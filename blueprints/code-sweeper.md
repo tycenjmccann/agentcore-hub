@@ -55,31 +55,32 @@ For every candidate before removal:
    `--retain-public`); if it may be an external API, KEEP and list it.
 Drop any candidate that fails these — into "not removed", with the reason.
 
-### Step 2.5: EMPTY SWEEP — you shut the whole run down
-If, after Steps 1-2, there are ZERO verified-dead removals, the workflow is over.
-There is no branch, no PR, no review, no QA, no ship, no merge approval — and it is
-YOUR job to end it. Do NOT report completion and let the pipeline cascade; a human
-must never be asked to approve a merge that doesn't exist.
+### Step 2.5: Report the yield — a number, not a decision
+A sweep runs as TWO tickets. The first is stamped `phase="detection"` and is Steps
+1-2 only: detect, verify, count, report. The second (`phase="development"`) is Steps
+3-5: remove, build, PR. If your ticket is the detection one, STOP at this step — do
+not delete anything, do not push a branch, do not open a PR.
 
-1. `Tickets___list_tickets(epic_id)` — every not-done ticket under this epic
-   except your own is now dead work.
-2. Skip each one via `Tickets___transition_ticket(ticket_id, "skip",
-   reason="No dead code identified — empty sweep, run stopped by code_sweeper")`.
-   If `skip` is rejected from the ticket's current status, transition it to
-   `block` first, then `skip`.
-3. **Order matters:** skip in REVERSE dependency order — the furthest-downstream
-   ticket first (CD, then the Merge Approval gate, then ship/review/QA), ending
-   with the ticket immediately after yours. Never mark a ticket done while a
-   ticket that depends on it is still open, or the orchestrator will dispatch it.
-4. Verify with `Tickets___list_tickets(epic_id)` that everything except your own
-   ticket is done. If anything is still open, skip it now.
-5. `WorkflowOutput___report_completion` with a clear NO-OP summary: what was
-   scanned, the tool output proving zero candidates survived verification, and
-   the list of tickets you skipped. Do NOT push a branch or open a PR.
+Whichever ticket you are on, close it with `WorkflowOutput___report_completion`
+carrying the two counts as their own fields:
 
-The same applies when the sweep produces candidates but ALL of them land in
-"Candidates not removed": nothing mergeable exists, so shut the run down and put
-the candidate list in the completion report for a human to read.
+- `verified_removable=<n>` — how many candidates survived Step 2 and are safe to
+  remove (on the detection ticket) or were actually removed (on the sweep ticket).
+- `candidates=<n>` — how many the tools flagged in Step 1, before verification.
+
+`verified_removable=0` is a normal, healthy result and the ONE value that ends the
+run: the orchestrator reads it, closes the workflow `nothing-to-remove`, and never
+dispatches review, QA, CI, ship or a human merge gate. **That decision is not yours
+to make.** Do not list, block, or skip other people's tickets; do not try to shut
+the run down; never withhold a completion in order to stall it. Report the number
+and stop — a run that is over gets ended by the orchestrator, and a run that is not
+over stays runnable.
+
+Put the evidence in the summary too, because the number alone is not reviewable:
+what was scanned, the raw tool output, and the full candidate list with the reason
+each one was kept. The same applies when candidates exist but ALL of them land in
+"Candidates not removed" — that is `verified_removable=0` with a long ledger, which
+is exactly the shape a human wants to read.
 
 ### Step 3: Remove surgically
 - Delete only verified-dead code. No refactors, no reformatting, no renames, no
@@ -117,9 +118,12 @@ still pass with the code gone.
 
 ## Rules
 - Pick the intelligence tier per `claude_code` call with `model=`: `"fable"` (default — top reasoning, plans/complex debugging), `"opus"` (deep implementation work), `"sonnet"` (routine, well-specified coding), `"haiku"` (trivial mechanical edits). Match the tier to the difficulty; when unsure, leave it empty.
-- ZERO verified removals = ZERO downstream work. Skip every open ticket under the
-  epic (Step 2.5) and report a NO-OP completion. Never let an empty sweep reach
-  review, QA, ship, or a human merge gate.
+- ALWAYS report `verified_removable=<n>` and `candidates=<n>` on
+  `WorkflowOutput___report_completion` (Step 2.5) — on the detection ticket and on
+  the sweep ticket, and especially when the answer is 0. Those fields are how the
+  run ends; prose saying "zero removals" is not read as a number.
+- Terminating the run is the ORCHESTRATOR's job, never yours: no listing, blocking
+  or skipping of other tickets, and no withheld completion.
 - Default is KEEP. Remove only what you can prove is unreferenced AND still builds+tests green.
 - Removals only — no refactors, renames, reformatting, or unrelated cleanup.
 - Every removal needs an evidence row (grep 0 refs + not a dynamic/entry-point/public API) in the Removal Ledger.

@@ -109,6 +109,121 @@ The single prose→verdict ladder they all read lives in the zero-import
   GitHub call, since the PR does not exist yet at this gate and the gate must
   stay replayable offline.
 
+**Sweep detection flag (TEAM-4247 D2, `lambda/orchestrator/`)** — same
+`off | shadow | enforce` convention as the three above (unset → `shadow`,
+unrecognized → `off`), normalized by the same `normalizeVerdictMode`.
+- `SWEEP_DETECTION_PHASE` — a `dead-code-sweep` run whose **detection** ticket
+  completes with `verified_removable: 0` (a strict integer 0; absent is not a
+  zero yield) has no work left to do. `enforce` closes the run as the terminal
+  outcome `nothing-to-remove` — labels the PR `sweep:no-op` if one exists,
+  publishes `workflow.nothing_to_remove`, and **skips the cascade for that
+  ticket** so no reviewer / QA / CI / release manager is ever dispatched against
+  a branch that does not exist (the `agent.complete` publish still happens first,
+  so the stream reads ticket-done → run-closed). `shadow` publishes
+  `sweep.detection_observed` and behaves exactly as today.
+- The sweep def's `completionRequiresAgentPhases` lists `"detection"`, but
+  `stripUnenforcedDetectionPhase` (`lambda/orchestrator/index.mjs`) removes it
+  from the **effective** def unless this flag is `enforce` — the same
+  flag/context-conditional pattern as `cd-registry.mjs`'s `stripShipPhases`.
+  Without the strip, every sweep run would hang the moment the config synced,
+  because nothing else requires the detection ticket to exist yet. The def's
+  `phases[]` is **never** stripped: the analyst must still plan and stamp the
+  detection ticket under `shadow`, or `shadow` observes nothing.
+- **Deploy order matters, because config and code ship separately.** The
+  detection phase only exists for the Lambdas once
+  `s3://$ARTIFACT_BUCKET/config/workflows.json` carries it (read on cold start,
+  no redeploy). The CD deploy stage
+  (`deploy/pipeline/buildspec-deploy.yml`) and `deploy/runtime-agent/deploy-topology.sh`
+  both do this copy; deploying by hand it is DEPLOY.md step 2:
+  `aws s3 cp src/config/workflows.json "s3://$ARTIFACT_BUCKET/config/workflows.json"`
+  (`ARTIFACT_BUCKET` from `deploy/config.sh` — never hardcoded). Order: ship the
+  orchestrator code → sync `workflows.json` → only then set
+  `SWEEP_DETECTION_PHASE=enforce`. Flipping the flag first makes `enforce`
+  unreachable (no detection phase, so the gate never matches); syncing the config
+  first is harmless (the strip keeps the phase non-required).
+
+**Sweep cadence gate (TEAM-4247 D2, `SWEEP_CADENCE_GATE`)** — the one flag in
+this family that lives on the **Next.js service**, not the orchestrator Lambda:
+it is read by `POST /api/workflow/start` (`src/lib/workflow/sweep-cadence.ts`),
+so it goes in the App Runner / ECS task env (both `deploy/apprunner/deploy.sh`
+and `deploy/ecs-express/deploy.sh` forward it when set), never in
+`lambda/orchestrator/deploy.sh`. Same three modes, same `shadow` default, same
+garbage → `off` rule.
+- A **scheduled** `dead-code-sweep` start is skipped when the same repo was swept
+  less than 14 days ago (`recent-sweep`) or still has an open sweep PR
+  (`open-sweep-pr`, matched on head branch / title / labels — see the match rule
+  in `sweep-cadence.ts`). `enforce` answers **HTTP 200**
+  `{ status: "skipped", reason, evidence }` — a skip is a successful no-op, and
+  the routines-runner treats 4xx as a terminal filing failure — and writes one
+  tombstone plus one `workflow.skipped` event. `shadow` runs both checks,
+  publishes `sweep.cadence_observed { wouldSkip, evidence, repo, defId }`, and
+  starts the run as today. `off` scans and probes nothing.
+- The gate runs **above** the dedup marker and every create, so a skip leaves no
+  epic, no tickets and no run row — nothing to clean up.
+- Only `trigger: "scheduled"` is gated. `lambda/routines-runner/index.mjs` stamps
+  it on every schedule tick; the "Run now" route
+  (`src/lib/routines/payload.ts`, `{ trigger: "manual" }`) and the SI
+  `prd-submitter` (`"autonomous"`) are never cadence-skipped, and an ad-hoc API
+  call with no `trigger` is likewise treated as deliberate.
+- The tombstone is **not a run**: PK `skip_<owner-repo>_<yyyymmdd>` (deterministic,
+  written with `attribute_not_exists`, so a repeat tick the same day writes
+  nothing and reports the same skip), `type: "skipped"`, `deleted: true`,
+  `phase: "cancelled"`, `skipReason: "sweep-cadence"`, plus `reason`, `evidence`,
+  `repo`, `defId`, `at`. `deleted: true` is load-bearing — it keeps the row out of
+  `listWorkflowsFromDynamo` and out of `cost-report`'s terminal scan, so a skip
+  can never appear as a zero-cost run on a performance card. `type: "skipped"`
+  keeps it out of the gate's own cadence evaluation (a skip must never be the
+  evidence for the next skip).
+- The open-PR probe needs `GITHUB_PAT` and **fails open**: with no token, a rate
+  limit or a 5xx, `evidence.prProbe` records `{ probed: false, reason }` and only
+  the cadence half decides. An expired token degrades to cadence-only, never to
+  "no sweeps ever again". The cadence read is a **filtered, projected, paginated
+  Scan** of the workflows table (no def GSI exists) — acceptable for a handful of
+  scheduled starts a week, off the hot human path; a very large workflows table
+  would want an index.
+
+**The `nothing-to-remove` terminal outcome (TEAM-4247 D2)** — a sixth terminal
+`WorkflowPhase`, deliberately **not** folded into `SHIP_BLOCKED_OUTCOMES`: a no-op
+sweep is a healthy run, not a blocked one, so it must not enter the ship-verdict
+gates, the blocked-run EventBridge rule or the blocked-run alerting.
+- Source of truth `NO_OP_OUTCOMES` in `src/lib/workflow/types.ts`, spread into
+  `TERMINAL_PHASES`. Hand-written mirrors in `lambda/orchestrator/completion.mjs`,
+  `lambda/workflow-analyzer/index.mjs`, `lambda/anomaly-watcher/index.mjs`,
+  `lambda/cost-report/index.mjs`, four `api/workflow/**` routes and
+  `deploy/workflow-manager/toolkit/run_outcomes.py` (the ONE Python copy —
+  `save_analysis.py` and `compute_metrics.py` both import it). All of them are
+  bound together by `src/lib/workflow/run-outcome-parity.test.ts`; add a value
+  there and to every mirror in the SAME commit.
+- **Excluded from every baseline** (FR-D2.8): a run with no work in it cannot be
+  the comparator that defines "anomalous", and a fleet swept on a cadence that
+  keeps finding nothing would otherwise halve the median and widen sigma until a
+  genuine cost blow-out stopped alerting. `cost-report`'s `isBaselineEligible`,
+  `buildFleetView`'s `baseline` slice (`src/lib/workflow/performance.ts`) and the
+  toolkit's `baseline_analyses` all drop it. The **current** window keeps it — the
+  run happened and cost money, so it is still listed, still in the totals, still
+  carded (`status: "ok"`, `noOp: true`). Consequence: a no-op card publishes **no**
+  `workflow.performance` event, so anything counting runs by that event
+  under-counts them by design.
+- **Yield-aware gate depth (FR-D2.6)** — when a zero-yield sweep runs on anyway
+  (the flag is `off`/`shadow`, or the close's CAS was lost), the diff is a
+  candidate ledger with no deletions in it. `sweepYieldNote` puts ONE ≤200-char
+  line into the QA verifier's and CI agent's `## Sweep Yield` context block
+  ("ledger-accuracy QA only … CI builds once") and the opposite line into the code
+  reviewer's and the human merge gate's review package (ledger re-verification
+  retained in full). Read by `blueprints/{qa-verifier,ci-agent}.md`;
+  `blueprints/code-reviewer.md` is untouched by D2 on purpose. Depth is set by
+  data on the run, never by an env flag the model cannot see.
+- `blueprints/code-sweeper.md` no longer terminates its own run: it reports
+  `verified_removable=<n>` + `candidates=<n>` and stops. The pre-D2 Step 2.5 had
+  the model hand-`skip` every downstream ticket in reverse dependency order — a
+  mass ticket mutation as the run's only termination mechanism.
+
+**New events (TEAM-4247 D2)**
+- `workflow.nothing_to_remove { workflowId, outcome, verifiedRemovable, candidates, prUrl, featureBranch, ticketId }` — `SWEEP_DETECTION_PHASE=enforce` closed a zero-yield sweep. Published **instead of** `workflow.complete`, never alongside it, and deliberately **not** added to the analyzer's EventBridge rule (auto-analysis of no-op sweeps is out of D2)
+- `sweep.detection_observed { workflowId, verifiedRemovable, candidates, wouldClose }` — `SWEEP_DETECTION_PHASE=shadow`, subject = the detection ticket
+- `workflow.skipped { reason, evidence, repo, defId, trigger }` — `SWEEP_CADENCE_GATE=enforce` skipped a scheduled start; one per tombstone
+- `sweep.cadence_observed { wouldSkip, reason, evidence, repo, defId }` — `SWEEP_CADENCE_GATE=shadow`, the run then starts as today
+
 **New events (TEAM-4246 D1)**
 - `orchestrator.verdict_observed { workflowId, verdict, verdictSource, wouldSuppress, spawnedTickets, testedHead }` — `VERDICT_GATE=shadow`, every gate completion
 - `orchestrator.verdict_suppressed { workflowId, verdict, unblocked, blockers, spawnedTickets }` — `VERDICT_GATE=enforce`, a non-PASS gate held its successor

@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
-  bandFor, buildFleetView, median, mad, formatKpi, type CardSummary, type PerformanceIndex,
+  bandFor, buildFleetView, isBaselineCard, isNoOpCard, median, mad, formatKpi, type CardSummary, type PerformanceIndex,
 } from "./performance";
 
 function card(over: Partial<CardSummary> & { completedAt: string; total?: number }): CardSummary {
@@ -187,5 +187,81 @@ describe("formatKpi", () => {
     expect(formatKpi("ms", 3 * 86_400_000)).toBe("3d 0h");
     expect(formatKpi("tokens", 12_800_000)).toBe("12.8M");
     expect(formatKpi("count", null)).toBe("—");
+  });
+});
+
+describe("no-op runs and the baseline (TEAM-4247 D2)", () => {
+  const now = new Date("2026-09-04T00:00:00Z");
+  const day = (n: number) => new Date(now.getTime() - n * 86_400_000).toISOString();
+  /** Six real sweeps at $100 in the baseline window, one normal run this week. */
+  const cards = [
+    ...[8, 9, 10, 11, 12, 13].map((d) => card({ completedAt: day(d), total: 100, workflowDefId: "dead-code-sweep" })),
+    card({ completedAt: day(1), total: 110, workflowId: "cur", workflowDefId: "dead-code-sweep" }),
+  ];
+  const view = (extra: CardSummary[]) =>
+    buildFleetView(
+      { version: 1, updatedAt: now.toISOString(), infra: null, cards: [...cards, ...extra] },
+      { days: 7, workflowDefId: "dead-code-sweep", now },
+    );
+
+  const noop = (over: Partial<CardSummary> = {}) =>
+    card({
+      completedAt: day(9), total: 4, workflowId: "noop", workflowDefId: "dead-code-sweep",
+      outcome: "nothing-to-remove", ...over,
+    });
+
+  it("isBaselineCard rejects a no-op card and a $0 card, accepts a real one", () => {
+    expect(isBaselineCard(cards[0])).toBe(true);
+    expect(isBaselineCard(noop())).toBe(false);
+    expect(isBaselineCard(card({ completedAt: day(9), total: 0 }))).toBe(false);
+    expect(isNoOpCard(noop())).toBe(true);
+    expect(isNoOpCard(cards[0])).toBe(false);
+    // Every other terminal outcome is still a comparable — this is not a
+    // "small runs don't count" rule, it is one named outcome.
+    expect(isNoOpCard(card({ completedAt: day(9), outcome: "deploy-blocked" }))).toBe(false);
+  });
+
+  it("a $4 no-op sweep in the window does not move the baseline median or the band", () => {
+    const clean = view([]);
+    const withNoop = view([noop()]);
+    const kpi = (v: ReturnType<typeof view>) => v.kpis.find((k) => k.key === "cost.total")!;
+    expect(kpi(withNoop).band?.median).toBe(kpi(clean).band?.median);
+    expect(kpi(withNoop).band?.n).toBe(kpi(clean).band?.n);
+    expect(kpi(withNoop).status).toBe(kpi(clean).status);
+  });
+
+  it("the SAME cards under a complete outcome wreck the band (not a vacuous test)", () => {
+    // A median is robust to ONE cheap outlier, so the case worth pinning is the
+    // one D2 exists for: a repo swept on a schedule that keeps finding nothing.
+    // Six no-op sweeps beside six real ones halve the median AND blow the sigma
+    // out from 10 to 71 — a bimodal baseline is not just wrong, it is so wide
+    // that a genuine cost blow-out stops alerting at all.
+    const cheap = [21, 22, 23, 24, 25, 26].map((n) => noop({ workflowId: `noop_${n}` }));
+    const clean = view(cheap);
+    const polluted = view(cheap.map((c) => ({ ...c, outcome: "complete" })));
+    const kpi = (v: ReturnType<typeof view>) => v.kpis.find((k) => k.key === "cost.total")!;
+
+    expect(kpi(polluted).band?.n).toBe((kpi(clean).band?.n ?? 0) + 6);
+    expect(kpi(clean).band?.median).toBe(100);
+    expect(kpi(polluted).band?.median).toBe(52);
+    expect(kpi(clean).band?.sigma).toBeCloseTo(10);
+    expect(kpi(polluted).band!.sigma).toBeGreaterThan(50);
+
+    // Same $420 sweep, same week: a 16-sigma alert against the real baseline,
+    // downgraded to a warn by the widened one.
+    const spike = card({ completedAt: day(2), total: 420, workflowId: "spike", workflowDefId: "dead-code-sweep" });
+    const cleanSpike = view([...cheap, spike]);
+    const pollutedSpike = view([...cheap.map((c) => ({ ...c, outcome: "complete" })), spike]);
+    expect(kpi(cleanSpike).status).toBe("alert");
+    expect(kpi(pollutedSpike).status).toBe("warn");
+  });
+
+  it("a no-op run in the CURRENT window is still listed and still counted in the totals", () => {
+    // The exclusion is about comparability, not visibility: the run happened, it
+    // cost money, and the fleet view must not quietly lose it.
+    const v = view([noop({ completedAt: day(2) })]);
+    expect(v.runs.map((r) => r.workflowId)).toContain("noop");
+    expect(v.totals.runs).toBe(2);
+    expect(v.totals.cost).toBeCloseTo(110 + 4);
   });
 });

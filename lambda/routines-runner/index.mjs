@@ -40,6 +40,10 @@ function buildPayload(input, firedAt) {
     description: input.description || "",
     workflowDefId: input.workflowDefId,
     sources: input.sources || [],
+    // TEAM-4247 D2: every fire from THIS Lambda is a schedule tick, which is the
+    // only trigger the sweep cadence gate skips. The manual "Run now" route
+    // stamps "manual" and is never skipped.
+    trigger: "scheduled",
   };
   if (input.repoConfig) payload.repoConfig = input.repoConfig;
   if (input.modelOverride) payload.modelOverride = input.modelOverride;
@@ -103,6 +107,15 @@ export async function handler(event) {
         return { statusCode: 200, body: `terminal client error (not retried): ${error}` };
       }
       throw new Error(`workflow API ${resp.status}: ${error}`);
+    }
+    // TEAM-4247 D2: a gate (today: the sweep cadence gate) can answer 200 with
+    // no run. That is a SUCCESSFUL no-op, not a failure and not a started run —
+    // recording it as "started" with an empty workflowId would put a dead link
+    // on the routine card.
+    if (data.status === "skipped") {
+      console.log(`[routines-runner] ${routineId} → skipped by the workflow API (${data.reason}) — no run created`);
+      await recordLastRun(routineId, { at: firedAt, status: "started", note: `skipped: ${data.reason || "gated"}` });
+      return { statusCode: 200, body: JSON.stringify({ routineId, skipped: data.reason || true }) };
     }
     const workflowId = data.workflowId || data.id;
     console.log(`[routines-runner] ${routineId} → workflow ${workflowId}`);

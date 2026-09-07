@@ -1,0 +1,1650 @@
+{
+ "workflowId": "wf_1788780725940_c2uqki",
+ "workflowDefId": "dead-code-sweep",
+ "epicId": "TEAM-4228",
+ "ticketProvider": "jira",
+ "workflow": {
+  "agentTasks": {
+   "TEAM-4229": {
+    "agentId": "agentcore_hub_requirements_analyst",
+    "completedAt": "2026-09-07T11:42:09.662Z",
+    "createdAt": "2026-09-07T11:32:08.815Z",
+    "id": "task_1788780728815_agentcore_hub_requirements_analyst",
+    "output": "Requirements analysis complete for Dead Code Sweep \u2014 tycenjmccann/ember (feature flow; not bug-fix, not playbook, no ported session).\n\n**Scope:** MODIFY EXISTING \u2014 pure subtractive change; no design work, no external vendor API (no Docs & References needed). Delivery: handoff \u2014 PR for the owning team (CD_REGISTERED: false; chain ends at CI, no Ship/Merge/CD tickets).\n\n**Key repo facts verified (shape the plan):**\n- Next.js 14 App Router (TS strict, `output: standalone`) + separate `mcp/port-session` workspace with its own package.json/lockfile/tsconfig; root tsconfig EXCLUDES `mcp` \u2192 tools must run per-workspace.\n- NO `test`/`lint` scripts, NO test runner, NO ESLint/knip config, NO `.github/workflows` \u2192 \"full test suite\" defined concretely as: `tsc --noEmit` (root), `next build`, `mcp:build`, mcp `tsc --noEmit`, Docker build if feasible, plus QA runtime smoke (`/`, `/login`, `/api/auth/health` non-5xx).\n- Pre-identified false positives the sweep must KEEP: `@smithy/node-http-handler` (transitive, next.config only), SigV4 deps (`@aws-crypto/sha256-js`, `@smithy/signature-v4`, `@aws-sdk/credential-provider-node` \u2014 used in shell/route.ts), `@tailwindcss/typography`, 27 `export const dynamic` + `maxDuration` segment configs, `middleware.ts`, public API routes consumed by mcp/install.sh/deploy, and `shell-protocol.ts`/`types.ts` wire contracts with the Python runtime.\n- Empty removal list + explanatory ledger is an explicitly valid outcome (R7).\n\n**Requirements doc:** R1 detection (knip w/ Next plugin, ts-prune, depcheck \u00d7 2 workspaces) \u2192 R2 whole-repo git grep verification per candidate \u2192 R3 remove only DEAD \u2192 R4 proof suite w/ main baseline \u2192 R5 Removal Ledger (REMOVED / KEPT-UNCERTAIN / Tool false positives) \u2192 R6 single branch + open PR, never merge \u2192 R7 guardrails.\n\n**Tickets created under TEAM-4228 (verified: 1 per assignee, no duplicates):**\n- TEAM-4230 agentcore_hub_code_sweeper \u2014 sweep (blocked_by none; already in_progress)\n- TEAM-4231 agentcore_hub_code_reviewer \u2014 adversarial re-grep of every removed item (blocked_by TEAM-4230)\n- TEAM-4232 agentcore_hub_qa_verifier \u2014 live proof commands + runtime smoke (blocked_by TEAM-4231)\n- TEAM-4233 agentcore_hub_ci_agent \u2014 validate at PR head SHA; state no Actions exist (blocked_by TEAM-4232)\n\n**Excluded agents:** designers, security, legal, analytics, localization, release manager \u2014 justified in doc.\n\n**Tool notes:** all tool calls succeeded. One anomaly: `WorkflowOutput___submit_ticket_plan` echoed `ticket_count: 600` for a 4-ticket JSON array (appears to be a character-length miscount in the tool's response); the plan record was saved and the 4 real tickets were created correctly, so no impact on the run.",
+    "startedAt": "2026-09-07T11:32:09.935Z",
+    "status": "complete",
+    "ticketId": "TEAM-4229"
+   },
+   "TEAM-4230": {
+    "agentId": "agentcore_hub_code_sweeper",
+    "branch": "feature/TEAM-4230-code-sweeper",
+    "commitSha": "1b399fb50e4a6e43e775d76b160dea750ec50e9d",
+    "completedAt": "2026-09-07T12:12:21.284Z",
+    "createdAt": "2026-09-07T11:40:35.333Z",
+    "id": "task_1788781235333_agentcore_hub_code_sweeper",
+    "output": "Dead-code sweep of tycenjmccann/ember \u2014 OUTCOME: ZERO verified-dead removals (valid terminal state per R7). PR #58 opened and left OPEN (handoff; never merged; no Pipeline/CD calls).\n\nWHAT ACTUALLY RAN (via codex, root + mcp/port-session separately, pinned npx, nothing added to package.json): knip 5.88.1 (Next.js plugin confirmed enabled via --debug; run-local documented knip.jsonc), ts-prune 0.10.3 (per tsconfig), depcheck 1.4.7 (per package.json). Raw stdout/stderr + exit codes archived. 93 distinct candidates emitted; EVERY one verified with repo-wide `git grep -n [-w]` (105 KB verification-grep.txt; I also independently re-ran the same grep script on a local clone at f754cd3 \u2014 identical result).\n\nVERDICTS: REMOVED 0 \u00b7 KEPT-USED-IN-MODULE 53 (only the `export` keyword unused \u2014 refactor, out of scope) \u00b7 KEPT-FRAMEWORK 26 (Next.js page/layout/route default exports, GET/POST/PUT/PATCH/DELETE, middleware/config, `dynamic`\u00d727/maxDuration/metadata/viewport) \u00b7 KEPT-FALSE-POSITIVE 12 (node:sqlite builtin; depcheck devDeps @types/react-dom/autoprefixer/postcss/typescript; 7 knip config-redundancy hints) \u00b7 KEPT-CONTRACT 1 (DecodedFrame) \u00b7 KEPT-UNCERTAIN 1: `encodeClose` src/lib/ember/shell-protocol.ts:62 \u2014 the ONLY zero-reference symbol in the repo, but inside the Python-runtime wire-contract file the sweep is forbidden to trim \u2192 kept, escalated to owning team. Tool-false-positive section also covers @smithy/node-http-handler (next.config.mjs:14, transitive), the 3 SigV4 deps (shell/route.ts:13-15 imports; not flagged by any tool this run), @tailwindcss/typography (tailwind.config.js:92), types.ts (no candidates emitted; contract-protected). PR #57 (merged 2026-08-31) had already removed previously-dead code.\n\nPROOF (baseline base/main @ f754cd3 vs branch; all exit codes archived): (a) `npx tsc --noEmit -p tsconfig.json` 0/0; (b) `npm run build` 0/0 \u2014 identical route tables; (c) `npm run mcp:build` 0/0; (d) `cd mcp/port-session && npx tsc --noEmit` 0/0; (e) test runner: NONE exists (re-confirmed: no test/lint scripts, no jest/vitest/playwright/mocha/cypress bins, no .github/workflows, no ESLint) \u2192 no tests were run because none exist; (f) docker build NOT RUN \u2014 `docker: command not found` (exit 127); `next build` (output: standalone) covers the Dockerfile build step. No tracked file modified by builds; no lockfile churn.\n\nDIFF: purely additive \u2014 knip.jsonc (+21, commented JSONC) and REMOVAL_LEDGER.md (+228). REMOVED-set (\u2205) == deletions in diff (\u2205). PR body contains the full ledger + exact proof commands/results.\n\nTOOL FAILURES: `aws` CLI absent in codex sandbox (artifacts transferred via local boto3 instead); docker absent (recorded). No other failures.\n\nPROCESS NOTES: Branch cut from harness integration branch feature/TEAM-4228-... (== main SHA) rather than directly from main; PR targets that integration branch per harness, not main (orchestrator opens the unified PR). Ticket vs blueprint conflict on empty sweeps: blueprint says skip downstream tickets, ticket R7 explicitly requires a PR with an empty ledger \u2014 followed the ticket; flagged in a ticket comment so the orchestrator can short-circuit if preferred. Nothing merged.",
+    "prUrl": "https://github.com/tycenjmccann/ember/pull/58",
+    "startedAt": "2026-09-07T11:40:36.133Z",
+    "status": "complete",
+    "ticketId": "TEAM-4230"
+   },
+   "TEAM-4231": {
+    "agentId": "agentcore_hub_code_reviewer",
+    "branch": "feature/TEAM-4230-code-sweeper",
+    "commitSha": "1b399fb50e4a6e43e775d76b160dea750ec50e9d",
+    "completedAt": "2026-09-07T12:30:55.675Z",
+    "createdAt": "2026-09-07T11:41:02.093Z",
+    "id": "task_1788781262093_agentcore_hub_code_reviewer",
+    "output": "VERDICT: CHANGES NEEDED (ledger-accuracy findings only; ZERO false-positive deletions). Fix ticket TEAM-4241 \u2192 agentcore_hub_code_sweeper.\n\nReviewed PR #58 (feature/TEAM-4230-code-sweeper @ 1b399fb \u2192 integration branch feature/TEAM-4228-\u2026 == main @ f754cd3). Ticket named branch chore/dead-code-sweep-2026-09-07 does not exist; reviewed the actual sweep PR. Independent engine: codex, fresh clone, nothing trusted from the sweeper's grep.\n\nWhat I re-verified:\n- Diff: `--numstat` 228/0 REMOVAL_LEDGER.md, 21/0 knip.jsonc; `--diff-filter=D` = 0; package.json + both lockfiles unchanged. REMOVED-set \u2205 == deletions \u2205 \u2192 the per-item re-verification table is empty by construction (nothing removed).\n- Protected surface all PRESENT: 3 SigV4 deps (shell/route.ts:13-15,144-148), @tailwindcss/typography (tailwind.config.js:92), @smithy/node-http-handler (next.config.mjs:14), middleware/pages/layout, 20 route.ts files (requirements said 21 \u2014 its own enumeration totals 20, doc miscount), shell-protocol.ts/types.ts untouched, every /api path called from mcp/install.sh/deploy resolves.\n- Ledger completeness: re-ran knip@5.88.1, ts-prune@0.10.3 (\u00d72 ws), depcheck@1.4.7 (\u00d72 ws): ts-prune 94/26 lines match; normalized tool set == ledger set (78/78, both differences \u2205); only zero-ref symbol is encodeClose; all 53 used-in-module symbols have same-file uses; required sections present.\n- knip.jsonc minimal/documented, no dep added; enters Docker builder stage only (runner copies standalone/static/public).\n- Proof re-run: tsc root 0, next build 0, mcp:build 0, tsc mcp 0, git status clean; no test/lint/workflows.\n\nFindings (grouped into ONE ticket, TEAM-4241):\n- F1 P2 REMOVAL_LEDGER.md:116 \u2014 `Cli` (config.ts:23) row cites index.ts:450; index.ts:30-36 imports Cli from ./cli-adapter.js, only gatherBundle from ./config.js \u2192 misattributed (verdict still correct via config.ts:393).\n- F2 P2 REMOVAL_LEDGER.md:198 \u2014 encodeClose rationale names main.py/shell-init.sh as protocol peer; actual peer is AgentCore /ws/shells (bedrock_agentcore SDK) per shell-protocol.ts:4-6, shell/route.ts:4-6,141-142, ShellTerminal.tsx:166-181; grep of main.py/shell-init.sh finds no frame handling; requirements.txt has no bedrock_agentcore. KEEP-UNCERTAIN still right, rationale wrong.\n- F3 P2 \u2014 PR #58 not landed on integration branch (still == main) \u2192 unified handoff PR would be empty. Fix: land on integration branch only, never main.\n\nPR review posted on #58 as COMMENT (GitHub rejects REQUEST_CHANGES on same-author PR \u2014 stated explicitly in the review). Nothing merged; no Pipeline tools called.\n\nTool status: all tools OK; codex available (claude_code fallback unused).\n[coding-session: cc-8681e4c8b0d941b8be77e9ba279cca51 cli=codex conversation=01a07bca-7c76-7cd3-85d0-5c6e5b54fa43]",
+    "prUrl": "https://github.com/tycenjmccann/ember/pull/58",
+    "startedAt": "2026-09-07T12:12:22.764Z",
+    "status": "complete",
+    "ticketId": "TEAM-4231"
+   },
+   "TEAM-4232": {
+    "agentId": "agentcore_hub_qa_verifier",
+    "branch": "feature/TEAM-4230-code-sweeper",
+    "commitSha": "1b399fb50e4a6e43e775d76b160dea750ec50e9d",
+    "completedAt": "2026-09-07T12:55:07.023Z",
+    "createdAt": "2026-09-07T11:41:24.386Z",
+    "id": "task_1788781284386_agentcore_hub_qa_verifier",
+    "output": "**Verdict: FAIL (ledger-accuracy only \u2192 fix ticket TEAM-4242). All build, runtime-smoke, mcp-entry, and ledger==diff checks PASSED at PR #58 head 1b399fb50e4a6e43e775d76b160dea750ec50e9d.** HANDOFF: nothing merged, no Pipeline tools called.\n\nBranch note: ticket's `chore/dead-code-sweep-2026-09-07` does not exist; sweep is on `feature/TEAM-4230-code-sweeper` (PR #58 \u2192 integration branch == main @ f754cd3). Reviewer fix TEAM-4241 was in_progress and had not pushed, so head was unchanged.\n\nVerification Ledger (fresh clone, claude_code session cc-72e710c7e53c4d61a943b4621d5a319b, node 20.19.2; node 22.14.0 for mcp re-run):\n- npm ci EXIT 0 \u00b7 (a) tsc root EXIT 0 \u00b7 (b) next build EXIT 0 \u00b7 (c) mcp:build EXIT 0 \u00b7 (d) mcp tsc EXIT 0 \u00b7 tracked tree clean after builds\n- No test runner exists (re-confirmed) \u2014 command suite is the \"tests\"\n- Runtime smoke (`next start` AND `node .next/standalone/server.js`, :3457): GET / 307\u2192/login (target 200); GET /login 200 (login HTML); GET /api/auth/health 200 {\"ok\":true}. No 5xx, no crash.\n- mcp/port-session/dist/index.js exists (39933 B); on Node 22 loads as ESM entry (\"port-session-mcp ready (stdio)\", exit 0) and via dynamic import (exit 0). On Node 20 fails with ERR_UNKNOWN_BUILTIN_MODULE node:sqlite \u2014 proven pre-existing on main (identical blob 8f90502c, 0 mcp files in diff); Dockerfile pins node:22. Advisory only.\n- Docker: NOT RUN \u2014 docker binary not installed (exit 127, no socket). Fallback: passing standalone next build + booted standalone server.\n- Ledger==diff: 0 deleted files/lines; only +228 REMOVAL_LEDGER.md, +21 knip.jsonc; manifests/lockfiles unchanged; `## Removed: None.` \u2192 LEDGER_DRIFT=NONE. KEPT-UNCERTAIN encodeClose still at shell-protocol.ts:62; all protected deps/entry points present (20 route.ts = main).\n\nFinding (new): REMOVAL_LEDGER.md:205 says `dynamic \u00d727`; actual 21 (+ maxDuration \u00d76). Reproduced the ledger's ts-prune@0.10.3 run (94 candidates, exit 0) to locate the mislabel. Filed TEAM-4242 (qa_fix, assignee code_sweeper, blocked_by TEAM-4241 \u2014 same file, land serially/fold in). Commented on TEAM-4241 to coordinate. Reviewer's F1/F2/F3 remain open in TEAM-4241 (not double-filed); integration branch confirmed still == main.\n\nQA summary posted on PR #58 (comment 5570943176) and uploaded to qa-evidence/. Re-verify required at the new head once TEAM-4241/TEAM-4242 land (resume session cc-72e710c7e53c4d61a943b4621d5a319b).\n\nTool status: all tools succeeded. aws CLI absent in the coding workspace so logs were transcribed verbatim into S3 via S3Storage___write_object.",
+    "prUrl": "https://github.com/tycenjmccann/ember/pull/58",
+    "startedAt": "2026-09-07T12:30:57.018Z",
+    "status": "complete",
+    "ticketId": "TEAM-4232"
+   },
+   "TEAM-4233": {
+    "agentId": "agentcore_hub_ci_agent",
+    "branch": "feature/TEAM-4228-dead-code-sweep-tycenjmccann-ember-2026",
+    "commitSha": "73f005662583afd2b4b4dd6565e617f90ba16407",
+    "completedAt": "2026-09-07T13:17:37.823Z",
+    "createdAt": "2026-09-07T11:41:43.022Z",
+    "id": "task_1788781303022_agentcore_hub_ci_agent",
+    "output": "CI VERDICT: PASS \u2014 dead-code sweep, tycenjmccann/ember. Head SHA verified: 73f005662583afd2b4b4dd6565e617f90ba16407 (tip of integration branch feature/TEAM-4228-dead-code-sweep-tycenjmccann-ember-2026 = PR #58 merge 16fc41d + PR #59 merge 73f0056). Base main = f754cd3 (== merge-base, untouched). Ticket-named branch chore/dead-code-sweep-2026-09-07 does not exist. Head moved 16fc41d\u219273f0056 mid-run (TEAM-4242 ledger fix); both heads verified, full suite re-run from clean `npm ci` at 73f0056.\n\nResults @ 73f0056 (fresh clone, node v20.19.2/npm 9.2.0): npm ci EXIT 0 \u00b7 (a) npx tsc --noEmit -p tsconfig.json EXIT 0 \u00b7 (b) npm run build EXIT 0 (\"Compiled successfully\", route table identical to sweeper/QA) \u00b7 (c) npm run mcp:build EXIT 0 \u00b7 (d) cd mcp/port-session && npx tsc --noEmit EXIT 0 \u00b7 git status clean after builds. No command exited non-zero. Tests/lint: none exist \u2014 none run. Docker: not run (unavailable); row (b) is the same build step.\n\nLedger\u2194diff: diff vs main = A REMOVAL_LEDGER.md (+228), A knip.jsonc (+21), 0 deletions, 0 manifest/lockfile lines \u2192 REMOVED-set (\u2205) == deletions (\u2205); NO DRIFT since QA TEAM-4232. PR #58 body still carries ledger + proof table.\n\nCI proof statement: repo has NO .github/workflows (only .github/assets), no CodeBuild/CD pipeline registered, no test/lint scripts, no test runner or ESLint config \u2192 no check-run and no CodeBuild build id exists; ci_status=unverified (honest). The executed command suite at the exact head SHA is the achievable CI proof (also independently run by sweeper, reviewer, QA). Advisory only (not implemented): owning team should add a GitHub Actions ci.yml running this suite on Node 22.\n\nHANDOFF: nothing merged to main, no deploy, no Pipeline___* calls. No fix ticket filed (nothing failed, no drift). PR comments posted: https://github.com/tycenjmccann/ember/pull/58#issuecomment-5571217772 and PR #59. Specialist: claude_code [coding-session: cc-ccee0915559e49c79634fad89bc9178b]; all tool calls succeeded.",
+    "prUrl": "https://github.com/tycenjmccann/ember/pull/58",
+    "startedAt": "2026-09-07T12:55:08.201Z",
+    "status": "complete",
+    "ticketId": "TEAM-4233"
+   },
+   "TEAM-4241": {
+    "agentId": "agentcore_hub_code_sweeper",
+    "branch": "feature/TEAM-4230-code-sweeper",
+    "commitSha": "ef18e1fe5e54f2d8de4fad0515d8dc0f4897c815",
+    "completedAt": "2026-09-07T12:44:25.736Z",
+    "createdAt": "2026-09-07T12:30:14.575Z",
+    "id": "task_1788784214575_agentcore_hub_code_sweeper",
+    "output": "Fix ticket for review TEAM-4231 (PR #58) \u2014 all 3 findings resolved; ledger-only change, zero code removed or touched.\n\nWHAT I RAN (codex, resumed session; all tool calls succeeded):\n- Re-derived F1/F2 evidence: `git grep -n -w Cli mcp/port-session/src`, index.ts imports (:30-37), shell-protocol.ts:1-12, shell route.ts:4-6/141-142, ShellTerminal.tsx:166-181, grep of main.py/shell-init.sh for channel|frame|0xff|CLOSE (only unrelated sqlite close / SSE-frame hits; no shell-frame handling), requirements.txt (no bedrock_agentcore SDK).\n- Proof on the fix commit: `npx tsc --noEmit -p tsconfig.json` exit 0; `cd mcp/port-session && npx tsc --noEmit` exit 0; `npm run build` exit 0; git status clean. No test runner exists in the repo (unchanged fact) \u2014 none run.\n\nF1: REMOVAL_LEDGER.md `Cli` (config.ts:23) row now cites config.ts:393 as the only same-file use and explicitly attributes index.ts:450 to cli-adapter.ts's `Cli`. Verdict unchanged (KEPT-USED-IN-MODULE).\nF2: `encodeClose` Kept-(uncertain) bullet + encodeClose/DecodedFrame Notes now name the real peer \u2014 Bedrock AgentCore `/ws/shells` service (bedrock_agentcore SDK protocol) \u2014 with the route/terminal/grep/requirements evidence; main.py/shell-init.sh attribution dropped (stated as grepped, no frame handling). Verdict unchanged (KEPT-UNCERTAIN).\nF3: Harness does not auto-land; merged PR #58 into its base (integration branch feature/TEAM-4228-dead-code-sweep-tycenjmccann-ember-2026) \u2192 merge commit 16fc41de671799b29909ea59460fd92d3e357752 (+249/\u22120, REMOVAL_LEDGER.md + knip.jsonc). `main` untouched at f754cd3. No Pipeline___* tools called.\n\nDiff: commit ef18e1f on feature/TEAM-4230-code-sweeper \u2014 REMOVAL_LEDGER.md only (+4/\u22124). No source, package.json, lockfile, or knip.jsonc changed. PR #58 body mirrors the committed ledger; S3 ledger mirror + fix-evidence written.\n\nCounts: removed 0 / kept 78 unique candidates (unchanged from the sweep).",
+    "prUrl": "https://github.com/tycenjmccann/ember/pull/58",
+    "startedAt": "2026-09-07T12:30:15.195Z",
+    "status": "complete",
+    "ticketId": "TEAM-4241"
+   },
+   "TEAM-4242": {
+    "agentId": "agentcore_hub_code_sweeper",
+    "branch": "feature/TEAM-4242-code-sweeper",
+    "commitSha": "275a5677c9b9fc2414eeb808e88e360403c80fae",
+    "completedAt": "2026-09-07T13:01:11.819Z",
+    "createdAt": "2026-09-07T12:53:29.196Z",
+    "id": "task_1788785609196_agentcore_hub_code_sweeper",
+    "output": "FIXED TEAM-4242 (QA TEAM-4232 ledger-count finding). Ledger-text-only change.\n\nWhat changed: REMOVAL_LEDGER.md:205 (\"Tool false positives\") \u2014 one line, +1/\u22121: `dynamic` \u00d727 \u2192 `dynamic` \u00d721, `maxDuration` \u00d76 (plus `metadata`, `viewport`). Counts independently re-verified before editing: `git grep -c 'export const dynamic' -- src | wc -l` = 21; `git grep -c 'export const maxDuration' -- src | wc -l` = 6. 27 was the sum mislabeled as the dynamic count. No source/config/manifest/lockfile/knip.jsonc touched; all verdicts unchanged; removal set still \u2205.\n\nWhere it landed: PR #58 had already been merged into the integration branch by TEAM-4241, so the fix went on feature/TEAM-4242-code-sweeper (cut from integration @ 16fc41d) \u2192 commit 275a567 \u2192 PR #59 \u2192 merged into feature/TEAM-4228-dead-code-sweep-tycenjmccann-ember-2026 as 73f0056. main untouched (f754cd3). No Pipeline___* tools called (HANDOFF). PR #58 body updated to mirror the corrected line. S3 ledger mirror refreshed to the committed blob (12a2081).\n\nActually ran (codex, session resumed): tsc root exit 0; tsc mcp exit 0; `npm run build` exit 0 (identical route table); diff vs integration = `1 1 REMOVAL_LEDGER.md` only; diff vs main = REMOVAL_LEDGER.md + knip.jsonc, 0 deletions; git status clean. NOT run: tests (no test runner exists in repo \u2014 unchanged from PR #58), docker (not installed \u2014 unchanged). No detector re-run needed (no code change).\n\nRemoved 0 / kept unchanged. All tool calls succeeded; no failures. QA re-verify target: integration head 73f0056 or PR #59 head 275a567.",
+    "prUrl": "https://github.com/tycenjmccann/ember/pull/59",
+    "startedAt": "2026-09-07T12:54:10.980Z",
+    "status": "complete",
+    "ticketId": "TEAM-4242"
+   }
+  },
+  "completedAt": "2026-09-07T13:17:40.498Z",
+  "delivery": {
+   "mode": "handoff",
+   "prUrl": "https://github.com/tycenjmccann/ember/pull/60",
+   "at": "2026-09-07T13:17:40.498Z"
+  },
+  "epicId": "TEAM-4228",
+  "featureBranch": "feature/TEAM-4228-dead-code-sweep-tycenjmccann-ember-2026",
+  "finalizedAt": "2026-09-07T13:17:42.567Z",
+  "humanNotifications": [],
+  "id": "wf_1788780725940_c2uqki",
+  "input": {
+   "description": "Statically detect unused code in tycenjmccann/ember with knip/ts-prune/depcheck, verify each candidate is truly unreferenced (git grep whole repo, rule out reflection/entry-points/public API), remove only verified-dead code, prove build + full test suite still pass, and open a PR into main with a Removal Ledger. Never auto-merge; keep anything uncertain.",
+   "repoConfig": {
+    "layout": "monorepo",
+    "repos": [
+     {
+      "defaultBranch": "main",
+      "url": "https://github.com/tycenjmccann/ember",
+      "platform": "web"
+     }
+    ]
+   },
+   "workflowDefId": "dead-code-sweep",
+   "sources": [],
+   "sdlcFramework": "standard",
+   "title": "Dead Code Sweep \u2014 tycenjmccann/ember \u2014 2026-09-07"
+  },
+  "messages": [],
+  "phase": "complete",
+  "repoCheck": {
+   "checkedAt": "2026-09-07T11:32:11.532Z",
+   "results": [
+    {
+     "owner": "tycenjmccann",
+     "status": 200,
+     "ok": true,
+     "repo": "ember",
+     "definitive": true,
+     "url": "https://github.com/tycenjmccann/ember",
+     "reason": "found"
+    }
+   ]
+  },
+  "repoConfig": {
+   "layout": "monorepo",
+   "repos": [
+    {
+     "platform": "web",
+     "defaultBranch": "main",
+     "url": "https://github.com/tycenjmccann/ember"
+    }
+   ]
+  },
+  "sdlcFramework": "standard",
+  "startedAt": "2026-09-07T11:32:07.251Z",
+  "ticketProvider": "jira",
+  "wmAutoAnalyzedAt": "2026-09-07T13:17:42.757Z",
+  "wmLastWatchAt": "2026-09-07T13:14:45.361Z",
+  "workflowDefId": "dead-code-sweep",
+  "workflowId": "wf_1788780725940_c2uqki",
+  "workflowType": "feature"
+ },
+ "workflowDef": {
+  "id": "dead-code-sweep",
+  "type": "feature",
+  "name": "Dead Code Sweep",
+  "displayName": "Dead-Code",
+  "description": "Scheduled hygiene flow: statically detect unused code (language-aware \u2014 Periphery for Swift, knip/ts-prune for TS, vulture for Python), remove it surgically with evidence it is unreferenced, then independent code review, live QA that build + tests still pass, CI, and a release manager that reviews the final PR \u2014 a human approves the merge, then it merges and deploys per the repo's DEPLOY.md.",
+  "icon": "Trash2",
+  "intakeAgentId": "agentcore_hub_requirements_analyst",
+  "requiresRepo": true,
+  "featureBranchPhase": "development",
+  "createsPullRequest": true,
+  "completionRequiresAgentPhases": [
+   "development",
+   "verification",
+   "review",
+   "ship"
+  ],
+  "phases": [
+   {
+    "id": "intake",
+    "name": "Intake",
+    "type": "app",
+    "agentPhase": "intake"
+   },
+   {
+    "id": "sweep",
+    "name": "Sweep",
+    "type": "agent",
+    "agentPhase": "development"
+   },
+   {
+    "id": "qa",
+    "name": "Verify & Ship",
+    "type": "agent",
+    "agentPhase": "verification",
+    "extraAgentPhases": [
+     "review",
+     "ship"
+    ]
+   }
+  ],
+  "reviewGates": [
+   {
+    "afterPhase": "ship",
+    "name": "Merge Approval",
+    "blocking": true,
+    "condition": "always",
+    "onReject": "rework",
+    "reviewerRole": "Code Owner",
+    "assignee": "human:engineer",
+    "maxRounds": 3,
+    "regressionCountsDouble": true,
+    "onCapReached": "escalate"
+   }
+  ],
+  "sdlcFramework": "standard"
+ },
+ "tickets": [
+  {
+   "ticketId": "TEAM-4229",
+   "title": "Sweep: agentcore_hub_requirements_analyst \u2014 Dead Code Sweep \u2014 tycenjmccann/ember \u2014 2026-09-07",
+   "description": "Analyze the request and create tickets for the relevant agents.\n\nTitle: Dead Code Sweep \u2014 tycenjmccann/ember \u2014 2026-09-07\nDescription: Statically detect unused code in tycenjmccann/ember with knip/ts-prune/depcheck, verify each candidate is truly unreferenced (git grep whole repo, rule out reflection/entry-points/public API), remove only verified-dead code, prove build + full test suite still pass, and open a PR into main with a Removal Ledger. Never auto-merge; keep anything uncertain.",
+   "status": "done",
+   "assignee": "agentcore_hub_requirements_analyst",
+   "parentId": "TEAM-4228",
+   "blockedBy": [],
+   "workflowId": "wf_1788780725940_c2uqki",
+   "type": "task",
+   "createdAt": "2026-09-07T04:32:07.637-0700",
+   "updatedAt": "2026-09-07T04:42:08.651-0700"
+  },
+  {
+   "ticketId": "TEAM-4230",
+   "title": "chore(sweep): dead-code sweep of tycenjmccann/ember \u2014 detect, verify, remove, ledger, PR",
+   "description": "You are performing a READ-MOSTLY, SUBTRACTIVE-ONLY dead-code sweep of tycenjmccann/ember (default branch: main). Full requirements: s3 workflows/wf_1788780725940_c2uqki/shared/requirements.md. Delivery is HANDOFF (CD_REGISTERED: false): NEVER merge, never call Pipeline___* tools; the PR stays OPEN for the owning team. Keep anything uncertain.\n\n## Repo facts you must rely on\n- Two workspaces: ROOT (Next.js 14 App Router, TS strict, `@/*` -> `./src/*`, `output: \"standalone\"`) and `mcp/port-session` (own package.json + package-lock.json + tsconfig.json, `type: module`, `bin: port-session-mcp -> dist/index.js`). Root tsconfig.json EXCLUDES `mcp` -> run every tool per-workspace.\n- NO `test` or `lint` script, NO test runner, NO ESLint config, NO knip config, NO `.github/workflows` (only `.github/assets`). Re-confirm this on your checkout and state it in the ledger.\n- External consumers of the API surface \u2014 PUBLIC API, never remove on \"no internal caller\": `mcp/port-session/src/*` calls `/api/ember/sessions/port`, `/api/ember/sessions/`, `/api/ember/config`, `/api/ember/auth`, `/api/auth/cli-config`; `install.sh` / `deploy/**` reference `/api/auth/{login,health,callback}` and `/api/ember/sessions/`.\n- Known FALSE POSITIVES (must land in the ledger's \"Tool false positives\" section, NOT the removal list): `@smithy/node-http-handler` (transitive pkg named in next.config.mjs serverComponentsExternalPackages, not a direct dep); `@aws-crypto/sha256-js`, `@smithy/signature-v4`, `@aws-sdk/credential-provider-node` (all directly imported in `src/app/api/ember/sessions/[id]/shell/route.ts`); `@tailwindcss/typography` (referenced from tailwind.config.js); every Next.js route/page/layout default export, `src/middleware.ts`, and segment-config exports (`export const dynamic` \u2014 27 occurrences \u2014 `maxDuration`, `revalidate`, `runtime`, `generateMetadata`).\n- Protocol/contract types: `src/lib/ember/shell-protocol.ts` is a wire contract with the Python coding-agent-runtime (`deploy/coding-agent-runtime/main.py`, `shell-init.sh`); `src/lib/ember/types.ts` holds shared DTOs. Do NOT trim these on \"unused field/export\" grounds.\n\n## Steps\n1. Create branch `chore/dead-code-sweep-2026-09-07` from main.\n2. DETECTION (R1): for EACH workspace run, via `npx` at pinned versions (record versions): `knip` (with a minimal, documented run-local knip config declaring the Next.js plugin/entry points, both workspaces, next.config.mjs / tailwind.config.js / postcss.config.js as config entries, and config-referenced deps), `ts-prune` (per tsconfig: root, then mcp/port-session), `depcheck` (per package.json). Do NOT add these tools to any package.json. Save raw stdout/stderr per (tool x workspace) as artifacts (`sweep-artifacts/<tool>-<workspace>.txt`).\n3. VERIFICATION (R2): for EVERY candidate run `git grep -n '<symbol>'` across the WHOLE repo (src, mcp, deploy, docs, public, install.sh, Dockerfile, *.md, *.sh, *.py, *.json, *.yml, *.css, .env.example). Record the command, matching lines (or \"no matches\"), and a verdict DEAD or KEEP-UNCERTAIN with a one-line rationale. Treat framework entry points, segment configs, `process.env.*`/dynamic `import()`/string-keyed access, env var names, public API routes, and cross-workspace/cross-language contracts as KEEP.\n4. REMOVAL (R3): delete ONLY DEAD-verdict items with recorded evidence. Remove verified-unused deps ONLY via `npm uninstall <pkg>` in the correct workspace (never hand-edit either lockfile). No refactors, no formatting-only changes, no import reordering unrelated to a removal, no behavior change, no version bumps. All UNCERTAIN items stay in place.\n5. PROOF (R4) \u2014 the \"full test suite\" is this concrete list (no test runner exists): (a) `npx tsc --noEmit -p tsconfig.json`; (b) `npm run build`; (c) `npm run mcp:build`; (d) `cd mcp/port-session && npx tsc --noEmit`; (e) any real test runner ONLY if you discover one (re-confirm none exists and say so); (f) `docker build -t ember-sweep-check .` if a daemon is available, else record \"not run \u2014 <reason>\" and cite the passing `next build`. Run the same commands on `main` as a baseline; the branch must introduce zero new errors. Save all output as artifacts.\n6. LEDGER (R5): write `REMOVAL_LEDGER.md` with table columns `Item | Kind (file/export/dependency) | Detected by | Verification evidence (grep result) | Verdict (REMOVED / KEPT-UNCERTAIN) | Notes`, plus sections \"Kept (uncertain)\" and \"Tool false positives\" (must list at least the items enumerated above), plus the tool versions used. The set of REMOVED rows must equal the set of deletions in the diff.\n7. PR (R6): conventional commits (`chore(sweep): ...`); push the branch; open ONE PR into main whose body contains the full ledger and the exact proof commands with pass/fail results. Leave it OPEN.\n8. If ZERO items are verified-dead, that is a VALID, successful outcome (R7): still open the PR (containing the ledger and, if used, the knip config) with an empty removal list explaining what was checked. Do not force removals.\n9. Upload all artifacts + the ledger to s3 `workflows/wf_1788780725940_c2uqki/shared/sweep-artifacts/`. Report branch, commit SHA, PR URL and artifact keys in report_completion.\n\n## Acceptance criteria\n- Branch exists with conventional commits; exactly one PR open against main; no merge; no Pipeline/CD calls.\n- Every deletion in the diff maps to a REMOVED ledger row with git grep evidence; REMOVED-set == diff deletions.\n- All UNCERTAIN items remain in code and are listed under \"Kept (uncertain)\".\n- \"Tool false positives\" lists at least: @smithy/node-http-handler, the three SigV4 AWS deps, @tailwindcss/typography, Next.js route/segment-config exports.\n- Proof commands (a)-(d) exit 0 with archived output; zero new errors vs main baseline; Docker result recorded.\n- Dependency removals updated the correct lockfile(s) mechanically only; no formatting/refactor churn; no version bumps.\n- PR body contains the ledger and the proof commands + results; artifacts uploaded to the shared S3 path.",
+   "status": "done",
+   "assignee": "agentcore_hub_code_sweeper",
+   "parentId": "TEAM-4228",
+   "blockedBy": [],
+   "workflowId": "wf_1788780725940_c2uqki",
+   "type": "task",
+   "createdAt": "2026-09-07T04:40:33.820-0700",
+   "updatedAt": "2026-09-07T05:12:19.934-0700"
+  },
+  {
+   "ticketId": "TEAM-4231",
+   "title": "Review: adversarially re-verify every removed item in the dead-code sweep PR (tycenjmccann/ember)",
+   "description": "Independently, adversarially review the dead-code sweep PR opened by agentcore_hub_code_sweeper (TEAM-4230) on tycenjmccann/ember (branch `chore/dead-code-sweep-2026-09-07` -> main). Full requirements: s3 workflows/wf_1788780725940_c2uqki/shared/requirements.md. Sweep artifacts + REMOVAL_LEDGER.md: s3 workflows/wf_1788780725940_c2uqki/shared/sweep-artifacts/. Delivery is HANDOFF (CD_REGISTERED: false): NEVER merge, never call Pipeline___* tools. Your evidence is what the owning team reads on the PR \u2014 make it complete.\n\nAssume NOTHING from the sweeper's grep \u2014 REDO it. The core risk of a dead-code sweep is a false-positive deletion (a Next.js entry point, reflective/string-keyed use, or a cross-workspace/cross-language contract the tools could not see).\n\n## Do\n1. Check out the PR branch. For EVERY removed item (file, export, dependency) in the diff and the ledger, run your OWN whole-repo `git grep -n` across src, mcp, deploy, docs, public, install.sh, Dockerfile, *.md, *.sh, *.py, *.json, *.yml, *.css, .env.example and confirm it is genuinely unreferenced.\n2. Hunt specifically for missed ENTRY POINTS / REFLECTION / CONTRACTS: Next.js route/page/layout default exports, `src/middleware.ts`, segment-config exports (`dynamic`, `maxDuration`, `revalidate`, `runtime`, `generateMetadata`); `process.env.*`, dynamic `import()`, string-keyed property access; public API route paths called by `mcp/port-session/src/*` (`/api/ember/sessions/port`, `/api/ember/sessions/`, `/api/ember/config`, `/api/ember/auth`, `/api/auth/cli-config`) and by `install.sh`/`deploy/**` (`/api/auth/{login,health,callback}`, `/api/ember/sessions/`); wire/DTO contracts in `src/lib/ember/shell-protocol.ts` and `src/lib/ember/types.ts` (other end: Python `deploy/coding-agent-runtime/main.py`, `shell-init.sh`). Confirm the SigV4 deps (`@aws-crypto/sha256-js`, `@smithy/signature-v4`, `@aws-sdk/credential-provider-node`, used in `src/app/api/ember/sessions/[id]/shell/route.ts`) and `@tailwindcss/typography` were NOT removed.\n3. LOCKFILE consistency: any removed dependency is gone from the correct package.json AND its lockfile (`package-lock.json` or `mcp/port-session/package-lock.json`) changed mechanically only (no hand edits, no unrelated churn); no version bumps; nothing removed that is still imported anywhere.\n4. LEDGER completeness: REMOVED-set == diff deletions; every tool candidate has a verdict + evidence; \"Kept (uncertain)\" and \"Tool false positives\" sections present and accurate; tool versions recorded.\n5. Confirm no behavior change, no refactor, no formatting-only churn, no new dependencies (knip config, if committed, is minimal and documented).\n6. Confirm the proof commands were run and passed per the PR body: `npx tsc --noEmit -p tsconfig.json`, `npm run build`, `npm run mcp:build`, `cd mcp/port-session && npx tsc --noEmit`. Re-run them yourself if anything looks off.\n7. For ANY wrongly-removed item, missed entry point, lockfile inconsistency, or ledger gap: file a fix ticket (assignee agentcore_hub_code_sweeper, parent TEAM-4228, ticket_type task, spawned_by_kind codex_fix, spawned_by_origin_id = this ticket, phase development, evidence_source static/unit with your grep as evidence_repro, invariant stated). Do NOT fix it yourself.\n8. Post your findings as a PR review (APPROVE or REQUEST_CHANGES) with the per-item re-verification table, and save the evidence file to s3 workflows/wf_1788780725940_c2uqki/shared/review-evidence/.\n\n## Acceptance criteria\n- Every REMOVED item has an independent re-verification result recorded (referenced / not-referenced + grep lines).\n- Any false-positive deletion, entry-point/reflection/contract miss, lockfile inconsistency, or ledger gap is documented and has a corresponding fix ticket assigned to agentcore_hub_code_sweeper.\n- A PR review summarizing PASS / CHANGES-REQUESTED with evidence is posted; evidence uploaded to S3. No merge performed.",
+   "status": "done",
+   "assignee": "agentcore_hub_code_reviewer",
+   "parentId": "TEAM-4228",
+   "blockedBy": [
+    "TEAM-4230"
+   ],
+   "workflowId": "wf_1788780725940_c2uqki",
+   "type": "task",
+   "createdAt": "2026-09-07T04:41:00.703-0700",
+   "updatedAt": "2026-09-07T05:30:54.531-0700"
+  },
+  {
+   "ticketId": "TEAM-4232",
+   "title": "QA: Verify dead-code sweep \u2014 run proof commands, boot app + mcp, capture evidence (tycenjmccann/ember)",
+   "description": "Live-verify the dead-code sweep PR branch `chore/dead-code-sweep-2026-09-07` of tycenjmccann/ember (sweeper ticket TEAM-4230, review TEAM-4231). Full requirements: s3 workflows/wf_1788780725940_c2uqki/shared/requirements.md. Delivery is HANDOFF (CD_REGISTERED: false): NEVER merge, never call Pipeline___* tools. Your evidence is what the owning team reads on the PR.\n\nIMPORTANT: this repo has NO test runner, NO `test`/`lint` scripts, and NO `.github/workflows`. \"Tests\" means the concrete command suite below. Verify at the CURRENT PR head SHA (re-verify if the reviewer's fix tickets changed the branch).\n\n## Do (capture stdout/stderr + exit code of each step to s3 workflows/wf_1788780725940_c2uqki/shared/qa-evidence/)\n1. Fresh clone of the PR branch; record head SHA; `npm ci` at root.\n2. Proof commands \u2014 each must exit 0: (a) `npx tsc --noEmit -p tsconfig.json`; (b) `npm run build`; (c) `npm run mcp:build`; (d) `cd mcp/port-session && npx tsc --noEmit`.\n3. RUNTIME SMOKE: after `npm run build`, start the app (`npm run start`, or `node .next/standalone/server.js` with PORT set) using minimal env from `.env.example` (placeholder values acceptable for boot). Hit `GET /` and `GET /login` \u2014 expect non-5xx (200 or 3xx redirect to login is fine). Hit one API route, `GET /api/auth/health` \u2014 expect non-5xx. Record status codes + response snippets. Any 5xx or boot crash is a FAIL.\n4. Confirm `mcp/port-session/dist/index.js` exists after the mcp build and loads as a node ESM entry without a module-resolution error (e.g. `node --input-type=module -e \"import('./mcp/port-session/dist/index.js')\"` with a short timeout, or `node dist/index.js --help`; a stdio MCP server waiting on stdin is acceptable \u2014 a thrown import error is not).\n5. `docker build -t ember-sweep-check .` if a Docker daemon is available; otherwise record \"not run \u2014 <reason>\" and rely on the passing `next build` (same build step, `output: standalone`).\n6. Cross-check: the diff at head SHA deletes exactly the items listed as REMOVED in REMOVAL_LEDGER.md (no drift); every KEPT-UNCERTAIN item is still present.\n7. If any command fails, any smoke route returns 5xx, or the ledger/diff drift: file a fix ticket (assignee agentcore_hub_code_sweeper, parent TEAM-4228, ticket_type task, spawned_by_kind qa_fix, spawned_by_origin_id = this ticket, phase development, evidence_source live, evidence_repro = the S3 key of the failing log, invariant stated).\n8. Post a QA summary (PASS/FAIL, head SHA, per-command results, smoke status codes, Docker result) as a PR comment and upload it to qa-evidence/. Pass evidence_kind=\"live\" and the evidence_keys in report_completion.\n\n## Acceptance criteria\n- Proof commands (a)-(d) exit 0 with logs in qa-evidence/.\n- `/`, `/login`, `/api/auth/health` return non-5xx with status codes + snippets recorded.\n- `mcp/port-session/dist/index.js` exists and loads.\n- Docker result (built / not-run-because-X) recorded.\n- Ledger REMOVED-set == diff deletions at head SHA.\n- QA summary posted on the PR and uploaded to qa-evidence/. No merge performed.",
+   "status": "done",
+   "assignee": "agentcore_hub_qa_verifier",
+   "parentId": "TEAM-4228",
+   "blockedBy": [
+    "TEAM-4231"
+   ],
+   "workflowId": "wf_1788780725940_c2uqki",
+   "type": "task",
+   "createdAt": "2026-09-07T04:41:22.988-0700",
+   "updatedAt": "2026-09-07T05:55:05.854-0700"
+  },
+  {
+   "ticketId": "TEAM-4233",
+   "title": "CI: Validate build and tests for dead-code sweep on PR head SHA (tycenjmccann/ember)",
+   "description": "Act as CI for the dead-code sweep PR on tycenjmccann/ember (branch `chore/dead-code-sweep-2026-09-07` -> main; sweeper TEAM-4230, review TEAM-4231, QA TEAM-4232). Full requirements: s3 workflows/wf_1788780725940_c2uqki/shared/requirements.md.\n\nDelivery is HANDOFF (CD_REGISTERED: false): the chain ENDS with this ticket. NEVER merge, never call Pipeline___* tools, never deploy. The orchestrator opens/keeps the unified PR OPEN for the owning team; your summary is what they read.\n\nIMPORTANT: this repo has NO `.github/workflows/` (only `.github/assets/`), NO `test`/`lint` scripts, and NO test runner. There is no GitHub Actions or CodeBuild proof to collect. State this explicitly and define CI proof as the runnable command suite below executed at the exact PR head SHA. Set ci_status honestly in report_completion (\"unverified\" if no CodeBuild/GitHub check-run proof exists \u2014 do not claim \"certified\" without a CodeBuild build id; note the locally-executed command suite as the actual evidence).\n\n## Do (against the exact PR HEAD SHA \u2014 record it first)\n1. Fresh clone at the head SHA; `npm ci` at root.\n2. Run and capture (stdout/stderr + exit code): (a) `npx tsc --noEmit -p tsconfig.json`; (b) `npm run build`; (c) `npm run mcp:build`; (d) `cd mcp/port-session && npx tsc --noEmit`. All must exit 0.\n3. Confirm the diff at head SHA matches REMOVAL_LEDGER.md's REMOVED set (no drift since QA TEAM-4232) and that the PR body still contains the ledger + proof results.\n4. Confirm no merge has happened and the PR is OPEN against main.\n5. Produce a CI status summary a human can consume: head SHA, command list, pass/fail per command, the explicit statement that no GitHub Actions workflow exists so this command suite is the achievable CI proof, and a recommendation (advisory only, not implemented) that the owning team add a CI workflow. Post it as a PR comment and upload to s3 workflows/wf_1788780725940_c2uqki/shared/ci-evidence/.\n6. If any command fails or the diff drifted from the ledger: file a fix ticket (assignee agentcore_hub_code_sweeper, parent TEAM-4228, ticket_type task, spawned_by_kind ci_fix, spawned_by_origin_id = this ticket, phase development, evidence_source unit, evidence_repro = the failing command / S3 log key, invariant stated).\n\n## Acceptance criteria\n- CI summary names the exact head SHA and reports pass/fail for each of the four commands (all expected to pass).\n- Summary explicitly states no `.github/workflows` exists and defines the achievable CI proof accordingly.\n- Evidence uploaded to ci-evidence/ and linked in a PR comment.\n- PR left OPEN; no merge, no CD, no Pipeline calls.",
+   "status": "done",
+   "assignee": "agentcore_hub_ci_agent",
+   "parentId": "TEAM-4228",
+   "blockedBy": [
+    "TEAM-4232"
+   ],
+   "workflowId": "wf_1788780725940_c2uqki",
+   "type": "task",
+   "createdAt": "2026-09-07T04:41:41.760-0700",
+   "updatedAt": "2026-09-07T06:17:36.694-0700"
+  },
+  {
+   "ticketId": "TEAM-4241",
+   "title": "Fix (review): REMOVAL_LEDGER.md \u2014 3 findings (2 misattributed citations + PR not landed on integration branch)",
+   "description": "Origin: code review TEAM-4231 of PR #58 (https://github.com/tycenjmccann/ember/pull/58, head feature/TEAM-4230-code-sweeper @ 1b399fb). Review evidence: s3 workflows/wf_1788780725940_c2uqki/shared/review-evidence/TEAM-4231-code-review-PR58.md. Zero false-positive deletions were found (the diff has 0 deletions); all findings are ledger-accuracy / delivery. HANDOFF mode: never merge into main, never call Pipeline___* tools.\n\nF1 \u2014 P2 \u2014 REMOVAL_LEDGER.md:116 \u2014 wrong-file citation for `Cli` (mcp/port-session/src/config.ts:23)\nRow says: \"definition plus mcp/port-session/src/config.ts:393 and mcp/port-session/src/index.ts:450 uses\".\nActual: mcp/port-session/src/index.ts:30-36 imports `type Cli` from \"./cli-adapter.js\"; index.ts:37 imports only `gatherBundle` from \"./config.js\"; index.ts:450 `const cli: Cli = coerceCli(args.cli)` therefore references cli-adapter's Cli, NOT config.ts's. The only real use of config.ts's Cli is config.ts:393 `gatherBundle(cli: Cli)`. Verdict KEPT-USED-IN-MODULE stays correct; fix the citation (drop index.ts:450 or attribute it to cli-adapter.ts). Repro: `git grep -n -w Cli mcp/port-session/src` + `sed -n 25,40p mcp/port-session/src/index.ts`.\n\nF2 \u2014 P2 \u2014 REMOVAL_LEDGER.md:198 (and row :149 Notes) \u2014 `encodeClose` rationale names the wrong protocol peer\nLedger says: \"Kept because shell-protocol.ts is the wire contract with the Python coding-agent-runtime (deploy/coding-agent-runtime/main.py, shell-init.sh)\".\nActual repo evidence: src/lib/ember/shell-protocol.ts:4-6 \u2014 protocol \"Ported from the bedrock_agentcore Python SDK (runtime/shell/protocol.py). Used by the browser terminal to talk to the runtime PTY over the presigned wss:// socket\"; src/app/api/ember/sessions/[id]/shell/route.ts:4-6,141-142 \u2014 browser connects DIRECTLY to `bedrock-agentcore.${REGION}.amazonaws.com/runtimes/${arn}/ws/shells`, the route only presigns; src/components/ember/ShellTerminal.tsx:166-181 \u2014 browser RECEIVES ShellChannel.CLOSE \u2192 setStatus(\"closed\"); `grep -n -iE \"channel|frame|0xff|0xFF|CLOSE\" deploy/coding-agent-runtime/main.py deploy/coding-agent-runtime/shell-init.sh` \u2192 no frame/channel handling; deploy/coding-agent-runtime/requirements.txt \u2192 fastapi, uvicorn, boto3, requests, aws-bedrock-token-generator (no bedrock_agentcore SDK). The peer is the Bedrock AgentCore runtime /ws/shells service (protocol owned by the bedrock_agentcore SDK). KEEP-UNCERTAIN remains the right verdict \u2014 arguably stronger, since the peer is an external service protocol the repo cannot inspect \u2014 but the ledger explicitly asks the owning team to decide on encodeClose from this rationale, so it must cite the real peer and drop the main.py/shell-init.sh attribution (or state that those files were grepped and contain no frame handling). Also correct the same \"Python runtime\" wording in the DecodedFrame/KEPT-CONTRACT notes if present.\n\nF3 \u2014 P2 \u2014 PR #58 not landed on the run's integration branch\nfeature/TEAM-4228-dead-code-sweep-tycenjmccann-ember-2026 is still f754cd3 == main. In HANDOFF mode the orchestrator opens the unified PR to main FROM the integration branch; if #58 never lands there the unified PR is empty and the ledger + knip.jsonc never reach the owning team. After F1/F2 are committed (conventional commit `chore(sweep): ...`, push to feature/TEAM-4230-code-sweeper, and mirror the corrected REMOVAL_LEDGER.md into the PR body AND to s3 workflows/wf_1788780725940_c2uqki/shared/sweep-artifacts/REMOVAL_LEDGER.md), land #58 on the integration branch ONLY \u2014 never on main. If the harness performs that merge automatically on review/QA PASS, say so on this ticket and skip the manual step.\n\nAcceptance: ledger row :116 cites only config.ts:393 (or correctly attributes index.ts:450 to cli-adapter.ts's Cli); :198 names the AgentCore /ws/shells + bedrock_agentcore SDK protocol as the peer with the grep evidence above; no other ledger rows, no source, no package.json/lockfile touched; proof commands still exit 0; PR body and S3 ledger updated to match the committed file.",
+   "status": "done",
+   "assignee": "agentcore_hub_code_sweeper",
+   "parentId": "TEAM-4228",
+   "blockedBy": [],
+   "workflowId": "wf_1788780725940_c2uqki",
+   "type": "task",
+   "createdAt": "2026-09-07T05:30:13.003-0700",
+   "updatedAt": "2026-09-07T05:54:39.001-0700"
+  },
+  {
+   "ticketId": "TEAM-4242",
+   "title": "Fix (QA): REMOVAL_LEDGER.md:205 \u2014 `dynamic \u00d727` is a count mislabel; actual is `dynamic \u00d721` + `maxDuration \u00d76`",
+   "description": "QA TEAM-4232 live-verified PR #58 (feature/TEAM-4230-code-sweeper @ 1b399fb50e4a6e43e775d76b160dea750ec50e9d). All proof commands exit 0, runtime smoke non-5xx, mcp entry loads on Node 22, REMOVED-set == diff deletions (both empty). ONE ledger-accuracy finding remains:\n\n## Finding\n`REMOVAL_LEDGER.md:205` (\"## Tool false positives\" section) states the ts-prune-flagged segment-config exports are \"(`dynamic` \u00d727, `maxDuration`, `metadata`, `viewport`)\".\n\nActual repo count at head 1b399fb:\n```\n$ git grep -c 'export const dynamic' -- src | wc -l\n21      # 20 API route.ts files + src/app/login/page.tsx\n```\nReproducing the ledger's own pinned tool run (`npx -y ts-prune@0.10.3`, root, with `.next/types` absent \u2014 the ledger's condition) yields exactly the ledger's headline \"94 emitted candidates, exit 0\", and within that output: `dynamic` = 21, `maxDuration` = 6. So \"\u00d727\" is 21 + 6 summed and mislabeled as the `dynamic` count, while `maxDuration` is ALSO listed separately on the same line. (requirements.md carried the same erroneous \"27\" figure; the ledger repeated it rather than verifying it.)\n\nEvidence: s3 workflows/wf_1788780725940_c2uqki/shared/qa-evidence/TEAM-4232-06-ledger-diff-crosscheck.txt\n\n## Fix\nEdit REMOVAL_LEDGER.md:205 (and the mirrored PR #58 body) so the false-positives line reads `dynamic` \u00d721, `maxDuration` \u00d76 (plus `metadata`, `viewport`). Ledger-text-only change; touch NO source, config, manifest, or lockfile. Commit as `chore(sweep): \u2026` on the same PR #58 branch.\n\n## Coordination\nSame file and same assignee as TEAM-4241 (reviewer fix: F1 Cli citation, F2 encodeClose peer, F3 land on integration branch). This ticket is blocked_by TEAM-4241 so the two edits to REMOVAL_LEDGER.md land serially \u2014 preferably fold this into the same commit/PR update as TEAM-4241 and close both. Never merge to main; never call Pipeline tools (HANDOFF).\n\n## Acceptance\n- `grep -n 'dynamic' REMOVAL_LEDGER.md` at the \"Tool false positives\" line shows \u00d721 and a separate `maxDuration` \u00d76.\n- `git grep -c 'export const dynamic' -- src | wc -l` == 21 still holds (no code touched).\n- `git diff <base>...HEAD --numstat` still shows only REMOVAL_LEDGER.md and knip.jsonc; 0 deletions outside those two files.\n- QA re-verify at the new PR head (proof commands a-d, smoke, ledger==diff) passes.",
+   "status": "done",
+   "assignee": "agentcore_hub_code_sweeper",
+   "parentId": "TEAM-4228",
+   "blockedBy": [
+    "TEAM-4241"
+   ],
+   "workflowId": "wf_1788780725940_c2uqki",
+   "type": "task",
+   "createdAt": "2026-09-07T05:53:27.743-0700",
+   "updatedAt": "2026-09-07T06:01:10.072-0700"
+  },
+  {
+   "ticketId": "TEAM-4228",
+   "title": "Dead Code Sweep \u2014 tycenjmccann/ember \u2014 2026-09-07",
+   "description": "Statically detect unused code in tycenjmccann/ember with knip/ts-prune/depcheck, verify each candidate is truly unreferenced (git grep whole repo, rule out reflection/entry-points/public API), remove only verified-dead code, prove build + full test suite still pass, and open a PR into main with a Removal Ledger. Never auto-merge; keep anything uncertain.",
+   "status": "done",
+   "blockedBy": [],
+   "type": "epic",
+   "createdAt": "2026-09-07T04:32:06.374-0700",
+   "updatedAt": "2026-09-07T06:17:42.204-0700"
+  }
+ ],
+ "events": [
+  {
+   "detail": {
+    "workflowId": "wf_1788780725940_c2uqki",
+    "ticketId": "TEAM-4229",
+    "ticket": {
+     "type": "task",
+     "id": "TEAM-4229",
+     "assignee": "agentcore_hub_requirements_analyst",
+     "updatedAt": "2026-09-07T11:32:09.033Z",
+     "parent": "TEAM-4228",
+     "title": "Sweep: agentcore_hub_requirements_analyst \u2014 Dead Code Sweep \u2014 tycenjmccann/ember \u2014 2026-09-07",
+     "status": "todo"
+    },
+    "timestamp": "2026-09-07T11:32:09.033Z"
+   },
+   "workflowId": "wf_1788780725940_c2uqki",
+   "source": "agentcore-hub.orchestrator",
+   "type": "ticket.created",
+   "timestamp": "2026-09-07T11:32:09.033Z",
+   "eventId": "0mtr5v05o-0000"
+  },
+  {
+   "workflowId": "wf_1788780725940_c2uqki",
+   "detail": {
+    "agentId": "agentcore_hub_requirements_analyst",
+    "timestamp": "2026-09-07T11:32:11.569Z",
+    "ticketId": "TEAM-4229",
+    "assignee": "agentcore_hub_requirements_analyst",
+    "phase": "requirements",
+    "workflowId": "wf_1788780725940_c2uqki"
+   },
+   "source": "agentcore-hub.orchestrator",
+   "type": "agent.invoked",
+   "timestamp": "2026-09-07T11:32:11.569Z",
+   "eventId": "0mtr5v21v-0000"
+  },
+  {
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788780725940_c2uqki",
+   "detail": {
+    "ticketId": "TEAM-4229",
+    "agentId": "agentcore_hub_requirements_analyst",
+    "sessionId": "TEAM-4229_wf_1788780725940_c2uqki-agentcore_hub_requirements_analyst-1788780731614",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:838829463875:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "timestamp": "2026-09-07T11:32:11.667Z",
+    "workflowId": "wf_1788780725940_c2uqki"
+   },
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-07T11:32:11.667Z",
+   "eventId": "0mtr5v24m-0000"
+  },
+  {
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "TEAM-4229",
+   "detail": {
+    "agentId": "agentcore_hub_requirements_analyst",
+    "assignee": "agentcore_hub_requirements_analyst",
+    "ticketId": "TEAM-4229",
+    "timestamp": "2026-09-07T11:32:12.196Z"
+   },
+   "type": "agent.started",
+   "timestamp": "2026-09-07T11:32:12.196Z",
+   "eventId": "0mtr5v2m3-0000",
+   "_pkNote": "ticket-keyed"
+  },
+  {
+   "workflowId": "wf_1788780725940_c2uqki",
+   "detail": {
+    "agentId": "agentcore_hub_requirements_analyst",
+    "timestamp": "2026-09-07T11:32:16Z",
+    "workflowId": "wf_1788780725940_c2uqki"
+   },
+   "timestamp": "2026-09-07T11:32:16Z",
+   "type": "agent.started",
+   "eventId": "1788780736407-trxq"
+  },
+  {
+   "workflowId": "wf_1788780725940_c2uqki",
+   "detail": {
+    "timestamp": "2026-09-07T11:40:35.583Z",
+    "ticket": {
+     "title": "chore(sweep): dead-code sweep of tycenjmccann/ember \u2014 detect, verify, remove, ledger, PR",
+     "type": "task",
+     "updatedAt": "2026-09-07T11:40:35.582Z",
+     "id": "TEAM-4230",
+     "parent": "TEAM-4228",
+     "status": "ready",
+     "assignee": "agentcore_hub_code_sweeper"
+    },
+    "ticketId": "TEAM-4230",
+    "workflowId": "wf_1788780725940_c2uqki"
+   },
+   "source": "agentcore-hub.orchestrator",
+   "timestamp": "2026-09-07T11:40:35.583Z",
+   "type": "ticket.created",
+   "eventId": "0mtr65vlp-0000"
+  },
+  {
+   "detail": {
+    "agentId": "agentcore_hub_code_sweeper",
+    "phase": "development",
+    "assignee": "agentcore_hub_code_sweeper",
+    "ticketId": "TEAM-4230",
+    "workflowId": "wf_1788780725940_c2uqki",
+    "timestamp": "2026-09-07T11:40:37.834Z"
+   },
+   "workflowId": "wf_1788780725940_c2uqki",
+   "source": "agentcore-hub.orchestrator",
+   "type": "agent.invoked",
+   "timestamp": "2026-09-07T11:40:37.834Z",
+   "eventId": "0mtr65wq5-0000"
+  },
+  {
+   "workflowId": "wf_1788780725940_c2uqki",
+   "source": "agentcore-hub.orchestrator",
+   "detail": {
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:838829463875:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "timestamp": "2026-09-07T11:40:37.997Z",
+    "workflowId": "wf_1788780725940_c2uqki",
+    "agentId": "agentcore_hub_code_sweeper",
+    "sessionId": "TEAM-4230_wf_1788780725940_c2uqki-agentcore_hub_code_sweeper-1788781237898",
+    "ticketId": "TEAM-4230"
+   },
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-07T11:40:37.997Z",
+   "eventId": "0mtr65wtz-0000"
+  },
+  {
+   "source": "agentcore-hub.orchestrator",
+   "detail": {
+    "assignee": "agentcore_hub_code_sweeper",
+    "timestamp": "2026-09-07T11:40:38.399Z",
+    "ticketId": "TEAM-4230",
+    "agentId": "agentcore_hub_code_sweeper"
+   },
+   "workflowId": "TEAM-4230",
+   "timestamp": "2026-09-07T11:40:38.399Z",
+   "type": "agent.started",
+   "eventId": "0mtr65x5b-0000",
+   "_pkNote": "ticket-keyed"
+  },
+  {
+   "workflowId": "wf_1788780725940_c2uqki",
+   "detail": {
+    "timestamp": "2026-09-07T11:40:40Z",
+    "workflowId": "wf_1788780725940_c2uqki",
+    "agentId": "agentcore_hub_code_sweeper"
+   },
+   "type": "agent.started",
+   "timestamp": "2026-09-07T11:40:40Z",
+   "eventId": "1788781240943-smza"
+  },
+  {
+   "workflowId": "wf_1788780725940_c2uqki",
+   "detail": {
+    "timestamp": "2026-09-07T11:41:02.311Z",
+    "workflowId": "wf_1788780725940_c2uqki",
+    "ticketId": "TEAM-4231",
+    "ticket": {
+     "parent": "TEAM-4228",
+     "id": "TEAM-4231",
+     "status": "todo",
+     "type": "task",
+     "title": "Review: adversarially re-verify every removed item in the dead-code sweep PR (tycenjmccann/ember)",
+     "assignee": "agentcore_hub_code_reviewer",
+     "updatedAt": "2026-09-07T11:41:02.311Z"
+    }
+   },
+   "source": "agentcore-hub.orchestrator",
+   "type": "ticket.created",
+   "timestamp": "2026-09-07T11:41:02.311Z",
+   "eventId": "0mtr66fmd-0000"
+  },
+  {
+   "detail": {
+    "timestamp": "2026-09-07T11:41:24.641Z",
+    "workflowId": "wf_1788780725940_c2uqki",
+    "ticket": {
+     "id": "TEAM-4232",
+     "assignee": "agentcore_hub_qa_verifier",
+     "type": "task",
+     "status": "todo",
+     "updatedAt": "2026-09-07T11:41:24.641Z",
+     "title": "QA: Verify dead-code sweep \u2014 run proof commands, boot app + mcp, capture evidence (tycenjmccann/ember)",
+     "parent": "TEAM-4228"
+    },
+    "ticketId": "TEAM-4232"
+   },
+   "workflowId": "wf_1788780725940_c2uqki",
+   "source": "agentcore-hub.orchestrator",
+   "type": "ticket.created",
+   "timestamp": "2026-09-07T11:41:24.641Z",
+   "eventId": "0mtr66wyq-0000"
+  },
+  {
+   "detail": {
+    "ticketId": "TEAM-4233",
+    "ticket": {
+     "id": "TEAM-4233",
+     "title": "CI: Validate build and tests for dead-code sweep on PR head SHA (tycenjmccann/ember)",
+     "assignee": "agentcore_hub_ci_agent",
+     "type": "task",
+     "status": "todo",
+     "parent": "TEAM-4228",
+     "updatedAt": "2026-09-07T11:41:43.249Z"
+    },
+    "timestamp": "2026-09-07T11:41:43.250Z",
+    "workflowId": "wf_1788780725940_c2uqki"
+   },
+   "workflowId": "wf_1788780725940_c2uqki",
+   "source": "agentcore-hub.orchestrator",
+   "timestamp": "2026-09-07T11:41:43.250Z",
+   "type": "ticket.created",
+   "eventId": "0mtr67b6o-0000"
+  },
+  {
+   "detail": {
+    "summary": "Requirements analysis complete for Dead Code Sweep \u2014 tycenjmccann/ember (feature flow; not bug-fix, not playbook, no ported session).\n\n**Scope:** MODIFY EXISTING \u2014 pure subtractive change; no design w",
+    "agentId": "agentcore_hub_requirements_analyst",
+    "branch": null,
+    "pr_url": null,
+    "ticketId": "TEAM-4229"
+   },
+   "workflowId": "wf_1788780725940_c2uqki",
+   "timestamp": "2026-09-07T11:42:08.118Z",
+   "type": "workflow.report_completion",
+   "eventId": "1788781328118-7sqn"
+  },
+  {
+   "detail": {
+    "assignee": "agentcore_hub_requirements_analyst",
+    "ticketId": "TEAM-4229",
+    "agentId": "agentcore_hub_requirements_analyst",
+    "unblocked": [],
+    "workflowId": "wf_1788780725940_c2uqki",
+    "timestamp": "2026-09-07T11:42:10.105Z"
+   },
+   "workflowId": "wf_1788780725940_c2uqki",
+   "source": "agentcore-hub.orchestrator",
+   "type": "agent.complete",
+   "timestamp": "2026-09-07T11:42:10.105Z",
+   "eventId": "0mtr67vx7-0000"
+  },
+  {
+   "detail": {
+    "summary": "Dead-code sweep of tycenjmccann/ember \u2014 OUTCOME: ZERO verified-dead removals (valid terminal state per R7). PR #58 opened and left OPEN (handoff; never merged; no Pipeline/CD calls).\n\nWHAT ACTUALLY RA",
+    "ticketId": "TEAM-4230",
+    "branch": "feature/TEAM-4230-code-sweeper",
+    "pr_url": "https://github.com/tycenjmccann/ember/pull/58",
+    "agentId": "agentcore_hub_code_sweeper"
+   },
+   "workflowId": "wf_1788780725940_c2uqki",
+   "timestamp": "2026-09-07T12:12:19.370Z",
+   "type": "workflow.report_completion",
+   "eventId": "1788783139370-awez"
+  },
+  {
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788780725940_c2uqki",
+   "detail": {
+    "workflowId": "wf_1788780725940_c2uqki",
+    "ticketId": "TEAM-4231",
+    "assignee": "agentcore_hub_code_reviewer",
+    "phase": "review",
+    "timestamp": "2026-09-07T12:12:23.804Z",
+    "agentId": "agentcore_hub_code_reviewer"
+   },
+   "timestamp": "2026-09-07T12:12:23.804Z",
+   "type": "agent.invoked",
+   "eventId": "0mtr7arkd-0000"
+  },
+  {
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788780725940_c2uqki",
+   "detail": {
+    "ticketId": "TEAM-4231",
+    "sessionId": "TEAM-4231_wf_1788780725940_c2uqki-agentcore_hub_code_reviewer-1788783143904",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:838829463875:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "timestamp": "2026-09-07T12:12:24.017Z",
+    "agentId": "agentcore_hub_code_reviewer",
+    "workflowId": "wf_1788780725940_c2uqki"
+   },
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-07T12:12:24.017Z",
+   "eventId": "0mtr7as23-0000"
+  },
+  {
+   "detail": {
+    "timestamp": "2026-09-07T12:12:24.113Z",
+    "ticketId": "TEAM-4231",
+    "workflowId": "wf_1788780725940_c2uqki",
+    "unblockedBy": "TEAM-4230"
+   },
+   "workflowId": "wf_1788780725940_c2uqki",
+   "source": "agentcore-hub.orchestrator",
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-09-07T12:12:24.113Z",
+   "eventId": "0mtr7as3l-0000"
+  },
+  {
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788780725940_c2uqki",
+   "detail": {
+    "ticketId": "TEAM-4230",
+    "agentId": "agentcore_hub_code_sweeper",
+    "unblocked": [
+     "TEAM-4231"
+    ],
+    "timestamp": "2026-09-07T12:12:24.144Z",
+    "assignee": "agentcore_hub_code_sweeper",
+    "workflowId": "wf_1788780725940_c2uqki"
+   },
+   "type": "agent.complete",
+   "timestamp": "2026-09-07T12:12:24.144Z",
+   "eventId": "0mtr7arpx-0000"
+  },
+  {
+   "workflowId": "wf_1788780725940_c2uqki",
+   "detail": {
+    "workflowId": "wf_1788780725940_c2uqki",
+    "timestamp": "2026-09-07T12:12:26Z",
+    "agentId": "agentcore_hub_code_reviewer"
+   },
+   "timestamp": "2026-09-07T12:12:26Z",
+   "type": "agent.started",
+   "eventId": "1788783146934-frlk"
+  },
+  {
+   "workflowId": "TEAM-4231",
+   "source": "agentcore-hub.orchestrator",
+   "detail": {
+    "ticketId": "TEAM-4231",
+    "assignee": "agentcore_hub_code_reviewer",
+    "timestamp": "2026-09-07T12:13:39.064Z",
+    "agentId": "agentcore_hub_code_reviewer"
+   },
+   "type": "agent.started",
+   "timestamp": "2026-09-07T12:13:39.064Z",
+   "eventId": "0mtr7cdgp-0000",
+   "_pkNote": "ticket-keyed"
+  },
+  {
+   "detail": {
+    "ticketId": "TEAM-4241",
+    "workflowId": "wf_1788780725940_c2uqki",
+    "timestamp": "2026-09-07T12:30:14.821Z",
+    "ticket": {
+     "assignee": "agentcore_hub_code_sweeper",
+     "parent": "TEAM-4228",
+     "id": "TEAM-4241",
+     "type": "task",
+     "updatedAt": "2026-09-07T12:30:14.821Z",
+     "status": "ready",
+     "title": "Fix (review): REMOVAL_LEDGER.md \u2014 3 findings (2 misattributed citations + PR not landed on integration branch)"
+    }
+   },
+   "workflowId": "wf_1788780725940_c2uqki",
+   "source": "agentcore-hub.orchestrator",
+   "timestamp": "2026-09-07T12:30:14.821Z",
+   "type": "ticket.created",
+   "eventId": "0mtr7xqbk-0000"
+  },
+  {
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788780725940_c2uqki",
+   "detail": {
+    "timestamp": "2026-09-07T12:30:16.365Z",
+    "assignee": "agentcore_hub_code_sweeper",
+    "workflowId": "wf_1788780725940_c2uqki",
+    "agentId": "agentcore_hub_code_sweeper",
+    "phase": "development",
+    "ticketId": "TEAM-4241"
+   },
+   "type": "agent.invoked",
+   "timestamp": "2026-09-07T12:30:16.365Z",
+   "eventId": "0mtr7xrcs-0000"
+  },
+  {
+   "workflowId": "wf_1788780725940_c2uqki",
+   "detail": {
+    "timestamp": "2026-09-07T12:30:16.489Z",
+    "agentId": "agentcore_hub_code_sweeper",
+    "ticketId": "TEAM-4241",
+    "sessionId": "TEAM-4241_wf_1788780725940_c2uqki-agentcore_hub_code_sweeper-1788784216455",
+    "workflowId": "wf_1788780725940_c2uqki",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:838829463875:runtime/agentcore_hub_agent-ITPP0eBToO"
+   },
+   "source": "agentcore-hub.orchestrator",
+   "timestamp": "2026-09-07T12:30:16.489Z",
+   "type": "orchestrator.agent_invoked",
+   "eventId": "0mtr7xr2o-0000"
+  },
+  {
+   "detail": {
+    "assignee": "agentcore_hub_code_sweeper",
+    "agentId": "agentcore_hub_code_sweeper",
+    "ticketId": "TEAM-4241",
+    "timestamp": "2026-09-07T12:30:16.859Z"
+   },
+   "workflowId": "TEAM-4241",
+   "source": "agentcore-hub.orchestrator",
+   "timestamp": "2026-09-07T12:30:16.859Z",
+   "type": "agent.started",
+   "eventId": "0mtr7xrbm-0000",
+   "_pkNote": "ticket-keyed"
+  },
+  {
+   "workflowId": "wf_1788780725940_c2uqki",
+   "detail": {
+    "agentId": "agentcore_hub_code_sweeper",
+    "workflowId": "wf_1788780725940_c2uqki",
+    "timestamp": "2026-09-07T12:30:19Z"
+   },
+   "type": "agent.started",
+   "timestamp": "2026-09-07T12:30:19Z",
+   "eventId": "1788784219596-szqs"
+  },
+  {
+   "workflowId": "wf_1788780725940_c2uqki",
+   "detail": {
+    "agentId": "agentcore_hub_code_reviewer",
+    "pr_url": "https://github.com/tycenjmccann/ember/pull/58",
+    "summary": "VERDICT: CHANGES NEEDED (ledger-accuracy findings only; ZERO false-positive deletions). Fix ticket TEAM-4241 \u2192 agentcore_hub_code_sweeper.\n\nReviewed PR #58 (feature/TEAM-4230-code-sweeper @ 1b399fb \u2192 ",
+    "branch": "feature/TEAM-4230-code-sweeper",
+    "ticketId": "TEAM-4231"
+   },
+   "timestamp": "2026-09-07T12:30:53.779Z",
+   "type": "workflow.report_completion",
+   "eventId": "1788784253778-m0os"
+  },
+  {
+   "source": "agentcore-hub.orchestrator",
+   "detail": {
+    "ticketId": "TEAM-4232",
+    "workflowId": "wf_1788780725940_c2uqki",
+    "timestamp": "2026-09-07T12:30:57.829Z",
+    "phase": "verification"
+   },
+   "workflowId": "wf_1788780725940_c2uqki",
+   "timestamp": "2026-09-07T12:30:57.829Z",
+   "type": "workflow.phase_change",
+   "eventId": "0mtr7ymy8-0000"
+  },
+  {
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788780725940_c2uqki",
+   "detail": {
+    "timestamp": "2026-09-07T12:30:58.152Z",
+    "phase": "verification",
+    "agentId": "agentcore_hub_qa_verifier",
+    "workflowId": "wf_1788780725940_c2uqki",
+    "ticketId": "TEAM-4232",
+    "assignee": "agentcore_hub_qa_verifier"
+   },
+   "timestamp": "2026-09-07T12:30:58.152Z",
+   "type": "agent.invoked",
+   "eventId": "0mtr7yn72-0000"
+  },
+  {
+   "detail": {
+    "timestamp": "2026-09-07T12:30:58.197Z",
+    "sessionId": "TEAM-4232_wf_1788780725940_c2uqki-agentcore_hub_qa_verifier-1788784258171",
+    "agentId": "agentcore_hub_qa_verifier",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:838829463875:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "ticketId": "TEAM-4232",
+    "workflowId": "wf_1788780725940_c2uqki"
+   },
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788780725940_c2uqki",
+   "timestamp": "2026-09-07T12:30:58.197Z",
+   "type": "orchestrator.agent_invoked",
+   "eventId": "0mtr7yndg-0000"
+  },
+  {
+   "detail": {
+    "workflowId": "wf_1788780725940_c2uqki",
+    "ticketId": "TEAM-4232",
+    "timestamp": "2026-09-07T12:30:58.283Z",
+    "unblockedBy": "TEAM-4231"
+   },
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788780725940_c2uqki",
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-09-07T12:30:58.283Z",
+   "eventId": "0mtr7ynao-0000"
+  },
+  {
+   "workflowId": "wf_1788780725940_c2uqki",
+   "detail": {
+    "ticketId": "TEAM-4231",
+    "assignee": "agentcore_hub_code_reviewer",
+    "workflowId": "wf_1788780725940_c2uqki",
+    "timestamp": "2026-09-07T12:30:58.315Z",
+    "unblocked": [
+     "TEAM-4232"
+    ],
+    "agentId": "agentcore_hub_code_reviewer"
+   },
+   "source": "agentcore-hub.orchestrator",
+   "timestamp": "2026-09-07T12:30:58.315Z",
+   "type": "agent.complete",
+   "eventId": "0mtr7yndh-0000"
+  },
+  {
+   "detail": {
+    "ticketId": "TEAM-4232",
+    "timestamp": "2026-09-07T12:30:59.121Z",
+    "agentId": "agentcore_hub_qa_verifier",
+    "assignee": "agentcore_hub_qa_verifier"
+   },
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "TEAM-4232",
+   "timestamp": "2026-09-07T12:30:59.121Z",
+   "type": "agent.started",
+   "eventId": "0mtr7ynyl-0000",
+   "_pkNote": "ticket-keyed"
+  },
+  {
+   "workflowId": "wf_1788780725940_c2uqki",
+   "detail": {
+    "workflowId": "wf_1788780725940_c2uqki",
+    "timestamp": "2026-09-07T12:31:01Z",
+    "agentId": "agentcore_hub_qa_verifier"
+   },
+   "type": "agent.started",
+   "timestamp": "2026-09-07T12:31:01Z",
+   "eventId": "1788784261205-jafd"
+  },
+  {
+   "workflowId": "wf_1788780725940_c2uqki",
+   "detail": {
+    "agentId": "agentcore_hub_code_sweeper",
+    "branch": "feature/TEAM-4230-code-sweeper",
+    "pr_url": "https://github.com/tycenjmccann/ember/pull/58",
+    "ticketId": "TEAM-4241",
+    "summary": "Fix ticket for review TEAM-4231 (PR #58) \u2014 all 3 findings resolved; ledger-only change, zero code removed or touched.\n\nWHAT I RAN (codex, resumed session; all tool calls succeeded):\n- Re-derived F1/F2"
+   },
+   "type": "workflow.report_completion",
+   "timestamp": "2026-09-07T12:44:23.902Z",
+   "eventId": "1788785063901-ckmj"
+  },
+  {
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788780725940_c2uqki",
+   "detail": {
+    "agentId": "agentcore_hub_code_sweeper",
+    "assignee": "agentcore_hub_code_sweeper",
+    "unblocked": [],
+    "ticketId": "TEAM-4241",
+    "workflowId": "wf_1788780725940_c2uqki",
+    "timestamp": "2026-09-07T12:44:26.060Z"
+   },
+   "timestamp": "2026-09-07T12:44:26.060Z",
+   "type": "agent.complete",
+   "eventId": "0mtr8fz3v-0000"
+  },
+  {
+   "detail": {
+    "ticket": {
+     "id": "TEAM-4242",
+     "updatedAt": "2026-09-07T12:53:29.404Z",
+     "type": "task",
+     "status": "todo",
+     "title": "Fix (QA): REMOVAL_LEDGER.md:205 \u2014 `dynamic \u00d727` is a count mislabel; actual is `dynamic \u00d721` + `maxDuration \u00d76`",
+     "assignee": "agentcore_hub_code_sweeper",
+     "parent": "TEAM-4228"
+    },
+    "timestamp": "2026-09-07T12:53:29.404Z",
+    "workflowId": "wf_1788780725940_c2uqki",
+    "ticketId": "TEAM-4242"
+   },
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788780725940_c2uqki",
+   "timestamp": "2026-09-07T12:53:29.404Z",
+   "type": "ticket.created",
+   "eventId": "0mtr8rmdj-0000"
+  },
+  {
+   "workflowId": "wf_1788780725940_c2uqki",
+   "detail": {
+    "agentId": "agentcore_hub_code_sweeper",
+    "ticketId": "TEAM-4242",
+    "workflowId": "wf_1788780725940_c2uqki",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:838829463875:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "timestamp": "2026-09-07T12:54:11.435Z",
+    "sessionId": "TEAM-4242_wf_1788780725940_c2uqki-agentcore_hub_code_sweeper-1788785651325"
+   },
+   "source": "agentcore-hub.orchestrator",
+   "timestamp": "2026-09-07T12:54:11.435Z",
+   "type": "orchestrator.agent_invoked",
+   "eventId": "0mtr8siek-0000"
+  },
+  {
+   "detail": {
+    "timestamp": "2026-09-07T12:54:15Z",
+    "agentId": "agentcore_hub_code_sweeper",
+    "workflowId": "wf_1788780725940_c2uqki"
+   },
+   "workflowId": "wf_1788780725940_c2uqki",
+   "timestamp": "2026-09-07T12:54:15Z",
+   "type": "agent.started",
+   "eventId": "1788785656002-srng"
+  },
+  {
+   "detail": {
+    "pr_url": "https://github.com/tycenjmccann/ember/pull/58",
+    "agentId": "agentcore_hub_qa_verifier",
+    "ticketId": "TEAM-4232",
+    "branch": "feature/TEAM-4230-code-sweeper",
+    "summary": "**Verdict: FAIL (ledger-accuracy only \u2192 fix ticket TEAM-4242). All build, runtime-smoke, mcp-entry, and ledger==diff checks PASSED at PR #58 head 1b399fb50e4a6e43e775d76b160dea750ec50e9d.** HANDOFF: n"
+   },
+   "workflowId": "wf_1788780725940_c2uqki",
+   "type": "workflow.report_completion",
+   "timestamp": "2026-09-07T12:55:05.238Z",
+   "eventId": "1788785705238-ydlw"
+  },
+  {
+   "detail": {
+    "timestamp": "2026-09-07T12:55:09.187Z",
+    "agentId": "agentcore_hub_ci_agent",
+    "ticketId": "TEAM-4233",
+    "assignee": "agentcore_hub_ci_agent",
+    "phase": "review",
+    "workflowId": "wf_1788780725940_c2uqki"
+   },
+   "workflowId": "wf_1788780725940_c2uqki",
+   "source": "agentcore-hub.orchestrator",
+   "timestamp": "2026-09-07T12:55:09.187Z",
+   "type": "agent.invoked",
+   "eventId": "0mtr8tr04-0000"
+  },
+  {
+   "workflowId": "wf_1788780725940_c2uqki",
+   "source": "agentcore-hub.orchestrator",
+   "detail": {
+    "ticketId": "TEAM-4233",
+    "workflowId": "wf_1788780725940_c2uqki",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:838829463875:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "agentId": "agentcore_hub_ci_agent",
+    "timestamp": "2026-09-07T12:55:09.291Z",
+    "sessionId": "TEAM-4233_wf_1788780725940_c2uqki-agentcore_hub_ci_agent-1788785709259"
+   },
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-07T12:55:09.291Z",
+   "eventId": "0mtr8trej-0000"
+  },
+  {
+   "source": "agentcore-hub.orchestrator",
+   "detail": {
+    "timestamp": "2026-09-07T12:55:09.390Z",
+    "workflowId": "wf_1788780725940_c2uqki",
+    "ticketId": "TEAM-4233",
+    "unblockedBy": "TEAM-4232"
+   },
+   "workflowId": "wf_1788780725940_c2uqki",
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-09-07T12:55:09.390Z",
+   "eventId": "0mtr8trh8-0000"
+  },
+  {
+   "workflowId": "wf_1788780725940_c2uqki",
+   "source": "agentcore-hub.orchestrator",
+   "detail": {
+    "agentId": "agentcore_hub_qa_verifier",
+    "unblocked": [
+     "TEAM-4233"
+    ],
+    "assignee": "agentcore_hub_qa_verifier",
+    "ticketId": "TEAM-4232",
+    "workflowId": "wf_1788780725940_c2uqki",
+    "timestamp": "2026-09-07T12:55:09.422Z"
+   },
+   "timestamp": "2026-09-07T12:55:09.422Z",
+   "type": "agent.complete",
+   "eventId": "0mtr8trds-0000"
+  },
+  {
+   "source": "agentcore-hub.orchestrator",
+   "detail": {
+    "agentId": "agentcore_hub_ci_agent",
+    "timestamp": "2026-09-07T12:55:10.312Z",
+    "assignee": "agentcore_hub_ci_agent",
+    "ticketId": "TEAM-4233"
+   },
+   "workflowId": "TEAM-4233",
+   "timestamp": "2026-09-07T12:55:10.312Z",
+   "type": "agent.started",
+   "eventId": "0mtr8tru4-0000",
+   "_pkNote": "ticket-keyed"
+  },
+  {
+   "workflowId": "wf_1788780725940_c2uqki",
+   "detail": {
+    "agentId": "agentcore_hub_ci_agent",
+    "workflowId": "wf_1788780725940_c2uqki",
+    "timestamp": "2026-09-07T12:55:14Z"
+   },
+   "timestamp": "2026-09-07T12:55:14Z",
+   "type": "agent.started",
+   "eventId": "1788785714582-nmmk"
+  },
+  {
+   "workflowId": "wf_1788780725940_c2uqki",
+   "detail": {
+    "ticketId": "TEAM-4242",
+    "summary": "FIXED TEAM-4242 (QA TEAM-4232 ledger-count finding). Ledger-text-only change.\n\nWhat changed: REMOVAL_LEDGER.md:205 (\"Tool false positives\") \u2014 one line, +1/\u22121: `dynamic` \u00d727 \u2192 `dynamic` \u00d721, `maxDurati",
+    "branch": "feature/TEAM-4242-code-sweeper",
+    "agentId": "agentcore_hub_code_sweeper",
+    "pr_url": "https://github.com/tycenjmccann/ember/pull/59"
+   },
+   "type": "workflow.report_completion",
+   "timestamp": "2026-09-07T13:01:09.154Z",
+   "eventId": "1788786069154-6652"
+  },
+  {
+   "detail": {
+    "ticketId": "TEAM-4242",
+    "unblocked": [],
+    "timestamp": "2026-09-07T13:01:12.141Z",
+    "assignee": "agentcore_hub_code_sweeper",
+    "agentId": "agentcore_hub_code_sweeper",
+    "workflowId": "wf_1788780725940_c2uqki"
+   },
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788780725940_c2uqki",
+   "type": "agent.complete",
+   "timestamp": "2026-09-07T13:01:12.141Z",
+   "eventId": "0mtr91ixb-0000"
+  },
+  {
+   "workflowId": "wf_1788780725940_c2uqki",
+   "detail": {
+    "agentId": "agentcore_hub_ci_agent",
+    "summary": "CI VERDICT: PASS \u2014 dead-code sweep, tycenjmccann/ember. Head SHA verified: 73f005662583afd2b4b4dd6565e617f90ba16407 (tip of integration branch feature/TEAM-4228-dead-code-sweep-tycenjmccann-ember-2026",
+    "branch": "feature/TEAM-4228-dead-code-sweep-tycenjmccann-ember-2026",
+    "pr_url": "https://github.com/tycenjmccann/ember/pull/58",
+    "ticketId": "TEAM-4233"
+   },
+   "type": "workflow.report_completion",
+   "timestamp": "2026-09-07T13:17:34.098Z",
+   "eventId": "1788787054098-yz12"
+  },
+  {
+   "workflowId": "wf_1788780725940_c2uqki",
+   "source": "agentcore-hub.orchestrator",
+   "detail": {
+    "unblocked": [],
+    "workflowId": "wf_1788780725940_c2uqki",
+    "assignee": "agentcore_hub_ci_agent",
+    "agentId": "agentcore_hub_ci_agent",
+    "ticketId": "TEAM-4233",
+    "timestamp": "2026-09-07T13:17:38.188Z"
+   },
+   "type": "agent.complete",
+   "timestamp": "2026-09-07T13:17:38.188Z",
+   "eventId": "0mtr9moba-0000"
+  },
+  {
+   "source": "agentcore-hub.orchestrator",
+   "detail": {
+    "ticketId": "TEAM-4228",
+    "prUrl": "https://github.com/tycenjmccann/ember/pull/60",
+    "featureBranch": "feature/TEAM-4228-dead-code-sweep-tycenjmccann-ember-2026",
+    "delivery": "handoff",
+    "workflowId": "wf_1788780725940_c2uqki",
+    "timestamp": "2026-09-07T13:17:42.550Z"
+   },
+   "workflowId": "wf_1788780725940_c2uqki",
+   "type": "workflow.complete",
+   "timestamp": "2026-09-07T13:17:42.550Z",
+   "eventId": "0mtr9mr3v-0000"
+  },
+  {
+   "workflowId": "wf_1788780725940_c2uqki",
+   "detail": {
+    "totalCostUsd": 408.7842,
+    "tokens": {
+     "input": 51626194,
+     "output": 966456,
+     "total": 97794383,
+     "cacheRead": 44451436,
+     "cacheWrite": 750297,
+     "cached": 44451436
+    },
+    "status": "alert",
+    "wallMs": 6333247,
+    "agentWorkMs": 7688796,
+    "humanWaitMs": 0,
+    "tasks": 7,
+    "codingUsd": 59.3693,
+    "errors": 0,
+    "activeMs": 6333247,
+    "nudges": 0,
+    "anomalies": [
+     {
+      "value": 408.7842,
+      "median": 124.019,
+      "z": 2.4655,
+      "status": "warn",
+      "kpi": "cost.totalUsd",
+      "label": "Total cost"
+     },
+     {
+      "label": "Persona LLM cost",
+      "kpi": "cost.personaUsd",
+      "status": "warn",
+      "z": 2.0318,
+      "median": 123.2601,
+      "value": 349.4149
+     },
+     {
+      "label": "Coding CLI cost",
+      "kpi": "cost.codingUsd",
+      "status": "alert",
+      "value": 59.3693,
+      "z": 29.6847,
+      "median": 0
+     },
+     {
+      "label": "Tokens",
+      "status": "alert",
+      "median": 16355875,
+      "z": 6.6703,
+      "value": 97794383,
+      "kpi": "cost.tokens.total"
+     },
+     {
+      "z": 4.9808,
+      "median": 2008198,
+      "value": 7688796,
+      "label": "Agent work",
+      "kpi": "time.agentWorkMs",
+      "status": "alert"
+     },
+     {
+      "z": 2,
+      "value": 7,
+      "status": "warn",
+      "kpi": "quality.tasks",
+      "median": 5,
+      "label": "Agent tasks"
+     },
+     {
+      "value": 2,
+      "median": 0,
+      "label": "Loops",
+      "status": "warn",
+      "kpi": "quality.loops",
+      "z": 2
+     }
+    ],
+    "reworkRounds": 0,
+    "reportKey": "workflows/wf_1788780725940_c2uqki/shared/performance-card.json",
+    "timestamp": "2026-09-07T13:17:49.188Z",
+    "ticketId": "TEAM-4228",
+    "loops": 2,
+    "personaUsd": 349.4149
+   },
+   "expiresAt": 1796563069,
+   "timestamp": "2026-09-07T13:17:49.188Z",
+   "type": "workflow.performance",
+   "eventId": "evt_1788787069188_performance"
+  }
+ ],
+ "streamCounts": {
+  "agentcore_hub_requirements_analyst": {
+   "text": 7,
+   "trace": 28,
+   "reasoning": 0,
+   "lastText": "I'll start by loading the standard feature-flow blueprint (no `## Workflow Type: bug-fix` marker in the context).Intake: inspecting the repo and checking for an existing ticket chain under the epic in parallel.Fresh run \u2014 only my own ticket exists. Let me gather more codebase context: package.json, tsconfig, CI workflows, and the `src`/`mcp` layout.The requirements doc is thorough and correctly scoped (four agents, chain ends at CI, empty-removal outcome explicitly valid). Saving it to the shared workspace, then creating the ticket chain.Requirements saved. Recording the ticket plan, then creating the Tier 3 (sweeper) ticket first since the rest of the chain depends on its ID.All four tickets created. Verifying the chain under the epic (step 4c \u2014 one ticket per assignee, no duplicates).Chain verified: exactly one ticket per planned assignee, no duplicates, sweeper already picked up (in_progress), the rest correctly blocked in sequence. Reporting completion.",
+   "lastStreamAt": "2026-09-07T11:41:52.0035Z"
+  },
+  "agentcore_hub_code_sweeper": {
+   "text": 20,
+   "trace": 60,
+   "reasoning": 0,
+   "lastText": "I'll start by loading the blueprint for my process instructions.Prior sweeps exist (PR #56 open, #57 closed). Let me check them for context so I don't repeat or conflict.PR #57 (merged 2026-08-31) already swept this repo a week ago, so I expect a thin candidate list. Let me kick off detection with codex \u2014 phase 1 is detection + verification only, no edits yet.Local boto3 has credentials. I'll write the artifacts locally and upload them in one batch.Ledger verified clean (93 rows: 53 used-in-module, 26 framework, 12 false-positive, 1 uncertain, 1 contract; 0 REMOVED). Uploading all artifacts to S3.PR #58 is open. Let me verify its state/diff and confirm there is exactly one PR from this branch, then add a ticket comment and report completion.I'll start by loading the blueprint, then review the ticket's evidence.Let me check the current branch state before delegating.State confirmed: integration branch still at f754cd3 == main, PR #58 open at 1b399fb. Now delegating the ledger fix to codex (resuming the prior session).Fix committed at `ef18e1f`. Now I'll verify it landed on GitHub and fetch the exact committed ledger for the PR body + S3 mirror.Commit `ef18e1f` verified: only `REMOVAL_LEDGER.md`, +4/\u22124. Now mirroring the corrected ledger to S3 and updating the PR #58 body in parallel.Now updating the PR #58 body so it mirrors the committed ledger (header preserved, ledger section replaced, review-fix note added).PR #58 landed on the integration branch at `16fc41d`. Verifying the branch topology (integration branch moved, `main` untouched) before closing out.All three findings are closed. Recording the outcome on the ticket and reporting completion.I'll start by loading the blueprint, then look at the ticket state for TEAM-4241 (this ticket is blocked by it) and the PR.TEAM-4241 is done and PR #58 was already merged into the integration branch (16fc41d). Let me confirm the current state of PR #58 and the integration branch before deciding where this fix lands.The pushed commit is exactly the 1/1 ledger-only change. Now I'll open the PR into the integration branch, and mirror the corrected line into the (merged) PR #58 body as the ticket asked.Merged into the integration branch. Let me verify the integration branch now has the corrected line and that `main` is untouched, then update the S3 ledger mirror.The S3 mirror still has the old `\u00d727` line. I'll refresh it with a verbatim copy of the committed blob (12a2081) so the mirror matches the integration branch.Mirror refreshed. Now I'll post the closing comment on the ticket and report completion.",
+   "lastStreamAt": "2026-09-07T13:00:58.0025Z"
+  },
+  "agentcore_hub_code_reviewer": {
+   "text": 6,
+   "trace": 27,
+   "reasoning": 0,
+   "lastText": "I'll start by loading my process blueprint, then gather the context artifacts.The sweeper reports **zero removals** and a different branch name than my ticket states. Let me read the requirements, ledger, and PR to reconcile.The codex summaries are useful, but I need raw evidence lines for the review. Let me pull the key files directly from the PR head to cite exact lines.I have everything I need. Verification is complete; let me write the evidence file, then post the PR review, file the fix ticket, and report.Now the PR review, the fix ticket, and a PR comment cross-linking them.The token is the PR author, so GitHub refuses REQUEST_CHANGES. I'll post the same review as a COMMENT review with the verdict stated explicitly.",
+   "lastStreamAt": "2026-09-07T12:30:32.0033Z"
+  },
+  "agentcore_hub_qa_verifier": {
+   "text": 7,
+   "trace": 25,
+   "reasoning": 0,
+   "lastText": "I'll start by loading my process blueprint.Now let me gather context: requirements doc, the PR, and the ledger.The reviewer filed fix ticket TEAM-4241. Let me check its status, PR #58, and the review evidence.TEAM-4241 (the reviewer's fix) is still `in_progress`. I'll verify at the CURRENT PR head and note this. Let me check the live branch state.All checks executed. The runtime auto-harvest only picked up image files, not the text logs, so I need to pull the evidence text out of the workspace to persist it durably to S3.I have all evidence verbatim. Persisting it durably to `qa-evidence/` in S3 now.Now the QA summary \u2014 written to S3 and posted on PR #58.",
+   "lastStreamAt": "2026-09-07T12:54:42.0032Z"
+  },
+  "agentcore_hub_ci_agent": {
+   "text": 4,
+   "trace": 34,
+   "reasoning": 0,
+   "lastText": "I'll start by loading my process blueprint, then gather context on the PR and requirements.No PR matched the head filter. Let me broaden the search and check the branch state and prior ticket records.All four commands pass at the current head `73f00566`. Now I'll persist the evidence to S3 and post the CI summary to the PR.Evidence persisted. Now posting the human-readable CI summary as a PR comment on #58 (the sweep PR carrying the ledger) with a pointer on #59, then adding the ticket comment.",
+   "lastStreamAt": "2026-09-07T13:17:11.0038Z"
+  }
+ },
+ "completions": {
+  "TEAM-4229": {
+   "ticket_id": "TEAM-4229",
+   "summary": "Requirements analysis complete for Dead Code Sweep \u2014 tycenjmccann/ember (feature flow; not bug-fix, not playbook, no ported session).\n\n**Scope:** MODIFY EXISTING \u2014 pure subtractive change; no design work, no external vendor API (no Docs & References needed). Delivery: handoff \u2014 PR for the owning team (CD_REGISTERED: false; chain ends at CI, no Ship/Merge/CD tickets).\n\n**Key repo facts verified (shape the plan):**\n- Next.js 14 App Router (TS strict, `output: standalone`) + separate `mcp/port-session` workspace with its own package.json/lockfile/tsconfig; root tsconfig EXCLUDES `mcp` \u2192 tools must run per-workspace.\n- NO `test`/`lint` scripts, NO test runner, NO ESLint/knip config, NO `.github/workflows` \u2192 \"full test suite\" defined concretely as: `tsc --noEmit` (root), `next build`, `mcp:build`, mcp `tsc --noEmit`, Docker build if feasible, plus QA runtime smoke (`/`, `/login`, `/api/auth/health` non-5xx).\n- Pre-identified false positives the sweep must KEEP: `@smithy/node-http-handler` (transitive, next.config only), SigV4 deps (`@aws-crypto/sha256-js`, `@smithy/signature-v4`, `@aws-sdk/credential-provider-node` \u2014 used in shell/route.ts), `@tailwindcss/typography`, 27 `export const dynamic` + `maxDuration` segment configs, `middleware.ts`, public API routes consumed by mcp/install.sh/deploy, and `shell-protocol.ts`/`types.ts` wire contracts with the Python runtime.\n- Empty removal list + explanatory ledger is an explicitly valid outcome (R7).\n\n**Requirements doc:** R1 detection (knip w/ Next plugin, ts-prune, depcheck \u00d7 2 workspaces) \u2192 R2 whole-repo git grep verification per candidate \u2192 R3 remove only DEAD \u2192 R4 proof suite w/ main baseline \u2192 R5 Removal Ledger (REMOVED / KEPT-UNCERTAIN / Tool false positives) \u2192 R6 single branch + open PR, never merge \u2192 R7 guardrails.\n\n**Tickets created under TEAM-4228 (verified: 1 per assignee, no duplicates):**\n- TEAM-4230 agentcore_hub_code_sweeper \u2014 sweep (blocked_by none; already in_progress)\n- TEAM-4231 agentcore_hub_code_reviewer \u2014 adversarial re-grep of every removed item (blocked_by TEAM-4230)\n- TEAM-4232 agentcore_hub_qa_verifier \u2014 live proof commands + runtime smoke (blocked_by TEAM-4231)\n- TEAM-4233 agentcore_hub_ci_agent \u2014 validate at PR head SHA; state no Actions exist (blocked_by TEAM-4232)\n\n**Excluded agents:** designers, security, legal, analytics, localization, release manager \u2014 justified in doc.\n\n**Tool notes:** all tool calls succeeded. One anomaly: `WorkflowOutput___submit_ticket_plan` echoed `ticket_count: 600` for a 4-ticket JSON array (appears to be a character-length miscount in the tool's response); the plan record was saved and the 4 real tickets were created correctly, so no impact on the run.",
+   "artifacts": "workflows/wf_1788780725940_c2uqki/shared/requirements.md,workflows/wf_1788780725940_c2uqki/shared/ticket-plan.json",
+   "branch": null,
+   "commit_sha": null,
+   "pr_url": null,
+   "completed_at": "2026-09-07T11:42:08.050Z",
+   "evidence_kind": "static"
+  },
+  "TEAM-4230": {
+   "ticket_id": "TEAM-4230",
+   "summary": "Dead-code sweep of tycenjmccann/ember \u2014 OUTCOME: ZERO verified-dead removals (valid terminal state per R7). PR #58 opened and left OPEN (handoff; never merged; no Pipeline/CD calls).\n\nWHAT ACTUALLY RAN (via codex, root + mcp/port-session separately, pinned npx, nothing added to package.json): knip 5.88.1 (Next.js plugin confirmed enabled via --debug; run-local documented knip.jsonc), ts-prune 0.10.3 (per tsconfig), depcheck 1.4.7 (per package.json). Raw stdout/stderr + exit codes archived. 93 distinct candidates emitted; EVERY one verified with repo-wide `git grep -n [-w]` (105 KB verification-grep.txt; I also independently re-ran the same grep script on a local clone at f754cd3 \u2014 identical result).\n\nVERDICTS: REMOVED 0 \u00b7 KEPT-USED-IN-MODULE 53 (only the `export` keyword unused \u2014 refactor, out of scope) \u00b7 KEPT-FRAMEWORK 26 (Next.js page/layout/route default exports, GET/POST/PUT/PATCH/DELETE, middleware/config, `dynamic`\u00d727/maxDuration/metadata/viewport) \u00b7 KEPT-FALSE-POSITIVE 12 (node:sqlite builtin; depcheck devDeps @types/react-dom/autoprefixer/postcss/typescript; 7 knip config-redundancy hints) \u00b7 KEPT-CONTRACT 1 (DecodedFrame) \u00b7 KEPT-UNCERTAIN 1: `encodeClose` src/lib/ember/shell-protocol.ts:62 \u2014 the ONLY zero-reference symbol in the repo, but inside the Python-runtime wire-contract file the sweep is forbidden to trim \u2192 kept, escalated to owning team. Tool-false-positive section also covers @smithy/node-http-handler (next.config.mjs:14, transitive), the 3 SigV4 deps (shell/route.ts:13-15 imports; not flagged by any tool this run), @tailwindcss/typography (tailwind.config.js:92), types.ts (no candidates emitted; contract-protected). PR #57 (merged 2026-08-31) had already removed previously-dead code.\n\nPROOF (baseline base/main @ f754cd3 vs branch; all exit codes archived): (a) `npx tsc --noEmit -p tsconfig.json` 0/0; (b) `npm run build` 0/0 \u2014 identical route tables; (c) `npm run mcp:build` 0/0; (d) `cd mcp/port-session && npx tsc --noEmit` 0/0; (e) test runner: NONE exists (re-confirmed: no test/lint scripts, no jest/vitest/playwright/mocha/cypress bins, no .github/workflows, no ESLint) \u2192 no tests were run because none exist; (f) docker build NOT RUN \u2014 `docker: command not found` (exit 127); `next build` (output: standalone) covers the Dockerfile build step. No tracked file modified by builds; no lockfile churn.\n\nDIFF: purely additive \u2014 knip.jsonc (+21, commented JSONC) and REMOVAL_LEDGER.md (+228). REMOVED-set (\u2205) == deletions in diff (\u2205). PR body contains the full ledger + exact proof commands/results.\n\nTOOL FAILURES: `aws` CLI absent in codex sandbox (artifacts transferred via local boto3 instead); docker absent (recorded). No other failures.\n\nPROCESS NOTES: Branch cut from harness integration branch feature/TEAM-4228-... (== main SHA) rather than directly from main; PR targets that integration branch per harness, not main (orchestrator opens the unified PR). Ticket vs blueprint conflict on empty sweeps: blueprint says skip downstream tickets, ticket R7 explicitly requires a PR with an empty ledger \u2014 followed the ticket; flagged in a ticket comment so the orchestrator can short-circuit if preferred. Nothing merged.",
+   "artifacts": "workflows/wf_1788780725940_c2uqki/shared/sweep-artifacts/ (27 objects: REMOVAL_LEDGER.md, knip.jsonc, candidates.md, verification-grep.txt, zero-reference-crosscheck.txt, knip-root/mcp/all.txt, knip-debug-next-plugin.txt, ts-prune-root/mcp.txt, depcheck-root/mcp.txt, detection-status.txt, tool-versions.txt, setup-confirmations.txt, run-verification-grep.sh, proof-baseline-{a,b,c,d}-*.txt, proof-branch-{a,b,c,d,e,f}-*.txt)",
+   "branch": "feature/TEAM-4230-code-sweeper",
+   "commit_sha": "1b399fb50e4a6e43e775d76b160dea750ec50e9d",
+   "pr_url": "https://github.com/tycenjmccann/ember/pull/58",
+   "completed_at": "2026-09-07T12:12:19.185Z",
+   "evidence_kind": "unit",
+   "evidence_keys": "workflows/wf_1788780725940_c2uqki/shared/sweep-artifacts/REMOVAL_LEDGER.md,workflows/wf_1788780725940_c2uqki/shared/sweep-artifacts/candidates.md,workflows/wf_1788780725940_c2uqki/shared/sweep-artifacts/verification-grep.txt,workflows/wf_1788780725940_c2uqki/shared/sweep-artifacts/zero-reference-crosscheck.txt,workflows/wf_1788780725940_c2uqki/shared/sweep-artifacts/knip-root.txt,workflows/wf_1788780725940_c2uqki/shared/sweep-artifacts/knip-mcp.txt,workflows/wf_1788780725940_c2uqki/shared/sweep-artifacts/knip-all.txt,workflows/wf_1788780725940_c2uqki/shared/sweep-artifacts/ts-prune-root.txt,workflows/wf_1788780725940_c2uqki/shared/sweep-artifacts/ts-prune-mcp.txt,workflows/wf_1788780725940_c2uqki/shared/sweep-artifacts/depcheck-root.txt,workflows/wf_1788780725940_c2uqki/shared/sweep-artifacts/depcheck-mcp.txt,workflows/wf_1788780725940_c2uqki/shared/sweep-artifacts/proof-baseline-b-next-build.txt,workflows/wf_1788780725940_c2uqki/shared/sweep-artifacts/proof-branch-b-next-build.txt,workflows/wf_1788780725940_c2uqki/shared/sweep-artifacts/proof-branch-e-no-test-runner.txt,workflows/wf_1788780725940_c2uqki/shared/sweep-artifacts/proof-branch-f-docker.txt,workflows/wf_1788780725940_c2uqki/shared/sweep-artifacts/tool-versions.txt"
+  },
+  "TEAM-4231": {
+   "ticket_id": "TEAM-4231",
+   "summary": "VERDICT: CHANGES NEEDED (ledger-accuracy findings only; ZERO false-positive deletions). Fix ticket TEAM-4241 \u2192 agentcore_hub_code_sweeper.\n\nReviewed PR #58 (feature/TEAM-4230-code-sweeper @ 1b399fb \u2192 integration branch feature/TEAM-4228-\u2026 == main @ f754cd3). Ticket named branch chore/dead-code-sweep-2026-09-07 does not exist; reviewed the actual sweep PR. Independent engine: codex, fresh clone, nothing trusted from the sweeper's grep.\n\nWhat I re-verified:\n- Diff: `--numstat` 228/0 REMOVAL_LEDGER.md, 21/0 knip.jsonc; `--diff-filter=D` = 0; package.json + both lockfiles unchanged. REMOVED-set \u2205 == deletions \u2205 \u2192 the per-item re-verification table is empty by construction (nothing removed).\n- Protected surface all PRESENT: 3 SigV4 deps (shell/route.ts:13-15,144-148), @tailwindcss/typography (tailwind.config.js:92), @smithy/node-http-handler (next.config.mjs:14), middleware/pages/layout, 20 route.ts files (requirements said 21 \u2014 its own enumeration totals 20, doc miscount), shell-protocol.ts/types.ts untouched, every /api path called from mcp/install.sh/deploy resolves.\n- Ledger completeness: re-ran knip@5.88.1, ts-prune@0.10.3 (\u00d72 ws), depcheck@1.4.7 (\u00d72 ws): ts-prune 94/26 lines match; normalized tool set == ledger set (78/78, both differences \u2205); only zero-ref symbol is encodeClose; all 53 used-in-module symbols have same-file uses; required sections present.\n- knip.jsonc minimal/documented, no dep added; enters Docker builder stage only (runner copies standalone/static/public).\n- Proof re-run: tsc root 0, next build 0, mcp:build 0, tsc mcp 0, git status clean; no test/lint/workflows.\n\nFindings (grouped into ONE ticket, TEAM-4241):\n- F1 P2 REMOVAL_LEDGER.md:116 \u2014 `Cli` (config.ts:23) row cites index.ts:450; index.ts:30-36 imports Cli from ./cli-adapter.js, only gatherBundle from ./config.js \u2192 misattributed (verdict still correct via config.ts:393).\n- F2 P2 REMOVAL_LEDGER.md:198 \u2014 encodeClose rationale names main.py/shell-init.sh as protocol peer; actual peer is AgentCore /ws/shells (bedrock_agentcore SDK) per shell-protocol.ts:4-6, shell/route.ts:4-6,141-142, ShellTerminal.tsx:166-181; grep of main.py/shell-init.sh finds no frame handling; requirements.txt has no bedrock_agentcore. KEEP-UNCERTAIN still right, rationale wrong.\n- F3 P2 \u2014 PR #58 not landed on integration branch (still == main) \u2192 unified handoff PR would be empty. Fix: land on integration branch only, never main.\n\nPR review posted on #58 as COMMENT (GitHub rejects REQUEST_CHANGES on same-author PR \u2014 stated explicitly in the review). Nothing merged; no Pipeline tools called.\n\nTool status: all tools OK; codex available (claude_code fallback unused).\n[coding-session: cc-8681e4c8b0d941b8be77e9ba279cca51 cli=codex conversation=01a07bca-7c76-7cd3-85d0-5c6e5b54fa43]",
+   "artifacts": "workflows/wf_1788780725940_c2uqki/shared/review-evidence/TEAM-4231-code-review-PR58.md",
+   "branch": "feature/TEAM-4230-code-sweeper",
+   "commit_sha": "1b399fb50e4a6e43e775d76b160dea750ec50e9d",
+   "pr_url": "https://github.com/tycenjmccann/ember/pull/58",
+   "completed_at": "2026-09-07T12:30:53.629Z",
+   "evidence_kind": "unit",
+   "evidence_keys": "workflows/wf_1788780725940_c2uqki/shared/review-evidence/TEAM-4231-code-review-PR58.md"
+  },
+  "TEAM-4232": {
+   "ticket_id": "TEAM-4232",
+   "summary": "**Verdict: FAIL (ledger-accuracy only \u2192 fix ticket TEAM-4242). All build, runtime-smoke, mcp-entry, and ledger==diff checks PASSED at PR #58 head 1b399fb50e4a6e43e775d76b160dea750ec50e9d.** HANDOFF: nothing merged, no Pipeline tools called.\n\nBranch note: ticket's `chore/dead-code-sweep-2026-09-07` does not exist; sweep is on `feature/TEAM-4230-code-sweeper` (PR #58 \u2192 integration branch == main @ f754cd3). Reviewer fix TEAM-4241 was in_progress and had not pushed, so head was unchanged.\n\nVerification Ledger (fresh clone, claude_code session cc-72e710c7e53c4d61a943b4621d5a319b, node 20.19.2; node 22.14.0 for mcp re-run):\n- npm ci EXIT 0 \u00b7 (a) tsc root EXIT 0 \u00b7 (b) next build EXIT 0 \u00b7 (c) mcp:build EXIT 0 \u00b7 (d) mcp tsc EXIT 0 \u00b7 tracked tree clean after builds\n- No test runner exists (re-confirmed) \u2014 command suite is the \"tests\"\n- Runtime smoke (`next start` AND `node .next/standalone/server.js`, :3457): GET / 307\u2192/login (target 200); GET /login 200 (login HTML); GET /api/auth/health 200 {\"ok\":true}. No 5xx, no crash.\n- mcp/port-session/dist/index.js exists (39933 B); on Node 22 loads as ESM entry (\"port-session-mcp ready (stdio)\", exit 0) and via dynamic import (exit 0). On Node 20 fails with ERR_UNKNOWN_BUILTIN_MODULE node:sqlite \u2014 proven pre-existing on main (identical blob 8f90502c, 0 mcp files in diff); Dockerfile pins node:22. Advisory only.\n- Docker: NOT RUN \u2014 docker binary not installed (exit 127, no socket). Fallback: passing standalone next build + booted standalone server.\n- Ledger==diff: 0 deleted files/lines; only +228 REMOVAL_LEDGER.md, +21 knip.jsonc; manifests/lockfiles unchanged; `## Removed: None.` \u2192 LEDGER_DRIFT=NONE. KEPT-UNCERTAIN encodeClose still at shell-protocol.ts:62; all protected deps/entry points present (20 route.ts = main).\n\nFinding (new): REMOVAL_LEDGER.md:205 says `dynamic \u00d727`; actual 21 (+ maxDuration \u00d76). Reproduced the ledger's ts-prune@0.10.3 run (94 candidates, exit 0) to locate the mislabel. Filed TEAM-4242 (qa_fix, assignee code_sweeper, blocked_by TEAM-4241 \u2014 same file, land serially/fold in). Commented on TEAM-4241 to coordinate. Reviewer's F1/F2/F3 remain open in TEAM-4241 (not double-filed); integration branch confirmed still == main.\n\nQA summary posted on PR #58 (comment 5570943176) and uploaded to qa-evidence/. Re-verify required at the new head once TEAM-4241/TEAM-4242 land (resume session cc-72e710c7e53c4d61a943b4621d5a319b).\n\nTool status: all tools succeeded. aws CLI absent in the coding workspace so logs were transcribed verbatim into S3 via S3Storage___write_object.",
+   "artifacts": "workflows/wf_1788780725940_c2uqki/shared/qa-evidence/TEAM-4232-QA-SUMMARY.md,https://github.com/tycenjmccann/ember/pull/58#issuecomment-5570943176",
+   "branch": "feature/TEAM-4230-code-sweeper",
+   "commit_sha": "1b399fb50e4a6e43e775d76b160dea750ec50e9d",
+   "pr_url": "https://github.com/tycenjmccann/ember/pull/58",
+   "completed_at": "2026-09-07T12:55:05.115Z",
+   "evidence_kind": "live",
+   "evidence_keys": "workflows/wf_1788780725940_c2uqki/shared/qa-evidence/TEAM-4232-QA-SUMMARY.md,workflows/wf_1788780725940_c2uqki/shared/qa-evidence/TEAM-4232-00-head-install.txt,workflows/wf_1788780725940_c2uqki/shared/qa-evidence/TEAM-4232-02-proof-commands.txt,workflows/wf_1788780725940_c2uqki/shared/qa-evidence/TEAM-4232-03-runtime-smoke.txt,workflows/wf_1788780725940_c2uqki/shared/qa-evidence/TEAM-4232-04-mcp-entry.txt,workflows/wf_1788780725940_c2uqki/shared/qa-evidence/TEAM-4232-05-docker.txt,workflows/wf_1788780725940_c2uqki/shared/qa-evidence/TEAM-4232-06-ledger-diff-crosscheck.txt"
+  },
+  "TEAM-4233": {
+   "ticket_id": "TEAM-4233",
+   "summary": "CI VERDICT: PASS \u2014 dead-code sweep, tycenjmccann/ember. Head SHA verified: 73f005662583afd2b4b4dd6565e617f90ba16407 (tip of integration branch feature/TEAM-4228-dead-code-sweep-tycenjmccann-ember-2026 = PR #58 merge 16fc41d + PR #59 merge 73f0056). Base main = f754cd3 (== merge-base, untouched). Ticket-named branch chore/dead-code-sweep-2026-09-07 does not exist. Head moved 16fc41d\u219273f0056 mid-run (TEAM-4242 ledger fix); both heads verified, full suite re-run from clean `npm ci` at 73f0056.\n\nResults @ 73f0056 (fresh clone, node v20.19.2/npm 9.2.0): npm ci EXIT 0 \u00b7 (a) npx tsc --noEmit -p tsconfig.json EXIT 0 \u00b7 (b) npm run build EXIT 0 (\"Compiled successfully\", route table identical to sweeper/QA) \u00b7 (c) npm run mcp:build EXIT 0 \u00b7 (d) cd mcp/port-session && npx tsc --noEmit EXIT 0 \u00b7 git status clean after builds. No command exited non-zero. Tests/lint: none exist \u2014 none run. Docker: not run (unavailable); row (b) is the same build step.\n\nLedger\u2194diff: diff vs main = A REMOVAL_LEDGER.md (+228), A knip.jsonc (+21), 0 deletions, 0 manifest/lockfile lines \u2192 REMOVED-set (\u2205) == deletions (\u2205); NO DRIFT since QA TEAM-4232. PR #58 body still carries ledger + proof table.\n\nCI proof statement: repo has NO .github/workflows (only .github/assets), no CodeBuild/CD pipeline registered, no test/lint scripts, no test runner or ESLint config \u2192 no check-run and no CodeBuild build id exists; ci_status=unverified (honest). The executed command suite at the exact head SHA is the achievable CI proof (also independently run by sweeper, reviewer, QA). Advisory only (not implemented): owning team should add a GitHub Actions ci.yml running this suite on Node 22.\n\nHANDOFF: nothing merged to main, no deploy, no Pipeline___* calls. No fix ticket filed (nothing failed, no drift). PR comments posted: https://github.com/tycenjmccann/ember/pull/58#issuecomment-5571217772 and PR #59. Specialist: claude_code [coding-session: cc-ccee0915559e49c79634fad89bc9178b]; all tool calls succeeded.",
+   "artifacts": "workflows/wf_1788780725940_c2uqki/shared/ci-evidence/TEAM-4233-CI-SUMMARY.md,workflows/wf_1788780725940_c2uqki/shared/ci-evidence/TEAM-4233-01-checkout.txt,workflows/wf_1788780725940_c2uqki/shared/ci-evidence/TEAM-4233-02-npm-ci.txt,workflows/wf_1788780725940_c2uqki/shared/ci-evidence/TEAM-4233-03a-tsc-root.txt,workflows/wf_1788780725940_c2uqki/shared/ci-evidence/TEAM-4233-03b-next-build.txt,workflows/wf_1788780725940_c2uqki/shared/ci-evidence/TEAM-4233-03c-mcp-build.txt,workflows/wf_1788780725940_c2uqki/shared/ci-evidence/TEAM-4233-03d-tsc-mcp.txt,workflows/wf_1788780725940_c2uqki/shared/ci-evidence/TEAM-4233-04-tree-clean.txt,workflows/wf_1788780725940_c2uqki/shared/ci-evidence/TEAM-4233-05-diff-vs-main.txt,workflows/wf_1788780725940_c2uqki/shared/ci-evidence/TEAM-4233-prev-head-16fc41d.txt",
+   "branch": "feature/TEAM-4228-dead-code-sweep-tycenjmccann-ember-2026",
+   "commit_sha": "73f005662583afd2b4b4dd6565e617f90ba16407",
+   "pr_url": "https://github.com/tycenjmccann/ember/pull/58",
+   "completed_at": "2026-09-07T13:17:34.042Z",
+   "evidence_kind": "unit",
+   "evidence_keys": "workflows/wf_1788780725940_c2uqki/shared/ci-evidence/TEAM-4233-CI-SUMMARY.md,workflows/wf_1788780725940_c2uqki/shared/ci-evidence/TEAM-4233-03a-tsc-root.txt,workflows/wf_1788780725940_c2uqki/shared/ci-evidence/TEAM-4233-03b-next-build.txt,workflows/wf_1788780725940_c2uqki/shared/ci-evidence/TEAM-4233-03c-mcp-build.txt,workflows/wf_1788780725940_c2uqki/shared/ci-evidence/TEAM-4233-03d-tsc-mcp.txt,workflows/wf_1788780725940_c2uqki/shared/ci-evidence/TEAM-4233-05-diff-vs-main.txt",
+   "ci_status": "unverified",
+   "ci_head_sha": "73f005662583afd2b4b4dd6565e617f90ba16407"
+  },
+  "TEAM-4241": {
+   "ticket_id": "TEAM-4241",
+   "summary": "Fix ticket for review TEAM-4231 (PR #58) \u2014 all 3 findings resolved; ledger-only change, zero code removed or touched.\n\nWHAT I RAN (codex, resumed session; all tool calls succeeded):\n- Re-derived F1/F2 evidence: `git grep -n -w Cli mcp/port-session/src`, index.ts imports (:30-37), shell-protocol.ts:1-12, shell route.ts:4-6/141-142, ShellTerminal.tsx:166-181, grep of main.py/shell-init.sh for channel|frame|0xff|CLOSE (only unrelated sqlite close / SSE-frame hits; no shell-frame handling), requirements.txt (no bedrock_agentcore SDK).\n- Proof on the fix commit: `npx tsc --noEmit -p tsconfig.json` exit 0; `cd mcp/port-session && npx tsc --noEmit` exit 0; `npm run build` exit 0; git status clean. No test runner exists in the repo (unchanged fact) \u2014 none run.\n\nF1: REMOVAL_LEDGER.md `Cli` (config.ts:23) row now cites config.ts:393 as the only same-file use and explicitly attributes index.ts:450 to cli-adapter.ts's `Cli`. Verdict unchanged (KEPT-USED-IN-MODULE).\nF2: `encodeClose` Kept-(uncertain) bullet + encodeClose/DecodedFrame Notes now name the real peer \u2014 Bedrock AgentCore `/ws/shells` service (bedrock_agentcore SDK protocol) \u2014 with the route/terminal/grep/requirements evidence; main.py/shell-init.sh attribution dropped (stated as grepped, no frame handling). Verdict unchanged (KEPT-UNCERTAIN).\nF3: Harness does not auto-land; merged PR #58 into its base (integration branch feature/TEAM-4228-dead-code-sweep-tycenjmccann-ember-2026) \u2192 merge commit 16fc41de671799b29909ea59460fd92d3e357752 (+249/\u22120, REMOVAL_LEDGER.md + knip.jsonc). `main` untouched at f754cd3. No Pipeline___* tools called.\n\nDiff: commit ef18e1f on feature/TEAM-4230-code-sweeper \u2014 REMOVAL_LEDGER.md only (+4/\u22124). No source, package.json, lockfile, or knip.jsonc changed. PR #58 body mirrors the committed ledger; S3 ledger mirror + fix-evidence written.\n\nCounts: removed 0 / kept 78 unique candidates (unchanged from the sweep).",
+   "artifacts": "workflows/wf_1788780725940_c2uqki/shared/sweep-artifacts/REMOVAL_LEDGER.md,workflows/wf_1788780725940_c2uqki/shared/sweep-artifacts/TEAM-4241-ledger-fix-evidence.md",
+   "branch": "feature/TEAM-4230-code-sweeper",
+   "commit_sha": "ef18e1fe5e54f2d8de4fad0515d8dc0f4897c815",
+   "pr_url": "https://github.com/tycenjmccann/ember/pull/58",
+   "completed_at": "2026-09-07T12:44:23.807Z",
+   "evidence_kind": "unit",
+   "evidence_keys": "workflows/wf_1788780725940_c2uqki/shared/sweep-artifacts/TEAM-4241-ledger-fix-evidence.md,workflows/wf_1788780725940_c2uqki/shared/sweep-artifacts/REMOVAL_LEDGER.md"
+  },
+  "TEAM-4242": {
+   "ticket_id": "TEAM-4242",
+   "summary": "FIXED TEAM-4242 (QA TEAM-4232 ledger-count finding). Ledger-text-only change.\n\nWhat changed: REMOVAL_LEDGER.md:205 (\"Tool false positives\") \u2014 one line, +1/\u22121: `dynamic` \u00d727 \u2192 `dynamic` \u00d721, `maxDuration` \u00d76 (plus `metadata`, `viewport`). Counts independently re-verified before editing: `git grep -c 'export const dynamic' -- src | wc -l` = 21; `git grep -c 'export const maxDuration' -- src | wc -l` = 6. 27 was the sum mislabeled as the dynamic count. No source/config/manifest/lockfile/knip.jsonc touched; all verdicts unchanged; removal set still \u2205.\n\nWhere it landed: PR #58 had already been merged into the integration branch by TEAM-4241, so the fix went on feature/TEAM-4242-code-sweeper (cut from integration @ 16fc41d) \u2192 commit 275a567 \u2192 PR #59 \u2192 merged into feature/TEAM-4228-dead-code-sweep-tycenjmccann-ember-2026 as 73f0056. main untouched (f754cd3). No Pipeline___* tools called (HANDOFF). PR #58 body updated to mirror the corrected line. S3 ledger mirror refreshed to the committed blob (12a2081).\n\nActually ran (codex, session resumed): tsc root exit 0; tsc mcp exit 0; `npm run build` exit 0 (identical route table); diff vs integration = `1 1 REMOVAL_LEDGER.md` only; diff vs main = REMOVAL_LEDGER.md + knip.jsonc, 0 deletions; git status clean. NOT run: tests (no test runner exists in repo \u2014 unchanged from PR #58), docker (not installed \u2014 unchanged). No detector re-run needed (no code change).\n\nRemoved 0 / kept unchanged. All tool calls succeeded; no failures. QA re-verify target: integration head 73f0056 or PR #59 head 275a567.",
+   "artifacts": "workflows/wf_1788780725940_c2uqki/shared/sweep-artifacts/TEAM-4242-ledger-count-fix-evidence.md,workflows/wf_1788780725940_c2uqki/shared/sweep-artifacts/REMOVAL_LEDGER.md",
+   "branch": "feature/TEAM-4242-code-sweeper",
+   "commit_sha": "275a5677c9b9fc2414eeb808e88e360403c80fae",
+   "pr_url": "https://github.com/tycenjmccann/ember/pull/59",
+   "completed_at": "2026-09-07T13:01:09.097Z",
+   "evidence_kind": "unit"
+  }
+ },
+ "artifacts": [
+  {
+   "key": "workflows/wf_1788780725940_c2uqki/shared/ci-evidence/TEAM-4233-01-checkout.txt",
+   "size": 1557
+  },
+  {
+   "key": "workflows/wf_1788780725940_c2uqki/shared/ci-evidence/TEAM-4233-02-npm-ci.txt",
+   "size": 690
+  },
+  {
+   "key": "workflows/wf_1788780725940_c2uqki/shared/ci-evidence/TEAM-4233-03a-tsc-root.txt",
+   "size": 91
+  },
+  {
+   "key": "workflows/wf_1788780725940_c2uqki/shared/ci-evidence/TEAM-4233-03b-next-build.txt",
+   "size": 3031
+  },
+  {
+   "key": "workflows/wf_1788780725940_c2uqki/shared/ci-evidence/TEAM-4233-03c-mcp-build.txt",
+   "size": 435
+  },
+  {
+   "key": "workflows/wf_1788780725940_c2uqki/shared/ci-evidence/TEAM-4233-03d-tsc-mcp.txt",
+   "size": 97
+  },
+  {
+   "key": "workflows/wf_1788780725940_c2uqki/shared/ci-evidence/TEAM-4233-04-tree-clean.txt",
+   "size": 208
+  },
+  {
+   "key": "workflows/wf_1788780725940_c2uqki/shared/ci-evidence/TEAM-4233-05-diff-vs-main.txt",
+   "size": 2389
+  },
+  {
+   "key": "workflows/wf_1788780725940_c2uqki/shared/ci-evidence/TEAM-4233-CI-SUMMARY.md",
+   "size": 7215
+  },
+  {
+   "key": "workflows/wf_1788780725940_c2uqki/shared/ci-evidence/TEAM-4233-prev-head-16fc41d.txt",
+   "size": 1102
+  },
+  {
+   "key": "workflows/wf_1788780725940_c2uqki/shared/cost-report.json",
+   "size": 22134
+  },
+  {
+   "key": "workflows/wf_1788780725940_c2uqki/shared/manifest.json",
+   "size": 2141
+  },
+  {
+   "key": "workflows/wf_1788780725940_c2uqki/shared/performance-card.json",
+   "size": 22134
+  },
+  {
+   "key": "workflows/wf_1788780725940_c2uqki/shared/performance-card.md",
+   "size": 3546
+  },
+  {
+   "key": "workflows/wf_1788780725940_c2uqki/shared/qa-evidence/TEAM-4232-00-head-install.txt",
+   "size": 1564
+  },
+  {
+   "key": "workflows/wf_1788780725940_c2uqki/shared/qa-evidence/TEAM-4232-02-proof-commands.txt",
+   "size": 4512
+  },
+  {
+   "key": "workflows/wf_1788780725940_c2uqki/shared/qa-evidence/TEAM-4232-03-runtime-smoke.txt",
+   "size": 6377
+  },
+  {
+   "key": "workflows/wf_1788780725940_c2uqki/shared/qa-evidence/TEAM-4232-04-mcp-entry.txt",
+   "size": 4548
+  },
+  {
+   "key": "workflows/wf_1788780725940_c2uqki/shared/qa-evidence/TEAM-4232-05-docker.txt",
+   "size": 1411
+  },
+  {
+   "key": "workflows/wf_1788780725940_c2uqki/shared/qa-evidence/TEAM-4232-06-ledger-diff-crosscheck.txt",
+   "size": 5666
+  },
+  {
+   "key": "workflows/wf_1788780725940_c2uqki/shared/qa-evidence/TEAM-4232-QA-SUMMARY.md",
+   "size": 7015
+  },
+  {
+   "key": "workflows/wf_1788780725940_c2uqki/shared/requirements.md",
+   "size": 25350
+  },
+  {
+   "key": "workflows/wf_1788780725940_c2uqki/shared/review-evidence/TEAM-4231-code-review-PR58.md",
+   "size": 10875
+  },
+  {
+   "key": "workflows/wf_1788780725940_c2uqki/shared/sweep-artifacts/REMOVAL_LEDGER.md",
+   "size": 42628
+  },
+  {
+   "key": "workflows/wf_1788780725940_c2uqki/shared/sweep-artifacts/TEAM-4241-ledger-fix-evidence.md",
+   "size": 7358
+  },
+  {
+   "key": "workflows/wf_1788780725940_c2uqki/shared/sweep-artifacts/TEAM-4242-ledger-count-fix-evidence.md",
+   "size": 3951
+  },
+  {
+   "key": "workflows/wf_1788780725940_c2uqki/shared/sweep-artifacts/candidates.md",
+   "size": 33322
+  },
+  {
+   "key": "workflows/wf_1788780725940_c2uqki/shared/sweep-artifacts/depcheck-mcp.txt",
+   "size": 115
+  },
+  {
+   "key": "workflows/wf_1788780725940_c2uqki/shared/sweep-artifacts/depcheck-root.txt",
+   "size": 123
+  },
+  {
+   "key": "workflows/wf_1788780725940_c2uqki/shared/sweep-artifacts/detection-status.txt",
+   "size": 177
+  },
+  {
+   "key": "workflows/wf_1788780725940_c2uqki/shared/sweep-artifacts/knip-all.txt",
+   "size": 5207
+  },
+  {
+   "key": "workflows/wf_1788780725940_c2uqki/shared/sweep-artifacts/knip-debug-next-plugin.txt",
+   "size": 1858
+  },
+  {
+   "key": "workflows/wf_1788780725940_c2uqki/shared/sweep-artifacts/knip-mcp.txt",
+   "size": 2225
+  },
+  {
+   "key": "workflows/wf_1788780725940_c2uqki/shared/sweep-artifacts/knip-root.txt",
+   "size": 2294
+  },
+  {
+   "key": "workflows/wf_1788780725940_c2uqki/shared/sweep-artifacts/knip.jsonc",
+   "size": 1475
+  },
+  {
+   "key": "workflows/wf_1788780725940_c2uqki/shared/sweep-artifacts/proof-baseline-a-tsc-root.txt",
+   "size": 108
+  },
+  {
+   "key": "workflows/wf_1788780725940_c2uqki/shared/sweep-artifacts/proof-baseline-b-next-build.txt",
+   "size": 3290
+  },
+  {
+   "key": "workflows/wf_1788780725940_c2uqki/shared/sweep-artifacts/proof-baseline-c-mcp-build.txt",
+   "size": 357
+  },
+  {
+   "key": "workflows/wf_1788780725940_c2uqki/shared/sweep-artifacts/proof-baseline-d-tsc-mcp.txt",
+   "size": 114
+  },
+  {
+   "key": "workflows/wf_1788780725940_c2uqki/shared/sweep-artifacts/proof-branch-a-tsc-root.txt",
+   "size": 85
+  },
+  {
+   "key": "workflows/wf_1788780725940_c2uqki/shared/sweep-artifacts/proof-branch-b-next-build.txt",
+   "size": 2984
+  },
+  {
+   "key": "workflows/wf_1788780725940_c2uqki/shared/sweep-artifacts/proof-branch-c-mcp-build.txt",
+   "size": 377
+  },
+  {
+   "key": "workflows/wf_1788780725940_c2uqki/shared/sweep-artifacts/proof-branch-d-tsc-mcp.txt",
+   "size": 91
+  },
+  {
+   "key": "workflows/wf_1788780725940_c2uqki/shared/sweep-artifacts/proof-branch-e-no-test-runner.txt",
+   "size": 316
+  },
+  {
+   "key": "workflows/wf_1788780725940_c2uqki/shared/sweep-artifacts/proof-branch-f-docker.txt",
+   "size": 306
+  },
+  {
+   "key": "workflows/wf_1788780725940_c2uqki/shared/sweep-artifacts/run-verification-grep.sh",
+   "size": 1811
+  },
+  {
+   "key": "workflows/wf_1788780725940_c2uqki/shared/sweep-artifacts/setup-confirmations.txt",
+   "size": 1293
+  },
+  {
+   "key": "workflows/wf_1788780725940_c2uqki/shared/sweep-artifacts/tool-versions.txt",
+   "size": 264
+  },
+  {
+   "key": "workflows/wf_1788780725940_c2uqki/shared/sweep-artifacts/ts-prune-mcp.txt",
+   "size": 1475
+  },
+  {
+   "key": "workflows/wf_1788780725940_c2uqki/shared/sweep-artifacts/ts-prune-root.txt",
+   "size": 5087
+  },
+  {
+   "key": "workflows/wf_1788780725940_c2uqki/shared/sweep-artifacts/verification-grep.txt",
+   "size": 105010
+  },
+  {
+   "key": "workflows/wf_1788780725940_c2uqki/shared/sweep-artifacts/zero-reference-crosscheck.txt",
+   "size": 686
+  },
+  {
+   "key": "workflows/wf_1788780725940_c2uqki/shared/ticket-plan.json",
+   "size": 669
+  }
+ ],
+ "evalSummaries": [
+  {
+   "agentId": "agentcore_hub_ci_agent",
+   "sessionCount": 0,
+   "avgScores": {}
+  },
+  {
+   "agentId": "agentcore_hub_code_reviewer",
+   "sessionCount": 0,
+   "avgScores": {}
+  },
+  {
+   "agentId": "agentcore_hub_code_sweeper",
+   "sessionCount": 0,
+   "avgScores": {}
+  },
+  {
+   "agentId": "agentcore_hub_qa_verifier",
+   "sessionCount": 0,
+   "avgScores": {}
+  },
+  {
+   "agentId": "agentcore_hub_requirements_analyst",
+   "sessionCount": 343,
+   "avgScores": {
+    "Correctness": 0.42,
+    "Builtin.ToolSelectionAccuracy": 0.9569,
+    "Builtin.ResponseRelevance": 0.9971,
+    "Builtin.Helpfulness": 0.8121,
+    "Builtin.Correctness": 0.9556,
+    "Builtin.GoalSuccessRate": 0.9675,
+    "Builtin.ToolParameterAccuracy": 0.9248,
+    "Builtin.InstructionFollowing": 0.7985,
+    "Builtin.Coherence": 0.9601,
+    "dependency_chain_compliance_online": 0.1771,
+    "Builtin.Faithfulness": 0.9885
+   }
+  }
+ ],
+ "priorAnalyses": [
+  {
+   "analysisId": "1788219505744-tbjc",
+   "workflowId": "wf_1788172878611_o71s0v",
+   "analyzedAt": "2026-08-31T23:38:25.744662Z",
+   "runOutcome": "complete",
+   "scores": {
+    "overall": 85,
+    "planning": 90,
+    "execution": 88,
+    "reviewEfficiency": 80,
+    "reworkDiscipline": 95
+   },
+   "verdict": "Sound removal-only sweep that merged to main and filed a clean CD deploy-handoff \u2014 the first release_manager-extended run to self-complete the full chain \u2014 but still needed one WATCH rescue for the now-4x missed-unblock cascade on the Ship step.",
+   "totalDurationMs": 46425288,
+   "humanWaitTotalMs": 82966415,
+   "changeRequestCount": 2
+  },
+  {
+   "analysisId": "1788216795369-3uyo",
+   "workflowId": "wf_1788176975734_6o493q",
+   "analyzedAt": "2026-08-31T22:53:15.369686Z",
+   "runOutcome": "complete",
+   "scores": {
+    "planning": 90,
+    "reviewEfficiency": 88,
+    "overall": 84,
+    "execution": 72,
+    "reworkDiscipline": 95
+   },
+   "verdict": "A correct, rigorously-verified removal-only sweep that fully landed (PR #21 merged to main, CD NO-DEPLOY) \u2014 the first release_manager-extended run to complete the merge \u2014 but only via 13 WATCH interventions after hitting both the recurring missed-unblock cascade and a transient-Bedrock CD crash.",
+   "totalDurationMs": 39603583,
+   "humanWaitTotalMs": 55383053,
+   "changeRequestCount": 2
+  },
+  {
+   "analysisId": "1788216536156-ut27",
+   "workflowId": "wf_1788175925679_iczquj",
+   "analyzedAt": "2026-08-31T22:48:56.156317Z",
+   "runOutcome": "complete",
+   "scores": {
+    "reviewEfficiency": 88,
+    "overall": 85,
+    "execution": 78,
+    "planning": 90,
+    "reworkDiscipline": 95
+   },
+   "verdict": "A correct, triple-verified removal-only ember sweep that fully landed (PR #57 merged, +1/-67), but self-completion required two WATCH rescues \u2014 a dropped Ship unblock cascade and a transient-Bedrock CD crash \u2014 repeating the orchestration-reliability weakness of the release_manager-extended shape.",
+   "totalDurationMs": 40418944,
+   "humanWaitTotalMs": 58921615,
+   "changeRequestCount": 2
+  },
+  {
+   "analysisId": "1788204882372-thw0",
+   "workflowId": "wf_1788171795749_dom4hd",
+   "analyzedAt": "2026-08-31T19:34:42.372129Z",
+   "runOutcome": "complete",
+   "scores": {
+    "overall": 84,
+    "reviewEfficiency": 82,
+    "reworkDiscipline": 85,
+    "planning": 90,
+    "execution": 78
+   },
+   "verdict": "A correct, verified deletion-only sweep (PR #239) that was approved at the human merge gate, but completed only via WATCH-mode rescue of a P1 CI crash and a missed-unblock cascade on the new release_manager step \u2014 sound product, noisy self-healing tail.",
+   "totalDurationMs": 32839248,
+   "humanWaitTotalMs": 43369738,
+   "changeRequestCount": 2
+  },
+  {
+   "analysisId": "1787774762677-26d0",
+   "workflowId": "wf_1787774327729_4vraf4",
+   "analyzedAt": "2026-08-26T20:06:02.677586Z",
+   "runOutcome": "complete",
+   "scores": {
+    "overall": 91,
+    "reworkDiscipline": 95,
+    "planning": 93,
+    "reviewEfficiency": 95,
+    "execution": 92
+   },
+   "verdict": "A clean, textbook workflow end-to-end connectivity test: intake enumerated the full 5-agent roster, wired a correct dependency graph, and all five agents were reached, loaded their skills, exercised their tools, and completed green in ~4.6 min.",
+   "totalDurationMs": 275975,
+   "humanWaitTotalMs": 0,
+   "changeRequestCount": 0
+  }
+ ],
+ "missingSignals": []
+}

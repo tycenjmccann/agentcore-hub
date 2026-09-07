@@ -119,12 +119,12 @@ const RECORD = JSON.stringify({
   pr_url: "https://github.com/o/r/pull/7",
 });
 
-function makeWorkflow(taskEntry) {
+function makeWorkflow(taskEntry, defId = "software-delivery") {
   return {
     id: "wf_1",
     workflowId: "wf_1",
     epicId: PARENT,
-    workflowDefId: "software-delivery",
+    workflowDefId: defId,
     input: { title: "t" },
     humanNotifications: [],
     agentTasks: {
@@ -468,6 +468,126 @@ describe("verdict/head harvest — verdict / tested_head / ci_head_sha (TEAM-424
     harvest({ summary: "PASS", evidence_keys: [] });
     await handleTicketDoneUnified(DONE);
     expect(h.state.merges[0].fields.evidence_keys).toBeUndefined();
+  });
+});
+
+/**
+ * TEAM-4247 D2 — the sweep yield.
+ *
+ * `verified_removable` is the number the orchestrator terminates a sweep on, and
+ * this harvest is the only writer of `agentTasks[tid].verifiedRemovable`. Run
+ * c2uqki is the proof it was missing: the sweeper verified 93 candidates, removed
+ * none, wrote "OUTCOME: ZERO verified-dead removals" in prose, and the only thing
+ * that could end the run was the model hand-skipping five downstream tickets.
+ *
+ * Every assertion here is really about ZERO. It is a legitimate harvested value,
+ * it is "already present" for the purposes of the fill-if-absent rule, and it
+ * satisfies the early-return clause — so all three tests are `Number.isInteger`,
+ * never truthiness.
+ */
+describe("sweep-yield harvest — verified_removable / candidates (TEAM-4247 D2)", () => {
+  const SWEEP = "dead-code-sweep";
+  const completionReads = () => h.state.s3Gets.filter((k) => k.startsWith("completions/"));
+
+  it("harvests a ZERO yield alongside the candidate count", async () => {
+    h.state.workflow = makeWorkflow(undefined, SWEEP);
+    harvest({
+      summary: "Scanned 47 modules. OUTCOME: ZERO verified-dead removals of 93 candidates.",
+      verified_removable: 0,
+      candidates: 93,
+    });
+    await handleTicketDoneUnified(DONE);
+    expect(h.state.merges[0].fields.verifiedRemovable).toBe(0);
+    expect(h.state.merges[0].fields.candidates).toBe(93);
+    // The in-memory entry the same invoke's close hook will read.
+    expect(h.state.workflow.agentTasks[DONE].verifiedRemovable).toBe(0);
+  });
+
+  it("harvests a productive yield the same way", async () => {
+    h.state.workflow = makeWorkflow(undefined, SWEEP);
+    harvest({ summary: "Removed 17 dead symbols.", verified_removable: 17, candidates: 93 });
+    await handleTicketDoneUnified(DONE);
+    expect(h.state.merges[0].fields.verifiedRemovable).toBe(17);
+  });
+
+  it("DDB-stream path harvests the same yield", async () => {
+    h.state.workflow = makeWorkflow(undefined, SWEEP);
+    harvest({ summary: "no-op sweep", verified_removable: 0 });
+    await handleTicketDone(DONE, streamImage());
+    expect(h.state.merges[0].fields.verifiedRemovable).toBe(0);
+  });
+
+  it("the fourth early-return clause: a sweep entry with evidence, a commit AND a verdict still gets harvested", async () => {
+    // The D1 regression, one gate later. A sweeper's ticket lands a summary, a
+    // commit and (as a sweep gate) a head, so the first three clauses are already
+    // satisfied and the harvest would return before ever reading the yield — on
+    // exactly the ticket whose yield ends the run.
+    h.state.workflow = makeWorkflow(
+      { output: "already summarized", commitSha: "12e9ac6ef50", testedHead: "12e9ac6ef50" },
+      SWEEP,
+    );
+    harvest({ summary: "no-op sweep", verified_removable: 0, candidates: 93 });
+    await handleTicketDoneUnified(DONE);
+    expect(completionReads()).toContain(COMPLETION_KEY);
+    expect(h.state.merges[0].fields.verifiedRemovable).toBe(0);
+    // Nothing the entry already had is touched.
+    expect(h.state.merges[0].fields.output).toBeUndefined();
+    expect(h.state.merges[0].fields.commitSha).toBeUndefined();
+  });
+
+  it("the clause is DEF-SCOPED: a software-delivery entry with all three prior signals still short-circuits", async () => {
+    // The trap the scoping exists for. No other def's tickets will ever carry
+    // verified_removable, so an unscoped clause would disable this early return
+    // fleet-wide and add an S3 GET to every done ticket on every cascade.
+    h.state.workflow = makeWorkflow({ output: "s", commitSha: "12e9ac6ef50", testedHead: "12e9ac6ef50" });
+    harvest({ summary: "no-op sweep", verified_removable: 0 });
+    await handleTicketDoneUnified(DONE);
+    expect(completionReads()).toEqual([]);
+    expect(h.state.merges).toHaveLength(0);
+  });
+
+  it("a stored ZERO satisfies the clause: no re-read on redelivery", async () => {
+    // Number.isInteger, not truthiness. Reading a harvested 0 as "not harvested
+    // yet" would re-GET the record on every redelivery of the one ticket that
+    // matters most.
+    h.state.workflow = makeWorkflow(
+      { output: "s", commitSha: "12e9ac6ef50", testedHead: "12e9ac6ef50", verifiedRemovable: 0 },
+      SWEEP,
+    );
+    harvest({ summary: "no-op sweep", verified_removable: 0 });
+    await handleTicketDoneUnified(DONE);
+    expect(completionReads()).toEqual([]);
+    expect(h.state.merges).toHaveLength(0);
+  });
+
+  it("a stored ZERO is never overwritten by a later record", async () => {
+    h.state.workflow = makeWorkflow({ verifiedRemovable: 0, candidates: 93 }, SWEEP);
+    harvest({ summary: "s", verified_removable: 17, candidates: 5 });
+    await handleTicketDoneUnified(DONE);
+    const fields = h.state.merges[0].fields;
+    expect(fields.verifiedRemovable).toBeUndefined();
+    expect(fields.candidates).toBeUndefined();
+    expect(h.state.workflow.agentTasks[DONE].verifiedRemovable).toBe(0);
+  });
+
+  it("a non-integer yield in the record is ignored (the Lambda drops it, this is the second line)", async () => {
+    // workflow-output's COUNT_RE already refuses "none"/"1.5"/"-1", but a
+    // hand-written or gateway-authored record can carry anything, and a coerced
+    // count would either fake a no-op or fake a productive sweep.
+    h.state.workflow = makeWorkflow(undefined, SWEEP);
+    harvest({ summary: "s", verified_removable: "0", candidates: 1.5 });
+    await handleTicketDoneUnified(DONE);
+    expect(h.state.merges[0].fields.verifiedRemovable).toBeUndefined();
+    expect(h.state.merges[0].fields.candidates).toBeUndefined();
+  });
+
+  it("a legacy record with neither D2 key merges the pre-4247 key set exactly", async () => {
+    h.state.workflow = makeWorkflow(undefined, SWEEP);
+    h.state.s3Objects[COMPLETION_KEY] = RECORD;
+    await handleTicketDoneUnified(DONE);
+    expect(Object.keys(h.state.merges[0].fields).sort()).toEqual([
+      "branch", "commitSha", "output", "prUrl",
+    ]);
   });
 });
 

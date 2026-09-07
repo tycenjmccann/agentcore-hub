@@ -57,8 +57,11 @@ export const CYCLE_MS = 600_000;
  *  TEAM-3747 D2: the lifecycle-integrity ship outcomes are terminal too — a run
  *  closed deploy-blocked / static-ci-only is FINISHED, so the watcher must not
  *  count it as open or nudge/escalate it. Additive; parity with
- *  completion.mjs SHIP_BLOCKED_OUTCOMES. */
-export const TERMINAL_PHASES = new Set(["complete", "cancelled", "error", "deploy-blocked", "static-ci-only"]);
+ *  completion.mjs SHIP_BLOCKED_OUTCOMES.
+ *  TEAM-4247 D2: same for "nothing-to-remove" — a no-op dead-code sweep is
+ *  finished, and nudging or escalating it would page a human about a run with no
+ *  work in it. Parity with completion.mjs NO_OP_OUTCOMES. */
+export const TERMINAL_PHASES = new Set(["complete", "cancelled", "error", "deploy-blocked", "static-ci-only", "nothing-to-remove"]);
 /** §6 — max OPEN anomaly-filed workflows fleet-wide. */
 export const OPEN_WORKFLOW_CAP = 3;
 /** TEAM-3334 F3: how many recent ratelimit cycle items supplement the GSI count. */

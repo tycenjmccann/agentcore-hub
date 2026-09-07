@@ -32,6 +32,9 @@ const RUN_OUTCOMES = [
   "error",
   "deploy-blocked",
   "static-ci-only",
+  // TEAM-4247 D2 — a dead-code sweep that found nothing removable. Terminal for
+  // the same reason as the two above: the run is over and the dossier must say so.
+  "nothing-to-remove",
 ] as const satisfies readonly RunOutcome[];
 
 describe("AC-D2.5 — RunOutcome new values are handled by a real consumer (isTerminalPhase)", () => {

@@ -131,8 +131,10 @@ const refusedPhases = (input) =>
     .map(([, value]) => value)
     .sort();
 
-/** All five phases a run can already be closed on (sorted, for comparison). */
-const ALL_TERMINAL_PHASES = ["cancelled", "complete", "deploy-blocked", "error", "static-ci-only"];
+/** All six phases a run can already be closed on (sorted, for comparison) —
+ *  TEAM-4247 D2 added "nothing-to-remove", the phase a no-op dead-code sweep is
+ *  claimed on, so both terminal claims must refuse it too. */
+const ALL_TERMINAL_PHASES = ["cancelled", "complete", "deploy-blocked", "error", "nothing-to-remove", "static-ci-only"];
 
 describe("createWorkflow", () => {
   it("puts create-once (attribute_not_exists on the key)", async () => {

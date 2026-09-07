@@ -7,18 +7,39 @@
  *   - TICKET_PROVIDER=jira → Real Jira Cloud + webhook trigger
  *
  * The Next.js app does NOT invoke any agents directly.
+ *
+ * OUTCOMES (200 unless noted):
+ *   - `{ workflowId, epicId, ticketId, … }`   a run was created.
+ *   - `{ workflowId, deduplicated: true }`    coalesced onto the canonical run for
+ *                                             this (sourceTicket, defId).
+ *   - `{ status: "skipped", reason, evidence }` a gate declined to start a run at
+ *                                             all — today only the sweep cadence
+ *                                             gate (TEAM-4247 D2). 200, because a
+ *                                             skip is a successful no-op and the
+ *                                             routines-runner treats 4xx as a
+ *                                             terminal filing failure.
+ *   - 400/403/422 validation, 500 on an internal failure.
  */
 
 import { timingSafeEqual, createHash } from "node:crypto";
 import { NextRequest, NextResponse } from "next/server";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
-import { DynamoDBDocumentClient, PutCommand, GetCommand, UpdateCommand, TransactWriteCommand } from "@aws-sdk/lib-dynamodb";
+import { DynamoDBDocumentClient, PutCommand, GetCommand, UpdateCommand, TransactWriteCommand, ScanCommand } from "@aws-sdk/lib-dynamodb";
 import { LambdaClient, InvokeCommand } from "@aws-sdk/client-lambda";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { validateIntakeSources, getSourceValidationMode, shouldRejectSubmission } from "@/lib/workflow/intake";
 import { validateSourcesShape } from "@/lib/workflow/source-shape";
-import { checkRepoConfig, definitiveFailures, describeRepoCheckFailure } from "@/lib/workflow/repo-check";
+import { checkRepoConfig, definitiveFailures, describeRepoCheckFailure, listOpenPullRequests } from "@/lib/workflow/repo-check";
 import type { RepoCheck } from "@/lib/workflow/repo-check";
+import {
+  normalizeSweepCadenceMode,
+  evaluateSweepGate,
+  buildSkipTombstone,
+  skipTombstoneId,
+  sweepRepoKey,
+  SWEEP_DEF_ID,
+} from "@/lib/workflow/sweep-cadence";
+import type { SweepWorkflowRow } from "@/lib/workflow/sweep-cadence";
 import type { WorkflowInput } from "@/lib/workflow/types";
 import type { WorkflowDef } from "@/lib/workflow/workflow-defs";
 import { workflowTypeForDef, resolveFramework, applyFramework } from "@/lib/workflow/workflow-defs";
@@ -28,6 +49,7 @@ import { resolveWorkflowDef } from "@/lib/workflow/defs-loader";
 const REGION = process.env.AWS_REGION || "us-east-1";
 const TICKETS_TABLE = process.env.TICKETS_TABLE || "agentcore-hub-tickets";
 const WORKFLOWS_TABLE = process.env.WORKFLOWS_TABLE || "agentcore-hub-workflows";
+const EVENTS_TABLE = process.env.EVENTS_TABLE || "agentcore-hub-events";
 const PROJECT_KEY = process.env.JIRA_PROJECT_KEY || process.env.PROJECT_KEY || "TEAM";
 const TICKET_PROVIDER = process.env.TICKET_PROVIDER || "dynamodb";
 const TICKET_TOOLS_LAMBDA = process.env.TICKET_TOOLS_LAMBDA || "agentcore-hub-tickets";
@@ -49,7 +71,15 @@ const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: REGION }), 
 const lambda = new LambdaClient({ region: REGION });
 const s3 = new S3Client({ region: REGION });
 
-const TERMINAL_PHASES = new Set(["complete", "error", "cancelled"]);
+// Dedup-only: which phases mean the canonical run behind a dedup marker is
+// FINISHED, so a fresh start re-points the marker instead of coalescing onto it.
+// TEAM-4247 D2 adds "nothing-to-remove" — a dead-code sweep that found nothing
+// removable is over, and coalescing next week's scheduled sweep onto it would
+// return the closed run's id and start nothing at all. (This set deliberately
+// still omits the ship-blocked outcomes, which predate D2 and are a separate
+// question: coalescing onto a deploy-blocked run is arguably right, since its
+// work DID happen. Not widened here.)
+const TERMINAL_PHASES = new Set(["complete", "error", "cancelled", "nothing-to-remove"]);
 
 // TEAM-3699: how long after a dedup marker is claimed the canonical run is
 // still presumed IN-FLIGHT when its workflow row hasn't appeared yet. The
@@ -323,6 +353,145 @@ async function markWorkflowStartError(workflowId: string, cause: unknown): Promi
   }
 }
 
+/**
+ * TEAM-4247 D2 FR-D2.4 — the sweep cadence gate.
+ *
+ * Runs ONLY for a scheduled `dead-code-sweep` start (see shouldGateSweep), above
+ * the dedup block, so a skip creates no marker, no epic, no ticket and no workflow
+ * row — nothing to clean up. Returns the NextResponse to send when the run is
+ * skipped, or null when it should proceed.
+ *
+ * Cost: one filtered+projected Scan of the workflows table and one GitHub call,
+ * for a handful of starts a week. It is a Scan (no defId GSI exists); acceptable
+ * here because it is off the hot human path, but a very large workflows table
+ * would want an index.
+ */
+async function applySweepCadenceGate(
+  body: WorkflowInput,
+  def: WorkflowDef
+): Promise<NextResponse | null> {
+  const mode = normalizeSweepCadenceMode(process.env.SWEEP_CADENCE_GATE);
+  if (mode === "off") return null;
+  if (def.id !== SWEEP_DEF_ID || body.trigger !== "scheduled") return null;
+  const repo = sweepRepoKey(body.repoConfig);
+  if (!repo) return null; // no parseable repo → nothing to be periodic about
+
+  const now = Date.now();
+  const at = new Date(now).toISOString();
+
+  // Prior runs of THIS def. Projected down to the cadence inputs (a full row
+  // carries agentTasks and the whole input), and fully paginated — the newest-50
+  // list read would hide a 3-day-old sweep on a busy table.
+  const rows: SweepWorkflowRow[] = [];
+  let lastKey: Record<string, unknown> | undefined;
+  do {
+    const page = await ddb.send(
+      new ScanCommand({
+        TableName: WORKFLOWS_TABLE,
+        FilterExpression: "#defId = :def",
+        ProjectionExpression: "workflowId, #defId, #phase, #type, startedAt, completedAt, deleted, #input.repoConfig",
+        ExpressionAttributeNames: {
+          "#defId": "workflowDefId",
+          "#phase": "phase",
+          "#type": "type",
+          "#input": "input",
+        },
+        ExpressionAttributeValues: { ":def": SWEEP_DEF_ID },
+        ExclusiveStartKey: lastKey,
+      })
+    );
+    rows.push(...((page.Items || []) as SweepWorkflowRow[]));
+    lastKey = page.LastEvaluatedKey as Record<string, unknown> | undefined;
+  } while (lastKey);
+
+  // The open-PR probe fails open (no token / rate limit / 5xx → probed:false), so
+  // a token expiry degrades to "cadence only", never to "no sweeps ever again".
+  const repoUrl = (body.repoConfig?.repos ?? []).find((r) => r?.url)?.url || "";
+  const probe = await listOpenPullRequests(repoUrl, { token: process.env.GITHUB_PAT });
+
+  const { skip, evidence } = evaluateSweepGate({
+    repo,
+    rows,
+    pulls: probe.pulls,
+    prProbe: { probed: probe.probed, ...(probe.reason ? { reason: probe.reason } : {}) },
+    now,
+  });
+
+  if (!skip) return null;
+
+  if (mode === "shadow") {
+    // Observe only: the run is created exactly as today. This is what makes the
+    // gate measurable before anyone lets it refuse work.
+    await writeSweepEvent(`shadow_${skipTombstoneId(repo, at)}`, at, "sweep.cadence_observed", {
+      wouldSkip: skip,
+      evidence,
+      repo,
+      defId: def.id,
+    });
+    console.warn(`[start] sweep cadence (shadow): would skip ${repo} — ${skip}`);
+    return null;
+  }
+
+  // enforce — one tombstone per (repo, day), conditional so a repeat tick that
+  // day writes nothing and reports the same skip.
+  const tombstone = buildSkipTombstone({ repo, reason: skip, evidence, at, defId: def.id, trigger: body.trigger });
+  try {
+    await ddb.send(
+      new PutCommand({
+        TableName: WORKFLOWS_TABLE,
+        Item: tombstone,
+        ConditionExpression: "attribute_not_exists(workflowId)",
+      })
+    );
+    await writeSweepEvent(tombstone.workflowId, at, "workflow.skipped", {
+      workflowId: tombstone.workflowId,
+      reason: skip,
+      evidence,
+      repo,
+      defId: def.id,
+      mode,
+    });
+  } catch (err) {
+    if ((err as Error).name !== "ConditionalCheckFailedException") throw err;
+    console.log(`[start] sweep cadence: ${tombstone.workflowId} already recorded today — skipping again, no new row`);
+  }
+
+  console.log(`[start] sweep cadence: SKIPPED ${repo} (${skip})`);
+  // 200, not 4xx: the routines-runner treats a 4xx as a terminal filing FAILURE,
+  // and a cadence skip is a successful no-op.
+  return NextResponse.json({ status: "skipped", reason: skip, evidence });
+}
+
+/**
+ * One events-table row, in the orchestrator's item shape (workflowId partition
+ * key, eventId sort key, type, detail, timestamp) — the same direct write
+ * publishEvent and the cancel route make. Non-fatal: an observation that cannot
+ * be recorded must not fail the start.
+ */
+async function writeSweepEvent(
+  workflowId: string,
+  timestamp: string,
+  type: string,
+  detail: Record<string, unknown>
+): Promise<void> {
+  try {
+    await ddb.send(
+      new PutCommand({
+        TableName: EVENTS_TABLE,
+        Item: {
+          workflowId,
+          eventId: `${Date.now()}-sweep-${Math.random().toString(36).slice(2, 6)}`,
+          timestamp,
+          type,
+          detail: { ...detail, timestamp },
+        },
+      })
+    );
+  } catch {
+    /* event publish is non-fatal */
+  }
+}
+
 export async function POST(req: NextRequest) {
   try {
     const body: WorkflowInput = await req.json();
@@ -476,6 +645,11 @@ export async function POST(req: NextRequest) {
       // `input: { ...body }`, so stamping body.sources is what reaches the row.
       body.sources = validation.sources;
     }
+
+    // TEAM-4247 D2 FR-D2.4: the cadence gate, ABOVE the dedup marker and every
+    // create — a skipped sweep must leave no marker, no epic and no tickets.
+    const cadenceSkip = await applySweepCadenceGate(body, def);
+    if (cadenceSkip) return cadenceSkip;
 
     // TEAM-3619 D4b: idempotency on (sourceTicket, defId). Only requests that
     // carry a sourceTicket are deduplicated — human/API callers keep the plain

@@ -8,6 +8,10 @@
  * and the fleet view never disagree about what "anomalous" means.
  */
 
+// The one source of the no-op outcome list; types.ts imports nothing, so this
+// stays cycle-free and the browser bundle picks up a string array, not AWS code.
+import { NO_OP_OUTCOMES } from "./types";
+
 export type BandStatus = "ok" | "warn" | "alert" | "insufficient" | "unknown";
 export type KpiUnit = "usd" | "ms" | "tokens" | "count" | "ratio";
 export type KpiGroup = "cost" | "time" | "quality";
@@ -239,6 +243,24 @@ export function isValidCard(c: CardSummary): boolean {
   return (c.cost?.total ?? 0) > 0 && !!c.completedAt;
 }
 
+/** Did this card's run close on a no-op outcome (TEAM-4247 D2)? */
+export function isNoOpCard(c: Pick<CardSummary, "outcome">): boolean {
+  return (NO_OP_OUTCOMES as readonly string[]).includes(c?.outcome ?? "");
+}
+
+/**
+ * May this card be a BASELINE comparable? Same predicate as
+ * `isBaselineEligible` in lambda/cost-report/index.mjs, so the fleet view and a
+ * run's own card never disagree about what "anomalous" means.
+ *
+ * A no-op run did happen and is worth looking at, but it did no delivery work:
+ * one detection agent, a few cents, one task. As a comparable it drags every
+ * median down and then flags the next real run as the anomaly.
+ */
+export function isBaselineCard(c: CardSummary): boolean {
+  return isValidCard(c) && !isNoOpCard(c);
+}
+
 export function buildFleetView(
   index: PerformanceIndex,
   opts: { days: number; workflowDefId?: string; now?: Date },
@@ -257,7 +279,11 @@ export function buildFleetView(
   const at = (c: CardSummary) => Date.parse(c.completedAt);
   const runs = scoped.filter((c) => at(c) >= start && at(c) < end).sort((a, b) => at(b) - at(a));
   const prior = scoped.filter((c) => at(c) >= priorStart && at(c) < start);
-  const baseline = scoped.filter((c) => at(c) >= baselineStart && at(c) < start);
+  // TEAM-4247 D2: the BASELINE is the comparator that defines "anomalous", so
+  // no-op runs are excluded from it. `runs` and `prior` deliberately keep theirs —
+  // those windows are descriptive ("what did the fleet actually do"), and a
+  // no-op sweep is part of that answer.
+  const baseline = scoped.filter((c) => at(c) >= baselineStart && at(c) < start && isBaselineCard(c));
 
   const kpis: FleetKpi[] = FLEET_KPIS.map((k) => {
     const cur = runs.map((c) => getPath(c, k.key)).filter((v): v is number => v != null);

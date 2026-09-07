@@ -9,7 +9,11 @@
 
 import type { RoutineInputTemplate } from "./types";
 
-export function buildStartPayload(input: RoutineInputTemplate, firedAt: Date) {
+export function buildStartPayload(
+  input: RoutineInputTemplate,
+  firedAt: Date,
+  opts: { trigger?: "scheduled" | "manual" } = {}
+) {
   const date = firedAt.toISOString().slice(0, 10);
   const title = input.titleTemplate.replace(/\{date\}/g, date);
   return {
@@ -20,5 +24,11 @@ export function buildStartPayload(input: RoutineInputTemplate, firedAt: Date) {
     sources: input.sources || [],
     ...(input.modelOverride ? { modelOverride: input.modelOverride } : {}),
     ...(input.connectors?.length ? { connectors: input.connectors } : {}),
+    // TEAM-4247 D2: the caller says how the run was initiated, because the sweep
+    // cadence gate skips "scheduled" starts only — this same builder serves the
+    // manual "Run now" route, which must never be cadence-skipped. Default
+    // "scheduled" (the schedule is the reason this module exists); Run now
+    // passes "manual" explicitly.
+    trigger: opts.trigger || "scheduled",
   };
 }

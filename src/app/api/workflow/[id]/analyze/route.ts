@@ -16,7 +16,10 @@ const ANALYZER_FUNCTION = process.env.WORKFLOW_ANALYZER_FUNCTION || "agentcore-h
 // TEAM-3747 D2: a run closed on a lifecycle-integrity ship outcome
 // (deploy-blocked / static-ci-only) is terminal and analyzable, exactly like
 // complete/error/cancelled. Additive; parity with completion.mjs SHIP_BLOCKED_OUTCOMES.
-const TERMINAL_PHASES = new Set(["complete", "cancelled", "error", "deploy-blocked", "static-ci-only"]);
+// TEAM-4247 D2: "nothing-to-remove" is terminal and analyzable too — a sweep that
+// found nothing removable is one of the runs most worth a dossier, since the
+// question it answers is whether the sweep was worth scheduling at all.
+const TERMINAL_PHASES = new Set(["complete", "cancelled", "error", "deploy-blocked", "static-ci-only", "nothing-to-remove"]);
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: REGION }), {
   marshallOptions: { removeUndefinedValues: true },

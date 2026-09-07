@@ -8,14 +8,22 @@
  * authored by the agent.
  */
 
-import type { ShipBlockedOutcome } from "./types";
+import type { NoOpOutcome, ShipBlockedOutcome } from "./types";
 
 export type AnalysisTrigger = "auto" | "manual" | "watch";
 // TEAM-3747 D2 — additively includes the lifecycle-integrity terminal outcomes
 // ("deploy-blocked" | "static-ci-only") so a blocked run is analyzed HONESTLY
 // rather than recorded as "complete". Legacy analyses (only complete/cancelled/
 // error) are unaffected. Parity: save_analysis.py RUN_OUTCOMES + WorkflowPhase.
-export type RunOutcome = "complete" | "cancelled" | "error" | ShipBlockedOutcome;
+// TEAM-4247 D2 adds the no-op outcomes ("nothing-to-remove") on the same terms —
+// a sweep that found nothing removable is a real run with a real analysis, and
+// recording it as "complete" is what made no-op sweeps look like deliveries.
+export type RunOutcome =
+  | "complete"
+  | "cancelled"
+  | "error"
+  | ShipBlockedOutcome
+  | NoOpOutcome;
 export type FindingKind = "bottleneck" | "failure" | "success" | "risk";
 export type FindingSeverity = "critical" | "high" | "medium" | "low";
 export type RecommendationPriority = "P0" | "P1" | "P2";

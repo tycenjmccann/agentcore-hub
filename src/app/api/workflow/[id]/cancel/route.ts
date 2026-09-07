@@ -20,7 +20,7 @@ import {
   QueryCommand,
   PutCommand,
 } from "@aws-sdk/lib-dynamodb";
-import { SHIP_BLOCKED_OUTCOMES } from "@/lib/workflow/types";
+import { SHIP_BLOCKED_OUTCOMES, NO_OP_OUTCOMES } from "@/lib/workflow/types";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const WORKFLOWS_TABLE = process.env.WORKFLOWS_TABLE || "agentcore-hub-workflows";
@@ -33,7 +33,17 @@ const TICKET_PROVIDER = process.env.TICKET_PROVIDER || "dynamodb";
 // honest verdict with "cancelled". PARITY with TERMINAL_PHASES in
 // complete/route.ts and completion.mjs; the F6 UI fix (WorkflowBoard hiding
 // Cancel) only removes the button — this route is the actual enforcement.
-const TERMINAL_PHASES = ["complete", "error", "cancelled", ...SHIP_BLOCKED_OUTCOMES] as const;
+// TEAM-4247 D2 spreads NO_OP_OUTCOMES in on exactly the same grounds: a no-op
+// dead-code sweep closed "nothing-to-remove" is finished, and cancelling it would
+// replace the outcome that says "there was nothing to remove" with "a human
+// cancelled it" — which is the wrong answer to the only question that run asked.
+const TERMINAL_PHASES = [
+  "complete",
+  "error",
+  "cancelled",
+  ...SHIP_BLOCKED_OUTCOMES,
+  ...NO_OP_OUTCOMES,
+] as const;
 
 /**
  * TEAM-3755 — build the "not already terminal" ConditionExpression from the

@@ -395,6 +395,39 @@ export default defineConfig({
       // ship cascade are identical with the gate armed. A gate that perturbed a
       // converging ship review would be worse than the hole it closes.
       "lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs",
+      // sweep-noop-close (TEAM-4247 D2) — the zero-yield sweep. Today the ONLY thing
+      // that ends such a run is blueprints/code-sweeper.md Step 2.5 asking the model
+      // to hand-skip every downstream ticket in reverse dependency order; miss one
+      // and a reviewer/QA/CI/release-manager is dispatched against a branch that does
+      // not exist. Drives both done twins through the REAL cascade, so the claims it
+      // pins are the wiring ones a predicate cannot express: zero successor
+      // dispatches, never workflow.complete, one close across the twins and a
+      // redelivery (the claimTerminalOutcome CAS), and `verified_removable` compared
+      // STRICTLY to 0 so an absent field on a pre-D2 record is not read as a no-op.
+      "lambda/orchestrator/sweep-noop-close.test.mjs",
+      // replay-c2uqki-sweep-noop (TEAM-4247 D2 acceptance) — the run D2 exists for:
+      // a sweep of tycenjmccann/ember that verified NOTHING removable, said so in
+      // prose, and then spent four gate personas, two fix tickets and a unified PR
+      // before reporting workflow.complete with a zero-task cost card. Replayed
+      // row-by-row from the vendored dossier through the REAL handler → cascade →
+      // completion → closeWorkflowNothingToRemove, with only the AWS seams mocked.
+      // Its load-bearing case is the flags-off one: the ordered event shape has to
+      // equal the shape the dossier's own events record. It also pins the two claims
+      // only a replay can make — that `enforce` reaches the close with ZERO
+      // reviewer/QA/CI dispatches on the fixture's real board, and that under shadow
+      // the yield note lands in the prompt each persona is actually dispatched with.
+      "lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs",
+      // replay-iczquj-sweep-full-chain (TEAM-4247 D2 regression) — the other half of
+      // the same argument, and the one that would actually hurt: a sweep of the same
+      // repo that DID find eight dead things and shipped them through review, QA, CI,
+      // a human Merge Approval and CD. c2uqki proves the detection gate fires; this
+      // proves it is inert everywhere else, on a real board rather than a predicate's
+      // idea of one. It is the f50ucz argument for D2: a gate that perturbed a
+      // productive sweep's cascade, its ship window or its completion would be worse
+      // than the hole it closes. Also pins the amendment-1 wedge — under `enforce` the
+      // sweep def requires BOTH `detection` and `development`, so a run with one
+      // sweeper ticket can never complete, which is why commit 4's intake plans two.
+      "lambda/orchestrator/replay-iczquj-sweep-full-chain.test.mjs",
     ],
     // Keep unit tests away from the Playwright specs under tests/.
     exclude: ["tests/**", "node_modules/**", "demo/**"],

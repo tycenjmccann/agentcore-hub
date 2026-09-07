@@ -36,7 +36,7 @@ import { getTicketsForWorkflowFromDynamo } from "@/lib/workflow/dynamo-read";
 import { getTicketsForWorkflowFromJira } from "@/lib/workflow/jira-read";
 import { JiraClient } from "@/lib/workflow/jira-client";
 import { resolveWorkflowDef } from "@/lib/workflow/defs-loader";
-import { SHIP_BLOCKED_OUTCOMES } from "@/lib/workflow/types";
+import { SHIP_BLOCKED_OUTCOMES, NO_OP_OUTCOMES } from "@/lib/workflow/types";
 import { resolveMissingEvidenceFromRecords } from "@/lib/workflow/completion-evidence";
 // TEAM-4246 D1: the verified-head gate's hand-port, in a lib module because a
 // route file may export only HTTP handlers (so the parity test can drive it).
@@ -85,7 +85,17 @@ const AGENT_PHASE_BY_ID: Record<string, string> = Object.fromEntries(
 // closed deploy-blocked / static-ci-only cannot be re-"completed" out from under
 // its honest verdict (the early guard below returns 409). Additive: legacy runs
 // never carry these phases, so their behavior is unchanged.
-const TERMINAL_PHASES = ["complete", "error", "cancelled", ...SHIP_BLOCKED_OUTCOMES] as const;
+// TEAM-4247 D2 adds the no-op outcomes for the same reason and it matters most
+// here: a no-op sweep closes "nothing-to-remove" with open (skipped-in-spirit)
+// siblings and no PR, and a manual or racing complete call would relabel that run
+// a delivery — the precise fiction D2 exists to end.
+const TERMINAL_PHASES = [
+  "complete",
+  "error",
+  "cancelled",
+  ...SHIP_BLOCKED_OUTCOMES,
+  ...NO_OP_OUTCOMES,
+] as const;
 const DONE_STATUSES = new Set(["done", "cancelled"]);
 
 /**

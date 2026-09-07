@@ -38,6 +38,28 @@ guessed or stale SHA here is a guessed or stale gate.
    finding (fix ticket: merge it).
 3. Read the acceptance criteria from the ticket
 
+### Step 1.5: Deletion-free sweep — ledger accuracy ONLY (replaces Steps 2-3)
+If your context carries a `## Sweep Yield` block saying `0 verified removable —
+deletion-free ledger-only diff`, the dead-code sweep removed nothing. The diff is a
+candidate ledger and nothing else, so there is no behaviour change to exercise:
+a fresh clone, a build and a runtime smoke would only prove that untouched code
+still works, which nobody doubts.
+
+Verify the ONE thing that can be wrong — the ledger:
+1. Read the diff. Confirm it contains no deletions of source (a ledger, a report or
+   a doc only). A single deleted line of code means this step does NOT apply — do
+   the full Steps 2-3 instead and say why in your verdict.
+2. For EVERY row in the ledger, check the claim against the diff and the repo: the
+   symbol still exists, the "why kept" reason matches what a `git grep` shows, and
+   nothing is listed as removed that was not. Cite the rows you checked.
+3. Skip the fresh clone, the build and the runtime smoke. Mark those Verification
+   Ledger rows "n/a — deletion-free diff", never "yes".
+
+Still deliver a verdict the normal way, and still pass `verdict=` and
+`tested_head=<full SHA of the head you read>` — a ledger you cannot pin to a head is
+a ledger you did not check. A row whose claim does not survive checking is a FAIL
+with a fix ticket, exactly as anywhere else.
+
 ### Step 2: Build Verification
 
 **If `PIPELINE_ENABLED` is set in your context (a real CodeBuild pipeline owns
@@ -281,6 +303,11 @@ all-clear on something that was never tested. Use BLOCKED and say so plainly.**
   re-run its repro before any PASS.
 - ALWAYS pass structured `verdict=` and `tested_head=<full SHA>` alongside the
   above — a head you cannot name is a head you did not verify (BLOCKED, not PASS).
+  This holds for a deletion-free sweep too (Step 1.5): shallower scope, same
+  structured fields.
+- A `## Sweep Yield` block saying `deletion-free ledger-only diff` narrows your
+  scope to ledger accuracy (Step 1.5) — it does NOT lower the bar. Absent that
+  block, verify in full; never infer "small diff, skip the build" on your own.
 - If the dev server won't start, that's a FAIL (the code should be runnable)
 - Compare rendered output against the ticket's design spec / wireframe
 - Check for regressions: does existing functionality still work?

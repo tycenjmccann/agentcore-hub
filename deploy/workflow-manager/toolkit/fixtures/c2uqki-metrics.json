@@ -1,0 +1,196 @@
+{
+ "startedAt": "2026-09-07T11:32:07.251000Z",
+ "completedAt": "2026-09-07T13:17:40.498000Z",
+ "totalDurationMs": 6333247,
+ "phases": [
+  {
+   "phase": "verification",
+   "enteredAt": "2026-09-07T12:30:57.829000Z",
+   "exitedAt": "2026-09-07T13:17:40.498000Z",
+   "durationMs": 2802669,
+   "taskCount": 1
+  }
+ ],
+ "agentTasks": [
+  {
+   "ticketId": "TEAM-4229",
+   "agentId": "agentcore_hub_requirements_analyst",
+   "phase": "requirements",
+   "invokedAt": "2026-09-07T11:32:11.569000Z",
+   "completedAt": "2026-09-07T11:42:10.105000Z",
+   "durationMs": 598536,
+   "status": "done",
+   "reworkCount": 0
+  },
+  {
+   "ticketId": "TEAM-4230",
+   "agentId": "agentcore_hub_code_sweeper",
+   "phase": "development",
+   "invokedAt": "2026-09-07T11:40:37.834000Z",
+   "completedAt": "2026-09-07T12:12:24.144000Z",
+   "durationMs": 1906310,
+   "status": "done",
+   "reworkCount": 0
+  },
+  {
+   "ticketId": "TEAM-4231",
+   "agentId": "agentcore_hub_code_reviewer",
+   "phase": "review",
+   "invokedAt": "2026-09-07T12:12:23.804000Z",
+   "completedAt": "2026-09-07T12:30:58.315000Z",
+   "durationMs": 1114511,
+   "status": "done",
+   "reworkCount": 0
+  },
+  {
+   "ticketId": "TEAM-4232",
+   "agentId": "agentcore_hub_qa_verifier",
+   "phase": "verification",
+   "invokedAt": "2026-09-07T12:30:58.152000Z",
+   "completedAt": "2026-09-07T12:55:09.422000Z",
+   "durationMs": 1451270,
+   "status": "done",
+   "reworkCount": 0
+  },
+  {
+   "ticketId": "TEAM-4233",
+   "agentId": "agentcore_hub_ci_agent",
+   "phase": "review",
+   "invokedAt": "2026-09-07T12:55:09.187000Z",
+   "completedAt": "2026-09-07T13:17:38.188000Z",
+   "durationMs": 1349001,
+   "status": "done",
+   "reworkCount": 0
+  },
+  {
+   "ticketId": "TEAM-4241",
+   "agentId": "agentcore_hub_code_sweeper",
+   "phase": "development",
+   "invokedAt": "2026-09-07T12:30:16.365000Z",
+   "completedAt": "2026-09-07T12:44:26.060000Z",
+   "durationMs": 849695,
+   "status": "done",
+   "reworkCount": 0
+  },
+  {
+   "ticketId": "TEAM-4242",
+   "agentId": "agentcore_hub_code_sweeper",
+   "phase": null,
+   "invokedAt": "2026-09-07T12:53:27.743000Z",
+   "completedAt": "2026-09-07T13:01:12.141000Z",
+   "durationMs": 464398,
+   "status": "done",
+   "reworkCount": 0
+  }
+ ],
+ "humanReviews": [],
+ "humanWaitTotalMs": 0,
+ "humanReviewsOutsideHours": 0,
+ "changeRequests": {
+  "count": 0,
+  "cycles": []
+ },
+ "fixTickets": {
+  "count": 2,
+  "ticketIds": [
+   "TEAM-4241",
+   "TEAM-4242"
+  ],
+  "entries": [
+   {
+    "ticketId": "TEAM-4241",
+    "kind": "codex_fix",
+    "originTicketId": null,
+    "round": 1,
+    "tag": "new",
+    "resurfacingSignal": null,
+    "paths": [
+     "removal_ledger.md"
+    ],
+    "createdAt": "2026-09-07T05:30:13.003-0700",
+    "title": "Fix (review): REMOVAL_LEDGER.md \u2014 3 findings (2 misattributed citations + PR not landed on integration branch)"
+   },
+   {
+    "ticketId": "TEAM-4242",
+    "kind": "qa_fix",
+    "originTicketId": null,
+    "round": 1,
+    "tag": "resurfacing",
+    "resurfacingSignal": "path",
+    "paths": [
+     "removal_ledger.md"
+    ],
+    "createdAt": "2026-09-07T05:53:27.743-0700",
+    "title": "Fix (QA): REMOVAL_LEDGER.md:205 \u2014 `dynamic \u00d727` is a count mislabel; actual is `dynamic \u00d721` + `maxDuration \u00d76`"
+   }
+  ],
+  "byKind": {
+   "codex_fix": 1,
+   "qa_fix": 1
+  },
+  "byTag": {
+   "new": 1,
+   "resurfacing": 1,
+   "fix-induced": 0,
+   "environmental": 0
+  }
+ },
+ "nudgeCount": 0,
+ "managerInterventions": [],
+ "errors": [],
+ "tokens": null,
+ "evalSummaries": [
+  {
+   "agentId": "agentcore_hub_ci_agent",
+   "sessionCount": 0,
+   "avgScores": {}
+  },
+  {
+   "agentId": "agentcore_hub_code_reviewer",
+   "sessionCount": 0,
+   "avgScores": {}
+  },
+  {
+   "agentId": "agentcore_hub_code_sweeper",
+   "sessionCount": 0,
+   "avgScores": {}
+  },
+  {
+   "agentId": "agentcore_hub_qa_verifier",
+   "sessionCount": 0,
+   "avgScores": {}
+  },
+  {
+   "agentId": "agentcore_hub_requirements_analyst",
+   "sessionCount": 343,
+   "avgScores": {
+    "Correctness": 0.42,
+    "Builtin.ToolSelectionAccuracy": 0.9569,
+    "Builtin.ResponseRelevance": 0.9971,
+    "Builtin.Helpfulness": 0.8121,
+    "Builtin.Correctness": 0.9556,
+    "Builtin.GoalSuccessRate": 0.9675,
+    "Builtin.ToolParameterAccuracy": 0.9248,
+    "Builtin.InstructionFollowing": 0.7985,
+    "Builtin.Coherence": 0.9601,
+    "dependency_chain_compliance_online": 0.1771,
+    "Builtin.Faithfulness": 0.9885
+   }
+  }
+ ],
+ "counts": {
+  "tickets": 8,
+  "events": 53,
+  "artifacts": 53,
+  "completions": 7
+ },
+ "dataQuality": {
+  "ticketProvider": "jira",
+  "missingSignals": [
+   "no token_usage events \u2014 per-run tokens unavailable (eval-config token totals are fleet-lifetime, not per-run)"
+  ],
+  "notes": [
+   "evalSummaries are fleet-lifetime rolling averages, not per-run scores"
+  ]
+ }
+}

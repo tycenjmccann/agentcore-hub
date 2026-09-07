@@ -1,0 +1,351 @@
+{
+ "workflowId": "wf_1788780725940_c2uqki",
+ "analysisId": "1788787425226-8hbb",
+ "schemaVersion": 1,
+ "workflowDefId": "dead-code-sweep",
+ "epicId": "TEAM-4228",
+ "analyzedAt": "2026-09-07T13:23:45.226067Z",
+ "trigger": "auto",
+ "runOutcome": "complete",
+ "model": "claude-fable-5",
+ "s3Prefix": "workflows/wf_1788780725940_c2uqki/analysis/1788787425226-8hbb/",
+ "metrics": {
+  "startedAt": "2026-09-07T11:32:07.251000Z",
+  "completedAt": "2026-09-07T13:17:40.498000Z",
+  "totalDurationMs": 6333247,
+  "phases": [
+   {
+    "phase": "verification",
+    "enteredAt": "2026-09-07T12:30:57.829000Z",
+    "exitedAt": "2026-09-07T13:17:40.498000Z",
+    "durationMs": 2802669,
+    "taskCount": 1
+   }
+  ],
+  "agentTasks": [
+   {
+    "ticketId": "TEAM-4229",
+    "agentId": "agentcore_hub_requirements_analyst",
+    "phase": "requirements",
+    "invokedAt": "2026-09-07T11:32:11.569000Z",
+    "completedAt": "2026-09-07T11:42:10.105000Z",
+    "durationMs": 598536,
+    "status": "done",
+    "reworkCount": 0
+   },
+   {
+    "ticketId": "TEAM-4230",
+    "agentId": "agentcore_hub_code_sweeper",
+    "phase": "development",
+    "invokedAt": "2026-09-07T11:40:37.834000Z",
+    "completedAt": "2026-09-07T12:12:24.144000Z",
+    "durationMs": 1906310,
+    "status": "done",
+    "reworkCount": 0
+   },
+   {
+    "ticketId": "TEAM-4231",
+    "agentId": "agentcore_hub_code_reviewer",
+    "phase": "review",
+    "invokedAt": "2026-09-07T12:12:23.804000Z",
+    "completedAt": "2026-09-07T12:30:58.315000Z",
+    "durationMs": 1114511,
+    "status": "done",
+    "reworkCount": 0
+   },
+   {
+    "ticketId": "TEAM-4232",
+    "agentId": "agentcore_hub_qa_verifier",
+    "phase": "verification",
+    "invokedAt": "2026-09-07T12:30:58.152000Z",
+    "completedAt": "2026-09-07T12:55:09.422000Z",
+    "durationMs": 1451270,
+    "status": "done",
+    "reworkCount": 0
+   },
+   {
+    "ticketId": "TEAM-4233",
+    "agentId": "agentcore_hub_ci_agent",
+    "phase": "review",
+    "invokedAt": "2026-09-07T12:55:09.187000Z",
+    "completedAt": "2026-09-07T13:17:38.188000Z",
+    "durationMs": 1349001,
+    "status": "done",
+    "reworkCount": 0
+   },
+   {
+    "ticketId": "TEAM-4241",
+    "agentId": "agentcore_hub_code_sweeper",
+    "phase": "development",
+    "invokedAt": "2026-09-07T12:30:16.365000Z",
+    "completedAt": "2026-09-07T12:44:26.060000Z",
+    "durationMs": 849695,
+    "status": "done",
+    "reworkCount": 0
+   },
+   {
+    "ticketId": "TEAM-4242",
+    "agentId": "agentcore_hub_code_sweeper",
+    "phase": null,
+    "invokedAt": "2026-09-07T12:53:27.743000Z",
+    "completedAt": "2026-09-07T13:01:12.141000Z",
+    "durationMs": 464398,
+    "status": "done",
+    "reworkCount": 0
+   }
+  ],
+  "humanReviews": [],
+  "humanWaitTotalMs": 0,
+  "humanReviewsOutsideHours": 0,
+  "changeRequests": {
+   "count": 0,
+   "cycles": []
+  },
+  "fixTickets": {
+   "count": 2,
+   "ticketIds": [
+    "TEAM-4241",
+    "TEAM-4242"
+   ],
+   "entries": [
+    {
+     "ticketId": "TEAM-4241",
+     "kind": "codex_fix",
+     "originTicketId": null,
+     "round": 1,
+     "tag": "new",
+     "resurfacingSignal": null,
+     "paths": [
+      "removal_ledger.md"
+     ],
+     "createdAt": "2026-09-07T05:30:13.003-0700",
+     "title": "Fix (review): REMOVAL_LEDGER.md \u2014 3 findings (2 misattributed citations + PR not landed on integration branch)"
+    },
+    {
+     "ticketId": "TEAM-4242",
+     "kind": "qa_fix",
+     "originTicketId": null,
+     "round": 1,
+     "tag": "resurfacing",
+     "resurfacingSignal": "path",
+     "paths": [
+      "removal_ledger.md"
+     ],
+     "createdAt": "2026-09-07T05:53:27.743-0700",
+     "title": "Fix (QA): REMOVAL_LEDGER.md:205 \u2014 `dynamic \u00d727` is a count mislabel; actual is `dynamic \u00d721` + `maxDuration \u00d76`"
+    }
+   ],
+   "byKind": {
+    "codex_fix": 1,
+    "qa_fix": 1
+   },
+   "byTag": {
+    "new": 1,
+    "resurfacing": 1,
+    "fix-induced": 0,
+    "environmental": 0
+   }
+  },
+  "nudgeCount": 0,
+  "managerInterventions": [],
+  "errors": [],
+  "tokens": null,
+  "evalSummaries": [
+   {
+    "agentId": "agentcore_hub_ci_agent",
+    "sessionCount": 0,
+    "avgScores": {}
+   },
+   {
+    "agentId": "agentcore_hub_code_reviewer",
+    "sessionCount": 0,
+    "avgScores": {}
+   },
+   {
+    "agentId": "agentcore_hub_code_sweeper",
+    "sessionCount": 0,
+    "avgScores": {}
+   },
+   {
+    "agentId": "agentcore_hub_qa_verifier",
+    "sessionCount": 0,
+    "avgScores": {}
+   },
+   {
+    "agentId": "agentcore_hub_requirements_analyst",
+    "sessionCount": 343,
+    "avgScores": {
+     "Correctness": 0.42,
+     "Builtin.ToolSelectionAccuracy": 0.9569,
+     "Builtin.ResponseRelevance": 0.9971,
+     "Builtin.Helpfulness": 0.8121,
+     "Builtin.Correctness": 0.9556,
+     "Builtin.GoalSuccessRate": 0.9675,
+     "Builtin.ToolParameterAccuracy": 0.9248,
+     "Builtin.InstructionFollowing": 0.7985,
+     "Builtin.Coherence": 0.9601,
+     "dependency_chain_compliance_online": 0.1771,
+     "Builtin.Faithfulness": 0.9885
+    }
+   }
+  ],
+  "counts": {
+   "tickets": 8,
+   "events": 53,
+   "artifacts": 53,
+   "completions": 7
+  },
+  "dataQuality": {
+   "ticketProvider": "jira",
+   "missingSignals": [
+    "no token_usage events \u2014 per-run tokens unavailable (eval-config token totals are fleet-lifetime, not per-run)"
+   ],
+   "notes": [
+    "evalSummaries are fleet-lifetime rolling averages, not per-run scores"
+   ]
+  }
+ },
+ "scores": {
+  "overall": 74,
+  "planning": 68,
+  "execution": 70,
+  "reviewEfficiency": 75,
+  "reworkDiscipline": 80
+ },
+ "verdict": "A fully autonomous, honestly-reported zero-removal ember sweep (0 errors, 0 nudges, 0 WATCH interventions, unified handoff PR #60 opened) that nonetheless spent 105.6 min, 97.8M tokens and $408.78 (3.3x median, performance card 'alert') running the full 4-gate chain on a repo swept 8 days earlier \u2014 the system executed well; the workflow should have short-circuited.",
+ "findings": [
+  {
+   "title": "Full 4-gate chain ran on a zero-deletion diff at 3.3x median cost",
+   "kind": "bottleneck",
+   "severity": "high",
+   "phase": "development",
+   "agentId": null,
+   "evidence": "TEAM-4230 REMOVED 0 of 93 candidates; PR #58 --diff-filter=D = 0 (+228 REMOVAL_LEDGER.md, +21 knip.jsonc). totalDurationMs 6,333,247; gate time reviewer 1,114,511 + QA 1,451,270 + CI 1,349,001 = 3,914,782 ms (61.8% of wall). workflow.performance: totalCostUsd 408.78 vs median 124.02 (z 2.47), tokens 97,794,383 vs median 16.4M (z 6.67), codingUsd 59.37 vs median 0 (z 29.7), status alert. Sweeper's own opening lastText: 'PR #57 (merged 2026-08-31) already swept this repo a week ago, so I expect a thin candidate list.'"
+  },
+  {
+   "title": "Sweep cadence: ember swept 3x in 14 days with diminishing yield 29 \u2192 8 \u2192 0",
+   "kind": "risk",
+   "severity": "high",
+   "phase": "intake",
+   "agentId": null,
+   "evidence": "wf_1787571125741_0ph7b1 (2026-08-24) 29 items, PR #56 still open; wf_1788175925679_iczquj (2026-08-31) 8 items, PR #57 merged f754cd3; wf_1788780725940_c2uqki (2026-09-07) 0 items. Auto-trigger has no last-sweep or open-sweep-PR check."
+  },
+  {
+   "title": "Sweeper ticket wired with blockedBy=[] \u2014 invoked before requirements completed (3rd ember recurrence)",
+   "kind": "risk",
+   "severity": "medium",
+   "phase": "requirements",
+   "agentId": "agentcore_hub_requirements_analyst",
+   "evidence": "TEAM-4230 blockedBy=[]; agent.invoked 11:40:37.834Z vs TEAM-4229 agent.complete 11:42:10.105Z (unblocked=[]) \u2014 92.3 s early. Same defect on 0ph7b1 and iczquj (TEAM-2859). No harm this run only because requirements.md was saved before the sweeper ticket was created."
+  },
+  {
+   "title": "Fix tickets ran concurrently with the gates that should have consumed them",
+   "kind": "risk",
+   "severity": "medium",
+   "phase": "verification",
+   "agentId": null,
+   "evidence": "TEAM-4241 blockedBy=[] ran 12:30:16\u201312:44:26 overlapping QA TEAM-4232 12:30:58\u201312:55:09 (QA verified stale head 1b399fb, noted fix in_progress). TEAM-4242 ran 12:53:27\u201313:01:12 overlapping CI TEAM-4233 12:55:09\u201313:17:38; CI observed head 16fc41d\u219273f0056 mid-run and re-ran the full suite. TEAM-4242 tagged resurfacing on path removal_ledger.md."
+  },
+  {
+   "title": "Ledger numeric error inherited from requirements.md and repeated without verification",
+   "kind": "failure",
+   "severity": "low",
+   "phase": "development",
+   "agentId": "agentcore_hub_code_sweeper",
+   "evidence": "TEAM-4242: REMOVAL_LEDGER.md:205 'dynamic \u00d727' \u2014 actual git grep -c = dynamic 21 + maxDuration 6; QA notes 'requirements.md carried the same erroneous 27 figure; the ledger repeated it rather than verifying it'. Fix commit 275a567 +1/\u22121."
+  },
+  {
+   "title": "Downstream tickets named a branch that never existed",
+   "kind": "risk",
+   "severity": "low",
+   "phase": "requirements",
+   "agentId": "agentcore_hub_requirements_analyst",
+   "evidence": "TEAM-4231/4232/4233 referenced chore/dead-code-sweep-2026-09-07; sweeper used feature/TEAM-4230-code-sweeper. Reviewer, QA and CI completions each report 'Ticket-named branch \u2026 does not exist' and reconciled manually."
+  },
+  {
+   "title": "Reviewer cannot post REQUEST_CHANGES \u2014 token is PR author",
+   "kind": "risk",
+   "severity": "low",
+   "phase": "review",
+   "agentId": "agentcore_hub_code_reviewer",
+   "evidence": "TEAM-4231 lastText: 'The token is the PR author, so GitHub refuses REQUEST_CHANGES. I'll post the same review as a COMMENT review.' PR #58 review state does not reflect the CHANGES NEEDED verdict."
+  },
+  {
+   "title": "Zero-intervention self-completion with honest zero-removal outcome and triple-verified ledger",
+   "kind": "success",
+   "severity": "low",
+   "phase": "complete",
+   "agentId": null,
+   "evidence": "managerInterventions=[], nudgeCount=0, errors=[], humanWaitTotalMs=0; every orchestrator.unblocked fired on time (TEAM-4231 12:12:24Z, TEAM-4232 12:30:58Z, TEAM-4233 12:55:09Z). 93/93 candidates grep-verified and independently re-verified on a fresh clone by reviewer; QA proof suite + runtime smoke exit 0; CI PASS at final head 73f0056 after re-running on head move. HANDOFF honoured: main untouched at f754cd3, unified PR #60 opened. knip.jsonc committed for future runs. First ember run since 0ph7b1 to need no WATCH rescue (iczquj needed 2)."
+  }
+ ],
+ "recommendations": [
+  {
+   "title": "Detection-only pre-flight phase with early exit on zero verified removals",
+   "priority": "P0",
+   "type": "workflow-def",
+   "target": "dead-code-sweep def: new phase between requirements and development",
+   "description": "Run knip/ts-prune/depcheck + grep verification as a cheap first phase. If verified-removals = 0, publish the ledger to S3/PR, terminate with a distinct outcome (nothing-to-remove) and skip code_reviewer/qa_verifier/ci_agent.",
+   "expectedImpact": "On this run: \u22123,914,782 ms of gate time (61.8% of wall) and the bulk of the $408.78; zero-yield sweeps become a ~40-min, low-cost no-op with an honest outcome label."
+  },
+  {
+   "title": "Cadence gate on auto-triggered sweeps",
+   "priority": "P0",
+   "type": "process",
+   "target": "intake / auto-trigger scheduler",
+   "description": "Before dispatching a dead-code sweep on a repo, check the workflows table and GitHub: skip if a sweep merged to the default branch < 14 days ago, or if a prior sweep PR is still open (ember: PR #56 open since 2026-08-24). Surface the skip as an event so it is visible.",
+   "expectedImpact": "Prevents the 29\u21928\u21920 diminishing-returns pattern from burning full-chain cost weekly; ember's third sweep in 14 days would not have run."
+  },
+  {
+   "title": "Enforce blockedBy=[requirements ticket] on the sweeper ticket; emit real branch names",
+   "priority": "P1",
+   "type": "prompt",
+   "target": "agentcore_hub_requirements_analyst blueprint + orchestrator ticket-plan validation",
+   "description": "Analyst blueprint must set blockedBy on the tier-3 (sweeper) ticket; orchestrator should reject a ticket-plan.json where a non-root ticket has blockedBy=[] while the requirements ticket is not done. Downstream tickets should reference the harness branch convention feature/<ticketId>-code-sweeper, not an aspirational chore/... name.",
+   "expectedImpact": "Closes a 3-of-3 ember wiring defect (TEAM-4230, TEAM-2859, 0ph7b1) and removes the per-agent 'ticket-named branch does not exist' reconciliation seen on TEAM-4231/4232/4233."
+  },
+  {
+   "title": "Fix-before-verify: re-block QA/CI on open fix tickets",
+   "priority": "P1",
+   "type": "gate-config",
+   "target": "orchestrator dispatch for qa_verifier / ci_agent",
+   "description": "When a reviewer files a fix ticket against the PR, add it to the QA ticket's blockedBy (and QA-filed fixes to CI's) before dispatch, so each gate verifies the corrected head.",
+   "expectedImpact": "Eliminates stale-head verification (QA on 1b399fb while TEAM-4241 in flight) and mid-run head moves (CI 16fc41d\u219273f0056); removes the 'resurfacing' fix class seen on TEAM-4242."
+  },
+  {
+   "title": "Deletion-count-aware gate depth",
+   "priority": "P1",
+   "type": "gate-config",
+   "target": "code_reviewer / qa_verifier gates",
+   "description": "If the PR diff has --diff-filter=D = 0 and touches only ledger/config paths, run a ledger-accuracy review only (skip fresh-clone build + runtime smoke in QA; CI verifies the build once).",
+   "expectedImpact": "Preserves the ledger-accuracy catches (3 reviewer + 1 QA findings) at a fraction of 1,114,511 + 1,451,270 ms of gate compute."
+  },
+  {
+   "title": "Sweeper re-derives any numeric claim inherited from requirements.md",
+   "priority": "P2",
+   "type": "prompt",
+   "target": "agentcore_hub_code_sweeper blueprint",
+   "description": "Counts copied from requirements into REMOVAL_LEDGER.md must be re-computed with git grep -c before commit; cite the command and result in the ledger row.",
+   "expectedImpact": "Would have avoided TEAM-4242 (464,398 ms + PR #59)."
+  },
+  {
+   "title": "Separate GitHub identity for the reviewer",
+   "priority": "P2",
+   "type": "tooling",
+   "target": "code_reviewer GitHub credentials",
+   "description": "Use a distinct GitHub App/identity for agentcore_hub_code_reviewer so REQUEST_CHANGES is permitted on PRs authored by the sweeper token.",
+   "expectedImpact": "PR review state reflects the gate verdict; humans reading PR #58-style handoffs see CHANGES NEEDED, not a comment."
+  }
+ ],
+ "trend": {
+  "priorRunsCompared": 5,
+  "deltas": {
+   "totalDurationMs": -34085697,
+   "humanWaitTotalMs": -58921615,
+   "changeRequests": -2,
+   "overallScore": -11
+  },
+  "notes": "Deltas vs wf_1788175925679_iczquj (ember, 2026-08-31, overall 85; its 40.4M ms wall was human-gate + transient-Bedrock crash park, its 2 change requests were phantom double-emits). This run is far more autonomous (0 WATCH rescues vs 2) but produced zero removals at 3.3x median cost. Ember yield trend: 29 (0ph7b1, 08-24) \u2192 8 (iczquj, 08-31) \u2192 0 (c2uqki, 09-07). Sweeper blockedBy=[] wiring defect now 3-of-3 on ember. Handoff (no release_manager) shape did NOT exhibit the missed-unblock cascade that hit all 4 extended-shape runs (dom4hd, iczquj, 6o493q, o71s0v)."
+ },
+ "summaryMarkdown": "# Run analysis \u2014 wf_1788780725940_c2uqki\n**Dead Code Sweep \u2014 tycenjmccann/ember \u2014 2026-09-07** \u00b7 defId `dead-code-sweep` \u00b7 outcome `complete` \u00b7 delivery `handoff` \u00b7 trigger auto\n\n## Verdict\nA fully autonomous, honestly-reported **zero-removal** sweep: the 5-agent chain self-completed with 0 errors, 0 nudges, 0 WATCH interventions and 0 human wait \u2014 the first ember run since 0ph7b1 to do so \u2014 but it spent **105.6 min, 97.8M tokens and $408.78** (performance card status `alert`, 3.3x the $124 median) proving that a repo swept 8 days earlier (PR #57, 2026-08-31) had nothing left to remove. The system executed well; the workflow should not have run the full chain.\n\n## Measured facts (compute_metrics.py)\n- Wall clock: **6,333,247 ms (105.6 min)**, 11:32:07Z \u2192 13:17:40Z. Agent work 7,688,796 ms (> wall: fix tickets ran in parallel with gates).\n- Serial chain: TEAM-4229 analyst 598,536 ms (10.0 min) \u2192 TEAM-4230 sweeper **1,906,310 ms (31.8 min, 30.1% of wall \u2014 critical path)** \u2192 TEAM-4231 reviewer 1,114,511 ms (18.6 min) \u2192 TEAM-4232 QA 1,451,270 ms (24.2 min) \u2192 TEAM-4233 CI 1,349,001 ms (22.5 min).\n- Fix tickets: 2 (TEAM-4241 codex_fix 849,695 ms; TEAM-4242 qa_fix 464,398 ms, tag `resurfacing` on the same path `REMOVAL_LEDGER.md`). changeRequests=0, humanReviews=[], nudges=0, errors=0, managerInterventions=[].\n- Counts: 8 tickets, 53 events, 53 artifacts, 7 completions. Ticket provider Jira.\n- Performance card (workflow.performance event): totalCostUsd 408.78 (median 124.02, z 2.47), personaUsd 349.41, codingUsd 59.37 (median 0, z 29.7), tokens 97,794,383 (median 16.4M, z 6.67), agentWorkMs z 4.98, loops 2.\n\n## Deliverable\n- Detection: knip 5.88.1 + ts-prune 0.10.3 + depcheck 1.4.7 run per-workspace (root + mcp/port-session). 93 candidates, every one grep-verified repo-wide (verification-grep.txt 105 KB, independently re-run on a fresh clone at f754cd3 \u2014 identical).\n- Verdicts: REMOVED 0 \u00b7 KEPT-USED-IN-MODULE 53 \u00b7 KEPT-FRAMEWORK 26 \u00b7 false-positive 12 \u00b7 uncertain 1 \u00b7 contract 1.\n- PR #58 (feature/TEAM-4230-code-sweeper @ 1b399fb): +228/\u22120 REMOVAL_LEDGER.md, +21/\u22120 knip.jsonc, `--diff-filter=D` = 0. Landed on integration branch as 16fc41d (TEAM-4241), then PR #59 \u2192 73f0056 (TEAM-4242). Unified handoff **PR #60** opened to main from feature/TEAM-4228-\u2026; main untouched at f754cd3.\n- Gates: reviewer CHANGES NEEDED (3 ledger-accuracy findings, 0 false-positive deletions) \u2192 QA FAIL (1 ledger-count finding; all proof commands exit 0, runtime smoke non-5xx) \u2192 CI PASS at 73f0056 (tsc root, next build, mcp:build, mcp tsc \u2014 all exit 0; re-ran full suite when head moved mid-run).\n- Lasting value: `knip.jsonc` is now committed, so future ember sweeps can run knip without re-deriving config.\n\n## Planning (68)\n- Roster correct for a handoff sweep (4 agents + CI, no Ship/CD \u2014 CD_REGISTERED false). Requirements defined \"full test suite\" concretely for a repo with no test runner (tsc root, next build, mcp:build, mcp tsc, runtime smoke) and declared the empty-removal outcome explicitly valid (R7). Good.\n- **Wiring defect, 3rd ember recurrence:** TEAM-4230 (sweeper) `blockedBy=[]`. The sweeper was invoked at 11:40:37.834Z, **92.3 s before** the analyst's agent.complete (11:42:10.105Z, `unblocked=[]`). Only the analyst's ordering discipline (requirements.md saved before the sweeper ticket was created) prevented a race on the requirements doc. Same pattern as 0ph7b1 and iczquj (TEAM-2859 blockedBy=[]). The analyst's fleet-lifetime `dependency_chain_compliance_online` = 0.18 is background consistent with this \u2014 not per-run evidence.\n- **Branch-name mismatch:** all four downstream tickets named branch `chore/dead-code-sweep-2026-09-07`; the sweeper actually used `feature/TEAM-4230-code-sweeper`. Reviewer, QA and CI each had to detect and reconcile this (\"Ticket-named branch \u2026 does not exist\") \u2014 friction on three sessions.\n- **Error seeded upstream:** requirements.md stated `dynamic \u00d727`; the true counts are `dynamic \u00d721` + `maxDuration \u00d76`. The sweeper copied the figure into REMOVAL_LEDGER.md:205 without verifying; QA caught it \u2192 TEAM-4242. Root cause is requirements accuracy + inherited-number trust, not sweeper detection.\n- **No pre-flight \"is there anything to sweep?\" check.** The sweeper itself wrote at start: \"PR #57 (merged 2026-08-31) already swept this repo a week ago, so I expect a thin candidate list.\" The workflow def has no cheap detection-only short-circuit; the full 4-gate chain ran on a diff with 0 deletions.\n\n## Execution (70)\n- Zero orchestration failures: every `orchestrator.unblocked` fired on time (TEAM-4231 @12:12:24, TEAM-4232 @12:30:58, TEAM-4233 @12:55:09), no dead sessions, no retries. This handoff shape (no release_manager) does not exhibit the missed-unblock cascade that hit all four extended-shape runs.\n- Sweeper 31.8 min is legitimate work (93 candidates verified one-by-one, artifacts archived) but for zero yield. Reviewer 18.6 + QA 24.2 + CI 22.5 = **65.3 min (61.8% of wall) of gate time on a 0-deletion, ledger-only diff**.\n- **Fix tickets ran concurrently with the gates they should have preceded:** TEAM-4241 (`blockedBy=[]`, 12:30:16\u201312:44:26) overlapped QA (12:30:58\u201312:55:09), so QA verified the stale head 1b399fb and had to note \"TEAM-4241 in_progress, had not pushed\". TEAM-4242 (12:53:27\u201313:01:12) overlapped CI (12:55:09\u201313:17:38); CI saw the head move 16fc41d\u219273f0056 mid-run and correctly re-ran the full suite at the final SHA. Outcome is sound only because CI was diligent \u2014 the def does not enforce fix-before-verify.\n- Cost: $408.78 / 97.8M tokens for +249/\u22120 of markdown+config. `codingUsd` 59.37 vs median 0 indicates the codex delegation path was used heavily (sweeper ran codex for detection, and resumed the session for both fixes).\n\n## Human-in-the-loop (reviewEfficiency 75)\n- No human gates by design (handoff delivery; PR #60 left for the owning team). humanWaitTotalMs = 0.\n- Agent gates did real independent verification: reviewer used a fresh clone + its own engine, confirmed REMOVED-set \u2205 == deletions \u2205 and the protected surface intact; QA ran the full proof suite + runtime smoke (`next start` and standalone server) on Node 20/22. Both caught genuine ledger inaccuracies (misattributed `Cli` citation at :116, wrong protocol peer for `encodeClose` at :198, `\u00d727` mislabel at :205).\n- But ROI was low: ~65 min of gate compute to correct three lines of prose in a ledger that documents *non*-removals. A deletion-count-aware gate policy (light review when `--diff-filter=D` = 0) would have preserved the accuracy check at a fraction of the cost.\n- Tooling gap: reviewer could not post REQUEST_CHANGES because the GitHub token is the PR author; verdict was posted as a COMMENT review. The PR's review state therefore does not reflect the gate verdict.\n\n## Rework (reworkDiscipline 80)\n- 2 fix tickets, both ledger-text-only, both resolved first pass, both with proof commands re-run (exit 0). TEAM-4242 correctly `blockedBy` TEAM-4241 so the two edits to the same file landed serially. Sweeper honoured HANDOFF mode throughout (never merged to main, never called Pipeline tools).\n- TEAM-4242 tagged `resurfacing` (same path as TEAM-4241): QA found a defect on the same file the reviewer had just fixed \u2014 because the reviewer's three findings did not include the count error and QA reviewed the pre-fix head. Not a fix-induced regression, but a sign the two gates overlapped rather than layered.\n- Root causes: F1/F2 = sweeper citation accuracy; F3 = process ambiguity about who lands the PR on the integration branch (\"If the harness performs that merge automatically \u2026 say so and skip\"); TEAM-4242 = inherited requirements error. None were detection false positives \u2014 the core sweep was correct.\n\n## Trend\n- Ember has now been swept 3x in 14 days: 0ph7b1 (2026-08-24, 29 items, PR #56 still open/unmerged), iczquj (2026-08-31, 8 items, PR #57 merged), c2uqki (2026-09-07, **0 items**). Diminishing returns are complete; weekly auto-cadence on this repo is now pure cost. Note PR #56 remains open \u2014 its 29 removals never landed, so a later sweep may re-discover them once #56 is closed or rebased.\n- vs iczquj (most recent ember, overall 85): wall \u221234,085,697 ms (iczquj's 40.4M ms was human-gate + crash park), human wait \u221258,921,615 ms, changeRequests \u22122 (iczquj's were phantom double-emits), score \u22129. This run is *more autonomous* but *less valuable* \u2014 the score penalises a full-chain run on a zero-yield target, not agent execution.\n- The `blockedBy=[]` on the sweeper ticket is now a 3-of-3 pattern on ember (0ph7b1, iczquj TEAM-2859, c2uqki TEAM-4230). Workflow-def-level, not repo-level.\n- Priors in dossier: o71s0v 85, 6o493q 84, iczquj 85, dom4hd 84, 4vraf4 91 (smoke). This run: 74.\n\n## Recommendations\n1. **P0 workflow-def \u2014 detection-only pre-flight with early exit.** Add a cheap phase after requirements: run knip/ts-prune/depcheck + grep verification; if verified-removals = 0, publish the ledger, terminate with a distinct `outcome=nothing-to-remove`, and skip reviewer/QA/CI. Would have saved ~65 min and most of the $409 here.\n2. **P0 process \u2014 sweep cadence gate on auto-trigger.** Do not auto-start a sweep on a repo whose last sweep (a) merged < 14 days ago or (b) still has an open sweep PR (ember: PR #56 open since 08-24, #57 merged 08-31). Check the workflows table / GitHub before dispatch.\n3. **P1 workflow-def / prompt \u2014 enforce `blockedBy=[requirements]` on the sweeper ticket.** 3-of-3 ember runs shipped it empty. Either the orchestrator validates the chain on ticket-plan.json (reject a tier-3 ticket with no blocker) or the analyst blueprint is made explicit. Also make the analyst emit the *actual* branch naming convention (`feature/<ticket>-code-sweeper`) into downstream tickets instead of an aspirational `chore/\u2026` name.\n4. **P1 gate-config \u2014 fix-before-verify ordering.** When a reviewer files a fix ticket, the QA ticket should be re-blocked on it (and CI on any QA fix) so gates verify the corrected head rather than a stale one. QA verified 1b399fb while TEAM-4241 was in flight; CI absorbed a mid-run head move.\n5. **P1 gate-config \u2014 deletion-count-aware review depth.** When `--diff-filter=D` = 0 and the diff touches only ledger/config, run a ledger-accuracy review only (no fresh-clone build/runtime smoke in QA, CI still verifies the build once).\n6. **P2 prompt \u2014 sweeper must verify inherited counts.** Any numeric claim copied from requirements.md into the ledger must be re-derived (`git grep -c`) before commit \u2014 the `\u00d727` mislabel originated upstream and was repeated verbatim.\n7. **P2 tooling \u2014 reviewer identity.** Use a distinct GitHub identity/app for the reviewer so REQUEST_CHANGES is permitted and PR review state reflects the gate verdict.\n"
+}

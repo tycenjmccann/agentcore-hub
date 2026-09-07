@@ -45,7 +45,9 @@ export async function PATCH(
     // 2. Refuse to archive a still-running workflow — archiving hides it while
     //    its agents keep working. Only terminal states may be archived.
     const phase = wfResult.Item.phase as string | undefined;
-    const TERMINAL = ["complete", "error", "cancelled"];
+    // TEAM-4247 D2: a no-op dead-code sweep ("nothing-to-remove") is finished, so
+    // it is archivable — it is also the run class a human most wants off the board.
+    const TERMINAL = ["complete", "error", "cancelled", "nothing-to-remove"];
     const alreadyArchived = wfResult.Item.archived === true;
     if (phase && !TERMINAL.includes(phase) && !alreadyArchived) {
       return NextResponse.json(

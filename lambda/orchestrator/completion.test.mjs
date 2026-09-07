@@ -5,6 +5,7 @@ import {
   shipVerdictOf,
   evaluateShipVerdict,
   SHIP_BLOCKED_OUTCOMES,
+  NO_OP_OUTCOMES,
   SHIP_PHASES,
   TERMINAL_WORKFLOW_PHASES,
   notTerminalPhaseGuard,
@@ -183,6 +184,65 @@ describe("isWorkflowComplete — legacy heuristic (no completionRequiresAgentPha
   it("is not complete with no terminal (dev/qa/ci) done ticket", () => {
     const children = [{ ticketId: "T-1", assignee: "agentcore_hub_requirements_analyst", status: "done" }];
     expect(isWorkflowComplete(children, LEGACY, {})).toBe(false);
+  });
+});
+
+/**
+ * TEAM-4247 D2 — the sweep def's "detection" phase, which is a DEF phase and not a
+ * ROSTER phase: no agent in agents.json claims it (the sweeper's roster phase is
+ * "development"), so the ONLY thing that can satisfy the requirement is the
+ * ticket's explicit `phase` stamp. That is why the intake context asks the analyst
+ * for `Tickets___create_ticket(phase="detection")`, and why the requirement itself
+ * is stripped from the effective def until SWEEP_DETECTION_PHASE=enforce
+ * (index.mjs stripUnenforcedDetectionPhase) — a synced config must not be able to
+ * wedge a sweep whose intake never stamped one.
+ */
+describe("isWorkflowComplete — the sweep's detection phase (TEAM-4247 D2)", () => {
+  // The dead-code-sweep def under enforce: detection is required, and it sits
+  // ahead of the removal phase the same agent serves.
+  const SWEEP_DEF = {
+    completionRequiresAgentPhases: ["detection", "development", "verification", "review", "ship"],
+    reviewGates: [{ afterPhase: "ship", blocking: true, condition: "always", onReject: "rework" }],
+  };
+  // The sweeper serves BOTH sweep phases, so its roster phase alone can never
+  // distinguish the two tickets — exactly the ambiguity the stamp resolves.
+  const sweepOpts = { getAgentPhase: (a) => (a === "sweeper" ? "development" : PHASE[a]) };
+  /** The removal + verify + ship chain, all done. Detection is the variable. */
+  const chain = (extra = []) => [
+    { ticketId: "S-2", assignee: "sweeper", status: "done" },
+    { ticketId: "T-2", assignee: "qa", status: "done" },
+    { ticketId: "T-3", assignee: "ci", status: "done" },
+    { ticketId: "T-4", assignee: "rm", status: "done" },
+    { ticketId: "G-1", assignee: "human:reviewer", phase: "ship", status: "done" },
+    ...extra,
+  ];
+
+  it("is NOT complete while the required detection phase has no done ticket", () => {
+    // Every other phase is done, and the sweeper's own removal ticket is done —
+    // its roster phase counts for "development" and cannot double as detection.
+    expect(isWorkflowComplete(chain(), SWEEP_DEF, sweepOpts)).toBe(false);
+  });
+
+  it("completes once the STAMPED detection ticket is done", () => {
+    const stamped = { ticketId: "S-1", assignee: "sweeper", phase: "detection", status: "done" };
+    expect(isWorkflowComplete(chain([stamped]), SWEEP_DEF, sweepOpts)).toBe(true);
+  });
+
+  it("an OPEN stamped detection ticket blocks completion", () => {
+    const open = { ticketId: "S-1", assignee: "sweeper", phase: "detection", status: "in_progress" };
+    expect(isWorkflowComplete(chain([open]), SWEEP_DEF, sweepOpts)).toBe(false);
+  });
+
+  it("the SAME children complete when the requirement is stripped (off/shadow)", () => {
+    // What stripUnenforcedDetectionPhase hands isWorkflowComplete under off and
+    // shadow: an unstamped run is completable exactly as it was pre-4247.
+    const stripped = {
+      ...SWEEP_DEF,
+      completionRequiresAgentPhases: SWEEP_DEF.completionRequiresAgentPhases.filter(
+        (p) => p !== "detection"
+      ),
+    };
+    expect(isWorkflowComplete(chain(), stripped, sweepOpts)).toBe(true);
   });
 });
 
@@ -686,6 +746,8 @@ describe("AC-D2.5 — legacy records evaluate exactly as before D2", () => {
     // deploy/workflow-manager/toolkit/save_analysis.py (RUN_OUTCOMES). A change
     // here without updating those breaks the three-way contract.
     expect(SHIP_BLOCKED_OUTCOMES).toEqual(["deploy-blocked", "static-ci-only"]);
+    // TEAM-4247 D2's outcome is a SEPARATE list, mirrored in the same three files.
+    expect(NO_OP_OUTCOMES).toEqual(["nothing-to-remove"]);
     expect(SHIP_PHASES.has("ship")).toBe(true);
     expect(SHIP_PHASES.has("review")).toBe(false);
   });
@@ -699,19 +761,29 @@ describe("AC-D2.5 — legacy records evaluate exactly as before D2", () => {
  * static-ci-only close overwrote the verdict with "complete".
  */
 describe("terminal-phase guard (TEAM-3755 F2)", () => {
-  it("the list is exactly the five phases a run can already be closed on", () => {
+  it("the list is exactly the six phases a run can already be closed on", () => {
+    // TEAM-4247 D2 added the sixth: a no-op dead-code sweep closes
+    // "nothing-to-remove" through claimTerminalOutcome, so every terminal-claim
+    // CAS must refuse it too or a late completion overwrites the honest outcome.
     expect([...TERMINAL_WORKFLOW_PHASES]).toEqual([
       "complete",
       "cancelled",
       "error",
       "deploy-blocked",
       "static-ci-only",
+      "nothing-to-remove",
     ]);
   });
 
-  it("derives from SHIP_BLOCKED_OUTCOMES, so a sixth outcome cannot be forgotten", () => {
-    for (const outcome of SHIP_BLOCKED_OUTCOMES) {
+  it("derives from SHIP_BLOCKED_OUTCOMES and NO_OP_OUTCOMES, so a further outcome cannot be forgotten", () => {
+    for (const outcome of [...SHIP_BLOCKED_OUTCOMES, ...NO_OP_OUTCOMES]) {
       expect(TERMINAL_WORKFLOW_PHASES).toContain(outcome);
+    }
+    // The two lists stay disjoint: a no-op sweep was not BLOCKED, and folding it
+    // into the ship-blocked set would trip the ship gates and the blocked-run
+    // alerting on a healthy run.
+    for (const outcome of NO_OP_OUTCOMES) {
+      expect(SHIP_BLOCKED_OUTCOMES).not.toContain(outcome);
     }
   });
 

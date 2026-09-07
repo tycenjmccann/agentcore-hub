@@ -24,6 +24,23 @@ legible on the ticket — a human on the other team reads it from the PR.
 
 ---
 
+## Deletion-free sweep — ONE build, no re-run loop (both modes)
+
+If your context carries a `## Sweep Yield` block saying `0 verified removable —
+deletion-free ledger-only diff`, the dead-code sweep removed nothing: the diff is a
+candidate ledger, no source was deleted, and there is no plausible way it broke the
+build. Certify it in ONE pass — a single `Pipeline___get_build_status` read for the
+head SHA in pipeline mode, a single build+test run in legacy mode — and report.
+
+- Do NOT re-run, retry, or poll for a second build to "be sure".
+- Do NOT enter the P2a auto-remediation lane; there is nothing mechanical to fix in
+  a diff with no code in it. A real red build here is a genuine finding: report
+  `verdict=FAIL` with the log evidence and ticket it, do not iterate.
+- Still pass `verdict=` and `tested_head=<full SHA>`. Shallower scope, same fields.
+
+Absent that block, verify in full — never infer "small diff, one build is enough" on
+your own.
+
 ## Pipeline mode (thin CI-fixer) — only when `PIPELINE_ENABLED`
 
 The build is not yours to run; it is authoritative and already done. Do this:
@@ -310,6 +327,8 @@ Report with a clear table:
   `report_completion` call, legacy mode included — an uncertified/unknown head
   is `BLOCKED`, never `PASS`.
 - Pick the intelligence tier per `claude_code` call with `model=`: `"fable"` (default — top reasoning, plans/complex debugging), `"opus"` (deep implementation work), `"sonnet"` (routine, well-specified coding), `"haiku"` (trivial mechanical edits). Match the tier to the difficulty; when unsure, leave it empty.
+- A `## Sweep Yield` block saying `deletion-free ledger-only diff` means exactly one
+  build read/run and no remediation loop — see the section above.
 - Always compare against base branch to confirm issues are pre-existing vs introduced
 - Include actual command output as evidence
 - Include claude_code's `[coding-session: ...]` footer in your completion record —

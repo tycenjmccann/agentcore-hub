@@ -168,6 +168,60 @@ export async function checkRepoConfig(
   return { checkedAt: new Date().toISOString(), results };
 }
 
+/** One open pull request, reduced to what a caller can decide on. */
+export interface OpenPullRequest {
+  number: number;
+  url: string;
+  headRef: string;
+  title: string;
+  draft: boolean;
+  labels: string[];
+}
+
+/**
+ * Open PRs on a repo (TEAM-4247 D2 — the sweep cadence gate's second input).
+ *
+ * FAILS OPEN, deliberately, the same trade checkRepoUrl already makes: with no
+ * token, a rate limit, a 5xx or a network error we learned NOTHING about the
+ * repo's PRs, so the caller is told `probed: false` and must not treat the empty
+ * list as "no open PRs". Failing closed would silently stop every scheduled sweep
+ * on a token expiry, which is the louder outage of the two.
+ */
+export async function listOpenPullRequests(
+  url: string,
+  opts: RepoCheckOptions = {}
+): Promise<{ probed: boolean; pulls: OpenPullRequest[]; reason?: string }> {
+  const gh = parseGitHubUrl(url);
+  if (!gh) return { probed: false, pulls: [], reason: "not a GitHub URL" };
+  if (!opts.token) return { probed: false, pulls: [], reason: "no GITHUB_PAT — PR probe skipped" };
+
+  let status: number;
+  let json: unknown;
+  try {
+    ({ status, json } = await ghGet(
+      `/repos/${encodeURIComponent(gh.owner)}/${encodeURIComponent(gh.repo)}/pulls?state=open&per_page=100`,
+      opts
+    ));
+  } catch (err) {
+    return { probed: false, pulls: [], reason: `GitHub unreachable: ${(err as Error).message}` };
+  }
+  if (status !== 200 || !Array.isArray(json)) {
+    return { probed: false, pulls: [], reason: `GitHub ${status} — could not list pull requests` };
+  }
+
+  const pulls = (json as Array<Record<string, unknown>>).map((p) => ({
+    number: typeof p.number === "number" ? p.number : 0,
+    url: typeof p.html_url === "string" ? p.html_url : "",
+    headRef: typeof (p.head as { ref?: string } | undefined)?.ref === "string" ? (p.head as { ref: string }).ref : "",
+    title: typeof p.title === "string" ? p.title : "",
+    draft: p.draft === true,
+    labels: Array.isArray(p.labels)
+      ? (p.labels as Array<{ name?: string }>).map((l) => l?.name || "").filter(Boolean)
+      : [],
+  }));
+  return { probed: true, pulls };
+}
+
 /** Definitive negatives only — the ones a submitter must fix or explicitly waive. */
 export function definitiveFailures(check: RepoCheck): RepoCheckResult[] {
   return check.results.filter((r) => !r.ok && r.definitive);
