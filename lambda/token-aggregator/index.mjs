@@ -19,22 +19,30 @@
  *      Claude Code never emits the gen_ai metric; its per-request event carries
  *      input/output/cache_read/cache_creation tokens and its own cost_usd.
  *
- * Bucket layout on the row (`daily` map, key = YYYY-MM-DD UTC of the record):
- *   daily[day] = { tokensIn, tokensOut, cacheRead, cacheWrite, cacheWrite1h,
- *                  calls, costUsd, sessions, evalScores, byModel[model] }
+ * Buckets live in their OWN table (EVAL_DAILY_TABLE, PK agentId / SK day =
+ * YYYY-MM-DD UTC of the record) — one small item per agent per day. They used
+ * to be a `daily` map on the eval-config row, but that row also carries the
+ * eval-packager's sessionBuffer and sits at the 400KB item cap for the busy
+ * agents, so every bucket write failed with "Item size to update has exceeded".
+ *
+ * Item shape (flat, so ONE atomic UpdateItem with ADD needs no path set-up):
+ *   tokensIn tokensOut cacheRead cacheWrite cacheWrite1h calls costUsd
+ *   m|<model>|<field>          per-model counters (field = one of the above,
+ *                              with input/output for tokensIn/tokensOut)
+ *   sessions, e|<evaluator>|sum, e|<evaluator>|count   (written by eval-packager)
+ *   expiresAt                  TTL = day + DAILY_RETAIN_DAYS
  * tokensIn is the FULL input (cache read + cache write + uncached) for every
- * shape. `sessions` / `evalScores` are written by the eval-packager into the
- * same bucket so the dashboard can apply ONE rolling window to every row.
- * Buckets older than DAILY_RETAIN_DAYS are pruned; there is no weekly reset.
+ * shape. The dashboard (src/lib/eval-metrics.ts) applies ONE rolling window
+ * to every row. No weekly reset; TTL retires old days.
  *
  * Environment Variables:
- *   EVAL_CONFIG_TABLE — DynamoDB table (default: agentcore-hub-eval-config)
+ *   EVAL_DAILY_TABLE  — per-day bucket table (default: agentcore-hub-eval-daily)
  *   ARTIFACTS_BUCKET  — S3 bucket for agents.json lookup
- *   DAILY_RETAIN_DAYS — days of buckets to keep (default 14)
+ *   DAILY_RETAIN_DAYS — days of buckets to keep, via TTL (default 14)
  */
 
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
-import { DynamoDBDocumentClient, UpdateCommand, GetCommand } from '@aws-sdk/lib-dynamodb';
+import { DynamoDBDocumentClient, UpdateCommand } from '@aws-sdk/lib-dynamodb';
 import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3';
 import { gunzipSync } from 'zlib';
 
@@ -43,7 +51,7 @@ const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
 });
 const s3 = new S3Client({});
 
-const TABLE = process.env.EVAL_CONFIG_TABLE || 'agentcore-hub-eval-config';
+const DAILY_TABLE = process.env.EVAL_DAILY_TABLE || 'agentcore-hub-eval-daily';
 const BUCKET = process.env.ARTIFACTS_BUCKET || process.env.ARTIFACT_BUCKET;
 if (!BUCKET) {
   throw new Error(
@@ -214,103 +222,51 @@ export function zeroModel() {
   return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cacheWrite1h: 0, costUsd: 0, calls: 0 };
 }
 
-// Shared with lambda/eval-packager (ensureDailyBucket there writes the same
-// shape): the packager owns `sessions` + `evalScores`, this Lambda the rest.
-export function zeroBucket() {
-  return {
-    tokensIn: 0, tokensOut: 0, cacheRead: 0, cacheWrite: 0, cacheWrite1h: 0,
-    calls: 0, costUsd: 0, sessions: 0, evalScores: {}, byModel: {},
-  };
+// ─── DynamoDB write ─────────────────────────────────────────────────────────
+// Flat attribute names so a single atomic ADD creates-or-increments every
+// counter with no `if_not_exists` path set-up and no read-modify-write. Every
+// name goes through a placeholder: `input` is a DynamoDB reserved word, and
+// model ids carry dots/colons.
+const FIELDS = ['input', 'output', 'cacheRead', 'cacheWrite', 'cacheWrite1h', 'costUsd', 'calls'];
+const BUCKET_FIELD = { input: 'tokensIn', output: 'tokensOut' };
+export const MODEL_ATTR_PREFIX = 'm|';
+
+export function modelAttr(model, field) {
+  return `${MODEL_ATTR_PREFIX}${model}|${field}`;
 }
 
-// ─── DynamoDB writes ────────────────────────────────────────────────────────
-// Three idempotent `if_not_exists` SETs materialise the nested paths, then ONE
-// atomic ADD applies every delta. ADD on a missing nested path is a
-// ValidationException, and SET/ADD can't share an overlapping path in one
-// expression, hence the split. Concurrent invocations (and the eval-packager
-// writing sibling `sessions`/`evalScores` paths) never lose increments.
-async function ensureBucket(agentId, day, models) {
-  await ddb.send(new UpdateCommand({
-    TableName: TABLE,
-    Key: { agentId },
-    UpdateExpression: 'SET daily = if_not_exists(daily, :emptyDaily)',
-    ExpressionAttributeValues: { ':emptyDaily': {} },
-  }));
-  await ddb.send(new UpdateCommand({
-    TableName: TABLE,
-    Key: { agentId },
-    UpdateExpression: 'SET daily.#d = if_not_exists(daily.#d, :zeroBucket)',
-    ExpressionAttributeNames: { '#d': day },
-    ExpressionAttributeValues: { ':zeroBucket': zeroBucket() },
-  }));
-  for (const model of models) {
-    await ddb.send(new UpdateCommand({
-      TableName: TABLE,
-      Key: { agentId },
-      UpdateExpression: 'SET daily.#d.byModel.#m = if_not_exists(daily.#d.byModel.#m, :zeroModel)',
-      ExpressionAttributeNames: { '#d': day, '#m': model },
-      ExpressionAttributeValues: { ':zeroModel': zeroModel() },
-    }));
-  }
+export function expiresAtFor(day, retainDays = RETAIN_DAYS) {
+  const d = new Date(`${day}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + retainDays + 1);
+  return Math.floor(d.getTime() / 1000);
 }
 
 export function buildAddExpression(day, models, now) {
-  const names = { '#d': day };
-  const values = { ':now': now };
+  const names = { '#expiresAt': 'expiresAt', '#updatedAt': 'updatedAt' };
+  const values = { ':now': now, ':ttl': expiresAtFor(day) };
   const adds = [];
   const total = zeroModel();
-  const fields = ['input', 'output', 'cacheRead', 'cacheWrite', 'cacheWrite1h', 'costUsd', 'calls'];
-  const bucketField = { input: 'tokensIn', output: 'tokensOut' };
   Object.entries(models).forEach(([model, delta], i) => {
-    names[`#m${i}`] = model;
-    for (const f of fields) {
+    for (const f of FIELDS) {
       if (!delta[f]) continue;
       total[f] += delta[f];
+      names[`#m${i}_${f}`] = modelAttr(model, f);
       values[`:m${i}_${f}`] = delta[f];
-      adds.push(`daily.#d.byModel.#m${i}.${f} :m${i}_${f}`);
+      adds.push(`#m${i}_${f} :m${i}_${f}`);
     }
   });
-  for (const f of fields) {
+  for (const f of FIELDS) {
     if (!total[f]) continue;
+    names[`#t_${f}`] = BUCKET_FIELD[f] || f;
     values[`:t_${f}`] = total[f];
-    adds.push(`daily.#d.${bucketField[f] || f} :t_${f}`);
+    adds.push(`#t_${f} :t_${f}`);
   }
   return {
-    UpdateExpression: `SET tokenLastEventAt = :now ADD ${adds.join(', ')}`,
+    UpdateExpression: `SET #updatedAt = :now, #expiresAt = if_not_exists(#expiresAt, :ttl) ADD ${adds.join(', ')}`,
     ExpressionAttributeNames: names,
     ExpressionAttributeValues: values,
     empty: adds.length === 0,
   };
-}
-
-// Drop buckets past the retention horizon — once per agent per UTC day per
-// warm container (a GET + REMOVE, cheap; the dashboard ignores old days anyway).
-const prunedOn = new Map();
-export function staleDays(dailyKeys, today = dayKey(Date.now()), retainDays = RETAIN_DAYS) {
-  const cutoff = new Date(`${today}T00:00:00Z`);
-  cutoff.setUTCDate(cutoff.getUTCDate() - (retainDays - 1));
-  const cutoffKey = cutoff.toISOString().slice(0, 10);
-  return dailyKeys.filter((k) => k < cutoffKey);
-}
-
-async function pruneOldBuckets(agentId) {
-  const today = dayKey(Date.now());
-  if (prunedOn.get(agentId) === today) return;
-  prunedOn.set(agentId, today);
-  const { Item } = await ddb.send(new GetCommand({
-    TableName: TABLE, Key: { agentId }, ProjectionExpression: 'daily',
-  }));
-  const stale = staleDays(Object.keys(Item?.daily || {}), today);
-  if (stale.length === 0) return;
-  const names = {};
-  stale.forEach((k, i) => { names[`#s${i}`] = k; });
-  await ddb.send(new UpdateCommand({
-    TableName: TABLE,
-    Key: { agentId },
-    UpdateExpression: `REMOVE ${stale.map((_, i) => `daily.#s${i}`).join(', ')}`,
-    ExpressionAttributeNames: names,
-  }));
-  console.log(`[token-agg] ${agentId}: pruned ${stale.length} day bucket(s)`);
 }
 
 // ─── Handler ────────────────────────────────────────────────────────────────
@@ -318,7 +274,7 @@ export const handler = async (event) => {
   // The weekly EventBridge reset is gone (rolling window replaces it). A stale
   // rule that still fires must not zero anything.
   if (event?.action === 'reset' || event?.['detail-type'] === 'token-reset') {
-    console.log('[token-agg] ignoring legacy reset event — daily buckets prune themselves');
+    console.log('[token-agg] ignoring legacy reset event — day buckets expire via TTL');
     return { statusCode: 200, body: 'reset-ignored' };
   }
 
@@ -345,13 +301,12 @@ export const handler = async (event) => {
   const now = new Date().toISOString();
   for (const day of days) {
     const models = byDay[day];
+    const expr = buildAddExpression(day, models, now);
+    if (expr.empty) continue;
     try {
-      await ensureBucket(agentId, day, Object.keys(models));
-      const expr = buildAddExpression(day, models, now);
-      if (expr.empty) continue;
       await ddb.send(new UpdateCommand({
-        TableName: TABLE,
-        Key: { agentId },
+        TableName: DAILY_TABLE,
+        Key: { agentId, day },
         UpdateExpression: expr.UpdateExpression,
         ExpressionAttributeNames: expr.ExpressionAttributeNames,
         ExpressionAttributeValues: expr.ExpressionAttributeValues,
@@ -363,12 +318,6 @@ export const handler = async (event) => {
     } catch (err) {
       console.error(`[token-agg] ${agentId} ${day} DDB update failed:`, err.message);
     }
-  }
-
-  try {
-    await pruneOldBuckets(agentId);
-  } catch (err) {
-    console.error(`[token-agg] ${agentId} prune failed:`, err.message);
   }
 
   return { statusCode: 200, body: 'ok' };

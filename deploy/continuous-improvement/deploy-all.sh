@@ -25,6 +25,10 @@ TABLE_NAME="agentcore-hub-eval-config"
 # the whole chain (this script, setup-lambda-role.sh, deploy.sh) at one name;
 # the default matches index.mjs's SEEN_TABLE fallback.
 SEEN_TABLE_NAME="${EVAL_SEEN_TABLE:-agentcore-hub-eval-seen}"
+# Per-agent per-UTC-day metric buckets (token-aggregator + eval-packager write,
+# /api/evaluations reads). Its own table because the eval-config row carries the
+# session buffer and sits at the 400KB item cap for busy agents.
+DAILY_TABLE_NAME="${EVAL_DAILY_TABLE:-agentcore-hub-eval-daily}"
 SEEN_TTL_ATTRIBUTE="expiresAt"
 REGION="${AWS_REGION:-us-east-1}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -42,6 +46,7 @@ done
 echo "[deploy-all] Region: ${REGION}"
 echo "[deploy-all] Table:  ${TABLE_NAME}"
 echo "[deploy-all] Seen:   ${SEEN_TABLE_NAME}"
+echo "[deploy-all] Daily:  ${DAILY_TABLE_NAME}"
 echo "[deploy-all] Fleet:  ${FLEET_IDS_FILE}"
 
 ###############################################################################
@@ -132,6 +137,38 @@ else
     echo "[deploy-all]   aws dynamodb update-time-to-live --table-name ${SEEN_TABLE_NAME} \\"
     echo "[deploy-all]     --time-to-live-specification Enabled=true,AttributeName=${SEEN_TTL_ATTRIBUTE}"
   fi
+fi
+
+
+###############################################################################
+# Daily metric buckets table: PK agentId (S) / SK day (S, YYYY-MM-DD UTC), TTL
+# on expiresAt (the Lambdas stamp day + DAILY_RETAIN_DAYS). Idempotent.
+###############################################################################
+if aws dynamodb describe-table --table-name "${DAILY_TABLE_NAME}" --region "${REGION}" >/dev/null 2>&1; then
+  echo "[deploy-all] Table '${DAILY_TABLE_NAME}' already exists. Skipping creation."
+else
+  echo "[deploy-all] Creating table '${DAILY_TABLE_NAME}' with on-demand billing..."
+  aws dynamodb create-table \
+    --table-name "${DAILY_TABLE_NAME}" \
+    --attribute-definitions AttributeName=agentId,AttributeType=S AttributeName=day,AttributeType=S \
+    --key-schema AttributeName=agentId,KeyType=HASH AttributeName=day,KeyType=RANGE \
+    --billing-mode PAY_PER_REQUEST \
+    --region "${REGION}" --output text --query 'TableDescription.TableStatus'
+  aws dynamodb wait table-exists --table-name "${DAILY_TABLE_NAME}" --region "${REGION}"
+  echo "[deploy-all] Table '${DAILY_TABLE_NAME}' is ACTIVE."
+fi
+
+DAILY_TTL_STATUS=$(aws dynamodb describe-time-to-live \
+  --table-name "${DAILY_TABLE_NAME}" --region "${REGION}" \
+  --query 'TimeToLiveDescription.TimeToLiveStatus' --output text 2>/dev/null || echo "DISABLED")
+if [[ "${DAILY_TTL_STATUS}" == "ENABLED" || "${DAILY_TTL_STATUS}" == "ENABLING" ]]; then
+  echo "[deploy-all] TTL already ${DAILY_TTL_STATUS} on ${DAILY_TABLE_NAME}.expiresAt. Skipping."
+else
+  echo "[deploy-all] Enabling TTL on ${DAILY_TABLE_NAME}.expiresAt..."
+  aws dynamodb update-time-to-live \
+    --table-name "${DAILY_TABLE_NAME}" \
+    --time-to-live-specification "Enabled=true,AttributeName=expiresAt" \
+    --region "${REGION}" --output text --query 'TimeToLiveSpecification.Enabled'
 fi
 
 ###############################################################################

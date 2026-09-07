@@ -105,27 +105,34 @@ describe('aggregateLogEvents', () => {
 });
 
 describe('buildAddExpression', () => {
-  it('adds per-model and bucket totals in one ADD clause', () => {
+  it('adds per-model and bucket totals in one ADD clause on flat attribute names', () => {
     const expr = mod.buildAddExpression('2026-09-07', {
       'us.anthropic.claude-fable-5-1': { ...mod.zeroModel(), input: 100, output: 10, cacheRead: 80, calls: 1 },
-      'claude-opus-4-8': { ...mod.zeroModel(), input: 7, output: 3, costUsd: 0.5, calls: 1 },
+      'us.anthropic.claude-sonnet-4-5-20250929-v1:0': { ...mod.zeroModel(), input: 7, output: 3, costUsd: 0.5, calls: 1 },
     }, 'now');
     expect(expr.empty).toBe(false);
-    expect(expr.UpdateExpression).toContain('SET tokenLastEventAt = :now ADD ');
-    expect(expr.UpdateExpression).toContain('daily.#d.byModel.#m0.input :m0_input');
-    expect(expr.UpdateExpression).toContain('daily.#d.tokensIn :t_input');
-    expect(expr.UpdateExpression).toContain('daily.#d.tokensOut :t_output');
-    expect(expr.UpdateExpression).not.toContain('cacheWrite1h'); // zero deltas omitted
+    expect(expr.UpdateExpression).toMatch(/^SET #updatedAt = :now, #expiresAt = if_not_exists\(#expiresAt, :ttl\) ADD /);
+    expect(expr.UpdateExpression).toContain('#m0_input :m0_input');
+    expect(expr.UpdateExpression).toContain('#t_input :t_input');
+    expect(expr.UpdateExpression).not.toContain(':t_cacheWrite1h'); // zero deltas omitted
+    // Only placeholders in the expression: `input` is a DynamoDB reserved word.
+    expect(expr.UpdateExpression).not.toMatch(/\b(input|output|tokensIn|calls)\b/);
+    expect(expr.ExpressionAttributeNames).toMatchObject({
+      '#t_input': 'tokensIn', '#t_output': 'tokensOut', '#t_cacheRead': 'cacheRead', '#t_calls': 'calls',
+      '#m0_input': 'm|us.anthropic.claude-fable-5-1|input',
+      '#m1_costUsd': 'm|us.anthropic.claude-sonnet-4-5-20250929-v1:0|costUsd',
+    });
     expect(expr.ExpressionAttributeValues[':t_input']).toBe(107);
     expect(expr.ExpressionAttributeValues[':t_calls']).toBe(2);
-    expect(expr.ExpressionAttributeNames).toEqual({ '#d': '2026-09-07', '#m0': 'us.anthropic.claude-fable-5-1', '#m1': 'claude-opus-4-8' });
+    expect(expr.ExpressionAttributeValues[':ttl']).toBe(mod.expiresAtFor('2026-09-07'));
+  });
+
+  it('TTL retires the bucket retainDays after its day', () => {
+    expect(mod.expiresAtFor('2026-09-07', 14)).toBe(Date.UTC(2026, 8, 22) / 1000);
   });
 });
 
-describe('staleDays / resolveAgentId', () => {
-  it('prunes buckets older than the retention horizon', () => {
-    expect(mod.staleDays(['2026-08-20', '2026-08-24', '2026-08-25', '2026-09-07'], '2026-09-07', 14)).toEqual(['2026-08-20', '2026-08-24']);
-  });
+describe('resolveAgentId', () => {
   it('matches runtime and harness log groups, longest id first', () => {
     const agents = [{ agentId: 'agentcore_hub_agent' }, { agentId: 'agentcore_hub_agent_x' }, { agentId: 'personal_assistant_agent' }];
     expect(mod.resolveAgentId('/aws/bedrock-agentcore/runtimes/agentcore_hub_agent-ITPP0eBToO-DEFAULT', agents)).toBe('agentcore_hub_agent');
