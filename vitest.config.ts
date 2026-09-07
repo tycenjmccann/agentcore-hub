@@ -392,6 +392,15 @@ export default defineConfig({
       // the ship review's change set enumerates its own PR's files only — so an
       // advisory branch's files cannot enter the reviewed diff.
       "lambda/orchestrator/advisory-routing.test.mjs",
+      // TEAM-4185 F4 — the create-time DERIVED awaited-edge hook, index.mjs REAL
+      // with only the AWS/store seams + the awaited-ids factory mocked. The hook
+      // used to sit behind trackTicketCreation's two write-once early returns
+      // (already tracked / lost trackTicket CAS), so a Streams REDELIVERY — or the
+      // Jira todo twin arriving after the DDB INSERT — derived no edge at all and
+      // left the origin unre-wakeable. Pins the edge on all three delivery paths
+      // across both creation twins, that ticket.created stays behind the CAS, and
+      // that AWAITED_IDS_MODE=off never even constructs the awaited-ids surface.
+      "lambda/orchestrator/awaited-derived-hook.test.mjs",
       // f50ucz replay (TEAM-4166 D1/D2 acceptance) — the real ship re-wake stall,
       // replayed through the REAL awaited-ids + cascade + reconcile-sweep wired as
       // index.mjs wires them. ship-rewake: TEAM-4126's awaited ship/CI fixes become

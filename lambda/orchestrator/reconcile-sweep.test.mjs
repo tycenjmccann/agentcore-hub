@@ -108,7 +108,9 @@ function makeSweep(overrides = {}) {
     // TEAM-4166 D1/D2 — optional; unwired unless the test supplies one.
     ...(overrides.awaitedIds ? { awaitedIds: overrides.awaitedIds } : {}),
     now: overrides.now || (() => NOW),
-    log: () => {},
+    // Swallowed unless a test asks to read the sweep's decision log (shadow mode
+    // logs the intent it deliberately did NOT write — the only observable there).
+    log: overrides.log || (() => {}),
   });
   return { ...sweep, ddb, getChildTickets, cascade, publishEvent, lease, redispatch, reawakenGate,
     store: overrides.store, blockTicket: overrides.blockTicket, awaitedIds: overrides.awaitedIds };
@@ -936,5 +938,181 @@ describe("TEAM-4166 D1/D2 — awaited-ids backstop + wait-SLA", () => {
     expect(records[0].ReconcileExitedOk).toBe(0);
     expect(records[0].ReconcileAwaiting).toBe(0);
     expect(records[0].ReconcileAwaitTimeouts).toBe(0);
+  });
+});
+
+/**
+ * TEAM-4185 F4 — the FIX-SIDE derived backstop (handleSpawnedFix).
+ *
+ * The TEAM-4166 backstop above reads the ORIGIN's `preconditionUnmet.awaitingIds`,
+ * so it can only repair an origin that already carries a stamp. The f50ucz gap is
+ * the other direction: the create-time derived hook never ran (a Streams
+ * REDELIVERY hit trackTicketCreation's early returns — see
+ * awaited-derived-hook.test.mjs), so the origin has NO stamp and NO edge and is
+ * therefore invisible to every origin-side sweep. The only surviving evidence is
+ * on the FIX ticket: `spawnedBy.qaTicketId` names the origin. These pin the sweep
+ * deriving that edge from the fix side, and staying its hand whenever the link
+ * already exists in either direction.
+ */
+describe("TEAM-4185 F4 — fix-side derived backfill", () => {
+  const FIX = "TEAM-9";
+  const ORIGIN = "TEAM-2";
+
+  function makeAwaited({ mode = "enforce", addBlockers, annotatePreconditionUnmet } = {}) {
+    return createAwaitedIds({
+      addBlockers: addBlockers || vi.fn(async () => [{ id: FIX, status: "written" }]),
+      annotatePreconditionUnmet: annotatePreconditionUnmet || vi.fn(async () => {}),
+      publishEvent: vi.fn(async () => {}),
+      getTicket: vi.fn(async () => null),
+      store: { markAwaitTimeoutEmitted: vi.fn(async () => true) },
+      now: () => NOW,
+      mode,
+      timeoutMinutes: 120,
+    });
+  }
+
+  /** The fix ticket, naming its origin the only way that survived: spawnedBy. */
+  const fixTicket = (extra = {}) => ({
+    ticketId: FIX, status: "in_progress", assignee: "dev", type: "task",
+    blockedBy: [], updatedAt: STALE_STARTED,
+    spawnedBy: { kind: "qa_fix", qaTicketId: ORIGIN },
+    ...extra,
+  });
+
+  /** The origin with NO stamp and NO edge — the state the missed hook leaves. */
+  const unlinkedOrigin = (extra = {}) => ({
+    ticketId: ORIGIN, status: "in_progress", assignee: "agentcore_hub_release_manager",
+    type: "task", blockedBy: [], updatedAt: STALE_STARTED,
+    ...extra,
+  });
+
+  it("enforce: an unstamped, un-edged origin gets the derived edge written from the fix's spawnedBy", async () => {
+    const addBlockers = vi.fn(async () => [{ id: FIX, status: "written" }]);
+    const annotatePreconditionUnmet = vi.fn(async () => {});
+    const awaitedIds = makeAwaited({ mode: "enforce", addBlockers, annotatePreconditionUnmet });
+    const siblings = [unlinkedOrigin(), fixTicket()];
+    const s = makeSweep({ workflows: [workflow()], siblings, awaitedIds });
+    const cap = captureMetrics();
+
+    const m = await s.runSweep("enforce");
+    const records = cap.records();
+    cap.restore();
+
+    // The edge lands on the ORIGIN, naming the FIX — derived, not tool-reported.
+    expect(addBlockers).toHaveBeenCalledTimes(1);
+    expect(addBlockers.mock.calls[0][0]).toBe(ORIGIN);
+    expect(addBlockers.mock.calls[0][1]).toEqual([FIX]);
+    expect(addBlockers.mock.calls[0][2]).toMatchObject({ source: "derived" });
+    // …and the origin is stamped so the D2 evidence guard can read the park.
+    expect(annotatePreconditionUnmet).toHaveBeenCalledTimes(1);
+    expect(annotatePreconditionUnmet.mock.calls[0][1]).toMatchObject({
+      awaitingIds: [FIX], source: "derived",
+    });
+
+    expect(m.derivedBackfills).toBe(1);
+    expect(records[0].ReconcileDerivedBackfills).toBe(1);
+  });
+
+  it("shadow: logs the intent and writes NOTHING", async () => {
+    const addBlockers = vi.fn(async () => []);
+    const annotatePreconditionUnmet = vi.fn(async () => {});
+    const awaitedIds = makeAwaited({ mode: "enforce", addBlockers, annotatePreconditionUnmet });
+    const siblings = [unlinkedOrigin(), fixTicket()];
+    const lines = [];
+    const s = makeSweep({ workflows: [workflow()], siblings, awaitedIds, log: (msg) => lines.push(String(msg)) });
+
+    const m = await s.runSweep("shadow");
+
+    // The intent is observable (that IS the point of shadow)…
+    const intent = lines.filter((l) => l.includes("reconcile.would_backfill_derived"));
+    expect(intent).toHaveLength(1);
+    expect(intent[0]).toContain(`origin=${ORIGIN}`);
+    expect(intent[0]).toContain(FIX);
+    // …and NOTHING was written.
+    expect(addBlockers).not.toHaveBeenCalled();
+    expect(annotatePreconditionUnmet).not.toHaveBeenCalled();
+    expect(m.derivedBackfills).toBe(0);
+  });
+
+  it("no-op: the edge is ALREADY in origin.blockedBy", async () => {
+    const addBlockers = vi.fn(async () => []);
+    const awaitedIds = makeAwaited({ mode: "enforce", addBlockers });
+    const siblings = [unlinkedOrigin({ blockedBy: [FIX] }), fixTicket()];
+    const s = makeSweep({ workflows: [workflow()], siblings, awaitedIds });
+
+    const m = await s.runSweep("enforce");
+
+    expect(addBlockers).not.toHaveBeenCalled();
+    expect(m.derivedBackfills).toBe(0);
+  });
+
+  it("no-op: the id is ALREADY stamped in origin.preconditionUnmet (handleAwaitedChild owns it)", async () => {
+    const addBlockers = vi.fn(async () => []);
+    const awaitedIds = makeAwaited({ mode: "enforce", addBlockers });
+    const origin = unlinkedOrigin({ preconditionUnmet: { awaitingIds: [FIX], reportedAt: STALE_STARTED } });
+    const siblings = [origin, fixTicket()];
+    const s = makeSweep({ workflows: [workflow()], siblings, awaitedIds });
+
+    const m = await s.runSweep("enforce");
+
+    // handleAwaitedChild does the origin-side backfill for this shape; the
+    // fix-side hook must NOT double-write.
+    expect(addBlockers.mock.calls.filter((c) => c[2]?.source === "derived")).toHaveLength(0);
+    expect(m.derivedBackfills).toBe(0);
+  });
+
+  it("no-op: the origin is already terminal — nothing left to re-wake", async () => {
+    const addBlockers = vi.fn(async () => []);
+    const awaitedIds = makeAwaited({ mode: "enforce", addBlockers });
+    const siblings = [unlinkedOrigin({ status: "done" }), fixTicket()];
+    const s = makeSweep({ workflows: [workflow()], siblings, awaitedIds });
+
+    const m = await s.runSweep("enforce");
+
+    expect(addBlockers).not.toHaveBeenCalled();
+    expect(m.derivedBackfills).toBe(0);
+  });
+
+  it("no-op: the origin is not among this epic's children (out of scope, zero extra reads)", async () => {
+    const addBlockers = vi.fn(async () => []);
+    const awaitedIds = makeAwaited({ mode: "enforce", addBlockers });
+    const siblings = [fixTicket({ spawnedBy: { kind: "qa_fix", qaTicketId: "OTHER-1" } })];
+    const s = makeSweep({ workflows: [workflow()], siblings, awaitedIds });
+
+    const m = await s.runSweep("enforce");
+
+    expect(addBlockers).not.toHaveBeenCalled();
+    expect(m.derivedBackfills).toBe(0);
+  });
+
+  it("no-op: a plain (non-fix) ticket has no spawnedBy to derive from", async () => {
+    const addBlockers = vi.fn(async () => []);
+    const awaitedIds = makeAwaited({ mode: "enforce", addBlockers });
+    const siblings = [unlinkedOrigin(), fixTicket({ spawnedBy: undefined })];
+    const s = makeSweep({ workflows: [workflow()], siblings, awaitedIds });
+
+    const m = await s.runSweep("enforce");
+
+    expect(addBlockers).not.toHaveBeenCalled();
+    expect(m.derivedBackfills).toBe(0);
+  });
+
+  it("a healthy sweep emits an explicit ReconcileDerivedBackfills zero", async () => {
+    const s = makeSweep({ workflows: [workflow()], siblings: inProgressStale });
+    const cap = captureMetrics();
+    await s.runSweep("enforce");
+    const records = cap.records();
+    cap.restore();
+
+    expect(records[0].ReconcileDerivedBackfills).toBe(0);
+  });
+
+  it("the fix-side hook is skipped entirely when awaitedIds is unwired (pre-4185 parity)", async () => {
+    const siblings = [unlinkedOrigin(), fixTicket()];
+    const s = makeSweep({ workflows: [workflow()], siblings }); // no awaitedIds
+
+    const m = await s.runSweep("enforce");
+
+    expect(m.derivedBackfills).toBe(0);
   });
 });

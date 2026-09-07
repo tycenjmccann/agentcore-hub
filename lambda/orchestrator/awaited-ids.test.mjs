@@ -617,3 +617,143 @@ describe("awaitedWaitedMs (TEAM-4184 F2)", () => {
     expect(awaitedWaitedMs(t, NOW_MS)).toBe(0);
   });
 });
+
+/**
+ * TEAM-4185 F4 — REPLAY safety and TRANSIENT-FAILURE recovery.
+ *
+ * F4 moves the create-time derived hook out from behind trackTicketCreation's
+ * early returns, so `applyAwaitedEdgesForSpawn` is now called on EVERY delivery of
+ * a fix ticket's creation — a Streams redelivery, the Jira `todo` twin arriving
+ * after the DDB INSERT, a Lambda retry after a mid-handler crash. That makes two
+ * previously-incidental properties load-bearing:
+ *
+ *   1. Replay must be a no-op, not a duplicate. Repeated calls converge on ONE
+ *      edge (the second reads back present-by-omission) and re-stamp with the same
+ *      awaitingIds — the tickets Lambda's monotonic merge (TEAM-4184/F3) absorbs
+ *      the re-stamp without moving reportedAt.
+ *   2. A retry after a transient seam failure must actually land the edge. The
+ *      first attempt's addBlockers throw is swallowed (an awaited edge is advisory
+ *      — it must never fail the cascade) and, critically, the stamp is NOT written
+ *      for an edge that did not land; the NEXT delivery writes both.
+ *
+ * NOTE (deliberate): asserted against the CURRENT applyAwaitedEdges return shape —
+ * a swallowed seam error yields `{ error: true, ids }`. Commit 3 refines that shape;
+ * these assertions are the before-picture it has to keep honest.
+ */
+for (const provider of ["dynamodb", "jira"]) {
+  describe(`TEAM-4185 F4 — replay + transient recovery [provider=${provider}]`, () => {
+    const ORIGIN = "TEAM-4126";
+    const FIX = "TEAM-4156";
+    const spawnedBy = { kind: "ship_fix", shipTicketId: ORIGIN };
+    const liveOrigin = { [ORIGIN]: { ticketId: ORIGIN, status: "in_progress" } };
+
+    it("applyAwaitedEdgesForSpawn is replay-safe: N deliveries → ONE edge", async () => {
+      const addBlockers = makeAddBlockers();
+      const h = makeDeps({ provider, mode: "enforce", addBlockers, tickets: liveOrigin });
+      const ai = createAwaitedIds(h.deps);
+      const m = ai.newMetrics();
+
+      const first = await ai.applyAwaitedEdgesForSpawn(FIX, spawnedBy);
+      const second = await ai.applyAwaitedEdgesForSpawn(FIX, spawnedBy);
+      const third = await ai.applyAwaitedEdgesForSpawn(FIX, spawnedBy);
+
+      expect(first).toMatchObject({ written: 1, present: 0, ids: [FIX] });
+      // Replays are present-by-omission, NOT a second edge.
+      expect(second).toMatchObject({ written: 0, present: 1, ids: [FIX] });
+      expect(third).toMatchObject({ written: 0, present: 1, ids: [FIX] });
+      expect(m.written).toBe(1);
+      expect(m.present).toBe(2);
+
+      // The seam saw three identical requests and converged on one edge.
+      expect(h._addBlockers.calls).toHaveLength(3);
+      for (const c of h._addBlockers.calls) {
+        expect(c.ticketId).toBe(ORIGIN);
+        expect(c.ids).toEqual([FIX]);
+      }
+      // Every attempt re-stamps identically — the merge, not the caller, dedupes.
+      expect(h._annotateCalls).toHaveLength(3);
+      for (const a of h._annotateCalls) {
+        expect(a.originId).toBe(ORIGIN);
+        expect(a.payload.awaitingIds).toEqual([FIX]);
+        expect(a.payload.source).toBe("derived");
+        expect(a.payload.reportedAt).toBe(new Date(NOW).toISOString());
+      }
+    });
+
+    it("a transient addBlockers throw is swallowed and writes NO stamp for an edge that never landed", async () => {
+      const boom = async () => { throw new Error("ProvisionedThroughputExceededException"); };
+      const h = makeDeps({ provider, mode: "enforce", addBlockers: boom, tickets: liveOrigin });
+      const ai = createAwaitedIds(h.deps);
+      const m = ai.newMetrics();
+
+      const res = await ai.applyAwaitedEdgesForSpawn(FIX, spawnedBy);
+
+      // Advisory, never fatal…
+      expect(res).toEqual({ error: true, ids: [FIX] });
+      // …and no stamp: claiming a park the origin does not actually have would
+      // make the D2 evidence guard read a phantom clean park.
+      expect(h._annotateCalls).toHaveLength(0);
+      expect(m.written).toBe(0);
+      expect(m.present).toBe(0);
+      expect(m.derived).toBe(1); // the derivation itself still happened
+      expect(h._logs.some((l) => l.includes("awaited.addBlockers_error"))).toBe(true);
+    });
+
+    it("the RETRY after that transient throw writes both the edge and the stamp", async () => {
+      // One flaky call, then a healthy seam — the shape a Streams redelivery hits.
+      const real = makeAddBlockers();
+      let attempts = 0;
+      const flaky = async (ticketId, ids, opts) => {
+        if (++attempts === 1) throw new Error("ProvisionedThroughputExceededException");
+        return real(ticketId, ids, opts);
+      };
+      flaky.calls = real.calls;
+      const h = makeDeps({ provider, mode: "enforce", addBlockers: flaky, tickets: liveOrigin });
+      const ai = createAwaitedIds(h.deps);
+      const m = ai.newMetrics();
+
+      const failed = await ai.applyAwaitedEdgesForSpawn(FIX, spawnedBy);
+      const retried = await ai.applyAwaitedEdgesForSpawn(FIX, spawnedBy);
+
+      expect(failed).toEqual({ error: true, ids: [FIX] });
+      expect(retried).toMatchObject({ written: 1, present: 0, ids: [FIX] });
+      expect(m.written).toBe(1);
+      expect(h._annotateCalls).toHaveLength(1); // only the successful attempt stamps
+      expect(h._annotateCalls[0].payload.awaitingIds).toEqual([FIX]);
+      expect(h._annotateCalls[0].payload.source).toBe("derived");
+    });
+
+    it("a failed STAMP still keeps the edge that landed (best-effort, never rolled back)", async () => {
+      const addBlockers = makeAddBlockers();
+      const h = makeDeps({
+        provider, mode: "enforce", addBlockers, tickets: liveOrigin,
+        annotatePreconditionUnmet: async () => { throw new Error("annotate unavailable"); },
+      });
+      const ai = createAwaitedIds(h.deps);
+
+      const res = await ai.applyAwaitedEdgesForSpawn(FIX, spawnedBy);
+
+      expect(res).toMatchObject({ written: 1, ids: [FIX] });
+      expect(h._addBlockers.calls).toHaveLength(1);
+      expect(h._logs.some((l) => l.includes("awaited.annotate_error"))).toBe(true);
+      // The next delivery re-stamps — the edge is what gates the re-wake, and
+      // handleAwaitedChild / handleSpawnedFix both re-derive from it.
+      expect(h._logs.some((l) => l.includes("awaited.apply"))).toBe(true);
+    });
+
+    it("a terminal origin discovered on the REPLAY is skipped — no second write", async () => {
+      const addBlockers = makeAddBlockers();
+      const origin = { ticketId: ORIGIN, status: "in_progress" };
+      const h = makeDeps({ provider, mode: "enforce", addBlockers, tickets: { [ORIGIN]: origin } });
+      const ai = createAwaitedIds(h.deps);
+
+      await ai.applyAwaitedEdgesForSpawn(FIX, spawnedBy);
+      origin.status = "done"; // the origin closed between deliveries
+      const second = await ai.applyAwaitedEdgesForSpawn(FIX, spawnedBy);
+
+      expect(second).toEqual({ skipped: "origin-terminal" });
+      expect(h._addBlockers.calls).toHaveLength(1);
+      expect(h._annotateCalls).toHaveLength(1);
+    });
+  });
+}

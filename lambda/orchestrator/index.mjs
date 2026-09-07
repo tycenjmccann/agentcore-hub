@@ -3914,8 +3914,14 @@ async function trackTicketCreation(ticketId, assignee, workflowId, parentId, spa
   const workflow = await resolveWorkflow(workflowId, parentId);
   if (!workflow) return;
 
-  // Already tracked (e.g., from a retry/re-delivery) — don't overwrite
-  if (workflow.agentTasks?.[ticketId]) return;
+  // Already tracked (e.g., from a retry/re-delivery) — don't overwrite the entry,
+  // but TEAM-4185 F4: the derived edge is NOT part of the tracking CAS, so a
+  // re-delivery must still get the chance to write it (the first delivery may
+  // have died between trackTicket and the hook).
+  if (workflow.agentTasks?.[ticketId]) {
+    await deriveAwaitedEdgeOnCreate(ticketId, spawnedBy);
+    return;
+  }
 
   const entry = {
     id: `task_${Date.now()}_${assignee}`,
@@ -3925,7 +3931,13 @@ async function trackTicketCreation(ticketId, assignee, workflowId, parentId, spa
     createdAt: new Date().toISOString(),
   };
   const created = await store.trackTicket(workflow.id, ticketId, entry);
-  if (!created) return; // concurrently tracked — keep the existing entry
+  if (!created) {
+    // Concurrently tracked — keep the existing entry. TEAM-4185 F4: losing the
+    // tracking CAS says nothing about the derived edge, so still try to write it
+    // (idempotent — the winner and this loser converge on the same edge).
+    await deriveAwaitedEdgeOnCreate(ticketId, spawnedBy);
+    return;
+  }
   if (!workflow.agentTasks) workflow.agentTasks = {};
   workflow.agentTasks[ticketId] = entry;
   console.log(`[orchestrator] Tracked new ticket ${ticketId} (${assignee}) in workflow ${workflow.id}`);
@@ -3950,19 +3962,33 @@ async function trackTicketCreation(ticketId, assignee, workflowId, parentId, spa
     console.warn(`[orchestrator] ticket.created publish failed for ${ticketId}:`, err.message);
   }
 
-  // TEAM-4166 D1 §1.4 — DERIVED awaited-ids hook. A freshly-created FIX ticket
-  // whose spawnedBy points back to an origin (KIND_TO_ORIGIN_KEY[kind]) means the
-  // origin is waiting on THIS fix: write the awaited edge on the origin now, so a
-  // release manager parked on a sub-cap CHANGES-NEEDED re-wakes when the fix
-  // closes even if the tool never explicitly reported the precondition. Idempotent
-  // with the tool-report pickup (both converge on the same edge), mode-gated
-  // (off → no-op before any I/O), and never fatal — must not fail ticket creation.
-  if (AWAITED_IDS_MODE !== "off" && spawnedBy?.kind && KIND_TO_ORIGIN_KEY[spawnedBy.kind]) {
-    try {
-      await getAwaitedIds().applyAwaitedEdgesForSpawn(ticketId, spawnedBy, "spawnedBy");
-    } catch (err) {
-      console.warn(`[orchestrator] awaited-ids derived hook failed for ${ticketId} (non-fatal): ${err?.message || err}`);
-    }
+  await deriveAwaitedEdgeOnCreate(ticketId, spawnedBy);
+}
+
+/**
+ * TEAM-4166 D1 §1.4 — DERIVED awaited-ids hook. A freshly-created FIX ticket
+ * whose spawnedBy points back to an origin (KIND_TO_ORIGIN_KEY[kind]) means the
+ * origin is waiting on THIS fix: write the awaited edge on the origin now, so a
+ * release manager parked on a sub-cap CHANGES-NEEDED re-wakes when the fix
+ * closes even if the tool never explicitly reported the precondition. Idempotent
+ * with the tool-report pickup (both converge on the same edge), mode-gated
+ * (off → no-op before any I/O), and never fatal — must not fail ticket creation.
+ *
+ * TEAM-4185 F4 — extracted from trackTicketCreation's tail so EVERY delivery gets
+ * a shot at the edge. The old placement sat behind two early returns (already
+ * tracked / lost trackTicket CAS), which meant a redelivered INSERT — the exact
+ * shape a Streams retry or the Jira todo twin produces — silently skipped the
+ * derivation and left the origin with no edge at all. Tracking is CAS-once;
+ * the edge is convergent, so it must NOT share that gate.
+ */
+async function deriveAwaitedEdgeOnCreate(ticketId, spawnedBy) {
+  // Mode gate FIRST: off means zero I/O, and getAwaitedIds() is never constructed.
+  if (AWAITED_IDS_MODE === "off") return;
+  if (!spawnedBy?.kind || !KIND_TO_ORIGIN_KEY[spawnedBy.kind]) return;
+  try {
+    await getAwaitedIds().applyAwaitedEdgesForSpawn(ticketId, spawnedBy, "spawnedBy");
+  } catch (err) {
+    console.warn(`[orchestrator] awaited-ids derived hook failed for ${ticketId} (non-fatal): ${err?.message || err}`);
   }
 }
 

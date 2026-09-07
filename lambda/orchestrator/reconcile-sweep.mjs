@@ -163,6 +163,56 @@ export function createReconcileSweep(deps) {
   }
 
   /**
+   * TEAM-4185 F4 — the FIX-SIDE backstop, the mirror image of handleAwaitedChild.
+   *
+   * handleAwaitedChild reads the ORIGIN's `preconditionUnmet.awaitingIds` and
+   * backfills the matching edges — which means it can only ever repair an origin
+   * that already carries a stamp. The f50ucz gap is the other direction: the fix
+   * ticket exists and names its origin in `spawnedBy`, but the origin has NO
+   * stamp and NO edge, because the create-time derived hook never ran (the INSERT
+   * was a redelivery that hit trackTicketCreation's early returns — see
+   * deriveAwaitedEdgeOnCreate in index.mjs). Nothing on the origin side hints
+   * that a fix is outstanding, so no amount of origin-side sweeping finds it.
+   *
+   * So sweep from the fix: derive the origin off spawnedBy and, when that origin
+   * is live and genuinely un-linked, write the edge. The origin is resolved from
+   * the sibling snapshot already in hand (zero extra reads), and every bail-out
+   * below is a case where the edge is already present or pointless:
+   *   - no spawnedBy / not a fix kind / self-reference → deriveAwaitedIds is null
+   *   - origin not in this epic's children, or terminal → nothing to re-wake
+   *   - edge already in origin.blockedBy, or id already stamped in
+   *     origin.preconditionUnmet.awaitingIds → handleAwaitedChild owns it
+   * A write, so enforce-only; shadow logs the intent.
+   */
+  async function handleSpawnedFix(sibling, siblings, m, mode, sweepId) {
+    const derived = awaitedIds.deriveAwaitedIds?.(sibling);
+    if (!derived) return;
+
+    const { originId, ids } = derived;
+    const origin = siblings.find((s) => s?.ticketId === originId);
+    if (!origin) return;                                          // not a sibling — out of scope
+    if (TERMINAL_TICKET_STATUSES.has(origin.status)) return;      // origin already closed
+
+    // Already linked in EITHER direction → the origin-side backstop has it.
+    const edges = new Set(origin.blockedBy || []);
+    const stamped = new Set(origin.preconditionUnmet?.awaitingIds || []);
+    if (ids.every((id) => edges.has(id) || stamped.has(id))) return;
+
+    if (mode !== "enforce") {
+      log(`reconcile.would_backfill_derived (shadow) — origin=${originId} += [${ids.join(", ")}] from fix ${sibling.ticketId} (sweep ${sweepId})`);
+      return;
+    }
+
+    try {
+      await awaitedIds.applyAwaitedEdges(originId, ids, "derived");
+      m.derivedBackfills++;
+      log(`reconcile.derived_backfill — origin=${originId} += [${ids.join(", ")}] from fix ${sibling.ticketId} (sweep ${sweepId})`);
+    } catch (err) {
+      log(`reconcile.derived_backfill_error — origin=${originId} from fix ${sibling.ticketId}: ${err?.message || err} (sweep ${sweepId})`);
+    }
+  }
+
+  /**
    * Run one sweep. `mode` is off | shadow | enforce (anything else is coerced to
    * shadow — fail safe). Returns a metrics summary (also emitted as an EMF
    * record) for observability + tests.
@@ -194,6 +244,8 @@ export function createReconcileSweep(deps) {
       exitedOk: 0,
       awaiting: 0,
       awaitTimeouts: 0,
+      // TEAM-4185 F4 — fix-side derived edges written by handleSpawnedFix.
+      derivedBackfills: 0,
     };
 
     if (mode === "off") {
@@ -237,6 +289,9 @@ export function createReconcileSweep(deps) {
           // wait still needs an SLA. No-op when the awaited module is unwired.
           if (awaitedIds && !TERMINAL_TICKET_STATUSES.has(sibling.status)) {
             await handleAwaitedChild(sibling, siblings, workflow, m, mode, sweepId);
+            // TEAM-4185 F4 — and the fix-side mirror: an origin with no stamp at
+            // all is invisible to handleAwaitedChild, so derive from the fix.
+            await handleSpawnedFix(sibling, siblings, m, mode, sweepId);
           }
 
           if (!allBlockersResolved(sibling, siblings)) continue;
@@ -266,7 +321,7 @@ export function createReconcileSweep(deps) {
 
     m.durationMs = now() - startedAtMs;
     emitReconcileMetrics(m);
-    log(`reconcile sweep done — mode=${mode} candidates=${m.candidates} skippedLiveLease=${m.skippedLiveLease} redispatched=${m.redispatched} escalated=${m.escalated || 0} escalationHeld=${m.escalationHeld || 0} reviewReawakened=${m.reviewReawakened} wouldRedispatch=${m.wouldRedispatch} noop=${m.noop} candidateErrors=${m.candidateErrors} truncated=${m.truncated} durationMs=${m.durationMs} (sweep ${sweepId})`);
+    log(`reconcile sweep done — mode=${mode} candidates=${m.candidates} skippedLiveLease=${m.skippedLiveLease} redispatched=${m.redispatched} escalated=${m.escalated || 0} escalationHeld=${m.escalationHeld || 0} reviewReawakened=${m.reviewReawakened} wouldRedispatch=${m.wouldRedispatch} noop=${m.noop} derivedBackfills=${m.derivedBackfills || 0} candidateErrors=${m.candidateErrors} truncated=${m.truncated} durationMs=${m.durationMs} (sweep ${sweepId})`);
     return m;
   }
 
@@ -347,6 +402,8 @@ export function emitReconcileMetrics(m) {
           { Name: "ReconcileExitedOk", Unit: "Count" },
           { Name: "ReconcileAwaiting", Unit: "Count" },
           { Name: "ReconcileAwaitTimeouts", Unit: "Count" },
+          // TEAM-4185 F4 — fix-side derived edge backfills.
+          { Name: "ReconcileDerivedBackfills", Unit: "Count" },
         ],
       }],
     },
@@ -365,5 +422,6 @@ export function emitReconcileMetrics(m) {
     ReconcileExitedOk: m.exitedOk || 0,
     ReconcileAwaiting: m.awaiting || 0,
     ReconcileAwaitTimeouts: m.awaitTimeouts || 0,
+    ReconcileDerivedBackfills: m.derivedBackfills || 0,
   }));
 }
