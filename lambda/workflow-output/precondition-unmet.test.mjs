@@ -13,10 +13,18 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
  */
 
 const h = vi.hoisted(() => {
-  const state = { puts: [], invokes: [], ddbPuts: [] };
-  // The real tickets-Lambda success shape — { ticketId, preconditionUnmet }, no
-  // `.error` — as pinned by agentcore-hub-tickets/precondition-contract.test.mjs.
-  state.defaultResponder = (parsed) => ({ ticketId: parsed.parameters?.ticket_id, preconditionUnmet: {} });
+  // ticketItem/ticketUpdates (TEAM-4261) belong to the REAL tickets handler, which
+  // the end-to-end cases below drive through this same lib-dynamodb mock.
+  const state = { puts: [], invokes: [], ddbPuts: [], ticketItem: null, ticketUpdates: [] };
+  // The real tickets-Lambda SUCCESS shape — { ticketId, preconditionUnmet: {
+  // awaitingIds } }, no `.error` — as pinned by
+  // agentcore-hub-tickets/precondition-contract.test.mjs. TEAM-4261: awaitingIds is
+  // REQUIRED, not decorative — it is the positive check the consumer now demands
+  // before it will report a stamp as persisted.
+  state.defaultResponder = (parsed) => ({
+    ticketId: parsed.parameters?.ticket_id,
+    preconditionUnmet: { awaitingIds: parsed.parameters?.awaitingIds || [] },
+  });
   // Per-test override (reset in beforeEach). A responder may return the payload
   // object directly, or { payload, FunctionError } to simulate a Lambda-level
   // unhandled exception, or THROW to simulate an invoke failure.
@@ -43,7 +51,10 @@ vi.mock("@aws-sdk/client-lambda", () => ({
       // invoke assertable (the failure tests check it was the annotate action).
       const parsed = JSON.parse(Buffer.from(cmd.input.Payload).toString());
       h.invokes.push(parsed);
-      const out = h.invokeResponder(parsed);
+      // Awaited (TEAM-4261): a responder may be the REAL tickets handler, which is
+      // async — an unawaited Promise would stringify to `{}` and silently pass a
+      // no-stamp payload to the consumer.
+      const out = await h.invokeResponder(parsed);
       const { payload, FunctionError } = out && typeof out === "object" && "payload" in out
         ? out
         : { payload: out, FunctionError: undefined };
@@ -53,13 +64,33 @@ vi.mock("@aws-sdk/client-lambda", () => ({
   InvokeCommand: class { constructor(input) { this.input = input; } },
 }));
 vi.mock("@aws-sdk/client-dynamodb", () => ({ DynamoDBClient: class {} }));
+// TEAM-4261 — the command set is wider than workflow-output's own PutCommand because
+// the end-to-end cases below import the REAL tickets Lambda, which reads the ticket
+// row (GetCommand) and writes the stamp (UpdateCommand) through this same seam.
 vi.mock("@aws-sdk/lib-dynamodb", () => ({
-  DynamoDBDocumentClient: { from: () => ({ send: async (cmd) => { h.ddbPuts.push(cmd?.input); return {}; } }) },
+  DynamoDBDocumentClient: {
+    from: () => ({
+      send: async (cmd) => {
+        const kind = cmd?.constructor?.name;
+        if (kind === "GetCommand") return { Item: h.ticketItem };
+        if (kind === "UpdateCommand") { h.ticketUpdates.push(cmd.input); return {}; }
+        h.ddbPuts.push(cmd?.input);
+        return {};
+      },
+    }),
+  },
   PutCommand: class { constructor(input) { this.input = input; } },
+  GetCommand: class { constructor(input) { this.input = input; } },
+  UpdateCommand: class { constructor(input) { this.input = input; } },
+  QueryCommand: class { constructor(input) { this.input = input; } },
+  ScanCommand: class { constructor(input) { this.input = input; } },
 }));
 
 process.env.ARTIFACT_BUCKET = "test-bucket";
 const { handler } = await import("./index.mjs");
+// The REAL DynamoDB tickets Lambda, so the end-to-end cases exercise the actual
+// producer→consumer pair rather than a hand-written literal (TEAM-4261).
+const tickets = await import("../agentcore-hub-tickets/index.mjs");
 
 const call = (args, name = "WorkflowOutput___report_precondition_unmet") =>
   handler({ tool_name: name, arguments: args });
@@ -71,6 +102,8 @@ beforeEach(() => {
   h.puts.length = 0;
   h.invokes.length = 0;
   h.ddbPuts.length = 0;
+  h.ticketUpdates.length = 0;
+  h.ticketItem = null;
   h.invokeResponder = h.defaultResponder;
 });
 
@@ -240,6 +273,94 @@ describe("report_precondition_unmet — a failed stamp is surfaced (TEAM-4189)",
     expect(r.error.length).toBe(300);
     const event = h.ddbPuts.find((p) => p?.Item?.type === "agent.precondition_unmet");
     expect(event.Item.detail.stampError.length).toBe(300);
+  });
+
+  /**
+   * TEAM-4261 (ship-review r2-F2) — the failure shapes TEAM-4189 did NOT cover,
+   * because it enumerated the JIRA provider's contract.
+   *
+   * The DynamoDB tickets Lambda answered a handled failure with content-only text
+   * (`{ content: [{ text: "Issue TEAM-404 not found." }] }`) — no `error` key, so the
+   * "everything else is success" branch reported stampPersisted true and told the
+   * agent it had parked. Nothing was written, so neither the D1 re-wake nor the D2
+   * liveness clock had a stamp to read, and the agent was never re-woken.
+   *
+   * (f)/(f2) drive the REAL tickets handler, so this is the actual producer→consumer
+   * pair, not a literal that could drift. (g)/(h) prove the consumer is robust on its
+   * own — a tickets Lambda deployed BEFORE the F1 producer fix still answers
+   * content-only, and the two Lambdas are deployed independently.
+   */
+  describe("(TEAM-4261) an annotate that did not stamp is never reported as a park", () => {
+    /** Route the invoke into the real tickets handler, tool_name and all. */
+    const throughRealTicketsLambda = () => {
+      h.invokeResponder = (parsed) =>
+        tickets.handler({ tool_name: parsed.tool_name, parameters: parsed.parameters });
+    };
+
+    it("(f) REAL dynamodb tickets Lambda, ticket row missing → surfaced failure, not a park", async () => {
+      throughRealTicketsLambda();
+      h.ticketItem = null; // GetCommand finds no item — the reproduction from the finding
+
+      const r = result(await call(ARGS));
+
+      expectSurfacedFailure(r, "not found");
+      // The producer really did decline to write.
+      expect(h.ticketUpdates).toHaveLength(0);
+    });
+
+    it("(f2) REAL dynamodb tickets Lambda, ticket present → the stamp IS reported as persisted", async () => {
+      throughRealTicketsLambda();
+      h.ticketItem = { ticketId: "TEAM-4126", status: "in_progress", blockedBy: [] };
+
+      const r = result(await call(ARGS));
+
+      // The positive check is pinned against the REAL producer, so tightening the
+      // consumer cannot silently start rejecting a genuine success.
+      expect(r.status).toBe("waiting");
+      expect(r.stampPersisted).toBe(true);
+      expect(h.ticketUpdates).toHaveLength(1);
+    });
+
+    it("(g) an OLDER deployed tickets Lambda's content-only failure is still a failed stamp", async () => {
+      // The exact literal the dynamodb provider returned before TEAM-4261 F1 — see
+      // lambda/agentcore-hub-tickets/precondition-contract.test.mjs for the contract
+      // both providers now honour.
+      h.invokeResponder = () => ({ content: [{ text: "Issue TEAM-404 not found." }] });
+
+      const r = result(await call(ARGS));
+
+      expectSurfacedFailure(r, "Issue TEAM-404 not found.");
+      // The provider's own words reach the agent, not a bare JSON dump.
+      expect(r.error).toContain("annotate returned no stamp");
+    });
+
+    it("(h) an empty payload is a failed stamp with a non-empty error", async () => {
+      h.invokeResponder = () => ({});
+
+      const r = result(await call(ARGS));
+
+      expectSurfacedFailure(r, "annotate returned no stamp");
+      expect(typeof r.error).toBe("string");
+      expect(r.error.length).toBeGreaterThan(0);
+    });
+
+    it("(i) the jira provider's real 404 failure literal is surfaced the same way", async () => {
+      // jiraFetch throws `Jira API <status>: <msg>` and the Jira handler's catch
+      // returns it as { error } — pinned by the same contract test.
+      h.invokeResponder = () => ({
+        error: "Jira API 404: Issue does not exist or you do not have permission to see it.",
+      });
+
+      expectSurfacedFailure(result(await call(ARGS)), "Jira API 404");
+    });
+
+    it("a payload whose preconditionUnmet carries no awaitingIds array is NOT a stamp", async () => {
+      // The shape the fixture used before this ticket. It is not what either provider
+      // returns, and it is not evidence that awaited ids were written.
+      h.invokeResponder = (parsed) => ({ ticketId: parsed.parameters?.ticket_id, preconditionUnmet: {} });
+
+      expectSurfacedFailure(result(await call(ARGS)), "annotate returned no stamp");
+    });
   });
 });
 
