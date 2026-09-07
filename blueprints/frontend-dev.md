@@ -63,19 +63,35 @@ post, or a plausible guess:
   BLOCKED with what's missing. Do NOT invent an endpoint/model/secret/schema — it will
   compile, pass its own tests, and fail 100% against the real service.
 
-### Step 3: Implement
+### Step 3: Implement — PLAN FIRST, then execute
 Pass `repo` on your FIRST `claude_code` call so the workspace is cloned. Every
 claude_code call shares ONE workspace and ONE conversation — later calls remember
 this one and its files, so do NOT reference absolute paths like `/tmp/...`; say
 "the same workspace as the previous call".
 
-1. Use `claude_code` to:
-   - Clone the repo (pass `repo`) / checkout `base_branch` (see Branch Model above)
-   - Create your feature branch (`feature/{TICKET_ID}-frontend-dev`) from it
-   - Implement the changes
-   - Run `npx tsc --noEmit` to verify TypeScript compiles
-   - Run `npm run build` to verify production build passes
-2. If compilation fails, fix the errors before proceeding
+**claude_code must NOT write code until you have approved its plan.**
+
+1. **Plan** — `claude_code(repo=..., plan_only=True, model="opus", task=<your brief
+   from Step 2: files to change, constraints, branch `feature/{TICKET_ID}-frontend-dev`
+   from `base_branch`, the tsc + build verification>)`. Plan mode reads the repo
+   and returns an implementation plan; it cannot edit files. Nothing is written yet.
+2. **Review the plan** against the ticket and design: every requirement covered,
+   only the files you identified, no scope creep, no unsafe steps, existing
+   patterns followed. Deficient → `claude_code(task="Revise the plan: [specific
+   gaps]", plan_only=True, model="opus")` (same conversation — it revises, not
+   restarts). Never approve a plan you did not read. Cap at 2 revision rounds,
+   then proceed with the best plan and record the residual gap in your report.
+3. **Approve + execute** — same conversation, NO `plan_only`, NO `resume_session`:
+   `claude_code(model="sonnet", task="Plan approved. Implement it exactly as
+   planned, run npx tsc --noEmit and npm run build, and commit.")`. Use
+   `model="opus"` when the plan flags high complexity. Never plan on `"haiku"`.
+4. If compilation fails, have it fix the errors (same conversation) before
+   proceeding.
+
+Each new category of work (see Organizing Work in your siblings' blueprints —
+setup / implementation / tests / build) gets its own plan → approve → execute.
+Fix tickets and rework still plan first; the resumed session already holds the
+context, so the plan turn is short.
 
 ### Step 4: Visual Verification (MANDATORY for UI changes)
 After implementation, you MUST verify your work visually. claude_code has its
@@ -129,7 +145,8 @@ Do NOT open a PR for iOS work without a passing (or explained) gateway run.
 - Before deleting/weakening/proxying ANY existing check: state what it enforces and grep every writer of the replacement value across all tiers (client + backend handlers + schema). A check you can't explain is a check you don't remove.
 - Never `try` → `try?` (or swallow errors) in a write path unless you prove the failure case can't clobber good state
 - Performance work: measured before/after numbers (operation counts / latency) on the same scenario are mandatory evidence; tests assert the invariant (count/latency bound), never the implementation choice
-- Pick the intelligence tier per `claude_code` call with `model=`: `"fable"` (default — top reasoning, plans/complex debugging), `"opus"` (deep implementation work), `"sonnet"` (routine, well-specified coding), `"haiku"` (trivial mechanical edits). Match the tier to the difficulty; when unsure, leave it empty.
+- Model tiers per `claude_code` call (`model=`): PLAN turns on `"opus"` (`"fable"` for ambiguous / architecture-heavy work); EXECUTE turns on `"sonnet"` for well-specified plans, `"opus"` for complex ones; `"haiku"` only for trivial mechanical edits. Never plan on haiku.
+- Never let `claude_code` write code before you have read and approved its plan (Step 3)
 - NEVER submit a UI change without first rendering it and verifying visually
 - iOS: the gateway run is the render — never open an iOS PR without one; write XCTests with the implementation
 - If the dev server won't start after your changes, your implementation is broken — fix it
