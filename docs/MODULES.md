@@ -182,6 +182,48 @@ garbage → `off` rule.
   scheduled starts a week, off the hot human path; a very large workflows table
   would want an index.
 
+**The `nothing-to-remove` terminal outcome (TEAM-4247 D2)** — a sixth terminal
+`WorkflowPhase`, deliberately **not** folded into `SHIP_BLOCKED_OUTCOMES`: a no-op
+sweep is a healthy run, not a blocked one, so it must not enter the ship-verdict
+gates, the blocked-run EventBridge rule or the blocked-run alerting.
+- Source of truth `NO_OP_OUTCOMES` in `src/lib/workflow/types.ts`, spread into
+  `TERMINAL_PHASES`. Hand-written mirrors in `lambda/orchestrator/completion.mjs`,
+  `lambda/workflow-analyzer/index.mjs`, `lambda/anomaly-watcher/index.mjs`,
+  `lambda/cost-report/index.mjs`, four `api/workflow/**` routes and
+  `deploy/workflow-manager/toolkit/run_outcomes.py` (the ONE Python copy —
+  `save_analysis.py` and `compute_metrics.py` both import it). All of them are
+  bound together by `src/lib/workflow/run-outcome-parity.test.ts`; add a value
+  there and to every mirror in the SAME commit.
+- **Excluded from every baseline** (FR-D2.8): a run with no work in it cannot be
+  the comparator that defines "anomalous", and a fleet swept on a cadence that
+  keeps finding nothing would otherwise halve the median and widen sigma until a
+  genuine cost blow-out stopped alerting. `cost-report`'s `isBaselineEligible`,
+  `buildFleetView`'s `baseline` slice (`src/lib/workflow/performance.ts`) and the
+  toolkit's `baseline_analyses` all drop it. The **current** window keeps it — the
+  run happened and cost money, so it is still listed, still in the totals, still
+  carded (`status: "ok"`, `noOp: true`). Consequence: a no-op card publishes **no**
+  `workflow.performance` event, so anything counting runs by that event
+  under-counts them by design.
+- **Yield-aware gate depth (FR-D2.6)** — when a zero-yield sweep runs on anyway
+  (the flag is `off`/`shadow`, or the close's CAS was lost), the diff is a
+  candidate ledger with no deletions in it. `sweepYieldNote` puts ONE ≤200-char
+  line into the QA verifier's and CI agent's `## Sweep Yield` context block
+  ("ledger-accuracy QA only … CI builds once") and the opposite line into the code
+  reviewer's and the human merge gate's review package (ledger re-verification
+  retained in full). Read by `blueprints/{qa-verifier,ci-agent}.md`;
+  `blueprints/code-reviewer.md` is untouched by D2 on purpose. Depth is set by
+  data on the run, never by an env flag the model cannot see.
+- `blueprints/code-sweeper.md` no longer terminates its own run: it reports
+  `verified_removable=<n>` + `candidates=<n>` and stops. The pre-D2 Step 2.5 had
+  the model hand-`skip` every downstream ticket in reverse dependency order — a
+  mass ticket mutation as the run's only termination mechanism.
+
+**New events (TEAM-4247 D2)**
+- `workflow.nothing_to_remove { workflowId, outcome, verifiedRemovable, candidates, prUrl, featureBranch, ticketId }` — `SWEEP_DETECTION_PHASE=enforce` closed a zero-yield sweep. Published **instead of** `workflow.complete`, never alongside it, and deliberately **not** added to the analyzer's EventBridge rule (auto-analysis of no-op sweeps is out of D2)
+- `sweep.detection_observed { workflowId, verifiedRemovable, candidates, wouldClose }` — `SWEEP_DETECTION_PHASE=shadow`, subject = the detection ticket
+- `workflow.skipped { reason, evidence, repo, defId, trigger }` — `SWEEP_CADENCE_GATE=enforce` skipped a scheduled start; one per tombstone
+- `sweep.cadence_observed { wouldSkip, reason, evidence, repo, defId }` — `SWEEP_CADENCE_GATE=shadow`, the run then starts as today
+
 **New events (TEAM-4246 D1)**
 - `orchestrator.verdict_observed { workflowId, verdict, verdictSource, wouldSuppress, spawnedTickets, testedHead }` — `VERDICT_GATE=shadow`, every gate completion
 - `orchestrator.verdict_suppressed { workflowId, verdict, unblocked, blockers, spawnedTickets }` — `VERDICT_GATE=enforce`, a non-PASS gate held its successor

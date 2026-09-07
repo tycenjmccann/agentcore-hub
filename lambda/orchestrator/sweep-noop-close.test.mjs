@@ -117,6 +117,15 @@ vi.mock("@aws-sdk/client-s3", () => ({
     async send(cmd) {
       const key = cmd.input?.Key || "";
       if (cmd.constructor.name === "GetObjectCommand") h.state.s3Gets.push(key);
+      // loadReviewPackage LISTS the shared/ prefix before reading the parts. Served
+      // out of the same seeded object map so the merge-and-clamp path runs for real;
+      // with nothing seeded it returns no Contents, which is what every other test
+      // in this file already relied on (the throw below was caught and read as
+      // "no package").
+      if (cmd.constructor.name === "ListObjectsV2Command") {
+        const prefix = cmd.input?.Prefix || "";
+        return { Contents: Object.keys(h.state.s3Objects).filter((k) => k.startsWith(prefix)).map((k) => ({ Key: k })) };
+      }
       if (cmd.constructor.name !== "GetObjectCommand" || !(key in h.state.s3Objects)) {
         const err = new Error(`NoSuchKey: ${key}`);
         err.name = "NoSuchKey";
@@ -235,13 +244,18 @@ let handleTicketDoneUnified;
 let handleTicketDone;
 let handler;
 let stripUnenforcedDetectionPhase;
+let buildAgentContext;
+let sweepYieldNote;
+let sweepYieldAudience;
 
 async function load(mode) {
   if (mode === undefined) delete process.env.SWEEP_DETECTION_PHASE;
   else process.env.SWEEP_DETECTION_PHASE = mode;
   vi.resetModules();
-  ({ handleTicketDoneUnified, handleTicketDone, handler, stripUnenforcedDetectionPhase } =
-    await import("./index.mjs"));
+  ({
+    handleTicketDoneUnified, handleTicketDone, handler, stripUnenforcedDetectionPhase,
+    buildAgentContext, sweepYieldNote, sweepYieldAudience,
+  } = await import("./index.mjs"));
   // Warm the module exactly as production does. The roster, the workflow defs and
   // the CD registry are loaded by `handler`, not by the twins, and both halves
   // matter here: without the defs, getEffectiveWorkflowDef falls back to
@@ -671,5 +685,146 @@ describe("no dispatch AFTER the close (the level-trigger paths)", () => {
     h.state.scanRows = [{ ...makeWorkflow() }]; // phase: "detection"
     const result = await handler({ source: "orchestrator.sweep", action: "reconcile_sweep" });
     expect(result.candidates).toBeGreaterThan(0);
+  });
+});
+
+/**
+ * TEAM-4247 D2 FR-D2.6 — yield-aware gate depth.
+ *
+ * A zero-yield sweep that runs ON (the flag is off/shadow, or the close's CAS was
+ * lost) hands its gates a diff with no deletions in it: a candidate ledger and
+ * nothing else. The full battery — fresh clone, build, runtime smoke — proves that
+ * code nobody touched still works, while the one thing that can actually be wrong,
+ * a ledger row claiming a live symbol is unreferenced, is a reading exercise.
+ *
+ * So the depth is set by DATA, not by an env flag the model cannot see: one line in
+ * the persona's context, and the same line in front of the human merge approver. The
+ * reviewer's line says the opposite of QA's on purpose — blueprints/code-reviewer.md
+ * is untouched by D2 and its ledger re-verification is retained in full.
+ */
+describe("yield-aware gate depth (FR-D2.6)", () => {
+  const LEDGER_ONLY = "ledger-accuracy QA only (no fresh-clone build + runtime smoke); CI builds once.";
+  const RETAINED = "ledger re-verification is retained in full";
+
+  /** The board after a zero-yield detection ticket was harvested (commit 1's fill). */
+  const harvested = (over = {}) =>
+    makeWorkflow({
+      agentTasks: {
+        [DETECT]: {
+          id: "task_detect", agentId: SWEEPER, ticketId: DETECT, status: "done",
+          verifiedRemovable: 0, candidates: 93,
+        },
+      },
+      ...over,
+    });
+
+  const ticketFor = (assignee) => ({
+    ticketId: QA, parentId: EPIC, workflowId: WF, assignee, status: "in_progress",
+    title: "Verify the sweep", description: "Verify the removal ledger.",
+  });
+
+  beforeEach(async () => {
+    // shadow: the mode in which a zero-yield run really does continue to its gates,
+    // which is the only situation where depth is a question at all.
+    await load("shadow");
+    h.state.workflow = harvested();
+  });
+
+  it("tells the QA verifier and the CI agent that the diff is deletion-free", async () => {
+    for (const assignee of ["agentcore_hub_qa_verifier", "agentcore_hub_ci_agent"]) {
+      const ctx = await buildAgentContext(ticketFor(assignee), h.state.workflow);
+      expect(ctx, assignee).toContain("## Sweep Yield");
+      expect(ctx, assignee).toContain("Detection: 93 candidates, 0 verified removable");
+      expect(ctx, assignee).toContain(LEDGER_ONLY);
+      expect(ctx, assignee).not.toContain(RETAINED);
+    }
+  });
+
+  it("tells the code reviewer the opposite — nothing about the ledger review is relaxed", async () => {
+    const ctx = await buildAgentContext(ticketFor("agentcore_hub_code_reviewer"), h.state.workflow);
+    expect(ctx).toContain("Detection: 93 candidates, 0 verified removable");
+    expect(ctx).toContain(RETAINED);
+    expect(ctx).not.toContain("no fresh-clone build");
+  });
+
+  it("says nothing at all to the personas whose depth it does not set", async () => {
+    // The release manager reviews the PR it is handed; the sweeper wrote the ledger.
+    for (const assignee of ["agentcore_hub_release_manager", SWEEPER]) {
+      const ctx = await buildAgentContext(ticketFor(assignee), h.state.workflow);
+      expect(ctx, assignee).not.toContain("## Sweep Yield");
+    }
+    expect(sweepYieldAudience("agentcore_hub_release_manager")).toBeNull();
+    expect(sweepYieldAudience("agentcore_hub_qa_verifier")).toBe("verify");
+    expect(sweepYieldAudience("agentcore_hub_code_reviewer")).toBe("reverify");
+  });
+
+  it("says nothing when the sweep DID remove code — 8 removals get the full battery", async () => {
+    h.state.workflow = harvested();
+    h.state.workflow.agentTasks[DETECT].verifiedRemovable = 8;
+    const ctx = await buildAgentContext(ticketFor("agentcore_hub_qa_verifier"), h.state.workflow);
+    expect(ctx).not.toContain("## Sweep Yield");
+    expect(sweepYieldNote(h.state.workflow, "verify")).toBeNull();
+  });
+
+  it("says nothing on a run whose record predates the field entirely", async () => {
+    h.state.workflow = makeWorkflow(); // no verifiedRemovable anywhere
+    const ctx = await buildAgentContext(ticketFor("agentcore_hub_qa_verifier"), h.state.workflow);
+    expect(ctx).not.toContain("## Sweep Yield");
+  });
+
+  it("says nothing on another def, even at zero yield", async () => {
+    const other = harvested({ workflowDefId: "software-delivery" });
+    expect(sweepYieldNote(other, "verify")).toBeNull();
+    const ctx = await buildAgentContext(ticketFor("agentcore_hub_qa_verifier"), other);
+    expect(ctx).not.toContain("## Sweep Yield");
+  });
+
+  it("respects the 200-char package-bullet clamp, and drops the count when it is absent", () => {
+    const wide = harvested();
+    wide.agentTasks[DETECT].candidates = 999999;
+    for (const audience of ["verify", "reverify"]) {
+      expect(sweepYieldNote(wide, audience).length, audience).toBeLessThanOrEqual(200);
+    }
+    const noCount = harvested();
+    delete noCount.agentTasks[DETECT].candidates;
+    expect(sweepYieldNote(noCount, "verify")).toContain("Detection: 0 verified removable");
+    expect(sweepYieldNote(noCount, "verify")).not.toContain("candidates");
+  });
+
+  it("leads the human merge gate's package with the same line", async () => {
+    // The Merge Approval gate is blocked by the CI ticket, so the package phase
+    // resolves to `review` — the real blocker walk, not a stubbed phase.
+    h.state.tickets[CI] = { ticketId: CI, parentId: EPIC, workflowId: WF, assignee: "agentcore_hub_ci_agent", status: "done" };
+    h.state.tickets[GATE] = { ticketId: GATE, parentId: EPIC, workflowId: WF, assignee: "human:engineer", status: "ready", blockedBy: [CI] };
+    h.state.s3Objects[`workflows/${WF}/shared/review-package-review.json`] = {
+      summary: "Ledger of 93 candidates; nothing removed.",
+      bullets: ["93 candidates examined", "no files deleted"],
+      links: [{ label: "PR", url: PR }],
+    };
+
+    await handler({
+      Records: [{
+        eventName: "MODIFY",
+        dynamodb: {
+          OldImage: { ticketId: { S: GATE }, status: { S: "blocked" } },
+          NewImage: {
+            ticketId: { S: GATE }, status: { S: "ready" },
+            assignee: { S: "human:engineer" }, parentId: { S: EPIC },
+            workflowId: { S: WF }, blockedBy: { L: [{ S: CI }] },
+            title: { S: "Merge Approval" },
+          },
+        },
+      }],
+    });
+
+    const comments = h.state.updates
+      .filter((u) => u.Key?.ticketId === GATE && u.ExpressionAttributeValues?.[":n"])
+      .flatMap((u) => u.ExpressionAttributeValues[":n"].map((c) => c.content))
+      .join("\n");
+    expect(comments).toContain("Detection: 93 candidates, 0 verified removable");
+    expect(comments).toContain(RETAINED);
+    // The agent's own bullets survive behind it — the note is added, not a rewrite.
+    expect(comments).toContain("93 candidates examined");
+    expect(comments).toContain("Ledger of 93 candidates");
   });
 });

@@ -4,6 +4,16 @@ Architectural decisions and their rationale. Newest first.
 
 ---
 
+## DL-014: Nothing-to-remove (TEAM-4247 D2) — the orchestrator ends a zero-yield sweep, not the model
+
+**Date:** 2026-09-07
+**Status:** IMPLEMENTED (shadow default)
+**Context:** wf_…c2uqki swept 93 candidates, verified zero as dead, and had no way to say so. `blueprints/code-sweeper.md` Step 2.5 made termination the model's job — `Tickets___list_tickets(epic)` then hand-`skip` every downstream ticket "in REVERSE dependency order" — so one missed or mis-ordered ticket dispatches a reviewer/QA/CI/release-manager against a branch that does not exist and pages a human to approve a merge with no PR. There was also no terminal outcome for it (the run closed as a fake `complete` or hung), zero-cost no-op runs polluted every performance baseline, and nothing stopped a weekly re-sweep of a repo whose previous sweep PR was still open.
+**Decision:** Make the yield a **number** and termination the orchestrator's. `report_completion` carries `verified_removable`/`candidates`; a strict integer `0` on a `dead-code-sweep` detection ticket closes the run as the new terminal outcome `nothing-to-remove` **before** `cascadeUnblock`, so there are zero successor dispatches and never a `workflow.complete`. `nothing-to-remove` is added to `NO_OP_OUTCOMES` and every terminal mirror but deliberately **not** to `SHIP_BLOCKED_OUTCOMES` — a no-op sweep is healthy, not blocked — and it is excluded from every baseline (cost-report, `buildFleetView`, the analysis toolkit) while staying visible and carded in the current window. A separate `SWEEP_CADENCE_GATE` skips a scheduled sweep of a repo swept < 14 days ago or with an open sweep PR, answering HTTP 200 with a tombstone rather than creating a run. All of it behind `off|shadow|enforce` flags defaulting to `shadow`, on the D1 ladder.
+**Consequences:** Config and code ship separately, so the detection phase is stripped from the effective def until `SWEEP_DETECTION_PHASE=enforce` (otherwise a synced `workflows.json` would wedge every sweep on an unsatisfiable required phase); the deploy order is code → `workflows.json` → flag. A no-op card publishes no `workflow.performance` event, so run counts taken from that event under-count by design. The open-PR probe fails open, so an expired `GITHUB_PAT` degrades to cadence-only rather than stopping all sweeps.
+
+---
+
 ## DL-013: Verdict gate (TEAM-4246 D1) — bind cascade/completion to gate verdicts, not ticket-done
 
 **Date:** 2026-09-07

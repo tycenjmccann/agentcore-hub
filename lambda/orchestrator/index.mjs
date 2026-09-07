@@ -1069,6 +1069,58 @@ async function observeSweepDetection(workflow, ticket) {
   }
 }
 
+/**
+ * TEAM-4247 D2 FR-D2.6 — yield-aware gate depth.
+ *
+ * A sweep that verified NOTHING to remove and still ran on (SWEEP_DETECTION_PHASE
+ * is `off`/`shadow`, or the close's CAS was lost) leaves a diff with no deletions in
+ * it: a candidate ledger and nothing else. Sending the full verification battery at
+ * that diff spends a fresh clone, a build and a runtime smoke to prove that code
+ * nobody touched still works — while the one thing that CAN be wrong (a ledger row
+ * claiming a symbol is unreferenced when it is not) is a reading exercise.
+ *
+ * So the gates are told the yield and what it implies for their depth. Two audiences:
+ *   - `verify`   (QA verifier, CI agent) → ledger accuracy only; CI builds once.
+ *   - `reverify` (code reviewer, and the human merge gate's package) → nothing is
+ *     relaxed; blueprints/code-reviewer.md is deliberately untouched by D2.
+ *
+ * SIGNAL: `verifiedRemovable === 0` on the detection task entry, and only that. A
+ * `deletions`/`diff_filter_d` count would be a second, better signal — the sweeper's
+ * completion record does not carry one and inventing it means widening commit 1's
+ * report_completion contract, so it is out of D2 rather than half-done here.
+ */
+const SWEEP_YIELD_AUDIENCES = new Map([
+  ["agentcore_hub_qa_verifier", "verify"],
+  ["agentcore_hub_ci_agent", "verify"],
+  ["agentcore_hub_code_reviewer", "reverify"],
+]);
+
+/** Which yield note (if any) this assignee gets. Release manager: none — the ship
+ *  persona's depth is set by the PR it is handed, not by the detection count. */
+export function sweepYieldAudience(assignee) {
+  return SWEEP_YIELD_AUDIENCES.get(assignee) || null;
+}
+
+/**
+ * The ONE line, or null when this run has no zero-yield detection entry. Clamped to
+ * the same 200 chars a review-package bullet gets, so it can be dropped into either
+ * surface (the agent context block, the gate package) without a second cap.
+ */
+export function sweepYieldNote(workflow, audience) {
+  if (workflow?.workflowDefId !== SWEEP_WORKFLOW_DEF_ID) return null;
+  if (audience !== "verify" && audience !== "reverify") return null;
+  // STRICT === 0 on the harvested integer, exactly as observeSweepDetection reads
+  // it: an absent field (every pre-D2 record) is not a zero yield, and truthiness
+  // would invert the test on the only value that matters.
+  const entry = Object.values(workflow.agentTasks || {}).find((t) => t?.verifiedRemovable === 0);
+  if (!entry) return null;
+  const candidates = Number.isInteger(entry.candidates) ? `${entry.candidates} candidates, ` : "";
+  const depth = audience === "verify"
+    ? "ledger-accuracy QA only (no fresh-clone build + runtime smoke); CI builds once."
+    : "ledger re-verification is retained in full (check every ledger row against the diff).";
+  return `Detection: ${candidates}0 verified removable — deletion-free ledger-only diff: ${depth}`.slice(0, 200);
+}
+
 // ─── Live-evidence re-verification (TEAM-4121 FR-9) ──────────────────────────
 // Lazy singleton, same shape as getReworkLoopCap(). Fires only when
 // LIVE_REVERIFY != off; default off ⇒ never constructed, so the done twins keep
@@ -2807,6 +2859,13 @@ async function loadReviewPackage(workflow, gateTicketId) {
       bullets: parts.flatMap((p) => (Array.isArray(p.bullets) ? p.bullets : [])),
       links: parts.flatMap((p) => (Array.isArray(p.links) ? p.links : [])),
     };
+    // TEAM-4247 D2 FR-D2.6: on a zero-yield sweep, the human merge approver is
+    // reading a diff with no deletions in it — say so FIRST, before the agent's own
+    // bullets, and say that the ledger re-verification behind it was NOT relaxed.
+    // Prepended (not appended) so the bullet cap below can never drop it; the note
+    // is already ≤200 chars, so the clamp that follows is a no-op on it.
+    const yieldNote = sweepYieldNote(workflow, "reverify");
+    if (yieldNote) merged.bullets.unshift(yieldNote);
     // Clamp to the contract so a rambling agent can't flood the ping: bullets
     // are one-liners, links carry either an in-run artifactKey or an https url.
     // Multi-part merges get proportionally wider caps, still phone-sized.
@@ -5398,6 +5457,15 @@ export async function buildAgentContext(ticket, workflow) {
   context += `workflow_id: ${workflow.id}\n`;
   context += `epic_id: ${workflow.epicId}\n`;
   context += `ticket_id: ${ticket.ticketId}\n\n`;
+
+  // Sweep yield (TEAM-4247 D2 FR-D2.6) — the same line the merge-gate package
+  // carries, addressed to the persona about to spend its budget. Reaches only the
+  // three personas whose depth it changes, only on the sweep def, and only when the
+  // detection entry really reported zero verified removals: every other run's
+  // context is byte-identical. An env flag would be invisible to the model, so the
+  // yield is stated as data, and blueprints/{qa-verifier,ci-agent}.md read it.
+  const yieldNote = sweepYieldNote(workflow, sweepYieldAudience(ticket.assignee));
+  if (yieldNote) context += `## Sweep Yield\n${yieldNote}\n\n`;
 
   // Shipped laptop session: the requester planned this work in a live coding
   // session and shipped it here. Visible to EVERY agent — the transcript is the
