@@ -10,6 +10,9 @@ import {
   markDeadSessionDetected,
   clearDeadSessionDetected,
   incrementDeadSessionRetry,
+  markAwaitTimeoutEmitted,
+  markInitialPhaseAnnounced,
+  incrementCleanExitRedispatch,
   claimDeadSessionSynthesis,
   claimReverifySlot,
   releaseReverifySlot,
@@ -300,6 +303,75 @@ describe("incrementDeadSessionRetry", () => {
   });
 });
 
+describe("markAwaitTimeoutEmitted (TEAM-4166 D1)", () => {
+  it("stamps the task's awaitTimeoutEmittedAt under attribute_not_exists (once-only)", async () => {
+    const won = await markAwaitTimeoutEmitted("wf_1", "TEAM-2", "2026-09-06T08:00:00Z");
+    expect(won).toBe(true);
+    const w = writes()[0];
+    expect(w.input.UpdateExpression).toBe("SET agentTasks.#tid.awaitTimeoutEmittedAt = :at");
+    expect(w.input.ConditionExpression).toBe("attribute_not_exists(agentTasks.#tid.awaitTimeoutEmittedAt)");
+    expect(w.input.ExpressionAttributeNames["#tid"]).toBe("TEAM-2");
+    expect(w.input.ExpressionAttributeValues[":at"]).toBe("2026-09-06T08:00:00Z");
+    // NOT anchored to a claim generation — no startedAt in the guard.
+    expect(w.input.ConditionExpression).not.toContain("startedAt");
+  });
+
+  it("returns false when another writer already emitted (CCFE), never throws", async () => {
+    failNextCondition = true;
+    await expect(markAwaitTimeoutEmitted("wf_1", "TEAM-2", "x")).resolves.toBe(false);
+  });
+});
+
+describe("markInitialPhaseAnnounced (TEAM-4167 D3 FR-3.3)", () => {
+  it("claims the emit under a top-level attribute_not_exists CAS (once-only)", async () => {
+    const won = await markInitialPhaseAnnounced("wf_1", "requirements");
+    expect(won).toBe(true);
+    const w = writes()[0];
+    expect(w.input.UpdateExpression).toBe("SET announcedInitialPhase = :p");
+    expect(w.input.ConditionExpression).toBe("attribute_not_exists(announcedInitialPhase)");
+    expect(w.input.ExpressionAttributeValues[":p"]).toBe("requirements");
+    // Row-level claim, not anchored to any per-task generation.
+    expect(w.input.ConditionExpression).not.toContain("startedAt");
+    expect(w.input.ConditionExpression).not.toContain("agentTasks");
+  });
+
+  it("returns false when the initial phase was already announced (CCFE), never throws", async () => {
+    failNextCondition = true;
+    await expect(markInitialPhaseAnnounced("wf_1", "requirements")).resolves.toBe(false);
+  });
+});
+
+describe("incrementCleanExitRedispatch (TEAM-4166 D2)", () => {
+  it("seeds the top-level map then bumps the per-ticket leaf with if_not_exists (never touches deadSessionRetries)", async () => {
+    await incrementCleanExitRedispatch("wf_1", "TEAM-2");
+    expect(writes()[0].input.UpdateExpression).toContain("if_not_exists(cleanExitRedispatches, :empty)");
+    expect(writes()[0].input.ConditionExpression).toBeUndefined();
+    const bump = writes()[1];
+    expect(bump.input.UpdateExpression).toBe(
+      "SET cleanExitRedispatches.#tid = if_not_exists(cleanExitRedispatches.#tid, :zero) + :one"
+    );
+    expect(bump.input.ExpressionAttributeNames["#tid"]).toBe("TEAM-2");
+    expect(bump.input.ReturnValues).toBe("UPDATED_NEW");
+    expect(bump.input.UpdateExpression).not.toContain("deadSessionRetries");
+  });
+
+  it("returns the new count read back from UPDATED_NEW", async () => {
+    const origSend = stubDdb.send;
+    stubDdb.send = async (cmd) => {
+      sent.push({ type: cmd.constructor.name, input: cmd.input });
+      if (cmd.input.ReturnValues === "UPDATED_NEW") {
+        return { Attributes: { cleanExitRedispatches: { "TEAM-2": 1 } } };
+      }
+      return {};
+    };
+    try {
+      expect(await incrementCleanExitRedispatch("wf_1", "TEAM-2")).toBe(1);
+    } finally {
+      stubDdb.send = origSend;
+    }
+  });
+});
+
 describe("claimDeadSessionSynthesis (TEAM-4120 FR-3)", () => {
   it("seeds the map, then claims the per-ticket leaf with attribute_not_exists", async () => {
     const ok = await claimDeadSessionSynthesis("wf_1", "TEAM-2");
@@ -458,6 +530,51 @@ describe("appendReviewNotificationOnce (TEAM-3684 Finding 2)", () => {
     expect(appended).toBe(false);
     expect(updates).toBe(1); // exactly one write attempt — no duplicate append
     expect(gets).toBe(2);    // re-read after the CAS loss, then stood down
+  });
+
+  it("persists an optional humanAssignee ADDITIVELY on the notification (TEAM-4166 D2 §2.4)", async () => {
+    const origSend = stubDdb.send;
+    stubDdb.send = async (cmd) => {
+      sent.push({ type: cmd.constructor.name, input: cmd.input });
+      if (cmd.constructor.name === "GetCommand") {
+        return { Item: { workflowId: "wf_1", notifVersion: 1, humanNotifications: [] } };
+      }
+      return {};
+    };
+    try {
+      const appended = await appendReviewNotificationOnce(
+        "wf_1", "GATE-1",
+        { id: "n1", ticketId: "GATE-1", type: "review_needed", acknowledged: false },
+        3, "human:alice"
+      );
+      expect(appended).toBe(true);
+    } finally {
+      stubDdb.send = origSend;
+    }
+    const w = sent.find((c) => c.type === "UpdateCommand");
+    expect(w.input.ExpressionAttributeValues[":n"][0].humanAssignee).toBe("human:alice");
+    // additive: the original fields survive untouched
+    expect(w.input.ExpressionAttributeValues[":n"][0].id).toBe("n1");
+  });
+
+  it("omits humanAssignee entirely when none is passed (byte-identical to existing callers)", async () => {
+    const origSend = stubDdb.send;
+    stubDdb.send = async (cmd) => {
+      sent.push({ type: cmd.constructor.name, input: cmd.input });
+      if (cmd.constructor.name === "GetCommand") {
+        return { Item: { workflowId: "wf_1", notifVersion: 1, humanNotifications: [] } };
+      }
+      return {};
+    };
+    try {
+      await appendReviewNotificationOnce("wf_1", "GATE-1", {
+        id: "n1", ticketId: "GATE-1", type: "review_needed", acknowledged: false,
+      });
+    } finally {
+      stubDdb.send = origSend;
+    }
+    const w = sent.find((c) => c.type === "UpdateCommand");
+    expect(w.input.ExpressionAttributeValues[":n"][0]).not.toHaveProperty("humanAssignee");
   });
 });
 

@@ -21,9 +21,10 @@ import { checkRepoConfig, definitiveFailures, describeRepoCheckFailure } from "@
 import type { RepoCheck } from "@/lib/workflow/repo-check";
 import type { WorkflowInput } from "@/lib/workflow/types";
 import type { WorkflowDef } from "@/lib/workflow/workflow-defs";
-import { workflowTypeForDef, resolveFramework, applyFramework } from "@/lib/workflow/workflow-defs";
+import { workflowTypeForDef, resolveFramework, applyFramework, validateWorkflowDef } from "@/lib/workflow/workflow-defs";
 import { intentGateFor, renderIntentMarkdown, intentReviewPackage, intentGateDescription } from "@/lib/workflow/intent";
 import { resolveWorkflowDef } from "@/lib/workflow/defs-loader";
+import { loadCdRegistry, findCdEntry } from "@/lib/cd-registry";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const TICKETS_TABLE = process.env.TICKETS_TABLE || "agentcore-hub-tickets";
@@ -423,6 +424,23 @@ export async function POST(req: NextRequest) {
     if (!body.repoConfig) {
       body.repoConfig = { layout: "multi-repo", repos: [] };
     }
+
+    // TEAM-4167 D3a: reject a run whose FRAMED def declares an unreachable ship
+    // gate BEFORE any epic/ticket is created — a phantom human gate on a handoff
+    // run would wedge the pipeline. cdRegistered is computed the same way the
+    // orchestrator resolves delivery mode: the primary repo (repos[0].url)
+    // against the live CD registry (loadCdRegistry is the existing cached lib
+    // reader — no new S3 read). A hard throw → 400 with the gate-naming message;
+    // soft findings are logged.
+    const cdRegistry = await loadCdRegistry();
+    const cdRegistered = !!findCdEntry(cdRegistry, body.repoConfig.repos?.[0]?.url);
+    let defWarnings: string[];
+    try {
+      defWarnings = validateWorkflowDef(def, { cdRegistered }).warnings;
+    } catch (defErr) {
+      return NextResponse.json({ error: (defErr as Error).message }, { status: 400 });
+    }
+    for (const w of defWarnings) console.warn(`[start] ${w}`);
 
     // Repo URL pre-flight. A mistyped owner used to sail through here and
     // surface a day later as a fake "all coding engines down" outage (the

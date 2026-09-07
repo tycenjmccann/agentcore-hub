@@ -44,6 +44,7 @@ import { resolveWatchdog, setWatchdogSource } from "./watchdog.mjs";
 import { createDetector } from "./dead-session-detector.mjs";
 import { createCascade } from "./cascade.mjs";
 import { createReconcileSweep } from "./reconcile-sweep.mjs";
+import { createAwaitedIds, normalizeAwaitedIdsMode } from "./awaited-ids.mjs";
 import { createReviewCap, parseDecision } from "./review-cap.mjs";
 import { createMergeOnGreen } from "./merge-on-green.mjs";
 import { createShipHeadGate, createGitHubShipHeadProbe } from "./ship-head-stability.mjs";
@@ -53,6 +54,8 @@ import { createLiveReverify, normalizeLiveReverifyMode } from "./live-reverify.m
 import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, SHIP_PHASES, SHIP_BLOCKED_OUTCOMES, TERMINAL_WORKFLOW_PHASES, FIX_KINDS, REWORK_FIX_KINDS, normalizeAdvisoryRoutingMode, isAdvisoryTicket, nonAdvisory } from "./completion.mjs";
 import { isPipelineEnabled } from "./pipeline-enabled.mjs";
 import { CD_REGISTRY_KEY, EMPTY_CD_REGISTRY, parseCdRegistry, isCdRegistered, effectiveWorkflowDef, resolveDelivery, deliveryModeContext } from "./cd-registry.mjs";
+import { validateEffectiveDef, validateDefForCreation } from "./workflow-def-validate.mjs";
+import { buildReviewResolved } from "./review-resolved.mjs";
 import { ensureRepoCheck, formatRepoCheckWarning } from "./repo-check.mjs";
 import { ensureCiCheck, formatCiCheckBlock, prefixCiWarning, normalizeCiCheckMode } from "./ci-check.mjs";
 import { syncBeforeCi, normalizeSyncMode } from "./sync-main.mjs";
@@ -68,7 +71,13 @@ import { applyBlockerEdge, normalizePreserveStatuses } from "./ticket-blockers.m
 // (No `escapeJql` here: the orchestrator's ONE JQL site interpolates an issue
 // key into an unquoted `parent = …` operand, which escaping cannot make safe —
 // it is shape-checked and refused instead. See getChildTicketsFromJira.)
-import { KIND_TO_ORIGIN_KEY, parseFixContractBlock, TICKET_KEY_RE } from "./fix-contract.mjs";
+import {
+  KIND_TO_ORIGIN_KEY,
+  parseFixContractBlock,
+  TICKET_KEY_RE,
+  reportedAtFromLabels,
+  maxReportedAt,
+} from "./fix-contract.mjs";
 import {
   normalizeChainGateMode, chainFor, chainDir, requiredArtifactsForTicket, sdlcFrameworkContext,
   gateInstructionOverride, fallbackReviewPackagePhase, artifactRepoPath, missingArtifactNote,
@@ -146,6 +155,29 @@ const CASCADE_EXTENDED_STATES_MODE = resolveCascadeMode(process.env.CASCADE_EXTE
 // DDB reads/writes. shadow/enforce only when the operator explicitly sets the
 // var (deploy.sh forwards it only when set).
 const RECONCILE_SWEEP_MODE = process.env.RECONCILE_SWEEP_MODE || "off";
+// Awaited-ids re-wake (TEAM-4166 D1): off | shadow | enforce, default off. When
+// a tool reports report_precondition_unmet, the orchestrator writes the awaited
+// sibling ids as real blockedBy edges (preserving an in-flight status) so the
+// parked ticket re-wakes through the SAME unblock cascade once every awaited fix
+// closes — no bespoke wait path. off = byte-identical (no edge writes, no derived
+// hook, no level-triggered pickup); the module mutates ticket state, so it stays
+// dark until an operator opts in. Garbage fails safe to off (normalizeAwaitedIdsMode).
+const AWAITED_IDS_MODE = normalizeAwaitedIdsMode(process.env.AWAITED_IDS_MODE);
+// The wait-SLA (D1 §5): once a ticket has awaited its open fixes longer than this,
+// the sweep/detector emit ONE advisory orchestrator.await_timeout (an event, never
+// a humanNotification). Default 120 minutes. The event lists only ids still proven
+// non-terminal, and carries reason=await_timeout (a real SLA breach) or
+// reason=clean_exit_cap (re-woken to the D2 cap with nothing left awaited, so
+// awaitingIds is empty) — TEAM-4184 F2.
+const AWAITED_IDS_TIMEOUT_MINUTES = Number.parseInt(process.env.AWAITED_IDS_TIMEOUT_MINUTES || "", 10) > 0
+  ? Number.parseInt(process.env.AWAITED_IDS_TIMEOUT_MINUTES, 10)
+  : 120;
+// D2 §2.3 clean-exit re-wake cap: how many times a cleanly-parked/completed ticket
+// may be automatically re-woken before the wait-SLA takes over (NEVER escalated as
+// a dead session). Positive integer; default 3.
+const CLEAN_EXIT_REDISPATCH_CAP = Number.parseInt(process.env.CLEAN_EXIT_REDISPATCH_CAP || "", 10) > 0
+  ? Number.parseInt(process.env.CLEAN_EXIT_REDISPATCH_CAP, 10)
+  : 3;
 // Level-triggered dispatch (TEAM-4060): off | shadow | enforce, default off.
 // When enforce, the done-cascade invokes a newly-unblocked dependent in-process
 // instead of waiting for its Ready webhook — closes the dispatch dead-zone.
@@ -177,7 +209,11 @@ const REWORK_LOOP_CAP = process.env.REWORK_LOOP_CAP
 // overwrites the direct copy instead of doubling it. STRICT allow-list (garbage
 // and "shadow" → off; see event-id.mjs). Instant rollback = set off. Must agree
 // across all three writers, which is why deploy.sh forwards it to all three.
-const EVENT_DEDUPE_MODE = normalizeEventDedupeMode(process.env.EVENT_DEDUPE_MODE);
+// TEAM-4167 D3 (FR-3.4): default ENFORCE. Leaving the twin write uncollapsed
+// silently double-counts every consumer that reads events-table row counts;
+// only an explicit EVENT_DEDUPE_MODE=off opts out (instant rollback). Must agree
+// with agent-invoker + events-writer (deploy.sh forwards enforce to all three).
+const EVENT_DEDUPE_MODE = normalizeEventDedupeMode(process.env.EVENT_DEDUPE_MODE, "enforce");
 // Human review-gate state machine (TEAM-4120 FR-1): off | shadow | enforce,
 // default off. The reject path today reads a human's intent off ONE ambiguous
 // signal — a gate ticket reaching `blocked` — which also fires for a gate's
@@ -379,9 +415,43 @@ export async function loadCdRegistry({ force = false } = {}) {
 // framework overlay applied (e.g. software-delivery + "playbook" → artifact
 // chain, always-on gates, branch at requirements), then the CD-registry handoff
 // strip. Every gate/artifact/branch decision reads THIS, never the raw def.
+//
+// TEAM-4167 D3 (FR-3.1): this is called on EVERY cascade tick, so it must NEVER
+// throw — a def that fails validation must not wedge an in-flight run. We run
+// the repo-aware validate in a try/catch: an invalid def is warned about ONCE
+// per (workflowId, workflowDefId) and surfaced as a WorkflowDefInvalid metric,
+// then the run proceeds with the ship-strip exactly as before. Run creation
+// (bootstrapBugWorkflow / start route) is where an invalid def is REFUSED.
+const _invalidDefWarned = new Set();
+
+function emitWorkflowDefInvalid(workflowDefId) {
+  console.log(JSON.stringify({
+    _aws: {
+      Timestamp: Date.now(),
+      CloudWatchMetrics: [{
+        Namespace: "AgentCoreHub/Orchestrator",
+        Dimensions: [["workflowDefId"]],
+        Metrics: [{ Name: "WorkflowDefInvalid", Unit: "Count" }],
+      }],
+    },
+    workflowDefId,
+    WorkflowDefInvalid: 1,
+  }));
+}
+
 function getEffectiveWorkflowDef(workflow) {
   const base = getWorkflowDef(workflow?.workflowDefId);
   const framed = applyFramework(base, frameworkOfWorkflow(base, workflow));
+  try {
+    validateEffectiveDef(framed, { cdRegistered: isCdRegistered(_cdRegistry, workflow?.repoConfig) });
+  } catch (err) {
+    const key = `${workflow?.id || ""}|${workflow?.workflowDefId || ""}`;
+    if (!_invalidDefWarned.has(key)) {
+      _invalidDefWarned.add(key);
+      console.warn(`[orchestrator] workflow_def.invalid (in-flight, proceeding): workflow=${workflow?.id} def=${workflow?.workflowDefId}: ${err.message}`);
+      emitWorkflowDefInvalid(workflow?.workflowDefId || "unknown");
+    }
+  }
   return effectiveWorkflowDef(framed, _cdRegistry, workflow?.repoConfig, SHIP_PHASES);
 }
 
@@ -389,6 +459,52 @@ function getDelivery(workflow) {
   return resolveDelivery(_cdRegistry, workflow?.repoConfig, {
     pipelineEnabled: isPipelineEnabled(process.env.PIPELINE_ENABLED),
   });
+}
+
+/**
+ * Emit workflow.phase_change when a dispatched agent ticket moves the run's
+ * phase (TEAM-4167 D3 FR-3.3). Two cases, so the lifecycle stream is COMPLETE
+ * (intake→requirements→development→…), not just the "jumps forward" subset:
+ *   - a genuine forward advance (agentPhaseIdx > currentPhaseIdx): stamp the new
+ *     phase and advancePhase, exactly as the two inline blocks did before.
+ *   - the FIRST agent ticket of the run's INITIAL agent phase, where
+ *     agentPhaseIdx === currentPhaseIdx (the run was created already at that
+ *     phase, so there is no ">" advance to hang the event on). Here we emit BOTH
+ *     the opening "intake" row AND the initial agent phase, in that order.
+ *
+ * CALL 6 F1: the "intake" phase_change is emitted HERE, not at a creation site.
+ * There are two creation paths — the app start route (src/app/api/workflow/
+ * start/route.ts, a direct PutCommand with NO event path) and bug bootstrap —
+ * and only this dispatch site is common to both, so anchoring the single
+ * intake emit here is what makes EVERY run (app-started ymo7dm-class included)
+ * get its intake row. A once-only store CAS (markInitialPhaseAnnounced)
+ * guarantees exactly one intake+initial pair per run across concurrent
+ * deliveries and re-dispatches; both emits sit behind that one CAS. The intake
+ * row is anchored at workflow.startedAt (publishEvent honors a valid ISO
+ * detail.timestamp) so the opening phase's duration measures from run start.
+ */
+export async function announcePhaseTransition(workflow, wfDef, agentDef, ticketId) {
+  const phaseOrder = Array.isArray(wfDef?.phaseOrder) ? wfDef.phaseOrder : [];
+  const agentPhaseIdx = phaseOrder.indexOf(agentDef.phase);
+  const currentPhaseIdx = phaseOrder.indexOf(workflow.phase);
+  if (agentPhaseIdx > currentPhaseIdx) {
+    workflow.phase = agentDef.phase;
+    await publishEvent(ticketId, "workflow.phase_change", { phase: agentDef.phase, workflowId: workflow.id });
+    await store.advancePhase(workflow.id, workflow.phase, workflow.featureBranch);
+    return;
+  }
+  // The initial agent phase is the first phaseOrder entry after "intake".
+  const firstAgentPhaseIdx = phaseOrder.findIndex((p) => p !== "intake");
+  if (agentPhaseIdx >= 0 && agentPhaseIdx === currentPhaseIdx && agentPhaseIdx === firstAgentPhaseIdx) {
+    if (await store.markInitialPhaseAnnounced(workflow.id, agentDef.phase)) {
+      // Two lifecycle rows behind the ONE CAS this run ever wins, in order:
+      // the run opened at "intake" (anchored at run start), then the initial
+      // agent phase (now). workflow.startedAt is the run's own creation stamp;
+      // if it is somehow absent publishEvent falls back to now.
+      await publishEvent(ticketId, "workflow.phase_change", { phase: "intake", workflowId: workflow.id, timestamp: workflow.startedAt });
+      await publishEvent(ticketId, "workflow.phase_change", { phase: agentDef.phase, workflowId: workflow.id });
+    }
+  }
 }
 
 async function loadAgentRoster() {
@@ -486,7 +602,16 @@ export async function loadWorkflowDefs() {
         sdlcFramework: w.sdlcFramework || "standard",
         artifactChain: w.artifactChain || null,
         frameworks: w.frameworks || null,
-        phases: (w.phases || []).map((p) => ({ id: p.id, name: p.name, agentPhase: p.agentPhase })),
+        // extraAgentPhases are display-only rollup phases (software-delivery's
+        // "ship"/"review" fold onto the QA card); they never affect phase
+        // advancement, but validateEffectiveDef needs them so a gate guarding a
+        // rollup phase isn't spuriously flagged as guarding an unknown phase.
+        phases: (w.phases || []).map((p) => ({
+          id: p.id,
+          name: p.name,
+          agentPhase: p.agentPhase,
+          extraAgentPhases: p.extraAgentPhases || undefined,
+        })),
       };
     }
     console.log(`[orchestrator] Loaded ${Object.keys(_workflowDefs).length} workflow definitions from S3`);
@@ -678,6 +803,60 @@ function syncDeps() {
   return _syncDeps;
 }
 
+// ─── Awaited-ids re-wake (TEAM-4166 D1) ──────────────────────────────────────
+
+/**
+ * Last agent.streaming timestamp for a ticket's current claim, for the D2
+ * escalation-evidence payload (null when there is no claim/agent or nothing
+ * streamed). Only ever called on the rare escalate path, so the one extra
+ * workflow read to resolve the agentId is cheap. Reuses lease.lastAgentActivity
+ * (the SAME last-activity read the liveness gate uses) rather than re-scanning.
+ */
+async function lastStreamAtForTicket(workflowId, ticketId) {
+  try {
+    const wf = await store.getWorkflow(workflowId);
+    const agentId = wf?.agentTasks?.[ticketId]?.agentId;
+    if (!agentId) return null;
+    return (await lastAgentActivity(ddb, EVENTS_TABLE, workflowId, agentId, ticketId)) || null;
+  } catch {
+    return null;
+  }
+}
+
+// One awaited-ids surface per warm container (mirrors getCascade()/getDetector()).
+// The board write goes through the SAME provider-aware addBlockers seam the rest
+// of the orchestrator uses (preserveStatusIf keeps a parked agent in_progress),
+// and the preconditionUnmet stamp through the identical Tickets___* tool the
+// workflow-output channel writes, so provider parity is free.
+let _awaitedIds = null;
+function getAwaitedIds() {
+  if (_awaitedIds) return _awaitedIds;
+  _awaitedIds = createAwaitedIds({
+    send: (input) => ddb.send(input),
+    ticketsTable: TICKETS_TABLE,
+    provider: TICKET_PROVIDER,
+    getChildTickets,
+    leaseTtlMs: LEASE_TTL_MS,
+    // Adapter: forward the awaited-edge write to the existing provider-aware seam,
+    // threading preserveStatusIf (so the parked agent is never yanked to Blocked).
+    addBlockers: (ticketId, ids, opts = {}) =>
+      addBlockers(ticketId, ids, { preserveStatusIf: opts.preserveStatusIf, source: opts.source }),
+    // Adapter: stamp the origin's preconditionUnmet through the SAME Tickets___*
+    // tool as the report_precondition_unmet channel (provider-agnostic).
+    annotatePreconditionUnmet: (originId, { awaitingIds, source, reportedAt }) =>
+      invokeTickets("annotate_precondition_unmet", {
+        ticket_id: originId, awaitingIds, source, reportedAt,
+      }),
+    publishEvent,
+    getTicket: getTicketConsistent,
+    store,
+    mode: AWAITED_IDS_MODE,
+    timeoutMinutes: AWAITED_IDS_TIMEOUT_MINUTES,
+    log: (msg) => console.log(`[orchestrator] ${msg}`),
+  });
+  return _awaitedIds;
+}
+
 // One detector per warm container so its per-agent median cache is reused
 // across the 5-minute sweeps (rebuilt from scratch on a cold start).
 let _detector = null;
@@ -697,6 +876,16 @@ function getDetector() {
     // TEAM-4120 FR-3 — undefined when DEAD_SESSION_ESCALATION_MODE=off (default),
     // which keeps the exhausted-retry page byte-identical.
     escalate: getDeadSessionEscalation()?.escalateExhausted,
+    // TEAM-4166 D2 §2.3 — the evidence-gated escalation guard. The guard engages
+    // only when the store exposes incrementCleanExitRedispatch, so an unwired
+    // store keeps the pre-4166 unconditional escalate.
+    awaitedIds: getAwaitedIds(),
+    cleanExitRedispatchCap: CLEAN_EXIT_REDISPATCH_CAP,
+    getLastStreamAt: lastStreamAtForTicket,
+    // TEAM-4166 §0 — the same sibling reader the cascade uses, so the detector's
+    // clean-park anti-thrash sees the awaited-fix closure and never re-dispatches
+    // a release manager that is legitimately still waiting.
+    getChildTickets,
   });
   return _detector;
 }
@@ -737,6 +926,12 @@ function getCascade() {
     blockTicket: blockTicketForFailedInvoke,
     // TEAM-4120 FR-3 — same hook as the detector; undefined when off.
     escalate: getDeadSessionEscalation()?.escalateExhausted,
+    // TEAM-4166 D1/D2 — the awaited-ids surface (union blocker predicate +
+    // wait-SLA timeout) and the §2.3 evidence-gated escalation guard. Guard
+    // engages only when store.incrementCleanExitRedispatch exists.
+    awaitedIds: getAwaitedIds(),
+    cleanExitRedispatchCap: CLEAN_EXIT_REDISPATCH_CAP,
+    getLastStreamAt: lastStreamAtForTicket,
   });
   return _cascade;
 }
@@ -757,6 +952,10 @@ function getReconcileSweep() {
     cascade: getCascade(),
     getChildTickets,
     leaseTtlMs: LEASE_TTL_MS,
+    // TEAM-4166 D1/D2 — the awaited-ids backstop (edge backfill + wait-SLA). The
+    // §2.3 evidence guard itself lives in the cascade's reconcileDependent, which
+    // this sweep routes every candidate through.
+    awaitedIds: getAwaitedIds(),
   });
   return _reconcileSweep;
 }
@@ -1538,7 +1737,7 @@ async function processStatusChange(ticketId, newStatus, oldStatus) {
       }
 
       // Track in agentTasks at creation time (both paths)
-      await trackTicketCreation(ticketId, todoTicket.assignee, todoTicket.workflowId, todoTicket.parentId);
+      await trackTicketCreation(ticketId, todoTicket.assignee, todoTicket.workflowId, todoTicket.parentId, todoTicket.spawnedBy);
 
       // TEAM-4121 FR-8: a fix ticket the ticket Lambda accepted under
       // FIX_TICKET_CONTRACT=shadow with fields missing carries
@@ -1670,6 +1869,7 @@ export async function handleTicketDoneUnified(ticketId) {
   // a pre-claim snapshot (double invocation).
   await markTaskComplete(workflow, ticketId, assignee);
   await ackApprovedGateNotification(workflow, ticketId, assignee);
+  await emitReviewResolvedApproved(workflow, ticketId, assignee);
   await wakeHeldTicketAfterEscalationGate(workflow, ticketId, ticket.title, assignee, parentId);
 
   // Unblock dependents via the shared cascade (TEAM-3618 D3). The helper owns
@@ -1834,6 +2034,56 @@ async function ackApprovedGateNotification(workflow, ticketId, assignee) {
     console.log(`[orchestrator] ${ticketId}: human gate approved — review_needed acknowledged`);
   } catch (err) {
     console.warn(`[orchestrator] ${ticketId}: review_needed ack failed (non-fatal): ${err?.message || err}`);
+  }
+}
+
+/**
+ * TEAM-4167 D3 (FR-3.2): emit the ONE canonical review.resolved(approved) for a
+ * human gate that resolved by approval. Called ONLY from the FRESH done-cascade
+ * paths (never the re-Done idempotent replay), so each gate completion emits
+ * exactly once. An advisory auto-approve reaches here too and correctly surfaces
+ * as review.resolved(approved) alongside the existing review.approved_with_advisory.
+ * A ship gate on a HANDOFF run is suppressed: it never had a human to approve —
+ * skipShipGateForHandoff resolved it and owns the review.resolved(skipped) emit,
+ * so emitting "approved" as well would double-count the same completion.
+ * Best-effort: an emit failure must never block the done cascade.
+ */
+async function emitReviewResolvedApproved(workflow, ticketId, assignee) {
+  if (!isHumanAssignee(assignee)) return;
+  try {
+    await loadCdRegistry();
+    if (!isCdRegistered(_cdRegistry, workflow.repoConfig)) {
+      const phase = await gatePhaseOf(ticketId);
+      if (SHIP_PHASES.has(phase)) return; // handoff skip owns the "skipped" emit
+    }
+    await publishEvent(
+      ticketId,
+      "review.resolved",
+      buildReviewResolved({ workflowId: workflow.id, ticketId, assignee, outcome: "approved", now: new Date().toISOString() })
+    );
+  } catch (err) {
+    console.warn(`[orchestrator] ${ticketId}: review.resolved(approved) emit failed (non-fatal): ${err?.message || err}`);
+  }
+}
+
+/**
+ * TEAM-4167 D3 (FR-3.2): emit the canonical review.resolved(rejected) for a
+ * human gate whose reviewer requested changes. Called alongside the terminal
+ * review.rejected emits in handleReviewRejection (hold, cap-escalated, rework
+ * re-open) — NOT the advisory auto-approve path, which resolves the gate to
+ * done and is already covered by review.resolved(approved). Human-origin only;
+ * best-effort (a failed emit must never block the rejection handling).
+ */
+async function emitReviewResolvedRejected(workflow, gateTicket) {
+  if (!isHumanAssignee(gateTicket?.assignee)) return;
+  try {
+    await publishEvent(
+      gateTicket.ticketId,
+      "review.resolved",
+      buildReviewResolved({ workflowId: workflow.id, ticketId: gateTicket.ticketId, assignee: gateTicket.assignee, outcome: "rejected", now: new Date().toISOString() })
+    );
+  } catch (err) {
+    console.warn(`[orchestrator] ${gateTicket.ticketId}: review.resolved(rejected) emit failed (non-fatal): ${err?.message || err}`);
   }
 }
 
@@ -2097,6 +2347,16 @@ async function skipShipGateForHandoff(ticketId, workflow) {
     handoffNote(workflow, "merge-approval gate"),
     { kind: "ship_gate", phase }
   );
+  // TEAM-4167 D3 (FR-3.2): this human gate resolved WITHOUT a human — the
+  // canonical review.resolved for it is "skipped". Emitted here (the resolution
+  // origin) so the ensuing Done cascade suppresses its "approved" emit and the
+  // gate produces exactly one review.resolved.
+  const gate = await getTicket(ticketId).catch(() => null);
+  await publishEvent(
+    ticketId,
+    "review.resolved",
+    buildReviewResolved({ workflowId: workflow.id, ticketId, assignee: gate?.assignee, outcome: "skipped", now: new Date().toISOString() })
+  );
   return true;
 }
 
@@ -2241,6 +2501,10 @@ async function handleHumanReviewGate(ticketId, assignee, workflow) {
       details: pkg?.summary || `Ticket ${ticketId} is awaiting review by ${reviewer}.`,
       ticketId,
       reviewer,
+      // TEAM-4166 §2.4: the FULL human:* assignee, so the analyzer's parkedOnHuman
+      // parks on this gate only when a human genuinely owns it (a bare agent-side
+      // notification lacking a human assignee must not silence the watchdog).
+      humanAssignee: assignee,
       ...(pkg ? { summary: pkg.summary, bullets: pkg.bullets, links: pkg.links, gate: pkg.gate } : {}),
       timestamp: new Date().toISOString(),
       acknowledged: false,
@@ -2770,6 +3034,7 @@ export async function handleReviewRejection(gateTicket) {
     await publishEvent(gateTicket.ticketId, "review.rejected", {
       ticketId: gateTicket.ticketId, onReject, workflowId: workflow.id,
     });
+    await emitReviewResolvedRejected(workflow, gateTicket);
     return;
   }
 
@@ -2856,6 +3121,7 @@ export async function handleReviewRejection(gateTicket) {
       effectiveRounds: capResult.effectiveRounds,
       maxRounds: capResult.maxRounds,
     });
+    await emitReviewResolvedRejected(workflow, gateTicket);
     return;
   }
 
@@ -3238,6 +3504,7 @@ export async function handleReviewRejection(gateTicket) {
   await publishEvent(gateTicket.ticketId, "review.rejected", {
     ticketId: gateTicket.ticketId, onReject, reopened, workflowId: workflow.id,
   });
+  await emitReviewResolvedRejected(workflow, gateTicket);
 }
 
 /**
@@ -3367,9 +3634,6 @@ async function handleTicketReadyUnified(ticketId, ticket) {
 
   // Phase advancement (workflow-def driven, with software-delivery fallback)
   const wfDef = getEffectiveWorkflowDef(workflow); // framework overlay decides featureBranchPhase
-  const phaseOrder = wfDef.phaseOrder;
-  const agentPhaseIdx = phaseOrder.indexOf(agentDef.phase);
-  const currentPhaseIdx = phaseOrder.indexOf(workflow.phase);
   // Shared feature branch on the def's branch phase (repo-backed workflows only).
   // Independent of the phase ADVANCE below: the playbook def's branch phase is
   // "requirements" — the run's INITIAL phase — so gating this on an advance
@@ -3378,11 +3642,7 @@ async function handleTicketReadyUnified(ticketId, ticket) {
   if (wfDef.featureBranchPhase && agentDef.phase === wfDef.featureBranchPhase && !workflow.featureBranch && workflow.repoConfig?.repos?.length > 0) {
     workflow.featureBranch = await ensureFeatureBranch(workflow);
   }
-  if (agentPhaseIdx > currentPhaseIdx) {
-    workflow.phase = agentDef.phase;
-    await publishEvent(ticketId, "workflow.phase_change", { phase: agentDef.phase, workflowId: workflow.id });
-    await store.advancePhase(workflow.id, workflow.phase, workflow.featureBranch);
-  }
+  await announcePhaseTransition(workflow, wfDef, agentDef, ticketId);
 
   // ─── PRE-CI SYNC (TEAM-4122 FR-6) ───
   // Merge the repo's default branch into the integration branch BEFORE the CI
@@ -3517,6 +3777,29 @@ async function processRecord(record) {
   // Skip counter item
   if (ticketId === "__COUNTER__") return;
 
+  // TEAM-4166 D1 §1.4 — LEVEL-TRIGGERED pickup of a tool-reported precondition.
+  // report_precondition_unmet stamps preconditionUnmet.awaitingIds WITHOUT
+  // changing status (it's an annotation, not a transition), so that write would
+  // fall through the status-change early-return just below. Pick it up HERE and
+  // write the awaited ids as real blockedBy edges, so the parked ticket re-wakes
+  // through the normal unblock cascade once its fixes close. Idempotent
+  // (applyBlockerEdge answers "present" on a re-run), gated on mode (off →
+  // no-op), and never fatal — an awaited edge is advisory bookkeeping.
+  if (AWAITED_IDS_MODE !== "off") {
+    const pu = unwrapDdbValue(newImage.preconditionUnmet);
+    const awaitingIds = Array.isArray(pu?.awaitingIds) ? pu.awaitingIds : null;
+    if (awaitingIds?.length) {
+      const existingEdges = new Set(unwrapDdbValue(newImage.blockedBy) || []);
+      if (awaitingIds.some((id) => !existingEdges.has(id))) {
+        try {
+          await getAwaitedIds().applyAwaitedEdges(ticketId, awaitingIds, "tool");
+        } catch (err) {
+          console.warn(`[orchestrator] awaited-ids pickup failed for ${ticketId} (non-fatal): ${err?.message || err}`);
+        }
+      }
+    }
+  }
+
   // Only react to status changes (or new inserts with actionable status)
   if (eventName === "MODIFY" && newStatus === oldStatus) return;
 
@@ -3527,7 +3810,7 @@ async function processRecord(record) {
     const insertAssignee = unwrapDdbValue(newImage.assignee);
     const insertWorkflowId = unwrapDdbValue(newImage.workflowId);
     const insertParentId = unwrapDdbValue(newImage.parentId);
-    await trackTicketCreation(ticketId, insertAssignee, insertWorkflowId, insertParentId);
+    await trackTicketCreation(ticketId, insertAssignee, insertWorkflowId, insertParentId, unwrapDdbValue(newImage.spawnedBy));
     // TEAM-4121 FR-8: the DDB-stream twin of the `todo` shadow-warning advisory.
     // The stream image already carries everything needed, so no extra read.
     await emitContractWarning(ticketId, {
@@ -3621,7 +3904,7 @@ export function isCreationTimeBlock(oldStatus) {
  *
  * Called from both Jira and DynamoDB paths when a ticket first appears.
  */
-async function trackTicketCreation(ticketId, assignee, workflowId, parentId) {
+async function trackTicketCreation(ticketId, assignee, workflowId, parentId, spawnedBy) {
   if (!assignee || !parentId) return;
 
   // Skip epics — they're containers, not agent tasks
@@ -3666,6 +3949,21 @@ async function trackTicketCreation(ticketId, assignee, workflowId, parentId) {
   } catch (err) {
     console.warn(`[orchestrator] ticket.created publish failed for ${ticketId}:`, err.message);
   }
+
+  // TEAM-4166 D1 §1.4 — DERIVED awaited-ids hook. A freshly-created FIX ticket
+  // whose spawnedBy points back to an origin (KIND_TO_ORIGIN_KEY[kind]) means the
+  // origin is waiting on THIS fix: write the awaited edge on the origin now, so a
+  // release manager parked on a sub-cap CHANGES-NEEDED re-wakes when the fix
+  // closes even if the tool never explicitly reported the precondition. Idempotent
+  // with the tool-report pickup (both converge on the same edge), mode-gated
+  // (off → no-op before any I/O), and never fatal — must not fail ticket creation.
+  if (AWAITED_IDS_MODE !== "off" && spawnedBy?.kind && KIND_TO_ORIGIN_KEY[spawnedBy.kind]) {
+    try {
+      await getAwaitedIds().applyAwaitedEdgesForSpawn(ticketId, spawnedBy, "spawnedBy");
+    } catch (err) {
+      console.warn(`[orchestrator] awaited-ids derived hook failed for ${ticketId} (non-fatal): ${err?.message || err}`);
+    }
+  }
 }
 
 // ─── Core Handlers ─────────────────────────────────────────────────────────────
@@ -3703,6 +4001,7 @@ export async function handleTicketDone(ticketId, image) {
   // Update agent task status — scoped write (see handleTicketDoneUnified).
   await markTaskComplete(workflow, ticketId, assignee);
   await ackApprovedGateNotification(workflow, ticketId, assignee);
+  await emitReviewResolvedApproved(workflow, ticketId, assignee);
   await wakeHeldTicketAfterEscalationGate(workflow, ticketId, unwrapDdbValue(image.title), assignee, parentId);
 
   // Unblock dependents via the shared cascade (TEAM-3618 D3). Same helper as the
@@ -3817,19 +4116,12 @@ async function handleTicketReady(ticketId, image) {
 
   // Advance phase if needed (workflow-def driven, with software-delivery fallback)
   const wfDef = getEffectiveWorkflowDef(workflow); // framework overlay decides featureBranchPhase
-  const phaseOrder = wfDef.phaseOrder;
-  const agentPhaseIdx = phaseOrder.indexOf(agentDef.phase);
-  const currentPhaseIdx = phaseOrder.indexOf(workflow.phase);
   // Shared feature branch on the def's branch phase — independent of the phase
   // advance (see handleTicketReadyUnified for why). ensureFeatureBranch persists itself.
   if (wfDef.featureBranchPhase && agentDef.phase === wfDef.featureBranchPhase && !workflow.featureBranch && workflow.repoConfig?.repos?.length > 0) {
     workflow.featureBranch = await ensureFeatureBranch(workflow);
   }
-  if (agentPhaseIdx > currentPhaseIdx) {
-    workflow.phase = agentDef.phase;
-    await publishEvent(ticketId, "workflow.phase_change", { phase: agentDef.phase, workflowId: workflow.id });
-    await store.advancePhase(workflow.id, workflow.phase, workflow.featureBranch);
-  }
+  await announcePhaseTransition(workflow, wfDef, agentDef, ticketId);
 
   // Build context and invoke agent
   const ticket = await getTicket(ticketId);
@@ -5074,6 +5366,29 @@ async function bootstrapBugWorkflow(bugTicket) {
     intakeChannel: "jira-webhook",
     workflowType: "bug",
   };
+  // TEAM-4167 D3 (FR-3.1): validate the def against THIS run's delivery mode
+  // BEFORE creating the workflow row. Unlike the in-flight getEffectiveWorkflowDef
+  // path (warn-only), run creation REFUSES an invalid def — a phantom ship gate
+  // on a handoff repo would wedge the run forever, so it must never be created.
+  //
+  // CALL 6 F2: the loaders run OUTSIDE the validate try/catch. A transient S3
+  // failure in loadWorkflowDefs/loadCdRegistry is an infra blip, not a
+  // misconfigured def — it must PROPAGATE (the trigger redelivers) exactly as it
+  // did before D3, never be laundered into a "your workflow is misconfigured"
+  // comment that fails bug intake closed. Only the pure validation verdict is
+  // caught and turned into the refusal.
+  await loadWorkflowDefs();
+  const registry = await loadCdRegistry();
+  const base = getWorkflowDef(workflow.workflowDefId);
+  const framed = applyFramework(base, frameworkOfWorkflow(base, workflow));
+  const verdict = validateDefForCreation(framed, isCdRegistered(registry, repoConfig));
+  if (!verdict.ok) {
+    console.error(`[orchestrator] workflow_def.invalid — refusing to create bug workflow ${workflowId}: ${verdict.message}`);
+    emitWorkflowDefInvalid(workflow.workflowDefId || "unknown");
+    await commentOnBug(bugKey, `AgentCore Hub: this run's workflow definition is misconfigured and cannot start — ${verdict.message}`);
+    return;
+  }
+
   // Create-once on the deterministic row key — the atomic dedup for
   // concurrent duplicate deliveries.
   const created = await store.createWorkflow(workflow);
@@ -5081,6 +5396,13 @@ async function bootstrapBugWorkflow(bugTicket) {
     console.log(`[orchestrator] Workflow ${workflowId} already exists — skipping duplicate bootstrap.`);
     return;
   }
+
+  // TEAM-4167 D3 (FR-3.3), CALL 6 F1: the run's opening "intake" phase_change is
+  // NOT emitted here. Both creation paths (this bug bootstrap and the app start
+  // route, which has no event path at all) converge on the first agent dispatch,
+  // where announcePhaseTransition emits the intake+initial pair behind ONE CAS —
+  // so every run gets exactly one intake row, anchored at startedAt. Emitting a
+  // second one here would give a bug run two intake rows with different stamps.
 
   // 2. Label the Bug ticket itself with `wf:<id>` so future webhooks can resolve the workflow
   try {
@@ -5306,6 +5628,39 @@ export function mapJiraIssueToTicket(issue) {
   }));
   const reviewComment = jiraComments.length ? jiraComments[jiraComments.length - 1].content : undefined;
 
+  // TEAM-4166 §1.2: reconstruct preconditionUnmet from the `awaiting:<id>` labels
+  // the jira Lambda stamps, enriched by the `<!-- precondition-unmet {...} -->`
+  // comment marker when comments are in scope (it carries reportedAt/agentId/
+  // source — the D2 liveness clock reads reportedAt). Labels are the durable
+  // index; the marker only enriches. Mirrors the spawnedBy-from-labels rebuild
+  // above so a Jira-mode ticket carries the same field DynamoDB mode stores.
+  //
+  // TEAM-4184: reportedAt now comes off the `precondition-at:<epochMs>` LABEL as
+  // well, and the two carriers are combined with max(). That matters because the
+  // read the D2 evidence guard actually runs on siblings
+  // (getChildTicketsFromJira) requests no `comment` field at all, and where
+  // comments ARE in scope Jira caps them at the 20 OLDEST — so the marker can be
+  // absent or stale while the label is neither. Max, not marker-precedence.
+  const awaitingLabelIds = labels
+    .filter((l) => l.startsWith("awaiting:"))
+    .map((l) => l.slice("awaiting:".length))
+    .filter(Boolean);
+  const preconditionMarker = parsePreconditionMarker(jiraComments);
+  let preconditionUnmet = null;
+  if (awaitingLabelIds.length > 0 || preconditionMarker) {
+    const ids = [];
+    for (const id of [...(preconditionMarker?.awaitingIds || []), ...awaitingLabelIds]) {
+      if (typeof id === "string" && id && !ids.includes(id)) ids.push(id);
+    }
+    const reportedAt = maxReportedAt(preconditionMarker?.reportedAt, reportedAtFromLabels(labels));
+    preconditionUnmet = {
+      awaitingIds: ids,
+      ...(reportedAt ? { reportedAt } : {}),
+      ...(preconditionMarker?.agentId !== undefined ? { agentId: preconditionMarker.agentId } : {}),
+      source: preconditionMarker?.source || "label",
+    };
+  }
+
   const rawIssueType = f.issuetype?.name || "Task";
   return {
     ticketId: issue.key,
@@ -5331,8 +5686,21 @@ export function mapJiraIssueToTicket(issue) {
     ...(spawnedBy ? { spawnedBy } : {}),
     ...(phase ? { phase } : {}),
     ...(fixContract ? { fixContract } : {}),
+    ...(preconditionUnmet ? { preconditionUnmet } : {}),
     artifacts: [],
   };
+}
+
+// TEAM-4166 §1.2: pull the newest structured precondition marker out of a comment
+// thread. Newest wins — an agent may re-report an updated awaited set. Returns the
+// parsed marker JSON ({ awaitingIds, reportedAt, agentId, source }) or null.
+function parsePreconditionMarker(comments) {
+  for (let i = (comments || []).length - 1; i >= 0; i--) {
+    const m = /<!-- precondition-unmet (\{.*?\}) -->/.exec(comments[i]?.content || "");
+    if (!m) continue;
+    try { return JSON.parse(m[1]); } catch { return null; }
+  }
+  return null;
 }
 
 function extractAdfText(adf) {
@@ -5820,7 +6188,19 @@ async function publishEvent(ticketId, detailType, detail) {
   // TEAM-4120: that same shared timestamp is also what makes the deterministic
   // eventId below reproducible from BOTH writers, so under EVENT_DEDUPE_MODE=
   // enforce the two copies collapse onto one row instead of needing a dedupe.
-  const timestamp = new Date().toISOString();
+  //
+  // TEAM-4167 D3 (CALL 6 F1): almost always "now", but a caller may ANCHOR an
+  // event at an earlier moment — the initial "intake" phase_change is stamped at
+  // the run's startedAt so the opening (requirements) phase's duration measures
+  // from run start, not from whenever the first agent happened to dispatch.
+  // Honor a valid ISO detail.timestamp; otherwise stamp now. deterministicEventId
+  // keys off this SAME stamped.timestamp (both writers see it via the EventBridge
+  // detail), so an anchored event still collapses onto one row.
+  const suppliedTs =
+    typeof detail?.timestamp === "string" && !Number.isNaN(Date.parse(detail.timestamp))
+      ? detail.timestamp
+      : null;
+  const timestamp = suppliedTs || new Date().toISOString();
   const stamped = { ...detail, ticketId, timestamp };
   try {
     await events.send(new PutEventsCommand({

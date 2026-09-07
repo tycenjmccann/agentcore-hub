@@ -24,6 +24,10 @@ import {
   contractLabels,
   renderFixContractBlock,
   escapeJql,
+  PRECONDITION_AT_PREFIX,
+  preconditionAtLabel,
+  preconditionAtMsFromLabels,
+  reportedAtFromLabels,
 } from "./fix-contract.mjs";
 
 // ─── Jira Config ─────────────────────────────────────────────────────────────
@@ -712,14 +716,47 @@ async function transitionTicket(params) {
     throw new Error(`No transition to "${effectiveStatus}" found. Available: ${available}`);
   }
 
-  await jiraFetch(`/rest/api/3/issue/${ticket_id}/transitions`, {
-    method: "POST",
-    body: JSON.stringify({ transition: { id: match.id } }),
-  });
-
   const finalStatus = isSkip ? "done" : mapStatusToInternal(match.to.name);
+
+  // TEAM-4167 D3 FR-3.2: a Done transition must set a Jira `resolution`, or the
+  // issue closes "Unresolved" and JQL/`resolutiondate` never fire — the honest
+  // "when did this gate resolve" signal the cost-report / toolkit read. We set
+  // resolution on EVERY Done transition, not just human-review gates: a resolved
+  // Jira issue should always carry a resolution, and deriving human-ness here
+  // would cost an extra labels fetch for no benefit. (A run's gate tickets carry
+  // a `reviewer:` label, but non-gate agent tickets legitimately reach Done too,
+  // and Done-with-resolution is correct for all of them.)
+  const body = { transition: { id: match.id } };
+  if (finalStatus === "done") body.fields = { resolution: { name: "Done" } };
+
+  try {
+    await jiraFetch(`/rest/api/3/issue/${ticket_id}/transitions`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+  } catch (err) {
+    // Guarded fallback: some project transition screens don't expose the
+    // `resolution` field, so Jira 400s the whole transition when we set it. The
+    // transition must NEVER fail over resolution — retry ONCE with the bare body
+    // (no fields) and log jira.resolution_unsupported. Only a 400 with the
+    // resolution field triggers the retry; every other error still throws.
+    if (body.fields && /Jira API 400/.test(err.message)) {
+      console.warn(`[jira-tools] jira.resolution_unsupported ${ticket_id}: resolution field rejected (${err.message}) — retrying transition without it`);
+      await jiraFetch(`/rest/api/3/issue/${ticket_id}/transitions`, {
+        method: "POST",
+        body: JSON.stringify({ transition: { id: match.id } }),
+      });
+    } else {
+      throw err;
+    }
+  }
+
   console.log(`[jira-tools] Transitioned ${ticket_id} to ${finalStatus} in Jira`);
-  return { ticketId: ticket_id, status: finalStatus, message: `Transitioned to ${finalStatus}` };
+  const result = { ticketId: ticket_id, status: finalStatus, message: `Transitioned to ${finalStatus}` };
+  // resolvedAt marks a real Done resolution (parity with the DDB provider's row
+  // field); callers read it the same way regardless of backend.
+  if (finalStatus === "done") result.resolvedAt = new Date().toISOString();
+  return result;
 }
 
 async function updateTicket(params) {
@@ -834,6 +871,101 @@ async function addComment(params) {
   });
 
   return { ticketId: ticket_id, message: "Comment added" };
+}
+
+/**
+ * TEAM-4166 §1.2 — stamp the non-terminal "precondition unmet" record in Jira.
+ * Jira has no structured record, so the LABELS are the index: one `awaiting:<id>`
+ * label per awaited sibling, which mapIssue (and the orchestrator's
+ * mapJiraIssueToTicket) parse back into `ticket.preconditionUnmet`. A structured
+ * comment marker carries the richer fields (reportedAt/agentId/source) for a
+ * reader that fetches comments. Deliberately NO transition — this is an
+ * annotation, not a status change; the awaited-edge write is the orchestrator's.
+ * `update.labels[{add}]` (not a whole-list `fields` replace) is additive and
+ * idempotent server-side, so a re-report unions rather than duplicating.
+ */
+async function annotatePreconditionUnmet(params) {
+  const ticketId = params.ticket_id || params.issue_key;
+  if (!ticketId) throw new Error("'ticket_id' is required");
+
+  const incoming = Array.isArray(params.awaitingIds)
+    ? params.awaitingIds
+    : params.awaitingIds
+      ? [params.awaitingIds]
+      : [];
+  const awaitingIds = [];
+  for (const id of incoming) {
+    const s = typeof id === "string" ? id.trim() : "";
+    if (s && !awaitingIds.includes(s)) awaitingIds.push(s);
+  }
+
+  const reportedAt = params.reportedAt || new Date().toISOString();
+  const agentId = params.agentId || null;
+  const source = params.source || "tool";
+  const note = typeof params.note === "string" ? params.note : "";
+  const preconditionUnmet = { awaitingIds, note, reportedAt, agentId, source };
+
+  // Machine-readable marker (parsed back by parsePreconditionMarker) + a human
+  // line. The marker JSON omits `note` — the human line already carries it, and
+  // labels are the field the orchestrator actually reads.
+  const marker = `<!-- precondition-unmet ${JSON.stringify({ awaitingIds, reportedAt, agentId, source })} -->`;
+  const humanLine = `Precondition unmet — awaiting ${awaitingIds.join(", ")}${note ? `: ${note}` : ""}`;
+  await jiraFetch(`/rest/api/3/issue/${ticketId}/comment`, {
+    method: "POST",
+    body: JSON.stringify({
+      body: {
+        type: "doc",
+        version: 1,
+        content: [
+          { type: "paragraph", content: [{ type: "text", text: humanLine }] },
+          { type: "paragraph", content: [{ type: "text", text: marker }] },
+        ],
+      },
+    }),
+  });
+
+  // NOT lowercased — the id must survive as a real ticket key so mapIssue reads
+  // it back as TEAM-1234, not team-1234.
+  const labelOps = awaitingIds.map((id) => ({ add: `awaiting:${id}` }));
+
+  // TEAM-4184 — the reportedAt CLOCK rides a `precondition-at:<epochMs>` label
+  // too, because the marker comment above does not reach the reader that needs
+  // it (see PRECONDITION_AT_PREFIX). MONOTONIC: an older re-report never moves
+  // the clock backwards, and the superseded labels are removed in this same PUT
+  // so only the max survives. Readers take the max regardless, so a removal that
+  // fails is a hygiene miss, not a correctness one.
+  const atLabel = preconditionAtLabel(reportedAt);
+  if (atLabel) {
+    let existingLabels = [];
+    try {
+      const current = await jiraFetch(`/rest/api/3/issue/${ticketId}?fields=labels`);
+      existingLabels = current?.fields?.labels || [];
+    } catch (err) {
+      // Fail SAFE toward writing the clock: add without pruning. An un-pruned
+      // older sibling label is harmless (max-wins), a missing clock is not.
+      console.warn(`[jira-tools] precondition-at label read failed for ${ticketId}, adding without pruning: ${err?.message || err}`);
+    }
+    const existingMs = preconditionAtMsFromLabels(existingLabels);
+    const incomingMs = preconditionAtMsFromLabels([atLabel]);
+    if (existingMs === null || incomingMs > existingMs) {
+      labelOps.push({ add: atLabel });
+      for (const label of existingLabels) {
+        if (typeof label === "string" && label.startsWith(PRECONDITION_AT_PREFIX) && label !== atLabel) {
+          labelOps.push({ remove: label });
+        }
+      }
+    }
+    // else: a NEWER clock is already on the issue — leave it, prune nothing.
+  }
+
+  if (labelOps.length > 0) {
+    await jiraFetch(`/rest/api/3/issue/${ticketId}`, {
+      method: "PUT",
+      body: JSON.stringify({ update: { labels: labelOps } }),
+    });
+  }
+
+  return { ticketId, preconditionUnmet };
 }
 
 async function searchIssues(params) {
@@ -1009,6 +1141,19 @@ function mapIssue(issue) {
     ? `human:${reviewerLabel.replace("reviewer:", "")}`
     : fields.assignee?.displayName || null;
 
+  // TEAM-4166 §1.2: reconstruct preconditionUnmet from the `awaiting:<id>` labels
+  // annotatePreconditionUnmet writes. mapIssue sees only fields (no comments), so
+  // the richer marker fields aren't available here — source:"label" says so; a
+  // reader with comment access can prefer the marker JSON.
+  const awaitingIds = labels
+    .filter((l) => l.startsWith("awaiting:"))
+    .map((l) => l.slice("awaiting:".length))
+    .filter(Boolean);
+  // TEAM-4184: …and the reportedAt clock from the `precondition-at:<epochMs>`
+  // label, so the D2 evidence guard's liveness comparison works off a fields-only
+  // read (no comment fetch).
+  const awaitingReportedAt = reportedAtFromLabels(labels);
+
   return {
     ticketId: issue.key,
     title: fields.summary || "",
@@ -1018,6 +1163,15 @@ function mapIssue(issue) {
     parentKey: fields.parent?.key || null,
     workflowId: wfLabel ? wfLabel.replace("wf:", "") : null,
     labels,
+    ...(awaitingIds.length > 0
+      ? {
+          preconditionUnmet: {
+            awaitingIds,
+            ...(awaitingReportedAt ? { reportedAt: awaitingReportedAt } : {}),
+            source: "label",
+          },
+        }
+      : {}),
   };
 }
 
@@ -1030,6 +1184,7 @@ const TOOLS = {
   Tickets___labels_add: addLabels,
   Tickets___list_tickets: listTickets,
   Tickets___add_comment: addComment,
+  Tickets___annotate_precondition_unmet: annotatePreconditionUnmet,
   Tickets___search_issues: searchIssues,
   Tickets___get_issue: getIssue,
   Tickets___get_transitions: getTransitions,
@@ -1043,6 +1198,7 @@ const TOOLS = {
   JiraIntegration___update_ticket: updateTicket,
   JiraIntegration___list_tickets: listTickets,
   JiraIntegration___add_comment: addComment,
+  JiraIntegration___annotate_precondition_unmet: annotatePreconditionUnmet,
   JiraIntegration___search_issues: searchIssues,
   JiraIntegration___get_issue: getIssue,
   JiraIntegration___get_transitions: getTransitions,

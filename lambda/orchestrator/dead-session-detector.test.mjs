@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { createDetector } from "./dead-session-detector.mjs";
+import { createAwaitedIds } from "./awaited-ids.mjs";
 import { SWEEP_ROTATION_QUANTUM_MS } from "./sweep-scan.mjs";
 
 /**
@@ -1188,5 +1189,552 @@ describe("TEAM-3756 F5 — the detector's workflow scan excludes EVERY terminal 
     const m = await runSweep("enforce");
 
     expect(m.candidates).toBe(1);
+  });
+});
+
+/**
+ * TEAM-4166 D2 §2.3 — the evidence-gated escalation guard. When the retry budget
+ * is spent (deadSessionRetries ≥ 1) the pre-4166 detector escalated
+ * unconditionally. A session that genuinely completed, or a ticket parked clean
+ * (preconditionUnmet stamped), is NOT dead — the guard re-wakes it capped on
+ * cleanExitRedispatches (NEVER touching deadSessionRetries) and reserves
+ * escalation for the genuinely silent. The guard engages ONLY when the store
+ * exposes incrementCleanExitRedispatch — an old store keeps the pre-4166 escalate
+ * (every test above uses such a store, so they are byte-identical).
+ */
+describe("TEAM-4166 D2 §2.3 — evidence-gated escalation guard", () => {
+  const FIX = "FIX-1";
+
+  // The default store PLUS the clean-exit CAS that arms the guard.
+  function guardStore(overrides = {}) {
+    return {
+      markDeadSessionDetected: vi.fn(async () => true),
+      clearDeadSessionDetected: vi.fn(async () => true),
+      incrementDeadSessionRetry: vi.fn(async () => 1),
+      incrementCleanExitRedispatch: vi.fn(async () => true),
+      markAwaitTimeoutEmitted: vi.fn(async () => true),
+      setTaskStatus: vi.fn(async () => {}),
+      appendNotification: vi.fn(async () => {}),
+      getWorkflow: vi.fn(async () => null),
+      ...overrides,
+    };
+  }
+
+  function makeAwaited(publishEvent, { mode = "enforce", timeoutMinutes = 120, store } = {}) {
+    return createAwaitedIds({
+      addBlockers: vi.fn(async () => []),
+      annotatePreconditionUnmet: vi.fn(async () => {}),
+      publishEvent,
+      getTicket: vi.fn(async () => null),
+      store: store || { markAwaitTimeoutEmitted: vi.fn(async () => true) },
+      now: () => NOW,
+      mode,
+      timeoutMinutes,
+    });
+  }
+
+  const parkedTicket = { ticketId: "TEAM-2", type: "task", status: "in_progress", assignee: "dev",
+    preconditionUnmet: { awaitingIds: [FIX], reportedAt: "2026-09-01T09:00:00Z" } };
+
+  it("parked clean + budget spent → clean re-wake 'exited-ok': incrementCleanExitRedispatch once, deadSessionRetries untouched, no escalate", async () => {
+    const wf = makeWorkflow({ deadSessionRetries: { "TEAM-2": 1 } });
+    const store = guardStore();
+    const { deps } = makeDeps({
+      ddb: makeDdb({ workflows: [wf] }), store,
+      getTicket: vi.fn(async () => parkedTicket),
+    });
+    const { runSweep } = createDetector({ ...deps, cleanExitRedispatchCap: 3 });
+
+    const m = await runSweep("enforce");
+
+    expect(m.exitedOk).toBe(1);
+    expect(store.incrementCleanExitRedispatch).toHaveBeenCalledTimes(1);
+    expect(store.incrementCleanExitRedispatch).toHaveBeenCalledWith("wf_1", "TEAM-2");
+    // The clean path NEVER burns the dead-session retry budget or errors the task.
+    expect(store.incrementDeadSessionRetry).not.toHaveBeenCalled();
+    expect(store.setTaskStatus).not.toHaveBeenCalled();
+    expect(deps.blockTicket).not.toHaveBeenCalled();
+    expect(deps.redispatch).toHaveBeenCalledTimes(1);
+    expect(eventsOfType(deps.publishEvent, "agent.escalated")).toHaveLength(0);
+    expect(m.escalations).toBe(0);
+  });
+
+  it("re-woken to the clean-exit cap → 'awaiting' + advisory await_timeout, NO escalation, NO redispatch", async () => {
+    const wf = makeWorkflow({ deadSessionRetries: { "TEAM-2": 1 }, cleanExitRedispatches: { "TEAM-2": 3 } });
+    const store = guardStore();
+    const { deps } = makeDeps({
+      ddb: makeDdb({ workflows: [wf] }), store,
+      getTicket: vi.fn(async () => parkedTicket),
+    });
+    const awaitedIds = makeAwaited(deps.publishEvent, { store });
+    const { runSweep } = createDetector({ ...deps, awaitedIds, cleanExitRedispatchCap: 3 });
+
+    const m = await runSweep("enforce");
+
+    expect(m.awaiting).toBe(1);
+    expect(m.escalations).toBe(0);
+    expect(store.incrementCleanExitRedispatch).not.toHaveBeenCalled();
+    expect(deps.redispatch).not.toHaveBeenCalled();
+    expect(store.setTaskStatus).not.toHaveBeenCalled();
+    // Advisory event only — never a manager_escalation (the parkedOnHuman trap).
+    expect(eventsOfType(deps.publishEvent, "orchestrator.await_timeout")).toHaveLength(1);
+    expect(eventsOfType(deps.publishEvent, "agent.escalated")).toHaveLength(0);
+    expect(store.appendNotification).not.toHaveBeenCalled();
+  });
+
+  it("no evidence (not completed, not parked clean) → the EXISTING escalate, now carrying six evidence fields", async () => {
+    const wf = makeWorkflow({ deadSessionRetries: { "TEAM-2": 1 } });
+    const store = guardStore();
+    const getLastStreamAt = vi.fn(async () => "2026-09-01T05:00:00Z");
+    // Default getTicket → leafTicket (no preconditionUnmet); no completion events.
+    const { deps } = makeDeps({ ddb: makeDdb({ workflows: [wf] }), store });
+    const { runSweep } = createDetector({ ...deps, getLastStreamAt, cleanExitRedispatchCap: 3 });
+
+    const m = await runSweep("enforce");
+
+    expect(m.escalations).toBe(1);
+    expect(store.setTaskStatus).toHaveBeenCalledWith("wf_1", "TEAM-2", "error");
+    // The guard did NOT re-wake this one.
+    expect(store.incrementCleanExitRedispatch).not.toHaveBeenCalled();
+    const esc = eventsOfType(deps.publishEvent, "agent.escalated");
+    expect(esc).toHaveLength(1);
+    const { evidence } = esc[0][2];
+    for (const k of ["lastSpanAt", "lastSpanStatus", "lastStreamAt", "completedAt", "preconditionAt", "exitReason"]) {
+      expect(Object.prototype.hasOwnProperty.call(evidence, k)).toBe(true);
+    }
+    // On the dead path: no "ok" span status, no completion/precondition, no exit reason.
+    expect(evidence.lastSpanStatus).toBeNull();
+    expect(evidence.completedAt).toBeNull();
+    expect(evidence.preconditionAt).toBeNull();
+    expect(evidence.exitReason).toBeNull();
+    expect(evidence.lastStreamAt).toBe("2026-09-01T05:00:00Z");
+  });
+
+  it("an OLD store (no incrementCleanExitRedispatch) keeps the pre-4166 unconditional escalate", async () => {
+    const wf = makeWorkflow({ deadSessionRetries: { "TEAM-2": 1 } });
+    // makeDeps' default store has NO incrementCleanExitRedispatch → canGuard false.
+    const { deps, store } = makeDeps({
+      ddb: makeDdb({ workflows: [wf] }),
+      getTicket: vi.fn(async () => parkedTicket), // even parked, the guard can't engage
+    });
+    const { runSweep } = createDetector(deps);
+
+    const m = await runSweep("enforce");
+
+    expect(m.escalations).toBe(1);
+    expect(m.exitedOk).toBeFalsy();
+    expect(store.setTaskStatus).toHaveBeenCalledWith("wf_1", "TEAM-2", "error");
+  });
+
+  // TEAM-4166 §0 — the clean-park ANTI-THRASH. When a sibling reader is wired the
+  // guard evaluates the union blockers (blockedBy ∪ preconditionUnmet.awaitingIds)
+  // BEFORE re-dispatching: a parked release manager still waiting on open fixes is
+  // left untouched (the cascade re-drives it when the last fix closes), and only a
+  // parked ticket whose awaited fixes have ALL landed is re-woken.
+  it("§0 anti-thrash: parked clean + reader wired + an awaited fix still open → 'awaiting', no redispatch, no counter", async () => {
+    const wf = makeWorkflow({ deadSessionRetries: { "TEAM-2": 1 }, epicId: "TEAM-1" });
+    const store = guardStore();
+    const getChildTickets = vi.fn(async () => [
+      parkedTicket,
+      { ticketId: FIX, type: "task", status: "in_progress" }, // the awaited fix is NOT terminal
+    ]);
+    const { deps } = makeDeps({
+      ddb: makeDdb({ workflows: [wf] }), store,
+      getTicket: vi.fn(async () => parkedTicket),
+    });
+    const { runSweep } = createDetector({ ...deps, getChildTickets, cleanExitRedispatchCap: 3 });
+
+    const m = await runSweep("enforce");
+
+    expect(getChildTickets).toHaveBeenCalledWith("TEAM-1");
+    expect(m.awaiting).toBe(1);
+    expect(m.exitedOk).toBeFalsy();
+    expect(m.escalations).toBe(0);
+    // Nothing is touched: no re-dispatch, no clean-exit counter, no dead-session
+    // budget, no status write — the ordinary cascade owns the re-drive.
+    expect(store.incrementCleanExitRedispatch).not.toHaveBeenCalled();
+    expect(store.incrementDeadSessionRetry).not.toHaveBeenCalled();
+    expect(deps.redispatch).not.toHaveBeenCalled();
+    expect(store.setTaskStatus).not.toHaveBeenCalled();
+    expect(eventsOfType(deps.publishEvent, "agent.escalated")).toHaveLength(0);
+  });
+
+  it("§0 anti-thrash: parked clean + reader wired + all awaited fixes terminal → clean re-wake 'exited-ok'", async () => {
+    const wf = makeWorkflow({ deadSessionRetries: { "TEAM-2": 1 }, epicId: "TEAM-1" });
+    const store = guardStore();
+    const getChildTickets = vi.fn(async () => [
+      parkedTicket,
+      { ticketId: FIX, type: "task", status: "done" }, // the awaited fix has landed
+    ]);
+    const { deps } = makeDeps({
+      ddb: makeDdb({ workflows: [wf] }), store,
+      getTicket: vi.fn(async () => parkedTicket),
+    });
+    const { runSweep } = createDetector({ ...deps, getChildTickets, cleanExitRedispatchCap: 3 });
+
+    const m = await runSweep("enforce");
+
+    expect(getChildTickets).toHaveBeenCalledWith("TEAM-1");
+    expect(m.exitedOk).toBe(1);
+    expect(m.awaiting).toBeFalsy();
+    expect(store.incrementCleanExitRedispatch).toHaveBeenCalledTimes(1);
+    expect(deps.redispatch).toHaveBeenCalledTimes(1);
+    expect(store.incrementDeadSessionRetry).not.toHaveBeenCalled();
+    expect(eventsOfType(deps.publishEvent, "agent.escalated")).toHaveLength(0);
+  });
+
+  /**
+   * TEAM-4184 F2 — the cap-path payload. The detector used to call
+   * checkAwaitTimeout with `[]` for the siblings, so EVERY id in the union counted
+   * as non-terminal and the advisory event listed ids that had already gone done —
+   * including the def-time blockedBy edges the ticket has carried since intake. It
+   * now judges against the snapshot it already fetched above.
+   */
+  it("TEAM-4184 F2: at the cap with everything landed → EMPTY awaitingIds, reason clean_exit_cap, real waitedMs", async () => {
+    const DEF_BLOCKER = "TEAM-0"; // a def-time edge, done since intake
+    const parkedAtCap = { ...parkedTicket, blockedBy: [DEF_BLOCKER],
+      preconditionUnmet: { awaitingIds: [FIX], reportedAt: "2026-09-01T09:00:00Z" } };
+    const wf = makeWorkflow({
+      deadSessionRetries: { "TEAM-2": 1 }, cleanExitRedispatches: { "TEAM-2": 3 }, epicId: "TEAM-1",
+    });
+    const store = guardStore();
+    const getChildTickets = vi.fn(async () => [
+      parkedAtCap,
+      { ticketId: FIX, type: "task", status: "done" },
+      { ticketId: DEF_BLOCKER, type: "task", status: "done" },
+    ]);
+    const { deps } = makeDeps({
+      ddb: makeDdb({ workflows: [wf] }), store,
+      getTicket: vi.fn(async () => parkedAtCap),
+    });
+    const awaitedIds = makeAwaited(deps.publishEvent, { store });
+    const { runSweep } = createDetector({ ...deps, getChildTickets, awaitedIds, cleanExitRedispatchCap: 3 });
+
+    const m = await runSweep("enforce");
+
+    expect(m.awaiting).toBe(1);
+    expect(m.escalations).toBe(0);
+    const [ev] = eventsOfType(deps.publishEvent, "orchestrator.await_timeout");
+    expect(ev).toBeTruthy();
+    const detail = ev[2];
+    // Neither the landed fix nor the intake-era blocker is presented as "awaited".
+    expect(detail.awaitingIds).toEqual([]);
+    expect(detail.awaitingIds).not.toContain(DEF_BLOCKER);
+    expect(detail.reason).toBe("clean_exit_cap");
+    expect(detail.waitedMs).toBe(NOW - Date.parse("2026-09-01T09:00:00Z")); // 3h, not 0
+    expect(detail.source).toBe("dead-session-detector");
+    // Advisory only, once: no page, no escalation, no re-dispatch.
+    expect(store.appendNotification).not.toHaveBeenCalled();
+    expect(store.markAwaitTimeoutEmitted).toHaveBeenCalledTimes(1);
+    expect(eventsOfType(deps.publishEvent, "agent.escalated")).toHaveLength(0);
+    expect(deps.redispatch).not.toHaveBeenCalled();
+  });
+
+  it("TEAM-4184 F2: reader ABSENT at the cap → the un-provable ids are still reported (reason await_timeout)", async () => {
+    // No getChildTickets → no snapshot → nothing can be proven closed, so the wait
+    // SLA reports the whole union. Conservative, and the pre-4184 shape.
+    const wf = makeWorkflow({ deadSessionRetries: { "TEAM-2": 1 }, cleanExitRedispatches: { "TEAM-2": 3 } });
+    const store = guardStore();
+    const { deps } = makeDeps({
+      ddb: makeDdb({ workflows: [wf] }), store,
+      getTicket: vi.fn(async () => parkedTicket),
+    });
+    const awaitedIds = makeAwaited(deps.publishEvent, { store });
+    const { runSweep } = createDetector({ ...deps, awaitedIds, cleanExitRedispatchCap: 3 });
+
+    await runSweep("enforce");
+
+    const detail = eventsOfType(deps.publishEvent, "orchestrator.await_timeout")[0][2];
+    expect(detail.awaitingIds).toEqual([FIX]);
+    expect(detail.reason).toBe("await_timeout");
+    expect(detail.waitedMs).toBe(NOW - Date.parse("2026-09-01T09:00:00Z"));
+  });
+
+  /**
+   * TEAM-4184 F1 — the detector twin of the cascade fix. `preconditionUnmet` is
+   * never cleared, so a stamp from an EARLIER claim used to keep a ticket
+   * un-escalatable forever: the correct clean re-wake spent the budget, and the
+   * re-woken (now genuinely dead) session still read "parked clean". The stamp is
+   * evidence about the claim that wrote it — a stamp predating the claim under
+   * inspection, whose awaited work has all landed, is spent evidence.
+   */
+  const parkedStale = { ...parkedTicket,
+    preconditionUnmet: { awaitingIds: [FIX], reportedAt: "2026-08-31T23:00:00Z" } }; // < DEAD_STARTED
+
+  it("TEAM-4184: a stamp from a PREVIOUS claim, already acted on, no longer blocks the escalate", async () => {
+    const wf = makeWorkflow({
+      deadSessionRetries: { "TEAM-2": 1 },
+      cleanExitRedispatches: { "TEAM-2": 1 }, // the re-wake that stamp already bought
+      epicId: "TEAM-1",
+    });
+    const store = guardStore();
+    const getChildTickets = vi.fn(async () => [
+      parkedStale,
+      { ticketId: FIX, type: "task", status: "done" }, // nothing awaited is open
+    ]);
+    const { deps } = makeDeps({
+      ddb: makeDdb({ workflows: [wf] }), store,
+      getTicket: vi.fn(async () => parkedStale),
+    });
+    const { runSweep } = createDetector({ ...deps, getChildTickets, cleanExitRedispatchCap: 3 });
+
+    const m = await runSweep("enforce");
+
+    expect(m.escalations).toBe(1);
+    expect(m.exitedOk).toBeFalsy();
+    expect(m.awaiting).toBeFalsy();
+    expect(store.setTaskStatus).toHaveBeenCalledWith("wf_1", "TEAM-2", "error");
+    expect(deps.blockTicket).toHaveBeenCalledWith("TEAM-2", "dead_session_retry_exhausted");
+    // The clean-exit budget is not spent again on the way out.
+    expect(store.incrementCleanExitRedispatch).not.toHaveBeenCalled();
+    expect(deps.redispatch).not.toHaveBeenCalled();
+    // The evidence says which branch decided, and the sibling snapshot was read
+    // ONCE for both the predicate and the anti-thrash check.
+    const esc = eventsOfType(deps.publishEvent, "agent.escalated");
+    expect(esc).toHaveLength(1);
+    expect(esc[0][2].evidence.parkEvidence).toBe("stale-stamp");
+    expect(esc[0][2].evidence.preconditionAt).toBe("2026-08-31T23:00:00Z");
+    expect(getChildTickets).toHaveBeenCalledTimes(1);
+  });
+
+  it("TEAM-4184: the SAME stale stamp still earns its FIRST re-wake (budget unspent → FR-2.1b intact)", async () => {
+    // Only difference from the case above: cleanExitRedispatches is 0. The stamp
+    // has not been acted on yet, so it is unconsumed evidence, not stale — this is
+    // the pre-deploy stamp (written before the clock existed) still being honoured.
+    const wf = makeWorkflow({ deadSessionRetries: { "TEAM-2": 1 }, epicId: "TEAM-1" });
+    const store = guardStore();
+    const getChildTickets = vi.fn(async () => [parkedStale, { ticketId: FIX, type: "task", status: "done" }]);
+    const { deps } = makeDeps({
+      ddb: makeDdb({ workflows: [wf] }), store,
+      getTicket: vi.fn(async () => parkedStale),
+    });
+    const { runSweep } = createDetector({ ...deps, getChildTickets, cleanExitRedispatchCap: 3 });
+
+    const m = await runSweep("enforce");
+
+    expect(m.exitedOk).toBe(1);
+    expect(m.escalations).toBe(0);
+    expect(store.incrementCleanExitRedispatch).toHaveBeenCalledTimes(1);
+    expect(store.setTaskStatus).not.toHaveBeenCalled();
+  });
+
+  /**
+   * TEAM-4184 (review finding of TEAM-4168): a sibling-fetch FAILURE must not
+   * read as "resolved". Before this fix, `siblings` stayed `null` whenever
+   * `getChildTickets` was unwired or threw, and `parkEvidence` was handed
+   * `undefined` — nonTerminalAwaitedIds(ticket, undefined) returns [] (its own
+   * "nothing provably open" contract, correct for checkAwaitTimeout's advisory
+   * use), so the awaited-open term went silent and a STALE stamp with a SPENT
+   * budget fell straight through to stale-stamp: a transient infra error
+   * escalating a live, legitimately parked ticket. parkEvidence now scores "no
+   * snapshot at all" as unproven (awaited-open) BEFORE it ever reaches the
+   * claim-currency/budget terms, so a fetch failure degrades to "leave it
+   * parked" (re-checked next sweep), never to "escalate".
+   */
+  it("TEAM-4184: getChildTickets THROWS on a stale stamp + spent budget → does NOT escalate (fails toward not escalating)", async () => {
+    const wf = makeWorkflow({
+      deadSessionRetries: { "TEAM-2": 1 },
+      cleanExitRedispatches: { "TEAM-2": 1 }, // budget already spent — the stale-stamp trigger
+      epicId: "TEAM-1",
+    });
+    const store = guardStore();
+    const getChildTickets = vi.fn(async () => { throw new Error("ProvisionedThroughputExceededException"); });
+    const { deps } = makeDeps({
+      ddb: makeDdb({ workflows: [wf] }), store,
+      getTicket: vi.fn(async () => parkedStale),
+    });
+    const { runSweep } = createDetector({ ...deps, getChildTickets, cleanExitRedispatchCap: 3 });
+
+    const m = await runSweep("enforce");
+
+    expect(getChildTickets).toHaveBeenCalledWith("TEAM-1");
+    // The false escalation this predicate exists to prevent, NOT triggered by
+    // the fetch error either — it re-wakes exactly as the unconsumed-stamp /
+    // budget-unspent case does, because parkedClean is still true.
+    expect(m.escalations).toBe(0);
+    expect(m.exitedOk).toBe(1);
+    expect(store.incrementCleanExitRedispatch).toHaveBeenCalledTimes(1);
+    expect(store.setTaskStatus).not.toHaveBeenCalled();
+    expect(deps.blockTicket).not.toHaveBeenCalled();
+    expect(eventsOfType(deps.publishEvent, "agent.escalated")).toHaveLength(0);
+    expect(store.appendNotification).not.toHaveBeenCalled();
+  });
+
+  it("TEAM-4184: getChildTickets UNWIRED on a stale stamp + spent budget → does NOT escalate (same fail-safe as a throw)", async () => {
+    const wf = makeWorkflow({
+      deadSessionRetries: { "TEAM-2": 1 },
+      cleanExitRedispatches: { "TEAM-2": 1 },
+      epicId: "TEAM-1",
+    });
+    const store = guardStore();
+    const { deps } = makeDeps({
+      ddb: makeDdb({ workflows: [wf] }), store,
+      getTicket: vi.fn(async () => parkedStale),
+    });
+    // No getChildTickets at all — same "can't see the board" state as a throw.
+    const { runSweep } = createDetector({ ...deps, cleanExitRedispatchCap: 3 });
+
+    const m = await runSweep("enforce");
+
+    expect(m.escalations).toBe(0);
+    expect(m.exitedOk).toBe(1);
+    expect(store.incrementCleanExitRedispatch).toHaveBeenCalledTimes(1);
+    expect(store.setTaskStatus).not.toHaveBeenCalled();
+    expect(deps.blockTicket).not.toHaveBeenCalled();
+    expect(eventsOfType(deps.publishEvent, "agent.escalated")).toHaveLength(0);
+  });
+
+  it("§0 anti-thrash: reader ABSENT keeps the pre-4166 capped re-wake (no siblings to consult)", async () => {
+    const wf = makeWorkflow({ deadSessionRetries: { "TEAM-2": 1 }, epicId: "TEAM-1" });
+    const store = guardStore();
+    const { deps } = makeDeps({
+      ddb: makeDdb({ workflows: [wf] }), store,
+      getTicket: vi.fn(async () => parkedTicket),
+    });
+    // No getChildTickets dep → the guard cannot see the awaited closure, so it
+    // re-wakes on the clean-exit counter exactly as it did before §0.
+    const { runSweep } = createDetector({ ...deps, cleanExitRedispatchCap: 3 });
+
+    const m = await runSweep("enforce");
+
+    expect(m.exitedOk).toBe(1);
+    expect(m.awaiting).toBeFalsy();
+    expect(store.incrementCleanExitRedispatch).toHaveBeenCalledTimes(1);
+    expect(deps.redispatch).toHaveBeenCalledTimes(1);
+  });
+
+  it("emits explicit zeros for DetectorExitedOk / DetectorAwaiting on a healthy sweep", async () => {
+    const { deps } = makeDeps();
+    const { runSweep } = createDetector(deps);
+
+    const { emf } = await captureEmf(() => runSweep("enforce"));
+
+    expect(emf.DetectorExitedOk).toBe(0);
+    expect(emf.DetectorAwaiting).toBe(0);
+  });
+});
+
+/**
+ * TEAM-4187 (review finding of TEAM-4168) — the detector's re-wake journal.
+ *
+ * The D2 clean-exit branch re-dispatches a ticket that was PARKED in
+ * in_progress. Until now that recovery published NOTHING (the
+ * orchestrator.unblocked journal only ever covered blocked/todo→Ready
+ * transitions), so a dossier reading the event stream saw a stalled ticket and
+ * then a fresh claim with nothing in between explaining the jump. This is the
+ * twin of the cascade's stealAndRedispatch emit, and ONLY this site: the dead
+ * path's first retry already announces itself with agent.error, and a retried
+ * DEAD session is not an unblock.
+ */
+describe("TEAM-4187 — orchestrator.unblocked on the detector's clean-exit re-wake", () => {
+  const FIX = "FIX-1";
+
+  function guardStore(overrides = {}) {
+    return {
+      markDeadSessionDetected: vi.fn(async () => true),
+      clearDeadSessionDetected: vi.fn(async () => true),
+      incrementDeadSessionRetry: vi.fn(async () => 1),
+      incrementCleanExitRedispatch: vi.fn(async () => true),
+      markAwaitTimeoutEmitted: vi.fn(async () => true),
+      setTaskStatus: vi.fn(async () => {}),
+      appendNotification: vi.fn(async () => {}),
+      getWorkflow: vi.fn(async () => null),
+      ...overrides,
+    };
+  }
+
+  const parkedTicket = { ticketId: "TEAM-2", type: "task", status: "in_progress", assignee: "dev",
+    preconditionUnmet: { awaitingIds: [FIX], reportedAt: "2026-09-01T09:00:00Z" } };
+
+  it("journals ONE orchestrator.unblocked (reason awaited_rewake, source dead-session-detector) + DetectorRewoken == 1", async () => {
+    const wf = makeWorkflow({ deadSessionRetries: { "TEAM-2": 1 } });
+    const store = guardStore();
+    const { deps } = makeDeps({
+      ddb: makeDdb({ workflows: [wf] }), store,
+      getTicket: vi.fn(async () => parkedTicket),
+    });
+    const { runSweep } = createDetector({ ...deps, cleanExitRedispatchCap: 3 });
+
+    const { result: m, emf } = await captureEmf(() => runSweep("enforce"));
+
+    // The recovery itself is unchanged (the TEAM-4166 D2 clean re-wake).
+    expect(m.exitedOk).toBe(1);
+    expect(deps.redispatch).toHaveBeenCalledTimes(1);
+    expect(store.incrementDeadSessionRetry).not.toHaveBeenCalled();
+
+    const un = eventsOfType(deps.publishEvent, "orchestrator.unblocked");
+    expect(un).toHaveLength(1);
+    expect(un[0][0]).toBe("TEAM-2");
+    expect(un[0][2]).toMatchObject({
+      ticketId: "TEAM-2",
+      workflowId: "wf_1",
+      unblockedBy: "dead-session-detector",
+      source: "dead-session-detector",
+      previousStatus: "in_progress",
+      reason: "awaited_rewake", // the ticket carried preconditionUnmet.awaitingIds
+    });
+    // The union it waited on, from the SAME blockerUnion the cascade journals.
+    expect(un[0][2].blockedBy).toEqual([FIX]);
+    // The injected clock, not wall time (deterministicEventId keys off this).
+    expect(un[0][2].timestamp).toBe(new Date(NOW).toISOString());
+
+    expect(m.rewoken).toBe(1);
+    expect(emf.DetectorRewoken).toBe(1);
+  });
+
+  it("the claim CAS losing journals NOTHING — the event tracks the re-dispatch, not the decision", async () => {
+    const wf = makeWorkflow({ deadSessionRetries: { "TEAM-2": 1 } });
+    const store = guardStore();
+    const { deps } = makeDeps({
+      ddb: makeDdb({ workflows: [wf] }), store,
+      getTicket: vi.fn(async () => parkedTicket),
+      redispatch: vi.fn(async () => false), // a racing claim won
+    });
+    const { runSweep } = createDetector({ ...deps, cleanExitRedispatchCap: 3 });
+
+    const m = await runSweep("enforce");
+
+    expect(m.exitedOk).toBe(1);          // the DECISION still counts
+    expect(m.rewoken).toBeFalsy();       // the re-dispatch did not land
+    expect(eventsOfType(deps.publishEvent, "orchestrator.unblocked")).toHaveLength(0);
+  });
+
+  it("a publish failure is swallowed — the completed recovery is never reported as an error", async () => {
+    const wf = makeWorkflow({ deadSessionRetries: { "TEAM-2": 1 } });
+    const store = guardStore();
+    const { deps } = makeDeps({
+      ddb: makeDdb({ workflows: [wf] }), store,
+      getTicket: vi.fn(async () => parkedTicket),
+      // ONLY the journal publish fails — the death announcement earlier on the
+      // path still lands (a blanket throw would abort the candidate before the
+      // clean-exit branch is even reached, testing nothing).
+      publishEvent: vi.fn(async (_id, type) => {
+        if (type === "orchestrator.unblocked") throw new Error("eventbridge down");
+      }),
+    });
+    const { runSweep } = createDetector({ ...deps, cleanExitRedispatchCap: 3 });
+
+    const m = await runSweep("enforce");
+
+    expect(m.exitedOk).toBe(1);
+    expect(m.candidateErrors).toBe(0); // NOT counted as a failed candidate
+    expect(deps.redispatch).toHaveBeenCalledTimes(1);
+  });
+
+  it("the plain dead-session FIRST RETRY journals no orchestrator.unblocked (agent.error already announces it)", async () => {
+    const { deps, store } = makeDeps();
+    const { runSweep } = createDetector(deps);
+
+    const { result: m, emf } = await captureEmf(() => runSweep("enforce"));
+
+    // The pre-4187 dead path, untouched: error → retry → re-dispatch.
+    expect(eventsOfType(deps.publishEvent, "agent.error")).toHaveLength(1);
+    expect(store.incrementDeadSessionRetry).toHaveBeenCalledWith("wf_1", "TEAM-2");
+    expect(deps.redispatch).toHaveBeenCalledTimes(1);
+    expect(m.retries).toBe(1);
+    // A retried DEAD session is not an unblock — no journal record, no counter.
+    expect(eventsOfType(deps.publishEvent, "orchestrator.unblocked")).toHaveLength(0);
+    expect(m.rewoken).toBeFalsy();
+    expect(emf.DetectorRewoken).toBe(0);
   });
 });

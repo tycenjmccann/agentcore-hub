@@ -17,11 +17,14 @@
  * has no GSI, neither writer stamps `ttl`, and the two items differ only in the
  * `source` attribute (the EventBridge copy carries it).
  *
- * Rollout: EVENT_DEDUPE_MODE = off (default) | enforce. `off` is byte-identical
- * to pre-4120 — eventIdFor delegates straight to the caller's legacy generator.
- * Instant rollback = set off. Note that the flag must agree across ALL THREE
+ * Rollout: EVENT_DEDUPE_MODE = off | enforce. As of TEAM-4167 D3 (FR-3.4) the
+ * DEFAULT is enforce: an unset (or garbage) value collapses the twin write,
+ * because leaving it off silently double-counts every consumer that reads row
+ * counts. `off` is the byte-identical pre-4120 escape hatch — eventIdFor then
+ * delegates straight to the caller's legacy generator. Only an EXACT "off"
+ * disables; instant rollback = set off. The flag must agree across ALL THREE
  * writers (orchestrator, agent-invoker, events-writer) for the overwrite to
- * happen, which is why deploy.sh forwards it to all three.
+ * happen, which is why deploy.sh forwards enforce to all three explicitly.
  *
  * The content key is deliberately the SAME string the consumer side already
  * dedupes by (lambda/cost-report/index.mjs dedupeEvents): collapsing on the
@@ -33,15 +36,27 @@
 import { createHash } from "node:crypto";
 
 /**
- * STRICT allow-list, same fail-safe direction as the ship gates: only an exact
- * "enforce" (case- and whitespace-insensitive) turns the collapse on. Legacy
- * truthy spellings ("on"/"true"/"1") and the mode word "shadow" — which this
- * flag deliberately does NOT implement, since there is nothing to observe
- * without writing — all coalesce to off. A typo can never change what gets
- * written to the events table.
+ * STRICT allow-list: exactly "off" | "enforce" (case- and whitespace-
+ * insensitive). Everything the allow-list does not recognize — unset/empty,
+ * legacy truthy spellings ("on"/"true"/"1"), the never-implemented "shadow",
+ * a typo — resolves to `defaultMode`.
+ *
+ * `defaultMode` (TEAM-4167 D3 FR-3.4): the value a MISSING/garbage env var takes.
+ *   - Historical single-arg callers keep the pre-4167 default of "off"
+ *     (byte-identical): only an explicit "enforce" turned collapse on.
+ *   - The three event producers now pass "enforce", so an unset var collapses
+ *     the twin write by default; only an EXACT "off" opts out (instant rollback).
+ * A non-empty unrecognized value is a real typo and is logged either way, so a
+ * misconfigured flag never silently picks a mode without saying which way it fell.
  */
-export function normalizeEventDedupeMode(v) {
-  return String(v ?? "").trim().toLowerCase() === "enforce" ? "enforce" : "off";
+export function normalizeEventDedupeMode(v, defaultMode = "off") {
+  const s = String(v ?? "").trim().toLowerCase();
+  if (s === "enforce") return "enforce";
+  if (s === "off") return "off";
+  if (s !== "") {
+    console.warn(`[event-id] EVENT_DEDUPE_MODE="${v}" is not "off" or "enforce" — using default "${defaultMode}".`);
+  }
+  return defaultMode === "enforce" ? "enforce" : "off";
 }
 
 /** Recursive key-sorted JSON — byte-identical to cost-report/index.mjs stableJson. */

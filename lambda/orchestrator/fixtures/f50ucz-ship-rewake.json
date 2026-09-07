@@ -1,0 +1,3042 @@
+{
+ "_provenance": {
+  "sourceS3Key": "workflows/wf_1788637257831_f50ucz/analysis/<analysisId>/dossier.json",
+  "reducedBy": "TEAM-4166 backend-dev (requirements \u00a75 reduction rules)",
+  "note": "The source dossier carries NO agent.streaming rows (only streamCounts); liveness replays must synthesize 20s agent.streaming heartbeats from streamHeartbeats below. spawnedBy on fix tickets is reconstructed from each ticket's fix-contract block (Jira provider: real spawnedBy is label-derived and was not in the dossier). agentTasks.output stripped; descriptions stripped to the fix-contract block."
+ },
+ "workflowId": "wf_1788637257831_f50ucz",
+ "workflowDefId": "software-delivery",
+ "epicId": "TEAM-4116",
+ "ticketProvider": "jira",
+ "workflow": {
+  "id": "wf_1788637257831_f50ucz",
+  "workflowId": "wf_1788637257831_f50ucz",
+  "phase": "complete",
+  "startedAt": "2026-09-05T19:40:59.233Z",
+  "completedAt": "2026-09-06T21:07:56.677Z",
+  "workflowDefId": "software-delivery",
+  "epicId": "TEAM-4116",
+  "featureBranch": "feature/TEAM-4116--si-system-gate-escalation-event-integri",
+  "delivery": {
+   "mode": "cd",
+   "pipeline": "agentcore-hub-deploy",
+   "at": "2026-09-06T21:07:56.677Z"
+  },
+  "ticketProvider": "jira",
+  "deadSessionRetries": {
+   "TEAM-4126": 1
+  },
+  "humanNotifications": [
+   {
+    "id": "notif_dead_session_TEAM-4126_2026-09-06T08:15:10.430Z",
+    "type": "manager_escalation",
+    "ticketId": "TEAM-4126",
+    "timestamp": "2026-09-06T08:15:10.430Z",
+    "acknowledged": false,
+    "reviewer": "reconcile-sweep",
+    "title": "Dead session (retry exhausted): TEAM-4126"
+   },
+   {
+    "id": "notif_TEAM-4127_2026-09-06T20:14:01.633Z",
+    "type": "review_needed",
+    "ticketId": "TEAM-4127",
+    "timestamp": "2026-09-06T20:14:01.633Z",
+    "acknowledged": true,
+    "reviewer": "engineer",
+    "gate": "ship",
+    "title": "Review needed: TEAM-4127"
+   }
+  ],
+  "agentTasks": {
+   "TEAM-4117": {
+    "agentId": "agentcore_hub_requirements_analyst",
+    "completedAt": "2026-09-05T20:07:31.738Z",
+    "createdAt": "2026-09-05T19:41:01.279Z",
+    "id": "task_1788637261279_agentcore_hub_requirements_analyst",
+    "startedAt": "2026-09-05T19:41:02.139Z",
+    "status": "complete",
+    "ticketId": "TEAM-4117"
+   },
+   "TEAM-4118": {
+    "agentId": "agentcore_hub_backend_designer",
+    "completedAt": "2026-09-05T20:47:37.209Z",
+    "createdAt": "2026-09-05T20:02:27.727Z",
+    "id": "task_1788638547727_agentcore_hub_backend_designer",
+    "startedAt": "2026-09-05T20:02:28.296Z",
+    "status": "complete",
+    "ticketId": "TEAM-4118"
+   },
+   "TEAM-4119": {
+    "agentId": "agentcore_hub_security_reviewer",
+    "completedAt": "2026-09-05T21:07:36.493Z",
+    "createdAt": "2026-09-05T20:02:46.376Z",
+    "id": "task_1788638566376_agentcore_hub_security_reviewer",
+    "startedAt": "2026-09-05T20:47:38.569Z",
+    "status": "complete",
+    "ticketId": "TEAM-4119"
+   },
+   "TEAM-4120": {
+    "agentId": "agentcore_hub_backend_dev",
+    "branch": "feature/TEAM-4120-backend-dev",
+    "commitSha": "6f6357a10da33535d251188b324b68abf11df2ab",
+    "completedAt": "2026-09-05T23:32:33.800Z",
+    "createdAt": "2026-09-05T20:03:26.062Z",
+    "id": "task_1788638606062_agentcore_hub_backend_dev",
+    "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/386",
+    "startedAt": "2026-09-05T21:07:38.025Z",
+    "status": "complete",
+    "ticketId": "TEAM-4120"
+   },
+   "TEAM-4121": {
+    "agentId": "agentcore_hub_backend_dev",
+    "branch": "feature/TEAM-4121-backend-dev",
+    "commitSha": "edde34aa7d5898faf47aa7df9cc204e70d73089f",
+    "completedAt": "2026-09-06T01:56:47.315Z",
+    "createdAt": "2026-09-05T20:04:00.982Z",
+    "id": "task_1788638640982_agentcore_hub_backend_dev",
+    "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/387",
+    "startedAt": "2026-09-05T23:32:35.100Z",
+    "status": "complete",
+    "ticketId": "TEAM-4121"
+   },
+   "TEAM-4122": {
+    "agentId": "agentcore_hub_backend_dev",
+    "branch": "feature/TEAM-4122-backend-dev",
+    "commitSha": "fed971af7b7bf03db71bda2991bc11327ea79b1b",
+    "completedAt": "2026-09-06T04:34:08.119Z",
+    "createdAt": "2026-09-05T20:04:36.062Z",
+    "id": "task_1788638676062_agentcore_hub_backend_dev",
+    "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/388",
+    "startedAt": "2026-09-06T01:56:48.596Z",
+    "status": "complete",
+    "ticketId": "TEAM-4122"
+   },
+   "TEAM-4123": {
+    "agentId": "agentcore_hub_code_reviewer",
+    "branch": "feature/TEAM-4116--si-system-gate-escalation-event-integri",
+    "commitSha": "6282d52f4cb08d15de18970eda15f823e5a33560",
+    "completedAt": "2026-09-06T05:01:37.422Z",
+    "createdAt": "2026-09-05T20:04:59.357Z",
+    "id": "task_1788638699357_agentcore_hub_code_reviewer",
+    "startedAt": "2026-09-06T04:34:09.441Z",
+    "status": "complete",
+    "ticketId": "TEAM-4123"
+   },
+   "TEAM-4124": {
+    "agentId": "agentcore_hub_qa_verifier",
+    "branch": "feature/TEAM-4116--si-system-gate-escalation-event-integri",
+    "commitSha": "1e1591f1e182fa4e9c0e303602be1e37c0388d0a",
+    "completedAt": "2026-09-06T06:44:27.717Z",
+    "createdAt": "2026-09-05T20:05:24.058Z",
+    "id": "task_1788638724058_agentcore_hub_qa_verifier",
+    "startedAt": "2026-09-06T05:01:38.883Z",
+    "status": "complete",
+    "ticketId": "TEAM-4124"
+   },
+   "TEAM-4125": {
+    "agentId": "agentcore_hub_ci_agent",
+    "branch": "feature/TEAM-4116--si-system-gate-escalation-event-integri",
+    "commitSha": "df1ed195fa7e52ed267e5a88b3ca2c3f7455e384",
+    "completedAt": "2026-09-06T06:53:02.874Z",
+    "createdAt": "2026-09-05T20:05:42.138Z",
+    "id": "task_1788638742138_agentcore_hub_ci_agent",
+    "startedAt": "2026-09-06T06:44:29.076Z",
+    "status": "complete",
+    "ticketId": "TEAM-4125"
+   },
+   "TEAM-4126": {
+    "agentId": "agentcore_hub_release_manager",
+    "branch": "feature/TEAM-4116--si-system-gate-escalation-event-integri",
+    "commitSha": "7c2391ba5102a00695fc5d6e90baefaa0e45d994",
+    "completedAt": "2026-09-06T20:13:59.049Z",
+    "createdAt": "2026-09-05T20:06:02.897Z",
+    "id": "task_1788638762897_agentcore_hub_release_manager",
+    "mergeCommit": "ff64a7db7059d21abd5025fd53329eb376c8b7c0",
+    "mergeVerifiedBy": "github",
+    "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/395",
+    "startedAt": "2026-09-06T19:46:52.337Z",
+    "status": "complete",
+    "ticketId": "TEAM-4126"
+   },
+   "TEAM-4129": {
+    "agentId": "agentcore_hub_backend_dev",
+    "branch": "feature/TEAM-4129-backend-dev",
+    "commitSha": "ab3ef4ae89b39423d98796efd30bd739a61d6a8b",
+    "completedAt": "2026-09-06T05:31:27.175Z",
+    "createdAt": "2026-09-06T04:59:24.003Z",
+    "id": "task_1788670764003_agentcore_hub_backend_dev",
+    "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/392",
+    "startedAt": "2026-09-06T04:59:24.683Z",
+    "status": "complete",
+    "ticketId": "TEAM-4129"
+   },
+   "TEAM-4130": {
+    "agentId": "agentcore_hub_backend_dev",
+    "branch": "feature/TEAM-4130-backend-dev",
+    "commitSha": "89e6154f9b2a428a84f7c44e6a3fe85f65c71355",
+    "completedAt": "2026-09-06T06:24:00.396Z",
+    "createdAt": "2026-09-06T05:00:03.407Z",
+    "id": "task_1788670803407_agentcore_hub_backend_dev",
+    "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/393",
+    "startedAt": "2026-09-06T05:31:28.632Z",
+    "status": "complete",
+    "ticketId": "TEAM-4130"
+   },
+   "TEAM-4131": {
+    "agentId": "agentcore_hub_backend_dev",
+    "branch": "feature/TEAM-4131-backend-dev",
+    "commitSha": "df1ed195fa7e52ed267e5a88b3ca2c3f7455e384",
+    "completedAt": "2026-09-06T06:50:13.597Z",
+    "createdAt": "2026-09-06T05:00:41.446Z",
+    "id": "task_1788670841446_agentcore_hub_backend_dev",
+    "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/394",
+    "startedAt": "2026-09-06T06:24:01.795Z",
+    "status": "complete",
+    "ticketId": "TEAM-4131"
+   },
+   "TEAM-4155": {
+    "agentId": "agentcore_hub_backend_dev",
+    "branch": "feature/TEAM-4116--si-system-gate-escalation-event-integri",
+    "commitSha": "2ac9ba44401a391f18a857d2a7e1362ae76e9ec5",
+    "completedAt": "2026-09-06T07:42:38.973Z",
+    "createdAt": "2026-09-06T07:07:15.439Z",
+    "id": "task_1788678435439_agentcore_hub_backend_dev",
+    "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/397",
+    "startedAt": "2026-09-06T07:07:16.038Z",
+    "status": "complete",
+    "ticketId": "TEAM-4155"
+   },
+   "TEAM-4156": {
+    "agentId": "agentcore_hub_backend_dev",
+    "branch": "feature/TEAM-4156-backend-dev",
+    "commitSha": "7c2391ba5102a00695fc5d6e90baefaa0e45d994",
+    "completedAt": "2026-09-06T08:19:27.775Z",
+    "createdAt": "2026-09-06T07:08:03.077Z",
+    "id": "task_1788678483077_agentcore_hub_backend_dev",
+    "prUrl": "https://github.com/tycenjmccann/agentcore-hub/pull/398",
+    "startedAt": "2026-09-06T07:42:40.212Z",
+    "status": "complete",
+    "ticketId": "TEAM-4156"
+   },
+   "TEAM-4157": {
+    "agentId": "agentcore_hub_ci_agent",
+    "branch": "feature/TEAM-4116--si-system-gate-escalation-event-integri",
+    "commitSha": "7c2391ba5102a00695fc5d6e90baefaa0e45d994",
+    "completedAt": "2026-09-06T08:27:48.071Z",
+    "createdAt": "2026-09-06T07:08:45.379Z",
+    "id": "task_1788678525379_agentcore_hub_ci_agent",
+    "startedAt": "2026-09-06T08:19:29.191Z",
+    "status": "complete",
+    "ticketId": "TEAM-4157"
+   },
+   "TEAM-4158": {
+    "status": "running",
+    "id": "task_1788678527980_agentcore_hub_backend_dev",
+    "agentId": "agentcore_hub_backend_dev",
+    "startedAt": "2026-09-06T07:08:47.980Z",
+    "ticketId": "TEAM-4158"
+   }
+  },
+  "wmLastWatchAt": "2026-09-06T08:14:44.878Z"
+ },
+ "tickets": [
+  {
+   "ticketId": "TEAM-4117",
+   "status": "done",
+   "assignee": "agentcore_hub_requirements_analyst",
+   "blockedBy": [],
+   "updatedAt": "2026-09-05T13:07:30.414-0700",
+   "title": "Requirements: agentcore_hub_requirements_analyst \u2014 [SI] system: gate/escalation event integrity, CI certification preflight, harness-enforce",
+   "type": "task",
+   "parentId": "TEAM-4116",
+   "createdAt": "2026-09-05T12:40:59.600-0700"
+  },
+  {
+   "ticketId": "TEAM-4118",
+   "status": "done",
+   "assignee": "agentcore_hub_backend_designer",
+   "blockedBy": [],
+   "updatedAt": "2026-09-05T13:47:36.114-0700",
+   "title": "Design: gate state machine, deterministic event ids, fix-ticket contract schema, CI reachability probe, dead-session escalation tree",
+   "type": "task",
+   "parentId": "TEAM-4116",
+   "createdAt": "2026-09-05T13:02:26.053-0700"
+  },
+  {
+   "ticketId": "TEAM-4119",
+   "status": "done",
+   "assignee": "agentcore_hub_security_reviewer",
+   "blockedBy": [
+    "TEAM-4118"
+   ],
+   "updatedAt": "2026-09-05T14:07:35.178-0700",
+   "title": "Security review: IAM grants for CodeBuild start/read, pipeline-tools trigger tool, Telegram escalation content",
+   "type": "task",
+   "parentId": "TEAM-4116",
+   "createdAt": "2026-09-05T13:02:45.131-0700"
+  },
+  {
+   "ticketId": "TEAM-4120",
+   "status": "done",
+   "assignee": "agentcore_hub_backend_dev",
+   "blockedBy": [
+    "TEAM-4118",
+    "TEAM-4119"
+   ],
+   "updatedAt": "2026-09-05T16:32:32.491-0700",
+   "title": "Dev A (P0): D1 gate/escalation event integrity \u2014 gate state guard, deterministic event ids, actionable dead-session escalation",
+   "type": "task",
+   "parentId": "TEAM-4116",
+   "createdAt": "2026-09-05T13:03:24.539-0700"
+  },
+  {
+   "ticketId": "TEAM-4121",
+   "status": "done",
+   "assignee": "agentcore_hub_backend_dev",
+   "blockedBy": [
+    "TEAM-4120"
+   ],
+   "updatedAt": "2026-09-05T18:56:46.010-0700",
+   "title": "Dev B (P1): D3 harness-enforced fix-ticket contract, live re-verify wiring, metrics lineage",
+   "type": "task",
+   "parentId": "TEAM-4116",
+   "createdAt": "2026-09-05T13:03:59.426-0700"
+  },
+  {
+   "ticketId": "TEAM-4122",
+   "status": "done",
+   "assignee": "agentcore_hub_backend_dev",
+   "blockedBy": [
+    "TEAM-4121"
+   ],
+   "updatedAt": "2026-09-05T21:34:06.897-0700",
+   "title": "Dev C (P1): D2 CI certification preflight \u2014 CodeBuild start tool + IaC flags, CI reachability check, sync-main before CI, advisory branch ro",
+   "type": "task",
+   "parentId": "TEAM-4116",
+   "createdAt": "2026-09-05T13:04:34.632-0700"
+  },
+  {
+   "ticketId": "TEAM-4123",
+   "status": "done",
+   "assignee": "agentcore_hub_code_reviewer",
+   "blockedBy": [
+    "TEAM-4120",
+    "TEAM-4121",
+    "TEAM-4122"
+   ],
+   "updatedAt": "2026-09-05T22:01:36.283-0700",
+   "title": "Review: gate/escalation event integrity, CI certification preflight, fix-ticket contract",
+   "type": "task",
+   "parentId": "TEAM-4116",
+   "createdAt": "2026-09-05T13:04:57.956-0700"
+  },
+  {
+   "ticketId": "TEAM-4124",
+   "status": "done",
+   "assignee": "agentcore_hub_qa_verifier",
+   "blockedBy": [
+    "TEAM-4123"
+   ],
+   "updatedAt": "2026-09-05T23:44:26.583-0700",
+   "title": "QA: Verify gate/escalation integrity, CI preflight, fix-ticket contract on the shared branch",
+   "type": "task",
+   "parentId": "TEAM-4116",
+   "createdAt": "2026-09-05T13:05:22.624-0700"
+  },
+  {
+   "ticketId": "TEAM-4125",
+   "status": "done",
+   "assignee": "agentcore_hub_ci_agent",
+   "blockedBy": [
+    "TEAM-4124"
+   ],
+   "updatedAt": "2026-09-05T23:53:01.373-0700",
+   "title": "CI: Validate build and tests for gate/escalation integrity, CI preflight, fix-ticket contract",
+   "type": "task",
+   "parentId": "TEAM-4116",
+   "createdAt": "2026-09-05T13:05:40.875-0700"
+  },
+  {
+   "ticketId": "TEAM-4126",
+   "status": "done",
+   "assignee": "agentcore_hub_release_manager",
+   "blockedBy": [
+    "TEAM-4125"
+   ],
+   "updatedAt": "2026-09-06T13:13:57.689-0700",
+   "title": "Ship: gate/escalation event integrity, CI certification preflight, harness-enforced fix-ticket contract",
+   "type": "task",
+   "parentId": "TEAM-4116",
+   "createdAt": "2026-09-05T13:06:00.951-0700"
+  },
+  {
+   "ticketId": "TEAM-4129",
+   "status": "done",
+   "assignee": "agentcore_hub_backend_dev",
+   "blockedBy": [],
+   "updatedAt": "2026-09-05T22:31:25.976-0700",
+   "title": "Fix (review): dead-session-escalation + gate-state guard + anomaly-watcher CI \u2014 3 findings",
+   "type": "task",
+   "parentId": "TEAM-4116",
+   "createdAt": "2026-09-05T21:59:22.374-0700"
+  },
+  {
+   "ticketId": "TEAM-4130",
+   "status": "done",
+   "assignee": "agentcore_hub_backend_dev",
+   "blockedBy": [
+    "TEAM-4129"
+   ],
+   "updatedAt": "2026-09-05T23:23:59.090-0700",
+   "title": "Fix (review): live-reverify ship blocking + re-verify idempotency + buildspec parity guard \u2014 3 findings",
+   "type": "task",
+   "parentId": "TEAM-4116",
+   "createdAt": "2026-09-05T22:00:01.799-0700"
+  },
+  {
+   "ticketId": "TEAM-4131",
+   "status": "done",
+   "assignee": "agentcore_hub_backend_dev",
+   "blockedBy": [
+    "TEAM-4130"
+   ],
+   "updatedAt": "2026-09-05T23:50:12.483-0700",
+   "title": "Fix (review): sync-main closed-fix reuse + advisory-label gate bypass \u2014 2 findings",
+   "type": "task",
+   "parentId": "TEAM-4116",
+   "createdAt": "2026-09-05T22:00:39.579-0700"
+  },
+  {
+   "ticketId": "TEAM-4155",
+   "status": "done",
+   "assignee": "agentcore_hub_backend_dev",
+   "blockedBy": [],
+   "updatedAt": "2026-09-06T00:42:37.723-0700",
+   "title": "Fix (ship-review r1): merge origin/main (#389-#391) into the shared branch \u2014 PR #395 is mergeable_state dirty (deploy.sh zip line + index.mj",
+   "type": "task",
+   "parentId": "TEAM-4116",
+   "createdAt": "2026-09-06T00:07:13.882-0700",
+   "fixContract": {
+    "version": "1",
+    "kind": "ship_fix",
+    "origin": "TEAM-4126",
+    "round": "1",
+    "finding": "F4",
+    "severity": "P1",
+    "evidence_source": "static"
+   },
+   "spawnedBy": {
+    "kind": "ship_fix",
+    "shipTicketId": "TEAM-4126",
+    "round": 1
+   }
+  },
+  {
+   "ticketId": "TEAM-4156",
+   "status": "done",
+   "assignee": "agentcore_hub_backend_dev",
+   "blockedBy": [
+    "TEAM-4155"
+   ],
+   "updatedAt": "2026-09-06T01:19:26.524-0700",
+   "title": "Fix (ship-review r1): Jira create_ticket returns { ticketId } but sync-main / live-reverify / dead-session-escalation read .key \u2014 all three ",
+   "type": "task",
+   "parentId": "TEAM-4116",
+   "createdAt": "2026-09-06T00:08:00.785-0700",
+   "fixContract": {
+    "version": "1",
+    "kind": "ship_fix",
+    "origin": "TEAM-4126",
+    "round": "1",
+    "finding": "F1 (P1) + F2 (P2), same component",
+    "severity": "P1",
+    "evidence_source": "unit"
+   },
+   "spawnedBy": {
+    "kind": "ship_fix",
+    "shipTicketId": "TEAM-4126",
+    "round": 1
+   }
+  },
+  {
+   "ticketId": "TEAM-4157",
+   "status": "done",
+   "assignee": "agentcore_hub_ci_agent",
+   "blockedBy": [
+    "TEAM-4155",
+    "TEAM-4156"
+   ],
+   "updatedAt": "2026-09-06T01:27:47.066-0700",
+   "title": "Fix (CI): re-certify the shared branch head after ship-review r1 fixes (TEAM-4155, TEAM-4156) \u2014 SHA cross-check for round 2",
+   "type": "task",
+   "parentId": "TEAM-4116",
+   "createdAt": "2026-09-06T00:08:44.063-0700",
+   "fixContract": {
+    "version": "1",
+    "kind": "ci_fix",
+    "origin": "TEAM-4125",
+    "round": "1",
+    "evidence_source": "unit"
+   },
+   "spawnedBy": {
+    "kind": "ci_fix",
+    "ciTicketId": "TEAM-4125",
+    "round": 1
+   }
+  },
+  {
+   "ticketId": "TEAM-4158",
+   "status": "done",
+   "assignee": "agentcore_hub_backend_dev",
+   "blockedBy": [],
+   "updatedAt": "2026-09-06T00:33:28.884-0700",
+   "title": "Advisory: Telegram scanManagerEscalations sends raw notif.details unredacted on the generic escalation branch (pre-existing on main; off-mai",
+   "type": "task",
+   "createdAt": "2026-09-06T00:08:46.222-0700",
+   "fixContract": {
+    "version": "1",
+    "kind": "advisory",
+    "origin": "TEAM-4126",
+    "severity": "P2",
+    "evidence_source": "static"
+   }
+  },
+  {
+   "ticketId": "TEAM-4116",
+   "status": "done",
+   "blockedBy": [],
+   "updatedAt": "2026-09-06T14:07:57.164-0700",
+   "title": "[SI] system: gate/escalation event integrity, CI certification preflight, harness-enforced fix-ticket contract",
+   "type": "epic",
+   "createdAt": "2026-09-05T12:40:58.327-0700"
+  }
+ ],
+ "events": [
+  {
+   "eventId": "0mtosg0fv-0000",
+   "type": "ticket.created",
+   "timestamp": "2026-09-05T19:41:01.534Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "timestamp": "2026-09-05T19:41:01.534Z",
+    "ticketId": "TEAM-4117",
+    "workflowId": "wf_1788637257831_f50ucz"
+   }
+  },
+  {
+   "eventId": "0mtosg4ye-0000",
+   "type": "agent.invoked",
+   "timestamp": "2026-09-05T19:41:08.107Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "assignee": "agentcore_hub_requirements_analyst",
+    "phase": "requirements",
+    "ticketId": "TEAM-4117",
+    "timestamp": "2026-09-05T19:41:08.107Z",
+    "workflowId": "wf_1788637257831_f50ucz",
+    "agentId": "agentcore_hub_requirements_analyst"
+   }
+  },
+  {
+   "eventId": "0mtosg520-0000",
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-05T19:41:08.199Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "ticketId": "TEAM-4117",
+    "workflowId": "wf_1788637257831_f50ucz",
+    "agentId": "agentcore_hub_requirements_analyst",
+    "timestamp": "2026-09-05T19:41:08.199Z"
+   }
+  },
+  {
+   "eventId": "0mtosg5c8-0000",
+   "type": "agent.started",
+   "timestamp": "2026-09-05T19:41:08.565Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "TEAM-4117",
+   "detail": {
+    "timestamp": "2026-09-05T19:41:08.565Z",
+    "ticketId": "TEAM-4117",
+    "agentId": "agentcore_hub_requirements_analyst",
+    "assignee": "agentcore_hub_requirements_analyst"
+   }
+  },
+  {
+   "eventId": "1788637272727-lhao",
+   "type": "agent.started",
+   "timestamp": "2026-09-05T19:41:12Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "agentId": "agentcore_hub_requirements_analyst",
+    "workflowId": "wf_1788637257831_f50ucz",
+    "timestamp": "2026-09-05T19:41:12Z"
+   }
+  },
+  {
+   "eventId": "1788638289666-wm-qxyk",
+   "type": "manager.intervention",
+   "timestamp": "2026-09-05T19:58:09.666230Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "action": "comment",
+    "by": "workflow-manager",
+    "ticketId": "TEAM-4117",
+    "note": "Watch-triage 19:57Z: requirements_analyst silent since 19:42:40Z (lastText 'Let me gather context in parallel'). Session ..._1788637268139 spans: last chat span OK 19:44:03Z (110s), orchestrator stream closed 19:44:38Z; "
+   }
+  },
+  {
+   "eventId": "0mtot7l1y-0000",
+   "type": "ticket.created",
+   "timestamp": "2026-09-05T20:02:27.926Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "timestamp": "2026-09-05T20:02:27.926Z",
+    "workflowId": "wf_1788637257831_f50ucz",
+    "ticketId": "TEAM-4118"
+   }
+  },
+  {
+   "eventId": "0mtot7m4j-0000",
+   "type": "workflow.phase_change",
+   "timestamp": "2026-09-05T20:02:29.078Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "phase": "design",
+    "ticketId": "TEAM-4118",
+    "timestamp": "2026-09-05T20:02:29.078Z",
+    "workflowId": "wf_1788637257831_f50ucz"
+   }
+  },
+  {
+   "eventId": "0mtot7lse-0000",
+   "type": "agent.invoked",
+   "timestamp": "2026-09-05T20:02:29.496Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "phase": "design",
+    "workflowId": "wf_1788637257831_f50ucz",
+    "timestamp": "2026-09-05T20:02:29.496Z",
+    "agentId": "agentcore_hub_backend_designer",
+    "ticketId": "TEAM-4118",
+    "assignee": "agentcore_hub_backend_designer"
+   }
+  },
+  {
+   "eventId": "0mtot7lwq-0000",
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-05T20:02:29.817Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "timestamp": "2026-09-05T20:02:29.817Z",
+    "ticketId": "TEAM-4118",
+    "agentId": "agentcore_hub_backend_designer",
+    "workflowId": "wf_1788637257831_f50ucz"
+   }
+  },
+  {
+   "eventId": "0mtot7mc0-0000",
+   "type": "agent.started",
+   "timestamp": "2026-09-05T20:02:30.359Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "TEAM-4118",
+   "detail": {
+    "timestamp": "2026-09-05T20:02:30.359Z",
+    "ticketId": "TEAM-4118",
+    "assignee": "agentcore_hub_backend_designer",
+    "agentId": "agentcore_hub_backend_designer"
+   }
+  },
+  {
+   "eventId": "1788638554841-vfax",
+   "type": "agent.started",
+   "timestamp": "2026-09-05T20:02:34Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "workflowId": "wf_1788637257831_f50ucz",
+    "timestamp": "2026-09-05T20:02:34Z",
+    "agentId": "agentcore_hub_backend_designer"
+   }
+  },
+  {
+   "eventId": "0mtot7yxa-0000",
+   "type": "ticket.created",
+   "timestamp": "2026-09-05T20:02:46.639Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "workflowId": "wf_1788637257831_f50ucz",
+    "timestamp": "2026-09-05T20:02:46.639Z",
+    "ticketId": "TEAM-4119"
+   }
+  },
+  {
+   "eventId": "0mtot8to9-0000",
+   "type": "ticket.created",
+   "timestamp": "2026-09-05T20:03:26.300Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "timestamp": "2026-09-05T20:03:26.300Z",
+    "ticketId": "TEAM-4120",
+    "workflowId": "wf_1788637257831_f50ucz"
+   }
+  },
+  {
+   "eventId": "0mtot9khs-0000",
+   "type": "ticket.created",
+   "timestamp": "2026-09-05T20:04:01.176Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "workflowId": "wf_1788637257831_f50ucz",
+    "timestamp": "2026-09-05T20:04:01.176Z",
+    "ticketId": "TEAM-4121"
+   }
+  },
+  {
+   "eventId": "0mtotabld-0000",
+   "type": "ticket.created",
+   "timestamp": "2026-09-05T20:04:36.282Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "ticketId": "TEAM-4122",
+    "workflowId": "wf_1788637257831_f50ucz",
+    "timestamp": "2026-09-05T20:04:36.282Z"
+   }
+  },
+  {
+   "eventId": "0mtotatgv-0000",
+   "type": "ticket.created",
+   "timestamp": "2026-09-05T20:04:59.548Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "ticketId": "TEAM-4123",
+    "workflowId": "wf_1788637257831_f50ucz",
+    "timestamp": "2026-09-05T20:04:59.548Z"
+   }
+  },
+  {
+   "eventId": "0mtotbcpt-0000",
+   "type": "ticket.created",
+   "timestamp": "2026-09-05T20:05:24.305Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "timestamp": "2026-09-05T20:05:24.305Z",
+    "workflowId": "wf_1788637257831_f50ucz",
+    "ticketId": "TEAM-4124"
+   }
+  },
+  {
+   "eventId": "0mtotbqns-0000",
+   "type": "ticket.created",
+   "timestamp": "2026-09-05T20:05:42.376Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "ticketId": "TEAM-4125",
+    "workflowId": "wf_1788637257831_f50ucz",
+    "timestamp": "2026-09-05T20:05:42.376Z"
+   }
+  },
+  {
+   "eventId": "0mtotc6kn-0000",
+   "type": "ticket.created",
+   "timestamp": "2026-09-05T20:06:03.124Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "workflowId": "wf_1788637257831_f50ucz",
+    "ticketId": "TEAM-4126",
+    "timestamp": "2026-09-05T20:06:03.124Z"
+   }
+  },
+  {
+   "eventId": "1788638849530-mq93",
+   "type": "workflow.report_completion",
+   "timestamp": "2026-09-05T20:07:29.531Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "ticketId": "TEAM-4117",
+    "agentId": "agentcore_hub_requirements_analyst",
+    "branch": null,
+    "pr_url": null
+   }
+  },
+  {
+   "eventId": "0mtote38f-0000",
+   "type": "agent.complete",
+   "timestamp": "2026-09-05T20:07:32.137Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "assignee": "agentcore_hub_requirements_analyst",
+    "workflowId": "wf_1788637257831_f50ucz",
+    "agentId": "agentcore_hub_requirements_analyst",
+    "unblocked": [],
+    "timestamp": "2026-09-05T20:07:32.137Z",
+    "ticketId": "TEAM-4117"
+   }
+  },
+  {
+   "eventId": "1788639815103-wm-gc0a",
+   "type": "manager.intervention",
+   "timestamp": "2026-09-05T20:23:35.103208Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "ticketId": "TEAM-4118",
+    "by": "workflow-manager",
+    "action": "comment",
+    "note": "Watch-triage 20:23Z: backend_designer stream silent since 20:03:08Z (lastText 'Reading the requirements and manifest'), ~19 min. Session ..._1788638549556 alive: 40 idle runtime pings (~120ms) 20:06:12Z\u219220:19:17Z, no err"
+   }
+  },
+  {
+   "eventId": "1788640632663-wm-pl8k",
+   "type": "manager.intervention",
+   "timestamp": "2026-09-05T20:37:12.663391Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "action": "comment",
+    "by": "workflow-manager",
+    "note": "Watch-triage 20:36Z: backend_designer ALIVE and progressing. Stream advanced 20:03:08Z -> 20:21:09Z since last pass; lastText 'Part 1 is strong and well-anchored. Launching Part 2 (FR-8, FR-9, FR-5, FR-4) in the same wor",
+    "ticketId": "TEAM-4118"
+   }
+  },
+  {
+   "eventId": "1788641253594-o955",
+   "type": "workflow.report_completion",
+   "timestamp": "2026-09-05T20:47:33.594Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "branch": null,
+    "ticketId": "TEAM-4118",
+    "agentId": "agentcore_hub_backend_designer",
+    "pr_url": null
+   }
+  },
+  {
+   "eventId": "0mtoutp8t-0000",
+   "type": "agent.invoked",
+   "timestamp": "2026-09-05T20:47:39.535Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "phase": "design",
+    "ticketId": "TEAM-4119",
+    "workflowId": "wf_1788637257831_f50ucz",
+    "assignee": "agentcore_hub_security_reviewer",
+    "timestamp": "2026-09-05T20:47:39.535Z",
+    "agentId": "agentcore_hub_security_reviewer"
+   }
+  },
+  {
+   "eventId": "0mtoutpd1-0000",
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-05T20:47:39.679Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "agentId": "agentcore_hub_security_reviewer",
+    "ticketId": "TEAM-4119",
+    "workflowId": "wf_1788637257831_f50ucz",
+    "timestamp": "2026-09-05T20:47:39.679Z"
+   }
+  },
+  {
+   "eventId": "0mtoutpuw-0000",
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-09-05T20:47:40.337Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "unblockedBy": "TEAM-4118",
+    "timestamp": "2026-09-05T20:47:40.337Z",
+    "ticketId": "TEAM-4119",
+    "workflowId": "wf_1788637257831_f50ucz"
+   }
+  },
+  {
+   "eventId": "0mtoutpvj-0000",
+   "type": "agent.complete",
+   "timestamp": "2026-09-05T20:47:40.369Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "agentId": "agentcore_hub_backend_designer",
+    "timestamp": "2026-09-05T20:47:40.369Z",
+    "assignee": "agentcore_hub_backend_designer",
+    "unblocked": [
+     "TEAM-4119"
+    ],
+    "workflowId": "wf_1788637257831_f50ucz",
+    "ticketId": "TEAM-4118"
+   }
+  },
+  {
+   "eventId": "0mtoutpzw-0000",
+   "type": "agent.started",
+   "timestamp": "2026-09-05T20:47:41.131Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "TEAM-4119",
+   "detail": {
+    "timestamp": "2026-09-05T20:47:41.131Z",
+    "agentId": "agentcore_hub_security_reviewer",
+    "ticketId": "TEAM-4119",
+    "assignee": "agentcore_hub_security_reviewer"
+   }
+  },
+  {
+   "eventId": "1788641262810-svck",
+   "type": "agent.started",
+   "timestamp": "2026-09-05T20:47:42Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "timestamp": "2026-09-05T20:47:42Z",
+    "agentId": "agentcore_hub_security_reviewer",
+    "workflowId": "wf_1788637257831_f50ucz"
+   }
+  },
+  {
+   "eventId": "1788642155080-wm-jrxu",
+   "type": "manager.intervention",
+   "timestamp": "2026-09-05T21:02:35.080288Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "note": "Watch-triage 21:00Z: security_reviewer stream silent since 20:47:54Z (lastText 'loading my blueprint, then gather the upstream artifacts'). Session ...1788641259588: S3 reads + event_loop_cycle OK at 20:47:48Z, then ONLY",
+    "action": "comment",
+    "by": "workflow-manager",
+    "ticketId": "TEAM-4119"
+   }
+  },
+  {
+   "eventId": "1788642454048-n5hm",
+   "type": "workflow.report_completion",
+   "timestamp": "2026-09-05T21:07:34.048Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "ticketId": "TEAM-4119",
+    "branch": null,
+    "agentId": "agentcore_hub_security_reviewer",
+    "pr_url": null
+   }
+  },
+  {
+   "eventId": "0mtovjeu2-0000",
+   "type": "workflow.phase_change",
+   "timestamp": "2026-09-05T21:07:38.820Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "timestamp": "2026-09-05T21:07:38.820Z",
+    "phase": "development",
+    "workflowId": "wf_1788637257831_f50ucz",
+    "ticketId": "TEAM-4120"
+   }
+  },
+  {
+   "eventId": "0mtovjff2-0000",
+   "type": "agent.invoked",
+   "timestamp": "2026-09-05T21:07:39.786Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "agentId": "agentcore_hub_backend_dev",
+    "ticketId": "TEAM-4120",
+    "phase": "development",
+    "timestamp": "2026-09-05T21:07:39.786Z",
+    "assignee": "agentcore_hub_backend_dev",
+    "workflowId": "wf_1788637257831_f50ucz"
+   }
+  },
+  {
+   "eventId": "0mtovjfhp-0000",
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-05T21:07:39.951Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "workflowId": "wf_1788637257831_f50ucz",
+    "timestamp": "2026-09-05T21:07:39.951Z",
+    "agentId": "agentcore_hub_backend_dev",
+    "ticketId": "TEAM-4120"
+   }
+  },
+  {
+   "eventId": "0mtovjfmj-0000",
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-09-05T21:07:40.165Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "timestamp": "2026-09-05T21:07:40.165Z",
+    "unblockedBy": "TEAM-4119",
+    "ticketId": "TEAM-4120",
+    "workflowId": "wf_1788637257831_f50ucz"
+   }
+  },
+  {
+   "eventId": "0mtovjfpn-0000",
+   "type": "agent.complete",
+   "timestamp": "2026-09-05T21:07:40.205Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "ticketId": "TEAM-4119",
+    "unblocked": [
+     "TEAM-4120"
+    ],
+    "workflowId": "wf_1788637257831_f50ucz",
+    "agentId": "agentcore_hub_security_reviewer",
+    "timestamp": "2026-09-05T21:07:40.205Z",
+    "assignee": "agentcore_hub_security_reviewer"
+   }
+  },
+  {
+   "eventId": "0mtovjfxg-0000",
+   "type": "agent.started",
+   "timestamp": "2026-09-05T21:07:41.125Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "TEAM-4120",
+   "detail": {
+    "ticketId": "TEAM-4120",
+    "assignee": "agentcore_hub_backend_dev",
+    "agentId": "agentcore_hub_backend_dev",
+    "timestamp": "2026-09-05T21:07:41.125Z"
+   }
+  },
+  {
+   "eventId": "1788642464059-oigt",
+   "type": "agent.started",
+   "timestamp": "2026-09-05T21:07:44Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "timestamp": "2026-09-05T21:07:44Z",
+    "agentId": "agentcore_hub_backend_dev",
+    "workflowId": "wf_1788637257831_f50ucz"
+   }
+  },
+  {
+   "eventId": "1788643601533-wm-zoef",
+   "type": "manager.intervention",
+   "timestamp": "2026-09-05T21:26:41.533264Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "note": "Watch-triage 21:26Z: backend_dev stream silent since 21:13:14Z (~13 min), lastText 'Fixtures staged. Now delegating \u2014 Call 1: repo setup + FR-2 producer side (deterministic event ids across the three writers)' \u2014 i.e. a l",
+    "action": "comment",
+    "ticketId": "TEAM-4120",
+    "by": "workflow-manager"
+   }
+  },
+  {
+   "eventId": "1788644830978-wm-7nq8",
+   "type": "manager.intervention",
+   "timestamp": "2026-09-05T21:47:10.978361Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "action": "comment",
+    "ticketId": "TEAM-4120",
+    "by": "workflow-manager",
+    "note": "Watch-triage 21:46Z: backend_dev ALIVE and progressing \u2014 stream advanced 21:13:14Z -> 21:33:16Z since last pass (Call 1 'repo setup + FR-2 producer side' finished; lastText 'Call 2: FR-2 consumer side (toolkit dedupe + m"
+   }
+  },
+  {
+   "eventId": "1788645703569-wm-d6c2",
+   "type": "manager.intervention",
+   "timestamp": "2026-09-05T22:01:43.569814Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "ticketId": "TEAM-4120",
+    "by": "workflow-manager",
+    "note": "Watch-triage 22:01Z: backend_dev ALIVE and progressing \u2014 stream advanced 21:33:16Z -> 21:50:27Z since last pass. Call 2 (FR-2 consumer side) finished: lastText 'FR-2 complete with exact acceptance numbers. Call 3: FR-1 g",
+    "action": "comment"
+   }
+  },
+  {
+   "eventId": "1788645881262-err-501609",
+   "type": "agent.error",
+   "timestamp": "2026-09-05T22:04:41.501609Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "agentId": "agentcore_hub_backend_dev",
+    "workflowId": "wf_1788637257831_f50ucz",
+    "ticketId": "TEAM-4120",
+    "error": "remote claude turn failed: claude exited 1: "
+   }
+  },
+  {
+   "eventId": "1788646932712-wm-7dtf",
+   "type": "manager.intervention",
+   "timestamp": "2026-09-05T22:22:12.712174Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "note": "Watch-triage 22:21Z: backend_dev ALIVE and progressing \u2014 stream advanced 21:50:27Z -> 22:14:33Z since last pass. Call 3 (FR-1 gate state guard) finished: claude_code span OK 543,661ms at 22:14:28Z; lastText 'FR-1 landed.",
+    "by": "workflow-manager",
+    "ticketId": "TEAM-4120",
+    "action": "comment"
+   }
+  },
+  {
+   "eventId": "1788648093031-wm-0v2h",
+   "type": "manager.intervention",
+   "timestamp": "2026-09-05T22:41:33.031920Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "action": "comment",
+    "ticketId": "TEAM-4120",
+    "note": "Watch-triage 22:41Z: backend_dev ALIVE and progressing \u2014 stream advanced 22:14:33Z -> 22:38:26Z since last pass. Call 5 (FR-3 escalation module + wiring) finished: claude_code span OK 624,122ms at 22:38:19Z, chat turn OK",
+    "by": "workflow-manager"
+   }
+  },
+  {
+   "eventId": "1788649280796-wm-rsdy",
+   "type": "manager.intervention",
+   "timestamp": "2026-09-05T23:01:20.796612Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "action": "comment",
+    "ticketId": "TEAM-4120",
+    "note": "Watch-triage 23:01Z: backend_dev ALIVE and progressing \u2014 stream advanced to 22:38:26Z (Call 5 FR-3 escalation module done, span OK 624s). Call 6 (FR-3 unit tests, lease tests, emitter hook regressions, Telegram DEAD SESS",
+    "by": "workflow-manager"
+   }
+  },
+  {
+   "eventId": "1788650201172-wm-he9h",
+   "type": "manager.intervention",
+   "timestamp": "2026-09-05T23:16:41.172453Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "by": "workflow-manager",
+    "ticketId": "TEAM-4120",
+    "note": "Watch-triage 23:16Z: backend_dev ALIVE and progressing \u2014 stream advanced 22:38:26Z -> 23:10:54Z since last pass. Calls 6 (FR-3 tests) and 7 (FR-3 acceptance replay of yteqfl 06:51-07:36Z slice) finished; lastText 'All th",
+    "action": "comment"
+   }
+  },
+  {
+   "eventId": "1788651149859-owla",
+   "type": "workflow.report_completion",
+   "timestamp": "2026-09-05T23:32:29.859Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "agentId": "agentcore_hub_backend_dev",
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/386",
+    "ticketId": "TEAM-4120",
+    "branch": "feature/TEAM-4120-backend-dev"
+   }
+  },
+  {
+   "eventId": "0mtp0ptw7-0000",
+   "type": "agent.invoked",
+   "timestamp": "2026-09-05T23:32:36.262Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "timestamp": "2026-09-05T23:32:36.262Z",
+    "phase": "development",
+    "workflowId": "wf_1788637257831_f50ucz",
+    "assignee": "agentcore_hub_backend_dev",
+    "ticketId": "TEAM-4121",
+    "agentId": "agentcore_hub_backend_dev"
+   }
+  },
+  {
+   "eventId": "0mtp0pu1v-0000",
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-05T23:32:36.771Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "timestamp": "2026-09-05T23:32:36.771Z",
+    "agentId": "agentcore_hub_backend_dev",
+    "ticketId": "TEAM-4121",
+    "workflowId": "wf_1788637257831_f50ucz"
+   }
+  },
+  {
+   "eventId": "0mtp0puiq-0000",
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-09-05T23:32:37.521Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "ticketId": "TEAM-4121",
+    "unblockedBy": "TEAM-4120",
+    "timestamp": "2026-09-05T23:32:37.521Z",
+    "workflowId": "wf_1788637257831_f50ucz"
+   }
+  },
+  {
+   "eventId": "0mtp0puke-0000",
+   "type": "agent.complete",
+   "timestamp": "2026-09-05T23:32:37.580Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "unblocked": [
+     "TEAM-4121"
+    ],
+    "ticketId": "TEAM-4120",
+    "timestamp": "2026-09-05T23:32:37.580Z",
+    "workflowId": "wf_1788637257831_f50ucz",
+    "assignee": "agentcore_hub_backend_dev",
+    "agentId": "agentcore_hub_backend_dev"
+   }
+  },
+  {
+   "eventId": "0mtp0putk-0000",
+   "type": "agent.started",
+   "timestamp": "2026-09-05T23:32:38.475Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "TEAM-4121",
+   "detail": {
+    "timestamp": "2026-09-05T23:32:38.475Z",
+    "ticketId": "TEAM-4121",
+    "assignee": "agentcore_hub_backend_dev",
+    "agentId": "agentcore_hub_backend_dev"
+   }
+  },
+  {
+   "eventId": "1788651161008-rubq",
+   "type": "agent.started",
+   "timestamp": "2026-09-05T23:32:40Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "agentId": "agentcore_hub_backend_dev",
+    "workflowId": "wf_1788637257831_f50ucz",
+    "timestamp": "2026-09-05T23:32:40Z"
+   }
+  },
+  {
+   "eventId": "1788652047542-wm-pzt6",
+   "type": "manager.intervention",
+   "timestamp": "2026-09-05T23:47:27.542270Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "ticketId": "TEAM-4121",
+    "action": "comment",
+    "by": "workflow-manager",
+    "note": "Watch-triage 23:47Z: NOT a stall. The 12-min 'silence' is the Dev A\u2192Dev B handoff: TEAM-4120 completed 23:32:29Z (PR #386 opened, CI green on 6f6357a, merged to integration branch), orchestrator unblocked+dispatched TEAM"
+   }
+  },
+  {
+   "eventId": "1788653214574-wm-plou",
+   "type": "manager.intervention",
+   "timestamp": "2026-09-06T00:06:54.574581Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "by": "workflow-manager",
+    "action": "comment",
+    "ticketId": "TEAM-4121",
+    "note": "Watch-triage 00:06Z: NOT a stall \u2014 backend_dev on Dev B is ALIVE and mid-work. Session ...1788651156660: runtime pings continuous 23:32:40Z -> 00:04:33Z (40 spans, 110-150ms, zero error spans, no agent.error). lastText 2"
+   }
+  },
+  {
+   "eventId": "1788654061917-wm-zzxo",
+   "type": "manager.intervention",
+   "timestamp": "2026-09-06T00:21:01.917700Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "note": "Watch-triage 00:20Z: NOT a stall. backend_dev (Dev B) session ...1788651156660 is ALIVE \u2014 runtime spans every ~20s through 00:18:46Z, last streamed 00:10:20Z ('Call 3: FR-8 tests'), i.e. inside a long claude_code delegat",
+    "action": "comment",
+    "ticketId": "TEAM-4121",
+    "by": "workflow-manager"
+   }
+  },
+  {
+   "eventId": "1788655342737-wm-rol2",
+   "type": "manager.intervention",
+   "timestamp": "2026-09-06T00:42:22.737391Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "ticketId": "TEAM-4121",
+    "note": "Watch-triage 00:42Z: NOT a stall. backend_dev (Dev B, TEAM-4121) is ALIVE and progressing \u2014 stream advanced 00:10:20Z -> 00:30:34Z since last pass (Call 3 'FR-8 tests' finished; lastText 'FR-8 done. Now call 4: FR-9 live",
+    "action": "comment",
+    "by": "workflow-manager"
+   }
+  },
+  {
+   "eventId": "1788656156145-wm-staw",
+   "type": "manager.intervention",
+   "timestamp": "2026-09-06T00:55:56.145530Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "ticketId": "TEAM-4121",
+    "note": "Watch-triage 00:55Z: NOT a stall. backend_dev (Dev B) ALIVE and progressing \u2014 stream advanced 00:30:34Z -> 00:47:52Z since last pass (Call 4 'FR-9 live re-verify implementation' finished; lastText 'Call 5: FR-9 tests inc",
+    "action": "comment",
+    "by": "workflow-manager"
+   }
+  },
+  {
+   "eventId": "1788657047511-wm-i4y5",
+   "type": "manager.intervention",
+   "timestamp": "2026-09-06T01:10:47.511510Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "by": "workflow-manager",
+    "action": "comment",
+    "ticketId": "TEAM-4121",
+    "note": "Watch-triage 01:10Z: NOT a stall (6th consecutive no-op pass). backend_dev (Dev B) session ...1788651156660 ALIVE and progressing \u2014 stream advanced 00:47:52Z -> 01:07:50Z, now on Call 6/6 'FR-10 metrics lineage' after FR"
+   }
+  },
+  {
+   "eventId": "1788658272501-wm-6ksc",
+   "type": "manager.intervention",
+   "timestamp": "2026-09-06T01:31:12.501097Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "note": "Watch-triage 01:30Z: NOT a stall (7th consecutive no-op pass). backend_dev (Dev B) session ...1788651156660 ALIVE \u2014 CloudWatch span at 01:29:52Z (<1 min before check); stream advanced 00:47:52Z -> 01:07:50Z, now on Call ",
+    "ticketId": "TEAM-4121",
+    "by": "workflow-manager",
+    "action": "comment"
+   }
+  },
+  {
+   "eventId": "1788659803380-h49k",
+   "type": "workflow.report_completion",
+   "timestamp": "2026-09-06T01:56:43.380Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "branch": "feature/TEAM-4121-backend-dev",
+    "agentId": "agentcore_hub_backend_dev",
+    "ticketId": "TEAM-4121",
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/387"
+   }
+  },
+  {
+   "eventId": "0mtp5var7-0000",
+   "type": "agent.invoked",
+   "timestamp": "2026-09-06T01:56:49.737Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "assignee": "agentcore_hub_backend_dev",
+    "workflowId": "wf_1788637257831_f50ucz",
+    "ticketId": "TEAM-4122",
+    "agentId": "agentcore_hub_backend_dev",
+    "phase": "development",
+    "timestamp": "2026-09-06T01:56:49.737Z"
+   }
+  },
+  {
+   "eventId": "0mtp5vau8-0000",
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-06T01:56:49.957Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "agentId": "agentcore_hub_backend_dev",
+    "timestamp": "2026-09-06T01:56:49.957Z",
+    "ticketId": "TEAM-4122",
+    "workflowId": "wf_1788637257831_f50ucz"
+   }
+  },
+  {
+   "eventId": "0mtp5vbbl-0000",
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-09-06T01:56:50.655Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "timestamp": "2026-09-06T01:56:50.655Z",
+    "workflowId": "wf_1788637257831_f50ucz",
+    "ticketId": "TEAM-4122",
+    "unblockedBy": "TEAM-4121"
+   }
+  },
+  {
+   "eventId": "0mtp5vbg0-0000",
+   "type": "agent.complete",
+   "timestamp": "2026-09-06T01:56:50.682Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "agentId": "agentcore_hub_backend_dev",
+    "assignee": "agentcore_hub_backend_dev",
+    "unblocked": [
+     "TEAM-4122"
+    ],
+    "timestamp": "2026-09-06T01:56:50.682Z",
+    "ticketId": "TEAM-4121",
+    "workflowId": "wf_1788637257831_f50ucz"
+   }
+  },
+  {
+   "eventId": "0mtp5vbnw-0000",
+   "type": "agent.started",
+   "timestamp": "2026-09-06T01:56:51.684Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "TEAM-4122",
+   "detail": {
+    "timestamp": "2026-09-06T01:56:51.684Z",
+    "assignee": "agentcore_hub_backend_dev",
+    "agentId": "agentcore_hub_backend_dev",
+    "ticketId": "TEAM-4122"
+   }
+  },
+  {
+   "eventId": "1788659813165-nblv",
+   "type": "agent.started",
+   "timestamp": "2026-09-06T01:56:53Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "timestamp": "2026-09-06T01:56:53Z",
+    "workflowId": "wf_1788637257831_f50ucz",
+    "agentId": "agentcore_hub_backend_dev"
+   }
+  },
+  {
+   "eventId": "1788660699392-wm-6u4r",
+   "type": "manager.intervention",
+   "timestamp": "2026-09-06T02:11:39.392960Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "ticketId": "TEAM-4122",
+    "action": "comment",
+    "by": "workflow-manager",
+    "note": "Watch-triage 02:11Z: NOT a stall (8th consecutive no-op pass on this run's dev chain). backend_dev on Dev C (TEAM-4122) invoked 01:56:48Z after Dev B completed 01:56:43Z; lastText 01:57:40Z 'Now the requirements doc for "
+   }
+  },
+  {
+   "eventId": "1788662881767-err-447298",
+   "type": "agent.error",
+   "timestamp": "2026-09-06T02:48:01.447298Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "ticketId": "TEAM-4122",
+    "workflowId": "wf_1788637257831_f50ucz",
+    "agentId": "agentcore_hub_backend_dev",
+    "error": "remote claude turn failed: claude exited 1: "
+   }
+  },
+  {
+   "eventId": "1788663690941-wm-elff",
+   "type": "manager.intervention",
+   "timestamp": "2026-09-06T03:01:30.941286Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "note": "Watch-triage 03:01Z: NOT a stall (9th consecutive no-op pass on this run's dev chain). backend_dev on Dev C (TEAM-4122) is ALIVE \u2014 session ...1788659809856 runtime spans every ~20s through 02:59:28Z (<2 min before check)",
+    "action": "comment",
+    "by": "workflow-manager",
+    "ticketId": "TEAM-4122"
+   }
+  },
+  {
+   "eventId": "1788664932699-wm-faq8",
+   "type": "manager.intervention",
+   "timestamp": "2026-09-06T03:22:12.699564Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "by": "workflow-manager",
+    "ticketId": "TEAM-4122",
+    "action": "comment",
+    "note": "Watch-triage 03:21Z: NOT a stall (10th consecutive no-op pass on this run's dev chain). backend_dev on Dev C (TEAM-4122) ALIVE \u2014 lastText 03:15:00Z 'FR-5 done with two real bugs caught by tests. Now FR-6 (SYNC_MAIN_BEFOR"
+   }
+  },
+  {
+   "eventId": "1788665471557-err-306632",
+   "type": "agent.error",
+   "timestamp": "2026-09-06T03:31:11.306632Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "workflowId": "wf_1788637257831_f50ucz",
+    "agentId": "agentcore_hub_backend_dev",
+    "ticketId": "TEAM-4122",
+    "error": "remote claude turn failed: claude exited 1: "
+   }
+  },
+  {
+   "eventId": "1788666444675-wm-0o7h",
+   "type": "manager.intervention",
+   "timestamp": "2026-09-06T03:47:24.675500Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "action": "comment",
+    "by": "workflow-manager",
+    "note": "Watch-triage 03:47Z: NOT a stall (11th consecutive no-op pass on this run's dev chain). backend_dev on Dev C (TEAM-4122) ALIVE and progressing \u2014 stream advanced 03:15:00Z -> 03:37:23Z since last pass; lastText: 'FR-6 imp",
+    "ticketId": "TEAM-4122"
+   }
+  },
+  {
+   "eventId": "1788667631863-wm-m771",
+   "type": "manager.intervention",
+   "timestamp": "2026-09-06T04:07:11.863457Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "note": "Watch-triage 04:06Z: NOT a stall (12th consecutive no-op pass on this run's dev chain). backend_dev on Dev C (TEAM-4122) ALIVE and progressing \u2014 stream advanced 03:37:23Z -> 03:57:31Z since last pass; lastText: 'Excellen",
+    "ticketId": "TEAM-4122",
+    "action": "comment",
+    "by": "workflow-manager"
+   }
+  },
+  {
+   "eventId": "1788669244165-2ovh",
+   "type": "workflow.report_completion",
+   "timestamp": "2026-09-06T04:34:04.166Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "agentId": "agentcore_hub_backend_dev",
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/388",
+    "ticketId": "TEAM-4122",
+    "branch": "feature/TEAM-4122-backend-dev"
+   }
+  },
+  {
+   "eventId": "0mtpbhncn-0000",
+   "type": "agent.invoked",
+   "timestamp": "2026-09-06T04:34:10.498Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "phase": "review",
+    "workflowId": "wf_1788637257831_f50ucz",
+    "timestamp": "2026-09-06T04:34:10.498Z",
+    "ticketId": "TEAM-4123",
+    "assignee": "agentcore_hub_code_reviewer",
+    "agentId": "agentcore_hub_code_reviewer"
+   }
+  },
+  {
+   "eventId": "0mtpbhner-0000",
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-06T04:34:10.711Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "timestamp": "2026-09-06T04:34:10.711Z",
+    "agentId": "agentcore_hub_code_reviewer",
+    "ticketId": "TEAM-4123",
+    "workflowId": "wf_1788637257831_f50ucz"
+   }
+  },
+  {
+   "eventId": "0mtpbhned-0000",
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-09-06T04:34:10.822Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "ticketId": "TEAM-4123",
+    "timestamp": "2026-09-06T04:34:10.822Z",
+    "unblockedBy": "TEAM-4122",
+    "workflowId": "wf_1788637257831_f50ucz"
+   }
+  },
+  {
+   "eventId": "0mtpbhndr-0000",
+   "type": "agent.complete",
+   "timestamp": "2026-09-06T04:34:10.859Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "unblocked": [
+     "TEAM-4123"
+    ],
+    "agentId": "agentcore_hub_backend_dev",
+    "ticketId": "TEAM-4122",
+    "assignee": "agentcore_hub_backend_dev",
+    "workflowId": "wf_1788637257831_f50ucz",
+    "timestamp": "2026-09-06T04:34:10.859Z"
+   }
+  },
+  {
+   "eventId": "0mtpbho06-0000",
+   "type": "agent.started",
+   "timestamp": "2026-09-06T04:34:11.589Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "TEAM-4123",
+   "detail": {
+    "ticketId": "TEAM-4123",
+    "timestamp": "2026-09-06T04:34:11.589Z",
+    "assignee": "agentcore_hub_code_reviewer",
+    "agentId": "agentcore_hub_code_reviewer"
+   }
+  },
+  {
+   "eventId": "1788669254023-zpcm",
+   "type": "agent.started",
+   "timestamp": "2026-09-06T04:34:14Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "timestamp": "2026-09-06T04:34:14Z",
+    "agentId": "agentcore_hub_code_reviewer",
+    "workflowId": "wf_1788637257831_f50ucz"
+   }
+  },
+  {
+   "eventId": "1788669956534-wm-i9do",
+   "type": "manager.intervention",
+   "timestamp": "2026-09-06T04:45:56.534222Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "action": "comment",
+    "ticketId": "TEAM-4123",
+    "note": "Watch-triage 04:46Z: NOT a stall (13th consecutive no-op pass on this run). Dev chain finished: TEAM-4122 (Dev C) completed 04:34:08Z with PR #388 merged to integration branch (6282d52), evidence at shared/dev-evidence/T",
+    "by": "workflow-manager"
+   }
+  },
+  {
+   "eventId": "0mtpce3am-0000",
+   "type": "ticket.created",
+   "timestamp": "2026-09-06T04:59:24.257Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "ticketId": "TEAM-4129",
+    "timestamp": "2026-09-06T04:59:24.257Z",
+    "workflowId": "wf_1788637257831_f50ucz"
+   }
+  },
+  {
+   "eventId": "0mtpce40b-0000",
+   "type": "agent.invoked",
+   "timestamp": "2026-09-06T04:59:25.804Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "workflowId": "wf_1788637257831_f50ucz",
+    "assignee": "agentcore_hub_backend_dev",
+    "timestamp": "2026-09-06T04:59:25.804Z",
+    "ticketId": "TEAM-4129",
+    "phase": "development",
+    "agentId": "agentcore_hub_backend_dev"
+   }
+  },
+  {
+   "eventId": "0mtpce4h9-0000",
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-06T04:59:25.969Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "timestamp": "2026-09-06T04:59:25.969Z",
+    "agentId": "agentcore_hub_backend_dev",
+    "ticketId": "TEAM-4129",
+    "workflowId": "wf_1788637257831_f50ucz"
+   }
+  },
+  {
+   "eventId": "0mtpce4dl-0000",
+   "type": "agent.started",
+   "timestamp": "2026-09-06T04:59:26.324Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "TEAM-4129",
+   "detail": {
+    "ticketId": "TEAM-4129",
+    "assignee": "agentcore_hub_backend_dev",
+    "agentId": "agentcore_hub_backend_dev",
+    "timestamp": "2026-09-06T04:59:26.324Z"
+   }
+  },
+  {
+   "eventId": "1788670770227-bfwn",
+   "type": "agent.started",
+   "timestamp": "2026-09-06T04:59:30Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "timestamp": "2026-09-06T04:59:30Z",
+    "agentId": "agentcore_hub_backend_dev",
+    "workflowId": "wf_1788637257831_f50ucz"
+   }
+  },
+  {
+   "eventId": "0mtpcexbf-0000",
+   "type": "ticket.created",
+   "timestamp": "2026-09-06T05:00:03.629Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "ticketId": "TEAM-4130",
+    "workflowId": "wf_1788637257831_f50ucz",
+    "timestamp": "2026-09-06T05:00:03.629Z"
+   }
+  },
+  {
+   "eventId": "0mtpcfqpr-0000",
+   "type": "ticket.created",
+   "timestamp": "2026-09-06T05:00:41.702Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "ticketId": "TEAM-4131",
+    "workflowId": "wf_1788637257831_f50ucz",
+    "timestamp": "2026-09-06T05:00:41.702Z"
+   }
+  },
+  {
+   "eventId": "1788670895694-c3xk",
+   "type": "workflow.report_completion",
+   "timestamp": "2026-09-06T05:01:35.694Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "ticketId": "TEAM-4123",
+    "pr_url": null,
+    "agentId": "agentcore_hub_code_reviewer",
+    "branch": "feature/TEAM-4116--si-system-gate-escalation-event-integri"
+   }
+  },
+  {
+   "eventId": "0mtpcgzd8-0000",
+   "type": "workflow.phase_change",
+   "timestamp": "2026-09-06T05:01:39.702Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "timestamp": "2026-09-06T05:01:39.702Z",
+    "phase": "verification",
+    "ticketId": "TEAM-4124",
+    "workflowId": "wf_1788637257831_f50ucz"
+   }
+  },
+  {
+   "eventId": "0mtpcgzpq-0000",
+   "type": "agent.invoked",
+   "timestamp": "2026-09-06T05:01:40.324Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "agentId": "agentcore_hub_qa_verifier",
+    "assignee": "agentcore_hub_qa_verifier",
+    "ticketId": "TEAM-4124",
+    "phase": "verification",
+    "workflowId": "wf_1788637257831_f50ucz",
+    "timestamp": "2026-09-06T05:01:40.324Z"
+   }
+  },
+  {
+   "eventId": "0mtpcgzu6-0000",
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-06T05:01:40.409Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "ticketId": "TEAM-4124",
+    "workflowId": "wf_1788637257831_f50ucz",
+    "agentId": "agentcore_hub_qa_verifier",
+    "timestamp": "2026-09-06T05:01:40.409Z"
+   }
+  },
+  {
+   "eventId": "0mtpcgzxk-0000",
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-09-06T05:01:40.601Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "timestamp": "2026-09-06T05:01:40.601Z",
+    "ticketId": "TEAM-4124",
+    "unblockedBy": "TEAM-4123",
+    "workflowId": "wf_1788637257831_f50ucz"
+   }
+  },
+  {
+   "eventId": "0mtpch00p-0000",
+   "type": "agent.complete",
+   "timestamp": "2026-09-06T05:01:40.649Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "unblocked": [
+     "TEAM-4124"
+    ],
+    "agentId": "agentcore_hub_code_reviewer",
+    "workflowId": "wf_1788637257831_f50ucz",
+    "timestamp": "2026-09-06T05:01:40.649Z",
+    "ticketId": "TEAM-4123",
+    "assignee": "agentcore_hub_code_reviewer"
+   }
+  },
+  {
+   "eventId": "0mtpch0m0-0000",
+   "type": "agent.started",
+   "timestamp": "2026-09-06T05:01:41.483Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "TEAM-4124",
+   "detail": {
+    "agentId": "agentcore_hub_qa_verifier",
+    "assignee": "agentcore_hub_qa_verifier",
+    "ticketId": "TEAM-4124",
+    "timestamp": "2026-09-06T05:01:41.483Z"
+   }
+  },
+  {
+   "eventId": "1788670902549-hbog",
+   "type": "agent.started",
+   "timestamp": "2026-09-06T05:01:42Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "timestamp": "2026-09-06T05:01:42Z",
+    "agentId": "agentcore_hub_qa_verifier",
+    "workflowId": "wf_1788637257831_f50ucz"
+   }
+  },
+  {
+   "eventId": "1788671850941-wm-tzad",
+   "type": "manager.intervention",
+   "timestamp": "2026-09-06T05:17:30.941913Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "by": "workflow-manager",
+    "note": "Watch-triage 05:17Z: NOT a stall (14th consecutive no-op pass on this run). qa_verifier session ...1788670900362 is ALIVE \u2014 chat turn OK 05:03:27Z (55s), InvokeAgentRuntime 40s at 05:04:07Z (delegation started), then run",
+    "ticketId": "TEAM-4124",
+    "action": "comment"
+   }
+  },
+  {
+   "eventId": "1788672685378-n2hh",
+   "type": "workflow.report_completion",
+   "timestamp": "2026-09-06T05:31:25.379Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "branch": "feature/TEAM-4129-backend-dev",
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/392",
+    "ticketId": "TEAM-4129",
+    "agentId": "agentcore_hub_backend_dev"
+   }
+  },
+  {
+   "eventId": "0mtpdjceg-0000",
+   "type": "agent.invoked",
+   "timestamp": "2026-09-06T05:31:29.595Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "ticketId": "TEAM-4130",
+    "phase": "development",
+    "assignee": "agentcore_hub_backend_dev",
+    "workflowId": "wf_1788637257831_f50ucz",
+    "timestamp": "2026-09-06T05:31:29.595Z",
+    "agentId": "agentcore_hub_backend_dev"
+   }
+  },
+  {
+   "eventId": "0mtpdjcj2-0000",
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-06T05:31:29.836Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "workflowId": "wf_1788637257831_f50ucz",
+    "timestamp": "2026-09-06T05:31:29.836Z",
+    "agentId": "agentcore_hub_backend_dev",
+    "ticketId": "TEAM-4130"
+   }
+  },
+  {
+   "eventId": "0mtpdjcmr-0000",
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-09-06T05:31:29.962Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "unblockedBy": "TEAM-4129",
+    "ticketId": "TEAM-4130",
+    "workflowId": "wf_1788637257831_f50ucz",
+    "timestamp": "2026-09-06T05:31:29.962Z"
+   }
+  },
+  {
+   "eventId": "0mtpdjcnr-0000",
+   "type": "agent.complete",
+   "timestamp": "2026-09-06T05:31:29.997Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "workflowId": "wf_1788637257831_f50ucz",
+    "ticketId": "TEAM-4129",
+    "assignee": "agentcore_hub_backend_dev",
+    "unblocked": [
+     "TEAM-4130"
+    ],
+    "timestamp": "2026-09-06T05:31:29.997Z",
+    "agentId": "agentcore_hub_backend_dev"
+   }
+  },
+  {
+   "eventId": "0mtpdjd9d-0000",
+   "type": "agent.started",
+   "timestamp": "2026-09-06T05:31:30.781Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "TEAM-4130",
+   "detail": {
+    "ticketId": "TEAM-4130",
+    "agentId": "agentcore_hub_backend_dev",
+    "assignee": "agentcore_hub_backend_dev",
+    "timestamp": "2026-09-06T05:31:30.781Z"
+   }
+  },
+  {
+   "eventId": "1788672693600-jqtp",
+   "type": "agent.started",
+   "timestamp": "2026-09-06T05:31:33Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "agentId": "agentcore_hub_backend_dev",
+    "timestamp": "2026-09-06T05:31:33Z",
+    "workflowId": "wf_1788637257831_f50ucz"
+   }
+  },
+  {
+   "eventId": "1788673630156-wm-dc45",
+   "type": "manager.intervention",
+   "timestamp": "2026-09-06T05:47:10.156927Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "action": "comment",
+    "by": "workflow-manager",
+    "ticketId": "TEAM-4124",
+    "note": "Watch-triage 05:47Z: NOT a stall (15th consecutive no-op pass on this run). Two agents live: (1) qa_verifier session ...1788670900362 ALIVE \u2014 runtime pings every ~20s continuously through 05:44:52Z (<1 min before check),"
+   }
+  },
+  {
+   "eventId": "1788675704497-wm-i8o7",
+   "type": "manager.intervention",
+   "timestamp": "2026-09-06T06:21:44.497130Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "note": "Watch-triage 06:20Z: NOT a stall (16th consecutive no-op pass on this run). Two agents live, one session each, no dead sessions: (1) qa_verifier session ...1788670900362 ALIVE \u2014 InvokeAgentRuntime spans every ~20s throug",
+    "ticketId": "TEAM-4124",
+    "action": "comment",
+    "by": "workflow-manager"
+   }
+  },
+  {
+   "eventId": "1788675838539-svrw",
+   "type": "workflow.report_completion",
+   "timestamp": "2026-09-06T06:23:58.540Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "agentId": "agentcore_hub_backend_dev",
+    "ticketId": "TEAM-4130",
+    "branch": "feature/TEAM-4130-backend-dev",
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/393"
+   }
+  },
+  {
+   "eventId": "0mtpfexj1-0000",
+   "type": "agent.invoked",
+   "timestamp": "2026-09-06T06:24:02.835Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "workflowId": "wf_1788637257831_f50ucz",
+    "assignee": "agentcore_hub_backend_dev",
+    "agentId": "agentcore_hub_backend_dev",
+    "phase": "development",
+    "timestamp": "2026-09-06T06:24:02.835Z",
+    "ticketId": "TEAM-4131"
+   }
+  },
+  {
+   "eventId": "0mtpfexrq-0000",
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-06T06:24:02.998Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "agentId": "agentcore_hub_backend_dev",
+    "workflowId": "wf_1788637257831_f50ucz",
+    "ticketId": "TEAM-4131",
+    "timestamp": "2026-09-06T06:24:02.998Z"
+   }
+  },
+  {
+   "eventId": "0mtpfexlx-0000",
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-09-06T06:24:03.085Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "ticketId": "TEAM-4131",
+    "unblockedBy": "TEAM-4130",
+    "timestamp": "2026-09-06T06:24:03.085Z",
+    "workflowId": "wf_1788637257831_f50ucz"
+   }
+  },
+  {
+   "eventId": "0mtpfexvr-0000",
+   "type": "agent.complete",
+   "timestamp": "2026-09-06T06:24:03.155Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "workflowId": "wf_1788637257831_f50ucz",
+    "ticketId": "TEAM-4130",
+    "timestamp": "2026-09-06T06:24:03.155Z",
+    "agentId": "agentcore_hub_backend_dev",
+    "assignee": "agentcore_hub_backend_dev",
+    "unblocked": [
+     "TEAM-4131"
+    ]
+   }
+  },
+  {
+   "eventId": "0mtpfeycz-0000",
+   "type": "agent.started",
+   "timestamp": "2026-09-06T06:24:04.044Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "TEAM-4131",
+   "detail": {
+    "ticketId": "TEAM-4131",
+    "agentId": "agentcore_hub_backend_dev",
+    "timestamp": "2026-09-06T06:24:04.044Z",
+    "assignee": "agentcore_hub_backend_dev"
+   }
+  },
+  {
+   "eventId": "1788675844661-stpr",
+   "type": "agent.started",
+   "timestamp": "2026-09-06T06:24:04Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "workflowId": "wf_1788637257831_f50ucz",
+    "agentId": "agentcore_hub_backend_dev",
+    "timestamp": "2026-09-06T06:24:04Z"
+   }
+  },
+  {
+   "eventId": "1788677066030-e70s",
+   "type": "workflow.report_completion",
+   "timestamp": "2026-09-06T06:44:26.031Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "agentId": "agentcore_hub_qa_verifier",
+    "branch": "feature/TEAM-4116--si-system-gate-escalation-event-integri",
+    "pr_url": null,
+    "ticketId": "TEAM-4124"
+   }
+  },
+  {
+   "eventId": "0mtpg58gy-0000",
+   "type": "agent.invoked",
+   "timestamp": "2026-09-06T06:44:30.225Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "phase": "review",
+    "workflowId": "wf_1788637257831_f50ucz",
+    "timestamp": "2026-09-06T06:44:30.225Z",
+    "assignee": "agentcore_hub_ci_agent",
+    "ticketId": "TEAM-4125",
+    "agentId": "agentcore_hub_ci_agent"
+   }
+  },
+  {
+   "eventId": "0mtpg58k1-0000",
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-06T06:44:30.356Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "ticketId": "TEAM-4125",
+    "timestamp": "2026-09-06T06:44:30.356Z",
+    "workflowId": "wf_1788637257831_f50ucz",
+    "agentId": "agentcore_hub_ci_agent"
+   }
+  },
+  {
+   "eventId": "0mtpg58pn-0000",
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-09-06T06:44:30.491Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "workflowId": "wf_1788637257831_f50ucz",
+    "ticketId": "TEAM-4125",
+    "timestamp": "2026-09-06T06:44:30.491Z",
+    "unblockedBy": "TEAM-4124"
+   }
+  },
+  {
+   "eventId": "0mtpg5928-0000",
+   "type": "agent.complete",
+   "timestamp": "2026-09-06T06:44:30.520Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "unblocked": [
+     "TEAM-4125"
+    ],
+    "ticketId": "TEAM-4124",
+    "workflowId": "wf_1788637257831_f50ucz",
+    "timestamp": "2026-09-06T06:44:30.520Z",
+    "agentId": "agentcore_hub_qa_verifier",
+    "assignee": "agentcore_hub_qa_verifier"
+   }
+  },
+  {
+   "eventId": "0mtpg59eq-0000",
+   "type": "agent.started",
+   "timestamp": "2026-09-06T06:44:31.465Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "TEAM-4125",
+   "detail": {
+    "agentId": "agentcore_hub_ci_agent",
+    "assignee": "agentcore_hub_ci_agent",
+    "timestamp": "2026-09-06T06:44:31.465Z",
+    "ticketId": "TEAM-4125"
+   }
+  },
+  {
+   "eventId": "1788677074710-ymfd",
+   "type": "agent.started",
+   "timestamp": "2026-09-06T06:44:34Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "agentId": "agentcore_hub_ci_agent",
+    "workflowId": "wf_1788637257831_f50ucz",
+    "timestamp": "2026-09-06T06:44:34Z"
+   }
+  },
+  {
+   "eventId": "1788677411953-mcad",
+   "type": "workflow.report_completion",
+   "timestamp": "2026-09-06T06:50:11.953Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "branch": "feature/TEAM-4131-backend-dev",
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/394",
+    "agentId": "agentcore_hub_backend_dev",
+    "ticketId": "TEAM-4131"
+   }
+  },
+  {
+   "eventId": "0mtpgclpp-0000",
+   "type": "agent.complete",
+   "timestamp": "2026-09-06T06:50:13.938Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "timestamp": "2026-09-06T06:50:13.938Z",
+    "workflowId": "wf_1788637257831_f50ucz",
+    "unblocked": [],
+    "ticketId": "TEAM-4131",
+    "agentId": "agentcore_hub_backend_dev",
+    "assignee": "agentcore_hub_backend_dev"
+   }
+  },
+  {
+   "eventId": "1788677580745-dewi",
+   "type": "workflow.report_completion",
+   "timestamp": "2026-09-06T06:53:00.745Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "branch": "feature/TEAM-4116--si-system-gate-escalation-event-integri",
+    "agentId": "agentcore_hub_ci_agent",
+    "pr_url": null,
+    "ticketId": "TEAM-4125"
+   }
+  },
+  {
+   "eventId": "0mtpgg9x9-0000",
+   "type": "agent.invoked",
+   "timestamp": "2026-09-06T06:53:05.096Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "assignee": "agentcore_hub_release_manager",
+    "phase": "ship",
+    "agentId": "agentcore_hub_release_manager",
+    "ticketId": "TEAM-4126",
+    "timestamp": "2026-09-06T06:53:05.096Z",
+    "workflowId": "wf_1788637257831_f50ucz"
+   }
+  },
+  {
+   "eventId": "0mtpggade-0000",
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-06T06:53:05.242Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "ticketId": "TEAM-4126",
+    "agentId": "agentcore_hub_release_manager",
+    "timestamp": "2026-09-06T06:53:05.242Z",
+    "workflowId": "wf_1788637257831_f50ucz"
+   }
+  },
+  {
+   "eventId": "0mtpggaf7-0000",
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-09-06T06:53:05.363Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "timestamp": "2026-09-06T06:53:05.363Z",
+    "unblockedBy": "TEAM-4125",
+    "workflowId": "wf_1788637257831_f50ucz",
+    "ticketId": "TEAM-4126"
+   }
+  },
+  {
+   "eventId": "0mtpggag5-0000",
+   "type": "agent.complete",
+   "timestamp": "2026-09-06T06:53:05.396Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "agentId": "agentcore_hub_ci_agent",
+    "ticketId": "TEAM-4125",
+    "timestamp": "2026-09-06T06:53:05.396Z",
+    "unblocked": [
+     "TEAM-4126"
+    ],
+    "workflowId": "wf_1788637257831_f50ucz",
+    "assignee": "agentcore_hub_ci_agent"
+   }
+  },
+  {
+   "eventId": "0mtpggaj8-0000",
+   "type": "agent.started",
+   "timestamp": "2026-09-06T06:53:06.117Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "TEAM-4126",
+   "detail": {
+    "timestamp": "2026-09-06T06:53:06.117Z",
+    "agentId": "agentcore_hub_release_manager",
+    "ticketId": "TEAM-4126",
+    "assignee": "agentcore_hub_release_manager"
+   }
+  },
+  {
+   "eventId": "1788677589996-wvqz",
+   "type": "agent.started",
+   "timestamp": "2026-09-06T06:53:09Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "timestamp": "2026-09-06T06:53:09Z",
+    "agentId": "agentcore_hub_release_manager",
+    "workflowId": "wf_1788637257831_f50ucz"
+   }
+  },
+  {
+   "eventId": "1788678359900-wm-5t7f",
+   "type": "manager.intervention",
+   "timestamp": "2026-09-06T07:05:59.900529Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "by": "workflow-manager",
+    "note": "Watch triage 07:05Z: watchdog fired on 12 min without a completion event, but release_manager is live \u2014 last stream 07:03:41Z ('Precondition met: CI TEAM-4125 Done, commit_sha df1ed195 == branch head\u2026 opening the draft P",
+    "ticketId": "TEAM-4126",
+    "action": "comment"
+   }
+  },
+  {
+   "eventId": "0mtpgyiln-0000",
+   "type": "ticket.created",
+   "timestamp": "2026-09-06T07:07:15.694Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "workflowId": "wf_1788637257831_f50ucz",
+    "timestamp": "2026-09-06T07:07:15.694Z",
+    "ticketId": "TEAM-4155"
+   }
+  },
+  {
+   "eventId": "0mtpgyjl6-0000",
+   "type": "agent.invoked",
+   "timestamp": "2026-09-06T07:07:17.078Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "ticketId": "TEAM-4155",
+    "assignee": "agentcore_hub_backend_dev",
+    "phase": "development",
+    "workflowId": "wf_1788637257831_f50ucz",
+    "timestamp": "2026-09-06T07:07:17.078Z",
+    "agentId": "agentcore_hub_backend_dev"
+   }
+  },
+  {
+   "eventId": "0mtpgyjo1-0000",
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-06T07:07:17.168Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "timestamp": "2026-09-06T07:07:17.168Z",
+    "agentId": "agentcore_hub_backend_dev",
+    "ticketId": "TEAM-4155",
+    "workflowId": "wf_1788637257831_f50ucz"
+   }
+  },
+  {
+   "eventId": "0mtpgyjf5-0000",
+   "type": "agent.started",
+   "timestamp": "2026-09-06T07:07:17.454Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "TEAM-4155",
+   "detail": {
+    "timestamp": "2026-09-06T07:07:17.454Z",
+    "agentId": "agentcore_hub_backend_dev",
+    "ticketId": "TEAM-4155",
+    "assignee": "agentcore_hub_backend_dev"
+   }
+  },
+  {
+   "eventId": "1788678441820-tuhw",
+   "type": "agent.started",
+   "timestamp": "2026-09-06T07:07:21Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "agentId": "agentcore_hub_backend_dev",
+    "workflowId": "wf_1788637257831_f50ucz",
+    "timestamp": "2026-09-06T07:07:21Z"
+   }
+  },
+  {
+   "eventId": "0mtpgziza-0000",
+   "type": "ticket.created",
+   "timestamp": "2026-09-06T07:08:03.312Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "timestamp": "2026-09-06T07:08:03.312Z",
+    "workflowId": "wf_1788637257831_f50ucz",
+    "ticketId": "TEAM-4156"
+   }
+  },
+  {
+   "eventId": "0mtph0fls-0000",
+   "type": "ticket.created",
+   "timestamp": "2026-09-06T07:08:45.577Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "timestamp": "2026-09-06T07:08:45.577Z",
+    "ticketId": "TEAM-4157",
+    "workflowId": "wf_1788637257831_f50ucz"
+   }
+  },
+  {
+   "eventId": "0mtph0i11-0000",
+   "type": "agent.invoked",
+   "timestamp": "2026-09-06T07:08:48.881Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "workflowId": "wf_1788637257831_f50ucz",
+    "assignee": "agentcore_hub_backend_dev",
+    "timestamp": "2026-09-06T07:08:48.881Z",
+    "agentId": "agentcore_hub_backend_dev",
+    "phase": "development",
+    "ticketId": "TEAM-4158"
+   }
+  },
+  {
+   "eventId": "0mtph0i37-0000",
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-06T07:08:49.039Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "ticketId": "TEAM-4158",
+    "timestamp": "2026-09-06T07:08:49.039Z",
+    "agentId": "agentcore_hub_backend_dev",
+    "workflowId": "wf_1788637257831_f50ucz"
+   }
+  },
+  {
+   "eventId": "0mtph0ib3-0000",
+   "type": "agent.started",
+   "timestamp": "2026-09-06T07:08:49.348Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "TEAM-4158",
+   "detail": {
+    "agentId": "agentcore_hub_backend_dev",
+    "timestamp": "2026-09-06T07:08:49.348Z",
+    "assignee": "agentcore_hub_backend_dev",
+    "ticketId": "TEAM-4158"
+   }
+  },
+  {
+   "eventId": "1788678531376-wpji",
+   "type": "agent.started",
+   "timestamp": "2026-09-06T07:08:51Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "workflowId": "wf_1788637257831_f50ucz",
+    "agentId": "agentcore_hub_backend_dev",
+    "timestamp": "2026-09-06T07:08:51Z"
+   }
+  },
+  {
+   "eventId": "1788680008103-7hcw",
+   "type": "workflow.report_completion",
+   "timestamp": "2026-09-06T07:33:28.103Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "agentId": "agentcore_hub_backend_dev",
+    "branch": "fix/TEAM-4158-advisory",
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/396",
+    "ticketId": "TEAM-4158"
+   }
+  },
+  {
+   "eventId": "1788680557000-kg74",
+   "type": "workflow.report_completion",
+   "timestamp": "2026-09-06T07:42:37.000Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/397",
+    "ticketId": "TEAM-4155",
+    "agentId": "agentcore_hub_backend_dev",
+    "branch": "feature/TEAM-4116--si-system-gate-escalation-event-integri"
+   }
+  },
+  {
+   "eventId": "0mtpi82ot-0000",
+   "type": "agent.invoked",
+   "timestamp": "2026-09-06T07:42:41.171Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "assignee": "agentcore_hub_backend_dev",
+    "phase": "development",
+    "ticketId": "TEAM-4156",
+    "workflowId": "wf_1788637257831_f50ucz",
+    "timestamp": "2026-09-06T07:42:41.171Z",
+    "agentId": "agentcore_hub_backend_dev"
+   }
+  },
+  {
+   "eventId": "0mtpi82rh-0000",
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-06T07:42:41.381Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "ticketId": "TEAM-4156",
+    "timestamp": "2026-09-06T07:42:41.381Z",
+    "agentId": "agentcore_hub_backend_dev",
+    "workflowId": "wf_1788637257831_f50ucz"
+   }
+  },
+  {
+   "eventId": "0mtpi8385-0000",
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-09-06T07:42:42.051Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "unblockedBy": "TEAM-4155",
+    "ticketId": "TEAM-4156",
+    "timestamp": "2026-09-06T07:42:42.051Z",
+    "workflowId": "wf_1788637257831_f50ucz"
+   }
+  },
+  {
+   "eventId": "0mtpi839h-0000",
+   "type": "agent.complete",
+   "timestamp": "2026-09-06T07:42:42.098Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "workflowId": "wf_1788637257831_f50ucz",
+    "assignee": "agentcore_hub_backend_dev",
+    "timestamp": "2026-09-06T07:42:42.098Z",
+    "agentId": "agentcore_hub_backend_dev",
+    "ticketId": "TEAM-4155",
+    "unblocked": [
+     "TEAM-4156"
+    ]
+   }
+  },
+  {
+   "eventId": "0mtpi83fv-0000",
+   "type": "agent.started",
+   "timestamp": "2026-09-06T07:42:42.865Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "TEAM-4156",
+   "detail": {
+    "ticketId": "TEAM-4156",
+    "assignee": "agentcore_hub_backend_dev",
+    "agentId": "agentcore_hub_backend_dev",
+    "timestamp": "2026-09-06T07:42:42.865Z"
+   }
+  },
+  {
+   "eventId": "1788680566147-uose",
+   "type": "agent.started",
+   "timestamp": "2026-09-06T07:42:46Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "agentId": "agentcore_hub_backend_dev",
+    "timestamp": "2026-09-06T07:42:46Z",
+    "workflowId": "wf_1788637257831_f50ucz"
+   }
+  },
+  {
+   "eventId": "0mtpi8p2y-0000",
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-06T07:43:10.741Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "ticketId": "TEAM-4126",
+    "agentId": "agentcore_hub_release_manager",
+    "timestamp": "2026-09-06T07:43:10.741Z",
+    "workflowId": "wf_1788637257831_f50ucz"
+   }
+  },
+  {
+   "eventId": "1788680594238-cghq",
+   "type": "agent.started",
+   "timestamp": "2026-09-06T07:43:14Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "workflowId": "wf_1788637257831_f50ucz",
+    "agentId": "agentcore_hub_release_manager",
+    "timestamp": "2026-09-06T07:43:14Z"
+   }
+  },
+  {
+   "eventId": "1788681800930-wm-chek",
+   "type": "manager.intervention",
+   "timestamp": "2026-09-06T08:03:20.930329Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "by": "workflow-manager",
+    "action": "comment",
+    "note": "Watch-triage 08:03Z: NOT a stall (18th consecutive no-op pass on this run). release_manager round-2 session ...1788680590660 EXITED CLEANLY at 07:45:00Z (invoke_agent OK, 104.9s) after finding precondition unmet: waits f",
+    "ticketId": "TEAM-4126"
+   }
+  },
+  {
+   "eventId": "0mtpjdur2-0000",
+   "type": "agent.escalated",
+   "timestamp": "2026-09-06T08:15:10.430Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "reason": "dead_session_retry_exhausted",
+    "timestamp": "2026-09-06T08:15:10.430Z",
+    "workflowId": "wf_1788637257831_f50ucz",
+    "claimStartedAt": "2026-09-06T07:43:10.259Z",
+    "source": "reconcile-sweep",
+    "agentId": "agentcore_hub_release_manager",
+    "ticketId": "TEAM-4126"
+   }
+  },
+  {
+   "eventId": "1788682763981-k7qo",
+   "type": "workflow.report_completion",
+   "timestamp": "2026-09-06T08:19:23.981Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "ticketId": "TEAM-4156",
+    "agentId": "agentcore_hub_backend_dev",
+    "branch": "feature/TEAM-4156-backend-dev",
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/398"
+   }
+  },
+  {
+   "eventId": "0mtpjjf20-0000",
+   "type": "agent.invoked",
+   "timestamp": "2026-09-06T08:19:30.124Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "workflowId": "wf_1788637257831_f50ucz",
+    "assignee": "agentcore_hub_ci_agent",
+    "ticketId": "TEAM-4157",
+    "phase": "review",
+    "timestamp": "2026-09-06T08:19:30.124Z",
+    "agentId": "agentcore_hub_ci_agent"
+   }
+  },
+  {
+   "eventId": "0mtpjjf6m-0000",
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-06T08:19:30.331Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "timestamp": "2026-09-06T08:19:30.331Z",
+    "workflowId": "wf_1788637257831_f50ucz",
+    "ticketId": "TEAM-4157",
+    "agentId": "agentcore_hub_ci_agent"
+   }
+  },
+  {
+   "eventId": "0mtpjjfdz-0000",
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-09-06T08:19:30.674Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "ticketId": "TEAM-4157",
+    "unblockedBy": "TEAM-4156",
+    "workflowId": "wf_1788637257831_f50ucz",
+    "timestamp": "2026-09-06T08:19:30.674Z"
+   }
+  },
+  {
+   "eventId": "0mtpjjfgq-0000",
+   "type": "agent.complete",
+   "timestamp": "2026-09-06T08:19:30.710Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "ticketId": "TEAM-4156",
+    "timestamp": "2026-09-06T08:19:30.710Z",
+    "workflowId": "wf_1788637257831_f50ucz",
+    "assignee": "agentcore_hub_backend_dev",
+    "unblocked": [
+     "TEAM-4157"
+    ],
+    "agentId": "agentcore_hub_backend_dev"
+   }
+  },
+  {
+   "eventId": "0mtpjjfs9-0000",
+   "type": "agent.started",
+   "timestamp": "2026-09-06T08:19:31.605Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "TEAM-4157",
+   "detail": {
+    "timestamp": "2026-09-06T08:19:31.605Z",
+    "assignee": "agentcore_hub_ci_agent",
+    "ticketId": "TEAM-4157",
+    "agentId": "agentcore_hub_ci_agent"
+   }
+  },
+  {
+   "eventId": "1788682777698-jwiy",
+   "type": "agent.started",
+   "timestamp": "2026-09-06T08:19:37Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "workflowId": "wf_1788637257831_f50ucz",
+    "agentId": "agentcore_hub_ci_agent",
+    "timestamp": "2026-09-06T08:19:37Z"
+   }
+  },
+  {
+   "eventId": "1788683266337-h0i9",
+   "type": "workflow.report_completion",
+   "timestamp": "2026-09-06T08:27:46.337Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "ticketId": "TEAM-4157",
+    "agentId": "agentcore_hub_ci_agent",
+    "branch": "feature/TEAM-4116--si-system-gate-escalation-event-integri",
+    "pr_url": null
+   }
+  },
+  {
+   "eventId": "0mtpju3ib-0000",
+   "type": "agent.complete",
+   "timestamp": "2026-09-06T08:27:48.449Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "assignee": "agentcore_hub_ci_agent",
+    "agentId": "agentcore_hub_ci_agent",
+    "timestamp": "2026-09-06T08:27:48.449Z",
+    "unblocked": [],
+    "workflowId": "wf_1788637257831_f50ucz",
+    "ticketId": "TEAM-4157"
+   }
+  },
+  {
+   "eventId": "1788724011397-nudge-cxr9",
+   "type": "workflow.nudge",
+   "timestamp": "2026-09-06T19:46:51.397Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "ticketsScanned": 1,
+    "nudged": [
+     "TEAM-4126 (dispatch\u2192ready)"
+    ]
+   }
+  },
+  {
+   "eventId": "1788724011412-wm-25iv",
+   "type": "manager.intervention",
+   "timestamp": "2026-09-06T19:46:51.412467Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "nudged": [
+     "TEAM-4126 (dispatch\u2192ready)"
+    ],
+    "ticketId": "TEAM-4126",
+    "by": "workflow-manager",
+    "action": "dispatch",
+    "note": "Missed re-wake (D2.2): Ship parked 07:45Z awaiting TEAM-4156 + TEAM-4157 (round-1 fix tickets). Both done \u2014 4156 at 08:19:30Z, 4157 at 08:27:48Z with completions/TEAM-4157.json present. 4126 blockedBy lists only TEAM-412"
+   }
+  },
+  {
+   "eventId": "0mtq83enj-0000",
+   "type": "agent.invoked",
+   "timestamp": "2026-09-06T19:46:53.450Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "timestamp": "2026-09-06T19:46:53.450Z",
+    "workflowId": "wf_1788637257831_f50ucz",
+    "assignee": "agentcore_hub_release_manager",
+    "agentId": "agentcore_hub_release_manager",
+    "ticketId": "TEAM-4126",
+    "phase": "ship"
+   }
+  },
+  {
+   "eventId": "0mtq83eqn-0000",
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-06T19:46:53.684Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "timestamp": "2026-09-06T19:46:53.684Z",
+    "agentId": "agentcore_hub_release_manager",
+    "ticketId": "TEAM-4126",
+    "workflowId": "wf_1788637257831_f50ucz"
+   }
+  },
+  {
+   "eventId": "0mtq83eye-0000",
+   "type": "agent.started",
+   "timestamp": "2026-09-06T19:46:54.014Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "TEAM-4126",
+   "detail": {
+    "ticketId": "TEAM-4126",
+    "assignee": "agentcore_hub_release_manager",
+    "agentId": "agentcore_hub_release_manager",
+    "timestamp": "2026-09-06T19:46:54.014Z"
+   }
+  },
+  {
+   "eventId": "1788724018845-cowr",
+   "type": "agent.started",
+   "timestamp": "2026-09-06T19:46:58Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "agentId": "agentcore_hub_release_manager",
+    "workflowId": "wf_1788637257831_f50ucz",
+    "timestamp": "2026-09-06T19:46:58Z"
+   }
+  },
+  {
+   "eventId": "1788725014943-pyux",
+   "type": "agent.started",
+   "timestamp": "2026-09-06T20:03:34Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "timestamp": "2026-09-06T20:03:34Z",
+    "workflowId": "wf_1788637257831_f50ucz",
+    "agentId": "agentcore_hub_backend_dev"
+   }
+  },
+  {
+   "eventId": "1788725636571-d2cr",
+   "type": "workflow.report_completion",
+   "timestamp": "2026-09-06T20:13:56.571Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "branch": "feature/TEAM-4116--si-system-gate-escalation-event-integri",
+    "pr_url": "https://github.com/tycenjmccann/agentcore-hub/pull/395",
+    "agentId": "agentcore_hub_release_manager",
+    "ticketId": "TEAM-4126"
+   }
+  },
+  {
+   "eventId": "0mtq92axi-0000",
+   "type": "agent.complete",
+   "timestamp": "2026-09-06T20:14:02.327Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "workflowId": "wf_1788637257831_f50ucz",
+    "assignee": "agentcore_hub_release_manager",
+    "agentId": "agentcore_hub_release_manager",
+    "ticketId": "TEAM-4126",
+    "timestamp": "2026-09-06T20:14:02.327Z",
+    "unblocked": [
+     "TEAM-4127"
+    ]
+   }
+  },
+  {
+   "eventId": "1788726983738-oyrm",
+   "type": "agent.started",
+   "timestamp": "2026-09-06T20:36:23Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "workflowId": "wf_1788637257831_f50ucz",
+    "timestamp": "2026-09-06T20:36:23Z",
+    "agentId": "agentcore_hub_release_manager"
+   }
+  },
+  {
+   "eventId": "0mtqazn92-0000",
+   "type": "workflow.complete",
+   "timestamp": "2026-09-06T21:07:57.481Z",
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "timestamp": "2026-09-06T21:07:57.481Z",
+    "workflowId": "wf_1788637257831_f50ucz",
+    "prUrl": "",
+    "featureBranch": "feature/TEAM-4116--si-system-gate-escalation-event-integri",
+    "delivery": "cd",
+    "ticketId": "TEAM-4116"
+   }
+  },
+  {
+   "eventId": "evt_1788728886836_performance",
+   "type": "workflow.performance",
+   "timestamp": "2026-09-06T21:08:06.836Z",
+   "source": null,
+   "workflowId": "wf_1788637257831_f50ucz",
+   "detail": {
+    "activeMs": 88383007,
+    "tasks": 19,
+    "loops": 6,
+    "reworkRounds": 1,
+    "agentWorkMs": 55612032,
+    "ticketId": "TEAM-4116",
+    "personaUsd": 1824.3833,
+    "totalCostUsd": 2079.8527,
+    "nudges": 1,
+    "errors": 3,
+    "anomalies": [
+     {
+      "median": 324.2886,
+      "label": "Total cost",
+      "value": 2079.8527,
+      "kpi": "cost.totalUsd",
+      "status": "alert",
+      "z": 8.1323
+     },
+     {
+      "z": 7.1859,
+      "label": "Persona LLM cost",
+      "median": 320.0727,
+      "status": "alert",
+      "value": 1824.3833,
+      "kpi": "cost.personaUsd"
+     },
+     {
+      "median": 15.7699,
+      "kpi": "cost.codingUsd",
+      "z": 17.2842,
+      "status": "alert",
+      "label": "Coding CLI cost",
+      "value": 255.4693
+     },
+     {
+      "z": 13.0429,
+      "kpi": "cost.tokens.total",
+      "label": "Tokens",
+      "median": 30611258,
+      "value": 364188514,
+      "status": "alert"
+     },
+     {
+      "median": 17281764,
+      "status": "warn",
+      "label": "Active time",
+      "value": 88383007,
+      "z": 2.9725,
+      "kpi": "time.activeMs"
+     },
+     {
+      "kpi": "time.agentWorkMs",
+      "label": "Agent work",
+      "median": 10195279,
+      "status": "alert",
+      "z": 6.7245,
+      "value": 55612032
+     },
+     {
+      "value": 6,
+      "status": "alert",
+      "median": 1,
+      "kpi": "quality.loops",
+      "z": 3.3725,
+      "label": "Loops"
+     },
+     {
+      "value": 3,
+      "label": "Errors",
+      "z": 3,
+      "kpi": "quality.errors",
+      "status": "alert",
+      "median": 0
+     }
+    ],
+    "reportKey": "workflows/wf_1788637257831_f50ucz/shared/performance-card.json",
+    "wallMs": 91617444,
+    "timestamp": "2026-09-06T21:08:06.836Z",
+    "status": "alert",
+    "codingUsd": 255.4693,
+    "tokens": {
+     "cached": 170274105,
+     "total": 364188514,
+     "cacheRead": 170274105,
+     "output": 4297570,
+     "input": 186583807,
+     "cacheWrite": 3033032
+    },
+    "humanWaitMs": 3234437
+   }
+  }
+ ],
+ "completions": {
+  "TEAM-4117": {},
+  "TEAM-4118": {},
+  "TEAM-4119": {},
+  "TEAM-4120": {},
+  "TEAM-4121": {},
+  "TEAM-4122": {},
+  "TEAM-4123": {},
+  "TEAM-4124": {},
+  "TEAM-4125": {},
+  "TEAM-4126": {},
+  "TEAM-4129": {},
+  "TEAM-4130": {},
+  "TEAM-4131": {},
+  "TEAM-4155": {},
+  "TEAM-4156": {},
+  "TEAM-4157": {},
+  "TEAM-4158": {}
+ },
+ "streamHeartbeats": {
+  "TEAM-4120": {
+   "from": "2026-09-05T21:07:38.025Z",
+   "to": "2026-09-05T23:32:33.800Z",
+   "intervalSec": 20,
+   "agentId": "agentcore_hub_backend_dev",
+   "evidence": "manager.intervention notes 21:26Z-23:16Z: stream advanced continuously"
+  },
+  "TEAM-4121": {
+   "from": "2026-09-05T23:32:35.100Z",
+   "to": "2026-09-06T01:56:47.315Z",
+   "intervalSec": 20,
+   "agentId": "agentcore_hub_backend_dev",
+   "evidence": "manager.intervention 00:21Z: runtime spans every ~20s through 00:18:46Z"
+  },
+  "TEAM-4122": {
+   "from": "2026-09-06T01:56:48.596Z",
+   "to": "2026-09-06T04:34:08.119Z",
+   "intervalSec": 20,
+   "agentId": "agentcore_hub_backend_dev",
+   "evidence": "manager.intervention 02:11Z-04:06Z: ALIVE, runtime pings"
+  },
+  "TEAM-4126": {
+   "from": "2026-09-06T07:43:10.259Z",
+   "to": "2026-09-06T07:45:00.000Z",
+   "intervalSec": 20,
+   "agentId": "agentcore_hub_release_manager",
+   "evidence": "manager.intervention 08:03Z: RM round-2 session EXITED CLEANLY at 07:45:00Z (invoke_agent OK, 104.9s); NO streaming after 07:45:00Z"
+  }
+ },
+ "_timeline": {
+  "shipFixesFiled": "2026-09-06T07:07:13Z..07:08:46Z (TEAM-4155/4156/4157/4158; spawnedBy.shipTicketId=TEAM-4126 for ship_fix)",
+  "rmReclaim": "2026-09-06T07:43:10.259Z (agentTasks[TEAM-4126].startedAt for the parked claim)",
+  "rmCleanExit": "2026-09-06T07:45:00Z (invoke OK, no report_completion, ticket left in_progress)",
+  "falseEscalation": "2026-09-06T08:15:10.430Z agent.escalated dead_session_retry_exhausted source=reconcile-sweep",
+  "TEAM-4156done": "2026-09-06T08:19:27.775Z",
+  "TEAM-4157done": "2026-09-06T08:27:48.071Z",
+  "humanRedispatch": "2026-09-06T19:46:51Z"
+ },
+ "parkedSnapshot": {
+  "TEAM-4126": {
+   "status": "in_progress",
+   "blockedBy": [
+    "TEAM-4125"
+   ],
+   "agentTask": {
+    "agentId": "agentcore_hub_release_manager",
+    "status": "running",
+    "startedAt": "2026-09-06T07:43:10.259Z",
+    "id": "task_1788638762897_agentcore_hub_release_manager",
+    "ticketId": "TEAM-4126"
+   },
+   "deadSessionRetries": 1
+  }
+ }
+}

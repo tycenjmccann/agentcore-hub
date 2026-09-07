@@ -56,6 +56,11 @@
  */
 
 import { UpdateCommand } from "@aws-sdk/lib-dynamodb";
+// TEAM-4184 F1 — the ONE D2 evidence predicate, shared with
+// dead-session-detector.mjs so the two guards can never diverge. Pure (awaited-ids.mjs
+// has zero AWS imports); the injected `awaitedIds` dep stays the seam for the
+// stateful surface (edge writes, timeout emission).
+import { parkEvidence, awaitedWaitedMs } from "./awaited-ids.mjs";
 
 // Extended-state rollout modes (TEAM-3747 D1) — same vocabulary + fail-safe
 // default (shadow) as DEAD_SESSION_DETECTOR_MODE.
@@ -64,6 +69,34 @@ const KNOWN_EXTENDED_MODES = ["off", "shadow", "enforce"];
 // The only ticket statuses that resolve a blocker. Same pair the snapshot
 // predicate uses; named here for the TEAM-3755 F9 point-read confirm.
 const RESOLVED_BLOCKER_STATUSES = new Set(["done", "cancelled"]);
+
+/**
+ * TEAM-4166 D1 — the blocker set a dependent actually waits on is the UNION of
+ * its permanent `blockedBy` edges and any awaited ids still carried in
+ * `preconditionUnmet.awaitingIds`. In enforce mode the awaited ids are written
+ * as real blockedBy edges, so the two agree; but a tool-reported id that hasn't
+ * been edge-written yet (or a shadow run) still gates the re-dispatch here. Pure.
+ */
+export function blockerUnion(ticket) {
+  const ids = new Set(ticket?.blockedBy || []);
+  const pu = ticket?.preconditionUnmet;
+  if (pu && Array.isArray(pu.awaitingIds)) for (const id of pu.awaitingIds) if (id) ids.add(id);
+  return [...ids];
+}
+
+/**
+ * Are all of `ticket`'s union blockers terminal in `snapshot`? When no snapshot
+ * is supplied the answer is `true` (the caller has already gated on resolution;
+ * this sub-check is defense-in-depth). Pure.
+ */
+export function unionBlockersResolved(ticket, snapshot, selfDoneId) {
+  if (!Array.isArray(snapshot)) return true;
+  return blockerUnion(ticket).every((bid) => {
+    if (selfDoneId && bid === selfDoneId) return true;
+    const blocker = snapshot.find((s) => s && s.ticketId === bid);
+    return blocker && RESOLVED_BLOCKER_STATUSES.has(blocker.status);
+  });
+}
 
 /**
  * Normalize the `extendedStates` dep into off | shadow | enforce. Backwards
@@ -130,7 +163,21 @@ export function createCascade(deps) {
     // TEAM-4120 FR-3 — optional dead-session escalation tree (page → synthesize
     // → park). Unwired = the bare manager_escalation notification, as before.
     escalate,
+    // TEAM-4166 D2 §2.3 — the evidence-gated escalation guard. All optional, so
+    // unwired = byte-identical to pre-4166 (the retry-exhausted branch escalates
+    // as before). `awaitedIds` supplies emitAwaitTimeoutOnce/checkAwaitTimeout for
+    // the clean-exit cap; `cleanExitRedispatchCap` bounds automatic re-wakes of a
+    // cleanly-parked ticket; `getLastStreamAt` feeds the escalation evidence
+    // payload (null when absent). store.incrementCleanExitRedispatch is the CAS
+    // that counts clean re-wakes WITHOUT touching deadSessionRetries.
+    awaitedIds,
+    cleanExitRedispatchCap = 3,
+    getLastStreamAt,
   } = deps;
+
+  const cleanExitCap = Number.isInteger(cleanExitRedispatchCap) && cleanExitRedispatchCap > 0
+    ? cleanExitRedispatchCap
+    : 3;
 
   // One normalization per cascade instance. The commit-4a union (blocked/todo →
   // Ready) is ALWAYS enforced regardless of this — extendedMode gates only the
@@ -183,6 +230,11 @@ export function createCascade(deps) {
   async function cascadeUnblock(ticketId, parentId, workflow) {
     const siblings = await getChildTickets(parentId);
     const unblocked = [];
+    // TEAM-4166 D1 — the union blocker snapshot per unblocked ticket, so the
+    // orchestrator.unblocked event records the full set the dependent waited on
+    // (blockedBy ∪ preconditionUnmet.awaitingIds) — the f50ucz proof that the
+    // parked ship ticket lists its awaited fix siblings.
+    const unblockedBlockers = new Map();
     const m = newMetrics();
 
     // Dependents whose blocker set wasn't fully resolved in the FIRST snapshot.
@@ -197,8 +249,11 @@ export function createCascade(deps) {
     // blockedBy entry is done/cancelled (this one just closed). Evaluated against
     // a supplied snapshot rather than a fresh per-blocker lookup (matches prior
     // code); the retry pass simply re-runs it against a re-fetched snapshot.
+    // TEAM-4166 D1 — evaluate the UNION (blockedBy ∪ preconditionUnmet.awaitingIds)
+    // so a parked ticket awaiting fix siblings only re-wakes once every awaited id
+    // is terminal, whether the edge was written or is still tool-reported.
     const allBlockersResolved = (sibling, snapshot) =>
-      (sibling.blockedBy || []).every((bid) => {
+      blockerUnion(sibling).every((bid) => {
         if (bid === ticketId) return true; // this one is done
         const blocker = snapshot.find((s) => s.ticketId === bid);
         return blocker && (blocker.status === "done" || blocker.status === "cancelled");
@@ -217,6 +272,7 @@ export function createCascade(deps) {
         if (sibling.status === "blocked" || sibling.status === "todo") {
           await transitionToReady(sibling);
           unblocked.push(sibling.ticketId);
+          unblockedBlockers.set(sibling.ticketId, blockerUnion(sibling));
           // Level-trigger (TEAM-4060): dispatch now instead of waiting for the
           // Ready webhook. No-op when levelTriggerMode is off.
           await levelDispatch(sibling, workflow, m);
@@ -299,6 +355,8 @@ export function createCascade(deps) {
     for (const unblockedId of unblocked) {
       await publishEvent(unblockedId, "orchestrator.unblocked", {
         ticketId: unblockedId, unblockedBy: ticketId, workflowId: workflow?.id,
+        // TEAM-4166 D1 — the union blocker set this dependent waited on.
+        blockedBy: unblockedBlockers.get(unblockedId) || [],
       });
     }
 
@@ -395,6 +453,41 @@ export function createCascade(deps) {
     if (dispatched) {
       m.redispatched++;
       log(`[orchestrator] cascade re-dispatch — ${sibling.ticketId} agent=${agentId}`);
+      // TEAM-4187 — the re-wake of a PARKED dependent used to be SILENT. The
+      // journal only ever recorded blocked/todo→Ready unblocks, so f50ucz's
+      // steal+redispatch of TEAM-4126 (08:27:48Z) left no event at all: the
+      // dossier, cost-report and the anomaly watcher could see the run stall and
+      // then move, with nothing in between explaining why.
+      //
+      // Emitted HERE and only here: this is the one point where both CASes have
+      // won (the steal took the exact claim generation, the re-dispatch took the
+      // fresh claim), so it fires exactly once per real re-dispatch — the CASes
+      // ARE the idempotency, no extra marker needed. The event is a journal
+      // record, so a publish failure must not turn a COMPLETED recovery into a
+      // counted dependentError/candidateError (which would also drop the
+      // outcome the sweep tallies): it is logged and swallowed, same shape as
+      // emitContractWarning's purely-observational publish.
+      m.rewoken = (m.rewoken || 0) + 1;
+      try {
+        await publishEvent(sibling.ticketId, "orchestrator.unblocked", {
+          ticketId: sibling.ticketId,
+          unblockedBy,
+          workflowId: workflow?.id,
+          blockedBy: blockerUnion(sibling),
+          // The discriminator: a consumer that only knows the Ready-transition
+          // journal can filter this shape out on previousStatus alone.
+          previousStatus: sibling.status || "in_progress",
+          reason: sibling.preconditionUnmet?.awaitingIds?.length ? "awaited_rewake" : "stale_lease_rewake",
+          source: unblockedBy === "reconcile-sweep" ? "reconcile-sweep" : "cascade",
+          // Stamped from the injected clock, not wall time: publishEvent honors a
+          // valid ISO detail.timestamp (TEAM-4167 D3) and deterministicEventId
+          // keys off the SAME value, so the EventBridge copy and the direct copy
+          // still collapse onto one row.
+          timestamp: new Date(now()).toISOString(),
+        });
+      } catch (err) {
+        log(`[orchestrator] cascade rewake_event_failed — ${sibling.ticketId}: ${err?.message || err}`);
+      }
       return "redispatched";
     }
     log(`[orchestrator] cascade re-dispatch refused — ${sibling.ticketId} (claim CAS lost)`);
@@ -513,7 +606,7 @@ export function createCascade(deps) {
    * `mode` is the SWEEP's rollout mode (independent of the cascade's) — shadow
    * observes, enforce writes. Returns an outcome string the sweep tallies.
    */
-  async function reconcileDependent(sibling, unblockedBy, workflow, m, mode) {
+  async function reconcileDependent(sibling, unblockedBy, workflow, m, mode, siblings) {
     // TEAM-3973 — an ESCALATED ticket is held for the human, in every status.
     // Escalation used to bind only the in_progress steal path, so the very next
     // sweep re-drove the ticket through the ready/todo/blocked branch and the
@@ -532,7 +625,7 @@ export function createCascade(deps) {
       return handleInReviewDependent(sibling, unblockedBy, workflow, m, mode);
     }
     if (sibling.status === "in_progress") {
-      return stealWithRetryBudget(sibling, unblockedBy, workflow, m, mode);
+      return stealWithRetryBudget(sibling, unblockedBy, workflow, m, mode, siblings);
     }
     // ready / todo / blocked — unblocked (or unblockable) but never dispatched.
     // No live claim to steal (the lease gate above already returned for a live
@@ -566,6 +659,37 @@ export function createCascade(deps) {
   }
 
   /**
+   * TEAM-4166 D2 §2.3 — the evidence block attached to an agent.escalated event
+   * so an operator can see WHY the orchestrator concluded a session was dead
+   * rather than cleanly parked. lastSpanAt/lastStreamAt come from the injected
+   * getLastStreamAt dep (null when unwired); lastSpanStatus is "ok" only when the
+   * task genuinely completed; exitReason is null on the dead escalate path.
+   */
+  async function buildEscalationEvidence(workflow, sibling, { completedOk = false, exitReason = null, parkEvidence: parkReason = null } = {}) {
+    const ticketId = sibling.ticketId;
+    let lastStreamAt = null;
+    try {
+      lastStreamAt = getLastStreamAt ? await getLastStreamAt(workflow?.id, ticketId) : null;
+    } catch {
+      lastStreamAt = null;
+    }
+    const task = workflow?.agentTasks?.[ticketId];
+    return {
+      lastSpanAt: lastStreamAt,
+      lastSpanStatus: completedOk ? "ok" : null,
+      lastStreamAt,
+      completedAt: task?.completedAt || null,
+      preconditionAt: sibling?.preconditionUnmet?.reportedAt || null,
+      exitReason: exitReason ?? null,
+      // TEAM-4184 F1 — WHICH term of the evidence predicate decided. "stale-stamp"
+      // says the ticket carries a preconditionUnmet from an EARLIER claim that has
+      // already been re-woken once, so the stamp is not evidence about this
+      // session; "no-stamp" says it never parked clean at all.
+      parkEvidence: parkReason,
+    };
+  }
+
+  /**
    * TEAM-3969 — the sweep's stale-lease recovery shares the dead-session
    * detector's retry budget (workflow.deadSessionRetries[ticketId]): ONE
    * automatic re-dispatch per ticket, then escalate to a human. Without the cap
@@ -576,7 +700,7 @@ export function createCascade(deps) {
    * The counter is bumped only after the steal CAS wins, so a steal aborted by a
    * live re-check never burns the budget. Unwired store = uncapped (pre-3968).
    */
-  async function stealWithRetryBudget(sibling, unblockedBy, workflow, m, mode) {
+  async function stealWithRetryBudget(sibling, unblockedBy, workflow, m, mode, siblings) {
     const ticketId = sibling.ticketId;
     const agentId = sibling.assignee;
     const priorRetries = workflow?.deadSessionRetries?.[ticketId] || 0;
@@ -588,16 +712,91 @@ export function createCascade(deps) {
       }
       return outcome;
     }
+
+    // TEAM-4166 D2 §2.3 — EVIDENCE GUARD. The retry budget is spent, so the
+    // pre-4166 code escalated unconditionally here. But a release manager that
+    // parked itself clean (preconditionUnmet stamped) or a session that genuinely
+    // completed is NOT a dead session — escalating it appends a manager_escalation
+    // that trips parkedOnHuman and freezes the whole run (the f50ucz false
+    // positive: TEAM-4126 escalated 08:15Z after exiting OK 07:45Z, run stuck to
+    // 19:46Z). Re-wake it instead, capped; escalation is reserved for the
+    // genuinely dead. Never touches deadSessionRetries on this clean path.
+    const task = workflow?.agentTasks?.[ticketId];
+    const claimStartedAt = task?.startedAt || null;
+    const completedOk = !!(
+      task?.completedAt && claimStartedAt &&
+      Date.parse(task.completedAt) >= Date.parse(claimStartedAt) &&
+      task.status !== "error"
+    );
+    // TEAM-4184 F1 — the stamp must be evidence about THIS claim. Mere presence
+    // meant a ticket that ever parked could never be escalated again, because
+    // nothing clears preconditionUnmet: its clean re-wake would burn the cap and
+    // then report "awaiting" forever. The shared predicate (awaited-ids.mjs) is
+    // the same one dead-session-detector.mjs uses.
+    const cleanRedispatches = workflow?.cleanExitRedispatches?.[ticketId] || 0;
+    const parkEv = parkEvidence(sibling, { siblings, claimStartedAt, cleanRedispatches });
+    const parkedClean = parkEv.parkedClean;
+    if (completedOk || parkedClean) {
+      // Anti-thrash: the awaited blockers are not all terminal yet → touch
+      // nothing (no redispatch, no escalate, no budget change). The sweep
+      // re-visits when the next blocker closes.
+      if (!unionBlockersResolved(sibling, siblings)) {
+        m.awaiting = (m.awaiting || 0) + 1;
+        log(`[orchestrator] reconcile awaiting (clean park, blockers open) — ${ticketId}`);
+        return "awaiting";
+      }
+      if (cleanRedispatches >= cleanExitCap) {
+        // Re-woken to the cap without landing — advisory timeout ONLY, never a
+        // manager_escalation (that is the parkedOnHuman trap this fix removes).
+        //
+        // TEAM-4184 F2: report the ids that are ACTUALLY still open, judged against
+        // this sweep's sibling snapshot. The old fallback listed the raw stamp
+        // (`preconditionUnmet.awaitingIds`) with waitedMs 0 — and since the cap path
+        // is only reachable once the union has resolved, every id in it was already
+        // done: an event that told the operator to go look at closed tickets. When
+        // nothing is left awaited the honest report is an EMPTY list under
+        // reason=clean_exit_cap, with the real wait either way.
+        if (awaitedIds?.emitAwaitTimeoutOnce) {
+          const to = awaitedIds.checkAwaitTimeout?.(sibling, siblings, now());
+          await awaitedIds.emitAwaitTimeoutOnce(
+            workflow, ticketId,
+            to?.awaitingIds || [],
+            to?.waitedMs ?? awaitedWaitedMs(sibling, now()),
+            unblockedBy,
+            { reason: to ? "await_timeout" : "clean_exit_cap" });
+        }
+        m.awaiting = (m.awaiting || 0) + 1;
+        log(`[orchestrator] reconcile awaiting (clean-exit cap ${cleanExitCap} reached) — ${ticketId}`);
+        return "awaiting";
+      }
+      if (mode !== "enforce") {
+        m.wouldRedispatch++;
+        log(`[orchestrator] reconcile would-redispatch (shadow, clean exit) — ${ticketId}`);
+        return "would-redispatch";
+      }
+      // A clean re-wake: count it on cleanExitRedispatches (NOT deadSessionRetries),
+      // then re-dispatch through the same lease-guarded CAS.
+      await store.incrementCleanExitRedispatch(workflow.id, ticketId);
+      m.exitedOk = (m.exitedOk || 0) + 1;
+      const outcome = await stealAndRedispatch(sibling, unblockedBy, workflow, m, mode);
+      return (outcome === "redispatched" || outcome === "redispatch-refused") ? "exited-ok" : outcome;
+    }
+
+    // else — genuinely dead: the EXISTING escalate branch, now carrying evidence.
     if (mode !== "enforce") {
       m.wouldRedispatch++;
       log(`[orchestrator] reconcile would-escalate (shadow) — ${ticketId} agent=${agentId} retry exhausted`);
       return "would-escalate";
     }
     const at = new Date(now()).toISOString();
+    const evidence = await buildEscalationEvidence(workflow, sibling, {
+      completedOk, exitReason: null, parkEvidence: parkEv.reason,
+    });
     await publishEvent(ticketId, "agent.escalated", {
       workflowId: workflow.id, ticketId, agentId,
       reason: "dead_session_retry_exhausted", source: unblockedBy,
       claimStartedAt: workflow?.agentTasks?.[ticketId]?.startedAt || null,
+      evidence,
     });
     await store.setTaskStatus(workflow.id, ticketId, "error");
     if (blockTicket) await blockTicket(ticketId, "dead_session_retry_exhausted");
@@ -678,6 +877,14 @@ export function newMetrics() {
     levelDispatched: 0,
     wouldDispatch: 0,
     levelDispatchErrors: 0,
+    // TEAM-4166 D2 §2.3 — evidence-gated outcomes: a clean re-wake (exitedOk) or
+    // a held clean park with open/capped blockers (awaiting), NEITHER an escalation.
+    exitedOk: 0,
+    awaiting: 0,
+    // TEAM-4187 — re-wakes of a PARKED in_progress dependent (steal CAS + claim
+    // CAS both won), the population the orchestrator.unblocked journal now covers.
+    // A subset of `redispatched`: counted alongside it, never instead of it.
+    rewoken: 0,
   };
 }
 
@@ -687,7 +894,8 @@ export function hasCascadeActivity(m) {
     m.nudged || m.skippedLiveLease || m.redispatched || m.reviewReawakened ||
     m.dependentErrors || m.wouldNudge || m.wouldSteal || m.wouldRedispatch ||
     m.wouldReviewReawaken || m.blockerConfirmAborted ||
-    m.levelDispatched || m.wouldDispatch || m.levelDispatchErrors
+    m.levelDispatched || m.wouldDispatch || m.levelDispatchErrors ||
+    m.exitedOk || m.awaiting || m.escalated || m.rewoken
   );
 }
 
@@ -718,6 +926,9 @@ export function emitCascadeMetrics(m) {
           { Name: "CascadeLevelDispatched", Unit: "Count" },
           { Name: "CascadeWouldDispatch", Unit: "Count" },
           { Name: "CascadeLevelDispatchErrors", Unit: "Count" },
+          { Name: "CascadeExitedOk", Unit: "Count" },
+          { Name: "CascadeAwaiting", Unit: "Count" },
+          { Name: "CascadeRewoken", Unit: "Count" },
         ],
       }],
     },
@@ -734,5 +945,8 @@ export function emitCascadeMetrics(m) {
     CascadeLevelDispatched: m.levelDispatched || 0,
     CascadeWouldDispatch: m.wouldDispatch || 0,
     CascadeLevelDispatchErrors: m.levelDispatchErrors || 0,
+    CascadeExitedOk: m.exitedOk || 0,
+    CascadeAwaiting: m.awaiting || 0,
+    CascadeRewoken: m.rewoken || 0,
   }));
 }

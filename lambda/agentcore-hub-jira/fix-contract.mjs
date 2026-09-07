@@ -118,7 +118,83 @@ export const SYSTEM_LABEL_PREFIXES = [
   "wf:",
   "human-review",
   "ci:",
+  // TEAM-4166 §1.2 / TEAM-4184 — the precondition-unmet stamp. In Jira mode these
+  // two ARE the stamp (there is no structured column), and the D2 evidence guard
+  // reads them to decide whether a parked session is awaiting work or dead. A
+  // forged `awaiting:<open-id>` or `precondition-at:<far-future>` would pin the
+  // guard's "still parked clean" verdict and suppress dead-session escalation
+  // forever, so neither may be minted by a caller-supplied label.
+  "awaiting:",
+  "precondition-at:",
 ];
+
+// TEAM-4184 — the precondition-unmet CLOCK, carried as a label.
+//
+// Jira has no structured record, so annotate_precondition_unmet writes the
+// awaited ids as `awaiting:<id>` labels plus a `<!-- precondition-unmet {...} -->`
+// comment marker for the richer fields. The marker is NOT a reliable carrier of
+// `reportedAt`: the sibling read the D2 evidence guard runs on
+// (getChildTicketsFromJira) does not request the `comment` field at all, and even
+// where comments ARE in scope Jira returns them oldest-first capped at 20, so on
+// a chatty ticket the newest marker is truncated away. Labels come back in full
+// on every read, so the clock rides one: `precondition-at:<epochMs>`.
+//
+// Readers take the MAX across every precondition-at label on the issue. That
+// makes the writer's pruning of superseded labels pure hygiene rather than a
+// correctness dependency — a removal that fails leaves the value right.
+export const PRECONDITION_AT_PREFIX = "precondition-at:";
+
+/**
+ * The label form of a `reportedAt` (ISO string or epoch ms). Returns null when
+ * the input is not a parseable instant — the caller then writes no clock label
+ * rather than a `precondition-at:NaN` that no reader could use.
+ */
+export function preconditionAtLabel(reportedAt) {
+  const ms = typeof reportedAt === "number" ? reportedAt : Date.parse(reportedAt ?? "");
+  if (!Number.isFinite(ms) || ms <= 0) return null;
+  return `${PRECONDITION_AT_PREFIX}${Math.trunc(ms)}`;
+}
+
+/**
+ * The NEWEST precondition-at instant on a label list, as epoch ms (null when
+ * there is none). Max-wins, so a stale sibling label left behind by a failed
+ * prune cannot move the clock backwards.
+ */
+export function preconditionAtMsFromLabels(labels) {
+  let max = null;
+  for (const label of Array.isArray(labels) ? labels : []) {
+    if (typeof label !== "string" || !label.startsWith(PRECONDITION_AT_PREFIX)) continue;
+    const raw = label.slice(PRECONDITION_AT_PREFIX.length);
+    if (!/^\d+$/.test(raw)) continue;
+    const ms = Number(raw);
+    if (!Number.isSafeInteger(ms) || ms <= 0) continue;
+    if (max === null || ms > max) max = ms;
+  }
+  return max;
+}
+
+/** preconditionAtMsFromLabels as an ISO string — the `preconditionUnmet.reportedAt` shape. */
+export function reportedAtFromLabels(labels) {
+  const ms = preconditionAtMsFromLabels(labels);
+  return ms === null ? null : new Date(ms).toISOString();
+}
+
+/**
+ * The later of two reportedAt values, keeping the winner's original string (so a
+ * comment marker's exact ISO survives when it is the fresher of the two). An
+ * unparseable side loses; both unparseable → null. Monotonic by construction, so
+ * it does not matter which carrier a caller passes first.
+ */
+export function maxReportedAt(a, b) {
+  const ams = Date.parse(a ?? "");
+  const bms = Date.parse(b ?? "");
+  const aok = Number.isFinite(ams);
+  const bok = Number.isFinite(bms);
+  if (!aok && !bok) return null;
+  if (!bok) return a;
+  if (!aok) return b;
+  return ams >= bms ? a : b;
+}
 
 // TEAM-4131 F2 — labels that are RESERVED on some tickets rather than globally.
 //

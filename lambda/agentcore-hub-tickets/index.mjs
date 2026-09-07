@@ -41,6 +41,7 @@ import {
   validateFixContract,
   normalizeContractMode,
   sanitizeUserLabels,
+  maxReportedAt,
 } from "./fix-contract.mjs";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
@@ -234,6 +235,8 @@ export const handler = async (event) => {
         return await getTransitions(args);
       case "add_comment":
         return await addComment(args);
+      case "annotate_precondition_unmet":
+        return await annotatePreconditionUnmet(args);
       case "labels_add":
         return await addLabels(args);
       case "list_projects":
@@ -246,7 +249,7 @@ export const handler = async (event) => {
         // Return an `error` field so callers (e.g. workflow-output) can tell a
         // no-op from a real result. Without this, an unrecognized tool name
         // looked like success and silently stalled the pipeline.
-        const message = `Unknown tool: "${toolName}". Available: create_ticket, get_issue, edit_issue, search_issues, list_tickets, transition_issue (alias: transition_ticket), get_transitions, add_comment, labels_add, list_projects, get_project_issue_types, lookup_user`;
+        const message = `Unknown tool: "${toolName}". Available: create_ticket, get_issue, edit_issue, search_issues, list_tickets, transition_issue (alias: transition_ticket), get_transitions, add_comment, annotate_precondition_unmet, labels_add, list_projects, get_project_issue_types, lookup_user`;
         return { error: message, content: [{ text: message }] };
       }
     }
@@ -792,6 +795,17 @@ async function transitionIssue(args) {
     exprValues[":bb"] = blockerList;
   }
 
+  // TEAM-4167 D3 FR-3.2: stamp resolvedAt on the row the moment a ticket reaches
+  // done (additive — never clobbers status/updatedAt). Parity with the Jira
+  // provider, which sets a Jira `resolution`+resolvedAt on its Done transition;
+  // both providers return resolvedAt so the caller reads it the same way.
+  const isDone = transition.to === "done";
+  if (isDone) {
+    updateExpr += ", #ra = :ra";
+    exprNames["#ra"] = "resolvedAt";
+    exprValues[":ra"] = now;
+  }
+
   await ddb.send(
     new UpdateCommand({
       TableName: TABLE_NAME,
@@ -809,6 +823,7 @@ async function transitionIssue(args) {
     to: transition.to,
     transition: transition.name,
     ...(reason ? { skipReason: reason } : {}),
+    ...(isDone ? { resolvedAt: now } : {}),
   };
 }
 
@@ -872,6 +887,85 @@ async function addComment(args) {
       created: comment.timestamp,
     },
   };
+}
+
+/**
+ * TEAM-4166 §1.2 — stamp the non-terminal "precondition unmet" record on a
+ * ticket. Top-level `preconditionUnmet` mirrors the Jira twin's parsed shape so
+ * the orchestrator reads the SAME field regardless of provider. Deliberately NO
+ * status or blockedBy change: this is an annotation the D1 re-wake / D2 liveness
+ * clock read — the actual awaited-edge write is the orchestrator's job (via the
+ * addBlockers seam), not this tool's. Re-reports UNION the awaited ids so a
+ * ticket can accumulate siblings across several agent reports rather than having
+ * the latest report clobber the earlier ones.
+ */
+/**
+ * How authoritative a preconditionUnmet `source` is (TEAM-4184): an agent's own
+ * tool report beats an orchestrator-derived spawn edge, which beats a stamp
+ * reconstructed from Jira labels. Unknown/absent ranks lowest, so any real source
+ * wins over a row that never carried one.
+ */
+const SOURCE_RANK = (source) => ({ tool: 3, derived: 2, label: 1 })[source] || 0;
+
+async function annotatePreconditionUnmet(args) {
+  const issueKey = args.issue_key || args.ticket_id;
+  if (!issueKey) return textResult("Error: 'issue_key' is required");
+
+  const incoming = Array.isArray(args.awaitingIds)
+    ? args.awaitingIds
+    : args.awaitingIds
+      ? [args.awaitingIds]
+      : [];
+
+  const current = await ddb.send(
+    new GetCommand({ TableName: TABLE_NAME, Key: { ticketId: issueKey } })
+  );
+  if (!current.Item) return textResult(`Issue ${issueKey} not found.`);
+
+  const existing = Array.isArray(current.Item.preconditionUnmet?.awaitingIds)
+    ? current.Item.preconditionUnmet.awaitingIds
+    : [];
+  const awaitingIds = [];
+  for (const id of [...existing, ...incoming]) {
+    if (typeof id === "string" && id && !awaitingIds.includes(id)) awaitingIds.push(id);
+  }
+
+  const now = new Date().toISOString();
+  // TEAM-4184 — the merge is MONOTONIC in the two fields the D2 evidence guard
+  // reasons about, because re-reports are not ordered. The orchestrator's
+  // level-triggered pickup re-annotates from the persisted row with a
+  // spawn-derived stamp, which can land AFTER the agent's own tool report: a
+  // last-writer-wins merge would then walk `reportedAt` backwards (making a
+  // current stamp look like a previous claim's residue) and downgrade `source`
+  // tool -> derived. The awaited ids already union for the same reason.
+  const incomingReportedAt = args.reportedAt || now;
+  const reportedAt = maxReportedAt(current.Item.preconditionUnmet?.reportedAt, incomingReportedAt)
+    || incomingReportedAt;
+  const incomingSource = args.source || "tool";
+  const source = SOURCE_RANK(current.Item.preconditionUnmet?.source) > SOURCE_RANK(incomingSource)
+    ? current.Item.preconditionUnmet.source
+    : incomingSource;
+  const preconditionUnmet = {
+    awaitingIds,
+    note: typeof args.note === "string" ? args.note : "",
+    reportedAt,
+    agentId: args.agentId || null,
+    source,
+  };
+
+  await ddb.send(
+    new UpdateCommand({
+      TableName: TABLE_NAME,
+      Key: { ticketId: issueKey },
+      UpdateExpression: "SET #pu = :pu, #u = :u",
+      // Never CREATE a row for a typo'd key (an Update with no condition upserts).
+      ConditionExpression: "attribute_exists(ticketId)",
+      ExpressionAttributeNames: { "#pu": "preconditionUnmet", "#u": "updatedAt" },
+      ExpressionAttributeValues: { ":pu": preconditionUnmet, ":u": now },
+    })
+  );
+
+  return { ticketId: issueKey, preconditionUnmet };
 }
 
 async function listProjects() {

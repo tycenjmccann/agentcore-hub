@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { createReconcileSweep, SWEEP_ROTATION_QUANTUM_MS } from "./reconcile-sweep.mjs";
 import { createCascade } from "./cascade.mjs";
+import { createAwaitedIds } from "./awaited-ids.mjs";
 
 /**
  * TEAM-3747 D1 — the missed-unblock reconciliation sweep. A scheduled sentinel
@@ -85,6 +86,11 @@ function makeCascade(overrides = {}) {
     // TEAM-4120 FR-3: unwired by default, exactly as production is with
     // DEAD_SESSION_ESCALATION_MODE off, so every existing case is unchanged.
     ...(overrides.escalate ? { escalate: overrides.escalate } : {}),
+    // TEAM-4166 D2 §2.3 — the evidence-gated guard's deps. Optional; unwired by
+    // default so pre-4166 cases are byte-identical.
+    ...(overrides.awaitedIds ? { awaitedIds: overrides.awaitedIds } : {}),
+    ...(overrides.cleanExitRedispatchCap !== undefined ? { cleanExitRedispatchCap: overrides.cleanExitRedispatchCap } : {}),
+    ...(overrides.getLastStreamAt ? { getLastStreamAt: overrides.getLastStreamAt } : {}),
   });
   return { cascade, publishEvent, lease, redispatch, reawakenGate };
 }
@@ -99,11 +105,13 @@ function makeSweep(overrides = {}) {
     cascade,
     getChildTickets,
     leaseTtlMs: overrides.leaseTtlMs !== undefined ? overrides.leaseTtlMs : TTL_MS,
+    // TEAM-4166 D1/D2 — optional; unwired unless the test supplies one.
+    ...(overrides.awaitedIds ? { awaitedIds: overrides.awaitedIds } : {}),
     now: overrides.now || (() => NOW),
     log: () => {},
   });
   return { ...sweep, ddb, getChildTickets, cascade, publishEvent, lease, redispatch, reawakenGate,
-    store: overrides.store, blockTicket: overrides.blockTicket };
+    store: overrides.store, blockTicket: overrides.blockTicket, awaitedIds: overrides.awaitedIds };
 }
 
 // A non-terminal workflow whose in_progress dependent carries a stale running claim.
@@ -144,8 +152,25 @@ describe("AC-D1.4 — a parked in_progress dependent with a satisfied blocker bu
     expect(s.redispatch).toHaveBeenCalledTimes(1);
     expect(s.redispatch.mock.calls[0][1].ticketId).toBe("TEAM-2");
     expect(m.redispatched).toBe(1);
-    // The sweep recovers WITHOUT ever Readying via the cascade — no unblock journal.
-    expect(eventsOfType(s.publishEvent, "orchestrator.unblocked")).toHaveLength(0);
+    // TEAM-4187 — the recovery is now JOURNALED. The sweep never Readies this
+    // ticket (it was parked in in_progress the whole time), so before 4187 the
+    // event stream showed a stall and then a fresh claim with nothing in between.
+    const un = eventsOfType(s.publishEvent, "orchestrator.unblocked");
+    expect(un).toHaveLength(1);
+    expect(m.rewoken).toBe(1);
+    expect(un[0][0]).toBe("TEAM-2");
+    expect(un[0][2]).toMatchObject({
+      ticketId: "TEAM-2",
+      workflowId: "wf_1",
+      unblockedBy: "reconcile-sweep",
+      source: "reconcile-sweep",
+      previousStatus: "in_progress",
+      // No preconditionUnmet stamp on this fixture → a plain stale-lease re-wake.
+      reason: "stale_lease_rewake",
+    });
+    expect(un[0][2].blockedBy).toEqual([DONE]);
+    // Still no nudge: that one stays deliberately unpublished on the sweep path
+    // (TEAM-3969 — it would reset the workflow-manager liveness clock every sweep).
     expect(eventsOfType(s.publishEvent, "orchestrator.nudge")).toHaveLength(0);
   });
 
@@ -161,6 +186,8 @@ describe("AC-D1.4 — a parked in_progress dependent with a satisfied blocker bu
     expect(records[0].ReconcileSweepCandidates).toBe(1);
     expect(records[0].ReconcileRedispatch).toBe(1);
     expect(records[0].ReconcileSkippedLiveLease).toBe(0);
+    // TEAM-4187 — the re-wake is folded up from the per-candidate cascade metrics.
+    expect(records[0].ReconcileRewoken).toBe(1);
   });
 
   it("a second pass whose claim CAS is lost is a harmless no-op (idempotent recovery)", async () => {
@@ -749,5 +776,184 @@ describe("TEAM-3973 — an escalated ticket is HELD for the human in every statu
 
     expect(m.escalationHeld).toBe(0);
     expect(m.escalated).toBe(1); // second death → escalate, unchanged (TEAM-3969)
+  });
+});
+
+/**
+ * TEAM-4166 D1/D2 — the sweep is the backstop for the awaited-ids channel: it
+ * backfills tool-reported edges the level-triggered pickup missed, and it puts a
+ * once-only advisory SLA on a wait that has run long. When `awaitedIds` is
+ * unwired the sweep behaves exactly as pre-4166 (proven by every case above).
+ */
+describe("TEAM-4166 D1/D2 — awaited-ids backstop + wait-SLA", () => {
+  const FIX = "FIX-1";
+
+  function makeAwaited({ mode = "enforce", timeoutMinutes = 120, publishEvent, addBlockers } = {}) {
+    return createAwaitedIds({
+      addBlockers: addBlockers || vi.fn(async () => []),
+      annotatePreconditionUnmet: vi.fn(async () => {}),
+      publishEvent,
+      getTicket: vi.fn(async () => null),
+      store: { markAwaitTimeoutEmitted: vi.fn(async () => true) },
+      now: () => NOW,
+      mode,
+      timeoutMinutes,
+    });
+  }
+
+  // A child still awaiting an OPEN fix, with the tool edge NOT yet written.
+  const awaitingChild = (extra = {}) => ({
+    ticketId: "TEAM-2", status: "in_progress", assignee: "dev", type: "task",
+    blockedBy: [], updatedAt: STALE_STARTED,
+    preconditionUnmet: { awaitingIds: [FIX], reportedAt: new Date(NOW - 60 * 1000).toISOString() },
+    ...extra,
+  });
+
+  it("enforce: backfills the missing tool edge; the still-open fix keeps the child OUT of the candidate set", async () => {
+    const addBlockers = vi.fn(async () => [{ id: FIX, status: "written" }]);
+    const publishEvent = vi.fn(async () => {});
+    const awaitedIds = makeAwaited({ mode: "enforce", publishEvent, addBlockers });
+    const siblings = [{ ticketId: FIX, status: "in_progress", type: "task" }, awaitingChild()];
+    const s = makeSweep({ workflows: [workflow()], siblings, publishEvent, awaitedIds });
+
+    const m = await s.runSweep("enforce");
+
+    // The edge was backfilled…
+    expect(addBlockers).toHaveBeenCalledTimes(1);
+    expect(addBlockers.mock.calls[0][0]).toBe("TEAM-2");
+    expect(addBlockers.mock.calls[0][1]).toEqual([FIX]);
+    // …and because the awaited fix is still open, the child is not a candidate.
+    expect(m.candidates).toBe(0);
+    expect(m.awaitTimeouts).toBe(0);
+    expect(eventsOfType(publishEvent, "orchestrator.await_timeout")).toHaveLength(0);
+  });
+
+  it("shadow: logs the intent but writes NOTHING (no edge backfill, no event)", async () => {
+    const addBlockers = vi.fn(async () => []);
+    const publishEvent = vi.fn(async () => {});
+    const awaitedIds = makeAwaited({ mode: "shadow", publishEvent, addBlockers });
+    const siblings = [{ ticketId: FIX, status: "in_progress", type: "task" }, awaitingChild()];
+    const s = makeSweep({ workflows: [workflow()], siblings, publishEvent, awaitedIds });
+
+    await s.runSweep("shadow");
+
+    expect(addBlockers).not.toHaveBeenCalled();
+    expect(eventsOfType(publishEvent, "orchestrator.await_timeout")).toHaveLength(0);
+  });
+
+  it("enforce: a wait past the SLA emits orchestrator.await_timeout ONCE (advisory, never a humanNotification)", async () => {
+    const publishEvent = vi.fn(async () => {});
+    // 60-min SLA; the wait was reported 12h ago → breached.
+    const awaitedIds = makeAwaited({ mode: "enforce", timeoutMinutes: 60, publishEvent });
+    const child = awaitingChild({
+      blockedBy: [FIX], // edge already present → no backfill noise
+      preconditionUnmet: { awaitingIds: [FIX], reportedAt: STALE_STARTED },
+    });
+    const siblings = [{ ticketId: FIX, status: "in_progress", type: "task" }, child];
+    const s = makeSweep({ workflows: [workflow()], siblings, publishEvent, awaitedIds });
+
+    const m = await s.runSweep("enforce");
+
+    expect(m.awaitTimeouts).toBe(1);
+    const evs = eventsOfType(publishEvent, "orchestrator.await_timeout");
+    expect(evs).toHaveLength(1);
+    expect(evs[0][2]).toMatchObject({ ticketId: "TEAM-2", awaitingIds: [FIX], source: "reconcile-sweep" });
+    // Advisory only — NO escalation of any kind.
+    expect(eventsOfType(publishEvent, "agent.escalated")).toHaveLength(0);
+  });
+
+  it("shadow: the same breached wait emits NO event and bumps no counter", async () => {
+    const publishEvent = vi.fn(async () => {});
+    const awaitedIds = makeAwaited({ mode: "shadow", timeoutMinutes: 60, publishEvent });
+    const child = awaitingChild({
+      blockedBy: [FIX],
+      preconditionUnmet: { awaitingIds: [FIX], reportedAt: STALE_STARTED },
+    });
+    const siblings = [{ ticketId: FIX, status: "in_progress", type: "task" }, child];
+    const s = makeSweep({ workflows: [workflow()], siblings, publishEvent, awaitedIds });
+
+    const m = await s.runSweep("shadow");
+
+    expect(m.awaitTimeouts).toBe(0);
+    expect(eventsOfType(publishEvent, "orchestrator.await_timeout")).toHaveLength(0);
+  });
+
+  it("allBlockersResolved unions blockedBy with preconditionUnmet.awaitingIds", () => {
+    const s = makeSweep();
+    const openFix = [{ ticketId: FIX, status: "in_progress" }];
+    const doneFix = [{ ticketId: FIX, status: "done" }];
+    // No blockedBy edge yet, but an OPEN awaited id still gates the dispatch.
+    expect(s.allBlockersResolved({ ticketId: "T", blockedBy: [], preconditionUnmet: { awaitingIds: [FIX] } }, openFix)).toBe(false);
+    // Awaited id now terminal → resolved.
+    expect(s.allBlockersResolved({ ticketId: "T", blockedBy: [], preconditionUnmet: { awaitingIds: [FIX] } }, doneFix)).toBe(true);
+  });
+
+  it("guard returns 'exited-ok' → tallied to m.exitedOk, deadSessionRetries untouched", async () => {
+    const store = {
+      incrementDeadSessionRetry: vi.fn(async () => 1),
+      incrementCleanExitRedispatch: vi.fn(async () => true),
+      setTaskStatus: vi.fn(async () => {}),
+      appendNotification: vi.fn(async () => {}),
+    };
+    // A genuinely-completed dependent whose blocker resolved; retry budget spent.
+    const wf = workflow({
+      deadSessionRetries: { "TEAM-2": 1 },
+      agentTasks: { "TEAM-2": { id: "t2", agentId: "dev", ticketId: "TEAM-2", status: "running", startedAt: STALE_STARTED, completedAt: "2026-09-01T06:00:00Z" } },
+    });
+    const s = makeSweep({ workflows: [wf], siblings: inProgressStale, store, cleanExitRedispatchCap: 3 });
+    const cap = captureMetrics();
+
+    const m = await s.runSweep("enforce");
+    const records = cap.records();
+    cap.restore();
+
+    expect(m.exitedOk).toBe(1);
+    expect(store.incrementCleanExitRedispatch).toHaveBeenCalledTimes(1);
+    expect(store.incrementDeadSessionRetry).not.toHaveBeenCalled();
+    expect(m.escalated).toBe(0);
+    expect(records[0].ReconcileExitedOk).toBe(1);
+  });
+
+  it("guard returns 'awaiting' at the clean-exit cap → tallied to m.awaiting, NO escalation", async () => {
+    const store = {
+      incrementDeadSessionRetry: vi.fn(async () => 1),
+      incrementCleanExitRedispatch: vi.fn(async () => true),
+      setTaskStatus: vi.fn(async () => {}),
+      appendNotification: vi.fn(async () => {}),
+      markAwaitTimeoutEmitted: vi.fn(async () => true),
+    };
+    const publishEvent = vi.fn(async () => {});
+    const awaitedIds = makeAwaited({ mode: "enforce", publishEvent });
+    // Parked clean, awaited fix DONE, but already re-woken to the cap (3).
+    const wf = workflow({
+      deadSessionRetries: { "TEAM-2": 1 },
+      cleanExitRedispatches: { "TEAM-2": 3 },
+    });
+    const child = {
+      ticketId: "TEAM-2", status: "in_progress", assignee: "dev", type: "task",
+      blockedBy: [FIX], updatedAt: STALE_STARTED,
+      preconditionUnmet: { awaitingIds: [FIX], reportedAt: "2026-09-01T09:00:00Z" },
+    };
+    const siblings = [{ ticketId: FIX, status: "done", type: "task" }, child];
+    const s = makeSweep({ workflows: [wf], siblings, store, publishEvent, awaitedIds, cleanExitRedispatchCap: 3 });
+
+    const m = await s.runSweep("enforce");
+
+    expect(m.awaiting).toBe(1);
+    expect(m.escalated).toBe(0);
+    expect(store.incrementCleanExitRedispatch).not.toHaveBeenCalled();
+    expect(eventsOfType(publishEvent, "agent.escalated")).toHaveLength(0);
+  });
+
+  it("healthy enforce sweep emits explicit zeros for the D1/D2 EMF fields", async () => {
+    const s = makeSweep({ workflows: [workflow()], siblings: inProgressStale });
+    const cap = captureMetrics();
+    await s.runSweep("enforce");
+    const records = cap.records();
+    cap.restore();
+
+    expect(records[0].ReconcileExitedOk).toBe(0);
+    expect(records[0].ReconcileAwaiting).toBe(0);
+    expect(records[0].ReconcileAwaitTimeouts).toBe(0);
   });
 });

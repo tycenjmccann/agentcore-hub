@@ -718,3 +718,42 @@ describe("transition_ticket — reaching done from in_progress vs from blocked (
     expect(live.transitions.map((t) => t.id)).toContain("done");
   });
 });
+
+/**
+ * TEAM-4167 D3 FR-3.2 — the DDB provider's Done-transition contract.
+ *
+ * The parity half of lambda/agentcore-hub-jira/transition-resolution.test.mjs:
+ * both providers must return a top-level `resolvedAt` ISO string when a ticket
+ * reaches done, so the caller reads it the same way regardless of backend. This
+ * pins the REAL handler response (not a fake) AND that resolvedAt is persisted to
+ * the row (additive — never at the cost of status/updatedAt).
+ */
+describe("transition_ticket — resolvedAt on Done (TEAM-4167 D3 FR-3.2 contract)", () => {
+  const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+  const transition = (args) => handler({ name: "Tickets___transition_ticket", arguments: args });
+
+  it("returns resolvedAt on the response AND writes it to the row on a real done transition", async () => {
+    h.state.items[SHIP] = { ticketId: SHIP, status: "in_progress", assignee: "agentcore_hub_release_manager" };
+
+    const res = await transition({ ticket_id: SHIP, to_status: "done" });
+
+    expect(res.to).toBe("done");
+    expect(res.resolvedAt).toMatch(ISO_RE);
+    // Persisted additively: the row write carries resolvedAt alongside status.
+    const upd = h.state.statusUpdates[0];
+    expect(upd.ExpressionAttributeNames["#ra"]).toBe("resolvedAt");
+    expect(upd.ExpressionAttributeValues[":ra"]).toBe(res.resolvedAt);
+    // resolvedAt == the same `now` used for updatedAt (one clock read).
+    expect(upd.ExpressionAttributeValues[":u"]).toBe(res.resolvedAt);
+  });
+
+  it("does NOT stamp resolvedAt on a non-done transition", async () => {
+    h.state.items[SHIP] = { ticketId: SHIP, status: "ready", assignee: "agentcore_hub_backend_dev" };
+
+    const res = await transition({ ticket_id: SHIP, to_status: "in_progress" });
+
+    expect(res.to).toBe("in_progress");
+    expect("resolvedAt" in res).toBe(false);
+    expect(h.state.statusUpdates[0].UpdateExpression).not.toContain("resolvedAt");
+  });
+});

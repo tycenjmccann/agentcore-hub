@@ -211,6 +211,138 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   };
 }
 
+// TEAM-4166 §1.2 — the structured "I can't finish yet" channel. An agent that
+// finds its ticket blocked on sibling work that isn't done reports the ids it is
+// waiting on instead of either lying via report_completion (which would Done the
+// ticket) or spinning silently. This is a NON-terminal signal: it stamps
+// preconditionUnmet on the ticket — the evidence the orchestrator's D1 re-wake
+// and D2 liveness clock read — via the SAME tickets-Lambda invoke path
+// report_completion uses, but with the annotate action, which NEVER transitions
+// the ticket and NEVER writes a completions/<id>.json record.
+//
+// TEAM-4189 — the RETURN VALUE distinguishes "stamp persisted" from "stamp
+// failed", because the stamp is the only evidence the orchestrator's D1 re-wake
+// and D2 liveness clock read: a silently dropped stamp makes a legitimately
+// parked agent indistinguishable from a dead session. So:
+//   { status: "waiting", stampPersisted: true,  … }  → the stamp is on the ticket
+//   { status: "error",   stampPersisted: false, error, … } → it is not; the agent
+//     must record its resume condition as a ticket comment before stopping.
+// Note the asymmetry: a VALIDATION error (bad ticket_id / no awaiting ids) returns
+// before any stamp is attempted and carries NO stampPersisted key at all.
+const TICKET_KEY_RE = /^[A-Z][A-Z0-9]+-\d+$/;
+const AWAITING_CAP = 20;
+const NOTE_MAX = 2000;
+// A stamp failure can carry a Lambda stack trace. Cap it in both the event detail
+// and the tool response so one bad invoke can't bloat the DDB item or the reply.
+const STAMP_ERROR_MAX = 300;
+
+async function reportPreconditionUnmet({ ticket_id, awaiting_ids, note = "", workflow_id, agent_id }) {
+  const self = typeof ticket_id === "string" ? ticket_id.trim() : "";
+  if (!TICKET_KEY_RE.test(self)) {
+    return { status: "error", message: "invalid ticket_id" };
+  }
+  // Split on whitespace OR commas (agents pass "TEAM-1, TEAM-2" or "TEAM-1 TEAM-2"),
+  // keep only ticket-shaped ids that aren't the reporter itself, dedupe, cap.
+  const raw = Array.isArray(awaiting_ids)
+    ? awaiting_ids
+    : typeof awaiting_ids === "string"
+      ? awaiting_ids.split(/[\s,]+/)
+      : [];
+  const awaitingIds = [];
+  for (const item of raw) {
+    const id = typeof item === "string" ? item.trim() : "";
+    if (!TICKET_KEY_RE.test(id) || id === self || awaitingIds.includes(id)) continue;
+    awaitingIds.push(id);
+    if (awaitingIds.length >= AWAITING_CAP) break;
+  }
+  if (awaitingIds.length === 0) {
+    return { status: "error", message: "no valid awaiting_ids" };
+  }
+
+  const noteText = typeof note === "string" ? note.slice(0, NOTE_MAX) : "";
+  const reportedAt = new Date().toISOString();
+  const agentId = agent_id || null;
+
+  // Set only by the annotate invoke below: true ONLY when the stamp is provably
+  // on the ticket. Every other path (invoke throw, error payload, Lambda-level
+  // FunctionError, synthetic id) leaves it false.
+  let stampPersisted = false;
+  let stampError = null;
+
+  // Same LambdaClient.invoke path report_completion uses for the Done transition,
+  // but the annotate action only STAMPS preconditionUnmet — no status change.
+  if (self && !self.startsWith("HEALTHCHECK-") && !self.startsWith("TEST-")) {
+    try {
+      const resp = await lambda.send(new InvokeCommand({
+        FunctionName: TICKET_TOOLS_LAMBDA,
+        InvocationType: "RequestResponse",
+        Payload: Buffer.from(JSON.stringify({
+          tool_name: "Tickets___annotate_precondition_unmet",
+          parameters: { ticket_id: self, awaitingIds, note: noteText, reportedAt, agentId, source: "tool" },
+        })),
+      }));
+      const payload = JSON.parse(new TextDecoder().decode(resp.Payload));
+      // Three failure shapes, all of which mean "no stamp on the ticket":
+      // an UNHANDLED tickets-Lambda exception (HTTP 200 + FunctionError, payload
+      // { errorType, errorMessage, trace } — no `.error` key, so it has to be
+      // checked FIRST or it reads as success), and the handled `{ error }` shape.
+      if (resp.FunctionError || payload.errorMessage) {
+        // TEAM-4189: errorMessage/FunctionError could in principle stringify
+        // empty — never let a falsy stampError slip status back to "waiting".
+        stampError = String(payload.errorMessage || resp.FunctionError) || "annotate failed";
+        console.error(`[report_precondition_unmet] annotate failed for ${self}:`, stampError);
+      } else if (payload.error) {
+        console.error(`[report_precondition_unmet] annotate failed for ${self}:`, payload.error);
+        // payload.error is truthy here but could be e.g. `true` or a value
+        // whose String() is empty — same non-empty guarantee as above.
+        stampError = String(payload.error) || "annotate failed";
+      } else {
+        console.log(`[report_precondition_unmet] ${self} awaiting ${awaitingIds.join(", ")}`);
+        stampPersisted = true;
+      }
+    } catch (err) {
+      console.error(`[report_precondition_unmet] Error annotating ${self}:`, err && err.message);
+      // TEAM-4189: a throw with no/empty message (a bare `throw undefined` or
+      // `throw new Error("")`) must still surface as a failed stamp — never a
+      // falsy stampError, which would fall through to a "waiting" success.
+      stampError = (err && err.message) || String(err) || "annotate invoke failed";
+    }
+  }
+  // else: HEALTHCHECK-/TEST- ids intentionally skip the invoke — synthetic ids
+  // that are never parked and never re-woken, so there is no stamp to persist:
+  // status stays "waiting" (nothing is wrong) with stampPersisted false.
+
+  if (stampError) stampError = String(stampError).slice(0, STAMP_ERROR_MAX);
+
+  // Journey log: dossier-only. The derivation trigger is the ticket stamp above
+  // (read by the orchestrator), NOT this event. stampPersisted/stampError ride
+  // along so the dossier shows a failed stamp instead of hiding it.
+  await publishJourneyEvent(workflow_id || self, "agent.precondition_unmet", {
+    workflowId: workflow_id || null, ticketId: self, awaitingIds, note: noteText, agentId, reportedAt,
+    stampPersisted, stampError,
+  });
+
+  const awaiting = awaitingIds.join(", ");
+  // Gated on stampError, not on !stampPersisted — that is what keeps the
+  // synthetic-id path (no stamp attempted, no error) on status "waiting".
+  if (stampError) {
+    return {
+      status: "error",
+      stampPersisted: false,
+      error: stampError,
+      message: `precondition stamp could not be written: ${stampError}; awaiting ${awaiting}. Record the resume condition (awaiting ${awaiting}) as a ticket comment so a human/orchestrator can re-wake you.`,
+      awaitingIds,
+    };
+  }
+
+  return {
+    status: "waiting",
+    stampPersisted,
+    message: `precondition unmet; awaiting ${awaiting}`,
+    awaitingIds,
+  };
+}
+
 // ─── Manifest Updates ──────────────────────────────────────────────────────────
 
 const PHASE_MAP = {
@@ -329,10 +461,12 @@ const TOOLS = {
   submit_ticket_plan: submitTicketPlan,
   save_design_doc: saveDesignDoc,
   report_completion: reportCompletion,
+  report_precondition_unmet: reportPreconditionUnmet,
   // Full prefixed names (sent by main.py @tool functions)
   "WorkflowOutput___submit_ticket_plan": submitTicketPlan,
   "WorkflowOutput___save_design_doc": saveDesignDoc,
   "WorkflowOutput___report_completion": reportCompletion,
+  "WorkflowOutput___report_precondition_unmet": reportPreconditionUnmet,
   // S3 storage tools (folded in from defunct agentcore-hub-s3-tools)
   "S3Storage___read_object": s3ReadObject,
   "S3Storage___write_object": s3WriteObject,
@@ -346,6 +480,9 @@ const TOOLS = {
 function inferToolFromArgs(args) {
   if (args.requirements && args.tickets) return "submit_ticket_plan";
   if (args.title && args.content && args.agent_id) return "save_design_doc";
+  // awaiting_ids is the discriminant for the non-terminal precondition channel —
+  // checked BEFORE report_completion so a call carrying both never Dones the ticket.
+  if (args.ticket_id && args.awaiting_ids) return "report_precondition_unmet";
   if (args.ticket_id && args.summary) return "report_completion";
   if (args.tickets) return "submit_ticket_plan";
   if (args.content && args.workflow_id) return "save_design_doc";

@@ -364,7 +364,12 @@ async function buildCard(workflowId, workflow, pricing) {
       agentWorkMs,
       busyMs,
       idleMs: activeMs == null ? null : Math.max(0, activeMs - busyMs),
-      agentUtilization: activeMs ? round4(busyMs / activeMs) : null,
+      // busyMs/activeMs are kept raw above so this clamp is auditable. FR-3.6:
+      // busy (union of task intervals) can exceed active (wall − humanWait) when
+      // humanWait over-subtracts, which reads as a >100% utilization — nonsense
+      // on the card. Clamp to 1 and floor the denominator so a near-zero active
+      // window can't blow the ratio up. utilizationClamped flags a clamped row.
+      ...computeUtilization(busyMs, activeMs),
       humanGates: count("review.needed"),
       phases,
     },
@@ -1176,32 +1181,54 @@ function unionMs(intervals) {
   return total;
 }
 
-function computeHumanWait(events, endedMs) {
-  // Union of review.needed → (review.approved|review.rejected|end) intervals.
-  // Union, not sum: gates overlap (parallel reviews, re-pings) and a summed
-  // wait can exceed wall-clock, which reads as nonsense on the card.
+// FR-3.6 — a run's active window can be understated (humanWait over-subtracted),
+// which drives busy/active above 1. The floor stops a near-zero active window
+// from exploding the ratio; the min clamps the residual overshoot to 100%.
+const MIN_ACTIVE_MS = 1000;
+
+/**
+ * Agent utilization = busy (union of task intervals) ÷ active (wall − humanWait),
+ * clamped to [0,1] with a MIN_ACTIVE_MS denominator floor. Returns null when the
+ * active window is unknown/zero. utilizationClamped is true iff the clamp
+ * actually fired (the raw ratio over the floored denominator exceeded 1) — the
+ * auditable signal that the underlying busy/active data disagreed.
+ */
+export function computeUtilization(busyMs, activeMs) {
+  if (!activeMs) return { agentUtilization: null, utilizationClamped: false };
+  const ratio = busyMs / Math.max(activeMs, MIN_ACTIVE_MS);
+  return { agentUtilization: round4(Math.min(1, ratio)), utilizationClamped: ratio > 1 };
+}
+
+export function computeHumanWait(events, endedMs) {
+  // Union of review.needed → resolution intervals. Union, not sum: gates overlap
+  // (parallel reviews, re-pings) and a summed wait can exceed wall-clock, which
+  // reads as nonsense on the card.
   const needed = events.filter((e) => e.type === "review.needed");
-  const resolved = events.filter((e) => e.type === "review.approved" || e.type === "review.rejected");
+  // FR-3.2: review.resolved is the authoritative gate-resolution signal (the
+  // provider stamps resolvedAt when the gate ticket reaches Done). Prefer it,
+  // keyed on ticketId with resolvedAt ≥ requestedAt; then fall back to the legacy
+  // review.approved/review.rejected events for runs recorded before it existed.
+  const resolvedEvents = events.filter((e) => e.type === "review.resolved");
+  const legacyResolved = events.filter((e) => e.type === "review.approved" || e.type === "review.rejected");
+  const resolvedAtMs = (r) => Date.parse(r.detail?.resolvedAt || r.timestamp);
   const intervals = [];
   for (const n of needed) {
     const reqAt = Date.parse(n.timestamp);
     const tid = n.detail?.ticketId;
-    const match = resolved.find((r) => r.detail?.ticketId === tid && Date.parse(r.timestamp) > reqAt);
-    const end = match ? Date.parse(match.timestamp) : endedMs;
-    if (end > reqAt) intervals.push([reqAt, end]);
-  }
-  intervals.sort((a, b) => a[0] - b[0]);
-  let total = 0, curStart = null, curEnd = null;
-  for (const [s, e] of intervals) {
-    if (curEnd === null || s > curEnd) {
-      if (curEnd !== null) total += curEnd - curStart;
-      curStart = s; curEnd = e;
-    } else if (e > curEnd) {
-      curEnd = e;
+    let end = null;
+    const resolved = resolvedEvents.find((r) => r.detail?.ticketId === tid && resolvedAtMs(r) >= reqAt);
+    if (resolved) {
+      end = resolvedAtMs(resolved);
+    } else {
+      const legacy = legacyResolved.find((r) => r.detail?.ticketId === tid && Date.parse(r.timestamp) > reqAt);
+      if (legacy) end = Date.parse(legacy.timestamp);
     }
+    // FR-3.2 / toolkit `open` semantics: an UNRESOLVED gate contributes NO wait.
+    // (The old code charged an open gate all the way to run-end, inflating
+    // humanWait past wall-clock. endedMs is now unused for an open gate.)
+    if (end != null && end > reqAt) intervals.push([reqAt, end]);
   }
-  if (curEnd !== null) total += curEnd - curStart;
-  return total;
+  return unionMs(intervals);
 }
 
 // ─── Markdown render ──────────────────────────────────────────────────────────

@@ -22,6 +22,12 @@ Globals:
         DEAD_SESSION_DETECTOR_MODE: !Ref DeadSessionDetectorMode
         CASCADE_EXTENDED_STATES: !Ref CascadeExtendedStates
         RECONCILE_SWEEP_MODE: !Ref ReconcileSweepMode
+        # Awaited-ids re-wake (TEAM-4166 D1/D2). Orchestrator-only (the derived
+        # hook, level-triggered pickup, cascade/sweep/detector wiring all live
+        # there); rides Globals for the same one-place-to-set parity.
+        AWAITED_IDS_MODE: !Ref AwaitedIdsMode
+        AWAITED_IDS_TIMEOUT_MINUTES: !Ref AwaitedIdsTimeoutMinutes
+        CLEAN_EXIT_REDISPATCH_CAP: !Ref CleanExitRedispatchCap
         # Globals reaches all three writers (orchestrator, agent-invoker,
         # events-writer) in one place, which is exactly the requirement: the
         # double-write only collapses when all three agree on the mode.
@@ -111,6 +117,42 @@ Parameters:
       dependents. Default "off" matches the code's unset default, so the backstop
       ships dark — same rollout posture as deploy.sh (TEAM-3763 F2), which only
       forwards RECONCILE_SWEEP_MODE when explicitly set.
+
+  AwaitedIdsMode:
+    Type: String
+    Default: "off"
+    AllowedValues: ["off", "shadow", "enforce"]
+    Description: >
+      Awaited-ids re-wake (TEAM-4166 D1/D2). A release manager that parks itself
+      in_progress on a sub-cap CHANGES-NEEDED and files sibling fix tickets never
+      re-wakes when those fixes close — its blockedBy was frozen at def-time. When
+      on, a fix ticket's spawnedBy origin (and any tool-reported precondition) is
+      written as a REAL blockedBy edge on the parked ticket (status preserved via
+      preserveStatusIf), so it re-wakes through the SAME unblock cascade with zero
+      predicate change; the preconditionUnmet stamp is the D2 evidence that tells a
+      clean park from a dead session. off = byte-identical (no edge writes, no
+      derived hook, no level-triggered pickup — this flag MUTATES ticket state, so
+      the safe default is dark); shadow = compute + metrics/logs, ZERO writes;
+      enforce = write the edges + stamp. A garbage value coalesces to OFF (fail
+      safe for a state-mutating flag). deploy.sh only forwards it when set.
+
+  AwaitedIdsTimeoutMinutes:
+    Type: String
+    Default: "120"
+    Description: >
+      Wait-SLA for an awaited ticket (TEAM-4166 D1 §5). Once a ticket has awaited
+      its open fixes longer than this, the sweep/detector emit ONE advisory
+      orchestrator.await_timeout event (never a humanNotification, so it cannot
+      trip parkedOnHuman). Default 120 minutes.
+
+  CleanExitRedispatchCap:
+    Type: String
+    Default: "3"
+    Description: >
+      Clean-exit re-wake cap (TEAM-4166 D2 §2.3). How many times a cleanly-parked
+      or genuinely-completed ticket may be automatically re-woken (counted on
+      cleanExitRedispatches, NOT deadSessionRetries) before the wait-SLA takes
+      over — it is NEVER escalated as a dead session on this clean path. Default 3.
 
   EventDedupeMode:
     Type: String

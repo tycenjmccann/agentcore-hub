@@ -203,6 +203,18 @@ export default defineConfig({
       // cd-registry.mjs — pure registry parsing / repo matching / ship-phase
       // stripping (which repos the hub merges + deploys); no I/O.
       "lambda/orchestrator/cd-registry.test.mjs",
+      // review-resolved.mjs (TEAM-4167 D3 FR-3.2) — the canonical review.resolved
+      // detail builder every human gate emits at completion; pure, no I/O. The
+      // .mjs↔.ts honesty-lint/validate parity is asserted separately by the
+      // auto-included src/lib/workflow/workflow-def-validate-parity.test.ts.
+      "lambda/orchestrator/review-resolved.test.mjs",
+      // phase-change-lifecycle (TEAM-4167 D3 FR-3.3 CALL 6 F1) — index.mjs REAL,
+      // AWS/store seams mocked: the exported announcePhaseTransition emits the
+      // intake row (anchored at workflow.startedAt) + the initial agent phase
+      // behind ONE markInitialPhaseAnnounced CAS (exactly-once across a second
+      // dispatch, both creation paths), and a forward advance emits one phase row
+      // and calls advancePhase.
+      "lambda/orchestrator/phase-change-lifecycle.test.mjs",
       // event-id.mjs (TEAM-4120 FR-2) — the deterministic event id that collapses
       // the events table's EventBridge/direct double-write. Pure (node:crypto
       // only): determinism, the 13-digit-ms id shape the anomaly-watcher's
@@ -291,6 +303,32 @@ export default defineConfig({
       // park-it and preserve-the-status conditions are mutually exclusive and
       // jointly exhaustive, which a read-then-write could not be.
       "lambda/orchestrator/ticket-blockers.test.mjs",
+      // awaited-ids.mjs (TEAM-4166 D1) — the awaited-ids re-wake decision module.
+      // Fully DI'd (no AWS): mode normalization, the off/shadow/enforce write
+      // rules, the addBlockers seam contract (both return shapes), the
+      // preconditionUnmet stamp, the once-only await-timeout CAS, and the EMF
+      // record — all asserted under a jira == dynamodb provider parity loop.
+      "lambda/orchestrator/awaited-ids.test.mjs",
+      // report_precondition_unmet channel (TEAM-4166 §1.2) — the non-terminal
+      // twin of report_completion. workflow-output/precondition-unmet: the REAL
+      // handler's ONLY side effects are the annotate invoke + the journey event
+      // (never a transition, never a completions/<id>.json write); parse/dedup/
+      // cap/self-drop and the inferToolFromArgs routing that keeps awaiting_ids
+      // off the completion path. The two annotate-precondition files pin each
+      // ticket Lambda's action in isolation (DDB column merge / Jira labels +
+      // marker + the label→awaitingIds round-trip). The jira twin
+      // (annotate-precondition.test.mjs) moved to node:test — CI runs
+      // `node --test lambda/agentcore-hub-jira`, and vi.mock/vi.stubGlobal abort
+      // under that runner. precondition-contract drives BOTH ticket Lambdas
+      // under a `for (provider of [dynamodb, jira])` loop with vi.mock on the
+      // DynamoDB Lambda's SDK client, so it lives in agentcore-hub-tickets/
+      // (vitest-only in CI) rather than the jira directory it also imports —
+      // proving the SAME `{ ticketId, preconditionUnmet }` shape and that
+      // NEITHER transitions, the parity workflow-output relies on to stay
+      // backend-blind.
+      "lambda/workflow-output/precondition-unmet.test.mjs",
+      "lambda/agentcore-hub-tickets/annotate-precondition.test.mjs",
+      "lambda/agentcore-hub-tickets/precondition-contract.test.mjs",
       // yteqfl loop 2 replay (TEAM-4121 FR-9) — the real prod failure this FR
       // exists for, from the dossier fixture: TEAM-4089 closed claiming live
       // evidence with none, QA re-verify TEAM-4092 caught it 48m later and filed
@@ -354,6 +392,30 @@ export default defineConfig({
       // the ship review's change set enumerates its own PR's files only — so an
       // advisory branch's files cannot enter the reviewed diff.
       "lambda/orchestrator/advisory-routing.test.mjs",
+      // f50ucz replay (TEAM-4166 D1/D2 acceptance) — the real ship re-wake stall,
+      // replayed through the REAL awaited-ids + cascade + reconcile-sweep wired as
+      // index.mjs wires them. ship-rewake: TEAM-4126's awaited ship/CI fixes become
+      // real blockedBy edges + a preconditionUnmet stamp, and the cascade re-drives
+      // it the moment the LAST fix (TEAM-4157) lands (08:27Z) instead of the 19:46Z
+      // human nudge — plus the FR-1.4 wait-SLA backstop, jira==dynamodb parity, the
+      // AWAITED_IDS_MODE=off byte-identity, and the create/annotate seam shapes.
+      // liveness: the same slice through the D2 evidence-gated sweep — the false
+      // dead_session_retry_exhausted escalation prod actually fired is now withheld
+      // while the stamp is present, and STILL fires (with all six evidence fields)
+      // once the stamp is gone (D1 off).
+      "lambda/orchestrator/replay-f50ucz-ship-rewake.test.mjs",
+      "lambda/orchestrator/replay-f50ucz-liveness.test.mjs",
+      // TEAM-4166 D2 — the analyzer liveness clock: mode normalization (garbage →
+      // shadow, never off), per-phase thresholds + the span-fresh proof-of-life
+      // override, buildLivenessTickets bucketing, decideWatch worst-ticket pick,
+      // phaseForAgent mapping, EMF zeros, the §2.5/§2.1 sync invariants vs the
+      // lease TTL + src/lib/workflow/stale.ts, and the §2.4 parkedOnHuman gate.
+      "lambda/workflow-analyzer/liveness.test.mjs",
+      // TEAM-4166 D2 acceptance replay — the two real reduced dossiers driven
+      // tick-by-tick through liveness.mjs: FR-2.3 (f50ucz dev window + ymo7dm QA
+      // no longer thrash), FR-2.4 (the genuinely idle RM still fires stale:ship),
+      // FR-2.5 (the bare manager_escalation does not park), + shadow safety.
+      "lambda/workflow-analyzer/replay-liveness.test.mjs",
     ],
     // Keep unit tests away from the Playwright specs under tests/.
     exclude: ["tests/**", "node_modules/**", "demo/**"],
