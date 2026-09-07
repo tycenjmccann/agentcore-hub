@@ -152,8 +152,25 @@ describe("AC-D1.4 — a parked in_progress dependent with a satisfied blocker bu
     expect(s.redispatch).toHaveBeenCalledTimes(1);
     expect(s.redispatch.mock.calls[0][1].ticketId).toBe("TEAM-2");
     expect(m.redispatched).toBe(1);
-    // The sweep recovers WITHOUT ever Readying via the cascade — no unblock journal.
-    expect(eventsOfType(s.publishEvent, "orchestrator.unblocked")).toHaveLength(0);
+    // TEAM-4187 — the recovery is now JOURNALED. The sweep never Readies this
+    // ticket (it was parked in in_progress the whole time), so before 4187 the
+    // event stream showed a stall and then a fresh claim with nothing in between.
+    const un = eventsOfType(s.publishEvent, "orchestrator.unblocked");
+    expect(un).toHaveLength(1);
+    expect(m.rewoken).toBe(1);
+    expect(un[0][0]).toBe("TEAM-2");
+    expect(un[0][2]).toMatchObject({
+      ticketId: "TEAM-2",
+      workflowId: "wf_1",
+      unblockedBy: "reconcile-sweep",
+      source: "reconcile-sweep",
+      previousStatus: "in_progress",
+      // No preconditionUnmet stamp on this fixture → a plain stale-lease re-wake.
+      reason: "stale_lease_rewake",
+    });
+    expect(un[0][2].blockedBy).toEqual([DONE]);
+    // Still no nudge: that one stays deliberately unpublished on the sweep path
+    // (TEAM-3969 — it would reset the workflow-manager liveness clock every sweep).
     expect(eventsOfType(s.publishEvent, "orchestrator.nudge")).toHaveLength(0);
   });
 
@@ -169,6 +186,8 @@ describe("AC-D1.4 — a parked in_progress dependent with a satisfied blocker bu
     expect(records[0].ReconcileSweepCandidates).toBe(1);
     expect(records[0].ReconcileRedispatch).toBe(1);
     expect(records[0].ReconcileSkippedLiveLease).toBe(0);
+    // TEAM-4187 — the re-wake is folded up from the per-candidate cascade metrics.
+    expect(records[0].ReconcileRewoken).toBe(1);
   });
 
   it("a second pass whose claim CAS is lost is a harmless no-op (idempotent recovery)", async () => {

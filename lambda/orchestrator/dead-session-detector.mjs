@@ -53,7 +53,10 @@ import { SWEEP_CAP, createOpenWorkflowScan } from "./sweep-scan.mjs";
 // TEAM-4166 §0 — the ONE union-blocker predicate the cascade / reconcile-sweep
 // use, so the detector's clean-park anti-thrash decides identically (blockedBy ∪
 // preconditionUnmet.awaitingIds, all terminal in the sibling snapshot). Pure.
-import { unionBlockersResolved } from "./cascade.mjs";
+// TEAM-4187 — blockerUnion is the SAME union the cascade journals on its own
+// re-wake path, imported (not re-derived) so the two orchestrator.unblocked
+// emitters can never disagree about what a ticket was waiting on.
+import { unionBlockersResolved, blockerUnion } from "./cascade.mjs";
 // TEAM-4184 F1 — the ONE D2 evidence predicate, shared with cascade.mjs so the two
 // guards can never diverge. Pure; awaited-ids.mjs has zero AWS imports.
 import { parkEvidence, awaitedWaitedMs } from "./awaited-ids.mjs";
@@ -387,6 +390,32 @@ export function createDetector(deps) {
         log(redispatched
           ? `detector.exited_ok — ${ticketId} clean park/exit re-woken (not dead) (sweep ${sweepId})`
           : `detector.exited_ok_claim_lost — ${ticketId} clean re-wake lost the claim CAS (sweep ${sweepId})`);
+        // TEAM-4187 — journal the re-wake, same shape the cascade emits. This is
+        // the detector's twin of cascade.stealAndRedispatch: a ticket that was
+        // PARKED in in_progress just got a fresh claim, and until now nothing in
+        // the event stream said so. ONLY this site: the dead-path first retry
+        // (retryOrEscalate above) is already announced by its own agent.error,
+        // and a retried DEAD session is not an unblock. Guarded on
+        // `redispatched` — the claim CAS is the idempotency, so a lost CAS
+        // journals nothing. Publish failure is logged and swallowed: the
+        // recovery has already completed and must not be reported as a failure.
+        if (redispatched) {
+          m.rewoken = (m.rewoken || 0) + 1;
+          try {
+            await publishEvent(ticketId, "orchestrator.unblocked", {
+              ticketId,
+              unblockedBy: "dead-session-detector",
+              workflowId: workflow.id,
+              blockedBy: blockerUnion(ticket),
+              previousStatus: ticket?.status || "in_progress",
+              reason: ticket?.preconditionUnmet?.awaitingIds?.length ? "awaited_rewake" : "stale_lease_rewake",
+              source: "dead-session-detector",
+              timestamp: new Date(now()).toISOString(),
+            });
+          } catch (err) {
+            log(`detector.rewake_event_failed — ${ticketId}: ${err?.message || err} (sweep ${sweepId})`);
+          }
+        }
         return;
       }
 
@@ -469,6 +498,10 @@ export function createDetector(deps) {
       // or a held clean park at the cap (awaiting), NEITHER an escalation.
       exitedOk: 0,
       awaiting: 0,
+      // TEAM-4187 — clean-exit re-wakes this sweep journaled as
+      // orchestrator.unblocked. A subset of exitedOk: exitedOk counts the
+      // DECISION, rewoken counts the re-dispatch that actually landed.
+      rewoken: 0,
     };
 
     if (mode === "off") {
@@ -731,6 +764,8 @@ export function emitMetrics(m) {
           // TEAM-4166 D2 §2.3 — evidence-gated re-wake outcomes.
           { Name: "DetectorExitedOk", Unit: "Count" },
           { Name: "DetectorAwaiting", Unit: "Count" },
+          // TEAM-4187 — clean-exit re-wakes journaled as orchestrator.unblocked.
+          { Name: "DetectorRewoken", Unit: "Count" },
         ],
       }],
     },
@@ -746,5 +781,6 @@ export function emitMetrics(m) {
     DetectorSweepTruncated: m.truncated ? 1 : 0,
     DetectorExitedOk: m.exitedOk || 0,
     DetectorAwaiting: m.awaiting || 0,
+    DetectorRewoken: m.rewoken || 0,
   }));
 }

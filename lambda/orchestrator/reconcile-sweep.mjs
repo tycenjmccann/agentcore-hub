@@ -194,6 +194,10 @@ export function createReconcileSweep(deps) {
       exitedOk: 0,
       awaiting: 0,
       awaitTimeouts: 0,
+      // TEAM-4187 — parked in_progress dependents this sweep re-woke (and
+      // journaled as orchestrator.unblocked). Folded up from the per-candidate
+      // cascade metrics, since the emit lives in cascade.stealAndRedispatch.
+      rewoken: 0,
     };
 
     if (mode === "off") {
@@ -244,18 +248,27 @@ export function createReconcileSweep(deps) {
 
           m.candidates++;
 
+          // TEAM-4187 — the per-candidate cascade accumulator is no longer a
+          // throwaway: `rewoken` is counted inside stealAndRedispatch (where the
+          // journal event is emitted), so it has to be folded up into the sweep's
+          // own metrics. Shadow can never increment it (the emit is enforce-only),
+          // but both branches fold so the two stay symmetric.
+          const cm = newCascadeMetrics();
+
           if (mode === "shadow") {
             // Observe only — run the same routing to learn the outcome shape,
             // but reconcileDependent honors shadow mode and performs no writes.
-            const outcome = await cascade.reconcileDependent(sibling, "reconcile-sweep", workflow, newCascadeMetrics(), "shadow", siblings);
+            const outcome = await cascade.reconcileDependent(sibling, "reconcile-sweep", workflow, cm, "shadow", siblings);
             tally(m, outcome);
+            m.rewoken += cm.rewoken || 0;
             log(`reconcile.would_recover (shadow) — ${sibling.ticketId} status=${sibling.status} → ${outcome} (sweep ${sweepId})`);
             continue;
           }
 
           // enforce — re-drive through the ONE implementation of the invariant.
-          const outcome = await cascade.reconcileDependent(sibling, "reconcile-sweep", workflow, newCascadeMetrics(), "enforce", siblings);
+          const outcome = await cascade.reconcileDependent(sibling, "reconcile-sweep", workflow, cm, "enforce", siblings);
           tally(m, outcome);
+          m.rewoken += cm.rewoken || 0;
           log(`reconcile.recover — ${sibling.ticketId} status=${sibling.status} → ${outcome} (sweep ${sweepId})`);
         } catch (err) {
           m.candidateErrors++;
@@ -266,7 +279,7 @@ export function createReconcileSweep(deps) {
 
     m.durationMs = now() - startedAtMs;
     emitReconcileMetrics(m);
-    log(`reconcile sweep done — mode=${mode} candidates=${m.candidates} skippedLiveLease=${m.skippedLiveLease} redispatched=${m.redispatched} escalated=${m.escalated || 0} escalationHeld=${m.escalationHeld || 0} reviewReawakened=${m.reviewReawakened} wouldRedispatch=${m.wouldRedispatch} noop=${m.noop} candidateErrors=${m.candidateErrors} truncated=${m.truncated} durationMs=${m.durationMs} (sweep ${sweepId})`);
+    log(`reconcile sweep done — mode=${mode} candidates=${m.candidates} skippedLiveLease=${m.skippedLiveLease} redispatched=${m.redispatched} rewoken=${m.rewoken || 0} escalated=${m.escalated || 0} escalationHeld=${m.escalationHeld || 0} reviewReawakened=${m.reviewReawakened} wouldRedispatch=${m.wouldRedispatch} noop=${m.noop} candidateErrors=${m.candidateErrors} truncated=${m.truncated} durationMs=${m.durationMs} (sweep ${sweepId})`);
     return m;
   }
 
@@ -347,6 +360,8 @@ export function emitReconcileMetrics(m) {
           { Name: "ReconcileExitedOk", Unit: "Count" },
           { Name: "ReconcileAwaiting", Unit: "Count" },
           { Name: "ReconcileAwaitTimeouts", Unit: "Count" },
+          // TEAM-4187 — parked in_progress re-wakes journaled this sweep.
+          { Name: "ReconcileRewoken", Unit: "Count" },
         ],
       }],
     },
@@ -365,5 +380,6 @@ export function emitReconcileMetrics(m) {
     ReconcileExitedOk: m.exitedOk || 0,
     ReconcileAwaiting: m.awaiting || 0,
     ReconcileAwaitTimeouts: m.awaitTimeouts || 0,
+    ReconcileRewoken: m.rewoken || 0,
   }));
 }
