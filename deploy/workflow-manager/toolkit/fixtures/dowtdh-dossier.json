@@ -1,0 +1,2320 @@
+{
+ "workflowId": "wf_1788731227559_dowtdh",
+ "workflowDefId": "software-delivery",
+ "epicId": "TEAM-4162",
+ "ticketProvider": "jira",
+ "workflow": {
+  "agentTasks": {
+   "TEAM-4163": {
+    "createdAt": "2026-09-06T21:48:29.657Z",
+    "status": "complete",
+    "id": "task_1788731309657_human:product-owner",
+    "agentId": "human:product-owner",
+    "ticketId": "TEAM-4163",
+    "completedAt": "2026-09-06T21:48:29.657Z"
+   },
+   "TEAM-4164": {
+    "agentId": "agentcore_hub_requirements_analyst",
+    "branch": "feature/TEAM-4162-clear-the-activity-feed-with-an-undo-window",
+    "commitSha": "b7b401878471893b63c06aeeabdd906ff8fd4f87",
+    "completedAt": "2026-09-06T22:08:01.901Z",
+    "createdAt": "2026-09-06T21:47:13.547Z",
+    "id": "task_1788731233547_agentcore_hub_requirements_analyst",
+    "output": "Playbook-mode requirements complete for \"Clear the Activity feed with an undo window\" (intent accepted at TEAM-4163).\n\nArtifacts committed on feature/TEAM-4162-clear-the-activity-feed-with-an-undo-window at b7b40187 (branch created from main; only .sdlc/wf_1788731227559_dowtdh/intent.md [verbatim, verified byte-identical] and spec.md changed). Spec mirrored to shared/spec.md; shared/requirements.md points at it; review-package-requirements.json written for the Spec Approval gate.\n\nScope: MODIFY EXISTING. Add clearActivities()/restoreActivities() to src/activity/activityStore.ts (reusing fail-soft read/write + sanitizeActivities), add Clear button + inline Undo (UNDO_WINDOW_MS=5000) + role=status + StrictMode-safe timer + focus management to ActivityFeed.tsx, CSS with existing tokens only, tests added only. App.tsx/App.css/deps/DEPLOY.md untouched. R1-R10 with Given/When/Then; all four policy skills answered.\n\n6 open Concerns (never resolved by me): brand-lead x1 (brand kit branding-kit/brand-system.md does not exist, prefix empty), design-lead x3 (undo-only vs confirm, 5 s auto-dismiss, no focus into live region), product-owner x2 (reload inside window is permanent under commit-at-click-time; second Clear merges snapshot).\n\nTicket chain (9, ends at CI, CD_REGISTERED=false): TEAM-4174 Spec Approval (human:product-owner) -> TEAM-4175 Frontend design -> TEAM-4176 Design Approval (human:product-owner) -> TEAM-4177 Plan (frontend_dev) -> TEAM-4178 Plan Approval (human:engineer) -> TEAM-4179 Implement (frontend_dev) -> TEAM-4180 Review -> TEAM-4181 QA -> TEAM-4182 CI. Verified: no duplicate assignee/tier; frontend_dev's two tickets are serially chained by design. Default-deny justified for backend/security/legal/localization/analytics/iOS/Android/api agents.\n\nTool notes: my Workflow Context lacked the ## SDLC Framework and ## Human Review Gates blocks, so artifact_dir/branch/gate wording were derived from the prior playbook run (wf_1788672380233_ymo7dm) and the blueprint defaults; the artifact branch did not pre-exist on origin and was created by claude_code. Tickets___search_issues rejected a plain-text query (JQL 400); worked around via list_tickets. No external APIs involved.",
+    "startedAt": "2026-09-06T21:48:30.977Z",
+    "status": "complete",
+    "ticketId": "TEAM-4164"
+   },
+   "TEAM-4174": {
+    "id": "task_1788732577478_human:product-owner",
+    "status": "complete",
+    "agentId": "human:product-owner",
+    "completedAt": "2026-09-06T22:09:37.478Z",
+    "ticketId": "TEAM-4174",
+    "createdAt": "2026-09-06T22:09:37.478Z"
+   },
+   "TEAM-4175": {
+    "agentId": "agentcore_hub_frontend_designer",
+    "branch": "feature/TEAM-4162-clear-the-activity-feed-with-an-undo-window",
+    "commitSha": "d04b405d7b59a4ba21dc5c7ef279aee459fb3b24",
+    "completedAt": "2026-09-06T22:25:42.013Z",
+    "createdAt": "2026-09-06T22:04:59.279Z",
+    "id": "task_1788732299279_agentcore_hub_frontend_designer",
+    "output": "Frontend design for \"Clear the Activity feed with an undo window\" delivered as a brownfield delta on the Activity card (ActivityFeed.tsx / ActivityFeed.css only).\n\n**Design (3 elements, spec R1-R7):**\n- `Clear activity` pill button in a new flex header row beside the h2; rendered only when entries exist; matches `.settings__toggle` at rest, uses its filled pair (#fff on #0f172a) for hover/active, 2px #0f172a `:focus-visible` ring; 44px tall (min-height 2.75rem).\n- Inline undo row (`div.activity-feed__notice`, always mounted, 0px when idle) holding the `role=\"status\"` paragraph (visible companion text) + `Undo` pill; not a toast, no ul/li/list.\n- Single always-mounted `<p role=\"status\">`: `Activity cleared.` / `Activity restored.` / empty on expiry (nothing announced).\n- Focus per R6: Clear\u2192Undo, Undo\u2192Clear, expiry-while-Undo-focused\u2192heading (tabIndex -1, outline suppressed).\n- All states specified (default, empty, cleared-with-undo, restored, expired, storage-failure, disabled = none with reason, second-clear, new-entry-during-window). Copy inventory = exactly the four spec strings; no new tokens except two numeric values (2.75rem, 2px) flagged in Concern 9.\n- Contrast named: #475569/#fff 7.58:1, #0f172a/#fff 17.85:1, #fff/#0f172a 17.85:1; #e2e8f0 border 1.23:1 noted as decorative.\n- Measured in Chromium: scrollWidth 320 at 320px and at 200% text zoom (no horizontal scroll).\n\n**Concerns:** #2 \u2192 undo-only; #3 \u2192 keep fixed 5000ms, do NOT pause on focus (R6 auto-focuses Undo so a focus-pause would make the window unbounded and R6's expiry path unreachable), hover-pause optional; #5 \u2192 accept as specified; #1 carried forward. New rows: #7 undo row sits above the list so Undo survives a new entry during the window (owner product-owner); #8 heading + Clear cannot share one line below ~388px, button wraps under the heading (owner design-lead); #9 two new numeric values / 44px vs 32px toggle (owner brand-lead).\n\n**Artifacts:** committed on the feature branch as `.sdlc/wf_1788731227559_dowtdh/design/frontend-designer.md` + mockup.html, mockup-320.html, design-mockup.png, design-mockup-320.png, design-mockup-zoom200.png (commit d04b405d7b59a4ba21dc5c7ef279aee459fb3b24, message `design: agentcore_hub_frontend_designer (wf_1788731227559_dowtdh)`). No src/ or package.json changes. S3 mirrors in shared/ and review package written. Mockups reviewed visually by me (all 5 states + 320px + zoom200). No tool failures. Not merged/deployed (repo not CD-registered).",
+    "startedAt": "2026-09-06T22:09:38.758Z",
+    "status": "complete",
+    "ticketId": "TEAM-4175"
+   },
+   "TEAM-4176": {
+    "createdAt": "2026-09-06T22:30:28.637Z",
+    "agentId": "human:product-owner",
+    "id": "task_1788733828637_human:product-owner",
+    "status": "complete",
+    "completedAt": "2026-09-06T22:30:28.637Z",
+    "ticketId": "TEAM-4176"
+   },
+   "TEAM-4177": {
+    "agentId": "agentcore_hub_frontend_dev",
+    "branch": "feature/TEAM-4162-clear-the-activity-feed-with-an-undo-window",
+    "commitSha": "001fe322479001fee3164ab355703721b07e9eb4",
+    "completedAt": "2026-09-06T22:41:45.290Z",
+    "createdAt": "2026-09-06T22:05:45.840Z",
+    "id": "task_1788732345840_agentcore_hub_frontend_dev",
+    "output": "PLAN TICKET complete \u2014 plan.md written, no implementation.\n\n**Deliverable:** `.sdlc/wf_1788731227559_dowtdh/plan.md` committed as 001fe322 on `feature/TEAM-4162-clear-the-activity-feed-with-an-undo-window` (commit touches exactly that one file, +180 lines; working tree clean). Mirrored to `workflows/wf_1788731227559_dowtdh/shared/plan.md`; review package at `shared/review-package-plan.json` (gate: plan).\n\n**Approach:** MODIFY EXISTING only \u2014 `activityStore.ts` gains `clearActivities()`/`restoreActivities()` reusing the existing read/write/sanitize helpers; `ActivityFeed.tsx` gains the designer's header/notice/status DOM, an effect-owned `UNDO_WINDOW_MS=5000` timer keyed on `[isWindowOpen, undoWindowKey]`, and a pendingFocus ref for Clear\u2192Undo\u2192Clear\u2192heading focus moves; `ActivityFeed.css` appends the designer's block verbatim. Tests appended to the two existing test files (20 cases enumerated with it() names). App.tsx/App.css/package.json untouched.\n\n**Key finding (codebase-driven, not in spec/design):** the existing subscriber re-reads localStorage on every notify, so with `setItem` throwing a pure pub/sub approach would resurface the old entries and the spec's R8 component test could not pass. Plan has the handlers set `activities` state last in the same React batch, which requires `restoreActivities` to return `Activity[]` instead of the spec's `void`. Recorded as new Concern rows 10 and 11 (owner: human:engineer) and Open questions 1\u20132, with recommendations \u2014 no silent deviation.\n\n**Policy re-check:** Security/Compliance/Brand/UX re-verified against the concrete plan; only deviations are Concerns 10\u201312 (return type, direct setState, appending to existing test files' import line). Spec Concerns 1\u20136 and designer Concerns 7\u20139 carried forward as open.\n\n**Verified:** all spec query-collision line numbers match the real test files; `.settings__section h2` specificity claim (0,1,1 vs 0,2,0) confirmed; DEPLOY.md absent; docs/ `TEAM-<n>-*.png` convention confirmed.\n\n**Note for orchestrator:** two similarly-named branches exist; artifacts live on `...-undo-window` (full name, per ticket), not `...-undo-win` (equals main). No tool failures.",
+    "startedAt": "2026-09-06T22:30:29.878Z",
+    "status": "complete",
+    "ticketId": "TEAM-4177"
+   },
+   "TEAM-4178": {
+    "completedAt": "2026-09-06T22:45:24.962Z",
+    "agentId": "human:engineer",
+    "ticketId": "TEAM-4178",
+    "status": "complete",
+    "id": "task_1788734724962_human:engineer",
+    "createdAt": "2026-09-06T22:45:24.962Z"
+   },
+   "TEAM-4179": {
+    "agentId": "agentcore_hub_frontend_dev",
+    "branch": "feature/TEAM-4179-frontend-dev",
+    "commitSha": "1dab06987ac806d00ad9c1fe665bc16cf9b0ee85",
+    "completedAt": "2026-09-06T23:04:05.598Z",
+    "createdAt": "2026-09-06T22:06:23.382Z",
+    "id": "task_1788732383382_agentcore_hub_frontend_dev",
+    "output": "Implemented TEAM-4162 \"Clear the Activity feed with an undo window\" per the approved plan.md (TEAM-4178).\n\n- activityStore.ts: added clearActivities(): Activity[] and restoreActivities(entries): Activity[] reusing readStoredActivities/writeStoredActivities/sanitizeActivities/notifySubscribers (fail-soft + timestamp bound inherited; snapshot-first merge so ids win on collision; no console output).\n- ActivityFeed.tsx: header row with `Clear activity` (only when stored), always-mounted notice row with single role=\"status\" (Activity cleared. / Activity restored. / '' on expiry) + inline `Undo` while window open, UNDO_WINDOW_MS=5000, effect-owned StrictMode-safe timer keyed on [isWindowOpen, undoWindowKey] (restarts on second clear, cleared on unmount), memory-only snapshot ref, heading tabIndex=-1, focus Clear\u2192Undo\u2192Clear and heading on expiry, handler setActivities queued last for R8 in-memory consistency, ul aria-live unchanged, no self-logging.\n- ActivityFeed.css: designer block appended verbatim (existing tokens + approved 2.75rem/2px numerics).\n- Tests add-only: +3 store, +17 component cases under fake timers with plan.md's exact it() names; all 37 existing tests untouched.\n- Gates: npm test 57/57, npm run lint clean, npm run build green. App.tsx/App.css byte-identical to main; package.json/lockfile unchanged; no DEPLOY.md; intent/spec/design untouched.\n- Visual evidence committed: docs/TEAM-4162-clear.png, docs/TEAM-4162-undo.png, docs/TEAM-4162-narrow.png (320px, scrollWidth 320, Clear 120x44, Undo 65x44) \u2014 reviewed against the design States table, all match.\n- PR #45 merged into feature/TEAM-4162-clear-the-activity-feed-with-an-undo-window (merge 351d5ec); the orchestrator's truncated integration branch feature/TEAM-4162-clear-the-activity-feed-with-an-undo-win was fast-forwarded (no force) to the same SHA so both are identical. main not touched; no Pipeline tools used (repo not CD-registered).\n\nDeviations from plan: 0 (recorded in plan.md).",
+    "prUrl": "https://github.com/tycenjmccann/demo-app/pull/45",
+    "startedAt": "2026-09-06T22:45:26.322Z",
+    "status": "complete",
+    "ticketId": "TEAM-4179"
+   },
+   "TEAM-4180": {
+    "agentId": "agentcore_hub_code_reviewer",
+    "branch": "feature/TEAM-4162-clear-the-activity-feed-with-an-undo-window",
+    "commitSha": "933ea6f1f04fc0212b88b84a6fcbe6aa0ce1d052",
+    "completedAt": "2026-09-06T23:19:19.285Z",
+    "createdAt": "2026-09-06T22:06:42.058Z",
+    "id": "task_1788732402058_agentcore_hub_code_reviewer",
+    "output": "VERDICT: CHANGES NEEDED (round 1). Fix ticket filed: TEAM-4183 \u2192 agentcore_hub_frontend_dev (codex_fix, phase=development).\n\nReviewed feature/TEAM-4162-clear-the-activity-feed-with-an-undo-window @ 351d5ec (PR #45 merge) vs origin/main with codex; re-ran gates in the review workspace: npm test 57/57, lint clean, build green. findings.md committed on the branch (933ea6f, both integration refs) and mirrored to workflows/wf_1788731227559_dowtdh/shared/findings.md.\n\nFINDINGS (grouped into one ticket, all in ActivityFeed component):\n- F1 P1 \u2014 Unrecorded deviation from the PO's Concern 3 decision. TEAM-4174 resolved Concern 3 as \"5000 ms; pause the countdown while Undo has focus or hover\"; TEAM-4176 approval restates \"paused on focus/hover\". Design, plan and code implement NO pause (plain setTimeout, ActivityFeed.tsx:145-168), plan Concern 3 says \"no focus-pause\", plan Deviations says \"None yet.\", and every Concern row in spec.md/plan.md is still `open`. The designer's R6 argument against a focus-pause is sound but was never taken back to the PO.\n- F2 P2 \u2014 ActivityFeed.css:156-158 `.activity-feed__status:empty { display:none }` removes the role=status element from the accessibility tree while empty, defeating the \"always mounted live region\" the JSX comment (tsx:207-208) relies on; per MDN the live region must exist before its content changes, so \"Activity cleared.\" may not be announced (R7). jsdom cannot see this. F2b P3: second Clear in an open window re-sets the identical status string \u2192 no mutation \u2192 silent (tsx:122).\n- F3 P3 \u2014 handleUndo (tsx:128-138) proceeds with a null/empty snapshot (expiry/click race with React 18's deferred timeout flush; or getItem throwing at Clear time so clearActivities() returns []): announces \"Activity restored.\" with nothing restored and drops focus to document.body (Clear button not mounted).\n\nCHECKED AND SOUND (evidence in findings.md): store clear/restore fail-soft + notify, snapshot-wins dedupe order (sanitize filters\u2192dedupes\u2192sorts), StrictMode-safe effect-owned timer with per-invocation cleanup + restart via undoWindowKey, R8 in-batch setState ordering, focus handoffs on happy path, no self-logging, no console output, R9 (App.tsx/App.css/package files byte-identical, no DEPLOY.md, existing tests additions-only), query-collision constraints, plan Files list fully respected, R10 test coverage complete except the pause behaviour and empty-snapshot Undo.\n\nTool status: all tools succeeded. Repo not CD-registered \u2014 no merge, no deploy, no Pipeline tools used.\n\n[coding-session: cc-45ced772a447491284e0bccb27d3fb50 cli=codex conversation=01a078f7-cee4-7563-b24e-a0b6e21fff4e]",
+    "startedAt": "2026-09-06T23:04:06.900Z",
+    "status": "complete",
+    "ticketId": "TEAM-4180"
+   },
+   "TEAM-4181": {
+    "agentId": "agentcore_hub_qa_verifier",
+    "branch": "feature/TEAM-4162-clear-the-activity-feed-with-an-undo-window",
+    "commitSha": "12e9ac6ef5081343701945e8a3b39803d9c53cc6",
+    "completedAt": "2026-09-06T23:36:30.022Z",
+    "createdAt": "2026-09-06T22:07:03.559Z",
+    "id": "task_1788732423559_agentcore_hub_qa_verifier",
+    "output": "VERDICT: FAIL \u2014 feature works as specified end-to-end, but the 4 review findings in findings.md (F1, F2, F2b, F3) are NOT addressed at head and were reproduced live. Fix ticket TEAM-4183 (codex_fix, phase=development) is still in_progress with no fix branch/PR; live repro + fix contract attached to it as a comment (no duplicate ticket filed \u2014 same component/agent). QA must re-run at TEAM-4183's head.\n\nVerification Ledger (branch feature/TEAM-4162-clear-the-activity-feed-with-an-undo-window, code head 933ea6f; QA evidence commit 12e9ac6 \u2014 docs/ + qa/ only, src untouched):\n- npm ci / npm test / npm run lint (tsc --noEmit) / npx tsc --noEmit / npm run build: all exit 0; tests 57/57 (3 files); 20 new tests added (it() 11\u219228 + 22\u219225), 0 existing tests removed (only import lines widened); build 38 modules, no warnings.\n- Constraints: src/App.tsx, src/App.css, package.json, package-lock.json byte-identical to main (git diff --exit-code 0); no DEPLOY.md; no console.* in activity source.\n- LIVE (Chromium/Playwright, real timers) at 1280\u00d7900 and 320\u00d7900, run twice, identical: 191 PASS / 8 FAIL. PASS: seed-25 Clear \u2192 0 li, status 'Activity cleared.', inline Undo (inside section, position static), storage '[]' immediately, no Clear button; Undo \u2192 same 20 in same order, all 25 ids restored, focus on Clear; expiry Undo present @4907ms / gone @5202ms, empty copy returns, no Clear, no ul/li/list; reload inside window \u2192 empty + no Undo, reload after undo \u2192 25 entries; toggle during window \u2192 new entry, Clear reappears, 2nd Clear + Undo restores 26; keyboard Tab\u00d72 \u2192 Enter/Space on Clear \u2192 focus Undo \u2192 Space/Enter on Undo \u2192 focus Clear; expiry with Undo focused \u2192 focus H2#activity-feed-title; one <p role=status>; toggle \u00d73 \u2192 exactly 3 entries; scrollWidth 320 at 320px; buttons 44.00px tall, rest/hover colors match tokens; 0 console errors/pageerrors. Screenshots match design mockup states.\n- FAIL rows (each at both viewports): F2 status display:none while empty (ActivityFeed.css:156); F2b 0 DOM mutations on [role=status] across a 2nd Clear (silent for SR); F3 empty-snapshot Undo (getItem throwing) announces 'Activity restored.' with 0 restored AND drops focus to BODY. F1 (PO Concern-3 pause decision not implemented/not recorded; plan.md Deviations \"None yet.\", all Concern rows open) confirmed by code read.\n\nNot merged, not deployed, no Pipeline tools (CD_REGISTERED=false).\n[coding-session: cc-926e952808c34febbfaaf36dab5163da]",
+    "startedAt": "2026-09-06T23:19:20.524Z",
+    "status": "complete",
+    "ticketId": "TEAM-4181"
+   },
+   "TEAM-4182": {
+    "agentId": "agentcore_hub_ci_agent",
+    "branch": "feature/TEAM-4162-clear-the-activity-feed-with-an-undo-window",
+    "commitSha": "12e9ac6ef5081343701945e8a3b39803d9c53cc6",
+    "completedAt": "2026-09-06T23:42:11.075Z",
+    "createdAt": "2026-09-06T22:07:19.301Z",
+    "id": "task_1788732439301_agentcore_hub_ci_agent",
+    "output": "CI verdict: PASS (legacy self-run; PIPELINE_ENABLED absent) for branch feature/TEAM-4162-clear-the-activity-feed-with-an-undo-window at tested head SHA 12e9ac6ef5081343701945e8a3b39803d9c53cc6 (vs origin/main ca989bc). Executed via claude_code [coding-session: cc-a4662cf93ece40c8bf2df8908a1dd552].\n\nResults (exit codes): npm ci \u2192 0 (185 packages); npm test / vitest run \u2192 0 (3 files, 57/57 passed: ActivityFeed.test.tsx 28, activityStore.test.ts 25, formatRelativeTime.test.ts 4); npm run lint / tsc --noEmit \u2192 0 (no diagnostics); npm run build / tsc -b && vite build \u2192 0 (38 modules; dist/index.html 0.46 kB, index-DpfP3Ydy.css 3.15 kB, index-BQCnjIPN.js 198.22 kB / 62.04 kB gzip).\n\nConstraint checks: package.json + package-lock.json diff vs main EMPTY; src/App.tsx and src/App.css blob SHAs identical to main (0ae4f03\u2026, e98983b\u2026); no DEPLOY.md in tree or index; src/activity/*.test.* additions-only (+468/\u22121 and +137/\u22122, the only 3 removed lines are import statements replaced with widened imports; it/test counts grew 11\u219228 and 22\u219225). Scope clean: 5 source files under src/activity plus .sdlc/, docs/, qa/ artifacts. npm audit --audit-level=high exit 1 \u2192 INFO only: 2 high (browserslist) + 1 moderate (esbuild via vite) transitive dev deps, pre-existing on main.\n\nci_status = unverified: no CodeBuild build exists for this repo (not CD-registered; no Pipeline___* calls made per delivery mode) and the repo has no .github/workflows so there are no GitHub check-runs. Evidence is the real local run.\n\nCaveat: review-fix ticket TEAM-4183 was still in_progress at run time (QA live-browser a11y/behaviour findings on ActivityFeed, not build/test failures). This PASS covers head 12e9ac6 only; if TEAM-4183 pushes new commits, CI must be re-run on the new head.\n\nNo merge, no deploy performed. Report written to workflows/wf_1788731227559_dowtdh/shared/ci-evidence/TEAM-4182-ci-report.md.",
+    "startedAt": "2026-09-06T23:36:31.543Z",
+    "status": "complete",
+    "ticketId": "TEAM-4182"
+   },
+   "TEAM-4183": {
+    "agentId": "agentcore_hub_frontend_dev",
+    "branch": "feature/TEAM-4183-frontend-dev",
+    "commitSha": "001259d6932c9c870889d74e0ac66673cfd7b49e",
+    "completedAt": "2026-09-06T23:46:57.093Z",
+    "createdAt": "2026-09-06T23:18:03.224Z",
+    "id": "task_1788736683224_agentcore_hub_frontend_dev",
+    "output": "All 4 review findings (F1, F2, F2b, F3) fixed on feature/TEAM-4183-frontend-dev; PR #46 merged into the integration branch. Both integration refs (\u2026-undo-win / \u2026-undo-window) reconciled by MERGE (no force-push) with QA's TEAM-4181 evidence commit and are identical at 001259d6932c9c870889d74e0ac66673cfd7b49e.\n\nF1 (P1) \u2192 option (a): hover-pause implemented (pointerenter on the notice row pauses the countdown; pointerleave restarts a fresh UNDO_WINDOW_MS; `isPaused` reset in handleClear/handleUndo/closeWindow so a stale pause can't make a window unbounded). Focus-pause deliberately omitted (R6 auto-focuses Undo \u2192 unbounded window, expiry-while-focused unreachable) and recorded as plan.md Deviation D1; PO re-confirmation requested via comment on TEAM-4183. spec.md Concerns 1\u20136 and plan.md Concerns 1\u201312 updated to `resolved`, citing TEAM-4174 (PO 15:09), TEAM-4176, TEAM-4178.\nF2 (P2) \u2192 `.activity-feed__status:empty { display:none }` removed; live region always rendered. Chromium: notice row 0 px tall idle (no layout change), status present in a11y tree while empty; docs/TEAM-4162-clear.png re-captured byte-identical. Deviation D2.\nF2b (P3) \u2192 second Clear blanks the status then re-sets 'Activity cleared.' on the next tick via an effect-owned setTimeout(0) (cancelled by Undo/expiry/unmount); only fires when the text is already 'Activity cleared.' so all existing synchronous assertions hold. Deviation D3.\nF3 (P3) \u2192 expiry logic extracted into shared `closeWindow()`; handleUndo with null/empty snapshot closes like expiry (no restoreActivities([]), no 'Activity restored.', focus \u2192 heading, never body). Deviation D4.\n\nGates: npm test 64/64 (57 existing untouched \u2014 zero removed lines \u2014 + 7 new tests, each proven load-bearing by mutating the fix); npm run lint clean; npm run build green; App.tsx/App.css/package.json/package-lock.json byte-identical to main; no console output; no new copy; findings.md untouched. Playwright/Chromium: Undo still present after 6 s hovered, gone ~5.2 s after pointer leaves; hover fill #0f172a/#fff confirmed (docs/TEAM-4183-hover-pause.png).\n\nNote for reviewer: the F2 jsdom test cannot assert the CSS cascade (vitest runs with CSS off; the preferred fs-read needs @types/node which is not a dependency) \u2014 the effective cascade is proven in the real browser and documented in the test, plan.md and PR body. Open item: PO decision on Deviation D1 (hover-pause only vs. lengthen UNDO_WINDOW_MS).",
+    "prUrl": "https://github.com/tycenjmccann/demo-app/pull/46",
+    "startedAt": "2026-09-06T23:18:05.164Z",
+    "status": "complete",
+    "ticketId": "TEAM-4183"
+   }
+  },
+  "completedAt": "2026-09-06T23:46:58.351Z",
+  "delivery": {
+   "mode": "handoff",
+   "prUrl": "https://github.com/tycenjmccann/demo-app/pull/47",
+   "at": "2026-09-06T23:46:58.351Z"
+  },
+  "epicId": "TEAM-4162",
+  "featureBranch": "feature/TEAM-4162-clear-the-activity-feed-with-an-undo-win",
+  "finalizedAt": "2026-09-06T23:47:00.660Z",
+  "humanNotifications": [
+   {
+    "bullets": [
+     "Problem: The Activity feed on the Settings page only grows. After a demo session it is full of test entries and there is no way to start clean short of clearing the browser's site data by h",
+     "Success: A 'Clear activity' control on the feed empties it. For about five seconds an 'Undo' affordance restores exactly what was cleared; after that the clear is permanent and survives rel",
+     "Constraints: Vite + React + TypeScript as-is; no new runtime dependencies; localStorage only; keep the existing Email notifications toggle and its tests untouched; do not touch DEPLOY.md.",
+     "Out of scope: Per-entry delete, filtering or search, syncing history to a server.",
+     "Approve = accept this intent as written and start the spec. Request changes = send it back to the originator."
+    ],
+    "ticketId": "TEAM-4163",
+    "links": [
+     {
+      "label": "intent.md",
+      "artifactKey": "workflows/wf_1788731227559_dowtdh/shared/intent.md"
+     }
+    ],
+    "reviewer": "product-owner",
+    "summary": "Intent Acceptance: \"Clear the Activity feed with an undo window\" \u2014 filed by Tycen McCann (product owner) - filed by his Claude Code operator session as the playbook-overlay validation run. Approving starts the spec author; nothing runs until you do.",
+    "id": "notif_TEAM-4163_2026-09-06T21:47:12.842Z",
+    "details": "Intent Acceptance: \"Clear the Activity feed with an undo window\" \u2014 filed by Tycen McCann (product owner) - filed by his Claude Code operator session as the playbook-overlay validation run. Approving starts the spec author; nothing runs until you do.",
+    "type": "review_needed",
+    "title": "Review needed: TEAM-4163",
+    "gate": "intake",
+    "acknowledged": true,
+    "timestamp": "2026-09-06T21:47:12.842Z"
+   },
+   {
+    "ticketId": "TEAM-4174",
+    "acknowledged": true,
+    "id": "notif_TEAM-4174_2026-09-06T22:08:04.727Z",
+    "summary": "Approve the spec for a 'Clear activity' control on the Settings page Activity feed with a five second inline 'Undo' window, committed to localStorage at click time, requested by Tycen McCann as the second sdlc-playbook validation run.",
+    "links": [
+     {
+      "label": "Spec",
+      "artifactKey": "workflows/wf_1788731227559_dowtdh/shared/spec.md"
+     },
+     {
+      "artifactKey": "workflows/wf_1788731227559_dowtdh/shared/intent.md",
+      "label": "Intent"
+     },
+     {
+      "url": "https://github.com/tycenjmccann/demo-app/commit/b7b401878471893b63c06aeeabdd906ff8fd4f87",
+      "label": "Spec commit b7b40187"
+     }
+    ],
+    "title": "Review needed: TEAM-4174",
+    "gate": "requirements",
+    "details": "Approve the spec for a 'Clear activity' control on the Settings page Activity feed with a five second inline 'Undo' window, committed to localStorage at click time, requested by Tycen McCann as the second sdlc-playbook validation run.",
+    "bullets": [
+     "6 open concerns: #1 human:brand-lead (brand kit branding-kit/brand-system.md missing; labels Clear activity / Undo and status strings unchecked), #2 human:design-lead (destructive clear with undo inst",
+     "Scope: MODIFY EXISTING src/activity/activityStore.ts (add clearActivities + restoreActivities reusing fail-soft read/write and sanitizeActivities), src/activity/ActivityFeed.tsx (Clear button, inline ",
+     "Riskiest requirement: R4/R5, the clear commits to storage at click time with a memory-only snapshot, so a reload inside the window loses undo and a second Clear must merge into the snapshot; existing ",
+     "Accessibility: native buttons only; focus Clear -> Undo -> Clear, heading on expiry; status announces 'Activity cleared.' / 'Activity restored.'; 320 px and 200% zoom constraints handed to the fronten",
+     "Out of scope: per-entry delete, filtering/search, server sync (intent), plus cross-tab sync, persisted snapshot, confirm dialog, App.tsx changes, DEPLOY.md",
+     "Spec committed to feature/TEAM-4162-clear-the-activity-feed-with-an-undo-window at b7b40187 under .sdlc/wf_1788731227559_dowtdh/; chain: Spec Approval -> Frontend design -> Design Approval -> Plan -> "
+    ],
+    "timestamp": "2026-09-06T22:08:04.727Z",
+    "reviewer": "product-owner",
+    "type": "review_needed"
+   },
+   {
+    "timestamp": "2026-09-06T22:25:44.702Z",
+    "type": "review_needed",
+    "details": "Frontend: a delta on the Activity card only \u2014 a Clear activity pill in a new header row, an inline status + Undo row (not a toast), and one always-mounted role=status element, all reusing the existing toggle's tokens; committed as .sdlc/wf_1788731227559_dowtdh/design/frontend-designer.md (d04b405).",
+    "acknowledged": true,
+    "title": "Review needed: TEAM-4176",
+    "bullets": [
+     "Scope: ActivityFeed.tsx + ActivityFeed.css only; App.tsx/App.css untouched; zero new colors, fonts, icons, copy or motion",
+     "Buttons match .settings__toggle at rest, use its filled pair (#fff on #0f172a) for hover/active, 2px #0f172a focus-visible ring; 44px tall (spec-preferred target) \u2014 Concern 9 notes the 12px delta vs t",
+     "Contrast: #475569/#fff 7.58:1, #0f172a/#fff 17.85:1, #fff/#0f172a 17.85:1 \u2014 all AA; #e2e8f0 border 1.23:1 flagged as decorative (same as existing toggle)",
+     "Measured in Chromium: no horizontal scroll at 320px and at 200% text zoom; heading + Clear cannot share one line below ~388px so the button wraps under the heading (new Concern 8)",
+     "Focus per R6: Clear\u2192Undo, Undo\u2192Clear, expiry-while-focused\u2192heading (tabIndex -1, ring suppressed); status/Undo row sits ABOVE the list so Undo survives a new entry during the window (new Concern 7)",
+     "Recommendations on co-owned concerns: #2 undo-only; #3 keep fixed 5000ms, do NOT pause on focus (R6 auto-focuses Undo), hover-pause optional; #5 accept as specified"
+    ],
+    "summary": "Frontend: a delta on the Activity card only \u2014 a Clear activity pill in a new header row, an inline status + Undo row (not a toast), and one always-mounted role=status element, all reusing the existing toggle's tokens; committed as .sdlc/wf_1788731227559_dowtdh/design/frontend-designer.md (d04b405).",
+    "links": [
+     {
+      "label": "Frontend design doc",
+      "artifactKey": "workflows/wf_1788731227559_dowtdh/shared/design-doc-agentcore_hub_frontend_designer.md"
+     },
+     {
+      "label": "Mockup: 5 states (1440px)",
+      "artifactKey": "workflows/wf_1788731227559_dowtdh/shared/design-mockup.png"
+     },
+     {
+      "label": "Mockup: 320px viewport",
+      "artifactKey": "workflows/wf_1788731227559_dowtdh/shared/design-mockup-320.png"
+     },
+     {
+      "label": "Interactive mockup (HTML)",
+      "artifactKey": "workflows/wf_1788731227559_dowtdh/shared/mockup.html"
+     }
+    ],
+    "ticketId": "TEAM-4176",
+    "reviewer": "product-owner",
+    "gate": "design",
+    "id": "notif_TEAM-4176_2026-09-06T22:25:44.702Z"
+   },
+   {
+    "id": "notif_TEAM-4178_2026-09-06T22:41:47.761Z",
+    "reviewer": "engineer",
+    "bullets": [
+     "Files: 3 source (activityStore.ts, ActivityFeed.tsx, ActivityFeed.css) + 2 test files (append-only describe blocks) + docs/ screenshots at implement time; App.tsx, App.css, package.json, lockfile must",
+     "Riskiest: R8 storage-failure \u2014 the existing subscriber RE-READS localStorage on notify, so a failed clear would resurface old entries; mitigation: handler sets activities state last in the same batch,",
+     "Timer: effect-owned setTimeout keyed on [isWindowOpen, undoWindowKey] (spec R3 pattern, StrictMode-safe, auto-cleanup on unmount) instead of the designer's imperative timerRef; identical behavior",
+     "Focus: pendingFocus ref consumed post-mount (Clear->Undo->Clear); on expiry read document.activeElement BEFORE state update so focus lands on the tabIndex=-1 heading",
+     "Tests: 3 store cases + 17 component cases under fake timers incl. 4999/5000 boundary, second-clear restart, Enter/Space, reload=unmount+render, setItem-throws; all existing tests unmodified, verified ",
+     "Open questions (4): accept Activity[] return type; effect-owned timer; commit docs/ screenshots; accept designer Concerns 7/8/9 \u2014 all with recommendations"
+    ],
+    "gate": "plan",
+    "title": "Review needed: TEAM-4178",
+    "summary": "Extend the existing activityStore with clearActivities()/restoreActivities() and the existing ActivityFeed component with an inline Clear/Undo/status row driven by an effect-owned 5000 ms timer \u2014 no new module, no new dependency, App.tsx/App.css untouched.",
+    "acknowledged": true,
+    "type": "review_needed",
+    "ticketId": "TEAM-4178",
+    "details": "Extend the existing activityStore with clearActivities()/restoreActivities() and the existing ActivityFeed component with an inline Clear/Undo/status row driven by an effect-owned 5000 ms timer \u2014 no new module, no new dependency, App.tsx/App.css untouched.",
+    "links": [
+     {
+      "label": "Plan",
+      "artifactKey": "workflows/wf_1788731227559_dowtdh/shared/plan.md"
+     },
+     {
+      "artifactKey": "workflows/wf_1788731227559_dowtdh/shared/spec.md",
+      "label": "Spec"
+     },
+     {
+      "artifactKey": "workflows/wf_1788731227559_dowtdh/shared/design-doc-agentcore_hub_frontend_designer.md",
+      "label": "Frontend design doc"
+     }
+    ],
+    "timestamp": "2026-09-06T22:41:47.761Z"
+   }
+  ],
+  "id": "wf_1788731227559_dowtdh",
+  "input": {
+   "sources": [],
+   "intent": {
+    "who": "Anyone demoing the Settings page; any real user who wants a tidy history.",
+    "constraints": "Vite + React + TypeScript as-is; no new runtime dependencies; localStorage only; keep the existing Email notifications toggle and its tests untouched; do not touch DEPLOY.md.",
+    "successCriteria": "A 'Clear activity' control on the feed empties it. For about five seconds an 'Undo' affordance restores exactly what was cleared; after that the clear is permanent and survives reload. Keyboard and screen-reader users can do both. Automated tests cover clear, undo, expiry and reload. Existing tests still pass and `npm run build` is green.",
+    "problem": "The Activity feed on the Settings page only grows. After a demo session it is full of test entries and there is no way to start clean short of clearing the browser's site data by hand.",
+    "outOfScope": "Per-entry delete, filtering or search, syncing history to a server.",
+    "originator": "Tycen McCann (product owner) - filed by his Claude Code operator session as the playbook-overlay validation run"
+   },
+   "workflowDefId": "software-delivery",
+   "description": "Second sdlc-playbook validation run: same Software Delivery pipeline with the Playbook framework flag on.",
+   "sdlcFramework": "playbook",
+   "title": "Clear the Activity feed with an undo window",
+   "repoConfig": {
+    "layout": "monorepo",
+    "repos": [
+     {
+      "platform": "shared",
+      "url": "https://github.com/tycenjmccann/demo-app.git",
+      "defaultBranch": "main"
+     }
+    ]
+   }
+  },
+  "messages": [],
+  "notifVersion": 8,
+  "phase": "complete",
+  "repoCheck": {
+   "results": [
+    {
+     "url": "https://github.com/tycenjmccann/demo-app.git",
+     "definitive": true,
+     "status": 200,
+     "owner": "tycenjmccann",
+     "reason": "found",
+     "ok": true,
+     "repo": "demo-app"
+    }
+   ],
+   "checkedAt": "2026-09-06T21:48:32.477Z"
+  },
+  "repoConfig": {
+   "repos": [
+    {
+     "defaultBranch": "main",
+     "url": "https://github.com/tycenjmccann/demo-app.git",
+     "platform": "shared"
+    }
+   ],
+   "layout": "monorepo"
+  },
+  "sdlcFramework": "playbook",
+  "startedAt": "2026-09-06T21:47:08.575Z",
+  "ticketProvider": "jira",
+  "wmAutoAnalyzedAt": "2026-09-06T23:47:00.819Z",
+  "wmLastWatchAt": "2026-09-06T23:29:44.788Z",
+  "workflowDefId": "software-delivery",
+  "workflowId": "wf_1788731227559_dowtdh",
+  "workflowType": "feature"
+ },
+ "workflowDef": {
+  "id": "software-delivery",
+  "type": "feature",
+  "name": "Software Delivery",
+  "displayName": "SDLC",
+  "description": "Autonomous feature/bug pipeline: requirements analysis, parallel design, development, QA verification, CI, and a release manager that reviews the final PR \u2014 a human approves the merge, then it merges and deploys per the repo's DEPLOY.md.",
+  "icon": "GitPullRequest",
+  "intakeAgentId": "agentcore_hub_requirements_analyst",
+  "requiresRepo": true,
+  "featureBranchPhase": "development",
+  "createsPullRequest": true,
+  "completionRequiresAgentPhases": [
+   "development",
+   "verification",
+   "review",
+   "ship"
+  ],
+  "reviewGates": [
+   {
+    "afterPhase": "requirements",
+    "name": "Spec Approval",
+    "blocking": true,
+    "condition": "flagged",
+    "onReject": "rework",
+    "reviewerRole": "Product Owner",
+    "assignee": "human:product-owner"
+   },
+   {
+    "afterPhase": "design",
+    "name": "Plan Approval",
+    "blocking": true,
+    "condition": "flagged",
+    "onReject": "rework",
+    "reviewerRole": "Designer",
+    "assignee": "human:engineer"
+   },
+   {
+    "afterPhase": "ship",
+    "name": "Merge Approval",
+    "blocking": true,
+    "condition": "always",
+    "onReject": "rework",
+    "reviewerRole": "Code Owner",
+    "assignee": "human:engineer",
+    "maxRounds": 3,
+    "regressionCountsDouble": true,
+    "onCapReached": "escalate"
+   }
+  ],
+  "phases": [
+   {
+    "id": "intake",
+    "name": "Intake",
+    "type": "app",
+    "agentPhase": "intake"
+   },
+   {
+    "id": "requirements",
+    "name": "Requirements",
+    "type": "agent",
+    "agentPhase": "requirements"
+   },
+   {
+    "id": "design",
+    "name": "Design",
+    "type": "agent",
+    "agentPhase": "design"
+   },
+   {
+    "id": "development",
+    "name": "Development",
+    "type": "agent",
+    "agentPhase": "development"
+   },
+   {
+    "id": "qa",
+    "name": "QA & Ship",
+    "type": "agent",
+    "agentPhase": "verification",
+    "extraAgentPhases": [
+     "review",
+     "ship"
+    ]
+   }
+  ],
+  "sdlcFramework": "standard",
+  "frameworks": {
+   "playbook": {
+    "label": "Playbook",
+    "description": "AI-native SDLC loop on the same pipeline: the request is captured verbatim as intent.md and accepted by the product owner before any agent runs; the analyst writes spec.md under the org's policy skills; designers commit their sections and mockups; a dev writes plan.md before any code and an engineer approves it; the reviewer checks the diff against the plan. Every artifact is committed to the feature branch; every gate is a human.",
+    "featureBranchPhase": "requirements",
+    "artifactChain": {
+     "dir": ".sdlc/{workflowId}",
+     "artifacts": [
+      {
+       "name": "intent.md",
+       "owner": "intake",
+       "gate": "Intent Acceptance"
+      },
+      {
+       "name": "spec.md",
+       "owner": "requirements",
+       "gate": "Spec Approval"
+      },
+      {
+       "name": "design/<agent>.md",
+       "owner": "design",
+       "gate": "Design Approval"
+      },
+      {
+       "name": "plan.md",
+       "owner": "plan",
+       "gate": "Plan Approval"
+      },
+      {
+       "name": "findings.md",
+       "owner": "review"
+      }
+     ]
+    },
+    "reviewGates": [
+     {
+      "afterPhase": "intake",
+      "name": "Intent Acceptance",
+      "blocking": true,
+      "condition": "always",
+      "onReject": "hold",
+      "reviewerRole": "Product Owner",
+      "assignee": "human:product-owner",
+      "instructions": "Created by the hub at intake (not by you): the Intent Acceptance ticket already exists and your own ticket was blocked by it."
+     },
+     {
+      "afterPhase": "requirements",
+      "name": "Spec Approval",
+      "blocking": true,
+      "condition": "always",
+      "onReject": "rework",
+      "reviewerRole": "Product Owner",
+      "assignee": "human:product-owner"
+     },
+     {
+      "afterPhase": "design",
+      "scope": "role",
+      "name": "Design Review",
+      "blocking": true,
+      "condition": "flagged",
+      "onReject": "rework",
+      "reviewerRole": "Designer",
+      "assignee": "human:design-lead",
+      "instructions": "Per-role design review (this run opted in): for EACH Tier 1 designer ticket you create, also create one \"<Surface> Design Review\" ticket (e.g. \"iOS Design Review\") assigned to \"human:<surface>-lead\" (ios-lead, android-lead, web-lead, backend-lead), blocked_by that designer's ticket. The Design Approval gate below must be blocked_by every one of these review tickets as well."
+     },
+     {
+      "afterPhase": "design",
+      "name": "Design Approval",
+      "blocking": true,
+      "condition": "always",
+      "onReject": "rework",
+      "reviewerRole": "Product Owner",
+      "assignee": "human:product-owner"
+     },
+     {
+      "afterPhase": "development",
+      "scope": "plan",
+      "name": "Plan Approval",
+      "blocking": true,
+      "condition": "always",
+      "onReject": "rework",
+      "reviewerRole": "Engineer",
+      "assignee": "human:engineer",
+      "instructions": "After the 'Plan:' ticket ONLY (not the implementation tickets): create a \"Plan Approval\" ticket assigned to \"human:engineer\", blocked_by the Plan ticket. Every implementation, review, QA and CI ticket must be blocked_by this gate (directly or through the chain)."
+     },
+     {
+      "afterPhase": "ship",
+      "name": "Merge Approval",
+      "blocking": true,
+      "condition": "always",
+      "onReject": "rework",
+      "reviewerRole": "Code Owner",
+      "assignee": "human:engineer",
+      "maxRounds": 3,
+      "regressionCountsDouble": true,
+      "onCapReached": "escalate"
+     }
+    ]
+   }
+  }
+ },
+ "tickets": [
+  {
+   "ticketId": "TEAM-4163",
+   "title": "Intent Acceptance: Clear the Activity feed with an undo window",
+   "description": "Intent Acceptance gate (playbook PLAN stage).\n\nYou are the product owner. Decide whether this intent, in the originator's own words, is worth building.\nApprove (Done) \u2192 the spec author starts. Request changes (Blocked) \u2192 leave a comment for the originator; nothing runs.\nArtifact: workflows/wf_1788731227559_dowtdh/shared/intent.md (also committed to the feature branch as the first link of the chain).\n\n----- intent.md -----\n# Intent: Clear the Activity feed with an undo window\n\n- Workflow: wf_1788731227559_dowtdh\n- Originator: Tycen McCann (product owner) - filed by his Claude Code operator session as the playbook-overlay validation run (via console)\n- Filed: 2026-09-06T21:47:08.617Z\n- Status: proposed \u2014 becomes accepted when the product owner approves the Intent Acceptance gate\n- Target repo: https://github.com/tycenjmccann/demo-app.git\n\n## Problem\nThe Activity feed on the Settings page only grows. After a demo session it is full of test entries and there is no way to start clean short of clearing the browser's site data by hand.\n\n## Who is affected\nAnyone demoing the Settings page; any real user who wants a tidy history.\n\n## Success criteria\nA 'Clear activity' control on the feed empties it. For about five seconds an 'Undo' affordance restores exactly what was cleared; after that the clear is permanent and survives reload. Keyboard and screen-reader users can do both. Automated tests cover clear, undo, expiry and reload. Existing tests still pass and `npm run build` is green.\n\n## Constraints\nVite + React + TypeScript as-is; no new runtime dependencies; localStorage only; keep the existing Email notifications toggle and its tests untouched; do not touch DEPLOY.md.\n\n## Out of scope\nPer-entry delete, filtering or search, syncing history to a server.\n\n## Original request (verbatim)\nSecond sdlc-playbook validation run: same Software Delivery pipeline with the Playbook framework flag on.\n\n---\nThis file is the first link of the run's artifact chain. It is accepted, not edited, by the product owner;\ncorrections come from the originator. The spec author commits it unchanged to the feature branch.",
+   "status": "done",
+   "assignee": "human:product-owner",
+   "parentId": "TEAM-4162",
+   "blockedBy": [],
+   "workflowId": "wf_1788731227559_dowtdh",
+   "type": "task",
+   "createdAt": "2026-09-06T14:47:09.070-0700",
+   "updatedAt": "2026-09-06T15:45:16.903-0700"
+  },
+  {
+   "ticketId": "TEAM-4164",
+   "title": "Requirements: agentcore_hub_requirements_analyst \u2014 Clear the Activity feed with an undo window",
+   "description": "Turn the accepted intent (workflows/wf_1788731227559_dowtdh/shared/intent.md) into the spec and the ticket plan. Blocked until the product owner approves the Intent Acceptance gate TEAM-4163.\n\nTitle: Clear the Activity feed with an undo window",
+   "status": "done",
+   "assignee": "agentcore_hub_requirements_analyst",
+   "parentId": "TEAM-4162",
+   "blockedBy": [
+    "TEAM-4163"
+   ],
+   "workflowId": "wf_1788731227559_dowtdh",
+   "type": "task",
+   "createdAt": "2026-09-06T14:47:11.369-0700",
+   "updatedAt": "2026-09-06T15:07:59.983-0700"
+  },
+  {
+   "ticketId": "TEAM-4174",
+   "title": "Spec Approval: Clear the Activity feed with an undo window",
+   "description": "Approve or request changes on the spec for playbook run wf_1788731227559_dowtdh. Read `.sdlc/wf_1788731227559_dowtdh/spec.md` and `.sdlc/wf_1788731227559_dowtdh/intent.md` on branch `feature/TEAM-4162-clear-the-activity-feed-with-an-undo-window` (spec commit b7b401878471893b63c06aeeabdd906ff8fd4f87). S3 mirror: workflows/wf_1788731227559_dowtdh/shared/spec.md.\n\nThis is the gate that follows the accepted intent (TEAM-4163). Scope under review: a `Clear activity` control empties the Activity feed (all stored entries, committed to localStorage at click time) and an inline `Undo` affordance restores exactly what was cleared for a 5000 ms window; after that the clear is permanent and survives reload. Keyboard and screen-reader paths are specified (native buttons, focus landing, one role=status region).\n\nSix open Concerns need a decision before engineering starts; the spec author does not resolve them:\n- #1 Brand (human:brand-lead): brand kit missing; labels `Clear activity` / `Undo` and status strings `Activity cleared.` / `Activity restored.` plus reuse of existing CSS values are unchecked.\n- #2 UX (human:design-lead): destructive action without a confirm dialog; undo is the safety net per the intent.\n- #3 UX (human:design-lead): Undo auto-dismisses after 5000 ms and has no persistent location (inherent to an undo window).\n- #4 Intent (human:product-owner): a reload inside the 5 s window is permanent under commit-at-click-time; alternative is deferring the storage write.\n- #5 UX (human:design-lead): no focus move into the live region and no aria-live on the Undo button.\n- #6 Intent (human:product-owner): a second Clear during an open window merges the snapshot and restarts the window.\n\nApprove = accept the spec as written and start the frontend designer. Request changes = send it back to the spec author.\nDelivery: handoff, PR for the owning team (repo is not CD-registered; nothing merges or deploys from this run). Artifact dir: .sdlc/wf_1788731227559_dowtdh.",
+   "status": "done",
+   "assignee": "human:product-owner",
+   "parentId": "TEAM-4162",
+   "blockedBy": [
+    "TEAM-4164"
+   ],
+   "workflowId": "wf_1788731227559_dowtdh",
+   "type": "task",
+   "createdAt": "2026-09-06T15:04:33.230-0700",
+   "updatedAt": "2026-09-06T15:45:20.193-0700"
+  },
+  {
+   "ticketId": "TEAM-4175",
+   "title": "Design: Frontend for Clear the Activity feed with an undo window",
+   "description": "Playbook run: read `.sdlc/wf_1788731227559_dowtdh/spec.md`; commit your design doc as `.sdlc/wf_1788731227559_dowtdh/design/frontend-designer.md` (mockups/diagrams alongside) on `feature/TEAM-4162-clear-the-activity-feed-with-an-undo-window` before report_completion.\n\nRepo: https://github.com/tycenjmccann/demo-app.git (Vite + React 19 + TypeScript, single light theme). Branch: feature/TEAM-4162-clear-the-activity-feed-with-an-undo-window (spec commit b7b40187). Artifact dir: .sdlc/wf_1788731227559_dowtdh. Spec S3 mirror: workflows/wf_1788731227559_dowtdh/shared/spec.md. Intent: .sdlc/wf_1788731227559_dowtdh/intent.md (verbatim, accepted).\n\nScope: the Settings page, Activity section only (`src/activity/ActivityFeed.tsx`, `src/activity/ActivityFeed.css`). Design three elements per spec.md R1-R7 and the Design brief:\n1. `Clear activity` control: native <button type=\"button\">, placed in the section header row next to the `Recent Activity` h2, rendered ONLY when at least one entry is stored. Touch target at least 24x24 CSS px, 44 px preferred.\n2. Inline `Undo` affordance: native <button> whose accessible name and visible text are both `Undo`, shown inline in the section (replacing the standard empty-state paragraph while the 5000 ms window is open). NOT a fixed-position toast. Must not be a ul/li or role=list (existing tests assert the empty state has none).\n3. One `role=\"status\"` element announcing `Activity cleared.` on clear and `Activity restored.` on undo; nothing on expiry. Separate element from the Undo button.\n\nHard constraints: reuse ONLY existing tokens: colors #0f172a, #475569, #e2e8f0, #ffffff; sizes 0.75rem and 0.875rem; the Inter, system-ui, -apple-system, sans-serif stack; the 999px pill radius (see `.settings__toggle` in src/App.css); existing 1px borders. No new colors, fonts, icons or icon sets. Must work at 320 px viewport width with no horizontal scroll and at 200% zoom (the existing 400px media query in ActivityFeed.css wraps items). No motion is required; if you propose any countdown visual it must respect prefers-reduced-motion and color must not be the only carrier of meaning. Name the contrast pairs: #475569 on #ffffff, #0f172a on #ffffff, #ffffff on #0f172a.\n\nFocus order to design around (spec R6): after Clear, focus moves to Undo; after Undo, focus moves to Clear; if the window expires while Undo has focus, focus moves to the `Recent Activity` heading (tabIndex={-1}). Visible focus indicators on both buttons.\n\nStates to specify with copy and next action: default (entries + Clear), empty (no Clear, standard copy `No recent activity yet. Actions you take will show up here.`), cleared-with-undo (status + Undo), restored, storage-failure (visually identical to success), disabled (none expected; state why).\n\nOpen Concerns you co-own (do not resolve; reflect them and name your recommendation): #2 undo-only vs confirm dialog, #3 5000 ms auto-dismiss (you may propose pausing the countdown while Undo has focus/hover), #5 no focus move into the live region. Do not introduce new names, tokens or copy beyond spec.md without adding a Concern row in your design doc. `src/App.tsx` and `src/App.css` are out of bounds.\n\nDeliverables: `.sdlc/wf_1788731227559_dowtdh/design/frontend-designer.md` committed on the branch plus mockups (HTML/PNG) alongside; write your review package to workflows/wf_1788731227559_dowtdh/shared/review-package-design.agentcore_hub_frontend_designer.json. Delivery: handoff, PR for the owning team (repo not CD-registered; never merge or deploy).",
+   "status": "done",
+   "assignee": "agentcore_hub_frontend_designer",
+   "parentId": "TEAM-4162",
+   "blockedBy": [
+    "TEAM-4174"
+   ],
+   "workflowId": "wf_1788731227559_dowtdh",
+   "type": "task",
+   "createdAt": "2026-09-06T15:04:57.960-0700",
+   "updatedAt": "2026-09-06T15:25:40.886-0700"
+  },
+  {
+   "ticketId": "TEAM-4176",
+   "title": "Design Approval: Clear the Activity feed with an undo window",
+   "description": "Approve or request changes on the frontend design for playbook run wf_1788731227559_dowtdh. Read `.sdlc/wf_1788731227559_dowtdh/design/frontend-designer.md` and its mockups on branch `feature/TEAM-4162-clear-the-activity-feed-with-an-undo-window`, checked against `.sdlc/wf_1788731227559_dowtdh/spec.md` (S3 mirror: workflows/wf_1788731227559_dowtdh/shared/spec.md).\n\nConfirm: the design reuses only existing tokens (#0f172a, #475569, #e2e8f0, #ffffff, 0.75rem/0.875rem, Inter stack, 999px pill, 1px borders); the `Clear activity` button sits in the section header row and appears only when entries are stored; the `Undo` affordance is inline (not a toast) and the empty state stays free of any ul/li/list role; the role=status announcements and the focus order (Clear -> Undo -> Clear, heading on expiry) match spec R6/R7; 320 px and 200% zoom behave with no horizontal scroll; every spec Concern the designer co-owns (#2, #3, #5) is reflected, not silently resolved; any new name/token/copy the mockup introduces appears as a new Concern row.\n\nApprove = the Plan ticket for agentcore_hub_frontend_dev starts. Request changes = back to the designer.\nDelivery: handoff, PR for the owning team (repo not CD-registered; nothing merges or deploys from this run). Artifact dir: .sdlc/wf_1788731227559_dowtdh.",
+   "status": "done",
+   "assignee": "human:product-owner",
+   "parentId": "TEAM-4162",
+   "blockedBy": [
+    "TEAM-4175"
+   ],
+   "workflowId": "wf_1788731227559_dowtdh",
+   "type": "task",
+   "createdAt": "2026-09-06T15:05:11.383-0700",
+   "updatedAt": "2026-09-06T15:45:22.235-0700"
+  },
+  {
+   "ticketId": "TEAM-4177",
+   "title": "Plan: Clear the Activity feed with an undo window",
+   "description": "load_blueprint(\"playbook-build\") \u2014 PLAN TICKET: write .sdlc/wf_1788731227559_dowtdh/plan.md only, no implementation.\n\nRepo: https://github.com/tycenjmccann/demo-app.git. Branch: feature/TEAM-4162-clear-the-activity-feed-with-an-undo-window (spec commit b7b40187). Artifact dir: .sdlc/wf_1788731227559_dowtdh. Read `.sdlc/wf_1788731227559_dowtdh/spec.md` (S3 mirror workflows/wf_1788731227559_dowtdh/shared/spec.md), `intent.md`, and the design docs listed below. Produce ONLY `.sdlc/wf_1788731227559_dowtdh/plan.md`; do not write product code, tests, CSS, or touch package.json in this ticket. Re-check the four policies (security, compliance, brand, UX) against your concrete design; any deviation from spec.md becomes a new Concern row in plan.md, never a silent change. Mirror plan.md to workflows/wf_1788731227559_dowtdh/shared/plan.md and write the review package workflows/wf_1788731227559_dowtdh/shared/review-package-plan.json.\n\nDesign docs to read: `.sdlc/wf_1788731227559_dowtdh/design/frontend-designer.md` (and its mockups alongside).\n\nREQUIREMENTS (from spec.md; Given/When/Then detail is in the spec):\nR1 Clear control: native <button type=\"button\"> named `Clear activity` in the Activity section header next to the `Recent Activity` heading, rendered ONLY when at least one activity is stored (stored count, not the 20-item visible slice). Activating it removes ALL stored entries from localStorage `demo.activity` immediately, the list disappears, subscribers are notified.\nR2 Undo window: after Clear, an inline `Undo` affordance (native button, accessible name and visible text `Undo`) is shown for UNDO_WINDOW_MS = 5000 ms, a single named constant. Inline in the section, replacing the standard empty-state paragraph for the duration; not a fixed-position toast. Undo restores exactly the cleared entries (same ids, types, descriptions, timestamps), merged with any entries added during the window; the store sorts newest-first, dedupes by id, caps at 100 (reuse sanitizeActivities).\nR3 Expiry: when the window elapses without Undo, the affordance is removed, the standard empty-state copy returns if still empty, and the in-memory snapshot is dropped. Timer cleared on unmount; StrictMode-safe (each effect owns its timer id, like the existing 30 s interval in ActivityFeed.tsx).\nR4 Reload semantics: the clear is committed to localStorage at click time; the snapshot lives in component/module memory only and is never written to storage. A reload at any point after Clear (including inside the window) shows the empty feed with no Undo; reload after Undo shows the restored entries. (Open Concern 4 for the product owner records the alternative.)\nR5 No self-logging: neither Clear nor Undo writes an Activity entry. Entries added during the window appear normally and make Clear available again; a second Clear during an open window merges the newly cleared entries into the snapshot and restarts the 5000 ms window (Concern 6).\nR6 Keyboard: Clear and Undo are native buttons reachable by Tab, activated by Enter/Space. After Clear, focus moves to Undo; after Undo, focus moves to Clear; if the window expires while Undo has focus, focus moves to the `Recent Activity` heading (tabIndex={-1}). Escape not required.\nR7 Screen readers: one `role=\"status\"` (polite) element inside the section announces `Activity cleared.` on clear and `Activity restored.` on undo; nothing on expiry. Status element and Undo button are separate; the status element is not a ul/li/role=list. Existing `aria-live=\"polite\"` on the ul unchanged.\nR8 Storage failure: if localStorage throws on clear or restore, fail soft exactly like the existing store (no throw, no console output, no error UI); the in-memory list still updates for the session.\nR9 Constraints: no new dependencies (runtime or dev); package.json/lockfile dependency sections unchanged; `src/App.tsx` and `src/App.css` byte-identical; every existing test in src/activity/*.test.* unmodified and passing; `npm test`, `npm run lint` (tsc --noEmit), `npm run build` (tsc -b && vite build) green; DEPLOY.md not created (it does not exist).\nR10 Automated tests: store unit tests (clearActivities returns removed entries and empties storage; restoreActivities merges/dedupes/sorts/caps; both fail soft when setItem/getItem throw; both notify subscribers) and component tests under fake timers (clear empties list and shows Undo + status; Undo restores the same entries in the same order; advancing 5000 ms removes Undo and the standard empty copy returns; reload simulated by unmount + re-render after clear shows empty with no Undo and after undo shows entries; Clear hidden when empty; entries added during the window appear; second Clear merges the snapshot; keyboard activation and focus assertions; no activity entry written by clear/undo).\n\nDESIGN BRIEF (from spec.md): MODIFY EXISTING plus added tests; no net-new module. Extend `src/activity/activityStore.ts` with `clearActivities(): Activity[]` (read current entries, write [], notify, return removed) and `restoreActivities(entries: Activity[]): void` (merge with stored, run through existing sanitizeActivities for dedupe-by-id / newest-first / 100 cap, write, notify), both reusing readStoredActivities/writeStoredActivities so the fail-soft try/catch and MAX_VALID_DATE_TIMESTAMP bound are inherited. Extend `src/activity/ActivityFeed.tsx` (Clear button gated on stored count >= 1; inline Undo affordance; one role=status element; UNDO_WINDOW_MS timer with per-effect cleanup; tabIndex={-1} on the heading; snapshot in memory only). Extend `src/activity/ActivityFeed.css` using only existing token values (#0f172a, #475569, #e2e8f0, #ffffff; 0.75rem/0.875rem; Inter stack; 999px pill; 1px borders). Add tests to `src/activity/activityStore.test.ts` / `src/activity/ActivityFeed.test.tsx` or new sibling files; never edit or remove an existing test. Query-collision constraints from the existing suite: the empty state must have no ul/li and no role=list; no new copy equal to `settings` or `just now`; new button names `Clear activity` and `Undo` are distinct from `Toggle email notifications`; the new timer cleanup must not log or throw (a test spies on console.error). Alternatives already rejected in the spec (do not re-open without a Concern): toast overlay, confirm dialog, deferred storage write, sessionStorage snapshot, \"Cleared activity\" self-log entry.\n\nDelivery: handoff, PR for the owning team (repo not CD-registered; never merge, never deploy, never call Pipeline tools).",
+   "status": "done",
+   "assignee": "agentcore_hub_frontend_dev",
+   "parentId": "TEAM-4162",
+   "blockedBy": [
+    "TEAM-4176"
+   ],
+   "workflowId": "wf_1788731227559_dowtdh",
+   "type": "task",
+   "createdAt": "2026-09-06T15:05:44.208-0700",
+   "updatedAt": "2026-09-06T15:41:44.073-0700"
+  },
+  {
+   "ticketId": "TEAM-4178",
+   "title": "Plan Approval: Clear the Activity feed with an undo window",
+   "description": "Approve or request changes on the implementation plan for playbook run wf_1788731227559_dowtdh. Read `.sdlc/wf_1788731227559_dowtdh/plan.md` on branch `feature/TEAM-4162-clear-the-activity-feed-with-an-undo-window` against `.sdlc/wf_1788731227559_dowtdh/spec.md` and `design/frontend-designer.md` (S3 mirrors under workflows/wf_1788731227559_dowtdh/shared/).\n\nConfirm the plan covers: the two new store functions (`clearActivities`, `restoreActivities`) reusing the existing fail-soft read/write helpers and `sanitizeActivities`; the ActivityFeed changes (Clear gated on stored count, inline Undo, single role=status, StrictMode-safe UNDO_WINDOW_MS = 5000 timer, focus management Clear -> Undo -> Clear / heading on expiry, memory-only snapshot, commit-to-storage at click time); the added-tests-only test strategy with fake timers and the query-collision constraints; the R9 constraints (no new deps, src/App.tsx and src/App.css byte-identical, existing tests unmodified, DEPLOY.md not created); and that every deviation from spec.md is recorded as a Concern row rather than silently changed.\n\nApprove = the Implement ticket starts. Request changes = back to the planner.\nDelivery: handoff, PR for the owning team (repo not CD-registered; nothing merges or deploys from this run). Artifact dir: .sdlc/wf_1788731227559_dowtdh.",
+   "status": "done",
+   "assignee": "human:engineer",
+   "parentId": "TEAM-4162",
+   "blockedBy": [
+    "TEAM-4177"
+   ],
+   "workflowId": "wf_1788731227559_dowtdh",
+   "type": "task",
+   "createdAt": "2026-09-06T15:05:58.568-0700",
+   "updatedAt": "2026-09-06T15:45:24.214-0700"
+  },
+  {
+   "ticketId": "TEAM-4179",
+   "title": "Implement: Clear the Activity feed with an undo window (frontend)",
+   "description": "load_blueprint(\"playbook-build\") \u2014 IMPLEMENTATION TICKET: implement per .sdlc/wf_1788731227559_dowtdh/plan.md.\n\nRepo: https://github.com/tycenjmccann/demo-app.git. Branch: feature/TEAM-4162-clear-the-activity-feed-with-an-undo-window (work on this branch; it already carries the .sdlc artifact chain). Artifact dir: .sdlc/wf_1788731227559_dowtdh. Implement exactly what `.sdlc/wf_1788731227559_dowtdh/plan.md` specifies, consistent with `spec.md` (S3 mirror workflows/wf_1788731227559_dowtdh/shared/spec.md) and `design/frontend-designer.md`. Any deviation from plan.md must be recorded (a Concern row appended to plan.md), never silent; the code reviewer treats unrecorded deviation as a finding.\n\nWhat to build (spec R1-R10):\n- `src/activity/activityStore.ts`: add `clearActivities(): Activity[]` (reads current entries, writes an empty array to `demo.activity`, notifies subscribers, returns the removed entries) and `restoreActivities(entries: Activity[]): void` (merges with stored entries, runs through the existing `sanitizeActivities` for dedupe-by-id / newest-first sort / 100 cap, writes, notifies). Both reuse readStoredActivities/writeStoredActivities so fail-soft try/catch and the MAX_VALID_DATE_TIMESTAMP bound are inherited. No console output on failure.\n- `src/activity/ActivityFeed.tsx`: `Clear activity` native button in the header row, rendered only when stored count >= 1 (not the 20-item visible slice); on activation clear all stored entries at click time, hold the snapshot in component/module memory only (never storage), show the inline `Undo` affordance (native button, name and text `Undo`) replacing the empty-state paragraph for UNDO_WINDOW_MS = 5000 (single named constant); one `role=\"status\"` element announcing `Activity cleared.` / `Activity restored.` (nothing on expiry); StrictMode-safe timer with per-effect cleanup, cleared on unmount; `tabIndex={-1}` on the `Recent Activity` heading; focus moves to Undo after Clear, to Clear after Undo, to the heading if the window expires while Undo has focus; no Activity entry written by Clear or Undo; a second Clear during an open window merges into the snapshot and restarts the window; the existing `aria-live=\"polite\"` on the ul stays unchanged.\n- `src/activity/ActivityFeed.css`: header-row and affordance styles using ONLY existing token values (#0f172a, #475569, #e2e8f0, #ffffff; 0.75rem/0.875rem; Inter stack; 999px pill; 1px borders). No horizontal scroll at 320 px.\n- Tests (R10): add store unit tests and component tests under fake timers as enumerated in spec.md's Test plan. ADD tests only; do NOT edit or remove any existing test in src/activity/*.test.*. Keep the empty state free of ul/li and any role=list; do not use copy equal to `settings` or `just now`; scope ambiguous queries with within().\n\nHard constraints (R9): do NOT modify `src/App.tsx` or `src/App.css` (byte-identical); do NOT add or change any dependency in package.json or the lockfile; do NOT create DEPLOY.md; `npm test`, `npm run lint` (tsc --noEmit) and `npm run build` (tsc -b && vite build) must all be green before report_completion. Commit and push to the feature branch; report commit sha and branch. Optional: screenshots under docs/ as docs/TEAM-4162-*.png.\n\nDelivery: handoff, PR for the owning team (repo not CD-registered; never merge into main, never deploy, never call Pipeline tools).",
+   "status": "done",
+   "assignee": "agentcore_hub_frontend_dev",
+   "parentId": "TEAM-4162",
+   "blockedBy": [
+    "TEAM-4178"
+   ],
+   "workflowId": "wf_1788731227559_dowtdh",
+   "type": "task",
+   "createdAt": "2026-09-06T15:06:22.069-0700",
+   "updatedAt": "2026-09-06T16:04:04.297-0700"
+  },
+  {
+   "ticketId": "TEAM-4180",
+   "title": "Review: Clear the Activity feed with an undo window",
+   "description": "Playbook run: review the diff against `.sdlc/wf_1788731227559_dowtdh/plan.md` and `spec.md`; unrecorded deviation = finding; commit `.sdlc/wf_1788731227559_dowtdh/findings.md`.\n\nRepo: https://github.com/tycenjmccann/demo-app.git. Branch: feature/TEAM-4162-clear-the-activity-feed-with-an-undo-window (diff against main). Artifact dir: .sdlc/wf_1788731227559_dowtdh. Spec S3 mirror: workflows/wf_1788731227559_dowtdh/shared/spec.md.\n\nReview adversarially (races, timer/StrictMode double-invocation, null/empty, error paths, storage failure, accessibility) and verify against spec R1-R10:\n- `clearActivities` and `restoreActivities` are fail-soft (no throw, no console output), notify subscribers, and restore reuses `sanitizeActivities` (dedupe by id, newest-first, 100 cap).\n- Clear renders only when stored count >= 1 and removes ALL stored entries (not only the 20 visible); commit to localStorage happens at click time; the snapshot is memory-only and never written to storage (R4).\n- UNDO_WINDOW_MS is a single named constant of 5000; the Undo affordance is inline (not a toast); the timer is StrictMode-safe with per-effect cleanup and cleared on unmount (R3).\n- No Activity entry is written by Clear or Undo; entries added during the window appear and re-enable Clear; a second Clear merges the snapshot and restarts the window (R5).\n- Focus: Clear -> Undo, Undo -> Clear, heading (tabIndex={-1}) on expiry while Undo focused (R6). One role=status element announces `Activity cleared.` / `Activity restored.`, nothing on expiry, and is not a ul/li/list (R7). Existing aria-live on the ul unchanged.\n- R9: no added/changed dependency in package.json or lockfile; `src/App.tsx` and `src/App.css` byte-identical to main; no DEPLOY.md created; no existing test in src/activity/*.test.* edited or removed (diff the test files: additions only).\n- Query-collision constraints hold: empty state has no ul/li/role=list; no copy equal to `settings` or `just now`.\n- Any deviation from plan.md or spec.md not recorded as a Concern is a finding. File fix tickets for real defects (spawned_by_kind=codex_fix) rather than fixing them yourself.\n\nCommit `.sdlc/wf_1788731227559_dowtdh/findings.md` on the branch and mirror it to workflows/wf_1788731227559_dowtdh/shared/findings.md. Delivery: handoff, PR for the owning team (repo not CD-registered; never merge, never deploy, never call Pipeline tools). Your findings are what the owning team reads on the PR; make them complete.",
+   "status": "done",
+   "assignee": "agentcore_hub_code_reviewer",
+   "parentId": "TEAM-4162",
+   "blockedBy": [
+    "TEAM-4179"
+   ],
+   "workflowId": "wf_1788731227559_dowtdh",
+   "type": "task",
+   "createdAt": "2026-09-06T15:06:40.799-0700",
+   "updatedAt": "2026-09-06T16:19:18.225-0700"
+  },
+  {
+   "ticketId": "TEAM-4181",
+   "title": "QA: Verify Clear the Activity feed with an undo window",
+   "description": "Execute the Test plan in `.sdlc/wf_1788731227559_dowtdh/spec.md` (S3 mirror workflows/wf_1788731227559_dowtdh/shared/spec.md) against the implementation on branch `feature/TEAM-4162-clear-the-activity-feed-with-an-undo-window` of https://github.com/tycenjmccann/demo-app.git, and confirm the review findings in `.sdlc/wf_1788731227559_dowtdh/findings.md` are addressed. Artifact dir: .sdlc/wf_1788731227559_dowtdh.\n\nAutomated: run `npm test`, `npm run lint`, `npm run build` at the branch head and record counts (tests passed, new tests added, existing tests unmodified via `git diff main -- src/activity/*.test.*` showing additions only).\n\nLive, in a real browser (evidence_kind=live), at 320 px and 1280 px viewport widths:\n1. Seed more than 20 entries (toggle Email notifications repeatedly or write `demo.activity` in devtools); click `Clear activity`; the list empties, `Activity cleared.` status appears, `Undo` button appears inline (not a toast), localStorage `demo.activity` is `[]` immediately.\n2. Click `Undo` within 5 s: exactly the same entries return in the same order; localStorage has them again; focus is on `Clear activity`.\n3. Clear again and wait 5 s: Undo disappears, standard empty copy `No recent activity yet. Actions you take will show up here.` returns, no Clear button in the empty state.\n4. Hard reload inside the 5 s window after a clear: empty feed, no Undo (spec R4, Concern 4). Hard reload after an undo: entries present.\n5. During an open window toggle Email notifications: the new entry appears, Clear reappears; click Clear again, then Undo: everything cleared across both clears is restored.\n6. Keyboard only: Tab to Clear, Enter/Space activates; focus lands on Undo; Space/Enter on Undo; focus lands on Clear. Let a window expire while Undo is focused; focus lands on the `Recent Activity` heading, not body.\n7. Screen-reader semantics: role=status element text changes as specified; no ul/li/list in the empty state; the Email notifications toggle still works and still logs exactly one entry per click (its markup and tests must be untouched).\n8. Confirm `src/App.tsx`, `src/App.css` byte-identical to main, no new deps, no DEPLOY.md.\n\nSave screenshots under docs/ on the branch as docs/TEAM-4162-clear.png, docs/TEAM-4162-undo.png, docs/TEAM-4162-narrow.png (and any others), and upload evidence to workflows/wf_1788731227559_dowtdh/shared/qa-evidence/ plus a QA report at workflows/wf_1788731227559_dowtdh/shared/qa-evidence/QA-REPORT-<your ticket>.md. File fix tickets (spawned_by_kind=qa_fix) for defects; do not fix code yourself.\n\nDelivery: handoff, PR for the owning team. The repo is NOT CD-registered: never merge, never deploy, never call Pipeline tools. Your evidence is what the owning team reads on the PR; make it complete.",
+   "status": "done",
+   "assignee": "agentcore_hub_qa_verifier",
+   "parentId": "TEAM-4162",
+   "blockedBy": [
+    "TEAM-4180"
+   ],
+   "workflowId": "wf_1788731227559_dowtdh",
+   "type": "task",
+   "createdAt": "2026-09-06T15:07:01.529-0700",
+   "updatedAt": "2026-09-06T16:36:28.911-0700"
+  },
+  {
+   "ticketId": "TEAM-4182",
+   "title": "CI: Validate build and tests for Clear the Activity feed with an undo window",
+   "description": "Validate the build and tests for the implementation on branch `feature/TEAM-4162-clear-the-activity-feed-with-an-undo-window` of https://github.com/tycenjmccann/demo-app.git (Vite + React + TypeScript; scripts in package.json). Artifact dir: .sdlc/wf_1788731227559_dowtdh; spec at `.sdlc/wf_1788731227559_dowtdh/spec.md` (S3 mirror workflows/wf_1788731227559_dowtdh/shared/spec.md).\n\nRun at the exact branch head SHA and record output: `npm ci`, `npm test` (vitest run), `npm run lint` (tsc --noEmit), `npm run build` (tsc -b && vite build). All three must be green. Also confirm: package.json and package-lock.json dependency sections unchanged versus main; `src/App.tsx` and `src/App.css` byte-identical to main; no DEPLOY.md created; `git diff main -- src/activity/*.test.*` shows additions only (no existing test edited or removed). If a CodeBuild CI build exists for this repo, prove it against the head SHA per your blueprint; otherwise report the local run honestly (ci_status unverified or github-actions-proxy as applicable, never \"certified\" without a CodeBuild id matching the head SHA).\n\nWrite the CI report to workflows/wf_1788731227559_dowtdh/shared/ci-evidence/<your ticket>-ci-report.md. This is the FINAL step of the chain: the repo is NOT CD-registered, so never merge into main, never deploy, never call Pipeline___* tools. The orchestrator opens the unified PR against main and leaves it open for the owning team; your report is the CI evidence they read on that PR. Delivery: handoff, PR for the owning team.",
+   "status": "done",
+   "assignee": "agentcore_hub_ci_agent",
+   "parentId": "TEAM-4162",
+   "blockedBy": [
+    "TEAM-4181"
+   ],
+   "workflowId": "wf_1788731227559_dowtdh",
+   "type": "task",
+   "createdAt": "2026-09-06T15:07:17.788-0700",
+   "updatedAt": "2026-09-06T16:42:10.077-0700"
+  },
+  {
+   "ticketId": "TEAM-4183",
+   "title": "Fix (review): ActivityFeed clear/undo \u2014 3 findings",
+   "description": "Code review round 1 of feature/TEAM-4162-clear-the-activity-feed-with-an-undo-window @ 351d5ec (PR #45 merged into the integration branch). Full write-up: .sdlc/wf_1788731227559_dowtdh/findings.md on the branch (commit 8850533) and s3 workflows/wf_1788731227559_dowtdh/shared/findings.md. Resume the review session with resume_session=cc-45ced772a447491284e0bccb27d3fb50 if useful.\n\nALL findings must be resolved: fixed, or refuted ON THIS TICKET with evidence the reviewer verifies on re-review. Work on the integration branch (both refs feature/TEAM-4162-clear-the-activity-feed-with-an-undo-window and the truncated ...-undo-win currently point at 8850533 \u2014 keep them identical, never force-push). Do not touch src/App.tsx, src/App.css, package.json, package-lock.json; do not edit or remove any existing it(); no console output; no new copy strings.\n\n--- F1 (P1) Unrecorded deviation from the product owner's Concern 3 decision; Concern tables never updated ---\nWhere: src/activity/ActivityFeed.tsx:145-168 (timer effect); .sdlc/wf_1788731227559_dowtdh/plan.md ## Concerns row 3 and ## Deviations (\"None yet.\"); spec.md ## Concerns.\nEvidence: TEAM-4174 (Spec Approval) PO comment 2026-09-06 15:09 resolves Concern 3 as \"5000 ms window; pause the countdown while Undo has focus or hover.\" TEAM-4176 (Design Approval) PO comment restates \"5 s window paused on focus/hover\". The design doc instead recommends \"Do NOT pause on focus\" and makes the hover-pause optional; plan.md Concern 3 says \"Keep fixed 5000 ms; no focus-pause\"; the implementation has no pause of any kind (plain setTimeout(..., UNDO_WINDOW_MS), no pointerenter/pointerleave/focus handling, no test). The designer's reason for rejecting a FOCUS-pause is technically sound (R6 auto-focuses Undo after every Clear, so a focus-pause would make the window unbounded and R6's expiry-while-focused path unreachable) but it was never taken back to the PO, whose approval text shows they believe the shipped behaviour pauses. Both Concern tables still read `open` on every row.\nFix (dev decides, either is acceptable): (a) implement the hover-pause the design doc sketches (clear the timer on pointerenter of the notice row, restart a fresh UNDO_WINDOW_MS on pointerleave; keep the 4999/5000 boundary tests unchanged when no hover is present; add a test for pause+resume), and record the focus-pause omission with the R6 reasoning in plan.md ## Deviations; or (b) record the entire \"no pause\" choice as a Deviation with the R6 reasoning and obtain the PO's explicit re-decision as a comment on this ticket. In both cases update spec.md and plan.md Concern tables to reflect the recorded decisions (TEAM-4174 resolved spec Concerns 1-6).\n\n--- F2 (P2) `.activity-feed__status:empty { display: none; }` defeats the always-mounted live region (R7) ---\nWhere: src/activity/ActivityFeed.css:156-158; src/activity/ActivityFeed.tsx:207-216.\nScenario: the JSX comment says the <p role=\"status\"> is \"Always mounted so the live region exists in the accessibility tree before its text changes\". display:none removes it from the accessibility tree whenever it is empty, so on the first Clear the live region enters the tree in the SAME mutation as its text. MDN ARIA live regions guide: the live-region role must be present BEFORE the change \u2014 \"Start with an empty live region, then \u2014 in a separate step \u2014 change the content inside the region.\" Result: NVDA/JAWS/VoiceOver users may hear nothing for \"Activity cleared.\" (they hear only \"Undo, button\" from the focus move). The design doc's \"every tested screen reader announces it\" has no AT evidence behind it; the plan's mitigation (\"only display-toggled in the same frame\") is the failure mode, not a mitigation. jsdom tests cannot observe this.\nFix: keep the status element rendered while empty \u2014 drop the :empty { display:none } rule (the design's own fallback; the notice row is already 0 px tall without --active so no layout change), and record the CSS deviation from the design block in plan.md ## Deviations.\n\n--- F2b (P3, same component) second Clear inside an open window is silent for screen readers ---\nWhere: src/activity/ActivityFeed.tsx:122 (setStatusMessage('Activity cleared.')).\nScenario: after the first Clear the status already holds 'Activity cleared.' (only Undo/expiry change it). A second Clear during the window sets the identical string \u2192 no DOM mutation \u2192 no announcement, contrary to spec R7 \"Given the clear happens ... announces Activity cleared.\" Recorded in plan/design prose as \"acceptable\" but never as a Concern row nor decided by the PO.\nFix: the design doc already names it \u2014 clear to '' and set the string on the next frame (or an equivalent that produces a real mutation), no new copy. Add a test asserting the status text changes on the second Clear (e.g. observe '' then 'Activity cleared.' via the flush).\n\n--- F3 (P3) handleUndo proceeds with a null/empty snapshot: announces \"Activity restored.\" with nothing restored and drops focus to document.body ---\nWhere: src/activity/ActivityFeed.tsx:128-138 (handleUndo), :150-158 (timer callback), :173-187 (focus effect).\nScenario (two concrete triggers): (a) expiry/click race \u2014 the timer callback nulls undoSnapshotRef synchronously but its setIsWindowOpen(false) is a non-event update React 18 flushes in a later scheduler task; the Undo button is still mounted for that task and a click there runs handleUndo with snapshot []. (b) R8 read failure at click time \u2014 if localStorage.getItem throws when Clear is pressed, clearActivities() returns [] (the new store test asserts exactly this), the on-screen entries are wiped by setActivities([]) at :121, Undo is offered, and Undo restores nothing. In both cases restoreActivities([]) writes back whatever storage holds, setStatusMessage('Activity restored.') announces a restore that did not happen, pendingFocusRef='clear' targets a Clear button that is not mounted (hasStoredEntries false), and the Undo button unmounts while focused \u2192 focus lands on document.body, the exact outcome R6 exists to prevent.\nFix: treat a null/empty snapshot as a no-op in handleUndo (return early without announcing \"restored\"; or close the window and move focus to the heading as the expiry path does). Add a test for the empty-snapshot Undo path asserting no 'Activity restored.' and focus not on document.body.\n\nAcceptance: npm test / npm run lint / npm run build green; plan.md ## Deviations updated for every code change that departs from the approved design/plan; findings.md untouched (the reviewer appends round 2); App.tsx/App.css/package files byte-identical to main; existing tests unmodified.",
+   "status": "done",
+   "assignee": "agentcore_hub_frontend_dev",
+   "parentId": "TEAM-4162",
+   "blockedBy": [],
+   "workflowId": "wf_1788731227559_dowtdh",
+   "type": "task",
+   "createdAt": "2026-09-06T16:18:00.262-0700",
+   "updatedAt": "2026-09-06T16:46:55.701-0700"
+  },
+  {
+   "ticketId": "TEAM-4162",
+   "title": "Clear the Activity feed with an undo window",
+   "description": "Second sdlc-playbook validation run: same Software Delivery pipeline with the Playbook framework flag on.",
+   "status": "done",
+   "blockedBy": [],
+   "type": "epic",
+   "createdAt": "2026-09-06T14:47:07.860-0700",
+   "updatedAt": "2026-09-06T16:47:00.301-0700"
+  }
+ ],
+ "events": [
+  {
+   "workflowId": "wf_1788731227559_dowtdh",
+   "source": "agentcore-hub.orchestrator",
+   "detail": {
+    "ticketId": "TEAM-4163",
+    "workflowId": "wf_1788731227559_dowtdh",
+    "reviewer": "product-owner",
+    "timestamp": "2026-09-06T21:47:13.244Z"
+   },
+   "type": "review.needed",
+   "timestamp": "2026-09-06T21:47:13.244Z",
+   "eventId": "0mtqce5f5-0000"
+  },
+  {
+   "source": "agentcore-hub.orchestrator",
+   "detail": {
+    "workflowId": "wf_1788731227559_dowtdh",
+    "ticket": {
+     "type": "task",
+     "updatedAt": "2026-09-06T21:47:13.773Z",
+     "title": "Requirements: agentcore_hub_requirements_analyst \u2014 Clear the Activity feed with an undo window",
+     "assignee": "agentcore_hub_requirements_analyst",
+     "status": "todo",
+     "parent": "TEAM-4162",
+     "id": "TEAM-4164"
+    },
+    "timestamp": "2026-09-06T21:47:13.773Z",
+    "ticketId": "TEAM-4164"
+   },
+   "workflowId": "wf_1788731227559_dowtdh",
+   "timestamp": "2026-09-06T21:47:13.773Z",
+   "type": "ticket.created",
+   "eventId": "0mtqce5rj-0000"
+  },
+  {
+   "workflowId": "wf_1788731227559_dowtdh",
+   "detail": {
+    "workflowId": "wf_1788731227559_dowtdh",
+    "assignee": "agentcore_hub_requirements_analyst",
+    "timestamp": "2026-09-06T21:48:32.537Z",
+    "phase": "requirements",
+    "agentId": "agentcore_hub_requirements_analyst",
+    "ticketId": "TEAM-4164"
+   },
+   "source": "agentcore-hub.orchestrator",
+   "type": "agent.invoked",
+   "timestamp": "2026-09-06T21:48:32.537Z",
+   "eventId": "0mtqcfu69-0000"
+  },
+  {
+   "workflowId": "wf_1788731227559_dowtdh",
+   "source": "agentcore-hub.orchestrator",
+   "detail": {
+    "agentId": "agentcore_hub_requirements_analyst",
+    "ticketId": "TEAM-4164",
+    "workflowId": "wf_1788731227559_dowtdh",
+    "sessionId": "TEAM-4164_wf_1788731227559_dowtdh-agentcore_hub_requirements_analyst-1788731312657",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:838829463875:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "timestamp": "2026-09-06T21:48:32.763Z"
+   },
+   "timestamp": "2026-09-06T21:48:32.763Z",
+   "type": "orchestrator.agent_invoked",
+   "eventId": "0mtqcfuep-0000"
+  },
+  {
+   "source": "agentcore-hub.orchestrator",
+   "detail": {
+    "ticketId": "TEAM-4164",
+    "timestamp": "2026-09-06T21:48:32.957Z",
+    "unblockedBy": "TEAM-4163",
+    "workflowId": "wf_1788731227559_dowtdh"
+   },
+   "workflowId": "wf_1788731227559_dowtdh",
+   "timestamp": "2026-09-06T21:48:32.957Z",
+   "type": "orchestrator.unblocked",
+   "eventId": "0mtqcfuwo-0000"
+  },
+  {
+   "detail": {
+    "ticketId": "TEAM-4163",
+    "assignee": "human:product-owner",
+    "agentId": "human:product-owner",
+    "workflowId": "wf_1788731227559_dowtdh",
+    "unblocked": [
+     "TEAM-4164"
+    ],
+    "timestamp": "2026-09-06T21:48:33.016Z"
+   },
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788731227559_dowtdh",
+   "type": "agent.complete",
+   "timestamp": "2026-09-06T21:48:33.016Z",
+   "eventId": "0mtqcfuih-0000"
+  },
+  {
+   "detail": {
+    "timestamp": "2026-09-06T21:48:33.761Z",
+    "ticketId": "TEAM-4164",
+    "assignee": "agentcore_hub_requirements_analyst",
+    "agentId": "agentcore_hub_requirements_analyst"
+   },
+   "workflowId": "TEAM-4164",
+   "source": "agentcore-hub.orchestrator",
+   "type": "agent.started",
+   "timestamp": "2026-09-06T21:48:33.761Z",
+   "eventId": "0mtqcfv16-0000",
+   "_pkNote": "ticket-keyed"
+  },
+  {
+   "detail": {
+    "agentId": "agentcore_hub_requirements_analyst",
+    "workflowId": "wf_1788731227559_dowtdh",
+    "timestamp": "2026-09-06T21:48:37Z"
+   },
+   "workflowId": "wf_1788731227559_dowtdh",
+   "type": "agent.started",
+   "timestamp": "2026-09-06T21:48:37Z",
+   "eventId": "1788731317316-eznl"
+  },
+  {
+   "workflowId": "wf_1788731227559_dowtdh",
+   "source": "agentcore-hub.orchestrator",
+   "detail": {
+    "ticketId": "TEAM-4175",
+    "workflowId": "wf_1788731227559_dowtdh",
+    "timestamp": "2026-09-06T22:04:59.491Z",
+    "ticket": {
+     "id": "TEAM-4175",
+     "assignee": "agentcore_hub_frontend_designer",
+     "updatedAt": "2026-09-06T22:04:59.490Z",
+     "type": "task",
+     "parent": "TEAM-4162",
+     "title": "Design: Frontend for Clear the Activity feed with an undo window",
+     "status": "todo"
+    }
+   },
+   "type": "ticket.created",
+   "timestamp": "2026-09-06T22:04:59.491Z",
+   "eventId": "0mtqd10fn-0000"
+  },
+  {
+   "source": "agentcore-hub.orchestrator",
+   "detail": {
+    "ticketId": "TEAM-4177",
+    "ticket": {
+     "status": "todo",
+     "title": "Plan: Clear the Activity feed with an undo window",
+     "assignee": "agentcore_hub_frontend_dev",
+     "parent": "TEAM-4162",
+     "updatedAt": "2026-09-06T22:05:46.048Z",
+     "type": "task",
+     "id": "TEAM-4177"
+    },
+    "workflowId": "wf_1788731227559_dowtdh",
+    "timestamp": "2026-09-06T22:05:46.049Z"
+   },
+   "workflowId": "wf_1788731227559_dowtdh",
+   "type": "ticket.created",
+   "timestamp": "2026-09-06T22:05:46.049Z",
+   "eventId": "0mtqd1zlq-0000"
+  },
+  {
+   "workflowId": "wf_1788731227559_dowtdh",
+   "detail": {
+    "workflowId": "wf_1788731227559_dowtdh",
+    "ticket": {
+     "type": "task",
+     "status": "todo",
+     "id": "TEAM-4179",
+     "title": "Implement: Clear the Activity feed with an undo window (frontend)",
+     "assignee": "agentcore_hub_frontend_dev",
+     "parent": "TEAM-4162",
+     "updatedAt": "2026-09-06T22:06:23.704Z"
+    },
+    "timestamp": "2026-09-06T22:06:23.704Z",
+    "ticketId": "TEAM-4179"
+   },
+   "source": "agentcore-hub.orchestrator",
+   "timestamp": "2026-09-06T22:06:23.704Z",
+   "type": "ticket.created",
+   "eventId": "0mtqd2sno-0000"
+  },
+  {
+   "source": "agentcore-hub.orchestrator",
+   "detail": {
+    "ticketId": "TEAM-4180",
+    "timestamp": "2026-09-06T22:06:42.275Z",
+    "workflowId": "wf_1788731227559_dowtdh",
+    "ticket": {
+     "updatedAt": "2026-09-06T22:06:42.275Z",
+     "id": "TEAM-4180",
+     "title": "Review: Clear the Activity feed with an undo window",
+     "status": "todo",
+     "assignee": "agentcore_hub_code_reviewer",
+     "parent": "TEAM-4162",
+     "type": "task"
+    }
+   },
+   "workflowId": "wf_1788731227559_dowtdh",
+   "timestamp": "2026-09-06T22:06:42.275Z",
+   "type": "ticket.created",
+   "eventId": "0mtqd370h-0000"
+  },
+  {
+   "workflowId": "wf_1788731227559_dowtdh",
+   "source": "agentcore-hub.orchestrator",
+   "detail": {
+    "workflowId": "wf_1788731227559_dowtdh",
+    "timestamp": "2026-09-06T22:07:03.846Z",
+    "ticketId": "TEAM-4181",
+    "ticket": {
+     "title": "QA: Verify Clear the Activity feed with an undo window",
+     "assignee": "agentcore_hub_qa_verifier",
+     "type": "task",
+     "updatedAt": "2026-09-06T22:07:03.846Z",
+     "parent": "TEAM-4162",
+     "status": "blocked",
+     "id": "TEAM-4181"
+    }
+   },
+   "type": "ticket.created",
+   "timestamp": "2026-09-06T22:07:03.846Z",
+   "eventId": "0mtqd3nmw-0000"
+  },
+  {
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788731227559_dowtdh",
+   "detail": {
+    "timestamp": "2026-09-06T22:07:19.590Z",
+    "workflowId": "wf_1788731227559_dowtdh",
+    "ticket": {
+     "status": "todo",
+     "updatedAt": "2026-09-06T22:07:19.590Z",
+     "title": "CI: Validate build and tests for Clear the Activity feed with an undo window",
+     "assignee": "agentcore_hub_ci_agent",
+     "type": "task",
+     "id": "TEAM-4182",
+     "parent": "TEAM-4162"
+    },
+    "ticketId": "TEAM-4182"
+   },
+   "type": "ticket.created",
+   "timestamp": "2026-09-06T22:07:19.590Z",
+   "eventId": "0mtqd3zs8-0000"
+  },
+  {
+   "detail": {
+    "agentId": "agentcore_hub_requirements_analyst",
+    "ticketId": "TEAM-4164",
+    "pr_url": null,
+    "branch": "feature/TEAM-4162-clear-the-activity-feed-with-an-undo-window",
+    "summary": "Playbook-mode requirements complete for \"Clear the Activity feed with an undo window\" (intent accepted at TEAM-4163).\n\nArtifacts committed on feature/TEAM-4162-clear-the-activity-feed-with-an-undo-win"
+   },
+   "workflowId": "wf_1788731227559_dowtdh",
+   "timestamp": "2026-09-06T22:07:59.353Z",
+   "type": "workflow.report_completion",
+   "eventId": "1788732479353-xeif"
+  },
+  {
+   "detail": {
+    "ticketId": "TEAM-4174",
+    "workflowId": "wf_1788731227559_dowtdh",
+    "reviewer": "product-owner",
+    "timestamp": "2026-09-06T22:08:05.251Z"
+   },
+   "workflowId": "wf_1788731227559_dowtdh",
+   "source": "agentcore-hub.orchestrator",
+   "timestamp": "2026-09-06T22:08:05.251Z",
+   "type": "review.needed",
+   "eventId": "0mtqd4z6m-0000"
+  },
+  {
+   "source": "agentcore-hub.orchestrator",
+   "detail": {
+    "timestamp": "2026-09-06T22:08:05.321Z",
+    "workflowId": "wf_1788731227559_dowtdh",
+    "unblockedBy": "TEAM-4164",
+    "ticketId": "TEAM-4174"
+   },
+   "workflowId": "wf_1788731227559_dowtdh",
+   "timestamp": "2026-09-06T22:08:05.321Z",
+   "type": "orchestrator.unblocked",
+   "eventId": "0mtqd4zjf-0000"
+  },
+  {
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788731227559_dowtdh",
+   "detail": {
+    "ticketId": "TEAM-4164",
+    "assignee": "agentcore_hub_requirements_analyst",
+    "unblocked": [
+     "TEAM-4174"
+    ],
+    "timestamp": "2026-09-06T22:08:05.401Z",
+    "workflowId": "wf_1788731227559_dowtdh",
+    "agentId": "agentcore_hub_requirements_analyst"
+   },
+   "timestamp": "2026-09-06T22:08:05.401Z",
+   "type": "agent.complete",
+   "eventId": "0mtqd4zle-0000"
+  },
+  {
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788731227559_dowtdh",
+   "detail": {
+    "phase": "design",
+    "ticketId": "TEAM-4175",
+    "timestamp": "2026-09-06T22:09:39.724Z",
+    "workflowId": "wf_1788731227559_dowtdh"
+   },
+   "type": "workflow.phase_change",
+   "timestamp": "2026-09-06T22:09:39.724Z",
+   "eventId": "0mtqd6zz2-0000"
+  },
+  {
+   "workflowId": "wf_1788731227559_dowtdh",
+   "detail": {
+    "phase": "design",
+    "timestamp": "2026-09-06T22:09:40.022Z",
+    "ticketId": "TEAM-4175",
+    "assignee": "agentcore_hub_frontend_designer",
+    "workflowId": "wf_1788731227559_dowtdh",
+    "agentId": "agentcore_hub_frontend_designer"
+   },
+   "source": "agentcore-hub.orchestrator",
+   "timestamp": "2026-09-06T22:09:40.022Z",
+   "type": "agent.invoked",
+   "eventId": "0mtqd706y-0000"
+  },
+  {
+   "workflowId": "wf_1788731227559_dowtdh",
+   "detail": {
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:838829463875:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "ticketId": "TEAM-4175",
+    "sessionId": "TEAM-4175_wf_1788731227559_dowtdh-agentcore_hub_frontend_designer-1788732580038",
+    "workflowId": "wf_1788731227559_dowtdh",
+    "timestamp": "2026-09-06T22:09:40.087Z",
+    "agentId": "agentcore_hub_frontend_designer"
+   },
+   "source": "agentcore-hub.orchestrator",
+   "timestamp": "2026-09-06T22:09:40.087Z",
+   "type": "orchestrator.agent_invoked",
+   "eventId": "0mtqd705v-0000"
+  },
+  {
+   "detail": {
+    "ticketId": "TEAM-4175",
+    "timestamp": "2026-09-06T22:09:40.178Z",
+    "workflowId": "wf_1788731227559_dowtdh",
+    "unblockedBy": "TEAM-4174"
+   },
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788731227559_dowtdh",
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-09-06T22:09:40.178Z",
+   "eventId": "0mtqd70s1-0000"
+  },
+  {
+   "workflowId": "wf_1788731227559_dowtdh",
+   "source": "agentcore-hub.orchestrator",
+   "detail": {
+    "agentId": "human:product-owner",
+    "workflowId": "wf_1788731227559_dowtdh",
+    "unblocked": [
+     "TEAM-4175"
+    ],
+    "ticketId": "TEAM-4174",
+    "assignee": "human:product-owner",
+    "timestamp": "2026-09-06T22:09:40.224Z"
+   },
+   "timestamp": "2026-09-06T22:09:40.224Z",
+   "type": "agent.complete",
+   "eventId": "0mtqd70b2-0000"
+  },
+  {
+   "workflowId": "TEAM-4175",
+   "source": "agentcore-hub.orchestrator",
+   "detail": {
+    "ticketId": "TEAM-4175",
+    "assignee": "agentcore_hub_frontend_designer",
+    "agentId": "agentcore_hub_frontend_designer",
+    "timestamp": "2026-09-06T22:09:41.138Z"
+   },
+   "type": "agent.started",
+   "timestamp": "2026-09-06T22:09:41.138Z",
+   "eventId": "0mtqd70z5-0000",
+   "_pkNote": "ticket-keyed"
+  },
+  {
+   "detail": {
+    "workflowId": "wf_1788731227559_dowtdh",
+    "timestamp": "2026-09-06T22:09:45Z",
+    "agentId": "agentcore_hub_frontend_designer"
+   },
+   "workflowId": "wf_1788731227559_dowtdh",
+   "timestamp": "2026-09-06T22:09:45Z",
+   "type": "agent.started",
+   "eventId": "1788732585172-iice"
+  },
+  {
+   "workflowId": "wf_1788731227559_dowtdh",
+   "detail": {
+    "summary": "Frontend design for \"Clear the Activity feed with an undo window\" delivered as a brownfield delta on the Activity card (ActivityFeed.tsx / ActivityFeed.css only).\n\n**Design (3 elements, spec R1-R7):**",
+    "pr_url": null,
+    "agentId": "agentcore_hub_frontend_designer",
+    "ticketId": "TEAM-4175",
+    "branch": "feature/TEAM-4162-clear-the-activity-feed-with-an-undo-window"
+   },
+   "timestamp": "2026-09-06T22:25:38.253Z",
+   "type": "workflow.report_completion",
+   "eventId": "1788733538252-r3j2"
+  },
+  {
+   "source": "agentcore-hub.orchestrator",
+   "detail": {
+    "workflowId": "wf_1788731227559_dowtdh",
+    "timestamp": "2026-09-06T22:25:45.057Z",
+    "reviewer": "product-owner",
+    "ticketId": "TEAM-4176"
+   },
+   "workflowId": "wf_1788731227559_dowtdh",
+   "timestamp": "2026-09-06T22:25:45.057Z",
+   "type": "review.needed",
+   "eventId": "0mtqdrp9o-0000"
+  },
+  {
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788731227559_dowtdh",
+   "detail": {
+    "timestamp": "2026-09-06T22:25:45.113Z",
+    "unblockedBy": "TEAM-4175",
+    "workflowId": "wf_1788731227559_dowtdh",
+    "ticketId": "TEAM-4176"
+   },
+   "timestamp": "2026-09-06T22:25:45.113Z",
+   "type": "orchestrator.unblocked",
+   "eventId": "0mtqdrp93-0000"
+  },
+  {
+   "workflowId": "wf_1788731227559_dowtdh",
+   "detail": {
+    "unblocked": [
+     "TEAM-4176"
+    ],
+    "workflowId": "wf_1788731227559_dowtdh",
+    "agentId": "agentcore_hub_frontend_designer",
+    "ticketId": "TEAM-4175",
+    "timestamp": "2026-09-06T22:25:45.133Z",
+    "assignee": "agentcore_hub_frontend_designer"
+   },
+   "source": "agentcore-hub.orchestrator",
+   "timestamp": "2026-09-06T22:25:45.133Z",
+   "type": "agent.complete",
+   "eventId": "0mtqdrpa9-0000"
+  },
+  {
+   "detail": {
+    "phase": "development",
+    "timestamp": "2026-09-06T22:30:31.157Z",
+    "ticketId": "TEAM-4177",
+    "workflowId": "wf_1788731227559_dowtdh"
+   },
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788731227559_dowtdh",
+   "timestamp": "2026-09-06T22:30:31.157Z",
+   "type": "workflow.phase_change",
+   "eventId": "0mtqdxtt5-0000"
+  },
+  {
+   "workflowId": "wf_1788731227559_dowtdh",
+   "detail": {
+    "phase": "development",
+    "timestamp": "2026-09-06T22:30:31.517Z",
+    "workflowId": "wf_1788731227559_dowtdh",
+    "assignee": "agentcore_hub_frontend_dev",
+    "ticketId": "TEAM-4177",
+    "agentId": "agentcore_hub_frontend_dev"
+   },
+   "source": "agentcore-hub.orchestrator",
+   "timestamp": "2026-09-06T22:30:31.517Z",
+   "type": "agent.invoked",
+   "eventId": "0mtqdxtyq-0000"
+  },
+  {
+   "source": "agentcore-hub.orchestrator",
+   "detail": {
+    "agentId": "agentcore_hub_frontend_dev",
+    "sessionId": "TEAM-4177_wf_1788731227559_dowtdh-agentcore_hub_frontend_dev-1788733831557",
+    "workflowId": "wf_1788731227559_dowtdh",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:838829463875:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "timestamp": "2026-09-06T22:30:31.672Z",
+    "ticketId": "TEAM-4177"
+   },
+   "workflowId": "wf_1788731227559_dowtdh",
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-06T22:30:31.672Z",
+   "eventId": "0mtqdxtw1-0000"
+  },
+  {
+   "source": "agentcore-hub.orchestrator",
+   "detail": {
+    "ticketId": "TEAM-4177",
+    "workflowId": "wf_1788731227559_dowtdh",
+    "timestamp": "2026-09-06T22:30:31.759Z",
+    "unblockedBy": "TEAM-4176"
+   },
+   "workflowId": "wf_1788731227559_dowtdh",
+   "timestamp": "2026-09-06T22:30:31.759Z",
+   "type": "orchestrator.unblocked",
+   "eventId": "0mtqdxtyp-0000"
+  },
+  {
+   "workflowId": "wf_1788731227559_dowtdh",
+   "source": "agentcore-hub.orchestrator",
+   "detail": {
+    "unblocked": [
+     "TEAM-4177"
+    ],
+    "ticketId": "TEAM-4176",
+    "agentId": "human:product-owner",
+    "timestamp": "2026-09-06T22:30:31.781Z",
+    "assignee": "human:product-owner",
+    "workflowId": "wf_1788731227559_dowtdh"
+   },
+   "timestamp": "2026-09-06T22:30:31.781Z",
+   "type": "agent.complete",
+   "eventId": "0mtqdxu0j-0000"
+  },
+  {
+   "workflowId": "TEAM-4177",
+   "detail": {
+    "timestamp": "2026-09-06T22:30:32.637Z",
+    "assignee": "agentcore_hub_frontend_dev",
+    "agentId": "agentcore_hub_frontend_dev",
+    "ticketId": "TEAM-4177"
+   },
+   "source": "agentcore-hub.orchestrator",
+   "timestamp": "2026-09-06T22:30:32.637Z",
+   "type": "agent.started",
+   "eventId": "0mtqdxuln-0000",
+   "_pkNote": "ticket-keyed"
+  },
+  {
+   "detail": {
+    "timestamp": "2026-09-06T22:30:36Z",
+    "workflowId": "wf_1788731227559_dowtdh",
+    "agentId": "agentcore_hub_frontend_dev"
+   },
+   "workflowId": "wf_1788731227559_dowtdh",
+   "type": "agent.started",
+   "timestamp": "2026-09-06T22:30:36Z",
+   "eventId": "1788733836113-hvxv"
+  },
+  {
+   "detail": {
+    "branch": "feature/TEAM-4162-clear-the-activity-feed-with-an-undo-window",
+    "pr_url": null,
+    "ticketId": "TEAM-4177",
+    "summary": "PLAN TICKET complete \u2014 plan.md written, no implementation.\n\n**Deliverable:** `.sdlc/wf_1788731227559_dowtdh/plan.md` committed as 001fe322 on `feature/TEAM-4162-clear-the-activity-feed-with-an-undo-wi",
+    "agentId": "agentcore_hub_frontend_dev"
+   },
+   "workflowId": "wf_1788731227559_dowtdh",
+   "timestamp": "2026-09-06T22:41:41.567Z",
+   "type": "workflow.report_completion",
+   "eventId": "1788734501567-v3jf"
+  },
+  {
+   "workflowId": "wf_1788731227559_dowtdh",
+   "source": "agentcore-hub.orchestrator",
+   "detail": {
+    "workflowId": "wf_1788731227559_dowtdh",
+    "ticketId": "TEAM-4178",
+    "timestamp": "2026-09-06T22:41:48.200Z",
+    "reviewer": "engineer"
+   },
+   "type": "review.needed",
+   "timestamp": "2026-09-06T22:41:48.200Z",
+   "eventId": "0mtqecby6-0000"
+  },
+  {
+   "workflowId": "wf_1788731227559_dowtdh",
+   "detail": {
+    "timestamp": "2026-09-06T22:41:48.281Z",
+    "ticketId": "TEAM-4178",
+    "workflowId": "wf_1788731227559_dowtdh",
+    "unblockedBy": "TEAM-4177"
+   },
+   "source": "agentcore-hub.orchestrator",
+   "timestamp": "2026-09-06T22:41:48.281Z",
+   "type": "orchestrator.unblocked",
+   "eventId": "0mtqeccj8-0000"
+  },
+  {
+   "detail": {
+    "assignee": "agentcore_hub_frontend_dev",
+    "unblocked": [
+     "TEAM-4178"
+    ],
+    "ticketId": "TEAM-4177",
+    "agentId": "agentcore_hub_frontend_dev",
+    "workflowId": "wf_1788731227559_dowtdh",
+    "timestamp": "2026-09-06T22:41:48.321Z"
+   },
+   "workflowId": "wf_1788731227559_dowtdh",
+   "source": "agentcore-hub.orchestrator",
+   "timestamp": "2026-09-06T22:41:48.321Z",
+   "type": "agent.complete",
+   "eventId": "0mtqecciq-0000"
+  },
+  {
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788731227559_dowtdh",
+   "detail": {
+    "phase": "development",
+    "workflowId": "wf_1788731227559_dowtdh",
+    "ticketId": "TEAM-4179",
+    "timestamp": "2026-09-06T22:45:27.342Z",
+    "agentId": "agentcore_hub_frontend_dev",
+    "assignee": "agentcore_hub_frontend_dev"
+   },
+   "type": "agent.invoked",
+   "timestamp": "2026-09-06T22:45:27.342Z",
+   "eventId": "0mtqeh1eo-0000"
+  },
+  {
+   "detail": {
+    "agentId": "agentcore_hub_frontend_dev",
+    "workflowId": "wf_1788731227559_dowtdh",
+    "sessionId": "TEAM-4179_wf_1788731227559_dowtdh-agentcore_hub_frontend_dev-1788734727441",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:838829463875:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "timestamp": "2026-09-06T22:45:27.481Z",
+    "ticketId": "TEAM-4179"
+   },
+   "workflowId": "wf_1788731227559_dowtdh",
+   "source": "agentcore-hub.orchestrator",
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-06T22:45:27.481Z",
+   "eventId": "0mtqeh16d-0000"
+  },
+  {
+   "source": "agentcore-hub.orchestrator",
+   "detail": {
+    "workflowId": "wf_1788731227559_dowtdh",
+    "unblockedBy": "TEAM-4178",
+    "timestamp": "2026-09-06T22:45:27.639Z",
+    "ticketId": "TEAM-4179"
+   },
+   "workflowId": "wf_1788731227559_dowtdh",
+   "timestamp": "2026-09-06T22:45:27.639Z",
+   "type": "orchestrator.unblocked",
+   "eventId": "0mtqeh1t0-0000"
+  },
+  {
+   "workflowId": "wf_1788731227559_dowtdh",
+   "source": "agentcore-hub.orchestrator",
+   "detail": {
+    "assignee": "human:engineer",
+    "agentId": "human:engineer",
+    "ticketId": "TEAM-4178",
+    "workflowId": "wf_1788731227559_dowtdh",
+    "unblocked": [
+     "TEAM-4179"
+    ],
+    "timestamp": "2026-09-06T22:45:27.665Z"
+   },
+   "type": "agent.complete",
+   "timestamp": "2026-09-06T22:45:27.665Z",
+   "eventId": "0mtqeh187-0000"
+  },
+  {
+   "detail": {
+    "assignee": "agentcore_hub_frontend_dev",
+    "ticketId": "TEAM-4179",
+    "agentId": "agentcore_hub_frontend_dev",
+    "timestamp": "2026-09-06T22:45:28.467Z"
+   },
+   "workflowId": "TEAM-4179",
+   "source": "agentcore-hub.orchestrator",
+   "type": "agent.started",
+   "timestamp": "2026-09-06T22:45:28.467Z",
+   "eventId": "0mtqeh1w4-0000",
+   "_pkNote": "ticket-keyed"
+  },
+  {
+   "detail": {
+    "workflowId": "wf_1788731227559_dowtdh",
+    "timestamp": "2026-09-06T22:45:32Z",
+    "agentId": "agentcore_hub_frontend_dev"
+   },
+   "workflowId": "wf_1788731227559_dowtdh",
+   "type": "agent.started",
+   "timestamp": "2026-09-06T22:45:32Z",
+   "eventId": "1788734732342-czih"
+  },
+  {
+   "detail": {
+    "ticketId": "TEAM-4179",
+    "branch": "feature/TEAM-4179-frontend-dev",
+    "agentId": "agentcore_hub_frontend_dev",
+    "pr_url": "https://github.com/tycenjmccann/demo-app/pull/45",
+    "summary": "Implemented TEAM-4162 \"Clear the Activity feed with an undo window\" per the approved plan.md (TEAM-4178).\n\n- activityStore.ts: added clearActivities(): Activity[] and restoreActivities(entries): Activ"
+   },
+   "workflowId": "wf_1788731227559_dowtdh",
+   "type": "workflow.report_completion",
+   "timestamp": "2026-09-06T23:04:03.063Z",
+   "eventId": "1788735843063-1muq"
+  },
+  {
+   "source": "agentcore-hub.orchestrator",
+   "detail": {
+    "ticketId": "TEAM-4180",
+    "workflowId": "wf_1788731227559_dowtdh",
+    "agentId": "agentcore_hub_code_reviewer",
+    "timestamp": "2026-09-06T23:04:08.017Z",
+    "phase": "review",
+    "assignee": "agentcore_hub_code_reviewer"
+   },
+   "workflowId": "wf_1788731227559_dowtdh",
+   "timestamp": "2026-09-06T23:04:08.017Z",
+   "type": "agent.invoked",
+   "eventId": "0mtqf527q-0000"
+  },
+  {
+   "workflowId": "wf_1788731227559_dowtdh",
+   "source": "agentcore-hub.orchestrator",
+   "detail": {
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:838829463875:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "timestamp": "2026-09-06T23:04:08.210Z",
+    "ticketId": "TEAM-4180",
+    "workflowId": "wf_1788731227559_dowtdh",
+    "sessionId": "TEAM-4180_wf_1788731227559_dowtdh-agentcore_hub_code_reviewer-1788735848078",
+    "agentId": "agentcore_hub_code_reviewer"
+   },
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-06T23:04:08.210Z",
+   "eventId": "0mtqf52cr-0000"
+  },
+  {
+   "source": "agentcore-hub.orchestrator",
+   "detail": {
+    "ticketId": "TEAM-4180",
+    "timestamp": "2026-09-06T23:04:08.324Z",
+    "workflowId": "wf_1788731227559_dowtdh",
+    "unblockedBy": "TEAM-4179"
+   },
+   "workflowId": "wf_1788731227559_dowtdh",
+   "timestamp": "2026-09-06T23:04:08.324Z",
+   "type": "orchestrator.unblocked",
+   "eventId": "0mtqf52ep-0000"
+  },
+  {
+   "detail": {
+    "timestamp": "2026-09-06T23:04:08.376Z",
+    "agentId": "agentcore_hub_frontend_dev",
+    "assignee": "agentcore_hub_frontend_dev",
+    "unblocked": [
+     "TEAM-4180"
+    ],
+    "workflowId": "wf_1788731227559_dowtdh",
+    "ticketId": "TEAM-4179"
+   },
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788731227559_dowtdh",
+   "timestamp": "2026-09-06T23:04:08.376Z",
+   "type": "agent.complete",
+   "eventId": "0mtqf52nw-0000"
+  },
+  {
+   "detail": {
+    "timestamp": "2026-09-06T23:04:09.221Z",
+    "ticketId": "TEAM-4180",
+    "assignee": "agentcore_hub_code_reviewer",
+    "agentId": "agentcore_hub_code_reviewer"
+   },
+   "workflowId": "TEAM-4180",
+   "source": "agentcore-hub.orchestrator",
+   "timestamp": "2026-09-06T23:04:09.221Z",
+   "type": "agent.started",
+   "eventId": "0mtqf534f-0000",
+   "_pkNote": "ticket-keyed"
+  },
+  {
+   "workflowId": "wf_1788731227559_dowtdh",
+   "detail": {
+    "timestamp": "2026-09-06T23:04:11Z",
+    "agentId": "agentcore_hub_code_reviewer",
+    "workflowId": "wf_1788731227559_dowtdh"
+   },
+   "timestamp": "2026-09-06T23:04:11Z",
+   "type": "agent.started",
+   "eventId": "1788735851652-ixcb"
+  },
+  {
+   "workflowId": "wf_1788731227559_dowtdh",
+   "detail": {
+    "workflowId": "wf_1788731227559_dowtdh",
+    "timestamp": "2026-09-06T23:18:03.468Z",
+    "ticket": {
+     "assignee": "agentcore_hub_frontend_dev",
+     "title": "Fix (review): ActivityFeed clear/undo \u2014 3 findings",
+     "updatedAt": "2026-09-06T23:18:03.468Z",
+     "status": "ready",
+     "parent": "TEAM-4162",
+     "type": "task",
+     "id": "TEAM-4183"
+    },
+    "ticketId": "TEAM-4183"
+   },
+   "source": "agentcore-hub.orchestrator",
+   "timestamp": "2026-09-06T23:18:03.468Z",
+   "type": "ticket.created",
+   "eventId": "0mtqfmyus-0000"
+  },
+  {
+   "source": "agentcore-hub.orchestrator",
+   "detail": {
+    "assignee": "agentcore_hub_frontend_dev",
+    "workflowId": "wf_1788731227559_dowtdh",
+    "agentId": "agentcore_hub_frontend_dev",
+    "timestamp": "2026-09-06T23:18:06.164Z",
+    "ticketId": "TEAM-4183",
+    "phase": "development"
+   },
+   "workflowId": "wf_1788731227559_dowtdh",
+   "timestamp": "2026-09-06T23:18:06.164Z",
+   "type": "agent.invoked",
+   "eventId": "0mtqfn0gb-0000"
+  },
+  {
+   "detail": {
+    "ticketId": "TEAM-4183",
+    "agentId": "agentcore_hub_frontend_dev",
+    "sessionId": "TEAM-4183_wf_1788731227559_dowtdh-agentcore_hub_frontend_dev-1788736686203",
+    "timestamp": "2026-09-06T23:18:06.285Z",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:838829463875:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "workflowId": "wf_1788731227559_dowtdh"
+   },
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788731227559_dowtdh",
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-06T23:18:06.285Z",
+   "eventId": "0mtqfn0jr-0000"
+  },
+  {
+   "detail": {
+    "agentId": "agentcore_hub_frontend_dev",
+    "assignee": "agentcore_hub_frontend_dev",
+    "timestamp": "2026-09-06T23:18:06.592Z",
+    "ticketId": "TEAM-4183"
+   },
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "TEAM-4183",
+   "timestamp": "2026-09-06T23:18:06.592Z",
+   "type": "agent.started",
+   "eventId": "0mtqfn0r0-0000",
+   "_pkNote": "ticket-keyed"
+  },
+  {
+   "workflowId": "wf_1788731227559_dowtdh",
+   "detail": {
+    "workflowId": "wf_1788731227559_dowtdh",
+    "timestamp": "2026-09-06T23:18:12Z",
+    "agentId": "agentcore_hub_frontend_dev"
+   },
+   "type": "agent.started",
+   "timestamp": "2026-09-06T23:18:12Z",
+   "eventId": "1788736692390-uzdz"
+  },
+  {
+   "detail": {
+    "ticketId": "TEAM-4180",
+    "agentId": "agentcore_hub_code_reviewer",
+    "summary": "VERDICT: CHANGES NEEDED (round 1). Fix ticket filed: TEAM-4183 \u2192 agentcore_hub_frontend_dev (codex_fix, phase=development).\n\nReviewed feature/TEAM-4162-clear-the-activity-feed-with-an-undo-window @ 35",
+    "branch": "feature/TEAM-4162-clear-the-activity-feed-with-an-undo-window",
+    "pr_url": null
+   },
+   "workflowId": "wf_1788731227559_dowtdh",
+   "type": "workflow.report_completion",
+   "timestamp": "2026-09-06T23:19:17.408Z",
+   "eventId": "1788736757408-k4j3"
+  },
+  {
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788731227559_dowtdh",
+   "detail": {
+    "workflowId": "wf_1788731227559_dowtdh",
+    "ticketId": "TEAM-4181",
+    "phase": "verification",
+    "timestamp": "2026-09-06T23:19:21.210Z"
+   },
+   "timestamp": "2026-09-06T23:19:21.210Z",
+   "type": "workflow.phase_change",
+   "eventId": "0mtqfomiz-0000"
+  },
+  {
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788731227559_dowtdh",
+   "detail": {
+    "ticketId": "TEAM-4181",
+    "workflowId": "wf_1788731227559_dowtdh",
+    "timestamp": "2026-09-06T23:19:21.563Z",
+    "agentId": "agentcore_hub_qa_verifier",
+    "phase": "verification",
+    "assignee": "agentcore_hub_qa_verifier"
+   },
+   "type": "agent.invoked",
+   "timestamp": "2026-09-06T23:19:21.563Z",
+   "eventId": "0mtqfomqo-0000"
+  },
+  {
+   "source": "agentcore-hub.orchestrator",
+   "detail": {
+    "workflowId": "wf_1788731227559_dowtdh",
+    "sessionId": "TEAM-4181_wf_1788731227559_dowtdh-agentcore_hub_qa_verifier-1788736761583",
+    "agentId": "agentcore_hub_qa_verifier",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:838829463875:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "ticketId": "TEAM-4181",
+    "timestamp": "2026-09-06T23:19:21.613Z"
+   },
+   "workflowId": "wf_1788731227559_dowtdh",
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-06T23:19:21.613Z",
+   "eventId": "0mtqfomp9-0000"
+  },
+  {
+   "workflowId": "wf_1788731227559_dowtdh",
+   "source": "agentcore-hub.orchestrator",
+   "detail": {
+    "ticketId": "TEAM-4181",
+    "unblockedBy": "TEAM-4180",
+    "timestamp": "2026-09-06T23:19:21.727Z",
+    "workflowId": "wf_1788731227559_dowtdh"
+   },
+   "timestamp": "2026-09-06T23:19:21.727Z",
+   "type": "orchestrator.unblocked",
+   "eventId": "0mtqfon5x-0000"
+  },
+  {
+   "detail": {
+    "ticketId": "TEAM-4180",
+    "timestamp": "2026-09-06T23:19:21.743Z",
+    "unblocked": [
+     "TEAM-4181"
+    ],
+    "workflowId": "wf_1788731227559_dowtdh",
+    "assignee": "agentcore_hub_code_reviewer",
+    "agentId": "agentcore_hub_code_reviewer"
+   },
+   "workflowId": "wf_1788731227559_dowtdh",
+   "source": "agentcore-hub.orchestrator",
+   "type": "agent.complete",
+   "timestamp": "2026-09-06T23:19:21.743Z",
+   "eventId": "0mtqfomqx-0000"
+  },
+  {
+   "detail": {
+    "ticketId": "TEAM-4181",
+    "timestamp": "2026-09-06T23:19:22.517Z",
+    "assignee": "agentcore_hub_qa_verifier",
+    "agentId": "agentcore_hub_qa_verifier"
+   },
+   "workflowId": "TEAM-4181",
+   "source": "agentcore-hub.orchestrator",
+   "type": "agent.started",
+   "timestamp": "2026-09-06T23:19:22.517Z",
+   "eventId": "0mtqfonbr-0000",
+   "_pkNote": "ticket-keyed"
+  },
+  {
+   "workflowId": "wf_1788731227559_dowtdh",
+   "detail": {
+    "agentId": "agentcore_hub_qa_verifier",
+    "workflowId": "wf_1788731227559_dowtdh",
+    "timestamp": "2026-09-06T23:19:26Z"
+   },
+   "type": "agent.started",
+   "timestamp": "2026-09-06T23:19:26Z",
+   "eventId": "1788736766032-jmac"
+  },
+  {
+   "detail": {
+    "note": "Watch triage 23:30Z: false-positive stall. QA verifier live \u2014 last streamed 23:25:24Z ('Phase 1 gates green at HEAD 933ea6f\u2026 now the live browser verification'), 11 min into the task, 0 errors, 1 session. Parallel fix ticket TEAM-4183 (frontend_dev) also live, last streamed 23:20:11Z gathering approval decisions. No intervention; re-watch if QA silent past ~23:50Z with no verdict/artifact.",
+    "ticketId": "TEAM-4181",
+    "action": "comment",
+    "by": "workflow-manager"
+   },
+   "workflowId": "wf_1788731227559_dowtdh",
+   "type": "manager.intervention",
+   "timestamp": "2026-09-06T23:31:04.239253Z",
+   "eventId": "1788737464239-wm-5ggi"
+  },
+  {
+   "detail": {
+    "pr_url": null,
+    "ticketId": "TEAM-4181",
+    "summary": "VERDICT: FAIL \u2014 feature works as specified end-to-end, but the 4 review findings in findings.md (F1, F2, F2b, F3) are NOT addressed at head and were reproduced live. Fix ticket TEAM-4183 (codex_fix, p",
+    "branch": "feature/TEAM-4162-clear-the-activity-feed-with-an-undo-window",
+    "agentId": "agentcore_hub_qa_verifier"
+   },
+   "workflowId": "wf_1788731227559_dowtdh",
+   "timestamp": "2026-09-06T23:36:28.115Z",
+   "type": "workflow.report_completion",
+   "eventId": "1788737788114-9cgh"
+  },
+  {
+   "detail": {
+    "agentId": "agentcore_hub_ci_agent",
+    "ticketId": "TEAM-4182",
+    "assignee": "agentcore_hub_ci_agent",
+    "workflowId": "wf_1788731227559_dowtdh",
+    "phase": "review",
+    "timestamp": "2026-09-06T23:36:32.551Z"
+   },
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788731227559_dowtdh",
+   "timestamp": "2026-09-06T23:36:32.551Z",
+   "type": "agent.invoked",
+   "eventId": "0mtqgaqly-0000"
+  },
+  {
+   "detail": {
+    "workflowId": "wf_1788731227559_dowtdh",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:838829463875:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "sessionId": "TEAM-4182_wf_1788731227559_dowtdh-agentcore_hub_ci_agent-1788737792613",
+    "timestamp": "2026-09-06T23:36:32.687Z",
+    "agentId": "agentcore_hub_ci_agent",
+    "ticketId": "TEAM-4182"
+   },
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788731227559_dowtdh",
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-09-06T23:36:32.687Z",
+   "eventId": "0mtqgaqqp-0000"
+  },
+  {
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788731227559_dowtdh",
+   "detail": {
+    "ticketId": "TEAM-4182",
+    "workflowId": "wf_1788731227559_dowtdh",
+    "timestamp": "2026-09-06T23:36:32.786Z",
+    "unblockedBy": "TEAM-4181"
+   },
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-09-06T23:36:32.786Z",
+   "eventId": "0mtqgaqq7-0000"
+  },
+  {
+   "source": "agentcore-hub.orchestrator",
+   "detail": {
+    "unblocked": [
+     "TEAM-4182"
+    ],
+    "agentId": "agentcore_hub_qa_verifier",
+    "timestamp": "2026-09-06T23:36:32.821Z",
+    "assignee": "agentcore_hub_qa_verifier",
+    "ticketId": "TEAM-4181",
+    "workflowId": "wf_1788731227559_dowtdh"
+   },
+   "workflowId": "wf_1788731227559_dowtdh",
+   "timestamp": "2026-09-06T23:36:32.821Z",
+   "type": "agent.complete",
+   "eventId": "0mtqgaqrw-0000"
+  },
+  {
+   "workflowId": "TEAM-4182",
+   "source": "agentcore-hub.orchestrator",
+   "detail": {
+    "assignee": "agentcore_hub_ci_agent",
+    "ticketId": "TEAM-4182",
+    "agentId": "agentcore_hub_ci_agent",
+    "timestamp": "2026-09-06T23:36:33.524Z"
+   },
+   "timestamp": "2026-09-06T23:36:33.524Z",
+   "type": "agent.started",
+   "eventId": "0mtqgardz-0000",
+   "_pkNote": "ticket-keyed"
+  },
+  {
+   "detail": {
+    "agentId": "agentcore_hub_ci_agent",
+    "timestamp": "2026-09-06T23:36:38Z",
+    "workflowId": "wf_1788731227559_dowtdh"
+   },
+   "workflowId": "wf_1788731227559_dowtdh",
+   "type": "agent.started",
+   "timestamp": "2026-09-06T23:36:38Z",
+   "eventId": "1788737798411-ijhe"
+  },
+  {
+   "detail": {
+    "ticketId": "TEAM-4182",
+    "pr_url": null,
+    "branch": "feature/TEAM-4162-clear-the-activity-feed-with-an-undo-window",
+    "agentId": "agentcore_hub_ci_agent",
+    "summary": "CI verdict: PASS (legacy self-run; PIPELINE_ENABLED absent) for branch feature/TEAM-4162-clear-the-activity-feed-with-an-undo-window at tested head SHA 12e9ac6ef5081343701945e8a3b39803d9c53cc6 (vs ori"
+   },
+   "workflowId": "wf_1788731227559_dowtdh",
+   "type": "workflow.report_completion",
+   "timestamp": "2026-09-06T23:42:09.238Z",
+   "eventId": "1788738129238-zpoo"
+  },
+  {
+   "detail": {
+    "ticketId": "TEAM-4182",
+    "unblocked": [],
+    "assignee": "agentcore_hub_ci_agent",
+    "agentId": "agentcore_hub_ci_agent",
+    "workflowId": "wf_1788731227559_dowtdh",
+    "timestamp": "2026-09-06T23:42:11.459Z"
+   },
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788731227559_dowtdh",
+   "timestamp": "2026-09-06T23:42:11.459Z",
+   "type": "agent.complete",
+   "eventId": "0mtqghzsu-0000"
+  },
+  {
+   "detail": {
+    "agentId": "agentcore_hub_frontend_dev",
+    "branch": "feature/TEAM-4183-frontend-dev",
+    "summary": "All 4 review findings (F1, F2, F2b, F3) fixed on feature/TEAM-4183-frontend-dev; PR #46 merged into the integration branch. Both integration refs (\u2026-undo-win / \u2026-undo-window) reconciled by MERGE (no f",
+    "ticketId": "TEAM-4183",
+    "pr_url": "https://github.com/tycenjmccann/demo-app/pull/46"
+   },
+   "workflowId": "wf_1788731227559_dowtdh",
+   "type": "workflow.report_completion",
+   "timestamp": "2026-09-06T23:46:55.149Z",
+   "eventId": "1788738415149-0ecq"
+  },
+  {
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788731227559_dowtdh",
+   "detail": {
+    "assignee": "agentcore_hub_frontend_dev",
+    "ticketId": "TEAM-4183",
+    "unblocked": [],
+    "workflowId": "wf_1788731227559_dowtdh",
+    "agentId": "agentcore_hub_frontend_dev",
+    "timestamp": "2026-09-06T23:46:57.508Z"
+   },
+   "timestamp": "2026-09-06T23:46:57.508Z",
+   "type": "agent.complete",
+   "eventId": "0mtqgo4on-0000"
+  },
+  {
+   "detail": {
+    "workflowId": "wf_1788731227559_dowtdh",
+    "featureBranch": "feature/TEAM-4162-clear-the-activity-feed-with-an-undo-win",
+    "ticketId": "TEAM-4162",
+    "timestamp": "2026-09-06T23:47:00.645Z",
+    "delivery": "handoff",
+    "prUrl": "https://github.com/tycenjmccann/demo-app/pull/47"
+   },
+   "workflowId": "wf_1788731227559_dowtdh",
+   "source": "agentcore-hub.orchestrator",
+   "timestamp": "2026-09-06T23:47:00.645Z",
+   "type": "workflow.complete",
+   "eventId": "0mtqgo6si-0000"
+  },
+  {
+   "workflowId": "wf_1788731227559_dowtdh",
+   "detail": {
+    "totalCostUsd": 450.0207,
+    "tokens": {
+     "input": 26516775,
+     "output": 828603,
+     "cacheRead": 23253794,
+     "total": 51475968,
+     "cacheWrite": 876796,
+     "cached": 23253794
+    },
+    "status": "ok",
+    "codingUsd": 26.4768,
+    "nudges": 0,
+    "humanWaitMs": 7185107,
+    "anomalies": [],
+    "loops": 1,
+    "personaUsd": 423.5439,
+    "timestamp": "2026-09-06T23:47:07.445Z",
+    "errors": 0,
+    "activeMs": 4669,
+    "ticketId": "TEAM-4162",
+    "reportKey": "workflows/wf_1788731227559_dowtdh/shared/performance-card.json",
+    "reworkRounds": 0,
+    "tasks": 8,
+    "agentWorkMs": 7942211,
+    "wallMs": 7189776
+   },
+   "expiresAt": 1796514427,
+   "timestamp": "2026-09-06T23:47:07.445Z",
+   "type": "workflow.performance",
+   "eventId": "evt_1788738427445_performance"
+  }
+ ],
+ "streamCounts": {
+  "agentcore_hub_requirements_analyst": {
+   "text": 6,
+   "trace": 59,
+   "reasoning": 0,
+   "lastText": "I'll start by loading the requirements-analyst blueprint and reading the accepted intent document, plus checking the gate ticket status.The prior run is a strong template. Let me read its ticket plan and review package (for gate wording and branch conventions), plus the current Activity code I need to scope against.The spec is committed. Let me verify the commit on origin and check the ticket chain for duplicates before mirroring and creating tickets.The committed spec is verified. Now mirroring it to S3 as `shared/spec.md`, plus a `requirements.md` pointer so downstream agents that look for the standard doc land on the spec.Now the ticket chain. I'll persist the plan record first, then create tickets tier by tier since each `blocked_by` needs the previous ticket's real ID.All nine tickets created. Now verifying the chain (4c) and writing the review package for the Spec Approval gate.",
+   "lastStreamAt": "2026-09-06T22:07:43.0065Z"
+  },
+  "agentcore_hub_frontend_designer": {
+   "text": 8,
+   "trace": 35,
+   "reasoning": 0,
+   "lastText": "I'll start by loading my process blueprint.Let me gather context: dedupe check, spec, intent, and existing code.Good progress. Let me review the screenshots and the design doc myself.The mockups look faithful to the existing card/toggle language. Let me review the design doc text.Committed and pushed. Let me verify the file on the branch, then mirror deliverables to S3.The committed doc is verified on the branch (commit `d04b405`). Now I'll save the design doc to S3 (mirroring the committed content exactly) and write the review package.The local copy now matches the committed version. Saving the design doc to S3 and writing the review package.All linked artifacts verified in `shared/`. Reporting completion.",
+   "lastStreamAt": "2026-09-06T22:25:17.0043Z"
+  },
+  "agentcore_hub_frontend_dev": {
+   "text": 25,
+   "trace": 60,
+   "reasoning": 0,
+   "lastText": "I'll start by loading the blueprint for this ticket type.Let me check the repo branches and read the upstream artifacts before delegating.The design doc is thorough. Let me read the spec (the authoritative input) and intent so I can verify claude_code's plan against them.The plan is committed. Let me verify the push landed on GitHub and that the commit touched only plan.md, then mirror it to S3.Commit 001fe322 touches exactly one file (plan.md, +180). Now mirroring to S3 and loading the review-package blueprint.All artifacts are in place. Reporting completion.I'll start by loading the blueprint as required.The ticket also references `playbook-build`. Let me load that and gather the upstream artifacts in parallel.Now let me read the approved plan and check the Plan Approval gate for the engineer's answers to open questions.Let me check the Plan Approval ticket (TEAM-4178) for the engineer's decisions on the open questions.Plan approved as recommended (no overriding answers). Let me verify the actual branch names in the repo, since the ticket and Branch context spell the base branch differently.Implementation is pushed. Before opening the PR, let me independently review the core files on the branch against the plan and design.The 320 px render matches designer Concern 8 exactly (Clear pill wrapped under the heading, left-aligned, no overflow). Let me check the two 1280 px states too.Both integration branches now carry the code. Let me leave a handoff comment on the ticket and report completion.I'll start by loading my process blueprint.Let me gather the upstream artifacts: findings, design doc, and the plan on the branch.Let me check the design doc's hover-pause sketch and the PO's decision text, plus current branch refs.Both integration refs now point at `933ea6f` (ticket said `8850533`). Let me check what landed since.The refs only advanced by the reviewer's bookkeeping commit. Before briefing, let me check how the existing second-Clear test asserts status (F2b's two-step fix must not break it) and the CSS.Now let me pull the Design Approval and Plan Approval decisions so the Concern tables can cite them accurately.Strong result. Before merging I'll review the actual diff myself \u2014 component, CSS, and the plan bookkeeping.Mergeable and clean. Merging into the integration branch (`...-undo-win`), then I'll fast-forward the sibling `...-undo-window` ref so both stay identical as the ticket requires.Merged at `c7c709c`. Now sync the sibling `...-undo-window` ref to the same commit (a fast-forward, not a force-push).Good that it stopped. The `...-undo-window` ref moved to `12e9ac6` since I started. Let me see what's there before doing anything.Bookkeeping is complete on the branch. Let me mirror the updated plan to the S3 shared workspace (the reviewer reads it from there too) and store a short completion note in my workspace.",
+   "lastStreamAt": "2026-09-06T23:46:37.0036Z"
+  },
+  "agentcore_hub_code_reviewer": {
+   "text": 7,
+   "trace": 21,
+   "reasoning": 0,
+   "lastText": "I'll start by loading my process blueprint.No prior coding session in my context, so this is a fresh review. Let me pull the spec mirror and the dev's completion record in parallel while I kick off the specialist.Now let me get the dev's completion record and the plan, then start the specialist.The report is stuck in the remote workspace. I need the content inline \u2014 I'll pull it in pieces.findings.md is committed at `8850533` on both integration branch refs. Now I'll mirror it to S3 and file the grouped fix ticket.Verified on GitHub. Mirroring to S3 and filing the grouped fix ticket in parallel.Fix ticket TEAM-4183 is filed. Let me record the fix ticket key on the branch's findings.md so the file is self-contained for the owning team, then report completion.",
+   "lastStreamAt": "2026-09-06T23:18:59.0028Z"
+  },
+  "agentcore_hub_qa_verifier": {
+   "text": 6,
+   "trace": 36,
+   "reasoning": 0,
+   "lastText": "I'll start by loading my process blueprint.Let me gather context: the spec, findings, and design doc.Phase 1 gates are green at HEAD 933ea6f, and the code-read confirms all four review findings (F1/F2/F2b/F3) are still present \u2014 TEAM-4183 hasn't landed. Now the live browser verification.Downloads succeeded (only `file` is missing). Let me inspect the screenshots myself.Evidence is solid and deterministic. Uploading the durable QA evidence to S3.Now attaching the live repro and fix contract to the existing fix ticket TEAM-4183 (rather than filing a duplicate against the same component).",
+   "lastStreamAt": "2026-09-06T23:36:06.0042Z"
+  },
+  "agentcore_hub_ci_agent": {
+   "text": 1,
+   "trace": 12,
+   "reasoning": 0,
+   "lastText": "I'll start by loading my process blueprint.",
+   "lastStreamAt": "2026-09-06T23:41:52.0013Z"
+  }
+ },
+ "completions": {
+  "TEAM-4164": {
+   "ticket_id": "TEAM-4164",
+   "summary": "Playbook-mode requirements complete for \"Clear the Activity feed with an undo window\" (intent accepted at TEAM-4163).\n\nArtifacts committed on feature/TEAM-4162-clear-the-activity-feed-with-an-undo-window at b7b40187 (branch created from main; only .sdlc/wf_1788731227559_dowtdh/intent.md [verbatim, verified byte-identical] and spec.md changed). Spec mirrored to shared/spec.md; shared/requirements.md points at it; review-package-requirements.json written for the Spec Approval gate.\n\nScope: MODIFY EXISTING. Add clearActivities()/restoreActivities() to src/activity/activityStore.ts (reusing fail-soft read/write + sanitizeActivities), add Clear button + inline Undo (UNDO_WINDOW_MS=5000) + role=status + StrictMode-safe timer + focus management to ActivityFeed.tsx, CSS with existing tokens only, tests added only. App.tsx/App.css/deps/DEPLOY.md untouched. R1-R10 with Given/When/Then; all four policy skills answered.\n\n6 open Concerns (never resolved by me): brand-lead x1 (brand kit branding-kit/brand-system.md does not exist, prefix empty), design-lead x3 (undo-only vs confirm, 5 s auto-dismiss, no focus into live region), product-owner x2 (reload inside window is permanent under commit-at-click-time; second Clear merges snapshot).\n\nTicket chain (9, ends at CI, CD_REGISTERED=false): TEAM-4174 Spec Approval (human:product-owner) -> TEAM-4175 Frontend design -> TEAM-4176 Design Approval (human:product-owner) -> TEAM-4177 Plan (frontend_dev) -> TEAM-4178 Plan Approval (human:engineer) -> TEAM-4179 Implement (frontend_dev) -> TEAM-4180 Review -> TEAM-4181 QA -> TEAM-4182 CI. Verified: no duplicate assignee/tier; frontend_dev's two tickets are serially chained by design. Default-deny justified for backend/security/legal/localization/analytics/iOS/Android/api agents.\n\nTool notes: my Workflow Context lacked the ## SDLC Framework and ## Human Review Gates blocks, so artifact_dir/branch/gate wording were derived from the prior playbook run (wf_1788672380233_ymo7dm) and the blueprint defaults; the artifact branch did not pre-exist on origin and was created by claude_code. Tickets___search_issues rejected a plain-text query (JQL 400); worked around via list_tickets. No external APIs involved.",
+   "artifacts": ".sdlc/wf_1788731227559_dowtdh/intent.md, .sdlc/wf_1788731227559_dowtdh/spec.md, workflows/wf_1788731227559_dowtdh/shared/spec.md, workflows/wf_1788731227559_dowtdh/shared/requirements.md, workflows/wf_1788731227559_dowtdh/shared/review-package-requirements.json, workflows/wf_1788731227559_dowtdh/shared/ticket-plan.json",
+   "branch": "feature/TEAM-4162-clear-the-activity-feed-with-an-undo-window",
+   "commit_sha": "b7b401878471893b63c06aeeabdd906ff8fd4f87",
+   "pr_url": null,
+   "completed_at": "2026-09-06T22:07:59.288Z",
+   "evidence_kind": "static"
+  },
+  "TEAM-4175": {
+   "ticket_id": "TEAM-4175",
+   "summary": "Frontend design for \"Clear the Activity feed with an undo window\" delivered as a brownfield delta on the Activity card (ActivityFeed.tsx / ActivityFeed.css only).\n\n**Design (3 elements, spec R1-R7):**\n- `Clear activity` pill button in a new flex header row beside the h2; rendered only when entries exist; matches `.settings__toggle` at rest, uses its filled pair (#fff on #0f172a) for hover/active, 2px #0f172a `:focus-visible` ring; 44px tall (min-height 2.75rem).\n- Inline undo row (`div.activity-feed__notice`, always mounted, 0px when idle) holding the `role=\"status\"` paragraph (visible companion text) + `Undo` pill; not a toast, no ul/li/list.\n- Single always-mounted `<p role=\"status\">`: `Activity cleared.` / `Activity restored.` / empty on expiry (nothing announced).\n- Focus per R6: Clear\u2192Undo, Undo\u2192Clear, expiry-while-Undo-focused\u2192heading (tabIndex -1, outline suppressed).\n- All states specified (default, empty, cleared-with-undo, restored, expired, storage-failure, disabled = none with reason, second-clear, new-entry-during-window). Copy inventory = exactly the four spec strings; no new tokens except two numeric values (2.75rem, 2px) flagged in Concern 9.\n- Contrast named: #475569/#fff 7.58:1, #0f172a/#fff 17.85:1, #fff/#0f172a 17.85:1; #e2e8f0 border 1.23:1 noted as decorative.\n- Measured in Chromium: scrollWidth 320 at 320px and at 200% text zoom (no horizontal scroll).\n\n**Concerns:** #2 \u2192 undo-only; #3 \u2192 keep fixed 5000ms, do NOT pause on focus (R6 auto-focuses Undo so a focus-pause would make the window unbounded and R6's expiry path unreachable), hover-pause optional; #5 \u2192 accept as specified; #1 carried forward. New rows: #7 undo row sits above the list so Undo survives a new entry during the window (owner product-owner); #8 heading + Clear cannot share one line below ~388px, button wraps under the heading (owner design-lead); #9 two new numeric values / 44px vs 32px toggle (owner brand-lead).\n\n**Artifacts:** committed on the feature branch as `.sdlc/wf_1788731227559_dowtdh/design/frontend-designer.md` + mockup.html, mockup-320.html, design-mockup.png, design-mockup-320.png, design-mockup-zoom200.png (commit d04b405d7b59a4ba21dc5c7ef279aee459fb3b24, message `design: agentcore_hub_frontend_designer (wf_1788731227559_dowtdh)`). No src/ or package.json changes. S3 mirrors in shared/ and review package written. Mockups reviewed visually by me (all 5 states + 320px + zoom200). No tool failures. Not merged/deployed (repo not CD-registered).",
+   "artifacts": "workflows/wf_1788731227559_dowtdh/shared/design-doc-agentcore_hub_frontend_designer.md, workflows/wf_1788731227559_dowtdh/shared/design-mockup.png, workflows/wf_1788731227559_dowtdh/shared/design-mockup-320.png, workflows/wf_1788731227559_dowtdh/shared/design-mockup-zoom200.png, workflows/wf_1788731227559_dowtdh/shared/mockup.html, workflows/wf_1788731227559_dowtdh/shared/mockup-320.html, workflows/wf_1788731227559_dowtdh/shared/review-package-design.agentcore_hub_frontend_designer.json, repo:.sdlc/wf_1788731227559_dowtdh/design/frontend-designer.md@d04b405, [coding-session: cc-e66c4dca065741439d6f2461ab5705f9 cli=claude conversation=5e04e089-58ba-432e-9cc9-a0434d901008]",
+   "branch": "feature/TEAM-4162-clear-the-activity-feed-with-an-undo-window",
+   "commit_sha": "d04b405d7b59a4ba21dc5c7ef279aee459fb3b24",
+   "pr_url": null,
+   "completed_at": "2026-09-06T22:25:38.088Z",
+   "evidence_kind": "live",
+   "evidence_keys": "workflows/wf_1788731227559_dowtdh/shared/design-mockup.png,workflows/wf_1788731227559_dowtdh/shared/design-mockup-320.png,workflows/wf_1788731227559_dowtdh/shared/design-mockup-zoom200.png"
+  },
+  "TEAM-4177": {
+   "ticket_id": "TEAM-4177",
+   "summary": "PLAN TICKET complete \u2014 plan.md written, no implementation.\n\n**Deliverable:** `.sdlc/wf_1788731227559_dowtdh/plan.md` committed as 001fe322 on `feature/TEAM-4162-clear-the-activity-feed-with-an-undo-window` (commit touches exactly that one file, +180 lines; working tree clean). Mirrored to `workflows/wf_1788731227559_dowtdh/shared/plan.md`; review package at `shared/review-package-plan.json` (gate: plan).\n\n**Approach:** MODIFY EXISTING only \u2014 `activityStore.ts` gains `clearActivities()`/`restoreActivities()` reusing the existing read/write/sanitize helpers; `ActivityFeed.tsx` gains the designer's header/notice/status DOM, an effect-owned `UNDO_WINDOW_MS=5000` timer keyed on `[isWindowOpen, undoWindowKey]`, and a pendingFocus ref for Clear\u2192Undo\u2192Clear\u2192heading focus moves; `ActivityFeed.css` appends the designer's block verbatim. Tests appended to the two existing test files (20 cases enumerated with it() names). App.tsx/App.css/package.json untouched.\n\n**Key finding (codebase-driven, not in spec/design):** the existing subscriber re-reads localStorage on every notify, so with `setItem` throwing a pure pub/sub approach would resurface the old entries and the spec's R8 component test could not pass. Plan has the handlers set `activities` state last in the same React batch, which requires `restoreActivities` to return `Activity[]` instead of the spec's `void`. Recorded as new Concern rows 10 and 11 (owner: human:engineer) and Open questions 1\u20132, with recommendations \u2014 no silent deviation.\n\n**Policy re-check:** Security/Compliance/Brand/UX re-verified against the concrete plan; only deviations are Concerns 10\u201312 (return type, direct setState, appending to existing test files' import line). Spec Concerns 1\u20136 and designer Concerns 7\u20139 carried forward as open.\n\n**Verified:** all spec query-collision line numbers match the real test files; `.settings__section h2` specificity claim (0,1,1 vs 0,2,0) confirmed; DEPLOY.md absent; docs/ `TEAM-<n>-*.png` convention confirmed.\n\n**Note for orchestrator:** two similarly-named branches exist; artifacts live on `...-undo-window` (full name, per ticket), not `...-undo-win` (equals main). No tool failures.",
+   "artifacts": ".sdlc/wf_1788731227559_dowtdh/plan.md,workflows/wf_1788731227559_dowtdh/shared/plan.md,workflows/wf_1788731227559_dowtdh/shared/review-package-plan.json",
+   "branch": "feature/TEAM-4162-clear-the-activity-feed-with-an-undo-window",
+   "commit_sha": "001fe322479001fee3164ab355703721b07e9eb4",
+   "pr_url": null,
+   "completed_at": "2026-09-06T22:41:41.358Z",
+   "evidence_kind": "static"
+  },
+  "TEAM-4179": {
+   "ticket_id": "TEAM-4179",
+   "summary": "Implemented TEAM-4162 \"Clear the Activity feed with an undo window\" per the approved plan.md (TEAM-4178).\n\n- activityStore.ts: added clearActivities(): Activity[] and restoreActivities(entries): Activity[] reusing readStoredActivities/writeStoredActivities/sanitizeActivities/notifySubscribers (fail-soft + timestamp bound inherited; snapshot-first merge so ids win on collision; no console output).\n- ActivityFeed.tsx: header row with `Clear activity` (only when stored), always-mounted notice row with single role=\"status\" (Activity cleared. / Activity restored. / '' on expiry) + inline `Undo` while window open, UNDO_WINDOW_MS=5000, effect-owned StrictMode-safe timer keyed on [isWindowOpen, undoWindowKey] (restarts on second clear, cleared on unmount), memory-only snapshot ref, heading tabIndex=-1, focus Clear\u2192Undo\u2192Clear and heading on expiry, handler setActivities queued last for R8 in-memory consistency, ul aria-live unchanged, no self-logging.\n- ActivityFeed.css: designer block appended verbatim (existing tokens + approved 2.75rem/2px numerics).\n- Tests add-only: +3 store, +17 component cases under fake timers with plan.md's exact it() names; all 37 existing tests untouched.\n- Gates: npm test 57/57, npm run lint clean, npm run build green. App.tsx/App.css byte-identical to main; package.json/lockfile unchanged; no DEPLOY.md; intent/spec/design untouched.\n- Visual evidence committed: docs/TEAM-4162-clear.png, docs/TEAM-4162-undo.png, docs/TEAM-4162-narrow.png (320px, scrollWidth 320, Clear 120x44, Undo 65x44) \u2014 reviewed against the design States table, all match.\n- PR #45 merged into feature/TEAM-4162-clear-the-activity-feed-with-an-undo-window (merge 351d5ec); the orchestrator's truncated integration branch feature/TEAM-4162-clear-the-activity-feed-with-an-undo-win was fast-forwarded (no force) to the same SHA so both are identical. main not touched; no Pipeline tools used (repo not CD-registered).\n\nDeviations from plan: 0 (recorded in plan.md).",
+   "artifacts": "docs/TEAM-4162-clear.png,docs/TEAM-4162-undo.png,docs/TEAM-4162-narrow.png,.sdlc/wf_1788731227559_dowtdh/plan.md",
+   "branch": "feature/TEAM-4179-frontend-dev",
+   "commit_sha": "1dab06987ac806d00ad9c1fe665bc16cf9b0ee85",
+   "pr_url": "https://github.com/tycenjmccann/demo-app/pull/45",
+   "completed_at": "2026-09-06T23:04:02.751Z",
+   "evidence_kind": "unit"
+  },
+  "TEAM-4180": {
+   "ticket_id": "TEAM-4180",
+   "summary": "VERDICT: CHANGES NEEDED (round 1). Fix ticket filed: TEAM-4183 \u2192 agentcore_hub_frontend_dev (codex_fix, phase=development).\n\nReviewed feature/TEAM-4162-clear-the-activity-feed-with-an-undo-window @ 351d5ec (PR #45 merge) vs origin/main with codex; re-ran gates in the review workspace: npm test 57/57, lint clean, build green. findings.md committed on the branch (933ea6f, both integration refs) and mirrored to workflows/wf_1788731227559_dowtdh/shared/findings.md.\n\nFINDINGS (grouped into one ticket, all in ActivityFeed component):\n- F1 P1 \u2014 Unrecorded deviation from the PO's Concern 3 decision. TEAM-4174 resolved Concern 3 as \"5000 ms; pause the countdown while Undo has focus or hover\"; TEAM-4176 approval restates \"paused on focus/hover\". Design, plan and code implement NO pause (plain setTimeout, ActivityFeed.tsx:145-168), plan Concern 3 says \"no focus-pause\", plan Deviations says \"None yet.\", and every Concern row in spec.md/plan.md is still `open`. The designer's R6 argument against a focus-pause is sound but was never taken back to the PO.\n- F2 P2 \u2014 ActivityFeed.css:156-158 `.activity-feed__status:empty { display:none }` removes the role=status element from the accessibility tree while empty, defeating the \"always mounted live region\" the JSX comment (tsx:207-208) relies on; per MDN the live region must exist before its content changes, so \"Activity cleared.\" may not be announced (R7). jsdom cannot see this. F2b P3: second Clear in an open window re-sets the identical status string \u2192 no mutation \u2192 silent (tsx:122).\n- F3 P3 \u2014 handleUndo (tsx:128-138) proceeds with a null/empty snapshot (expiry/click race with React 18's deferred timeout flush; or getItem throwing at Clear time so clearActivities() returns []): announces \"Activity restored.\" with nothing restored and drops focus to document.body (Clear button not mounted).\n\nCHECKED AND SOUND (evidence in findings.md): store clear/restore fail-soft + notify, snapshot-wins dedupe order (sanitize filters\u2192dedupes\u2192sorts), StrictMode-safe effect-owned timer with per-invocation cleanup + restart via undoWindowKey, R8 in-batch setState ordering, focus handoffs on happy path, no self-logging, no console output, R9 (App.tsx/App.css/package files byte-identical, no DEPLOY.md, existing tests additions-only), query-collision constraints, plan Files list fully respected, R10 test coverage complete except the pause behaviour and empty-snapshot Undo.\n\nTool status: all tools succeeded. Repo not CD-registered \u2014 no merge, no deploy, no Pipeline tools used.\n\n[coding-session: cc-45ced772a447491284e0bccb27d3fb50 cli=codex conversation=01a078f7-cee4-7563-b24e-a0b6e21fff4e]",
+   "artifacts": ".sdlc/wf_1788731227559_dowtdh/findings.md,workflows/wf_1788731227559_dowtdh/shared/findings.md,workflows/wf_1788731227559_dowtdh/agents/agentcore_hub_code_reviewer/round1-fix-ticket.md",
+   "branch": "feature/TEAM-4162-clear-the-activity-feed-with-an-undo-window",
+   "commit_sha": "933ea6f1f04fc0212b88b84a6fcbe6aa0ce1d052",
+   "pr_url": null,
+   "completed_at": "2026-09-06T23:19:17.074Z",
+   "evidence_kind": "static"
+  },
+  "TEAM-4181": {
+   "ticket_id": "TEAM-4181",
+   "summary": "VERDICT: FAIL \u2014 feature works as specified end-to-end, but the 4 review findings in findings.md (F1, F2, F2b, F3) are NOT addressed at head and were reproduced live. Fix ticket TEAM-4183 (codex_fix, phase=development) is still in_progress with no fix branch/PR; live repro + fix contract attached to it as a comment (no duplicate ticket filed \u2014 same component/agent). QA must re-run at TEAM-4183's head.\n\nVerification Ledger (branch feature/TEAM-4162-clear-the-activity-feed-with-an-undo-window, code head 933ea6f; QA evidence commit 12e9ac6 \u2014 docs/ + qa/ only, src untouched):\n- npm ci / npm test / npm run lint (tsc --noEmit) / npx tsc --noEmit / npm run build: all exit 0; tests 57/57 (3 files); 20 new tests added (it() 11\u219228 + 22\u219225), 0 existing tests removed (only import lines widened); build 38 modules, no warnings.\n- Constraints: src/App.tsx, src/App.css, package.json, package-lock.json byte-identical to main (git diff --exit-code 0); no DEPLOY.md; no console.* in activity source.\n- LIVE (Chromium/Playwright, real timers) at 1280\u00d7900 and 320\u00d7900, run twice, identical: 191 PASS / 8 FAIL. PASS: seed-25 Clear \u2192 0 li, status 'Activity cleared.', inline Undo (inside section, position static), storage '[]' immediately, no Clear button; Undo \u2192 same 20 in same order, all 25 ids restored, focus on Clear; expiry Undo present @4907ms / gone @5202ms, empty copy returns, no Clear, no ul/li/list; reload inside window \u2192 empty + no Undo, reload after undo \u2192 25 entries; toggle during window \u2192 new entry, Clear reappears, 2nd Clear + Undo restores 26; keyboard Tab\u00d72 \u2192 Enter/Space on Clear \u2192 focus Undo \u2192 Space/Enter on Undo \u2192 focus Clear; expiry with Undo focused \u2192 focus H2#activity-feed-title; one <p role=status>; toggle \u00d73 \u2192 exactly 3 entries; scrollWidth 320 at 320px; buttons 44.00px tall, rest/hover colors match tokens; 0 console errors/pageerrors. Screenshots match design mockup states.\n- FAIL rows (each at both viewports): F2 status display:none while empty (ActivityFeed.css:156); F2b 0 DOM mutations on [role=status] across a 2nd Clear (silent for SR); F3 empty-snapshot Undo (getItem throwing) announces 'Activity restored.' with 0 restored AND drops focus to BODY. F1 (PO Concern-3 pause decision not implemented/not recorded; plan.md Deviations \"None yet.\", all Concern rows open) confirmed by code read.\n\nNot merged, not deployed, no Pipeline tools (CD_REGISTERED=false).\n[coding-session: cc-926e952808c34febbfaaf36dab5163da]",
+   "artifacts": "workflows/wf_1788731227559_dowtdh/shared/qa-evidence/QA-REPORT-TEAM-4181.md,workflows/wf_1788731227559_dowtdh/shared/qa-evidence/TEAM-4181-live-log.md,workflows/wf_1788731227559_dowtdh/shared/qa-evidence/TEAM-4181-phase1-gates.md",
+   "branch": "feature/TEAM-4162-clear-the-activity-feed-with-an-undo-window",
+   "commit_sha": "12e9ac6ef5081343701945e8a3b39803d9c53cc6",
+   "pr_url": null,
+   "completed_at": "2026-09-06T23:36:27.997Z",
+   "evidence_kind": "live",
+   "evidence_keys": "workflows/wf_1788731227559_dowtdh/shared/qa-evidence/QA-REPORT-TEAM-4181.md,workflows/wf_1788731227559_dowtdh/shared/qa-evidence/TEAM-4181-live-log.md,workflows/wf_1788731227559_dowtdh/shared/qa-evidence/TEAM-4181-phase1-gates.md,workflows/wf_1788731227559_dowtdh/shared/qa-evidence/TEAM-4181-live.mjs,workflows/wf_1788731227559_dowtdh/shared/qa-evidence/TEAM-4162-clear.png,workflows/wf_1788731227559_dowtdh/shared/qa-evidence/TEAM-4162-undo.png,workflows/wf_1788731227559_dowtdh/shared/qa-evidence/TEAM-4162-narrow.png,workflows/wf_1788731227559_dowtdh/shared/qa-evidence/TEAM-4162-narrow-clear.png,workflows/wf_1788731227559_dowtdh/shared/qa-evidence/TEAM-4162-narrow-undo.png,workflows/wf_1788731227559_dowtdh/shared/qa-evidence/TEAM-4162-expired.png,workflows/wf_1788731227559_dowtdh/shared/qa-evidence/TEAM-4162-default.png"
+  },
+  "TEAM-4182": {
+   "ticket_id": "TEAM-4182",
+   "summary": "CI verdict: PASS (legacy self-run; PIPELINE_ENABLED absent) for branch feature/TEAM-4162-clear-the-activity-feed-with-an-undo-window at tested head SHA 12e9ac6ef5081343701945e8a3b39803d9c53cc6 (vs origin/main ca989bc). Executed via claude_code [coding-session: cc-a4662cf93ece40c8bf2df8908a1dd552].\n\nResults (exit codes): npm ci \u2192 0 (185 packages); npm test / vitest run \u2192 0 (3 files, 57/57 passed: ActivityFeed.test.tsx 28, activityStore.test.ts 25, formatRelativeTime.test.ts 4); npm run lint / tsc --noEmit \u2192 0 (no diagnostics); npm run build / tsc -b && vite build \u2192 0 (38 modules; dist/index.html 0.46 kB, index-DpfP3Ydy.css 3.15 kB, index-BQCnjIPN.js 198.22 kB / 62.04 kB gzip).\n\nConstraint checks: package.json + package-lock.json diff vs main EMPTY; src/App.tsx and src/App.css blob SHAs identical to main (0ae4f03\u2026, e98983b\u2026); no DEPLOY.md in tree or index; src/activity/*.test.* additions-only (+468/\u22121 and +137/\u22122, the only 3 removed lines are import statements replaced with widened imports; it/test counts grew 11\u219228 and 22\u219225). Scope clean: 5 source files under src/activity plus .sdlc/, docs/, qa/ artifacts. npm audit --audit-level=high exit 1 \u2192 INFO only: 2 high (browserslist) + 1 moderate (esbuild via vite) transitive dev deps, pre-existing on main.\n\nci_status = unverified: no CodeBuild build exists for this repo (not CD-registered; no Pipeline___* calls made per delivery mode) and the repo has no .github/workflows so there are no GitHub check-runs. Evidence is the real local run.\n\nCaveat: review-fix ticket TEAM-4183 was still in_progress at run time (QA live-browser a11y/behaviour findings on ActivityFeed, not build/test failures). This PASS covers head 12e9ac6 only; if TEAM-4183 pushes new commits, CI must be re-run on the new head.\n\nNo merge, no deploy performed. Report written to workflows/wf_1788731227559_dowtdh/shared/ci-evidence/TEAM-4182-ci-report.md.",
+   "artifacts": "workflows/wf_1788731227559_dowtdh/shared/ci-evidence/TEAM-4182-ci-report.md",
+   "branch": "feature/TEAM-4162-clear-the-activity-feed-with-an-undo-window",
+   "commit_sha": "12e9ac6ef5081343701945e8a3b39803d9c53cc6",
+   "pr_url": null,
+   "completed_at": "2026-09-06T23:42:09.046Z",
+   "evidence_kind": "unit",
+   "evidence_keys": "workflows/wf_1788731227559_dowtdh/shared/ci-evidence/TEAM-4182-ci-report.md",
+   "ci_status": "unverified",
+   "ci_head_sha": "12e9ac6ef5081343701945e8a3b39803d9c53cc6"
+  },
+  "TEAM-4183": {
+   "ticket_id": "TEAM-4183",
+   "summary": "All 4 review findings (F1, F2, F2b, F3) fixed on feature/TEAM-4183-frontend-dev; PR #46 merged into the integration branch. Both integration refs (\u2026-undo-win / \u2026-undo-window) reconciled by MERGE (no force-push) with QA's TEAM-4181 evidence commit and are identical at 001259d6932c9c870889d74e0ac66673cfd7b49e.\n\nF1 (P1) \u2192 option (a): hover-pause implemented (pointerenter on the notice row pauses the countdown; pointerleave restarts a fresh UNDO_WINDOW_MS; `isPaused` reset in handleClear/handleUndo/closeWindow so a stale pause can't make a window unbounded). Focus-pause deliberately omitted (R6 auto-focuses Undo \u2192 unbounded window, expiry-while-focused unreachable) and recorded as plan.md Deviation D1; PO re-confirmation requested via comment on TEAM-4183. spec.md Concerns 1\u20136 and plan.md Concerns 1\u201312 updated to `resolved`, citing TEAM-4174 (PO 15:09), TEAM-4176, TEAM-4178.\nF2 (P2) \u2192 `.activity-feed__status:empty { display:none }` removed; live region always rendered. Chromium: notice row 0 px tall idle (no layout change), status present in a11y tree while empty; docs/TEAM-4162-clear.png re-captured byte-identical. Deviation D2.\nF2b (P3) \u2192 second Clear blanks the status then re-sets 'Activity cleared.' on the next tick via an effect-owned setTimeout(0) (cancelled by Undo/expiry/unmount); only fires when the text is already 'Activity cleared.' so all existing synchronous assertions hold. Deviation D3.\nF3 (P3) \u2192 expiry logic extracted into shared `closeWindow()`; handleUndo with null/empty snapshot closes like expiry (no restoreActivities([]), no 'Activity restored.', focus \u2192 heading, never body). Deviation D4.\n\nGates: npm test 64/64 (57 existing untouched \u2014 zero removed lines \u2014 + 7 new tests, each proven load-bearing by mutating the fix); npm run lint clean; npm run build green; App.tsx/App.css/package.json/package-lock.json byte-identical to main; no console output; no new copy; findings.md untouched. Playwright/Chromium: Undo still present after 6 s hovered, gone ~5.2 s after pointer leaves; hover fill #0f172a/#fff confirmed (docs/TEAM-4183-hover-pause.png).\n\nNote for reviewer: the F2 jsdom test cannot assert the CSS cascade (vitest runs with CSS off; the preferred fs-read needs @types/node which is not a dependency) \u2014 the effective cascade is proven in the real browser and documented in the test, plan.md and PR body. Open item: PO decision on Deviation D1 (hover-pause only vs. lengthen UNDO_WINDOW_MS).",
+   "artifacts": "workflows/wf_1788731227559_dowtdh/shared/plan.md,workflows/wf_1788731227559_dowtdh/agents/agentcore_hub_frontend_dev/TEAM-4183-fix-summary.md",
+   "branch": "feature/TEAM-4183-frontend-dev",
+   "commit_sha": "001259d6932c9c870889d74e0ac66673cfd7b49e",
+   "pr_url": "https://github.com/tycenjmccann/demo-app/pull/46",
+   "completed_at": "2026-09-06T23:46:55.023Z",
+   "evidence_kind": "live",
+   "evidence_keys": "workflows/wf_1788731227559_dowtdh/shared/plan.md,workflows/wf_1788731227559_dowtdh/agents/agentcore_hub_frontend_dev/TEAM-4183-fix-summary.md"
+  }
+ },
+ "artifacts": [
+  {
+   "key": "workflows/wf_1788731227559_dowtdh/agentcore_hub_frontend_designer/design-doc-agentcore_hub_frontend_designer.md",
+   "size": 37483
+  },
+  {
+   "key": "workflows/wf_1788731227559_dowtdh/agents/agentcore_hub_code_reviewer/round1-fix-ticket.md",
+   "size": 308
+  },
+  {
+   "key": "workflows/wf_1788731227559_dowtdh/agents/agentcore_hub_frontend_dev/TEAM-4183-fix-summary.md",
+   "size": 2475
+  },
+  {
+   "key": "workflows/wf_1788731227559_dowtdh/shared/ci-evidence/TEAM-4182-ci-report.md",
+   "size": 5821
+  },
+  {
+   "key": "workflows/wf_1788731227559_dowtdh/shared/cost-report.json",
+   "size": 25220
+  },
+  {
+   "key": "workflows/wf_1788731227559_dowtdh/shared/design-doc-agentcore_hub_frontend_designer.md",
+   "size": 37483
+  },
+  {
+   "key": "workflows/wf_1788731227559_dowtdh/shared/design-mockup-320.png",
+   "size": 33741
+  },
+  {
+   "key": "workflows/wf_1788731227559_dowtdh/shared/design-mockup-zoom200.png",
+   "size": 75584
+  },
+  {
+   "key": "workflows/wf_1788731227559_dowtdh/shared/design-mockup.png",
+   "size": 222335
+  },
+  {
+   "key": "workflows/wf_1788731227559_dowtdh/shared/findings.md",
+   "size": 13931
+  },
+  {
+   "key": "workflows/wf_1788731227559_dowtdh/shared/intent.md",
+   "size": 1701
+  },
+  {
+   "key": "workflows/wf_1788731227559_dowtdh/shared/manifest.json",
+   "size": 2880
+  },
+  {
+   "key": "workflows/wf_1788731227559_dowtdh/shared/mockup-320.html",
+   "size": 9127
+  },
+  {
+   "key": "workflows/wf_1788731227559_dowtdh/shared/mockup.html",
+   "size": 16626
+  },
+  {
+   "key": "workflows/wf_1788731227559_dowtdh/shared/performance-card.json",
+   "size": 25220
+  },
+  {
+   "key": "workflows/wf_1788731227559_dowtdh/shared/performance-card.md",
+   "size": 3409
+  },
+  {
+   "key": "workflows/wf_1788731227559_dowtdh/shared/plan.md",
+   "size": 40501
+  },
+  {
+   "key": "workflows/wf_1788731227559_dowtdh/shared/qa-evidence/QA-REPORT-TEAM-4181.md",
+   "size": 8537
+  },
+  {
+   "key": "workflows/wf_1788731227559_dowtdh/shared/qa-evidence/TEAM-4162-clear.png",
+   "size": 28277
+  },
+  {
+   "key": "workflows/wf_1788731227559_dowtdh/shared/qa-evidence/TEAM-4162-default.png",
+   "size": 115868
+  },
+  {
+   "key": "workflows/wf_1788731227559_dowtdh/shared/qa-evidence/TEAM-4162-expired.png",
+   "size": 29789
+  },
+  {
+   "key": "workflows/wf_1788731227559_dowtdh/shared/qa-evidence/TEAM-4162-narrow-clear.png",
+   "size": 24144
+  },
+  {
+   "key": "workflows/wf_1788731227559_dowtdh/shared/qa-evidence/TEAM-4162-narrow-undo.png",
+   "size": 38832
+  },
+  {
+   "key": "workflows/wf_1788731227559_dowtdh/shared/qa-evidence/TEAM-4162-narrow.png",
+   "size": 37796
+  },
+  {
+   "key": "workflows/wf_1788731227559_dowtdh/shared/qa-evidence/TEAM-4162-undo.png",
+   "size": 57020
+  },
+  {
+   "key": "workflows/wf_1788731227559_dowtdh/shared/qa-evidence/TEAM-4181-live-log.md",
+   "size": 43639
+  },
+  {
+   "key": "workflows/wf_1788731227559_dowtdh/shared/qa-evidence/TEAM-4181-live.mjs",
+   "size": 29381
+  },
+  {
+   "key": "workflows/wf_1788731227559_dowtdh/shared/qa-evidence/TEAM-4181-phase1-gates.md",
+   "size": 23598
+  },
+  {
+   "key": "workflows/wf_1788731227559_dowtdh/shared/requirements.md",
+   "size": 2260
+  },
+  {
+   "key": "workflows/wf_1788731227559_dowtdh/shared/review-package-design.agentcore_hub_frontend_designer.json",
+   "size": 1971
+  },
+  {
+   "key": "workflows/wf_1788731227559_dowtdh/shared/review-package-intake.json",
+   "size": 1238
+  },
+  {
+   "key": "workflows/wf_1788731227559_dowtdh/shared/review-package-plan.json",
+   "size": 1977
+  },
+  {
+   "key": "workflows/wf_1788731227559_dowtdh/shared/review-package-requirements.json",
+   "size": 2590
+  },
+  {
+   "key": "workflows/wf_1788731227559_dowtdh/shared/spec.md",
+   "size": 45075
+  },
+  {
+   "key": "workflows/wf_1788731227559_dowtdh/shared/ticket-plan.json",
+   "size": 2174
+  }
+ ],
+ "evalSummaries": [
+  {
+   "agentId": "agentcore_hub_ci_agent",
+   "sessionCount": 0,
+   "avgScores": {}
+  },
+  {
+   "agentId": "agentcore_hub_code_reviewer",
+   "sessionCount": 0,
+   "avgScores": {}
+  },
+  {
+   "agentId": "agentcore_hub_frontend_designer",
+   "sessionCount": 0,
+   "avgScores": {}
+  },
+  {
+   "agentId": "agentcore_hub_frontend_dev",
+   "sessionCount": 0,
+   "avgScores": {}
+  },
+  {
+   "agentId": "agentcore_hub_qa_verifier",
+   "sessionCount": 0,
+   "avgScores": {}
+  },
+  {
+   "agentId": "agentcore_hub_requirements_analyst",
+   "sessionCount": 343,
+   "avgScores": {
+    "Correctness": 0.42,
+    "Builtin.ToolSelectionAccuracy": 0.9569,
+    "Builtin.ResponseRelevance": 0.9971,
+    "Builtin.Helpfulness": 0.8121,
+    "Builtin.Correctness": 0.9556,
+    "Builtin.GoalSuccessRate": 0.9675,
+    "Builtin.ToolParameterAccuracy": 0.9248,
+    "Builtin.InstructionFollowing": 0.7985,
+    "Builtin.Coherence": 0.9601,
+    "dependency_chain_compliance_online": 0.1771,
+    "Builtin.Faithfulness": 0.9885
+   }
+  }
+ ],
+ "priorAnalyses": [
+  {
+   "analysisId": "1788729954838-3ke1",
+   "workflowId": "wf_1788637257831_f50ucz",
+   "analyzedAt": "2026-09-06T21:25:54.838109Z",
+   "runOutcome": "complete",
+   "scores": {
+    "planning": 84,
+    "overall": 72,
+    "reviewEfficiency": 80,
+    "reworkDiscipline": 85,
+    "execution": 58
+   },
+   "verdict": "A fully-shipped, well-decomposed SI run whose 6 fix tickets were 2 disciplined single-round rejection fan-outs (0 resurfacing, 0 regression-of-fix) but which lost ~678 idle minutes (~44% of 91.6M ms) to a missed Ship re-wake compounded by a reconcile-sweep false dead-session escalation.",
+   "totalDurationMs": 91617444,
+   "humanWaitTotalMs": 3193914,
+   "changeRequestCount": 0
+  },
+  {
+   "analysisId": "1788344101540-e98a",
+   "workflowId": "wf_1788339281937_r30dhl",
+   "analyzedAt": "2026-09-02T10:15:01.540261Z",
+   "runOutcome": "complete",
+   "scores": {
+    "execution": 74,
+    "reviewEfficiency": 88,
+    "overall": 78,
+    "planning": 82,
+    "reworkDiscipline": 80
+   },
+   "verdict": "A cleanly reviewed/QA'd/CI-green docs deliverable (PR #273) that a recurring missed-unblock cascade stalled at Ship until a WM dispatch recovered it, and that CD then correctly fail-closed on a real IAM gap \u2014 approved but never actually merged.",
+   "totalDurationMs": 4590944,
+   "humanWaitTotalMs": 1185863,
+   "changeRequestCount": 2
+  },
+  {
+   "analysisId": "1788239872230-o0up",
+   "workflowId": "wf_1788221573769_d68649",
+   "analyzedAt": "2026-09-01T05:17:52.231011Z",
+   "runOutcome": "complete",
+   "scores": {
+    "reviewEfficiency": 86,
+    "reworkDiscipline": 87,
+    "planning": 85,
+    "overall": 80,
+    "execution": 64
+   },
+   "verdict": "The kiro bake-off arm genuinely shipped a fully-verified, production-reachable Recent Activity feature (PR #40 merged, ca989bc) with the sharpest review of the three arms, but posted the worst execution of the trio \u2014 its Ship ticket hit the heaviest instance of the TEAM-3268 orchestration tax, needing 6 WM interventions plus an escalate.",
+   "totalDurationMs": 18076144,
+   "humanWaitTotalMs": 933688,
+   "changeRequestCount": 2
+  },
+  {
+   "analysisId": "1788236754509-zevv",
+   "workflowId": "wf_1788221561103_29g73c",
+   "analyzedAt": "2026-09-01T04:25:54.509230Z",
+   "runOutcome": "complete",
+   "scores": {
+    "overall": 74,
+    "reviewEfficiency": 80,
+    "reworkDiscipline": 86,
+    "planning": 85,
+    "execution": 72
+   },
+   "verdict": "A cleanly-built, thrice-reviewed feature with textbook single-pass rework and zero defect recurrence, undercut by a terminal false-complete (round-3 approved but never merged) and the recurring orchestrator re-enqueue tax.",
+   "totalDurationMs": 14927474,
+   "humanWaitTotalMs": 15142552,
+   "changeRequestCount": 4
+  },
+  {
+   "analysisId": "1788235193057-j30q",
+   "workflowId": "wf_1788221567769_xm2bmz",
+   "analyzedAt": "2026-09-01T03:59:53.057230Z",
+   "runOutcome": "complete",
+   "scores": {
+    "execution": 70,
+    "planning": 86,
+    "overall": 80,
+    "reviewEfficiency": 82,
+    "reworkDiscipline": 88
+   },
+   "verdict": "A real, fully-verified codex bake-off run that shipped a merged PR (#38, f627fef) after its ship-review caught a genuine production escape (addActivity had zero call sites \u2014 feature inert in prod) and converged in 2 rounds with zero regression-of-fix, but paid heavily in non-agent time: 5 manager interventions all for the same missed-unblock/re-enqueue-after-rework defect plus a ~5.8h human merge gate.",
+   "totalDurationMs": 13388434,
+   "humanWaitTotalMs": 11375424,
+   "changeRequestCount": 2
+  }
+ ],
+ "missingSignals": []
+}

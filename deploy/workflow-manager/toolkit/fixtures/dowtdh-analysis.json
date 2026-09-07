@@ -1,0 +1,425 @@
+{
+ "workflowId": "wf_1788731227559_dowtdh",
+ "analysisId": "1788738918637-okvc",
+ "schemaVersion": 1,
+ "workflowDefId": "software-delivery",
+ "epicId": "TEAM-4162",
+ "analyzedAt": "2026-09-06T23:55:18.637340Z",
+ "trigger": "auto",
+ "runOutcome": "complete",
+ "model": "claude-fable-5",
+ "s3Prefix": "workflows/wf_1788731227559_dowtdh/analysis/1788738918637-okvc/",
+ "metrics": {
+  "startedAt": "2026-09-06T21:47:08.575000Z",
+  "completedAt": "2026-09-06T23:46:58.351000Z",
+  "totalDurationMs": 7189776,
+  "phases": [
+   {
+    "phase": "design",
+    "enteredAt": "2026-09-06T22:09:39.724000Z",
+    "exitedAt": "2026-09-06T22:30:31.157000Z",
+    "durationMs": 1251433,
+    "taskCount": 1
+   },
+   {
+    "phase": "development",
+    "enteredAt": "2026-09-06T22:30:31.157000Z",
+    "exitedAt": "2026-09-06T23:19:21.210000Z",
+    "durationMs": 2930053,
+    "taskCount": 3
+   },
+   {
+    "phase": "verification",
+    "enteredAt": "2026-09-06T23:19:21.210000Z",
+    "exitedAt": "2026-09-06T23:46:58.351000Z",
+    "durationMs": 1657141,
+    "taskCount": 1
+   }
+  ],
+  "agentTasks": [
+   {
+    "ticketId": "TEAM-4164",
+    "agentId": "agentcore_hub_requirements_analyst",
+    "phase": "requirements",
+    "invokedAt": "2026-09-06T21:48:32.537000Z",
+    "completedAt": "2026-09-06T22:08:05.401000Z",
+    "durationMs": 1172864,
+    "status": "done",
+    "reworkCount": 0
+   },
+   {
+    "ticketId": "TEAM-4175",
+    "agentId": "agentcore_hub_frontend_designer",
+    "phase": "design",
+    "invokedAt": "2026-09-06T22:09:40.022000Z",
+    "completedAt": "2026-09-06T22:25:45.133000Z",
+    "durationMs": 965111,
+    "status": "done",
+    "reworkCount": 0
+   },
+   {
+    "ticketId": "TEAM-4177",
+    "agentId": "agentcore_hub_frontend_dev",
+    "phase": "development",
+    "invokedAt": "2026-09-06T22:30:31.517000Z",
+    "completedAt": "2026-09-06T22:41:48.321000Z",
+    "durationMs": 676804,
+    "status": "done",
+    "reworkCount": 0
+   },
+   {
+    "ticketId": "TEAM-4179",
+    "agentId": "agentcore_hub_frontend_dev",
+    "phase": "development",
+    "invokedAt": "2026-09-06T22:45:27.342000Z",
+    "completedAt": "2026-09-06T23:04:08.376000Z",
+    "durationMs": 1121034,
+    "status": "done",
+    "reworkCount": 0
+   },
+   {
+    "ticketId": "TEAM-4180",
+    "agentId": "agentcore_hub_code_reviewer",
+    "phase": "review",
+    "invokedAt": "2026-09-06T23:04:08.017000Z",
+    "completedAt": "2026-09-06T23:19:21.743000Z",
+    "durationMs": 913726,
+    "status": "done",
+    "reworkCount": 0
+   },
+   {
+    "ticketId": "TEAM-4181",
+    "agentId": "agentcore_hub_qa_verifier",
+    "phase": "verification",
+    "invokedAt": "2026-09-06T23:19:21.563000Z",
+    "completedAt": "2026-09-06T23:36:32.821000Z",
+    "durationMs": 1031258,
+    "status": "done",
+    "reworkCount": 0
+   },
+   {
+    "ticketId": "TEAM-4182",
+    "agentId": "agentcore_hub_ci_agent",
+    "phase": "review",
+    "invokedAt": "2026-09-06T23:36:32.551000Z",
+    "completedAt": "2026-09-06T23:42:11.459000Z",
+    "durationMs": 338908,
+    "status": "done",
+    "reworkCount": 0
+   },
+   {
+    "ticketId": "TEAM-4183",
+    "agentId": "agentcore_hub_frontend_dev",
+    "phase": "development",
+    "invokedAt": "2026-09-06T23:18:06.164000Z",
+    "completedAt": "2026-09-06T23:46:57.508000Z",
+    "durationMs": 1731344,
+    "status": "done",
+    "reworkCount": 0
+   }
+  ],
+  "humanReviews": [
+   {
+    "gateTicketId": "TEAM-4163",
+    "reviewer": "human:product-owner",
+    "gateName": "Intent Acceptance: Clear the Activity feed with an undo window",
+    "requestedAt": "2026-09-06T21:47:13.244000Z",
+    "resolvedAt": "2026-09-06T22:45:16.903000Z",
+    "waitMs": 3483659,
+    "outcome": "approved",
+    "cycle": 1,
+    "outsideHours": true
+   },
+   {
+    "gateTicketId": "TEAM-4174",
+    "reviewer": "human:product-owner",
+    "gateName": "Spec Approval: Clear the Activity feed with an undo window",
+    "requestedAt": "2026-09-06T22:08:05.251000Z",
+    "resolvedAt": "2026-09-06T22:45:20.193000Z",
+    "waitMs": 2234942,
+    "outcome": "approved",
+    "cycle": 1,
+    "outsideHours": true
+   },
+   {
+    "gateTicketId": "TEAM-4176",
+    "reviewer": "human:product-owner",
+    "gateName": "Design Approval: Clear the Activity feed with an undo window",
+    "requestedAt": "2026-09-06T22:25:45.057000Z",
+    "resolvedAt": "2026-09-06T22:45:22.235000Z",
+    "waitMs": 1177178,
+    "outcome": "approved",
+    "cycle": 1,
+    "outsideHours": true
+   },
+   {
+    "gateTicketId": "TEAM-4178",
+    "reviewer": "human:engineer",
+    "gateName": "Plan Approval: Clear the Activity feed with an undo window",
+    "requestedAt": "2026-09-06T22:41:48.200000Z",
+    "resolvedAt": "2026-09-06T22:45:24.214000Z",
+    "waitMs": 216014,
+    "outcome": "approved",
+    "cycle": 1,
+    "outsideHours": true
+   }
+  ],
+  "humanWaitTotalMs": 7111793,
+  "humanReviewsOutsideHours": 4,
+  "changeRequests": {
+   "count": 0,
+   "cycles": []
+  },
+  "fixTickets": {
+   "count": 1,
+   "ticketIds": [
+    "TEAM-4183"
+   ],
+   "entries": [
+    {
+     "ticketId": "TEAM-4183",
+     "kind": "codex_fix",
+     "originTicketId": null,
+     "round": 1,
+     "tag": "new",
+     "resurfacingSignal": null,
+     "paths": [
+      "activityfeed"
+     ],
+     "createdAt": "2026-09-06T16:18:00.262-0700",
+     "title": "Fix (review): ActivityFeed clear/undo \u2014 3 findings"
+    }
+   ],
+   "byKind": {
+    "codex_fix": 1
+   },
+   "byTag": {
+    "new": 1,
+    "resurfacing": 0,
+    "fix-induced": 0,
+    "environmental": 0
+   }
+  },
+  "nudgeCount": 0,
+  "managerInterventions": [
+   {
+    "action": "comment",
+    "ticketId": "TEAM-4181",
+    "at": "2026-09-06T23:31:04.239253Z",
+    "note": "Watch triage 23:30Z: false-positive stall. QA verifier live \u2014 last streamed 23:25:24Z ('Phase 1 gates green at HEAD 933ea6f\u2026 now the live browser verification'), 11 min into the task, 0 errors, 1 session. Parallel fix ticket TEAM-4183 (frontend_dev) also live, last streamed 23:20:11Z gathering approval decisions. No intervention; re-watch if QA silent past ~23:50Z with no verdict/artifact."
+   }
+  ],
+  "errors": [],
+  "tokens": null,
+  "evalSummaries": [
+   {
+    "agentId": "agentcore_hub_ci_agent",
+    "sessionCount": 0,
+    "avgScores": {}
+   },
+   {
+    "agentId": "agentcore_hub_code_reviewer",
+    "sessionCount": 0,
+    "avgScores": {}
+   },
+   {
+    "agentId": "agentcore_hub_frontend_designer",
+    "sessionCount": 0,
+    "avgScores": {}
+   },
+   {
+    "agentId": "agentcore_hub_frontend_dev",
+    "sessionCount": 0,
+    "avgScores": {}
+   },
+   {
+    "agentId": "agentcore_hub_qa_verifier",
+    "sessionCount": 0,
+    "avgScores": {}
+   },
+   {
+    "agentId": "agentcore_hub_requirements_analyst",
+    "sessionCount": 343,
+    "avgScores": {
+     "Correctness": 0.42,
+     "Builtin.ToolSelectionAccuracy": 0.9569,
+     "Builtin.ResponseRelevance": 0.9971,
+     "Builtin.Helpfulness": 0.8121,
+     "Builtin.Correctness": 0.9556,
+     "Builtin.GoalSuccessRate": 0.9675,
+     "Builtin.ToolParameterAccuracy": 0.9248,
+     "Builtin.InstructionFollowing": 0.7985,
+     "Builtin.Coherence": 0.9601,
+     "dependency_chain_compliance_online": 0.1771,
+     "Builtin.Faithfulness": 0.9885
+    }
+   }
+  ],
+  "counts": {
+   "tickets": 13,
+   "events": 80,
+   "artifacts": 35,
+   "completions": 8
+  },
+  "dataQuality": {
+   "ticketProvider": "jira",
+   "missingSignals": [
+    "no token_usage events \u2014 per-run tokens unavailable (eval-config token totals are fleet-lifetime, not per-run)"
+   ],
+   "notes": [
+    "evalSummaries are fleet-lifetime rolling averages, not per-run scores"
+   ]
+  }
+ },
+ "scores": {
+  "overall": 71,
+  "planning": 84,
+  "execution": 72,
+  "reviewEfficiency": 66,
+  "reworkDiscipline": 60
+ },
+ "verdict": "A fast (7.19M ms), well-specified playbook run whose reviewer (CHANGES NEEDED) and QA (FAIL) caught real defects that the orchestrator then flowed past as green: QA and CI verified the pre-fix heads (933ea6f/12e9ac6), the fix TEAM-4183 landed at 001259d three seconds before workflow.complete, and PR #47 was handed off with no re-review, re-QA or re-CI \u2014 third recurrence of the unverified-follow-on-fix gap, first with explicit FAIL verdicts overridden.",
+ "findings": [
+  {
+   "title": "Verdict-blind flow: CHANGES NEEDED and FAIL both unblocked the next stage",
+   "kind": "failure",
+   "severity": "critical",
+   "phase": "verification",
+   "agentId": null,
+   "evidence": "TEAM-4180 code_reviewer verdict 'CHANGES NEEDED (round 1)' at 23:19:21 -> agent.complete unblocked:[TEAM-4181]. TEAM-4181 qa_verifier verdict 'FAIL' at 23:36:32 -> agent.complete unblocked:[TEAM-4182]. TEAM-4182 CI PASS at 23:42:11 on head 12e9ac6 with caveat 'if TEAM-4183 pushes new commits, CI must be re-run'. workflow.complete 23:47:00 (delivery=handoff, PR #47) 3s after TEAM-4183 agent.complete 23:46:57 (unblocked:[]). Zero re-review/re-QA/re-CI tasks exist; metrics.counts.completions=8."
+  },
+  {
+   "title": "Handed-off head 001259d is unverified by the pipeline (unverified-follow-on-fix gap, 3rd recurrence)",
+   "kind": "risk",
+   "severity": "high",
+   "phase": "development",
+   "agentId": null,
+   "evidence": "TEAM-4183 (codex_fix, blockedBy=[], created 23:18:03 status=ready) merged PR #46 into the integration branch at 001259d; QA evidence covers 933ea6f, CI covers 12e9ac6. QA summary: 'QA must re-run at TEAM-4183's head'. TEAM-4183 ticket text: 'evidence the reviewer verifies on re-review' - no re-review occurred. Prior sightings: f50ucz (mitigated by ship-review r2 + TEAM-4157 CI re-cert), yteqfl. Deviation D1 (hover-pause only) is an open PO decision shipped in the handoff."
+  },
+  {
+   "title": "PO gate decision lost across spec -> design -> plan (reviewer F1, P1)",
+   "kind": "failure",
+   "severity": "high",
+   "phase": "design",
+   "agentId": null,
+   "evidence": "TEAM-4174 Spec Approval resolved Concern 3 as '5000 ms; pause while Undo has focus or hover'; TEAM-4176 Design Approval restated 'paused on focus/hover'. TEAM-4175 design and TEAM-4177 plan recorded 'no focus-pause'; TEAM-4178 Plan Approval approved it; every Concern row stayed open until TEAM-4183. Two human gates emitted a decision no artifact bound; cost = reviewer F1 + the whole TEAM-4183 loop (1,731,344ms)."
+  },
+  {
+   "title": "humanWaitTotalMs=7,111,793 (99% of wall clock) is a Jira-bookkeeping artifact, not blocking wait",
+   "kind": "risk",
+   "severity": "medium",
+   "phase": "requirements",
+   "agentId": null,
+   "evidence": "orchestrator.unblocked fired for downstream tickets at 21:48:32 (TEAM-4164 by TEAM-4163), 22:09:40 (TEAM-4175 by TEAM-4174), 22:30:31 (TEAM-4177 by TEAM-4176), 22:45:27 (TEAM-4179 by TEAM-4178) - minutes after each review.needed (21:47:13, 22:08:05, 22:25:45, 22:41:48). metrics.humanReviews resolvedAt for all four = 22:45:16-22:45:24 (batch Jira close). Performance card repeats humanWaitMs=7,185,107. Overstates human friction for this run and pollutes def-level baselines."
+  },
+  {
+   "title": "Review + QA + CI each did honest, evidence-backed work on the head they were given",
+   "kind": "success",
+   "severity": "low",
+   "phase": "verification",
+   "agentId": null,
+   "evidence": "TEAM-4180: 4 findings with file:line (F1 P1, F2 P2, F2b P3, F3 P3), re-ran gates 57/57 in the review workspace, findings.md committed 933ea6f. TEAM-4181: 191 PASS / 8 FAIL live Chromium rows at 1280 and 320, run twice identical, all 4 findings reproduced, 7 screenshots + live log artifacts, no duplicate ticket filed. TEAM-4182: 57/57, lint/build 0, constraint diffs verified, honest ci_status=unverified + explicit re-run caveat. Zero agent errors, 0 nudges, 1 session per task."
+  },
+  {
+   "title": "Fast, clean critical path - best software-delivery feature duration since the healthy baselines",
+   "kind": "success",
+   "severity": "low",
+   "phase": "development",
+   "agentId": null,
+   "evidence": "totalDurationMs=7,189,776 vs prior five: 91,617,444 / 4,590,944 (docs) / 18,076,144 / 14,927,474 / 13,388,434. Phases design 1,251,433 \u00b7 development 2,930,053 \u00b7 verification 1,657,141. errors=[], nudgeCount=0, managerInterventions=1 (comment only, no action needed). Fix TEAM-4183 closed all 4 findings with +7 tests (64/64), 0 resurfacing, 0 fix-induced."
+  },
+  {
+   "title": "Cost $450.02 for a 5-source-file brownfield delta; playbook overlay 2.35x the first playbook run",
+   "kind": "bottleneck",
+   "severity": "medium",
+   "phase": "requirements",
+   "agentId": null,
+   "evidence": "cost-report.json: totalUsd=450.0207 (persona 423.5439, coding 26.4768), tokens.total=51,475,968, cacheHitRate 0.4591, perTaskUsd 56.2526; bands z=0.463 vs def median 341.2299 (status ok). ymo7dm (playbook run 1) cost $191.21 for a similar-size change. Per-task cost breakdown is null in the report, so the driver (4 gate review packages + verbatim artifact mirroring is the hypothesis) is not measured."
+  },
+  {
+   "title": "Requirements analyst ran without SDLC Framework / Human Review Gates context blocks",
+   "kind": "risk",
+   "severity": "low",
+   "phase": "requirements",
+   "agentId": "agentcore_hub_requirements_analyst",
+   "evidence": "TEAM-4164 completion: 'my Workflow Context lacked the ## SDLC Framework and ## Human Review Gates blocks, so artifact_dir/branch/gate wording were derived from the prior playbook run (wf_1788672380233_ymo7dm)'. Also Tickets___search_issues JQL 400 worked around via list_tickets. Output was correct this time; dependence on a prior run's artifacts is fragile."
+  },
+  {
+   "title": "Metrics undercount rework: reworkRounds=0, firstPassYield=1 on a run with CHANGES NEEDED + FAIL",
+   "kind": "risk",
+   "severity": "low",
+   "phase": "verification",
+   "agentId": null,
+   "evidence": "performance-card quality: reworkRounds 0, gateRounds 0, changeRequests 0, firstPassYield 1, fixTickets 1. compute_metrics: changeRequests.count=0, fixTickets.count=1 (TEAM-4183 'Fix (review)'). Verdict strings live only in completion summaries; no structured verdict event exists for the metric to key on."
+  }
+ ],
+ "recommendations": [
+  {
+   "title": "Make agent verdicts binding: a CHANGES NEEDED / FAIL completion must not unblock successors",
+   "priority": "P0",
+   "type": "workflow-def",
+   "target": "orchestrator unblock cascade for review/verification tasks (code_reviewer, qa_verifier, ci_agent)",
+   "description": "Require a structured verdict field on agent.complete for review/QA/CI personas (PASS | CHANGES_NEEDED | FAIL | BLOCKED). On any non-PASS verdict: do not emit orchestrator.unblocked for the successor; instead set the successor's blockedBy += the spawned fix ticket(s) and re-create (or re-open) the verdict-owning ticket for round N+1 once the fix completes. In dowtdh both TEAM-4180 (CHANGES NEEDED) and TEAM-4181 (FAIL) unblocked their successors and the run completed on an unverified head.",
+   "expectedImpact": "Eliminates verdict-blind completion; QA/CI can only certify the head that will be handed off/merged. Directly closes the unverified-follow-on-fix gap (3 runs) and the QA-parallel-with-fix pattern (3 runs)."
+  },
+  {
+   "title": "Fix tickets must pin downstream verification: QA and CI re-run at the fix head before completion",
+   "priority": "P0",
+   "type": "workflow-def",
+   "target": "software-delivery def: codex_fix / ship_fix / ci_fix ticket template + completion condition",
+   "description": "When a fix ticket is created under the epic, add it to blockedBy of every not-yet-done QA/CI ticket, and register a 'Re-verify (round N)' QA + CI pair blocked on the fix. Workflow completion condition: 0 open fix tickets AND last QA/CI completion SHA == integration head SHA. In dowtdh the completion fired 3s after TEAM-4183 with QA at 933ea6f, CI at 12e9ac6, head at 001259d. f50ucz showed the right shape ad hoc (ship-review r2 + TEAM-4157 CI re-cert) - make it def-level.",
+   "expectedImpact": "Handed-off/merged head is always the verified head; removes the standing P1 that has now recurred 3 times."
+  },
+  {
+   "title": "Bind human-gate decisions to a tracked Decision record that downstream artifacts must reference",
+   "priority": "P1",
+   "type": "process",
+   "target": "playbook overlay: Spec Approval / Design Approval / Plan Approval gates + designer/dev prompts",
+   "description": "When a PO/engineer resolves a Concern at a gate, write it to .sdlc/<wf>/decisions.md (id, gate ticket, text, status). Designer/planner prompts must either implement each open decision or file an explicit Deviation row and re-route to the decision owner BEFORE the next gate. Plan Approval reviewer package should surface 'decisions not honored' as a checklist. In dowtdh Concern 3 (pause on focus/hover, TEAM-4174/TEAM-4176) was contradicted by design and plan with 'Deviations: None yet.' and only surfaced as reviewer F1 (P1), costing the TEAM-4183 loop (1,731,344ms).",
+   "expectedImpact": "Removes the class of 'unrecorded deviation' P1s; makes human-gate time convert into binding requirements instead of advisory text."
+  },
+  {
+   "title": "humanWait metric: key gate resolution on the gate's agent.complete/unblock, not the Jira transition",
+   "priority": "P1",
+   "type": "tooling",
+   "target": "compute_metrics.py humanReviews + performance-card humanWaitMs",
+   "description": "Use the earliest of (gate ticket agent.complete, orchestrator.unblocked whose unblockedBy == gate ticket) as resolvedAt; fall back to the Jira transition only when neither exists. Flag as 'bookkeeping-batched' when several gates resolve within <60s of each other long after their unblocks. dowtdh: metric says 7,111,793ms across 4 gates; unblocks happened at 21:48:32 / 22:09:40 / 22:30:31 / 22:45:27 while all four Jira closes landed 22:45:16-24.",
+   "expectedImpact": "Restores humanWait as a real friction signal and stops batch-closes from polluting the def baseline bands."
+  },
+  {
+   "title": "Emit a structured verdict event so rework metrics stop reading 0 on rejected runs",
+   "priority": "P2",
+   "type": "tooling",
+   "target": "orchestrator agent.complete payload + performance card quality block",
+   "description": "Add detail.verdict and detail.spawnedTickets to agent.complete for review/QA/CI personas; compute reworkRounds/gateRounds/firstPassYield from those instead of change-request events. dowtdh perf card: reworkRounds 0, gateRounds 0, firstPassYield 1 on a CHANGES NEEDED + FAIL run.",
+   "expectedImpact": "Rework visibility in dashboards and SI batching without parsing summary prose."
+  },
+  {
+   "title": "Populate SDLC Framework and Human Review Gates blocks in the intake Workflow Context for playbook runs",
+   "priority": "P2",
+   "type": "tooling",
+   "target": "intake / orchestrator Workflow Context builder (sdlcFramework=playbook)",
+   "description": "TEAM-4164 reported both blocks missing and reconstructed conventions from wf_1788672380233_ymo7dm's artifacts. Ship the blocks from the def + input.sdlcFramework so the analyst never depends on a prior run existing.",
+   "expectedImpact": "Removes a silent single point of failure for the first playbook run in any new repo; small reduction in analyst tokens (1,172,864ms task)."
+  },
+  {
+   "title": "Per-task cost attribution in cost-report.json",
+   "priority": "P2",
+   "type": "tooling",
+   "target": "performance/cost card generator (agentTasks[].usd currently null)",
+   "description": "agentTasks entries carry durationMs but usd/personaUsd/codingUsd are null, so the $450.02 total (2.35x ymo7dm's $191.21) cannot be attributed to the gate review packages vs. verification vs. fix loop. Attribute by coding-session id and persona invocation window.",
+   "expectedImpact": "Lets the next analysis name the cost center instead of hypothesising; prerequisite for any cost-reduction recommendation on the playbook overlay."
+  }
+ ],
+ "trend": {
+  "priorRunsCompared": 5,
+  "deltas": {
+   "totalDurationMs": -84427668,
+   "humanWaitTotalMs": 3917879,
+   "changeRequests": 0,
+   "overallScore": -1
+  },
+  "notes": "Prior: f50ucz 72 (91,617,444ms), r30dhl 78, d68649 80, 29g73c 74, xm2bmz 80; this run 71. Duration is the best since the healthy small-fix baselines, but the humanWait delta is a Jira-bookkeeping artifact (gate tickets batch-closed 22:45:16-24 while downstream was released minutes after each review.needed). Unverified-follow-on-fix gap now on 3 runs (f50ucz, yteqfl, dowtdh) and QA-parallel-with-fix on 3 (f50ucz, sffzti, dowtdh) - this run is the worst instance because both agent verdicts were explicit and still ignored. TEAM-3268 missed-re-wake family not exercised (no Ship ticket in a handoff chain). Playbook overlay run 2 of 2: faster than ymo7dm (4.6M ms) but 2.35x the cost ($450.02 vs $191.21)."
+ },
+ "summaryMarkdown": "# Run analysis \u2014 wf_1788731227559_dowtdh \u00b7 \"Clear the Activity feed with an undo window\"\n\nworkflowDefId=software-delivery \u00b7 sdlcFramework=playbook (2nd playbook validation run) \u00b7 outcome=complete \u00b7 trigger=auto\nRepo: tycenjmccann/demo-app \u00b7 delivery=handoff (CD_REGISTERED=false) \u00b7 PR #47 handed off at workflow.complete\nStarted 2026-09-06T21:47:08.575Z \u2192 completed 23:46:58.351Z \u00b7 totalDurationMs=7,189,776 (~2h0m)\n\n## Verdict\n\nA fast, well-specified playbook run whose code reviewer and QA verifier both caught real defects\n(P1 unrecorded PO-decision deviation + 3 a11y/edge findings) \u2014 and whose orchestrator then ignored\nboth verdicts. Review said CHANGES NEEDED and QA said FAIL, yet each `agent.complete` unblocked the\nnext stage as if green: QA verified the pre-fix head (933ea6f), CI certified the pre-fix head\n(12e9ac6), and the fix (TEAM-4183 \u2192 001259d) landed 3 seconds before `workflow.complete` with no\nre-review, re-QA or re-CI. The handed-off PR #47 head is unverified by the pipeline. Third\nrecurrence of the unverified-follow-on-fix gap on this def, and the first where explicit FAIL\nverdicts were overridden by flow.\n\n## Scores\n\n| dimension | score | one-liner |\n|---|---|---|\n| planning | 84 | 9-ticket serial chain correct; PO decision from Spec Approval lost between spec\u2192design\u2192plan |\n| execution | 72 | 7.19M ms, 0 errors/nudges/retries; verification ran on the wrong head; $450 for a 5-file feature |\n| reviewEfficiency | 66 | human gates fast in practice (metric overstates); agent verdicts not enforced by the orchestrator |\n| reworkDiscipline | 60 | 1 fix, 4/4 findings closed, +7 tests, 0 resurfacing \u2014 but zero verification of the fixed head |\n| **overall** | **71** | |\n\n## Timeline (from metrics.agentTasks / events)\n\n| ticket | agent | invoked | done | durationMs |\n|---|---|---|---|---|\n| TEAM-4164 Requirements | requirements_analyst | 21:48:32 | 22:08:05 | 1,172,864 |\n| TEAM-4175 Design | frontend_designer | 22:09:40 | 22:25:45 | 965,111 |\n| TEAM-4177 Plan | frontend_dev | 22:30:31 | 22:41:48 | 676,804 |\n| TEAM-4179 Implement | frontend_dev | 22:45:27 | 23:04:08 | 1,121,034 |\n| TEAM-4180 Review \u2192 CHANGES NEEDED | code_reviewer | 23:04:08 | 23:19:21 | 913,726 |\n| TEAM-4183 Fix (review) | frontend_dev | 23:18:06 | 23:46:57 | 1,731,344 (longest task) |\n| TEAM-4181 QA \u2192 FAIL | qa_verifier | 23:19:21 | 23:36:32 | 1,031,258 |\n| TEAM-4182 CI \u2192 PASS @12e9ac6 (caveated) | ci_agent | 23:36:32 | 23:42:11 | 338,908 |\n| workflow.complete (PR #47, handoff) | orchestrator | \u2014 | 23:47:00 | \u2014 |\n\nPhases: design 1,251,433ms \u00b7 development 2,930,053ms \u00b7 verification 1,657,141ms.\nHuman gates (metrics.humanReviews): TEAM-4163 intent 3,483,659ms \u00b7 TEAM-4174 spec 2,234,942ms \u00b7\nTEAM-4176 design 1,177,178ms \u00b7 TEAM-4178 plan 216,014ms \u00b7 humanWaitTotalMs=7,111,793 (all 4 outsideHours).\n\n## 1. Planning (84)\n\n- The requirements analyst (TEAM-4164) produced a coherent playbook chain: intent (verbatim) \u2192 spec R1\u2013R10\n  with Given/When/Then \u2192 Spec Approval \u2192 Design \u2192 Design Approval \u2192 Plan \u2192 Plan Approval \u2192 Implement \u2192\n  Review \u2192 QA \u2192 CI. Chain deliberately ends at CI (CD_REGISTERED=false, handoff) \u2014 correct for this repo.\n  No duplicate assignee/tier; frontend_dev's Plan/Implement tickets serially chained by design.\n- Six open Concerns were carried forward honestly rather than silently resolved. Good.\n- Gap A \u2014 **decision loss across artifacts**: the PO resolved Concern 3 at Spec Approval (TEAM-4174,\n  \"5000 ms; pause the countdown while Undo has focus or hover\") and restated it at Design Approval\n  (TEAM-4176). Design (TEAM-4175) argued against a focus-pause and plan (TEAM-4177) recorded \"no\n  focus-pause\" \u2014 but neither took it back to the PO, and every Concern row stayed `open`. The reviewer's\n  F1 (P1) is exactly this. Two human gates produced a decision the pipeline had no mechanism to bind.\n- Gap B \u2014 **intake context incomplete**: TEAM-4164 reports its Workflow Context lacked the\n  `## SDLC Framework` and `## Human Review Gates` blocks; it reverse-engineered gate wording and\n  branch/artifact conventions from the prior playbook run (wf_1788672380233_ymo7dm). Worked, but fragile.\n- Gap C \u2014 **fix ticket created with blockedBy=[] and no downstream re-verification**: TEAM-4183 was\n  filed at 23:18:03 in phase=development while QA/CI still had blockedBy=[TEAM-4180]/[TEAM-4181] only.\n  Nothing in the ticket plan made QA or CI depend on the fix, and no \"re-review\" ticket exists.\n\n## 2. Execution (72)\n\n- Wall clock 7,189,776ms \u2014 the fastest software-delivery feature run since the healthy baselines\n  (bake-off arms 13.4M\u201318.1M ms; f50ucz 91.6M ms). errors=0, nudges=0, retries=0, 1 session per task.\n- Critical path was agent work throughout; the fix TEAM-4183 (1,731,344ms) was the longest single task\n  and ran fully in parallel with QA (1,031,258ms) + CI (338,908ms). Parallelism saved wall time but\n  made the verification phase verify the wrong head (see \u00a74).\n- Cost (shared/cost-report.json, workflow.performance): totalCostUsd=450.02 (persona $423.54,\n  coding $26.48), tokens total 51,475,968, cache hit 45.9%, perTaskUsd=56.25. Bands: z=0.46 vs def\n  median $341.23 \u2014 inside \"ok\", but for a 5-source-file brownfield delta this is expensive; the 4\n  human-gate review packages + verbatim artifact mirroring are the plausible drivers (not measured per task).\n- Manager interventions: 1 (comment on TEAM-4181 at 23:31:04Z \u2014 watch triage judged QA alive from\n  lastText, no action). Correct call: QA completed 5.5 min later. No cost to the run.\n- Data-quality: no token_usage events (per-run tokens come only from the performance card).\n\n## 3. Human-in-the-loop (66)\n\n- Four human gates, all approved, all outsideHours. metrics.humanWaitTotalMs=7,111,793 (99% of wall\n  clock) \u2014 but this number is an artifact of Jira bookkeeping, not of blocking. The event log shows the\n  orchestrator released downstream work minutes after each review.needed:\n  TEAM-4163 review.needed 21:47:13 \u2192 orchestrator.unblocked TEAM-4164 21:48:32;\n  TEAM-4174 22:08:05 \u2192 TEAM-4175 released 22:09:40;\n  TEAM-4176 22:25:45 \u2192 TEAM-4177 released 22:30:31;\n  TEAM-4178 22:41:48 \u2192 TEAM-4179 released 22:45:27.\n  The four gate tickets were then closed in Jira as a batch at 22:45:16\u201322:45:24, which is the\n  `resolvedAt` the metric keys on. Real blocking wait was on the order of minutes per gate, not hours.\n  \u2192 Data-quality finding: humanWait should key on the agent.complete/unblock of the gate ticket, not\n  the Jira transition. (The performance card repeats the same inflated humanWaitMs=7,185,107.)\n- Gate ROI: Spec Approval (TEAM-4174) did real work \u2014 it recorded a PO decision on Concern 3. Design\n  Approval restated it. Plan Approval (TEAM-4178) approved a plan that contradicted it. So the human\n  gates carried the right information; the system failed to make it binding. Intent Acceptance\n  (TEAM-4163) was a pure pass-through.\n- Agent verdict gates: code_reviewer TEAM-4180 = CHANGES NEEDED (F1 P1, F2 P2, F2b P3, F3 P3), QA\n  TEAM-4181 = FAIL (191 PASS / 8 FAIL live rows, all four findings reproduced in Chromium at 1280 and\n  320), CI TEAM-4182 = PASS with explicit caveat \"covers head 12e9ac6 only; if TEAM-4183 pushes new\n  commits, CI must be re-run\". All three agents were right and said so plainly. None of the verdicts\n  changed the orchestrator's behaviour \u2014 each agent.complete unblocked its successor.\n\n## 4. Rework (60) \u2014 the core failure of this run\n\nSequence (events + completions):\n1. 23:18:03 reviewer files TEAM-4183 (codex_fix, status=ready, blockedBy=[]); 23:18:06 orchestrator\n   dispatches frontend_dev on it immediately.\n2. 23:19:21 reviewer's agent.complete unblocks QA TEAM-4181 \u2014 despite verdict CHANGES NEEDED.\n3. 23:19\u201323:36 QA verifies head 933ea6f (pre-fix), correctly FAILs, comments the live repro + fix\n   contract onto TEAM-4183, and writes \"QA must re-run at TEAM-4183's head\".\n4. 23:36:32 QA's agent.complete unblocks CI TEAM-4182 \u2014 despite verdict FAIL.\n5. 23:36\u201323:42 CI PASSes head 12e9ac6 (QA evidence commit; src still pre-fix) with the re-run caveat.\n6. 23:46:57 TEAM-4183 completes: all 4 findings fixed, PR #46 merged into the integration branch at\n   001259d, 64/64 tests (+7), lint/build green, hover-pause screenshot. Its `unblocked` is [].\n7. 23:47:00 workflow.complete, delivery=handoff, prUrl=PR #47.\n\nWhat never happened: re-review of TEAM-4183 (its own ticket text says \"evidence the reviewer verifies\non re-review\"); QA at 001259d; CI at 001259d. Deviation D1 (hover-pause only, no focus-pause) is an\nOPEN PO decision shipped inside the handoff. Metrics/perf card report reworkRounds=0, gateRounds=0,\nfirstPassYield=1 \u2014 all wrong; compute_metrics does count fixTickets=1 (title \"Fix (review)\").\nAgent-side discipline was good: 1 ticket, 4/4 findings closed with per-finding evidence, 0\nresurfacing, 0 fix-induced. The 60 is for the system: a fix landed with zero pipeline verification.\n\n## 5. Deliverables vs. intent\n\nIntent successCriteria \u2192 evidence:\n- \"Clear activity control empties the feed\" \u2014 TEAM-4179 clearActivities(); QA live PASS (seed-25 \u2192 0 li, storage '[]').\n- \"~5 s Undo restores exactly what was cleared\" \u2014 QA live PASS (same 20 in same order, 25 ids restored; Undo present @4907ms, gone @5202ms).\n- \"after that permanent, survives reload\" \u2014 QA live PASS (reload inside window \u2192 empty; reload after undo \u2192 25).\n- \"keyboard + screen-reader users can do both\" \u2014 keyboard PASS; screen-reader F2/F2b FAILED at QA head, fixed in TEAM-4183 but not re-verified by QA.\n- \"tests cover clear, undo, expiry, reload; existing pass; build green\" \u2014 57/57 at CI head, 64/64 at fix head (dev-reported); existing 37 untouched (CI: additions-only diff verified).\n- Constraints \u2014 App.tsx/App.css/package.json byte-identical to main, no DEPLOY.md, no new deps: verified by QA and CI.\nArtifacts: 35 (intent, spec, design doc + 3 mockups, plan, findings, QA report + 7 screenshots + live log,\nCI report, 4 review packages, cost/performance cards, manifest). Complete artifact set for a playbook run.\nNet: the feature very likely works at 001259d, but the pipeline can only *attest* to 12e9ac6.\n\n## 6. Trend (5 prior analyses on this def)\n\nf50ucz 72 (09-06, 91.6M ms) \u00b7 r30dhl 78 \u00b7 d68649 80 \u00b7 29g73c 74 \u00b7 xm2bmz 80. This run 71.\nDeltas vs f50ucz: duration \u221284,427,668ms; humanWait +3,917,879ms (metric artifact, see \u00a73);\nchangeRequests 0 \u2192 0; overall \u22121.\n- Unverified-follow-on-fix gap: now 3 runs (f50ucz mitigated via ship-review r2 + CI re-cert; yteqfl;\n  this run with no mitigation because the chain has no Ship stage). Confirmed recurring, P0 in playbook mode.\n- QA-parallel-with-fix: 3rd sighting (f50ucz TEAM-4124/4131, sffzti, this run) \u2014 worst instance: QA\n  FAILed and was still treated as green.\n- TEAM-3268 missed-re-wake family: NOT observed (no Ship ticket in this chain, so no exposure).\n- Playbook overlay (2nd run): 2h vs ymo7dm 4.6M ms/$191 \u2014 faster but 2.35\u00d7 the cost. Both playbook\n  runs had a QA-stage event (ymo7dm crash, this run verdict override).\n"
+}
