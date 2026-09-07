@@ -37,6 +37,17 @@ import {
   phaseForAgent,
   emitLivenessMetrics,
   isParkedOnHuman,
+  // TEAM-4186 F6 — the LEGACY clock, kept as the pre-epic function over a 25-row
+  // window so `off` is byte-identical and `shadow` still measures the real thing.
+  LEGACY_EVENT_WINDOW,
+  legacySignificantEventAge,
+  // TEAM-4186 F7 — the pure half of the bounded event-window read: who is active,
+  // how deep a verdict can look, who is still starved, and when to stop paging.
+  activeTicketIds,
+  maxThresholdMs,
+  eventsWindowFloor,
+  missingSampleTicketIds,
+  livenessWindowSatisfied,
 } from "./liveness.mjs";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
@@ -54,6 +65,9 @@ const ANALYZE_DELAY_MS = Number(process.env.WM_ANALYZE_DELAY_MS || 30_000);
 // shadow logs where the two disagree; enforce lets liveness drive the invoke.
 const LIVENESS_MODE = normalizeLivenessMode(process.env.WM_LIVENESS_MODE);
 const LIVENESS_THRESHOLDS = thresholdsFromEnv();
+// The deepest any verdict can look back (largest phase threshold) — the paging
+// loop's early-stop horizon, TEAM-4186 F7.
+const MAX_THRESHOLD_MS = maxThresholdMs(LIVENESS_THRESHOLDS);
 
 // TEAM-3747 D2: includes the lifecycle-integrity ship outcomes so a blocked run
 // is recorded HONESTLY (the dossier carries phase deploy-blocked / static-ci-only,
@@ -350,7 +364,10 @@ async function watchScan() {
 
   // TEAM-4166 D2 — one EMF record per scan; explicit zeros so a healthy scan is
   // distinguishable from a silent one.
-  const lm = { mode: LIVENESS_MODE, staleTickets: 0, watchFired: 0, spanFreshSkips: 0, shadowDivergence: 0 };
+  const lm = {
+    mode: LIVENESS_MODE, staleTickets: 0, watchFired: 0, spanFreshSkips: 0, shadowDivergence: 0,
+    windowPages: 0, windowTruncated: 0,
+  };
 
   const watched = [];
   for (const wf of active) {
@@ -360,8 +377,29 @@ async function watchScan() {
     // ── LEGACY decision (WM_STALE_MINUTES event-age window) — the sole driver in
     //    off + shadow. Age used to decide AND to report: event age when we have
     //    events, else time since the run started (0 if we know neither). ──
-    const events = await recentEvents(wf.workflowId);
-    const lastEventAge = significantEventAge(events, now);
+    // TEAM-4186 F7: read the window deep enough that no active ticket is starved
+    // of evidence (bounded — see recentEventsPaged). `off` still does the single
+    // pre-epic Query.
+    const liveIds = LIVENESS_MODE === "off" ? [] : activeTicketIds({ agentTasks: wf.agentTasks });
+    const win = await recentEventsPaged({
+      workflowId: wf.workflowId,
+      activeTicketIds: liveIds,
+      nowMs: now,
+      maxThresholdMs: MAX_THRESHOLD_MS,
+    });
+    lm.windowPages += win.pages;
+    if (win.truncated) {
+      lm.windowTruncated++;
+      console.log(`[analyzer] liveness.window_truncated ${JSON.stringify({
+        workflowId: wf.workflowId, pages: win.pages, rows: win.events.length,
+        missingSampleTicketIds: win.missing,
+        windowFloorAt: win.windowFloorMs == null ? null : new Date(win.windowFloorMs).toISOString(),
+      })}`);
+    }
+    // TEAM-4186 F6: the legacy decision sees ONLY the first 25 rows of page 1. The
+    // wider window exists for the liveness clock; letting it reach here makes the
+    // watchdog fire on a healthy streaming agent (see LEGACY_EVENT_WINDOW).
+    const lastEventAge = legacySignificantEventAge(win.legacyWindow, now);
     const legacyAge = lastEventAge ?? (wf.startedAt ? now - Date.parse(wf.startedAt) : 0);
     const legacyFire = legacyAge >= STALE_MS;
 
@@ -373,8 +411,11 @@ async function watchScan() {
     if (LIVENESS_MODE !== "off") {
       const tickets = buildLivenessTickets({
         agentTasks: wf.agentTasks,
-        events,
+        events: win.events,
         nowMs: now,
+        // TEAM-4186 F7 — a ticket with no row in the window is anchored here, a
+        // sound lower bound on its silence, instead of at its hours-old startedAt.
+        windowFloorMs: win.windowFloorMs,
         phaseOf: (_tid, task) => phaseForAgent(task?.agentId, wf.phase),
       });
       const decision = decideWatch(wf, tickets, now, LIVENESS_MODE, LIVENESS_THRESHOLDS);
@@ -424,34 +465,83 @@ async function watchScan() {
   return { active: active.length, watched };
 }
 
-// Not agent activity: streaming chunks are too chatty to mean anything alone,
-// and orchestrator.nudge is a housekeeping event the orchestrator publishes
-// itself (a live lease it chose not to steal) — counting either keeps a run
-// looking fresh no matter what the agent is doing (TEAM-3969).
-const NON_SIGNIFICANT_EVENT_TYPES = new Set(["agent.streaming", "orchestrator.nudge"]);
+// The liveness clock's page size. TEAM-4166 D2 raised it from the pre-epic 25:
+// the clock needs enough recent rows to find the newest agent.streaming per
+// ticket (the span-fresh proof-of-life), which the chatty streaming rows can
+// otherwise push past a 25-row window. The LEGACY decision is deliberately NOT
+// widened with it — see LEGACY_EVENT_WINDOW in liveness.mjs (TEAM-4186 F6).
+export const LIVENESS_EVENT_PAGE = 50;
+
+// Hard ceiling on the paged window: 10 × 50 = 500 rows per workflow per scan.
+// A runaway streaming agent must not be able to turn one WATCH scan into an
+// unbounded table read, so the loop always stops — and when it stops early the
+// verdict stays sound because a starved ticket is anchored at the window floor
+// (liveness.mjs computeSilenceMs), never at its hours-old startedAt.
+export const MAX_EVENT_PAGES = 10;
 
 /**
- * The newest events for a workflow, newest first. TEAM-4166 D2 raised the Limit
- * from 25 to 50: the liveness clock needs enough recent rows to find the newest
- * agent.streaming per ticket (the span-fresh proof-of-life), which the chatty
- * streaming rows can otherwise push past a 25-row window.
+ * The newest events for a workflow, newest first, read deep enough to DECIDE.
+ *
+ * TEAM-4186 F7 — one 50-row page is shared by every ticket in the run, so a
+ * single agent streaming for 15 minutes starves its siblings of evidence: with
+ * no row of their own they used to fall back to startedAt (hours) and were
+ * declared stale while working. This pages until every active ticket has a
+ * sample, then stops (livenessWindowSatisfied) — bounded by MAX_EVENT_PAGES.
+ *
+ * Returns { events, legacyWindow, windowFloorMs, pages, truncated, missing }.
+ * `legacyWindow` is pinned to the first LEGACY_EVENT_WINDOW rows of the FIRST
+ * page, so the deeper read structurally cannot leak into the legacy decision
+ * (TEAM-4186 F6). In `off` mode this is the PRE-EPIC read — one Query, Limit 25,
+ * no paging, not one extra consumed capacity unit: the clock never runs there.
  */
-async function recentEvents(workflowId) {
-  const page = await ddb.send(new QueryCommand({
+export async function recentEventsPaged({ workflowId, activeTicketIds: ids, nowMs, maxThresholdMs: maxMs }) {
+  const queryFor = (Limit, ExclusiveStartKey) => new QueryCommand({
     TableName: EVENTS_TABLE,
     KeyConditionExpression: "workflowId = :w",
     ExpressionAttributeValues: { ":w": workflowId },
     ScanIndexForward: false,
-    Limit: 50,
-  }));
-  return page.Items || [];
-}
+    Limit,
+    ExclusiveStartKey,
+  });
 
-/** Age in ms of the newest non-streaming event in `items`, or null if none. */
-function significantEventAge(items, now) {
-  const item = (items || []).find((e) => !NON_SIGNIFICANT_EVENT_TYPES.has(e.type)) || (items || [])[0];
-  if (!item?.timestamp) return null;
-  return now - Date.parse(item.timestamp);
+  if (LIVENESS_MODE === "off") {
+    const page = await ddb.send(queryFor(LEGACY_EVENT_WINDOW));
+    const items = page.Items || [];
+    return {
+      events: items,
+      legacyWindow: items.slice(0, LEGACY_EVENT_WINDOW),
+      windowFloorMs: eventsWindowFloor(items),
+      pages: 1,
+      truncated: false,
+      missing: [],
+    };
+  }
+
+  const events = [];
+  let legacyWindow = null;
+  let pages = 0;
+  let truncated = false;
+  let ExclusiveStartKey;
+  for (;;) {
+    const page = await ddb.send(queryFor(LIVENESS_EVENT_PAGE, ExclusiveStartKey));
+    const items = page.Items || [];
+    if (legacyWindow == null) legacyWindow = items.slice(0, LEGACY_EVENT_WINDOW);
+    events.push(...items);
+    pages++;
+    ExclusiveStartKey = page.LastEvaluatedKey;
+    if (!ExclusiveStartKey) break; // read the whole run
+    if (livenessWindowSatisfied({ activeTicketIds: ids, events, nowMs, maxThresholdMs: maxMs })) break;
+    if (pages >= MAX_EVENT_PAGES) { truncated = true; break; }
+  }
+
+  return {
+    events,
+    legacyWindow: legacyWindow || [],
+    windowFloorMs: eventsWindowFloor(events),
+    pages,
+    truncated,
+    missing: missingSampleTicketIds({ activeTicketIds: ids, events }),
+  };
 }
 
 // ─── Harness invoke ────────────────────────────────────────────────────────────
