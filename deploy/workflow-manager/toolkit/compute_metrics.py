@@ -216,6 +216,31 @@ def compute_phases(events, started, ended, missing):
         if phase:
             invoked_by_phase[phase] = invoked_by_phase.get(phase, 0) + 1
     phases = []
+    first_change = parse_ts(changes[0].get("timestamp"))
+    # A run spends real time in its OPENING phase before the first phase_change
+    # ever fires — requirements, on a run whose first logged change is already
+    # "development". Without a row for that stretch phases[] can never sum to
+    # totalDurationMs (it silently drops the whole intake/requirements window).
+    # Label it from the first agent.invoked seen before that change (its phase
+    # names the work that was actually running), else "intake", and mark it
+    # derived so a reader knows the row was reconstructed, not logged.
+    if started is not None and first_change is not None and first_change > started:
+        label = next(
+            (detail(e).get("phase")
+             for e in events_of(events, "agent.invoked")
+             if detail(e).get("phase")
+             and parse_ts(e.get("timestamp"))
+             and parse_ts(e.get("timestamp")) < first_change),
+            None,
+        ) or "intake"
+        phases.append({
+            "phase": label,
+            "enteredAt": iso(started),
+            "exitedAt": iso(first_change),
+            "durationMs": ms_between(started, first_change),
+            "taskCount": invoked_by_phase.get(label, 0),
+            "derived": "run-start",
+        })
     for i, e in enumerate(changes):
         entered = parse_ts(e.get("timestamp"))
         exited = parse_ts(changes[i + 1].get("timestamp")) if i + 1 < len(changes) else ended
@@ -226,6 +251,7 @@ def compute_phases(events, started, ended, missing):
             "exitedAt": iso(exited),
             "durationMs": ms_between(entered, exited),
             "taskCount": invoked_by_phase.get(phase, 0),
+            "derived": None,
         })
     return phases
 
@@ -278,25 +304,61 @@ def compute_human_reviews(tickets, events, workflow, ended, missing, window=None
         return reviews, 0
     needed = events_of(events, "review.needed")
     rejected = events_of(events, "review.rejected")
+    resolved_evs = events_of(events, "review.resolved")
+    gate_terminal = events_of(events, *TERMINAL_TASK_EVENTS)
     for ticket in gate_tickets:
         tid = ticket["ticketId"]
+        assignee = str(ticket.get("assignee") or "")
         requests = [parse_ts(e.get("timestamp")) for e in needed if event_ticket(e) == tid]
         if not requests:
             fallback = notif_ts.get(tid)
             if fallback:
                 requests = [fallback]
                 missing.append(f"{tid}: review.needed missing — used humanNotifications timestamp")
-        rejections = [parse_ts(e.get("timestamp")) for e in rejected if event_ticket(e) == tid]
-        done_at = parse_ts(ticket.get("updatedAt")) if ticket.get("status") == "done" else None
-        for cycle, requested in enumerate(sorted(filter(None, requests)), start=1):
-            rejection = next((r for r in sorted(filter(None, rejections)) if r and r > requested), None)
-            if rejection:
-                resolved, outcome = rejection, "rejected"
-            elif done_at and done_at > requested and cycle == len(requests):
-                resolved, outcome = done_at, "approved"
-            else:
-                resolved, outcome = ended, "unresolved"
-            wait = ms_between(requested, resolved)
+        rejections = sorted(
+            r for r in (parse_ts(e.get("timestamp")) for e in rejected if event_ticket(e) == tid) if r
+        )
+        # (a) review.resolved is the HONEST signal a human actually closed the
+        # gate: keyed on the event's resolvedAt (its own timestamp as a fallback)
+        # and carrying the human's outcome verbatim.
+        resolutions = sorted(
+            (
+                (parse_ts(detail(e).get("resolvedAt")) or parse_ts(e.get("timestamp")),
+                 detail(e).get("outcome"))
+                for e in resolved_evs if event_ticket(e) == tid
+            ),
+            key=lambda x: (x[0] is None, x[0] or datetime.min.replace(tzinfo=timezone.utc)),
+        )
+        # (d) the gate's OWN terminal event (a human assignee reporting the gate
+        # complete) — weaker than the ticket's done stamp, so it comes after (c).
+        gate_done = sorted(
+            g for g in (
+                parse_ts(e.get("timestamp")) for e in gate_terminal if event_ticket(e) == tid
+            ) if g
+        )
+        # (c) the ticket's own resolvedAt, else its updatedAt once it is done —
+        # the pre-event-contract signal, kept for the LAST cycle only and AHEAD
+        # of the gate's own terminal event.
+        done_at = parse_ts(ticket.get("resolvedAt")) or (
+            parse_ts(ticket.get("updatedAt")) if ticket.get("status") == "done" else None
+        )
+        reqs = sorted(filter(None, requests))
+        for cycle, requested in enumerate(reqs, start=1):
+            resolved, outcome, resolved_by = None, None, None
+            resolution = next(((rts, oc) for rts, oc in resolutions if rts and rts >= requested), None)
+            if resolution:
+                resolved, outcome, resolved_by = resolution[0], (resolution[1] or "approved"), "review.resolved"
+            elif (rej := next((r for r in rejections if r > requested), None)):
+                resolved, outcome, resolved_by = rej, "rejected", "review.rejected"
+            elif done_at and done_at > requested and cycle == len(reqs):
+                resolved, outcome, resolved_by = done_at, "approved", "ticket"
+            elif assignee.startswith(HUMAN_PREFIX) and (gd := next((g for g in gate_done if g > requested), None)):
+                resolved, outcome, resolved_by = gd, "approved", "agent.complete"
+            # (e) An OPEN gate has no measured wait: it was never resolved (the
+            # run ended, was cancelled, or the human simply never came back), so
+            # the run-end wall clock is not a human's decision time. Excluded from
+            # humanWaitTotalMs — we removed the old "unresolved → run end" charge.
+            wait = ms_between(requested, resolved) if resolved else None
             if wait:
                 total_wait += wait
             reviews.append({
@@ -304,10 +366,13 @@ def compute_human_reviews(tickets, events, workflow, ended, missing, window=None
                 "reviewer": ticket.get("assignee"),
                 "gateName": ticket.get("title"),
                 "requestedAt": iso(requested),
-                "resolvedAt": iso(resolved),
+                "resolvedAt": iso(resolved) if resolved else None,
                 "waitMs": wait,
-                "outcome": outcome,
+                "outcome": outcome or "open",
                 "cycle": cycle,
+                # Which signal closed the gate — the outcome is a claim about what
+                # a human did, so how we know travels with it.
+                "resolvedBy": resolved_by,
                 # Was the human ASKED outside their working hours? Keyed on
                 # requestedAt, not on the wait: a request that lands at 23:40
                 # Friday explains its own 40-hour wait, and that explanation is
@@ -522,6 +587,159 @@ def finder_origin(kind, created, events):
     return best_tid
 
 
+# A ```fix-contract fenced block — the machine contract an agent embeds in a fix
+# ticket's description. Deliberately NOT the human-prose "== D3 fix contract =="
+# header some tickets carry: that is a summary for a reader, not the contract,
+# and must fall through to the finder-in-flight rule.
+FIX_CONTRACT_FENCE = "```fix-contract"
+# Block scalar name → the field name parseFixContractBlock uses in
+# lambda/orchestrator/fix-contract.mjs. Kept in that spelling so the parity is a
+# visible diff (this toolkit cannot import the JS — different language, and the
+# container has no lambda/ dir).
+_FIX_CONTRACT_SCALARS = {
+    "kind": "kind",
+    "origin": "origin",
+    "round": "round",
+    "phase": "phase",
+    "invariant": "invariant",
+    "evidence_source": "evidenceSource",
+    "evidence_repro": "evidenceRepro",
+    "sibling_scope": "siblingScope",
+}
+_FIX_CONTRACT_SCALAR_RE = re.compile(r"^([a-z_]+):(?:\s+(.*))?$")
+_FIX_CONTRACT_LIST_ITEM_RE = re.compile(r"^\s*-\s+(.*)$")
+
+
+def parse_fix_contract_block(description):
+    """Parse a ```fix-contract fenced block from a ticket description.
+
+    → {kind, origin, round, phase, invariant, evidenceSource, evidenceRepro,
+    citedLocation, siblingScope} (absent scalars None, round coerced to int when
+    it parses, citedLocation a list), mirroring fix-contract.mjs field names — or
+    None when the description carries no such fenced block.
+
+    A description can hold the block twice (a truncated preview then the full
+    copy, as the scrubbed dossiers do). We scan from the first fenced open to the
+    first BARE ``` close; a second ```fix-contract line inside is treated as
+    content, and repeated scalars simply overwrite — they agree, so last-wins is
+    safe."""
+    text = str(description or "")
+    if FIX_CONTRACT_FENCE not in text:
+        return None
+    lines = text.splitlines()
+    start = next((i for i, l in enumerate(lines) if l.strip() == FIX_CONTRACT_FENCE), None)
+    if start is None:
+        return None
+    out = {
+        "kind": None, "origin": None, "round": None, "phase": None,
+        "invariant": None, "evidenceSource": None, "evidenceRepro": None,
+        "citedLocation": [], "siblingScope": None,
+    }
+    in_cited = False
+    for line in lines[start + 1:]:
+        stripped = line.strip()
+        if stripped == "```":  # bare close — end of the block
+            break
+        if stripped == FIX_CONTRACT_FENCE:  # a second open (the full copy) — keep going
+            in_cited = False
+            continue
+        item = _FIX_CONTRACT_LIST_ITEM_RE.match(line)
+        if in_cited and item:
+            loc = item.group(1).strip()
+            if loc:
+                out["citedLocation"].append(loc)
+            continue
+        m = _FIX_CONTRACT_SCALAR_RE.match(stripped)
+        if not m:
+            continue
+        key = m.group(1)
+        val = (m.group(2) or "").strip().strip('"').strip()
+        in_cited = key == "cited_location"
+        if key == "cited_location":
+            if val:  # inline comma form, alongside the "  - item" list form
+                out["citedLocation"].extend(p.strip() for p in val.split(",") if p.strip())
+            continue
+        field = _FIX_CONTRACT_SCALARS.get(key)
+        if not field:
+            continue
+        if field == "round":
+            try:
+                out["round"] = int(str(val).strip())
+            except (ValueError, TypeError):
+                out["round"] = None
+        else:
+            out[field] = val or None
+    return out
+
+
+def dispatch_count(origin_ticket_id, created, events):
+    """ROUND via dispatch count: how many times the ORIGIN ticket's agent was
+    dispatched at or before the fix was filed. Prefer agent.invoked (dedupe by
+    timestamp — the twin writes share a timestamp); fall back to agent.started
+    only when the origin has no agent.invoked rows at all. 0 when unknown, so the
+    caller keeps its running-counter fallback.
+
+    Keyed on detail.ticketId directly, never event_ticket's workflowId fallback:
+    a runtime-level agent.started (ticketId absent → workflowId) is not a dispatch
+    OF the origin ticket."""
+    if not origin_ticket_id or created is None:
+        return 0
+
+    def stamps_at_or_before(etype):
+        seen = set()
+        for e in events_of(events, etype):
+            if detail(e).get("ticketId") != origin_ticket_id:
+                continue
+            ts = parse_ts(e.get("timestamp"))
+            if ts and ts <= created:
+                seen.add(e.get("timestamp"))
+        return seen
+
+    has_any_invoked = any(
+        detail(e).get("ticketId") == origin_ticket_id for e in events_of(events, "agent.invoked")
+    )
+    if has_any_invoked:
+        return len(stamps_at_or_before("agent.invoked"))
+    return len(stamps_at_or_before("agent.started"))
+
+
+def finder_in_flight(kind, created, events):
+    """ORIGIN when the finder was STILL RUNNING as the fix was filed: an
+    agent.invoked/agent.started for the finder agent at or before the fix's
+    createdAt whose ticket has NO agent.complete between that dispatch and
+    createdAt. The reviewer that opens three fix tickets mid-review has not
+    completed yet, so finder_origin (last COMPLETED before) finds nothing — this
+    catches exactly that case. Latest still-in-flight dispatch wins.
+
+    Keyed on detail.ticketId (never the workflowId fallback), so a runtime-level
+    agent.started row can never masquerade as the origin ticket."""
+    agent = KIND_TO_FINDER_AGENT.get(kind)
+    if not agent or created is None:
+        return None
+    completes = [
+        (parse_ts(e.get("timestamp")), detail(e).get("ticketId"))
+        for e in events_of(events, "agent.complete")
+        if detail(e).get("agentId") == agent
+    ]
+    best_ts, best_tid = None, None
+    for e in events_of(events, "agent.invoked", "agent.started"):
+        d = detail(e)
+        tid = d.get("ticketId")
+        if d.get("agentId") != agent or not tid:
+            continue
+        disp = parse_ts(e.get("timestamp"))
+        if disp is None or disp > created:
+            continue
+        done_between = any(
+            cts and ctid == tid and disp <= cts <= created for cts, ctid in completes
+        )
+        if done_between:
+            continue
+        if best_ts is None or disp > best_ts:
+            best_ts, best_tid = disp, tid
+    return best_tid
+
+
 def compute_fix_tickets(tickets, events, epic_id):
     """fixTickets v2 — the count the WM cites, plus the lineage behind it.
 
@@ -551,19 +769,71 @@ def compute_fix_tickets(tickets, events, epic_id):
         spawned = ticket.get("spawnedBy") if isinstance(ticket.get("spawnedBy"), dict) else {}
         contract = ticket.get("fixContract") if isinstance(ticket.get("fixContract"), dict) else {}
 
+        block = parse_fix_contract_block(ticket.get("description"))
+
         kind = spawned_kind(ticket)
         title_kind, reverify = title_fix_kind(title)
         if not kind:
-            kind = title_kind
+            # A block that names its own kind beats the title guess when nothing
+            # was machine-stamped — the contract is closer to the agent's intent
+            # than a parenthesized word in the summary.
+            if block and block.get("kind"):
+                kind = str(block["kind"])
+            else:
+                kind = title_kind
         elif spawned.get("reverify"):
             reverify = True
 
-        origin = spawned.get(KIND_TO_ORIGIN_KEY.get(kind, ""), None) or None
-        if not origin:
-            origin = finder_origin(kind, created, events)
+        # ORIGIN — strongest provenance first, each source named in originSource:
+        #   spawnedBy         the machine-stamped origin key (FR-8 contract)
+        #   fixContract       the structured contract field
+        #   block             the origin: scalar of a ```fix-contract block
+        #   finder            the finder's last ticket COMPLETED before the fix
+        #   finder-in-flight  the finder agent STILL RUNNING when the fix was filed
+        #
+        # finder-in-flight is the LAST resort, tried only when no finder run had
+        # completed before the fix — the case it exists for: a code reviewer that
+        # opens three fix tickets mid-review has not completed, so finder_origin
+        # is empty and the still-running review IS the finding. When a finder run
+        # DID complete first, that completed run is the finding of record; a later
+        # still-running dispatch is often a downstream RE-VERIFY of the fixes,
+        # whose blockedBy legitimately lists them, and letting it win would flip a
+        # resurfacing fix to fix-induced on a dependency edge that is not breakage.
+        origin, origin_source = None, None
+        stamped_origin = spawned.get(KIND_TO_ORIGIN_KEY.get(kind, ""), None) or None
+        found = finder_origin(kind, created, events)
+        in_flight = finder_in_flight(kind, created, events)
+        if stamped_origin:
+            origin, origin_source = stamped_origin, "spawnedBy"
+        elif contract.get("originId"):
+            origin, origin_source = contract["originId"], "fixContract"
+        elif block and block.get("origin"):
+            origin, origin_source = block["origin"], "block"
+        elif found:
+            origin, origin_source = found, "finder"
+        elif in_flight:
+            origin, origin_source = in_flight, "finder-in-flight"
 
         key = (kind, origin)
+        # The running per-(kind, origin) counter is ALWAYS advanced (so a run
+        # with no richer signal — the synthetic lineage fixture — keeps its 1,2,3
+        # numbering); a stronger round source below just overrides the value.
         rounds[key] = rounds.get(key, 0) + 1
+
+        # ROUND — strongest first, each source named in roundSource:
+        #   spawnedBy       the machine-stamped round
+        #   block           the round: scalar of a ```fix-contract block
+        #   dispatch-count  how many times the origin was dispatched by now
+        #   counter         the per-(kind, origin) running counter (fallback)
+        round_val, round_source = rounds[key], "counter"
+        dc = dispatch_count(origin, created, events)
+        if dc:
+            round_val, round_source = dc, "dispatch-count"
+        if block and isinstance(block.get("round"), int) and block["round"] >= 1:
+            round_val, round_source = block["round"], "block"
+        stamped_round = spawned.get("round")
+        if isinstance(stamped_round, int) and stamped_round >= 1:
+            round_val, round_source = stamped_round, "spawnedBy"
 
         # The contract wins when it is there; the title is the fallback for the
         # runs that predate it. `hasContract` keeps the two apart, because the
@@ -622,7 +892,11 @@ def compute_fix_tickets(tickets, events, epic_id):
             "ticketId": tid,
             "kind": kind,
             "originTicketId": origin,
-            "round": rounds[key],
+            # How we know the origin — the tag downstream is an accusation, so
+            # the provenance of the ticket it points at travels with it.
+            "originSource": origin_source,
+            "round": round_val,
+            "roundSource": round_source,
             "tag": tag,
             # Which rule made it "resurfacing" (None for every other tag), and
             # the fingerprint it matched on — the tag is an accusation ("an

@@ -15,10 +15,12 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from compute_metrics import (  # noqa: E402
     business_window,
+    compute_fix_tickets,
     compute_metrics,
     intake_completed_at,
     is_outside_hours,
     jaccard,
+    parse_fix_contract_block,
     title_fix_kind,
     title_paths,
     title_slot_tokens,
@@ -204,7 +206,7 @@ class MissingPhaseEvents(unittest.TestCase):
 
 
 class CancelledRun(unittest.TestCase):
-    def test_uses_cancelled_at_and_marks_unresolved_review(self):
+    def test_uses_cancelled_at_and_marks_open_review(self):
         metrics = compute_metrics(dossier(
             workflow={"startedAt": T0, "cancelledAt": ts(50), "humanNotifications": []},
             tickets=[
@@ -219,9 +221,15 @@ class CancelledRun(unittest.TestCase):
             ],
         ))
         self.assertEqual(metrics["totalDurationMs"], 50 * 60 * 1000)
+        # An OPEN gate has no measured wait: the run was cancelled while the
+        # human still held the review, so the run-end wall clock is not a
+        # decision time and is excluded from humanWaitTotalMs.
         review = metrics["humanReviews"][0]
-        self.assertEqual(review["outcome"], "unresolved")
-        self.assertEqual(review["waitMs"], 40 * 60 * 1000)  # 10 → run end
+        self.assertEqual(review["outcome"], "open")
+        self.assertIsNone(review["waitMs"])
+        self.assertIsNone(review["resolvedAt"])
+        self.assertIsNone(review["resolvedBy"])
+        self.assertEqual(metrics["humanWaitTotalMs"], 0)
         # TEAM-4121 FR-10: count/ticketIds keep their old meaning (this dossier
         # has no intake events, so the legacy "Fix:" title still counts — see
         # FixLineage for the exclusion), with the lineage alongside them.
@@ -289,8 +297,12 @@ class ParkedAdvisory(unittest.TestCase):
     def test_not_a_review_resolution(self):
         reviews = self.metrics["humanReviews"]
         self.assertEqual(len(reviews), 1)
-        # Parked is not rejected and not approved — the gate is still waiting.
-        self.assertEqual(reviews[0]["outcome"], "unresolved")
+        # Parked is not rejected and not approved — the gate is still waiting, so
+        # the row is open with no measured wait (an open gate has no measured
+        # wait; it was never resolved).
+        self.assertEqual(reviews[0]["outcome"], "open")
+        self.assertIsNone(reviews[0]["waitMs"])
+        self.assertIsNone(reviews[0]["resolvedBy"])
 
 
 def reordered(detail):
@@ -420,11 +432,102 @@ class RealDossierFixtures(unittest.TestCase):
         tasks = {t["ticketId"]: t["reworkCount"] for t in m["agentTasks"]}
         self.assertEqual({t: n for t, n in tasks.items() if n}, {"TEAM-3790": 2, "TEAM-3799": 2})
 
+    def test_ymo7dm(self):
+        """TEAM-4167 D3 — an honest, twin-doubled run. FR-3.3 (the opening phase
+        is derived so phases sum to the whole run), FR-3.4 (content-dedupe), and
+        FR-3.5 (every gate resolves through the ticket's own done stamp — there
+        are no review.resolved events on this run — and nothing is "unresolved")."""
+        d = self.load("ymo7dm")
+        raw = d["events"]
+        # The reducer kept the EventBridge twins verbatim (see _provenance): 109
+        # rows, 47 of them the with-source copy, so 62 distinct events survive.
+        self.assertEqual(len(raw), 109)
+        self.assertEqual(sum(1 for e in raw if e.get("source")), 47)
+
+        m = compute_metrics(d)
+        # 62 is the exact content-key count (the AC rounds to "≈55"); the point is
+        # only that dedupe collapses the twins, so it is strictly below raw.
+        self.assertEqual(m["counts"]["events"], 62)
+        self.assertLess(m["counts"]["events"], len(raw))
+
+        self.assertEqual(m["totalDurationMs"], 4600180)
+        self.assertEqual(m["humanWaitTotalMs"], 353371)
+        # No gate is "unresolved" any more — the run-end fallback is gone.
+        self.assertNotIn("unresolved", [r["outcome"] for r in m["humanReviews"]])
+        # Three gates, each approved on its first cycle through the ticket's own
+        # done stamp (no review.resolved events on this run).
+        gates = {r["gateTicketId"]: r for r in m["humanReviews"]}
+        self.assertEqual(
+            sorted((r["gateTicketId"], r["outcome"], r["cycle"], r["waitMs"], r["resolvedBy"])
+                   for r in m["humanReviews"]),
+            [("TEAM-4139", "approved", 1, 182137, "ticket"),
+             ("TEAM-4148", "approved", 1, 97193, "ticket"),
+             ("TEAM-4150", "approved", 1, 74041, "ticket")],
+        )
+        self.assertEqual(182137 + 97193 + 74041, m["humanWaitTotalMs"])
+
+        # FR-3.3: the derived opening row makes phases[] sum to the whole run.
+        phases = m["phases"]
+        self.assertEqual(phases[0]["derived"], "run-start")
+        # Labelled from the first agent.invoked before the first phase_change —
+        # requirements ran before the run logged "development".
+        self.assertEqual(phases[0]["phase"], "requirements")
+        self.assertIsNone(phases[1]["derived"])
+        phase_sum = sum(p["durationMs"] or 0 for p in phases)
+        self.assertLessEqual(abs(phase_sum - m["totalDurationMs"]), m["totalDurationMs"] // 100)
+        self.assertEqual(phase_sum, m["totalDurationMs"])  # exact here
+
+    def test_f50ucz(self):
+        """TEAM-4167 D3 FR-3.5 — fix-ticket lineage from the two honest sources a
+        run without stamped spawnedBy has: a ```fix-contract block, and the finder
+        that was still in flight when the fix was filed. All six origins resolve."""
+        d = self.load("f50ucz")
+        m = compute_metrics(d)
+        entries = {e["ticketId"]: e for e in m["fixTickets"]["entries"]}
+
+        # (kind, originTicketId, round) exactly as designed.
+        self.assertEqual(
+            {t: (e["kind"], e["originTicketId"], e["round"]) for t, e in entries.items()},
+            {
+                # The three "Fix (review)" tickets were filed WHILE the code
+                # reviewer TEAM-4123 was still running (it completed a minute
+                # later): finder-in-flight, round 1 from its single dispatch.
+                "TEAM-4129": ("codex_fix", "TEAM-4123", 1),
+                "TEAM-4130": ("codex_fix", "TEAM-4123", 1),
+                "TEAM-4131": ("codex_fix", "TEAM-4123", 1),
+                # The ship-review fixes carry a ```fix-contract block naming their
+                # origin and round outright.
+                "TEAM-4155": ("ship_fix", "TEAM-4126", 1),
+                "TEAM-4156": ("ship_fix", "TEAM-4126", 1),
+                "TEAM-4157": ("ci_fix", "TEAM-4125", 1),
+            },
+        )
+        # 6/6 origins resolved — the whole point of the two new rules.
+        self.assertTrue(all(e["originTicketId"] for e in entries.values()))
+        self.assertEqual(sum(1 for e in entries.values() if e["originTicketId"]), 6)
+
+        # The audit strings say HOW each was derived.
+        self.assertEqual(
+            {t: e["originSource"] for t, e in entries.items()},
+            {"TEAM-4129": "finder-in-flight", "TEAM-4130": "finder-in-flight",
+             "TEAM-4131": "finder-in-flight", "TEAM-4155": "block",
+             "TEAM-4156": "block", "TEAM-4157": "block"},
+        )
+        self.assertEqual(
+            {t: e["roundSource"] for t, e in entries.items()},
+            {"TEAM-4129": "dispatch-count", "TEAM-4130": "dispatch-count",
+             "TEAM-4131": "dispatch-count", "TEAM-4155": "block",
+             "TEAM-4156": "block", "TEAM-4157": "block"},
+        )
+        # FR-3.3 holds on this run too: derived opening row, phases sum to whole.
+        self.assertEqual(m["phases"][0]["derived"], "run-start")
+        self.assertEqual(sum(p["durationMs"] or 0 for p in m["phases"]), m["totalDurationMs"])
+
     def test_idempotent(self):
         """Deduping an already-deduped dossier changes nothing — pull_dossier now
         collapses at collection time, so compute_metrics usually sees clean
         input, and must give the same answer either way."""
-        for name in ("yteqfl", "sffzti"):
+        for name in ("yteqfl", "sffzti", "ymo7dm", "f50ucz"):
             with self.subTest(name):
                 d = self.load(name)
                 once = compute_metrics(d)
@@ -943,6 +1046,165 @@ class OutsideHours(unittest.TestCase):
         # The 7-hour wait RealDossierFixtures pins is unchanged — this only
         # explains it, it does not restate it.
         self.assertEqual(review["waitMs"], 25255120)
+
+
+class ParseFixContractBlock(unittest.TestCase):
+    """TEAM-4167 D3 — the ```fix-contract fenced block parser, mirroring
+    lambda/orchestrator/fix-contract.mjs field names."""
+
+    def test_parses_a_fenced_block(self):
+        desc = (
+            "Ship review round 1 on PR #395.\n\n"
+            "```fix-contract\n"
+            "version: 1\n"
+            "kind: ship_fix\n"
+            "origin: TEAM-4126\n"
+            "round: 2\n"
+            'invariant: "the PR is mergeable"\n'
+            "evidence_source: static\n"
+            "cited_location:\n"
+            "  - lambda/orchestrator/deploy.sh:59\n"
+            "  - lambda/orchestrator/index.mjs:57\n"
+            'sibling_scope: "vitest.config.ts"\n'
+            "```\n"
+        )
+        b = parse_fix_contract_block(desc)
+        self.assertEqual(b["kind"], "ship_fix")
+        self.assertEqual(b["origin"], "TEAM-4126")
+        self.assertEqual(b["round"], 2)
+        self.assertEqual(b["invariant"], "the PR is mergeable")  # quotes stripped
+        self.assertEqual(b["evidenceSource"], "static")
+        self.assertEqual(b["citedLocation"],
+                         ["lambda/orchestrator/deploy.sh:59", "lambda/orchestrator/index.mjs:57"])
+        self.assertEqual(b["siblingScope"], "vitest.config.ts")
+
+    def test_prose_header_is_not_a_block(self):
+        # The "== D3 fix contract ==" form some tickets carry is a human summary,
+        # not the machine contract — it must NOT parse (so those tickets fall
+        # through to the finder-in-flight rule).
+        desc = ("Review TEAM-4123.\n\n== D3 fix contract ==\n"
+                "invariant: a thing holds\norigin: TEAM-9\n")
+        self.assertIsNone(parse_fix_contract_block(desc))
+
+    def test_no_block_returns_none(self):
+        self.assertIsNone(parse_fix_contract_block("just a plain description"))
+        self.assertIsNone(parse_fix_contract_block(None))
+
+    def test_a_non_integer_round_is_none(self):
+        b = parse_fix_contract_block("```fix-contract\nkind: ci_fix\nround: n/a\n```")
+        self.assertEqual(b["kind"], "ci_fix")
+        self.assertIsNone(b["round"])
+
+    def test_two_copies_scan_to_the_first_bare_close_last_wins(self):
+        # A truncated preview then the full copy, as the scrubbed dossiers store
+        # it: a second ```fix-contract line is content, only a bare ``` closes.
+        desc = ("```fix-contract\nkind: ship_fix\norigin: TEAM-1\nround: 1\n"
+                "…\n```fix-contract\nkind: ship_fix\norigin: TEAM-1\nround: 1\n```")
+        b = parse_fix_contract_block(desc)
+        self.assertEqual((b["kind"], b["origin"], b["round"]), ("ship_fix", "TEAM-1", 1))
+
+
+class HonestHumanReviews(unittest.TestCase):
+    """TEAM-4167 D3 FR-3.5 — review.resolved is the honest signal, and an open
+    gate has no measured wait."""
+
+    def test_review_resolved_beats_the_ticket_done_stamp(self):
+        m = compute_metrics(dossier(
+            tickets=[ticket("GATE-1", "human:alice", "done", title="Gate", updatedAt=ts(200))],
+            events=[
+                ev(10, "review.needed", {"ticketId": "GATE-1", "reviewer": "human:alice",
+                                         "workflowId": "wf-1"}),
+                ev(30, "review.resolved", {"ticketId": "GATE-1", "outcome": "approved_with_advisory",
+                                           "resolvedAt": ts(30), "workflowId": "wf-1"}),
+            ],
+        ))
+        r = m["humanReviews"][0]
+        self.assertEqual(r["resolvedBy"], "review.resolved")
+        self.assertEqual(r["outcome"], "approved_with_advisory")  # the human's verbatim outcome
+        self.assertEqual(r["resolvedAt"], iso_of(ts(30)))
+        # 10 → 30, NOT 10 → 200: the event, not the ticket's much later updatedAt.
+        self.assertEqual(r["waitMs"], 20 * 60 * 1000)
+
+    def test_open_gate_has_no_measured_wait(self):
+        m = compute_metrics(dossier(
+            workflow={"startedAt": T0, "cancelledAt": ts(60), "humanNotifications": []},
+            tickets=[ticket("GATE-1", "human:bob", "in_review", title="Gate")],
+            events=[ev(10, "review.needed", {"ticketId": "GATE-1", "reviewer": "human:bob",
+                                             "workflowId": "wf-1"})],
+        ))
+        r = m["humanReviews"][0]
+        self.assertEqual(r["outcome"], "open")
+        self.assertIsNone(r["waitMs"])
+        self.assertIsNone(r["resolvedAt"])
+        self.assertIsNone(r["resolvedBy"])
+        self.assertEqual(m["humanWaitTotalMs"], 0)  # excluded from the total
+
+
+class FixLineageSynthetic(unittest.TestCase):
+    """TEAM-4167 D3 FR-3.5 — the two new origin/round rules on small cases."""
+
+    def test_finder_in_flight_and_dispatch_count_round(self):
+        tickets = [
+            ticket("REV-1", "agentcore_hub_code_reviewer", "in_progress",
+                   title="Review of the integration branch"),
+            ticket("FIX-1", "codex_agent", "in_progress",
+                   title="Fix (review): foo.ts — the leak is back", createdAt=ts(50)),
+        ]
+        events = [
+            ev(10, "agent.invoked", {"ticketId": "REV-1", "agentId": "agentcore_hub_code_reviewer",
+                                     "phase": "review", "workflowId": "wf-1"}),
+            # Re-dispatched — a second review pass, still no completion.
+            ev(40, "agent.invoked", {"ticketId": "REV-1", "agentId": "agentcore_hub_code_reviewer",
+                                     "phase": "review", "workflowId": "wf-1"}),
+        ]
+        e = {x["ticketId"]: x
+             for x in compute_fix_tickets(tickets, events, "EPIC-1")["entries"]}["FIX-1"]
+        self.assertEqual(e["kind"], "codex_fix")
+        self.assertEqual(e["originTicketId"], "REV-1")
+        self.assertEqual(e["originSource"], "finder-in-flight")
+        # The reviewer was dispatched twice before the fix was filed → round 2.
+        self.assertEqual(e["round"], 2)
+        self.assertEqual(e["roundSource"], "dispatch-count")
+
+    def test_a_completed_finder_beats_a_later_in_flight_dispatch(self):
+        """finder-in-flight is the fallback for when NOTHING completed. A finder
+        that completed before the fix is the finding of record even if a later
+        re-verify pass is still running — this is what keeps a resurfacing fix
+        from being misread as fix-induced (the real yteqfl TEAM-4105 case)."""
+        tickets = [
+            ticket("QA-1", "agentcore_hub_qa_verifier", "done",
+                   title="QA: verify the probe"),
+            ticket("QA-2", "agentcore_hub_qa_verifier", "in_progress",
+                   title="QA: re-verify after fixes", createdAt=ts(30), blockedBy=["FIX-2"]),
+            ticket("FIX-2", "qa_agent", "in_progress",
+                   title="Fix (QA): bar.ts — still leaks", createdAt=ts(50)),
+        ]
+        events = [
+            ev(5, "agent.invoked", {"ticketId": "QA-1", "agentId": "agentcore_hub_qa_verifier",
+                                    "workflowId": "wf-1"}),
+            ev(20, "agent.complete", {"ticketId": "QA-1", "agentId": "agentcore_hub_qa_verifier",
+                                      "workflowId": "wf-1"}),
+            # QA-2 is a re-verify still running when FIX-2 is filed — must NOT win.
+            ev(40, "agent.invoked", {"ticketId": "QA-2", "agentId": "agentcore_hub_qa_verifier",
+                                     "workflowId": "wf-1"}),
+        ]
+        e = {x["ticketId"]: x
+             for x in compute_fix_tickets(tickets, events, "EPIC-1")["entries"]}["FIX-2"]
+        self.assertEqual(e["originTicketId"], "QA-1")  # the COMPLETED finder, not QA-2
+        self.assertEqual(e["originSource"], "finder")
+
+    def test_block_kind_beats_the_title_when_nothing_is_stamped(self):
+        # Title says "review" (→ codex_fix), block says ci_fix — with no
+        # spawnedBy, the block's own kind is closer to the agent's intent.
+        desc = "```fix-contract\nkind: ci_fix\norigin: BUILD-9\nround: 1\n```"
+        tickets = [ticket("FIX-3", "ci_agent", "in_progress",
+                          title="Fix (review): red build", createdAt=ts(50), description=desc)]
+        e = {x["ticketId"]: x
+             for x in compute_fix_tickets(tickets, [], "EPIC-1")["entries"]}["FIX-3"]
+        self.assertEqual(e["kind"], "ci_fix")
+        self.assertEqual(e["originTicketId"], "BUILD-9")
+        self.assertEqual(e["originSource"], "block")
+        self.assertEqual(e["tag"], "environmental")  # ci_fix is environmental
 
 
 if __name__ == "__main__":
