@@ -691,13 +691,53 @@ describe("shadow — one read, one event, zero writes", () => {
   });
 });
 
-// ─── 4. off (unset) ──────────────────────────────────────────────────────────
+// ─── 4. off, and the plain install (TEAM-4188) ───────────────────────────────
 
-describe("unset — byte-identical to pre-4122", () => {
+/**
+ * TEAM-4188 (TEAM-4169 D1 FR-1.6). This describe used to assert that an UNSET
+ * SYNC_MAIN_BEFORE_CI was byte-identical to pre-4122 — which was true, and was
+ * the defect: every install that never exported the var ran with the pre-CI sync
+ * OFF while the blueprints told the CI agent the orchestrator had already merged
+ * main for it. The default is now enforce, so the same setup (var DELETED, main
+ * moved, the merge 409s) has to produce the enforce outcome. This is the
+ * behavioural half of the FR-1.6 assertion — `load(undefined)` re-imports the
+ * real index.mjs after resetModules, so the real guard at the real dispatch site
+ * executes; the surface/source half lives in sync-main-effective-flag.test.mjs.
+ */
+describe("unset — the plain install now ENFORCES (TEAM-4188 / FR-1.6)", () => {
+  it("no env var set: main is merged in and the 409 files the sync_fix ticket", async () => {
+    mainMoved();
+    compareRoutes(
+      ["src/lib/workflow/intake.ts", "src/components/WorkflowBoard.tsx", "README.md"],
+      ["src/lib/workflow/intake.ts", "src/components/WorkflowBoard.tsx", "docs/MODULES.md"],
+    );
+    h.state.ghRoutes[`POST ${MERGES}`] = { status: 409, body: { message: "Merge conflict" } };
+    await load(undefined);
+    await handler(readyWebhook());
+
+    // The merge WAS attempted — nobody opted in, and the guarantee is on.
+    expect(ghKeys()).toContain(`POST ${MERGES}`);
+
+    // …and the conflict is ticketed exactly as an explicit enforce would.
+    const created = createTicketCalls();
+    expect(created).toHaveLength(1);
+    expect(created[0].parameters.spawned_by).toEqual({ kind: "sync_fix", ciTicketId: CI });
+    expect(blockerLinks()).toHaveLength(1);
+    expect(eventsOf("workflow.sync_conflict")).toHaveLength(1);
+    expect(h.state.syncMains[0].sm).toMatchObject({ status: "conflict", fixTicketId: FIX });
+
+    // THE point: no CI run against a head that provably cannot merge.
+    expect(agentInvokes()).toHaveLength(0);
+  });
+});
+
+describe("explicit off — byte-identical to pre-4122", () => {
   it("not one GitHub call, and CI dispatches exactly once", async () => {
     mainMoved();
     h.state.ghRoutes[`POST ${MERGES}`] = { status: 409, body: { message: "Merge conflict" } };
-    await load(undefined);
+    // TEAM-4188: the rollback path keeps its byte-identical guarantee, now pinned
+    // to the EXPLICIT value rather than to the absence of one.
+    await load("off");
     await handler(readyWebhook());
 
     expect(h.state.githubCalls).toHaveLength(0);

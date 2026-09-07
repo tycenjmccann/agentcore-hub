@@ -47,7 +47,8 @@ Globals:
         # there); rides Globals for the same one-place-to-set parity.
         CI_CHECK_MODE: !Ref CiCheckMode
         # Orchestrator-only (both ready paths dispatch the CI agent); rides
-        # Globals for the same one-place-to-set parity.
+        # Globals for the same one-place-to-set parity. AgentInvoker and
+        # EventsWriter receive it too — neither reads it, so it is inert there.
         SYNC_MAIN_BEFORE_CI: !Ref SyncMainBeforeCi
         # Orchestrator-only (the completion gates + buildAgentContext + the
         # feature-branch adoption all live there); rides Globals for the same
@@ -256,7 +257,7 @@ Parameters:
 
   SyncMainBeforeCi:
     Type: String
-    Default: "off"
+    Default: "enforce"
     AllowedValues: ["off", "shadow", "enforce"]
     Description: >
       Pre-CI default-branch sync (TEAM-4122 FR-6). Three dev agents push to one
@@ -279,9 +280,15 @@ Parameters:
       repo, 404/422/5xx, network — fails OPEN and CI proceeds against the un-synced
       head, because a sync we could not do must never wedge CI. Same asymmetry as
       CiCheckMode: a PRESENT-but-garbage value coalesces to OFF, not shadow,
-      because enforce PUSHES A COMMIT to a shared branch. Default "off" matches the
-      code's unset default and deploy.sh only forwards the var when explicitly set.
-      Instant rollback = set off.
+      because enforce PUSHES A COMMIT to a shared branch — that fail-safe is
+      unchanged, which is exactly why the UNSET default is resolved separately
+      from the allow-list (resolveSyncModeFromEnv, not normalizeSyncMode).
+      Default is now "enforce" (TEAM-4188, from TEAM-4169 D1 FR-1.6): the flag is
+      the only thing that decides whether a run syncs, so an install that never
+      sets it must get the guarantee, not silently lose it. deploy.sh forwards the
+      var unconditionally with the same "enforce" default, so all three surfaces
+      agree. With no GITHUB_PAT this is still a silent no-op. Instant rollback =
+      set off EXPLICITLY — an empty value counts as unset and re-arms enforce.
 
   AdvisoryRouting:
     Type: String

@@ -58,7 +58,7 @@ import { validateEffectiveDef, validateDefForCreation } from "./workflow-def-val
 import { buildReviewResolved } from "./review-resolved.mjs";
 import { ensureRepoCheck, formatRepoCheckWarning } from "./repo-check.mjs";
 import { ensureCiCheck, formatCiCheckBlock, prefixCiWarning, normalizeCiCheckMode } from "./ci-check.mjs";
-import { syncBeforeCi, normalizeSyncMode } from "./sync-main.mjs";
+import { syncBeforeCi, resolveSyncModeFromEnv } from "./sync-main.mjs";
 import { eventIdFor, normalizeEventDedupeMode } from "./event-id.mjs";
 import { GATE_STATES, classifyRejection, normalizeGateGuardMode } from "./gate-state.mjs";
 import { createDeadSessionEscalation, normalizeEscalationMode } from "./dead-session-escalation.mjs";
@@ -275,9 +275,10 @@ const CI_CHECK_MODE = normalizeCiCheckMode(process.env.CI_CHECK_MODE);
 // merge the default branch into the feature branch right before the CI agent is
 // dispatched, and on a 409 file a `Fix (sync-main)` sync_fix ticket that blocks
 // the CI ticket. off = byte-identical: no GitHub call, no event, no write.
-// STRICT allow-list (garbage → off) because enforce PUSHES A COMMIT to a shared
-// branch. Instant rollback = set off.
-const SYNC_MAIN_BEFORE_CI = normalizeSyncMode(process.env.SYNC_MAIN_BEFORE_CI);
+// STRICT allow-list for a PRESENT value (garbage → off) because enforce PUSHES A
+// COMMIT to a shared branch; UNSET/empty → enforce (TEAM-4188). Instant rollback
+// = set off explicitly.
+const SYNC_MAIN_BEFORE_CI = resolveSyncModeFromEnv();
 
 // Advisory-ticket routing (TEAM-4122 FR-7): off | enforce, default off. An
 // "advisory" ticket is out-of-scope-but-worth-doing work the reviewers file as
