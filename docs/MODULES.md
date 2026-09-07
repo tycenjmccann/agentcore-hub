@@ -109,6 +109,39 @@ The single prose→verdict ladder they all read lives in the zero-import
   GitHub call, since the PR does not exist yet at this gate and the gate must
   stay replayable offline.
 
+**Sweep detection flag (TEAM-4247 D2, `lambda/orchestrator/`)** — same
+`off | shadow | enforce` convention as the three above (unset → `shadow`,
+unrecognized → `off`), normalized by the same `normalizeVerdictMode`.
+- `SWEEP_DETECTION_PHASE` — a `dead-code-sweep` run whose **detection** ticket
+  completes with `verified_removable: 0` (a strict integer 0; absent is not a
+  zero yield) has no work left to do. `enforce` closes the run as the terminal
+  outcome `nothing-to-remove` — labels the PR `sweep:no-op` if one exists,
+  publishes `workflow.nothing_to_remove`, and **skips the cascade for that
+  ticket** so no reviewer / QA / CI / release manager is ever dispatched against
+  a branch that does not exist (the `agent.complete` publish still happens first,
+  so the stream reads ticket-done → run-closed). `shadow` publishes
+  `sweep.detection_observed` and behaves exactly as today.
+- The sweep def's `completionRequiresAgentPhases` lists `"detection"`, but
+  `stripUnenforcedDetectionPhase` (`lambda/orchestrator/index.mjs`) removes it
+  from the **effective** def unless this flag is `enforce` — the same
+  flag/context-conditional pattern as `cd-registry.mjs`'s `stripShipPhases`.
+  Without the strip, every sweep run would hang the moment the config synced,
+  because nothing else requires the detection ticket to exist yet. The def's
+  `phases[]` is **never** stripped: the analyst must still plan and stamp the
+  detection ticket under `shadow`, or `shadow` observes nothing.
+- **Deploy order matters, because config and code ship separately.** The
+  detection phase only exists for the Lambdas once
+  `s3://$ARTIFACT_BUCKET/config/workflows.json` carries it (read on cold start,
+  no redeploy). The CD deploy stage
+  (`deploy/pipeline/buildspec-deploy.yml`) and `deploy/runtime-agent/deploy-topology.sh`
+  both do this copy; deploying by hand it is DEPLOY.md step 2:
+  `aws s3 cp src/config/workflows.json "s3://$ARTIFACT_BUCKET/config/workflows.json"`
+  (`ARTIFACT_BUCKET` from `deploy/config.sh` — never hardcoded). Order: ship the
+  orchestrator code → sync `workflows.json` → only then set
+  `SWEEP_DETECTION_PHASE=enforce`. Flipping the flag first makes `enforce`
+  unreachable (no detection phase, so the gate never matches); syncing the config
+  first is harmless (the strip keeps the phase non-required).
+
 **New events (TEAM-4246 D1)**
 - `orchestrator.verdict_observed { workflowId, verdict, verdictSource, wouldSuppress, spawnedTickets, testedHead }` — `VERDICT_GATE=shadow`, every gate completion
 - `orchestrator.verdict_suppressed { workflowId, verdict, unblocked, blockers, spawnedTickets }` — `VERDICT_GATE=enforce`, a non-PASS gate held its successor

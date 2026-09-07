@@ -35,6 +35,15 @@ export interface WorkflowDefPhase {
    * order is derived solely from `agentPhase`, so these never affect it.
    */
   extraAgentPhases?: string[];
+  /**
+   * The ONE agent that serves this phase, for a phase no roster agent claims via
+   * its own `phase` field (TEAM-4247: the sweep's "detection" phase, served by
+   * `agentcore_hub_code_sweeper`, whose roster phase is "development"). Read by
+   * the orchestrator's intake context — which asks the analyst to stamp that
+   * ticket `phase: "<agentPhase>"` — and by the zero-yield sweep gate's fallback
+   * when the stamp is missing. Absent on every other def's phases.
+   */
+  agentId?: string;
 }
 
 /**

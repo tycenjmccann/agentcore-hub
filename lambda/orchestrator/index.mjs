@@ -321,6 +321,12 @@ const VERIFIED_HEAD_COMPLETION = normalizeVerdictMode(process.env.VERIFIED_HEAD_
 //   shadow  = publish `sweep.detection_observed` with what WOULD have closed, and
 //             behave exactly as today (the blueprint choreography still runs).
 //   off     = the completion record is not even read.
+//
+// The same flag decides whether "detection" is a COMPLETION-REQUIRED phase: under
+// off/shadow `stripUnenforcedDetectionPhase` removes it from the effective def's
+// completionRequiresAgentPhases, so syncing src/config/workflows.json cannot wedge
+// a sweep whose intake never stamped a detection ticket. The def's `phases` array
+// is never stripped — the analyst must see the phase (and stamp it) in shadow too.
 const SWEEP_DETECTION_PHASE = normalizeVerdictMode(process.env.SWEEP_DETECTION_PHASE);
 
 /**
@@ -449,7 +455,35 @@ export async function loadCdRegistry({ force = false } = {}) {
 function getEffectiveWorkflowDef(workflow) {
   const base = getWorkflowDef(workflow?.workflowDefId);
   const framed = applyFramework(base, frameworkOfWorkflow(base, workflow));
-  return effectiveWorkflowDef(framed, _cdRegistry, workflow?.repoConfig, SHIP_PHASES);
+  return stripUnenforcedDetectionPhase(
+    effectiveWorkflowDef(framed, _cdRegistry, workflow?.repoConfig, SHIP_PHASES)
+  );
+}
+
+/**
+ * TEAM-4247 D2 — "detection" is REQUIRED for completion only under
+ * `SWEEP_DETECTION_PHASE=enforce`. Same shape as cd-registry's stripShipPhases:
+ * one narrowing of the effective def, applied where every consumer already reads.
+ *
+ * Why it has to be conditional: `src/config/workflows.json` reaches the Lambdas by
+ * a manual `aws s3 cp`, on its own schedule, and no roster agent claims
+ * `phase: "detection"`. The moment that config lands, `isWorkflowComplete`'s
+ * `required.every(...)` would demand a done detection ticket on runs whose intake
+ * never created one — wedging every in-flight sweep until the dead-session
+ * detector escalated it. Requiring the phase only under enforce means the config
+ * can be synced at any time, and the phase becomes load-bearing exactly when the
+ * flag that also acts on it is armed.
+ *
+ * The `phases` array is NEVER stripped: the analyst has to see the detection phase
+ * (and stamp its ticket) under shadow too, or shadow observes nothing. Only the
+ * completion REQUIREMENT is flag-gated. Returns the def unchanged when there is
+ * nothing to strip, so identity checks elsewhere keep working.
+ */
+export function stripUnenforcedDetectionPhase(def) {
+  if (SWEEP_DETECTION_PHASE === "enforce") return def;
+  const required = def?.completionRequiresAgentPhases;
+  if (!Array.isArray(required) || !required.includes(DETECTION_PHASE)) return def;
+  return { ...def, completionRequiresAgentPhases: required.filter((p) => p !== DETECTION_PHASE) };
 }
 
 function getDelivery(workflow) {
@@ -5397,6 +5431,26 @@ export async function buildAgentContext(ticket, workflow) {
       .map(a => `  - "${a.agentId}" (${a.phase})`)
       .join("\n");
     context += `## Available Agents\n${roster}\n\n`;
+
+    // TEAM-4247 D2 — phases a NAMED agent serves, which no roster phase covers.
+    // The roster block above is the only place the analyst learns who exists, and
+    // it prints each agent's ROSTER phase — so a def phase like the sweep's
+    // "detection" (served by the sweeper, whose roster phase is "development") is
+    // invisible there, and the ticket that reports the run's yield would be
+    // indistinguishable from the removal ticket. Naming the phase, its agent and
+    // the required stamp is the whole instruction: the stamp is what
+    // completion.mjs's phaseOf() trusts first and what the zero-yield close reads.
+    const namedPhases = (wfDef.phases || []).filter((p) => p.agentId && p.agentPhase);
+    if (namedPhases.length > 0) {
+      const lines = namedPhases.map(
+        (p) =>
+          `  - phase "${p.agentPhase}" ("${p.name || p.id}") → ONE ticket assigned to "${p.agentId}", created with phase="${p.agentPhase}" on Tickets___create_ticket.`
+      );
+      context += `## Phase-Stamped Tickets (REQUIRED)\n${lines.join("\n")}\n` +
+        `These come FIRST in their agent's chain and every later ticket for that agent is blocked_by them. ` +
+        `They are an EXPECTED extra ticket for that assignee, so your Step 4c "exactly ONE ticket per planned assignee" check does not flag them. ` +
+        `The phase= stamp is REQUIRED: the orchestrator reads that ticket's completion to decide whether the rest of the run has any work to do.\n\n`;
+    }
 
     // Human-review gates active for this run. The intake agent must insert one
     // review ticket per gate (assignee "human:<who>"), blocked by all the agent

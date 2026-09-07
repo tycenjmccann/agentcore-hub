@@ -1857,7 +1857,9 @@ def WorkflowOutput___report_completion(ticket_id: str, summary: str, artifacts: 
             know which one you actually tested. Completion is refused when the
             reviewed, CI-certified and shipped heads disagree.
         verified_removable: code sweeper only — how many candidates you VERIFIED
-            as dead and actually removed, as a plain integer ("0", "17"). Pass
+            as dead, as a plain integer ("0", "17"): on a "detection"-phase ticket
+            that is how many are removable, on a removal ticket how many you
+            actually removed. Pass
             "0" when the sweep found nothing removable: that is what ends the
             run. The orchestrator closes a zero-yield sweep as "nothing-to-remove"
             (no branch, no PR, no review, no QA, no merge gate), so do NOT skip

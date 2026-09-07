@@ -223,12 +223,14 @@ function board() {
 let handleTicketDoneUnified;
 let handleTicketDone;
 let handler;
+let stripUnenforcedDetectionPhase;
 
 async function load(mode) {
   if (mode === undefined) delete process.env.SWEEP_DETECTION_PHASE;
   else process.env.SWEEP_DETECTION_PHASE = mode;
   vi.resetModules();
-  ({ handleTicketDoneUnified, handleTicketDone, handler } = await import("./index.mjs"));
+  ({ handleTicketDoneUnified, handleTicketDone, handler, stripUnenforcedDetectionPhase } =
+    await import("./index.mjs"));
   // Warm the module exactly as production does. The roster, the workflow defs and
   // the CD registry are loaded by `handler`, not by the twins, and both halves
   // matter here: without the defs, getEffectiveWorkflowDef falls back to
@@ -494,5 +496,78 @@ describe("SWEEP_DETECTION_PHASE=off — byte-identical to pre-4247", () => {
     // The harvest's own read is memoized and shared, so the gate adds no S3 GET.
     // Off must not add one either: exactly one read of this record on the path.
     expect(h.state.s3Gets.filter((k) => k === `completions/${DETECT}.json`)).toHaveLength(1);
+  });
+});
+
+/**
+ * TEAM-4247 D2, commit 4 — the required-phase strip.
+ *
+ * `src/config/workflows.json` now declares "detection" in the sweep def's
+ * `completionRequiresAgentPhases`, and it reaches the Lambdas by a MANUAL
+ * `aws s3 cp` on its own schedule. No roster agent claims `phase: "detection"`,
+ * so the moment that config landed, `isWorkflowComplete`'s `required.every(...)`
+ * would demand a done detection ticket on every in-flight sweep — including the
+ * ones whose intake ran before the phase existed — and wedge them until the
+ * dead-session detector escalated.
+ *
+ * So the REQUIREMENT is flag-gated and the PHASE LIST is not: under off/shadow the
+ * def the orchestrator follows has no detection requirement, but it still has the
+ * detection phase, because the analyst has to see it (and stamp its ticket) in
+ * shadow or shadow observes nothing.
+ */
+describe("the detection required-phase strip (config can be synced at any time)", () => {
+  /** The def as a run FOLLOWS it, for the mode currently loaded. */
+  const effective = () => stripUnenforcedDetectionPhase(sweepDefWithDetection());
+
+  it("strips the REQUIREMENT under shadow, keeping every other phase in order", async () => {
+    await load("shadow");
+    expect(effective().completionRequiresAgentPhases).toEqual([
+      "development",
+      "verification",
+      "review",
+      "ship",
+    ]);
+  });
+
+  it("strips the REQUIREMENT under off", async () => {
+    await load("off");
+    expect(effective().completionRequiresAgentPhases).not.toContain("detection");
+  });
+
+  it("KEEPS the requirement under enforce — the gate and the requirement arm together", async () => {
+    await load("enforce");
+    expect(effective().completionRequiresAgentPhases).toEqual([
+      "detection",
+      "development",
+      "verification",
+      "review",
+      "ship",
+    ]);
+  });
+
+  it("NEVER strips the phase itself, in any mode", async () => {
+    for (const mode of ["off", "shadow", "enforce"]) {
+      await load(mode);
+      const def = effective();
+      expect(def.phases.map((p) => p.agentPhase)).toContain("detection");
+      // And the phase still names its agent, which is what the intake context
+      // renders and what the zero-yield gate's fallback matches on.
+      const detection = def.phases.find((p) => p.agentPhase === "detection");
+      expect(detection).toMatchObject({ agentPhase: "detection", agentId: SWEEPER });
+    }
+  });
+
+  it("does not mutate the def it is given (the defs cache is shared)", async () => {
+    await load("shadow");
+    const input = sweepDefWithDetection();
+    const before = JSON.stringify(input);
+    stripUnenforcedDetectionPhase(input);
+    expect(JSON.stringify(input)).toBe(before);
+  });
+
+  it("leaves a def with no detection requirement untouched, by identity", async () => {
+    await load("shadow");
+    const other = { id: "software-delivery", completionRequiresAgentPhases: ["development"] };
+    expect(stripUnenforcedDetectionPhase(other)).toBe(other);
   });
 });

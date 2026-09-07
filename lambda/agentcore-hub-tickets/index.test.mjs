@@ -1,4 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import agentsConfig from "../../src/config/agents.json";
+import workflowsConfig from "../../src/config/workflows.json";
 
 /**
  * TEAM-3619 D4c — create_ticket's spawnedBy/phase pass-through.
@@ -224,6 +226,58 @@ describe("create_ticket — fix-ticket phase allowlist (TEAM-3686 F2)", () => {
       expect(res.content[0].text).toMatch(/^Error:/);
       expect(res.content[0].text).toContain("development, generation, scheduling");
       expect(h.state.puts.length).toBe(0);
+    });
+  });
+
+  /**
+   * TEAM-4247 D2 — "detection" is a legal ticket phase because the REPO's own
+   * config says so, with no code change here: the loader unions every def's
+   * `phases[].agentPhase` and `completionRequiresAgentPhases`. Fed the real files
+   * rather than a synthetic def, so the day someone renames or drops the sweep's
+   * detection phase this fails instead of the intake silently minting a phase the
+   * Lambda rejects.
+   */
+  describe("with the REPO's own config (TEAM-4247 D2)", () => {
+    beforeEach(async () => {
+      process.env.ARTIFACT_BUCKET = "test-bucket";
+      h.state.s3 = {
+        "config/agents.json": agentsConfig,
+        "config/workflows.json": workflowsConfig,
+      };
+      vi.resetModules();
+      ({ handler } = await import("./index.mjs"));
+    });
+
+    afterEach(() => {
+      delete process.env.ARTIFACT_BUCKET;
+    });
+
+    it('accepts phase="detection" — the sweep def puts it in the valid set', async () => {
+      await create({ ...BASE, ...FIX, phase: "detection" });
+      expect(h.state.puts.map((p) => p.phase)).toEqual(["detection"]);
+    });
+
+    it("the FALLBACK set does not contain it — the S3 sync is the enabling step", async () => {
+      // Deploy order, pinned: code first, then `aws s3 cp src/config/workflows.json
+      // s3://$ARTIFACT_BUCKET/config/workflows.json`, then the flag. Until that
+      // copy lands, a FIX ticket stamped "detection" is refused here.
+      delete process.env.ARTIFACT_BUCKET;
+      vi.resetModules();
+      ({ handler } = await import("./index.mjs"));
+      const res = await create({ ...BASE, ...FIX, phase: "detection" });
+      expect(res.content[0].text).toMatch(/^Error:/);
+      expect(h.state.puts.length).toBe(0);
+    });
+
+    it("a NON-fix detection ticket keeps its stamp (the reject is fix-only)", async () => {
+      // The intake's detection ticket is not a fix ticket, so it never reaches the
+      // hard reject — which is why the orchestrator can read the stamp on a run
+      // whose config sync has not happened yet.
+      delete process.env.ARTIFACT_BUCKET;
+      vi.resetModules();
+      ({ handler } = await import("./index.mjs"));
+      await create({ ...BASE, phase: "detection" });
+      expect(h.state.puts.map((p) => p.phase)).toEqual(["detection"]);
     });
   });
 });

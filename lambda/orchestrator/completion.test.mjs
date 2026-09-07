@@ -187,6 +187,65 @@ describe("isWorkflowComplete — legacy heuristic (no completionRequiresAgentPha
   });
 });
 
+/**
+ * TEAM-4247 D2 — the sweep def's "detection" phase, which is a DEF phase and not a
+ * ROSTER phase: no agent in agents.json claims it (the sweeper's roster phase is
+ * "development"), so the ONLY thing that can satisfy the requirement is the
+ * ticket's explicit `phase` stamp. That is why the intake context asks the analyst
+ * for `Tickets___create_ticket(phase="detection")`, and why the requirement itself
+ * is stripped from the effective def until SWEEP_DETECTION_PHASE=enforce
+ * (index.mjs stripUnenforcedDetectionPhase) — a synced config must not be able to
+ * wedge a sweep whose intake never stamped one.
+ */
+describe("isWorkflowComplete — the sweep's detection phase (TEAM-4247 D2)", () => {
+  // The dead-code-sweep def under enforce: detection is required, and it sits
+  // ahead of the removal phase the same agent serves.
+  const SWEEP_DEF = {
+    completionRequiresAgentPhases: ["detection", "development", "verification", "review", "ship"],
+    reviewGates: [{ afterPhase: "ship", blocking: true, condition: "always", onReject: "rework" }],
+  };
+  // The sweeper serves BOTH sweep phases, so its roster phase alone can never
+  // distinguish the two tickets — exactly the ambiguity the stamp resolves.
+  const sweepOpts = { getAgentPhase: (a) => (a === "sweeper" ? "development" : PHASE[a]) };
+  /** The removal + verify + ship chain, all done. Detection is the variable. */
+  const chain = (extra = []) => [
+    { ticketId: "S-2", assignee: "sweeper", status: "done" },
+    { ticketId: "T-2", assignee: "qa", status: "done" },
+    { ticketId: "T-3", assignee: "ci", status: "done" },
+    { ticketId: "T-4", assignee: "rm", status: "done" },
+    { ticketId: "G-1", assignee: "human:reviewer", phase: "ship", status: "done" },
+    ...extra,
+  ];
+
+  it("is NOT complete while the required detection phase has no done ticket", () => {
+    // Every other phase is done, and the sweeper's own removal ticket is done —
+    // its roster phase counts for "development" and cannot double as detection.
+    expect(isWorkflowComplete(chain(), SWEEP_DEF, sweepOpts)).toBe(false);
+  });
+
+  it("completes once the STAMPED detection ticket is done", () => {
+    const stamped = { ticketId: "S-1", assignee: "sweeper", phase: "detection", status: "done" };
+    expect(isWorkflowComplete(chain([stamped]), SWEEP_DEF, sweepOpts)).toBe(true);
+  });
+
+  it("an OPEN stamped detection ticket blocks completion", () => {
+    const open = { ticketId: "S-1", assignee: "sweeper", phase: "detection", status: "in_progress" };
+    expect(isWorkflowComplete(chain([open]), SWEEP_DEF, sweepOpts)).toBe(false);
+  });
+
+  it("the SAME children complete when the requirement is stripped (off/shadow)", () => {
+    // What stripUnenforcedDetectionPhase hands isWorkflowComplete under off and
+    // shadow: an unstamped run is completable exactly as it was pre-4247.
+    const stripped = {
+      ...SWEEP_DEF,
+      completionRequiresAgentPhases: SWEEP_DEF.completionRequiresAgentPhases.filter(
+        (p) => p !== "detection"
+      ),
+    };
+    expect(isWorkflowComplete(chain(), stripped, sweepOpts)).toBe(true);
+  });
+});
+
 describe("isWorkflowComplete — guards", () => {
   it("returns false for an empty child list", () => {
     expect(isWorkflowComplete([], DEF, opts)).toBe(false);

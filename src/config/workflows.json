@@ -263,6 +263,7 @@
       "featureBranchPhase": "development",
       "createsPullRequest": true,
       "completionRequiresAgentPhases": [
+        "detection",
         "development",
         "verification",
         "review",
@@ -274,6 +275,13 @@
           "name": "Intake",
           "type": "app",
           "agentPhase": "intake"
+        },
+        {
+          "id": "detection",
+          "name": "Detect",
+          "type": "agent",
+          "agentPhase": "detection",
+          "agentId": "agentcore_hub_code_sweeper"
         },
         {
           "id": "sweep",
