@@ -69,7 +69,7 @@ import { applyBlockerEdge, normalizePreserveStatuses } from "./ticket-blockers.m
 // a dynamic import would leave the new deploy.sh zip entry unenforced. The
 // module is pure (no clock, no AWS, no env beyond one normalizer), so importing it
 // with all three flags off costs a parse and nothing else.
-import { normalizeVerdictMode, GATE_PERSONAS, resolveVerdict, resolveTestedHead, enrichCompleteDetail, selectFixBeforeVerifyTargets } from "./verdict-contract.mjs";
+import { normalizeVerdictMode, GATE_PERSONAS, resolveVerdict, resolveTestedHead, enrichCompleteDetail, selectFixBeforeVerifyTargets, selectOpenEpicFixes } from "./verdict-contract.mjs";
 // TEAM-4121 FR-8: the fix-ticket contract lives in a zero-import module that is
 // byte-identical across the orchestrator + both ticket Lambdas (CI cmp's them).
 // The orchestrator only READS contracts — it maps a Jira issue's labels and
@@ -1033,7 +1033,7 @@ function resolveVerdictInfo({ ticketId, assignee, workflow, parentId, siblings }
   _verdictInfoCache.set(ticketId, p);
   return p;
 }
-const NO_VERDICT_INFO = { isGatePersona: false, verdict: null, verdictSource: null, spawnedTickets: [], testedHead: "" };
+const NO_VERDICT_INFO = { isGatePersona: false, verdict: null, verdictSource: null, spawnedTickets: [], testedHead: "", openEpicFixIds: [] };
 async function computeVerdictInfo({ ticketId, assignee, workflow, parentId, siblings }) {
   try {
     const agentId =
@@ -1055,6 +1055,15 @@ async function computeVerdictInfo({ ticketId, assignee, workflow, parentId, sibl
       // is what every gate persona has always reported.
       testedHead: resolveTestedHead(record) || resolveTestedHead(workflow?.agentTasks?.[ticketId]) || "",
       spawnedTickets: spawnedFixIdsFor(ticketId, children),
+      // FR-D1.5/D1.6 — every open fix under the epic, not just this persona's own.
+      // dowtdh's QA failed over the REVIEWER's still-open TEAM-4183 and filed nothing
+      // itself, so `spawnedTickets` alone would have re-verified an unfixed head.
+      openEpicFixIds: selectOpenEpicFixes({
+        siblings: children,
+        excludeTicketId: ticketId,
+        isFixKind: (kind) => FIX_KINDS.has(kind),
+        isAdvisory: isAdvisoryTicket,
+      }),
     };
   } catch (err) {
     console.warn(`[verdict] could not resolve ${ticketId}'s verdict (non-fatal): ${err?.message || err}`);

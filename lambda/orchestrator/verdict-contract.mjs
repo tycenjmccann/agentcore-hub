@@ -323,6 +323,51 @@ export function selectFixBeforeVerifyTargets({ fixId, siblings, isFixKind, isAdv
 }
 
 /**
+ * Every fix ticket still open under the epic (TEAM-4246 D1, FR-D1.5/D1.6) — what a
+ * non-PASS gate verdict must wait for, IN ADDITION to the fixes this persona filed
+ * itself.
+ *
+ * Why "regardless of who filed it": dowtdh's QA returned FAIL while the REVIEWER's
+ * TEAM-4183 was still in_progress, and QA had filed nothing of its own. Holding only
+ * on `spawnedTickets` there means the re-verify dispatches against the unfixed head,
+ * fails for the same reason, and burns a round — the exact loop the gate exists to
+ * stop. An open fix under the epic is an open statement that the code is wrong; no
+ * verifier's second look is worth anything until it lands.
+ *
+ * Injected predicates, same reason as selectFixBeforeVerifyTargets — this module
+ * imports nothing:
+ *   isFixKind(kind)  → FIX_KINDS (completion.mjs)
+ *   isAdvisory(t)    → isAdvisoryTicket (completion.mjs)
+ *
+ * FOUR exclusions, each one a way this could wedge a run instead of gating it:
+ *   1. the gate ticket itself (`excludeTicketId`) — a ticket may not block itself,
+ *      and a gate ticket CAN carry a fix kind (a re-verify ticket is one).
+ *   2. closed tickets (done/cancelled) — nothing waits on a landed fix.
+ *   3. advisory tickets — by definition the run does not wait on them.
+ *   4. re-verify tickets (`spawnedBy.reverify`). They are ORCHESTRATOR bookkeeping
+ *      that carries a fix kind on purpose (live-reverify GATE_OWNER_FIX_KIND), so
+ *      counting them would make round N's re-verify a blocker for round N+1's — two
+ *      re-verifies of the same lineage waiting on each other, forever.
+ */
+export function selectOpenEpicFixes({ siblings, excludeTicketId, isFixKind, isAdvisory } = {}) {
+  if (!Array.isArray(siblings)) return [];
+  const isFix = typeof isFixKind === "function" ? isFixKind : () => false;
+  const advisory = typeof isAdvisory === "function" ? isAdvisory : () => false;
+  const out = [];
+  for (const t of siblings) {
+    const id = t?.ticketId || t?.key;
+    if (!id || id === excludeTicketId || out.includes(id)) continue;
+    if (!isFix(t?.spawnedBy?.kind)) continue;
+    if (t.spawnedBy.reverify === true) continue;
+    const status = String(t?.status || "").trim().toLowerCase();
+    if (status === "done" || status === "cancelled") continue;
+    if (advisory(t)) continue;
+    out.push(id);
+  }
+  return out;
+}
+
+/**
  * The verdict fields on an `agent.complete` event detail.
  *
  * All four keys are ALWAYS present, with explicit off-defaults, rather than

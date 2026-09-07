@@ -14,6 +14,7 @@ import {
   resolveTestedHead,
   resolveVerdict,
   sanitizeTicketIds,
+  selectOpenEpicFixes,
 } from "./verdict-contract.mjs";
 
 /**
@@ -447,6 +448,59 @@ describe("verdict-contract — spawnedTickets sanitisation", () => {
     const once = sanitizeTicketIds([" TEAM-4183 ", "junk", "TEAM-4184"]);
     expect(sanitizeTicketIds(once)).toEqual(once);
     expect(once).toEqual(["TEAM-4183", "TEAM-4184"]);
+  });
+});
+
+describe("selectOpenEpicFixes — what a non-PASS verdict waits for (FR-D1.5/D1.6)", () => {
+  const FIX_KINDS = new Set(["review_fix", "qa_fix", "ci_fix", "ship_fix", "codex_fix"]);
+  const isFixKind = (kind) => FIX_KINDS.has(kind);
+  const isAdvisory = (t) => t?.advisory === true;
+  const select = (siblings, excludeTicketId) => selectOpenEpicFixes({ siblings, excludeTicketId, isFixKind, isAdvisory });
+  const fix = (ticketId, over = {}) => ({
+    ticketId, status: "in_progress", spawnedBy: { kind: "review_fix", gateTicketId: "TEAM-4180" }, ...over,
+  });
+
+  it("includes an open fix filed by SOMEONE ELSE — the dowtdh case", () => {
+    // TEAM-4183 was the REVIEWER's fix; the gate resolving here is QA, which filed
+    // nothing. This one id is the whole point of the union.
+    expect(select([fix("TEAM-4183"), { ticketId: "TEAM-4182", status: "blocked" }], "TEAM-4181")).toEqual(["TEAM-4183"]);
+  });
+
+  it("includes every open fix kind, in board order, without duplicates", () => {
+    const rows = [fix("T-1", { spawnedBy: { kind: "qa_fix" } }), fix("T-2", { status: "todo" }), fix("T-1")];
+    expect(select(rows, "TEAM-4181")).toEqual(["T-1", "T-2"]);
+  });
+
+  it("excludes done and cancelled fixes — nothing waits on a landed fix", () => {
+    expect(select([fix("T-1", { status: "done" }), fix("T-2", { status: "cancelled" })], "G")).toEqual([]);
+    // Status matching is case/whitespace-tolerant, as everywhere else in this module.
+    expect(select([fix("T-3", { status: " Done " })], "G")).toEqual([]);
+  });
+
+  it("excludes advisory fixes — by definition the run does not wait on them", () => {
+    expect(select([fix("T-1", { advisory: true }), fix("T-2")], "G")).toEqual(["T-2"]);
+  });
+
+  it("excludes re-verify tickets, or round N would block round N+1 forever", () => {
+    // A gate re-verify carries the owner's fix kind ON PURPOSE (live-reverify's
+    // GATE_OWNER_FIX_KIND) so completion.mjs counts it as outstanding work. That is
+    // exactly why it has to be filtered out HERE.
+    const rv = fix("T-RV", { spawnedBy: { kind: "qa_fix", reverify: true, rearmOf: "TEAM-4181", round: 2 } });
+    expect(select([rv, fix("T-2")], "G")).toEqual(["T-2"]);
+  });
+
+  it("excludes the gate ticket itself, even when it carries a fix kind", () => {
+    // A re-verify ticket IS assigned to a gate persona, so the ticket resolving a
+    // verdict can itself be a fix-kind row; it may not block itself.
+    expect(select([fix("T-SELF"), fix("T-2")], "T-SELF")).toEqual(["T-2"]);
+  });
+
+  it("excludes non-fix tickets and degrades to [] on junk input", () => {
+    expect(select([{ ticketId: "T-1", status: "todo" }, { ticketId: "T-2", status: "todo", spawnedBy: { kind: "nope" } }], "G")).toEqual([]);
+    expect(selectOpenEpicFixes()).toEqual([]);
+    expect(selectOpenEpicFixes({ siblings: null })).toEqual([]);
+    // No predicates injected → nothing is a fix, so nothing is selected (never a throw).
+    expect(selectOpenEpicFixes({ siblings: [fix("T-1")] })).toEqual([]);
   });
 });
 

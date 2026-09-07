@@ -251,6 +251,11 @@ export function createCascade(deps) {
       verdictSource: info.verdictSource || null,
       testedHead: info.testedHead || "",
       spawnedTickets: (Array.isArray(info.spawnedTickets) ? info.spawnedTickets : []).filter(Boolean),
+      // FR-D1.5/D1.6 — the open fixes under the epic this persona did NOT file.
+      // Resolved by index.mjs (it owns FIX_KINDS + the advisory predicate) via
+      // verdict-contract's selectOpenEpicFixes; absent on an older resolver, which
+      // degrades to exactly the spawnedTickets-only hold.
+      openFixIds: (Array.isArray(info.openEpicFixIds) ? info.openEpicFixIds : []).filter(Boolean),
       round: Number.isFinite(Number(info.round)) ? Number(info.round) : null,
     };
   }
@@ -293,13 +298,21 @@ export function createCascade(deps) {
       (s) => s?.spawnedBy?.rearmOf === ticketId && s?.spawnedBy?.round
     ).length;
 
+    // What the successors AND the re-verify wait on: this persona's own fixes plus
+    // every other fix still open under the epic (FR-D1.5/D1.6). A non-PASS verdict
+    // while ANY fix is open must wait for it regardless of who filed it — dowtdh's
+    // QA FAIL cited the reviewer's still-open TEAM-4183 and filed nothing of its own,
+    // so holding on `spawnedTickets` alone would dispatch the re-verify against the
+    // unfixed head and burn a round on the same finding.
+    const blockOn = [...new Set([...gate.spawnedTickets, ...gate.openFixIds])];
+
     const filed = await reverify?.({
       kind: "gate",
       workflow,
       owner,
       gateTicket,
       headSha: gate.testedHead,
-      blockedBy: gate.spawnedTickets,
+      blockedBy: blockOn,
       round: gate.round ?? priorRounds + 1,
       reason: `${gate.verdict} (${gate.verdictSource || "unknown source"})`,
     });
@@ -307,7 +320,7 @@ export function createCascade(deps) {
     // filter(Boolean) is load-bearing: a re-verify that could not be filed (no head
     // sha, create_ticket down) leaves the FIXES holding the successor. An empty list
     // still holds — this pass simply refuses to unblock — and says so in the event.
-    const blockers = [...new Set([...gate.spawnedTickets, filed?.reverifyTicketId].filter(Boolean))];
+    const blockers = [...new Set([...blockOn, filed?.reverifyTicketId].filter(Boolean))];
 
     for (const sibling of successors) {
       const already = sibling.blockedBy || [];
@@ -491,6 +504,11 @@ export function createCascade(deps) {
         verdictSource: gate.verdictSource,
         wouldSuppress: unblocked,
         spawnedTickets: gate.spawnedTickets,
+        // What enforce WOULD have held them on (FR-D1.5/D1.6): this persona's fixes
+        // plus every other fix open under the epic. Reported separately from
+        // spawnedTickets so the shadow week can see how often the union is wider
+        // than what the persona filed — dowtdh is the case where it is everything.
+        wouldBlockOn: [...new Set([...gate.spawnedTickets, ...gate.openFixIds])],
         testedHead: gate.testedHead,
       });
       log(`[orchestrator] verdict-gate shadow — ${ticketId} ${gate.verdict} (${gate.verdictSource}) would hold [${unblocked.join(", ")}]`);

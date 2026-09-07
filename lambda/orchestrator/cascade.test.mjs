@@ -1225,6 +1225,12 @@ describe("verdict gate (TEAM-4246 D1)", () => {
           verdictSource: "declared",
           wouldSuppress: [SUCC],          // the REAL list, measured after the loop
           spawnedTickets: [FIX],
+          // FR-D1.5/D1.6: what enforce would have held them ON — this persona's own
+          // fixes UNION every fix still open under the epic. This harness's resolver
+          // reports no other open fix, so the union is just [FIX] here; the wider
+          // case (a fix filed by another persona) is pinned in the enforce block
+          // below and, end to end, in replay-dowtdh-verdict-gate.
+          wouldBlockOn: [FIX],
           testedHead: HEAD,
         },
       ]);
@@ -1245,6 +1251,40 @@ describe("verdict gate (TEAM-4246 D1)", () => {
   });
 
   describe("enforce — a non-PASS verdict holds the successor", () => {
+    it("holds on a fix this persona did NOT file, and files the re-verify behind it too (FR-D1.5/D1.6)", async () => {
+      // The dowtdh shape: the gate persona filed NOTHING (spawnedTickets []), and the
+      // fix that made it fail was filed by someone else. Holding only on what this
+      // persona filed would dispatch the re-verify against the unfixed head.
+      const FOREIGN = "TEAM-4183";
+      const h = gateHarness({ gate: { spawnedTickets: [], openEpicFixIds: [FOREIGN] } });
+
+      const unblocked = await h.cascadeUnblock(DONE, "EPIC-1", workflow);
+
+      expect(unblocked).toEqual([]);
+      // The successor waits on the foreign fix AND on the re-verify.
+      expect(h.addBlockers.mock.calls.map((c) => [c[0], c[1]])).toEqual([
+        [SUCC, [FOREIGN]],
+        [SUCC, [RV]],
+      ]);
+      // …and so does the re-verify itself: it must not run before the fix lands.
+      expect(h.reverify.mock.calls[0][0].blockedBy).toEqual([FOREIGN]);
+      expect(detailOf(h.publishEvent, "orchestrator.verdict_suppressed")[0]).toMatchObject({
+        blockers: [FOREIGN, RV],
+        spawnedTickets: [],   // reported verbatim: the blueprint-compliance signal
+      });
+    });
+
+    it("unions the persona's own fixes with the epic's, without duplicating either", async () => {
+      // The resolver reports its own fix in BOTH lists — it is an open epic fix too.
+      const OTHER = "TEAM-4191";
+      const h = gateHarness({ gate: { spawnedTickets: [FIX], openEpicFixIds: [FIX, OTHER] } });
+
+      await h.cascadeUnblock(DONE, "EPIC-1", workflow);
+
+      expect(h.reverify.mock.calls[0][0].blockedBy).toEqual([FIX, OTHER]);
+      expect(detailOf(h.publishEvent, "orchestrator.verdict_suppressed")[0].blockers).toEqual([FIX, OTHER, RV]);
+    });
+
     it("suppresses the transition, the dispatch and the journal event together", async () => {
       const dispatchReady = vi.fn(async () => {});
       const h = gateHarness();

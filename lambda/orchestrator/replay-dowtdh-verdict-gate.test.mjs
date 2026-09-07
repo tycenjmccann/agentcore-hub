@@ -727,6 +727,18 @@ describe("dowtdh replay — the D1 flags", () => {
     expect(h.state.board.get(QA).status).toBe("blocked");
   });
 
+  it("(a) enforce: TEAM-4181's FAIL holds TEAM-4182 on TEAM-4183 too, though QA filed no fix itself", async () => {
+    await upToQaFail();
+
+    // FR-D1.5/D1.6. QA's own `spawnedTickets` is empty — it filed nothing — so before
+    // the union this hold rested on the re-verify alone, and that re-verify was free
+    // to run against code TEAM-4183 had not landed on yet.
+    const qaHold = detailsOfType("orchestrator.verdict_suppressed").find((s) => s.verdict === "FAIL");
+    expect(qaHold).toMatchObject({ unblocked: [CI], spawnedTickets: [] });
+    expect(qaHold.blockers).toEqual([FIX, qaReverifies()[0].key]);
+    expect(h.state.board.get(CI).blockedBy).toEqual([QA, FIX, qaReverifies()[0].key]);
+  });
+
   it("(a) enforce: the inferred ladder holds TEAM-4181 identically from the fixture's prose alone", async () => {
     // No declared verdict anywhere — the run exactly as it was recorded. This is the
     // path every pre-4246 agent still takes until the blueprints roll out, so the
@@ -779,11 +791,12 @@ describe("dowtdh replay — the D1 flags", () => {
     expect(qaRv.summary).toMatch(/^Re-verify \(round \d+\)/);
     expect(qaRv.spawned_by).toMatchObject({ kind: "qa_fix", reverify: true, rearmOf: QA, headSha: CODE_HEAD });
 
-    // …and it is blocked on NOTHING, which is not a miss: dowtdh's QA filed no fix
-    // ticket of its own. TEAM-4183 is the REVIEWER's fix, so it is the reviewer's
-    // re-verify that carries it — the §1 empty-spawnedTickets path holds the
-    // successor on the re-verify alone rather than failing open.
-    expect(qaRv.blocked_by).toEqual([]);
+    // …and it waits on TEAM-4183 even though QA filed nothing of its own: TEAM-4183
+    // is the REVIEWER's fix, and FR-D1.5/D1.6 holds a non-PASS gate behind every fix
+    // open under the epic regardless of who filed it. Without that union this ticket
+    // would dispatch against the unfixed head and fail for the same reason — a whole
+    // round burned, which is the loop the gate exists to stop.
+    expect(qaRv.blocked_by).toEqual([FIX]);
     const [reviewerRv] = owned("agentcore_hub_code_reviewer");
     expect(reviewerRv.blocked_by).toEqual([FIX]);
     expect(reviewerRv.spawned_by).toMatchObject({ kind: "review_fix", reverify: true, rearmOf: REVIEW });
