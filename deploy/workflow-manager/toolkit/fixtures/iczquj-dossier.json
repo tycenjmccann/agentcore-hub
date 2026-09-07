@@ -1,0 +1,2429 @@
+{
+ "workflowId": "wf_1788175925679_iczquj",
+ "workflowDefId": "dead-code-sweep",
+ "epicId": "TEAM-3582",
+ "ticketProvider": "jira",
+ "workflow": {
+  "agentTasks": {
+   "TEAM-3583": {
+    "agentId": "agentcore_hub_requirements_analyst",
+    "completedAt": "2026-08-31T11:42:37.501Z",
+    "createdAt": "2026-08-31T11:32:08.509Z",
+    "id": "task_1788175928509_agentcore_hub_requirements_analyst",
+    "startedAt": "2026-08-31T11:32:09.493Z",
+    "status": "complete",
+    "ticketId": "TEAM-3583"
+   },
+   "TEAM-3585": {
+    "agentId": "agentcore_hub_code_sweeper",
+    "completedAt": "2026-08-31T12:03:20.871Z",
+    "createdAt": "2026-08-31T11:40:14.787Z",
+    "id": "task_1788176414787_agentcore_hub_code_sweeper",
+    "startedAt": "2026-08-31T11:40:15.508Z",
+    "status": "complete",
+    "ticketId": "TEAM-3585"
+   },
+   "TEAM-3586": {
+    "agentId": "agentcore_hub_code_reviewer",
+    "completedAt": "2026-08-31T12:08:07.886Z",
+    "createdAt": "2026-08-31T11:40:37.688Z",
+    "id": "task_1788176437688_agentcore_hub_code_reviewer",
+    "startedAt": "2026-08-31T12:03:22.850Z",
+    "status": "complete",
+    "ticketId": "TEAM-3586"
+   },
+   "TEAM-3587": {
+    "agentId": "agentcore_hub_qa_verifier",
+    "completedAt": "2026-08-31T12:21:21.570Z",
+    "createdAt": "2026-08-31T11:41:02.384Z",
+    "id": "task_1788176462384_agentcore_hub_qa_verifier",
+    "startedAt": "2026-08-31T12:08:09.586Z",
+    "status": "complete",
+    "ticketId": "TEAM-3587"
+   },
+   "TEAM-3588": {
+    "agentId": "agentcore_hub_ci_agent",
+    "completedAt": "2026-08-31T12:38:40.154Z",
+    "createdAt": "2026-08-31T11:41:19.552Z",
+    "id": "task_1788176479552_agentcore_hub_ci_agent",
+    "startedAt": "2026-08-31T12:21:23.709Z",
+    "status": "complete",
+    "ticketId": "TEAM-3588"
+   },
+   "TEAM-3589": {
+    "agentId": "agentcore_hub_release_manager",
+    "completedAt": "2026-08-31T12:57:07.966Z",
+    "createdAt": "2026-08-31T11:41:38.185Z",
+    "id": "task_1788176498185_agentcore_hub_release_manager",
+    "startedAt": "2026-08-31T12:51:47.710Z",
+    "status": "complete",
+    "ticketId": "TEAM-3589"
+   },
+   "TEAM-3590": {
+    "status": "complete",
+    "completedAt": "2026-08-31T19:30:37.564Z",
+    "id": "task_1788204637564_human:engineer",
+    "ticketId": "TEAM-3590",
+    "agentId": "human:engineer",
+    "createdAt": "2026-08-31T19:30:37.564Z"
+   },
+   "TEAM-3591": {
+    "agentId": "agentcore_hub_release_manager",
+    "completedAt": "2026-08-31T22:45:45.135Z",
+    "createdAt": "2026-08-31T11:42:10.983Z",
+    "id": "task_1788176530983_agentcore_hub_release_manager",
+    "startedAt": "2026-08-31T22:42:03.906Z",
+    "status": "complete",
+    "ticketId": "TEAM-3591"
+   }
+  },
+  "completedAt": "2026-08-31T22:45:45.807Z",
+  "epicId": "TEAM-3582",
+  "finalizedAt": "2026-08-31T22:45:46.746Z",
+  "humanNotifications": [
+   {
+    "type": "review_needed",
+    "acknowledged": false,
+    "details": "Ticket TEAM-3590 is awaiting review by engineer.",
+    "id": "notif_TEAM-3590_2026-08-31T12:57:10.724Z",
+    "timestamp": "2026-08-31T12:57:10.724Z",
+    "ticketId": "TEAM-3590",
+    "reviewer": "engineer",
+    "title": "Review needed: TEAM-3590"
+   }
+  ],
+  "id": "wf_1788175925679_iczquj",
+  "input": {
+   "description": "Statically detect unused code in tycenjmccann/ember with knip/ts-prune/depcheck, verify each candidate is truly unreferenced (git grep whole repo, rule out reflection/entry-points/public API), remove only verified-dead code, prove build + full test suite still pass, and open a PR into main with a Removal Ledger. Never auto-merge; keep anything uncertain.",
+   "repoConfig": {
+    "layout": "monorepo",
+    "repos": [
+     {
+      "defaultBranch": "main",
+      "platform": "web",
+      "url": "https://github.com/tycenjmccann/ember"
+     }
+    ]
+   },
+   "workflowDefId": "dead-code-sweep",
+   "sources": [],
+   "title": "Dead Code Sweep \u2014 tycenjmccann/ember \u2014 2026-08-31"
+  },
+  "managerWatch": true,
+  "messages": [],
+  "notifVersion": 1,
+  "phase": "complete",
+  "repoConfig": {
+   "layout": "monorepo",
+   "repos": [
+    {
+     "platform": "web",
+     "defaultBranch": "main",
+     "url": "https://github.com/tycenjmccann/ember"
+    }
+   ]
+  },
+  "resumeContexts": {},
+  "startedAt": "2026-08-31T11:32:06.863Z",
+  "ticketProvider": "jira",
+  "wmAutoAnalyzedAt": "2026-08-31T22:45:47.642Z",
+  "wmLastWatchAt": "2026-08-31T22:39:44.768Z",
+  "workflowDefId": "dead-code-sweep",
+  "workflowId": "wf_1788175925679_iczquj",
+  "workflowType": "feature"
+ },
+ "workflowDef": {
+  "id": "dead-code-sweep",
+  "name": "Dead Code Sweep",
+  "displayName": "Dead-Code",
+  "description": "Scheduled hygiene flow: statically detect unused code (language-aware \u2014 Periphery for Swift, knip/ts-prune for TS, vulture for Python), remove it surgically with evidence it is unreferenced, then independent code review, live QA that build + tests still pass, CI, and a release manager that reviews the final PR \u2014 a human approves the merge, then it merges and deploys per the repo's DEPLOY.md.",
+  "icon": "Trash2",
+  "intakeAgentId": "agentcore_hub_requirements_analyst",
+  "requiresRepo": true,
+  "featureBranchPhase": "development",
+  "createsPullRequest": true,
+  "completionRequiresAgentPhases": [
+   "development",
+   "verification",
+   "review",
+   "ship"
+  ],
+  "phases": [
+   {
+    "id": "intake",
+    "name": "Intake",
+    "type": "app",
+    "agentPhase": "intake"
+   },
+   {
+    "id": "sweep",
+    "name": "Sweep",
+    "type": "agent",
+    "agentPhase": "development"
+   },
+   {
+    "id": "qa",
+    "name": "Verify & Ship",
+    "type": "agent",
+    "agentPhase": "verification",
+    "extraAgentPhases": [
+     "review",
+     "ship"
+    ]
+   }
+  ],
+  "reviewGates": [
+   {
+    "afterPhase": "ship",
+    "name": "Merge Approval",
+    "blocking": true,
+    "condition": "always",
+    "onReject": "rework",
+    "reviewerRole": "Code Owner",
+    "assignee": "human:engineer"
+   }
+  ]
+ },
+ "tickets": [
+  {
+   "ticketId": "TEAM-3583",
+   "title": "Sweep: agentcore_hub_requirements_analyst \u2014 Dead Code Sweep \u2014 tycenjmccann/ember \u2014 2026-08-31",
+   "description": "Analyze the request and create tickets for the relevant agents.\n\nTitle: Dead Code Sweep \u2014 tycenjmccann/ember \u2014 2026-08-31\nDescription: Statically detect unused code in tycenjmccann/ember with knip/ts-prune/depcheck, verify each candidate is truly unreferenced (git grep whole repo, rule out reflection/entry-points/public API), remove only verified-dead code, prove build + full test suite still pass, and open a PR into main with a Removal Ledger. Never auto-merge; keep anything uncertain.",
+   "status": "done",
+   "assignee": "agentcore_hub_requirements_analyst",
+   "parentId": "TEAM-3582",
+   "blockedBy": [],
+   "workflowId": "wf_1788175925679_iczquj",
+   "type": "task",
+   "createdAt": "2026-08-31T04:32:07.318-0700",
+   "updatedAt": "2026-08-31T04:42:36.575-0700"
+  },
+  {
+   "ticketId": "TEAM-3585",
+   "title": "Sweep: Dead code sweep of tycenjmccann/ember (detect, verify, remove, prove, PR)",
+   "description": "Repo: tycenjmccann/ember | Base: main | Work branch: sweep/dead-code-2026-08-31\nRequirements doc: s3 workflows/wf_1788175925679_iczquj/shared/requirements.md (READ FIRST \u2014 contains full FRs/ACs and repo facts)\n\nONE ticket \u2014 do the entire sweep. NEVER auto-merge anything.\n\nREPO FACTS (verified 2026-08-31):\n- Next.js 14 App Router + TypeScript, source in src/; Tailwind.\n- Nested second TS project: mcp/port-session/ (own package.json/tsconfig; root tsconfig EXCLUDES mcp). Its MCP tools/prompts are dispatched by NAME STRING via CallToolRequestSchema/ListTools/GetPrompt handlers \u2014 top false-positive source.\n- NO test script and NO test framework in either package. NO .github/workflows CI. Proof of safety = `npm run build` (next build incl. tsc type-check) + `npm run mcp:build`, both green on a FRESH install.\n- knip/ts-prune/depcheck are NOT installed \u2014 run via npx ONLY; NEVER add them to any package.json/lockfile.\n\nDO:\n1. DETECT: run `npx knip`, `npx ts-prune`, `npx depcheck` over BOTH projects (root and mcp/port-session/ separately). Capture raw output + resolved tool versions. Build a consolidated candidate list tagged file|export/symbol|dependency + detecting tool(s).\n2. VERIFY every candidate (detection alone is NEVER sufficient): `git grep` the WHOLE repo \u2014 incl. Dockerfile, .dockerignore, install.sh, deploy/** (shell+Python+YAML/JSON), docs/** (incl. docs/mockups/*.html), *.css, both package.json files. Rule out: (a) framework entry points \u2014 src/app/**/page.tsx, layout.tsx, route.ts (~20 API route.ts files), loading/error/not-found, src/middleware.ts, next.config.mjs, postcss/tailwind/tsconfig, next-env.d.ts \u2014 these are LIVE BY DEFINITION, never remove even if flagged; (b) dynamic imports/reflection/name-string dispatch (esp. MCP handlers); (c) string references \u2014 Tailwind content-glob classes, public/ asset URL paths (/favicon.svg etc.), env keys from .env.example, file paths in Docker/install/deploy scripts; (d) public API \u2014 MCP bin (dist/index.js), tool/prompt schemas, surfaces documented in README/docs. Cross-project: a symbol unused in src/ but referenced from mcp/port-session/ (or vice-versa) is NOT dead.\n3. REMOVE only verified-dead items. Deletion-only \u2014 no renames/refactors; minimal mechanical cleanup of a deletion allowed. Dependency removals: edit the correct package.json and regenerate its lockfile via npm (never hand-edit); don't drop a dep the other project uses.\n4. KEEP anything uncertain \u2014 record as \"kept \u2014 uncertain\" with reason.\n5. PROVE: fresh install, then `npm run build` and `npm run mcp:build` both green; re-check for any test runner added since 2026-08-31 and run it if found; otherwise record \"No test runner present; proof is build + mcp:build\". Capture logs.\n6. LEDGER: draft the Removal Ledger per the template in requirements.md \u2014 one row per removed item (item | type | detected by | git-grep evidence + ruled-out dynamic-usage classes | proof) and one row per kept-uncertain candidate (candidate | flagged by | reason), plus proof-of-safety section and detection appendix.\n7. Push sweep/dead-code-2026-08-31 and open the working PR into main with the ledger in the body. Do NOT merge; do NOT enable auto-merge.\n\nACCEPTANCE CRITERIA:\n- Diff is removal-only; ledger removed-rows map 1:1 to deleted items; zero uncertain items removed; no entry-point/config/public-API file touched.\n- No knip/ts-prune/depcheck (or helper) added to any manifest/lockfile (`git diff main -- '**/package.json' '**/package-lock.json'` clean of tooling deps).\n- npm run build + npm run mcp:build green on fresh install, logs captured.\n- Exactly one PR: base main, head sweep/dead-code-2026-08-31, Removal Ledger + proof + detection appendix in body, no auto-merge.",
+   "status": "done",
+   "assignee": "agentcore_hub_code_sweeper",
+   "parentId": "TEAM-3582",
+   "blockedBy": [],
+   "workflowId": "wf_1788175925679_iczquj",
+   "type": "task",
+   "createdAt": "2026-08-31T04:40:13.365-0700",
+   "updatedAt": "2026-08-31T05:03:19.635-0700"
+  },
+  {
+   "ticketId": "TEAM-3586",
+   "title": "Review: Adversarial review of dead-code sweep branch (false-positive hunt)",
+   "description": "Repo: tycenjmccann/ember | Branch under review: sweep/dead-code-2026-08-31 (PR into main opened by TEAM-3585)\nRequirements doc: s3 workflows/wf_1788175925679_iczquj/shared/requirements.md\n\nAdversarially review the dead-code-sweep PR. This is a DELETION-ONLY PR \u2014 your job is to hunt FALSE POSITIVES (things removed that are actually referenced dynamically).\n\nDO:\n- Independently re-verify a meaningful sample of removals: re-run whole-repo `git grep` for the removed symbol/file/dependency names (incl. Dockerfile, install.sh, deploy/** shell+Python, docs/** incl. docs/mockups/*.html, *.css, both package.json files) and reproduce the no-hit evidence claimed in the Removal Ledger.\n- Actively hunt false positives in these classes: dynamic imports/require/computed access; MCP name-string dispatch in mcp/port-session/src/index.ts (CallToolRequestSchema/ListTools/GetPrompt handlers); Next.js App Router entry points (page/layout/route/loading/error/not-found), src/middleware.ts, config files (next.config.mjs, postcss/tailwind/tsconfig, next-env.d.ts); Tailwind content-glob class strings; public/ asset URL-string references; env-var-gated code (.env.example); file paths referenced in Dockerfile/install.sh/deploy/**.\n- Confirm NOTHING marked \"kept \u2014 uncertain\" in the ledger was actually deleted in the diff.\n- Confirm the diff is removal-only (no refactors/renames/behavior changes) and lockfile changes match only intended dependency removals (no hand-edits, no knip/ts-prune/depcheck added).\n- Confirm entry-point/config/public-API files are untouched.\n- If any false positive or violation is found: file fix feedback back to the sweep (block progression until fixed). NEVER merge or enable auto-merge.\n\nACCEPTANCE CRITERIA: every sampled removal reproduces its no-hit evidence; zero uncertain items removed; diff confirmed removal-only; no tooling deps in manifests/lockfiles; findings (or clean pass) documented on the ticket/PR.",
+   "status": "done",
+   "assignee": "agentcore_hub_code_reviewer",
+   "parentId": "TEAM-3582",
+   "blockedBy": [
+    "TEAM-3585"
+   ],
+   "workflowId": "wf_1788175925679_iczquj",
+   "type": "task",
+   "createdAt": "2026-08-31T04:40:36.399-0700",
+   "updatedAt": "2026-08-31T05:08:06.606-0700"
+  },
+  {
+   "ticketId": "TEAM-3587",
+   "title": "QA: Verify proof-of-safety and Removal Ledger completeness",
+   "description": "Repo: tycenjmccann/ember | Branch: sweep/dead-code-2026-08-31 (PR into main)\nRequirements doc: s3 workflows/wf_1788175925679_iczquj/shared/requirements.md\n\nIndependently verify the proof-of-safety and the Removal Ledger of the dead-code-sweep PR.\n\nREPO FACTS: NO test script/framework exists in either package.json (root or mcp/port-session) and NO .github/workflows CI as of 2026-08-31 \u2014 proof of safety is `npm run build` (next build incl. tsc type-check) + `npm run mcp:build`.\n\nDO:\n1. On a clean checkout of sweep/dead-code-2026-08-31, fresh dependency install, then independently run `npm run build` and `npm run mcp:build` \u2014 both must pass. Capture output.\n2. Re-check for any test runner added since 2026-08-31 (both package.json files, config files, .github/workflows). If found, run it and record results; otherwise confirm the ledger explicitly states \"no test runner present\".\n3. Verify Removal Ledger completeness in the PR body: every deleted item in the diff has exactly one \"removed\" row with concrete git-grep verification evidence; every \"kept \u2014 uncertain\" candidate has a row with a reason and does NOT appear as a deletion; removed-rows count == distinct deleted items (1:1, no orphans either direction).\n4. Verify PR body also contains proof results and the detection appendix (npx commands + tool versions).\n5. Any discrepancy \u2192 block and report back for fix. NEVER merge or enable auto-merge.\n\nACCEPTANCE CRITERIA: both builds independently reproduced green from fresh install; ledger 1:1 with diff; kept-uncertain items intact in the codebase; results documented on the ticket.",
+   "status": "done",
+   "assignee": "agentcore_hub_qa_verifier",
+   "parentId": "TEAM-3582",
+   "blockedBy": [
+    "TEAM-3586"
+   ],
+   "workflowId": "wf_1788175925679_iczquj",
+   "type": "task",
+   "createdAt": "2026-08-31T04:40:58.802-0700",
+   "updatedAt": "2026-08-31T05:21:18.103-0700"
+  },
+  {
+   "ticketId": "TEAM-3588",
+   "title": "CI: Validate build and tests for Dead Code Sweep \u2014 tycenjmccann/ember \u2014 2026-08-31",
+   "description": "Repo: tycenjmccann/ember | Branch: sweep/dead-code-2026-08-31 (PR into main)\nRequirements doc: s3 workflows/wf_1788175925679_iczquj/shared/requirements.md\n\nValidate build/CI cleanliness of the dead-code-sweep branch. NOTE: this repo has NO .github/workflows CI \u2014 this fresh-install gate IS the CI substitute.\n\nDO:\n1. Clean checkout of sweep/dead-code-2026-08-31. Fresh dependency install (`npm ci` at root; mcp/port-session installs via `npm run mcp:build`).\n2. Run `npm run build` and `npm run mcp:build` \u2014 both must complete clean, with no new warnings/errors introduced by the removals relative to main.\n3. Verify manifest/lockfile hygiene: `git diff main -- '**/package.json' '**/package-lock.json'` shows ONLY intended dependency removals; lockfiles regenerated by npm (not hand-edited); NO knip/ts-prune/depcheck or helper tooling added anywhere.\n4. Confirm the diff vs main is removal-only at the file level (deletions + mechanical cleanup; no entry-point/config files modified).\n5. Any failure \u2192 block and report back. NEVER merge or enable auto-merge.\n\nACCEPTANCE CRITERIA: fresh install + both builds green; no lockfile drift beyond intended removals; no tooling deps in any manifest/lockfile; results documented on the ticket.",
+   "status": "done",
+   "assignee": "agentcore_hub_ci_agent",
+   "parentId": "TEAM-3582",
+   "blockedBy": [
+    "TEAM-3587"
+   ],
+   "workflowId": "wf_1788175925679_iczquj",
+   "type": "task",
+   "createdAt": "2026-08-31T04:41:18.176-0700",
+   "updatedAt": "2026-08-31T05:38:39.187-0700"
+  },
+  {
+   "ticketId": "TEAM-3589",
+   "title": "Ship: Dead Code Sweep \u2014 tycenjmccann/ember \u2014 2026-08-31",
+   "description": "Repo: tycenjmccann/ember | Branch: sweep/dead-code-2026-08-31 | PR into main (opened by TEAM-3585)\nRequirements doc: s3 workflows/wf_1788175925679_iczquj/shared/requirements.md\n\nSHIP phase \u2014 finalize the dead-code-sweep PR. DO NOT MERGE. Never enable auto-merge. The merge happens only in the CD ticket after the human Merge Approval gate.\n\nDO:\n1. Ensure the PR into main is finalized: title/description clear, and the FINAL Removal Ledger is present in the PR body \u2014 removed rows (item | type | detected by | git-grep evidence | proof), kept-uncertain rows (candidate | flagged by | reason), proof-of-safety section (`npm run build` + `npm run mcp:build` green on fresh install; test-runner note), detection appendix (npx commands + tool versions).\n2. Review the final assembled diff end-to-end: removal-only (deletions + mechanical cleanup), no entry-point/config/public-API files touched, lockfile changes match only intended dependency removals, no tooling deps added.\n3. Confirm review (TEAM-3586), QA (TEAM-3587), and CI (TEAM-3588) outcomes are reflected/resolved.\n4. Leave the PR OPEN and ready for the human Merge Approval gate. Do NOT merge; do NOT enable auto-merge.\n\nACCEPTANCE CRITERIA: PR body carries the complete final ledger + proof + appendix; assembled diff reviewed and confirmed removal-only; PR base main, head sweep/dead-code-2026-08-31; PR NOT merged and no auto-merge flag set.",
+   "status": "done",
+   "assignee": "agentcore_hub_release_manager",
+   "parentId": "TEAM-3582",
+   "blockedBy": [
+    "TEAM-3588"
+   ],
+   "workflowId": "wf_1788175925679_iczquj",
+   "type": "task",
+   "createdAt": "2026-08-31T04:41:36.707-0700",
+   "updatedAt": "2026-08-31T05:57:06.311-0700"
+  },
+  {
+   "ticketId": "TEAM-3590",
+   "title": "Merge Approval \u2014 Dead Code Sweep \u2014 tycenjmccann/ember \u2014 2026-08-31",
+   "description": "DECISION: Approve to merge PR #57 into ember (removes 67 lines of dead code across 9 files + 1 unused package). Reject = nothing merges. Fully revertible with one click if anything breaks.\n\nWHAT HAPPENED\n- Scanned with knip + ts-prune + depcheck; every candidate re-verified by hand.\n- 8 items proven dead and removed; 5 groups of look-alike candidates kept as uncertain.\n- App build + MCP build pass from a fresh install. 3 independent agents re-verified every removal. (Repo has no test suite - verified builds are the proof here.)\n\nWHAT'S IN THE PR (plain English)\n- 4 small formatting/styling helper functions nothing imports anymore.\n- 4 duplicate \"default export\" declarations on components that are already exported by name - pure redundancy.\n- 2 unused database functions (an old session-delete and tenant-write path).\n- 1 unused package dependency (clsx) dropped from package.json.\n\nWHAT WAS KEPT (and why)\n- Page/route files, MCP entries, and build tooling that scanners flag by design but are loaded by the framework - kept, correctly.\n\nRISK IF WE'RE WRONG: Low. Zero references repo-wide for everything removed, no app routes or configs touched, both builds green. Worst case = revert the PR.\n\nDETAILS: PR #57 body has the full removal ledger; evidence in workflows/wf_1788175925679_iczquj/shared/ (sweep, QA, CI reports + ship-review-summary.md).",
+   "status": "done",
+   "assignee": "human:engineer",
+   "parentId": "TEAM-3582",
+   "blockedBy": [
+    "TEAM-3589"
+   ],
+   "workflowId": "wf_1788175925679_iczquj",
+   "type": "task",
+   "createdAt": "2026-08-31T04:41:53.501-0700",
+   "updatedAt": "2026-08-31T12:30:36.576-0700"
+  },
+  {
+   "ticketId": "TEAM-3591",
+   "title": "CD: Dead Code Sweep \u2014 tycenjmccann/ember \u2014 2026-08-31",
+   "description": "Repo: tycenjmccann/ember | Branch: sweep/dead-code-2026-08-31 | PR into main\n\nCD phase \u2014 merge the approved dead-code-sweep PR. STRICT PRECONDITION: the human Merge Approval gate (TEAM-3590) MUST be done/approved before ANY merge action. Never auto-merge; never merge ahead of the gate.\n\nDO:\n1. Confirm TEAM-3590 is approved (done) and the PR is unchanged since the Ship review (no new commits invalidating the review; if changed, send back through the chain).\n2. Merge the PR into main (standard merge per repo convention).\n3. Deployment: the repo has NO CI/CD pipeline and no DEPLOY.md; deploy/** contains manual AWS-oriented scripts. Do NOT run production deploy scripts for a removal-only sweep unless repo docs explicitly require it \u2014 merging to main completes this workflow. Note this decision on the ticket.\n4. Clean up the sweep branch per repo convention (delete after merge if that is the norm).\n\nACCEPTANCE CRITERIA: merge performed strictly after recorded human approval; main receives the removal-only diff; merge commit/SHA recorded on the ticket.",
+   "status": "done",
+   "assignee": "agentcore_hub_release_manager",
+   "parentId": "TEAM-3582",
+   "blockedBy": [
+    "TEAM-3590"
+   ],
+   "workflowId": "wf_1788175925679_iczquj",
+   "type": "task",
+   "createdAt": "2026-08-31T04:42:09.964-0700",
+   "updatedAt": "2026-08-31T15:45:44.121-0700"
+  },
+  {
+   "ticketId": "TEAM-3582",
+   "title": "Dead Code Sweep \u2014 tycenjmccann/ember \u2014 2026-08-31",
+   "description": "Statically detect unused code in tycenjmccann/ember with knip/ts-prune/depcheck, verify each candidate is truly unreferenced (git grep whole repo, rule out reflection/entry-points/public API), remove only verified-dead code, prove build + full test suite still pass, and open a PR into main with a Removal Ledger. Never auto-merge; keep anything uncertain.",
+   "status": "done",
+   "blockedBy": [],
+   "type": "epic",
+   "createdAt": "2026-08-31T04:32:06.024-0700",
+   "updatedAt": "2026-08-31T15:45:46.276-0700"
+  }
+ ],
+ "events": [
+  {
+   "workflowId": "wf_1788175925679_iczquj",
+   "detail": {
+    "ticketId": "TEAM-3583",
+    "workflowId": "wf_1788175925679_iczquj",
+    "timestamp": "2026-08-31T11:32:08.718Z",
+    "ticket": {
+     "title": "Sweep: agentcore_hub_requirements_analyst \u2014 Dead Code Sweep \u2014 tycenjmccann/ember \u2014 2026-08-31",
+     "parent": "TEAM-3582",
+     "type": "task",
+     "id": "TEAM-3583",
+     "updatedAt": "2026-08-31T11:32:08.718Z",
+     "status": "todo",
+     "assignee": "agentcore_hub_requirements_analyst"
+    }
+   },
+   "type": "ticket.created",
+   "timestamp": "2026-08-31T11:32:08.718Z",
+   "eventId": "1788175928750-5y7p"
+  },
+  {
+   "workflowId": "wf_1788175925679_iczquj",
+   "source": "agentcore-hub.orchestrator",
+   "detail": {
+    "timestamp": "2026-08-31T11:32:08.718Z",
+    "workflowId": "wf_1788175925679_iczquj",
+    "ticket": {
+     "parent": "TEAM-3582",
+     "title": "Sweep: agentcore_hub_requirements_analyst \u2014 Dead Code Sweep \u2014 tycenjmccann/ember \u2014 2026-08-31",
+     "type": "task",
+     "updatedAt": "2026-08-31T11:32:08.718Z",
+     "id": "TEAM-3583",
+     "assignee": "agentcore_hub_requirements_analyst",
+     "status": "todo"
+    },
+    "ticketId": "TEAM-3583"
+   },
+   "timestamp": "2026-08-31T11:32:08Z",
+   "type": "ticket.created",
+   "eventId": "0mth5s18f-0000"
+  },
+  {
+   "detail": {
+    "timestamp": "2026-08-31T11:32:12.937Z",
+    "phase": "requirements",
+    "assignee": "agentcore_hub_requirements_analyst",
+    "workflowId": "wf_1788175925679_iczquj",
+    "agentId": "agentcore_hub_requirements_analyst",
+    "ticketId": "TEAM-3583"
+   },
+   "workflowId": "wf_1788175925679_iczquj",
+   "type": "agent.invoked",
+   "timestamp": "2026-08-31T11:32:12.937Z",
+   "eventId": "1788175932948-tw9u"
+  },
+  {
+   "workflowId": "wf_1788175925679_iczquj",
+   "detail": {
+    "timestamp": "2026-08-31T11:32:12.937Z",
+    "phase": "requirements",
+    "agentId": "agentcore_hub_requirements_analyst",
+    "ticketId": "TEAM-3583",
+    "assignee": "agentcore_hub_requirements_analyst",
+    "workflowId": "wf_1788175925679_iczquj"
+   },
+   "source": "agentcore-hub.orchestrator",
+   "type": "agent.invoked",
+   "timestamp": "2026-08-31T11:32:12Z",
+   "eventId": "0mth5s4gj-0000"
+  },
+  {
+   "workflowId": "wf_1788175925679_iczquj",
+   "detail": {
+    "agentId": "agentcore_hub_requirements_analyst",
+    "ticketId": "TEAM-3583",
+    "workflowId": "wf_1788175925679_iczquj",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:838829463875:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "sessionId": "TEAM-3583_wf_1788175925679_iczquj-agentcore_hub_requirements_analyst-1788175932968",
+    "timestamp": "2026-08-31T11:32:13.002Z"
+   },
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-08-31T11:32:13.002Z",
+   "eventId": "1788175933013-e8st"
+  },
+  {
+   "workflowId": "TEAM-3583",
+   "detail": {
+    "timestamp": "2026-08-31T11:32:13.282Z",
+    "assignee": "agentcore_hub_requirements_analyst",
+    "agentId": "agentcore_hub_requirements_analyst",
+    "ticketId": "TEAM-3583"
+   },
+   "type": "agent.started",
+   "timestamp": "2026-08-31T11:32:13.282Z",
+   "eventId": "1788175933292-ve38",
+   "_pkNote": "ticket-keyed"
+  },
+  {
+   "workflowId": "wf_1788175925679_iczquj",
+   "detail": {
+    "ticketId": "TEAM-3583",
+    "timestamp": "2026-08-31T11:32:13.002Z",
+    "agentId": "agentcore_hub_requirements_analyst",
+    "sessionId": "TEAM-3583_wf_1788175925679_iczquj-agentcore_hub_requirements_analyst-1788175932968",
+    "workflowId": "wf_1788175925679_iczquj",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:838829463875:runtime/agentcore_hub_agent-ITPP0eBToO"
+   },
+   "source": "agentcore-hub.orchestrator",
+   "timestamp": "2026-08-31T11:32:13Z",
+   "type": "orchestrator.agent_invoked",
+   "eventId": "0mth5s4it-0000"
+  },
+  {
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "TEAM-3583",
+   "detail": {
+    "ticketId": "TEAM-3583",
+    "agentId": "agentcore_hub_requirements_analyst",
+    "timestamp": "2026-08-31T11:32:13.282Z",
+    "assignee": "agentcore_hub_requirements_analyst"
+   },
+   "type": "agent.started",
+   "timestamp": "2026-08-31T11:32:13Z",
+   "eventId": "0mth5s4q4-0000",
+   "_pkNote": "ticket-keyed"
+  },
+  {
+   "workflowId": "wf_1788175925679_iczquj",
+   "detail": {
+    "timestamp": "2026-08-31T11:32:13Z",
+    "agentId": "agentcore_hub_requirements_analyst",
+    "workflowId": "wf_1788175925679_iczquj"
+   },
+   "timestamp": "2026-08-31T11:32:13Z",
+   "type": "agent.started",
+   "eventId": "1788175933937-ufcs"
+  },
+  {
+   "workflowId": "wf_1788175925679_iczquj",
+   "detail": {
+    "ticket": {
+     "parent": "TEAM-3582",
+     "assignee": "agentcore_hub_code_sweeper",
+     "id": "TEAM-3585",
+     "title": "Sweep: Dead code sweep of tycenjmccann/ember (detect, verify, remove, prove, PR)",
+     "updatedAt": "2026-08-31T11:40:15.171Z",
+     "type": "task",
+     "status": "ready"
+    },
+    "workflowId": "wf_1788175925679_iczquj",
+    "ticketId": "TEAM-3585",
+    "timestamp": "2026-08-31T11:40:15.171Z"
+   },
+   "timestamp": "2026-08-31T11:40:15.171Z",
+   "type": "ticket.created",
+   "eventId": "1788176415229-jou0"
+  },
+  {
+   "detail": {
+    "workflowId": "wf_1788175925679_iczquj",
+    "ticket": {
+     "assignee": "agentcore_hub_code_sweeper",
+     "updatedAt": "2026-08-31T11:40:15.171Z",
+     "type": "task",
+     "parent": "TEAM-3582",
+     "id": "TEAM-3585",
+     "status": "ready",
+     "title": "Sweep: Dead code sweep of tycenjmccann/ember (detect, verify, remove, prove, PR)"
+    },
+    "timestamp": "2026-08-31T11:40:15.171Z",
+    "ticketId": "TEAM-3585"
+   },
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788175925679_iczquj",
+   "timestamp": "2026-08-31T11:40:15Z",
+   "type": "ticket.created",
+   "eventId": "0mth62glx-0000"
+  },
+  {
+   "detail": {
+    "assignee": "agentcore_hub_code_sweeper",
+    "ticketId": "TEAM-3585",
+    "agentId": "agentcore_hub_code_sweeper",
+    "phase": "development",
+    "timestamp": "2026-08-31T11:40:16.652Z",
+    "workflowId": "wf_1788175925679_iczquj"
+   },
+   "workflowId": "wf_1788175925679_iczquj",
+   "timestamp": "2026-08-31T11:40:16.652Z",
+   "type": "agent.invoked",
+   "eventId": "1788176416668-95l7"
+  },
+  {
+   "detail": {
+    "timestamp": "2026-08-31T11:40:16.715Z",
+    "ticketId": "TEAM-3585",
+    "workflowId": "wf_1788175925679_iczquj",
+    "sessionId": "TEAM-3585_wf_1788175925679_iczquj-agentcore_hub_code_sweeper-1788176416688",
+    "agentId": "agentcore_hub_code_sweeper",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:838829463875:runtime/agentcore_hub_agent-ITPP0eBToO"
+   },
+   "workflowId": "wf_1788175925679_iczquj",
+   "timestamp": "2026-08-31T11:40:16.715Z",
+   "type": "orchestrator.agent_invoked",
+   "eventId": "1788176416728-bv1v"
+  },
+  {
+   "workflowId": "wf_1788175925679_iczquj",
+   "detail": {
+    "phase": "development",
+    "workflowId": "wf_1788175925679_iczquj",
+    "assignee": "agentcore_hub_code_sweeper",
+    "agentId": "agentcore_hub_code_sweeper",
+    "timestamp": "2026-08-31T11:40:16.652Z",
+    "ticketId": "TEAM-3585"
+   },
+   "source": "agentcore-hub.orchestrator",
+   "timestamp": "2026-08-31T11:40:16Z",
+   "type": "agent.invoked",
+   "eventId": "0mth62hon-0000"
+  },
+  {
+   "workflowId": "wf_1788175925679_iczquj",
+   "detail": {
+    "workflowId": "wf_1788175925679_iczquj",
+    "timestamp": "2026-08-31T11:40:16.715Z",
+    "ticketId": "TEAM-3585",
+    "agentId": "agentcore_hub_code_sweeper",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:838829463875:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "sessionId": "TEAM-3585_wf_1788175925679_iczquj-agentcore_hub_code_sweeper-1788176416688"
+   },
+   "source": "agentcore-hub.orchestrator",
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-08-31T11:40:16Z",
+   "eventId": "0mth62hqn-0000"
+  },
+  {
+   "workflowId": "TEAM-3585",
+   "detail": {
+    "ticketId": "TEAM-3585",
+    "timestamp": "2026-08-31T11:40:17.112Z",
+    "agentId": "agentcore_hub_code_sweeper",
+    "assignee": "agentcore_hub_code_sweeper"
+   },
+   "type": "agent.started",
+   "timestamp": "2026-08-31T11:40:17.112Z",
+   "eventId": "1788176417128-0vky",
+   "_pkNote": "ticket-keyed"
+  },
+  {
+   "workflowId": "TEAM-3585",
+   "detail": {
+    "assignee": "agentcore_hub_code_sweeper",
+    "timestamp": "2026-08-31T11:40:17.112Z",
+    "ticketId": "TEAM-3585",
+    "agentId": "agentcore_hub_code_sweeper"
+   },
+   "source": "agentcore-hub.orchestrator",
+   "type": "agent.started",
+   "timestamp": "2026-08-31T11:40:17Z",
+   "eventId": "0mth62i0z-0000",
+   "_pkNote": "ticket-keyed"
+  },
+  {
+   "detail": {
+    "workflowId": "wf_1788175925679_iczquj",
+    "timestamp": "2026-08-31T11:40:19Z",
+    "agentId": "agentcore_hub_code_sweeper"
+   },
+   "workflowId": "wf_1788175925679_iczquj",
+   "type": "agent.started",
+   "timestamp": "2026-08-31T11:40:19Z",
+   "eventId": "1788176419670-rekh"
+  },
+  {
+   "workflowId": "wf_1788175925679_iczquj",
+   "detail": {
+    "workflowId": "wf_1788175925679_iczquj",
+    "ticket": {
+     "updatedAt": "2026-08-31T11:40:37.903Z",
+     "assignee": "agentcore_hub_code_reviewer",
+     "type": "task",
+     "parent": "TEAM-3582",
+     "title": "Review: Adversarial review of dead-code sweep branch (false-positive hunt)",
+     "status": "todo",
+     "id": "TEAM-3586"
+    },
+    "timestamp": "2026-08-31T11:40:37.903Z",
+    "ticketId": "TEAM-3586"
+   },
+   "type": "ticket.created",
+   "timestamp": "2026-08-31T11:40:37.903Z",
+   "eventId": "1788176437963-1gim"
+  },
+  {
+   "workflowId": "wf_1788175925679_iczquj",
+   "source": "agentcore-hub.orchestrator",
+   "detail": {
+    "ticket": {
+     "id": "TEAM-3586",
+     "status": "todo",
+     "assignee": "agentcore_hub_code_reviewer",
+     "title": "Review: Adversarial review of dead-code sweep branch (false-positive hunt)",
+     "parent": "TEAM-3582",
+     "type": "task",
+     "updatedAt": "2026-08-31T11:40:37.903Z"
+    },
+    "ticketId": "TEAM-3586",
+    "timestamp": "2026-08-31T11:40:37.903Z",
+    "workflowId": "wf_1788175925679_iczquj"
+   },
+   "timestamp": "2026-08-31T11:40:37Z",
+   "type": "ticket.created",
+   "eventId": "0mth62y4o-0000"
+  },
+  {
+   "detail": {
+    "ticket": {
+     "id": "TEAM-3587",
+     "assignee": "agentcore_hub_qa_verifier",
+     "parent": "TEAM-3582",
+     "type": "task",
+     "title": "QA: Verify proof-of-safety and Removal Ledger completeness",
+     "updatedAt": "2026-08-31T11:41:02.761Z",
+     "status": "blocked"
+    },
+    "workflowId": "wf_1788175925679_iczquj",
+    "timestamp": "2026-08-31T11:41:02.762Z",
+    "ticketId": "TEAM-3587"
+   },
+   "workflowId": "wf_1788175925679_iczquj",
+   "timestamp": "2026-08-31T11:41:02.762Z",
+   "type": "ticket.created",
+   "eventId": "1788176463002-2krh"
+  },
+  {
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788175925679_iczquj",
+   "detail": {
+    "workflowId": "wf_1788175925679_iczquj",
+    "ticket": {
+     "parent": "TEAM-3582",
+     "type": "task",
+     "title": "QA: Verify proof-of-safety and Removal Ledger completeness",
+     "status": "blocked",
+     "assignee": "agentcore_hub_qa_verifier",
+     "id": "TEAM-3587",
+     "updatedAt": "2026-08-31T11:41:02.761Z"
+    },
+    "ticketId": "TEAM-3587",
+    "timestamp": "2026-08-31T11:41:02.762Z"
+   },
+   "type": "ticket.created",
+   "timestamp": "2026-08-31T11:41:02Z",
+   "eventId": "0mth63hgd-0000"
+  },
+  {
+   "workflowId": "wf_1788175925679_iczquj",
+   "detail": {
+    "ticketId": "TEAM-3588",
+    "ticket": {
+     "title": "CI: Validate build and tests for Dead Code Sweep \u2014 tycenjmccann/ember \u2014 2026-08-31",
+     "status": "todo",
+     "type": "task",
+     "updatedAt": "2026-08-31T11:41:19.759Z",
+     "id": "TEAM-3588",
+     "parent": "TEAM-3582",
+     "assignee": "agentcore_hub_ci_agent"
+    },
+    "workflowId": "wf_1788175925679_iczquj",
+    "timestamp": "2026-08-31T11:41:19.759Z"
+   },
+   "type": "ticket.created",
+   "timestamp": "2026-08-31T11:41:19.759Z",
+   "eventId": "1788176479788-5kvl"
+  },
+  {
+   "workflowId": "wf_1788175925679_iczquj",
+   "source": "agentcore-hub.orchestrator",
+   "detail": {
+    "ticketId": "TEAM-3588",
+    "ticket": {
+     "status": "todo",
+     "assignee": "agentcore_hub_ci_agent",
+     "id": "TEAM-3588",
+     "title": "CI: Validate build and tests for Dead Code Sweep \u2014 tycenjmccann/ember \u2014 2026-08-31",
+     "parent": "TEAM-3582",
+     "updatedAt": "2026-08-31T11:41:19.759Z",
+     "type": "task"
+    },
+    "timestamp": "2026-08-31T11:41:19.759Z",
+    "workflowId": "wf_1788175925679_iczquj"
+   },
+   "timestamp": "2026-08-31T11:41:19Z",
+   "type": "ticket.created",
+   "eventId": "0mth63ufe-0000"
+  },
+  {
+   "detail": {
+    "timestamp": "2026-08-31T11:41:38.485Z",
+    "workflowId": "wf_1788175925679_iczquj",
+    "ticket": {
+     "id": "TEAM-3589",
+     "assignee": "agentcore_hub_release_manager",
+     "status": "todo",
+     "type": "task",
+     "updatedAt": "2026-08-31T11:41:38.485Z",
+     "parent": "TEAM-3582",
+     "title": "Ship: Dead Code Sweep \u2014 tycenjmccann/ember \u2014 2026-08-31"
+    },
+    "ticketId": "TEAM-3589"
+   },
+   "workflowId": "wf_1788175925679_iczquj",
+   "type": "ticket.created",
+   "timestamp": "2026-08-31T11:41:38.485Z",
+   "eventId": "1788176498512-zh9l"
+  },
+  {
+   "workflowId": "wf_1788175925679_iczquj",
+   "detail": {
+    "ticket": {
+     "updatedAt": "2026-08-31T11:41:38.485Z",
+     "type": "task",
+     "title": "Ship: Dead Code Sweep \u2014 tycenjmccann/ember \u2014 2026-08-31",
+     "assignee": "agentcore_hub_release_manager",
+     "parent": "TEAM-3582",
+     "status": "todo",
+     "id": "TEAM-3589"
+    },
+    "workflowId": "wf_1788175925679_iczquj",
+    "ticketId": "TEAM-3589",
+    "timestamp": "2026-08-31T11:41:38.485Z"
+   },
+   "source": "agentcore-hub.orchestrator",
+   "timestamp": "2026-08-31T11:41:38Z",
+   "type": "ticket.created",
+   "eventId": "0mth648tu-0000"
+  },
+  {
+   "detail": {
+    "onReject": "rework",
+    "reopened": [
+     "TEAM-3589"
+    ],
+    "ticketId": "TEAM-3590",
+    "timestamp": "2026-08-31T11:41:57.701Z",
+    "workflowId": "wf_1788175925679_iczquj"
+   },
+   "workflowId": "wf_1788175925679_iczquj",
+   "timestamp": "2026-08-31T11:41:57.701Z",
+   "type": "review.rejected",
+   "eventId": "1788176517728-qsyz"
+  },
+  {
+   "workflowId": "wf_1788175925679_iczquj",
+   "source": "agentcore-hub.orchestrator",
+   "detail": {
+    "timestamp": "2026-08-31T11:41:57.701Z",
+    "onReject": "rework",
+    "workflowId": "wf_1788175925679_iczquj",
+    "ticketId": "TEAM-3590",
+    "reopened": [
+     "TEAM-3589"
+    ]
+   },
+   "type": "review.rejected",
+   "timestamp": "2026-08-31T11:41:57Z",
+   "eventId": "0mth64nnt-0000"
+  },
+  {
+   "workflowId": "wf_1788175925679_iczquj",
+   "detail": {
+    "phase": "ship",
+    "timestamp": "2026-08-31T11:42:00.122Z",
+    "workflowId": "wf_1788175925679_iczquj",
+    "ticketId": "TEAM-3589",
+    "assignee": "agentcore_hub_release_manager",
+    "agentId": "agentcore_hub_release_manager"
+   },
+   "type": "agent.invoked",
+   "timestamp": "2026-08-31T11:42:00.122Z",
+   "eventId": "1788176520206-ga3f"
+  },
+  {
+   "detail": {
+    "ticketId": "TEAM-3589",
+    "agentId": "agentcore_hub_release_manager",
+    "sessionId": "TEAM-3589_wf_1788175925679_iczquj-agentcore_hub_release_manager-1788176520230",
+    "workflowId": "wf_1788175925679_iczquj",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:838829463875:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "timestamp": "2026-08-31T11:42:00.384Z"
+   },
+   "workflowId": "wf_1788175925679_iczquj",
+   "timestamp": "2026-08-31T11:42:00.384Z",
+   "type": "orchestrator.agent_invoked",
+   "eventId": "1788176520401-f7vn"
+  },
+  {
+   "workflowId": "TEAM-3589",
+   "detail": {
+    "assignee": "agentcore_hub_release_manager",
+    "timestamp": "2026-08-31T11:42:00.730Z",
+    "ticketId": "TEAM-3589",
+    "agentId": "agentcore_hub_release_manager"
+   },
+   "type": "agent.started",
+   "timestamp": "2026-08-31T11:42:00.730Z",
+   "eventId": "1788176520741-m00s",
+   "_pkNote": "ticket-keyed"
+  },
+  {
+   "detail": {
+    "timestamp": "2026-08-31T11:42:00.122Z",
+    "workflowId": "wf_1788175925679_iczquj",
+    "phase": "ship",
+    "assignee": "agentcore_hub_release_manager",
+    "ticketId": "TEAM-3589",
+    "agentId": "agentcore_hub_release_manager"
+   },
+   "workflowId": "wf_1788175925679_iczquj",
+   "source": "agentcore-hub.orchestrator",
+   "timestamp": "2026-08-31T11:42:00Z",
+   "type": "agent.invoked",
+   "eventId": "0mth64pkx-0000"
+  },
+  {
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788175925679_iczquj",
+   "detail": {
+    "workflowId": "wf_1788175925679_iczquj",
+    "ticketId": "TEAM-3589",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:838829463875:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "timestamp": "2026-08-31T11:42:00.384Z",
+    "sessionId": "TEAM-3589_wf_1788175925679_iczquj-agentcore_hub_release_manager-1788176520230",
+    "agentId": "agentcore_hub_release_manager"
+   },
+   "timestamp": "2026-08-31T11:42:00Z",
+   "type": "orchestrator.agent_invoked",
+   "eventId": "0mth64prj-0000"
+  },
+  {
+   "detail": {
+    "assignee": "agentcore_hub_release_manager",
+    "ticketId": "TEAM-3589",
+    "timestamp": "2026-08-31T11:42:00.730Z",
+    "agentId": "agentcore_hub_release_manager"
+   },
+   "workflowId": "TEAM-3589",
+   "source": "agentcore-hub.orchestrator",
+   "type": "agent.started",
+   "timestamp": "2026-08-31T11:42:00Z",
+   "eventId": "0mth64q09-0000",
+   "_pkNote": "ticket-keyed"
+  },
+  {
+   "workflowId": "wf_1788175925679_iczquj",
+   "detail": {
+    "timestamp": "2026-08-31T11:42:01Z",
+    "workflowId": "wf_1788175925679_iczquj",
+    "agentId": "agentcore_hub_release_manager"
+   },
+   "timestamp": "2026-08-31T11:42:01Z",
+   "type": "agent.started",
+   "eventId": "1788176521314-yvzy"
+  },
+  {
+   "detail": {
+    "workflowId": "wf_1788175925679_iczquj",
+    "ticketId": "TEAM-3591",
+    "ticket": {
+     "assignee": "agentcore_hub_release_manager",
+     "parent": "TEAM-3582",
+     "status": "todo",
+     "id": "TEAM-3591",
+     "title": "CD: Dead Code Sweep \u2014 tycenjmccann/ember \u2014 2026-08-31",
+     "type": "task",
+     "updatedAt": "2026-08-31T11:42:11.347Z"
+    },
+    "timestamp": "2026-08-31T11:42:11.347Z"
+   },
+   "workflowId": "wf_1788175925679_iczquj",
+   "timestamp": "2026-08-31T11:42:11.347Z",
+   "type": "ticket.created",
+   "eventId": "1788176531401-uesi"
+  },
+  {
+   "detail": {
+    "ticket": {
+     "title": "CD: Dead Code Sweep \u2014 tycenjmccann/ember \u2014 2026-08-31",
+     "parent": "TEAM-3582",
+     "assignee": "agentcore_hub_release_manager",
+     "type": "task",
+     "updatedAt": "2026-08-31T11:42:11.347Z",
+     "id": "TEAM-3591",
+     "status": "todo"
+    },
+    "ticketId": "TEAM-3591",
+    "timestamp": "2026-08-31T11:42:11.347Z",
+    "workflowId": "wf_1788175925679_iczquj"
+   },
+   "workflowId": "wf_1788175925679_iczquj",
+   "source": "agentcore-hub.orchestrator",
+   "timestamp": "2026-08-31T11:42:11Z",
+   "type": "ticket.created",
+   "eventId": "0mth64y7l-0000"
+  },
+  {
+   "detail": {
+    "summary": "Requirements analysis complete for Dead Code Sweep \u2014 tycenjmccann/ember \u2014 2026-08-31.\n\nScope: MODIFY EXISTING \u2014 removal-only maintenance sweep of a Next.js 14 + TS repo with a nested second TS project",
+    "ticketId": "TEAM-3583",
+    "agentId": "agentcore_hub_requirements_analyst",
+    "pr_url": null,
+    "branch": null
+   },
+   "workflowId": "wf_1788175925679_iczquj",
+   "type": "workflow.report_completion",
+   "timestamp": "2026-08-31T11:42:36.050Z",
+   "eventId": "1788176556050-x4j4"
+  },
+  {
+   "workflowId": "wf_1788175925679_iczquj",
+   "detail": {
+    "unblocked": [],
+    "workflowId": "wf_1788175925679_iczquj",
+    "agentId": "agentcore_hub_requirements_analyst",
+    "ticketId": "TEAM-3583",
+    "timestamp": "2026-08-31T11:42:37.780Z",
+    "assignee": "agentcore_hub_requirements_analyst"
+   },
+   "timestamp": "2026-08-31T11:42:37.780Z",
+   "type": "agent.complete",
+   "eventId": "1788176557827-8j81"
+  },
+  {
+   "source": "agentcore-hub.orchestrator",
+   "detail": {
+    "assignee": "agentcore_hub_requirements_analyst",
+    "agentId": "agentcore_hub_requirements_analyst",
+    "unblocked": [],
+    "workflowId": "wf_1788175925679_iczquj",
+    "timestamp": "2026-08-31T11:42:37.780Z",
+    "ticketId": "TEAM-3583"
+   },
+   "workflowId": "wf_1788175925679_iczquj",
+   "type": "agent.complete",
+   "timestamp": "2026-08-31T11:42:37Z",
+   "eventId": "0mth65inc-0000"
+  },
+  {
+   "workflowId": "wf_1788175925679_iczquj",
+   "detail": {
+    "pr_url": "https://github.com/tycenjmccann/ember/pull/57",
+    "ticketId": "TEAM-3585",
+    "agentId": "agentcore_hub_code_sweeper",
+    "summary": "Dead-code sweep of tycenjmccann/ember complete. PR #57 open (base main \u2190 head sweep/dead-code-2026-08-31), NOT merged, no auto-merge.\n\nACTUALLY RAN (via codex):\n- Detection: npx knip 6.33.0, ts-prune ",
+    "branch": "sweep/dead-code-2026-08-31"
+   },
+   "timestamp": "2026-08-31T12:03:18.966Z",
+   "type": "workflow.report_completion",
+   "eventId": "1788177798966-l4mx"
+  },
+  {
+   "workflowId": "wf_1788175925679_iczquj",
+   "detail": {
+    "assignee": "agentcore_hub_code_sweeper",
+    "unblocked": [
+     "TEAM-3586"
+    ],
+    "timestamp": "2026-08-31T12:03:22.005Z",
+    "workflowId": "wf_1788175925679_iczquj",
+    "agentId": "agentcore_hub_code_sweeper",
+    "ticketId": "TEAM-3585"
+   },
+   "timestamp": "2026-08-31T12:03:22.005Z",
+   "type": "agent.complete",
+   "eventId": "1788177802046-3uu0"
+  },
+  {
+   "workflowId": "wf_1788175925679_iczquj",
+   "detail": {
+    "ticketId": "TEAM-3586",
+    "workflowId": "wf_1788175925679_iczquj",
+    "unblockedBy": "TEAM-3585",
+    "timestamp": "2026-08-31T12:03:22.066Z"
+   },
+   "timestamp": "2026-08-31T12:03:22.066Z",
+   "type": "orchestrator.unblocked",
+   "eventId": "1788177802075-9ttn"
+  },
+  {
+   "detail": {
+    "timestamp": "2026-08-31T12:03:22.066Z",
+    "unblockedBy": "TEAM-3585",
+    "ticketId": "TEAM-3586",
+    "workflowId": "wf_1788175925679_iczquj"
+   },
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788175925679_iczquj",
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-08-31T12:03:22Z",
+   "eventId": "0mth6w6og-0000"
+  },
+  {
+   "detail": {
+    "workflowId": "wf_1788175925679_iczquj",
+    "agentId": "agentcore_hub_code_sweeper",
+    "timestamp": "2026-08-31T12:03:22.005Z",
+    "assignee": "agentcore_hub_code_sweeper",
+    "ticketId": "TEAM-3585",
+    "unblocked": [
+     "TEAM-3586"
+    ]
+   },
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788175925679_iczquj",
+   "type": "agent.complete",
+   "timestamp": "2026-08-31T12:03:22Z",
+   "eventId": "0mth6w6oo-0000"
+  },
+  {
+   "workflowId": "wf_1788175925679_iczquj",
+   "detail": {
+    "agentId": "agentcore_hub_code_reviewer",
+    "ticketId": "TEAM-3586",
+    "timestamp": "2026-08-31T12:03:24.066Z",
+    "assignee": "agentcore_hub_code_reviewer",
+    "phase": "review",
+    "workflowId": "wf_1788175925679_iczquj"
+   },
+   "type": "agent.invoked",
+   "timestamp": "2026-08-31T12:03:24.066Z",
+   "eventId": "1788177804076-ipep"
+  },
+  {
+   "workflowId": "wf_1788175925679_iczquj",
+   "detail": {
+    "workflowId": "wf_1788175925679_iczquj",
+    "timestamp": "2026-08-31T12:03:24.134Z",
+    "agentId": "agentcore_hub_code_reviewer",
+    "sessionId": "TEAM-3586_wf_1788175925679_iczquj-agentcore_hub_code_reviewer-1788177804106",
+    "ticketId": "TEAM-3586",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:838829463875:runtime/agentcore_hub_agent-ITPP0eBToO"
+   },
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-08-31T12:03:24.134Z",
+   "eventId": "1788177804143-7xc3"
+  },
+  {
+   "detail": {
+    "assignee": "agentcore_hub_code_reviewer",
+    "timestamp": "2026-08-31T12:03:24.504Z",
+    "ticketId": "TEAM-3586",
+    "agentId": "agentcore_hub_code_reviewer"
+   },
+   "workflowId": "TEAM-3586",
+   "timestamp": "2026-08-31T12:03:24.504Z",
+   "type": "agent.started",
+   "eventId": "1788177804513-s9wg",
+   "_pkNote": "ticket-keyed"
+  },
+  {
+   "workflowId": "wf_1788175925679_iczquj",
+   "source": "agentcore-hub.orchestrator",
+   "detail": {
+    "agentId": "agentcore_hub_code_reviewer",
+    "phase": "review",
+    "workflowId": "wf_1788175925679_iczquj",
+    "timestamp": "2026-08-31T12:03:24.066Z",
+    "ticketId": "TEAM-3586",
+    "assignee": "agentcore_hub_code_reviewer"
+   },
+   "timestamp": "2026-08-31T12:03:24Z",
+   "type": "agent.invoked",
+   "eventId": "0mth6w88k-0000"
+  },
+  {
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788175925679_iczquj",
+   "detail": {
+    "ticketId": "TEAM-3586",
+    "agentId": "agentcore_hub_code_reviewer",
+    "workflowId": "wf_1788175925679_iczquj",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:838829463875:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "sessionId": "TEAM-3586_wf_1788175925679_iczquj-agentcore_hub_code_reviewer-1788177804106",
+    "timestamp": "2026-08-31T12:03:24.134Z"
+   },
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-08-31T12:03:24Z",
+   "eventId": "0mth6w89i-0000"
+  },
+  {
+   "source": "agentcore-hub.orchestrator",
+   "detail": {
+    "timestamp": "2026-08-31T12:03:24.504Z",
+    "agentId": "agentcore_hub_code_reviewer",
+    "ticketId": "TEAM-3586",
+    "assignee": "agentcore_hub_code_reviewer"
+   },
+   "workflowId": "TEAM-3586",
+   "timestamp": "2026-08-31T12:03:24Z",
+   "type": "agent.started",
+   "eventId": "0mth6w8kn-0000",
+   "_pkNote": "ticket-keyed"
+  },
+  {
+   "workflowId": "wf_1788175925679_iczquj",
+   "detail": {
+    "timestamp": "2026-08-31T12:03:27Z",
+    "agentId": "agentcore_hub_code_reviewer",
+    "workflowId": "wf_1788175925679_iczquj"
+   },
+   "type": "agent.started",
+   "timestamp": "2026-08-31T12:03:27Z",
+   "eventId": "1788177807819-qoff"
+  },
+  {
+   "detail": {
+    "ticketId": "TEAM-3586",
+    "summary": "VERDICT: PASS \u2014 zero findings. Adversarial review of PR #57 (sweep/dead-code-2026-08-31 \u2192 main, d231648 vs f6859d3) complete; review documented on the PR.\n\nRe-verified ALL 8 ledger removals independen",
+    "branch": "sweep/dead-code-2026-08-31",
+    "pr_url": "https://github.com/tycenjmccann/ember/pull/57",
+    "agentId": "agentcore_hub_code_reviewer"
+   },
+   "workflowId": "wf_1788175925679_iczquj",
+   "timestamp": "2026-08-31T12:08:05.893Z",
+   "type": "workflow.report_completion",
+   "eventId": "1788178085893-61v6"
+  },
+  {
+   "detail": {
+    "agentId": "agentcore_hub_code_reviewer",
+    "ticketId": "TEAM-3586",
+    "unblocked": [
+     "TEAM-3587"
+    ],
+    "workflowId": "wf_1788175925679_iczquj",
+    "timestamp": "2026-08-31T12:08:08.904Z",
+    "assignee": "agentcore_hub_code_reviewer"
+   },
+   "workflowId": "wf_1788175925679_iczquj",
+   "timestamp": "2026-08-31T12:08:08.904Z",
+   "type": "agent.complete",
+   "eventId": "1788178088948-ewn2"
+  },
+  {
+   "detail": {
+    "ticketId": "TEAM-3587",
+    "workflowId": "wf_1788175925679_iczquj",
+    "timestamp": "2026-08-31T12:08:08.954Z",
+    "unblockedBy": "TEAM-3586"
+   },
+   "workflowId": "wf_1788175925679_iczquj",
+   "type": "orchestrator.unblocked",
+   "timestamp": "2026-08-31T12:08:08.954Z",
+   "eventId": "1788178088965-lv19"
+  },
+  {
+   "detail": {
+    "ticketId": "TEAM-3586",
+    "assignee": "agentcore_hub_code_reviewer",
+    "unblocked": [
+     "TEAM-3587"
+    ],
+    "workflowId": "wf_1788175925679_iczquj",
+    "agentId": "agentcore_hub_code_reviewer",
+    "timestamp": "2026-08-31T12:08:08.904Z"
+   },
+   "workflowId": "wf_1788175925679_iczquj",
+   "source": "agentcore-hub.orchestrator",
+   "type": "agent.complete",
+   "timestamp": "2026-08-31T12:08:08Z",
+   "eventId": "0mth72c1s-0000"
+  },
+  {
+   "workflowId": "wf_1788175925679_iczquj",
+   "source": "agentcore-hub.orchestrator",
+   "detail": {
+    "unblockedBy": "TEAM-3586",
+    "timestamp": "2026-08-31T12:08:08.954Z",
+    "ticketId": "TEAM-3587",
+    "workflowId": "wf_1788175925679_iczquj"
+   },
+   "timestamp": "2026-08-31T12:08:08Z",
+   "type": "orchestrator.unblocked",
+   "eventId": "0mth72c2a-0000"
+  },
+  {
+   "detail": {
+    "timestamp": "2026-08-31T12:08:10.461Z",
+    "workflowId": "wf_1788175925679_iczquj",
+    "phase": "verification",
+    "ticketId": "TEAM-3587"
+   },
+   "workflowId": "wf_1788175925679_iczquj",
+   "type": "workflow.phase_change",
+   "timestamp": "2026-08-31T12:08:10.461Z",
+   "eventId": "1788178090471-hn4n"
+  },
+  {
+   "workflowId": "wf_1788175925679_iczquj",
+   "detail": {
+    "assignee": "agentcore_hub_qa_verifier",
+    "ticketId": "TEAM-3587",
+    "phase": "verification",
+    "workflowId": "wf_1788175925679_iczquj",
+    "agentId": "agentcore_hub_qa_verifier",
+    "timestamp": "2026-08-31T12:08:10.769Z"
+   },
+   "timestamp": "2026-08-31T12:08:10.769Z",
+   "type": "agent.invoked",
+   "eventId": "1788178090779-s72m"
+  },
+  {
+   "workflowId": "wf_1788175925679_iczquj",
+   "detail": {
+    "agentId": "agentcore_hub_qa_verifier",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:838829463875:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "workflowId": "wf_1788175925679_iczquj",
+    "sessionId": "TEAM-3587_wf_1788175925679_iczquj-agentcore_hub_qa_verifier-1788178090846",
+    "ticketId": "TEAM-3587",
+    "timestamp": "2026-08-31T12:08:10.899Z"
+   },
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-08-31T12:08:10.899Z",
+   "eventId": "1788178090912-lh9n"
+  },
+  {
+   "source": "agentcore-hub.orchestrator",
+   "detail": {
+    "workflowId": "wf_1788175925679_iczquj",
+    "phase": "verification",
+    "timestamp": "2026-08-31T12:08:10.461Z",
+    "ticketId": "TEAM-3587"
+   },
+   "workflowId": "wf_1788175925679_iczquj",
+   "type": "workflow.phase_change",
+   "timestamp": "2026-08-31T12:08:10Z",
+   "eventId": "0mth72d79-0000"
+  },
+  {
+   "source": "agentcore-hub.orchestrator",
+   "detail": {
+    "assignee": "agentcore_hub_qa_verifier",
+    "phase": "verification",
+    "agentId": "agentcore_hub_qa_verifier",
+    "ticketId": "TEAM-3587",
+    "workflowId": "wf_1788175925679_iczquj",
+    "timestamp": "2026-08-31T12:08:10.769Z"
+   },
+   "workflowId": "wf_1788175925679_iczquj",
+   "type": "agent.invoked",
+   "timestamp": "2026-08-31T12:08:10Z",
+   "eventId": "0mth72dh4-0000"
+  },
+  {
+   "detail": {
+    "workflowId": "wf_1788175925679_iczquj",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:838829463875:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "agentId": "agentcore_hub_qa_verifier",
+    "sessionId": "TEAM-3587_wf_1788175925679_iczquj-agentcore_hub_qa_verifier-1788178090846",
+    "timestamp": "2026-08-31T12:08:10.899Z",
+    "ticketId": "TEAM-3587"
+   },
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788175925679_iczquj",
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-08-31T12:08:10Z",
+   "eventId": "0mth72dji-0000"
+  },
+  {
+   "detail": {
+    "ticketId": "TEAM-3587",
+    "assignee": "agentcore_hub_qa_verifier",
+    "timestamp": "2026-08-31T12:08:11.230Z",
+    "agentId": "agentcore_hub_qa_verifier"
+   },
+   "workflowId": "TEAM-3587",
+   "timestamp": "2026-08-31T12:08:11.230Z",
+   "type": "agent.started",
+   "eventId": "1788178091246-8hre",
+   "_pkNote": "ticket-keyed"
+  },
+  {
+   "source": "agentcore-hub.orchestrator",
+   "detail": {
+    "assignee": "agentcore_hub_qa_verifier",
+    "timestamp": "2026-08-31T12:08:11.230Z",
+    "ticketId": "TEAM-3587",
+    "agentId": "agentcore_hub_qa_verifier"
+   },
+   "workflowId": "TEAM-3587",
+   "timestamp": "2026-08-31T12:08:11Z",
+   "type": "agent.started",
+   "eventId": "0mth72dta-0000",
+   "_pkNote": "ticket-keyed"
+  },
+  {
+   "detail": {
+    "timestamp": "2026-08-31T12:08:14Z",
+    "workflowId": "wf_1788175925679_iczquj",
+    "agentId": "agentcore_hub_qa_verifier"
+   },
+   "workflowId": "wf_1788175925679_iczquj",
+   "timestamp": "2026-08-31T12:08:14Z",
+   "type": "agent.started",
+   "eventId": "1788178094091-igfz"
+  },
+  {
+   "workflowId": "wf_1788175925679_iczquj",
+   "detail": {
+    "ticketId": "TEAM-3587",
+    "agentId": "agentcore_hub_qa_verifier",
+    "branch": "sweep/dead-code-2026-08-31",
+    "summary": "QA VERDICT: PASS \u2014 dead-code-sweep PR #57 (sweep/dead-code-2026-08-31 \u2192 main, HEAD d2316487) fully verified.\n\n\u2022 Independently reproduced proof of safety on a clean checkout + fresh install (deleted no",
+    "pr_url": null
+   },
+   "timestamp": "2026-08-31T12:21:17.386Z",
+   "type": "workflow.report_completion",
+   "eventId": "1788178877386-7ml4"
+  },
+  {
+   "detail": {
+    "assignee": "agentcore_hub_qa_verifier",
+    "unblocked": [
+     "TEAM-3588"
+    ],
+    "agentId": "agentcore_hub_qa_verifier",
+    "timestamp": "2026-08-31T12:21:22.905Z",
+    "workflowId": "wf_1788175925679_iczquj",
+    "ticketId": "TEAM-3587"
+   },
+   "workflowId": "wf_1788175925679_iczquj",
+   "timestamp": "2026-08-31T12:21:22.905Z",
+   "type": "agent.complete",
+   "eventId": "1788178882969-b8fr"
+  },
+  {
+   "workflowId": "wf_1788175925679_iczquj",
+   "detail": {
+    "unblockedBy": "TEAM-3587",
+    "ticketId": "TEAM-3588",
+    "timestamp": "2026-08-31T12:21:22.987Z",
+    "workflowId": "wf_1788175925679_iczquj"
+   },
+   "timestamp": "2026-08-31T12:21:22.987Z",
+   "type": "orchestrator.unblocked",
+   "eventId": "1788178883068-dbd3"
+  },
+  {
+   "detail": {
+    "ticketId": "TEAM-3587",
+    "timestamp": "2026-08-31T12:21:22.905Z",
+    "agentId": "agentcore_hub_qa_verifier",
+    "unblocked": [
+     "TEAM-3588"
+    ],
+    "assignee": "agentcore_hub_qa_verifier",
+    "workflowId": "wf_1788175925679_iczquj"
+   },
+   "workflowId": "wf_1788175925679_iczquj",
+   "source": "agentcore-hub.orchestrator",
+   "timestamp": "2026-08-31T12:21:22Z",
+   "type": "agent.complete",
+   "eventId": "0mth7jcpc-0000"
+  },
+  {
+   "detail": {
+    "workflowId": "wf_1788175925679_iczquj",
+    "unblockedBy": "TEAM-3587",
+    "ticketId": "TEAM-3588",
+    "timestamp": "2026-08-31T12:21:22.987Z"
+   },
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788175925679_iczquj",
+   "timestamp": "2026-08-31T12:21:22Z",
+   "type": "orchestrator.unblocked",
+   "eventId": "0mth7jcuw-0000"
+  },
+  {
+   "workflowId": "wf_1788175925679_iczquj",
+   "detail": {
+    "assignee": "agentcore_hub_ci_agent",
+    "timestamp": "2026-08-31T12:21:24.837Z",
+    "ticketId": "TEAM-3588",
+    "agentId": "agentcore_hub_ci_agent",
+    "phase": "review",
+    "workflowId": "wf_1788175925679_iczquj"
+   },
+   "type": "agent.invoked",
+   "timestamp": "2026-08-31T12:21:24.837Z",
+   "eventId": "1788178884856-ekqi"
+  },
+  {
+   "workflowId": "wf_1788175925679_iczquj",
+   "detail": {
+    "ticketId": "TEAM-3588",
+    "workflowId": "wf_1788175925679_iczquj",
+    "timestamp": "2026-08-31T12:21:24.966Z",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:838829463875:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "sessionId": "TEAM-3588_wf_1788175925679_iczquj-agentcore_hub_ci_agent-1788178884867",
+    "agentId": "agentcore_hub_ci_agent"
+   },
+   "timestamp": "2026-08-31T12:21:24.966Z",
+   "type": "orchestrator.agent_invoked",
+   "eventId": "1788178884978-uzwa"
+  },
+  {
+   "detail": {
+    "ticketId": "TEAM-3588",
+    "phase": "review",
+    "assignee": "agentcore_hub_ci_agent",
+    "timestamp": "2026-08-31T12:21:24.837Z",
+    "workflowId": "wf_1788175925679_iczquj",
+    "agentId": "agentcore_hub_ci_agent"
+   },
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788175925679_iczquj",
+   "timestamp": "2026-08-31T12:21:24Z",
+   "type": "agent.invoked",
+   "eventId": "0mth7je5r-0000"
+  },
+  {
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788175925679_iczquj",
+   "detail": {
+    "workflowId": "wf_1788175925679_iczquj",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:838829463875:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "ticketId": "TEAM-3588",
+    "agentId": "agentcore_hub_ci_agent",
+    "sessionId": "TEAM-3588_wf_1788175925679_iczquj-agentcore_hub_ci_agent-1788178884867",
+    "timestamp": "2026-08-31T12:21:24.966Z"
+   },
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-08-31T12:21:24Z",
+   "eventId": "0mth7je8t-0000"
+  },
+  {
+   "workflowId": "TEAM-3588",
+   "detail": {
+    "ticketId": "TEAM-3588",
+    "assignee": "agentcore_hub_ci_agent",
+    "agentId": "agentcore_hub_ci_agent",
+    "timestamp": "2026-08-31T12:21:25.288Z"
+   },
+   "timestamp": "2026-08-31T12:21:25.288Z",
+   "type": "agent.started",
+   "eventId": "1788178885307-ux57",
+   "_pkNote": "ticket-keyed"
+  },
+  {
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "TEAM-3588",
+   "detail": {
+    "assignee": "agentcore_hub_ci_agent",
+    "timestamp": "2026-08-31T12:21:25.288Z",
+    "ticketId": "TEAM-3588",
+    "agentId": "agentcore_hub_ci_agent"
+   },
+   "timestamp": "2026-08-31T12:21:25Z",
+   "type": "agent.started",
+   "eventId": "0mth7jeho-0000",
+   "_pkNote": "ticket-keyed"
+  },
+  {
+   "detail": {
+    "timestamp": "2026-08-31T12:21:28Z",
+    "agentId": "agentcore_hub_ci_agent",
+    "workflowId": "wf_1788175925679_iczquj"
+   },
+   "workflowId": "wf_1788175925679_iczquj",
+   "timestamp": "2026-08-31T12:21:28Z",
+   "type": "agent.started",
+   "eventId": "1788178888206-vivg"
+  },
+  {
+   "detail": {
+    "pr_url": null,
+    "ticketId": "TEAM-3588",
+    "agentId": "agentcore_hub_ci_agent",
+    "branch": "sweep/dead-code-2026-08-31",
+    "summary": "CI GATE: \u2705 PASS \u2014 tycenjmccann/ember @ sweep/dead-code-2026-08-31, tested HEAD SHA d2316487e699f5bb2d167c54e344aa3492abac3b (baseline origin/main f6859d3aa744ff195ad6876ebb1c2c220597fcae).\n\nResults:\n-"
+   },
+   "workflowId": "wf_1788175925679_iczquj",
+   "timestamp": "2026-08-31T12:38:38.417Z",
+   "type": "workflow.report_completion",
+   "eventId": "1788179918417-ltkh"
+  },
+  {
+   "detail": {
+    "unblocked": [],
+    "assignee": "agentcore_hub_ci_agent",
+    "ticketId": "TEAM-3588",
+    "agentId": "agentcore_hub_ci_agent",
+    "workflowId": "wf_1788175925679_iczquj",
+    "timestamp": "2026-08-31T12:38:40.422Z"
+   },
+   "workflowId": "wf_1788175925679_iczquj",
+   "type": "agent.complete",
+   "timestamp": "2026-08-31T12:38:40.422Z",
+   "eventId": "1788179920474-1er8"
+  },
+  {
+   "detail": {
+    "unblocked": [],
+    "agentId": "agentcore_hub_ci_agent",
+    "workflowId": "wf_1788175925679_iczquj",
+    "timestamp": "2026-08-31T12:38:40.422Z",
+    "assignee": "agentcore_hub_ci_agent",
+    "ticketId": "TEAM-3588"
+   },
+   "workflowId": "wf_1788175925679_iczquj",
+   "source": "agentcore-hub.orchestrator",
+   "type": "agent.complete",
+   "timestamp": "2026-08-31T12:38:40Z",
+   "eventId": "0mth85l8h-0000"
+  },
+  {
+   "workflowId": "wf_1788175925679_iczquj",
+   "detail": {
+    "action": "unstick",
+    "by": "workflow-manager",
+    "note": "Missed unblock cascade: TEAM-3588 (CI) completed at 12:38:40Z with agent.complete unblocked=[], so its downstream TEAM-3589 (Ship, release_manager, blockedBy=[TEAM-3588]) was never re-dispatched. TEAM-3589 sits in_progress from an earlier correct self-block (release_manager last streamed 11:45:24Z, no live session/lease). CI PASS verdict recorded (PR #57, HEAD d2316487, baseline f6859d3). Re-firing the cascade to re-run the Ship ticket.",
+    "ticketsScanned": 8,
+    "nudged": []
+   },
+   "type": "manager.intervention",
+   "timestamp": "2026-08-31T12:51:17.616625Z",
+   "eventId": "1788180677616-wm-pkl9"
+  },
+  {
+   "workflowId": "wf_1788175925679_iczquj",
+   "detail": {
+    "reason": "manual_restart",
+    "ticketId": "TEAM-3589",
+    "agentId": "agentcore_hub_release_manager"
+   },
+   "type": "agent.retry",
+   "timestamp": "2026-08-31T12:51:44.081Z",
+   "eventId": "1788180704081-retry-gxev"
+  },
+  {
+   "workflowId": "wf_1788175925679_iczquj",
+   "detail": {
+    "agentId": "agentcore_hub_release_manager",
+    "action": "retry",
+    "note": "Re-dispatch TEAM-3589 (Ship). Its only blocker TEAM-3588 (CI) completed 12:38:40Z (CI GATE PASS, HEAD d2316487, baseline f6859d3) but the agent.complete carried unblocked=[] \u2014 the unblock cascade to TEAM-3589 was dropped, so the Ship ticket was never re-invoked. TEAM-3589 has been in_progress since an earlier CORRECT self-block (ran before deliverables existed); release_manager last streamed 11:45:24Z with no live session and only a ship-blocked-evidence.md artifact (no Ship verdict shipped). Blocker now satisfied; re-running per the release_manager's own documented unblock path.",
+    "by": "workflow-manager",
+    "ticketId": "TEAM-3589"
+   },
+   "type": "manager.intervention",
+   "timestamp": "2026-08-31T12:51:44.093090Z",
+   "eventId": "1788180704093-wm-veel"
+  },
+  {
+   "detail": {
+    "agentId": "agentcore_hub_release_manager",
+    "timestamp": "2026-08-31T12:51:49.016Z",
+    "phase": "ship",
+    "assignee": "agentcore_hub_release_manager",
+    "workflowId": "wf_1788175925679_iczquj",
+    "ticketId": "TEAM-3589"
+   },
+   "workflowId": "wf_1788175925679_iczquj",
+   "type": "agent.invoked",
+   "timestamp": "2026-08-31T12:51:49.016Z",
+   "eventId": "1788180709094-1s6t"
+  },
+  {
+   "workflowId": "wf_1788175925679_iczquj",
+   "detail": {
+    "workflowId": "wf_1788175925679_iczquj",
+    "agentId": "agentcore_hub_release_manager",
+    "sessionId": "TEAM-3589_wf_1788175925679_iczquj-agentcore_hub_release_manager-1788180709130",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:838829463875:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "ticketId": "TEAM-3589",
+    "timestamp": "2026-08-31T12:51:49.241Z"
+   },
+   "timestamp": "2026-08-31T12:51:49.241Z",
+   "type": "orchestrator.agent_invoked",
+   "eventId": "1788180709270-pgex"
+  },
+  {
+   "detail": {
+    "timestamp": "2026-08-31T12:51:49.629Z",
+    "ticketId": "TEAM-3589",
+    "assignee": "agentcore_hub_release_manager",
+    "agentId": "agentcore_hub_release_manager"
+   },
+   "workflowId": "TEAM-3589",
+   "type": "agent.started",
+   "timestamp": "2026-08-31T12:51:49.629Z",
+   "eventId": "1788180709649-oeyh",
+   "_pkNote": "ticket-keyed"
+  },
+  {
+   "workflowId": "wf_1788175925679_iczquj",
+   "source": "agentcore-hub.orchestrator",
+   "detail": {
+    "agentId": "agentcore_hub_release_manager",
+    "ticketId": "TEAM-3589",
+    "timestamp": "2026-08-31T12:51:49.016Z",
+    "phase": "ship",
+    "assignee": "agentcore_hub_release_manager",
+    "workflowId": "wf_1788175925679_iczquj"
+   },
+   "type": "agent.invoked",
+   "timestamp": "2026-08-31T12:51:49Z",
+   "eventId": "0mth8mhqw-0000"
+  },
+  {
+   "detail": {
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:838829463875:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "timestamp": "2026-08-31T12:51:49.241Z",
+    "sessionId": "TEAM-3589_wf_1788175925679_iczquj-agentcore_hub_release_manager-1788180709130",
+    "ticketId": "TEAM-3589",
+    "agentId": "agentcore_hub_release_manager",
+    "workflowId": "wf_1788175925679_iczquj"
+   },
+   "workflowId": "wf_1788175925679_iczquj",
+   "source": "agentcore-hub.orchestrator",
+   "timestamp": "2026-08-31T12:51:49Z",
+   "type": "orchestrator.agent_invoked",
+   "eventId": "0mth8mhwx-0000"
+  },
+  {
+   "workflowId": "TEAM-3589",
+   "detail": {
+    "assignee": "agentcore_hub_release_manager",
+    "timestamp": "2026-08-31T12:51:49.629Z",
+    "agentId": "agentcore_hub_release_manager",
+    "ticketId": "TEAM-3589"
+   },
+   "source": "agentcore-hub.orchestrator",
+   "timestamp": "2026-08-31T12:51:49Z",
+   "type": "agent.started",
+   "eventId": "0mth8mi6j-0000",
+   "_pkNote": "ticket-keyed"
+  },
+  {
+   "detail": {
+    "timestamp": "2026-08-31T12:51:53Z",
+    "workflowId": "wf_1788175925679_iczquj",
+    "agentId": "agentcore_hub_release_manager"
+   },
+   "workflowId": "wf_1788175925679_iczquj",
+   "type": "agent.started",
+   "timestamp": "2026-08-31T12:51:53Z",
+   "eventId": "1788180713510-zsam"
+  },
+  {
+   "detail": {
+    "summary": "SHIP VERDICT: PASS \u2014 zero findings. PR #57 (sweep/dead-code-2026-08-31 \u2192 main) finalized and left OPEN for the human Merge Approval gate. NOT merged; auto-merge NOT enabled (autoMergeRequest: null ver",
+    "agentId": "agentcore_hub_release_manager",
+    "branch": "sweep/dead-code-2026-08-31",
+    "ticketId": "TEAM-3589",
+    "pr_url": "https://github.com/tycenjmccann/ember/pull/57"
+   },
+   "workflowId": "wf_1788175925679_iczquj",
+   "type": "workflow.report_completion",
+   "timestamp": "2026-08-31T12:57:03.710Z",
+   "eventId": "1788181023710-ceyb"
+  },
+  {
+   "workflowId": "wf_1788175925679_iczquj",
+   "detail": {
+    "workflowId": "wf_1788175925679_iczquj",
+    "assignee": "agentcore_hub_release_manager",
+    "timestamp": "2026-08-31T12:57:09.265Z",
+    "ticketId": "TEAM-3589",
+    "agentId": "agentcore_hub_release_manager",
+    "unblocked": [
+     "TEAM-3590"
+    ]
+   },
+   "type": "agent.complete",
+   "timestamp": "2026-08-31T12:57:09.265Z",
+   "eventId": "1788181029328-ne5x"
+  },
+  {
+   "workflowId": "wf_1788175925679_iczquj",
+   "detail": {
+    "unblockedBy": "TEAM-3589",
+    "workflowId": "wf_1788175925679_iczquj",
+    "timestamp": "2026-08-31T12:57:09.368Z",
+    "ticketId": "TEAM-3590"
+   },
+   "timestamp": "2026-08-31T12:57:09.368Z",
+   "type": "orchestrator.unblocked",
+   "eventId": "1788181029378-5wq4"
+  },
+  {
+   "workflowId": "wf_1788175925679_iczquj",
+   "source": "agentcore-hub.orchestrator",
+   "detail": {
+    "ticketId": "TEAM-3589",
+    "assignee": "agentcore_hub_release_manager",
+    "unblocked": [
+     "TEAM-3590"
+    ],
+    "workflowId": "wf_1788175925679_iczquj",
+    "agentId": "agentcore_hub_release_manager",
+    "timestamp": "2026-08-31T12:57:09.265Z"
+   },
+   "type": "agent.complete",
+   "timestamp": "2026-08-31T12:57:09Z",
+   "eventId": "0mth8tcuh-0000"
+  },
+  {
+   "workflowId": "wf_1788175925679_iczquj",
+   "source": "agentcore-hub.orchestrator",
+   "detail": {
+    "workflowId": "wf_1788175925679_iczquj",
+    "timestamp": "2026-08-31T12:57:09.368Z",
+    "ticketId": "TEAM-3590",
+    "unblockedBy": "TEAM-3589"
+   },
+   "timestamp": "2026-08-31T12:57:09Z",
+   "type": "orchestrator.unblocked",
+   "eventId": "0mth8td15-0000"
+  },
+  {
+   "detail": {
+    "reviewer": "engineer",
+    "workflowId": "wf_1788175925679_iczquj",
+    "timestamp": "2026-08-31T12:57:10.768Z",
+    "ticketId": "TEAM-3590"
+   },
+   "workflowId": "wf_1788175925679_iczquj",
+   "timestamp": "2026-08-31T12:57:10.768Z",
+   "type": "review.needed",
+   "eventId": "1788181030778-wo2k"
+  },
+  {
+   "detail": {
+    "timestamp": "2026-08-31T12:57:10.768Z",
+    "ticketId": "TEAM-3590",
+    "workflowId": "wf_1788175925679_iczquj",
+    "reviewer": "engineer"
+   },
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788175925679_iczquj",
+   "timestamp": "2026-08-31T12:57:10Z",
+   "type": "review.needed",
+   "eventId": "0mth8tdye-0000"
+  },
+  {
+   "workflowId": "wf_1788175925679_iczquj",
+   "detail": {
+    "by": "workflow-manager",
+    "action": "comment",
+    "ticketId": "TEAM-3590",
+    "note": "Watch check: pipeline is healthy and complete through Ship (TEAM-3583..3589 all done, rework=0, release_manager verdict PASS, ship-review-summary.md persisted). The ~153min of no events is this human merge-approval gate awaiting an engineer, with CD (TEAM-3591) correctly blocked behind it. No agent stall, no error, no orphan. No intervention taken \u2014 waiting on human approval as designed."
+   },
+   "timestamp": "2026-08-31T15:30:41.198895Z",
+   "type": "manager.intervention",
+   "eventId": "1788190241198-wm-k9uh"
+  },
+  {
+   "detail": {
+    "note": "Third watch pass on a designed human wait. Pipeline fully healthy and complete through Ship: TEAM-3583..3589 all done, rework=0, no errors; release_manager verdict PASS at 12:57:09Z (PR #57, HEAD d231648 == CI-tested SHA, ship-review-summary.md persisted to S3). The 149min silence is the human merge-approval gate TEAM-3590 (in_review, human:engineer) awaiting an engineer, with CD TEAM-3591 correctly blocked behind it. Prior pass at 15:30Z already diagnosed identically and commented. Nothing agent-side is actionable \u2014 muting the circuit breaker so this designed human touchpoint stops paging. Un-mutes naturally when the human approves and CD resumes.",
+    "action": "mute",
+    "by": "workflow-manager"
+   },
+   "workflowId": "wf_1788175925679_iczquj",
+   "type": "manager.intervention",
+   "timestamp": "2026-08-31T18:00:55.751601Z",
+   "eventId": "1788199255751-wm-4qap"
+  },
+  {
+   "detail": {
+    "timestamp": "2026-08-31T19:30:38.555Z",
+    "workflowId": "wf_1788175925679_iczquj",
+    "ticketId": "TEAM-3590",
+    "agentId": "human:engineer",
+    "assignee": "human:engineer",
+    "unblocked": [
+     "TEAM-3591"
+    ]
+   },
+   "workflowId": "wf_1788175925679_iczquj",
+   "timestamp": "2026-08-31T19:30:38.555Z",
+   "type": "agent.complete",
+   "eventId": "1788204638568-kdq3"
+  },
+  {
+   "workflowId": "wf_1788175925679_iczquj",
+   "detail": {
+    "unblockedBy": "TEAM-3590",
+    "workflowId": "wf_1788175925679_iczquj",
+    "ticketId": "TEAM-3591",
+    "timestamp": "2026-08-31T19:30:38.575Z"
+   },
+   "timestamp": "2026-08-31T19:30:38.575Z",
+   "type": "orchestrator.unblocked",
+   "eventId": "1788204638585-j83n"
+  },
+  {
+   "workflowId": "wf_1788175925679_iczquj",
+   "detail": {
+    "agentId": "human:engineer",
+    "assignee": "human:engineer",
+    "workflowId": "wf_1788175925679_iczquj",
+    "unblocked": [
+     "TEAM-3591"
+    ],
+    "ticketId": "TEAM-3590",
+    "timestamp": "2026-08-31T19:30:38.555Z"
+   },
+   "source": "agentcore-hub.orchestrator",
+   "type": "agent.complete",
+   "timestamp": "2026-08-31T19:30:38Z",
+   "eventId": "0mthmvduc-0000"
+  },
+  {
+   "workflowId": "wf_1788175925679_iczquj",
+   "source": "agentcore-hub.orchestrator",
+   "detail": {
+    "unblockedBy": "TEAM-3590",
+    "workflowId": "wf_1788175925679_iczquj",
+    "ticketId": "TEAM-3591",
+    "timestamp": "2026-08-31T19:30:38.575Z"
+   },
+   "timestamp": "2026-08-31T19:30:38Z",
+   "type": "orchestrator.unblocked",
+   "eventId": "0mthmvedy-0000"
+  },
+  {
+   "workflowId": "wf_1788175925679_iczquj",
+   "detail": {
+    "ticketId": "TEAM-3591",
+    "timestamp": "2026-08-31T19:30:40.955Z",
+    "agentId": "agentcore_hub_release_manager",
+    "assignee": "agentcore_hub_release_manager",
+    "workflowId": "wf_1788175925679_iczquj",
+    "phase": "ship"
+   },
+   "timestamp": "2026-08-31T19:30:40.955Z",
+   "type": "agent.invoked",
+   "eventId": "1788204641043-c1s9"
+  },
+  {
+   "workflowId": "wf_1788175925679_iczquj",
+   "detail": {
+    "sessionId": "TEAM-3591_wf_1788175925679_iczquj-agentcore_hub_release_manager-1788204641084",
+    "workflowId": "wf_1788175925679_iczquj",
+    "agentId": "agentcore_hub_release_manager",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:838829463875:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "timestamp": "2026-08-31T19:30:41.184Z",
+    "ticketId": "TEAM-3591"
+   },
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-08-31T19:30:41.184Z",
+   "eventId": "1788204641203-r1ye"
+  },
+  {
+   "workflowId": "TEAM-3591",
+   "detail": {
+    "timestamp": "2026-08-31T19:30:41.532Z",
+    "assignee": "agentcore_hub_release_manager",
+    "agentId": "agentcore_hub_release_manager",
+    "ticketId": "TEAM-3591"
+   },
+   "type": "agent.started",
+   "timestamp": "2026-08-31T19:30:41.532Z",
+   "eventId": "1788204641543-mkhy",
+   "_pkNote": "ticket-keyed"
+  },
+  {
+   "workflowId": "wf_1788175925679_iczquj",
+   "detail": {
+    "workflowId": "wf_1788175925679_iczquj",
+    "ticketId": "TEAM-3591",
+    "agentId": "agentcore_hub_release_manager",
+    "phase": "ship",
+    "timestamp": "2026-08-31T19:30:40.955Z",
+    "assignee": "agentcore_hub_release_manager"
+   },
+   "source": "agentcore-hub.orchestrator",
+   "type": "agent.invoked",
+   "timestamp": "2026-08-31T19:30:41Z",
+   "eventId": "0mthmvfrn-0000"
+  },
+  {
+   "detail": {
+    "ticketId": "TEAM-3591",
+    "timestamp": "2026-08-31T19:30:41.184Z",
+    "sessionId": "TEAM-3591_wf_1788175925679_iczquj-agentcore_hub_release_manager-1788204641084",
+    "workflowId": "wf_1788175925679_iczquj",
+    "agentId": "agentcore_hub_release_manager",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:838829463875:runtime/agentcore_hub_agent-ITPP0eBToO"
+   },
+   "workflowId": "wf_1788175925679_iczquj",
+   "source": "agentcore-hub.orchestrator",
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-08-31T19:30:41Z",
+   "eventId": "0mthmvfw2-0000"
+  },
+  {
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "TEAM-3591",
+   "detail": {
+    "ticketId": "TEAM-3591",
+    "assignee": "agentcore_hub_release_manager",
+    "timestamp": "2026-08-31T19:30:41.532Z",
+    "agentId": "agentcore_hub_release_manager"
+   },
+   "timestamp": "2026-08-31T19:30:41Z",
+   "type": "agent.started",
+   "eventId": "0mthmvg65-0000",
+   "_pkNote": "ticket-keyed"
+  },
+  {
+   "workflowId": "wf_1788175925679_iczquj",
+   "detail": {
+    "agentId": "agentcore_hub_release_manager",
+    "timestamp": "2026-08-31T19:30:42Z",
+    "workflowId": "wf_1788175925679_iczquj"
+   },
+   "timestamp": "2026-08-31T19:30:42Z",
+   "type": "agent.started",
+   "eventId": "1788204642652-kdlj"
+  },
+  {
+   "workflowId": "wf_1788175925679_iczquj",
+   "detail": {
+    "agentId": "agentcore_hub_release_manager",
+    "workflowId": "wf_1788175925679_iczquj",
+    "ticketId": "",
+    "error": "An error occurred (ServiceUnavailableException) when calling the ConverseStream operation (reached max retries: 2): Bedrock is unable to process your request."
+   },
+   "timestamp": "2026-08-31T19:31:57.373033Z",
+   "type": "agent.error",
+   "eventId": "1788204717919-err-373033"
+  },
+  {
+   "detail": {
+    "reason": "manual_restart",
+    "agentId": "agentcore_hub_release_manager",
+    "ticketId": "TEAM-3591"
+   },
+   "workflowId": "wf_1788175925679_iczquj",
+   "timestamp": "2026-08-31T22:42:00.116Z",
+   "type": "agent.retry",
+   "eventId": "1788216120116-retry-eepq"
+  },
+  {
+   "detail": {
+    "agentId": "agentcore_hub_release_manager",
+    "action": "retry",
+    "ticketId": "TEAM-3591",
+    "by": "workflow-manager",
+    "note": "CD ticket TEAM-3591 crashed: release_manager hit agent.error 'ServiceUnavailableException (ConverseStream, max retries: 2) \u2014 Bedrock unable to process request' at 2026-08-31T19:31:57Z, ~11s after streaming its CD plan and before merging. Transient Bedrock outage, NOT a silent stall. No merge occurred (no merge-commit SHA on ticket, no CD artifact). All upstream gates PASS and human Merge Approval TEAM-3590 is done/approved; PR #57 verified at head SHA d231648 (matches CI-tested SHA). Retry to merge PR #57 into main per ticket acceptance criteria and complete the run. Lease dead ~190 min."
+   },
+   "workflowId": "wf_1788175925679_iczquj",
+   "type": "manager.intervention",
+   "timestamp": "2026-08-31T22:42:00.156057Z",
+   "eventId": "1788216120156-wm-1aug"
+  },
+  {
+   "workflowId": "wf_1788175925679_iczquj",
+   "detail": {
+    "ticketId": "TEAM-3591",
+    "assignee": "agentcore_hub_release_manager",
+    "workflowId": "wf_1788175925679_iczquj",
+    "phase": "ship",
+    "timestamp": "2026-08-31T22:42:05.194Z",
+    "agentId": "agentcore_hub_release_manager"
+   },
+   "type": "agent.invoked",
+   "timestamp": "2026-08-31T22:42:05.194Z",
+   "eventId": "1788216125329-xq24"
+  },
+  {
+   "workflowId": "wf_1788175925679_iczquj",
+   "detail": {
+    "agentId": "agentcore_hub_release_manager",
+    "workflowId": "wf_1788175925679_iczquj",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:838829463875:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "ticketId": "TEAM-3591",
+    "timestamp": "2026-08-31T22:42:05.493Z",
+    "sessionId": "TEAM-3591_wf_1788175925679_iczquj-agentcore_hub_release_manager-1788216125354"
+   },
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-08-31T22:42:05.493Z",
+   "eventId": "1788216125505-wnq2"
+  },
+  {
+   "detail": {
+    "ticketId": "TEAM-3591",
+    "agentId": "agentcore_hub_release_manager",
+    "timestamp": "2026-08-31T22:42:05.882Z",
+    "assignee": "agentcore_hub_release_manager"
+   },
+   "workflowId": "TEAM-3591",
+   "type": "agent.started",
+   "timestamp": "2026-08-31T22:42:05.882Z",
+   "eventId": "1788216125892-nsd8",
+   "_pkNote": "ticket-keyed"
+  },
+  {
+   "detail": {
+    "ticketId": "TEAM-3591",
+    "phase": "ship",
+    "workflowId": "wf_1788175925679_iczquj",
+    "assignee": "agentcore_hub_release_manager",
+    "agentId": "agentcore_hub_release_manager",
+    "timestamp": "2026-08-31T22:42:05.194Z"
+   },
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788175925679_iczquj",
+   "timestamp": "2026-08-31T22:42:05Z",
+   "type": "agent.invoked",
+   "eventId": "0mthtplm3-0000"
+  },
+  {
+   "detail": {
+    "sessionId": "TEAM-3591_wf_1788175925679_iczquj-agentcore_hub_release_manager-1788216125354",
+    "workflowId": "wf_1788175925679_iczquj",
+    "runtimeArn": "arn:aws:bedrock-agentcore:us-east-1:838829463875:runtime/agentcore_hub_agent-ITPP0eBToO",
+    "agentId": "agentcore_hub_release_manager",
+    "ticketId": "TEAM-3591",
+    "timestamp": "2026-08-31T22:42:05.493Z"
+   },
+   "workflowId": "wf_1788175925679_iczquj",
+   "source": "agentcore-hub.orchestrator",
+   "type": "orchestrator.agent_invoked",
+   "timestamp": "2026-08-31T22:42:05Z",
+   "eventId": "0mthtpln2-0000"
+  },
+  {
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "TEAM-3591",
+   "detail": {
+    "timestamp": "2026-08-31T22:42:05.882Z",
+    "agentId": "agentcore_hub_release_manager",
+    "ticketId": "TEAM-3591",
+    "assignee": "agentcore_hub_release_manager"
+   },
+   "type": "agent.started",
+   "timestamp": "2026-08-31T22:42:05Z",
+   "eventId": "0mthtpm0c-0000",
+   "_pkNote": "ticket-keyed"
+  },
+  {
+   "workflowId": "wf_1788175925679_iczquj",
+   "detail": {
+    "timestamp": "2026-08-31T22:42:10Z",
+    "workflowId": "wf_1788175925679_iczquj",
+    "agentId": "agentcore_hub_release_manager"
+   },
+   "type": "agent.started",
+   "timestamp": "2026-08-31T22:42:10Z",
+   "eventId": "1788216130326-cpbn"
+  },
+  {
+   "workflowId": "wf_1788175925679_iczquj",
+   "detail": {
+    "ticketId": "TEAM-3591",
+    "action": "comment",
+    "note": "## Crash RCA: agentcore_hub_release_manager on TEAM-3591 (wf_1788175925679_iczquj)\n- Symptom: CD ticket stuck in_progress; run silent ~188 min in verification phase. Full upstream chain (req->sweep->review->QA->CI->Ship->human Merge Approval) all done; PR #57 verified/approved at head SHA d231648, but never merged.\n- Occurrences: ONE dead session TEAM-3591_wf_...-agentcore_hub_release_manager-1788204641084. agent.started 19:30:41Z, streamed CD plan until 19:31:46Z, agent.error 19:31:57Z. Single ",
+    "by": "workflow-manager"
+   },
+   "type": "manager.intervention",
+   "timestamp": "2026-08-31T22:43:08.088605Z",
+   "eventId": "1788216188088-wm-18fa"
+  },
+  {
+   "detail": {
+    "summary": "CD COMPLETE \u2014 PR #57 merged to main strictly after recorded human approval; deployment intentionally out of scope.\n\n\u2022 Preconditions verified BEFORE merge: Merge Approval gate TEAM-3590 (human:engineer",
+    "branch": "main",
+    "agentId": "agentcore_hub_release_manager",
+    "pr_url": "https://github.com/tycenjmccann/ember/pull/57",
+    "ticketId": "TEAM-3591"
+   },
+   "workflowId": "wf_1788175925679_iczquj",
+   "type": "workflow.report_completion",
+   "timestamp": "2026-08-31T22:45:43.186Z",
+   "eventId": "1788216343185-1t8v"
+  },
+  {
+   "detail": {
+    "agentId": "agentcore_hub_release_manager",
+    "timestamp": "2026-08-31T22:45:45.447Z",
+    "unblocked": [],
+    "workflowId": "wf_1788175925679_iczquj",
+    "ticketId": "TEAM-3591",
+    "assignee": "agentcore_hub_release_manager"
+   },
+   "workflowId": "wf_1788175925679_iczquj",
+   "timestamp": "2026-08-31T22:45:45.447Z",
+   "type": "agent.complete",
+   "eventId": "1788216345489-5v97"
+  },
+  {
+   "source": "agentcore-hub.orchestrator",
+   "detail": {
+    "workflowId": "wf_1788175925679_iczquj",
+    "agentId": "agentcore_hub_release_manager",
+    "timestamp": "2026-08-31T22:45:45.447Z",
+    "ticketId": "TEAM-3591",
+    "assignee": "agentcore_hub_release_manager",
+    "unblocked": []
+   },
+   "workflowId": "wf_1788175925679_iczquj",
+   "type": "agent.complete",
+   "timestamp": "2026-08-31T22:45:45Z",
+   "eventId": "0mthtuayk-0000"
+  },
+  {
+   "workflowId": "wf_1788175925679_iczquj",
+   "detail": {
+    "prUrl": "",
+    "workflowId": "wf_1788175925679_iczquj",
+    "ticketId": "TEAM-3582",
+    "timestamp": "2026-08-31T22:45:46.724Z"
+   },
+   "type": "workflow.complete",
+   "timestamp": "2026-08-31T22:45:46.724Z",
+   "eventId": "1788216346735-7y72"
+  },
+  {
+   "source": "agentcore-hub.orchestrator",
+   "workflowId": "wf_1788175925679_iczquj",
+   "detail": {
+    "ticketId": "TEAM-3582",
+    "timestamp": "2026-08-31T22:45:46.724Z",
+    "workflowId": "wf_1788175925679_iczquj",
+    "prUrl": ""
+   },
+   "type": "workflow.complete",
+   "timestamp": "2026-08-31T22:45:46Z",
+   "eventId": "0mthtuc05-0000"
+  }
+ ],
+ "streamCounts": {
+  "agentcore_hub_requirements_analyst": {
+   "text": 5,
+   "trace": 16,
+   "reasoning": 0,
+   "lastText": "Feature-flow workflow (not a bug-fix). Following the requirements-analyst blueprint. First, intake: inspect the repo and check for an existing ticket chain under the epic (re-invocation guard).Excellent output from claude_code. Saving the requirements doc to the shared workspace and recording the ticket plan.Now creating the tickets in dependency order (each needs the previous ticket's ID). T1 first:Step 4c \u2014 verify the created chain has no duplicates:Chain verified \u2014 exactly one ticket per planned assignee (release_manager correctly has two: Ship + CD), no duplicates. Reporting completion.",
+   "lastStreamAt": "2026-08-31T11:42:24.0021Z"
+  },
+  "agentcore_hub_code_sweeper": {
+   "text": 3,
+   "trace": 8,
+   "reasoning": 0,
+   "lastText": "Detection complete. Now Phase 2: verification and surgical removal. I'll give codex explicit keep-rules for the framework entry points and dynamic-dispatch surfaces.Removals look surgical (67 deletions, 1 mechanical insertion from a multiline-import cleanup). Now Phase 3: fresh-install proof, commit, and push.Fresh-install builds are green and the branch is pushed. Now I'll persist the evidence to S3 and open the PR with the Removal Ledger.",
+   "lastStreamAt": "2026-08-31T12:03:03.0011Z"
+  },
+  "agentcore_hub_release_manager": {
+   "text": 22,
+   "trace": 43,
+   "reasoning": 0,
+   "lastText": "re-fires once upstream delivers \u2014 the BLOCKED verdict and evidence are recorded on the ticket comment and in S3. I will **not** transition it to Done, since `report_completion`/Done would un-park the human Merge Approval gate with nothing behind it.\n\n---\n\n## Final Report \u2014 TEAM-3589 Ship: Dead Code Sweep (rework pass)\n\n### Verdict: **BLOCKED \u2014 there is nothing to ship**\n\nI redid the work from scratch rather than trusting any prior state, and the Ship phase fails at Step 1 (PR open/adopt + CI-SHA cross-check) on hard evidence:\n\n| Check | Command | Result |\n|---|---|---|\n| Head branch exists | `list_branches(tycenjmccann/ember)` | \u274c `sweep/dead-code-2026-08-31` **does not exist** (branches: main, feature/TEAM-2859-code-sweeper, feat/ecs-express-deploy, feat/runtime-aws-parity, fix/disable-codex-web-search) |\n| PR from that head | `list_pull_requests(head=tycenjmccann:sweep/dead-code-2026-08-31, state=all)` | \u274c `[]` \u2014 TEAM-3585 never opened the PR |\n| Upstream chain done | `Tickets___list_tickets(TEAM-3582)` | \u274c Sweep TEAM-3585 = in_progress; Review TEAM-3586, QA TEAM-3587, CI TEAM-3588 = blocked |\n| CI-tested SHA (mandatory cross-check) | `S3 list completions/TEAM-35*` | \u274c Only `TEAM-3583.json` exists for this workflow; no CI completion \u2192 no tested SHA \u2192 automatic block |\n\n### Key judgment call (likely the point of the requested rework)\nOpen **PR #56** (\"chore: dead code sweep \u2014 remove 29 unused symbols/files\", head `feature/TEAM-2859-code-sweeper`, created 2026-08-24, SHA `78a5e7a`) is the **previous** sweep run (epic TEAM-2859), not this run (epic TEAM-3582, 2026-08-31). I explicitly did **not** adopt it: doing so would bypass this run's entire review\u2192QA\u2192CI chain and attach the human merge gate to code this run never verified.\n\n### Guarantees honored\n- Nothing merged; **no auto-merge** set anywhere; Merge Approval gate **TEAM-3590 remains parked and untouched**\n- No PR fabricated against a nonexistent branch; no codex review run against the wrong run's diff\n- Did not call `report_completion` (would falsely Done this ticket and un-park the gate)\n\n### Actions taken\n1. Evidence record \u2192 `s3://\u2026/workflows/wf_1788175925679_iczquj/agents/agentcore_hub_release_manager/ship-blocked-evidence.md`\n2. Nudge comment on owning dev ticket **TEAM-3585** with the exact unblock requirements (branch, PR, full Removal Ledger, proof-of-safety `npm run build` + `npm run mcp:build`, detection appendix) \u2014 no duplicate fix ticket filed since the owning ticket is already open and in progress\n3. BLOCKED verdict + evidence comment on **TEAM-3589**; ticket left In Progress for re-run\n\n### Tool status note\nOne tool failure to report: `Tickets___transition_ticket(TEAM-3589 \u2192 blocked)` was rejected \u2014 this workflow has no \"Blocked\" transition. Handled by leaving the ticket In Progress with the BLOCKED verdict documented in comments, per the blueprint's rework loop. Also: an initial `Tickets___search_issues(\"TEAM-3589\")` returned a JQL 400; I routed around it with `list_tickets`.\n\n### Unblock path\nTEAM-3585 delivers branch + PR + ledger \u2192 TEAM-3586 review \u2192 TEAM-3587 QA \u2192 TEAM-3588 CI (completion must record the tested head SHA) \u2192 this Ship ticket re-runs: PR adopt, SHA cross-check, codex final-diff review, external bot-review harvest, verdict.PR #57 adopted; head SHA `d231648` matches CI's tested SHA exactly. Now let me confirm upstream review/QA outcomes and read the requirements.All upstream gates green (review PASS, QA PASS, CI PASS on the same SHA). Now the independent final-diff review with codex.Zero findings from the independent codex review, no external bot findings, auto-merge confirmed OFF. Verdict: **PASS**. Posting the review summary to the PR and to S3 for the human merge gate.CD ticket confirmed. Following the blueprint: verify the human gate, verify the PR is unchanged since the Ship review, preflight DEPLOY.md, then merge. Gathering the facts in parallel:Merge complete. Writing the CD evidence artifact and recording the decision on the ticket:",
+   "lastStreamAt": "2026-08-31T22:45:25.0012Z"
+  },
+  "agentcore_hub_code_reviewer": {
+   "text": 3,
+   "trace": 7,
+   "reasoning": 0,
+   "lastText": "I have the blueprint and requirements. Now let me find the PR and its Removal Ledger, then kick off the adversarial review with `codex`.PR #57 found with the full Removal Ledger (8 removals). Now I'll delegate the independent re-verification to `codex`.The independent re-verification is complete and clean across all checks. Let me document the clean pass on the PR, then report completion.",
+   "lastStreamAt": "2026-08-31T12:07:48.0010Z"
+  },
+  "agentcore_hub_qa_verifier": {
+   "text": 3,
+   "trace": 11,
+   "reasoning": 0,
+   "lastText": "All checks passed. The harvest footer didn't include the verification artifact, so let me retrieve its content to persist as durable QA evidence.The content didn't come through in the reply. Let me ask it to include the text directly in its response.All verification steps passed. Now persisting durable evidence to S3 and documenting results.",
+   "lastStreamAt": "2026-08-31T12:21:02.0014Z"
+  },
+  "agentcore_hub_ci_agent": {
+   "text": 1,
+   "trace": 6,
+   "reasoning": 0,
+   "lastText": "All CI checks passed. Let me persist the evidence to S3 and document results on the ticket.",
+   "lastStreamAt": "2026-08-31T12:38:19.0007Z"
+  }
+ },
+ "completions": {
+  "TEAM-3583": {
+   "ticket_id": "TEAM-3583",
+   "summary": "Requirements analysis complete for Dead Code Sweep \u2014 tycenjmccann/ember \u2014 2026-08-31.\n\nScope: MODIFY EXISTING \u2014 removal-only maintenance sweep of a Next.js 14 + TS repo with a nested second TS project (mcp/port-session, excluded from root tsconfig).\n\nKey repo facts verified: NO test script/framework and NO CI workflow exist \u2014 proof-of-safety is `npm run build` + `npm run mcp:build` on fresh install. knip/ts-prune/depcheck not installed \u2014 must run via npx only. Top false-positive risks documented: App Router entry points (~20 route.ts), src/middleware.ts, MCP name-string tool dispatch, Tailwind content-glob classes, public/ URL-string assets, env-gated code, paths referenced in Dockerfile/install.sh/deploy/**.\n\nDeliverables:\n- Requirements doc (FR-1..FR-5 with ACs, per-candidate verification protocol, Removal Ledger template, agent selection with default-DENY justification) saved to shared/requirements.md.\n- Ticket chain created under epic TEAM-3582 (verified, no duplicates):\n  TEAM-3585 code_sweeper (sweep, branch sweep/dead-code-2026-08-31, PR into main) \u2192 TEAM-3586 code_reviewer (false-positive hunt) \u2192 TEAM-3587 qa_verifier (proof + ledger 1:1) \u2192 TEAM-3588 ci_agent (fresh-install build gate) \u2192 TEAM-3589 release_manager Ship (finalize PR, no merge) \u2192 TEAM-3590 human:engineer Merge Approval (BLOCKING gate) \u2192 TEAM-3591 release_manager CD (merge only after approval).\n\nNever-auto-merge rule embedded in every ticket; uncertain candidates are kept and ledgered. All tool calls succeeded.",
+   "artifacts": "workflows/wf_1788175925679_iczquj/shared/requirements.md,workflows/wf_1788175925679_iczquj/shared/ticket-plan.json",
+   "branch": null,
+   "commit_sha": null,
+   "pr_url": null,
+   "completed_at": "2026-08-31T11:42:36.008Z"
+  },
+  "TEAM-3585": {
+   "ticket_id": "TEAM-3585",
+   "summary": "Dead-code sweep of tycenjmccann/ember complete. PR #57 open (base main \u2190 head sweep/dead-code-2026-08-31), NOT merged, no auto-merge.\n\nACTUALLY RAN (via codex):\n- Detection: npx knip 6.33.0, ts-prune 0.10.3, depcheck 1.4.7 \u2014 separately over root and mcp/port-session. Raw output captured (evidence artifact). No tool failures; nothing added to any manifest/lockfile (git diff main on package.json/lockfiles shows only the clsx removal).\n- Verification: whole-repo git grep per candidate (incl. Dockerfile, install.sh, deploy/**, docs/**, css, manifests); MCP name-string dispatch (CallToolRequestSchema/ListTools/GetPrompt) checked; App Router entry points treated live by definition.\n- Proof: FRESH install (node_modules + .next wiped, npm ci) then npm run build \u2192 exit 0 \u2705 and npm run mcp:build \u2192 exit 0 \u2705, post-removal.\n- Tests: NONE exist in repo (re-verified: no test script, no framework, no .github/workflows) \u2192 proof of safety is build + mcp:build, stated in ledger. No test suite was run because none exists.\n\nCOUNTS: 8 removed (src/lib/utils.ts file; 4 duplicate default-export lines in CodeBlock/KindlingLoader/MarkdownRenderer/PullCommandButton; deleteSession; putTenantSilo; dep clsx via npm uninstall) vs ~140 flagged candidates KEPT (framework entry points, root-knip nested-MCP false positives, tooling deps, all \"(used in module)\" exports). Zero uncertain items removed. Diff: 67 deletions, 1 mechanical insertion (import cleanup).\n\nPR body contains full Removal Ledger (1:1 with diff), kept-uncertain section, proof of safety, and detection appendix with tool versions.",
+   "artifacts": "workflows/wf_1788175925679_iczquj/shared/dev-evidence/TEAM-3585-sweep-evidence.md",
+   "branch": "sweep/dead-code-2026-08-31",
+   "commit_sha": "d2316487e699f5bb2d167c54e344aa3492abac3b",
+   "pr_url": "https://github.com/tycenjmccann/ember/pull/57",
+   "completed_at": "2026-08-31T12:03:18.780Z"
+  },
+  "TEAM-3586": {
+   "ticket_id": "TEAM-3586",
+   "summary": "VERDICT: PASS \u2014 zero findings. Adversarial review of PR #57 (sweep/dead-code-2026-08-31 \u2192 main, d231648 vs f6859d3) complete; review documented on the PR.\n\nRe-verified ALL 8 ledger removals independently (fresh clone, greps against origin/main so deleted code was present, codex engine \u2014 independent of the sweep's engine):\n- src/lib/utils.ts: all import forms \u2192 0 hits; `truncate` external hits are Tailwind class strings only; `cn` hit is binary PNG noise (git grep -I clean); not in tsconfig paths/next.config/barrels.\n- 4 duplicate default-export removals: no `import X from` default imports; all dynamic()/import() in repo target ShellTerminal/ArtifactsPanel/Lightbox only; no React.lazy.\n- deleteSession/putTenantSilo: definition-only repo-wide incl. case variants, deploy/** shell+Python, docs/mockups HTML, CSS; not among MCP tool/prompt dispatch names (read index.ts handlers: port_session_to_cloud, pull_session_from_cloud, sync_cli_config, login_cli, authenticate + prompts).\n- clsx: root-only on main; 0 hits on sweep incl. no residual lockfile entry; mcp manifests never referenced it.\n\nStructural: diff removal-only (11 pure deletions + 2 mechanical import cleanups with remaining symbols verified in use; no adds/renames; 67 del/1 ins matches ledger); entry-point/config/public/deploy files untouched; manifest+lockfile diff = clsx only, no knip/ts-prune/depcheck or helpers leaked, mcp lockfile unchanged; zero \"kept \u2014 uncertain\" items deleted (spot-checked getTenantSilo, encodeClose, mintInstallationToken, safeRelPath, tooling devDeps \u2014 all present). No root REVIEW.md. Ledger 8 rows \u2194 diff 1:1. PR not merged, no auto-merge \u2014 QA (T3) proceeds.\n\nTool status: all tools succeeded.\n[coding-session: cc-b3d095c8ee94468785b3706b215c67a4 cli=codex conversation=01a057b5-44f6-7ad2-a3d7-b9119805cc9a]",
+   "artifacts": "workflows/wf_1788175925679_iczquj/shared/dev-evidence/TEAM-3585-sweep-evidence.md",
+   "branch": "sweep/dead-code-2026-08-31",
+   "commit_sha": null,
+   "pr_url": "https://github.com/tycenjmccann/ember/pull/57",
+   "completed_at": "2026-08-31T12:08:05.848Z"
+  },
+  "TEAM-3587": {
+   "ticket_id": "TEAM-3587",
+   "summary": "QA VERDICT: PASS \u2014 dead-code-sweep PR #57 (sweep/dead-code-2026-08-31 \u2192 main, HEAD d2316487) fully verified.\n\n\u2022 Independently reproduced proof of safety on a clean checkout + fresh install (deleted node_modules \u00d72 + .next, npm ci exit 0): `npm run build` exit 0 (next build incl. tsc, no type errors) and `npm run mcp:build` exit 0.\n\u2022 Test-runner re-check at execution time: NONE exists (no test script in either package.json, no .github/workflows/, no jest/vitest/playwright/cypress/mocha config or dep) \u2014 ledger's explicit \"no test runner present\" statement confirmed accurate.\n\u2022 Removal Ledger 1:1 with diff: 8 removed rows == 8 distinct deleted items (src/lib/utils.ts, clsx dep, deleteSession, putTenantSilo, 4 redundant default exports), no orphans either direction; diff is 67 deletions + 1 mechanical import-rewrite insertion, exactly as claimed.\n\u2022 Grep evidence independently re-run: 0 hits for all removed symbols/dep; remaining component imports all NAMED; named exports intact; all `truncate` hits are Tailwind classes, not the deleted util.\n\u2022 Kept-uncertain items all intact: middleware.ts, 9 mcp/port-session src files, 20 API route.ts, all spot-checked kept exports present; none appear as deletions.\n\u2022 Manifest hygiene: only clsx removal; knip/ts-prune/depcheck in zero manifests/lockfiles. PR body contains proof results + detection appendix (npx commands, knip 6.33.0 / ts-prune 0.10.3 / depcheck 1.4.7).\n\u2022 PR NOT merged, auto-merge not touched. Pre-existing npm audit advisories noted as non-findings (PR adds/changes nothing \u2014 removal only).\n[coding-session: cc-6e16f9fdbecb402da6c6f651e2164379]",
+   "artifacts": "workflows/wf_1788175925679_iczquj/shared/qa-evidence/TEAM-3587-qa-verification.md",
+   "branch": "sweep/dead-code-2026-08-31",
+   "commit_sha": null,
+   "pr_url": null,
+   "completed_at": "2026-08-31T12:21:17.325Z"
+  },
+  "TEAM-3588": {
+   "ticket_id": "TEAM-3588",
+   "summary": "CI GATE: \u2705 PASS \u2014 tycenjmccann/ember @ sweep/dead-code-2026-08-31, tested HEAD SHA d2316487e699f5bb2d167c54e344aa3492abac3b (baseline origin/main f6859d3aa744ff195ad6876ebb1c2c220597fcae).\n\nResults:\n- Fresh install: rm -rf node_modules && npm ci \u2192 exit 0, 276 pkgs, no lockfile drift\n- npm run build (next build + type-check) \u2192 exit 0, 25 routes, 7/7 static, compiled clean\n- npm run mcp:build (mcp/port-session install + tsc) \u2192 exit 0, clean\n- Baseline vs main: rebuilt main from fresh install \u2014 identical output/warnings; NO new warnings/errors introduced by sweep (only warning is an environmental AWS SDK node-version notice, present on main too)\n- Manifest/lockfile hygiene: only change is REMOVAL of `clsx` (package.json + package-lock.json, entry removed wholesale, lockfileVersion unchanged); lockfiles npm-consistent (npm ls exit 0 + --package-lock-only --dry-run \"up to date\" in both projects; working tree clean after npm ci)\n- Tooling check: ZERO knip/ts-prune/depcheck or helper deps in any manifest/lockfile or diff\n- Diff scope: 9 files, +1/\u221267, strictly removal-only (single +1 is mechanical import rewrite in tenant-store.ts); no new files; NO entry-point/config files touched\n- Test runner: none exists in repo (verified) \u2192 proof of safety is build + mcp:build, both green\n\nNo merge/push/commit performed. Branch is CI-clean; NEVER auto-merge \u2014 human gate still required downstream.\n\n[coding-session: cc-975a1f46560c4372810e0eef241aa454]",
+   "artifacts": "workflows/wf_1788175925679_iczquj/shared/ci-evidence/TEAM-3588-ci-report.md",
+   "branch": "sweep/dead-code-2026-08-31",
+   "commit_sha": "d2316487e699f5bb2d167c54e344aa3492abac3b",
+   "pr_url": null,
+   "completed_at": "2026-08-31T12:38:38.376Z"
+  },
+  "TEAM-3589": {
+   "ticket_id": "TEAM-3589",
+   "summary": "SHIP VERDICT: PASS \u2014 zero findings. PR #57 (sweep/dead-code-2026-08-31 \u2192 main) finalized and left OPEN for the human Merge Approval gate. NOT merged; auto-merge NOT enabled (autoMergeRequest: null verified via gh).\n\n\u2022 PR adopted: https://github.com/tycenjmccann/ember/pull/57, base main (f6859d3), head d2316487e699f5bb2d167c54e344aa3492abac3b.\n\u2022 SHA cross-check: PR head == CI-tested SHA (TEAM-3588 completion record) \u2014 no untested commits; single commit on branch, no rework/seam risk.\n\u2022 PR body complete: final Removal Ledger (8 removed rows 1:1 with diff), kept-uncertain table, proof-of-safety (fresh npm ci + npm run build exit 0 + npm run mcp:build exit 0; explicit \"no test runner present\" note), detection appendix (npx-only; knip 6.33.0 / ts-prune 0.10.3 / depcheck 1.4.7).\n\u2022 Independent final-diff review via codex (different engine): ZERO FINDINGS. Diff 9 files, +1/\u221267, strictly removal-only \u2014 sole non-lockfile insertion is the mechanical import rewrite in tenant-store.ts (remaining symbols verified in use). No entry-point/config/public-API files touched (src/app/**, middleware, configs, Dockerfile, install.sh, deploy/**, public/**, docs/**, mcp/** all clean). Manifest/lockfile diff = clsx removal only, lockfileVersion 3 intact, no tooling deps added. All 8 removals independently re-verified dead (grep evidence per item; truncate hits are Tailwind classes; no default imports/dynamic()/React.lazy; deleteSession/putTenantSilo reference-free and not MCP dispatch names). No root REVIEW.md on main.\n\u2022 External review harvest: no bot reviews or inline comments; only TEAM-3586's PASS review. mergeStateStatus CLEAN.\n\u2022 Upstream gates reflected: TEAM-3586 review PASS, TEAM-3587 QA PASS, TEAM-3588 CI PASS \u2014 all on this exact SHA.\n\u2022 Review summary posted as PR comment (issuecomment-5478684074) and written to workflows/wf_1788175925679_iczquj/shared/ship-review-summary.md for the merge gate.\n\nTool status: all tools succeeded. Merge Approval gate (T6) is the human's call; CD (T7) merges only after approval, and only at SHA d231648 \u2014 any drift requires re-review.\n[coding-session: cc-d0d93cdb957641019cf84e00204580b9 cli=codex conversation=01a057e1-7770-7050-8722-390b180278b4]",
+   "artifacts": "workflows/wf_1788175925679_iczquj/shared/ship-review-summary.md,workflows/wf_1788175925679_iczquj/shared/dev-evidence/TEAM-3585-sweep-evidence.md,workflows/wf_1788175925679_iczquj/shared/qa-evidence/TEAM-3587-qa-verification.md,workflows/wf_1788175925679_iczquj/shared/ci-evidence/TEAM-3588-ci-report.md",
+   "branch": "sweep/dead-code-2026-08-31",
+   "commit_sha": "d2316487e699f5bb2d167c54e344aa3492abac3b",
+   "pr_url": "https://github.com/tycenjmccann/ember/pull/57",
+   "completed_at": "2026-08-31T12:57:03.519Z"
+  },
+  "TEAM-3591": {
+   "ticket_id": "TEAM-3591",
+   "summary": "CD COMPLETE \u2014 PR #57 merged to main strictly after recorded human approval; deployment intentionally out of scope.\n\n\u2022 Preconditions verified BEFORE merge: Merge Approval gate TEAM-3590 (human:engineer) = done/approved; PR head d2316487e699f5bb2d167c54e344aa3492abac3b exactly matched the Ship-review SHA (TEAM-3589) and CI-tested SHA (TEAM-3588) \u2014 zero drift, single commit, mergeStateStatus CLEAN, auto-merge never enabled.\n\u2022 Merge: gh pr merge 57 --squash --delete-branch \u2192 exit 0. Merge commit on main: f754cd36618f9b2adad03217bb4705d443ca8dd8 (2026-08-31T22:44:08Z). Verified on origin/main: f6859d3 \u2192 f754cd3, 9 files, +1/\u221267 \u2014 the exact removal-only sweep diff the human approved.\n\u2022 Branch cleanup: remote sweep/dead-code-2026-08-31 deleted (git ls-remote \u2192 empty).\n\u2022 Deployment decision (recorded on ticket): repo has NO DEPLOY.md and NO CI/CD pipeline (.github/workflows absent \u2014 verified on main and PR head); deploy/** = manual AWS tenant scripts, not a merge deploy contract. Per the never-deploy-without-DEPLOY.md rule and the ticket's explicit merge-only scope for a removal-only sweep, NO deploy/smoke command was run \u2014 merge to main completes this workflow. Production untouched; no rollback needed. Non-blocking recommendation: add a root DEPLOY.md if automated CD is ever wanted for this repo.\n\u2022 Tool status: all tools succeeded (one gh --json field quirk on `merged`, retried with valid fields; noted in evidence).\n\n[coding-session: cc-1461c7466b25435f9e36eb9a0a7c1282 cli=claude conversation=8d4a91c6-02ed-4a6d-a0d1-e5336f26b895]",
+   "artifacts": "workflows/wf_1788175925679_iczquj/shared/cd-evidence/deploy-f754cd36618f9b2adad03217bb4705d443ca8dd8.md,workflows/wf_1788175925679_iczquj/shared/ship-review-summary.md",
+   "branch": "main",
+   "commit_sha": "f754cd36618f9b2adad03217bb4705d443ca8dd8",
+   "pr_url": "https://github.com/tycenjmccann/ember/pull/57",
+   "completed_at": "2026-08-31T22:45:43.031Z"
+  }
+ },
+ "artifacts": [
+  {
+   "key": "workflows/wf_1788175925679_iczquj/agents/agentcore_hub_release_manager/ship-blocked-evidence.md",
+   "size": 3211
+  },
+  {
+   "key": "workflows/wf_1788175925679_iczquj/shared/cd-evidence/deploy-f754cd36618f9b2adad03217bb4705d443ca8dd8.md",
+   "size": 3673
+  },
+  {
+   "key": "workflows/wf_1788175925679_iczquj/shared/ci-evidence/TEAM-3588-ci-report.md",
+   "size": 3930
+  },
+  {
+   "key": "workflows/wf_1788175925679_iczquj/shared/dev-evidence/TEAM-3585-sweep-evidence.md",
+   "size": 4247
+  },
+  {
+   "key": "workflows/wf_1788175925679_iczquj/shared/manifest.json",
+   "size": 2475
+  },
+  {
+   "key": "workflows/wf_1788175925679_iczquj/shared/qa-evidence/TEAM-3587-qa-verification.md",
+   "size": 6744
+  },
+  {
+   "key": "workflows/wf_1788175925679_iczquj/shared/requirements.md",
+   "size": 18051
+  },
+  {
+   "key": "workflows/wf_1788175925679_iczquj/shared/ship-review-summary.md",
+   "size": 4148
+  },
+  {
+   "key": "workflows/wf_1788175925679_iczquj/shared/ticket-plan.json",
+   "size": 1042
+  }
+ ],
+ "evalSummaries": [
+  {
+   "agentId": "agentcore_hub_ci_agent",
+   "sessionCount": 0,
+   "avgScores": {}
+  },
+  {
+   "agentId": "agentcore_hub_code_reviewer",
+   "sessionCount": 0,
+   "avgScores": {}
+  },
+  {
+   "agentId": "agentcore_hub_code_sweeper",
+   "sessionCount": 0,
+   "avgScores": {}
+  },
+  {
+   "agentId": "agentcore_hub_qa_verifier",
+   "sessionCount": 0,
+   "avgScores": {}
+  },
+  {
+   "agentId": "agentcore_hub_release_manager",
+   "sessionCount": 0,
+   "avgScores": {}
+  },
+  {
+   "agentId": "agentcore_hub_requirements_analyst",
+   "sessionCount": 343,
+   "avgScores": {
+    "Correctness": 0.42,
+    "Builtin.ToolSelectionAccuracy": 0.9569,
+    "Builtin.ResponseRelevance": 0.9971,
+    "Builtin.Helpfulness": 0.8121,
+    "Builtin.Correctness": 0.9556,
+    "Builtin.GoalSuccessRate": 0.9675,
+    "Builtin.ToolParameterAccuracy": 0.9248,
+    "Builtin.InstructionFollowing": 0.7985,
+    "Builtin.Coherence": 0.9601,
+    "dependency_chain_compliance_online": 0.1771,
+    "Builtin.Faithfulness": 0.9885
+   }
+  }
+ ],
+ "priorAnalyses": [
+  {
+   "analysisId": "1788204882372-thw0",
+   "workflowId": "wf_1788171795749_dom4hd",
+   "analyzedAt": "2026-08-31T19:34:42.372129Z",
+   "runOutcome": "complete",
+   "scores": {
+    "overall": 84,
+    "reviewEfficiency": 82,
+    "reworkDiscipline": 85,
+    "planning": 90,
+    "execution": 78
+   },
+   "verdict": "A correct, verified deletion-only sweep (PR #239) that was approved at the human merge gate, but completed only via WATCH-mode rescue of a P1 CI crash and a missed-unblock cascade on the new release_manager step \u2014 sound product, noisy self-healing tail.",
+   "totalDurationMs": 32839248,
+   "humanWaitTotalMs": 43369738,
+   "changeRequestCount": 2
+  },
+  {
+   "analysisId": "1787774762677-26d0",
+   "workflowId": "wf_1787774327729_4vraf4",
+   "analyzedAt": "2026-08-26T20:06:02.677586Z",
+   "runOutcome": "complete",
+   "scores": {
+    "overall": 91,
+    "reworkDiscipline": 95,
+    "planning": 93,
+    "reviewEfficiency": 95,
+    "execution": 92
+   },
+   "verdict": "A clean, textbook workflow end-to-end connectivity test: intake enumerated the full 5-agent roster, wired a correct dependency graph, and all five agents were reached, loaded their skills, exercised their tools, and completed green in ~4.6 min.",
+   "totalDurationMs": 275975,
+   "humanWaitTotalMs": 0,
+   "changeRequestCount": 0
+  },
+  {
+   "analysisId": "1787773540275-bvnt",
+   "workflowId": "wf_1787773178083_pzwkun",
+   "analyzedAt": "2026-08-26T19:45:40.275702Z",
+   "runOutcome": "complete",
+   "scores": {
+    "planning": 95,
+    "reworkDiscipline": 95,
+    "reviewEfficiency": 90,
+    "overall": 91,
+    "execution": 94
+   },
+   "verdict": "A textbook workflow end-to-end connectivity test: intake correctly enumerated the full roster and built a correct parallel dependency graph, all five agents were reached, loaded skills, exercised tools and reported completion in ~3.4 min with zero errors \u2014 the pipeline is healthy.",
+   "totalDurationMs": 201159,
+   "humanWaitTotalMs": 0,
+   "changeRequestCount": 0
+  },
+  {
+   "analysisId": "1787572497045-0uxz",
+   "workflowId": "wf_1787570051649_kvkmlw",
+   "analyzedAt": "2026-08-24T11:54:57.045183Z",
+   "runOutcome": "complete",
+   "scores": {
+    "planning": 90,
+    "overall": 82,
+    "execution": 85,
+    "reworkDiscipline": 95,
+    "reviewEfficiency": 88
+   },
+   "verdict": "A clean, fully-autonomous 5-agent sweep that correctly removed 102 lines of verified-dead Swift and honestly diagnosed a pre-existing build blocker \u2014 but shipped a PR whose FR-4 build/test acceptance criteria were never actually met, verified only by static grep.",
+   "totalDurationMs": 1795428,
+   "humanWaitTotalMs": 0,
+   "changeRequestCount": 0
+  },
+  {
+   "analysisId": "1787572492498-0d5w",
+   "workflowId": "wf_1787571125741_0ph7b1",
+   "analyzedAt": "2026-08-24T11:54:52.498311Z",
+   "runOutcome": "complete",
+   "scores": {
+    "planning": 82,
+    "execution": 93,
+    "overall": 89,
+    "reviewEfficiency": 95,
+    "reworkDiscipline": 95
+   },
+   "verdict": "A clean, fully-autonomous dead-code sweep of tycenjmccann/ember: 29 verified-dead items removed, full serial review/QA/CI chain all PASS, PR #56 opened and correctly left un-merged \u2014 marred only by a missing requirements\u2192sweeper dependency edge that let the sweeper start ~49s before requirements finished.",
+   "totalDurationMs": 1162865,
+   "humanWaitTotalMs": 0,
+   "changeRequestCount": 0
+  }
+ ],
+ "missingSignals": []
+}
