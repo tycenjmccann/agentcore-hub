@@ -453,6 +453,41 @@ export function createCascade(deps) {
     if (dispatched) {
       m.redispatched++;
       log(`[orchestrator] cascade re-dispatch — ${sibling.ticketId} agent=${agentId}`);
+      // TEAM-4187 — the re-wake of a PARKED dependent used to be SILENT. The
+      // journal only ever recorded blocked/todo→Ready unblocks, so f50ucz's
+      // steal+redispatch of TEAM-4126 (08:27:48Z) left no event at all: the
+      // dossier, cost-report and the anomaly watcher could see the run stall and
+      // then move, with nothing in between explaining why.
+      //
+      // Emitted HERE and only here: this is the one point where both CASes have
+      // won (the steal took the exact claim generation, the re-dispatch took the
+      // fresh claim), so it fires exactly once per real re-dispatch — the CASes
+      // ARE the idempotency, no extra marker needed. The event is a journal
+      // record, so a publish failure must not turn a COMPLETED recovery into a
+      // counted dependentError/candidateError (which would also drop the
+      // outcome the sweep tallies): it is logged and swallowed, same shape as
+      // emitContractWarning's purely-observational publish.
+      m.rewoken = (m.rewoken || 0) + 1;
+      try {
+        await publishEvent(sibling.ticketId, "orchestrator.unblocked", {
+          ticketId: sibling.ticketId,
+          unblockedBy,
+          workflowId: workflow?.id,
+          blockedBy: blockerUnion(sibling),
+          // The discriminator: a consumer that only knows the Ready-transition
+          // journal can filter this shape out on previousStatus alone.
+          previousStatus: sibling.status || "in_progress",
+          reason: sibling.preconditionUnmet?.awaitingIds?.length ? "awaited_rewake" : "stale_lease_rewake",
+          source: unblockedBy === "reconcile-sweep" ? "reconcile-sweep" : "cascade",
+          // Stamped from the injected clock, not wall time: publishEvent honors a
+          // valid ISO detail.timestamp (TEAM-4167 D3) and deterministicEventId
+          // keys off the SAME value, so the EventBridge copy and the direct copy
+          // still collapse onto one row.
+          timestamp: new Date(now()).toISOString(),
+        });
+      } catch (err) {
+        log(`[orchestrator] cascade rewake_event_failed — ${sibling.ticketId}: ${err?.message || err}`);
+      }
       return "redispatched";
     }
     log(`[orchestrator] cascade re-dispatch refused — ${sibling.ticketId} (claim CAS lost)`);
@@ -846,6 +881,10 @@ export function newMetrics() {
     // a held clean park with open/capped blockers (awaiting), NEITHER an escalation.
     exitedOk: 0,
     awaiting: 0,
+    // TEAM-4187 — re-wakes of a PARKED in_progress dependent (steal CAS + claim
+    // CAS both won), the population the orchestrator.unblocked journal now covers.
+    // A subset of `redispatched`: counted alongside it, never instead of it.
+    rewoken: 0,
   };
 }
 
@@ -856,7 +895,7 @@ export function hasCascadeActivity(m) {
     m.dependentErrors || m.wouldNudge || m.wouldSteal || m.wouldRedispatch ||
     m.wouldReviewReawaken || m.blockerConfirmAborted ||
     m.levelDispatched || m.wouldDispatch || m.levelDispatchErrors ||
-    m.exitedOk || m.awaiting || m.escalated
+    m.exitedOk || m.awaiting || m.escalated || m.rewoken
   );
 }
 
@@ -889,6 +928,7 @@ export function emitCascadeMetrics(m) {
           { Name: "CascadeLevelDispatchErrors", Unit: "Count" },
           { Name: "CascadeExitedOk", Unit: "Count" },
           { Name: "CascadeAwaiting", Unit: "Count" },
+          { Name: "CascadeRewoken", Unit: "Count" },
         ],
       }],
     },
@@ -907,5 +947,6 @@ export function emitCascadeMetrics(m) {
     CascadeLevelDispatchErrors: m.levelDispatchErrors || 0,
     CascadeExitedOk: m.exitedOk || 0,
     CascadeAwaiting: m.awaiting || 0,
+    CascadeRewoken: m.rewoken || 0,
   }));
 }

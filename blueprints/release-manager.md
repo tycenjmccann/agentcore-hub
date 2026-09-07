@@ -246,7 +246,9 @@ missing = empty state, round 1):
      shared branch, starting again from Step 1's SHA cross-check. Then call
      `WorkflowOutput___report_precondition_unmet(ticket_id=<your ticket>, awaiting_ids=<the fix-ticket keys you filed>)`
      so the orchestrator re-wakes you automatically when those fixes close — do not
-     rely on a human to re-dispatch.
+     rely on a human to re-dispatch. If the tool returns `status: "error"` (stamp
+     not persisted), record the resume condition — the awaited ticket keys — as a
+     comment on your ticket via `Tickets___add_comment` before stopping.
    - **CHANGES NEEDED, effective count >= `maxRounds` — ESCALATE. Do NOT spawn
      this round's fix tickets.** The loop stops here; leave the round's
      `fixTickets` empty, then:

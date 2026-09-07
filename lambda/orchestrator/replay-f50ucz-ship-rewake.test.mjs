@@ -101,19 +101,68 @@ describe("f50ucz D1 — the cascade re-wakes TEAM-4126 when the LAST awaited fix
     const shipIdx = w.redispatchedIds.indexOf(SHIP);
     expect(w.redispatchedBlockedBy[shipIdx]).toEqual(expect.arrayContaining([FIX_B, FIX_CI]));
 
+    // TEAM-4187 — the AC's "orchestrator.unblocked for TEAM-4126" is now literally
+    // emitted. The parked in_progress re-wake used to be silent (only blocked/todo
+    // →Ready transitions journaled), so this recovery left no trace at all.
+    const un = w.eventsOfType("orchestrator.unblocked").filter((e) => e.detail.ticketId === SHIP);
+    expect(un).toHaveLength(1);
+    expect(un[0].detail.unblockedBy).toBe(FIX_CI);     // the LAST awaited fix closing
+    expect(un[0].detail.source).toBe("cascade");        // event path, not the sweep
+    expect(un[0].detail.previousStatus).toBe("in_progress"); // the re-wake shape
+    expect(un[0].detail.reason).toBe("awaited_rewake"); // it carried awaitingIds
+    expect(un[0].detail.workflowId).toBe(WF_ID);
+    // The journal records the FULL union it waited on, not just the closer.
+    expect(un[0].detail.blockedBy).toEqual(expect.arrayContaining([FIX_B, FIX_CI]));
+    // Stamped from the injected clock — within one sweep interval of the close.
+    const stamp = Date.parse(un[0].detail.timestamp);
+    expect(stamp).toBeGreaterThanOrEqual(Date.parse(COMPLETED[FIX_CI]));
+    expect(stamp).toBeLessThanOrEqual(Date.parse(COMPLETED[FIX_CI]) + 60_000);
+
     // A follow-up sweep must NOT re-dispatch again — the fresh claim is now live.
     const before = w.redispatchedIds.length;
     await w.sweep.runSweep("enforce");
     expect(w.redispatchedIds.length).toBe(before);
+    // ...and therefore journals no second unblock: the event is one-per-redispatch.
+    expect(w.eventsOfType("orchestrator.unblocked").filter((e) => e.detail.ticketId === SHIP))
+      .toHaveLength(1);
   });
 
-  // NOTE (AC deviation, reported): the design line "orchestrator.unblocked for
-  // TEAM-4126" is not literally emittable here. cascadeUnblock publishes
-  // orchestrator.unblocked ONLY for blocked/todo→Ready transitions; a parked
-  // in_progress dependent (which is exactly what preserveStatusIf keeps TEAM-4126)
-  // re-wakes through the steal+redispatch path, which emits no orchestrator.unblocked.
-  // The substantive AC — the redispatch and the union blockedBy it carried — is
-  // asserted above.
+  it("TEAM-4187: the SWEEP re-wake journals orchestrator.unblocked too (source reconcile-sweep)", async () => {
+    const w = await armed();
+
+    // No cascadeUnblock at all — the fan-out was MISSED (the f50ucz failure mode).
+    // All three fixes are done by 08:27:48Z; one interval later the sweep is the
+    // only thing left to recover TEAM-4126.
+    w.advanceTo("2026-09-06T08:28:48Z");
+    const m = await w.sweep.runSweep("enforce");
+
+    // The clean-park evidence gate routes it to the D2 clean-exit re-wake, which
+    // tallies exitedOk (not redispatched) — but the re-dispatch is real, so the
+    // journal fires exactly once.
+    expect(m.candidates).toBe(1);
+    expect(m.exitedOk).toBe(1);
+    expect(m.redispatched).toBe(0);
+    expect(m.rewoken).toBe(1);
+    expect(w.redispatchedIds.filter((id) => id === SHIP)).toEqual([SHIP]);
+
+    const un = w.eventsOfType("orchestrator.unblocked").filter((e) => e.detail.ticketId === SHIP);
+    expect(un).toHaveLength(1);
+    expect(un[0].detail.source).toBe("reconcile-sweep");
+    expect(un[0].detail.unblockedBy).toBe("reconcile-sweep");
+    expect(un[0].detail.previousStatus).toBe("in_progress");
+    expect(un[0].detail.reason).toBe("awaited_rewake");
+    expect(un[0].detail.blockedBy).toEqual(expect.arrayContaining([FIX_B, FIX_CI]));
+    // The injected clock, exactly — not wall time (deterministicEventId keys off it).
+    expect(un[0].detail.timestamp).toBe("2026-09-06T08:28:48.000Z");
+
+    // Second sweep: the fresh claim is live, so no second re-dispatch and no
+    // second journal record.
+    const before = w.redispatchedIds.length;
+    await w.sweep.runSweep("enforce");
+    expect(w.redispatchedIds.length).toBe(before);
+    expect(w.eventsOfType("orchestrator.unblocked").filter((e) => e.detail.ticketId === SHIP))
+      .toHaveLength(1);
+  });
 
   it("provider parity — jira issue-links reach the identical re-dispatch + event set", async () => {
     const ddbW = await armed("dynamodb");

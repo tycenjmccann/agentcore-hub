@@ -187,7 +187,10 @@ Mechanical mixed with logic failures → auto-fix the mechanical, file dev ticke
 for the logic, verdict FAIL until the dev tickets land. When you FAIL and file
 fix tickets, call `WorkflowOutput___report_precondition_unmet(ticket_id=<your CI ticket>, awaiting_ids=<the ci_fix keys you filed>)`
 so the orchestrator re-wakes you to re-certify when those fixes close — do not
-report_completion (that would Done your ticket unverified).
+report_completion (that would Done your ticket unverified). If the tool returns
+`status: "error"` (stamp not persisted), record the resume condition — the awaited
+ticket keys — as a comment on your ticket via `Tickets___add_comment` before
+stopping.
 
 ### P3: Report
 Report a short table: head SHA, CodeBuild build id, status, log link. On any

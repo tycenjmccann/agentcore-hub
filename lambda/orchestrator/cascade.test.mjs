@@ -1326,3 +1326,165 @@ describe("TEAM-4166 D2 §2.3 — evidence-gated escalation guard", () => {
     expect(evidence.lastStreamAt).toBe("2026-09-01T05:00:00Z");
   });
 });
+
+/**
+ * TEAM-4187 (review finding of TEAM-4168) — the parked-re-wake journal.
+ *
+ * cascadeUnblock's orchestrator.unblocked journal only ever covered
+ * blocked/todo→Ready transitions. A dependent PARKED in in_progress (the shape
+ * preserveStatusIf keeps a release manager in while it waits on its fix tickets)
+ * re-wakes through steal+redispatch instead — which published nothing at all. So
+ * the f50ucz recovery at 08:27:48Z was invisible: the run stalled, then moved,
+ * with no event in between to explain why.
+ *
+ * The emit lives at the ONE point where both CASes have won
+ * (cascade.stealAndRedispatch), so every producer — event path, reconcile sweep,
+ * dead-session detector — inherits it, and it can never fire for a re-dispatch
+ * that did not actually happen.
+ */
+describe("TEAM-4187 — orchestrator.unblocked on a parked in_progress re-wake", () => {
+  const unblockEvents = (publishEvent) => eventsOfType(publishEvent, "orchestrator.unblocked");
+
+  it("stale lease + no stamp → one event, reason stale_lease_rewake, CascadeRewoken == 1", async () => {
+    const siblings = [
+      { ticketId: DONE, status: "done" },
+      { ticketId: "TEAM-2", status: "in_progress", assignee: "dev", blockedBy: [DONE] },
+    ];
+    const { deps, publishEvent, redispatch } = makeExtDeps({
+      getChildTickets: vi.fn(async () => siblings),
+    });
+    const cap = captureMetrics();
+    const { cascadeUnblock } = createCascade(deps);
+
+    await cascadeUnblock(DONE, "EPIC-1", extWorkflow);
+    const records = cap.records();
+    cap.restore();
+
+    expect(redispatch).toHaveBeenCalledTimes(1);
+    const evs = unblockEvents(publishEvent);
+    expect(evs).toHaveLength(1);
+    const [ticketId, , detail] = evs[0];
+    expect(ticketId).toBe("TEAM-2");
+    expect(detail.ticketId).toBe("TEAM-2");
+    expect(detail.unblockedBy).toBe(DONE);
+    expect(detail.workflowId).toBe("wf_1");
+    expect(detail.previousStatus).toBe("in_progress");
+    // No preconditionUnmet → this was a plain stale-lease recovery, not a wait.
+    expect(detail.reason).toBe("stale_lease_rewake");
+    expect(detail.source).toBe("cascade");
+    expect(detail.blockedBy).toEqual([DONE]);
+    // Stamped from the injected clock (publishEvent honors a supplied ISO ts).
+    expect(detail.timestamp).toBe(new Date(NOW).toISOString());
+    // The counter rides along with the emit, and is declared in the EMF record.
+    expect(records[0].CascadeRewoken).toBe(1);
+    expect(records[0]._aws.CloudWatchMetrics[0].Metrics.map((x) => x.Name)).toContain("CascadeRewoken");
+  });
+
+  it("shadow mode → would-steal only: ZERO events, rewoken not counted", async () => {
+    const siblings = [
+      { ticketId: DONE, status: "done" },
+      { ticketId: "TEAM-2", status: "in_progress", assignee: "dev", blockedBy: [DONE] },
+    ];
+    const { deps, publishEvent, redispatch } = makeExtDeps({
+      extendedStates: "shadow",
+      getChildTickets: vi.fn(async () => siblings),
+    });
+    const m = newMetrics();
+    const { handleInProgressDependent } = createCascade(deps);
+
+    const outcome = await handleInProgressDependent(siblings[1], DONE, extWorkflow, m, "shadow");
+
+    expect(outcome).toBe("would-steal");
+    expect(redispatch).not.toHaveBeenCalled();
+    expect(unblockEvents(publishEvent)).toHaveLength(0);
+    expect(m.rewoken).toBe(0);
+  });
+
+  it("no re-dispatch, no journal: steal CAS lost / claim CAS lost / lease live on re-check", async () => {
+    const siblings = [
+      { ticketId: DONE, status: "done" },
+      { ticketId: "TEAM-2", status: "in_progress", assignee: "dev", blockedBy: [DONE] },
+    ];
+
+    // (a) the steal CAS loses — the claim moved after we read it.
+    const stealLost = makeExtDeps({
+      getChildTickets: vi.fn(async () => siblings),
+      lease: { stealClaim: vi.fn(async () => false) },
+    });
+    const mA = newMetrics();
+    const oA = await createCascade(stealLost.deps)
+      .handleInProgressDependent(siblings[1], DONE, extWorkflow, mA, "enforce");
+    expect(oA).toBe("steal-lost");
+    expect(stealLost.redispatch).not.toHaveBeenCalled();
+    expect(unblockEvents(stealLost.publishEvent)).toHaveLength(0);
+    expect(mA.rewoken).toBe(0);
+
+    // (b) the steal wins but the re-dispatch claim CAS refuses — nothing was woken.
+    const refused = makeExtDeps({
+      getChildTickets: vi.fn(async () => siblings),
+      redispatch: vi.fn(async () => false),
+    });
+    const mB = newMetrics();
+    const oB = await createCascade(refused.deps)
+      .handleInProgressDependent(siblings[1], DONE, extWorkflow, mB, "enforce");
+    expect(oB).toBe("redispatch-refused");
+    expect(unblockEvents(refused.publishEvent)).toHaveLength(0);
+    expect(mB.rewoken).toBe(0);
+
+    // (c) TEAM-3755 F7 — the agent heart-beat in the read→steal window, so the
+    // steal aborts into a nudge. A nudge is not a re-wake: no journal event.
+    const alive = makeExtDeps({
+      getChildTickets: vi.fn(async () => siblings),
+      lease: { isLeaseLive: vi.fn().mockReturnValueOnce(false).mockReturnValue(true) },
+    });
+    const mC = newMetrics();
+    const oC = await createCascade(alive.deps)
+      .handleInProgressDependent(siblings[1], DONE, extWorkflow, mC, "enforce");
+    expect(oC).toBe("nudged");
+    expect(alive.redispatch).not.toHaveBeenCalled();
+    expect(unblockEvents(alive.publishEvent)).toHaveLength(0);
+    expect(mC.rewoken).toBe(0);
+  });
+
+  it("the SWEEP's D2 clean-exit re-wake journals with source=reconcile-sweep, reason=awaited_rewake", async () => {
+    const FIX = "FIX-1";
+    const store = {
+      incrementCleanExitRedispatch: vi.fn(async () => true),
+      incrementDeadSessionRetry: vi.fn(async () => true),
+      setTaskStatus: vi.fn(async () => {}),
+      appendNotification: vi.fn(async () => {}),
+    };
+    const base = makeExtDeps({ extendedStates: "enforce" });
+    const cascade = createCascade({ ...base.deps, store, cleanExitRedispatchCap: 3 });
+
+    // The f50ucz shape: parked with a CURRENT stamp, awaited fix now done, and the
+    // dead-session retry budget already spent (so the D2 guard branch decides).
+    const sibling = {
+      ticketId: "TEAM-2", status: "in_progress", assignee: "dev", blockedBy: [FIX],
+      preconditionUnmet: { awaitingIds: [FIX], reportedAt: "2026-09-01T11:00:00Z" },
+    };
+    const siblings = [{ ticketId: FIX, status: "done" }, sibling];
+    const wf = {
+      id: "wf_1", workflowId: "wf_1",
+      deadSessionRetries: { "TEAM-2": 1 },
+      agentTasks: { "TEAM-2": { id: "t2", agentId: "dev", ticketId: "TEAM-2", status: "running", startedAt: STALE_STARTED } },
+    };
+    const m = newMetrics();
+
+    const outcome = await cascade.reconcileDependent(sibling, "reconcile-sweep", wf, m, "enforce", siblings);
+
+    expect(outcome).toBe("exited-ok");
+    expect(m.exitedOk).toBe(1);
+    expect(m.rewoken).toBe(1);
+    expect(store.incrementCleanExitRedispatch).toHaveBeenCalledTimes(1);
+    const evs = unblockEvents(base.publishEvent);
+    expect(evs).toHaveLength(1);
+    expect(evs[0][2].source).toBe("reconcile-sweep");
+    expect(evs[0][2].unblockedBy).toBe("reconcile-sweep");
+    expect(evs[0][2].previousStatus).toBe("in_progress");
+    // It carried a stamp → this was a WAIT that ended, not a bare stale lease.
+    expect(evs[0][2].reason).toBe("awaited_rewake");
+    expect(evs[0][2].blockedBy).toEqual([FIX]);
+    expect(eventsOfType(base.publishEvent, "agent.escalated")).toHaveLength(0);
+  });
+});

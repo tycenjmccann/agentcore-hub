@@ -12,7 +12,17 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
  * channel exists to prevent.
  */
 
-const h = vi.hoisted(() => ({ puts: [], invokes: [], ddbPuts: [] }));
+const h = vi.hoisted(() => {
+  const state = { puts: [], invokes: [], ddbPuts: [] };
+  // The real tickets-Lambda success shape — { ticketId, preconditionUnmet }, no
+  // `.error` — as pinned by agentcore-hub-tickets/precondition-contract.test.mjs.
+  state.defaultResponder = (parsed) => ({ ticketId: parsed.parameters?.ticket_id, preconditionUnmet: {} });
+  // Per-test override (reset in beforeEach). A responder may return the payload
+  // object directly, or { payload, FunctionError } to simulate a Lambda-level
+  // unhandled exception, or THROW to simulate an invoke failure.
+  state.invokeResponder = state.defaultResponder;
+  return state;
+});
 
 vi.mock("@aws-sdk/client-s3", () => ({
   S3Client: class {
@@ -29,10 +39,15 @@ vi.mock("@aws-sdk/s3-request-presigner", () => ({ getSignedUrl: async () => "htt
 vi.mock("@aws-sdk/client-lambda", () => ({
   LambdaClient: class {
     async send(cmd) {
-      // Record the parsed invoke so the test can assert the tool + params.
+      // Record the parsed invoke FIRST, so a throwing responder still leaves the
+      // invoke assertable (the failure tests check it was the annotate action).
       const parsed = JSON.parse(Buffer.from(cmd.input.Payload).toString());
       h.invokes.push(parsed);
-      return { Payload: new TextEncoder().encode(JSON.stringify({ ticketId: parsed.parameters?.ticket_id, preconditionUnmet: {} })) };
+      const out = h.invokeResponder(parsed);
+      const { payload, FunctionError } = out && typeof out === "object" && "payload" in out
+        ? out
+        : { payload: out, FunctionError: undefined };
+      return { Payload: new TextEncoder().encode(JSON.stringify(payload)), ...(FunctionError ? { FunctionError } : {}) };
     }
   },
   InvokeCommand: class { constructor(input) { this.input = input; } },
@@ -56,6 +71,7 @@ beforeEach(() => {
   h.puts.length = 0;
   h.invokes.length = 0;
   h.ddbPuts.length = 0;
+  h.invokeResponder = h.defaultResponder;
 });
 
 describe("report_precondition_unmet — happy path", () => {
@@ -70,6 +86,8 @@ describe("report_precondition_unmet — happy path", () => {
 
     expect(r.status).toBe("waiting");
     expect(r.awaitingIds).toEqual(["TEAM-4156", "TEAM-4157"]);
+    // TEAM-4189 — the stamp landed, and the caller is told so explicitly.
+    expect(r.stampPersisted).toBe(true);
 
     // Exactly one tickets-Lambda invoke, and it is the annotate action.
     expect(h.invokes).toHaveLength(1);
@@ -92,6 +110,8 @@ describe("report_precondition_unmet — happy path", () => {
     expect(event.Item.detail).toMatchObject({
       ticketId: "TEAM-4126", awaitingIds: ["TEAM-4156", "TEAM-4157"], agentId: "agentcore_hub_release_manager",
     });
+    expect(event.Item.detail.stampPersisted).toBe(true);
+    expect(event.Item.detail.stampError).toBeNull();
   });
 
   it("splits on whitespace, drops self and invalid, dedupes, and caps at 20", async () => {
@@ -126,6 +146,100 @@ describe("report_precondition_unmet — validation", () => {
     const r = result(await call({ ticket_id: "TEAM-4126", awaiting_ids: "TEAM-4126, junk" }));
     expect(r).toEqual({ status: "error", message: "no valid awaiting_ids" });
     expect(h.invokes).toHaveLength(0);
+  });
+});
+
+/**
+ * TEAM-4189 — a stamp that never landed must be surfaced to the caller. The stamp
+ * is the ONLY evidence the orchestrator's D1 re-wake and D2 liveness clock read,
+ * so a swallowed annotate failure makes a legitimately parked agent look like a
+ * dead session. Every failure shape returns status "error" + stampPersisted false
+ * while STILL holding the two hard invariants (no transition, no completion) and
+ * still publishing the journey event — now carrying the failure.
+ */
+describe("report_precondition_unmet — a failed stamp is surfaced (TEAM-4189)", () => {
+  const ARGS = {
+    ticket_id: "TEAM-4126",
+    awaiting_ids: "TEAM-4156, TEAM-4157",
+    workflow_id: "wf_1",
+    agent_id: "agentcore_hub_release_manager",
+  };
+
+  /** The invariants that hold on EVERY path, plus the failure-shaped event. */
+  function expectSurfacedFailure(r, reason) {
+    expect(r.status).toBe("error");
+    expect(r.stampPersisted).toBe(false);
+    expect(r.error).toContain(reason);
+    expect(r.message).toContain("precondition stamp could not be written");
+    expect(r.message).toContain("TEAM-4156, TEAM-4157");
+    expect(r.awaitingIds).toEqual(["TEAM-4156", "TEAM-4157"]); // ids preserved for the comment
+
+    // Exactly one tickets-Lambda invoke, and it was the annotate action.
+    expect(h.invokes).toHaveLength(1);
+    expect(h.invokes[0].tool_name).toBe("Tickets___annotate_precondition_unmet");
+    // The invariants do NOT weaken on the failure path.
+    expect(h.invokes.some((i) => i.tool_name === "Tickets___transition_ticket")).toBe(false);
+    expect(h.puts.some((p) => String(p.Key || "").startsWith("completions/"))).toBe(false);
+
+    // The dossier still gets the event — and can see the stamp failed.
+    const event = h.ddbPuts.find((p) => p?.Item?.type === "agent.precondition_unmet");
+    expect(event).toBeTruthy();
+    expect(event.Item.detail.stampPersisted).toBe(false);
+    expect(event.Item.detail.stampError).toContain(reason);
+    expect(event.Item.detail.awaitingIds).toEqual(["TEAM-4156", "TEAM-4157"]);
+  }
+
+  it("(a) annotate returning { error } → status error, stampPersisted false, invariants intact", async () => {
+    h.invokeResponder = () => ({ error: "ConditionalCheckFailedException: ticket TEAM-4126 not found" });
+    expectSurfacedFailure(result(await call(ARGS)), "ConditionalCheckFailedException");
+  });
+
+  it("(b) a throwing annotate invoke → same error shape, stampError from err.message", async () => {
+    h.invokeResponder = () => { throw new Error("Lambda unavailable"); };
+    const r = result(await call(ARGS));
+    expectSurfacedFailure(r, "Lambda unavailable");
+    expect(r.error).toBe("Lambda unavailable");
+  });
+
+  it("(d) an UNHANDLED tickets-Lambda exception (FunctionError + errorMessage) is a failed stamp, not a success", async () => {
+    // HTTP 200 with FunctionError and an { errorType, errorMessage } payload —
+    // there is no `.error` key, so a naive check would report stampPersisted true.
+    h.invokeResponder = () => ({
+      payload: { errorType: "TypeError", errorMessage: "x is not a function" },
+      FunctionError: "Unhandled",
+    });
+    expectSurfacedFailure(result(await call(ARGS)), "x is not a function");
+  });
+
+  it("(e) a throwing invoke with no message still surfaces as a failed stamp", async () => {
+    // A bare `throw undefined` leaves err.message unreachable and String(err)
+    // still non-empty ("undefined") — the point is that NO shape of a thrown
+    // non-Error (or an Error with an empty message) is allowed to leave
+    // stampError falsy, which would fall through to a "waiting" success.
+    h.invokeResponder = () => { throw undefined; };
+    const r = result(await call(ARGS));
+
+    expect(r.status).toBe("error");
+    expect(r.stampPersisted).toBe(false);
+    expect(typeof r.error).toBe("string");
+    expect(r.error.length).toBeGreaterThan(0);
+
+    expect(h.invokes).toHaveLength(1);
+    expect(h.invokes[0].tool_name).toBe("Tickets___annotate_precondition_unmet");
+    expect(h.invokes.some((i) => i.tool_name === "Tickets___transition_ticket")).toBe(false);
+    expect(h.puts.some((p) => String(p.Key || "").startsWith("completions/"))).toBe(false);
+
+    const event = h.ddbPuts.find((p) => p?.Item?.type === "agent.precondition_unmet");
+    expect(event).toBeTruthy();
+    expect(event.Item.detail.stampPersisted).toBe(false);
+  });
+
+  it("caps a stack-trace-sized stampError so it can't bloat the event or the reply", async () => {
+    h.invokeResponder = () => ({ error: `boom ${"x".repeat(5000)}` });
+    const r = result(await call(ARGS));
+    expect(r.error.length).toBe(300);
+    const event = h.ddbPuts.find((p) => p?.Item?.type === "agent.precondition_unmet");
+    expect(event.Item.detail.stampError.length).toBe(300);
   });
 });
 

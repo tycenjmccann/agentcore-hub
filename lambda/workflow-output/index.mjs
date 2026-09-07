@@ -219,9 +219,22 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
 // and D2 liveness clock read — via the SAME tickets-Lambda invoke path
 // report_completion uses, but with the annotate action, which NEVER transitions
 // the ticket and NEVER writes a completions/<id>.json record.
+//
+// TEAM-4189 — the RETURN VALUE distinguishes "stamp persisted" from "stamp
+// failed", because the stamp is the only evidence the orchestrator's D1 re-wake
+// and D2 liveness clock read: a silently dropped stamp makes a legitimately
+// parked agent indistinguishable from a dead session. So:
+//   { status: "waiting", stampPersisted: true,  … }  → the stamp is on the ticket
+//   { status: "error",   stampPersisted: false, error, … } → it is not; the agent
+//     must record its resume condition as a ticket comment before stopping.
+// Note the asymmetry: a VALIDATION error (bad ticket_id / no awaiting ids) returns
+// before any stamp is attempted and carries NO stampPersisted key at all.
 const TICKET_KEY_RE = /^[A-Z][A-Z0-9]+-\d+$/;
 const AWAITING_CAP = 20;
 const NOTE_MAX = 2000;
+// A stamp failure can carry a Lambda stack trace. Cap it in both the event detail
+// and the tool response so one bad invoke can't bloat the DDB item or the reply.
+const STAMP_ERROR_MAX = 300;
 
 async function reportPreconditionUnmet({ ticket_id, awaiting_ids, note = "", workflow_id, agent_id }) {
   const self = typeof ticket_id === "string" ? ticket_id.trim() : "";
@@ -250,6 +263,12 @@ async function reportPreconditionUnmet({ ticket_id, awaiting_ids, note = "", wor
   const reportedAt = new Date().toISOString();
   const agentId = agent_id || null;
 
+  // Set only by the annotate invoke below: true ONLY when the stamp is provably
+  // on the ticket. Every other path (invoke throw, error payload, Lambda-level
+  // FunctionError, synthetic id) leaves it false.
+  let stampPersisted = false;
+  let stampError = null;
+
   // Same LambdaClient.invoke path report_completion uses for the Done transition,
   // but the annotate action only STAMPS preconditionUnmet — no status change.
   if (self && !self.startsWith("HEALTHCHECK-") && !self.startsWith("TEST-")) {
@@ -263,25 +282,63 @@ async function reportPreconditionUnmet({ ticket_id, awaiting_ids, note = "", wor
         })),
       }));
       const payload = JSON.parse(new TextDecoder().decode(resp.Payload));
-      if (payload.error) {
+      // Three failure shapes, all of which mean "no stamp on the ticket":
+      // an UNHANDLED tickets-Lambda exception (HTTP 200 + FunctionError, payload
+      // { errorType, errorMessage, trace } — no `.error` key, so it has to be
+      // checked FIRST or it reads as success), and the handled `{ error }` shape.
+      if (resp.FunctionError || payload.errorMessage) {
+        // TEAM-4189: errorMessage/FunctionError could in principle stringify
+        // empty — never let a falsy stampError slip status back to "waiting".
+        stampError = String(payload.errorMessage || resp.FunctionError) || "annotate failed";
+        console.error(`[report_precondition_unmet] annotate failed for ${self}:`, stampError);
+      } else if (payload.error) {
         console.error(`[report_precondition_unmet] annotate failed for ${self}:`, payload.error);
+        // payload.error is truthy here but could be e.g. `true` or a value
+        // whose String() is empty — same non-empty guarantee as above.
+        stampError = String(payload.error) || "annotate failed";
       } else {
         console.log(`[report_precondition_unmet] ${self} awaiting ${awaitingIds.join(", ")}`);
+        stampPersisted = true;
       }
     } catch (err) {
-      console.error(`[report_precondition_unmet] Error annotating ${self}:`, err.message);
+      console.error(`[report_precondition_unmet] Error annotating ${self}:`, err && err.message);
+      // TEAM-4189: a throw with no/empty message (a bare `throw undefined` or
+      // `throw new Error("")`) must still surface as a failed stamp — never a
+      // falsy stampError, which would fall through to a "waiting" success.
+      stampError = (err && err.message) || String(err) || "annotate invoke failed";
     }
   }
+  // else: HEALTHCHECK-/TEST- ids intentionally skip the invoke — synthetic ids
+  // that are never parked and never re-woken, so there is no stamp to persist:
+  // status stays "waiting" (nothing is wrong) with stampPersisted false.
+
+  if (stampError) stampError = String(stampError).slice(0, STAMP_ERROR_MAX);
 
   // Journey log: dossier-only. The derivation trigger is the ticket stamp above
-  // (read by the orchestrator), NOT this event.
+  // (read by the orchestrator), NOT this event. stampPersisted/stampError ride
+  // along so the dossier shows a failed stamp instead of hiding it.
   await publishJourneyEvent(workflow_id || self, "agent.precondition_unmet", {
     workflowId: workflow_id || null, ticketId: self, awaitingIds, note: noteText, agentId, reportedAt,
+    stampPersisted, stampError,
   });
+
+  const awaiting = awaitingIds.join(", ");
+  // Gated on stampError, not on !stampPersisted — that is what keeps the
+  // synthetic-id path (no stamp attempted, no error) on status "waiting".
+  if (stampError) {
+    return {
+      status: "error",
+      stampPersisted: false,
+      error: stampError,
+      message: `precondition stamp could not be written: ${stampError}; awaiting ${awaiting}. Record the resume condition (awaiting ${awaiting}) as a ticket comment so a human/orchestrator can re-wake you.`,
+      awaitingIds,
+    };
+  }
 
   return {
     status: "waiting",
-    message: `precondition unmet; awaiting ${awaitingIds.join(", ")}`,
+    stampPersisted,
+    message: `precondition unmet; awaiting ${awaiting}`,
     awaitingIds,
   };
 }

@@ -1866,6 +1866,15 @@ def WorkflowOutput___report_precondition_unmet(ticket_id: str, awaiting_ids: str
         awaiting_ids: The ticket id(s) you are waiting on — comma- or
             space-separated (e.g. "TEAM-4156, TEAM-4157").
         note: Optional one-line reason describing what you are waiting for.
+
+    Returns:
+        On success: status "waiting" with stampPersisted true — the wait is
+            recorded on your ticket and the orchestrator will re-wake you.
+        On failure: status "error" with stampPersisted false and an `error`
+            reason — the wait was NOT recorded, so nothing will re-wake you.
+            If the tool returns status error, do NOT call report_completion.
+            Leave a ticket comment (Tickets___add_comment) stating your resume
+            condition (the awaited ticket ids) and then stop.
     """
     # workflow_id / agent_id come from invocation context (not exposed to agent),
     # exactly like report_completion.

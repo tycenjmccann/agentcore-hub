@@ -1613,3 +1613,128 @@ describe("TEAM-4166 D2 §2.3 — evidence-gated escalation guard", () => {
     expect(emf.DetectorAwaiting).toBe(0);
   });
 });
+
+/**
+ * TEAM-4187 (review finding of TEAM-4168) — the detector's re-wake journal.
+ *
+ * The D2 clean-exit branch re-dispatches a ticket that was PARKED in
+ * in_progress. Until now that recovery published NOTHING (the
+ * orchestrator.unblocked journal only ever covered blocked/todo→Ready
+ * transitions), so a dossier reading the event stream saw a stalled ticket and
+ * then a fresh claim with nothing in between explaining the jump. This is the
+ * twin of the cascade's stealAndRedispatch emit, and ONLY this site: the dead
+ * path's first retry already announces itself with agent.error, and a retried
+ * DEAD session is not an unblock.
+ */
+describe("TEAM-4187 — orchestrator.unblocked on the detector's clean-exit re-wake", () => {
+  const FIX = "FIX-1";
+
+  function guardStore(overrides = {}) {
+    return {
+      markDeadSessionDetected: vi.fn(async () => true),
+      clearDeadSessionDetected: vi.fn(async () => true),
+      incrementDeadSessionRetry: vi.fn(async () => 1),
+      incrementCleanExitRedispatch: vi.fn(async () => true),
+      markAwaitTimeoutEmitted: vi.fn(async () => true),
+      setTaskStatus: vi.fn(async () => {}),
+      appendNotification: vi.fn(async () => {}),
+      getWorkflow: vi.fn(async () => null),
+      ...overrides,
+    };
+  }
+
+  const parkedTicket = { ticketId: "TEAM-2", type: "task", status: "in_progress", assignee: "dev",
+    preconditionUnmet: { awaitingIds: [FIX], reportedAt: "2026-09-01T09:00:00Z" } };
+
+  it("journals ONE orchestrator.unblocked (reason awaited_rewake, source dead-session-detector) + DetectorRewoken == 1", async () => {
+    const wf = makeWorkflow({ deadSessionRetries: { "TEAM-2": 1 } });
+    const store = guardStore();
+    const { deps } = makeDeps({
+      ddb: makeDdb({ workflows: [wf] }), store,
+      getTicket: vi.fn(async () => parkedTicket),
+    });
+    const { runSweep } = createDetector({ ...deps, cleanExitRedispatchCap: 3 });
+
+    const { result: m, emf } = await captureEmf(() => runSweep("enforce"));
+
+    // The recovery itself is unchanged (the TEAM-4166 D2 clean re-wake).
+    expect(m.exitedOk).toBe(1);
+    expect(deps.redispatch).toHaveBeenCalledTimes(1);
+    expect(store.incrementDeadSessionRetry).not.toHaveBeenCalled();
+
+    const un = eventsOfType(deps.publishEvent, "orchestrator.unblocked");
+    expect(un).toHaveLength(1);
+    expect(un[0][0]).toBe("TEAM-2");
+    expect(un[0][2]).toMatchObject({
+      ticketId: "TEAM-2",
+      workflowId: "wf_1",
+      unblockedBy: "dead-session-detector",
+      source: "dead-session-detector",
+      previousStatus: "in_progress",
+      reason: "awaited_rewake", // the ticket carried preconditionUnmet.awaitingIds
+    });
+    // The union it waited on, from the SAME blockerUnion the cascade journals.
+    expect(un[0][2].blockedBy).toEqual([FIX]);
+    // The injected clock, not wall time (deterministicEventId keys off this).
+    expect(un[0][2].timestamp).toBe(new Date(NOW).toISOString());
+
+    expect(m.rewoken).toBe(1);
+    expect(emf.DetectorRewoken).toBe(1);
+  });
+
+  it("the claim CAS losing journals NOTHING — the event tracks the re-dispatch, not the decision", async () => {
+    const wf = makeWorkflow({ deadSessionRetries: { "TEAM-2": 1 } });
+    const store = guardStore();
+    const { deps } = makeDeps({
+      ddb: makeDdb({ workflows: [wf] }), store,
+      getTicket: vi.fn(async () => parkedTicket),
+      redispatch: vi.fn(async () => false), // a racing claim won
+    });
+    const { runSweep } = createDetector({ ...deps, cleanExitRedispatchCap: 3 });
+
+    const m = await runSweep("enforce");
+
+    expect(m.exitedOk).toBe(1);          // the DECISION still counts
+    expect(m.rewoken).toBeFalsy();       // the re-dispatch did not land
+    expect(eventsOfType(deps.publishEvent, "orchestrator.unblocked")).toHaveLength(0);
+  });
+
+  it("a publish failure is swallowed — the completed recovery is never reported as an error", async () => {
+    const wf = makeWorkflow({ deadSessionRetries: { "TEAM-2": 1 } });
+    const store = guardStore();
+    const { deps } = makeDeps({
+      ddb: makeDdb({ workflows: [wf] }), store,
+      getTicket: vi.fn(async () => parkedTicket),
+      // ONLY the journal publish fails — the death announcement earlier on the
+      // path still lands (a blanket throw would abort the candidate before the
+      // clean-exit branch is even reached, testing nothing).
+      publishEvent: vi.fn(async (_id, type) => {
+        if (type === "orchestrator.unblocked") throw new Error("eventbridge down");
+      }),
+    });
+    const { runSweep } = createDetector({ ...deps, cleanExitRedispatchCap: 3 });
+
+    const m = await runSweep("enforce");
+
+    expect(m.exitedOk).toBe(1);
+    expect(m.candidateErrors).toBe(0); // NOT counted as a failed candidate
+    expect(deps.redispatch).toHaveBeenCalledTimes(1);
+  });
+
+  it("the plain dead-session FIRST RETRY journals no orchestrator.unblocked (agent.error already announces it)", async () => {
+    const { deps, store } = makeDeps();
+    const { runSweep } = createDetector(deps);
+
+    const { result: m, emf } = await captureEmf(() => runSweep("enforce"));
+
+    // The pre-4187 dead path, untouched: error → retry → re-dispatch.
+    expect(eventsOfType(deps.publishEvent, "agent.error")).toHaveLength(1);
+    expect(store.incrementDeadSessionRetry).toHaveBeenCalledWith("wf_1", "TEAM-2");
+    expect(deps.redispatch).toHaveBeenCalledTimes(1);
+    expect(m.retries).toBe(1);
+    // A retried DEAD session is not an unblock — no journal record, no counter.
+    expect(eventsOfType(deps.publishEvent, "orchestrator.unblocked")).toHaveLength(0);
+    expect(m.rewoken).toBeFalsy();
+    expect(emf.DetectorRewoken).toBe(0);
+  });
+});
