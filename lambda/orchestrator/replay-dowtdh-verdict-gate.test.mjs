@@ -72,6 +72,8 @@ const h = vi.hoisted(() => ({
     notifications: /** @type {any[]} */ ([]),
     blockedKeys: new Map(),
     reverifySlots: new Set(),
+    /** Every claimReverifySlot call and the tri-state it returned. */
+    reverifySlotClaims: /** @type {any[]} */ ([]),
     nextTicketNum: 0,
   },
 }));
@@ -254,9 +256,10 @@ vi.mock("./workflow-store.mjs", async (importOriginal) => {
     }),
     claimReverifySlot: vi.fn(async (wfId, ticketId, slotSha) => {
       const slot = `${wfId}|${ticketId}|${slotSha}`;
-      if (h.state.reverifySlots.has(slot)) return "taken";
-      h.state.reverifySlots.add(slot);
-      return "claimed";
+      const result = h.state.reverifySlots.has(slot) ? "taken" : "claimed";
+      if (result === "claimed") h.state.reverifySlots.add(slot);
+      h.state.reverifySlotClaims.push({ ticketId, slotSha, result });
+      return result;
     }),
     releaseReverifySlot: vi.fn(async (wfId, ticketId, slotSha) => {
       h.state.reverifySlots.delete(`${wfId}|${ticketId}|${slotSha}`);
@@ -554,6 +557,7 @@ describe("dowtdh replay — the D1 flags", () => {
     h.state.notifications.length = 0;
     h.state.blockedKeys.clear();
     h.state.reverifySlots.clear();
+    h.state.reverifySlotClaims.length = 0;
     h.state.nextTicketNum = 0;
     process.env.ARTIFACT_BUCKET = "test-artifacts";
     process.env.EVENT_BUS = "test-bus";
@@ -742,9 +746,69 @@ describe("dowtdh replay — the D1 flags", () => {
   });
 
   // ── (b) ────────────────────────────────────────────────────────────────────
-  it.todo(
-    "(b) a Re-verify ticket owned by agentcore_hub_qa_verifier AND one owned by agentcore_hub_ci_agent exist, tied to TEAM-4183",
-  );
+  it("(b) a Re-verify ticket owned by agentcore_hub_qa_verifier AND one owned by agentcore_hub_ci_agent exist, tied to TEAM-4183", async () => {
+    await loadWith({ verdict: "enforce", fixBefore: "off", verifiedHead: "enforce" });
+    await replay(); // history as it happened: the gate reacts, it does not rewrite the past
+
+    // The cascade's own re-verify tickets are open FIX-kind rows, and the open-fix
+    // clause runs before the head comparison — so completion cannot even be reached,
+    // let alone diverge, until they close. They are closed here WITHOUT a new
+    // certification (an output so the evidence gate — which runs first — is
+    // satisfied, but no tested head), which is the design-faithful counterfactual:
+    // a round that certifies nothing adds no head, so the heads the run really
+    // proved still stand, and the divergence the gate must catch is still there.
+    for (const row of h.state.board.values()) {
+      if (row.status === "done" || row.status === "cancelled") continue;
+      row.status = "done";
+      row.completedAt = "2026-09-06T23:50:00.000Z";
+      h.state.workflow.agentTasks[row.ticketId] = {
+        ticketId: row.ticketId,
+        agentId: row.assignee,
+        status: "complete",
+        completedAt: row.completedAt,
+        output: "closed without re-certifying a head",
+      };
+    }
+    await completeWorkflow(h.state.workflow);
+
+    const owned = (assignee) => reverifyTickets().filter((t) => t.assignee === assignee);
+
+    // ── The QA re-verify, from the cascade hold on TEAM-4181's FAIL.
+    const [qaRv] = owned(QA_VERIFIER_ID);
+    expect(qaRv).toBeTruthy();
+    expect(qaRv.summary).toMatch(/^Re-verify \(round \d+\)/);
+    expect(qaRv.spawned_by).toMatchObject({ kind: "qa_fix", reverify: true, rearmOf: QA, headSha: CODE_HEAD });
+
+    // …and it is blocked on NOTHING, which is not a miss: dowtdh's QA filed no fix
+    // ticket of its own. TEAM-4183 is the REVIEWER's fix, so it is the reviewer's
+    // re-verify that carries it — the §1 empty-spawnedTickets path holds the
+    // successor on the re-verify alone rather than failing open.
+    expect(qaRv.blocked_by).toEqual([]);
+    const [reviewerRv] = owned("agentcore_hub_code_reviewer");
+    expect(reviewerRv.blocked_by).toEqual([FIX]);
+    expect(reviewerRv.spawned_by).toMatchObject({ kind: "review_fix", reverify: true, rearmOf: REVIEW });
+
+    // ── The CI re-verify. CI reported PASS, so no cascade hold fired for it; it
+    // comes from the completion gate's stale-head remediation instead, which is the
+    // only layer that can notice CI certified 12e9ac6 while 001259d shipped.
+    const [ciRv] = owned(CI_AGENT_ID);
+    expect(ciRv).toBeTruthy();
+    expect(ciRv.summary).toMatch(/^Re-verify \(round \d+\)/);
+    expect(ciRv.spawned_by).toMatchObject({ kind: "ci_fix", reverify: true, rearmOf: CI });
+
+    // It is blocked on nothing BY DESIGN: TEAM-4183 is already done by the time
+    // completion is attempted, so an edge onto it would be inert — and `reason` is
+    // not a persisted spawnedBy field at all, it rides on the event.
+    expect(ciRv.blocked_by).toEqual([]);
+    expect(ciRv.spawned_by.headSha.startsWith("001259d")).toBe(true);
+    expect(ciRv.spawned_by.headSha).toBe(SHIPPED_HEAD);
+    const ciFiled = detailsOfType("fix.reverify_created").find((e) => e.owner === CI_AGENT_ID);
+    expect(ciFiled).toMatchObject({ kind: "gate", reason: "stale-head", blockedBy: [] });
+
+    // Both verifiers are re-armed at the head that actually shipped or the head they
+    // were told to re-run at — which is the whole remediation.
+    expect(reverifyTickets().every((t) => t.spawned_by.reverify === true)).toBe(true);
+  });
 
   // ── (c) ────────────────────────────────────────────────────────────────────
   /**
@@ -775,7 +839,70 @@ describe("dowtdh replay — the D1 flags", () => {
   });
 
   // ── (d) ────────────────────────────────────────────────────────────────────
-  it.todo(
-    "(d) the TEAM-4181 agent.complete delivered twice creates exactly one QA re-verify and leaves the blocker-edge writes unchanged",
-  );
+  /** The board + workflow at the moment TEAM-4181 reports FAIL, from the replay. */
+  async function upToQaFail() {
+    await loadWith(ENFORCE_VERDICT_ONLY);
+    await deliver(doneRecord(DEV));
+    await deliver(insertFixRecord());
+    await deliver(doneRecord(REVIEW));
+    await deliver(doneRecord(QA));
+  }
+
+  const qaReverifies = () =>
+    reverifyTickets().filter((t) => t.assignee === QA_VERIFIER_ID && t.spawned_by?.rearmOf === QA);
+
+  it("(d) the TEAM-4181 agent.complete delivered twice creates exactly one QA re-verify and leaves the blocker-edge writes unchanged", async () => {
+    await upToQaFail();
+
+    expect(qaReverifies()).toHaveLength(1);
+    const rvKey = qaReverifies()[0].key;
+    const blockersBefore = JSON.parse(JSON.stringify(h.state.blockerWrites));
+    const ciBlockedBefore = [...h.state.board.get(CI).blockedBy];
+    expect(ciBlockedBefore).toContain(rvKey);
+
+    // The at-least-once redelivery: the SAME stream record, replayed. `done → done`
+    // is not a status change, so the real handler needs the row to still read as the
+    // pre-Done image — which is exactly what a duplicated stream record carries.
+    const row = h.state.board.get(QA);
+    h.state.board.set(QA, { ...row, status: "in_progress" });
+    await deliver(doneRecord(QA));
+
+    // Exactly one ticket, one edge set, one blockedBy — the three-layer idempotency
+    // holding across a whole second pass through handler → cascade → reverify.
+    expect(qaReverifies()).toHaveLength(1);
+    expect(qaReverifies()[0].key).toBe(rvKey);
+    expect(h.state.board.get(CI).blockedBy).toEqual(ciBlockedBefore);
+    expect(h.state.blockerWrites).toEqual(blockersBefore);
+
+    // Layer 1 (the agentTasks marker mergeTaskMetadata wrote) is what caught it, so
+    // the CAS is never reached a second time — cheapest-first, by design.
+    expect(h.state.workflow.agentTasks[QA].reverifyTicketId).toBe(rvKey);
+    expect(h.state.reverifySlotClaims.filter((c) => c.ticketId === QA)).toHaveLength(1);
+  });
+
+  it("(d) …and still exactly one when the marker write was lost, on the CAS alone", async () => {
+    await upToQaFail();
+    const rvKey = qaReverifies()[0].key;
+
+    // A lost mergeTaskMetadata write (or an untracked task): layer 1 is blind, so the
+    // claim is the only thing standing between a redelivery and a duplicate ticket.
+    delete h.state.workflow.agentTasks[QA].reverifyTicketId;
+    delete h.state.workflow.agentTasks[QA].reverifySha;
+    const row = h.state.board.get(QA);
+    h.state.board.set(QA, { ...row, status: "in_progress" });
+    await deliver(doneRecord(QA));
+
+    expect(qaReverifies()).toHaveLength(1);
+    expect(qaReverifies()[0].key).toBe(rvKey);
+    const claims = h.state.reverifySlotClaims.filter((c) => c.ticketId === QA);
+    expect(claims.map((c) => c.result)).toEqual(["claimed", "taken"]);
+  });
+
+  /**
+   * The jira twin (handleTicketDoneUnified) is not driven here: it needs
+   * TICKET_PROVIDER=jira, which makes `handler` ignore stream records entirely, so it
+   * cannot share this harness's driver. The two twins are pinned byte-identical —
+   * same enrichCompleteDetail call, same cascade entry — in
+   * done-handlers-cascade.test.mjs, which is what makes replaying one replay both.
+   */
 });
