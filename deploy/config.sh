@@ -76,13 +76,6 @@ export MCP_GATEWAY_NAME="${MCP_GATEWAY_NAME:-agentis_gateway}"
 # runtime (comma-separated agent ids, or "all"). Empty = every persona runs the
 # CLI locally in its own microVM (legacy behavior). Roll out by wave.
 export REMOTE_CODING_PERSONAS="${REMOTE_CODING_PERSONAS:-}"
-# Plan-first coding: coding personas make claude_code PLAN first (plan mode, no
-# edits), review/approve the plan, then execute it in the same conversation.
-# Off by default (empty). Set "on" to enable; PLAN_FIRST_BLUEPRINTS narrows which
-# blueprints get the protocol (default backend-dev,frontend-dev,bug-fixer).
-# See docs/plan-first-coding.md.
-export PLAN_FIRST_CODING="${PLAN_FIRST_CODING:-}"
-export PLAN_FIRST_BLUEPRINTS="${PLAN_FIRST_BLUEPRINTS:-}"
 # DynamoDB table the fleet records workflow coding sessions into (Cloud Code tab reads it).
 export CLOUD_CODE_TABLE="${CLOUD_CODE_TABLE:-agentcore-hub-cloud-code-sessions}"
 # Tenant that owns workflow coding sessions. Multi-tenant deployments must set

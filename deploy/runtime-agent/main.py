@@ -515,61 +515,14 @@ CODING_MODEL_TIERS = {
     "haiku": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
 }
 
-# ─── Plan-first coding delegation ────────────────────────────────────────────
-# When ON, coding personas are instructed (via a fragment appended to their
-# blueprint in load_blueprint) to run claude_code in two turns: a PLAN turn
+# Plan-first coding delegation: coding personas (backend-dev / frontend-dev /
+# bug-fixer blueprints) run claude_code in two turns — a PLAN turn
 # (`plan_only=True` → `claude --permission-mode plan`: reads the repo, returns a
-# plan, cannot edit) that the persona reviews and may send back for revision,
-# then an EXECUTE turn in the same conversation with full autonomy. Validated
-# 20/20 locally (plan held, same-session resume, tests green, 2 revise rounds
-# exercised) before shipping — see docs/plan-first-coding.md. OFF = the
-# blueprint text and the claude_code argv are byte-identical to before; the
-# `plan_only` tool arg itself is always honored if a persona passes it.
-PLAN_FIRST_CODING = os.getenv("PLAN_FIRST_CODING", "").strip().lower() in ("1", "true", "on", "enforce")
-# Blueprints that receive the fragment (the personas that implement code).
-PLAN_FIRST_BLUEPRINTS = {
-    b.strip() for b in os.getenv(
-        "PLAN_FIRST_BLUEPRINTS", "backend-dev,frontend-dev,bug-fixer"
-    ).split(",") if b.strip()
-}
-# Source of truth for the fragment — hot-editable, synced by the deploy stage
-# with the rest of blueprints/. The embedded copy below is only the fallback
-# when that S3 read fails, so the gate cannot silently vanish.
-PLAN_FIRST_FRAGMENT_KEY = "blueprints/_plan-first-coding.md"
-_PLAN_FIRST_FALLBACK = """## Plan-First Delegation (MANDATORY)
-
-Your coding agent must NOT write code until you have approved its plan. Every
-implementation on this ticket follows this loop:
-
-1. **PLAN** — `claude_code(task=<full brief: design, files, acceptance criteria,
-   constraints>, repo=<repo>, plan_only=True, model="opus")`. Plan mode reads the
-   repo and returns an implementation plan; it cannot edit files or run mutating
-   commands. Nothing is written yet.
-2. **REVIEW** the plan against the design and acceptance criteria: every
-   requirement covered, no scope creep, tests planned, no unsafe or destructive
-   steps, branch model respected. If deficient:
-   `claude_code(task="Revise the plan: <specific gaps>", plan_only=True, model="opus")`
-   — same conversation, so it revises rather than restarts. Never approve a plan
-   you did not read. Cap at 2 revision rounds; then proceed with the best plan
-   and record the residual gap in your completion report.
-3. **APPROVE + EXECUTE** — `claude_code(task="Plan approved. Implement it exactly
-   as planned, write the tests, run them, and commit.", model="sonnet")`. Same
-   conversation — all your claude_code calls in this task share one workspace
-   and one conversation, so do NOT pass resume_session here. Use model="opus"
-   instead when the plan itself flags high complexity or touches many subsystems.
-4. **INSPECT** — verify the result as your blueprint's review step requires
-   (files exist, tests actually ran and passed, diff matches the plan), then
-   deliver.
-
-Model split: plan on "opus" (or "fable" for ambiguous / architecture-heavy
-work); execute on "sonnet" for well-specified plans, "opus" for complex ones.
-Never plan on "haiku".
-
-Fix tickets and rework still plan first — the resumed session already holds
-the context, so the plan turn is short. Splitting work across several
-claude_code calls is fine; each new category of work gets its own
-plan → approve → execute.
-"""
+# plan, cannot edit) the persona reviews and may send back for revision, then an
+# EXECUTE turn in the same conversation with full autonomy. Plan on opus,
+# execute on sonnet. Validated 20/20 locally before shipping — see
+# docs/plan-first-coding.md. The protocol lives in the blueprints; the tool
+# side is the `plan_only` arg on claude_code below.
 
 # One coding session per agent-task: every claude_code/codex call in this
 # invocation lands on the same warm EFS workspace and resumes the same CLI
@@ -1974,37 +1927,17 @@ def load_blueprint(blueprint_name: str) -> str:
     try:
         s3 = boto3.client("s3", region_name=REGION)
         resp = s3.get_object(Bucket=ARTIFACT_BUCKET, Key=s3_key)
-        return resp["Body"].read().decode("utf-8") + _plan_first_addendum(blueprint_name, s3)
+        return resp["Body"].read().decode("utf-8")
     except s3.exceptions.NoSuchKey:
         # List available blueprints so the agent knows what's there
         try:
             objs = s3.list_objects_v2(Bucket=ARTIFACT_BUCKET, Prefix="blueprints/", Delimiter="/")
             available = [o["Key"].replace("blueprints/", "").replace(".md", "") for o in objs.get("Contents", [])]
-            # "_"-prefixed keys are shared fragments (e.g. _plan-first-coding), not personas.
-            available = [a for a in available if a and not a.startswith("_")]
             return f"Blueprint '{blueprint_name}' not found. Available: {', '.join(available)}"
         except Exception:
             return f"Blueprint '{blueprint_name}' not found at s3://{ARTIFACT_BUCKET}/{s3_key}"
     except Exception as e:
         return f"ERROR loading blueprint: {e}"
-
-
-def _plan_first_addendum(blueprint_name: str, s3=None) -> str:
-    """The plan-first protocol appended to a coding persona's blueprint when
-    PLAN_FIRST_CODING is on. Source of truth = PLAN_FIRST_FRAGMENT_KEY in S3
-    (hot-editable, synced with the other blueprints); the embedded copy is the
-    fallback so an S3 read failure can't silently drop the gate. Empty string
-    when the flag is off or the blueprint isn't a coding persona — i.e. the
-    blueprint text is byte-identical to before."""
-    if not PLAN_FIRST_CODING or blueprint_name not in PLAN_FIRST_BLUEPRINTS:
-        return ""
-    text = ""
-    try:
-        s3 = s3 or boto3.client("s3", region_name=REGION)
-        text = s3.get_object(Bucket=ARTIFACT_BUCKET, Key=PLAN_FIRST_FRAGMENT_KEY)["Body"].read().decode("utf-8")
-    except Exception as e:  # noqa: BLE001
-        logger.warning(f"[plan-first] {PLAN_FIRST_FRAGMENT_KEY} unavailable ({str(e)[:120]}) — using embedded copy")
-    return "\n\n" + (text.strip() or _PLAN_FIRST_FALLBACK.strip()) + "\n"
 
 
 # ─── External Tool Integration (via MCP — GitHub, GitLab, Jira, etc.) ────────

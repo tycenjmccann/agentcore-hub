@@ -2,17 +2,18 @@
 
 The pattern: a coding persona makes claude_code PLAN first (plan mode — reads
 the repo, returns a plan, cannot edit), reviews/approves the plan, then
-executes it in the SAME conversation. Validated 20/20 locally with the real
-backend_dev prompt + blueprint before shipping (docs/plan-first-coding.md).
+executes it in the SAME conversation. Plan on opus, execute on sonnet.
+Validated 20/20 locally with the real backend_dev prompt + blueprint before
+shipping (docs/plan-first-coding.md). Always on — the protocol is written into
+the coding blueprints, the tool side is `claude_code(plan_only=)`.
 
 Three things must hold on this side:
   1. `claude_code(plan_only=True)` reaches the coding runtime as
      `permission_mode: "plan"` (claude only) — and is absent otherwise, so a
      legacy far side sees today's payload.
-  2. The plan-first protocol is appended to a coding persona's blueprint ONLY
-     when PLAN_FIRST_CODING is on AND the blueprint is in PLAN_FIRST_BLUEPRINTS;
-     source of truth is the S3 fragment, embedded copy is the fallback. Flag
-     off = blueprint text byte-identical to before.
+  2. The three coding blueprints carry the protocol: plan turn with
+     plan_only=True on opus, review/revise instruction, execute on sonnet in the
+     same conversation.
   3. The LOCAL fallback path (no coding runtime) honors plan_only too: plan
      turn = `--permission-mode plan`, and the execute turn `--resume`s the plan
      turn's conversation. A task that never passes plan_only keeps today's argv
@@ -25,6 +26,7 @@ the real body, not a copy that could drift.
 
 import ast
 import json
+import re
 import textwrap
 import types
 from pathlib import Path
@@ -33,6 +35,7 @@ from unittest import mock
 import pytest
 
 MAIN_PY = Path(__file__).resolve().parent.parent / "main.py"
+REPO_ROOT = MAIN_PY.parent.parent.parent
 _SRC = MAIN_PY.read_text()
 _TREE = ast.parse(_SRC)
 
@@ -129,99 +132,55 @@ def test_execute_turn_resumes_the_plan_turns_conversation():
     assert "permission_mode" not in captured[1]
 
 
-# ─── 2. blueprint fragment injection ─────────────────────────────────────────
+# ─── 2. the coding blueprints carry the protocol ─────────────────────────────
 
-class _NoSuchKey(Exception):
-    pass
-
-
-class _FakeS3:
-    def __init__(self, objects, fail_keys=()):
-        self.objects, self.fail_keys = objects, set(fail_keys)
-        self.exceptions = types.SimpleNamespace(NoSuchKey=_NoSuchKey)
-
-    def get_object(self, Bucket, Key):
-        if Key in self.fail_keys:
-            raise RuntimeError("s3 down")
-        if Key not in self.objects:
-            raise _NoSuchKey(Key)
-        return {"Body": types.SimpleNamespace(read=lambda: self.objects[Key].encode())}
-
-    def list_objects_v2(self, **kw):
-        return {"Contents": [{"Key": k} for k in self.objects]}
+CODING_BLUEPRINTS = ["backend-dev", "frontend-dev", "bug-fixer"]
 
 
-BLUEPRINT = "# Blueprint: Backend Dev Lead\n\n## Process\nStep 2: delegate to claude_code.\n"
-FRAGMENT = "## Plan-First Delegation (MANDATORY)\n\n(from S3)\n"
+def _blueprint(name):
+    return (REPO_ROOT / "blueprints" / f"{name}.md").read_text()
 
 
-def _bp_ns(flag, s3, blueprints="backend-dev,frontend-dev,bug-fixer"):
-    ns = {
-        "boto3": types.SimpleNamespace(client=lambda *a, **k: s3),
-        "REGION": "us-east-1", "ARTIFACT_BUCKET": "bkt", "logger": mock.Mock(),
-        "PLAN_FIRST_CODING": flag,
-        "PLAN_FIRST_BLUEPRINTS": {b for b in blueprints.split(",") if b},
-    }
-    return _exec(ns, lambda n: _is_assign(n, "PLAN_FIRST_FRAGMENT_KEY"),
-                 lambda n: _is_assign(n, "_PLAN_FIRST_FALLBACK"),
-                 lambda n: _is_def(n, "load_blueprint"),
-                 lambda n: _is_def(n, "_plan_first_addendum"))
+@pytest.mark.parametrize("name", CODING_BLUEPRINTS)
+def test_blueprint_requires_a_plan_turn_before_code(name):
+    text = _blueprint(name)
+    assert "PLAN FIRST" in text
+    assert re.search(r"must NOT (write|change) code until you have approved", text), name
+    # the plan turn: plan_only on a strong tier
+    assert "plan_only=True" in text
+    assert re.search(r'plan_only=True,\s*model="opus"|model="opus",\s*.*plan_only=True|plan_only=True[^\n]*model="opus"',
+                     text, re.S), f"{name}: plan turn must run on opus"
+    assert "Never plan on" in text  # never on haiku
 
 
-def _s3(extra=None, **kw):
-    objs = {"blueprints/backend-dev.md": BLUEPRINT, "blueprints/qa-verifier.md": "# QA\n",
-            "blueprints/_plan-first-coding.md": FRAGMENT}
-    objs.update(extra or {})
-    return _FakeS3(objs, **kw)
+@pytest.mark.parametrize("name", CODING_BLUEPRINTS)
+def test_blueprint_has_review_revise_and_execute_steps(name):
+    text = _blueprint(name)
+    assert "Revise the plan" in text  # the revise path (exercised 2/20 in validation)
+    assert "Never approve a plan you did not read" in text
+    assert "Cap at 2 revision rounds" in text
+    assert "Plan approved." in text  # the execute turn
+    assert 'model="sonnet"' in text  # ...on the cheaper tier
+    # execute is the SAME conversation — no plan_only, no resume_session
+    assert re.search(r"NO `plan_only`, NO `resume_session`", text), name
 
 
-def test_flag_off_blueprint_is_byte_identical():
-    ns = _bp_ns(False, _s3())
-    assert ns["load_blueprint"]("backend-dev") == BLUEPRINT
+@pytest.mark.parametrize("name", CODING_BLUEPRINTS)
+def test_blueprint_rules_pin_the_model_split(name):
+    text = _blueprint(name)
+    assert re.search(r'PLAN turns on `"opus"`', text), name
+    assert re.search(r'EXECUTE turns on `"sonnet"`', text), name
+    assert re.search(r"Never let `claude_code` (write|change) code before you have read and approved", text), name
 
 
-def test_flag_on_appends_s3_fragment_to_coding_blueprint():
-    ns = _bp_ns(True, _s3())
-    out = ns["load_blueprint"]("backend-dev")
-    assert out.startswith(BLUEPRINT)
-    assert out.rstrip().endswith("(from S3)")
-    assert "Plan-First Delegation (MANDATORY)" in out
-
-
-def test_flag_on_leaves_non_coding_blueprints_alone():
-    ns = _bp_ns(True, _s3())
-    assert ns["load_blueprint"]("qa-verifier") == "# QA\n"
-
-
-def test_flag_on_respects_blueprint_allow_list_override():
-    ns = _bp_ns(True, _s3(), blueprints="frontend-dev")
-    assert ns["load_blueprint"]("backend-dev") == BLUEPRINT
-
-
-def test_fragment_read_failure_falls_back_to_embedded_copy_never_drops_gate():
-    ns = _bp_ns(True, _s3(fail_keys={"blueprints/_plan-first-coding.md"}))
-    out = ns["load_blueprint"]("backend-dev")
-    assert out.startswith(BLUEPRINT)
-    assert "(from S3)" not in out
-    assert "Plan-First Delegation (MANDATORY)" in out  # embedded copy
-    assert 'plan_only=True, model="opus"' in out
-    ns["logger"].warning.assert_called()
-
-
-def test_embedded_fallback_matches_shipped_fragment_file():
-    # blueprints/_plan-first-coding.md is what the deploy stage syncs to S3; the
-    # embedded copy is its fallback. They must not drift.
-    ns = _bp_ns(True, _s3())
-    shipped = (MAIN_PY.parent.parent.parent / "blueprints" / "_plan-first-coding.md").read_text()
-    assert shipped.strip() == ns["_PLAN_FIRST_FALLBACK"].strip()
-
-
-def test_available_listing_hides_fragment_files():
-    ns = _bp_ns(True, _s3())
-    out = ns["load_blueprint"]("nope")
-    assert "not found" in out
-    assert "backend-dev" in out and "qa-verifier" in out
-    assert "_plan-first-coding" not in out
+def test_load_blueprint_has_no_injection_or_flag():
+    # The protocol lives IN the blueprint files (synced to S3 as-is). There is no
+    # runtime fragment injection and no env flag — flag-off/flag-on drift is impossible.
+    assert "PLAN_FIRST" not in _SRC
+    assert "_plan_first_addendum" not in _SRC
+    src = _segment(lambda n: _is_def(n, "load_blueprint"))
+    assert 'return resp["Body"].read().decode("utf-8")' in src
+    assert not (REPO_ROOT / "blueprints" / "_plan-first-coding.md").exists()
 
 
 # ─── 3. local fallback path honors plan_only + chains the conversation ───────
