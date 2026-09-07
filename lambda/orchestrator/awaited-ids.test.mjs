@@ -249,6 +249,22 @@ for (const provider of ["dynamodb", "jira"]) {
         expect(m.derived).toBe(1);
       });
 
+      /**
+       * TEAM-4184 — the stamp's `source` must survive the write. It was hardcoded
+       * "derived" for every caller, so an agent's own `Tickets___report_precondition`
+       * report (source "tool") was persisted as an orchestrator-derived guess; the
+       * tickets Lambda's monotonic merge then had nothing to rank, and the more
+       * authoritative source was lost.
+       */
+      it("stamps the caller's source: tool stays tool, spawnedBy stays derived", async () => {
+        const h = makeDeps({ provider, mode: "enforce" });
+        const ai = createAwaitedIds(h.deps);
+        ai.newMetrics();
+        await ai.applyAwaitedEdges("TEAM-4126", ["TEAM-4156"], "tool");
+        await ai.applyAwaitedEdges("TEAM-4126", ["TEAM-4157"], "spawnedBy");
+        expect(h._annotateCalls.map((c) => c.payload.source)).toEqual(["tool", "derived"]);
+      });
+
       it("dedupes, drops self-reference, and caps at 20 ids", async () => {
         const h = makeDeps({ provider, mode: "enforce" });
         const ai = createAwaitedIds(h.deps);

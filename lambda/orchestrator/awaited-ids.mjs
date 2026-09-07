@@ -361,7 +361,11 @@ export function createAwaitedIds(deps = {}) {
     try {
       await annotatePreconditionUnmet?.(originId, {
         awaitingIds: clean,
-        source: "derived",
+        // TEAM-4184 — honor the caller's source. This was hard-coded "derived",
+        // so an agent's OWN report (the level-triggered "tool" pickup) was
+        // recorded as an orchestrator inference, losing the distinction the
+        // provenance field exists to make.
+        source: isTool ? "tool" : "derived",
         reportedAt: new Date(now()).toISOString(),
       });
     } catch (err) {

@@ -9,6 +9,7 @@ import {
   preconditionAtLabel,
   preconditionAtMsFromLabels,
   reportedAtFromLabels,
+  maxReportedAt,
 } from "./fix-contract.mjs";
 
 /**
@@ -147,7 +148,15 @@ export function makeWorld({
     const t = tickets[originId];
     const prior = projectRead(t)?.preconditionUnmet?.awaitingIds || [];
     const merged = [...new Set([...prior, ...awaitingIds])];
-    const preconditionUnmet = { awaitingIds: merged, source, reportedAt };
+    // The real tool's MONOTONIC merge (TEAM-4184): reportedAt never moves
+    // backwards and source is never downgraded tool -> derived.
+    const priorPu = provider === "jira" ? projectRead(t)?.preconditionUnmet : t?.preconditionUnmet;
+    const rank = (src) => ({ tool: 3, derived: 2, label: 1 })[src] || 0;
+    const preconditionUnmet = {
+      awaitingIds: merged,
+      source: rank(priorPu?.source) > rank(source) ? priorPu.source : source,
+      reportedAt: maxReportedAt(priorPu?.reportedAt, reportedAt) || reportedAt,
+    };
     if (t && provider === "jira") {
       const labels = [...(t.labels || [])];
       for (const id of merged) {
