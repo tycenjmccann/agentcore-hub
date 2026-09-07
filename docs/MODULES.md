@@ -104,7 +104,7 @@ The continuous-improvement loop. Self-contained surface.
 **Lambdas** (`lambda/`)
 - `eval-packager` — triggered by CloudWatch Logs subscription filters; parses
   evaluator results and buffers them
-- `token-aggregator` — token/cost aggregation
+- `token-aggregator` — token/cost aggregation into per-UTC-day buckets (`daily[YYYY-MM-DD]` on the eval-config row) from Strands `chat` spans, harness EMF metrics and Claude Code `api_request` events; the Evaluations tab reads a rolling 7-day window (no weekly reset)
 - `prd-submitter` — S3-triggered handoff into the improver agent
 
 **DynamoDB tables**

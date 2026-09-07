@@ -48,16 +48,48 @@ authoritative docs — never from memory, a blog/launch post, or a plausible gue
   guessed protocol compiles and passes its own tests but fails 100% against the real
   service. Put the verified reference facts in your completion record.
 
-### Step 2: Delegate to Claude Code
+### Step 2: Delegate to Claude Code — PLAN FIRST, then execute
 Pass `repo` on your FIRST call so the workspace is cloned. Every claude_code call
 shares ONE workspace and ONE conversation — later calls remember this one, so do
-NOT reference absolute paths like `/tmp/...`.
+NOT reference absolute paths like `/tmp/...`; just refer to "the same workspace as
+the previous call".
+
+**claude_code must NOT write code until you have approved its plan.**
+
+**2a. Plan** — `plan_only=True`, `model="opus"`. Plan mode reads the repo and
+returns an implementation plan; it cannot edit files or run mutating commands.
+Nothing is written yet.
 ```
 claude_code(
     repo="[owner/name or clone URL]",
-    task="Implement the API endpoints from this design.\n\nDesign Doc:\n[paste API spec]\n\nBranch: Create feature/{TICKET_ID}-api-dev FROM {base_branch} (pull base_branch first)\n\nExisting Patterns:\n[middleware, validation, error handling patterns]\n\nImplement:\n1. Route handlers\n2. Input validation (Zod schemas)\n3. Error handling\n4. Unit + integration tests\n5. OpenAPI spec updates\n6. Commit and push"
+    plan_only=True,
+    model="opus",
+    task="Plan the implementation of the API endpoints from this design — do NOT write code yet.\n\nDesign Doc:\n[paste API spec]\n\nBranch: feature/{TICKET_ID}-api-dev FROM {base_branch} (pull base_branch first — sibling work merges into it)\n\nExisting Patterns:\n[middleware, validation, error handling patterns you found]\n\nThe plan must cover:\n1. Route handlers to create/change\n2. Input validation (Zod schemas)\n3. Error handling\n4. Unit + integration tests\n5. OpenAPI spec updates\n6. Commit message\n\nConstraints:\n[from design — tech stack, contract, patterns to follow. Include any verified vendor facts from Step 1b.]"
 )
 ```
+
+**2b. Review the plan** against the design and acceptance criteria: every endpoint
+covered, contract matches the verified vendor facts (Step 1b), no scope creep, tests
+planned, no unsafe or destructive steps, branch model respected. Deficient → send it
+back (same conversation, so it revises rather than restarts):
+`claude_code(task="Revise the plan: [specific gaps]", plan_only=True, model="opus")`.
+Never approve a plan you did not read. Cap at 2 revision rounds, then proceed with
+the best plan and record the residual gap in your completion record.
+
+**2c. Approve + execute** — same conversation; NO `plan_only`, NO `resume_session`:
+```
+claude_code(
+    model="sonnet",
+    task="Plan approved. Implement it exactly as planned, write the tests, run them, and commit."
+)
+```
+Use `model="opus"` for the execute turn when the plan itself flags high complexity
+or touches many subsystems. Never plan on `"haiku"`.
+
+Splitting the work across several claude_code calls (see Organizing Work) is fine —
+each new category of work gets its own plan → approve → execute. Fix tickets and
+rework still plan first; the resumed session already holds the context, so the plan
+turn is short.
 
 ### Step 3: Review & Deliver
 - Verify all endpoints from design are implemented
@@ -91,7 +123,8 @@ Target ~10 minutes of activity per session. Hard timeout is 15 minutes — sessi
 - Before deleting/weakening/proxying ANY existing check: state what it enforces and grep every writer of the replacement value across all tiers (client + backend handlers + schema). A check you can't explain is a check you don't remove.
 - Never `try` → `try?` (or swallow errors) in a write path unless you prove the failure case can't clobber good state
 - Performance work: measured before/after numbers (operation counts / latency) on the same scenario are mandatory evidence; tests assert the invariant (count/latency bound), never the implementation choice
-- Pick the intelligence tier per `claude_code` call with `model=`: `"fable"` (default — top reasoning, plans/complex debugging), `"opus"` (deep implementation work), `"sonnet"` (routine, well-specified coding), `"haiku"` (trivial mechanical edits). Match the tier to the difficulty; when unsure, leave it empty.
+- Model tiers per `claude_code` call (`model=`): PLAN turns on `"opus"` (`"fable"` for ambiguous / architecture-heavy work); EXECUTE turns on `"sonnet"` for well-specified plans, `"opus"` for complex ones; `"haiku"` only for trivial mechanical edits. Never plan on haiku.
+- Never let `claude_code` write code before you have read and approved its plan (Step 2).
 - Always delegate to `claude_code`
 - If `claude_code` fails or times out, break the task smaller and retry
 - If `claude_code` times out twice on the same subtask, report BLOCKED
