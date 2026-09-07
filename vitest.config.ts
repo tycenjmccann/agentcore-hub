@@ -394,6 +394,11 @@ export default defineConfig({
       // phaseForAgent mapping, EMF zeros, the §2.5/§2.1 sync invariants vs the
       // lease TTL + src/lib/workflow/stale.ts, and the §2.4 parkedOnHuman gate.
       "lambda/workflow-analyzer/liveness.test.mjs",
+      // TEAM-4166 D2 acceptance replay — the two real reduced dossiers driven
+      // tick-by-tick through liveness.mjs: FR-2.3 (f50ucz dev window + ymo7dm QA
+      // no longer thrash), FR-2.4 (the genuinely idle RM still fires stale:ship),
+      // FR-2.5 (the bare manager_escalation does not park), + shadow safety.
+      "lambda/workflow-analyzer/replay-liveness.test.mjs",
     ],
     // Keep unit tests away from the Playwright specs under tests/.
     exclude: ["tests/**", "node_modules/**", "demo/**"],
