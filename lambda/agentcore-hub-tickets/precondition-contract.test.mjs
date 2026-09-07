@@ -51,8 +51,8 @@ vi.stubGlobal("fetch", vi.fn(async (url, options = {}) => {
 }));
 
 delete process.env.ARTIFACT_BUCKET;
-const dynamodb = await import("../agentcore-hub-tickets/index.mjs");
-const jira = await import("./index.mjs");
+const dynamodb = await import("./index.mjs");
+const jira = await import("../agentcore-hub-jira/index.mjs");
 
 const HANDLERS = { dynamodb: dynamodb.handler, jira: jira.handler };
 

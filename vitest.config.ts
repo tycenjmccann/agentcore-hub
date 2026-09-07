@@ -304,14 +304,19 @@ export default defineConfig({
       // cap/self-drop and the inferToolFromArgs routing that keeps awaiting_ids
       // off the completion path. The two annotate-precondition files pin each
       // ticket Lambda's action in isolation (DDB column merge / Jira labels +
-      // marker + the label→awaitingIds round-trip). precondition-contract drives
-      // BOTH ticket Lambdas under a `for (provider of [dynamodb, jira])` loop to
-      // prove the SAME `{ ticketId, preconditionUnmet }` shape and that NEITHER
-      // transitions — the parity workflow-output relies on to stay backend-blind.
+      // marker + the label→awaitingIds round-trip). The jira twin
+      // (annotate-precondition.test.mjs) moved to node:test — CI runs
+      // `node --test lambda/agentcore-hub-jira`, and vi.mock/vi.stubGlobal abort
+      // under that runner. precondition-contract drives BOTH ticket Lambdas
+      // under a `for (provider of [dynamodb, jira])` loop with vi.mock on the
+      // DynamoDB Lambda's SDK client, so it lives in agentcore-hub-tickets/
+      // (vitest-only in CI) rather than the jira directory it also imports —
+      // proving the SAME `{ ticketId, preconditionUnmet }` shape and that
+      // NEITHER transitions, the parity workflow-output relies on to stay
+      // backend-blind.
       "lambda/workflow-output/precondition-unmet.test.mjs",
       "lambda/agentcore-hub-tickets/annotate-precondition.test.mjs",
-      "lambda/agentcore-hub-jira/annotate-precondition.test.mjs",
-      "lambda/agentcore-hub-jira/precondition-contract.test.mjs",
+      "lambda/agentcore-hub-tickets/precondition-contract.test.mjs",
       // yteqfl loop 2 replay (TEAM-4121 FR-9) — the real prod failure this FR
       // exists for, from the dossier fixture: TEAM-4089 closed claiming live
       // evidence with none, QA re-verify TEAM-4092 caught it 48m later and filed

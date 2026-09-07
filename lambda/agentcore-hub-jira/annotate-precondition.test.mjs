@@ -1,5 +1,3 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
-
 /**
  * TEAM-4166 §1.2 — the Jira twin of `annotate_precondition_unmet`. Jira has no
  * structured columns, so the awaited siblings ride as `awaiting:<id>` LABELS
@@ -8,14 +6,16 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
  * annotation. And the labels must round-trip: mapIssue (exercised here through
  * the exported getIssue) reconstructs `preconditionUnmet.awaitingIds` from them,
  * so a Jira-mode ticket carries the SAME field a DynamoDB-mode one stores.
+ *
+ * Uses only Node's built-in runner (node:test + node:assert) — no ARTIFACT_BUCKET
+ * so loadValidAssignees skips S3 entirely (see index.test.mjs for the pattern).
  */
 
-const h = vi.hoisted(() => ({ calls: [] }));
+import test from "node:test";
+import assert from "node:assert/strict";
 
-vi.mock("@aws-sdk/client-s3", () => ({
-  S3Client: class { async send() { return {}; } },
-  GetObjectCommand: class { constructor(input) { this.input = input; } },
-}));
+delete process.env.ARTIFACT_BUCKET;
+const jira = await import("./index.mjs");
 
 function response(status, body) {
   return {
@@ -25,30 +25,21 @@ function response(status, body) {
   };
 }
 
-// A recording fetch keyed by `METHOD path`. Comment POST / label PUT succeed;
-// GET issue + GET comments serve whatever `h.issue` / `h.comments` hold.
-vi.stubGlobal("fetch", vi.fn(async (url, options = {}) => {
-  const method = options.method || "GET";
-  const path = String(url).replace(/^https?:\/\/[^/]+/, "");
-  h.calls.push({ method, path, body: options.body ? JSON.parse(options.body) : undefined });
-  if (method === "POST" && /\/comment$/.test(path)) return response(201, { id: "10001" });
-  if (method === "PUT" && /\/issue\/[^/]+$/.test(path)) return response(204, "");
-  if (method === "GET" && /\/comment(\?|$)/.test(path)) return response(200, { comments: h.comments || [] });
-  if (method === "GET" && /\/issue\/[^/?]+/.test(path)) return response(200, h.issue || {});
-  return response(200, {});
-}));
+test("annotate_precondition_unmet (jira): posts a marker comment + awaiting: labels, never transitions, returns { ticketId, preconditionUnmet }", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
 
-delete process.env.ARTIFACT_BUCKET; // loadValidAssignees skips S3 → fallback roster
-const jira = await import("./index.mjs");
+  // A recording fetch keyed by `METHOD path`. Comment POST / label PUT succeed.
+  globalThis.fetch = async (url, options = {}) => {
+    const method = options.method || "GET";
+    const path = String(url).replace(/^https?:\/\/[^/]+/, "");
+    calls.push({ method, path, body: options.body ? JSON.parse(options.body) : undefined });
+    if (method === "POST" && /\/comment$/.test(path)) return response(201, { id: "10001" });
+    if (method === "PUT" && /\/issue\/[^/]+$/.test(path)) return response(204, "");
+    return response(200, {});
+  };
 
-beforeEach(() => {
-  h.calls.length = 0;
-  h.issue = null;
-  h.comments = [];
-});
-
-describe("annotate_precondition_unmet (jira)", () => {
-  it("posts a marker comment + awaiting: labels, never transitions, returns { ticketId, preconditionUnmet }", async () => {
+  try {
     const r = await jira.handler({
       tool_name: "Tickets___annotate_precondition_unmet",
       parameters: {
@@ -57,36 +48,52 @@ describe("annotate_precondition_unmet (jira)", () => {
       },
     });
 
-    expect(r.ticketId).toBe("TEAM-4126");
-    expect(r.preconditionUnmet.awaitingIds).toEqual(["TEAM-4156", "TEAM-4157"]);
-    expect(r.preconditionUnmet.source).toBe("tool");
+    assert.equal(r.ticketId, "TEAM-4126");
+    assert.deepEqual(r.preconditionUnmet.awaitingIds, ["TEAM-4156", "TEAM-4157"]);
+    assert.equal(r.preconditionUnmet.source, "tool");
 
     // The comment carries the machine-readable marker.
-    const comment = h.calls.find((c) => c.method === "POST" && /\/comment$/.test(c.path));
-    expect(comment).toBeTruthy();
+    const comment = calls.find((c) => c.method === "POST" && /\/comment$/.test(c.path));
+    assert.ok(comment, "expected a comment POST");
     const commentText = JSON.stringify(comment.body);
-    expect(commentText).toContain("<!-- precondition-unmet");
-    expect(commentText).toContain("TEAM-4156");
+    assert.ok(commentText.includes("<!-- precondition-unmet"));
+    assert.ok(commentText.includes("TEAM-4156"));
 
     // Labels are added via the additive update verb, case PRESERVED so the id
     // round-trips as a real ticket key.
-    const put = h.calls.find((c) => c.method === "PUT" && /\/issue\/TEAM-4126$/.test(c.path));
-    expect(put.body.update.labels).toEqual([{ add: "awaiting:TEAM-4156" }, { add: "awaiting:TEAM-4157" }]);
+    const put = calls.find((c) => c.method === "PUT" && /\/issue\/TEAM-4126$/.test(c.path));
+    assert.deepEqual(put.body.update.labels, [{ add: "awaiting:TEAM-4156" }, { add: "awaiting:TEAM-4157" }]);
 
     // NEVER a transition.
-    expect(h.calls.some((c) => /\/transitions/.test(c.path))).toBe(false);
-  });
+    assert.ok(!calls.some((c) => /\/transitions/.test(c.path)), "must never transition");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
 
-  it("round-trips: getIssue rebuilds preconditionUnmet.awaitingIds from awaiting: labels", async () => {
-    h.issue = {
-      key: "TEAM-4126",
-      fields: {
-        summary: "ship", status: { name: "In Progress" }, issuetype: { name: "Task" },
-        labels: ["wf:wf_1", "awaiting:TEAM-4156", "awaiting:TEAM-4157"],
-      },
-    };
+test("annotate_precondition_unmet (jira): getIssue round-trips preconditionUnmet.awaitingIds from awaiting: labels", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, options = {}) => {
+    const method = options.method || "GET";
+    const path = String(url).replace(/^https?:\/\/[^/]+/, "");
+    if (method === "GET" && /\/comment(\?|$)/.test(path)) return response(200, { comments: [] });
+    if (method === "GET" && /\/issue\/[^/?]+/.test(path)) {
+      return response(200, {
+        key: "TEAM-4126",
+        fields: {
+          summary: "ship", status: { name: "In Progress" }, issuetype: { name: "Task" },
+          labels: ["wf:wf_1", "awaiting:TEAM-4156", "awaiting:TEAM-4157"],
+        },
+      });
+    }
+    return response(200, {});
+  };
+
+  try {
     const t = await jira.getIssue({ ticket_id: "TEAM-4126" });
-    expect(t.preconditionUnmet.awaitingIds).toEqual(["TEAM-4156", "TEAM-4157"]);
-    expect(t.preconditionUnmet.source).toBe("label"); // mapIssue sees only fields
-  });
+    assert.deepEqual(t.preconditionUnmet.awaitingIds, ["TEAM-4156", "TEAM-4157"]);
+    assert.equal(t.preconditionUnmet.source, "label"); // mapIssue sees only fields
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
