@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { readFileSync } from "node:fs";
 import { selectFixBeforeVerifyTargets, FIX_BEFORE_VERIFY_PERSONAS } from "./verdict-contract.mjs";
 
 /**
@@ -357,5 +358,63 @@ describe("the boundary — a failure never rejects the stream record", () => {
     h.state.updateThrows = true;
 
     await expect(handler(insertFix())).resolves.toBeUndefined();
+  });
+});
+
+/**
+ * The hook has to exist on BOTH creation-time paths — the DDB-stream INSERT branch
+ * (what the tests above drive) and the jira `todo` branch, which is the one the hub
+ * actually runs (TICKET_PROVIDER=jira; dowtdh was a jira run). The two are separate
+ * code paths that the repo has kept in step by convention only, so the only thing
+ * that can catch "someone added the second twin and forgot the first" is a source
+ * check: every place the sibling creation-time advisory fires, this hook fires too.
+ *
+ * Grepping the source rather than driving the jira handler is deliberate — driving
+ * it would need a whole second webhook harness to assert a property that is really
+ * about code placement, and a passing handler test would not stop a future edit from
+ * adding a third `emitContractWarning` site with no hook beside it.
+ */
+describe("both creation-time advisories are paired in the source (FR-D1.7 twins)", () => {
+  const SOURCE = readFileSync(new URL("./index.mjs", import.meta.url), "utf8");
+  const PARTNER = "observeFixBeforeVerify(";
+  // Wide enough for the house comment style between the two calls (the jira site
+  // carries a 5-line rationale block), tight enough that an unrelated call site
+  // several handlers away could never satisfy it.
+  const WINDOW = 900;
+
+  /** Call sites only: the `async function foo(` definition is not one. */
+  const callSitesOf = (name) => {
+    const sites = [];
+    for (let at = SOURCE.indexOf(`${name}(`); at !== -1; at = SOURCE.indexOf(`${name}(`, at + 1)) {
+      const before = SOURCE.slice(Math.max(0, at - 20), at);
+      if (/function\s+$/.test(before)) continue;
+      sites.push(at);
+    }
+    return sites;
+  };
+
+  it("finds the sites it claims to check (the grep itself cannot silently pass)", () => {
+    expect(callSitesOf("emitContractWarning")).toHaveLength(2);
+    expect(callSitesOf("observeFixBeforeVerify")).toHaveLength(2);
+    // If the definitions were counted as calls these would be 3 apiece.
+    expect(SOURCE).toContain("async function emitContractWarning(");
+    expect(SOURCE).toContain("async function observeFixBeforeVerify(");
+  });
+
+  it("every emitContractWarning call is followed by observeFixBeforeVerify", () => {
+    const sites = callSitesOf("emitContractWarning");
+    for (const at of sites) {
+      const window = SOURCE.slice(at, at + WINDOW);
+      const line = SOURCE.slice(0, at).split("\n").length;
+      expect(window, `index.mjs:${line} — advisory with no fix-before-verify twin beside it`).toContain(PARTNER);
+    }
+  });
+
+  it("one of the pairs is the jira `todo` path, the other the stream INSERT path", () => {
+    const [first, second] = callSitesOf("emitContractWarning");
+    // Distinguished by the argument the caller already has in hand: the jira path
+    // passes the ticket it just read, the stream path unwraps the stream image.
+    expect(SOURCE.slice(first, first + WINDOW)).toContain("todoTicket.spawnedBy");
+    expect(SOURCE.slice(second, second + WINDOW)).toContain("unwrapDdbValue(newImage.spawnedBy)");
   });
 });

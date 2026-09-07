@@ -53,7 +53,7 @@ import { createReworkLoopCap, normalizeReworkLoopMode } from "./rework-loop-cap.
 // Imported (as cascade.mjs does) rather than re-listed, so "what is mid-flight" has
 // one definition across the live re-verify, the verdict hold and FR-D1.7.
 import { createLiveReverify, normalizeLiveReverifyMode, LIVE_SHIP_STATUSES } from "./live-reverify.mjs";
-import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, SHIP_PHASES, SHIP_BLOCKED_OUTCOMES, TERMINAL_WORKFLOW_PHASES, FIX_KINDS, REWORK_FIX_KINDS, normalizeAdvisoryRoutingMode, isAdvisoryTicket, nonAdvisory } from "./completion.mjs";
+import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, evaluateVerifiedHeads, SHIP_PHASES, SHIP_BLOCKED_OUTCOMES, TERMINAL_WORKFLOW_PHASES, FIX_KINDS, REWORK_FIX_KINDS, normalizeAdvisoryRoutingMode, isAdvisoryTicket, nonAdvisory } from "./completion.mjs";
 import { isPipelineEnabled } from "./pipeline-enabled.mjs";
 import { CD_REGISTRY_KEY, EMPTY_CD_REGISTRY, parseCdRegistry, isCdRegistered, effectiveWorkflowDef, resolveDelivery, deliveryModeContext } from "./cd-registry.mjs";
 import { ensureRepoCheck, formatRepoCheckWarning } from "./repo-check.mjs";
@@ -1769,6 +1769,17 @@ async function processStatusChange(ticketId, newStatus, oldStatus) {
       // reads it as a count of tickets). Best-effort and non-fatal: an
       // unpublishable advisory must never block the ticket from being routed.
       await emitContractWarning(ticketId, todoTicket);
+
+      // TEAM-4246 D1 FR-D1.7 — the jira-mode twin of the fix-before-verify hook.
+      // This is the path the hub actually runs (TICKET_PROVIDER=jira), and dowtdh
+      // is a jira run: without this call the DDB-stream twin below would be the
+      // only writer and the gate would be dark in production. Same shape as the
+      // stream twin, off the ticket we already read; inert when FIX_BEFORE_VERIFY=off.
+      await observeFixBeforeVerify(ticketId, {
+        workflowId: todoTicket.workflowId,
+        parentId: todoTicket.parentId,
+        spawnedBy: todoTicket.spawnedBy,
+      });
 
       if (TICKET_PROVIDER === "jira") {
         // Jira mode: the agentcore-hub-jira Lambda handles initial routing by transitioning
@@ -4261,6 +4272,93 @@ async function notifyCompletionBlockedOnce(workflow, offenders) {
 }
 
 /**
+ * TEAM-4246 D1 — the verified-head / open-fix refusal, told exactly once per
+ * distinct refusal.
+ *
+ * Unlike the evidence gate's escalation this is NOT idempotent on a notification
+ * id: a refused run keeps re-entering completeWorkflow (every done cascade, every
+ * reconcile sweep), and the heads MOVE while a human reads the escalation — so the
+ * claim is a store CAS on the head triple plus the reason. Same heads, same reason
+ * → silence. A verifier re-runs at the shipped head, or the open fix closes and a
+ * divergence surfaces underneath it → a genuinely new refusal, told again.
+ *
+ * The reason is part of the claim key on purpose: `open-fix` masks divergence (it
+ * is checked first), so "open fix at these heads" and "divergence at these heads"
+ * are two different pieces of news about the same triple.
+ *
+ * Returns true when this caller is the one that told the story.
+ */
+async function notifyUnverifiedHeadOnce(workflow, vh, mode) {
+  const digest = store.completionBlockedKey(vh.heads);
+  const key = `${vh.reason}:${digest}`;
+  let claim = "claimed";
+  try {
+    claim = await store.claimCompletionBlocked(workflow.id, key);
+  } catch (err) {
+    // Fail OPEN on the claim (a throttled CAS must not swallow the only signal a
+    // human gets that the run is being held); the worst case is a duplicate event.
+    console.warn(`[orchestrator] ${workflow.id}: completion-blocked claim failed, publishing anyway: ${err?.message || err}`);
+  }
+  // "untracked" = no workflow row to claim on. Same fail-open reading the
+  // live-reverify slot CAS gives it: proceed, because the alternative is silence.
+  if (claim === "taken") return false;
+  const headLine = `qa=${vh.heads.qa || "unknown"} ci=${vh.heads.ci || "unknown"} pr=${vh.heads.pr || "unknown"}`;
+  try {
+    await publishEvent(workflow.epicId, "orchestrator.completion_blocked", {
+      workflowId: workflow.id,
+      reason: vh.reason,
+      heads: vh.heads,
+      offenders: vh.offenders,
+      mode,
+    });
+    const details = vh.reason === "open-fix"
+      ? `Completion is refused while fix tickets are still open under ${workflow.epicId}: ${vh.offenders.join(", ") || "none listed"}. Nothing is dispatched for this — closing the fix re-triggers completion. Heads at the refusal: ${headLine}.`
+      : `Completion is refused because the run's gate personas did not all verify the head that would ship (${headLine}). ` +
+        `A re-verification has been filed for each persona whose head is stale; when it returns at the PR head the run completes. ` +
+        `To close the run without re-verifying, set VERIFIED_HEAD_COMPLETION=off.`;
+    await store.appendNotification(workflow.id, {
+      id: `notif_completion_heads_${workflow.id}_${digest.slice(0, 12)}_${vh.reason}`,
+      type: "manager_escalation",
+      title: vh.reason === "open-fix"
+        ? "Run cannot complete: fix tickets still open"
+        : "Run cannot complete: the shipping head was never verified",
+      details,
+      reviewer: "verified-head-gate",
+      timestamp: new Date().toISOString(),
+      acknowledged: false,
+    });
+    console.log(`[orchestrator] ${workflow.id}: completion blocked (${vh.reason}) — ${headLine}`);
+    return true;
+  } catch (err) {
+    console.warn(`[orchestrator] ${workflow.id}: completion-blocked notification failed (non-fatal): ${err?.message || err}`);
+    return false;
+  }
+}
+
+/**
+ * The persona's own latest done ticket — the thing a stale-head re-verification is
+ * filed AGAINST (its task entry owns the re-verify claim slot, and its title is
+ * what the new ticket re-states). Deliberately a separate scan from
+ * evaluateVerifiedHeads: that answers "which head", this answers "whose ticket",
+ * and pushing ticket ids into the pure gate's return would change a contract the
+ * route twin mirrors.
+ */
+function latestDoneTicketFor(children, agentTasks, assignee) {
+  let best = null;
+  let bestAt = "";
+  for (const t of children || []) {
+    if (!t || t.assignee !== assignee) continue;
+    if (String(t.status || "").toLowerCase() !== "done") continue;
+    const entry = agentTasks?.[t.ticketId];
+    const when = String(entry?.completedAt || t.completedAt || "");
+    if (best && when < bestAt) continue;
+    best = t;
+    bestAt = when;
+  }
+  return best;
+}
+
+/**
  * PR description for a CD HANDOFF run: the hub opened the PR but will not
  * merge or deploy — say so where the owning team will read it.
  */
@@ -4527,6 +4625,89 @@ export async function completeWorkflow(workflow) {
   // ticket / WM surfaces it) instead of lying. Best-effort: a GitHub/API failure
   // (or no PAT) never blocks a legitimate completion — it only tightens when it
   // can PROVE the branch is unmerged. Opt-out: SHIP_MERGE_VERIFY=off.
+  // ── TEAM-4246 D1 gate #3: the VERIFIED-HEAD gate. ────────────────────────────
+  // The last line, and the one dowtdh walked straight through: every gate above
+  // asks "did this ticket record something?" — none of them compares one ticket's
+  // recorded head against another's. dowtdh closed green with QA verified at one
+  // head, CI certified at a second (QA's evidence commit) and the fix that
+  // actually landed at a third, five seconds before workflow.complete.
+  //
+  // Runs LAST of the three completion gates, per the TEAM-3760 ordering argument:
+  // the honest-terminal gates close runs that never shipped, so this one only ever
+  // sees runs whose recorded evidence claims a ship — the runs where "which head
+  // shipped" is a real question. (Its one cost: MERGE_ON_GREEN, default off, can
+  // land the merge in gate 2 before this gate refuses. The refusal is still worth
+  // making — the re-verification then runs against merged code — and the D2
+  // follow-up is to consult this gate before merging.)
+  //
+  // Fail-CLOSED under enforce, including on its own exception: a gate that cannot
+  // prove the heads agree must hold, or the flag buys nothing. Under shadow it
+  // logs and completion proceeds exactly as today.
+  if (VERIFIED_HEAD_COMPLETION !== "off") {
+    let hold = false;
+    try {
+      const children = gateChildren(await getChildTickets(workflow.epicId));
+      const freshWf = await store.getWorkflow(workflow.id);
+      const agentTasks = freshWf?.agentTasks || workflow.agentTasks || {};
+      // The caller's object carries the run's identity (epicId, featureBranch) and
+      // the fresh row carries the heads — the two consumers below need both, and
+      // neither the escalation's target nor a re-verify ticket's parent may depend
+      // on which fields the re-read happened to project.
+      const gateWorkflow = { ...workflow, agentTasks };
+      // No prHeadSha is passed: heads.pr is the run's own latest recorded dev/fix
+      // commit, derived inside the gate (the PR does not exist yet at this point,
+      // and featureBranchMergeProbe returns merge proof with no head sha).
+      const vh = evaluateVerifiedHeads(children, agentTasks);
+      if (!vh.ok) {
+        await notifyUnverifiedHeadOnce(gateWorkflow, vh, VERIFIED_HEAD_COMPLETION);
+        if (VERIFIED_HEAD_COMPLETION === "enforce") {
+          // Remediation, only for divergence: file one stale-head re-verification
+          // per persona whose head is not the shipping head. An open fix gets
+          // nothing — the fix closing re-enters completion by itself, and a
+          // re-verify filed now would just be re-filed at the fix's head anyway.
+          if (vh.reason === "head-divergence") {
+            for (const owner of vh.stalePersonas) {
+              const gateTicket = latestDoneTicketFor(children, agentTasks, owner);
+              if (!gateTicket) {
+                console.warn(`[orchestrator] ${workflow.id}: no done ticket found for stale persona ${owner} — cannot file a re-verification`);
+                continue;
+              }
+              // The factory owns "exactly one re-verify per (ticket, head)", so a
+              // redelivered completion attempt files nothing new.
+              await getLiveReverify().reverify({
+                kind: "gate",
+                reason: "stale-head",
+                workflow: gateWorkflow,
+                owner,
+                gateTicket,
+                headSha: vh.heads.pr,
+                blockedBy: [],
+              });
+            }
+          }
+          console.error(
+            `[orchestrator] CompletionRejectedUnverifiedHead ${workflow.id}: ${vh.reason} ` +
+              `(qa=${vh.heads.qa || "unknown"} ci=${vh.heads.ci || "unknown"} pr=${vh.heads.pr || "unknown"}` +
+              `${vh.offenders.length ? `, open fixes: ${vh.offenders.join(", ")}` : ""}) — leaving run open.`
+          );
+          hold = true;
+        } else {
+          console.warn(
+            `[orchestrator] ${workflow.id} would be blocked on ${vh.reason} (shadow): ` +
+              `qa=${vh.heads.qa || "unknown"} ci=${vh.heads.ci || "unknown"} pr=${vh.heads.pr || "unknown"}`
+          );
+        }
+      }
+    } catch (err) {
+      if (VERIFIED_HEAD_COMPLETION === "enforce") {
+        console.error(`[orchestrator] verified-head gate failed for ${workflow.id} — holding completion (enforce): ${err?.message || err}`);
+        return;
+      }
+      console.warn(`[orchestrator] verified-head check skipped for ${workflow.id}: ${err?.message || err}`);
+    }
+    if (hold) return;
+  }
+
   const completedAt = new Date().toISOString();
   const won = await store.completeWorkflow(workflow.id, completedAt);
   if (!won) {

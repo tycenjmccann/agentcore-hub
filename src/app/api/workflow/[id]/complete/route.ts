@@ -38,6 +38,14 @@ import { JiraClient } from "@/lib/workflow/jira-client";
 import { resolveWorkflowDef } from "@/lib/workflow/defs-loader";
 import { SHIP_BLOCKED_OUTCOMES } from "@/lib/workflow/types";
 import { resolveMissingEvidenceFromRecords } from "@/lib/workflow/completion-evidence";
+// TEAM-4246 D1: the verified-head gate's hand-port, in a lib module because a
+// route file may export only HTTP handlers (so the parity test can drive it).
+import {
+  evaluateVerifiedHeads,
+  normalizeVerifiedHeadMode,
+  type HeadTaskLike,
+  type HeadTicketLike,
+} from "@/lib/workflow/verified-heads";
 import agentsConfig from "@/config/agents.json";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
@@ -672,6 +680,64 @@ export async function POST(
       console.warn(`[complete] ship-verdict check skipped: ${(err as Error).message}`);
     }
 
+    // 2d. TEAM-4246 D1 — the VERIFIED-HEAD gate, PARITY with the orchestrator's
+    //     completeWorkflow gate #3. A run may not be closed green while the heads
+    //     its gate personas certified are not the head it is about to ship, or
+    //     while a fix ticket under the epic is still open. dowtdh closed with QA
+    //     at one head, CI at a second and the landed fix at a third — and this
+    //     route, the human-driven way to close a run, would have closed it too.
+    //     Default shadow (observe, complete anyway); enforce → 409, no completion.
+    //     Its own failure never turns a legitimate completion into a 500 — under
+    //     enforce it refuses honestly instead of guessing the heads agree.
+    let completionBlockedObserved: { reason: string; heads: Record<string, string | null> } | null = null;
+    const verifiedHeadMode = normalizeVerifiedHeadMode(process.env.VERIFIED_HEAD_COMPLETION);
+    if (verifiedHeadMode !== "off") {
+      try {
+        const vh = evaluateVerifiedHeads(
+          tickets as HeadTicketLike[],
+          (workflow.agentTasks as Record<string, HeadTaskLike>) || {}
+        );
+        if (!vh.ok) {
+          if (verifiedHeadMode === "enforce") {
+            return NextResponse.json(
+              {
+                error: "completion_blocked",
+                reason: vh.reason,
+                heads: vh.heads,
+                ...(vh.offenders.length ? { offenders: vh.offenders } : {}),
+                ...(vh.stalePersonas.length ? { stalePersonas: vh.stalePersonas } : {}),
+                hint:
+                  vh.reason === "open-fix"
+                    ? "Close (or cancel) the open fix tickets listed above — completion has no bypass."
+                    : "The heads QA/CI verified are not the head this run would ship. Re-verify at the PR head " +
+                      "(the orchestrator files those re-verifications itself), or set VERIFIED_HEAD_COMPLETION=off.",
+              },
+              { status: 409 }
+            );
+          }
+          completionBlockedObserved = { reason: String(vh.reason), heads: vh.heads };
+          console.warn(
+            `[complete] ${workflowId} would be blocked on ${vh.reason} (shadow): ` +
+              `qa=${vh.heads.qa || "unknown"} ci=${vh.heads.ci || "unknown"} pr=${vh.heads.pr || "unknown"}`
+          );
+        }
+      } catch (err) {
+        if (verifiedHeadMode === "enforce") {
+          console.error(`[complete] verified-head gate failed for ${workflowId} — refusing (enforce): ${(err as Error).message}`);
+          return NextResponse.json(
+            {
+              error: "verified_head_check_failed",
+              detail:
+                `The verified-head gate could not be evaluated (${(err as Error).message}), and under enforce it ` +
+                `refuses rather than assuming the heads agree. Retry, or set VERIFIED_HEAD_COMPLETION=off.`,
+            },
+            { status: 409 }
+          );
+        }
+        console.warn(`[complete] verified-head check skipped: ${(err as Error).message}`);
+      }
+    }
+
     const completedAt = new Date().toISOString();
 
     // 3. Roll the epic up in Jira so the board reflects the closure. Best-effort:
@@ -808,7 +874,15 @@ export async function POST(
       `[complete] Workflow ${workflowId} completed (was: ${workflow.phase}, epicRolledUp=${epicRolledUp})`
     );
     return NextResponse.json(
-      { status: "complete", completedAt, epicRolledUp, ...(reason ? { reason } : {}) },
+      {
+        status: "complete",
+        completedAt,
+        epicRolledUp,
+        ...(reason ? { reason } : {}),
+        // TEAM-4246 D1 shadow: the run completed, but say what enforce WOULD have
+        // refused — that is the whole measurement the shadow rollout is for.
+        ...(completionBlockedObserved ? { completionBlockedObserved } : {}),
+      },
       { status: 200 }
     );
   } catch (err) {
