@@ -657,12 +657,89 @@ describe("dowtdh replay — the D1 flags", () => {
   });
 
   // ── (a) ────────────────────────────────────────────────────────────────────
-  it.todo(
-    "(a) enforce: after TEAM-4180 CHANGES_NEEDED no orchestrator.unblocked names TEAM-4181, TEAM-4181 is not dispatched, and verdict_suppressed's blockers hold TEAM-4183 + a re-verify id",
-  );
-  it.todo(
-    "(a) enforce: TEAM-4181.blockedBy gained TEAM-4183 and the reviewer re-verify, and TEAM-4183 completing releases the re-verify, not TEAM-4181",
-  );
+  /**
+   * VERDICT_GATE alone. FIX_BEFORE_VERIFY is off on purpose: its creation-time edge
+   * would block TEAM-4181 the moment TEAM-4183 was filed, and then the missing
+   * unblock would prove nothing about the cascade gate.
+   */
+  const ENFORCE_VERDICT_ONLY = { verdict: "enforce", fixBefore: "off", verifiedHead: "off" };
+
+  it("(a) enforce: after TEAM-4180 CHANGES_NEEDED no orchestrator.unblocked names TEAM-4181, TEAM-4181 is not dispatched, and verdict_suppressed's blockers hold TEAM-4183 + a re-verify id", async () => {
+    await loadWith(ENFORCE_VERDICT_ONLY);
+    await deliver(doneRecord(DEV));
+    await deliver(insertFixRecord());
+    await deliver(doneRecord(REVIEW));
+
+    // The dev's own release still happens — only the non-PASS gate is held.
+    const unblocked = detailsOfType("orchestrator.unblocked");
+    expect(unblocked.map((u) => u.ticketId)).toEqual([REVIEW]);
+    expect(unblocked.some((u) => u.ticketId === QA)).toBe(false);
+
+    // Not transitioned, therefore never dispatched: the whole point of gating at the
+    // top of cascadeUnblock is that transition, dispatch and event fall together.
+    expect(h.state.statusWrites.filter((w) => w.ticketId === QA && w.status === "todo")).toEqual([]);
+    expect(h.state.board.get(QA).status).toBe("blocked");
+
+    const suppressed = detailsOfType("orchestrator.verdict_suppressed");
+    expect(suppressed).toHaveLength(1);
+    expect(suppressed[0]).toMatchObject({
+      workflowId: WF_ID,
+      verdict: "CHANGES_NEEDED",
+      unblocked: [QA],          // what WOULD have been released
+      spawnedTickets: [FIX],    // the reviewer's own fix ticket
+    });
+
+    // The reviewer filed a fix, so the hold rides on it — plus the re-verify that
+    // makes the reviewer look again once the fix lands. Both, not either.
+    const [rv] = reverifyTickets();
+    expect(rv).toBeTruthy();
+    expect(suppressed[0].blockers).toEqual([FIX, rv.key]);
+    expect(rv.blocked_by).toEqual([FIX]);
+  });
+
+  it("(a) enforce: TEAM-4181.blockedBy gained TEAM-4183 and the reviewer re-verify, and TEAM-4183 completing releases the re-verify — not TEAM-4181", async () => {
+    await loadWith(ENFORCE_VERDICT_ONLY);
+    await deliver(doneRecord(DEV));
+    await deliver(insertFixRecord());
+    await deliver(doneRecord(REVIEW));
+
+    const rvKey = reverifyTickets()[0].key;
+    // The hold is an ordinary blocker edge — which is why the existing blocked→ready
+    // cascade and the reconcile sweep already know how to release it.
+    expect(h.state.board.get(QA).blockedBy).toEqual([REVIEW, FIX, rvKey]);
+    expect(h.state.blockerWrites.map((w) => ({ ticketId: w.ticketId, ids: w.ids }))).toEqual([
+      { ticketId: QA, ids: [FIX] },
+      { ticketId: QA, ids: [rvKey] },
+    ]);
+
+    h.state.ebEvents.length = 0;
+    await deliver(doneRecord(FIX));
+
+    // What the graph correctly yields: the fix's only fully-unblocked successor is
+    // the re-verify. TEAM-4181 is still held by it, and stays held until the
+    // reviewer's second look closes — no verifier runs against unfixed code.
+    expect(detailsOfType("orchestrator.unblocked").map((u) => u.ticketId)).toEqual([rvKey]);
+    expect(h.state.board.get(rvKey).status).toBe("todo");
+    expect(h.state.board.get(QA).status).toBe("blocked");
+  });
+
+  it("(a) enforce: the inferred ladder holds TEAM-4181 identically from the fixture's prose alone", async () => {
+    // No declared verdict anywhere — the run exactly as it was recorded. This is the
+    // path every pre-4246 agent still takes until the blueprints roll out, so the
+    // hold cannot depend on the new field being present.
+    h.state.completions = buildCompletions({ inferred: true });
+    await loadWith(ENFORCE_VERDICT_ONLY);
+    await deliver(doneRecord(DEV));
+    await deliver(insertFixRecord());
+    await deliver(doneRecord(REVIEW));
+
+    const suppressed = detailsOfType("orchestrator.verdict_suppressed");
+    expect(suppressed).toHaveLength(1);
+    expect(suppressed[0]).toMatchObject({ verdict: "CHANGES_NEEDED", unblocked: [QA], spawnedTickets: [FIX] });
+    expect(detailsOfType("orchestrator.unblocked").some((u) => u.ticketId === QA)).toBe(false);
+    expect(reverifyTickets()).toHaveLength(1);
+    expect(h.state.board.get(QA).blockedBy).toEqual([REVIEW, FIX, reverifyTickets()[0].key]);
+  });
 
   // ── (b) ────────────────────────────────────────────────────────────────────
   it.todo(
@@ -670,9 +747,32 @@ describe("dowtdh replay — the D1 flags", () => {
   );
 
   // ── (c) ────────────────────────────────────────────────────────────────────
-  it.todo(
-    "(c) enforce: workflow.complete count 0 and exactly ONE orchestrator.completion_blocked with heads.qa 933ea6f, heads.pr 001259d, reason head-divergence",
-  );
+  /**
+   * The third hole in isolation: the run EXACTLY as it happened (cascade gate off,
+   * so QA and CI really do run and really do close), with only the completion gate
+   * armed. That is the counterfactual the criterion asks about — had this gate
+   * existed on 2026-09-06, the run would not have closed.
+   */
+  it("(c) enforce: workflow.complete count 0 and exactly ONE orchestrator.completion_blocked with heads.qa 933ea6f, heads.pr 001259d, reason head-divergence", async () => {
+    await loadWith({ verdict: "off", fixBefore: "off", verifiedHead: "enforce" });
+    await replay();
+
+    expect(detailsOfType("workflow.complete")).toHaveLength(0);
+    expect(h.state.storeCompletions).toEqual([]);
+    expect(h.state.finalized).toEqual([]);
+
+    const blocked = detailsOfType("orchestrator.completion_blocked");
+    expect(blocked).toHaveLength(1);
+    expect(blocked[0]).toMatchObject({ workflowId: WF_ID, reason: "head-divergence", mode: "enforce" });
+    expect(blocked[0].heads.qa.startsWith("933ea6f")).toBe(true); // the head QA was told to re-run at
+    expect(blocked[0].heads.ci.startsWith("12e9ac6")).toBe(true); // the head CI actually certified
+    expect(blocked[0].heads.pr.startsWith("001259d")).toBe(true); // the head that shipped
+    expect(blocked[0].heads.qa).toBe(CODE_HEAD);
+    expect(blocked[0].heads.pr).toBe(SHIPPED_HEAD);
+
+    // The run is left OPEN for the remediation, not rewritten to a terminal state.
+    expect(h.state.workflow.phase).not.toBe("complete");
+  });
 
   // ── (d) ────────────────────────────────────────────────────────────────────
   it.todo(
