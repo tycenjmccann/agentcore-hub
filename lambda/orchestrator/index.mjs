@@ -483,6 +483,12 @@ function getAgentDef(id) {
 
 const DEFAULT_WORKFLOW_DEF_ID = "software-delivery";
 
+// TEAM-4247 D2 — the scheduled hygiene def, named once. It is the only def with a
+// detection phase and a yield (verified_removable), and therefore the only def
+// whose runs can end "nothing-to-remove". PARITY: src/config/workflows.json's
+// dead-code-sweep def id.
+const SWEEP_WORKFLOW_DEF_ID = "dead-code-sweep";
+
 // Reproduces the original hardcoded 14-agent pipeline exactly. Used as fallback
 // and whenever a workflow has no (or an unknown) workflowDefId.
 const FALLBACK_WORKFLOW_DEF = {
@@ -2195,7 +2201,16 @@ async function harvestCompletionEvidence(workflow, ticketId) {
   const hasVerdictSignal =
     (typeof entry?.verdict === "string" && entry.verdict.trim().length > 0) ||
     (typeof entry?.testedHead === "string" && entry.testedHead.trim().length > 0);
-  if (hasEvidence && hasShipSignal && hasVerdictSignal) return;
+  // TEAM-4247 D2: and once more for the sweep yield — but ONLY on the def that
+  // has a yield. Scoped that way because no other def's tickets will ever carry
+  // the field, so an unscoped clause would permanently disable this early return
+  // for the whole fleet. Note the test is Number.isInteger, NOT truthiness:
+  // `verifiedRemovable: 0` is the entire point of the field, and reading 0 as
+  // "not harvested yet" would re-read the record on every redelivery of the one
+  // ticket whose value matters most.
+  const hasSweepSignal =
+    workflow.workflowDefId !== SWEEP_WORKFLOW_DEF_ID || Number.isInteger(entry?.verifiedRemovable);
+  if (hasEvidence && hasShipSignal && hasVerdictSignal && hasSweepSignal) return;
   try {
     // Shared per-invocation read (TEAM-4121 FR-9): the live-reverify hook needs
     // the same record moments later, and one GET serves both.
@@ -2245,6 +2260,17 @@ async function harvestCompletionEvidence(workflow, ticketId) {
       // very record carries several other 7-hex tokens.
       const testedHead = resolveTestedHead(record);
       if (testedHead) fields.testedHead = testedHead;
+    }
+    // TEAM-4247 D2 — the sweep yield pair, same fill-if-absent rule, with
+    // Number.isInteger on BOTH sides: a stored 0 is present (do not overwrite),
+    // and a record value of 0 is a real yield (do not skip). The declared field
+    // is the only source — c2uqki's sweeper wrote "ZERO verified-dead removals"
+    // in prose and there is deliberately no ladder that reads a count out of it.
+    if (Number.isInteger(record.verified_removable) && !Number.isInteger(entry?.verifiedRemovable)) {
+      fields.verifiedRemovable = record.verified_removable;
+    }
+    if (Number.isInteger(record.candidates) && !Number.isInteger(entry?.candidates)) {
+      fields.candidates = record.candidates;
     }
     if (Object.keys(fields).length === 0) return;
     await store.mergeTaskMetadata(workflow.id, ticketId, fields);

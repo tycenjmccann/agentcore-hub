@@ -240,3 +240,62 @@ describe("report_completion — verdict / tested_head", () => {
     expect(Object.keys(record()).sort()).toEqual([...BASE_KEYS, "tested_head"].sort());
   });
 });
+
+// TEAM-4247 D2 — the sweep yield pair. Everything here turns on ZERO being a
+// real, storable value: run wf_1788780725940_c2uqki verified 93 candidates,
+// removed none, and the orchestrator now ends such a run on that number. Any
+// falsiness test anywhere on this path (here, in main.py, or in the harvest)
+// silently deletes the one value the feature exists for.
+describe("report_completion — verified_removable / candidates", () => {
+  it("persists a ZERO yield as an integer, not as absence", async () => {
+    await report({ verified_removable: "0", candidates: "93" });
+    const r = record();
+    expect(r.verified_removable).toBe(0);
+    expect(r.candidates).toBe(93);
+    expect(Object.keys(r).sort()).toEqual([...BASE_KEYS, "verified_removable", "candidates"].sort());
+  });
+
+  it("persists a productive yield", async () => {
+    await report({ verified_removable: "17" });
+    expect(record().verified_removable).toBe(17);
+  });
+
+  it("accepts numbers as well as strings (the Lambda is called directly too)", async () => {
+    await report({ verified_removable: 0, candidates: 4 });
+    expect(record().verified_removable).toBe(0);
+    expect(record().candidates).toBe(4);
+  });
+
+  it("a record written without them keeps exactly the pre-4247 key set", async () => {
+    await report({});
+    expect(Object.keys(record()).sort()).toEqual([...BASE_KEYS].sort());
+  });
+
+  it("drops anything that is not a plain non-negative integer", async () => {
+    // "none" is what a model writes when it means zero, and Number("none") is
+    // NaN — but Number("") is 0, which is why the emptiness test is on the raw
+    // string and the shape test is a regex rather than a cast.
+    for (const raw of ["none", "-1", "1.5", "12abc", "1e3", "0x0", "1,000", " ", "1234567"]) {
+      h.puts.length = 0;
+      h.warns.length = 0;
+      await report({ verified_removable: raw });
+      expect("verified_removable" in record(), raw).toBe(false);
+      if (raw.trim()) expect(h.warns.join("\n"), raw).toMatch(/dropping non-integer verified_removable/);
+    }
+  });
+
+  it("drops a bad candidates without losing a good verified_removable", async () => {
+    await report({ verified_removable: "0", candidates: "lots" });
+    const r = record();
+    expect(r.verified_removable).toBe(0);
+    expect("candidates" in r).toBe(false);
+    expect(h.warns.join("\n")).toMatch(/dropping non-integer candidates "lots"/);
+  });
+
+  it("clamps an oversized value in the warning, never in the record", async () => {
+    await report({ verified_removable: "9".repeat(5000) });
+    expect("verified_removable" in record()).toBe(false);
+    const warn = h.warns.find((w) => w.includes("dropping non-integer verified_removable"));
+    expect(warn.length).toBeLessThan(300);
+  });
+});

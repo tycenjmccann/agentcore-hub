@@ -241,3 +241,49 @@ def test_verdict_fields_omitted_give_the_pre_4246_payload_exactly():
 def test_verdict_fields_blank_are_the_same_as_omitted():
     _, payload = _payload(verdict="   ", tested_head="")
     assert payload == PRE_4121_PAYLOAD
+
+
+# ─── TEAM-4247 D2: verified_removable / candidates ────────────────────────────
+#
+# The sweep yield, as a field. wf_1788780725940_c2uqki scanned a whole repo,
+# verified 93 candidates, removed NONE, and said so only in prose — so the only
+# thing that could end the run was the sweeper hand-skipping every downstream
+# ticket. "0" is therefore the single most load-bearing value this tool carries,
+# and every emptiness test on its path has to be on the raw string: a truthiness
+# test in Python (`if not verified_removable`) or a cast in the Lambda
+# (`Number("")` is 0) deletes exactly the value the feature exists for.
+
+def test_zero_yield_is_forwarded_not_swallowed():
+    _, payload = _payload(verified_removable="0", candidates="93")
+    assert payload["verified_removable"] == "0"
+    assert payload["candidates"] == "93"
+
+
+def test_productive_yield_is_forwarded():
+    _, payload = _payload(verified_removable="17", candidates="93")
+    assert payload["verified_removable"] == "17"
+
+
+def test_yield_fields_trimmed_but_not_otherwise_touched():
+    """No casing rule (they're digits) and no cast — the Lambda owns the integer
+    allow-list (COUNT_RE), so "none" travels and is DROPPED there rather than
+    being coerced to 0 here, where it would silently terminate a real sweep."""
+    _, payload = _payload(verified_removable="  0  ", candidates=" none ")
+    assert payload["verified_removable"] == "0"
+    assert payload["candidates"] == "none"
+
+
+def test_yield_alone_is_legitimate():
+    _, payload = _payload(verified_removable="0")
+    assert payload["verified_removable"] == "0"
+    assert "candidates" not in payload
+
+
+def test_yield_fields_omitted_give_the_pre_4247_payload_exactly():
+    _, payload = _payload()
+    assert payload == PRE_4121_PAYLOAD
+
+
+def test_yield_fields_blank_are_the_same_as_omitted():
+    _, payload = _payload(verified_removable="   ", candidates="")
+    assert payload == PRE_4121_PAYLOAD

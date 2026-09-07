@@ -150,7 +150,25 @@ const CI_FIELD_MAX_LEN = 128;
 const VERDICTS = ["PASS", "CHANGES_NEEDED", "FAIL", "BLOCKED"];
 const SHA_RE = /^[0-9a-f]{7,40}$/;
 
-async function reportCompletion({ ticket_id, summary, artifacts = "", branch, commit_sha, pr_url, workflow_id, agent_id, evidence_kind, evidence_keys, ci_status, ci_build_id, ci_head_sha, verdict, tested_head }) {
+// TEAM-4247 D2 — a dead-code sweep's YIELD, as a field. Run
+// wf_1788780725940_c2uqki scanned an entire repo, verified 93 candidates and
+// removed NONE of them ("OUTCOME: ZERO verified-dead removals"), and that fact
+// existed only in prose — so the only thing that could end the run was the
+// sweeper itself hand-skipping every downstream ticket in reverse dependency
+// order (blueprints/code-sweeper.md Step 2.5). An LLM performing a mass ticket
+// mutation is how a reviewer, a QA verifier and a human merge gate get
+// dispatched against a branch that does not exist.
+//
+// `verified_removable` is the number the orchestrator terminates on (0 → close
+// the run "nothing-to-remove"), `candidates` is what detection FOUND before
+// verification — both integers, both optional, and a 6-digit cap because these
+// are file/symbol counts, not sizes. Same drop-rather-than-store rule as every
+// field above: a value that is not a plain non-negative integer is warned about
+// and dropped, never coerced, because Number("") === 0 and a coerced 0 here
+// would silently terminate a productive sweep.
+const COUNT_RE = /^\d{1,6}$/;
+
+async function reportCompletion({ ticket_id, summary, artifacts = "", branch, commit_sha, pr_url, workflow_id, agent_id, evidence_kind, evidence_keys, ci_status, ci_build_id, ci_head_sha, verdict, tested_head, verified_removable, candidates }) {
   const key = `completions/${ticket_id}.json`;
   const report = {
     ticket_id,
@@ -204,6 +222,17 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   if (testedHead) {
     if (SHA_RE.test(testedHead)) report.tested_head = testedHead;
     else console.warn(`[report_completion] dropping non-SHA tested_head "${testedHead.slice(0, CI_FIELD_MAX_LEN)}"`);
+  }
+
+  // TEAM-4247 D2: the sweep yield pair. `0` is the whole point of the field, so
+  // the emptiness test is on the RAW value ("" and undefined are absent, "0" is
+  // present) — a truthiness test would drop exactly the value the orchestrator
+  // terminates on.
+  for (const [name, raw] of [["verified_removable", verified_removable], ["candidates", candidates]]) {
+    const text = typeof raw === "number" ? String(raw) : typeof raw === "string" ? raw.trim() : "";
+    if (!text) continue;
+    if (COUNT_RE.test(text)) report[name] = Number(text);
+    else console.warn(`[report_completion] dropping non-integer ${name} "${text.slice(0, CI_FIELD_MAX_LEN)}" (expected a non-negative integer)`);
   }
 
   await s3.send(new PutObjectCommand({

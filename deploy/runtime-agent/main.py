@@ -1819,7 +1819,7 @@ def Pipeline___capabilities() -> str:
 # ─── Workflow Output Tools ────────────────────────────────────────────────────
 
 @tool
-def WorkflowOutput___report_completion(ticket_id: str, summary: str, artifacts: str = "", branch: str = "", commit_sha: str = "", pr_url: str = "", evidence_kind: str = "", evidence_keys: str = "", ci_status: str = "", ci_build_id: str = "", ci_head_sha: str = "", verdict: str = "", tested_head: str = "") -> str:
+def WorkflowOutput___report_completion(ticket_id: str, summary: str, artifacts: str = "", branch: str = "", commit_sha: str = "", pr_url: str = "", evidence_kind: str = "", evidence_keys: str = "", ci_status: str = "", ci_build_id: str = "", ci_head_sha: str = "", verdict: str = "", tested_head: str = "", verified_removable: str = "", candidates: str = "") -> str:
     """Report that your work is complete. This saves your completion summary to S3 AND automatically transitions your Jira ticket to Done. Do NOT call Tickets___transition_ticket to mark your own ticket done — this tool handles that for you.
 
     Args:
@@ -1856,6 +1856,16 @@ def WorkflowOutput___report_completion(ticket_id: str, summary: str, artifacts: 
             (the branch point, the PR merge, other tickets' heads) and only you
             know which one you actually tested. Completion is refused when the
             reviewed, CI-certified and shipped heads disagree.
+        verified_removable: code sweeper only — how many candidates you VERIFIED
+            as dead and actually removed, as a plain integer ("0", "17"). Pass
+            "0" when the sweep found nothing removable: that is what ends the
+            run. The orchestrator closes a zero-yield sweep as "nothing-to-remove"
+            (no branch, no PR, no review, no QA, no merge gate), so do NOT skip
+            the downstream tickets yourself and do NOT report a prose-only no-op.
+        candidates: code sweeper only — how many candidates DETECTION found
+            before verification, as a plain integer. Reported alongside
+            verified_removable so a "93 found, 0 removable" sweep is legible
+            without reading the summary.
     """
     # Include workflow_id and agent_id from invocation context for journey logging (not exposed to agent)
     payload = {
@@ -1886,6 +1896,15 @@ def WorkflowOutput___report_completion(ticket_id: str, summary: str, artifacts: 
         payload["verdict"] = verdict.strip().upper()
     if tested_head.strip():
         payload["tested_head"] = tested_head.strip().lower()
+    # TEAM-4247 D2: the sweep yield pair. Strings (like every other kwarg on this
+    # tool) so "0" — the value the orchestrator terminates a sweep on — travels
+    # as a present field instead of being swallowed by a falsiness test, and so a
+    # model that types "none" gets it DROPPED by the Lambda's integer check
+    # rather than coerced to zero here.
+    if verified_removable.strip():
+        payload["verified_removable"] = verified_removable.strip()
+    if candidates.strip():
+        payload["candidates"] = candidates.strip()
     return _invoke_lambda(WORKFLOW_OUTPUT_LAMBDA, "WorkflowOutput___report_completion", payload)
 
 
