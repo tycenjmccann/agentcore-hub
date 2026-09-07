@@ -371,6 +371,15 @@ export default defineConfig({
       // INSERT record: enforce writes one preserving edge per open verifier, shadow
       // publishes only, off never reads the board, and no failure rejects the record.
       "lambda/orchestrator/fix-before-verify.test.mjs",
+      // verified-head completion (TEAM-4246 D1, FR-D1.9) — the last of the three
+      // holes: dowtdh published workflow.complete 5s after a fix landed at a head
+      // nothing had verified. The head trio is READ OUT OF the dowtdh dossier and
+      // run through the same resolveTestedHead the harvest uses, so the test proves
+      // the real run diverges rather than proving `!==` works; also pins that
+      // unknown heads are not divergence, that a short sha equals the full sha it
+      // prefixes, that the open-fix refusal is phase-BLIND (the fix isWorkflowComplete
+      // could not see), and the head-triple CAS that keeps one refusal to one escalation.
+      "lambda/orchestrator/verified-head-completion.test.mjs",
     ],
     // Keep unit tests away from the Playwright specs under tests/.
     exclude: ["tests/**", "node_modules/**", "demo/**"],

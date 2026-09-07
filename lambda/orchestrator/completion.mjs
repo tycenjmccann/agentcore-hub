@@ -546,3 +546,199 @@ export function evaluateShipVerdict(children, agentTasks, shipPhases, opts = {})
   }
   return { required: true, shipped: false, outcome: blocked || "static-ci-only", blockReason, offenders };
 }
+
+// ─── TEAM-4246 D1 — the verified-head completion gate ────────────────────────
+//
+// Run wf_1788731227559_dowtdh closed green over three different heads: QA
+// verified 933ea6f, CI certified 12e9ac6 (QA's own evidence commit, not the code
+// head), and the fix that finally landed did so at 001259d — five seconds before
+// workflow.complete. Every gate above passed, because none of them compares one
+// ticket's head against another's: the evidence gate wants any output, the ship
+// verdict gate wants a merge commit, and neither asks "did anybody actually
+// verify the code that is about to ship?".
+//
+// So this is the third gate, and it is the only one that reads across tickets.
+
+/**
+ * PARITY MIRROR of normalizeSha in lambda/orchestrator/verdict-contract.mjs.
+ *
+ * A local copy rather than an import for the same reason FIX_KINDS above is one:
+ * this module is loaded by callers that ship neither sibling (the HTTP route's
+ * parity test, the toolkit's offline replays), and it has no local imports of its
+ * own to build a cycle out of. verified-head-completion.test.mjs asserts the two
+ * agree over a table of inputs, so the copy cannot drift.
+ *
+ * 7-40 lowercase hex and nothing else — the whole point of D1's rule 2 is that a
+ * head SHA is never inferred from prose, so anything that is not a git object
+ * name is not a head.
+ */
+const HEAD_SHA_RE = /^[0-9a-f]{7,40}$/;
+export function normalizeHeadSha(raw) {
+  if (typeof raw !== "string") return null;
+  const norm = raw.trim().toLowerCase();
+  return HEAD_SHA_RE.test(norm) ? norm : null;
+}
+
+export const QA_VERIFIER_ID = "agentcore_hub_qa_verifier";
+export const CI_AGENT_ID = "agentcore_hub_ci_agent";
+
+/**
+ * PARITY MIRROR of GATE_PERSONAS in verdict-contract.mjs (same zero-import
+ * reason as normalizeHeadSha; the test pins set equality).
+ *
+ * Used here for ONE purpose: excluding a gate persona's ticket from the PR-head
+ * derivation. A gate persona's `commitSha` is the head it INSPECTED, so counting
+ * it as the run's current head makes the comparison self-fulfilling — dowtdh's
+ * reviewer would have "proved" the head was 933ea6f, which is exactly the head
+ * whose staleness the gate exists to catch.
+ */
+export const GATE_PERSONA_IDS = new Set([
+  "agentcore_hub_code_reviewer",
+  QA_VERIFIER_ID,
+  CI_AGENT_ID,
+  "agentcore_hub_release_manager",
+]);
+
+/** First readable head among `fields`, in order. Structured fields ONLY. */
+function headFrom(entry, fields) {
+  for (const field of fields) {
+    const sha = normalizeHeadSha(entry?.[field]);
+    if (sha) return sha;
+  }
+  return null;
+}
+
+/**
+ * Two heads name the same commit. Prefix equality COUNTS: the same head reaches
+ * this function as a 7-char short sha from one agent's prose-free field and as a
+ * 40-char full sha from another's (dowtdh's CI wrote `12e9ac6ef50…` in full while
+ * the reviewer's record carried `933ea6f`), and treating those as different heads
+ * would report divergence on every run that mixes the two conventions.
+ */
+const sameHead = (a, b) => a === b || a.startsWith(b) || b.startsWith(a);
+
+/**
+ * TEAM-4246 D1 (FR-D1.9) — may this run close at the head it is about to ship?
+ *
+ * Two refusals, in this order, both returned as a `reason` the caller publishes
+ * verbatim on `orchestrator.completion_blocked`:
+ *
+ *   "open-fix"        a fix ticket under the epic is still open. EPIC-WIDE on
+ *                     purpose: isWorkflowComplete only waits on fixes routed
+ *                     under a REQUIRED phase, so a fix stamped with a phase the
+ *                     def does not require (or with none at all) is invisible to
+ *                     it — and dowtdh's TEAM-4183 was exactly a fix nobody was
+ *                     waiting on. The `!isAdvisoryTicket` clause is there for
+ *                     shape-parity with every other gate in this module, but note
+ *                     it can never fire on a fix ticket: advisoryNeverApplies
+ *                     (TEAM-4131 F2) already refuses the `advisory` label on
+ *                     FIX_KINDS precisely so a label cannot bypass the gate the
+ *                     fix exists to hold.
+ *   "head-divergence" the heads the gate personas certified and the head the run
+ *                     is shipping are not the same commit.
+ *
+ * The three heads, from STRUCTURED FIELDS ONLY:
+ *   heads.qa   the newest head the QA verifier declared (testedHead)
+ *   heads.ci   the newest head the CI agent declared (testedHead, else the
+ *              proven-build ci_head_sha it has recorded since TEAM-4122 FR-4)
+ *   heads.pr   opts.prHeadSha when the caller knows it, else the newest
+ *              `commitSha` recorded by a done NON-GATE ticket — the dev/fix work
+ *              that produced the code. Deliberately NOT `mergeCommit`:
+ *              mergeCommit is the integration MERGE commit, a different object
+ *              from the branch head every gate persona tested, so comparing
+ *              against it would report divergence on every merged run.
+ *
+ * "Newest" is by `completedAt`, and a done ticket that declared NO head is
+ * skipped rather than treated as erasing the head an earlier round proved: the
+ * question is "what is the newest head this persona certified", and a head-less
+ * completion certifies nothing.
+ *
+ * FEWER THAN TWO KNOWN HEADS IS NOT DIVERGENCE. A run whose personas recorded no
+ * head predates the field, or ran a def with no QA/CI phase at all, and refusing
+ * to close it would wedge every such run for a fact nobody stated. Unknown is
+ * unknown — the same discipline as missingEvidenceTickets' "only tightens when it
+ * can prove".
+ *
+ * Never reads `delivery.mode`: the heads must agree whether the run merges itself
+ * or hands the PR off, because the handoff PR is what the owning team reviews.
+ *
+ * @param children    the epic's child tickets (advisory ones included; filtered here)
+ * @param agentTasks  the workflow's harvested agentTasks map
+ * @param opts        { prHeadSha } — the real PR head when the caller has it
+ * @returns {{ ok: boolean, reason: null|"open-fix"|"head-divergence",
+ *             heads: { qa: string|null, ci: string|null, pr: string|null },
+ *             offenders: string[], stalePersonas: string[] }}
+ *          `offenders` is the open-fix ticket list; divergence reports the
+ *          personas whose head is stale in `stalePersonas` instead (the caller
+ *          turns those into the re-verify tickets that remediate it).
+ */
+export function evaluateVerifiedHeads(children, agentTasks, opts = {}) {
+  const heads = { qa: null, ci: null, pr: normalizeHeadSha(opts.prHeadSha) };
+  // `inert` aliases `heads` on purpose: every pass/skip return still reports the
+  // heads the scan below discovered, so the caller's event and log line say what
+  // was compared even when nothing was wrong.
+  const inert = { ok: true, reason: null, heads, offenders: [], stalePersonas: [] };
+  if (!Array.isArray(children) || children.length === 0) return inert;
+  // A caller-supplied head wins over any derivation — but only if it IS a head.
+  const prGiven = heads.pr !== null;
+
+  const tasks = agentTasks && typeof agentTasks === "object" ? agentTasks : {};
+  // agentTasks may be keyed by ticketId (orchestrator) or by task id with a
+  // ticketId field — the same secondary index missingEvidenceTickets builds.
+  const byTicketId = new Map();
+  for (const entry of Object.values(tasks)) {
+    if (entry && typeof entry.ticketId === "string") byTicketId.set(entry.ticketId, entry);
+  }
+
+  // Newest-wins by completedAt (ISO strings compare lexicographically); a tie or
+  // a missing timestamp falls back to board order, so the scan is deterministic.
+  const at = { qa: "", ci: "", pr: "" };
+  const take = (slot, sha, when) => {
+    if (!sha || when < at[slot]) return;
+    heads[slot] = sha;
+    at[slot] = when;
+  };
+
+  const openFixes = [];
+  for (const t of children) {
+    if (!t || t.type === "epic") continue;
+    if (t.spawnedBy && FIX_KINDS.has(t.spawnedBy.kind) && isOpen(t) && !isAdvisoryTicket(t)) {
+      const id = String(t.ticketId || "");
+      if (id && !openFixes.includes(id)) openFixes.push(id);
+    }
+    if (String(t.status || "").toLowerCase() !== "done") continue;
+    const ticketId = String(t.ticketId || "");
+    const entry = tasks[ticketId] || byTicketId.get(ticketId);
+    if (!entry) continue;
+    const assignee = t.assignee || entry.agentId || "";
+    const when = String(entry.completedAt || t.completedAt || "");
+    if (assignee === QA_VERIFIER_ID) {
+      take("qa", headFrom(entry, ["testedHead", "tested_head"]), when);
+    } else if (assignee === CI_AGENT_ID) {
+      take("ci", headFrom(entry, ["testedHead", "tested_head", "ci_head_sha", "ciHeadSha"]), when);
+    }
+    // The run's own head: dev/fix work only, and only when the caller did not
+    // supply the real PR head.
+    if (!prGiven && !GATE_PERSONA_IDS.has(assignee) && !isHuman(assignee)) {
+      take("pr", headFrom(entry, ["commitSha", "commit_sha"]), when);
+    }
+  }
+
+  if (openFixes.length > 0) {
+    return { ok: false, reason: "open-fix", heads, offenders: openFixes, stalePersonas: [] };
+  }
+
+  const known = Object.entries(heads).filter(([, sha]) => sha);
+  if (known.length < 2) return inert;
+  if (known.every(([, a]) => known.every(([, b]) => sameHead(a, b)))) return inert;
+
+  const personaOf = { qa: QA_VERIFIER_ID, ci: CI_AGENT_ID };
+  // Whose head is stale? Against the PR head when it is known — that is the head
+  // the run is shipping, so anything that disagrees with it is what went
+  // unverified. With no PR head, two disagreeing verifiers have no majority to
+  // appeal to, so NEITHER can be called current and both are reported.
+  const stalePersonas = ["qa", "ci"]
+    .filter((slot) => heads[slot] && (!heads.pr || !sameHead(heads[slot], heads.pr)))
+    .map((slot) => personaOf[slot]);
+  return { ok: false, reason: "head-divergence", heads, offenders: [], stalePersonas };
+}

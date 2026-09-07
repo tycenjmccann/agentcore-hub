@@ -204,10 +204,11 @@ describe("completion-evidence harvest on the done cascade", () => {
     expect(h.state.workflow.agentTasks[DONE].output).toBe("webhook merge landed first");
   });
 
-  it("evidence AND a ship signal already present — no S3 read, no merge", async () => {
-    // Both halves satisfied is the only short-circuit left; it must still hold or
-    // every done ticket re-reads S3 on every cascade.
-    h.state.workflow = makeWorkflow({ output: "webhook merge landed first", mergeCommit: "9f1c2ab" });
+  it("evidence, a ship signal AND a verdict signal already present — no S3 read, no merge", async () => {
+    // All THREE halves satisfied is the only short-circuit left (TEAM-4246 D1 added
+    // the third); it must still hold or every done ticket re-reads S3 on every
+    // cascade forever.
+    h.state.workflow = makeWorkflow({ output: "webhook merge landed first", mergeCommit: "9f1c2ab", testedHead: "9f1c2ab" });
     h.state.s3Objects[COMPLETION_KEY] = RECORD;
     await handleTicketDoneUnified(DONE);
     expect(h.state.s3Gets).not.toContain(COMPLETION_KEY);
@@ -331,6 +332,142 @@ describe("ship-verdict harvest — merge_commit / outcome / block_reason (TEAM-3
       commitSha: "abc123",
       prUrl: "https://github.com/o/r/pull/7",
     });
+  });
+});
+
+/**
+ * TEAM-4246 D1 — the verdict / tested-head signals.
+ *
+ * `evaluateVerifiedHeads` compares one persona's tested head against another's,
+ * and the ONLY writer of `agentTasks[tid].testedHead` / `.verdict` on the live
+ * cascade is this harvest. Run dowtdh is the proof it was missing: three gate
+ * personas completed (reviewer CHANGES NEEDED, QA FAIL, CI PASS at a third head)
+ * and not one verdict or head reached any task entry, so every gate above read
+ * an empty field and passed.
+ *
+ * Two rules, both pinned below: the fills are additive (a legacy record's merged
+ * key set is byte-identical to pre-4246), and `verdict` is harvested
+ * DECLARED-ONLY — the prose ladder stays live in the resolver, because a stored
+ * inference would make `verdictSource: "declared"` a lie on the entry.
+ */
+describe("verdict/head harvest — verdict / tested_head / ci_head_sha (TEAM-4246 D1)", () => {
+  const GATE_RECORD = {
+    summary: "VERDICT: FAIL — QA must re-run at the fix's head.",
+    commit_sha: "12e9ac6ef5081343701945e8a3b39803d9c53cc6",
+    verdict: "FAIL",
+    verdict_source: "declared",
+    tested_head: "933ea6f1f04fc0212b88b84a6fcbe6aa0ce1d052",
+    ci_head_sha: "12e9ac6ef5081343701945e8a3b39803d9c53cc6",
+    ci_status: "failed",
+    evidence_kind: "playwright",
+    evidence_keys: ["qa/TEAM-1/report.json"],
+  };
+
+  it("harvests verdict, verdictSource, testedHead and the CI/evidence signals", async () => {
+    harvest(GATE_RECORD);
+    await handleTicketDoneUnified(DONE);
+    expect(h.state.merges).toHaveLength(1);
+    expect(h.state.merges[0].fields).toEqual({
+      output: "VERDICT: FAIL — QA must re-run at the fix's head.",
+      commitSha: "12e9ac6ef5081343701945e8a3b39803d9c53cc6",
+      verdict: "FAIL",
+      verdictSource: "declared",
+      // tested_head wins the precedence over ci_head_sha and commit_sha.
+      testedHead: "933ea6f1f04fc0212b88b84a6fcbe6aa0ce1d052",
+      ci_head_sha: "12e9ac6ef5081343701945e8a3b39803d9c53cc6",
+      ci_status: "failed",
+      evidence_kind: "playwright",
+      evidence_keys: ["qa/TEAM-1/report.json"],
+    });
+    // The in-memory entry the same invoke's completion gate will read.
+    expect(h.state.workflow.agentTasks[DONE].verdict).toBe("FAIL");
+    expect(h.state.workflow.agentTasks[DONE].testedHead).toBe(
+      "933ea6f1f04fc0212b88b84a6fcbe6aa0ce1d052"
+    );
+  });
+
+  it("DDB-stream path harvests the same verdict/head", async () => {
+    harvest(GATE_RECORD);
+    await handleTicketDone(DONE, streamImage());
+    expect(h.state.merges[0].fields.verdict).toBe("FAIL");
+    expect(h.state.merges[0].fields.testedHead).toBe("933ea6f1f04fc0212b88b84a6fcbe6aa0ce1d052");
+  });
+
+  it("the third early-return clause: an entry with evidence AND a commit still gets harvested", async () => {
+    // THE regression this commit exists to prevent. Pre-4246 the early return was
+    // `hasEvidence && hasShipSignal`, and a gate ticket satisfies both the moment
+    // its summary lands — so the verdict and head were never read. dowtdh again.
+    h.state.workflow = makeWorkflow({ output: "already summarized", commitSha: "12e9ac6ef50" });
+    harvest(GATE_RECORD);
+    await handleTicketDoneUnified(DONE);
+    expect(h.state.s3Gets).toContain(COMPLETION_KEY);
+    expect(h.state.merges[0].fields.verdict).toBe("FAIL");
+    expect(h.state.merges[0].fields.testedHead).toBe("933ea6f1f04fc0212b88b84a6fcbe6aa0ce1d052");
+    // The deliverable and the commit the entry already had are untouched.
+    expect(h.state.merges[0].fields.output).toBeUndefined();
+    expect(h.state.merges[0].fields.commitSha).toBeUndefined();
+  });
+
+  // One record per test: readCompletionRecord memoizes per invocation, so a second
+  // harvest in the same test would re-serve the first record from that cache.
+  it("falls back to ci_head_sha when there is no tested_head", async () => {
+    harvest({ summary: "PASS", ci_head_sha: "12e9ac6ef5081343701945e8a3b39803d9c53cc6" });
+    await handleTicketDoneUnified(DONE);
+    expect(h.state.merges[0].fields.testedHead).toBe("12e9ac6ef5081343701945e8a3b39803d9c53cc6");
+  });
+
+  it("falls back to commit_sha last", async () => {
+    harvest({ summary: "PASS", commit_sha: "001259dab" });
+    await handleTicketDoneUnified(DONE);
+    expect(h.state.merges[0].fields.testedHead).toBe("001259dab");
+  });
+
+  it("a non-SHA tested_head is dropped, not stored", async () => {
+    // resolveTestedHead is structured-fields-only AND shape-checked; "HEAD" or a
+    // branch name must never become a head the divergence gate then compares.
+    harvest({ summary: "PASS", tested_head: "HEAD" });
+    await handleTicketDoneUnified(DONE);
+    expect(h.state.merges[0].fields.testedHead).toBeUndefined();
+  });
+
+  it("verdict and testedHead already on the entry are never overwritten", async () => {
+    h.state.workflow = makeWorkflow({ verdict: "PASS", verdictSource: "declared", testedHead: "aaaaaaa" });
+    harvest(GATE_RECORD);
+    await handleTicketDoneUnified(DONE);
+    const fields = h.state.merges[0].fields;
+    expect(fields.verdict).toBeUndefined();
+    expect(fields.verdictSource).toBeUndefined();
+    expect(fields.testedHead).toBeUndefined();
+    expect(h.state.workflow.agentTasks[DONE].verdict).toBe("PASS");
+    expect(h.state.workflow.agentTasks[DONE].testedHead).toBe("aaaaaaa");
+  });
+
+  it("a legacy record with none of the D1 keys merges the pre-4246 key set exactly", async () => {
+    // Additive: the only key a legacy record can newly produce is testedHead, and
+    // only when its commit_sha is SHA-shaped. RECORD's is "abc123" (6 chars), so
+    // this merge is byte-identical to the pre-4246 one.
+    h.state.s3Objects[COMPLETION_KEY] = RECORD;
+    await handleTicketDoneUnified(DONE);
+    expect(Object.keys(h.state.merges[0].fields).sort()).toEqual([
+      "branch", "commitSha", "output", "prUrl",
+    ]);
+  });
+
+  it("no verdict in the record → no verdict/verdictSource keys invented", async () => {
+    // The prose says FAIL; the ladder is NOT applied here. resolveVerdictInfo does
+    // that live, so `verdictSource: "declared"` on an entry always means declared.
+    harvest({ summary: "VERDICT: FAIL — this is prose, not a field.", commit_sha: "001259dab" });
+    await handleTicketDoneUnified(DONE);
+    expect(h.state.merges[0].fields.verdict).toBeUndefined();
+    expect(h.state.merges[0].fields.verdictSource).toBeUndefined();
+    // …but the head IS structural, so it is harvested.
+    expect(h.state.merges[0].fields.testedHead).toBe("001259dab");
+  });
+
+  it("an empty evidence_keys array is not merged", async () => {
+    harvest({ summary: "PASS", evidence_keys: [] });
+    await handleTicketDoneUnified(DONE);
+    expect(h.state.merges[0].fields.evidence_keys).toBeUndefined();
   });
 });
 

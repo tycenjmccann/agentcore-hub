@@ -2166,7 +2166,16 @@ async function harvestCompletionEvidence(workflow, ticketId) {
     (typeof entry?.mergeCommit === "string" && entry.mergeCommit.trim().length > 0) ||
     (typeof entry?.commitSha === "string" && entry.commitSha.trim().length > 0) ||
     (typeof entry?.outcome === "string" && entry.outcome.trim().length > 0);
-  if (hasEvidence && hasShipSignal) return;
+  // TEAM-4246 D1: the SAME argument again, one gate later. A gate persona's ticket
+  // has a summary AND a commit_sha on essentially every completion, so both
+  // clauses above are already true and the harvest used to return before ever
+  // reading the record — leaving the verdict and the tested head unharvested on
+  // exactly the tickets whose verdict and head the D1 gates exist to read. dowtdh
+  // is the proof: three gate completions, not one recorded verdict or head.
+  const hasVerdictSignal =
+    (typeof entry?.verdict === "string" && entry.verdict.trim().length > 0) ||
+    (typeof entry?.testedHead === "string" && entry.testedHead.trim().length > 0);
+  if (hasEvidence && hasShipSignal && hasVerdictSignal) return;
   try {
     // Shared per-invocation read (TEAM-4121 FR-9): the live-reverify hook needs
     // the same record moments later, and one GET serves both.
@@ -2196,6 +2205,26 @@ async function harvestCompletionEvidence(workflow, ticketId) {
     }
     if (record.block_reason && !entry?.blockReason) {
       fields.blockReason = String(record.block_reason).slice(0, 500);
+    }
+    // TEAM-4246 D1 — the verdict/head signals, same additive fill-if-absent rule.
+    // `verdict` is harvested DECLARED-ONLY (the value the agent put in the field,
+    // written through workflow-output's allow-list): the prose ladder's answer is
+    // resolved live by resolveVerdictInfo, and persisting an inference here would
+    // make `verdictSource: "declared"` a lie on the entry every later reader trusts.
+    if (record.ci_head_sha && !entry?.ci_head_sha) fields.ci_head_sha = record.ci_head_sha;
+    if (record.ci_status && !entry?.ci_status) fields.ci_status = record.ci_status;
+    if (record.evidence_kind && !entry?.evidence_kind) fields.evidence_kind = record.evidence_kind;
+    if (Array.isArray(record.evidence_keys) && record.evidence_keys.length > 0 && !entry?.evidence_keys) {
+      fields.evidence_keys = record.evidence_keys;
+    }
+    if (record.verdict && !entry?.verdict) fields.verdict = record.verdict;
+    if (record.verdict_source && !entry?.verdictSource) fields.verdictSource = record.verdict_source;
+    if (!entry?.testedHead) {
+      // resolveTestedHead reads STRUCTURED FIELDS ONLY, in one precedence
+      // (tested_head → ci_head_sha → commit_sha) — never the prose, which on this
+      // very record carries several other 7-hex tokens.
+      const testedHead = resolveTestedHead(record);
+      if (testedHead) fields.testedHead = testedHead;
     }
     if (Object.keys(fields).length === 0) return;
     await store.mergeTaskMetadata(workflow.id, ticketId, fields);
