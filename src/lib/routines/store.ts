@@ -20,8 +20,6 @@ import {
 import type { Routine, RoutineSummary } from "./types";
 import { DEFAULT_TENANT_ID } from "@/lib/auth/identity";
 
-export { DEFAULT_USER_ID, DEFAULT_TENANT_ID } from "@/lib/auth/identity";
-
 const REGION = process.env.AWS_REGION || "us-east-1";
 const TABLE = process.env.ROUTINES_TABLE || "agentcore-hub-routines";
 
