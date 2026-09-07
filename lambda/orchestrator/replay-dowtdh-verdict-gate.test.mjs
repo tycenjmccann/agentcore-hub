@@ -533,7 +533,9 @@ describe("dowtdh replay — the fixture still says what this replay claims", () 
   it("published workflow.complete with the cascade unblocking every gate in turn", () => {
     // The baseline criterion (e) reproduces, straight out of the dossier.
     const shape = fixtureCascadeShape();
-    expect(shape.filter((s) => s.type === "orchestrator.unblocked").map((s) => s.ticketId)).toEqual([QA, CI]);
+    // Each gate released the next on `done` alone: the dev released the reviewer,
+    // the reviewer released QA (over its own CHANGES NEEDED), QA released CI.
+    expect(shape.filter((s) => s.type === "orchestrator.unblocked").map((s) => s.ticketId)).toEqual([REVIEW, QA, CI]);
     expect(shape.filter((s) => s.type === "workflow.complete")).toHaveLength(1);
   });
 });
@@ -588,15 +590,38 @@ describe("dowtdh replay — the D1 flags", () => {
     expect(d1).toEqual([]);
   });
 
-  it("(e) all three flags off: agent.complete still carries the four keys at their off defaults", async () => {
+  it("(e) all three flags off: agent.complete carries the four keys on every ticket, at off defaults for non-gate personas", async () => {
     await loadWith({ verdict: "off", fixBefore: "off", verifiedHead: "off" });
     await replay();
 
-    // enrichCompleteDetail is unconditional (the twins are one line), so the keys
-    // are always present — with the empty values that mean "nobody asked".
-    for (const detail of detailsOfType("agent.complete")) {
-      expect(detail).toMatchObject({ verdict: null, verdictSource: null, spawnedTickets: [], testedHead: "" });
+    const byTicket = Object.fromEntries(detailsOfType("agent.complete").map((d) => [d.ticketId, d]));
+    expect(Object.keys(byTicket).sort()).toEqual([...REPLAYED].sort());
+
+    // enrichCompleteDetail is unconditional (the twins are one line), so all four
+    // keys are always present. The dev and the fix are not gate personas, so theirs
+    // are the empty values that mean "nobody asked".
+    for (const id of [DEV, FIX]) {
+      expect(byTicket[id]).toMatchObject({ verdict: null, verdictSource: null, spawnedTickets: [], testedHead: "" });
     }
+
+    // The gate personas' verdicts, however, are reported even with VERDICT_GATE=off,
+    // and that is deliberate rather than a leak: `off` is a promise about WRITES —
+    // no ticket, no blocker edge, no suppressed unblock — not about observability.
+    // The shadow-week rollout (risk 2) and the cost-report quality card both read
+    // verdict/verdictSource off this event, so gating the enrichment on the flag
+    // would blind the very measurement that decides when to move to enforce.
+    expect(byTicket[REVIEW]).toMatchObject({
+      verdict: "CHANGES_NEEDED",
+      verdictSource: "declared",
+      spawnedTickets: [FIX],
+      testedHead: CODE_HEAD,
+    });
+    expect(byTicket[QA]).toMatchObject({ verdict: "FAIL", verdictSource: "declared", spawnedTickets: [] });
+    expect(byTicket[CI]).toMatchObject({ verdict: "PASS", verdictSource: "declared", testedHead: EVIDENCE_HEAD });
+
+    // …and the reported verdicts changed nothing: the run closed exactly as it did.
+    expect(h.state.createdTickets).toEqual([]);
+    expect(h.state.blockerWrites).toEqual([]);
   });
 
   // ── (f) ────────────────────────────────────────────────────────────────────
