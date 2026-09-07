@@ -375,6 +375,19 @@ export default defineConfig({
       // the ship review's change set enumerates its own PR's files only — so an
       // advisory branch's files cannot enter the reviewed diff.
       "lambda/orchestrator/advisory-routing.test.mjs",
+      // f50ucz replay (TEAM-4166 D1/D2 acceptance) — the real ship re-wake stall,
+      // replayed through the REAL awaited-ids + cascade + reconcile-sweep wired as
+      // index.mjs wires them. ship-rewake: TEAM-4126's awaited ship/CI fixes become
+      // real blockedBy edges + a preconditionUnmet stamp, and the cascade re-drives
+      // it the moment the LAST fix (TEAM-4157) lands (08:27Z) instead of the 19:46Z
+      // human nudge — plus the FR-1.4 wait-SLA backstop, jira==dynamodb parity, the
+      // AWAITED_IDS_MODE=off byte-identity, and the create/annotate seam shapes.
+      // liveness: the same slice through the D2 evidence-gated sweep — the false
+      // dead_session_retry_exhausted escalation prod actually fired is now withheld
+      // while the stamp is present, and STILL fires (with all six evidence fields)
+      // once the stamp is gone (D1 off).
+      "lambda/orchestrator/replay-f50ucz-ship-rewake.test.mjs",
+      "lambda/orchestrator/replay-f50ucz-liveness.test.mjs",
     ],
     // Keep unit tests away from the Playwright specs under tests/.
     exclude: ["tests/**", "node_modules/**", "demo/**"],

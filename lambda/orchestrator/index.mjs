@@ -778,6 +778,10 @@ function getDetector() {
     awaitedIds: getAwaitedIds(),
     cleanExitRedispatchCap: CLEAN_EXIT_REDISPATCH_CAP,
     getLastStreamAt: lastStreamAtForTicket,
+    // TEAM-4166 §0 — the same sibling reader the cascade uses, so the detector's
+    // clean-park anti-thrash sees the awaited-fix closure and never re-dispatches
+    // a release manager that is legitimately still waiting.
+    getChildTickets,
   });
   return _detector;
 }

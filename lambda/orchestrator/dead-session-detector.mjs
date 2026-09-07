@@ -50,6 +50,10 @@ import { QueryCommand, ScanCommand } from "@aws-sdk/lib-dynamodb";
 // capped window ROTATES across sweeps (TEAM-3764 F5) so >SWEEP_CAP open
 // workflows can never permanently starve the older tail.
 import { SWEEP_CAP, createOpenWorkflowScan } from "./sweep-scan.mjs";
+// TEAM-4166 §0 — the ONE union-blocker predicate the cascade / reconcile-sweep
+// use, so the detector's clean-park anti-thrash decides identically (blockedBy ∪
+// preconditionUnmet.awaitingIds, all terminal in the sibling snapshot). Pure.
+import { unionBlockersResolved } from "./cascade.mjs";
 
 // Sweep bounds and threshold knobs. The silence threshold is derived per-agent
 // from its own recent run durations; these frame that derivation.
@@ -106,6 +110,13 @@ export function createDetector(deps) {
     awaitedIds,
     cleanExitRedispatchCap = 3,
     getLastStreamAt,
+    // TEAM-4166 §0 — OPTIONAL sibling reader (the same getChildTickets the
+    // cascade / reconcile-sweep use). When wired, the clean-park guard checks the
+    // union blockers before re-dispatching a parked ticket, so it never thrashes
+    // a release manager that is legitimately still waiting on open fixes. When
+    // absent the guard keeps its pre-4166 capped-redispatch behavior (the detector
+    // has no sibling snapshot of its own, so it cannot see the awaited edges).
+    getChildTickets,
     now = () => Date.now(),
     log = (msg) => console.log(`[orchestrator] ${msg}`),
   } = deps;
@@ -299,6 +310,29 @@ export function createDetector(deps) {
       const completedOk = canGuard && await hasCompletionSince(workflow.id, ticketId, claimStartedAt);
       const parkedClean = canGuard && !!ticket?.preconditionUnmet?.awaitingIds?.length;
       if (canGuard && (completedOk || parkedClean)) {
+        // TEAM-4166 §0 ANTI-THRASH. A cleanly-parked ticket is still legitimately
+        // waiting until its awaited fixes close. The cascade guards this with the
+        // sibling snapshot it already holds; the detector has none, so — only when
+        // a sibling reader is wired — fetch the closure and evaluate the SAME
+        // union predicate (blockedBy ∪ preconditionUnmet.awaitingIds). If any
+        // awaited id is still non-terminal, touch nothing (no redispatch, no
+        // budget, no clean-exit counter): the ordinary cascade re-drives it when
+        // the last blocker closes. Reader absent → fall through to the capped
+        // re-wake below (today's behavior — the detector can't see the edges).
+        if (parkedClean && getChildTickets && workflow?.epicId) {
+          let siblings = null;
+          try {
+            siblings = await getChildTickets(workflow.epicId);
+          } catch (err) {
+            siblings = null;
+            log(`detector.awaited_siblings_error — ${ticketId}: ${err?.message || err} (sweep ${sweepId})`);
+          }
+          if (Array.isArray(siblings) && !unionBlockersResolved(ticket, siblings)) {
+            m.awaiting = (m.awaiting || 0) + 1;
+            log(`detector.awaiting — ${ticketId} clean park, awaited blockers still open (sweep ${sweepId})`);
+            return;
+          }
+        }
         const cleanRedispatches = workflow?.cleanExitRedispatches?.[ticketId] || 0;
         if (cleanRedispatches >= cleanExitCap) {
           // Re-woken to the cap without landing — advisory wait-SLA timeout ONLY,

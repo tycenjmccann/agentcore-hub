@@ -1326,6 +1326,82 @@ describe("TEAM-4166 D2 §2.3 — evidence-gated escalation guard", () => {
     expect(store.setTaskStatus).toHaveBeenCalledWith("wf_1", "TEAM-2", "error");
   });
 
+  // TEAM-4166 §0 — the clean-park ANTI-THRASH. When a sibling reader is wired the
+  // guard evaluates the union blockers (blockedBy ∪ preconditionUnmet.awaitingIds)
+  // BEFORE re-dispatching: a parked release manager still waiting on open fixes is
+  // left untouched (the cascade re-drives it when the last fix closes), and only a
+  // parked ticket whose awaited fixes have ALL landed is re-woken.
+  it("§0 anti-thrash: parked clean + reader wired + an awaited fix still open → 'awaiting', no redispatch, no counter", async () => {
+    const wf = makeWorkflow({ deadSessionRetries: { "TEAM-2": 1 }, epicId: "TEAM-1" });
+    const store = guardStore();
+    const getChildTickets = vi.fn(async () => [
+      parkedTicket,
+      { ticketId: FIX, type: "task", status: "in_progress" }, // the awaited fix is NOT terminal
+    ]);
+    const { deps } = makeDeps({
+      ddb: makeDdb({ workflows: [wf] }), store,
+      getTicket: vi.fn(async () => parkedTicket),
+    });
+    const { runSweep } = createDetector({ ...deps, getChildTickets, cleanExitRedispatchCap: 3 });
+
+    const m = await runSweep("enforce");
+
+    expect(getChildTickets).toHaveBeenCalledWith("TEAM-1");
+    expect(m.awaiting).toBe(1);
+    expect(m.exitedOk).toBeFalsy();
+    expect(m.escalations).toBe(0);
+    // Nothing is touched: no re-dispatch, no clean-exit counter, no dead-session
+    // budget, no status write — the ordinary cascade owns the re-drive.
+    expect(store.incrementCleanExitRedispatch).not.toHaveBeenCalled();
+    expect(store.incrementDeadSessionRetry).not.toHaveBeenCalled();
+    expect(deps.redispatch).not.toHaveBeenCalled();
+    expect(store.setTaskStatus).not.toHaveBeenCalled();
+    expect(eventsOfType(deps.publishEvent, "agent.escalated")).toHaveLength(0);
+  });
+
+  it("§0 anti-thrash: parked clean + reader wired + all awaited fixes terminal → clean re-wake 'exited-ok'", async () => {
+    const wf = makeWorkflow({ deadSessionRetries: { "TEAM-2": 1 }, epicId: "TEAM-1" });
+    const store = guardStore();
+    const getChildTickets = vi.fn(async () => [
+      parkedTicket,
+      { ticketId: FIX, type: "task", status: "done" }, // the awaited fix has landed
+    ]);
+    const { deps } = makeDeps({
+      ddb: makeDdb({ workflows: [wf] }), store,
+      getTicket: vi.fn(async () => parkedTicket),
+    });
+    const { runSweep } = createDetector({ ...deps, getChildTickets, cleanExitRedispatchCap: 3 });
+
+    const m = await runSweep("enforce");
+
+    expect(getChildTickets).toHaveBeenCalledWith("TEAM-1");
+    expect(m.exitedOk).toBe(1);
+    expect(m.awaiting).toBeFalsy();
+    expect(store.incrementCleanExitRedispatch).toHaveBeenCalledTimes(1);
+    expect(deps.redispatch).toHaveBeenCalledTimes(1);
+    expect(store.incrementDeadSessionRetry).not.toHaveBeenCalled();
+    expect(eventsOfType(deps.publishEvent, "agent.escalated")).toHaveLength(0);
+  });
+
+  it("§0 anti-thrash: reader ABSENT keeps the pre-4166 capped re-wake (no siblings to consult)", async () => {
+    const wf = makeWorkflow({ deadSessionRetries: { "TEAM-2": 1 }, epicId: "TEAM-1" });
+    const store = guardStore();
+    const { deps } = makeDeps({
+      ddb: makeDdb({ workflows: [wf] }), store,
+      getTicket: vi.fn(async () => parkedTicket),
+    });
+    // No getChildTickets dep → the guard cannot see the awaited closure, so it
+    // re-wakes on the clean-exit counter exactly as it did before §0.
+    const { runSweep } = createDetector({ ...deps, cleanExitRedispatchCap: 3 });
+
+    const m = await runSweep("enforce");
+
+    expect(m.exitedOk).toBe(1);
+    expect(m.awaiting).toBeFalsy();
+    expect(store.incrementCleanExitRedispatch).toHaveBeenCalledTimes(1);
+    expect(deps.redispatch).toHaveBeenCalledTimes(1);
+  });
+
   it("emits explicit zeros for DetectorExitedOk / DetectorAwaiting on a healthy sweep", async () => {
     const { deps } = makeDeps();
     const { runSweep } = createDetector(deps);
