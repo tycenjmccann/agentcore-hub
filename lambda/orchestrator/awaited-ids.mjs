@@ -84,27 +84,35 @@ export function normalizeAwaitedIdsMode(v, log = (msg) => console.warn(msg)) {
 }
 
 /**
- * Fold one `addBlockers` seam return into { written, present } counts.
+ * Fold one `addBlockers` seam return into { written, present, failed } counts.
  *
  * The seam is tolerated in BOTH the shapes it can answer in:
- *   - the idealized per-id token form — an array of "added" | "present" |
- *     "skipped" (or a single such string when one id was written);
- *   - the CURRENT addBlockers return (index.mjs) — an array of the ID STRINGS
- *     that were newly added, with idempotent-present ids OMITTED entirely.
+ *   - the per-id token form (index.mjs addBlockers with `detailed: true`,
+ *     TEAM-4185 F5) — an array of "added"/"blocked"/"preserved" | "present" |
+ *     "failed"/"error" | "skipped" (or a single such string for one id);
+ *   - the LEGACY addBlockers return — an array of the ID STRINGS that were newly
+ *     added, with idempotent-present ids OMITTED entirely.
  *
- * So: an explicit write/present token is counted as such; a returned id string
- * that we asked for is a write; and — only when the result carried no status
- * tokens at all (i.e. it was the id-string form) — a requested id ABSENT from
- * the result is treated as the idempotent "present" no-op the real seam signals
- * by omission.
+ * So: an explicit write/present/failed token is counted as such; a returned id
+ * string that we asked for is a write; and — only when the result carried no
+ * status tokens at all (i.e. it was the id-string form) — a requested id ABSENT
+ * from the result is treated as the idempotent "present" no-op the legacy seam
+ * signals by omission.
+ *
+ * TEAM-4185 F5 — `failed` is why the token form exists. The id-array shape signals
+ * BOTH "already linked" and "the write blew up" by omission, so applyAwaitedEdges
+ * could not tell them apart and stamped a fresh park for an edge that never
+ * landed. A failed write must leave the stamp (and its clock) alone.
  */
 export function tallyBlockerResult(res, requestedIds) {
   const WRITE_TOKENS = new Set(["added", "blocked", "preserved", "written"]);
+  const FAIL_TOKENS = new Set(["failed", "error"]);
   const requested = new Set(requestedIds);
   const arr = Array.isArray(res) ? res : res === undefined || res === null ? [] : [res];
 
   let written = 0;
   let present = 0;
+  let failed = 0;
   let sawToken = false;
   const writtenIds = new Set();
 
@@ -113,6 +121,7 @@ export function tallyBlockerResult(res, requestedIds) {
     const norm = el.trim().toLowerCase();
     if (WRITE_TOKENS.has(norm)) { written++; sawToken = true; continue; }
     if (norm === "present") { present++; sawToken = true; continue; }
+    if (FAIL_TOKENS.has(norm)) { failed++; sawToken = true; continue; }
     if (norm === "skipped") { sawToken = true; continue; }
     // Otherwise it's an id string: a write iff it is one of the ids we asked for
     // (or at least looks like a ticket id).
@@ -122,14 +131,16 @@ export function tallyBlockerResult(res, requestedIds) {
     }
   }
 
-  // The real seam OMITS idempotent-present ids. When the answer was purely
+  // The LEGACY seam shape OMITS idempotent-present ids. When the answer was purely
   // id-shaped (no tokens), any requested id we didn't see written is a present
-  // no-op — the only signal the seam gives for "the edge was already there".
+  // no-op — the only signal that shape gives for "the edge was already there".
+  // (Under `detailed: true` every id answers with a token, so this never fires and
+  // a failure is never mistaken for an idempotent no-op.)
   if (!sawToken) {
     for (const id of requested) if (!writtenIds.has(id)) present++;
   }
 
-  return { written, present };
+  return { written, present, failed };
 }
 
 /**
@@ -287,9 +298,18 @@ export function createAwaitedIds(deps = {}) {
     // send / ticketsTable / provider / getChildTickets / leaseTtlMs are accepted
     // for parity with the sibling factories and the reconcile-sweep wiring; the
     // board write itself goes exclusively through the injected `addBlockers`
-    // seam, so this module never touches a raw command.
+    // seam, so this module never touches a raw command (and this file stays free
+    // of @aws-sdk imports — DI only).
+    //
+    // TEAM-4185 F5 — the `addBlockers` seam SHOULD answer in the per-id token form
+    // ("added"/"blocked"/"preserved" | "present" | "failed"), which the orchestrator
+    // adapter gets by passing `detailed: true`. The legacy added-id-array shape is
+    // still accepted (tallyBlockerResult infers present-by-omission), but it cannot
+    // distinguish a failed write from an already-present edge, so a seam stuck on
+    // that shape will stamp preconditionUnmet for edges that never landed.
     addBlockers,               // (ticketId, ids, { preserveStatusIf, source }) → seam result
     annotatePreconditionUnmet, // (originId, { awaitingIds, source, reportedAt }) — merges ids
+                               // TEAM-4185 F3(b): called ONLY when a write landed.
     publishEvent,              // (ticketId, type, detail)
     getTicket,                 // (ticketId) → ticket row | null
     store,                     // workflow-store (markAwaitTimeoutEmitted CAS)
@@ -305,7 +325,8 @@ export function createAwaitedIds(deps = {}) {
     : DEFAULT_TIMEOUT_MINUTES) * 60000;
 
   function freshMetrics() {
-    return { mode, derived: 0, fromTool: 0, written: 0, present: 0, timeouts: 0 };
+    // TEAM-4185 F5 — `failed` is a first-class outcome, not the absence of one.
+    return { mode, derived: 0, fromTool: 0, written: 0, present: 0, failed: 0, timeouts: 0 };
   }
   let metrics = freshMetrics();
   function newMetrics() {
@@ -354,7 +375,25 @@ export function createAwaitedIds(deps = {}) {
   /**
    * Write awaited `ids` as blocker edges on `originId` and stamp its
    * preconditionUnmet (the D2 evidence). off → no-op; shadow → count derivation
-   * metrics + log, ZERO writes; enforce → write via the seam + annotate.
+   * metrics + log, ZERO writes; enforce → write via the seam, then annotate IFF a
+   * write actually landed. Returns { written, present, failed, ids }.
+   *
+   * TEAM-4185 F3(b)/F5 — the annotate is gated on `written > 0`. Two paths used to
+   * re-stamp `reportedAt` for a write that changed nothing:
+   *   - the level-triggered "tool" pickup re-reporting an edge that is ALREADY on
+   *     the board (present). Re-stamping reset the wait clock every sweep, so
+   *     awaitedWaitedMs never grew and the D1 wait-SLA could not fire — a ticket
+   *     could sit awaiting a fix forever without one await_timeout.
+   *   - a wholly-FAILED write (F5). Stamping there is worse than useless: it claims
+   *     evidence of a park that has no edge behind it, and the D2 evidence guard
+   *     reads that phantom stamp as a clean park.
+   * Neither is silent — both are logged with `failed=N` — and the recovery for a
+   * failed derived write is the F4 fix-side sweep backstop (handleSpawnedFix in
+   * reconcile-sweep.mjs), which re-derives the edge from the fix ticket precisely
+   * because no stamp was left behind to find it by.
+   *
+   * Never throws: an awaited edge is advisory bookkeeping on the done cascade, so a
+   * seam throw is folded into the normal return as `failed = clean.length`.
    */
   async function applyAwaitedEdges(originId, ids, source = "tool") {
     const clean = normalizeIds(originId, ids);
@@ -372,38 +411,50 @@ export function createAwaitedIds(deps = {}) {
       return { skipped: "shadow", ids: clean };
     }
 
-    // enforce — the ONE provider-aware write seam. Never throws fatally: an
-    // awaited edge is advisory bookkeeping on the done cascade.
+    // enforce — the ONE provider-aware write seam. A seam THROW is not a special
+    // return shape: it is every requested id failing, folded into the normal path
+    // so the caller has exactly one outcome vocabulary to read.
     let res;
+    let threw = null;
     try {
       res = await addBlockers(originId, clean, { preserveStatusIf: PRESERVE_STATUSES, source });
     } catch (err) {
+      threw = err;
       log(`awaited.addBlockers_error — origin=${originId}: ${err?.message || err}`);
-      return { error: true, ids: clean };
     }
-    const { written, present } = tallyBlockerResult(res, clean);
+    const { written, present, failed } = threw
+      ? { written: 0, present: 0, failed: clean.length }
+      : tallyBlockerResult(res, clean);
     metrics.written += written;
     metrics.present += present;
+    metrics.failed += failed;
 
     // Stamp the origin's preconditionUnmet (merging ids if already present) —
     // this is what the D2 evidence guard reads to tell a clean park from a dead
     // session. Best-effort: a failed stamp must not undo the edge that landed.
-    try {
-      await annotatePreconditionUnmet?.(originId, {
-        awaitingIds: clean,
-        // TEAM-4184 — honor the caller's source. This was hard-coded "derived",
-        // so an agent's OWN report (the level-triggered "tool" pickup) was
-        // recorded as an orchestrator inference, losing the distinction the
-        // provenance field exists to make.
-        source: isTool ? "tool" : "derived",
-        reportedAt: new Date(now()).toISOString(),
-      });
-    } catch (err) {
-      log(`awaited.annotate_error — origin=${originId}: ${err?.message || err}`);
+    //
+    // TEAM-4185 F3(b) — ONLY when a write landed. `written === 0` means either the
+    // edge was already there (present) or nothing landed at all (failed); in both
+    // cases there is no new fact to record, and re-stamping would move `reportedAt`
+    // forward and reset the wait clock awaitedWaitedMs / checkAwaitTimeout read.
+    if (written > 0) {
+      try {
+        await annotatePreconditionUnmet?.(originId, {
+          awaitingIds: clean,
+          // TEAM-4184 — honor the caller's source. This was hard-coded "derived",
+          // so an agent's OWN report (the level-triggered "tool" pickup) was
+          // recorded as an orchestrator inference, losing the distinction the
+          // provenance field exists to make.
+          source: isTool ? "tool" : "derived",
+          reportedAt: new Date(now()).toISOString(),
+        });
+      } catch (err) {
+        log(`awaited.annotate_error — origin=${originId}: ${err?.message || err}`);
+      }
     }
 
-    log(`awaited.apply — origin=${originId} += [${clean.join(", ")}] source=${source} written=${written} present=${present}`);
-    return { written, present, ids: clean };
+    log(`awaited.apply — origin=${originId} += [${clean.join(", ")}] source=${source} written=${written} present=${present} failed=${failed}`);
+    return { written, present, failed, ids: clean };
   }
 
   /**
@@ -505,6 +556,9 @@ export function createAwaitedIds(deps = {}) {
             { Name: "AwaitedEdgesFromTool", Unit: "Count" },
             { Name: "AwaitedEdgesWritten", Unit: "Count" },
             { Name: "AwaitedEdgesPresent", Unit: "Count" },
+            // TEAM-4185 F5 — a wholly-failed write leaves NO stamp, so this metric
+            // is the only signal that a re-wake edge silently did not land.
+            { Name: "AwaitedEdgesFailed", Unit: "Count" },
             { Name: "AwaitTimeouts", Unit: "Count" },
           ],
         }],
@@ -514,6 +568,7 @@ export function createAwaitedIds(deps = {}) {
       AwaitedEdgesFromTool: m.fromTool || 0,
       AwaitedEdgesWritten: m.written || 0,
       AwaitedEdgesPresent: m.present || 0,
+      AwaitedEdgesFailed: m.failed || 0,
       AwaitTimeouts: m.timeouts || 0,
     }));
   }

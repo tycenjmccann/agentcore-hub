@@ -41,7 +41,6 @@ import {
   validateFixContract,
   normalizeContractMode,
   sanitizeUserLabels,
-  maxReportedAt,
 } from "./fix-contract.mjs";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
@@ -907,6 +906,24 @@ async function addComment(args) {
  */
 const SOURCE_RANK = (source) => ({ tool: 3, derived: 2, label: 1 })[source] || 0;
 
+/**
+ * TEAM-4185 F3 — are these two preconditionUnmet records the same record? Used to
+ * short-circuit a re-report that would change nothing, so `updatedAt` (and the
+ * orchestrator's parkedLongEnough / wait-SLA clocks that read it) does not move.
+ * Strict on presence: a legacy row missing `note`/`agentId` differs from the
+ * normalized shape, so it is rewritten ONCE and is a no-op from then on.
+ */
+function samePreconditionUnmet(a, b) {
+  if (!a || !b) return false;
+  const aIds = Array.isArray(a.awaitingIds) ? a.awaitingIds : null;
+  if (!aIds || aIds.length !== b.awaitingIds.length) return false;
+  if (aIds.some((id, i) => id !== b.awaitingIds[i])) return false;
+  return a.note === b.note
+    && a.reportedAt === b.reportedAt
+    && a.agentId === b.agentId
+    && a.source === b.source;
+}
+
 async function annotatePreconditionUnmet(args) {
   const issueKey = args.issue_key || args.ticket_id;
   if (!issueKey) return textResult("Error: 'issue_key' is required");
@@ -931,6 +948,7 @@ async function annotatePreconditionUnmet(args) {
   }
 
   const now = new Date().toISOString();
+  const prior = current.Item.preconditionUnmet || {};
   // TEAM-4184 — the merge is MONOTONIC in the two fields the D2 evidence guard
   // reasons about, because re-reports are not ordered. The orchestrator's
   // level-triggered pickup re-annotates from the persisted row with a
@@ -938,20 +956,40 @@ async function annotatePreconditionUnmet(args) {
   // last-writer-wins merge would then walk `reportedAt` backwards (making a
   // current stamp look like a previous claim's residue) and downgrade `source`
   // tool -> derived. The awaited ids already union for the same reason.
+  //
+  // TEAM-4185 F3 tightens `reportedAt` further: FIRST-writer-wins, not max-wins.
+  // Max-wins still let a re-report move the stamp FORWARD, and the level-triggered
+  // pickup re-annotates with `now()` when the row carries no explicit reportedAt —
+  // which restarted the FR-1.4 wait SLA on every pickup, so a ticket that had been
+  // waiting for hours read as freshly parked and its await_timeout never fired.
+  // The stamp is meant to record when the wait BEGAN, so the first parseable value
+  // is the right one; an absent/unparseable stored stamp still loses to the
+  // incoming one. `source` remains rank-preserving (it is not a clock).
   const incomingReportedAt = args.reportedAt || now;
-  const reportedAt = maxReportedAt(current.Item.preconditionUnmet?.reportedAt, incomingReportedAt)
-    || incomingReportedAt;
+  const reportedAt = Number.isFinite(Date.parse(prior.reportedAt ?? ""))
+    ? prior.reportedAt
+    : incomingReportedAt;
   const incomingSource = args.source || "tool";
-  const source = SOURCE_RANK(current.Item.preconditionUnmet?.source) > SOURCE_RANK(incomingSource)
-    ? current.Item.preconditionUnmet.source
+  const source = SOURCE_RANK(prior.source) > SOURCE_RANK(incomingSource)
+    ? prior.source
     : incomingSource;
-  const preconditionUnmet = {
-    awaitingIds,
-    note: typeof args.note === "string" ? args.note : "",
-    reportedAt,
-    agentId: args.agentId || null,
-    source,
-  };
+  // TEAM-4185 F3 — `note`/`agentId` are first-NON-EMPTY-writer-wins for the same
+  // reason: the pickup's re-annotate carries neither, and a last-writer-wins merge
+  // clobbered the reporting agent's own note to "" and its id to null, erasing WHO
+  // parked and WHY from the row an operator reads.
+  const incomingNote = typeof args.note === "string" ? args.note : "";
+  const note = typeof prior.note === "string" && prior.note ? prior.note : incomingNote;
+  const agentId = prior.agentId || args.agentId || null;
+  const preconditionUnmet = { awaitingIds, note, reportedAt, agentId, source };
+
+  // TEAM-4185 F3 — a re-report that changes NOTHING writes nothing. Every field
+  // above is now monotonic, so the steady state of a parked ticket being
+  // re-reported each sweep is an identical record; writing it anyway moved
+  // `updatedAt`, and `parkedLongEnough` reads `updatedAt`, so a ticket re-reported
+  // more often than the min-parked window could never become a sweep candidate.
+  if (samePreconditionUnmet(prior, preconditionUnmet)) {
+    return { ticketId: issueKey, preconditionUnmet, unchanged: true };
+  }
 
   await ddb.send(
     new UpdateCommand({

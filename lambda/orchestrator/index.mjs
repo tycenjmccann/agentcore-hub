@@ -840,8 +840,13 @@ function getAwaitedIds() {
     leaseTtlMs: LEASE_TTL_MS,
     // Adapter: forward the awaited-edge write to the existing provider-aware seam,
     // threading preserveStatusIf (so the parked agent is never yanked to Blocked).
+    // TEAM-4185 F5 — `detailed: true` is passed ONLY here: awaited-ids is the one
+    // caller that must distinguish an already-present edge from a FAILED write,
+    // because it stamps preconditionUnmet (and therefore the wait clock) on the
+    // strength of the write actually landing. Every other addBlockers caller keeps
+    // the unchanged added-id array.
     addBlockers: (ticketId, ids, opts = {}) =>
-      addBlockers(ticketId, ids, { preserveStatusIf: opts.preserveStatusIf, source: opts.source }),
+      addBlockers(ticketId, ids, { preserveStatusIf: opts.preserveStatusIf, source: opts.source, detailed: true }),
     // Adapter: stamp the origin's preconditionUnmet through the SAME Tickets___*
     // tool as the report_precondition_unmet channel (provider-agnostic).
     annotatePreconditionUnmet: (originId, { awaitingIds, source, reportedAt }) =>
@@ -1339,16 +1344,32 @@ async function blockShipOnPrereq(ticketId, shipTicket, blockerId) {
  * made inside the conditional write (see ticket-blockers.mjs), never by a
  * read-then-write that would race the agent's own transition.
  *
+ * TEAM-4185 F5 — `opts.detailed`: return a PER-ID token array (positionally
+ * aligned with the requested ids) instead of the added-id array. The default
+ * return is unchanged byte for byte, because the id array is load-bearing for
+ * live-reverify.mjs / sync-main.mjs / dead-session-escalation.mjs, which read the
+ * ids back. Only the awaited-ids adapter opts in, because it is the one caller
+ * that must tell an idempotent "the edge was already there" from a FAILED write:
+ * the id-array shape signals both by omission, so a wholly-failed write was
+ * indistinguishable from an all-present no-op and got stamped as a fresh park.
+ * Tokens: "added"/"blocked"/"preserved" = written, "present" = idempotent no-op,
+ * "failed" = the write did not land. See tallyBlockerResult in awaited-ids.mjs.
+ *
  * NOTE: this is a deliberate, acknowledged duplicate of the tickets-Lambda
  * `add_blockers` op added in PR #380, which main does not yet carry. When #380
  * merges, replace the body with invokeTickets("add_blockers", …) so the board
  * write lives in exactly one place again.
  */
-async function addBlockers(ticketId, ids, opts = {}) {
+// Exported for tests only (same reason as isCreationTimeBlock / mapJiraIssueToTicket):
+// the `detailed` token contract below is what awaited-ids' annotate gate depends on,
+// so it is pinned directly rather than inferred through the handler.
+export async function addBlockers(ticketId, ids, opts = {}) {
   const blockers = (Array.isArray(ids) ? ids : [ids]).filter(Boolean);
   if (!ticketId || !blockers.length) return [];
   const preserveStatusIf = normalizePreserveStatuses(opts.preserveStatusIf);
+  const detailed = opts.detailed === true;
   const added = [];
+  const tokens = [];
   if (TICKET_PROVIDER === "jira") {
     for (const id of blockers) {
       try {
@@ -1358,14 +1379,18 @@ async function addBlockers(ticketId, ids, opts = {}) {
           outwardIssue: { key: ticketId },
         });
         added.push(id);
+        tokens.push("added");
       } catch (err) {
         console.warn(`[orchestrator] addBlockers: link ${id} → ${ticketId} failed (non-fatal): ${err?.message || err}`);
+        // Jira dedupes (type, pair), so a repeat link SUCCEEDS — a throw here is a
+        // genuine failure, never the idempotent case.
+        tokens.push("failed");
       }
     }
     if (added.length && !(await jiraStatusIsPreserved(ticketId, preserveStatusIf))) {
       await jiraTransition(ticketId, "Blocked");
     }
-    return added;
+    return detailed ? tokens : added;
   }
   for (const id of blockers) {
     const outcome = await applyBlockerEdge({
@@ -1381,8 +1406,11 @@ async function addBlockers(ticketId, ids, opts = {}) {
       console.log(`[orchestrator] addBlockers: ${ticketId} += ${id} (edge only — status preserved, TEAM-4130 F1)`);
     }
     if (outcome === "blocked" || outcome === "preserved") added.push(id);
+    // "blocked"/"preserved" are already write tokens; "present" passes through as
+    // the idempotent no-op; anything else (i.e. "error") is a failed write.
+    tokens.push(outcome === "blocked" || outcome === "preserved" || outcome === "present" ? outcome : "failed");
   }
-  return added;
+  return detailed ? tokens : added;
 }
 
 /**
@@ -3915,8 +3943,14 @@ async function trackTicketCreation(ticketId, assignee, workflowId, parentId, spa
   const workflow = await resolveWorkflow(workflowId, parentId);
   if (!workflow) return;
 
-  // Already tracked (e.g., from a retry/re-delivery) — don't overwrite
-  if (workflow.agentTasks?.[ticketId]) return;
+  // Already tracked (e.g., from a retry/re-delivery) — don't overwrite the entry,
+  // but TEAM-4185 F4: the derived edge is NOT part of the tracking CAS, so a
+  // re-delivery must still get the chance to write it (the first delivery may
+  // have died between trackTicket and the hook).
+  if (workflow.agentTasks?.[ticketId]) {
+    await deriveAwaitedEdgeOnCreate(ticketId, spawnedBy);
+    return;
+  }
 
   const entry = {
     id: `task_${Date.now()}_${assignee}`,
@@ -3926,7 +3960,13 @@ async function trackTicketCreation(ticketId, assignee, workflowId, parentId, spa
     createdAt: new Date().toISOString(),
   };
   const created = await store.trackTicket(workflow.id, ticketId, entry);
-  if (!created) return; // concurrently tracked — keep the existing entry
+  if (!created) {
+    // Concurrently tracked — keep the existing entry. TEAM-4185 F4: losing the
+    // tracking CAS says nothing about the derived edge, so still try to write it
+    // (idempotent — the winner and this loser converge on the same edge).
+    await deriveAwaitedEdgeOnCreate(ticketId, spawnedBy);
+    return;
+  }
   if (!workflow.agentTasks) workflow.agentTasks = {};
   workflow.agentTasks[ticketId] = entry;
   console.log(`[orchestrator] Tracked new ticket ${ticketId} (${assignee}) in workflow ${workflow.id}`);
@@ -3951,19 +3991,33 @@ async function trackTicketCreation(ticketId, assignee, workflowId, parentId, spa
     console.warn(`[orchestrator] ticket.created publish failed for ${ticketId}:`, err.message);
   }
 
-  // TEAM-4166 D1 §1.4 — DERIVED awaited-ids hook. A freshly-created FIX ticket
-  // whose spawnedBy points back to an origin (KIND_TO_ORIGIN_KEY[kind]) means the
-  // origin is waiting on THIS fix: write the awaited edge on the origin now, so a
-  // release manager parked on a sub-cap CHANGES-NEEDED re-wakes when the fix
-  // closes even if the tool never explicitly reported the precondition. Idempotent
-  // with the tool-report pickup (both converge on the same edge), mode-gated
-  // (off → no-op before any I/O), and never fatal — must not fail ticket creation.
-  if (AWAITED_IDS_MODE !== "off" && spawnedBy?.kind && KIND_TO_ORIGIN_KEY[spawnedBy.kind]) {
-    try {
-      await getAwaitedIds().applyAwaitedEdgesForSpawn(ticketId, spawnedBy, "spawnedBy");
-    } catch (err) {
-      console.warn(`[orchestrator] awaited-ids derived hook failed for ${ticketId} (non-fatal): ${err?.message || err}`);
-    }
+  await deriveAwaitedEdgeOnCreate(ticketId, spawnedBy);
+}
+
+/**
+ * TEAM-4166 D1 §1.4 — DERIVED awaited-ids hook. A freshly-created FIX ticket
+ * whose spawnedBy points back to an origin (KIND_TO_ORIGIN_KEY[kind]) means the
+ * origin is waiting on THIS fix: write the awaited edge on the origin now, so a
+ * release manager parked on a sub-cap CHANGES-NEEDED re-wakes when the fix
+ * closes even if the tool never explicitly reported the precondition. Idempotent
+ * with the tool-report pickup (both converge on the same edge), mode-gated
+ * (off → no-op before any I/O), and never fatal — must not fail ticket creation.
+ *
+ * TEAM-4185 F4 — extracted from trackTicketCreation's tail so EVERY delivery gets
+ * a shot at the edge. The old placement sat behind two early returns (already
+ * tracked / lost trackTicket CAS), which meant a redelivered INSERT — the exact
+ * shape a Streams retry or the Jira todo twin produces — silently skipped the
+ * derivation and left the origin with no edge at all. Tracking is CAS-once;
+ * the edge is convergent, so it must NOT share that gate.
+ */
+async function deriveAwaitedEdgeOnCreate(ticketId, spawnedBy) {
+  // Mode gate FIRST: off means zero I/O, and getAwaitedIds() is never constructed.
+  if (AWAITED_IDS_MODE === "off") return;
+  if (!spawnedBy?.kind || !KIND_TO_ORIGIN_KEY[spawnedBy.kind]) return;
+  try {
+    await getAwaitedIds().applyAwaitedEdgesForSpawn(ticketId, spawnedBy, "spawnedBy");
+  } catch (err) {
+    console.warn(`[orchestrator] awaited-ids derived hook failed for ${ticketId} (non-fatal): ${err?.message || err}`);
   }
 }
 

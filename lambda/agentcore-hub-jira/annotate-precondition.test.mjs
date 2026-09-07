@@ -79,9 +79,16 @@ test("annotate_precondition_unmet (jira): posts a marker comment + awaiting: lab
  * TEAM-4184 — the reportedAt clock must survive a FIELDS-ONLY read, because the
  * sibling read the D2 evidence guard runs (getChildTicketsFromJira) requests no
  * `comment` field, and Jira caps an issue's comments at the 20 oldest anyway. So
- * it rides a `precondition-at:<epochMs>` label, written MONOTONICALLY: newest
- * wins, superseded labels are pruned in the same PUT, an older re-report is a
- * no-op on the clock.
+ * it rides a `precondition-at:<epochMs>` label.
+ *
+ * TEAM-4185 F3 flips WHICH stamp wins: FIRST-writer, not newest. The stamp records
+ * when the wait BEGAN, and a clock that moved forward on every re-report restarted
+ * the FR-1.4 wait SLA (same change as the DynamoDB twin's reportedAt merge). So an
+ * existing clock is preserved and reported back, a real write prunes the newer
+ * sibling labels so the max-wins READERS converge on that first instant, and a
+ * re-report with nothing new to say writes NOTHING — no comment, no PUT — because
+ * either write bumps the issue's `updated`, which is the field parkedLongEnough
+ * reads.
  */
 function recordingFetch(calls, existingLabels) {
   return async (url, options = {}) => {
@@ -101,54 +108,90 @@ function recordingFetch(calls, existingLabels) {
 const annotate = (parameters) =>
   jira.handler({ tool_name: "Tickets___annotate_precondition_unmet", parameters });
 
-test("annotate_precondition_unmet (jira): a NEWER reportedAt adds the clock and prunes the superseded label", async () => {
+test("annotate_precondition_unmet (jira): TEAM-4185 F3 — a NEWER reportedAt never replaces the existing clock", async () => {
   const originalFetch = globalThis.fetch;
   const calls = [];
   const older = `precondition-at:${Date.parse("2026-09-06T07:07:00.000Z")}`;
   globalThis.fetch = recordingFetch(calls, ["wf:wf_1", "awaiting:TEAM-4156", older]);
 
   try {
-    await annotate({
+    const r = await annotate({
       ticket_id: "TEAM-4126", awaitingIds: ["TEAM-4157"],
       reportedAt: "2026-09-06T09:10:00.000Z", source: "tool",
     });
 
+    // The new awaited id lands; the clock is left exactly as it was. (Pre-4185 this
+    // added precondition-at:09:10 and removed the 07:07 one.)
     const put = calls.find((c) => c.method === "PUT" && /\/issue\/TEAM-4126$/.test(c.path));
-    const newer = `precondition-at:${Date.parse("2026-09-06T09:10:00.000Z")}`;
-    assert.deepEqual(put.body.update.labels, [
-      { add: "awaiting:TEAM-4157" },
-      { add: newer },
-      { remove: older },
-    ]);
+    assert.deepEqual(put.body.update.labels, [{ add: "awaiting:TEAM-4157" }]);
+
+    // The PRESERVED stamp is what the tool reports back and what the marker
+    // comment carries — the comment trail and the label clock never disagree.
+    assert.equal(r.preconditionUnmet.reportedAt, "2026-09-06T07:07:00.000Z");
+    const comment = calls.find((c) => c.method === "POST" && /\/comment$/.test(c.path));
+    assert.ok(JSON.stringify(comment.body).includes("2026-09-06T07:07:00.000Z"));
+    assert.ok(!JSON.stringify(comment.body).includes("09:10"));
   } finally {
     globalThis.fetch = originalFetch;
   }
 });
 
-test("annotate_precondition_unmet (jira): an OLDER reportAt never moves the clock backwards and prunes nothing", async () => {
+test("annotate_precondition_unmet (jira): TEAM-4185 F3 — a real write prunes back to the OLDEST clock", async () => {
   const originalFetch = globalThis.fetch;
   const calls = [];
+  const older = `precondition-at:${Date.parse("2026-09-06T07:07:00.000Z")}`;
   const newer = `precondition-at:${Date.parse("2026-09-06T09:10:00.000Z")}`;
-  globalThis.fetch = recordingFetch(calls, ["awaiting:TEAM-4156", newer]);
+  // Two clock labels — a prune that failed earlier. The max-wins readers would
+  // read 09:10; pruning the newer one converges them on the first stamp.
+  globalThis.fetch = recordingFetch(calls, ["awaiting:TEAM-4156", older, newer]);
 
   try {
-    // The level-triggered pickup re-reports a DERIVED (spawn-time) stamp long
-    // after the agent's own tool report. It must not clobber the live clock.
-    await annotate({
-      ticket_id: "TEAM-4126", awaitingIds: ["TEAM-4156"],
-      reportedAt: "2026-09-06T07:07:00.000Z", source: "derived",
+    const r = await annotate({
+      ticket_id: "TEAM-4126", awaitingIds: ["TEAM-4157"],
+      reportedAt: "2026-09-06T10:00:00.000Z", source: "tool",
     });
 
     const put = calls.find((c) => c.method === "PUT" && /\/issue\/TEAM-4126$/.test(c.path));
-    // Only the (idempotent, server-side-deduped) awaiting add — no clock add, no
-    // remove of the fresher label.
-    assert.deepEqual(put.body.update.labels, [{ add: "awaiting:TEAM-4156" }]);
+    assert.deepEqual(put.body.update.labels, [
+      { add: "awaiting:TEAM-4157" },
+      { remove: newer },
+    ]);
+    assert.equal(r.preconditionUnmet.reportedAt, "2026-09-06T07:07:00.000Z");
   } finally {
     globalThis.fetch = originalFetch;
   }
 });
 
-test("annotate_precondition_unmet (jira): a failed labels read still writes the clock (max-wins makes pruning optional)", async () => {
+test("annotate_precondition_unmet (jira): TEAM-4185 F3 — a re-report with no new id and a clock present writes NOTHING", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  const clock = `precondition-at:${Date.parse("2026-09-06T07:07:00.000Z")}`;
+  globalThis.fetch = recordingFetch(calls, ["awaiting:TEAM-4156", clock]);
+
+  try {
+    // The level-triggered pickup re-reports a DERIVED (spawn-time) stamp long
+    // after the agent's own tool report — the every-sweep case. Pre-4185 this
+    // POSTed a duplicate marker comment, bumping the issue's `updated` and so
+    // resetting parkedLongEnough: the parked ticket could never be recovered.
+    const r = await annotate({
+      ticket_id: "TEAM-4126", awaitingIds: ["TEAM-4156"],
+      reportedAt: "2026-09-06T09:10:00.000Z", source: "derived",
+    });
+
+    assert.equal(calls.filter((c) => c.method !== "GET").length, 0, "no write of any kind");
+    assert.ok(!calls.some((c) => c.method === "POST"), "no marker comment");
+    assert.ok(!calls.some((c) => c.method === "PUT"), "no label PUT");
+    // The contract still holds on the no-op path, carrying the preserved clock.
+    assert.equal(r.ticketId, "TEAM-4126");
+    assert.equal(r.unchanged, true);
+    assert.equal(r.preconditionUnmet.reportedAt, "2026-09-06T07:07:00.000Z");
+    assert.deepEqual(r.preconditionUnmet.awaitingIds, ["TEAM-4156"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("annotate_precondition_unmet (jira): a failed labels read still writes the clock (fails SAFE toward writing)", async () => {
   const originalFetch = globalThis.fetch;
   const calls = [];
   globalThis.fetch = recordingFetch(calls, "throw");
@@ -201,6 +244,23 @@ test("annotate_precondition_unmet (jira): an unparseable reportedAt writes no cl
       !JSON.stringify(put.body).includes("precondition-at:"),
       "must never write precondition-at:NaN"
     );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("annotate_precondition_unmet (jira): nothing to add AND no writable clock → no write (TEAM-4185 F3)", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = recordingFetch(calls, []);
+
+  try {
+    // No awaited ids and an unparseable stamp: there is literally nothing to
+    // record, so the tool must not leave a comment behind either.
+    const r = await annotate({ ticket_id: "TEAM-4126", awaitingIds: [], reportedAt: "not-a-date" });
+    assert.equal(calls.filter((c) => c.method !== "GET").length, 0);
+    assert.equal(r.unchanged, true);
+    assert.equal(r.ticketId, "TEAM-4126");
   } finally {
     globalThis.fetch = originalFetch;
   }

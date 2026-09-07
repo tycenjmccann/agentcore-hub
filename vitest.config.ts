@@ -309,6 +309,13 @@ export default defineConfig({
       // preconditionUnmet stamp, the once-only await-timeout CAS, and the EMF
       // record — all asserted under a jira == dynamodb provider parity loop.
       "lambda/orchestrator/awaited-ids.test.mjs",
+      // addBlockers `detailed` tokens (TEAM-4185 F5) — the other side of that seam,
+      // pinned in index.mjs itself because the two provider branches are separate
+      // code. The default added-id return must stay byte-identical (live-reverify /
+      // sync-main / dead-session-escalation read the ids back), while `detailed`
+      // distinguishes an idempotent "present" from a "failed" write — the
+      // distinction the F3(b) annotate gate is built on.
+      "lambda/orchestrator/add-blockers-detailed.test.mjs",
       // report_precondition_unmet channel (TEAM-4166 §1.2) — the non-terminal
       // twin of report_completion. workflow-output/precondition-unmet: the REAL
       // handler's ONLY side effects are the annotate invoke + the journey event
@@ -392,6 +399,15 @@ export default defineConfig({
       // the ship review's change set enumerates its own PR's files only — so an
       // advisory branch's files cannot enter the reviewed diff.
       "lambda/orchestrator/advisory-routing.test.mjs",
+      // TEAM-4185 F4 — the create-time DERIVED awaited-edge hook, index.mjs REAL
+      // with only the AWS/store seams + the awaited-ids factory mocked. The hook
+      // used to sit behind trackTicketCreation's two write-once early returns
+      // (already tracked / lost trackTicket CAS), so a Streams REDELIVERY — or the
+      // Jira todo twin arriving after the DDB INSERT — derived no edge at all and
+      // left the origin unre-wakeable. Pins the edge on all three delivery paths
+      // across both creation twins, that ticket.created stays behind the CAS, and
+      // that AWAITED_IDS_MODE=off never even constructs the awaited-ids surface.
+      "lambda/orchestrator/awaited-derived-hook.test.mjs",
       // TEAM-4188 (TEAM-4169 D1 FR-1.6) — SYNC_MAIN_BEFORE_CI's EFFECTIVE value, the
       // assertion FR-1.6 asked for and nothing made. All four surfaces used to resolve
       // to off (template Default, deploy.sh's forward-only-when-exported, a commented

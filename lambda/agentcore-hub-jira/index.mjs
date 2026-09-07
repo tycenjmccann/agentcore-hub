@@ -26,7 +26,6 @@ import {
   escapeJql,
   PRECONDITION_AT_PREFIX,
   preconditionAtLabel,
-  preconditionAtMsFromLabels,
   reportedAtFromLabels,
 } from "./fix-contract.mjs";
 
@@ -873,6 +872,32 @@ async function addComment(params) {
   return { ticketId: ticket_id, message: "Comment added" };
 }
 
+const AWAITING_PREFIX = "awaiting:";
+
+/**
+ * The OLDEST precondition-at instant on a label list, as epoch ms (null when there
+ * is none). Same parsing rules as fix-contract.mjs's preconditionAtMsFromLabels,
+ * MIN instead of MAX.
+ *
+ * TEAM-4185 F3 — a deliberate, LOCAL deviation. fix-contract.mjs is byte-identical
+ * across three Lambdas (scripts/check-fix-kinds-parity.sh compares them), so a
+ * writer-only need cannot be expressed there. Readers stay max-wins and that
+ * remains correct BECAUSE this writer prunes to the single oldest clock label on
+ * every real write: with one label left, max and min are the same instant.
+ */
+function oldestPreconditionAtMs(labels) {
+  let min = null;
+  for (const label of Array.isArray(labels) ? labels : []) {
+    if (typeof label !== "string" || !label.startsWith(PRECONDITION_AT_PREFIX)) continue;
+    const raw = label.slice(PRECONDITION_AT_PREFIX.length);
+    if (!/^\d+$/.test(raw)) continue;
+    const ms = Number(raw);
+    if (!Number.isSafeInteger(ms) || ms <= 0) continue;
+    if (min === null || ms < min) min = ms;
+  }
+  return min;
+}
+
 /**
  * TEAM-4166 §1.2 — stamp the non-terminal "precondition unmet" record in Jira.
  * Jira has no structured record, so the LABELS are the index: one `awaiting:<id>`
@@ -883,6 +908,9 @@ async function addComment(params) {
  * annotation, not a status change; the awaited-edge write is the orchestrator's.
  * `update.labels[{add}]` (not a whole-list `fields` replace) is additive and
  * idempotent server-side, so a re-report unions rather than duplicating.
+ *
+ * TEAM-4185 F3 — and a re-report that would say nothing NEW performs no write at
+ * all (returns `unchanged: true`), so it cannot bump the issue's `updated`.
  */
 async function annotatePreconditionUnmet(params) {
   const ticketId = params.ticket_id || params.issue_key;
@@ -899,15 +927,84 @@ async function annotatePreconditionUnmet(params) {
     if (s && !awaitingIds.includes(s)) awaitingIds.push(s);
   }
 
-  const reportedAt = params.reportedAt || new Date().toISOString();
+  // TEAM-4185 F3 — the labels read is HOISTED above every write, because both
+  // decisions below depend on it: the first-writer-wins clock, and whether this
+  // re-report needs to write at all. Pre-4185 the marker comment was POSTed
+  // unconditionally, so every sweep re-report bumped the issue's `updated` field —
+  // and `updated` is exactly what the orchestrator's parkedLongEnough reads, so a
+  // ticket re-reported once a minute could never look parked long enough to be
+  // recovered, and its await_timeout never fired. Fails SAFE on a read error:
+  // treat it as "nothing on the issue", which writes (a duplicate marker comment
+  // is noise; a missing clock label is a correctness bug — see residual 2).
+  let existingLabels = [];
+  try {
+    const current = await jiraFetch(`/rest/api/3/issue/${ticketId}?fields=labels`);
+    existingLabels = current?.fields?.labels || [];
+  } catch (err) {
+    console.warn(`[jira-tools] precondition label read failed for ${ticketId}, writing without pruning: ${err?.message || err}`);
+  }
+
+  // Which awaited ids are genuinely NEW to this issue. Server-side label adds are
+  // idempotent, so re-adding is harmless — but it is a WRITE, and the point here
+  // is to not write.
+  const existingAwaiting = new Set(
+    existingLabels
+      .filter((l) => typeof l === "string" && l.startsWith(AWAITING_PREFIX))
+      .map((l) => l.slice(AWAITING_PREFIX.length))
+  );
+  const newIds = awaitingIds.filter((id) => !existingAwaiting.has(id));
+
+  // TEAM-4184 — the reportedAt CLOCK rides a `precondition-at:<epochMs>` label,
+  // because the marker comment below does not reach the reader that needs it (see
+  // PRECONDITION_AT_PREFIX).
+  //
+  // TEAM-4185 F3 tightens TEAM-4184's newest-wins to FIRST-writer-wins: the stamp
+  // records when the WAIT BEGAN, and a re-report that moved it forward restarted
+  // the FR-1.4 wait SLA (the DDB twin's reportedAt merge changes for the same
+  // reason). So an existing clock is never replaced — it is PRESERVED and reported
+  // back — and a real write prunes every newer sibling label so the max-wins
+  // readers converge on that first instant.
+  const existingMs = oldestPreconditionAtMs(existingLabels);
+  const reportedAt = existingMs !== null
+    ? new Date(existingMs).toISOString()
+    : (params.reportedAt || new Date().toISOString());
   const agentId = params.agentId || null;
   const source = params.source || "tool";
   const note = typeof params.note === "string" ? params.note : "";
   const preconditionUnmet = { awaitingIds, note, reportedAt, agentId, source };
 
+  const atLabel = preconditionAtLabel(reportedAt);
+  // Nothing new to record and the clock is already on the issue → write NOTHING.
+  // Not a comment, not a label PUT: the whole point is to leave `updated` alone.
+  if (newIds.length === 0 && existingMs !== null) {
+    return { ticketId, preconditionUnmet, unchanged: true };
+  }
+
+  // NOT lowercased — the id must survive as a real ticket key so mapIssue reads
+  // it back as TEAM-1234, not team-1234.
+  const labelOps = newIds.map((id) => ({ add: `${AWAITING_PREFIX}${id}` }));
+  if (atLabel && existingMs === null) labelOps.push({ add: atLabel });
+  if (atLabel && existingMs !== null) {
+    // A real write is happening anyway — take the chance to prune back to the one
+    // surviving (oldest) clock. Hygiene only: readers already take the max, and
+    // after this there is only one label for max to pick.
+    for (const label of existingLabels) {
+      if (typeof label === "string" && label.startsWith(PRECONDITION_AT_PREFIX) && label !== atLabel) {
+        labelOps.push({ remove: label });
+      }
+    }
+  }
+
+  if (labelOps.length === 0) {
+    // No new ids AND no writable clock (an unparseable reportedAt on a virgin
+    // issue) — there is nothing to say. Still no comment: same `updated` argument.
+    return { ticketId, preconditionUnmet, unchanged: true };
+  }
+
   // Machine-readable marker (parsed back by parsePreconditionMarker) + a human
   // line. The marker JSON omits `note` — the human line already carries it, and
-  // labels are the field the orchestrator actually reads.
+  // labels are the field the orchestrator actually reads. It carries the PRESERVED
+  // reportedAt, so the comment trail and the label clock never disagree.
   const marker = `<!-- precondition-unmet ${JSON.stringify({ awaitingIds, reportedAt, agentId, source })} -->`;
   const humanLine = `Precondition unmet — awaiting ${awaitingIds.join(", ")}${note ? `: ${note}` : ""}`;
   await jiraFetch(`/rest/api/3/issue/${ticketId}/comment`, {
@@ -924,47 +1021,26 @@ async function annotatePreconditionUnmet(params) {
     }),
   });
 
-  // NOT lowercased — the id must survive as a real ticket key so mapIssue reads
-  // it back as TEAM-1234, not team-1234.
-  const labelOps = awaitingIds.map((id) => ({ add: `awaiting:${id}` }));
+  await jiraFetch(`/rest/api/3/issue/${ticketId}`, {
+    method: "PUT",
+    body: JSON.stringify({ update: { labels: labelOps } }),
+  });
 
-  // TEAM-4184 — the reportedAt CLOCK rides a `precondition-at:<epochMs>` label
-  // too, because the marker comment above does not reach the reader that needs
-  // it (see PRECONDITION_AT_PREFIX). MONOTONIC: an older re-report never moves
-  // the clock backwards, and the superseded labels are removed in this same PUT
-  // so only the max survives. Readers take the max regardless, so a removal that
-  // fails is a hygiene miss, not a correctness one.
-  const atLabel = preconditionAtLabel(reportedAt);
-  if (atLabel) {
-    let existingLabels = [];
-    try {
-      const current = await jiraFetch(`/rest/api/3/issue/${ticketId}?fields=labels`);
-      existingLabels = current?.fields?.labels || [];
-    } catch (err) {
-      // Fail SAFE toward writing the clock: add without pruning. An un-pruned
-      // older sibling label is harmless (max-wins), a missing clock is not.
-      console.warn(`[jira-tools] precondition-at label read failed for ${ticketId}, adding without pruning: ${err?.message || err}`);
-    }
-    const existingMs = preconditionAtMsFromLabels(existingLabels);
-    const incomingMs = preconditionAtMsFromLabels([atLabel]);
-    if (existingMs === null || incomingMs > existingMs) {
-      labelOps.push({ add: atLabel });
-      for (const label of existingLabels) {
-        if (typeof label === "string" && label.startsWith(PRECONDITION_AT_PREFIX) && label !== atLabel) {
-          labelOps.push({ remove: label });
-        }
-      }
-    }
-    // else: a NEWER clock is already on the issue — leave it, prune nothing.
-  }
-
-  if (labelOps.length > 0) {
-    await jiraFetch(`/rest/api/3/issue/${ticketId}`, {
-      method: "PUT",
-      body: JSON.stringify({ update: { labels: labelOps } }),
-    });
-  }
-
+  // TEAM-4185 F3 — two accepted residuals of the above:
+  //
+  // 1. The returned `preconditionUnmet.awaitingIds` is the INCOMING set, not the
+  //    union of it with the `awaiting:` labels already on the issue (the DynamoDB
+  //    twin returns the union, because there the column IS the record). Accepted:
+  //    every consumer that needs the union re-reads it off the labels via
+  //    mapIssue/mapJiraIssueToTicket, and the union is what the labels hold either
+  //    way. The parity contract is the KEY (`preconditionUnmet`) and the field
+  //    names, not the completeness of this one echo.
+  //
+  // 2. A failed labels GET fails safe toward writing, so on a Jira read error a
+  //    duplicate marker comment (and therefore an `updated` bump) is still
+  //    possible. Accepted: the alternative — skipping the write — can lose the
+  //    clock entirely, which un-parks nothing and makes the D2 evidence guard read
+  //    a legitimately parked agent as unproven.
   return { ticketId, preconditionUnmet };
 }
 
