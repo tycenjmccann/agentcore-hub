@@ -122,6 +122,7 @@ jobs:
           deploy/runtime-agent/tests
           deploy/runtime-agent/test_telemetry_init.py
           deploy/runtime-agent/test_build_env_vars.py
+          deploy/coding-agent-runtime/test_plan_mode_args.py
           deploy/workflow-manager/toolkit
           deploy/pipeline/test_ecs_primary_container.py
           deploy/pipeline/test_plan_surfaces.py

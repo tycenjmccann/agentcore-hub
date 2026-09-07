@@ -1938,7 +1938,8 @@ def _otel_turn_env(session_id: str | None) -> dict:
 
 def _run_claude(prompt: str, workdir: str, claude_session_id: str | None,
                 session_id: str | None = None, model: str | None = None,
-                turn_timeout_s: int = TURN_TIMEOUT_S) -> dict:
+                turn_timeout_s: int = TURN_TIMEOUT_S,
+                permission_mode: str | None = None) -> dict:
     """Run one Claude Code turn. Resume the conversation when a prior
     claude_session_id is supplied (same microVM keeps its ~/.claude state)."""
     config_dir = os.environ.get("CLAUDE_CONFIG_DIR", os.path.join(WORKSPACE_ROOT, ".claude-data"))
@@ -1947,7 +1948,8 @@ def _run_claude(prompt: str, workdir: str, claude_session_id: str | None,
     # `claude --print` does NOT auto-load a project .mcp.json (needs interactive
     # approval). _build_claude_args passes --mcp-config explicitly; it's variadic,
     # so the positional prompt must come last (appended here).
-    args = _build_claude_args(config_dir, claude_session_id, stream=False, model=model) + [prompt]
+    args = _build_claude_args(config_dir, claude_session_id, stream=False, model=model,
+                              permission_mode=permission_mode) + [prompt]
     env = {**os.environ, "CLAUDE_CODE_USE_BEDROCK": "1", "CLAUDE_CONFIG_DIR": config_dir,
            **_otel_turn_env(session_id)}
 
@@ -1963,17 +1965,31 @@ def _run_claude(prompt: str, workdir: str, claude_session_id: str | None,
         return {"response": proc.stdout.strip(), "claude_session_id": None}
 
 
+# Permission modes a caller may request for ONE turn. Only "plan" is honored:
+# Claude Code's plan mode reads the repo and returns an implementation plan but
+# is blocked from editing files or running mutating commands — the persona
+# reviews/approves that plan, then the next turn (same conversation, no mode)
+# executes it with full autonomy. Anything else (unknown/typo/absent) falls
+# back to today's --dangerously-skip-permissions, so a malformed field can
+# never silently change how a turn runs.
+CLAUDE_PERMISSION_MODES = frozenset({"plan"})
+
+
 def _build_claude_args(config_dir: str, claude_session_id: str | None, stream: bool,
-                       model: str | None = None) -> list:
+                       model: str | None = None, permission_mode: str | None = None) -> list:
     """Shared argv for a Claude turn. stream=True emits realtime stream-json.
     model overrides CLAUDE_MODEL for this turn (pipeline personas carry their
-    own per-persona model)."""
+    own per-persona model). permission_mode="plan" swaps the full-autonomy
+    flag for `--permission-mode plan` (plan-only turn, no edits)."""
     args = ["claude", "--print"]
     mcp_config = os.path.join(config_dir, ".mcp.json")
     if os.path.isfile(mcp_config):
         args += ["--mcp-config", mcp_config]
-    args += ["--dangerously-skip-permissions",
-             "--model", model or CLAUDE_MODEL, "--max-turns", os.environ.get("MAX_TURNS", "100")]
+    if permission_mode in CLAUDE_PERMISSION_MODES:
+        args += ["--permission-mode", permission_mode]
+    else:
+        args += ["--dangerously-skip-permissions"]
+    args += ["--model", model or CLAUDE_MODEL, "--max-turns", os.environ.get("MAX_TURNS", "100")]
     if stream:
         # --include-partial-messages emits token-level content_block_delta frames
         # (without it, claude sends whole message blocks → one chunk at the end).
@@ -1987,7 +2003,8 @@ def _build_claude_args(config_dir: str, claude_session_id: str | None, stream: b
 
 def _stream_claude(prompt: str, workdir: str, claude_session_id: str | None, repo: str | None = None,
                    session_id: str | None = None, tenant_id: str | None = None,
-                   model: str | None = None, turn_timeout_s: int = TURN_TIMEOUT_S):
+                   model: str | None = None, turn_timeout_s: int = TURN_TIMEOUT_S,
+                   permission_mode: str | None = None):
     """Generator yielding SSE lines for a Claude turn as it runs.
 
     Parses claude stream-json line-by-line: assistant text deltas → 'text'
@@ -1996,7 +2013,8 @@ def _stream_claude(prompt: str, workdir: str, claude_session_id: str | None, rep
     """
     config_dir = os.environ.get("CLAUDE_CONFIG_DIR", os.path.join(WORKSPACE_ROOT, ".claude-data"))
     os.makedirs(config_dir, exist_ok=True)
-    args = _build_claude_args(config_dir, claude_session_id, stream=True, model=model) + [prompt]
+    args = _build_claude_args(config_dir, claude_session_id, stream=True, model=model,
+                              permission_mode=permission_mode) + [prompt]
     env = {**os.environ, "CLAUDE_CODE_USE_BEDROCK": "1", "CLAUDE_CONFIG_DIR": config_dir,
            **_otel_turn_env(session_id)}
 
@@ -2475,7 +2493,8 @@ def _journal_write(path: str, record: dict) -> bool:
 def _run_turn_async(turn_id: str, journal: str, cli: str, prompt: str, workdir: str,
                     claude_session_id: str | None, repo: str | None,
                     session_id: str | None, tenant_id: str | None,
-                    model: str | None, turn_timeout_s: int = TURN_TIMEOUT_S) -> None:
+                    model: str | None, turn_timeout_s: int = TURN_TIMEOUT_S,
+                    permission_mode: str | None = None) -> None:
     """Runner thread body: drive one CLI turn via the existing streaming
     generators (they carry the watchdog, artifact harvest, and session-id
     bookkeeping), heartbeat the journal while it runs, then journal the terminal
@@ -2522,7 +2541,8 @@ def _run_turn_async(turn_id: str, journal: str, cli: str, prompt: str, workdir: 
                                turn_timeout_s)
         else:
             gen = _stream_claude(prompt, workdir, claude_session_id, repo,
-                                 session_id, tenant_id, model, turn_timeout_s)
+                                 session_id, tenant_id, model, turn_timeout_s,
+                                 permission_mode=permission_mode)
         for line in gen:
             if not line.startswith("data:"):
                 continue
@@ -2749,6 +2769,13 @@ async def invocations(request: Request):
     claude_session_id = payload.get("claude_session_id")
     # Per-turn model override (pipeline personas run on their own model).
     model = (payload.get("model") or "").strip() or None
+    # Per-turn permission mode (claude only). "plan" = plan-only turn: the CLI
+    # reads the repo and returns a plan without editing anything; the persona
+    # approves it and the NEXT turn (same conversation) executes. Strict
+    # allow-list — anything else runs as a normal full-autonomy turn.
+    permission_mode = (payload.get("permission_mode") or "").strip().lower() or None
+    if permission_mode not in CLAUDE_PERMISSION_MODES:
+        permission_mode = None
     # Per-turn watchdog wall-clock: the orchestrator resolves turnTimeoutSecs per
     # agent (agents.json watchdog) and forwards it here (TEAM-3687). Falls back to
     # the fleet default TURN_TIMEOUT_S (env → legacy 1500) when absent/invalid.
@@ -2793,7 +2820,7 @@ async def invocations(request: Request):
 
     logger.info("turn_start", extra=redact(
         {"cli": cli, "repo": _scrub_git_url(repo) if repo else repo, "resume": bool(claude_session_id),
-         "stream": stream, "prompt_head": prompt[:120]}))
+         "stream": stream, "permission_mode": permission_mode, "prompt_head": prompt[:120]}))
 
     # Workflow turns stamp their session dir (origin marker + activity mtime) so
     # the GC below can distinguish them from human sessions, which it never touches.
@@ -3021,7 +3048,7 @@ async def invocations(request: Request):
         threading.Thread(
             target=_run_turn_async,
             args=(turn_id, journal, cli, prompt, workdir, claude_session_id,
-                  repo, session_id, tenant_id, model, turn_timeout_s),
+                  repo, session_id, tenant_id, model, turn_timeout_s, permission_mode),
             daemon=True,
         ).start()
         logger.info("turn_submitted", extra={"cli": cli, "turn_id": turn_id})
@@ -3039,7 +3066,7 @@ async def invocations(request: Request):
                                turn_timeout_s)
         else:
             gen = _stream_claude(prompt, workdir, claude_session_id, repo, session_id, tenant_id,
-                                 model, turn_timeout_s)
+                                 model, turn_timeout_s, permission_mode=permission_mode)
         return StreamingResponse(gen, media_type="text/event-stream")
 
     try:
@@ -3048,7 +3075,8 @@ async def invocations(request: Request):
         elif cli == "kiro":
             result = _run_kiro(prompt, workdir, claude_session_id, session_id, model, turn_timeout_s)
         elif cli == "claude":
-            result = _run_claude(prompt, workdir, claude_session_id, session_id, model, turn_timeout_s)
+            result = _run_claude(prompt, workdir, claude_session_id, session_id, model, turn_timeout_s,
+                                 permission_mode=permission_mode)
         else:
             return JSONResponse({"error": f"unknown cli '{cli}'"}, status_code=400)
     except subprocess.TimeoutExpired:

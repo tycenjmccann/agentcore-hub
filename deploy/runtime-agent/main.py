@@ -515,6 +515,62 @@ CODING_MODEL_TIERS = {
     "haiku": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
 }
 
+# ─── Plan-first coding delegation ────────────────────────────────────────────
+# When ON, coding personas are instructed (via a fragment appended to their
+# blueprint in load_blueprint) to run claude_code in two turns: a PLAN turn
+# (`plan_only=True` → `claude --permission-mode plan`: reads the repo, returns a
+# plan, cannot edit) that the persona reviews and may send back for revision,
+# then an EXECUTE turn in the same conversation with full autonomy. Validated
+# 20/20 locally (plan held, same-session resume, tests green, 2 revise rounds
+# exercised) before shipping — see docs/plan-first-coding.md. OFF = the
+# blueprint text and the claude_code argv are byte-identical to before; the
+# `plan_only` tool arg itself is always honored if a persona passes it.
+PLAN_FIRST_CODING = os.getenv("PLAN_FIRST_CODING", "").strip().lower() in ("1", "true", "on", "enforce")
+# Blueprints that receive the fragment (the personas that implement code).
+PLAN_FIRST_BLUEPRINTS = {
+    b.strip() for b in os.getenv(
+        "PLAN_FIRST_BLUEPRINTS", "backend-dev,frontend-dev,bug-fixer"
+    ).split(",") if b.strip()
+}
+# Source of truth for the fragment — hot-editable, synced by the deploy stage
+# with the rest of blueprints/. The embedded copy below is only the fallback
+# when that S3 read fails, so the gate cannot silently vanish.
+PLAN_FIRST_FRAGMENT_KEY = "blueprints/_plan-first-coding.md"
+_PLAN_FIRST_FALLBACK = """## Plan-First Delegation (MANDATORY)
+
+Your coding agent must NOT write code until you have approved its plan. Every
+implementation on this ticket follows this loop:
+
+1. **PLAN** — `claude_code(task=<full brief: design, files, acceptance criteria,
+   constraints>, repo=<repo>, plan_only=True, model="opus")`. Plan mode reads the
+   repo and returns an implementation plan; it cannot edit files or run mutating
+   commands. Nothing is written yet.
+2. **REVIEW** the plan against the design and acceptance criteria: every
+   requirement covered, no scope creep, tests planned, no unsafe or destructive
+   steps, branch model respected. If deficient:
+   `claude_code(task="Revise the plan: <specific gaps>", plan_only=True, model="opus")`
+   — same conversation, so it revises rather than restarts. Never approve a plan
+   you did not read. Cap at 2 revision rounds; then proceed with the best plan
+   and record the residual gap in your completion report.
+3. **APPROVE + EXECUTE** — `claude_code(task="Plan approved. Implement it exactly
+   as planned, write the tests, run them, and commit.", model="sonnet")`. Same
+   conversation — all your claude_code calls in this task share one workspace
+   and one conversation, so do NOT pass resume_session here. Use model="opus"
+   instead when the plan itself flags high complexity or touches many subsystems.
+4. **INSPECT** — verify the result as your blueprint's review step requires
+   (files exist, tests actually ran and passed, diff matches the plan), then
+   deliver.
+
+Model split: plan on "opus" (or "fable" for ambiguous / architecture-heavy
+work); execute on "sonnet" for well-specified plans, "opus" for complex ones.
+Never plan on "haiku".
+
+Fix tickets and rework still plan first — the resumed session already holds
+the context, so the plan turn is short. Splitting work across several
+claude_code calls is fine; each new category of work gets its own
+plan → approve → execute.
+"""
+
 # One coding session per agent-task: every claude_code/codex call in this
 # invocation lands on the same warm EFS workspace and resumes the same CLI
 # conversation. Conversation ids are per-CLI — claude and codex resume handles
@@ -973,13 +1029,17 @@ def _submit_and_poll(client, payload: dict, outer_deadline: float | None = None,
     return _poll_coding_turn(client, submitted["turn_id"], outer_deadline, budget_s)
 
 
-def _remote_coding_turn(task: str, cli: str, repo: str = "", model: str = "") -> str:
+def _remote_coding_turn(task: str, cli: str, repo: str = "", model: str = "",
+                        plan_only: bool = False) -> str:
     """Run one coding turn on the Cloud Code runtime. Returns the CLI's text
     response with a session footer, or an ERROR string (never raises).
 
     model: intelligence tier the persona chose ("fable"/"opus"/"sonnet"/"haiku"
     or a full Bedrock inference-profile id). Claude only — codex is pinned by
-    the coding runtime. Empty = the runtime's default (Fable 5)."""
+    the coding runtime. Empty = the runtime's default (Fable 5).
+    plan_only: claude only — run the turn in Claude Code plan mode (reads the
+    repo, returns a plan, cannot edit). Same conversation as the execute turn
+    that follows, so the runtime's --resume carries the approved plan over."""
     if not _CODING_SESSION["session_id"]:
         _CODING_SESSION["session_id"] = f"cc-{uuid.uuid4().hex}"  # >=33 chars for AgentCore
     if repo and not _CODING_SESSION.get("repo"):
@@ -1007,6 +1067,11 @@ def _remote_coding_turn(task: str, cli: str, repo: str = "", model: str = "") ->
         payload["repo"] = _CODING_SESSION["repo"]
     if conversation_id:
         payload["claude_session_id"] = conversation_id
+    # Plan-first: ask the coding runtime for a plan-mode turn (no edits). Legacy
+    # far sides ignore the unknown field and run a normal turn — the persona's
+    # review step still sees whatever came back, so this degrades to today.
+    if plan_only and cli == "claude":
+        payload["permission_mode"] = "plan"
     # Ported laptop session: tell the coding runtime to install the S3
     # transcript + check out the ported branch. Idempotent runtime-side
     # (.resume-installed marker), so forwarding on every turn is safe.
@@ -1032,7 +1097,8 @@ def _remote_coding_turn(task: str, cli: str, repo: str = "", model: str = "") ->
 
     logger.info(
         f"[remote-coding] {cli} turn on {_CODING_SESSION['session_id']} "
-        f"(resume={bool(conversation_id)}, repo={_CODING_SESSION.get('repo')}, mode=async)"
+        f"(resume={bool(conversation_id)}, repo={_CODING_SESSION.get('repo')}, mode=async"
+        f"{', plan_only' if payload.get('permission_mode') == 'plan' else ''})"
     )
     # Scale the poll budget + outer deadline when the forwarded per-agent turn
     # cap exceeds the 1500s the fleet defaults already assume (TEAM-3687). The
@@ -1908,17 +1974,37 @@ def load_blueprint(blueprint_name: str) -> str:
     try:
         s3 = boto3.client("s3", region_name=REGION)
         resp = s3.get_object(Bucket=ARTIFACT_BUCKET, Key=s3_key)
-        return resp["Body"].read().decode("utf-8")
+        return resp["Body"].read().decode("utf-8") + _plan_first_addendum(blueprint_name, s3)
     except s3.exceptions.NoSuchKey:
         # List available blueprints so the agent knows what's there
         try:
             objs = s3.list_objects_v2(Bucket=ARTIFACT_BUCKET, Prefix="blueprints/", Delimiter="/")
             available = [o["Key"].replace("blueprints/", "").replace(".md", "") for o in objs.get("Contents", [])]
+            # "_"-prefixed keys are shared fragments (e.g. _plan-first-coding), not personas.
+            available = [a for a in available if a and not a.startswith("_")]
             return f"Blueprint '{blueprint_name}' not found. Available: {', '.join(available)}"
         except Exception:
             return f"Blueprint '{blueprint_name}' not found at s3://{ARTIFACT_BUCKET}/{s3_key}"
     except Exception as e:
         return f"ERROR loading blueprint: {e}"
+
+
+def _plan_first_addendum(blueprint_name: str, s3=None) -> str:
+    """The plan-first protocol appended to a coding persona's blueprint when
+    PLAN_FIRST_CODING is on. Source of truth = PLAN_FIRST_FRAGMENT_KEY in S3
+    (hot-editable, synced with the other blueprints); the embedded copy is the
+    fallback so an S3 read failure can't silently drop the gate. Empty string
+    when the flag is off or the blueprint isn't a coding persona — i.e. the
+    blueprint text is byte-identical to before."""
+    if not PLAN_FIRST_CODING or blueprint_name not in PLAN_FIRST_BLUEPRINTS:
+        return ""
+    text = ""
+    try:
+        s3 = s3 or boto3.client("s3", region_name=REGION)
+        text = s3.get_object(Bucket=ARTIFACT_BUCKET, Key=PLAN_FIRST_FRAGMENT_KEY)["Body"].read().decode("utf-8")
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"[plan-first] {PLAN_FIRST_FRAGMENT_KEY} unavailable ({str(e)[:120]}) — using embedded copy")
+    return "\n\n" + (text.strip() or _PLAN_FIRST_FALLBACK.strip()) + "\n"
 
 
 # ─── External Tool Integration (via MCP — GitHub, GitLab, Jira, etc.) ────────
@@ -2176,7 +2262,8 @@ def _create_mcp_clients(extra_servers=None, extra_gateways=None):
 # reading repos, analyzing code structure, generating docs from source, etc.
 
 @tool
-def claude_code(task: str, working_directory: str = "/tmp", repo: str = "", model: str = "", resume_session: str = "") -> str:
+def claude_code(task: str, working_directory: str = "/tmp", repo: str = "", model: str = "",
+                resume_session: str = "", plan_only: bool = False) -> str:
     """Delegate a coding task to Claude Code — a specialized AI coding agent.
 
     Claude Code excels at:
@@ -2229,13 +2316,22 @@ def claude_code(task: str, working_directory: str = "/tmp", repo: str = "", mode
               one, the feedback says start over, or a resumed session errors —
               resume is best-effort and falls back to a fresh workspace.
               Only honored on your FIRST coding call of this task.
+        plan_only: True = PLAN-ONLY turn. Claude Code reads the repo and returns
+              an implementation plan but is blocked from editing files or
+              running mutating commands — nothing is written. Review the plan
+              against the design; if it is deficient call again with
+              plan_only=True and specific feedback (same conversation, it
+              revises). When it is sound, call claude_code again WITHOUT
+              plan_only to execute it — same conversation, no resume_session
+              needed. Plan on a strong tier (model="opus"), execute on a
+              cheaper one (model="sonnet").
     """
     import subprocess
     import shutil
 
     if _remote_coding_enabled():
         _maybe_resume_session(resume_session)
-        return _remote_coding_turn(task, "claude", repo, model)
+        return _remote_coding_turn(task, "claude", repo, model, plan_only=plan_only)
 
     task = _localize_repo_task(task, repo, working_directory)
     logger.info(f"[claude_code] Delegating task: {task[:150]}...")
@@ -2262,21 +2358,29 @@ def claude_code(task: str, working_directory: str = "/tmp", repo: str = "", mode
         or "us.anthropic.claude-fable-5-1"
     )
 
+    # Plan-first on the LOCAL fallback path: the execute turn must land in the
+    # plan turn's conversation, so once plan_only is used in this task every
+    # local call switches to JSON output (to learn the conversation id) and
+    # --resume's it. A task that never passes plan_only keeps today's argv
+    # exactly (text output, fresh conversation per call).
+    local_conv = _CODING_SESSION["conversation_ids"].get("claude")
+    chain = bool(plan_only or local_conv)
+    argv = [claude_bin, "--print"]
+    argv += ["--permission-mode", "plan"] if plan_only else ["--dangerously-skip-permissions"]
+    argv += ["--output-format", "json" if chain else "text",
+             "--model", cc_model,
+             "--max-turns", "100"]
+    if chain and local_conv:
+        argv += ["--resume", local_conv]
+    argv.append(task)
+
     try:
         # Use Popen + start_new_session to create a new process group.
         # This ensures we can kill claude AND all its grandchildren (Node, git, LSP)
         # on timeout. Without this, grandchildren inherit pipe FDs and keep them open,
         # causing communicate() to block forever even after timeout fires.
         proc = subprocess.Popen(
-            [
-                claude_bin,
-                "--print",
-                "--dangerously-skip-permissions",
-                "--output-format", "text",
-                "--model", cc_model,
-                "--max-turns", "100",
-                task,
-            ],
+            argv,
             cwd=working_directory,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -2352,10 +2456,23 @@ def claude_code(task: str, working_directory: str = "/tmp", repo: str = "", mode
             )
 
         output = stdout.strip()
+        if chain:
+            # JSON envelope: unwrap the text and stash the conversation id so the
+            # next local call (the execute turn) resumes this plan's conversation.
+            try:
+                envelope = json.loads(output)
+                output = (envelope.get("result") or "").strip()
+                if envelope.get("session_id"):
+                    _CODING_SESSION["conversation_ids"]["claude"] = envelope["session_id"]
+            except (json.JSONDecodeError, ValueError, AttributeError):
+                pass  # non-JSON (crash/usage error) — surface stdout as-is below
+            conv = _CODING_SESSION["conversation_ids"].get("claude") or "n/a"
+            output += f"\n\n[coding-session: local cli=claude conversation={conv}]"
         if proc.returncode != 0 and stderr:
             output += f"\n\nSTDERR: {stderr[-500:]}"
 
-        logger.info(f"[claude_code] Complete. {len(output)} chars, exit code: {proc.returncode}")
+        logger.info(f"[claude_code] Complete. {len(output)} chars, exit code: {proc.returncode}"
+                    f"{' (plan_only)' if plan_only else ''}")
         if proc.returncode != 0:
             logger.warning(f"[claude_code] FAILED — stdout: {stdout[:200]!r}")
             logger.warning(f"[claude_code] FAILED — stderr: {stderr[:200]!r}")
