@@ -405,6 +405,18 @@ export default defineConfig({
       // redelivery (the claimTerminalOutcome CAS), and `verified_removable` compared
       // STRICTLY to 0 so an absent field on a pre-D2 record is not read as a no-op.
       "lambda/orchestrator/sweep-noop-close.test.mjs",
+      // replay-c2uqki-sweep-noop (TEAM-4247 D2 acceptance) — the run D2 exists for:
+      // a sweep of tycenjmccann/ember that verified NOTHING removable, said so in
+      // prose, and then spent four gate personas, two fix tickets and a unified PR
+      // before reporting workflow.complete with a zero-task cost card. Replayed
+      // row-by-row from the vendored dossier through the REAL handler → cascade →
+      // completion → closeWorkflowNothingToRemove, with only the AWS seams mocked.
+      // Its load-bearing case is the flags-off one: the ordered event shape has to
+      // equal the shape the dossier's own events record. It also pins the two claims
+      // only a replay can make — that `enforce` reaches the close with ZERO
+      // reviewer/QA/CI dispatches on the fixture's real board, and that under shadow
+      // the yield note lands in the prompt each persona is actually dispatched with.
+      "lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs",
     ],
     // Keep unit tests away from the Playwright specs under tests/.
     exclude: ["tests/**", "node_modules/**", "demo/**"],
