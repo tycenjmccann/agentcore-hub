@@ -18,6 +18,9 @@
 #     PIPELINE_CI_START_BUILD=1 (off by default, the fallback when the webhook
 #     can't be installed) is a separate flag read by
 #     deploy/setup-pipeline-tools-lambda.mjs, not by this stack.
+#     Runbook for getting either flag certifying PRs in prod:
+#     deploy/pipeline/README.md → "Runbook: CodeBuild-certified CI for PRs
+#     (TEAM-4258)".
 #
 # Usage:
 #   PIPELINE_GITHUB_OWNER=tycenjmccann ./deploy/pipeline/deploy.sh
@@ -44,11 +47,33 @@ if [[ -z "${PIPELINE_GITHUB_OWNER}" ]]; then
   exit 1
 fi
 
+# PR-check webhook state, echoed in the banner: the flag is read fresh on every
+# run and the stack rewrites the project unconditionally, so an unset flag does
+# not "keep" a previously installed webhook — CDK diffs it away.
+CI_WEBHOOK_ON=0
+case "${PIPELINE_CI_WEBHOOK:-}" in
+  1 | true) CI_WEBHOOK_ON=1 ;;
+esac
+
 echo "═══════════════════════════════════════════════════════════════"
 echo "  CI/CD Pipeline module — cdk deploy"
 echo "  Account: $ACCOUNT_ID  Region: $AWS_REGION"
 echo "  Repo:    $PIPELINE_GITHUB_OWNER/$PIPELINE_GITHUB_REPO @ $PIPELINE_BRANCH"
 echo "  Bucket:  $ARTIFACT_BUCKET"
+if [[ "$CI_WEBHOOK_ON" == "1" ]]; then
+  echo "  PR check: webhook ON (PIPELINE_CI_WEBHOOK=$PIPELINE_CI_WEBHOOK)"
+else
+  echo "───────────────────────────────────────────────────────────────"
+  echo "  NOTICE: PIPELINE_CI_WEBHOOK is not set — the CodeBuild PR-check"
+  echo "  webhook will be OFF, and REMOVED if it was previously installed"
+  echo "  (this stack rewrites the CI project; CDK diffs the webhook away)."
+  echo "  Without it, CodeBuild certification depends on"
+  echo "  PIPELINE_CI_START_BUILD=1 on the pipeline-tools Lambda"
+  echo "  (node deploy/setup-pipeline-tools-lambda.mjs). With neither, the CI"
+  echo "  agent can never report ci_status=\"certified\"."
+  echo "  Runbook: deploy/pipeline/README.md → 'Runbook: CodeBuild-certified CI"
+  echo "  for PRs (TEAM-4258)'."
+fi
 echo "═══════════════════════════════════════════════════════════════"
 
 cd "$HERE"

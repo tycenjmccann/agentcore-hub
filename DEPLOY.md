@@ -337,6 +337,13 @@ script):**
 | `lambda/*/deploy.sh`, `deploy/*/deploy.sh`, `deploy/setup-*.{sh,mjs}` | the script itself — these change IAM / env vars / tables, which the pipeline role deliberately cannot |
 | `lambda/cost-report/index.mjs` with a `REPORT_VERSION` bump | code ships via the pipeline, but run `lambda/cost-report/deploy.sh --backfill` afterwards (`--rebuild-index` alone drops every older-version card from the fleet index) |
 
+> **Flags are not sticky.** `deploy/setup-pipeline-tools-lambda.mjs` must be re-run WITH
+> `PIPELINE_CI_START_BUILD=1` and `deploy/pipeline/deploy.sh` WITH `PIPELINE_CI_WEBHOOK=1`
+> (when those are meant to stay on): the first rewrites the role's whole `inline` policy and
+> the second lets CDK diff the webhook away, so an omitted flag silently revokes the
+> `CiStartBuild` grant / removes the PR-check webhook. Runbook:
+> `deploy/pipeline/README.md` → "Runbook: CodeBuild-certified CI for PRs (TEAM-4258)".
+
 Runtime-image CD landed in PR 2 — a baked source change (persona tool code) now
 deploys automatically. Only runtime env / lifecycle / IAM / EFS changes (which
 need `UpdateFunctionConfiguration`-class perms the narrow roles lack) remain a
