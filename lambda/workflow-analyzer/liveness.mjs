@@ -28,6 +28,63 @@ import {
 /** The allow-list. Order is documentation only. */
 export const LIVENESS_MODES = ["off", "shadow", "enforce"];
 
+/**
+ * TEAM-4186 F6 — the LEGACY clock's event window, as a named constant.
+ *
+ * Pre-epic, the analyzer's whole staleness decision was ONE function whose input
+ * was a Query with `Limit: 25`:
+ *
+ *   const page = await ddb.send(new QueryCommand({ …, ScanIndexForward: false, Limit: 25 }));
+ *   const item = (page.Items || []).find((e) => !NON_SIGNIFICANT_EVENT_TYPES.has(e.type)) || (page.Items || [])[0];
+ *
+ * TEAM-4166 D2 raised that Limit to 50 for the liveness clock (which needs more
+ * rows to find each ticket's newest agent.streaming) and reused the SAME find
+ * over all 50 for the legacy decision. That silently changed the legacy verdict,
+ * which is supposed to be byte-identical in `off` and to be the sole driver in
+ * `shadow`: a healthy generating agent emits one agent.streaming row per content
+ * delta (lambda/orchestrator/agent-invoker.mjs contentBlockDelta;
+ * deploy/runtime-agent/main.py), so ≥25 streaming rows being newest is NORMAL.
+ * Pre-epic that window held no significant row at all, so the decision fell back
+ * to items[0] — a streaming row, age ≈ 0, no fire. Over 50 rows the find instead
+ * reaches a significant row at position 26-50 (e.g. an agent.invoked 15 minutes
+ * old), so legacyAge ≥ STALE_MS and the watchdog fires MORE on healthy agents,
+ * on the DEFAULT path.
+ *
+ * The fix is to hand the legacy decision exactly the first 25 rows. That is a
+ * restoration, not an approximation: the Query carries no FilterExpression, so
+ * `Limit: 25` returns PRECISELY the first 25 items of the same
+ * `ScanIndexForward: false` ordering that `Limit: 50` returns —
+ * i.e. Limit-25 ≡ slice(0, 25) of the Limit-50 page, item for item.
+ */
+export const LEGACY_EVENT_WINDOW = 25;
+
+/**
+ * Not agent activity: streaming chunks are too chatty to mean anything alone,
+ * and orchestrator.nudge is a housekeeping event the orchestrator publishes
+ * itself (a live lease it chose not to steal) — counting either keeps a run
+ * looking fresh no matter what the agent is doing (TEAM-3969).
+ *
+ * Lives here (rather than in index.mjs) as of TEAM-4186 so the legacy decision
+ * and its tests share ONE definition with no AWS import in the way.
+ */
+export const NON_SIGNIFICANT_EVENT_TYPES = new Set(["agent.streaming", "orchestrator.nudge"]);
+
+/**
+ * Age in ms of the newest non-streaming event in `items`, or null if none.
+ *
+ * The two lines below are the pre-epic `lastSignificantEventAge` body VERBATIM
+ * (lambda/workflow-analyzer/index.mjs before TEAM-4166), so byte-identity is
+ * inspectable rather than argued. The only change is where the 25 rows come
+ * from: the caller slices them (see LEGACY_EVENT_WINDOW) instead of the Query
+ * limiting them. Callers MUST pass at most LEGACY_EVENT_WINDOW rows — handing it
+ * a deeper window is exactly the F6 regression.
+ */
+export function legacySignificantEventAge(items, nowMs) {
+  const item = (items || []).find((e) => !NON_SIGNIFICANT_EVENT_TYPES.has(e.type)) || (items || [])[0];
+  if (!item?.timestamp) return null;
+  return nowMs - Date.parse(item.timestamp);
+}
+
 /** Agent-task statuses that mean "a session is (or should be) live". */
 const ACTIVE_STATUSES = new Set(["running", "in_progress"]);
 

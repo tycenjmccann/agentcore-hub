@@ -8,6 +8,9 @@ import {
   computeStaleTickets,
   decideWatch,
   buildLivenessTickets,
+  LEGACY_EVENT_WINDOW,
+  NON_SIGNIFICANT_EVENT_TYPES,
+  legacySignificantEventAge,
   phaseForAgent,
   isParkedOnHuman,
   parkedOnHuman,
@@ -123,6 +126,94 @@ describe("thresholdFor — per-phase thresholds at the boundary", () => {
     const underBoundary = { phase: "ship", startedAt: now - 12 * MIN + 1 };
     expect(computeStaleTickets([atBoundary], now, DEFAULT_THRESHOLDS)).toHaveLength(1);
     expect(computeStaleTickets([underBoundary], now, DEFAULT_THRESHOLDS)).toHaveLength(0);
+  });
+});
+
+describe("TEAM-4186 F6 legacySignificantEventAge — the legacy clock sees 25 rows", () => {
+  const now = 10_000 * MIN;
+  const iso = (ms) => new Date(ms).toISOString();
+  const LEGACY_STALE_MS = 10 * MIN; // WM_STALE_MINUTES default, as in index.mjs
+
+  /**
+   * The PRE-EPIC decision, re-implemented here from the analyzer as it stood
+   * before TEAM-4166: a Query with `Limit: 25` (no FilterExpression) followed by
+   * the find. `rows` is the full newest-first table ordering, so `slice(0, 25)`
+   * models exactly what that Query returned. This is the oracle — the fix is
+   * correct iff the shipped function agrees with it on every window.
+   */
+  const preEpicOracle = (rows, nowMs) => {
+    const items = (rows || []).slice(0, 25); // the Query's Limit
+    const item = items.find((e) => !new Set(["agent.streaming", "orchestrator.nudge"]).has(e.type)) || items[0];
+    if (!item?.timestamp) return null;
+    return nowMs - Date.parse(item.timestamp);
+  };
+
+  /** n streaming rows, newest first, one every 2s — a healthy generating agent. */
+  const streamingBurst = (n, fromMs) =>
+    Array.from({ length: n }, (_, i) => ({ type: "agent.streaming", timestamp: iso(fromMs - i * 2_000) }));
+
+  it("LEGACY_EVENT_WINDOW is 25 — the pre-epic Query limit, named", () => {
+    expect(LEGACY_EVENT_WINDOW).toBe(25);
+  });
+
+  it("matches the pre-epic oracle on a 50-row burst whose first 25 are agent.streaming and agent.invoked sits at row 26", () => {
+    const rows = [
+      ...streamingBurst(25, now - 1_000),                        // rows 1-25: healthy chatter
+      { type: "agent.invoked", timestamp: iso(now - 15 * MIN) }, // row 26: the trap
+      ...streamingBurst(24, now - 16 * MIN),
+    ];
+    expect(rows).toHaveLength(50);
+    const got = legacySignificantEventAge(rows.slice(0, LEGACY_EVENT_WINDOW), now);
+    expect(got).toBe(preEpicOracle(rows, now));
+    expect(got).toBe(1_000);                 // fell back to items[0], a streaming row
+    expect(got).toBeLessThan(LEGACY_STALE_MS); // → no fire, as pre-epic
+  });
+
+  it("the slice is load-bearing: the unsliced 50-row answer WOULD fire (>= STALE_MS) where the sliced one does not", () => {
+    const rows = [
+      ...streamingBurst(25, now - 1_000),
+      { type: "agent.invoked", timestamp: iso(now - 15 * MIN) },
+      ...streamingBurst(24, now - 16 * MIN),
+    ];
+    const regressed = legacySignificantEventAge(rows, now);          // the TEAM-4166 behaviour
+    const restored = legacySignificantEventAge(rows.slice(0, LEGACY_EVENT_WINDOW), now);
+    expect(regressed).toBe(15 * MIN);
+    expect(regressed >= LEGACY_STALE_MS).toBe(true);                 // fires on a healthy agent
+    expect(restored >= LEGACY_STALE_MS).toBe(false);                 // F6: does not
+  });
+
+  it("boundary — a significant row at position 25 is seen, at 26 is not", () => {
+    const at = (pos) => {
+      const rows = streamingBurst(50, now - 1_000);
+      rows[pos - 1] = { type: "agent.invoked", timestamp: iso(now - 15 * MIN) };
+      return legacySignificantEventAge(rows.slice(0, LEGACY_EVENT_WINDOW), now);
+    };
+    expect(at(25)).toBe(15 * MIN);  // last row inside the window
+    expect(at(26)).toBe(1_000);     // first row outside → items[0] fallback
+  });
+
+  it("an all-streaming window falls back to items[0] (age ~ 0 — the healthy-agent path)", () => {
+    const rows = streamingBurst(25, now - 500);
+    expect(legacySignificantEventAge(rows, now)).toBe(500);
+    expect(legacySignificantEventAge(rows, now)).toBe(preEpicOracle(rows, now));
+  });
+
+  it("orchestrator.nudge is still non-significant (TEAM-3969)", () => {
+    expect([...NON_SIGNIFICANT_EVENT_TYPES].sort()).toEqual(["agent.streaming", "orchestrator.nudge"]);
+    const rows = [
+      { type: "orchestrator.nudge", timestamp: iso(now - 1_000) },
+      { type: "agent.streaming", timestamp: iso(now - 2_000) },
+      { type: "tool_end", timestamp: iso(now - 30 * MIN) },
+    ];
+    expect(legacySignificantEventAge(rows, now)).toBe(30 * MIN); // skipped both
+  });
+
+  it("null for an empty/absent list or a timestamp-less row", () => {
+    expect(legacySignificantEventAge([], now)).toBeNull();
+    expect(legacySignificantEventAge(undefined, now)).toBeNull();
+    expect(legacySignificantEventAge(null, now)).toBeNull();
+    expect(legacySignificantEventAge([{ type: "tool_end" }], now)).toBeNull();
+    expect(legacySignificantEventAge([{ type: "agent.streaming" }], now)).toBeNull();
   });
 });
 

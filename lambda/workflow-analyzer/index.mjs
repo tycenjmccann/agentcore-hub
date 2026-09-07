@@ -37,6 +37,10 @@ import {
   phaseForAgent,
   emitLivenessMetrics,
   isParkedOnHuman,
+  // TEAM-4186 F6 — the LEGACY clock, kept as the pre-epic function over a 25-row
+  // window so `off` is byte-identical and `shadow` still measures the real thing.
+  LEGACY_EVENT_WINDOW,
+  legacySignificantEventAge,
 } from "./liveness.mjs";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
@@ -361,7 +365,10 @@ async function watchScan() {
     //    off + shadow. Age used to decide AND to report: event age when we have
     //    events, else time since the run started (0 if we know neither). ──
     const events = await recentEvents(wf.workflowId);
-    const lastEventAge = significantEventAge(events, now);
+    // TEAM-4186 F6: the legacy decision sees ONLY the first 25 rows. The wider
+    // window exists for the liveness clock; letting it reach here makes the
+    // watchdog fire on a healthy streaming agent (see LEGACY_EVENT_WINDOW).
+    const lastEventAge = legacySignificantEventAge(events.slice(0, LEGACY_EVENT_WINDOW), now);
     const legacyAge = lastEventAge ?? (wf.startedAt ? now - Date.parse(wf.startedAt) : 0);
     const legacyFire = legacyAge >= STALE_MS;
 
@@ -424,17 +431,20 @@ async function watchScan() {
   return { active: active.length, watched };
 }
 
-// Not agent activity: streaming chunks are too chatty to mean anything alone,
-// and orchestrator.nudge is a housekeeping event the orchestrator publishes
-// itself (a live lease it chose not to steal) — counting either keeps a run
-// looking fresh no matter what the agent is doing (TEAM-3969).
-const NON_SIGNIFICANT_EVENT_TYPES = new Set(["agent.streaming", "orchestrator.nudge"]);
+// The liveness clock's page size. TEAM-4166 D2 raised it from the pre-epic 25:
+// the clock needs enough recent rows to find the newest agent.streaming per
+// ticket (the span-fresh proof-of-life), which the chatty streaming rows can
+// otherwise push past a 25-row window. The LEGACY decision is deliberately NOT
+// widened with it — see LEGACY_EVENT_WINDOW in liveness.mjs (TEAM-4186 F6).
+const LIVENESS_EVENT_PAGE = 50;
 
 /**
- * The newest events for a workflow, newest first. TEAM-4166 D2 raised the Limit
- * from 25 to 50: the liveness clock needs enough recent rows to find the newest
- * agent.streaming per ticket (the span-fresh proof-of-life), which the chatty
- * streaming rows can otherwise push past a 25-row window.
+ * The newest events for a workflow, newest first.
+ *
+ * TEAM-4186 F6 — in `off` mode this issues the PRE-EPIC read: one Query with
+ * Limit 25, exactly what the analyzer did before TEAM-4166. Off is then
+ * byte-identical in the read as well as in the decision, and costs not one extra
+ * consumed capacity unit; the liveness clock never runs there to need more.
  */
 async function recentEvents(workflowId) {
   const page = await ddb.send(new QueryCommand({
@@ -442,16 +452,9 @@ async function recentEvents(workflowId) {
     KeyConditionExpression: "workflowId = :w",
     ExpressionAttributeValues: { ":w": workflowId },
     ScanIndexForward: false,
-    Limit: 50,
+    Limit: LIVENESS_MODE === "off" ? LEGACY_EVENT_WINDOW : LIVENESS_EVENT_PAGE,
   }));
   return page.Items || [];
-}
-
-/** Age in ms of the newest non-streaming event in `items`, or null if none. */
-function significantEventAge(items, now) {
-  const item = (items || []).find((e) => !NON_SIGNIFICANT_EVENT_TYPES.has(e.type)) || (items || [])[0];
-  if (!item?.timestamp) return null;
-  return now - Date.parse(item.timestamp);
 }
 
 // ─── Harness invoke ────────────────────────────────────────────────────────────
