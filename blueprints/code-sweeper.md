@@ -50,6 +50,16 @@ Static dead-code detection is wrong often. Code that LOOKS unused but is live:
 ### Step 2: Verify each candidate is actually dead
 For every candidate before removal:
 1. `git grep` the symbol name across the entire repo — zero non-definition hits.
+   - **Never inherit a number.** Any count you did not run yourself this session
+     — from `requirements.md`, a prior REMOVAL_LEDGER, an issue, or a blueprint
+     (e.g. "dynamic x27") — is a CLAIM, not evidence. RE-DERIVE it against the
+     current tree with `git grep -c <pattern>` (or an equivalent counting
+     command) and cite the exact command beside the number in that candidate's
+     Removal Ledger row. `-c` reports per-FILE counts, so a repo-wide total needs
+     the sum — cite the command that produced the total you print, e.g.
+     `git grep -c <pattern> | awk -F: '{n+=$2} END{print n}'`. This has already
+     gone wrong: a run copied "dynamic x27" out of `requirements.md` unchecked,
+     and re-deriving gave dynamic 21 plus maxDuration 6 (run c2uqki → TEAM-4242).
 2. Check the dynamic/reflection/entry-point exceptions above.
 3. For a public/exported symbol, confirm this repo is the sole consumer (or
    `--retain-public`); if it may be an external API, KEEP and list it.
@@ -108,7 +118,11 @@ still pass with the code gone.
 
    | Symbol / file | Location | Why safe to remove | Verified by |
    |---|---|---|---|
-   | ... | file:line | grep: 0 refs; not reflection/entry-point | build+tests green (build_id) |
+   | `formatLegacySpan` | src/lib/spans.ts:88 | 0 refs; not reflection/entry-point/public API | `git grep -c formatLegacySpan` → 0; build+tests green (build_id) |
+   | `LEGACY_FLAG` (6 sites) | src/lib/flags.ts + 5 callers | flag retired; count RE-DERIVED against this tree, not inherited | `git grep -c LEGACY_FLAG \| awk -F: '{n+=$2} END{print n}'` → 6 (requirements.md had claimed 27); build+tests green |
+
+   Every number in the ledger — refs, files, occurrences — is followed by the exact
+   command that produced it. A number with no command beside it is not evidence.
 
    Plus a **Candidates NOT removed** section (what was flagged but kept, and why).
 4. `WorkflowOutput___report_completion` with: branch, commit SHA, PR URL, count
@@ -123,6 +137,7 @@ still pass with the code gone.
 - Default is KEEP. Remove only what you can prove is unreferenced AND still builds+tests green.
 - Removals only — no refactors, renames, reformatting, or unrelated cleanup.
 - Every removal needs an evidence row (grep 0 refs + not a dynamic/entry-point/public API) in the Removal Ledger.
+- Inherited numbers are never copied. Any count from requirements.md, a prior ledger, an issue or a blueprint is RE-DERIVED with `git grep -c` against the current tree, and the exact command is cited in the ledger row.
 - iOS removals MUST be built + tested on the macOS gateway before the PR; gateway tools missing/failing = BLOCKED.
 - NEVER auto-merge. Always a PR for human review. When unsure about a candidate, keep it and list it.
 - If detection tools cannot be installed/run, or the build/test cannot run, report BLOCKED — do not open a PR of unverified deletions.

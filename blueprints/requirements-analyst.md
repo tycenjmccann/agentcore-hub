@@ -187,6 +187,32 @@ Your context always carries a `## Delivery Mode` block, derived from the hub's
   ("Delivery: handoff — PR for the owning team") so downstream agents plan their
   evidence for a human reviewer on the PR.
 
+### Step 2d: Dead-code-sweep runs (worked example)
+
+On a `dead-code-sweep` run the roster is six agents — you, `agentcore_hub_code_sweeper`,
+`agentcore_hub_code_reviewer`, `agentcore_hub_qa_verifier`, `agentcore_hub_ci_agent`,
+`agentcore_hub_release_manager`. There are no designers, so Tiers 1-2 are EMPTY and the
+sweeper is the first ticket after yours. Two things go wrong on these runs every time:
+
+1. **The sweeper's `blocked_by` names YOUR ticket — never `""`.** It cannot start before
+   your requirements exist, and an empty `blocked_by` makes the orchestrator dispatch it
+   immediately against no scope (TEAM-4230, TEAM-2859 and 0ph7b1 all shipped it empty).
+   `blocked_by: ""` belongs to ADVISORY tickets (Step 2) and to nothing else in the chain.
+2. **Never invent a branch name.** The HARNESS names each development-phase agent's
+   branch `feature/<ticketId>-<persona>`, where `<persona>` is its `agentId` with
+   `agentcore_hub_` stripped and `_` replaced by `-` (`lambda/orchestrator/index.mjs`, the
+   `feature_branch` emitter — currently the slug at :4896, emitted at :4898,
+   development-phase guard at :4887; an advisory ticket is the one exception, taking
+   `feature/<ticketId>-advisory`). So the sweeper works on `feature/TEAM-4231-code-sweeper`
+   — NOT `chore/dead-code-sweep-<date>` or any other name you make up. Do not write a
+   branch name into a ticket description unless it matches that pattern exactly.
+
+Chain: `agentcore_hub_code_sweeper` (blocked_by = YOUR ticket) → `agentcore_hub_code_reviewer`
+(blocked_by = the sweeper ticket) → `agentcore_hub_qa_verifier` → `agentcore_hub_ci_agent`
+→ and only when `## Delivery Mode` says `CD_REGISTERED: true`, `agentcore_hub_release_manager`
+Ship → the "Merge Approval" gate → `agentcore_hub_release_manager` CD. One ticket per
+assignee (the release manager's Ship + CD are the expected pair).
+
 ### Step 3: Delegate to Claude Code
 Call `claude_code` to produce the requirements document and agent selection:
 
