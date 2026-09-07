@@ -466,6 +466,13 @@ class RealDossierFixtures(unittest.TestCase):
         )
         self.assertEqual(182137 + 97193 + 74041, m["humanWaitTotalMs"])
 
+        # TEAM-4167 D3 FR-3.6 regression guard: human wait can never exceed the
+        # run's wall-clock (the bug this class of change fixes — open gates
+        # charged to run-end used to blow past it). The toolkit exposes no
+        # utilization / active-time figure, so the ≤1 / ≤total utilization guard
+        # the brief mentions is N/A here and intentionally omitted.
+        self.assertLessEqual(m["humanWaitTotalMs"], m["totalDurationMs"])
+
         # FR-3.3: the derived opening row makes phases[] sum to the whole run.
         phases = m["phases"]
         self.assertEqual(phases[0]["derived"], "run-start")
