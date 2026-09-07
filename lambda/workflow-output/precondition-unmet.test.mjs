@@ -211,6 +211,29 @@ describe("report_precondition_unmet — a failed stamp is surfaced (TEAM-4189)",
     expectSurfacedFailure(result(await call(ARGS)), "x is not a function");
   });
 
+  it("(e) a throwing invoke with no message still surfaces as a failed stamp", async () => {
+    // A bare `throw undefined` leaves err.message unreachable and String(err)
+    // still non-empty ("undefined") — the point is that NO shape of a thrown
+    // non-Error (or an Error with an empty message) is allowed to leave
+    // stampError falsy, which would fall through to a "waiting" success.
+    h.invokeResponder = () => { throw undefined; };
+    const r = result(await call(ARGS));
+
+    expect(r.status).toBe("error");
+    expect(r.stampPersisted).toBe(false);
+    expect(typeof r.error).toBe("string");
+    expect(r.error.length).toBeGreaterThan(0);
+
+    expect(h.invokes).toHaveLength(1);
+    expect(h.invokes[0].tool_name).toBe("Tickets___annotate_precondition_unmet");
+    expect(h.invokes.some((i) => i.tool_name === "Tickets___transition_ticket")).toBe(false);
+    expect(h.puts.some((p) => String(p.Key || "").startsWith("completions/"))).toBe(false);
+
+    const event = h.ddbPuts.find((p) => p?.Item?.type === "agent.precondition_unmet");
+    expect(event).toBeTruthy();
+    expect(event.Item.detail.stampPersisted).toBe(false);
+  });
+
   it("caps a stack-trace-sized stampError so it can't bloat the event or the reply", async () => {
     h.invokeResponder = () => ({ error: `boom ${"x".repeat(5000)}` });
     const r = result(await call(ARGS));

@@ -287,18 +287,25 @@ async function reportPreconditionUnmet({ ticket_id, awaiting_ids, note = "", wor
       // { errorType, errorMessage, trace } — no `.error` key, so it has to be
       // checked FIRST or it reads as success), and the handled `{ error }` shape.
       if (resp.FunctionError || payload.errorMessage) {
-        stampError = String(payload.errorMessage || resp.FunctionError);
+        // TEAM-4189: errorMessage/FunctionError could in principle stringify
+        // empty — never let a falsy stampError slip status back to "waiting".
+        stampError = String(payload.errorMessage || resp.FunctionError) || "annotate failed";
         console.error(`[report_precondition_unmet] annotate failed for ${self}:`, stampError);
       } else if (payload.error) {
         console.error(`[report_precondition_unmet] annotate failed for ${self}:`, payload.error);
-        stampError = String(payload.error);
+        // payload.error is truthy here but could be e.g. `true` or a value
+        // whose String() is empty — same non-empty guarantee as above.
+        stampError = String(payload.error) || "annotate failed";
       } else {
         console.log(`[report_precondition_unmet] ${self} awaiting ${awaitingIds.join(", ")}`);
         stampPersisted = true;
       }
     } catch (err) {
-      console.error(`[report_precondition_unmet] Error annotating ${self}:`, err.message);
-      stampError = err.message;
+      console.error(`[report_precondition_unmet] Error annotating ${self}:`, err && err.message);
+      // TEAM-4189: a throw with no/empty message (a bare `throw undefined` or
+      // `throw new Error("")`) must still surface as a failed stamp — never a
+      // falsy stampError, which would fall through to a "waiting" success.
+      stampError = (err && err.message) || String(err) || "annotate invoke failed";
     }
   }
   // else: HEALTHCHECK-/TEST- ids intentionally skip the invoke — synthetic ids
