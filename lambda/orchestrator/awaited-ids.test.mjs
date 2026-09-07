@@ -518,9 +518,51 @@ describe("parkEvidence / isStampCurrent / nonTerminalAwaitedIds (TEAM-4184 F1)",
         .toBe("awaited-open");
     });
 
-    it("defaults are safe: no options at all → the stamp is current (no claim to compare against)", () => {
+    it("defaults are safe: no options at all → no-snapshot short-circuit, not stale-stamp", () => {
+      // No `siblings` key at all is the SAME "can't see the board" case as an
+      // explicit undefined/null (TEAM-4184) — it must never fall through to a
+      // claim-currency/budget verdict it has no evidence for.
       expect(parkEvidence(ticketWith(BEFORE_CLAIM))).toEqual({
-        parkedClean: true, reason: "stamp-current", awaitingIds: [],
+        parkedClean: true, reason: "awaited-open", awaitingIds: ["TEAM-4156", "TEAM-4157", "TEAM-4125"],
+      });
+    });
+
+    /**
+     * TEAM-4184 (review finding of TEAM-4168): the guard's own no-siblings
+     * default used to be nonTerminalAwaitedIds(ticket, siblings) — [] for any
+     * non-array `siblings` — which is the RIGHT polarity for checkAwaitTimeout
+     * (advisory only) but the WRONG one here. An unwired reader, or a fetch
+     * that failed and degraded to null (dead-session-detector.mjs's own
+     * catch block), then read as "nothing is open", and a stamp older than the
+     * claim with a spent clean-exit budget fell through to stale-stamp: a
+     * transient DDB/Jira read error escalating a live, legitimately parked
+     * ticket — the exact false-positive class TEAM-4184 F1 exists to prevent,
+     * just triggered by infra flakiness instead of stale data.
+     */
+    it("no snapshot at all (fetch failed/unwired) is scored as unproven, NOT as resolved — even with a stale stamp and a spent budget", () => {
+      for (const siblings of [undefined, null]) {
+        const ev = parkEvidence(ticketWith(BEFORE_CLAIM), {
+          siblings, claimStartedAt: CLAIM, cleanRedispatches: 1,
+        });
+        expect(ev.parkedClean).toBe(true);
+        expect(ev.reason).toBe("awaited-open");
+        expect(ev.reason).not.toBe("stale-stamp");
+      }
+    });
+
+    it("a REAL empty snapshot (parent genuinely has no other children) is NOT the same code path as no snapshot, but lands on the same verdict", () => {
+      // [] is an array — Array.isArray([]) is true — so this takes the NORMAL
+      // nonTerminalAwaitedIds path, not the no-snapshot short-circuit; every
+      // awaited id is simply absent from it and so still counted non-terminal
+      // (nonTerminalAwaitedIds's own "absent = unproven" rule). Same reason,
+      // same ids, reached by the already-correct existing path — confirming
+      // the new short-circuit only changes behavior when siblings ISN'T an
+      // array at all.
+      const ev = parkEvidence(ticketWith(BEFORE_CLAIM), {
+        siblings: [], claimStartedAt: CLAIM, cleanRedispatches: 1,
+      });
+      expect(ev).toEqual({
+        parkedClean: true, reason: "awaited-open", awaitingIds: ["TEAM-4156", "TEAM-4157", "TEAM-4125"],
       });
     });
 

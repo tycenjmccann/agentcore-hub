@@ -1518,6 +1518,72 @@ describe("TEAM-4166 D2 §2.3 — evidence-gated escalation guard", () => {
     expect(store.setTaskStatus).not.toHaveBeenCalled();
   });
 
+  /**
+   * TEAM-4184 (review finding of TEAM-4168): a sibling-fetch FAILURE must not
+   * read as "resolved". Before this fix, `siblings` stayed `null` whenever
+   * `getChildTickets` was unwired or threw, and `parkEvidence` was handed
+   * `undefined` — nonTerminalAwaitedIds(ticket, undefined) returns [] (its own
+   * "nothing provably open" contract, correct for checkAwaitTimeout's advisory
+   * use), so the awaited-open term went silent and a STALE stamp with a SPENT
+   * budget fell straight through to stale-stamp: a transient infra error
+   * escalating a live, legitimately parked ticket. parkEvidence now scores "no
+   * snapshot at all" as unproven (awaited-open) BEFORE it ever reaches the
+   * claim-currency/budget terms, so a fetch failure degrades to "leave it
+   * parked" (re-checked next sweep), never to "escalate".
+   */
+  it("TEAM-4184: getChildTickets THROWS on a stale stamp + spent budget → does NOT escalate (fails toward not escalating)", async () => {
+    const wf = makeWorkflow({
+      deadSessionRetries: { "TEAM-2": 1 },
+      cleanExitRedispatches: { "TEAM-2": 1 }, // budget already spent — the stale-stamp trigger
+      epicId: "TEAM-1",
+    });
+    const store = guardStore();
+    const getChildTickets = vi.fn(async () => { throw new Error("ProvisionedThroughputExceededException"); });
+    const { deps } = makeDeps({
+      ddb: makeDdb({ workflows: [wf] }), store,
+      getTicket: vi.fn(async () => parkedStale),
+    });
+    const { runSweep } = createDetector({ ...deps, getChildTickets, cleanExitRedispatchCap: 3 });
+
+    const m = await runSweep("enforce");
+
+    expect(getChildTickets).toHaveBeenCalledWith("TEAM-1");
+    // The false escalation this predicate exists to prevent, NOT triggered by
+    // the fetch error either — it re-wakes exactly as the unconsumed-stamp /
+    // budget-unspent case does, because parkedClean is still true.
+    expect(m.escalations).toBe(0);
+    expect(m.exitedOk).toBe(1);
+    expect(store.incrementCleanExitRedispatch).toHaveBeenCalledTimes(1);
+    expect(store.setTaskStatus).not.toHaveBeenCalled();
+    expect(deps.blockTicket).not.toHaveBeenCalled();
+    expect(eventsOfType(deps.publishEvent, "agent.escalated")).toHaveLength(0);
+    expect(store.appendNotification).not.toHaveBeenCalled();
+  });
+
+  it("TEAM-4184: getChildTickets UNWIRED on a stale stamp + spent budget → does NOT escalate (same fail-safe as a throw)", async () => {
+    const wf = makeWorkflow({
+      deadSessionRetries: { "TEAM-2": 1 },
+      cleanExitRedispatches: { "TEAM-2": 1 },
+      epicId: "TEAM-1",
+    });
+    const store = guardStore();
+    const { deps } = makeDeps({
+      ddb: makeDdb({ workflows: [wf] }), store,
+      getTicket: vi.fn(async () => parkedStale),
+    });
+    // No getChildTickets at all — same "can't see the board" state as a throw.
+    const { runSweep } = createDetector({ ...deps, cleanExitRedispatchCap: 3 });
+
+    const m = await runSweep("enforce");
+
+    expect(m.escalations).toBe(0);
+    expect(m.exitedOk).toBe(1);
+    expect(store.incrementCleanExitRedispatch).toHaveBeenCalledTimes(1);
+    expect(store.setTaskStatus).not.toHaveBeenCalled();
+    expect(deps.blockTicket).not.toHaveBeenCalled();
+    expect(eventsOfType(deps.publishEvent, "agent.escalated")).toHaveLength(0);
+  });
+
   it("§0 anti-thrash: reader ABSENT keeps the pre-4166 capped re-wake (no siblings to consult)", async () => {
     const wf = makeWorkflow({ deadSessionRetries: { "TEAM-2": 1 }, epicId: "TEAM-1" });
     const store = guardStore();
