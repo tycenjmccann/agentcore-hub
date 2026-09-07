@@ -354,6 +354,15 @@ export default defineConfig({
       // the ship review's change set enumerates its own PR's files only — so an
       // advisory branch's files cannot enter the reviewed diff.
       "lambda/orchestrator/advisory-routing.test.mjs",
+      // verdict-contract (TEAM-4246 D1) — the single definition of what a gate
+      // persona's verdict IS, and the only place prose is read for one. Zero
+      // imports and pure, so the table is driven by the REAL completion records
+      // in the dowtdh + f50ucz dossiers: all nine gate summaries across two runs
+      // resolve to the verdict a human reads, "Verdict: code deploy SUCCEEDED"
+      // resolves to NONE rather than PASS, and a head SHA is only ever taken
+      // from a structured field — dowtdh TEAM-4180's prose holds five SHAs and
+      // the first one is not the head it reviewed.
+      "lambda/orchestrator/verdict-contract.test.mjs",
     ],
     // Keep unit tests away from the Playwright specs under tests/.
     exclude: ["tests/**", "node_modules/**", "demo/**"],

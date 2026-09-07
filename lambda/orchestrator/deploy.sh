@@ -56,7 +56,7 @@ cp "$REPO_ROOT/src/config/lease-constants.json" ./lease-constants.json
 # agent-invoker.mjs, events-writer.mjs (TEAM-3696) — a module missing here dies
 # at cold start with ERR_MODULE_NOT_FOUND. Verify with
 # ./scripts/check-lambda-zip-manifest.sh before changing this line.
-zip -rq function.zip index.mjs agent-invoker.mjs events-writer.mjs workflow-store.mjs lease.mjs lease-constants.json watchdog.mjs dead-session-detector.mjs cascade.mjs review-cap.mjs ship-review.mjs completion.mjs pipeline-enabled.mjs cd-registry.mjs reconcile-sweep.mjs sweep-scan.mjs merge-on-green.mjs ship-head-stability.mjs ship-dispatch-gate.mjs rework-loop-cap.mjs live-reverify.mjs repo-check.mjs ci-check.mjs sync-main.mjs event-id.mjs gate-state.mjs dead-session-escalation.mjs ticket-blockers.mjs fix-contract.mjs artifact-chain.mjs package.json node_modules/
+zip -rq function.zip index.mjs agent-invoker.mjs events-writer.mjs workflow-store.mjs lease.mjs lease-constants.json watchdog.mjs dead-session-detector.mjs cascade.mjs review-cap.mjs ship-review.mjs completion.mjs pipeline-enabled.mjs cd-registry.mjs reconcile-sweep.mjs sweep-scan.mjs merge-on-green.mjs ship-head-stability.mjs ship-dispatch-gate.mjs rework-loop-cap.mjs live-reverify.mjs repo-check.mjs ci-check.mjs sync-main.mjs event-id.mjs gate-state.mjs dead-session-escalation.mjs ticket-blockers.mjs fix-contract.mjs artifact-chain.mjs verdict-contract.mjs package.json node_modules/
 rm -f lease-constants.json
 
 SIZE=$(ls -lh function.zip | awk '{print $5}')
@@ -318,7 +318,48 @@ if [ -n "${ADVISORY_ROUTING:-}" ]; then
   echo "  ADVISORY_ROUTING=${ADVISORY_ROUTING} forwarded to orchestrator"
 fi
 
-ENV_VARS_ORCH="Variables={ARTIFACT_BUCKET=${ARTIFACT_BUCKET},TICKETS_TABLE=${TICKETS_TABLE},WORKFLOWS_TABLE=${WORKFLOWS_TABLE},EVENTS_TABLE=${EVENTS_TABLE},TICKET_PROVIDER=${TICKET_PROVIDER},TICKET_TOOLS_LAMBDA=${TICKET_TOOLS_LAMBDA}${JIRA_VARS}${GITHUB_VARS}${LEASE_VARS}${DETECTOR_VARS}${CASCADE_VARS}${RECONCILE_VARS}${PIPELINE_VARS}${LEVEL_DISPATCH_VARS}${MERGE_ON_GREEN_VARS}${SHIP_HEAD_STABILITY_VARS}${SHIP_DISPATCH_GATE_VARS}${REWORK_LOOP_CAP_VARS}${EVENT_DEDUPE_VARS}${GATE_STATE_GUARD_VARS}${DEAD_SESSION_ESCALATION_VARS}${LIVE_REVERIFY_VARS}${REPO_CHECK_MODE_VARS}${CI_CHECK_VARS}${SYNC_MAIN_BEFORE_CI_VARS}${ADVISORY_ROUTING_VARS}}"
+# ─── Gate-verdict binding (TEAM-4246 D1) ──────────────────────────────────────
+#
+# Three flags: off | shadow | enforce. Run wf_1788731227559_dowtdh shipped over
+# "VERDICT: CHANGES NEEDED" and then "VERDICT: FAIL" because a verdict had only
+# ever existed in prose — the cascade unblocks on ticket-DONE, and completion never
+# compared the reviewed head (933ea6f) against the certified (12e9ac6) or shipped
+# (001259d) one.
+#
+# READ THIS BEFORE ASSUMING A PLAIN REDEPLOY IS A NO-OP: unlike every other flag
+# in this file, these three default to SHADOW in code, not off. Not forwarding them
+# therefore lands in shadow — extra events (`orchestrator.verdict_observed`,
+# `fix_before_verify_observed`) and extra log lines, but still no ticket, no blocker
+# edge and no held cascade. Shadow is the intended rollout state; to get the fully
+# byte-identical old behaviour, set the var EXPLICITLY to `off`.
+#
+# Garbage → off in code (normalizeVerdictMode), so a typo can never mint a ticket.
+# Instant rollback = set off.
+VERDICT_GATE_VARS=""
+if [ -n "${VERDICT_GATE:-}" ]; then
+  VERDICT_GATE_VARS=",VERDICT_GATE=${VERDICT_GATE}"
+  echo "  VERDICT_GATE=${VERDICT_GATE} forwarded to orchestrator"
+else
+  echo "  VERDICT_GATE unset - orchestrator defaults to shadow (set off for the pre-4246 cascade)"
+fi
+
+FIX_BEFORE_VERIFY_VARS=""
+if [ -n "${FIX_BEFORE_VERIFY:-}" ]; then
+  FIX_BEFORE_VERIFY_VARS=",FIX_BEFORE_VERIFY=${FIX_BEFORE_VERIFY}"
+  echo "  FIX_BEFORE_VERIFY=${FIX_BEFORE_VERIFY} forwarded to orchestrator"
+else
+  echo "  FIX_BEFORE_VERIFY unset - orchestrator defaults to shadow (set off to disable)"
+fi
+
+VERIFIED_HEAD_COMPLETION_VARS=""
+if [ -n "${VERIFIED_HEAD_COMPLETION:-}" ]; then
+  VERIFIED_HEAD_COMPLETION_VARS=",VERIFIED_HEAD_COMPLETION=${VERIFIED_HEAD_COMPLETION}"
+  echo "  VERIFIED_HEAD_COMPLETION=${VERIFIED_HEAD_COMPLETION} forwarded to orchestrator"
+else
+  echo "  VERIFIED_HEAD_COMPLETION unset - orchestrator defaults to shadow (set off to disable)"
+fi
+
+ENV_VARS_ORCH="Variables={ARTIFACT_BUCKET=${ARTIFACT_BUCKET},TICKETS_TABLE=${TICKETS_TABLE},WORKFLOWS_TABLE=${WORKFLOWS_TABLE},EVENTS_TABLE=${EVENTS_TABLE},TICKET_PROVIDER=${TICKET_PROVIDER},TICKET_TOOLS_LAMBDA=${TICKET_TOOLS_LAMBDA}${JIRA_VARS}${GITHUB_VARS}${LEASE_VARS}${DETECTOR_VARS}${CASCADE_VARS}${RECONCILE_VARS}${PIPELINE_VARS}${LEVEL_DISPATCH_VARS}${MERGE_ON_GREEN_VARS}${SHIP_HEAD_STABILITY_VARS}${SHIP_DISPATCH_GATE_VARS}${REWORK_LOOP_CAP_VARS}${EVENT_DEDUPE_VARS}${GATE_STATE_GUARD_VARS}${DEAD_SESSION_ESCALATION_VARS}${LIVE_REVERIFY_VARS}${REPO_CHECK_MODE_VARS}${CI_CHECK_VARS}${SYNC_MAIN_BEFORE_CI_VARS}${ADVISORY_ROUTING_VARS}${VERDICT_GATE_VARS}${FIX_BEFORE_VERIFY_VARS}${VERIFIED_HEAD_COMPLETION_VARS}}"
 ENV_VARS_INVOKER="Variables={ARTIFACT_BUCKET=${ARTIFACT_BUCKET},TICKETS_TABLE=${TICKETS_TABLE},WORKFLOWS_TABLE=${WORKFLOWS_TABLE},EVENTS_TABLE=${EVENTS_TABLE},TICKET_PROVIDER=${TICKET_PROVIDER},TICKET_TOOLS_LAMBDA=${TICKET_TOOLS_LAMBDA}${EVENT_DEDUPE_VARS}}"
 ENV_VARS_EVENTS="Variables={EVENTS_TABLE=${EVENTS_TABLE}${EVENT_DEDUPE_VARS}}"
 

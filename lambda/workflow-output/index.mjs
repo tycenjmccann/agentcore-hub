@@ -135,7 +135,22 @@ const EVIDENCE_KINDS = ["static", "unit", "live"];
 const CI_STATUSES = ["certified", "github-actions-proxy", "unverified"];
 const CI_FIELD_MAX_LEN = 128;
 
-async function reportCompletion({ ticket_id, summary, artifacts = "", branch, commit_sha, pr_url, workflow_id, agent_id, evidence_kind, evidence_keys, ci_status, ci_build_id, ci_head_sha }) {
+// TEAM-4246 D1 — the gate persona's verdict, as a FIELD. Run
+// wf_1788731227559_dowtdh shipped over "VERDICT: CHANGES NEEDED" and then
+// "VERDICT: FAIL" because a verdict had only ever existed in prose, so nothing
+// downstream could act on one. `tested_head` is the head the persona actually
+// verified, which dowtdh proved cannot be recovered afterwards: three gate
+// tickets there reported three different heads (933ea6f, 12e9ac6, 001259d) and
+// the reviewer's own summary names five SHAs, the first of which is not its own.
+//
+// This Lambda stores what the agent DECLARED and nothing more — there is no
+// prose inference here. The one prose ladder lives in
+// lambda/orchestrator/verdict-contract.mjs, on the orchestrator side, so that
+// "what does this summary say" has exactly one answer in the codebase.
+const VERDICTS = ["PASS", "CHANGES_NEEDED", "FAIL", "BLOCKED"];
+const SHA_RE = /^[0-9a-f]{7,40}$/;
+
+async function reportCompletion({ ticket_id, summary, artifacts = "", branch, commit_sha, pr_url, workflow_id, agent_id, evidence_kind, evidence_keys, ci_status, ci_build_id, ci_head_sha, verdict, tested_head }) {
   const key = `completions/${ticket_id}.json`;
   const report = {
     ticket_id,
@@ -168,6 +183,28 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   const headSha = typeof ci_head_sha === "string" ? ci_head_sha.trim() : "";
   if (headSha && headSha.length <= CI_FIELD_MAX_LEN) report.ci_head_sha = headSha;
   else if (headSha) console.warn(`[report_completion] dropping oversized ci_head_sha (${headSha.length} chars)`);
+
+  // TEAM-4246 D1: same additive-and-closed rule again. Separators are normalized
+  // before the allow-list because the blueprints have written "CHANGES NEEDED"
+  // with a space for a year and reviewGateHistory persists "CHANGES-NEEDED" with
+  // a hyphen — dropping a real declared verdict over a space would be the worst
+  // possible reading of "closed". `verdict_source` is stamped only alongside an
+  // accepted verdict, so a reader can always tell a declared verdict from one the
+  // orchestrator later inferred from prose.
+  const declaredVerdict = typeof verdict === "string" ? verdict.trim().toUpperCase().replace(/[\s-]+/g, "_") : "";
+  if (declaredVerdict) {
+    if (VERDICTS.includes(declaredVerdict)) {
+      report.verdict = declaredVerdict;
+      report.verdict_source = "declared";
+    } else console.warn(`[report_completion] dropping unknown verdict "${declaredVerdict}" (expected ${VERDICTS.join("|")})`);
+  }
+  // A head SHA is never guessed and never truncated-in-place: it is either a git
+  // object name or it is absent. dowtdh's head gate is only as good as this field.
+  const testedHead = typeof tested_head === "string" ? tested_head.trim().toLowerCase() : "";
+  if (testedHead) {
+    if (SHA_RE.test(testedHead)) report.tested_head = testedHead;
+    else console.warn(`[report_completion] dropping non-SHA tested_head "${testedHead.slice(0, CI_FIELD_MAX_LEN)}"`);
+  }
 
   await s3.send(new PutObjectCommand({
     Bucket: BUCKET,

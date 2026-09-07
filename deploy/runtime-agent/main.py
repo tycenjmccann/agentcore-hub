@@ -1819,7 +1819,7 @@ def Pipeline___capabilities() -> str:
 # ─── Workflow Output Tools ────────────────────────────────────────────────────
 
 @tool
-def WorkflowOutput___report_completion(ticket_id: str, summary: str, artifacts: str = "", branch: str = "", commit_sha: str = "", pr_url: str = "", evidence_kind: str = "", evidence_keys: str = "", ci_status: str = "", ci_build_id: str = "", ci_head_sha: str = "") -> str:
+def WorkflowOutput___report_completion(ticket_id: str, summary: str, artifacts: str = "", branch: str = "", commit_sha: str = "", pr_url: str = "", evidence_kind: str = "", evidence_keys: str = "", ci_status: str = "", ci_build_id: str = "", ci_head_sha: str = "", verdict: str = "", tested_head: str = "") -> str:
     """Report that your work is complete. This saves your completion summary to S3 AND automatically transitions your Jira ticket to Done. Do NOT call Tickets___transition_ticket to mark your own ticket done — this tool handles that for you.
 
     Args:
@@ -1845,6 +1845,17 @@ def WorkflowOutput___report_completion(ticket_id: str, summary: str, artifacts: 
             means neither.
         ci_build_id: the CodeBuild build id backing ci_status="certified".
         ci_head_sha: the exact head SHA that build id was proven against.
+        verdict: gate personas (code reviewer, QA verifier, CI agent, release
+            manager) only — "PASS" | "CHANGES_NEEDED" | "FAIL" | "BLOCKED". Pass
+            it as well as writing it in your summary: a non-PASS verdict holds the
+            next gate until your fix ticket is done, and a verdict that exists
+            only in prose cannot do that. If you return anything other than PASS
+            you MUST also file a fix ticket.
+        tested_head: the exact head SHA you verified. Do not leave this to be
+            guessed from your summary — a summary routinely names several SHAs
+            (the branch point, the PR merge, other tickets' heads) and only you
+            know which one you actually tested. Completion is refused when the
+            reviewed, CI-certified and shipped heads disagree.
     """
     # Include workflow_id and agent_id from invocation context for journey logging (not exposed to agent)
     payload = {
@@ -1868,6 +1879,13 @@ def WorkflowOutput___report_completion(ticket_id: str, summary: str, artifacts: 
         payload["ci_build_id"] = ci_build_id.strip()
     if ci_head_sha.strip():
         payload["ci_head_sha"] = ci_head_sha.strip()
+    # TEAM-4246 D1: same additive rule again. The Lambda owns the allow-list and
+    # the SHA check — an unrecognized verdict is dropped there rather than stored,
+    # so nothing downstream ever has to guess what a novel value meant.
+    if verdict.strip():
+        payload["verdict"] = verdict.strip().upper()
+    if tested_head.strip():
+        payload["tested_head"] = tested_head.strip().lower()
     return _invoke_lambda(WORKFLOW_OUTPUT_LAMBDA, "WorkflowOutput___report_completion", payload)
 
 

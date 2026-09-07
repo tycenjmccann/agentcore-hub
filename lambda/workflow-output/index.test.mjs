@@ -154,3 +154,89 @@ describe("report_completion — ci_status / ci_build_id / ci_head_sha", () => {
     expect(h.warns.join("\n")).toMatch(/oversized ci_head_sha/);
   });
 });
+
+// TEAM-4246 D1 — the gate persona's verdict and the head it tested, as FIELDS.
+// wf_1788731227559_dowtdh shipped over "VERDICT: CHANGES NEEDED" and then
+// "VERDICT: FAIL" because neither was anything but prose. This Lambda stores only
+// what the agent DECLARED — the prose ladder lives in the orchestrator's
+// verdict-contract.mjs — under the same additive-and-closed contract as above.
+describe("report_completion — verdict / tested_head", () => {
+  it("persists both, and stamps verdict_source=declared", async () => {
+    await report({ verdict: "CHANGES_NEEDED", tested_head: "933ea6f1f04a3b2c" });
+    const r = record();
+    expect(r.verdict).toBe("CHANGES_NEEDED");
+    expect(r.verdict_source).toBe("declared");
+    expect(r.tested_head).toBe("933ea6f1f04a3b2c");
+  });
+
+  it("a record written without them keeps exactly the pre-4246 key set", async () => {
+    await report({});
+    expect(Object.keys(record()).sort()).toEqual([...BASE_KEYS].sort());
+  });
+
+  it("accepts all three CHANGES_NEEDED spellings and normalizes case/whitespace", async () => {
+    // The blueprints have written "CHANGES NEEDED" with a space for a year and
+    // reviewGateHistory persists the hyphen form; dropping a real verdict over a
+    // separator would be the worst possible reading of "closed".
+    for (const raw of ["CHANGES NEEDED", "changes-needed", "  Changes_Needed  "]) {
+      h.puts.length = 0;
+      await report({ verdict: raw });
+      expect(record().verdict, raw).toBe("CHANGES_NEEDED");
+    }
+  });
+
+  it("accepts the other three verdicts", async () => {
+    for (const raw of ["PASS", "fail", " BLOCKED "]) {
+      h.puts.length = 0;
+      await report({ verdict: raw });
+      expect(record().verdict).toBe(raw.trim().toUpperCase());
+    }
+  });
+
+  it("verdict allow-list drops unknown values", async () => {
+    // f50ucz TEAM-4128's real summary says "Verdict: code deploy SUCCEEDED" —
+    // which is not a verdict. Stored as one it would read as a passing gate.
+    await report({ verdict: "SUCCEEDED", tested_head: "7c2391ba" });
+    const r = record();
+    expect("verdict" in r).toBe(false);
+    expect("verdict_source" in r).toBe(false);
+    // The head still lands — it is a separate, independently valid signal.
+    expect(r.tested_head).toBe("7c2391ba");
+    expect(h.warns.join("\n")).toMatch(/unknown verdict "SUCCEEDED"/);
+  });
+
+  it("tested head rejected when not a SHA", async () => {
+    for (const raw of ["HEAD", "main", "not-a-sha", "abc", "z".repeat(40), "0".repeat(41)]) {
+      h.puts.length = 0;
+      h.warns.length = 0;
+      await report({ tested_head: raw });
+      expect("tested_head" in record(), raw).toBe(false);
+      expect(h.warns.join("\n")).toMatch(/non-SHA tested_head/);
+    }
+  });
+
+  it("tested head is clamped in the warning, never in the record", async () => {
+    // A 4KB blob in the log line would be the only thing in the log line.
+    await report({ tested_head: "q".repeat(5000) });
+    expect("tested_head" in record()).toBe(false);
+    const warn = h.warns.find((w) => w.includes("non-SHA tested_head"));
+    expect(warn.length).toBeLessThan(200);
+  });
+
+  it("normalizes an uppercase SHA", async () => {
+    await report({ tested_head: " 933EA6F1F0 " });
+    expect(record().tested_head).toBe("933ea6f1f0");
+  });
+
+  it("blank values are the same as absent, and neither implies the other", async () => {
+    await report({ verdict: "   ", tested_head: "" });
+    expect(Object.keys(record()).sort()).toEqual([...BASE_KEYS].sort());
+    // A verdict with no head, and a head with no verdict, are both legitimate.
+    h.puts.length = 0;
+    await report({ verdict: "PASS" });
+    expect(Object.keys(record()).sort()).toEqual([...BASE_KEYS, "verdict", "verdict_source"].sort());
+    h.puts.length = 0;
+    await report({ tested_head: "deadbeef" });
+    expect(Object.keys(record()).sort()).toEqual([...BASE_KEYS, "tested_head"].sort());
+  });
+});

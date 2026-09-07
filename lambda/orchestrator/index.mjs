@@ -60,6 +60,13 @@ import { eventIdFor, normalizeEventDedupeMode } from "./event-id.mjs";
 import { GATE_STATES, classifyRejection, normalizeGateGuardMode } from "./gate-state.mjs";
 import { createDeadSessionEscalation, normalizeEscalationMode } from "./dead-session-escalation.mjs";
 import { applyBlockerEdge, normalizePreserveStatuses } from "./ticket-blockers.mjs";
+// TEAM-4246 D1: what a gate persona's verdict IS — also a zero-import module, and
+// statically imported for the same reason ticket-blockers.mjs is:
+// scripts/check-lambda-zip-manifest.sh walks STATIC sibling-import edges only, so
+// a dynamic import would leave the new deploy.sh zip entry unenforced. The
+// module is pure (no clock, no AWS, no env beyond one normalizer), so importing it
+// with all three flags off costs a parse and nothing else.
+import { normalizeVerdictMode } from "./verdict-contract.mjs";
 // TEAM-4121 FR-8: the fix-ticket contract lives in a zero-import module that is
 // byte-identical across the orchestrator + both ticket Lambdas (CI cmp's them).
 // The orchestrator only READS contracts — it maps a Jira issue's labels and
@@ -256,6 +263,45 @@ const SYNC_MAIN_BEFORE_CI = normalizeSyncMode(process.env.SYNC_MAIN_BEFORE_CI);
 // either lie to the agent or do nothing at all. STRICT allow-list (garbage → off)
 // because enforce changes what the run waits on. Instant rollback = set off.
 const ADVISORY_ROUTING = normalizeAdvisoryRoutingMode(process.env.ADVISORY_ROUTING);
+
+// ─── Gate-verdict binding (TEAM-4246 D1) ──────────────────────────────────────
+//
+// Three flags, one failure. Run wf_1788731227559_dowtdh shipped over its own
+// verdicts: the reviewer returned "VERDICT: CHANGES NEEDED" and QA was dispatched
+// 4s later, QA returned "VERDICT: FAIL" and CI was dispatched 4s later, CI
+// certified head 12e9ac6 while QA had verified 933ea6f, the fix landed at 001259d
+// and `workflow.complete` fired 5s after that. Nothing was broken — a verdict has
+// never been anything but prose, the cascade unblocks on ticket-DONE, and
+// completion never compared the heads.
+//
+// All three DEFAULT TO SHADOW, which is the opposite of every other flag in this
+// file, and deliberately: the holes are invisible today, so a rollout that
+// observes nothing tells us nothing about how often they open. Shadow writes no
+// ticket, no blocker edge and no workflow row — it publishes events. Garbage → off
+// (normalizeVerdictMode), so a typo can never mint a ticket or hold a cascade.
+// NOTE: because these default to shadow, `off` must be set EXPLICITLY.
+// Instant rollback = set off.
+
+// VERDICT_GATE — the cascade gate. shadow = publish
+// `orchestrator.verdict_observed` with what WOULD have been suppressed; enforce =
+// a non-PASS gate verdict holds its successor on the fix ticket (or, if the
+// persona filed none, on a re-verify ticket the orchestrator files) so
+// `orchestrator.unblocked` does not fire. off = the cascade behaves exactly as it
+// does today.
+const VERDICT_GATE = normalizeVerdictMode(process.env.VERDICT_GATE);
+
+// FIX_BEFORE_VERIFY — the creation-time half of the same hole. dowtdh's TEAM-4183
+// was created with `blockedBy: []`, so QA was dispatched against un-fixed code 78s
+// later. enforce blocks the run's open, not-yet-started gate tickets on a new fix
+// ticket at INSERT; shadow publishes `orchestrator.fix_before_verify_observed`.
+const FIX_BEFORE_VERIFY = normalizeVerdictMode(process.env.FIX_BEFORE_VERIFY);
+
+// VERIFIED_HEAD_COMPLETION — the last line. A run may not close green while the
+// reviewed, CI-certified and shipped heads disagree, or while a non-advisory fix
+// ticket in the epic is still open. enforce publishes
+// `orchestrator.completion_blocked` and refuses; shadow warns and completes.
+const VERIFIED_HEAD_COMPLETION = normalizeVerdictMode(process.env.VERIFIED_HEAD_COMPLETION);
+
 /**
  * The children a completion GATE may consider (TEAM-4122 FR-7). Under enforce an
  * advisory ticket owes the run nothing — no deliverable evidence, no merge
