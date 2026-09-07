@@ -249,12 +249,17 @@ export const handler = async (event) => {
         // no-op from a real result. Without this, an unrecognized tool name
         // looked like success and silently stalled the pipeline.
         const message = `Unknown tool: "${toolName}". Available: create_ticket, get_issue, edit_issue, search_issues, list_tickets, transition_issue (alias: transition_ticket), get_transitions, add_comment, annotate_precondition_unmet, labels_add, list_projects, get_project_issue_types, lookup_user`;
-        return { error: message, content: [{ text: message }] };
+        return errorResult(message);
       }
     }
   } catch (err) {
+    // TEAM-4261 — a THROWN failure is a failure on the wire too: errorResult keeps
+    // the same text but adds the top-level `error` the Jira Lambda's catch has
+    // always returned. Without it a ConditionalCheckFailedException out of the
+    // guarded annotate Update came back as content-only text, which
+    // report_precondition_unmet read as a persisted stamp.
     console.error("Tool execution error:", err);
-    return textResult(`Error: ${err.message}`);
+    return errorResult(`Error: ${err.message}`);
   }
 };
 
@@ -738,7 +743,12 @@ async function transitionIssue(args) {
   const current = await ddb.send(
     new GetCommand({ TableName: TABLE_NAME, Key: { ticketId: issueKey } })
   );
-  if (!current.Item) return textResult(`Issue ${issueKey} not found.`);
+  // TEAM-4261 — the three handled failures below carry a top-level `error` (text
+  // unchanged). workflow-output's report_completion reads `payload.error` on the
+  // transition it fires after writing the completion record, and the Jira Lambda's
+  // transition failures already surface as `{ error }`; content-only text here made
+  // a refused transition log "Transitioned → Done" on the dynamodb provider.
+  if (!current.Item) return errorResult(`Issue ${issueKey} not found.`);
 
   const currentStatus = current.Item.status || "todo";
   const available = TRANSITIONS[currentStatus] || [];
@@ -749,7 +759,7 @@ async function transitionIssue(args) {
   );
 
   if (!transition) {
-    return textResult(
+    return errorResult(
       `Invalid transition "${transitionId}" from status "${currentStatus}". ` +
       `Available: ${available.map((t) => `${t.id} (→ ${t.to})`).join(", ")}`
     );
@@ -759,7 +769,7 @@ async function transitionIssue(args) {
   // reviewer (assignee "human:*") may enter it — an agent ticket parked there
   // would never be invoked and would stall forever.
   if (transition.to === "in_review" && !String(current.Item.assignee || "").startsWith("human:")) {
-    return textResult(
+    return errorResult(
       `Cannot move ${issueKey} to in_review: only human-review tickets (assignee "human:*") can be sent to review.`
     );
   }
@@ -925,8 +935,15 @@ function samePreconditionUnmet(a, b) {
 }
 
 async function annotatePreconditionUnmet(args) {
+  // TEAM-4261 — every handled failure of THIS tool returns a top-level `error`
+  // (texts unchanged), because the stamp it writes is the only evidence the D1
+  // re-wake and the D2 liveness clock have that a ticket parked. workflow-output's
+  // report_precondition_unmet answers the agent "parked, waiting" unless it can see
+  // a failure, so content-only text here told the agent it had parked when nothing
+  // had been written and nothing would re-wake it (ship-review r2-F2). The Jira
+  // provider already failed with `{ error }` on both of these paths.
   const issueKey = args.issue_key || args.ticket_id;
-  if (!issueKey) return textResult("Error: 'issue_key' is required");
+  if (!issueKey) return errorResult("Error: 'issue_key' is required");
 
   const incoming = Array.isArray(args.awaitingIds)
     ? args.awaitingIds
@@ -937,7 +954,7 @@ async function annotatePreconditionUnmet(args) {
   const current = await ddb.send(
     new GetCommand({ TableName: TABLE_NAME, Key: { ticketId: issueKey } })
   );
-  if (!current.Item) return textResult(`Issue ${issueKey} not found.`);
+  if (!current.Item) return errorResult(`Issue ${issueKey} not found.`);
 
   const existing = Array.isArray(current.Item.preconditionUnmet?.awaitingIds)
     ? current.Item.preconditionUnmet.awaitingIds
@@ -1119,4 +1136,23 @@ function detectTool(event) {
 
 function textResult(text) {
   return { content: [{ text }] };
+}
+
+/**
+ * TEAM-4261 — a HANDLED failure carries a top-level `error` AS WELL AS the text.
+ *
+ * `error` is the ONE failure shape both ticket providers share (the Jira Lambda's
+ * handler catch returns `{ error: err.message }`) and the only one a caller can
+ * branch on: workflow-output's report_precondition_unmet / report_completion read
+ * `payload.error`, and the orchestrator's invokeTickets throws on it. Returning
+ * content-only text for a handled failure is what let a failed annotate be
+ * reported to the agent as a successful park (ship-review r2-F2).
+ *
+ * `content` is kept alongside it so every text-reading caller is byte-unaffected —
+ * notably deploy/runtime-agent/main.py's _invoke_lambda, which branches on
+ * `"content" in result` first. Same shape the handler's `default:` case already
+ * returned before this ticket.
+ */
+function errorResult(text) {
+  return { error: text, content: [{ text }] };
 }

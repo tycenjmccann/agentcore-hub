@@ -236,6 +236,47 @@ const NOTE_MAX = 2000;
 // and the tool response so one bad invoke can't bloat the DDB item or the reply.
 const STAMP_ERROR_MAX = 300;
 
+/**
+ * TEAM-4261 — the stamp counts as persisted ONLY on the explicit success shape.
+ *
+ * BOTH ticket Lambdas return `{ ticketId: <string>, preconditionUnmet: { awaitingIds:
+ * [...] , … } }` from a successful annotate — dynamodb writes the column, jira writes
+ * `awaiting:` labels plus a marker comment, and both echo exactly that, including on
+ * the `unchanged: true` no-op path. Pinned by
+ * lambda/agentcore-hub-tickets/precondition-contract.test.mjs, which drives both real
+ * handlers.
+ *
+ * Inferring success from the ABSENCE of known error keys is what let a failed
+ * annotate be reported to the agent as a successful park (ship-review r2-F2): the
+ * dynamodb provider answered `{ content: [{ text: "Issue TEAM-404 not found." }] }`,
+ * which has no `error` key, so the agent was told "waiting, stamp persisted" while
+ * nothing had been written and nothing would ever re-wake it. TEAM-4261 F1 gives that
+ * provider a top-level `error`, but requiring the POSITIVE shape here is what makes
+ * the consumer robust on its own — including against an older DEPLOYED tickets Lambda
+ * that still answers content-only (the two are deployed independently).
+ */
+function annotateStamped(payload) {
+  return !!payload
+    && typeof payload.ticketId === "string"
+    && !!payload.preconditionUnmet
+    && Array.isArray(payload.preconditionUnmet.awaitingIds);
+}
+
+/**
+ * A short description of an unrecognized annotate payload, for stampError. Prefer the
+ * provider's own text (`content[0].text`) over a JSON dump so the agent's reply says
+ * WHY; the caller caps the result at STAMP_ERROR_MAX.
+ */
+function describeAnnotatePayload(payload) {
+  const text = payload?.content?.[0]?.text;
+  if (typeof text === "string" && text.trim()) return text.trim();
+  try {
+    return JSON.stringify(payload);
+  } catch {
+    return String(payload);
+  }
+}
+
 async function reportPreconditionUnmet({ ticket_id, awaiting_ids, note = "", workflow_id, agent_id }) {
   const self = typeof ticket_id === "string" ? ticket_id.trim() : "";
   if (!TICKET_KEY_RE.test(self)) {
@@ -282,10 +323,15 @@ async function reportPreconditionUnmet({ ticket_id, awaiting_ids, note = "", wor
         })),
       }));
       const payload = JSON.parse(new TextDecoder().decode(resp.Payload));
-      // Three failure shapes, all of which mean "no stamp on the ticket":
-      // an UNHANDLED tickets-Lambda exception (HTTP 200 + FunctionError, payload
-      // { errorType, errorMessage, trace } — no `.error` key, so it has to be
-      // checked FIRST or it reads as success), and the handled `{ error }` shape.
+      // The stamp is persisted ONLY on the explicit success shape (annotateStamped).
+      // Everything else means "no stamp on the ticket":
+      //   - an UNHANDLED tickets-Lambda exception (HTTP 200 + FunctionError, payload
+      //     { errorType, errorMessage, trace } — no `.error` key, so it has to be
+      //     checked FIRST or it reads as success);
+      //   - the handled `{ error }` shape;
+      //   - TEAM-4261: ANY other payload, e.g. the content-only text an older
+      //     deployed tickets Lambda returns for a handled failure. Absence of an
+      //     error key is not evidence of a write.
       if (resp.FunctionError || payload.errorMessage) {
         // TEAM-4189: errorMessage/FunctionError could in principle stringify
         // empty — never let a falsy stampError slip status back to "waiting".
@@ -296,9 +342,14 @@ async function reportPreconditionUnmet({ ticket_id, awaiting_ids, note = "", wor
         // payload.error is truthy here but could be e.g. `true` or a value
         // whose String() is empty — same non-empty guarantee as above.
         stampError = String(payload.error) || "annotate failed";
-      } else {
+      } else if (annotateStamped(payload)) {
         console.log(`[report_precondition_unmet] ${self} awaiting ${awaitingIds.join(", ")}`);
         stampPersisted = true;
+      } else {
+        // No error key, but no stamp either — surface the provider's own text so the
+        // agent's reply says why, and fall through to the stampError return below.
+        stampError = `annotate returned no stamp: ${describeAnnotatePayload(payload)}`;
+        console.error(`[report_precondition_unmet] annotate failed for ${self}:`, stampError);
       }
     } catch (err) {
       console.error(`[report_precondition_unmet] Error annotating ${self}:`, err && err.message);

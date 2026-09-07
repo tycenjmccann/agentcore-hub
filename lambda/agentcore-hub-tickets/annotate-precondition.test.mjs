@@ -10,7 +10,9 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
  * seam), not this tool's.
  */
 
-const h = vi.hoisted(() => ({ item: null, updates: [] }));
+// `updateThrows` (TEAM-4261) makes the guarded UpdateCommand fail the way DynamoDB
+// really does when `attribute_exists(ticketId)` is not satisfied.
+const h = vi.hoisted(() => ({ item: null, updates: [], updateThrows: null }));
 
 vi.mock("@aws-sdk/client-dynamodb", () => ({ DynamoDBClient: class {} }));
 vi.mock("@aws-sdk/lib-dynamodb", () => ({
@@ -19,7 +21,15 @@ vi.mock("@aws-sdk/lib-dynamodb", () => ({
       async send(cmd) {
         const kind = cmd?.constructor?.name;
         if (kind === "GetCommand") return { Item: h.item };
-        if (kind === "UpdateCommand") { h.updates.push(cmd.input); return {}; }
+        if (kind === "UpdateCommand") {
+          h.updates.push(cmd.input);
+          if (h.updateThrows) {
+            const err = new Error(h.updateThrows.message);
+            err.name = h.updateThrows.name;
+            throw err;
+          }
+          return {};
+        }
         return {};
       },
     }),
@@ -45,6 +55,7 @@ const annotate = (parameters) =>
 beforeEach(() => {
   h.item = { ticketId: "TEAM-4126", status: "in_progress", blockedBy: [] };
   h.updates.length = 0;
+  h.updateThrows = null;
 });
 
 describe("annotate_precondition_unmet (dynamodb)", () => {
@@ -88,7 +99,39 @@ describe("annotate_precondition_unmet (dynamodb)", () => {
     h.item = null;
     const r = await annotate({ ticket_id: "TEAM-9999", awaitingIds: ["TEAM-1"] });
     expect(JSON.stringify(r)).toMatch(/not found/i);
+    // TEAM-4261 — and it is a top-level `error`, not text the caller has to parse.
+    // The consumer (workflow-output report_precondition_unmet) branches on this key
+    // to decide whether the agent really parked; content-only text read as success.
+    expect(typeof r.error).toBe("string");
+    expect(r.error).toMatch(/not found/i);
     expect(h.updates).toHaveLength(0);
+  });
+
+  /**
+   * TEAM-4261 — a THROWN write failure is a failure on the wire too.
+   *
+   * The stamp write is guarded by `attribute_exists(ticketId)` (TEAM-4166), so a
+   * row deleted between the GetCommand and the UpdateCommand raises
+   * ConditionalCheckFailedException. That lands in the handler's catch, which
+   * returned content-only text before this ticket — so the agent was told it had
+   * parked even though the stamp never persisted.
+   */
+  it("a ConditionalCheckFailedException on the guarded write surfaces as { error, content }", async () => {
+    h.updateThrows = {
+      name: "ConditionalCheckFailedException",
+      message: "The conditional request failed",
+    };
+
+    const r = await annotate({ ticket_id: "TEAM-4126", awaitingIds: ["TEAM-4156"] });
+
+    expect(h.updates).toHaveLength(1); // the write was attempted…
+    expect(typeof r.error).toBe("string"); // …and its failure is visible
+    expect(r.error).toMatch(/conditional request failed/i);
+    // The text channel still carries the same message (text-readers unaffected).
+    expect(r.content[0].text).toBe(r.error);
+    // NONE of the success keys — the caller cannot mistake this for a stamp.
+    expect(r.ticketId).toBeUndefined();
+    expect(r.preconditionUnmet).toBeUndefined();
   });
 });
 
