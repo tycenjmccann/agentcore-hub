@@ -99,6 +99,12 @@ describe("annotate_precondition_unmet (dynamodb)", () => {
  * that can land after the agent's own tool report. Last-writer-wins there would
  * walk the liveness clock backwards (making a current park look like a previous
  * claim's residue → a false dead-session escalation) and downgrade the source.
+ *
+ * TEAM-4185 F3 tightens `reportedAt` from max-wins to FIRST-writer-wins: max-wins
+ * still let a re-report move the stamp FORWARD, and the level-triggered pickup
+ * re-annotates with `now()`, which restarted the FR-1.4 wait SLA on every pickup.
+ * The stamp records when the wait BEGAN, so the first parseable value is the one
+ * that matters. `source` stays rank-preserving — it is not a clock.
  */
 describe("annotate_precondition_unmet — monotonic merge (TEAM-4184)", () => {
   it("keeps the LATER reportedAt when an older re-report arrives", async () => {
@@ -113,12 +119,18 @@ describe("annotate_precondition_unmet — monotonic merge (TEAM-4184)", () => {
     expect(r.preconditionUnmet.awaitingIds).toEqual(["TEAM-4156", "TEAM-4157"]);
   });
 
-  it("advances reportedAt when the incoming report IS newer", async () => {
+  // TEAM-4185 F3 — was "advances reportedAt when the incoming report IS newer".
+  // It must NOT advance: a stamp that moves forward on every re-report resets the
+  // wait-SLA clock, so a ticket parked for hours keeps reading as freshly parked
+  // and its await_timeout never fires. First (parseable) writer wins.
+  it("does NOT advance reportedAt when the incoming report is newer (TEAM-4185 F3)", async () => {
     h.item.preconditionUnmet = { awaitingIds: ["TEAM-4156"], reportedAt: "2026-09-06T07:07:00.000Z" };
     const r = await annotate({
       ticket_id: "TEAM-4126", awaitingIds: ["TEAM-4199"], reportedAt: "2026-09-06T09:10:00.000Z",
     });
-    expect(r.preconditionUnmet.reportedAt).toBe("2026-09-06T09:10:00.000Z");
+    expect(r.preconditionUnmet.reportedAt).toBe("2026-09-06T07:07:00.000Z");
+    // The NEW awaited id still lands — only the clock is pinned.
+    expect(r.preconditionUnmet.awaitingIds).toEqual(["TEAM-4156", "TEAM-4199"]);
   });
 
   it("takes the incoming reportedAt when the row carries none (or an unparseable one)", async () => {
@@ -153,5 +165,90 @@ describe("annotate_precondition_unmet — monotonic merge (TEAM-4184)", () => {
     h.item.preconditionUnmet = { awaitingIds: ["TEAM-4156"] }; // no source at all
     const r = await annotate({ ticket_id: "TEAM-4126", awaitingIds: ["TEAM-4156"], source: "label" });
     expect(r.preconditionUnmet.source).toBe("label");
+  });
+});
+
+/**
+ * TEAM-4185 F3 — first-writer-wins metadata, and a no-op writes NOTHING.
+ *
+ * The remaining last-writer-wins fields (`note`, `agentId`) were clobbered by the
+ * orchestrator's level-triggered re-annotate, which carries neither: the reporting
+ * agent's own note became "" and its id became null, erasing who parked and why.
+ * And because the record was rewritten unconditionally, `updatedAt` moved on every
+ * re-report — which is the timestamp reconcile-sweep's parkedLongEnough reads, so a
+ * ticket re-reported once per sweep interval could never become a candidate.
+ */
+describe("annotate_precondition_unmet — first-writer-wins + no-op (TEAM-4185 F3)", () => {
+  const STAMPED = {
+    awaitingIds: ["TEAM-4156"],
+    note: "waiting on the ship fixes",
+    reportedAt: "2026-09-06T07:07:00.000Z",
+    agentId: "agentcore_hub_release_manager",
+    source: "tool",
+  };
+
+  it("preserves the stored note and agentId when a re-report carries neither", async () => {
+    h.item.preconditionUnmet = { ...STAMPED };
+    const r = await annotate({ ticket_id: "TEAM-4126", awaitingIds: ["TEAM-4157"], source: "derived" });
+    expect(r.preconditionUnmet.note).toBe("waiting on the ship fixes");
+    expect(r.preconditionUnmet.agentId).toBe("agentcore_hub_release_manager");
+    // Still the first stamp, and the union still grew.
+    expect(r.preconditionUnmet.reportedAt).toBe("2026-09-06T07:07:00.000Z");
+    expect(r.preconditionUnmet.awaitingIds).toEqual(["TEAM-4156", "TEAM-4157"]);
+  });
+
+  it("takes the incoming note/agentId when the row carries none (empty is not a writer)", async () => {
+    for (const prior of [{}, { note: "", agentId: null }]) {
+      h.item.preconditionUnmet = { awaitingIds: ["TEAM-4156"], ...prior };
+      const r = await annotate({
+        ticket_id: "TEAM-4126", awaitingIds: ["TEAM-4156"], note: "n", agentId: "agentcore_hub_ci",
+      });
+      expect(r.preconditionUnmet.note).toBe("n");
+      expect(r.preconditionUnmet.agentId).toBe("agentcore_hub_ci");
+    }
+  });
+
+  it("a re-report that changes nothing performs NO write (updatedAt does not move)", async () => {
+    h.item.preconditionUnmet = { ...STAMPED };
+    const r = await annotate({
+      ticket_id: "TEAM-4126", awaitingIds: ["TEAM-4156"], note: STAMPED.note,
+      reportedAt: STAMPED.reportedAt, agentId: STAMPED.agentId, source: "tool",
+    });
+    expect(h.updates).toHaveLength(0);
+    expect(r.unchanged).toBe(true);
+    // The caller still gets the record back — the contract is unchanged.
+    expect(r.ticketId).toBe("TEAM-4126");
+    expect(r.preconditionUnmet).toEqual(STAMPED);
+  });
+
+  it("a re-report with DIFFERENT metadata but the same ids is still a no-op", async () => {
+    h.item.preconditionUnmet = { ...STAMPED };
+    await annotate({
+      ticket_id: "TEAM-4126", awaitingIds: ["TEAM-4156"],
+      // Every one of these loses to the stored value, so the merged record is
+      // byte-identical to what is already there → nothing to write.
+      reportedAt: "2026-09-06T09:10:00.000Z", source: "derived",
+      agentId: "orchestrator", note: "re-derived at pickup",
+    });
+    expect(h.updates).toHaveLength(0);
+  });
+
+  it("a genuinely NEW awaited id still writes", async () => {
+    h.item.preconditionUnmet = { ...STAMPED };
+    await annotate({ ticket_id: "TEAM-4126", awaitingIds: ["TEAM-4157"] });
+    expect(h.updates).toHaveLength(1);
+  });
+
+  it("a legacy row missing note/agentId is normalized ONCE, then goes quiet", async () => {
+    // Pre-4185 rows exist without the full field set; the first re-report fills
+    // them in (a real change), and the next identical one writes nothing.
+    h.item.preconditionUnmet = { awaitingIds: ["TEAM-4156"], reportedAt: STAMPED.reportedAt, source: "tool" };
+    const first = await annotate({ ticket_id: "TEAM-4126", awaitingIds: ["TEAM-4156"] });
+    expect(h.updates).toHaveLength(1);
+    expect(first.unchanged).toBeUndefined();
+
+    h.item.preconditionUnmet = first.preconditionUnmet;
+    await annotate({ ticket_id: "TEAM-4126", awaitingIds: ["TEAM-4156"] });
+    expect(h.updates).toHaveLength(1); // still just the first write
   });
 });
