@@ -402,6 +402,17 @@ export default defineConfig({
       // off (enforce PUSHES A COMMIT) while UNSET/empty now arms enforce. The
       // behavioural half lives in replay-yteqfl-sync-main.test.mjs.
       "lambda/orchestrator/sync-main-effective-flag.test.mjs",
+      // TEAM-4190 (ship-review r1 F2) — EVENT_DEDUPE_MODE's EFFECTIVE value. Same
+      // class of bug as sync-main-effective-flag.test.mjs, one surface over: TEAM-4167
+      // D3 (FR-3.4) flipped the code default to enforce in all three writers and in
+      // deploy.sh, but template.yaml's EventDedupeMode parameter Default was never
+      // updated (still "off"), so a `sam deploy` relying on the template default
+      // silently re-armed the events-table twin write. .env.example also disagreed
+      // (commented line, "(default off)" header, wrong garbage-value prose). Pins one
+      // EXPECTED_DEFAULT across template.yaml / deploy.sh / .env.example / all three
+      // code consumers, plus a per-function check that nothing overrides the Globals
+      // var on any one writer.
+      "lambda/orchestrator/event-dedupe-effective-flag.test.mjs",
       // f50ucz replay (TEAM-4166 D1/D2 acceptance) — the real ship re-wake stall,
       // replayed through the REAL awaited-ids + cascade + reconcile-sweep wired as
       // index.mjs wires them. ship-rewake: TEAM-4126's awaited ship/CI fixes become

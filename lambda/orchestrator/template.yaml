@@ -157,20 +157,25 @@ Parameters:
 
   EventDedupeMode:
     Type: String
-    Default: "off"
+    Default: "enforce"
     AllowedValues: ["off", "enforce"]
     Description: >
-      Events-table double-write collapse (TEAM-4120 FR-2). Every event is stored
-      TWICE today — once by the publisher's direct Put, once by the events-writer
-      fan-out of the same EventBridge event, under two different eventIds. off =
-      byte-identical to pre-4120 (random / base36 eventIds; consumers keep
-      deduping by content); enforce = every writer derives the eventId from the
-      event's CONTENT, so the fan-out Put lands on the same (workflowId, eventId)
-      and overwrites the direct copy — one row per event. Default "off" matches
-      the code's unset default, and deploy.sh only forwards EVENT_DEDUPE_MODE
-      when explicitly set, so a fresh deploy is byte-identical. Instant rollback
-      = set off. There is deliberately no "shadow": nothing is observable
-      without changing the write.
+      Events-table double-write collapse (TEAM-4120 FR-2). Every event would
+      otherwise be stored TWICE — once by the publisher's direct Put, once by the
+      events-writer fan-out of the same EventBridge event, under two different
+      eventIds. off = byte-identical to pre-4120 (random / base36 eventIds;
+      consumers keep deduping by content); enforce = every writer derives the
+      eventId from the event's CONTENT, so the fan-out Put lands on the same
+      (workflowId, eventId) and overwrites the direct copy — one row per event.
+      Default "enforce" as of TEAM-4167 D3 (FR-3.4), matching the code's unset
+      default in all three writers and deploy.sh's
+      EVENT_DEDUPE_MODE=${EVENT_DEDUPE_MODE:-enforce}: leaving the twin write
+      live silently double-counts every consumer that reads events-table row
+      counts. This parameter rides Globals, so one value reaches all three
+      writers — which is required, because a single writer left in off keeps
+      writing its own second row. Instant rollback = set off (already-collapsed
+      rows stay; nothing to unwind). There is deliberately no "shadow": nothing
+      is observable without changing the write.
 
   GateStateGuard:
     Type: String
