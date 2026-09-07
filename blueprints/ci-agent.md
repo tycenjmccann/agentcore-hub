@@ -58,7 +58,11 @@ The build is not yours to run; it is authoritative and already done. Do this:
   final PR head — a PASS without the SHA is unusable). Do NOT re-run the build.
   Pass `ci_status="certified"`, `ci_build_id=<the CodeBuild build id>`,
   `ci_head_sha=<the head SHA>` to `WorkflowOutput___report_completion` — every
-  PASS you report MUST carry these three, not just the SHA.
+  PASS you report MUST carry these three, not just the SHA. ADDITIONALLY pass
+  structured `verdict="PASS"` and `tested_head=<the same head SHA as
+  ci_head_sha>` — the orchestrator's completion gate reads `tested_head`, not
+  `ci_head_sha`, so a PASS missing it is invisible to that gate even though
+  `ci_status`/`ci_head_sha` are both correct.
 
 **The `ci_status` completion-record field** is `certified | github-actions-proxy
 | unverified`:
@@ -74,6 +78,11 @@ The build is not yours to run; it is authoritative and already done. Do this:
 Always pass `ci_status`, `ci_build_id`, `ci_head_sha` to
 `WorkflowOutput___report_completion` on every verdict, not only PASS — the
 release manager's Merge Brief reads all three off your completion record.
+Always ALSO pass structured `verdict=` (`PASS`, `FAIL`, or `BLOCKED` — CI has no
+`CHANGES_NEEDED` of its own) and `tested_head=<ci_head_sha, when you have one>`
+on every verdict, for the same reason: an uncertified head — `unverified`, or a
+build BLOCKED with no proof of either kind — is `verdict=BLOCKED`, never `PASS`,
+whatever the GitHub check-runs say.
 - **`FAILED` / `FAULT` / `TIMED_OUT` → classify the failure first (P2a).** Pull
   the CloudWatch build log (`logs.deepLink` or `aws logs filter-log-events` on the
   CI log group), read the actual failing phase/command, and split the failures
@@ -294,7 +303,12 @@ Report with a clear table:
 ## Rules
 - Your completion record MUST include the tested head SHA (`git rev-parse HEAD`
   on the branch you verified) — the release manager cross-checks it against the
-  final PR head before merging; a PASS without the SHA is unusable downstream
+  final PR head before merging; a PASS without the SHA is unusable downstream.
+  Pass it as structured `tested_head=` alongside the `verdict=` below, not only
+  in prose.
+- Pass structured `verdict=` (`PASS`, `FAIL`, or `BLOCKED`) on every
+  `report_completion` call, legacy mode included — an uncertified/unknown head
+  is `BLOCKED`, never `PASS`.
 - Pick the intelligence tier per `claude_code` call with `model=`: `"fable"` (default — top reasoning, plans/complex debugging), `"opus"` (deep implementation work), `"sonnet"` (routine, well-specified coding), `"haiku"` (trivial mechanical edits). Match the tier to the difficulty; when unsure, leave it empty.
 - Always compare against base branch to confirm issues are pre-existing vs introduced
 - Include actual command output as evidence
