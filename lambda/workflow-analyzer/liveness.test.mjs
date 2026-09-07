@@ -8,6 +8,11 @@ import {
   computeStaleTickets,
   decideWatch,
   buildLivenessTickets,
+  activeTicketIds,
+  maxThresholdMs,
+  eventsWindowFloor,
+  missingSampleTicketIds,
+  livenessWindowSatisfied,
   LEGACY_EVENT_WINDOW,
   NON_SIGNIFICANT_EVENT_TYPES,
   legacySignificantEventAge,
@@ -275,6 +280,150 @@ describe("buildLivenessTickets — bucketing, fallbacks, and no-data → not act
   });
 });
 
+describe("TEAM-4186 F7 — the bounded event window cannot starve a sibling into a false stale", () => {
+  const now = 10_000 * MIN;
+  const iso = (ms) => new Date(ms).toISOString();
+  const DEV = { phaseOf: () => "development" }; // devMs = 45 min
+  const tasks = (startedAtMs) => ({
+    "T-dev": { agentId: "agentcore_hub_backend_dev", ticketId: "T-dev", status: "running", startedAt: iso(startedAtMs) },
+  });
+  /** The window holds ONLY a chatty sibling's rows — T-dev is starved. */
+  const siblingOnly = (fromMs, n = 3) =>
+    Array.from({ length: n }, (_, i) => ({
+      type: "agent.streaming",
+      timestamp: iso(fromMs - i * 2_000),
+      detail: { ticketId: "T-loud" },
+    }));
+
+  describe("window helpers — the READ and the DECISION agree on what is active", () => {
+    it("activeTicketIds matches the tickets buildLivenessTickets keeps", () => {
+      const agentTasks = {
+        A: { agentId: "a", status: "running", startedAt: iso(now - MIN) },
+        B: { agentId: "b", status: "in_progress", startedAt: iso(now - MIN) },
+        C: { agentId: "c", status: "done", startedAt: iso(now - MIN) },
+        D: { agentId: "d", status: "in_review", startedAt: iso(now - MIN) },
+      };
+      expect(activeTicketIds({ agentTasks }).sort()).toEqual(["A", "B"]);
+      expect(buildLivenessTickets({ agentTasks, events: [], nowMs: now }).map((t) => t.ticketId).sort())
+        .toEqual(activeTicketIds({ agentTasks }).sort());
+      // a live lease is active on either side
+      const live = { agentTasks, isLeaseLive: (t) => t?.agentId === "d" };
+      expect(activeTicketIds(live).sort()).toEqual(["A", "B", "D"]);
+      expect(buildLivenessTickets({ ...live, events: [], nowMs: now }).map((t) => t.ticketId).sort())
+        .toEqual(activeTicketIds(live).sort());
+      expect(activeTicketIds()).toEqual([]);
+    });
+
+    it("maxThresholdMs is the largest PHASE threshold and ignores spanFreshMs", () => {
+      expect(maxThresholdMs(DEFAULT_THRESHOLDS)).toBe(45 * MIN); // dev dominates
+      expect(maxThresholdMs({ devMs: 1, verifyMs: 2, shipMs: 3, defaultMs: 9, spanFreshMs: 999 })).toBe(9);
+      expect(maxThresholdMs({})).toBe(0);
+    });
+
+    it("eventsWindowFloor is the OLDEST parseable row (null when there are none)", () => {
+      const evs = [{ timestamp: iso(now - MIN) }, { ts: now - 30 * MIN }, { timestamp: "nonsense" }];
+      expect(eventsWindowFloor(evs)).toBe(now - 30 * MIN);
+      expect(eventsWindowFloor([])).toBeNull();
+      expect(eventsWindowFloor(undefined)).toBeNull();
+      expect(eventsWindowFloor([{ type: "x" }])).toBeNull();
+    });
+
+    it("missingSampleTicketIds names only the starved tickets", () => {
+      const events = [...siblingOnly(now - 1_000), { type: "tool_end", timestamp: iso(now - MIN), detail: { ticketId: "T-dev" } }];
+      expect(missingSampleTicketIds({ activeTicketIds: ["T-dev", "T-loud", "T-quiet"], events })).toEqual(["T-quiet"]);
+      expect(missingSampleTicketIds({ activeTicketIds: [], events })).toEqual([]);
+      expect(missingSampleTicketIds({ activeTicketIds: ["T-dev"], events: [] })).toEqual(["T-dev"]);
+    });
+
+    it("livenessWindowSatisfied — keep paging while a ticket is starved and the floor is recent", () => {
+      const events = siblingOnly(now - 1_000); // floor ~ now, T-dev has nothing
+      expect(livenessWindowSatisfied({
+        activeTicketIds: ["T-dev", "T-loud"], events, nowMs: now, maxThresholdMs: 45 * MIN,
+      })).toBe(false);
+    });
+
+    it("livenessWindowSatisfied — stop once every active ticket has a sample", () => {
+      const events = [...siblingOnly(now - 1_000), { type: "tool_end", timestamp: iso(now - MIN), detail: { ticketId: "T-dev" } }];
+      expect(livenessWindowSatisfied({
+        activeTicketIds: ["T-dev", "T-loud"], events, nowMs: now, maxThresholdMs: 45 * MIN,
+      })).toBe(true);
+    });
+
+    it("livenessWindowSatisfied — stop when the floor is already older than the max threshold (a starved ticket is decided)", () => {
+      const events = siblingOnly(now - 46 * MIN); // floor > 45 min back
+      expect(livenessWindowSatisfied({
+        activeTicketIds: ["T-dev", "T-loud"], events, nowMs: now, maxThresholdMs: 45 * MIN,
+      })).toBe(true);
+      // exactly AT the horizon is not yet past it — keep reading
+      expect(livenessWindowSatisfied({
+        activeTicketIds: ["T-dev"], events: [{ timestamp: iso(now - 45 * MIN), detail: { ticketId: "T-loud" } }],
+        nowMs: now, maxThresholdMs: 45 * MIN,
+      })).toBe(false);
+      // an EMPTY window decides nothing
+      expect(livenessWindowSatisfied({ activeTicketIds: ["T-dev"], events: [], nowMs: now, maxThresholdMs: 45 * MIN })).toBe(false);
+    });
+  });
+
+  describe("windowFloorAt — truncation is SOUND, not merely bounded", () => {
+    it("a no-sample ticket under a truncated window is anchored at the window floor, not startedAt", () => {
+      const floor = now - 40_000;            // the oldest row the cap let us read
+      const agentTasks = tasks(now - 3 * 60 * MIN); // claimed 3 hours ago
+      const events = siblingOnly(now - 1_000);
+      const [t] = buildLivenessTickets({ agentTasks, events, nowMs: now, windowFloorMs: floor, ...DEV });
+      expect(t.lastStreamAt).toBeNull();
+      expect(t.lastEventAt).toBeNull();
+      expect(t.windowFloorAt).toBe(floor);
+      expect(computeSilenceMs(t, now)).toBe(40_000);             // NOT 3 hours
+      expect(computeStaleTickets([t], now, DEFAULT_THRESHOLDS)).toEqual([]); // NOT stale
+      expect(decideWatch({}, [t], now, "enforce", DEFAULT_THRESHOLDS).fire).toBe(false);
+
+      // Load-bearing: without the floor this is exactly the F7 false positive.
+      const [starved] = buildLivenessTickets({ agentTasks, events, nowMs: now, ...DEV });
+      expect(starved.windowFloorAt).toBeNull();
+      expect(computeSilenceMs(starved, now)).toBe(3 * 60 * MIN);
+      expect(decideWatch({}, [starved], now, "enforce", DEFAULT_THRESHOLDS).fire).toBe(true);
+    });
+
+    it("…and IS stale once the floor itself is older than the threshold", () => {
+      const floor = now - 50 * MIN;          // even the lower bound crosses devMs (45m)
+      const [t] = buildLivenessTickets({
+        agentTasks: tasks(now - 3 * 60 * MIN), events: siblingOnly(now - 1_000),
+        nowMs: now, windowFloorMs: floor, ...DEV,
+      });
+      const [stale] = computeStaleTickets([t], now, DEFAULT_THRESHOLDS);
+      expect(stale.ticketId).toBe("T-dev");
+      expect(stale.staleAgeMs).toBe(now - floor);
+      expect(stale.staleAgeMs).toBe(50 * MIN);
+      expect(stale.thresholdMs).toBe(45 * MIN);
+      // spanFresh cannot engage on a floor-anchored ticket: lastStreamAt is
+      // UNKNOWN, not proven absent.
+      const [v] = decideWatch({}, [t], now, "enforce", DEFAULT_THRESHOLDS).verdicts;
+      expect(v.spanFresh).toBe(false);
+      expect(v.stale).toBe(true);
+    });
+
+    it("a ticket WITH a sample ignores windowFloorAt", () => {
+      const agentTasks = tasks(now - 3 * 60 * MIN);
+      const events = [{ type: "tool_end", timestamp: iso(now - 2 * MIN), detail: { ticketId: "T-dev" } }];
+      const [t] = buildLivenessTickets({ agentTasks, events, nowMs: now, windowFloorMs: now - 50 * MIN, ...DEV });
+      expect(t.lastEventAt).toBe(now - 2 * MIN);
+      expect(t.windowFloorAt).toBeNull();       // newest event known exactly
+      expect(computeSilenceMs(t, now)).toBe(2 * MIN);
+      expect(computeStaleTickets([t], now, DEFAULT_THRESHOLDS)).toEqual([]);
+    });
+
+    it("drops a no-sample ticket only when startedAt AND windowFloorAt are both absent", () => {
+      const agentTasks = { "T-x": { agentId: "a", ticketId: "T-x", status: "running" } }; // no startedAt
+      expect(buildLivenessTickets({ agentTasks, events: [], nowMs: now })).toEqual([]);
+      const [t] = buildLivenessTickets({ agentTasks, events: [], nowMs: now, windowFloorMs: now - MIN });
+      expect(t.windowFloorAt).toBe(now - MIN);  // still a candidate on the floor alone
+      expect(computeSilenceMs(t, now)).toBe(MIN);
+      // an unparseable floor is no floor at all
+      expect(buildLivenessTickets({ agentTasks, events: [], nowMs: now, windowFloorMs: "nonsense" })).toEqual([]);
+    });
+  });
+});
+
 describe("decideWatch — fires on the WORST (longest-silent) stale ticket", () => {
   const now = 10_000 * MIN;
   it("picks the most-stalled ticket and reports its phase", () => {
@@ -319,19 +468,32 @@ describe("phaseForAgent — role → liveness phase", () => {
 describe("emitLivenessMetrics — one EMF record with explicit zeros", () => {
   let spy;
   afterEach(() => spy?.mockRestore());
-  it("emits the namespace, mode field, and four zeroed metrics", () => {
+  it("emits the namespace, mode field, and six zeroed metrics", () => {
     spy = vi.spyOn(console, "log").mockImplementation(() => {});
     emitLivenessMetrics({ mode: "shadow" });
     expect(spy).toHaveBeenCalledTimes(1);
     const rec = JSON.parse(spy.mock.calls[0][0]);
     expect(rec._aws.CloudWatchMetrics[0].Namespace).toBe("AgentCoreHub/Orchestrator");
     const names = rec._aws.CloudWatchMetrics[0].Metrics.map((m) => m.Name).sort();
-    expect(names).toEqual(["LivenessShadowDivergence", "LivenessSpanFreshSkips", "LivenessStaleTickets", "LivenessWatchFired"]);
+    expect(names).toEqual([
+      "LivenessShadowDivergence", "LivenessSpanFreshSkips", "LivenessStaleTickets",
+      "LivenessWatchFired", "LivenessWindowPages", "LivenessWindowTruncated",
+    ]);
     expect(rec.LivenessMode).toBe("shadow");
     expect(rec.LivenessStaleTickets).toBe(0);
     expect(rec.LivenessWatchFired).toBe(0);
     expect(rec.LivenessSpanFreshSkips).toBe(0);
     expect(rec.LivenessShadowDivergence).toBe(0);
+    expect(rec.LivenessWindowPages).toBe(0);      // TEAM-4186 F7
+    expect(rec.LivenessWindowTruncated).toBe(0);
+  });
+
+  it("carries the window counters through when the read had to page", () => {
+    spy = vi.spyOn(console, "log").mockImplementation(() => {});
+    emitLivenessMetrics({ mode: "enforce", windowPages: 7, windowTruncated: 2 });
+    const rec = JSON.parse(spy.mock.calls[0][0]);
+    expect(rec.LivenessWindowPages).toBe(7);
+    expect(rec.LivenessWindowTruncated).toBe(2);
   });
 });
 

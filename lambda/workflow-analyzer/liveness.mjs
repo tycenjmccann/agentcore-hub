@@ -143,12 +143,28 @@ function newest(...vals) {
 
 /**
  * ms of silence for one liveness ticket: now minus its newest signal of ANY
- * kind (stream, span, event, or the claim's startedAt fallback). Returns null
- * when the ticket carries no timestamp at all — the caller treats that as "no
- * evidence → not stale" (fail toward not firing).
+ * kind (stream, span, event, the window floor, or the claim's startedAt
+ * fallback). Returns null when the ticket carries no timestamp at all — the
+ * caller treats that as "no evidence → not stale" (fail toward not firing).
+ *
+ * TEAM-4186 F7 — why `windowFloorAt` belongs in the anchor. The event window is
+ * a bounded read (index.mjs recentEventsPaged, hard cap MAX_EVENT_PAGES), so a
+ * ticket can legitimately have NO row in it: one sibling streaming for 15
+ * minutes emits thousands of agent.streaming rows and can push every other
+ * ticket's newest row past the cap. Without a floor such a ticket falls back to
+ * startedAt (hours old) and is declared stale purely because it was starved of
+ * evidence — a false positive that, in enforce, interrupts a working agent.
+ *
+ * The floor makes truncation SOUND rather than merely bounded. For a ticket with
+ * no row in the window, its newest event is provably OLDER than the oldest row
+ * read, so `now − windowFloor` is a LOWER BOUND on its true silence. Anchoring
+ * at the floor means stale fires only when even that lower bound crosses the
+ * threshold: never a false stale from starvation, at worst a delayed detection
+ * (and each later scan reads a fresher window). spanFresh correctly cannot
+ * engage on such a ticket — lastStreamAt is unknown, not proven absent.
  */
 export function computeSilenceMs(t, nowMs) {
-  const anchor = newest(t?.lastStreamAt, t?.lastSpanAt, t?.lastEventAt, t?.startedAt);
+  const anchor = newest(t?.lastStreamAt, t?.lastSpanAt, t?.lastEventAt, t?.windowFloorAt, t?.startedAt);
   if (anchor == null) return null;
   return nowMs - anchor;
 }
@@ -234,24 +250,95 @@ export function decideWatch(workflow, tickets, nowMs, mode, thresholds) {
 }
 
 /**
+ * The ticket ids this workflow considers ACTIVE — status running/in_progress, or
+ * a live lease per the injected isLeaseLive.
+ *
+ * TEAM-4186 F7 — extracted so the READ (how deep to page the event window) and
+ * the DECISION (buildLivenessTickets) cannot drift on what "active" means: the
+ * paging loop stops once every active ticket has a sample, which is only sound
+ * if it is asking about exactly the tickets the clock will later judge.
+ */
+export function activeTicketIds({ agentTasks, isLeaseLive } = {}) {
+  return Object.entries(agentTasks || {})
+    .filter(([, task]) => ACTIVE_STATUSES.has(task?.status) || !!isLeaseLive?.(task))
+    .map(([tid]) => tid);
+}
+
+/**
+ * The largest PHASE threshold (ms) — the deepest any verdict can look back.
+ * spanFreshMs is deliberately excluded: it is not a staleness threshold but the
+ * proof-of-life override, and it is the smallest of the five.
+ */
+export function maxThresholdMs(thresholds) {
+  return Math.max(
+    thresholds?.devMs || 0,
+    thresholds?.verifyMs || 0,
+    thresholds?.shipMs || 0,
+    thresholds?.defaultMs || 0
+  );
+}
+
+/** Oldest (min) parseable event timestamp in the window, or null if it has none. */
+export function eventsWindowFloor(events) {
+  let floor = null;
+  for (const e of Array.isArray(events) ? events : []) {
+    const ts = toMs(e?.timestamp ?? e?.ts);
+    if (ts != null && (floor == null || ts < floor)) floor = ts;
+  }
+  return floor;
+}
+
+/** The active ticket ids with NO row of their own in `events` (starved). */
+export function missingSampleTicketIds({ activeTicketIds: ids, events }) {
+  const seen = new Set();
+  for (const e of Array.isArray(events) ? events : []) {
+    const tid = e?.detail?.ticketId;
+    if (tid != null && toMs(e.timestamp ?? e.ts) != null) seen.add(tid);
+  }
+  return (ids || []).filter((tid) => !seen.has(tid));
+}
+
+/**
+ * TEAM-4186 F7 — may the paging loop stop? True when the window already decides
+ * every active ticket, i.e. either
+ *   (a) every active id has at least one row of its own in it, or
+ *   (b) the OLDEST row read is already older than now − maxThresholdMs.
+ * (b) is sound because a starved ticket's newest event is provably older than
+ * that floor, so its silence already exceeds every phase threshold — a deeper
+ * read can only make it older, and spanFresh cannot engage that far back
+ * (spanFreshMs is the smallest threshold). This is the EFFICIENCY stop; the
+ * windowFloorAt anchor (see computeSilenceMs) is what makes the hard page cap
+ * safe when this never becomes true.
+ */
+export function livenessWindowSatisfied({ activeTicketIds: ids, events, nowMs, maxThresholdMs: maxMs }) {
+  if (!missingSampleTicketIds({ activeTicketIds: ids, events }).length) return true;
+  const floor = eventsWindowFloor(events);
+  return floor != null && Number.isFinite(nowMs) && Number.isFinite(maxMs) && nowMs - floor > maxMs;
+}
+
+/**
  * Bucket a workflow's agentTasks + raw events into per-ticket liveness records
  * — the pure input to computeStaleTickets/decideWatch. Only ACTIVE tickets are
- * candidates (status running/in_progress, or a live lease per the injected
- * isLeaseLive). Per ticket:
- *   lastStreamAt — newest agent.streaming event ts for this ticket
- *   lastEventAt  — newest event of ANY type for this ticket
- *   lastSpanAt   — = lastStreamAt (Q1 proxy: no separate span source yet)
- *   startedAt    — the claim's startedAt (fallback anchor)
- * A ticket with NO timestamp at all is dropped (fail toward not firing). Event
+ * candidates (see activeTicketIds). Per ticket:
+ *   lastStreamAt  — newest agent.streaming event ts for this ticket
+ *   lastEventAt   — newest event of ANY type for this ticket
+ *   lastSpanAt    — = lastStreamAt (Q1 proxy: no separate span source yet)
+ *   windowFloorAt — TEAM-4186 F7: for a ticket with NO row in the window, the
+ *                   oldest row READ (the caller's windowFloorMs) — a sound lower
+ *                   bound on its silence. null when the ticket HAS a sample: its
+ *                   newest event is then known exactly, so no bound is needed.
+ *   startedAt     — the claim's startedAt (last-resort anchor)
+ * A ticket with NO timestamp at all — none of lastStreamAt/lastEventAt/
+ * windowFloorAt/startedAt — is dropped (fail toward not firing). Event
  * timestamps accept ISO or epoch-ms; phase comes from the injected phaseOf.
  */
-export function buildLivenessTickets({ agentTasks, events, nowMs, phaseOf, isLeaseLive }) {
+export function buildLivenessTickets({ agentTasks, events, nowMs, phaseOf, isLeaseLive, windowFloorMs }) {
   const evs = Array.isArray(events) ? events : [];
+  const floorMs = toMs(windowFloorMs);
   const out = [];
 
-  for (const [tid, task] of Object.entries(agentTasks || {})) {
-    const active = ACTIVE_STATUSES.has(task?.status) || !!isLeaseLive?.(task);
-    if (!active) continue;
+  for (const tid of activeTicketIds({ agentTasks, isLeaseLive })) {
+    const task = agentTasks[tid];
 
     let lastStreamAt = null;
     let lastEventAt = null;
@@ -267,8 +354,11 @@ export function buildLivenessTickets({ agentTasks, events, nowMs, phaseOf, isLea
 
     const startedAt = toMs(task?.startedAt);
     const lastSpanAt = lastStreamAt; // Q1 proxy
+    // Only a STARVED ticket gets the floor: with a sample of its own, its newest
+    // event is known exactly and a lower bound would be strictly worse.
+    const windowFloorAt = lastStreamAt == null && lastEventAt == null ? floorMs : null;
 
-    if (lastStreamAt == null && lastEventAt == null && startedAt == null) continue;
+    if (lastStreamAt == null && lastEventAt == null && windowFloorAt == null && startedAt == null) continue;
 
     const phase = phaseOf?.(tid, task) ?? "default";
     out.push({
@@ -279,6 +369,7 @@ export function buildLivenessTickets({ agentTasks, events, nowMs, phaseOf, isLea
       lastStreamAt,
       lastEventAt,
       lastSpanAt,
+      windowFloorAt,
       startedAt,
     });
   }
@@ -352,6 +443,10 @@ export function emitLivenessMetrics(m) {
               { Name: "LivenessWatchFired", Unit: "Count" },
               { Name: "LivenessSpanFreshSkips", Unit: "Count" },
               { Name: "LivenessShadowDivergence", Unit: "Count" },
+              // TEAM-4186 F7 — how deep the event window had to go, and how often
+              // the hard page cap cut it short (the windowFloorAt-anchored path).
+              { Name: "LivenessWindowPages", Unit: "Count" },
+              { Name: "LivenessWindowTruncated", Unit: "Count" },
             ],
           },
         ],
@@ -361,6 +456,8 @@ export function emitLivenessMetrics(m) {
       LivenessWatchFired: m?.watchFired || 0,
       LivenessSpanFreshSkips: m?.spanFreshSkips || 0,
       LivenessShadowDivergence: m?.shadowDivergence || 0,
+      LivenessWindowPages: m?.windowPages || 0,
+      LivenessWindowTruncated: m?.windowTruncated || 0,
     })
   );
 }
