@@ -392,6 +392,16 @@ export default defineConfig({
       // the ship review's change set enumerates its own PR's files only — so an
       // advisory branch's files cannot enter the reviewed diff.
       "lambda/orchestrator/advisory-routing.test.mjs",
+      // TEAM-4188 (TEAM-4169 D1 FR-1.6) — SYNC_MAIN_BEFORE_CI's EFFECTIVE value, the
+      // assertion FR-1.6 asked for and nothing made. All four surfaces used to resolve
+      // to off (template Default, deploy.sh's forward-only-when-exported, a commented
+      // .env.example line, normalizeSyncMode(undefined)), so the pre-CI main sync was
+      // dark on every install while ci-agent.md promised it had already happened. Pins
+      // the one default across template.yaml / deploy.sh / .env.example / the resolver,
+      // and the deliberate split that keeps a PRESENT-but-garbage value failing safe to
+      // off (enforce PUSHES A COMMIT) while UNSET/empty now arms enforce. The
+      // behavioural half lives in replay-yteqfl-sync-main.test.mjs.
+      "lambda/orchestrator/sync-main-effective-flag.test.mjs",
       // f50ucz replay (TEAM-4166 D1/D2 acceptance) — the real ship re-wake stall,
       // replayed through the REAL awaited-ids + cascade + reconcile-sweep wired as
       // index.mjs wires them. ship-rewake: TEAM-4126's awaited ship/CI fixes become

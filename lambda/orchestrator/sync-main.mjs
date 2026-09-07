@@ -69,6 +69,33 @@ export function normalizeSyncMode(v) {
   return MODES.includes(s) ? s : "off";
 }
 
+/**
+ * The DEPLOYED default (TEAM-4188, from TEAM-4169 D1 FR-1.6). Kept here, next to
+ * the allow-list, so template.yaml / deploy.sh / .env.example / the code have one
+ * reviewable source of truth — sync-main-effective-flag.test.mjs asserts all four
+ * agree.
+ */
+export const DEFAULT_SYNC_MODE = "enforce";
+
+/**
+ * Resolve the effective mode from the environment. Deliberately NOT a defaultMode
+ * parameter on normalizeSyncMode (the event-id.mjs shape): there, garbage falls
+ * back to the default — here that would let a typo'd value start pushing merge
+ * commits. The two cases are opposite by design:
+ *   ABSENT or EMPTY  → DEFAULT_SYNC_MODE (enforce). Nobody chose off, and the
+ *                      whole point of FR-1.6 is that the flag is the guarantee.
+ *                      Empty counts as unset to match deploy.sh's
+ *                      `${SYNC_MAIN_BEFORE_CI:-enforce}` — `:-` substitutes for
+ *                      unset AND empty, so both halves of one install agree.
+ *   PRESENT          → normalizeSyncMode, unchanged: garbage → off, because
+ *                      enforce PUSHES A COMMIT to a shared branch.
+ */
+export function resolveSyncModeFromEnv(env = process.env) {
+  const raw = env?.SYNC_MAIN_BEFORE_CI;
+  if (raw === undefined || raw === null || String(raw).trim() === "") return DEFAULT_SYNC_MODE;
+  return normalizeSyncMode(raw);
+}
+
 // A git ref we are willing to interpolate into a URL path. Deliberately narrower
 // than git's own rules: no `%` (double-encoding), no `?`/`#` (query/fragment
 // injection), no whitespace, and `..` is rejected separately (path traversal AND
