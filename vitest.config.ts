@@ -417,6 +417,17 @@ export default defineConfig({
       // reviewer/QA/CI dispatches on the fixture's real board, and that under shadow
       // the yield note lands in the prompt each persona is actually dispatched with.
       "lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs",
+      // replay-iczquj-sweep-full-chain (TEAM-4247 D2 regression) — the other half of
+      // the same argument, and the one that would actually hurt: a sweep of the same
+      // repo that DID find eight dead things and shipped them through review, QA, CI,
+      // a human Merge Approval and CD. c2uqki proves the detection gate fires; this
+      // proves it is inert everywhere else, on a real board rather than a predicate's
+      // idea of one. It is the f50ucz argument for D2: a gate that perturbed a
+      // productive sweep's cascade, its ship window or its completion would be worse
+      // than the hole it closes. Also pins the amendment-1 wedge — under `enforce` the
+      // sweep def requires BOTH `detection` and `development`, so a run with one
+      // sweeper ticket can never complete, which is why commit 4's intake plans two.
+      "lambda/orchestrator/replay-iczquj-sweep-full-chain.test.mjs",
     ],
     // Keep unit tests away from the Playwright specs under tests/.
     exclude: ["tests/**", "node_modules/**", "demo/**"],
