@@ -115,6 +115,28 @@ export interface WorkflowMetrics {
   };
   /** How many human reviews were requested outside business hours (FR-10). */
   humanReviewsOutsideHours?: number;
+  /**
+   * TEAM-4246 D1 FR-D1.11 — gate accounting from the verdict each gate persona
+   * stated, with the same three names cost-report puts on the performance card's
+   * `quality` block. `firstPassYield` is 1 when every gate PASSed on its first
+   * look, 0 when any did not, and null when no gate stated anything readable
+   * ("nothing stated" is not "failed"). Optional: absent from every metrics.json
+   * written before D1.
+   */
+  quality?: {
+    reworkRounds: number;
+    gateRounds: number;
+    firstPassYield: number | null;
+    verdicts: Array<{
+      ticketId: string | null;
+      agentId: string;
+      verdict: "PASS" | "CHANGES_NEEDED" | "FAIL" | "BLOCKED";
+      /** "declared" = the agent passed verdict= on report_completion; "inferred" =
+       * read out of the summary prose by the toolkit's retro ladder. */
+      verdictSource: "declared" | "inferred";
+      at: string | null;
+    }>;
+  };
   nudgeCount: number;
   managerInterventions: ManagerIntervention[];
   errors: Array<{ agentId: string | null; error: string; at: string }>;

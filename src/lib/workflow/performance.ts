@@ -35,6 +35,20 @@ export interface CardSummary {
     tasks: number; reworkRounds: number; changeRequests: number; fixTickets: number;
     loops: number; nudges: number; errors: number; gateRounds: number;
     firstPassYield: number | null; humanGates: number;
+    /**
+     * TEAM-4246 D1 FR-D1.11 — which definition produced `reworkRounds`,
+     * `gateRounds` and `firstPassYield` on this card:
+     *   "verdict-events"      the run's gate personas stated verdicts (the real
+     *                         signal): rework = review/QA non-PASS verdicts,
+     *                         gateRounds = every gate completion, yield = 1 iff
+     *                         every gate PASSed on its first look;
+     *   "reviewGateHistory"   pre-D1 run with no verdict anywhere — rework and
+     *                         yield are task-derived (re-invocation counts) and
+     *                         gateRounds counts human review REQUESTS.
+     * Optional because cards written before this field exist; absent reads as
+     * the legacy definition.
+     */
+    gateMetricSource?: "verdict-events" | "reviewGateHistory" | null;
   };
   agents: Record<string, { usd: number; workMs: number; tasks: number; reworkRounds: number }>;
   status: BandStatus;
@@ -90,11 +104,18 @@ export const FLEET_KPIS: KpiDef[] = [
   { key: "time.agentWork", label: "Agent work", unit: "ms", group: "time", floor: 900_000, help: "Sum of agent task durations (agents actually working)" },
   { key: "time.humanWait", label: "Human wait", unit: "ms", group: "time", floor: 900_000, help: "Union of open review-gate intervals" },
   { key: "quality.tasks", label: "Agent tasks", unit: "count", group: "quality", floor: 1, help: "Tickets worked by agents (fewer = tighter pipeline)" },
-  { key: "quality.reworkRounds", label: "Rework rounds", unit: "count", group: "quality", floor: 1, help: "Re-invocations of a ticket after its first run" },
+  // TEAM-4246 D1 FR-D1.11 — verdict-derived on runs whose gate personas stated a
+  // verdict (`quality.gateMetricSource === "verdict-events"`), task-derived on
+  // pre-D1 runs. Both are "times the run had to go back", so they share a band;
+  // the card's own gateMetricSource says which one a given point is.
+  { key: "quality.reworkRounds", label: "Rework rounds", unit: "count", group: "quality", floor: 1, help: "Review/QA non-PASS verdicts — or, on pre-verdict runs, re-invocations of a ticket after its first run" },
   { key: "quality.loops", label: "Loops", unit: "count", group: "quality", floor: 1, help: "Change requests + fix tickets — times the pipeline went back" },
   { key: "quality.nudges", label: "Nudges", unit: "count", group: "quality", floor: 1, help: "Workflow Manager had to push a stalled run" },
   { key: "quality.errors", label: "Errors", unit: "count", group: "quality", floor: 1, help: "agent.error events" },
-  { key: "quality.firstPassYield", label: "First-pass yield", unit: "ratio", group: "quality", floor: 0.1, direction: "lower", help: "Share of agent tasks that needed no rework (higher is better)" },
+  // Verdict-derived this is BINARY (1 = every gate PASSed on its first look), not
+  // a share — deliberately, because "3 of 4 gates passed" is not 75% of a shipped
+  // run, it is a run that went back. Pre-verdict cards keep the task-share.
+  { key: "quality.firstPassYield", label: "First-pass yield", unit: "ratio", group: "quality", floor: 0.1, direction: "lower", help: "1 when every gate PASSed on its first look — or, on pre-verdict runs, the share of agent tasks that needed no rework (higher is better)" },
   { key: "cost.personaCacheHitRate", label: "Persona cache hit rate", unit: "ratio", group: "cost", floor: 0.1, direction: "lower", help: "Share of persona input tokens served from the Bedrock prompt cache (higher is better)" },
 ];
 

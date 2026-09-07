@@ -76,6 +76,46 @@ KIND_TO_FINDER_AGENT = {
 # (Same reasoning as REWORK_FIX_KINDS in fix-contract.mjs.)
 ENVIRONMENTAL_KINDS = frozenset({"ci_fix", "sync_fix"})
 INTAKE_AGENT_ID = "agentcore_hub_requirements_analyst"
+
+# ── Gate verdicts (TEAM-4246 D1 FR-D1.11) ───────────────────────────────────
+# The RETRO ladder. Kept in lockstep with lambda/orchestrator/verdict-contract.mjs
+# (GATE_PERSONAS, VERDICTS, VERDICT_LADDER, normalizeVerdict) — same reason as
+# FIX_KINDS above: different language, and the toolkit ships to a container with
+# no lambda/ dir.
+#
+# This is the ONE place a verdict is read out of prose retroactively. The
+# orchestrator writes `detail.verdict` on every gate completion from D1 onward and
+# cost-report reads only that field; but every dossier collected BEFORE D1 — both
+# vendored fixtures included — carries verdicts nowhere except the completion
+# summary an agent typed. Scoring those runs offline is this toolkit's job, so the
+# ladder lives here and nowhere else on this side.
+#
+# The two implementations are kept honest by asserting the SAME fixture verdicts:
+# test_metrics.py::GateVerdicts and verdict-contract.test.mjs both pin dowtdh
+# TEAM-4180 → CHANGES_NEEDED, TEAM-4181 → FAIL, TEAM-4182 → PASS off the same
+# three literal summaries. If they ever drift, only retro numbers are wrong — a
+# gate DECISION never reads this file.
+GATE_PERSONAS = (
+    "agentcore_hub_code_reviewer",
+    "agentcore_hub_qa_verifier",
+    "agentcore_hub_ci_agent",
+    "agentcore_hub_release_manager",
+)
+VERDICTS = ("PASS", "CHANGES_NEEDED", "FAIL", "BLOCKED")
+# Whose non-PASS verdict sent dev work back. Mirrors cost-report's REWORK_PERSONAS
+# / REWORK_VERDICTS: a red CI or a ship-review round is a gate ROUND, not rework.
+REWORK_PERSONAS = ("agentcore_hub_code_reviewer", "agentcore_hub_qa_verifier")
+REWORK_VERDICTS = ("CHANGES_NEEDED", "FAIL")
+# PARITY: VERDICT_ALT + VERDICT_LADDER in verdict-contract.mjs, in that order —
+# a labelled "VERDICT: X" / "CI verdict: X" line first, then the release manager's
+# unlabelled "Ship review round 2 — PASS on head `…`" heading. There is
+# deliberately no rung matching a bare PASS/FAIL: these summaries are full of
+# "npm test 57/57" and "GH Actions green", and a wrong verdict is worse than none.
+_VERDICT_ALT = r"(PASS|FAIL|BLOCKED|CHANGES[\s_-]*NEEDED)"
+VERDICT_LADDER = (
+    re.compile(r"verdict\s*:\s*\*{0,2}\s*" + _VERDICT_ALT + r"\b", re.I),
+    re.compile(r"round\s*\d+\s*[—–-]+\s*\*{0,2}\s*" + _VERDICT_ALT + r"\b", re.I),
+)
 REGRESSION_MARKER = "REGRESSION-OF-FIX"
 # Similarity floor for the PRE-CONTRACT fallback only (two fix titles about the
 # same thing). Deliberately high: a false "resurfacing" accuses an agent of not
@@ -346,6 +386,110 @@ def compute_change_requests(events):
             "reworkDurationMs": ms_between(rejected_at, rework_end),
         })
     return {"count": len(cycles), "cycles": cycles}
+
+
+def normalize_verdict(raw):
+    """One of VERDICTS, or None.
+
+    PARITY: verdict-contract.mjs normalizeVerdict — accepts all three spellings the
+    repo contains ("CHANGES NEEDED" in blueprint prose, "CHANGES-NEEDED" as
+    persisted in reviewGateHistory rounds, CHANGES_NEEDED on the wire), and reads
+    "PASS-with-known-findings" as PASS (it is review-cap's own spelling of a
+    passing round; None would report a reviewer who passed as having said nothing).
+    """
+    if not isinstance(raw, str):
+        return None
+    norm = re.sub(r"[\s-]+", "_", raw.strip().upper())
+    if norm.startswith("PASS"):
+        return "PASS"
+    if norm == "CHANGES_NEEDED":
+        return "CHANGES_NEEDED"
+    if norm in ("FAIL", "BLOCKED"):
+        return norm
+    return None
+
+
+def derive_verdict(summary):
+    """The verdict a completion summary states, or None. First rung wins.
+
+    PARITY: verdict-contract.mjs deriveVerdict. "request changes" is deliberately
+    NOT a rung: the labelled form is what every gate blueprint emits, and matching
+    loose prose would read a reviewer QUOTING another ticket's findings as its own
+    verdict (dowtdh TEAM-4181's summary discusses TEAM-4180's).
+    """
+    if not isinstance(summary, str) or not summary:
+        return None
+    for pattern in VERDICT_LADDER:
+        match = pattern.search(summary)
+        if not match:
+            continue
+        verdict = normalize_verdict(match.group(1))
+        if verdict:
+            return verdict
+    return None
+
+
+def compute_gate_verdicts(events, completions):
+    """Gate accounting for a run: reworkRounds / gateRounds / firstPassYield.
+
+    One row per `agent.complete` from a gate persona, in timestamp order. The
+    verdict comes from `detail.verdict` when the event carries one (D1 onward,
+    already resolved by the orchestrator) and from the retro ladder over
+    `completions[ticketId].summary` otherwise — which is every dossier collected
+    before D1, including both vendored fixtures.
+
+    The three numbers, matching lambda/cost-report/index.mjs computeGateRounds:
+      reworkRounds   review/QA completions whose verdict was CHANGES_NEEDED or FAIL
+      gateRounds     every gate completion with a readable verdict (initial + each
+                     re-verify)
+      firstPassYield 1 iff every gate persona that appeared PASSed on its FIRST
+                     completion, else 0 — None when no gate stated anything, since
+                     "no signal" is not "failed".
+
+    `verdicts` is the per-ticket detail, because the number alone does not tell a
+    reviewer WHICH gate refused (wf_1788731227559_dowtdh: the reviewer said CHANGES
+    NEEDED, QA said FAIL, CI said PASS at QA's evidence commit — three gate rounds
+    the pre-D1 metrics reported as zero).
+    """
+    completions = completions or {}
+    rows = []
+    for e in events_of(events, "agent.complete"):
+        d = detail(e)
+        agent = d.get("agentId") or d.get("assignee")
+        if agent not in GATE_PERSONAS:
+            continue
+        ticket_id = d.get("ticketId")
+        declared = normalize_verdict(d.get("verdict"))
+        if declared:
+            verdict, source = declared, "declared"
+        else:
+            record = completions.get(ticket_id) or {}
+            verdict, source = derive_verdict(record.get("summary")), "inferred"
+        if not verdict:
+            continue
+        rows.append({
+            "ticketId": ticket_id,
+            "agentId": agent,
+            "verdict": verdict,
+            "verdictSource": source,
+            "at": e.get("timestamp"),
+        })
+    rows.sort(key=lambda r: (r["at"] or "", r["ticketId"] or ""))
+
+    first_of = {}
+    for r in rows:
+        first_of.setdefault(r["agentId"], r["verdict"])
+    return {
+        "reworkRounds": sum(
+            1 for r in rows
+            if r["agentId"] in REWORK_PERSONAS and r["verdict"] in REWORK_VERDICTS
+        ),
+        "gateRounds": len(rows),
+        "firstPassYield": (
+            None if not first_of else int(all(v == "PASS" for v in first_of.values()))
+        ),
+        "verdicts": rows,
+    }
 
 
 def spawned_kind(ticket):
@@ -713,6 +857,10 @@ def compute_metrics(dossier):
         # the honest denominator for "why did this run wait 7 hours".
         "humanReviewsOutsideHours": sum(1 for r in reviews if r.get("outsideHours")),
         "changeRequests": compute_change_requests(events),
+        # TEAM-4246 D1 FR-D1.11 — the same three names cost-report puts on the
+        # performance card's `quality` block, so a dossier analysis and the card
+        # for one run can be read side by side.
+        "quality": compute_gate_verdicts(events, dossier.get("completions")),
         "fixTickets": fix_tickets,
         "nudgeCount": len(events_of(events, "workflow.nudge", "nudge")),
         "managerInterventions": interventions,
@@ -756,6 +904,12 @@ def main():
         "totalDurationMs": metrics["totalDurationMs"],
         "humanWaitTotalMs": metrics["humanWaitTotalMs"],
         "changeRequests": metrics["changeRequests"]["count"],
+        # Gate accounting first: "3 gate rounds, 2 refusals, no first-pass yield"
+        # is the headline for a run that shipped over its own failing verdicts,
+        # and changeRequests alone reports 0 for it (no HUMAN gate was rejected).
+        "gateRounds": metrics["quality"]["gateRounds"],
+        "reworkRounds": metrics["quality"]["reworkRounds"],
+        "firstPassYield": metrics["quality"]["firstPassYield"],
         "fixTickets": metrics["fixTickets"]["count"],
         # The breakdown, not just the total: "3 fix tickets, all resurfacing" is
         # a different run from "3 fix tickets, all new", and the summary line is

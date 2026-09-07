@@ -487,3 +487,62 @@ describe("verdict-contract — the agent.complete twins stay identical (TEAM-424
     }
   });
 });
+
+describe("verdict-contract — the cost-report mirror (TEAM-4246 D1 FR-D1.11)", () => {
+  /**
+   * lambda/cost-report/index.mjs computes reworkRounds / gateRounds /
+   * firstPassYield off `agent.complete.detail.verdict`, so it needs to know WHICH
+   * personas gate and WHICH strings are verdicts. It cannot import this module:
+   * its deploy.sh ships a single-file zip (`zip -q -j "$ZIP" index.mjs`), so an
+   * import would be a missing file at runtime, not a bundling detail.
+   *
+   * So it holds literal copies, and this test is the drift guard — a source grep
+   * rather than an import, because importing that Lambda here would pull its
+   * top-level AWS clients into the orchestrator's test process. Same mechanism as
+   * the twin test above: read the file, read the literals back out, compare to the
+   * values in this module.
+   */
+  const costReport = readFileSync(
+    fileURLToPath(new URL("../cost-report/index.mjs", import.meta.url)), "utf8");
+
+  /** The string literals of `const <name> = [ … ];`, in source order. */
+  const literalList = (name) => {
+    const m = costReport.match(new RegExp(`const ${name} = \\[([^\\]]*)\\]`));
+    expect(m, `cost-report/index.mjs no longer declares const ${name} = [ … ]`).toBeTruthy();
+    return [...m[1].matchAll(/"([^"]+)"/g)].map((g) => g[1]);
+  };
+
+  it("mirrors GATE_PERSONAS exactly — same ids, no extras, no omissions", () => {
+    // Order-insensitive on purpose (one is a Set), membership is not: adding
+    // security_reviewer on either side is the mistake this catches.
+    expect(literalList("GATE_PERSONAS").sort()).toEqual([...GATE_PERSONAS].sort());
+  });
+
+  it("mirrors the VERDICTS vocabulary exactly, in the same order", () => {
+    // Order matters here: both files declare the enum, and a reader comparing them
+    // side by side should see the same list, not a permutation.
+    expect(literalList("VERDICTS")).toEqual(VERDICTS);
+  });
+
+  it("its rework personas and verdicts are a subset of the contract's", () => {
+    // cost-report narrows the set (a red CI is a gate round, not dev rework) —
+    // narrowing is allowed, inventing a persona or a verdict word is not.
+    for (const id of literalList("REWORK_PERSONAS")) expect(GATE_PERSONAS.has(id)).toBe(true);
+    for (const v of literalList("REWORK_VERDICTS")) expect(VERDICTS).toContain(v);
+    // …and it must actually narrow, or `reworkRounds` is just `gateRounds`.
+    expect(literalList("REWORK_PERSONAS").length).toBeLessThan(GATE_PERSONAS.size);
+  });
+
+  it("reads the verdict off the event and never re-derives one", () => {
+    // The single prose ladder lives in this module. A second one inside a
+    // single-file Lambda would need its own fixture parity guard for a
+    // backfill-only concern (plan §3), so cost-report is expected to consume the
+    // already-resolved field and nothing else.
+    expect(costReport).toContain("VERDICTS.includes(d.verdict)");
+    // None of the resolution machinery may appear over there — a copy of any of
+    // these three names IS the second ladder.
+    for (const name of ["deriveVerdict", "normalizeVerdict", "VERDICT_LADDER"]) {
+      expect(costReport, `cost-report grew its own ${name}`).not.toContain(name);
+    }
+  });
+});

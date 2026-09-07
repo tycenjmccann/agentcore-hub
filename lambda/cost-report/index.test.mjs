@@ -30,7 +30,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
-import { dedupeEvents, fixTicketIds, intakeCompletedAt, isFixTicket } from "./index.mjs";
+import { computeGateRounds, dedupeEvents, fixTicketIds, intakeCompletedAt, isFixTicket } from "./index.mjs";
 
 const FIXTURE = fileURLToPath(
   new URL("../../deploy/workflow-manager/toolkit/fixtures/fix-lineage.json", import.meta.url),
@@ -167,4 +167,127 @@ test("ids are deduped across the three sources and ordered by creation", () => {
   const ids = fixTicketIds(events(), rows, asWorkflow());
   assert.deepEqual(ids, EXPECTED_IDS);
   assert.equal(new Set(ids).size, ids.length);
+});
+
+// ─── TEAM-4246 D1 FR-D1.11 — gate metrics from verdict events ────────────────
+//
+// The three numbers this card reports about gates (`reworkRounds`, `gateRounds`,
+// `firstPassYield`) had no access to a verdict before D1, so they answered
+// adjacent questions instead: how many times a TICKET was re-invoked, how many
+// times a HUMAN gate was re-requested. wf_1788731227559_dowtdh is the run that
+// showed the gap — its reviewer said CHANGES NEEDED, its QA verifier said FAIL and
+// its CI agent said PASS, three gate rounds and two rejections, and the card
+// reported `gateRounds: 0` because none of the three was a human review gate.
+//
+// The sequences below are literal (the real dowtdh dossier carries no
+// `detail.verdict` — it predates the field; the orchestrator's own
+// verdict-contract.test.mjs pins the ladder that reads its prose, and the Python
+// toolkit does the retro scoring). What is asserted here is the ARITHMETIC on top
+// of an already-resolved verdict, plus the fallback that keeps every pre-D1 card
+// numerically unchanged.
+
+const QA = "agentcore_hub_qa_verifier";
+const REVIEWER = "agentcore_hub_code_reviewer";
+const CI = "agentcore_hub_ci_agent";
+
+const complete = (ticketId, agentId, at, extra = {}) =>
+  ({ type: "agent.complete", timestamp: at, detail: { ticketId, agentId, assignee: agentId, ...extra } });
+
+/** dowtdh's gate sequence, at its real timestamps, as it would be published today. */
+const DOWTDH_GATES = [
+  complete("TEAM-4180", REVIEWER, "2026-09-06T23:19:21.743Z", { verdict: "CHANGES_NEEDED", verdictSource: "declared" }),
+  complete("TEAM-4181", QA, "2026-09-06T23:36:32.821Z", { verdict: "FAIL", verdictSource: "declared", testedHead: "12e9ac6" }),
+  complete("TEAM-4182", CI, "2026-09-06T23:42:11.459Z", { verdict: "PASS", verdictSource: "declared", testedHead: "12e9ac6" }),
+];
+
+test("enriched events: dowtdh's three gate verdicts → 2 reworks, 3 rounds, no first-pass yield", () => {
+  const gates = computeGateRounds({}, DOWTDH_GATES);
+  assert.equal(gates.reworkRounds, 2);   // reviewer CHANGES_NEEDED + QA FAIL
+  assert.equal(gates.gateRounds, 3);     // …and the CI PASS is still a gate round
+  assert.equal(gates.firstPassYield, 0); // two of the three failed on first look
+  assert.equal(gates.source, "verdict-events");
+});
+
+test("enriched events: every gate PASSing first look yields 1", () => {
+  const gates = computeGateRounds({}, [
+    complete("T-1", REVIEWER, "2026-09-06T23:00:00Z", { verdict: "PASS" }),
+    complete("T-2", QA, "2026-09-06T23:10:00Z", { verdict: "PASS" }),
+    complete("T-3", CI, "2026-09-06T23:20:00Z", { verdict: "PASS" }),
+  ]);
+  assert.equal(gates.reworkRounds, 0);
+  assert.equal(gates.gateRounds, 3);
+  assert.equal(gates.firstPassYield, 1);
+});
+
+test("the FIRST verdict decides the yield — a re-verify PASS does not retroactively earn it", () => {
+  const gates = computeGateRounds({}, [
+    complete("TEAM-4181", QA, "2026-09-06T23:36:32Z", { verdict: "FAIL" }),
+    complete("TEAM-4190", QA, "2026-09-07T00:10:00Z", { verdict: "PASS" }),   // the re-verify
+  ]);
+  assert.equal(gates.gateRounds, 2);     // initial + re-verify
+  assert.equal(gates.reworkRounds, 1);
+  assert.equal(gates.firstPassYield, 0);
+  // …and the reverse order: a first-look PASS followed by a later FAIL still
+  // yielded on the first look, but is not rework-free.
+  const later = computeGateRounds({}, [
+    complete("TEAM-4181", QA, "2026-09-06T23:36:32Z", { verdict: "PASS" }),
+    complete("TEAM-4190", QA, "2026-09-07T00:10:00Z", { verdict: "FAIL" }),
+  ]);
+  assert.equal(later.firstPassYield, 1);
+  assert.equal(later.reworkRounds, 1);
+});
+
+test("only gate personas and only recognized verdicts count", () => {
+  const gates = computeGateRounds({}, [
+    complete("T-1", "agentcore_hub_backend_dev", "2026-09-06T22:00:00Z", { verdict: "PASS" }),  // not a gate
+    complete("T-2", "human:engineer", "2026-09-06T22:10:00Z", { verdict: "PASS" }),             // not a gate
+    complete("T-3", QA, "2026-09-06T22:20:00Z", { verdict: "LGTM" }),                           // not a verdict
+    complete("T-4", CI, "2026-09-06T22:30:00Z", { verdict: "BLOCKED" }),
+  ]);
+  assert.equal(gates.gateRounds, 1);
+  // BLOCKED is a verdict and a gate round, but the CI agent is not one of the two
+  // personas whose non-PASS means the dev work goes back.
+  assert.equal(gates.reworkRounds, 0);
+  assert.equal(gates.firstPassYield, 0);
+});
+
+test("legacy events without a verdict: the reviewGateHistory numbers, unchanged", () => {
+  // A run with two human review gates: 3 rounds on the first, 1 on the second.
+  // Snapshot of the pre-change computation — rounds 4, reworks (3-1)+(1-1) = 2.
+  const workflow = {
+    reviewGateHistory: {
+      "TEAM-4178": { rounds: [{ verdict: "CHANGES-NEEDED" }, { verdict: "CHANGES-NEEDED" }, { verdict: "PASS" }] },
+      "TEAM-4186": { rounds: [{ verdict: "PASS" }] },
+    },
+  };
+  const legacyEvents = [
+    complete("TEAM-4180", REVIEWER, "2026-09-06T23:19:21.743Z"),   // no detail.verdict at all
+    complete("TEAM-4181", QA, "2026-09-06T23:36:32.821Z"),
+    complete("TEAM-4182", CI, "2026-09-06T23:42:11.459Z"),
+  ];
+  const gates = computeGateRounds(workflow, legacyEvents);
+  assert.equal(gates.gateRounds, 4);
+  assert.equal(gates.gateReworks, 2);
+  assert.equal(gates.source, "reviewGateHistory");
+  // null, not 0: the caller substitutes the task-derived value it has always
+  // reported. A 0 here would silently zero every pre-D1 card's rework row.
+  assert.equal(gates.reworkRounds, null);
+  assert.equal(gates.firstPassYield, null);
+
+  // No events at all, and no history: also the legacy shape, all zeros.
+  assert.deepEqual(computeGateRounds({}, []), {
+    gateRounds: 0, gateReworks: 0, reworkRounds: null, firstPassYield: null, source: "reviewGateHistory",
+  });
+  // The old single-argument call still answers the same way.
+  assert.deepEqual(computeGateRounds(workflow), { ...gates });
+});
+
+test("gateReworks stays review-request-derived even when verdicts are present", () => {
+  // The two numbers answer different questions and must not collapse into one:
+  // `gateRounds` counts verdicts stated, `gateReworks` counts a human gate being
+  // re-requested. A run can have three verdicts and zero re-requests.
+  const workflow = { reviewGateHistory: { "TEAM-4178": { rounds: [{ verdict: "PASS" }] } } };
+  const gates = computeGateRounds(workflow, DOWTDH_GATES);
+  assert.equal(gates.gateRounds, 3);
+  assert.equal(gates.gateReworks, 0);
 });
