@@ -395,6 +395,16 @@ export default defineConfig({
       // ship cascade are identical with the gate armed. A gate that perturbed a
       // converging ship review would be worse than the hole it closes.
       "lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs",
+      // sweep-noop-close (TEAM-4247 D2) — the zero-yield sweep. Today the ONLY thing
+      // that ends such a run is blueprints/code-sweeper.md Step 2.5 asking the model
+      // to hand-skip every downstream ticket in reverse dependency order; miss one
+      // and a reviewer/QA/CI/release-manager is dispatched against a branch that does
+      // not exist. Drives both done twins through the REAL cascade, so the claims it
+      // pins are the wiring ones a predicate cannot express: zero successor
+      // dispatches, never workflow.complete, one close across the twins and a
+      // redelivery (the claimTerminalOutcome CAS), and `verified_removable` compared
+      // STRICTLY to 0 so an absent field on a pre-D2 record is not read as a no-op.
+      "lambda/orchestrator/sweep-noop-close.test.mjs",
     ],
     // Keep unit tests away from the Playwright specs under tests/.
     exclude: ["tests/**", "node_modules/**", "demo/**"],

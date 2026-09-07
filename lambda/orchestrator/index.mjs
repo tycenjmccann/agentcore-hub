@@ -305,6 +305,24 @@ const FIX_BEFORE_VERIFY = normalizeVerdictMode(process.env.FIX_BEFORE_VERIFY);
 // `orchestrator.completion_blocked` and refuses; shadow warns and completes.
 const VERIFIED_HEAD_COMPLETION = normalizeVerdictMode(process.env.VERIFIED_HEAD_COMPLETION);
 
+// SWEEP_DETECTION_PHASE (TEAM-4247 D2) — the fourth flag on the same ladder, and
+// deliberately the same normalizer, defaults and rollback story as the D1 three
+// above (unset → shadow, garbage → off, instant rollback = off).
+//
+// The hole it closes: a dead-code sweep that verifies NOTHING to remove has no
+// terminal outcome today, so blueprints/code-sweeper.md Step 2.5 asks the MODEL to
+// end the run by hand-skipping every downstream ticket in reverse dependency
+// order. Miss one, or skip out of order, and the orchestrator dispatches a
+// reviewer/QA/CI/release-manager against a branch that does not exist — and a
+// human is paged to approve a merge with no PR.
+//   enforce = a zero-yield detection completion closes the run
+//             "nothing-to-remove" (claimTerminalOutcome) and the cascade for that
+//             ticket does not run, so no successor is ever dispatched.
+//   shadow  = publish `sweep.detection_observed` with what WOULD have closed, and
+//             behave exactly as today (the blueprint choreography still runs).
+//   off     = the completion record is not even read.
+const SWEEP_DETECTION_PHASE = normalizeVerdictMode(process.env.SWEEP_DETECTION_PHASE);
+
 /**
  * The children a completion GATE may consider (TEAM-4122 FR-7). Under enforce an
  * advisory ticket owes the run nothing — no deliverable evidence, no merge
@@ -541,7 +559,16 @@ export async function loadWorkflowDefs() {
         sdlcFramework: w.sdlcFramework || "standard",
         artifactChain: w.artifactChain || null,
         frameworks: w.frameworks || null,
-        phases: (w.phases || []).map((p) => ({ id: p.id, name: p.name, agentPhase: p.agentPhase })),
+        // `agentId` (TEAM-4247 D2): a phase may name the ONE agent that serves it,
+        // for a phase no roster agent claims via its own `phase` field. Read by
+        // isSweepDetectionTicket's fallback and by the intake context, and absent on
+        // every other def's phases, so nothing else changes shape.
+        phases: (w.phases || []).map((p) => ({
+          id: p.id,
+          name: p.name,
+          agentPhase: p.agentPhase,
+          ...(p.agentId ? { agentId: p.agentId } : {}),
+        })),
       };
     }
     console.log(`[orchestrator] Loaded ${Object.keys(_workflowDefs).length} workflow definitions from S3`);
@@ -924,6 +951,87 @@ async function observeReworkLoop(workflow, ticket) {
     });
   } catch (err) {
     console.warn(`[orchestrator] rework-loop observe failed (non-fatal): ${err?.message || err}`);
+  }
+}
+
+// ─── Zero-yield sweep close (TEAM-4247 D2) ───────────────────────────────────
+
+/** The sweep def's detection phase. PARITY: src/config/workflows.json. */
+const DETECTION_PHASE = "detection";
+
+/**
+ * Is this the ticket that reports the sweep's YIELD?
+ *
+ * Explicit stamp first (`Tickets___create_ticket(phase="detection")`, which is what
+ * the intake context asks the analyst for): the stamp is also what completion.mjs's
+ * phaseOf() trusts first, so "which phase is this ticket" has one answer.
+ *
+ * Fallback: the def's detection phase names its agent, and this ticket is assigned
+ * to it. That covers a run whose intake forgot the stamp. It can also match the
+ * SWEEP ticket (same agent serves both phases of this def) — which is correct, not a
+ * bug: the only way to reach the close is a completion record that says zero
+ * verified removals, and a sweep ticket reporting zero removals is exactly the run
+ * this gate exists to end.
+ */
+function isSweepDetectionTicket(workflow, ticket) {
+  if (ticket?.phase === DETECTION_PHASE) return true;
+  const detection = (getEffectiveWorkflowDef(workflow)?.phases || []).find(
+    (p) => p.agentPhase === DETECTION_PHASE
+  );
+  return Boolean(detection?.agentId && ticket?.assignee === detection.agentId);
+}
+
+/**
+ * TEAM-4247 D2 — decide whether this done ticket ends the run with nothing removed.
+ *
+ * Returns the close plan (`{ ticketId, candidates, prUrl }`) or null. Both done
+ * twins call it BEFORE cascadeUnblock, because the cascade is what dispatches the
+ * reviewer/QA/CI/release-manager, and the whole point of the gate is that a no-op
+ * sweep produces ZERO successor dispatches. Acting on the plan happens after the
+ * `agent.complete` publish (see the twins) so the event stream still reads
+ * ticket-done → run-closed.
+ *
+ * Non-throwing by contract (the observer discipline every D1 flag follows): any
+ * failure degrades to a warn and today's behaviour, never a wedged run.
+ *
+ *   off     → returns immediately; the completion record is not read.
+ *   shadow  → publishes `sweep.detection_observed` and returns null, so the
+ *             blueprint's own Step 2.5 choreography still runs.
+ *   enforce → returns the plan.
+ */
+async function observeSweepDetection(workflow, ticket) {
+  if (SWEEP_DETECTION_PHASE === "off") return null;
+  try {
+    if (workflow?.workflowDefId !== SWEEP_WORKFLOW_DEF_ID) return null;
+    const ticketId = ticket?.ticketId || ticket?.key;
+    if (!ticketId || !isSweepDetectionTicket(workflow, ticket)) return null;
+
+    // STRICT === 0, on the integer the workflow-output Lambda parsed. An absent
+    // field (every pre-D2 record) is NOT a zero yield, and a truthiness test here
+    // would invert the whole gate — 0 is the only value that closes a run.
+    const record = await readCompletionRecord(ticketId);
+    if (record?.verified_removable !== 0) return null;
+
+    const candidates = Number.isInteger(record.candidates) ? record.candidates : null;
+    const prUrl = typeof record.pr_url === "string" ? record.pr_url : "";
+
+    if (SWEEP_DETECTION_PHASE !== "enforce") {
+      // Subject = the detection ticket, NOT the epic: publishEvent stamps its
+      // first argument over `detail.ticketId`, and the ticket that reported the
+      // yield is the one a shadow reader has to be able to open. The events-table
+      // partition key is `detail.workflowId`, so the row still lands on the run.
+      await publishEvent(ticketId, "sweep.detection_observed", {
+        workflowId: workflow.id,
+        verifiedRemovable: 0,
+        candidates,
+        wouldClose: true,
+      });
+      return null;
+    }
+    return { ticketId, candidates, prUrl };
+  } catch (err) {
+    console.warn(`[orchestrator] sweep-detection observe failed (non-fatal): ${err?.message || err}`);
+    return null;
   }
 }
 
@@ -1928,11 +2036,18 @@ export async function handleTicketDoneUnified(ticketId) {
   // below — otherwise a completed run could silently never be finalized. Treat a
   // cascade failure as "unblocked nothing" and proceed. (Symmetric with the
   // DDB-stream twin handleTicketDone.)
+  //
+  // TEAM-4247 D2 — decided BEFORE the cascade (a zero-yield sweep must dispatch
+  // nobody), acted on AFTER agent.complete (below), so a no-op close still reads
+  // ticket-done → run-closed. Null under off/shadow ⇒ this whole block is today's.
+  const noOpSweep = await observeSweepDetection(workflow, ticket);
   let unblocked = [];
-  try {
-    unblocked = await getCascade().cascadeUnblock(ticketId, parentId, workflow);
-  } catch (err) {
-    console.error(`[orchestrator] cascade failed for ${ticketId} — publishing completion anyway: ${err?.message || err}`);
+  if (!noOpSweep) {
+    try {
+      unblocked = await getCascade().cascadeUnblock(ticketId, parentId, workflow);
+    } catch (err) {
+      console.error(`[orchestrator] cascade failed for ${ticketId} — publishing completion anyway: ${err?.message || err}`);
+    }
   }
 
   // TEAM-4246 D1 — enrichCompleteDetail is the ONE place that decides what a
@@ -1947,6 +2062,14 @@ export async function handleTicketDoneUnified(ticketId) {
       await resolveVerdictInfo({ ticketId, assignee, workflow, parentId })
     )
   );
+
+  // TEAM-4247 D2 — the run is over with nothing removed: claim the terminal
+  // outcome and stop. No completion check (nothing was delivered), no rework /
+  // live-reverify observation (there is no fix and no new head to re-verify).
+  if (noOpSweep) {
+    await closeWorkflowNothingToRemove(workflow, noOpSweep);
+    return;
+  }
 
   // TEAM-4113 — observe the per-phase rework loop (no-op when off / non-fix).
   await observeReworkLoop(workflow, ticket);
@@ -4028,11 +4151,23 @@ export async function handleTicketDone(ticketId, image) {
   // An unexpected throw must never skip the agent.complete publish or the
   // completion check below — treat a cascade failure as "unblocked nothing" so
   // the last ticket to close can still finalize the run.
+  //
+  // TEAM-4247 D2 — same placement as the webhook twin: decide before the cascade,
+  // act after agent.complete. The hook reads only ticketId/assignee/phase, all
+  // present on the stream image, so this adds no ticket read (and none at all
+  // while SWEEP_DETECTION_PHASE is off).
+  const noOpSweep = await observeSweepDetection(workflow, {
+    ticketId,
+    assignee,
+    phase: unwrapDdbValue(image.phase),
+  });
   let unblocked = [];
-  try {
-    unblocked = await getCascade().cascadeUnblock(ticketId, parentId, workflow);
-  } catch (err) {
-    console.error(`[orchestrator] cascade failed for ${ticketId} — publishing completion anyway: ${err?.message || err}`);
+  if (!noOpSweep) {
+    try {
+      unblocked = await getCascade().cascadeUnblock(ticketId, parentId, workflow);
+    } catch (err) {
+      console.error(`[orchestrator] cascade failed for ${ticketId} — publishing completion anyway: ${err?.message || err}`);
+    }
   }
 
   // Publish event for UI. TEAM-4246 D1 — enrichCompleteDetail, same call shape
@@ -4045,6 +4180,13 @@ export async function handleTicketDone(ticketId, image) {
       await resolveVerdictInfo({ ticketId, assignee, workflow, parentId })
     )
   );
+
+  // TEAM-4247 D2 — nothing to remove: claim the outcome and stop (see the webhook
+  // twin for why no completion check and no observers run).
+  if (noOpSweep) {
+    await closeWorkflowNothingToRemove(workflow, noOpSweep);
+    return;
+  }
 
   // TEAM-4113 / TEAM-4121 FR-9 — observe the per-phase rework loop, then live
   // re-verification. The stream image is raw DDB, so fetch the normalized ticket
@@ -4886,6 +5028,93 @@ async function closeWorkflowBlocked(workflow, verdict) {
       featureBranch: workflow.featureBranch,
     }
   );
+
+  await store.markFinalized(workflow.id);
+}
+
+/**
+ * TEAM-4247 D2 — close a dead-code sweep that verified NOTHING to remove.
+ *
+ * Same side-effect discipline as closeWorkflowBlocked above, for the same reason:
+ * the phase claim is an ATOMIC CAS (store.claimTerminalOutcome refuses any already
+ * terminal phase — "nothing-to-remove" among them since D2's parity commit), so a
+ * webhook/stream twin delivery and a redelivered stream record yield exactly ONE
+ * winner, and only the winner runs the side effects.
+ *
+ * What it deliberately does NOT do:
+ *   - it never publishes `workflow.complete`. A sweep with no removals did not
+ *     ship anything, and the dossier / performance card must not say it did.
+ *   - it never calls completeWorkflow. Nothing was delivered, so there is no PR to
+ *     assemble, no ship verdict to evaluate and no verified head to compare.
+ *   - it is not a ship-BLOCKED close either: nothing was blocked, which is why
+ *     NO_OP_OUTCOMES is disjoint from SHIP_BLOCKED_OUTCOMES.
+ *
+ * The open siblings are transitioned to `blocked` (best effort, per ticket) so the
+ * board does not show live work under a terminal run. Human-assignee gate tickets
+ * are deliberately EXCLUDED: on the Jira path a human gate moving to "blocked" is
+ * read as "Request changes" and would reopen upstream work (handleReviewRejection).
+ * They need no tidy anyway — a gate is only ever notified when the cascade unblocks
+ * it, and the cascade is exactly what this close skips.
+ */
+async function closeWorkflowNothingToRemove(workflow, { candidates, prUrl, ticketId } = {}) {
+  const outcome = "nothing-to-remove";
+  const completedAt = new Date().toISOString();
+  const reason = "No verified-dead code to remove — sweep closed with zero removals";
+  const won = await store.claimTerminalOutcome(workflow.id, outcome, completedAt, reason);
+  if (!won) {
+    console.log(`[orchestrator] Workflow ${workflow.id} already terminal — skipping duplicate ${outcome} close.`);
+    return;
+  }
+  console.log(
+    `[orchestrator] Workflow ${workflow.id} closed ${outcome} (nothing shipped): ${ticketId || "?"} verified 0 removable` +
+    (Number.isInteger(candidates) ? ` of ${candidates} candidate(s)` : "")
+  );
+
+  workflow.phase = outcome;
+  workflow.completedAt = completedAt;
+  workflow.blockReason = reason;
+
+  // Best-effort board tidy — a throw here must never leave the run finalized-less.
+  try {
+    const children = await getChildTickets(workflow.epicId);
+    for (const t of children) {
+      const id = t?.ticketId || t?.key;
+      if (!id || id === ticketId) continue;
+      if (t.status === "done" || t.status === "cancelled" || t.status === "blocked") continue;
+      if (isHumanAssignee(t.assignee)) continue;
+      try {
+        await transitionTicketStatus(id, "blocked");
+      } catch (err) {
+        console.warn(`[orchestrator] no-op sweep: could not block ${id}: ${err?.message || err}`);
+      }
+    }
+  } catch (err) {
+    console.warn(`[orchestrator] no-op sweep: sibling tidy skipped for ${workflow.id}: ${err?.message || err}`);
+  }
+
+  // Same contract as the blocked close: a missing PAT / label / PR must never turn
+  // the terminal close into a throw.
+  if (prUrl) {
+    try {
+      await labelPullRequest(prUrl, "sweep:no-op");
+    } catch (err) {
+      console.warn(`[orchestrator] PR label sweep:no-op skipped for ${prUrl}: ${err?.message || err}`);
+    }
+  }
+
+  // Subject = the detection ticket when we have one (publishEvent stamps its first
+  // argument over `detail.ticketId`), so the run-closing event names the ticket
+  // whose zero yield closed it; the epic is the fallback, as for every other
+  // run-level event. Either way the events-table row is keyed on
+  // `detail.workflowId`, so this lands in the run's own stream.
+  await publishEvent(ticketId || workflow.epicId, "workflow.nothing_to_remove", {
+    workflowId: workflow.id,
+    outcome,
+    verifiedRemovable: 0,
+    candidates: Number.isInteger(candidates) ? candidates : null,
+    prUrl: prUrl || "",
+    featureBranch: workflow.featureBranch,
+  });
 
   await store.markFinalized(workflow.id);
 }
