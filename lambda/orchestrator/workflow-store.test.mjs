@@ -13,6 +13,8 @@ import {
   claimDeadSessionSynthesis,
   claimReverifySlot,
   releaseReverifySlot,
+  completionBlockedKey,
+  claimCompletionBlocked,
   advancePhase,
   setResumeContext,
   setRepoCheck,
@@ -1168,5 +1170,108 @@ describe("re-verify slot CAS (TEAM-4130 F2)", () => {
     boom.name = "TimeoutError";
     throwOnce = boom;
     await expect(releaseReverifySlot("wf_1", FIX, SHA)).rejects.toThrow("network");
+  });
+});
+
+/**
+ * TEAM-4246 D1 — the completion-blocked claim.
+ *
+ * A refused completion is not a one-shot event: the run keeps trying to complete
+ * (every done cascade re-enters completeWorkflow), so the escalation has to be
+ * claimed or the human gets one notification per attempt. The claim is keyed on
+ * the HEAD TRIPLE, not on the reason: while the heads stand still the refusal is
+ * the same refusal, and the moment any head moves it is genuinely new news.
+ *
+ * Unlike claimReverifySlot there is NO stale-takeover window — nothing waits on
+ * this claim, so a caller that dies after claiming costs one missed notification,
+ * never a wedged run.
+ */
+describe("completion-blocked claim (TEAM-4246 D1)", () => {
+  const HEADS = { qa: "933ea6f", ci: "12e9ac6", pr: "001259d" };
+  const NOW = "2026-09-06T23:47:00.000Z";
+
+  describe("completionBlockedKey", () => {
+    it("is a stable sha256 of the triple", () => {
+      const key = completionBlockedKey(HEADS);
+      expect(key).toMatch(/^[0-9a-f]{64}$/);
+      expect(completionBlockedKey({ ...HEADS })).toBe(key);
+    });
+
+    it("changes when ANY head moves — that is what re-arms the escalation", () => {
+      const key = completionBlockedKey(HEADS);
+      expect(completionBlockedKey({ ...HEADS, qa: "001259d" })).not.toBe(key);
+      expect(completionBlockedKey({ ...HEADS, ci: "001259d" })).not.toBe(key);
+      expect(completionBlockedKey({ ...HEADS, pr: "12e9ac6" })).not.toBe(key);
+    });
+
+    it("is position-sensitive: the same shas in different slots are a different claim", () => {
+      expect(completionBlockedKey({ qa: "aaaaaaa", ci: "bbbbbbb", pr: null }))
+        .not.toBe(completionBlockedKey({ qa: "bbbbbbb", ci: "aaaaaaa", pr: null }));
+    });
+
+    it("normalizes case/whitespace and treats a missing head as empty", () => {
+      expect(completionBlockedKey({ qa: "  933EA6F  ", ci: "12e9ac6" }))
+        .toBe(completionBlockedKey({ qa: "933ea6f", ci: "12e9ac6", pr: null }));
+      expect(completionBlockedKey(undefined)).toBe(completionBlockedKey({}));
+    });
+  });
+
+  it("claims with a scoped CAS on the key, recording when it fired", async () => {
+    const key = completionBlockedKey(HEADS);
+    expect(await claimCompletionBlocked("wf_1", key, NOW)).toBe("claimed");
+    expect(writes()).toHaveLength(1);
+    const { input } = writes()[0];
+    expect(input.UpdateExpression).toBe(
+      "SET completionBlockedKey = :key, completionBlockedAt = :now"
+    );
+    expect(input.ConditionExpression).toBe(
+      "attribute_exists(workflowId) AND (attribute_not_exists(completionBlockedKey)" +
+      " OR completionBlockedKey <> :key)"
+    );
+    expect(input.ExpressionAttributeValues).toEqual({ ":key": key, ":now": NOW });
+    // No read on the winning path — the CAS is the whole decision.
+    expect(sent.filter((c) => c.type === "GetCommand")).toHaveLength(0);
+  });
+
+  it("returns taken on the second call for the same heads (one escalation per triple)", async () => {
+    const key = completionBlockedKey(HEADS);
+    condOutcomes.push("fail");
+    stubItem = { workflowId: "wf_1", completionBlockedKey: key };
+    expect(await claimCompletionBlocked("wf_1", key, NOW)).toBe("taken");
+    expect(writes()).toHaveLength(1);   // no takeover attempted
+    const get = sent.find((c) => c.type === "GetCommand");
+    expect(get.input.ProjectionExpression).toBe("completionBlockedKey");
+    expect(get.input.ConsistentRead).toBe(true);
+  });
+
+  it("re-arms once a head moves: the new triple claims cleanly", async () => {
+    const first = completionBlockedKey(HEADS);
+    expect(await claimCompletionBlocked("wf_1", first, NOW)).toBe("claimed");
+    // QA re-ran at the shipped head — a different refusal, worth telling a human.
+    const second = completionBlockedKey({ ...HEADS, qa: "001259d" });
+    expect(await claimCompletionBlocked("wf_1", second, NOW)).toBe("claimed");
+    expect(writes()).toHaveLength(2);
+    expect(writes()[1].input.ExpressionAttributeValues[":key"]).toBe(second);
+  });
+
+  it("returns untracked when the row is gone (fail-open, same shape as the slot CAS)", async () => {
+    condOutcomes.push("fail");
+    stubItem = null;
+    expect(await claimCompletionBlocked("wf_1", completionBlockedKey(HEADS), NOW)).toBe("untracked");
+    expect(sent.filter((c) => c.type === "GetCommand")).toHaveLength(1);
+  });
+
+  it("defaults the timestamp rather than writing an unbound placeholder", async () => {
+    // The stub throws ValidationException on a missing :now, so passing IS the
+    // assertion; the value is only ever read by a human.
+    expect(await claimCompletionBlocked("wf_1", completionBlockedKey(HEADS))).toBe("claimed");
+    expect(writes()[0].input.ExpressionAttributeValues[":now"]).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+  });
+
+  it("rethrows a non-CCFE error instead of guessing", async () => {
+    const boom = new Error("throttled");
+    boom.name = "ProvisionedThroughputExceededException";
+    throwOnce = boom;
+    await expect(claimCompletionBlocked("wf_1", "k", NOW)).rejects.toThrow("throttled");
   });
 });

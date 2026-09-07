@@ -302,10 +302,17 @@ async function buildCard(workflowId, workflow, pricing) {
   // parked gate is not resolved.
   const changeRequests = count("review.rejected") + count("review.parked_advisory");
   const fixTickets = countFixTickets(events, agentTasks, workflow);
-  const gates = computeGateRounds(workflow);
-  const reworkRounds = aiTasks.reduce((s, t) => s + t.reworkRounds, 0);
+  const gates = computeGateRounds(workflow, events);
+  // TEAM-4246 D1 FR-D1.11: a verdict-derived count when the run has verdict
+  // events, else the task-derived re-invocation sum this card has always
+  // reported. `??` and not `||`, so a real 0 rework rounds is not read as "no
+  // signal" and silently replaced by the task count.
+  const taskReworkRounds = aiTasks.reduce((s, t) => s + t.reworkRounds, 0);
+  const reworkRounds = gates.reworkRounds ?? taskReworkRounds;
   const tasksCompleted = aiTasks.filter((t) => t.status === "complete" || t.status === "done").length;
   const firstPass = aiTasks.filter((t) => t.reworkRounds === 0).length;
+  const taskFirstPassYield = aiTasks.length ? round4(firstPass / aiTasks.length) : null;
+  const firstPassYield = gates.firstPassYield ?? taskFirstPassYield;
   const prUrl = findPrUrl(workflow, events, agentTasks);
   const outcome = workflow.phase || "unknown";
 
@@ -375,15 +382,19 @@ async function buildCard(workflowId, workflow, pricing) {
       reworkRounds,
       changeRequests,
       fixTickets,
-      gateRounds: gates.rounds,
-      gateReworks: gates.reworks,
+      gateRounds: gates.gateRounds,
+      gateReworks: gates.gateReworks,
+      // Which definition produced reworkRounds / gateRounds / firstPassYield on
+      // THIS card. Without it a fleet baseline silently mixes two units and no
+      // reader can tell which runs contributed which.
+      gateMetricSource: gates.source,
       loops: changeRequests + fixTickets,
       nudges: count("workflow.nudge") + count("nudge"),
       interventions: count("manager.intervention"),
       errors: count("agent.error") + count("error"),
       retries: count("agent.retry"),
       unblocks: count("orchestrator.unblocked"),
-      firstPassYield: aiTasks.length ? round4(firstPass / aiTasks.length) : null,
+      firstPassYield,
       prUrl,
     },
     agents,
@@ -548,6 +559,9 @@ export function summarize(card) {
       fixTickets: card.quality.fixTickets, loops: card.quality.loops, nudges: card.quality.nudges,
       errors: card.quality.errors, gateRounds: card.quality.gateRounds, firstPassYield: card.quality.firstPassYield,
       humanGates: card.time.humanGates,
+      // Carried into the fleet index so performance.ts readers can tell a
+      // verdict-derived rework/yield from a task-derived one (TEAM-4246 D1).
+      gateMetricSource: card.quality.gateMetricSource ?? null,
     },
     agents: Object.fromEntries(Object.entries(card.agents || {}).map(([k, v]) => [k, {
       usd: v.usd, workMs: v.workMs, tasks: v.tasks, reworkRounds: v.reworkRounds,
@@ -1137,14 +1151,101 @@ function countFixTickets(events, agentTasks, workflow) {
   return fixTicketIds(events, agentTasks, workflow).length;
 }
 
-/** reviewGateHistory[ticket].rounds[] — one round per review request. */
-function computeGateRounds(workflow) {
+/**
+ * TEAM-4246 D1 FR-D1.11 — the gate personas whose verdict decides these numbers.
+ *
+ * PARITY MIRROR of lambda/orchestrator/verdict-contract.mjs (GATE_PERSONAS and
+ * VERDICTS). This Lambda ships as a single-file zip — deploy.sh:26 is
+ * `zip -q -j "$ZIP" index.mjs` — so it cannot import the orchestrator's module,
+ * and a second prose ladder here would need its own parity guard for a
+ * backfill-only concern. Instead this file reads verdicts that are ALREADY
+ * resolved (event `detail.verdict`, written by the orchestrator's one ladder) and
+ * only needs the two vocabularies. verdict-contract.test.mjs greps both literal
+ * lists out of this file and asserts they equal the orchestrator's, so the copies
+ * cannot drift.
+ */
+const GATE_PERSONAS = [
+  "agentcore_hub_code_reviewer",
+  "agentcore_hub_qa_verifier",
+  "agentcore_hub_ci_agent",
+  "agentcore_hub_release_manager",
+];
+const VERDICTS = ["PASS", "CHANGES_NEEDED", "FAIL", "BLOCKED"];
+
+/**
+ * Whose non-PASS verdict means the run had to redo work. The release manager and
+ * the CI agent are deliberately absent: a ship-review round and a CI re-run are
+ * counted as gate ROUNDS, but a red CI on a merge-base conflict is not the dev
+ * work being sent back — `gateRounds` already carries those, and conflating them
+ * would make "rework" the same number as "gate rounds" on every run that CI
+ * re-ran.
+ */
+const REWORK_PERSONAS = ["agentcore_hub_code_reviewer", "agentcore_hub_qa_verifier"];
+const REWORK_VERDICTS = ["CHANGES_NEEDED", "FAIL"];
+
+/**
+ * Gate accounting, from the verdict a gate persona STATED when the run carries
+ * enriched `agent.complete` events, and from `reviewGateHistory[].rounds[]` (one
+ * round per review request) when it does not.
+ *
+ * Why two definitions: pre-TEAM-4246 runs have no `detail.verdict` anywhere, so
+ * the only gate signal they carry is the human review gate's round list — which
+ * counts a REQUEST, not a verdict, and therefore misses every machine gate
+ * (dowtdh's reviewer CHANGES_NEEDED, QA FAIL and CI PASS are three gate rounds
+ * that `reviewGateHistory` records as zero). The fallback exists so those runs
+ * keep exactly the numbers the fleet baseline was built from; a run with verdict
+ * events gets the real thing.
+ *
+ * `reworkRounds` and `firstPassYield` come back **null** on the fallback path,
+ * meaning "no verdict signal — keep today's task-derived value"; the caller owns
+ * that substitution, because the task-derived versions need `agentTasks`.
+ * `gateReworks` is always `reviewGateHistory`-derived: it answers a different
+ * question (how many times a gate ticket was re-REQUESTED) and no verdict stream
+ * can restate it.
+ */
+export function computeGateRounds(workflow, events = []) {
   let rounds = 0, reworks = 0;
   for (const g of Object.values(workflow.reviewGateHistory || {})) {
     const n = Array.isArray(g?.rounds) ? g.rounds.length : 0;
     rounds += n; reworks += Math.max(0, n - 1);
   }
-  return { rounds, reworks };
+  const legacy = {
+    gateRounds: rounds, gateReworks: reworks,
+    reworkRounds: null, firstPassYield: null, source: "reviewGateHistory",
+  };
+
+  // One row per gate-persona completion that states a verdict we recognize. An
+  // unrecognized verdict string is dropped rather than bucketed: the orchestrator
+  // already normalized every value it wrote, so a stranger here is corruption.
+  const gateCompletions = [];
+  for (const e of events) {
+    if (e.type !== "agent.complete") continue;
+    const d = e.detail || {};
+    const agentId = d.agentId || d.assignee;
+    if (!GATE_PERSONAS.includes(agentId) || !VERDICTS.includes(d.verdict)) continue;
+    gateCompletions.push({ agentId, verdict: d.verdict, at: Date.parse(e.timestamp || d.timestamp || "") || 0 });
+  }
+  if (!gateCompletions.length) return legacy;
+
+  // Sort is stable in V8, so completions sharing (or missing) a timestamp keep
+  // their stream order — which is the order the orchestrator published them in.
+  gateCompletions.sort((a, b) => a.at - b.at);
+  const firstOf = new Map();
+  for (const c of gateCompletions) if (!firstOf.has(c.agentId)) firstOf.set(c.agentId, c.verdict);
+
+  return {
+    // Every gate completion: the initial round plus each re-verify.
+    gateRounds: gateCompletions.length,
+    gateReworks: reworks,
+    reworkRounds: gateCompletions.filter(
+      (c) => REWORK_PERSONAS.includes(c.agentId) && REWORK_VERDICTS.includes(c.verdict)).length,
+    // Binary, and deliberately so: "did every gate this run put in front of it
+    // pass on the FIRST look". A run where QA passed only on the re-verify did
+    // not yield on the first pass, whatever the task-level re-invocation count
+    // says.
+    firstPassYield: [...firstOf.values()].every((v) => v === "PASS") ? 1 : 0,
+    source: "verdict-events",
+  };
 }
 
 const PR_RE = /https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/\d+/g;
@@ -1284,11 +1385,19 @@ function renderMarkdown(c) {
     `|---|---|`,
     `| Outcome | ${c.quality.outcome} |`,
     `| Agent tasks (completed) | ${c.quality.tasks} (${c.quality.tasksCompleted}) |`,
-    `| First-pass yield (tasks with no rework) | ${pct(c.quality.firstPassYield)} |`,
-    `| Rework rounds (re-invocations) | ${c.quality.reworkRounds} |`,
+    // TEAM-4246 D1: the two labels state which definition produced the number —
+    // a verdict-derived yield is "every gate passed first look", a task-derived
+    // one is "share of tickets never re-invoked", and they are not comparable.
+    ...(c.quality.gateMetricSource === "verdict-events"
+      ? [`| First-pass yield (every gate PASSed first look) | ${pct(c.quality.firstPassYield)} |`,
+         `| Rework rounds (review/QA non-PASS verdicts) | ${c.quality.reworkRounds} |`]
+      : [`| First-pass yield (tasks with no rework) | ${pct(c.quality.firstPassYield)} |`,
+         `| Rework rounds (re-invocations) | ${c.quality.reworkRounds} |`]),
     `| Change requests (review rejected) | ${c.quality.changeRequests} |`,
     `| Fix tickets | ${c.quality.fixTickets} |`,
-    `| Review-gate rounds / reworks | ${c.quality.gateRounds} / ${c.quality.gateReworks} |`,
+    ...(c.quality.gateMetricSource === "verdict-events"
+      ? [`| Gate rounds (verdicts stated) / review re-requests | ${c.quality.gateRounds} / ${c.quality.gateReworks} |`]
+      : [`| Review-gate rounds / reworks | ${c.quality.gateRounds} / ${c.quality.gateReworks} |`]),
     `| Nudges / manager interventions | ${c.quality.nudges} / ${c.quality.interventions} |`,
     `| Errors / retries | ${c.quality.errors} / ${c.quality.retries} |`,
     ...(c.quality.prUrl ? [`| PR | ${c.quality.prUrl} |`] : []),

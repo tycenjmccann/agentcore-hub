@@ -4,6 +4,15 @@ Architectural decisions and their rationale. Newest first.
 
 ---
 
+## DL-013: Verdict gate (TEAM-4246 D1) — bind cascade/completion to gate verdicts, not ticket-done
+
+**Date:** 2026-09-07
+**Status:** IMPLEMENTED (shadow default)
+**Context:** wf_1788731227559_dowtdh shipped over a reviewer CHANGES-NEEDED and a QA FAIL because the cascade advanced on ticket-done and completion never compared heads; the verdict existed only as prose.
+**Decision:** Three independent `off|shadow|enforce` flags (`VERDICT_GATE`, `FIX_BEFORE_VERIFY`, `VERIFIED_HEAD_COMPLETION`) gate the cascade, fix-ticket creation, and completion on a structured `verdict`/`tested_head` now carried on `report_completion` and `agent.complete`, resolved by one zero-import ladder (`lambda/orchestrator/verdict-contract.mjs`).
+
+---
+
 ## DL-012: Cloud CLI config that works in chat AND terminal, portable across engineers
 
 **Date:** 2026-06-20

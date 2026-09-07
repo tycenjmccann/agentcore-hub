@@ -165,10 +165,22 @@ the ticket with proof it is not real (which you verify on the re-review). A
 diff passes only when your findings list is EMPTY after the prove-or-file
 discipline above.
 
+On EVERY `WorkflowOutput___report_completion` call below, pass structured
+`verdict=` (one of `PASS`, `CHANGES_NEEDED`, `FAIL`, `BLOCKED`) and
+`tested_head=<the full 40-char SHA of the PR head you actually reviewed>` — the
+`git diff origin/<base>...<branch>` head from Step 2, never the base. These are
+read by the orchestrator's completion gate (`VERIFIED_HEAD_COMPLETION`), which
+checks your `tested_head` against QA's and the shipped commit before letting a
+run close. Also keep writing the prose `VERDICT: …` line in your summary — a run
+without the structured field still needs the inferred fallback to read something.
+
 - **PASS** — ZERO findings. `WorkflowOutput___report_completion` with a summary
   of what you checked and why it's sound. This Dones your ticket; QA proceeds.
-- **CHANGES NEEDED** — one or more real findings. **GROUP findings by file/
-  component/module first — ONE fix ticket per component, NOT one per finding.**
+- **CHANGES NEEDED** — one or more real findings, and you MUST file at least one
+  fix ticket for them (see below) — a non-PASS verdict with no fix ticket leaves
+  the orchestrator's cascade gate holding QA on a re-verification ticket with
+  nothing to wait on, which is spend with no path to green. **GROUP findings by
+  file/component/module first — ONE fix ticket per component, NOT one per finding.**
   Ten findings across `GrokVoice.js` and `session.py` = TWO fix tickets, each
   listing its findings. Parallel agents fixing the same file produce conflicting
   siloed PRs; grouping is what keeps fixes additive. Then per fix ticket:

@@ -25,6 +25,9 @@ import { notTerminalPhaseGuard } from "./completion.mjs";
 // derived from the one list instead of hand-spelled twice. gate-state.mjs is pure
 // (zero imports), so this cannot cycle either.
 import { GATE_STATES } from "./gate-state.mjs";
+// completionBlockedKey below hashes the head triple it claims on. node:crypto is a
+// runtime builtin, so it adds nothing to the deploy manifest.
+import { createHash } from "node:crypto";
 
 let _ddb = null;
 let _table = null;
@@ -1208,6 +1211,77 @@ export async function claimTerminalOutcome(workflowId, outcome, completedAt, rea
     }
     throw err;
   }
+}
+
+// ─── Completion-blocked claim (TEAM-4246 D1) ──────────────────────────────────
+
+/**
+ * The claim key for one completion refusal: sha256 of the head triple the gate
+ * compared (`qa|ci|pr`, empty string for an unknown head).
+ *
+ * Keyed on the HEADS rather than on the reason, because the heads are what
+ * changes: a run refused at (933ea6f, 12e9ac6, 001259d) must not re-escalate on
+ * every subsequent completion attempt at the same three heads, but once a
+ * re-verify lands and a head moves, the refusal is genuinely new and the operator
+ * needs to hear it again. The reason is not part of the key and does not need to
+ * be: "head-divergence" requires at least two KNOWN, disagreeing heads, so it can
+ * never produce the same triple as an "open-fix" refusal at converged heads.
+ *
+ * Pure and clock-free, so the caller can compute it, log it, and compare it.
+ */
+export function completionBlockedKey(heads) {
+  const h = heads && typeof heads === "object" ? heads : {};
+  const part = (v) => (typeof v === "string" ? v.trim().toLowerCase() : "");
+  return createHash("sha256").update(`${part(h.qa)}|${part(h.ci)}|${part(h.pr)}`).digest("hex");
+}
+
+/**
+ * Claim the right to escalate ONE completion refusal, modelled on
+ * claimReverifySlot above and returning the same tri-state for the same reason —
+ * the caller's three actions differ:
+ *
+ *   "claimed"   — this caller owns the refusal and must publish + escalate;
+ *   "taken"     — this exact head triple was already escalated: stay silent;
+ *   "untracked" — there is no workflow row to hold a claim on, so the CAS is
+ *                 unavailable. Fail-OPEN like the re-verify slot: the caller
+ *                 still refuses completion (that decision is never the claim's
+ *                 to make) and just re-publishes.
+ *
+ * The `<> :key` arm is the re-arm: a new triple is a new refusal. Unlike
+ * claimReverifySlot there is no stale-takeover window, because nothing waits on
+ * this claim — a winner that dies after claiming costs one un-repeated
+ * notification, not a wedged run, and the run's next head change re-arms it
+ * anyway. Scoped to two top-level attributes; never a map replacement (R2).
+ */
+export async function claimCompletionBlocked(workflowId, key, nowIso) {
+  try {
+    await _ddb.send(new UpdateCommand({
+      TableName: _table,
+      Key: { workflowId },
+      UpdateExpression: "SET completionBlockedKey = :key, completionBlockedAt = :now",
+      ConditionExpression:
+        "attribute_exists(workflowId) AND (attribute_not_exists(completionBlockedKey)" +
+        " OR completionBlockedKey <> :key)",
+      ExpressionAttributeValues: { ":key": key, ":now": nowIso || new Date().toISOString() },
+    }));
+    return "claimed";
+  } catch (err) {
+    if (err?.name !== "ConditionalCheckFailedException") throw err;
+  }
+
+  // Lost the CAS. By the condition that means either no row at all, or this exact
+  // key is already claimed — one projected read tells them apart (same
+  // version-independent trick as claimReverifySlot: no
+  // ReturnValuesOnConditionCheckFailure, because the orchestrator runs on the
+  // Lambda runtime's unpinned bundled SDK).
+  const res = await _ddb.send(new GetCommand({
+    TableName: _table,
+    Key: { workflowId },
+    ConsistentRead: true,
+    ProjectionExpression: "completionBlockedKey",
+  }));
+  if (!res?.Item) return "untracked";
+  return "taken";
 }
 
 /** Record that completion side effects (PR, epic roll-up, event) finished. */

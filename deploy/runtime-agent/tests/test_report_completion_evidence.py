@@ -187,3 +187,57 @@ def test_ci_fields_omitted_give_the_pre_4122_payload_exactly():
 def test_ci_fields_blank_are_the_same_as_omitted():
     _, payload = _payload(ci_status="   ", ci_build_id="", ci_head_sha="")
     assert payload == PRE_4121_PAYLOAD
+
+
+# ─── TEAM-4246 D1: verdict / tested_head ──────────────────────────────────────
+#
+# The pair that closes wf_1788731227559_dowtdh: a gate persona's verdict existed
+# only in prose ("VERDICT: CHANGES NEEDED", then "VERDICT: FAIL"), so nothing
+# downstream could hold the cascade on it, and the head each persona actually
+# tested was unrecoverable afterwards (933ea6f reviewed, 12e9ac6 certified,
+# 001259d shipped).
+
+def test_verdict_and_tested_head_forwarded():
+    _, payload = _payload(verdict="CHANGES_NEEDED", tested_head="933ea6f1f0")
+    assert payload["verdict"] == "CHANGES_NEEDED"
+    assert payload["tested_head"] == "933ea6f1f0"
+
+
+@pytest.mark.parametrize("verdict", ["PASS", "CHANGES_NEEDED", "FAIL", "BLOCKED"])
+def test_all_four_verdicts_pass_through(verdict):
+    _, payload = _payload(verdict=verdict)
+    assert payload["verdict"] == verdict
+
+
+def test_verdict_uppercased_and_head_lowercased():
+    """An LLM writes "pass" as readily as "PASS", and quotes a SHA in whatever case
+    it copied. Normalizing here means the Lambda's allow-list sees one spelling."""
+    _, payload = _payload(verdict="  changes needed  ", tested_head="  933EA6F1F0  ")
+    assert payload["verdict"] == "CHANGES NEEDED"
+    assert payload["tested_head"] == "933ea6f1f0"
+
+
+def test_unknown_verdict_still_forwarded_for_lambda_side_rejection():
+    """Same division of labour as evidence_kind: the workflow-output Lambda owns
+    the allow-list (VERDICTS) so a gateway call is filtered identically. f50ucz
+    TEAM-4128's real "Verdict: code deploy SUCCEEDED" is the case that matters."""
+    _, payload = _payload(verdict="SUCCEEDED", tested_head="not-a-sha")
+    assert payload["verdict"] == "SUCCEEDED"
+    assert payload["tested_head"] == "not-a-sha"
+
+
+def test_verdict_alone_and_head_alone_are_both_legitimate():
+    _, payload = _payload(verdict="PASS")
+    assert "tested_head" not in payload
+    _, payload = _payload(tested_head="7c2391ba")
+    assert "verdict" not in payload
+
+
+def test_verdict_fields_omitted_give_the_pre_4246_payload_exactly():
+    _, payload = _payload()
+    assert payload == PRE_4121_PAYLOAD
+
+
+def test_verdict_fields_blank_are_the_same_as_omitted():
+    _, payload = _payload(verdict="   ", tested_head="")
+    assert payload == PRE_4121_PAYLOAD

@@ -354,6 +354,47 @@ export default defineConfig({
       // the ship review's change set enumerates its own PR's files only — so an
       // advisory branch's files cannot enter the reviewed diff.
       "lambda/orchestrator/advisory-routing.test.mjs",
+      // verdict-contract (TEAM-4246 D1) — the single definition of what a gate
+      // persona's verdict IS, and the only place prose is read for one. Zero
+      // imports and pure, so the table is driven by the REAL completion records
+      // in the dowtdh + f50ucz dossiers: all nine gate summaries across two runs
+      // resolve to the verdict a human reads, "Verdict: code deploy SUCCEEDED"
+      // resolves to NONE rather than PASS, and a head SHA is only ever taken
+      // from a structured field — dowtdh TEAM-4180's prose holds five SHAs and
+      // the first one is not the head it reviewed.
+      "lambda/orchestrator/verdict-contract.test.mjs",
+      // fix-before-verify (TEAM-4246 D1, FR-D1.7) — the creation-time half of the
+      // verdict hole: dowtdh filed fix TEAM-4183 with `blockedBy: []` and invoked QA
+      // TEAM-4181 78 seconds later, against code the fix had not landed on. Pins the
+      // pure target selection (including the CYCLE guard — two fix tickets in one
+      // stream batch must not block each other) and then the real handler on a real
+      // INSERT record: enforce writes one preserving edge per open verifier, shadow
+      // publishes only, off never reads the board, and no failure rejects the record.
+      "lambda/orchestrator/fix-before-verify.test.mjs",
+      // verified-head completion (TEAM-4246 D1, FR-D1.9) — the last of the three
+      // holes: dowtdh published workflow.complete 5s after a fix landed at a head
+      // nothing had verified. The head trio is READ OUT OF the dowtdh dossier and
+      // run through the same resolveTestedHead the harvest uses, so the test proves
+      // the real run diverges rather than proving `!==` works; also pins that
+      // unknown heads are not divergence, that a short sha equals the full sha it
+      // prefixes, that the open-fix refusal is phase-BLIND (the fix isWorkflowComplete
+      // could not see), and the head-triple CAS that keeps one refusal to one escalation.
+      "lambda/orchestrator/verified-head-completion.test.mjs",
+      // replay-dowtdh-verdict-gate (TEAM-4246 D1 acceptance) — the run all three
+      // flags exist for, replayed row-by-row from the vendored dossier through the
+      // REAL handler → cascade → live-reverify → completeWorkflow, with only the AWS
+      // seams mocked. Its load-bearing case is the flags-off one: the ordered event
+      // shape has to equal the shape the dossier's own events record, because "off
+      // changes nothing" is the only claim that cannot be verified in production.
+      "lambda/orchestrator/replay-dowtdh-verdict-gate.test.mjs",
+      // replay-f50ucz-ship-review-regression (TEAM-4246 D1 acceptance, FR-D1.13) —
+      // the other half of the acceptance argument. dowtdh proves D1 changes the
+      // wrong outcome; f50ucz is a run whose ship path CONVERGED (r1 CHANGES-NEEDED
+      // → 2 fixes + a CI re-cert → r2 PASS → merge approval → CD), and this replay
+      // pins that the ship-review round arithmetic, the ship verdict and the whole
+      // ship cascade are identical with the gate armed. A gate that perturbed a
+      // converging ship review would be worse than the hole it closes.
+      "lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs",
     ],
     // Keep unit tests away from the Playwright specs under tests/.
     exclude: ["tests/**", "node_modules/**", "demo/**"],

@@ -216,9 +216,12 @@ missing = empty state, round 1):
      write it to `workflows/{workflow_id}/shared/ship-review-summary.md`, write
      the ledger, then write the **Merge Brief** (Step 5) and the **review
      package** (Step 6), and finally
-     `WorkflowOutput___report_completion` with the PR URL +
-     head SHA. This Dones your ticket and un-parks the Merge Approval gate: a
-     human approves or rejects the merge — that is their call, not yours.
+     `WorkflowOutput___report_completion` with the PR URL + head SHA, PLUS
+     structured `verdict=` (`PASS`, or `PASS-with-known-findings` reads as
+     `PASS` — see the mapping in the Rules section) and
+     `tested_head=<reviewedHeadSha>`. This Dones your ticket and un-parks the
+     Merge Approval gate: a human approves or rejects the merge — that is their
+     call, not yours.
    - **CHANGES NEEDED, effective count < `maxRounds`** — group the IN-DIFF
      findings by component, ONE fix ticket per component assigned to the owning
      dev (same parent as your ticket; `ticket_type: "subtask"` if the parent is
@@ -243,7 +246,12 @@ missing = empty state, round 1):
 
      Record the fix-ticket keys in the round entry, write the ledger, and put your
      own ticket back to `in_progress` — you re-review after the fixes merge to the
-     shared branch, starting again from Step 1's SHA cross-check.
+     shared branch, starting again from Step 1's SHA cross-check. Do NOT file a
+     CI re-certification ticket yourself for the new head: when the ship fixes
+     close, the orchestrator's completion gate (`VERIFIED_HEAD_COMPLETION`) files
+     that `Re-verify (round N)` ticket against the CI agent automatically if the
+     head it last certified is stale relative to the new PR head. An ad hoc one
+     from you would race the orchestrator's and risk a duplicate.
    - **CHANGES NEEDED, effective count >= `maxRounds` — ESCALATE. Do NOT spawn
      this round's fix tickets.** The loop stops here; leave the round's
      `fixTickets` empty, then:
@@ -648,6 +656,13 @@ actual, pass/fail), evidence key, rollback status if invoked.
 - Every claim carries evidence: command + exit code + output; "deployed successfully" alone is INVALID
 - Use `codex` for the review pass, `claude_code` for merge/deploy; either unavailable where required → BLOCKED
 - Include the `[coding-session: ...]` footer from your specialist's output in your completion record
+- On every `report_completion` (ship review, CD, or the escalation path), pass
+  structured `verdict=` mapped from the round record's own `verdict` field —
+  `PASS` and `PASS-with-known-findings` both → `PASS`, `CHANGES-NEEDED` →
+  `CHANGES_NEEDED` — plus `tested_head=<reviewedHeadSha>`. The round record
+  itself keeps its own spelling unchanged; this is an ADDITIONAL structured pair
+  alongside it, read by the orchestrator's completion gate
+  (`VERIFIED_HEAD_COMPLETION`), never a replacement for the ledger entry.
 - Ship convergence: the round ledger is read at the start and written at the end
   of EVERY ship round; `maxRounds` and `regressionCountsDouble` come from the
   gate config, never from your own judgement; effective count >= `maxRounds` =

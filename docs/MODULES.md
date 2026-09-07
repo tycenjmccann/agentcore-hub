@@ -82,6 +82,41 @@ The orchestration pipeline. Self-contained surface.
 `PERFORMANCE_INDEX_KEY` (default `performance/index.json`), `PUBLISH_CW_METRICS`, `INFRA_REGION`;
 intake source validation: `SOURCE_VALIDATION_MODE` (`lenient` default | `strict`, see `src/lib/workflow/intake.ts`).
 
+**Verdict gate flags (TEAM-4246 D1, `lambda/orchestrator/`)** — three independent
+`off | shadow | enforce` flags, same convention as `LIVE_REVERIFY`: unset defaults
+to `shadow`, an unrecognized value falls to `off` (a typo must not silently
+enforce a hold). `shadow` only publishes the "would have…" observation event
+below and changes no ticket state; `enforce` writes the hold/block described.
+The single prose→verdict ladder they all read lives in the zero-import
+`lambda/orchestrator/verdict-contract.mjs` (`GATE_PERSONAS`, `VERDICTS`,
+`deriveVerdict`) — never duplicated elsewhere in this Lambda.
+- `VERDICT_GATE` — a gate persona's (`code_reviewer`/`qa_verifier`/`ci_agent`/
+  `release_manager`) non-`PASS` completion holds its cascade successor on the
+  fix ticket(s) it spawned, or — if it spawned none — on an orchestrator-filed
+  `kind:"gate"` re-verify ticket instead (`live-reverify.mjs`), so a gate refusal
+  with no fix ticket still blocks something.
+- `FIX_BEFORE_VERIFY` — a new fix ticket (`spawnedBy.kind` in `FIX_KINDS`) blocks
+  the run's open QA/CI siblings at ticket-creation time, so a verifier is never
+  dispatched against code a filed-but-unstarted fix has not touched yet.
+- `VERIFIED_HEAD_COMPLETION` — `completeWorkflow`'s gate #3: refuses to close the
+  run while QA's, CI's, and the shipped commit's heads disagree, or while any
+  fix ticket under the epic is still open in no required phase. `enforce` holds
+  completion and, on a head disagreement, files one stale-gate re-verify per
+  stale persona; the TS twin (`src/lib/workflow/verified-heads.ts`, used by
+  `POST /api/workflow/[id]/complete`) applies the identical predicate so the
+  human-driven completion route cannot bypass it. `heads.pr` is derived locally
+  — the latest recorded `commitSha` among done non-gate-persona tasks — never a
+  GitHub call, since the PR does not exist yet at this gate and the gate must
+  stay replayable offline.
+
+**New events (TEAM-4246 D1)**
+- `orchestrator.verdict_observed { workflowId, verdict, verdictSource, wouldSuppress, spawnedTickets, testedHead }` — `VERDICT_GATE=shadow`, every gate completion
+- `orchestrator.verdict_suppressed { workflowId, verdict, unblocked, blockers, spawnedTickets }` — `VERDICT_GATE=enforce`, a non-PASS gate held its successor
+- `orchestrator.fix_before_verify_observed { workflowId, fixId, wouldBlock }` — `FIX_BEFORE_VERIFY=shadow`, spelled `blocked` (not `wouldBlock`) under `enforce`
+- `orchestrator.completion_blocked { workflowId, reason, heads: { qa, ci, pr } }`, `reason` ∈ `"head-divergence" | "open-fix"` — `VERIFIED_HEAD_COMPLETION`, either mode; claimed once per `(workflow, reason, heads)` via `store.claimCompletionBlocked` so a redelivered completion attempt never double-escalates
+- `agent.complete` detail gained four optional keys on a gate persona's completion: `verdict`, `verdictSource` (`"declared" | "inferred" | "none"`, `null` for a non-gate persona), `testedHead`, `spawnedTickets` — written by `enrichCompleteDetail` in both `agent.complete` publish sites (webhook + DDB-stream) so the two twins can never diverge
+- `quality.gateMetricSource` (`"verdict-events" | "reviewGateHistory"`) on the cost-report performance card / fleet index — says whether `reworkRounds` / `gateRounds` / `firstPassYield` on that card came from the run's verdict events or (pre-D1 runs) the task/review-request fallback
+
 Fleet runtime agents (`deploy/runtime-agent`, see `DEPLOY.md`) additionally read:
 - `PERSONA_PROMPT_CACHE` — `1` (default on); Bedrock prompt caching for the persona system prompt + tools, set `0` to disable
 - `PERSONA_CACHE_TTL` — `1h` (`5m`|`1h`, default `1h`); prompt-cache TTL, invalid values fall back to `1h`

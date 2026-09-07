@@ -1,0 +1,262 @@
+{
+ "startedAt": "2026-09-06T21:47:08.575000Z",
+ "completedAt": "2026-09-06T23:46:58.351000Z",
+ "totalDurationMs": 7189776,
+ "phases": [
+  {
+   "phase": "design",
+   "enteredAt": "2026-09-06T22:09:39.724000Z",
+   "exitedAt": "2026-09-06T22:30:31.157000Z",
+   "durationMs": 1251433,
+   "taskCount": 1
+  },
+  {
+   "phase": "development",
+   "enteredAt": "2026-09-06T22:30:31.157000Z",
+   "exitedAt": "2026-09-06T23:19:21.210000Z",
+   "durationMs": 2930053,
+   "taskCount": 3
+  },
+  {
+   "phase": "verification",
+   "enteredAt": "2026-09-06T23:19:21.210000Z",
+   "exitedAt": "2026-09-06T23:46:58.351000Z",
+   "durationMs": 1657141,
+   "taskCount": 1
+  }
+ ],
+ "agentTasks": [
+  {
+   "ticketId": "TEAM-4164",
+   "agentId": "agentcore_hub_requirements_analyst",
+   "phase": "requirements",
+   "invokedAt": "2026-09-06T21:48:32.537000Z",
+   "completedAt": "2026-09-06T22:08:05.401000Z",
+   "durationMs": 1172864,
+   "status": "done",
+   "reworkCount": 0
+  },
+  {
+   "ticketId": "TEAM-4175",
+   "agentId": "agentcore_hub_frontend_designer",
+   "phase": "design",
+   "invokedAt": "2026-09-06T22:09:40.022000Z",
+   "completedAt": "2026-09-06T22:25:45.133000Z",
+   "durationMs": 965111,
+   "status": "done",
+   "reworkCount": 0
+  },
+  {
+   "ticketId": "TEAM-4177",
+   "agentId": "agentcore_hub_frontend_dev",
+   "phase": "development",
+   "invokedAt": "2026-09-06T22:30:31.517000Z",
+   "completedAt": "2026-09-06T22:41:48.321000Z",
+   "durationMs": 676804,
+   "status": "done",
+   "reworkCount": 0
+  },
+  {
+   "ticketId": "TEAM-4179",
+   "agentId": "agentcore_hub_frontend_dev",
+   "phase": "development",
+   "invokedAt": "2026-09-06T22:45:27.342000Z",
+   "completedAt": "2026-09-06T23:04:08.376000Z",
+   "durationMs": 1121034,
+   "status": "done",
+   "reworkCount": 0
+  },
+  {
+   "ticketId": "TEAM-4180",
+   "agentId": "agentcore_hub_code_reviewer",
+   "phase": "review",
+   "invokedAt": "2026-09-06T23:04:08.017000Z",
+   "completedAt": "2026-09-06T23:19:21.743000Z",
+   "durationMs": 913726,
+   "status": "done",
+   "reworkCount": 0
+  },
+  {
+   "ticketId": "TEAM-4181",
+   "agentId": "agentcore_hub_qa_verifier",
+   "phase": "verification",
+   "invokedAt": "2026-09-06T23:19:21.563000Z",
+   "completedAt": "2026-09-06T23:36:32.821000Z",
+   "durationMs": 1031258,
+   "status": "done",
+   "reworkCount": 0
+  },
+  {
+   "ticketId": "TEAM-4182",
+   "agentId": "agentcore_hub_ci_agent",
+   "phase": "review",
+   "invokedAt": "2026-09-06T23:36:32.551000Z",
+   "completedAt": "2026-09-06T23:42:11.459000Z",
+   "durationMs": 338908,
+   "status": "done",
+   "reworkCount": 0
+  },
+  {
+   "ticketId": "TEAM-4183",
+   "agentId": "agentcore_hub_frontend_dev",
+   "phase": "development",
+   "invokedAt": "2026-09-06T23:18:06.164000Z",
+   "completedAt": "2026-09-06T23:46:57.508000Z",
+   "durationMs": 1731344,
+   "status": "done",
+   "reworkCount": 0
+  }
+ ],
+ "humanReviews": [
+  {
+   "gateTicketId": "TEAM-4163",
+   "reviewer": "human:product-owner",
+   "gateName": "Intent Acceptance: Clear the Activity feed with an undo window",
+   "requestedAt": "2026-09-06T21:47:13.244000Z",
+   "resolvedAt": "2026-09-06T22:45:16.903000Z",
+   "waitMs": 3483659,
+   "outcome": "approved",
+   "cycle": 1,
+   "outsideHours": true
+  },
+  {
+   "gateTicketId": "TEAM-4174",
+   "reviewer": "human:product-owner",
+   "gateName": "Spec Approval: Clear the Activity feed with an undo window",
+   "requestedAt": "2026-09-06T22:08:05.251000Z",
+   "resolvedAt": "2026-09-06T22:45:20.193000Z",
+   "waitMs": 2234942,
+   "outcome": "approved",
+   "cycle": 1,
+   "outsideHours": true
+  },
+  {
+   "gateTicketId": "TEAM-4176",
+   "reviewer": "human:product-owner",
+   "gateName": "Design Approval: Clear the Activity feed with an undo window",
+   "requestedAt": "2026-09-06T22:25:45.057000Z",
+   "resolvedAt": "2026-09-06T22:45:22.235000Z",
+   "waitMs": 1177178,
+   "outcome": "approved",
+   "cycle": 1,
+   "outsideHours": true
+  },
+  {
+   "gateTicketId": "TEAM-4178",
+   "reviewer": "human:engineer",
+   "gateName": "Plan Approval: Clear the Activity feed with an undo window",
+   "requestedAt": "2026-09-06T22:41:48.200000Z",
+   "resolvedAt": "2026-09-06T22:45:24.214000Z",
+   "waitMs": 216014,
+   "outcome": "approved",
+   "cycle": 1,
+   "outsideHours": true
+  }
+ ],
+ "humanWaitTotalMs": 7111793,
+ "humanReviewsOutsideHours": 4,
+ "changeRequests": {
+  "count": 0,
+  "cycles": []
+ },
+ "fixTickets": {
+  "count": 1,
+  "ticketIds": [
+   "TEAM-4183"
+  ],
+  "entries": [
+   {
+    "ticketId": "TEAM-4183",
+    "kind": "codex_fix",
+    "originTicketId": null,
+    "round": 1,
+    "tag": "new",
+    "resurfacingSignal": null,
+    "paths": [
+     "activityfeed"
+    ],
+    "createdAt": "2026-09-06T16:18:00.262-0700",
+    "title": "Fix (review): ActivityFeed clear/undo \u2014 3 findings"
+   }
+  ],
+  "byKind": {
+   "codex_fix": 1
+  },
+  "byTag": {
+   "new": 1,
+   "resurfacing": 0,
+   "fix-induced": 0,
+   "environmental": 0
+  }
+ },
+ "nudgeCount": 0,
+ "managerInterventions": [
+  {
+   "action": "comment",
+   "ticketId": "TEAM-4181",
+   "at": "2026-09-06T23:31:04.239253Z",
+   "note": "Watch triage 23:30Z: false-positive stall. QA verifier live \u2014 last streamed 23:25:24Z ('Phase 1 gates green at HEAD 933ea6f\u2026 now the live browser verification'), 11 min into the task, 0 errors, 1 session. Parallel fix ticket TEAM-4183 (frontend_dev) also live, last streamed 23:20:11Z gathering approval decisions. No intervention; re-watch if QA silent past ~23:50Z with no verdict/artifact."
+  }
+ ],
+ "errors": [],
+ "tokens": null,
+ "evalSummaries": [
+  {
+   "agentId": "agentcore_hub_ci_agent",
+   "sessionCount": 0,
+   "avgScores": {}
+  },
+  {
+   "agentId": "agentcore_hub_code_reviewer",
+   "sessionCount": 0,
+   "avgScores": {}
+  },
+  {
+   "agentId": "agentcore_hub_frontend_designer",
+   "sessionCount": 0,
+   "avgScores": {}
+  },
+  {
+   "agentId": "agentcore_hub_frontend_dev",
+   "sessionCount": 0,
+   "avgScores": {}
+  },
+  {
+   "agentId": "agentcore_hub_qa_verifier",
+   "sessionCount": 0,
+   "avgScores": {}
+  },
+  {
+   "agentId": "agentcore_hub_requirements_analyst",
+   "sessionCount": 343,
+   "avgScores": {
+    "Correctness": 0.42,
+    "Builtin.ToolSelectionAccuracy": 0.9569,
+    "Builtin.ResponseRelevance": 0.9971,
+    "Builtin.Helpfulness": 0.8121,
+    "Builtin.Correctness": 0.9556,
+    "Builtin.GoalSuccessRate": 0.9675,
+    "Builtin.ToolParameterAccuracy": 0.9248,
+    "Builtin.InstructionFollowing": 0.7985,
+    "Builtin.Coherence": 0.9601,
+    "dependency_chain_compliance_online": 0.1771,
+    "Builtin.Faithfulness": 0.9885
+   }
+  }
+ ],
+ "counts": {
+  "tickets": 13,
+  "events": 80,
+  "artifacts": 35,
+  "completions": 8
+ },
+ "dataQuality": {
+  "ticketProvider": "jira",
+  "missingSignals": [
+   "no token_usage events \u2014 per-run tokens unavailable (eval-config token totals are fleet-lifetime, not per-run)"
+  ],
+  "notes": [
+   "evalSummaries are fleet-lifetime rolling averages, not per-run scores"
+  ]
+ }
+}

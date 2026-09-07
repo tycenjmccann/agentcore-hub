@@ -1102,3 +1102,380 @@ describe("TEAM-3755 F9 — blockers are confirmed by consistent point-read befor
     expect(redispatch).toHaveBeenCalledTimes(1);
   });
 });
+
+/**
+ * TEAM-4246 D1 — the gate-verdict binding.
+ *
+ * dowtdh's second hole, at the exact line it happened on: TEAM-4180 returned
+ * "VERDICT: CHANGES NEEDED" and TEAM-4181 (QA) was dispatched four seconds later,
+ * because this cascade only ever asked whether the ticket was DONE. What these tests
+ * pin is the three-effect suppression — no transition, no level-trigger dispatch, no
+ * orchestrator.unblocked — and, just as load-bearing, that `off` touches nothing at
+ * all so the rollout can start with the flag unset.
+ */
+describe("verdict gate (TEAM-4246 D1)", () => {
+  const FIX = "TEAM-4183";
+  const RV = "TEAM-4290";
+  const HEAD = "933ea6f1c2b3a4d5e6f70819202a3b4c5d6e7f80";
+  const SUCC = "TEAM-2";
+
+  const board = (over = {}) => [
+    { ticketId: DONE, status: "done", assignee: "agentcore_hub_code_reviewer", ...over.done },
+    { ticketId: SUCC, status: "blocked", blockedBy: [DONE], ...over.succ },
+    ...(over.extra || []),
+  ];
+
+  function gateHarness({
+    mode = "enforce",
+    siblings = board(),
+    gate = {},
+    reverifyResult = { action: "created", reverifyTicketId: RV, sha7: HEAD.slice(0, 7) },
+    reverifyImpl,
+    verdictGateImpl,
+    extendedStates,
+  } = {}) {
+    const { deps, ddb, publishEvent, sleep, getChildTickets } = makeDeps({
+      getChildTickets: vi.fn(async () => siblings),
+      ...(extendedStates ? {} : {}),
+    });
+    const verdictGate = vi.fn(
+      verdictGateImpl ||
+        (async () => ({
+          isGatePersona: true,
+          verdict: "CHANGES_NEEDED",
+          verdictSource: "declared",
+          testedHead: HEAD,
+          spawnedTickets: [FIX],
+          ...gate,
+        }))
+    );
+    const reverify = vi.fn(reverifyImpl || (async () => reverifyResult));
+    const addBlockers = vi.fn(async (_ticketId, ids) => ids);
+    Object.assign(deps, { verdictGate, verdictGateMode: mode, reverify, addBlockers }, extendedStates ? { extendedStates } : {});
+    const { cascadeUnblock } = createCascade(deps);
+    return { cascadeUnblock, deps, ddb, publishEvent, sleep, verdictGate, reverify, addBlockers, getChildTickets, siblings };
+  }
+
+  const detailOf = (publishEvent, type) => eventsOfType(publishEvent, type).map((c) => c[2]);
+
+  describe("off — pre-4246 behaviour, byte for byte", () => {
+    it("never even asks: the resolver and every new dep are untouched", async () => {
+      const h = gateHarness({ mode: "off" });
+
+      const unblocked = await h.cascadeUnblock(DONE, "EPIC-1", workflow);
+
+      expect(unblocked).toEqual([SUCC]);
+      expect(h.verdictGate).not.toHaveBeenCalled();
+      expect(h.reverify).not.toHaveBeenCalled();
+      expect(h.addBlockers).not.toHaveBeenCalled();
+      expect(statusWrites(h.ddb)).toHaveLength(1);
+      expect(eventsOfType(h.publishEvent, "orchestrator.unblocked")).toHaveLength(1);
+      expect(eventsOfType(h.publishEvent, "orchestrator.verdict_observed")).toHaveLength(0);
+      expect(eventsOfType(h.publishEvent, "orchestrator.verdict_suppressed")).toHaveLength(0);
+    });
+
+    it.each(["enfroce", "", "   ", "on", "true"])("an unrecognized mode (%s) is off", async (mode) => {
+      const h = gateHarness({ mode });
+
+      expect(await h.cascadeUnblock(DONE, "EPIC-1", workflow)).toEqual([SUCC]);
+      expect(h.verdictGate).not.toHaveBeenCalled();
+    });
+
+    it("a cascade built with NO verdictGateMode dep at all is off", async () => {
+      // index.mjs always passes one; every other caller (reconcile sweep tests, an
+      // older deployment mid-rollout) must keep the pre-4246 cascade.
+      const { deps, ddb } = makeDeps({ getChildTickets: vi.fn(async () => board()) });
+      const verdictGate = vi.fn(async () => ({ isGatePersona: true, verdict: "FAIL" }));
+      deps.verdictGate = verdictGate;
+      const { cascadeUnblock } = createCascade(deps);
+
+      expect(await cascadeUnblock(DONE, "EPIC-1", workflow)).toEqual([SUCC]);
+      expect(verdictGate).not.toHaveBeenCalled();
+      expect(statusWrites(ddb)).toHaveLength(1);
+    });
+
+    it("enforce with NO resolver wired is off — not a hold on nothing", async () => {
+      // A half-wired cascade (an older index.mjs, a test double) must degrade to the
+      // old behaviour rather than stall every successor in the run.
+      const { deps, ddb } = makeDeps({ getChildTickets: vi.fn(async () => board()) });
+      deps.verdictGateMode = "enforce";
+      const { cascadeUnblock } = createCascade(deps);
+
+      expect(await cascadeUnblock(DONE, "EPIC-1", workflow)).toEqual([SUCC]);
+      expect(statusWrites(ddb)).toHaveLength(1);
+    });
+  });
+
+  describe("shadow — observe, write nothing", () => {
+    it("cascades exactly as before AND reports what enforce would have held", async () => {
+      const h = gateHarness({ mode: "shadow" });
+
+      const unblocked = await h.cascadeUnblock(DONE, "EPIC-1", workflow);
+
+      expect(unblocked).toEqual([SUCC]);
+      expect(statusWrites(h.ddb)).toHaveLength(1);
+      expect(eventsOfType(h.publishEvent, "orchestrator.unblocked")).toHaveLength(1);
+      // Zero writes: no ticket, no blocker edge.
+      expect(h.reverify).not.toHaveBeenCalled();
+      expect(h.addBlockers).not.toHaveBeenCalled();
+      expect(detailOf(h.publishEvent, "orchestrator.verdict_observed")).toEqual([
+        {
+          workflowId: "wf_1",
+          verdict: "CHANGES_NEEDED",
+          verdictSource: "declared",
+          wouldSuppress: [SUCC],          // the REAL list, measured after the loop
+          spawnedTickets: [FIX],
+          // FR-D1.5/D1.6: what enforce would have held them ON — this persona's own
+          // fixes UNION every fix still open under the epic. This harness's resolver
+          // reports no other open fix, so the union is just [FIX] here; the wider
+          // case (a fix filed by another persona) is pinned in the enforce block
+          // below and, end to end, in replay-dowtdh-verdict-gate.
+          wouldBlockOn: [FIX],
+          testedHead: HEAD,
+        },
+      ]);
+    });
+
+    it("wouldSuppress is empty when there was nothing to unblock anyway", async () => {
+      // The rollout signal is "how much would enforce have held", so a non-PASS
+      // verdict whose successor is not ready to move must read as zero, not as one.
+      const h = gateHarness({
+        mode: "shadow",
+        siblings: board({ succ: { status: "blocked", blockedBy: [DONE, "TEAM-9"] } }),
+      });
+
+      await h.cascadeUnblock(DONE, "EPIC-1", workflow);
+
+      expect(detailOf(h.publishEvent, "orchestrator.verdict_observed")[0].wouldSuppress).toEqual([]);
+    });
+  });
+
+  describe("enforce — a non-PASS verdict holds the successor", () => {
+    it("holds on a fix this persona did NOT file, and files the re-verify behind it too (FR-D1.5/D1.6)", async () => {
+      // The dowtdh shape: the gate persona filed NOTHING (spawnedTickets []), and the
+      // fix that made it fail was filed by someone else. Holding only on what this
+      // persona filed would dispatch the re-verify against the unfixed head.
+      const FOREIGN = "TEAM-4183";
+      const h = gateHarness({ gate: { spawnedTickets: [], openEpicFixIds: [FOREIGN] } });
+
+      const unblocked = await h.cascadeUnblock(DONE, "EPIC-1", workflow);
+
+      expect(unblocked).toEqual([]);
+      // The successor waits on the foreign fix AND on the re-verify.
+      expect(h.addBlockers.mock.calls.map((c) => [c[0], c[1]])).toEqual([
+        [SUCC, [FOREIGN]],
+        [SUCC, [RV]],
+      ]);
+      // …and so does the re-verify itself: it must not run before the fix lands.
+      expect(h.reverify.mock.calls[0][0].blockedBy).toEqual([FOREIGN]);
+      expect(detailOf(h.publishEvent, "orchestrator.verdict_suppressed")[0]).toMatchObject({
+        blockers: [FOREIGN, RV],
+        spawnedTickets: [],   // reported verbatim: the blueprint-compliance signal
+      });
+    });
+
+    it("unions the persona's own fixes with the epic's, without duplicating either", async () => {
+      // The resolver reports its own fix in BOTH lists — it is an open epic fix too.
+      const OTHER = "TEAM-4191";
+      const h = gateHarness({ gate: { spawnedTickets: [FIX], openEpicFixIds: [FIX, OTHER] } });
+
+      await h.cascadeUnblock(DONE, "EPIC-1", workflow);
+
+      expect(h.reverify.mock.calls[0][0].blockedBy).toEqual([FIX, OTHER]);
+      expect(detailOf(h.publishEvent, "orchestrator.verdict_suppressed")[0].blockers).toEqual([FIX, OTHER, RV]);
+    });
+
+    it("suppresses the transition, the dispatch and the journal event together", async () => {
+      const dispatchReady = vi.fn(async () => {});
+      const h = gateHarness();
+      h.deps.dispatchReady = dispatchReady;
+      h.deps.levelTriggerDispatch = "enforce";
+      const { cascadeUnblock } = createCascade(h.deps);
+
+      const unblocked = await cascadeUnblock(DONE, "EPIC-1", workflow);
+
+      expect(unblocked).toEqual([]);
+      expect(statusWrites(h.ddb)).toHaveLength(0);
+      expect(dispatchReady).not.toHaveBeenCalled();
+      expect(eventsOfType(h.publishEvent, "orchestrator.unblocked")).toHaveLength(0);
+    });
+
+    it("holds on the fixes AND the gate's own re-verify ticket", async () => {
+      const h = gateHarness();
+
+      await h.cascadeUnblock(DONE, "EPIC-1", workflow);
+
+      // The fixes closing is not the gate passing — the re-verify is what makes the
+      // persona re-state its verdict at the head those fixes landed on.
+      expect(h.reverify).toHaveBeenCalledTimes(1);
+      expect(h.reverify.mock.calls[0][0]).toMatchObject({
+        kind: "gate",
+        owner: "agentcore_hub_code_reviewer",
+        headSha: HEAD,
+        blockedBy: [FIX],
+        round: 1,
+      });
+      expect(h.reverify.mock.calls[0][0].gateTicket.ticketId).toBe(DONE);
+      expect(h.addBlockers.mock.calls).toEqual([
+        [SUCC, [FIX], { preserveStatusIf: ["in_progress", "in_review"] }],
+        [SUCC, [RV], { preserveStatusIf: ["in_progress", "in_review"] }],
+      ]);
+      expect(detailOf(h.publishEvent, "orchestrator.verdict_suppressed")).toEqual([
+        { workflowId: "wf_1", verdict: "CHANGES_NEEDED", unblocked: [SUCC], blockers: [FIX, RV], spawnedTickets: [FIX] },
+      ]);
+    });
+
+    it("holds every successor, one edge per (successor, blocker) pair", async () => {
+      const h = gateHarness({
+        siblings: board({ extra: [{ ticketId: "TEAM-3", status: "todo", blockedBy: [DONE] }] }),
+      });
+
+      await h.cascadeUnblock(DONE, "EPIC-1", workflow);
+
+      expect(h.addBlockers).toHaveBeenCalledTimes(4);
+      expect(detailOf(h.publishEvent, "orchestrator.verdict_suppressed")[0].unblocked).toEqual([SUCC, "TEAM-3"]);
+    });
+
+    it("no fix ticket filed → the re-verify alone holds it (the blueprint-gap case)", async () => {
+      const h = gateHarness({ gate: { spawnedTickets: [] } });
+
+      await h.cascadeUnblock(DONE, "EPIC-1", workflow);
+
+      expect(h.reverify.mock.calls[0][0].blockedBy).toEqual([]);
+      expect(h.addBlockers.mock.calls).toEqual([[SUCC, [RV], { preserveStatusIf: ["in_progress", "in_review"] }]]);
+      expect(detailOf(h.publishEvent, "orchestrator.verdict_suppressed")[0]).toMatchObject({
+        blockers: [RV],
+        spawnedTickets: [],   // verbatim: THIS is the blueprint-compliance signal
+      });
+    });
+
+    it("a re-verify that could not be filed leaves the fixes holding it", async () => {
+      const h = gateHarness({ reverifyResult: { action: "failed" } });
+
+      const unblocked = await h.cascadeUnblock(DONE, "EPIC-1", workflow);
+
+      expect(unblocked).toEqual([]);
+      expect(h.addBlockers.mock.calls).toEqual([[SUCC, [FIX], { preserveStatusIf: ["in_progress", "in_review"] }]]);
+      expect(detailOf(h.publishEvent, "orchestrator.verdict_suppressed")[0].blockers).toEqual([FIX]);
+    });
+
+    it("NOTHING to hold on still refuses to unblock", async () => {
+      // The one case with no fail-open left: no fix ticket, and the re-verify could
+      // not be created. The successor stays where it is and the event says why.
+      const h = gateHarness({ gate: { spawnedTickets: [] }, reverifyResult: { action: "no-sha" } });
+
+      const unblocked = await h.cascadeUnblock(DONE, "EPIC-1", workflow);
+
+      expect(unblocked).toEqual([]);
+      expect(statusWrites(h.ddb)).toHaveLength(0);
+      expect(h.addBlockers).not.toHaveBeenCalled();
+      expect(detailOf(h.publishEvent, "orchestrator.verdict_suppressed")[0].blockers).toEqual([]);
+    });
+
+    it("a throw anywhere in the hold falls back to HOLDING, never to unblocking", async () => {
+      const h = gateHarness({ reverifyImpl: async () => { throw new Error("Jira 503"); } });
+
+      const unblocked = await h.cascadeUnblock(DONE, "EPIC-1", workflow);
+
+      expect(unblocked).toEqual([]);
+      expect(statusWrites(h.ddb)).toHaveLength(0);
+      expect(eventsOfType(h.publishEvent, "orchestrator.unblocked")).toHaveLength(0);
+    });
+
+    it("a resolver that throws before it knows anything cascades as before", async () => {
+      // Documented asymmetry: holding on an UNKNOWN would stall the ten non-gate
+      // personas' successors too, so the boundary only holds what it knows is a gate.
+      const h = gateHarness({ verdictGateImpl: async () => { throw new Error("S3 500"); } });
+
+      expect(await h.cascadeUnblock(DONE, "EPIC-1", workflow)).toEqual([SUCC]);
+    });
+
+    it("does not re-add an edge the successor already has", async () => {
+      const h = gateHarness({ siblings: board({ succ: { status: "blocked", blockedBy: [DONE, FIX] } }) });
+
+      await h.cascadeUnblock(DONE, "EPIC-1", workflow);
+
+      expect(h.addBlockers.mock.calls).toEqual([[SUCC, [RV], { preserveStatusIf: ["in_progress", "in_review"] }]]);
+    });
+
+    it("never re-blocks a successor that already finished", async () => {
+      const h = gateHarness({ siblings: board({ succ: { status: "done", blockedBy: [DONE] } }) });
+
+      await h.cascadeUnblock(DONE, "EPIC-1", workflow);
+
+      expect(h.addBlockers).not.toHaveBeenCalled();
+      expect(detailOf(h.publishEvent, "orchestrator.verdict_suppressed")[0].unblocked).toEqual([]);
+    });
+
+    it("a LIVE successor keeps its status — the edge is the point", async () => {
+      // in_progress/in_review reach Done through their own transition; stranding one
+      // in `blocked` would leave the `skip` alias as its only route out.
+      const h = gateHarness({
+        siblings: board({ succ: { status: "in_progress", blockedBy: [DONE] } }),
+        extendedStates: "enforce",
+      });
+
+      await h.cascadeUnblock(DONE, "EPIC-1", workflow);
+
+      expect(h.addBlockers.mock.calls.every((c) => c[2].preserveStatusIf.includes("in_progress"))).toBe(true);
+      expect(statusWrites(h.ddb)).toHaveLength(0);
+      // …and the extended-state path never ran on a ticket we are holding.
+      expect(eventsOfType(h.publishEvent, "orchestrator.nudge")).toHaveLength(0);
+    });
+
+    it("a held successor is not a stale-GSI victim: no re-fetch, no sleep", async () => {
+      const h = gateHarness();
+
+      await h.cascadeUnblock(DONE, "EPIC-1", workflow);
+
+      expect(h.sleep).not.toHaveBeenCalled();
+      expect(h.getChildTickets).toHaveBeenCalledTimes(1);
+    });
+
+    it("counts the rounds already on the board so a re-hold reads as the next one", async () => {
+      const h = gateHarness({
+        siblings: board({
+          extra: [{ ticketId: "TEAM-4288", spawnedBy: { kind: "review_fix", rearmOf: DONE, round: 2 } }],
+        }),
+      });
+
+      await h.cascadeUnblock(DONE, "EPIC-1", workflow);
+
+      expect(h.reverify.mock.calls[0][0].round).toBe(2);
+    });
+  });
+
+  describe("what does NOT hold", () => {
+    it.each([
+      ["a PASS verdict", { verdict: "PASS" }],
+      ["no verdict at all", { verdict: null, verdictSource: "none" }],
+      ["a non-gate persona", { isGatePersona: false, verdict: "FAIL" }],
+    ])("%s cascades and publishes nothing", async (_label, gate) => {
+      for (const mode of ["shadow", "enforce"]) {
+        const h = gateHarness({ mode, gate, siblings: board() });
+
+        expect(await h.cascadeUnblock(DONE, "EPIC-1", workflow)).toEqual([SUCC]);
+        expect(h.reverify).not.toHaveBeenCalled();
+        expect(h.addBlockers).not.toHaveBeenCalled();
+        expect(eventsOfType(h.publishEvent, "orchestrator.verdict_observed")).toHaveLength(0);
+        expect(eventsOfType(h.publishEvent, "orchestrator.verdict_suppressed")).toHaveLength(0);
+      }
+    });
+
+    it("a resolver that returns nothing means 'nothing known'", async () => {
+      for (const value of [null, undefined, {}]) {
+        const h = gateHarness({ verdictGateImpl: async () => value, siblings: board() });
+
+        expect(await h.cascadeUnblock(DONE, "EPIC-1", workflow)).toEqual([SUCC]);
+        expect(eventsOfType(h.publishEvent, "orchestrator.verdict_suppressed")).toHaveLength(0);
+      }
+    });
+
+    it.each(["FAIL", "BLOCKED", "CHANGES_NEEDED"])("%s holds", async (verdict) => {
+      const h = gateHarness({ gate: { verdict }, siblings: board() });
+
+      expect(await h.cascadeUnblock(DONE, "EPIC-1", workflow)).toEqual([]);
+      expect(detailOf(h.publishEvent, "orchestrator.verdict_suppressed")[0].verdict).toBe(verdict);
+    });
+  });
+});

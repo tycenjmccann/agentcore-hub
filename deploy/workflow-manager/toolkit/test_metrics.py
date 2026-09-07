@@ -15,8 +15,11 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from compute_metrics import (  # noqa: E402
     business_window,
+    compute_gate_verdicts,
     compute_metrics,
+    derive_verdict,
     intake_completed_at,
+    normalize_verdict,
     is_outside_hours,
     jaccard,
     title_fix_kind,
@@ -943,6 +946,119 @@ class OutsideHours(unittest.TestCase):
         # The 7-hour wait RealDossierFixtures pins is unchanged — this only
         # explains it, it does not restate it.
         self.assertEqual(review["waitMs"], 25255120)
+
+
+class GateVerdicts(unittest.TestCase):
+    """TEAM-4246 D1 FR-D1.11 — gate accounting from the verdict a gate stated.
+
+    wf_1788731227559_dowtdh shipped over three failing gate verdicts, and every
+    pre-D1 metric reported the run as clean: `changeRequests` counts a HUMAN gate
+    being rejected and no human rejected anything, so the number was 0 while the
+    reviewer had said CHANGES NEEDED, QA had said FAIL, and CI had PASSed at QA's
+    evidence commit rather than the code head.
+
+    The retro ladder here and the canonical one in verdict-contract.mjs cannot
+    share code, so they share these three FIXTURE SUMMARIES:
+    verdict-contract.test.mjs pins TEAM-4180 → CHANGES_NEEDED, TEAM-4181 → FAIL,
+    TEAM-4182 → PASS off the identical strings. That agreement IS the cross-language
+    parity mechanism (plan risk 3); a drift only ever moves retro numbers, because
+    no gate decision reads this file.
+    """
+
+    def load(self, name):
+        with open(FIXTURES / f"{name}-dossier.json") as f:
+            return json.load(f)
+
+    def test_dowtdh_gate_rounds_and_first_pass_yield(self):
+        m = compute_metrics(self.load("dowtdh"))
+        q = m["quality"]
+        # The acceptance criterion is a floor — the fixture is a REDUCED dossier
+        # and what matters is that the refusals are visible at all.
+        self.assertGreaterEqual(q["reworkRounds"], 1)
+        self.assertGreaterEqual(q["gateRounds"], 2)
+        # The exact numbers, since the fixture is vendored and never changes: the
+        # reviewer's CHANGES NEEDED and QA's FAIL are the two reworks, and CI's
+        # PASS is the third round. cost-report's index.test.mjs asserts the same
+        # 2 / 3 / 0 for the same three verdicts from JavaScript.
+        self.assertEqual((q["reworkRounds"], q["gateRounds"]), (2, 3))
+        # The whole point: this run did not yield on the first pass, and the
+        # pre-D1 metrics said nothing at all about it.
+        self.assertEqual(q["firstPassYield"], 0)
+        # …and the number changeRequests reports for the same run, for contrast.
+        self.assertEqual(m["changeRequests"]["count"], 0)
+
+        # The per-ticket detail, which is what a reviewer actually reads.
+        by_ticket = {r["ticketId"]: r for r in q["verdicts"]}
+        self.assertEqual(by_ticket["TEAM-4180"]["verdict"], "CHANGES_NEEDED")
+        self.assertEqual(by_ticket["TEAM-4181"]["verdict"], "FAIL")
+        self.assertEqual(by_ticket["TEAM-4182"]["verdict"], "PASS")
+        # Every one of them read out of prose: the fixture predates the field.
+        self.assertEqual({r["verdictSource"] for r in q["verdicts"]}, {"inferred"})
+        self.assertEqual(
+            by_ticket["TEAM-4181"]["agentId"], "agentcore_hub_qa_verifier")
+
+    def test_the_ladder_agrees_with_verdict_contract_on_the_literal_summaries(self):
+        """The cross-language parity check, on the three real summaries.
+
+        The strings come out of the fixture rather than being retyped here, so this
+        cannot pass against prose that no persona ever wrote.
+        """
+        completions = self.load("dowtdh")["completions"]
+        expected = {
+            "TEAM-4180": "CHANGES_NEEDED",  # "VERDICT: CHANGES NEEDED (round 1)."
+            "TEAM-4181": "FAIL",            # "VERDICT: FAIL — feature works …"
+            "TEAM-4182": "PASS",            # "CI verdict: PASS (legacy self-run …"
+        }
+        for ticket_id, verdict in expected.items():
+            summary = completions[ticket_id]["summary"]
+            with self.subTest(ticket_id):
+                self.assertEqual(derive_verdict(summary), verdict)
+
+        # The spellings the repo actually contains, all three reading as one value
+        # (blueprint prose, the persisted reviewGateHistory round, the wire value).
+        for raw in ("CHANGES NEEDED", "CHANGES-NEEDED", "changes_needed"):
+            self.assertEqual(normalize_verdict(raw), "CHANGES_NEEDED")
+        # review-cap's own spelling of a passing round.
+        self.assertEqual(normalize_verdict("PASS-with-known-findings"), "PASS")
+        # Prose with no verdict in it stays None — a wrong verdict is worse than
+        # none, because none leaves the pre-4246 numbers in place.
+        for summary in (None, "", "npm test 57/57 green, 0 Critical", "GH Actions passed"):
+            self.assertIsNone(derive_verdict(summary))
+
+    def test_a_declared_verdict_on_the_event_beats_the_prose(self):
+        """D1-onward dossiers carry `detail.verdict`; the ladder is the fallback."""
+        d = self.load("dowtdh")
+        for e in d["events"]:
+            if e.get("type") == "agent.complete" and (e.get("detail") or {}).get("ticketId") == "TEAM-4181":
+                e["detail"]["verdict"] = "PASS"  # what the agent would have declared
+        q = compute_metrics(d)["quality"]
+        by_ticket = {r["ticketId"]: r for r in q["verdicts"]}
+        self.assertEqual(by_ticket["TEAM-4181"]["verdict"], "PASS")
+        self.assertEqual(by_ticket["TEAM-4181"]["verdictSource"], "declared")
+        # The reviewer's CHANGES_NEEDED is still inferred, and still counts.
+        self.assertEqual(by_ticket["TEAM-4180"]["verdictSource"], "inferred")
+        self.assertEqual(q["reworkRounds"], 1)
+
+    def test_no_gate_completion_means_no_yield_rather_than_a_zero(self):
+        """"Nothing stated" is not "failed" — a run with no gate rows reports None."""
+        q = compute_gate_verdicts([], {})
+        self.assertEqual(q, {"reworkRounds": 0, "gateRounds": 0, "firstPassYield": None, "verdicts": []})
+        # A non-gate persona's completion is not a gate round, whatever it declares.
+        events = [ev(10, "agent.complete", {"ticketId": "T-1", "agentId": "agentcore_hub_backend_dev", "verdict": "FAIL"})]
+        self.assertEqual(compute_gate_verdicts(events, {})["gateRounds"], 0)
+
+    def test_the_first_verdict_decides_the_yield(self):
+        """A re-verify PASS does not retroactively earn a first-pass yield."""
+        events = [
+            ev(10, "agent.complete", {"ticketId": "T-1", "agentId": "agentcore_hub_qa_verifier", "verdict": "FAIL"}),
+            ev(60, "agent.complete", {"ticketId": "T-2", "agentId": "agentcore_hub_qa_verifier", "verdict": "PASS"}),
+        ]
+        q = compute_gate_verdicts(events, {})
+        self.assertEqual((q["gateRounds"], q["reworkRounds"], q["firstPassYield"]), (2, 1, 0))
+        # A red CI is a gate round, but not the dev work going back.
+        ci = [ev(10, "agent.complete", {"ticketId": "T-1", "agentId": "agentcore_hub_ci_agent", "verdict": "FAIL"})]
+        q = compute_gate_verdicts(ci, {})
+        self.assertEqual((q["gateRounds"], q["reworkRounds"], q["firstPassYield"]), (1, 0, 0))
 
 
 if __name__ == "__main__":

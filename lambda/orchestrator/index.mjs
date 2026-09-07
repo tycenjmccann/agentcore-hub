@@ -49,8 +49,11 @@ import { createMergeOnGreen } from "./merge-on-green.mjs";
 import { createShipHeadGate, createGitHubShipHeadProbe } from "./ship-head-stability.mjs";
 import { shouldGateShipDispatch, normalizeShipDispatchMode, emitShipDispatchMetrics } from "./ship-dispatch-gate.mjs";
 import { createReworkLoopCap, normalizeReworkLoopMode } from "./rework-loop-cap.mjs";
-import { createLiveReverify, normalizeLiveReverifyMode } from "./live-reverify.mjs";
-import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, SHIP_PHASES, SHIP_BLOCKED_OUTCOMES, TERMINAL_WORKFLOW_PHASES, FIX_KINDS, REWORK_FIX_KINDS, normalizeAdvisoryRoutingMode, isAdvisoryTicket, nonAdvisory } from "./completion.mjs";
+// LIVE_SHIP_STATUSES: the statuses a blocker edge must never yank a ticket out of.
+// Imported (as cascade.mjs does) rather than re-listed, so "what is mid-flight" has
+// one definition across the live re-verify, the verdict hold and FR-D1.7.
+import { createLiveReverify, normalizeLiveReverifyMode, LIVE_SHIP_STATUSES } from "./live-reverify.mjs";
+import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, evaluateVerifiedHeads, SHIP_PHASES, SHIP_BLOCKED_OUTCOMES, TERMINAL_WORKFLOW_PHASES, FIX_KINDS, REWORK_FIX_KINDS, normalizeAdvisoryRoutingMode, isAdvisoryTicket, nonAdvisory } from "./completion.mjs";
 import { isPipelineEnabled } from "./pipeline-enabled.mjs";
 import { CD_REGISTRY_KEY, EMPTY_CD_REGISTRY, parseCdRegistry, isCdRegistered, effectiveWorkflowDef, resolveDelivery, deliveryModeContext } from "./cd-registry.mjs";
 import { ensureRepoCheck, formatRepoCheckWarning } from "./repo-check.mjs";
@@ -60,6 +63,13 @@ import { eventIdFor, normalizeEventDedupeMode } from "./event-id.mjs";
 import { GATE_STATES, classifyRejection, normalizeGateGuardMode } from "./gate-state.mjs";
 import { createDeadSessionEscalation, normalizeEscalationMode } from "./dead-session-escalation.mjs";
 import { applyBlockerEdge, normalizePreserveStatuses } from "./ticket-blockers.mjs";
+// TEAM-4246 D1: what a gate persona's verdict IS — also a zero-import module, and
+// statically imported for the same reason ticket-blockers.mjs is:
+// scripts/check-lambda-zip-manifest.sh walks STATIC sibling-import edges only, so
+// a dynamic import would leave the new deploy.sh zip entry unenforced. The
+// module is pure (no clock, no AWS, no env beyond one normalizer), so importing it
+// with all three flags off costs a parse and nothing else.
+import { normalizeVerdictMode, GATE_PERSONAS, resolveVerdict, resolveTestedHead, enrichCompleteDetail, selectFixBeforeVerifyTargets, selectOpenEpicFixes } from "./verdict-contract.mjs";
 // TEAM-4121 FR-8: the fix-ticket contract lives in a zero-import module that is
 // byte-identical across the orchestrator + both ticket Lambdas (CI cmp's them).
 // The orchestrator only READS contracts — it maps a Jira issue's labels and
@@ -256,6 +266,45 @@ const SYNC_MAIN_BEFORE_CI = normalizeSyncMode(process.env.SYNC_MAIN_BEFORE_CI);
 // either lie to the agent or do nothing at all. STRICT allow-list (garbage → off)
 // because enforce changes what the run waits on. Instant rollback = set off.
 const ADVISORY_ROUTING = normalizeAdvisoryRoutingMode(process.env.ADVISORY_ROUTING);
+
+// ─── Gate-verdict binding (TEAM-4246 D1) ──────────────────────────────────────
+//
+// Three flags, one failure. Run wf_1788731227559_dowtdh shipped over its own
+// verdicts: the reviewer returned "VERDICT: CHANGES NEEDED" and QA was dispatched
+// 4s later, QA returned "VERDICT: FAIL" and CI was dispatched 4s later, CI
+// certified head 12e9ac6 while QA had verified 933ea6f, the fix landed at 001259d
+// and `workflow.complete` fired 5s after that. Nothing was broken — a verdict has
+// never been anything but prose, the cascade unblocks on ticket-DONE, and
+// completion never compared the heads.
+//
+// All three DEFAULT TO SHADOW, which is the opposite of every other flag in this
+// file, and deliberately: the holes are invisible today, so a rollout that
+// observes nothing tells us nothing about how often they open. Shadow writes no
+// ticket, no blocker edge and no workflow row — it publishes events. Garbage → off
+// (normalizeVerdictMode), so a typo can never mint a ticket or hold a cascade.
+// NOTE: because these default to shadow, `off` must be set EXPLICITLY.
+// Instant rollback = set off.
+
+// VERDICT_GATE — the cascade gate. shadow = publish
+// `orchestrator.verdict_observed` with what WOULD have been suppressed; enforce =
+// a non-PASS gate verdict holds its successor on the fix ticket (or, if the
+// persona filed none, on a re-verify ticket the orchestrator files) so
+// `orchestrator.unblocked` does not fire. off = the cascade behaves exactly as it
+// does today.
+const VERDICT_GATE = normalizeVerdictMode(process.env.VERDICT_GATE);
+
+// FIX_BEFORE_VERIFY — the creation-time half of the same hole. dowtdh's TEAM-4183
+// was created with `blockedBy: []`, so QA was dispatched against un-fixed code 78s
+// later. enforce blocks the run's open, not-yet-started gate tickets on a new fix
+// ticket at INSERT; shadow publishes `orchestrator.fix_before_verify_observed`.
+const FIX_BEFORE_VERIFY = normalizeVerdictMode(process.env.FIX_BEFORE_VERIFY);
+
+// VERIFIED_HEAD_COMPLETION — the last line. A run may not close green while the
+// reviewed, CI-certified and shipped heads disagree, or while a non-advisory fix
+// ticket in the epic is still open. enforce publishes
+// `orchestrator.completion_blocked` and refuses; shadow warns and completes.
+const VERIFIED_HEAD_COMPLETION = normalizeVerdictMode(process.env.VERIFIED_HEAD_COMPLETION);
+
 /**
  * The children a completion GATE may consider (TEAM-4122 FR-7). Under enforce an
  * advisory ticket owes the run nothing — no deliverable evidence, no merge
@@ -737,6 +786,26 @@ function getCascade() {
     blockTicket: blockTicketForFailedInvoke,
     // TEAM-4120 FR-3 — same hook as the detector; undefined when off.
     escalate: getDeadSessionEscalation()?.escalateExhausted,
+    // TEAM-4246 D1 — the verdict gate. `verdictGateMode` is read unconditionally
+    // (cascade.mjs itself normalizes off|shadow|enforce), but `verdictGate` stays
+    // null under "off" so an off deployment calls the resolver ZERO times — byte
+    // for byte the pre-4246 cascade, not just an early return inside it.
+    verdictGateMode: VERDICT_GATE,
+    ...(VERDICT_GATE !== "off"
+      ? {
+          verdictGate: (args) =>
+            resolveVerdictInfo({
+              ticketId: args?.ticketId,
+              workflow: args?.workflow,
+              siblings: args?.siblings,
+              parentId: args?.workflow?.epicId || args?.workflow?.parentId,
+            }),
+          // Same factory as observeLiveReverify's kind:"ship" path — one memo,
+          // one idempotency store, whichever kind asks first.
+          reverify: (args) => getLiveReverify().reverify(args),
+          addBlockers,
+        }
+      : { verdictGate: null }),
   });
   return _cascade;
 }
@@ -897,6 +966,111 @@ async function readCompletionRecord(ticketId) {
   return p;
 }
 
+// ─── Gate-persona verdicts (TEAM-4246 D1) ────────────────────────────────────
+
+/**
+ * The fix tickets a gate persona filed DURING this task: its own children on the
+ * board, matched through the same `spawnedBy` origin key the fix contract writes
+ * (`review_fix` → `gateTicketId`, `qa_fix` → `qaTicketId`, …).
+ *
+ * Two exclusions, both load-bearing:
+ *   - re-verify tickets (`spawnedBy.reverify` / `rearmOf`) are ORCHESTRATOR-filed,
+ *     not persona-filed. Counting one would let a prior round's re-verify come back
+ *     as a blocker for the next round, and would report the orchestrator's own
+ *     bookkeeping as the reviewer's findings.
+ *   - closed ones. The list is used as the successor's blockers, and a done fix is
+ *     not something to wait on. (`isOpen` mirrors completion.mjs's module-private
+ *     predicate of the same name — same two terminal statuses.)
+ */
+function spawnedFixIdsFor(ticketId, siblings) {
+  const isOpen = (t) => t?.status !== "done" && t?.status !== "cancelled";
+  const out = [];
+  for (const t of Array.isArray(siblings) ? siblings : []) {
+    const kind = t?.spawnedBy?.kind;
+    if (!kind || !FIX_KINDS.has(kind)) continue;
+    if (t.spawnedBy.reverify === true || t.spawnedBy.rearmOf) continue;
+    const originKey = KIND_TO_ORIGIN_KEY[kind];
+    if (!originKey || t.spawnedBy[originKey] !== ticketId) continue;
+    if (!isOpen(t)) continue;
+    const id = t.ticketId || t.key;
+    if (id && !out.includes(id)) out.push(id);
+  }
+  return out;
+}
+
+/**
+ * What a just-completed persona actually DECIDED — the ONE resolver behind both
+ * the cascade's verdict gate (cascade.mjs `verdictGate` dep) and the two
+ * `agent.complete` twins, so "what did this ticket decide" cannot answer two
+ * different things inside a single invocation.
+ *
+ * Inputs, in order of what they cost:
+ *   - the completion record, memoized above. harvestCompletionEvidence already
+ *     fetched it a few lines earlier on both done paths, so this is a cache hit,
+ *     not a second S3 GET.
+ *   - the sibling snapshot. The cascade HAS one and passes it; the twins do not, so
+ *     for a gate persona this reads the children once (a GSI query, or the same JQL
+ *     the cascade just ran) and memoizes the answer. Deliberately paid regardless
+ *     of VERDICT_GATE: the `agent.complete` detail must be identical whatever the
+ *     flag says (verdict-contract.mjs enrichCompleteDetail, replay criterion (e)),
+ *     and resolving spawnedTickets only when the gate is on would make it differ.
+ *     Non-gate personas return before any I/O at all.
+ *
+ * Never throws, and a record it cannot read yields a null verdict — which by
+ * contract holds nothing. That is the same outcome as a persona who stated nothing
+ * the ladder recognizes, and it is the only safe reading: the record is the sole
+ * input, so there is no second opinion to fall back to, and holding every successor
+ * over a transient S3 error would stall runs instead of gating them.
+ */
+let _verdictInfoCache = new Map();
+function resetVerdictInfoCache() {
+  _verdictInfoCache = new Map();
+}
+function resolveVerdictInfo({ ticketId, assignee, workflow, parentId, siblings } = {}) {
+  if (!ticketId) return Promise.resolve(NO_VERDICT_INFO);
+  if (_verdictInfoCache.has(ticketId)) return _verdictInfoCache.get(ticketId);
+  const p = computeVerdictInfo({ ticketId, assignee, workflow, parentId, siblings });
+  _verdictInfoCache.set(ticketId, p);
+  return p;
+}
+const NO_VERDICT_INFO = { isGatePersona: false, verdict: null, verdictSource: null, spawnedTickets: [], testedHead: "", openEpicFixIds: [] };
+async function computeVerdictInfo({ ticketId, assignee, workflow, parentId, siblings }) {
+  try {
+    const agentId =
+      assignee ||
+      (Array.isArray(siblings) ? siblings.find((t) => (t?.ticketId || t?.key) === ticketId)?.assignee : null) ||
+      workflow?.agentTasks?.[ticketId]?.agentId ||
+      null;
+    if (!GATE_PERSONAS.has(agentId)) return NO_VERDICT_INFO;
+    const record = await readCompletionRecord(ticketId);
+    const { verdict, verdictSource } = resolveVerdict(record, agentId);
+    const children =
+      Array.isArray(siblings) ? siblings : await getChildTickets(parentId || workflow?.epicId).catch(() => []);
+    return {
+      isGatePersona: true,
+      verdict,
+      verdictSource,
+      // Structured fields only, record first: the S3 record carries tested_head /
+      // ci_head_sha, and agentTasks is the fallback because the harvested commitSha
+      // is what every gate persona has always reported.
+      testedHead: resolveTestedHead(record) || resolveTestedHead(workflow?.agentTasks?.[ticketId]) || "",
+      spawnedTickets: spawnedFixIdsFor(ticketId, children),
+      // FR-D1.5/D1.6 — every open fix under the epic, not just this persona's own.
+      // dowtdh's QA failed over the REVIEWER's still-open TEAM-4183 and filed nothing
+      // itself, so `spawnedTickets` alone would have re-verified an unfixed head.
+      openEpicFixIds: selectOpenEpicFixes({
+        siblings: children,
+        excludeTicketId: ticketId,
+        isFixKind: (kind) => FIX_KINDS.has(kind),
+        isAdvisory: isAdvisoryTicket,
+      }),
+    };
+  } catch (err) {
+    console.warn(`[verdict] could not resolve ${ticketId}'s verdict (non-fatal): ${err?.message || err}`);
+    return { ...NO_VERDICT_INFO, isGatePersona: true, verdictSource: "none" };
+  }
+}
+
 /**
  * Observe a just-completed FIX ticket for live re-verification (TEAM-4121 FR-9).
  * Called from BOTH done paths, right after observeReworkLoop. Cheap + non-fatal:
@@ -914,6 +1088,58 @@ async function observeLiveReverify(workflow, ticket) {
     });
   } catch (err) {
     console.warn(`[orchestrator] live-reverify observe failed (non-fatal): ${err?.message || err}`);
+  }
+}
+
+/**
+ * Fix before verify (TEAM-4246 D1, FR-D1.7) — the CREATION-time half of the
+ * verdict hole the cascade gate closes at completion time.
+ *
+ * dowtdh: TEAM-4183 (`Fix (review): ActivityFeed clear/undo — 3 findings`) was
+ * created at 23:18:03 with `blockedBy: []`, and QA TEAM-4181 was dispatched 78
+ * seconds later — against code the fix had not landed on. Waiting for the next
+ * cascade cannot fix that: by then the verifier has already run. So the edge is
+ * written when the fix ticket appears.
+ *
+ * Cheap and dark by default: returns before any I/O for a non-fix ticket or when
+ * FIX_BEFORE_VERIFY=off, publishes-and-writes-nothing under shadow, and the whole
+ * body sits in a non-throwing boundary — a stream record must never be retried
+ * (or a ticket never routed) because an advisory blocker edge could not be
+ * written. Idempotent on twin/redelivered INSERTs: a target already carrying
+ * `fixId` in blockedBy is not a target, so the second delivery selects nothing
+ * and publishes nothing.
+ */
+async function observeFixBeforeVerify(fixId, { workflowId, parentId, spawnedBy } = {}) {
+  if (FIX_BEFORE_VERIFY === "off" || !fixId || !parentId) return [];
+  if (!spawnedBy?.kind || !FIX_KINDS.has(spawnedBy.kind)) return [];
+  try {
+    const siblings = (await getChildTickets(parentId)) || [];
+    const targets = selectFixBeforeVerifyTargets({
+      fixId,
+      siblings,
+      isFixKind: (kind) => FIX_KINDS.has(kind),
+      isAdvisory: isAdvisoryTicket,
+      // Board field first, roster second: a ticket the tickets Lambda stamped with
+      // an explicit phase means it, and the roster is the fallback for one that
+      // did not (and the reason ci_agent is ALSO matched by explicit id).
+      phaseOf: (t) => t?.phase || getAgentDef(t?.assignee)?.phase || null,
+    });
+    // Nothing to hold: publish nothing. An event per fix ticket saying "no open
+    // verifiers" would bury the ones that matter.
+    if (targets.length === 0) return [];
+
+    if (FIX_BEFORE_VERIFY === "enforce") {
+      for (const target of targets) {
+        await addBlockers(target, [fixId], { preserveStatusIf: LIVE_SHIP_STATUSES });
+      }
+      await publishEvent(fixId, "orchestrator.fix_before_verify_observed", { workflowId: workflowId || null, fixId, blocked: targets });
+    } else {
+      await publishEvent(fixId, "orchestrator.fix_before_verify_observed", { workflowId: workflowId || null, fixId, wouldBlock: targets });
+    }
+    return targets;
+  } catch (err) {
+    console.warn(`[orchestrator] fix-before-verify observe failed (non-fatal): ${err?.message || err}`);
+    return [];
   }
 }
 
@@ -1380,6 +1606,9 @@ export const handler = async (event) => {
   // a timer: a record written between two invocations must be visible to the
   // second one, otherwise re-Done'ing a ticket could not pick up late evidence.
   resetCompletionRecordCache();
+  // Same per-invocation reasoning, same reason (TEAM-4246 D1) — a verdict decided
+  // between two invocations must be re-read, not replayed from a warm container.
+  resetVerdictInfoCache();
   // Load roster + workflow defs from S3 on first invocation (cached for warm starts)
   await loadAgentRoster();
   await loadWorkflowDefs();
@@ -1550,6 +1779,17 @@ async function processStatusChange(ticketId, newStatus, oldStatus) {
       // unpublishable advisory must never block the ticket from being routed.
       await emitContractWarning(ticketId, todoTicket);
 
+      // TEAM-4246 D1 FR-D1.7 — the jira-mode twin of the fix-before-verify hook.
+      // This is the path the hub actually runs (TICKET_PROVIDER=jira), and dowtdh
+      // is a jira run: without this call the DDB-stream twin below would be the
+      // only writer and the gate would be dark in production. Same shape as the
+      // stream twin, off the ticket we already read; inert when FIX_BEFORE_VERIFY=off.
+      await observeFixBeforeVerify(ticketId, {
+        workflowId: todoTicket.workflowId,
+        parentId: todoTicket.parentId,
+        spawnedBy: todoTicket.spawnedBy,
+      });
+
       if (TICKET_PROVIDER === "jira") {
         // Jira mode: the agentcore-hub-jira Lambda handles initial routing by transitioning
         // to "Ready" (no blockers) or "Blocked" (has blockers) AFTER creating links.
@@ -1689,7 +1929,18 @@ export async function handleTicketDoneUnified(ticketId) {
     console.error(`[orchestrator] cascade failed for ${ticketId} — publishing completion anyway: ${err?.message || err}`);
   }
 
-  await publishEvent(ticketId, "agent.complete", { ticketId, assignee, agentId: assignee, unblocked, workflowId: workflow?.id });
+  // TEAM-4246 D1 — enrichCompleteDetail is the ONE place that decides what a
+  // gate persona's completion carries. Both agent.complete twins call it with
+  // the same argument shape so the detail cannot differ depending on which path
+  // a ticket happened to close on (replay criterion (e)).
+  await publishEvent(
+    ticketId,
+    "agent.complete",
+    enrichCompleteDetail(
+      { ticketId, assignee, agentId: assignee, unblocked, workflowId: workflow?.id },
+      await resolveVerdictInfo({ ticketId, assignee, workflow, parentId })
+    )
+  );
 
   // TEAM-4113 — observe the per-phase rework loop (no-op when off / non-fix).
   await observeReworkLoop(workflow, ticket);
@@ -1935,7 +2186,16 @@ async function harvestCompletionEvidence(workflow, ticketId) {
     (typeof entry?.mergeCommit === "string" && entry.mergeCommit.trim().length > 0) ||
     (typeof entry?.commitSha === "string" && entry.commitSha.trim().length > 0) ||
     (typeof entry?.outcome === "string" && entry.outcome.trim().length > 0);
-  if (hasEvidence && hasShipSignal) return;
+  // TEAM-4246 D1: the SAME argument again, one gate later. A gate persona's ticket
+  // has a summary AND a commit_sha on essentially every completion, so both
+  // clauses above are already true and the harvest used to return before ever
+  // reading the record — leaving the verdict and the tested head unharvested on
+  // exactly the tickets whose verdict and head the D1 gates exist to read. dowtdh
+  // is the proof: three gate completions, not one recorded verdict or head.
+  const hasVerdictSignal =
+    (typeof entry?.verdict === "string" && entry.verdict.trim().length > 0) ||
+    (typeof entry?.testedHead === "string" && entry.testedHead.trim().length > 0);
+  if (hasEvidence && hasShipSignal && hasVerdictSignal) return;
   try {
     // Shared per-invocation read (TEAM-4121 FR-9): the live-reverify hook needs
     // the same record moments later, and one GET serves both.
@@ -1965,6 +2225,26 @@ async function harvestCompletionEvidence(workflow, ticketId) {
     }
     if (record.block_reason && !entry?.blockReason) {
       fields.blockReason = String(record.block_reason).slice(0, 500);
+    }
+    // TEAM-4246 D1 — the verdict/head signals, same additive fill-if-absent rule.
+    // `verdict` is harvested DECLARED-ONLY (the value the agent put in the field,
+    // written through workflow-output's allow-list): the prose ladder's answer is
+    // resolved live by resolveVerdictInfo, and persisting an inference here would
+    // make `verdictSource: "declared"` a lie on the entry every later reader trusts.
+    if (record.ci_head_sha && !entry?.ci_head_sha) fields.ci_head_sha = record.ci_head_sha;
+    if (record.ci_status && !entry?.ci_status) fields.ci_status = record.ci_status;
+    if (record.evidence_kind && !entry?.evidence_kind) fields.evidence_kind = record.evidence_kind;
+    if (Array.isArray(record.evidence_keys) && record.evidence_keys.length > 0 && !entry?.evidence_keys) {
+      fields.evidence_keys = record.evidence_keys;
+    }
+    if (record.verdict && !entry?.verdict) fields.verdict = record.verdict;
+    if (record.verdict_source && !entry?.verdictSource) fields.verdictSource = record.verdict_source;
+    if (!entry?.testedHead) {
+      // resolveTestedHead reads STRUCTURED FIELDS ONLY, in one precedence
+      // (tested_head → ci_head_sha → commit_sha) — never the prose, which on this
+      // very record carries several other 7-hex tokens.
+      const testedHead = resolveTestedHead(record);
+      if (testedHead) fields.testedHead = testedHead;
     }
     if (Object.keys(fields).length === 0) return;
     await store.mergeTaskMetadata(workflow.id, ticketId, fields);
@@ -3535,6 +3815,14 @@ async function processRecord(record) {
       spawnedBy: unwrapDdbValue(newImage.spawnedBy),
       fixContract: unwrapDdbValue(newImage.fixContract),
     });
+    // TEAM-4246 D1 FR-D1.7 — a new fix ticket blocks the run's open verifiers
+    // (dowtdh dispatched QA 78s after a fix was filed). Same creation-time hook,
+    // same stream image, no extra ticket read; inert when FIX_BEFORE_VERIFY=off.
+    await observeFixBeforeVerify(ticketId, {
+      workflowId: insertWorkflowId,
+      parentId: insertParentId,
+      spawnedBy: unwrapDdbValue(newImage.spawnedBy),
+    });
   }
 
   switch (newStatus) {
@@ -3721,8 +4009,16 @@ export async function handleTicketDone(ticketId, image) {
     console.error(`[orchestrator] cascade failed for ${ticketId} — publishing completion anyway: ${err?.message || err}`);
   }
 
-  // Publish event for UI
-  await publishEvent(ticketId, "agent.complete", { ticketId, assignee, agentId: assignee, unblocked, workflowId: workflow?.id });
+  // Publish event for UI. TEAM-4246 D1 — enrichCompleteDetail, same call shape
+  // as the webhook twin (handleTicketDoneUnified); see the comment there.
+  await publishEvent(
+    ticketId,
+    "agent.complete",
+    enrichCompleteDetail(
+      { ticketId, assignee, agentId: assignee, unblocked, workflowId: workflow?.id },
+      await resolveVerdictInfo({ ticketId, assignee, workflow, parentId })
+    )
+  );
 
   // TEAM-4113 / TEAM-4121 FR-9 — observe the per-phase rework loop, then live
   // re-verification. The stream image is raw DDB, so fetch the normalized ticket
@@ -3982,6 +4278,93 @@ async function notifyCompletionBlockedOnce(workflow, offenders) {
     console.warn(`[orchestrator] ${workflow.id}: completion-blocked notification failed (non-fatal): ${err?.message || err}`);
     return false;
   }
+}
+
+/**
+ * TEAM-4246 D1 — the verified-head / open-fix refusal, told exactly once per
+ * distinct refusal.
+ *
+ * Unlike the evidence gate's escalation this is NOT idempotent on a notification
+ * id: a refused run keeps re-entering completeWorkflow (every done cascade, every
+ * reconcile sweep), and the heads MOVE while a human reads the escalation — so the
+ * claim is a store CAS on the head triple plus the reason. Same heads, same reason
+ * → silence. A verifier re-runs at the shipped head, or the open fix closes and a
+ * divergence surfaces underneath it → a genuinely new refusal, told again.
+ *
+ * The reason is part of the claim key on purpose: `open-fix` masks divergence (it
+ * is checked first), so "open fix at these heads" and "divergence at these heads"
+ * are two different pieces of news about the same triple.
+ *
+ * Returns true when this caller is the one that told the story.
+ */
+async function notifyUnverifiedHeadOnce(workflow, vh, mode) {
+  const digest = store.completionBlockedKey(vh.heads);
+  const key = `${vh.reason}:${digest}`;
+  let claim = "claimed";
+  try {
+    claim = await store.claimCompletionBlocked(workflow.id, key);
+  } catch (err) {
+    // Fail OPEN on the claim (a throttled CAS must not swallow the only signal a
+    // human gets that the run is being held); the worst case is a duplicate event.
+    console.warn(`[orchestrator] ${workflow.id}: completion-blocked claim failed, publishing anyway: ${err?.message || err}`);
+  }
+  // "untracked" = no workflow row to claim on. Same fail-open reading the
+  // live-reverify slot CAS gives it: proceed, because the alternative is silence.
+  if (claim === "taken") return false;
+  const headLine = `qa=${vh.heads.qa || "unknown"} ci=${vh.heads.ci || "unknown"} pr=${vh.heads.pr || "unknown"}`;
+  try {
+    await publishEvent(workflow.epicId, "orchestrator.completion_blocked", {
+      workflowId: workflow.id,
+      reason: vh.reason,
+      heads: vh.heads,
+      offenders: vh.offenders,
+      mode,
+    });
+    const details = vh.reason === "open-fix"
+      ? `Completion is refused while fix tickets are still open under ${workflow.epicId}: ${vh.offenders.join(", ") || "none listed"}. Nothing is dispatched for this — closing the fix re-triggers completion. Heads at the refusal: ${headLine}.`
+      : `Completion is refused because the run's gate personas did not all verify the head that would ship (${headLine}). ` +
+        `A re-verification has been filed for each persona whose head is stale; when it returns at the PR head the run completes. ` +
+        `To close the run without re-verifying, set VERIFIED_HEAD_COMPLETION=off.`;
+    await store.appendNotification(workflow.id, {
+      id: `notif_completion_heads_${workflow.id}_${digest.slice(0, 12)}_${vh.reason}`,
+      type: "manager_escalation",
+      title: vh.reason === "open-fix"
+        ? "Run cannot complete: fix tickets still open"
+        : "Run cannot complete: the shipping head was never verified",
+      details,
+      reviewer: "verified-head-gate",
+      timestamp: new Date().toISOString(),
+      acknowledged: false,
+    });
+    console.log(`[orchestrator] ${workflow.id}: completion blocked (${vh.reason}) — ${headLine}`);
+    return true;
+  } catch (err) {
+    console.warn(`[orchestrator] ${workflow.id}: completion-blocked notification failed (non-fatal): ${err?.message || err}`);
+    return false;
+  }
+}
+
+/**
+ * The persona's own latest done ticket — the thing a stale-head re-verification is
+ * filed AGAINST (its task entry owns the re-verify claim slot, and its title is
+ * what the new ticket re-states). Deliberately a separate scan from
+ * evaluateVerifiedHeads: that answers "which head", this answers "whose ticket",
+ * and pushing ticket ids into the pure gate's return would change a contract the
+ * route twin mirrors.
+ */
+function latestDoneTicketFor(children, agentTasks, assignee) {
+  let best = null;
+  let bestAt = "";
+  for (const t of children || []) {
+    if (!t || t.assignee !== assignee) continue;
+    if (String(t.status || "").toLowerCase() !== "done") continue;
+    const entry = agentTasks?.[t.ticketId];
+    const when = String(entry?.completedAt || t.completedAt || "");
+    if (best && when < bestAt) continue;
+    best = t;
+    bestAt = when;
+  }
+  return best;
 }
 
 /**
@@ -4251,6 +4634,89 @@ export async function completeWorkflow(workflow) {
   // ticket / WM surfaces it) instead of lying. Best-effort: a GitHub/API failure
   // (or no PAT) never blocks a legitimate completion — it only tightens when it
   // can PROVE the branch is unmerged. Opt-out: SHIP_MERGE_VERIFY=off.
+  // ── TEAM-4246 D1 gate #3: the VERIFIED-HEAD gate. ────────────────────────────
+  // The last line, and the one dowtdh walked straight through: every gate above
+  // asks "did this ticket record something?" — none of them compares one ticket's
+  // recorded head against another's. dowtdh closed green with QA verified at one
+  // head, CI certified at a second (QA's evidence commit) and the fix that
+  // actually landed at a third, five seconds before workflow.complete.
+  //
+  // Runs LAST of the three completion gates, per the TEAM-3760 ordering argument:
+  // the honest-terminal gates close runs that never shipped, so this one only ever
+  // sees runs whose recorded evidence claims a ship — the runs where "which head
+  // shipped" is a real question. (Its one cost: MERGE_ON_GREEN, default off, can
+  // land the merge in gate 2 before this gate refuses. The refusal is still worth
+  // making — the re-verification then runs against merged code — and the D2
+  // follow-up is to consult this gate before merging.)
+  //
+  // Fail-CLOSED under enforce, including on its own exception: a gate that cannot
+  // prove the heads agree must hold, or the flag buys nothing. Under shadow it
+  // logs and completion proceeds exactly as today.
+  if (VERIFIED_HEAD_COMPLETION !== "off") {
+    let hold = false;
+    try {
+      const children = gateChildren(await getChildTickets(workflow.epicId));
+      const freshWf = await store.getWorkflow(workflow.id);
+      const agentTasks = freshWf?.agentTasks || workflow.agentTasks || {};
+      // The caller's object carries the run's identity (epicId, featureBranch) and
+      // the fresh row carries the heads — the two consumers below need both, and
+      // neither the escalation's target nor a re-verify ticket's parent may depend
+      // on which fields the re-read happened to project.
+      const gateWorkflow = { ...workflow, agentTasks };
+      // No prHeadSha is passed: heads.pr is the run's own latest recorded dev/fix
+      // commit, derived inside the gate (the PR does not exist yet at this point,
+      // and featureBranchMergeProbe returns merge proof with no head sha).
+      const vh = evaluateVerifiedHeads(children, agentTasks);
+      if (!vh.ok) {
+        await notifyUnverifiedHeadOnce(gateWorkflow, vh, VERIFIED_HEAD_COMPLETION);
+        if (VERIFIED_HEAD_COMPLETION === "enforce") {
+          // Remediation, only for divergence: file one stale-head re-verification
+          // per persona whose head is not the shipping head. An open fix gets
+          // nothing — the fix closing re-enters completion by itself, and a
+          // re-verify filed now would just be re-filed at the fix's head anyway.
+          if (vh.reason === "head-divergence") {
+            for (const owner of vh.stalePersonas) {
+              const gateTicket = latestDoneTicketFor(children, agentTasks, owner);
+              if (!gateTicket) {
+                console.warn(`[orchestrator] ${workflow.id}: no done ticket found for stale persona ${owner} — cannot file a re-verification`);
+                continue;
+              }
+              // The factory owns "exactly one re-verify per (ticket, head)", so a
+              // redelivered completion attempt files nothing new.
+              await getLiveReverify().reverify({
+                kind: "gate",
+                reason: "stale-head",
+                workflow: gateWorkflow,
+                owner,
+                gateTicket,
+                headSha: vh.heads.pr,
+                blockedBy: [],
+              });
+            }
+          }
+          console.error(
+            `[orchestrator] CompletionRejectedUnverifiedHead ${workflow.id}: ${vh.reason} ` +
+              `(qa=${vh.heads.qa || "unknown"} ci=${vh.heads.ci || "unknown"} pr=${vh.heads.pr || "unknown"}` +
+              `${vh.offenders.length ? `, open fixes: ${vh.offenders.join(", ")}` : ""}) — leaving run open.`
+          );
+          hold = true;
+        } else {
+          console.warn(
+            `[orchestrator] ${workflow.id} would be blocked on ${vh.reason} (shadow): ` +
+              `qa=${vh.heads.qa || "unknown"} ci=${vh.heads.ci || "unknown"} pr=${vh.heads.pr || "unknown"}`
+          );
+        }
+      }
+    } catch (err) {
+      if (VERIFIED_HEAD_COMPLETION === "enforce") {
+        console.error(`[orchestrator] verified-head gate failed for ${workflow.id} — holding completion (enforce): ${err?.message || err}`);
+        return;
+      }
+      console.warn(`[orchestrator] verified-head check skipped for ${workflow.id}: ${err?.message || err}`);
+    }
+    if (hold) return;
+  }
+
   const completedAt = new Date().toISOString();
   const won = await store.completeWorkflow(workflow.id, completedAt);
   if (!won) {

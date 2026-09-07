@@ -53,9 +53,24 @@
  *   F9: a strongly-consistent per-blocker CONFIRM before the event path acts on
  *       an in_progress dependent (the sibling snapshot is an eventually-consistent
  *       GSI page; the sweep has a quiet period, the event path does not).
+ *
+ * TEAM-4246 D1 — the cascade now asks WHAT THE PERSONA DECIDED, not just whether the
+ * ticket closed. Until this, "done" was the only input: run
+ * wf_1788731227559_dowtdh's reviewer returned "VERDICT: CHANGES NEEDED", its QA
+ * verifier "VERDICT: FAIL", and each successor was dispatched four seconds later,
+ * because a verdict lived in prose and Done was Done. Behind VERDICT_GATE
+ * (off | shadow | enforce): a GATE PERSONA's non-PASS verdict holds its successors on
+ * the fix tickets it filed plus its own re-verify ticket, and only a PASS — or no
+ * resolvable verdict at all — cascades as before. off is byte-identical to pre-4246:
+ * the resolver is never called, no dep is touched, no event is written.
  */
 
 import { UpdateCommand } from "@aws-sdk/lib-dynamodb";
+// TEAM-4246 D1 — "do not yank a ticket someone is working right now" has ONE
+// definition (live-reverify.mjs), and the verdict hold writes the same kind of
+// blocker edge the live re-verify does. No cycle: live-reverify.mjs imports only
+// fix-contract.mjs and ticket-blockers.mjs, neither of which knows this module.
+import { LIVE_SHIP_STATUSES } from "./live-reverify.mjs";
 
 // Extended-state rollout modes (TEAM-3747 D1) — same vocabulary + fail-safe
 // default (shadow) as DEAD_SESSION_DETECTOR_MODE.
@@ -130,6 +145,31 @@ export function createCascade(deps) {
     // TEAM-4120 FR-3 — optional dead-session escalation tree (page → synthesize
     // → park). Unwired = the bare manager_escalation notification, as before.
     escalate,
+    // ── Gate-verdict binding (TEAM-4246 D1) ─────────────────────────────────
+    // The cascade has always unblocked a successor on ticket-DONE. That is the
+    // second of the three holes wf_1788731227559_dowtdh shipped through: the
+    // reviewer returned "VERDICT: CHANGES NEEDED" and QA was dispatched 4 seconds
+    // later, because a verdict was prose and Done was Done.
+    //
+    // `verdictGate` answers "what did this ticket's persona actually decide" —
+    // async ({ ticketId, workflow, siblings }) → { isGatePersona, verdict,
+    // verdictSource, testedHead, spawnedTickets } — and index.mjs owns it, because
+    // resolving it means reading the completion record (an S3 seam). Returning
+    // null/undefined, or isGatePersona !== true, means "nothing known": today's
+    // path, unchanged.
+    //
+    // `verdictGateMode` is off | shadow | enforce (normalized by index.mjs from
+    // VERDICT_GATE — this module still reads no env). Named for its flag rather
+    // than a bare `mode` because two other rollout modes already live in this dep
+    // bag and a reader must be able to tell them apart at the call site.
+    verdictGate,
+    verdictGateMode = "off",
+    // Files the gate persona's own re-verify ticket (live-reverify.mjs `reverify`),
+    // so a non-PASS verdict always has something REAL to hold the successor on.
+    reverify,
+    // Writes the blocker edge without yanking a ticket an agent or human is mid-way
+    // through (index.mjs applyBlockerEdge, via preserveStatusIf).
+    addBlockers,
   } = deps;
 
   // One normalization per cascade instance. The commit-4a union (blocked/todo →
@@ -140,6 +180,10 @@ export function createCascade(deps) {
   const levelTriggerMode = ["shadow", "enforce"].includes(levelTriggerDispatch)
     ? levelTriggerDispatch
     : "off";
+  // index.mjs normalizes VERDICT_GATE (verdict-contract.normalizeVerdictMode, whose
+  // unset default is shadow); this is the belt-and-braces re-read for a dep that
+  // arrives unset — off, so an un-wired cascade behaves exactly as it did pre-4246.
+  const verdictMode = ["shadow", "enforce"].includes(verdictGateMode) ? verdictGateMode : "off";
 
   /**
    * Level-triggered dispatch (TEAM-4060). Invoke a now-dispatchable dependent
@@ -168,6 +212,130 @@ export function createCascade(deps) {
     }
   }
 
+  /** A publish that cannot abort the cascade — the journal is not the decision. */
+  const safePublish = async (ticketId, type, detail) => {
+    try {
+      await publishEvent(ticketId, type, detail);
+    } catch (err) {
+      log(`[orchestrator] verdict-gate: ${type} publish failed (non-fatal) — ${ticketId}: ${err?.message || err}`);
+    }
+  };
+
+  /** The successors this completion would unblock: open siblings that wait on it. */
+  const successorsOf = (ticketId, siblings) =>
+    siblings.filter(
+      (s) =>
+        s.ticketId !== ticketId &&
+        (s.blockedBy || []).includes(ticketId) &&
+        !RESOLVED_BLOCKER_STATUSES.has(s.status)
+    );
+
+  /**
+   * What this ticket's own verdict says about letting its successors run
+   * (TEAM-4246 D1). Returns null for every case that must behave exactly as it did
+   * before — flag off, no resolver wired, not a gate persona, no verdict resolvable,
+   * or a PASS. Only a gate persona's NON-PASS verdict produces a hold.
+   *
+   * A null verdict deliberately does not hold: "the persona stated nothing the
+   * contract recognizes" is not "the persona failed", and holding there would stall
+   * every run whose reviewer writes a summary the ladder cannot read.
+   */
+  async function resolveVerdictHold(ticketId, workflow, siblings) {
+    if (verdictMode === "off" || typeof verdictGate !== "function") return null;
+    const info = await verdictGate({ ticketId, workflow, siblings });
+    if (!info || info.isGatePersona !== true) return null;
+    const verdict = info.verdict || null;
+    if (!verdict || verdict === "PASS") return null;
+    return {
+      verdict,
+      verdictSource: info.verdictSource || null,
+      testedHead: info.testedHead || "",
+      spawnedTickets: (Array.isArray(info.spawnedTickets) ? info.spawnedTickets : []).filter(Boolean),
+      // FR-D1.5/D1.6 — the open fixes under the epic this persona did NOT file.
+      // Resolved by index.mjs (it owns FIX_KINDS + the advisory predicate) via
+      // verdict-contract's selectOpenEpicFixes; absent on an older resolver, which
+      // degrades to exactly the spawnedTickets-only hold.
+      openFixIds: (Array.isArray(info.openEpicFixIds) ? info.openEpicFixIds : []).filter(Boolean),
+      round: Number.isFinite(Number(info.round)) ? Number(info.round) : null,
+    };
+  }
+
+  /**
+   * Hold every successor of a non-PASS gate verdict, and return what they are now
+   * waiting on (enforce only).
+   *
+   * THREE things have to be true at once for this to be safe, and each is a line
+   * below:
+   *   1. the hold is an ORDINARY blocker edge, so every existing release path — this
+   *      cascade, the reconcile sweep, a human resolving the fix — already knows how
+   *      to lift it. Nothing here invents a new parked state.
+   *   2. there is always something REAL to wait on. The gate persona's own re-verify
+   *      ticket is filed even when it did file fixes, because the fixes closing is
+   *      NOT the gate passing — that is dowtdh's bug one step removed (a fix landed,
+   *      QA ran, and the reviewer never re-stated its verdict). The re-verify is
+   *      blocked on the fixes, so it dispatches once they land and its own PASS is
+   *      what finally cascades.
+   *   3. a ticket an agent or a human is mid-way through keeps its status
+   *      (preserveStatusIf): the edge is the point, the status flip is not.
+   *
+   * The in-memory snapshot is patched with the new edges so allBlockersResolved —
+   * the ONE predicate the whole cascade routes through — suppresses the transition,
+   * the level-trigger dispatch and the orchestrator.unblocked emit together. That is
+   * why the gate lives here rather than at the emit loop: three effects, one guard.
+   */
+  async function applyVerdictHold(ticketId, workflow, siblings, gate, held) {
+    const successors = successorsOf(ticketId, siblings);
+    // Held BEFORE anything is written: a throw from here lands in the caller's
+    // boundary, which must fall back to holding, never to unblocking.
+    for (const s of successors) held.add(s.ticketId);
+
+    const gateTicket = siblings.find((s) => s.ticketId === ticketId) || { ticketId };
+    const owner =
+      gateTicket.assignee || workflow?.agentTasks?.[ticketId]?.agentId || null;
+    // N from the board, so a re-hold at a NEW head reads as the next round: the
+    // gate re-verify tickets already filed for this ticket ARE the rounds.
+    const priorRounds = siblings.filter(
+      (s) => s?.spawnedBy?.rearmOf === ticketId && s?.spawnedBy?.round
+    ).length;
+
+    // What the successors AND the re-verify wait on: this persona's own fixes plus
+    // every other fix still open under the epic (FR-D1.5/D1.6). A non-PASS verdict
+    // while ANY fix is open must wait for it regardless of who filed it — dowtdh's
+    // QA FAIL cited the reviewer's still-open TEAM-4183 and filed nothing of its own,
+    // so holding on `spawnedTickets` alone would dispatch the re-verify against the
+    // unfixed head and burn a round on the same finding.
+    const blockOn = [...new Set([...gate.spawnedTickets, ...gate.openFixIds])];
+
+    const filed = await reverify?.({
+      kind: "gate",
+      workflow,
+      owner,
+      gateTicket,
+      headSha: gate.testedHead,
+      blockedBy: blockOn,
+      round: gate.round ?? priorRounds + 1,
+      reason: `${gate.verdict} (${gate.verdictSource || "unknown source"})`,
+    });
+
+    // filter(Boolean) is load-bearing: a re-verify that could not be filed (no head
+    // sha, create_ticket down) leaves the FIXES holding the successor. An empty list
+    // still holds — this pass simply refuses to unblock — and says so in the event.
+    const blockers = [...new Set([...blockOn, filed?.reverifyTicketId].filter(Boolean))];
+
+    for (const sibling of successors) {
+      const already = sibling.blockedBy || [];
+      for (const blocker of blockers) {
+        if (already.includes(blocker)) continue;
+        await addBlockers?.(sibling.ticketId, [blocker], { preserveStatusIf: LIVE_SHIP_STATUSES });
+      }
+      // Patch the snapshot the predicate reads, so this pass cannot transition or
+      // dispatch a ticket whose edge we just wrote.
+      sibling.blockedBy = [...new Set([...already, ...blockers])];
+    }
+
+    return blockers;
+  }
+
   /**
    * Fan a just-closed ticket's completion out to its dependents.
    *
@@ -184,6 +352,31 @@ export function createCascade(deps) {
     const siblings = await getChildTickets(parentId);
     const unblocked = [];
     const m = newMetrics();
+
+    // ── Gate-verdict binding (TEAM-4246 D1) ─────────────────────────────────
+    // Deliberately held successors. Distinct from `deferred` below: a hold is a
+    // decision, not a stale-GSI read, so it must not cost the 300 ms re-fetch and
+    // must not be retried into an unblock.
+    const held = new Set();
+    let gate = null;
+    let gateBlockers = [];
+    try {
+      gate = await resolveVerdictHold(ticketId, workflow, siblings);
+      if (gate && verdictMode === "enforce") {
+        gateBlockers = await applyVerdictHold(ticketId, workflow, siblings, gate, held);
+      }
+    } catch (err) {
+      // NO FAIL-OPEN, but also no stalling a run over an unknown: `held` is only
+      // populated once we KNOW this is a gate persona with a non-PASS verdict, so a
+      // throw after that point keeps every successor held with whatever edges got
+      // written, and this pass unblocks nothing. A throw from the resolver ITSELF
+      // (before we know anything) falls through to today's path on purpose — it is a
+      // programming error in a resolver written not to throw, and holding every
+      // dependent of every completion on one would stall all 14 personas rather than
+      // one gate ticket.
+      log(`[orchestrator] verdict-gate failed (${verdictMode}) — ${ticketId}: ${err?.message || err}. ` +
+        (held.size ? `holding [${[...held].join(", ")}]` : "cascading as before"));
+    }
 
     // Dependents whose blocker set wasn't fully resolved in the FIRST snapshot.
     // That snapshot comes from the eventually-consistent parentId-index GSI, so a
@@ -251,6 +444,8 @@ export function createCascade(deps) {
       if (sibling.ticketId === ticketId) continue;
       const blockers = sibling.blockedBy || [];
       if (!blockers.includes(ticketId)) continue;
+      // TEAM-4246: a deliberate verdict hold. Not deferred — see `held` above.
+      if (held.has(sibling.ticketId)) continue;
 
       if (!allBlockersResolved(sibling, siblings)) {
         // Unresolved means at least one blocker isn't done/cancelled in this
@@ -292,6 +487,41 @@ export function createCascade(deps) {
         ? ` levelTrigger=${levelTriggerMode} levelDispatched=${m.levelDispatched || 0}` +
           ` wouldDispatch=${m.wouldDispatch || 0} levelDispatchErrors=${m.levelDispatchErrors || 0}`
         : ""));
+
+    // ── Gate-verdict journal (TEAM-4246 D1) ─────────────────────────────────
+    // Published AFTER the cascade because both events report the successor set:
+    //   shadow  — wouldSuppress is exactly what this run DID unblock, i.e. the
+    //             tickets enforce would have held. That comparison against
+    //             verdict_suppressed volume is the rollout signal, so it has to be
+    //             the real list, not a prediction made before the loop ran.
+    //   enforce — `unblocked` names the successors that would have been unblocked
+    //             and are now held (the contract's key name, kept verbatim so the
+    //             cost-report and replay readers stay one shape).
+    if (gate && verdictMode === "shadow") {
+      await safePublish(ticketId, "orchestrator.verdict_observed", {
+        workflowId: workflow?.id,
+        verdict: gate.verdict,
+        verdictSource: gate.verdictSource,
+        wouldSuppress: unblocked,
+        spawnedTickets: gate.spawnedTickets,
+        // What enforce WOULD have held them on (FR-D1.5/D1.6): this persona's fixes
+        // plus every other fix open under the epic. Reported separately from
+        // spawnedTickets so the shadow week can see how often the union is wider
+        // than what the persona filed — dowtdh is the case where it is everything.
+        wouldBlockOn: [...new Set([...gate.spawnedTickets, ...gate.openFixIds])],
+        testedHead: gate.testedHead,
+      });
+      log(`[orchestrator] verdict-gate shadow — ${ticketId} ${gate.verdict} (${gate.verdictSource}) would hold [${unblocked.join(", ")}]`);
+    } else if (gate && verdictMode === "enforce") {
+      await safePublish(ticketId, "orchestrator.verdict_suppressed", {
+        workflowId: workflow?.id,
+        verdict: gate.verdict,
+        unblocked: [...held],
+        blockers: gateBlockers,
+        spawnedTickets: gate.spawnedTickets,
+      });
+      log(`[orchestrator] verdict-gate enforce — ${ticketId} ${gate.verdict} held [${[...held].join(", ")}] on [${gateBlockers.join(", ")}]`);
+    }
 
     // Journey log: one orchestrator.unblocked per Ready transition. The helper
     // OWNS this event so BOTH call sites emit an identical journal trail (the
