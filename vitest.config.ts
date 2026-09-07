@@ -380,6 +380,13 @@ export default defineConfig({
       // prefixes, that the open-fix refusal is phase-BLIND (the fix isWorkflowComplete
       // could not see), and the head-triple CAS that keeps one refusal to one escalation.
       "lambda/orchestrator/verified-head-completion.test.mjs",
+      // replay-dowtdh-verdict-gate (TEAM-4246 D1 acceptance) — the run all three
+      // flags exist for, replayed row-by-row from the vendored dossier through the
+      // REAL handler → cascade → live-reverify → completeWorkflow, with only the AWS
+      // seams mocked. Its load-bearing case is the flags-off one: the ordered event
+      // shape has to equal the shape the dossier's own events record, because "off
+      // changes nothing" is the only claim that cannot be verified in production.
+      "lambda/orchestrator/replay-dowtdh-verdict-gate.test.mjs",
     ],
     // Keep unit tests away from the Playwright specs under tests/.
     exclude: ["tests/**", "node_modules/**", "demo/**"],
