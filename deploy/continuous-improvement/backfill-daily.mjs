@@ -2,12 +2,13 @@
 /**
  * deploy/continuous-improvement/backfill-daily.mjs
  *
- * Rebuilds the per-UTC-day `daily[YYYY-MM-DD]` buckets on agentcore-hub-eval-config
- * rows from CloudWatch Logs Insights, so the Evaluations tab's rolling window is
- * populated right after the token-aggregator / eval-packager Lambdas start
- * writing buckets (or after an outage). Idempotent: each day bucket is
+ * Rebuilds the per-agent per-UTC-day items in agentcore-hub-eval-daily (PK
+ * agentId / SK day) from CloudWatch Logs Insights, so the Evaluations tab's
+ * rolling window is populated right after the token-aggregator / eval-packager
+ * Lambdas start writing (or after an outage). Idempotent: each day item is
  * OVERWRITTEN with the Insights totals for that day (today included — the live
- * Lambdas keep adding on top after the query instant).
+ * Lambdas keep adding on top after the query instant). Flat item shape, same
+ * as the Lambdas: tokensIn/… totals, m|<model>|<field>, e|<evaluator>|sum|count.
  *
  * Same three emitter shapes as lambda/token-aggregator/index.mjs:
  *   Strands runtimes  -> strands.telemetry.tracer `chat` spans (cache-inclusive input)
@@ -28,7 +29,7 @@ import {
   CloudWatchLogsClient, DescribeLogGroupsCommand, StartQueryCommand, GetQueryResultsCommand,
 } from '@aws-sdk/client-cloudwatch-logs';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
-import { DynamoDBDocumentClient, UpdateCommand } from '@aws-sdk/lib-dynamodb';
+import { DynamoDBDocumentClient, PutCommand } from '@aws-sdk/lib-dynamodb';
 
 const args = process.argv.slice(2);
 const opt = (name, dflt) => {
@@ -39,7 +40,8 @@ const DAYS = Math.min(14, Math.max(1, Number(opt('days', 7)) || 7));
 const REGION = opt('region', process.env.AWS_REGION || 'us-east-1');
 const ONLY_AGENT = opt('agent', null);
 const DRY_RUN = args.includes('--dry-run');
-const TABLE = process.env.EVAL_CONFIG_TABLE || 'agentcore-hub-eval-config';
+const TABLE = process.env.EVAL_DAILY_TABLE || 'agentcore-hub-eval-daily';
+const RETAIN_DAYS = Math.max(7, Number(process.env.DAILY_RETAIN_DAYS) || 14);
 
 const here = dirname(fileURLToPath(import.meta.url));
 const agentsFile = resolve(here, '../../src/config/agents.json');
@@ -222,27 +224,32 @@ for (const lg of evalGroups) {
 }
 
 // ─── write ──────────────────────────────────────────────────────────────────
+function flattenBucket(agentId, day, b) {
+  const item = { agentId, day, updatedAt: new Date().toISOString(), backfilledAt: new Date().toISOString() };
+  for (const k of ['tokensIn', 'tokensOut', 'cacheRead', 'cacheWrite', 'cacheWrite1h', 'calls', 'costUsd', 'sessions']) {
+    if (b[k]) item[k] = Math.round(b[k] * 1e4) / 1e4;
+  }
+  for (const [model, m] of Object.entries(b.byModel)) {
+    for (const [f, v] of Object.entries(m)) if (v) item[`m|${model}|${f}`] = Math.round(v * 1e4) / 1e4;
+  }
+  for (const [ev, sc] of Object.entries(b.evalScores)) {
+    if (sc.count) { item[`e|${ev}|sum`] = Math.round(sc.sum * 1e4) / 1e4; item[`e|${ev}|count`] = sc.count; }
+  }
+  const expires = new Date(`${day}T00:00:00Z`);
+  expires.setUTCDate(expires.getUTCDate() + RETAIN_DAYS + 1);
+  item.expiresAt = Math.floor(expires.getTime() / 1000);
+  return item;
+}
+
 let written = 0;
 for (const [agentId, days] of Object.entries(perAgent)) {
   const dayKeys = Object.keys(days).sort();
   const summary = dayKeys.map((d) => `${d.slice(5)}:${Math.round(days[d].tokensIn / 1000)}K/${days[d].sessions}s`).join(' ');
   console.log(`${agentId}: ${summary}`);
   if (DRY_RUN) continue;
-  await ddb.send(new UpdateCommand({
-    TableName: TABLE, Key: { agentId },
-    UpdateExpression: 'SET daily = if_not_exists(daily, :emptyDaily)',
-    ExpressionAttributeValues: { ':emptyDaily': {} },
-  }));
   for (const day of dayKeys) {
-    const b = days[day];
-    for (const k of ['tokensIn', 'tokensOut', 'cacheRead', 'cacheWrite', 'cacheWrite1h', 'costUsd', 'sessions']) b[k] = Math.round(b[k] * 1e4) / 1e4;
-    await ddb.send(new UpdateCommand({
-      TableName: TABLE, Key: { agentId },
-      UpdateExpression: 'SET daily.#d = :bucket, tokenLastBackfillAt = :now',
-      ExpressionAttributeNames: { '#d': day },
-      ExpressionAttributeValues: { ':bucket': b, ':now': new Date().toISOString() },
-    }));
+    await ddb.send(new PutCommand({ TableName: TABLE, Item: flattenBucket(agentId, day, days[day]) }));
     written++;
   }
 }
-console.log(DRY_RUN ? 'dry-run: nothing written' : `wrote ${written} day bucket(s) across ${Object.keys(perAgent).length} agent(s)`);
+console.log(DRY_RUN ? 'dry-run: nothing written' : `wrote ${written} day item(s) across ${Object.keys(perAgent).length} agent(s) to ${TABLE}`);

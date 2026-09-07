@@ -1,22 +1,22 @@
 /**
  * GET /api/evaluations?days=7 — Fetch evaluation scorecard + per-agent metrics
  *
- * Source: a single DynamoDB Scan on agentcore-hub-eval-config. Every number is
- * folded from the per-UTC-day `daily` buckets the token-aggregator (tokens,
- * cache, cost) and eval-packager (sessions, evaluator scores) Lambdas write, so
- * sessions, scores, tokens and cost all describe the SAME rolling window —
- * today plus the previous (days - 1) UTC days. `days` is clamped to 1..14
- * (bucket retention). No weekly reset, no all-time counters.
+ * Sources: a Scan of agentcore-hub-eval-config (which agents exist) and a Scan
+ * of agentcore-hub-eval-daily — one item per agent per UTC day, written by the
+ * token-aggregator (tokens, cache, cost) and eval-packager (sessions, evaluator
+ * scores) Lambdas. Every number is folded over the SAME rolling window — today
+ * plus the previous (days - 1) UTC days; `days` clamps to 1..14 (bucket TTL).
+ * No weekly reset, no all-time counters.
  */
 
 import { NextRequest, NextResponse } from "next/server";
-import { getAllEvalConfigs } from "@/lib/eval-config";
+import { getAllEvalConfigs, getAllEvalDaily } from "@/lib/eval-config";
 import {
   DEFAULT_WINDOW_DAYS,
+  groupDailyItems,
   summarizeDaily,
   windowDays,
   type AgentWindowSummary,
-  type DailyBucket,
   type Pricing,
 } from "@/lib/eval-metrics";
 import agentsConfig from "@/config/agents.json";
@@ -90,7 +90,8 @@ export async function GET(req: NextRequest) {
   }
 
   try {
-    const items = await getAllEvalConfigs();
+    const [items, dailyItems] = await Promise.all([getAllEvalConfigs(), getAllEvalDaily()]);
+    const dailyByAgent = groupDailyItems(dailyItems);
 
     const agents: string[] = [];
     const scorecard: Scorecard = {};
@@ -102,11 +103,7 @@ export async function GET(req: NextRequest) {
       if (!displayName) continue;
       agents.push(displayName);
 
-      const summary = summarizeDaily(
-        item.daily as Record<string, Partial<DailyBucket>> | undefined,
-        days,
-        PRICING
-      );
+      const summary = summarizeDaily(dailyByAgent[agentId], days, PRICING);
       const scores = scorecardFrom(summary);
       if (scores) scorecard[displayName] = scores;
 

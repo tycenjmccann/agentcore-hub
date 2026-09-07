@@ -46,7 +46,9 @@ done
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 LAMBDA_NAME="agentcore-hub-token-aggregator"
 LAMBDA_ROLE="${LAMBDA_ROLE_ARN:-arn:aws:iam::${ACCOUNT_ID}:role/agentcore-hub-lambda-role}"
-TABLE_NAME="agentcore-hub-eval-config"
+# Per-day bucket table (PK agentId / SK day, TTL expiresAt). Created by
+# deploy-all.sh; ensured here too so this script is a complete entry point.
+DAILY_TABLE_NAME="${EVAL_DAILY_TABLE:-agentcore-hub-eval-daily}"
 # Artifact bucket convention (matches deploy/config.sh): agentcore-hub-artifacts-<ACCOUNT>-<REGION>.
 # The previous version dropped the region suffix and pointed the Lambda at a
 # bucket that does not exist on first install.
@@ -58,6 +60,28 @@ echo "=== Deploy Token Aggregator ==="
 echo "Region:  ${REGION}"
 echo "Account: ${ACCOUNT_ID}"
 echo "Lambda:  ${LAMBDA_NAME}"
+
+###############################################################################
+# Step 0: Daily bucket table (idempotent; full setup lives in deploy-all.sh)
+###############################################################################
+echo ""
+echo "--- Step 0: Daily bucket table ---"
+if aws dynamodb describe-table --table-name "${DAILY_TABLE_NAME}" --region "${REGION}" >/dev/null 2>&1; then
+  echo "✓ ${DAILY_TABLE_NAME} exists"
+else
+  aws dynamodb create-table \
+    --table-name "${DAILY_TABLE_NAME}" \
+    --attribute-definitions AttributeName=agentId,AttributeType=S AttributeName=day,AttributeType=S \
+    --key-schema AttributeName=agentId,KeyType=HASH AttributeName=day,KeyType=RANGE \
+    --billing-mode PAY_PER_REQUEST \
+    --region "${REGION}" --output text --query 'TableDescription.TableStatus'
+  aws dynamodb wait table-exists --table-name "${DAILY_TABLE_NAME}" --region "${REGION}"
+  aws dynamodb update-time-to-live \
+    --table-name "${DAILY_TABLE_NAME}" \
+    --time-to-live-specification "Enabled=true,AttributeName=expiresAt" \
+    --region "${REGION}" --output text --query 'TimeToLiveSpecification.Enabled'
+  echo "✓ ${DAILY_TABLE_NAME} created (TTL on expiresAt)"
+fi
 
 ###############################################################################
 # Step 1: Package and deploy Lambda
@@ -78,7 +102,7 @@ if aws lambda get-function --function-name "${LAMBDA_NAME}" --region "${REGION}"
   aws lambda update-function-configuration \
     --function-name "${LAMBDA_NAME}" \
     --timeout 60 --memory-size 256 \
-    --environment "Variables={EVAL_CONFIG_TABLE=${TABLE_NAME},ARTIFACTS_BUCKET=${BUCKET},DAILY_RETAIN_DAYS=14}" \
+    --environment "Variables={EVAL_DAILY_TABLE=${DAILY_TABLE_NAME},ARTIFACTS_BUCKET=${BUCKET},DAILY_RETAIN_DAYS=14}" \
     --region "${REGION}" --output text --query 'FunctionArn'
 else
   echo "Creating new Lambda..."
@@ -89,7 +113,7 @@ else
     --role "${LAMBDA_ROLE}" \
     --zip-file fileb:///tmp/token-aggregator.zip \
     --timeout 60 --memory-size 256 \
-    --environment "Variables={EVAL_CONFIG_TABLE=${TABLE_NAME},ARTIFACTS_BUCKET=${BUCKET},DAILY_RETAIN_DAYS=14}" \
+    --environment "Variables={EVAL_DAILY_TABLE=${DAILY_TABLE_NAME},ARTIFACTS_BUCKET=${BUCKET},DAILY_RETAIN_DAYS=14}" \
     --region "${REGION}" --output text --query 'FunctionArn'
   aws lambda wait function-active --function-name "${LAMBDA_NAME}" --region "${REGION}"
 fi
@@ -193,6 +217,6 @@ aws lambda remove-permission \
 ###############################################################################
 echo ""
 echo "=== Token Aggregator Deployment Complete ==="
-echo "Agent log groups → subscription filter → ${LAMBDA_NAME} → DDB (${TABLE_NAME}) daily[YYYY-MM-DD]"
+echo "Agent log groups → subscription filter → ${LAMBDA_NAME} → DDB ${DAILY_TABLE_NAME} (agentId, day)"
 echo ""
 echo "Next: node deploy/continuous-improvement/backfill-daily.mjs --days 7   # fill the window from CW Logs Insights"

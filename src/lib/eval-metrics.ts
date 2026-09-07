@@ -1,11 +1,16 @@
 /**
  * Rolling-window math for the Evaluations tab's Operational Metrics.
  *
- * The token-aggregator and eval-packager Lambdas write per-UTC-day buckets to
- * `daily[YYYY-MM-DD]` on each agent's agentcore-hub-eval-config row. This module
- * folds the buckets inside ONE window (default 7 days, today inclusive) into the
- * numbers the dashboard shows, so sessions, evaluator scores, tokens and cost
- * all describe the same period. Pure functions — unit-tested, no AWS.
+ * The token-aggregator and eval-packager Lambdas write one item per agent per
+ * UTC day to the agentcore-hub-eval-daily table (PK agentId / SK day). Items
+ * are FLAT so the Lambdas can create-or-increment with a single atomic ADD:
+ *   tokensIn tokensOut cacheRead cacheWrite cacheWrite1h calls costUsd sessions
+ *   m|<model>|<field>           per-model token counters (token-aggregator)
+ *   e|<evaluator>|sum / |count  evaluator score sums (eval-packager)
+ * `bucketFromDailyItem` lifts an item into the nested DailyBucket shape and
+ * `summarizeDaily` folds the buckets inside ONE window (default 7 days, today
+ * inclusive) into the numbers the dashboard shows, so sessions, evaluator
+ * scores, tokens and cost all describe the same period. Pure — no AWS.
  */
 
 export interface DailyModelUsage {
@@ -62,6 +67,56 @@ export interface AgentWindowSummary {
 }
 
 export const DEFAULT_WINDOW_DAYS = 7;
+export const MODEL_ATTR_PREFIX = "m|";
+export const EVALUATOR_ATTR_PREFIX = "e|";
+
+const MODEL_FIELDS = new Set<keyof DailyModelUsage>(["input", "output", "cacheRead", "cacheWrite", "cacheWrite1h", "costUsd", "calls"]);
+
+/** Lift one flat daily-table item into the nested bucket shape. */
+export function bucketFromDailyItem(item: Record<string, unknown>): Partial<DailyBucket> {
+  const bucket: Partial<DailyBucket> = {
+    tokensIn: n(item.tokensIn),
+    tokensOut: n(item.tokensOut),
+    cacheRead: n(item.cacheRead),
+    cacheWrite: n(item.cacheWrite),
+    cacheWrite1h: n(item.cacheWrite1h),
+    calls: n(item.calls),
+    costUsd: n(item.costUsd),
+    sessions: n(item.sessions),
+    evalScores: {},
+    byModel: {},
+  };
+  for (const [key, raw] of Object.entries(item)) {
+    if (key.startsWith(MODEL_ATTR_PREFIX)) {
+      const sep = key.lastIndexOf("|");
+      const model = key.slice(MODEL_ATTR_PREFIX.length, sep);
+      const field = key.slice(sep + 1) as keyof DailyModelUsage;
+      if (!model || !MODEL_FIELDS.has(field)) continue;
+      const m = (bucket.byModel![model] ||= {});
+      m[field] = n(raw);
+    } else if (key.startsWith(EVALUATOR_ATTR_PREFIX)) {
+      const sep = key.lastIndexOf("|");
+      const evaluator = key.slice(EVALUATOR_ATTR_PREFIX.length, sep);
+      const field = key.slice(sep + 1);
+      if (!evaluator || (field !== "sum" && field !== "count")) continue;
+      const e = (bucket.evalScores![evaluator] ||= { sum: 0, count: 0 });
+      e[field] = n(raw);
+    }
+  }
+  return bucket;
+}
+
+/** Group daily-table items by agentId → day → bucket. */
+export function groupDailyItems(items: Array<Record<string, unknown>>): Record<string, Record<string, Partial<DailyBucket>>> {
+  const out: Record<string, Record<string, Partial<DailyBucket>>> = {};
+  for (const item of items) {
+    const agentId = typeof item.agentId === "string" ? item.agentId : null;
+    const day = typeof item.day === "string" ? item.day : null;
+    if (!agentId || !day) continue;
+    (out[agentId] ||= {})[day] = bucketFromDailyItem(item);
+  }
+  return out;
+}
 export const MAX_WINDOW_DAYS = 14; // matches the Lambdas' DAILY_RETAIN_DAYS default
 
 export function dayKey(d: Date): string {

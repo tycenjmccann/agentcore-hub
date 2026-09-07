@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { windowDays, modelCost, summarizeDaily, type Pricing } from "./eval-metrics";
+import { windowDays, modelCost, summarizeDaily, bucketFromDailyItem, groupDailyItems, type Pricing } from "./eval-metrics";
 
 const pricing: Pricing = {
   models: { "us.anthropic.claude-fable-5-1": { input: 20, output: 100 }, "claude-opus-4-8": { input: 5.5, output: 27.5 } },
@@ -63,5 +63,36 @@ describe("summarizeDaily", () => {
   it("returns zeros for agents with no buckets", () => {
     const s = summarizeDaily(undefined, days, pricing);
     expect(s).toMatchObject({ sessions: 0, tokensIn: 0, cost: 0, costPerSession: 0, models: [], evalScores: {} });
+  });
+});
+
+describe("bucketFromDailyItem / groupDailyItems", () => {
+  it("lifts flat m|model|field and e|evaluator|sum/count attributes into the nested bucket", () => {
+    const item = {
+      agentId: "agentcore_hub_agent", day: "2026-09-07", tokensIn: 1510, tokensOut: 151, cacheRead: 900, calls: 5, sessions: 3,
+      "m|us.anthropic.claude-fable-5-1|input": 1500, "m|us.anthropic.claude-fable-5-1|output": 150, "m|us.anthropic.claude-fable-5-1|cacheRead": 900,
+      "m|us.anthropic.claude-sonnet-4-5-20250929-v1:0|input": 10, "m|us.anthropic.claude-sonnet-4-5-20250929-v1:0|output": 1,
+      "e|Builtin.Helpfulness|sum": 2, "e|Builtin.Helpfulness|count": 3, "e|Builtin.Correctness|sum": 1, "e|Builtin.Correctness|count": 1,
+      "m|junk": 1, "e|junk|median": 1, expiresAt: 1, updatedAt: "x",
+    };
+    const b = bucketFromDailyItem(item);
+    expect(b).toMatchObject({ tokensIn: 1510, tokensOut: 151, cacheRead: 900, calls: 5, sessions: 3 });
+    expect(b.byModel).toEqual({
+      "us.anthropic.claude-fable-5-1": { input: 1500, output: 150, cacheRead: 900 },
+      "us.anthropic.claude-sonnet-4-5-20250929-v1:0": { input: 10, output: 1 },
+    });
+    expect(b.evalScores).toEqual({ "Builtin.Helpfulness": { sum: 2, count: 3 }, "Builtin.Correctness": { sum: 1, count: 1 } });
+  });
+
+  it("groups items by agent and day and feeds summarizeDaily", () => {
+    const grouped = groupDailyItems([
+      { agentId: "a", day: "2026-09-07", sessions: 1, "m|x|input": 10, "m|x|output": 1 },
+      { agentId: "a", day: "2026-09-06", sessions: 2, "m|x|input": 20, "m|x|output": 2 },
+      { agentId: "b", day: "2026-09-07", sessions: 5 },
+      { agentId: "bad" },
+    ]);
+    expect(Object.keys(grouped).sort()).toEqual(["a", "b"]);
+    const s = summarizeDaily(grouped.a, windowDays(7, new Date("2026-09-07T12:00:00Z")), pricing);
+    expect(s).toMatchObject({ sessions: 3, tokensIn: 30, tokensOut: 3 });
   });
 });
