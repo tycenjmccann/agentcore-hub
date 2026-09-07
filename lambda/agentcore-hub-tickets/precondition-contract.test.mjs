@@ -11,7 +11,11 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
  * that an agent — and the orchestrator — never has to know which is running.
  */
 
-const h = vi.hoisted(() => ({ ddbItem: null, ddbUpdates: [], jiraCalls: [], jiraLabels: [] }));
+// `jiraMissing` (TEAM-4261) makes every Jira route answer 404, i.e. "that issue
+// does not exist" — the Jira half of `ddbItem = null`.
+const h = vi.hoisted(() => ({
+  ddbItem: null, ddbUpdates: [], jiraCalls: [], jiraLabels: [], jiraMissing: false,
+}));
 
 // ─── DynamoDB tickets Lambda seams ───────────────────────────────────────────
 // The Update is APPLIED to the in-memory row (TEAM-4185), not just recorded: the
@@ -58,6 +62,11 @@ vi.stubGlobal("fetch", vi.fn(async (url, options = {}) => {
   const path = String(url).replace(/^https?:\/\/[^/]+/, "");
   const body = options.body ? JSON.parse(options.body) : undefined;
   h.jiraCalls.push({ method, path, body });
+  if (h.jiraMissing) {
+    return response(404, {
+      errorMessages: ["Issue does not exist or you do not have permission to see it."],
+    });
+  }
   if (method === "POST" && /\/comment$/.test(path)) return response(201, { id: "1" });
   if (method === "PUT" && /\/issue\/[^/]+$/.test(path)) {
     for (const op of body?.update?.labels || []) {
@@ -83,6 +92,7 @@ beforeEach(() => {
   h.ddbUpdates.length = 0;
   h.jiraCalls.length = 0;
   h.jiraLabels = [];
+  h.jiraMissing = false;
 });
 
 /**
@@ -93,7 +103,8 @@ beforeEach(() => {
  */
 const BOARD = {
   dynamodb: {
-    awaited: () => h.ddbItem.preconditionUnmet?.awaitingIds || [],
+    // `?.` on the row too: the TEAM-4261 failure cases run with no row at all.
+    awaited: () => h.ddbItem?.preconditionUnmet?.awaitingIds || [],
     writes: () => h.ddbUpdates.length,
   },
   jira: {
@@ -173,6 +184,52 @@ for (const provider of ["dynamodb", "jira"]) {
       expect(r2.ticketId).toBe("TEAM-4126");
       expect(r2.preconditionUnmet.awaitingIds).toContain("TEAM-4156");
       expect(r2.preconditionUnmet.reportedAt).toBe("2026-09-06T07:07:00.000Z");
+    });
+  });
+
+  /**
+   * TEAM-4261 — the FAILURE half of the same parity contract.
+   *
+   * workflow-output's report_precondition_unmet cannot branch on provider, so a
+   * HANDLED failure has to be shape-identical too: a non-empty top-level `error`
+   * and NONE of the success keys. Before this ticket the dynamodb provider
+   * answered content-only text (`{ content: [{ text: "Issue … not found." }] }`)
+   * while jira threw into a `{ error }` catch — and because the consumer inferred
+   * success from the ABSENCE of error keys, a failed annotate on dynamodb was
+   * reported to the agent as a successful park with nothing written and nothing to
+   * re-wake it (ship-review r2-F2).
+   *
+   * Asserted on SHAPE, not on message text: the texts are provider-specific, the
+   * contract is not.
+   */
+  describe(`annotate failure contract [provider=${provider}]`, () => {
+    const annotate = (parameters) =>
+      HANDLERS[provider]({ tool_name: "Tickets___annotate_precondition_unmet", parameters });
+
+    const expectHandledFailure = (r) => {
+      expect(typeof r.error).toBe("string");
+      expect(r.error.length).toBeGreaterThan(0);
+      // No success keys — the consumer's positive check must not be satisfiable.
+      expect(r.ticketId).toBeUndefined();
+      expect(r.preconditionUnmet).toBeUndefined();
+    };
+
+    it("a ticket that does not exist is a handled failure, and nothing lands on the board", async () => {
+      if (provider === "dynamodb") h.ddbItem = null;
+      else h.jiraMissing = true;
+
+      const r = await annotate({ ticket_id: "TEAM-404", awaitingIds: ["TEAM-4156"] });
+
+      expectHandledFailure(r);
+      // No stamp on the DDB column / no `awaiting:` label on the Jira issue.
+      expect(BOARD[provider].awaited()).toEqual([]);
+    });
+
+    it("a missing ticket_id is a handled failure with no provider call at all", async () => {
+      const r = await annotate({ awaitingIds: ["TEAM-4156"] });
+
+      expectHandledFailure(r);
+      expect(BOARD[provider].writes()).toBe(0);
     });
   });
 }

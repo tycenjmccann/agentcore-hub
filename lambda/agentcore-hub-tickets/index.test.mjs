@@ -757,3 +757,51 @@ describe("transition_ticket — resolvedAt on Done (TEAM-4167 D3 FR-3.2 contract
     expect(h.state.statusUpdates[0].UpdateExpression).not.toContain("resolvedAt");
   });
 });
+
+/**
+ * TEAM-4261 — transition_ticket's HANDLED failures carry a top-level `error`.
+ *
+ * The same content-vs-error asymmetry as the annotate stamp, on a consumer that
+ * really does read the response: workflow-output's report_completion invokes
+ * transition_ticket and branches on `payload.error` alone
+ * (lambda/workflow-output/index.mjs). The Jira provider's transition failures
+ * already surface as `{ error }`; the dynamodb provider returned content-only
+ * text, so a REFUSED transition logged "Transitioned <id> → Done" and the agent
+ * was told the ticket had closed.
+ *
+ * The text is unchanged and still asserted — `error` is purely additive, and
+ * `content` stays so text-readers (deploy/runtime-agent/main.py) are unaffected.
+ */
+describe("transition_ticket — handled failures return { error, content } (TEAM-4261)", () => {
+  const transition = (args) => handler({ name: "Tickets___transition_ticket", arguments: args });
+
+  const expectHandledFailure = (res, text) => {
+    expect(typeof res.error).toBe("string");
+    expect(res.error.length).toBeGreaterThan(0);
+    expect(res.error).toContain(text);
+    // The text channel is preserved byte-for-byte alongside it.
+    expect(res.content[0].text).toBe(res.error);
+    expect(res.content[0].text).toContain(text);
+    // Nothing was written, and none of the success keys are present.
+    expect(h.state.statusUpdates).toHaveLength(0);
+    expect(res.status).toBeUndefined();
+    expect(res.key).toBeUndefined();
+  };
+
+  it("a ticket that does not exist", async () => {
+    const res = await transition({ ticket_id: "TEAM-404", to_status: "done" });
+    expectHandledFailure(res, "Issue TEAM-404 not found.");
+  });
+
+  it("a transition that is not available from the current status", async () => {
+    h.state.items[SHIP] = { ticketId: SHIP, status: "done", assignee: "agentcore_hub_release_manager" };
+    const res = await transition({ ticket_id: SHIP, to_status: "in_progress" });
+    expectHandledFailure(res, 'Invalid transition "in_progress" from status "done"');
+  });
+
+  it("the in_review human-gate guard on an agent-assigned ticket", async () => {
+    h.state.items[SHIP] = { ticketId: SHIP, status: "in_progress", assignee: "agentcore_hub_backend_dev" };
+    const res = await transition({ ticket_id: SHIP, to_status: "in_review" });
+    expectHandledFailure(res, `Cannot move ${SHIP} to in_review`);
+  });
+});
