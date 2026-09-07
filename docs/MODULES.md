@@ -142,6 +142,46 @@ unrecognized → `off`), normalized by the same `normalizeVerdictMode`.
   unreachable (no detection phase, so the gate never matches); syncing the config
   first is harmless (the strip keeps the phase non-required).
 
+**Sweep cadence gate (TEAM-4247 D2, `SWEEP_CADENCE_GATE`)** — the one flag in
+this family that lives on the **Next.js service**, not the orchestrator Lambda:
+it is read by `POST /api/workflow/start` (`src/lib/workflow/sweep-cadence.ts`),
+so it goes in the App Runner / ECS task env (both `deploy/apprunner/deploy.sh`
+and `deploy/ecs-express/deploy.sh` forward it when set), never in
+`lambda/orchestrator/deploy.sh`. Same three modes, same `shadow` default, same
+garbage → `off` rule.
+- A **scheduled** `dead-code-sweep` start is skipped when the same repo was swept
+  less than 14 days ago (`recent-sweep`) or still has an open sweep PR
+  (`open-sweep-pr`, matched on head branch / title / labels — see the match rule
+  in `sweep-cadence.ts`). `enforce` answers **HTTP 200**
+  `{ status: "skipped", reason, evidence }` — a skip is a successful no-op, and
+  the routines-runner treats 4xx as a terminal filing failure — and writes one
+  tombstone plus one `workflow.skipped` event. `shadow` runs both checks,
+  publishes `sweep.cadence_observed { wouldSkip, evidence, repo, defId }`, and
+  starts the run as today. `off` scans and probes nothing.
+- The gate runs **above** the dedup marker and every create, so a skip leaves no
+  epic, no tickets and no run row — nothing to clean up.
+- Only `trigger: "scheduled"` is gated. `lambda/routines-runner/index.mjs` stamps
+  it on every schedule tick; the "Run now" route
+  (`src/lib/routines/payload.ts`, `{ trigger: "manual" }`) and the SI
+  `prd-submitter` (`"autonomous"`) are never cadence-skipped, and an ad-hoc API
+  call with no `trigger` is likewise treated as deliberate.
+- The tombstone is **not a run**: PK `skip_<owner-repo>_<yyyymmdd>` (deterministic,
+  written with `attribute_not_exists`, so a repeat tick the same day writes
+  nothing and reports the same skip), `type: "skipped"`, `deleted: true`,
+  `phase: "cancelled"`, `skipReason: "sweep-cadence"`, plus `reason`, `evidence`,
+  `repo`, `defId`, `at`. `deleted: true` is load-bearing — it keeps the row out of
+  `listWorkflowsFromDynamo` and out of `cost-report`'s terminal scan, so a skip
+  can never appear as a zero-cost run on a performance card. `type: "skipped"`
+  keeps it out of the gate's own cadence evaluation (a skip must never be the
+  evidence for the next skip).
+- The open-PR probe needs `GITHUB_PAT` and **fails open**: with no token, a rate
+  limit or a 5xx, `evidence.prProbe` records `{ probed: false, reason }` and only
+  the cadence half decides. An expired token degrades to cadence-only, never to
+  "no sweeps ever again". The cadence read is a **filtered, projected, paginated
+  Scan** of the workflows table (no def GSI exists) — acceptable for a handful of
+  scheduled starts a week, off the hot human path; a very large workflows table
+  would want an index.
+
 **New events (TEAM-4246 D1)**
 - `orchestrator.verdict_observed { workflowId, verdict, verdictSource, wouldSuppress, spawnedTickets, testedHead }` — `VERDICT_GATE=shadow`, every gate completion
 - `orchestrator.verdict_suppressed { workflowId, verdict, unblocked, blockers, spawnedTickets }` — `VERDICT_GATE=enforce`, a non-PASS gate held its successor

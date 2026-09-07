@@ -58,6 +58,11 @@ export async function handler(event) {
       }],
     },
     sources: prd.sources || [],
+    // TEAM-4247 D2: self-improvement re-entry is automated but is NOT a schedule,
+    // so it is not cadence-gated. Inert to the sweep gate (this Lambda only ever
+    // submits the default delivery pipeline), but every automated caller now says
+    // how it was triggered.
+    trigger: "autonomous",
   };
 
   const resp = await fetch(`${WORKFLOW_API}/api/workflow/start`, {

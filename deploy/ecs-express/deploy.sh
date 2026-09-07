@@ -390,7 +390,7 @@ for var in AWS_REGION TICKET_PROVIDER WORKFLOWS_TABLE EVENTS_TABLE TICKETS_TABLE
            ROUTINES_DLQ_ARN ANOMALY_INTAKE_SECRET \
            WM_MAX_OPEN_AUTO_BUGS WM_BUG_MUTE_DAYS \
            WORKFLOW_COMMAND_QUEUE_URL WORKFLOW_LEASE_TTL_MINUTES \
-           SOURCE_VALIDATION_MODE; do
+           SOURCE_VALIDATION_MODE SWEEP_CADENCE_GATE; do
   val="${!var:-}"
   if [[ -n "$val" ]]; then
     escaped="${val//\\/\\\\}"; escaped="${escaped//\"/\\\"}"

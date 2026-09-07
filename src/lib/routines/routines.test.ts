@@ -42,4 +42,12 @@ describe("buildStartPayload", () => {
     const p = buildStartPayload({ ...base, modelOverride: "opus" }, fired);
     expect(p.modelOverride).toBe("opus");
   });
+
+  // TEAM-4247 D2: the sweep cadence gate skips trigger:"scheduled" starts only,
+  // and this one builder serves both the scheduler and the "Run now" button — so a
+  // manual fire must not be able to arrive labelled as a schedule tick.
+  it("stamps trigger scheduled by default and manual when asked", () => {
+    expect(buildStartPayload(base, fired).trigger).toBe("scheduled");
+    expect(buildStartPayload(base, fired, { trigger: "manual" }).trigger).toBe("manual");
+  });
 });

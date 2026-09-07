@@ -413,6 +413,16 @@ export interface WorkflowInput {
    */
   workflowDefId?: string;
   /**
+   * How this start was initiated (TEAM-4247 D2). Stamped by every AUTOMATED
+   * caller — the routines-runner ("scheduled"), the "Run now" route ("manual"),
+   * the SI prd-submitter ("autonomous") — and absent on human/API submissions.
+   *
+   * The sweep cadence gate reads ONLY "scheduled": a human who pressed Run now
+   * has said what they want and is never cadence-skipped, and an absent value
+   * (an ad-hoc API call) is likewise treated as deliberate.
+   */
+  trigger?: "scheduled" | "manual" | "autonomous";
+  /**
    * Agent phases the requester wants a human-review gate after. Activates any
    * def reviewGates whose condition is "flagged". "always" gates apply regardless.
    */

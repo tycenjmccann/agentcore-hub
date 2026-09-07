@@ -8,6 +8,8 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
 function buildPayload(input, firedAt) {
   const date = firedAt.toISOString().slice(0, 10);
@@ -17,6 +19,7 @@ function buildPayload(input, firedAt) {
     description: input.description || "",
     workflowDefId: input.workflowDefId,
     sources: input.sources || [],
+    trigger: "scheduled",
   };
   if (input.repoConfig) payload.repoConfig = input.repoConfig;
   if (input.modelOverride) payload.modelOverride = input.modelOverride;
@@ -64,4 +67,18 @@ test("passes connectors through when present, omits when empty", () => {
   assert.deepEqual(p.connectors, ["meta-ads"]);
   const q = buildPayload({ titleTemplate: "x", workflowDefId: "wf", connectors: [] }, FIRED);
   assert.ok(!("connectors" in q));
+});
+
+// TEAM-4247 D2: every fire from this Lambda is a schedule tick, and the sweep
+// cadence gate skips ONLY trigger:"scheduled" — so the label is load-bearing.
+test("stamps trigger scheduled on every payload", () => {
+  assert.equal(buildPayload({ titleTemplate: "x", workflowDefId: "wf" }, FIRED).trigger, "scheduled");
+});
+
+// The copy above is a re-declaration, so it can drift from the real builder in
+// silence. Read index.mjs and prove the field is really there.
+test("index.mjs's own buildPayload stamps the trigger", () => {
+  const src = readFileSync(fileURLToPath(new URL("./index.mjs", import.meta.url)), "utf8");
+  const body = src.slice(src.indexOf("function buildPayload"), src.indexOf("async function recordLastRun"));
+  assert.match(body, /trigger:\s*"scheduled"/);
 });

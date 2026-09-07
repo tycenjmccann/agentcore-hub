@@ -23,7 +23,10 @@ export async function POST(
   const routine = await getOwnedRoutine(id, tenantId);
   if (!routine) return NextResponse.json({ error: "Not found" }, { status: 404 });
 
-  const payload = buildStartPayload(routine.input, new Date());
+  // trigger: "manual" — a human pressed Run now, so the sweep cadence gate
+  // (TEAM-4247 D2) does not apply, even if the same routine's scheduled tick
+  // today would have been skipped.
+  const payload = buildStartPayload(routine.input, new Date(), { trigger: "manual" });
   // Self-call over loopback: the public origin is not routable from inside the
   // container (no route back through the load balancer). The app listens on $PORT.
   const origin = `http://127.0.0.1:${process.env.PORT || 8080}`;
