@@ -960,7 +960,9 @@ describe("TEAM-4185 F4 — fix-side derived backfill", () => {
 
   function makeAwaited({ mode = "enforce", addBlockers, annotatePreconditionUnmet } = {}) {
     return createAwaitedIds({
-      addBlockers: addBlockers || vi.fn(async () => [{ id: FIX, status: "written" }]),
+      // TEAM-4185 F5 — the seam answers in the per-id token form ("added" = written),
+      // which is what the orchestrator adapter gets by passing detailed: true.
+      addBlockers: addBlockers || vi.fn(async () => ["added"]),
       annotatePreconditionUnmet: annotatePreconditionUnmet || vi.fn(async () => {}),
       publishEvent: vi.fn(async () => {}),
       getTicket: vi.fn(async () => null),
@@ -987,7 +989,7 @@ describe("TEAM-4185 F4 — fix-side derived backfill", () => {
   });
 
   it("enforce: an unstamped, un-edged origin gets the derived edge written from the fix's spawnedBy", async () => {
-    const addBlockers = vi.fn(async () => [{ id: FIX, status: "written" }]);
+    const addBlockers = vi.fn(async () => ["added"]);
     const annotatePreconditionUnmet = vi.fn(async () => {});
     const awaitedIds = makeAwaited({ mode: "enforce", addBlockers, annotatePreconditionUnmet });
     const siblings = [unlinkedOrigin(), fixTicket()];

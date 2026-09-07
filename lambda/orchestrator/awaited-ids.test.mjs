@@ -110,15 +110,42 @@ describe("normalizeAwaitedIdsMode", () => {
 
 describe("tallyBlockerResult (seam contract — tolerate both shapes)", () => {
   it("counts a returned id string as a write", () => {
-    expect(tallyBlockerResult(["TEAM-100"], ["TEAM-100"])).toEqual({ written: 1, present: 0 });
+    expect(tallyBlockerResult(["TEAM-100"], ["TEAM-100"])).toEqual({ written: 1, present: 0, failed: 0 });
   });
-  it("treats a requested id ABSENT from an id-shaped result as present (real seam omission)", () => {
-    expect(tallyBlockerResult([], ["TEAM-100"])).toEqual({ written: 0, present: 1 });
+  it("treats a requested id ABSENT from an id-shaped result as present (LEGACY seam omission)", () => {
+    expect(tallyBlockerResult([], ["TEAM-100"])).toEqual({ written: 0, present: 1, failed: 0 });
   });
-  it("tolerates the idealized token form (added / present / single string)", () => {
-    expect(tallyBlockerResult(["added"], ["TEAM-100"])).toEqual({ written: 1, present: 0 });
-    expect(tallyBlockerResult(["present"], ["TEAM-100"])).toEqual({ written: 0, present: 1 });
-    expect(tallyBlockerResult("added", ["TEAM-100"])).toEqual({ written: 1, present: 0 });
+  it("tolerates the token form (added / present / single string)", () => {
+    expect(tallyBlockerResult(["added"], ["TEAM-100"])).toEqual({ written: 1, present: 0, failed: 0 });
+    expect(tallyBlockerResult(["present"], ["TEAM-100"])).toEqual({ written: 0, present: 1, failed: 0 });
+    expect(tallyBlockerResult("added", ["TEAM-100"])).toEqual({ written: 1, present: 0, failed: 0 });
+  });
+
+  /**
+   * TEAM-4185 F5 — the whole point of the token form. Under the legacy id-array
+   * shape a failed write and an already-present edge BOTH read as omission, so
+   * applyAwaitedEdges could not tell them apart and stamped either way.
+   */
+  it("counts the failure tokens (failed / error), and never as present", () => {
+    expect(tallyBlockerResult(["failed"], ["TEAM-100"])).toEqual({ written: 0, present: 0, failed: 1 });
+    expect(tallyBlockerResult(["error"], ["TEAM-100"])).toEqual({ written: 0, present: 0, failed: 1 });
+    expect(tallyBlockerResult("failed", ["TEAM-100"])).toEqual({ written: 0, present: 0, failed: 1 });
+  });
+
+  it("tallies a MIXED per-id batch positionally: added + present + failed", () => {
+    const ids = ["TEAM-100", "TEAM-101", "TEAM-102"];
+    expect(tallyBlockerResult(["added", "present", "failed"], ids))
+      .toEqual({ written: 1, present: 1, failed: 1 });
+    // The DDB branch's own outcome vocabulary passes through unchanged.
+    expect(tallyBlockerResult(["blocked", "preserved", "failed"], ids))
+      .toEqual({ written: 2, present: 0, failed: 1 });
+  });
+
+  it("a token answer NEVER falls back to present-by-omission (that is legacy-shape only)", () => {
+    // Two ids requested, one "failed" token back: the missing id is NOT invented as
+    // present — the answer carried tokens, so omission means nothing.
+    expect(tallyBlockerResult(["failed"], ["TEAM-100", "TEAM-101"]))
+      .toEqual({ written: 0, present: 0, failed: 1 });
   });
 });
 
@@ -366,7 +393,10 @@ for (const provider of ["dynamodb", "jira"]) {
     });
 
     describe("emitAwaitedMetrics — EMF record with explicit zeros", () => {
-      it("writes the AgentCoreHub/Orchestrator record with all five metrics + AwaitedMode", () => {
+      // TEAM-4185 F5 — AwaitedEdgesFailed rides the SAME record with an explicit 0:
+      // a wholly-failed write leaves no stamp behind, so this metric is the only
+      // signal that a re-wake edge silently did not land.
+      it("writes the AgentCoreHub/Orchestrator record with all six metrics + AwaitedMode", () => {
         const spy = vi.spyOn(console, "log").mockImplementation(() => {});
         try {
           const { deps } = makeDeps({ provider, mode: "enforce" });
@@ -377,9 +407,9 @@ for (const provider of ["dynamodb", "jira"]) {
           const names = rec._aws.CloudWatchMetrics[0].Metrics.map((x) => x.Name);
           expect(names).toEqual([
             "AwaitedEdgesDerived", "AwaitedEdgesFromTool", "AwaitedEdgesWritten",
-            "AwaitedEdgesPresent", "AwaitTimeouts",
+            "AwaitedEdgesPresent", "AwaitedEdgesFailed", "AwaitTimeouts",
           ]);
-          for (const k of ["AwaitedEdgesDerived", "AwaitedEdgesFromTool", "AwaitedEdgesWritten", "AwaitedEdgesPresent", "AwaitTimeouts"]) {
+          for (const k of ["AwaitedEdgesDerived", "AwaitedEdgesFromTool", "AwaitedEdgesWritten", "AwaitedEdgesPresent", "AwaitedEdgesFailed", "AwaitTimeouts"]) {
             expect(rec[k]).toBe(0);
           }
           expect(rec.AwaitedMode).toBe("enforce");
@@ -628,17 +658,17 @@ describe("awaitedWaitedMs (TEAM-4184 F2)", () => {
  * previously-incidental properties load-bearing:
  *
  *   1. Replay must be a no-op, not a duplicate. Repeated calls converge on ONE
- *      edge (the second reads back present-by-omission) and re-stamp with the same
- *      awaitingIds — the tickets Lambda's monotonic merge (TEAM-4184/F3) absorbs
- *      the re-stamp without moving reportedAt.
+ *      edge (the replay reads back "present") and — TEAM-4185 F3(b) — do NOT
+ *      re-stamp: only the delivery that actually WROTE the edge annotates, so
+ *      reportedAt (and therefore the wait clock) is set once and then left alone.
  *   2. A retry after a transient seam failure must actually land the edge. The
  *      first attempt's addBlockers throw is swallowed (an awaited edge is advisory
  *      — it must never fail the cascade) and, critically, the stamp is NOT written
  *      for an edge that did not land; the NEXT delivery writes both.
  *
- * NOTE (deliberate): asserted against the CURRENT applyAwaitedEdges return shape —
- * a swallowed seam error yields `{ error: true, ids }`. Commit 3 refines that shape;
- * these assertions are the before-picture it has to keep honest.
+ * TEAM-4185 F5 — a seam throw is no longer a special return shape: it is folded into
+ * the normal path as `failed = <every requested id>`, so every enforce call answers
+ * in the one { written, present, failed, ids } vocabulary.
  */
 for (const provider of ["dynamodb", "jira"]) {
   describe(`TEAM-4185 F4 — replay + transient recovery [provider=${provider}]`, () => {
@@ -657,12 +687,13 @@ for (const provider of ["dynamodb", "jira"]) {
       const second = await ai.applyAwaitedEdgesForSpawn(FIX, spawnedBy);
       const third = await ai.applyAwaitedEdgesForSpawn(FIX, spawnedBy);
 
-      expect(first).toMatchObject({ written: 1, present: 0, ids: [FIX] });
-      // Replays are present-by-omission, NOT a second edge.
-      expect(second).toMatchObject({ written: 0, present: 1, ids: [FIX] });
-      expect(third).toMatchObject({ written: 0, present: 1, ids: [FIX] });
+      expect(first).toMatchObject({ written: 1, present: 0, failed: 0, ids: [FIX] });
+      // Replays read back present, NOT a second edge — and never as a failure.
+      expect(second).toMatchObject({ written: 0, present: 1, failed: 0, ids: [FIX] });
+      expect(third).toMatchObject({ written: 0, present: 1, failed: 0, ids: [FIX] });
       expect(m.written).toBe(1);
       expect(m.present).toBe(2);
+      expect(m.failed).toBe(0);
 
       // The seam saw three identical requests and converged on one edge.
       expect(h._addBlockers.calls).toHaveLength(3);
@@ -670,14 +701,14 @@ for (const provider of ["dynamodb", "jira"]) {
         expect(c.ticketId).toBe(ORIGIN);
         expect(c.ids).toEqual([FIX]);
       }
-      // Every attempt re-stamps identically — the merge, not the caller, dedupes.
-      expect(h._annotateCalls).toHaveLength(3);
-      for (const a of h._annotateCalls) {
-        expect(a.originId).toBe(ORIGIN);
-        expect(a.payload.awaitingIds).toEqual([FIX]);
-        expect(a.payload.source).toBe("derived");
-        expect(a.payload.reportedAt).toBe(new Date(NOW).toISOString());
-      }
+      // TEAM-4185 F3(b) — ONLY the delivery that wrote the edge stamps. The two
+      // replays changed nothing, so re-stamping would only push reportedAt forward
+      // and reset the wait clock checkAwaitTimeout reads.
+      expect(h._annotateCalls).toHaveLength(1);
+      expect(h._annotateCalls[0].originId).toBe(ORIGIN);
+      expect(h._annotateCalls[0].payload.awaitingIds).toEqual([FIX]);
+      expect(h._annotateCalls[0].payload.source).toBe("derived");
+      expect(h._annotateCalls[0].payload.reportedAt).toBe(new Date(NOW).toISOString());
     });
 
     it("a transient addBlockers throw is swallowed and writes NO stamp for an edge that never landed", async () => {
@@ -688,13 +719,15 @@ for (const provider of ["dynamodb", "jira"]) {
 
       const res = await ai.applyAwaitedEdgesForSpawn(FIX, spawnedBy);
 
-      // Advisory, never fatal…
-      expect(res).toEqual({ error: true, ids: [FIX] });
+      // Advisory, never fatal — and TEAM-4185 F5 folds the throw into the normal
+      // vocabulary: every requested id failed.
+      expect(res).toEqual({ written: 0, present: 0, failed: 1, ids: [FIX] });
       // …and no stamp: claiming a park the origin does not actually have would
       // make the D2 evidence guard read a phantom clean park.
       expect(h._annotateCalls).toHaveLength(0);
       expect(m.written).toBe(0);
       expect(m.present).toBe(0);
+      expect(m.failed).toBe(1); // …and observable, via AwaitedEdgesFailed
       expect(m.derived).toBe(1); // the derivation itself still happened
       expect(h._logs.some((l) => l.includes("awaited.addBlockers_error"))).toBe(true);
     });
@@ -715,9 +748,10 @@ for (const provider of ["dynamodb", "jira"]) {
       const failed = await ai.applyAwaitedEdgesForSpawn(FIX, spawnedBy);
       const retried = await ai.applyAwaitedEdgesForSpawn(FIX, spawnedBy);
 
-      expect(failed).toEqual({ error: true, ids: [FIX] });
-      expect(retried).toMatchObject({ written: 1, present: 0, ids: [FIX] });
+      expect(failed).toEqual({ written: 0, present: 0, failed: 1, ids: [FIX] });
+      expect(retried).toMatchObject({ written: 1, present: 0, failed: 0, ids: [FIX] });
       expect(m.written).toBe(1);
+      expect(m.failed).toBe(1); // the flaky attempt is still counted, not erased
       expect(h._annotateCalls).toHaveLength(1); // only the successful attempt stamps
       expect(h._annotateCalls[0].payload.awaitingIds).toEqual([FIX]);
       expect(h._annotateCalls[0].payload.source).toBe("derived");
@@ -736,8 +770,9 @@ for (const provider of ["dynamodb", "jira"]) {
       expect(res).toMatchObject({ written: 1, ids: [FIX] });
       expect(h._addBlockers.calls).toHaveLength(1);
       expect(h._logs.some((l) => l.includes("awaited.annotate_error"))).toBe(true);
-      // The next delivery re-stamps — the edge is what gates the re-wake, and
-      // handleAwaitedChild / handleSpawnedFix both re-derive from it.
+      // The edge is what gates the re-wake, and both sweep backstops
+      // (handleAwaitedChild / handleSpawnedFix) re-derive from it — so a lost stamp
+      // is recoverable even though F3(b) means the next replay will NOT re-stamp.
       expect(h._logs.some((l) => l.includes("awaited.apply"))).toBe(true);
     });
 
@@ -754,6 +789,159 @@ for (const provider of ["dynamodb", "jira"]) {
       expect(second).toEqual({ skipped: "origin-terminal" });
       expect(h._addBlockers.calls).toHaveLength(1);
       expect(h._annotateCalls).toHaveLength(1);
+    });
+  });
+}
+
+/**
+ * TEAM-4185 F3(b) + F5 — the annotate gate, at the applyAwaitedEdges level.
+ *
+ * F3 (commit 1) made the tickets-Lambda merge first-writer-wins on reportedAt, so a
+ * re-stamp there is already harmless. F3(b) is the ORCHESTRATOR half: don't send the
+ * write at all unless something landed. Two reasons, both of which cost real
+ * behaviour before:
+ *
+ *   - the level-triggered "tool" pickup re-reports edges that are ALREADY on the
+ *     board every sweep. Each re-stamp moved reportedAt forward, so awaitedWaitedMs
+ *     never grew and the D1 wait-SLA (checkAwaitTimeout → orchestrator.await_timeout)
+ *     could never fire — a ticket could await a fix indefinitely in silence.
+ *   - a wholly-FAILED write (F5) used to stamp too, manufacturing D2 park evidence
+ *     for an edge that does not exist. The recovery for a failed derived write is the
+ *     F4 fix-side sweep backstop (handleSpawnedFix), which re-derives the edge from
+ *     the fix ticket precisely BECAUSE no stamp was left to find it by.
+ */
+for (const provider of ["dynamodb", "jira"]) {
+  describe(`TEAM-4185 F3(b)/F5 — annotate only when a write landed [provider=${provider}]`, () => {
+    const ORIGIN = "TEAM-4126";
+    const A = "TEAM-4156";
+    const B = "TEAM-4157";
+    const liveOrigin = { [ORIGIN]: { ticketId: ORIGIN, status: "in_progress" } };
+
+    it("per-id seam FAILURES: failed=N, present=0, and NO stamp", async () => {
+      // The detailed token form — index.mjs answers "failed" per id that did not land.
+      const addBlockers = vi.fn(async () => ["failed", "failed"]);
+      const h = makeDeps({ provider, mode: "enforce", addBlockers, tickets: liveOrigin });
+      const ai = createAwaitedIds(h.deps);
+      const m = ai.newMetrics();
+
+      const res = await ai.applyAwaitedEdges(ORIGIN, [A, B], "derived");
+
+      expect(res).toEqual({ written: 0, present: 0, failed: 2, ids: [A, B] });
+      // A failure is NEVER read as the idempotent no-op…
+      expect(res.present).toBe(0);
+      expect(m.failed).toBe(2);
+      // …and nothing is stamped, so no phantom park evidence exists.
+      expect(h._annotateCalls).toHaveLength(0);
+      expect(h._logs.some((l) => l.includes("failed=2"))).toBe(true);
+    });
+
+    it("a PARTIAL failure still stamps (one edge did land) and reports both counts", async () => {
+      const addBlockers = vi.fn(async () => ["added", "failed"]);
+      const h = makeDeps({ provider, mode: "enforce", addBlockers, tickets: liveOrigin });
+      const ai = createAwaitedIds(h.deps);
+
+      const res = await ai.applyAwaitedEdges(ORIGIN, [A, B], "derived");
+
+      expect(res).toMatchObject({ written: 1, present: 0, failed: 1 });
+      expect(h._annotateCalls).toHaveLength(1);
+      // The stamp carries the ids the caller asked to await — the merge on the
+      // tickets side is what reconciles it with whatever is already there.
+      expect(h._annotateCalls[0].payload.awaitingIds).toEqual([A, B]);
+    });
+
+    it("an ALL-PRESENT re-run: present=N, failed=0, and NO stamp", async () => {
+      const addBlockers = vi.fn(async () => ["present", "present"]);
+      const h = makeDeps({ provider, mode: "enforce", addBlockers, tickets: liveOrigin });
+      const ai = createAwaitedIds(h.deps);
+      const m = ai.newMetrics();
+
+      const res = await ai.applyAwaitedEdges(ORIGIN, [A, B], "tool");
+
+      expect(res).toEqual({ written: 0, present: 2, failed: 0, ids: [A, B] });
+      expect(m.present).toBe(2);
+      expect(h._annotateCalls).toHaveLength(0); // nothing new to record
+    });
+
+    /**
+     * The load-bearing consequence: the FIRST stamp's clock must survive every
+     * later "tool" pickup of the same edge, or the wait SLA can never mature.
+     */
+    it("the first stamp's reportedAt survives a later 'tool' pickup, so awaitedWaitedMs keeps growing", async () => {
+      const T0 = Date.parse("2026-09-06T08:00:00.000Z");
+      const T1 = T0 + 3 * 3600_000; // a sweep 3h later
+
+      // A tiny board: annotate writes the stamp, the seam reads back present once
+      // the edge exists (exactly what the real DDB/jira seams do).
+      const board = { ticketId: ORIGIN, status: "in_progress", blockedBy: [] };
+      const annotateCalls = [];
+      const mk = (nowMs) => createAwaitedIds({
+        provider,
+        addBlockers: async (_id, ids) => ids.map((i) => (board.blockedBy.includes(i) ? "present" : (board.blockedBy.push(i), "added"))),
+        annotatePreconditionUnmet: async (originId, payload) => {
+          annotateCalls.push({ originId, payload });
+          // First-writer-wins, mirroring the tickets Lambda's TEAM-4185 F3 merge.
+          const prev = board.preconditionUnmet;
+          board.preconditionUnmet = {
+            awaitingIds: [...new Set([...(prev?.awaitingIds || []), ...payload.awaitingIds])],
+            source: payload.source,
+            reportedAt: prev?.reportedAt || payload.reportedAt,
+          };
+        },
+        publishEvent: async () => {},
+        getTicket: async () => board,
+        store: { markAwaitTimeoutEmitted: async () => true },
+        now: () => nowMs,
+        log: () => {},
+        mode: "enforce",
+        timeoutMinutes: 120,
+      });
+
+      // T0: the derived hook writes the edge and stamps.
+      await mk(T0).applyAwaitedEdges(ORIGIN, [A], "derived");
+      expect(annotateCalls).toHaveLength(1);
+      expect(board.preconditionUnmet.reportedAt).toBe(new Date(T0).toISOString());
+
+      // T1: the level-triggered pickup re-reports the SAME edge. It is present, so
+      // there is no write and therefore no stamp.
+      const again = await mk(T1).applyAwaitedEdges(ORIGIN, [A], "tool");
+      expect(again).toMatchObject({ written: 0, present: 1, failed: 0 });
+      expect(annotateCalls).toHaveLength(1); // still one — the clock was not touched
+      expect(board.preconditionUnmet.reportedAt).toBe(new Date(T0).toISOString());
+
+      // …so the measured wait is the REAL 3h, not 0. Pre-F3(b) the re-stamp reset
+      // this to now on every sweep and the SLA never matured.
+      expect(awaitedWaitedMs(board, T1)).toBe(3 * 3600_000);
+    });
+
+    it("the LEGACY bare-id seam shape still infers present-by-omission (no false failures)", async () => {
+      // A seam that has not opted into `detailed` answers with added-id strings and
+      // omits present ids. That must read as present, never as failed.
+      const addBlockers = vi.fn(async () => [A]); // B omitted → already linked
+      const h = makeDeps({ provider, mode: "enforce", addBlockers, tickets: liveOrigin });
+      const ai = createAwaitedIds(h.deps);
+
+      const res = await ai.applyAwaitedEdges(ORIGIN, [A, B], "derived");
+
+      expect(res).toMatchObject({ written: 1, present: 1, failed: 0 });
+      expect(h._annotateCalls).toHaveLength(1); // A landed, so the stamp is earned
+    });
+
+    it("AwaitedEdgesFailed rides the EMF record — explicit 0 when healthy, the real count otherwise", async () => {
+      const spy = vi.spyOn(console, "log").mockImplementation(() => {});
+      try {
+        const healthy = createAwaitedIds(makeDeps({ provider, mode: "enforce" }).deps);
+        healthy.emitAwaitedMetrics(healthy.newMetrics());
+        expect(JSON.parse(spy.mock.calls.at(-1)[0]).AwaitedEdgesFailed).toBe(0);
+
+        const h = makeDeps({ provider, mode: "enforce", addBlockers: vi.fn(async () => ["failed"]), tickets: liveOrigin });
+        const ai = createAwaitedIds(h.deps);
+        ai.newMetrics();
+        await ai.applyAwaitedEdges(ORIGIN, [A], "derived");
+        ai.emitAwaitedMetrics();
+        expect(JSON.parse(spy.mock.calls.at(-1)[0]).AwaitedEdgesFailed).toBe(1);
+      } finally {
+        spy.mockRestore();
+      }
     });
   });
 }

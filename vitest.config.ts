@@ -309,6 +309,13 @@ export default defineConfig({
       // preconditionUnmet stamp, the once-only await-timeout CAS, and the EMF
       // record — all asserted under a jira == dynamodb provider parity loop.
       "lambda/orchestrator/awaited-ids.test.mjs",
+      // addBlockers `detailed` tokens (TEAM-4185 F5) — the other side of that seam,
+      // pinned in index.mjs itself because the two provider branches are separate
+      // code. The default added-id return must stay byte-identical (live-reverify /
+      // sync-main / dead-session-escalation read the ids back), while `detailed`
+      // distinguishes an idempotent "present" from a "failed" write — the
+      // distinction the F3(b) annotate gate is built on.
+      "lambda/orchestrator/add-blockers-detailed.test.mjs",
       // report_precondition_unmet channel (TEAM-4166 §1.2) — the non-terminal
       // twin of report_completion. workflow-output/precondition-unmet: the REAL
       // handler's ONLY side effects are the annotate invoke + the journey event

@@ -839,8 +839,13 @@ function getAwaitedIds() {
     leaseTtlMs: LEASE_TTL_MS,
     // Adapter: forward the awaited-edge write to the existing provider-aware seam,
     // threading preserveStatusIf (so the parked agent is never yanked to Blocked).
+    // TEAM-4185 F5 — `detailed: true` is passed ONLY here: awaited-ids is the one
+    // caller that must distinguish an already-present edge from a FAILED write,
+    // because it stamps preconditionUnmet (and therefore the wait clock) on the
+    // strength of the write actually landing. Every other addBlockers caller keeps
+    // the unchanged added-id array.
     addBlockers: (ticketId, ids, opts = {}) =>
-      addBlockers(ticketId, ids, { preserveStatusIf: opts.preserveStatusIf, source: opts.source }),
+      addBlockers(ticketId, ids, { preserveStatusIf: opts.preserveStatusIf, source: opts.source, detailed: true }),
     // Adapter: stamp the origin's preconditionUnmet through the SAME Tickets___*
     // tool as the report_precondition_unmet channel (provider-agnostic).
     annotatePreconditionUnmet: (originId, { awaitingIds, source, reportedAt }) =>
@@ -1338,16 +1343,32 @@ async function blockShipOnPrereq(ticketId, shipTicket, blockerId) {
  * made inside the conditional write (see ticket-blockers.mjs), never by a
  * read-then-write that would race the agent's own transition.
  *
+ * TEAM-4185 F5 — `opts.detailed`: return a PER-ID token array (positionally
+ * aligned with the requested ids) instead of the added-id array. The default
+ * return is unchanged byte for byte, because the id array is load-bearing for
+ * live-reverify.mjs / sync-main.mjs / dead-session-escalation.mjs, which read the
+ * ids back. Only the awaited-ids adapter opts in, because it is the one caller
+ * that must tell an idempotent "the edge was already there" from a FAILED write:
+ * the id-array shape signals both by omission, so a wholly-failed write was
+ * indistinguishable from an all-present no-op and got stamped as a fresh park.
+ * Tokens: "added"/"blocked"/"preserved" = written, "present" = idempotent no-op,
+ * "failed" = the write did not land. See tallyBlockerResult in awaited-ids.mjs.
+ *
  * NOTE: this is a deliberate, acknowledged duplicate of the tickets-Lambda
  * `add_blockers` op added in PR #380, which main does not yet carry. When #380
  * merges, replace the body with invokeTickets("add_blockers", …) so the board
  * write lives in exactly one place again.
  */
-async function addBlockers(ticketId, ids, opts = {}) {
+// Exported for tests only (same reason as isCreationTimeBlock / mapJiraIssueToTicket):
+// the `detailed` token contract below is what awaited-ids' annotate gate depends on,
+// so it is pinned directly rather than inferred through the handler.
+export async function addBlockers(ticketId, ids, opts = {}) {
   const blockers = (Array.isArray(ids) ? ids : [ids]).filter(Boolean);
   if (!ticketId || !blockers.length) return [];
   const preserveStatusIf = normalizePreserveStatuses(opts.preserveStatusIf);
+  const detailed = opts.detailed === true;
   const added = [];
+  const tokens = [];
   if (TICKET_PROVIDER === "jira") {
     for (const id of blockers) {
       try {
@@ -1357,14 +1378,18 @@ async function addBlockers(ticketId, ids, opts = {}) {
           outwardIssue: { key: ticketId },
         });
         added.push(id);
+        tokens.push("added");
       } catch (err) {
         console.warn(`[orchestrator] addBlockers: link ${id} → ${ticketId} failed (non-fatal): ${err?.message || err}`);
+        // Jira dedupes (type, pair), so a repeat link SUCCEEDS — a throw here is a
+        // genuine failure, never the idempotent case.
+        tokens.push("failed");
       }
     }
     if (added.length && !(await jiraStatusIsPreserved(ticketId, preserveStatusIf))) {
       await jiraTransition(ticketId, "Blocked");
     }
-    return added;
+    return detailed ? tokens : added;
   }
   for (const id of blockers) {
     const outcome = await applyBlockerEdge({
@@ -1380,8 +1405,11 @@ async function addBlockers(ticketId, ids, opts = {}) {
       console.log(`[orchestrator] addBlockers: ${ticketId} += ${id} (edge only — status preserved, TEAM-4130 F1)`);
     }
     if (outcome === "blocked" || outcome === "preserved") added.push(id);
+    // "blocked"/"preserved" are already write tokens; "present" passes through as
+    // the idempotent no-op; anything else (i.e. "error") is a failed write.
+    tokens.push(outcome === "blocked" || outcome === "preserved" || outcome === "present" ? outcome : "failed");
   }
-  return added;
+  return detailed ? tokens : added;
 }
 
 /**
