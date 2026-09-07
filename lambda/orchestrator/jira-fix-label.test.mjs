@@ -178,3 +178,100 @@ describe("mapJiraIssueToTicket — the FR-8 contract carriers", () => {
     expect(t.description).toBe("");
   });
 });
+
+/**
+ * TEAM-4184 — `preconditionUnmet.reportedAt` in Jira mode.
+ *
+ * The D2 evidence guard compares reportedAt against the claim's startedAt to tell
+ * a session that parked on open work from one whose stamp is stale evidence left
+ * over from a previous claim. Its sibling read is getChildTicketsFromJira, whose
+ * field list does NOT include `comment` — so the `<!-- precondition-unmet -->`
+ * marker is simply absent there, and before this change reportedAt was too. Every
+ * issue below is built WITHOUT a comment field on purpose: that is the shape the
+ * guard actually sees.
+ */
+describe("mapJiraIssueToTicket — the precondition-at clock (TEAM-4184)", () => {
+  const AT = Date.parse("2026-09-06T09:10:00.000Z");
+
+  it("recovers reportedAt from the label with NO comment field in scope", () => {
+    const t = mapJiraIssueToTicket(issue(["wf:run1", "awaiting:TEAM-4157", `precondition-at:${AT}`]));
+    expect(t.preconditionUnmet).toEqual({
+      awaitingIds: ["TEAM-4157"],
+      reportedAt: new Date(AT).toISOString(),
+      source: "label",
+    });
+  });
+
+  it("takes the MAX when a failed prune left several clock labels behind", () => {
+    const older = Date.parse("2026-09-06T07:07:00.000Z");
+    const t = mapJiraIssueToTicket(
+      issue(["awaiting:TEAM-4157", `precondition-at:${older}`, `precondition-at:${AT}`])
+    );
+    expect(t.preconditionUnmet.reportedAt).toBe(new Date(AT).toISOString());
+  });
+
+  it("ignores a malformed clock label rather than inventing an instant", () => {
+    const t = mapJiraIssueToTicket(issue(["awaiting:TEAM-4157", "precondition-at:", "precondition-at:junk"]));
+    expect(t.preconditionUnmet.awaitingIds).toEqual(["TEAM-4157"]);
+    expect("reportedAt" in t.preconditionUnmet).toBe(false);
+  });
+
+  it("no awaited labels and no marker → no preconditionUnmet, clock label or not", () => {
+    expect(mapJiraIssueToTicket(issue(["wf:run1", `precondition-at:${AT}`])).preconditionUnmet).toBeUndefined();
+  });
+
+  it("marker and label are combined with MAX — a truncated-away newer label still wins", () => {
+    // Jira returns an issue's comments OLDEST-first capped at 20, so on a chatty
+    // ticket the marker in scope can be an old one. The label is not subject to
+    // that cap, so it must not lose to a stale marker.
+    const stale = "2026-09-06T07:07:00.000Z";
+    const withMarker = {
+      key: "TEAM-9",
+      fields: {
+        summary: "s", status: { name: "In Progress" }, issuetype: { name: "Task" }, description: null,
+        labels: ["awaiting:TEAM-4157", `precondition-at:${AT}`],
+        comment: {
+          comments: [{
+            author: { displayName: "rm" },
+            created: stale,
+            body: {
+              type: "doc", version: 1,
+              content: [{
+                type: "paragraph",
+                content: [{ type: "text", text: `<!-- precondition-unmet {"awaitingIds":["TEAM-4157"],"reportedAt":"${stale}","source":"tool"} -->` }],
+              }],
+            },
+          }],
+        },
+      },
+    };
+    const t = mapJiraIssueToTicket(withMarker);
+    expect(t.preconditionUnmet.reportedAt).toBe(new Date(AT).toISOString());
+    // The marker still supplies what only it carries.
+    expect(t.preconditionUnmet.source).toBe("tool");
+  });
+
+  it("a marker FRESHER than the label keeps its own exact ISO", () => {
+    const fresh = "2026-09-06T11:30:00.123Z";
+    const t = mapJiraIssueToTicket({
+      key: "TEAM-9",
+      fields: {
+        summary: "s", status: { name: "In Progress" }, issuetype: { name: "Task" }, description: null,
+        labels: ["awaiting:TEAM-4157", `precondition-at:${AT}`],
+        comment: {
+          comments: [{
+            author: { displayName: "rm" }, created: fresh,
+            body: {
+              type: "doc", version: 1,
+              content: [{
+                type: "paragraph",
+                content: [{ type: "text", text: `<!-- precondition-unmet {"awaitingIds":["TEAM-4157"],"reportedAt":"${fresh}","source":"tool"} -->` }],
+              }],
+            },
+          }],
+        },
+      },
+    });
+    expect(t.preconditionUnmet.reportedAt).toBe(fresh);
+  });
+});
