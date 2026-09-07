@@ -306,16 +306,20 @@ fi
 # (it CANNOT tell whether the merge would conflict — only a merge can); enforce
 # = merge the default branch INTO the feature branch immediately before the CI
 # agent is dispatched, and on a 409 file a `Fix (sync-main)` sync_fix ticket that
-# blocks the CI ticket until a dev resolves it. Needs GITHUB_PAT (no PAT = no-op).
-# Forwarded ONLY when explicitly set, so a plain install stays default off —
-# byte-identical: no GitHub call, no event, no write. STRICT allow-list in code
-# (garbage → off, not shadow) because enforce PUSHES A COMMIT to a shared branch.
-# Instant rollback = set off (or unset and redeploy).
-SYNC_MAIN_BEFORE_CI_VARS=""
-if [ -n "${SYNC_MAIN_BEFORE_CI:-}" ]; then
-  SYNC_MAIN_BEFORE_CI_VARS=",SYNC_MAIN_BEFORE_CI=${SYNC_MAIN_BEFORE_CI}"
-  echo "  SYNC_MAIN_BEFORE_CI=${SYNC_MAIN_BEFORE_CI} forwarded to orchestrator"
-fi
+# blocks the CI ticket until a dev resolves it. Needs GITHUB_PAT (no PAT = a
+# silent no-op: sync-main returns skipped/no_pat before any call or event).
+# TEAM-4188: the DEFAULT is now "enforce" (unset → enforce). Forwarding it only
+# when set left every install that never exported the var running with the
+# guarantee OFF while the docs described it as the behaviour. Forwarded
+# UNCONDITIONALLY with the default so the deployed config is self-describing.
+# `${VAR:-enforce}` also treats an exported-but-EMPTY value as unset, matching
+# resolveSyncModeFromEnv in sync-main.mjs. Strict allow-list in code (garbage →
+# off, not shadow) because enforce PUSHES A COMMIT to a shared branch. Instant
+# rollback = set SYNC_MAIN_BEFORE_CI=off. Orchestrator ONLY: it is the sole
+# dispatcher of the CI agent — the agent-invoker and events-writer have no sync
+# logic (they do receive the var via template.yaml Globals, inertly).
+SYNC_MAIN_BEFORE_CI_VARS=",SYNC_MAIN_BEFORE_CI=${SYNC_MAIN_BEFORE_CI:-enforce}"
+echo "  SYNC_MAIN_BEFORE_CI=${SYNC_MAIN_BEFORE_CI:-enforce} forwarded to orchestrator"
 
 # Advisory-ticket routing (TEAM-4122 FR-7): off | enforce. An "advisory" ticket is
 # out-of-scope-but-worth-doing work the reviewers file as backlog. enforce makes
