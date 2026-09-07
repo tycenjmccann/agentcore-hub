@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
-  bandFor, buildFleetView, median, mad, formatKpi, type CardSummary, type PerformanceIndex,
+  bandFor, buildFleetView, median, mad, formatKpi, FLEET_KPIS, type CardSummary, type PerformanceIndex,
 } from "./performance";
 
 function card(over: Partial<CardSummary> & { completedAt: string; total?: number }): CardSummary {
@@ -187,5 +187,45 @@ describe("formatKpi", () => {
     expect(formatKpi("ms", 3 * 86_400_000)).toBe("3d 0h");
     expect(formatKpi("tokens", 12_800_000)).toBe("12.8M");
     expect(formatKpi("count", null)).toBe("—");
+  });
+
+  it("clamps a ratio to [0,1] on display (legacy unclamped utilization)", () => {
+    // A pre-fix cost-report stored busy/active without clamping — 981.51 must
+    // read as a sane 100%, not "98151%". Negatives floor to 0%.
+    expect(formatKpi("ratio", 981.51)).toBe("100%");
+    expect(formatKpi("ratio", 1)).toBe("100%");
+    expect(formatKpi("ratio", -0.5)).toBe("0%");
+    expect(formatKpi("ratio", 0.6)).toBe("60%");
+  });
+});
+
+describe("time.utilization KPI (D3a)", () => {
+  const now = new Date("2026-09-04T00:00:00Z");
+  const day = (n: number) => new Date(now.getTime() - n * 86_400_000).toISOString();
+  const utilCard = (over: Partial<CardSummary> & { completedAt: string; total?: number }, util: number): CardSummary => {
+    const c = card(over);
+    return { ...c, time: { ...c.time, utilization: util } };
+  };
+
+  it("is a banded, lower-is-worse fleet KPI in the time group", () => {
+    const k = FLEET_KPIS.find((x) => x.key === "time.utilization");
+    expect(k).toBeDefined();
+    expect(k!.direction).toBe("lower");
+    expect(k!.group).toBe("time");
+    expect(k!.unit).toBe("ratio");
+
+    const index: PerformanceIndex = {
+      version: 1, updatedAt: now.toISOString(), infra: null,
+      cards: [
+        ...[8, 9, 10, 11, 12, 13].map((d) => utilCard({ completedAt: day(d), total: 100 }, 0.6)),
+        utilCard({ completedAt: day(1), total: 100, workflowId: "a" }, 0.3),
+        utilCard({ completedAt: day(2), total: 100, workflowId: "b" }, 0.3),
+        utilCard({ completedAt: day(3), total: 100, workflowId: "c" }, 0.3),
+      ],
+    };
+    const v = buildFleetView(index, { days: 7, workflowDefId: "software-delivery", now });
+    const u = v.kpis.find((x) => x.key === "time.utilization")!;
+    expect(u.band).not.toBeNull();
+    expect(u.current?.median).toBe(0.3);
   });
 });
