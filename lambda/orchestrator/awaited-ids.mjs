@@ -31,6 +31,15 @@
  * the ticket-id shape (TICKET_KEY_RE) — the same shape the fix-ticket origin ids
  * are validated against.
  *
+ * Event contract — `orchestrator.await_timeout`
+ * `{workflowId, ticketId, awaitingIds, waitedMs, timestamp, source, reason}`,
+ * emitted at most once per ticket (store CAS) and NEVER accompanied by a
+ * humanNotification (that would trip parkedOnHuman). `awaitingIds` lists only ids
+ * PROVEN still non-terminal in the caller's sibling snapshot, `waitedMs` is the
+ * real wait since the stamp (or the row's updatedAt), and `reason` is
+ * "await_timeout" for a wait-SLA breach or "clean_exit_cap" for a ticket re-woken
+ * to the clean-exit cap with nothing left awaited (empty `awaitingIds`) — TEAM-4184 F2.
+ *
  * Modes (AWAITED_IDS_MODE): off (DEFAULT — this mutates ticket state, so a fresh
  * deploy changes nothing) = no-op; shadow = compute + log + EMF metrics, ZERO
  * writes; enforce = write the edge + stamp preconditionUnmet. Garbage coerces to
@@ -169,6 +178,24 @@ export function isStampCurrent(preconditionUnmet, claimStartedAt) {
   const stampMs = Date.parse(preconditionUnmet?.reportedAt ?? "");
   if (!Number.isFinite(stampMs)) return false;
   return stampMs >= claimMs;
+}
+
+/**
+ * PURE. How long this ticket has been waiting, in ms: since the stamp's
+ * `reportedAt` when it has one, else since the row's `updatedAt` (the D1 §5 SLA
+ * definition). 0 when neither is parseable — an unknown wait is reported as no
+ * wait rather than as an invented one — and never negative (a clock skew that puts
+ * the stamp in the future is 0, not a negative "wait").
+ *
+ * TEAM-4184 F2: the cap path needs this WITHOUT checkAwaitTimeout, because when
+ * every awaited id has already landed checkAwaitTimeout returns null (nothing is
+ * awaited) and the caller still has a real wait to report.
+ */
+export function awaitedWaitedMs(ticket, nowMs) {
+  const pu = ticket?.preconditionUnmet;
+  const since = Date.parse((pu && pu.reportedAt) || ticket?.updatedAt || "");
+  if (!Number.isFinite(since) || !Number.isFinite(nowMs)) return 0;
+  return Math.max(0, nowMs - since);
 }
 
 /**
@@ -385,10 +412,7 @@ export function createAwaitedIds(deps = {}) {
     const awaitingIds = nonTerminalAwaitedIds(ticket, siblings || []);
     if (!awaitingIds.length) return null;
 
-    const pu = ticket.preconditionUnmet;
-    const reportedAt = pu && pu.reportedAt ? pu.reportedAt : ticket.updatedAt;
-    const since = Date.parse(reportedAt);
-    const waitedMs = Number.isFinite(since) ? nowMs - since : 0;
+    const waitedMs = awaitedWaitedMs(ticket, nowMs);
     return { timedOut: waitedMs >= timeoutMs, waitedMs, awaitingIds };
   }
 
@@ -399,11 +423,17 @@ export function createAwaitedIds(deps = {}) {
    * a genuinely-stuck await never trips parkedOnHuman. off → nothing; shadow →
    * log the decision, no store write, no event; enforce → CAS then event + metric.
    * Returns true only when THIS caller emitted.
+   *
+   * TEAM-4184 F2: `reason` distinguishes the two situations that share this event.
+   * "await_timeout" (default) = the wait SLA on ids that are genuinely still open.
+   * "clean_exit_cap" = a ticket re-woken to the clean-exit cap with NOTHING left
+   * awaited, so `awaitingIds` is legitimately empty; without the field an operator
+   * reading an empty list could not tell it from a malformed SLA breach.
    */
-  async function emitAwaitTimeoutOnce(workflow, ticketId, awaitingIds, waitedMs, source = "sweep") {
+  async function emitAwaitTimeoutOnce(workflow, ticketId, awaitingIds, waitedMs, source = "sweep", { reason = "await_timeout" } = {}) {
     if (mode === "off") return false;
     if (mode === "shadow") {
-      log(`awaited.await_timeout (shadow) — ${ticketId} awaiting=[${(awaitingIds || []).join(", ")}] waitedMs=${waitedMs}`);
+      log(`awaited.await_timeout (shadow) — ${ticketId} awaiting=[${(awaitingIds || []).join(", ")}] waitedMs=${waitedMs} reason=${reason}`);
       return false;
     }
     const at = new Date(now()).toISOString();
@@ -416,9 +446,10 @@ export function createAwaitedIds(deps = {}) {
       waitedMs,
       timestamp: at,
       source,
+      reason,
     });
     metrics.timeouts++;
-    log(`awaited.await_timeout — ${ticketId} awaiting=[${(awaitingIds || []).join(", ")}] waitedMs=${waitedMs} source=${source}`);
+    log(`awaited.await_timeout — ${ticketId} awaiting=[${(awaitingIds || []).join(", ")}] waitedMs=${waitedMs} source=${source} reason=${reason}`);
     return true;
   }
 

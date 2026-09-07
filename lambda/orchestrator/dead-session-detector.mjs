@@ -56,7 +56,7 @@ import { SWEEP_CAP, createOpenWorkflowScan } from "./sweep-scan.mjs";
 import { unionBlockersResolved } from "./cascade.mjs";
 // TEAM-4184 F1 — the ONE D2 evidence predicate, shared with cascade.mjs so the two
 // guards can never diverge. Pure; awaited-ids.mjs has zero AWS imports.
-import { parkEvidence } from "./awaited-ids.mjs";
+import { parkEvidence, awaitedWaitedMs } from "./awaited-ids.mjs";
 
 // Sweep bounds and threshold knobs. The silence threshold is derived per-agent
 // from its own recent run durations; these frame that derivation.
@@ -359,12 +359,21 @@ export function createDetector(deps) {
           // Re-woken to the cap without landing — advisory wait-SLA timeout ONLY,
           // never a manager_escalation (that is the parkedOnHuman trap this fix
           // removes). An event, not a humanNotification.
+          //
+          // TEAM-4184 F2: judged against the sibling snapshot fetched above, not
+          // against `[]`. Passing no snapshot made every id in the union count as
+          // non-terminal, so the event listed ids that had already gone done — the
+          // cap path is only reachable once they have. With nothing left awaited the
+          // honest report is an empty list under reason=clean_exit_cap; either way
+          // the wait is the real one, not 0.
           if (awaitedIds?.emitAwaitTimeoutOnce) {
-            const to = awaitedIds.checkAwaitTimeout?.(ticket, [], now());
+            const to = awaitedIds.checkAwaitTimeout?.(ticket, Array.isArray(siblings) ? siblings : [], now());
             await awaitedIds.emitAwaitTimeoutOnce(
               workflow, ticketId,
-              to?.awaitingIds || ticket.preconditionUnmet?.awaitingIds || [],
-              to?.waitedMs ?? 0, "dead-session-detector");
+              to?.awaitingIds || [],
+              to?.waitedMs ?? awaitedWaitedMs(ticket, now()),
+              "dead-session-detector",
+              { reason: to ? "await_timeout" : "clean_exit_cap" });
           }
           m.awaiting = (m.awaiting || 0) + 1;
           log(`detector.awaiting — ${ticketId} clean park/exit at clean-exit cap ${cleanExitCap} (sweep ${sweepId})`);

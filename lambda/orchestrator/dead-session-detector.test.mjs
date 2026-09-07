@@ -1384,6 +1384,73 @@ describe("TEAM-4166 D2 §2.3 — evidence-gated escalation guard", () => {
   });
 
   /**
+   * TEAM-4184 F2 — the cap-path payload. The detector used to call
+   * checkAwaitTimeout with `[]` for the siblings, so EVERY id in the union counted
+   * as non-terminal and the advisory event listed ids that had already gone done —
+   * including the def-time blockedBy edges the ticket has carried since intake. It
+   * now judges against the snapshot it already fetched above.
+   */
+  it("TEAM-4184 F2: at the cap with everything landed → EMPTY awaitingIds, reason clean_exit_cap, real waitedMs", async () => {
+    const DEF_BLOCKER = "TEAM-0"; // a def-time edge, done since intake
+    const parkedAtCap = { ...parkedTicket, blockedBy: [DEF_BLOCKER],
+      preconditionUnmet: { awaitingIds: [FIX], reportedAt: "2026-09-01T09:00:00Z" } };
+    const wf = makeWorkflow({
+      deadSessionRetries: { "TEAM-2": 1 }, cleanExitRedispatches: { "TEAM-2": 3 }, epicId: "TEAM-1",
+    });
+    const store = guardStore();
+    const getChildTickets = vi.fn(async () => [
+      parkedAtCap,
+      { ticketId: FIX, type: "task", status: "done" },
+      { ticketId: DEF_BLOCKER, type: "task", status: "done" },
+    ]);
+    const { deps } = makeDeps({
+      ddb: makeDdb({ workflows: [wf] }), store,
+      getTicket: vi.fn(async () => parkedAtCap),
+    });
+    const awaitedIds = makeAwaited(deps.publishEvent, { store });
+    const { runSweep } = createDetector({ ...deps, getChildTickets, awaitedIds, cleanExitRedispatchCap: 3 });
+
+    const m = await runSweep("enforce");
+
+    expect(m.awaiting).toBe(1);
+    expect(m.escalations).toBe(0);
+    const [ev] = eventsOfType(deps.publishEvent, "orchestrator.await_timeout");
+    expect(ev).toBeTruthy();
+    const detail = ev[2];
+    // Neither the landed fix nor the intake-era blocker is presented as "awaited".
+    expect(detail.awaitingIds).toEqual([]);
+    expect(detail.awaitingIds).not.toContain(DEF_BLOCKER);
+    expect(detail.reason).toBe("clean_exit_cap");
+    expect(detail.waitedMs).toBe(NOW - Date.parse("2026-09-01T09:00:00Z")); // 3h, not 0
+    expect(detail.source).toBe("dead-session-detector");
+    // Advisory only, once: no page, no escalation, no re-dispatch.
+    expect(store.appendNotification).not.toHaveBeenCalled();
+    expect(store.markAwaitTimeoutEmitted).toHaveBeenCalledTimes(1);
+    expect(eventsOfType(deps.publishEvent, "agent.escalated")).toHaveLength(0);
+    expect(deps.redispatch).not.toHaveBeenCalled();
+  });
+
+  it("TEAM-4184 F2: reader ABSENT at the cap → the un-provable ids are still reported (reason await_timeout)", async () => {
+    // No getChildTickets → no snapshot → nothing can be proven closed, so the wait
+    // SLA reports the whole union. Conservative, and the pre-4184 shape.
+    const wf = makeWorkflow({ deadSessionRetries: { "TEAM-2": 1 }, cleanExitRedispatches: { "TEAM-2": 3 } });
+    const store = guardStore();
+    const { deps } = makeDeps({
+      ddb: makeDdb({ workflows: [wf] }), store,
+      getTicket: vi.fn(async () => parkedTicket),
+    });
+    const awaitedIds = makeAwaited(deps.publishEvent, { store });
+    const { runSweep } = createDetector({ ...deps, awaitedIds, cleanExitRedispatchCap: 3 });
+
+    await runSweep("enforce");
+
+    const detail = eventsOfType(deps.publishEvent, "orchestrator.await_timeout")[0][2];
+    expect(detail.awaitingIds).toEqual([FIX]);
+    expect(detail.reason).toBe("await_timeout");
+    expect(detail.waitedMs).toBe(NOW - Date.parse("2026-09-01T09:00:00Z"));
+  });
+
+  /**
    * TEAM-4184 F1 — the detector twin of the cascade fix. `preconditionUnmet` is
    * never cleared, so a stamp from an EARLIER claim used to keep a ticket
    * un-escalatable forever: the correct clean re-wake spent the budget, and the

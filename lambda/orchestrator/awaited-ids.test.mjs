@@ -7,6 +7,7 @@ import {
   parkEvidence,
   isStampCurrent,
   nonTerminalAwaitedIds,
+  awaitedWaitedMs,
 } from "./awaited-ids.mjs";
 import { normalizeSyncMode } from "./sync-main.mjs";
 import { KIND_TO_ORIGIN_KEY } from "./fix-contract.mjs";
@@ -312,6 +313,27 @@ for (const provider of ["dynamodb", "jira"]) {
         expect(m.timeouts).toBe(1);
       });
 
+      // TEAM-4184 F2 — the event now says WHY it fired, because the D2 cap path can
+      // legitimately emit it with an EMPTY awaitingIds (nothing is awaited any
+      // more; the ticket simply ran out of automatic re-wakes).
+      it("carries the reason through to the payload, defaulting to await_timeout", async () => {
+        const h = makeDeps({ provider, mode: "enforce", casResults: [true] });
+        const ai = createAwaitedIds(h.deps);
+        ai.newMetrics();
+        await ai.emitAwaitTimeoutOnce({ id: "wf_1" }, "TEAM-4126", [], 3 * 3600_000, "dead-session-detector", { reason: "clean_exit_cap" });
+        expect(h._events[0].detail).toMatchObject({
+          awaitingIds: [], waitedMs: 3 * 3600_000, source: "dead-session-detector", reason: "clean_exit_cap",
+        });
+      });
+
+      it("the pre-4184 5-argument call still emits reason await_timeout", async () => {
+        const h = makeDeps({ provider, mode: "enforce", casResults: [true] });
+        const ai = createAwaitedIds(h.deps);
+        ai.newMetrics();
+        await ai.emitAwaitTimeoutOnce({ id: "wf_1" }, "TEAM-4126", ["TEAM-4156"], 99, "reconcile-sweep");
+        expect(h._events[0].detail.reason).toBe("await_timeout");
+      });
+
       it("shadow logs the decision but writes no store row and emits no event", async () => {
         const marked = [];
         const h = makeDeps({
@@ -502,5 +524,38 @@ describe("parkEvidence / isStampCurrent / nonTerminalAwaitedIds (TEAM-4184 F1)",
       parkEvidence(t, { siblings: ALL_DONE, claimStartedAt: CLAIM, cleanRedispatches: 1 });
       expect(JSON.stringify(t)).toBe(before);
     });
+  });
+});
+
+/**
+ * TEAM-4184 F2 — the wait itself, factored out of checkAwaitTimeout so the D2 cap
+ * path can report a real wait even when NOTHING is awaited any more (which is the
+ * only way the cap path is reached). It used to hard-code `waitedMs: 0` there.
+ */
+describe("awaitedWaitedMs (TEAM-4184 F2)", () => {
+  const NOW_MS = Date.parse("2026-09-06T12:00:00.000Z");
+
+  it("measures from preconditionUnmet.reportedAt when there is a stamp", () => {
+    const t = { ticketId: "TEAM-4126", updatedAt: "2026-09-06T11:59:00.000Z",
+      preconditionUnmet: { awaitingIds: ["TEAM-4156"], reportedAt: "2026-09-06T09:00:00.000Z" } };
+    expect(awaitedWaitedMs(t, NOW_MS)).toBe(3 * 3600_000); // the stamp wins over updatedAt
+  });
+
+  it("falls back to updatedAt when the stamp carries no clock (the legacy jira shape)", () => {
+    const t = { ticketId: "TEAM-4126", updatedAt: "2026-09-06T10:30:00.000Z",
+      preconditionUnmet: { awaitingIds: ["TEAM-4156"], source: "label" } };
+    expect(awaitedWaitedMs(t, NOW_MS)).toBe(90 * 60_000);
+  });
+
+  it("0 when neither timestamp is parseable — an unknown wait is never invented", () => {
+    expect(awaitedWaitedMs({ ticketId: "TEAM-4126" }, NOW_MS)).toBe(0);
+    expect(awaitedWaitedMs({ ticketId: "TEAM-4126", updatedAt: "whenever" }, NOW_MS)).toBe(0);
+    expect(awaitedWaitedMs(null, NOW_MS)).toBe(0);
+    expect(awaitedWaitedMs({ updatedAt: "2026-09-06T09:00:00.000Z" }, NaN)).toBe(0);
+  });
+
+  it("never negative — a stamp in the future reads as no wait, not a negative one", () => {
+    const t = { preconditionUnmet: { reportedAt: "2026-09-06T13:00:00.000Z" } };
+    expect(awaitedWaitedMs(t, NOW_MS)).toBe(0);
   });
 });

@@ -271,6 +271,38 @@ describe("f50ucz D2 — FR-2.1d: a stale stamp no longer disables escalation (TE
     expect(w.wf.cleanExitRedispatches[SHIP]).toBe(2);
   });
 
+  /**
+   * TEAM-4184 F2 (review finding 2 of TEAM-4168) — the cap-path advisory event.
+   *
+   * Reaching the cap means the awaited work has landed (that is the only way past
+   * the anti-thrash gate), yet the event fell back to printing the raw stamp with
+   * `waitedMs: 0` — a page pointing an operator at tickets that are already done,
+   * claiming the ticket had waited no time at all.
+   */
+  it("F2: the cap-path await_timeout lists no landed id and carries a real wait", async () => {
+    const w = await afterCleanReWake();
+    // Skip ahead to the cap: the run has spent its automatic re-wakes.
+    w.wf.cleanExitRedispatches[SHIP] = 3;
+
+    const NEW_FIX = "TEAM-4199";
+    await repark(w, NEW_FIX, "2026-09-06T09:10:00Z"); // a legitimate re-park (stamp-current)
+    w.advanceTo("2026-09-06T09:30:00Z");
+    w.tickets[NEW_FIX].status = "done";
+    await sweepRepeatedly(w, 1, "2026-09-06T09:40:00Z");
+
+    const [ev] = w.eventsOfType("orchestrator.await_timeout");
+    expect(ev).toBeTruthy();
+    // Nothing landed is presented as awaited — and here NOTHING is awaited at all.
+    const done = Object.values(w.tickets).filter((t) => t.status === "done").map((t) => t.ticketId);
+    expect(ev.detail.awaitingIds.filter((id) => done.includes(id))).toEqual([]);
+    expect(ev.detail.awaitingIds).toEqual([]);
+    expect(ev.detail.reason).toBe("clean_exit_cap");
+    expect(ev.detail.waitedMs).toBe(30 * 60_000); // 09:10 → 09:40, not 0
+    // Still advisory: no escalation, no page.
+    expect(w.eventsOfType("agent.escalated")).toHaveLength(0);
+    expect(w.wf.humanNotifications).toHaveLength(0);
+  });
+
   it("the JIRA twin of the genuine death: no re-park, so the label clock stays pre-claim → escalates", async () => {
     const w = await afterCleanReWake({ provider: "jira" });
     // No re-park: the only clock label is still the 07:07Z one, which predates the

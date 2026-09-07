@@ -126,7 +126,11 @@ export function createReconcileSweep(deps) {
    *      — idempotent via applyBlockerEdge "present".
    *   2. Wait-SLA: once the wait exceeds AWAITED_IDS_TIMEOUT_MINUTES, emit the
    *      once-only advisory orchestrator.await_timeout — an event, never a
-   *      humanNotification (so it can't trip parkedOnHuman).
+   *      humanNotification (so it can't trip parkedOnHuman). This path always has
+   *      open awaited ids by construction (checkAwaitTimeout returned non-null), so
+   *      it emits the default reason=await_timeout; the D2 cap paths in cascade.mjs /
+   *      dead-session-detector.mjs are the ones that can emit reason=clean_exit_cap
+   *      with an empty list (TEAM-4184 F2).
    * Both are writes, so they run only in an enforce sweep; shadow logs the intent.
    */
   async function handleAwaitedChild(sibling, siblings, workflow, m, mode, sweepId) {

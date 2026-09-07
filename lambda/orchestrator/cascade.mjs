@@ -60,7 +60,7 @@ import { UpdateCommand } from "@aws-sdk/lib-dynamodb";
 // dead-session-detector.mjs so the two guards can never diverge. Pure (awaited-ids.mjs
 // has zero AWS imports); the injected `awaitedIds` dep stays the seam for the
 // stateful surface (edge writes, timeout emission).
-import { parkEvidence } from "./awaited-ids.mjs";
+import { parkEvidence, awaitedWaitedMs } from "./awaited-ids.mjs";
 
 // Extended-state rollout modes (TEAM-3747 D1) — same vocabulary + fail-safe
 // default (shadow) as DEAD_SESSION_DETECTOR_MODE.
@@ -713,12 +713,22 @@ export function createCascade(deps) {
       if (cleanRedispatches >= cleanExitCap) {
         // Re-woken to the cap without landing — advisory timeout ONLY, never a
         // manager_escalation (that is the parkedOnHuman trap this fix removes).
+        //
+        // TEAM-4184 F2: report the ids that are ACTUALLY still open, judged against
+        // this sweep's sibling snapshot. The old fallback listed the raw stamp
+        // (`preconditionUnmet.awaitingIds`) with waitedMs 0 — and since the cap path
+        // is only reachable once the union has resolved, every id in it was already
+        // done: an event that told the operator to go look at closed tickets. When
+        // nothing is left awaited the honest report is an EMPTY list under
+        // reason=clean_exit_cap, with the real wait either way.
         if (awaitedIds?.emitAwaitTimeoutOnce) {
-          const to = awaitedIds.checkAwaitTimeout?.(sibling, siblings || [], now());
+          const to = awaitedIds.checkAwaitTimeout?.(sibling, siblings, now());
           await awaitedIds.emitAwaitTimeoutOnce(
             workflow, ticketId,
-            to?.awaitingIds || sibling.preconditionUnmet?.awaitingIds || [],
-            to?.waitedMs ?? 0, unblockedBy);
+            to?.awaitingIds || [],
+            to?.waitedMs ?? awaitedWaitedMs(sibling, now()),
+            unblockedBy,
+            { reason: to ? "await_timeout" : "clean_exit_cap" });
         }
         m.awaiting = (m.awaiting || 0) + 1;
         log(`[orchestrator] reconcile awaiting (clean-exit cap ${cleanExitCap} reached) — ${ticketId}`);

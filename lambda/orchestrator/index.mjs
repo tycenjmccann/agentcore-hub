@@ -165,7 +165,10 @@ const RECONCILE_SWEEP_MODE = process.env.RECONCILE_SWEEP_MODE || "off";
 const AWAITED_IDS_MODE = normalizeAwaitedIdsMode(process.env.AWAITED_IDS_MODE);
 // The wait-SLA (D1 §5): once a ticket has awaited its open fixes longer than this,
 // the sweep/detector emit ONE advisory orchestrator.await_timeout (an event, never
-// a humanNotification). Default 120 minutes.
+// a humanNotification). Default 120 minutes. The event lists only ids still proven
+// non-terminal, and carries reason=await_timeout (a real SLA breach) or
+// reason=clean_exit_cap (re-woken to the D2 cap with nothing left awaited, so
+// awaitingIds is empty) — TEAM-4184 F2.
 const AWAITED_IDS_TIMEOUT_MINUTES = Number.parseInt(process.env.AWAITED_IDS_TIMEOUT_MINUTES || "", 10) > 0
   ? Number.parseInt(process.env.AWAITED_IDS_TIMEOUT_MINUTES, 10)
   : 120;
