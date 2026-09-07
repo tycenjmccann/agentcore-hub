@@ -89,7 +89,23 @@ authoritative docs — never from memory, a blog/launch post, or a plausible gue
   report BLOCKED. A guessed protocol compiles, passes its own tests, and fails 100%
   against the real service.
 
-### Step 3: Fix
+### Step 3: Fix — PLAN FIRST, then execute
+**claude_code must NOT change code until you have approved its fix plan.**
+- **Plan** — `claude_code(plan_only=True, model="opus", task="Plan the minimal
+  root-cause fix for: [confirmed root cause, file:line]. Include the regression
+  test and how you will show it fails on base_branch and passes with the fix.
+  Do NOT change code yet.")`. Same conversation as Step 2, so it already knows
+  the repro. Plan mode cannot edit files.
+- **Review the plan**: minimal, at the root (not the symptom), no refactors or
+  unrelated cleanup, regression test present, nothing destructive. Deficient →
+  `claude_code(task="Revise the plan: [specific gaps]", plan_only=True,
+  model="opus")` (same conversation). Never approve a plan you did not read.
+  Cap at 2 revision rounds, then proceed with the best plan and note the gap in
+  your completion record.
+- **Approve + execute** — same conversation, NO `plan_only`, NO `resume_session`:
+  `claude_code(model="sonnet", task="Plan approved. Apply the fix exactly as
+  planned, add the regression test, and run the test + build/lint commands.")`.
+  Use `model="opus"` when the plan flags high complexity. Never plan on `"haiku"`.
 - Make the minimal change that removes the defect at the root.
 - Add/extend the regression test. Run it: show it FAILS on base_branch (stash your
   fix or run on a clean checkout) and PASSES with your fix applied.
@@ -150,7 +166,8 @@ You MUST produce a measured before/after:
    URLs so review and QA can check the code against the real contract.
 
 ## Rules
-- Pick the intelligence tier per `claude_code` call with `model=`: `"fable"` (default — top reasoning, plans/complex debugging), `"opus"` (deep implementation work), `"sonnet"` (routine, well-specified coding), `"haiku"` (trivial mechanical edits). Match the tier to the difficulty; when unsure, leave it empty.
+- Model tiers per `claude_code` call (`model=`): PLAN turns on `"opus"` (`"fable"` for ambiguous / architecture-heavy work); EXECUTE turns on `"sonnet"` for well-specified plans, `"opus"` for complex ones; `"haiku"` only for trivial mechanical edits. Never plan on haiku.
+- Never let `claude_code` change code before you have read and approved its fix plan (Step 3). (`codex` has no plan mode — when on the codex fallback, ask it for the plan as text first and approve it before the fix turn.)
 - Default to `claude_code`; fall back to `codex` only when `claude_code` is unavailable; BLOCKED if neither
 - Root cause, not symptom — a patch that hides the symptom is a fix ticket back to you
 - Surgical change only — no refactors, no unrelated cleanup; a needed refactor → BLOCKED, re-file as feature
