@@ -2,7 +2,7 @@ import { vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { createAwaitedIds } from "./awaited-ids.mjs";
-import { createCascade } from "./cascade.mjs";
+import { createCascade, resolveCascadeMode } from "./cascade.mjs";
 import { createReconcileSweep } from "./reconcile-sweep.mjs";
 import {
   PRECONDITION_AT_PREFIX,
@@ -69,6 +69,13 @@ export const fxSpawnedBy = (id) => FX.tickets.find((t) => t.ticketId === id)?.sp
  * semantics vs. jira issue-links); `awaitedMode` is the AWAITED_IDS_MODE under
  * test; `holdOpen` names fix tickets that must NEVER reach done (FR-1.4 / FR-2.1);
  * `startClock` overrides the window start.
+ *
+ * TEAM-4260 (r2-F1) — `extendedStates` used to be the hard-coded literal "enforce",
+ * a flag combination PRODUCTION DOES NOT RUN (CASCADE_EXTENDED_STATES defaults off
+ * on every surface). That masked the bug this replay exists to prove: the FR-1.3
+ * re-wake was gated behind that second, dark flag. It now resolves from the env with
+ * the SAME function index.mjs uses, so unset → "off" and the replay runs the real
+ * production combination by default. Callers can still force a mode explicitly.
  */
 export function makeWorld({
   provider = "dynamodb",
@@ -76,6 +83,7 @@ export function makeWorld({
   timeoutMinutes = 120,
   holdOpen = [],
   startClock = "2026-09-06T07:07:00Z",
+  extendedStates = resolveCascadeMode(process.env.CASCADE_EXTENDED_STATES),
 } = {}) {
   let clock = Date.parse(startClock);
   const nowIso = () => new Date(clock).toISOString();
@@ -270,7 +278,7 @@ export function makeWorld({
     publishEvent,
     now: () => clock,
     log: () => {},
-    extendedStates: "enforce",
+    extendedStates,
     lease,
     eventsTable: "events",
     workflowsTable: "workflows",

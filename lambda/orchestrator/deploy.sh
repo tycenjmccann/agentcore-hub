@@ -105,6 +105,8 @@ fi
 # NOT byte-identical to off (shadow's extended path issues extra reads). Only
 # forward an explicit override so a stale config.sh value can never silently
 # flip it off OFF. (TEAM-3763 F6: aligns code default with this doc.)
+# TEAM-4260: this is NOT a prerequisite for AWAITED_IDS_MODE — an awaited-stamped
+# dependent is routed at AWAITED_IDS_MODE's own mode even with this left off.
 CASCADE_VARS=""
 if [ -n "${CASCADE_EXTENDED_STATES:-}" ]; then
   CASCADE_VARS=",CASCADE_EXTENDED_STATES=${CASCADE_EXTENDED_STATES}"
@@ -128,6 +130,9 @@ fi
 # when explicitly set. AWAITED_IDS_TIMEOUT_MINUTES (default 120) is the wait-SLA
 # and CLEAN_EXIT_REDISPATCH_CAP (default 3) bounds automatic clean-exit re-wakes;
 # both forwarded only when set so an unset install keeps the code defaults.
+# TEAM-4260: AWAITED_IDS_MODE=enforce is SELF-SUFFICIENT — the cascade routes an
+# awaited-STAMPED dependent on this flag alone, so you do NOT also need to set
+# CASCADE_EXTENDED_STATES for the FR-1.3 re-wake to fire on the event path.
 AWAITED_IDS_VARS=""
 if [ -n "${AWAITED_IDS_MODE:-}" ]; then
   AWAITED_IDS_VARS=",AWAITED_IDS_MODE=${AWAITED_IDS_MODE}"

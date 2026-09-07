@@ -46,6 +46,29 @@
  * (reconcile-sweep.mjs, TEAM-3747 D1) can reuse it via the exported
  * reconcileDependent() rather than re-implementing lease/steal semantics.
  *
+ * TEAM-4260 (ship-review r2-F1) — CASCADE_EXTENDED_STATES and AWAITED_IDS_MODE are
+ * INDEPENDENT rollout flags, and the awaited-ids re-wake (FR-1.3: "when the last
+ * awaited id completes, the parked in_progress/in_review origin ticket is
+ * re-dispatched") lives behind the commit-4b handlers above. So with
+ * AWAITED_IDS_MODE=enforce and every other flag at its production default, the
+ * event path returned at `if (extendedMode === "off")` and FR-1.3 did not hold —
+ * recovery was deferred to the ≥30-min reconcile sweep, which never consults
+ * extendedMode. handleDependent therefore computes a per-dependent EFFECTIVE mode:
+ * extendedMode when set, else awaitedRouteMode(sibling), which yields
+ * AWAITED_IDS_MODE only for a dependent carrying a non-empty
+ * preconditionUnmet.awaitingIds stamp.
+ *
+ * Why an awaited-STAMPED dependent may bypass the CASCADE_EXTENDED_STATES gate: the
+ * stamp is strictly NARROWER evidence than the flag it substitutes for. The flag
+ * routes EVERY moving dependent; the stamp routes only ones a park actually parked
+ * (nothing ever clears preconditionUnmet, so it is a durable "this was parked once"
+ * marker — the premise of TEAM-4184's parkEvidence). Every downstream guard is
+ * unchanged — the F9 strongly-consistent per-blocker confirm, the F7 TOCTOU
+ * liveness re-check, the stealClaim generation CAS and the redispatch claim CAS —
+ * so the worst case of an over-broad route is a nudge or a lost CAS, never a bad
+ * write. AWAITED_IDS_MODE=off stays byte-identical: awaitedRouteMode is pure
+ * property reads, so it adds ZERO I/O.
+ *
  * TEAM-3755 — two guards on the enforce path, both documented at their call site:
  *   F7: a TOCTOU liveness RE-CHECK immediately before every stealClaim (the steal
  *       CAS keys on the claim generation, which an agent that heart-beats in the
@@ -111,6 +134,29 @@ export function normalizeExtendedMode(value) {
   if (KNOWN_EXTENDED_MODES.includes(mode)) return mode;
   if (mode === "on" || mode === "true" || mode === "1") return "enforce";
   return "shadow";
+}
+
+/**
+ * Resolve CASCADE_EXTENDED_STATES to off | shadow | enforce. Legacy truthies
+ * ("true"/"1"/"on"/"enforce") → enforce; explicit "shadow" → shadow; unset, "",
+ * "off", "false", "0", or anything unrecognized → off (the pre-epic passthrough,
+ * TEAM-3763 F6). shadow/enforce are granted ONLY on an explicit, recognized
+ * value so an unset or typo'd var can never add the extended path's extra DDB
+ * reads. Trimmed + lowercased so a casing slip can never grant write access.
+ *
+ * TEAM-4260 — moved here from index.mjs (behaviour byte-identical) so tests and
+ * replay harnesses resolve the mode with the SAME function the Lambda uses
+ * instead of hard-coding a literal. Note this fails safe in the OPPOSITE
+ * direction from normalizeExtendedMode above (garbage → shadow): that one
+ * normalizes an already-injected dep supplied by a caller who opted in, this one
+ * reads a raw env var on a surface where unset means "not opted in at all". Both
+ * are deliberate; keep them distinct.
+ */
+export function resolveCascadeMode(raw) {
+  const v = String(raw ?? "").trim().toLowerCase();
+  if (v === "enforce" || v === "on" || v === "true" || v === "1") return "enforce";
+  if (v === "shadow") return "shadow";
+  return "off"; // "", unset, "off", "false", "0", or garbage → off (pre-epic)
 }
 
 export function createCascade(deps) {
@@ -187,6 +233,32 @@ export function createCascade(deps) {
   const levelTriggerMode = ["shadow", "enforce"].includes(levelTriggerDispatch)
     ? levelTriggerDispatch
     : "off";
+
+  /**
+   * TEAM-4260 (r2-F1) — the mode an AWAITED-STAMPED dependent is routed at when
+   * CASCADE_EXTENDED_STATES is dark. `awaitedIds.mode` is the resolved
+   * AWAITED_IDS_MODE (awaited-ids.mjs exposes it on the created object), so
+   * enabling the epic's OWN flag delivers its headline requirement (FR-1.3)
+   * without also requiring the unrelated extended-states rollout flag.
+   *
+   * Deliberately narrow: it returns a routable mode ONLY when the awaited-ids dep
+   * is wired, not off, AND this dependent carries a non-empty
+   * preconditionUnmet.awaitingIds stamp — i.e. a ticket some park actually parked.
+   * "Stamp non-empty" is the whole test; membership of the just-closed id in
+   * awaitingIds is NOT required, because handleDependent is only reached for a
+   * sibling that already lists it in blockedBy AND whose whole blockerUnion is
+   * resolved, and the two lists legitimately diverge (TEAM-4185 F3(b) skips the
+   * annotate when written === 0; a def-time blockedBy edge can be the last to
+   * close; the jira label reconstruction is lossy).
+   *
+   * Pure property reads — no I/O — so AWAITED_IDS_MODE=off is byte-identical to
+   * pre-epic, which is the whole point of the "off" default.
+   */
+  const awaitedRouteMode = (sibling) => {
+    if (!awaitedIds || !awaitedIds.mode || awaitedIds.mode === "off") return "off";
+    const stamped = sibling?.preconditionUnmet?.awaitingIds;
+    return Array.isArray(stamped) && stamped.length ? awaitedIds.mode : "off";
+  };
 
   /**
    * Level-triggered dispatch (TEAM-4060). Invoke a now-dispatchable dependent
@@ -290,13 +362,25 @@ export function createCascade(deps) {
         // Commit 4b (CASCADE_EXTENDED_STATES). The last blocker of an ALREADY-
         // MOVING dependent just resolved. off → no-op (commit-4a only); shadow →
         // observe + would-* metrics, zero writes; enforce → act for real.
-        if (extendedMode === "off") return;
-        if (sibling.status === "in_progress") {
-          await handleInProgressDependent(sibling, ticketId, workflow, m, extendedMode);
-        } else if (sibling.status === "in_review") {
-          await handleInReviewDependent(sibling, ticketId, workflow, m, extendedMode);
+        // TEAM-4260 (r2-F1): when CASCADE_EXTENDED_STATES is dark, an awaited-
+        // STAMPED dependent is still routed — at AWAITED_IDS_MODE's own mode — so
+        // AWAITED_IDS_MODE=enforce alone satisfies FR-1.3. See the header note.
+        const effective = extendedMode !== "off" ? extendedMode : awaitedRouteMode(sibling);
+        if (effective === "off") return;
+        if (sibling.status !== "in_progress" && sibling.status !== "in_review") return;
+        if (extendedMode === "off") {
+          m.awaitedRouted = (m.awaitedRouted || 0) + 1;
+          log(
+            `[orchestrator] cascade awaited-routed ${sibling.ticketId} status=${sibling.status} ` +
+              `mode=${effective} (CASCADE_EXTENDED_STATES=off, AWAITED_IDS_MODE=${effective})`
+          );
         }
-        // done / cancelled / any other terminal state → no-op.
+        if (sibling.status === "in_progress") {
+          await handleInProgressDependent(sibling, ticketId, workflow, m, effective);
+        } else {
+          await handleInReviewDependent(sibling, ticketId, workflow, m, effective);
+        }
+        // done / cancelled / any other terminal state → no-op (guarded above).
       } catch (err) {
         m.dependentErrors++;
         log(`[orchestrator] cascade dependent error — ${sibling.ticketId}: ${err?.message || err}`);
@@ -339,10 +423,13 @@ export function createCascade(deps) {
     }
 
     log(`[orchestrator] ${ticketId} cascade — unblocked=[${unblocked.join(", ")}] errors=${m.dependentErrors}` +
-      (extendedMode !== "off"
+      // TEAM-4260: the extended-state segment also prints when the awaited-ids
+      // route fired with CASCADE_EXTENDED_STATES off — otherwise the re-wake this
+      // ticket adds would be invisible in the logs.
+      (extendedMode !== "off" || m.awaitedRouted
         ? ` mode=${extendedMode} nudged=${m.nudged} redispatched=${m.redispatched} reviewReawakened=${m.reviewReawakened}` +
           ` wouldNudge=${m.wouldNudge} wouldSteal=${m.wouldSteal} wouldRedispatch=${m.wouldRedispatch} wouldReviewReawaken=${m.wouldReviewReawaken}` +
-          ` blockerConfirmAborted=${m.blockerConfirmAborted}`
+          ` blockerConfirmAborted=${m.blockerConfirmAborted} awaitedRouted=${m.awaitedRouted || 0}`
         : "") +
       (levelTriggerMode !== "off"
         ? ` levelTrigger=${levelTriggerMode} levelDispatched=${m.levelDispatched || 0}` +
@@ -885,6 +972,11 @@ export function newMetrics() {
     // CAS both won), the population the orchestrator.unblocked journal now covers.
     // A subset of `redispatched`: counted alongside it, never instead of it.
     rewoken: 0,
+    // TEAM-4260 (r2-F1) — extended-state dependents routed on AWAITED_IDS_MODE
+    // alone because CASCADE_EXTENDED_STATES was off. Counts the ROUTE, not the
+    // outcome (the outcome lands in nudged/redispatched/would-*), so it is the
+    // metric that shows FR-1.3 firing on the production flag combination.
+    awaitedRouted: 0,
   };
 }
 
@@ -895,7 +987,7 @@ export function hasCascadeActivity(m) {
     m.dependentErrors || m.wouldNudge || m.wouldSteal || m.wouldRedispatch ||
     m.wouldReviewReawaken || m.blockerConfirmAborted ||
     m.levelDispatched || m.wouldDispatch || m.levelDispatchErrors ||
-    m.exitedOk || m.awaiting || m.escalated || m.rewoken
+    m.exitedOk || m.awaiting || m.escalated || m.rewoken || m.awaitedRouted
   );
 }
 
@@ -929,6 +1021,7 @@ export function emitCascadeMetrics(m) {
           { Name: "CascadeExitedOk", Unit: "Count" },
           { Name: "CascadeAwaiting", Unit: "Count" },
           { Name: "CascadeRewoken", Unit: "Count" },
+          { Name: "CascadeAwaitedRouted", Unit: "Count" },
         ],
       }],
     },
@@ -948,5 +1041,6 @@ export function emitCascadeMetrics(m) {
     CascadeExitedOk: m.exitedOk || 0,
     CascadeAwaiting: m.awaiting || 0,
     CascadeRewoken: m.rewoken || 0,
+    CascadeAwaitedRouted: m.awaitedRouted || 0,
   }));
 }

@@ -1488,3 +1488,148 @@ describe("TEAM-4187 — orchestrator.unblocked on a parked in_progress re-wake",
     expect(eventsOfType(base.publishEvent, "agent.escalated")).toHaveLength(0);
   });
 });
+
+// ─── TEAM-4260 (r2-F1) — AWAITED_IDS_MODE routes the extended-state re-wake ────
+/**
+ * CASCADE_EXTENDED_STATES and AWAITED_IDS_MODE are independent rollout flags, and
+ * the FR-1.3 re-wake ("the last awaited id closes → the parked in_progress /
+ * in_review origin ticket is re-dispatched") lived behind the extended-state
+ * handlers. Since CASCADE_EXTENDED_STATES defaults OFF on every surface,
+ * AWAITED_IDS_MODE=enforce alone did NOT deliver it — handleDependent returned at
+ * `if (extendedMode === "off")` and recovery slipped to the ≥30-min reconcile
+ * sweep (which never consults extendedMode).
+ *
+ * These four cases pin the new per-dependent effective mode from both sides: it
+ * routes on the awaited stamp, it respects AWAITED_IDS_MODE's own tri-state, it
+ * adds ZERO I/O when that flag is off, and it is narrow (no stamp → no route).
+ */
+describe("TEAM-4260 — awaited-stamped dependents route on AWAITED_IDS_MODE when CASCADE_EXTENDED_STATES is off", () => {
+  const FIX = "FIX-1";
+
+  // A cascade with the extended-states flag DARK (the production default) and a
+  // REAL createAwaitedIds at `awaitedMode`, exactly as index.mjs wires it.
+  function setup({ awaitedMode, sibling, extendedStates = "off" }) {
+    // FIX is DONE in the snapshot: blockerUnion() adds the stamped awaitingIds to
+    // blockedBy, so the awaited fix has to be terminal here or the dependent is
+    // (correctly) deferred as still-blocked and never reaches the route at all.
+    const siblings = [{ ticketId: DONE, status: "done" }, { ticketId: FIX, status: "done" }, sibling];
+    const base = makeExtDeps({
+      extendedStates,
+      getChildTickets: vi.fn(async () => siblings),
+    });
+    const awaited = createAwaitedIds({
+      addBlockers: vi.fn(async () => []),
+      annotatePreconditionUnmet: vi.fn(async () => {}),
+      publishEvent: base.publishEvent,
+      getTicket: vi.fn(async () => null),
+      store: { markAwaitTimeoutEmitted: vi.fn(async () => true) },
+      now: () => NOW,
+      mode: awaitedMode,
+      log: () => {},
+    });
+    const cascade = createCascade({ ...base.deps, awaitedIds: awaited });
+    return { cascade, awaited, ...base };
+  }
+
+  // The parked dependent: in_progress, stale claim, carrying the awaited stamp.
+  const stamped = () => ({
+    ticketId: "TEAM-2", status: "in_progress", assignee: "dev", blockedBy: [DONE],
+    preconditionUnmet: { awaitingIds: [FIX], source: "tool", reportedAt: "2026-09-01T11:00:00Z" },
+  });
+
+  it("enforce + extendedStates off → the stamped in_progress dependent is stolen, re-dispatched and journaled", async () => {
+    const cap = captureMetrics();
+    try {
+      const { cascade, lease, redispatch, publishEvent } = setup({
+        awaitedMode: "enforce", sibling: stamped(),
+      });
+
+      await cascade.cascadeUnblock(DONE, "EPIC-1", extWorkflow);
+
+      // The extended flag really was off — the route came from AWAITED_IDS_MODE.
+      expect(cascade.extendedMode).toBe("off");
+      expect(lease.stealClaim).toHaveBeenCalledTimes(1);
+      expect(redispatch).toHaveBeenCalledTimes(1);
+
+      // TEAM-4187's journal record, unchanged by the new route.
+      const un = eventsOfType(publishEvent, "orchestrator.unblocked");
+      expect(un).toHaveLength(1);
+      expect(un[0][2].previousStatus).toBe("in_progress");
+      expect(un[0][2].reason).toBe("awaited_rewake");
+      expect(un[0][2].source).toBe("cascade");
+      expect(un[0][2].blockedBy).toEqual(expect.arrayContaining([DONE, FIX]));
+
+      // The route is counted, and the EMF record carries it.
+      const rec = cap.records().find((r) => r.CascadeAwaitedRouted !== undefined);
+      expect(rec.CascadeAwaitedRouted).toBe(1);
+      expect(rec.CascadeRedispatch).toBe(1);
+    } finally {
+      cap.restore();
+    }
+  });
+
+  it("shadow + extendedStates off → would-* metrics only, ZERO writes", async () => {
+    const { cascade, lease, redispatch, publishEvent } = setup({
+      awaitedMode: "shadow", sibling: stamped(),
+    });
+
+    await cascade.cascadeUnblock(DONE, "EPIC-1", extWorkflow);
+
+    // Observed, never acted on: no steal CAS, no claim, no journal event.
+    expect(lease.stealClaim).not.toHaveBeenCalled();
+    expect(redispatch).not.toHaveBeenCalled();
+    expect(eventsOfType(publishEvent, "orchestrator.unblocked")).toHaveLength(0);
+    expect(eventsOfType(publishEvent, "orchestrator.nudge")).toHaveLength(0);
+  });
+
+  it("AWAITED_IDS_MODE=off + extendedStates off → byte-identical to pre-epic: ZERO extra I/O", async () => {
+    const { cascade, lease, redispatch, getTicketConsistent, publishEvent } = setup({
+      awaitedMode: "off", sibling: stamped(),
+    });
+
+    await cascade.cascadeUnblock(DONE, "EPIC-1", extWorkflow);
+
+    // Not merely "no writes" — the extended path's READS never happen either
+    // (the F9 strongly-consistent blocker confirm and the lease-liveness read are
+    // what make shadow non-identical to off; awaitedRouteMode short-circuits
+    // before both on pure property reads).
+    expect(getTicketConsistent).not.toHaveBeenCalled();
+    expect(lease.lastAgentActivity).not.toHaveBeenCalled();
+    expect(lease.isLeaseLive).not.toHaveBeenCalled();
+    expect(lease.stealClaim).not.toHaveBeenCalled();
+    expect(redispatch).not.toHaveBeenCalled();
+    expect(publishEvent).not.toHaveBeenCalled();
+  });
+
+  it("enforce but NO preconditionUnmet stamp → untouched (the new gate is narrow)", async () => {
+    const { cascade, lease, redispatch, getTicketConsistent, publishEvent } = setup({
+      awaitedMode: "enforce",
+      // Same parked in_progress dependent with the same resolved blocker — the
+      // ONLY difference is that no park ever stamped it.
+      sibling: { ticketId: "TEAM-2", status: "in_progress", assignee: "dev", blockedBy: [DONE] },
+    });
+
+    await cascade.cascadeUnblock(DONE, "EPIC-1", extWorkflow);
+
+    expect(getTicketConsistent).not.toHaveBeenCalled();
+    expect(lease.isLeaseLive).not.toHaveBeenCalled();
+    expect(lease.stealClaim).not.toHaveBeenCalled();
+    expect(redispatch).not.toHaveBeenCalled();
+    expect(publishEvent).not.toHaveBeenCalled();
+  });
+
+  it("an EMPTY awaitingIds array is not a stamp → untouched", async () => {
+    const { cascade, lease, redispatch } = setup({
+      awaitedMode: "enforce",
+      sibling: {
+        ticketId: "TEAM-2", status: "in_progress", assignee: "dev", blockedBy: [DONE],
+        preconditionUnmet: { awaitingIds: [], source: "tool" },
+      },
+    });
+
+    await cascade.cascadeUnblock(DONE, "EPIC-1", extWorkflow);
+
+    expect(lease.isLeaseLive).not.toHaveBeenCalled();
+    expect(redispatch).not.toHaveBeenCalled();
+  });
+});
