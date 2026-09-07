@@ -3047,6 +3047,39 @@ describe('TEAM-3385: span-missing classification + concurrency claims', () => {
     expect(ddbState.aggWrites[0].ExpressionAttributeValues[':nextVersion']).toBe(1);
   });
 
+  it('writes the delivery into the per-UTC-day bucket alongside the all-time aggregates', async () => {
+    ddbState.config = { ...ddbState.config, batchSize: 10 };
+
+    // Log-event timestamps are 1_700_000_000_000 + i → 2023-11-14 UTC.
+    await handler(
+      awslogsEvent([
+        evalRecord({ sessionId: 'sess-day-a', score: 8, scoreLabel: 'pass', requestId: 'req-day-a' }),
+        evalRecord({ sessionId: 'sess-day-b', evaluatorName: 'builtin.helpfulness', score: 6, scoreLabel: 'pass', requestId: 'req-day-b' }),
+      ])
+    );
+
+    const updates = sentCommands(ddbSend, 'UpdateCommand').map((c) => c.input);
+    // Idempotent materialisation of daily + daily.<day> before the CAS merge.
+    expect(updates.some((u) => u.UpdateExpression === 'SET daily = if_not_exists(daily, :emptyDaily)')).toBe(true);
+    const bucketEnsure = updates.find((u) => u.UpdateExpression === 'SET daily.#d = if_not_exists(daily.#d, :zeroBucket)');
+    expect(bucketEnsure.ExpressionAttributeNames).toEqual({ '#d': '2023-11-14' });
+    expect(bucketEnsure.ExpressionAttributeValues[':zeroBucket']).toMatchObject({ sessions: 0, evalScores: {}, byModel: {}, tokensIn: 0 });
+
+    // The scorecard merge carries the day's scores (SET) and session count (ADD).
+    expect(ddbState.aggWrites).toHaveLength(1);
+    const agg = ddbState.aggWrites[0];
+    expect(agg.ExpressionAttributeNames).toEqual({ '#d0': '2023-11-14' });
+    expect(agg.UpdateExpression).toContain('daily.#d0.evalScores = :dayScores0');
+    expect(agg.UpdateExpression).toMatch(/ ADD daily\.#d0\.sessions :daySessions0$/);
+    expect(agg.ExpressionAttributeValues[':dayScores0']).toEqual({
+      'builtin.correctness': { sum: 8, count: 1 },
+      'builtin.helpfulness': { sum: 6, count: 1 },
+    });
+    expect(agg.ExpressionAttributeValues[':daySessions0']).toBe(2);
+    // All-time aggregates unchanged in shape.
+    expect(agg.ExpressionAttributeValues[':sc']).toBe(2);
+  });
+
   it('exhausting the aggregation retries is non-fatal: the delivery is still buffered and flushed', async () => {
     ddbState.aggConflicts = 3; // every attempt loses
 

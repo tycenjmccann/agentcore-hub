@@ -31,6 +31,8 @@ export default defineConfig({
       // fake gh — still hermetic (no AWS, no network).
       "deploy/lib/__tests__/**/*.test.ts",
       "lambda/eval-packager/**/*.test.mjs",
+      // token-aggregator: pure record parsing + day bucketing (no AWS sends).
+      "lambda/token-aggregator/**/*.test.mjs",
       "deploy/telegram-bug-intake/**/*.test.mjs",
       // workflow-store is pure DDB-command construction — unit-testable with a
       // stub client, same rationale as the eval-packager classifiers.

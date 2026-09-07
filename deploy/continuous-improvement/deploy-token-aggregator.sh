@@ -1,9 +1,15 @@
 #!/usr/bin/env bash
 # deploy/continuous-improvement/deploy-token-aggregator.sh
 #
-# Deploys the token-aggregator Lambda and creates subscription filters
-# on all runtime log groups to pipe token usage metrics into DDB.
-# Also sets up a weekly EventBridge cron to reset counters.
+# Deploys the token-aggregator Lambda and creates subscription filters on every
+# evaluations-enabled agent's log group (runtimes AND managed harnesses) to pipe
+# LLM token usage into per-UTC-day buckets in DDB. The filter pattern depends on
+# what each log group emits (see lambda/token-aggregator/index.mjs):
+#   Strands runtimes  -> `chat` spans (the only cache-inclusive input count)
+#   managed harnesses -> EMF gen_ai.client.token.usage metric records
+#   coding runtime    -> Claude Code claude_code.api_request events
+# Also REMOVES the legacy weekly EventBridge reset — the dashboard reads a
+# rolling window from the day buckets, which prune themselves.
 #
 # Idempotent: re-runs update the Lambda code/config and skip resources that
 # already exist.
@@ -72,7 +78,7 @@ if aws lambda get-function --function-name "${LAMBDA_NAME}" --region "${REGION}"
   aws lambda update-function-configuration \
     --function-name "${LAMBDA_NAME}" \
     --timeout 60 --memory-size 256 \
-    --environment "Variables={EVAL_CONFIG_TABLE=${TABLE_NAME},ARTIFACTS_BUCKET=${BUCKET}}" \
+    --environment "Variables={EVAL_CONFIG_TABLE=${TABLE_NAME},ARTIFACTS_BUCKET=${BUCKET},DAILY_RETAIN_DAYS=14}" \
     --region "${REGION}" --output text --query 'FunctionArn'
 else
   echo "Creating new Lambda..."
@@ -83,7 +89,7 @@ else
     --role "${LAMBDA_ROLE}" \
     --zip-file fileb:///tmp/token-aggregator.zip \
     --timeout 60 --memory-size 256 \
-    --environment "Variables={EVAL_CONFIG_TABLE=${TABLE_NAME},ARTIFACTS_BUCKET=${BUCKET}}" \
+    --environment "Variables={EVAL_CONFIG_TABLE=${TABLE_NAME},ARTIFACTS_BUCKET=${BUCKET},DAILY_RETAIN_DAYS=14}" \
     --region "${REGION}" --output text --query 'FunctionArn'
   aws lambda wait function-active --function-name "${LAMBDA_NAME}" --region "${REGION}"
 fi
@@ -108,89 +114,85 @@ aws lambda add-permission \
 echo "✓ CW Logs invoke permission set"
 
 ###############################################################################
-# Step 3: Create subscription filters on all runtime log groups
+# Step 3: Subscription filters on every evaluations-enabled agent log group
 ###############################################################################
 echo ""
 echo "--- Step 3: Subscription filters ---"
 
-RUNTIME_GROUPS=$(aws logs describe-log-groups \
-  --log-group-name-prefix "/aws/bedrock-agentcore/runtimes/agentcore_hub_" \
+AGENTS_FILE="${SCRIPT_DIR}/../../src/config/agents.json"
+ALL_GROUPS=$(aws logs describe-log-groups \
+  --log-group-name-prefix "/aws/bedrock-agentcore/runtimes/" \
   --query 'logGroups[].logGroupName' \
   --output json --region "${REGION}")
 
-FILTER_COUNT=0
-echo "${RUNTIME_GROUPS}" | python3 -c "
+echo "${ALL_GROUPS}" | python3 -c "
 import json, sys, subprocess
 groups = json.load(sys.stdin)
-# Exclude fleet_improver and container runtimes
-groups = [g for g in groups if 'fleet_improver' not in g and 'container' not in g]
+agents = [a['agentId'] for a in json.load(open('${AGENTS_FILE}'))['agents'] if a.get('evaluationsEnabled')]
+agents.sort(key=len, reverse=True)  # longest first: agentcore_hub_agent must not shadow agentcore_hub_agent_x
+
+def resolve(leaf):
+    for aid in agents:
+        if leaf == aid or leaf.startswith(aid + '-') or leaf.startswith('harness_' + aid + '-'):
+            return aid
+    return None
+
+# One pattern per emitter shape; the Lambda parses whichever arrives.
+SPANS   = '\"strands.telemetry.tracer\" \"gen_ai.usage.input_tokens\"'
+METRIC  = 'gen_ai.client.token.usage'
+CLAUDE  = '\"claude_code.api_request\"'
+
 for lg in groups:
+    leaf = lg.split('/')[-1]
+    if 'container' in leaf:
+        continue
+    aid = resolve(leaf)
+    if not aid:
+        continue
+    if leaf.startswith('harness_'):
+        pattern = METRIC
+    elif 'coding_runtime' in aid:
+        pattern = CLAUDE
+    else:
+        pattern = SPANS
     result = subprocess.run([
         'aws', 'logs', 'put-subscription-filter',
         '--log-group-name', lg,
         '--filter-name', 'token-to-aggregator',
-        '--filter-pattern', 'gen_ai.client.token.usage',
+        '--filter-pattern', pattern,
         '--destination-arn', '${LAMBDA_ARN}',
         '--region', '${REGION}'
     ], capture_output=True, text=True)
-    status = '✓' if result.returncode == 0 else '✗'
-    print(f'  {status} {lg.split(\"/\")[-1][:50]}')
+    status = 'OK ' if result.returncode == 0 else 'ERR'
+    print(f'  {status} {leaf[:60]:60s} {pattern}' + ('' if result.returncode == 0 else '  ' + result.stderr.strip()[:120]))
 "
 
-echo "✓ Subscription filters created"
+echo "✓ Subscription filters in place"
 
 ###############################################################################
-# Step 4: EventBridge weekly reset cron
+# Step 4: Remove the legacy weekly reset cron (rolling window replaces it)
 ###############################################################################
 echo ""
-echo "--- Step 4: Weekly reset cron ---"
+echo "--- Step 4: Legacy weekly reset ---"
 
 RULE_NAME="agentcore-hub-token-reset-weekly"
-
-# put-rule is idempotent — upsert and capture stderr so a failure surfaces
-# instead of leaving a half-configured rule with no target.
-aws events put-rule \
-  --name "${RULE_NAME}" \
-  --schedule-expression "cron(0 0 ? * MON *)" \
-  --state ENABLED \
-  --region "${REGION}" --output text --query 'RuleArn' >/dev/null
-
-# Allow EventBridge to invoke Lambda. add-permission errors with
-# ResourceConflictException on re-runs; that's the only error we ignore.
-aws lambda add-permission \
+if aws events describe-rule --name "${RULE_NAME}" --region "${REGION}" >/dev/null 2>&1; then
+  aws events remove-targets --rule "${RULE_NAME}" --ids token-reset --region "${REGION}" >/dev/null 2>&1 || true
+  aws events delete-rule --name "${RULE_NAME}" --region "${REGION}"
+  echo "✓ Deleted ${RULE_NAME} (counters are no longer zeroed weekly)"
+else
+  echo "(no legacy reset rule present)"
+fi
+aws lambda remove-permission \
   --function-name "${LAMBDA_NAME}" \
   --statement-id "eventbridge-weekly-reset" \
-  --action "lambda:InvokeFunction" \
-  --principal "events.amazonaws.com" \
-  --source-arn "arn:aws:events:${REGION}:${ACCOUNT_ID}:rule/${RULE_NAME}" \
-  --region "${REGION}" >/dev/null 2>&1 || echo "(permission already exists)"
-
-# put-targets accepts a JSON file via file:// to avoid quoting bugs in the
-# inline --targets JSON (the previous version embedded literal {} in a string
-# argument, which silently dropped the Input on some shells and left the rule
-# without a target — the cron fired but the Lambda never received "action:reset").
-TARGETS_JSON="$(mktemp)"
-trap 'rm -f "$TARGETS_JSON"' EXIT
-cat > "${TARGETS_JSON}" <<EOF
-[{
-  "Id": "token-reset",
-  "Arn": "${LAMBDA_ARN}",
-  "Input": "{\"action\":\"reset\"}"
-}]
-EOF
-
-aws events put-targets \
-  --rule "${RULE_NAME}" \
-  --targets "file://${TARGETS_JSON}" \
-  --region "${REGION}" --output text --query 'FailedEntryCount' >/dev/null
-
-echo "✓ Weekly reset cron configured (Mondays 00:00 UTC)"
+  --region "${REGION}" >/dev/null 2>&1 || true
 
 ###############################################################################
 # Done
 ###############################################################################
 echo ""
 echo "=== Token Aggregator Deployment Complete ==="
-echo "Runtime log groups → subscription filter → ${LAMBDA_NAME} → DDB (${TABLE_NAME})"
+echo "Agent log groups → subscription filter → ${LAMBDA_NAME} → DDB (${TABLE_NAME}) daily[YYYY-MM-DD]"
 echo ""
-echo "Next: Run backfill-tokens.sh to populate historical data"
+echo "Next: node deploy/continuous-improvement/backfill-daily.mjs --days 7   # fill the window from CW Logs Insights"

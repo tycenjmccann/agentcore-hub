@@ -127,6 +127,44 @@ conditionally written instead of being globally serialized:
   ledger. `evalSessionCount` in particular stays **approximate** under
   at-least-once delivery regardless of locking — that's accepted, not chased.
 
+### Operational metrics: per-day buckets, one rolling window
+
+The Evaluations tab's Operational Metrics (sessions, evaluator scores, tokens,
+cache hit, cost) are all read from **per-UTC-day buckets** on the agent's
+`agentcore-hub-eval-config` row — `daily["YYYY-MM-DD"]` — and folded over a
+single rolling window (`GET /api/evaluations?days=7`, clamped to 1..14) by
+`src/lib/eval-metrics.ts`. There is no weekly reset and no all-time counter in
+that table's UI path any more (the legacy `tokenTotalInput` / `tokenByModel`
+counters and the `agentcore-hub-token-reset-weekly` cron were retired; the
+all-time `evalScores` / `evalSessionCount` fields are still written for the
+anomaly-watcher and the Workflow Manager dossier).
+
+Two writers share a bucket, on sibling paths, so neither clobbers the other:
+
+| Writer | Fields | Source records |
+|--------|--------|----------------|
+| `lambda/token-aggregator` | `tokensIn` (full prompt incl. cache), `tokensOut`, `cacheRead`, `cacheWrite`, `cacheWrite1h`, `calls`, `costUsd`, `byModel[model]` | Strands `chat` spans (`strands.telemetry.tracer`) on Strands runtimes — the only record whose input count includes prompt-cache reads/writes; EMF `gen_ai.client.token.usage` metrics on managed harnesses; `claude_code.api_request` events on the coding runtime |
+| `lambda/eval-packager` (`aggregateScoresToDdb`) | `sessions`, `evalScores[evaluator] = {sum, count}` | evaluator results, same deduped entries as the all-time aggregates |
+
+Both materialise the bucket with idempotent `if_not_exists` SETs and then apply
+atomic `ADD`s (packager: `SET daily.#d.evalScores` under its existing CAS +
+`ADD daily.#d.sessions`). The token-aggregator prunes buckets older than
+`DAILY_RETAIN_DAYS` (14). Cost is computed read-side from `src/config/pricing.json`
+(`cachedInputDiscount`, `cacheWriteMultiplier` by TTL).
+
+Deploy / repair:
+
+```bash
+bash deploy/continuous-improvement/deploy-token-aggregator.sh   # Lambda + per-shape subscription filters, deletes the weekly reset
+node deploy/continuous-improvement/backfill-daily.mjs --days 7  # rebuild the window from CW Logs Insights (idempotent, overwrites day buckets)
+```
+
+Why the shapes matter: the previous aggregator only matched the EMF metric,
+whose `input` type on Strands runtimes carries the *uncached* input (a few tokens
+per call once prompt caching is on) — the dashboard showed 3K in / 2M out for
+the shared runtime — and the coding runtime, which never emits that metric,
+always showed $0.
+
 4. **S3 Batch Archive** (`fleet-imp-agent/batches/`):
    - The raw flushed batch (`{agentId, batchSize, flushedAt, sessions[]}`)
    - Named: `batch-<agentId>-<timestamp>.json`

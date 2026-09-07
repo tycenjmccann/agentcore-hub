@@ -1338,6 +1338,45 @@ async function appendToBuffer(agentId, sessionData, batchSize) {
 // so tests stay deterministic and fast.
 const AGG_RETRY = { maxAttempts: 3, baseDelayMs: 25 };
 
+// ─── Per-UTC-day buckets (shared with lambda/token-aggregator) ─────────────
+// The dashboard applies ONE rolling window to sessions, scores AND tokens, so
+// the packager writes its sessions/evalScores into the same `daily[day]`
+// bucket the token-aggregator fills with token counts. Same zero shape on both
+// sides — whichever Lambda gets there first materialises the bucket.
+export function dayKeyOf(ms) {
+  const n = Number(ms);
+  return new Date(Number.isFinite(n) && n > 0 ? n : Date.now()).toISOString().slice(0, 10);
+}
+
+export function zeroDailyBucket() {
+  return {
+    tokensIn: 0, tokensOut: 0, cacheRead: 0, cacheWrite: 0, cacheWrite1h: 0,
+    calls: 0, costUsd: 0, sessions: 0, evalScores: {}, byModel: {},
+  };
+}
+
+// Idempotent `if_not_exists` SETs so the nested `daily.#d.*` paths exist before
+// the conditional merge below touches them (a SET/ADD on a missing nested path
+// is a ValidationException that would sink the whole scorecard write).
+async function ensureDailyBuckets(agentId, days) {
+  if (days.length === 0) return;
+  await ddb.send(new UpdateCommand({
+    TableName: TABLE,
+    Key: { agentId },
+    UpdateExpression: 'SET daily = if_not_exists(daily, :emptyDaily)',
+    ExpressionAttributeValues: { ':emptyDaily': {} },
+  }));
+  for (const day of days) {
+    await ddb.send(new UpdateCommand({
+      TableName: TABLE,
+      Key: { agentId },
+      UpdateExpression: 'SET daily.#d = if_not_exists(daily.#d, :zeroBucket)',
+      ExpressionAttributeNames: { '#d': day },
+      ExpressionAttributeValues: { ':zeroBucket': zeroDailyBucket() },
+    }));
+  }
+}
+
 // Exported (TEAM-3427) so the config-evals battery suite can exercise the
 // guard hermetically with a mocked DDB client.
 export async function aggregateScoresToDdb(agentId, entries = []) {
@@ -1361,9 +1400,17 @@ export async function aggregateScoresToDdb(agentId, entries = []) {
     return true;
   });
 
+  // Per-UTC-day view of the same deltas, keyed by the evaluator result's log
+  // timestamp: { day: { sessions: Set, evalScores: { name: { sum, count } } } }.
+  const dailyDeltas = {};
+  const dayOf = (r) => (dailyDeltas[dayKeyOf(r.timestamp)] ||= { sessions: new Set(), evalScores: {} });
+
   for (const r of entries) {
     if (r.parseError) continue;
-    if (r.sessionId) sessions.add(r.sessionId);
+    if (r.sessionId) {
+      sessions.add(r.sessionId);
+      dayOf(r).sessions.add(r.sessionId);
+    }
     // Same eligibility as the old raw parse: an evaluator name, a finite score
     // (extractSessionData already nulls NaN garbage that would poison the
     // rolling sum), and no error signal (error.type or the raw error===1 flag).
@@ -1372,10 +1419,25 @@ export async function aggregateScoresToDdb(agentId, entries = []) {
       if (!scoreDeltas[r.evaluatorName]) scoreDeltas[r.evaluatorName] = { sum: 0, count: 0 };
       scoreDeltas[r.evaluatorName].sum += r.score;
       scoreDeltas[r.evaluatorName].count += 1;
+      const dayScores = dayOf(r).evalScores;
+      if (!dayScores[r.evaluatorName]) dayScores[r.evaluatorName] = { sum: 0, count: 0 };
+      dayScores[r.evaluatorName].sum += r.score;
+      dayScores[r.evaluatorName].count += 1;
     }
   }
 
   if (Object.keys(scoreDeltas).length === 0 && sessions.size === 0) return;
+
+  // Materialise the day buckets up front (outside the CAS loop — idempotent).
+  // If that fails the all-time aggregates below still land; only the windowed
+  // view goes stale for this delivery.
+  let dailyDays = Object.keys(dailyDeltas).sort();
+  try {
+    await ensureDailyBuckets(agentId, dailyDays);
+  } catch (err) {
+    console.error(`[eval-packager] ${agentId}: daily bucket ensure failed, skipping windowed aggregates:`, err.message);
+    dailyDays = [];
+  }
 
   const deliverySummary = computeBatchSummary(entries);
   const sleep =
@@ -1390,7 +1452,7 @@ export async function aggregateScoresToDdb(agentId, entries = []) {
         TableName: TABLE,
         Key: { agentId },
         ProjectionExpression:
-          'evalScores, evalSessionCount, evalStatusCounts, evalAggVersion',
+          'evalScores, evalSessionCount, evalStatusCounts, evalAggVersion, daily',
       }));
 
       const expectedVersion =
@@ -1446,16 +1508,42 @@ export async function aggregateScoresToDdb(agentId, entries = []) {
         values[':errReason'] = String(firstError?.statusReason || 'unknown eval error').slice(0, 200);
       }
 
+      // Windowed view: merge each day's score deltas onto the stored bucket
+      // (read above, so a lost CAS re-merges onto the winner's value) and ADD
+      // the day's session count atomically. `evalScores` and `sessions` are
+      // sibling paths under daily.#d — the token-aggregator's ADDs on the
+      // token fields of the same bucket never collide with either.
+      const names = {};
+      const addParts = [];
+      const existingDaily = Item?.daily || {};
+      dailyDays.forEach((day, i) => {
+        const delta = dailyDeltas[day];
+        const merged = { ...(existingDaily[day]?.evalScores || {}) };
+        for (const [evaluator, d] of Object.entries(delta.evalScores)) {
+          const cur = merged[evaluator] || { sum: 0, count: 0 };
+          merged[evaluator] = { sum: cur.sum + d.sum, count: cur.count + d.count };
+        }
+        names[`#d${i}`] = day;
+        updateExpr.push(`daily.#d${i}.evalScores = :dayScores${i}`);
+        values[`:dayScores${i}`] = merged;
+        if (delta.sessions.size > 0) {
+          addParts.push(`daily.#d${i}.sessions :daySessions${i}`);
+          values[`:daySessions${i}`] = delta.sessions.size;
+        }
+      });
+
       // Write the merged scorecard, but ONLY if nobody else wrote between the
       // read above and now (TEAM-3385 finding 7).
       await ddb.send(new UpdateCommand({
         TableName: TABLE,
         Key: { agentId },
-        UpdateExpression: 'SET ' + updateExpr.join(', '),
+        UpdateExpression:
+          'SET ' + updateExpr.join(', ') + (addParts.length ? ' ADD ' + addParts.join(', ') : ''),
         ConditionExpression:
           expectedVersion !== null
             ? 'evalAggVersion = :expectedVersion'
             : 'attribute_not_exists(evalAggVersion)',
+        ...(Object.keys(names).length ? { ExpressionAttributeNames: names } : {}),
         ExpressionAttributeValues: values,
       }));
 
