@@ -42,7 +42,10 @@ import {
 } from "./lease.mjs";
 import { resolveWatchdog, setWatchdogSource } from "./watchdog.mjs";
 import { createDetector } from "./dead-session-detector.mjs";
-import { createCascade } from "./cascade.mjs";
+// TEAM-4260 — resolveCascadeMode lives in cascade.mjs now (behaviour unchanged) so
+// tests and the F50UCZ replay harness resolve CASCADE_EXTENDED_STATES with the same
+// function this module does instead of hard-coding a mode literal.
+import { createCascade, resolveCascadeMode } from "./cascade.mjs";
 import { createReconcileSweep } from "./reconcile-sweep.mjs";
 import { createAwaitedIds, normalizeAwaitedIdsMode } from "./awaited-ids.mjs";
 import { createReviewCap, parseDecision } from "./review-cap.mjs";
@@ -162,6 +165,10 @@ const RECONCILE_SWEEP_MODE = process.env.RECONCILE_SWEEP_MODE || "off";
 // closes — no bespoke wait path. off = byte-identical (no edge writes, no derived
 // hook, no level-triggered pickup); the module mutates ticket state, so it stays
 // dark until an operator opts in. Garbage fails safe to off (normalizeAwaitedIdsMode).
+// TEAM-4260 (r2-F1): `enforce` is SELF-SUFFICIENT — cascade routes an awaited-STAMPED
+// dependent on this flag alone (cascade.mjs awaitedRouteMode), so CASCADE_EXTENDED_STATES
+// is NOT required for the FR-1.3 re-wake. Before that fix the event path returned at
+// `if (extendedMode === "off")` and recovery fell to the reconcile sweep.
 const AWAITED_IDS_MODE = normalizeAwaitedIdsMode(process.env.AWAITED_IDS_MODE);
 // The wait-SLA (D1 §5): once a ticket has awaited its open fixes longer than this,
 // the sweep/detector emit ONE advisory orchestrator.await_timeout (an event, never
@@ -306,20 +313,6 @@ const gateChildren = (children) => (ADVISORY_ROUTING === "enforce" ? nonAdvisory
 // and certifies the branch head. Matches the roster entry below.
 const CI_AGENT_ID = "agentcore_hub_ci_agent";
 
-/**
- * Resolve CASCADE_EXTENDED_STATES to off | shadow | enforce. Legacy truthies
- * ("true"/"1"/"on"/"enforce") → enforce; explicit "shadow" → shadow; unset, "",
- * "off", "false", "0", or anything unrecognized → off (the pre-epic passthrough,
- * TEAM-3763 F6). shadow/enforce are granted ONLY on an explicit, recognized
- * value so an unset or typo'd var can never add the extended path's extra DDB
- * reads. Trimmed + lowercased so a casing slip can never grant write access.
- */
-function resolveCascadeMode(raw) {
-  const v = String(raw ?? "").trim().toLowerCase();
-  if (v === "enforce" || v === "on" || v === "true" || v === "1") return "enforce";
-  if (v === "shadow") return "shadow";
-  return "off"; // "", unset, "off", "false", "0", or garbage → off (pre-epic)
-}
 // TEAM-3686 Finding 3 / TEAM-3690: deliverable-evidence gate on the orchestrator
 // completion path — same flag, same semantics as the HTTP complete route
 // (TEAM-3619 D4a, design §X.5 step 6: "evidence check behind

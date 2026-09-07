@@ -127,6 +127,60 @@ describe("f50ucz D1 — the cascade re-wakes TEAM-4126 when the LAST awaited fix
       .toHaveLength(1);
   });
 
+  /**
+   * TEAM-4260 (ship-review r2-F1) — the regression test for the flag coupling.
+   *
+   * This replay used to hard-code extendedStates: "enforce" in the harness, so it
+   * proved FR-1.3 only under a flag combination production does not run:
+   * CASCADE_EXTENDED_STATES defaults OFF on every surface (index.mjs
+   * resolveCascadeMode, template.yaml, deploy.sh), and cascade's handleDependent
+   * returned at `if (extendedMode === "off")` BEFORE the extended-state handlers —
+   * so with AWAITED_IDS_MODE=enforce and every other flag at its default, the
+   * parked RM was not re-woken on the event path at all (recovery slipped to the
+   * ≥30-min reconcile sweep, which never consults extendedMode).
+   *
+   * Here the extended flag is provably dark and the re-wake must still happen,
+   * routed on AWAITED_IDS_MODE alone via the awaited stamp.
+   */
+  it("AWAITED_IDS_MODE=enforce with CASCADE_EXTENDED_STATES unset re-dispatches the parked ship ticket (r2-F1)", async () => {
+    const prior = process.env.CASCADE_EXTENDED_STATES;
+    delete process.env.CASCADE_EXTENDED_STATES;
+    try {
+      const w = await armed();
+      // The extended-states flag really is dark — this is the production default,
+      // resolved by the same function index.mjs uses.
+      expect(w.cascade.extendedMode).toBe("off");
+
+      w.advanceTo(COMPLETED[FIX_A]);
+      await w.cascade.cascadeUnblock(FIX_A, EPIC, w.wf);
+      expect(w.redispatchedIds).not.toContain(SHIP);
+
+      w.advanceTo(COMPLETED[FIX_B]);
+      await w.cascade.cascadeUnblock(FIX_B, EPIC, w.wf);
+      expect(w.redispatchedIds).not.toContain(SHIP);
+
+      // The LAST awaited fix closes → the stamped, stale-lease RM is stolen and
+      // re-dispatched exactly once, with CASCADE_EXTENDED_STATES still off.
+      w.advanceTo(COMPLETED[FIX_CI]);
+      await w.cascade.cascadeUnblock(FIX_CI, EPIC, w.wf);
+      expect(w.redispatchedIds.filter((id) => id === SHIP)).toEqual([SHIP]);
+      expect(w.lease.stealClaim).toHaveBeenCalledWith(
+        expect.anything(), "workflows", WF_ID, SHIP, CLAIM_STARTED
+      );
+
+      // Same journal shape as the extended-states-on path — one event, not two.
+      const un = w.eventsOfType("orchestrator.unblocked").filter((e) => e.detail.ticketId === SHIP);
+      expect(un).toHaveLength(1);
+      expect(un[0].detail.previousStatus).toBe("in_progress");
+      expect(un[0].detail.reason).toBe("awaited_rewake");
+      expect(un[0].detail.source).toBe("cascade");
+      expect(un[0].detail.unblockedBy).toBe(FIX_CI);
+    } finally {
+      if (prior === undefined) delete process.env.CASCADE_EXTENDED_STATES;
+      else process.env.CASCADE_EXTENDED_STATES = prior;
+    }
+  });
+
   it("TEAM-4187: the SWEEP re-wake journals orchestrator.unblocked too (source reconcile-sweep)", async () => {
     const w = await armed();
 

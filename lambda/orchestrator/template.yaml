@@ -105,6 +105,8 @@ Parameters:
       in_progress whose last blocker resolves is lease-guarded (live lease →
       orchestrator.nudge only; stale lease → steal + re-dispatch via the claim
       CAS) and an in_review gate is re-woken (review.reawakened + gate re-run).
+      TEAM-4260: this flag is NOT required by AwaitedIdsMode — an awaited-stamped
+      dependent is routed on AwaitedIdsMode's own mode even when this is off.
 
   ReconcileSweepMode:
     Type: String
@@ -136,6 +138,9 @@ Parameters:
       the safe default is dark); shadow = compute + metrics/logs, ZERO writes;
       enforce = write the edges + stamp. A garbage value coalesces to OFF (fail
       safe for a state-mutating flag). deploy.sh only forwards it when set.
+      TEAM-4260: "enforce" is SELF-SUFFICIENT — the cascade routes an
+      awaited-STAMPED dependent on this flag alone, so CascadeExtendedStates is
+      NOT a prerequisite for the FR-1.3 re-wake.
 
   AwaitedIdsTimeoutMinutes:
     Type: String

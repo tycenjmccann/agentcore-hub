@@ -7,7 +7,8 @@
  * cascade.test.mjs. What lives ONLY in index.mjs is the value each env var
  * resolves to before it is handed down:
  *   F2 — RECONCILE_SWEEP_MODE unset → "off"  (`process.env.RECONCILE_SWEEP_MODE || "off"`)
- *   F6 — CASCADE_EXTENDED_STATES unset → "off" (resolveCascadeMode)
+ *   F6 — CASCADE_EXTENDED_STATES unset → "off" (resolveCascadeMode, which TEAM-4260
+ *        moved into cascade.mjs; index.mjs imports it, behaviour unchanged)
  *
  * Both must default DARK: the reconcile sweep is now SCHEDULED (deploy.sh wires a
  * reconcile_sweep EventBridge target — F2), and shadow is NOT byte-identical to
@@ -55,7 +56,13 @@ vi.mock("@aws-sdk/client-bedrock-agent-runtime", () => ({
 }));
 
 // F6: capture the extendedStates mode index passes to createCascade.
-vi.mock("./cascade.mjs", () => ({
+// TEAM-4260 — index.mjs now IMPORTS resolveCascadeMode from cascade.mjs, so the
+// factory must spread importOriginal(): a mock that exports only createCascade +
+// newMetrics leaves the import binding undefined and index.mjs throws on load.
+// Spreading also keeps the REAL resolver under test below (F6 is its
+// characterisation test — the move must not change a single answer).
+vi.mock("./cascade.mjs", async (importOriginal) => ({
+  ...(await importOriginal()),
   createCascade: (opts) => {
     h.extendedStates.push(opts?.extendedStates);
     return { cascadeUnblock: async () => [], reconcileDependent: async () => "noop" };
@@ -117,7 +124,11 @@ describe("F2 — RECONCILE_SWEEP_MODE default (index.mjs reconcile dispatch)", (
   });
 });
 
-describe("F6 — CASCADE_EXTENDED_STATES default (index.mjs resolveCascadeMode)", () => {
+// TEAM-4260 — the resolver now lives in cascade.mjs (exported) and index.mjs imports
+// it. These assertions are unchanged on purpose: they ARE the characterisation test
+// proving the move kept every answer byte-identical, and they still observe the value
+// through index.mjs's own call, not the function directly.
+describe("F6 — CASCADE_EXTENDED_STATES default (resolveCascadeMode, now in cascade.mjs)", () => {
   it("UNSET → the cascade is built with extendedStates=off (pre-epic, zero extra reads)", async () => {
     const handler = await loadHandler();
     await handler({ ...RECONCILE_EVENT }); // instantiates getCascade() via the reconcile deps
