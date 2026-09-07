@@ -63,6 +63,26 @@ export const GATE_PERSONAS = new Set([
 /** 7-40 hex — a short or full git object name, and nothing else. */
 const SHA_RE = /^[0-9a-f]{7,40}$/;
 
+/**
+ * A ticket key. CANONICAL SOURCE: fix-contract.mjs:140 (`TICKET_KEY_RE`) — this is
+ * a local copy only because this module is zero-import by design, and
+ * verdict-contract.test.mjs asserts the two `.source` strings are equal so the copy
+ * cannot drift. Every ticket id that reaches an event detail goes through it: the
+ * ids arrive from agent-authored `spawned_by` markers, and an event is read by the
+ * UI, cost-report and the replay harness.
+ */
+export const TICKET_KEY_RE = /^[A-Z][A-Z0-9]+-\d+$/;
+
+/** Ticket ids only, trimmed, de-duplicated, order preserved. Never throws. */
+export function sanitizeTicketIds(raw) {
+  const out = [];
+  for (const v of Array.isArray(raw) ? raw : []) {
+    const id = typeof v === "string" ? v.trim() : "";
+    if (TICKET_KEY_RE.test(id) && !out.includes(id)) out.push(id);
+  }
+  return out;
+}
+
 /** The enum, as it appears in prose: PASS / FAIL / BLOCKED / CHANGES NEEDED. */
 const VERDICT_ALT = "(PASS|FAIL|BLOCKED|CHANGES[\\s_-]*NEEDED)";
 
@@ -247,14 +267,30 @@ export function evaluateGate({ assignee, verdict, spawnedTickets, mode } = {}) {
  * spread in only when known: `agent.complete` is the event the UI, cost-report
  * and the replay harness all read, and a key that appears only sometimes forces
  * every one of them to distinguish "no verdict" from "an older orchestrator".
- * Fixed shape, explicit nulls.
+ * Fixed shape, fixed types:
+ *
+ *   verdict         one of VERDICTS, or null (non-gate persona / nothing stated)
+ *   verdictSource   declared | inferred | none, or null for a non-gate persona
+ *   spawnedTickets  the fix tickets this persona filed during the task — [], never null
+ *   testedHead      the head it verified — "" when unknown, never null
+ *
+ * `spawnedTickets` and `testedHead` default to the EMPTY value of their own type
+ * rather than to null so a consumer can `.length` / `.startsWith` unconditionally;
+ * `verdict`/`verdictSource` stay nullable because "no verdict" is a real, distinct
+ * state there and "" would read as a fifth enum value.
+ *
+ * `wouldSuppress` deliberately does NOT appear: whether a verdict WOULD have held
+ * the successor is a property of one cascade decision under one flag mode, not of
+ * the completion, and it lives on `orchestrator.verdict_observed` alone. Putting it
+ * here would make the same completion carry different `agent.complete` details
+ * depending on VERDICT_GATE, which is exactly what replay criterion (e) forbids.
  */
 export function enrichCompleteDetail(base, info = {}) {
   return {
     ...base,
     verdict: normalizeVerdict(info.verdict),
     verdictSource: info.verdictSource ?? null,
-    testedHead: normalizeSha(info.testedHead),
-    wouldSuppress: info.wouldSuppress === true,
+    spawnedTickets: sanitizeTicketIds(info.spawnedTickets),
+    testedHead: normalizeSha(info.testedHead) ?? "",
   };
 }

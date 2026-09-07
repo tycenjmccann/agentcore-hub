@@ -134,8 +134,10 @@ function harness({ mode = "enforce", children = [], record = liveRecord(), tasks
     publishEvent: vi.fn(async (ticketId, type, detail) => { calls.events.push({ ticketId, type, detail }); }),
     log: { warn: (m) => calls.warns.push(m), log: () => {} },
   };
-  const { onFixDone } = createLiveReverify(deps);
-  return { onFixDone, deps, calls, workflow, record };
+  // `reverify` is the TEAM-4246 gate lineage on the same machinery — additive, so
+  // every test above keeps destructuring exactly what it always did.
+  const { onFixDone, reverify } = createLiveReverify(deps);
+  return { onFixDone, reverify, deps, calls, workflow, record };
 }
 
 /** A completion record that DOES carry live evidence. */
@@ -1084,5 +1086,298 @@ describe("TEAM-4156 — the re-verify ticket's id is read under BOTH providers",
         /could not create the re-verify ticket/,
       );
     }
+  });
+});
+
+/**
+ * TEAM-4246 D1 — the GATE lineage on the same machinery.
+ *
+ * A gate persona can state a non-PASS verdict and file no fix ticket (its blueprint
+ * now requires one, but the orchestrator cannot assume it). The cascade must still
+ * hold the successor, and a hold needs something real to wait on — this ticket. It
+ * shares every line of the three-layer idempotency with the live lineage, which is
+ * the whole reason the extraction happened, so what these tests pin is the part that
+ * DIFFERS: the payload, the namespaced CAS slot, the round discriminator, and the
+ * fact that the cascade — not this module — writes the successor edges.
+ */
+describe("reverify({ kind: 'gate' }) — a gate persona's own re-verification", () => {
+  const GATE = "TEAM-4180";
+  const REVIEWER = "agentcore_hub_code_reviewer";
+  const FIX_A = "TEAM-4183";
+  const FIX_B = "TEAM-4184";
+  const GATE_TITLE = "Code review: ActivityFeed clear/undo";
+
+  /** The gate ticket has its own task entry — that is where the CAS slot lives. */
+  const gateHarness = (over = {}) =>
+    harness({
+      tasks: { [GATE]: { agentId: REVIEWER, commitSha: SHA } },
+      phases: { [SHIP]: "ship", [REVIEWER]: "review" },
+      ...over,
+    });
+
+  const gateTicket = (over = {}) => ({ ticketId: GATE, title: GATE_TITLE, assignee: REVIEWER, ...over });
+
+  const fileGate = (h, over = {}) =>
+    h.reverify({
+      kind: "gate",
+      workflow: h.workflow,
+      owner: REVIEWER,
+      gateTicket: gateTicket(),
+      headSha: SHA,
+      blockedBy: [FIX_A],
+      round: 1,
+      ...over,
+    });
+
+  it("files ONE ticket for the gate persona itself, in its own fix lineage", async () => {
+    const h = gateHarness();
+
+    const res = await fileGate(h, { blockedBy: [FIX_A, FIX_B] });
+
+    expect(res).toMatchObject({ action: "created", reverifyTicketId: REVERIFY, sha7: SHA7, round: 2 });
+    expect(created(h.calls)).toHaveLength(1);
+    const { params } = created(h.calls)[0];
+    expect(params.summary).toBe(`Re-verify (round 2): ${GATE_TITLE} @ ${SHA7}`);
+    // Back to the SAME persona: the gate it stated is the gate that must be re-run.
+    expect(params.assignee).toBe(REVIEWER);
+    expect(params.blocked_by).toEqual([FIX_A, FIX_B]);
+    expect(params.parent_key).toBe(EPIC);
+    expect(params.workflow_id).toBe(WF);
+    expect(params.phase).toBe("review");            // the OWNER's phase, via getAgentDef
+    expect(params.spawned_by).toEqual({
+      kind: "review_fix",                            // GATE_OWNER_FIX_KIND[reviewer]
+      gateTicketId: GATE,                            // KIND_TO_ORIGIN_KEY[review_fix]
+      reverify: true,
+      rearmOf: GATE,
+      headSha: SHA,
+      round: 2,
+    });
+    // No fix_contract: this is not a finding being re-run, it is a GATE being re-run,
+    // and inventing an invariant/repro for it would be an agent-authored claim the
+    // orchestrator made up.
+    expect(params).not.toHaveProperty("fix_contract");
+    expect(params.description).toContain(`Re-run your own gate at HEAD ${SHA}`);
+    expect(params.description).toContain(`${FIX_A}, ${FIX_B}`);
+    expect(params.description).toMatch(/verdict=PASS\|CHANGES_NEEDED\|FAIL\|BLOCKED/);
+  });
+
+  it.each([
+    ["qa_verifier", "agentcore_hub_qa_verifier", "qa_fix", "qaTicketId"],
+    ["ci_agent", "agentcore_hub_ci_agent", "ci_fix", "ciTicketId"],
+    ["release_manager", "agentcore_hub_release_manager", "ship_fix", "shipTicketId"],
+    ["code_reviewer", REVIEWER, "review_fix", "gateTicketId"],
+  ])("%s → kind %s on %s", async (_label, owner, kind, originKey) => {
+    const h = harness({ tasks: { [GATE]: { agentId: owner, commitSha: SHA } }, phases: { [owner]: "review" } });
+
+    await fileGate(h, { owner, gateTicket: gateTicket({ assignee: owner }) });
+
+    expect(created(h.calls)[0].params.spawned_by).toMatchObject({ kind, [originKey]: GATE });
+  });
+
+  it("is NOT gated on LIVE_REVERIFY — the cascade's VERDICT_GATE drives it", async () => {
+    // Reading this module's mode here would make a gate hold depend on a flag that
+    // has nothing to do with it; the two rollouts are independent by design.
+    for (const mode of ["off", "shadow", "enforce"]) {
+      const h = gateHarness({ mode });
+      expect((await fileGate(h)).action).toBe("created");
+      expect(created(h.calls)).toHaveLength(1);
+    }
+  });
+
+  it("leaves every successor edge to the cascade — zero addBlockers calls", async () => {
+    // The cascade holds the sibling snapshot allBlockersResolved reads in the same
+    // pass, so it must write the edge itself; a second writer here would flip a
+    // status the cascade is mid-decision on.
+    const h = gateHarness({ children: [{ ticketId: SHIP, status: "ready", assignee: "agentcore_hub_release_manager" }] });
+
+    await fileGate(h);
+
+    expect(h.calls.addBlockers).toEqual([]);
+  });
+
+  it("claims a NAMESPACED slot so it can never be confused with a live re-verify", async () => {
+    const h = gateHarness();
+
+    await fileGate(h);
+
+    expect(h.calls.claims).toEqual([{ wfId: WF, tid: GATE, sha7: `gate:${SHA7}`, nowIso: expect.any(String) }]);
+    expect(h.calls.mergeTaskMetadata.at(-1)).toEqual({
+      wfId: WF,
+      tid: GATE,
+      fields: { reverifyTicketId: REVERIFY, reverifySha: `gate:${SHA7}` },
+    });
+  });
+
+  it("a LIVE claim already on that entry does not satisfy the gate", async () => {
+    // A re-verify ticket is itself both a gate persona's ticket and a fix ticket, so
+    // both lineages can claim the same entry in one done cascade. Reading the live
+    // claim as ours would hand the cascade the WRONG ticket id to hold on — a hold
+    // on a QA live re-run instead of on the gate being re-stated.
+    const h = gateHarness({
+      tasks: { [GATE]: { agentId: REVIEWER, commitSha: SHA, reverifySha: SHA7, reverifyTicketId: "TEAM-4200-live" } },
+      children: [
+        // the live lineage's ticket for the same (owner, head) — no round stamped
+        { ticketId: "TEAM-4200-live", spawnedBy: { kind: "qa_fix", reverify: true, rearmOf: GATE, headSha: SHA } },
+      ],
+    });
+
+    const res = await fileGate(h);
+
+    expect(res.action).toBe("created");
+    expect(res.reverifyTicketId).toBe(REVERIFY);
+    expect(created(h.calls)).toHaveLength(1);
+  });
+
+  it("is idempotent per (gate ticket, head): a redelivered decision files nothing", async () => {
+    const h = gateHarness();
+
+    const first = await fileGate(h);
+    const second = await fileGate(h);
+
+    expect(first.action).toBe("created");
+    expect(second).toMatchObject({ action: "already", reverifyTicketId: REVERIFY, sha7: SHA7 });
+    expect(created(h.calls)).toHaveLength(1);
+  });
+
+  it("a new head IS a new claim — the gate was re-stated somewhere else", async () => {
+    const h = gateHarness();
+    await fileGate(h);
+    h.deps.invokeTickets.mockResolvedValueOnce({ key: "TEAM-4201" });
+
+    const second = await fileGate(h, { headSha: "9ca1963aa1e0e1c6f0d0d0a4c8f2b1e3d4c5b6a7", round: 2 });
+
+    expect(second).toMatchObject({ action: "created", reverifyTicketId: "TEAM-4201", sha7: "9ca1963", round: 3 });
+    expect(created(h.calls)).toHaveLength(1);   // the second create bypassed the recorder
+  });
+
+  it("the CAS loser files nothing (concurrent cascade + stream twin)", async () => {
+    const h = gateHarness();
+    const [a, b] = await Promise.all([fileGate(h), fileGate(h)]);
+
+    expect([a.action, b.action].sort()).toEqual(["already", "created"]);
+    expect(createAttempts(h.deps)).toHaveLength(1);
+  });
+
+  it("an existing gate re-verify on the board is adopted, not duplicated", async () => {
+    const h = gateHarness({
+      children: [
+        { ticketId: "TEAM-4290", spawnedBy: { kind: "review_fix", reverify: true, rearmOf: GATE, headSha: SHA, round: 2 } },
+      ],
+    });
+
+    const res = await fileGate(h);
+
+    expect(res).toMatchObject({ action: "already", reverifyTicketId: "TEAM-4290" });
+    expect(created(h.calls)).toHaveLength(0);
+    expect(h.calls.mergeTaskMetadata.at(-1).fields).toEqual({ reverifyTicketId: "TEAM-4290", reverifySha: `gate:${SHA7}` });
+  });
+
+  it("hands the slot back when create_ticket fails, so the next decision retries", async () => {
+    const h = gateHarness();
+    h.deps.invokeTickets.mockResolvedValueOnce({ error: "Jira 400" });
+
+    const res = await fileGate(h);
+
+    expect(res).toEqual({ action: "failed", sha7: SHA7 });
+    expect(h.calls.releases).toEqual([{ wfId: WF, tid: GATE, sha7: `gate:${SHA7}` }]);
+    expect(eventsOfType(h.calls, "fix.reverify_created")).toEqual([]);
+    // The caller must be able to tell "no ticket" apart from "here is your blocker".
+    expect(res.reverifyTicketId).toBeUndefined();
+  });
+
+  it("publishes fix.reverify_created with the gate's own shape", async () => {
+    const h = gateHarness();
+
+    await fileGate(h, { reason: "stale-head" });
+
+    const ev = eventsOfType(h.calls, "fix.reverify_created");
+    expect(ev).toHaveLength(1);
+    expect(ev[0].ticketId).toBe(GATE);
+    expect(ev[0].detail).toEqual({
+      workflowId: WF,
+      fixTicketId: GATE,     // the lineage owner — consumers keyed on this still work
+      gateTicketId: GATE,
+      reverifyTicketId: REVERIFY,
+      kind: "gate",
+      owner: REVIEWER,
+      sha7: SHA7,
+      round: 2,
+      blockedBy: [FIX_A],
+      reason: "stale-head",
+      at: expect.any(String),
+    });
+  });
+
+  it("does not count as a rework round (the cap must not fire on a re-check)", async () => {
+    const h = gateHarness();
+    await fileGate(h);
+
+    const { spawned_by } = created(h.calls)[0].params;
+    expect(isReworkFix({ spawnedBy: spawned_by })).toBe(false);
+  });
+
+  it("renders the gate title inert — it is agent-authored text", async () => {
+    const h = gateHarness();
+
+    await fileGate(h, { gateTicket: gateTicket({ title: "Review `rm -rf /`\nand\tthen ship" }) });
+
+    expect(created(h.calls)[0].params.summary).toBe(`Re-verify (round 2): Review rm -rf / and then ship @ ${SHA7}`);
+  });
+
+  it("de-duplicates and trims the fix ids it is told to block on", async () => {
+    const h = gateHarness();
+
+    await fileGate(h, { blockedBy: [` ${FIX_A} `, FIX_A, "", null, FIX_B] });
+
+    expect(created(h.calls)[0].params.blocked_by).toEqual([FIX_A, FIX_B]);
+  });
+
+  it("says so in the body when NOTHING was filed for the verdict", async () => {
+    const h = gateHarness();
+
+    await fileGate(h, { blockedBy: [] });
+
+    expect(created(h.calls)[0].params.blocked_by).toEqual([]);
+    expect(created(h.calls)[0].params.description).toContain("No fix ticket was filed");
+  });
+
+  it("round 1 when the caller has no round to report", async () => {
+    const h = gateHarness();
+
+    for (const round of [undefined, null, "", "abc", NaN]) {
+      h.calls.invokeTickets.length = 0;
+      const res = await fileGate(h, { round, headSha: `${SHA.slice(0, 39)}${round === undefined ? "a" : "b"}` });
+      expect(res.round).toBe(1);
+      if (created(h.calls).length) expect(created(h.calls)[0].params.spawned_by.round).toBe(1);
+    }
+  });
+
+  it.each([
+    ["no head sha", { headSha: "" }, "no-sha"],
+    ["a non-string head", { headSha: null }, "no-sha"],
+    ["an unknown owner", { owner: "agentcore_hub_bug_fixer" }, "skipped"],
+    ["no owner", { owner: undefined }, "skipped"],
+    ["no gate ticket", { gateTicket: {} }, "skipped"],
+    ["no workflow", { workflow: undefined }, "skipped"],
+    ["a kind this factory does not own", { kind: "ship" }, "unsupported-kind"],
+  ])("%s → %s, and nothing is written", async (_label, over, action) => {
+    const h = gateHarness();
+
+    const res = await fileGate(h, over);
+
+    expect(res.action).toBe(action);
+    expect(created(h.calls)).toHaveLength(0);
+    expect(h.calls.claims).toEqual([]);
+    expect(h.calls.mergeTaskMetadata).toEqual([]);
+    expect(h.calls.events).toEqual([]);
+    expect(h.calls.warns.join("\n")).not.toBe("");   // never silent
+  });
+
+  it("never throws — the cascade's hold must not depend on this succeeding", async () => {
+    const h = gateHarness();
+    h.deps.getChildTickets.mockRejectedValue(new Error("Jira 503"));
+    h.deps.invokeTickets.mockRejectedValue(new Error("Jira 503"));
+
+    await expect(fileGate(h)).resolves.toMatchObject({ action: "failed" });
   });
 });

@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
   GATE_PERSONAS,
+  TICKET_KEY_RE,
   VERDICTS,
   deriveVerdict,
   enrichCompleteDetail,
@@ -12,6 +13,7 @@ import {
   normalizeVerdictMode,
   resolveTestedHead,
   resolveVerdict,
+  sanitizeTicketIds,
 } from "./verdict-contract.mjs";
 
 /**
@@ -352,7 +354,7 @@ describe("verdict-contract — evaluateGate", () => {
 
 describe("verdict-contract — enrichCompleteDetail", () => {
   const base = { ticketId: "TEAM-4181", agentId: "agentcore_hub_qa_verifier", workflowId: "wf_1" };
-  const KEYS = ["verdict", "verdictSource", "testedHead", "wouldSuppress"];
+  const KEYS = ["verdict", "verdictSource", "spawnedTickets", "testedHead"];
 
   it("always emits all four keys, with off-defaults, when nothing is known", () => {
     // Fixed shape on purpose: agent.complete is read by the UI, cost-report and
@@ -361,8 +363,27 @@ describe("verdict-contract — enrichCompleteDetail", () => {
     for (const info of [undefined, {}, { verdict: null }, { verdict: "SUCCEEDED", testedHead: "HEAD" }]) {
       const detail = enrichCompleteDetail(base, info);
       expect(Object.keys(detail)).toEqual([...Object.keys(base), ...KEYS]);
-      expect(detail).toMatchObject({ ...base, verdict: null, verdictSource: null, testedHead: null, wouldSuppress: false });
+      expect(detail).toEqual({ ...base, verdict: null, verdictSource: null, spawnedTickets: [], testedHead: "" });
     }
+  });
+
+  it("defaults the two collection-shaped keys to the empty value of their OWN type", () => {
+    // A consumer must be able to .length / .startsWith unconditionally; nulls there
+    // would push that check into the UI, cost-report and the replay harness alike.
+    const detail = enrichCompleteDetail(base, {});
+    expect(Array.isArray(detail.spawnedTickets)).toBe(true);
+    expect(detail.testedHead).toBe("");
+    expect(detail.testedHead).not.toBeNull();
+  });
+
+  it("never carries wouldSuppress — that belongs to orchestrator.verdict_observed alone", () => {
+    // Whether a verdict WOULD have held the successor is a property of one cascade
+    // decision under one flag mode. On agent.complete it would make the same
+    // completion emit different details per VERDICT_GATE value, which is exactly
+    // what replay criterion (e) — off is byte-identical to baseline — forbids.
+    const detail = enrichCompleteDetail(base, { verdict: "FAIL", verdictSource: "declared", wouldSuppress: true });
+    expect(detail).not.toHaveProperty("wouldSuppress");
+    expect(Object.keys(detail)).toEqual([...Object.keys(base), ...KEYS]);
   });
 
   it("carries a resolved verdict through, normalized", () => {
@@ -370,23 +391,22 @@ describe("verdict-contract — enrichCompleteDetail", () => {
     const detail = enrichCompleteDetail(base, {
       ...resolveVerdict(record, assignee),
       testedHead: resolveTestedHead(record),
-      wouldSuppress: true,
+      spawnedTickets: ["TEAM-4183"],
     });
-    expect(detail).toMatchObject({
+    expect(detail).toEqual({
       ...base,
       verdict: "CHANGES_NEEDED",
       verdictSource: "inferred",
+      spawnedTickets: ["TEAM-4183"],
       testedHead: record.commit_sha.toLowerCase(),
-      wouldSuppress: true,
     });
     expect(detail.testedHead.startsWith("933ea6f")).toBe(true);
   });
 
   it("normalizes hyphen/space spellings and uppercase SHAs on the way onto the event", () => {
-    expect(enrichCompleteDetail(base, { verdict: "changes-needed", testedHead: " 933EA6F ", wouldSuppress: "yes" })).toMatchObject({
+    expect(enrichCompleteDetail(base, { verdict: "changes-needed", testedHead: " 933EA6F " })).toMatchObject({
       verdict: "CHANGES_NEEDED",
       testedHead: "933ea6f",
-      wouldSuppress: false, // only a literal true is true
     });
   });
 
@@ -394,5 +414,38 @@ describe("verdict-contract — enrichCompleteDetail", () => {
     const detail = enrichCompleteDetail({ ...base, verdict: "STALE" }, { verdict: "PASS", verdictSource: "declared" });
     expect(detail.verdict).toBe("PASS");
     expect(detail.ticketId).toBe("TEAM-4181");
+  });
+});
+
+describe("verdict-contract — spawnedTickets sanitisation", () => {
+  const base = { ticketId: "TEAM-4180" };
+
+  it("uses the SAME ticket-key regex as fix-contract.mjs:140", async () => {
+    // verdict-contract.mjs is zero-import by design (like ticket-blockers.mjs), so
+    // it holds a LOCAL copy of TICKET_KEY_RE. This is the guard that the copy can
+    // never drift from the canonical definition — the test may import both.
+    const { TICKET_KEY_RE: canonical } = await import("./fix-contract.mjs");
+    expect(TICKET_KEY_RE.source).toBe(canonical.source);
+  });
+
+  it("keeps only ticket keys, trimmed and de-duplicated, order preserved", () => {
+    const { spawnedTickets } = enrichCompleteDetail(base, {
+      spawnedTickets: [" TEAM-4183 ", "TEAM-4183", "TEAM-4184", "not a ticket", "team-4185", "", null, 7, "TEAM-", "TEAM-4183"],
+    });
+    expect(spawnedTickets).toEqual(["TEAM-4183", "TEAM-4184"]);
+  });
+
+  it("never invents ids from prose or from a non-array", () => {
+    // The ids reach this function from agent-authored spawned_by markers and from a
+    // sibling scan; a summary sentence naming "TEAM-4183" is NOT a filed ticket.
+    for (const raw of [undefined, null, "TEAM-4183", { 0: "TEAM-4183" }, 42]) {
+      expect(enrichCompleteDetail(base, { spawnedTickets: raw }).spawnedTickets).toEqual([]);
+    }
+  });
+
+  it("accepts sanitizeTicketIds output as its own input unchanged (idempotent)", () => {
+    const once = sanitizeTicketIds([" TEAM-4183 ", "junk", "TEAM-4184"]);
+    expect(sanitizeTicketIds(once)).toEqual(once);
+    expect(once).toEqual(["TEAM-4183", "TEAM-4184"]);
   });
 });
