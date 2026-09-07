@@ -113,7 +113,7 @@ const SYNTHESIZED_CONTRACT = {
     'submit_workflow with an unreadable s3:// source surfaces the real S3 error, never the SDK placeholder name "Unknown"',
   evidenceSource: "live",
   evidenceRepro:
-    "POST /api/workflow/start with source s3://agentcore-hub-artifacts-838829463875-us-east-1/nope.md and read the returned detail",
+    "POST /api/workflow/start with source s3://test-bucket/nope.md and read the returned detail",
   citedLocation: ["src/lib/workflow/intake.ts:checkS3Source"],
   siblingScope: "none",
 };
