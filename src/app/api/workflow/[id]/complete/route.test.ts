@@ -169,8 +169,10 @@ const refusedPhases = (update: Record<string, unknown>): string[] => {
     .sort();
 };
 
-/** All five phases a run can already be closed on (sorted, for comparison). */
-const ALL_TERMINAL_PHASES = ["cancelled", "complete", "deploy-blocked", "error", "static-ci-only"];
+/** All six phases a run can already be closed on (sorted, for comparison) —
+ *  TEAM-4247 D2 added "nothing-to-remove", so a completion racing in behind a
+ *  no-op sweep's close cannot overwrite it either. */
+const ALL_TERMINAL_PHASES = ["cancelled", "complete", "deploy-blocked", "error", "nothing-to-remove", "static-ci-only"];
 
 function post(id = "wf_1") {
   return POST(new NextRequest(`http://localhost/api/workflow/${id}/complete`, { method: "POST", body: "{}" }), {
@@ -554,6 +556,19 @@ describe("POST complete — ship/CD merge-verdict gate (TEAM-3747 D2)", () => {
     expect(h.state.updates.length).toBe(0);
   });
 
+  it("nothing-to-remove is terminal too — 409, no write (TEAM-4247 D2)", async () => {
+    // The most exposed of the six: a no-op dead-code sweep closes with siblings
+    // that were never worked and no PR, so a manual or racing `complete` would
+    // relabel a run that removed nothing as a delivery.
+    h.state.workflow = { ...shipWorkflow({ mergeCommit: "9f1c2ab" }), phase: "nothing-to-remove" };
+    h.state.tickets = [doneShipTicket];
+    await load();
+    const res = await post();
+    expect(res.status).toBe(409);
+    expect((await res.json()).phase).toBe("nothing-to-remove");
+    expect(h.state.updates.length).toBe(0);
+  });
+
   it("a blocked close losing its CAS to a concurrent terminal write yields 409, not a fake close", async () => {
     h.state.workflow = shipWorkflow({});
     h.state.tickets = [doneShipTicket];
@@ -666,7 +681,7 @@ describe("POST complete — required-phase gate (TEAM-3755 F4)", () => {
  * overwrote the blocked verdict with "complete".
  */
 describe("POST complete — terminal-claim CAS parity (TEAM-3755 F2)", () => {
-  it("the green complete write CASes off all five terminal phases", async () => {
+  it("the green complete write CASes off all six terminal phases", async () => {
     h.state.workflow = {
       workflowId: "wf_1",
       phase: "ship",

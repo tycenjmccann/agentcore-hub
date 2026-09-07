@@ -1100,7 +1100,10 @@ describe("TEAM-3756 F5 — the detector's workflow scan excludes EVERY terminal 
     const keys = inList.split(",").map((k) => k.trim());
     return keys.map((k) => input.ExpressionAttributeValues[k]).sort();
   };
-  const ALL_TERMINAL_PHASES = ["cancelled", "complete", "deploy-blocked", "error", "static-ci-only"];
+  // Sorted, because refusedPhases() sorts. TEAM-4247 D2 added "nothing-to-remove":
+  // a no-op dead-code sweep is closed, so its stale agentTasks must not be stolen,
+  // re-dispatched or escalated either.
+  const ALL_TERMINAL_PHASES = ["cancelled", "complete", "deploy-blocked", "error", "nothing-to-remove", "static-ci-only"];
 
   /**
    * A ddb stub that EMULATES the server-side filter (makeDdb returns every row

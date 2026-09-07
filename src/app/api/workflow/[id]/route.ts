@@ -22,7 +22,12 @@ const REGION = process.env.AWS_REGION || "us-east-1";
 const WORKFLOWS_TABLE = process.env.WORKFLOWS_TABLE || "agentcore-hub-workflows";
 const EVENTS_TABLE = process.env.EVENTS_TABLE || "agentcore-hub-events";
 
-const TERMINAL_PHASES = ["complete", "error", "cancelled"] as const;
+// DELETE-only: a run must be finished before it can be deleted. TEAM-4247 D2 adds
+// "nothing-to-remove" so a no-op dead-code sweep is deletable like any other
+// closed run (without it, DELETE answers 409 "Cannot delete a running workflow"
+// for a run that has been over since the day it started). The ship-blocked
+// outcomes predate D2 and are left as they are.
+const TERMINAL_PHASES = ["complete", "error", "cancelled", "nothing-to-remove"] as const;
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: REGION }), {
   marshallOptions: { removeUndefinedValues: true },

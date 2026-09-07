@@ -56,6 +56,28 @@ export const REWORK_FIX_KINDS = new Set(["review_fix", "qa_fix", "codex_fix", "s
 export const SHIP_BLOCKED_OUTCOMES = ["deploy-blocked", "static-ci-only"];
 
 /**
+ * TEAM-4247 D2 — terminal outcomes for a run that had NOTHING TO DO. PARITY
+ * MIRROR of src/lib/workflow/types.ts NO_OP_OUTCOMES (and of RUN_OUTCOMES in
+ * save_analysis.py); run-outcome-parity.test.ts fails if they drift.
+ *   - "nothing-to-remove" : a dead-code sweep verified its candidates and found
+ *     none actually removable, so there is no branch, no PR, and nothing for a
+ *     reviewer / QA verifier / CI agent / human merge gate to act on.
+ *
+ * Kept SEPARATE from SHIP_BLOCKED_OUTCOMES on purpose: nothing was blocked here,
+ * and a no-op sweep must not trip the ship-verdict gates or the blocked-run
+ * alerting. The only thing the two lists share is terminality, which is why the
+ * merge happens in TERMINAL_WORKFLOW_PHASES below and nowhere else.
+ *
+ * NOTE for the D2 gates: neither isWorkflowComplete nor evaluateShipVerdict needs
+ * a change for this outcome. A no-op sweep closes through
+ * store.claimTerminalOutcome (like closeWorkflowBlocked) and therefore never
+ * enters completeWorkflow, so those two functions are not on its path; and
+ * evaluateShipVerdict only ever inspects done SHIP-phase children, which a sweep
+ * that never reached a ship phase does not have.
+ */
+export const NO_OP_OUTCOMES = ["nothing-to-remove"];
+
+/**
  * TEAM-3755 F2 — the ONE list of phases a run can already be closed on. Every
  * terminal-claim CAS must refuse ALL of them, or a later write can overwrite an
  * earlier honest verdict.
@@ -68,15 +90,17 @@ export const SHIP_BLOCKED_OUTCOMES = ["deploy-blocked", "static-ci-only"];
  * shipped. claimTerminalOutcome already listed all five; the two writes had
  * drifted apart because each spelled the list out by hand.
  *
- * Derived from SHIP_BLOCKED_OUTCOMES so a sixth outcome cannot be added to one
- * write and forgotten in the other. PARITY MIRROR of the TERMINAL_PHASES in
- * src/lib/workflow/types.ts (same five values, same purpose).
+ * Derived from SHIP_BLOCKED_OUTCOMES (and, since TEAM-4247 D2, NO_OP_OUTCOMES) so
+ * a further outcome cannot be added to one write and forgotten in the other.
+ * PARITY MIRROR of the TERMINAL_PHASES in src/lib/workflow/types.ts (same six
+ * values, same purpose).
  */
 export const TERMINAL_WORKFLOW_PHASES = Object.freeze([
   "complete",
   "cancelled",
   "error",
   ...SHIP_BLOCKED_OUTCOMES,
+  ...NO_OP_OUTCOMES,
 ]);
 
 /**

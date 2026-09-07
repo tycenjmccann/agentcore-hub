@@ -106,10 +106,20 @@ class OutcomeMapping(unittest.TestCase):
 class RunOutcomesConstant(unittest.TestCase):
     def test_constant_covers_new_and_legacy_values(self):
         # Parity guard for the phase->outcome mapping's accept-set. PARITY:
-        # src/lib/workflow/types.ts SHIP_BLOCKED_OUTCOMES + analysis-types.ts.
+        # src/lib/workflow/types.ts SHIP_BLOCKED_OUTCOMES + NO_OP_OUTCOMES +
+        # analysis-types.ts. TEAM-4247 D2 added "nothing-to-remove": without it the
+        # mapping's `else "complete"` fallback records a no-op dead-code sweep as a
+        # delivery, which is how no-op sweeps got into the delivery baselines.
         self.assertEqual(
             save_analysis.RUN_OUTCOMES,
-            {"complete", "cancelled", "error", "deploy-blocked", "static-ci-only"},
+            {
+                "complete",
+                "cancelled",
+                "error",
+                "deploy-blocked",
+                "static-ci-only",
+                "nothing-to-remove",
+            },
         )
 
 

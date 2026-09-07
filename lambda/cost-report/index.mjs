@@ -73,7 +73,11 @@ const INFRA_REFRESH_MS = 6 * 3600_000;
 const INDEX_CAP = 2000;
 /** CloudWatch rejects datapoints older than 2 weeks; leave a margin. */
 const METRIC_MAX_AGE_MS = 13 * 86_400_000;
-const TERMINAL_PHASES = new Set(["complete", "cancelled", "error", "deploy-blocked", "static-ci-only"]);
+/** Parity mirror of src/lib/workflow/types.ts TERMINAL_PHASES — TEAM-4247 D2 adds
+ *  "nothing-to-remove" so a no-op dead-code sweep is scanned and carded like any
+ *  other finished run. (Keeping it OUT of the performance baselines is a separate
+ *  question, handled where the baselines are built, not here.) */
+const TERMINAL_PHASES = new Set(["complete", "cancelled", "error", "deploy-blocked", "static-ci-only", "nothing-to-remove"]);
 
 const DEFAULT_PRICING = {
   models: {}, default: { input: 5.5, output: 27.5 }, cachedInputDiscount: 0.1,

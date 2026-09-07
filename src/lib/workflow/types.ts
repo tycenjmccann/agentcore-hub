@@ -146,9 +146,34 @@ export type AgentPhase = "requirements" | "design" | "development" | "verificati
 // PARITY — this list is the single source of truth. Mirror ANY change in:
 //   - lambda/orchestrator/completion.mjs           (SHIP_BLOCKED_OUTCOMES)
 //   - deploy/workflow-manager/toolkit/save_analysis.py (RUN_OUTCOMES)
+//   - deploy/workflow-manager/deploy.sh            (the EventBridge detail-type
+//     list on the analyzer rule — asserted by terminal-outcome-surfaces.test.ts)
 // (.mjs cannot import this TS module, and the toolkit is Python — hence mirrors.)
 export const SHIP_BLOCKED_OUTCOMES = ["deploy-blocked", "static-ci-only"] as const;
 export type ShipBlockedOutcome = (typeof SHIP_BLOCKED_OUTCOMES)[number];
+
+// TEAM-4247 D2 — terminal outcomes for a run that had NOTHING TO DO. Distinct
+// from the ship-blocked pair above: those mean "work existed and did not ship",
+// this means "the work the run was scheduled to do turned out not to exist":
+//   - "nothing-to-remove" : a dead-code sweep verified its candidates and found
+//     none actually removable (verified_removable === 0), so there is no branch,
+//     no PR, and nothing for a reviewer/QA/CI/merge gate to act on.
+// It is deliberately NOT a member of SHIP_BLOCKED_OUTCOMES — nothing was blocked,
+// and widening that list would make the ship gates and the analyzer's
+// blocked-run alerting fire on a healthy no-op.
+//
+// PARITY — same rule as SHIP_BLOCKED_OUTCOMES, mirror ANY change in:
+//   - lambda/orchestrator/completion.mjs               (NO_OP_OUTCOMES)
+//   - lambda/workflow-analyzer/index.mjs               (TERMINAL_PHASES literal)
+//   - lambda/anomaly-watcher/index.mjs                 (TERMINAL_PHASES literal)
+//   - lambda/cost-report/index.mjs                     (TERMINAL_PHASES literal)
+//   - deploy/workflow-manager/toolkit/save_analysis.py (RUN_OUTCOMES)
+//   - the workflow API routes that keep literal terminal sets (start, [id],
+//     [id]/analyze, [id]/archive)
+// `src/lib/workflow/run-outcome-parity.test.ts` reads the .mjs and .py sources as
+// text and fails if any of them drifts from this file.
+export const NO_OP_OUTCOMES = ["nothing-to-remove"] as const;
+export type NoOpOutcome = (typeof NO_OP_OUTCOMES)[number];
 
 export type WorkflowPhase =
   | "intake"
@@ -161,15 +186,23 @@ export type WorkflowPhase =
   | "complete"
   | "error"
   | "cancelled"
-  | ShipBlockedOutcome;
+  | ShipBlockedOutcome
+  | NoOpOutcome;
 
 // Every phase in which a run is FINISHED — the shared definition of "not open".
 // TEAM-3747 D2 folds the ship-blocked outcomes in additively, so a deploy-blocked
 // / static-ci-only run reads as terminal everywhere isTerminalPhase is used
-// (workflow list running/past split, etc.). The .mjs fleet (anomaly-watcher,
-// workflow-analyzer) and the /complete route keep their own literal mirrors of
-// this set — see the PARITY note above.
-export const TERMINAL_PHASES = ["complete", "error", "cancelled", ...SHIP_BLOCKED_OUTCOMES] as const;
+// (workflow list running/past split, etc.); TEAM-4247 D2 folds in the no-op
+// outcomes the same way. The .mjs fleet (anomaly-watcher, workflow-analyzer) and
+// the /complete route keep their own literal mirrors of this set — see the PARITY
+// notes above.
+export const TERMINAL_PHASES = [
+  "complete",
+  "error",
+  "cancelled",
+  ...SHIP_BLOCKED_OUTCOMES,
+  ...NO_OP_OUTCOMES,
+] as const;
 
 /** Whether a workflow phase is terminal (the run is finished). Unknown/legacy
  *  values are treated as non-terminal, exactly as before this helper existed. */

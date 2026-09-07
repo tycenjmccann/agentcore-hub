@@ -38,7 +38,12 @@ SCORE_KEYS = {"overall", "planning", "execution", "reviewEfficiency", "reworkDis
 # closed as deploy-blocked / static-ci-only is recorded HONESTLY (mapping the
 # phase straight through below) instead of masquerading as "complete". PARITY:
 # src/lib/workflow/types.ts SHIP_BLOCKED_OUTCOMES + analysis-types.ts RunOutcome.
-RUN_OUTCOMES = {"complete", "cancelled", "error", "deploy-blocked", "static-ci-only"}
+# TEAM-4247 D2 adds "nothing-to-remove" on the same terms: a dead-code sweep that
+# verified its candidates and found none removable is a real terminal outcome, and
+# the `else "complete"` fallback below is exactly what used to record such a run as
+# a delivery. PARITY: types.ts NO_OP_OUTCOMES + completion.mjs NO_OP_OUTCOMES —
+# src/lib/workflow/run-outcome-parity.test.ts reads this literal and fails on drift.
+RUN_OUTCOMES = {"complete", "cancelled", "error", "deploy-blocked", "static-ci-only", "nothing-to-remove"}
 
 
 def fail(msg):

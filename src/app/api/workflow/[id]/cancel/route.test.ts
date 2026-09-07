@@ -79,7 +79,10 @@ function workflowUpdates() {
 }
 
 describe("TEAM-3755 — cancel refuses every terminal phase, not just complete/error/cancelled", () => {
-  it.each(["deploy-blocked", "static-ci-only", "complete", "error", "cancelled"])(
+  // "nothing-to-remove" (TEAM-4247 D2) is in the list for the same reason as the
+  // ship-blocked pair: the run is over, and a cancel would overwrite the outcome
+  // that recorded WHY it was over.
+  it.each(["deploy-blocked", "static-ci-only", "nothing-to-remove", "complete", "error", "cancelled"])(
     "409s a %s workflow and never issues the CAS write",
     async (phase) => {
       h.state.workflow = { workflowId: "wf-1", epicId: "epic-1", phase };
@@ -96,7 +99,7 @@ describe("TEAM-3755 — cancel refuses every terminal phase, not just complete/e
     expect(workflowUpdates()).toHaveLength(1);
   });
 
-  it("the CAS ConditionExpression excludes all five terminal phases, not the old three-literal chain", async () => {
+  it("the CAS ConditionExpression excludes all six terminal phases, not the old three-literal chain", async () => {
     h.state.workflow = { workflowId: "wf-1", epicId: "epic-1", phase: "development" };
     await POST(makeRequest(), { params: { id: "wf-1" } });
     expect(workflowUpdates()).toHaveLength(1);
@@ -108,7 +111,9 @@ describe("TEAM-3755 — cancel refuses every terminal phase, not just complete/e
       .map(([, v]) => v)
       .sort();
     expect(excludedPhases).toEqual(
-      ["complete", "error", "cancelled", "deploy-blocked", "static-ci-only"].sort()
+      // TEAM-4247 D2: "nothing-to-remove" is terminal too — cancelling a no-op
+      // sweep after the fact would overwrite its honest outcome with "cancelled".
+      ["complete", "error", "cancelled", "deploy-blocked", "static-ci-only", "nothing-to-remove"].sort()
     );
   });
 });

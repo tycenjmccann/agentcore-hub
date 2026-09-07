@@ -49,7 +49,15 @@ const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: REGION }), 
 const lambda = new LambdaClient({ region: REGION });
 const s3 = new S3Client({ region: REGION });
 
-const TERMINAL_PHASES = new Set(["complete", "error", "cancelled"]);
+// Dedup-only: which phases mean the canonical run behind a dedup marker is
+// FINISHED, so a fresh start re-points the marker instead of coalescing onto it.
+// TEAM-4247 D2 adds "nothing-to-remove" — a dead-code sweep that found nothing
+// removable is over, and coalescing next week's scheduled sweep onto it would
+// return the closed run's id and start nothing at all. (This set deliberately
+// still omits the ship-blocked outcomes, which predate D2 and are a separate
+// question: coalescing onto a deploy-blocked run is arguably right, since its
+// work DID happen. Not widened here.)
+const TERMINAL_PHASES = new Set(["complete", "error", "cancelled", "nothing-to-remove"]);
 
 // TEAM-3699: how long after a dedup marker is claimed the canonical run is
 // still presumed IN-FLIGHT when its workflow row hasn't appeared yet. The

@@ -469,7 +469,9 @@ describe("TEAM-3755 F8 — the workflow scan excludes EVERY terminal phase", () 
     const keys = inList.split(",").map((k) => k.trim());
     return keys.map((k) => input.ExpressionAttributeValues[k]).sort();
   };
-  const ALL_TERMINAL_PHASES = ["cancelled", "complete", "deploy-blocked", "error", "static-ci-only"];
+  // TEAM-4247 D2 added the sixth ("nothing-to-remove"): the sweep must not
+  // re-drive parked work inside a run that closed as a no-op either.
+  const ALL_TERMINAL_PHASES = ["cancelled", "complete", "deploy-blocked", "error", "nothing-to-remove", "static-ci-only"];
 
   /**
    * A ddb stub that EMULATES the server-side filter (the real Scan applies it;
@@ -487,7 +489,7 @@ describe("TEAM-3755 F8 — the workflow scan excludes EVERY terminal phase", () 
     };
   }
 
-  it("refuses all five terminal phases, derived from the shared list", async () => {
+  it("refuses all six terminal phases, derived from the shared list", async () => {
     const s = makeSweep({ workflows: [workflow()], siblings: inProgressStale });
     await s.runSweep("enforce");
 

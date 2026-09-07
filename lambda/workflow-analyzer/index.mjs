@@ -42,7 +42,13 @@ const ANALYZE_DELAY_MS = Number(process.env.WM_ANALYZE_DELAY_MS || 30_000);
 // which save_analysis.py maps straight through RUN_OUTCOMES) instead of the line
 // ~126 fallback rewriting it to "complete", and so the watch loop treats it as
 // terminal. Additive; parity with completion.mjs SHIP_BLOCKED_OUTCOMES.
-const TERMINAL_PHASES = new Set(["complete", "cancelled", "error", "deploy-blocked", "static-ci-only"]);
+// TEAM-4247 D2 adds "nothing-to-remove" on the same terms: a dead-code sweep that
+// found nothing removable is FINISHED, and labelling that dossier "complete"
+// is exactly what made no-op sweeps read as deliveries. Note this set is asserted
+// against src/lib/workflow/types.ts TERMINAL_PHASES by
+// src/components/workflow/__tests__/terminal-outcome-surfaces.test.ts — it cannot
+// drift from the TS list even by one value.
+const TERMINAL_PHASES = new Set(["complete", "cancelled", "error", "deploy-blocked", "static-ci-only", "nothing-to-remove"]);
 /** 1-2 rework loops are normal; the 3rd fix ticket marks a loop anomaly. */
 const LOOP_ANOMALY_FIX_TICKETS = Number(process.env.WM_LOOP_ANOMALY_FIX_TICKETS || 3);
 
