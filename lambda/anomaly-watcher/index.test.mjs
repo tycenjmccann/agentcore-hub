@@ -53,6 +53,11 @@ import {
   renderEvidence,
 } from "./detect.mjs";
 import { validateBands, VERIFIED_EVENT_TYPES } from "./bands-schema.mjs";
+// The producer of the ids readEvents' `eventId > :cursor` compares. Pure
+// (node:crypto only), so importing it into anomaly-watcher's node --test suite
+// pulls in no AWS deps — it pins that the REAL id (not a hand-written literal)
+// keeps the 13-digit ms ordering class dropStaleItems/readEvents depend on.
+import { deterministicEventId } from "../orchestrator/event-id.mjs";
 
 // ─── fixtures ────────────────────────────────────────────────────────────────
 
@@ -1489,4 +1494,29 @@ test("TEAM-4120: a base36 events-writer id sorts BEFORE any decimal cursor — t
   assert.deepEqual(dropStaleItems([stale], cursor), [], "far-behind format artefact is ignored");
   // Under EVENT_DEDUPE_MODE=enforce the events-writer stops minting base36 ids
   // for non-streaming events, so this class of row simply stops appearing.
+});
+
+// TEAM-4167 D3 FR-3.4 — the previous three tests pin the ordering with a
+// hand-written DETERMINISTIC_ID literal; this one pins that the REAL producer
+// (lambda/orchestrator/event-id.mjs, now the default under enforce) actually
+// emits an id in that class, so a producer change can't silently break the
+// consumer's `eventId > :cursor` cursor advance.
+test("TEAM-4167: the real deterministicEventId keeps a 13-digit ms prefix and sorts after an earlier cursor", () => {
+  const early = deterministicEventId("agent.complete", { ticketId: "TEAM-1", timestamp: DECIMAL_CURSOR_TS });
+  // 500ms later → strictly greater as a STRING (what DynamoDB's range key uses).
+  const later = deterministicEventId("agent.complete", { ticketId: "TEAM-1", timestamp: "2026-09-05T12:00:00.500Z" });
+  assert.match(early, /^\d{13}-[0-9a-f]{8}$/, "13-digit decimal ms prefix + 8 hex");
+  assert.equal(early.split("-")[0].length, 13);
+  assert.ok(later > early, "a later event's real id sorts after an earlier one as a string");
+  // …and after a legacy decimal cursor at an earlier instant.
+  assert.ok(early > DECIMAL_CURSOR_ID);
+
+  // dropStaleItems keeps a batch of real deterministic-id rows whose timestamps
+  // sit inside the tolerance window — one row per event, none dropped.
+  const cursor = { lastEventId: DECIMAL_CURSOR_ID, lastTimestamp: DECIMAL_CURSOR_TS };
+  const rows = [
+    { eventId: early, timestamp: DECIMAL_CURSOR_TS, type: "agent.complete" },
+    { eventId: later, timestamp: "2026-09-05T12:00:00.500Z", type: "agent.complete" },
+  ];
+  assert.deepEqual(dropStaleItems(rows, cursor), rows);
 });

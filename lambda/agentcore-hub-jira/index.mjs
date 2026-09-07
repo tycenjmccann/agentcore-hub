@@ -712,14 +712,47 @@ async function transitionTicket(params) {
     throw new Error(`No transition to "${effectiveStatus}" found. Available: ${available}`);
   }
 
-  await jiraFetch(`/rest/api/3/issue/${ticket_id}/transitions`, {
-    method: "POST",
-    body: JSON.stringify({ transition: { id: match.id } }),
-  });
-
   const finalStatus = isSkip ? "done" : mapStatusToInternal(match.to.name);
+
+  // TEAM-4167 D3 FR-3.2: a Done transition must set a Jira `resolution`, or the
+  // issue closes "Unresolved" and JQL/`resolutiondate` never fire — the honest
+  // "when did this gate resolve" signal the cost-report / toolkit read. We set
+  // resolution on EVERY Done transition, not just human-review gates: a resolved
+  // Jira issue should always carry a resolution, and deriving human-ness here
+  // would cost an extra labels fetch for no benefit. (A run's gate tickets carry
+  // a `reviewer:` label, but non-gate agent tickets legitimately reach Done too,
+  // and Done-with-resolution is correct for all of them.)
+  const body = { transition: { id: match.id } };
+  if (finalStatus === "done") body.fields = { resolution: { name: "Done" } };
+
+  try {
+    await jiraFetch(`/rest/api/3/issue/${ticket_id}/transitions`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+  } catch (err) {
+    // Guarded fallback: some project transition screens don't expose the
+    // `resolution` field, so Jira 400s the whole transition when we set it. The
+    // transition must NEVER fail over resolution — retry ONCE with the bare body
+    // (no fields) and log jira.resolution_unsupported. Only a 400 with the
+    // resolution field triggers the retry; every other error still throws.
+    if (body.fields && /Jira API 400/.test(err.message)) {
+      console.warn(`[jira-tools] jira.resolution_unsupported ${ticket_id}: resolution field rejected (${err.message}) — retrying transition without it`);
+      await jiraFetch(`/rest/api/3/issue/${ticket_id}/transitions`, {
+        method: "POST",
+        body: JSON.stringify({ transition: { id: match.id } }),
+      });
+    } else {
+      throw err;
+    }
+  }
+
   console.log(`[jira-tools] Transitioned ${ticket_id} to ${finalStatus} in Jira`);
-  return { ticketId: ticket_id, status: finalStatus, message: `Transitioned to ${finalStatus}` };
+  const result = { ticketId: ticket_id, status: finalStatus, message: `Transitioned to ${finalStatus}` };
+  // resolvedAt marks a real Done resolution (parity with the DDB provider's row
+  // field); callers read it the same way regardless of backend.
+  if (finalStatus === "done") result.resolvedAt = new Date().toISOString();
+  return result;
 }
 
 async function updateTicket(params) {

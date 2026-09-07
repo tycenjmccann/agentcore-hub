@@ -794,6 +794,17 @@ async function transitionIssue(args) {
     exprValues[":bb"] = blockerList;
   }
 
+  // TEAM-4167 D3 FR-3.2: stamp resolvedAt on the row the moment a ticket reaches
+  // done (additive — never clobbers status/updatedAt). Parity with the Jira
+  // provider, which sets a Jira `resolution`+resolvedAt on its Done transition;
+  // both providers return resolvedAt so the caller reads it the same way.
+  const isDone = transition.to === "done";
+  if (isDone) {
+    updateExpr += ", #ra = :ra";
+    exprNames["#ra"] = "resolvedAt";
+    exprValues[":ra"] = now;
+  }
+
   await ddb.send(
     new UpdateCommand({
       TableName: TABLE_NAME,
@@ -811,6 +822,7 @@ async function transitionIssue(args) {
     to: transition.to,
     transition: transition.name,
     ...(reason ? { skipReason: reason } : {}),
+    ...(isDone ? { resolvedAt: now } : {}),
   };
 }
 

@@ -89,6 +89,7 @@ export const FLEET_KPIS: KpiDef[] = [
   { key: "time.active", label: "Active", unit: "ms", group: "time", floor: 900_000, help: "Wall-clock minus time waiting on human gates" },
   { key: "time.agentWork", label: "Agent work", unit: "ms", group: "time", floor: 900_000, help: "Sum of agent task durations (agents actually working)" },
   { key: "time.humanWait", label: "Human wait", unit: "ms", group: "time", floor: 900_000, help: "Union of open review-gate intervals" },
+  { key: "time.utilization", label: "Utilization", unit: "ratio", group: "time", floor: 0.1, direction: "lower", help: "busy ÷ active (clamped 0-1)" },
   { key: "quality.tasks", label: "Agent tasks", unit: "count", group: "quality", floor: 1, help: "Tickets worked by agents (fewer = tighter pipeline)" },
   { key: "quality.reworkRounds", label: "Rework rounds", unit: "count", group: "quality", floor: 1, help: "Re-invocations of a ticket after its first run" },
   { key: "quality.loops", label: "Loops", unit: "count", group: "quality", floor: 1, help: "Change requests + fix tickets — times the pipeline went back" },
@@ -319,7 +320,11 @@ export function formatKpi(unit: KpiUnit, v: number | null | undefined, compact =
       return `${Math.floor(h / 24)}d ${h % 24}h`;
     }
     case "tokens": return v >= 1e6 ? `${(v / 1e6).toFixed(1)}M` : `${Math.round(v / 1000)}k`;
-    case "ratio": return `${Math.round(v * 100)}%`;
+    // Ratios are shares in [0,1] (utilization, first-pass yield, cache hit
+    // rate). A legacy card that stored a busy/active ratio unclamped (e.g.
+    // 981.51 from a pre-fix cost-report) would render as "98151%"; clamp the
+    // DISPLAY so it reads as a sane 100%. The stored/compute path is unchanged.
+    case "ratio": return `${Math.round(Math.min(1, Math.max(0, v)) * 100)}%`;
     default: return Number.isInteger(v) ? String(v) : v.toFixed(1);
   }
 }

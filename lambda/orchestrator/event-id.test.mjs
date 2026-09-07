@@ -258,6 +258,73 @@ describe("normalizeEventDedupeMode — strict allow-list, everything else is off
   });
 });
 
+describe("normalizeEventDedupeMode — defaultMode param (TEAM-4167 D3 FR-3.4)", () => {
+  it("an unset/empty value takes the caller's defaultMode", () => {
+    // The three producers now pass "enforce", so a missing env var collapses the
+    // twin write by default — the whole point of FR-3.4.
+    expect(normalizeEventDedupeMode("", "enforce")).toBe("enforce");
+    expect(normalizeEventDedupeMode(undefined, "enforce")).toBe("enforce");
+    expect(normalizeEventDedupeMode(null, "enforce")).toBe("enforce");
+    expect(normalizeEventDedupeMode("   ", "enforce")).toBe("enforce");
+  });
+
+  it("an EXACT \"off\" still opts out even when the default is enforce (instant rollback)", () => {
+    expect(normalizeEventDedupeMode("off", "enforce")).toBe("off");
+    expect(normalizeEventDedupeMode("  OFF ", "enforce")).toBe("off");
+  });
+
+  it("an explicit \"enforce\" is honored under either default", () => {
+    expect(normalizeEventDedupeMode("enforce", "off")).toBe("enforce");
+    expect(normalizeEventDedupeMode("enforce", "enforce")).toBe("enforce");
+  });
+
+  it("garbage falls to the default and warns which way it fell", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    expect(normalizeEventDedupeMode("shadow", "enforce")).toBe("enforce");
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][0]).toContain('using default "enforce"');
+    // Same garbage, "off" default → off.
+    warn.mockClear();
+    expect(normalizeEventDedupeMode("shadow", "off")).toBe("off");
+    expect(warn.mock.calls[0][0]).toContain('using default "off"');
+  });
+
+  it("the single-arg default stays \"off\" (pre-4167 callers byte-identical)", () => {
+    expect(normalizeEventDedupeMode("")).toBe("off");
+    expect(normalizeEventDedupeMode("enforce")).toBe("enforce");
+  });
+});
+
+describe("twin write collapse under enforce (TEAM-4167 D3 FR-3.4)", () => {
+  // The direct-write producer (publishEvent) and the EventBridge-fanned producer
+  // (events-writer) each mint their eventId through eventIdFor with their OWN
+  // legacy generator. Under enforce both ignore the legacy fn and derive the id
+  // from content, so the two Puts land on the SAME (workflowId, eventId) and the
+  // second overwrites the first — one row per event instead of two.
+  it("the direct path and the events-writer path produce an identical eventId", () => {
+    const direct = eventIdFor("enforce", "review.resolved", TICKET_DETAIL, () => `${Date.now()}-directRand`);
+    const writer = eventIdFor("enforce", "review.resolved", TICKET_DETAIL, () => `${Date.now()}-writerRand`);
+    expect(direct).toBe(writer);
+    expect(direct).toBe(deterministicEventId("review.resolved", TICKET_DETAIL));
+    expect(direct).toMatch(ID_RE);
+  });
+
+  it("the collapse key (workflowId, eventId) is identical for both writers", () => {
+    // workflowId is a table key attribute both writers copy verbatim from detail;
+    // the eventId is what could diverge, and enforce makes it converge.
+    const key = (fn) => `${TICKET_DETAIL.workflowId}|${eventIdFor("enforce", "review.resolved", TICKET_DETAIL, fn)}`;
+    expect(key(() => "a")).toBe(key(() => "b"));
+  });
+
+  it("under off the two writers keep DISTINCT (legacy) ids — the pre-collapse behavior", () => {
+    const direct = eventIdFor("off", "review.resolved", TICKET_DETAIL, () => "DIRECT");
+    const writer = eventIdFor("off", "review.resolved", TICKET_DETAIL, () => "WRITER");
+    expect(direct).toBe("DIRECT");
+    expect(writer).toBe("WRITER");
+    expect(direct).not.toBe(writer);
+  });
+});
+
 describe("eventIdFor — the single call site the three writers share", () => {
   const legacy = () => "LEGACY-ID";
 

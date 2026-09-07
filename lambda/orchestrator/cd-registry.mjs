@@ -102,21 +102,28 @@ export function isCdRegistered(registry, repoConfig) {
  * else (phase order, intake agent, feature-branch/PR flags) is untouched, so
  * the run still creates its branch and gets its PR at completion.
  *
+ * A gate with condition:"cdRegistered" is ALSO dropped here regardless of the
+ * phase it guards (D3a): "cdRegistered" means "present only when the repo is
+ * CD-registered", and this is the not-registered (handoff) path — so such a
+ * gate is auto-absent by definition, not just when its afterPhase is "ship".
+ *
  * Returns the def itself when nothing needs stripping (registered repo, or a
- * def with no ship phase) — call sites can rely on identity in that case.
+ * def with no ship phase and no cdRegistered gate) — call sites can rely on
+ * identity in that case.
  */
 export function stripShipPhases(def, shipPhases) {
   if (!def) return def;
   const ship = shipPhases instanceof Set ? shipPhases : new Set(shipPhases || ["ship"]);
+  const dropGate = (g) => ship.has(g?.afterPhase) || g?.condition === "cdRegistered";
   const required = Array.isArray(def.completionRequiresAgentPhases) ? def.completionRequiresAgentPhases : [];
   const gates = Array.isArray(def.reviewGates) ? def.reviewGates : [];
   const hasShipPhase = required.some((p) => ship.has(p));
-  const hasShipGate = gates.some((g) => ship.has(g?.afterPhase));
-  if (!hasShipPhase && !hasShipGate) return def;
+  const hasDroppableGate = gates.some(dropGate);
+  if (!hasShipPhase && !hasDroppableGate) return def;
   return {
     ...def,
     completionRequiresAgentPhases: required.filter((p) => !ship.has(p)),
-    reviewGates: gates.filter((g) => !ship.has(g?.afterPhase)),
+    reviewGates: gates.filter((g) => !dropGate(g)),
     cdHandoff: true,
   };
 }

@@ -10,7 +10,7 @@
  * the wrong intake agent. This loader + a hard 400 on unknown ids is the fix.
  */
 
-import { WORKFLOW_DEFS, type WorkflowDef } from "@/lib/workflow/workflow-defs";
+import { WORKFLOW_DEFS, lintWorkflowDefShape, type WorkflowDef } from "@/lib/workflow/workflow-defs";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const ARTIFACT_BUCKET = process.env.ARTIFACT_BUCKET || "";
@@ -35,24 +35,42 @@ export async function loadWorkflowDefs(): Promise<WorkflowDef[]> {
   const now = Date.now();
   if (_cache && now - _cache.at < TTL_MS) return _cache.defs;
 
-  if (!ARTIFACT_BUCKET) return WORKFLOW_DEFS;
-
-  try {
-    const { S3Client, GetObjectCommand } = await import("@aws-sdk/client-s3");
-    const s3 = new S3Client({ region: REGION });
-    const obj = await s3.send(
-      new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: "config/workflows.json" })
-    );
-    const doc = JSON.parse(await obj.Body!.transformToString());
-    const s3Defs: WorkflowDef[] = Array.isArray(doc) ? doc : doc.workflows || [];
-    const defs = merge(s3Defs);
-    _cache = { defs, at: now };
-    return defs;
-  } catch {
-    // S3 unavailable → bundled defs so checked-in workflows still resolve.
-    // S3-only routine defs will be absent → the caller 400s (correct).
-    return WORKFLOW_DEFS;
+  // Resolve the def set: live S3 (merged over bundled) when reachable, else the
+  // bundled defs. ONLY the S3-fetch failure falls back here — the honesty lint
+  // below is deliberately OUTSIDE this catch so a dishonest ship gate throws
+  // instead of being swallowed into a silent bundled fallback.
+  let defs: WorkflowDef[];
+  // Only a successful S3 load is cached. The fetch-FAILURE fallback stays
+  // UNCACHED (as before this change) so the next call retries S3 rather than
+  // serving bundled for the whole TTL after one transient blip.
+  let cacheable = true;
+  if (!ARTIFACT_BUCKET) {
+    defs = WORKFLOW_DEFS;
+  } else {
+    try {
+      const { S3Client, GetObjectCommand } = await import("@aws-sdk/client-s3");
+      const s3 = new S3Client({ region: REGION });
+      const obj = await s3.send(
+        new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: "config/workflows.json" })
+      );
+      const doc = JSON.parse(await obj.Body!.transformToString());
+      const s3Defs: WorkflowDef[] = Array.isArray(doc) ? doc : doc.workflows || [];
+      defs = merge(s3Defs);
+    } catch {
+      // S3 unavailable → bundled defs so checked-in workflows still resolve.
+      // S3-only routine defs will be absent → the caller 400s (correct).
+      defs = WORKFLOW_DEFS;
+      cacheable = false;
+    }
   }
+
+  // Load-time honesty lint (repo-agnostic, D3a). Applies to EVERY def — bundled
+  // and S3-only alike — so a checked-in OR routine-authored dishonest ship gate
+  // fails loudly at load. Throws; not caught by the fetch fallback above.
+  for (const d of defs) lintWorkflowDefShape(d);
+
+  if (cacheable) _cache = { defs, at: now };
+  return defs;
 }
 
 /** Resolve one def by id from the live (S3) set. Returns null for unknown ids —

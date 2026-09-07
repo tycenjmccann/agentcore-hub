@@ -13,7 +13,19 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
  * because a downstream reader must never have to guess what a novel value meant.
  */
 
-const h = vi.hoisted(() => ({ puts: [], warns: [] }));
+const h = vi.hoisted(() => ({
+  puts: [], warns: [], invokes: [],
+  // TEAM-4167 D3 FR-3.2 (TEAM-4156-class): the fake MUST mirror the real
+  // ticket-tools Done response, or a test passes against a shape production never
+  // produces. Both providers return a top-level `resolvedAt` ISO string on a done
+  // transition (Jira: {ticketId,status,message,resolvedAt}; DDB adds key/from/to)
+  // — pinned in agentcore-hub-jira/transition-resolution.test.mjs and
+  // agentcore-hub-tickets/index.test.mjs. report_completion reads only `.error`,
+  // so the extra field is harmless here, but the fake carries it for fidelity.
+  transitionDoneResponse: (ticketId) => ({
+    ticketId, status: "done", message: "Transitioned to done", resolvedAt: "2026-09-05T12:00:00.000Z",
+  }),
+}));
 
 vi.mock("@aws-sdk/client-s3", () => ({
   S3Client: class {
@@ -28,8 +40,19 @@ vi.mock("@aws-sdk/client-s3", () => ({
 }));
 vi.mock("@aws-sdk/s3-request-presigner", () => ({ getSignedUrl: async () => "https://signed" }));
 vi.mock("@aws-sdk/client-lambda", () => ({
-  // The Done transition is not under test; a plain success keeps the log quiet.
-  LambdaClient: class { async send() { return { Payload: new TextEncoder().encode(JSON.stringify({ ok: true })) }; } },
+  // Tool-aware fake: transition_ticket(done) returns the REAL provider shape
+  // (incl. resolvedAt); everything else returns a plain success to keep the log
+  // quiet. Captures each decoded invoke payload for the contract assertion.
+  LambdaClient: class {
+    async send(cmd) {
+      const payload = JSON.parse(Buffer.from(cmd.input.Payload).toString());
+      h.invokes.push(payload);
+      const body = payload.tool_name?.endsWith("transition_ticket") && payload.parameters?.transition_id === "done"
+        ? h.transitionDoneResponse(payload.parameters.ticket_id)
+        : { ok: true };
+      return { Payload: new TextEncoder().encode(JSON.stringify(body)) };
+    }
+  },
   InvokeCommand: class { constructor(input) { this.input = input; } },
 }));
 vi.mock("@aws-sdk/client-dynamodb", () => ({ DynamoDBClient: class {} }));
@@ -63,7 +86,32 @@ const BASE_KEYS = ["ticket_id", "summary", "artifacts", "branch", "commit_sha", 
 beforeEach(() => {
   h.puts.length = 0;
   h.warns.length = 0;
+  h.invokes.length = 0;
   vi.spyOn(console, "warn").mockImplementation((...args) => h.warns.push(args.join(" ")));
+});
+
+// TEAM-4167 D3 FR-3.2 — report_completion's Done transition invoke, and the
+// contract that the fake mirrors the real provider's response.
+describe("report_completion — transition_ticket(done) invoke (TEAM-4167 D3 FR-3.2 contract)", () => {
+  const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+
+  it("invokes Tickets___transition_ticket with transition_id done and completes", async () => {
+    const res = await report({});
+    const invoke = h.invokes.find((p) => p.tool_name === "Tickets___transition_ticket");
+    expect(invoke).toBeTruthy();
+    expect(invoke.parameters).toMatchObject({ ticket_id: "TEAM-4200", transition_id: "done" });
+    // The richer real shape (resolvedAt) does not disturb report_completion,
+    // which reads only `.error`. (The handler wraps the tool result in content[].)
+    expect(JSON.parse(res.content[0].text).status).toBe("complete");
+  });
+
+  it("the fake response mirrors the real provider Done shape (carries resolvedAt)", () => {
+    // Pins the fake against reality: both providers' contract tests assert a
+    // top-level resolvedAt ISO string, so this fake must too.
+    const shape = h.transitionDoneResponse("TEAM-4200");
+    expect(shape.status).toBe("done");
+    expect(shape.resolvedAt).toMatch(ISO_RE);
+  });
 });
 
 describe("report_completion — evidence_kind / evidence_keys", () => {

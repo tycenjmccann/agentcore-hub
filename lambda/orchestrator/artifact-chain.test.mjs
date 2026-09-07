@@ -31,11 +31,15 @@ describe("framework overlay (software-delivery + playbook)", () => {
     expect(chainDir(playbook, "wf_1")).toBe(".sdlc/wf_1");
     expect(playbook.label).toBeUndefined(); // overlay-only presentation fields do not leak onto the def
   });
-  it("every playbook gate is human-assigned; all but the per-role Design Review are always-on", () => {
+  it("every playbook gate is human-assigned; ship gate is cdRegistered, per-role Design Review is flagged, the rest always-on", () => {
     for (const g of playbook.reviewGates) {
       expect(g.blocking).toBe(true);
       expect(g.assignee.startsWith("human:")).toBe(true);
-      expect(g.condition).toBe(g.scope === "role" ? "flagged" : "always");
+      // TEAM-4167 D3a: a ship gate must never be condition:"always" (a phantom
+      // human expectation on a handoff run) — it is "cdRegistered" (auto-absent
+      // on handoff). The per-role Design Review stays "flagged"; all else always-on.
+      const expected = g.afterPhase === "ship" ? "cdRegistered" : g.scope === "role" ? "flagged" : "always";
+      expect(g.condition).toBe(expected);
     }
     expect(playbook.reviewGates.map((g) => g.name)).toEqual([
       "Intent Acceptance", "Spec Approval", "Design Review", "Design Approval", "Plan Approval", "Merge Approval",

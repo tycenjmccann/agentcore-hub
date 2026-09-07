@@ -61,8 +61,16 @@ export interface ReviewGate {
    * free label. Omitted → "human:reviewer" (anyone watching the board).
    */
   assignee?: string;
-  /** "always" → gate always inserted; "flagged" → only when the run requests it. */
-  condition: "always" | "flagged";
+  /**
+   * When this gate is inserted into the run:
+   *   "always"       → inserted on every run of this def, regardless of repo.
+   *   "flagged"      → inserted only when the run explicitly requests it.
+   *   "cdRegistered" → inserted only when the target repo is CD-registered, so a
+   *                    ship gate is AUTO-ABSENT on a handoff run — no strip, no
+   *                    phantom human expectation (D3a option B). This is the
+   *                    honest declaration for any ship-phase gate.
+   */
+  condition: "always" | "flagged" | "cdRegistered";
   /** On "Request changes": "rework" re-opens the upstream work, "hold" just pauses. */
   onReject: "rework" | "hold";
   /**
@@ -181,6 +189,122 @@ export function resolveReviewGateCap(gate: ReviewGate): {
       gate.regressionCountsDouble ?? REVIEW_GATE_CAP_DEFAULTS.regressionCountsDouble,
     onCapReached: gate.onCapReached ?? REVIEW_GATE_CAP_DEFAULTS.onCapReached,
   };
+}
+
+/**
+ * Agent phases whose review gate is a SHIP gate — a human merge/deploy approval
+ * that only makes sense on a CD-registered repo. On a handoff run the ship phase
+ * carries no work and is stripped, so a ship gate that ignores delivery mode
+ * (condition:"always") becomes an unreachable, phantom human expectation. Keep
+ * in sync with the orchestrator's ship-phase set (lambda/orchestrator passes
+ * ["ship"] to stripShipPhases in cd-registry.mjs).
+ */
+export const SHIP_PHASES: readonly string[] = ["ship"];
+
+/**
+ * Repo-AGNOSTIC honesty lint for a def's SHAPE: a ship-phase gate must never be
+ * condition:"always", because "always" ignores delivery mode and turns into a
+ * phantom human expectation on any handoff run of the def. The honest choices
+ * are "cdRegistered" (present only when the repo is registered) or "flagged"
+ * (opt-in per run).
+ *
+ * Validates the def's own reviewGates AND every framework overlay's reviewGates
+ * — overlays REPLACE the gate set (a framework's reviewGates fully substitute
+ * the base def's), and the playbook overlay is exactly where a dishonest ship
+ * gate can hide even when the base def is clean. Throws on the first offender,
+ * naming the def, the framework (if any), and the gate.
+ *
+ * This is the load-time gate (defs-loader) — it needs no repo, so it can fail a
+ * checked-in or S3-only def the moment it is loaded.
+ */
+export function lintWorkflowDefShape(def: WorkflowDef): void {
+  const check = (gates: ReviewGate[] | undefined, where: string) => {
+    for (const gate of gates || []) {
+      if (SHIP_PHASES.includes(gate.afterPhase) && gate.condition === "always") {
+        const label = gate.name ?? gate.afterPhase;
+        throw new Error(
+          `Workflow def "${def.id}"${where}: ship gate "${label}" has condition:"always"; ` +
+            `ship gates must be condition:"cdRegistered" or "flagged".`
+        );
+      }
+    }
+  };
+  check(def.reviewGates, "");
+  for (const [name, overlay] of Object.entries(def.frameworks || {})) {
+    check(overlay?.reviewGates, ` (framework "${name}")`);
+  }
+}
+
+/** Soft findings from {@link validateWorkflowDef} the caller should log. */
+export interface ValidateWorkflowDefResult {
+  warnings: string[];
+}
+
+/**
+ * Repo-AWARE validation of a resolved (framed) def against ONE run's delivery
+ * mode. Called at run creation, before any epic/ticket exists, so a misconfig
+ * fails as an HTTP 400 rather than a wedged run.
+ *
+ * THROWS (hard errors):
+ *   - a ship-phase gate with condition:"always" on a repo that is NOT
+ *     CD-registered — the ship phase is stripped on handoff, so the gate is
+ *     unreachable (a phantom human expectation that would wedge the run).
+ *   - any reviewGate.afterPhase that is not a known phase of this def
+ *     (getPhaseOrder) — a gate guarding a phase that never runs.
+ *
+ * RETURNS warnings (does NOT throw):
+ *   - completionRequiresAgentPhases lists a ship phase but no ship gate survives
+ *     on a CD-registered repo — completion hinges on a phase with no human gate.
+ *
+ * Pure: no AWS, no clock. The caller supplies cdRegistered (computed the same
+ * way the orchestrator resolves delivery mode: primary repo vs the CD registry).
+ */
+export function validateWorkflowDef(
+  def: WorkflowDef,
+  opts: { cdRegistered: boolean }
+): ValidateWorkflowDefResult {
+  const warnings: string[] = [];
+  // A gate may guard a display-only rollup phase (software-delivery's "ship" and
+  // "review" are extraAgentPhases folded onto the QA card, not standalone
+  // getPhaseOrder entries), so the known-phase set is the phase ORDER plus every
+  // phase's extraAgentPhases — the same universe completionRequiresAgentPhases
+  // draws from.
+  const order = getPhaseOrder(def);
+  const known = new Set([...order, ...def.phases.flatMap((p) => p.extraAgentPhases || [])]);
+  const gates = def.reviewGates || [];
+
+  for (const gate of gates) {
+    const label = gate.name ?? gate.afterPhase;
+    if (!known.has(gate.afterPhase)) {
+      throw new Error(
+        `Workflow def "${def.id}" declares review gate "${label}" with afterPhase="${gate.afterPhase}", ` +
+          `which is not a phase of this def (known phases: ${[...known].join(", ")}).`
+      );
+    }
+    if (SHIP_PHASES.includes(gate.afterPhase) && gate.condition === "always" && !opts.cdRegistered) {
+      throw new Error(
+        `Workflow def "${def.id}" declares review gate "${label}" (afterPhase="ship", condition="always") ` +
+          `but the target repo is not CD-registered. A ship gate on a handoff run is unreachable — ` +
+          `set condition:"cdRegistered" (auto-absent on handoff) or register the repo. See docs/agents-own-cd.md.`
+      );
+    }
+  }
+
+  // A ship phase in the completion set with no surviving ship gate on a
+  // registered repo: a warning, not a throw. "flagged" gates do not survive by
+  // default, so they don't count; "always"/"cdRegistered" do.
+  const requiresShip = (def.completionRequiresAgentPhases || []).some((p) => SHIP_PHASES.includes(p));
+  if (requiresShip && opts.cdRegistered) {
+    const surviving = gates.some((g) => SHIP_PHASES.includes(g.afterPhase) && g.condition !== "flagged");
+    if (!surviving) {
+      warnings.push(
+        `Workflow def "${def.id}" requires a ship phase for completion but declares no ship review gate ` +
+          `on a CD-registered repo — completion will not wait on any human merge approval.`
+      );
+    }
+  }
+
+  return { warnings };
 }
 
 export interface WorkflowDef {
