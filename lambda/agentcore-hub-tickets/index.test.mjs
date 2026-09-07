@@ -727,6 +727,14 @@ describe("transition_ticket — reaching done from in_progress vs from blocked (
  * reaches done, so the caller reads it the same way regardless of backend. This
  * pins the REAL handler response (not a fake) AND that resolvedAt is persisted to
  * the row (additive — never at the cost of status/updatedAt).
+ *
+ * TEAM-4262 (r2-F3) adds `resolutionSet` to that parity surface. On THIS provider it
+ * is always true on done: the Lambda writes the resolvedAt column itself, so there
+ * is no transition screen that can reject it and nothing to read back. The field
+ * exists for the Jira side, whose Done transition falls back to a bare body when a
+ * project omits `fields.resolution` — leaving the issue Done with no resolution, and
+ * reporting resolutionSet:false rather than claiming one. Both keys are absent on a
+ * non-done transition, so a caller can tell the branches apart.
  */
 describe("transition_ticket — resolvedAt on Done (TEAM-4167 D3 FR-3.2 contract)", () => {
   const ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
@@ -739,6 +747,9 @@ describe("transition_ticket — resolvedAt on Done (TEAM-4167 D3 FR-3.2 contract
 
     expect(res.to).toBe("done");
     expect(res.resolvedAt).toMatch(ISO_RE);
+    // TEAM-4262 — always true here: this provider sets the field itself, so a
+    // resolvedAt on the response is always backed by a real write.
+    expect(res.resolutionSet).toBe(true);
     // Persisted additively: the row write carries resolvedAt alongside status.
     const upd = h.state.statusUpdates[0];
     expect(upd.ExpressionAttributeNames["#ra"]).toBe("resolvedAt");
@@ -754,6 +765,11 @@ describe("transition_ticket — resolvedAt on Done (TEAM-4167 D3 FR-3.2 contract
 
     expect(res.to).toBe("in_progress");
     expect("resolvedAt" in res).toBe(false);
+    // TEAM-4262 — neither resolution key appears off the done path. (On done the
+    // Jira provider holds resolvedAt as null rather than omitting it, so key
+    // ABSENCE is what marks a non-done transition on both providers.)
+    expect("resolutionSet" in res).toBe(false);
+    expect("resolutionFallback" in res).toBe(false);
     expect(h.state.statusUpdates[0].UpdateExpression).not.toContain("resolvedAt");
   });
 });

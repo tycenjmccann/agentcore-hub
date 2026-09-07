@@ -725,9 +725,21 @@ async function transitionTicket(params) {
   // would cost an extra labels fetch for no benefit. (A run's gate tickets carry
   // a `reviewer:` label, but non-gate agent tickets legitimately reach Done too,
   // and Done-with-resolution is correct for all of them.)
+  //
+  // TEAM-4262 (r2-F3) — the response distinguishes "status transitioned" from
+  // "resolution actually set". The resolution is set BY CONSTRUCTION only when Jira
+  // accepts the resolution-bearing body; on the bare-body fallback below it is READ
+  // BACK, and an unconfirmed resolution is reported as resolvedAt:null +
+  // resolutionSet:false rather than guessed. Stamping resolvedAt on every
+  // finalStatus === "done" made the fallback path indistinguishable from the
+  // accepted one, so on exactly the projects FR-3.2 exists for the issue was Done
+  // with no resolution and no resolutiondate while this response claimed a precise
+  // resolution instant — the "Done but resolved=None" dishonesty itself.
+  const wantsResolution = finalStatus === "done";
   const body = { transition: { id: match.id } };
-  if (finalStatus === "done") body.fields = { resolution: { name: "Done" } };
+  if (wantsResolution) body.fields = { resolution: { name: "Done" } };
 
+  let resolutionFallback = false;
   try {
     await jiraFetch(`/rest/api/3/issue/${ticket_id}/transitions`, {
       method: "POST",
@@ -739,8 +751,13 @@ async function transitionTicket(params) {
     // transition must NEVER fail over resolution — retry ONCE with the bare body
     // (no fields) and log jira.resolution_unsupported. Only a 400 with the
     // resolution field triggers the retry; every other error still throws.
+    //
+    // TEAM-4262: taking this path means the resolution was NOT set by the
+    // transition, so `resolutionFallback` sends the result below through the
+    // read-back instead of letting it assume a resolution landed.
     if (body.fields && /Jira API 400/.test(err.message)) {
       console.warn(`[jira-tools] jira.resolution_unsupported ${ticket_id}: resolution field rejected (${err.message}) — retrying transition without it`);
+      resolutionFallback = true;
       await jiraFetch(`/rest/api/3/issue/${ticket_id}/transitions`, {
         method: "POST",
         body: JSON.stringify({ transition: { id: match.id } }),
@@ -753,9 +770,56 @@ async function transitionTicket(params) {
   console.log(`[jira-tools] Transitioned ${ticket_id} to ${finalStatus} in Jira`);
   const result = { ticketId: ticket_id, status: finalStatus, message: `Transitioned to ${finalStatus}` };
   // resolvedAt marks a real Done resolution (parity with the DDB provider's row
-  // field); callers read it the same way regardless of backend.
-  if (finalStatus === "done") result.resolvedAt = new Date().toISOString();
+  // field); callers read it the same way regardless of backend. TEAM-4262: on a
+  // done transition the key is always PRESENT — an ISO string or null — so a caller
+  // can tell "not a Done transition" from "Done, resolution unconfirmed".
+  if (wantsResolution && !resolutionFallback) {
+    // Jira accepted the resolution-bearing body, so the resolution is set by
+    // construction — no read-back needed, and the happy path keeps its call count.
+    result.resolvedAt = new Date().toISOString();
+    result.resolutionSet = true;
+  } else if (wantsResolution) {
+    result.resolutionFallback = true;
+    const confirmed = await confirmJiraResolution(ticket_id);
+    result.resolvedAt = confirmed.resolvedAt;
+    result.resolutionSet = confirmed.resolutionSet;
+    if (!confirmed.resolutionSet) {
+      console.warn(
+        `[jira-tools] jira.resolution_unset ${ticket_id}: transitioned to Done but Jira ` +
+        `resolution is unset (transition screen rejected fields.resolution` +
+        `${confirmed.readbackError ? `; read-back failed: ${confirmed.readbackError}` : ""}) ` +
+        `— resolutiondate will not fire`
+      );
+    }
+  }
   return result;
+}
+
+/**
+ * TEAM-4262 (r2-F3) — after the bare-body fallback, ASK Jira whether a resolution
+ * actually landed instead of assuming it did. One GET, only on that path.
+ *
+ * Read-only on purpose: a PUT of fields.resolution via the edit endpoint is
+ * project-screen-dependent and not verifiable here, so we report honestly rather
+ * than fabricate. Never throws — the transition has ALREADY succeeded, and losing a
+ * real status change over a verification GET would be strictly worse than an
+ * unconfirmed resolution. A read-back failure is reported as UNCONFIRMED
+ * (resolutionSet false), never as confirmed.
+ */
+async function confirmJiraResolution(ticketId) {
+  try {
+    const issue = await jiraFetch(`/rest/api/3/issue/${ticketId}?fields=resolution,resolutiondate`);
+    if (!issue?.fields?.resolution) return { resolutionSet: false, resolvedAt: null };
+    // A team-managed project can auto-set the resolution even though the transition
+    // screen rejected the field, so this really does come back true sometimes.
+    const ms = Date.parse(issue.fields.resolutiondate);
+    return {
+      resolutionSet: true,
+      resolvedAt: Number.isNaN(ms) ? new Date().toISOString() : new Date(ms).toISOString(),
+    };
+  } catch (err) {
+    return { resolutionSet: false, resolvedAt: null, readbackError: err.message };
+  }
 }
 
 async function updateTicket(params) {
