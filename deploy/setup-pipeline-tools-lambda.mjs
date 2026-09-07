@@ -256,6 +256,13 @@ async function main() {
         : "StartBuild not granted (PIPELINE_CI_START_BUILD unset)"
     }`
   );
+  if (PIPELINE_CI_START_BUILD !== "1") {
+    console.log(
+      "          → the CI agent cannot certify a PR head SHA (capabilities startCiBuild:false, " +
+        "start_ci_build → start_build_not_granted). Re-run with PIPELINE_CI_START_BUILD=1 to grant " +
+        "it — see deploy/pipeline/README.md 'Runbook: CodeBuild-certified CI for PRs'."
+    );
+  }
 
   // ─── 1. IAM role (scoped to exactly this pipeline + its three CodeBuild projects) ─
   const inlinePolicy = buildInlinePolicy({ ...cfg, ACCOUNT });

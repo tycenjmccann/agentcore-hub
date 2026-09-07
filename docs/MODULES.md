@@ -322,6 +322,18 @@ CloudWatch Logs. Deploy role is deliberately narrow (Lambda code-only, no
   (defaults `agentcore-hub-deploy` / `agentcore-hub-build` / `agentcore-hub-ci`).
 - `PIPELINE_CI_WEBHOOK` — CDK-time flag turning on the CodeBuild PR-check
   webhook (default OFF; required PR checks today come from GitHub Actions).
+  Must be re-passed on every `deploy/pipeline/deploy.sh` run or CDK diffs an
+  installed webhook away.
+- `PIPELINE_CI_START_BUILD` — tools-Lambda-time flag (read by
+  `deploy/setup-pipeline-tools-lambda.mjs`, NOT the CDK stack; default OFF).
+  Grants the pipeline-tools role `codebuild:StartBuild` on the CI project only,
+  so `Pipeline___start_ci_build` works and the CI agent can start a PR-check
+  build itself — the fallback for when the webhook above cannot be installed.
+  With **both** flags off, no CodeBuild certification is possible: the CI agent
+  degrades to `github-actions-proxy` / BLOCKED. Current prod state and the two
+  remedies are in
+  [`deploy/pipeline/README.md`](../deploy/pipeline/README.md) → "Runbook:
+  CodeBuild-certified CI for PRs (TEAM-4258)".
 - `DEPLOY_PIPELINE_NAME` — on the **telegram-bug-intake** Lambda: enables the
   deploy-gate Telegram approval bridge (unset = the whole path is a no-op).
 
