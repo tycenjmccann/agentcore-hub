@@ -124,6 +124,102 @@ export function tallyBlockerResult(res, requestedIds) {
 }
 
 /**
+ * PURE. The awaited union — preconditionUnmet.awaitingIds ∪ blockedBy, minus the
+ * ticket itself — restricted to ids that are PROVEN still non-terminal in
+ * `siblings`. An id absent from the snapshot counts as non-terminal (we cannot
+ * prove it closed), so a caller that has no snapshot must pass none at all: a
+ * non-array `siblings` yields [] rather than "everything is open", mirroring the
+ * direction cascade.unionBlockersResolved(t, undefined) already fails in
+ * (resolved). The one place the union's shape is defined; checkAwaitTimeout and
+ * parkEvidence both read it here.
+ */
+export function nonTerminalAwaitedIds(ticket, siblings) {
+  if (!ticket || typeof ticket !== "object") return [];
+  if (!Array.isArray(siblings)) return [];
+  const union = new Set();
+  const pu = ticket.preconditionUnmet;
+  if (pu && Array.isArray(pu.awaitingIds)) for (const id of pu.awaitingIds) if (isTicketId(id)) union.add(id.trim());
+  if (Array.isArray(ticket.blockedBy)) for (const id of ticket.blockedBy) if (isTicketId(id)) union.add(id.trim());
+
+  const statusOf = (id) => {
+    const s = siblings.find((x) => x && x.ticketId === id);
+    return s ? s.status : undefined;
+  };
+  return [...union].filter((id) => id !== ticket.ticketId && !TERMINAL_TICKET_STATUSES.has(statusOf(id)));
+}
+
+/**
+ * PURE. Was this preconditionUnmet stamp written by the claim generation that is
+ * under inspection — i.e. is it evidence about THIS session, or a leftover from a
+ * previous one?
+ *
+ * Fail-safe directions, both chosen to preserve the pre-TEAM-4184 behaviour when
+ * the comparison cannot be made:
+ *   - no parseable claimStartedAt → TRUE. We cannot prove the stamp is stale, and
+ *     a legacy/odd task row must not become escalatable just because its claim
+ *     lacks a timestamp.
+ *   - no parseable reportedAt → FALSE. Not provably current (jira rows stamped
+ *     before the precondition-at label existed land here). Those are still held
+ *     by parkEvidence's other two terms, so a stamp is never judged stale on the
+ *     strength of a missing clock alone.
+ */
+export function isStampCurrent(preconditionUnmet, claimStartedAt) {
+  const claimMs = Date.parse(claimStartedAt ?? "");
+  if (!Number.isFinite(claimMs)) return true;
+  const stampMs = Date.parse(preconditionUnmet?.reportedAt ?? "");
+  if (!Number.isFinite(stampMs)) return false;
+  return stampMs >= claimMs;
+}
+
+/**
+ * PURE. THE D2 evidence predicate (TEAM-4166 §2.3, corrected by TEAM-4184 F1):
+ * once a ticket's dead-session retry budget is spent, is its `preconditionUnmet`
+ * stamp live evidence that the session parked itself CLEANLY on work it is
+ * waiting for — in which case it gets re-woken, capped, never escalated — or is
+ * it stale residue from a claim that has since been re-dispatched and died?
+ *
+ * The bug this replaces tested mere PRESENCE of the stamp. Because nothing ever
+ * clears `preconditionUnmet`, a ticket that parked once could never again be
+ * escalated: after its awaited fixes closed and it was correctly re-woken, a
+ * genuinely dead re-woken session still read "parked clean" on the old stamp, so
+ * it burned the clean-exit cap and then reported "awaiting" forever — no
+ * escalation, no error status, no page. §2.3's timestamp rule always required an
+ * UNRESOLVED stamp; this is that rule.
+ *
+ * Three independent reasons a stamp is still live evidence, in order:
+ *   awaited-open      — something in the awaited union is still non-terminal.
+ *                       The ordinary "parked and waiting" case (FR-2.1), and the
+ *                       one that carries a legitimate RE-park on both providers.
+ *   stamp-current     — the stamp was written at/after this claim started, so it
+ *                       is this session's own report (a re-park whose awaited
+ *                       fixes happen to have closed already).
+ *   unconsumed-stamp  — no clean-exit re-dispatch has been spent on this ticket
+ *                       yet, so the stamp has not yet been acted on. This is the
+ *                       benefit of the doubt FR-2.1b requires, and it is what
+ *                       covers stamps written before a reportedAt was recorded.
+ * All three false → the stamp is spent evidence about a previous claim, and the
+ * caller falls through to its genuine dead-session branch.
+ *
+ * `cleanRedispatches` is the workflow row's cleanExitRedispatches[ticketId] — no
+ * new state: a clean re-dispatch mints a fresh claim (a new agentTasks[].startedAt),
+ * so the counter and claimStartedAt together already say "the stamp was used".
+ *
+ * Returns { parkedClean, reason, awaitingIds } — `reason` rides the escalation
+ * evidence block so an operator can see WHICH term decided.
+ */
+export function parkEvidence(ticket, { siblings, claimStartedAt, cleanRedispatches = 0 } = {}) {
+  const pu = ticket?.preconditionUnmet;
+  const hasStamp = !!(pu && Array.isArray(pu.awaitingIds) && pu.awaitingIds.length);
+  if (!hasStamp) return { parkedClean: false, reason: "no-stamp", awaitingIds: [] };
+
+  const awaitingIds = nonTerminalAwaitedIds(ticket, siblings);
+  if (awaitingIds.length) return { parkedClean: true, reason: "awaited-open", awaitingIds };
+  if (isStampCurrent(pu, claimStartedAt)) return { parkedClean: true, reason: "stamp-current", awaitingIds };
+  if (!(Number(cleanRedispatches) > 0)) return { parkedClean: true, reason: "unconsumed-stamp", awaitingIds };
+  return { parkedClean: false, reason: "stale-stamp", awaitingIds };
+}
+
+/**
  * Build the awaited-ids decision surface bound to its dependencies. Stateless
  * across logical batches except for the metrics accumulator, which newMetrics()
  * resets: a caller runs newMetrics() → does its edge/timeout work →
@@ -282,18 +378,14 @@ export function createAwaitedIds(deps = {}) {
    */
   function checkAwaitTimeout(ticket, siblings, nowMs) {
     if (!ticket || typeof ticket !== "object") return null;
-    const statusOf = (id) => {
-      const s = (siblings || []).find((x) => x && x.ticketId === id);
-      return s ? s.status : undefined;
-    };
-    const union = new Set();
-    const pu = ticket.preconditionUnmet;
-    if (pu && Array.isArray(pu.awaitingIds)) for (const id of pu.awaitingIds) if (isTicketId(id)) union.add(id.trim());
-    if (Array.isArray(ticket.blockedBy)) for (const id of ticket.blockedBy) if (isTicketId(id)) union.add(id.trim());
-
-    const awaitingIds = [...union].filter((id) => id !== ticket.ticketId && !TERMINAL_TICKET_STATUSES.has(statusOf(id)));
+    // TEAM-4184: the union lives in the module-level nonTerminalAwaitedIds, shared
+    // with parkEvidence, so the two can never disagree about what "awaited" means.
+    // NOTE the deliberate `siblings || []` — a caller with no snapshot gets
+    // "nothing is provably terminal", the conservative direction for a wait SLA.
+    const awaitingIds = nonTerminalAwaitedIds(ticket, siblings || []);
     if (!awaitingIds.length) return null;
 
+    const pu = ticket.preconditionUnmet;
     const reportedAt = pu && pu.reportedAt ? pu.reportedAt : ticket.updatedAt;
     const since = Date.parse(reportedAt);
     const waitedMs = Number.isFinite(since) ? nowMs - since : 0;

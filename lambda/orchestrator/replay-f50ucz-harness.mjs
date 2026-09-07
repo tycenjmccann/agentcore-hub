@@ -236,6 +236,9 @@ export function makeWorld({
   });
 
   const getLastStreamAt = vi.fn(async () => null);
+  // The dead-escalate branch's ticket-side effect (index.mjs blockTicket), kept as
+  // a named seam so the replays can assert it fired.
+  const blockTicket = vi.fn(async () => {});
 
   const awaited = createAwaitedIds({
     addBlockers,
@@ -265,7 +268,7 @@ export function makeWorld({
     redispatch,
     reawakenGate: vi.fn(async () => true),
     store,
-    blockTicket: vi.fn(async () => {}),
+    blockTicket,
     awaitedIds: awaited,
     cleanExitRedispatchCap: 3,
     getLastStreamAt,
@@ -282,7 +285,7 @@ export function makeWorld({
   return {
     wf, tickets, awaited, cascade, sweep, store, lease, deadClaims, projectRead,
     addBlockers, annotatePreconditionUnmet, publishEvent, getChildTickets,
-    redispatch, redispatchedIds, redispatchedBlockedBy, issueLinks,
+    redispatch, redispatchedIds, redispatchedBlockedBy, issueLinks, blockTicket,
     events, at: () => nowIso(), advanceTo,
     eventsOfType: (type) => events.filter((e) => e.type === type),
     // Apply the derived spawn edges for the two ship fixes + the CI fix, exactly

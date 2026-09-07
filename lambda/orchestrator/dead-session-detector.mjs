@@ -54,6 +54,9 @@ import { SWEEP_CAP, createOpenWorkflowScan } from "./sweep-scan.mjs";
 // use, so the detector's clean-park anti-thrash decides identically (blockedBy ∪
 // preconditionUnmet.awaitingIds, all terminal in the sibling snapshot). Pure.
 import { unionBlockersResolved } from "./cascade.mjs";
+// TEAM-4184 F1 — the ONE D2 evidence predicate, shared with cascade.mjs so the two
+// guards can never diverge. Pure; awaited-ids.mjs has zero AWS imports.
+import { parkEvidence } from "./awaited-ids.mjs";
 
 // Sweep bounds and threshold knobs. The silence threshold is derived per-agent
 // from its own recent run durations; these frame that derivation.
@@ -253,7 +256,7 @@ export function createDetector(deps) {
    * task genuinely completed (never true on this dead escalate path); exitReason
    * is null on the dead path.
    */
-  async function buildEscalationEvidence(workflow, ticket, { completedOk = false, exitReason = null } = {}) {
+  async function buildEscalationEvidence(workflow, ticket, { completedOk = false, exitReason = null, parkEvidence: parkReason = null } = {}) {
     const ticketId = ticket?.ticketId;
     let lastStreamAt = null;
     try {
@@ -269,6 +272,10 @@ export function createDetector(deps) {
       completedAt: task?.completedAt || null,
       preconditionAt: ticket?.preconditionUnmet?.reportedAt || null,
       exitReason: exitReason ?? null,
+      // TEAM-4184 F1 — which term of the evidence predicate decided. "stale-stamp"
+      // = the ticket carries a preconditionUnmet from an EARLIER claim that was
+      // already re-woken once, so it says nothing about this session.
+      parkEvidence: parkReason,
     };
   }
 
@@ -308,32 +315,46 @@ export function createDetector(deps) {
       const canGuard = typeof store.incrementCleanExitRedispatch === "function";
       const claimStartedAt = workflow.agentTasks?.[ticketId]?.startedAt || detectorMeta?.claimStartedAt || null;
       const completedOk = canGuard && await hasCompletionSince(workflow.id, ticketId, claimStartedAt);
-      const parkedClean = canGuard && !!ticket?.preconditionUnmet?.awaitingIds?.length;
-      if (canGuard && (completedOk || parkedClean)) {
-        // TEAM-4166 §0 ANTI-THRASH. A cleanly-parked ticket is still legitimately
-        // waiting until its awaited fixes close. The cascade guards this with the
-        // sibling snapshot it already holds; the detector has none, so — only when
-        // a sibling reader is wired — fetch the closure and evaluate the SAME
-        // union predicate (blockedBy ∪ preconditionUnmet.awaitingIds). If any
-        // awaited id is still non-terminal, touch nothing (no redispatch, no
-        // budget, no clean-exit counter): the ordinary cascade re-drives it when
-        // the last blocker closes. Reader absent → fall through to the capped
-        // re-wake below (today's behavior — the detector can't see the edges).
-        if (parkedClean && getChildTickets && workflow?.epicId) {
-          let siblings = null;
-          try {
-            siblings = await getChildTickets(workflow.epicId);
-          } catch (err) {
-            siblings = null;
-            log(`detector.awaited_siblings_error — ${ticketId}: ${err?.message || err} (sweep ${sweepId})`);
-          }
-          if (Array.isArray(siblings) && !unionBlockersResolved(ticket, siblings)) {
-            m.awaiting = (m.awaiting || 0) + 1;
-            log(`detector.awaiting — ${ticketId} clean park, awaited blockers still open (sweep ${sweepId})`);
-            return;
-          }
+      const cleanRedispatches = workflow?.cleanExitRedispatches?.[ticketId] || 0;
+
+      // TEAM-4166 §0 ANTI-THRASH / TEAM-4184 F1. A cleanly-parked ticket is still
+      // legitimately waiting until its awaited fixes close, and "is any awaited id
+      // still open" is now also one term of the evidence predicate itself — so the
+      // sibling closure is fetched ONCE, here, ahead of the parkedClean decision,
+      // and shared by both. The cascade has this snapshot for free; the detector
+      // fetches it only when the ticket actually carries a stamp, and only when a
+      // reader is wired (index.mjs always wires one; absent, the predicate simply
+      // cannot see the edges and falls back to its two timestamp/budget terms).
+      let siblings = null;
+      if (canGuard && ticket?.preconditionUnmet?.awaitingIds?.length && getChildTickets && workflow?.epicId) {
+        try {
+          siblings = await getChildTickets(workflow.epicId);
+        } catch (err) {
+          siblings = null;
+          log(`detector.awaited_siblings_error — ${ticketId}: ${err?.message || err} (sweep ${sweepId})`);
         }
-        const cleanRedispatches = workflow?.cleanExitRedispatches?.[ticketId] || 0;
+      }
+
+      // The SHARED D2 evidence predicate (awaited-ids.mjs) — the same one
+      // cascade.stealWithRetryBudget uses. Mere presence of preconditionUnmet used
+      // to be enough here, which made a ticket that ever parked permanently
+      // un-escalatable: nothing clears the stamp, so a genuinely dead RE-WOKEN
+      // session kept reading "parked clean" off the old stamp.
+      const parkEv = parkEvidence(ticket, {
+        siblings: Array.isArray(siblings) ? siblings : undefined,
+        claimStartedAt,
+        cleanRedispatches,
+      });
+      const parkedClean = canGuard && parkEv.parkedClean;
+      if (canGuard && (completedOk || parkedClean)) {
+        // Still waiting on open work → touch nothing (no redispatch, no budget, no
+        // clean-exit counter): the ordinary cascade re-drives it when the last
+        // blocker closes.
+        if (parkedClean && Array.isArray(siblings) && !unionBlockersResolved(ticket, siblings)) {
+          m.awaiting = (m.awaiting || 0) + 1;
+          log(`detector.awaiting — ${ticketId} clean park, awaited blockers still open (sweep ${sweepId})`);
+          return;
+        }
         if (cleanRedispatches >= cleanExitCap) {
           // Re-woken to the cap without landing — advisory wait-SLA timeout ONLY,
           // never a manager_escalation (that is the parkedOnHuman trap this fix
@@ -360,8 +381,9 @@ export function createDetector(deps) {
         return;
       }
 
-      // Genuinely dead — escalate, don't loop. Now carries the §2.3 evidence.
-      const evidence = await buildEscalationEvidence(workflow, ticket);
+      // Genuinely dead — escalate, don't loop. Now carries the §2.3 evidence,
+      // including WHICH evidence term ruled the park out (TEAM-4184 F1).
+      const evidence = await buildEscalationEvidence(workflow, ticket, { parkEvidence: parkEv.reason });
       await publishEvent(ticketId, "agent.escalated", {
         workflowId: workflow.id, ticketId, agentId,
         reason: "dead_session_retry_exhausted", detectorMeta,

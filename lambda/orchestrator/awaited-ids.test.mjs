@@ -4,6 +4,9 @@ import {
   normalizeAwaitedIdsMode,
   AWAITED_IDS_MODES,
   tallyBlockerResult,
+  parkEvidence,
+  isStampCurrent,
+  nonTerminalAwaitedIds,
 } from "./awaited-ids.mjs";
 import { normalizeSyncMode } from "./sync-main.mjs";
 import { KIND_TO_ORIGIN_KEY } from "./fix-contract.mjs";
@@ -349,3 +352,155 @@ for (const provider of ["dynamodb", "jira"]) {
     });
   });
 }
+
+/**
+ * TEAM-4184 F1 — the D2 evidence predicate, the ONE thing cascade.mjs and
+ * dead-session-detector.mjs both ask "is this preconditionUnmet stamp evidence
+ * about the CLAIM I am inspecting, or residue from an earlier one?".
+ *
+ * The bug it replaces tested mere PRESENCE of the stamp. Since nothing ever clears
+ * preconditionUnmet, a ticket that parked once could never be escalated again: its
+ * correct clean re-wake burned the cap, and the re-woken session — however dead —
+ * kept reading "parked clean" off the original stamp. §2.3 always specified an
+ * UNRESOLVED stamp; these are the three ways a stamp is still unresolved.
+ */
+describe("parkEvidence / isStampCurrent / nonTerminalAwaitedIds (TEAM-4184 F1)", () => {
+  const SHIP = "TEAM-4126";
+  const CLAIM = "2026-09-06T07:43:10.259Z";      // the claim under inspection
+  const BEFORE_CLAIM = "2026-09-06T07:07:00.000Z"; // the stamp the RM wrote earlier
+  const AFTER_CLAIM = "2026-09-06T09:10:00.000Z";  // a re-park inside this claim
+
+  const ticketWith = (reportedAt, awaitingIds = ["TEAM-4156", "TEAM-4157"]) => ({
+    ticketId: SHIP,
+    status: "in_progress",
+    blockedBy: ["TEAM-4125", ...awaitingIds],
+    ...(awaitingIds ? { preconditionUnmet: { awaitingIds, source: "tool", ...(reportedAt ? { reportedAt } : {}) } } : {}),
+  });
+  const board = (statuses) => Object.entries(statuses).map(([ticketId, status]) => ({ ticketId, status }));
+  const ALL_DONE = board({ "TEAM-4125": "done", "TEAM-4156": "done", "TEAM-4157": "done" });
+  const ONE_OPEN = board({ "TEAM-4125": "done", "TEAM-4156": "done", "TEAM-4157": "in_progress" });
+
+  describe("nonTerminalAwaitedIds", () => {
+    it("is the union of awaitingIds and blockedBy, minus what the snapshot proves terminal", () => {
+      expect(nonTerminalAwaitedIds(ticketWith(BEFORE_CLAIM), ONE_OPEN)).toEqual(["TEAM-4157"]);
+      expect(nonTerminalAwaitedIds(ticketWith(BEFORE_CLAIM), ALL_DONE)).toEqual([]);
+    });
+
+    it("counts an id ABSENT from the snapshot as non-terminal (it cannot be proven closed)", () => {
+      expect(nonTerminalAwaitedIds(ticketWith(BEFORE_CLAIM), board({ "TEAM-4125": "done" })))
+        .toEqual(["TEAM-4156", "TEAM-4157"]);
+    });
+
+    it("never counts the ticket itself, and ignores cancelled as terminal", () => {
+      const t = { ticketId: SHIP, blockedBy: [SHIP], preconditionUnmet: { awaitingIds: ["TEAM-4156"] } };
+      expect(nonTerminalAwaitedIds(t, board({ [SHIP]: "in_progress", "TEAM-4156": "cancelled" }))).toEqual([]);
+    });
+
+    it("drops ids that are not ticket-shaped rather than treating junk as an open blocker", () => {
+      const t = { ticketId: SHIP, blockedBy: ["", "not a ticket", null], preconditionUnmet: { awaitingIds: ["nope"] } };
+      expect(nonTerminalAwaitedIds(t, [])).toEqual([]);
+    });
+
+    it("with NO snapshot returns [] — 'nothing provably open', not 'everything open'", () => {
+      // Same direction cascade.unionBlockersResolved(t, undefined) fails in
+      // (resolved): a caller without a snapshot must not have the open-work term
+      // decide for it.
+      expect(nonTerminalAwaitedIds(ticketWith(BEFORE_CLAIM), undefined)).toEqual([]);
+      expect(nonTerminalAwaitedIds(ticketWith(BEFORE_CLAIM), null)).toEqual([]);
+    });
+  });
+
+  describe("isStampCurrent", () => {
+    it("true at or after the claim start, false before it", () => {
+      expect(isStampCurrent({ reportedAt: AFTER_CLAIM }, CLAIM)).toBe(true);
+      expect(isStampCurrent({ reportedAt: CLAIM }, CLAIM)).toBe(true); // boundary: same instant counts
+      expect(isStampCurrent({ reportedAt: BEFORE_CLAIM }, CLAIM)).toBe(false);
+    });
+
+    it("no parseable claimStartedAt → TRUE (staleness cannot be proven, so nothing becomes escalatable)", () => {
+      expect(isStampCurrent({ reportedAt: BEFORE_CLAIM }, null)).toBe(true);
+      expect(isStampCurrent({ reportedAt: BEFORE_CLAIM }, "not-a-date")).toBe(true);
+    });
+
+    it("no parseable reportedAt → FALSE (not provably current; the other terms still hold it)", () => {
+      // The jira shape before TEAM-4184's precondition-at label existed.
+      expect(isStampCurrent({ awaitingIds: ["TEAM-4156"], source: "label" }, CLAIM)).toBe(false);
+      expect(isStampCurrent({ reportedAt: "" }, CLAIM)).toBe(false);
+      expect(isStampCurrent(undefined, CLAIM)).toBe(false);
+    });
+  });
+
+  describe("parkEvidence", () => {
+    it("no stamp → not parked clean (the FR-2.1c control: a genuinely dead session)", () => {
+      expect(parkEvidence({ ticketId: SHIP, blockedBy: ["TEAM-4125"] }, { siblings: ALL_DONE, claimStartedAt: CLAIM }))
+        .toEqual({ parkedClean: false, reason: "no-stamp", awaitingIds: [] });
+      // An empty awaitingIds array is not a stamp either.
+      expect(parkEvidence({ ticketId: SHIP, preconditionUnmet: { awaitingIds: [] } }, { claimStartedAt: CLAIM }).reason)
+        .toBe("no-stamp");
+    });
+
+    it("awaited-open: something is still open → parked clean, whatever the stamp's age (FR-2.1)", () => {
+      const ev = parkEvidence(ticketWith(BEFORE_CLAIM), {
+        siblings: ONE_OPEN, claimStartedAt: CLAIM, cleanRedispatches: 2,
+      });
+      expect(ev).toEqual({ parkedClean: true, reason: "awaited-open", awaitingIds: ["TEAM-4157"] });
+    });
+
+    it("stamp-current: a RE-PARK inside this claim is parked clean even with everything closed", () => {
+      const ev = parkEvidence(ticketWith(AFTER_CLAIM), {
+        siblings: ALL_DONE, claimStartedAt: CLAIM, cleanRedispatches: 1,
+      });
+      expect(ev).toEqual({ parkedClean: true, reason: "stamp-current", awaitingIds: [] });
+    });
+
+    it("unconsumed-stamp: an older stamp not yet acted on still earns the re-wake (FR-2.1b)", () => {
+      const ev = parkEvidence(ticketWith(BEFORE_CLAIM), {
+        siblings: ALL_DONE, claimStartedAt: CLAIM, cleanRedispatches: 0,
+      });
+      expect(ev).toEqual({ parkedClean: true, reason: "unconsumed-stamp", awaitingIds: [] });
+    });
+
+    it("stale-stamp: acted on, everything closed, stamp predates the claim → NOT parked clean", () => {
+      // THE FIX. This is the state a re-woken session that then died leaves
+      // behind, and it used to read "parked clean" forever.
+      const ev = parkEvidence(ticketWith(BEFORE_CLAIM), {
+        siblings: ALL_DONE, claimStartedAt: CLAIM, cleanRedispatches: 1,
+      });
+      expect(ev).toEqual({ parkedClean: false, reason: "stale-stamp", awaitingIds: [] });
+    });
+
+    it("a clock-less stamp (jira before the precondition-at label) is held by the budget term, then goes stale", () => {
+      const noClock = ticketWith(null);
+      expect(parkEvidence(noClock, { siblings: ALL_DONE, claimStartedAt: CLAIM, cleanRedispatches: 0 }).reason)
+        .toBe("unconsumed-stamp");
+      expect(parkEvidence(noClock, { siblings: ALL_DONE, claimStartedAt: CLAIM, cleanRedispatches: 1 }).reason)
+        .toBe("stale-stamp");
+      // …but open awaited work still wins, on any provider.
+      expect(parkEvidence(noClock, { siblings: ONE_OPEN, claimStartedAt: CLAIM, cleanRedispatches: 1 }).reason)
+        .toBe("awaited-open");
+    });
+
+    it("defaults are safe: no options at all → the stamp is current (no claim to compare against)", () => {
+      expect(parkEvidence(ticketWith(BEFORE_CLAIM))).toEqual({
+        parkedClean: true, reason: "stamp-current", awaitingIds: [],
+      });
+    });
+
+    it("a non-numeric cleanRedispatches is treated as unspent, not as a spent budget", () => {
+      for (const v of [undefined, null, "", NaN, "1"]) {
+        const ev = parkEvidence(ticketWith(BEFORE_CLAIM), {
+          siblings: ALL_DONE, claimStartedAt: CLAIM, cleanRedispatches: v,
+        });
+        // "1" coerces to a real spent budget; the empty/absent forms do not.
+        expect(ev.reason).toBe(v === "1" ? "stale-stamp" : "unconsumed-stamp");
+      }
+    });
+
+    it("is PURE — it never touches the ticket it is handed", () => {
+      const t = ticketWith(BEFORE_CLAIM);
+      const before = JSON.stringify(t);
+      parkEvidence(t, { siblings: ALL_DONE, claimStartedAt: CLAIM, cleanRedispatches: 1 });
+      expect(JSON.stringify(t)).toBe(before);
+    });
+  });
+});

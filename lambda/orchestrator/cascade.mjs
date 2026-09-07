@@ -56,6 +56,11 @@
  */
 
 import { UpdateCommand } from "@aws-sdk/lib-dynamodb";
+// TEAM-4184 F1 — the ONE D2 evidence predicate, shared with
+// dead-session-detector.mjs so the two guards can never diverge. Pure (awaited-ids.mjs
+// has zero AWS imports); the injected `awaitedIds` dep stays the seam for the
+// stateful surface (edge writes, timeout emission).
+import { parkEvidence } from "./awaited-ids.mjs";
 
 // Extended-state rollout modes (TEAM-3747 D1) — same vocabulary + fail-safe
 // default (shadow) as DEAD_SESSION_DETECTOR_MODE.
@@ -625,7 +630,7 @@ export function createCascade(deps) {
    * getLastStreamAt dep (null when unwired); lastSpanStatus is "ok" only when the
    * task genuinely completed; exitReason is null on the dead escalate path.
    */
-  async function buildEscalationEvidence(workflow, sibling, { completedOk = false, exitReason = null } = {}) {
+  async function buildEscalationEvidence(workflow, sibling, { completedOk = false, exitReason = null, parkEvidence: parkReason = null } = {}) {
     const ticketId = sibling.ticketId;
     let lastStreamAt = null;
     try {
@@ -641,6 +646,11 @@ export function createCascade(deps) {
       completedAt: task?.completedAt || null,
       preconditionAt: sibling?.preconditionUnmet?.reportedAt || null,
       exitReason: exitReason ?? null,
+      // TEAM-4184 F1 — WHICH term of the evidence predicate decided. "stale-stamp"
+      // says the ticket carries a preconditionUnmet from an EARLIER claim that has
+      // already been re-woken once, so the stamp is not evidence about this
+      // session; "no-stamp" says it never parked clean at all.
+      parkEvidence: parkReason,
     };
   }
 
@@ -683,7 +693,14 @@ export function createCascade(deps) {
       Date.parse(task.completedAt) >= Date.parse(claimStartedAt) &&
       task.status !== "error"
     );
-    const parkedClean = !!sibling.preconditionUnmet?.awaitingIds?.length;
+    // TEAM-4184 F1 — the stamp must be evidence about THIS claim. Mere presence
+    // meant a ticket that ever parked could never be escalated again, because
+    // nothing clears preconditionUnmet: its clean re-wake would burn the cap and
+    // then report "awaiting" forever. The shared predicate (awaited-ids.mjs) is
+    // the same one dead-session-detector.mjs uses.
+    const cleanRedispatches = workflow?.cleanExitRedispatches?.[ticketId] || 0;
+    const parkEv = parkEvidence(sibling, { siblings, claimStartedAt, cleanRedispatches });
+    const parkedClean = parkEv.parkedClean;
     if (completedOk || parkedClean) {
       // Anti-thrash: the awaited blockers are not all terminal yet → touch
       // nothing (no redispatch, no escalate, no budget change). The sweep
@@ -693,7 +710,6 @@ export function createCascade(deps) {
         log(`[orchestrator] reconcile awaiting (clean park, blockers open) — ${ticketId}`);
         return "awaiting";
       }
-      const cleanRedispatches = workflow?.cleanExitRedispatches?.[ticketId] || 0;
       if (cleanRedispatches >= cleanExitCap) {
         // Re-woken to the cap without landing — advisory timeout ONLY, never a
         // manager_escalation (that is the parkedOnHuman trap this fix removes).
@@ -728,7 +744,9 @@ export function createCascade(deps) {
       return "would-escalate";
     }
     const at = new Date(now()).toISOString();
-    const evidence = await buildEscalationEvidence(workflow, sibling, { completedOk, exitReason: null });
+    const evidence = await buildEscalationEvidence(workflow, sibling, {
+      completedOk, exitReason: null, parkEvidence: parkEv.reason,
+    });
     await publishEvent(ticketId, "agent.escalated", {
       workflowId: workflow.id, ticketId, agentId,
       reason: "dead_session_retry_exhausted", source: unblockedBy,

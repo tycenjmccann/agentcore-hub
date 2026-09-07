@@ -1383,6 +1383,74 @@ describe("TEAM-4166 D2 §2.3 — evidence-gated escalation guard", () => {
     expect(eventsOfType(deps.publishEvent, "agent.escalated")).toHaveLength(0);
   });
 
+  /**
+   * TEAM-4184 F1 — the detector twin of the cascade fix. `preconditionUnmet` is
+   * never cleared, so a stamp from an EARLIER claim used to keep a ticket
+   * un-escalatable forever: the correct clean re-wake spent the budget, and the
+   * re-woken (now genuinely dead) session still read "parked clean". The stamp is
+   * evidence about the claim that wrote it — a stamp predating the claim under
+   * inspection, whose awaited work has all landed, is spent evidence.
+   */
+  const parkedStale = { ...parkedTicket,
+    preconditionUnmet: { awaitingIds: [FIX], reportedAt: "2026-08-31T23:00:00Z" } }; // < DEAD_STARTED
+
+  it("TEAM-4184: a stamp from a PREVIOUS claim, already acted on, no longer blocks the escalate", async () => {
+    const wf = makeWorkflow({
+      deadSessionRetries: { "TEAM-2": 1 },
+      cleanExitRedispatches: { "TEAM-2": 1 }, // the re-wake that stamp already bought
+      epicId: "TEAM-1",
+    });
+    const store = guardStore();
+    const getChildTickets = vi.fn(async () => [
+      parkedStale,
+      { ticketId: FIX, type: "task", status: "done" }, // nothing awaited is open
+    ]);
+    const { deps } = makeDeps({
+      ddb: makeDdb({ workflows: [wf] }), store,
+      getTicket: vi.fn(async () => parkedStale),
+    });
+    const { runSweep } = createDetector({ ...deps, getChildTickets, cleanExitRedispatchCap: 3 });
+
+    const m = await runSweep("enforce");
+
+    expect(m.escalations).toBe(1);
+    expect(m.exitedOk).toBeFalsy();
+    expect(m.awaiting).toBeFalsy();
+    expect(store.setTaskStatus).toHaveBeenCalledWith("wf_1", "TEAM-2", "error");
+    expect(deps.blockTicket).toHaveBeenCalledWith("TEAM-2", "dead_session_retry_exhausted");
+    // The clean-exit budget is not spent again on the way out.
+    expect(store.incrementCleanExitRedispatch).not.toHaveBeenCalled();
+    expect(deps.redispatch).not.toHaveBeenCalled();
+    // The evidence says which branch decided, and the sibling snapshot was read
+    // ONCE for both the predicate and the anti-thrash check.
+    const esc = eventsOfType(deps.publishEvent, "agent.escalated");
+    expect(esc).toHaveLength(1);
+    expect(esc[0][2].evidence.parkEvidence).toBe("stale-stamp");
+    expect(esc[0][2].evidence.preconditionAt).toBe("2026-08-31T23:00:00Z");
+    expect(getChildTickets).toHaveBeenCalledTimes(1);
+  });
+
+  it("TEAM-4184: the SAME stale stamp still earns its FIRST re-wake (budget unspent → FR-2.1b intact)", async () => {
+    // Only difference from the case above: cleanExitRedispatches is 0. The stamp
+    // has not been acted on yet, so it is unconsumed evidence, not stale — this is
+    // the pre-deploy stamp (written before the clock existed) still being honoured.
+    const wf = makeWorkflow({ deadSessionRetries: { "TEAM-2": 1 }, epicId: "TEAM-1" });
+    const store = guardStore();
+    const getChildTickets = vi.fn(async () => [parkedStale, { ticketId: FIX, type: "task", status: "done" }]);
+    const { deps } = makeDeps({
+      ddb: makeDdb({ workflows: [wf] }), store,
+      getTicket: vi.fn(async () => parkedStale),
+    });
+    const { runSweep } = createDetector({ ...deps, getChildTickets, cleanExitRedispatchCap: 3 });
+
+    const m = await runSweep("enforce");
+
+    expect(m.exitedOk).toBe(1);
+    expect(m.escalations).toBe(0);
+    expect(store.incrementCleanExitRedispatch).toHaveBeenCalledTimes(1);
+    expect(store.setTaskStatus).not.toHaveBeenCalled();
+  });
+
   it("§0 anti-thrash: reader ABSENT keeps the pre-4166 capped re-wake (no siblings to consult)", async () => {
     const wf = makeWorkflow({ deadSessionRetries: { "TEAM-2": 1 }, epicId: "TEAM-1" });
     const store = guardStore();

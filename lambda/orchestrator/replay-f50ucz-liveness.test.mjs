@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
-  FX, WF_ID, SHIP, FIX_A, FIX_B, FIX_CI, CLAIM_STARTED, COMPLETED, makeWorld,
+  FX, WF_ID, EPIC, SHIP, FIX_A, FIX_B, FIX_CI, CLAIM_STARTED, COMPLETED, makeWorld,
 } from "./replay-f50ucz-harness.mjs";
 
 /**
@@ -133,5 +133,156 @@ describe("f50ucz D2 — FR-2.1c: with NO evidence, the historical escalation STI
     // (no raw agent.streaming rows; 20s heartbeats + spawnedBy reconstructed).
     expect(typeof FX._provenance?.note).toBe("string");
     expect(FX._provenance.note.length).toBeGreaterThan(0);
+  });
+});
+
+/**
+ * TEAM-4184 F1 (review finding of TEAM-4168) — FR-2.1d: the guard's evidence must
+ * be about the CLAIM being inspected.
+ *
+ * Nothing ever CLEARS preconditionUnmet. The shipped guard tested only that the
+ * stamp existed, so the very re-wake FR-2.1b prescribes turned the ticket
+ * permanently un-escalatable: the clean-exit budget was spent on the correct
+ * re-wake, and the re-woken session — no matter how dead — kept reading "parked
+ * clean" off the 07:07Z stamp. Forever. No agent.escalated, no error status, no
+ * page; deadSessionRetries frozen at 1.
+ *
+ * The fix scopes the stamp to the current claim generation. These four cases are
+ * the whole matrix that matters in the replay: die after the re-wake (escalate) vs
+ * legitimately re-park (still spared) — on BOTH providers, because prod is Jira.
+ */
+describe("f50ucz D2 — FR-2.1d: a stale stamp no longer disables escalation (TEAM-4184 F1)", () => {
+  /** FR-2.1b's re-wake, replayed: returns with TEAM-4126 re-dispatched at 08:28Z. */
+  async function afterCleanReWake(opts) {
+    const w = await withStamp(opts);
+    w.advanceTo("2026-09-06T08:28:00Z");
+    await w.sweep.runSweep("enforce");
+    expect(w.wf.cleanExitRedispatches[SHIP]).toBe(1);
+    expect(w.eventsOfType("agent.escalated")).toHaveLength(0);
+    return w;
+  }
+
+  /** The re-woken RM files a new fix and parks on it — a LEGITIMATE second park. */
+  async function repark(w, newId, atIso) {
+    w.advanceTo(atIso);
+    w.tickets[newId] = {
+      ticketId: newId, type: "task", status: "in_progress",
+      assignee: "agentcore_hub_backend_dev", parentId: EPIC, blockedBy: [],
+    };
+    await w.awaited.applyAwaitedEdges(SHIP, [newId], "tool");
+    w.deadClaims.add(SHIP); // it parked and exited, exactly as at 07:45Z
+  }
+
+  /** Sweep repeatedly with the lease stale, as the real reconcile loop does. */
+  async function sweepRepeatedly(w, times, fromIso) {
+    let at = Date.parse(fromIso);
+    const metrics = [];
+    for (let i = 0; i < times; i++) {
+      w.advanceTo(new Date(at + i * 15 * 60 * 1000).toISOString());
+      metrics.push(await w.sweep.runSweep("enforce"));
+    }
+    return metrics;
+  }
+
+  it("the reviewer's repro: the re-woken session dies → ESCALATES, once, reason stale-stamp", async () => {
+    const w = await afterCleanReWake();
+
+    // The stamp is 07:07Z evidence about the claim that ended at 07:45Z — it says
+    // nothing about the 08:28Z claim the sweep is now inspecting.
+    const stamp = w.tickets[SHIP].preconditionUnmet.reportedAt;
+    expect(Date.parse(stamp)).toBeLessThan(Date.parse(w.wf.agentTasks[SHIP].startedAt));
+
+    // The fresh claim goes silent too: no spans, no stream, no completion.
+    w.deadClaims.add(SHIP);
+    const metrics = await sweepRepeatedly(w, 8, "2026-09-06T09:00:00Z");
+
+    const escalations = w.eventsOfType("agent.escalated").filter((e) => e.ticketId === SHIP);
+    expect(escalations).toHaveLength(1); // once — not per sweep, and not never
+    expect(metrics.reduce((n, m) => n + (m.escalated || 0), 0)).toBeGreaterThanOrEqual(1);
+
+    const detail = escalations[0].detail;
+    expect(detail.reason).toBe("dead_session_retry_exhausted");
+    // The 7th evidence field says WHICH branch of the guard concluded this, so an
+    // operator reading the page can tell a stale stamp from no stamp at all.
+    expect(detail.evidence.parkEvidence).toBe("stale-stamp");
+    expect(detail.evidence.preconditionAt).toBe(stamp);
+
+    // The full escalation, not just the event.
+    expect(w.store.setTaskStatus).toHaveBeenCalledWith(WF_ID, SHIP, "error");
+    expect(w.blockTicket).toHaveBeenCalledWith(SHIP, "dead_session_retry_exhausted");
+    expect(w.wf.humanNotifications.filter((n) => n.type === "manager_escalation")).toHaveLength(1);
+
+    // The clean-exit budget was NOT burned further, and deadSessionRetries stays 1:
+    // escalating IS the progression the exhausted budget calls for, so the counter
+    // is deliberately not bumped again.
+    expect(w.wf.cleanExitRedispatches[SHIP]).toBe(1);
+    expect(w.wf.deadSessionRetries[SHIP]).toBe(1);
+    // And the pre-fix symptom is gone: it never reports "awaiting" forever.
+    expect(metrics.every((m) => m.awaiting === 0)).toBe(true);
+  });
+
+  it("(d) a LEGITIMATE re-park after the re-wake is still spared — dynamodb", async () => {
+    const w = await afterCleanReWake();
+    const NEW_FIX = "TEAM-4199";
+    await repark(w, NEW_FIX, "2026-09-06T09:10:00Z");
+
+    // The new fix lands; the awaited union is resolved again.
+    w.advanceTo("2026-09-06T09:30:00Z");
+    w.tickets[NEW_FIX].status = "done";
+    const metrics = await sweepRepeatedly(w, 3, "2026-09-06T09:40:00Z");
+
+    // Re-woken a SECOND time (cap is 3), never escalated.
+    expect(w.eventsOfType("agent.escalated")).toHaveLength(0);
+    expect(w.wf.humanNotifications.filter((n) => n.type === "manager_escalation")).toHaveLength(0);
+    expect(w.wf.cleanExitRedispatches[SHIP]).toBe(2);
+    expect(metrics.reduce((n, m) => n + (m.exitedOk || 0), 0)).toBeGreaterThanOrEqual(1);
+    expect(w.wf.deadSessionRetries[SHIP]).toBe(1);
+  });
+
+  /**
+   * The same (d) case in JIRA mode — the provider prod actually runs (Dockerfile /
+   * .env.example ship TICKET_PROVIDER=jira). This is the case that FAILED before
+   * the precondition-at label existed: Jira has no structured column, and the
+   * sibling read the guard runs (getChildTicketsFromJira) fetches no `comment`, so
+   * the re-park's reportedAt was simply ABSENT. isStampCurrent would then be false,
+   * the clean-exit budget was already 1, and a legitimately re-parked release
+   * manager got escalated — the f50ucz bug class, re-introduced on the prod path.
+   */
+  it("(d) a LEGITIMATE re-park after the re-wake is still spared — JIRA (the label carries the clock)", async () => {
+    const w = await afterCleanReWake({ provider: "jira" });
+    const NEW_FIX = "TEAM-4199";
+    await repark(w, NEW_FIX, "2026-09-06T09:10:00Z");
+
+    // The mechanism, pinned: the stamp lives in labels, and exactly ONE monotonic
+    // clock label survives, carrying the RE-PARK instant (not the 07:07Z one).
+    const clocks = w.tickets[SHIP].labels.filter((l) => l.startsWith("precondition-at:"));
+    expect(clocks).toHaveLength(1);
+    const read = w.projectRead(w.tickets[SHIP]).preconditionUnmet;
+    expect(read.reportedAt).toBe("2026-09-06T09:10:00.000Z");
+    expect(read.awaitingIds).toContain(NEW_FIX);
+    expect(Date.parse(read.reportedAt)).toBeGreaterThan(Date.parse(w.wf.agentTasks[SHIP].startedAt));
+
+    w.advanceTo("2026-09-06T09:30:00Z");
+    w.tickets[NEW_FIX].status = "done";
+    await sweepRepeatedly(w, 3, "2026-09-06T09:40:00Z");
+
+    expect(w.eventsOfType("agent.escalated")).toHaveLength(0);
+    expect(w.wf.humanNotifications.filter((n) => n.type === "manager_escalation")).toHaveLength(0);
+    expect(w.wf.cleanExitRedispatches[SHIP]).toBe(2);
+  });
+
+  it("the JIRA twin of the genuine death: no re-park, so the label clock stays pre-claim → escalates", async () => {
+    const w = await afterCleanReWake({ provider: "jira" });
+    // No re-park: the only clock label is still the 07:07Z one, which predates the
+    // 08:28Z claim. The label mechanism must not over-suppress escalation either.
+    expect(w.projectRead(w.tickets[SHIP]).preconditionUnmet.reportedAt).toBe("2026-09-06T07:07:00.000Z");
+
+    w.deadClaims.add(SHIP);
+    await sweepRepeatedly(w, 4, "2026-09-06T09:00:00Z");
+
+    const escalations = w.eventsOfType("agent.escalated").filter((e) => e.ticketId === SHIP);
+    expect(escalations).toHaveLength(1);
+    expect(escalations[0].detail.evidence.parkEvidence).toBe("stale-stamp");
+    expect(w.blockTicket).toHaveBeenCalledWith(SHIP, "dead_session_retry_exhausted");
   });
 });
