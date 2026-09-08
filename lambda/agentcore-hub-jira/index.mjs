@@ -725,8 +725,26 @@ async function transitionTicket(params) {
   // Link the new blockers BEFORE the transition so the Blocked webhook the
   // orchestrator receives already carries the issuelinks it maps to blockedBy
   // (its claim release on agent self-park keys off "own blockers still open").
+  // Then VERIFY every requested blocker is really an inward "Blocks" link
+  // (Codex review on #452): linkBlockers logs-and-continues on a 4xx, which is
+  // right for a duplicate link but would otherwise park the ticket Blocked with
+  // no edge — a state nothing can cascade out of. A missing link aborts the
+  // transition so the agent sees the error and can fix the key.
   if (blockers.length > 0) {
     await linkBlockers(ticket_id, blockers);
+    const issue = await jiraFetch(`/rest/api/3/issue/${ticket_id}?fields=issuelinks`);
+    const linked = new Set(
+      (issue?.fields?.issuelinks || [])
+        .filter((l) => l?.type?.name === "Blocks" && l.inwardIssue?.key)
+        .map((l) => l.inwardIssue.key)
+    );
+    const missing = blockers.filter((b) => !linked.has(b));
+    if (missing.length > 0) {
+      throw new Error(
+        `blocked_by: could not link ${missing.join(", ")} as blocker(s) of ${ticket_id} — ` +
+        `ticket NOT transitioned. Check the key(s) exist and retry.`
+      );
+    }
   }
 
   // Transition in Jira
