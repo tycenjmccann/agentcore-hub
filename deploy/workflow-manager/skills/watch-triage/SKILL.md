@@ -99,7 +99,21 @@ blockers:
   but the record is missing/blank: apply the create-only remedy above, then
   `complete`. Different failure: `API 502: {"error":"completion evidence record
   write failed"…}` means the ticket did **not** move and nothing was recorded —
-  fix the cause (bucket config / IAM) and re-run `mark-done`.
+  fix the cause (bucket config / IAM) and re-run `mark-done`. Safe to retry: a
+  raced conditional write (409) is retried for you, so a 502 is a real fault,
+  not a collision.
+- **The third failure: `API 500`, the ambiguous one.** `API 500:
+  {"error":"Lambda invocation failed","completionRecordWritten":true,…}` means
+  the transition outcome is **unknown** — the tickets Lambda may or may not have
+  moved the ticket before the call died — but `completionRecordWritten: true`
+  says the evidence record **was** written and was deliberately left in place.
+  So do NOT apply the create-only remedy (there is nothing missing) and do NOT
+  delete anything. Just re-run the same `mark-done`: if the ticket did not move
+  it moves now and the existing record is kept; if it already moved you get
+  `API 409: {"error":"Ticket transition rejected"…}` on the `done → done`, which
+  is itself confirmation the record is in place — `complete` the run. A 500 with
+  `completionRecordWritten: false` means no record was written either, so treat
+  it like the 502 above.
 
 ## 3. THE STUCK-AGENT TEST — "did the work actually ship?"
 
