@@ -5,7 +5,9 @@
  * PURE: no AWS calls, no clock reads (callers pass `now`). The band arithmetic
  * (median + MAD, warn at 2σ, alert at 3σ, sigma floored at max(floor, 10% of
  * |median|)) deliberately mirrors lambda/cost-report/index.mjs so a run's card
- * and the fleet view never disagree about what "anomalous" means.
+ * and the fleet view never disagree about what "anomalous" means. The BAND
+ * arithmetic is what is mirrored; the GATE arithmetic
+ * (reworkRounds/gateRounds/firstPassYield) is not — see `gateMetricSource` below.
  */
 
 // The one source of the no-op outcome list; types.ts imports nothing, so this
@@ -51,6 +53,14 @@ export interface CardSummary {
      *                         gateRounds counts human review REQUESTS.
      * Optional because cards written before this field exist; absent reads as
      * the legacy definition.
+     *
+     * All three metrics are computed in exactly ONE place —
+     * `computeGateRounds` in lambda/cost-report/index.mjs — and this module only
+     * consumes and bands them. There is deliberately no TS port: no browser-side
+     * caller has the event stream to compute from (the fleet view reads
+     * `performance/index.json`, which `summarize()` writes), so a port would be
+     * dead code. `gate-metrics-parity.test.ts` is what guards that boundary — the
+     * card's key set against this type, and BAND_KPIS against FLEET_KPIS.
      */
     gateMetricSource?: "verdict-events" | "reviewGateHistory" | null;
   };
@@ -108,6 +118,11 @@ export const FLEET_KPIS: KpiDef[] = [
   { key: "time.agentWork", label: "Agent work", unit: "ms", group: "time", floor: 900_000, help: "Sum of agent task durations (agents actually working)" },
   { key: "time.humanWait", label: "Human wait", unit: "ms", group: "time", floor: 900_000, help: "Union of open review-gate intervals" },
   { key: "quality.tasks", label: "Agent tasks", unit: "count", group: "quality", floor: 1, help: "Tickets worked by agents (fewer = tighter pipeline)" },
+  // `quality.gateRounds` is on every card but deliberately absent from this list:
+  // its two definitions are different units (gate persona completions vs human
+  // review REQUESTS), so a baseline mixing them would compare one against the
+  // other. `quality.reworkRounds` below is banded because both of ITS definitions
+  // answer one question.
   // TEAM-4246 D1 FR-D1.11 — verdict-derived on runs whose gate personas stated a
   // verdict (`quality.gateMetricSource === "verdict-events"`), task-derived on
   // pre-D1 runs. Both are "times the run had to go back", so they share a band;

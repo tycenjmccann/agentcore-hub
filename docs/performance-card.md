@@ -12,8 +12,40 @@ card on each finished run. No LLM is involved anywhere in the pipeline.
 |---|---|---|
 | **Cost** | Total / persona LLM / coding CLIs, tokens in/out/cache-read/cache-write, persona cache hit rate, $ per task, by engine, by agent | Persona spans (`gen_ai.usage.*` on `aws/spans` + per-runtime span groups), Claude Code `api_request` events, Codex/Kiro `coding_usage` records; priced from `src/config/pricing.json` (Bedrock list, synced to S3 `config/pricing.json`) |
 | **Time** | End-to-end wall-clock, human-gate wait (interval union), active (wall − human), agent work (Σ task durations), orchestration idle (active − work), utilization, per phase | Workflow record + events table |
-| **Quality** | Agent tasks (+completed), rework rounds (re-invocations of a ticket), change requests (`review.rejected`), fix tickets, review-gate rounds, loops (= change requests + fix tickets), nudges, manager interventions, errors/retries, first-pass yield, PR, outcome | Events table (deduplicated — every event is written twice) + `reviewGateHistory` |
+| **Quality** | Agent tasks (+completed), rework rounds (gate non-PASS verdicts, or on pre-verdict runs re-invocations of a ticket), change requests (`review.rejected`), fix tickets, gate rounds (gate persona completions, or on pre-verdict runs human review requests) + `gateMetricSource`, loops (= change requests + fix tickets), nudges, manager interventions, errors/retries, first-pass yield, PR, outcome | Events table (deduplicated — every event is written twice) + `reviewGateHistory` |
 | **Infra** | AgentCore runtime compute / memory, network, storage, CloudWatch, platform, optional (evaluations, CodeBuild fleet, legacy App Runner); per-runtime GB·h/vCPU·h split; per-run allocation | Cost Explorer (trailing 30d, region-scoped) + `AWS/Bedrock-AgentCore` metrics, refreshed at most every 6h |
+
+### The gate metrics (`reworkRounds`, `gateRounds`, `firstPassYield`)
+
+These three have **two definitions**, and the card says which one it used in
+`quality.gateMetricSource`:
+
+| `gateMetricSource` | When | `reworkRounds` | `gateRounds` | `firstPassYield` |
+|---|---|---|---|---|
+| `verdict-events` | The run's gate personas stated verdicts on `agent.complete` (TEAM-4246 D1 onward) | Reviewer/QA `CHANGES_NEEDED`/`FAIL` verdicts | Every gate persona completion — the initial round plus each re-verify | **Binary**: 1 iff every gate PASSed on its first look |
+| `reviewGateHistory` | Pre-D1 run with no verdict anywhere | Task-derived: re-invocations of a ticket after its first run | Human review **requests** (`reviewGateHistory[].rounds[]`) — zero on a run whose gates were all machine gates | Task-derived: share of agent tasks that needed no rework |
+
+Cards written before the field exists read as `null`, which means the legacy
+definition.
+
+**Which side computes, which side bands.** All three are computed in exactly one
+place — `computeGateRounds` in `lambda/cost-report/index.mjs` — and only there.
+`src/lib/workflow/performance.ts` types them (`CardSummary["quality"]`) and bands
+them; it deliberately carries **no port** of the arithmetic, because no
+browser-side caller has the event stream to compute from (the fleet view reads
+`performance/index.json`, which `summarize()` writes). On the fallback path
+`computeGateRounds` returns `reworkRounds: null` / `firstPassYield: null`, meaning
+"no verdict signal — keep the task-derived value", and the Lambda's caller
+substitutes with `??` so a real 0 is not mistaken for absence.
+`src/lib/workflow/gate-metrics-parity.test.ts` guards that boundary: the key set
+`summarize()` writes against the type the UI reads, the two `gateMetricSource`
+values against the TS union, and `BAND_KPIS` against `FLEET_KPIS`.
+
+**Why `quality.gateRounds` has no band.** Its two definitions are different
+*units* — gate persona completions vs human review requests — so a baseline
+mixing both would compare one against the other (wf_…dowtdh scores 3 one way and
+0 the other). `quality.reworkRounds` **is** banded, because both of its
+definitions answer one question: times the run had to go back. See DL-016.
 
 ## Anomaly bands
 
@@ -29,7 +61,10 @@ anomaly (`direction: lower`):
 | Persona cache hit rate | `cost.personaCacheHitRate` | ratio | 0.1 | lower (a drop) |
 
 The per-run card, the fleet view (`src/lib/workflow/performance.ts`) and the
-Lambda (`lambda/cost-report/index.mjs`) share this arithmetic on purpose.
+Lambda (`lambda/cost-report/index.mjs`) share this **band** arithmetic on purpose,
+so a run's card and the fleet view never disagree about what "anomalous" means.
+The **gate** arithmetic is not shared and is not meant to be: it lives only in the
+Lambda (above).
 
 Per-run values are also published as CloudWatch metrics
 (`AgentCoreHub/Performance`, dimension `WorkflowDefId`: `CostUsd`,

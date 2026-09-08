@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { effectiveRoundCount, effectiveRoundCountDiffScoped, mergeRound } from "./ship-review.mjs";
-import { evaluateShipVerdict, shipVerdictOf, SHIP_PHASES } from "./completion.mjs";
+import { evaluateShipVerdict, shipVerdictOf, evaluateVerifiedHeads, SHIP_PHASES } from "./completion.mjs";
 
 /**
  * TEAM-4246 D1 ACCEPTANCE REPLAY (FR-D1.13) — wf_1788637257831_f50ucz, epic TEAM-4116.
@@ -37,10 +37,12 @@ import { evaluateShipVerdict, shipVerdictOf, SHIP_PHASES } from "./completion.mj
  *
  * The run's own hole (the f50ucz half of H3) is upstream of this window: QA
  * TEAM-4124 returned PASS on head 1e1591f, and the head that shipped was 7c2391b.
- * That divergence is what the dowtdh replay's criterion (c) pins; here it is only
- * the reason the completion gate is left OFF wherever this file drives completion —
- * arming it would refuse this run, which is correct behaviour but says nothing
- * about ship-review round accounting.
+ * That divergence is what the dowtdh replay's criterion (c) pins; here it is the
+ * reason the completion gate is left OFF in every describe that asserts ship-review
+ * ROUND ACCOUNTING — arming it refuses this run, which is correct behaviour but
+ * says nothing about the arithmetic. The LAST describe arms it on purpose, for
+ * exactly that refusal: it is what makes the orchestrator file the CI
+ * re-certification FR-D1.13 claims it files (TEAM-4277 QA-1b).
  *
  * ══ WHICH LAYER THIS EXERCISES ═══════════════════════════════════════════════
  * The REAL orchestrator, same as the dowtdh replay: `handler` over DynamoDB-stream
@@ -345,6 +347,7 @@ const REPLAYED = [CI1, FIX1, FIX2, RECERT, SHIP, APPROVAL, CD];
 
 const RELEASE_MANAGER_ID = "agentcore_hub_release_manager";
 const CI_AGENT_ID = "agentcore_hub_ci_agent";
+const QA_VERIFIER_ID = "agentcore_hub_qa_verifier";
 
 /** The head CI certified before the ship review, and the head r1 was dispatched on. */
 const R1_HEAD = fixtureCompletion(CI1).commit_sha;      // df1ed19…
@@ -356,10 +359,12 @@ const QA_HEAD = fixtureCompletion(QA).commit_sha;       // 1e1591f…
 /** All three flags off — the pre-D1 orchestrator. */
 const ALL_OFF = { verdict: "off", fixBefore: "off", verifiedHead: "off" };
 /**
- * The gate armed and nothing else. VERIFIED_HEAD_COMPLETION stays off throughout:
- * f50ucz's QA head really does differ from its shipped head, so that gate refuses
- * this run — a correct refusal (pinned by the dowtdh replay) that would mask every
- * ship-cascade claim this file makes.
+ * The verdict gate armed and nothing else. VERIFIED_HEAD_COMPLETION stays off in
+ * every describe that uses this mode: f50ucz's QA head really does differ from its
+ * shipped head, so that gate refuses this run — a correct refusal (pinned by the
+ * dowtdh replay) that would mask every ship-cascade claim those tests make. The
+ * FR-D1.13 describe at the bottom of the file arms it instead, and asserts the
+ * refusal itself.
  */
 const ENFORCE_VERDICT_ONLY = { verdict: "enforce", fixBefore: "off", verifiedHead: "off" };
 
@@ -889,4 +894,330 @@ describe("f50ucz replay — a non-PASS ship round's re-verify comes from the fac
     expect(reverifyTickets().map((t) => t.key)).toEqual([first]);
     expect(h.state.board.get(APPROVAL).blockedBy).toEqual(edges);
   });
+});
+
+/**
+ * ══ WHO FILES THE CI RE-CERTIFICATION (FR-D1.13) — TEAM-4277 QA-1b ═══════════
+ *
+ * f50ucz's TEAM-4157 ("Fix (CI): re-certify the shared branch head after
+ * ship-review r1 fixes") was filed BY THE RELEASE MANAGER: the fixture row carries
+ * `spawnedBy: null`, no reverify marker and no slot claim — pinned as such by the
+ * first describe. FR-D1.13 claims that under D1 the ORCHESTRATOR files it, and
+ * nothing in this file proved that: the r2 PASS test asserts the orchestrator files
+ * NOTHING, and the only orchestrator-filed re-verify above is a counterfactual
+ * `ship_fix` for the release manager. This describe replays the run WITHOUT
+ * TEAM-4157 and shows the orchestrator producing its `ci_fix` equivalent.
+ *
+ * ── WHICH PATH FILES IT, AND WHEN (the honest timing) ────────────────────────
+ * Not the cascade's verdict path — that yields the RM's `ship_fix`. The path that
+ * files a `ci_fix` is the VERIFIED_HEAD_COMPLETION head-divergence remediation
+ * (index.mjs:5326): for every persona whose certified head is not the head that
+ * would ship it calls live-reverify's
+ * `reverify({kind:"gate", reason:"stale-head", owner, headSha: vh.heads.pr})`, and
+ * `GATE_OWNER_FIX_KIND[agentcore_hub_ci_agent]` is `ci_fix`.
+ *
+ * That path can only run once EVERY fix-kind ticket under the epic is closed: the
+ * open-fix refusal short-circuits ahead of the head comparison (completion.mjs:763,
+ * returning `stalePersonas: []`), and the remediation sits inside
+ * `if (vh.reason === "head-divergence")`. So the orchestrator's CI re-cert is filed
+ * at the point the run would otherwise COMPLETE — strictly LATER than the r1 close
+ * at which the release manager hand-filed TEAM-4157 historically (07:07Z, with
+ * TEAM-4155/4156 still open and still to move the head). Test (5) pins that
+ * short-circuit directly, so the timing is asserted rather than merely described.
+ *
+ * The acceptance clause still holds as written — the ticket IS orchestrator-created,
+ * not ad hoc by the persona, and the release manager never needs to file it, because
+ * the run cannot close until the re-cert PASSes at the moved head. But the PRD's
+ * acceptance sentence reads as though the ticket appears BEFORE the fixes, which is
+ * not what ships. It should be amended to: "the orchestrator files the CI re-cert
+ * itself when the verified heads diverge, and holds workflow.complete until it
+ * PASSes at the moved head."
+ *
+ * ── THE HEADS (correcting the premise the finding was written against) ───────
+ * The head TEAM-4157 re-certified is `7c2391b` — the post-r1-fix shared head, which
+ * is also the head r2 reviewed and the head PR #395 shipped. NOT `df1ed19`:
+ * `df1ed19` is the STALE head CI TEAM-4125 certified BEFORE the r1 fixes. Both
+ * literals appear in test (2)'s assertions.
+ *
+ * Because QA's head is stale too (`1e1591f`, f50ucz's own half of hole H3), the
+ * orchestrator files TWO stale-head re-verifies — `qa_fix` against TEAM-4124 and
+ * `ci_fix` against TEAM-4125 — and holds the run until both return at `7c2391b`.
+ * That is the shipped gate's honest behaviour, so both are pinned rather than
+ * hidden behind an assertion about the CI one only.
+ *
+ * ── SYNTHESIZED HERE, beyond the file's notes 1-4 ────────────────────────────
+ *  5. `agentTasks[TEAM-4124].testedHead`. Hole H1 again: f50ucz predates FR-D1.1,
+ *     so QA's entry carries `commitSha` and prose ("PASS on head 1e1591f…") but no
+ *     structured head, and evaluateVerifiedHeads reads STRUCTURED FIELDS ONLY.
+ *     Seeded from the fixture's own `completions[TEAM-4124].commit_sha` — the same
+ *     value the prose states — on that one entry, inside this describe only. CI's
+ *     head is NOT seeded: the replay's own TEAM-4125 done harvests it from the
+ *     record, through the real harvest path.
+ *  6. The two re-verify tickets' completion records. The CI one is the fixture's OWN
+ *     TEAM-4157 record (PASS @ 7c2391b — the evidence the hand-filed ticket
+ *     produced, now attached to the orchestrator-filed one); the QA one is
+ *     TEAM-4124's record re-declared at 7c2391b, which is the re-run the fixture's
+ *     QA summary itself recommended ("re-verify on the post-4131 head recommended
+ *     before Merge Approval"). Both keep their original `commit_sha`, so the
+ *     harvest's structured precedence (tested_head first) is what decides the head.
+ *  7. The GitHub seam. `heads.pr` is the feature-branch head read from GitHub
+ *     (TEAM-4264 F3), so this replay serves that one request itself instead of
+ *     depending on whether the shell running it holds a PAT — the fa46f3c lesson
+ *     from the dowtdh replay. SCOPED to this describe: setting GITHUB_PAT also arms
+ *     featureBranchMergeProbe, and the nine tests above are pinned to a run with no
+ *     GitHub seam at all. (The stub 404s the probe's two paths, so githubApi throws,
+ *     the probe returns `{merged: null}` and the gate fails open — but "no
+ *     behaviour change" is a claim worth not making file-wide when it can be scoped.)
+ */
+describe("f50ucz replay — the CI re-certification is filed by the orchestrator, not by the persona (FR-D1.13)", () => {
+  /** The repo and branch heads.pr is read from, from the fixture's own workflow row. */
+  const REPO_URL = DOSSIER.workflow.repoConfig?.repos?.[0]?.url || "";
+  // parseRepoUrl's own regex (index.mjs:7365), so the stub's path and the
+  // orchestrator's path cannot drift apart.
+  const [, REPO_OWNER = "", REPO_NAME = ""] = /github\.com[:/]([^/]+)\/([^/.]+)/.exec(REPO_URL) || [];
+  const FEATURE_BRANCH = DOSSIER.workflow.featureBranch;
+  const REF_PATH = `/repos/${REPO_OWNER}/${REPO_NAME}/git/ref/heads/${encodeURIComponent(FEATURE_BRANCH)}`;
+
+  /**
+   * The gate that files it, armed. FIX_BEFORE_VERIFY off — the r1 fixes must not
+   * block the ship path here, that clause is the c2uqki replay's. LIVE_REVERIFY
+   * left UNSET on purpose: `reverify()` never reads this module's mode
+   * (live-reverify.mjs:439), and a gate hold must not depend on a flag that has
+   * nothing to do with it.
+   */
+  const ENFORCE_VERIFIED_HEAD = { verdict: "enforce", fixBefore: "off", verifiedHead: "enforce" };
+
+  /** What the stub answers `git/ref/heads/<the fixture's branch>` with. */
+  let branchHead = SHIP_HEAD;
+  /** Every api.github.com path the replay's code path asked for, in order. */
+  const githubPaths = [];
+  let realFetch;
+  let consoleSpies = [];
+
+  beforeEach(() => {
+    githubPaths.length = 0;
+    branchHead = SHIP_HEAD;
+    process.env.GITHUB_PAT = "gh-test-token";
+    realFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async (url) => {
+      const path = String(url).replace("https://api.github.com", "");
+      githubPaths.push(path);
+      const hit = path === REF_PATH && Boolean(branchHead);
+      const body = hit ? { object: { sha: branchHead } } : { message: "Not Found" };
+      return { ok: hit, status: hit ? 200 : 404, text: async () => JSON.stringify(body) };
+    });
+    // SYNTHESIZED note 5 — hole H1, on QA's entry only.
+    h.state.workflow.agentTasks[QA].testedHead = QA_HEAD;
+    // The enforce path logs its refusal at error level by design; the two spies are
+    // restored individually rather than through restoreAllMocks, which would also
+    // reach into the module mocks above.
+    consoleSpies = [
+      vi.spyOn(console, "error").mockImplementation(() => {}),
+      vi.spyOn(console, "warn").mockImplementation(() => {}),
+    ];
+  });
+
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+    delete process.env.GITHUB_PAT;
+    for (const spy of consoleSpies) spy.mockRestore();
+    consoleSpies = [];
+  });
+
+  /** The run exactly as the fixture records it, MINUS TEAM-4157: nobody files the
+   * re-certification, and the release manager closes on the r2 PASS regardless. */
+  async function replayWithoutRecert() {
+    await deliver(doneRecord(CI1));
+    for (const id of [FIX1, FIX2]) await deliver(insertFixRecord(id));
+    await deliver(doneRecord(FIX1));
+    await deliver(doneRecord(FIX2));
+    await replayShipTail();
+  }
+
+  const reverifyFor = (assignee) => reverifyTickets().find((t) => t.assignee === assignee);
+
+  /** SYNTHESIZED note 6: the record the re-verify's own persona writes when it
+   * re-runs at the shipped head, built from that persona's fixture record. */
+  const recordAt = (ticketId, head) => ({
+    ...JSON.parse(JSON.stringify(fixtureCompletion(ticketId))),
+    verdict: "PASS",
+    tested_head: head,
+  });
+
+  /** Drive one orchestrator-filed re-verify ticket to done through the real handler. */
+  async function completeReverify(ticket, record) {
+    h.state.completions[ticket.key] = { ...record, ticket_id: ticket.key };
+    await deliver(doneRecord(ticket.key));
+  }
+
+  // ── (1) ────────────────────────────────────────────────────────────────────
+  it("files the CI re-certification itself, in the ci_fix lineage, when no persona does", async () => {
+    await loadWith(ENFORCE_VERIFIED_HEAD);
+    await replayWithoutRecert();
+
+    // Nobody hand-filed it: TEAM-4157 never reaches the board in this replay, and
+    // the row the fixture DOES have carries no fix marker at all.
+    expect(h.state.board.has(RECERT)).toBe(false);
+    expect(fixtureTicket(RECERT).spawnedBy ?? null).toBeNull();
+    expect(h.state.createdTickets.map((t) => t.assignee)).toEqual([QA_VERIFIER_ID, CI_AGENT_ID]);
+
+    // Two stale-head re-verifies, one per persona whose head is not the shipping
+    // head — filed in evaluateVerifiedHeads' own slot order (qa, then ci).
+    const rv = reverifyTickets();
+    expect(rv.map((t) => t.assignee)).toEqual([QA_VERIFIER_ID, CI_AGENT_ID]);
+    const ci = reverifyFor(CI_AGENT_ID);
+    expect(ci.summary).toMatch(/^Re-verify \(round 1\)/);
+    expect(ci.parent_key).toBe(EPIC);
+    expect(ci.workflow_id).toBe(WF_ID);
+    // The shape live-reverify's factory stamps — GATE_OWNER_FIX_KIND[ci_agent] plus
+    // KIND_TO_ORIGIN_KEY.ci_fix, which is what makes completion.mjs's open-fix gate
+    // count it without learning a new kind.
+    expect(ci.spawned_by).toEqual({
+      kind: "ci_fix",
+      ciTicketId: CI1,
+      reverify: true,
+      rearmOf: CI1,
+      headSha: SHIP_HEAD,
+      round: 1,
+    });
+    // FR-D1.5's edge is not this ticket's job: every r1 fix is already closed by
+    // the time the completion pass can file it (test 5).
+    expect(ci.blocked_by).toEqual([]);
+
+    const created = detailsOfType("fix.reverify_created");
+    expect(created.map((d) => d.owner)).toEqual([QA_VERIFIER_ID, CI_AGENT_ID]);
+    expect(created.find((d) => d.owner === CI_AGENT_ID)).toMatchObject({
+      workflowId: WF_ID,
+      kind: "gate",
+      reason: "stale-head",
+      gateTicketId: CI1,
+      reverifyTicketId: ci.key,
+      sha7: SHIP_HEAD.slice(0, 7),
+      round: 1,
+      blockedBy: [],
+    });
+    // One CAS slot per (gate ticket, head) — the factory's idempotency unit.
+    expect(h.state.reverifySlotClaims).toEqual([
+      { ticketId: QA, slotSha: `gate:${SHIP_HEAD.slice(0, 7)}`, result: "claimed" },
+      { ticketId: CI1, slotSha: `gate:${SHIP_HEAD.slice(0, 7)}`, result: "claimed" },
+    ]);
+  }, 60_000);
+
+  // ── (2) ────────────────────────────────────────────────────────────────────
+  it("pins it to the head that shipped (7c2391b), not the head CI certified (df1ed19)", async () => {
+    await loadWith(ENFORCE_VERIFIED_HEAD);
+    await replayWithoutRecert();
+
+    const ci = reverifyFor(CI_AGENT_ID);
+    expect(ci.spawned_by.headSha.startsWith("7c2391b")).toBe(true);
+    expect(ci.spawned_by.headSha).toBe(SHIP_HEAD);
+    expect(ci.summary).toContain("@ 7c2391b");
+    // The correction: the stale head is CI TEAM-4125's own, and it is NOT what the
+    // re-certification is filed against.
+    expect(fixtureCompletion(CI1).commit_sha.startsWith("df1ed19")).toBe(true);
+    expect(ci.spawned_by.headSha).not.toBe(fixtureCompletion(CI1).commit_sha);
+    // …and it IS the head the fixture's own hand-filed TEAM-4157 re-certified.
+    expect(fixtureCompletion(RECERT).summary).toContain(SHIP_HEAD);
+
+    // heads.pr came from GitHub, off the fixture's own branch (TEAM-4264 F3): no
+    // derived head, and one read per Lambda invocation (memoized).
+    expect(githubPaths).toContain(REF_PATH);
+    expect(FEATURE_BRANCH).toBe("feature/TEAM-4116--si-system-gate-escalation-event-integri");
+    expect(`${REPO_OWNER}/${REPO_NAME}`).toBe("tycenjmccann/agentcore-hub");
+  }, 60_000);
+
+  // ── (3) ────────────────────────────────────────────────────────────────────
+  it("holds workflow.complete and names the three heads on the refusal", async () => {
+    await loadWith(ENFORCE_VERIFIED_HEAD);
+    await replayWithoutRecert();
+
+    // Every ticket the fixture records is done — and the run does NOT close.
+    expect(children().filter((t) => t.status !== "done").map((t) => t.ticketId))
+      .toEqual(reverifyTickets().map((t) => t.key));
+    expect(detailsOfType("workflow.complete")).toEqual([]);
+    expect(h.state.storeCompletions).toEqual([]);
+    expect(h.state.finalized).toEqual([]);
+
+    const blocked = detailsOfType("orchestrator.completion_blocked");
+    expect(blocked).toHaveLength(1);
+    expect(blocked[0]).toMatchObject({
+      workflowId: WF_ID,
+      reason: "head-divergence",
+      mode: "enforce",
+      heads: { qa: QA_HEAD, ci: R1_HEAD, pr: SHIP_HEAD },
+      offenders: [],
+    });
+    expect(h.state.notifications.map((n) => n.n.title)).toEqual([
+      "Run cannot complete: the shipping head was never verified",
+    ]);
+  }, 60_000);
+
+  // ── (4) ────────────────────────────────────────────────────────────────────
+  it("completes only once both stale personas re-verify at the shipped head", async () => {
+    await loadWith(ENFORCE_VERIFIED_HEAD);
+    await replayWithoutRecert();
+    const ci = reverifyFor(CI_AGENT_ID);
+    const qa = reverifyFor(QA_VERIFIER_ID);
+
+    await completeReverify(ci, recordAt(RECERT, SHIP_HEAD));
+    expect(detailsOfType("workflow.complete")).toEqual([]);
+    expect(h.state.storeCompletions).toEqual([]);
+    // CI now certifies the shipping head — and the gate refuses on the QA
+    // re-verify, which is itself an open fix-kind ticket (completion.mjs:744 does
+    // not exclude reverify rows). That refusal is UPSTREAM of the completion pass:
+    // isWorkflowComplete's per-phase check sees an open verification ticket, so
+    // completeWorkflow is never entered and no second completion_blocked is
+    // published. The gate's own reading, on the board the handlers just left:
+    expect(evaluateVerifiedHeads(children(), tasks(), { prHeadSha: SHIP_HEAD })).toMatchObject({
+      ok: false,
+      reason: "open-fix",
+      offenders: [qa.key],
+      stalePersonas: [],
+      heads: { qa: QA_HEAD, ci: SHIP_HEAD, pr: SHIP_HEAD },
+    });
+
+    await completeReverify(qa, recordAt(QA, SHIP_HEAD));
+    expect(detailsOfType("workflow.complete")).toHaveLength(1);
+    expect(h.state.storeCompletions.map((c) => c.id)).toEqual([WF_ID]);
+    expect(evaluateVerifiedHeads(children(), tasks(), { prHeadSha: SHIP_HEAD })).toMatchObject({
+      ok: true,
+      reason: null,
+      heads: { qa: SHIP_HEAD, ci: SHIP_HEAD, pr: SHIP_HEAD },
+    });
+
+    // The stream's at-least-once redelivery of the CI re-verify: no third ticket
+    // (the CAS slot answers "taken") and no second completion.
+    const before = reverifyTickets().map((t) => t.key);
+    h.state.board.get(ci.key).status = "in_progress";
+    await deliver(doneRecord(ci.key));
+    expect(reverifyTickets().map((t) => t.key)).toEqual(before);
+    expect(detailsOfType("workflow.complete")).toHaveLength(1);
+  }, 60_000);
+
+  // ── (5) ────────────────────────────────────────────────────────────────────
+  it("cannot file it at the r1 close: the open-fix refusal short-circuits the head comparison", async () => {
+    await loadWith(ENFORCE_VERIFIED_HEAD);
+    await deliver(doneRecord(CI1));
+    for (const id of [FIX1, FIX2]) await deliver(insertFixRecord(id));
+
+    // The board as it read at 07:08Z, the moment the release manager hand-filed
+    // TEAM-4157: the heads ALREADY diverge, and the gate still reports open-fix —
+    // with an empty stalePersonas, which is what the remediation iterates. Hence
+    // the orchestrator's re-cert cannot exist before every fix closes.
+    const vh = evaluateVerifiedHeads(children(), tasks(), { prHeadSha: SHIP_HEAD });
+    expect(vh).toMatchObject({
+      ok: false,
+      reason: "open-fix",
+      offenders: [FIX1, FIX2],
+      stalePersonas: [],
+      heads: { qa: QA_HEAD, ci: R1_HEAD, pr: SHIP_HEAD },
+    });
+    expect(vh.heads.qa).not.toBe(vh.heads.pr);
+    expect(vh.heads.ci).not.toBe(vh.heads.pr);
+
+    // …and nothing was filed, by the orchestrator or anyone else.
+    expect(reverifyTickets()).toEqual([]);
+    expect(detailsOfType("fix.reverify_created")).toEqual([]);
+    expect(detailsOfType("orchestrator.completion_blocked")).toEqual([]);
+  }, 60_000);
 });

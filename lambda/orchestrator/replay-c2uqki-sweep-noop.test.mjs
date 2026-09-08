@@ -75,10 +75,14 @@ import { fileURLToPath } from "node:url";
  *     synthesized from the row's own title — "Fix (review): …" → `review_fix` with
  *     KIND_TO_ORIGIN_KEY's `gateTicketId` → its filer TEAM-4231, "Fix (QA): …" →
  *     `qa_fix` / `qaTicketId` → TEAM-4232.
+ *  7. THE BRANCH HEAD (TEAM-4277). No dispatch path reads the feature-branch head, so
+ *     the head each verifier was handed is modelled from the fix ledger — see the
+ *     `modelHead` docblock for the call-site audit behind that, and for why this is
+ *     the strongest honest assertion for PRD D1 acceptance 2's clause 3.
  */
 
-const h = vi.hoisted(() => ({
-  state: {
+const h = vi.hoisted(() => {
+  const state = {
     /** The live board, ticketId → row. Mutated by the real handlers' writes. */
     board: /** @type {Map<string, any>} */ (new Map()),
     /** The live workflow row (agentTasks mutate in place, as in production). */
@@ -105,11 +109,28 @@ const h = vi.hoisted(() => ({
     notifications: /** @type {any[]} */ ([]),
     /** Every outbound GitHub call (the sweep:no-op label rides on one). */
     githubCalls: /** @type {any[]} */ ([]),
+    /** Every `git/ref/heads/<branch>` read the ORCHESTRATOR made, with the head it
+     *  was served and the tick it happened on — see FR-D1 "head at dispatch" below. */
+    refReads: /** @type {any[]} */ ([]),
     blockedKeys: new Map(),
     reverifySlots: new Set(),
     nextTicketNum: 0,
-  },
-}));
+    /** Monotonic tick, see `nextSeq`. */
+    seq: 0,
+    /** How far `drainDispatches` has consumed `statusWrites`. */
+    drained: 0,
+  };
+  return {
+    state,
+    /**
+     * One monotonic clock shared by every recorded agent dispatch and every
+     * published event. Without it, "CI was invoked AFTER TEAM-4242 completed" is a
+     * claim about two unrelated arrays; with it, it is a comparison inside a single
+     * totally-ordered stream.
+     */
+    nextSeq: () => ++state.seq,
+  };
+});
 
 vi.mock("@aws-sdk/client-dynamodb", () => ({ DynamoDBClient: class {} }));
 
@@ -201,7 +222,10 @@ vi.mock("@aws-sdk/client-lambda", () => ({
       // Agent dispatch: the rendered context travels as `prompt`, which is where the
       // FR-D2.6 yield note has to land for a persona to ever read it.
       if (String(cmd.input?.FunctionName || "").includes("agent-invoker")) {
-        h.state.invokes.push(payload || {});
+        // `headAtDispatch` is the head the feature branch carried AT THIS TICK, per
+        // the fix ledger (see modelHead). The orchestrator does not put a head in the
+        // payload — that absence is the finding, not an omission here.
+        h.state.invokes.push({ ...(payload || {}), seq: h.nextSeq(), headAtDispatch: modelHead() });
         return {};
       }
       if (tool.startsWith("Tickets___create_ticket")) {
@@ -264,7 +288,12 @@ vi.mock("@aws-sdk/client-s3", () => ({
 }));
 
 vi.mock("@aws-sdk/client-eventbridge", () => ({
-  EventBridgeClient: class { async send(cmd) { h.state.ebEvents.push(cmd.input); return {}; } },
+  EventBridgeClient: class {
+    async send(cmd) {
+      h.state.ebEvents.push({ ...cmd.input, seq: h.nextSeq() });
+      return {};
+    }
+  },
   PutEventsCommand: class { constructor(i) { this.input = i; } },
 }));
 
@@ -403,6 +432,56 @@ const UNIFIED_PR = DOSSIER.workflow.delivery.prUrl;      // …/ember/pull/60
 /** The candidate count the sweeper's own summary reports (note 3). */
 const CANDIDATES = 93;
 
+// ─── The feature branch's head, as a timeline (PRD D1 acceptance 2, clause 3) ──
+/**
+ * "CI observes no mid-run head move (16fc41d → 73f0056)."
+ *
+ * THE FINDING BEHIND THE MODEL BELOW. No dispatch path reads the feature-branch
+ * head, so there is no head-at-dispatch value in the invoke payload to assert on.
+ * `featureBranchHeadSha` has exactly two production callers and neither is dispatch:
+ * the verdict gate, which needs a sha to PIN a re-verify ticket to (TEAM-4264 F2),
+ * and the verified-head completion check (TEAM-4264 F3). `buildAgentContext`
+ * resolves a branch PLAN, never a head; the only sha it renders into a prompt is the
+ * per-fix `head <sha7>` row of `## Unverified Fixes`, which is that fix ticket's own
+ * commit and not the branch tip the verifier is told to test.
+ *
+ * So the head is modelled HERE, as a function of the fix ledger, and the model is
+ * driven by the same board the orchestrator is deciding on — a head move is a fix
+ * ticket reaching `done`, which is the only way the branch tip moved on this run:
+ *
+ *   1b399fb  the sweeper's own commit, before either fix lands
+ *   16fc41d  TEAM-4241's merge of PR #58 into the integration branch
+ *   73f0056  TEAM-4242's merge of PR #59 — the head CI certified
+ *
+ * Every value is read out of the dossier (never retyped), and the `refReads` stub in
+ * beforeEach serves the SAME model to any `git/ref/heads/<branch>` read the
+ * orchestrator makes — so the day dispatch does resolve a head, these assertions
+ * start checking the real one instead of silently passing.
+ */
+const HEAD_PRE = fixtureCompletion(DETECT).commit_sha;
+/** TEAM-4241's F3 line: "merged PR #58 into its base … → merge commit <sha>". */
+const HEAD_AFTER_REVIEW_FIX = (() => {
+  const m = /merge commit ([0-9a-f]{40})/.exec(fixtureCompletion(REVIEW_FIX).summary);
+  if (!m) throw new Error(`c2uqki fixture: no merge commit in ${REVIEW_FIX}'s summary`);
+  return m[1];
+})();
+/** The head the CI agent recorded as verified — PR #59's merge. */
+const HEAD_AFTER_QA_FIX = fixtureCompletion(CI).ci_head_sha;
+
+/** A 40-char sha as the prose (and a prompt) abbreviates it. */
+const sha7 = (sha) => String(sha).slice(0, 7);
+
+/**
+ * The branch head at this instant, per the live board. A fix ticket is "landed" once
+ * it is `done`; the later fix wins because it merged on top of the earlier one.
+ */
+function modelHead() {
+  const isDone = (id) => h.state.board.get(id)?.status === "done";
+  if (isDone(QA_FIX)) return HEAD_AFTER_QA_FIX;
+  if (isDone(REVIEW_FIX)) return HEAD_AFTER_REVIEW_FIX;
+  return HEAD_PRE;
+}
+
 // ─── Board / workflow / records, built from the fixture ──────────────────────
 
 /** The fix markers each row's own title implies (see SYNTHESIZED note 6). */
@@ -535,8 +614,8 @@ function insertFixRecord(ticketId) {
 
 const allEvents = () =>
   h.state.ebEvents
-    .flatMap((i) => i.Entries || [])
-    .map((e) => ({ type: e.DetailType, detail: JSON.parse(e.Detail) }));
+    .flatMap((i) => (i.Entries || []).map((e) => ({ entry: e, seq: i.seq })))
+    .map(({ entry, seq }) => ({ type: entry.DetailType, detail: JSON.parse(entry.Detail), seq }));
 
 const detailsOfType = (type) => allEvents().filter((e) => e.type === type).map((e) => e.detail);
 const countOfType = (type) => detailsOfType(type).length;
@@ -588,6 +667,13 @@ const promptFor = (agentId) => (dispatchedTo(agentId)[0]?.prompt || "");
 const RUNNABLE = new Set(["todo", "ready", "in_progress"]);
 const madeRunnable = () => h.state.statusWrites.filter((w) => RUNNABLE.has(w.status));
 
+/** The tick an `agent.complete` was published on — the ordering anchor for FR-D1.7. */
+const completeSeq = (ticketId) => {
+  const e = allEvents().find((x) => x.type === "agent.complete" && x.detail?.ticketId === ticketId);
+  if (!e) throw new Error(`no agent.complete was published for ${ticketId}`);
+  return e.seq;
+};
+
 // ─── The driver ──────────────────────────────────────────────────────────────
 
 let handler;
@@ -618,6 +704,32 @@ async function loadWith({ sweep, verdict = "off", fixBefore = "off", verifiedHea
 
 /** One stream delivery, through the real handler. */
 const deliver = (record) => handler({ Records: [record] });
+
+/** The two writes a dispatch is level-triggered off (in_progress is the claim the
+ *  dispatch itself makes, not an invitation to dispatch again). */
+const DISPATCH_TRIGGER = new Set(["ready", "todo"]);
+
+/**
+ * Dispatch is LEVEL-TRIGGERED: the cascade writes a successor runnable, the tickets
+ * table emits that MODIFY, and THAT hop invokes the agent. So this replay never
+ * fabricates a `ready` record — it delivers one only for a status the cascade
+ * actually just wrote. That is what makes "CI was never invoked" a fact about the
+ * gate's decision instead of a fact about which records the test chose to deliver.
+ */
+async function drainDispatches() {
+  while (h.state.drained < h.state.statusWrites.length) {
+    const w = h.state.statusWrites[h.state.drained++];
+    if (!DISPATCH_TRIGGER.has(w.status)) continue;
+    if (h.state.board.get(w.ticketId)?.status !== w.status) continue; // superseded since
+    await deliver(readyRecord(w.ticketId, w.status));
+  }
+}
+
+/** One delivery plus the dispatches the cascade's own writes then trigger. */
+async function deliverAndDrain(record) {
+  await deliver(record);
+  await drainDispatches();
+}
 
 /**
  * The run, in the order the fixture records it: intake, the sweeper's zero-yield
@@ -663,6 +775,34 @@ describe("c2uqki replay — the fixture still says what this replay claims", () 
     expect(UNIFIED_PR).toMatch(/\/tycenjmccann\/ember\/pull\/60$/);
   });
 
+  /**
+   * The three heads of PRD D1 acceptance 2 clause 3, and the mid-run move itself —
+   * pinned to the literals so a fixture reshuffle fails HERE, loudly, instead of
+   * quietly re-pointing every head assertion below at some other commit.
+   */
+  it("records the head moving twice, and CI verifying only the last one", () => {
+    expect(HEAD_PRE).toMatch(/^1b399fb/);
+    expect(HEAD_AFTER_REVIEW_FIX).toMatch(/^16fc41d/);
+    expect(HEAD_AFTER_QA_FIX).toMatch(/^73f0056/);
+    expect(new Set([HEAD_PRE, HEAD_AFTER_REVIEW_FIX, HEAD_AFTER_QA_FIX]).size).toBe(3);
+
+    // The move CI itself reported, in its own words — clause 3's subject.
+    const ciSummary = fixtureCompletion(CI).summary;
+    expect(ciSummary).toContain(`Head moved ${sha7(HEAD_AFTER_REVIEW_FIX)}→${sha7(HEAD_AFTER_QA_FIX)} mid-run`);
+    expect(fixtureCompletion(CI).ci_head_sha).toBe(HEAD_AFTER_QA_FIX);
+
+    // …and the reason it moved: each fix merged its own PR into the shared branch,
+    // which is what makes a head a function of the fix ledger (see modelHead).
+    expect(fixtureCompletion(REVIEW_FIX).summary).toContain(`merge commit ${HEAD_AFTER_REVIEW_FIX}`);
+    expect(fixtureCompletion(QA_FIX).summary).toContain(`cut from integration @ ${sha7(HEAD_AFTER_REVIEW_FIX)}`);
+    expect(fixtureCompletion(QA_FIX).summary).toContain(`merged into ${DOSSIER.workflow.featureBranch} as ${sha7(HEAD_AFTER_QA_FIX)}`);
+
+    // The pre-fix head is what the sweeper AND both earlier gates actually saw.
+    for (const id of [DETECT, REVIEW, QA]) {
+      expect(fixtureCompletion(id).commit_sha, id).toBe(HEAD_PRE);
+    }
+  });
+
   it("spent four personas and two fix tickets on it, then reported a completed delivery", () => {
     const shape = fixtureCascadeShape();
     expect(shape.filter((s) => s.type === "orchestrator.unblocked").map((s) => s.ticketId))
@@ -693,15 +833,28 @@ describe("c2uqki replay — SWEEP_DETECTION_PHASE", () => {
     h.state.finalized.length = 0;
     h.state.notifications.length = 0;
     h.state.githubCalls.length = 0;
+    h.state.refReads.length = 0;
     h.state.blockedKeys.clear();
     h.state.reverifySlots.clear();
     h.state.nextTicketNum = 0;
+    h.state.seq = 0;
+    h.state.drained = 0;
     process.env.ARTIFACT_BUCKET = "test-artifacts";
     process.env.EVENT_BUS = "test-bus";
     vi.spyOn(console, "error").mockImplementation(() => {});
     vi.spyOn(console, "warn").mockImplementation(() => {});
     vi.stubGlobal("fetch", async (url, init) => {
-      h.state.githubCalls.push({ url: String(url), method: init?.method, body: init?.body });
+      const href = String(url);
+      h.state.githubCalls.push({ url: href, method: init?.method, body: init?.body });
+      // The branch-head read (TEAM-4264 F2/F3), served from the SAME ledger model the
+      // assertions use — so a future dispatch-time head read is captured here rather
+      // than reaching GitHub, and this replay stays hermetic with or without a
+      // developer PAT in the environment (the fa46f3c lesson from the dowtdh replay).
+      if (/\/git\/ref\/heads\//.test(href)) {
+        const head = modelHead();
+        h.state.refReads.push({ path: href.replace("https://api.github.com", ""), head, seq: h.nextSeq() });
+        return { ok: true, status: 200, text: async () => JSON.stringify({ object: { sha: head } }) };
+      }
       return { ok: true, status: 200, text: async () => "[]" };
     });
   });
@@ -1016,6 +1169,161 @@ describe("c2uqki replay — SWEEP_DETECTION_PHASE", () => {
       expect(h.state.blockerWrites.filter((w) => w.ids.includes(QA_FIX)).map((w) => w.ticketId).sort())
         .toEqual([QA, CI].sort());
       expect(h.state.board.get(CI).blockedBy).toContain(QA_FIX);
+    });
+
+    /**
+     * PRD D1 acceptance 2, clause 3 — "CI observes no mid-run head move
+     * (16fc41d → 73f0056)".
+     *
+     * The blocker EDGE above is not that clause: an edge says the board was written,
+     * not that the verifier was never handed the moving branch. These tests assert
+     * the dispatch itself — that no `agent.invoked`/invoke exists for CI before
+     * TEAM-4242's `agent.complete`, and which head each verifier was dispatched
+     * against — with an `off` control per clause so neither one can pass vacuously.
+     * The head is the ledger model of `modelHead`; see its docblock for why that is
+     * the strongest honest assertion available (the dispatch path reads no head).
+     */
+    describe("the head each verifier is dispatched against", () => {
+      beforeEach(() => {
+        // With a PAT set, any branch-head read the orchestrator makes is served by
+        // the beforeEach stub instead of reaching GitHub — so these tests behave
+        // identically with and without a developer PAT in the environment.
+        process.env.GITHUB_PAT = "ghp_test";
+      });
+
+      /** The fixture's own order, up to and including the hop that releases CI. */
+      async function replayToCiDispatch() {
+        await deliverAndDrain(doneRecord(ANALYST));      // 11:42:10
+        await deliverAndDrain(doneRecord(DETECT));       // 12:12:24 → reviewer dispatched
+        await deliverAndDrain(insertFixRecord(REVIEW_FIX)); // 12:30:13
+        await deliverAndDrain(doneRecord(REVIEW));       // 12:30:58
+        await deliverAndDrain(doneRecord(REVIEW_FIX));   // 12:44:26 → head 16fc41d
+        await deliverAndDrain(insertFixRecord(QA_FIX));  // 12:53:27
+        await deliverAndDrain(doneRecord(QA));           // 12:55:09
+        await deliverAndDrain(doneRecord(QA_FIX));       // 13:01:12 → head 73f0056
+      }
+
+      it("CI is not invoked at any hop before TEAM-4242 completes", async () => {
+        await loadWith({ sweep: "off", fixBefore: "enforce" });
+
+        const hops = [
+          ["11:42 intake done", () => doneRecord(ANALYST)],
+          ["12:12 detection done", () => doneRecord(DETECT)],
+          ["12:30:13 reviewer files TEAM-4241", () => insertFixRecord(REVIEW_FIX)],
+          ["12:30:58 reviewer done", () => doneRecord(REVIEW)],
+          ["12:44:26 TEAM-4241 done", () => doneRecord(REVIEW_FIX)],
+          ["12:53:27 QA files TEAM-4242", () => insertFixRecord(QA_FIX)],
+          ["12:55:09 QA done", () => doneRecord(QA)],
+        ];
+        for (const [label, record] of hops) {
+          await deliverAndDrain(record());
+          expect(dispatchedTo(CI_ID), label).toEqual([]);
+          expect(detailsOfType("agent.invoked").filter((d) => d.agentId === CI_ID), label).toEqual([]);
+          expect(detailsOfType("orchestrator.agent_invoked").filter((d) => d.agentId === CI_ID), label).toEqual([]);
+        }
+
+        // 13:01:12 — the fix lands, and only now is CI released.
+        await deliverAndDrain(doneRecord(QA_FIX));
+        const ci = dispatchedTo(CI_ID);
+        expect(ci).toHaveLength(1);
+        expect(ci[0].ticketId).toBe(CI);
+        // The ordering, in the one stream both the dispatch and the event live in.
+        expect(ci[0].seq).toBeGreaterThan(completeSeq(QA_FIX));
+      });
+
+      it("…and under `off` the same shape dispatches CI while TEAM-4242 is still open, at 16fc41d", async () => {
+        await loadWith({ sweep: "off", fixBefore: "off" });
+        await deliverAndDrain(doneRecord(ANALYST));
+        await deliverAndDrain(doneRecord(DETECT));
+        await deliverAndDrain(insertFixRecord(REVIEW_FIX));
+        await deliverAndDrain(doneRecord(REVIEW));
+        await deliverAndDrain(doneRecord(REVIEW_FIX));
+        await deliverAndDrain(insertFixRecord(QA_FIX));
+        await deliverAndDrain(doneRecord(QA));
+
+        // 12:55:09 → 12:55:08 in the dossier: CI started one second after QA closed,
+        // with TEAM-4242 open. This is the run clause 3 was written about.
+        expect(h.state.board.get(QA_FIX).status).not.toBe("done");
+        const ci = dispatchedTo(CI_ID);
+        expect(ci).toHaveLength(1);
+        expect(ci[0].headAtDispatch).toBe(HEAD_AFTER_REVIEW_FIX);   // 16fc41d
+        expect(ci[0].headAtDispatch).not.toBe(HEAD_AFTER_QA_FIX);
+
+        // …and then the head moved under the running task: 16fc41d → 73f0056.
+        await deliverAndDrain(doneRecord(QA_FIX));
+        expect(modelHead()).toBe(HEAD_AFTER_QA_FIX);               // 73f0056
+        expect(ci[0].seq).toBeLessThan(completeSeq(QA_FIX));
+        // Nothing re-dispatched CI at the new head either — the run just carried on.
+        expect(dispatchedTo(CI_ID)).toHaveLength(1);
+      });
+
+      it("CI is dispatched against 73f0056, and that head does not move under its task", async () => {
+        await loadWith({ sweep: "off", fixBefore: "enforce" });
+        await replayToCiDispatch();
+
+        const ci = dispatchedTo(CI_ID);
+        expect(ci).toHaveLength(1);
+
+        // (a) the head at dispatch is the post-TEAM-4242 head, not either earlier one
+        expect(ci[0].headAtDispatch).toBe(HEAD_AFTER_QA_FIX);       // 73f0056
+        expect(ci[0].headAtDispatch).not.toBe(HEAD_AFTER_REVIEW_FIX); // not 16fc41d
+        expect(ci[0].headAtDispatch).not.toBe(HEAD_PRE);              // not 1b399fb
+
+        // (b) …because every head-moving fix was already `done` when CI was handed it
+        for (const fix of FIXES) expect(h.state.board.get(fix).status, fix).toBe("done");
+
+        // (c) …and it is still that head when CI reports: no move during the task.
+        await deliverAndDrain(doneRecord(CI));
+        expect(modelHead()).toBe(ci[0].headAtDispatch);
+        expect(modelHead()).toBe(HEAD_AFTER_QA_FIX);
+        // The head the fixture's CI agent actually certified is that same commit.
+        expect(fixtureCompletion(CI).ci_head_sha).toBe(ci[0].headAtDispatch);
+
+        // (d) Self-arming: every branch-head read the ORCHESTRATOR made inside the CI
+        // window was served 73f0056. Vacuous today — nothing on the dispatch path
+        // reads the head (see modelHead) — and that is precisely why it is here: the
+        // day one does, this checks the real value instead of silently passing.
+        const inWindow = h.state.refReads.filter((r) => r.seq > ci[0].seq);
+        for (const r of inWindow) expect(r.head, r.path).toBe(HEAD_AFTER_QA_FIX);
+      });
+
+      it("QA is not invoked until TEAM-4241 lands, and then against 16fc41d — never 1b399fb", async () => {
+        await loadWith({ sweep: "off", fixBefore: "enforce" });
+        await deliverAndDrain(doneRecord(ANALYST));
+        await deliverAndDrain(doneRecord(DETECT));
+        await deliverAndDrain(insertFixRecord(REVIEW_FIX));
+        await deliverAndDrain(doneRecord(REVIEW));
+
+        // 12:30:58 — the reviewer closed with CHANGES NEEDED and QA is held, so the
+        // pre-fix head is never the one a verifier is handed.
+        expect(dispatchedTo(QA_ID)).toEqual([]);
+        expect(modelHead()).toBe(HEAD_PRE);                          // 1b399fb
+
+        await deliverAndDrain(doneRecord(REVIEW_FIX));               // 12:44:26
+        const qa = dispatchedTo(QA_ID);
+        expect(qa).toHaveLength(1);
+        expect(qa[0].ticketId).toBe(QA);
+        expect(qa[0].headAtDispatch).toBe(HEAD_AFTER_REVIEW_FIX);    // 16fc41d
+        expect(qa[0].headAtDispatch).not.toBe(HEAD_PRE);             // not 1b399fb
+        expect(qa[0].seq).toBeGreaterThan(completeSeq(REVIEW_FIX));
+      });
+
+      it("…and under `off` QA is dispatched against 1b399fb, the head it really verified", async () => {
+        await loadWith({ sweep: "off", fixBefore: "off" });
+        await deliverAndDrain(doneRecord(ANALYST));
+        await deliverAndDrain(doneRecord(DETECT));
+        await deliverAndDrain(insertFixRecord(REVIEW_FIX));
+        await deliverAndDrain(doneRecord(REVIEW));
+
+        // 12:30:57 in the dossier — QA started while TEAM-4241 was still running.
+        expect(h.state.board.get(REVIEW_FIX).status).not.toBe("done");
+        const qa = dispatchedTo(QA_ID);
+        expect(qa).toHaveLength(1);
+        expect(qa[0].headAtDispatch).toBe(HEAD_PRE);                 // 1b399fb
+        expect(qa[0].headAtDispatch).not.toBe(HEAD_AFTER_REVIEW_FIX);
+        // Non-vacuous: 1b399fb is the commit the fixture's QA verifier really recorded.
+        expect(fixtureCompletion(QA).commit_sha).toBe(HEAD_PRE);
+      });
     });
   });
 
