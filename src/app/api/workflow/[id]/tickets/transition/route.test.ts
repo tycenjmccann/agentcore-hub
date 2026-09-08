@@ -42,6 +42,20 @@ const h = vi.hoisted(() => {
     // Every S3/Lambda command, in the order the route issued them: proves the
     // PutObject happens BEFORE the tickets-Lambda InvokeCommand.
     calls: Array<{ client: "s3" | "lambda"; command: string; input: Record<string, unknown> }>;
+    // TEAM-4284: `calls` only sees what was SENT, so it cannot tell "no key was ever
+    // built" from "a key was built and the send was skipped". These record every
+    // command CONSTRUCTION — the moment `completions/${ticketId}.json` would come
+    // into existence (route.ts:121) — which is the actual claim the key-shape guard
+    // makes. `ctorKeys` covers all three S3 commands so a traversal cannot hide in a
+    // Get/Delete either.
+    ctorLog: string[];
+    ctorKeys: string[];
+    putCtorKeys: string[];
+    // Which workflow id each ticket reader was asked for, per request. Recorded in the
+    // hoisted state rather than asserted on the vi.fn, because load() calls
+    // vi.resetModules() and the route therefore holds a DIFFERENT mock instance.
+    jiraListCalls: string[];
+    dynamoListCalls: string[];
     // The fake bucket: key -> { body, etag }. A 412 must leave it as it was.
     bucket: Record<string, { body: string; etag: string }>;
     // When set, the next PutObject rejects with this error.
@@ -58,6 +72,7 @@ const h = vi.hoisted(() => {
     etagSeq: number;
   } = {
     tickets: [], workflow: { workflowId: "wf_1" }, calls: [], bucket: {},
+    ctorLog: [], ctorKeys: [], putCtorKeys: [], jiraListCalls: [], dynamoListCalls: [],
     s3PutError: null, s3GetError: null, afterGet: null,
     lambdaPayload: { status: "transitioned" }, jiraListError: null, etagSeq: 0,
   };
@@ -75,14 +90,20 @@ const h = vi.hoisted(() => {
 });
 
 vi.mock("@aws-sdk/client-s3", () => {
+  /** TEAM-4284: every construction is recorded, whether or not it is ever sent. */
+  const ctor = (command: string, input: Record<string, unknown>) => {
+    h.state.ctorLog.push(command);
+    h.state.ctorKeys.push(String(input.Key ?? ""));
+    if (command === "PutObjectCommand") h.state.putCtorKeys.push(String(input.Key ?? ""));
+  };
   class PutObjectCommand {
-    constructor(public input: Record<string, unknown>) {}
+    constructor(public input: Record<string, unknown>) { ctor("PutObjectCommand", input); }
   }
   class GetObjectCommand {
-    constructor(public input: Record<string, unknown>) {}
+    constructor(public input: Record<string, unknown>) { ctor("GetObjectCommand", input); }
   }
   class DeleteObjectCommand {
-    constructor(public input: Record<string, unknown>) {}
+    constructor(public input: Record<string, unknown>) { ctor("DeleteObjectCommand", input); }
   }
   class S3Client {
     async send(cmd: { constructor: { name: string }; input: Record<string, unknown> }) {
@@ -119,7 +140,7 @@ vi.mock("@aws-sdk/client-s3", () => {
 
 vi.mock("@aws-sdk/client-lambda", () => {
   class InvokeCommand {
-    constructor(public input: Record<string, unknown>) {}
+    constructor(public input: Record<string, unknown>) { h.state.ctorLog.push("InvokeCommand"); }
   }
   class LambdaClient {
     async send(cmd: { constructor: { name: string }; input: Record<string, unknown> }) {
@@ -132,10 +153,14 @@ vi.mock("@aws-sdk/client-lambda", () => {
 
 vi.mock("@/lib/workflow/dynamo-read", () => ({
   getWorkflowFromDynamo: vi.fn(async () => h.state.workflow),
-  getTicketsForWorkflowFromDynamo: vi.fn(async () => h.state.tickets),
+  getTicketsForWorkflowFromDynamo: vi.fn(async (id: string) => {
+    h.state.dynamoListCalls.push(id);
+    return h.state.tickets;
+  }),
 }));
 vi.mock("@/lib/workflow/jira-read", () => ({
-  getTicketsForWorkflowFromJira: vi.fn(async () => {
+  getTicketsForWorkflowFromJira: vi.fn(async (id: string) => {
+    h.state.jiraListCalls.push(id);
     if (h.state.jiraListError) throw h.state.jiraListError;
     return h.state.tickets;
   }),
@@ -172,6 +197,11 @@ function seed(key: string, record: Record<string, unknown>, etag = '"etag-seed"'
 
 beforeEach(() => {
   h.state.calls.length = 0;
+  h.state.ctorLog.length = 0;
+  h.state.ctorKeys.length = 0;
+  h.state.putCtorKeys.length = 0;
+  h.state.jiraListCalls.length = 0;
+  h.state.dynamoListCalls.length = 0;
   h.state.bucket = {};
   h.state.s3PutError = null;
   h.state.s3GetError = null;
@@ -212,6 +242,9 @@ const dels = () => h.state.calls.filter((c) => c.client === "s3" && c.command ==
 const invokes = () => h.state.calls.filter((c) => c.client === "lambda");
 const stored = () =>
   Object.fromEntries(Object.entries(h.state.bucket).map(([k, v]) => [k, v.body]));
+/** TEAM-4284: constructed (not merely sent) commands — see h.state.ctorLog. */
+const putCtors = () => h.state.putCtorKeys;
+const ctorLog = () => h.state.ctorLog;
 
 describe("transition route — completion evidence record (TEAM-4266)", () => {
   it("done + evidence + no existing record → writes completions/{ticketId}.json BEFORE the transition", async () => {
@@ -479,7 +512,16 @@ describe("transition route — a refused transition is not a success (TEAM-4282 
  * proved it belongs to THIS workflow before PR #430 used it.
  */
 describe("transition route — ticketId shape + ownership (TEAM-4282 F1b)", () => {
-  it.each(["../../etc/passwd", "a/b", "has space", "__COUNTER__", "TEAM-X.json", ""])(
+  it.each([
+    "../../etc/passwd",
+    // TEAM-4284: QA's own probe id, pinned here alongside the original vectors.
+    "../../evil/TEAM-9999",
+    "a/b",
+    "has space",
+    "__COUNTER__",
+    "TEAM-X.json",
+    "",
+  ])(
     "rejects ticketId %j with 400 and no AWS traffic",
     async (bad) => {
       await load();
@@ -490,6 +532,8 @@ describe("transition route — ticketId shape + ownership (TEAM-4282 F1b)", () =
       expect(json.error).toMatch(/ticketId/);
       expect(s3calls()).toHaveLength(0);
       expect(invokes()).toHaveLength(0);
+      // TEAM-4284: nothing was even CONSTRUCTED, so no key was ever built.
+      expect(putCtors()).toEqual([]);
     }
   );
 
@@ -718,4 +762,155 @@ describe("transition route — 412 fill-if-blank (TEAM-4282 F3)", () => {
     expect(stored()).toEqual({});
     expect(invokes()).toHaveLength(1);
   });
+});
+
+/**
+ * TEAM-4284 (QA F3 pin) — the QA battery for TEAM-4266 probed the route with
+ * `ticketId: "../../evil/TEAM-9999"` and with a well-formed id belonging to another
+ * run, in BOTH ticket-provider modes, because on 4f20dd5 the id went straight into
+ * `completions/${ticketId}.json` (route.ts:121) with no shape check and — in jira mode
+ * — no proof of workflow ownership. TEAM-4282 closed both holes (TICKET_ID_RE at
+ * route.ts:33 checked at :338; the jira ownership gate at :428-440). Nothing here
+ * changes route.ts: these are the missing PINS, so the guard cannot be deleted
+ * silently.
+ *
+ * Two things make these stronger than the pre-existing cases above:
+ *
+ *  1. They assert on CONSTRUCTIONS (h.state.putCtorKeys / ctorLog), not sends. "The
+ *     evidence key was never built" is the actual security claim; "no PutObject was
+ *     sent" is only a consequence of it.
+ *  2. Every hostile id is SEEDED INTO the mocked ticket list, so the ownership check
+ *     would happily pass it. That leaves the key-shape guard as the only thing that
+ *     can refuse — without the seeding these tests would still go green against a
+ *     build with no shape guard at all, via the ownership 404 (and the dynamodb
+ *     ownership check predates TEAM-4282 entirely).
+ */
+describe("TEAM-4284: ticketId can never reach an S3 key (QA F3 pin, both provider modes)", () => {
+  /** QA's fixture: the two tickets that really do belong to the run under test. */
+  const QA_TICKETS = [
+    { ticketId: "TEAM-4237", status: "in_progress", assignee: "agentcore_hub_backend_dev", title: "Implement the thing" },
+    { ticketId: "TEAM-4273", status: "in_progress", assignee: "agentcore_hub_qa", title: "Verify the thing" },
+  ];
+  const QA_EVIDENCE = "PR #23 review posted";
+  const TRAVERSAL_ID = "../../evil/TEAM-9999";
+  /** A ticket row for `id`, so ownership cannot be what refuses the request. */
+  const seedTicket = (id: string) => ({
+    ticketId: id,
+    status: "in_progress",
+    assignee: "agentcore_hub_backend_dev",
+    title: "seeded so the ownership check passes",
+  });
+
+  it("TEAM-4284: jira mode — a well-formed ticketId from another workflow is refused before any write", async () => {
+    process.env.TICKET_PROVIDER = "jira"; // read at module load (route.ts:19) — set BEFORE load()
+    await load();
+    h.state.tickets = QA_TICKETS; // TEAM-9999 is NOT one of them
+
+    const res = await post({ ticketId: "TEAM-9999", targetStatus: "done", evidence: QA_EVIDENCE });
+    const json = await res.json();
+
+    expect(res.status).toBeGreaterThanOrEqual(400);
+    expect(res.status).toBeLessThan(500);
+    expect(res.status).toBe(404); // route.ts:438 — the same answer dynamodb mode gives
+    expect(json).toEqual({ error: "Ticket not found" });
+
+    // The ownership proof really ran; the 404 is not an accident of some earlier check.
+    expect(h.state.jiraListCalls).toEqual(["wf_1"]);
+    expect(putCtors()).toEqual([]);
+    expect(ctorLog()).toEqual([]);
+    expect(s3calls()).toHaveLength(0);
+    expect(invokes()).toHaveLength(0);
+    expect(stored()).toEqual({});
+  });
+
+  it("TEAM-4284: jira mode — \"../../evil/TEAM-9999\" is refused by the SHAPE guard, not by ownership", async () => {
+    process.env.TICKET_PROVIDER = "jira";
+    await load();
+    h.state.tickets = [seedTicket(TRAVERSAL_ID), ...QA_TICKETS];
+
+    const res = await post({ ticketId: TRAVERSAL_ID, targetStatus: "done", evidence: QA_EVIDENCE });
+    const json = await res.json();
+
+    expect(res.status).toBeGreaterThanOrEqual(400);
+    expect(res.status).toBeLessThan(500);
+    expect(res.status).toBe(400); // route.ts:338
+    expect(json.error).toMatch(/ticketId/);
+
+    // No key was ever BUILT — not for a Put, not for a Get, not for a Delete.
+    expect(putCtors()).toEqual([]);
+    expect(h.state.ctorKeys.some((k) => k.includes("evil"))).toBe(false);
+    expect(h.state.ctorKeys).toEqual([]);
+    expect(ctorLog()).toEqual([]);
+    expect(s3calls()).toHaveLength(0);
+    expect(invokes()).toHaveLength(0);
+    expect(stored()).toEqual({});
+    // The guard sits so early (before route.ts:354/:400) that Jira was never queried.
+    expect(h.state.jiraListCalls).toEqual([]);
+  });
+
+  it("TEAM-4284: dynamodb mode — \"../../evil/TEAM-9999\" is refused by the SHAPE guard, not by ownership", async () => {
+    await load(); // TICKET_PROVIDER = "dynamodb" from beforeEach
+    h.state.tickets = [seedTicket(TRAVERSAL_ID), ...QA_TICKETS];
+
+    const res = await post({ ticketId: TRAVERSAL_ID, targetStatus: "done", evidence: QA_EVIDENCE });
+    const json = await res.json();
+
+    expect(res.status).toBe(400);
+    expect(json.error).toMatch(/ticketId/);
+    expect(putCtors()).toEqual([]);
+    expect(h.state.ctorKeys.some((k) => k.includes("evil"))).toBe(false);
+    expect(ctorLog()).toEqual([]);
+    expect(s3calls()).toHaveLength(0);
+    expect(invokes()).toHaveLength(0);
+    expect(stored()).toEqual({});
+    // The shape guard (route.ts:338) precedes the provider branch (route.ts:363).
+    expect(h.state.dynamoListCalls).toEqual([]);
+  });
+
+  it("TEAM-4284: dynamodb mode — a foreign well-formed ticketId is 404 Ticket not found before any write", async () => {
+    await load();
+    h.state.tickets = QA_TICKETS;
+
+    const res = await post({ ticketId: "TEAM-9999", targetStatus: "done", evidence: QA_EVIDENCE });
+    const json = await res.json();
+
+    expect(res.status).toBe(404); // route.ts:367
+    expect(json).toEqual({ error: "Ticket not found" });
+    expect(h.state.dynamoListCalls).toEqual(["wf_1"]);
+    expect(putCtors()).toEqual([]);
+    expect(ctorLog()).toEqual([]);
+    expect(s3calls()).toHaveLength(0);
+    expect(invokes()).toHaveLength(0);
+    expect(stored()).toEqual({});
+  });
+
+  /**
+   * Property-style: no hostile id, in either mode, may ever produce a constructed
+   * evidence key. Each id is seeded into the mocked list first (see the describe
+   * header), so the shape guard is the only possible refuser.
+   */
+  const HOSTILE_IDS = [TRAVERSAL_ID, "TEAM-1/..", "..", "completions/x", "TEAM-1%2F..", "TEAM-1?x", "", "   "];
+  const MODES = ["dynamodb", "jira"] as const;
+
+  it.each(MODES.flatMap((mode) => HOSTILE_IDS.map((id) => [mode, id] as [string, string])))(
+    "TEAM-4284: %s mode rejects ticketId %j with no evidence key ever constructed",
+    async (mode, hostile) => {
+      process.env.TICKET_PROVIDER = mode;
+      await load();
+      h.state.tickets = [seedTicket(hostile), ...QA_TICKETS];
+
+      const res = await post({ ticketId: hostile, targetStatus: "done", evidence: QA_EVIDENCE });
+      const json = await res.json();
+
+      expect(res.status).toBeGreaterThanOrEqual(400);
+      expect(res.status).toBeLessThan(500);
+      expect(json.error).toMatch(/ticketId/);
+      expect(putCtors()).toEqual([]);
+      expect(h.state.ctorKeys).toEqual([]);
+      expect(ctorLog()).toEqual([]);
+      expect(s3calls()).toHaveLength(0);
+      expect(invokes()).toHaveLength(0);
+      expect(stored()).toEqual({});
+    }
+  );
 });
