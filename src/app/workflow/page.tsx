@@ -7,6 +7,7 @@ import WorkflowManagerChat from "@/components/workflow/WorkflowManagerChat";
 import IntakeForm from "@/components/workflow/IntakeForm";
 import PerformanceCard from "@/components/workflow/PerformanceCard";
 import { type WorkflowState, type WorkflowInput, isTerminalPhase } from "@/lib/workflow/types";
+import { isNoOpPhase } from "@/lib/workflow/run-outcome-display";
 import { WORKFLOW_DEFS, DEFAULT_WORKFLOW_DEF_ID, getWorkflowDef } from "@/lib/workflow/workflow-defs";
 import { resolveSdlcFramework, SDLC_BADGE_META } from "@/lib/workflow/sdlc-framework";
 import DeleteConfirmationModal from "@/components/workflow/DeleteConfirmationModal";
@@ -93,8 +94,8 @@ export default function WorkflowPage() {
         .filter((w: WorkflowSummary) => w.id);
       // Sort: active first, then by date descending
       list.sort((a, b) => {
-        const aActive = a.phase !== "complete" && a.phase !== "error" && a.phase !== "cancelled";
-        const bActive = b.phase !== "complete" && b.phase !== "error" && b.phase !== "cancelled";
+        const aActive = !isTerminalPhase(a.phase);
+        const bActive = !isTerminalPhase(b.phase);
         if (aActive && !bActive) return -1;
         if (!aActive && bActive) return 1;
         return new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime();
@@ -268,8 +269,8 @@ export default function WorkflowPage() {
           const updated = [...prev, targetWorkflow];
           // Re-sort: active first, then by date descending
           updated.sort((a, b) => {
-            const aActive = a.phase !== "complete" && a.phase !== "error" && a.phase !== "cancelled";
-            const bActive = b.phase !== "complete" && b.phase !== "error" && b.phase !== "cancelled";
+            const aActive = !isTerminalPhase(a.phase);
+            const bActive = !isTerminalPhase(b.phase);
             if (aActive && !bActive) return -1;
             if (!aActive && bActive) return 1;
             return new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime();
@@ -531,6 +532,10 @@ function WorkflowListItem({
             <div className="w-2 h-2 rounded-full bg-red-500 mt-0.5" />
           ) : workflow.phase === "cancelled" ? (
             <div className="w-2 h-2 rounded-full bg-amber-500/60 mt-0.5" />
+          ) : isNoOpPhase(workflow.phase) ? (
+            // TEAM-4249 D2.9 — sky, not the green "delivered" dot: the run finished
+            // cleanly but shipped nothing, which is a different fact.
+            <div className="w-2 h-2 rounded-full bg-sky-400/60 mt-0.5" />
           ) : (
             <div className="w-2 h-2 rounded-full bg-green-500/60 mt-0.5" />
           )}
@@ -581,7 +586,25 @@ function WorkflowListItem({
               )}
             </div>
           )}
-          {!isRunning && workflow.phase !== "cancelled" && onArchive && (
+          {/* TEAM-4249 D2.9 — mirrors the Cancelled badge above (same archive-button
+              placement, so the button below stays excluded and is not duplicated). */}
+          {!isRunning && isNoOpPhase(workflow.phase) && (
+            <div className="mt-1 flex items-center gap-1.5">
+              <span className="text-[9px] px-1.5 py-0.5 rounded bg-sky-500/10 text-sky-400 border border-sky-500/20 font-medium uppercase tracking-wider">
+                Nothing to remove
+              </span>
+              {onArchive && (
+                <button
+                  onClick={(e) => { e.stopPropagation(); onArchive(workflow.id); }}
+                  className="p-0.5 rounded hover:bg-orange-500/20 text-[var(--color-text-muted)] hover:text-orange-400 transition-colors"
+                  title="Archive workflow"
+                >
+                  <Archive className="w-3 h-3" />
+                </button>
+              )}
+            </div>
+          )}
+          {!isRunning && workflow.phase !== "cancelled" && !isNoOpPhase(workflow.phase) && onArchive && (
             <div className="mt-1 flex items-center gap-1.5">
               <button
                 onClick={(e) => { e.stopPropagation(); onArchive(workflow.id); }}
