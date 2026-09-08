@@ -193,6 +193,34 @@ function clamp(text: string): string {
   return t.length > MAX_NOTICE_CHARS ? `${t.slice(0, MAX_NOTICE_CHARS - 1)}…` : t;
 }
 
+/** A commit SHA (short or full) — anything else renders as "unknown". */
+const SHA_RE = /^[0-9a-f]{7,40}$/i;
+
+/** `QA <sha7> · CI <sha7> · PR <sha7>`, "unknown" for a missing/malformed head. */
+function formatHeads(rawHeads: unknown): string {
+  const heads = rawHeads && typeof rawHeads === "object" ? (rawHeads as Record<string, unknown>) : {};
+  const shortSha = (value: unknown): string => {
+    const s = clean(value);
+    return SHA_RE.test(s) ? s.slice(0, 7) : "unknown";
+  };
+  return `QA ${shortSha(heads.qa)} · CI ${shortSha(heads.ci)} · PR ${shortSha(heads.pr)}`;
+}
+
+/** Evidence is an open shape (sweep-cadence's two evidence interfaces differ per
+ *  reason) — flatten only top-level SCALAR fields, sorted for a stable line,
+ *  capped so one bloated field can't crowd out the rest. */
+const MAX_EVIDENCE_PAIRS = 6;
+function formatEvidence(rawEvidence: unknown): string {
+  if (!rawEvidence || typeof rawEvidence !== "object" || Array.isArray(rawEvidence)) return "";
+  const evidence = rawEvidence as Record<string, unknown>;
+  const pairs = Object.keys(evidence)
+    .sort()
+    .filter((key) => ["string", "number", "boolean"].includes(typeof evidence[key]))
+    .slice(0, MAX_EVIDENCE_PAIRS)
+    .map((key) => `${key}=${clean(evidence[key])}`);
+  return pairs.length ? ` · ${pairs.join(" · ")}` : "";
+}
+
 /**
  * Structurally narrow one of the orchestrator's non-`WorkflowEvent` events to a
  * notice line (+ the phase it implies). Returns null for everything else —
@@ -206,25 +234,36 @@ export function describeOrchestratorEvent(raw: unknown): OrchestratorEventDispla
 
   switch (event.type) {
     case "orchestrator.completion_blocked": {
+      // Acceptance criterion (design §3.4): show reason + the three heads. Heads
+      // only mean anything for head-divergence (open-fix never carries them) —
+      // still show "unknown" x3 for a malformed head-divergence payload so a
+      // reviewer sees the contract broke, rather than silently dropping the segment.
       const slug = clean(event.reason);
       const reason = COMPLETION_BLOCKED_REASONS[slug] || slug || "reason not reported";
+      const headsSegment = slug === "open-fix" ? "" : ` · ${formatHeads(event.heads)}`;
       const offenders = Array.isArray(event.offenders)
         ? event.offenders.map(clean).filter(Boolean)
         : [];
       const detail = offenders.length ? ` (${offenders.length}: ${offenders.join(", ")})` : "";
       return {
-        text: clamp(`Completion blocked — ${reason}${detail}`),
+        text: clamp(`Completion blocked — ${reason}${headsSegment}${detail}`),
         phase: null,
         tone: "ship-blocked",
       };
     }
 
     case "workflow.skipped": {
+      // Acceptance criterion: show reason + evidence. Evidence is an open shape
+      // (sweep-cadence's two evidence interfaces differ per reason), so flatten
+      // only its top-level scalar fields rather than hardcoding either shape.
       const slug = clean(event.reason);
       const reason = SKIP_REASONS[slug] || slug || "reason not reported";
       const repo = clean(event.repo);
+      const evidenceSegment = formatEvidence(event.evidence);
       return {
-        text: clamp(`Run skipped — ${reason}${repo ? ` (${repo})` : ""}`),
+        text: clamp(
+          `Run skipped — ${reason}${repo ? ` (${repo})` : ""}${evidenceSegment}`
+        ),
         phase: null,
         tone: "cancelled",
       };

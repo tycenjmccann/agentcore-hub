@@ -142,12 +142,17 @@ describe("isNoOpPhase", () => {
 
 describe("describeOrchestratorEvent — orchestrator.completion_blocked", () => {
   // Payload shape from lambda/orchestrator/index.mjs (publishEvent
-  // "orchestrator.completion_blocked"), flattened by transform-event.ts.
+  // "orchestrator.completion_blocked"), flattened by transform-event.ts. 40-char
+  // (full) SHAs on purpose — proves the render slices to 7, not just passes
+  // through an already-short fixture.
+  const QA_SHA = "933ea6f" + "0".repeat(33);
+  const CI_SHA = "12e9ac6" + "0".repeat(33);
+  const PR_SHA = "001259d" + "0".repeat(33);
   const event = {
     type: "orchestrator.completion_blocked",
     workflowId: "wf-1",
     reason: "head-divergence",
-    heads: { qa: "933ea6f", ci: "933ea6f", pr: "001259d" },
+    heads: { qa: QA_SHA, ci: CI_SHA, pr: PR_SHA },
     offenders: [],
     mode: "enforce",
     timestamp: "2026-09-08T00:00:00.000Z",
@@ -162,7 +167,26 @@ describe("describeOrchestratorEvent — orchestrator.completion_blocked", () => 
     expect(d!.text).toContain("verified");
   });
 
-  it("names the offenders for the open-fix reason", () => {
+  it("shows reason + all three heads, sliced to 7 chars, for head-divergence", () => {
+    const d = describeOrchestratorEvent(event);
+    expect(d!.text).toContain("QA 933ea6f · CI 12e9ac6 · PR 001259d");
+  });
+
+  it("renders unknown for all three heads when `heads` is missing", () => {
+    const { heads, ...withoutHeads } = event;
+    const d = describeOrchestratorEvent(withoutHeads);
+    expect(d!.text).toContain("QA unknown · CI unknown · PR unknown");
+  });
+
+  it("renders unknown only for the slot whose head isn't a hex SHA", () => {
+    const d = describeOrchestratorEvent({
+      ...event,
+      heads: { qa: "not-a-sha", ci: CI_SHA, pr: PR_SHA },
+    });
+    expect(d!.text).toContain("QA unknown · CI 12e9ac6 · PR 001259d");
+  });
+
+  it("names the offenders for the open-fix reason, and omits the heads segment entirely", () => {
     const d = describeOrchestratorEvent({
       ...event,
       reason: "open-fix",
@@ -172,13 +196,19 @@ describe("describeOrchestratorEvent — orchestrator.completion_blocked", () => 
     expect(d!.text).toContain("2");
     expect(d!.text).toContain("TEAM-4101");
     expect(d!.text).toContain("TEAM-4102");
+    // open-fix never carries heads (design §3.4) — the segment is omitted, not
+    // rendered as three "unknown"s, even though this fixture's `heads` is set.
+    expect(d!.text).not.toContain("QA ");
+    expect(d!.text).not.toContain("unknown");
   });
 
   it("falls back to the raw slug for an unmapped reason, and never renders undefined", () => {
     const unmapped = describeOrchestratorEvent({ ...event, reason: "some-new-reason" });
     expect(unmapped!.text).toContain("some-new-reason");
     const missing = describeOrchestratorEvent({ type: "orchestrator.completion_blocked" });
-    expect(missing!.text).toBe("Completion blocked — reason not reported");
+    // No `reason` field is not `head-divergence`, so this is also the "unmapped
+    // reason" path — heads still render since the slug isn't "open-fix".
+    expect(missing!.text).toBe("Completion blocked — reason not reported · QA unknown · CI unknown · PR unknown");
     expect(missing!.text).not.toContain("undefined");
   });
 });
@@ -186,19 +216,17 @@ describe("describeOrchestratorEvent — orchestrator.completion_blocked", () => 
 describe("describeOrchestratorEvent — workflow.skipped", () => {
   // Payload from src/app/api/workflow/start/route.ts (writeSweepEvent), with the
   // evidence shapes from ./sweep-cadence.
-  it("explains a recent-sweep skip without setting a phase (tombstone, never ran)", () => {
+  it("explains a recent-sweep skip, flattening scalar evidence and ignoring nested objects", () => {
     const d = describeOrchestratorEvent({
       type: "workflow.skipped",
       workflowId: "wf-skip-1",
       reason: "recent-sweep",
       evidence: {
         repo: "tycenjmccann/agentcore-hub",
-        lastRunId: "wf-prev",
-        lastRunAt: "2026-09-05T00:00:00.000Z",
+        lastSweepAt: "2026-09-05T00:00:00.000Z",
+        minIntervalDays: 14,
         ageDays: 3,
-        minIntervalDays: 7,
-        runsConsidered: 4,
-        prProbe: { probed: true },
+        prProbe: { probed: true }, // nested object — must be ignored, not "[object Object]"
       },
       repo: "tycenjmccann/agentcore-hub",
       defId: "dead-code-sweep",
@@ -209,6 +237,32 @@ describe("describeOrchestratorEvent — workflow.skipped", () => {
     expect(d!.text).toContain("Run skipped");
     expect(d!.text).toContain("minimum interval");
     expect(d!.text).toContain("tycenjmccann/agentcore-hub");
+    expect(d!.text).toContain("lastSweepAt=2026-09-05T00:00:00.000Z");
+    expect(d!.text).toContain("minIntervalDays=14");
+    expect(d!.text).not.toContain("[object Object]");
+    expect(d!.text).not.toContain("probed");
+  });
+
+  it("caps flattened evidence at 6 pairs, in a stable (sorted) order", () => {
+    const d = describeOrchestratorEvent({
+      type: "workflow.skipped",
+      reason: "recent-sweep",
+      evidence: { g: 1, f: 2, e: 3, d: 4, c: 5, b: 6, a: 7 },
+    });
+    // Sorted: a, b, c, d, e, f — "g" is the 7th and must be dropped by the cap.
+    expect(d!.text).toContain("a=7 · b=6 · c=5 · d=4 · e=3 · f=2");
+    expect(d!.text).not.toContain("g=1");
+  });
+
+  it("keeps existing behaviour when evidence is absent", () => {
+    const d = describeOrchestratorEvent({
+      type: "workflow.skipped",
+      reason: "recent-sweep",
+      repo: "tycenjmccann/agentcore-hub",
+    });
+    expect(d!.text).toBe(
+      "Run skipped — a sweep already ran for this repo inside the minimum interval (tycenjmccann/agentcore-hub)"
+    );
   });
 
   it("explains an open-sweep-pr skip", () => {
@@ -227,6 +281,17 @@ describe("describeOrchestratorEvent — workflow.skipped", () => {
     });
     expect(d!.phase).toBeNull();
     expect(d!.text).toContain("sweep PR is still open");
+  });
+
+  it("a 2000-char evidence value is still clamped to <= 240 chars total", () => {
+    const d = describeOrchestratorEvent({
+      type: "workflow.skipped",
+      reason: "recent-sweep",
+      repo: "tycenjmccann/agentcore-hub",
+      evidence: { note: "x".repeat(2000) },
+    });
+    expect(d!.text.length).toBeLessThanOrEqual(240);
+    expect(d!.text.endsWith("…")).toBe(true);
   });
 });
 
