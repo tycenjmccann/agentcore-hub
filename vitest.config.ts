@@ -363,6 +363,14 @@ export default defineConfig({
       // from a structured field — dowtdh TEAM-4180's prose holds five SHAs and
       // the first one is not the head it reviewed.
       "lambda/orchestrator/verdict-contract.test.mjs",
+      // verdict-ladder-corpus (TEAM-4264 F1) — the same ladder against EVERY gate
+      // completion in ALL SIX vendored dossiers, 31 records, exhaustively tabled.
+      // Separate from verdict-contract.test.mjs on purpose: that file pins the
+      // prose spellings the ladder must read, this one pins what it says about
+      // records nobody chose. It exists because a null verdict now HOLDS, so a
+      // rung added to read more summaries can flip a real PASS to FAIL and stall
+      // a run — the first attempt at F1's widening flipped 11 of 12.
+      "lambda/orchestrator/verdict-ladder-corpus.test.mjs",
       // fix-before-verify (TEAM-4246 D1, FR-D1.7) — the creation-time half of the
       // verdict hole: dowtdh filed fix TEAM-4183 with `blockedBy: []` and invoked QA
       // TEAM-4181 78 seconds later, against code the fix had not landed on. Pins the

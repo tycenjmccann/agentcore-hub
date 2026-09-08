@@ -95,16 +95,66 @@ const VERDICT_ALT = "(PASS|FAIL|BLOCKED|CHANGES[\\s_-]*NEEDED)";
  *   ROUND     "**Ship review round 2 — PASS on head `7c2391ba…`**" — the release
  *             manager's own heading form, which carries no "verdict:" label at
  *             all (f50ucz TEAM-4126). Second, so a labelled line always wins.
+ *   HEADLINE  "QA FAIL: 191 PASS / 8 FAIL", "Review complete: CHANGES NEEDED",
+ *             "CI GATE: ✅ PASS —", "BLOCKED: startCiBuild=false" — the form the
+ *             blueprints actually produce when the persona leads with its answer
+ *             instead of labelling it (TEAM-4264 F1). See HEADLINE_RE.
  *
- * There is deliberately no third rung scanning for a bare PASS/FAIL: these
- * summaries are full of "npm test 57/57", "0 Critical", "GH Actions green" and
- * "Deploy stage ended with the intentional HANDOFF exit 2". A wrong verdict is
- * worse than no verdict, because no verdict leaves today's behaviour in place.
+ * There is deliberately STILL no rung that scans a summary for a bare PASS/FAIL
+ * anywhere in the body: these summaries are full of "npm test 57/57",
+ * "0 Critical", "GH Actions green" and "Deploy stage ended with the intentional
+ * HANDOFF exit 2". A wrong verdict is worse than no verdict — and under
+ * TEAM-4264 that is now literally true in both directions, because a null
+ * verdict HOLDS the successor (cascade.mjs resolveVerdictHold) rather than
+ * releasing it, so a mis-read PASS ships over a failure and a mis-read FAIL
+ * costs a re-verify round. The HEADLINE rung is what keeps that safe: it is
+ * anchored to the START of a line, so the verdict token has to be the thing the
+ * line is ABOUT. A document-wide /\bFAIL\b/ scan (with or without a numeric
+ * zero-guard) was measured against the six vendored dossiers and flipped 11 of
+ * 12 real PASS/CHANGES_NEEDED gate completions to FAIL — dowtdh TEAM-4182's
+ * "CI verdict: PASS" among them, because its body enumerates the failures it
+ * fixed. Line-anchoring drops that to 0 flips with no heuristic at all.
  */
 const VERDICT_LADDER = [
   new RegExp(`verdict\\s*:\\s*\\*{0,2}\\s*${VERDICT_ALT}\\b`, "i"),
   new RegExp(`round\\s*\\d+\\s*[—–-]+\\s*\\*{0,2}\\s*${VERDICT_ALT}\\b`, "i"),
 ];
+
+/**
+ * Rung 3 — the HEADLINE form (TEAM-4264 F1), evaluated per LINE.
+ *
+ * A line qualifies when, reading left to right, it is:
+ *
+ *   DECOR   leading markdown / status emoji ("> ", "**", "### ", "✅", "🔴")
+ *   LABEL   at most TWO short words, each optionally followed by its own
+ *           separator — "QA ", "CI GATE: ", "Review complete: ", "Ship review: ".
+ *           Two is what the corpus needs and no more: the cap is the difference
+ *           between reading a headline and reading a sentence.
+ *   VERDICT one of the four enum values, optionally bolded
+ *   END     a TERMINATOR — ":", an em/en dash, "-", "(", "," or end of line.
+ *
+ * The terminator is the half that does the real work. It is why none of
+ * "0 FAIL", "FAILURES: 0", "8 FAIL in live Chromium" or "191 PASS / 8 FAIL"
+ * can match — either a digit precedes the token (so the line does not START
+ * with it) or what follows is prose rather than a break. No count parsing and
+ * no zero-guard is needed anywhere in this module, which is the point: a rule
+ * that reads "0 FAIL" correctly by NOT matching it cannot be fooled by "00
+ * FAIL" or "zero FAIL".
+ *
+ * Every line is scanned and the MOST SEVERE hit wins (BLOCKED > FAIL >
+ * CHANGES_NEEDED > PASS), because a persona that writes "PASS on the unit
+ * suite" above "BLOCKED: no CI credentials" has not passed. That ordering is
+ * the same one FR-D1.2 states and the same one applyVerdictHold acts on.
+ */
+const HEADLINE_DECOR = "[\\s>*#_`\\u2705\\u274C\\u26A0\\uFE0F\\u{1F7E2}\\u{1F534}\\u{1F7E1}]*";
+const HEADLINE_LABEL = "(?:[A-Za-z]{1,12}\\s*[:\\u2014\\u2013-]?\\s+){0,2}";
+const HEADLINE_RE = new RegExp(
+  `^${HEADLINE_DECOR}${HEADLINE_LABEL}${HEADLINE_DECOR}\\*{0,2}${VERDICT_ALT}\\*{0,2}\\s*(?:[:\\u2014\\u2013-]|\\(|,|$)`,
+  "iu"
+);
+
+/** Most-severe-wins, for the HEADLINE rung only. Higher number = worse news. */
+const VERDICT_SEVERITY = { BLOCKED: 4, FAIL: 3, CHANGES_NEEDED: 2, PASS: 1 };
 
 /**
  * One of VERDICTS, or null. Accepts all three spellings the repo already
@@ -139,6 +189,11 @@ export function normalizeSha(raw) {
 /**
  * The verdict a summary states, or null. `matched` is the substring that decided
  * it, so an operator reading the event can see WHY without re-running the regex.
+ *
+ * Rungs 1-2 are document-wide and FIRST-HIT-WINS, unchanged: a labelled line is
+ * the persona answering the question directly, and there has never been a corpus
+ * case with two of them disagreeing. Rung 3 runs only when neither labelled form
+ * is present, and is per-line + most-severe-wins (see HEADLINE_RE).
  */
 export function deriveVerdict(summary) {
   if (typeof summary !== "string" || !summary) return null;
@@ -148,7 +203,17 @@ export function deriveVerdict(summary) {
     const verdict = normalizeVerdict(m[1]);
     if (verdict) return { verdict, source: "inferred", matched: m[0].trim() };
   }
-  return null;
+  let worst = null;
+  for (const line of summary.split(/\r?\n/)) {
+    const m = line.match(HEADLINE_RE);
+    if (!m) continue;
+    const verdict = normalizeVerdict(m[1]);
+    if (!verdict) continue;
+    if (!worst || VERDICT_SEVERITY[verdict] > VERDICT_SEVERITY[worst.verdict]) {
+      worst = { verdict, source: "inferred", matched: m[0].trim() };
+    }
+  }
+  return worst;
 }
 
 /**
@@ -234,9 +299,18 @@ export function normalizeVerdictMode(raw) {
  * so the caller files ONE re-verify ticket and holds on that instead. Holding on
  * nothing would wedge the run; dispatching anyway would be the hole D1 closes.
  *
- * A null verdict never suppresses. "The agent stated nothing" is not "the agent
- * failed", and inventing a hold there would stall every run whose gate persona
- * writes a summary the ladder cannot read.
+ * A NULL verdict suppresses too (TEAM-4264 F1), and `reason` stays "no-verdict"
+ * so the two causes remain distinguishable in the journal. This inverts what
+ * this function shipped with, and the inversion is the finding: FR-D1.4 and
+ * DL-013 both say "null is never PASS", but routing null and PASS to the same
+ * `wouldSuppress: false` made it exactly PASS. A gate persona is the one role
+ * whose SILENCE IS NOT CONSENT — every other persona's job is to produce work,
+ * and this one's job is to say whether the work is good. "The reviewer wrote a
+ * paragraph we cannot parse" is a reason to ask again, not a reason to ship. The
+ * cost is bounded and paid in the right currency: an unreadable summary costs
+ * ONE re-verify round (and the round is capped), where the old behaviour cost a
+ * released gate. dowtdh is the run that proves the direction — its QA FAIL and
+ * reviewer CHANGES-NEEDED were both unreadable prose to the shipped ladder.
  */
 export function evaluateGate({ assignee, verdict, spawnedTickets, mode } = {}) {
   const base = { reason: "off", wouldSuppress: false, suppress: false, blockOn: [], needsGateReverify: false };
@@ -244,7 +318,6 @@ export function evaluateGate({ assignee, verdict, spawnedTickets, mode } = {}) {
   if (normMode === "off") return base;
   if (!GATE_PERSONAS.has(assignee)) return { ...base, reason: "not-a-gate" };
   const normVerdict = normalizeVerdict(verdict);
-  if (!normVerdict) return { ...base, reason: "no-verdict" };
   if (normVerdict === "PASS") return { ...base, reason: "pass" };
 
   const blockOn = [];
@@ -252,7 +325,7 @@ export function evaluateGate({ assignee, verdict, spawnedTickets, mode } = {}) {
     if (typeof id === "string" && id.trim() && !blockOn.includes(id.trim())) blockOn.push(id.trim());
   }
   return {
-    reason: "non-pass",
+    reason: normVerdict ? "non-pass" : "no-verdict",
     wouldSuppress: true,
     suppress: normMode === "enforce",
     blockOn,

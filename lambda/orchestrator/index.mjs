@@ -925,6 +925,10 @@ function getCascade() {
           // Same factory as observeLiveReverify's kind:"ship" path — one memo,
           // one idempotency store, whichever kind asks first.
           reverify: (args) => getLiveReverify().reverify(args),
+          // TEAM-4264 F2 — the fallback head for a gate re-verify when the persona
+          // reported no tested_head. Memoized, null-on-anything, so the cascade
+          // pays at most one GitHub read per invocation and never throws.
+          headResolver: (workflow) => featureBranchHeadSha(workflow),
           addBlockers,
         }
       : { verdictGate: null }),
@@ -1271,11 +1275,19 @@ function spawnedFixIdsFor(ticketId, siblings) {
  *     and resolving spawnedTickets only when the gate is on would make it differ.
  *     Non-gate personas return before any I/O at all.
  *
- * Never throws, and a record it cannot read yields a null verdict — which by
- * contract holds nothing. That is the same outcome as a persona who stated nothing
- * the ladder recognizes, and it is the only safe reading: the record is the sole
- * input, so there is no second opinion to fall back to, and holding every successor
- * over a transient S3 error would stall runs instead of gating them.
+ * Never throws, and a record it cannot read yields a null verdict — which, since
+ * TEAM-4264 F1, HOLDS rather than releases. The record is the sole input, so there
+ * is no second opinion to fall back to, and the question a read failure poses is
+ * not "did this gate pass" but "may we ship without knowing": for a gate persona
+ * the answer is no. The old rationale here argued the inverse — that holding over
+ * a transient S3 error would stall runs — and the accepted cost is now explicit:
+ * an unreadable record costs ONE re-verify round (bounded by the gate re-verify
+ * cap), not a released gate.
+ *
+ * `resolveError: true` marks the catch branch specifically, so the shadow rollout
+ * can tell "the persona wrote prose the ladder cannot parse" (no flag) from "the
+ * read itself threw" (flagged) and measure how often the second happens before
+ * anyone enforces. Both hold; only the second is an outage.
  */
 let _verdictInfoCache = new Map();
 function resetVerdictInfoCache() {
@@ -1322,7 +1334,7 @@ async function computeVerdictInfo({ ticketId, assignee, workflow, parentId, sibl
     };
   } catch (err) {
     console.warn(`[verdict] could not resolve ${ticketId}'s verdict (non-fatal): ${err?.message || err}`);
-    return { ...NO_VERDICT_INFO, isGatePersona: true, verdictSource: "none" };
+    return { ...NO_VERDICT_INFO, isGatePersona: true, verdictSource: "none", resolveError: true };
   }
 }
 
@@ -1864,6 +1876,10 @@ export const handler = async (event) => {
   // Same per-invocation reasoning, same reason (TEAM-4246 D1) — a verdict decided
   // between two invocations must be re-read, not replayed from a warm container.
   resetVerdictInfoCache();
+  // Same again for the branch head (TEAM-4264 F2/F3): a push between invocations
+  // moves the head, and a re-verify pinned to a warm-container sha would be pinned
+  // to the wrong code.
+  resetBranchHeadCache();
   // Load roster + workflow defs from S3 on first invocation (cached for warm starts)
   await loadAgentRoster();
   await loadWorkflowDefs();
@@ -6937,6 +6953,47 @@ async function featureBranchMergeProbe(workflow) {
     console.warn(`[orchestrator] merge-verify skipped for ${workflow.id}: ${err.message}`);
     return { merged: null }; // fail open, no proof
   }
+}
+
+/**
+ * The run's CURRENT feature-branch head sha, or null (TEAM-4264 F2/F3).
+ *
+ * One `git/ref/heads/<featureBranch>` read, memoized per Lambda invocation because
+ * both callers can fire on the same completion: the verdict gate needs a sha to PIN
+ * a re-verify ticket to (an unpinned re-verify is not idempotent), and the
+ * verified-head completion check needs the real PR head instead of the latest dev
+ * commit it used to guess from.
+ *
+ * Null is "unknown", never "diverged" — no GITHUB_PAT, a deleted branch after a
+ * merge, a 404, a transient — all land here, and every caller treats null as
+ * no-information rather than as evidence. That direction is deliberate: fabricating
+ * a head from a stale proxy is what F3 was.
+ */
+const _branchHeadCache = new Map();
+function resetBranchHeadCache() {
+  _branchHeadCache.clear();
+}
+async function featureBranchHeadSha(workflow) {
+  const branch = workflow?.featureBranch;
+  if (!branch || !workflow?.repoConfig) return null;
+  const key = `${workflow.id}::${branch}`;
+  if (_branchHeadCache.has(key)) return _branchHeadCache.get(key);
+  const p = (async () => {
+    try {
+      const { owner, repo } = parseRepoUrl(workflow.repoConfig);
+      const ref = await githubApi(
+        `/repos/${owner}/${repo}/git/ref/heads/${encodeURIComponent(branch)}`
+      );
+      return ref?.object?.sha || null;
+    } catch (err) {
+      console.warn(
+        `[orchestrator] branch head unresolved for ${workflow.id} (${branch}): ${err?.message || err}`
+      );
+      return null;
+    }
+  })();
+  _branchHeadCache.set(key, p);
+  return p;
 }
 
 /**

@@ -167,6 +167,15 @@ export function createCascade(deps) {
     // Files the gate persona's own re-verify ticket (live-reverify.mjs `reverify`),
     // so a non-PASS verdict always has something REAL to hold the successor on.
     reverify,
+    // TEAM-4264 F2 — the run's CURRENT feature-branch head, async (workflow) → sha
+    // | null (index.mjs featureBranchHeadSha, one memoised GitHub read). Used ONLY
+    // as a fallback when the gate persona reported no tested head of its own: an
+    // unpinned re-verify cannot be filed idempotently, so before this dep a gate
+    // that stated a verdict without a head produced NO durable hold at all — the
+    // successor was suppressed in memory for one pass and re-dispatched by the next
+    // reconcile sweep. Unwired = that old behaviour (the sentinel slot in
+    // live-reverify.mjs is the second belt).
+    headResolver,
     // Writes the blocker edge without yanking a ticket an agent or human is mid-way
     // through (index.mjs applyBlockerEdge, via preserveStatusIf).
     addBlockers,
@@ -231,24 +240,48 @@ export function createCascade(deps) {
     );
 
   /**
+   * The hold's verdict as the JOURNAL spells it: "UNKNOWN" is a cascade-internal
+   * name, so it goes out as null (TEAM-4264 F1). D1 already published
+   * `verdict: null` + `verdictSource: "none"` for an unresolved verdict and every
+   * reader parses that shape; adding a fifth enum value to the wire would make
+   * each consumer's verdict switch fall through instead.
+   */
+  const wireVerdict = (gate) => (gate.verdict === "UNKNOWN" ? null : gate.verdict);
+
+  /**
    * What this ticket's own verdict says about letting its successors run
    * (TEAM-4246 D1). Returns null for every case that must behave exactly as it did
-   * before — flag off, no resolver wired, not a gate persona, no verdict resolvable,
-   * or a PASS. Only a gate persona's NON-PASS verdict produces a hold.
+   * before — flag off, no resolver wired, not a gate persona, or a PASS. A gate
+   * persona's NON-PASS verdict produces a hold, and so does a NULL one.
    *
-   * A null verdict deliberately does not hold: "the persona stated nothing the
-   * contract recognizes" is not "the persona failed", and holding there would stall
-   * every run whose reviewer writes a summary the ladder cannot read.
+   * A null verdict HOLDS, as "UNKNOWN" (TEAM-4264 F1). This is the inversion of
+   * what the module shipped with, and the reason is that the old rule read the
+   * contract backwards: FR-D1.4 says "null is never PASS", but sending null down
+   * the same early return as PASS made it PASS in the only way that matters. The
+   * argument for the old behaviour — "the persona stated nothing the contract
+   * recognizes" is not "the persona failed" — is true and is not the question. The
+   * question is what to DO about not knowing, and for a gate persona the answer
+   * cannot be "ship": its entire job is to decide, so silence is the one output it
+   * is not allowed to produce. What the run pays is one re-verify round, capped,
+   * against a persona that will usually just restate its verdict in a form the
+   * ladder reads. dowtdh paid the other price.
+   *
+   * `verdict` is therefore never null in the returned hold — it is a real enum
+   * value or the string "UNKNOWN", so every consumer can switch on one field.
+   * `verdictSource` stays "none" for UNKNOWN (the wire value D1 already defines)
+   * and `resolveError` distinguishes "we read the record and could not parse it"
+   * from "the read itself threw" — both hold, but only the second is an outage.
    */
   async function resolveVerdictHold(ticketId, workflow, siblings) {
     if (verdictMode === "off" || typeof verdictGate !== "function") return null;
     const info = await verdictGate({ ticketId, workflow, siblings });
     if (!info || info.isGatePersona !== true) return null;
-    const verdict = info.verdict || null;
-    if (!verdict || verdict === "PASS") return null;
+    const verdict = info.verdict || "UNKNOWN";
+    if (verdict === "PASS") return null;
     return {
       verdict,
-      verdictSource: info.verdictSource || null,
+      verdictSource: info.verdictSource || (verdict === "UNKNOWN" ? "none" : null),
+      resolveError: info.resolveError === true,
       testedHead: info.testedHead || "",
       spawnedTickets: (Array.isArray(info.spawnedTickets) ? info.spawnedTickets : []).filter(Boolean),
       // FR-D1.5/D1.6 — the open fixes under the epic this persona did NOT file.
@@ -289,6 +322,20 @@ export function createCascade(deps) {
     // boundary, which must fall back to holding, never to unblocking.
     for (const s of successors) held.add(s.ticketId);
 
+    // TEAM-4264 F1 — an UNKNOWN verdict with NOTHING to hold files nothing. A
+    // re-verify ticket exists to gate a SUCCESSOR; when the gate persona is the
+    // last ticket standing there is no successor to gate, and filing one is pure
+    // cost against a persona that never said anything was wrong. Measured on the
+    // six vendored dossiers, this single line is the difference between "null
+    // holds" costing zero and it re-verifying three genuinely PASSING completions
+    // whose prose the ladder cannot read (f50ucz TEAM-4128 "Verdict: code deploy
+    // SUCCEEDED", iczquj TEAM-3591 "CD COMPLETE — PR #57 merged to main" — both
+    // release managers reporting a finished deploy in words the enum has no room
+    // for). Deliberately scoped to UNKNOWN: a STATED non-PASS verdict with no
+    // successors still files, because the persona told us something IS wrong and
+    // the re-verify is the record of that.
+    if (gate.verdict === "UNKNOWN" && successors.length === 0) return [];
+
     const gateTicket = siblings.find((s) => s.ticketId === ticketId) || { ticketId };
     const owner =
       gateTicket.assignee || workflow?.agentTasks?.[ticketId]?.agentId || null;
@@ -306,12 +353,29 @@ export function createCascade(deps) {
     // unfixed head and burn a round on the same finding.
     const blockOn = [...new Set([...gate.spawnedTickets, ...gate.openFixIds])];
 
+    // The head the re-verify is pinned to (TEAM-4264 F2 belt 1). What the persona
+    // reported wins; the resolver — the run's CURRENT feature-branch head — is the
+    // fallback for the gate that stated a verdict and no head. Without it that gate
+    // produced no durable hold whatsoever: reverify() refuses to file unpinned, so
+    // `blockers` came back empty and only the in-memory `held` Set stood between
+    // the successor and the next reconcile sweep. A failed lookup is not fatal here
+    // — live-reverify.mjs then files against its own deterministic sentinel slot —
+    // so this is one belt of two and neither is load-bearing alone.
+    let headSha = gate.testedHead || "";
+    if (!headSha && typeof headResolver === "function") {
+      try {
+        headSha = (await headResolver(workflow)) || "";
+      } catch (err) {
+        log(`[orchestrator] verdict-gate: head resolve failed (non-fatal) — ${ticketId}: ${err?.message || err}`);
+      }
+    }
+
     const filed = await reverify?.({
       kind: "gate",
       workflow,
       owner,
       gateTicket,
-      headSha: gate.testedHead,
+      headSha,
       blockedBy: blockOn,
       round: gate.round ?? priorRounds + 1,
       reason: `${gate.verdict} (${gate.verdictSource || "unknown source"})`,
@@ -500,8 +564,10 @@ export function createCascade(deps) {
     if (gate && verdictMode === "shadow") {
       await safePublish(ticketId, "orchestrator.verdict_observed", {
         workflowId: workflow?.id,
-        verdict: gate.verdict,
+        verdict: wireVerdict(gate),
         verdictSource: gate.verdictSource,
+        reason: gate.verdict === "UNKNOWN" ? "no-verdict" : "non-pass",
+        ...(gate.resolveError ? { resolveError: true } : {}),
         wouldSuppress: unblocked,
         spawnedTickets: gate.spawnedTickets,
         // What enforce WOULD have held them on (FR-D1.5/D1.6): this persona's fixes
@@ -515,7 +581,10 @@ export function createCascade(deps) {
     } else if (gate && verdictMode === "enforce") {
       await safePublish(ticketId, "orchestrator.verdict_suppressed", {
         workflowId: workflow?.id,
-        verdict: gate.verdict,
+        verdict: wireVerdict(gate),
+        verdictSource: gate.verdictSource,
+        reason: gate.verdict === "UNKNOWN" ? "no-verdict" : "non-pass",
+        ...(gate.resolveError ? { resolveError: true } : {}),
         unblocked: [...held],
         blockers: gateBlockers,
         spawnedTickets: gate.spawnedTickets,

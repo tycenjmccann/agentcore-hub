@@ -1133,6 +1133,7 @@ describe("verdict gate (TEAM-4246 D1)", () => {
     reverifyImpl,
     verdictGateImpl,
     extendedStates,
+    headResolver,
   } = {}) {
     const { deps, ddb, publishEvent, sleep, getChildTickets } = makeDeps({
       getChildTickets: vi.fn(async () => siblings),
@@ -1151,9 +1152,16 @@ describe("verdict gate (TEAM-4246 D1)", () => {
     );
     const reverify = vi.fn(reverifyImpl || (async () => reverifyResult));
     const addBlockers = vi.fn(async (_ticketId, ids) => ids);
-    Object.assign(deps, { verdictGate, verdictGateMode: mode, reverify, addBlockers }, extendedStates ? { extendedStates } : {});
+    Object.assign(
+      deps,
+      { verdictGate, verdictGateMode: mode, reverify, addBlockers },
+      // TEAM-4264 F2 — absent by default, so every pre-existing case still pins
+      // the behaviour of a cascade with no head resolver wired.
+      headResolver ? { headResolver } : {},
+      extendedStates ? { extendedStates } : {}
+    );
     const { cascadeUnblock } = createCascade(deps);
-    return { cascadeUnblock, deps, ddb, publishEvent, sleep, verdictGate, reverify, addBlockers, getChildTickets, siblings };
+    return { cascadeUnblock, deps, ddb, publishEvent, sleep, verdictGate, reverify, addBlockers, getChildTickets, siblings, headResolver };
   }
 
   const detailOf = (publishEvent, type) => eventsOfType(publishEvent, type).map((c) => c[2]);
@@ -1232,6 +1240,10 @@ describe("verdict gate (TEAM-4246 D1)", () => {
           // below and, end to end, in replay-dowtdh-verdict-gate.
           wouldBlockOn: [FIX],
           testedHead: HEAD,
+          // TEAM-4264 F1 — `reason` distinguishes "the persona stated a non-PASS
+          // verdict" from "the persona stated nothing we can read", which now
+          // hold identically and must stay tellable apart in the journal.
+          reason: "non-pass",
         },
       ]);
     });
@@ -1321,7 +1333,15 @@ describe("verdict gate (TEAM-4246 D1)", () => {
         [SUCC, [RV], { preserveStatusIf: ["in_progress", "in_review"] }],
       ]);
       expect(detailOf(h.publishEvent, "orchestrator.verdict_suppressed")).toEqual([
-        { workflowId: "wf_1", verdict: "CHANGES_NEEDED", unblocked: [SUCC], blockers: [FIX, RV], spawnedTickets: [FIX] },
+        {
+          workflowId: "wf_1",
+          verdict: "CHANGES_NEEDED",
+          verdictSource: "declared",   // TEAM-4264 F1 — parity with verdict_observed
+          reason: "non-pass",
+          unblocked: [SUCC],
+          blockers: [FIX, RV],
+          spawnedTickets: [FIX],
+        },
       ]);
     });
 
@@ -1445,10 +1465,173 @@ describe("verdict gate (TEAM-4246 D1)", () => {
     });
   });
 
+  /**
+   * TEAM-4264 F1 — the inversion. `resolveVerdictHold` used to route a null verdict
+   * down the same early return as PASS, so the one persona whose job is to DECIDE
+   * was allowed to say nothing and have that read as consent. dowtdh is the run
+   * that proves the direction: its QA FAIL and reviewer CHANGES-NEEDED were both
+   * prose the ladder could not read, i.e. exactly this case.
+   */
+  describe("a null verdict holds (TEAM-4264 F1)", () => {
+    const nullGate = { verdict: null, verdictSource: "none", spawnedTickets: [] };
+
+    it("enforce holds the successor and files the re-verify", async () => {
+      const h = gateHarness({ gate: nullGate });
+
+      const unblocked = await h.cascadeUnblock(DONE, "EPIC-1", workflow);
+
+      expect(unblocked).toEqual([]);
+      expect(h.reverify).toHaveBeenCalledTimes(1);
+      expect(h.reverify.mock.calls[0][0]).toMatchObject({ kind: "gate", gateTicket: expect.anything(), blockedBy: [] });
+      // The successor waits on the re-verify — a DURABLE edge, not the in-memory
+      // hold alone (F2's other half).
+      expect(h.addBlockers.mock.calls.map((c) => [c[0], c[1]])).toEqual([[SUCC, [RV]]]);
+    });
+
+    it("the journal says null / none / no-verdict, never the internal UNKNOWN", async () => {
+      // "UNKNOWN" is the cascade's own name for the state; the wire keeps D1's
+      // shape, because every reader (UI, cost-report, replay) switches on these
+      // four enum values and a fifth would fall through.
+      const h = gateHarness({ gate: nullGate });
+
+      await h.cascadeUnblock(DONE, "EPIC-1", workflow);
+
+      expect(detailOf(h.publishEvent, "orchestrator.verdict_suppressed")[0]).toMatchObject({
+        verdict: null,
+        verdictSource: "none",
+        reason: "no-verdict",
+        unblocked: [SUCC],
+        blockers: [RV],
+      });
+    });
+
+    it("a STATED non-PASS still reports reason non-pass", async () => {
+      const h = gateHarness({ gate: { verdict: "FAIL" } });
+
+      await h.cascadeUnblock(DONE, "EPIC-1", workflow);
+
+      expect(detailOf(h.publishEvent, "orchestrator.verdict_suppressed")[0]).toMatchObject({
+        verdict: "FAIL", reason: "non-pass",
+      });
+      expect(detailOf(h.publishEvent, "orchestrator.verdict_suppressed")[0]).not.toHaveProperty("resolveError");
+    });
+
+    it("shadow observes and releases, exactly as for a stated non-PASS", async () => {
+      // The flag still owns the action. F1 changes what the decision IS, not who
+      // is allowed to act on it — a shadow deployment must stay observe-only.
+      const h = gateHarness({ mode: "shadow", gate: nullGate });
+
+      expect(await h.cascadeUnblock(DONE, "EPIC-1", workflow)).toEqual([SUCC]);
+      expect(h.addBlockers).not.toHaveBeenCalled();
+      expect(detailOf(h.publishEvent, "orchestrator.verdict_observed")[0]).toMatchObject({
+        verdict: null, verdictSource: "none", reason: "no-verdict", wouldSuppress: [SUCC],
+      });
+      expect(eventsOfType(h.publishEvent, "orchestrator.verdict_suppressed")).toHaveLength(0);
+    });
+
+    it("a resolver ERROR holds too, and is flagged as an outage", async () => {
+      // Same hold, different cause: `resolveError` is what lets the shadow week
+      // measure how often the S3 read itself failed versus how often a persona
+      // wrote prose the ladder cannot parse. Both hold; only one is an incident.
+      const h = gateHarness({ gate: { ...nullGate, resolveError: true } });
+
+      expect(await h.cascadeUnblock(DONE, "EPIC-1", workflow)).toEqual([]);
+      expect(detailOf(h.publishEvent, "orchestrator.verdict_suppressed")[0]).toMatchObject({
+        verdict: null, reason: "no-verdict", resolveError: true,
+      });
+    });
+
+    it("nothing to hold → observe only, no re-verify ticket", async () => {
+      // The refinement that makes F1 free on the vendored corpus: two of the six
+      // runs end with a release manager reporting a finished deploy in words the
+      // enum has no room for ("code deploy SUCCEEDED", "CD COMPLETE"), and both
+      // are the LAST ticket standing. A re-verify ticket exists to gate a
+      // SUCCESSOR; with no successor it is pure cost against a persona that never
+      // said anything was wrong.
+      const h = gateHarness({ gate: nullGate, siblings: board({ succ: { status: "done", blockedBy: [DONE] } }) });
+
+      expect(await h.cascadeUnblock(DONE, "EPIC-1", workflow)).toEqual([]);
+      expect(h.reverify).not.toHaveBeenCalled();
+      expect(h.addBlockers).not.toHaveBeenCalled();
+      // Still OBSERVED — the run's journal records that the gate said nothing.
+      expect(detailOf(h.publishEvent, "orchestrator.verdict_suppressed")[0]).toMatchObject({
+        verdict: null, reason: "no-verdict", unblocked: [], blockers: [],
+      });
+    });
+
+    it("a STATED non-PASS with no successors DOES still file", async () => {
+      // Deliberately not symmetric: the persona told us something is wrong, so the
+      // re-verify is the record of that even with nothing to gate.
+      const h = gateHarness({
+        gate: { verdict: "FAIL", spawnedTickets: [] },
+        siblings: board({ succ: { status: "done", blockedBy: [DONE] } }),
+      });
+
+      await h.cascadeUnblock(DONE, "EPIC-1", workflow);
+
+      expect(h.reverify).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  /**
+   * TEAM-4264 F2 belt 1 — the hold must be DURABLE, and a re-verify ticket can
+   * only be filed if it can be pinned to a head. A gate that reported no
+   * tested_head used to produce `{action:"no-sha"}`, no blocker edge, and a hold
+   * that lived only in this pass's `held` Set — released by the next reconcile
+   * sweep.
+   */
+  describe("the re-verify is always pinnable (TEAM-4264 F2)", () => {
+    const NEW_HEAD = "5fa3728abcdef0123456789abcdef0123456789a";
+
+    it("falls back to the branch head when the persona reported none", async () => {
+      const headResolver = vi.fn(async () => NEW_HEAD);
+      const h = gateHarness({ gate: { testedHead: "" }, headResolver });
+
+      await h.cascadeUnblock(DONE, "EPIC-1", workflow);
+
+      expect(headResolver).toHaveBeenCalledTimes(1);
+      expect(headResolver.mock.calls[0][0]).toBe(workflow);
+      expect(h.reverify.mock.calls[0][0].headSha).toBe(NEW_HEAD);
+    });
+
+    it("never resolves a head it was already given", async () => {
+      // One GitHub read per invocation is the budget; the persona's own
+      // tested_head is both cheaper and more accurate (it is the head that was
+      // actually checked, not whatever the branch points at now).
+      const headResolver = vi.fn(async () => NEW_HEAD);
+      const h = gateHarness({ headResolver });
+
+      await h.cascadeUnblock(DONE, "EPIC-1", workflow);
+
+      expect(headResolver).not.toHaveBeenCalled();
+      expect(h.reverify.mock.calls[0][0].headSha).toBe(HEAD);
+    });
+
+    it.each([
+      ["a resolver that knows nothing", async () => null],
+      ["a resolver that throws", async () => { throw new Error("GitHub 403"); }],
+    ])("%s is non-fatal — the re-verify is still attempted and the hold stands", async (_label, impl) => {
+      const h = gateHarness({ gate: { testedHead: "" }, headResolver: vi.fn(impl) });
+
+      expect(await h.cascadeUnblock(DONE, "EPIC-1", workflow)).toEqual([]);
+      expect(h.reverify).toHaveBeenCalledTimes(1);
+      // Empty, not undefined: live-reverify's sentinel slot is what makes an
+      // unpinnable gate re-verify idempotent (live-reverify.test.mjs).
+      expect(h.reverify.mock.calls[0][0].headSha).toBe("");
+    });
+
+    it("a cascade with no resolver dep behaves exactly as before", async () => {
+      const h = gateHarness({ gate: { testedHead: "" } });
+
+      await h.cascadeUnblock(DONE, "EPIC-1", workflow);
+
+      expect(h.reverify.mock.calls[0][0].headSha).toBe("");
+    });
+  });
+
   describe("what does NOT hold", () => {
     it.each([
       ["a PASS verdict", { verdict: "PASS" }],
-      ["no verdict at all", { verdict: null, verdictSource: "none" }],
       ["a non-gate persona", { isGatePersona: false, verdict: "FAIL" }],
     ])("%s cascades and publishes nothing", async (_label, gate) => {
       for (const mode of ["shadow", "enforce"]) {
