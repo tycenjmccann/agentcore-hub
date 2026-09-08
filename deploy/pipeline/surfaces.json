@@ -38,6 +38,9 @@
       "dir": "lambda/workflow-analyzer",
       "files": [
         "index.mjs",
+        "liveness.mjs",
+        "liveness-constants.mjs",
+        "liveness-constants.json",
         "package.json",
         "node_modules/"
       ],

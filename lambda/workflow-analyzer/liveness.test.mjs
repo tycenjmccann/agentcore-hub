@@ -22,7 +22,10 @@ import {
   parkedOnHuman,
   emitLivenessMetrics,
 } from "./liveness.mjs";
-// The mjs mirror + its TS twin must agree (both read src/config/liveness-constants.json).
+// The mjs mirror + its TS twin must agree. TEAM-4295: they no longer read the same
+// file — the TS side imports src/config/liveness-constants.json directly, while the
+// mjs side now resolves the COMMITTED ./liveness-constants.json mirror beside it, so
+// the equality below is a real cross-file gate rather than a tautology.
 import {
   LIVENESS_DEV_MS,
   LIVENESS_VERIFY_MS,
@@ -31,6 +34,9 @@ import {
   LIVENESS_DEFAULT_MS,
 } from "./liveness-constants.mjs";
 import * as tsConsts from "@/lib/workflow/liveness-constants";
+import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 // §2.1 sync anchors: the board STUCK thresholds + the lease TTL.
 import { STALE_THRESHOLD_CLAUDE_CODE_MS } from "@/lib/workflow/stale";
 import { LEASE_TTL_MS } from "../orchestrator/lease.mjs";
@@ -40,6 +46,7 @@ import { LEASE_TTL_MS } from "../orchestrator/lease.mjs";
  * liveness.mjs). Every branch runs against plain objects; no AWS, no real clock.
  */
 
+const HERE = dirname(fileURLToPath(import.meta.url));
 const MIN = 60_000;
 const DEFAULT_THRESHOLDS = thresholdsFromEnv({}); // 45/20/12/2/10 min
 
@@ -612,6 +619,20 @@ describe("§2.1/§2.5 sync invariants — constants agree and dominate the ancho
     expect(tsConsts.LIVENESS_SHIP_MS).toBe(LIVENESS_SHIP_MS);
     expect(tsConsts.LIVENESS_SPAN_FRESH_MS).toBe(LIVENESS_SPAN_FRESH_MS);
     expect(tsConsts.LIVENESS_DEFAULT_MS).toBe(LIVENESS_DEFAULT_MS);
+  });
+
+  // TEAM-4295 — the Lambda mirror is a COMMITTED byte-identical copy of the
+  // src/config source of truth: the pipeline's Target 1b zips exactly the `files`
+  // list in deploy/pipeline/surfaces.json, so a copy-at-deploy-time mirror (the
+  // lambda/orchestrator/lease-constants.json pattern) simply never shipped and the
+  // deployed analyzer silently fell through to hard-coded literals. The equality
+  // above now proves the two agree on VALUES; this proves the bytes, catching a
+  // reformat or an added/removed key that the five derived values cannot see.
+  it("the Lambda's committed liveness-constants.json is byte-identical to src/config's", () => {
+    const src = readFileSync(resolve(HERE, "../../src/config/liveness-constants.json"));
+    const mirror = readFileSync(resolve(HERE, "liveness-constants.json"));
+    expect(mirror.equals(src)).toBe(true); // Buffer compare — bytes, not parsed JSON
+    expect(JSON.parse(mirror)).toEqual(JSON.parse(src)); // readable diff when it fails
   });
 
   it("§2.5 — the dev window is at least the lease TTL (never fire before a lease could expire)", () => {
