@@ -132,7 +132,7 @@ describe("completion guard honors the cdRegistered ship gate", () => {
 
 describe("resolver parity — app (TS) vs orchestrator (.mjs)", () => {
   const CONDITIONS = ["always", "cdRegistered", "flagged", undefined, "bogus"];
-  const REQUESTED = [[], ["ship"], ["design"]];
+  const REQUESTED: string[][] = [[], ["ship"], ["design"]];
 
   it("agrees on every condition x cdRegistered x requestedGates combination", () => {
     for (const condition of CONDITIONS) {

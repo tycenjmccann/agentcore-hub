@@ -34,6 +34,11 @@ import { isGateActive } from "./cd-registry.mjs";
  * complete. `ctx` is { requestedGates, cdRegistered } — see isGateActive.
  * Exported so the app-side parity test can assert this set is identical to the
  * one index.mjs hands the intake agent (TEAM-4288 r3-F1).
+ * @template {{ afterPhase?: string, condition?: string, blocking?: boolean }} T
+ * @param {T[]} [gates]
+ * @param {string} p
+ * @param {{ requestedGates?: string[], cdRegistered?: boolean }} [ctx]
+ * @returns {T[]}
  */
 export function activeBlockingGatesFor(gates, p, ctx = {}) {
   return (Array.isArray(gates) ? gates : []).filter(

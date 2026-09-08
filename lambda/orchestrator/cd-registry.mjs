@@ -117,6 +117,9 @@ export function isCdRegistered(registry, repoConfig) {
  *
  * PARITY MIRROR of isGateActive/activeGates in src/lib/workflow/workflow-defs.ts
  * (pinned by src/lib/workflow/merge-approval-gate.test.ts).
+ *
+ * @param {{ afterPhase?: string, condition?: string } | null | undefined} gate
+ * @param {{ requestedGates?: string[], cdRegistered?: boolean }} [ctx]
  */
 export function isGateActive(gate, { requestedGates = [], cdRegistered = false } = {}) {
   if (!gate) return false;
@@ -125,7 +128,15 @@ export function isGateActive(gate, { requestedGates = [], cdRegistered = false }
   return (requestedGates || []).includes(gate.afterPhase);
 }
 
-/** The subset of `gates` active for a run — see {@link isGateActive}. */
+/**
+ * The subset of `gates` active for a run — see {@link isGateActive}. Generic so
+ * callers with a richer gate shape (e.g. the full ReviewGate) get it back typed,
+ * not narrowed to the { afterPhase, condition } isGateActive reads.
+ * @template {{ afterPhase?: string, condition?: string }} T
+ * @param {T[]} [gates]
+ * @param {{ requestedGates?: string[], cdRegistered?: boolean }} [ctx]
+ * @returns {T[]}
+ */
 export function activeGates(gates, ctx) {
   return (Array.isArray(gates) ? gates : []).filter((g) => isGateActive(g, ctx));
 }
