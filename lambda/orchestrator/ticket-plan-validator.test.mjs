@@ -155,6 +155,8 @@ describe("validateTicketPlan — unblocked-non-root", () => {
     expect(unblocked[0].ticketRef).toBe("TEAM-4230");
     expect(unblocked[0].message).toContain("TEAM-4230");
     expect(unblocked[0].message).toContain("TEAM-4229");
+    // TEAM-4264 F8: the one violation that MAY reject a plan.
+    expect(unblocked[0].severity).toBe("error");
   });
 
   it("fails open entirely once the requirements root is done", () => {
@@ -260,6 +262,60 @@ describe("branch tokens", () => {
       { rootStatus: "done", knownBranches: ["chore/legacy-thing"] },
     );
     expect(violations).toHaveLength(0);
+  });
+});
+
+/**
+ * TEAM-4264 F8 — invented-branch is advisory (severity "warn"), always. Existence
+ * cannot be checked from any of the three writers that call this module (none
+ * holds a GitHub credential), so a token this validator does not recognize might
+ * be a real, non-canonical branch (a `chore/…` sweep name, a `fix/foo`, a
+ * `release/v1.2`) rather than an invention — and `knownBranches` is how a caller
+ * that CAN name real branches keeps them from ever being flagged at all.
+ */
+describe("validateTicketPlan — invented-branch is advisory (TEAM-4264 F8)", () => {
+  const plan = (branchToken, extra = {}) => [
+    { ticketId: "T-1", description: `Review ${branchToken}`, blockedBy: ["T-0"], ...extra },
+  ];
+
+  it("a real non-canonical branch, named via knownBranches, is clean", () => {
+    const { ok, violations } = validateTicketPlan(
+      plan("chore/dead-code-sweep-2026-08-31"),
+      { rootStatus: "done", knownBranches: ["chore/dead-code-sweep-2026-08-31"] },
+    );
+    expect(ok).toBe(true);
+    expect(violations).toHaveLength(0);
+  });
+
+  it("the same token with EMPTY knownBranches is flagged, but only as severity warn", () => {
+    const { ok, violations } = validateTicketPlan(
+      plan("chore/dead-code-sweep-2026-08-31"),
+      { rootStatus: "done", knownBranches: [] },
+    );
+    const invented = violations.filter((v) => v.code === "invented-branch");
+    expect(invented).toHaveLength(1);
+    expect(invented[0].severity).toBe("warn");
+    // Advisory-only: ok is a pure function of whether any violation exists at
+    // all, not of severity — a caller decides what to DO with severity.
+    expect(ok).toBe(false);
+  });
+
+  it.each(["fix/foo", "release/v1.2"])("%s is clean when known, warn when not", (token) => {
+    const known = validateTicketPlan(plan(token), { rootStatus: "done", knownBranches: [token] });
+    expect(known.violations.filter((v) => v.code === "invented-branch")).toHaveLength(0);
+
+    const unknown = validateTicketPlan(plan(token), { rootStatus: "done", knownBranches: [] });
+    const invented = unknown.violations.filter((v) => v.code === "invented-branch");
+    expect(invented).toHaveLength(1);
+    expect(invented[0].severity).toBe("warn");
+  });
+
+  it("the canonical convention never flags, known or not", () => {
+    const { violations } = validateTicketPlan(
+      plan("feature/TEAM-4230-code-sweeper"),
+      { rootStatus: "done", knownBranches: [] },
+    );
+    expect(violations.filter((v) => v.code === "invented-branch")).toHaveLength(0);
   });
 });
 

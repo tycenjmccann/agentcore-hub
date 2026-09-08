@@ -431,3 +431,66 @@ describe("submit_ticket_plan — TICKET_PLAN_VALIDATOR", () => {
     expect(r.status).toBe("saved");
   });
 });
+
+/**
+ * TEAM-4264 F8 — invented-branch (severity "warn") may never reject a plan, in
+ * any mode; only unblocked-non-root (severity "error") may. The root is DONE in
+ * every case below, so unblocked-non-root cannot fire and the only violation on
+ * the board is the branch one.
+ */
+describe("submit_ticket_plan — invented-branch is advisory, unblocked-non-root is not (TEAM-4264 F8)", () => {
+  const INVENTED_BRANCH_PLAN = [
+    { ticketId: "T-1", title: "Review", description: "Review chore/dead-code-sweep-2026-09-07", blockedBy: ["T-0"] },
+  ];
+
+  it("enforce + ONLY invented-branch: the plan is SAVED, warnings[] present, isError falsy", async () => {
+    const handler = await loadWithMode("enforce");
+    h.puts.length = 0;
+    const r = await submit(handler, { tickets: INVENTED_BRANCH_PLAN, root_ticket_id: "TEAM-4229", root_status: "done" });
+    expect(r.isError).toBeFalsy();
+    const body = resultOf(r);
+    expect(body.status).toBe("saved");
+    expect(body.warnings).toHaveLength(1);
+    expect(body.warnings[0]).toContain("chore/dead-code-sweep-2026-09-07");
+    expect(h.puts.filter((p) => p.Key?.endsWith("/ticket-plan.json"))).toHaveLength(1);
+  });
+
+  it("enforce + unblocked-non-root: still isError true, nothing saved", async () => {
+    const handler = await loadWithMode("enforce");
+    h.puts.length = 0;
+    const r = await submit(handler, { tickets: C2UQKI_PLAN, root_ticket_id: "TEAM-4229" });
+    expect(r.isError).toBe(true);
+    expect(r.content[0].text).toContain("Ticket plan rejected");
+    expect(h.puts.filter((p) => p.Key?.endsWith("/ticket-plan.json"))).toHaveLength(0);
+  });
+
+  it("enforce + BOTH: rejects on the error violation, and the rejection message does not include the warn one", async () => {
+    const handler = await loadWithMode("enforce");
+    h.puts.length = 0;
+    const mixed = [
+      { ticketId: "T-1", title: "Sweep", description: "Review chore/dead-code-sweep-2026-09-07", blockedBy: [] },
+    ];
+    const r = await submit(handler, { tickets: mixed, root_ticket_id: "TEAM-4229" });
+    expect(r.isError).toBe(true);
+    expect(r.content[0].text).toContain("TEAM-4229"); // the unblocked-non-root violation
+    expect(r.content[0].text).not.toContain("chore/dead-code-sweep-2026-09-07"); // the warn one is excluded
+    expect(h.puts.filter((p) => p.Key?.endsWith("/ticket-plan.json"))).toHaveLength(0);
+  });
+
+  it("off: the result is key-for-key today's — no warnings key, plan saved", async () => {
+    const handler = await loadWithMode("off");
+    const r = resultOf(await submit(handler, { tickets: INVENTED_BRANCH_PLAN, root_ticket_id: "TEAM-4229", root_status: "done" }));
+    expect("warnings" in r).toBe(false);
+    expect(Object.keys(r).sort()).toEqual(["location", "message", "status", "ticket_count"]);
+  });
+
+  it("shadow: console.warn fires, but the plan still saves", async () => {
+    const handler = await loadWithMode("shadow");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const r = resultOf(await submit(handler, { tickets: INVENTED_BRANCH_PLAN, root_ticket_id: "TEAM-4229", root_status: "done" }));
+    expect(r.status).toBe("saved");
+    expect(r.warnings).toHaveLength(1);
+    expect(warn.mock.calls.some((c) => String(c[0]).includes("plan violation"))).toBe(true);
+    warn.mockRestore();
+  });
+});

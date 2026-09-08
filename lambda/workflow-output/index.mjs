@@ -68,6 +68,10 @@ async function submitTicketPlan({ workflow_id, requirements, tickets, root_ticke
   // and invoked 92.3s before the requirements analyst it depends on finished.
   // Enforcement happens BEFORE the S3 write so a rejected plan leaves no
   // half-authoritative record behind.
+  // TEAM-4264 F8: `invented-branch` is severity "warn" — advisory in every mode,
+  // at every call site — because existence cannot be checked from here (this
+  // Lambda holds no GitHub credential; see ticket-plan-validator.mjs's docblock).
+  // Only `unblocked-non-root` (severity "error") may ever reject a plan.
   const warnings = [];
   if (TICKET_PLAN_VALIDATOR !== "off") {
     const { violations } = validateTicketPlan(parsed, {
@@ -75,13 +79,14 @@ async function submitTicketPlan({ workflow_id, requirements, tickets, root_ticke
       rootStatus: root_status || null,
     });
     for (const v of violations) warnings.push(v.message);
+    const errors = violations.filter((v) => v.severity === "error");
+    if (TICKET_PLAN_VALIDATOR === "enforce" && errors.length) {
+      throw new Error(
+        `Ticket plan rejected — ${errors.length} violation(s). Fix the plan and call ` +
+        `submit_ticket_plan again:\n${errors.map((v) => `- ${v.message}`).join("\n")}`,
+      );
+    }
     if (warnings.length) {
-      if (TICKET_PLAN_VALIDATOR === "enforce") {
-        throw new Error(
-          `Ticket plan rejected — ${warnings.length} violation(s). Fix the plan and call ` +
-          `submit_ticket_plan again:\n${warnings.map((w) => `- ${w}`).join("\n")}`,
-        );
-      }
       console.warn(`[submit_ticket_plan] ${warnings.length} plan violation(s):\n${warnings.map((w) => `- ${w}`).join("\n")}`);
     }
   }
