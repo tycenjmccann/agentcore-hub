@@ -418,12 +418,34 @@ async function watchScan() {
         windowFloorMs: win.windowFloorMs,
         phaseOf: (_tid, task) => phaseForAgent(task?.agentId, wf.phase),
       });
-      const decision = decideWatch(wf, tickets, now, LIVENESS_MODE, LIVENESS_THRESHOLDS);
+      // TEAM-4289 r3-F2 — the WORKFLOW-level idle fallback. decideWatch consults
+      // this ONLY when it has zero verdicts (nothing running/leased, so no
+      // per-ticket clock exists to judge); with even one active ticket the
+      // per-phase verdicts still decide and this is ignored. Age + threshold are
+      // the EXISTING legacy clock (legacyAge vs STALE_MS), not a new knob, which
+      // is what makes enforce a provable superset of the legacy watchdog: a
+      // zero-active-task run that legacy would have caught can no longer sit
+      // unattended in enforce. Computed in SHADOW too — shadow exists to measure
+      // what enforce would do, and the divergence log below would otherwise
+      // systematically under-report the one class of run this changes. Shadow
+      // still ACTS on legacyFire, so no intervention behaviour moves; `off` skips
+      // this whole block.
+      const decision = decideWatch(wf, tickets, now, LIVENESS_MODE, LIVENESS_THRESHOLDS, {
+        ageMs: legacyAge,
+        thresholdMs: STALE_MS,
+      });
       livenessFire = decision.fire;
       livenessAgeMs = decision.staleAgeMs;
       livenessReason = decision.reason;
       lm.staleTickets += decision.verdicts.filter((v) => v.stale).length;
       lm.spanFreshSkips += decision.verdicts.filter((v) => v.spanFresh).length;
+      if (livenessFire && livenessReason === "stale:idle") {
+        console.log(`[analyzer] liveness.idle_fallback ${JSON.stringify({
+          workflowId: wf.workflowId, phase: wf.phase, mode: LIVENESS_MODE,
+          enforced: LIVENESS_MODE === "enforce",
+          legacyAgeMs: legacyAge, thresholdMs: STALE_MS, activeTicketIds: liveIds,
+        })}`);
+      }
       if (LIVENESS_MODE === "shadow" && legacyFire !== livenessFire) {
         lm.shadowDivergence++;
         console.log(`[analyzer] liveness.shadow_divergence ${JSON.stringify({

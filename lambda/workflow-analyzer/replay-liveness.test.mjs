@@ -387,6 +387,82 @@ describe("TEAM-4186 F7 — a streaming burst must not starve a sibling", () => {
   });
 });
 
+describe("TEAM-4289 r3-F2 — enforce is a superset of the legacy watchdog", () => {
+  const MIN = 60_000;
+  const t = ms("2026-09-06T12:00:00Z");
+  const iso = (x) => new Date(x).toISOString();
+
+  /**
+   * The reviewer's scratch run, modelled: a NON-TERMINAL run whose only claims
+   * have COMPLETED (the dependent's Ready webhook was dropped, so nothing was
+   * ever dispatched to replace them). The legacy workflow-level clock fires on
+   * it; pre-fix, enforce did not — the run sat unattended.
+   */
+  const startedAtMs = t - 2 * 60 * MIN;
+  const agentTasks = {
+    "TEAM-1": {
+      agentId: "agentcore_hub_backend_dev", ticketId: "TEAM-1",
+      status: "complete", startedAt: iso(t - 90 * MIN), completedAt: iso(t - 30 * MIN),
+    },
+  };
+  // Newest significant row is 30 min old — past LEGACY_STALE_MS (10 min).
+  const events = [
+    { type: "ticket.updated", timestamp: iso(t - 30 * MIN), detail: { ticketId: "TEAM-1" } },
+    { type: "agent.streaming", timestamp: iso(t - 31 * MIN), detail: { ticketId: "TEAM-1" } },
+    { type: "agent.invoked", timestamp: iso(t - 90 * MIN), detail: { ticketId: "TEAM-1" } },
+  ];
+  const workflow = { workflowId: "wf-idle", phase: "development", startedAt: iso(startedAtMs), agentTasks };
+
+  it("legacy fires, the pre-fix decision does not, and the idle fallback closes the gap", () => {
+    // No active claim → nothing for the per-phase clock to judge.
+    expect(activeTicketIds({ agentTasks })).toEqual([]);
+    const tickets = buildLivenessTickets({
+      agentTasks, events, nowMs: t,
+      phaseOf: (_id, task) => phaseForAgent(task?.agentId, "development"),
+      windowFloorMs: eventsWindowFloor(events),
+    });
+    expect(tickets).toEqual([]);
+
+    // The LEGACY clock — via the same helper the rest of this file replays with.
+    expect(legacyFiresAt(events, t, startedAtMs)).toBe(true);
+    const legacyAge =
+      legacySignificantEventAge(events.slice(0, LEGACY_EVENT_WINDOW), t) ?? t - startedAtMs;
+    expect(legacyAge).toBe(30 * MIN);
+
+    // PRE-FIX (no idle ctx): enforce sees an empty verdict list and stands down —
+    // exactly the `legacyFire:true, decision.fire:false` pair r3-F2 reported.
+    const preFix = decideWatch(workflow, tickets, t, "enforce", TH);
+    expect(preFix.fire).toBe(false);
+
+    // POST-FIX: index.mjs hands decideWatch its existing legacyAge + STALE_MS.
+    const postFix = decideWatch(workflow, tickets, t, "enforce", TH, {
+      ageMs: legacyAge, thresholdMs: LEGACY_STALE_MS,
+    });
+    expect(postFix.fire).toBe(true);
+    expect(postFix.reason).toBe("stale:idle");
+    expect(postFix.ticketId).toBeNull();
+    expect(postFix.staleAgeMs).toBe(legacyAge); // what the WATCH prompt reports
+
+    // Superset, stated as the invariant: wherever legacy fires on a run with no
+    // active claim, enforce now fires too.
+    expect(postFix.fire).toBe(legacyFiresAt(events, t, startedAtMs));
+  });
+
+  it("…and a human gate still parks the run instead of firing", () => {
+    const parked = {
+      ...workflow,
+      humanNotifications: [
+        { type: "review_needed", ticketId: "TEAM-1", humanAssignee: "human:engineer", acknowledged: false },
+      ],
+    };
+    expect(isParkedOnHuman(parked)).toBe(true);
+    expect(legacyFiresAt(events, t, startedAtMs)).toBe(true); // legacy WOULD fire…
+    expect(decideWatch(parked, [], t, "enforce", TH, {           // …the fallback does not
+      ageMs: 30 * MIN, thresholdMs: LEGACY_STALE_MS,
+    }).fire).toBe(false);
+  });
+});
+
 describe("Shadow safety — no mode value leaves the run with no watchdog", () => {
   it("a garbage mode normalizes to shadow (never off) and decideWatch still computes", () => {
     expect(normalizeLivenessMode("banana")).toBe("shadow");
