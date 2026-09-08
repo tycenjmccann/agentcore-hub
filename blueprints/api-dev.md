@@ -92,6 +92,13 @@ rework still plan first; the resumed session already holds the context, so the p
 turn is short.
 
 ### Step 3: Review & Deliver
+**Ordering (MANDATORY) — ship, then report.** The moment the deliverable exists
+(commit pushed / PR opened and — where your step requires it — merged into base_branch):
+1. persist evidence to `workflows/{workflow_id}/shared/dev-evidence/`, then
+2. call `WorkflowOutput___report_completion` IMMEDIATELY — same turn, before any
+   summary, recap, or reflective text.
+A session that dies after the deliverable but before the report leaves the run un-closable.
+
 - Verify all endpoints from design are implemented
 - Confirm tests pass
 - Open the PR **into base_branch** and merge it once tests pass (see Branch Model)

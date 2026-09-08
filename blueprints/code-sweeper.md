@@ -130,6 +130,13 @@ still pass with the code gone.
     tested. An unbuilt deletion is exactly the failure mode to avoid.
 
 ### Step 5: PR for human review — never auto-merge
+**Ordering (MANDATORY) — ship, then report.** The moment the deliverable exists
+(commit pushed / PR opened and — where your step requires it — merged into base_branch):
+1. persist evidence to `workflows/{workflow_id}/shared/dev-evidence/`, then
+2. call `WorkflowOutput___report_completion` IMMEDIATELY — same turn, before any
+   summary, recap, or reflective text.
+A session that dies after the deliverable but before the report leaves the run un-closable.
+
 1. Commit referencing the routine + date.
 2. Push `feature_branch`, open a PR into `base_branch`.
 3. PR body MUST contain a **Removal Ledger**:

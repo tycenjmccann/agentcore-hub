@@ -124,6 +124,13 @@ If incomplete, call `claude_code` again with specific corrections (no `repo`
 needed — it continues in the same workspace and remembers what it already did).
 
 ### Step 4: Deliver
+**Ordering (MANDATORY) — ship, then report.** The moment the deliverable exists
+(commit pushed / PR opened and — where your step requires it — merged into base_branch):
+1. persist evidence to `workflows/{workflow_id}/shared/dev-evidence/`, then
+2. call `WorkflowOutput___report_completion` IMMEDIATELY — same turn, before any
+   summary, recap, or reflective text.
+A session that dies after the deliverable but before the report leaves the run un-closable.
+
 - Confirm code is committed and pushed
 - Open the PR **into base_branch** and merge it once tests pass (see Branch Model)
 - `WorkflowOutput___report_completion` with branch name, PR URL, and summary.

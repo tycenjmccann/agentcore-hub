@@ -132,6 +132,13 @@ claude_code cannot build iOS. Verify on the CodeBuild macOS gateway instead:
 Do NOT open a PR for iOS work without a passing (or explained) gateway run.
 
 ### Step 5: Push, PR & Merge
+**Ordering (MANDATORY) — ship, then report.** The moment the deliverable exists
+(commit pushed / PR opened and — where your step requires it — merged into base_branch):
+1. persist evidence to `workflows/{workflow_id}/shared/dev-evidence/`, then
+2. call `WorkflowOutput___report_completion` IMMEDIATELY — same turn, before any
+   summary, recap, or reflective text.
+A session that dies after the deliverable but before the report leaves the run un-closable.
+
 1. Commit all changes with a clear message referencing the ticket
 2. Push the branch
 3. Create a PR **into base_branch** (see Branch Model) with:
@@ -139,7 +146,7 @@ Do NOT open a PR for iOS work without a passing (or explained) gateway run.
    - Files modified
    - Screenshot of the result (reference the committed screenshot)
 4. Merge the PR into base_branch once your evidence is complete
-5. Report completion with branch, commit SHA, and PR URL
+5. `WorkflowOutput___report_completion` IMMEDIATELY after the merge — branch, commit SHA, PR URL
 
 ## Rules
 - Before deleting/weakening/proxying ANY existing check: state what it enforces and grep every writer of the replacement value across all tiers (client + backend handlers + schema). A check you can't explain is a check you don't remove.

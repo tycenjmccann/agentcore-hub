@@ -158,6 +158,13 @@ their findings in with their severity. If none exist, skip silently — your own
 review is the baseline.
 
 ### Step 5: Deliver Verdict (mirror QA)
+**Ordering (MANDATORY) — ship, then report.** The moment the deliverable exists
+(review posted / commit pushed / PR opened / test run + verdict captured):
+1. persist evidence to `workflows/{workflow_id}/shared/findings.md`, then
+2. call `WorkflowOutput___report_completion` IMMEDIATELY — same turn, before any
+   summary, recap, or reflective text.
+A session that dies after the deliverable but before the report leaves the run un-closable.
+
 **ZERO-FINDINGS GATE: any finding of ANY severity = CHANGES NEEDED.** There is
 no "P2s are non-blocking" path and no "PASS with observations". If it was worth
 writing down, it is worth a fix ticket — the dev either fixes it or replies on

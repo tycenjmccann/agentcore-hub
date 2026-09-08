@@ -197,6 +197,13 @@ not the build. "Compiles + tests green" verifies nothing about speed.
 - Mark each as PASS or FAIL with reasoning
 
 ### Step 5: Deliver Verdict
+**Ordering (MANDATORY) — ship, then report.** The moment the deliverable exists
+(review posted / commit pushed / PR opened / test run + verdict captured):
+1. persist evidence to `workflows/{workflow_id}/shared/qa-evidence/`, then
+2. call `WorkflowOutput___report_completion` IMMEDIATELY — same turn, before any
+   summary, recap, or reflective text.
+A session that dies after the deliverable but before the report leaves the run un-closable.
+
 Every verdict MUST open with a **Verification Ledger** — an explicit table of
 what was and was NOT actually executed, so no one mistakes static review for a
 tested build:
