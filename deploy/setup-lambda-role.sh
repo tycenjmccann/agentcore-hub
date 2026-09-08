@@ -75,6 +75,7 @@ echo "   ✓ Attached AWSLambdaBasicExecutionRole"
 #   agentcore-hub-events        (orchestrator, events-writer, workflow-output)
 #   agentcore-hub-eval-config   (eval-packager, token-aggregator)
 #   agentcore-hub-eval-daily    (eval-packager + token-aggregator per-day metric buckets)
+#   agentcore-hub-cloud-code-sessions (cost-report joins coding-CLI usage to workflow/agent)
 #   agentcore-hub-eval-seen     (eval-packager dedup seen-set — conditional
 #                                PutItem per keyed evaluator-result row, plus
 #                                Get/BatchGet for the read-before-claim path.
@@ -111,6 +112,8 @@ aws iam put-role-policy \
           \"arn:aws:dynamodb:${REGION}:${ACCOUNT_ID}:table/agentcore-hub-eval-config\",
           \"arn:aws:dynamodb:${REGION}:${ACCOUNT_ID}:table/agentcore-hub-eval-config/index/*\",
           \"arn:aws:dynamodb:${REGION}:${ACCOUNT_ID}:table/agentcore-hub-eval-daily\",
+          \"arn:aws:dynamodb:${REGION}:${ACCOUNT_ID}:table/agentcore-hub-cloud-code-sessions\",
+          \"arn:aws:dynamodb:${REGION}:${ACCOUNT_ID}:table/agentcore-hub-cloud-code-sessions/index/*\",
           \"arn:aws:dynamodb:${REGION}:${ACCOUNT_ID}:table/agentcore-hub-workflow-analyses\",
           \"arn:aws:dynamodb:${REGION}:${ACCOUNT_ID}:table/agentcore-hub-workflow-analyses/index/*\"
         ]
