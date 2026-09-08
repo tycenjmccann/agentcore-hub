@@ -94,7 +94,45 @@ The single prose→verdict ladder they all read lives in the zero-import
   `release_manager`) non-`PASS` completion holds its cascade successor on the
   fix ticket(s) it spawned, or — if it spawned none — on an orchestrator-filed
   `kind:"gate"` re-verify ticket instead (`live-reverify.mjs`), so a gate refusal
-  with no fix ticket still blocks something.
+  with no fix ticket still blocks something. **A `null`/unreadable verdict is
+  never `PASS` (TEAM-4264 F1):** under `enforce` it holds exactly like a
+  declared non-`PASS` verdict, EXCEPT it observes-only (no re-verify filed) when
+  the completion has zero cascade successors — a hold with nothing to hold is
+  pure noise, and this is what keeps a genuinely-passing completion whose prose
+  the ladder cannot parse (e.g. `release_manager`'s `Verdict: code deploy
+  SUCCEEDED`, which is deliberately not a recognized verdict token) from costing
+  a round. The ladder itself has three rungs, all in the zero-import
+  `verdict-contract.mjs`: an explicit `Verdict: X` field, a `Round N — X` label,
+  and — widened by F1 — a per-line **headline** form (`HEADLINE_RE`): after
+  stripping leading markdown/emoji decoration and up to two short label words
+  ("QA ", "Review complete: "), the line must *begin* with a verdict token
+  terminated by `:`, an em/en dash, `-`, `(`, `,` or end-of-line; the most severe
+  hit across all lines wins (`BLOCKED` > `FAIL` > `CHANGES_NEEDED` > `PASS`). The
+  line-anchoring is what lets `0 FAIL`, `FAILURES: 0` and `191 PASS / 8 FAIL`
+  resolve to nothing rather than flipping a real pass to a fail. **A held
+  non-`PASS` verdict is durable, not just in-memory (TEAM-4264 F2):** the
+  re-verify `live-reverify.mjs` files is always pinnable to a head — `testedHead`
+  when the gate declared one, else the orchestrator's own
+  `featureBranchHeadSha(workflow)` read, else the deterministic sentinel slot
+  `gate:unknown:r<N>` (round-scoped, so a second round at a still-unresolvable
+  head still files exactly once) — and on every reconcile sweep pass,
+  `reconcileDependent` re-consults the **lineage-latest** gate verdict (the
+  highest `spawnedBy.round` in the `rearmOf` chain, not the completing ticket's
+  direct children) before releasing a sibling; a sibling held this way reports
+  outcome `"verdict-held"` (tallied as `ReconcileVerdictHeld` in the sweep's EMF
+  record) and fails CLOSED under `enforce` if the predicate itself throws. **Gate
+  re-verify rounds are capped (TEAM-4264 F4):** `resolveGateReverifyCap` reads
+  the same `reviewGates[].maxRounds` the human review→rework cap uses (`>= 1`
+  guard, default 3, clamped to `REVIEW_GATE_MAX_ROUNDS_CEILING` = 20 — one number
+  per gate, both loops obey it). At the cap, nothing new is filed; successors are
+  held on the gate's own open fix tickets, or on the newest **open** re-verify in
+  the lineage when there are none, or reported `heldOn: []` (honestly — an edge
+  to a done ticket would look like a hold and be none) when every round is
+  closed; the orchestrator publishes `orchestrator.gate_reverify_cap_reached
+  { workflowId, gateTicketId, persona, verdict, round, maxRounds, heldSuccessors,
+  heldOn }` and escalates through the same `store.appendReworkEscalation` +
+  `parkRunEscalationGate("gate-reverify")` pair `rework-loop-cap.mjs` uses,
+  idempotently keyed `<workflowId>:gate-reverify:<lineageRootTicketId>`.
 - `FIX_BEFORE_VERIFY` — a new fix ticket (`spawnedBy.kind` in `FIX_KINDS`) blocks
   the run's open QA/CI siblings at ticket-creation time, so a verifier is never
   dispatched against code a filed-but-unstarted fix has not touched yet.
@@ -104,10 +142,20 @@ The single prose→verdict ladder they all read lives in the zero-import
   completion and, on a head disagreement, files one stale-gate re-verify per
   stale persona; the TS twin (`src/lib/workflow/verified-heads.ts`, used by
   `POST /api/workflow/[id]/complete`) applies the identical predicate so the
-  human-driven completion route cannot bypass it. `heads.pr` is derived locally
-  — the latest recorded `commitSha` among done non-gate-persona tasks — never a
-  GitHub call, since the PR does not exist yet at this gate and the gate must
-  stay replayable offline.
+  human-driven completion route cannot bypass it. **`heads.pr` is the FEATURE
+  BRANCH HEAD, read from GitHub, and nothing else (TEAM-4264 F3):** the
+  orchestrator calls its own `featureBranchHeadSha(workflow)`
+  (`git/ref/heads/<branch>`, memoized per invocation); the route calls the twin
+  `branchHeadSha(url, branch, opts)` in `src/lib/workflow/repo-check.ts`, using
+  the `GITHUB_PAT` it already holds for the repo pre-flight. Neither ever derives
+  `heads.pr` from a dev ticket's `commitSha` or a `mergeCommit` any more — after
+  any merge that commit is a PARENT of the real head, so every merged run used to
+  read QA/CI as stale against a head nobody was shipping. A head that cannot be
+  resolved (no `GITHUB_PAT`, a branch deleted post-merge, a 404, a transient) is
+  `null` — UNKNOWN, never divergence — and the gate then compares only the two
+  verifiers to each other; two KNOWN heads that disagree are still divergence
+  with or without a PR head, so with none to appeal to, **both** verifiers are
+  reported stale rather than neither.
 
 **Sweep detection flag (TEAM-4247 D2, `lambda/orchestrator/`)** — same
 `off | shadow | enforce` convention as the three above (unset → `shadow`,
@@ -200,7 +248,16 @@ is read by **four** Lambdas.
   contain its own root), and a branch token that is neither known nor
   `feature/<ticketId>-<persona-slug>`. `shadow` warns (a `warnings[]` on
   `submit_ticket_plan`, a `warning` field on the created ticket) and still writes;
-  `enforce` rejects before anything is minted. No root resolvable → **fail open**,
+  `enforce` rejects before anything is minted — **but only on the first check**
+  (`severity: "error"`). **The branch check is `severity: "warn"`, always, in
+  every mode (TEAM-4264 F8):** existence can only be confirmed against GitHub,
+  and none of the four Lambdas that call this module holds a GitHub credential,
+  so a real-but-non-canonical branch (a repo's own `chore/*`, a `fix/foo`, a
+  `release/v1.2`) is exactly as branch-shaped as a genuinely invented name —
+  `enforce` can never hard-reject on it, only surface it in `warnings[]` +
+  `console.warn`. `knownBranches` (unchanged) remains the whitelist for a caller
+  that CAN name real branches; the orchestrator's three call sites already
+  include `workflow.featureBranch` in it. No root resolvable → **fail open**,
   silently. The branch rewrite is **context-only in both modes** — the orchestrator
   never rewrites a stored description, only the prompt it renders. Non-`off` also
   renders `## Branch` for **every** persona (with a "you do not push to this
@@ -307,6 +364,7 @@ gates, the blocked-run EventBridge rule or the blocked-run alerting.
 - `orchestrator.completion_blocked { workflowId, reason, heads: { qa, ci, pr } }`, `reason` ∈ `"head-divergence" | "open-fix"` — `VERIFIED_HEAD_COMPLETION`, either mode; claimed once per `(workflow, reason, heads)` via `store.claimCompletionBlocked` so a redelivered completion attempt never double-escalates
 - `agent.complete` detail gained four optional keys on a gate persona's completion: `verdict`, `verdictSource` (`"declared" | "inferred" | "none"`, `null` for a non-gate persona), `testedHead`, `spawnedTickets` — written by `enrichCompleteDetail` in both `agent.complete` publish sites (webhook + DDB-stream) so the two twins can never diverge
 - `quality.gateMetricSource` (`"verdict-events" | "reviewGateHistory"`) on the cost-report performance card / fleet index — says whether `reworkRounds` / `gateRounds` / `firstPassYield` on that card came from the run's verdict events or (pre-D1 runs) the task/review-request fallback
+- The `agentTasks[tid].evidence_keys` harvest accepts the shape `report_completion` actually writes — a comma-joined **string** (`lambda/workflow-output/index.mjs` joins any array it is given) — not only the `Array.isArray` shape it was scoped to before (TEAM-4264 F5). Reuses `live-reverify.mjs`'s `splitCsv`, dedupes, caps at 50 keys, and DROPS (never truncates) any key over 512 chars.
 
 Fleet runtime agents (`deploy/runtime-agent`, see `DEPLOY.md`) additionally read:
 - `PERSONA_PROMPT_CACHE` — `1` (default on); Bedrock prompt caching for the persona system prompt + tools, set `0` to disable

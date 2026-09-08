@@ -307,6 +307,17 @@ const EVIDENCE_HEAD = fixtureCompletion(CI).ci_head_sha;  // 12e9ac6…
 /** The head that actually shipped. */
 const SHIPPED_HEAD = fixtureCompletion(FIX).commit_sha;   // 001259d…
 
+/**
+ * The repo + branch the fixture's own run used. Since TEAM-4264 F3 the completion
+ * gate reads `heads.pr` from GitHub — `featureBranchHeadSha` on this branch — so
+ * the replay has to serve that ONE request itself (stubGitHub below). Both values
+ * come out of the dossier, and the fixture-integrity describe pins them.
+ */
+const FIXTURE_REPO_URL = DOSSIER.workflow?.repoConfig?.repos?.[0]?.url || "";
+const FEATURE_BRANCH = DOSSIER.workflow?.featureBranch || "";
+const [, REPO_OWNER = "", REPO_NAME = ""] =
+  /github\.com[/:]([^/]+)\/([^/.]+)/.exec(FIXTURE_REPO_URL) || [];
+
 // ─── Board / workflow / records, built from the fixture ──────────────────────
 
 /** The fix marker the row's own title implies (see SYNTHESIZED note 3). */
@@ -510,6 +521,40 @@ async function replay() {
 
 const reverifyTickets = () => h.state.createdTickets.filter((t) => /Re-verify/i.test(String(t.summary || "")));
 
+// ─── The GitHub seam ─────────────────────────────────────────────────────────
+
+/** Every api.github.com path the replay's code path asked for, in order. */
+const githubPaths = [];
+/** What the stub answers `git/ref/heads/<the fixture's branch>` with. */
+let branchHead = SHIPPED_HEAD;
+let realFetch;
+
+/**
+ * The ONE GitHub fact this replay needs, served locally.
+ *
+ * Since TEAM-4264 F3 the completion gate takes `heads.pr` from the FEATURE-BRANCH
+ * HEAD (featureBranchHeadSha → githubApi → global fetch), not from a dev ticket's
+ * commitSha. Without this stub the replay's answer depends on the shell it runs in:
+ * a developer box with a GITHUB_PAT reached the real api.github.com and read
+ * tycenjmccann/demo-app's live branch — which still points at 001259d, so the
+ * assertions passed by accident of the outside world — while CI, which has no PAT,
+ * got null and failed. Neither is a test. Same idiom as
+ * verified-head-completion.test.mjs: answer the ref for the fixture's OWN repo and
+ * branch, 404 everything else, so no other GitHub path can quietly start passing.
+ */
+function installGitHubStub() {
+  const refPath = `/repos/${REPO_OWNER}/${REPO_NAME}/git/ref/heads/${encodeURIComponent(FEATURE_BRANCH)}`;
+  process.env.GITHUB_PAT = "gh-test-token";
+  realFetch = globalThis.fetch;
+  globalThis.fetch = vi.fn(async (url) => {
+    const path = String(url).replace("https://api.github.com", "");
+    githubPaths.push(path);
+    const hit = path === refPath && Boolean(branchHead);
+    const body = hit ? { object: { sha: branchHead } } : { message: "Not Found" };
+    return { ok: hit, status: hit ? 200 : 404, text: async () => JSON.stringify(body) };
+  });
+}
+
 describe("dowtdh replay — the fixture still says what this replay claims", () => {
   it("records three different heads and not one structured verdict", () => {
     expect(CODE_HEAD.startsWith("933ea6f")).toBe(true);
@@ -531,6 +576,14 @@ describe("dowtdh replay — the fixture still says what this replay claims", () 
     expect(fixtureTicket(QA).blockedBy).toContain(REVIEW);
     expect(fixtureTicket(QA).assignee).toBe(QA_VERIFIER_ID);
     expect(fixtureTicket(CI).assignee).toBe(CI_AGENT_ID);
+  });
+
+  it("names the repo and the feature branch heads.pr is read from (TEAM-4264 F3)", () => {
+    // The GitHub stub is built from these three values, so fixture drift must fail
+    // here rather than turn into a 404 and a null head three tests later.
+    expect(FEATURE_BRANCH).toBe("feature/TEAM-4162-clear-the-activity-feed-with-an-undo-win");
+    expect(REPO_OWNER).toBe("tycenjmccann");
+    expect(REPO_NAME).toBe("demo-app");
   });
 
   it("published workflow.complete with the cascade unblocking every gate in turn", () => {
@@ -561,12 +614,17 @@ describe("dowtdh replay — the D1 flags", () => {
     h.state.nextTicketNum = 0;
     process.env.ARTIFACT_BUCKET = "test-artifacts";
     process.env.EVENT_BUS = "test-bus";
+    githubPaths.length = 0;
+    branchHead = SHIPPED_HEAD; // the head the fix really left the branch at
+    installGitHubStub();
     vi.spyOn(console, "error").mockImplementation(() => {});
     vi.spyOn(console, "warn").mockImplementation(() => {});
   });
 
   afterEach(() => {
     vi.restoreAllMocks();
+    globalThis.fetch = realFetch;
+    delete process.env.GITHUB_PAT;
     delete process.env.VERDICT_GATE;
     delete process.env.FIX_BEFORE_VERIFY;
     delete process.env.VERIFIED_HEAD_COMPLETION;
@@ -847,8 +905,39 @@ describe("dowtdh replay — the D1 flags", () => {
     expect(blocked[0].heads.qa).toBe(CODE_HEAD);
     expect(blocked[0].heads.pr).toBe(SHIPPED_HEAD);
 
+    // …and it is the BRANCH that supplied it (TEAM-4264 F3), not a dev ticket's
+    // commitSha: the gate read the fixture's own feature branch, exactly once.
+    const refReads = githubPaths.filter((p) => p.includes("/git/ref/heads/"));
+    expect(refReads).toEqual([
+      `/repos/${REPO_OWNER}/${REPO_NAME}/git/ref/heads/${encodeURIComponent(FEATURE_BRANCH)}`,
+    ]);
+
     // The run is left OPEN for the remediation, not rewritten to a terminal state.
     expect(h.state.workflow.phase).not.toBe("complete");
+  });
+
+  /**
+   * The same board with the branch head UNRESOLVABLE — a 404, an expired PAT, or the
+   * no-PAT environment CI runs in. `heads.pr` is then null, and null is UNKNOWN, not
+   * divergence (TEAM-4264 F3): the gate must still refuse this run, because QA
+   * (933ea6f) and CI (12e9ac6) are two known heads that disagree with each other.
+   */
+  it("(c) enforce: an unresolvable branch head leaves heads.pr null and still blocks on QA vs CI", async () => {
+    branchHead = null;
+    await loadWith({ verdict: "off", fixBefore: "off", verifiedHead: "enforce" });
+    await replay();
+
+    expect(detailsOfType("workflow.complete")).toHaveLength(0);
+    const blocked = detailsOfType("orchestrator.completion_blocked");
+    expect(blocked).toHaveLength(1);
+    expect(blocked[0]).toMatchObject({ reason: "head-divergence", mode: "enforce" });
+    expect(blocked[0].heads.pr).toBeNull();
+    expect(blocked[0].heads.qa).toBe(CODE_HEAD);
+    expect(blocked[0].heads.ci).toBe(EVIDENCE_HEAD);
+    // Both verifiers are stale against an unknown PR head, so both are re-armed —
+    // at the round sentinel, because there is no sha to pin them to (F2 belt 1).
+    const stale = detailsOfType("fix.reverify_created").filter((e) => e.reason === "stale-head");
+    expect(stale.map((e) => e.owner).sort()).toEqual([CI_AGENT_ID, QA_VERIFIER_ID].sort());
   });
 
   // ── (d) ────────────────────────────────────────────────────────────────────

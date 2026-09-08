@@ -222,6 +222,51 @@ export async function listOpenPullRequests(
   return { probed: true, pulls };
 }
 
+/**
+ * A branch's current head sha (TEAM-4264 F3 / amendment A2 — the route twin of
+ * the orchestrator's `featureBranchHeadSha`).
+ *
+ * The completion route hand-ports the verified-head gate (verified-heads.ts), and
+ * that gate's `heads.pr` is now the SHIPPING BRANCH HEAD rather than a dev-commit
+ * proxy. The orchestrator reads it straight from `git/ref/heads/<branch>`; this is
+ * the same read for the route, which already holds a `GITHUB_PAT` for the repo
+ * checks above — so the human-driven completion path gets the same fact rather
+ * than a permanently-unknown one.
+ *
+ * FAILS OPEN like every other probe here: `sha: null` is UNKNOWN, and the gate
+ * treats unknown as "compare the verifiers to each other only", never as
+ * divergence. `probed` separates "we never asked" (no token, not a GitHub URL,
+ * GitHub unreachable) from "we asked and there is no such ref" (a 404 on a branch
+ * deleted by the merge is the ordinary case), which is observability, not a
+ * decision the caller makes — both give the same null sha.
+ */
+export async function branchHeadSha(
+  url: string,
+  branch: string,
+  opts: RepoCheckOptions = {}
+): Promise<{ probed: boolean; sha: string | null; reason?: string }> {
+  const gh = parseGitHubUrl(url);
+  if (!gh) return { probed: false, sha: null, reason: "not a GitHub URL" };
+  if (!branch) return { probed: false, sha: null, reason: "no branch" };
+  if (!opts.token) return { probed: false, sha: null, reason: "no GITHUB_PAT" };
+
+  let status: number;
+  let json: unknown;
+  try {
+    ({ status, json } = await ghGet(
+      `/repos/${encodeURIComponent(gh.owner)}/${encodeURIComponent(gh.repo)}/git/ref/heads/${encodeURIComponent(branch)}`,
+      opts
+    ));
+  } catch (err) {
+    return { probed: false, sha: null, reason: `GitHub unreachable: ${(err as Error).message}` };
+  }
+  const sha = (json as { object?: { sha?: unknown } } | null)?.object?.sha;
+  if (status !== 200 || typeof sha !== "string" || !sha) {
+    return { probed: true, sha: null, reason: `GitHub ${status} — no head for ${branch}` };
+  }
+  return { probed: true, sha };
+}
+
 /** Definitive negatives only — the ones a submitter must fix or explicitly waive. */
 export function definitiveFailures(check: RepoCheck): RepoCheckResult[] {
   return check.results.filter((r) => !r.ok && r.definitive);

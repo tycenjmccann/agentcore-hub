@@ -1085,23 +1085,35 @@ describe("iczquj replay — SWEEP_DETECTION_PHASE is inert on a productive sweep
     await loadWith({ sweep: "enforce", verdict: "enforce" });
     await replay();
 
-    // Three PASS verdicts, mapped off the personas' own prose by the shared ladder.
+    // FOUR PASS verdicts, mapped off the personas' own prose by the shared ladder.
     const verdicts = Object.fromEntries(
       detailsOfType("agent.complete").filter((d) => d.verdict).map((d) => [d.ticketId, d.verdict]),
     );
-    expect(verdicts).toEqual({ [REVIEW]: "PASS", [QA]: "PASS", [SHIP]: "PASS" });
+    expect(verdicts).toEqual({ [REVIEW]: "PASS", [QA]: "PASS", [CI]: "PASS", [SHIP]: "PASS" });
 
-    // The fourth, TEAM-3588, resolves NO verdict — and that is the ladder's rule 1,
-    // not a bug this replay should paper over: the CI agent wrote "CI GATE: ✅ PASS",
-    // which carries neither a `verdict:` label nor the release manager's round form,
-    // and verdict-contract.mjs refuses to guess ("a wrong verdict is worse than no
-    // verdict, because no verdict leaves today's behaviour in place"). So the gate
-    // has nothing to hold on, which is exactly the pre-D1 cascade.
+    // TEAM-3588 is the one TEAM-4264 F1 rescued, and it is the reason F1 needed a
+    // widened ladder and not just an inverted default. The CI agent wrote
+    // "CI GATE: ✅ PASS" — no `verdict:` label, not the release manager's round
+    // form — so the shipped two-rung ladder read NOTHING, and this replay used to
+    // assert that "nothing" was fine because nothing was fine when a null verdict
+    // released. Once a null verdict HOLDS, the same silence would have held a
+    // passing CI gate and re-verified it. The HEADLINE rung reads the line the
+    // human reads.
     expect(fixtureCompletion(CI).summary.startsWith("CI GATE: ✅ PASS")).toBe(true);
-    expect(deriveVerdict(fixtureCompletion(CI).summary)).toBeNull();
-    expect(verdicts[CI]).toBeUndefined();
-    // So nothing was held, nothing was re-verified, and the run still completed.
-    expect(detailsOfType("orchestrator.verdict_suppressed")).toEqual([]);
+    expect(deriveVerdict(fixtureCompletion(CI).summary)).toMatchObject({ verdict: "PASS", source: "inferred" });
+
+    // TEAM-3591 (CD) is the OTHER half of the same finding: "CD COMPLETE — PR #57
+    // merged to main" is a finished deploy stated in words the enum has no room
+    // for, and the ladder still refuses to guess a semantic PASS. So it resolves
+    // to null and, under enforce, that now HOLDS — except it is the last ticket
+    // in the chain, so applyVerdictHold has no successor to hold and files
+    // nothing. Observed, not acted on: zero tickets created, and the run still
+    // completes.
+    expect(deriveVerdict(fixtureCompletion(CD).summary)).toBeNull();
+    expect(verdicts[CD]).toBeUndefined();
+    const suppressed = detailsOfType("orchestrator.verdict_suppressed");
+    expect(suppressed.map((d) => [d.ticketId, d.verdict, d.verdictSource, d.reason, d.unblocked, d.blockers]))
+      .toEqual([[CD, null, "none", "no-verdict", [], []]]);
     expect(h.state.createdTickets).toEqual([]);
     expect(countOfType("workflow.complete")).toBe(1);
   }, 20_000);

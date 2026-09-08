@@ -71,6 +71,11 @@ import { UpdateCommand } from "@aws-sdk/lib-dynamodb";
 // blocker edge the live re-verify does. No cycle: live-reverify.mjs imports only
 // fix-contract.mjs and ticket-blockers.mjs, neither of which knows this module.
 import { LIVE_SHIP_STATUSES } from "./live-reverify.mjs";
+// TEAM-4264 F4 — the gate re-verify cap reuses the review gate's own maxRounds
+// (one number per gate, two loops) and the review cap's derived "is there an
+// escalation still open" reader. review-cap.mjs imports only ship-review.mjs,
+// which imports nothing, so this adds no cycle and no new zip entry.
+import { openEscalation, resolveGateReverifyCap } from "./review-cap.mjs";
 
 // Extended-state rollout modes (TEAM-3747 D1) — same vocabulary + fail-safe
 // default (shadow) as DEAD_SESSION_DETECTOR_MODE.
@@ -79,6 +84,72 @@ const KNOWN_EXTENDED_MODES = ["off", "shadow", "enforce"];
 // The only ticket statuses that resolve a blocker. Same pair the snapshot
 // predicate uses; named here for the TEAM-3755 F9 point-read confirm.
 const RESOLVED_BLOCKER_STATUSES = new Set(["done", "cancelled"]);
+
+// ── Gate re-verify lineage (TEAM-4264 F2 belt 2 / F4) ───────────────────────────
+// A gate persona's verdict is not one ticket's property, it is a LINEAGE's: the
+// gate ticket, then the re-verify ticket it spawned, then that one's re-verify…
+// Both new behaviours need the same walk, so it lives here once, at module scope,
+// with no deps and no I/O — the snapshot is the only input.
+
+/** A re-verify ticket (live-reverify.mjs stamps both fields on every one). */
+const isGateReverifyTicket = (t) => t?.spawnedBy?.reverify === true || !!t?.spawnedBy?.rearmOf;
+
+/** A lineage member's round. The gate's own first pass is round 1 by definition. */
+const lineageRoundOf = (t) =>
+  Number.isFinite(Number(t?.spawnedBy?.round)) ? Number(t.spawnedBy.round) : 1;
+
+/** Milliseconds for the tie-break, 0 when the row carries no usable timestamp. */
+const completedAtMs = (t) => {
+  const raw = t?.completedAt || t?.updatedAt || null;
+  const ms = raw ? Date.parse(raw) : NaN;
+  return Number.isFinite(ms) ? ms : 0;
+};
+
+/**
+ * Walk UP to the lineage root. `spawnedBy.rearmOf` points at the ticket that was
+ * re-armed — which for round 3 is the round-2 re-verify ticket, NOT the original
+ * gate ticket (live-reverify.mjs files against `gateTicket`, and the cascade hands
+ * it whatever just completed). So the lineage is a CHAIN and both directions have
+ * to be followed transitively; a `seen` guard makes a corrupt cycle terminate
+ * rather than hang the Lambda.
+ */
+export function gateLineageRoot(ticketId, snapshot = []) {
+  let id = ticketId;
+  const seen = new Set();
+  for (;;) {
+    if (!id || seen.has(id)) return ticketId;
+    seen.add(id);
+    const up = snapshot.find((s) => s?.ticketId === id)?.spawnedBy?.rearmOf;
+    if (typeof up !== "string" || !up || up === id) return id;
+    id = up;
+  }
+}
+
+/**
+ * The whole lineage, root first: the root's row plus every row reachable from it
+ * through `rearmOf`. Rows the snapshot does not contain are simply absent — the
+ * callers treat a lineage they cannot see as "no newer verdict than the root's",
+ * which is the conservative reading.
+ */
+export function gateLineage(rootId, snapshot = []) {
+  const lineage = [];
+  const seen = new Set();
+  let frontier = [rootId];
+  while (frontier.length) {
+    const next = [];
+    for (const id of frontier) {
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      const row = snapshot.find((s) => s?.ticketId === id);
+      if (row) lineage.push(row);
+      for (const s of snapshot) {
+        if (s?.spawnedBy?.rearmOf === id && s?.ticketId && !seen.has(s.ticketId)) next.push(s.ticketId);
+      }
+    }
+    frontier = next;
+  }
+  return lineage;
+}
 
 /**
  * Normalize the `extendedStates` dep into off | shadow | enforce. Backwards
@@ -167,6 +238,23 @@ export function createCascade(deps) {
     // Files the gate persona's own re-verify ticket (live-reverify.mjs `reverify`),
     // so a non-PASS verdict always has something REAL to hold the successor on.
     reverify,
+    // TEAM-4264 F2 — the run's CURRENT feature-branch head, async (workflow) → sha
+    // | null (index.mjs featureBranchHeadSha, one memoised GitHub read). Used ONLY
+    // as a fallback when the gate persona reported no tested head of its own: an
+    // unpinned re-verify cannot be filed idempotently, so before this dep a gate
+    // that stated a verdict without a head produced NO durable hold at all — the
+    // successor was suppressed in memory for one pass and re-dispatched by the next
+    // reconcile sweep. Unwired = that old behaviour (the sentinel slot in
+    // live-reverify.mjs is the second belt).
+    headResolver,
+    // TEAM-4264 F4 — (workflow, persona) → the ReviewGate def whose maxRounds caps
+    // this gate persona's re-verify rounds, or null. Unwired ⇒ the shared defaults
+    // (3 rounds), because an uncapped sequence is the defect, not the fallback.
+    reviewGateFor,
+    // TEAM-4264 F4 — the same best-effort human page rework-loop-cap.mjs uses at
+    // its own cap (index.mjs parkRunEscalationGate). Optional: unwired, the cap
+    // still holds and still publishes, it just does not park a gate.
+    parkRunEscalationGate,
     // Writes the blocker edge without yanking a ticket an agent or human is mid-way
     // through (index.mjs applyBlockerEdge, via preserveStatusIf).
     addBlockers,
@@ -231,24 +319,48 @@ export function createCascade(deps) {
     );
 
   /**
+   * The hold's verdict as the JOURNAL spells it: "UNKNOWN" is a cascade-internal
+   * name, so it goes out as null (TEAM-4264 F1). D1 already published
+   * `verdict: null` + `verdictSource: "none"` for an unresolved verdict and every
+   * reader parses that shape; adding a fifth enum value to the wire would make
+   * each consumer's verdict switch fall through instead.
+   */
+  const wireVerdict = (gate) => (gate.verdict === "UNKNOWN" ? null : gate.verdict);
+
+  /**
    * What this ticket's own verdict says about letting its successors run
    * (TEAM-4246 D1). Returns null for every case that must behave exactly as it did
-   * before — flag off, no resolver wired, not a gate persona, no verdict resolvable,
-   * or a PASS. Only a gate persona's NON-PASS verdict produces a hold.
+   * before — flag off, no resolver wired, not a gate persona, or a PASS. A gate
+   * persona's NON-PASS verdict produces a hold, and so does a NULL one.
    *
-   * A null verdict deliberately does not hold: "the persona stated nothing the
-   * contract recognizes" is not "the persona failed", and holding there would stall
-   * every run whose reviewer writes a summary the ladder cannot read.
+   * A null verdict HOLDS, as "UNKNOWN" (TEAM-4264 F1). This is the inversion of
+   * what the module shipped with, and the reason is that the old rule read the
+   * contract backwards: FR-D1.4 says "null is never PASS", but sending null down
+   * the same early return as PASS made it PASS in the only way that matters. The
+   * argument for the old behaviour — "the persona stated nothing the contract
+   * recognizes" is not "the persona failed" — is true and is not the question. The
+   * question is what to DO about not knowing, and for a gate persona the answer
+   * cannot be "ship": its entire job is to decide, so silence is the one output it
+   * is not allowed to produce. What the run pays is one re-verify round, capped,
+   * against a persona that will usually just restate its verdict in a form the
+   * ladder reads. dowtdh paid the other price.
+   *
+   * `verdict` is therefore never null in the returned hold — it is a real enum
+   * value or the string "UNKNOWN", so every consumer can switch on one field.
+   * `verdictSource` stays "none" for UNKNOWN (the wire value D1 already defines)
+   * and `resolveError` distinguishes "we read the record and could not parse it"
+   * from "the read itself threw" — both hold, but only the second is an outage.
    */
   async function resolveVerdictHold(ticketId, workflow, siblings) {
     if (verdictMode === "off" || typeof verdictGate !== "function") return null;
     const info = await verdictGate({ ticketId, workflow, siblings });
     if (!info || info.isGatePersona !== true) return null;
-    const verdict = info.verdict || null;
-    if (!verdict || verdict === "PASS") return null;
+    const verdict = info.verdict || "UNKNOWN";
+    if (verdict === "PASS") return null;
     return {
       verdict,
-      verdictSource: info.verdictSource || null,
+      verdictSource: info.verdictSource || (verdict === "UNKNOWN" ? "none" : null),
+      resolveError: info.resolveError === true,
       testedHead: info.testedHead || "",
       spawnedTickets: (Array.isArray(info.spawnedTickets) ? info.spawnedTickets : []).filter(Boolean),
       // FR-D1.5/D1.6 — the open fixes under the epic this persona did NOT file.
@@ -289,14 +401,32 @@ export function createCascade(deps) {
     // boundary, which must fall back to holding, never to unblocking.
     for (const s of successors) held.add(s.ticketId);
 
+    // TEAM-4264 F1 — an UNKNOWN verdict with NOTHING to hold files nothing. A
+    // re-verify ticket exists to gate a SUCCESSOR; when the gate persona is the
+    // last ticket standing there is no successor to gate, and filing one is pure
+    // cost against a persona that never said anything was wrong. Measured on the
+    // six vendored dossiers, this single line is the difference between "null
+    // holds" costing zero and it re-verifying three genuinely PASSING completions
+    // whose prose the ladder cannot read (f50ucz TEAM-4128 "Verdict: code deploy
+    // SUCCEEDED", iczquj TEAM-3591 "CD COMPLETE — PR #57 merged to main" — both
+    // release managers reporting a finished deploy in words the enum has no room
+    // for). Deliberately scoped to UNKNOWN: a STATED non-PASS verdict with no
+    // successors still files, because the persona told us something IS wrong and
+    // the re-verify is the record of that.
+    if (gate.verdict === "UNKNOWN" && successors.length === 0) return [];
+
     const gateTicket = siblings.find((s) => s.ticketId === ticketId) || { ticketId };
     const owner =
       gateTicket.assignee || workflow?.agentTasks?.[ticketId]?.agentId || null;
     // N from the board, so a re-hold at a NEW head reads as the next round: the
-    // gate re-verify tickets already filed for this ticket ARE the rounds.
-    const priorRounds = siblings.filter(
-      (s) => s?.spawnedBy?.rearmOf === ticketId && s?.spawnedBy?.round
-    ).length;
+    // gate re-verify tickets already filed for this LINEAGE are the rounds. Counted
+    // over the whole chain rather than over this ticket's direct children
+    // (TEAM-4264 F4) because `rearmOf` points at the previous ROUND: round 3's
+    // ticket hangs off round 2's, so counting direct children alone reported "1
+    // prior round" forever and every re-verify after the first was mislabelled
+    // round 2. The cap below counts the same rounds, so it has to be the same walk.
+    const lineage = gateLineage(gateLineageRoot(ticketId, siblings), siblings);
+    const priorRounds = lineage.filter(isGateReverifyTicket).length;
 
     // What the successors AND the re-verify wait on: this persona's own fixes plus
     // every other fix still open under the epic (FR-D1.5/D1.6). A non-PASS verdict
@@ -306,12 +436,77 @@ export function createCascade(deps) {
     // unfixed head and burn a round on the same finding.
     const blockOn = [...new Set([...gate.spawnedTickets, ...gate.openFixIds])];
 
+    // ── The gate re-verify cap (TEAM-4264 F4) ───────────────────────────────
+    // `priorRounds` re-verify tickets already exist for this lineage, so filing
+    // another makes it round priorRounds + 1 — and once that exceeds the gate's
+    // maxRounds the persona has restated a non-PASS verdict as often as anyone is
+    // willing to pay for. Nothing compared these numbers before: the review cap
+    // counts HUMAN rejections of a gate, and rework-loop-cap.mjs deliberately
+    // excludes the reverify/rearmOf lineage from its own count, so this sequence
+    // was the one loop in the run with no ceiling at all.
+    //
+    // Reaching the cap is NOT a release — that would turn a bounded loop into the
+    // exact fail-open F1 just closed. The successors stay held (they are already in
+    // `held`), the hold is written against whatever is durable — the open fixes if
+    // there are any, else an OPEN re-verify ticket still on the board — and a human
+    // is paged through the SAME pair rework-loop-cap.mjs uses.
+    //
+    // Only an OPEN blocker counts: an edge to a re-verify ticket that is already
+    // Done satisfies allBlockersResolved, so writing one would look like a hold and
+    // be none. On the usual road to the cap every prior round IS closed (that is how
+    // the rounds got spent), so `heldOn` is legitimately empty and the successor is
+    // held by the other two mechanisms — belt 2 (gateBlockerHolds), which re-reads
+    // the lineage's still-non-PASS verdict on the next reconcile sweep, and the
+    // escalation gate this parks. The event reports the empty list honestly rather
+    // than naming a done ticket as if it were a barrier.
+    const { maxRounds } = resolveGateReverifyCap(reviewGateFor?.(workflow, owner));
+    if (priorRounds >= maxRounds) {
+      const openReverify = lineage
+        .filter(isGateReverifyTicket)
+        .filter((t) => !RESOLVED_BLOCKER_STATUSES.has(t.status))
+        .sort((a, b) => lineageRoundOf(b) - lineageRoundOf(a) || completedAtMs(b) - completedAtMs(a))[0];
+      const heldOn = blockOn.length ? blockOn : [openReverify?.ticketId].filter(Boolean);
+      await writeHoldEdges(successors, heldOn);
+      log(`[orchestrator] verdict-gate cap — ${ticketId} ${gate.verdict} at round ${priorRounds + 1} > max ${maxRounds}; ` +
+        `holding [${successors.map((s) => s.ticketId).join(", ")}] on ` +
+        `[${heldOn.join(", ") || "nothing durable — belt 2 + the escalation gate"}] and paging a human`);
+      await escalateGateReverifyCap({
+        workflow,
+        gateTicketId: ticketId,
+        rootId: gateLineageRoot(ticketId, siblings),
+        persona: owner,
+        verdict: gate.verdict,
+        round: priorRounds + 1,
+        maxRounds,
+        heldSuccessors: successors.map((s) => s.ticketId),
+        heldOn,
+      });
+      return heldOn;
+    }
+
+    // The head the re-verify is pinned to (TEAM-4264 F2 belt 1). What the persona
+    // reported wins; the resolver — the run's CURRENT feature-branch head — is the
+    // fallback for the gate that stated a verdict and no head. Without it that gate
+    // produced no durable hold whatsoever: reverify() refuses to file unpinned, so
+    // `blockers` came back empty and only the in-memory `held` Set stood between
+    // the successor and the next reconcile sweep. A failed lookup is not fatal here
+    // — live-reverify.mjs then files against its own deterministic sentinel slot —
+    // so this is one belt of two and neither is load-bearing alone.
+    let headSha = gate.testedHead || "";
+    if (!headSha && typeof headResolver === "function") {
+      try {
+        headSha = (await headResolver(workflow)) || "";
+      } catch (err) {
+        log(`[orchestrator] verdict-gate: head resolve failed (non-fatal) — ${ticketId}: ${err?.message || err}`);
+      }
+    }
+
     const filed = await reverify?.({
       kind: "gate",
       workflow,
       owner,
       gateTicket,
-      headSha: gate.testedHead,
+      headSha,
       blockedBy: blockOn,
       round: gate.round ?? priorRounds + 1,
       reason: `${gate.verdict} (${gate.verdictSource || "unknown source"})`,
@@ -322,18 +517,131 @@ export function createCascade(deps) {
     // still holds — this pass simply refuses to unblock — and says so in the event.
     const blockers = [...new Set([...blockOn, filed?.reverifyTicketId].filter(Boolean))];
 
+    await writeHoldEdges(successors, blockers);
+
+    return blockers;
+  }
+
+  /**
+   * Write the hold as ordinary blocker edges and patch the in-memory snapshot the
+   * predicate reads, so this pass cannot transition or dispatch a ticket whose edge
+   * we just wrote. Shared by the normal hold and the cap hold (TEAM-4264 F4) —
+   * "held" must mean exactly the same thing on both paths.
+   */
+  async function writeHoldEdges(successors, blockers) {
     for (const sibling of successors) {
       const already = sibling.blockedBy || [];
       for (const blocker of blockers) {
         if (already.includes(blocker)) continue;
         await addBlockers?.(sibling.ticketId, [blocker], { preserveStatusIf: LIVE_SHIP_STATUSES });
       }
-      // Patch the snapshot the predicate reads, so this pass cannot transition or
-      // dispatch a ticket whose edge we just wrote.
       sibling.blockedBy = [...new Set([...already, ...blockers])];
     }
+  }
 
-    return blockers;
+  /**
+   * Page a human at the gate re-verify cap (TEAM-4264 F4), through the pair
+   * rework-loop-cap.mjs already uses: an append-only escalation marker in the
+   * ledger (which is also this signal's idempotency key — a redelivered Done must
+   * not re-page) plus a best-effort park of the run's open escalation gate.
+   *
+   * The ledger key is namespaced `<workflowId>:gate-reverify:<rootTicketId>` so it
+   * shares the store's writer and openEscalation's derivation without landing in
+   * any `<workflowId>:<phase>` bucket the rework cap counts — two caps, two
+   * sequences, one ledger, and neither one's arithmetic reads the other's rows.
+   *
+   * Never throws: every step is best-effort, because the HOLD is the safety
+   * property and the page is the notification. Losing the page must not lose the
+   * hold.
+   */
+  async function escalateGateReverifyCap({ workflow, gateTicketId, rootId, persona, verdict, round, maxRounds, heldSuccessors, heldOn }) {
+    const key = `${workflow?.id}:gate-reverify:${rootId}`;
+    if (openEscalation(workflow?.reworkLineage?.[key])) {
+      log(`[orchestrator] verdict-gate cap — ${gateTicketId} already escalated (${key}); not re-paging`);
+      return false;
+    }
+    try {
+      await store?.appendReworkEscalation?.(workflow.id, key, {
+        escalatedAtRound: round,
+        decision: null,
+        escalatedAt: new Date(now()).toISOString(),
+      });
+    } catch (err) {
+      log(`[orchestrator] verdict-gate cap: escalation persist failed (signalling anyway) — ${key}: ${err?.message || err}`);
+    }
+    await safePublish(gateTicketId, "orchestrator.gate_reverify_cap_reached", {
+      workflowId: workflow?.id,
+      gateTicketId,
+      persona,
+      verdict: verdict === "UNKNOWN" ? null : verdict,
+      round,
+      maxRounds,
+      heldSuccessors,
+      heldOn,
+    });
+    if (typeof parkRunEscalationGate === "function") {
+      try {
+        return (await parkRunEscalationGate(workflow, "gate-reverify")) === true;
+      } catch (err) {
+        log(`[orchestrator] verdict-gate cap: park failed (non-fatal) — ${gateTicketId}: ${err?.message || err}`);
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Belt 2 of the durable hold (TEAM-4264 F2): does a DONE gate blocker's verdict
+   * still hold this sibling back, whatever the board says about its blockers?
+   *
+   * The cascade's hold is an edge, and an edge can fail to be written — create_ticket
+   * down, an unpinnable re-verify, addBlockers throwing. Before this, the reconcile
+   * sweep decided purely on `allBlockersResolved` + lease + parked-long-enough, so a
+   * hold that existed only in the completing invocation's memory was released by the
+   * next sweep 5 minutes later. This is the predicate that closes that: the sweep
+   * re-asks the gate itself.
+   *
+   * The verdict it asks for is the LINEAGE-LATEST one, not the blocker's own
+   * (amendment A1). A gate that returned FAIL and whose round-2 re-verify then
+   * returned PASS has passed — holding on the FAIL forever would wedge the run, and
+   * it is the same "Done is Done" error in reverse: the newest statement by the same
+   * persona about the same gate is the one that counts. Only DONE members are
+   * considered; an open one means the sibling's blockers are unresolved anyway, so
+   * the sweep never gets here.
+   *
+   * Re-verify blockers are SKIPPED as blockers in their own right: their verdict is
+   * already the lineage answer for their root, and evaluating them separately would
+   * double-count a lineage whose root is also in `blockedBy`.
+   */
+  async function gateBlockerHolds(sibling, workflow, snapshot) {
+    if (verdictMode === "off" || typeof verdictGate !== "function") return null;
+    for (const bid of sibling.blockedBy || []) {
+      if (bid === sibling.ticketId) continue;
+      const row = snapshot.find((s) => s?.ticketId === bid);
+      if (!row || !RESOLVED_BLOCKER_STATUSES.has(row.status)) continue;
+      if (isGateReverifyTicket(row)) continue;
+      const info = await verdictGate({ ticketId: bid, workflow, siblings: snapshot });
+      if (!info || info.isGatePersona !== true) continue;
+
+      // Lineage-latest: highest round wins, most recently completed breaks a tie.
+      const done = gateLineage(bid, snapshot).filter((t) => RESOLVED_BLOCKER_STATUSES.has(t.status));
+      const latest = done.sort(
+        (a, b) => lineageRoundOf(b) - lineageRoundOf(a) || completedAtMs(b) - completedAtMs(a)
+      )[0];
+      const latestInfo =
+        latest && latest.ticketId !== bid
+          ? await verdictGate({ ticketId: latest.ticketId, workflow, siblings: snapshot })
+          : info;
+      const verdict = latestInfo?.verdict || "UNKNOWN";
+      if (verdict === "PASS") continue;
+      return {
+        blockerId: bid,
+        gateTicketId: latest?.ticketId || bid,
+        verdict,
+        verdictSource: latestInfo?.verdictSource || (verdict === "UNKNOWN" ? "none" : null),
+        resolveError: latestInfo?.resolveError === true,
+      };
+    }
+    return null;
   }
 
   /**
@@ -500,8 +808,10 @@ export function createCascade(deps) {
     if (gate && verdictMode === "shadow") {
       await safePublish(ticketId, "orchestrator.verdict_observed", {
         workflowId: workflow?.id,
-        verdict: gate.verdict,
+        verdict: wireVerdict(gate),
         verdictSource: gate.verdictSource,
+        reason: gate.verdict === "UNKNOWN" ? "no-verdict" : "non-pass",
+        ...(gate.resolveError ? { resolveError: true } : {}),
         wouldSuppress: unblocked,
         spawnedTickets: gate.spawnedTickets,
         // What enforce WOULD have held them on (FR-D1.5/D1.6): this persona's fixes
@@ -515,7 +825,10 @@ export function createCascade(deps) {
     } else if (gate && verdictMode === "enforce") {
       await safePublish(ticketId, "orchestrator.verdict_suppressed", {
         workflowId: workflow?.id,
-        verdict: gate.verdict,
+        verdict: wireVerdict(gate),
+        verdictSource: gate.verdictSource,
+        reason: gate.verdict === "UNKNOWN" ? "no-verdict" : "non-pass",
+        ...(gate.resolveError ? { resolveError: true } : {}),
         unblocked: [...held],
         blockers: gateBlockers,
         spawnedTickets: gate.spawnedTickets,
@@ -726,6 +1039,33 @@ export function createCascade(deps) {
   }
 
   /**
+   * gateBlockerHolds with its boundary (TEAM-4264 F2 belt 2): resolve the snapshot,
+   * and fail CLOSED under enforce.
+   *
+   * The fail direction is the opposite of `resolveVerdictHold`'s and the difference
+   * is which way each one is wrong. There, a resolver that throws before we know
+   * anything is a throw for EVERY completion of every persona, so holding would
+   * stall all 14. Here we are asked about ONE parked ticket that a gate blocker
+   * already gated once: refusing to re-dispatch it costs one sweep cycle and the
+   * next sweep asks again, while releasing it is the fail-open the finding is about.
+   * Same posture as `escalationHeld` immediately above.
+   */
+  async function reconcileVerdictHold(sibling, workflow, opts) {
+    if (verdictMode === "off" || typeof verdictGate !== "function") return null;
+    try {
+      const snapshot = Array.isArray(opts?.snapshot)
+        ? opts.snapshot
+        : (await getChildTickets(workflow?.epicId || workflow?.parentId)) || [];
+      return await gateBlockerHolds(sibling, workflow, snapshot);
+    } catch (err) {
+      log(`[orchestrator] reconcile verdict check failed (${verdictMode}) — ${sibling.ticketId}: ${err?.message || err}` +
+        (verdictMode === "enforce" ? " — holding" : " — proceeding (shadow)"));
+      if (verdictMode !== "enforce") return null;
+      return { blockerId: null, gateTicketId: null, verdict: "UNKNOWN", verdictSource: "none", resolveError: true };
+    }
+  }
+
+  /**
    * Recover ONE parked/ready dependent whose blockers are ALL resolved but which
    * missed its unblock event (TEAM-3747 D1, used by reconcile-sweep.mjs). This is
    * the single reuse point for the invariant — the sweep NEVER re-implements the
@@ -742,18 +1082,50 @@ export function createCascade(deps) {
    *
    * `mode` is the SWEEP's rollout mode (independent of the cascade's) — shadow
    * observes, enforce writes. Returns an outcome string the sweep tallies.
+   *
+   * `opts.snapshot` is the sibling page the caller already read (the sweep has one
+   * per workflow); absent, the verdict check re-reads the children itself. The
+   * VERDICT check is governed by VERDICT_GATE, not by `mode` — the sweep's mode says
+   * whether the sweep may write, the gate's flag says whether a verdict binds — so
+   * under sweep-shadow a held candidate still reports `verdict-held` and still
+   * writes nothing, which is exactly what shadow means.
    */
-  async function reconcileDependent(sibling, unblockedBy, workflow, m, mode) {
+  async function reconcileDependent(sibling, unblockedBy, workflow, m, mode, opts = {}) {
     // TEAM-3973 — an ESCALATED ticket is held for the human, in every status.
     // Escalation used to bind only the in_progress steal path, so the very next
     // sweep re-drove the ticket through the ready/todo/blocked branch and the
     // escalation meant nothing (prod TEAM-3897: escalated 20:54Z, re-dispatched
     // 20:59Z). The park transition cannot carry this on its own — a board with
     // no Blocked transition falls back to To Do, which IS dispatch-eligible.
+    // Kept FIRST: it is synchronous, it needs no completion record, and a ticket
+    // already parked on a human needs no second reason to stay put.
     if (escalationHeld(sibling, workflow)) {
       m.escalationHeld = (m.escalationHeld || 0) + 1;
       log(`[orchestrator] reconcile hold (escalated, awaiting human) — ${sibling.ticketId} status=${sibling.status}`);
       return "escalation-held";
+    }
+    // TEAM-4264 F2 belt 2 — a non-PASS gate verdict holds here too, or the sweep
+    // undoes the cascade's hold 5 minutes later (the hold is an edge; belt 1 makes
+    // the edge writable, this makes its ABSENCE non-fatal).
+    const gateHold = await reconcileVerdictHold(sibling, workflow, opts);
+    if (gateHold) {
+      if (verdictMode === "enforce") {
+        m.verdictHeld = (m.verdictHeld || 0) + 1;
+        log(`[orchestrator] reconcile hold (gate verdict ${gateHold.verdict} on ${gateHold.gateTicketId}) — ${sibling.ticketId} status=${sibling.status}`);
+        return "verdict-held";
+      }
+      await safePublish(sibling.ticketId, "orchestrator.verdict_observed", {
+        workflowId: workflow?.id,
+        path: "reconcile",
+        verdict: gateHold.verdict === "UNKNOWN" ? null : gateHold.verdict,
+        verdictSource: gateHold.verdictSource,
+        reason: gateHold.verdict === "UNKNOWN" ? "no-verdict" : "non-pass",
+        ...(gateHold.resolveError ? { resolveError: true } : {}),
+        gateTicketId: gateHold.gateTicketId,
+        blockerId: gateHold.blockerId,
+        wouldSuppress: [sibling.ticketId],
+      });
+      log(`[orchestrator] reconcile would-hold (shadow, gate verdict ${gateHold.verdict} on ${gateHold.gateTicketId}) — ${sibling.ticketId}`);
     }
     if (await leaseIsLive(sibling, workflow)) {
       return emitNudge(sibling, unblockedBy, workflow, m, mode);
@@ -908,6 +1280,9 @@ export function newMetrics() {
     levelDispatched: 0,
     wouldDispatch: 0,
     levelDispatchErrors: 0,
+    // TEAM-4264 F2 belt 2 — reconcile candidates held by a gate blocker's
+    // lineage-latest non-PASS verdict instead of being re-dispatched.
+    verdictHeld: 0,
   };
 }
 
@@ -917,7 +1292,8 @@ export function hasCascadeActivity(m) {
     m.nudged || m.skippedLiveLease || m.redispatched || m.reviewReawakened ||
     m.dependentErrors || m.wouldNudge || m.wouldSteal || m.wouldRedispatch ||
     m.wouldReviewReawaken || m.blockerConfirmAborted ||
-    m.levelDispatched || m.wouldDispatch || m.levelDispatchErrors
+    m.levelDispatched || m.wouldDispatch || m.levelDispatchErrors ||
+    m.verdictHeld
   );
 }
 
@@ -948,6 +1324,7 @@ export function emitCascadeMetrics(m) {
           { Name: "CascadeLevelDispatched", Unit: "Count" },
           { Name: "CascadeWouldDispatch", Unit: "Count" },
           { Name: "CascadeLevelDispatchErrors", Unit: "Count" },
+          { Name: "CascadeVerdictHeld", Unit: "Count" },
         ],
       }],
     },
@@ -964,5 +1341,6 @@ export function emitCascadeMetrics(m) {
     CascadeLevelDispatched: m.levelDispatched || 0,
     CascadeWouldDispatch: m.wouldDispatch || 0,
     CascadeLevelDispatchErrors: m.levelDispatchErrors || 0,
+    CascadeVerdictHeld: m.verdictHeld || 0,
   }));
 }

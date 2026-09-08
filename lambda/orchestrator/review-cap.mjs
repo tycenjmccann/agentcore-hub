@@ -88,6 +88,26 @@ export function resolveReviewGateCap(gate) {
 }
 
 /**
+ * The cap on GATE RE-VERIFY rounds (TEAM-4264 F4).
+ *
+ * Deliberately the SAME number, from the same `reviewGates[].maxRounds` field and
+ * with the same >= 1 guard and ceiling clamp, as the human review→rework cap
+ * above — an operator tunes ONE value per gate and both loops it can drive obey
+ * it. The two loops are different mechanisms (a human rejecting a gate vs a gate
+ * persona restating a non-PASS verdict) and neither counted the other, which is
+ * how the verdict re-verify sequence shipped unbounded: rework-loop-cap.mjs
+ * excludes the reverify/rearmOf lineage by design (isReworkFix), and the
+ * per-gate review cap only ever saw human rejections.
+ *
+ * Only `maxRounds` is returned: `regressionCountsDouble` needs findings to
+ * compare (a verdict has none) and `onCapReached` has one possible value here —
+ * hold the successors and page a human. Both would be dead config.
+ */
+export function resolveGateReverifyCap(gate) {
+  return { maxRounds: resolveReviewGateCap(gate).maxRounds };
+}
+
+/**
  * Stable 32-bit FNV-1a hash of a string, hex. Deliberately not crypto: this
  * only has to be deterministic across invocations so the same complaint about
  * the same ticket fingerprints identically two rounds apart.

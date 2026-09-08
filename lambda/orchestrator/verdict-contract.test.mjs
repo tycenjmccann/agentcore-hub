@@ -118,9 +118,9 @@ describe("verdict-contract — the real fixture summaries", () => {
 
 describe("verdict-contract — null is not PASS", () => {
   // The load-bearing distinction. "The agent stated nothing I can read" must
-  // never become "the agent passed", in either direction: a null verdict leaves
-  // today's cascade behaviour exactly as it is, while a null read as PASS would
-  // launder an unreadable summary into a green gate.
+  // never become "the agent passed", and since TEAM-4264 F1 that is enforced on
+  // BOTH sides: null is not laundered into a green gate, AND it no longer takes
+  // the same early return PASS does.
   it("an unreadable summary from a gate persona is `none`, never PASS", () => {
     const { record, assignee } = completionOf("f50ucz", "TEAM-4128");
     const resolved = resolveVerdict(record, assignee);
@@ -129,12 +129,44 @@ describe("verdict-contract — null is not PASS", () => {
     expect(resolved.verdict).not.toBe("PASS");
   });
 
-  it("`none` does not suppress the cascade under enforce", () => {
-    // The other half of the same rule: a null verdict is not a failure either.
-    // Holding every successor whose gate wrote an unreadable summary would stall
-    // more runs than the hole D1 closes.
+  it("`none` SUPPRESSES the cascade under enforce (TEAM-4264 F1)", () => {
+    // Inverted from the shipped assertion, which read the contract backwards.
+    // FR-D1.4 says "null is never PASS" — but sending null down the same early
+    // return as PASS made it PASS in the only way that matters. A gate persona is
+    // the one role whose silence is not consent: deciding IS its job, so "I could
+    // not read the decision" cannot resolve to "ship". The run pays one re-verify
+    // round; dowtdh paid the other price.
     const gate = evaluateGate({ assignee: "agentcore_hub_qa_verifier", verdict: null, spawnedTickets: [], mode: "enforce" });
-    expect(gate).toMatchObject({ reason: "no-verdict", wouldSuppress: false, suppress: false, needsGateReverify: false });
+    expect(gate).toMatchObject({ reason: "no-verdict", wouldSuppress: true, suppress: true, needsGateReverify: true });
+  });
+
+  it("`none` is observed but never acted on under shadow or off", () => {
+    // The flag still owns whether anything happens. `wouldSuppress` is the
+    // rollout signal; `suppress` is the action.
+    for (const mode of ["shadow", undefined]) {
+      expect(evaluateGate({ assignee: "agentcore_hub_ci_agent", verdict: null, spawnedTickets: [], mode }))
+        .toMatchObject({ reason: "no-verdict", wouldSuppress: true, suppress: false });
+    }
+    expect(evaluateGate({ assignee: "agentcore_hub_ci_agent", verdict: null, spawnedTickets: [], mode: "off" }))
+      .toMatchObject({ suppress: false });
+  });
+
+  it("a null verdict from a NON-gate persona still does nothing", () => {
+    // The inversion is scoped to the four gate personas. Every other persona's
+    // silence is ordinary — a backend dev is not being asked for a decision.
+    for (const assignee of ["agentcore_hub_backend_dev", "agentcore_hub_security_reviewer", undefined]) {
+      expect(evaluateGate({ assignee, verdict: null, spawnedTickets: [], mode: "enforce" }))
+        .toMatchObject({ reason: "not-a-gate", wouldSuppress: false, suppress: false });
+    }
+  });
+
+  it("PASS is the ONLY verdict that releases", () => {
+    for (const verdict of ["FAIL", "BLOCKED", "CHANGES_NEEDED", null, undefined, "", "SUCCEEDED"]) {
+      const gate = evaluateGate({ assignee: "agentcore_hub_code_reviewer", verdict, spawnedTickets: [], mode: "enforce" });
+      expect(gate.suppress, String(verdict)).toBe(true);
+    }
+    expect(evaluateGate({ assignee: "agentcore_hub_code_reviewer", verdict: "PASS", spawnedTickets: [], mode: "enforce" }))
+      .toMatchObject({ reason: "pass", wouldSuppress: false, suppress: false });
   });
 
   it("prose about someone else's PASS is not this ticket's verdict", () => {
@@ -217,6 +249,101 @@ describe("verdict-contract — all three CHANGES_NEEDED spellings", () => {
     ]) {
       expect(deriveVerdict(summary), summary).toBeNull();
     }
+  });
+});
+
+describe("verdict-contract — the HEADLINE rung (TEAM-4264 F1)", () => {
+  /**
+   * Rung 3 exists because the blueprints do not all label their verdict: a persona
+   * that leads with its answer ("QA FAIL: …") was unreadable to the shipped
+   * ladder, and unreadable now HOLDS. So this rung is the difference between
+   * holding on real failures and holding on noise.
+   *
+   * Its whole safety property is the ANCHOR plus the TERMINATOR: the token has to
+   * be what the line is about. That is why no test here parses a count and why
+   * "0 FAIL" needs no special case — a rule that reads it correctly by not
+   * matching it cannot be fooled by "00 FAIL" or "zero FAIL" either.
+   */
+  it.each([
+    // The forms the corpus and the blueprints actually produce.
+    ["CI GATE: ✅ PASS — tycenjmccann/ember @ sweep/dead-code, HEAD d231648", "PASS"],
+    ["QA FAIL: 191 PASS / 8 FAIL in live Chromium.", "FAIL"],
+    ["Review complete: CHANGES NEEDED — 3 findings filed", "CHANGES_NEEDED"],
+    ["BLOCKED: startCiBuild=false, no pipeline for this repo.", "BLOCKED"],
+    ["**FAIL** — the migration drops a column still read by the API.", "FAIL"],
+    ["🔴 FAIL (round 2)", "FAIL"],
+    ["> ### PASS", "PASS"],
+    ["Ship review: PASS", "PASS"],
+    ["CHANGES-NEEDED: two P2s.", "CHANGES_NEEDED"],
+    ["PASS", "PASS"],
+  ])("%s → %s", (summary, verdict) => {
+    expect(deriveVerdict(summary)).toMatchObject({ verdict, source: "inferred" });
+  });
+
+  it.each([
+    // Every one of these appears in a real gate summary BODY. Each is a line a
+    // document-wide scan reads as a verdict and this rung does not.
+    "0 FAIL",
+    "FAILURES: 0",
+    "191 PASS / 8 FAIL",
+    "8 FAIL in live Chromium, all pre-existing.",
+    "npm test 57/57, 0 failures",
+    "Deploy stage ended with the intentional HANDOFF exit 2",
+    "Verdict: code deploy SUCCEEDED",
+    "CD COMPLETE — PR #57 merged to main after human approval.",
+    "The reviewer's FAIL was on the previous head.",
+    "Tests that FAIL under load are tracked in TEAM-4001.",
+    "Everything PASSES except the flake noted below.",
+    "FAILING_SUITES=0",
+    "PASSED_COUNT: 57",
+    "Now blocked on TEAM-4183.",
+    "changes needed to the docs only, filed as TEAM-4200.",
+  ])("%s is not a verdict", (summary) => {
+    expect(deriveVerdict(summary), summary).toBeNull();
+  });
+
+  it("scans every line and the MOST SEVERE hit wins", () => {
+    // A persona that passed the unit suite and was then blocked has not passed.
+    // First-hit-wins would read the reassuring line and ship.
+    const summary = [
+      "PASS on the unit suite (57/57).",
+      "Coverage held at 84%.",
+      "BLOCKED: no CI credentials for the target account.",
+    ].join("\n");
+    expect(deriveVerdict(summary)).toMatchObject({ verdict: "BLOCKED", source: "inferred" });
+
+    expect(deriveVerdict("PASS: lint clean\nFAIL: two suites red")).toMatchObject({ verdict: "FAIL" });
+    expect(deriveVerdict("CHANGES NEEDED: naming\nFAIL: the migration is not reversible")).toMatchObject({ verdict: "FAIL" });
+    expect(deriveVerdict("PASS: build\nCHANGES NEEDED: two P2s")).toMatchObject({ verdict: "CHANGES_NEEDED" });
+  });
+
+  it("a LABELLED line still wins over any headline, on any line", () => {
+    // Rungs 1-2 stay document-wide and first-hit-wins: a labelled line is the
+    // persona answering the question directly, and the headline rung must not be
+    // able to overrule it with a more severe word further down.
+    expect(deriveVerdict("FAIL: the first attempt.\nVERDICT: PASS after the fix.")).toMatchObject({ verdict: "PASS" });
+    expect(deriveVerdict("BLOCKED: waiting on creds.\nCI verdict: PASS")).toMatchObject({ verdict: "PASS" });
+    // …and the round heading (rung 2) likewise.
+    expect(deriveVerdict("FAIL: round 1.\n**Ship review round 2 — PASS on head `7c2391ba`**")).toMatchObject({ verdict: "PASS" });
+  });
+
+  it("at most TWO label words — a sentence is not a headline", () => {
+    // The cap is the line between reading a headline and reading prose. Three
+    // words in is a narrative, and narratives quote other tickets' verdicts.
+    expect(deriveVerdict("CI GATE: PASS")).toMatchObject({ verdict: "PASS" });
+    expect(deriveVerdict("The reviewer said the gate was PASS")).toBeNull();
+    expect(deriveVerdict("In round one the suite was FAIL, since fixed.")).toBeNull();
+  });
+
+  it("requires a terminator — a verdict word that starts a sentence is prose", () => {
+    expect(deriveVerdict("PASS — nothing outstanding.")).toMatchObject({ verdict: "PASS" });
+    expect(deriveVerdict("PASSING the head is not the same as passing the gate.")).toBeNull();
+    expect(deriveVerdict("FAILED attempts are listed below.")).toBeNull();
+    expect(deriveVerdict("BLOCKED tickets get re-dispatched on the next sweep.")).toBeNull();
+  });
+
+  it("reports the matched line so an operator can see why", () => {
+    expect(deriveVerdict("QA FAIL: 191 PASS / 8 FAIL").matched).toBe("QA FAIL:");
   });
 });
 

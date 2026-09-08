@@ -89,8 +89,14 @@ export function normalizeLiveReverifyMode(value) {
   return "off";
 }
 
-/** Comma list, JSON array, or artifact objects → a flat list of key strings. */
-function splitCsv(value) {
+/**
+ * Comma list, JSON array, or artifact objects → a flat list of key strings.
+ * Exported for index.mjs's evidence_keys harvest (TEAM-4264 F5): workflow-output
+ * writes the field as a comma-joined STRING (main.py's report_completion declares
+ * it `str`), while the harvest used to accept only an array — the branch had never
+ * fired in production.
+ */
+export function splitCsv(value) {
   if (Array.isArray(value)) {
     return value
       .map((v) => (typeof v === "string" ? v : typeof v?.s3Key === "string" ? v.s3Key : ""))
@@ -169,10 +175,18 @@ const hasSpawnRound = (t) => Number.isFinite(Number(t?.spawnedBy?.round)) && t?.
  * term only matters for the one ticket that is both a gate persona's ticket and a
  * fix ticket — a re-verify ticket itself — where both lineages would otherwise
  * match the same sibling and each would report the other's ticket as its own.
+ *
+ * The UNKNOWN-head gate slot (TEAM-4264 F2) is the one case the sha cannot key,
+ * because every unpinnable round shares the same empty head. There the ROUND is
+ * the slot: round 2 at an unknown head must not read round 1's ticket as its own,
+ * or the cap would never advance and a genuine second hold would file nothing.
  */
-function matchesReverifySlot(t, kind, ownerId, headSha) {
-  if (t?.spawnedBy?.rearmOf !== ownerId || t?.spawnedBy?.headSha !== headSha) return false;
-  return kind === "gate" ? hasSpawnRound(t) : !hasSpawnRound(t);
+function matchesReverifySlot(t, kind, ownerId, headSha, round = null) {
+  if (t?.spawnedBy?.rearmOf !== ownerId) return false;
+  if (kind !== "gate") return t?.spawnedBy?.headSha === headSha && !hasSpawnRound(t);
+  if (!hasSpawnRound(t)) return false;
+  if (!headSha) return !t?.spawnedBy?.headSha && Number(t?.spawnedBy?.round) === Number(round);
+  return t?.spawnedBy?.headSha === headSha;
 }
 
 export function createLiveReverify(deps = {}) {
@@ -266,7 +280,14 @@ export function createLiveReverify(deps = {}) {
    */
   function gateReverifyDescription({ gateId, owner, headSha, fixIds, reason }) {
     return [
-      `Re-run your own gate at HEAD ${headSha} and DECLARE the verdict.`,
+      headSha
+        ? `Re-run your own gate at HEAD ${headSha} and DECLARE the verdict.`
+        : "Re-run your own gate at the CURRENT head of the feature branch and DECLARE the verdict.",
+      // TEAM-4264 F2 — say why no sha is named, so the persona reports the head it
+      // actually checked instead of assuming the orchestrator already knows it.
+      headSha
+        ? ""
+        : "The head could not be resolved when this ticket was filed (the gate reported no tested_head and the branch ref was unreadable), so resolve it yourself with `git rev-parse HEAD` in the checkout and report it in tested_head.",
       "",
       `${gateId} returned a non-PASS verdict, so the successor phase is held until this ticket closes.`,
       fixIds.length
@@ -306,7 +327,7 @@ export function createLiveReverify(deps = {}) {
    * `reverifySha <> :sha` arm lets both claims through to layer 3, whose scan is
    * the backstop that keeps the ticket count at one per lineage.
    */
-  async function fileReverifyTicket({ kind, workflow, ownerId, headSha, slotSha, ticket, blockTargets } = {}) {
+  async function fileReverifyTicket({ kind, workflow, ownerId, headSha, slotSha, matchRound = null, ticket, blockTargets } = {}) {
     const sha7 = typeof headSha === "string" && headSha ? headSha.slice(0, 7) : "";
     const entry = workflow.agentTasks?.[ownerId];
 
@@ -341,7 +362,7 @@ export function createLiveReverify(deps = {}) {
     //    thing that sees a ticket filed before F2 existed, or one whose
     //    metadata write was lost. Also the source of the ship tickets below.
     const siblings = (await safe("getChildTickets", () => getChildTickets?.(workflow.epicId), [])) || [];
-    const existing = siblings.find((t) => matchesReverifySlot(t, kind, ownerId, headSha));
+    const existing = siblings.find((t) => matchesReverifySlot(t, kind, ownerId, headSha, matchRound));
 
     if (claim === "taken") {
       // Another invocation owns this exact (owner, slot). NEVER create: either its
@@ -429,19 +450,25 @@ export function createLiveReverify(deps = {}) {
       }
       const sha = typeof headSha === "string" ? headSha.trim() : "";
       const sha7 = sha ? sha.slice(0, 7) : "";
-      if (!sha7) {
-        // Same rule as the live path: a re-verification that is not pinned to a
-        // head is not idempotent, and an unpinnable one filed twice per redelivery
-        // would be worse than the hold the caller falls back to.
-        warn(`reverify(gate): ${gateId} has no head sha to pin a re-verification to`);
-        return { action: "no-sha" };
-      }
 
       // Round N+1: the caller counts the round it OBSERVED, and this ticket is the
       // next one. Also what tells the sibling scan a gate re-verify apart from a
       // live-evidence one when the owner is a ticket that is both (a re-verify
       // ticket is assigned to a gate persona AND carries a fix kind).
       const nextRound = Number.isFinite(Number(round)) ? Math.floor(Number(round)) + 1 : 1;
+
+      // TEAM-4264 F2 — an unpinnable GATE re-verify is filed anyway, against a
+      // deterministic sentinel slot. The live path's rule (no sha ⇒ file nothing)
+      // is right for it and wrong here, and the difference is what the caller does
+      // when nothing is filed: onFixDone simply skips, whereas the cascade FALLS
+      // BACK TO AN IN-MEMORY HOLD it cannot persist — so "no ticket" there means
+      // the successor is released by the next reconcile sweep. Idempotency, which
+      // is the reason the live path refuses, is preserved by scoping the slot to
+      // the ROUND instead of the head: `gate:unknown:r<N>` is as stable across a
+      // redelivery as a sha7 is, and a genuine round N+1 at a still-unknown head
+      // gets its own slot rather than colliding with round N. The gate re-verify
+      // cap is what bounds that sequence.
+      const slotSha = sha7 ? `gate:${sha7}` : `gate:unknown:r${nextRound}`;
       const title = inertOneLine(gateTicket?.title || gateTicket?.summary || gateId, 160);
       const fixIds = [...new Set(blockedBy.filter((id) => typeof id === "string" && id.trim()).map((id) => id.trim()))];
 
@@ -452,9 +479,12 @@ export function createLiveReverify(deps = {}) {
         headSha: sha,
         // Namespaced so it can never collide with the live path's claim on the same
         // entry — see fileReverifyTicket's doc.
-        slotSha: `gate:${sha7}`,
+        slotSha,
+        // Only consulted for the unknown-head slot, where the sha cannot tell two
+        // rounds apart (matchesReverifySlot).
+        matchRound: nextRound,
         ticket: {
-          summary: `Re-verify (round ${nextRound}): ${title} @ ${sha7}`.slice(0, 240),
+          summary: `Re-verify (round ${nextRound}): ${title} @ ${sha7 || "unknown"}`.slice(0, 240),
           description: gateReverifyDescription({ gateId, owner, headSha: sha, fixIds, reason }),
           assignee: owner,
           blocked_by: fixIds,
@@ -481,7 +511,7 @@ export function createLiveReverify(deps = {}) {
       });
 
       if (res.action === "failed") {
-        warn(`reverify(gate): could not create the re-verify ticket for ${gateId} @ ${sha7} — the caller must hold on its own`);
+        warn(`reverify(gate): could not create the re-verify ticket for ${gateId} @ ${sha7 || "unknown head"} — the caller must hold on its own`);
         return { action: "failed", sha7 };
       }
       await safe("publishEvent(fix.reverify_created)", () =>
@@ -499,7 +529,7 @@ export function createLiveReverify(deps = {}) {
           at: new Date(now()).toISOString(),
         })
       );
-      info(`${gateId}: gate re-verify ${res.reverifyTicketId} (round ${nextRound}) @ ${sha7}${res.action === "already" ? " (already existed)" : ""}`);
+      info(`${gateId}: gate re-verify ${res.reverifyTicketId} (round ${nextRound}) @ ${sha7 || "unknown head (slot " + slotSha + ")"}${res.action === "already" ? " (already existed)" : ""}`);
       return { ...res, round: nextRound };
     } catch (err) {
       // The caller (cascade) must never fail open on our account: it treats

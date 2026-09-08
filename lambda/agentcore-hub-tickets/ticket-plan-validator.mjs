@@ -230,14 +230,41 @@ export function findBranchTokens(text) {
  * Validate a ticket plan. NEVER throws — the caller decides what a violation
  * costs, and a bug in here must not be how a plan gets lost.
  *
- * Returns { ok, violations: [{ code, ticketRef, message }] }.
+ * Returns { ok, violations: [{ code, ticketRef, message, severity }] }.
  *
- * Codes:
- *   unblocked-non-root  an entry with blocked_by=[] that is not the requirements
- *                       root, not advisory and claims no fix lineage, while the
- *                       root is still open. THE c2uqki DEFECT.
- *   invented-branch     a branch-shaped token in an entry's prose that is
- *                       neither a known branch nor the harness convention.
+ * Codes (TEAM-4264 F8 adds `severity` to both):
+ *   unblocked-non-root  severity "error". An entry with blocked_by=[] that is
+ *                       not the requirements root, not advisory and claims no
+ *                       fix lineage, while the root is still open. THE c2uqki
+ *                       DEFECT — the only rule a caller may reject a plan for.
+ *   invented-branch     severity "warn", ALWAYS — never fatal, in any mode, at
+ *                       any call site. A branch-shaped token in an entry's
+ *                       prose that is neither a known branch nor the harness
+ *                       convention is a genuine defect (FR-D3.2: "a branch that
+ *                       does not exist"), but this validator cannot tell an
+ *                       invented name from a real, non-canonical one — a repo's
+ *                       `chore/dead-code-sweep-2026-08-31` or a hotfix's
+ *                       `fix/foo` is exactly as branch-shaped as c2uqki's
+ *                       fabricated `chore/dead-code-sweep-2026-09-07`. Existence
+ *                       is only checkable against GitHub, and NONE of the three
+ *                       writers that call this module (workflow-output,
+ *                       agentcore-hub-tickets, agentcore-hub-jira) holds a
+ *                       GitHub credential — adding one would plumb a new
+ *                       secret and a network hop into a ticket-minting hot
+ *                       path, which the ticket's "no new Lambda/table/resource"
+ *                       constraint forbids in spirit. `knownBranches` (an
+ *                       existing opt, unchanged by F8) is the escape hatch: a
+ *                       caller that CAN name real branches — the orchestrator
+ *                       passes the run's own rendered/known branches,
+ *                       including workflow.featureBranch — whitelists them and
+ *                       the token is never flagged at all. Both of the
+ *                       `createTicket` paths (agentcore-hub-jira/index.mjs,
+ *                       agentcore-hub-tickets/index.mjs) already surface only
+ *                       `unblocked-non-root` today (they end on
+ *                       `violations.find(v => v.code === "unblocked-non-root")
+ *                       ?.message`) — this rule was never enforceable there to
+ *                       begin with, so making it advisory changes nothing at
+ *                       those two call sites.
  *
  * Fails open on every uncertainty: no root resolvable → no unblocked-non-root
  * violations at all; a TERMINAL rootStatus → likewise (the plan is being
@@ -272,6 +299,7 @@ export function validateTicketPlan(tickets, opts = {}) {
       violations.push({
         code: "unblocked-non-root",
         ticketRef: refOf(t),
+        severity: "error",
         message:
           `${refOf(t)} has blocked_by=[] but the requirements root ` +
           `${rootRef || "the requirements ticket"} is not done — a non-root ticket ` +
@@ -290,6 +318,11 @@ export function validateTicketPlan(tickets, opts = {}) {
       violations.push({
         code: "invented-branch",
         ticketRef: refOf(t),
+        // TEAM-4264 F8: advisory, always — see the docblock. Existence cannot be
+        // checked at any of the three writers that call this module, so a real,
+        // non-canonical branch this validator has no way to know about (a
+        // knownBranches miss) must never hard-reject a plan.
+        severity: "warn",
         message:
           `${refOf(t)} names the branch "${tok}", which does not exist and does ` +
           `not follow the harness convention feature/<ticketId>-<persona-slug>. ` +

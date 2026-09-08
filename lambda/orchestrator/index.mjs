@@ -52,7 +52,7 @@ import { createReworkLoopCap, normalizeReworkLoopMode } from "./rework-loop-cap.
 // LIVE_SHIP_STATUSES: the statuses a blocker edge must never yank a ticket out of.
 // Imported (as cascade.mjs does) rather than re-listed, so "what is mid-flight" has
 // one definition across the live re-verify, the verdict hold and FR-D1.7.
-import { createLiveReverify, normalizeLiveReverifyMode, LIVE_SHIP_STATUSES } from "./live-reverify.mjs";
+import { createLiveReverify, normalizeLiveReverifyMode, LIVE_SHIP_STATUSES, splitCsv } from "./live-reverify.mjs";
 import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, evaluateVerifiedHeads, SHIP_PHASES, SHIP_BLOCKED_OUTCOMES, NO_OP_OUTCOMES, TERMINAL_WORKFLOW_PHASES, FIX_KINDS, REWORK_FIX_KINDS, normalizeAdvisoryRoutingMode, isAdvisoryTicket, nonAdvisory } from "./completion.mjs";
 import { isPipelineEnabled } from "./pipeline-enabled.mjs";
 import { CD_REGISTRY_KEY, EMPTY_CD_REGISTRY, parseCdRegistry, isCdRegistered, effectiveWorkflowDef, resolveDelivery, deliveryModeContext } from "./cd-registry.mjs";
@@ -925,6 +925,16 @@ function getCascade() {
           // Same factory as observeLiveReverify's kind:"ship" path — one memo,
           // one idempotency store, whichever kind asks first.
           reverify: (args) => getLiveReverify().reverify(args),
+          // TEAM-4264 F2 — the fallback head for a gate re-verify when the persona
+          // reported no tested_head. Memoized, null-on-anything, so the cascade
+          // pays at most one GitHub read per invocation and never throws.
+          headResolver: (workflow) => featureBranchHeadSha(workflow),
+          // TEAM-4264 F4 — the cap on gate re-verify rounds is the review gate's
+          // own maxRounds, so an operator tunes ONE number per gate for both loops
+          // it can drive. No gate def for the persona's phase ⇒ the shared default.
+          reviewGateFor: gateDefForPersona,
+          // Same human page rework-loop-cap.mjs uses when ITS cap trips.
+          parkRunEscalationGate,
           addBlockers,
         }
       : { verdictGate: null }),
@@ -993,6 +1003,23 @@ function getReworkLoopCap() {
     log: (msg) => console.log(`[orchestrator] ${msg}`),
   });
   return _reworkLoopCap;
+}
+
+/**
+ * The ReviewGate def that governs a GATE PERSONA's own phase (TEAM-4264 F4), or
+ * null. Only `maxRounds` is read from it — the cap on how many times that persona
+ * may re-verify one gate before a human is paged — so a def that declares no gate
+ * for the phase degrades to REVIEW_GATE_CAP_DEFAULTS rather than to no cap.
+ */
+function gateDefForPersona(workflow, persona) {
+  try {
+    const phase = getAgentDef(persona)?.phase;
+    if (!phase) return null;
+    const wfDef = getEffectiveWorkflowDef(workflow);
+    return (wfDef?.reviewGates || []).find((g) => g?.afterPhase === phase) || null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -1271,11 +1298,19 @@ function spawnedFixIdsFor(ticketId, siblings) {
  *     and resolving spawnedTickets only when the gate is on would make it differ.
  *     Non-gate personas return before any I/O at all.
  *
- * Never throws, and a record it cannot read yields a null verdict — which by
- * contract holds nothing. That is the same outcome as a persona who stated nothing
- * the ladder recognizes, and it is the only safe reading: the record is the sole
- * input, so there is no second opinion to fall back to, and holding every successor
- * over a transient S3 error would stall runs instead of gating them.
+ * Never throws, and a record it cannot read yields a null verdict — which, since
+ * TEAM-4264 F1, HOLDS rather than releases. The record is the sole input, so there
+ * is no second opinion to fall back to, and the question a read failure poses is
+ * not "did this gate pass" but "may we ship without knowing": for a gate persona
+ * the answer is no. The old rationale here argued the inverse — that holding over
+ * a transient S3 error would stall runs — and the accepted cost is now explicit:
+ * an unreadable record costs ONE re-verify round (bounded by the gate re-verify
+ * cap), not a released gate.
+ *
+ * `resolveError: true` marks the catch branch specifically, so the shadow rollout
+ * can tell "the persona wrote prose the ladder cannot parse" (no flag) from "the
+ * read itself threw" (flagged) and measure how often the second happens before
+ * anyone enforces. Both hold; only the second is an outage.
  */
 let _verdictInfoCache = new Map();
 function resetVerdictInfoCache() {
@@ -1322,7 +1357,7 @@ async function computeVerdictInfo({ ticketId, assignee, workflow, parentId, sibl
     };
   } catch (err) {
     console.warn(`[verdict] could not resolve ${ticketId}'s verdict (non-fatal): ${err?.message || err}`);
-    return { ...NO_VERDICT_INFO, isGatePersona: true, verdictSource: "none" };
+    return { ...NO_VERDICT_INFO, isGatePersona: true, verdictSource: "none", resolveError: true };
   }
 }
 
@@ -1864,6 +1899,10 @@ export const handler = async (event) => {
   // Same per-invocation reasoning, same reason (TEAM-4246 D1) — a verdict decided
   // between two invocations must be re-read, not replayed from a warm container.
   resetVerdictInfoCache();
+  // Same again for the branch head (TEAM-4264 F2/F3): a push between invocations
+  // moves the head, and a re-verify pinned to a warm-container sha would be pinned
+  // to the wrong code.
+  resetBranchHeadCache();
   // Load roster + workflow defs from S3 on first invocation (cached for warm starts)
   await loadAgentRoster();
   await loadWorkflowDefs();
@@ -2748,8 +2787,18 @@ async function harvestCompletionEvidence(workflow, ticketId) {
     if (record.ci_head_sha && !entry?.ci_head_sha) fields.ci_head_sha = record.ci_head_sha;
     if (record.ci_status && !entry?.ci_status) fields.ci_status = record.ci_status;
     if (record.evidence_kind && !entry?.evidence_kind) fields.evidence_kind = record.evidence_kind;
-    if (Array.isArray(record.evidence_keys) && record.evidence_keys.length > 0 && !entry?.evidence_keys) {
-      fields.evidence_keys = record.evidence_keys;
+    // TEAM-4264 F5: workflow-output writes this field as a comma-joined STRING
+    // (report_completion's schema declares it `str`), but the harvest only ever
+    // accepted an array — so the branch had never fired in production and every
+    // real evidence_keys value was silently dropped. splitCsv (live-reverify.mjs)
+    // already normalizes both shapes for the same field's OTHER reader
+    // (hasLiveArtifact), so this reuses it rather than a second parser.
+    if (!entry?.evidence_keys) {
+      const evidenceKeys = splitCsv(record.evidence_keys)
+        .filter((k) => k.length <= 512) // drop, never truncate — a cut S3 key is a broken key
+        .filter((k, i, arr) => arr.indexOf(k) === i) // dedupe, order preserved
+        .slice(0, 50);
+      if (evidenceKeys.length > 0) fields.evidence_keys = evidenceKeys;
     }
     if (record.verdict && !entry?.verdict) fields.verdict = record.verdict;
     if (record.verdict_source && !entry?.verdictSource) fields.verdictSource = record.verdict_source;
@@ -5255,10 +5304,18 @@ export async function completeWorkflow(workflow) {
       // neither the escalation's target nor a re-verify ticket's parent may depend
       // on which fields the re-read happened to project.
       const gateWorkflow = { ...workflow, agentTasks };
-      // No prHeadSha is passed: heads.pr is the run's own latest recorded dev/fix
-      // commit, derived inside the gate (the PR does not exist yet at this point,
-      // and featureBranchMergeProbe returns merge proof with no head sha).
-      const vh = evaluateVerifiedHeads(children, agentTasks);
+      // heads.pr is the FEATURE BRANCH HEAD, read from GitHub (TEAM-4264 F3).
+      // This used to pass nothing, which made the gate compare the verifiers
+      // against the newest dev `commitSha` — a head that is correct only until
+      // the branch moves. After any merge that proxy is a PARENT of the real
+      // head, so QA and CI heads matching the merge commit read as divergent and
+      // enforce files stale-head re-verifies in a loop. Null (no PAT, branch
+      // deleted post-merge, a 404, a transient) is UNKNOWN, never divergence:
+      // the gate then only compares the two verifiers to each other, and the
+      // open-fix refusal ahead of it needs no GitHub call at all.
+      const vh = evaluateVerifiedHeads(children, agentTasks, {
+        prHeadSha: await featureBranchHeadSha(workflow),
+      });
       if (!vh.ok) {
         await notifyUnverifiedHeadOnce(gateWorkflow, vh, VERIFIED_HEAD_COMPLETION);
         if (VERIFIED_HEAD_COMPLETION === "enforce") {
@@ -6937,6 +6994,47 @@ async function featureBranchMergeProbe(workflow) {
     console.warn(`[orchestrator] merge-verify skipped for ${workflow.id}: ${err.message}`);
     return { merged: null }; // fail open, no proof
   }
+}
+
+/**
+ * The run's CURRENT feature-branch head sha, or null (TEAM-4264 F2/F3).
+ *
+ * One `git/ref/heads/<featureBranch>` read, memoized per Lambda invocation because
+ * both callers can fire on the same completion: the verdict gate needs a sha to PIN
+ * a re-verify ticket to (an unpinned re-verify is not idempotent), and the
+ * verified-head completion check needs the real PR head instead of the latest dev
+ * commit it used to guess from.
+ *
+ * Null is "unknown", never "diverged" — no GITHUB_PAT, a deleted branch after a
+ * merge, a 404, a transient — all land here, and every caller treats null as
+ * no-information rather than as evidence. That direction is deliberate: fabricating
+ * a head from a stale proxy is what F3 was.
+ */
+const _branchHeadCache = new Map();
+function resetBranchHeadCache() {
+  _branchHeadCache.clear();
+}
+async function featureBranchHeadSha(workflow) {
+  const branch = workflow?.featureBranch;
+  if (!branch || !workflow?.repoConfig) return null;
+  const key = `${workflow.id}::${branch}`;
+  if (_branchHeadCache.has(key)) return _branchHeadCache.get(key);
+  const p = (async () => {
+    try {
+      const { owner, repo } = parseRepoUrl(workflow.repoConfig);
+      const ref = await githubApi(
+        `/repos/${owner}/${repo}/git/ref/heads/${encodeURIComponent(branch)}`
+      );
+      return ref?.object?.sha || null;
+    } catch (err) {
+      console.warn(
+        `[orchestrator] branch head unresolved for ${workflow.id} (${branch}): ${err?.message || err}`
+      );
+      return null;
+    }
+  })();
+  _branchHeadCache.set(key, p);
+  return p;
 }
 
 /**

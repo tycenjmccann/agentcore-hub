@@ -54,6 +54,13 @@ jobs:
       - name: Anomaly-watcher lambda unit tests (node --test)
         run: node --test lambda/anomaly-watcher
 
+      # The routines-runner Lambda has a node:test suite (buildPayload's trigger
+      # stamping, the dispatch fan-out). Same rationale as cost-report/Jira/
+      # anomaly-watcher above: standalone `node --test`, not in the vitest include
+      # list, so it needs its own step or it never gates a PR (TEAM-4264 F7).
+      - name: Routines-runner lambda unit tests (node --test)
+        run: node --test lambda/routines-runner
+
       # R2 (docs/race-condition-study.md): the workflows table may only be
       # written through lambda/orchestrator/workflow-store.mjs — ad-hoc writes
       # are the read-modify-write clobber class behind most workflow races.

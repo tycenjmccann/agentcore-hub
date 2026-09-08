@@ -1208,6 +1208,78 @@ describe("reverify({ kind: 'gate' }) — a gate persona's own re-verification", 
     });
   });
 
+  // ─── TEAM-4264 F2 — an unpinnable GATE re-verify is filed anyway ─────────────
+  //
+  // The live path's rule (no sha ⇒ no ticket) is right for IT and wrong here, and
+  // the difference is what the caller does with "nothing was filed": onFixDone
+  // skips, while the cascade falls back to a hold it cannot persist — so the
+  // successor is released by the next reconcile sweep. These four tests pin that
+  // the ticket is filed AND that it is still filed exactly once.
+
+  it("no head sha → still files, against a ROUND-scoped sentinel slot", async () => {
+    const h = gateHarness();
+
+    const res = await fileGate(h, { headSha: "", round: 1 });
+
+    expect(res).toMatchObject({ action: "created", reverifyTicketId: REVERIFY, round: 2 });
+    expect(created(h.calls)).toHaveLength(1);
+    const { params } = created(h.calls)[0];
+    expect(params.summary).toBe(`Re-verify (round 2): ${GATE_TITLE} @ unknown`);
+    // The head is honestly absent on the lineage record — no fabricated sha.
+    expect(params.spawned_by).toMatchObject({ rearmOf: GATE, reverify: true, headSha: "", round: 2 });
+    // The persona is told to resolve the head itself rather than left to assume
+    // the orchestrator knows one.
+    expect(params.description).toContain("CURRENT head of the feature branch");
+    expect(params.description).toContain("git rev-parse HEAD");
+    expect(params.description).not.toContain("at HEAD undefined");
+    expect(h.calls.claims).toEqual([{ wfId: WF, tid: GATE, sha7: "gate:unknown:r2", nowIso: expect.any(String) }]);
+  });
+
+  it.each([
+    ["an empty string", ""],
+    ["a non-string head", null],
+  ])("%s takes the sentinel path, not the no-sha path", async (_label, headSha) => {
+    const h = gateHarness();
+
+    const res = await fileGate(h, { headSha });
+
+    expect(res.action).toBe("created");
+    expect(res.sha7).toBe("");
+  });
+
+  it("files the unknown-head re-verify ONCE across two identical passes", async () => {
+    // The whole reason the live path refuses to file without a sha is idempotency;
+    // the round-scoped slot is what buys it back, so this is the test that makes
+    // the deviation legitimate rather than convenient.
+    const h = gateHarness();
+
+    const first = await fileGate(h, { headSha: "", round: 1 });
+    const second = await fileGate(h, { headSha: "", round: 1 });
+
+    expect(first.action).toBe("created");
+    expect(second).toMatchObject({ action: "already", reverifyTicketId: REVERIFY });
+    expect(created(h.calls)).toHaveLength(1);
+  });
+
+  it("a NEW round at a still-unknown head gets its own slot", async () => {
+    // Round-scoped, not gate-scoped: a second genuine hold must still be able to
+    // file, or the run would sit on round 1 forever with nothing durable added.
+    const h = gateHarness({
+      children: [
+        { ticketId: "TEAM-4200-r2", spawnedBy: { kind: "review_fix", reverify: true, rearmOf: GATE, headSha: "", round: 2 } },
+      ],
+    });
+
+    const same = await fileGate(h, { headSha: "", round: 1 });   // → round 2, already there
+    expect(same).toMatchObject({ action: "already", reverifyTicketId: "TEAM-4200-r2" });
+    expect(created(h.calls)).toHaveLength(0);
+
+    const next = await fileGate(h, { headSha: "", round: 2 });   // → round 3, its own slot
+    expect(next).toMatchObject({ action: "created", round: 3 });
+    expect(created(h.calls)).toHaveLength(1);
+    expect(h.calls.claims.at(-1).sha7).toBe("gate:unknown:r3");
+  });
+
   it("a LIVE claim already on that entry does not satisfy the gate", async () => {
     // A re-verify ticket is itself both a gate persona's ticket and a fix ticket, so
     // both lineages can claim the same entry in one done cascade. Reading the live
@@ -1353,8 +1425,6 @@ describe("reverify({ kind: 'gate' }) — a gate persona's own re-verification", 
   });
 
   it.each([
-    ["no head sha", { headSha: "" }, "no-sha"],
-    ["a non-string head", { headSha: null }, "no-sha"],
     ["an unknown owner", { owner: "agentcore_hub_bug_fixer" }, "skipped"],
     ["no owner", { owner: undefined }, "skipped"],
     ["no gate ticket", { gateTicket: {} }, "skipped"],

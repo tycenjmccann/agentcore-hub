@@ -25,9 +25,10 @@ export const QA_VERIFIER_ID = "agentcore_hub_qa_verifier";
 export const CI_AGENT_ID = "agentcore_hub_ci_agent";
 
 /**
- * PARITY MIRROR of GATE_PERSONA_IDS. Used for ONE purpose: keeping a gate
- * persona's own `commitSha` out of the PR-head derivation — it is the head that
- * persona INSPECTED, so counting it would make the comparison self-fulfilling.
+ * PARITY MIRROR of GATE_PERSONA_IDS. It used to keep a gate persona's own
+ * `commitSha` out of the PR-head derivation; TEAM-4264 F3 deleted that
+ * derivation, so this now has no reader here either and stays exported for the
+ * parity guard, exactly as in the .mjs original.
  */
 export const GATE_PERSONA_IDS = new Set([
   "agentcore_hub_code_reviewer",
@@ -112,7 +113,10 @@ const sameHead = (a: string, b: string) => a === b || a.startsWith(b) || b.start
  *     fixes routed under a required phase, and dowtdh's fix was not one);
  *   - "head-divergence" when the known heads are not all the same commit;
  *   - fewer than two KNOWN heads is never divergence (unknown is unknown);
- *   - heads.pr is the newest non-gate `commitSha`, never `mergeCommit`;
+ *   - heads.pr is `opts.prHeadSha` and nothing else (TEAM-4264 F3): never a dev
+ *     ticket's `commitSha`, never `mergeCommit`. Null is unknown, not divergence
+ *     — but two KNOWN heads that differ (QA vs CI) still are, and with no PR
+ *     head to appeal to both verifiers are reported stale;
  *   - `delivery.mode` is never read — a handoff PR must be verified too.
  */
 export function evaluateVerifiedHeads(
@@ -125,7 +129,6 @@ export function evaluateVerifiedHeads(
   // compared.
   const inert: VerifiedHeads = { ok: true, reason: null, heads, offenders: [], stalePersonas: [] };
   if (!Array.isArray(children) || children.length === 0) return inert;
-  const prGiven = heads.pr !== null;
 
   const tasks = agentTasks && typeof agentTasks === "object" ? agentTasks : {};
   const byTicketId = new Map<string, HeadTaskLike>();
@@ -133,8 +136,9 @@ export function evaluateVerifiedHeads(
     if (entry && typeof entry.ticketId === "string") byTicketId.set(entry.ticketId, entry);
   }
 
-  const at: Record<"qa" | "ci" | "pr", string> = { qa: "", ci: "", pr: "" };
-  const take = (slot: "qa" | "ci" | "pr", sha: string | null, when: string) => {
+  // `pr` is not in here: it is the caller's fact, never scanned for.
+  const at: Record<"qa" | "ci", string> = { qa: "", ci: "" };
+  const take = (slot: "qa" | "ci", sha: string | null, when: string) => {
     if (!sha || when < at[slot]) return;
     heads[slot] = sha;
     at[slot] = when;
@@ -158,9 +162,8 @@ export function evaluateVerifiedHeads(
     } else if (assignee === CI_AGENT_ID) {
       take("ci", headFrom(entry, ["testedHead", "tested_head", "ci_head_sha", "ciHeadSha"]), when);
     }
-    if (!prGiven && !GATE_PERSONA_IDS.has(assignee) && !isHuman(assignee)) {
-      take("pr", headFrom(entry, ["commitSha", "commit_sha"]), when);
-    }
+    // NOTHING derives heads.pr (TEAM-4264 F3). A dev ticket's commitSha is the
+    // head that ticket produced, not the head the run is shipping.
   }
 
   if (openFixes.length > 0) {

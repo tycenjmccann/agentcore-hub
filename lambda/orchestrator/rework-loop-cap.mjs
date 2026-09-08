@@ -79,6 +79,10 @@ export function isReworkFix(ticket, fixKinds = DEFAULT_FIX_KINDS) {
   // re-armed (reverify/rearmOf), the loop has not advanced — the same finding is
   // being checked again — so counting it would burn the cap toward a human
   // escalation for work the loop already accounted for.
+  // TEAM-4264 F4 — and that lineage IS capped, just not here: cascade.mjs bounds
+  // the gate re-verify rounds against the same reviewGates[].maxRounds
+  // (resolveGateReverifyCap). Until then this exclusion left it uncapped outright,
+  // which is the difference between "counted elsewhere" and "counted nowhere".
   if (ticket.spawnedBy.reverify === true || ticket.spawnedBy.rearmOf) return false;
   return true;
 }
