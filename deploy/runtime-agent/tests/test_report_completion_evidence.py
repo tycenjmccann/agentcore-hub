@@ -187,3 +187,24 @@ def test_ci_fields_omitted_give_the_pre_4122_payload_exactly():
 def test_ci_fields_blank_are_the_same_as_omitted():
     _, payload = _payload(ci_status="   ", ci_build_id="", ci_head_sha="")
     assert payload == PRE_4121_PAYLOAD
+
+
+# ─── DL-024 / ship verdict: merge_commit, outcome, block_reason ───────────────
+
+def test_ship_verdict_fields_forwarded():
+    _, payload = _payload(merge_commit=" 0ef5892abc ", outcome=" Shipped ", block_reason="")
+    assert payload["merge_commit"] == "0ef5892abc"
+    assert payload["outcome"] == "shipped"  # lower-cased; the Lambda owns the allow-list
+    assert "block_reason" not in payload
+
+
+def test_block_reason_rides_with_a_blocked_outcome():
+    _, payload = _payload(outcome="deploy-blocked", block_reason="Deploy stage failed twice")
+    assert payload["outcome"] == "deploy-blocked"
+    assert payload["block_reason"] == "Deploy stage failed twice"
+    assert "merge_commit" not in payload
+
+
+def test_ship_verdict_fields_omitted_keep_the_pre_4121_payload():
+    _, payload = _payload(merge_commit="", outcome="   ", block_reason="")
+    assert payload == PRE_4121_PAYLOAD

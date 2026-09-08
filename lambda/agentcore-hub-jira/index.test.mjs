@@ -829,3 +829,137 @@ test("labels_add: a rejected PUT surfaces as a bare { error }, and nothing is re
     globalThis.fetch = originalFetch;
   }
 });
+
+// ─── DL-024: transition_ticket blocked_by + get_issue blockedBy ────────────────
+
+/**
+ * Stateful Jira stub for transition_ticket: records issueLink POSTs, comment
+ * POSTs and transition POSTs; serves a transition list that includes Blocked.
+ */
+function installTransitionStub({ failLinkFor = [] } = {}) {
+  const calls = { links: [], comments: [], transitions: [] };
+  globalThis.fetch = async (url, init = {}) => {
+    const method = (init.method || "GET").toUpperCase();
+    if (url.endsWith("/rest/api/3/issueLink") && method === "POST") {
+      const body = JSON.parse(init.body);
+      calls.links.push(body);
+      if (failLinkFor.includes(body.inwardIssue.key)) {
+        return new Response(JSON.stringify({ errorMessages: ["Issue link already exists."] }), { status: 400 });
+      }
+      return new Response("", { status: 201 });
+    }
+    if (url.includes("/comment") && method === "POST") {
+      calls.comments.push(JSON.parse(init.body));
+      return new Response(JSON.stringify({ id: "1" }), { status: 201 });
+    }
+    if (url.includes("/transitions") && method === "GET") {
+      return new Response(JSON.stringify({ transitions: [
+        { id: "11", name: "Blocked", to: { name: "Blocked" } },
+        { id: "31", name: "Done", to: { name: "Done" } },
+      ] }), { status: 200 });
+    }
+    if (url.includes("/transitions") && method === "POST") {
+      calls.transitions.push(JSON.parse(init.body));
+      return new Response(null, { status: 204 });
+    }
+    throw new Error(`unexpected ${method} ${url}`);
+  };
+  return calls;
+}
+
+test("transition_ticket: blocked_by links each blocker as Blocks BEFORE the transition (agent self-park)", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = installTransitionStub();
+  try {
+    const res = await handler({
+      tool_name: "Tickets___transition_ticket",
+      parameters: { ticket_id: "TEAM-24", transition_id: "blocked", reason: "ship-review r1: waiting on 2 fixes", blocked_by: "TEAM-30, TEAM-31,TEAM-30" },
+    });
+    assert.equal(res.status, "blocked");
+    assert.deepEqual(res.blockedByAdded, ["TEAM-30", "TEAM-31"]); // deduped, trimmed
+    // blocker → ticket, one link per key
+    assert.deepEqual(
+      calls.links.map((l) => [l.type.name, l.inwardIssue.key, l.outwardIssue.key]),
+      [["Blocks", "TEAM-30", "TEAM-24"], ["Blocks", "TEAM-31", "TEAM-24"]]
+    );
+    assert.deepEqual(calls.transitions, [{ transition: { id: "11" } }]);
+    assert.equal(calls.comments.length, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("transition_ticket: blocked_by accepts an array and an existing-link 400 is logged, not fatal", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = installTransitionStub({ failLinkFor: ["TEAM-30"] });
+  try {
+    const res = await handler({
+      tool_name: "Tickets___transition_ticket",
+      parameters: { ticket_id: "TEAM-24", transition_id: "blocked", blocked_by: ["TEAM-30", "TEAM-31"] },
+    });
+    assert.equal(res.status, "blocked");
+    assert.equal(calls.links.length, 2);
+    assert.equal(calls.transitions.length, 1, "the transition still happens after a duplicate-link 400");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("transition_ticket: without blocked_by the call is unchanged (no issueLink traffic, no blockedByAdded)", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = installTransitionStub();
+  try {
+    const res = await handler({
+      tool_name: "Tickets___transition_ticket",
+      parameters: { ticket_id: "TEAM-24", transition_id: "blocked" },
+    });
+    assert.equal(res.status, "blocked");
+    assert.equal("blockedByAdded" in res, false);
+    assert.deepEqual(calls.links, []);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("transition_ticket: a malformed blocked_by entry is rejected before any Jira write", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = installTransitionStub();
+  try {
+    // The handler converts throws into a bare { error } for the tool caller.
+    const res = await handler({ tool_name: "Tickets___transition_ticket", parameters: { ticket_id: "TEAM-24", transition_id: "blocked", blocked_by: "TEAM-30,not a key" } });
+    assert.match(res.error, /Invalid blocked_by entry/);
+    assert.deepEqual(calls.links, []);
+    assert.deepEqual(calls.transitions, []);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("getIssue: requests issuelinks and returns blockedBy from the inward side of Blocks links", async () => {
+  const originalFetch = globalThis.fetch;
+  const requested = [];
+  globalThis.fetch = async (url) => {
+    requested.push(url);
+    if (url.includes("/comment")) return new Response(JSON.stringify({ comments: [] }), { status: 200 });
+    return new Response(JSON.stringify({
+      key: "TEAM-24",
+      fields: {
+        summary: "Ship", status: { name: "Blocked" }, labels: ["agent:agentcore_hub_release_manager"], issuetype: { name: "Task" },
+        issuelinks: [
+          { type: { name: "Blocks" }, inwardIssue: { key: "TEAM-30" } },   // TEAM-30 blocks TEAM-24
+          { type: { name: "Blocks" }, outwardIssue: { key: "TEAM-40" } },  // TEAM-24 blocks TEAM-40 — not a blocker of ours
+          { type: { name: "Relates" }, inwardIssue: { key: "TEAM-50" } },  // unrelated link type
+        ],
+      },
+    }), { status: 200 });
+  };
+  try {
+    const result = await getIssue({ issue_key: "TEAM-24" });
+    assert.deepEqual(result.blockedBy, ["TEAM-30"]);
+    assert.equal(result.assignee, "agentcore_hub_release_manager");
+    const issueUrl = requested.find((u) => !u.includes("/comment"));
+    assert.ok(/fields=[^&]*issuelinks/.test(issueUrl), `issue GET should request issuelinks: ${issueUrl}`);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});

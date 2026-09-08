@@ -619,6 +619,8 @@ QA re-verifies (same checks)
 - `WorkflowOutput___request_fix` tool (was referenced in prompts but never implemented — no longer needed)
 - `request_fix` webhook handler logic (dead code after this change — cleanup TODO)
 
+**Landed 2026-09-08 (DL-009 cleanup PR 3):** the verb this decision assumed finally exists on every surface — `Tickets___transition_ticket(ticket_id, transition_id="blocked", blocked_by="<csv>")` on the runtime tool, the Jira Lambda (one `Blocks` link per key, linked BEFORE the transition so the Blocked webhook carries them) and the DynamoDB Lambda (additive union). `WorkflowOutput___report_completion` also carries `merge_commit` / `outcome` / `block_reason` (the ship verdict the completion gate already read). The orchestrator's only addition: on `in_progress → blocked` for an agent ticket whose own blockers are still open it releases the invocation claim (`orchestrator.claim_released`, `reason=agent_self_park`) so the cascade's later Ready can re-dispatch — see DL-024.
+
 ---
 
 ### DL-012: System Prompts Baked at Deploy Time (Not Passed at Invocation)

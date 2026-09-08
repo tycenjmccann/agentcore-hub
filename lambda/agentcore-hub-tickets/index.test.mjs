@@ -718,3 +718,48 @@ describe("transition_ticket — reaching done from in_progress vs from blocked (
     expect(live.transitions.map((t) => t.id)).toContain("done");
   });
 });
+
+// DL-024 — an agent parks ITS OWN ticket behind the tickets it just filed.
+// transition_ticket's blocked_by must be ADDITIVE (union with the row), matching
+// the Jira Lambda where each entry becomes one more "Blocks" link; a whole-array
+// SET here would let a re-park drop a blocker the creation-time graph installed.
+describe("transition_ticket — blocked_by is additive (DL-024 agent self-park)", () => {
+  const transition = (args) => handler({ name: "Tickets___transition_ticket", arguments: args });
+
+  it("unions CSV blocked_by with the row's existing blockers and reports what was added", async () => {
+    h.state.items[SHIP] = { ticketId: SHIP, status: "in_progress", assignee: "agentcore_hub_release_manager", blockedBy: ["TEAM-2"] };
+
+    const res = await transition({ ticket_id: SHIP, transition_id: "blocked", blocked_by: "TEAM-3, TEAM-2,TEAM-4" });
+
+    expect(res).toMatchObject({ key: SHIP, from: "in_progress", to: "blocked", blockedByAdded: ["TEAM-3", "TEAM-4"] });
+    const u = h.state.statusUpdates[0];
+    expect(u.ExpressionAttributeValues[":s"]).toBe("blocked");
+    expect(u.ExpressionAttributeValues[":bb"]).toEqual(["TEAM-2", "TEAM-3", "TEAM-4"]);
+  });
+
+  it("accepts an array too", async () => {
+    h.state.items[SHIP] = { ticketId: SHIP, status: "in_progress", assignee: "agentcore_hub_release_manager" };
+
+    const res = await transition({ ticket_id: SHIP, transition_id: "blocked", blocked_by: ["TEAM-3"] });
+
+    expect(res.blockedByAdded).toEqual(["TEAM-3"]);
+    expect(h.state.statusUpdates[0].ExpressionAttributeValues[":bb"]).toEqual(["TEAM-3"]);
+  });
+
+  it("re-parking on blockers already present writes no blockedBy at all", async () => {
+    h.state.items[SHIP] = { ticketId: SHIP, status: "in_progress", assignee: "agentcore_hub_release_manager", blockedBy: ["TEAM-2", "TEAM-3"] };
+
+    const res = await transition({ ticket_id: SHIP, transition_id: "blocked", blocked_by: "TEAM-3,TEAM-2" });
+
+    expect("blockedByAdded" in res).toBe(false);
+    expect(h.state.statusUpdates[0].UpdateExpression).not.toContain("#bb");
+  });
+
+  it("without blocked_by the transition write is unchanged", async () => {
+    h.state.items[SHIP] = { ticketId: SHIP, status: "in_progress", assignee: "agentcore_hub_release_manager", blockedBy: ["TEAM-2"] };
+
+    await transition({ ticket_id: SHIP, transition_id: "blocked" });
+
+    expect(h.state.statusUpdates[0].UpdateExpression).not.toContain("#bb");
+  });
+});
