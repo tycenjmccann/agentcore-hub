@@ -237,8 +237,9 @@ phases:
   build:
     commands:
       - npm run build           # next build == module-removal smoke test
-      - npm run test:cloud-code # hermetic (page.route-mocked) UI gate — NOT the
-                                # AWS-backed tab/api specs, which need live creds
+      - npm run test:ui-mocked  # hermetic (page.route-mocked) UI gate: Cloud Code +
+                                # workflow board — NOT the AWS-backed tab/api specs,
+                                # which need live creds
       # HARD GATE: the exact guard DEPLOY.md's inline zip bypassed
       - bash scripts/check-lambda-zip-manifest.sh
   post_build:

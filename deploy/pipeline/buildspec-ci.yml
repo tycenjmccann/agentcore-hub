@@ -72,7 +72,8 @@ phases:
       # list/start) and CANNOT pass in a credential-less CI container — it is a
       # live-deployment smoke test, NOT a hermetic gate, and .github/workflows/ci.yml
       # does not run it as a blocking job either. The authoritative UI gate that
-      # IS hermetic is the Cloud Code suite (every backend call page.route-mocked).
+      # IS hermetic is test:ui-mocked — Cloud Code plus the workflow board
+      # (FR-D2.9), every backend call page.route-mocked.
       - "nohup npm run start -- -p 3000 > /tmp/next-server.log 2>&1 &"
       - |
         for i in $(seq 1 30); do
@@ -80,9 +81,10 @@ phases:
           sleep 2
           if [ "$i" = "30" ]; then echo "server did not come up"; cat /tmp/next-server.log; exit 1; fi
         done
-      # Cloud Code UI regression suite — the hermetic (mocked) blocking UI job
-      # from GH CI. This is the UI gate; the AWS-backed tab/api specs are not.
-      - "PLAYWRIGHT_BASE_URL=http://localhost:3000 npm run test:cloud-code -- --trace retain-on-failure"
+      # Mocked UI regression suite (Cloud Code + workflow board) — the hermetic
+      # blocking UI job from GH CI. This is the UI gate; the AWS-backed tab/api
+      # specs are not.
+      - "PLAYWRIGHT_BASE_URL=http://localhost:3000 npm run test:ui-mocked -- --trace retain-on-failure"
       # runtime-agent telemetry pytest (hermetic, no AWS)
       - |
         python3 -m venv /tmp/pyci && . /tmp/pyci/bin/activate
