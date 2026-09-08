@@ -12,6 +12,7 @@ import {
   incrementDeadSessionRetry,
   markAwaitTimeoutEmitted,
   markInitialPhaseAnnounced,
+  clearInitialPhaseAnnounced,
   incrementCleanExitRedispatch,
   claimDeadSessionSynthesis,
   claimReverifySlot,
@@ -338,6 +339,26 @@ describe("markInitialPhaseAnnounced (TEAM-4167 D3 FR-3.3)", () => {
   it("returns false when the initial phase was already announced (CCFE), never throws", async () => {
     failNextCondition = true;
     await expect(markInitialPhaseAnnounced("wf_1", "requirements")).resolves.toBe(false);
+  });
+});
+
+describe("clearInitialPhaseAnnounced (TEAM-4288 r3-F4)", () => {
+  it("REMOVEs the claim only while it still holds the phase this caller stamped", async () => {
+    const released = await clearInitialPhaseAnnounced("wf_1", "requirements");
+    expect(released).toBe(true);
+    const w = writes()[0];
+    expect(w.input.Key).toEqual({ workflowId: "wf_1" });
+    expect(w.input.UpdateExpression).toBe("REMOVE announcedInitialPhase");
+    // Scoped release: NOT an unconditional REMOVE, so a slow loser can't stomp a
+    // claim that has since been re-taken and successfully published.
+    expect(w.input.ConditionExpression).toBe("announcedInitialPhase = :p");
+    expect(w.input.ExpressionAttributeValues[":p"]).toBe("requirements");
+    expect(w.input.UpdateExpression).not.toContain("SET");
+  });
+
+  it("returns false when the claim has moved on (CCFE), never throws", async () => {
+    failNextCondition = true;
+    await expect(clearInitialPhaseAnnounced("wf_1", "requirements")).resolves.toBe(false);
   });
 });
 

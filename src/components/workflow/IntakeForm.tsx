@@ -5,12 +5,14 @@ import type { WorkflowInput, IntakeSource, RepoConfig, RepoLayout, IntentBrief }
 import type { CdRegistry, CdRegistryEntry } from "@/lib/cd-registry";
 import type { ModelOption, ModelsApiResponse } from "@/lib/workflow/model-config";
 import { modelOptionToOverride } from "@/lib/workflow/model-config";
+import { isGateActive } from "@/lib/workflow/workflow-defs";
 
 interface ReviewGateOption {
   afterPhase: string;
   name?: string;
   blocking: boolean;
-  condition: "always" | "flagged";
+  /** Mirrors ReviewGate.condition in @/lib/workflow/workflow-defs. */
+  condition: "always" | "flagged" | "cdRegistered";
 }
 
 interface FrameworkOption {
@@ -298,7 +300,13 @@ export default function IntakeForm({ onSubmit, isLoading }: IntakeFormProps) {
       {/* Human review gates — opt-in for any "flagged" gates the selected framework offers */}
       {(() => {
         const flaggedGates = effectiveGates.filter((g) => g.condition === "flagged");
-        const alwaysGates = effectiveGates.filter((g) => g.condition === "always");
+        // Non-optional gates for THIS run. A condition:"cdRegistered" gate (the
+        // ship-phase Merge Approval) is on only when the target repo is in the CD
+        // registry, so read the registry status already fetched for the repo field
+        // — otherwise the form under-reports the human gates a CD run will create.
+        const alwaysGates = effectiveGates.filter((g) =>
+          isGateActive(g, { cdRegistered: !!cdStatus?.registered })
+        );
         const alwaysNote = isPlaybook && alwaysGates.length > 0 ? (
           <div data-testid="playbook-gates" className="mb-3">
             <label className="block text-sm font-medium text-secondary mb-1">Human gates (always on)</label>

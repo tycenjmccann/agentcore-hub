@@ -56,7 +56,7 @@ import { createReworkLoopCap, normalizeReworkLoopMode } from "./rework-loop-cap.
 import { createLiveReverify, normalizeLiveReverifyMode } from "./live-reverify.mjs";
 import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, SHIP_PHASES, SHIP_BLOCKED_OUTCOMES, TERMINAL_WORKFLOW_PHASES, FIX_KINDS, REWORK_FIX_KINDS, normalizeAdvisoryRoutingMode, isAdvisoryTicket, nonAdvisory } from "./completion.mjs";
 import { isPipelineEnabled } from "./pipeline-enabled.mjs";
-import { CD_REGISTRY_KEY, EMPTY_CD_REGISTRY, parseCdRegistry, isCdRegistered, effectiveWorkflowDef, resolveDelivery, deliveryModeContext } from "./cd-registry.mjs";
+import { CD_REGISTRY_KEY, EMPTY_CD_REGISTRY, parseCdRegistry, isCdRegistered, effectiveWorkflowDef, resolveDelivery, deliveryModeContext, activeGates as activeGatesFor } from "./cd-registry.mjs";
 import { validateEffectiveDef, validateDefForCreation } from "./workflow-def-validate.mjs";
 import { buildReviewResolved } from "./review-resolved.mjs";
 import { ensureRepoCheck, formatRepoCheckWarning } from "./repo-check.mjs";
@@ -495,8 +495,30 @@ export async function announcePhaseTransition(workflow, wfDef, agentDef, ticketI
       // the run opened at "intake" (anchored at run start), then the initial
       // agent phase (now). workflow.startedAt is the run's own creation stamp;
       // if it is somehow absent publishEvent falls back to now.
-      await publishEvent(ticketId, "workflow.phase_change", { phase: "intake", workflowId: workflow.id, timestamp: workflow.startedAt });
-      await publishEvent(ticketId, "workflow.phase_change", { phase: agentDef.phase, workflowId: workflow.id });
+      //
+      // TEAM-4288 r3-F4: the CAS stays FIRST (that is what keeps concurrent
+      // deliveries from double-emitting), but these two rows are published
+      // { requireDurable: true } so an events-table failure is REPORTED, and the
+      // claim is released on failure — otherwise a single transient DDB error
+      // loses the pair permanently (the claim can never be re-won) and
+      // cost-report's computePhases has no opening interval to measure.
+      try {
+        await publishEvent(ticketId, "workflow.phase_change", { phase: "intake", workflowId: workflow.id, timestamp: workflow.startedAt }, { requireDurable: true });
+        await publishEvent(ticketId, "workflow.phase_change", { phase: agentDef.phase, workflowId: workflow.id }, { requireDurable: true });
+      } catch (err) {
+        // Accepted rare duplicate: if row 1 landed and row 2 failed, the retry
+        // re-publishes row 1. It is anchored at workflow.startedAt, so its
+        // deterministic eventId makes that an idempotent OVERWRITE of the same
+        // events-table item (and the intake row carries a ticketId, so
+        // EVENT_DEDUPE_MODE=enforce collapses it) — strictly better than the
+        // alternative of keeping the claim and losing BOTH rows forever.
+        console.warn(`[orchestrator] initial-phase lifecycle rows failed to persist for ${workflow.id}, releasing the claim so a re-dispatch retries:`, err?.message || err);
+        await store.clearInitialPhaseAnnounced(workflow.id, agentDef.phase).catch((e) => {
+          console.warn(`[orchestrator] could not release the initial-phase claim for ${workflow.id}:`, e?.message || e);
+        });
+        // Deliberately swallowed here: this is a journal/metric write, and
+        // throwing would fail the agent dispatch that called us.
+      }
     }
   }
 }
@@ -4286,6 +4308,10 @@ async function evaluateCompletionSnapshot(epicId, workflow) {
     getAgentPhase: (assignee) => getAgentDef(assignee)?.phase,
     gatePhaseOf,
     requestedGates: workflow?.input?.reviewGates || [],
+    // TEAM-4288 r3-F1: same delivery fact the intake context used, so the gate the
+    // intake agent was told to create is exactly the gate this guard waits for.
+    // A registered repo keeps its human Merge Approval; a handoff run has none.
+    cdRegistered: isCdRegistered(_cdRegistry, workflow?.repoConfig),
     // TEAM-4122 FR-7: completion.mjs reads no env (it is a pure module), so the
     // flag arrives as an option — "off" leaves its decision untouched.
     advisoryRouting: ADVISORY_ROUTING,
@@ -5022,10 +5048,14 @@ export async function buildAgentContext(ticket, workflow) {
     // tickets of the gate's afterPhase, and — for blocking gates — make the next
     // phase's tickets blockedBy the gate ticket. The orchestrator parks human
     // tickets for a person instead of invoking an agent.
-    const requestedGates = workflow.input?.reviewGates || [];
-    const activeGates = (wfDef.reviewGates || []).filter(
-      (g) => g.condition === "always" || requestedGates.includes(g.afterPhase)
-    );
+    // TEAM-4288 r3-F1: activation goes through the SHARED resolver, so a
+    // condition:"cdRegistered" gate (the ship-phase Merge Approval) is offered on
+    // a CD run and auto-absent on a handoff run — and always matches the set
+    // completion.mjs will later wait for.
+    const activeGates = activeGatesFor(wfDef.reviewGates, {
+      requestedGates: workflow.input?.reviewGates || [],
+      cdRegistered: deliveryForContext.mode === "cd",
+    });
     if (activeGates.length > 0) {
       const gateLines = [];
       for (const g of activeGates) {
@@ -6228,7 +6258,22 @@ async function emitContractWarning(ticketId, ticket) {
   }
 }
 
-async function publishEvent(ticketId, detailType, detail) {
+/**
+ * TEAM-4288 r3-F4: `opts.requireDurable` makes the events-table write REPORT its
+ * failure by rethrowing instead of swallowing it. Strictly opt-in — every
+ * existing caller passes nothing and keeps the historical fully-non-fatal
+ * behaviour. It is for the few rows that are load-bearing DATA rather than a
+ * dashboard nicety (the initial-phase lifecycle pair, which cost-report's
+ * computePhases reads to build contiguous phase intervals) and whose emit sits
+ * behind a once-only claim, so a silently dropped write is unrecoverable.
+ * EventBridge stays best-effort either way: the events table is the read path.
+ *
+ * @param {string} ticketId
+ * @param {string} detailType
+ * @param {Record<string, any>} detail
+ * @param {{ requireDurable?: boolean }} [opts]
+ */
+async function publishEvent(ticketId, detailType, detail, opts = {}) {
   // ONE timestamp for both writes (and inside detail): the anomaly-watcher
   // dedupes the EventBridge copy against the direct copy by
   // (workflowId, type, timestamp, ticketId, agentId) — two generated
@@ -6276,7 +6321,10 @@ async function publishEvent(ticketId, detailType, detail) {
           timestamp,
         },
       }));
-    } catch { /* non-fatal */ }
+    } catch (err) {
+      if (opts?.requireDurable) throw err;
+      /* non-fatal */
+    }
   }
 }
 

@@ -23,6 +23,29 @@
  * a dev still gates the SHIP phase), else the assignee's roster phase.
  */
 
+// The shared gate-activation resolver. This is the module's only import: it must
+// stay in lock-step with index.mjs's intake-context predicate, or the intake agent
+// creates a gate ticket this guard never waits for (or worse, the reverse).
+// cd-registry.mjs is pure (no I/O, no SDK) and already in the orchestrator's zip.
+import { isGateActive } from "./cd-registry.mjs";
+
+/**
+ * The BLOCKING review gates a run must have approved before phase `p` counts as
+ * complete. `ctx` is { requestedGates, cdRegistered } — see isGateActive.
+ * Exported so the app-side parity test can assert this set is identical to the
+ * one index.mjs hands the intake agent (TEAM-4288 r3-F1).
+ * @template {{ afterPhase?: string, condition?: string, blocking?: boolean }} T
+ * @param {T[]} [gates]
+ * @param {string} p
+ * @param {{ requestedGates?: string[], cdRegistered?: boolean }} [ctx]
+ * @returns {T[]}
+ */
+export function activeBlockingGatesFor(gates, p, ctx = {}) {
+  return (Array.isArray(gates) ? gates : []).filter(
+    (g) => g?.afterPhase === p && g?.blocking && isGateActive(g, ctx)
+  );
+}
+
 /**
  * TEAM-4121 FR-8 — PARITY MIRROR of FIX_KINDS in lambda/orchestrator/fix-contract.mjs
  * (and its byte-identical copies in both ticket Lambdas), the kind union in
@@ -353,6 +376,10 @@ export function nonAdvisory(children) {
  *   getAgentPhase(assignee) → agent phase for a ticket's assignee (undefined for humans/unknowns)
  *   gatePhaseOf(ticket)     → the phase a human-assignee gate ticket guards (undefined if unknown)
  *   requestedGates          → workflow.input.reviewGates (activates "flagged" gates)
+ *   cdRegistered            → whether the run's repo is CD-registered; activates
+ *                             condition:"cdRegistered" gates (the ship-phase human
+ *                             Merge Approval). Absent → false, the fail-safe
+ *                             direction and what isCdRegistered returns for no repo.
  *   advisoryRouting         → ADVISORY_ROUTING ("enforce" drops advisory-labelled
  *                             tickets out of every gate below; anything else, incl.
  *                             absent, leaves the decision byte-identical to pre-FR-7)
@@ -392,13 +419,7 @@ export function isWorkflowComplete(children, wfDef, opts = {}) {
 
   // ── Config-driven per-phase re-verify.
   const gates = (wfDef && wfDef.reviewGates) || [];
-  const activeBlockingGatesFor = (p) =>
-    gates.filter(
-      (g) =>
-        g.afterPhase === p &&
-        g.blocking &&
-        (g.condition === "always" || requestedGates.includes(g.afterPhase))
-    );
+  const gateCtx = { requestedGates, cdRegistered: Boolean(opts.cdRegistered) };
 
   return required.every((p) => {
     const inPhase = children.filter((t) => phaseOf(t) === p);
@@ -422,7 +443,7 @@ export function isWorkflowComplete(children, wfDef, opts = {}) {
     // (ii) every active blocking gate for the phase is approved. The gate ticket
     //      is a human-assignee child whose guarded phase is p; approval == done.
     //      If a required gate has no ticket yet, the gate hasn't been approved.
-    const requiredGates = activeBlockingGatesFor(p);
+    const requiredGates = activeBlockingGatesFor(gates, p, gateCtx);
     if (requiredGates.length > 0) {
       const gateTickets = children.filter((t) => isHuman(t.assignee) && gatePhaseOf(t) === p);
       if (gateTickets.length === 0) return false;

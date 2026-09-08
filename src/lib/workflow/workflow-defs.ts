@@ -202,6 +202,54 @@ export function resolveReviewGateCap(gate: ReviewGate): {
 export const SHIP_PHASES: readonly string[] = ["ship"];
 
 /**
+ * The only two fields activation reads. Widened from ReviewGate so UI components
+ * carrying a narrower gate shape (IntakeForm's ReviewGateOption, the API's
+ * definitions payload) can use the same resolver instead of re-deriving it.
+ */
+export type GateActivationShape = Pick<ReviewGate, "afterPhase" | "condition">;
+
+/** Delivery/request context a gate's activation depends on. */
+export interface GateActivationContext {
+  /** workflow.input.reviewGates — the phases this run explicitly asked to gate. */
+  requestedGates?: string[];
+  /** Whether the run's repo is in the CD registry. */
+  cdRegistered?: boolean;
+}
+
+/**
+ * TEAM-4288 r3-F1 — the ONE answer to "is this review gate part of this run?".
+ *
+ * Every call site that decides whether a gate exists for a run MUST go through
+ * here, or the intake agent (which creates the gate ticket) and the completion
+ * guard (which waits for it) can disagree about whether a human approval is
+ * expected. See {@link ReviewGate.condition} for the three values; "flagged" and
+ * anything else (incl. absent) means opt-in by phase.
+ *
+ * Context defaults are the fail-safe direction: with no context only "always"
+ * gates are active.
+ *
+ * PARITY MIRROR of isGateActive/activeGates in lambda/orchestrator/cd-registry.mjs
+ * (pinned by merge-approval-gate.test.ts).
+ */
+export function isGateActive(
+  gate: GateActivationShape | null | undefined,
+  ctx: GateActivationContext = {}
+): boolean {
+  if (!gate) return false;
+  if (gate.condition === "always") return true;
+  if (gate.condition === "cdRegistered") return Boolean(ctx.cdRegistered);
+  return (ctx.requestedGates || []).includes(gate.afterPhase);
+}
+
+/** The subset of `gates` active for a run — see {@link isGateActive}. */
+export function activeGates<T extends GateActivationShape>(
+  gates: T[] | undefined,
+  ctx: GateActivationContext = {}
+): T[] {
+  return (gates || []).filter((g) => isGateActive(g, ctx));
+}
+
+/**
  * Repo-AGNOSTIC honesty lint for a def's SHAPE: a ship-phase gate must never be
  * condition:"always", because "always" ignores delivery mode and turns into a
  * phantom human expectation on any handoff run of the def. The honest choices

@@ -443,6 +443,36 @@ export async function markInitialPhaseAnnounced(workflowId, phase) {
 }
 
 /**
+ * TEAM-4288 r3-F4 — RELEASE the initial-phase claim taken by
+ * markInitialPhaseAnnounced, so a dispatch that won the CAS but could not
+ * persist its two `workflow.phase_change` rows does not lose them forever (the
+ * claim is otherwise un-winnable and cost-report's computePhases needs the rows
+ * to build contiguous phase intervals — FR-3.3).
+ *
+ * Conditional on the attribute STILL holding the phase this claim wrote, for the
+ * same reason every other release in this file is scoped: an unconditional
+ * REMOVE would let a slow loser stomp a claim that has since been re-taken and
+ * successfully published, re-opening the door to a duplicate emit. A CCFE means
+ * somebody else owns the claim now — there is nothing to release, so return
+ * false rather than throwing. Returns true when this caller released the stamp.
+ */
+export async function clearInitialPhaseAnnounced(workflowId, phase) {
+  try {
+    await _ddb.send(new UpdateCommand({
+      TableName: _table,
+      Key: { workflowId },
+      UpdateExpression: "REMOVE announcedInitialPhase",
+      ConditionExpression: "announcedInitialPhase = :p",
+      ExpressionAttributeValues: { ":p": phase },
+    }));
+    return true;
+  } catch (err) {
+    if (err?.name === "ConditionalCheckFailedException") return false;
+    throw err;
+  }
+}
+
+/**
  * TEAM-4166 D2 — increment the per-ticket clean-exit re-dispatch counter, scoped
  * to the top-level cleanExitRedispatches map so it never touches
  * deadSessionRetries or a sibling. This is the D2 evidence guard's OWN budget:

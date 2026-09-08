@@ -97,6 +97,51 @@ export function isCdRegistered(registry, repoConfig) {
 }
 
 /**
+ * TEAM-4288 r3-F1 — the ONE answer to "is this review gate part of this run?".
+ *
+ * Every call site that decides whether a gate exists for a run MUST go through
+ * here, or the intake agent and the completion guard can disagree about whether a
+ * human approval is expected. `condition`:
+ *   "always"       → active on every run.
+ *   "cdRegistered" → active only when the run's repo is CD-registered. This is
+ *                    the honest declaration for a ship gate (D3a): it is
+ *                    auto-absent on a handoff run, where stripShipPhases removes
+ *                    it outright — but on a REGISTERED run it must be ACTIVE, and
+ *                    a predicate that only knows "always" silently drops the
+ *                    human Merge Approval gate from every CD run.
+ *   "flagged" (and anything else, incl. absent) → active only when the run asked
+ *                    for it by phase (workflow.input.reviewGates).
+ *
+ * Context defaults are the fail-safe direction: with no context only "always"
+ * gates are active, matching isCdRegistered(registry, undefined) === false.
+ *
+ * PARITY MIRROR of isGateActive/activeGates in src/lib/workflow/workflow-defs.ts
+ * (pinned by src/lib/workflow/merge-approval-gate.test.ts).
+ *
+ * @param {{ afterPhase?: string, condition?: string } | null | undefined} gate
+ * @param {{ requestedGates?: string[], cdRegistered?: boolean }} [ctx]
+ */
+export function isGateActive(gate, { requestedGates = [], cdRegistered = false } = {}) {
+  if (!gate) return false;
+  if (gate.condition === "always") return true;
+  if (gate.condition === "cdRegistered") return Boolean(cdRegistered);
+  return (requestedGates || []).includes(gate.afterPhase);
+}
+
+/**
+ * The subset of `gates` active for a run — see {@link isGateActive}. Generic so
+ * callers with a richer gate shape (e.g. the full ReviewGate) get it back typed,
+ * not narrowed to the { afterPhase, condition } isGateActive reads.
+ * @template {{ afterPhase?: string, condition?: string }} T
+ * @param {T[]} [gates]
+ * @param {{ requestedGates?: string[], cdRegistered?: boolean }} [ctx]
+ * @returns {T[]}
+ */
+export function activeGates(gates, ctx) {
+  return (Array.isArray(gates) ? gates : []).filter((g) => isGateActive(g, ctx));
+}
+
+/**
  * Derive the workflow def a HANDOFF run actually follows: the ship completion
  * phases and every review gate guarding a ship phase are removed. Everything
  * else (phase order, intake agent, feature-branch/PR flags) is untouched, so

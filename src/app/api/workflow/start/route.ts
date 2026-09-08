@@ -514,9 +514,9 @@ export async function POST(req: NextRequest) {
     }
 
     if (TICKET_PROVIDER === "jira") {
-      return await startWithJira(body, def, workflowId, markerId, responseMeta, repoCheck);
+      return await startWithJira(body, def, workflowId, markerId, responseMeta, repoCheck, cdRegistered);
     } else {
-      return await startWithDynamoDB(body, def, workflowId, markerId, responseMeta, repoCheck);
+      return await startWithDynamoDB(body, def, workflowId, markerId, responseMeta, repoCheck, cdRegistered);
     }
   } catch (err) {
     console.error("Workflow start error:", err);
@@ -530,7 +530,7 @@ export async function POST(req: NextRequest) {
  *  contradicted the resolved def and was overridden (the def always wins). */
 type StartResponseMeta = { workflowTypeOverridden?: true; note?: string; repoCheck?: RepoCheck };
 
-async function startWithJira(body: WorkflowInput, def: WorkflowDef, presetWorkflowId?: string, markerId?: string, responseMeta: StartResponseMeta = {}, repoCheck?: RepoCheck) {
+async function startWithJira(body: WorkflowInput, def: WorkflowDef, presetWorkflowId?: string, markerId?: string, responseMeta: StartResponseMeta = {}, repoCheck?: RepoCheck, cdRegistered = false) {
   const { JiraCloudProvider } = await import("@/lib/workflow/ticket-provider-jira");
   const jira = new JiraCloudProvider();
 
@@ -608,7 +608,7 @@ async function startWithJira(body: WorkflowInput, def: WorkflowDef, presetWorkfl
     // Playbook defs: the hub itself creates the Intent Acceptance gate (a human
     // ticket, Ready now) and the intake ticket waits behind it. The product
     // owner's approval — not the submit — is what starts the first agent.
-    const intentGate = intentGateFor(def, body.reviewGates || []);
+    const intentGate = intentGateFor(def, body.reviewGates || [], { cdRegistered });
     let gateTicketId: string | undefined;
     if (intentGate) {
       const intentMd = await writeIntentArtifacts(workflowId, body);
@@ -657,7 +657,7 @@ async function startWithJira(body: WorkflowInput, def: WorkflowDef, presetWorkfl
 
 // ─── DynamoDB Backend (via ticket tools Lambda) ──────────────────────────────
 
-async function startWithDynamoDB(body: WorkflowInput, def: WorkflowDef, presetWorkflowId?: string, markerId?: string, responseMeta: StartResponseMeta = {}, repoCheck?: RepoCheck) {
+async function startWithDynamoDB(body: WorkflowInput, def: WorkflowDef, presetWorkflowId?: string, markerId?: string, responseMeta: StartResponseMeta = {}, repoCheck?: RepoCheck, cdRegistered = false) {
   const intakePhase = def.phases.find((p) => p.type === "agent")?.agentPhase || "requirements";
   const intakePhaseName = def.phases.find((p) => p.type === "agent")?.name || "Intake";
   const workflowId = presetWorkflowId || mintWorkflowId();
@@ -773,7 +773,7 @@ async function startWithDynamoDB(body: WorkflowInput, def: WorkflowDef, presetWo
   let reqResult: Record<string, unknown>;
   try {
     // Playbook defs: hub-created Intent Acceptance gate first (see startWithJira).
-    const intentGate = intentGateFor(def, body.reviewGates || []);
+    const intentGate = intentGateFor(def, body.reviewGates || [], { cdRegistered });
     let gateTicketId: string | undefined;
     if (intentGate) {
       const intentMd = await writeIntentArtifacts(workflowId, body);
