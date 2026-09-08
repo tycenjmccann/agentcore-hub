@@ -18,6 +18,7 @@
  */
 
 import { parseGitHubUrl } from "./repo-check";
+import { NO_OP_OUTCOMES, isTerminalPhase } from "./types";
 import type { RepoConfig } from "./types";
 
 /** Minimum days between two SCHEDULED sweeps of the same repo. */
@@ -122,15 +123,15 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 /**
  * Was this repo swept too recently?
  *
- * Counts any row for the sweep def on the same repo — INCLUDING one still
- * running, which is the strongest reason not to start another, and including one
- * that closed `nothing-to-remove` (the sweep did happen; it just found nothing,
- * and nothing will have changed by next week either).
+ * "Swept" is exactly {@link countsAsPriorSweep}: a PRODUCTIVE terminal outcome
+ * ("complete" or a no-op outcome) or a LIVE run. A sweep that errored, was
+ * cancelled or closed ship-blocked is NOT a sweep and cannot justify a skip.
  *
  * Deliberately NOT counted:
  *   - this gate's own tombstones (`type: "skipped"`), or a skip would make the
- *     next 14 days of ticks skip on the evidence of a skip, and
- *   - `deleted` rows (the metrics-only tombstones the DELETE route leaves).
+ *     next 14 days of ticks skip on the evidence of a skip;
+ *   - `deleted` rows (the metrics-only tombstones the DELETE route leaves); and
+ *   - failed/abandoned runs (TEAM-4265 F10 — see countsAsPriorSweep).
  */
 export function evaluateSweepCadence(args: {
   repo: string;
@@ -146,10 +147,43 @@ export function evaluateSweepCadence(args: {
 }
 
 /**
+ * TEAM-4265 F10 — does this row count as "this repo was swept"?
+ *
+ * COUNTED:
+ *   - `"complete"` — the sweep ran and landed;
+ *   - a {@link NO_OP_OUTCOMES} member (`"nothing-to-remove"`) — the sweep did
+ *     happen, it just found nothing, and nothing will have changed by next week
+ *     either;
+ *   - any LIVE row, i.e. one whose phase is not terminal at all — a sweep still in
+ *     flight is the strongest possible reason not to start a second one. A row with
+ *     NO phase is live by this rule too, on purpose: unknown is not dead.
+ *
+ * NOT COUNTED — `"error"`, `"cancelled"`, and the ship-blocked outcomes
+ * (`"deploy-blocked"`, `"static-ci-only"`). FR-D2.4 means "swept < 14 days ago",
+ * not "attempted": a scheduled sweep that crashed three minutes in used to suppress
+ * every retry for a fortnight. A blocked sweep whose removal PR is still open is
+ * already caught by the open-PR probe, and one whose PR was closed unmerged should
+ * be re-sweepable at the next tick.
+ *
+ * Reads the shared {@link isTerminalPhase}/{@link NO_OP_OUTCOMES} from ./types
+ * rather than a hand-written phase list, so a new terminal outcome cannot silently
+ * start counting here.
+ */
+function countsAsPriorSweep(row: SweepWorkflowRow): boolean {
+  const phase = row.phase;
+  if (phase === "complete") return true;
+  if ((NO_OP_OUTCOMES as readonly string[]).includes(String(phase))) return true;
+  return !isTerminalPhase(phase);
+}
+
+/**
  * What the cadence check SAW: the newest prior sweep of this repo and its age.
  * Separate from the decision because a run the gate lets through still reports
  * this as its evidence (that is what a shadow rollout reads), and re-deriving it
  * by re-running the decision with a zero interval would report nothing.
+ *
+ * `runsConsidered` reports the FILTERED set — the rows that actually count as a
+ * prior sweep of this repo, not every row the Scan returned.
  */
 function sweepHistoryEvidence(args: {
   repo: string;
@@ -166,7 +200,8 @@ function sweepHistoryEvidence(args: {
       r.deleted !== true &&
       r.type !== "skipped" &&
       (r.workflowDefId || SWEEP_DEF_ID) === SWEEP_DEF_ID &&
-      rowRepoKey(r) === repo
+      rowRepoKey(r) === repo &&
+      countsAsPriorSweep(r)
   );
 
   let newest: SweepWorkflowRow | null = null;

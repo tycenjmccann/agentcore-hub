@@ -126,6 +126,57 @@ describe("evaluateSweepCadence", () => {
   it("does nothing without a repo key (every repo-less run would look like one repo)", () => {
     expect(evaluateSweepCadence({ repo: "", rows: [row(1)], now: NOW })).toBeNull();
   });
+
+  /**
+   * TEAM-4265 F10 — a sweep that did not SWEEP is not a prior sweep. Under enforce a
+   * scheduled sweep that crashed three minutes in used to suppress every retry for
+   * the next 14 days: FR-D2.4 means "swept < 14 days ago", not "attempted".
+   */
+  describe("only productive or live sweeps count (TEAM-4265 F10)", () => {
+    it("an ERRORED sweep 2 days ago is not a sweep — the next tick runs", () => {
+      expect(evaluateSweepCadence({ repo: REPO, rows: [row(2, { phase: "error" })], now: NOW })).toBeNull();
+    });
+
+    it("a CANCELLED sweep 2 days ago is not a sweep", () => {
+      expect(evaluateSweepCadence({ repo: REPO, rows: [row(2, { phase: "cancelled" })], now: NOW })).toBeNull();
+    });
+
+    it("a ship-BLOCKED sweep 2 days ago is not a sweep (its open PR is the probe's job)", () => {
+      expect(evaluateSweepCadence({ repo: REPO, rows: [row(2, { phase: "deploy-blocked" })], now: NOW })).toBeNull();
+      expect(evaluateSweepCadence({ repo: REPO, rows: [row(2, { phase: "static-ci-only" })], now: NOW })).toBeNull();
+    });
+
+    it("a recent error does not mask an older real sweep — the COMPLETE run is the evidence", () => {
+      const rows = [row(2, { workflowId: "wf_crashed", phase: "error" }), row(20, { workflowId: "wf_landed" })];
+      const gate = evaluateSweepGate({ repo: REPO, rows, prProbe: { probed: true }, pulls: [], now: NOW });
+      expect(gate.skip).toBeNull(); // 20 days > the 14-day window
+      expect(gate.evidence).toMatchObject({ lastRunId: "wf_landed", runsConsidered: 1 });
+      expect((gate.evidence as { ageDays: number }).ageDays).toBeCloseTo(20, 1);
+    });
+
+    it("a still-RUNNING sweep still counts (a live run is the strongest reason to wait)", () => {
+      const running = row(1, { workflowId: "wf_live", phase: "development", completedAt: undefined });
+      const d = evaluateSweepCadence({ repo: REPO, rows: [running], now: NOW });
+      expect(d?.skip).toBe("recent-sweep");
+      expect(d?.evidence.lastRunId).toBe("wf_live");
+    });
+
+    it("a nothing-to-remove sweep still counts (productive: it verified there was nothing)", () => {
+      expect(
+        evaluateSweepCadence({ repo: REPO, rows: [row(2, { phase: "nothing-to-remove" })], now: NOW })?.skip
+      ).toBe("recent-sweep");
+    });
+
+    it("a row with NO phase counts — unknown is not dead", () => {
+      const d = evaluateSweepCadence({
+        repo: REPO,
+        rows: [row(2, { workflowId: "wf_phaseless", phase: undefined })],
+        now: NOW,
+      });
+      expect(d?.skip).toBe("recent-sweep");
+      expect(d?.evidence.lastRunId).toBe("wf_phaseless");
+    });
+  });
 });
 
 describe("findOpenSweepPr", () => {
