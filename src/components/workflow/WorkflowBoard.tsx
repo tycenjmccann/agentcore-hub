@@ -650,12 +650,19 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
     // If scrubber is at the very end, just set phase to "complete" directly
     // This avoids any reconstruction race that could flash a non-complete state
     const atEnd = replayIndex >= replayEvents.length - 1;
-    // TEAM-4249 D2.9: the notice is reconstructed like phase — from the SAME
-    // forward walk below, last orchestrator event up to replayIndex wins — so
-    // scrubbing anywhere AFTER the event still shows it, and anywhere before it
-    // correctly shows none (captured via a local var since the loop lives inside
-    // the setState updater, then applied once after).
+    // TEAM-4249 D2.9: the notice is reconstructed like phase — last orchestrator
+    // event up to replayIndex wins — so scrubbing anywhere AFTER the event still
+    // shows it, and anywhere before it correctly shows none. Computed in its OWN
+    // forward walk rather than inside the setState updater below: React defers
+    // calling that updater until the state is actually reconciled, so a value
+    // written to an outer variable from inside it is not yet visible to code
+    // that runs immediately after the setState(...) call returns.
     let reconstructedNotice: string | null = null;
+    for (let i = 0; i <= replayIndex && i < replayEvents.length; i++) {
+      const orch = describeOrchestratorEvent(replayEvents[i]);
+      if (orch) reconstructedNotice = orch.text;
+    }
+    setOrchestratorNotice(reconstructedNotice);
     // Reconstruct state from scratch up to replayIndex
     setState((baseState) => {
       if (!baseState) return baseState;
@@ -664,8 +671,6 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
       let s: WorkflowState = { ...baseState, phase: "requirements", agentTasks: {} };
       for (let i = 0; i <= replayIndex && i < replayEvents.length; i++) {
         s = applyEventToState(s, replayEvents[i]);
-        const orch = describeOrchestratorEvent(replayEvents[i]);
-        if (orch) reconstructedNotice = orch.text;
       }
       // If at end and workflow was loaded as complete, force phase to "complete"
       // (handles race conditions and missing workflow_complete events)
@@ -681,7 +686,6 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
       }
       return s;
     });
-    setOrchestratorNotice(reconstructedNotice);
     // Fire visual effects for just the current event
     if (replayIndex < replayEvents.length) {
       fireReplayVisuals(replayEvents[replayIndex]);
