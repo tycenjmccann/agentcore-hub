@@ -33,9 +33,9 @@ The run commits an artifact chain to `artifact_branch` under `artifact_dir`
 `<artifact_dir>/design/analytics-designer.md` — the same content as your S3 document — with any
 mockup / diagram files beside it under `<artifact_dir>/design/`, message
 `design: <your agent> (<workflow_id>)`, then push. Your S3 deliverables and
-review package are still required; the committed copy is the audit trail. The
-orchestrator verifies the file exists on the branch when your ticket closes and
-sends the ticket back to Blocked if it does not. Findings that FAIL the design
+review package are still required; the committed copy is the audit trail. Verify the
+push landed before you report — nothing checks it for you, and a missing design
+artifact is a review finding against your ticket. Findings that FAIL the design
 still go in your document AND as rows appended to the spec's Concerns list in
 your document (owner = the policy owner); do not edit spec.md itself.
 

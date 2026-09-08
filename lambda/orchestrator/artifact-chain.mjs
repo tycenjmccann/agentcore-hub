@@ -16,8 +16,6 @@
  * Same split as cd-registry.mjs so this file is unit-testable in isolation.
  */
 
-export const ARTIFACT_CHAIN_GATE_MODES = new Set(["enforce", "off"]);
-
 /**
  * The framework a run follows: the requested overlay when the def offers it,
  * else the def's own `sdlcFramework`, else "standard". Twin of
@@ -47,12 +45,6 @@ export function applyFramework(def, framework) {
 /** The framework a stored workflow row runs under (row stamp, else input, else def). */
 export function frameworkOfWorkflow(def, workflow) {
   return resolveFramework(def, workflow?.sdlcFramework || workflow?.input?.sdlcFramework);
-}
-
-/** ARTIFACT_CHAIN_GATE env → "enforce" (default) | "off". Only applies to defs with a chain. */
-export function normalizeChainGateMode(raw) {
-  const v = String(raw ?? "").trim().toLowerCase();
-  return ARTIFACT_CHAIN_GATE_MODES.has(v) ? v : "enforce";
 }
 
 /** The def's chain, or null when the def does not run the playbook. */
@@ -118,7 +110,7 @@ export function isPlanTicket(ticket, agentDef) {
 /**
  * The `## SDLC Framework` context block every persona on a playbook run sees.
  * Names the chain dir + branch, the whole chain, and — for this ticket — the
- * artifact it owes and the rule the orchestrator enforces.
+ * artifact it owes and the commit-before-report rule (blueprint-enforced).
  */
 export function sdlcFrameworkContext({ def, workflow, ticket, agentDef, intakeAgentId }) {
   const chain = chainFor(def);
@@ -139,8 +131,8 @@ export function sdlcFrameworkContext({ def, workflow, ticket, agentDef, intakeAg
     lines.push(`your_artifact: ${owed.join(", ")}`);
     lines.push(
       `RULE: commit ${owed.join(" and ")} under ${dir}/ on ${branch} and push BEFORE WorkflowOutput___report_completion. ` +
-      `Mirror the same content to S3 shared/<name> for the console viewer. The orchestrator verifies the file exists on the branch ` +
-      `when your ticket closes and moves the ticket to Blocked with the missing path if it does not.`
+      `Mirror the same content to S3 shared/<name> for the console viewer. Verify the push landed before you report: ` +
+      `nothing checks it for you, and a missing artifact is a review finding against your ticket (the code reviewer diffs the branch against the chain).`
     );
     if (plan) {
       lines.push(`This is the PLAN ticket: write plan.md ONLY — do not implement. load_blueprint("playbook-build") and follow its "Plan ticket" section.`);
@@ -179,20 +171,4 @@ export function fallbackReviewPackagePhase(gateTicket) {
   if (/intent acceptance/i.test(title)) return "intake";
   if (!Array.isArray(gateTicket?.blockedBy) || gateTicket.blockedBy.length === 0) return "intake";
   return undefined;
-}
-
-/** GitHub contents-API path for one chain artifact. */
-export function artifactRepoPath(def, workflowId, name) {
-  const dir = chainDir(def, workflowId);
-  return dir ? `${dir}/${name}` : null;
-}
-
-/** The ticket comment + resume note when a chain artifact is missing. */
-export function missingArtifactNote({ missing, dir, branch }) {
-  const list = missing.map((m) => `- ${dir}/${m}`).join("\n");
-  return (
-    `Artifact chain gate: your ticket closed but the following file(s) are not on branch ${branch}:\n${list}\n` +
-    `Commit and push them to that branch (and mirror to S3 shared/), then move this ticket back to Ready. ` +
-    `Nothing downstream starts until the artifact exists — that is the point of the chain.`
-  );
 }

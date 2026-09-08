@@ -426,11 +426,12 @@ every judgment call is a human gate. Standard runs are untouched.
 | Development | `plan.md` — a `Plan:` dev ticket writes the plan first (files, "what could this break?", tests, rollback); implementation is blocked behind the gate and records deviations | **Plan Approval** (`human:engineer`) |
 | Review / Ship | `findings.md` — the code reviewer diffs the branch against `plan.md` and `spec.md`; unrecorded deviation = finding | **Merge Approval** (CD-registered repos) or handoff PR |
 
-The orchestrator enforces the chain: a ticket that owes an artifact is sent
-back to Blocked (with the missing path) if the file is not on the branch when
-it closes (`lambda/orchestrator/artifact-chain.mjs`; `ARTIFACT_CHAIN_GATE=off`
-disables). The board's framework badge (STANDARD / PLAYBOOK) is stamped from
-the run's resolved framework.
+The blueprints enforce the chain: each producing persona commits its artifact
+to the shared branch before it reports completion, and the code reviewer diffs
+the branch against `plan.md` / `spec.md`, so a missing artifact surfaces as a
+review finding (DL-009 — the orchestrator does not gate on it). The board's
+framework badge (STANDARD / PLAYBOOK) is stamped from the run's resolved
+framework.
 
 ### CD registry — who merges and deploys
 

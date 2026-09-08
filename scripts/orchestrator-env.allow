@@ -51,7 +51,6 @@ COMPLETION_EVIDENCE_REQUIRED
 SHIP_MERGE_VERIFY
 REPO_CHECK_MODE
 PIPELINE_ENABLED
-ARTIFACT_CHAIN_GATE
 
 # dark in prod, scheduled for deletion (cleanup PR 2 — remove with the modules)
 ADVISORY_ROUTING

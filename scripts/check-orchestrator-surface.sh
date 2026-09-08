@@ -31,7 +31,7 @@ MODULES_ALLOW="scripts/orchestrator-modules.allow"
 ENV_ALLOW="scripts/orchestrator-env.allow"
 # Budgets: PR 2 of the cleanup lowers these to (actual + 2.5%).
 ORCH_LOC_BUDGET=17000
-ORCH_INDEX_BUDGET=6150
+ORCH_INDEX_BUDGET=6100
 
 RULE="DL-009: the orchestrator is cascade/dispatch/claim/reaper/completion only.
         Put this behaviour in a blueprint (Tickets___create_ticket /

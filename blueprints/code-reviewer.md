@@ -124,7 +124,21 @@ performance claim". A perf change nobody measured is unreviewed by definition.
 
 ### Step 3b: Playbook runs — review the diff AGAINST the plan (MANDATORY when `## SDLC Framework` is in your context)
 On a playbook run (software-delivery with the playbook framework) the branch carries the artifact chain under
-`artifact_dir` (`.sdlc/<workflow_id>/`): `intent.md`, `spec.md`, `plan.md`.
+`artifact_dir` (`.sdlc/<workflow_id>/`): `intent.md`, `spec.md`, `design/<agent>.md`
+per design persona, `plan.md`. Nothing in the orchestrator checks that chain
+(DL-009) — YOU do, first:
+- **Enumerate what the run owes.** Read the `chain:` line of `## SDLC Framework`.
+  `Tickets___list_tickets(epic_id)`: for every Done ticket whose assignee is a
+  design-phase persona (`*_designer`, `security_reviewer`, `legal_compliance`,
+  `localization`, …) expect `design/<slug>.md` where `<slug>` is the assignee
+  minus `agentcore_hub_` with `_` → `-`; expect `intent.md` + `spec.md` from the
+  intake ticket and `plan.md` from the `Plan:` ticket when the chain lists them.
+- **Verify each exists on `artifact_branch`** (`git ls-tree -r --name-only
+  origin/<artifact_branch> -- <artifact_dir>/` via codex/claude_code). Every
+  missing file is a **P1 finding** — a fix ticket assigned to the producing
+  agent, grouped per agent ("commit `<artifact_dir>/<path>` on `<branch>` with
+  the same content as your S3 deliverable"), filed and parked on like any other
+  fix below. A run cannot PASS review with a hole in its audit trail.
 The engineer approved plan.md; the dev implemented against it. Your job adds a
 compliance pass on top of the adversarial one:
 - Read `plan.md` `## Files` and `## Approach`. Every changed file outside that
@@ -144,9 +158,10 @@ verdict, the review round, every finding (severity, file, scenario, status),
 the plan-compliance result (files in/out of plan, deviations recorded/unrecorded),
 and the spec-coverage result (criteria with/without tests). Commit it
 (`review: findings round <n> (<workflow_id>)`) and push. Mirror the text to
-`workflows/{workflow_id}/shared/findings.md`. The orchestrator blocks your ticket
-at close if `<artifact_dir>/findings.md` is not on the branch. Re-reviews
-APPEND a new round to the same file.
+`workflows/{workflow_id}/shared/findings.md`. Verify the push landed before you
+report — nothing checks it for you, and a run whose findings.md is missing has
+no audit trail for the merge gate. Re-reviews APPEND a new round to the same
+file.
 
 ### Step 4: (Optional) Harvest External PR Reviews
 Only if the repo has external review bots (Codex, Devin) configured. Your

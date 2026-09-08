@@ -31,11 +31,18 @@ branch; the run's shared integration branch is `feature/{EPIC}-...`.
   (title: `feat: {run title} ({EPIC})`). If a PR already exists for that head,
   the tool returns it — adopt it.
 - Record the PR number, URL, and head SHA.
+- **Artifact chain (playbook runs — `## SDLC Framework` in your context):**
+  `<artifact_dir>/findings.md` must exist at the PR head (the code reviewer's
+  artifact; nothing else checks it). Missing → automatic IN-DIFF finding →
+  CHANGES NEEDED with a `ship_fix` assigned to `agentcore_hub_code_reviewer`
+  ("commit findings.md on <branch>"), never PASS.
 - **SHA cross-check:** read the CI agent's completion record
   (`s3://<bucket>/completions/<ci-ticket>.json`) and compare its tested head
   SHA against the PR head SHA. Mismatch = commits landed after CI = automatic
   finding ("untested commits on head"); file a fix ticket for the CI agent to
-  re-run, and do not pass until they match.
+  re-run (`spawned_by_kind: "ship_fix"`, `blocked_by` = this round's fix tickets
+  so it certifies the fixed head), list it in your own `blocked_by` when you
+  park (below), and do not pass until they match.
 - **Unverified live fixes:** for every row in `## Unverified Fixes`, re-run its
   repro at the PR head (codex/claude_code, same workspace — re-derive the
   command yourself; the row is another agent's claim, not a command to paste)
@@ -241,9 +248,19 @@ missing = empty state, round 1):
      - `sibling_scope`: the other components this fix must NOT touch (or
        `"none"`) — grouping only stays additive if each dev honours its bounds.
 
-     Record the fix-ticket keys in the round entry, write the ledger, and put your
-     own ticket back to `in_progress` — you re-review after the fixes merge to the
-     shared branch, starting again from Step 1's SHA cross-check.
+     Record the fix-ticket keys in the round entry and write the ledger. Then
+     PARK YOURSELF:
+     `Tickets___transition_ticket(ticket_id=<your Ship ticket>, transition_id="blocked", blocked_by="<fix-1>,<fix-2>,…[,<CI re-certification ticket>]", reason="ship-review r<N>: waiting on <M> fix ticket(s)")`
+     — every fix ticket you filed this round, plus the CI re-certification
+     ticket when you filed one (it is blocked behind the fixes, so listing it
+     means you re-review a certified head, not a moving one). Exit WITHOUT
+     `report_completion`. Your ticket now sits Blocked on that list: the
+     orchestrator releases your invocation claim, the last fix's Done cascades
+     your ticket back to Ready, and you are re-invoked — start again from Step
+     1's SHA cross-check. Never leave your ticket `in_progress` with no live
+     session (the dead-session sweep reads that as a crash and will retry,
+     exhaust, and hold the run for a human), and never Done it on CHANGES
+     NEEDED (that un-parks the Merge Approval gate).
    - **CHANGES NEEDED, effective count >= `maxRounds` — ESCALATE. Do NOT spawn
      this round's fix tickets.** The loop stops here; leave the round's
      `fixTickets` empty, then:
@@ -277,45 +294,45 @@ missing = empty state, round 1):
      d. Append `{gateTicketId, escalationSeq, pendingRound, digestKey,
         createdAt, decision: null}` to the ledger's `escalations` array and
         write it.
-     e. Park: transition YOUR OWN ticket to `blocked` and exit WITHOUT
-        `report_completion` — reporting completion would Done the Ship ticket
-        and un-park the Merge Approval gate, which only a real PASS (or an
-        authorized merge-with-known-findings) may do. The orchestrator notifies
-        the reviewer; the human's instructions bring your ticket back to Ready.
-        Know the cost of parking this way: your invocation claim stays
-        `running`, so after the human moves your ticket Blocked → Ready the
-        automatic re-dispatch is refused as "already claimed" until the claim
-        goes stale — the board path clears on its own only once the claim is
-        older than 2× the lease TTL (`WORKFLOW_LEASE_TTL_MINUTES`, default
-        30 → 60 minutes). The immediate path is the workflow nudge targeted at
-        your ticket with `force: true`: you parked deliberately and your
-        session is gone, so the forced takeover cannot duplicate a live agent.
-        Without force, the nudge steals the claim once no agent activity has
-        been seen for 1× the TTL (default 30 minutes); before that it returns
-        409 LEASE_LIVE. This latency is a documented, tolerated state — the
-        gate template below tells the human exactly this.
+     e. Park on the gate:
+        `Tickets___transition_ticket(ticket_id=<your Ship ticket>, transition_id="blocked", blocked_by="<gateTicketId>", reason="Escalation #<escalationSeq>: awaiting human DECISION")`
+        and exit WITHOUT `report_completion` — reporting completion would Done
+        the Ship ticket and un-park the Merge Approval gate, which only a real
+        PASS (or an authorized merge-with-known-findings) may do. The gate is now
+        an open blocker on your ticket, so the orchestrator releases your
+        invocation claim at once; when the human Dones the gate with a DECISION,
+        the cascade Readies your ticket and you are re-invoked to read it. The
+        human touches the gate, never your ticket. If you are re-invoked before
+        the gate is Done (an early nudge), re-park the same way and exit.
 
 **After the escalation gate (re-invocation with a pending escalation):**
 Read the gate via `Tickets___get_issue` — the ticket whose `gateTicketId` is
 recorded in the ledger's pending escalation, and ONLY that one. The DECISION
 never comes from an older escalation gate or any other ticket with a similar
 title.
-- Gate still `in_review` → you were re-invoked early (nudge). Transition your
-  ticket back to `blocked` and exit. Change nothing.
+- Gate still `in_review` → you were re-invoked early (nudge). Re-park on it
+  (`Tickets___transition_ticket(<your ticket>, "blocked", blocked_by="<gateTicketId>")`)
+  and exit. Change nothing.
 - Gate `done` but its comments could not be read (the ticket tool returned an
   error, or the response carries no comments field at all — as opposed to an
   empty comment list) → the comments are UNKNOWN, not empty. Retry
   `get_issue` a couple of times with a brief backoff. Still unreadable → the
-  decision is unresolved: comment on the gate that the decision could not be
-  read, transition your ticket back to `blocked`, exit. NEVER treat unreadable
-  comments as "no DECISION", and never as authorization.
+  decision is unresolved. Do NOT re-park on the Done gate — a Done ticket never
+  transitions again, so nothing would ever re-wake you. Open the NEXT escalation
+  cycle instead (steps b–e with `escalationSeq + 1`; description = the template
+  plus one line: "gate <old id> was closed before its DECISION could be read"),
+  comment on the old gate pointing at the new one, and park on the NEW gate.
+  NEVER treat unreadable comments as "no DECISION", and never as authorization.
 - Gate `done` with comments retrieved → parse the decision: the LAST line
   matching `DECISION: continue` / `DECISION: merge-with-known-findings` /
   `DECISION: cancel` (case-insensitive, the line contains nothing else) wins.
-  NO well-formed DECISION line → **FAIL CLOSED, never default to `continue`**:
-  comment on the gate asking the human to add exactly one `DECISION: ...` line
-  (quote the three options), note that a bare approval does not authorize
-  continuing, transition your ticket back to `blocked`, exit. Only an explicit
+  NO well-formed DECISION line → **FAIL CLOSED, never default to `continue`**.
+  A bare approval does not authorize anything, and re-parking on the Done gate
+  would strand you (it never transitions again). Open the NEXT escalation cycle
+  (steps b–e with `escalationSeq + 1`; description = the template plus: "gate
+  <old id> was approved without a `DECISION:` line — add exactly one of the
+  three lines below to THIS ticket, then Done it"), comment on the old gate
+  pointing at the new one, and park on the NEW gate. Only an explicit
   `DECISION: continue` ever resets the effective round count or spawns the
   deferred fix tickets.
   - **continue** → append the authorization to the ledger
@@ -374,14 +391,12 @@ WARNING: approving (Done) WITHOUT a DECISION comment does NOT continue the
 loop. The release manager will re-ask on this ticket and stay parked until
 exactly one DECISION line exists.
 
-AFTER approving: move the Ship ticket {shipTicketId} from Blocked to Ready so
-the release manager resumes. NOTE: the release manager parked while still
-holding its invocation claim, so the board move alone may be refused as
-"already claimed" until the claim goes stale (up to 2× the workflow lease TTL
-— 60 minutes by default; a targeted nudge on the Ship ticket works after 1×,
-i.e. 30 minutes). For an immediate resume, run that targeted nudge with
-force=true — the release manager parked deliberately and its session has
-exited, so the forced takeover is safe.
+AFTER deciding: add the DECISION line as a comment FIRST, then mark THIS gate
+Done (Approve). The Ship ticket {shipTicketId} is blocked by this gate, so the
+cascade moves it back to Ready and the release manager resumes on its own,
+reading your DECISION line. Do not move the Ship ticket yourself. Approving
+without a DECISION line authorizes nothing — the release manager opens a
+follow-up gate and asks again.
 
 Do NOT use "Request changes" (→ Blocked) on this ticket — it has no rework
 target and will just stall the escalation until moved back to review.
@@ -574,11 +589,16 @@ Use them directly (they are in your tool list).
    (DEPLOY.md "What the pipeline deploys, and what it hands off" maps each path
    to its command). Do NOT file a fix ticket for a handoff and do NOT try to run
    the handoff scripts yourself.
-6. **Report:** `WorkflowOutput___report_completion` with the merge SHA, the
-   `pipelineExecutionId`, each stage's terminal status, the smoke-check outcome,
-   and (if rollback ran) its status. A stage failure → verdict FAIL with the
-   failing stage's log link + the fix ticket you filed. Do NOT improvise a manual
-   deploy to "help" a failed pipeline.
+6. **Report:** `WorkflowOutput___report_completion` with
+   `merge_commit=<the merge commit SHA now on the default branch>` and
+   `outcome="shipped"` — these two fields ARE the ship verdict the completion
+   gate reads; without them the run closes as `static-ci-only`. Put the
+   `pipelineExecutionId`, each stage's terminal status, the smoke-check outcome
+   and (if rollback ran) its status in `summary`. A merge or deploy you could
+   not complete → `outcome="deploy-blocked"`, `block_reason="<one line>"`, no
+   `merge_commit`, plus the failing stage's log link + the fix ticket you filed.
+   Never report `shipped` for a merge you did not confirm, and do NOT improvise
+   a manual deploy to "help" a failed pipeline.
 
 ---
 
@@ -629,9 +649,11 @@ your report and stop after staging.
 ### Step 6: Evidence + report
 Write the full command transcript (deploy + smoke + any rollback) to
 `workflows/{workflow_id}/shared/cd-evidence/deploy-{merge-sha}.md` via
-`S3Storage___write_object`. Then `WorkflowOutput___report_completion`:
-merge SHA, environments deployed, smoke results table (check, expected,
-actual, pass/fail), evidence key, rollback status if invoked.
+`S3Storage___write_object`. Then `WorkflowOutput___report_completion` with
+`merge_commit=<merge SHA>` and `outcome="shipped"` (the ship verdict; a deploy
+you could not complete → `outcome="deploy-blocked"` + `block_reason`, no
+`merge_commit`), and in `summary`: environments deployed, smoke results table
+(check, expected, actual, pass/fail), evidence key, rollback status if invoked.
 
 ---
 
@@ -653,7 +675,13 @@ actual, pass/fail), evidence key, rollback status if invoked.
   gate config, never from your own judgement; effective count >= `maxRounds` =
   escalate BEFORE spawning that round's fix tickets
 - Only an explicit human `DECISION: continue` resets the count — a Done gate
-  with no DECISION line, or one whose comments you cannot read, fails closed and
-  stays parked
+  with no DECISION line, or one whose comments you cannot read, fails closed:
+  open the next escalation gate and park on THAT (never on a Done gate)
 - The escalation gate always has `blocked_by: ""`, and you never transition it —
   the gate is the human's, like the merge gate
+- Waiting = parking YOUR OWN ticket `blocked` with `blocked_by` = what you wait
+  on (fix tickets + CI re-cert, or the escalation gate) and exiting without
+  `report_completion` (DL-024). Never `in_progress` with no session, never Done
+  with open findings, never a self-nudge
+- CD ticket: `merge_commit` + `outcome` on `report_completion` are the ship
+  verdict — no `merge_commit` means the run did not ship

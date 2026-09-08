@@ -104,7 +104,8 @@ export interface ArtifactChainEntry {
 /**
  * The committed-artifact chain of a playbook run. Every artifact is committed
  * to `dir` on the run's shared feature branch before the producing ticket may
- * close; the orchestrator verifies the file exists on the branch.
+ * close; the blueprints enforce it (the code reviewer diffs the branch against
+ * the chain) — the orchestrator does not gate on it (DL-009).
  */
 export interface ArtifactChain {
   /** Directory in the target repo; "{workflowId}" is substituted. */
