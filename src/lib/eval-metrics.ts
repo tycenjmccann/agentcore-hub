@@ -37,7 +37,7 @@ export interface DailyBucket {
 }
 
 export interface Pricing {
-  models: Record<string, { input: number; output: number }>;
+  models: Record<string, { input: number; output: number; cacheReadInput?: number }>;
   default: { input: number; output: number };
   cachedInputDiscount?: number;
   cacheWriteMultiplier?: Record<string, number | string>;
@@ -155,11 +155,13 @@ export function modelCost(model: string, u: Partial<DailyModelUsage>, pricing: P
   const cacheWrite1h = Math.min(n(u.cacheWrite1h), cacheWrite);
   const uncached = Math.max(0, input - cacheRead - cacheWrite);
   const discount = typeof pricing.cachedInputDiscount === "number" ? pricing.cachedInputDiscount : 0.1;
+  // Per-model absolute cache-read rate (USD/1M) wins over the fractional default.
+  const readRate = typeof p.cacheReadInput === "number" && Number.isFinite(p.cacheReadInput) ? p.cacheReadInput : p.input * discount;
   const mult5m = multiplier(pricing, "5m", multiplier(pricing, "default", 1.25));
   const mult1h = multiplier(pricing, "1h", 2.0);
   const inputUsd =
-    (uncached + cacheRead * discount + (cacheWrite - cacheWrite1h) * mult5m + cacheWrite1h * mult1h) *
-    (p.input / 1_000_000);
+    (uncached * p.input + cacheRead * readRate + ((cacheWrite - cacheWrite1h) * mult5m + cacheWrite1h * mult1h) * p.input) /
+    1_000_000;
   const outputUsd = n(u.output) * (p.output / 1_000_000);
   return inputUsd + outputUsd;
 }

@@ -76,6 +76,25 @@ test("unknown engine falls back to the inclusive heuristic (input >= cache => su
   assert.equal(uncachedInput("persona", 2, 3, 2), 0);  // never negative
 });
 
+test("per-model cacheReadInput overrides the fractional cache-read discount", () => {
+  const pricing = { ...PRICING, models: { m: { input: 10, output: 50, cacheReadInput: 0.25 } } };
+  const byAgent = {};
+  addUsage(byAgent, "req", "persona", { model: "m", inp: M, outp: 0, cacheRead: M }, pricing);
+  // 1M read @ $0.25 absolute (not $10 * 0.1 = $1).
+  assert.equal(byAgent.req.engines.persona.usd, 0.25);
+});
+
+test("regression: Buster at the Cost-Explorer-verified fable-5-1 rates lands near $70 (5m writes)", () => {
+  const pricing = { ...PRICING, models: { f: { input: 11, output: 55, cacheReadInput: 0.275 } } };
+  const byAgent = {};
+  addUsage(byAgent, "run", "persona", {
+    model: "f", inp: 79_315_825, outp: 410_456, cacheRead: 77_443_509, cacheWrite: 1_871_132, ttl: "5m",
+  }, pricing);
+  const usd = byAgent.run.engines.persona.usd;
+  // read 77.44M*0.275=21.30 + write 1.87M*11*1.25=25.73 + out 0.41M*55=22.58 + ~0 uncached
+  assert.ok(usd > 69 && usd < 71, `expected ~69.6, got ${usd}`);
+});
+
 test("regression: Buster dead-code sweep (wf_1788779651903_463811) persona spend", () => {
   // Real persona totals from the run's v3 card. At 20/100 the card said
   // $1,857.09; the correct Bedrock-equivalent figure is ~$243.

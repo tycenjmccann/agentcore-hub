@@ -443,9 +443,12 @@ export function addUsage(byAgent, agentId, engine, row, pricing) {
     const discount = pricing.cachedInputDiscount ?? 0.1;
     const writeMult = pricing.cacheWriteMultiplier?.[row.ttl] ?? pricing.cacheWriteMultiplier?.default ?? 1.25;
     const uncached = uncachedInput(engine, inp, read, write);
+    // Per-model absolute cache-read rate wins over the fractional default
+    // (fable-5-1 bills cache reads at 2.5% of input, not 10%).
+    const readRate = Number.isFinite(p.cacheReadInput) ? p.cacheReadInput : p.input * discount;
     usd = (uncached / 1e6) * p.input
       + (outp / 1e6) * p.output
-      + (read / 1e6) * p.input * discount
+      + (read / 1e6) * readRate
       + (write / 1e6) * p.input * writeMult;
   }
   u.usd += usd;
