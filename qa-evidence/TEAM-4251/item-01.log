@@ -1,0 +1,110 @@
+=== ITEM 1 (D1) — after TEAM-4180 CHANGES NEEDED there is no orchestrator.unblocked for TEAM-4181 until TEAM-4183 completes ===
+Named file: lambda/orchestrator/replay-dowtdh-verdict-gate.test.mjs
+Fixture ids: DEV=TEAM-4179 REVIEW=TEAM-4180(code_reviewer) QA=TEAM-4181 CI=TEAM-4182 FIX=TEAM-4183
+
+--- 1. verbose run ---
+$ npx vitest run lambda/orchestrator/replay-dowtdh-verdict-gate.test.mjs --reporter=verbose
+ ✓ lambda/orchestrator/replay-dowtdh-verdict-gate.test.mjs > dowtdh replay — the fixture still says what this replay claims > records three different heads and not one structured verdict
+ ✓ lambda/orchestrator/replay-dowtdh-verdict-gate.test.mjs > dowtdh replay — the fixture still says what this replay claims > published workflow.complete with the cascade unblocking every gate in turn
+ ✓ lambda/orchestrator/replay-dowtdh-verdict-gate.test.mjs > dowtdh replay — the D1 flags > (e) all three flags off: the event sequence equals the pre-D1 baseline, with zero writes 961ms
+ ✓ lambda/orchestrator/replay-dowtdh-verdict-gate.test.mjs > dowtdh replay — the D1 flags > (e) all three flags off: agent.complete carries the four keys on every ticket, at off defaults for non-gate personas 345ms
+ ✓ lambda/orchestrator/replay-dowtdh-verdict-gate.test.mjs > dowtdh replay — the D1 flags > (f) shadow (the default): verdict_observed x2 + completion_blocked, workflow.complete still published, zero writes 318ms
+ ✓ lambda/orchestrator/replay-dowtdh-verdict-gate.test.mjs > dowtdh replay — the D1 flags > (f) shadow: the inferred ladder observes the same two verdicts from the fixture's prose alone 329ms
+ ✓ lambda/orchestrator/replay-dowtdh-verdict-gate.test.mjs > dowtdh replay — the D1 flags > (a) enforce: after TEAM-4180 CHANGES_NEEDED no orchestrator.unblocked names TEAM-4181, TEAM-4181 is not dispatched, and verdict_suppressed's blockers hold TEAM-4183 + a re-verify id
+ ✓ lambda/orchestrator/replay-dowtdh-verdict-gate.test.mjs > dowtdh replay — the D1 flags > (a) enforce: TEAM-4181.blockedBy gained TEAM-4183 and the reviewer re-verify, and TEAM-4183 completing releases the re-verify — not TEAM-4181 353ms
+ ✓ lambda/orchestrator/replay-dowtdh-verdict-gate.test.mjs > dowtdh replay — the D1 flags > (a) enforce: TEAM-4181's FAIL holds TEAM-4182 on TEAM-4183 too, though QA filed no fix itself
+ ✓ lambda/orchestrator/replay-dowtdh-verdict-gate.test.mjs > dowtdh replay — the D1 flags > (a) enforce: the inferred ladder holds TEAM-4181 identically from the fixture's prose alone
+ ✓ lambda/orchestrator/replay-dowtdh-verdict-gate.test.mjs > dowtdh replay — the D1 flags > (b) a Re-verify ticket owned by agentcore_hub_qa_verifier AND one owned by agentcore_hub_ci_agent exist, tied to TEAM-4183 357ms
+ ✓ lambda/orchestrator/replay-dowtdh-verdict-gate.test.mjs > dowtdh replay — the D1 flags > (c) enforce: workflow.complete count 0 and exactly ONE orchestrator.completion_blocked with heads.qa 933ea6f, heads.pr 001259d, reason head-divergence
+ ✓ lambda/orchestrator/replay-dowtdh-verdict-gate.test.mjs > dowtdh replay — the D1 flags > (d) the TEAM-4181 agent.complete delivered twice creates exactly one QA re-verify and leaves the blocker-edge writes unchanged
+ ✓ lambda/orchestrator/replay-dowtdh-verdict-gate.test.mjs > dowtdh replay — the D1 flags > (d) …and still exactly one when the marker write was lost, on the CAS alone
+ Test Files  1 passed (1)
+      Tests  14 passed (14)
+
+--- 2. the proving test, and its ACTUAL assertions (lines 671-702) ---
+  it("(a) enforce: after TEAM-4180 CHANGES_NEEDED no orchestrator.unblocked names TEAM-4181, TEAM-4181 is not dispatched, and verdict_suppressed's blockers hold TEAM-4183 + a re-verify id", async () => {
+    await loadWith(ENFORCE_VERDICT_ONLY);
+    await deliver(doneRecord(DEV));
+    await deliver(insertFixRecord());
+    await deliver(doneRecord(REVIEW));
+
+    // The dev's own release still happens — only the non-PASS gate is held.
+    const unblocked = detailsOfType("orchestrator.unblocked");
+    expect(unblocked.map((u) => u.ticketId)).toEqual([REVIEW]);
+    expect(unblocked.some((u) => u.ticketId === QA)).toBe(false);
+
+    // Not transitioned, therefore never dispatched: the whole point of gating at the
+    // top of cascadeUnblock is that transition, dispatch and event fall together.
+    expect(h.state.statusWrites.filter((w) => w.ticketId === QA && w.status === "todo")).toEqual([]);
+    expect(h.state.board.get(QA).status).toBe("blocked");
+
+    const suppressed = detailsOfType("orchestrator.verdict_suppressed");
+    expect(suppressed).toHaveLength(1);
+    expect(suppressed[0]).toMatchObject({
+      workflowId: WF_ID,
+      verdict: "CHANGES_NEEDED",
+      unblocked: [QA],          // what WOULD have been released
+      spawnedTickets: [FIX],    // the reviewer's own fix ticket
+    });
+
+    // The reviewer filed a fix, so the hold rides on it — plus the re-verify that
+    // makes the reviewer look again once the fix lands. Both, not either.
+    const [rv] = reverifyTickets();
+    expect(rv).toBeTruthy();
+    expect(suppressed[0].blockers).toEqual([FIX, rv.key]);
+    expect(rv.blocked_by).toEqual([FIX]);
+  });
+
+--- 3. assertion audit — does it assert the stated property? ---
+  YES, and by ticket id, not by count:
+    L679  expect(unblocked.map((u) => u.ticketId)).toEqual([REVIEW]);
+            -> the ONLY orchestrator.unblocked is for TEAM-4180 itself
+    L680  expect(unblocked.some((u) => u.ticketId === QA)).toBe(false);
+            -> explicitly NO unblocked names TEAM-4181
+    L684  expect(h.state.statusWrites.filter((w) => w.ticketId === QA && w.status === "todo")).toEqual([]);
+    L685  expect(h.state.board.get(QA).status).toBe("blocked");
+            -> not merely "no event": no status write and the board row is blocked,
+               so the ticket is provably never dispatched
+    L688  expect(suppressed).toHaveLength(1);
+    L691  verdict: "CHANGES_NEEDED"   L692 unblocked: [QA]   L693 spawnedTickets: [FIX]
+    L700  expect(suppressed[0].blockers).toEqual([FIX, rv.key]);
+  The verdict is REAL, not stubbed: the sibling test at L742 re-proves the identical
+  hold with no declared verdict at all, from the fixture prose via the ladder.
+
+--- 4. the 'until TEAM-4183 completes' half (lines 704-728) ---
+  it("(a) enforce: TEAM-4181.blockedBy gained TEAM-4183 and the reviewer re-verify, and TEAM-4183 completing releases the re-verify — not TEAM-4181", async () => {
+    await loadWith(ENFORCE_VERDICT_ONLY);
+    await deliver(doneRecord(DEV));
+    await deliver(insertFixRecord());
+    await deliver(doneRecord(REVIEW));
+
+    const rvKey = reverifyTickets()[0].key;
+    // The hold is an ordinary blocker edge — which is why the existing blocked→ready
+    // cascade and the reconcile sweep already know how to release it.
+    expect(h.state.board.get(QA).blockedBy).toEqual([REVIEW, FIX, rvKey]);
+    expect(h.state.blockerWrites.map((w) => ({ ticketId: w.ticketId, ids: w.ids }))).toEqual([
+      { ticketId: QA, ids: [FIX] },
+      { ticketId: QA, ids: [rvKey] },
+    ]);
+
+    h.state.ebEvents.length = 0;
+    await deliver(doneRecord(FIX));
+
+    // What the graph correctly yields: the fix's only fully-unblocked successor is
+    // the re-verify. TEAM-4181 is still held by it, and stays held until the
+    // reviewer's second look closes — no verifier runs against unfixed code.
+    expect(detailsOfType("orchestrator.unblocked").map((u) => u.ticketId)).toEqual([rvKey]);
+    expect(h.state.board.get(rvKey).status).toBe("todo");
+    expect(h.state.board.get(QA).status).toBe("blocked");
+  });
+
+  DEVIATION (implementation is STRICTER than the acceptance wording):
+  the acceptance text says TEAM-4181 gets no unblocked "until TEAM-4183 completes",
+  implying it unblocks when the fix lands. The test asserts the opposite and stronger
+  thing at L725-727: after TEAM-4183 completes, the only unblocked is the RE-VERIFY
+  ticket, and TEAM-4181 is STILL blocked:
+    L725  expect(detailsOfType("orchestrator.unblocked").map((u) => u.ticketId)).toEqual([rvKey]);
+    L727  expect(h.state.board.get(QA).status).toBe("blocked");
+  TEAM-4181 stays held until the reviewer's re-verify closes. The acceptance
+  criterion is satisfied (no unblocked before TEAM-4183) but understates the hold.
+EXIT=0

@@ -1,0 +1,274 @@
+=== ITEM 7 — A completion whose heads mismatch emits orchestrator.completion_blocked, never workflow.complete ===
+Named test: lambda/orchestrator/verified-head-completion.test.mjs
+
+--- (1) vitest run --reporter=verbose ---
+[33mThe CJS build of Vite's Node API is deprecated. See https://vite.dev/guide/troubleshooting.html#vite-cjs-node-api-deprecated for more details.[39m
+
+ RUN  v2.1.9 /mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub
+
+ ✓ lambda/orchestrator/verified-head-completion.test.mjs > evaluateVerifiedHeads — dowtdh, the run this gate exists for > refuses the completion with reason head-divergence
+ ✓ lambda/orchestrator/verified-head-completion.test.mjs > evaluateVerifiedHeads — dowtdh, the run this gate exists for > reports the three heads the run actually produced
+ ✓ lambda/orchestrator/verified-head-completion.test.mjs > evaluateVerifiedHeads — dowtdh, the run this gate exists for > names BOTH verifier personas as stale — neither certified the shipped head
+ ✓ lambda/orchestrator/verified-head-completion.test.mjs > evaluateVerifiedHeads — dowtdh, the run this gate exists for > does not derive the PR head from the reviewer's ticket
+ ✓ lambda/orchestrator/verified-head-completion.test.mjs > evaluateVerifiedHeads — dowtdh, the run this gate exists for > takes the run's head from a done dev/fix commitSha, never from a mergeCommit
+ ✓ lambda/orchestrator/verified-head-completion.test.mjs > evaluateVerifiedHeads — dowtdh, the run this gate exists for > passes once the run's head IS the head both verifiers certified
+ ✓ lambda/orchestrator/verified-head-completion.test.mjs > evaluateVerifiedHeads — dowtdh, the run this gate exists for > sees no head at all before the D1 harvest — which is why the harvest changed
+ ✓ lambda/orchestrator/verified-head-completion.test.mjs > evaluateVerifiedHeads — the head-equality rule > passes when all three heads are the same commit
+ ✓ lambda/orchestrator/verified-head-completion.test.mjs > evaluateVerifiedHeads — the head-equality rule > passes on ONE known head — nothing to compare it against
+ ✓ lambda/orchestrator/verified-head-completion.test.mjs > evaluateVerifiedHeads — the head-equality rule > passes on two known EQUAL heads, refuses two known DIFFERENT ones
+ ✓ lambda/orchestrator/verified-head-completion.test.mjs > evaluateVerifiedHeads — the head-equality rule > treats a short sha and the full sha it prefixes as the SAME head
+ ✓ lambda/orchestrator/verified-head-completion.test.mjs > evaluateVerifiedHeads — the head-equality rule > with no PR head, two disagreeing verifiers are BOTH stale
+ ✓ lambda/orchestrator/verified-head-completion.test.mjs > evaluateVerifiedHeads — the head-equality rule > names only the persona that disagrees with the PR head
+ ✓ lambda/orchestrator/verified-head-completion.test.mjs > evaluateVerifiedHeads — the head-equality rule > prefers the caller's PR head over any derived one
+ ✓ lambda/orchestrator/verified-head-completion.test.mjs > evaluateVerifiedHeads — the head-equality rule > takes the NEWEST head each persona declared, by completedAt
+ ✓ lambda/orchestrator/verified-head-completion.test.mjs > evaluateVerifiedHeads — the head-equality rule > a head-less later round does not erase the head an earlier one proved
+ ✓ lambda/orchestrator/verified-head-completion.test.mjs > evaluateVerifiedHeads — the head-equality rule > ignores a ticket that is not done, and one with no task entry
+ ✓ lambda/orchestrator/verified-head-completion.test.mjs > evaluateVerifiedHeads — the head-equality rule > returns the inert shape for junk input
+ ✓ lambda/orchestrator/verified-head-completion.test.mjs > evaluateVerifiedHeads — the head-equality rule > never reads delivery.mode — a handoff run is held to the same heads
+ ✓ lambda/orchestrator/verified-head-completion.test.mjs > evaluateVerifiedHeads — the epic-wide open-fix refusal > refuses on an open fix whose phase no def requires — this is the dowtdh shape
+ ✓ lambda/orchestrator/verified-head-completion.test.mjs > evaluateVerifiedHeads — the epic-wide open-fix refusal > still reports the heads it compared, so the event says what state was refused
+ ✓ lambda/orchestrator/verified-head-completion.test.mjs > evaluateVerifiedHeads — the epic-wide open-fix refusal > lists every open fix once, in board order
+ ✓ lambda/orchestrator/verified-head-completion.test.mjs > evaluateVerifiedHeads — the epic-wide open-fix refusal > ignores a fix that is done or cancelled
+ ✓ lambda/orchestrator/verified-head-completion.test.mjs > evaluateVerifiedHeads — the epic-wide open-fix refusal > ignores an open ticket that is not a fix — that is isWorkflowComplete's job
+ ✓ lambda/orchestrator/verified-head-completion.test.mjs > evaluateVerifiedHeads — the epic-wide open-fix refusal > an `advisory` label does NOT excuse an open fix (TEAM-4131 F2)
+ ✓ lambda/orchestrator/verified-head-completion.test.mjs > evaluateVerifiedHeads — the epic-wide open-fix refusal > refuses on the open fix BEFORE reporting divergence — the fix is the actionable one
+ ✓ lambda/orchestrator/verified-head-completion.test.mjs > completion.mjs parity mirrors > normalizeHeadSha agrees with verdict-contract's normalizeSha
+ ✓ lambda/orchestrator/verified-head-completion.test.mjs > completion.mjs parity mirrors > GATE_PERSONA_IDS is the same set as verdict-contract's GATE_PERSONAS
+stdout | lambda/orchestrator/verified-head-completion.test.mjs > completeWorkflow — the verified-head gate (FR-D1.9 wiring) > enforce + divergence: one completion_blocked, no workflow.complete, one re-verify per stale persona
+[orchestrator] wf_1: completion blocked (head-divergence) — qa=aaaaaaa111111111111111111111111111111111 ci=aaaaaaa111111111111111111111111111111111 pr=bbbbbbb222222222222222222222222222222222
+[orchestrator] live-reverify: V-2: gate re-verify RV-1 (round 1) @ bbbbbbb
+[orchestrator] live-reverify: V-3: gate re-verify RV-2 (round 1) @ bbbbbbb
+
+ ✓ lambda/orchestrator/verified-head-completion.test.mjs > completeWorkflow — the verified-head gate (FR-D1.9 wiring) > enforce + divergence: one completion_blocked, no workflow.complete, one re-verify per stale persona 550ms
+stdout | lambda/orchestrator/verified-head-completion.test.mjs > completeWorkflow — the verified-head gate (FR-D1.9 wiring) > the same refusal twice (twin delivery / reconcile sweep) adds no event and no ticket
+[orchestrator] wf_1: completion blocked (head-divergence) — qa=aaaaaaa111111111111111111111111111111111 ci=aaaaaaa111111111111111111111111111111111 pr=bbbbbbb222222222222222222222222222222222
+[orchestrator] live-reverify: V-2: gate re-verify RV-1 (round 1) @ bbbbbbb
+[orchestrator] live-reverify: V-3: gate re-verify RV-2 (round 1) @ bbbbbbb
+[orchestrator] live-reverify: V-2: gate re-verify RV-1 (round 1) @ bbbbbbb (already existed)
+[orchestrator] live-reverify: V-3: gate re-verify RV-2 (round 1) @ bbbbbbb (already existed)
+
+ ✓ lambda/orchestrator/verified-head-completion.test.mjs > completeWorkflow — the verified-head gate (FR-D1.9 wiring) > the same refusal twice (twin delivery / reconcile sweep) adds no event and no ticket
+stdout | lambda/orchestrator/verified-head-completion.test.mjs > completeWorkflow — the verified-head gate (FR-D1.9 wiring) > open-fix: refused with reason open-fix, and nothing is dispatched for it
+[orchestrator] wf_1: completion blocked (open-fix) — qa=aaaaaaa111111111111111111111111111111111 ci=aaaaaaa111111111111111111111111111111111 pr=bbbbbbb222222222222222222222222222222222
+
+ ✓ lambda/orchestrator/verified-head-completion.test.mjs > completeWorkflow — the verified-head gate (FR-D1.9 wiring) > open-fix: refused with reason open-fix, and nothing is dispatched for it
+stdout | lambda/orchestrator/verified-head-completion.test.mjs > completeWorkflow — the verified-head gate (FR-D1.9 wiring) > open-fix then divergence at the SAME heads are two distinct refusals
+[orchestrator] wf_1: completion blocked (open-fix) — qa=aaaaaaa111111111111111111111111111111111 ci=aaaaaaa111111111111111111111111111111111 pr=bbbbbbb222222222222222222222222222222222
+[orchestrator] wf_1: completion blocked (head-divergence) — qa=aaaaaaa111111111111111111111111111111111 ci=aaaaaaa111111111111111111111111111111111 pr=bbbbbbb222222222222222222222222222222222
+[orchestrator] live-reverify: V-2: gate re-verify RV-1 (round 1) @ bbbbbbb
+[orchestrator] live-reverify: V-3: gate re-verify RV-2 (round 1) @ bbbbbbb
+
+ ✓ lambda/orchestrator/verified-head-completion.test.mjs > completeWorkflow — the verified-head gate (FR-D1.9 wiring) > open-fix then divergence at the SAME heads are two distinct refusals
+stdout | lambda/orchestrator/verified-head-completion.test.mjs > completeWorkflow — the verified-head gate (FR-D1.9 wiring) > shadow: the refusal is observed and the run still completes
+[orchestrator] wf_1: completion blocked (head-divergence) — qa=aaaaaaa111111111111111111111111111111111 ci=aaaaaaa111111111111111111111111111111111 pr=bbbbbbb222222222222222222222222222222222
+[orchestrator] Workflow wf_1 complete!
+
+ ✓ lambda/orchestrator/verified-head-completion.test.mjs > completeWorkflow — the verified-head gate (FR-D1.9 wiring) > shadow: the refusal is observed and the run still completes
+stdout | lambda/orchestrator/verified-head-completion.test.mjs > completeWorkflow — the verified-head gate (FR-D1.9 wiring) > off: the gate is never even called and completion is byte-identical to pre-4246
+[orchestrator] Workflow wf_1 complete!
+
+ ✓ lambda/orchestrator/verified-head-completion.test.mjs > completeWorkflow — the verified-head gate (FR-D1.9 wiring) > off: the gate is never even called and completion is byte-identical to pre-4246
+stdout | lambda/orchestrator/verified-head-completion.test.mjs > completeWorkflow — the verified-head gate (FR-D1.9 wiring) > heads that agree complete under enforce, with no event and no ticket
+[orchestrator] Workflow wf_1 complete!
+
+ ✓ lambda/orchestrator/verified-head-completion.test.mjs > completeWorkflow — the verified-head gate (FR-D1.9 wiring) > heads that agree complete under enforce, with no event and no ticket
+ ✓ lambda/orchestrator/verified-head-completion.test.mjs > completeWorkflow — the verified-head gate (FR-D1.9 wiring) > enforce: the gate throwing HOLDS the completion (unlike gates #1 and #2)
+stdout | lambda/orchestrator/verified-head-completion.test.mjs > completeWorkflow — the verified-head gate (FR-D1.9 wiring) > shadow: the gate throwing does not hold anything
+[orchestrator] Workflow wf_1 complete!
+
+ ✓ lambda/orchestrator/verified-head-completion.test.mjs > completeWorkflow — the verified-head gate (FR-D1.9 wiring) > shadow: the gate throwing does not hold anything
+stdout | lambda/orchestrator/verified-head-completion.test.mjs > completeWorkflow — the verified-head gate (FR-D1.9 wiring) > an untracked claim row still tells the story (fail-open, as the slot CAS does)
+[orchestrator] wf_1: completion blocked (head-divergence) — qa=aaaaaaa111111111111111111111111111111111 ci=aaaaaaa111111111111111111111111111111111 pr=bbbbbbb222222222222222222222222222222222
+[orchestrator] live-reverify: V-2: gate re-verify RV-1 (round 1) @ bbbbbbb
+[orchestrator] live-reverify: V-3: gate re-verify RV-2 (round 1) @ bbbbbbb
+[orchestrator] wf_1: completion blocked (head-divergence) — qa=aaaaaaa111111111111111111111111111111111 ci=aaaaaaa111111111111111111111111111111111 pr=bbbbbbb222222222222222222222222222222222
+[orchestrator] live-reverify: V-2: gate re-verify RV-1 (round 1) @ bbbbbbb (already existed)
+[orchestrator] live-reverify: V-3: gate re-verify RV-2 (round 1) @ bbbbbbb (already existed)
+
+ ✓ lambda/orchestrator/verified-head-completion.test.mjs > completeWorkflow — the verified-head gate (FR-D1.9 wiring) > an untracked claim row still tells the story (fail-open, as the slot CAS does)
+stdout | lambda/orchestrator/verified-head-completion.test.mjs > completeWorkflow — the verified-head gate (FR-D1.9 wiring) > an unrecognized mode is OFF, not enforce — a typo cannot hold every run
+[orchestrator] Workflow wf_1 complete!
+
+ ✓ lambda/orchestrator/verified-head-completion.test.mjs > completeWorkflow — the verified-head gate (FR-D1.9 wiring) > an unrecognized mode is OFF, not enforce — a typo cannot hold every run
+stdout | lambda/orchestrator/verified-head-completion.test.mjs > completeWorkflow — the verified-head gate (FR-D1.9 wiring) > the mode defaults to shadow when the var is unset
+[orchestrator] wf_1: completion blocked (head-divergence) — qa=aaaaaaa111111111111111111111111111111111 ci=aaaaaaa111111111111111111111111111111111 pr=bbbbbbb222222222222222222222222222222222
+[orchestrator] Workflow wf_1 complete!
+
+ ✓ lambda/orchestrator/verified-head-completion.test.mjs > completeWorkflow — the verified-head gate (FR-D1.9 wiring) > the mode defaults to shadow when the var is unset
+
+ Test Files  1 passed (1)
+      Tests  40 passed (40)
+   Start at  05:22:25
+   Duration  3.57s (transform 534ms, setup 0ms, collect 222ms, tests 1.10s, environment 0ms, prepare 142ms)
+
+VITEST_EXIT=0
+
+--- (2) ASSERTION AUDIT ---
+
+The proving test is lambda/orchestrator/verified-head-completion.test.mjs:578-601. Verbatim:
+  it("enforce + divergence: one completion_blocked, no workflow.complete, one re-verify per stale persona", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    await loadWith("enforce");
+    const wf = { ...WF };
+    await completeWorkflow(wf);
+
+    // The refusal, once, on the epic — the same target the evidence gate publishes to.
+    const blocked = detailsOfType("orchestrator.completion_blocked");
+    expect(blocked).toHaveLength(1);
+    expect(blocked[0]).toMatchObject({
+      workflowId: "wf_1",
+      reason: "head-divergence",
+      heads: { qa: VERIFIED, ci: VERIFIED, pr: SHIPPED },
+      offenders: [],
+      mode: "enforce",
+    });
+
+    // …and NO green close: not the claim, not the event, not the finalize.
+    expect(h.state.storeCompletions).toHaveLength(0);
+    expect(detailsOfType("workflow.complete")).toHaveLength(0);
+    expect(h.state.finalized).toHaveLength(0);
+    expect(h.state.terminalClaims).toHaveLength(0);
+    expect(wf.phase).toBe("review"); // the run is left OPEN, not rewritten
+    expect(gate).toHaveBeenCalledTimes(1);
+
+  Both halves of item 7 are asserted EXACTLY, not approximately:
+    :586  expect(blocked).toHaveLength(1);                              <- emits completion_blocked
+    :597  expect(detailsOfType("workflow.complete")).toHaveLength(0);   <- NEVER workflow.complete
+  and the refusal is corroborated three further ways, so a green close cannot
+  slip through some other path:
+    :596  expect(h.state.storeCompletions).toHaveLength(0);
+    :598  expect(h.state.finalized).toHaveLength(0);
+    :599  expect(h.state.terminalClaims).toHaveLength(0);
+    :600  expect(wf.phase).toBe("review");   // left OPEN, not rewritten
+  :590 also pins heads = { qa, ci, pr } by value, which is item 3's heads-shape
+  requirement satisfied a second, independent time.
+
+*** MATERIAL DEVIATION — item 7 is true only under enforce ***
+Under the SHIPPED DEFAULT (shadow) the same head mismatch emits
+completion_blocked AND completes the run. lambda/orchestrator/verified-head-completion.test.mjs:697-715:
+  it("shadow: the refusal is observed and the run still completes", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    await loadWith("shadow");
+    const wf = { ...WF };
+    await completeWorkflow(wf);
+
+    const blocked = detailsOfType("orchestrator.completion_blocked");
+    expect(blocked).toHaveLength(1);
+    expect(blocked[0]).toMatchObject({ reason: "head-divergence", mode: "shadow" });
+    // Today's path, unchanged: claimed, published, finalized…
+    expect(h.state.storeCompletions).toHaveLength(1);
+    expect(detailsOfType("workflow.complete")).toHaveLength(1);
+    expect(h.state.finalized).toEqual(["wf_1"]);
+    expect(wf.phase).toBe("complete");
+    // …and NOTHING is written to the board: shadow observes, it does not remediate.
+    expect(h.state.createdTickets).toHaveLength(0);
+    expect(warn.mock.calls.some((c) => String(c[0]).includes("would be blocked on head-divergence (shadow)"))).toBe(true);
+    warn.mockRestore();
+  });
+
+  :708  expect(detailsOfType("workflow.complete")).toHaveLength(1);
+  So on a default-configured deployment, 'never workflow.complete' is FALSE.
+  The event is emitted as an observation and the run closes anyway. This is the
+  documented intent of shadow mode, and CLAUDE.md says the flags default to
+  shadow — but the acceptance sentence states an unconditional guarantee that
+  only holds at VERIFIED_HEAD_COMPLETION=enforce.
+
+  For completeness, off (:717-730) emits NOTHING and completes: :722 asserts the
+  gate is not even called, :724 zero completion_blocked, :728 one workflow.complete.
+
+--- (3) INDEPENDENT PROBE — probes/p-b-heads-pr.mjs (real completion.mjs + real dossier) ---
+=== P-B.1  the raw material: every done ticket's head-bearing fields ===
+  TEAM-4163 human:product-owner                    status=done  gate=n
+      commitSha=-  testedHead=-  mergeCommit=-  completedAt=2026-09-06T21:48:29.657Z
+  TEAM-4164 agentcore_hub_requirements_analyst     status=done  gate=n
+      commitSha=b7b4018  testedHead=-  mergeCommit=-  completedAt=2026-09-06T22:08:01.901Z
+  TEAM-4174 human:product-owner                    status=done  gate=n
+      commitSha=-  testedHead=-  mergeCommit=-  completedAt=2026-09-06T22:09:37.478Z
+  TEAM-4175 agentcore_hub_frontend_designer        status=done  gate=n
+      commitSha=d04b405  testedHead=-  mergeCommit=-  completedAt=2026-09-06T22:25:42.013Z
+  TEAM-4176 human:product-owner                    status=done  gate=n
+      commitSha=-  testedHead=-  mergeCommit=-  completedAt=2026-09-06T22:30:28.637Z
+  TEAM-4177 agentcore_hub_frontend_dev             status=done  gate=n
+      commitSha=001fe32  testedHead=-  mergeCommit=-  completedAt=2026-09-06T22:41:45.290Z
+  TEAM-4178 human:engineer                         status=done  gate=n
+      commitSha=-  testedHead=-  mergeCommit=-  completedAt=2026-09-06T22:45:24.962Z
+  TEAM-4179 agentcore_hub_frontend_dev             status=done  gate=n
+      commitSha=1dab069  testedHead=-  mergeCommit=-  completedAt=2026-09-06T23:04:05.598Z
+  TEAM-4180 agentcore_hub_code_reviewer            status=done  gate=Y
+      commitSha=933ea6f  testedHead=-  mergeCommit=-  completedAt=2026-09-06T23:19:19.285Z
+  TEAM-4181 agentcore_hub_qa_verifier              status=done  gate=Y
+      commitSha=12e9ac6  testedHead=-  mergeCommit=-  completedAt=2026-09-06T23:36:30.022Z
+  TEAM-4182 agentcore_hub_ci_agent                 status=done  gate=Y
+      commitSha=12e9ac6  testedHead=-  mergeCommit=-  completedAt=2026-09-06T23:42:11.075Z
+  TEAM-4183 agentcore_hub_frontend_dev             status=done  gate=n
+      commitSha=001259d  testedHead=-  mergeCommit=-  completedAt=2026-09-06T23:46:57.093Z
+
+=== P-B.2  evaluateVerifiedHeads on the dossier AS VENDORED (no opts) ===
+  {
+    "ok": true,
+    "reason": null,
+    "heads": {
+      "qa": null,
+      "ci": null,
+      "pr": "001259d6932c9c870889d74e0ac66673cfd7b49e"
+    },
+    "offenders": [],
+    "stalePersonas": []
+  }
+  heads.qa/heads.ci are NULL because the pre-D1 fixture has no testedHead field
+  anywhere — the exact hole D1 exists to close.
+
+=== P-B.3  with tested_head seeded (what the personas write under D1) ===
+  {
+    "ok": false,
+    "reason": "head-divergence",
+    "heads": {
+      "qa": "933ea6f1f04fc0212b88b84a6fcbe6aa0ce1d052",
+      "ci": "12e9ac6ef5081343701945e8a3b39803d9c53cc6",
+      "pr": "001259d6932c9c870889d74e0ac66673cfd7b49e"
+    },
+    "offenders": [],
+    "stalePersonas": [
+      "agentcore_hub_qa_verifier",
+      "agentcore_hub_ci_agent"
+    ]
+  }
+
+=== P-B.4  where did heads.pr come from? ===
+  2026-09-06T22:08:01.901Z  TEAM-4164 agentcore_hub_requirements_analyst b7b4018
+  2026-09-06T22:25:42.013Z  TEAM-4175 agentcore_hub_frontend_designer  d04b405
+  2026-09-06T22:41:45.290Z  TEAM-4177 agentcore_hub_frontend_dev       001fe32
+  2026-09-06T23:04:05.598Z  TEAM-4179 agentcore_hub_frontend_dev       1dab069
+  2026-09-06T23:46:57.093Z  TEAM-4183 agentcore_hub_frontend_dev       001259d
+  newest-by-completedAt = TEAM-4183 @ 001259d
+  heads.pr reported     = 001259d
+  MATCH? YES — heads.pr IS the latest non-gate (dev/fix) commitSha
+
+=== P-B.5  does a caller-supplied prHeadSha win? ===
+  heads.pr with opts.prHeadSha = deadbeefffffffffffffffffffffffffffffffff
+  => the opts path EXISTS and takes precedence (completion.mjs:700,707).
+
+=== P-B.6  is mergeCommit ever used? ===
+  agentTasks entries carrying a mergeCommit: 0
+  headFrom() for the pr slot reads ONLY ["commitSha","commit_sha"]
+  (completion.mjs:747) — mergeCommit is deliberately excluded.
+
+=== P-B VERDICT ===
+  heads.pr = normalizeHeadSha(opts.prHeadSha) when the CALLER supplies one,
+  else the newest `commitSha` on a done NON-GATE, non-human ticket — i.e. the
+  latest dev/fix task commit. It is NOT read from the actual PR or from the
+  integration branch head, and never from mergeCommit.
+  normalizeHeadSha sanity: "933ea6f"
+PROBE_EXIT=0
+
+  The probe independently reproduces the refusal from the real module: seeding only
+  the two tested_head fields the pre-D1 fixture lacks turns ok:true into
+  reason:'head-divergence' with stalePersonas [qa_verifier, ci_agent] — matching
+  the test's :605 expectation of exactly those two personas, in that order.
+
+--- ITEM 7 VERDICT: VERIFIED under enforce; the unconditional wording is wrong ---
+  'emits orchestrator.completion_blocked' : VERIFIED (exactly 1).
+  'never workflow.complete'               : VERIFIED under enforce; FALSE under the
+                                            shipped default shadow, where the run
+                                            still completes (asserted at :708).
+EXIT=0

@@ -1,0 +1,590 @@
+=== ITEM 5 — Replay f50ucz ship-review r1->r2: no regression; TEAM-4157 CI re-cert is orchestrator-created ===
+Named test: lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs
+
+--- (1) vitest run --reporter=verbose ---
+[33mThe CJS build of Vite's Node API is deprecated. See https://vite.dev/guide/troubleshooting.html#vite-cjs-node-api-deprecated for more details.[39m
+
+ RUN  v2.1.9 /mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub
+
+ ✓ lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs > f50ucz replay — the fixture still says what this replay claims > records a converging two-round ship review whose CI re-cert the agent filed itself
+ ✓ lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs > f50ucz replay — the fixture still says what this replay claims > reconstructs the ledger the RM reported: effective round count 1 of 3
+stdout | lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs > f50ucz replay — D1 leaves a converging ship review alone > ship-review round accounting is identical under VERDICT_GATE=enforce vs off
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 6 workflow definitions from S3
+[orchestrator] CD registry: 1 repo(s) registered for merge+deploy
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4125: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4155: NEW → todo
+[orchestrator] Tracked new ticket TEAM-4155 (agentcore_hub_backend_dev) in workflow wf_1788637257831_f50ucz
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4156: NEW → blocked
+[orchestrator] Tracked new ticket TEAM-4156 (agentcore_hub_backend_dev) in workflow wf_1788637257831_f50ucz
+[orchestrator] TEAM-4156: NEW → blocked is the gate's creation-time dependency block, not a review rejection — ignoring.
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4157: NEW → blocked
+[orchestrator] Tracked new ticket TEAM-4157 (agentcore_hub_ci_agent) in workflow wf_1788637257831_f50ucz
+[orchestrator] TEAM-4157: NEW → blocked is the gate's creation-time dependency block, not a review rejection — ignoring.
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4155: in_progress → done
+
+stderr | lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs > f50ucz replay — D1 leaves a converging ship review alone > ship-review round accounting is identical under VERDICT_GATE=enforce vs off
+[orchestrator] Manifest init failed (non-fatal): The specified key does not exist.
+[orchestrator] Error processing record: TypeError: Cannot read properties of null (reading 'send')
+    at Proxy.advancePhase (/mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/lambda/orchestrator/workflow-store.mjs:523:14)
+    at handleTicketReady (/mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/lambda/orchestrator/index.mjs:4719:17)
+    at processTicksAndRejections (node:internal/process/task_queues:95:5)
+    at processRecord (/mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/lambda/orchestrator/index.mjs:4421:9)
+    at handler (/mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/lambda/orchestrator/index.mjs:1950:7)
+    at shipAccountingTrace (/mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs:707:44)
+    at /mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs:720:17
+    at file:///mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/node_modules/@vitest/runner/dist/index.js:533:5
+    at runTest (file:///mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/node_modules/@vitest/runner/dist/index.js:1056:11)
+    at runSuite (file:///mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/node_modules/@vitest/runner/dist/index.js:1205:15)
+
+stdout | lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs > f50ucz replay — D1 leaves a converging ship review alone > ship-review round accounting is identical under VERDICT_GATE=enforce vs off
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4156: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4157: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4126: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4127: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4128: todo → done
+
+stderr | lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs > f50ucz replay — D1 leaves a converging ship review alone > ship-review round accounting is identical under VERDICT_GATE=enforce vs off
+[orchestrator] evidence harvest skipped for TEAM-4127: no readable completions/TEAM-4127.json
+[orchestrator] TEAM-4127: review_needed ack failed (non-fatal): Cannot read properties of null (reading 'send')
+
+stdout | lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs > f50ucz replay — D1 leaves a converging ship review alone > ship-review round accounting is identical under VERDICT_GATE=enforce vs off
+[orchestrator] Workflow wf_1788637257831_f50ucz complete!
+
+stdout | lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs > f50ucz replay — D1 leaves a converging ship review alone > ship-review round accounting is identical under VERDICT_GATE=enforce vs off
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 6 workflow definitions from S3
+[orchestrator] CD registry: 1 repo(s) registered for merge+deploy
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4125: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4155: NEW → todo
+[orchestrator] Tracked new ticket TEAM-4155 (agentcore_hub_backend_dev) in workflow wf_1788637257831_f50ucz
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4156: NEW → blocked
+[orchestrator] Tracked new ticket TEAM-4156 (agentcore_hub_backend_dev) in workflow wf_1788637257831_f50ucz
+[orchestrator] TEAM-4156: NEW → blocked is the gate's creation-time dependency block, not a review rejection — ignoring.
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4157: NEW → blocked
+[orchestrator] Tracked new ticket TEAM-4157 (agentcore_hub_ci_agent) in workflow wf_1788637257831_f50ucz
+[orchestrator] TEAM-4157: NEW → blocked is the gate's creation-time dependency block, not a review rejection — ignoring.
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4155: in_progress → done
+
+stderr | lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs > f50ucz replay — D1 leaves a converging ship review alone > ship-review round accounting is identical under VERDICT_GATE=enforce vs off
+[orchestrator] Manifest init failed (non-fatal): The specified key does not exist.
+[orchestrator] Error processing record: TypeError: Cannot read properties of null (reading 'send')
+    at Proxy.advancePhase (/mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/lambda/orchestrator/workflow-store.mjs:523:14)
+    at handleTicketReady (/mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/lambda/orchestrator/index.mjs:4719:17)
+    at processTicksAndRejections (node:internal/process/task_queues:95:5)
+    at processRecord (/mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/lambda/orchestrator/index.mjs:4421:9)
+    at handler (/mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/lambda/orchestrator/index.mjs:1950:7)
+    at shipAccountingTrace (/mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs:707:44)
+    at /mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs:724:21
+    at file:///mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/node_modules/@vitest/runner/dist/index.js:533:5
+    at runTest (file:///mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/node_modules/@vitest/runner/dist/index.js:1056:11)
+    at runSuite (file:///mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/node_modules/@vitest/runner/dist/index.js:1205:15)
+
+stdout | lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs > f50ucz replay — D1 leaves a converging ship review alone > ship-review round accounting is identical under VERDICT_GATE=enforce vs off
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4156: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4157: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4126: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4127: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4128: todo → done
+
+stderr | lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs > f50ucz replay — D1 leaves a converging ship review alone > ship-review round accounting is identical under VERDICT_GATE=enforce vs off
+[orchestrator] evidence harvest skipped for TEAM-4127: no readable completions/TEAM-4127.json
+[orchestrator] TEAM-4127: review_needed ack failed (non-fatal): Cannot read properties of null (reading 'send')
+
+stdout | lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs > f50ucz replay — D1 leaves a converging ship review alone > ship-review round accounting is identical under VERDICT_GATE=enforce vs off
+[orchestrator] Workflow wf_1788637257831_f50ucz complete!
+
+ ✓ lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs > f50ucz replay — D1 leaves a converging ship review alone > ship-review round accounting is identical under VERDICT_GATE=enforce vs off 4741ms
+stdout | lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs > f50ucz replay — D1 leaves a converging ship review alone > flags off reproduces the fixture's own cascade shape, with zero writes
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 6 workflow definitions from S3
+[orchestrator] CD registry: 1 repo(s) registered for merge+deploy
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4125: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4155: NEW → todo
+[orchestrator] Tracked new ticket TEAM-4155 (agentcore_hub_backend_dev) in workflow wf_1788637257831_f50ucz
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4156: NEW → blocked
+[orchestrator] Tracked new ticket TEAM-4156 (agentcore_hub_backend_dev) in workflow wf_1788637257831_f50ucz
+[orchestrator] TEAM-4156: NEW → blocked is the gate's creation-time dependency block, not a review rejection — ignoring.
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4157: NEW → blocked
+[orchestrator] Tracked new ticket TEAM-4157 (agentcore_hub_ci_agent) in workflow wf_1788637257831_f50ucz
+[orchestrator] TEAM-4157: NEW → blocked is the gate's creation-time dependency block, not a review rejection — ignoring.
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4155: in_progress → done
+
+stderr | lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs > f50ucz replay — D1 leaves a converging ship review alone > flags off reproduces the fixture's own cascade shape, with zero writes
+[orchestrator] Manifest init failed (non-fatal): The specified key does not exist.
+[orchestrator] Error processing record: TypeError: Cannot read properties of null (reading 'send')
+    at Proxy.advancePhase (/mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/lambda/orchestrator/workflow-store.mjs:523:14)
+    at handleTicketReady (/mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/lambda/orchestrator/index.mjs:4719:17)
+    at processTicksAndRejections (node:internal/process/task_queues:95:5)
+    at processRecord (/mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/lambda/orchestrator/index.mjs:4421:9)
+    at handler (/mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/lambda/orchestrator/index.mjs:1950:7)
+    at replayToRecert (/mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs:580:42)
+    at /mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs:737:5
+    at file:///mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/node_modules/@vitest/runner/dist/index.js:533:5
+    at runTest (file:///mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/node_modules/@vitest/runner/dist/index.js:1056:11)
+    at runSuite (file:///mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/node_modules/@vitest/runner/dist/index.js:1205:15)
+
+stdout | lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs > f50ucz replay — D1 leaves a converging ship review alone > flags off reproduces the fixture's own cascade shape, with zero writes
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4156: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4157: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4126: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4127: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4128: todo → done
+
+stderr | lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs > f50ucz replay — D1 leaves a converging ship review alone > flags off reproduces the fixture's own cascade shape, with zero writes
+[orchestrator] evidence harvest skipped for TEAM-4127: no readable completions/TEAM-4127.json
+[orchestrator] TEAM-4127: review_needed ack failed (non-fatal): Cannot read properties of null (reading 'send')
+
+stdout | lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs > f50ucz replay — D1 leaves a converging ship review alone > flags off reproduces the fixture's own cascade shape, with zero writes
+[orchestrator] Workflow wf_1788637257831_f50ucz complete!
+
+ ✓ lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs > f50ucz replay — D1 leaves a converging ship review alone > flags off reproduces the fixture's own cascade shape, with zero writes 2061ms
+stdout | lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs > f50ucz replay — D1 leaves a converging ship review alone > enforce does not hold the ship path on a mapped PASS
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 6 workflow definitions from S3
+[orchestrator] CD registry: 1 repo(s) registered for merge+deploy
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4125: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4155: NEW → todo
+[orchestrator] Tracked new ticket TEAM-4155 (agentcore_hub_backend_dev) in workflow wf_1788637257831_f50ucz
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4156: NEW → blocked
+[orchestrator] Tracked new ticket TEAM-4156 (agentcore_hub_backend_dev) in workflow wf_1788637257831_f50ucz
+[orchestrator] TEAM-4156: NEW → blocked is the gate's creation-time dependency block, not a review rejection — ignoring.
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4157: NEW → blocked
+[orchestrator] Tracked new ticket TEAM-4157 (agentcore_hub_ci_agent) in workflow wf_1788637257831_f50ucz
+[orchestrator] TEAM-4157: NEW → blocked is the gate's creation-time dependency block, not a review rejection — ignoring.
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4155: in_progress → done
+
+stderr | lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs > f50ucz replay — D1 leaves a converging ship review alone > enforce does not hold the ship path on a mapped PASS
+[orchestrator] Manifest init failed (non-fatal): The specified key does not exist.
+[orchestrator] Error processing record: TypeError: Cannot read properties of null (reading 'send')
+    at Proxy.advancePhase (/mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/lambda/orchestrator/workflow-store.mjs:523:14)
+    at handleTicketReady (/mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/lambda/orchestrator/index.mjs:4719:17)
+    at processTicksAndRejections (node:internal/process/task_queues:95:5)
+    at processRecord (/mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/lambda/orchestrator/index.mjs:4421:9)
+    at handler (/mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/lambda/orchestrator/index.mjs:1950:7)
+    at replayToRecert (/mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs:580:42)
+    at /mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs:761:5
+    at file:///mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/node_modules/@vitest/runner/dist/index.js:533:5
+    at runTest (file:///mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/node_modules/@vitest/runner/dist/index.js:1056:11)
+    at runSuite (file:///mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/node_modules/@vitest/runner/dist/index.js:1205:15)
+
+stdout | lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs > f50ucz replay — D1 leaves a converging ship review alone > enforce does not hold the ship path on a mapped PASS
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4156: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4157: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4126: todo → done
+
+ ✓ lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs > f50ucz replay — D1 leaves a converging ship review alone > enforce does not hold the ship path on a mapped PASS 354ms
+stdout | lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs > f50ucz replay — the release manager's verdict is mapped, not inferred > maps the r2 PASS and the CI re-cert off the declared field, with the reviewed head
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 6 workflow definitions from S3
+[orchestrator] CD registry: 1 repo(s) registered for merge+deploy
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4125: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4155: NEW → todo
+[orchestrator] Tracked new ticket TEAM-4155 (agentcore_hub_backend_dev) in workflow wf_1788637257831_f50ucz
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4156: NEW → blocked
+[orchestrator] Tracked new ticket TEAM-4156 (agentcore_hub_backend_dev) in workflow wf_1788637257831_f50ucz
+[orchestrator] TEAM-4156: NEW → blocked is the gate's creation-time dependency block, not a review rejection — ignoring.
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4157: NEW → blocked
+[orchestrator] Tracked new ticket TEAM-4157 (agentcore_hub_ci_agent) in workflow wf_1788637257831_f50ucz
+[orchestrator] TEAM-4157: NEW → blocked is the gate's creation-time dependency block, not a review rejection — ignoring.
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4155: in_progress → done
+
+stderr | lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs > f50ucz replay — the release manager's verdict is mapped, not inferred > maps the r2 PASS and the CI re-cert off the declared field, with the reviewed head
+[orchestrator] Manifest init failed (non-fatal): The specified key does not exist.
+[orchestrator] Error processing record: TypeError: Cannot read properties of null (reading 'send')
+    at Proxy.advancePhase (/mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/lambda/orchestrator/workflow-store.mjs:523:14)
+    at handleTicketReady (/mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/lambda/orchestrator/index.mjs:4719:17)
+    at processTicksAndRejections (node:internal/process/task_queues:95:5)
+    at processRecord (/mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/lambda/orchestrator/index.mjs:4421:9)
+    at handler (/mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/lambda/orchestrator/index.mjs:1950:7)
+    at replayToRecert (/mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs:580:42)
+    at /mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs:779:5
+    at file:///mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/node_modules/@vitest/runner/dist/index.js:533:5
+    at runTest (file:///mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/node_modules/@vitest/runner/dist/index.js:1056:11)
+    at runSuite (file:///mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/node_modules/@vitest/runner/dist/index.js:1205:15)
+
+stdout | lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs > f50ucz replay — the release manager's verdict is mapped, not inferred > maps the r2 PASS and the CI re-cert off the declared field, with the reviewed head
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4156: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4157: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4126: todo → done
+
+ ✓ lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs > f50ucz replay — the release manager's verdict is mapped, not inferred > maps the r2 PASS and the CI re-cert off the declared field, with the reviewed head 356ms
+stdout | lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs > f50ucz replay — the release manager's verdict is mapped, not inferred > maps the ledger's hyphen spelling and PASS-with-known-findings, both declared
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 6 workflow definitions from S3
+[orchestrator] CD registry: 1 repo(s) registered for merge+deploy
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4125: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4155: NEW → todo
+[orchestrator] Tracked new ticket TEAM-4155 (agentcore_hub_backend_dev) in workflow wf_1788637257831_f50ucz
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4156: NEW → blocked
+[orchestrator] Tracked new ticket TEAM-4156 (agentcore_hub_backend_dev) in workflow wf_1788637257831_f50ucz
+[orchestrator] TEAM-4156: NEW → blocked is the gate's creation-time dependency block, not a review rejection — ignoring.
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4157: NEW → blocked
+[orchestrator] Tracked new ticket TEAM-4157 (agentcore_hub_ci_agent) in workflow wf_1788637257831_f50ucz
+[orchestrator] TEAM-4157: NEW → blocked is the gate's creation-time dependency block, not a review rejection — ignoring.
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4155: in_progress → done
+
+stderr | lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs > f50ucz replay — the release manager's verdict is mapped, not inferred > maps the ledger's hyphen spelling and PASS-with-known-findings, both declared
+[orchestrator] Manifest init failed (non-fatal): The specified key does not exist.
+[orchestrator] Error processing record: TypeError: Cannot read properties of null (reading 'send')
+    at Proxy.advancePhase (/mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/lambda/orchestrator/workflow-store.mjs:523:14)
+    at handleTicketReady (/mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/lambda/orchestrator/index.mjs:4719:17)
+    at processTicksAndRejections (node:internal/process/task_queues:95:5)
+    at processRecord (/mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/lambda/orchestrator/index.mjs:4421:9)
+    at handler (/mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/lambda/orchestrator/index.mjs:1950:7)
+    at replayToRecert (/mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs:580:42)
+    at /mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs:806:5
+    at file:///mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/node_modules/@vitest/runner/dist/index.js:533:5
+    at runTest (file:///mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/node_modules/@vitest/runner/dist/index.js:1056:11)
+    at runSuite (file:///mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/node_modules/@vitest/runner/dist/index.js:1205:15)
+
+stdout | lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs > f50ucz replay — the release manager's verdict is mapped, not inferred > maps the ledger's hyphen spelling and PASS-with-known-findings, both declared
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4156: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4157: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4126: todo → done
+
+stdout | lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs > f50ucz replay — the release manager's verdict is mapped, not inferred > maps the ledger's hyphen spelling and PASS-with-known-findings, both declared
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 6 workflow definitions from S3
+[orchestrator] CD registry: 1 repo(s) registered for merge+deploy
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4125: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4155: NEW → todo
+[orchestrator] Tracked new ticket TEAM-4155 (agentcore_hub_backend_dev) in workflow wf_1788637257831_f50ucz
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4156: NEW → blocked
+[orchestrator] Tracked new ticket TEAM-4156 (agentcore_hub_backend_dev) in workflow wf_1788637257831_f50ucz
+[orchestrator] TEAM-4156: NEW → blocked is the gate's creation-time dependency block, not a review rejection — ignoring.
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4157: NEW → blocked
+[orchestrator] Tracked new ticket TEAM-4157 (agentcore_hub_ci_agent) in workflow wf_1788637257831_f50ucz
+[orchestrator] TEAM-4157: NEW → blocked is the gate's creation-time dependency block, not a review rejection — ignoring.
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4155: in_progress → done
+
+stderr | lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs > f50ucz replay — the release manager's verdict is mapped, not inferred > maps the ledger's hyphen spelling and PASS-with-known-findings, both declared
+[orchestrator] Manifest init failed (non-fatal): The specified key does not exist.
+[orchestrator] Error processing record: TypeError: Cannot read properties of null (reading 'send')
+    at Proxy.advancePhase (/mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/lambda/orchestrator/workflow-store.mjs:523:14)
+    at handleTicketReady (/mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/lambda/orchestrator/index.mjs:4719:17)
+    at processTicksAndRejections (node:internal/process/task_queues:95:5)
+    at processRecord (/mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/lambda/orchestrator/index.mjs:4421:9)
+    at handler (/mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/lambda/orchestrator/index.mjs:1950:7)
+    at replayToRecert (/mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs:580:42)
+    at /mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs:821:5
+    at file:///mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/node_modules/@vitest/runner/dist/index.js:533:5
+    at runTest (file:///mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/node_modules/@vitest/runner/dist/index.js:1056:11)
+    at runSuite (file:///mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/node_modules/@vitest/runner/dist/index.js:1205:15)
+
+stdout | lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs > f50ucz replay — the release manager's verdict is mapped, not inferred > maps the ledger's hyphen spelling and PASS-with-known-findings, both declared
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4156: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4157: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4126: todo → done
+
+ ✓ lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs > f50ucz replay — the release manager's verdict is mapped, not inferred > maps the ledger's hyphen spelling and PASS-with-known-findings, both declared 736ms
+stdout | lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs > f50ucz replay — a non-PASS ship round's re-verify comes from the factory > files exactly one ship_fix re-verify, blocked on every fix still open under the epic
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 6 workflow definitions from S3
+[orchestrator] CD registry: 1 repo(s) registered for merge+deploy
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4125: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4155: NEW → todo
+[orchestrator] Tracked new ticket TEAM-4155 (agentcore_hub_backend_dev) in workflow wf_1788637257831_f50ucz
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4156: NEW → blocked
+[orchestrator] Tracked new ticket TEAM-4156 (agentcore_hub_backend_dev) in workflow wf_1788637257831_f50ucz
+[orchestrator] TEAM-4156: NEW → blocked is the gate's creation-time dependency block, not a review rejection — ignoring.
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4157: NEW → blocked
+[orchestrator] Tracked new ticket TEAM-4157 (agentcore_hub_ci_agent) in workflow wf_1788637257831_f50ucz
+[orchestrator] TEAM-4157: NEW → blocked is the gate's creation-time dependency block, not a review rejection — ignoring.
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4155: in_progress → done
+
+stderr | lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs > f50ucz replay — a non-PASS ship round's re-verify comes from the factory > files exactly one ship_fix re-verify, blocked on every fix still open under the epic
+[orchestrator] Manifest init failed (non-fatal): The specified key does not exist.
+[orchestrator] Error processing record: TypeError: Cannot read properties of null (reading 'send')
+    at Proxy.advancePhase (/mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/lambda/orchestrator/workflow-store.mjs:523:14)
+    at handleTicketReady (/mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/lambda/orchestrator/index.mjs:4719:17)
+    at processTicksAndRejections (node:internal/process/task_queues:95:5)
+    at processRecord (/mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/lambda/orchestrator/index.mjs:4421:9)
+    at handler (/mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/lambda/orchestrator/index.mjs:1950:7)
+    at replayToRecert (/mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs:580:42)
+    at r1Close (/mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs:839:5)
+    at /mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs:849:5
+    at file:///mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/node_modules/@vitest/runner/dist/index.js:533:5
+    at runTest (file:///mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/node_modules/@vitest/runner/dist/index.js:1056:11)
+
+stdout | lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs > f50ucz replay — a non-PASS ship round's re-verify comes from the factory > files exactly one ship_fix re-verify, blocked on every fix still open under the epic
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4156: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4157: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4126: todo → done
+[orchestrator] live-reverify: TEAM-4126: gate re-verify TEAM-4161 (round 2) @ df1ed19
+
+ ✓ lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs > f50ucz replay — a non-PASS ship round's re-verify comes from the factory > files exactly one ship_fix re-verify, blocked on every fix still open under the epic 364ms
+stdout | lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs > f50ucz replay — a non-PASS ship round's re-verify comes from the factory > does not file a second one when the same round is redelivered
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 6 workflow definitions from S3
+[orchestrator] CD registry: 1 repo(s) registered for merge+deploy
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4125: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4155: NEW → todo
+[orchestrator] Tracked new ticket TEAM-4155 (agentcore_hub_backend_dev) in workflow wf_1788637257831_f50ucz
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4156: NEW → blocked
+[orchestrator] Tracked new ticket TEAM-4156 (agentcore_hub_backend_dev) in workflow wf_1788637257831_f50ucz
+[orchestrator] TEAM-4156: NEW → blocked is the gate's creation-time dependency block, not a review rejection — ignoring.
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4157: NEW → blocked
+[orchestrator] Tracked new ticket TEAM-4157 (agentcore_hub_ci_agent) in workflow wf_1788637257831_f50ucz
+[orchestrator] TEAM-4157: NEW → blocked is the gate's creation-time dependency block, not a review rejection — ignoring.
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4155: in_progress → done
+
+stderr | lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs > f50ucz replay — a non-PASS ship round's re-verify comes from the factory > does not file a second one when the same round is redelivered
+[orchestrator] Manifest init failed (non-fatal): The specified key does not exist.
+[orchestrator] Error processing record: TypeError: Cannot read properties of null (reading 'send')
+    at Proxy.advancePhase (/mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/lambda/orchestrator/workflow-store.mjs:523:14)
+    at handleTicketReady (/mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/lambda/orchestrator/index.mjs:4719:17)
+    at processTicksAndRejections (node:internal/process/task_queues:95:5)
+    at processRecord (/mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/lambda/orchestrator/index.mjs:4421:9)
+    at handler (/mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/lambda/orchestrator/index.mjs:1950:7)
+    at replayToRecert (/mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs:580:42)
+    at r1Close (/mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs:839:5)
+    at /mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs:880:5
+    at file:///mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/node_modules/@vitest/runner/dist/index.js:533:5
+    at runTest (file:///mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/node_modules/@vitest/runner/dist/index.js:1056:11)
+
+stdout | lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs > f50ucz replay — a non-PASS ship round's re-verify comes from the factory > does not file a second one when the same round is redelivered
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4156: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4157: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4126: todo → done
+[orchestrator] live-reverify: TEAM-4126: gate re-verify TEAM-4161 (round 2) @ df1ed19
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4126: in_progress → done
+[orchestrator] live-reverify: TEAM-4126: gate re-verify TEAM-4161 (round 3) @ df1ed19 (already existed)
+
+ ✓ lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs > f50ucz replay — a non-PASS ship round's re-verify comes from the factory > does not file a second one when the same round is redelivered 390ms
+
+ Test Files  1 passed (1)
+      Tests  9 passed (9)
+   Start at  05:18:07
+   Duration  11.49s (transform 512ms, setup 0ms, collect 260ms, tests 9.01s, environment 0ms, prepare 143ms)
+
+VITEST_EXIT=0
+
+--- (2) ASSERTION AUDIT ---
+
+CLAUSE 1 — 'no regression'. VERIFIED, and by the strongest available form:
+lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs:719-733
+  it("ship-review round accounting is identical under VERDICT_GATE=enforce vs off", async () => {
+    const off = await shipAccountingTrace(ALL_OFF);
+
+    // A fresh board/workflow for the second pass — beforeEach only runs once per it.
+    Object.assign(h.state, { board: buildBoard(), workflow: buildWorkflow(), ebEvents: [], createdTickets: [], blockerWrites: [], statusWrites: [], reverifySlots: new Set(), reverifySlotClaims: [], nextTicketNum: 0 });
+    const enforce = await shipAccountingTrace(ENFORCE_VERDICT_ONLY);
+
+    expect(enforce).toEqual(off);
+    // And the trace is not vacuous: the ledger is the RM's, the run ships.
+    expect(off.map((s) => s.effective)).toEqual([1, 1, 1, 1, 1, 1]);
+    expect(off.at(-1).shipVerdictOfShip).toBe("shipped");
+    expect(off.at(-1).ship).toMatchObject({ required: true, shipped: true, offenders: [] });
+    // Two full passes, each paying COMPLETION_RECHECK_DELAY_MS on every fix-phase
+    // trigger — the real re-read guard, not a harness sleep, so it is waited out.
+  }, 60_000);
+
+  expect(enforce).toEqual(off) at :726 is a full trace-equality between the two
+  modes — not a spot check — and :728-730 prove the trace is non-vacuous (the run
+  actually ships). Reinforced by :735-757:
+    expect(cascadeShape()).toEqual(fixtureCascadeShape());
+    // Which is to say: the ship path released each successor in turn and closed.
+    expect(detailsOfType("orchestrator.unblocked").map((u) => u.ticketId)).toEqual([SHIP, FIX2, RECERT, APPROVAL, CD]);
+    expect(detailsOfType("workflow.complete")).toHaveLength(1);
+
+    // Nothing D1 owns fired, and nothing D1 owns wrote.
+    for (const type of [
+      "orchestrator.verdict_observed",
+      "orchestrator.verdict_suppressed",
+      "orchestrator.fix_before_verify_observed",
+      "orchestrator.completion_blocked",
+      "fix.reverify_created",
+    ]) {
+      expect(detailsOfType(type)).toEqual([]);
+    }
+    expect(h.state.createdTickets).toEqual([]);
+    expect(h.state.blockerWrites).toEqual([]);
+  });
+  and by :759-770, which proves enforce does not hold a mapped PASS:
+    expect(detailsOfType("orchestrator.unblocked").map((u) => u.ticketId)).toEqual([APPROVAL]);
+    expect(detailsOfType("orchestrator.verdict_suppressed")).toEqual([]);
+    expect(h.state.board.get(APPROVAL).blockedBy).toEqual([SHIP]);
+    expect(reverifyTickets()).toEqual([]);
+
+CLAUSE 2 — 'TEAM-4157 CI re-cert is orchestrator-created'. CONTRADICTED.
+The named test asserts the OPPOSITE, and says so in its own name:
+646:  it("records a converging two-round ship review whose CI re-cert the agent filed itself", () => {
+lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs:660-665
+    expect(fixtureTicket(RECERT).assignee).toBe(CI_AGENT_ID);
+    expect(fixtureTicket(RECERT).blockedBy).toEqual([FIX1, FIX2]);
+
+    // Hole H1 again, and the pre-contract markers this replay synthesizes.
+    for (const id of [SHIP, RECERT, CI1]) expect(fixtureCompletion(id).verdict).toBeUndefined();
+    for (const id of [FIX1, FIX2, RECERT]) expect(fixtureTicket(id).spawnedBy ?? null).toBeNull();
+
+  :665 asserts spawnedBy is NULL for TEAM-4157 — i.e. NO orchestrator lineage
+  stamp — which is precisely the marker of an AGENT-filed ticket. The test's own
+  header comment states it outright (lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs:829-834):
+  /**
+   * FR-D1.13's regression claim, on the counterfactual r1 close: TEAM-4157 was
+   * filed BY the release manager (spawnedBy null, no reverify marker, no slot
+   * claim). Under D1 the orchestrator files the re-verification itself, through
+   * live-reverify.mjs's factory — one ticket per (gate, head), stamped
+   * `reverify: true` in the gate owner's own fix lineage so completion.mjs's
+   * open-fix gate counts it while the rework-loop cap does not.
+   */
+
+  Read carefully, the code does the RIGHT thing and the acceptance text is simply
+  written wrong. Three separate ways it does not match:
+    (a) TEAM-4157 itself is and remains agent-filed. Nothing in D1 retro-creates it.
+    (b) On the ACTUAL converging r1->r2 path the orchestrator files NOTHING:
+        :769  expect(reverifyTickets()).toEqual([]);
+        An orchestrator re-verify appears only in a COUNTERFACTUAL r1 close that
+        the test constructs by rewinding TEAM-4155/4156 to in_progress (:836-845).
+    (c) When the orchestrator DOES file one, it is not a CI re-cert. It is assigned
+        to the RELEASE MANAGER with kind ship_fix (:853-861), because live-reverify
+        keys the ticket to the GATE OWNER, and the ship round's owner is the RM.
+        A CI re-certification ticket assigned to agentcore_hub_ci_agent is never
+        produced by this path.
+
+  ALSO: that assertion requires process.env.LIVE_REVERIFY = 'enforce' (:848), an
+  EIGHTH flag that is NOT in item 16's list of seven. LIVE_REVERIFY is pre-existing
+  and defaults to off (index.mjs:238, :1336 'if (LIVE_REVERIFY === "off") return'),
+  so at shipped defaults the orchestrator files no ship re-verify at all.
+
+--- (3) INDEPENDENT PROBE — probes/item-05-recert-origin.mjs ---
+=== item-5.0  vendored f50ucz fixtures ===
+  f50ucz-dossier.json
+
+=== item-5.1  TEAM-4157 as the fixture records it ===
+  ticketId   TEAM-4157
+  title      Fix (CI): re-certify the shared branch head after ship-review r1 fixes (TEAM-4155, TEAM-4156) — SHA cross-check for round 2
+  assignee   agentcore_hub_ci_agent
+  blockedBy  ["TEAM-4155","TEAM-4156"]
+  spawnedBy  null
+  => spawnedBy is NULL — no orchestrator lineage stamp, i.e. AGENT-FILED
+
+=== item-5.2  what the orchestrator files instead (real GATE_OWNER_FIX_KIND) ===
+  agentcore_hub_code_reviewer            -> review_fix
+  agentcore_hub_qa_verifier              -> qa_fix
+  agentcore_hub_ci_agent                 -> ci_fix
+  agentcore_hub_release_manager          -> ship_fix
+  A ship round is owned by agentcore_hub_release_manager, so an orchestrator-filed
+  re-verify is assigned to the RELEASE MANAGER with kind ship_fix and the title
+  'Re-verify (round N)' — it is NOT a CI re-certification ticket.
+
+=== item-5.3  which f50ucz tickets carry an orchestrator lineage stamp? ===
+  TEAM-4117 agentcore_hub_requirements_analyst     spawnedBy=null
+  TEAM-4118 agentcore_hub_backend_designer         spawnedBy=null
+  TEAM-4119 agentcore_hub_security_reviewer        spawnedBy=null
+  TEAM-4120 agentcore_hub_backend_dev              spawnedBy=null
+  TEAM-4121 agentcore_hub_backend_dev              spawnedBy=null
+  TEAM-4122 agentcore_hub_backend_dev              spawnedBy=null
+  TEAM-4123 agentcore_hub_code_reviewer            spawnedBy=null
+  TEAM-4124 agentcore_hub_qa_verifier              spawnedBy=null
+  TEAM-4125 agentcore_hub_ci_agent                 spawnedBy=null
+  TEAM-4126 agentcore_hub_release_manager          spawnedBy=null
+  TEAM-4127 human:engineer                         spawnedBy=null
+  TEAM-4128 agentcore_hub_release_manager          spawnedBy=null
+  TEAM-4129 agentcore_hub_backend_dev              spawnedBy=null
+  TEAM-4130 agentcore_hub_backend_dev              spawnedBy=null
+  TEAM-4131 agentcore_hub_backend_dev              spawnedBy=null
+  TEAM-4155 agentcore_hub_backend_dev              spawnedBy=null
+  TEAM-4156 agentcore_hub_backend_dev              spawnedBy=null
+  TEAM-4157 agentcore_hub_ci_agent                 spawnedBy=null
+  TEAM-4158 agentcore_hub_backend_dev              spawnedBy=null
+  TEAM-4159 agentcore_hub_backend_dev              spawnedBy=null
+  TEAM-4116 undefined                              spawnedBy=null
+  tickets with a spawnedBy stamp: 0 of 21
+
+=== item-5 VERDICT ===
+  clause 'no regression': see the test assertion expect(enforce).toEqual(off).
+  clause 'TEAM-4157 CI re-cert is orchestrator-created': CONTRADICTED.
+    TEAM-4157 is agent-filed in the fixture (spawnedBy null), and on the
+    converging r1->r2 path the orchestrator files NOTHING at all.
+PROBE_EXIT=0
+
+--- ITEM 5 VERDICT: PARTIAL ---
+  Clause 1 (no regression r1->r2): VERIFIED. Trace-equality enforce vs off.
+  Clause 2 (TEAM-4157 CI re-cert is orchestrator-created): FAILED AS WORDED.
+    The fixture ticket is agent-filed (spawnedBy null, 0 of 21 f50ucz tickets carry
+    a stamp); the converging path creates no re-verify; and the re-verify the
+    orchestrator does create under a counterfactual + LIVE_REVERIFY=enforce is a
+    release-manager ship_fix, not a CI re-cert. The underlying capability exists
+    and is tested; the acceptance sentence describes it inaccurately.
+EXIT=0

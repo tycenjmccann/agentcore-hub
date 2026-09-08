@@ -1,0 +1,53 @@
+=== ITEM 3 (D1) — workflow.complete refused while QA head 933ea6f and PR head 001259d; EXACTLY ONE completion_blocked{reason,heads} ===
+Named file: lambda/orchestrator/replay-dowtdh-verdict-gate.test.mjs  test (c)
+
+--- 1. verbose run: the (c) test ---
+ ✓ lambda/orchestrator/replay-dowtdh-verdict-gate.test.mjs > dowtdh replay — the D1 flags > (c) enforce: workflow.complete count 0 and exactly ONE orchestrator.completion_blocked with heads.qa 933ea6f, heads.pr 001259d, reason head-divergence
+
+--- 2. the ACTUAL assertions (lines 833-852) ---
+  it("(c) enforce: workflow.complete count 0 and exactly ONE orchestrator.completion_blocked with heads.qa 933ea6f, heads.pr 001259d, reason head-divergence", async () => {
+    await loadWith({ verdict: "off", fixBefore: "off", verifiedHead: "enforce" });
+    await replay();
+
+    expect(detailsOfType("workflow.complete")).toHaveLength(0);
+    expect(h.state.storeCompletions).toEqual([]);
+    expect(h.state.finalized).toEqual([]);
+
+    const blocked = detailsOfType("orchestrator.completion_blocked");
+    expect(blocked).toHaveLength(1);
+    expect(blocked[0]).toMatchObject({ workflowId: WF_ID, reason: "head-divergence", mode: "enforce" });
+    expect(blocked[0].heads.qa.startsWith("933ea6f")).toBe(true); // the head QA was told to re-run at
+    expect(blocked[0].heads.ci.startsWith("12e9ac6")).toBe(true); // the head CI actually certified
+    expect(blocked[0].heads.pr.startsWith("001259d")).toBe(true); // the head that shipped
+    expect(blocked[0].heads.qa).toBe(CODE_HEAD);
+    expect(blocked[0].heads.pr).toBe(SHIPPED_HEAD);
+
+    // The run is left OPEN for the remediation, not rewritten to a terminal state.
+    expect(h.state.workflow.phase).not.toBe("complete");
+  });
+
+--- 3. assertion audit — count === 1, and heads has qa/ci/pr? ---
+  BOTH REQUESTED CHECKS CONFIRMED PRESENT AND EXACT:
+
+  (i) the count assertion IS an exact 1, not a >=1:
+      L842  expect(blocked).toHaveLength(1);
+      toHaveLength(1) is an equality on .length, so a second emit fails the test.
+      Refusal is asserted three independent ways, not just by absence of an event:
+      L837  expect(detailsOfType("workflow.complete")).toHaveLength(0);
+      L838  expect(h.state.storeCompletions).toEqual([]);
+      L839  expect(h.state.finalized).toEqual([]);
+      L851  expect(h.state.workflow.phase).not.toBe("complete");
+
+  (ii) `heads` carries all three slots, each asserted by VALUE:
+      L844  blocked[0].heads.qa.startsWith("933ea6f") === true    <- the QA head
+      L845  blocked[0].heads.ci.startsWith("12e9ac6") === true    <- the CI head
+      L846  blocked[0].heads.pr.startsWith("001259d") === true    <- the shipped head
+      L847  blocked[0].heads.qa === CODE_HEAD      (full-sha identity, not prefix)
+      L848  blocked[0].heads.pr === SHIPPED_HEAD
+      and `reason` at L843: toMatchObject({ workflowId, reason: "head-divergence", mode: "enforce" })
+
+  The two heads the acceptance text names (QA 933ea6f, PR 001259d) are exactly the
+  two asserted at L844/L846 and pinned to full SHAs at L847/L848.
+
+  VERDICT: VERIFIED, with the count assertion confirmed to be an exact-one.
+EXIT=0

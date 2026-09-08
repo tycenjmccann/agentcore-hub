@@ -1,0 +1,692 @@
+=== ITEM 4 — Replay c2uqki: QA held until TEAM-4241 completes; CI until TEAM-4242; CI observes no mid-run head move (16fc41d -> 73f0056) ===
+Named tests: lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs, lambda/orchestrator/fix-before-verify.test.mjs
+
+--- (1) vitest run --reporter=verbose ---
+[33mThe CJS build of Vite's Node API is deprecated. See https://vite.dev/guide/troubleshooting.html#vite-cjs-node-api-deprecated for more details.[39m
+
+ RUN  v2.1.9 /mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub
+
+ ✓ lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — the fixture still says what this replay claims > records a sweep that removed nothing, in prose only
+ ✓ lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — the fixture still says what this replay claims > spent four personas and two fix tickets on it, then reported a completed delivery
+stdout | lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > enforce — the orchestrator ends the run at the detection ticket > closes the run as nothing-to-remove, carrying the yield on the event
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 6 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4229: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4230: in_progress → done
+[orchestrator] Workflow wf_1788780725940_c2uqki closed nothing-to-remove (nothing shipped): TEAM-4230 verified 0 removable of 93 candidate(s)
+
+ ✓ lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > enforce — the orchestrator ends the run at the detection ticket > closes the run as nothing-to-remove, carrying the yield on the event 603ms
+stdout | lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > enforce — the orchestrator ends the run at the detection ticket > labels the sweep PR sweep:no-op
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 6 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4229: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4230: in_progress → done
+[orchestrator] Workflow wf_1788780725940_c2uqki closed nothing-to-remove (nothing shipped): TEAM-4230 verified 0 removable of 93 candidate(s)
+
+ ✓ lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > enforce — the orchestrator ends the run at the detection ticket > labels the sweep PR sweep:no-op
+stdout | lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > enforce — the orchestrator ends the run at the detection ticket > dispatches NOBODY — no reviewer, no QA verifier, no CI agent
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 6 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4229: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4230: in_progress → done
+[orchestrator] Workflow wf_1788780725940_c2uqki closed nothing-to-remove (nothing shipped): TEAM-4230 verified 0 removable of 93 candidate(s)
+
+ ✓ lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > enforce — the orchestrator ends the run at the detection ticket > dispatches NOBODY — no reviewer, no QA verifier, no CI agent
+stdout | lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > enforce — the orchestrator ends the run at the detection ticket > refuses a late ready/todo delivery for the reviewer once the run is closed
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 6 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4229: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4230: in_progress → done
+[orchestrator] Workflow wf_1788780725940_c2uqki closed nothing-to-remove (nothing shipped): TEAM-4230 verified 0 removable of 93 candidate(s)
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4231: blocked → ready
+[orchestrator] GUARD: Skipping invocation for TEAM-4231 — workflow wf_1788780725940_c2uqki is nothing-to-remove
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4231: blocked → todo
+[orchestrator] GUARD: Skipping invocation for TEAM-4231 — workflow wf_1788780725940_c2uqki is nothing-to-remove
+
+ ✓ lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > enforce — the orchestrator ends the run at the detection ticket > refuses a late ready/todo delivery for the reviewer once the run is closed
+stdout | lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > enforce — the orchestrator ends the run at the detection ticket > one close, whichever twin delivers it (redelivery + the webhook twin)
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 6 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4229: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4230: in_progress → done
+[orchestrator] Workflow wf_1788780725940_c2uqki closed nothing-to-remove (nothing shipped): TEAM-4230 verified 0 removable of 93 candidate(s)
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4230: in_progress → done
+[orchestrator] Workflow wf_1788780725940_c2uqki already terminal — skipping duplicate nothing-to-remove close.
+[orchestrator] TEAM-4230 already marked complete — skipping duplicate cascade.
+
+ ✓ lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > enforce — the orchestrator ends the run at the detection ticket > one close, whichever twin delivers it (redelivery + the webhook twin)
+stdout | lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > shadow (the default) — observed, and the run goes on > publishes sweep.detection_observed once and still cascades
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 6 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4229: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4230: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4241: NEW → todo
+[orchestrator] Tracked new ticket TEAM-4241 (agentcore_hub_code_sweeper) in workflow wf_1788780725940_c2uqki
+[orchestrator] Initialized manifest for wf_1788780725940_c2uqki
+[orchestrator] Invoking agent agentcore_hub_code_sweeper for ticket TEAM-4241
+[orchestrator] Using Harness for agentcore_hub_code_sweeper
+[orchestrator] Async invoke sent for agentcore_hub_code_sweeper (session: TEAM-4241_wf_1788780725940_c2uqki-agentcore_hub_code_sweeper-1788844615633)
+[orchestrator] Recorded session for agentcore_hub_code_sweeper in manifest
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4231: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4241: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4242: NEW → blocked
+[orchestrator] Tracked new ticket TEAM-4242 (agentcore_hub_code_sweeper) in workflow wf_1788780725940_c2uqki
+[orchestrator] TEAM-4242: NEW → blocked is the gate's creation-time dependency block, not a review rejection — ignoring.
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4232: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4242: blocked → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4233: todo → done
+
+stdout | lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > shadow (the default) — observed, and the run goes on > publishes sweep.detection_observed once and still cascades
+[orchestrator] Workflow wf_1788780725940_c2uqki complete!
+
+ ✓ lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > shadow (the default) — observed, and the run goes on > publishes sweep.detection_observed once and still cascades 1560ms
+stdout | lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > shadow (the default) — observed, and the run goes on > tells the QA verifier and the CI agent the diff is deletion-free, and the reviewer the opposite
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 6 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4229: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4230: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4231: blocked → ready
+[orchestrator] Initialized manifest for wf_1788780725940_c2uqki
+[orchestrator] Invoking agent agentcore_hub_code_reviewer for ticket TEAM-4231
+[orchestrator] Using Harness for agentcore_hub_code_reviewer
+[orchestrator] Async invoke sent for agentcore_hub_code_reviewer (session: TEAM-4231_wf_1788780725940_c2uqki-agentcore_hub_code_reviewer-1788844617190)
+[orchestrator] Recorded session for agentcore_hub_code_reviewer in manifest
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4231: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4232: blocked → ready
+[orchestrator] Initialized manifest for wf_1788780725940_c2uqki
+[orchestrator] Invoking agent agentcore_hub_qa_verifier for ticket TEAM-4232
+[orchestrator] Using Harness for agentcore_hub_qa_verifier
+[orchestrator] Async invoke sent for agentcore_hub_qa_verifier (session: TEAM-4232_wf_1788780725940_c2uqki-agentcore_hub_qa_verifier-1788844617191)
+[orchestrator] Recorded session for agentcore_hub_qa_verifier in manifest
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4232: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4233: blocked → ready
+[orchestrator] Initialized manifest for wf_1788780725940_c2uqki
+[orchestrator] Invoking agent agentcore_hub_ci_agent for ticket TEAM-4233
+[orchestrator] Using Harness for agentcore_hub_ci_agent
+[orchestrator] Async invoke sent for agentcore_hub_ci_agent (session: TEAM-4233_wf_1788780725940_c2uqki-agentcore_hub_ci_agent-1788844617192)
+[orchestrator] Recorded session for agentcore_hub_ci_agent in manifest
+
+ ✓ lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > shadow (the default) — observed, and the run goes on > tells the QA verifier and the CI agent the diff is deletion-free, and the reviewer the opposite
+stdout | lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > shadow (the default) — observed, and the run goes on > dispatches exactly one CI ticket
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 6 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4229: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4230: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4231: blocked → ready
+[orchestrator] Initialized manifest for wf_1788780725940_c2uqki
+[orchestrator] Invoking agent agentcore_hub_code_reviewer for ticket TEAM-4231
+[orchestrator] Using Harness for agentcore_hub_code_reviewer
+[orchestrator] Async invoke sent for agentcore_hub_code_reviewer (session: TEAM-4231_wf_1788780725940_c2uqki-agentcore_hub_code_reviewer-1788844617250)
+[orchestrator] Recorded session for agentcore_hub_code_reviewer in manifest
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4231: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4232: blocked → ready
+[orchestrator] Initialized manifest for wf_1788780725940_c2uqki
+[orchestrator] Invoking agent agentcore_hub_qa_verifier for ticket TEAM-4232
+[orchestrator] Using Harness for agentcore_hub_qa_verifier
+[orchestrator] Async invoke sent for agentcore_hub_qa_verifier (session: TEAM-4232_wf_1788780725940_c2uqki-agentcore_hub_qa_verifier-1788844617252)
+[orchestrator] Recorded session for agentcore_hub_qa_verifier in manifest
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4232: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4233: blocked → ready
+[orchestrator] Initialized manifest for wf_1788780725940_c2uqki
+[orchestrator] Invoking agent agentcore_hub_ci_agent for ticket TEAM-4233
+[orchestrator] Using Harness for agentcore_hub_ci_agent
+[orchestrator] Async invoke sent for agentcore_hub_ci_agent (session: TEAM-4233_wf_1788780725940_c2uqki-agentcore_hub_ci_agent-1788844617253)
+[orchestrator] Recorded session for agentcore_hub_ci_agent in manifest
+
+ ✓ lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > shadow (the default) — observed, and the run goes on > dispatches exactly one CI ticket
+stdout | lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > off — byte-identical to the run the dossier recorded > reproduces the fixture's own cascade shape, paying nothing
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 6 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4229: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4230: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4241: NEW → todo
+[orchestrator] Tracked new ticket TEAM-4241 (agentcore_hub_code_sweeper) in workflow wf_1788780725940_c2uqki
+[orchestrator] Initialized manifest for wf_1788780725940_c2uqki
+[orchestrator] Invoking agent agentcore_hub_code_sweeper for ticket TEAM-4241
+[orchestrator] Using Harness for agentcore_hub_code_sweeper
+[orchestrator] Async invoke sent for agentcore_hub_code_sweeper (session: TEAM-4241_wf_1788780725940_c2uqki-agentcore_hub_code_sweeper-1788844617300)
+[orchestrator] Recorded session for agentcore_hub_code_sweeper in manifest
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4231: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4241: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4242: NEW → blocked
+[orchestrator] Tracked new ticket TEAM-4242 (agentcore_hub_code_sweeper) in workflow wf_1788780725940_c2uqki
+[orchestrator] TEAM-4242: NEW → blocked is the gate's creation-time dependency block, not a review rejection — ignoring.
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4232: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4242: blocked → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4233: todo → done
+
+stdout | lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > off — byte-identical to the run the dossier recorded > reproduces the fixture's own cascade shape, paying nothing
+[orchestrator] Workflow wf_1788780725940_c2uqki complete!
+
+ ✓ lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > off — byte-identical to the run the dossier recorded > reproduces the fixture's own cascade shape, paying nothing 1551ms
+stdout | lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > off — byte-identical to the run the dossier recorded > does not read the detection record beyond the harvest's own read
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 6 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4229: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4230: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4241: NEW → todo
+[orchestrator] Tracked new ticket TEAM-4241 (agentcore_hub_code_sweeper) in workflow wf_1788780725940_c2uqki
+[orchestrator] Initialized manifest for wf_1788780725940_c2uqki
+[orchestrator] Invoking agent agentcore_hub_code_sweeper for ticket TEAM-4241
+[orchestrator] Using Harness for agentcore_hub_code_sweeper
+[orchestrator] Async invoke sent for agentcore_hub_code_sweeper (session: TEAM-4241_wf_1788780725940_c2uqki-agentcore_hub_code_sweeper-1788844618864)
+[orchestrator] Recorded session for agentcore_hub_code_sweeper in manifest
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4231: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4241: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4242: NEW → blocked
+[orchestrator] Tracked new ticket TEAM-4242 (agentcore_hub_code_sweeper) in workflow wf_1788780725940_c2uqki
+[orchestrator] TEAM-4242: NEW → blocked is the gate's creation-time dependency block, not a review rejection — ignoring.
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4232: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4242: blocked → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4233: todo → done
+
+stdout | lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > off — byte-identical to the run the dossier recorded > does not read the detection record beyond the harvest's own read
+[orchestrator] Workflow wf_1788780725940_c2uqki complete!
+
+ ✓ lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > off — byte-identical to the run the dossier recorded > does not read the detection record beyond the harvest's own read 1564ms
+ ✓ lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > detection is a valid ticket phase > the repo's own def declares it as an agent phase
+stdout | lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > detection is a valid ticket phase > only enforce requires it — off and shadow strip it out of the completion gate
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 6 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+
+stdout | lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > detection is a valid ticket phase > only enforce requires it — off and shadow strip it out of the completion gate
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 6 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+
+stdout | lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > detection is a valid ticket phase > only enforce requires it — off and shadow strip it out of the completion gate
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 6 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+
+ ✓ lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > detection is a valid ticket phase > only enforce requires it — off and shadow strip it out of the completion gate
+ ✓ lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > detection is a valid ticket phase > the completion gate accepts a stamped detection ticket, over its assignee's roster phase
+stdout | lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > FIX_BEFORE_VERIFY=enforce — no verifier runs against unfixed code > QA does not start until TEAM-4241 completes, and CI not until TEAM-4242 does
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 6 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4229: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4230: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4241: NEW → todo
+[orchestrator] Tracked new ticket TEAM-4241 (agentcore_hub_code_sweeper) in workflow wf_1788780725940_c2uqki
+[orchestrator] Initialized manifest for wf_1788780725940_c2uqki
+[orchestrator] Invoking agent agentcore_hub_code_sweeper for ticket TEAM-4241
+[orchestrator] Using Harness for agentcore_hub_code_sweeper
+[orchestrator] Async invoke sent for agentcore_hub_code_sweeper (session: TEAM-4241_wf_1788780725940_c2uqki-agentcore_hub_code_sweeper-1788844620593)
+[orchestrator] Recorded session for agentcore_hub_code_sweeper in manifest
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4231: todo → done
+
+stdout | lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > FIX_BEFORE_VERIFY=enforce — no verifier runs against unfixed code > QA does not start until TEAM-4241 completes, and CI not until TEAM-4242 does
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4241: in_progress → done
+
+stdout | lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > FIX_BEFORE_VERIFY=enforce — no verifier runs against unfixed code > QA does not start until TEAM-4241 completes, and CI not until TEAM-4242 does
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4242: NEW → blocked
+[orchestrator] Tracked new ticket TEAM-4242 (agentcore_hub_code_sweeper) in workflow wf_1788780725940_c2uqki
+[orchestrator] TEAM-4242: NEW → blocked is the gate's creation-time dependency block, not a review rejection — ignoring.
+
+ ✓ lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > FIX_BEFORE_VERIFY=enforce — no verifier runs against unfixed code > QA does not start until TEAM-4241 completes, and CI not until TEAM-4242 does 664ms
+stdout | lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > the published outcome is not baseline-eligible and raises no performance alert
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 6 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4229: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4230: in_progress → done
+[orchestrator] Workflow wf_1788780725940_c2uqki closed nothing-to-remove (nothing shipped): TEAM-4230 verified 0 removable of 93 candidate(s)
+
+(node:11875) Warning: NodeVersionSupportWarning: The AWS SDK for JavaScript (v3)
+versions published after the first week of January 2027
+will require node >=22. You are running node v20.19.2.
+
+To continue receiving updates to AWS services, bug fixes,
+and security updates please upgrade to node >=22.
+
+More information can be found at: https://a.co/c895JFp
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > the published outcome is not baseline-eligible and raises no performance alert 667ms
+ ✓ lambda/orchestrator/fix-before-verify.test.mjs > selectFixBeforeVerifyTargets — who waits for a fresh fix ticket > picks the run's open QA and CI tickets
+ ✓ lambda/orchestrator/fix-before-verify.test.mjs > selectFixBeforeVerifyTargets — who waits for a fresh fix ticket > matches the CI agent by ID, not by phase — agents.json puts it in `review`
+ ✓ lambda/orchestrator/fix-before-verify.test.mjs > selectFixBeforeVerifyTargets — who waits for a fresh fix ticket > also picks a verification-phase ticket whose assignee is not in the set
+ ✓ lambda/orchestrator/fix-before-verify.test.mjs > selectFixBeforeVerifyTargets — who waits for a fresh fix ticket > falls back to the injected phaseOf when the board carries no phase field
+ ✓ lambda/orchestrator/fix-before-verify.test.mjs > selectFixBeforeVerifyTargets — who waits for a fresh fix ticket > ignores every persona that is not a verifier
+ ✓ lambda/orchestrator/fix-before-verify.test.mjs > selectFixBeforeVerifyTargets — who waits for a fresh fix ticket > excludes a DONE verifier — nothing waits on a finished ticket
+ ✓ lambda/orchestrator/fix-before-verify.test.mjs > selectFixBeforeVerifyTargets — who waits for a fresh fix ticket > excludes a CANCELLED verifier
+ ✓ lambda/orchestrator/fix-before-verify.test.mjs > selectFixBeforeVerifyTargets — who waits for a fresh fix ticket > is case- and whitespace-tolerant about terminal statuses
+ ✓ lambda/orchestrator/fix-before-verify.test.mjs > selectFixBeforeVerifyTargets — who waits for a fresh fix ticket > excludes an advisory verifier — the run does not wait on backlog
+ ✓ lambda/orchestrator/fix-before-verify.test.mjs > selectFixBeforeVerifyTargets — who waits for a fresh fix ticket > never selects the fix ticket itself
+ ✓ lambda/orchestrator/fix-before-verify.test.mjs > selectFixBeforeVerifyTargets — who waits for a fresh fix ticket > never selects ANOTHER fix ticket — the cycle guard
+ ✓ lambda/orchestrator/fix-before-verify.test.mjs > selectFixBeforeVerifyTargets — who waits for a fresh fix ticket > skips a target that already lists the fix in blockedBy (twin delivery)
+ ✓ lambda/orchestrator/fix-before-verify.test.mjs > selectFixBeforeVerifyTargets — who waits for a fresh fix ticket > de-duplicates and tolerates junk siblings without throwing
+ ✓ lambda/orchestrator/fix-before-verify.test.mjs > selectFixBeforeVerifyTargets — who waits for a fresh fix ticket > returns [] for a missing fixId or a non-array board
+ ✓ lambda/orchestrator/fix-before-verify.test.mjs > selectFixBeforeVerifyTargets — who waits for a fresh fix ticket > defaults its injected predicates to inert — a missing isFixKind never crashes
+stdout | lambda/orchestrator/fix-before-verify.test.mjs > FIX_BEFORE_VERIFY=enforce — the edge is written at creation > blocks each open verifier exactly once, preserving a mid-flight status
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4241: NEW → blocked
+[orchestrator] Tracked new ticket TEAM-4241 (agentcore_hub_backend_dev) in workflow wf_c2uqki
+[orchestrator] TEAM-4241: NEW → blocked is the gate's creation-time dependency block, not a review rejection — ignoring.
+
+stderr | lambda/orchestrator/fix-before-verify.test.mjs > FIX_BEFORE_VERIFY=enforce — the edge is written at creation > blocks each open verifier exactly once, preserving a mid-flight status
+[orchestrator] Failed to load roster from S3: NoSuchKey — using fallback
+[orchestrator] Failed to load workflow defs from S3: NoSuchKey — using fallback only
+[orchestrator] CD registry read failed: NoSuchKey — keeping empty registry
+
+ ✓ lambda/orchestrator/fix-before-verify.test.mjs > FIX_BEFORE_VERIFY=enforce — the edge is written at creation > blocks each open verifier exactly once, preserving a mid-flight status
+stdout | lambda/orchestrator/fix-before-verify.test.mjs > FIX_BEFORE_VERIFY=enforce — the edge is written at creation > publishes one observed event naming what it blocked
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4241: NEW → blocked
+[orchestrator] Tracked new ticket TEAM-4241 (agentcore_hub_backend_dev) in workflow wf_c2uqki
+[orchestrator] TEAM-4241: NEW → blocked is the gate's creation-time dependency block, not a review rejection — ignoring.
+
+stderr | lambda/orchestrator/fix-before-verify.test.mjs > FIX_BEFORE_VERIFY=enforce — the edge is written at creation > publishes one observed event naming what it blocked
+[orchestrator] Failed to load roster from S3: NoSuchKey — using fallback
+[orchestrator] Failed to load workflow defs from S3: NoSuchKey — using fallback only
+[orchestrator] CD registry read failed: NoSuchKey — keeping empty registry
+
+ ✓ lambda/orchestrator/fix-before-verify.test.mjs > FIX_BEFORE_VERIFY=enforce — the edge is written at creation > publishes one observed event naming what it blocked
+stdout | lambda/orchestrator/fix-before-verify.test.mjs > FIX_BEFORE_VERIFY=enforce — the edge is written at creation > is idempotent on twin/redelivered INSERTs — zero new edges the second time
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4241: NEW → blocked
+[orchestrator] Tracked new ticket TEAM-4241 (agentcore_hub_backend_dev) in workflow wf_c2uqki
+[orchestrator] TEAM-4241: NEW → blocked is the gate's creation-time dependency block, not a review rejection — ignoring.
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4241: NEW → blocked
+[orchestrator] Tracked new ticket TEAM-4241 (agentcore_hub_backend_dev) in workflow wf_c2uqki
+[orchestrator] TEAM-4241: NEW → blocked is the gate's creation-time dependency block, not a review rejection — ignoring.
+
+stderr | lambda/orchestrator/fix-before-verify.test.mjs > FIX_BEFORE_VERIFY=enforce — the edge is written at creation > is idempotent on twin/redelivered INSERTs — zero new edges the second time
+[orchestrator] Failed to load roster from S3: NoSuchKey — using fallback
+[orchestrator] Failed to load workflow defs from S3: NoSuchKey — using fallback only
+[orchestrator] CD registry read failed: NoSuchKey — keeping empty registry
+
+ ✓ lambda/orchestrator/fix-before-verify.test.mjs > FIX_BEFORE_VERIFY=enforce — the edge is written at creation > is idempotent on twin/redelivered INSERTs — zero new edges the second time
+stdout | lambda/orchestrator/fix-before-verify.test.mjs > FIX_BEFORE_VERIFY=enforce — the edge is written at creation > writes nothing for a non-fix ticket INSERT
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4241: NEW → blocked
+[orchestrator] Tracked new ticket TEAM-4241 (agentcore_hub_backend_dev) in workflow wf_c2uqki
+[orchestrator] TEAM-4241: NEW → blocked is the gate's creation-time dependency block, not a review rejection — ignoring.
+
+stderr | lambda/orchestrator/fix-before-verify.test.mjs > FIX_BEFORE_VERIFY=enforce — the edge is written at creation > writes nothing for a non-fix ticket INSERT
+[orchestrator] Failed to load roster from S3: NoSuchKey — using fallback
+[orchestrator] Failed to load workflow defs from S3: NoSuchKey — using fallback only
+[orchestrator] CD registry read failed: NoSuchKey — keeping empty registry
+
+ ✓ lambda/orchestrator/fix-before-verify.test.mjs > FIX_BEFORE_VERIFY=enforce — the edge is written at creation > writes nothing for a non-fix ticket INSERT
+stdout | lambda/orchestrator/fix-before-verify.test.mjs > FIX_BEFORE_VERIFY=enforce — the edge is written at creation > publishes nothing when there is no open verifier to hold
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4241: NEW → blocked
+[orchestrator] Tracked new ticket TEAM-4241 (agentcore_hub_backend_dev) in workflow wf_c2uqki
+[orchestrator] TEAM-4241: NEW → blocked is the gate's creation-time dependency block, not a review rejection — ignoring.
+
+stderr | lambda/orchestrator/fix-before-verify.test.mjs > FIX_BEFORE_VERIFY=enforce — the edge is written at creation > publishes nothing when there is no open verifier to hold
+[orchestrator] Failed to load roster from S3: NoSuchKey — using fallback
+[orchestrator] Failed to load workflow defs from S3: NoSuchKey — using fallback only
+[orchestrator] CD registry read failed: NoSuchKey — keeping empty registry
+
+ ✓ lambda/orchestrator/fix-before-verify.test.mjs > FIX_BEFORE_VERIFY=enforce — the edge is written at creation > publishes nothing when there is no open verifier to hold
+stdout | lambda/orchestrator/fix-before-verify.test.mjs > FIX_BEFORE_VERIFY=shadow — observe, write nothing > publishes wouldBlock and writes ZERO blocker edges
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4241: NEW → blocked
+[orchestrator] Tracked new ticket TEAM-4241 (agentcore_hub_backend_dev) in workflow wf_c2uqki
+[orchestrator] TEAM-4241: NEW → blocked is the gate's creation-time dependency block, not a review rejection — ignoring.
+
+stderr | lambda/orchestrator/fix-before-verify.test.mjs > FIX_BEFORE_VERIFY=shadow — observe, write nothing > publishes wouldBlock and writes ZERO blocker edges
+[orchestrator] Failed to load roster from S3: NoSuchKey — using fallback
+[orchestrator] Failed to load workflow defs from S3: NoSuchKey — using fallback only
+[orchestrator] CD registry read failed: NoSuchKey — keeping empty registry
+
+ ✓ lambda/orchestrator/fix-before-verify.test.mjs > FIX_BEFORE_VERIFY=shadow — observe, write nothing > publishes wouldBlock and writes ZERO blocker edges
+stdout | lambda/orchestrator/fix-before-verify.test.mjs > FIX_BEFORE_VERIFY=shadow — observe, write nothing > is the UNSET default — a fresh deploy observes rather than acts
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4241: NEW → blocked
+[orchestrator] Tracked new ticket TEAM-4241 (agentcore_hub_backend_dev) in workflow wf_c2uqki
+[orchestrator] TEAM-4241: NEW → blocked is the gate's creation-time dependency block, not a review rejection — ignoring.
+
+stderr | lambda/orchestrator/fix-before-verify.test.mjs > FIX_BEFORE_VERIFY=shadow — observe, write nothing > is the UNSET default — a fresh deploy observes rather than acts
+[orchestrator] Failed to load roster from S3: NoSuchKey — using fallback
+[orchestrator] Failed to load workflow defs from S3: NoSuchKey — using fallback only
+[orchestrator] CD registry read failed: NoSuchKey — keeping empty registry
+
+ ✓ lambda/orchestrator/fix-before-verify.test.mjs > FIX_BEFORE_VERIFY=shadow — observe, write nothing > is the UNSET default — a fresh deploy observes rather than acts
+stdout | lambda/orchestrator/fix-before-verify.test.mjs > FIX_BEFORE_VERIFY=off — byte-identical to pre-4246 > does not even read the board: no event, no write
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4241: NEW → blocked
+[orchestrator] Tracked new ticket TEAM-4241 (agentcore_hub_backend_dev) in workflow wf_c2uqki
+[orchestrator] TEAM-4241: NEW → blocked is the gate's creation-time dependency block, not a review rejection — ignoring.
+
+stderr | lambda/orchestrator/fix-before-verify.test.mjs > FIX_BEFORE_VERIFY=off — byte-identical to pre-4246 > does not even read the board: no event, no write
+[orchestrator] Failed to load roster from S3: NoSuchKey — using fallback
+[orchestrator] Failed to load workflow defs from S3: NoSuchKey — using fallback only
+[orchestrator] CD registry read failed: NoSuchKey — keeping empty registry
+
+ ✓ lambda/orchestrator/fix-before-verify.test.mjs > FIX_BEFORE_VERIFY=off — byte-identical to pre-4246 > does not even read the board: no event, no write
+stdout | lambda/orchestrator/fix-before-verify.test.mjs > FIX_BEFORE_VERIFY=off — byte-identical to pre-4246 > an unrecognized mode falls to off (the typo case), not to shadow
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4241: NEW → blocked
+[orchestrator] Tracked new ticket TEAM-4241 (agentcore_hub_backend_dev) in workflow wf_c2uqki
+[orchestrator] TEAM-4241: NEW → blocked is the gate's creation-time dependency block, not a review rejection — ignoring.
+
+stderr | lambda/orchestrator/fix-before-verify.test.mjs > FIX_BEFORE_VERIFY=off — byte-identical to pre-4246 > an unrecognized mode falls to off (the typo case), not to shadow
+[orchestrator] Failed to load roster from S3: NoSuchKey — using fallback
+[orchestrator] Failed to load workflow defs from S3: NoSuchKey — using fallback only
+[orchestrator] CD registry read failed: NoSuchKey — keeping empty registry
+
+ ✓ lambda/orchestrator/fix-before-verify.test.mjs > FIX_BEFORE_VERIFY=off — byte-identical to pre-4246 > an unrecognized mode falls to off (the typo case), not to shadow
+stdout | lambda/orchestrator/fix-before-verify.test.mjs > the boundary — a failure never rejects the stream record > survives a failing sibling query
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4241: NEW → blocked
+[orchestrator] Tracked new ticket TEAM-4241 (agentcore_hub_backend_dev) in workflow wf_c2uqki
+[orchestrator] TEAM-4241: NEW → blocked is the gate's creation-time dependency block, not a review rejection — ignoring.
+
+stderr | lambda/orchestrator/fix-before-verify.test.mjs > the boundary — a failure never rejects the stream record > survives a failing sibling query
+[orchestrator] Failed to load roster from S3: NoSuchKey — using fallback
+[orchestrator] Failed to load workflow defs from S3: NoSuchKey — using fallback only
+[orchestrator] CD registry read failed: NoSuchKey — keeping empty registry
+[orchestrator] fix-before-verify observe failed (non-fatal): parentId-index unavailable
+
+ ✓ lambda/orchestrator/fix-before-verify.test.mjs > the boundary — a failure never rejects the stream record > survives a failing sibling query
+stdout | lambda/orchestrator/fix-before-verify.test.mjs > the boundary — a failure never rejects the stream record > survives a failing blocker write
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4241: NEW → blocked
+[orchestrator] Tracked new ticket TEAM-4241 (agentcore_hub_backend_dev) in workflow wf_c2uqki
+[orchestrator] TEAM-4241: NEW → blocked is the gate's creation-time dependency block, not a review rejection — ignoring.
+
+stderr | lambda/orchestrator/fix-before-verify.test.mjs > the boundary — a failure never rejects the stream record > survives a failing blocker write
+[orchestrator] Failed to load roster from S3: NoSuchKey — using fallback
+[orchestrator] Failed to load workflow defs from S3: NoSuchKey — using fallback only
+[orchestrator] CD registry read failed: NoSuchKey — keeping empty registry
+[orchestrator] addBlockers: TEAM-4232 += TEAM-4241 failed (non-fatal): conditional write failed
+[orchestrator] addBlockers: TEAM-4233 += TEAM-4241 failed (non-fatal): conditional write failed
+
+ ✓ lambda/orchestrator/fix-before-verify.test.mjs > the boundary — a failure never rejects the stream record > survives a failing blocker write
+ ✓ lambda/orchestrator/fix-before-verify.test.mjs > both creation-time advisories are paired in the source (FR-D1.7 twins) > finds the sites it claims to check (the grep itself cannot silently pass)
+ ✓ lambda/orchestrator/fix-before-verify.test.mjs > both creation-time advisories are paired in the source (FR-D1.7 twins) > every emitContractWarning call is followed by observeFixBeforeVerify
+ ✓ lambda/orchestrator/fix-before-verify.test.mjs > both creation-time advisories are paired in the source (FR-D1.7 twins) > one of the pairs is the jira `todo` path, the other the stream INSERT path
+
+ Test Files  2 passed (2)
+      Tests  46 passed (46)
+   Start at  05:16:52
+   Duration  10.67s (transform 669ms, setup 0ms, collect 326ms, tests 7.76s, environment 0ms, prepare 252ms)
+
+VITEST_EXIT=0
+
+--- (1a) the test names that bear on item 4 ---
+ ✓ lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > enforce — the orchestrator ends the run at the detection ticket > dispatches NOBODY — no reviewer, no QA verifier, no CI agent
+ ✓ lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > shadow (the default) — observed, and the run goes on > tells the QA verifier and the CI agent the diff is deletion-free, and the reviewer the opposite
+ ✓ lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > FIX_BEFORE_VERIFY=enforce — no verifier runs against unfixed code > QA does not start until TEAM-4241 completes, and CI not until TEAM-4242 does 664ms
+ ✓ lambda/orchestrator/fix-before-verify.test.mjs > selectFixBeforeVerifyTargets — who waits for a fresh fix ticket > picks the run's open QA and CI tickets
+ ✓ lambda/orchestrator/fix-before-verify.test.mjs > selectFixBeforeVerifyTargets — who waits for a fresh fix ticket > matches the CI agent by ID, not by phase — agents.json puts it in `review`
+ ✓ lambda/orchestrator/fix-before-verify.test.mjs > selectFixBeforeVerifyTargets — who waits for a fresh fix ticket > also picks a verification-phase ticket whose assignee is not in the set
+ ✓ lambda/orchestrator/fix-before-verify.test.mjs > selectFixBeforeVerifyTargets — who waits for a fresh fix ticket > falls back to the injected phaseOf when the board carries no phase field
+ ✓ lambda/orchestrator/fix-before-verify.test.mjs > selectFixBeforeVerifyTargets — who waits for a fresh fix ticket > ignores every persona that is not a verifier
+ ✓ lambda/orchestrator/fix-before-verify.test.mjs > selectFixBeforeVerifyTargets — who waits for a fresh fix ticket > excludes a DONE verifier — nothing waits on a finished ticket
+ ✓ lambda/orchestrator/fix-before-verify.test.mjs > selectFixBeforeVerifyTargets — who waits for a fresh fix ticket > excludes a CANCELLED verifier
+ ✓ lambda/orchestrator/fix-before-verify.test.mjs > selectFixBeforeVerifyTargets — who waits for a fresh fix ticket > is case- and whitespace-tolerant about terminal statuses
+ ✓ lambda/orchestrator/fix-before-verify.test.mjs > selectFixBeforeVerifyTargets — who waits for a fresh fix ticket > excludes an advisory verifier — the run does not wait on backlog
+ ✓ lambda/orchestrator/fix-before-verify.test.mjs > selectFixBeforeVerifyTargets — who waits for a fresh fix ticket > never selects the fix ticket itself
+ ✓ lambda/orchestrator/fix-before-verify.test.mjs > selectFixBeforeVerifyTargets — who waits for a fresh fix ticket > never selects ANOTHER fix ticket — the cycle guard
+ ✓ lambda/orchestrator/fix-before-verify.test.mjs > selectFixBeforeVerifyTargets — who waits for a fresh fix ticket > skips a target that already lists the fix in blockedBy (twin delivery)
+ ✓ lambda/orchestrator/fix-before-verify.test.mjs > selectFixBeforeVerifyTargets — who waits for a fresh fix ticket > de-duplicates and tolerates junk siblings without throwing
+ ✓ lambda/orchestrator/fix-before-verify.test.mjs > selectFixBeforeVerifyTargets — who waits for a fresh fix ticket > returns [] for a missing fixId or a non-array board
+ ✓ lambda/orchestrator/fix-before-verify.test.mjs > selectFixBeforeVerifyTargets — who waits for a fresh fix ticket > defaults its injected predicates to inert — a missing isFixKind never crashes
+ ✓ lambda/orchestrator/fix-before-verify.test.mjs > FIX_BEFORE_VERIFY=enforce — the edge is written at creation > blocks each open verifier exactly once, preserving a mid-flight status
+ ✓ lambda/orchestrator/fix-before-verify.test.mjs > FIX_BEFORE_VERIFY=enforce — the edge is written at creation > publishes one observed event naming what it blocked
+ ✓ lambda/orchestrator/fix-before-verify.test.mjs > FIX_BEFORE_VERIFY=enforce — the edge is written at creation > is idempotent on twin/redelivered INSERTs — zero new edges the second time
+ ✓ lambda/orchestrator/fix-before-verify.test.mjs > FIX_BEFORE_VERIFY=enforce — the edge is written at creation > writes nothing for a non-fix ticket INSERT
+ ✓ lambda/orchestrator/fix-before-verify.test.mjs > FIX_BEFORE_VERIFY=enforce — the edge is written at creation > publishes nothing when there is no open verifier to hold
+ ✓ lambda/orchestrator/fix-before-verify.test.mjs > FIX_BEFORE_VERIFY=shadow — observe, write nothing > publishes wouldBlock and writes ZERO blocker edges
+ ✓ lambda/orchestrator/fix-before-verify.test.mjs > FIX_BEFORE_VERIFY=shadow — observe, write nothing > is the UNSET default — a fresh deploy observes rather than acts
+ ✓ lambda/orchestrator/fix-before-verify.test.mjs > FIX_BEFORE_VERIFY=off — byte-identical to pre-4246 > does not even read the board: no event, no write
+ ✓ lambda/orchestrator/fix-before-verify.test.mjs > FIX_BEFORE_VERIFY=off — byte-identical to pre-4246 > an unrecognized mode falls to off (the typo case), not to shadow
+ ✓ lambda/orchestrator/fix-before-verify.test.mjs > the boundary — a failure never rejects the stream record > survives a failing sibling query
+ ✓ lambda/orchestrator/fix-before-verify.test.mjs > the boundary — a failure never rejects the stream record > survives a failing blocker write
+ ✓ lambda/orchestrator/fix-before-verify.test.mjs > both creation-time advisories are paired in the source (FR-D1.7 twins) > finds the sites it claims to check (the grep itself cannot silently pass)
+ ✓ lambda/orchestrator/fix-before-verify.test.mjs > both creation-time advisories are paired in the source (FR-D1.7 twins) > every emitContractWarning call is followed by observeFixBeforeVerify
+ ✓ lambda/orchestrator/fix-before-verify.test.mjs > both creation-time advisories are paired in the source (FR-D1.7 twins) > one of the pairs is the jira `todo` path, the other the stream INSERT path
+
+--- (2) ASSERTION AUDIT — do the names actually assert the property? ---
+
+replay-c2uqki-sweep-noop.test.mjs:995-1020 (the clause-1/2 test, verbatim):
+
+  // ── (5) FR-D1.7 — a fix filed mid-run blocks the open verifiers ────────────
+  describe("FIX_BEFORE_VERIFY=enforce — no verifier runs against unfixed code", () => {
+    it("QA does not start until TEAM-4241 completes, and CI not until TEAM-4242 does", async () => {
+      await loadWith({ sweep: "off", fixBefore: "enforce" });
+      await deliver(doneRecord(ANALYST));
+      await deliver(doneRecord(DETECT));
+
+      // 12:30:13 — the reviewer files its fix while QA and CI are still open.
+      await deliver(insertFixRecord(REVIEW_FIX));
+      const afterReviewFix = h.state.blockerWrites.filter((w) => w.ids.includes(REVIEW_FIX));
+      expect(afterReviewFix.map((w) => w.ticketId).sort()).toEqual([QA, CI].sort());
+      expect(h.state.board.get(QA).blockedBy).toContain(REVIEW_FIX);
+
+      await deliver(doneRecord(REVIEW));
+      await deliver(doneRecord(REVIEW_FIX));
+
+      // 12:53:27 — QA files its own fix, 1m42s before closing its own ticket, so
+      // BOTH open verifiers are held: CI has not run yet, and QA's own re-verify
+      // round must not start against the unfixed ledger either.
+      await deliver(insertFixRecord(QA_FIX));
+      expect(h.state.blockerWrites.filter((w) => w.ids.includes(QA_FIX)).map((w) => w.ticketId).sort())
+        .toEqual([QA, CI].sort());
+      expect(h.state.board.get(CI).blockedBy).toContain(QA_FIX);
+    });
+  });
+
+ANALYSIS of the quoted assertions:
+  * Clause 1 (QA held until TEAM-4241 completes) — ASSERTED, via blocker edge:
+      expect(h.state.board.get(QA).blockedBy).toContain(REVIEW_FIX);
+    where REVIEW_FIX is TEAM-4241. PROVEN.
+  * Clause 2 (CI held until TEAM-4242 completes) — ASSERTED, via blocker edge:
+      expect(h.state.board.get(CI).blockedBy).toContain(QA_FIX);
+    where QA_FIX is TEAM-4242. PROVEN.
+  * Both are actually STRICTER than the acceptance wording. The acceptance text
+    pairs one fix with one verifier; the code blocks BOTH verifiers on EACH fix:
+      expect(afterReviewFix.map((w) => w.ticketId).sort()).toEqual([QA, CI].sort());
+      expect(...w.ids.includes(QA_FIX)...).toEqual([QA, CI].sort());
+    Deviation in the safe direction, but it IS a deviation: TEAM-4241 also blocks
+    CI, and TEAM-4242 also blocks QA's own re-verify round.
+
+  EVIDENCE GAP (edge != dispatch): the test asserts the blocker EDGE is written.
+  It does not assert the held verifier is then not INVOKED, even though this
+  harness captures every dispatch (h.state.invokes, dispatchedTo(), line 585).
+  Dispatch suppression is covered only indirectly, by fix-before-verify.test.mjs
+  'blocks each open verifier exactly once, preserving a mid-flight status'.
+
+--- (2b) CLAUSE 3 — 'CI observes no mid-run head move (16fc41d -> 73f0056)' ---
+Repo-wide grep for the two SHAs named in the acceptance item:
+$ grep -rIln '16fc41d\|73f0056' --exclude-dir=node_modules --exclude-dir=.git .
+qa-evidence/TEAM-4251/probes/item-04-fix-before-verify.mjs
+deploy/workflow-manager/toolkit/fixtures/c2uqki-analysis.json
+deploy/workflow-manager/toolkit/fixtures/c2uqki-dossier.json
+
+Both SHAs appear ONLY in the two vendored c2uqki fixtures, and ONLY as prose
+narrative ABOUT the historical run, e.g. from c2uqki-analysis.json:
+  "CI observed head 16fc41d->73f0056 mid-run and re-ran the full suite."
+  "Outcome is sound only because CI was diligent - the def does not enforce
+   fix-before-verify."
+Neither string occurs in ANY .test.mjs / .test.ts file. There is NO assertion
+anywhere that CI observes a single, stable head. => CLAUSE 3 IS NOT ASSERTED.
+
+--- (3) INDEPENDENT PROBE — probes/item-04-fix-before-verify.mjs ---
+Drives the REAL selectFixBeforeVerifyTargets (zero-import leaf, nothing stubbed)
+against the REAL vendored c2uqki board, snapshotted at each fix's createdAt.
+
+=== item-4.0  FIX_BEFORE_VERIFY_PERSONAS (real Set) ===
+  agentcore_hub_qa_verifier
+  agentcore_hub_ci_agent
+
+=== item-4.1  the real c2uqki board, as vendored ===
+  TEAM-4229 agentcore_hub_requirements_analyst     created=2026-09-07T04:32:07.637-0700 done=2026-09-07T04:42:08.651-0700 blockedBy=[]
+  TEAM-4230 agentcore_hub_code_sweeper             created=2026-09-07T04:40:33.820-0700 done=2026-09-07T05:12:19.934-0700 blockedBy=[]
+  TEAM-4231 agentcore_hub_code_reviewer            created=2026-09-07T04:41:00.703-0700 done=2026-09-07T05:30:54.531-0700 blockedBy=["TEAM-4230"]
+  TEAM-4232 agentcore_hub_qa_verifier              created=2026-09-07T04:41:22.988-0700 done=2026-09-07T05:55:05.854-0700 blockedBy=["TEAM-4231"]
+  TEAM-4233 agentcore_hub_ci_agent                 created=2026-09-07T04:41:41.760-0700 done=2026-09-07T06:17:36.694-0700 blockedBy=["TEAM-4232"]
+  TEAM-4241 agentcore_hub_code_sweeper             created=2026-09-07T05:30:13.003-0700 done=2026-09-07T05:54:39.001-0700 blockedBy=[]
+  TEAM-4242 agentcore_hub_code_sweeper             created=2026-09-07T05:53:27.743-0700 done=2026-09-07T06:01:10.072-0700 blockedBy=["TEAM-4241"]
+  TEAM-4228 undefined                              created=2026-09-07T04:32:06.374-0700 done=2026-09-07T06:17:42.204-0700 blockedBy=[]
+
+=== item-4.2  TEAM-4241 (codex_fix) INSERTed at 2026-09-07T05:30:13.003-0700 — board snapshot ===
+    TEAM-4229 agentcore_hub_requirements_analyst     done
+    TEAM-4230 agentcore_hub_code_sweeper             done
+    TEAM-4231 agentcore_hub_code_reviewer            in_progress
+    TEAM-4232 agentcore_hub_qa_verifier              in_progress
+    TEAM-4233 agentcore_hub_ci_agent                 in_progress
+    TEAM-4241 agentcore_hub_code_sweeper             in_progress
+  selectFixBeforeVerifyTargets -> ["TEAM-4232","TEAM-4233"]
+  acceptance names TEAM-4232 (QA) as the verifier to hold
+  TEAM-4232 in targets? -> YES (blocked at creation)
+
+=== item-4.2  TEAM-4242 (qa_fix) INSERTed at 2026-09-07T05:53:27.743-0700 — board snapshot ===
+    TEAM-4229 agentcore_hub_requirements_analyst     done
+    TEAM-4230 agentcore_hub_code_sweeper             done
+    TEAM-4231 agentcore_hub_code_reviewer            done
+    TEAM-4232 agentcore_hub_qa_verifier              in_progress
+    TEAM-4233 agentcore_hub_ci_agent                 in_progress
+    TEAM-4241 agentcore_hub_code_sweeper             in_progress
+    TEAM-4242 agentcore_hub_code_sweeper             in_progress
+  selectFixBeforeVerifyTargets -> ["TEAM-4232","TEAM-4233"]
+  acceptance names TEAM-4233 (CI) as the verifier to hold
+  TEAM-4233 in targets? -> YES (blocked at creation)
+
+=== item-4.2b  the vendored tickets carry NO spawnedBy field ===
+  TEAM-4241.spawnedBy = undefined
+  TEAM-4242.spawnedBy = undefined
+  So the fixture cannot exercise the cycle guard (line 318 reads target.spawnedBy.kind).
+  Re-running case TEAM-4241 with production-shaped spawnedBy attached:
+    -> ["TEAM-4232","TEAM-4233"]  (fix siblings still excluded; verifiers still held)
+
+=== item-4.3  clause 3 — the mid-run head move, derived ===
+  TEAM-4242 created      2026-09-07T05:53:27.743-0700
+  TEAM-4242 completed    2026-09-07T06:01:10.072-0700
+  TEAM-4233 (CI) created 2026-09-07T04:41:41.760-0700
+  TEAM-4233 (CI) done    2026-09-07T06:17:36.694-0700
+  Historical CI dispatch (fixture narrative): 12:55:09Z = 2026-09-07T12:55:09.000Z
+  Was the fix still in flight at CI dispatch? YES
+  => TEAM-4242 was open when CI was dispatched, so the FIX_BEFORE_VERIFY edge
+     written at 4.2 would have held CI until 13:01:12Z, i.e. until AFTER the
+     73f0056 merge. CI would then start once, at the final head.
+  NOTE: this is a DERIVATION from the blocker edge, not an assertion. No test
+     in the named files mentions 16fc41d or 73f0056 at all.
+
+=== item-4 VERDICT ===
+  clauses 1+2 (QA/CI held on their fixes): REPRODUCED against the real fixture board
+  clause 3 (no mid-run head move): NOT ASSERTED by any test; derivable only.
+PROBE_EXIT=0
+
+--- (3a) probe note: my FIRST run of this probe returned [] for both cases ---
+That was a PROBE bug, not a code defect, and it is worth recording because it is
+the exact misreading a future maintainer will make: selectFixBeforeVerifyTargets
+applies isFixKind to the TARGET's own spawnedBy.kind (verdict-contract.mjs:318,
+the cycle guard), NOT to the incoming fix's kind. Passing a constant-true
+isFixKind therefore excludes every sibling. Corrected to pass the real FIX_KINDS
+predicate; the vendored tickets carry no spawnedBy at all (see 4.2b).
+
+--- (4) MINOR DOC DRIFT (not a functional defect) ---
+fix-before-verify.test.mjs:27 says:
+ * The board below models run c2uqki's shape (QA TEAM-4232 open, CI TEAM-4233 open,
+ * fix TEAM-4241 filed against them). No c2uqki dossier is vendored on this branch,
+ * so these are literal objects, not fixture reads.
+That is now false — deploy/workflow-manager/toolkit/fixtures/c2uqki-dossier.json
+and c2uqki-analysis.json ARE vendored at this HEAD. The literal objects in that
+test still model the board correctly (verified in 4.1 above), so nothing is wrong
+with the test; only its comment is stale.
+
+--- ITEM 4 VERDICT: PARTIAL ---
+  Clause 1 (QA held on TEAM-4241): VERIFIED — asserted + independently reproduced.
+  Clause 2 (CI held on TEAM-4242): VERIFIED — asserted + independently reproduced.
+  Clause 3 (CI observes no mid-run head move 16fc41d -> 73f0056): NOT VERIFIED.
+    No test asserts it. The SHAs exist only as fixture narrative. The property is
+    a DERIVED CONSEQUENCE of clause 2 (probe 4.3 shows TEAM-4242 was still open at
+    the historical 12:55:09Z CI dispatch, so the edge would have deferred CI past
+    the 73f0056 merge), but a derivation by the QA engineer is not test coverage.
+    An honest statement of the coverage is: the CAUSE is gated and tested; the
+    EFFECT the acceptance item names is unasserted.
+EXIT=0

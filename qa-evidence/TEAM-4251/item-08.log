@@ -1,0 +1,693 @@
+=== ITEM 8 — Replay c2uqki ends after detection with runOutcome=nothing-to-remove, 0 reviewer/QA/CI tasks, no workflow.performance alert ===
+Named test: lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs (+ sweep-noop-close.test.mjs, cost-report for the alert clause)
+
+--- (1) vitest run --reporter=verbose ---
+[33mThe CJS build of Vite's Node API is deprecated. See https://vite.dev/guide/troubleshooting.html#vite-cjs-node-api-deprecated for more details.[39m
+
+ RUN  v2.1.9 /mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub
+
+ ✓ lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — the fixture still says what this replay claims > records a sweep that removed nothing, in prose only
+ ✓ lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — the fixture still says what this replay claims > spent four personas and two fix tickets on it, then reported a completed delivery
+stdout | lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > enforce — the orchestrator ends the run at the detection ticket > closes the run as nothing-to-remove, carrying the yield on the event
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 6 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4229: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4230: in_progress → done
+[orchestrator] Workflow wf_1788780725940_c2uqki closed nothing-to-remove (nothing shipped): TEAM-4230 verified 0 removable of 93 candidate(s)
+
+ ✓ lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > enforce — the orchestrator ends the run at the detection ticket > closes the run as nothing-to-remove, carrying the yield on the event 578ms
+stdout | lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > enforce — the orchestrator ends the run at the detection ticket > labels the sweep PR sweep:no-op
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 6 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4229: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4230: in_progress → done
+[orchestrator] Workflow wf_1788780725940_c2uqki closed nothing-to-remove (nothing shipped): TEAM-4230 verified 0 removable of 93 candidate(s)
+
+ ✓ lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > enforce — the orchestrator ends the run at the detection ticket > labels the sweep PR sweep:no-op
+stdout | lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > enforce — the orchestrator ends the run at the detection ticket > dispatches NOBODY — no reviewer, no QA verifier, no CI agent
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 6 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4229: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4230: in_progress → done
+[orchestrator] Workflow wf_1788780725940_c2uqki closed nothing-to-remove (nothing shipped): TEAM-4230 verified 0 removable of 93 candidate(s)
+
+ ✓ lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > enforce — the orchestrator ends the run at the detection ticket > dispatches NOBODY — no reviewer, no QA verifier, no CI agent
+stdout | lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > enforce — the orchestrator ends the run at the detection ticket > refuses a late ready/todo delivery for the reviewer once the run is closed
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 6 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4229: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4230: in_progress → done
+[orchestrator] Workflow wf_1788780725940_c2uqki closed nothing-to-remove (nothing shipped): TEAM-4230 verified 0 removable of 93 candidate(s)
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4231: blocked → ready
+[orchestrator] GUARD: Skipping invocation for TEAM-4231 — workflow wf_1788780725940_c2uqki is nothing-to-remove
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4231: blocked → todo
+[orchestrator] GUARD: Skipping invocation for TEAM-4231 — workflow wf_1788780725940_c2uqki is nothing-to-remove
+
+ ✓ lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > enforce — the orchestrator ends the run at the detection ticket > refuses a late ready/todo delivery for the reviewer once the run is closed
+stdout | lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > enforce — the orchestrator ends the run at the detection ticket > one close, whichever twin delivers it (redelivery + the webhook twin)
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 6 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4229: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4230: in_progress → done
+[orchestrator] Workflow wf_1788780725940_c2uqki closed nothing-to-remove (nothing shipped): TEAM-4230 verified 0 removable of 93 candidate(s)
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4230: in_progress → done
+[orchestrator] Workflow wf_1788780725940_c2uqki already terminal — skipping duplicate nothing-to-remove close.
+[orchestrator] TEAM-4230 already marked complete — skipping duplicate cascade.
+
+ ✓ lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > enforce — the orchestrator ends the run at the detection ticket > one close, whichever twin delivers it (redelivery + the webhook twin)
+stdout | lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > shadow (the default) — observed, and the run goes on > publishes sweep.detection_observed once and still cascades
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 6 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4229: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4230: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4241: NEW → todo
+[orchestrator] Tracked new ticket TEAM-4241 (agentcore_hub_code_sweeper) in workflow wf_1788780725940_c2uqki
+[orchestrator] Initialized manifest for wf_1788780725940_c2uqki
+[orchestrator] Invoking agent agentcore_hub_code_sweeper for ticket TEAM-4241
+[orchestrator] Using Harness for agentcore_hub_code_sweeper
+[orchestrator] Async invoke sent for agentcore_hub_code_sweeper (session: TEAM-4241_wf_1788780725940_c2uqki-agentcore_hub_code_sweeper-1788845101639)
+[orchestrator] Recorded session for agentcore_hub_code_sweeper in manifest
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4231: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4241: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4242: NEW → blocked
+[orchestrator] Tracked new ticket TEAM-4242 (agentcore_hub_code_sweeper) in workflow wf_1788780725940_c2uqki
+[orchestrator] TEAM-4242: NEW → blocked is the gate's creation-time dependency block, not a review rejection — ignoring.
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4232: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4242: blocked → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4233: todo → done
+
+stdout | lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > shadow (the default) — observed, and the run goes on > publishes sweep.detection_observed once and still cascades
+[orchestrator] Workflow wf_1788780725940_c2uqki complete!
+
+ ✓ lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > shadow (the default) — observed, and the run goes on > publishes sweep.detection_observed once and still cascades 1563ms
+stdout | lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > shadow (the default) — observed, and the run goes on > tells the QA verifier and the CI agent the diff is deletion-free, and the reviewer the opposite
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 6 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4229: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4230: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4231: blocked → ready
+[orchestrator] Initialized manifest for wf_1788780725940_c2uqki
+[orchestrator] Invoking agent agentcore_hub_code_reviewer for ticket TEAM-4231
+[orchestrator] Using Harness for agentcore_hub_code_reviewer
+[orchestrator] Async invoke sent for agentcore_hub_code_reviewer (session: TEAM-4231_wf_1788780725940_c2uqki-agentcore_hub_code_reviewer-1788845103198)
+[orchestrator] Recorded session for agentcore_hub_code_reviewer in manifest
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4231: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4232: blocked → ready
+[orchestrator] Initialized manifest for wf_1788780725940_c2uqki
+[orchestrator] Invoking agent agentcore_hub_qa_verifier for ticket TEAM-4232
+[orchestrator] Using Harness for agentcore_hub_qa_verifier
+[orchestrator] Async invoke sent for agentcore_hub_qa_verifier (session: TEAM-4232_wf_1788780725940_c2uqki-agentcore_hub_qa_verifier-1788845103200)
+[orchestrator] Recorded session for agentcore_hub_qa_verifier in manifest
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4232: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4233: blocked → ready
+[orchestrator] Initialized manifest for wf_1788780725940_c2uqki
+[orchestrator] Invoking agent agentcore_hub_ci_agent for ticket TEAM-4233
+[orchestrator] Using Harness for agentcore_hub_ci_agent
+[orchestrator] Async invoke sent for agentcore_hub_ci_agent (session: TEAM-4233_wf_1788780725940_c2uqki-agentcore_hub_ci_agent-1788845103201)
+[orchestrator] Recorded session for agentcore_hub_ci_agent in manifest
+
+ ✓ lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > shadow (the default) — observed, and the run goes on > tells the QA verifier and the CI agent the diff is deletion-free, and the reviewer the opposite
+stdout | lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > shadow (the default) — observed, and the run goes on > dispatches exactly one CI ticket
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 6 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4229: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4230: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4231: blocked → ready
+[orchestrator] Initialized manifest for wf_1788780725940_c2uqki
+[orchestrator] Invoking agent agentcore_hub_code_reviewer for ticket TEAM-4231
+[orchestrator] Using Harness for agentcore_hub_code_reviewer
+[orchestrator] Async invoke sent for agentcore_hub_code_reviewer (session: TEAM-4231_wf_1788780725940_c2uqki-agentcore_hub_code_reviewer-1788845103249)
+[orchestrator] Recorded session for agentcore_hub_code_reviewer in manifest
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4231: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4232: blocked → ready
+[orchestrator] Initialized manifest for wf_1788780725940_c2uqki
+[orchestrator] Invoking agent agentcore_hub_qa_verifier for ticket TEAM-4232
+[orchestrator] Using Harness for agentcore_hub_qa_verifier
+[orchestrator] Async invoke sent for agentcore_hub_qa_verifier (session: TEAM-4232_wf_1788780725940_c2uqki-agentcore_hub_qa_verifier-1788845103250)
+[orchestrator] Recorded session for agentcore_hub_qa_verifier in manifest
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4232: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4233: blocked → ready
+[orchestrator] Initialized manifest for wf_1788780725940_c2uqki
+[orchestrator] Invoking agent agentcore_hub_ci_agent for ticket TEAM-4233
+[orchestrator] Using Harness for agentcore_hub_ci_agent
+[orchestrator] Async invoke sent for agentcore_hub_ci_agent (session: TEAM-4233_wf_1788780725940_c2uqki-agentcore_hub_ci_agent-1788845103251)
+[orchestrator] Recorded session for agentcore_hub_ci_agent in manifest
+
+ ✓ lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > shadow (the default) — observed, and the run goes on > dispatches exactly one CI ticket
+stdout | lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > off — byte-identical to the run the dossier recorded > reproduces the fixture's own cascade shape, paying nothing
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 6 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4229: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4230: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4241: NEW → todo
+[orchestrator] Tracked new ticket TEAM-4241 (agentcore_hub_code_sweeper) in workflow wf_1788780725940_c2uqki
+[orchestrator] Initialized manifest for wf_1788780725940_c2uqki
+[orchestrator] Invoking agent agentcore_hub_code_sweeper for ticket TEAM-4241
+[orchestrator] Using Harness for agentcore_hub_code_sweeper
+[orchestrator] Async invoke sent for agentcore_hub_code_sweeper (session: TEAM-4241_wf_1788780725940_c2uqki-agentcore_hub_code_sweeper-1788845103299)
+[orchestrator] Recorded session for agentcore_hub_code_sweeper in manifest
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4231: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4241: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4242: NEW → blocked
+[orchestrator] Tracked new ticket TEAM-4242 (agentcore_hub_code_sweeper) in workflow wf_1788780725940_c2uqki
+[orchestrator] TEAM-4242: NEW → blocked is the gate's creation-time dependency block, not a review rejection — ignoring.
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4232: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4242: blocked → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4233: todo → done
+
+stdout | lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > off — byte-identical to the run the dossier recorded > reproduces the fixture's own cascade shape, paying nothing
+[orchestrator] Workflow wf_1788780725940_c2uqki complete!
+
+ ✓ lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > off — byte-identical to the run the dossier recorded > reproduces the fixture's own cascade shape, paying nothing 1551ms
+stdout | lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > off — byte-identical to the run the dossier recorded > does not read the detection record beyond the harvest's own read
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 6 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4229: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4230: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4241: NEW → todo
+[orchestrator] Tracked new ticket TEAM-4241 (agentcore_hub_code_sweeper) in workflow wf_1788780725940_c2uqki
+[orchestrator] Initialized manifest for wf_1788780725940_c2uqki
+[orchestrator] Invoking agent agentcore_hub_code_sweeper for ticket TEAM-4241
+[orchestrator] Using Harness for agentcore_hub_code_sweeper
+[orchestrator] Async invoke sent for agentcore_hub_code_sweeper (session: TEAM-4241_wf_1788780725940_c2uqki-agentcore_hub_code_sweeper-1788845104853)
+[orchestrator] Recorded session for agentcore_hub_code_sweeper in manifest
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4231: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4241: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4242: NEW → blocked
+[orchestrator] Tracked new ticket TEAM-4242 (agentcore_hub_code_sweeper) in workflow wf_1788780725940_c2uqki
+[orchestrator] TEAM-4242: NEW → blocked is the gate's creation-time dependency block, not a review rejection — ignoring.
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4232: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4242: blocked → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4233: todo → done
+
+stdout | lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > off — byte-identical to the run the dossier recorded > does not read the detection record beyond the harvest's own read
+[orchestrator] Workflow wf_1788780725940_c2uqki complete!
+
+ ✓ lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > off — byte-identical to the run the dossier recorded > does not read the detection record beyond the harvest's own read 1552ms
+ ✓ lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > detection is a valid ticket phase > the repo's own def declares it as an agent phase
+stdout | lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > detection is a valid ticket phase > only enforce requires it — off and shadow strip it out of the completion gate
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 6 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+
+stdout | lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > detection is a valid ticket phase > only enforce requires it — off and shadow strip it out of the completion gate
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 6 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+
+stdout | lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > detection is a valid ticket phase > only enforce requires it — off and shadow strip it out of the completion gate
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 6 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+
+ ✓ lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > detection is a valid ticket phase > only enforce requires it — off and shadow strip it out of the completion gate
+ ✓ lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > detection is a valid ticket phase > the completion gate accepts a stamped detection ticket, over its assignee's roster phase
+stdout | lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > FIX_BEFORE_VERIFY=enforce — no verifier runs against unfixed code > QA does not start until TEAM-4241 completes, and CI not until TEAM-4242 does
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 6 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4229: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4230: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4241: NEW → todo
+[orchestrator] Tracked new ticket TEAM-4241 (agentcore_hub_code_sweeper) in workflow wf_1788780725940_c2uqki
+[orchestrator] Initialized manifest for wf_1788780725940_c2uqki
+[orchestrator] Invoking agent agentcore_hub_code_sweeper for ticket TEAM-4241
+[orchestrator] Using Harness for agentcore_hub_code_sweeper
+[orchestrator] Async invoke sent for agentcore_hub_code_sweeper (session: TEAM-4241_wf_1788780725940_c2uqki-agentcore_hub_code_sweeper-1788845106612)
+[orchestrator] Recorded session for agentcore_hub_code_sweeper in manifest
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4231: todo → done
+
+stdout | lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > FIX_BEFORE_VERIFY=enforce — no verifier runs against unfixed code > QA does not start until TEAM-4241 completes, and CI not until TEAM-4242 does
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4241: in_progress → done
+
+stdout | lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > FIX_BEFORE_VERIFY=enforce — no verifier runs against unfixed code > QA does not start until TEAM-4241 completes, and CI not until TEAM-4242 does
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4242: NEW → blocked
+[orchestrator] Tracked new ticket TEAM-4242 (agentcore_hub_code_sweeper) in workflow wf_1788780725940_c2uqki
+[orchestrator] TEAM-4242: NEW → blocked is the gate's creation-time dependency block, not a review rejection — ignoring.
+
+ ✓ lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > FIX_BEFORE_VERIFY=enforce — no verifier runs against unfixed code > QA does not start until TEAM-4241 completes, and CI not until TEAM-4242 does 677ms
+stdout | lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > the published outcome is not baseline-eligible and raises no performance alert
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 6 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4229: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4230: in_progress → done
+[orchestrator] Workflow wf_1788780725940_c2uqki closed nothing-to-remove (nothing shipped): TEAM-4230 verified 0 removable of 93 candidate(s)
+
+(node:12747) Warning: NodeVersionSupportWarning: The AWS SDK for JavaScript (v3)
+versions published after the first week of January 2027
+will require node >=22. You are running node v20.19.2.
+
+To continue receiving updates to AWS services, bug fixes,
+and security updates please upgrade to node >=22.
+
+More information can be found at: https://a.co/c895JFp
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs > c2uqki replay — SWEEP_DETECTION_PHASE > the published outcome is not baseline-eligible and raises no performance alert 641ms
+stdout | lambda/orchestrator/sweep-noop-close.test.mjs > SWEEP_DETECTION_PHASE=enforce — the orchestrator ends the run > closes nothing-to-remove from the webhook twin, dispatching nobody
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 2 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+[orchestrator] Workflow wf_c2uqki closed nothing-to-remove (nothing shipped): TEAM-4230 verified 0 removable of 93 candidate(s)
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > SWEEP_DETECTION_PHASE=enforce — the orchestrator ends the run > closes nothing-to-remove from the webhook twin, dispatching nobody
+stdout | lambda/orchestrator/sweep-noop-close.test.mjs > SWEEP_DETECTION_PHASE=enforce — the orchestrator ends the run > closes nothing-to-remove from the stream twin, dispatching nobody
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 2 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+[orchestrator] Workflow wf_c2uqki closed nothing-to-remove (nothing shipped): TEAM-4230 verified 0 removable of 93 candidate(s)
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > SWEEP_DETECTION_PHASE=enforce — the orchestrator ends the run > closes nothing-to-remove from the stream twin, dispatching nobody
+stdout | lambda/orchestrator/sweep-noop-close.test.mjs > SWEEP_DETECTION_PHASE=enforce — the orchestrator ends the run > blocks the open agent siblings and leaves the human gate alone
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 2 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+[orchestrator] Workflow wf_c2uqki closed nothing-to-remove (nothing shipped): TEAM-4230 verified 0 removable of 93 candidate(s)
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > SWEEP_DETECTION_PHASE=enforce — the orchestrator ends the run > blocks the open agent siblings and leaves the human gate alone
+stdout | lambda/orchestrator/sweep-noop-close.test.mjs > SWEEP_DETECTION_PHASE=enforce — the orchestrator ends the run > labels the PR when the record carries one
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 2 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+[orchestrator] Workflow wf_c2uqki closed nothing-to-remove (nothing shipped): TEAM-4230 verified 0 removable of 93 candidate(s)
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > SWEEP_DETECTION_PHASE=enforce — the orchestrator ends the run > labels the PR when the record carries one
+stdout | lambda/orchestrator/sweep-noop-close.test.mjs > SWEEP_DETECTION_PHASE=enforce — the orchestrator ends the run > a failing label never blocks the close (best-effort by contract)
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 2 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+[orchestrator] Workflow wf_c2uqki closed nothing-to-remove (nothing shipped): TEAM-4230 verified 0 removable of 93 candidate(s)
+
+stderr | lambda/orchestrator/sweep-noop-close.test.mjs > SWEEP_DETECTION_PHASE=enforce — the orchestrator ends the run > a failing label never blocks the close (best-effort by contract)
+[orchestrator] PR label sweep:no-op skipped for https://github.com/tycenjmccann/ember/pull/60: GitHub POST /repos/tycenjmccann/ember/issues/60/labels 403: forbidden
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > SWEEP_DETECTION_PHASE=enforce — the orchestrator ends the run > a failing label never blocks the close (best-effort by contract)
+stdout | lambda/orchestrator/sweep-noop-close.test.mjs > SWEEP_DETECTION_PHASE=enforce — the orchestrator ends the run > closes exactly ONCE across the two twins — the CAS is the only arbiter
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 2 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+[orchestrator] Workflow wf_c2uqki closed nothing-to-remove (nothing shipped): TEAM-4230 verified 0 removable of 93 candidate(s)
+[orchestrator] Workflow wf_c2uqki already terminal — skipping duplicate nothing-to-remove close.
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > SWEEP_DETECTION_PHASE=enforce — the orchestrator ends the run > closes exactly ONCE across the two twins — the CAS is the only arbiter
+stdout | lambda/orchestrator/sweep-noop-close.test.mjs > SWEEP_DETECTION_PHASE=enforce — the orchestrator ends the run > matches the detection ticket by the def's phase agent when the stamp is missing
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 2 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+[orchestrator] Workflow wf_c2uqki closed nothing-to-remove (nothing shipped): TEAM-4230 verified 0 removable of 93 candidate(s)
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > SWEEP_DETECTION_PHASE=enforce — the orchestrator ends the run > matches the detection ticket by the def's phase agent when the stamp is missing
+stdout | lambda/orchestrator/sweep-noop-close.test.mjs > SWEEP_DETECTION_PHASE=enforce — the orchestrator ends the run > does NOT close a productive sweep — 8 removals cascade as always
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 2 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > SWEEP_DETECTION_PHASE=enforce — the orchestrator ends the run > does NOT close a productive sweep — 8 removals cascade as always
+stdout | lambda/orchestrator/sweep-noop-close.test.mjs > SWEEP_DETECTION_PHASE=enforce — the orchestrator ends the run > does NOT close on a record with no yield field at all (every pre-D2 record)
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 2 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > SWEEP_DETECTION_PHASE=enforce — the orchestrator ends the run > does NOT close on a record with no yield field at all (every pre-D2 record)
+stdout | lambda/orchestrator/sweep-noop-close.test.mjs > SWEEP_DETECTION_PHASE=enforce — the orchestrator ends the run > does NOT close a run on another def, even at zero yield
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 2 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > SWEEP_DETECTION_PHASE=enforce — the orchestrator ends the run > does NOT close a run on another def, even at zero yield
+stdout | lambda/orchestrator/sweep-noop-close.test.mjs > SWEEP_DETECTION_PHASE=enforce — the orchestrator ends the run > degrades to today's behaviour when the record read throws
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 2 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+
+stderr | lambda/orchestrator/sweep-noop-close.test.mjs > SWEEP_DETECTION_PHASE=enforce — the orchestrator ends the run > degrades to today's behaviour when the record read throws
+[orchestrator] evidence harvest skipped for TEAM-4230: no readable completions/TEAM-4230.json
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > SWEEP_DETECTION_PHASE=enforce — the orchestrator ends the run > degrades to today's behaviour when the record read throws
+stdout | lambda/orchestrator/sweep-noop-close.test.mjs > SWEEP_DETECTION_PHASE=shadow — observe, change nothing > publishes sweep.detection_observed and still cascades as today
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 2 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > SWEEP_DETECTION_PHASE=shadow — observe, change nothing > publishes sweep.detection_observed and still cascades as today
+stdout | lambda/orchestrator/sweep-noop-close.test.mjs > SWEEP_DETECTION_PHASE=shadow — observe, change nothing > is the UNSET default — a fresh deploy observes rather than acts
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 2 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+
+stdout | lambda/orchestrator/sweep-noop-close.test.mjs > SWEEP_DETECTION_PHASE=shadow — observe, change nothing > is the UNSET default — a fresh deploy observes rather than acts
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 2 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > SWEEP_DETECTION_PHASE=shadow — observe, change nothing > is the UNSET default — a fresh deploy observes rather than acts
+stdout | lambda/orchestrator/sweep-noop-close.test.mjs > SWEEP_DETECTION_PHASE=shadow — observe, change nothing > garbage coalesces to off, never to enforce
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 2 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+
+stdout | lambda/orchestrator/sweep-noop-close.test.mjs > SWEEP_DETECTION_PHASE=shadow — observe, change nothing > garbage coalesces to off, never to enforce
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 2 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > SWEEP_DETECTION_PHASE=shadow — observe, change nothing > garbage coalesces to off, never to enforce
+stdout | lambda/orchestrator/sweep-noop-close.test.mjs > SWEEP_DETECTION_PHASE=off — byte-identical to pre-4247 > does not read the completion record for the gate, and publishes nothing new
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 2 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > SWEEP_DETECTION_PHASE=off — byte-identical to pre-4247 > does not read the completion record for the gate, and publishes nothing new
+stdout | lambda/orchestrator/sweep-noop-close.test.mjs > the detection required-phase strip (config can be synced at any time) > strips the REQUIREMENT under shadow, keeping every other phase in order
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 2 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > the detection required-phase strip (config can be synced at any time) > strips the REQUIREMENT under shadow, keeping every other phase in order
+stdout | lambda/orchestrator/sweep-noop-close.test.mjs > the detection required-phase strip (config can be synced at any time) > strips the REQUIREMENT under off
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 2 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > the detection required-phase strip (config can be synced at any time) > strips the REQUIREMENT under off
+stdout | lambda/orchestrator/sweep-noop-close.test.mjs > the detection required-phase strip (config can be synced at any time) > KEEPS the requirement under enforce — the gate and the requirement arm together
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 2 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > the detection required-phase strip (config can be synced at any time) > KEEPS the requirement under enforce — the gate and the requirement arm together
+stdout | lambda/orchestrator/sweep-noop-close.test.mjs > the detection required-phase strip (config can be synced at any time) > NEVER strips the phase itself, in any mode
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 2 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+
+stdout | lambda/orchestrator/sweep-noop-close.test.mjs > the detection required-phase strip (config can be synced at any time) > NEVER strips the phase itself, in any mode
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 2 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+
+stdout | lambda/orchestrator/sweep-noop-close.test.mjs > the detection required-phase strip (config can be synced at any time) > NEVER strips the phase itself, in any mode
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 2 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > the detection required-phase strip (config can be synced at any time) > NEVER strips the phase itself, in any mode
+stdout | lambda/orchestrator/sweep-noop-close.test.mjs > the detection required-phase strip (config can be synced at any time) > does not mutate the def it is given (the defs cache is shared)
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 2 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > the detection required-phase strip (config can be synced at any time) > does not mutate the def it is given (the defs cache is shared)
+stdout | lambda/orchestrator/sweep-noop-close.test.mjs > the detection required-phase strip (config can be synced at any time) > leaves a def with no detection requirement untouched, by identity
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 2 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > the detection required-phase strip (config can be synced at any time) > leaves a def with no detection requirement untouched, by identity
+stdout | lambda/orchestrator/sweep-noop-close.test.mjs > no dispatch AFTER the close (the level-trigger paths) > refuses a late "ready" delivery for the reviewer once the run is closed
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 2 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+[orchestrator] Workflow wf_c2uqki closed nothing-to-remove (nothing shipped): TEAM-4230 verified 0 removable of 93 candidate(s)
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4231: blocked → ready
+[orchestrator] GUARD: Skipping invocation for TEAM-4231 — workflow wf_c2uqki is nothing-to-remove
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > no dispatch AFTER the close (the level-trigger paths) > refuses a late "ready" delivery for the reviewer once the run is closed
+stdout | lambda/orchestrator/sweep-noop-close.test.mjs > no dispatch AFTER the close (the level-trigger paths) > refuses a late "todo" delivery for the reviewer once the run is closed
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 2 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+[orchestrator] Workflow wf_c2uqki closed nothing-to-remove (nothing shipped): TEAM-4230 verified 0 removable of 93 candidate(s)
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4231: blocked → todo
+[orchestrator] GUARD: Skipping invocation for TEAM-4231 — workflow wf_c2uqki is nothing-to-remove
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > no dispatch AFTER the close (the level-trigger paths) > refuses a late "todo" delivery for the reviewer once the run is closed
+stdout | lambda/orchestrator/sweep-noop-close.test.mjs > no dispatch AFTER the close (the level-trigger paths) > DOES dispatch the same delivery while the run is open (the guard is the only difference)
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 2 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4231: blocked → ready
+[orchestrator] Invoking agent agentcore_hub_code_reviewer for ticket TEAM-4231
+[orchestrator] Using Harness for agentcore_hub_code_reviewer
+[orchestrator] Async invoke sent for agentcore_hub_code_reviewer (session: TEAM-4231_wf_c2uqki-agentcore_hub_code_reviewer-1788845109865)
+
+stderr | lambda/orchestrator/sweep-noop-close.test.mjs > no dispatch AFTER the close (the level-trigger paths) > DOES dispatch the same delivery while the run is open (the guard is the only difference)
+[orchestrator] Manifest init failed (non-fatal): NoSuchKey: workflows/wf_c2uqki/shared/manifest.json
+[orchestrator] repo-check skipped for wf_c2uqki: [vitest] No "setRepoCheck" export is defined on the "./workflow-store.mjs" mock. Did you forget to return it from "vi.mock"?
+If you need to partially mock a module, you can use "importOriginal" helper inside:
+
+[orchestrator] Manifest session write failed (non-fatal): NoSuchKey: workflows/wf_c2uqki/shared/manifest.json
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > no dispatch AFTER the close (the level-trigger paths) > DOES dispatch the same delivery while the run is open (the guard is the only difference)
+stdout | lambda/orchestrator/sweep-noop-close.test.mjs > no dispatch AFTER the close (the level-trigger paths) > the reconcile sweep does not even SEE a closed run (the scan's terminal filter)
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 2 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+[orchestrator] reconcile sweep (mode=enforce)
+{"_aws":{"Timestamp":1788845109912,"CloudWatchMetrics":[{"Namespace":"AgentCoreHub/Orchestrator","Dimensions":[[]],"Metrics":[{"Name":"ReconcileSweepDurationMs","Unit":"Milliseconds"},{"Name":"ReconcileSweepCandidates","Unit":"Count"},{"Name":"ReconcileSkippedLiveLease","Unit":"Count"},{"Name":"ReconcileRedispatch","Unit":"Count"},{"Name":"ReconcileEscalations","Unit":"Count"},{"Name":"ReconcileEscalationHeld","Unit":"Count"},{"Name":"ReconcileReviewReawaken","Unit":"Count"},{"Name":"ReconcileWouldRedispatch","Unit":"Count"},{"Name":"ReconcileNoop","Unit":"Count"},{"Name":"ReconcileCandidateErrors","Unit":"Count"},{"Name":"ReconcileSweepTruncated","Unit":"Count"}]}]},"ReconcileMode":"enforce","ReconcileSweepDurationMs":1,"ReconcileSweepCandidates":0,"ReconcileSkippedLiveLease":0,"ReconcileRedispatch":0,"ReconcileEscalations":0,"ReconcileEscalationHeld":0,"ReconcileReviewReawaken":0,"ReconcileWouldRedispatch":0,"ReconcileNoop":0,"ReconcileCandidateErrors":0,"ReconcileSweepTruncated":0}
+[orchestrator] reconcile sweep done — mode=enforce candidates=0 skippedLiveLease=0 redispatched=0 escalated=0 escalationHeld=0 reviewReawakened=0 wouldRedispatch=0 noop=0 candidateErrors=0 truncated=false durationMs=1 (sweep reconcile_1788845109911)
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > no dispatch AFTER the close (the level-trigger paths) > the reconcile sweep does not even SEE a closed run (the scan's terminal filter)
+stdout | lambda/orchestrator/sweep-noop-close.test.mjs > no dispatch AFTER the close (the level-trigger paths) > …and DOES see the same run while it is open (non-vacuous)
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 2 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+[orchestrator] reconcile sweep (mode=enforce)
+[orchestrator] Using Harness for agentcore_hub_code_reviewer
+[orchestrator] Async invoke sent for agentcore_hub_code_reviewer (session: TEAM-4231_wf_c2uqki-agentcore_hub_code_reviewer-1788845109959)
+[orchestrator] reconcile.recover — TEAM-4231 status=todo → redispatched (sweep reconcile_1788845109956)
+{"_aws":{"Timestamp":1788845109959,"CloudWatchMetrics":[{"Namespace":"AgentCoreHub/Orchestrator","Dimensions":[[]],"Metrics":[{"Name":"ReconcileSweepDurationMs","Unit":"Milliseconds"},{"Name":"ReconcileSweepCandidates","Unit":"Count"},{"Name":"ReconcileSkippedLiveLease","Unit":"Count"},{"Name":"ReconcileRedispatch","Unit":"Count"},{"Name":"ReconcileEscalations","Unit":"Count"},{"Name":"ReconcileEscalationHeld","Unit":"Count"},{"Name":"ReconcileReviewReawaken","Unit":"Count"},{"Name":"ReconcileWouldRedispatch","Unit":"Count"},{"Name":"ReconcileNoop","Unit":"Count"},{"Name":"ReconcileCandidateErrors","Unit":"Count"},{"Name":"ReconcileSweepTruncated","Unit":"Count"}]}]},"ReconcileMode":"enforce","ReconcileSweepDurationMs":3,"ReconcileSweepCandidates":1,"ReconcileSkippedLiveLease":0,"ReconcileRedispatch":1,"ReconcileEscalations":0,"ReconcileEscalationHeld":0,"ReconcileReviewReawaken":0,"ReconcileWouldRedispatch":0,"ReconcileNoop":0,"ReconcileCandidateErrors":0,"ReconcileSweepTruncated":0}
+[orchestrator] reconcile sweep done — mode=enforce candidates=1 skippedLiveLease=0 redispatched=1 escalated=0 escalationHeld=0 reviewReawakened=0 wouldRedispatch=0 noop=0 candidateErrors=0 truncated=false durationMs=3 (sweep reconcile_1788845109956)
+
+stderr | lambda/orchestrator/sweep-noop-close.test.mjs > no dispatch AFTER the close (the level-trigger paths) > …and DOES see the same run while it is open (non-vacuous)
+[orchestrator] repo-check skipped for wf_c2uqki: [vitest] No "setRepoCheck" export is defined on the "./workflow-store.mjs" mock. Did you forget to return it from "vi.mock"?
+If you need to partially mock a module, you can use "importOriginal" helper inside:
+
+[orchestrator] Manifest session write failed (non-fatal): NoSuchKey: workflows/wf_c2uqki/shared/manifest.json
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > no dispatch AFTER the close (the level-trigger paths) > …and DOES see the same run while it is open (non-vacuous)
+stdout | lambda/orchestrator/sweep-noop-close.test.mjs > yield-aware gate depth (FR-D2.6) > tells the QA verifier and the CI agent that the diff is deletion-free
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 2 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+
+stderr | lambda/orchestrator/sweep-noop-close.test.mjs > yield-aware gate depth (FR-D2.6) > tells the QA verifier and the CI agent that the diff is deletion-free
+[orchestrator] repo-check skipped for wf_c2uqki: [vitest] No "setRepoCheck" export is defined on the "./workflow-store.mjs" mock. Did you forget to return it from "vi.mock"?
+If you need to partially mock a module, you can use "importOriginal" helper inside:
+
+[orchestrator] repo-check skipped for wf_c2uqki: [vitest] No "setRepoCheck" export is defined on the "./workflow-store.mjs" mock. Did you forget to return it from "vi.mock"?
+If you need to partially mock a module, you can use "importOriginal" helper inside:
+
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > yield-aware gate depth (FR-D2.6) > tells the QA verifier and the CI agent that the diff is deletion-free
+stdout | lambda/orchestrator/sweep-noop-close.test.mjs > yield-aware gate depth (FR-D2.6) > tells the code reviewer the opposite — nothing about the ledger review is relaxed
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 2 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+
+stderr | lambda/orchestrator/sweep-noop-close.test.mjs > yield-aware gate depth (FR-D2.6) > tells the code reviewer the opposite — nothing about the ledger review is relaxed
+[orchestrator] repo-check skipped for wf_c2uqki: [vitest] No "setRepoCheck" export is defined on the "./workflow-store.mjs" mock. Did you forget to return it from "vi.mock"?
+If you need to partially mock a module, you can use "importOriginal" helper inside:
+
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > yield-aware gate depth (FR-D2.6) > tells the code reviewer the opposite — nothing about the ledger review is relaxed
+stdout | lambda/orchestrator/sweep-noop-close.test.mjs > yield-aware gate depth (FR-D2.6) > says nothing at all to the personas whose depth it does not set
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 2 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+
+stderr | lambda/orchestrator/sweep-noop-close.test.mjs > yield-aware gate depth (FR-D2.6) > says nothing at all to the personas whose depth it does not set
+[orchestrator] repo-check skipped for wf_c2uqki: [vitest] No "setRepoCheck" export is defined on the "./workflow-store.mjs" mock. Did you forget to return it from "vi.mock"?
+If you need to partially mock a module, you can use "importOriginal" helper inside:
+
+[orchestrator] repo-check skipped for wf_c2uqki: [vitest] No "setRepoCheck" export is defined on the "./workflow-store.mjs" mock. Did you forget to return it from "vi.mock"?
+If you need to partially mock a module, you can use "importOriginal" helper inside:
+
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > yield-aware gate depth (FR-D2.6) > says nothing at all to the personas whose depth it does not set
+stdout | lambda/orchestrator/sweep-noop-close.test.mjs > yield-aware gate depth (FR-D2.6) > says nothing when the sweep DID remove code — 8 removals get the full battery
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 2 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+
+stderr | lambda/orchestrator/sweep-noop-close.test.mjs > yield-aware gate depth (FR-D2.6) > says nothing when the sweep DID remove code — 8 removals get the full battery
+[orchestrator] repo-check skipped for wf_c2uqki: [vitest] No "setRepoCheck" export is defined on the "./workflow-store.mjs" mock. Did you forget to return it from "vi.mock"?
+If you need to partially mock a module, you can use "importOriginal" helper inside:
+
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > yield-aware gate depth (FR-D2.6) > says nothing when the sweep DID remove code — 8 removals get the full battery
+stdout | lambda/orchestrator/sweep-noop-close.test.mjs > yield-aware gate depth (FR-D2.6) > says nothing on a run whose record predates the field entirely
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 2 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+
+stderr | lambda/orchestrator/sweep-noop-close.test.mjs > yield-aware gate depth (FR-D2.6) > says nothing on a run whose record predates the field entirely
+[orchestrator] repo-check skipped for wf_c2uqki: [vitest] No "setRepoCheck" export is defined on the "./workflow-store.mjs" mock. Did you forget to return it from "vi.mock"?
+If you need to partially mock a module, you can use "importOriginal" helper inside:
+
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > yield-aware gate depth (FR-D2.6) > says nothing on a run whose record predates the field entirely
+stdout | lambda/orchestrator/sweep-noop-close.test.mjs > yield-aware gate depth (FR-D2.6) > says nothing on another def, even at zero yield
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 2 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+
+stderr | lambda/orchestrator/sweep-noop-close.test.mjs > yield-aware gate depth (FR-D2.6) > says nothing on another def, even at zero yield
+[orchestrator] repo-check skipped for wf_c2uqki: [vitest] No "setRepoCheck" export is defined on the "./workflow-store.mjs" mock. Did you forget to return it from "vi.mock"?
+If you need to partially mock a module, you can use "importOriginal" helper inside:
+
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > yield-aware gate depth (FR-D2.6) > says nothing on another def, even at zero yield
+stdout | lambda/orchestrator/sweep-noop-close.test.mjs > yield-aware gate depth (FR-D2.6) > respects the 200-char package-bullet clamp, and drops the count when it is absent
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 2 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > yield-aware gate depth (FR-D2.6) > respects the 200-char package-bullet clamp, and drops the count when it is absent
+stdout | lambda/orchestrator/sweep-noop-close.test.mjs > yield-aware gate depth (FR-D2.6) > leads the human merge gate's package with the same line
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 2 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4239: blocked → ready
+[orchestrator] TEAM-4239 parked for human review (engineer) — not invoking an agent.
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > yield-aware gate depth (FR-D2.6) > leads the human merge gate's package with the same line
+
+ Test Files  2 passed (2)
+      Tests  51 passed (51)
+   Start at  05:24:58
+   Duration  12.12s (transform 694ms, setup 0ms, collect 376ms, tests 9.04s, environment 1ms, prepare 260ms)
+
+VITEST_EXIT=0
+
+*** INCOMPLETE — HALF 1 covered items 1-7 only. This log holds the vitest run for
+*** item 8 as a checkpoint; its assertion audit and probe belong to HALF 2.

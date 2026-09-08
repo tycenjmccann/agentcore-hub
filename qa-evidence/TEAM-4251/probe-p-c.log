@@ -1,0 +1,109 @@
+=== P-C.1  producer output shape, then consumer guard on that output ===
+  CSV string (what runtime-agent main.py:1822 sends)
+    input            = "qa-evidence/401.png,qa-evidence/run.log"
+    stored record    = {"evidence_keys":"qa-evidence/401.png,qa-evidence/run.log"}
+    typeof stored    = string
+    Array.isArray    = false
+    orchestrator harvests evidence_keys? -> NO
+  single-key string
+    input            = "qa-evidence/a.png"
+    stored record    = {"evidence_keys":"qa-evidence/a.png"}
+    typeof stored    = string
+    Array.isArray    = false
+    orchestrator harvests evidence_keys? -> NO
+  array (only reachable via a direct Lambda invoke)
+    input            = ["qa-evidence/a.png","qa-evidence/b.png"]
+    stored record    = {"evidence_keys":"qa-evidence/a.png,qa-evidence/b.png"}
+    typeof stored    = string
+    Array.isArray    = false
+    orchestrator harvests evidence_keys? -> NO
+  empty string
+    input            = ""
+    stored record    = {}
+    typeof stored    = undefined
+    Array.isArray    = false
+    orchestrator harvests evidence_keys? -> NO
+  undefined
+    input            = undefined
+    stored record    = {}
+    typeof stored    = undefined
+    Array.isArray    = false
+    orchestrator harvests evidence_keys? -> NO
+
+  harvested in 0 of 5 cases
+
+=== P-C.2  the ONLY record shape that would satisfy the consumer ===
+  hand-built record {"evidence_keys":["qa-evidence/a.png"]} -> harvests=true
+  ...but producerNormalize can never emit that shape: .join(",") makes it a string.
+
+=== P-C.3  cross-check — live-reverify.mjs reads the SAME field CSV-correctly ===
+  CSV string (what runtime-agent main.py:1822 sends): splitCsv(record.evidence_keys) -> ["qa-evidence/401.png","qa-evidence/run.log"]
+  single-key string: splitCsv(record.evidence_keys) -> ["qa-evidence/a.png"]
+  array (only reachable via a direct Lambda invoke): splitCsv(record.evidence_keys) -> ["qa-evidence/a.png","qa-evidence/b.png"]
+  empty string: splitCsv(record.evidence_keys) -> []
+  undefined: splitCsv(record.evidence_keys) -> []
+
+=== P-C VERDICT ===
+  Producer writes:  string (always — arrays are .join(",")-flattened)
+  Consumer expects: Array  (Array.isArray guard at index.mjs:2751)
+  => They DO NOT AGREE. The harvest branch is UNREACHABLE for any record
+     written by workflow-output, so agentTasks[t].evidence_keys is never set.
+  => Blast radius today: nil. grep shows NOTHING reads the harvested
+     entry.evidence_keys, and live-reverify.mjs:116 reads the S3 record
+     directly through a shape-tolerant splitCsv (handles string AND array).
+     It is a dead branch / latent bug, not a live functional break.
+EXIT=0
+
+=== P-C.4  the two real source sites, quoted at this HEAD ===
+PRODUCER — lambda/workflow-output/index.mjs:234-240:
+  if (kind) {
+    if (EVIDENCE_KINDS.includes(kind)) report.evidence_kind = kind;
+    else console.warn(`[report_completion] dropping unknown evidence_kind "${kind}" (expected ${EVIDENCE_KINDS.join("|")})`);
+  }
+  const keys = typeof evidence_keys === "string" ? evidence_keys.trim() : Array.isArray(evidence_keys) ? evidence_keys.join(",") : "";
+  if (keys) report.evidence_keys = keys;
+
+
+CONSUMER — lambda/orchestrator/index.mjs:2748-2754 (inside harvestCompletionEvidence):
+    if (record.ci_head_sha && !entry?.ci_head_sha) fields.ci_head_sha = record.ci_head_sha;
+    if (record.ci_status && !entry?.ci_status) fields.ci_status = record.ci_status;
+    if (record.evidence_kind && !entry?.evidence_kind) fields.evidence_kind = record.evidence_kind;
+    if (Array.isArray(record.evidence_keys) && record.evidence_keys.length > 0 && !entry?.evidence_keys) {
+      fields.evidence_keys = record.evidence_keys;
+    }
+    if (record.verdict && !entry?.verdict) fields.verdict = record.verdict;
+
+=== P-C.5  does anything READ the harvested entry.evidence_keys? ===
+$ grep -rn 'evidence_keys' --include=*.mjs --include=*.ts --include=*.tsx --exclude-dir=node_modules . | grep -v '\.test\.'
+qa-evidence/TEAM-4251/probes/p-c-evidence-keys.mjs:2: * P-C — does workflow-output's evidence_keys WRITE shape agree with the
+qa-evidence/TEAM-4251/probes/p-c-evidence-keys.mjs:11: * produce (`evidence_keys: str = ""` — a comma-separated string).
+qa-evidence/TEAM-4251/probes/p-c-evidence-keys.mjs:15:function producerNormalize(evidence_keys) {
+qa-evidence/TEAM-4251/probes/p-c-evidence-keys.mjs:17:    typeof evidence_keys === "string"
+qa-evidence/TEAM-4251/probes/p-c-evidence-keys.mjs:18:      ? evidence_keys.trim()
+qa-evidence/TEAM-4251/probes/p-c-evidence-keys.mjs:19:      : Array.isArray(evidence_keys)
+qa-evidence/TEAM-4251/probes/p-c-evidence-keys.mjs:20:        ? evidence_keys.join(",")
+qa-evidence/TEAM-4251/probes/p-c-evidence-keys.mjs:23:  if (keys) report.evidence_keys = keys;
+qa-evidence/TEAM-4251/probes/p-c-evidence-keys.mjs:30:    Array.isArray(record.evidence_keys) &&
+qa-evidence/TEAM-4251/probes/p-c-evidence-keys.mjs:31:    record.evidence_keys.length > 0 &&
+qa-evidence/TEAM-4251/probes/p-c-evidence-keys.mjs:32:    !entry?.evidence_keys
+qa-evidence/TEAM-4251/probes/p-c-evidence-keys.mjs:51:  const stored = record.evidence_keys;
+qa-evidence/TEAM-4251/probes/p-c-evidence-keys.mjs:59:  console.log(`    orchestrator harvests evidence_keys? -> ${harvests ? "YES" : "NO"}`);
+qa-evidence/TEAM-4251/probes/p-c-evidence-keys.mjs:64:const arrayRecord = { evidence_keys: ["qa-evidence/a.png"] };
+qa-evidence/TEAM-4251/probes/p-c-evidence-keys.mjs:72:  console.log(`  ${label}: splitCsv(record.evidence_keys) -> ${JSON.stringify(extractEvidenceKeys(record))}`);
+qa-evidence/TEAM-4251/probes/p-c-evidence-keys.mjs:79:console.log("     written by workflow-output, so agentTasks[t].evidence_keys is never set.");
+qa-evidence/TEAM-4251/probes/p-c-evidence-keys.mjs:81:console.log("     entry.evidence_keys, and live-reverify.mjs:116 reads the S3 record");
+qa-evidence/TEAM-4251/probes/p-c-splitcsv-shim.mjs:13:  return [...splitCsv(record.artifacts), ...splitCsv(record.evidence_keys)];
+lambda/orchestrator/index.mjs:2751:    if (Array.isArray(record.evidence_keys) && record.evidence_keys.length > 0 && !entry?.evidence_keys) {
+lambda/orchestrator/index.mjs:2752:      fields.evidence_keys = record.evidence_keys;
+lambda/orchestrator/live-reverify.mjs:116:  const keys = [...splitCsv(record.artifacts), ...splitCsv(record.evidence_keys)];
+lambda/workflow-output/index.mjs:220:async function reportCompletion({ ticket_id, summary, artifacts = "", branch, commit_sha, pr_url, workflow_id, agent_id, evidence_kind, evidence_keys, ci_status, ci_build_id, ci_head_sha, verdict, tested_head, verified_removable, candidates }) {
+lambda/workflow-output/index.mjs:238:  const keys = typeof evidence_keys === "string" ? evidence_keys.trim() : Array.isArray(evidence_keys) ? evidence_keys.join(",") : "";
+lambda/workflow-output/index.mjs:239:  if (keys) report.evidence_keys = keys;
+
+  Only THREE non-test sites exist:
+    workflow-output/index.mjs:238-239   WRITES the field (always a string)
+    orchestrator/index.mjs:2751-2752    harvests it, gated on Array.isArray -> DEAD
+    live-reverify.mjs:116               reads the S3 record directly via splitCsv
+  Nothing anywhere reads the HARVESTED agentTasks[t].evidence_keys, so the dead
+  branch has no functional consequence today. Latent bug, not a live break.
+EXIT=0

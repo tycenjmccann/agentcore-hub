@@ -1,0 +1,77 @@
+=== ITEM 2 (D1) — a Re-verify QA ticket and a Re-verify CI ticket exist, EACH BLOCKED ON TEAM-4183 ===
+Named file: lambda/orchestrator/replay-dowtdh-verdict-gate.test.mjs  test (b)
+
+--- 1. verbose run: the (b) test ---
+ ✓ lambda/orchestrator/replay-dowtdh-verdict-gate.test.mjs > dowtdh replay — the D1 flags > (b) a Re-verify ticket owned by agentcore_hub_qa_verifier AND one owned by agentcore_hub_ci_agent exist, tied to TEAM-4183 357ms
+
+--- 2. the ACTUAL assertions (lines 786-824) ---
+    const owned = (assignee) => reverifyTickets().filter((t) => t.assignee === assignee);
+
+    // ── The QA re-verify, from the cascade hold on TEAM-4181's FAIL.
+    const [qaRv] = owned(QA_VERIFIER_ID);
+    expect(qaRv).toBeTruthy();
+    expect(qaRv.summary).toMatch(/^Re-verify \(round \d+\)/);
+    expect(qaRv.spawned_by).toMatchObject({ kind: "qa_fix", reverify: true, rearmOf: QA, headSha: CODE_HEAD });
+
+    // …and it waits on TEAM-4183 even though QA filed nothing of its own: TEAM-4183
+    // is the REVIEWER's fix, and FR-D1.5/D1.6 holds a non-PASS gate behind every fix
+    // open under the epic regardless of who filed it. Without that union this ticket
+    // would dispatch against the unfixed head and fail for the same reason — a whole
+    // round burned, which is the loop the gate exists to stop.
+    expect(qaRv.blocked_by).toEqual([FIX]);
+    const [reviewerRv] = owned("agentcore_hub_code_reviewer");
+    expect(reviewerRv.blocked_by).toEqual([FIX]);
+    expect(reviewerRv.spawned_by).toMatchObject({ kind: "review_fix", reverify: true, rearmOf: REVIEW });
+
+    // ── The CI re-verify. CI reported PASS, so no cascade hold fired for it; it
+    // comes from the completion gate's stale-head remediation instead, which is the
+    // only layer that can notice CI certified 12e9ac6 while 001259d shipped.
+    const [ciRv] = owned(CI_AGENT_ID);
+    expect(ciRv).toBeTruthy();
+    expect(ciRv.summary).toMatch(/^Re-verify \(round \d+\)/);
+    expect(ciRv.spawned_by).toMatchObject({ kind: "ci_fix", reverify: true, rearmOf: CI });
+
+    // It is blocked on nothing BY DESIGN: TEAM-4183 is already done by the time
+    // completion is attempted, so an edge onto it would be inert — and `reason` is
+    // not a persisted spawnedBy field at all, it rides on the event.
+    expect(ciRv.blocked_by).toEqual([]);
+    expect(ciRv.spawned_by.headSha.startsWith("001259d")).toBe(true);
+    expect(ciRv.spawned_by.headSha).toBe(SHIPPED_HEAD);
+    const ciFiled = detailsOfType("fix.reverify_created").find((e) => e.owner === CI_AGENT_ID);
+    expect(ciFiled).toMatchObject({ kind: "gate", reason: "stale-head", blockedBy: [] });
+
+    // Both verifiers are re-armed at the head that actually shipped or the head they
+    // were told to re-run at — which is the whole remediation.
+    expect(reverifyTickets().every((t) => t.spawned_by.reverify === true)).toBe(true);
+  });
+
+--- 3. assertion audit ---
+  BOTH TICKETS EXIST — verified:
+    L789-790  const [qaRv] = owned(QA_VERIFIER_ID);  expect(qaRv).toBeTruthy();
+    L807-808  const [ciRv] = owned(CI_AGENT_ID);     expect(ciRv).toBeTruthy();
+    L791/809  both summaries match /^Re-verify \(round \d+\)/
+    L792      qaRv.spawned_by -> { kind: "qa_fix", reverify: true, rearmOf: TEAM-4181 }
+    L810      ciRv.spawned_by -> { kind: "ci_fix", reverify: true, rearmOf: TEAM-4182 }
+
+  "EACH BLOCKED ON TEAM-4183" — NOT VERIFIED. Only the QA one is:
+    L799  expect(qaRv.blocked_by).toEqual([FIX]);        <- TEAM-4183. matches acceptance.
+    L815  expect(ciRv.blocked_by).toEqual([]);           <- BLOCKED ON NOTHING.
+    L819  expect(ciFiled).toMatchObject({ kind: "gate", reason: "stale-head", blockedBy: [] });
+
+  The test ASSERTS the CI re-verify has an EMPTY blocked_by, and documents why
+  (L812-814): "It is blocked on nothing BY DESIGN: TEAM-4183 is already done by the
+  time completion is attempted, so an edge onto it would be inert."
+
+  The two tickets also have DIFFERENT PROVENANCE, which the acceptance text flattens:
+    * the QA re-verify comes from the CASCADE hold on TEAM-4181's FAIL verdict.
+    * the CI re-verify comes from the COMPLETION gate's stale-head remediation
+      (L804-806), because CI reported PASS so no cascade hold ever fired for it.
+    * a THIRD re-verify exists that the acceptance text does not mention at all —
+      the code_reviewer's, L800-802, also blocked_by [TEAM-4183].
+  Note the test's own title says the tickets are "tied to TEAM-4183", not "blocked
+  on" it — the title is honest; the acceptance wording is what overstates.
+
+  VERDICT: PARTIAL. Both re-verify tickets exist with the right owners/kinds, but
+  only the QA one carries a TEAM-4183 blocker edge. The CI one is deliberately
+  unblocked, so "each blocked on TEAM-4183" is false as written.
+EXIT=0

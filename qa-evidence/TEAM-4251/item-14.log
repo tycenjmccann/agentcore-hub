@@ -1,0 +1,149 @@
+=== ITEM 14 — "chore/dead-code-sweep-2026-09-07 is rewritten to feature/TEAM-4230-code-sweeper IN THE TICKET BODY" ===
+Question posed: does ANY code path rewrite the ticket description/body (Jira or DDB)
+under TICKET_PLAN_VALIDATOR=enforce, or only the dispatch context handed to the agent?
+
+VERDICT: The ticket body/description is NEVER rewritten. In NO mode. The rewrite is
+applied ONLY to the local prompt string handed to the agent. The dev notes
+("context-only, no description write path") are ACCURATE; the ACCEPTANCE WORDING
+("IN THE TICKET BODY") is NOT satisfied.
+
+--- 1. The only production caller of rewriteBranchNames ---
+$ grep -rn "rewriteBranchNames" --include=*.mjs --include=*.ts lambda/ src/ | grep -v "\.test\."
+lambda/orchestrator/index.mjs:88:import { normalizeTicketPlanValidatorMode, canonicalBranchFor, rewriteBranchNames } from "./ticket-plan-validator.mjs";
+lambda/orchestrator/index.mjs:5869:      ? rewriteBranchNames(ticket.description, {
+lambda/orchestrator/ticket-plan-validator.mjs:313:export function rewriteBranchNames(text, { canonical, knownBranches = [] } = {}) {
+lambda/agentcore-hub-tickets/ticket-plan-validator.mjs:313:export function rewriteBranchNames(text, { canonical, knownBranches = [] } = {}) {
+lambda/workflow-output/ticket-plan-validator.mjs:313:export function rewriteBranchNames(text, { canonical, knownBranches = [] } = {}) {
+lambda/agentcore-hub-jira/ticket-plan-validator.mjs:313:export function rewriteBranchNames(text, { canonical, knownBranches = [] } = {}) {
+
+  -> exactly ONE call site: lambda/orchestrator/index.mjs:5869.
+  -> the other three hits are the byte-identical COPIES of the module required by
+     the zero-import contract; none of their own Lambdas ever calls the function:
+
+  $ grep -n rewriteBranchNames lambda/agentcore-hub-tickets/*.mjs | grep -v ticket-plan-validator.mjs
+    (no matches — never called in this Lambda)
+  $ grep -n rewriteBranchNames lambda/agentcore-hub-jira/*.mjs | grep -v ticket-plan-validator.mjs
+    (no matches — never called in this Lambda)
+  $ grep -n rewriteBranchNames lambda/workflow-output/*.mjs | grep -v ticket-plan-validator.mjs
+    (no matches — never called in this Lambda)
+
+--- 2. What the single call site does with the result (index.mjs:5853-5897, quoted) ---
+  // TEAM-4248 D3 — an invented branch name in the ticket prose is the c2uqki
+  // defect reaching the model. The rewrite is CONTEXT-ONLY in both modes: the one
+  // writer of a description is Tickets___update_ticket, which the orchestrator
+  // never calls and which flattens the whole description into a single ADF
+  // paragraph, so persisting this would destroy the structure of every ticket it
+  // touched in order to fix a branch name.
+  //
+  // CONSUMERS only. A producer's prompt is byte-identical in every mode: it is
+  // told the branch to push in the ## Branch block, which it has always had and
+  // has always followed (c2uqki's sweeper pushed the convention while its own
+  // ticket named the invention), so rewriting its prose would change the prompt of
+  // the one persona that was never confused — for nothing.
+  const branchRewrite =
+    TICKET_PLAN_VALIDATOR !== "off" && branchPlan && !branchPlan.producer
+      ? rewriteBranchNames(ticket.description, {
+          canonical: branchPlan.canonical,
+          knownBranches: branchPlan.knownBranches,
+        })
+      : null;
+  if (branchRewrite?.rewrites.length) {
+    const detail = {
+      workflowId: workflow.id,
+      ticketId: ticket.ticketId,
+      assignee: ticket.assignee || null,
+      phase: agentDef?.phase || null,
+      canonical: branchPlan.canonical,
+      rewrites: branchRewrite.rewrites,
+    };
+    // shadow observes and the prompt is byte-identical; enforce is the only mode
+    // in which the rewritten text actually reaches the model.
+    if (TICKET_PLAN_VALIDATOR === "enforce") {
+      await publishEvent(ticket.ticketId, "ticket_plan.branch_rewritten", detail);
+    } else {
+      await publishEvent(ticket.ticketId, "ticket_plan.branch_rewritten_observed", detail);
+    }
+  }
+  const description =
+    TICKET_PLAN_VALIDATOR === "enforce" && branchRewrite?.rewrites.length
+      ? branchRewrite.text
+      : ticket.description;
+
+  let context = `# Your Assignment: ${ticket.title}\n\n`;
+  context += `## Ticket\nID: ${ticket.ticketId}\nDescription: ${description}\n\n`;
+
+--- 3. Every use of the rewrite result ---
+$ grep -n "branchRewrite" lambda/orchestrator/index.mjs
+5867:  const branchRewrite =
+5874:  if (branchRewrite?.rewrites.length) {
+5881:      rewrites: branchRewrite.rewrites,
+5892:    TICKET_PLAN_VALIDATOR === "enforce" && branchRewrite?.rewrites.length
+5893:      ? branchRewrite.text
+
+  Line-by-line: 5867 assigns it; 5874/5881 read only `.rewrites` (the event detail
+  for ticket_plan.branch_rewritten{,_observed}); 5892-5893 read `.text` into the
+  LOCAL const `description`, which line 5897 interpolates into the prompt:
+
+      context += `## Ticket\nID: ${ticket.ticketId}\nDescription: ${description}\n\n`;
+
+  `branchRewrite.text` reaches NO store. There is no putItem/update/PUT anywhere in
+  its data flow — it flows into a template literal and out to the model.
+
+--- 4. Is there a description write path at all? Yes — but the orchestrator never calls it ---
+  The orchestrator's own comment (index.mjs:5856-5860) claims "the one writer of a
+  description is Tickets___update_ticket, which the orchestrator never calls and
+  which flattens the whole description into a single ADF paragraph". Both halves
+  verified independently rather than taken on trust:
+
+  (a) the writer exists and does flatten (lambda/agentcore-hub-jira/index.mjs):
+async function updateTicket(params) {
+  const { ticket_id, description, title } = params;
+
+  const fields = {};
+  if (title) fields.summary = title;
+  if (description) {
+    fields.description = {
+      type: "doc",
+      version: 1,
+      content: [{ type: "paragraph", content: [{ type: "text", text: description }] }],
+    };
+  }
+
+  await jiraFetch(`/rest/api/3/issue/${ticket_id}`, {
+    method: "PUT",
+    body: JSON.stringify({ fields }),
+  });
+
+  return { ticketId: ticket_id, message: "Updated" };
+}
+      -> registered as Tickets___update_ticket / JiraIntegration___update_ticket
+         (lambda/agentcore-hub-jira/index.mjs:1146,1160). It IS a real body-write
+         path, and it does collapse the description to one ADF paragraph.
+
+  (b) the orchestrator never calls it:
+$ grep -n "update_ticket\|updateTicket" lambda/orchestrator/index.mjs
+1758: * real, Jira mode cannot (the ticket-tools Lambda's update_ticket only carries
+5857:  // writer of a description is Tickets___update_ticket, which the orchestrator
+      -> the single hit is the explanatory COMMENT at 5857 and a remark at 1758.
+         No call. Tickets___update_ticket is an AGENT-facing tool; the rewrite is an
+         orchestrator-side prompt transformation. The two never meet.
+
+--- 5. Scope caveats on the rewrite that DOES happen ---
+  * CONSUMERS ONLY: the guard is `TICKET_PLAN_VALIDATOR !== "off" && branchPlan &&
+    !branchPlan.producer` (5868). A producer persona's prompt is byte-identical in
+    every mode — so the sweeper ticket TEAM-4230 itself, the ticket the acceptance
+    text names, is exactly the one whose prose is NOT rewritten. Its downstream
+    reviewer/QA/CI consumers are the ones that see the corrected name.
+  * MODE SPLIT: shadow computes the rewrite and publishes
+    ticket_plan.branch_rewritten_observed, but line 5892 gates the substitution on
+    `=== "enforce"`, so only enforce changes the prompt bytes.
+
+--- CONCLUSION (stated plainly, as requested) ---
+  Under TICKET_PLAN_VALIDATOR=enforce the invented branch name
+  `chore/dead-code-sweep-2026-09-07` IS replaced by `feature/TEAM-4230-code-sweeper`
+  in the DISPATCH CONTEXT of consumer personas, and an event records it. NOTHING
+  writes that correction back to the Jira issue or the DynamoDB ticket row, so
+  anyone reading the ticket in Jira/the UI still sees the invented branch. The
+  acceptance sentence "is rewritten ... IN THE TICKET BODY" is therefore FALSE as
+  written; the implemented behaviour is context-only, which is what the dev notes say.
+EXIT=0

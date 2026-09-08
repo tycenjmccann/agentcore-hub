@@ -1,0 +1,83 @@
+=== P-B.1  the raw material: every done ticket's head-bearing fields ===
+  TEAM-4163 human:product-owner                    status=done  gate=n
+      commitSha=-  testedHead=-  mergeCommit=-  completedAt=2026-09-06T21:48:29.657Z
+  TEAM-4164 agentcore_hub_requirements_analyst     status=done  gate=n
+      commitSha=b7b4018  testedHead=-  mergeCommit=-  completedAt=2026-09-06T22:08:01.901Z
+  TEAM-4174 human:product-owner                    status=done  gate=n
+      commitSha=-  testedHead=-  mergeCommit=-  completedAt=2026-09-06T22:09:37.478Z
+  TEAM-4175 agentcore_hub_frontend_designer        status=done  gate=n
+      commitSha=d04b405  testedHead=-  mergeCommit=-  completedAt=2026-09-06T22:25:42.013Z
+  TEAM-4176 human:product-owner                    status=done  gate=n
+      commitSha=-  testedHead=-  mergeCommit=-  completedAt=2026-09-06T22:30:28.637Z
+  TEAM-4177 agentcore_hub_frontend_dev             status=done  gate=n
+      commitSha=001fe32  testedHead=-  mergeCommit=-  completedAt=2026-09-06T22:41:45.290Z
+  TEAM-4178 human:engineer                         status=done  gate=n
+      commitSha=-  testedHead=-  mergeCommit=-  completedAt=2026-09-06T22:45:24.962Z
+  TEAM-4179 agentcore_hub_frontend_dev             status=done  gate=n
+      commitSha=1dab069  testedHead=-  mergeCommit=-  completedAt=2026-09-06T23:04:05.598Z
+  TEAM-4180 agentcore_hub_code_reviewer            status=done  gate=Y
+      commitSha=933ea6f  testedHead=-  mergeCommit=-  completedAt=2026-09-06T23:19:19.285Z
+  TEAM-4181 agentcore_hub_qa_verifier              status=done  gate=Y
+      commitSha=12e9ac6  testedHead=-  mergeCommit=-  completedAt=2026-09-06T23:36:30.022Z
+  TEAM-4182 agentcore_hub_ci_agent                 status=done  gate=Y
+      commitSha=12e9ac6  testedHead=-  mergeCommit=-  completedAt=2026-09-06T23:42:11.075Z
+  TEAM-4183 agentcore_hub_frontend_dev             status=done  gate=n
+      commitSha=001259d  testedHead=-  mergeCommit=-  completedAt=2026-09-06T23:46:57.093Z
+
+=== P-B.2  evaluateVerifiedHeads on the dossier AS VENDORED (no opts) ===
+  {
+    "ok": true,
+    "reason": null,
+    "heads": {
+      "qa": null,
+      "ci": null,
+      "pr": "001259d6932c9c870889d74e0ac66673cfd7b49e"
+    },
+    "offenders": [],
+    "stalePersonas": []
+  }
+  heads.qa/heads.ci are NULL because the pre-D1 fixture has no testedHead field
+  anywhere — the exact hole D1 exists to close.
+
+=== P-B.3  with tested_head seeded (what the personas write under D1) ===
+  {
+    "ok": false,
+    "reason": "head-divergence",
+    "heads": {
+      "qa": "933ea6f1f04fc0212b88b84a6fcbe6aa0ce1d052",
+      "ci": "12e9ac6ef5081343701945e8a3b39803d9c53cc6",
+      "pr": "001259d6932c9c870889d74e0ac66673cfd7b49e"
+    },
+    "offenders": [],
+    "stalePersonas": [
+      "agentcore_hub_qa_verifier",
+      "agentcore_hub_ci_agent"
+    ]
+  }
+
+=== P-B.4  where did heads.pr come from? ===
+  2026-09-06T22:08:01.901Z  TEAM-4164 agentcore_hub_requirements_analyst b7b4018
+  2026-09-06T22:25:42.013Z  TEAM-4175 agentcore_hub_frontend_designer  d04b405
+  2026-09-06T22:41:45.290Z  TEAM-4177 agentcore_hub_frontend_dev       001fe32
+  2026-09-06T23:04:05.598Z  TEAM-4179 agentcore_hub_frontend_dev       1dab069
+  2026-09-06T23:46:57.093Z  TEAM-4183 agentcore_hub_frontend_dev       001259d
+  newest-by-completedAt = TEAM-4183 @ 001259d
+  heads.pr reported     = 001259d
+  MATCH? YES — heads.pr IS the latest non-gate (dev/fix) commitSha
+
+=== P-B.5  does a caller-supplied prHeadSha win? ===
+  heads.pr with opts.prHeadSha = deadbeefffffffffffffffffffffffffffffffff
+  => the opts path EXISTS and takes precedence (completion.mjs:700,707).
+
+=== P-B.6  is mergeCommit ever used? ===
+  agentTasks entries carrying a mergeCommit: 0
+  headFrom() for the pr slot reads ONLY ["commitSha","commit_sha"]
+  (completion.mjs:747) — mergeCommit is deliberately excluded.
+
+=== P-B VERDICT ===
+  heads.pr = normalizeHeadSha(opts.prHeadSha) when the CALLER supplies one,
+  else the newest `commitSha` on a done NON-GATE, non-human ticket — i.e. the
+  latest dev/fix task commit. It is NOT read from the actual PR or from the
+  integration branch head, and never from mergeCommit.
+  normalizeHeadSha sanity: "933ea6f"
+EXIT=0

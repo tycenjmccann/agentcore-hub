@@ -1,0 +1,435 @@
+=== ITEM 6 — Replayed dowtdh performance card: reworkRounds >= 1, gateRounds >= 2, firstPassYield == 0 ===
+Named: test_metrics.py (already run in gate h); ALSO check lambda/cost-report/index.test.mjs has
+the JS-side equivalent, and that src/lib/workflow/performance.ts mirrors it.
+
+--- (1a) the Python side, re-run in isolation with -v ---
+============================= test session starts ==============================
+platform linux -- Python 3.13.15, pytest-9.1.1, pluggy-1.6.0 -- /tmp/qa-venv/bin/python
+cachedir: .pytest_cache
+rootdir: /mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub
+plugins: asyncio-1.4.0, anyio-4.15.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collecting ... collected 64 items / 58 deselected / 6 selected
+
+deploy/workflow-manager/toolkit/test_metrics.py::OutsideHours::test_the_real_yteqfl_gate_was_asked_on_a_saturday PASSED [ 16%]
+deploy/workflow-manager/toolkit/test_metrics.py::GateVerdicts::test_a_declared_verdict_on_the_event_beats_the_prose PASSED [ 33%]
+deploy/workflow-manager/toolkit/test_metrics.py::GateVerdicts::test_dowtdh_gate_rounds_and_first_pass_yield PASSED [ 50%]
+deploy/workflow-manager/toolkit/test_metrics.py::GateVerdicts::test_no_gate_completion_means_no_yield_rather_than_a_zero PASSED [ 66%]
+deploy/workflow-manager/toolkit/test_metrics.py::GateVerdicts::test_the_first_verdict_decides_the_yield PASSED [ 83%]
+deploy/workflow-manager/toolkit/test_metrics.py::GateVerdicts::test_the_ladder_agrees_with_verdict_contract_on_the_literal_summaries 
+deploy/workflow-manager/toolkit/test_metrics.py::GateVerdicts::test_the_ladder_agrees_with_verdict_contract_on_the_literal_summaries PASSED [100%]
+
+============= 6 passed, 58 deselected, 3 subtests passed in 0.23s ==============
+PYTEST_EXIT=0
+
+--- (1b) the JS side: lambda/cost-report/index.test.mjs (node --test, per ci.yml:41) ---
+TAP version 13
+# (node:12415) Warning: NodeVersionSupportWarning: The AWS SDK for JavaScript (v3)
+# versions published after the first week of January 2027
+# will require node >=22. You are running node v20.19.2.
+# To continue receiving updates to AWS services, bug fixes,
+# and security updates please upgrade to node >=22.
+# More information can be found at: https://a.co/c895JFp
+# (Use `node --trace-warnings ...` to show where the warning was created)
+# Subtest: the shared fixture yields the same fix tickets as the Python toolkit
+ok 1 - the shared fixture yields the same fix tickets as the Python toolkit
+  ---
+  duration_ms: 4.150905
+  ...
+# Subtest: the intake-planned 'Fix:' ticket is excluded, the later one is not
+ok 2 - the intake-planned 'Fix:' ticket is excluded, the later one is not
+  ---
+  duration_ms: 1.068641
+  ...
+# Subtest: no intake signal at all → nothing is excluded (overcount by one beats dropping a fix)
+ok 3 - no intake signal at all → nothing is excluded (overcount by one beats dropping a fix)
+  ---
+  duration_ms: 0.845359
+  ...
+# Subtest: intake completion falls back to the first task completing when agentId is gone
+ok 4 - intake completion falls back to the first task completing when agentId is gone
+  ---
+  duration_ms: 0.517606
+  ...
+# Subtest: ticket.created events alone are enough (a run whose workflow row was trimmed)
+ok 5 - ticket.created events alone are enough (a run whose workflow row was trimmed)
+  ---
+  duration_ms: 0.504771
+  ...
+# Subtest: computed task rows are a title source too
+ok 6 - computed task rows are a title source too
+  ---
+  duration_ms: 0.254169
+  ...
+# Subtest: spawnedBy.kind outranks the title — provenance beats prose
+ok 7 - spawnedBy.kind outranks the title — provenance beats prose
+  ---
+  duration_ms: 0.217574
+  ...
+# Subtest: every title shape the fleet actually mints is recognized
+ok 8 - every title shape the fleet actually mints is recognized
+  ---
+  duration_ms: 0.500096
+  ...
+# Subtest: the regression this replaced: the real titles never started with 'Fix:'
+ok 9 - the regression this replaced: the real titles never started with 'Fix:'
+  ---
+  duration_ms: 0.5376
+  ...
+# Subtest: ids are deduped across the three sources and ordered by creation
+ok 10 - ids are deduped across the three sources and ordered by creation
+  ---
+  duration_ms: 0.710967
+  ...
+# Subtest: enriched events: dowtdh's three gate verdicts → 2 reworks, 3 rounds, no first-pass yield
+ok 11 - enriched events: dowtdh's three gate verdicts → 2 reworks, 3 rounds, no first-pass yield
+  ---
+  duration_ms: 0.670959
+  ...
+# Subtest: enriched events: every gate PASSing first look yields 1
+ok 12 - enriched events: every gate PASSing first look yields 1
+  ---
+  duration_ms: 0.29555
+  ...
+# Subtest: the FIRST verdict decides the yield — a re-verify PASS does not retroactively earn it
+ok 13 - the FIRST verdict decides the yield — a re-verify PASS does not retroactively earn it
+  ---
+  duration_ms: 0.288633
+  ...
+# Subtest: only gate personas and only recognized verdicts count
+ok 14 - only gate personas and only recognized verdicts count
+  ---
+  duration_ms: 0.439819
+  ...
+# Subtest: legacy events without a verdict: the reviewGateHistory numbers, unchanged
+ok 15 - legacy events without a verdict: the reviewGateHistory numbers, unchanged
+  ---
+  duration_ms: 0.330591
+  ...
+# Subtest: gateReworks stays review-request-derived even when verdicts are present
+ok 16 - gateReworks stays review-request-derived even when verdicts are present
+  ---
+  duration_ms: 0.720946
+  ...
+# Subtest: a nothing-to-remove summary is not baseline-eligible; a complete one is
+ok 17 - a nothing-to-remove summary is not baseline-eligible; a complete one is
+  ---
+  duration_ms: 0.351007
+  ...
+# Subtest: a $5 no-op sweep in the index does not move the next real sweep's medians
+ok 18 - a $5 no-op sweep in the index does not move the next real sweep's medians
+  ---
+  duration_ms: 2.532257
+  ...
+# Subtest: without the exclusion the same no-op WOULD have moved the median (the test is not vacuous)
+ok 19 - without the exclusion the same no-op WOULD have moved the median (the test is not vacuous)
+  ---
+  duration_ms: 0.776143
+  ...
+# Subtest: the no-op run's OWN card raises nothing: status ok, noOp flagged, no anomalies, no alert
+ok 20 - the no-op run's OWN card raises nothing: status ok, noOp flagged, no anomalies, no alert
+  ---
+  duration_ms: 0.723356
+  ...
+# Subtest: the SAME numbers under a complete outcome DO alert (the gate is the outcome, not the size)
+ok 21 - the SAME numbers under a complete outcome DO alert (the gate is the outcome, not the size)
+  ---
+  duration_ms: 0.540869
+  ...
+1..21
+# tests 21
+# suites 0
+# pass 21
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 1299.817948
+NODE_TEST_EXIT=0
+
+--- (2) ASSERTION AUDIT ---
+
+CLAUSE 1 — reworkRounds >= 1, gateRounds >= 2, firstPassYield == 0 (Python).
+deploy/workflow-manager/toolkit/test_metrics.py:979-1005, verbatim:
+    def test_dowtdh_gate_rounds_and_first_pass_yield(self):
+        m = compute_metrics(self.load("dowtdh"))
+        q = m["quality"]
+        # The acceptance criterion is a floor — the fixture is a REDUCED dossier
+        # and what matters is that the refusals are visible at all.
+        self.assertGreaterEqual(q["reworkRounds"], 1)
+        self.assertGreaterEqual(q["gateRounds"], 2)
+        # The exact numbers, since the fixture is vendored and never changes: the
+        # reviewer's CHANGES NEEDED and QA's FAIL are the two reworks, and CI's
+        # PASS is the third round. cost-report's index.test.mjs asserts the same
+        # 2 / 3 / 0 for the same three verdicts from JavaScript.
+        self.assertEqual((q["reworkRounds"], q["gateRounds"]), (2, 3))
+        # The whole point: this run did not yield on the first pass, and the
+        # pre-D1 metrics said nothing at all about it.
+        self.assertEqual(q["firstPassYield"], 0)
+        # …and the number changeRequests reports for the same run, for contrast.
+        self.assertEqual(m["changeRequests"]["count"], 0)
+
+        # The per-ticket detail, which is what a reviewer actually reads.
+        by_ticket = {r["ticketId"]: r for r in q["verdicts"]}
+        self.assertEqual(by_ticket["TEAM-4180"]["verdict"], "CHANGES_NEEDED")
+        self.assertEqual(by_ticket["TEAM-4181"]["verdict"], "FAIL")
+        self.assertEqual(by_ticket["TEAM-4182"]["verdict"], "PASS")
+        # Every one of them read out of prose: the fixture predates the field.
+        self.assertEqual({r["verdictSource"] for r in q["verdicts"]}, {"inferred"})
+        self.assertEqual(
+            by_ticket["TEAM-4181"]["agentId"], "agentcore_hub_qa_verifier")
+
+  VERIFIED, and stronger than the acceptance floor. :984/:985 are the literal
+  >= assertions the item names; :990 pins the EXACT pair (2, 3); :993 is
+  firstPassYield == 0 exactly. It runs compute_metrics() over the real vendored
+  dowtdh dossier (:980), not a synthesized input, and :998-1005 pin the
+  per-ticket verdicts so the aggregate cannot be right by accident.
+  Note :1003 — every dowtdh verdict is verdictSource 'inferred', i.e. read out of
+  prose. Relevant to probe P-A: dowtdh's real summaries happen to use the LABELLED
+  form ('VERDICT: FAIL — …'), which is exactly what the ladder matches.
+
+CLAUSE 2 — 'lambda/cost-report/index.test.mjs has the JS-side equivalent'. VERIFIED.
+lambda/cost-report/index.test.mjs:205-218, verbatim:
+/** dowtdh's gate sequence, at its real timestamps, as it would be published today. */
+const DOWTDH_GATES = [
+  complete("TEAM-4180", REVIEWER, "2026-09-06T23:19:21.743Z", { verdict: "CHANGES_NEEDED", verdictSource: "declared" }),
+  complete("TEAM-4181", QA, "2026-09-06T23:36:32.821Z", { verdict: "FAIL", verdictSource: "declared", testedHead: "12e9ac6" }),
+  complete("TEAM-4182", CI, "2026-09-06T23:42:11.459Z", { verdict: "PASS", verdictSource: "declared", testedHead: "12e9ac6" }),
+];
+
+test("enriched events: dowtdh's three gate verdicts → 2 reworks, 3 rounds, no first-pass yield", () => {
+  const gates = computeGateRounds({}, DOWTDH_GATES);
+  assert.equal(gates.reworkRounds, 2);   // reviewer CHANGES_NEEDED + QA FAIL
+  assert.equal(gates.gateRounds, 3);     // …and the CI PASS is still a gate round
+  assert.equal(gates.firstPassYield, 0); // two of the three failed on first look
+  assert.equal(gates.source, "verdict-events");
+});
+
+  Same three numbers (2 / 3 / 0) for the same three dowtdh gate verdicts, at the
+  run's real timestamps, plus source == 'verdict-events'.
+  HONEST CAVEAT, which the test states itself at :191-196: the events here are
+  LITERAL/synthesized with verdictSource 'declared' — it does NOT read the dowtdh
+  dossier. So the JS side asserts the ARITHMETIC over already-resolved verdicts;
+  the prose->verdict step is asserted only by the Python toolkit and by
+  verdict-contract.test.mjs. That is a reasonable split and is documented, not
+  hidden, but it does mean no single test covers dossier-prose -> JS card.
+
+CLAUSE 3 — 'src/lib/workflow/performance.ts mirrors it'. PARTIAL.
+performance.ts does not compute any of the three numbers. Its D1 change is a TYPE
+and DESCRIPTOR change only (src/lib/workflow/performance.ts:44-55):
+     * TEAM-4246 D1 FR-D1.11 — which definition produced `reworkRounds`,
+     * `gateRounds` and `firstPassYield` on this card:
+     *   "verdict-events"      the run's gate personas stated verdicts (the real
+     *                         signal): rework = review/QA non-PASS verdicts,
+     *                         gateRounds = every gate completion, yield = 1 iff
+     *                         every gate PASSed on its first look;
+     *   "reviewGateHistory"   pre-D1 run with no verdict anywhere — rework and
+     *                         yield are task-derived (re-invocation counts) and
+     *                         gateRounds counts human review REQUESTS.
+     * Optional because cards written before this field exist; absent reads as
+     * the legacy definition.
+     */
+    gateMetricSource?: "verdict-events" | "reviewGateHistory" | null;
+  };
+
+  and the KPI help text at :115-122. There is NO parity test between performance.ts
+  and cost-report/index.mjs, even though src/lib/workflow/ ships SEVEN such files
+  for other cross-surface contracts:
+src/lib/workflow/completion-evidence-parity.test.ts
+src/lib/workflow/fix-contract-parity.test.ts
+src/lib/workflow/lease-parity.test.ts
+src/lib/workflow/review-cap-parity.test.ts
+src/lib/workflow/run-outcome-parity.test.ts
+src/lib/workflow/ship-review-parity.test.ts
+src/lib/workflow/verified-heads-parity.test.ts
+  So the mirror is real but UNGUARDED — the repo's own established idiom for
+  exactly this risk was not applied here. Probe (3) below performs the check
+  manually and it currently passes.
+
+--- (3) INDEPENDENT PROBE — probes/item-06-performance-mirror.mjs ---
+=== item-6.3a  BAND_KPIS (lambda/cost-report/index.mjs) ===
+  cost.totalUsd                  floor=5 dir=- "Total cost"
+  cost.personaUsd                floor=5 dir=- "Persona LLM cost"
+  cost.codingUsd                 floor=2 dir=- "Coding CLI cost"
+  cost.tokens.total              floor=500000 dir=- "Tokens"
+  time.wallMs                    floor=900000 dir=- "Wall-clock"
+  time.activeMs                  floor=900000 dir=- "Active time"
+  time.agentWorkMs               floor=900000 dir=- "Agent work"
+  time.humanWaitMs               floor=900000 dir=- "Human wait"
+  quality.tasks                  floor=1 dir=- "Agent tasks"
+  quality.reworkRounds           floor=1 dir=- "Rework rounds"
+  quality.loops                  floor=1 dir=- "Loops"
+  quality.nudges                 floor=1 dir=- "Nudges"
+  quality.errors                 floor=1 dir=- "Errors"
+  quality.firstPassYield         floor=0.1 dir=lower "First-pass yield"
+  cost.personaCacheHitRate       floor=0.1 dir=lower "Persona cache hit rate"
+  count=15
+
+=== item-6.3b  FLEET_KPIS (src/lib/workflow/performance.ts) ===
+  cost.total                     floor=5 dir=- "Cost per run"
+  cost.persona                   floor=5 dir=- "Persona LLM"
+  cost.coding                    floor=2 dir=- "Coding CLIs"
+  cost.tokens                    floor=500000 dir=- "Tokens per run"
+  time.wall                      floor=900000 dir=- "End-to-end"
+  time.active                    floor=900000 dir=- "Active"
+  time.agentWork                 floor=900000 dir=- "Agent work"
+  time.humanWait                 floor=900000 dir=- "Human wait"
+  quality.tasks                  floor=1 dir=- "Agent tasks"
+  quality.reworkRounds           floor=1 dir=- "Rework rounds"
+  quality.loops                  floor=1 dir=- "Loops"
+  quality.nudges                 floor=1 dir=- "Nudges"
+  quality.errors                 floor=1 dir=- "Errors"
+  quality.firstPassYield         floor=0.1 dir=lower "First-pass yield"
+  cost.personaCacheHitRate       floor=0.1 dir=lower "Persona cache hit rate"
+  count=15
+
+=== item-6.3c  key-set diff ===
+  only in BAND_KPIS : ["cost.totalUsd","cost.personaUsd","cost.codingUsd","cost.tokens.total","time.wallMs","time.activeMs","time.agentWorkMs","time.humanWaitMs"]
+  only in FLEET_KPIS : ["cost.total","cost.persona","cost.coding","cost.tokens","time.wall","time.active","time.agentWork","time.humanWait"]
+
+=== item-6.3d  the three gate KPIs item 6 names, field by field ===
+  quality.reworkRounds
+    BAND_KPIS: floor=1 dir=- label="Rework rounds"
+    FLEET_KPIS: floor=1 dir=- label="Rework rounds"
+    agree? YES
+  quality.gateRounds
+    BAND_KPIS: ABSENT
+    FLEET_KPIS: ABSENT
+  quality.firstPassYield
+    BAND_KPIS: floor=0.1 dir=lower label="First-pass yield"
+    FLEET_KPIS: floor=0.1 dir=lower label="First-pass yield"
+    agree? YES
+
+=== item-6.3e  does performance.ts COMPUTE any gate metric? ===
+  performance.ts contains "computeGateRounds"? false
+  performance.ts contains "reworkRounds ="? false
+  performance.ts contains "firstPassYield ="? false
+  performance.ts contains "gateRounds ="? true
+  gateMetricSource occurrences in performance.ts:
+    :55  gateMetricSource?: "verdict-events" | "reviewGateHistory" | null;
+    :112  // verdict (`quality.gateMetricSource === "verdict-events"`), task-derived on
+    :114  // the card's own gateMetricSource says which one a given point is.
+
+=== item-6.3 VERDICT ===
+  performance.ts does NOT compute the gate metrics — it only TYPES them and
+  describes the KPI. 'Mirrors it' is therefore true only in the weak sense of
+  type + descriptor agreement, which this probe checks directly above. No
+  automated parity test exists for it, unlike the 7 other *-parity.test.ts
+  files in the same directory. (UI array is FLEET_KPIS, not METRICS.)
+PROBE_EXIT=0
+
+--- (3a) reading the probe output ---
+  * quality.reworkRounds  — floor/direction/label AGREE across both surfaces.
+  * quality.firstPassYield — AGREE (floor 0.1, direction 'lower').
+  * quality.gateRounds    — ABSENT from BOTH band lists. It is computed and shown
+    on the card but gets no anomaly band on either side. Consistent, and correct
+    (a gate-round count has no meaningful outlier band), but worth stating: the
+    acceptance item names gateRounds, and gateRounds is the one of the three that
+    is NOT banded anywhere.
+  * The 8 'only in' keys are NOT a defect: the Lambda card uses cost.totalUsd /
+    time.wallMs while the UI CardSummary uses cost.total / time.wall
+    (src/lib/workflow/performance.ts:28-37). Two deliberately distinct shapes,
+    each with its own key list. The quality.* keys — the ones this item is about —
+    are byte-identical across both.
+
+--- (4) node --test result for the JS side ---
+# tests 21
+# pass 21
+# fail 0
+
+--- ITEM 6 VERDICT: VERIFIED (with one documented coverage gap) ---
+  reworkRounds >= 1  : VERIFIED (asserted >=1 AND ==2, over the real dossier).
+  gateRounds   >= 2  : VERIFIED (asserted >=2 AND ==3).
+  firstPassYield == 0: VERIFIED (asserted == 0 exactly).
+  JS-side equivalent : VERIFIED (2/3/0, source='verdict-events'), but over
+                       synthesized declared verdicts, not the dossier prose.
+  performance.ts mirror: PARTIAL — mirror is present and currently correct, but it
+                       is type/descriptor only and has no parity test guarding it,
+                       against a repo convention of 7 such tests in that directory.
+EXIT=0
+
+--- (5) ADDED: node --test lambda/cost-report (directory form, as ci.yml:41 runs it) ---
+(node:12911) Warning: NodeVersionSupportWarning: The AWS SDK for JavaScript (v3)
+versions published after the first week of January 2027
+will require node >=22. You are running node v20.19.2.
+
+To continue receiving updates to AWS services, bug fixes,
+and security updates please upgrade to node >=22.
+
+More information can be found at: https://a.co/c895JFp
+(Use `node --trace-warnings ...` to show where the warning was created)
+✔ the shared fixture yields the same fix tickets as the Python toolkit (4.06025ms)
+✔ the intake-planned 'Fix:' ticket is excluded, the later one is not (0.975568ms)
+✔ no intake signal at all → nothing is excluded (overcount by one beats dropping a fix) (0.809251ms)
+✔ intake completion falls back to the first task completing when agentId is gone (0.492221ms)
+✔ ticket.created events alone are enough (a run whose workflow row was trimmed) (0.489384ms)
+✔ computed task rows are a title source too (0.257191ms)
+✔ spawnedBy.kind outranks the title — provenance beats prose (0.21791ms)
+✔ every title shape the fleet actually mints is recognized (0.447507ms)
+✔ the regression this replaced: the real titles never started with 'Fix:' (0.529887ms)
+✔ ids are deduped across the three sources and ordered by creation (0.700286ms)
+✔ enriched events: dowtdh's three gate verdicts → 2 reworks, 3 rounds, no first-pass yield (0.684679ms)
+✔ enriched events: every gate PASSing first look yields 1 (0.302251ms)
+✔ the FIRST verdict decides the yield — a re-verify PASS does not retroactively earn it (0.2843ms)
+✔ only gate personas and only recognized verdicts count (0.437205ms)
+✔ legacy events without a verdict: the reviewGateHistory numbers, unchanged (0.328088ms)
+✔ gateReworks stays review-request-derived even when verdicts are present (0.712791ms)
+✔ a nothing-to-remove summary is not baseline-eligible; a complete one is (0.350222ms)
+✔ a $5 no-op sweep in the index does not move the next real sweep's medians (2.490171ms)
+✔ without the exclusion the same no-op WOULD have moved the median (the test is not vacuous) (0.740145ms)
+✔ the no-op run's OWN card raises nothing: status ok, noOp flagged, no anomalies, no alert (0.711388ms)
+✔ the SAME numbers under a complete outcome DO alert (the gate is the outcome, not the size) (0.489764ms)
+(node:12922) Warning: NodeVersionSupportWarning: The AWS SDK for JavaScript (v3)
+versions published after the first week of January 2027
+will require node >=22. You are running node v20.19.2.
+
+To continue receiving updates to AWS services, bug fixes,
+and security updates please upgrade to node >=22.
+
+More information can be found at: https://a.co/c895JFp
+(Use `node --trace-warnings ...` to show where the warning was created)
+✔ cache-read tokens are billed at the discounted input rate (1.777197ms)
+✔ cache-write is billed at the per-TTL surcharge multiple of the input rate (0.276035ms)
+✔ missing or unknown ttl falls back to the default write multiplier (0.24593ms)
+✔ tokens accumulate across rows and byModel tracks read/write (0.24694ms)
+✔ back-compat: cachedInputTokens mirrors cacheReadInputTokens (0.409337ms)
+✔ plain rows (no cache fields) are unchanged by cache logic (0.264261ms)
+✔ persona chat-span filter matches the exact strands >=1.53 span name (0.366571ms)
+✔ persona chat-span filter still matches the legacy 'chat <model>' shape (0.192348ms)
+✔ persona chat-span filter still ORs in the api_request event-name branch (0.382872ms)
+ℹ tests 30
+ℹ suites 0
+ℹ pass 30
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 1821.893243
+NODE_TEST_DIR_EXIT=0
+
+--- (5a) grep for the dowtdh / gate-round tests in that run ---
+154:    def test_dowtdh_gate_rounds_and_first_pass_yield(self):
+155:        m = compute_metrics(self.load("dowtdh"))
+168:        self.assertEqual(q["firstPassYield"], 0)
+184:  firstPassYield == 0 exactly. It runs compute_metrics() over the real vendored
+185:  dowtdh dossier (:980), not a synthesized input, and :998-1005 pin the
+187:  Note :1003 — every dowtdh verdict is verdictSource 'inferred', i.e. read out of
+188:  prose. Relevant to probe P-A: dowtdh's real summaries happen to use the LABELLED
+193:/** dowtdh's gate sequence, at its real timestamps, as it would be published today. */
+200:test("enriched events: dowtdh's three gate verdicts → 2 reworks, 3 rounds, no first-pass yield", () => {
+203:  assert.equal(gates.gateRounds, 3);     // …and the CI PASS is still a gate round
+204:  assert.equal(gates.firstPassYield, 0); // two of the three failed on first look
+208:  Same three numbers (2 / 3 / 0) for the same three dowtdh gate verdicts, at the
+211:  LITERAL/synthesized with verdictSource 'declared' — it does NOT read the dowtdh
+264:  quality.firstPassYield         floor=0.1 dir=lower "First-pass yield"
+282:  quality.firstPassYield         floor=0.1 dir=lower "First-pass yield"
+298:  quality.firstPassYield
+306:  performance.ts contains "firstPassYield ="? false
+343:  firstPassYield == 0: VERIFIED (asserted == 0 exactly).
+371:✔ enriched events: dowtdh's three gate verdicts → 2 reworks, 3 rounds, no first-pass yield (0.684679ms)
+410:--- (5a) grep for the dowtdh / gate-round tests in that run ---
+
+  CONFIRMED: the JS-side dowtdh gate-round test is registered and PASSES in the
+  directory-form run that ci.yml:41 actually executes:
+    ✔ enriched events: dowtdh's three gate verdicts → 2 reworks, 3 rounds, no first-pass yield
+EXIT=0

@@ -1,0 +1,93 @@
+=== P-A.1  deriveVerdict(summary) ===
+  input="QA FAIL: 191 PASS / 8 FAIL, live Chromium"
+    deriveVerdict -> null
+  input="Verdict: CHANGES NEEDED"
+    deriveVerdict -> {"verdict":"CHANGES_NEEDED","source":"inferred","matched":"Verdict: CHANGES NEEDED"}
+  input="CHANGES NEEDED — see findings"
+    deriveVerdict -> null
+  input="PASS"
+    deriveVerdict -> null
+  input="BLOCKED: no gateway"
+    deriveVerdict -> null
+  input="All checks passed"
+    deriveVerdict -> null
+  input=""
+    deriveVerdict -> null
+
+=== P-A.2  resolveVerdict({summary}, qa_verifier) — gate persona, nothing declared ===
+  input="QA FAIL: 191 PASS / 8 FAIL, live Chromium"
+    -> {"verdict":null,"verdictSource":"none"}
+  input="Verdict: CHANGES NEEDED"
+    -> {"verdict":"CHANGES_NEEDED","verdictSource":"inferred","matched":"Verdict: CHANGES NEEDED"}
+  input="CHANGES NEEDED — see findings"
+    -> {"verdict":null,"verdictSource":"none"}
+  input="PASS"
+    -> {"verdict":null,"verdictSource":"none"}
+  input="BLOCKED: no gateway"
+    -> {"verdict":null,"verdictSource":"none"}
+  input="All checks passed"
+    -> {"verdict":null,"verdictSource":"none"}
+  input=""
+    -> {"verdict":null,"verdictSource":"none"}
+
+=== P-A.3  enforce mode, gate persona, verdict resolves to null ===
+  verdict=null mode=enforce -> {"reason":"no-verdict","wouldSuppress":false,"suppress":false,"blockOn":[],"needsGateReverify":false}
+  verdict=undefined mode=enforce -> {"reason":"no-verdict","wouldSuppress":false,"suppress":false,"blockOn":[],"needsGateReverify":false}
+  verdict="" mode=enforce -> {"reason":"no-verdict","wouldSuppress":false,"suppress":false,"blockOn":[],"needsGateReverify":false}
+  verdict="SUCCEEDED" mode=enforce -> {"reason":"no-verdict","wouldSuppress":false,"suppress":false,"blockOn":[],"needsGateReverify":false}
+
+=== P-A.4  control: a real non-PASS under enforce DOES suppress ===
+  verdict=FAIL -> suppress=true reason=non-pass blockOn=["TEAM-4183"] needsGateReverify=false
+  verdict=CHANGES_NEEDED -> suppress=true reason=non-pass blockOn=["TEAM-4183"] needsGateReverify=false
+  verdict=BLOCKED -> suppress=true reason=non-pass blockOn=["TEAM-4183"] needsGateReverify=false
+  verdict=PASS -> suppress=false reason=pass blockOn=[] needsGateReverify=false
+
+=== P-A.5  the end-to-end hole: QA prose 'QA FAIL: ...' under enforce ===
+  resolveVerdict -> {"verdict":null,"verdictSource":"none"}
+  evaluateGate   -> {"reason":"no-verdict","wouldSuppress":false,"suppress":false,"blockOn":[],"needsGateReverify":false}
+  NET: successor is DISPATCHED (fail-open) despite prose stating FAIL
+
+=== P-A.6  normalizeVerdictMode fallbacks ===
+  undefined -> shadow
+  null -> shadow
+  "" -> shadow
+  "  " -> shadow
+  "off" -> off
+  "shadow" -> shadow
+  "enforce" -> enforce
+  "ENFORCE" -> enforce
+  "garbage" -> off
+  "enforce " -> enforce
+  "1" -> off
+  "true" -> off
+EXIT=0
+
+=== P-A.7  the cascade.mjs branch, quoted (lambda/orchestrator/cascade.mjs:240-262) ===
+   * contract recognizes" is not "the persona failed", and holding there would stall
+   * every run whose reviewer writes a summary the ladder cannot read.
+   */
+  async function resolveVerdictHold(ticketId, workflow, siblings) {
+    if (verdictMode === "off" || typeof verdictGate !== "function") return null;
+    const info = await verdictGate({ ticketId, workflow, siblings });
+    if (!info || info.isGatePersona !== true) return null;
+    const verdict = info.verdict || null;
+    if (!verdict || verdict === "PASS") return null;
+    return {
+      verdict,
+      verdictSource: info.verdictSource || null,
+      testedHead: info.testedHead || "",
+      spawnedTickets: (Array.isArray(info.spawnedTickets) ? info.spawnedTickets : []).filter(Boolean),
+      // FR-D1.5/D1.6 — the open fixes under the epic this persona did NOT file.
+      // Resolved by index.mjs (it owns FIX_KINDS + the advisory predicate) via
+      // verdict-contract's selectOpenEpicFixes; absent on an older resolver, which
+      // degrades to exactly the spawnedTickets-only hold.
+      openFixIds: (Array.isArray(info.openEpicFixIds) ? info.openEpicFixIds : []).filter(Boolean),
+      round: Number.isFinite(Number(info.round)) ? Number(info.round) : null,
+    };
+  }
+
+
+  Line 248 is the fail-open: a null verdict returns null from resolveVerdictHold,
+  which is the same value the function returns for VERDICT_GATE=off. The successor
+  is UNBLOCKED. There is no 'hold on unknown' branch anywhere in this function.
+EXIT=0
