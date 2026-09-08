@@ -127,6 +127,51 @@ conditionally written instead of being globally serialized:
   ledger. `evalSessionCount` in particular stays **approximate** under
   at-least-once delivery regardless of locking — that's accepted, not chased.
 
+### Operational metrics: per-day buckets, one rolling window
+
+The Evaluations tab's Operational Metrics (sessions, evaluator scores, tokens,
+cache hit, cost) are all read from the **`agentcore-hub-eval-daily`** table —
+one item per agent per UTC day (PK `agentId`, SK `day` = `YYYY-MM-DD`) — and
+folded over a single rolling window (`GET /api/evaluations?days=7`, clamped to
+1..14) by `src/lib/eval-metrics.ts`. There is no weekly reset and no all-time
+counter in the UI path any more (the legacy `tokenTotalInput` / `tokenByModel`
+counters on the eval-config row and the `agentcore-hub-token-reset-weekly`
+cron were retired; the all-time `evalScores` / `evalSessionCount` fields are
+still written for the anomaly-watcher and the Workflow Manager dossier).
+
+The buckets deliberately do **not** live on the eval-config row: that row also
+carries `sessionBuffer` and sits at DynamoDB's 400KB item cap for the busy
+agents (Hub Agent, Workflow Manager), so any extra map there fails with
+"Item size to update has exceeded the maximum allowed size".
+
+Items are FLAT so each writer needs exactly one atomic `UpdateItem ... ADD`
+(create-or-increment, no path set-up, no read-modify-write, no CAS):
+
+| Writer | Attributes | Source records |
+|--------|-----------|----------------|
+| `lambda/token-aggregator` | `tokensIn` (full prompt incl. cache), `tokensOut`, `cacheRead`, `cacheWrite`, `cacheWrite1h`, `calls`, `costUsd`, `m\|<model>\|<field>` | Strands `chat` spans (`strands.telemetry.tracer`) on Strands runtimes — the only record whose input count includes prompt-cache reads/writes; EMF `gen_ai.client.token.usage` metrics on managed harnesses; `claude_code.api_request` events on the coding runtime |
+| `lambda/eval-packager` (`aggregateScoresToDdb`) | `sessions`, `e\|<evaluator>\|sum`, `e\|<evaluator>\|count` | evaluator results, same deduped entries as the all-time aggregates |
+
+Both stamp `expiresAt = day + DAILY_RETAIN_DAYS (14)`; the table's TTL retires
+old days. Cost is computed read-side from `src/config/pricing.json`
+(`cachedInputDiscount`, `cacheWriteMultiplier` by TTL). Env var
+`EVAL_DAILY_TABLE` on both Lambdas and the app (default
+`agentcore-hub-eval-daily`).
+
+Deploy / repair:
+
+```bash
+bash deploy/continuous-improvement/deploy-all.sh                 # creates the table (+ TTL) with the other eval tables
+bash deploy/continuous-improvement/deploy-token-aggregator.sh   # Lambda + per-shape subscription filters, deletes the weekly reset
+node deploy/continuous-improvement/backfill-daily.mjs --days 7  # rebuild the window from CW Logs Insights (idempotent, overwrites day items)
+```
+
+Why the shapes matter: the previous aggregator only matched the EMF metric,
+whose `input` type on Strands runtimes carries the *uncached* input (a few tokens
+per call once prompt caching is on) — the dashboard showed 3K in / 2M out for
+the shared runtime — and the coding runtime, which never emits that metric,
+always showed $0.
+
 4. **S3 Batch Archive** (`fleet-imp-agent/batches/`):
    - The raw flushed batch (`{agentId, batchSize, flushedAt, sessions[]}`)
    - Named: `batch-<agentId>-<timestamp>.json`

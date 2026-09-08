@@ -129,15 +129,6 @@ export interface Artifact {
   timestamp: string;
 }
 
-// ─── Agent Definitions ───────────────────────────────────────────────────────
-
-// "detection" (TEAM-4247 D2) is a DEF phase, not a roster phase: no agent in
-// agents.json claims it (the sweeper's roster phase is "development"). The
-// dead-code-sweep def names the agent that serves it, and the ticket carries the
-// phase as an explicit `phase` stamp — which is what makes a zero-yield sweep
-// identifiable as such. Every other phase here is a roster phase.
-export type AgentPhase = "requirements" | "design" | "development" | "detection" | "verification" | "review" | "ship";
-
 // ─── Workflow State ──────────────────────────────────────────────────────────
 
 // TEAM-3747 D2 — lifecycle-integrity terminal outcomes ("no green close over

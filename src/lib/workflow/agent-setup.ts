@@ -13,10 +13,3 @@ export const ARTIFACT_BUCKET = process.env.ARTIFACT_BUCKET || "";
 export function getWorkflowS3Prefix(workflowId: string, agentId: string): string {
   return `workflows/${workflowId}/${agentId}/`;
 }
-
-/**
- * Get the S3 prefix for shared artifacts (accessible by all agents in a workflow).
- */
-export function getSharedArtifactsPrefix(workflowId: string): string {
-  return `workflows/${workflowId}/shared/`;
-}
