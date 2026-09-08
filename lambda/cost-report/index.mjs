@@ -587,8 +587,14 @@ export function computeBands(card, summaries) {
   };
 }
 
-/** Card KPI path → index-summary path (summaries are compact). */
-function summaryPathOf(path) {
+/**
+ * Card KPI path → index-summary path (summaries are compact).
+ *
+ * Exported for src/lib/workflow/gate-metrics-parity.test.ts, which uses it to
+ * compare BAND_KPIS against performance.ts's FLEET_KPIS — the two lists are keyed
+ * in the two different vocabularies this function translates between.
+ */
+export function summaryPathOf(path) {
   return path
     .replace("cost.totalUsd", "cost.total")
     .replace("cost.personaUsd", "cost.persona")
