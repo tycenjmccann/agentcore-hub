@@ -198,17 +198,24 @@ async function writeCompletionRecord(ticketId: string, evidence: string): Promis
   };
   const s3 = new S3Client({ region: REGION });
 
-  // TEAM-4286 — the create → read → refill sequence is a bounded LOOP, not a
-  // straight line, because AWS's documented answer to "a concurrent delete won" is
-  // to reupload: an If-Match PUT answers 404 when the object was deleted after the
-  // read ("You should reupload the object", conditional-writes userguide). Both
-  // vanish cases therefore go round again and RE-CREATE the record instead of
-  // giving up — the previous code returned "kept" for the read-back 404, which let
-  // the ticket close with NO record at all, the exact stall TEAM-4266 exists to
-  // remove. Budget exhausted → "failed" (502), never "kept".
+  // TEAM-4286/TEAM-4293 — the create → read → refill sequence is a bounded LOOP, not
+  // a straight line. Every UNCERTAIN outcome goes round again and re-reads; only a
+  // PROVEN one returns. Three ways a round ends inconclusively, all races against a
+  // concurrent writer of the same key:
+  //   read-back GET 404   — deleted between our PUT and the read. AWS: reupload
+  //                         ("You should reupload the object", conditional-writes
+  //                         userguide) → re-create.
+  //   refill PUT 404      — deleted after the read → re-create.
+  //   refill PUT 412      — REWRITTEN after the read. TEAM-4293: this is not proof
+  //                         the winner is evidence, so re-read and judge it.
+  // The rule: "kept" is only ever returned after completionRecordHasEvidence has
+  // actually run on the bytes being kept. Budget exhausted → "failed" (502), never
+  // "kept" — closing the ticket here is unrecoverable (done→done cannot be retried),
+  // a 502 is retryable.
   //
   // Worst case is 3 rounds x (<=3 create PUTs + 1 GET + <=3 refill PUTs) = 21 sends
   // and <=600ms of backoff, reachable only against an adversarial bucket.
+  let exhaustedBecause = "kept vanishing between the create-only PUT and the read";
   for (let round = 1; round <= WRITE_ROUNDS; round++) {
     try {
       const put = await sendConditional(
@@ -302,8 +309,21 @@ async function writeCompletionRecord(ticketId: string, evidence: string): Promis
       return { outcome: "filled", key, etag: put.ETag, previousBody };
     } catch (err) {
       if (is412(err)) {
-        console.log(`[transition] ${ticketId}: ${key} changed while filling it — keeping the newer record`);
-        return { outcome: "kept" };
+        // TEAM-4293: a 412 here says only "the object changed between the GET at the
+        // top of this round and this PUT" — it does NOT say the winner is evidence.
+        // reportCompletion (lambda/workflow-output) is the only unconditional writer
+        // of this key and it stores `summary` verbatim, so a BLANK winner is real —
+        // the same premise the 412 read-back exists for (see F3 in the header). This
+        // used to `return { outcome: "kept" }`, which transitioned the ticket without
+        // ever running completionRecordHasEvidence on the new bytes: the TEAM-4266
+        // stall again, since done→done cannot be retried. Go round instead — the next
+        // create-only PUT 412s, the GET reads the NEWER record, and evidence ⇒ kept
+        // (proven), blank ⇒ refill against ITS ETag.
+        exhaustedBecause = "kept being rewritten while every version read back was blank";
+        console.log(
+          `[transition] ${ticketId}: ${key} changed while filling it — re-reading the newer record (round ${round}/${WRITE_ROUNDS})`
+        );
+        continue;
       }
       if (isNotFound(err)) {
         // TEAM-4286: an If-Match PUT answers 404 when a concurrent delete wins, and
@@ -320,12 +340,13 @@ async function writeCompletionRecord(ticketId: string, evidence: string): Promis
     }
   }
 
-  // TEAM-4286: every round raced with a delete. Refusing is the point — "kept" here
-  // would close the ticket with no record and no way to retry.
-  console.error(`[transition] ${ticketId}: ${key} kept vanishing — gave up after ${WRITE_ROUNDS} attempts`);
+  // TEAM-4286/TEAM-4293: every round ended inconclusively. Refusing is the point —
+  // "kept" here would close the ticket on a record nobody proved, with no way to
+  // retry.
+  console.error(`[transition] ${ticketId}: ${key} ${exhaustedBecause} — gave up after ${WRITE_ROUNDS} attempts`);
   return {
     outcome: "failed",
-    message: `${key} kept vanishing between the create-only PUT and the read after ${WRITE_ROUNDS} attempts`,
+    message: `${key} ${exhaustedBecause} after ${WRITE_ROUNDS} attempts`,
   };
 }
 

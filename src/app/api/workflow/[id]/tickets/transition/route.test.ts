@@ -791,12 +791,78 @@ describe("transition route — 412 fill-if-blank (TEAM-4282 F3)", () => {
 
     expect(res.status).toBe(200);
     expect(json).toMatchObject({ success: true, completionRecordWritten: false });
-    // Two PUTs attempted (create-only, then the refill), both refused; the agent's
-    // record is untouched and no revert is owed.
-    expect(puts()).toHaveLength(2);
+    // TEAM-4293: the refill's 412 goes round again — round 2's create-only PUT 412s
+    // and a SECOND GET reads the winner, which is what proves it is evidence before
+    // returning "kept". Three PUTs total (round 1's create + refill, round 2's
+    // create), two GETs; the agent's record is untouched and no revert is owed.
+    expect(puts()).toHaveLength(3);
+    expect(gets()).toHaveLength(2);
     expect(dels()).toHaveLength(0);
     expect(stored()).toEqual({ [KEY]: winner });
     expect(invokes()).toHaveLength(1);
+  });
+
+  /**
+   * TEAM-4293 — round-2 residual on the loop TEAM-4286 introduced. A 412 on the
+   * REFILL means only "the object changed between our GET and this PUT" — it does
+   * NOT mean the winner is evidence. reportCompletion (lambda/workflow-output) is
+   * the only unconditional writer of this key and stores `summary` verbatim, so a
+   * blank winner is real. Before this fix the route returned {outcome:"kept"} here
+   * without ever running completionRecordHasEvidence on the new bytes, closing the
+   * ticket on a record that fails the gate — the TEAM-4266 stall through a
+   * different door, since done→done cannot be retried.
+   */
+  it("TEAM-4293: the refill 412s against a BLANK concurrent winner → the newer record is re-read and filled on the next round", async () => {
+    await load();
+    seed(KEY, { ticket_id: "TEAM-X", summary: "" }, '"etag-blank-1"');
+    // A competing writer lands a NEW but still-blank record in the window between
+    // our GET and our IfMatch PUT — once. "Newer" and "evidence" are different
+    // claims; this pins that the route checks the latter, not just the former.
+    let seen = 0;
+    h.state.afterGet = () => {
+      if (++seen === 1) seed(KEY, { ticket_id: "TEAM-X", summary: "" }, '"etag-blank-2"');
+    };
+
+    const res = await post({ ticketId: "TEAM-X", targetStatus: "done", evidence: EVIDENCE });
+    const json = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(json).toMatchObject({ success: true, completionRecordWritten: true });
+    // Round 1: create (412) → GET → refill IfMatch etag-blank-1 (412, rewritten).
+    // Round 2: create (412) → GET → refill IfMatch etag-blank-2 (lands).
+    expect(puts()).toHaveLength(4);
+    expect(gets()).toHaveLength(2); // it RE-READ — the whole fix
+    expect(puts()[1].input.IfMatch).toBe('"etag-blank-1"');
+    expect(puts()[3].input.IfMatch).toBe('"etag-blank-2"'); // conditions on the NEWER version
+    expect(dels()).toHaveLength(0);
+    const merged = JSON.parse(stored()[KEY]);
+    expect(merged).toMatchObject({ ticket_id: "TEAM-X", summary: EVIDENCE });
+    const { completionRecordHasEvidence } = await import("@/lib/workflow/completion-evidence");
+    expect(completionRecordHasEvidence(merged)).toBe(true);
+    expect(invokes()).toHaveLength(1);
+  });
+
+  it("TEAM-4293: a concurrent winner that is blank on EVERY round → 502, and the ticket never closes on an unproven record", async () => {
+    await load();
+    seed(KEY, { ticket_id: "TEAM-X", summary: "" }, '"etag-blank-0"');
+    let n = 0;
+    h.state.afterGet = () => { seed(KEY, { ticket_id: "TEAM-X", summary: "" }, `"etag-blank-${++n}"`); };
+
+    const res = await post({ ticketId: "TEAM-X", targetStatus: "done", evidence: EVIDENCE });
+    const json = await res.json();
+
+    // Same rule as the vanish path: exhausted is "failed", never "kept". Closing
+    // here would leave a done ticket whose record does not satisfy the gate,
+    // unretryably.
+    expect(res.status).toBe(502);
+    expect(json.error).toBe("completion evidence record write failed");
+    expect(json.details).toContain("kept being rewritten while every version read back was blank");
+    expect(puts()).toHaveLength(6); // 3 rounds x (create + refill)
+    expect(gets()).toHaveLength(3);
+    expect(invokes()).toHaveLength(0); // the transition never fired
+    expect(dels()).toHaveLength(0);
+    // The winner is left exactly as its writer left it — never clobbered.
+    expect(JSON.parse(stored()[KEY])).toMatchObject({ ticket_id: "TEAM-X", summary: "" });
   });
 
   it("an unparseable existing record is not evidence → refilled", async () => {
@@ -1010,6 +1076,35 @@ describe("TEAM-4284: ticketId can never reach an S3 key (QA F3 pin, both provide
       expect(stored()).toEqual({});
     }
   );
+});
+
+/**
+ * TEAM-4293 (r2-F3, doc pin) — SKILL.md's "third failure" bullet describes the
+ * remedy for a done ticket whose re-run mark-done reveals it already moved: in jira
+ * mode that is `API 409 Ticket transition rejected`, but in dynamodb mode a genuine
+ * done→done never reaches the Lambda at all — it is refused LOCALLY by
+ * VALID_TRANSITIONS (route.ts:46, checked at :491-496) with a 400, before any S3
+ * read or Lambda invoke. This test does not exercise the TEAM-4293 fix above (it
+ * PASSES on base too — the 400 predates this change); it pins the API shape the
+ * corrected SKILL.md prose now names, so a future edit to VALID_TRANSITIONS or the
+ * local-check ordering cannot silently make the prose wrong again.
+ */
+describe("TEAM-4293 (doc pin): dynamodb mode's local legality check answers a done→done before jira mode's Lambda would", () => {
+  it("TEAM-4293 (doc pin): dynamodb mode — a genuine done → done is refused locally with 400 before any S3 read or Lambda call", async () => {
+    await load();
+    h.state.tickets = [
+      { ticketId: "TEAM-X", status: "done", assignee: "agentcore_hub_backend_dev", title: "Already done" },
+    ];
+
+    const res = await post({ ticketId: "TEAM-X", targetStatus: "done", evidence: EVIDENCE });
+    const json = await res.json();
+
+    expect(res.status).toBe(400);
+    expect(json).toEqual({ error: "Invalid transition from done to done" });
+    expect(s3calls()).toHaveLength(0);
+    expect(invokes()).toHaveLength(0);
+    expect(ctorLog()).toEqual([]);
+  });
 });
 
 /**

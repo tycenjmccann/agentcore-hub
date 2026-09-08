@@ -110,8 +110,12 @@ blockers:
   So do NOT apply the create-only remedy (there is nothing missing) and do NOT
   delete anything. Just re-run the same `mark-done`: if the ticket did not move
   it moves now and the existing record is kept; if it already moved you get
-  `API 409: {"error":"Ticket transition rejected"…}` on the `done → done`, which
-  is itself confirmation the record is in place — `complete` the run. A 500 with
+  `API 409 Ticket transition rejected` (jira mode) or `API 400 Invalid transition
+  from done to done` (dynamodb mode) on the `done → done` — either is
+  confirmation the ticket already moved and the record is in place, so
+  `complete` the run. The two differ because dynamodb mode checks legality
+  locally against the tickets table before any S3 read or Lambda call, while
+  jira mode lets the ticket Lambda refuse. A 500 with
   `completionRecordWritten: false` means no record was written either, so treat
   it like the 502 above.
 
