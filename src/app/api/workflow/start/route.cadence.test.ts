@@ -321,6 +321,22 @@ describe("POST /api/workflow/start — sweep cadence gate (TEAM-4247 D2)", () =>
     expect(h.invokes.length).toBeGreaterThan(0); // the run really started
   });
 
+  it("an ERRORED sweep 2 days ago is not a sweep — the scheduled run is created (TEAM-4265 F10)", async () => {
+    // The crash-loop this fixes: a scheduled sweep that died 3 minutes in used to
+    // suppress every retry for 14 days, so the repo silently stopped being swept.
+    const crashed = priorSweep(2, { workflowId: "wf_prior_err", phase: "error" });
+    h.store.set(crashed.workflowId, crashed);
+
+    const res = await post(sweepBody());
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.status).toBeUndefined(); // not "skipped"
+    expect(body.workflowId).toMatch(/^wf_/);
+    expect(tombstones()).toEqual([]);
+    expect(events().filter((e) => e.type === "workflow.skipped")).toEqual([]);
+    expect(h.invokes.length).toBeGreaterThan(0); // the run really started
+  });
+
   it("paginates the scan — a prior sweep behind a page boundary still skips", async () => {
     // Two OTHER sweep rows (different repo) ahead of the recent one, so the
     // deciding row is only visible if the route follows LastEvaluatedKey.

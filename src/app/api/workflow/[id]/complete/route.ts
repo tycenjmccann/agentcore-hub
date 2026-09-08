@@ -46,6 +46,9 @@ import {
   type HeadTaskLike,
   type HeadTicketLike,
 } from "@/lib/workflow/verified-heads";
+// TEAM-4265 F9: the detection-phase strip's hand-port, in a lib module for the same
+// reason as the gate above (a route file may export only HTTP handlers).
+import { normalizeSweepDetectionMode, stripUnenforcedDetectionPhase } from "@/lib/workflow/sweep-detection";
 import { branchHeadSha } from "@/lib/workflow/repo-check";
 import agentsConfig from "@/config/agents.json";
 
@@ -544,6 +547,20 @@ export async function POST(
       );
     }
 
+    // TEAM-4265 F9 — PARITY with lambda/orchestrator/index.mjs
+    // stripUnenforcedDetectionPhase, which the orchestrator applies centrally in
+    // getEffectiveWorkflowDef. "detection" is a completion-REQUIRED phase only
+    // under SWEEP_DETECTION_PHASE=enforce; the sweep def in
+    // src/config/workflows.json already lists it, so reading the RAW def here 409s
+    // `required_phase_incomplete` on every sweep whose intake never stamped a
+    // detection ticket — while the orchestrator twin completes it. Read PER
+    // REQUEST, like verifiedHeadMode below: a long-lived server must not cache a
+    // flag the operator can flip. All three gates below route their required-phase
+    // read through requiredPhasesOf so they cannot drift from one another.
+    const sweepDetectionMode = normalizeSweepDetectionMode(process.env.SWEEP_DETECTION_PHASE);
+    const requiredPhasesOf = (def: { completionRequiresAgentPhases?: string[] } | null | undefined): string[] =>
+      stripUnenforcedDetectionPhase(def || {}, sweepDetectionMode).completionRequiresAgentPhases || [];
+
     // 2b. TEAM-3619 D4a: deliverable-evidence gate. Every done ticket in a
     //     completion-required phase must have real work behind it (task output or
     //     an artifact). Enforced by default (TEAM-3690): missing evidence → 409.
@@ -552,7 +569,7 @@ export async function POST(
     //     the open-children gate has none.
     try {
       const def = await resolveWorkflowDef(String(workflow.workflowDefId || ""));
-      const requiredPhases = def?.completionRequiresAgentPhases || [];
+      const requiredPhases = requiredPhasesOf(def);
       const agentTasks = (workflow.agentTasks as Record<string, AgentTaskLike>) || {};
       let missing = missingEvidenceTickets(tickets, agentTasks, requiredPhases);
       // TEAM-3976: a ticket closed out-of-band (mark_done) BEFORE its
@@ -640,7 +657,7 @@ export async function POST(
     //      gate, not an evidence heuristic.
     try {
       const def = await resolveWorkflowDef(String(workflow.workflowDefId || ""));
-      const requiredPhases = def?.completionRequiresAgentPhases || [];
+      const requiredPhases = requiredPhasesOf(def);
       const unrun = requiredPhasesMissingDoneAgent(tickets, requiredPhases);
       if (unrun.length > 0) {
         return NextResponse.json(
@@ -670,7 +687,7 @@ export async function POST(
     //     by default; the explicit opt-out only shadow-logs and completes.
     try {
       const def = await resolveWorkflowDef(String(workflow.workflowDefId || ""));
-      const requiredPhases = def?.completionRequiresAgentPhases || [];
+      const requiredPhases = requiredPhasesOf(def);
       const verdict = evaluateShipVerdict(
         tickets,
         (workflow.agentTasks as Record<string, ShipTaskLike>) || {},
