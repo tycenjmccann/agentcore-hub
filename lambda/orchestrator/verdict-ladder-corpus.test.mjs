@@ -146,6 +146,41 @@ describe("verdict ladder — the whole vendored corpus", () => {
       .toEqual(["TEAM-3591", "TEAM-4128"]);
   });
 
+  it("exactly ONE corpus record resolves on the HEADLINE rung, and it is the rescue", () => {
+    // Provenance, not just verdicts. `matched` says which rung answered: rungs 1-2
+    // leave a "verdict:" label or a "round N" heading in it, so what remains is
+    // the HEADLINE rung. Pinning the SET matters more than the count — it is what
+    // makes the adversarial pass below meaningful, because a rung that answers for
+    // exactly one record is a rung only that record can regress.
+    const headline = gateCompletions()
+      .filter((c) => (c.record?.summary || "").trim() !== "")
+      .map((c) => ({ id: `${c.run}/${c.ticketId}`, ...resolveVerdict(c.record, c.assignee) }))
+      .filter((r) => r.verdict !== null && r.matched && !/verdict\s*:/i.test(r.matched) && !/round\s*\d+/i.test(r.matched));
+    expect(headline.map((r) => r.id)).toEqual(["iczquj/TEAM-3588"]);
+    expect(headline[0].verdict).toBe("PASS");
+  });
+
+  it("appending a zero-count line to any record changes NOTHING (TEAM-4285)", () => {
+    // The adversarial guard on the count-payload rule. Every gate summary in the
+    // wild eventually grows a "FAIL: 0" line, and before TEAM-4285 that line was
+    // read as a FAIL headline that out-severed the persona's real answer.
+    //
+    // The teeth are in ONE record and that is worth stating plainly: without the
+    // fix this flips iczquj/TEAM-3588 from PASS to FAIL. The other 14 resolve at
+    // rungs 1-2, which are document-wide and first-hit-wins, so an appended line
+    // cannot reach them — TEAM-3588 is the corpus's only HEADLINE-rung resolution
+    // and therefore the only record that can prove the rule.
+    let compared = 0;
+    for (const c of gateCompletions()) {
+      const base = resolveVerdict(c.record, c.assignee);
+      if (base.verdict === null) continue;
+      const adversarial = { ...c.record, summary: `${c.record.summary}\nFAIL: 0\nSKIP: 0` };
+      expect(resolveVerdict(adversarial, c.assignee).verdict, `${c.run}/${c.ticketId}`).toBe(base.verdict);
+      compared++;
+    }
+    expect(compared).toBe(15);
+  });
+
   it("every unsummarised gate completion is a null verdict, not a PASS", () => {
     // 14 records, all of sffzti and yteqfl. Nothing to read is exactly the case
     // F1 inverted: before TEAM-4264 each of these released its successor.

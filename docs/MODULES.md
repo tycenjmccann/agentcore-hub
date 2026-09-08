@@ -109,7 +109,11 @@ The single prose→verdict ladder they all read lives in the zero-import
   terminated by `:`, an em/en dash, `-`, `(`, `,` or end-of-line; the most severe
   hit across all lines wins (`BLOCKED` > `FAIL` > `CHANGES_NEEDED` > `PASS`). The
   line-anchoring is what lets `0 FAIL`, `FAILURES: 0` and `191 PASS / 8 FAIL`
-  resolve to nothing rather than flipping a real pass to a fail. **A held
+  resolve to nothing rather than flipping a real pass to a fail. Count lines are
+  excluded from the headline rung as well (TEAM-4285): a verdict token whose
+  payload is only a number — `FAIL: 0`, `PASS: 0`, `FAIL: 3 / PASS: 191` — is a
+  metric rather than a headline, so a zero-fail count can no longer out-severe a
+  real `PASS` stated on the line above it. **A held
   non-`PASS` verdict is durable, not just in-memory (TEAM-4264 F2):** the
   re-verify `live-reverify.mjs` files is always pinnable to a head — `testedHead`
   when the gate declared one, else the orchestrator's own
@@ -157,9 +161,9 @@ The single prose→verdict ladder they all read lives in the zero-import
   with or without a PR head, so with none to appeal to, **both** verifiers are
   reported stale rather than neither.
 
-**Sweep detection flag (TEAM-4247 D2, `lambda/orchestrator/`)** — same
-`off | shadow | enforce` convention as the three above (unset → `shadow`,
-unrecognized → `off`), normalized by the same `normalizeVerdictMode`.
+**Sweep detection flag (TEAM-4247 D2 — `lambda/orchestrator/` AND the Next.js
+service)** — same `off | shadow | enforce` convention as the three above (unset →
+`shadow`, unrecognized → `off`), normalized by the same `normalizeVerdictMode`.
 - `SWEEP_DETECTION_PHASE` — a `dead-code-sweep` run whose **detection** ticket
   completes with `verified_removable: 0` (a strict integer 0; absent is not a
   zero yield) has no work left to do. `enforce` closes the run as the terminal
@@ -177,6 +181,23 @@ unrecognized → `off`), normalized by the same `normalizeVerdictMode`.
   because nothing else requires the detection ticket to exist yet. The def's
   `phases[]` is **never** stripped: the analyst must still plan and stamp the
   detection ticket under `shadow`, or `shadow` observes nothing.
+- **The `/complete` route applies the SAME strip** (TEAM-4265 F9). `POST
+  /api/workflow/[id]/complete` — the Workflow Manager's human-driven close — resolves
+  its own def and feeds all three of its gates (evidence, required-phase,
+  ship-verdict) through `src/lib/workflow/sweep-detection.ts`, a hand-port of
+  `stripUnenforcedDetectionPhase` pinned against the `.mjs` original by
+  `src/lib/workflow/sweep-detection-parity.test.ts`. Without it the route read the
+  raw def and answered 409 `required_phase_incomplete` on exactly the sweeps the
+  orchestrator completes — a gate only one tier enforces is a gate with a bypass, and
+  this one wedged the path a human reaches for when a run is already stuck.
+- **So this flag is ALSO app env**, like `SWEEP_CADENCE_GATE`: the route reads it
+  from the Next.js service's own environment, per request. Both
+  `deploy/apprunner/deploy.sh` and `deploy/ecs-express/deploy.sh` forward it when
+  set, in addition to `lambda/orchestrator/deploy.sh`. If only the **Lambda** is set
+  to `enforce`, the route stays at its `shadow` default and keeps stripping — safe
+  and non-wedging (it never refuses a run the orchestrator would complete), but the
+  route will not *require* a detection ticket until the app env is set too. Set both
+  to keep the twins honest.
 - **Deploy order matters, because config and code ship separately.** The
   detection phase only exists for the Lambdas once
   `s3://$ARTIFACT_BUCKET/config/workflows.json` carries it (read on cold start,
@@ -206,6 +227,19 @@ garbage → `off` rule.
   tombstone plus one `workflow.skipped` event. `shadow` runs both checks,
   publishes `sweep.cadence_observed { wouldSkip, evidence, repo, defId }`, and
   starts the run as today. `off` scans and probes nothing.
+- **Which prior runs count as "swept"** (TEAM-4265 F10) — only a **productive
+  terminal** outcome (`complete`, or a no-op outcome like `nothing-to-remove`: the
+  sweep did happen, it just found nothing) or a **live** run (any non-terminal phase,
+  including a row carrying no phase at all — unknown is not dead; a sweep still in
+  flight is the strongest reason not to start a second). `error`, `cancelled`,
+  `deploy-blocked` and `static-ci-only` rows do **not** count: FR-D2.4 means "swept
+  < 14 days ago", not "attempted", and a scheduled sweep that crashed three minutes
+  in used to suppress every retry for a fortnight. A blocked sweep whose removal PR
+  is still open is caught by the open-PR probe instead, and one whose PR was closed
+  unmerged should be re-sweepable. `countsAsPriorSweep` reads the shared
+  `isTerminalPhase` / `NO_OP_OUTCOMES` from `src/lib/workflow/types.ts` rather than a
+  hand-written list, so a new terminal outcome cannot silently start counting.
+  `evidence.runsConsidered` reports this filtered set, not every row the Scan saw.
 - The gate runs **above** the dedup marker and every create, so a skip leaves no
   epic, no tickets and no run row — nothing to clean up.
 - Only `trigger: "scheduled"` is gated. `lambda/routines-runner/index.mjs` stamps

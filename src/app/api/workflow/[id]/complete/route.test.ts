@@ -123,7 +123,7 @@ vi.mock("@/lib/workflow/defs-loader", () => ({
 
 let POST: typeof import("./route").POST;
 
-const SAVED = ["COMPLETION_EVIDENCE_REQUIRED", "TICKET_PROVIDER", "ARTIFACT_BUCKET", "VERIFIED_HEAD_COMPLETION", "GITHUB_PAT"] as const;
+const SAVED = ["COMPLETION_EVIDENCE_REQUIRED", "TICKET_PROVIDER", "ARTIFACT_BUCKET", "VERIFIED_HEAD_COMPLETION", "GITHUB_PAT", "SWEEP_DETECTION_PHASE"] as const;
 const saved: Partial<Record<(typeof SAVED)[number], string | undefined>> = {};
 
 async function load() {
@@ -147,6 +147,7 @@ beforeEach(() => {
   delete process.env.COMPLETION_EVIDENCE_REQUIRED;
   delete process.env.VERIFIED_HEAD_COMPLETION;
   delete process.env.GITHUB_PAT;
+  delete process.env.SWEEP_DETECTION_PHASE;
 });
 
 afterEach(() => {
@@ -673,6 +674,100 @@ describe("POST complete — required-phase gate (TEAM-3755 F4)", () => {
     const res = await post();
     expect(res.status).toBe(200);
     expect((await res.json()).status).toBe("complete");
+  });
+});
+
+/**
+ * TEAM-4265 F9 — PARITY with lambda/orchestrator/index.mjs
+ * stripUnenforcedDetectionPhase: "detection" is a completion-REQUIRED phase only
+ * under SWEEP_DETECTION_PHASE=enforce.
+ *
+ * The bug: this route read `def.completionRequiresAgentPhases` RAW, while the
+ * orchestrator strips "detection" out of the effective def unless the flag is
+ * enforce. src/config/workflows.json already lists it for dead-code-sweep, so under
+ * the DEFAULT (shadow) a sweep whose intake never stamped a detection ticket
+ * completed via the orchestrator and 409'd here — a wedge on the one path a human
+ * reaches for when a run is already stuck. The strip's own parity with the .mjs
+ * original is pinned in src/lib/workflow/sweep-detection-parity.test.ts; what lives
+ * only here is that all three gates read through it.
+ */
+describe("POST complete — detection phase is required only under enforce (TEAM-4265 F9)", () => {
+  /** The dead-code-sweep def's required phases, detection first as in the config. */
+  const SWEEP_REQUIRED = ["detection", "development", "verification", "review", "ship"];
+
+  /** A finished sweep: every required phase done WITH evidence, ship really merged,
+   *  and NO detection ticket (the intake that predates the config sync). */
+  const sweepTickets = [
+    { ticketId: "T-1", type: "task", status: "done", phase: "development", assignee: "dev" },
+    { ticketId: "T-2", type: "task", status: "done", phase: "verification", assignee: "qa" },
+    { ticketId: "T-3", type: "task", status: "done", phase: "review", assignee: "reviewer" },
+    { ticketId: "T-4", type: "task", status: "done", phase: "ship", assignee: "rm" },
+  ];
+  const sweepWorkflow = () => ({
+    workflowId: "wf_1",
+    phase: "ship",
+    workflowDefId: "dead-code-sweep",
+    agentTasks: {
+      "T-1": { ticketId: "T-1", output: "removed 4 unreferenced helpers" },
+      "T-2": { ticketId: "T-2", output: "suite green" },
+      "T-3": { ticketId: "T-3", output: "LGTM" },
+      // mergeCommit is what satisfies the ship-verdict gate (2c).
+      "T-4": { ticketId: "T-4", output: "merged the removal PR", mergeCommit: "9f1c2ab" },
+    },
+  });
+
+  beforeEach(() => {
+    h.state.def = { completionRequiresAgentPhases: SWEEP_REQUIRED };
+    h.state.workflow = sweepWorkflow();
+    h.state.tickets = [...sweepTickets];
+  });
+
+  it("flag UNSET (shadow default): the detection requirement is stripped — 200 complete", async () => {
+    await load();
+    const res = await post();
+    expect(res.status).toBe(200);
+    expect((await res.json()).status).toBe("complete");
+    expect(h.state.updates.length).toBe(1);
+  });
+
+  it("=off: same strip, same completion (the rollback position is not a wedge)", async () => {
+    process.env.SWEEP_DETECTION_PHASE = "off";
+    await load();
+    const res = await post();
+    expect(res.status).toBe(200);
+    expect((await res.json()).status).toBe("complete");
+  });
+
+  it("=enforce with no detection ticket: 409 required_phase_incomplete, naming detection only", async () => {
+    process.env.SWEEP_DETECTION_PHASE = "enforce";
+    await load();
+    const res = await post();
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body.error).toBe("required_phase_incomplete");
+    expect(body.phases).toEqual(["detection"]);
+    // Refused, not faked and not closed on some invented outcome.
+    expect(h.state.updates.length).toBe(0);
+  });
+
+  it("=enforce with a done, evidenced detection ticket: 200 complete", async () => {
+    process.env.SWEEP_DETECTION_PHASE = "enforce";
+    h.state.tickets = [
+      { ticketId: "T-0", type: "task", status: "done", phase: "detection", assignee: "sweeper" },
+      ...sweepTickets,
+    ];
+    h.state.workflow = {
+      ...sweepWorkflow(),
+      agentTasks: {
+        ...sweepWorkflow().agentTasks,
+        "T-0": { ticketId: "T-0", output: "12 candidates, 4 verified removable" },
+      },
+    };
+    await load();
+    const res = await post();
+    expect(res.status).toBe(200);
+    expect((await res.json()).status).toBe("complete");
+    expect(h.state.updates.length).toBe(1);
   });
 });
 

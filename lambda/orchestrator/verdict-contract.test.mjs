@@ -259,10 +259,17 @@ describe("verdict-contract — the HEADLINE rung (TEAM-4264 F1)", () => {
    * ladder, and unreadable now HOLDS. So this rung is the difference between
    * holding on real failures and holding on noise.
    *
-   * Its whole safety property is the ANCHOR plus the TERMINATOR: the token has to
-   * be what the line is about. That is why no test here parses a count and why
-   * "0 FAIL" needs no special case — a rule that reads it correctly by not
-   * matching it cannot be fooled by "00 FAIL" or "zero FAIL" either.
+   * Its safety property is the ANCHOR plus the TERMINATOR: the token has to be
+   * what the line is about. That is why "0 FAIL" needs no special case — a rule
+   * that reads it correctly by not matching it cannot be fooled by "00 FAIL" or
+   * "zero FAIL" either.
+   *
+   * The anchor is not sufficient on its own, though, and TEAM-4285 is where it
+   * ran out: "FAIL: 0" starts with the token and ends it with a real terminator.
+   * So there is now ONE payload rule — a verdict token followed by nothing but a
+   * number is a count, not an answer — and the rows below pin both sides of it:
+   * "FAIL: 0" is not a verdict, while "QA FAIL: 191 PASS / …" still is, because
+   * its number is followed by a word.
    */
   it.each([
     // The forms the corpus and the blueprints actually produce.
@@ -298,6 +305,14 @@ describe("verdict-contract — the HEADLINE rung (TEAM-4264 F1)", () => {
     "PASSED_COUNT: 57",
     "Now blocked on TEAM-4183.",
     "changes needed to the docs only, filed as TEAM-4200.",
+    // TEAM-4285 — the token leads the line and ":" terminates it, so the anchor
+    // and the terminator both say "headline". The PAYLOAD says metric: there is
+    // nothing here but a number, and a count is not an answer.
+    "FAIL: 0",
+    "PASS: 0",
+    "FAIL: 3 / PASS: 191",
+    "PASS: 100%",
+    "| vitest | 3325 | 0 |",
   ])("%s is not a verdict", (summary) => {
     expect(deriveVerdict(summary), summary).toBeNull();
   });
@@ -315,6 +330,26 @@ describe("verdict-contract — the HEADLINE rung (TEAM-4264 F1)", () => {
     expect(deriveVerdict("PASS: lint clean\nFAIL: two suites red")).toMatchObject({ verdict: "FAIL" });
     expect(deriveVerdict("CHANGES NEEDED: naming\nFAIL: the migration is not reversible")).toMatchObject({ verdict: "FAIL" });
     expect(deriveVerdict("PASS: build\nCHANGES NEEDED: two P2s")).toMatchObject({ verdict: "CHANGES_NEEDED" });
+  });
+
+  it("a zero-count line never overrides the headline above it (TEAM-4285)", () => {
+    // Most-severe-wins is what made this a REAL hold rather than a cosmetic
+    // misread: "FAIL: 0" outranks the PASS the persona actually stated, so a QA
+    // summary that printed its own zero-fail count resolved to FAIL, and under
+    // TEAM-4264 a non-PASS verdict holds the successor. The gate re-opened on a
+    // green run and cost a re-verify round.
+    const QA = "agentcore_hub_qa_verifier";
+    expect(resolveVerdict({ summary: "QA PASS — 191 passed\nFAIL: 0\nSKIP: 8" }, QA))
+      .toMatchObject({ verdict: "PASS", verdictSource: "inferred" });
+    expect(resolveVerdict({ summary: "PASS\nFAIL: 0\nFix tickets: none" }, QA))
+      .toMatchObject({ verdict: "PASS", verdictSource: "inferred" });
+    // A markdown results table is the same shape with pipes instead of colons.
+    expect(resolveVerdict({ summary: "PASS\n| vitest | 3325 | 0 |" }, QA))
+      .toMatchObject({ verdict: "PASS", verdictSource: "inferred" });
+    // The counterpart the rule must NOT eat: a count followed by a word is prose,
+    // so a real headline whose payload happens to start with a number survives.
+    expect(deriveVerdict("QA FAIL: 191 PASS / 8 FAIL in live Chromium."))
+      .toMatchObject({ verdict: "FAIL", source: "inferred" });
   });
 
   it("a LABELLED line still wins over any headline, on any line", () => {
