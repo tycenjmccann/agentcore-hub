@@ -79,6 +79,13 @@ import { normalizeVerdictMode, GATE_PERSONAS, resolveVerdict, resolveTestedHead,
 // key into an unquoted `parent = …` operand, which escaping cannot make safe —
 // it is shape-checked and refused instead. See getChildTicketsFromJira.)
 import { KIND_TO_ORIGIN_KEY, parseFixContractBlock, TICKET_KEY_RE } from "./fix-contract.mjs";
+// TEAM-4248 D3: the same zero-import-and-byte-copied arrangement, for the same
+// reason — this module also ships inside both ticket Lambdas and workflow-output,
+// which cannot import from lambda/orchestrator/. The orchestrator uses only its
+// branch half: canonicalBranchFor is the SINGLE definition of the convention the
+// ## Branch block below renders, and branch-name-parity.test.mjs reads this file
+// as text to prove the two have not drifted.
+import { normalizeTicketPlanValidatorMode, canonicalBranchFor, rewriteBranchNames } from "./ticket-plan-validator.mjs";
 import {
   normalizeChainGateMode, chainFor, chainDir, requiredArtifactsForTicket, sdlcFrameworkContext,
   gateInstructionOverride, fallbackReviewPackagePhase, artifactRepoPath, missingArtifactNote,
@@ -328,6 +335,29 @@ const VERIFIED_HEAD_COMPLETION = normalizeVerdictMode(process.env.VERIFIED_HEAD_
 // a sweep whose intake never stamped a detection ticket. The def's `phases` array
 // is never stripped — the analyst must see the phase (and stamp it) in shadow too.
 const SWEEP_DETECTION_PHASE = normalizeVerdictMode(process.env.SWEEP_DETECTION_PHASE);
+
+// TICKET_PLAN_VALIDATOR (TEAM-4248 D3) — the branch half of the flag, in the
+// orchestrator. (The graph half runs in the two ticket Lambdas and
+// workflow-output; one flag because they are one defect: a plan nobody checked.)
+//
+// The hole: all four of c2uqki's downstream tickets told their persona to look at
+// `chore/dead-code-sweep-2026-09-07`. The sweeper had actually pushed
+// `feature/TEAM-4230-code-sweeper`. The reviewer, QA and CI each opened a session,
+// discovered "Ticket-named branch does not exist", and reconciled by hand — three
+// sessions of friction and three chances to review the wrong tree. The
+// orchestrator has always known the answer: it RENDERS the convention, in the
+// ## Branch block — but only for development-phase personas, so the four who had
+// to find the branch were the four never told it.
+//   enforce = every phase gets ## Branch, and an invented branch name in the
+//             ticket description is rewritten to the real one IN THE PROMPT.
+//   shadow  = every phase gets ## Branch; the description reaches the model
+//             byte-identical and `ticket_plan.branch_rewritten_observed` records
+//             what would have changed.
+//   off     = development only, exactly as today, and no sibling read.
+// Its own normalizer (unset → shadow, garbage → off) rather than
+// normalizeVerdictMode, because the same value is read by three Lambdas that
+// cannot import verdict-contract.mjs.
+const TICKET_PLAN_VALIDATOR = normalizeTicketPlanValidatorMode(process.env.TICKET_PLAN_VALIDATOR);
 
 /**
  * The children a completion GATE may consider (TEAM-4122 FR-7). Under enforce an
@@ -5443,14 +5473,147 @@ export function formatSourceLine(source) {
   return line;
 }
 
+/**
+ * The branch this persona must look at, plus every branch name it is legitimate
+ * for its ticket to mention (TEAM-4248 D3).
+ *
+ * A development-phase persona PRODUCES a branch, and its name is the harness
+ * convention applied to that persona's own ticket — today's literal exactly,
+ * which is why `canonicalBranchFor` is now the only definition of it (the four
+ * byte-copies are cmp'd by check-fix-kinds-parity.sh, and this file no longer
+ * carries a second copy of the template).
+ *
+ * Everyone else CONSUMES one, and until now was told nothing at all: c2uqki's
+ * reviewer, QA and CI were each handed the invented `chore/dead-code-sweep-
+ * 2026-09-07`, opened a session, found no such branch, and reconciled by hand.
+ * Their branch is the producer's, resolved from the epic's own children: when
+ * exactly one non-advisory sibling is a producer (a sweep run has one sweeper),
+ * that ticket's branch IS the tree to review; with several producers there is no
+ * single tree, so the run's shared integration branch is the honest answer.
+ *
+ * Returns null only when there is nothing to say — no agentDef, or `off` for a
+ * non-producer. A failed sibling read degrades to the feature branch; the block is
+ * never dropped, because dropping it is what produced the defect.
+ */
+async function resolveBranchPlan(ticket, workflow, agentDef, siblingsOnce) {
+  if (!agentDef) return null;
+  const defaultBranch = workflow.repoConfig?.repos?.[0]?.defaultBranch || "main";
+
+  if (agentDef.phase === "development") {
+    // TEAM-4122 FR-7: an advisory ticket is work the humans explicitly declined
+    // for THIS run, so it must not enter the shared integration branch — its
+    // files would otherwise appear in the unified PR's change set and land with
+    // the approved scope. Under enforce it gets its own branch off the repo
+    // default and PRs there; the release manager never reviews it in this run.
+    const advisory = ADVISORY_ROUTING === "enforce" && isAdvisoryTicket(ticket);
+    const canonical = canonicalBranchFor(ticket.ticketId, agentDef.agentId, { advisory });
+    return {
+      producer: true,
+      advisory,
+      canonical,
+      base: advisory ? defaultBranch : workflow.featureBranch || defaultBranch,
+      defaultBranch,
+      degraded: false,
+      knownBranches: [canonical, workflow.featureBranch, defaultBranch].filter(Boolean),
+    };
+  }
+
+  if (TICKET_PLAN_VALIDATOR === "off") return null; // byte-identical to before
+
+  const siblings = await siblingsOnce();
+  const featureBranch = workflow.featureBranch || defaultBranch;
+  const isAdvisorySibling = (t) => ADVISORY_ROUTING === "enforce" && isAdvisoryTicket(t);
+  const branchOf = (t) =>
+    canonicalBranchFor(t.ticketId || t.id || t.key, t.assignee, { advisory: isAdvisorySibling(t) });
+  const producers = (siblings || []).filter((t) => getAgentDef(t.assignee)?.phase === "development");
+  const shared = producers.filter((t) => !isAdvisorySibling(t));
+  return {
+    producer: false,
+    advisory: false,
+    // One producer → its branch. Several (or none, or a failed read) → the shared
+    // integration branch, which always exists and is never wrong, only vaguer.
+    canonical: shared.length === 1 ? branchOf(shared[0]) : featureBranch,
+    base: featureBranch,
+    defaultBranch,
+    degraded: siblings === null,
+    // An advisory producer's branch is a real branch, so mentioning it is not an
+    // invention even though it is never the tree this run reviews.
+    knownBranches: [featureBranch, defaultBranch, ...producers.map(branchOf)].filter(Boolean),
+  };
+}
+
 // Exported solely for cd-handoff.test.mjs (Delivery Mode / roster / gates block).
 export async function buildAgentContext(ticket, workflow) {
   await loadCdRegistry(); // the Delivery Mode block below reads it
   // Pure registry read, hoisted: the phase decides which blocks this persona
   // gets (## Unverified Fixes below, the manifest, the dev branch identity).
   const agentDef = getAgentDef(ticket.assignee);
+
+  // ONE sibling read for the whole function (TEAM-4248 D3). Two blocks want the
+  // epic's children — ## Unverified Fixes (LIVE_REVERIFY) and the ## Branch
+  // block's producer lookup — and on a Jira run that is a JQL search each. Both
+  // await the same promise instead. Never throws: `null` means "the read failed",
+  // `[]` means "no siblings", and each caller degrades on its own terms.
+  let _siblingsPromise = null;
+  const siblingsOnce = () => {
+    if (!_siblingsPromise) {
+      _siblingsPromise = (async () => {
+        try {
+          return (await getChildTickets(workflow.epicId)) || [];
+        } catch (err) {
+          console.warn(`[orchestrator] context sibling read failed (rows degraded): ${err?.message || err}`);
+          return null;
+        }
+      })();
+    }
+    return _siblingsPromise;
+  };
+
+  const branchPlan = await resolveBranchPlan(ticket, workflow, agentDef, siblingsOnce);
+
+  // TEAM-4248 D3 — an invented branch name in the ticket prose is the c2uqki
+  // defect reaching the model. The rewrite is CONTEXT-ONLY in both modes: the one
+  // writer of a description is Tickets___update_ticket, which the orchestrator
+  // never calls and which flattens the whole description into a single ADF
+  // paragraph, so persisting this would destroy the structure of every ticket it
+  // touched in order to fix a branch name.
+  //
+  // CONSUMERS only. A producer's prompt is byte-identical in every mode: it is
+  // told the branch to push in the ## Branch block, which it has always had and
+  // has always followed (c2uqki's sweeper pushed the convention while its own
+  // ticket named the invention), so rewriting its prose would change the prompt of
+  // the one persona that was never confused — for nothing.
+  const branchRewrite =
+    TICKET_PLAN_VALIDATOR !== "off" && branchPlan && !branchPlan.producer
+      ? rewriteBranchNames(ticket.description, {
+          canonical: branchPlan.canonical,
+          knownBranches: branchPlan.knownBranches,
+        })
+      : null;
+  if (branchRewrite?.rewrites.length) {
+    const detail = {
+      workflowId: workflow.id,
+      ticketId: ticket.ticketId,
+      assignee: ticket.assignee || null,
+      phase: agentDef?.phase || null,
+      canonical: branchPlan.canonical,
+      rewrites: branchRewrite.rewrites,
+    };
+    // shadow observes and the prompt is byte-identical; enforce is the only mode
+    // in which the rewritten text actually reaches the model.
+    if (TICKET_PLAN_VALIDATOR === "enforce") {
+      await publishEvent(ticket.ticketId, "ticket_plan.branch_rewritten", detail);
+    } else {
+      await publishEvent(ticket.ticketId, "ticket_plan.branch_rewritten_observed", detail);
+    }
+  }
+  const description =
+    TICKET_PLAN_VALIDATOR === "enforce" && branchRewrite?.rewrites.length
+      ? branchRewrite.text
+      : ticket.description;
+
   let context = `# Your Assignment: ${ticket.title}\n\n`;
-  context += `## Ticket\nID: ${ticket.ticketId}\nDescription: ${ticket.description}\n\n`;
+  context += `## Ticket\nID: ${ticket.ticketId}\nDescription: ${description}\n\n`;
 
   // Workflow identifiers
   context += `## Workflow Context\n`;
@@ -5702,12 +5865,9 @@ export async function buildAgentContext(ticket, workflow) {
       // ONE sibling read, only on this branch: the titles, the repro strings and
       // the re-verify tickets' live statuses all live on the tickets, not in
       // agentTasks. A failed read degrades the rows, never the block.
-      let siblings = [];
-      try {
-        siblings = (await getChildTickets(workflow.epicId)) || [];
-      } catch (err) {
-        console.warn(`[orchestrator] unverified-fix context: sibling read failed (rows degraded): ${err?.message || err}`);
-      }
+      // TEAM-4248 D3: shared with the ## Branch block's producer lookup via
+      // siblingsOnce, so both features on is still one read, not two.
+      const siblings = (await siblingsOnce()) || [];
       const byId = new Map(siblings.map((t) => [t.ticketId || t.id || t.key, t]));
       const inert = (s) => String(s || "").replace(/[`\r\n]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 300);
       const rows = unverified.map(([fixId, task]) => {
@@ -5746,34 +5906,35 @@ export async function buildAgentContext(ticket, workflow) {
     }
   } catch { /* manifest read failed — non-fatal */ }
 
-  // Dev agents: branch identity (scope, not HOW)
-  if (agentDef?.phase === "development") {
-    // TEAM-4122 FR-7: an advisory ticket is work the humans explicitly declined
-    // for THIS run, so it must not enter the shared integration branch — its
-    // files would otherwise appear in the unified PR's change set and land with
-    // the approved scope. Under enforce it gets its own branch off the repo
-    // default and PRs there; the release manager never reviews it in this run.
-    const advisory = ADVISORY_ROUTING === "enforce" && isAdvisoryTicket(ticket);
-    const defaultBranch = workflow.repoConfig?.repos?.[0]?.defaultBranch || "main";
-    const baseBranch = advisory ? defaultBranch : workflow.featureBranch || defaultBranch;
-    const slug = agentDef.agentId.replace(/^agentcore_hub_/, "").replace(/_/g, "-");
+  // Branch identity (scope, not HOW). Producers are told the branch to PUSH;
+  // every other persona is told the branch to CHECK OUT — TEAM-4248 D3, because
+  // the four c2uqki personas who had to find the branch were the four this block
+  // never reached. Under `off` resolveBranchPlan returns null for them and this
+  // renders for development only, exactly as it did before.
+  if (branchPlan) {
     context += `## Branch\n`;
-    context += `feature_branch: feature/${ticket.ticketId}-${advisory ? "advisory" : slug}\n`;
-    context += `base_branch: ${baseBranch}\n`;
-    if (advisory) {
-      context += `NOTE: ADVISORY ticket. Branch from ${defaultBranch} and open your PR against ${defaultBranch}. It is NOT part of this run's shared integration branch or its unified PR; the release manager will not review it in this run.\n`;
+    context += `feature_branch: ${branchPlan.canonical}\n`;
+    context += `base_branch: ${branchPlan.base}\n`;
+    if (!branchPlan.producer) {
+      context += `NOTE: you do not push to this branch; check it out to verify. This is the branch the ticket's upstream work was pushed to — the ticket text is not authoritative about branch names, this block is. If you cannot find it, say so in your completion instead of guessing another name.\n`;
+    } else if (branchPlan.advisory) {
+      context += `NOTE: ADVISORY ticket. Branch from ${branchPlan.defaultBranch} and open your PR against ${branchPlan.defaultBranch}. It is NOT part of this run's shared integration branch or its unified PR; the release manager will not review it in this run.\n`;
     } else if (workflow.featureBranch) {
       context += `NOTE: base_branch is this run's SHARED integration branch. Branch from it, target your PR at it (never the repo default branch), and merge your PR into it when your evidence is complete — one unified PR to the default branch is opened by the orchestrator at run completion.\n`;
     }
     context += `\n`;
 
-    // Design artifacts content (scope)
-    try {
-      const designDoc = await readS3Artifact(workflow.id, "shared/output.md");
-      if (designDoc) {
-        context += `## Design Artifacts\n${designDoc.slice(0, 8000)}\n\n`;
-      }
-    } catch { /* no design docs yet */ }
+    // Design artifacts content (scope) — DEVELOPMENT ONLY. It was nested in the
+    // same `if` as the branch block above, and widening that block must not turn
+    // one S3 read per dev ticket into one per ticket of every run.
+    if (agentDef?.phase === "development") {
+      try {
+        const designDoc = await readS3Artifact(workflow.id, "shared/output.md");
+        if (designDoc) {
+          context += `## Design Artifacts\n${designDoc.slice(0, 8000)}\n\n`;
+        }
+      } catch { /* no design docs yet */ }
+    }
   }
 
   // Original request + input sources for the workflow's intake agent (any def).

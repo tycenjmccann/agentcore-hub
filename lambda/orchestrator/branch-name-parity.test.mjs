@@ -4,69 +4,68 @@ import { fileURLToPath } from "node:url";
 import { canonicalBranchFor } from "./ticket-plan-validator.mjs";
 
 /**
- * canonicalBranchFor MUST render the branch index.mjs renders (TEAM-4248 D3).
+ * ONE definition of the branch convention, and it renders what it always did
+ * (TEAM-4248 D3).
  *
- * There are now FIVE places the convention lives: the literal in index.mjs's
- * buildAgentContext ## Branch block, and canonicalBranchFor in four byte-copied
- * modules. check-fix-kinds-parity.sh keeps the four copies identical to each
- * other; nothing keeps them identical to the string an agent is actually TOLD.
+ * The convention now lives in canonicalBranchFor, byte-copied into four Lambda
+ * zips — check-fix-kinds-parity.sh cmp's the copies against each other. What
+ * that guard cannot see is a FIFTH copy: index.mjs used to build the string by
+ * hand in its ## Branch block, and the whole point of D3 is that a branch name
+ * an agent is TOLD must never disagree with the branch a producer actually
+ * pushes. c2uqki is what disagreement costs: the sweeper pushed
+ * feature/TEAM-4230-code-sweeper while the reviewer, QA and CI were each told to
+ * look at chore/dead-code-sweep-2026-09-07.
  *
- * If they drift, the failure is silent and expensive in exactly the way c2uqki
- * was: the harness tells the sweeper one branch, and the reviewer, QA and CI are
- * each judged against a different name. So this test does not compare prose — it
- * extracts index.mjs's own two lines as TEXT, executes them, and requires the
- * output to equal canonicalBranchFor's for the same inputs. A refactor that
- * moves or renames the literal fails here rather than in production.
+ * So this file guards two things:
+ *   1. index.mjs derives the name from canonicalBranchFor and carries no second
+ *      template of its own — a re-inlined literal fails here.
+ *   2. canonicalBranchFor still renders exactly what index.mjs rendered BEFORE
+ *      D3 moved it. The expectations below are the output of the pre-D3 lines
+ *      (index.mjs at 40bd1ca):
+ *        const slug = agentDef.agentId.replace(/^agentcore_hub_/, "").replace(/_/g, "-");
+ *        context += `feature_branch: feature/${ticket.ticketId}-${advisory ? "advisory" : slug}\n`;
+ *      transcribed as literals, so this test is a behavioural pin rather than a
+ *      restatement of the implementation it is checking.
  */
 
 const INDEX = fileURLToPath(new URL("./index.mjs", import.meta.url));
 const src = readFileSync(INDEX, "utf8");
 
-const slugMatch = /const slug = (agentDef\.agentId(?:[^;\n]+));/.exec(src);
-const branchMatch = /context \+= `feature_branch: (feature\/[^`\n]+?)\\n`;/.exec(src);
-
-describe("branch-name parity: index.mjs vs canonicalBranchFor", () => {
-  it("still finds the ## Branch literal in index.mjs", () => {
-    // An empty extraction would make every assertion below vacuously pass.
-    expect(
-      slugMatch,
-      "the `const slug = agentDef.agentId...` line moved — update this extractor",
-    ).not.toBeNull();
-    expect(
-      branchMatch,
-      "the `feature_branch: feature/...` literal moved — update this extractor",
-    ).not.toBeNull();
+describe("branch-name parity: index.mjs has ONE source for the convention", () => {
+  it("index.mjs renders the block from canonicalBranchFor", () => {
+    expect(src).toMatch(/import \{[^}]*canonicalBranchFor[^}]*\} from "\.\/ticket-plan-validator\.mjs";/);
+    expect(src).toContain("context += `feature_branch: ${branchPlan.canonical}\\n`;");
   });
 
-  it("renders the same branch as index.mjs for every persona shape", () => {
-    const slugExpr = slugMatch[1];
-    const tpl = branchMatch[1];
-    // index.mjs's own expressions, executed. `advisory` and `ticket` are the
-    // names they close over there, so the body is copied verbatim.
-    const renderAsIndexDoes = new Function(
-      "agentDef",
-      "ticket",
-      "advisory",
-      `const slug = ${slugExpr}; return \`${tpl}\`;`,
+  it("index.mjs carries no hand-rolled copy of the template", () => {
+    // The two shapes the pre-D3 code used. Either one reappearing means a second
+    // definition is live and free to drift from the four copies.
+    expect(src, "a `feature/<ticketId>-…` template was re-inlined in index.mjs").not.toContain(
+      "feature_branch: feature/${ticket.ticketId}",
     );
-
-    const cases = [
-      ["TEAM-4230", "agentcore_hub_code_sweeper", false],
-      ["TEAM-4231", "agentcore_hub_code_reviewer", false],
-      ["TEAM-4177", "agentcore_hub_backend_dev", false],
-      ["TEAM-4177", "agentcore_hub_backend_dev", true],
-      ["PROJ-1", "agentcore_hub_frontend_designer", false],
-      // No prefix and no underscores — the slug helpers must be no-ops.
-      ["TEAM-1", "sweeper", false],
-    ];
-
-    for (const [ticketId, agentId, advisory] of cases) {
-      const fromIndex = renderAsIndexDoes({ agentId }, { ticketId }, advisory);
-      expect(canonicalBranchFor(ticketId, agentId, { advisory }), `${agentId} advisory=${advisory}`).toBe(
-        fromIndex,
-      );
-    }
+    expect(src, "the persona slug is derived in index.mjs again").not.toMatch(
+      /const slug = agentDef\.agentId/,
+    );
   });
+});
+
+describe("canonicalBranchFor renders the pre-D3 literal", () => {
+  // [ticketId, agentId, advisory, what index.mjs rendered at 40bd1ca]
+  const cases = [
+    ["TEAM-4230", "agentcore_hub_code_sweeper", false, "feature/TEAM-4230-code-sweeper"],
+    ["TEAM-4231", "agentcore_hub_code_reviewer", false, "feature/TEAM-4231-code-reviewer"],
+    ["TEAM-4177", "agentcore_hub_backend_dev", false, "feature/TEAM-4177-backend-dev"],
+    ["TEAM-4177", "agentcore_hub_backend_dev", true, "feature/TEAM-4177-advisory"],
+    ["PROJ-1", "agentcore_hub_frontend_designer", false, "feature/PROJ-1-frontend-designer"],
+    // No prefix and no underscores — both slug replacements must be no-ops.
+    ["TEAM-1", "sweeper", false, "feature/TEAM-1-sweeper"],
+  ];
+
+  for (const [ticketId, agentId, advisory, expected] of cases) {
+    it(`${agentId} advisory=${advisory} → ${expected}`, () => {
+      expect(canonicalBranchFor(ticketId, agentId, { advisory })).toBe(expected);
+    });
+  }
 
   it("agrees on c2uqki's real sweeper branch", () => {
     // The branch the sweeper actually pushed, and the one the other three
@@ -74,6 +73,5 @@ describe("branch-name parity: index.mjs vs canonicalBranchFor", () => {
     expect(canonicalBranchFor("TEAM-4230", "agentcore_hub_code_sweeper")).toBe(
       "feature/TEAM-4230-code-sweeper",
     );
-    expect(src).toContain("feature_branch: feature/${ticket.ticketId}-");
   });
 });

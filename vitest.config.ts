@@ -437,14 +437,23 @@ export default defineConfig({
       // obvious "first unblocked entry is the root" heuristic and it is the whole
       // reason the root is resolved by ROLE here.
       "lambda/orchestrator/ticket-plan-validator.test.mjs",
-      // branch-name-parity (TEAM-4248 D3) — the convention now lives in FIVE places:
-      // the literal index.mjs renders in its ## Branch block, and canonicalBranchFor
-      // in four byte-copied modules. check-fix-kinds-parity.sh keeps the four copies
-      // identical to each other; only this spec keeps them identical to the string an
-      // agent is actually told. It extracts index.mjs's two lines as TEXT and
-      // executes them, so a refactor that moves the literal fails loudly instead of
-      // handing the reviewer a branch the sweeper never pushed.
+      // branch-name-parity (TEAM-4248 D3) — index.mjs's ## Branch block now derives
+      // the name from canonicalBranchFor instead of building it by hand, so this spec
+      // guards the two things check-fix-kinds-parity.sh cannot see: that no FIFTH copy
+      // of the template has been re-inlined into index.mjs, and that
+      // canonicalBranchFor still renders exactly what index.mjs rendered before D3
+      // moved it. Drift here is what handed c2uqki's reviewer a branch the sweeper
+      // never pushed.
       "lambda/orchestrator/branch-name-parity.test.mjs",
+      // branch-context (TEAM-4248 D3) — the ## Branch block through the REAL
+      // buildAgentContext. It used to render for development-phase personas only, so
+      // c2uqki's reviewer, QA and CI were told nothing and each followed the invented
+      // `chore/dead-code-sweep-2026-09-07` into a session that had to reconcile by
+      // hand. The cases pin the whole ladder: off is byte-identical to before (no
+      // block, no board read), shadow tells every persona while leaving the prose
+      // untouched, and enforce is the only mode in which the rewritten description
+      // reaches the model.
+      "lambda/orchestrator/branch-context.test.mjs",
     ],
     // Keep unit tests away from the Playwright specs under tests/.
     exclude: ["tests/**", "node_modules/**", "demo/**"],
