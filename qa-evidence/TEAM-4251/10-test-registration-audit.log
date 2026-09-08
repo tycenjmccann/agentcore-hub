@@ -1,0 +1,140 @@
+=== TEAM-4251 TEST-REGISTRATION AUDIT ===
+HEAD = 5fa37288b94f8887611b2b101f57f263cc96dc98
+baseline = 4633c010bdf895a8bea8ca53344ef5e32f037eff
+
+--- A. new/changed test files in range (37) ---
+$ git diff --name-only 4633c010bdf895a8bea8ca53344ef5e32f037eff..HEAD | grep -E '\.test\.(mjs|ts|tsx)$'
+lambda/agentcore-hub-jira/index.test.mjs
+lambda/agentcore-hub-tickets/index.test.mjs
+lambda/cost-report/index.test.mjs
+lambda/orchestrator/artifact-chain.test.mjs
+lambda/orchestrator/branch-context.test.mjs
+lambda/orchestrator/branch-name-parity.test.mjs
+lambda/orchestrator/cascade.test.mjs
+lambda/orchestrator/completion.test.mjs
+lambda/orchestrator/dead-session-detector.test.mjs
+lambda/orchestrator/decision-ledger.test.mjs
+lambda/orchestrator/evidence-harvest.test.mjs
+lambda/orchestrator/fix-before-verify.test.mjs
+lambda/orchestrator/live-reverify.test.mjs
+lambda/orchestrator/reconcile-sweep.test.mjs
+lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs
+lambda/orchestrator/replay-dowtdh-decision-loss.test.mjs
+lambda/orchestrator/replay-dowtdh-verdict-gate.test.mjs
+lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs
+lambda/orchestrator/replay-iczquj-sweep-full-chain.test.mjs
+lambda/orchestrator/sweep-noop-close.test.mjs
+lambda/orchestrator/ticket-plan-validator.test.mjs
+lambda/orchestrator/unverified-fixes-context.test.mjs
+lambda/orchestrator/verdict-contract.test.mjs
+lambda/orchestrator/verified-head-completion.test.mjs
+lambda/orchestrator/workflow-store.test.mjs
+lambda/routines-runner/index.test.mjs
+lambda/workflow-output/index.test.mjs
+src/app/api/workflow/[id]/cancel/route.test.ts
+src/app/api/workflow/[id]/complete/route.test.ts
+src/app/api/workflow/start/route.cadence.test.ts
+src/lib/routines/routines.test.ts
+src/lib/workflow/analysis-types.test.ts
+src/lib/workflow/performance.test.ts
+src/lib/workflow/run-outcome-display.test.ts
+src/lib/workflow/run-outcome-parity.test.ts
+src/lib/workflow/sweep-cadence.test.ts
+src/lib/workflow/verified-heads-parity.test.ts
+
+The 10 src/**/*.test.ts files are all covered by the "src/**/*.test.ts" glob at
+vitest.config.ts include[0]. No deploy/** test file changed in this range.
+
+--- B. per-file registration check (lambda/** and deploy/**, 27 files) ---
+Method: exact-path grep against vitest.config.ts test.include, then fallback to
+`node --test` steps in .github/workflows/ci.yml (lines 41, 48, 55).
+
+NOT-IN-VITEST  lambda/agentcore-hub-jira/index.test.mjs      -> COVERED by ci.yml:48 `node --test lambda/agentcore-hub-jira`
+IN-VITEST      lambda/agentcore-hub-tickets/index.test.mjs
+NOT-IN-VITEST  lambda/cost-report/index.test.mjs             -> COVERED by ci.yml:41 `node --test lambda/cost-report`
+IN-VITEST      lambda/orchestrator/artifact-chain.test.mjs
+IN-VITEST      lambda/orchestrator/branch-context.test.mjs
+IN-VITEST      lambda/orchestrator/branch-name-parity.test.mjs
+IN-VITEST      lambda/orchestrator/cascade.test.mjs
+IN-VITEST      lambda/orchestrator/completion.test.mjs
+IN-VITEST      lambda/orchestrator/dead-session-detector.test.mjs
+IN-VITEST      lambda/orchestrator/decision-ledger.test.mjs
+IN-VITEST      lambda/orchestrator/evidence-harvest.test.mjs
+IN-VITEST      lambda/orchestrator/fix-before-verify.test.mjs
+IN-VITEST      lambda/orchestrator/live-reverify.test.mjs
+IN-VITEST      lambda/orchestrator/reconcile-sweep.test.mjs
+IN-VITEST      lambda/orchestrator/replay-c2uqki-sweep-noop.test.mjs
+IN-VITEST      lambda/orchestrator/replay-dowtdh-decision-loss.test.mjs
+IN-VITEST      lambda/orchestrator/replay-dowtdh-verdict-gate.test.mjs
+IN-VITEST      lambda/orchestrator/replay-f50ucz-ship-review-regression.test.mjs
+IN-VITEST      lambda/orchestrator/replay-iczquj-sweep-full-chain.test.mjs
+IN-VITEST      lambda/orchestrator/sweep-noop-close.test.mjs
+IN-VITEST      lambda/orchestrator/ticket-plan-validator.test.mjs
+IN-VITEST      lambda/orchestrator/unverified-fixes-context.test.mjs
+IN-VITEST      lambda/orchestrator/verdict-contract.test.mjs
+IN-VITEST      lambda/orchestrator/verified-head-completion.test.mjs
+IN-VITEST      lambda/orchestrator/workflow-store.test.mjs
+NOT-IN-VITEST  lambda/routines-runner/index.test.mjs         -> *** NOT COVERED BY ANYTHING — FINDING F1 ***
+IN-VITEST      lambda/workflow-output/index.test.mjs
+
+--- C. FINDING F1: lambda/routines-runner/index.test.mjs is executed by no runner ---
+Confirmed by exhaustive search — zero references outside the file itself:
+
+$ grep -rn "routines-runner" .github/ package.json vitest.config.ts scripts/ tests/ playwright.config.ts
+(no matches; rc=1)
+
+$ grep -rn "node --test" .github/ package.json scripts/
+.github/workflows/ci.yml:41:        run: node --test lambda/cost-report
+.github/workflows/ci.yml:48:        run: node --test lambda/agentcore-hub-jira
+.github/workflows/ci.yml:55:        run: node --test lambda/anomaly-watcher
+  -> routines-runner is not among the three `node --test` dirs, and its path is
+     absent from vitest.config.ts include. It is also not matched by any glob in
+     that array: the only lambda globs are "lambda/eval-packager/**/*.test.mjs"
+     and per-file entries; every other lambda/**/*.test.mjs is listed explicitly.
+
+Severity is raised by this epic's own change. The file is not merely legacy dead
+weight — TEAM-4247 (commit 723d946, "feat(api): sweep cadence gate on scheduled
+starts") ADDED 17 lines of new assertions to it inside this very range:
+
+$ git diff --stat 4633c01..HEAD -- lambda/routines-runner/index.test.mjs
+ lambda/routines-runner/index.test.mjs | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+The two new tests are:
+  test("stamps trigger scheduled on every payload")
+  test("index.mjs's own buildPayload stamps the trigger")   <- reads index.mjs and
+      asserts /trigger:\s*"scheduled"/, i.e. the drift guard for the load-bearing
+      label that the TEAM-4247 sweep cadence gate keys on ('skips ONLY
+      trigger:"scheduled"' per the test's own comment).
+So the drift guard protecting the epic's cadence gate never runs in CI. If
+index.mjs later drops trigger:"scheduled", CI stays green and the cadence gate
+silently stops matching.
+
+The file itself is healthy — it passes when invoked manually, which is why the gap
+is invisible:
+$ node --test lambda/routines-runner
+# tests 8 / # pass 8 / # fail 0   (exit 0)
+
+Fix is one line — either add "lambda/routines-runner/index.test.mjs" to
+vitest.config.ts include (NOTE: it uses node:test, so it would need converting to
+vitest imports first), or add a `node --test lambda/routines-runner` step to
+ci.yml alongside the existing three. The ci.yml route needs no source change.
+
+--- D. npm run test:unit mapping ---
+$ node -e "console.log('test:unit =>', require('./package.json').scripts['test:unit'])"
+test:unit => vitest run
+  -> CONFIRMED: test:unit is exactly `vitest run`.
+
+--- E. node:test imports among orchestrator tests ---
+$ grep -l "node:test" lambda/orchestrator/*.test.mjs
+(no matches; grep_rc=1)
+  -> CONFIRMED: no orchestrator test uses node:test. Spot-checked framework
+     imports of the new tests:
+       import { describe, it, expect } from "vitest";
+       import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+  -> All vitest-native, so all are genuinely executed by `vitest run`.
+  (For contrast, the orphan lambda/routines-runner/index.test.mjs DOES use
+   `import test from "node:test"` — consistent with F1: it was written for
+   `node --test` and no `node --test` step was ever added for it.)
+
+EXIT=0

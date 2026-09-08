@@ -1,0 +1,32 @@
+=== GATE (a) npm ci — TEAM-4251 @ 5fa37288b94f8887611b2b101f57f263cc96dc98 ===
+
+ENVIRONMENT CONSTRAINT (not a repo defect):
+  RLIMIT_NOFILE soft=1024 hard=1024 (cannot be raised: 'ulimit -n 4096' and
+  'prlimit --nofile=8192' both -> Operation not permitted). npm 9.2.0 / node v20.19.2
+  reify fan-out exceeds 1024 concurrent fds -> EMFILE.
+
+--- attempt 1: npm ci (defaults) ---
+npm ERR! code EMFILE  open .npm/_cacache/index-v5/84/d7/a5acf...  EXIT=232
+--- attempt 2: npm ci --maxsockets 3 --no-audit --no-fund ---
+npm ERR! code EMFILE  open .npm/_cacache/index-v5/32/93/bf4c4...  EXIT=232
+--- attempt 3: npm ci --cache /tmp/npmcache-qa --maxsockets 2 --no-audit --no-fund (fresh cache) ---
+npm ERR! code EMFILE  open /tmp/npmcache-qa/_cacache/index-v5/27/2c/d1d3f...  EXIT=232
+
+--- attempt 4 (RECORDED RESULT): node -r /tmp/fdshim.cjs npm-cli.js ci --no-audit --no-fund --maxsockets 4 ---
+  /tmp/fdshim.cjs = preload that retries EMFILE/ENFILE with backoff (graceful-fs semantics).
+  It changes no repo content and no dependency resolution; package-lock.json is honored by ci.
+
+npm WARN deprecated inflight@1.0.6: This module is not supported, and leaks memory. Do not use it. Check out lru-cache if you want a good and tested way to coalesce async requests by a key value, which is much more comprehensive and powerful.
+npm WARN deprecated @humanwhocodes/config-array@0.13.0: Use @eslint/config-array instead
+npm WARN deprecated rimraf@3.0.2: Rimraf versions prior to v4 are no longer supported
+npm WARN deprecated @humanwhocodes/object-schema@2.0.3: Use @eslint/object-schema instead
+npm WARN deprecated glob@7.2.3: Old versions of glob are not supported, and contain widely publicized security vulnerabilities, which have been fixed in the current version. Please update. Support for old versions may be purchased (at exorbitant rates) by contacting i@izs.me
+npm WARN deprecated glob@10.3.10: Old versions of glob are not supported, and contain widely publicized security vulnerabilities, which have been fixed in the current version. Please update. Support for old versions may be purchased (at exorbitant rates) by contacting i@izs.me
+npm WARN deprecated eslint@8.57.1: This version is no longer supported. Please see https://eslint.org/version-support for other options.
+
+added 792 packages in 4m
+
+installed tree sanity:
+acorn autoprefixer baseline-browser-mapping browserslist cssesc depcheck esbuild eslint esparse esvalidate formatly glob jiti js-yaml jsesc json5 knip knip-bun loose-envify mkdirp nanoid napi-postinstall next node-which parser playwright playwright-core resolve rimraf rollup semver sucrase sucrase-node tailwind tailwindcss ts-prune tsc tsserver update-browserslist-db vite vite-node vitest why-is-node-running yaml 
+package count: 561 top-level entries; .package-lock.json present: yes
+EXIT=0

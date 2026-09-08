@@ -1,0 +1,1070 @@
+=== GATE (e) node --test lambda/cost-report lambda/agentcore-hub-jira lambda/anomaly-watcher ===
+TAP version 13
+# [jira-tools] could not fetch comments for TEAM-2: Jira API 500: boom
+# (node:10080) Warning: NodeVersionSupportWarning: The AWS SDK for JavaScript (v3)
+# versions published after the first week of January 2027
+# will require node >=22. You are running node v20.19.2.
+# To continue receiving updates to AWS services, bug fixes,
+# and security updates please upgrade to node >=22.
+# More information can be found at: https://a.co/c895JFp
+# (Use `node --trace-warnings ...` to show where the warning was created)
+# Subtest: adfToText: hardBreak splits a paragraph so DECISION stays on its own line
+ok 1 - adfToText: hardBreak splits a paragraph so DECISION stays on its own line
+  ---
+  duration_ms: 1.831917
+  ...
+# Subtest: adfToText: bulletList items each land on their own line
+ok 2 - adfToText: bulletList items each land on their own line
+  ---
+  duration_ms: 1.309298
+  ...
+# Subtest: adfToText: orderedList items each land on their own line
+ok 3 - adfToText: orderedList items each land on their own line
+  ---
+  duration_ms: 0.287977
+  ...
+# Subtest: adfToText: blockquote and codeBlock each land on their own line
+ok 4 - adfToText: blockquote and codeBlock each land on their own line
+  ---
+  duration_ms: 0.260699
+  ...
+# Subtest: adfToText: heading and paragraph behavior unchanged
+ok 5 - adfToText: heading and paragraph behavior unchanged
+  ---
+  duration_ms: 0.55443
+  ...
+# Subtest: adfToText: plain strings pass through and unknown nodes flatten their content
+ok 6 - adfToText: plain strings pass through and unknown nodes flatten their content
+  ---
+  duration_ms: 0.254322
+  ...
+# Subtest: getIssue: fetches comments newest-first and returns them chronologically
+ok 7 - getIssue: fetches comments newest-first and returns them chronologically
+  ---
+  duration_ms: 28.26923
+  ...
+# Subtest: getIssue: comment fetch failure returns the mapped issue with comments: []
+ok 8 - getIssue: comment fetch failure returns the mapped issue with comments: []
+  ---
+  duration_ms: 2.225662
+  ...
+# [agentcore-hub-jira] Failed to load roster from S3: User: arn:aws:sts::838829463875:assumed-role/agentcore-hub-coding-runtime-role/BedrockAgentCore-96193f1a-737e-4f77-9c9d-10eb60c51b33 is not authorized to perform: s3:GetObject on resource: "arn:aws:s3:::agentcore-hub-artifacts-838829463875-us-east-1/config/agents.json" because no identity-based policy allows the s3:GetObject action — using fallback
+# [jira-tools] tool=Tickets___create_ticket params={"summary":"Escalation: ship-review not converging (TEAM-1)","workflow_id":"run1"}
+# [jira-tools] Created TEAM-11 in Jira. Status: todo
+# [jira-tools] tool=Tickets___create_ticket result={"ticketId":"TEAM-11","status":"todo","message":"Created TEAM-11: Escalation: ship-review not converging (TEAM-1)"}
+# [jira-tools] tool=Tickets___create_ticket params={"summary":"Escalation: ship-review not converging (TEAM-1)","workflow_id":"run1"}
+# [jira-tools] IDEMPOTENT: "Escalation: ship-review not converging (TEAM-1)" (unassigned) already exists as TEAM-10 in run1 — reconciled blockers/status, returning existing instead of duplicating.
+# [jira-tools] tool=Tickets___create_ticket result={"ticketId":"TEAM-10","title":"Escalation: ship-review not converging (TEAM-1)","status":"todo","assignee":null,"issueType":"Task","parentKey":null,"workflowId":"run1","labels":["wf:run1"],"deduplicated":true}
+# [jira-tools] tool=Tickets___get_issue params={"ticket_id":"TEAM-123"}
+# [jira-tools] tool=Tickets___get_issue result={"ticketId":"TEAM-123","title":"Gateway direct","status":"in_review","assignee":null,"issueType":"Task","parentKey":null,"workflowId":"run9","labels":["wf:run9"],"comments":[]}
+# [jira-tools] tool=Tickets___create_ticket params={"summary":"Fix flaky login test","workflow_id":"run1","assignee":"agentcore_hub_backend_dev","spawned_by":{"kind":"qa_fix"}}
+# [jira-tools] Could not transition TEAM-77 to Ready: Cannot read properties of undefined (reading 'find')
+# [jira-tools] Created TEAM-77 in Jira. Status: todo
+# [jira-tools] tool=Tickets___create_ticket result={"ticketId":"TEAM-77","status":"todo","message":"Created TEAM-77: Fix flaky login test"}
+# [jira-tools] tool=Tickets___create_ticket params={"summary":"Something","workflow_id":"run1","spawned_by":{"kind":"not_a_real_kind"}}
+# [jira-tools] Created TEAM-78 in Jira. Status: todo
+# [jira-tools] tool=Tickets___create_ticket result={"ticketId":"TEAM-78","status":"todo","message":"Created TEAM-78: Something"}
+# [jira-tools] ignoring spawned_by with unknown/invalid kind: {"kind":"not_a_real_kind"} ('spawned_by.kind' must be one of: review_fix, qa_fix, codex_fix, ship_fix, ci_fix, sync_fix)
+# Subtest: createTicket: a Done same-summary ticket is NOT a duplicate — a new ticket is created
+ok 9 - createTicket: a Done same-summary ticket is NOT a duplicate — a new ticket is created
+  ---
+  duration_ms: 162.373364
+  ...
+# Subtest: createTicket: a non-Done same-summary ticket IS still returned as a duplicate
+ok 10 - createTicket: a non-Done same-summary ticket IS still returned as a duplicate
+  ---
+  duration_ms: 1.525464
+  ...
+# Subtest: handler(Tickets___get_issue) accepts ticket_id and hits Jira with the real key
+ok 11 - handler(Tickets___get_issue) accepts ticket_id and hits Jira with the real key
+  ---
+  duration_ms: 2.105793
+  ...
+# Subtest: createTicket: spawned_by {kind:'qa_fix'} adds a fix:qa_fix label to the POST
+ok 12 - createTicket: spawned_by {kind:'qa_fix'} adds a fix:qa_fix label to the POST
+  ---
+  duration_ms: 3.257812
+  ...
+# Subtest: createTicket: spawned_by with an unknown kind is dropped (no fix: label)
+ok 13 - createTicket: spawned_by with an unknown kind is dropped (no fix: label)
+  ---
+  duration_ms: 1.432899
+  ...
+# [agentcore-hub-jira] No ARTIFACT_BUCKET — using fallback roster
+# [jira-tools] tool=Tickets___create_ticket params={"summary":"Fix (ship): auth — expired token 500s","description":"The final diff regresses the expired-token path.","workflow_id":"run1","assignee":"agentcore_hub_backend_dev","phase":"ship","spawned_by":{"kind":"ship_fix","shipTicketId":"TEAM-50"},"fix_contract":{"invariant":"an expired token yields 401, never 500","evidence_source":"live","evidence_repro":"curl -H 'Authorization: Bearer expired' /api/me","cited_location":"src/auth.ts:88, src/auth.ts:120-134","sibling_scope":"do not touch the session store"}}
+# [agentcore-hub-jira] No ARTIFACT_BUCKET — using fallback phase set
+# [jira-tools] Could not transition TEAM-500 to Ready: Cannot read properties of undefined (reading 'find')
+# [jira-tools] Created TEAM-500 in Jira. Status: todo
+# [jira-tools] tool=Tickets___create_ticket result={"ticketId":"TEAM-500","status":"todo","message":"Created TEAM-500: Fix (ship): auth — expired token 500s"}
+# Subtest: FR-8 enforce: a complete contract becomes labels + a yaml codeBlock description
+ok 14 - FR-8 enforce: a complete contract becomes labels + a yaml codeBlock description
+  ---
+  duration_ms: 19.420505
+  ...
+# [agentcore-hub-jira] No ARTIFACT_BUCKET — using fallback roster
+# [jira-tools] tool=Tickets___create_ticket params={"summary":"Fix (ship): auth — expired token 500s","description":"The final diff regresses the expired-token path.","workflow_id":"run1","assignee":"agentcore_hub_backend_dev","phase":"ship","spawned_by":{"kind":"ship_fix","shipTicketId":"TEAM-50"},"fix_contract":{"invariant":"an expired token yields 401, never 500","evidence_source":"live","evidence_repro":"curl -H 'Authorization: Bearer expired' /api/me","cited_location":"src/auth.ts:88, src/auth.ts:120-134","sibling_scope":"do not touch the session store"}}
+# [agentcore-hub-jira] No ARTIFACT_BUCKET — using fallback phase set
+# [jira-tools] Could not transition TEAM-500 to Ready: Cannot read properties of undefined (reading 'find')
+# [jira-tools] Created TEAM-500 in Jira. Status: todo
+# [jira-tools] tool=Tickets___create_ticket result={"ticketId":"TEAM-500","status":"todo","message":"Created TEAM-500: Fix (ship): auth — expired token 500s"}
+# Subtest: FR-8: adfToText(description) → parseFixContractBlock round-trips, rest === the prose
+ok 15 - FR-8: adfToText(description) → parseFixContractBlock round-trips, rest === the prose
+  ---
+  duration_ms: 13.473647
+  ...
+# [agentcore-hub-jira] No ARTIFACT_BUCKET — using fallback roster
+# [jira-tools] tool=Tickets___create_ticket params={"summary":"Fix (ship): auth — expired token 500s","description":"The final diff regresses the expired-token path.","workflow_id":"run1","assignee":"agentcore_hub_backend_dev","phase":"ship","spawned_by":{"kind":"ship_fix","shipTicketId":"TEAM-50"},"fix_contract":{"invariant":"an expired token yields 401, never 500"}}
+# [agentcore-hub-jira] No ARTIFACT_BUCKET — using fallback phase set
+# [jira-tools] fix contract incomplete (shadow, accepting): missing: evidence_source, cited_location
+# [jira-tools] Could not transition TEAM-500 to Ready: Cannot read properties of undefined (reading 'find')
+# [jira-tools] Created TEAM-500 in Jira. Status: todo
+# [jira-tools] tool=Tickets___create_ticket result={"ticketId":"TEAM-500","status":"todo","message":"Created TEAM-500: Fix (ship): auth — expired token 500s"}
+# Subtest: FR-8 shadow: an incomplete contract is accepted and marked contract:incomplete
+ok 16 - FR-8 shadow: an incomplete contract is accepted and marked contract:incomplete
+  ---
+  duration_ms: 10.868163
+  ...
+# [agentcore-hub-jira] No ARTIFACT_BUCKET — using fallback roster
+# [jira-tools] tool=Tickets___create_ticket params={"summary":"Fix (ship): auth — expired token 500s","description":"The final diff regresses the expired-token path.","workflow_id":"run1","assignee":"agentcore_hub_backend_dev","phase":"ship","spawned_by":{"kind":"ship_fix","shipTicketId":"TEAM-50"},"fix_contract":{"evidence_source":"live","evidence_repro":"curl /api/me","cited_location":"src/auth.ts:88"}}
+# [agentcore-hub-jira] No ARTIFACT_BUCKET — using fallback phase set
+# [jira-tools] tool=Tickets___create_ticket ERROR: 'invariant' is required on a fix ticket (missing: invariant)
+# Subtest: FR-8 enforce: an incomplete contract is refused and NOTHING is created in Jira
+ok 17 - FR-8 enforce: an incomplete contract is refused and NOTHING is created in Jira
+  ---
+  duration_ms: 11.064946
+  ...
+# [jira-tools] tool=Tickets___create_ticket params={"summary":"Fix (ship): auth — expired token 500s","description":"The final diff regresses the expired-token path.","workflow_id":"run1","assignee":"agentcore_hub_backend_dev","phase":"ship","spawned_by":{"kind":"ship_fix","shipTicketId":"TEAM-50"},"fix_contract":{"invariant":""}}
+# [jira-tools] Could not transition TEAM-500 to Ready: Cannot read properties of undefined (reading 'find')
+# [jira-tools] Created TEAM-500 in Jira. Status: todo
+# [jira-tools] tool=Tickets___create_ticket result={"ticketId":"TEAM-500","status":"todo","message":"Created TEAM-500: Fix (ship): auth — expired token 500s"}
+# [agentcore-hub-jira] No ARTIFACT_BUCKET — using fallback roster
+# [agentcore-hub-jira] No ARTIFACT_BUCKET — using fallback phase set
+# Subtest: FR-8 off: labels carry fix:/phase: only and the description stays a plain paragraph
+ok 18 - FR-8 off: labels carry fix:/phase: only and the description stays a plain paragraph
+  ---
+  duration_ms: 10.06645
+  ...
+# [agentcore-hub-jira] No ARTIFACT_BUCKET — using fallback roster
+# [jira-tools] tool=Tickets___create_ticket params={"summary":"Fix (ship): auth — expired token 500s","description":"The final diff regresses the expired-token path.","workflow_id":"run1","assignee":"agentcore_hub_backend_dev","phase":"zz_nonexistent","spawned_by":{"kind":"ship_fix","shipTicketId":"TEAM-50"},"fix_contract":{"invariant":"an expired token yields 401, never 500","evidence_source":"live","evidence_repro":"curl -H 'Authorization: Bearer expired' /api/me","cited_location":"src/auth.ts:88, src/auth.ts:120-134","sibling_scope":"do not touch the session store"}}
+# [agentcore-hub-jira] No ARTIFACT_BUCKET — using fallback phase set
+# [jira-tools] tool=Tickets___create_ticket ERROR: 'phase' "zz_nonexistent" is not a known workflow phase — a fix ticket with an unknown phase would be invisible to the completion open-fix gate. Valid phases: design, development, requirements, review, ship, verification
+# Subtest: FR-8 F7: a fix ticket with an unknown phase is refused, with the tickets-Lambda wording
+ok 19 - FR-8 F7: a fix ticket with an unknown phase is refused, with the tickets-Lambda wording
+  ---
+  duration_ms: 10.857212
+  ...
+# [agentcore-hub-jira] No ARTIFACT_BUCKET — using fallback roster
+# [jira-tools] tool=Tickets___create_ticket params={"summary":"Fix (ship): auth — expired token 500s","description":"The final diff regresses the expired-token path.","workflow_id":"run1","assignee":"agentcore_hub_backend_dev","phase":"ship","spawned_by":{"kind":"ship_fix","shipTicketId":"TEAM-50"},"fix_contract":{"invariant":"an expired token yields 401, never 500","evidence_source":"live","evidence_repro":"curl -H 'Authorization: Bearer expired' /api/me","cited_location":"src/auth.ts:88, src/auth.ts:120-134","sibling_scope":"do not touch the session store"},"labels":"advisory, fix:review_fix, WF:other, needs docs"}
+# [agentcore-hub-jira] No ARTIFACT_BUCKET — using fallback phase set
+# [jira-tools] dropped 3 label(s) squatting a system namespace: advisory, fix:review_fix, wf:other
+# [jira-tools] Could not transition TEAM-500 to Ready: Cannot read properties of undefined (reading 'find')
+# [jira-tools] Created TEAM-500 in Jira. Status: todo
+# [jira-tools] tool=Tickets___create_ticket result={"ticketId":"TEAM-500","status":"todo","message":"Created TEAM-500: Fix (ship): auth — expired token 500s"}
+# Subtest: FR-8: caller labels are sanitized — a forged system label never reaches Jira
+ok 20 - FR-8: caller labels are sanitized — a forged system label never reaches Jira
+  ---
+  duration_ms: 11.532095
+  ...
+# [agentcore-hub-jira] No ARTIFACT_BUCKET — using fallback roster
+# [jira-tools] tool=Tickets___create_ticket params={"summary":"Rename the legacy columns","workflow_id":"run1","assignee":"agentcore_hub_backend_dev","phase":"development","labels":"advisory, needs docs"}
+# [jira-tools] Could not transition TEAM-500 to Ready: Cannot read properties of undefined (reading 'find')
+# [jira-tools] Created TEAM-500 in Jira. Status: todo
+# [jira-tools] tool=Tickets___create_ticket result={"ticketId":"TEAM-500","status":"todo","message":"Created TEAM-500: Rename the legacy columns"}
+# Subtest: TEAM-4131 F2: `advisory` survives on a NON-fix ticket — the guard is per ticket shape, not global
+ok 21 - TEAM-4131 F2: `advisory` survives on a NON-fix ticket — the guard is per ticket shape, not global
+  ---
+  duration_ms: 10.171656
+  ...
+# [agentcore-hub-jira] No ARTIFACT_BUCKET — using fallback roster
+# [jira-tools] tool=Tickets___create_ticket params={"summary":"Merge Approval","workflow_id":"run1","assignee":"human:reviewer","phase":"ship","labels":"advisory"}
+# [jira-tools] dropped 1 label(s) squatting a system namespace: advisory
+# [jira-tools] reviewer "reviewer" not assignable in TEAM — label-only
+# [jira-tools] Could not transition TEAM-500 to Ready: Cannot read properties of undefined (reading 'find')
+# [jira-tools] Created TEAM-500 in Jira. Status: todo
+# [jira-tools] tool=Tickets___create_ticket result={"ticketId":"TEAM-500","status":"todo","message":"Created TEAM-500: Merge Approval"}
+# [jira-tools] tool=Tickets___create_ticket params={"summary":"x","workflow_id":"run1\\" OR labels = \\"wf:other"}
+# [jira-tools] tool=Tickets___create_ticket ERROR: Invalid 'workflow_id' "run1\\" OR labels = \\"wf:other" — expected a hub workflow id (letters, digits, _ and - only)
+# [jira-tools] tool=Tickets___create_ticket params={"summary":"He said \\"hi\\" \\\\ bye\\" OR project = OTHER","workflow_id":"run1"}
+# [jira-tools] Created TEAM-500 in Jira. Status: todo
+# [jira-tools] tool=Tickets___create_ticket result={"ticketId":"TEAM-500","status":"todo","message":"Created TEAM-500: He said \\"hi\\" \\\\ bye\\" OR project = OTHER"}
+# [jira-tools] tool=Tickets___list_tickets params={"parent_id":"TEAM-1 OR project = OTHER"}
+# [jira-tools] tool=Tickets___list_tickets ERROR: Invalid 'parent_id' "TEAM-1 OR project = OTHER" — expected an issue key like TEAM-123
+# [jira-tools] tool=Tickets___lookup_user params={"query":"bob\\" OR x"}
+# [jira-tools] tool=Tickets___lookup_user result={"users":[]}
+# [jira-tools] tool=Tickets___labels_add params={"ticket_id":"EPIC-1","issue_key":"EPIC-1","labels":["ci:uncertifiable"]}
+# [jira-tools] tool=Tickets___labels_add result={"ticketId":"EPIC-1","status":"labels_added","added":["ci:uncertifiable"]}
+# [jira-tools] tool=Tickets___labels_add params={"issue_key":"EPIC-9","labels":["ci:uncertifiable"]}
+# [jira-tools] tool=Tickets___labels_add result={"ticketId":"EPIC-9","status":"labels_added","added":["ci:uncertifiable"]}
+# [jira-tools] tool=Tickets___labels_add params={"ticket_id":"EPIC-1","labels":["ci:uncertifiable"]}
+# Subtest: TEAM-4131 F2: a HUMAN GATE ticket cannot be labelled advisory
+ok 22 - TEAM-4131 F2: a HUMAN GATE ticket cannot be labelled advisory
+  ---
+  duration_ms: 9.893535
+  ...
+# Subtest: F6: a workflow_id that is not a hub id is refused before any JQL is built
+ok 23 - F6: a workflow_id that is not a hub id is refused before any JQL is built
+  ---
+  duration_ms: 0.526327
+  ...
+# Subtest: F6: a summary containing a quote and a backslash is escaped inside the JQL literal
+# [jira-tools] tool=Tickets___labels_add ERROR: Jira API 400: label is not valid
+ok 24 - F6: a summary containing a quote and a backslash is escaped inside the JQL literal
+  ---
+  duration_ms: 1.018573
+  ...
+# Subtest: F6: list_tickets refuses a parent_id that is not an issue key (unquoted operand)
+ok 25 - F6: list_tickets refuses a parent_id that is not an issue key (unquoted operand)
+  ---
+  duration_ms: 0.550794
+  ...
+# Subtest: F6: lookup_user escapes the agent query inside its quoted JQL literal
+ok 26 - F6: lookup_user escapes the agent query inside its quoted JQL literal
+  ---
+  duration_ms: 1.345963
+  ...
+# Subtest: labels_add: PUTs the additive update verb for ci:uncertifiable
+ok 27 - labels_add: PUTs the additive update verb for ci:uncertifiable
+  ---
+  duration_ms: 0.932726
+  ...
+# Subtest: labels_add: issue_key alone is accepted (the dynamodb spelling)
+ok 28 - labels_add: issue_key alone is accepted (the dynamodb spelling)
+  ---
+  duration_ms: 0.611075
+  ...
+# Subtest: labels_add: a rejected PUT surfaces as a bare { error }, and nothing is reported added
+ok 29 - labels_add: a rejected PUT surfaces as a bare { error }, and nothing is reported added
+  ---
+  duration_ms: 0.692821
+  ...
+# [agentcore-hub-jira] No ARTIFACT_BUCKET — using fallback roster
+# [jira-tools] tool=Tickets___create_ticket params={"summary":"Sweep tycenjmccann/ember for dead code","workflow_id":"c2uqki","assignee":"agentcore_hub_backend_dev","parent_key":"TEAM-4228"}
+# [jira-tools] Could not transition TEAM-4230 to Ready: Cannot read properties of undefined (reading 'find')
+# [jira-tools] Created TEAM-4230 in Jira. Status: todo
+# [jira-tools] tool=Tickets___create_ticket result={"ticketId":"TEAM-4230","status":"todo","message":"Created TEAM-4230: Sweep tycenjmccann/ember for dead code"}
+# Subtest: D3 off: no root lookup at all, and the result gains no keys
+ok 30 - D3 off: no root lookup at all, and the result gains no keys
+  ---
+  duration_ms: 18.266632
+  ...
+# [agentcore-hub-jira] No ARTIFACT_BUCKET — using fallback roster
+# [jira-tools] tool=Tickets___create_ticket params={"summary":"Sweep tycenjmccann/ember for dead code","workflow_id":"c2uqki","assignee":"agentcore_hub_backend_dev","parent_key":"TEAM-4228"}
+# [jira-tools] Sweep tycenjmccann/ember for dead code has blocked_by=[] but the requirements root TEAM-4229 is not done — a non-root ticket must be blocked_by at least one upstream ticket.
+# [jira-tools] Could not transition TEAM-4230 to Ready: Cannot read properties of undefined (reading 'find')
+# [jira-tools] Created TEAM-4230 in Jira. Status: todo
+# [jira-tools] tool=Tickets___create_ticket result={"ticketId":"TEAM-4230","status":"todo","message":"Created TEAM-4230: Sweep tycenjmccann/ember for dead code","warning":"Sweep tycenjmccann/ember for dead code has blocked_by=[] but the requirements root TEAM-4229 is not done — a non-root ticket must be blocked_by at least one upstream ticket."}
+# Subtest: D3 shadow: the ticket is created and the warning names TEAM-4230 and TEAM-4229
+ok 31 - D3 shadow: the ticket is created and the warning names TEAM-4230 and TEAM-4229
+  ---
+  duration_ms: 11.656468
+  ...
+# [agentcore-hub-jira] No ARTIFACT_BUCKET — using fallback roster
+# [jira-tools] tool=Tickets___create_ticket params={"summary":"Sweep tycenjmccann/ember for dead code","workflow_id":"c2uqki","assignee":"agentcore_hub_backend_dev","parent_key":"TEAM-4228"}
+# [jira-tools] tool=Tickets___create_ticket ERROR: Sweep tycenjmccann/ember for dead code has blocked_by=[] but the requirements root TEAM-4229 is not done — a non-root ticket must be blocked_by at least one upstream ticket.
+# Subtest: D3 enforce: the create is refused and NOTHING is POSTed to Jira
+ok 32 - D3 enforce: the create is refused and NOTHING is POSTed to Jira
+  ---
+  duration_ms: 8.419325
+  ...
+# [agentcore-hub-jira] No ARTIFACT_BUCKET — using fallback roster
+# [jira-tools] tool=Tickets___create_ticket params={"summary":"Sweep tycenjmccann/ember for dead code","workflow_id":"c2uqki","assignee":"agentcore_hub_backend_dev","parent_key":"TEAM-4228"}
+# [jira-tools] tool=Tickets___create_ticket ERROR: Sweep tycenjmccann/ember for dead code has blocked_by=[] but the requirements root TEAM-4229 is not done — a non-root ticket must be blocked_by at least one upstream ticket.
+# Subtest: D3: the root is also found by a phase:requirements label alone
+ok 33 - D3: the root is also found by a phase:requirements label alone
+  ---
+  duration_ms: 8.521035
+  ...
+# [agentcore-hub-jira] No ARTIFACT_BUCKET — using fallback roster
+# [jira-tools] tool=Tickets___create_ticket params={"summary":"Sweep tycenjmccann/ember for dead code","workflow_id":"c2uqki","assignee":"agentcore_hub_backend_dev","parent_key":"TEAM-4228"}
+# [jira-tools] tool=Tickets___create_ticket ERROR: Sweep tycenjmccann/ember for dead code has blocked_by=[] but the requirements root TEAM-4229 is not done — a non-root ticket must be blocked_by at least one upstream ticket.
+# Subtest: D3: an earlier unblocked human gate is NOT mistaken for the root
+ok 34 - D3: an earlier unblocked human gate is NOT mistaken for the root
+  ---
+  duration_ms: 8.319975
+  ...
+# [agentcore-hub-jira] No ARTIFACT_BUCKET — using fallback roster
+# [jira-tools] tool=Tickets___create_ticket params={"summary":"Sweep tycenjmccann/ember for dead code","workflow_id":"c2uqki","assignee":"agentcore_hub_backend_dev","parent_key":"TEAM-4228"}
+# [jira-tools] Could not transition TEAM-4230 to Ready: Cannot read properties of undefined (reading 'find')
+# [jira-tools] Created TEAM-4230 in Jira. Status: todo
+# [jira-tools] tool=Tickets___create_ticket result={"ticketId":"TEAM-4230","status":"todo","message":"Created TEAM-4230: Sweep tycenjmccann/ember for dead code"}
+# Subtest: D3: no requirements root under the epic → fail open, silently
+ok 35 - D3: no requirements root under the epic → fail open, silently
+  ---
+  duration_ms: 9.093421
+  ...
+# [agentcore-hub-jira] No ARTIFACT_BUCKET — using fallback roster
+# [jira-tools] tool=Tickets___create_ticket params={"summary":"Sweep tycenjmccann/ember for dead code","workflow_id":"c2uqki","assignee":"agentcore_hub_backend_dev","parent_key":"TEAM-4228"}
+# [jira-tools] Could not transition TEAM-4230 to Ready: Cannot read properties of undefined (reading 'find')
+# [jira-tools] Created TEAM-4230 in Jira. Status: todo
+# [jira-tools] tool=Tickets___create_ticket result={"ticketId":"TEAM-4230","status":"todo","message":"Created TEAM-4230: Sweep tycenjmccann/ember for dead code"}
+# Subtest: D3: a Done root fails open, so a late sibling is not rejected
+ok 36 - D3: a Done root fails open, so a late sibling is not rejected
+  ---
+  duration_ms: 9.736306
+  ...
+# [agentcore-hub-jira] No ARTIFACT_BUCKET — using fallback roster
+# [jira-tools] tool=Tickets___create_ticket params={"summary":"Sweep tycenjmccann/ember for dead code","workflow_id":"c2uqki","assignee":"agentcore_hub_requirements_analyst","parent_key":"TEAM-4228"}
+# [jira-tools] Could not transition TEAM-4230 to Ready: Cannot read properties of undefined (reading 'find')
+# [jira-tools] Created TEAM-4230 in Jira. Status: todo
+# [jira-tools] tool=Tickets___create_ticket result={"ticketId":"TEAM-4230","status":"todo","message":"Created TEAM-4230: Sweep tycenjmccann/ember for dead code"}
+# [jira-tools] tool=Tickets___create_ticket params={"summary":"Sweep tycenjmccann/ember for dead code","workflow_id":"c2uqki","assignee":"agentcore_hub_backend_dev","parent_key":"TEAM-4228","phase":"requirements"}
+# [jira-tools] Could not transition TEAM-4230 to Ready: Cannot read properties of undefined (reading 'find')
+# [jira-tools] Created TEAM-4230 in Jira. Status: todo
+# [jira-tools] tool=Tickets___create_ticket result={"ticketId":"TEAM-4230","status":"todo","message":"Created TEAM-4230: Sweep tycenjmccann/ember for dead code"}
+# [jira-tools] tool=Tickets___create_ticket params={"summary":"Sweep tycenjmccann/ember for dead code","workflow_id":"c2uqki","assignee":"agentcore_hub_backend_dev","parent_key":"TEAM-4228","labels":["advisory"]}
+# [jira-tools] Could not transition TEAM-4230 to Ready: Cannot read properties of undefined (reading 'find')
+# [jira-tools] Created TEAM-4230 in Jira. Status: todo
+# [jira-tools] tool=Tickets___create_ticket result={"ticketId":"TEAM-4230","status":"todo","message":"Created TEAM-4230: Sweep tycenjmccann/ember for dead code"}
+# [jira-tools] tool=Tickets___create_ticket params={"summary":"Sweep tycenjmccann/ember for dead code","workflow_id":"c2uqki","assignee":"agentcore_hub_backend_dev","parent_key":"TEAM-4228","spawned_by":{"kind":"qa_fix","qaTicketId":"TEAM-4231"},"phase":"development"}
+# [agentcore-hub-jira] No ARTIFACT_BUCKET — using fallback phase set
+# [jira-tools] Could not transition TEAM-4230 to Ready: Cannot read properties of undefined (reading 'find')
+# [jira-tools] Created TEAM-4230 in Jira. Status: todo
+# [jira-tools] tool=Tickets___create_ticket result={"ticketId":"TEAM-4230","status":"todo","message":"Created TEAM-4230: Sweep tycenjmccann/ember for dead code"}
+# [jira-tools] tool=Tickets___create_ticket params={"summary":"Sweep tycenjmccann/ember for dead code","workflow_id":"c2uqki","assignee":"agentcore_hub_backend_dev","parent_key":"TEAM-4228","blocked_by":["TEAM-4229"]}
+# [jira-tools] Could not transition TEAM-4230 to Blocked: Cannot read properties of undefined (reading 'find')
+# [jira-tools] Created TEAM-4230 in Jira. Status: blocked
+# [jira-tools] tool=Tickets___create_ticket result={"ticketId":"TEAM-4230","status":"blocked","message":"Created TEAM-4230: Sweep tycenjmccann/ember for dead code"}
+# [jira-tools] tool=Tickets___create_ticket params={"summary":"Sweep tycenjmccann/ember for dead code","workflow_id":"c2uqki","assignee":"human:product-owner","parent_key":"TEAM-4228"}
+# [jira-tools] reviewer "product-owner" not assignable in TEAM — label-only
+# [jira-tools] Could not transition TEAM-4230 to Ready: Cannot read properties of undefined (reading 'find')
+# [jira-tools] Created TEAM-4230 in Jira. Status: todo
+# [jira-tools] tool=Tickets___create_ticket result={"ticketId":"TEAM-4230","status":"todo","message":"Created TEAM-4230: Sweep tycenjmccann/ember for dead code"}
+# [jira-tools] tool=Tickets___create_ticket params={"summary":"Sweep tycenjmccann/ember for dead code","workflow_id":"c2uqki","assignee":"agentcore_hub_backend_dev"}
+# [jira-tools] Could not transition TEAM-4230 to Ready: Cannot read properties of undefined (reading 'find')
+# [jira-tools] Created TEAM-4230 in Jira. Status: todo
+# [jira-tools] tool=Tickets___create_ticket result={"ticketId":"TEAM-4230","status":"todo","message":"Created TEAM-4230: Sweep tycenjmccann/ember for dead code"}
+# Subtest: D3: the root itself, an advisory, rework, a chained ticket and a human gate are exempt
+ok 37 - D3: the root itself, an advisory, rework, a chained ticket and a human gate are exempt
+  ---
+  duration_ms: 22.264358
+  ...
+# [agentcore-hub-jira] No ARTIFACT_BUCKET — using fallback roster
+# [jira-tools] tool=Tickets___create_ticket params={"summary":"Sweep tycenjmccann/ember for dead code","workflow_id":"c2uqki","assignee":"agentcore_hub_backend_dev","parent_key":"TEAM-4228"}
+# [jira-tools] requirements-root lookup failed for TEAM-4228 (failing open): Jira API 429: throttled
+# [jira-tools] Could not transition TEAM-4230 to Ready: Cannot read properties of undefined (reading 'find')
+# [jira-tools] Created TEAM-4230 in Jira. Status: todo
+# [jira-tools] tool=Tickets___create_ticket result={"ticketId":"TEAM-4230","status":"todo","message":"Created TEAM-4230: Sweep tycenjmccann/ember for dead code"}
+# Subtest: D3: a failed board read fails open rather than blocking the run
+ok 38 - D3: a failed board read fails open rather than blocking the run
+  ---
+  duration_ms: 9.22509
+  ...
+# Subtest: §3.6 case 1: exactly 1.0σ is tier1 (thresholds are INCLUSIVE)
+ok 39 - §3.6 case 1: exactly 1.0σ is tier1 (thresholds are INCLUSIVE)
+  ---
+  duration_ms: 3.624612
+  ...
+# Subtest: §3.6 case 2: exactly 2.0σ is tier2 — full verdict shape (§3.1)
+ok 40 - §3.6 case 2: exactly 2.0σ is tier2 — full verdict shape (§3.1)
+  ---
+  duration_ms: 0.549946
+  ...
+# Subtest: §3.6 case 3: exactly 3.0σ is tier3 via rule 1
+ok 41 - §3.6 case 3: exactly 3.0σ is tier3 via rule 1
+  ---
+  duration_ms: 0.344917
+  ...
+# Subtest: §3.6 case 4: 0.9σ is ok / tier0
+ok 42 - §3.6 case 4: 0.9σ is ok / tier0
+  ---
+  duration_ms: 0.332035
+  ...
+# Subtest: §3.6 case 5: 1.5σ is tier1
+ok 43 - §3.6 case 5: 1.5σ is tier1
+  ---
+  duration_ms: 0.300559
+  ...
+# Subtest: §3.6 case 6: 2.5σ is tier2
+ok 44 - §3.6 case 6: 2.5σ is tier2
+  ---
+  duration_ms: 0.273754
+  ...
+# Subtest: §3.6 case 7: 3.5σ is tier3
+ok 45 - §3.6 case 7: 3.5σ is tier3
+  ---
+  duration_ms: 0.520147
+  ...
+# Subtest: §3.6 case 8: empty baseline is insufficient_sample / below_min_baseline_buckets
+ok 46 - §3.6 case 8: empty baseline is insufficient_sample / below_min_baseline_buckets
+  ---
+  duration_ms: 0.274855
+  ...
+# Subtest: §3.6 case 9: a single baseline bucket stops before the n−1 stddev
+ok 47 - §3.6 case 9: a single baseline bucket stops before the n−1 stddev
+  ---
+  duration_ms: 0.680607
+  ...
+# Subtest: §3.6 case 10: min−1 buckets with a 50σ outlier still refuses to classify
+ok 48 - §3.6 case 10: min−1 buckets with a 50σ outlier still refuses to classify
+  ---
+  duration_ms: 0.602937
+  ...
+# Subtest: §3.6 case 11: a null evalValue is no_source_events_in_window, never a zero anomaly
+ok 49 - §3.6 case 11: a null evalValue is no_source_events_in_window, never a zero anomaly
+  ---
+  duration_ms: 0.373432
+  ...
+# Subtest: §3.6 case 11b: undefined and NaN evalValues take the same guard
+ok 50 - §3.6 case 11b: undefined and NaN evalValues take the same guard
+  ---
+  duration_ms: 0.729144
+  ...
+# Subtest: §3.6 case 12: evalSampleCount one below the minimum is below_min_eval_samples
+ok 51 - §3.6 case 12: evalSampleCount one below the minimum is below_min_eval_samples
+  ---
+  duration_ms: 0.422701
+  ...
+# Subtest: §3.6 case 13: epsilon floor turns a zero-variance baseline into 0.8σ / ok
+ok 52 - §3.6 case 13: epsilon floor turns a zero-variance baseline into 0.8σ / ok
+  ---
+  duration_ms: 0.496161
+  ...
+# Subtest: §3.6 case 13b: the floor suppresses a 15σ artifact from a near-flat baseline
+ok 53 - §3.6 case 13b: the floor suppresses a 15σ artifact from a near-flat baseline
+  ---
+  duration_ms: 0.491372
+  ...
+# Subtest: §3.6 case 13c: relFloor floors relative to |mean| and wins when it is largest
+ok 54 - §3.6 case 13c: relFloor floors relative to |mean| and wins when it is largest
+  ---
+  duration_ms: 0.691347
+  ...
+# Subtest: effectiveStddev 0 (no variance, no floors) reports 0σ rather than ±Infinity
+ok 55 - effectiveStddev 0 (no variance, no floors) reports 0σ rather than ±Infinity
+  ---
+  duration_ms: 2.30499
+  ...
+# Subtest: §3.6 case 14: direction lower ignores an upward spike and fires on a drop
+ok 56 - §3.6 case 14: direction lower ignores an upward spike and fires on a drop
+  ---
+  duration_ms: 0.795585
+  ...
+# Subtest: direction both fires on either side
+ok 57 - direction both fires on either side
+  ---
+  duration_ms: 0.468297
+  ...
+# Subtest: §3.6 case 15: rule 2 — 2 of the last 3 beyond tier2
+ok 58 - §3.6 case 15: rule 2 — 2 of the last 3 beyond tier2
+  ---
+  duration_ms: 1.907741
+  ...
+# Subtest: §3.6 case 15b: rule 2 alone promotes a tier1 reading to tier2
+ok 59 - §3.6 case 15b: rule 2 alone promotes a tier1 reading to tier2
+  ---
+  duration_ms: 0.319779
+  ...
+# Subtest: §3.6 case 15c: rule 2 does NOT trigger on the wrong side (direction upper)
+ok 60 - §3.6 case 15c: rule 2 does NOT trigger on the wrong side (direction upper)
+  ---
+  duration_ms: 0.251599
+  ...
+# Subtest: §3.6 case 15d: direction both requires the run to be on ONE side
+ok 61 - §3.6 case 15d: direction both requires the run to be on ONE side
+  ---
+  duration_ms: 0.571492
+  ...
+# Subtest: §3.6 case 16: rule 3 — 4 of the last 5 beyond tier1
+ok 62 - §3.6 case 16: rule 3 — 4 of the last 5 beyond tier1
+  ---
+  duration_ms: 0.265076
+  ...
+# Subtest: §3.6 case 16b: rule 3 does NOT trigger on the wrong side
+ok 63 - §3.6 case 16b: rule 3 does NOT trigger on the wrong side
+  ---
+  duration_ms: 0.225189
+  ...
+# Subtest: §3.6 case 16c: rule 3 needs 4 hits, not 3
+ok 64 - §3.6 case 16c: rule 3 needs 4 hits, not 3
+  ---
+  duration_ms: 0.21911
+  ...
+# Subtest: §3.6 case 17: rule 1 and rule 2 together — tier3, both listed
+ok 65 - §3.6 case 17: rule 1 and rule 2 together — tier3, both listed
+  ---
+  duration_ms: 0.272567
+  ...
+# Subtest: §3.6 case 17b: all three rules can be listed at once, tier stays 3
+ok 66 - §3.6 case 17b: all three rules can be listed at once, tier stays 3
+  ---
+  duration_ms: 0.289438
+  ...
+# Subtest: §3.6 case 18: too few recentPoints — tier2 via the plain band, no rules
+ok 67 - §3.6 case 18: too few recentPoints — tier2 via the plain band, no rules
+  ---
+  duration_ms: 0.22384
+  ...
+# Subtest: §3.6 case 18b: an empty recentPoints history never blocks rule 1
+ok 68 - §3.6 case 18b: an empty recentPoints history never blocks rule 1
+  ---
+  duration_ms: 0.241818
+  ...
+# Subtest: only the last MAX_RECENT_POINTS prior points are considered
+ok 69 - only the last MAX_RECENT_POINTS prior points are considered
+  ---
+  duration_ms: 0.235327
+  ...
+# Subtest: recentPoints entries without a finite sigma are ignored, not treated as 0
+ok 70 - recentPoints entries without a finite sigma are ignored, not treated as 0
+  ---
+  duration_ms: 0.451304
+  ...
+# Subtest: westernElectric.rules gates each rule independently
+ok 71 - westernElectric.rules gates each rule independently
+  ---
+  duration_ms: 0.592279
+  ...
+# Subtest: §3.6 case 19: same input ⇒ same output, three times, inputs unmutated
+ok 72 - §3.6 case 19: same input ⇒ same output, three times, inputs unmutated
+  ---
+  duration_ms: 1.951309
+  ...
+# Subtest: §3.6 case 20: contributors are ranked desc with their share of the total
+ok 73 - §3.6 case 20: contributors are ranked desc with their share of the total
+  ---
+  duration_ms: 0.307515
+  ...
+# Subtest: §3.6 case 20b: contributors are capped at MAX_CONTRIBUTORS, shares stay over the full total
+ok 74 - §3.6 case 20b: contributors are capped at MAX_CONTRIBUTORS, shares stay over the full total
+  ---
+  duration_ms: 0.433116
+  ...
+# Subtest: contributor ties break by workflowId ascending so diagnosis targets are stable
+ok 75 - contributor ties break by workflowId ascending so diagnosis targets are stable
+  ---
+  duration_ms: 0.27887
+  ...
+# Subtest: non-numeric contributors are dropped and a zero total yields 0 shares
+ok 76 - non-numeric contributors are dropped and a zero total yields 0 shares
+  ---
+  duration_ms: 0.280512
+  ...
+# Subtest: contributors survive the insufficient-sample guards (evidence still names them)
+ok 77 - contributors survive the insufficient-sample guards (evidence still names them)
+  ---
+  duration_ms: 0.237894
+  ...
+# Subtest: a disabled metric is never evaluated
+ok 78 - a disabled metric is never evaluated
+  ---
+  duration_ms: 0.305589
+  ...
+# Subtest: mean and sample stddev match a hand-computed fixture (n−1 denominator)
+ok 79 - mean and sample stddev match a hand-computed fixture (n−1 denominator)
+  ---
+  duration_ms: 0.262476
+  ...
+# Subtest: baseline points with an unusable value are dropped from the statistics
+ok 80 - baseline points with an unusable value are dropped from the statistics
+  ---
+  duration_ms: 0.226336
+  ...
+# Subtest: rate baselines drop buckets below minSamples.bucketDenominator
+ok 81 - rate baselines drop buckets below minSamples.bucketDenominator
+  ---
+  duration_ms: 0.321869
+  ...
+# Subtest: a rate bucket exactly at bucketDenominator qualifies (inclusive)
+ok 82 - a rate bucket exactly at bucketDenominator qualifies (inclusive)
+  ---
+  duration_ms: 0.237049
+  ...
+# Subtest: duration metrics ignore denominators entirely
+ok 83 - duration metrics ignore denominators entirely
+  ---
+  duration_ms: 0.210635
+  ...
+# Subtest: canonicalWindowStart floors to the window, UTC, second precision
+ok 84 - canonicalWindowStart floors to the window, UTC, second precision
+  ---
+  duration_ms: 1.090782
+  ...
+# Subtest: hourBucket keys by the event's own ISO timestamp
+ok 85 - hourBucket keys by the event's own ISO timestamp
+  ---
+  duration_ms: 0.252288
+  ...
+# Subtest: aggregate dedupes a double-written event (same tuple, different eventId)
+ok 86 - aggregate dedupes a double-written event (same tuple, different eventId)
+  ---
+  duration_ms: 0.986814
+  ...
+# Subtest: aggregate keeps events that differ in any tuple field
+ok 87 - aggregate keeps events that differ in any tuple field
+  ---
+  duration_ms: 0.314947
+  ...
+# Subtest: aggregate drops agent.streaming but still advances the cursor past it
+ok 88 - aggregate drops agent.streaming but still advances the cursor past it
+  ---
+  duration_ms: 0.356455
+  ...
+# Subtest: aggregate skips items with no usable timestamp instead of throwing
+ok 89 - aggregate skips items with no usable timestamp instead of throwing
+  ---
+  duration_ms: 0.499272
+  ...
+# Subtest: aggregate buckets by the event timestamp, not the eventId prefix
+ok 90 - aggregate buckets by the event timestamp, not the eventId prefix
+  ---
+  duration_ms: 0.247291
+  ...
+# Subtest: aggregate pairs a duration across two cycles via openPairs
+ok 91 - aggregate pairs a duration across two cycles via openPairs
+  ---
+  duration_ms: 0.457888
+  ...
+# Subtest: aggregate pairs within one batch and accepts workflow.report_completion as terminal
+ok 92 - aggregate pairs within one batch and accepts workflow.report_completion as terminal
+  ---
+  duration_ms: 0.302173
+  ...
+# Subtest: aggregate carries a start whose only terminal event predates it
+ok 93 - aggregate carries a start whose only terminal event predates it
+  ---
+  duration_ms: 0.278014
+  ...
+# Subtest: aggregate ignores carried openPairs with an unparseable timestamp
+ok 94 - aggregate ignores carried openPairs with an unparseable timestamp
+  ---
+  duration_ms: 0.239182
+  ...
+# Subtest: aggregate groups by a detail path and skips unattributable events
+ok 95 - aggregate groups by a detail path and skips unattributable events
+  ---
+  duration_ms: 1.179801
+  ...
+# Subtest: aggregate applies a flat where matcher with equals
+ok 96 - aggregate applies a flat where matcher with equals
+  ---
+  duration_ms: 0.530003
+  ...
+# Subtest: aggregate applies where matchers with in and startsWith
+ok 97 - aggregate applies where matchers with in and startsWith
+  ---
+  duration_ms: 1.321886
+  ...
+# Subtest: aggregate applies a roled where to the numerator only
+ok 98 - aggregate applies a roled where to the numerator only
+  ---
+  duration_ms: 0.366144
+  ...
+# Subtest: aggregate ignores snapshot metrics and unknown aggregations
+ok 99 - aggregate ignores snapshot metrics and unknown aggregations
+  ---
+  duration_ms: 0.227231
+  ...
+# Subtest: aggregate output ordering is deterministic and independent of read order
+ok 100 - aggregate output ordering is deterministic and independent of read order
+  ---
+  duration_ms: 0.35792
+  ...
+# Subtest: aggregate tolerates junk input without throwing
+ok 101 - aggregate tolerates junk input without throwing
+  ---
+  duration_ms: 0.250414
+  ...
+# Subtest: aggregate does not mutate its inputs
+ok 102 - aggregate does not mutate its inputs
+  ---
+  duration_ms: 0.575633
+  ...
+# Subtest: the pure modules contain no I/O, clock, randomness, or model-client tokens
+ok 103 - the pure modules contain no I/O, clock, randomness, or model-client tokens
+  ---
+  duration_ms: 5.700941
+  ...
+# Subtest: detect.mjs imports only ./bands-schema.mjs, which imports nothing
+ok 104 - detect.mjs imports only ./bands-schema.mjs, which imports nothing
+  ---
+  duration_ms: 4.256039
+  ...
+# Subtest: the shipped bands.yaml loads, validates, and hashes
+ok 105 - the shipped bands.yaml loads, validates, and hashes
+  ---
+  duration_ms: 19.18281
+  ...
+# Subtest: the §2.4 invalid fixture produces every annotated error, each distinct
+ok 106 - the §2.4 invalid fixture produces every annotated error, each distinct
+  ---
+  duration_ms: 1.105449
+  ...
+# Subtest: sub-hour and non-multiple evaluation windows are both rejected
+ok 107 - sub-hour and non-multiple evaluation windows are both rejected
+  ---
+  duration_ms: 5.126693
+  ...
+# Subtest: an invalid config takes NO tiered action for the whole cycle
+ok 108 - an invalid config takes NO tiered action for the whole cycle
+  ---
+  duration_ms: 3.40995
+  ...
+# Subtest: renderEvidence carries every §8.2 field an operator needs
+ok 109 - renderEvidence carries every §8.2 field an operator needs
+  ---
+  duration_ms: 1.323417
+  ...
+# Subtest: renderEvidence prepends the RATE-LIMITED banner when rateLimited
+ok 110 - renderEvidence prepends the RATE-LIMITED banner when rateLimited
+  ---
+  duration_ms: 5.448722
+  ...
+# Subtest: renderEvidence says so when nothing is attributable
+ok 111 - renderEvidence says so when nothing is attributable
+  ---
+  duration_ms: 0.405413
+  ...
+# Subtest: buildStartPayload is a bug-fix filing on the anomaly-detector channel
+ok 112 - buildStartPayload is a bug-fix filing on the anomaly-detector channel
+  ---
+  duration_ms: 1.037941
+  ...
+# Subtest: buildStartPayload omits repos when no repo is configured
+ok 113 - buildStartPayload omits repos when no repo is configured
+  ---
+  duration_ms: 0.795137
+  ...
+# Subtest: openCountFrom counts only non-terminal, non-archived workflows
+ok 114 - openCountFrom counts only non-terminal, non-archived workflows
+  ---
+  duration_ms: 0.548188
+  ...
+# Subtest: allowedFilings is inclusive-capped: 3 open blocks, 2 open allows exactly one
+ok 115 - allowedFilings is inclusive-capped: 3 open blocks, 2 open allows exactly one
+  ---
+  duration_ms: 0.259443
+  ...
+# Subtest: the cap counts open workflows, not rows on the index
+ok 116 - the cap counts open workflows, not rows on the index
+  ---
+  duration_ms: 7.443867
+  ...
+# Subtest: exactly three open workflows block the filing
+ok 117 - exactly three open workflows block the filing
+  ---
+  duration_ms: 2.604364
+  ...
+# Subtest: a second sequential cycle for the same window files nothing
+ok 118 - a second sequential cycle for the same window files nothing
+  ---
+  duration_ms: 3.907396
+  ...
+# Subtest: a later cycle in the same suppression window is stopped by the metric claim
+ok 119 - a later cycle in the same suppression window is stopped by the metric claim
+  ---
+  duration_ms: 3.520747
+  ...
+# Subtest: two CONCURRENT invocations of the same cycle produce exactly one filing
+ok 120 - two CONCURRENT invocations of the same cycle produce exactly one filing
+  ---
+  duration_ms: 5.222295
+  ...
+# Subtest: Tier 2 diagnoses and notifies and NEVER posts to /api/workflow/start
+ok 121 - Tier 2 diagnoses and notifies and NEVER posts to /api/workflow/start
+  ---
+  duration_ms: 4.255757
+  ...
+# Subtest: Tier 3 posts exactly one filing with the evidence and the intake channel
+ok 122 - Tier 3 posts exactly one filing with the evidence and the intake channel
+  ---
+  duration_ms: 4.850677
+  ...
+# Subtest: Tier 3 at the cap files nothing and pages an operator instead
+ok 123 - Tier 3 at the cap files nothing and pages an operator instead
+  ---
+  duration_ms: 2.214785
+  ...
+# Subtest: an unverifiable open count fails CLOSED
+ok 124 - an unverifiable open count fails CLOSED
+  ---
+  duration_ms: 3.11514
+  ...
+# Subtest: a 5xx from intake KEEPS the claim marked unverified and does not throw
+ok 125 - a 5xx from intake KEEPS the claim marked unverified and does not throw
+  ---
+  duration_ms: 3.281295
+  ...
+# Subtest: a 4xx from intake KEEPS the claim and degrades to a marked notification
+ok 126 - a 4xx from intake KEEPS the claim and degrades to a marked notification
+  ---
+  duration_ms: 3.656292
+  ...
+# Subtest: a generic state-table claim error skips the action with no side effect
+ok 127 - a generic state-table claim error skips the action with no side effect
+  ---
+  duration_ms: 1.745741
+  ...
+# Subtest: one failing metric does not stop the next metric's evaluation
+ok 128 - one failing metric does not stop the next metric's evaluation
+  ---
+  duration_ms: 4.226048
+  ...
+# Subtest: a disabled metric is counted and never evaluated
+ok 129 - a disabled metric is counted and never evaluated
+  ---
+  duration_ms: 1.041175
+  ...
+# Subtest: canonicalWindowStart floors to the cycle, never rounds
+ok 130 - canonicalWindowStart floors to the cycle, never rounds
+  ---
+  duration_ms: 0.324717
+  ...
+# Subtest: metricWindows snaps the evaluation window down to the hourly bucket
+ok 131 - metricWindows snaps the evaluation window down to the hourly bucket
+  ---
+  duration_ms: 0.600339
+  ...
+# Subtest: resolveScheduledTime prefers the scheduled instant over the clock
+ok 132 - resolveScheduledTime prefers the scheduled instant over the clock
+  ---
+  duration_ms: 0.248913
+  ...
+# Subtest: two invocations of the same scheduled cycle agree on label and windows
+ok 133 - two invocations of the same scheduled cycle agree on label and windows
+  ---
+  duration_ms: 6.63449
+  ...
+# Subtest: a lost response to a processed POST never double-files (F1)
+ok 134 - a lost response to a processed POST never double-files (F1)
+  ---
+  duration_ms: 4.940429
+  ...
+# Subtest: an unverified claim whose filing is verifiably absent is released and retried (F1)
+ok 135 - an unverified claim whose filing is verifiably absent is released and retried (F1)
+  ---
+  duration_ms: 7.623195
+  ...
+# Subtest: an unverified claim stays put when verification itself fails (F1 fail-closed)
+ok 136 - an unverified claim stays put when verification itself fails (F1 fail-closed)
+  ---
+  duration_ms: 2.881568
+  ...
+# Subtest: a pre-connection failure (ECONNREFUSED) still releases the claim for retry (F1)
+ok 137 - a pre-connection failure (ECONNREFUSED) still releases the claim for retry (F1)
+  ---
+  duration_ms: 5.541893
+  ...
+# Subtest: a truncated open-count query fails CLOSED and blocks the filing (F2)
+ok 138 - a truncated open-count query fails CLOSED and blocks the filing (F2)
+  ---
+  duration_ms: 2.074584
+  ...
+# Subtest: a workflow filed last cycle but missing from the GSI still counts toward the cap (F3)
+ok 139 - a workflow filed last cycle but missing from the GSI still counts toward the cap (F3)
+  ---
+  duration_ms: 1.315001
+  ...
+# Subtest: a filed id already visible in the GSI is not double-counted (F3)
+ok 140 - a filed id already visible in the GSI is not double-counted (F3)
+  ---
+  duration_ms: 1.316642
+  ...
+# Subtest: readEnv picks up ANOMALY_INTAKE_SECRET, empty when unset (TEAM-3335 F2)
+ok 141 - readEnv picks up ANOMALY_INTAKE_SECRET, empty when unset (TEAM-3335 F2)
+  ---
+  duration_ms: 0.284886
+  ...
+# Subtest: postStart sends x-intake-internal-secret when the secret is set (TEAM-3335 F2)
+ok 142 - postStart sends x-intake-internal-secret when the secret is set (TEAM-3335 F2)
+  ---
+  duration_ms: 1.790162
+  ...
+# Subtest: postStart OMITS the x-intake-internal-secret header entirely when the secret is empty (TEAM-3335 F2)
+ok 143 - postStart OMITS the x-intake-internal-secret header entirely when the secret is empty (TEAM-3335 F2)
+  ---
+  duration_ms: 1.256308
+  ...
+# Subtest: TEAM-3966 F6: review.parked_advisory is a verified event type and validates as a numerator
+ok 144 - TEAM-3966 F6: review.parked_advisory is a verified event type and validates as a numerator
+  ---
+  duration_ms: 0.47273
+  ...
+# Subtest: TEAM-4120: a deterministic eventId sorts AFTER a legacy decimal cursor (same 13-digit prefix class)
+ok 145 - TEAM-4120: a deterministic eventId sorts AFTER a legacy decimal cursor (same 13-digit prefix class)
+  ---
+  duration_ms: 0.182126
+  ...
+# Subtest: TEAM-4120: dropStaleItems KEEPS a deterministic-id item whose timestamp is inside the tolerance
+ok 146 - TEAM-4120: dropStaleItems KEEPS a deterministic-id item whose timestamp is inside the tolerance
+  ---
+  duration_ms: 0.323217
+  ...
+# Subtest: TEAM-4120: a base36 events-writer id sorts BEFORE any decimal cursor — the pre-existing blind spot
+ok 147 - TEAM-4120: a base36 events-writer id sorts BEFORE any decimal cursor — the pre-existing blind spot
+  ---
+  duration_ms: 0.177793
+  ...
+# (node:10113) Warning: NodeVersionSupportWarning: The AWS SDK for JavaScript (v3)
+# versions published after the first week of January 2027
+# will require node >=22. You are running node v20.19.2.
+# To continue receiving updates to AWS services, bug fixes,
+# and security updates please upgrade to node >=22.
+# More information can be found at: https://a.co/c895JFp
+# (Use `node --trace-warnings ...` to show where the warning was created)
+# Subtest: the shared fixture yields the same fix tickets as the Python toolkit
+ok 148 - the shared fixture yields the same fix tickets as the Python toolkit
+  ---
+  duration_ms: 4.302468
+  ...
+# Subtest: the intake-planned 'Fix:' ticket is excluded, the later one is not
+ok 149 - the intake-planned 'Fix:' ticket is excluded, the later one is not
+  ---
+  duration_ms: 1.036831
+  ...
+# Subtest: no intake signal at all → nothing is excluded (overcount by one beats dropping a fix)
+ok 150 - no intake signal at all → nothing is excluded (overcount by one beats dropping a fix)
+  ---
+  duration_ms: 0.841829
+  ...
+# Subtest: intake completion falls back to the first task completing when agentId is gone
+ok 151 - intake completion falls back to the first task completing when agentId is gone
+  ---
+  duration_ms: 0.529878
+  ...
+# Subtest: ticket.created events alone are enough (a run whose workflow row was trimmed)
+ok 152 - ticket.created events alone are enough (a run whose workflow row was trimmed)
+  ---
+  duration_ms: 0.500573
+  ...
+# Subtest: computed task rows are a title source too
+ok 153 - computed task rows are a title source too
+  ---
+  duration_ms: 0.25845
+  ...
+# Subtest: spawnedBy.kind outranks the title — provenance beats prose
+ok 154 - spawnedBy.kind outranks the title — provenance beats prose
+  ---
+  duration_ms: 0.215038
+  ...
+# Subtest: every title shape the fleet actually mints is recognized
+ok 155 - every title shape the fleet actually mints is recognized
+  ---
+  duration_ms: 0.453769
+  ...
+# Subtest: the regression this replaced: the real titles never started with 'Fix:'
+ok 156 - the regression this replaced: the real titles never started with 'Fix:'
+  ---
+  duration_ms: 0.613435
+  ...
+# Subtest: ids are deduped across the three sources and ordered by creation
+ok 157 - ids are deduped across the three sources and ordered by creation
+  ---
+  duration_ms: 0.706455
+  ...
+# Subtest: enriched events: dowtdh's three gate verdicts → 2 reworks, 3 rounds, no first-pass yield
+ok 158 - enriched events: dowtdh's three gate verdicts → 2 reworks, 3 rounds, no first-pass yield
+  ---
+  duration_ms: 0.685861
+  ...
+# Subtest: enriched events: every gate PASSing first look yields 1
+ok 159 - enriched events: every gate PASSing first look yields 1
+  ---
+  duration_ms: 0.310058
+  ...
+# Subtest: the FIRST verdict decides the yield — a re-verify PASS does not retroactively earn it
+ok 160 - the FIRST verdict decides the yield — a re-verify PASS does not retroactively earn it
+  ---
+  duration_ms: 0.284361
+  ...
+# Subtest: only gate personas and only recognized verdicts count
+ok 161 - only gate personas and only recognized verdicts count
+  ---
+  duration_ms: 0.456891
+  ...
+# Subtest: legacy events without a verdict: the reviewGateHistory numbers, unchanged
+ok 162 - legacy events without a verdict: the reviewGateHistory numbers, unchanged
+  ---
+  duration_ms: 0.356178
+  ...
+# Subtest: gateReworks stays review-request-derived even when verdicts are present
+ok 163 - gateReworks stays review-request-derived even when verdicts are present
+  ---
+  duration_ms: 0.668258
+  ...
+# Subtest: a nothing-to-remove summary is not baseline-eligible; a complete one is
+ok 164 - a nothing-to-remove summary is not baseline-eligible; a complete one is
+  ---
+  duration_ms: 0.354804
+  ...
+# Subtest: a $5 no-op sweep in the index does not move the next real sweep's medians
+ok 165 - a $5 no-op sweep in the index does not move the next real sweep's medians
+  ---
+  duration_ms: 2.514875
+  ...
+# Subtest: without the exclusion the same no-op WOULD have moved the median (the test is not vacuous)
+ok 166 - without the exclusion the same no-op WOULD have moved the median (the test is not vacuous)
+  ---
+  duration_ms: 0.758391
+  ...
+# Subtest: the no-op run's OWN card raises nothing: status ok, noOp flagged, no anomalies, no alert
+ok 167 - the no-op run's OWN card raises nothing: status ok, noOp flagged, no anomalies, no alert
+  ---
+  duration_ms: 0.707465
+  ...
+# Subtest: the SAME numbers under a complete outcome DO alert (the gate is the outcome, not the size)
+ok 168 - the SAME numbers under a complete outcome DO alert (the gate is the outcome, not the size)
+  ---
+  duration_ms: 0.492964
+  ...
+# (node:10124) Warning: NodeVersionSupportWarning: The AWS SDK for JavaScript (v3)
+# versions published after the first week of January 2027
+# will require node >=22. You are running node v20.19.2.
+# To continue receiving updates to AWS services, bug fixes,
+# and security updates please upgrade to node >=22.
+# More information can be found at: https://a.co/c895JFp
+# (Use `node --trace-warnings ...` to show where the warning was created)
+# Subtest: cache-read tokens are billed at the discounted input rate
+ok 169 - cache-read tokens are billed at the discounted input rate
+  ---
+  duration_ms: 1.779291
+  ...
+# Subtest: cache-write is billed at the per-TTL surcharge multiple of the input rate
+ok 170 - cache-write is billed at the per-TTL surcharge multiple of the input rate
+  ---
+  duration_ms: 0.259196
+  ...
+# Subtest: missing or unknown ttl falls back to the default write multiplier
+ok 171 - missing or unknown ttl falls back to the default write multiplier
+  ---
+  duration_ms: 0.252054
+  ...
+# Subtest: tokens accumulate across rows and byModel tracks read/write
+ok 172 - tokens accumulate across rows and byModel tracks read/write
+  ---
+  duration_ms: 0.247068
+  ...
+# Subtest: back-compat: cachedInputTokens mirrors cacheReadInputTokens
+ok 173 - back-compat: cachedInputTokens mirrors cacheReadInputTokens
+  ---
+  duration_ms: 0.507933
+  ...
+# Subtest: plain rows (no cache fields) are unchanged by cache logic
+ok 174 - plain rows (no cache fields) are unchanged by cache logic
+  ---
+  duration_ms: 0.26687
+  ...
+# Subtest: persona chat-span filter matches the exact strands >=1.53 span name
+ok 175 - persona chat-span filter matches the exact strands >=1.53 span name
+  ---
+  duration_ms: 0.356349
+  ...
+# Subtest: persona chat-span filter still matches the legacy 'chat <model>' shape
+ok 176 - persona chat-span filter still matches the legacy 'chat <model>' shape
+  ---
+  duration_ms: 0.190067
+  ...
+# Subtest: persona chat-span filter still ORs in the api_request event-name branch
+ok 177 - persona chat-span filter still ORs in the api_request event-name branch
+  ---
+  duration_ms: 0.44845
+  ...
+1..177
+# tests 177
+# suites 0
+# pass 177
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 3523.250591
+EXIT=0

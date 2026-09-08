@@ -1,0 +1,13 @@
+=== GATE (g) workflow-writes / deploy-surfaces / lambda-zip-manifest guards ===
+
+--- bash scripts/check-workflow-writes.sh ---
+workflow-write guard: OK
+EXIT=0
+
+--- bash scripts/check-deploy-surfaces.sh ---
+deploy-surface manifest covers lambda/ and deploy/ (13 lambdas, 3 harnesses, 4 s3 surfaces)
+EXIT=0
+
+--- bash scripts/check-lambda-zip-manifest.sh (exists) ---
+lambda zip manifest guard: OK (31 modules in closure, all present in zip manifest line in lambda/orchestrator/deploy.sh)
+EXIT=0
