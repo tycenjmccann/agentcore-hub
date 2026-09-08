@@ -159,3 +159,60 @@ def test_every_lambda_dir_is_a_surface_or_excluded():
     for d in sorted(p for p in (root / "lambda").iterdir() if p.is_dir()):
         rel = f"lambda/{d.name}"
         assert rel in listed, f"{rel} is neither a lambda surface nor excluded"
+
+
+def test_lambda_files_pack_the_whole_import_closure():
+    root = HERE.parent.parent
+    assert ps.check_lambda_files(root, MANIFEST) == []
+
+
+def test_ticket_plan_validator_ships_with_all_three_lambdas():
+    # TEAM-4278: index.mjs statically imports it in all three; Target 1b zips
+    # exactly the files column, so an omission = ERR_MODULE_NOT_FOUND at cold start.
+    for changed, fn in [
+        ("lambda/agentcore-hub-jira/index.mjs", "agentcore-hub-jira"),
+        ("lambda/agentcore-hub-tickets/index.mjs", "agentcore-hub-tickets"),
+        ("lambda/workflow-output/index.mjs", "agentcore-hub-workflow-output"),
+    ]:
+        lam = kinds(ps.plan([changed], MANIFEST), "LAMBDA")[0]
+        assert lam[1] == fn, changed
+        assert "ticket-plan-validator.mjs" in lam[5].split(), fn
+
+
+def _fake_lambda(tmp_path, sources: dict) -> Path:
+    """Write a synthetic lambda/fake/ tree; returns the repo root to pass in."""
+    for rel, src in sources.items():
+        p = tmp_path / "lambda" / "fake" / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(src, encoding="utf-8")
+    return tmp_path
+
+
+def test_unlisted_local_import_is_reported(tmp_path):
+    root = _fake_lambda(tmp_path, {
+        "index.mjs": 'import { a } from "./missing.mjs";\nexport const handler = () => a;\n',
+        "missing.mjs": "export const a = 1;\n",
+    })
+    manifest = {"lambdas": [{"function": "fake", "dir": "lambda/fake", "files": ["index.mjs"]}]}
+    out = ps.check_lambda_files(root, manifest)
+    assert len(out) == 1, out
+    assert "fake" in out[0] and "missing.mjs" in out[0] and "index.mjs" in out[0]
+    manifest["lambdas"][0]["files"].append("missing.mjs")
+    assert ps.check_lambda_files(root, manifest) == []
+
+
+def test_dir_entry_covers_nested_modules(tmp_path):
+    # A "lib/" files entry packs the whole subtree (eval-packager's real shape),
+    # and specifiers resolve relative to the importing module.
+    root = _fake_lambda(tmp_path, {
+        "index.mjs": 'import "./lib/x.mjs";\n',
+        "lib/x.mjs": 'import { y } from "./deep/y.mjs";\nexport const x = y;\n',
+        "lib/deep/y.mjs": "export const y = 1;\n",
+    })
+    files = ["index.mjs", "lib/", "node_modules/"]
+    assert ps.check_lambda_files(root, {"lambdas": [
+        {"function": "fake", "dir": "lambda/fake", "files": files}]}) == []
+    # …and dropping lib/ surfaces both nested modules.
+    out = ps.check_lambda_files(root, {"lambdas": [
+        {"function": "fake", "dir": "lambda/fake", "files": ["index.mjs"]}]})
+    assert len(out) == 2 and any("lib/deep/y.mjs" in l for l in out)

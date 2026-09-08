@@ -29,12 +29,18 @@ Rules:
 
 `--check` mode (scripts/check-deploy-surfaces.sh) verifies the manifest covers
 every tracked file under lambda/ and deploy/ — a new Lambda or deploy script
-that nobody added to surfaces.json fails CI instead of silently drifting.
+that nobody added to surfaces.json fails CI instead of silently drifting. It
+also (TEAM-4278) walks every Lambda entry's transitive local-import closure
+(`./x.mjs`, followed recursively) starting from its `files[]` entrypoints and
+fails when a module in that closure is not packed by `files[]` — Target 1b of
+buildspec-deploy.yml zips exactly that column, so an unlisted local import
+ships a Lambda that dies at cold start with ERR_MODULE_NOT_FOUND.
 """
 from __future__ import annotations
 
 import json
 import os
+import posixpath
 import re
 import subprocess
 import sys
@@ -176,21 +182,91 @@ def check(root: Path, manifest: dict) -> list[str]:
     return uncovered
 
 
+# ─── --check: Lambda zip import-closure coverage (TEAM-4278) ─────────────────
+#
+# TEAM-4248 D3 added ticket-plan-validator.mjs as a local import of index.mjs in
+# three pipeline-deployed Lambdas, but nobody added it to their surfaces.json
+# files[] — Target 1b of buildspec-deploy.yml zips exactly that column, so the
+# next deploy would have shipped a Lambda that dies at cold start with
+# ERR_MODULE_NOT_FOUND (the same failure mode scripts/check-lambda-zip-manifest.sh
+# guards against for lambda/orchestrator alone). This walks the same kind of
+# transitive closure for every Lambda entry in the manifest.
+
+LOCAL_IMPORT_RE = re.compile(r"""(?:from|import)\s+["']\./([\w./-]+\.mjs)["']""")
+
+
+def _local_imports(text: str) -> list[str]:
+    return LOCAL_IMPORT_RE.findall(text)
+
+
+def _covered_by_files(module: str, files: list[str]) -> bool:
+    """True when files[] packs `module`: exact filename, or under a "dir/" entry."""
+    if module in files:
+        return True
+    return any(f.endswith("/") and module.startswith(f) for f in files)
+
+
+def check_lambda_files(root: Path, manifest: dict) -> list[str]:
+    """FAIL lines for modules a Lambda imports but its surfaces.json files[] omits."""
+    failures: list[str] = []
+    for lam in manifest.get("lambdas", []):
+        files = list(lam.get("files", []))
+        seeds = [f for f in files if f.endswith(".mjs")]
+        if not seeds:
+            continue  # .py handler (session-reaper) — nothing to walk
+        lam_dir = root / lam["dir"].rstrip("/")
+        importer: dict[str, str] = {}
+        seen: set[str] = set()
+        queue = list(seeds)
+        while queue:
+            mod = queue.pop(0)
+            if mod in seen:
+                continue
+            seen.add(mod)
+            src = lam_dir / mod
+            if not src.is_file():
+                failures.append(
+                    f"FAIL: {lam['function']}: {mod} is imported by "
+                    f"{importer.get(mod, 'surfaces.json files[]')} but does not exist in {lam['dir']}"
+                )
+                continue
+            for spec in _local_imports(src.read_text(encoding="utf-8")):
+                dep = posixpath.normpath(posixpath.join(posixpath.dirname(mod), spec))
+                importer.setdefault(dep, mod)
+                queue.append(dep)
+        for mod in sorted(seen.difference(seeds)):
+            if not _covered_by_files(mod, files):
+                failures.append(
+                    f"FAIL: {lam['function']}: {mod} is imported by "
+                    f"{importer[mod]} but missing from surfaces.json files[]"
+                )
+    return failures
+
+
 def main(argv: list[str]) -> int:
     if "--check" in argv:
         root = HERE.parent.parent
         manifest = load_manifest()
         missing = check(root, manifest)
+        unpacked = check_lambda_files(root, manifest)
         if missing:
             print("FAIL: files under lambda/ or deploy/ not covered by deploy/pipeline/surfaces.json:", file=sys.stderr)
             for f in missing:
                 print(f"  - {f}", file=sys.stderr)
             print("Add the surface (lambdas / s3 / harnesses), list it under handoff (infra script), "
                   "or add it to excluded with a reason.", file=sys.stderr)
+        if unpacked:
+            for line in unpacked:
+                print(line, file=sys.stderr)
+            print("A module a Lambda entrypoint imports but files[] omits is NOT packed by "
+                  "buildspec-deploy.yml Target 1b - the deployed function dies at cold start with "
+                  "ERR_MODULE_NOT_FOUND (TEAM-4278). Add it to that surface's files[].", file=sys.stderr)
+        if missing or unpacked:
             return 1
         print(f"deploy-surface manifest covers lambda/ and deploy/ "
               f"({len(manifest.get('lambdas', []))} lambdas, {len(manifest.get('harnesses', []))} harnesses, "
-              f"{len(manifest.get('s3', []))} s3 surfaces)")
+              f"{len(manifest.get('s3', []))} s3 surfaces); every Lambda's local-import closure is packed "
+              f"by its files[]")
         return 0
 
     args = [a for a in argv if not a.startswith("--")]

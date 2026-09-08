@@ -56,17 +56,19 @@
       "dir": "lambda/agentcore-hub-jira",
       "files": [
         "index.mjs",
-        "fix-contract.mjs"
+        "fix-contract.mjs",
+        "ticket-plan-validator.mjs"
       ],
       "npm": false,
-      "note": "Only @aws-sdk/client-s3 is declared, which the nodejs20.x runtime provides \u2014 deploy/setup-tickets-lambda.mjs ships index.mjs alone too."
+      "note": "Only @aws-sdk/client-s3 is declared, which the nodejs20.x runtime provides - deploy/setup-tickets-lambda.mjs zips the same three files (index.mjs fix-contract.mjs ticket-plan-validator.mjs), no node_modules."
     },
     {
       "function": "agentcore-hub-tickets",
       "dir": "lambda/agentcore-hub-tickets",
       "files": [
         "index.mjs",
-        "fix-contract.mjs"
+        "fix-contract.mjs",
+        "ticket-plan-validator.mjs"
       ],
       "npm": false,
       "optional": true,
@@ -104,6 +106,7 @@
       "dir": "lambda/workflow-output",
       "files": [
         "index.mjs",
+        "ticket-plan-validator.mjs",
         "node_modules/"
       ],
       "npm": true
