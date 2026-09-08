@@ -40,6 +40,11 @@
  */
 
 import { newMetrics as newCascadeMetrics, blockerUnion } from "./cascade.mjs";
+// TEAM-4290 — the ONE "is this stamp already covering these ids" predicate, shared
+// with awaited-ids.mjs so the bail-out in handleSpawnedFix and the annotate gate in
+// applyAwaitedEdges can never disagree. A PURE import, exactly like blockerUnion
+// above: the effectful module still arrives through the `awaitedIds` dep.
+import { stampCoversIds } from "./awaited-ids.mjs";
 // The ONE open-workflow scan, shared with dead-session-detector.mjs
 // (TEAM-3839). Carries the TEAM-3764 F5 rotating window and the TEAM-3755
 // F8-derived terminal-phase filter. SWEEP_ROTATION_QUANTUM_MS is re-exported
@@ -147,7 +152,11 @@ export function createReconcileSweep(deps) {
 
     if (missingEdge) {
       try {
-        await awaitedIds.applyAwaitedEdges(sibling.ticketId, awaitingIds, "tool");
+        // TEAM-4290 — `sibling` IS the origin here, so the stamp decision needs no
+        // read of its own. (This path is always already stamped — that is its entry
+        // condition — so it can never trigger the convergence rule; passing the
+        // snapshot just avoids a pointless fallback GET on the all-present race.)
+        await awaitedIds.applyAwaitedEdges(sibling.ticketId, awaitingIds, "tool", { origin: sibling });
         log(`reconcile.awaited_backfill — ${sibling.ticketId} awaiting=[${awaitingIds.join(", ")}] (sweep ${sweepId})`);
       } catch (err) {
         log(`reconcile.awaited_backfill_error — ${sibling.ticketId}: ${err?.message || err} (sweep ${sweepId})`);
@@ -180,9 +189,14 @@ export function createReconcileSweep(deps) {
    * below is a case where the edge is already present or pointless:
    *   - no spawnedBy / not a fix kind / self-reference → deriveAwaitedIds is null
    *   - origin not in this epic's children, or terminal → nothing to re-wake
-   *   - edge already in origin.blockedBy, or id already stamped in
-   *     origin.preconditionUnmet.awaitingIds → handleAwaitedChild owns it
+   *   - every id already STAMPED in origin.preconditionUnmet.awaitingIds →
+   *     handleAwaitedChild owns it
    * A write, so enforce-only; shadow logs the intent.
+   *
+   * TEAM-4290 — note what is NOT a bail-out any more: an origin that carries the
+   * EDGE but no stamp is a REPAIRABLE state (the annotate failed after the edge
+   * landed, or the process died between them), so it re-enters applyAwaitedEdges to
+   * get the stamp written. Counted as `stampRepairs`, distinct from derivedBackfills.
    */
   async function handleSpawnedFix(sibling, siblings, m, mode, sweepId) {
     const derived = awaitedIds.deriveAwaitedIds?.(sibling);
@@ -193,20 +207,42 @@ export function createReconcileSweep(deps) {
     if (!origin) return;                                          // not a sibling — out of scope
     if (TERMINAL_TICKET_STATUSES.has(origin.status)) return;      // origin already closed
 
-    // Already linked in EITHER direction → the origin-side backstop has it.
+    // TEAM-4290 — bail ONLY when every id is STAMPED. Pre-4290 this also bailed on
+    // `edges.has(id)`, which is precisely why an annotate that failed AFTER its edge
+    // landed could never be healed: the id was in blockedBy, so this backstop
+    // returned, handleAwaitedChild could not see an origin with no stamp, and
+    // parkEvidence answered `no-stamp` forever. The stamp is the D2 evidence and the
+    // thing that must converge; the edge write is idempotent (it answers "present"),
+    // so re-entering applyAwaitedEdges for a stamp-only repair is cheap and safe.
+    if (stampCoversIds(origin, ids)) return;              // handleAwaitedChild owns it
+
+    // Which repair is this? Edge already on the board → only the stamp is missing
+    // (a stamp REPAIR, TEAM-4290). Otherwise it is the original F4 case: no edge and
+    // no stamp (a derived BACKFILL). They are counted separately on purpose —
+    // folding a healed stamp into derivedBackfills would hide the new failure mode
+    // behind a metric that means "fix-side edges written".
     const edges = new Set(origin.blockedBy || []);
-    const stamped = new Set(origin.preconditionUnmet?.awaitingIds || []);
-    if (ids.every((id) => edges.has(id) || stamped.has(id))) return;
+    const stampRepair = ids.every((id) => edges.has(id));
 
     if (mode !== "enforce") {
-      log(`reconcile.would_backfill_derived (shadow) — origin=${originId} += [${ids.join(", ")}] from fix ${sibling.ticketId} (sweep ${sweepId})`);
+      log(stampRepair
+        ? `reconcile.would_repair_stamp (shadow) — origin=${originId} edge present, stamp missing for [${ids.join(", ")}] from fix ${sibling.ticketId} (sweep ${sweepId})`
+        : `reconcile.would_backfill_derived (shadow) — origin=${originId} += [${ids.join(", ")}] from fix ${sibling.ticketId} (sweep ${sweepId})`);
       return;
     }
 
     try {
-      await awaitedIds.applyAwaitedEdges(originId, ids, "derived");
-      m.derivedBackfills++;
-      log(`reconcile.derived_backfill — origin=${originId} += [${ids.join(", ")}] from fix ${sibling.ticketId} (sweep ${sweepId})`);
+      // The origin snapshot rides along: applyAwaitedEdges has to know whether a
+      // covering stamp exists, and the sweep already holds the row — so the repair
+      // costs ZERO extra reads.
+      await awaitedIds.applyAwaitedEdges(originId, ids, "derived", { origin });
+      if (stampRepair) {
+        m.stampRepairs++;
+        log(`reconcile.stamp_repair — origin=${originId} stamped [${ids.join(", ")}] from fix ${sibling.ticketId} (sweep ${sweepId})`);
+      } else {
+        m.derivedBackfills++;
+        log(`reconcile.derived_backfill — origin=${originId} += [${ids.join(", ")}] from fix ${sibling.ticketId} (sweep ${sweepId})`);
+      }
     } catch (err) {
       log(`reconcile.derived_backfill_error — origin=${originId} from fix ${sibling.ticketId}: ${err?.message || err} (sweep ${sweepId})`);
     }
@@ -246,6 +282,8 @@ export function createReconcileSweep(deps) {
       awaitTimeouts: 0,
       // TEAM-4185 F4 — fix-side derived edges written by handleSpawnedFix.
       derivedBackfills: 0,
+      // TEAM-4290 — origins whose edge was present but whose stamp was missing.
+      stampRepairs: 0,
       // TEAM-4187 — parked in_progress dependents this sweep re-woke (and
       // journaled as orchestrator.unblocked). Folded up from the per-candidate
       // cascade metrics, since the emit lives in cascade.stealAndRedispatch.
@@ -334,11 +372,13 @@ export function createReconcileSweep(deps) {
 
     m.durationMs = now() - startedAtMs;
     emitReconcileMetrics(m);
-    // Both new counters ride the one done line: TEAM-4187's `rewoken` (parked
-    // dependents this sweep actually re-drove) and TEAM-4185 F4's
-    // `derivedBackfills` (fix-side edges it had to write first). They answer
-    // different halves of the same question, so neither replaces the other.
-    log(`reconcile sweep done — mode=${mode} candidates=${m.candidates} skippedLiveLease=${m.skippedLiveLease} redispatched=${m.redispatched} rewoken=${m.rewoken || 0} escalated=${m.escalated || 0} escalationHeld=${m.escalationHeld || 0} reviewReawakened=${m.reviewReawakened} wouldRedispatch=${m.wouldRedispatch} noop=${m.noop} derivedBackfills=${m.derivedBackfills || 0} candidateErrors=${m.candidateErrors} truncated=${m.truncated} durationMs=${m.durationMs} (sweep ${sweepId})`);
+    // All three repair counters ride the one done line: TEAM-4187's `rewoken`
+    // (parked dependents this sweep actually re-drove), TEAM-4185 F4's
+    // `derivedBackfills` (fix-side edges it had to write first) and TEAM-4290's
+    // `stampRepairs` (origins whose edge was already there but whose park evidence
+    // was missing). They answer different halves of the same question, so none
+    // replaces another.
+    log(`reconcile sweep done — mode=${mode} candidates=${m.candidates} skippedLiveLease=${m.skippedLiveLease} redispatched=${m.redispatched} rewoken=${m.rewoken || 0} escalated=${m.escalated || 0} escalationHeld=${m.escalationHeld || 0} reviewReawakened=${m.reviewReawakened} wouldRedispatch=${m.wouldRedispatch} noop=${m.noop} derivedBackfills=${m.derivedBackfills || 0} stampRepairs=${m.stampRepairs || 0} candidateErrors=${m.candidateErrors} truncated=${m.truncated} durationMs=${m.durationMs} (sweep ${sweepId})`);
     return m;
   }
 
@@ -421,6 +461,8 @@ export function emitReconcileMetrics(m) {
           { Name: "ReconcileAwaitTimeouts", Unit: "Count" },
           // TEAM-4185 F4 — fix-side derived edge backfills.
           { Name: "ReconcileDerivedBackfills", Unit: "Count" },
+          // TEAM-4290 — fix-side stamp repairs (edge present, stamp missing).
+          { Name: "ReconcileStampRepairs", Unit: "Count" },
           // TEAM-4187 — parked in_progress re-wakes journaled this sweep.
           { Name: "ReconcileRewoken", Unit: "Count" },
         ],
@@ -442,6 +484,7 @@ export function emitReconcileMetrics(m) {
     ReconcileAwaiting: m.awaiting || 0,
     ReconcileAwaitTimeouts: m.awaitTimeouts || 0,
     ReconcileDerivedBackfills: m.derivedBackfills || 0,
+    ReconcileStampRepairs: m.stampRepairs || 0,
     ReconcileRewoken: m.rewoken || 0,
   }));
 }

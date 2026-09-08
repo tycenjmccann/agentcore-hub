@@ -1055,16 +1055,104 @@ describe("TEAM-4185 F4 — fix-side derived backfill", () => {
     expect(m.derivedBackfills).toBe(0);
   });
 
-  it("no-op: the edge is ALREADY in origin.blockedBy", async () => {
-    const addBlockers = vi.fn(async () => []);
-    const awaitedIds = makeAwaited({ mode: "enforce", addBlockers });
+  /**
+   * TEAM-4290 (ship-review r3-F3) — this fixture USED to be a no-op, and that was
+   * the bug. An origin carrying the EDGE but no STAMP is what a partial write leaves
+   * behind (the addBlockers call landed, the annotate then failed or the process died
+   * between the two). Pre-4290 handleSpawnedFix bailed because `edges.has(FIX)` was
+   * true, handleAwaitedChild could not see it (it is gated on the stamp existing),
+   * and parkEvidence answered `no-stamp` forever — so the D2 guard escalated a
+   * cleanly parked release manager. The stamp is the evidence; it has to converge.
+   */
+  it("repair: the origin carries the EDGE but no stamp → applyAwaitedEdges is called and the stamp lands (zero extra reads)", async () => {
+    const addBlockers = vi.fn(async () => []); // the edge is there → present-by-omission
+    const annotatePreconditionUnmet = vi.fn(async () => {});
+    const getTicket = vi.fn(async () => null);
+    const awaitedIds = createAwaitedIds({
+      addBlockers, annotatePreconditionUnmet,
+      publishEvent: vi.fn(async () => {}),
+      getTicket,
+      store: { markAwaitTimeoutEmitted: vi.fn(async () => true) },
+      now: () => NOW, mode: "enforce", timeoutMinutes: 120,
+    });
     const siblings = [unlinkedOrigin({ blockedBy: [FIX] }), fixTicket()];
+    const s = makeSweep({ workflows: [workflow()], siblings, awaitedIds });
+    const cap = captureMetrics();
+
+    const m = await s.runSweep("enforce");
+    const records = cap.records();
+    cap.restore();
+
+    // The edge write is idempotent (it answers present), so re-entering the seam for
+    // a stamp-only repair is cheap and safe.
+    expect(addBlockers).toHaveBeenCalledTimes(1);
+    expect(addBlockers.mock.calls[0][0]).toBe(ORIGIN);
+    expect(addBlockers.mock.calls[0][1]).toEqual([FIX]);
+    expect(addBlockers.mock.calls[0][2]).toMatchObject({ source: "derived" });
+    // …and the missing stamp is written, which is the whole point.
+    expect(annotatePreconditionUnmet).toHaveBeenCalledTimes(1);
+    expect(annotatePreconditionUnmet.mock.calls[0][1]).toMatchObject({
+      awaitingIds: [FIX], source: "derived",
+    });
+    // Counted apart from derivedBackfills: folding a healed stamp into a metric that
+    // means "fix-side edges written" would hide this failure mode.
+    expect(m.stampRepairs).toBe(1);
+    expect(m.derivedBackfills).toBe(0);
+    expect(records[0].ReconcileStampRepairs).toBe(1);
+    // The sweep already holds the origin row, so the repair costs ZERO extra reads.
+    expect(getTicket).not.toHaveBeenCalled();
+  });
+
+  it("no-op: the edge is present AND stamped — nothing left to converge", async () => {
+    const addBlockers = vi.fn(async () => []);
+    const annotatePreconditionUnmet = vi.fn(async () => {});
+    const awaitedIds = makeAwaited({ mode: "enforce", addBlockers, annotatePreconditionUnmet });
+    const siblings = [
+      unlinkedOrigin({ blockedBy: [FIX], preconditionUnmet: { awaitingIds: [FIX], reportedAt: STALE_STARTED } }),
+      fixTicket(),
+    ];
     const s = makeSweep({ workflows: [workflow()], siblings, awaitedIds });
 
     const m = await s.runSweep("enforce");
 
+    // handleAwaitedChild sees no missing edge, and the fix side sees a covering
+    // stamp — so neither writes, and the wait clock is never touched.
     expect(addBlockers).not.toHaveBeenCalled();
+    expect(annotatePreconditionUnmet).not.toHaveBeenCalled();
+    expect(m.stampRepairs).toBe(0);
     expect(m.derivedBackfills).toBe(0);
+  });
+
+  it("shadow: a stamp repair logs reconcile.would_repair_stamp and writes NOTHING", async () => {
+    const addBlockers = vi.fn(async () => []);
+    const annotatePreconditionUnmet = vi.fn(async () => {});
+    const awaitedIds = makeAwaited({ mode: "enforce", addBlockers, annotatePreconditionUnmet });
+    const siblings = [unlinkedOrigin({ blockedBy: [FIX] }), fixTicket()];
+    const lines = [];
+    const s = makeSweep({ workflows: [workflow()], siblings, awaitedIds, log: (msg) => lines.push(String(msg)) });
+
+    const m = await s.runSweep("shadow");
+
+    // The repair is named distinctly from a derived BACKFILL: they are different
+    // states (stamp missing vs. edge AND stamp missing) and read differently in logs.
+    const intent = lines.filter((l) => l.includes("reconcile.would_repair_stamp"));
+    expect(intent).toHaveLength(1);
+    expect(intent[0]).toContain(`origin=${ORIGIN}`);
+    expect(intent[0]).toContain(FIX);
+    expect(lines.filter((l) => l.includes("reconcile.would_backfill_derived"))).toHaveLength(0);
+    expect(addBlockers).not.toHaveBeenCalled();
+    expect(annotatePreconditionUnmet).not.toHaveBeenCalled();
+    expect(m.stampRepairs).toBe(0);
+  });
+
+  it("a healthy sweep emits an explicit ReconcileStampRepairs zero", async () => {
+    const s = makeSweep({ workflows: [workflow()], siblings: inProgressStale });
+    const cap = captureMetrics();
+    await s.runSweep("enforce");
+    const records = cap.records();
+    cap.restore();
+
+    expect(records[0].ReconcileStampRepairs).toBe(0);
   });
 
   it("no-op: the id is ALREADY stamped in origin.preconditionUnmet (handleAwaitedChild owns it)", async () => {
@@ -1077,9 +1165,11 @@ describe("TEAM-4185 F4 — fix-side derived backfill", () => {
     const m = await s.runSweep("enforce");
 
     // handleAwaitedChild does the origin-side backfill for this shape; the
-    // fix-side hook must NOT double-write.
+    // fix-side hook must NOT double-write. TEAM-4290 — "every id stamped" is now the
+    // ONLY bail-out by linkage, so this is the case that still exercises it.
     expect(addBlockers.mock.calls.filter((c) => c[2]?.source === "derived")).toHaveLength(0);
     expect(m.derivedBackfills).toBe(0);
+    expect(m.stampRepairs).toBe(0);
   });
 
   it("no-op: the origin is already terminal — nothing left to re-wake", async () => {
