@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   parseGitHubUrl,
+  branchHeadSha,
   checkRepoUrl,
   checkRepoConfig,
   definitiveFailures,
@@ -132,5 +133,64 @@ describe("checkRepoConfig / helpers", () => {
     expect(w).toMatch(/NOT a coding-runtime outage/);
     expect(w).toMatch(/https:\/\/github.com\/tycenjmccann\/agentcore-hub/);
     expect(w).toMatch(/STOP\. Block your ticket/);
+  });
+});
+
+/**
+ * TEAM-4264 F3 / amendment A2 — the completion route's feature-branch head read.
+ *
+ * The verified-head gate's `heads.pr` is the SHIPPING BRANCH HEAD, and the route is
+ * the human-driven half of that gate. Every negative here has to land on
+ * `sha: null` (UNKNOWN), because the gate reads a null head as "compare the two
+ * verifiers to each other" — never as divergence. `probed` is the observability
+ * split: "we never asked" vs "we asked and there is no such ref".
+ */
+describe("branchHeadSha (TEAM-4264 F3)", () => {
+  const REF = "/repos/acme/widgets/git/ref/heads/feature%2FTEAM-1-backend-dev";
+  const HEAD = "5fa3728" + "a".repeat(33);
+  const url = "https://github.com/acme/widgets";
+  const branch = "feature/TEAM-1-backend-dev";
+
+  it("200 → the head sha, off the branch ref the orchestrator reads", async () => {
+    const calls: string[] = [];
+    const r = await branchHeadSha(url, branch, {
+      token: "t",
+      fetchImpl: fakeFetch({ [REF]: { status: 200, json: { object: { sha: HEAD, type: "commit" } } } }, calls),
+    });
+    expect(r).toEqual({ probed: true, sha: HEAD });
+    // The branch is URL-encoded: `feature/x` is one ref segment, not two path parts.
+    expect(calls).toEqual([`GET https://api.github.com${REF}`]);
+  });
+
+  it("404 → probed, but no head: the ordinary post-merge case (branch deleted)", async () => {
+    const r = await branchHeadSha(url, branch, { token: "t", fetchImpl: fakeFetch({}) });
+    expect(r).toMatchObject({ probed: true, sha: null });
+    expect(r.reason).toMatch(/GitHub 404/);
+    expect(r.reason).toContain(branch);
+  });
+
+  it("no token → not probed, no head, and no request at all", async () => {
+    const calls: string[] = [];
+    const r = await branchHeadSha(url, branch, { fetchImpl: fakeFetch({ [REF]: { status: 200, json: { object: { sha: HEAD } } } }, calls) });
+    expect(r).toEqual({ probed: false, sha: null, reason: "no GITHUB_PAT" });
+    expect(calls).toEqual([]);
+  });
+
+  it("a non-GitHub URL and a missing branch are both unknown, not errors", async () => {
+    expect(await branchHeadSha("https://gitlab.com/x/y", branch, { token: "t" })).toEqual({
+      probed: false, sha: null, reason: "not a GitHub URL",
+    });
+    expect(await branchHeadSha(url, "", { token: "t" })).toEqual({ probed: false, sha: null, reason: "no branch" });
+  });
+
+  it("a 200 with no sha in the body, and a thrown fetch, both fail OPEN", async () => {
+    const empty = await branchHeadSha(url, branch, { token: "t", fetchImpl: fakeFetch({ [REF]: { status: 200, json: {} } }) });
+    expect(empty).toMatchObject({ probed: true, sha: null });
+    const thrown = await branchHeadSha(url, branch, {
+      token: "t",
+      fetchImpl: (async () => { throw new Error("socket hang up"); }) as unknown as typeof fetch,
+    });
+    expect(thrown).toMatchObject({ probed: false, sha: null });
+    expect(thrown.reason).toMatch(/GitHub unreachable: socket hang up/);
   });
 });

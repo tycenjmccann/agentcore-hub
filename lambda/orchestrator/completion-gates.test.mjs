@@ -894,12 +894,16 @@ describe("completeWorkflow — ship-phase merge gate (TEAM-3721)", () => {
     process.env.SHIP_MERGE_VERIFY = "off";
     h.state.snapshots = [SHIP_CHILDREN];
     h.state.freshWorkflow = { id: "wf_1", agentTasks: SHIP_TASKS };
-    // fetch would say unmerged, but the gate is off so it must not even be called.
+    // fetch would say unmerged, but the gate is off so it must not ask.
     global.fetch = vi.fn(async () => ({ ok: true, status: 200, text: async () => JSON.stringify([{ merged_at: null }]) }));
     await loadShip();
     await completeWorkflow({ ...SHIP_WF });
     expect(h.state.storeCompletions.length).toBe(1);
-    expect(global.fetch).not.toHaveBeenCalled();
+    // Scoped to the merge-verify requests: the verified-head gate reads the feature
+    // branch head off git/ref/heads on its own (TEAM-4264 F3), and that call is
+    // governed by VERIFIED_HEAD_COMPLETION, not by this flag.
+    const mergeVerifyCalls = global.fetch.mock.calls.filter(([url]) => /\/(pulls|compare)/.test(String(url)));
+    expect(mergeVerifyCalls).toEqual([]);
   });
 });
 

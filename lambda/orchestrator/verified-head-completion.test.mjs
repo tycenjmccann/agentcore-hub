@@ -75,6 +75,13 @@ const h = vi.hoisted(() => ({
     /** `${workflowId}|${ticketId}|${slotSha}` for every re-verify slot held. */
     reverifySlots: new Set(),
     s3Gets: /** @type {any[]} */ ([]),
+    /**
+     * TEAM-4264 F3: heads.pr is now the FEATURE BRANCH HEAD, so the wiring half has
+     * to answer one `git/ref/heads/<branch>` read. `branchHead: null` is the
+     * unresolvable case (no such ref / expired PAT), which must read as UNKNOWN.
+     */
+    branchHead: /** @type {string | null} */ (null),
+    githubPaths: /** @type {string[]} */ ([]),
   },
 }));
 
@@ -229,9 +236,16 @@ const recordHead = (ticketId) => resolveTestedHead(DOWTDH.completions[ticketId])
 
 describe("evaluateVerifiedHeads — dowtdh, the run this gate exists for", () => {
   const { children, agentTasks } = harvested(DOWTDH);
+  /**
+   * The head the run was SHIPPING, supplied by the CALLER (TEAM-4264 F3): the
+   * orchestrator reads it off the feature branch. In dowtdh it happens to equal the
+   * fix ticket TEAM-4183's commitSha, which is exactly why the old dev-commit proxy
+   * went unnoticed here — it only breaks once a merge sits between the two.
+   */
+  const SHIPPED_HEAD = recordHead("TEAM-4183");
   let result;
   beforeEach(() => {
-    result = evaluateVerifiedHeads(children, agentTasks);
+    result = evaluateVerifiedHeads(children, agentTasks, { prHeadSha: SHIPPED_HEAD });
   });
 
   it("refuses the completion with reason head-divergence", () => {
@@ -259,39 +273,68 @@ describe("evaluateVerifiedHeads — dowtdh, the run this gate exists for", () =>
     // TEAM-4180 (code_reviewer) recorded 933ea6f — the head it INSPECTED. Counting
     // a gate persona's commitSha as the run's current head would make the
     // comparison self-fulfilling, so the reviewer's head appears nowhere here.
+    // After F3 nothing on the board can become heads.pr at all, which makes this
+    // structural rather than a rule about gate personas.
     const reviewerHead = recordHead("TEAM-4180");
     expect(reviewerHead.startsWith("933ea6f")).toBe(true);
     expect(Object.values(result.heads)).not.toContain(reviewerHead);
   });
 
-  it("takes the run's head from a done dev/fix commitSha, never from a mergeCommit", () => {
-    // mergeCommit is the integration MERGE object — a different commit from the
-    // branch head every persona tested, so comparing against it would report
-    // divergence on every merged run. Adding one changes nothing.
+  it("derives the PR head from NOTHING on the board — not a commitSha, not a mergeCommit (TEAM-4264 F3)", () => {
+    // The inversion of the pre-F3 rule. `commitSha` is the head that ONE ticket
+    // produced and `mergeCommit` is the integration merge object; neither is the
+    // head the run is shipping, and guessing from either is what made every merged
+    // run read as divergent. With no caller-supplied head, heads.pr is UNKNOWN —
+    // and unknown never refuses: the two verifiers agree here, so the run passes.
     const tasks = JSON.parse(JSON.stringify(agentTasks));
     tasks["TEAM-4183"].mergeCommit = "f".repeat(40); // synthetic: no merge commit exists in this run
-    expect(evaluateVerifiedHeads(children, tasks).heads.pr).toBe(recordHead("TEAM-4183"));
+    const derived = evaluateVerifiedHeads(children, tasks);
+    expect(derived.heads.pr).toBeNull();
+    expect(derived.heads.pr).not.toBe(recordHead("TEAM-4183"));
+    expect(derived).toMatchObject({ ok: true, reason: null, stalePersonas: [] });
   });
 
   it("passes once the run's head IS the head both verifiers certified", () => {
     // The counterfactual: had QA and CI re-run at TEAM-4183's head, this closes.
     const tasks = JSON.parse(JSON.stringify(agentTasks));
-    const shipped = recordHead("TEAM-4183");
-    tasks["TEAM-4181"].testedHead = shipped;
-    tasks["TEAM-4182"].testedHead = shipped;
-    const ok = evaluateVerifiedHeads(children, tasks);
+    tasks["TEAM-4181"].testedHead = SHIPPED_HEAD;
+    tasks["TEAM-4182"].testedHead = SHIPPED_HEAD;
+    const ok = evaluateVerifiedHeads(children, tasks, { prHeadSha: SHIPPED_HEAD });
     expect(ok).toMatchObject({ ok: true, reason: null, offenders: [], stalePersonas: [] });
-    expect(ok.heads).toEqual({ qa: shipped, ci: shipped, pr: shipped });
+    expect(ok.heads).toEqual({ qa: SHIPPED_HEAD, ci: SHIPPED_HEAD, pr: SHIPPED_HEAD });
   });
 
   it("sees no head at all before the D1 harvest — which is why the harvest changed", () => {
     // The RAW fixture entries (status complete, a commitSha, no head field) are the
     // pre-4246 state. QA's and CI's heads are unknown there, and unknown is not
     // divergence — the gate cannot refuse a run for a fact nobody recorded.
-    const raw = evaluateVerifiedHeads(DOWTDH.tickets, DOWTDH.workflow.agentTasks);
+    const raw = evaluateVerifiedHeads(DOWTDH.tickets, DOWTDH.workflow.agentTasks, { prHeadSha: SHIPPED_HEAD });
     expect(raw.heads.qa).toBeNull();
     expect(raw.heads.ci).toBeNull();
     expect(raw).toMatchObject({ ok: true, reason: null });
+  });
+
+  it("the merge case F3 exists for: QA+CI at the merge commit, a dev commit one parent back", () => {
+    // This very branch. 5fa3728 (the integration head) has parents fcb47de and
+    // 6c63c70, and the dev ticket reported 6c63c70. Both verifiers ran at the merge
+    // commit, so the run is verified — but the old proxy took the newest dev
+    // commitSha as "the PR head" and reported divergence at a parent of the head,
+    // which under enforce filed a stale-head re-verify on every single merged run.
+    const MERGE = "5fa3728" + "a".repeat(33);
+    const PARENT = "6c63c70" + "b".repeat(33);
+    const tasks = JSON.parse(JSON.stringify(agentTasks));
+    tasks["TEAM-4181"].testedHead = MERGE;
+    tasks["TEAM-4182"].testedHead = MERGE;
+    tasks["TEAM-4183"].commitSha = PARENT;
+    delete tasks["TEAM-4183"].testedHead;
+
+    const res = evaluateVerifiedHeads(children, tasks, { prHeadSha: MERGE });
+    expect(res).toMatchObject({ ok: true, reason: null, stalePersonas: [] });
+    expect(res.heads).toEqual({ qa: MERGE, ci: MERGE, pr: MERGE });
+    // The proxy is gone, not merely outranked: the parent commit is nowhere in the
+    // answer, so there is nothing left for a merge to make stale.
+    expect(res.heads.pr).not.toBe(PARENT);
+    expect(Object.values(res.heads)).not.toContain(PARENT);
   });
 });
 
@@ -307,61 +350,81 @@ describe("evaluateVerifiedHeads — the head-equality rule", () => {
     Object.fromEntries(rows.map((r) => [r.ticketId, { ticketId: r.ticketId, agentId: r.assignee, status: "complete", ...r }])),
   ];
   const evaluate = (...rows) => evaluateVerifiedHeads(...board(...rows));
+  /** The caller's head — after TEAM-4264 F3 the ONLY thing that can be heads.pr. */
+  const evaluateAt = (prHeadSha, ...rows) => evaluateVerifiedHeads(...board(...rows), { prHeadSha });
 
   it("passes when all three heads are the same commit", () => {
-    expect(evaluate(qa(A), ci(A), dev(A))).toMatchObject({ ok: true, reason: null });
+    expect(evaluateAt(A, qa(A), ci(A), dev(A))).toMatchObject({ ok: true, reason: null });
   });
 
   it("passes on ONE known head — nothing to compare it against", () => {
-    expect(evaluate(dev(A))).toMatchObject({ ok: true, reason: null, heads: { qa: null, ci: null, pr: A } });
+    expect(evaluateAt(A, dev(A))).toMatchObject({ ok: true, reason: null, heads: { qa: null, ci: null, pr: A } });
     expect(evaluate(qa(A))).toMatchObject({ ok: true, reason: null, heads: { qa: A, ci: null, pr: null } });
   });
 
   it("passes on two known EQUAL heads, refuses two known DIFFERENT ones", () => {
-    expect(evaluate(qa(A), dev(A))).toMatchObject({ ok: true, reason: null });
-    expect(evaluate(qa(A), dev(B))).toMatchObject({ ok: false, reason: "head-divergence", stalePersonas: [QA_VERIFIER_ID] });
+    expect(evaluateAt(A, qa(A), dev(A))).toMatchObject({ ok: true, reason: null });
+    expect(evaluateAt(B, qa(A), dev(B))).toMatchObject({ ok: false, reason: "head-divergence", stalePersonas: [QA_VERIFIER_ID] });
   });
 
   it("treats a short sha and the full sha it prefixes as the SAME head", () => {
     // The two conventions genuinely coexist in one run: dowtdh's CI wrote a
     // 40-char head while the reviewer's record carried a 7-char one.
-    expect(evaluate(qa(A.slice(0, 7)), ci(A), dev(A))).toMatchObject({ ok: true, reason: null });
-    expect(evaluate(qa(A.slice(0, 7)), dev(B.slice(0, 7)))).toMatchObject({ ok: false, reason: "head-divergence" });
+    expect(evaluateAt(A, qa(A.slice(0, 7)), ci(A), dev(A))).toMatchObject({ ok: true, reason: null });
+    expect(evaluateAt(B.slice(0, 7), qa(A.slice(0, 7)))).toMatchObject({ ok: false, reason: "head-divergence" });
   });
 
-  it("with no PR head, two disagreeing verifiers are BOTH stale", () => {
-    // There is no majority to appeal to, so neither head can be called current.
+  it("with no PR head, two disagreeing verifiers are BOTH stale (TEAM-4264 F3)", () => {
+    // A null PR head is UNKNOWN, and unknown never manufactures divergence — but it
+    // does not excuse one either: two KNOWN heads that differ are still divergence
+    // (design §3.3), and with no PR head to appeal to, neither can be called
+    // current, so BOTH verifiers are named.
     expect(evaluate(qa(A), ci(B))).toMatchObject({
       ok: false,
       reason: "head-divergence",
+      heads: { qa: A, ci: B, pr: null },
       stalePersonas: [QA_VERIFIER_ID, CI_AGENT_ID],
     });
   });
 
-  it("names only the persona that disagrees with the PR head", () => {
-    expect(evaluate(qa(A), ci(B), dev(B))).toMatchObject({ stalePersonas: [QA_VERIFIER_ID] });
-    expect(evaluate(qa(A), ci(B), dev(A))).toMatchObject({ stalePersonas: [CI_AGENT_ID] });
+  it("with no PR head, two AGREEING verifiers pass — unknown is not divergence", () => {
+    expect(evaluate(qa(A), ci(A), dev(B))).toMatchObject({
+      ok: true,
+      reason: null,
+      heads: { qa: A, ci: A, pr: null },
+      stalePersonas: [],
+    });
   });
 
-  it("prefers the caller's PR head over any derived one", () => {
+  it("names only the persona that disagrees with the PR head", () => {
+    expect(evaluateAt(B, qa(A), ci(B), dev(B))).toMatchObject({ stalePersonas: [QA_VERIFIER_ID] });
+    expect(evaluateAt(A, qa(A), ci(B), dev(A))).toMatchObject({ stalePersonas: [CI_AGENT_ID] });
+  });
+
+  it("heads.pr is the caller's head or NULL — never a derivation (TEAM-4264 F3)", () => {
     const [children, agentTasks] = board(qa(A), ci(A), dev(A));
     expect(evaluateVerifiedHeads(children, agentTasks, { prHeadSha: B })).toMatchObject({
       ok: false,
       reason: "head-divergence",
       heads: { pr: B },
     });
-    // A prHeadSha that is not a SHA is not a head: fall back to the derivation
-    // rather than silently reporting "no PR head" and passing.
+    // A prHeadSha that is not a SHA is not a head — and the inversion of the old
+    // rule: it falls back to NULL (unknown), not to the dev commit on the board.
+    // The verifiers still agree, so the gate passes rather than guessing.
     expect(evaluateVerifiedHeads(children, agentTasks, { prHeadSha: "HEAD" })).toMatchObject({
       ok: true,
-      heads: { pr: A },
+      reason: null,
+      heads: { qa: A, ci: A, pr: null },
     });
+    for (const junk of [undefined, null, "", "  ", 42, {}, ["deadbee"]]) {
+      expect(evaluateVerifiedHeads(children, agentTasks, { prHeadSha: junk }).heads.pr).toBeNull();
+    }
   });
 
   it("takes the NEWEST head each persona declared, by completedAt", () => {
     const early = { ...qa(B), ticketId: "T-1", completedAt: "2026-01-01T01:00:00Z" };
     const late = { ...qa(A), ticketId: "T-9", completedAt: "2026-01-01T09:00:00Z" };
-    expect(evaluate(late, early, dev(A))).toMatchObject({ ok: true, heads: { qa: A } });
+    expect(evaluateAt(A, late, early, dev(A))).toMatchObject({ ok: true, heads: { qa: A } });
   });
 
   it("a head-less later round does not erase the head an earlier one proved", () => {
@@ -369,13 +432,15 @@ describe("evaluateVerifiedHeads — the head-equality rule", () => {
     // reading it as "QA now has no head" would fail the run OPEN.
     const proved = { ...qa(B), ticketId: "T-1", completedAt: "2026-01-01T01:00:00Z" };
     const headless = { ...qa(undefined), ticketId: "T-9", completedAt: "2026-01-01T09:00:00Z" };
-    expect(evaluate(proved, headless, dev(A))).toMatchObject({ ok: false, reason: "head-divergence" });
+    expect(evaluateAt(A, proved, headless, dev(A))).toMatchObject({ ok: false, reason: "head-divergence" });
   });
 
   it("ignores a ticket that is not done, and one with no task entry", () => {
-    const [children, agentTasks] = board(qa(A), dev(B));
-    children.find((t) => t.ticketId === "T-3").status = "in_progress";
-    expect(evaluateVerifiedHeads(children, agentTasks)).toMatchObject({ ok: true, heads: { pr: null } });
+    const [children, agentTasks] = board(qa(A), ci(B));
+    children.find((t) => t.ticketId === "T-2").status = "in_progress";
+    // CI never finished, so its head certifies nothing — one known head, nothing to
+    // compare it against, even though the board carries a second value.
+    expect(evaluateVerifiedHeads(children, agentTasks)).toMatchObject({ ok: true, heads: { qa: A, ci: null } });
     delete agentTasks["T-1"];
     expect(evaluateVerifiedHeads(children, agentTasks)).toMatchObject({ ok: true, heads: { qa: null } });
   });
@@ -394,10 +459,10 @@ describe("evaluateVerifiedHeads — the head-equality rule", () => {
     // too. Neither delivery mode is even reachable from here: passing one changes
     // nothing about the answer.
     const [children, agentTasks] = board(qa(A), dev(B));
-    const bare = evaluateVerifiedHeads(children, agentTasks);
+    const bare = evaluateVerifiedHeads(children, agentTasks, { prHeadSha: B });
     expect(bare).toMatchObject({ ok: false, reason: "head-divergence" });
     for (const mode of ["cd", "handoff"]) {
-      expect(evaluateVerifiedHeads(children, agentTasks, { delivery: { mode } })).toEqual(bare);
+      expect(evaluateVerifiedHeads(children, agentTasks, { prHeadSha: B, delivery: { mode } })).toEqual(bare);
     }
   });
 });
@@ -406,8 +471,8 @@ describe("evaluateVerifiedHeads — the epic-wide open-fix refusal", () => {
   const HEAD = "c".repeat(7) + "d".repeat(33); // 40 hex, synthetic
   const done = (over) => ({ ticketId: "T-1", status: "done", assignee: "agentcore_hub_backend_dev", type: "task", commitSha: HEAD, completedAt: "2026-01-01T01:00:00Z", ...over });
   const fix = (over = {}) => ({ ticketId: "T-FIX", status: "in_progress", assignee: "agentcore_hub_backend_dev", type: "task", spawnedBy: { kind: "review_fix", gateTicketId: "T-GATE" }, ...over });
-  const evaluate = (children) =>
-    evaluateVerifiedHeads(children, Object.fromEntries(children.map((t) => [t.ticketId, { ...t, agentId: t.assignee }])));
+  const evaluate = (children, opts) =>
+    evaluateVerifiedHeads(children, Object.fromEntries(children.map((t) => [t.ticketId, { ...t, agentId: t.assignee }])), opts);
 
   it("refuses on an open fix whose phase no def requires — this is the dowtdh shape", () => {
     // isWorkflowComplete only waits on fixes routed under a REQUIRED phase, so a
@@ -420,7 +485,10 @@ describe("evaluateVerifiedHeads — the epic-wide open-fix refusal", () => {
   });
 
   it("still reports the heads it compared, so the event says what state was refused", () => {
-    expect(evaluate([done(), fix()]).heads.pr).toBe(HEAD);
+    expect(evaluate([done(), fix()], { prHeadSha: HEAD }).heads.pr).toBe(HEAD);
+    // …and the refusal needs no PR head at all: open-fix is checked first, which is
+    // why a GitHub call that fails can never mask the actionable half of the gate.
+    expect(evaluate([done(), fix()])).toMatchObject({ ok: false, reason: "open-fix", heads: { pr: null } });
   });
 
   it("lists every open fix once, in board order", () => {
@@ -450,7 +518,7 @@ describe("evaluateVerifiedHeads — the epic-wide open-fix refusal", () => {
 
   it("refuses on the open fix BEFORE reporting divergence — the fix is the actionable one", () => {
     const qa = { ticketId: "T-QA", status: "done", assignee: QA_VERIFIER_ID, type: "task", testedHead: "eeeeeee9999999999999999999999999999999ee", completedAt: "2026-01-01T02:00:00Z" };
-    expect(evaluate([done(), qa, fix()])).toMatchObject({ reason: "open-fix" });
+    expect(evaluate([done(), qa, fix()], { prHeadSha: HEAD })).toMatchObject({ reason: "open-fix" });
   });
 });
 
@@ -520,8 +588,20 @@ const OPEN_FIX = {
   spawnedBy: { kind: "review_fix", gateTicketId: "V-0" },
 };
 
-/** No featureBranch and no repoConfig: nothing here should reach GitHub. */
-const WF = { id: "wf_1", phase: "review", workflowDefId: "software-delivery", epicId: "EPIC-1", input: { title: "t" } };
+/**
+ * A branch and a repo, because heads.pr is read off the branch (TEAM-4264 F3). The
+ * GitHub seam is the `fetch` stub below, which answers `git/ref/heads/<branch>` with
+ * `h.state.branchHead` and 404s everything else.
+ */
+const WF = {
+  id: "wf_1",
+  phase: "review",
+  workflowDefId: "software-delivery",
+  epicId: "EPIC-1",
+  input: { title: "t" },
+  featureBranch: "feature/V-1-backend-dev",
+  repoConfig: { repos: [{ url: "https://github.com/acme/widgets", role: "primary" }] },
+};
 
 const detailsOfType = (type) =>
   h.state.ebEvents
@@ -533,6 +613,7 @@ describe("completeWorkflow — the verified-head gate (FR-D1.9 wiring)", () => {
   let completeWorkflow;
   let gate; // the evaluateVerifiedHeads spy from the graph index.mjs just loaded
   let completionBlockedKey;
+  let realFetch;
 
   /**
    * VERIFIED_HEAD_COMPLETION is read at module scope, so the mode has to be set
@@ -568,11 +649,27 @@ describe("completeWorkflow — the verified-head gate (FR-D1.9 wiring)", () => {
     h.state.blockedRowMissing = false;
     h.state.reverifySlots.clear();
     h.state.s3Gets.length = 0;
+    h.state.branchHead = SHIPPED;
+    h.state.githubPaths.length = 0;
     delete process.env.ARTIFACT_BUCKET;
+
+    // The one GitHub fact this gate needs (TEAM-4264 F3): the feature-branch head.
+    // Everything else 404s, so no other GitHub path can quietly start passing here.
+    process.env.GITHUB_PAT = "gh-test-token";
+    realFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async (url) => {
+      const path = String(url).replace("https://api.github.com", "");
+      h.state.githubPaths.push(path);
+      const isRef = path.includes("/git/ref/heads/");
+      const body = isRef && h.state.branchHead ? { object: { sha: h.state.branchHead } } : { message: "Not Found" };
+      return { ok: isRef && Boolean(h.state.branchHead), status: body.object ? 200 : 404, text: async () => JSON.stringify(body) };
+    });
   });
 
   afterEach(() => {
     delete process.env.VERIFIED_HEAD_COMPLETION;
+    delete process.env.GITHUB_PAT;
+    globalThis.fetch = realFetch;
   });
 
   it("enforce + divergence: one completion_blocked, no workflow.complete, one re-verify per stale persona", async () => {
@@ -739,6 +836,77 @@ describe("completeWorkflow — the verified-head gate (FR-D1.9 wiring)", () => {
     expect(h.state.blockedClaims).toHaveLength(0);
     expect(h.state.createdTickets).toHaveLength(0);
     expect(h.state.storeCompletions).toHaveLength(1);
+    expect(detailsOfType("workflow.complete")).toHaveLength(1);
+  });
+
+  it("the PR head comes from git/ref/heads on the feature branch (TEAM-4264 F3)", async () => {
+    // The merged-PR shape the finding is about: QA and CI certified the branch head
+    // 5fa3728-style commit, and the newest DEV commit is a parent of it. The old
+    // proxy took that parent as "the PR head" and refused a fully-verified run; the
+    // gate now asks GitHub, sees the same head the verifiers used, and closes.
+    const MERGE = "b".repeat(7) + "2".repeat(33); // == SHIPPED: what the branch points at
+    const PARENT = "c".repeat(7) + "3".repeat(33); // the dev commit, one parent back
+    h.state.branchHead = MERGE;
+    h.state.freshWorkflow = { id: "wf_1", agentTasks: TASKS({ qa: MERGE, ci: MERGE, pr: PARENT }) };
+    await loadWith("enforce");
+    await completeWorkflow({ ...WF });
+
+    expect(h.state.githubPaths).toContain("/repos/acme/widgets/git/ref/heads/feature%2FV-1-backend-dev");
+    expect(gate.mock.calls[0][2]).toMatchObject({ prHeadSha: MERGE });
+    expect(gate.mock.results[0].value.heads).toEqual({ qa: MERGE, ci: MERGE, pr: MERGE });
+    expect(detailsOfType("orchestrator.completion_blocked")).toHaveLength(0);
+    expect(h.state.createdTickets).toHaveLength(0);
+    expect(detailsOfType("workflow.complete")).toHaveLength(1);
+  });
+
+  it("an UNRESOLVABLE head is unknown, not divergence — the run is not held", async () => {
+    // No such ref (the branch was deleted by the merge), or an expired PAT. Under
+    // enforce the gate then compares only the two verifiers to each other; they
+    // agree, so the run closes. Fabricating a head from a stale proxy — which is
+    // what refusing here would amount to — is the defect, not the safeguard.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    h.state.branchHead = null;
+    await loadWith("enforce");
+    await completeWorkflow({ ...WF });
+
+    expect(gate.mock.calls[0][2]).toMatchObject({ prHeadSha: null });
+    expect(gate.mock.results[0].value.heads).toEqual({ qa: VERIFIED, ci: VERIFIED, pr: null });
+    expect(detailsOfType("orchestrator.completion_blocked")).toHaveLength(0);
+    expect(h.state.createdTickets).toHaveLength(0);
+    expect(detailsOfType("workflow.complete")).toHaveLength(1);
+    expect(warn.mock.calls.some((c) => String(c[0]).includes("branch head unresolved"))).toBe(true);
+    warn.mockRestore();
+  });
+
+  it("an unresolvable head still cannot excuse two DISAGREEING verifiers", async () => {
+    // The other half of "unknown is not divergence": two KNOWN heads that differ are
+    // divergence with or without a PR head, and with none to appeal to BOTH
+    // verifiers are re-verified — at the only head there is, which is neither of
+    // theirs, so the re-verify is filed against the unknown-head slot F2 added.
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    h.state.branchHead = null;
+    h.state.freshWorkflow = { id: "wf_1", agentTasks: TASKS({ qa: VERIFIED, ci: SHIPPED }) };
+    await loadWith("enforce");
+    await completeWorkflow({ ...WF });
+
+    const blocked = detailsOfType("orchestrator.completion_blocked");
+    expect(blocked).toHaveLength(1);
+    expect(blocked[0]).toMatchObject({ reason: "head-divergence", heads: { qa: VERIFIED, ci: SHIPPED, pr: null } });
+    expect(h.state.storeCompletions).toHaveLength(0);
+    expect(h.state.createdTickets.map((t) => t.assignee)).toEqual([QA_VERIFIER_ID, CI_AGENT_ID]);
+    error.mockRestore();
+  });
+
+  it("a run with no feature branch never calls GitHub at all", async () => {
+    // Nothing to read a head off: the gate degrades to the verifier-vs-verifier
+    // comparison without paying a round trip. (Bug-bootstrap runs land here.)
+    const { featureBranch, ...noBranch } = WF;
+    h.state.freshWorkflow = { id: "wf_1", agentTasks: TASKS({ qa: VERIFIED, ci: VERIFIED }) };
+    await loadWith("enforce");
+    await completeWorkflow({ ...noBranch });
+
+    expect(h.state.githubPaths).toEqual([]);
+    expect(gate.mock.calls[0][2]).toMatchObject({ prHeadSha: null });
     expect(detailsOfType("workflow.complete")).toHaveLength(1);
   });
 

@@ -123,7 +123,7 @@ vi.mock("@/lib/workflow/defs-loader", () => ({
 
 let POST: typeof import("./route").POST;
 
-const SAVED = ["COMPLETION_EVIDENCE_REQUIRED", "TICKET_PROVIDER", "ARTIFACT_BUCKET"] as const;
+const SAVED = ["COMPLETION_EVIDENCE_REQUIRED", "TICKET_PROVIDER", "ARTIFACT_BUCKET", "VERIFIED_HEAD_COMPLETION", "GITHUB_PAT"] as const;
 const saved: Partial<Record<(typeof SAVED)[number], string | undefined>> = {};
 
 async function load() {
@@ -145,6 +145,8 @@ beforeEach(() => {
   // at module load, so it must be set before every load()).
   process.env.ARTIFACT_BUCKET = "test-bucket";
   delete process.env.COMPLETION_EVIDENCE_REQUIRED;
+  delete process.env.VERIFIED_HEAD_COMPLETION;
+  delete process.env.GITHUB_PAT;
 });
 
 afterEach(() => {
@@ -806,5 +808,192 @@ describe("POST complete — completions-record fallback (TEAM-3976)", () => {
     expect(res.status).toBe(200);
     expect(h.state.s3Gets).toEqual([]);
     expect(h.state.updates.length).toBe(1); // only the green completion write
+  });
+});
+
+/**
+ * TEAM-4264 F3 / amendment A2 — the verified-head gate's PR head on this route.
+ *
+ * `heads.pr` used to be the newest done dev ticket's `commitSha`. On a merged run
+ * that commit is a PARENT of the branch head, so QA and CI — which both certified
+ * the merge commit — read as stale and `VERIFIED_HEAD_COMPLETION=enforce` refused a
+ * fully-verified run. The route now asks GitHub for the feature branch head
+ * (`branchHeadSha`, the twin of the orchestrator's `featureBranchHeadSha`), and a
+ * head it cannot resolve is UNKNOWN — the gate then compares the two verifiers to
+ * each other and never manufactures divergence out of a failed lookup.
+ */
+describe("POST complete — verified-head gate: heads.pr is the branch head (TEAM-4264 F3)", () => {
+  const QA_ID = "agentcore_hub_qa_verifier";
+  const CI_ID = "agentcore_hub_ci_agent";
+  const MERGE = "5fa3728" + "a".repeat(33); // the branch head both verifiers tested
+  const PARENT = "6c63c70" + "b".repeat(33); // the dev commit — the old proxy's answer
+  const BRANCH = "feature/TEAM-4264-backend-dev";
+  const REF = `/repos/acme/widgets/git/ref/heads/${encodeURIComponent(BRANCH)}`;
+
+  let realFetch: typeof fetch;
+  let ghPaths: string[];
+
+  /** A merged run: dev landed PARENT, QA and CI both certified the merge commit. */
+  const mergedRun = () => {
+    h.state.def = {};
+    h.state.workflow = {
+      workflowId: "wf_1",
+      phase: "review",
+      workflowDefId: "software-delivery",
+      featureBranch: BRANCH,
+      repoConfig: { repos: [{ url: "https://github.com/acme/widgets", role: "primary" }] },
+      agentTasks: {
+        "T-1": { ticketId: "T-1", output: "implemented", commitSha: PARENT, completedAt: "2026-09-08T01:00:00Z" },
+        "T-2": { ticketId: "T-2", output: "qa report", testedHead: MERGE, completedAt: "2026-09-08T02:00:00Z" },
+        "T-3": { ticketId: "T-3", output: "ci green", testedHead: MERGE, completedAt: "2026-09-08T03:00:00Z" },
+      },
+    };
+    h.state.tickets = [
+      { ticketId: "T-1", type: "task", status: "done", phase: "development", assignee: "agentcore_hub_backend_dev" },
+      { ticketId: "T-2", type: "task", status: "done", phase: "verification", assignee: QA_ID },
+      { ticketId: "T-3", type: "task", status: "done", phase: "review", assignee: CI_ID },
+    ];
+  };
+
+  /** The branch ref, or a 404 when `sha` is null. Nothing else is answered. */
+  const stubGitHub = (sha: string | null) => {
+    ghPaths = [];
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const path = String(input).replace("https://api.github.com", "");
+      ghPaths.push(path);
+      const found = path === REF && Boolean(sha);
+      return {
+        status: found ? 200 : 404,
+        ok: found,
+        json: async () => (found ? { object: { sha } } : { message: "Not Found" }),
+      } as unknown as Response;
+    }) as typeof fetch;
+  };
+
+  beforeEach(() => {
+    realFetch = globalThis.fetch;
+    process.env.VERIFIED_HEAD_COMPLETION = "enforce";
+    process.env.GITHUB_PAT = "gh-test-token";
+    process.env.COMPLETION_EVIDENCE_REQUIRED = "off";
+    mergedRun();
+  });
+
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+  });
+
+  it("a merged PR completes under enforce: the head it reads is the head QA and CI certified", async () => {
+    stubGitHub(MERGE);
+    await load();
+    const res = await post();
+
+    expect(res.status).toBe(200);
+    // One request, on the URL-encoded branch ref — `feature/x` is one ref segment.
+    expect(ghPaths).toEqual([REF]);
+    expect(h.state.updates.length).toBe(1); // the run really closed
+  });
+
+  it("the dev commit is NOT the PR head — the old proxy refused exactly this board", async () => {
+    // Same board, but the gate is handed the parent commit as the branch head (what
+    // the derivation used to produce). That IS divergence, and the route refuses it
+    // — which is what made every merged run stall under enforce.
+    stubGitHub(PARENT);
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    await load();
+    const res = await post();
+
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body).toMatchObject({
+      error: "completion_blocked",
+      reason: "head-divergence",
+      heads: { qa: MERGE, ci: MERGE, pr: PARENT },
+      stalePersonas: [QA_ID, CI_ID],
+    });
+    expect(h.state.updates.length).toBe(0);
+    error.mockRestore();
+  });
+
+  it("an unresolvable head does NOT block: unknown is not divergence", async () => {
+    // The branch was deleted by the merge (404). heads.pr is null, the two verifiers
+    // agree, and the run closes rather than being held on a fact GitHub would not give.
+    stubGitHub(null);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    await load();
+    const res = await post();
+
+    expect(res.status).toBe(200);
+    expect(h.state.updates.length).toBe(1);
+    expect(warn.mock.calls.some((c) => String(c[0]).includes("feature-branch head unresolved"))).toBe(true);
+    warn.mockRestore();
+  });
+
+  it("no GITHUB_PAT: no request at all, still not blocked", async () => {
+    delete process.env.GITHUB_PAT;
+    stubGitHub(MERGE);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    await load();
+    const res = await post();
+
+    expect(res.status).toBe(200);
+    expect(ghPaths).toEqual([]);
+    expect(warn.mock.calls.some((c) => String(c[0]).includes("no GITHUB_PAT"))).toBe(true);
+    warn.mockRestore();
+  });
+
+  it("an unresolvable head still cannot excuse two DISAGREEING verifiers", async () => {
+    // The other direction of "unknown is not divergence": two KNOWN heads that
+    // differ are divergence with or without a PR head, and both verifiers are named.
+    (h.state.workflow.agentTasks as Record<string, { testedHead?: string }>)["T-3"].testedHead = PARENT;
+    stubGitHub(null);
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    await load();
+    const res = await post();
+
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({
+      error: "completion_blocked",
+      reason: "head-divergence",
+      heads: { qa: MERGE, ci: PARENT, pr: null },
+      stalePersonas: [QA_ID, CI_ID],
+    });
+    expect(h.state.updates.length).toBe(0);
+    error.mockRestore();
+    warn.mockRestore();
+  });
+
+  it("an open fix refuses without any GitHub call — open-fix is checked first", async () => {
+    (h.state.tickets as Array<Record<string, unknown>>).push({
+      ticketId: "T-FIX", type: "task", status: "in_progress", phase: "development",
+      assignee: "agentcore_hub_backend_dev", spawnedBy: { kind: "review_fix", gateTicketId: "T-3" },
+    });
+    stubGitHub(MERGE);
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    await load();
+    const res = await post();
+
+    // The open child gate fires first here (it always did); what matters is that
+    // nothing on this path needed the head, so a GitHub outage cannot mask it.
+    expect(res.status).toBe(409);
+    expect(h.state.updates.length).toBe(0);
+    error.mockRestore();
+  });
+
+  it("shadow (the default) observes and completes; off never asks GitHub", async () => {
+    stubGitHub(PARENT); // would be divergence under enforce
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    delete process.env.VERIFIED_HEAD_COMPLETION;
+    await load();
+    expect((await post()).status).toBe(200);
+    expect(warn.mock.calls.some((c) => String(c[0]).includes("would be blocked on head-divergence (shadow)"))).toBe(true);
+
+    h.state.updates.length = 0;
+    stubGitHub(PARENT);
+    process.env.VERIFIED_HEAD_COMPLETION = "off";
+    await load();
+    expect((await post()).status).toBe(200);
+    expect(ghPaths).toEqual([]); // off pays nothing, not even the round trip
+    warn.mockRestore();
   });
 });

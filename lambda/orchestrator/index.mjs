@@ -5294,10 +5294,18 @@ export async function completeWorkflow(workflow) {
       // neither the escalation's target nor a re-verify ticket's parent may depend
       // on which fields the re-read happened to project.
       const gateWorkflow = { ...workflow, agentTasks };
-      // No prHeadSha is passed: heads.pr is the run's own latest recorded dev/fix
-      // commit, derived inside the gate (the PR does not exist yet at this point,
-      // and featureBranchMergeProbe returns merge proof with no head sha).
-      const vh = evaluateVerifiedHeads(children, agentTasks);
+      // heads.pr is the FEATURE BRANCH HEAD, read from GitHub (TEAM-4264 F3).
+      // This used to pass nothing, which made the gate compare the verifiers
+      // against the newest dev `commitSha` — a head that is correct only until
+      // the branch moves. After any merge that proxy is a PARENT of the real
+      // head, so QA and CI heads matching the merge commit read as divergent and
+      // enforce files stale-head re-verifies in a loop. Null (no PAT, branch
+      // deleted post-merge, a 404, a transient) is UNKNOWN, never divergence:
+      // the gate then only compares the two verifiers to each other, and the
+      // open-fix refusal ahead of it needs no GitHub call at all.
+      const vh = evaluateVerifiedHeads(children, agentTasks, {
+        prHeadSha: await featureBranchHeadSha(workflow),
+      });
       if (!vh.ok) {
         await notifyUnverifiedHeadOnce(gateWorkflow, vh, VERIFIED_HEAD_COMPLETION);
         if (VERIFIED_HEAD_COMPLETION === "enforce") {

@@ -610,11 +610,13 @@ export const CI_AGENT_ID = "agentcore_hub_ci_agent";
  * PARITY MIRROR of GATE_PERSONAS in verdict-contract.mjs (same zero-import
  * reason as normalizeHeadSha; the test pins set equality).
  *
- * Used here for ONE purpose: excluding a gate persona's ticket from the PR-head
- * derivation. A gate persona's `commitSha` is the head it INSPECTED, so counting
- * it as the run's current head makes the comparison self-fulfilling — dowtdh's
- * reviewer would have "proved" the head was 933ea6f, which is exactly the head
- * whose staleness the gate exists to catch.
+ * It used to exclude a gate persona's ticket from the PR-head derivation (a gate
+ * persona's `commitSha` is the head it INSPECTED, so counting it made the
+ * comparison self-fulfilling). TEAM-4264 F3 deleted that derivation outright —
+ * heads.pr is the caller's fact or nothing — so this set now has no reader in
+ * this module and stays exported for the parity guard that pins it against
+ * verdict-contract's GATE_PERSONAS. Keeping it is cheaper than re-deriving the
+ * four ids the next time something here needs them.
  */
 export const GATE_PERSONA_IDS = new Set([
   "agentcore_hub_code_reviewer",
@@ -665,12 +667,25 @@ const sameHead = (a, b) => a === b || a.startsWith(b) || b.startsWith(a);
  *   heads.qa   the newest head the QA verifier declared (testedHead)
  *   heads.ci   the newest head the CI agent declared (testedHead, else the
  *              proven-build ci_head_sha it has recorded since TEAM-4122 FR-4)
- *   heads.pr   opts.prHeadSha when the caller knows it, else the newest
- *              `commitSha` recorded by a done NON-GATE ticket — the dev/fix work
- *              that produced the code. Deliberately NOT `mergeCommit`:
- *              mergeCommit is the integration MERGE commit, a different object
- *              from the branch head every gate persona tested, so comparing
- *              against it would report divergence on every merged run.
+ *   heads.pr   `opts.prHeadSha` — the real head of the branch the run is
+ *              shipping, and NOTHING ELSE. Null when the caller could not
+ *              resolve it, and null is UNKNOWN, never divergence.
+ *
+ * heads.pr used to fall back to the newest `commitSha` recorded by a done
+ * NON-GATE ticket when the caller supplied nothing, and every caller supplied
+ * nothing (TEAM-4264 F3). That proxy is a DEV COMMIT, which is the run's head
+ * only until the branch moves: after any merge it is a PARENT of the real head,
+ * so QA and CI heads that match the merge commit exactly read as divergent and
+ * `enforce` files stale-head re-verifies in a loop. This branch's own history is
+ * the proof — 5fa3728 has parents fcb47de + 6c63c70 and the dev persona reported
+ * 6c63c70. Design §3.3 specified `pr: normalizeSha(opts.prHeadSha)`; a derived
+ * head was never in the contract, and a fabricated head is worse than no head
+ * for the same reason a fabricated verdict is (verdict-contract.mjs).
+ *
+ * What this does NOT weaken: two KNOWN heads that disagree are still divergence.
+ * QA at one sha and CI at another is a real disagreement with or without a PR
+ * head, and with no PR head to appeal to, BOTH are reported stale (neither has a
+ * majority). Only the pr↔verifier comparison goes quiet when pr is unknown.
  *
  * "Newest" is by `completedAt`, and a done ticket that declared NO head is
  * skipped rather than treated as erasing the head an earlier round proved: the
@@ -688,7 +703,8 @@ const sameHead = (a, b) => a === b || a.startsWith(b) || b.startsWith(a);
  *
  * @param children    the epic's child tickets (advisory ones included; filtered here)
  * @param agentTasks  the workflow's harvested agentTasks map
- * @param opts        { prHeadSha } — the real PR head when the caller has it
+ * @param opts        { prHeadSha } — the real head of the shipping branch, or
+ *                    nothing at all, in which case heads.pr stays unknown
  * @returns {{ ok: boolean, reason: null|"open-fix"|"head-divergence",
  *             heads: { qa: string|null, ci: string|null, pr: string|null },
  *             offenders: string[], stalePersonas: string[] }}
@@ -703,8 +719,6 @@ export function evaluateVerifiedHeads(children, agentTasks, opts = {}) {
   // was compared even when nothing was wrong.
   const inert = { ok: true, reason: null, heads, offenders: [], stalePersonas: [] };
   if (!Array.isArray(children) || children.length === 0) return inert;
-  // A caller-supplied head wins over any derivation — but only if it IS a head.
-  const prGiven = heads.pr !== null;
 
   const tasks = agentTasks && typeof agentTasks === "object" ? agentTasks : {};
   // agentTasks may be keyed by ticketId (orchestrator) or by task id with a
@@ -716,7 +730,8 @@ export function evaluateVerifiedHeads(children, agentTasks, opts = {}) {
 
   // Newest-wins by completedAt (ISO strings compare lexicographically); a tie or
   // a missing timestamp falls back to board order, so the scan is deterministic.
-  const at = { qa: "", ci: "", pr: "" };
+  // `pr` is not in here: it is the caller's fact, never scanned for.
+  const at = { qa: "", ci: "" };
   const take = (slot, sha, when) => {
     if (!sha || when < at[slot]) return;
     heads[slot] = sha;
@@ -741,11 +756,8 @@ export function evaluateVerifiedHeads(children, agentTasks, opts = {}) {
     } else if (assignee === CI_AGENT_ID) {
       take("ci", headFrom(entry, ["testedHead", "tested_head", "ci_head_sha", "ciHeadSha"]), when);
     }
-    // The run's own head: dev/fix work only, and only when the caller did not
-    // supply the real PR head.
-    if (!prGiven && !GATE_PERSONA_IDS.has(assignee) && !isHuman(assignee)) {
-      take("pr", headFrom(entry, ["commitSha", "commit_sha"]), when);
-    }
+    // NOTHING derives heads.pr (TEAM-4264 F3). A dev ticket's commitSha is the
+    // head that ticket produced, not the head the run is shipping.
   }
 
   if (openFixes.length > 0) {

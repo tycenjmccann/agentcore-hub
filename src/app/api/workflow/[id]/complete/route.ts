@@ -46,6 +46,7 @@ import {
   type HeadTaskLike,
   type HeadTicketLike,
 } from "@/lib/workflow/verified-heads";
+import { branchHeadSha } from "@/lib/workflow/repo-check";
 import agentsConfig from "@/config/agents.json";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
@@ -703,9 +704,31 @@ export async function POST(
     const verifiedHeadMode = normalizeVerifiedHeadMode(process.env.VERIFIED_HEAD_COMPLETION);
     if (verifiedHeadMode !== "off") {
       try {
+        // heads.pr is the FEATURE BRANCH HEAD, read from GitHub (TEAM-4264 F3 /
+        // amendment A2) — the same fact the orchestrator's featureBranchHeadSha
+        // resolves. It used to be derived from the newest dev ticket's commitSha,
+        // which after any merge is a PARENT of the real head, so every merged run
+        // read as divergent. A null head (no PAT, branch deleted post-merge, a
+        // 404, a transient) is UNKNOWN, never divergence: the gate then compares
+        // only the two verifiers to each other, and the open-fix refusal ahead of
+        // it needs no GitHub call at all. This lives inside the gate's own
+        // try/catch, so a GitHub failure cannot 500 a legitimate completion.
+        const repoUrl = ((workflow.repoConfig as { repos?: Array<{ url?: string }> } | undefined)?.repos ?? [])
+          .map((r) => r?.url)
+          .find((u): u is string => Boolean(u));
+        const head = repoUrl
+          ? await branchHeadSha(repoUrl, String(workflow.featureBranch || ""), { token: process.env.GITHUB_PAT })
+          : { probed: false, sha: null, reason: "no repo URL on the run" };
+        if (!head.sha) {
+          console.warn(
+            `[complete] ${workflowId} feature-branch head unresolved (probed=${head.probed}): ${head.reason} — ` +
+              `the verified-head gate treats that as unknown, not divergence`
+          );
+        }
         const vh = evaluateVerifiedHeads(
           tickets as HeadTicketLike[],
-          (workflow.agentTasks as Record<string, HeadTaskLike>) || {}
+          (workflow.agentTasks as Record<string, HeadTaskLike>) || {},
+          { prHeadSha: head.sha }
         );
         if (!vh.ok) {
           if (verifiedHeadMode === "enforce") {

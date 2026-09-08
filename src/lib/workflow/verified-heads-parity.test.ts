@@ -24,8 +24,14 @@ import { normalizeVerdictMode } from "../../../lambda/orchestrator/verdict-contr
  *
  * The table below is not arbitrary: every row is a branch of the predicate that
  * could plausibly be ported wrong (prefix equality, unknown-is-not-divergence,
- * mergeCommit exclusion, the gate-persona exclusion from the PR head, newest-wins,
- * the epic-wide open-fix check, and the advisory label that must NOT excuse a fix).
+ * heads.pr coming ONLY from the caller — TEAM-4264 F3 — newest-wins, the epic-wide
+ * open-fix check, and the advisory label that must NOT excuse a fix).
+ *
+ * TEAM-4264 F3 note on the `opts` column: `heads.pr` is now the caller's
+ * `prHeadSha` and nothing else, so a row that means to exercise a THREE-way
+ * comparison has to say so. A row with no `opts` is the unknown-PR-head shape
+ * (an expired PAT, a branch deleted by the merge), where the gate compares the two
+ * verifiers to each other and refuses only if THEY disagree.
  */
 
 const QA = "agentcore_hub_qa_verifier";
@@ -66,6 +72,8 @@ const CASES: Row[] = [
       "TEAM-4182": task("TEAM-4182", { ci_head_sha: QA_HEAD_DOWTDH, completedAt: "2026-09-06T23:42:09Z" }),
       "TEAM-4183": task("TEAM-4183", { commitSha: PR_HEAD_DOWTDH, completedAt: "2026-09-06T23:46:55Z" }),
     },
+    // The fix landed this head and the branch pointed at it; the caller supplies it.
+    opts: { prHeadSha: PR_HEAD_DOWTDH },
   },
   {
     name: "everything at one head → clean",
@@ -75,6 +83,17 @@ const CASES: Row[] = [
       "T-2": task("T-2", { testedHead: A }),
       "T-3": task("T-3", { commitSha: A }),
     },
+    opts: { prHeadSha: A },
+  },
+  {
+    name: "the merge case (TEAM-4264 F3): QA+CI at the merge commit, dev one parent back",
+    children: [done("T-1", QA), done("T-2", CI), done("T-3", DEV)],
+    tasks: {
+      "T-1": task("T-1", { testedHead: B }),
+      "T-2": task("T-2", { testedHead: B }),
+      "T-3": task("T-3", { commitSha: A }), // the parent — what the old proxy used
+    },
+    opts: { prHeadSha: B },
   },
   {
     name: "prefix equality: short QA head vs full PR head",
@@ -83,11 +102,21 @@ const CASES: Row[] = [
       "T-1": task("T-1", { testedHead: A.slice(0, 7) }),
       "T-3": task("T-3", { commitSha: A }),
     },
+    opts: { prHeadSha: A },
   },
   {
     name: "only one known head → unknown is not divergence",
     children: [done("T-1", QA), done("T-3", DEV)],
     tasks: { "T-1": task("T-1", { testedHead: A }), "T-3": task("T-3", {}) },
+  },
+  {
+    name: "no caller head at all (TEAM-4264 F3): agreeing verifiers still pass",
+    children: [done("T-1", QA), done("T-2", CI), done("T-3", DEV)],
+    tasks: {
+      "T-1": task("T-1", { testedHead: A }),
+      "T-2": task("T-2", { testedHead: A }),
+      "T-3": task("T-3", { commitSha: B }), // ignored: nothing derives heads.pr
+    },
   },
   {
     name: "no heads recorded at all (the pre-4246 shape) → clean",
@@ -106,6 +135,7 @@ const CASES: Row[] = [
       "T-2": task("T-2", { testedHead: A }),
       "T-3": task("T-3", { commitSha: A }),
     },
+    opts: { prHeadSha: A },
   },
   {
     name: "no PR head: two verifiers disagree, both are stale",
@@ -113,7 +143,7 @@ const CASES: Row[] = [
     tasks: { "T-1": task("T-1", { testedHead: A }), "T-2": task("T-2", { testedHead: B }) },
   },
   {
-    name: "mergeCommit is NOT the PR head",
+    name: "neither commitSha nor mergeCommit becomes the PR head (TEAM-4264 F3)",
     children: [done("T-1", QA), done("T-3", DEV)],
     tasks: {
       "T-1": task("T-1", { testedHead: A }),
@@ -121,7 +151,7 @@ const CASES: Row[] = [
     },
   },
   {
-    name: "a gate persona's own commitSha never becomes the PR head",
+    name: "a gate persona's own commitSha never becomes the PR head either",
     children: [done("T-1", QA), done("T-0", REVIEWER)],
     tasks: {
       "T-1": task("T-1", { testedHead: A }),
@@ -136,6 +166,7 @@ const CASES: Row[] = [
       "T-1b": task("T-1b", { testedHead: A, completedAt: "2026-09-06T20:00:00Z" }),
       "T-3": task("T-3", { commitSha: A, completedAt: "2026-09-06T19:00:00Z" }),
     },
+    opts: { prHeadSha: A },
   },
   {
     name: "a later head-less QA round does not erase the proven head",
@@ -145,6 +176,7 @@ const CASES: Row[] = [
       "T-1b": task("T-1b", { completedAt: "2026-09-06T20:00:00Z" }),
       "T-3": task("T-3", { commitSha: A }),
     },
+    opts: { prHeadSha: A },
   },
   {
     name: "an open fix under the epic, in no required phase → open-fix",
@@ -182,16 +214,22 @@ const CASES: Row[] = [
     tasks: { "T-1": task("T-1", { testedHead: B }), "T-3": task("T-3", { commitSha: A }) },
   },
   {
-    name: "a caller-supplied PR head wins over the derivation",
+    name: "the caller-supplied PR head is the only source of heads.pr",
     children: [done("T-1", QA), done("T-3", DEV)],
     tasks: { "T-1": task("T-1", { testedHead: A }), "T-3": task("T-3", { commitSha: A }) },
     opts: { prHeadSha: B },
   },
   {
-    name: "a non-SHA prHeadSha falls back to the derivation",
+    name: "a non-SHA prHeadSha is UNKNOWN, never a fallback to the derivation",
     children: [done("T-1", QA), done("T-3", DEV)],
     tasks: { "T-1": task("T-1", { testedHead: A }), "T-3": task("T-3", { commitSha: A }) },
     opts: { prHeadSha: "HEAD" },
+  },
+  {
+    name: "an explicitly null prHeadSha is the same unknown",
+    children: [done("T-1", QA), done("T-2", CI)],
+    tasks: { "T-1": task("T-1", { testedHead: A }), "T-2": task("T-2", { testedHead: B }) },
+    opts: { prHeadSha: null },
   },
   {
     name: "task entries keyed by task id with a ticketId field",
@@ -200,6 +238,7 @@ const CASES: Row[] = [
       task_a: task("T-1", { testedHead: B }),
       task_b: task("T-3", { commitSha: A }),
     },
+    opts: { prHeadSha: A },
   },
   {
     name: "cancelled fix + done work → clean",
