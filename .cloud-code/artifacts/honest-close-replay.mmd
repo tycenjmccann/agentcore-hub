@@ -1,0 +1,34 @@
+sequenceDiagram
+  autonumber
+  participant WM as WM / intervene.py
+  participant TR as Next.js transition route
+  participant S3 as S3 completions/
+  participant EV as Events table
+  participant OR as orchestrator completeWorkflow
+  participant AN as analyzer watchScan
+  participant GT as Gate ticket (human:operator)
+
+  Note over OR: T0 — all tickets Done, reviewer record missing
+  OR->>OR: missingEvidenceTickets → [TEAM-4237@review]
+  OR->>EV: workflow.completion_blocked
+  OR->>OR: notifyCompletionBlockedOnce → notification {awaitingTriage:true}
+  AN->>AN: parkedOnHuman ignores awaitingTriage → completionBlocked(wf)=true
+  AN->>WM: WATCH <wf> COMPLETION BLOCKED reason=missing_evidence offenders=TEAM-4237@review
+  alt offender already done (resolve path)
+    WM->>TR: mark-done TEAM-4237 --evidence s3://…/review/TEAM-4237/ --source-session <sid>
+    TR->>S3: PutObject completions/TEAM-4237.json IfNoneMatch:* (+evidence, backfilled, markedBy, sourceSession)
+    TR->>EV: agent.complete {backfilled:true, evidence, …}
+    TR->>EV: manager.intervention {action:mark_done, evidence}
+    TR->>OR: ticket transition (re-check)
+    OR->>S3: resolveMissingEvidenceFromRecords → completionRecordHasEvidence(evidence)=true
+    OR->>EV: workflow.evidence_exempted {source:record}
+    OR->>OR: shipVerdict ignores backfilled → deploy-blocked/static-ci-only if ship phase
+    OR->>EV: workflow.handoff_pr_missing (if handoff && prUrl=="")
+    OR->>EV: workflow.complete
+  else offender not resolvable (escalate path)
+    WM->>GT: Tickets___create_ticket "Escalation: completion blocked on TEAM-4237 (missing_evidence)" assignee=human:operator parent=epic
+    WM->>EV: review.needed {ticketId:<gate>, workflowId, reason}
+    WM->>TR: ack awaitingTriage notification
+    Note over GT: humanWaitTotalMs accrues (compute_human_reviews)
+    GT-->>OR: human Dones gate → cascade → completeWorkflow re-evaluates
+  end

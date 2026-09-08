@@ -1,0 +1,34 @@
+sequenceDiagram
+  autonumber
+  participant P as Persona (ci_agent / qa_verifier)
+  participant TT as Tickets Lambda (Tickets___transition_ticket)
+  participant OR as Orchestrator (build-parking.mjs)
+  participant WS as workflow-store (parkedBuilds)
+  participant EB as EventBridge (aws.codebuild)
+  participant RS as reconcile_sweep (1-min)
+  participant CB as CodeBuild / ios gateway
+
+  P->>CB: ios_test(branch, scheme) → build_id
+  P->>TT: transition_ticket(self, "waiting_on_build", awaited_build_id=build_id)
+  TT->>OR: ticket.transition event
+  OR->>WS: parkedBuilds[build_id] = {ticketId, parkedAt, source}
+  OR->>OR: releaseClaimOnSelfPark(reason=agent_park_on_build)
+  Note over P: persona exits — no report_completion, no polling
+  alt same-account project
+    CB->>EB: CodeBuild Build State Change (SUCCEEDED|FAILED|…)
+    EB->>OR: action=codebuild_state {buildId, buildStatus}
+  else external / cross-account (ios-agent-tests)
+    RS->>OR: pollParkedBuilds(): parkedAt > BUILD_PARK_POLL_MINUTES
+    Note over OR: buildStatus="unknown", instruction: poll once, re-park if running
+  end
+  OR->>WS: UpdateItem SET parkedBuilds.#b.wokeAt=:now IF attribute_not_exists(wokeAt)
+  alt claim won
+    OR->>WS: setResumeContext(ticketId, {buildId, buildStatus, …})
+    OR->>TT: transition_ticket(ticketId, "ready")
+    TT->>OR: Ready → existing claim CAS → dispatch
+    OR->>P: invoke with resumeContext
+    P->>CB: ios_build_status(build_id) (one call)
+    P->>P: verdict → report_completion, or park again
+  else duplicate delivery
+    WS-->>OR: ConditionalCheckFailedException → no-op
+  end
