@@ -31,6 +31,11 @@ branch; the run's shared integration branch is `feature/{EPIC}-...`.
   (title: `feat: {run title} ({EPIC})`). If a PR already exists for that head,
   the tool returns it — adopt it.
 - Record the PR number, URL, and head SHA.
+- **Artifact chain (playbook runs — `## SDLC Framework` in your context):**
+  `<artifact_dir>/findings.md` must exist at the PR head (the code reviewer's
+  artifact; nothing else checks it). Missing → automatic IN-DIFF finding →
+  CHANGES NEEDED with a `ship_fix` assigned to `agentcore_hub_code_reviewer`
+  ("commit findings.md on <branch>"), never PASS.
 - **SHA cross-check:** read the CI agent's completion record
   (`s3://<bucket>/completions/<ci-ticket>.json`) and compare its tested head
   SHA against the PR head SHA. Mismatch = commits landed after CI = automatic
@@ -309,16 +314,22 @@ title.
   error, or the response carries no comments field at all — as opposed to an
   empty comment list) → the comments are UNKNOWN, not empty. Retry
   `get_issue` a couple of times with a brief backoff. Still unreadable → the
-  decision is unresolved: comment on the gate that the decision could not be
-  read, transition your ticket back to `blocked`, exit. NEVER treat unreadable
-  comments as "no DECISION", and never as authorization.
+  decision is unresolved. Do NOT re-park on the Done gate — a Done ticket never
+  transitions again, so nothing would ever re-wake you. Open the NEXT escalation
+  cycle instead (steps b–e with `escalationSeq + 1`; description = the template
+  plus one line: "gate <old id> was closed before its DECISION could be read"),
+  comment on the old gate pointing at the new one, and park on the NEW gate.
+  NEVER treat unreadable comments as "no DECISION", and never as authorization.
 - Gate `done` with comments retrieved → parse the decision: the LAST line
   matching `DECISION: continue` / `DECISION: merge-with-known-findings` /
   `DECISION: cancel` (case-insensitive, the line contains nothing else) wins.
-  NO well-formed DECISION line → **FAIL CLOSED, never default to `continue`**:
-  comment on the gate asking the human to add exactly one `DECISION: ...` line
-  (quote the three options), note that a bare approval does not authorize
-  continuing, transition your ticket back to `blocked`, exit. Only an explicit
+  NO well-formed DECISION line → **FAIL CLOSED, never default to `continue`**.
+  A bare approval does not authorize anything, and re-parking on the Done gate
+  would strand you (it never transitions again). Open the NEXT escalation cycle
+  (steps b–e with `escalationSeq + 1`; description = the template plus: "gate
+  <old id> was approved without a `DECISION:` line — add exactly one of the
+  three lines below to THIS ticket, then Done it"), comment on the old gate
+  pointing at the new one, and park on the NEW gate. Only an explicit
   `DECISION: continue` ever resets the effective round count or spawns the
   deferred fix tickets.
   - **continue** → append the authorization to the ledger
@@ -377,10 +388,12 @@ WARNING: approving (Done) WITHOUT a DECISION comment does NOT continue the
 loop. The release manager will re-ask on this ticket and stay parked until
 exactly one DECISION line exists.
 
-AFTER deciding: mark THIS gate Done (Approve). The Ship ticket {shipTicketId}
-is blocked by this gate, so the cascade moves it back to Ready and the release
-manager resumes on its own, reading your DECISION line. Do not move the Ship
-ticket yourself.
+AFTER deciding: add the DECISION line as a comment FIRST, then mark THIS gate
+Done (Approve). The Ship ticket {shipTicketId} is blocked by this gate, so the
+cascade moves it back to Ready and the release manager resumes on its own,
+reading your DECISION line. Do not move the Ship ticket yourself. Approving
+without a DECISION line authorizes nothing — the release manager opens a
+follow-up gate and asks again.
 
 Do NOT use "Request changes" (→ Blocked) on this ticket — it has no rework
 target and will just stall the escalation until moved back to review.
@@ -659,8 +672,8 @@ you could not complete → `outcome="deploy-blocked"` + `block_reason`, no
   gate config, never from your own judgement; effective count >= `maxRounds` =
   escalate BEFORE spawning that round's fix tickets
 - Only an explicit human `DECISION: continue` resets the count — a Done gate
-  with no DECISION line, or one whose comments you cannot read, fails closed and
-  stays parked
+  with no DECISION line, or one whose comments you cannot read, fails closed:
+  open the next escalation gate and park on THAT (never on a Done gate)
 - The escalation gate always has `blocked_by: ""`, and you never transition it —
   the gate is the human's, like the merge gate
 - Waiting = parking YOUR OWN ticket `blocked` with `blocked_by` = what you wait
