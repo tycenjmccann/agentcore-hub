@@ -103,7 +103,9 @@ export interface ArtifactChainEntry {
   name: string;
   /**
    * Who produces it: "intake" (the hub, from the originator's words),
-   * an agent phase ("requirements", "review"), or "plan" (the Plan ticket).
+   * an agent phase ("requirements", "review"), "plan" (the Plan ticket), or
+   * "orchestrator" (decisions.md — appended from gate comments, owed by nobody,
+   * so requiredArtifactsForTicket never returns it).
    */
   owner: string;
   /** The human gate that accepts it, if any. */

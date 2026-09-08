@@ -1,0 +1,68 @@
+{
+  "_fixture": [
+    "The two human gate comments dowtdh SHOULD have carried, HAND-AUTHORED — and the",
+    "fact that they had to be is the defect TEAM-4248 D3 fixes.",
+    "",
+    "dowtdh-dossier.json's tickets carry no `comments` key at all: the product owner's",
+    "words exist nowhere in the run's own record, which is precisely why the decision",
+    "could be lost between spec.md, the design docs and plan.md and only resurface as",
+    "reviewer finding F1 (P1) and fix ticket TEAM-4183.",
+    "",
+    "Every decision string below is verbatim from the reviewer's F1 evidence in",
+    "dowtdh-analysis.json:",
+    "  \"TEAM-4174 Spec Approval resolved Concern 3 as '5000 ms; pause while Undo has",
+    "   focus or hover'; TEAM-4176 Design Approval restated 'paused on focus/hover'.",
+    "   TEAM-4175 design and TEAM-4177 plan recorded 'no focus-pause'; TEAM-4178 Plan",
+    "   Approval approved it\"",
+    "The comment PROSE around those strings (author, wording, the LGTM decoys) is",
+    "reconstructed, not quoted. Gate assignees and ticket ids are from the dossier."
+  ],
+  "gates": [
+    {
+      "gateTicketId": "TEAM-4174",
+      "gateName": "Spec Approval",
+      "assignee": "human:product-owner",
+      "comments": [
+        {
+          "author": "human:product-owner",
+          "timestamp": "2026-09-06T14:12:00.000Z",
+          "content": "Spec reads well. Two things before I approve.\nConcern 3 (Undo auto-dismiss): RESOLVED - 5000 ms window; pause the countdown while Undo has focus or hover.\nConcern 4 (reload inside the window): RESOLVED - accept commit-at-click; the snapshot stays memory-only."
+        },
+        {
+          "author": "human:product-owner",
+          "timestamp": "2026-09-06T14:13:00.000Z",
+          "content": "Approved."
+        }
+      ]
+    },
+    {
+      "gateTicketId": "TEAM-4176",
+      "gateName": "Design Approval",
+      "assignee": "human:product-owner",
+      "comments": [
+        {
+          "author": "human:design-lead",
+          "timestamp": "2026-09-06T14:48:00.000Z",
+          "content": "LGTM on the DOM and the tokens."
+        },
+        {
+          "author": "human:product-owner",
+          "timestamp": "2026-09-06T14:51:00.000Z",
+          "content": "Concern 3: RESOLVED - the countdown stays paused on focus/hover, as I said at Spec Approval. I don't mind how it is implemented but it does not auto-dismiss under someone's cursor."
+        }
+      ]
+    },
+    {
+      "gateTicketId": "TEAM-4178",
+      "gateName": "Plan Approval",
+      "assignee": "human:engineer",
+      "comments": [
+        {
+          "author": "human:engineer",
+          "timestamp": "2026-09-06T15:31:00.000Z",
+          "content": "Plan looks complete. Approved."
+        }
+      ]
+    }
+  ]
+}

@@ -7,14 +7,20 @@
  * the run's shared feature branch, and the next stage starts by reading it:
  *
  *   intent.md          (hub, from the originator's words; product owner accepts)
+ *   decisions.md       (the ORCHESTRATOR, from what humans decide at the gates)
  *   spec.md            (requirements analyst; product owner signs off)
  *   design/<agent>.md  (each design-phase persona; role leads + product owner)
  *   plan.md            (the "Plan:" dev ticket; engineer approves)
  *   findings.md        (code reviewer, diff checked against the plan)
  *
  * Pure helpers only — the orchestrator (index.mjs) owns S3/GitHub/ticket I/O.
- * Same split as cd-registry.mjs so this file is unit-testable in isolation.
+ * Same split as cd-registry.mjs so this file is unit-testable in isolation. The
+ * one import is live-reverify.mjs's `inertOneLine` (TEAM-4248 D3): a gate
+ * decision is a string a human typed that ends up in a prompt, and writing a
+ * second sanitiser would be a second thing to keep correct.
  */
+
+import { inertOneLine } from "./live-reverify.mjs";
 
 export const ARTIFACT_CHAIN_GATE_MODES = new Set(["enforce", "off"]);
 
@@ -119,8 +125,13 @@ export function isPlanTicket(ticket, agentDef) {
  * The `## SDLC Framework` context block every persona on a playbook run sees.
  * Names the chain dir + branch, the whole chain, and — for this ticket — the
  * artifact it owes and the rule the orchestrator enforces.
+ *
+ * `openDecisions` (TEAM-4248 D3) additionally emits `## Gate Decisions (REQUIRED
+ * checklist)` for the two personas that WRITE the artifacts a gate then judges —
+ * design-phase personas and the Plan ticket. Under DECISION_LEDGER=off the
+ * caller passes nothing and the block is not emitted at all.
  */
-export function sdlcFrameworkContext({ def, workflow, ticket, agentDef, intakeAgentId }) {
+export function sdlcFrameworkContext({ def, workflow, ticket, agentDef, intakeAgentId, openDecisions }) {
   const chain = chainFor(def);
   if (!chain) return "";
   const dir = chainDir(def, workflow?.id);
@@ -154,7 +165,24 @@ export function sdlcFrameworkContext({ def, workflow, ticket, agentDef, intakeAg
   } else {
     lines.push(`your_artifact: none — read the chain (${dir}/) before you start; it is the run's source of truth.`);
   }
-  return lines.join("\n") + "\n\n";
+  let block = lines.join("\n") + "\n\n";
+  // Only the artifact AUTHORS a gate judges get the checklist. Handing it to a QA
+  // verifier would be handing another persona's obligation to someone who cannot
+  // discharge it.
+  const checklist = plan || agentDef?.phase === "design" ? openDecisionChecklist(openDecisions) : "";
+  if (checklist) {
+    block +=
+      `## Gate Decisions (REQUIRED checklist)\n` +
+      `A human RESOLVED each line below at a review gate on this run (${dir}/decisions.md is the ledger). ` +
+      `For every line: either implement it and cite its id in your artifact, or add a "## Deviations" row in ` +
+      `your artifact naming the id and why you departed from it. Citing the id is the requirement — you may ` +
+      `disagree with a decision, but you may not leave it unmentioned. An artifact that cites none of these ` +
+      `does not pass its gate; "## Deviations: None yet." with an open line above it is exactly the failure ` +
+      `this checklist exists to prevent.\n` +
+      checklist +
+      "\n\n";
+  }
+  return block;
 }
 
 /**
@@ -185,6 +213,255 @@ export function fallbackReviewPackagePhase(gateTicket) {
 export function artifactRepoPath(def, workflowId, name) {
   const dir = chainDir(def, workflowId);
   return dir ? `${dir}/${name}` : null;
+}
+
+// ---------------------------------------------------------------------------
+// Decision ledger (TEAM-4248 D3)
+//
+// dowtdh is the whole reason this exists. The product owner resolved Concern 3
+// at Spec Approval TEAM-4174 as "5000 ms window; pause the countdown while Undo
+// has focus or hover", and restated it at Design Approval TEAM-4176. The design
+// then recommended the opposite, plan.md TEAM-4177 wrote "Keep fixed 5000 ms; no
+// focus-pause" under "## Deviations: None yet.", and TEAM-4178 (Plan Approval)
+// APPROVED that plan — the engineer's review package never mentioned the
+// contradiction. It surfaced at the very end as reviewer finding F1 P1 and cost
+// a fix ticket. The dossier proves the mechanism: its tickets carry no
+// `comments` array at all, so the human's words exist nowhere in the run's own
+// record. A decision a human paid attention to is strictly weaker than an
+// artifact, so D3 makes it one.
+// ---------------------------------------------------------------------------
+
+export const DECISION_LEDGER_MODES = new Set(["off", "shadow", "enforce"]);
+
+/**
+ * DECISION_LEDGER env → "off" | "shadow" (default) | "enforce".
+ *
+ * Fail-safe direction is deliberately RECORD, not silence: losing a decision is
+ * the danger this feature exists for, so unset AND garbage both land on shadow,
+ * which records the ledger without gating any human. Only an explicit "off"
+ * turns the feature off, and only an explicit "enforce" lets it withhold a gate.
+ *
+ * Not `normalizeReworkLoopMode`: that one maps the legacy truthy strings
+ * ("on"/"true"/"1") to ENFORCE (rework-loop-cap.mjs), and for a flag whose
+ * enforce mode pushes a commit and can reject a human gate, `DECISION_LEDGER=on`
+ * must not silently mean "push".
+ */
+export function normalizeDecisionLedgerMode(raw) {
+  const v = String(raw ?? "").trim().toLowerCase();
+  return v === "off" || v === "enforce" ? v : "shadow";
+}
+
+/**
+ * A numbered decision: "Concern 3 (…): RESOLVED - <text>" or "#3: DECIDED — …".
+ * The concern number is what makes the id stable and citable, so it is the
+ * preferred grammar and the one the blueprints ask humans for.
+ */
+const NUMBERED_DECISION_RE =
+  /^\s*(?:#|Concern\s+)(\d+)\b([^:\n]*):\s*(?:RESOLVED|DECIDED|DECISION)\s*[-–—:]\s*(.+)$/i;
+
+/** An unnumbered decision: "DECISION: <text>" — no concern to anchor to. */
+const UNNUMBERED_DECISION_RE = /^\s*DECISION:\s*(.+)$/i;
+
+/**
+ * Gate-ticket comments → ledger entries. Two grammars only; a comment that
+ * matches neither is NOT a decision — "LGTM", "approved", "thanks" must never
+ * become ledger entries an artifact is then required to cite.
+ *
+ * ids: "<gateTicketId>#<n>" for the numbered grammar (dowtdh's PO comment yields
+ * TEAM-4174#3), "<gateTicketId>#D<seq>" for the unnumbered one, seq being the
+ * 1-based index among unnumbered hits IN THIS COMMENT SET — so a webhook
+ * redelivery of the same comments produces the same ids and appends nothing.
+ *
+ * Every text goes through inertOneLine: the entry ends up in a prompt and in a
+ * committed file, and a newline in a human's comment is how "a decision" becomes
+ * a second instruction line.
+ */
+export function extractGateDecisions(comments, { gateTicketId, gateName, reviewer } = {}) {
+  const out = [];
+  let unnumberedSeq = 0;
+  for (const c of Array.isArray(comments) ? comments : []) {
+    const body = typeof c === "string" ? c : String(c?.content ?? c?.body ?? "");
+    if (!body.trim()) continue;
+    const author = (typeof c === "string" ? "" : String(c?.author || "")) || reviewer || "unknown";
+    const at = typeof c === "string" ? "" : String(c?.timestamp || c?.created || "");
+    // extractAdfText has no hardBreak handling, so a multi-line Jira comment can
+    // arrive already line-joined; splitting still handles the DynamoDB provider
+    // and hand-written comments, and the joined case matches on its first clause.
+    for (const line of body.split(/\r?\n/)) {
+      const numbered = NUMBERED_DECISION_RE.exec(line);
+      if (numbered) {
+        const concern = Number(numbered[1]);
+        out.push({
+          id: `${gateTicketId}#${concern}`,
+          concern,
+          gateTicketId: gateTicketId || null,
+          gateName: gateName || null,
+          reviewer: author,
+          at,
+          text: inertOneLine(numbered[3]),
+          status: "open",
+        });
+        continue;
+      }
+      const unnumbered = UNNUMBERED_DECISION_RE.exec(line);
+      if (unnumbered) {
+        unnumberedSeq += 1;
+        out.push({
+          id: `${gateTicketId}#D${unnumberedSeq}`,
+          concern: null,
+          gateTicketId: gateTicketId || null,
+          gateName: gateName || null,
+          reviewer: author,
+          at,
+          text: inertOneLine(unnumbered[1]),
+          status: "open",
+        });
+      }
+    }
+  }
+  return out;
+}
+
+/** The header a fresh decisions.md opens with (the file is orchestrator-owned). */
+export const DECISIONS_LEDGER_HEADER =
+  `# Gate Decisions\n\n` +
+  `Every decision a human recorded at a review gate on this run, extracted from the gate ticket's ` +
+  `comments by the orchestrator. Do not hand-edit — append happens on each gate resolution.\n\n` +
+  `Downstream artifacts must CITE the id of every open decision they act on, or record a ` +
+  `"## Deviations" row naming the id and the reason for departing from it.\n`;
+
+/** One ledger entry, rendered. Round-trips through parseDecisionsLedger. */
+export function renderDecisionEntry(d) {
+  return (
+    [
+      `### ${d?.id ?? ""}`,
+      `- **id:** ${d?.id ?? ""}`,
+      `- **Gate:** ${d?.gateName || "Review"} (${d?.gateTicketId || "unknown"})`,
+      `- **Concern:** ${d?.concern == null ? "-" : d.concern}`,
+      `- **Reviewer:** ${d?.reviewer || "unknown"}`,
+      `- **At:** ${d?.at || ""}`,
+      `- **Status:** ${d?.status || "open"}`,
+      `- **Decision:** ${d?.text || ""}`,
+    ].join("\n") + "\n"
+  );
+}
+
+const FIELD_RE = (label) => new RegExp(`^- \\*\\*${label}:\\*\\* (.*)$`, "im");
+
+/**
+ * decisions.md → entries. `status` is read back as a real field, not assumed:
+ * a human or a later feature marking an entry resolved must be able to retire it
+ * without the gate check re-firing on it forever.
+ */
+export function parseDecisionsLedger(md) {
+  const text = typeof md === "string" ? md : "";
+  const out = [];
+  for (const block of text.split(/^### /m).slice(1)) {
+    const field = (label) => {
+      const m = FIELD_RE(label).exec(block);
+      return m ? m[1].trim() : "";
+    };
+    const id = field("id") || block.split(/\r?\n/, 1)[0].trim();
+    if (!id) continue;
+    const gate = /^- \*\*Gate:\*\* (.*?)\s*\(([^)]*)\)\s*$/im.exec(block);
+    const concernRaw = field("Concern");
+    out.push({
+      id,
+      concern: concernRaw && concernRaw !== "-" ? Number(concernRaw) : null,
+      gateTicketId: gate ? gate[2] : "",
+      gateName: gate ? gate[1] : "",
+      reviewer: field("Reviewer"),
+      at: field("At"),
+      status: field("Status") || "open",
+      text: field("Decision"),
+    });
+  }
+  return out;
+}
+
+/**
+ * Append entries not already in the ledger. Idempotent BY ID, not by text: a
+ * human editing their own comment changes the prose but resolves the same
+ * concern, and the artifacts downstream cite the id. `added` is what the caller
+ * writes on — added.length === 0 means no GitHub PUT, no S3 write, no event, so
+ * a webhook redelivery costs nothing.
+ */
+export function appendDecisions(existingMd, entries) {
+  const md0 = typeof existingMd === "string" ? existingMd : "";
+  const have = new Set(parseDecisionsLedger(md0).map((d) => d.id));
+  const added = [];
+  for (const e of Array.isArray(entries) ? entries : []) {
+    if (!e?.id || have.has(e.id)) continue;
+    have.add(e.id);
+    added.push(e);
+  }
+  if (!added.length) return { md: md0, added };
+  const base = md0.trim() ? `${md0.replace(/\s*$/, "")}\n` : DECISIONS_LEDGER_HEADER;
+  return { md: `${base}\n${added.map(renderDecisionEntry).join("\n")}`, added };
+}
+
+/**
+ * Open decisions the artifact under review does not cite.
+ *
+ * The rule is a CITATION rule, deliberately, and it is the whole contract. A
+ * decision counts as referenced iff the artifact text contains, case-insensitively,
+ * either
+ *   1. the id token ("TEAM-4174#3"), or
+ *   2. BOTH the gate ticket key ("TEAM-4174") AND a "Concern <n>" / "#<n>" token
+ *      for that decision's concern number.
+ * Nothing else counts — no substring matching on the decision prose, which is
+ * unpredictable for the agent being judged and untestable for us. An unnumbered
+ * ("#D<seq>") decision has no concern number and is referenced only by rule 1.
+ *
+ * Consequence, and it is intended: a "## Deviations" row that names the id is
+ * "referenced" and passes. The contract is "cite the decision and say what you
+ * did with it", NOT "obey it" — a designer who disagrees with the product owner
+ * records the departure and the human sees it at the gate. dowtdh's plan.md fails
+ * this check not because it chose "no focus-pause" but because it cites
+ * TEAM-4174 nowhere at all, under "## Deviations: None yet."
+ *
+ * status !== "open" is never reported: a retired decision is settled.
+ */
+export function unreferencedDecisions(decisions, artifactText) {
+  const text = typeof artifactText === "string" ? artifactText : "";
+  const lower = text.toLowerCase();
+  return (Array.isArray(decisions) ? decisions : []).filter((d) => {
+    if (!d || String(d.status || "open").toLowerCase() !== "open") return false;
+    const id = String(d.id || "");
+    if (id && lower.includes(id.toLowerCase())) return false;
+    const key = String(d.gateTicketId || "");
+    if (!key || d.concern == null) return true;
+    if (!lower.includes(key.toLowerCase())) return true;
+    return !new RegExp(`(?:concern\\s*|#)${Number(d.concern)}\\b`, "i").test(text);
+  });
+}
+
+/**
+ * "Decisions not honoured" bullets for a review package. Each leads with the id
+ * (the token the artifact was supposed to cite) and clamps to 200 chars — the
+ * same per-bullet clamp loadReviewPackage applies to agent bullets, so a long
+ * decision cannot push a package over the wire budget. The remedy is stated once
+ * in the section preamble rather than repeated into every bullet's clamp.
+ */
+export function decisionsNotHonouredBullets(entries) {
+  return (Array.isArray(entries) ? entries : []).map((d) => {
+    const head = `${d?.id || "decision"} not cited — `;
+    return (head + inertOneLine(d?.text, Math.max(20, 200 - head.length))).slice(0, 200);
+  });
+}
+
+/** The `## Gate Decisions (REQUIRED checklist)` body: one `- [ ]` per open decision. */
+export function openDecisionChecklist(entries) {
+  const open = (Array.isArray(entries) ? entries : []).filter(
+    (d) => d?.id && String(d.status || "open").toLowerCase() === "open",
+  );
+  if (!open.length) return "";
+  return open
+    .map((d) => {
+      const gate = d.gateName ? ` (${d.gateName}, ${d.gateTicketId || "?"})` : "";
+      return `- [ ] ${d.id} — ${inertOneLine(d.text, 300)}${gate}`;
+    })
+    .join("\n");
 }
 
 /** The ticket comment + resume note when a chain artifact is missing. */
