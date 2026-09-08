@@ -1,0 +1,283 @@
+TEAM-4251 acceptance item 15 — STEP 2: how do we get a REAL browser onto this UI?
+repo HEAD 5fa3728  ·  branch feature/TEAM-4251-qa-verifier
+
+=== 2.1  What did the TEAM-4249 frontend dev leave behind to verify live? ===
+
+  $ git log --all --oneline | grep -i 4249
+    5fa3728 TEAM-4249: render nothing-to-remove terminal outcome + completion_blocked/skipped events in workflow UI (#429)
+    6c63c70 TEAM-4249: visual verification screenshots
+    58c1a93 TEAM-4249: fix orchestrator-notice reconstruction reading stale setState updater result
+    9a54f32 TEAM-4249: completion_blocked shows heads, skipped shows evidence, notice reconstructed in replay
+    921c44a TEAM-4249: render nothing-to-remove terminal outcome + completion_blocked/skipped events in workflow UI
+    c551198 TEAM-4249: add run-outcome-display helper + tests (nothing-to-remove, orchestrator events)
+
+  $ git show --stat 6c63c70          # "visual verification screenshots"
+    docs/team-4249-completion-blocked.png | Bin 0 -> 126234 bytes
+    docs/team-4249-nothing-to-remove.png  | Bin 0 -> 114918 bytes
+    2 files changed, 0 insertions(+), 0 deletions(-)
+
+  $ git show --stat 5fa3728          # the whole squashed feature
+    docs/team-4249-completion-blocked.png             | Bin
+    docs/team-4249-nothing-to-remove.png              | Bin
+    src/app/workflow/page.tsx                         |  33 +-
+    src/components/workflow/PipelineVisualization.tsx |   8 +
+    src/components/workflow/WorkflowBoard.tsx         | 132 +++++--
+    src/lib/workflow/run-outcome-display.test.ts      | 428 ++++++++++++++++++++++
+    src/lib/workflow/run-outcome-display.ts           | 287 +++++++++++++++
+    7 files changed, 859 insertions(+), 29 deletions(-)
+
+  $ grep -rln "nothing-to-remove" tests/ scripts/ playwright.config.ts
+    (no matches)
+  $ git log --all --diff-filter=D --name-only 921c44a~1..5fa3728
+    (nothing relevant deleted — no probe/fixture was added then removed)
+
+  FINDING: there is NOTHING to reuse. TEAM-4249 shipped 428 lines of pure-module
+  unit tests (run-outcome-display.test.ts) plus TWO HAND-CAPTURED PNGs, and no
+  Playwright spec, fixture, stub, seed script or env-gated data path that puts a
+  nothing-to-remove run in front of a browser. The two PNGs are the only live
+  evidence for the change, and they are not reproducible from the repo.
+  -> Item 15 has to build its own harness. That is itself an acceptance finding
+     (no regression test guards the rendering these screenshots prove).
+
+=== 2.2  The repo's own precedent for the harness ===
+
+  tests/cloud-code-ui.spec.ts:6
+    " * Every backend call is intercepted with page.route, so this runs green against"
+    " * no AWS."
+  ...and 10 further page.route() calls in that one spec.
+
+  So network-level interception with page.route() is the established in-repo way to
+  render a hub UI with no AWS. Item 15 follows it rather than inventing a mechanism.
+
+=== 2.3  Is /workflow server-rendered from DynamoDB? (does interception even work?) ===
+
+  NO — it is a client component and every read is a browser fetch:
+
+  $ grep -n 'fetch(' src/app/workflow/page.tsx
+     74:  const res = await fetch("/api/workflow/list");          <- the run list
+    127:  fetch("/api/workflow/start", ...)                        (POST, intake)
+    182:  fetch("/api/workflow/start", ...)                        (POST, test run)
+    213:  fetch(`/api/workflow/${id}/nudge`,   { method: "POST" })
+    228:  fetch(`/api/workflow/${id}/archive`, { method: "PATCH" })
+    255:  fetch(`/api/workflow/${deleteTargetId}`, { method: "DELETE" })
+
+  $ grep -n 'fetch(\|EventSource(' src/components/workflow/WorkflowBoard.tsx
+    166:  fetch("/api/pipeline/status")                            deploy-gate poll, 20s
+    291:  fetch(`/api/workflow/${id}/cancel`,  POST)
+    316:  fetch(`/api/workflow/${id}/state?t=${ts}`)               initial + 3s poll
+    346:  fetch(`/api/workflow/${id}/agent-output?agentId=...`)    prefetch on complete
+    355:  fetch(`/api/workflow/${id}/events`)                      replay (complete path)
+    369:  fetch(`/api/workflow/${id}/events`)                      catch-up (live path)
+    456:  fetch(`/api/workflow/${id}/tickets`)                     15s poll
+    510:  fetch(`/api/workflow/${id}/agent-output?agentId=...`)    open-panel poll, 3s
+   1101:  fetch(`/api/workflow/${id}/watch`)                       GET manager watch
+   1112:  fetch(`/api/workflow/${id}/watch`,   PUT)
+   1161:  fetch(`/api/workflow/${id}/nudge`,   POST)
+   1752/1801: fetch(`/api/workflow/${id}/agent-output?agentId=...`)
+
+  $ grep -n 'EventSource(' src/components/workflow/useWorkflowStream.ts
+     89:  `/api/workflow/${workflowId}/stream?cursor=${encodeURIComponent(cursor)}`
+     90:  `/api/workflow/${workflowId}/stream`
+     92:  es = new EventSource(url);
+
+  Also reached from the "no run selected" placeholder and the run panels:
+    /api/workflow/performance?days=&defId=      (PerformanceCard.tsx:113)
+    /api/workflow/performance?workflowId=       (RunPerformanceCard.tsx:74)
+    /api/workflow/${id}/analysis                (WorkflowManagerPanel.tsx:100)
+
+  CONCLUSION: page.route() interception is sufficient. NO SSR read of
+  src/lib/workflow/dynamo-read.ts is on the /workflow render path, so nothing in
+  src/ needs to be stubbed, patched or env-gated. Zero source files are modified.
+
+  Two things deliberately NOT stubbed, because they are bundled client-side and are
+  part of what we want to exercise for real:
+    - src/config/workflows.json  -> workflow-defs.ts:18 imports it, so the
+      "dead-code-sweep" def and its Intake/Detect/Sweep/... phase boxes are the
+      REAL ones.
+    - src/lib/workflow/run-outcome-display.ts -> the module under test.
+
+=== 2.4  What shape must the fixture events have? ===
+
+  /api/workflow/[id]/events maps every DDB row through transform-event.ts with
+  { includeEventId: true }; the three orchestrator events are not members of the
+  closed WorkflowEvent union and land on the passthrough:
+
+    src/lib/workflow/transform-event.ts:126-127
+      default:
+        return base({ type: eventType, ...detail, timestamp });
+
+  So the probe serves them pre-transformed: { eventId, type, ...detail, timestamp }
+  — i.e. exactly what the board's reducer and describeOrchestratorEvent() receive
+  in production.
+
+
+=====================================================================
+STEPS 3-5: the live run (dev server on :3111, headless chromium 1440x900)
+=====================================================================
+
+=== TEAM-4251 item 15 — live UI check of TEAM-4249 D2.9 ===
+    base URL: http://localhost:3111   viewport: 1440x900   browser: chromium (headless)
+
+--- 15a  /workflow list
+      ACTIVE section    (1): ["Control run - active feature TEAM-9998 12h ago DEVELOPMENT SDLC STANDARD"]
+      COMPLETED section (1): ["Dead-code sweep - ember TEAM-9999 12h ago NOTHING TO REMOVE DEAD-CODE STANDARD"]
+      ASSERT no-op run is in COMPLETED, not ACTIVE: PASS
+      list badge RENDERED: "NOTHING TO REMOVE"  (span is `uppercase tracking-wider`)
+      list badge DOM text: "Nothing to remove"
+      sky status dot (bg-sky-400/60) present: YES (count=1)
+      -> ui-15a-workflow-list.png
+
+--- 15b  board header for the nothing-to-remove run
+      header innerText : "STANDARD Nothing To Remove"   <- as RENDERED
+      header textContent: "STANDARDNothing to Remove"   <- DOM string
+      (the two differ only in word case: .pipeline-status-header carries
+       text-transform:capitalize at WorkflowBoard.tsx:2130, a pre-existing
+       style that also renders "Deploy Blocked" / "Complete". Not a D2.9 change.)
+      header class     : "pipeline-status-header  noop"
+      ASSERT class carries the no-op tone ("noop"): PASS
+      header computed  : {"color":"rgb(56, 189, 248)","background":"rgba(0, 0, 0, 0)","border":"rgb(229, 231, 235)"}
+      ASSERT page text does NOT contain "In Progress: nothing-to-remove": PASS
+      ASSERT page text does NOT contain "Waiting to start": PASS
+      ASSERT page text does NOT contain "Idle - Waiting to start": PASS
+      ASSERT header DOM text is "Nothing to Remove": PASS
+      finished-run analysis panel rendered: YES (matches=3)
+      active-run Cancel control rendered  : NO (expected: terminal run)
+      -> ui-15b-board-header.png
+
+--- 15c  orchestrator notices (completion_blocked / skipped)
+      NOTE: WorkflowBoard.tsx:660-665 reconstructs the notice as the LAST
+      orchestrator event up to replayIndex, so exactly ONE notice is on
+      screen at a time. Captured at two scrubber positions.
+      [scrub 5/5] rendered notice: "Run skipped — an earlier sweep PR is still open · pr=56 · repo=tycenjmccann/ember"
+      notice label computed style: {"color":"rgb(56, 189, 248)","fontSize":"13px","fontWeight":"600"}
+      -> ui-15c-events.png  (workflow.skipped notice + Nothing to Remove header)
+      [scrub 4/5] rendered notice: "Completion blocked — the head that would ship was never verified by every gate persona · QA 933ea6f · CI 12e9ac6 · PR 001259d"
+      header at 4/5 (phase still closed by e003): "STANDARDNothing to Remove"
+      -> ui-15c2-events-completion-blocked.png  (orchestrator.completion_blocked notice)
+      [scrub 3/5] rendered notice: "Nothing to remove — 0 of 93 candidates verified removable."
+
+--- 15d  requested text assertions vs what the UI actually renders
+      ASSERT completion-blocked line contains all three sha7s ["933ea6f","12e9ac6","001259d"]: PASS
+             rendered: "Completion blocked — the head that would ship was never verified by every gate persona · QA 933ea6f · CI 12e9ac6 · PR 001259d"
+      ASSERT skipped line contains the literal slug "open-sweep-pr": FAIL
+             rendered: "Run skipped — an earlier sweep PR is still open · pr=56 · repo=tycenjmccann/ember"
+             WHY: run-outcome-display.ts:177-180 SKIP_REASONS maps the slug to
+             prose — "open-sweep-pr" -> "an earlier sweep PR is still open" — so the
+             raw slug is by design never shown to a human. The equivalent assertion
+             on the humanised wording is checked next.
+      ASSERT skipped line = "Run skipped - <prose reason> + evidence": PASS
+
+--- 15e  whole-page sweep on a FRESH load of the finished run
+      header (DOM)   : "STANDARDNothing to Remove"
+      notice (DOM)   : "Run skipped — an earlier sweep PR is still open · pr=56 · repo=tycenjmccann/ember"
+      PASS  page does NOT contain 'In Progress: nothing-to-remove'
+      PASS  page does NOT contain 'Waiting to start'
+      PASS  page does NOT contain the raw phase slug 'nothing-to-remove' anywhere
+      PASS  page header DOM text is 'Nothing to Remove'
+      PASS  page contains the list badge (case-insensitive: renders UPPERCASE)
+      PASS  page notice on fresh load is the LAST event (workflow.skipped)
+
+--- 15f  OBSERVATION (not part of the acceptance item): stale notice at the live edge
+      Scrubbing BACKWARD then forward to the last index leaves the notice on the
+      value from the earlier scrub position:
+         after seek 5/5 -> 4/5 -> 3/5 -> 5/5, notice = "Nothing to remove — 0 of 93 candidates verified removable."
+         expected the last event's line = "Run skipped — an earlier sweep PR is still open · pr=56 · repo=tycenjmccann/ember"
+      Cause: WorkflowBoard.tsx:649 `if (!replayMode && atLiveEdge) return;` skips
+      the reconstruction that owns the notice, and seekTo (:704) sets atLiveEdge
+      true at the last index; the live handleEvent path deliberately does not
+      write the notice (:635-640). Fresh load is correct (15e), so this only
+      affects a user who scrubs back and returns. Cosmetic, pre-existing shape.
+
+--- 15g  OBSERVATION: `finished` does not stop the SSE for a no-op close
+      run-outcome-display.ts:59 documents `finished` as "pollers, intervals and
+      the SSE nudge stop". Wiring check: the only consumer of outcome.finished is
+      WorkflowBoard.tsx:1018 `outcome.tone === "complete" && outcome.finished`, so
+      a nothing-to-remove run is never `isComplete`; wasLoadedCompleteRef stays
+      false and the board takes the LIVE path, enabling the EventSource (:970).
+      status pill on the finished no-op run reads: "Reconnecting..."
+      What IS correctly wired for the no-op phase: the tickets poller (:492-497,
+      explicit D2.9 isNoOpPhase guard), the pipeline/deploy-gate poller (:161,
+      via isTerminalPhase) and the /state poller (cleared at :448 on catch-up).
+      So this is the SSE only — and it is pre-existing shape shared with the
+      cancelled / error / deploy-blocked / static-ci-only closes, not new in D2.9.
+
+=== ITEM 15 RESULT: PASS ===
+    One requested assertion is unsatisfiable by design: the literal reason
+    slug "open-sweep-pr" is never rendered — the UI humanises it. Verified on
+    the humanised wording instead, and reported as a spec/UI wording mismatch,
+    not a defect.
+
+--- endpoints intercepted (network layer only; no src/ file stubbed or edited)
+      (fallback) /api/agentcore/region
+      GET /api/pipeline/status
+      GET /api/workflow/list
+      GET /api/workflow/performance
+      GET /api/workflow/wf_qa_noop/analysis
+      GET /api/workflow/wf_qa_noop/events
+      GET /api/workflow/wf_qa_noop/state?t=<ts>
+      GET /api/workflow/wf_qa_noop/stream (SSE)
+      GET /api/workflow/wf_qa_noop/tickets
+      GET /api/workflow/wf_qa_noop/watch
+
+PROBE_EXIT=0
+
+
+=====================================================================
+STEP 5: what each screenshot actually shows (1440x900, light theme)
+=====================================================================
+
+ui-15a-workflow-list.png  —  /workflow, no run selected
+  Left rail: the hub nav (Workflow highlighted blue). Run-history sidebar open.
+  TWO sections, in this order:
+    ACTIVE      (green uppercase heading)
+      "Control run - active feature"  ·  TEAM-9998  ·  12h ago
+      pulsing green Radio icon at the left; green pill "DEVELOPMENT";
+      grey chips "SDLC" + "STANDARD"; amber nudge (zap) icon.
+    COMPLETED   (grey uppercase heading)
+      "Dead-code sweep - ember"  ·  TEAM-9999  ·  12h ago
+      a small SOLID SKY-BLUE DOT (bg-sky-400/60) — deliberately NOT the green
+      "delivered" dot (page.tsx:535-537);
+      sky pill, sky text, sky border: "NOTHING TO REMOVE";
+      an archive icon beside it (same placement as the Cancelled badge).
+  The no-op run is in COMPLETED and carries no green running indicator and no
+  raw phase pill — which is the acceptance point.
+  Main area: the Performance Card ("within bands", 0 runs) and the
+  "Select a workflow or start a new one" placeholder.
+
+ui-15b-board-header.png  —  the board for wf_qa_noop
+  Top page header: "Workflow: Dead-code sweep - ember".
+  A sky-blue notice line spans the top of the board:
+    "Run skipped — an earlier sweep PR is still open · pr=56 · repo=tycenjmccann/ember"
+    (the .review-banner / data-testid="orchestrator-notice" row, #38bdf8, 13px/600).
+  Replay bar: restart button, scrubber at the far right, counter "5 / 5",
+  an amber "Reconnecting..." stream pill (see 15g).
+  Board status header, right of centre, in SKY BLUE (#38bdf8, rgb(56,189,248)):
+    grey "STANDARD" SDLC chip + "Nothing To Remove"
+    — class "pipeline-status-header  noop". It does NOT read
+    "In Progress: nothing-to-remove" and does NOT read "Idle — Waiting to start…".
+  Below: the REAL dead-code-sweep phase boxes from src/config/workflows.json —
+  PHASE 1 Intake, PHASE 2 Detect, PHASE 3 Sweep (1 Runtime Agent, Claude Fable 5.1,
+  37 Tools, Evaluations: Active, agent "Code Sweeper", tools S3 Storage / Jira /
+  AgentCore (Strands) / Claude Code / GitHub (MCP)).
+  The left sidebar shows the selected run highlighted blue, still under COMPLETED.
+
+ui-15c-events.png  —  same board, scrubber at 5 / 5
+  Identical framing to 15b, kept as the dedicated capture of the
+  workflow.skipped notice rendered legibly at the top of the board:
+    "Run skipped — an earlier sweep PR is still open · pr=56 · repo=tycenjmccann/ember"
+
+ui-15c2-events-completion-blocked.png  —  same board, scrubber dragged to 4 / 5
+  The notice line now reads, in the same sky blue:
+    "Completion blocked — the head that would ship was never verified by every
+     gate persona · QA 933ea6f · CI 12e9ac6 · PR 001259d"
+  Replay bar shows counter "4 / 5" and a red "LIVE" jump-to-live button.
+  The board header still reads "Nothing To Remove" in sky blue — the phase was
+  closed by e003 (workflow.nothing_to_remove) which is at/below this index, so
+  scrubbing does not reopen the run.
+
+  WHY TWO FILES FOR THE EVENT LINES: the board renders exactly ONE orchestrator
+  notice at a time — WorkflowBoard.tsx:660-665 reconstructs it as the LAST
+  orchestrator event up to replayIndex. A single frame showing both the
+  completion_blocked and the skipped line is therefore not reachable in this UI;
+  each is captured at the scrub position where it is the live notice. There is no
+  raw event-feed panel anywhere in src/components/workflow/ to show both at once.
