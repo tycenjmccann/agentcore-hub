@@ -299,3 +299,135 @@ describe("report_completion — verified_removable / candidates", () => {
     expect(warn.length).toBeLessThan(300);
   });
 });
+
+/**
+ * submit_ticket_plan — the plan's own dependency graph (TEAM-4248 D3).
+ *
+ * Two defects, one call. (a) `tickets` arrives as a JSON STRING (main.py declares
+ * `tickets: str`), so `tickets.length` has been reporting the character count of
+ * that string since the tool was written — a 4-ticket plan reported ~600. (b)
+ * nothing had ever looked at the graph: c2uqki's sweeper TEAM-4230 was planned
+ * with blocked_by=[] and invoked 92.3s before the analyst it depends on finished.
+ *
+ * The count fix is NOT flag-gated — gating a meaningless number would leave `off`
+ * deliberately wrong — and an unparseable non-empty `tickets` throws in every
+ * mode, because saving [] under a corrected `ticket_count: 0` would silently
+ * erase a plan the analyst believes it filed.
+ */
+
+/** The plan as the analyst submits it: no root entry, first entry unblocked. */
+const C2UQKI_PLAN = [
+  { title: "Sweep tycenjmccann/ember for dead code", assignee: "agentcore_hub_code_sweeper", blockedBy: [] },
+  { title: "Review the sweep", assignee: "agentcore_hub_code_reviewer", blockedBy: ["TEAM-4230"] },
+];
+
+/** A load of the Lambda with TICKET_PLAN_VALIDATOR set — the flag is module-scope. */
+async function loadWithMode(mode) {
+  vi.resetModules();
+  if (mode === undefined) delete process.env.TICKET_PLAN_VALIDATOR;
+  else process.env.TICKET_PLAN_VALIDATOR = mode;
+  return (await import("./index.mjs")).handler;
+}
+
+const submit = (h, args) =>
+  h({ tool_name: "WorkflowOutput___submit_ticket_plan", arguments: { workflow_id: "wf_1", requirements: "req", ...args } });
+
+/** The tool result, parsed out of the MCP content envelope. */
+const resultOf = (r) => JSON.parse(r.content[0].text);
+/** The ticket-plan.json body this call wrote, parsed. */
+const planWritten = () => JSON.parse(h.puts.find((p) => p.Key?.endsWith("/ticket-plan.json")).Body);
+
+describe("submit_ticket_plan — ticket_count", () => {
+  it("counts TICKETS, not the characters of the JSON string main.py sends", async () => {
+    const handler = await loadWithMode("off");
+    const json = JSON.stringify(C2UQKI_PLAN);
+    expect(json.length).toBeGreaterThan(100); // the number it used to report
+    expect(resultOf(await submit(handler, { tickets: json })).ticket_count).toBe(2);
+    // ...and the parsed array is what gets stored, not the string.
+    expect(planWritten().tickets).toEqual(C2UQKI_PLAN);
+  });
+
+  it("counts an array argument the same way (the Lambda is called directly too)", async () => {
+    const handler = await loadWithMode("off");
+    expect(resultOf(await submit(handler, { tickets: C2UQKI_PLAN })).ticket_count).toBe(2);
+  });
+
+  it("throws on an unparseable non-empty tickets in EVERY mode, and saves nothing", async () => {
+    for (const mode of ["off", "shadow", "enforce"]) {
+      const handler = await loadWithMode(mode);
+      h.puts.length = 0;
+      const r = await submit(handler, { tickets: "Ticket 1: sweep the repo" });
+      expect(r.isError, mode).toBe(true);
+      expect(r.content[0].text, mode).toContain("'tickets' must be a JSON array of ticket objects");
+      expect(h.puts.filter((p) => p.Key?.endsWith("/ticket-plan.json")), mode).toHaveLength(0);
+    }
+  });
+
+  it("treats absent/empty tickets as an empty plan, as before", async () => {
+    const handler = await loadWithMode("off");
+    expect(resultOf(await submit(handler, {})).ticket_count).toBe(0);
+    expect(resultOf(await submit(handler, { tickets: "" })).ticket_count).toBe(0);
+  });
+});
+
+describe("submit_ticket_plan — TICKET_PLAN_VALIDATOR", () => {
+  it("off: the result carries no warnings and the plan is saved", async () => {
+    const handler = await loadWithMode("off");
+    const r = resultOf(await submit(handler, { tickets: C2UQKI_PLAN, root_ticket_id: "TEAM-4229" }));
+    expect("warnings" in r).toBe(false);
+    expect(r.status).toBe("saved");
+    expect(Object.keys(r).sort()).toEqual(["location", "message", "status", "ticket_count"]);
+  });
+
+  it("shadow: saves the plan AND names both the offender and the root", async () => {
+    const handler = await loadWithMode("shadow");
+    const r = resultOf(await submit(handler, { tickets: C2UQKI_PLAN, root_ticket_id: "TEAM-4229" }));
+    expect(r.status).toBe("saved");
+    expect(r.warnings).toHaveLength(1);
+    expect(r.warnings[0]).toContain("TEAM-4229");
+    expect(r.warnings[0]).toContain("Sweep tycenjmccann/ember for dead code");
+    expect(planWritten().tickets).toEqual(C2UQKI_PLAN);
+  });
+
+  it("enforce: rejects and writes NO S3 object", async () => {
+    const handler = await loadWithMode("enforce");
+    h.puts.length = 0;
+    const r = await submit(handler, { tickets: C2UQKI_PLAN, root_ticket_id: "TEAM-4229" });
+    expect(r.isError).toBe(true);
+    expect(r.content[0].text).toContain("Ticket plan rejected");
+    expect(r.content[0].text).toContain("TEAM-4229");
+    expect(h.puts.filter((p) => p.Key?.endsWith("/ticket-plan.json"))).toHaveLength(0);
+  });
+
+  it("unset defaults to shadow", async () => {
+    const handler = await loadWithMode(undefined);
+    const r = resultOf(await submit(handler, { tickets: C2UQKI_PLAN, root_ticket_id: "TEAM-4229" }));
+    expect(r.status).toBe("saved");
+    expect(r.warnings).toHaveLength(1);
+  });
+
+  it("an unrecognized mode falls to off, not to enforce", async () => {
+    const handler = await loadWithMode("yes");
+    const r = resultOf(await submit(handler, { tickets: C2UQKI_PLAN, root_ticket_id: "TEAM-4229" }));
+    expect("warnings" in r).toBe(false);
+  });
+
+  it("a correctly chained plan is clean even under enforce", async () => {
+    const handler = await loadWithMode("enforce");
+    const fixed = [
+      { ...C2UQKI_PLAN[0], blockedBy: ["TEAM-4229"] },
+      C2UQKI_PLAN[1],
+    ];
+    const r = resultOf(await submit(handler, { tickets: fixed, root_ticket_id: "TEAM-4229" }));
+    expect(r.status).toBe("saved");
+    expect("warnings" in r).toBe(false);
+  });
+
+  it("fails open once the root is done, so a replay is not rejected", async () => {
+    const handler = await loadWithMode("enforce");
+    const r = resultOf(await submit(handler, {
+      tickets: C2UQKI_PLAN, root_ticket_id: "TEAM-4229", root_status: "done",
+    }));
+    expect(r.status).toBe("saved");
+  });
+});

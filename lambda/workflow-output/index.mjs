@@ -10,6 +10,11 @@ import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { LambdaClient, InvokeCommand } from "@aws-sdk/client-lambda";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, PutCommand } from "@aws-sdk/lib-dynamodb";
+import {
+  normalizeTicketPlanValidatorMode,
+  parseTicketPlanTickets,
+  validateTicketPlan,
+} from "./ticket-plan-validator.mjs";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const s3 = new S3Client({ region: REGION });
@@ -22,6 +27,12 @@ const TICKET_PROVIDER = process.env.TICKET_PROVIDER || "jira";
 const TICKET_TOOLS_LAMBDA = process.env.TICKET_TOOLS_LAMBDA ||
   (TICKET_PROVIDER === "jira" ? "agentcore-hub-jira" : "agentcore-hub-tickets");
 const EVENTS_TABLE = process.env.EVENTS_TABLE || "agentcore-hub-events";
+
+// TEAM-4248 D3 — is the submitted ticket plan a legal dependency graph?
+// `off` = today exactly; `shadow` = the plan is saved and the violations come
+// back on the result; `enforce` = the plan is rejected before anything is
+// written. Unset → shadow, unrecognized → off (see the normalizer).
+const TICKET_PLAN_VALIDATOR = normalizeTicketPlanValidatorMode(process.env.TICKET_PLAN_VALIDATOR);
 
 async function publishJourneyEvent(workflowId, type, detail) {
   if (!EVENTS_TABLE || !workflowId) return;
@@ -39,19 +50,57 @@ async function publishJourneyEvent(workflowId, type, detail) {
   } catch { /* non-fatal */ }
 }
 
-async function submitTicketPlan({ workflow_id, requirements, tickets }) {
+async function submitTicketPlan({ workflow_id, requirements, tickets, root_ticket_id, root_status }) {
+  // main.py declares `tickets: str` and passes a JSON string, so `tickets.length`
+  // has been the CHARACTER COUNT of that string since the tool was written — a
+  // 6-ticket plan reported ticket_count ~380. Parsing first fixes the count for
+  // every mode including `off`: gating a meaningless number behind a flag would
+  // leave `off` deliberately wrong.
+  const parsed = parseTicketPlanTickets(tickets);
+  // Non-empty but not a plan. Saving `[]` under a corrected `ticket_count: 0`
+  // would silently erase a plan the analyst believes it filed, which is a worse
+  // failure than the count bug — so this throws in every mode, `off` included.
+  if (parsed === null) {
+    throw new Error("'tickets' must be a JSON array of ticket objects");
+  }
+
+  // TEAM-4248 D3 — the c2uqki defect: TEAM-4230 was planned with blocked_by=[]
+  // and invoked 92.3s before the requirements analyst it depends on finished.
+  // Enforcement happens BEFORE the S3 write so a rejected plan leaves no
+  // half-authoritative record behind.
+  const warnings = [];
+  if (TICKET_PLAN_VALIDATOR !== "off") {
+    const { violations } = validateTicketPlan(parsed, {
+      rootTicketId: root_ticket_id || null,
+      rootStatus: root_status || null,
+    });
+    for (const v of violations) warnings.push(v.message);
+    if (warnings.length) {
+      if (TICKET_PLAN_VALIDATOR === "enforce") {
+        throw new Error(
+          `Ticket plan rejected — ${warnings.length} violation(s). Fix the plan and call ` +
+          `submit_ticket_plan again:\n${warnings.map((w) => `- ${w}`).join("\n")}`,
+        );
+      }
+      console.warn(`[submit_ticket_plan] ${warnings.length} plan violation(s):\n${warnings.map((w) => `- ${w}`).join("\n")}`);
+    }
+  }
+
   const key = `workflows/${workflow_id}/shared/ticket-plan.json`;
   await s3.send(new PutObjectCommand({
     Bucket: BUCKET,
     Key: key,
-    Body: JSON.stringify({ requirements, tickets }, null, 2),
+    Body: JSON.stringify({ requirements, tickets: parsed }, null, 2),
     ContentType: "application/json",
   }));
   return {
     status: "saved",
     location: `s3://${BUCKET}/${key}`,
-    ticket_count: tickets.length,
-    message: `Ticket plan saved with ${tickets.length} tickets as a record. NEXT: you must call Tickets___create_ticket once per ticket to actually create them under the epic in the ticket system. submit_ticket_plan only persists the plan — it does not create tickets.`,
+    ticket_count: parsed.length,
+    message: `Ticket plan saved with ${parsed.length} tickets as a record. NEXT: you must call Tickets___create_ticket once per ticket to actually create them under the epic in the ticket system. submit_ticket_plan only persists the plan — it does not create tickets.`,
+    // Only present when there is something to say, so a clean plan's result keeps
+    // exactly today's key set.
+    ...(warnings.length ? { warnings } : {}),
   };
 }
 

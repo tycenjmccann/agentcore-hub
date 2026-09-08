@@ -829,3 +829,229 @@ test("labels_add: a rejected PUT surfaces as a bare { error }, and nothing is re
     globalThis.fetch = originalFetch;
   }
 });
+
+// ─── TEAM-4248 D3: create_ticket's unblocked-non-root guard ─────────────────────
+//
+// Production runs THIS Lambda (`deploy/runtime-agent/deploy-one.sh:226` deploys
+// the fleet with TICKET_TOOLS_LAMBDA=agentcore-hub-jira; c2uqki's dossier records
+// ticketProvider: "jira"), so the guard has to hold here or FR-D3.1 is a no-op.
+//
+// c2uqki: TEAM-4230 (code sweeper) was created with blocked_by=[] and invoked at
+// 11:40:37.834Z — 92.3 s BEFORE requirements analyst TEAM-4229 published
+// agent.complete. Nothing rejected it because nothing had ever looked at the
+// graph. The root is found by ROLE (the `agent:` label for the analyst, or a
+// `phase:requirements` stamp), never by "earliest child with no blockers": the
+// hub mints the Intent Acceptance gate first, unblocked, and treating THAT as the
+// root would exempt the first agent ticket after it.
+//
+// TICKET_PLAN_VALIDATOR is snapshotted at module load, so each mode gets its own
+// instance via the cache-busting-specifier trick loadWithMode already uses.
+
+let planSeq = 0;
+async function loadWithPlanMode(mode) {
+  if (mode === undefined) delete process.env.TICKET_PLAN_VALIDATOR;
+  else process.env.TICKET_PLAN_VALIDATOR = mode;
+  // Pinned off so a fix-contract advisory can never be mistaken for a plan one.
+  process.env.FIX_TICKET_CONTRACT = "off";
+  delete process.env.ARTIFACT_BUCKET;
+  return import(`./index.mjs?plan-validator-mode=${mode ?? "unset"}-${planSeq++}`);
+}
+
+const D3_EPIC = "TEAM-4228";
+/** The analyst's own ticket, still open — the root, by its agent: label. */
+const D3_ROOT = {
+  key: "TEAM-4229",
+  fields: {
+    summary: "Analyze dead-code-sweep requirements",
+    status: { name: "In Progress" },
+    labels: ["wf:c2uqki", "agent:agentcore_hub_requirements_analyst", "phase:requirements"],
+    issuetype: { name: "Task" },
+  },
+};
+/** The hub-created Intent Acceptance gate: earliest, unblocked, NOT the root. */
+const D3_GATE = {
+  key: "TEAM-4227",
+  fields: {
+    summary: "Intent Acceptance",
+    status: { name: "In Review" },
+    labels: ["wf:c2uqki", "reviewer:product-owner"],
+    issuetype: { name: "Task" },
+  },
+};
+/**
+ * The offender as create_ticket receives it. c2uqki's real assignee was
+ * `agentcore_hub_code_sweeper`, which exists only in the S3 roster overlay — with
+ * no ARTIFACT_BUCKET this Lambda falls back to the core roster and would reject
+ * it on assignee grounds before reaching the graph check. The check is
+ * role-agnostic, so a core dev persona reproduces it exactly.
+ */
+const D3_SWEEPER = {
+  summary: "Sweep tycenjmccann/ember for dead code",
+  workflow_id: "c2uqki",
+  assignee: "agentcore_hub_backend_dev",
+  parent_key: D3_EPIC,
+};
+
+/**
+ * Route Jira for a create under an epic whose children are `children`. The root
+ * lookup and the dedupe check both hit /search/jql, so they are told apart by the
+ * JQL itself (`parent = <key>` is the root lookup).
+ */
+function captureD3({ children = [], createdKey = "TEAM-4230" } = {}) {
+  const cap = { posts: [], rootSearches: [], dedupeSearches: [], restore: null, fail: false };
+  const originalFetch = globalThis.fetch;
+  cap.restore = () => { globalThis.fetch = originalFetch; };
+  globalThis.fetch = async (url, options = {}) => {
+    const method = options.method || "GET";
+    const u = String(url);
+    if (u.includes("/rest/api/3/search/jql")) {
+      const jql = decodeURIComponent(u.split("jql=")[1].split("&")[0]).replace(/\+/g, " ");
+      if (jql.includes(`parent = ${D3_EPIC}`)) {
+        cap.rootSearches.push(jql);
+        if (cap.fail) return new Response("throttled", { status: 429 });
+        return new Response(JSON.stringify({ issues: children }), { status: 200 });
+      }
+      cap.dedupeSearches.push(jql);
+      return new Response(JSON.stringify({ issues: [] }), { status: 200 });
+    }
+    if (u.endsWith("/rest/api/3/issue") && method === "POST") {
+      cap.posts.push(JSON.parse(options.body).fields);
+      return new Response(JSON.stringify({ key: createdKey }), { status: 201 });
+    }
+    return new Response(JSON.stringify({}), { status: 200 });
+  };
+  return cap;
+}
+
+test("D3 off: no root lookup at all, and the result gains no keys", async () => {
+  const { handler: h } = await loadWithPlanMode("off");
+  const cap = captureD3({ children: [D3_ROOT] });
+  try {
+    const result = await h({ tool_name: "Tickets___create_ticket", parameters: D3_SWEEPER });
+    assert.equal(cap.rootSearches.length, 0, "off must not read the board");
+    assert.equal(cap.posts.length, 1);
+    assert.equal(result.ticketId, "TEAM-4230");
+    assert.ok(!("warning" in result), JSON.stringify(result));
+  } finally {
+    cap.restore();
+  }
+});
+
+test("D3 shadow: the ticket is created and the warning names TEAM-4230 and TEAM-4229", async () => {
+  const { handler: h } = await loadWithPlanMode("shadow");
+  const cap = captureD3({ children: [D3_ROOT] });
+  try {
+    const result = await h({ tool_name: "Tickets___create_ticket", parameters: D3_SWEEPER });
+    assert.equal(cap.posts.length, 1, "shadow files the ticket");
+    assert.equal(result.ticketId, "TEAM-4230");
+    assert.ok(result.warning.includes("TEAM-4229"), result.warning);
+    assert.ok(result.warning.includes(D3_SWEEPER.summary), result.warning);
+    assert.equal(cap.rootSearches.length, 1, "one lookup per invocation, memoised");
+  } finally {
+    cap.restore();
+  }
+});
+
+test("D3 enforce: the create is refused and NOTHING is POSTed to Jira", async () => {
+  const { handler: h } = await loadWithPlanMode("enforce");
+  const cap = captureD3({ children: [D3_ROOT] });
+  try {
+    const result = await h({ tool_name: "Tickets___create_ticket", parameters: D3_SWEEPER });
+    assert.ok(result.error, JSON.stringify(result));
+    assert.ok(result.error.includes("TEAM-4229"), result.error);
+    assert.equal(cap.posts.length, 0, "enforce mints nothing");
+  } finally {
+    cap.restore();
+  }
+});
+
+test("D3: the root is also found by a phase:requirements label alone", async () => {
+  const { handler: h } = await loadWithPlanMode("enforce");
+  const root = {
+    ...D3_ROOT,
+    fields: { ...D3_ROOT.fields, labels: ["wf:c2uqki", "agent:agentcore_hub_backend_designer", "phase:requirements"] },
+  };
+  const cap = captureD3({ children: [root] });
+  try {
+    const result = await h({ tool_name: "Tickets___create_ticket", parameters: D3_SWEEPER });
+    assert.ok(result.error?.includes("TEAM-4229"), JSON.stringify(result));
+  } finally {
+    cap.restore();
+  }
+});
+
+test("D3: an earlier unblocked human gate is NOT mistaken for the root", async () => {
+  const { handler: h } = await loadWithPlanMode("enforce");
+  const cap = captureD3({ children: [D3_GATE, D3_ROOT] });
+  try {
+    const result = await h({ tool_name: "Tickets___create_ticket", parameters: D3_SWEEPER });
+    assert.ok(result.error?.includes("TEAM-4229"), JSON.stringify(result));
+    assert.ok(!result.error.includes("TEAM-4227"), result.error);
+  } finally {
+    cap.restore();
+  }
+});
+
+test("D3: no requirements root under the epic → fail open, silently", async () => {
+  const { handler: h } = await loadWithPlanMode("enforce");
+  const cap = captureD3({ children: [D3_GATE] });
+  try {
+    const result = await h({ tool_name: "Tickets___create_ticket", parameters: D3_SWEEPER });
+    assert.equal(cap.posts.length, 1, "a bug-fix run has no requirements ticket and must still work");
+    assert.ok(!("warning" in result), JSON.stringify(result));
+  } finally {
+    cap.restore();
+  }
+});
+
+test("D3: a Done root fails open, so a late sibling is not rejected", async () => {
+  const { handler: h } = await loadWithPlanMode("enforce");
+  const done = { ...D3_ROOT, fields: { ...D3_ROOT.fields, status: { name: "Done" } } };
+  const cap = captureD3({ children: [done] });
+  try {
+    const result = await h({ tool_name: "Tickets___create_ticket", parameters: D3_SWEEPER });
+    assert.equal(cap.posts.length, 1);
+    assert.ok(!("warning" in result), JSON.stringify(result));
+  } finally {
+    cap.restore();
+  }
+});
+
+test("D3: the root itself, an advisory, rework, a chained ticket and a human gate are exempt", async () => {
+  const { handler: h } = await loadWithPlanMode("enforce");
+  const exempt = [
+    { ...D3_SWEEPER, assignee: "agentcore_hub_requirements_analyst" }, // is the root
+    { ...D3_SWEEPER, phase: "requirements" },                          // is the root, by stamp
+    { ...D3_SWEEPER, labels: ["advisory"] },                           // declined scope
+    { ...D3_SWEEPER, spawned_by: { kind: "qa_fix", qaTicketId: "TEAM-4231" }, phase: "development" },
+    { ...D3_SWEEPER, blocked_by: ["TEAM-4229"] },                      // already chained
+    { ...D3_SWEEPER, assignee: "human:product-owner" },                // hub-created gate
+    { ...D3_SWEEPER, parent_key: undefined },                          // no epic to look under
+  ];
+  for (const params of exempt) {
+    const cap = captureD3({ children: [D3_ROOT] });
+    try {
+      const result = await h({ tool_name: "Tickets___create_ticket", parameters: params });
+      assert.equal(cap.posts.length, 1, `expected a create for ${JSON.stringify(params)}: ${JSON.stringify(result)}`);
+      assert.ok(
+        !(result.warning || "").includes("blocked_by=[]"),
+        `${JSON.stringify(params)} → ${result.warning}`,
+      );
+    } finally {
+      cap.restore();
+    }
+  }
+});
+
+test("D3: a failed board read fails open rather than blocking the run", async () => {
+  const { handler: h } = await loadWithPlanMode("enforce");
+  const cap = captureD3({ children: [D3_ROOT] });
+  cap.fail = true; // Jira 429s the lookup
+  try {
+    const result = await h({ tool_name: "Tickets___create_ticket", parameters: D3_SWEEPER });
+    assert.equal(cap.posts.length, 1, `a throttled lookup must not stop a create: ${JSON.stringify(result)}`);
+    assert.ok(!("warning" in result), JSON.stringify(result));
+  } finally {
+    cap.restore();
+  }
+});

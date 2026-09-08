@@ -42,6 +42,16 @@ import {
   normalizeContractMode,
   sanitizeUserLabels,
 } from "./fix-contract.mjs";
+// TEAM-4248 D3: the ticket-plan contract, on the same footing as fix-contract.mjs
+// above — a zero-import module byte-copied into FOUR zips (this one, the jira
+// Lambda, workflow-output and the orchestrator). CI byte-compares all four
+// (scripts/check-fix-kinds-parity.sh section 1b). Edit one, cp the rest.
+import {
+  isAdvisoryTicket,
+  isRequirementsRoot,
+  normalizeTicketPlanValidatorMode,
+  validateTicketPlan,
+} from "./ticket-plan-validator.mjs";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const TABLE_NAME = process.env.TICKETS_TABLE || "agentcore-hub-tickets";
@@ -205,6 +215,11 @@ export const handler = async (event) => {
 
   // Load roster from S3 on first invocation (cached for warm starts)
   await loadValidAgents();
+  // TEAM-4248 D3: the requirements-root memo is per-INVOCATION. The roster above
+  // is immutable config and is cached across warm starts; a root's STATUS is not
+  // — caching "requirements is still open" into the next invocation would keep
+  // rejecting tickets after the analyst finished.
+  ROOT_CACHE.clear();
 
   // Gateway sends tool name via different field patterns
   let toolName = event._tool_name || event.tool_name || event.name || detectTool(event);
@@ -268,6 +283,88 @@ export const handler = async (event) => {
 // pre-feature behavior); shadow = validate + accept + warn; enforce = reject an
 // incomplete contract. Read once at module load — a mode change is a deploy.
 const FIX_TICKET_CONTRACT = normalizeContractMode(process.env.FIX_TICKET_CONTRACT);
+
+// TEAM-4248 D3: off = no root lookup at all (byte-identical to before);
+// shadow = mint the ticket and hand the caller a `warning`; enforce = refuse
+// before the id counter is touched. Unset → shadow, unrecognized → off.
+const TICKET_PLAN_VALIDATOR = normalizeTicketPlanValidatorMode(process.env.TICKET_PLAN_VALIDATOR);
+
+// ─── TEAM-4248 D3: the run's requirements ROOT ────────────────────────────────
+// Cleared at every handler entry, so a warm container never answers from a cache
+// older than the invocation. Within one invocation create_ticket runs once, so
+// this is at most one extra Query per created ticket — and zero under `off`.
+const ROOT_CACHE = new Map();
+
+/**
+ * The requirements ticket under `parentId`, found by ROLE — the requirements
+ * analyst assignee or a `phase: "requirements"` stamp. NEVER "the earliest child
+ * with no blockers": on a playbook run the hub itself creates the Intent
+ * Acceptance gate before the requirements ticket exists, so the earliest
+ * unblocked child is a human gate, and treating it as the root would exempt the
+ * first agent ticket minted after it — the exact class of mistake D3 exists for.
+ *
+ * Returns null on any failure or when no such child exists, and every caller
+ * reads null as FAIL OPEN: a bug-fix run, an advisory-only epic and the window
+ * before the requirements ticket exists are all legitimate.
+ */
+async function findRequirementsRoot(parentId) {
+  if (!parentId) return null;
+  if (ROOT_CACHE.has(parentId)) return ROOT_CACHE.get(parentId);
+  let root = null;
+  try {
+    const result = await ddb.send(
+      new QueryCommand({
+        TableName: TABLE_NAME,
+        IndexName: "parentId-index",
+        KeyConditionExpression: "parentId = :pid",
+        ExpressionAttributeValues: { ":pid": parentId },
+      })
+    );
+    const children = (result.Items || [])
+      .filter((i) => i.ticketId !== "__COUNTER__")
+      .sort((a, b) => String(a.createdAt || "").localeCompare(String(b.createdAt || "")));
+    const found = children.find(isRequirementsRoot);
+    if (found) root = { ticketId: found.ticketId, status: found.status };
+  } catch (err) {
+    console.warn(`[agentcore-hub-tickets] requirements-root lookup failed for ${parentId} (failing open): ${err.message}`);
+    root = null;
+  }
+  ROOT_CACHE.set(parentId, root);
+  return root;
+}
+
+/**
+ * TEAM-4248 D3 — is this ticket about to be born unblocked while the run's
+ * requirements are still open? Returns the violation message, or null.
+ *
+ * The c2uqki defect: TEAM-4230 (code sweeper) was created with `blocked_by=[]`
+ * and invoked at 11:40:37.834Z, 92.3 s BEFORE the analyst it depends on published
+ * agent.complete. Nothing rejected it, because nothing had ever looked.
+ *
+ * Exempt, in order of how cheap the test is: no epic to look under, already
+ * chained, rework (the fix contract chains those), a human gate (the HUB creates
+ * those, not the analyst), this ticket IS the root, declined scope. Only then is
+ * the root looked up at all. The jira twin reaches the same decisions by the
+ * same order — the hole would just move provider otherwise.
+ */
+async function unblockedNonRootViolation({ parentKey, assignee, blockers, spawnValue, labels, phaseStamp, summary }) {
+  if (TICKET_PLAN_VALIDATOR === "off") return null;
+  if (!parentKey) return null;
+  if (blockers.length) return null;
+  if (spawnValue) return null;
+  if (typeof assignee === "string" && assignee.startsWith("human:")) return null;
+  const candidate = { title: summary, assignee, phase: phaseStamp, labels, blockedBy: [] };
+  if (isRequirementsRoot(candidate)) return null;
+  if (isAdvisoryTicket(candidate)) return null;
+
+  const root = await findRequirementsRoot(parentKey);
+  if (!root?.ticketId) return null; // fail open, silently — see findRequirementsRoot
+  const { violations } = validateTicketPlan([candidate], {
+    rootTicketId: root.ticketId,
+    rootStatus: root.status,
+  });
+  return violations.find((v) => v.code === "unblocked-non-root")?.message || null;
+}
 
 async function createTicket(args) {
   const { summary, project_key, issue_type, description, assignee, priority, parent_key, blocked_by, workflow_id, spawned_by, phase, fix_contract, labels } = args;
@@ -348,10 +445,26 @@ async function createTicket(args) {
     );
   }
 
+  const blockers = Array.isArray(blocked_by) ? blocked_by : blocked_by ? [blocked_by] : [];
+
+  // TEAM-4248 D3: the dependency-chain check, above nextTicketId so `enforce`
+  // mints NOTHING — the ticket id counter is not even touched, the same
+  // discipline the fix-contract rejection above keeps.
+  const planWarning = await unblockedNonRootViolation({
+    parentKey: parent_key,
+    assignee,
+    blockers,
+    spawnValue: spawn.value,
+    labels,
+    phaseStamp,
+    summary,
+  });
+  if (planWarning && TICKET_PLAN_VALIDATOR === "enforce") return textResult(`Error: ${planWarning}`);
+  if (planWarning) console.warn(`[agentcore-hub-tickets] ${planWarning}`);
+
   const ticketId = await nextTicketId(project_key);
   const now = new Date().toISOString();
   const type = (issue_type || "Task").toLowerCase();
-  const blockers = Array.isArray(blocked_by) ? blocked_by : blocked_by ? [blocked_by] : [];
   const status = blockers.length > 0 ? "blocked" : "todo";
 
   // DynamoDB GSI keys cannot be null — omit fields entirely if empty
@@ -392,7 +505,11 @@ async function createTicket(args) {
     // ticket was FILED with an incomplete contract (shadow only — enforce
     // returns an error instead); `droppedLabels` says a label was refused, so
     // an agent isn't left wondering why its own filter finds nothing.
-    ...(contractWarning ? { warning: contractWarning } : {}),
+    // TEAM-4248 D3: a shadow plan violation rides the same field. Both can be
+    // true of one ticket, so they are joined rather than one silently winning.
+    ...(contractWarning || planWarning
+      ? { warning: [contractWarning, planWarning].filter(Boolean).join(" | ") }
+      : {}),
     ...(userLabels.dropped.length > 0 ? { droppedLabels: userLabels.dropped } : {}),
     ticket: {
       key: ticketId,

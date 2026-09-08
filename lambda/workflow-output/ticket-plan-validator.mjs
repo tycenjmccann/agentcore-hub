@@ -150,6 +150,9 @@ export function isAdvisoryTicket(t) {
 
 const REQUIREMENTS_ASSIGNEE = "agentcore_hub_requirements_analyst";
 
+/** A root in one of these states can no longer be raced. See validateTicketPlan. */
+export const TERMINAL_ROOT_STATUSES = new Set(["done", "closed"]);
+
 /** Is this entry the run's requirements ROOT — by role, never by position? */
 export function isRequirementsRoot(t) {
   const assignee = String(t?.assignee || "").trim().toLowerCase();
@@ -237,8 +240,12 @@ export function findBranchTokens(text) {
  *                       neither a known branch nor the harness convention.
  *
  * Fails open on every uncertainty: no root resolvable → no unblocked-non-root
- * violations at all; rootStatus "done" → likewise (the plan is being submitted
- * or replayed after requirements closed, so an unblocked entry is legitimate).
+ * violations at all; a TERMINAL rootStatus → likewise (the plan is being
+ * submitted or replayed after requirements closed, so an unblocked entry is
+ * legitimate). Both providers' terminal names count — the jira Lambda's
+ * mapStatusToInternal and the DynamoDB twin's TRANSITIONS each produce "done"
+ * AND "closed", and reading a closed root as still-open would reject a legal
+ * ticket for the rest of the run.
  */
 export function validateTicketPlan(tickets, opts = {}) {
   const violations = [];
@@ -248,7 +255,7 @@ export function validateTicketPlan(tickets, opts = {}) {
   const { rootTicketId = null, rootStatus = null, knownBranches = [] } = opts;
 
   // ── 1. unblocked-non-root ───────────────────────────────────────────────────
-  const rootDone = String(rootStatus || "").trim().toLowerCase() === "done";
+  const rootDone = TERMINAL_ROOT_STATUSES.has(String(rootStatus || "").trim().toLowerCase());
   const roleRoot = list.find(isRequirementsRoot) || null;
   // Root by ROLE, never by position — see rule 1 in the docblock.
   const rootRef = rootTicketId || (roleRoot ? refOf(roleRoot) : null);

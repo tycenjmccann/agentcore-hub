@@ -25,6 +25,16 @@ import {
   renderFixContractBlock,
   escapeJql,
 } from "./fix-contract.mjs";
+// TEAM-4248 D3: the ticket-plan contract, on the same footing as fix-contract.mjs
+// above — a zero-import module byte-copied into FOUR zips (this one, the
+// DynamoDB tickets Lambda, workflow-output and the orchestrator). CI byte-compares
+// all four (scripts/check-fix-kinds-parity.sh section 1b). Edit one, cp the rest.
+import {
+  isAdvisoryTicket,
+  isRequirementsRoot,
+  normalizeTicketPlanValidatorMode,
+  validateTicketPlan,
+} from "./ticket-plan-validator.mjs";
 
 // ─── Jira Config ─────────────────────────────────────────────────────────────
 
@@ -38,6 +48,10 @@ const PROJECT_KEY = process.env.JIRA_PROJECT_KEY || "TEAM";
 // TEAM-4121 FR-8: off = ignore the contract fields (byte-identical to before);
 // shadow = validate + accept + label `contract:incomplete`; enforce = reject.
 const FIX_TICKET_CONTRACT = normalizeContractMode(process.env.FIX_TICKET_CONTRACT);
+// TEAM-4248 D3: off = no root lookup at all (byte-identical to before);
+// shadow = create the ticket and hand the caller a `warning`; enforce = refuse
+// before anything is created in Jira. Unset → shadow, unrecognized → off.
+const TICKET_PLAN_VALIDATOR = normalizeTicketPlanValidatorMode(process.env.TICKET_PLAN_VALIDATOR);
 
 const BASE_URL = `https://${SITE}`;
 const AUTH = `Basic ${Buffer.from(`${EMAIL}:${TOKEN}`).toString("base64")}`;
@@ -304,6 +318,87 @@ async function listReviewers(params = {}) {
 
 // ─── Tool Implementations ────────────────────────────────────────────────────
 
+// ─── TEAM-4248 D3: the run's requirements ROOT ────────────────────────────────
+// Cleared at every handler entry, so a warm container never answers from a cache
+// older than the invocation. Within one invocation create_ticket runs once, so
+// this is at most one extra Jira search per created ticket — and zero under `off`.
+const ROOT_CACHE = new Map();
+
+/**
+ * The requirements ticket under `parentKey`, found by ROLE — the `agent:` label
+ * for the requirements analyst, or a `phase:requirements` stamp. NEVER "the
+ * earliest child with no blockers": on a playbook run the hub itself creates the
+ * Intent Acceptance gate before the requirements ticket exists, so the earliest
+ * unblocked child is a human gate, and treating it as the root would exempt the
+ * first agent ticket minted after it — the exact class of mistake D3 exists for.
+ *
+ * Returns null on any failure or when no such child exists. Every caller reads
+ * null as FAIL OPEN: a bug-fix run, an advisory-only epic and the window before
+ * the requirements ticket exists are all legitimate.
+ */
+async function findRequirementsRoot(parentKey) {
+  if (!parentKey || !TICKET_KEY_RE.test(String(parentKey))) return null;
+  if (ROOT_CACHE.has(parentKey)) return ROOT_CACHE.get(parentKey);
+  let root = null;
+  try {
+    const data = await jiraSearch(
+      `parent = ${parentKey} ORDER BY created ASC`,
+      ["summary", "status", "labels", "assignee", "issuetype"],
+      100,
+    );
+    for (const issue of data.issues || []) {
+      const mapped = mapIssue(issue);
+      // Jira has no `phase` field; the stamp rides as a `phase:<p>` label.
+      const phaseLabel = (mapped.labels || []).find((l) => String(l).startsWith("phase:"));
+      const candidate = {
+        assignee: mapped.assignee,
+        phase: phaseLabel ? String(phaseLabel).slice("phase:".length) : null,
+      };
+      if (isRequirementsRoot(candidate)) {
+        root = { ticketId: mapped.ticketId, status: mapped.status };
+        break;
+      }
+    }
+  } catch (err) {
+    console.warn(`[jira-tools] requirements-root lookup failed for ${parentKey} (failing open): ${err.message}`);
+    root = null;
+  }
+  ROOT_CACHE.set(parentKey, root);
+  return root;
+}
+
+/**
+ * TEAM-4248 D3 — is this ticket about to be born unblocked while the run's
+ * requirements are still open? Returns the violation message, or null.
+ *
+ * The c2uqki defect: TEAM-4230 (code sweeper) was created with `blocked_by=[]`
+ * and invoked at 11:40:37.834Z, 92.3 s BEFORE the analyst it depends on published
+ * agent.complete. Nothing rejected it, because nothing had ever looked.
+ *
+ * Exempt, in order of how cheap the test is: no epic to look under, already
+ * chained, rework (the fix contract chains those), a human gate (the HUB creates
+ * those, not the analyst), this ticket IS the root, declined scope. Only then is
+ * the root looked up at all.
+ */
+async function unblockedNonRootViolation({ parentKey, assignee, blockers, spawnValue, labels, phaseStamp, summary }) {
+  if (TICKET_PLAN_VALIDATOR === "off") return null;
+  if (!parentKey) return null;
+  if (blockers.length) return null;
+  if (spawnValue) return null;
+  if (typeof assignee === "string" && assignee.startsWith("human:")) return null;
+  const candidate = { title: summary, assignee, phase: phaseStamp, labels, blockedBy: [] };
+  if (isRequirementsRoot(candidate)) return null;
+  if (isAdvisoryTicket(candidate)) return null;
+
+  const root = await findRequirementsRoot(parentKey);
+  if (!root?.ticketId) return null; // fail open, silently — see findRequirementsRoot
+  const { violations } = validateTicketPlan([candidate], {
+    rootTicketId: root.ticketId,
+    rootStatus: root.status,
+  });
+  return violations.find((v) => v.code === "unblocked-non-root")?.message || null;
+}
+
 async function createTicket(params) {
   const { summary, description, parent_key, assignee, issue_type, blocked_by, workflow_id, spawned_by, fix_contract, phase, labels } = params;
 
@@ -361,6 +456,20 @@ async function createTicket(params) {
       `Note: There is NO "agentcore_hub_ios_dev" agent. ALL iOS/SwiftUI/Android/Web development goes to "agentcore_hub_frontend_dev".`
     );
   }
+
+  // TEAM-4248 D3: the dependency-chain check, alongside the other pre-create
+  // validations so `enforce` leaves no partially-wired issue behind.
+  const planWarning = await unblockedNonRootViolation({
+    parentKey: parent_key,
+    assignee,
+    blockers: Array.isArray(blocked_by) ? blocked_by : blocked_by ? [blocked_by] : [],
+    spawnValue: spawn.value,
+    labels,
+    phaseStamp,
+    summary,
+  });
+  if (planWarning && TICKET_PLAN_VALIDATOR === "enforce") throw new Error(planWarning);
+  if (planWarning) console.warn(`[jira-tools] ${planWarning}`);
 
   // ─── Idempotency guard ───────────────────────────────────────────────────
   // create_ticket has no natural idempotency, so any repeat (a model retry, an
@@ -608,7 +717,15 @@ async function createTicket(params) {
   const status = await reconcileBlockersAndStatus(ticketId, blockers, assignee);
 
   console.log(`[jira-tools] Created ${ticketId} in Jira. Status: ${status}`);
-  return { ticketId, status, message: `Created ${ticketId}: ${summary}` };
+  return {
+    ticketId,
+    status,
+    message: `Created ${ticketId}: ${summary}`,
+    // TEAM-4248 D3 shadow: the ticket was filed, and the caller is told what a
+    // future `enforce` would have refused. Same shape as the fix-contract
+    // `warning` the DynamoDB twin returns.
+    ...(planWarning ? { warning: planWarning } : {}),
+  };
 }
 
 // Bring a ticket to its intended blocker-links + initial status. Idempotent:
@@ -1055,6 +1172,11 @@ const TOOLS = {
 export const handler = async (event) => {
   // Load roster from S3 on first invocation (cached for warm starts)
   await loadValidAssignees();
+  // TEAM-4248 D3: the requirements-root memo is per-INVOCATION. The roster above
+  // is immutable config and is cached across warm starts; a root's STATUS is not
+  // — caching "requirements is still open" into the next invocation would keep
+  // rejecting tickets after the analyst finished.
+  ROOT_CACHE.clear();
 
   const toolName = event.tool_name;
   const params = event.parameters || {};
