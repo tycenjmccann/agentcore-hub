@@ -182,6 +182,30 @@ export function nonTerminalAwaitedIds(ticket, siblings) {
 }
 
 /**
+ * PURE. Does `ticket`'s preconditionUnmet stamp already name EVERY id in `ids`?
+ *
+ * TEAM-4290 — the ONE definition of "covered", shared with reconcile-sweep's
+ * handleSpawnedFix so the sweep's bail-out and applyAwaitedEdges' annotate gate can
+ * never disagree about whether a stamp still needs writing. Deliberately reads ONLY
+ * the stamp, never `blockedBy`: the edge is what drives the re-wake, the stamp is
+ * what parkEvidence reads as park evidence, and the whole point of this ticket is
+ * that having the first is not having the second.
+ *
+ * A ticket with no stamp covers nothing; an empty `ids` is vacuously covered (there
+ * is nothing to record).
+ */
+export function stampCoversIds(ticket, ids) {
+  if (!Array.isArray(ids) || !ids.length) return true;
+  const pu = ticket?.preconditionUnmet;
+  if (!pu || !Array.isArray(pu.awaitingIds)) return false;
+  const stamped = new Set();
+  for (const id of pu.awaitingIds) {
+    if (typeof id === "string" && id.trim()) stamped.add(id.trim());
+  }
+  return ids.every((id) => stamped.has(id));
+}
+
+/**
  * PURE. Was this preconditionUnmet stamp written by the claim generation that is
  * under inspection — i.e. is it evidence about THIS session, or a leftover from a
  * previous one?
@@ -309,9 +333,14 @@ export function createAwaitedIds(deps = {}) {
     // that shape will stamp preconditionUnmet for edges that never landed.
     addBlockers,               // (ticketId, ids, { preserveStatusIf, source }) → seam result
     annotatePreconditionUnmet, // (originId, { awaitingIds, source, reportedAt }) — merges ids
-                               // TEAM-4185 F3(b): called ONLY when a write landed.
+                               // TEAM-4185 F3(b) / TEAM-4290: called when a write LANDED,
+                               // or when the edge is already present, nothing failed, and
+                               // the origin carries no stamp covering these ids. NEVER
+                               // called on a covering stamp — that would move reportedAt.
     publishEvent,              // (ticketId, type, detail)
-    getTicket,                 // (ticketId) → ticket row | null
+    getTicket,                 // (ticketId) → ticket row | null. TEAM-4290 — also the
+                               // FALLBACK origin read for the convergence decision, used
+                               // only when the caller supplies no { origin } snapshot.
     store,                     // workflow-store (markAwaitTimeoutEmitted CAS)
     now = () => Date.now(),
     log = (msg) => console.log(`[orchestrator] ${msg}`),
@@ -326,7 +355,11 @@ export function createAwaitedIds(deps = {}) {
 
   function freshMetrics() {
     // TEAM-4185 F5 — `failed` is a first-class outcome, not the absence of one.
-    return { mode, derived: 0, fromTool: 0, written: 0, present: 0, failed: 0, timeouts: 0 };
+    // TEAM-4290 — `stampRepairs` counts the convergence stamps (edge already
+    // present, no covering stamp). Attempted, not confirmed: the annotate is
+    // best-effort and logs awaited.annotate_error on failure — the same semantic
+    // the sweep's derivedBackfills already has.
+    return { mode, derived: 0, fromTool: 0, written: 0, present: 0, failed: 0, stampRepairs: 0, timeouts: 0 };
   }
   let metrics = freshMetrics();
   function newMetrics() {
@@ -373,13 +406,41 @@ export function createAwaitedIds(deps = {}) {
   }
 
   /**
+   * The origin row the stamp decision needs, WITHOUT paying for a read when the
+   * caller already holds it (TEAM-4290).
+   *
+   * Every real caller does hold it — applyAwaitedEdgesForSpawn read it to check the
+   * origin is live, handleSpawnedFix/handleAwaitedChild have the sibling snapshot —
+   * so the repair normally costs ZERO extra reads. The fresh read is the fallback
+   * for a caller that supplies nothing (index.mjs's level-triggered pickup), and it
+   * is reached only on the narrow
+   * `enforce && written === 0 && present > 0 && failed === 0` path.
+   *
+   * A missing/unreadable origin returns null, and the caller then does NOT stamp: a
+   * clock we cannot see is never moved. Never throws.
+   */
+  async function readOriginForStamp(originId, supplied) {
+    if (supplied && typeof supplied === "object") return supplied;
+    if (typeof getTicket !== "function") return null;
+    try {
+      return (await getTicket(originId)) || null;
+    } catch (err) {
+      log(`awaited.origin_read_error — ${originId}: ${err?.message || err}`);
+      return null;
+    }
+  }
+
+  /**
    * Write awaited `ids` as blocker edges on `originId` and stamp its
    * preconditionUnmet (the D2 evidence). off → no-op; shadow → count derivation
-   * metrics + log, ZERO writes; enforce → write via the seam, then annotate IFF a
-   * write actually landed. Returns { written, present, failed, ids }.
+   * metrics + log, ZERO writes; enforce → write via the seam, then annotate when a
+   * write LANDED, or (TEAM-4290) when the edge is already present, nothing failed
+   * and the origin carries no stamp covering these ids. Returns
+   * { written, present, failed, ids }. The optional 4th arg takes an `{ origin }`
+   * snapshot the caller already holds, so the convergence check needs no read.
    *
-   * TEAM-4185 F3(b)/F5 — the annotate is gated on `written > 0`. Two paths used to
-   * re-stamp `reportedAt` for a write that changed nothing:
+   * TEAM-4185 F3(b)/F5 — the annotate used to be gated on `written > 0` alone,
+   * because two paths re-stamped `reportedAt` for a write that changed nothing:
    *   - the level-triggered "tool" pickup re-reporting an edge that is ALREADY on
    *     the board (present). Re-stamping reset the wait clock every sweep, so
    *     awaitedWaitedMs never grew and the D1 wait-SLA could not fire — a ticket
@@ -387,15 +448,20 @@ export function createAwaitedIds(deps = {}) {
    *   - a wholly-FAILED write (F5). Stamping there is worse than useless: it claims
    *     evidence of a park that has no edge behind it, and the D2 evidence guard
    *     reads that phantom stamp as a clean park.
-   * Neither is silent — both are logged with `failed=N` — and the recovery for a
-   * failed derived write is the F4 fix-side sweep backstop (handleSpawnedFix in
-   * reconcile-sweep.mjs), which re-derives the edge from the fix ticket precisely
-   * because no stamp was left behind to find it by.
+   * Neither is silent — both are logged with `failed=N`.
+   *
+   * TEAM-4290 — but that gate was a ONE-SHOT, and the F4 sweep backstop could not
+   * cover for it: when the edge write lands and the annotate then fails, the origin
+   * is left edge-present/stamp-absent and every retry reads
+   * `written === 0, present === N`, so the stamp was skipped FOREVER. `present` now
+   * earns a stamp too, but only when the origin has no stamp covering these ids —
+   * which keeps F3(b) and F5 exactly intact (see the gate below).
    *
    * Never throws: an awaited edge is advisory bookkeeping on the done cascade, so a
-   * seam throw is folded into the normal return as `failed = clean.length`.
+   * seam throw is folded into the normal return as `failed = clean.length`, and a
+   * failed origin read simply declines to stamp without changing the return shape.
    */
-  async function applyAwaitedEdges(originId, ids, source = "tool") {
+  async function applyAwaitedEdges(originId, ids, source = "tool", { origin } = {}) {
     const clean = normalizeIds(originId, ids);
     if (!clean.length) return { skipped: "no-ids" };
 
@@ -433,11 +499,41 @@ export function createAwaitedIds(deps = {}) {
     // this is what the D2 evidence guard reads to tell a clean park from a dead
     // session. Best-effort: a failed stamp must not undo the edge that landed.
     //
-    // TEAM-4185 F3(b) — ONLY when a write landed. `written === 0` means either the
-    // edge was already there (present) or nothing landed at all (failed); in both
-    // cases there is no new fact to record, and re-stamping would move `reportedAt`
-    // forward and reset the wait clock awaitedWaitedMs / checkAwaitTimeout read.
-    if (written > 0) {
+    // TEAM-4185 F3(b) — a write that LANDED earns a stamp, and a `written === 0`
+    // batch used to earn nothing at all. That protected the wait clock (a `present`
+    // re-report every sweep moved `reportedAt` forward, so awaitedWaitedMs never
+    // grew and the D1 wait-SLA could never fire) and it kept a wholly-FAILED write
+    // from manufacturing park evidence for an edge that does not exist (F5).
+    //
+    // TEAM-4290 — but it was a ONE-SHOT gate. When the edge write lands and the
+    // annotate then fails (or the process dies between the two), every later retry
+    // reads `written === 0, present === N` and skips the stamp FOREVER: the sweep
+    // backstop bailed on the edge being present, and parkEvidence answered
+    // `no-stamp`, so the dead-session detector escalated a cleanly parked ticket.
+    // So `present` now also earns a stamp — but ONLY when the origin has no stamp
+    // covering these ids. Three properties keep F3(b)/F5 exactly intact:
+    //   - a covering stamp is NEVER re-annotated, so `reportedAt` never moves and
+    //     awaitedWaitedMs / checkAwaitTimeout keep reading the ORIGINAL instant;
+    //   - `failed === 0` is required, so a batch with any failure still stamps
+    //     nothing (F5 verbatim) — the next retry converges once the failure clears;
+    //   - a PARTIAL stamp merges the missing ids, which is safe because both
+    //     providers keep the earliest `reportedAt` (first-writer-wins:
+    //     agentcore-hub-tickets/index.mjs:993-996, agentcore-hub-jira:1031-1034).
+    // The payload stays the full `clean` list, as on the written path — each
+    // provider filters to the genuinely-new ids itself (jira:1019) and unions the
+    // rest (tickets:970-973), so one payload shape serves both stamp reasons.
+    let stamp = written > 0 ? "written" : "none";
+    if (stamp === "none" && present > 0 && failed === 0) {
+      const snapshot = await readOriginForStamp(originId, origin);
+      // No snapshot → we cannot PROVE the stamp is missing, so we leave it alone
+      // (the sweep retries next pass with its own snapshot).
+      if (snapshot && !stampCoversIds(snapshot, clean)) {
+        stamp = "converge";
+        metrics.stampRepairs++;
+      }
+    }
+
+    if (stamp !== "none") {
       try {
         await annotatePreconditionUnmet?.(originId, {
           awaitingIds: clean,
@@ -453,7 +549,7 @@ export function createAwaitedIds(deps = {}) {
       }
     }
 
-    log(`awaited.apply — origin=${originId} += [${clean.join(", ")}] source=${source} written=${written} present=${present} failed=${failed}`);
+    log(`awaited.apply — origin=${originId} += [${clean.join(", ")}] source=${source} written=${written} present=${present} failed=${failed} stamp=${stamp}`);
     return { written, present, failed, ids: clean };
   }
 
@@ -478,7 +574,12 @@ export function createAwaitedIds(deps = {}) {
     if (!origin) return { skipped: "origin-missing" };
     if (TERMINAL_TICKET_STATUSES.has(origin.status)) return { skipped: "origin-terminal" };
 
-    return applyAwaitedEdges(derived.originId, derived.ids, source);
+    // TEAM-4290 — hand the row we just read to the stamp decision: this is the
+    // create-time derived hook, the path where the edge is written BEFORE the stamp
+    // and so the one that can be left edge-present/unstamped. Reusing this read
+    // means convergence costs ZERO extra I/O here. The snapshot predates the
+    // addBlockers write, which is correct: only annotate writes the stamp.
+    return applyAwaitedEdges(derived.originId, derived.ids, source, { origin });
   }
 
   /**
@@ -559,6 +660,10 @@ export function createAwaitedIds(deps = {}) {
             // TEAM-4185 F5 — a wholly-failed write leaves NO stamp, so this metric
             // is the only signal that a re-wake edge silently did not land.
             { Name: "AwaitedEdgesFailed", Unit: "Count" },
+            // TEAM-4290 — convergence stamps: the edge was already present and the
+            // origin carried no covering stamp. The ONLY signal for the repair on
+            // the index.mjs derived-hook path, which the sweep's counter cannot see.
+            { Name: "AwaitedStampRepairs", Unit: "Count" },
             { Name: "AwaitTimeouts", Unit: "Count" },
           ],
         }],
@@ -569,6 +674,7 @@ export function createAwaitedIds(deps = {}) {
       AwaitedEdgesWritten: m.written || 0,
       AwaitedEdgesPresent: m.present || 0,
       AwaitedEdgesFailed: m.failed || 0,
+      AwaitedStampRepairs: m.stampRepairs || 0,
       AwaitTimeouts: m.timeouts || 0,
     }));
   }
