@@ -65,7 +65,7 @@ const INDEX_KEY = process.env.PERFORMANCE_INDEX_KEY || "performance/index.json";
 const METRIC_NAMESPACE = process.env.METRIC_NAMESPACE || "AgentCoreHub/Performance";
 const PUBLISH_METRICS = (process.env.PUBLISH_CW_METRICS ?? "1") !== "0";
 
-export const REPORT_VERSION = 3;
+export const REPORT_VERSION = 4; // 4: uncached-input pricing (cache tokens no longer double-billed)
 export const BASELINE_DAYS = 28;
 export const BASELINE_MIN = 5;
 const INFRA_WINDOW_DAYS = 30;
@@ -398,6 +398,26 @@ async function buildCard(workflowId, workflow, pricing) {
   };
 }
 
+/**
+ * Whether an engine's `input_tokens` already counts its cache traffic.
+ *
+ * Strands/Bedrock spans (persona) report input_tokens = uncached + cache_read +
+ * cache_write (verified live: total_tokens == input + output, and
+ * input − read − write ≈ 2 per call). Codex/OpenAI `cached_input_tokens` is a
+ * subset of `input_tokens`. Claude Code's api_request event reports only the
+ * uncached remainder. Billing `inp` at the full rate AND adding the cache lines
+ * charged cached tokens at 110% instead of 10% — a ~7x overstatement on
+ * cache-heavy persona runs (REPORT_VERSION 4 corrects every card).
+ */
+const INPUT_INCLUDES_CACHE = { persona: true, codex: true, kiro: true, claude_code: false };
+
+/** Input tokens that Bedrock bills at the full (uncached) rate. */
+export function uncachedInput(engine, inp, read, write) {
+  const cached = read + write;
+  const inclusive = INPUT_INCLUDES_CACHE[engine] ?? (inp >= cached);
+  return inclusive ? Math.max(inp - cached, 0) : inp;
+}
+
 export function addUsage(byAgent, agentId, engine, row, pricing) {
   const rec = (byAgent[agentId] ||= { engines: {} });
   const u = (rec.engines[engine] ||= {
@@ -422,9 +442,13 @@ export function addUsage(byAgent, agentId, engine, row, pricing) {
     const p = pricing.models[model] || pricing.default;
     const discount = pricing.cachedInputDiscount ?? 0.1;
     const writeMult = pricing.cacheWriteMultiplier?.[row.ttl] ?? pricing.cacheWriteMultiplier?.default ?? 1.25;
-    usd = (inp / 1e6) * p.input
+    const uncached = uncachedInput(engine, inp, read, write);
+    // Per-model absolute cache-read rate wins over the fractional default
+    // (fable-5-1 bills cache reads at 2.5% of input, not 10%).
+    const readRate = Number.isFinite(p.cacheReadInput) ? p.cacheReadInput : p.input * discount;
+    usd = (uncached / 1e6) * p.input
       + (outp / 1e6) * p.output
-      + (read / 1e6) * p.input * discount
+      + (read / 1e6) * readRate
       + (write / 1e6) * p.input * writeMult;
   }
   u.usd += usd;

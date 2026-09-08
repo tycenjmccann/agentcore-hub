@@ -38,6 +38,14 @@ describe("modelCost", () => {
   });
 });
 
+describe("modelCost cacheReadInput override", () => {
+  it("bills cache reads at the model's absolute rate when present", () => {
+    const p: Pricing = { ...pricing, models: { f: { input: 11, output: 55, cacheReadInput: 0.275 } } };
+    // 1M read @ 0.275 (not 11 * 0.1 = 1.1); no uncached, no writes, no output.
+    expect(modelCost("f", { input: 1_000_000, cacheRead: 1_000_000 }, p)).toBeCloseTo(0.275, 6);
+  });
+});
+
 describe("summarizeDaily", () => {
   const daily = {
     "2026-08-20": { tokensIn: 999, sessions: 99, byModel: { "claude-opus-4-8": { input: 999, output: 9 } }, evalScores: { Helpfulness: { sum: 99, count: 99 } } },
