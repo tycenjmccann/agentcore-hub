@@ -74,6 +74,16 @@ jobs:
       - name: Deploy-surface manifest guard
         run: ./scripts/check-deploy-surfaces.sh
 
+      # TEAM-4295: the guard above checks that every surface is COVERED by the
+      # manifest; this one checks that each Lambda entry's `files` list is a complete
+      # import closure. That list IS the pipeline's zip manifest (Target 1b runs a
+      # bare `zip -rq $FILES`), so a local import or JSON read outside it ships a
+      # Lambda that dies at cold start — how the analyzer's liveness closure was left
+      # out. Also re-checks the orchestrator's hand-listed zip line. Ran only in
+      # buildspec-ci.yml until now, so GitHub PRs had no coverage at all.
+      - name: Lambda zip manifest + import closure guard
+        run: bash scripts/check-lambda-zip-manifest.sh
+
       - name: Build
         run: npm run build
 

@@ -125,13 +125,23 @@ ENV_VARS="{WORKFLOW_MANAGER_ARN=${WM_ARN},ANALYSES_TABLE=${ANALYSES_TABLE},WORKF
 
 cd "${REPO_ROOT}/lambda/workflow-analyzer" && rm -f function.zip
 # TEAM-4166: the liveness constants are the src/config JSON single source of
-# truth (same TS-imports / Lambda-reads pattern as lease-constants.json). Copy it
-# in beside the module so liveness-constants.mjs resolves its LOCAL ./ candidate
-# in the deployed Lambda; remove the copy after zipping (it is not committed here).
-cp "${REPO_ROOT}/src/config/liveness-constants.json" liveness-constants.json
+# truth, and liveness-constants.mjs resolves its LOCAL ./ candidate first.
+#
+# TEAM-4295: that local JSON is now a COMMITTED byte-identical mirror, not a
+# deploy-time copy. The pipeline's Target 1b zips exactly the `files` list from
+# deploy/pipeline/surfaces.json and has no hook to copy anything in, so the
+# unshipped copy meant the pipeline deployed an analyzer whose import closure was
+# incomplete. This deploy therefore no longer creates the file (a cp/rm pair here
+# would now delete a TRACKED file) — it only refuses to ship a stale mirror.
+# Byte-equality is also asserted in lambda/workflow-analyzer/liveness.test.mjs.
+if ! cmp -s "${REPO_ROOT}/src/config/liveness-constants.json" liveness-constants.json; then
+  echo "FATAL: lambda/workflow-analyzer/liveness-constants.json has drifted from" >&2
+  echo "       src/config/liveness-constants.json (the single source of truth)." >&2
+  echo "       Re-sync it:  cp src/config/liveness-constants.json lambda/workflow-analyzer/" >&2
+  exit 1
+fi
 npm install --omit=dev --no-audit --no-fund --silent
 zip -rq function.zip index.mjs liveness.mjs liveness-constants.mjs liveness-constants.json package.json node_modules/
-rm -f liveness-constants.json
 if aws lambda get-function --function-name "$LAMBDA_NAME" >/dev/null 2>&1; then
   aws lambda update-function-code --function-name "$LAMBDA_NAME" \
     --zip-file fileb://function.zip --output text >/dev/null

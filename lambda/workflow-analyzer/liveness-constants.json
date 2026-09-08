@@ -1,0 +1,7 @@
+{
+  "devMinutes": 45,
+  "verifyMinutes": 20,
+  "shipMinutes": 12,
+  "spanFreshMinutes": 2,
+  "defaultMinutes": 10
+}

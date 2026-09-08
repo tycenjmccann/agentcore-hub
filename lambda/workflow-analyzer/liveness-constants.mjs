@@ -1,12 +1,22 @@
 /**
  * Liveness-clock thresholds — TEAM-4166 D2 (§2.1, §2.5). Lambda mirror.
  *
- * Reads the SAME src/config/liveness-constants.json the TS side imports
- * (src/lib/workflow/liveness-constants.ts), so the numbers can only be changed
- * in one place — the exact lease-constants.mjs precedent. The deploy copies the
- * JSON in beside this module (deploy/workflow-manager/deploy.sh), so the local
- * "./liveness-constants.json" is preferred; the "../../src/config/..." fallback
- * is what resolves in the repo (tests, local runs) where no copy has been made.
+ * The numbers can only be changed in one place: src/config/liveness-constants.json,
+ * which the TS side imports directly (src/lib/workflow/liveness-constants.ts).
+ *
+ * TEAM-4295 — "./liveness-constants.json" beside this module is a COMMITTED
+ * byte-identical mirror of that file, so the local candidate is what resolves both
+ * in the repo and in every deploy. It is committed rather than copied in at deploy
+ * time (the lease-constants.json pattern) because the pipeline zips exactly the
+ * `files` list in deploy/pipeline/surfaces.json — Target 1b has no hook to copy
+ * anything in, so an uncommitted mirror simply never shipped, and this module fell
+ * through to the last-resort literals below in the deployed Lambda. The mirror is
+ * kept honest in three places: a byte-equality assertion in liveness.test.mjs, a
+ * cmp drift check in deploy/workflow-manager/deploy.sh, and the closure guard in
+ * scripts/check-lambda-zip-manifest.sh (which requires surfaces.json to list it).
+ *
+ * The "../../src/config/..." fallback is retained for a tree where the mirror is
+ * absent, and the literals for a zip that somehow carries neither.
  */
 
 import { readFileSync } from "node:fs";
