@@ -475,6 +475,15 @@ export async function POST(
     const response = await lambda.send(command);
 
     if (response.FunctionError) {
+      // TEAM-4282: deliberately NOT reverted. A FunctionError is AMBIGUOUS — the
+      // Lambda can throw after it already applied the DDB/Jira transition (e.g. a
+      // timeout on the way out) — so we cannot tell "did not move" from "moved, then
+      // failed to tell us". Reverting on a guess would recreate the unrecoverable
+      // done-with-no-record state TEAM-4266 exists to fix. An orphan record left on a
+      // still-open ticket is inert (both completion gates only read records for done
+      // tickets) and reportCompletion overwrites it unconditionally regardless. Only
+      // rejectedDetails, a payload-level refusal, is an UNAMBIGUOUS "did not move" —
+      // that is the only path that reverts.
       const errorMessage = response.Payload
         ? Buffer.from(response.Payload).toString()
         : "Unknown error";
@@ -532,6 +541,10 @@ export async function POST(
       ...(wantsEvidenceRecord ? { completionRecordWritten } : {}),
     });
   } catch (err: unknown) {
+    // TEAM-4282: same reasoning as the FunctionError branch above — the invoke
+    // itself throwing (e.g. a network timeout) is AMBIGUOUS about whether the
+    // Lambda applied the transition before we lost the response, so the evidence
+    // record is left as is rather than reverted on a guess.
     const errorMessage = err instanceof Error ? err.message : "Unknown error";
     return NextResponse.json(
       { error: "Lambda invocation failed", details: errorMessage },
