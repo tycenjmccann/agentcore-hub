@@ -10,8 +10,7 @@
 # imports only, followed recursively) starting from the Lambda entrypoints
 # packed in the zip — index.mjs, agent-invoker.mjs, events-writer.mjs — and
 # fails if any module in that closure is missing from the zip manifest line
-# in deploy.sh. model-router.mjs is test-only (no entrypoint imports it) and
-# is correctly excluded from both the closure and the zip.
+# in deploy.sh.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

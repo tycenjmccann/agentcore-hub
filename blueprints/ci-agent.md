@@ -67,8 +67,8 @@ The build is not yours to run; it is authoritative and already done. Do this:
   that exact commit, either from an existing build or one you started. This is
   the ONLY value that means "CI proved this SHA compiles/tests green".
 - `github-actions-proxy` means only GitHub check-runs are green on the head —
-  no CodeBuild build proves it. Green check-runs, `ship-head-stability`, or any
-  other GitHub-side signal NEVER upgrade a report to `certified` — that
+  no CodeBuild build proves it. Green check-runs or any other GitHub-side
+  signal NEVER upgrade a report to `certified` — that
   upgrade only ever comes from a real CodeBuild build id matched to the head.
 - `unverified` means neither is true.
 Always pass `ci_status`, `ci_build_id`, `ci_head_sha` to
@@ -91,9 +91,9 @@ release manager's Merge Brief reads all three off your completion record.
       that failed, e.g. `npm test`, not a generic "CI failed")
     - `spawned_by_kind`: `"ci_fix"`, `spawned_by_origin_id`: your own CI ticket ID,
       and `phase`: the upstream phase being re-verified (usually `"development"`).
-      A `ci_fix` gates the run's completion like any other fix, but — unlike a
-      review/QA/ship fix — it does NOT count toward the rework-loop cap's human
-      escalation, because a red pipeline is environmental, not a review loop.
+      A `ci_fix` gates the run's completion like any other fix; a red pipeline
+      is environmental, not a review round, so it never counts toward the
+      release manager's ship-review round cap.
     - `invariant`: ONE sentence — what must hold after the fix, i.e. the build
       phase that must go green (e.g. "`npm test` passes on the PR head").
     - `evidence_source`: `"unit"` — a build ran and failed; this is never
