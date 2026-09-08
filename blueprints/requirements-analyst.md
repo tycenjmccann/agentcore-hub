@@ -236,3 +236,8 @@ a full duplicate set of tickets that wedges the whole run:
   verified (Step 2b) BEFORE tickets are written, and the verified endpoint/auth/
   secret/model/schema facts + source URLs are embedded in every relevant ticket.
   No authoritative reference → the ticket is BLOCKED, not guessed.
+- Never plan a ticket that adds logic or an env flag to `lambda/orchestrator/`
+  (DL-009: the orchestrator is cascade/dispatch/claim/reaper/completion only).
+  A stall, loop or missed hand-off is a blueprint fix — the agent parks itself
+  with `Tickets___transition_ticket(blocked_by=…)` or files a ticket — or a
+  `Tickets___*` / `WorkflowOutput___*` tool change. Write the ticket that way.

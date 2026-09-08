@@ -1,0 +1,39 @@
+# Non-test modules permitted in lambda/orchestrator/ (scripts/check-orchestrator-surface.sh).
+# DL-009: cascade / dispatch / claim / reaper / completion only. Adding a name here
+# needs a DL entry in docs/workflow-pipeline-architecture.md in the same PR.
+
+# entrypoints (one zip → three Lambdas)
+index.mjs
+agent-invoker.mjs
+events-writer.mjs
+
+# core: routing, cascade, claims, reapers, completion, effective def
+cascade.mjs
+workflow-store.mjs
+lease.mjs
+dead-session-detector.mjs
+reconcile-sweep.mjs
+sweep-scan.mjs
+completion.mjs
+cd-registry.mjs
+pipeline-enabled.mjs
+artifact-chain.mjs
+watchdog.mjs
+event-id.mjs
+repo-check.mjs
+fix-contract.mjs
+gate-state.mjs
+review-cap.mjs
+ship-review.mjs
+dead-session-escalation.mjs
+ticket-blockers.mjs
+
+# dark in prod, scheduled for deletion (cleanup PR 2 — remove these lines with the files)
+ci-check.mjs
+live-reverify.mjs
+merge-on-green.mjs
+model-router.mjs
+rework-loop-cap.mjs
+ship-dispatch-gate.mjs
+ship-head-stability.mjs
+sync-main.mjs

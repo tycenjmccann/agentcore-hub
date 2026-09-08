@@ -44,6 +44,11 @@ Bucket every finding/recommendation in the batch:
 - **System-level** (yours): orchestrator dispatch/recovery, gate placement and
   convergence, workflow-def phase design, runtime/harness infra (timeouts,
   silent deaths, artifact handoffs), intake scoping. These become the PRD.
+  Orchestrator deliverables are limited to dispatch / cascade / claim / reaper
+  / completion *correctness* (DL-009). Everything about what happens next —
+  who waits on whom, re-verification, branch sync, loop caps — is an agent
+  blueprint or ticket-tool change (DL-011), even when the symptom is a stall.
+  Never ask for a new orchestrator module or `*_MODE` flag.
 
 Rank by leverage: recurrence across runs × wall-clock or rework cost, citing
 analysisIds + metric values. 2-4 deliverables max — a PRD with 10 asks
