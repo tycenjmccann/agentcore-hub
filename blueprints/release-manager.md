@@ -241,9 +241,16 @@ missing = empty state, round 1):
      - `sibling_scope`: the other components this fix must NOT touch (or
        `"none"`) — grouping only stays additive if each dev honours its bounds.
 
-     Record the fix-ticket keys in the round entry, write the ledger, and put your
-     own ticket back to `in_progress` — you re-review after the fixes merge to the
-     shared branch, starting again from Step 1's SHA cross-check.
+     Record the fix-ticket keys in the round entry, write the ledger, and exit
+     WITHOUT `report_completion` — and do NOT touch your own ticket's status.
+     The orchestrator parks your Ship ticket `Blocked` on the fix tickets you
+     just filed (and on the CI re-certification ticket queued behind them) the
+     moment they dispatch, and moves it back to Ready when the last one is Done;
+     you are then re-invoked and re-review after the fixes merge to the shared
+     branch, starting again from Step 1's SHA cross-check. Never set your ticket
+     back to `in_progress`: an in_progress ticket with no live session is what
+     the dead-session sweep treats as a crash — it will retry you, exhaust, and
+     hold the run for a human.
    - **CHANGES NEEDED, effective count >= `maxRounds` — ESCALATE. Do NOT spawn
      this round's fix tickets.** The loop stops here; leave the round's
      `fixTickets` empty, then:

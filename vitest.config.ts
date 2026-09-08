@@ -48,6 +48,9 @@ export default defineConfig({
       // artifact-chain.mjs — the playbook's committed-artifact chain (pure
       // helpers: owed artifacts per ticket, context block, gate overrides).
       "lambda/orchestrator/artifact-chain.test.mjs",
+      // ship-fix-park.mjs — a dispatched ship_fix parks the Ship ticket Blocked on
+      // the run's open ship fixes (DI: stub board, no AWS).
+      "lambda/orchestrator/ship-fix-park.test.mjs",
       // watchdog.mjs mirrors the TS watchdog resolver (TEAM-3618 D1.1) — pure
       // config resolution, unit-testable via setWatchdogSource().
       "lambda/orchestrator/watchdog.test.mjs",

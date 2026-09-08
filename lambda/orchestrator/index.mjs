@@ -50,6 +50,7 @@ import { createShipHeadGate, createGitHubShipHeadProbe } from "./ship-head-stabi
 import { shouldGateShipDispatch, normalizeShipDispatchMode, emitShipDispatchMetrics } from "./ship-dispatch-gate.mjs";
 import { createReworkLoopCap, normalizeReworkLoopMode } from "./rework-loop-cap.mjs";
 import { createLiveReverify, normalizeLiveReverifyMode } from "./live-reverify.mjs";
+import { createShipFixPark, normalizeShipFixParkMode } from "./ship-fix-park.mjs";
 import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, SHIP_PHASES, SHIP_BLOCKED_OUTCOMES, TERMINAL_WORKFLOW_PHASES, FIX_KINDS, REWORK_FIX_KINDS, normalizeAdvisoryRoutingMode, isAdvisoryTicket, nonAdvisory } from "./completion.mjs";
 import { isPipelineEnabled } from "./pipeline-enabled.mjs";
 import { CD_REGISTRY_KEY, EMPTY_CD_REGISTRY, parseCdRegistry, isCdRegistered, effectiveWorkflowDef, resolveDelivery, deliveryModeContext } from "./cd-registry.mjs";
@@ -850,6 +851,41 @@ async function observeReworkLoop(workflow, ticket) {
   } catch (err) {
     console.warn(`[orchestrator] rework-loop observe failed (non-fatal): ${err?.message || err}`);
   }
+}
+
+// ─── Ship-review parking (release-manager wait protocol) ─────────────────────
+// A dispatched `ship_fix` parks the Ship ticket it answers to Blocked on the
+// run's open ship fixes and releases the release manager's stale claim, so the
+// unblock cascade — not a human, not the dead-session sweep — brings the
+// release manager back for the next round. Default ON; SHIP_FIX_PARK=off is
+// the kill switch. See ship-fix-park.mjs for the failure it closes.
+const SHIP_FIX_PARK = normalizeShipFixParkMode(process.env.SHIP_FIX_PARK);
+let _shipFixPark = null;
+function getShipFixPark() {
+  if (_shipFixPark) return _shipFixPark;
+  _shipFixPark = createShipFixPark({
+    mode: SHIP_FIX_PARK,
+    getChildTickets,
+    addBlockers,
+    // Same release the artifact-chain re-open uses: claimInvocation's CAS admits
+    // any status other than "running", so the cascade's Ready can claim again.
+    releaseClaim: (workflowId, ticketId) => store.setTaskStatus(workflowId, ticketId, "blocked"),
+    publishEvent,
+    getAgentPhase: (a) => getAgentDef(a)?.phase,
+    isHumanAssignee,
+    log: console,
+  });
+  return _shipFixPark;
+}
+
+/**
+ * Park the reviewer behind a just-claimed fix ticket. Called from BOTH Ready
+ * handlers right after the claim succeeds. Cheap + non-fatal: returns before
+ * any I/O for a non-ship_fix ticket, and the module itself never throws.
+ */
+async function parkReviewerOnFixDispatch(workflow, fixTicket) {
+  if (SHIP_FIX_PARK === "off" || !workflow || fixTicket?.spawnedBy?.kind !== "ship_fix") return;
+  await getShipFixPark().onFixReady({ workflow, fixTicket });
 }
 
 // ─── Live-evidence re-verification (TEAM-4121 FR-9) ──────────────────────────
@@ -3360,6 +3396,10 @@ async function handleTicketReadyUnified(ticketId, ticket) {
     }
   }
 
+  // A ship_fix dispatching = the release manager is waiting on it: park its
+  // Ship ticket Blocked on the run's open ship fixes (ship-fix-park.mjs).
+  await parkReviewerOnFixDispatch(workflow, ticket);
+
   // Initialize manifest if needed
   try { await initManifestIfNeeded(workflow); } catch (err) {
     console.warn(`[orchestrator] Manifest init failed (non-fatal): ${err.message}`);
@@ -3809,6 +3849,16 @@ async function handleTicketReady(ticketId, image) {
     }
     throw err; // unexpected error — re-throw
   }
+
+  // Same ship-review parking as the Jira path (ship-fix-park.mjs).
+  await parkReviewerOnFixDispatch(workflow, {
+    ticketId,
+    parentId,
+    assignee,
+    spawnedBy: unwrapDdbValue(image.spawnedBy),
+    phase: unwrapDdbValue(image.phase),
+    blockedBy: unwrapDdbValue(image.blockedBy) || [],
+  });
 
   // Ensure manifest exists (initializes on first agent invocation)
   try { await initManifestIfNeeded(workflow); } catch (err) {
