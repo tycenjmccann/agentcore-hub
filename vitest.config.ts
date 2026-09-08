@@ -454,6 +454,15 @@ export default defineConfig({
       // untouched, and enforce is the only mode in which the rewritten description
       // reaches the model.
       "lambda/orchestrator/branch-context.test.mjs",
+      // decision-ledger (TEAM-4248 D3) — the ledger's I/O half through the REAL
+      // index.mjs: record on gate approval, surface in the review package, withhold
+      // the gate under enforce, and the open-decision checklist in context.
+      // artifact-chain.test.mjs pins the grammar; only these cases can pin the
+      // COSTS — that off touches neither GitHub nor S3, that a webhook redelivery
+      // performs zero PUTs, and that a withheld gate records no cycle. dowtdh's
+      // TEAM-4178 approved a plan contradicting the product owner's own Concern-3
+      // decision because nothing in the package said so.
+      "lambda/orchestrator/decision-ledger.test.mjs",
     ],
     // Keep unit tests away from the Playwright specs under tests/.
     exclude: ["tests/**", "node_modules/**", "demo/**"],
