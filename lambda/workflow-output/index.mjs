@@ -135,7 +135,14 @@ const EVIDENCE_KINDS = ["static", "unit", "live"];
 const CI_STATUSES = ["certified", "github-actions-proxy", "unverified"];
 const CI_FIELD_MAX_LEN = 128;
 
-async function reportCompletion({ ticket_id, summary, artifacts = "", branch, commit_sha, pr_url, workflow_id, agent_id, evidence_kind, evidence_keys, ci_status, ci_build_id, ci_head_sha }) {
+// DL-024 / ship verdict — the release manager's CD ticket reports how the run
+// ended. The orchestrator's completion evidence harvest already reads these
+// three keys from the record (completion.mjs SHIP_BLOCKED_OUTCOMES); this is the
+// writer side. Same drop-rather-than-store rule as CI_STATUSES.
+const SHIP_OUTCOMES = ["shipped", "deploy-blocked", "static-ci-only", "handoff"];
+const BLOCK_REASON_MAX_LEN = 500;
+
+async function reportCompletion({ ticket_id, summary, artifacts = "", branch, commit_sha, pr_url, workflow_id, agent_id, evidence_kind, evidence_keys, ci_status, ci_build_id, ci_head_sha, merge_commit, outcome, block_reason }) {
   const key = `completions/${ticket_id}.json`;
   const report = {
     ticket_id,
@@ -168,6 +175,18 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   const headSha = typeof ci_head_sha === "string" ? ci_head_sha.trim() : "";
   if (headSha && headSha.length <= CI_FIELD_MAX_LEN) report.ci_head_sha = headSha;
   else if (headSha) console.warn(`[report_completion] dropping oversized ci_head_sha (${headSha.length} chars)`);
+
+  // DL-024 ship verdict: additive-only, closed vocabulary.
+  const mergeCommit = typeof merge_commit === "string" ? merge_commit.trim() : "";
+  if (mergeCommit && mergeCommit.length <= CI_FIELD_MAX_LEN) report.merge_commit = mergeCommit;
+  else if (mergeCommit) console.warn(`[report_completion] dropping oversized merge_commit (${mergeCommit.length} chars)`);
+  const shipOutcome = typeof outcome === "string" ? outcome.trim().toLowerCase() : "";
+  if (shipOutcome) {
+    if (SHIP_OUTCOMES.includes(shipOutcome)) report.outcome = shipOutcome;
+    else console.warn(`[report_completion] dropping unknown outcome "${shipOutcome}" (expected ${SHIP_OUTCOMES.join("|")})`);
+  }
+  const blockReason = typeof block_reason === "string" ? block_reason.trim() : "";
+  if (blockReason) report.block_reason = blockReason.slice(0, BLOCK_REASON_MAX_LEN);
 
   await s3.send(new PutObjectCommand({
     Bucket: BUCKET,

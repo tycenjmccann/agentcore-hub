@@ -1579,17 +1579,34 @@ def Tickets___create_ticket(title: str, description: str, parent_id: str = "", a
 
 
 @tool
-def Tickets___transition_ticket(ticket_id: str, transition_id: str, reason: str = "") -> str:
+def Tickets___transition_ticket(ticket_id: str, transition_id: str, reason: str = "", blocked_by: str = "") -> str:
     """Transition a ticket to a new status (e.g., done, skip, blocked).
+
+    To WAIT on work you just filed (fix tickets, a CI re-certification, an
+    escalation gate), park YOUR OWN ticket: transition_id="blocked" with
+    blocked_by = those ticket IDs, then exit WITHOUT report_completion. The
+    orchestrator releases your invocation claim, and when the last blocker is
+    Done the cascade moves your ticket back to Ready and you are re-invoked.
+    Never leave your ticket in_progress with no live session (the dead-session
+    sweep reads that as a crash), and never mark it done while you still have
+    open findings.
 
     Args:
         ticket_id: The ticket ID to transition
         transition_id: Target status (done, skip, blocked, in_progress, todo)
-        reason: Reason for the transition
+        reason: Reason for the transition (posted as a comment)
+        blocked_by: comma-separated ticket IDs to ADD as blockers of this ticket
+            (additive — existing blockers are kept). Meaningful with
+            transition_id="blocked"; the cascade re-Readies the ticket once every
+            listed blocker is Done.
     """
-    return _invoke_lambda(TICKET_TOOLS_LAMBDA, "Tickets___transition_ticket", {
-        "ticket_id": ticket_id, "transition_id": transition_id, "reason": reason
-    })
+    payload = {"ticket_id": ticket_id, "transition_id": transition_id, "reason": reason}
+    # DL-024: sent only when supplied, so a call without it is byte-identical to
+    # before (both ticket Lambdas treat absent as "no blocker change").
+    blockers = [b.strip() for b in blocked_by.split(",") if b.strip()] if blocked_by else []
+    if blockers:
+        payload["blocked_by"] = blockers
+    return _invoke_lambda(TICKET_TOOLS_LAMBDA, "Tickets___transition_ticket", payload)
 
 
 @tool
@@ -1819,7 +1836,7 @@ def Pipeline___capabilities() -> str:
 # ─── Workflow Output Tools ────────────────────────────────────────────────────
 
 @tool
-def WorkflowOutput___report_completion(ticket_id: str, summary: str, artifacts: str = "", branch: str = "", commit_sha: str = "", pr_url: str = "", evidence_kind: str = "", evidence_keys: str = "", ci_status: str = "", ci_build_id: str = "", ci_head_sha: str = "") -> str:
+def WorkflowOutput___report_completion(ticket_id: str, summary: str, artifacts: str = "", branch: str = "", commit_sha: str = "", pr_url: str = "", evidence_kind: str = "", evidence_keys: str = "", ci_status: str = "", ci_build_id: str = "", ci_head_sha: str = "", merge_commit: str = "", outcome: str = "", block_reason: str = "") -> str:
     """Report that your work is complete. This saves your completion summary to S3 AND automatically transitions your Jira ticket to Done. Do NOT call Tickets___transition_ticket to mark your own ticket done — this tool handles that for you.
 
     Args:
@@ -1845,6 +1862,14 @@ def WorkflowOutput___report_completion(ticket_id: str, summary: str, artifacts: 
             means neither.
         ci_build_id: the CodeBuild build id backing ci_status="certified".
         ci_head_sha: the exact head SHA that build id was proven against.
+        merge_commit: release manager, CD ticket only — the merge commit SHA now
+            on the default branch. Together with outcome="shipped" this IS the
+            ship verdict the completion gate reads; never set it for a merge you
+            did not confirm.
+        outcome: ship-phase tickets only — "shipped" | "deploy-blocked" |
+            "static-ci-only" | "handoff". Anything else is dropped by the Lambda.
+        block_reason: one line on why the outcome is not "shipped" (required with
+            "deploy-blocked").
     """
     # Include workflow_id and agent_id from invocation context for journey logging (not exposed to agent)
     payload = {
@@ -1868,6 +1893,15 @@ def WorkflowOutput___report_completion(ticket_id: str, summary: str, artifacts: 
         payload["ci_build_id"] = ci_build_id.strip()
     if ci_head_sha.strip():
         payload["ci_head_sha"] = ci_head_sha.strip()
+    # DL-024 / ship verdict: same additive rule — the orchestrator's completion
+    # evidence harvest already reads merge_commit / outcome / block_reason from
+    # the record; only the tool and the Lambda lacked the fields.
+    if merge_commit.strip():
+        payload["merge_commit"] = merge_commit.strip()
+    if outcome.strip():
+        payload["outcome"] = outcome.strip().lower()
+    if block_reason.strip():
+        payload["block_reason"] = block_reason.strip()
     return _invoke_lambda(WORKFLOW_OUTPUT_LAMBDA, "WorkflowOutput___report_completion", payload)
 
 

@@ -620,7 +620,12 @@ async function createTicket(params) {
 //     premature "Ready" webhook before dependencies are done)
 //   - no blockers + has assignee → transition to "Ready" (tells orchestrator to
 //     invoke)
-async function reconcileBlockersAndStatus(ticketId, blockers, assignee) {
+// One "Blocks" issue link per blocker key (blocker → ticket). Additive: Jira
+// keeps a single link per (type, pair), so re-linking an existing blocker is a
+// logged 4xx, never a duplicate and never fatal. Shared by create_ticket
+// (creation-time blockers) and transition_ticket's blocked_by (DL-024 agent
+// self-park).
+async function linkBlockers(ticketId, blockers) {
   for (const blockerKey of blockers) {
     try {
       await jiraFetch("/rest/api/3/issueLink", {
@@ -635,6 +640,10 @@ async function reconcileBlockersAndStatus(ticketId, blockers, assignee) {
       console.log(`Warning: could not link blocker ${blockerKey} -> ${ticketId}: ${err.message}`);
     }
   }
+}
+
+async function reconcileBlockersAndStatus(ticketId, blockers, assignee) {
+  await linkBlockers(ticketId, blockers);
 
   const status = blockers.length > 0 ? "blocked" : "todo";
   if (blockers.length > 0) {
@@ -674,7 +683,20 @@ async function reconcileBlockersAndStatus(ticketId, blockers, assignee) {
 }
 
 async function transitionTicket(params) {
-  const { ticket_id, transition_id, reason } = params;
+  const { ticket_id, transition_id, reason, blocked_by } = params;
+  // DL-024: an agent parks ITS OWN ticket behind the tickets it just filed.
+  // Normalize CSV / array / single key; validate shape so a stray string can't
+  // become a bogus issue-link call.
+  const rawBlockers = Array.isArray(blocked_by)
+    ? blocked_by
+    : typeof blocked_by === "string" && blocked_by.trim()
+    ? blocked_by.split(",")
+    : [];
+  const blockers = [...new Set(rawBlockers.map((b) => String(b).trim()).filter(Boolean))];
+  const badBlocker = blockers.find((b) => !TICKET_KEY_RE.test(b));
+  if (badBlocker) {
+    throw new Error(`Invalid blocked_by entry ${JSON.stringify(badBlocker)} — expected an issue key like ${PROJECT_KEY}-123`);
+  }
 
   const targetStatus = transition_id;
   const jiraStatusName = INTERNAL_TO_JIRA[targetStatus] || targetStatus;
@@ -700,6 +722,31 @@ async function transitionTicket(params) {
     await addComment({ ticket_id, comment: isSkip ? `Skipped: ${reason}` : reason });
   }
 
+  // Link the new blockers BEFORE the transition so the Blocked webhook the
+  // orchestrator receives already carries the issuelinks it maps to blockedBy
+  // (its claim release on agent self-park keys off "own blockers still open").
+  // Then VERIFY every requested blocker is really an inward "Blocks" link
+  // (Codex review on #452): linkBlockers logs-and-continues on a 4xx, which is
+  // right for a duplicate link but would otherwise park the ticket Blocked with
+  // no edge — a state nothing can cascade out of. A missing link aborts the
+  // transition so the agent sees the error and can fix the key.
+  if (blockers.length > 0) {
+    await linkBlockers(ticket_id, blockers);
+    const issue = await jiraFetch(`/rest/api/3/issue/${ticket_id}?fields=issuelinks`);
+    const linked = new Set(
+      (issue?.fields?.issuelinks || [])
+        .filter((l) => l?.type?.name === "Blocks" && l.inwardIssue?.key)
+        .map((l) => l.inwardIssue.key)
+    );
+    const missing = blockers.filter((b) => !linked.has(b));
+    if (missing.length > 0) {
+      throw new Error(
+        `blocked_by: could not link ${missing.join(", ")} as blocker(s) of ${ticket_id} — ` +
+        `ticket NOT transitioned. Check the key(s) exist and retry.`
+      );
+    }
+  }
+
   // Transition in Jira
   const data = await jiraFetch(`/rest/api/3/issue/${ticket_id}/transitions`);
   const match = data.transitions.find(
@@ -718,8 +765,13 @@ async function transitionTicket(params) {
   });
 
   const finalStatus = isSkip ? "done" : mapStatusToInternal(match.to.name);
-  console.log(`[jira-tools] Transitioned ${ticket_id} to ${finalStatus} in Jira`);
-  return { ticketId: ticket_id, status: finalStatus, message: `Transitioned to ${finalStatus}` };
+  console.log(`[jira-tools] Transitioned ${ticket_id} to ${finalStatus} in Jira${blockers.length ? ` (blocked_by +${blockers.join(",")})` : ""}`);
+  return {
+    ticketId: ticket_id,
+    status: finalStatus,
+    message: `Transitioned to ${finalStatus}`,
+    ...(blockers.length ? { blockedByAdded: blockers } : {}),
+  };
 }
 
 async function updateTicket(params) {
@@ -859,7 +911,7 @@ export async function getIssue(params) {
   // embedded `comment` container paginates ASCENDING, so on long threads the
   // NEWEST comments (where the release manager's DECISION lives) get cut off.
   const query = new URLSearchParams({
-    fields: "summary,status,labels,assignee,issuetype,parent",
+    fields: "summary,status,labels,assignee,issuetype,parent,issuelinks",
   });
   const issue = await jiraFetch(`/rest/api/3/issue/${issue_key}?${query.toString()}`);
 
@@ -1009,6 +1061,15 @@ function mapIssue(issue) {
     ? `human:${reviewerLabel.replace("reviewer:", "")}`
     : fields.assignee?.displayName || null;
 
+  // "is blocked by" = inward side of a Blocks link. Only present when the caller
+  // requested `issuelinks` (getIssue does; list/search keep their lean field set
+  // and return no blockedBy rather than an empty one).
+  const blockedBy = Array.isArray(fields.issuelinks)
+    ? fields.issuelinks
+        .filter((l) => l?.type?.name === "Blocks" && l.inwardIssue?.key)
+        .map((l) => l.inwardIssue.key)
+    : undefined;
+
   return {
     ticketId: issue.key,
     title: fields.summary || "",
@@ -1018,6 +1079,7 @@ function mapIssue(issue) {
     parentKey: fields.parent?.key || null,
     workflowId: wfLabel ? wfLabel.replace("wf:", "") : null,
     labels,
+    ...(blockedBy !== undefined ? { blockedBy } : {}),
   };
 }
 

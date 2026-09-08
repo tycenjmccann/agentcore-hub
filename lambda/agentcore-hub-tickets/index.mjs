@@ -783,13 +783,23 @@ async function transitionIssue(args) {
     exprValues[":rvc"] = reason;
   }
 
-  // Support setting blockedBy (e.g., QA blocks itself on a fix ticket)
+  // DL-024: an agent parks ITS OWN ticket behind the tickets it just filed.
+  // ADDITIVE — union with the row's existing blockers (the row is already in
+  // hand), matching the Jira Lambda where each blocked_by entry becomes one more
+  // "Blocks" link. edit_issue keeps the explicit whole-array "set" semantics.
   const blockers = args.blocked_by;
+  let blockedByAdded = [];
   if (blockers) {
-    const blockerList = Array.isArray(blockers) ? blockers : [blockers];
-    updateExpr += ", #bb = :bb";
-    exprNames["#bb"] = "blockedBy";
-    exprValues[":bb"] = blockerList;
+    const requested = (Array.isArray(blockers) ? blockers : String(blockers).split(","))
+      .map((b) => String(b).trim())
+      .filter(Boolean);
+    const existing = Array.isArray(current.Item.blockedBy) ? current.Item.blockedBy : [];
+    blockedByAdded = requested.filter((b) => !existing.includes(b));
+    if (blockedByAdded.length > 0) {
+      updateExpr += ", #bb = :bb";
+      exprNames["#bb"] = "blockedBy";
+      exprValues[":bb"] = [...existing, ...new Set(blockedByAdded)];
+    }
   }
 
   await ddb.send(
@@ -809,6 +819,7 @@ async function transitionIssue(args) {
     to: transition.to,
     transition: transition.name,
     ...(reason ? { skipReason: reason } : {}),
+    ...(blockedByAdded.length ? { blockedByAdded } : {}),
   };
 }
 

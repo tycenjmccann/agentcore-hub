@@ -654,6 +654,26 @@ QA re-verifies (same checks)
 - `WorkflowOutput___request_fix` tool (was referenced in prompts but never implemented — no longer needed)
 - `request_fix` webhook handler logic (dead code after this change — cleanup TODO)
 
+**Landed 2026-09-08 (DL-009 cleanup PR 3):** the verb this decision assumed finally exists on every surface — `Tickets___transition_ticket(ticket_id, transition_id="blocked", blocked_by="<csv>")` on the runtime tool, the Jira Lambda (one `Blocks` link per key, linked BEFORE the transition so the Blocked webhook carries them) and the DynamoDB Lambda (additive union). `WorkflowOutput___report_completion` also carries `merge_commit` / `outcome` / `block_reason` (the ship verdict the completion gate already read). The orchestrator's only addition: on `in_progress → blocked` for an agent ticket whose own blockers are still open it releases the invocation claim (`orchestrator.claim_released`, `reason=agent_self_park`) so the cascade's later Ready can re-dispatch — see DL-024.
+
+---
+
+### DL-024: Agent Self-Park Contract (`blocked_by` on `transition_ticket`)
+
+**Date**: 2026-09-08
+**Decision**: An agent that must wait on work it just filed parks ITS OWN ticket `blocked` with `blocked_by` = the tickets it is waiting on, and exits without `report_completion`. The orchestrator's only part is to release the parked ticket's invocation claim and, later, to cascade it back to Ready.
+**Status**: ACTIVE (landing in the DL-009 cleanup series, PRs 3–5)
+
+**Context**: DL-011 specified exactly this in May (`Tickets___transition_ticket` on ITSELF with `blocked_by: [fix-ticket-id]`), but the Jira ticket tool and the runtime tool never grew the `blocked_by` parameter (only the DynamoDB Lambda had it). Without the verb, every agent that needed to wait either Done'd its ticket (losing the re-verify trigger — code reviewer, QA) or sat `in_progress` with no session (read by the dead-session sweep as a crash — release manager). Each gap was then patched orchestrator-side (`ship-fix-park`, `live-reverify`, `sync-main`), violating DL-009.
+
+**Contract**:
+1. Tool: `Tickets___transition_ticket(ticket_id, transition_id="blocked", blocked_by="<csv>", reason)` — `blocked_by` is ADDITIVE (Jira: one `Blocks` issue link per key, then the transition; DynamoDB: union into `blockedBy`). Available on both ticket Lambdas and the runtime tool.
+2. Agent: after filing fix / re-cert / escalation tickets, park your own ticket on them and exit WITHOUT `report_completion`. Re-invocation means your blockers closed — re-verify from where you left off (the `## Prior Coding Session` block carries your session id). Three rounds, then `report_completion` with an `ESCALATE:` summary (or, for the release manager, the escalation gate).
+3. Orchestrator: on `in_progress → blocked` for an AGENT ticket whose own blockers are still open and whose claim is `running`, release the claim (`lease.mjs stealClaim` CAS, event `orchestrator.claim_released` `reason=agent_self_park`). Nothing else. The existing cascade Readies the ticket when the last blocker is Done; the existing claim CAS admits the re-dispatch. A ticket whose blockers are all resolved is NOT released (its agent may be live) — the lease TTL / stale-claim hatch / nudge apply as before.
+4. Never: an agent setting its own ticket back to `in_progress` (sweep = crash), or Done-ing a ticket whose verdict is not final (un-parks the downstream human gate).
+
+**Consequences**: the release manager, QA verifier, CI agent and code reviewer all wait the same way; re-verification has a trigger for the first time (a Done fix cascades the waiting reviewer back to Ready); the orchestrator-side parking / re-verify / sync modules are deleted rather than maintained.
+
 ---
 
 ### DL-024: Agent Self-Park Contract (`blocked_by` on `transition_ticket`)

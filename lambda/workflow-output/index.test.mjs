@@ -154,3 +154,45 @@ describe("report_completion — ci_status / ci_build_id / ci_head_sha", () => {
     expect(h.warns.join("\n")).toMatch(/oversized ci_head_sha/);
   });
 });
+
+// DL-024 / ship verdict — the release manager's CD ticket reports how the run
+// ended. The orchestrator's completion evidence harvest already reads these
+// keys (completion.mjs SHIP_BLOCKED_OUTCOMES); same additive-and-closed contract.
+describe("report_completion — merge_commit / outcome / block_reason", () => {
+  it("persists all three when the release manager supplies them", async () => {
+    await report({ merge_commit: "0ef5892abc", outcome: "shipped", block_reason: "" });
+    const r = record();
+    expect(r.merge_commit).toBe("0ef5892abc");
+    expect(r.outcome).toBe("shipped");
+    expect("block_reason" in r).toBe(false);
+  });
+
+  it("a record written without them keeps exactly the base key set", async () => {
+    await report({});
+    expect(Object.keys(record()).sort()).toEqual([...BASE_KEYS].sort());
+  });
+
+  it("normalizes outcome case/whitespace and accepts every allowed value", async () => {
+    for (const oc of ["shipped", "deploy-blocked", "static-ci-only", "handoff"]) {
+      h.puts.length = 0;
+      await report({ outcome: ` ${oc.toUpperCase()} ` });
+      expect(record().outcome).toBe(oc);
+    }
+  });
+
+  it("drops an unknown outcome with a warning but keeps block_reason", async () => {
+    await report({ outcome: "kinda-shipped", block_reason: "pipeline stage Deploy failed" });
+    const r = record();
+    expect("outcome" in r).toBe(false);
+    expect(r.block_reason).toBe("pipeline stage Deploy failed");
+    expect(h.warns.join("\n")).toMatch(/unknown outcome "kinda-shipped"/);
+  });
+
+  it("clips block_reason to 500 chars and drops an oversized merge_commit", async () => {
+    await report({ merge_commit: "x".repeat(129), block_reason: "y".repeat(600) });
+    const r = record();
+    expect("merge_commit" in r).toBe(false);
+    expect(r.block_reason).toHaveLength(500);
+    expect(h.warns.join("\n")).toMatch(/oversized merge_commit/);
+  });
+});
