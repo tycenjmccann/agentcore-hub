@@ -60,7 +60,7 @@ if [ -f package.json ]; then
     exit 1
   fi
 fi
-zip -qr function.zip index.mjs node_modules
+zip -qr function.zip index.mjs ticket-plan-validator.mjs node_modules
 
 SIZE=$(ls -lh function.zip | awk '{print $5}')
 echo "  Zip size: $SIZE"

@@ -271,7 +271,7 @@ console.log("\n3/5 Deploying Lambda function...");
 // function at cold start with ERR_MODULE_NOT_FOUND.
 const lambdaDir = join(__dirname, "..", "lambda", LAMBDA_SOURCE_DIR);
 const zipPath = `/tmp/${LAMBDA_NAME}.zip`;
-execSync(`cd "${lambdaDir}" && zip -j "${zipPath}" index.mjs fix-contract.mjs`, { stdio: "pipe" });
+execSync(`cd "${lambdaDir}" && zip -j "${zipPath}" index.mjs fix-contract.mjs ticket-plan-validator.mjs`, { stdio: "pipe" });
 const zipBuffer = readFileSync(zipPath);
 
 // FIX_TICKET_CONTRACT is forwarded ONLY when set in the deploying shell, so an

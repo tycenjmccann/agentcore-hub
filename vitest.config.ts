@@ -428,6 +428,23 @@ export default defineConfig({
       // sweep def requires BOTH `detection` and `development`, so a run with one
       // sweeper ticket can never complete, which is why commit 4's intake plans two.
       "lambda/orchestrator/replay-iczquj-sweep-full-chain.test.mjs",
+      // ticket-plan-validator (TEAM-4248 D3) — what a valid ticket plan IS. Nothing
+      // validated one before: c2uqki's sweeper TEAM-4230 was minted with
+      // blocked_by=[] and invoked 92.3s BEFORE the requirements analyst it depends
+      // on completed, and the same shape appears on all three ember runs. The cases
+      // run against the vendored c2uqki plan AS SUBMITTED — root entry absent, so
+      // the first entry is the offender — because that shape is what defeats the
+      // obvious "first unblocked entry is the root" heuristic and it is the whole
+      // reason the root is resolved by ROLE here.
+      "lambda/orchestrator/ticket-plan-validator.test.mjs",
+      // branch-name-parity (TEAM-4248 D3) — the convention now lives in FIVE places:
+      // the literal index.mjs renders in its ## Branch block, and canonicalBranchFor
+      // in four byte-copied modules. check-fix-kinds-parity.sh keeps the four copies
+      // identical to each other; only this spec keeps them identical to the string an
+      // agent is actually told. It extracts index.mjs's two lines as TEXT and
+      // executes them, so a refactor that moves the literal fails loudly instead of
+      // handing the reviewer a branch the sweeper never pushed.
+      "lambda/orchestrator/branch-name-parity.test.mjs",
     ],
     // Keep unit tests away from the Playwright specs under tests/.
     exclude: ["tests/**", "node_modules/**", "demo/**"],
