@@ -28,10 +28,15 @@ import { extractGateDecisions, appendDecisions } from "./artifact-chain.mjs";
  *
  * Every fixture here is that run's own record: the workflow row, the workflow def,
  * the six review-package bullets the engineer actually saw and the two events the
- * gate emitted all come out of dowtdh-dossier.json; plan.md is the real
- * 001fe322 blob. The one thing hand-authored is the two gate COMMENTS
- * (dowtdh-gate-decisions.json) — the dossier's tickets carry no `comments` key at
- * all, and that absence is the defect D3 fixes.
+ * gate emitted all come out of dowtdh-dossier.json; plan.md is the real 001fe322
+ * blob; and the gate comments in dowtdh-gate-decisions.json are the real Jira
+ * comment bodies on TEAM-4174 / TEAM-4176 / TEAM-4178. They had to be fetched from
+ * Jira rather than read off the run, because the dossier's tickets carry no
+ * `comments` key at all — that absence is the defect D3 fixes.
+ *
+ * Reading the real Spec Approval body also corrects the run analysis: the product
+ * owner resolved SIX numbered Concerns in that one comment, so the approved plan
+ * dropped six decisions. F1 caught one of them.
  */
 
 const FIXTURES = "../../deploy/workflow-manager/toolkit/fixtures/";
@@ -83,8 +88,14 @@ const LEDGER_MD = [SPEC_GATE, DESIGN_GATE].reduce((md, gateTicketId) => {
     gateTicketId, gateName: g.gateName, reviewer: g.assignee,
   })).md;
 }, "");
-/** TEAM-4174#3, TEAM-4174#4, TEAM-4176#3 — every one open, none cited in plan.md. */
-const OPEN_IDS = [`${SPEC_GATE}#3`, `${SPEC_GATE}#4`, `${DESIGN_GATE}#3`];
+/**
+ * TEAM-4174#1 .. #6 — the six Concerns the product owner resolved in ONE comment
+ * at Spec Approval, every one open and none of them cited anywhere in the plan
+ * TEAM-4178 approved. Reviewer finding F1 reported the loss of Concern 3; the real
+ * comment shows five more went with it. TEAM-4176 contributes nothing: its real
+ * body restates Concern 3 in prose, and a restatement is not a new decision.
+ */
+const OPEN_IDS = [1, 2, 3, 4, 5, 6].map((n) => `${SPEC_GATE}#${n}`);
 
 const h = vi.hoisted(() => ({
   state: {
@@ -471,8 +482,10 @@ describe("the ledger the run never had", () => {
     await load("shadow");
     await recordBothGates();
 
-    // One commit per gate, on the run's feature branch, at the chain path.
-    expect(ghCalls("PUT")).toHaveLength(2);
+    // ONE commit, not one per gate: Spec Approval carried all six decisions and
+    // Design Approval's prose restatement yields no entry, so `added.length === 0`
+    // buys zero writes — the same contract a webhook redelivery relies on.
+    expect(ghCalls("PUT")).toHaveLength(1);
     for (const put of ghCalls("PUT")) {
       expect(contentsPathOf(put.path)).toBe(LEDGER_PATH);
       expect(put.body.branch).toBe(DOSSIER.workflow.featureBranch);
@@ -480,8 +493,9 @@ describe("the ledger the run never had", () => {
     const md = h.state.ghFiles[LEDGER_PATH].text;
     for (const id of OPEN_IDS) expect(md).toContain(`### ${id}`);
     expect(md).toContain("5000 ms window; pause the countdown while Undo has focus or hover.");
-    // The design lead's "LGTM on the DOM and the tokens." is not a decision.
-    expect(md).not.toContain("LGTM");
+    // The Telegram approval receipt both gates end on is not a decision.
+    expect(md).not.toContain("Approved via Telegram");
+    expect(md).not.toContain("Proceed to the Plan ticket");
     // The S3 mirror is what the gate check and the dispatch checklist read.
     expect(h.state.s3Objects[MIRROR_KEY]).toBe(md);
 
@@ -507,19 +521,23 @@ describe("TEAM-4178 package lists Concern 3 as not honoured", () => {
     });
 
     const notification = await notificationFor(PLAN_GATE);
-    expect(notification.summary).toMatch(/^Decisions not honoured \(3\)/);
-    // Concern 3 leads, by id, in ≤200 chars — the bullet contract.
-    expect(notification.bullets[0]).toContain(`${SPEC_GATE}#3`);
-    expect(notification.bullets[0]).toContain("pause the countdown while Undo has focus or hover");
+    expect(notification.summary).toMatch(/^Decisions not honoured \(6\)/);
+    // Every dropped decision leads the package, by id, in ≤200 chars — and one of
+    // them is the Concern 3 the reviewer eventually had to file TEAM-4183 for.
+    expect(notification.bullets.slice(0, 6).map((b) => b.split(" ")[0])).toEqual(OPEN_IDS);
+    const concern3Bullet = notification.bullets.find((b) => b.startsWith(`${SPEC_GATE}#3`));
+    expect(concern3Bullet).toContain("pause the countdown while Undo has focus or hover");
     for (const b of notification.bullets) expect(b.length).toBeLessThanOrEqual(200);
-    // Prepended AFTER loadReviewPackage's clamp: all six of the engineer's own
-    // bullets survive, in order, and the links are untouched.
-    expect(notification.bullets.slice(3)).toEqual(PACKAGE_BULLETS);
+    // Prepended AFTER loadReviewPackage's clamp, which is what makes the widening
+    // real: six decision bullets AND all six of the engineer's own bullets survive,
+    // in order, past a cap that is nominally Math.min(6 * parts.length, 10) = 6.
+    expect(notification.bullets).toHaveLength(12);
+    expect(notification.bullets.slice(6)).toEqual(PACKAGE_BULLETS);
     expect(notification.links).toEqual(NOTIF.links);
 
     // The reviewer opening the ticket sees the same thing the phone ping said.
     const comment = commentsOn(PLAN_GATE).find((c) => c.startsWith("Review package —"));
-    expect(comment).toContain("Decisions not honoured (3)");
+    expect(comment).toContain("Decisions not honoured (6)");
     expect(comment).toContain(`${SPEC_GATE}#3`);
     expect(comment).toContain(PACKAGE_BULLETS[0]);
   });

@@ -255,9 +255,17 @@ export function normalizeDecisionLedgerMode(raw) {
  * A numbered decision: "Concern 3 (…): RESOLVED - <text>" or "#3: DECIDED — …".
  * The concern number is what makes the id stable and citable, so it is the
  * preferred grammar and the one the blueprints ask humans for.
+ *
+ * The descriptor group is LAZY and allows colons on purpose. dowtdh's real
+ * TEAM-4174 comment writes the policy owner into it —
+ * "#1 Brand (human:brand-lead): RESOLVED - …" — and a colon-free descriptor
+ * class silently matched none of that run's six decisions: the first colon it
+ * could reach was the one inside `human:brand-lead`. Lazy means the split lands
+ * on the first colon actually followed by the verdict keyword, so the owner tag
+ * stays in the descriptor and the decision text stays whole.
  */
 const NUMBERED_DECISION_RE =
-  /^\s*(?:#|Concern\s+)(\d+)\b([^:\n]*):\s*(?:RESOLVED|DECIDED|DECISION)\s*[-–—:]\s*(.+)$/i;
+  /^\s*(?:#|Concern\s+)(\d+)\b(.*?):\s*(?:RESOLVED|DECIDED|DECISION)\s*[-–—:]\s*(.+)$/i;
 
 /** An unnumbered decision: "DECISION: <text>" — no concern to anchor to. */
 const UNNUMBERED_DECISION_RE = /^\s*DECISION:\s*(.+)$/i;

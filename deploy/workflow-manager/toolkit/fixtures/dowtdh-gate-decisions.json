@@ -1,21 +1,31 @@
 {
   "_fixture": [
-    "The two human gate comments dowtdh SHOULD have carried, HAND-AUTHORED — and the",
-    "fact that they had to be is the defect TEAM-4248 D3 fixes.",
+    "The THREE human gate comment sets from run wf_1788731227559_dowtdh, with REAL",
+    "bodies — source: the Jira comments on TEAM-4174 (Spec Approval), TEAM-4176",
+    "(Design Approval) and TEAM-4178 (Plan Approval), fetched from Jira and pasted",
+    "verbatim. Author on the substantive comments: Tycen McCann (a Claude Code",
+    "operator session acting with policy-owner authority for that validation run);",
+    "the `author` fields below carry the run's assignee identity for the gate, which",
+    "is what the orchestrator stamps on a ledger entry.",
     "",
-    "dowtdh-dossier.json's tickets carry no `comments` key at all: the product owner's",
-    "words exist nowhere in the run's own record, which is precisely why the decision",
-    "could be lost between spec.md, the design docs and plan.md and only resurface as",
-    "reviewer finding F1 (P1) and fix ticket TEAM-4183.",
+    "Why a fixture exists at all: dowtdh-dossier.json's tickets carry no `comments`",
+    "key. The run's own record never held these words, which is exactly how the",
+    "product owner's decisions could be lost between spec.md, the design docs and",
+    "plan.md and only resurface as reviewer finding F1 (P1) and fix ticket TEAM-4183.",
     "",
-    "Every decision string below is verbatim from the reviewer's F1 evidence in",
-    "dowtdh-analysis.json:",
-    "  \"TEAM-4174 Spec Approval resolved Concern 3 as '5000 ms; pause while Undo has",
-    "   focus or hover'; TEAM-4176 Design Approval restated 'paused on focus/hover'.",
-    "   TEAM-4175 design and TEAM-4177 plan recorded 'no focus-pause'; TEAM-4178 Plan",
-    "   Approval approved it\"",
-    "The comment PROSE around those strings (author, wording, the LGTM decoys) is",
-    "reconstructed, not quoted. Gate assignees and ticket ids are from the dossier."
+    "What the bodies mean for the ledger:",
+    "  - TEAM-4174 resolved SIX numbered Concerns in ONE comment, so the gate yields",
+    "    TEAM-4174#1 .. TEAM-4174#6. Concern 3 ('5000 ms window; pause the countdown",
+    "    while Undo has focus or hover') is the one reviewer finding F1 tracked, but",
+    "    it was never the only decision at risk — the plan cites TEAM-4174 nowhere,",
+    "    so all six were dropped.",
+    "  - TEAM-4176 restates Concern 3 in PROSE with no numbered lines, so it yields",
+    "    ZERO decisions. That is the correct answer and a deliberate negative case: a",
+    "    restatement is not a new decision, and a ledger that invented an entry for",
+    "    every approving comment would be noise the next persona learns to ignore.",
+    "  - TEAM-4178 carries only the Telegram approval receipt — no decision.",
+    "The Telegram receipts ('Approved via Telegram by chat <id>') are the real bodies",
+    "the bridge writes, and are load-bearing here: they must not become entries."
   ],
   "gates": [
     {
@@ -25,13 +35,13 @@
       "comments": [
         {
           "author": "human:product-owner",
-          "timestamp": "2026-09-06T14:12:00.000Z",
-          "content": "Spec reads well. Two things before I approve.\nConcern 3 (Undo auto-dismiss): RESOLVED - 5000 ms window; pause the countdown while Undo has focus or hover.\nConcern 4 (reload inside the window): RESOLVED - accept commit-at-click; the snapshot stays memory-only."
+          "timestamp": "2026-09-06T22:09:35.865Z",
+          "content": "Spec APPROVED. Product owner decision (Claude Code operator session acting for Tycen McCann, playbook-overlay validation run), resolving the six open Concerns with policy-owner authority for this run:\n\n#1 Brand (human:brand-lead): RESOLVED - approve 'Clear activity', 'Undo', 'Activity cleared.', 'Activity restored.' and the reuse of existing App.css values as-is. No brand kit exists for demo-app.\n#2 UX rule 14 (human:design-lead): RESOLVED - undo-only, no confirm dialog; the intent asked for undo as the safety net.\n#3 UX rule 12 (human:design-lead): RESOLVED - 5000 ms window; pause the countdown while Undo has focus or hover.\n#4 Reload inside the window (human:product-owner): RESOLVED - commit at click time; a reload inside the window is permanent. Simplest and honest.\n#5 A11y (human:design-lead): RESOLVED - native buttons + role=status region; do not move focus into the live region.\n#6 Concurrency (human:product-owner): RESOLVED - merge-and-restart: a second Clear during an open window merges into the snapshot and restarts the 5 s window so Undo restores everything.\n\nDesigner: design against these resolutions and commit design/frontend-designer.md. Plan ticket follows Design Approval."
         },
         {
           "author": "human:product-owner",
-          "timestamp": "2026-09-06T14:13:00.000Z",
-          "content": "Approved."
+          "timestamp": "2026-09-06T22:45:19.668Z",
+          "content": "Approved via Telegram by chat 8661669497"
         }
       ]
     },
@@ -41,14 +51,9 @@
       "assignee": "human:product-owner",
       "comments": [
         {
-          "author": "human:design-lead",
-          "timestamp": "2026-09-06T14:48:00.000Z",
-          "content": "LGTM on the DOM and the tokens."
-        },
-        {
           "author": "human:product-owner",
-          "timestamp": "2026-09-06T14:51:00.000Z",
-          "content": "Concern 3: RESOLVED - the countdown stays paused on focus/hover, as I said at Spec Approval. I don't mind how it is implemented but it does not auto-dismiss under someone's cursor."
+          "timestamp": "2026-09-06T22:30:26.737Z",
+          "content": "Design APPROVED. Product owner decision (Claude Code operator session acting for Tycen McCann, playbook-overlay validation run). Reviewed design/frontend-designer.md + mockups (1280, 320, zoom 200) against spec.md and the six resolved Concerns: Clear + Undo as native buttons, role=status announcements, 5 s window paused on focus/hover, commit-at-click, merge-and-restart. Proceed to the Plan ticket."
         }
       ]
     },
@@ -59,8 +64,8 @@
       "comments": [
         {
           "author": "human:engineer",
-          "timestamp": "2026-09-06T15:31:00.000Z",
-          "content": "Plan looks complete. Approved."
+          "timestamp": "2026-09-06T22:45:19.668Z",
+          "content": "Approved via Telegram by chat 8661669497"
         }
       ]
     }
