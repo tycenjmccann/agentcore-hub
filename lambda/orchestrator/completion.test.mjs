@@ -915,3 +915,74 @@ describe("completion-record fallback (TEAM-3976)", () => {
     });
   });
 });
+
+/**
+ * TEAM-4266 — the record a Workflow Manager mark-done writes is accepted by the
+ * UNMODIFIED gate.
+ *
+ * The bug: `intervene.py mark-done --evidence "…"` recorded an operator's proof as
+ * prose only (a ticket comment + a manager.intervention event), so when an agent
+ * shipped its deliverable and died before report_completion, NOTHING ever wrote
+ * completions/{ticketId}.json — and the run emitted
+ * workflow.completion_blocked reason=missing_evidence forever.
+ *
+ * The fix is writer-side (src/app/api/workflow/[id]/tickets/transition/route.ts now
+ * PUTs this record). These cases are the contract between the two halves: they pin
+ * that the exact bytes that route writes clear the gate here with no gate change,
+ * so a future edit to either side that breaks the pairing fails a test.
+ */
+describe("workflow-manager completion record clears the gate (TEAM-4266)", () => {
+  const EVIDENCE = "PR #87 open+green / streamed QA VERDICT: PASS";
+
+  /** Byte-for-byte the record writeCompletionRecord() PUTs in the transition route. */
+  const MANAGER_RECORD = {
+    ticket_id: "TEAM-X",
+    summary: EVIDENCE,
+    artifacts: "",
+    branch: null,
+    commit_sha: null,
+    pr_url: null,
+    completed_at: "2026-09-08T12:00:00.000Z",
+    source: "workflow-manager",
+    evidence_kind: "static",
+  };
+
+  it("counts as evidence — a non-empty summary is enough, unknown keys are ignored", () => {
+    expect(completionRecordHasEvidence(MANAGER_RECORD)).toBe(true);
+  });
+
+  it("backfills ONLY output — there is no branch/commit/PR to claim", () => {
+    // The operator supplied prose, not merge signals; the record's nulls must not
+    // become fabricated branch/commitSha/prUrl on the agentTasks entry.
+    const fields = evidenceBackfillFields(MANAGER_RECORD, { ticketId: "TEAM-X", status: "complete" });
+    expect(fields).toEqual({ output: EVIDENCE });
+  });
+
+  it("resolves the missing-evidence offender through the record fallback", async () => {
+    const calls = { reads: [], backfills: [] };
+    const remaining = await resolveMissingEvidenceFromRecords(
+      [{ ticketId: "TEAM-X", phase: "development" }],
+      { "TEAM-X": { ticketId: "TEAM-X", status: "complete" } },
+      {
+        readCompletionRecord: async (tid) => { calls.reads.push(tid); return MANAGER_RECORD; },
+        backfill: async (tid, fields) => { calls.backfills.push({ tid, fields }); },
+        log: () => {},
+      }
+    );
+    expect(remaining).toEqual([]);
+    expect(calls.reads).toEqual(["TEAM-X"]);
+    expect(calls.backfills).toEqual([{ tid: "TEAM-X", fields: { output: EVIDENCE } }]);
+  });
+
+  it("the backfilled entry then passes missingEvidenceTickets outright", () => {
+    const children = [{ ticketId: "TEAM-X", assignee: "dev", status: "done" }];
+    const tasks = { "TEAM-X": { ticketId: "TEAM-X", status: "complete", output: EVIDENCE } };
+    expect(missingEvidenceTickets(children, tasks, ["development"], { getAgentPhase })).toEqual([]);
+  });
+
+  it("but it is NOT a merge verdict — a ship-phase run still closes static-ci-only", () => {
+    // Deliberate: operator prose is not proof anything merged (TEAM-3755 F1). The
+    // record unblocks missing_evidence without ever synthesizing a ship signal.
+    expect(shipVerdictOf(evidenceBackfillFields(MANAGER_RECORD, {}))).toBeNull();
+  });
+});

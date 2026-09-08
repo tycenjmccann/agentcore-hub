@@ -44,6 +44,20 @@ blockers:
   then `mark-done` (shipped) or `retry` (not shipped).
 - review gate `in_review` / `human:*` waiting on a human (NOT a failure — do
   not touch; escalate only if waiting extraordinarily long)
+- **every non-epic child Done but the run still non-terminal, AND the dossier
+  shows a `workflow.completion_blocked` event or an unacknowledged
+  `manager_escalation` from `reviewer: "completion-gate"` in
+  `workflow.humanNotifications`** — the completion evidence gate is refusing.
+  This is also what `complete` failing `API 409: {"error":"missing_evidence",…}`
+  means, and it is a DIFFERENT failure from the open-children 409 (§4.4): the
+  run needs EVIDENCE, not a nudge. `mark-done --evidence` now also writes
+  `completions/<ticketId>.json` (the record the gate reads), so a mark-done from
+  here on prevents this. It cannot heal a run already blocked, because
+  `done → done` is rejected — for those, write the record out of band
+  (`aws s3 cp - s3://$ARTIFACT_BUCKET/completions/<ticketId>.json` with
+  `{"ticket_id":"<id>","summary":"<evidence>"}`), then `complete` the run. Note a
+  SHIP-phase ticket healed this way closes honestly as `static-ci-only` rather
+  than `complete`, because operator prose is not proof anything merged.
 
 ## 3. THE STUCK-AGENT TEST — "did the work actually ship?"
 
