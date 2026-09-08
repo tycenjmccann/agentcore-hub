@@ -1,4 +1,5 @@
 // TEAM-3954: cache-aware cost accounting in the performance-card Lambda.
+// REPORT_VERSION 4: input_tokens semantics are per-engine (see uncachedInput).
 //
 // Unit tests for the pure `addUsage` reducer exported by index.mjs. Importing
 // index.mjs evaluates its top-level `@aws-sdk/*` imports and constructs a few
@@ -13,7 +14,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { addUsage, PERSONA_CHAT_SPAN_FILTER } from "./index.mjs";
+import { addUsage, uncachedInput, PERSONA_CHAT_SPAN_FILTER } from "./index.mjs";
 
 // Fixture: 10/50 USD per 1M in/out; cache-read at 0.1x input; cache-write
 // surcharge 1.25x (5m) / 2x (1h) / 1.25x (default) of the input rate.
@@ -26,46 +27,87 @@ const PRICING = {
 
 const M = 1_000_000;
 
-// Fresh accumulator + the engine record addUsage writes into.
-function fresh() {
+// Fresh accumulator + the engine record addUsage writes into. Default engine
+// is "persona" (Strands spans), whose input_tokens INCLUDES cache traffic.
+function fresh(engine = "persona") {
   const byAgent = {};
   return {
     byAgent,
-    add: (row) => addUsage(byAgent, "req", "strands", row, PRICING),
-    eng: () => byAgent.req.engines.strands,
+    add: (row) => addUsage(byAgent, "req", engine, row, PRICING),
+    eng: () => byAgent.req.engines[engine],
   };
 }
 
-test("cache-read tokens are billed at the discounted input rate", () => {
+test("persona: cache-read tokens are billed ONLY at the discounted rate (input includes them)", () => {
   const t = fresh();
-  t.add({ model: "m", inp: M, outp: 0, cacheRead: M });
+  // Strands reports input_tokens = uncached + cache_read + cache_write, so a
+  // 2M input with 1M read means 1M uncached ($10) + 1M read ($10 * 0.1 = $1).
+  t.add({ model: "m", inp: 2 * M, outp: 0, cacheRead: M });
   const u = t.eng();
-  // plain input 1M => $10; cache-read 1M => $10 * 0.1 = $1.
   assert.equal(u.usd, 11);
+  assert.equal(u.inputTokens, 2 * M); // token counters stay raw
   assert.equal(u.cacheReadInputTokens, M);
   assert.equal(u.cacheWriteInputTokens, 0);
 });
 
+test("persona: a fully cached prompt is not also billed as fresh input (the 7x bug)", () => {
+  const t = fresh();
+  t.add({ model: "m", inp: M, outp: 0, cacheRead: M });
+  // Pre-v4 this came out as $10 + $1 = $11 — the cached 1M charged at 110%.
+  assert.equal(t.eng().usd, 1);
+});
+
+test("claude_code: input_tokens is the uncached remainder, so it is billed in full", () => {
+  const t = fresh("claude_code");
+  t.add({ model: "m", inp: M, outp: 0, cacheRead: M });
+  // 1M uncached ($10) + 1M read ($1).
+  assert.equal(t.eng().usd, 11);
+});
+
+test("codex: cached_input_tokens is a subset of input_tokens", () => {
+  const t = fresh("codex");
+  t.add({ model: "m", inp: 2 * M, outp: 0, cacheRead: M });
+  assert.equal(t.eng().usd, 11);
+});
+
+test("unknown engine falls back to the inclusive heuristic (input >= cache => subtract)", () => {
+  assert.equal(uncachedInput("mystery", 10, 3, 2), 5); // inclusive shape
+  assert.equal(uncachedInput("mystery", 2, 3, 2), 2);  // remainder shape
+  assert.equal(uncachedInput("persona", 2, 3, 2), 0);  // never negative
+});
+
+test("regression: Buster dead-code sweep (wf_1788779651903_463811) persona spend", () => {
+  // Real persona totals from the run's v3 card. At 20/100 the card said
+  // $1,857.09; the correct Bedrock-equivalent figure is ~$243.
+  const pricing = { ...PRICING, models: { f: { input: 20, output: 100 } }, default: { input: 20, output: 100 } };
+  const byAgent = {};
+  addUsage(byAgent, "run", "persona", {
+    model: "f", inp: 79_315_825, outp: 410_456, cacheRead: 77_443_509, cacheWrite: 1_871_132, ttl: "5m",
+  }, pricing);
+  const usd = byAgent.run.engines.persona.usd;
+  assert.ok(usd > 240 && usd < 246, `expected ~243, got ${usd}`);
+});
+
 test("cache-write is billed at the per-TTL surcharge multiple of the input rate", () => {
   const oneHour = fresh();
-  oneHour.add({ model: "m", inp: 0, outp: 0, cacheWrite: M, ttl: "1h" });
+  oneHour.add({ model: "m", inp: M, outp: 0, cacheWrite: M, ttl: "1h" });
   // 1M cache-write @ 1h => $10 * 2 = $20.
   assert.equal(oneHour.eng().usd, 20);
   assert.equal(oneHour.eng().cacheWriteInputTokens, M);
 
   const fiveMin = fresh();
-  fiveMin.add({ model: "m", inp: 0, outp: 0, cacheWrite: M, ttl: "5m" });
+  fiveMin.add({ model: "m", inp: M, outp: 0, cacheWrite: M, ttl: "5m" });
   // 1M cache-write @ 5m => $10 * 1.25 = $12.50.
   assert.equal(fiveMin.eng().usd, 12.5);
 });
 
 test("missing or unknown ttl falls back to the default write multiplier", () => {
   const noTtl = fresh();
-  noTtl.add({ model: "m", inp: 0, outp: 0, cacheWrite: M }); // ttl absent
+  noTtl.add({ model: "m", inp: M, outp: 0, cacheWrite: M }); // ttl absent
   assert.equal(noTtl.eng().usd, 12.5); // default 1.25 => $12.50
 
   const badTtl = fresh();
-  badTtl.add({ model: "m", inp: 0, outp: 0, cacheWrite: M, ttl: "42h" }); // unknown tier
+  badTtl.add({ model: "m", inp: M, outp: 0, cacheWrite: M, ttl: "42h" }); // unknown tier
   assert.equal(badTtl.eng().usd, 12.5); // still default 1.25 => $12.50
 });
 
