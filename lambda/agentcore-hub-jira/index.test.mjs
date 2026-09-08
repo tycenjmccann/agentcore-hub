@@ -836,8 +836,9 @@ test("labels_add: a rejected PUT surfaces as a bare { error }, and nothing is re
  * Stateful Jira stub for transition_ticket: records issueLink POSTs, comment
  * POSTs and transition POSTs; serves a transition list that includes Blocked.
  */
-function installTransitionStub({ failLinkFor = [] } = {}) {
+function installTransitionStub({ failLinkFor = [], preLinked = [] } = {}) {
   const calls = { links: [], comments: [], transitions: [] };
+  const linked = new Set(preLinked); // inward Blocks links Jira would report on the ticket
   globalThis.fetch = async (url, init = {}) => {
     const method = (init.method || "GET").toUpperCase();
     if (url.endsWith("/rest/api/3/issueLink") && method === "POST") {
@@ -846,7 +847,13 @@ function installTransitionStub({ failLinkFor = [] } = {}) {
       if (failLinkFor.includes(body.inwardIssue.key)) {
         return new Response(JSON.stringify({ errorMessages: ["Issue link already exists."] }), { status: 400 });
       }
+      linked.add(body.inwardIssue.key);
       return new Response("", { status: 201 });
+    }
+    if (url.includes("/rest/api/3/issue/") && url.includes("fields=issuelinks") && method === "GET") {
+      return new Response(JSON.stringify({ key: "TEAM-24", fields: {
+        issuelinks: [...linked].map((k) => ({ type: { name: "Blocks" }, inwardIssue: { key: k } })),
+      } }), { status: 200 });
     }
     if (url.includes("/comment") && method === "POST") {
       calls.comments.push(JSON.parse(init.body));
@@ -889,9 +896,9 @@ test("transition_ticket: blocked_by links each blocker as Blocks BEFORE the tran
   }
 });
 
-test("transition_ticket: blocked_by accepts an array and an existing-link 400 is logged, not fatal", async () => {
+test("transition_ticket: blocked_by accepts an array; a duplicate-link 400 on an ALREADY-linked blocker is not fatal", async () => {
   const originalFetch = globalThis.fetch;
-  const calls = installTransitionStub({ failLinkFor: ["TEAM-30"] });
+  const calls = installTransitionStub({ failLinkFor: ["TEAM-30"], preLinked: ["TEAM-30"] });
   try {
     const res = await handler({
       tool_name: "Tickets___transition_ticket",
@@ -899,7 +906,24 @@ test("transition_ticket: blocked_by accepts an array and an existing-link 400 is
     });
     assert.equal(res.status, "blocked");
     assert.equal(calls.links.length, 2);
-    assert.equal(calls.transitions.length, 1, "the transition still happens after a duplicate-link 400");
+    assert.equal(calls.transitions.length, 1, "the transition still happens: the link exists, the 400 was a duplicate");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("transition_ticket: a blocker that could NOT be linked aborts the transition (no Blocked-with-no-edge parking)", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = installTransitionStub({ failLinkFor: ["TEAM-999"] }); // e.g. a nonexistent key
+  try {
+    const res = await handler({
+      tool_name: "Tickets___transition_ticket",
+      parameters: { ticket_id: "TEAM-24", transition_id: "blocked", blocked_by: "TEAM-30,TEAM-999" },
+    });
+    assert.match(res.error, /could not link TEAM-999/);
+    assert.match(res.error, /NOT transitioned/);
+    assert.equal(calls.links.length, 2);
+    assert.deepEqual(calls.transitions, [], "no transition when a requested blocker is missing");
   } finally {
     globalThis.fetch = originalFetch;
   }

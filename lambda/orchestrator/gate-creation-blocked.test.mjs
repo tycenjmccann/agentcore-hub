@@ -780,6 +780,24 @@ describe("processRecord case blocked — DDB-stream entry point (TEAM-4045)", ()
     expect(isLiveClaim(h.state.workflow.agentTasks["TEAM-24"])).toBe(true);
     expect(eventsOf("orchestrator.claim_released")).toHaveLength(0);
   });
+
+  it("(e-DDB-6) mixed open blockers — one reopened, one never completed → the never-completed one proves a self-park: claim released (Codex on #452)", async () => {
+    seedRunningShipTask();
+    // TEAM-23 completed earlier and was reopened; TEAM-26 is a fix ticket the RM just filed.
+    h.state.workflow.agentTasks["TEAM-23"] = {
+      id: "t23", agentId: CI, ticketId: "TEAM-23", status: "complete", completedAt: "2026-09-05T03:00:00.000Z",
+    };
+    h.state.tickets["TEAM-26"] = { ticketId: "TEAM-26", assignee: "agentcore_hub_backend_dev", type: "task", status: "todo", blockedBy: [], parentId: "TEAM-1", workflowId: "wf_1", title: "Fix (ship-review r1): api" };
+    const mixed = (status) => ({ ...shipImage(status), blockedBy: L(["TEAM-23", "TEAM-26"]) });
+
+    await handler(record("MODIFY", mixed("blocked"), mixed("in_progress")));
+
+    expect(isLiveClaim(h.state.workflow.agentTasks["TEAM-24"])).toBe(false);
+    expectStealCas("TEAM-24", h.state.startedAt);
+    const released = eventsOf("orchestrator.claim_released");
+    expect(released).toHaveLength(1);
+    expect(released[0].detail.blockedBy).toEqual(["TEAM-23", "TEAM-26"]);
+  });
 });
 
 // ─── (d) handleReviewRejection rework path: upstream blocker guard ───────────

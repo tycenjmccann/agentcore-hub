@@ -65,13 +65,18 @@ done
 
 # ─── 2. env-var allow-list ────────────────────────────────────────────────────
 # Comment lines are dropped first so a header that mentions a retired flag does
-# not count as a read. Dynamic lookups (process.env[key]) are not scanned; the
-# only one is the RUNTIME_ARN_<AGENT> convention in invokeAgent.
+# not count as a read. Three static access forms are scanned: `process.env.X` /
+# `env.X` (DI modules take `env = process.env`), `process.env["X"]`, and a
+# same-line destructuring `const { X, Y: alias = dflt } = process.env`. Only a
+# COMPUTED lookup (process.env[someVar]) is not scanned; the one in the tree is
+# the RUNTIME_ARN_<AGENT> convention in invokeAgent.
 ALLOWED_ENV="$(allow_list "$ENV_ALLOW")"
-READ_ENV="$(cd "$ORCH" && cat $MODULES \
-  | grep -vE '^[[:space:]]*(//|\*|/\*)' \
-  | grep -ohE '(process\.env|[^A-Za-z0-9_.]env)\.[A-Z][A-Z0-9_]*' \
-  | sed -E 's/.*env\.//' | sort -u)"
+CODE="$(cd "$ORCH" && cat $MODULES | grep -vE '^[[:space:]]*(//|\*|/\*)')"
+READ_DOT="$(grep -ohE '(process\.env|[^A-Za-z0-9_.]env)\.[A-Z][A-Z0-9_]*' <<<"$CODE" | sed -E 's/.*env\.//' || true)"
+READ_BRACKET="$(grep -ohE "process\.env\[['\"][A-Z][A-Z0-9_]*['\"]\]" <<<"$CODE" | sed -E "s/.*\[['\"]([A-Z][A-Z0-9_]*)['\"]\]/\1/" || true)"
+READ_DESTRUCT="$(grep -ohE '\{[^}]*\}[[:space:]]*=[[:space:]]*process\.env\b' <<<"$CODE" \
+  | sed -E 's/\}.*//; s/^\{//' | tr ',' '\n' | sed -E 's/^[[:space:]]*([A-Z][A-Z0-9_]*).*/\1/' | grep -E '^[A-Z][A-Z0-9_]*$' || true)"
+READ_ENV="$(printf '%s\n%s\n%s\n' "$READ_DOT" "$READ_BRACKET" "$READ_DESTRUCT" | grep -v '^$' | sort -u)"
 for v in $READ_ENV; do
   if ! grep -qx "$v" <<<"$ALLOWED_ENV"; then
     echo "FAIL: orchestrator reads env var $v which is not in $ENV_ALLOW" >&2
