@@ -111,6 +111,69 @@ const isNotFound = (err: unknown) => {
   return e?.name === "NoSuchKey" || e?.name === "NotFound" || e?.$metadata?.httpStatusCode === 404;
 };
 
+/**
+ * TEAM-4286 — a 409 ConditionalRequestConflict is a RACE, not a fault, and was
+ * being lumped in with AccessDenied et al: `!is412(err)` → "failed" → 502, so a
+ * mark-done that lost a millisecond-scale race got "completion evidence record
+ * write failed" and the ticket never closed.
+ *
+ * Straight off the installed SDK (@aws-sdk/client-s3 3.1048.0):
+ *   commands/PutObjectCommand.d.ts:75-78 (IfNoneMatch)
+ *     "If a conflicting operation occurs during the upload, S3 returns a 409
+ *      ConditionalRequestConflict response. On a 409 failure, retry the upload."
+ *   models/models_0.d.ts:14711 (PutObjectRequest.IfMatch)
+ *     "...On a 409 failure you should fetch the object's ETag and retry the upload."
+ * DeleteObject documents no 409 at all (models_0.d.ts:3439 — 412 only).
+ *
+ * BOTH arms are required. 409 is not modelled as a named exception class (the
+ * command's @throws list is EncryptionTypeMismatch | InvalidRequest |
+ * InvalidWriteOffset | TooManyParts | S3ServiceException), so it arrives via
+ * @smithy/core's throwDefaultError, which names the exception
+ * `parsedBody.Code || errorCode || String(statusCode)`: that is
+ * "ConditionalRequestConflict" when S3 sends the <Code>, and the bare "409" when
+ * the error body is empty — which only the $metadata arm catches.
+ *
+ * And the SDK will not do this for us: 409 is absent from @smithy/core's
+ * TRANSIENT_ERROR_STATUS_CODES ([500, 502, 503, 504]) and the error is
+ * $fault: "client", so the default maxAttempts never retries it.
+ */
+const is409 = (err: unknown) => {
+  const e = err as { name?: string; $metadata?: { httpStatusCode?: number } };
+  return e?.name === "ConditionalRequestConflict" || e?.$metadata?.httpStatusCode === 409;
+};
+
+/** Total attempts per conditional command, and the waits between them. */
+const CONFLICT_ATTEMPTS = 3;
+const CONFLICT_BACKOFF_MS = [25, 75];
+
+/** Rounds of the create → read → refill sequence (see writeCompletionRecord). */
+const WRITE_ROUNDS = 3;
+
+/**
+ * TEAM-4286 — send ONE conditional S3 command, retrying ONLY a 409. Every other
+ * error (412, 404, AccessDenied) is rethrown on its first occurrence, so the 412
+ * fill-if-blank path (F3) and the fail-closed path (F2) are reached exactly as
+ * before — in particular a 409 must never be mistaken for a 412 and trigger the
+ * read-back.
+ *
+ * The backoff is a short fixed pair rather than something the tests stub: it
+ * bounds the added latency at 100ms per command, which is cheap enough that the
+ * unit tests need no seam and production code needs no test-awareness.
+ */
+async function sendConditional<T>(send: () => Promise<T>, label: string): Promise<T> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await send();
+    } catch (err) {
+      if (!is409(err) || attempt >= CONFLICT_ATTEMPTS) throw err;
+      console.warn(
+        `[transition] ${label}: 409 ConditionalRequestConflict — retrying (${attempt + 1}/${CONFLICT_ATTEMPTS})`
+      );
+      await new Promise((r) => setTimeout(r, CONFLICT_BACKOFF_MS[attempt - 1] ?? 75));
+    }
+  }
+}
+
 async function writeCompletionRecord(ticketId: string, evidence: string): Promise<EvidenceWrite> {
   if (!ARTIFACT_BUCKET) {
     // TEAM-4282 F2: a distinct, self-diagnosing message — the alternative
@@ -134,96 +197,136 @@ async function writeCompletionRecord(ticketId: string, evidence: string): Promis
     evidence_kind: "static",
   };
   const s3 = new S3Client({ region: REGION });
-  try {
-    const put = await s3.send(
-      new PutObjectCommand({
-        Bucket: ARTIFACT_BUCKET,
-        Key: key,
-        Body: JSON.stringify(record, null, 2),
-        ContentType: "application/json",
-        IfNoneMatch: "*",
-      })
-    );
-    console.log(`[transition] ${ticketId}: wrote completion evidence record s3://${ARTIFACT_BUCKET}/${key}`);
-    return { outcome: "created", key, etag: put.ETag };
-  } catch (err) {
-    if (!is412(err)) {
+
+  // TEAM-4286 — the create → read → refill sequence is a bounded LOOP, not a
+  // straight line, because AWS's documented answer to "a concurrent delete won" is
+  // to reupload: an If-Match PUT answers 404 when the object was deleted after the
+  // read ("You should reupload the object", conditional-writes userguide). Both
+  // vanish cases therefore go round again and RE-CREATE the record instead of
+  // giving up — the previous code returned "kept" for the read-back 404, which let
+  // the ticket close with NO record at all, the exact stall TEAM-4266 exists to
+  // remove. Budget exhausted → "failed" (502), never "kept".
+  //
+  // Worst case is 3 rounds x (<=3 create PUTs + 1 GET + <=3 refill PUTs) = 21 sends
+  // and <=600ms of backoff, reachable only against an adversarial bucket.
+  for (let round = 1; round <= WRITE_ROUNDS; round++) {
+    try {
+      const put = await sendConditional(
+        () =>
+          s3.send(
+            new PutObjectCommand({
+              Bucket: ARTIFACT_BUCKET,
+              Key: key,
+              Body: JSON.stringify(record, null, 2),
+              ContentType: "application/json",
+              IfNoneMatch: "*",
+            })
+          ),
+        `${ticketId} create`
+      );
+      console.log(`[transition] ${ticketId}: wrote completion evidence record s3://${ARTIFACT_BUCKET}/${key}`);
+      return { outcome: "created", key, etag: put.ETag };
+    } catch (err) {
+      if (!is412(err)) {
+        console.error(
+          `[transition] ${ticketId}: completion evidence record write failed: ${err instanceof Error ? err.message : err}`
+        );
+        return { outcome: "failed", message: err instanceof Error ? err.message : String(err) };
+      }
+    }
+
+    // ── TEAM-4282 F3: 412 — a record exists. Fill it only if it is not evidence. ──
+    let previousBody: string;
+    let previousEtag: string | undefined;
+    try {
+      const existing = await s3.send(new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: key }));
+      previousBody = (await existing.Body?.transformToString()) || "";
+      previousEtag = existing.ETag;
+    } catch (err) {
+      if (isNotFound(err)) {
+        // TEAM-4286: raced with a delete between our PUT and this GET. Nothing was
+        // written, so re-create it rather than closing the ticket with no evidence.
+        console.log(
+          `[transition] ${ticketId}: ${key} vanished between the create-only PUT and the read — re-creating it (round ${round}/${WRITE_ROUNDS})`
+        );
+        continue;
+      }
       console.error(
-        `[transition] ${ticketId}: completion evidence record write failed: ${err instanceof Error ? err.message : err}`
+        `[transition] ${ticketId}: could not read the existing completion record: ${err instanceof Error ? err.message : err}`
+      );
+      return { outcome: "failed", message: err instanceof Error ? err.message : String(err) };
+    }
+
+    let existingRecord: Record<string, unknown> | null = null;
+    try {
+      const parsed = JSON.parse(previousBody);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        existingRecord = parsed as Record<string, unknown>;
+      }
+    } catch {
+      // An unparseable body cannot be evidence — fall through and fill it.
+    }
+
+    if (completionRecordHasEvidence(existingRecord)) {
+      console.log(`[transition] ${ticketId}: ${key} already carries evidence — keeping the existing record`);
+      return { outcome: "kept" };
+    }
+
+    // Spread-then-override: only the fields this record owns are set, so a blank
+    // record's incidental non-evidence fields (e.g. `branch`) survive the refill.
+    const merged = {
+      ...(existingRecord || {}),
+      ticket_id: ticketId,
+      summary: record.summary,
+      completed_at: (existingRecord?.completed_at as string) || record.completed_at,
+      source: "workflow-manager",
+      evidence_kind: (existingRecord?.evidence_kind as string) || "static",
+    };
+    try {
+      const put = await sendConditional(
+        () =>
+          s3.send(
+            new PutObjectCommand({
+              Bucket: ARTIFACT_BUCKET,
+              Key: key,
+              Body: JSON.stringify(merged, null, 2),
+              ContentType: "application/json",
+              // Conditional on what we just read: an agent's authoritative record landing
+              // in between makes this 412 and IT wins.
+              IfMatch: previousEtag,
+            })
+          ),
+        `${ticketId} refill`
+      );
+      console.log(`[transition] ${ticketId}: filled the evidence-less completion record s3://${ARTIFACT_BUCKET}/${key}`);
+      return { outcome: "filled", key, etag: put.ETag, previousBody };
+    } catch (err) {
+      if (is412(err)) {
+        console.log(`[transition] ${ticketId}: ${key} changed while filling it — keeping the newer record`);
+        return { outcome: "kept" };
+      }
+      if (isNotFound(err)) {
+        // TEAM-4286: an If-Match PUT answers 404 when a concurrent delete wins, and
+        // AWS says to reupload — so fall back to the create-only PUT.
+        console.log(
+          `[transition] ${ticketId}: ${key} was deleted after the read — re-creating it (round ${round}/${WRITE_ROUNDS})`
+        );
+        continue;
+      }
+      console.error(
+        `[transition] ${ticketId}: completion evidence refill failed: ${err instanceof Error ? err.message : err}`
       );
       return { outcome: "failed", message: err instanceof Error ? err.message : String(err) };
     }
   }
 
-  // ── TEAM-4282 F3: 412 — a record exists. Fill it only if it is not evidence. ──
-  let previousBody: string;
-  let previousEtag: string | undefined;
-  try {
-    const existing = await s3.send(new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: key }));
-    previousBody = (await existing.Body?.transformToString()) || "";
-    previousEtag = existing.ETag;
-  } catch (err) {
-    if (isNotFound(err)) {
-      // Raced with a delete between our PUT and this GET. Nothing to inspect and
-      // nothing was written — treat as "kept" rather than guessing.
-      console.log(`[transition] ${ticketId}: ${key} vanished between the create-only PUT and the read — nothing written`);
-      return { outcome: "kept" };
-    }
-    console.error(
-      `[transition] ${ticketId}: could not read the existing completion record: ${err instanceof Error ? err.message : err}`
-    );
-    return { outcome: "failed", message: err instanceof Error ? err.message : String(err) };
-  }
-
-  let existingRecord: Record<string, unknown> | null = null;
-  try {
-    const parsed = JSON.parse(previousBody);
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-      existingRecord = parsed as Record<string, unknown>;
-    }
-  } catch {
-    // An unparseable body cannot be evidence — fall through and fill it.
-  }
-
-  if (completionRecordHasEvidence(existingRecord)) {
-    console.log(`[transition] ${ticketId}: ${key} already carries evidence — keeping the existing record`);
-    return { outcome: "kept" };
-  }
-
-  // Spread-then-override: only the fields this record owns are set, so a blank
-  // record's incidental non-evidence fields (e.g. `branch`) survive the refill.
-  const merged = {
-    ...(existingRecord || {}),
-    ticket_id: ticketId,
-    summary: record.summary,
-    completed_at: (existingRecord?.completed_at as string) || record.completed_at,
-    source: "workflow-manager",
-    evidence_kind: (existingRecord?.evidence_kind as string) || "static",
+  // TEAM-4286: every round raced with a delete. Refusing is the point — "kept" here
+  // would close the ticket with no record and no way to retry.
+  console.error(`[transition] ${ticketId}: ${key} kept vanishing — gave up after ${WRITE_ROUNDS} attempts`);
+  return {
+    outcome: "failed",
+    message: `${key} kept vanishing between the create-only PUT and the read after ${WRITE_ROUNDS} attempts`,
   };
-  try {
-    const put = await s3.send(
-      new PutObjectCommand({
-        Bucket: ARTIFACT_BUCKET,
-        Key: key,
-        Body: JSON.stringify(merged, null, 2),
-        ContentType: "application/json",
-        // Conditional on what we just read: an agent's authoritative record landing
-        // in between makes this 412 and IT wins.
-        IfMatch: previousEtag,
-      })
-    );
-    console.log(`[transition] ${ticketId}: filled the evidence-less completion record s3://${ARTIFACT_BUCKET}/${key}`);
-    return { outcome: "filled", key, etag: put.ETag, previousBody };
-  } catch (err) {
-    if (is412(err)) {
-      console.log(`[transition] ${ticketId}: ${key} changed while filling it — keeping the newer record`);
-      return { outcome: "kept" };
-    }
-    console.error(
-      `[transition] ${ticketId}: completion evidence refill failed: ${err instanceof Error ? err.message : err}`
-    );
-    return { outcome: "failed", message: err instanceof Error ? err.message : String(err) };
-  }
 }
 
 /**
@@ -246,20 +349,32 @@ async function revertCompletionRecord(ticketId: string, write: EvidenceWrite): P
   }
   const s3 = new S3Client({ region: REGION });
   try {
+    // TEAM-4286: the restore PUT's IfMatch is documented to answer 409 on a
+    // concurrent operation, so it gets the same bounded retry as the forward
+    // writes. DeleteObject's IfMatch documents 412 only (models_0.d.ts:3439), so
+    // wrapping it too is defence in depth rather than a known case.
     if (write.outcome === "created") {
-      await s3.send(
-        new DeleteObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: write.key, IfMatch: write.etag })
+      await sendConditional(
+        () =>
+          s3.send(
+            new DeleteObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: write.key, IfMatch: write.etag })
+          ),
+        `${ticketId} revert-delete`
       );
       console.log(`[transition] ${ticketId}: transition refused — removed the evidence record this call created`);
     } else {
-      await s3.send(
-        new PutObjectCommand({
-          Bucket: ARTIFACT_BUCKET,
-          Key: write.key,
-          Body: write.previousBody,
-          ContentType: "application/json",
-          IfMatch: write.etag,
-        })
+      await sendConditional(
+        () =>
+          s3.send(
+            new PutObjectCommand({
+              Bucket: ARTIFACT_BUCKET,
+              Key: write.key,
+              Body: write.previousBody,
+              ContentType: "application/json",
+              IfMatch: write.etag,
+            })
+          ),
+        `${ticketId} revert-restore`
       );
       console.log(`[transition] ${ticketId}: transition refused — restored the record this call had filled`);
     }
@@ -267,6 +382,12 @@ async function revertCompletionRecord(ticketId: string, write: EvidenceWrite): P
   } catch (err) {
     if (is412(err)) {
       console.log(`[transition] ${ticketId}: evidence record changed since this call wrote it — left as is`);
+    } else if (is409(err)) {
+      // TEAM-4286: still racing after the full budget. Leaving the record is the
+      // same lesser harm as the no-ETag case above.
+      console.warn(
+        `[transition] ${ticketId}: evidence record still conflicted after ${CONFLICT_ATTEMPTS} attempts — left as is`
+      );
     } else {
       console.warn(
         `[transition] ${ticketId}: could not revert the evidence record: ${err instanceof Error ? err.message : err}`
@@ -488,7 +609,18 @@ export async function POST(
         ? Buffer.from(response.Payload).toString()
         : "Unknown error";
       return NextResponse.json(
-        { error: "Lambda invocation failed", details: errorMessage },
+        {
+          error: "Lambda invocation failed",
+          // TEAM-4286: this branch deliberately leaves the record in place (see
+          // above), so the body has to SAY an orphan record was left or the operator
+          // is blind — the 500 was previously indistinguishable from one that wrote
+          // nothing. Placed BEFORE `details` because intervene.py's api_post
+          // truncates the surfaced body at 500 chars and `details` is unbounded.
+          // Gated on wantsEvidenceRecord, so the console UI's and the Telegram
+          // bot's response shapes are unchanged (same idiom as the 409 body below).
+          ...(wantsEvidenceRecord ? { completionRecordWritten, completionRecordReverted: false } : {}),
+          details: errorMessage,
+        },
         { status: 500 }
       );
     }
@@ -547,7 +679,13 @@ export async function POST(
     // record is left as is rather than reverted on a guess.
     const errorMessage = err instanceof Error ? err.message : "Unknown error";
     return NextResponse.json(
-      { error: "Lambda invocation failed", details: errorMessage },
+      {
+        error: "Lambda invocation failed",
+        // TEAM-4286: same as the FunctionError branch — the record is left on
+        // purpose, so the answer says so.
+        ...(wantsEvidenceRecord ? { completionRecordWritten, completionRecordReverted: false } : {}),
+        details: errorMessage,
+      },
       { status: 500 }
     );
   }
