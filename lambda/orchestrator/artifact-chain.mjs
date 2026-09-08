@@ -174,8 +174,10 @@ export function sdlcFrameworkContext({ def, workflow, ticket, agentDef, intakeAg
     block +=
       `## Gate Decisions (REQUIRED checklist)\n` +
       `A human RESOLVED each line below at a review gate on this run (${dir}/decisions.md is the ledger). ` +
-      `For every line: either implement it and cite its id in your artifact, or add a "## Deviations" row in ` +
-      `your artifact naming the id and why you departed from it. Citing the id is the requirement — you may ` +
+      `For every line: either implement it and cite it in your artifact, or add a "## Deviations" row in ` +
+      `your artifact naming it and why you departed from it. To cite, write the id (e.g. TEAM-4174#3) ` +
+      `anywhere, or name the gate ticket on the SAME line or table row as the concern number ` +
+      `("Concern 3", "#3", or a leading "| 3 |" cell). Citing is the requirement — you may ` +
       `disagree with a decision, but you may not leave it unmentioned. An artifact that cites none of these ` +
       `does not pass its gate; "## Deviations: None yet." with an open line above it is exactly the failure ` +
       `this checklist exists to prevent.\n` +
@@ -412,35 +414,55 @@ export function appendDecisions(existingMd, entries) {
  * Open decisions the artifact under review does not cite.
  *
  * The rule is a CITATION rule, deliberately, and it is the whole contract. A
- * decision counts as referenced iff the artifact text contains, case-insensitively,
- * either
- *   1. the id token ("TEAM-4174#3"), or
- *   2. BOTH the gate ticket key ("TEAM-4174") AND a "Concern <n>" / "#<n>" token
- *      for that decision's concern number.
+ * decision counts as referenced iff, case-insensitively, either
+ *   1. the artifact contains its id token ("TEAM-4174#3") anywhere, or
+ *   2. ONE LINE of the artifact contains BOTH the gate ticket key ("TEAM-4174")
+ *      and the concern number, the number written as "Concern <n>", "#<n>", or the
+ *      FIRST cell of a markdown table row ("| 3 | … |").
  * Nothing else counts — no substring matching on the decision prose, which is
  * unpredictable for the agent being judged and untestable for us. An unnumbered
  * ("#D<seq>") decision has no concern number and is referenced only by rule 1.
  *
- * Consequence, and it is intended: a "## Deviations" row that names the id is
- * "referenced" and passes. The contract is "cite the decision and say what you
- * did with it", NOT "obey it" — a designer who disagrees with the product owner
- * records the departure and the human sees it at the gate. dowtdh's plan.md fails
- * this check not because it chose "no focus-pause" but because it cites
- * TEAM-4174 nowhere at all, under "## Deviations: None yet."
+ * Rule 2 is LINE-SCOPED, which cuts both ways on purpose. It is stricter than a
+ * document-wide match — the gate key in a header and "Concern 3" in an unrelated
+ * paragraph 80 lines later is not a citation of anything — and it is the only way
+ * to accept the form a real fixed artifact uses. dowtdh's post-fix plan.md cites
+ * its decisions in the Concerns table:
+ *
+ *   | 3 | (spec) Undo auto-dismisses at 5000 ms… | UX | human:design-lead |
+ *     5000 ms window; pause… (PO, TEAM-4174 comment 2026-09-06 15:09.) | resolved |
+ *
+ * That row names the gate and the concern in one place and is unambiguous to a
+ * human reader; flagging it would reopen a good plan under enforce, which is the
+ * worst false positive this feature can produce. The table-cell form requires the
+ * first cell to be EXACTLY the number, so a "| 13 |" row is not a citation of
+ * concern 3.
+ *
+ * Consequence, and it is intended: a "## Deviations" row that names the id — or
+ * names the gate and the concern on that row — is "referenced" and passes. The
+ * contract is "cite the decision and say what you did with it", NOT "obey it": a
+ * designer who disagrees with the product owner records the departure and the
+ * human sees it at the gate. dowtdh's approved plan.md fails this check not
+ * because it chose "no focus-pause" but because it cites TEAM-4174 nowhere at
+ * all, under "## Deviations: None yet."
  *
  * status !== "open" is never reported: a retired decision is settled.
  */
 export function unreferencedDecisions(decisions, artifactText) {
   const text = typeof artifactText === "string" ? artifactText : "";
   const lower = text.toLowerCase();
+  const lines = lower.split(/\r?\n/);
   return (Array.isArray(decisions) ? decisions : []).filter((d) => {
     if (!d || String(d.status || "open").toLowerCase() !== "open") return false;
     const id = String(d.id || "");
     if (id && lower.includes(id.toLowerCase())) return false;
-    const key = String(d.gateTicketId || "");
+    const key = String(d.gateTicketId || "").toLowerCase();
     if (!key || d.concern == null) return true;
-    if (!lower.includes(key.toLowerCase())) return true;
-    return !new RegExp(`(?:concern\\s*|#)${Number(d.concern)}\\b`, "i").test(text);
+    const n = Number(d.concern);
+    // "Concern 3" / "#3" anywhere on the line, or the line is a table row whose
+    // first cell is exactly "3".
+    const concernOnLine = new RegExp(`(?:concern\\s*|#)${n}\\b|^\\s*\\|\\s*${n}\\s*\\|`, "i");
+    return !lines.some((line) => line.includes(key) && concernOnLine.test(line));
   });
 }
 

@@ -2477,9 +2477,10 @@ function decisionsNotHonouredSection(entries) {
     `Decisions not honoured (${entries.length}). A human resolved each of these at a review gate on this run, ` +
     `and the artifact under review cites none of them:\n` +
     bullets.map((b) => `• ${b}`).join("\n") +
-    `\nFor EVERY id above: either implement the decision and cite the id in the artifact, or add a "## Deviations" ` +
-    `row naming the id and why you departed from it. Citing it is the requirement — you may disagree with a ` +
-    `decision, you may not leave it unmentioned.`;
+    `\nFor EVERY id above: either implement the decision and cite it in the artifact, or add a "## Deviations" ` +
+    `row naming it and why you departed from it. To cite, write the id (e.g. TEAM-4174#3) anywhere, or name the ` +
+    `gate ticket on the SAME line or table row as the concern number ("Concern 3", "#3", or a leading "| 3 |" ` +
+    `cell). Citing it is the requirement — you may disagree with a decision, you may not leave it unmentioned.`;
   return { bullets, text };
 }
 

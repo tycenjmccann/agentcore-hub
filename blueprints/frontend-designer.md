@@ -84,8 +84,12 @@ your document (owner = the policy owner); do not edit spec.md itself.
 If your context has a `## Gate Decisions (REQUIRED checklist)` block, every line
 in it is something a human already decided at a review gate on this run (the
 ledger is `<artifact_dir>/decisions.md`). For each line, either implement the
-decision and **cite its id** (e.g. `TEAM-4174#3`) where you implement it, or add
-a `## Deviations` row to your design naming that id and why you departed from it.
+decision and **cite it** where you implement it, or add a `## Deviations` row to
+your design naming it and why you departed from it. Citing means either the id
+(e.g. `TEAM-4174#3`) anywhere in the artifact, or the gate ticket (`TEAM-4174`) on
+the **same line or table row** as the concern number (`Concern 3`, `#3`, or a
+leading `| 3 |` cell) — the id is the shortest form, the row form is what a
+Concerns table already looks like.
 Citing is the obligation, not agreeing — you may argue against a decision, you
 may not leave it unmentioned. A design that mentions none of the open lines does
 not pass its gate: a real run shipped `## Deviations: None yet.` over an open

@@ -218,9 +218,11 @@ is read by **four** Lambdas.
   `workflows/<id>/shared/decisions.md`, publish `decision.recorded`, lead the
   review package with a `Decisions not honoured` section, and emit
   `## Gate Decisions (REQUIRED checklist)` to design-phase personas and the Plan
-  ticket. A decision counts as honoured when the artifact cites its id, or cites
-  the gate key **and** the concern number — so a `## Deviations` row naming the id
-  passes; the rule is "cite it or deviate from it explicitly", never "obey it".
+  ticket. A decision counts as honoured when the artifact cites its id anywhere, or
+  names the gate ticket on the **same line or table row** as the concern number
+  (`Concern 3`, `#3`, or a leading `| 3 |` cell) — so a `## Deviations` row naming
+  the id passes, and so does a Concerns row ending "(PO, TEAM-4174 comment …)";
+  the rule is "cite it or deviate from it explicitly", never "obey it".
   `enforce` adds one thing: when an artifact cites none of the open decisions the
   gate is **withheld** rather than presented — `handleReviewRejection` reopens the
   authoring ticket, no human is paged, and `gateStates` is left **untouched**

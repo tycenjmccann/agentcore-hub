@@ -378,9 +378,21 @@ describe("unreferencedDecisions — the citation rule", () => {
     expect(unreferencedDecisions([concern3], "…as decided in TEAM-4174#3 we pause on hover.")).toEqual([]);
   });
 
-  it("gate key AND a concern token → referenced", () => {
+  it("gate key AND a concern token ON THE SAME LINE → referenced", () => {
     expect(unreferencedDecisions([concern3], "Concern 3 was resolved by the PO on TEAM-4174.")).toEqual([]);
     expect(unreferencedDecisions([concern3], "TEAM-4174 settled #3.")).toEqual([]);
+  });
+
+  it("the gate key and the concern number on DIFFERENT lines → UNREFERENCED", () => {
+    // Rule 2 is line-scoped, which is deliberately stricter than a document-wide
+    // match: a gate key in a header and a "Concern 3" eighty lines away in an
+    // unrelated paragraph is not a citation of anything.
+    const md = [
+      "# Plan (spec signed off at TEAM-4174)",
+      ...Array(20).fill("Lorem ipsum about the undo notice."),
+      "Concern 3 is the auto-dismiss window and we keep it fixed.",
+    ].join("\n");
+    expect(unreferencedDecisions([concern3], md).map((d) => d.id)).toEqual(["TEAM-4174#3"]);
   });
 
   it("the gate key alone → UNREFERENCED", () => {
@@ -394,9 +406,39 @@ describe("unreferencedDecisions — the citation rule", () => {
       .toEqual(["TEAM-4174#3"]);
   });
 
+  it("a table row whose FIRST cell is the concern number, on a line naming the gate → referenced", () => {
+    // The form the real post-fix plan.md uses. The gate key arrives in the
+    // resolution cell, the concern number in the leading cell, one row.
+    const row = "| 3 | (spec) Undo auto-dismisses at 5000 ms. | UX | human:design-lead | 5000 ms window; pause on focus or hover. (PO, TEAM-4174 comment 2026-09-06 15:09.) | resolved |";
+    expect(unreferencedDecisions([concern3], row)).toEqual([]);
+  });
+
+  it("a table row for concern 13 does not satisfy concern 3", () => {
+    // Exact cell, not a prefix: "| 13 |" is concern thirteen. Same word-boundary
+    // discipline as the "#13" / "Concern 13" forms.
+    const rows = [
+      "| 13 | Something else entirely. | Data | human:product-owner | Decided in TEAM-4174. | resolved |",
+      "Also see TEAM-4174 and #13 and Concern 13.",
+    ].join("\n");
+    expect(unreferencedDecisions([concern3], rows).map((d) => d.id)).toEqual(["TEAM-4174#3"]);
+  });
+
   it("a ## Deviations row naming the id → referenced, and that is intended", () => {
     // The contract is "cite it and say what you did", not "obey it".
     const md = "## Deviations\n- D1 — TEAM-4174#3: hover-pause ships, focus-pause omitted because …";
+    expect(unreferencedDecisions([concern3], md)).toEqual([]);
+  });
+
+  it("a ## Deviations TABLE row naming the gate and the concern → referenced", () => {
+    // The real post-fix plan records its departure this way — the deviation's own
+    // id ("D1") is in the first cell, so the citation rides on "Concern 3" and the
+    // gate key sharing the row.
+    const md = [
+      "## Deviations",
+      "| id | Concern | Departure and reason |",
+      "| --- | --- | --- |",
+      "| D1 | 3 | PO decision on Concern 3 (TEAM-4174 comment 2026-09-06 15:09) was hover-or-focus pause; focus-pause omitted because … |",
+    ].join("\n");
     expect(unreferencedDecisions([concern3], md)).toEqual([]);
   });
 
@@ -428,8 +470,18 @@ describe("unreferencedDecisions — the citation rule", () => {
     // And it is not one lost decision but all six the PO resolved in that comment.
     expect(unreferencedDecisions(extractFrom(SPEC_APPROVAL), original).map((d) => d.id)).toEqual(SPEC_IDS);
 
+    // The post-fix fixture cites the way the REAL fixed plan cites: a leading
+    // "| n |" cell and "(PO, TEAM-4174 comment 2026-09-06 15:09.)" in the
+    // resolution — never a "TEAM-4174#n" id, which no human ever wrote. If this
+    // artifact were flagged, DECISION_LEDGER=enforce would reopen a good plan,
+    // which is the worst false positive this feature can produce.
     const postfix = fixture("dowtdh-plan-postfix.md");
-    expect(unreferencedDecisions([concern3], postfix)).toEqual([]);
+    const body = postfix.slice(postfix.indexOf("-->") + 3);
+    expect(body).toContain("(PO, TEAM-4174 comment 2026-09-06 15:09.)");
+    expect(body).not.toContain("TEAM-4174#");
+    expect(unreferencedDecisions([concern3], body)).toEqual([]);
+    expect(unreferencedDecisions(extractFrom(SPEC_APPROVAL), body)).toEqual([]);
+    // …and the whole file, header comment included, clears too.
     expect(unreferencedDecisions(extractFrom(SPEC_APPROVAL), postfix)).toEqual([]);
   });
 
