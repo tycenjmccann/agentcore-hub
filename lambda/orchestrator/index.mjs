@@ -52,7 +52,7 @@ import { createReworkLoopCap, normalizeReworkLoopMode } from "./rework-loop-cap.
 // LIVE_SHIP_STATUSES: the statuses a blocker edge must never yank a ticket out of.
 // Imported (as cascade.mjs does) rather than re-listed, so "what is mid-flight" has
 // one definition across the live re-verify, the verdict hold and FR-D1.7.
-import { createLiveReverify, normalizeLiveReverifyMode, LIVE_SHIP_STATUSES } from "./live-reverify.mjs";
+import { createLiveReverify, normalizeLiveReverifyMode, LIVE_SHIP_STATUSES, splitCsv } from "./live-reverify.mjs";
 import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, evaluateVerifiedHeads, SHIP_PHASES, SHIP_BLOCKED_OUTCOMES, NO_OP_OUTCOMES, TERMINAL_WORKFLOW_PHASES, FIX_KINDS, REWORK_FIX_KINDS, normalizeAdvisoryRoutingMode, isAdvisoryTicket, nonAdvisory } from "./completion.mjs";
 import { isPipelineEnabled } from "./pipeline-enabled.mjs";
 import { CD_REGISTRY_KEY, EMPTY_CD_REGISTRY, parseCdRegistry, isCdRegistered, effectiveWorkflowDef, resolveDelivery, deliveryModeContext } from "./cd-registry.mjs";
@@ -2787,8 +2787,18 @@ async function harvestCompletionEvidence(workflow, ticketId) {
     if (record.ci_head_sha && !entry?.ci_head_sha) fields.ci_head_sha = record.ci_head_sha;
     if (record.ci_status && !entry?.ci_status) fields.ci_status = record.ci_status;
     if (record.evidence_kind && !entry?.evidence_kind) fields.evidence_kind = record.evidence_kind;
-    if (Array.isArray(record.evidence_keys) && record.evidence_keys.length > 0 && !entry?.evidence_keys) {
-      fields.evidence_keys = record.evidence_keys;
+    // TEAM-4264 F5: workflow-output writes this field as a comma-joined STRING
+    // (report_completion's schema declares it `str`), but the harvest only ever
+    // accepted an array — so the branch had never fired in production and every
+    // real evidence_keys value was silently dropped. splitCsv (live-reverify.mjs)
+    // already normalizes both shapes for the same field's OTHER reader
+    // (hasLiveArtifact), so this reuses it rather than a second parser.
+    if (!entry?.evidence_keys) {
+      const evidenceKeys = splitCsv(record.evidence_keys)
+        .filter((k) => k.length <= 512) // drop, never truncate — a cut S3 key is a broken key
+        .filter((k, i, arr) => arr.indexOf(k) === i) // dedupe, order preserved
+        .slice(0, 50);
+      if (evidenceKeys.length > 0) fields.evidence_keys = evidenceKeys;
     }
     if (record.verdict && !entry?.verdict) fields.verdict = record.verdict;
     if (record.verdict_source && !entry?.verdictSource) fields.verdictSource = record.verdict_source;

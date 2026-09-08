@@ -89,8 +89,14 @@ export function normalizeLiveReverifyMode(value) {
   return "off";
 }
 
-/** Comma list, JSON array, or artifact objects → a flat list of key strings. */
-function splitCsv(value) {
+/**
+ * Comma list, JSON array, or artifact objects → a flat list of key strings.
+ * Exported for index.mjs's evidence_keys harvest (TEAM-4264 F5): workflow-output
+ * writes the field as a comma-joined STRING (main.py's report_completion declares
+ * it `str`), while the harvest used to accept only an array — the branch had never
+ * fired in production.
+ */
+export function splitCsv(value) {
   if (Array.isArray(value)) {
     return value
       .map((v) => (typeof v === "string" ? v : typeof v?.s3Key === "string" ? v.s3Key : ""))

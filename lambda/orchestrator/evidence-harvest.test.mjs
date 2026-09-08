@@ -1,4 +1,8 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
+// TEAM-4264 F5: the real writer, so the harvest test can prove it reads the
+// SHAPE report_completion actually produces (a comma string), not a shape
+// nobody ever writes. Same mocked S3/Lambda/DDB seams this file already sets up.
+import { handler as workflowOutputHandler } from "../workflow-output/index.mjs";
 
 /**
  * Completion-evidence harvest on the done cascade.
@@ -21,6 +25,7 @@ const h = vi.hoisted(() => ({
     workflow: /** @type {any} */ (null),
     s3Objects: /** @type {Record<string, string>} */ ({}),
     s3Gets: /** @type {string[]} */ ([]),
+    s3Puts: /** @type {any[]} */ ([]),
     merges: /** @type {any[]} */ ([]),
   },
 }));
@@ -66,6 +71,10 @@ vi.mock("@aws-sdk/client-s3", () => ({
         if (body === undefined) throw new Error("NoSuchKey");
         return { Body: { transformToString: async () => body } };
       }
+      // TEAM-4264 F5: record what workflow-output's report_completion actually
+      // wrote, so a test can feed that real Body straight back into the harvest
+      // rather than hand-typing the shape the writer produces.
+      if (cmd.constructor.name === "PutObjectCommand") h.state.s3Puts.push(cmd.input);
       return {};
     }
   },
@@ -149,6 +158,7 @@ beforeEach(async () => {
   h.state.workflow = makeWorkflow();
   h.state.s3Objects = {};
   h.state.s3Gets.length = 0;
+  h.state.s3Puts.length = 0;
   h.state.merges.length = 0;
   await load();
 });
@@ -662,5 +672,76 @@ describe("late re-harvest on an evidence-less complete entry (TEAM-3976)", () =>
     await handleTicketDoneUnified(DONE);
     expect(completionReads()).toEqual([]);
     expect(h.state.merges).toHaveLength(0);
+  });
+});
+
+/**
+ * TEAM-4264 F5 — evidence_keys is written as a STRING, harvested only as an array.
+ *
+ * workflow-output's report_completion joins evidence_keys with commas (its schema
+ * declares the field a plain string); the orchestrator's harvest accepted only
+ * `Array.isArray(record.evidence_keys)`. The branch had never fired in production
+ * — every real evidence_keys value silently vanished. Now it accepts both shapes
+ * via live-reverify.mjs's splitCsv, the same parser hasLiveArtifact already trusts
+ * for this exact field.
+ */
+describe("evidence_keys harvest accepts the writer's own shape (TEAM-4264 F5)", () => {
+  /** Drive the REAL report_completion Lambda and hand its own S3 write to the harvest. */
+  async function writeRealRecord(extra) {
+    await workflowOutputHandler({
+      tool_name: "WorkflowOutput___report_completion",
+      arguments: { ticket_id: DONE, summary: "Ran the QA suite.", ...extra },
+    });
+    const put = h.state.s3Puts.find((p) => p.Key === COMPLETION_KEY);
+    h.state.s3Objects[COMPLETION_KEY] = put.Body;
+    return JSON.parse(put.Body);
+  }
+
+  it("a record produced by the REAL writer, given evidence_keys as a comma string, harvests as an array", async () => {
+    const written = await writeRealRecord({ evidence_keys: "qa-evidence/a.png,qa-evidence/b.har" });
+    expect(typeof written.evidence_keys).toBe("string"); // pins the writer's own shape
+    await handleTicketDoneUnified(DONE);
+    expect(h.state.merges[0].fields.evidence_keys).toEqual(["qa-evidence/a.png", "qa-evidence/b.har"]);
+  });
+
+  it("array input is unchanged (the pre-existing shape still works)", async () => {
+    harvest({ summary: "PASS", evidence_keys: ["qa/a.json", "qa/b.json"] });
+    await handleTicketDoneUnified(DONE);
+    expect(h.state.merges[0].fields.evidence_keys).toEqual(["qa/a.json", "qa/b.json"]);
+  });
+
+  it('"a, ,b" → ["a","b"] — blanks between commas are dropped, not stored as empty keys', async () => {
+    harvest({ summary: "PASS", evidence_keys: "a, ,b" });
+    await handleTicketDoneUnified(DONE);
+    expect(h.state.merges[0].fields.evidence_keys).toEqual(["a", "b"]);
+  });
+
+  it("51 keys are capped at 50", async () => {
+    const keys = Array.from({ length: 51 }, (_, i) => `qa/${i}.json`);
+    harvest({ summary: "PASS", evidence_keys: keys.join(",") });
+    await handleTicketDoneUnified(DONE);
+    expect(h.state.merges[0].fields.evidence_keys).toHaveLength(50);
+    expect(h.state.merges[0].fields.evidence_keys).toEqual(keys.slice(0, 50));
+  });
+
+  it("a 600-char key is DROPPED, never truncated", async () => {
+    const long = "qa/" + "x".repeat(600) + ".json";
+    harvest({ summary: "PASS", evidence_keys: `qa/short.json,${long}` });
+    await handleTicketDoneUnified(DONE);
+    expect(h.state.merges[0].fields.evidence_keys).toEqual(["qa/short.json"]);
+  });
+
+  it("duplicates collapse, first occurrence wins the order", async () => {
+    harvest({ summary: "PASS", evidence_keys: "qa/a.json,qa/b.json,qa/a.json" });
+    await handleTicketDoneUnified(DONE);
+    expect(h.state.merges[0].fields.evidence_keys).toEqual(["qa/a.json", "qa/b.json"]);
+  });
+
+  it("an existing entry.evidence_keys is never overwritten", async () => {
+    h.state.workflow = makeWorkflow({ evidence_keys: ["already/there.json"] });
+    harvest({ summary: "PASS", evidence_keys: "new/one.json" });
+    await handleTicketDoneUnified(DONE);
+    expect(h.state.merges[0].fields.evidence_keys).toBeUndefined();
+    expect(h.state.workflow.agentTasks[DONE].evidence_keys).toEqual(["already/there.json"]);
   });
 });
