@@ -53,12 +53,16 @@ not a rubber stamp, and the revise path recovers.
 
 ## What shipped
 
-**Blueprints** — the protocol is written into the delegation step of
-`blueprints/backend-dev.md` (Step 2), `blueprints/frontend-dev.md` (Step 3)
-and `blueprints/bug-fixer.md` (Step 3: the fix is planned after the root cause
-is confirmed in Step 2). Each blueprint's Rules pin the model split. Synced to
-the artifact bucket by the deploy stage like every other blueprint; unit tests
-pin the protocol's presence in all three.
+**Blueprints** — the protocol is written into the delegation step of every dev
+implementer: `blueprints/backend-dev.md` (Step 2), `blueprints/frontend-dev.md`
+(Step 3), `blueprints/bug-fixer.md` (Step 3: the fix is planned after the root
+cause is confirmed in Step 2), and `blueprints/api-dev.md` (Step 2). Each pins
+the model split in its Rules. `blueprints/code-sweeper.md` (Step 3) carries a
+**codex-aware** variant: its default engine is `codex`, which has no plan mode,
+so it gets the removal plan as text and approves it before any deletion; the
+`claude_code` fallback uses `plan_only`. Synced to the artifact bucket by the
+deploy stage like every other blueprint; unit tests pin the protocol's presence
+in all of them.
 
 **Coding runtime** (`deploy/coding-agent-runtime/main.py`) — a per-turn
 `permission_mode` payload field. Only `"plan"` is honored, swapping
@@ -91,13 +95,14 @@ Rollback is a blueprint edit: restore the previous delegation step and re-sync
 
 ## Not in this change
 
-- **Codex** has no plan mode equivalent. `plan_only` is ignored for `codex`
-  (the payload never carries `permission_mode` for it). The bug-fixer blueprint
-  tells the persona to ask codex for a text plan and approve it before the fix
-  turn when on that fallback. A read-only sandbox turn
+- **Codex enforcement.** `plan_only` is ignored for `codex` (the payload never
+  carries `permission_mode` for it), so the codex plan gate is prompt-only: the
+  bug-fixer and code-sweeper blueprints tell the persona to ask codex for a text
+  plan and approve it before the write/delete turn. A read-only sandbox turn
   (`codex exec --sandbox read-only`) could enforce it later.
-- **Other coding personas** (api-dev, code-sweeper, playbook-build) keep their
-  current delegation; adopt by copying the delegation step.
+- **Remaining personas.** `playbook-build` keeps its current delegation; adopt
+  by copying the delegation step. Designers, CI, and release-manager are not
+  code implementers and stay as-is.
 - **Plan artifacts.** Claude Code persists plans under its config dir on the
   coding runtime's EFS; they are not yet harvested to S3 or surfaced in the
   workflow artifact viewer.

@@ -11,9 +11,10 @@ Three things must hold on this side:
   1. `claude_code(plan_only=True)` reaches the coding runtime as
      `permission_mode: "plan"` (claude only) — and is absent otherwise, so a
      legacy far side sees today's payload.
-  2. The three coding blueprints carry the protocol: plan turn with
+  2. The dev coding blueprints carry the protocol: plan turn with
      plan_only=True on opus, review/revise instruction, execute on sonnet in the
-     same conversation.
+     same conversation. code-sweeper carries a codex-aware variant (text plan on
+     codex, plan_only on the claude_code fallback) checked separately.
   3. The LOCAL fallback path (no coding runtime) honors plan_only too: plan
      turn = `--permission-mode plan`, and the execute turn `--resume`s the plan
      turn's conversation. A task that never passes plan_only keeps today's argv
@@ -134,7 +135,10 @@ def test_execute_turn_resumes_the_plan_turns_conversation():
 
 # ─── 2. the coding blueprints carry the protocol ─────────────────────────────
 
-CODING_BLUEPRINTS = ["backend-dev", "frontend-dev", "bug-fixer"]
+# The dev implementers that plan on opus / execute on sonnet in one conversation.
+# code-sweeper is NOT here — its default engine is codex (no plan mode, no model=),
+# so it carries a codex-aware variant checked separately below.
+CODING_BLUEPRINTS = ["backend-dev", "frontend-dev", "bug-fixer", "api-dev"]
 
 
 def _blueprint(name):
@@ -171,6 +175,27 @@ def test_blueprint_rules_pin_the_model_split(name):
     assert re.search(r'PLAN turns on `"opus"`', text), name
     assert re.search(r'EXECUTE turns on `"sonnet"`', text), name
     assert re.search(r"Never let `claude_code` (write|change) code before you have read and approved", text), name
+
+
+def test_code_sweeper_carries_a_codex_aware_plan_first_variant():
+    # code-sweeper defaults to codex (no plan mode), so it can't use the verbatim
+    # opus-plan/sonnet-execute protocol. It still must plan the removals and approve
+    # the plan before ANY deletion — text plan on codex, plan_only on the claude_code
+    # fallback. The "plan" here is the removal ledger.
+    text = _blueprint("code-sweeper")
+    assert "PLAN the removals" in text
+    assert re.search(r"must NOT delete code until you have approved", text)
+    # codex path: no plan mode → get the plan as text first
+    assert "has no plan mode" in text
+    assert "as TEXT" in text
+    # claude_code fallback path: real plan mode
+    assert "plan_only=True" in text
+    # the review is a real gate, and the revise path recovers
+    assert "Never approve a plan you did not read" in text
+    assert "Cap at 2 revision rounds" in text
+    assert "Plan approved." in text
+    # Rules restate the gate
+    assert re.search(r"Never let the engine delete code before you have read and approved", text)
 
 
 def test_load_blueprint_has_no_injection_or_flag():

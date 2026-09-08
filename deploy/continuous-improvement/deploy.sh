@@ -30,6 +30,8 @@ FLEET_REPO="$FLEET_REPO_URL"
 # Cross-delivery dedup seen-set (config.sh defaults it to agentcore-hub-eval-seen,
 # matching index.mjs and the table deploy-all.sh creates).
 SEEN_TABLE="$EVAL_SEEN_TABLE"
+# Per-day metric buckets (PK agentId / SK day) — see deploy-all.sh + backfill-daily.mjs.
+DAILY_TABLE="${EVAL_DAILY_TABLE:-agentcore-hub-eval-daily}"
 
 # Resolve the Fleet Improver runtime ARN dynamically (no hardcoded suffix —
 # the runtime id is account-specific). eval-packager invokes this on flush to
@@ -122,7 +124,7 @@ deploy_lambda() {
 # naming it here makes the wiring visible in the function config instead of
 # hiding a silently fail-open dedup layer behind a code default.
 deploy_lambda "eval-packager" "eval-packager" 600 512 \
-  "{ARTIFACT_BUCKET=${BUCKET},IMPROVEMENT_AGENT_ARN=${IMPROVER_ARN},AWS_ACCOUNT_ID=${ACCOUNT_ID},EVAL_SEEN_TABLE=${SEEN_TABLE}}"
+  "{ARTIFACT_BUCKET=${BUCKET},IMPROVEMENT_AGENT_ARN=${IMPROVER_ARN},AWS_ACCOUNT_ID=${ACCOUNT_ID},EVAL_SEEN_TABLE=${SEEN_TABLE},EVAL_DAILY_TABLE=${DAILY_TABLE}}"
 
 deploy_lambda "prd-submitter" "prd-submitter" 30 256 \
   "{ARTIFACT_BUCKET=${BUCKET},WORKFLOW_API_URL=${WORKFLOW_API},FLEET_REPO_URL=${FLEET_REPO}}"

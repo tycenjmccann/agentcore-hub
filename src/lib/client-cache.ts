@@ -70,13 +70,6 @@ export function getCached<T>(url: string): T | null {
 }
 
 /**
- * Invalidate a specific cache entry (e.g., after a mutation).
- */
-export function invalidateCache(url: string) {
-  cache.delete(url);
-}
-
-/**
  * Invalidate all entries matching a prefix.
  */
 export function invalidateCachePrefix(prefix: string) {

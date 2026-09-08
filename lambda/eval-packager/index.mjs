@@ -1338,6 +1338,73 @@ async function appendToBuffer(agentId, sessionData, batchSize) {
 // so tests stay deterministic and fast.
 const AGG_RETRY = { maxAttempts: 3, baseDelayMs: 25 };
 
+// ─── Per-UTC-day buckets (shared table with lambda/token-aggregator) ────────
+// The dashboard applies ONE rolling window to sessions, scores AND tokens, so
+// the packager writes its per-day sessions/evalScores into the same
+// EVAL_DAILY_TABLE item (PK agentId / SK day) the token-aggregator fills with
+// token counts. Flat attribute names (`sessions`, `e|<evaluator>|sum`,
+// `e|<evaluator>|count`) so ONE atomic ADD creates-or-increments everything —
+// no read-modify-write, no CAS, no contention with the token writer. Kept OFF
+// the eval-config row on purpose: that row carries sessionBuffer and sits at
+// the 400KB item cap for busy agents.
+const DAILY_TABLE = process.env.EVAL_DAILY_TABLE || 'agentcore-hub-eval-daily';
+const DAILY_RETAIN_DAYS = Math.max(7, Number(process.env.DAILY_RETAIN_DAYS) || 14);
+
+export function dayKeyOf(ms) {
+  const n = Number(ms);
+  return new Date(Number.isFinite(n) && n > 0 ? n : Date.now()).toISOString().slice(0, 10);
+}
+
+export function evaluatorAttr(evaluator, field) {
+  return `e|${evaluator}|${field}`;
+}
+
+export function buildDailyEvalExpression(day, delta, now, retainDays = DAILY_RETAIN_DAYS) {
+  const expires = new Date(`${day}T00:00:00Z`);
+  expires.setUTCDate(expires.getUTCDate() + retainDays + 1);
+  const names = { '#expiresAt': 'expiresAt', '#updatedAt': 'updatedAt' };
+  const values = { ':now': now, ':ttl': Math.floor(expires.getTime() / 1000) };
+  const adds = [];
+  if (delta.sessions > 0) {
+    names['#sessions'] = 'sessions';
+    values[':sessions'] = delta.sessions;
+    adds.push('#sessions :sessions');
+  }
+  Object.entries(delta.evalScores).forEach(([evaluator, d], i) => {
+    names[`#e${i}s`] = evaluatorAttr(evaluator, 'sum');
+    names[`#e${i}c`] = evaluatorAttr(evaluator, 'count');
+    values[`:e${i}s`] = d.sum;
+    values[`:e${i}c`] = d.count;
+    adds.push(`#e${i}s :e${i}s`, `#e${i}c :e${i}c`);
+  });
+  return {
+    UpdateExpression: `SET #updatedAt = :now, #expiresAt = if_not_exists(#expiresAt, :ttl) ADD ${adds.join(', ')}`,
+    ExpressionAttributeNames: names,
+    ExpressionAttributeValues: values,
+    empty: adds.length === 0,
+  };
+}
+
+// Non-fatal: a failed day-bucket write leaves the windowed dashboard stale for
+// one delivery; the all-time aggregates below are untouched by it.
+async function writeDailyEvalBuckets(agentId, dailyDeltas, now) {
+  for (const [day, delta] of Object.entries(dailyDeltas)) {
+    const expr = buildDailyEvalExpression(day, { sessions: delta.sessions.size, evalScores: delta.evalScores }, now);
+    if (expr.empty) continue;
+    try {
+      await ddb.send(new UpdateCommand({
+        TableName: DAILY_TABLE,
+        Key: { agentId, day },
+        UpdateExpression: expr.UpdateExpression,
+        ExpressionAttributeNames: expr.ExpressionAttributeNames,
+        ExpressionAttributeValues: expr.ExpressionAttributeValues,
+      }));
+    } catch (err) {
+      console.error(`[eval-packager] ${agentId} ${day}: daily bucket write failed:`, err.message);
+    }
+  }
+}
+
 // Exported (TEAM-3427) so the config-evals battery suite can exercise the
 // guard hermetically with a mocked DDB client.
 export async function aggregateScoresToDdb(agentId, entries = []) {
@@ -1361,9 +1428,17 @@ export async function aggregateScoresToDdb(agentId, entries = []) {
     return true;
   });
 
+  // Per-UTC-day view of the same deltas, keyed by the evaluator result's log
+  // timestamp: { day: { sessions: Set, evalScores: { name: { sum, count } } } }.
+  const dailyDeltas = {};
+  const dayOf = (r) => (dailyDeltas[dayKeyOf(r.timestamp)] ||= { sessions: new Set(), evalScores: {} });
+
   for (const r of entries) {
     if (r.parseError) continue;
-    if (r.sessionId) sessions.add(r.sessionId);
+    if (r.sessionId) {
+      sessions.add(r.sessionId);
+      dayOf(r).sessions.add(r.sessionId);
+    }
     // Same eligibility as the old raw parse: an evaluator name, a finite score
     // (extractSessionData already nulls NaN garbage that would poison the
     // rolling sum), and no error signal (error.type or the raw error===1 flag).
@@ -1372,10 +1447,18 @@ export async function aggregateScoresToDdb(agentId, entries = []) {
       if (!scoreDeltas[r.evaluatorName]) scoreDeltas[r.evaluatorName] = { sum: 0, count: 0 };
       scoreDeltas[r.evaluatorName].sum += r.score;
       scoreDeltas[r.evaluatorName].count += 1;
+      const dayScores = dayOf(r).evalScores;
+      if (!dayScores[r.evaluatorName]) dayScores[r.evaluatorName] = { sum: 0, count: 0 };
+      dayScores[r.evaluatorName].sum += r.score;
+      dayScores[r.evaluatorName].count += 1;
     }
   }
 
   if (Object.keys(scoreDeltas).length === 0 && sessions.size === 0) return;
+
+  // Windowed view first: its own table, its own atomic ADD, independent of the
+  // CAS below (a lost version check re-merges the all-time scorecard only).
+  await writeDailyEvalBuckets(agentId, dailyDeltas, new Date().toISOString());
 
   const deliverySummary = computeBatchSummary(entries);
   const sleep =

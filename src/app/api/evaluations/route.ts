@@ -1,13 +1,24 @@
 /**
- * GET /api/evaluations — Fetch evaluation scorecard + per-agent metrics
+ * GET /api/evaluations?days=7 — Fetch evaluation scorecard + per-agent metrics
  *
- * Sources: Single DynamoDB Scan on agentcore-hub-eval-config table.
- * Token usage and eval scores are pre-aggregated by subscription-filter Lambdas.
+ * Sources: a Scan of agentcore-hub-eval-config (which agents exist) and a Scan
+ * of agentcore-hub-eval-daily — one item per agent per UTC day, written by the
+ * token-aggregator (tokens, cache, cost) and eval-packager (sessions, evaluator
+ * scores) Lambdas. Every number is folded over the SAME rolling window — today
+ * plus the previous (days - 1) UTC days; `days` clamps to 1..14 (bucket TTL).
+ * No weekly reset, no all-time counters.
  */
 
-import { NextResponse } from "next/server";
-import { headers } from "next/headers";
-import { getAllEvalConfigs } from "@/lib/eval-config";
+import { NextRequest, NextResponse } from "next/server";
+import { getAllEvalConfigs, getAllEvalDaily } from "@/lib/eval-config";
+import {
+  DEFAULT_WINDOW_DAYS,
+  groupDailyItems,
+  summarizeDaily,
+  windowDays,
+  type AgentWindowSummary,
+  type Pricing,
+} from "@/lib/eval-metrics";
 import agentsConfig from "@/config/agents.json";
 import pricingConfig from "@/config/pricing.json";
 
@@ -22,11 +33,9 @@ function normalizeEvaluatorName(raw: string): string {
   return raw;
 }
 
-// Per-model pricing (per 1M tokens) — src/config/pricing.json is the single
-// source of truth, shared with the cost-report Lambda via the S3 config prefix.
-const MODEL_PRICING: Record<string, { input: number; output: number }> =
-  pricingConfig.models;
-const DEFAULT_PRICING = pricingConfig.default;
+// src/config/pricing.json is the single source of truth (shared with the
+// cost-report Lambda via the S3 config prefix); cache discount/surcharge included.
+const PRICING = pricingConfig as unknown as Pricing;
 
 // Agent ID → display name map
 const AGENT_DISPLAY_NAMES = new Map(
@@ -35,111 +44,84 @@ const AGENT_DISPLAY_NAMES = new Map(
     .map((a) => [a.agentId, a.displayName])
 );
 
-// In-memory cache
-let cachedResponse: { data: unknown; timestamp: number } | null = null;
+// In-memory cache, per window length
+const cache = new Map<number, { data: unknown; timestamp: number }>();
 const CACHE_TTL_MS = 2 * 60 * 1000; // 2 minutes
 
-export async function GET() {
-  await headers();
+const EVALUATORS = [
+  "ToolSelectionAccuracy",
+  "ToolParameterAccuracy",
+  "InstructionFollowing",
+  "GoalSuccessRate",
+  "Correctness",
+  "Coherence",
+  "Faithfulness",
+  "Helpfulness",
+  "Conciseness",
+  "ResponseRelevance",
+  "DependencyChainCompliance",
+];
 
-  if (cachedResponse && Date.now() - cachedResponse.timestamp < CACHE_TTL_MS) {
-    return NextResponse.json(cachedResponse.data);
+type Scorecard = Record<string, Record<string, { avg: number; count: number; passing: number }>>;
+
+function scorecardFrom(summary: AgentWindowSummary): Record<string, { avg: number; count: number; passing: number }> | null {
+  const out: Record<string, { avg: number; count: number; passing: number }> = {};
+  for (const [rawEvaluator, data] of Object.entries(summary.evalScores)) {
+    if (!data.count) continue;
+    const avg = data.sum / data.count;
+    // Estimate passing rate: scores >= 0.7 (avg as proxy since we store sum/count)
+    out[normalizeEvaluatorName(rawEvaluator)] = {
+      avg: Math.round(avg * 100) / 100,
+      count: data.count,
+      passing: avg >= 0.7 ? 100 : Math.round(avg * 100),
+    };
+  }
+  return Object.keys(out).length ? out : null;
+}
+
+export async function GET(req: NextRequest) {
+  const requested = Number(req.nextUrl.searchParams.get("days"));
+  const days = windowDays(Number.isFinite(requested) && requested > 0 ? requested : DEFAULT_WINDOW_DAYS);
+  const windowLen = days.length;
+
+  const hit = cache.get(windowLen);
+  if (hit && Date.now() - hit.timestamp < CACHE_TTL_MS) {
+    return NextResponse.json(hit.data);
   }
 
   try {
-    // Single DDB Scan — returns all agent configs with pre-aggregated metrics
-    const items = await getAllEvalConfigs();
+    const [items, dailyItems] = await Promise.all([getAllEvalConfigs(), getAllEvalDaily()]);
+    const dailyByAgent = groupDailyItems(dailyItems);
 
     const agents: string[] = [];
-    const scorecardSummary: Record<string, Record<string, { avg: number; count: number; passing: number }>> = {};
-    const metrics: Record<string, {
-      sessions: number;
-      tokensIn: number;
-      tokensOut: number;
-      cost: number;
-      costPerSession: number;
-      models: Array<{ model: string; input: number; output: number; cost: number }>;
-    }> = {};
+    const scorecard: Scorecard = {};
+    const metrics: Record<string, Omit<AgentWindowSummary, "evalScores">> = {};
 
     for (const item of items) {
       const agentId = item.agentId as string;
       const displayName = AGENT_DISPLAY_NAMES.get(agentId);
       if (!displayName) continue;
-
       agents.push(displayName);
 
-      // ─── Eval Scores (pre-aggregated by eval-packager Lambda) ───────
-      const evalScores = (item.evalScores || {}) as Record<string, { sum: number; count: number }>;
-      const sessions = (item.evalSessionCount as number) || 0;
+      const summary = summarizeDaily(dailyByAgent[agentId], days, PRICING);
+      const scores = scorecardFrom(summary);
+      if (scores) scorecard[displayName] = scores;
 
-      if (Object.keys(evalScores).length > 0) {
-        scorecardSummary[displayName] = {};
-        for (const [rawEvaluator, data] of Object.entries(evalScores)) {
-          const evaluator = normalizeEvaluatorName(rawEvaluator);
-          if (data.count === 0) continue;
-          const avg = data.sum / data.count;
-          // Estimate passing rate: scores >= 0.7 (using avg as proxy since we store sum/count)
-          const passing = avg >= 0.7 ? 100 : Math.round(avg * 100);
-          scorecardSummary[displayName][evaluator] = {
-            avg: Math.round(avg * 100) / 100,
-            count: data.count,
-            passing,
-          };
-        }
-      }
-
-      // ─── Token Metrics (pre-aggregated by token-aggregator Lambda) ──
-      const tokensIn = (item.tokenTotalInput as number) || 0;
-      const tokensOut = (item.tokenTotalOutput as number) || 0;
-      const tokenByModel = (item.tokenByModel || {}) as Record<string, { input: number; output: number }>;
-
-      let totalCost = 0;
-      const modelBreakdown: Array<{ model: string; input: number; output: number; cost: number }> = [];
-      for (const [model, usage] of Object.entries(tokenByModel)) {
-        const pricing = MODEL_PRICING[model] || DEFAULT_PRICING;
-        const modelCost = (usage.input / 1_000_000 * pricing.input) + (usage.output / 1_000_000 * pricing.output);
-        totalCost += modelCost;
-        modelBreakdown.push({
-          model,
-          input: Math.round(usage.input),
-          output: Math.round(usage.output),
-          cost: Math.round(modelCost * 100) / 100,
-        });
-      }
-
-      const costPerSession = sessions > 0 ? totalCost / sessions : 0;
-
-      metrics[displayName] = {
-        sessions,
-        tokensIn: Math.round(tokensIn),
-        tokensOut: Math.round(tokensOut),
-        cost: Math.round(totalCost * 100) / 100,
-        costPerSession: Math.round(costPerSession * 100) / 100,
-        models: modelBreakdown,
-      };
+      const { evalScores: _omit, ...rest } = summary;
+      void _omit;
+      metrics[displayName] = rest;
     }
 
     const responseData = {
       agents,
-      scorecard: scorecardSummary,
+      scorecard,
       metrics,
-      evaluators: [
-        "ToolSelectionAccuracy",
-        "ToolParameterAccuracy",
-        "InstructionFollowing",
-        "GoalSuccessRate",
-        "Correctness",
-        "Coherence",
-        "Faithfulness",
-        "Helpfulness",
-        "Conciseness",
-        "ResponseRelevance",
-        "DependencyChainCompliance",
-      ],
+      evaluators: EVALUATORS,
+      window: { days: windowLen, start: days[0], end: days[days.length - 1], timezone: "UTC" },
       lastUpdated: new Date().toISOString(),
     };
 
-    cachedResponse = { data: responseData, timestamp: Date.now() };
+    cache.set(windowLen, { data: responseData, timestamp: Date.now() });
     return NextResponse.json(responseData);
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : "Unknown error";

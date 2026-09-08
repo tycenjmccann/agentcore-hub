@@ -20,13 +20,6 @@
  * Ready → In Progress → Ready after a reopen).
  */
 
-export interface WorkflowCommand {
-  source: "jira-webhook";
-  ticketId: string;
-  newStatus: string;
-  oldStatus: string;
-}
-
 /** All commands for one workflow serialize under its root issue key. */
 export function commandGroupId(issueKey: string, parentKey?: string): string {
   return parentKey || issueKey;

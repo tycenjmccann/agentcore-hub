@@ -82,10 +82,38 @@ each one was kept. The same applies when candidates exist but ALL of them land i
 "Candidates not removed" — that is `verified_removable=0` with a long ledger, which
 is exactly the shape a human wants to read.
 
-### Step 3: Remove surgically
-- Delete only verified-dead code. No refactors, no reformatting, no renames, no
-  "while I'm here" changes. Removals only.
-- Group the diff logically (by module/file) so review is easy.
+### Step 3: PLAN the removals, then remove
+The engine must NOT delete code until you have approved a removal plan. A deletion
+is irreversible in the diff and the whole risk here is false positives, so the plan
+gate is where you catch a removal that Step 2 let through.
+
+**3a. Plan.**
+- **`claude_code` (fallback):** `plan_only=True`, `model="opus"`. Plan mode reads the
+  repo and returns the plan; it cannot edit files or run mutating commands.
+- **`codex` (default) has no plan mode:** ask it for the removal plan as TEXT and make
+  no edits this turn — "List every deletion you will make and why each is safe; do NOT
+  edit any file yet."
+
+  The plan must be, per candidate: file:line, symbol, the exact deletion, the grep/entry-point
+  evidence it is dead, and the build + test command that will prove nothing broke. It must
+  cover ONLY candidates that passed Step 2 verification — nothing from "Candidates not removed",
+  no refactors, renames, or reformatting.
+
+**3b. Review the plan** against your verified candidate list: every deletion maps to a
+Step-2-verified-dead candidate, no KEEP candidate is being removed, removals only (no
+refactor/rename/reformat), and the build+test step is named. Deficient → send it back
+(same conversation, so it revises rather than restarts): `Revise the plan: [specific
+gaps]` (claude_code: `plan_only=True, model="opus"`).
+Never approve a plan you did not read. Cap at 2 revision rounds, then proceed with the
+best plan and note the residual gap in the ledger.
+
+**3c. Approve + execute the deletions.**
+- **`claude_code`:** same conversation, NO `plan_only`, NO `resume_session`,
+  `model="sonnet"`: "Plan approved. Make exactly those deletions and nothing else."
+- **`codex`:** "Plan approved. Make exactly those deletions and nothing else."
+
+Removals only — no refactors, no reformatting, no renames, no "while I'm here" changes.
+Group the diff logically (by module/file) so review is easy.
 
 ### Step 4: Prove nothing broke — BUILD + TEST
 A green delete is NOT proof. You must show the project still builds and its tests
@@ -117,7 +145,8 @@ still pass with the code gone.
    State plainly what you ACTUALLY built and ran vs did not.
 
 ## Rules
-- Pick the intelligence tier per `claude_code` call with `model=`: `"fable"` (default — top reasoning, plans/complex debugging), `"opus"` (deep implementation work), `"sonnet"` (routine, well-specified coding), `"haiku"` (trivial mechanical edits). Match the tier to the difficulty; when unsure, leave it empty.
+- Plan the removals and approve the plan BEFORE any deletion (Step 3). Never let the engine delete code before you have read and approved its removal plan. `codex` (the default) has no plan mode — get the plan as text and approve it before the delete turn; on the `claude_code` fallback use `plan_only=True`.
+- `claude_code` fallback model tiers (`model=`): PLAN turns on `"opus"` (`"fable"` for ambiguous work); EXECUTE turns on `"sonnet"`, `"opus"` for complex ones. Never plan on haiku. (`codex` is pinned — no `model=`.)
 - ALWAYS report `verified_removable=<n>` and `candidates=<n>` on
   `WorkflowOutput___report_completion` (Step 2.5) — on the detection ticket and on
   the sweep ticket, and especially when the answer is 0. Those fields are how the

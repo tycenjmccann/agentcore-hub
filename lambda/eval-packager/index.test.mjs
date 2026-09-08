@@ -3047,6 +3047,39 @@ describe('TEAM-3385: span-missing classification + concurrency claims', () => {
     expect(ddbState.aggWrites[0].ExpressionAttributeValues[':nextVersion']).toBe(1);
   });
 
+  it('writes the delivery into the per-UTC-day bucket table alongside the all-time aggregates', async () => {
+    ddbState.config = { ...ddbState.config, batchSize: 10 };
+
+    // Log-event timestamps are 1_700_000_000_000 + i → 2023-11-14 UTC.
+    await handler(
+      awslogsEvent([
+        evalRecord({ sessionId: 'sess-day-a', score: 8, scoreLabel: 'pass', requestId: 'req-day-a' }),
+        evalRecord({ sessionId: 'sess-day-b', evaluatorName: 'builtin.helpfulness', score: 6, scoreLabel: 'pass', requestId: 'req-day-b' }),
+      ])
+    );
+
+    const daily = sentCommands(ddbSend, 'UpdateCommand').map((c) => c.input).filter((u) => u.Key?.day);
+    expect(daily).toHaveLength(1);
+    const [w] = daily;
+    expect(w.TableName).toBe('agentcore-hub-eval-daily');
+    expect(w.Key).toEqual({ agentId: AGENT_ID, day: '2023-11-14' });
+    // One atomic ADD, flat names — no path set-up, no CAS.
+    expect(w.UpdateExpression).toMatch(/^SET #updatedAt = :now, #expiresAt = if_not_exists\(#expiresAt, :ttl\) ADD #sessions :sessions, #e0s :e0s, #e0c :e0c, #e1s :e1s, #e1c :e1c$/);
+    expect(w.ExpressionAttributeNames).toMatchObject({
+      '#sessions': 'sessions',
+      '#e0s': 'e|builtin.correctness|sum', '#e0c': 'e|builtin.correctness|count',
+      '#e1s': 'e|builtin.helpfulness|sum', '#e1c': 'e|builtin.helpfulness|count',
+    });
+    expect(w.ExpressionAttributeValues).toMatchObject({ ':sessions': 2, ':e0s': 8, ':e0c': 1, ':e1s': 6, ':e1c': 1 });
+    expect(w.ExpressionAttributeValues[':ttl']).toBe(Date.UTC(2023, 10, 29) / 1000); // 14 + 1 days after 2023-11-14
+    expect(w.ConditionExpression).toBeUndefined();
+
+    // All-time aggregates untouched in shape and still CAS-guarded.
+    expect(ddbState.aggWrites).toHaveLength(1);
+    expect(ddbState.aggWrites[0].ExpressionAttributeValues[':sc']).toBe(2);
+    expect(ddbState.aggWrites[0].UpdateExpression).not.toContain('daily');
+  });
+
   it('exhausting the aggregation retries is non-fatal: the delivery is still buffered and flushed', async () => {
     ddbState.aggConflicts = 3; // every attempt loses
 

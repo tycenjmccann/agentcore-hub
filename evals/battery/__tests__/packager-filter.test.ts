@@ -222,7 +222,11 @@ describe("eval-packager battery guard — behavioral, both paths (TEAM-3390)", (
     ddbMock.sent.length = 0;
     await aggregateScoresToDdb("test-agent", extractSessionData(mixedBatch).evaluatorResults);
 
-    const update = ddbMock.sent.find((cmd) => cmd.constructor.name === "UpdateCommand");
+    // The scorecard merge is the UpdateCommand carrying :sc — the per-day bucket
+    // materialisation (if_not_exists SETs) now precedes it.
+    const update = ddbMock.sent.find(
+      (cmd) => cmd.constructor.name === "UpdateCommand" && cmd.input.ExpressionAttributeValues?.[":sc"] !== undefined
+    );
     expect(update).toBeDefined();
 
     const values = update.input.ExpressionAttributeValues;
@@ -246,7 +250,11 @@ describe("eval-packager battery guard — behavioral, both paths (TEAM-3390)", (
       entryOf("prod-run-43", "correctness", 0.8),
     ]);
 
-    const update = ddbMock.sent.find((cmd) => cmd.constructor.name === "UpdateCommand");
+    // The scorecard merge is the UpdateCommand carrying :sc — the per-day bucket
+    // materialisation (if_not_exists SETs) now precedes it.
+    const update = ddbMock.sent.find(
+      (cmd) => cmd.constructor.name === "UpdateCommand" && cmd.input.ExpressionAttributeValues?.[":sc"] !== undefined
+    );
     expect(update).toBeDefined();
     const values = update.input.ExpressionAttributeValues;
     expect(values[":sc"]).toBe(2);
@@ -404,7 +412,11 @@ describe("top-level session.id hits the battery guard (TEAM-3427 finding 6)", ()
     ]);
     await aggregateScoresToDdb("test-agent", data.evaluatorResults);
 
-    const update = ddbMock.sent.find((cmd) => cmd.constructor.name === "UpdateCommand");
+    // The scorecard merge is the UpdateCommand carrying :sc — the per-day bucket
+    // materialisation (if_not_exists SETs) now precedes it.
+    const update = ddbMock.sent.find(
+      (cmd) => cmd.constructor.name === "UpdateCommand" && cmd.input.ExpressionAttributeValues?.[":sc"] !== undefined
+    );
     expect(update).toBeDefined();
     const values = update.input.ExpressionAttributeValues;
     expect(values[":sc"]).toBe(2);
@@ -424,7 +436,11 @@ describe("top-level session.id hits the battery guard (TEAM-3427 finding 6)", ()
       entryOf("prod-run-42", "helpfulness", 0.9),
     ]);
 
-    const update = ddbMock.sent.find((cmd) => cmd.constructor.name === "UpdateCommand");
+    // The scorecard merge is the UpdateCommand carrying :sc — the per-day bucket
+    // materialisation (if_not_exists SETs) now precedes it.
+    const update = ddbMock.sent.find(
+      (cmd) => cmd.constructor.name === "UpdateCommand" && cmd.input.ExpressionAttributeValues?.[":sc"] !== undefined
+    );
     expect(update).toBeDefined();
     const values = update.input.ExpressionAttributeValues;
     expect(values[":sc"]).toBe(1);
@@ -443,7 +459,11 @@ describe("top-level session.id hits the battery guard (TEAM-3427 finding 6)", ()
     });
     await aggregateScoresToDdb("test-agent", data.evaluatorResults);
 
-    const update = ddbMock.sent.find((cmd) => cmd.constructor.name === "UpdateCommand");
+    // The scorecard merge is the UpdateCommand carrying :sc — the per-day bucket
+    // materialisation (if_not_exists SETs) now precedes it.
+    const update = ddbMock.sent.find(
+      (cmd) => cmd.constructor.name === "UpdateCommand" && cmd.input.ExpressionAttributeValues?.[":sc"] !== undefined
+    );
     expect(update).toBeDefined();
     const values = update.input.ExpressionAttributeValues;
     // both shapes count: prod-run-77 (top-level) + prod-run-42 (attributes)

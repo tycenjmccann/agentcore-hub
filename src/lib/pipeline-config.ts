@@ -324,7 +324,7 @@ export function getPhaseToolCount(phaseId: string, defId: string = DEFAULT_WORKF
 
 
 
-// ─── Derive PIPELINE_PHASES from agents.json + display metadata ─────────────
+// ─── Derive pipeline phases from agents.json + display metadata ─────────────
 
 /** Convert a kebab-case skill slug into a Title Case display label. */
 const SKILL_ACRONYMS = new Set(["api", "aws", "ci", "cd", "hig", "i18n", "qa", "ux", "ui"]);
@@ -442,9 +442,6 @@ function buildPipelinePhasesForDef(def: WorkflowDef): PipelinePhaseConfig[] {
 export function getPipelinePhases(defId: string = DEFAULT_WORKFLOW_DEF_ID): PipelinePhaseConfig[] {
   return buildPipelinePhasesForDef(getWorkflowDef(defId));
 }
-
-/** Default workflow pipeline (software-delivery) — preserves the original export. */
-export const PIPELINE_PHASES: PipelinePhaseConfig[] = getPipelinePhases();
 
 // ─── Helper: Resolve tool name to icon ──────────────────────────────────────
 
