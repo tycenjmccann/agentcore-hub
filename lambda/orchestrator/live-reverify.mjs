@@ -117,8 +117,13 @@ export function hasLiveArtifact(record) {
   return keys.some((k) => k.includes("/qa-evidence/") || k.startsWith("qa-evidence/"));
 }
 
-/** One line, no backticks/control chars — the repro is inert data in every render. */
-function inertOneLine(value, max = 500) {
+/**
+ * One line, no backticks/control chars — the repro is inert data in every render.
+ * Exported for artifact-chain.mjs (TEAM-4248 D3): a gate decision is another
+ * string a human typed that ends up inside a prompt, so it needs the same
+ * treatment, and a second sanitiser would be a second thing to keep correct.
+ */
+export function inertOneLine(value, max = 500) {
   const s = typeof value === "string" ? value : "";
   return s
     // Backticks and control chars out first (a newline is how a "repro" turns into

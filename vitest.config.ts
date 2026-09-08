@@ -428,6 +428,49 @@ export default defineConfig({
       // sweep def requires BOTH `detection` and `development`, so a run with one
       // sweeper ticket can never complete, which is why commit 4's intake plans two.
       "lambda/orchestrator/replay-iczquj-sweep-full-chain.test.mjs",
+      // ticket-plan-validator (TEAM-4248 D3) — what a valid ticket plan IS. Nothing
+      // validated one before: c2uqki's sweeper TEAM-4230 was minted with
+      // blocked_by=[] and invoked 92.3s BEFORE the requirements analyst it depends
+      // on completed, and the same shape appears on all three ember runs. The cases
+      // run against the vendored c2uqki plan AS SUBMITTED — root entry absent, so
+      // the first entry is the offender — because that shape is what defeats the
+      // obvious "first unblocked entry is the root" heuristic and it is the whole
+      // reason the root is resolved by ROLE here.
+      "lambda/orchestrator/ticket-plan-validator.test.mjs",
+      // branch-name-parity (TEAM-4248 D3) — index.mjs's ## Branch block now derives
+      // the name from canonicalBranchFor instead of building it by hand, so this spec
+      // guards the two things check-fix-kinds-parity.sh cannot see: that no FIFTH copy
+      // of the template has been re-inlined into index.mjs, and that
+      // canonicalBranchFor still renders exactly what index.mjs rendered before D3
+      // moved it. Drift here is what handed c2uqki's reviewer a branch the sweeper
+      // never pushed.
+      "lambda/orchestrator/branch-name-parity.test.mjs",
+      // branch-context (TEAM-4248 D3) — the ## Branch block through the REAL
+      // buildAgentContext. It used to render for development-phase personas only, so
+      // c2uqki's reviewer, QA and CI were told nothing and each followed the invented
+      // `chore/dead-code-sweep-2026-09-07` into a session that had to reconcile by
+      // hand. The cases pin the whole ladder: off is byte-identical to before (no
+      // block, no board read), shadow tells every persona while leaving the prose
+      // untouched, and enforce is the only mode in which the rewritten description
+      // reaches the model.
+      "lambda/orchestrator/branch-context.test.mjs",
+      // decision-ledger (TEAM-4248 D3) — the ledger's I/O half through the REAL
+      // index.mjs: record on gate approval, surface in the review package, withhold
+      // the gate under enforce, and the open-decision checklist in context.
+      // artifact-chain.test.mjs pins the grammar; only these cases can pin the
+      // COSTS — that off touches neither GitHub nor S3, that a webhook redelivery
+      // performs zero PUTs, and that a withheld gate records no cycle. dowtdh's
+      // TEAM-4178 approved a plan contradicting the product owner's own Concern-3
+      // decision because nothing in the package said so.
+      "lambda/orchestrator/decision-ledger.test.mjs",
+      // replay-dowtdh-decision-loss (TEAM-4248 D3, acceptance 4) — the run itself,
+      // driven through the REAL gate path with the REAL review-cap: the two gate
+      // approvals that carried the product owner's decisions, then TEAM-4178. Its
+      // fixtures are dowtdh's own record (workflow row, workflow def, the six
+      // review-package bullets the engineer saw, the review.needed / agent.complete
+      // events), so `off` reproduces the defect exactly, shadow leads the same package
+      // with what was dropped, and enforce reopens TEAM-4177 instead of paging anyone.
+      "lambda/orchestrator/replay-dowtdh-decision-loss.test.mjs",
     ],
     // Keep unit tests away from the Playwright specs under tests/.
     exclude: ["tests/**", "node_modules/**", "demo/**"],

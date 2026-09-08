@@ -56,7 +56,7 @@ cp "$REPO_ROOT/src/config/lease-constants.json" ./lease-constants.json
 # agent-invoker.mjs, events-writer.mjs (TEAM-3696) — a module missing here dies
 # at cold start with ERR_MODULE_NOT_FOUND. Verify with
 # ./scripts/check-lambda-zip-manifest.sh before changing this line.
-zip -rq function.zip index.mjs agent-invoker.mjs events-writer.mjs workflow-store.mjs lease.mjs lease-constants.json watchdog.mjs dead-session-detector.mjs cascade.mjs review-cap.mjs ship-review.mjs completion.mjs pipeline-enabled.mjs cd-registry.mjs reconcile-sweep.mjs sweep-scan.mjs merge-on-green.mjs ship-head-stability.mjs ship-dispatch-gate.mjs rework-loop-cap.mjs live-reverify.mjs repo-check.mjs ci-check.mjs sync-main.mjs event-id.mjs gate-state.mjs dead-session-escalation.mjs ticket-blockers.mjs fix-contract.mjs artifact-chain.mjs verdict-contract.mjs package.json node_modules/
+zip -rq function.zip index.mjs agent-invoker.mjs events-writer.mjs workflow-store.mjs lease.mjs lease-constants.json watchdog.mjs dead-session-detector.mjs cascade.mjs review-cap.mjs ship-review.mjs completion.mjs pipeline-enabled.mjs cd-registry.mjs reconcile-sweep.mjs sweep-scan.mjs merge-on-green.mjs ship-head-stability.mjs ship-dispatch-gate.mjs rework-loop-cap.mjs live-reverify.mjs repo-check.mjs ci-check.mjs sync-main.mjs event-id.mjs gate-state.mjs dead-session-escalation.mjs ticket-blockers.mjs fix-contract.mjs artifact-chain.mjs verdict-contract.mjs ticket-plan-validator.mjs package.json node_modules/
 rm -f lease-constants.json
 
 SIZE=$(ls -lh function.zip | awk '{print $5}')
@@ -374,7 +374,44 @@ else
   echo "  SWEEP_DETECTION_PHASE unset - orchestrator defaults to shadow (set off to disable)"
 fi
 
-ENV_VARS_ORCH="Variables={ARTIFACT_BUCKET=${ARTIFACT_BUCKET},TICKETS_TABLE=${TICKETS_TABLE},WORKFLOWS_TABLE=${WORKFLOWS_TABLE},EVENTS_TABLE=${EVENTS_TABLE},TICKET_PROVIDER=${TICKET_PROVIDER},TICKET_TOOLS_LAMBDA=${TICKET_TOOLS_LAMBDA}${JIRA_VARS}${GITHUB_VARS}${LEASE_VARS}${DETECTOR_VARS}${CASCADE_VARS}${RECONCILE_VARS}${PIPELINE_VARS}${LEVEL_DISPATCH_VARS}${MERGE_ON_GREEN_VARS}${SHIP_HEAD_STABILITY_VARS}${SHIP_DISPATCH_GATE_VARS}${REWORK_LOOP_CAP_VARS}${EVENT_DEDUPE_VARS}${GATE_STATE_GUARD_VARS}${DEAD_SESSION_ESCALATION_VARS}${LIVE_REVERIFY_VARS}${REPO_CHECK_MODE_VARS}${CI_CHECK_VARS}${SYNC_MAIN_BEFORE_CI_VARS}${ADVISORY_ROUTING_VARS}${VERDICT_GATE_VARS}${FIX_BEFORE_VERIFY_VARS}${VERIFIED_HEAD_COMPLETION_VARS}${SWEEP_DETECTION_PHASE_VARS}}"
+# TICKET_PLAN_VALIDATOR (TEAM-4248 D3) — the branch half of the ticket-plan check,
+# in the orchestrator. Unset lands in SHADOW: every persona gets the ## Branch block
+# (the four c2uqki personas who had to FIND the branch were the four this block never
+# reached) and one `ticket_plan.branch_rewritten_observed` event per ticket whose prose
+# invents a branch name, with the prompt otherwise byte-identical. Enforce is the only
+# mode in which the rewritten description reaches the model. Off is pre-4248 exactly:
+# development-phase personas only, no board read, no event.
+# Garbage -> off in code (normalizeTicketPlanValidatorMode), and the SAME value is read
+# by workflow-output and both ticket Lambdas, where it gates the dependency-graph check
+# - keep the three deploys in step.
+TICKET_PLAN_VALIDATOR_VARS=""
+if [ -n "${TICKET_PLAN_VALIDATOR:-}" ]; then
+  TICKET_PLAN_VALIDATOR_VARS=",TICKET_PLAN_VALIDATOR=${TICKET_PLAN_VALIDATOR}"
+  echo "  TICKET_PLAN_VALIDATOR=${TICKET_PLAN_VALIDATOR} forwarded to orchestrator"
+else
+  echo "  TICKET_PLAN_VALIDATOR unset - orchestrator defaults to shadow (set off for the pre-4248 prompt)"
+fi
+
+# DECISION_LEDGER (TEAM-4248 D3) - gate decisions become a committed chain artifact.
+# Unset lands in SHADOW, and shadow is NOT a no-op: it records .sdlc/<wf>/decisions.md
+# on the run's branch and prepends a "Decisions not honoured" section to a review
+# package whose artifact cites none of the open decisions. That is deliberate - an
+# operator flipping enforce onto an empty ledger would be flipping a check with
+# nothing to check, and losing a decision (dowtdh Concern 3, reviewer F1 P1) is the
+# danger this flag exists for. Enforce adds only the withhold: a gate whose artifact
+# cites no open decision is sent back for rework instead of paging a human.
+# Off is the only byte-identical mode. Garbage -> shadow (normalizeDecisionLedgerMode).
+# Requires contents:write on GITHUB_PAT to commit; a read-only token degrades to the
+# S3 mirror with a warning.
+DECISION_LEDGER_VARS=""
+if [ -n "${DECISION_LEDGER:-}" ]; then
+  DECISION_LEDGER_VARS=",DECISION_LEDGER=${DECISION_LEDGER}"
+  echo "  DECISION_LEDGER=${DECISION_LEDGER} forwarded to orchestrator"
+else
+  echo "  DECISION_LEDGER unset - orchestrator defaults to shadow (records + surfaces, never withholds a gate)"
+fi
+
+ENV_VARS_ORCH="Variables={ARTIFACT_BUCKET=${ARTIFACT_BUCKET},TICKETS_TABLE=${TICKETS_TABLE},WORKFLOWS_TABLE=${WORKFLOWS_TABLE},EVENTS_TABLE=${EVENTS_TABLE},TICKET_PROVIDER=${TICKET_PROVIDER},TICKET_TOOLS_LAMBDA=${TICKET_TOOLS_LAMBDA}${JIRA_VARS}${GITHUB_VARS}${LEASE_VARS}${DETECTOR_VARS}${CASCADE_VARS}${RECONCILE_VARS}${PIPELINE_VARS}${LEVEL_DISPATCH_VARS}${MERGE_ON_GREEN_VARS}${SHIP_HEAD_STABILITY_VARS}${SHIP_DISPATCH_GATE_VARS}${REWORK_LOOP_CAP_VARS}${EVENT_DEDUPE_VARS}${GATE_STATE_GUARD_VARS}${DEAD_SESSION_ESCALATION_VARS}${LIVE_REVERIFY_VARS}${REPO_CHECK_MODE_VARS}${CI_CHECK_VARS}${SYNC_MAIN_BEFORE_CI_VARS}${ADVISORY_ROUTING_VARS}${VERDICT_GATE_VARS}${FIX_BEFORE_VERIFY_VARS}${VERIFIED_HEAD_COMPLETION_VARS}${SWEEP_DETECTION_PHASE_VARS}${TICKET_PLAN_VALIDATOR_VARS}${DECISION_LEDGER_VARS}}"
 ENV_VARS_INVOKER="Variables={ARTIFACT_BUCKET=${ARTIFACT_BUCKET},TICKETS_TABLE=${TICKETS_TABLE},WORKFLOWS_TABLE=${WORKFLOWS_TABLE},EVENTS_TABLE=${EVENTS_TABLE},TICKET_PROVIDER=${TICKET_PROVIDER},TICKET_TOOLS_LAMBDA=${TICKET_TOOLS_LAMBDA}${EVENT_DEDUPE_VARS}}"
 ENV_VARS_EVENTS="Variables={EVENTS_TABLE=${EVENTS_TABLE}${EVENT_DEDUPE_VARS}}"
 

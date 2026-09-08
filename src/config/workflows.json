@@ -101,6 +101,10 @@
                 "gate": "Intent Acceptance"
               },
               {
+                "name": "decisions.md",
+                "owner": "orchestrator"
+              },
+              {
                 "name": "spec.md",
                 "owner": "requirements",
                 "gate": "Spec Approval"

@@ -23,6 +23,22 @@ at close if `<artifact_dir>/plan.md` is not on `artifact_branch`.
 Design and Test plan are your inputs. Do not re-decide the design; plan how to
 build it in THIS codebase.
 
+If your context has a `## Gate Decisions (REQUIRED checklist)` block, every line
+in it is something a human already decided at an earlier review gate on this run
+(the ledger is `<artifact_dir>/decisions.md`). Brief `claude_code` with those
+lines: for each one the plan must either implement the decision and **cite it** in
+the row or section that carries it, or carry a `## Deviations` row naming it and
+why the plan departs from it. Citing means either the id (e.g. `TEAM-4174#3`)
+anywhere in the plan, or the gate ticket (`TEAM-4174`) on the **same line or table
+row** as the concern number (`Concern 3`, `#3`, or a leading `| 3 |` cell) — so a
+Concerns row that opens `| 3 |` and ends "(PO, TEAM-4174 comment …)" already
+cites it. Citing is
+the obligation, not agreeing — you may argue against a decision at Plan
+Approval, you may not leave it unmentioned. A plan that mentions none of the open
+lines does not pass Plan Approval: a real run shipped `## Deviations: None yet.`
+over an open product-owner decision on the undo window, the gate approved it, and
+the reviewer found the lost decision at the end of the run as a P1 fix ticket.
+
 ### Step 2: Plan with claude_code — read-only except the plan file
 Pass `repo` on the first call. Brief:
 

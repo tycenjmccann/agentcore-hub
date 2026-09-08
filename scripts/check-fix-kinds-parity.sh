@@ -22,6 +22,11 @@
 # completion gate stops waiting on it, the harness drops the origin id and the fix
 # has no lineage, or the delivery metrics under-count a whole class of rework.
 #
+# TEAM-4248 D3 added a second byte-copied module on the same footing —
+# ticket-plan-validator.mjs, in FOUR copies (orchestrator + both ticket Lambdas +
+# workflow-output) — so section 1b below guards it the same way section 1 guards
+# fix-contract.mjs.
+#
 # This guard normalizes every kind list to a sorted set and fails on ANY
 # difference. It also (a) byte-compares the three fix-contract.mjs copies (cmp),
 # the only thing keeping the duplicated module from drifting, and (b) compares the
@@ -44,6 +49,29 @@ for copy in lambda/agentcore-hub-tickets/fix-contract.mjs lambda/agentcore-hub-j
     echo "      fix-contract.mjs is a zero-import module duplicated per Lambda zip." >&2
     echo "      Edit ONE copy, then: cp $CANON $copy" >&2
     diff <(cat "$CANON") <(cat "$copy") | head -20 >&2 || true
+    fail=1
+  fi
+done
+
+# ─── 1b. the four ticket-plan-validator.mjs copies must be byte-identical ─────
+# TEAM-4248 D3: same duplication problem, one more consumer. The module is copied
+# into FOUR zips because workflow-output validates the plan at submit time while
+# both ticket Lambdas validate each create_ticket, and none of them can import
+# from lambda/orchestrator/. canonicalBranchFor in particular MUST NOT drift:
+# index.mjs renders the branch a persona is told to use, and the copies decide
+# whether a name found in a ticket description is "invented".
+VALIDATOR_CANON="lambda/orchestrator/ticket-plan-validator.mjs"
+for copy in lambda/agentcore-hub-tickets/ticket-plan-validator.mjs \
+            lambda/agentcore-hub-jira/ticket-plan-validator.mjs \
+            lambda/workflow-output/ticket-plan-validator.mjs; do
+  if [ ! -f "$copy" ]; then
+    echo "FAIL: missing ticket-plan-validator.mjs copy: $copy" >&2
+    fail=1
+  elif ! cmp -s "$VALIDATOR_CANON" "$copy"; then
+    echo "FAIL: $copy is not byte-identical to $VALIDATOR_CANON" >&2
+    echo "      ticket-plan-validator.mjs is a zero-import module duplicated per Lambda zip." >&2
+    echo "      Edit ONE copy, then: cp $VALIDATOR_CANON $copy" >&2
+    diff <(cat "$VALIDATOR_CANON") <(cat "$copy") | head -20 >&2 || true
     fail=1
   fi
 done
@@ -245,3 +273,4 @@ echo "  FIX_KINDS        = ${KINDS[0]}  (${#KINDS[@]} locations in agreement)"
 echo "  REWORK_FIX_KINDS = $rw_contract"
 echo "  origin-key map   = $map_contract  (${#MAPS[@]} locations in agreement)"
 echo "  fix-contract.mjs = 3 byte-identical copies"
+echo "  ticket-plan-validator.mjs = 4 byte-identical copies"

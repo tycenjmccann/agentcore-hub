@@ -145,6 +145,12 @@ let handler, buildAgentContext;
 async function load(mode) {
   if (mode === undefined) delete process.env.LIVE_REVERIFY;
   else process.env.LIVE_REVERIFY = mode;
+  // TEAM-4248 D3: the epic's children are now read by TWO context blocks through
+  // one shared memo (## Unverified Fixes here, ## Branch there), and
+  // TICKET_PLAN_VALIDATOR defaults to shadow. Pinned off so the `childReads === 0`
+  // assertions below keep measuring what they were written to measure — LIVE_REVERIFY's
+  // OWN I/O — instead of silently becoming assertions about the other feature.
+  process.env.TICKET_PLAN_VALIDATOR = "off";
   h.state.s3Objects = {
     "config/agents.json": AGENTS_CONFIG,
     "config/workflows.json": WORKFLOWS_CONFIG,

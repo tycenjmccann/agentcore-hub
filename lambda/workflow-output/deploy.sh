@@ -60,12 +60,25 @@ if [ -f package.json ]; then
     exit 1
   fi
 fi
-zip -qr function.zip index.mjs node_modules
+zip -qr function.zip index.mjs ticket-plan-validator.mjs node_modules
 
 SIZE=$(ls -lh function.zip | awk '{print $5}')
 echo "  Zip size: $SIZE"
 
-ENV_VARS="Variables={ARTIFACT_BUCKET=${ARTIFACT_BUCKET},EVENTS_TABLE=${EVENTS_TABLE},TICKET_PROVIDER=${TICKET_PROVIDER},TICKET_TOOLS_LAMBDA=${TICKET_TOOLS_LAMBDA}}"
+# TICKET_PLAN_VALIDATOR (TEAM-4248 D3) - submit_ticket_plan validates the chain the
+# analyst filed: every non-root ticket blocked_by at least one upstream ticket, and
+# no invented branch names. shadow returns warnings[] with the plan still saved;
+# enforce rejects the submission (isError) and writes no S3 object. Unset defaults
+# to shadow inside index.mjs; anything unrecognised coalesces to off.
+TICKET_PLAN_VALIDATOR_VARS=""
+if [ -n "${TICKET_PLAN_VALIDATOR:-}" ]; then
+  TICKET_PLAN_VALIDATOR_VARS=",TICKET_PLAN_VALIDATOR=${TICKET_PLAN_VALIDATOR}"
+  echo "  TICKET_PLAN_VALIDATOR=${TICKET_PLAN_VALIDATOR} forwarded to workflow-output"
+else
+  echo "  TICKET_PLAN_VALIDATOR unset - workflow-output defaults to shadow (warns, still saves)"
+fi
+
+ENV_VARS="Variables={ARTIFACT_BUCKET=${ARTIFACT_BUCKET},EVENTS_TABLE=${EVENTS_TABLE},TICKET_PROVIDER=${TICKET_PROVIDER},TICKET_TOOLS_LAMBDA=${TICKET_TOOLS_LAMBDA}${TICKET_PLAN_VALIDATOR_VARS}}"
 
 echo "=== Deploying $NAME ==="
 if aws lambda get-function --function-name "$NAME" --region "$AWS_REGION" >/dev/null 2>&1; then

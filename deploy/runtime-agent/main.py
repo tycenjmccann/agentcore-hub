@@ -1926,21 +1926,35 @@ def WorkflowOutput___save_design_doc(workflow_id: str, agent_id: str, content: s
 
 
 @tool
-def WorkflowOutput___submit_ticket_plan(workflow_id: str, epic_id: str, tickets: str) -> str:
+def WorkflowOutput___submit_ticket_plan(
+    workflow_id: str, epic_id: str, tickets: str, root_ticket_id: str = ""
+) -> str:
     """Persist your ticket plan as a record. This does NOT create tickets.
 
     After calling this, you MUST call Tickets___create_ticket once per ticket
     in the plan to actually create them under the epic. The orchestration
     engine reacts to ticket status changes — it does not expand plans.
 
+    Every ticket in the plan except the root MUST list at least one blockedBy.
+    A ticket planned with blockedBy=[] is dispatched immediately, in parallel
+    with your own — TEAM-4230 was invoked 92 seconds before the requirements
+    ticket it depended on finished, and only luck kept it from reading a
+    document that did not exist yet. Pass root_ticket_id so the plan can be
+    checked against the ticket the plan descends from (yours).
+
     Args:
         workflow_id: Workflow ID
         epic_id: Epic ticket ID to create children under
         tickets: JSON array of ticket objects [{title, description, assignee, blockedBy}]
+        root_ticket_id: YOUR ticket id — the requirements ticket the first tier
+            of the plan must be blockedBy. Optional; omit if you do not have it.
     """
-    return _invoke_lambda(WORKFLOW_OUTPUT_LAMBDA, "WorkflowOutput___submit_ticket_plan", {
-        "workflow_id": workflow_id, "epic_id": epic_id, "tickets": tickets
-    })
+    params = {"workflow_id": workflow_id, "epic_id": epic_id, "tickets": tickets}
+    # Only when supplied: an empty string would look like a root named "" to the
+    # validator, which reads a falsy rootTicketId as "no root" and fails open.
+    if root_ticket_id:
+        params["root_ticket_id"] = root_ticket_id
+    return _invoke_lambda(WORKFLOW_OUTPUT_LAMBDA, "WorkflowOutput___submit_ticket_plan", params)
 
 
 # ─── Blueprint Loader Tool ────────────────────────────────────────────────────

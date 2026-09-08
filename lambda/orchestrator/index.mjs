@@ -79,10 +79,19 @@ import { normalizeVerdictMode, GATE_PERSONAS, resolveVerdict, resolveTestedHead,
 // key into an unquoted `parent = …` operand, which escaping cannot make safe —
 // it is shape-checked and refused instead. See getChildTicketsFromJira.)
 import { KIND_TO_ORIGIN_KEY, parseFixContractBlock, TICKET_KEY_RE } from "./fix-contract.mjs";
+// TEAM-4248 D3: the same zero-import-and-byte-copied arrangement, for the same
+// reason — this module also ships inside both ticket Lambdas and workflow-output,
+// which cannot import from lambda/orchestrator/. The orchestrator uses only its
+// branch half: canonicalBranchFor is the SINGLE definition of the convention the
+// ## Branch block below renders, and branch-name-parity.test.mjs reads this file
+// as text to prove the two have not drifted.
+import { normalizeTicketPlanValidatorMode, canonicalBranchFor, rewriteBranchNames } from "./ticket-plan-validator.mjs";
 import {
   normalizeChainGateMode, chainFor, chainDir, requiredArtifactsForTicket, sdlcFrameworkContext,
   gateInstructionOverride, fallbackReviewPackagePhase, artifactRepoPath, missingArtifactNote,
-  applyFramework, frameworkOfWorkflow,
+  applyFramework, frameworkOfWorkflow, isPlanTicket,
+  normalizeDecisionLedgerMode, extractGateDecisions, appendDecisions, parseDecisionsLedger,
+  unreferencedDecisions, decisionsNotHonouredBullets,
 } from "./artifact-chain.mjs";
 
 // Playbook artifact-chain gate (framework overlay): a ticket that owes a chain
@@ -328,6 +337,52 @@ const VERIFIED_HEAD_COMPLETION = normalizeVerdictMode(process.env.VERIFIED_HEAD_
 // a sweep whose intake never stamped a detection ticket. The def's `phases` array
 // is never stripped — the analyst must see the phase (and stamp it) in shadow too.
 const SWEEP_DETECTION_PHASE = normalizeVerdictMode(process.env.SWEEP_DETECTION_PHASE);
+
+// TICKET_PLAN_VALIDATOR (TEAM-4248 D3) — the branch half of the flag, in the
+// orchestrator. (The graph half runs in the two ticket Lambdas and
+// workflow-output; one flag because they are one defect: a plan nobody checked.)
+//
+// The hole: all four of c2uqki's downstream tickets told their persona to look at
+// `chore/dead-code-sweep-2026-09-07`. The sweeper had actually pushed
+// `feature/TEAM-4230-code-sweeper`. The reviewer, QA and CI each opened a session,
+// discovered "Ticket-named branch does not exist", and reconciled by hand — three
+// sessions of friction and three chances to review the wrong tree. The
+// orchestrator has always known the answer: it RENDERS the convention, in the
+// ## Branch block — but only for development-phase personas, so the four who had
+// to find the branch were the four never told it.
+//   enforce = every phase gets ## Branch, and an invented branch name in the
+//             ticket description is rewritten to the real one IN THE PROMPT.
+//   shadow  = every phase gets ## Branch; the description reaches the model
+//             byte-identical and `ticket_plan.branch_rewritten_observed` records
+//             what would have changed.
+//   off     = development only, exactly as today, and no sibling read.
+// Its own normalizer (unset → shadow, garbage → off) rather than
+// normalizeVerdictMode, because the same value is read by three Lambdas that
+// cannot import verdict-contract.mjs.
+const TICKET_PLAN_VALIDATOR = normalizeTicketPlanValidatorMode(process.env.TICKET_PLAN_VALIDATOR);
+
+// DECISION_LEDGER (TEAM-4248 D3) — a human's gate decision becomes a committed
+// chain artifact, so the next persona has to answer for it.
+//
+// The hole, from dowtdh: the product owner resolved Concern 3 at Spec Approval
+// TEAM-4174 ("5000 ms window; pause the countdown while Undo has focus or hover")
+// and restated it at Design Approval TEAM-4176. Design TEAM-4175 recommended the
+// opposite, plan TEAM-4177 wrote "Keep fixed 5000 ms; no focus-pause" under
+// "## Deviations: None yet.", and TEAM-4178 (Plan Approval) APPROVED that plan —
+// the engineer's package never mentioned the contradiction. It surfaced only as
+// reviewer finding F1 (P1) and fix ticket TEAM-4183. The dossier proves the
+// mechanism: its tickets carry no `comments` array at all, so the human's words
+// existed nowhere in the run's own record.
+//   enforce = record, surface in the package and the prompt, AND withhold a gate
+//             whose artifact cites none of the open decisions (rework, not a page).
+//   shadow  = record + surface. The gate is still presented.
+//   off     = byte-identical to before: nothing read, written or emitted.
+// shadow RECORDS deliberately — it is NOT byte-identical. An operator flipping
+// enforce onto an empty ledger would be flipping a check with nothing to check,
+// the same trap gateRejectionAdmitted calls out in code; and losing a decision is
+// the danger this feature exists for, which is why the normalizer sends unset AND
+// garbage to shadow rather than to off.
+const DECISION_LEDGER = normalizeDecisionLedgerMode(process.env.DECISION_LEDGER);
 
 /**
  * The children a completion GATE may consider (TEAM-4122 FR-7). Under enforce an
@@ -2094,7 +2149,7 @@ export async function handleTicketDoneUnified(ticketId) {
     // not: re-Done'ing an escalation gate (a corrected DECISION comment, a
     // second approval) has to reach the parked release manager, or the human's
     // only lever silently does nothing. Both calls below are idempotent.
-    await ackApprovedGateNotification(workflow, ticketId, assignee);
+    await ackApprovedGateNotification(workflow, ticketId, assignee, ticket);
     await wakeHeldTicketAfterEscalationGate(workflow, ticketId, ticket.title, assignee, parentId);
     // TEAM-3985 — re-Done'ing any ticket is the human's deterministic "re-check
     // completion" lever (evidence that landed late, gate opt-out flipped).
@@ -2109,7 +2164,7 @@ export async function handleTicketDoneUnified(ticketId) {
   // concurrent invocation claims of just-unblocked siblings and can resurrect
   // a pre-claim snapshot (double invocation).
   await markTaskComplete(workflow, ticketId, assignee);
-  await ackApprovedGateNotification(workflow, ticketId, assignee);
+  await ackApprovedGateNotification(workflow, ticketId, assignee, ticket);
   await wakeHeldTicketAfterEscalationGate(workflow, ticketId, ticket.title, assignee, parentId);
 
   // Unblock dependents via the shared cascade (TEAM-3618 D3). The helper owns
@@ -2270,6 +2325,236 @@ async function wakeHeldTicketAfterEscalationGate(workflow, gateTicketId, gateTit
   }
 }
 
+// ─── Decision ledger (TEAM-4248 D3) ───────────────────────────────────────────
+//
+// The pure half lives in artifact-chain.mjs; this is the I/O. Every entry point
+// here returns rather than throws: a run must never fail because the orchestrator
+// could not keep its own notes.
+
+/** Where this run's decisions.md lives, or null when the run cannot carry one. */
+function decisionLedgerTarget(workflow) {
+  const def = getEffectiveWorkflowDef(workflow);
+  const path = chainFor(def) ? artifactRepoPath(def, workflow?.id, "decisions.md") : null;
+  const branch = workflow?.featureBranch;
+  const { owner, repo } = parseRepoUrl(workflow?.repoConfig);
+  if (!path || !branch || !owner || !repo || !process.env.GITHUB_PAT) return null;
+  return { owner, repo, path, branch };
+}
+
+/**
+ * This run's ledger entries. The S3 mirror is read FIRST and the branch is only
+ * the fallback: both hold the same bytes, and a dispatch-path read happens far
+ * more often than a gate resolution, so one S3 GET beats a GitHub round trip.
+ * Any failure is an empty ledger — surfacing no checklist is a degradation, while
+ * throwing here would fail a dispatch.
+ */
+async function readDecisionsLedger(workflow) {
+  try {
+    const mirror = await readS3Artifact(workflow?.id, "shared/decisions.md");
+    if (mirror) return parseDecisionsLedger(mirror);
+    const target = decisionLedgerTarget(workflow);
+    if (!target) return [];
+    return parseDecisionsLedger((await githubReadFile(target)).text);
+  } catch (err) {
+    console.warn(`[decision-ledger] ledger read failed for ${workflow?.id} (non-fatal): ${err?.message || err}`);
+    return [];
+  }
+}
+
+const isOpenDecision = (d) => String(d?.status || "open").toLowerCase() === "open";
+
+/**
+ * FR-D3.3 — a human resolved a gate, so append whatever they decided to
+ * decisions.md on the run's branch and mirror it to S3.
+ *
+ * Reads `ticket.comments`, which both providers already normalize to
+ * [{author, content, timestamp}] on the done ticket, so recording costs ZERO
+ * extra ticket reads. `added.length === 0` (a redelivered webhook, an approval
+ * with no DECISION line) costs zero writes and emits no event.
+ */
+async function recordGateDecisions(workflow, ticket) {
+  if (DECISION_LEDGER === "off" || !workflow || !ticket?.ticketId) return;
+  try {
+    const target = decisionLedgerTarget(workflow);
+    // A def with no chain has no ledger; a run with no branch/PAT has nowhere to
+    // put one. Both are silent no-ops, not degradations.
+    if (!chainFor(getEffectiveWorkflowDef(workflow))) return;
+    const gateTicketId = ticket.ticketId;
+    const decisions = extractGateDecisions(ticket.comments, {
+      gateTicketId,
+      gateName: String(ticket.title || ticket.summary || "Review").replace(/:.*$/, "").trim() || "Review",
+      reviewer: ticket.assignee,
+    });
+    if (!decisions.length) return;
+
+    const existing = target ? await githubReadFile(target) : { text: await readS3Artifact(workflow.id, "shared/decisions.md") || "", sha: null };
+    const { md, added } = appendDecisions(existing.text, decisions);
+    if (!added.length) {
+      console.log(`[decision-ledger] ${gateTicketId}: ${decisions.length} decision(s) already in the ledger — nothing to write`);
+      return;
+    }
+
+    let committed = false;
+    if (target) {
+      const res = await githubPutFile({
+        ...target,
+        message: `chore(sdlc): record ${added.length} gate decision(s) from ${gateTicketId}`,
+        content: md,
+        sha: existing.sha,
+        // On a CAS conflict, re-derive from the winner's file instead of replaying
+        // our body: another gate resolving concurrently has entries of its own.
+        rebuild: (remote) => {
+          const again = appendDecisions(remote, decisions);
+          return again.added.length ? again.md : null;
+        },
+      });
+      committed = Boolean(res.committed);
+    }
+    // The mirror is written even when the commit did not land (a read-only PAT is
+    // open risk 4): the ledger the checklist and the gate check read is this one.
+    await writeS3Artifact(workflow.id, "shared/decisions.md", md);
+    await publishEvent(gateTicketId, "decision.recorded", {
+      workflowId: workflow.id,
+      gateTicketId,
+      mode: DECISION_LEDGER,
+      added: added.length,
+      ids: added.map((d) => d.id),
+      committed,
+    });
+    console.log(`[decision-ledger] ${gateTicketId}: recorded ${added.map((d) => d.id).join(", ")}${committed ? "" : " (S3 mirror only)"}`);
+  } catch (err) {
+    console.warn(`[decision-ledger] record failed for ${ticket?.ticketId} (non-fatal): ${err?.message || err}`);
+  }
+}
+
+/**
+ * The artifact a gate is actually judging, by review-package phase. This is what
+ * "did the author cite the decision" is asked of — dowtdh's Plan Approval gate
+ * was judging plan.md, whose Concern-3 row named no gate at all.
+ */
+const DECISION_GATE_ARTIFACTS = {
+  requirements: ["shared/spec.md"],
+  plan: ["shared/plan.md"],
+  development: ["shared/plan.md"],
+  review: ["shared/findings.md"],
+  // A Merge Approval reads the plan AND the review: a decision may have been
+  // honoured in either one.
+  ship: ["shared/plan.md", "shared/findings.md"],
+};
+
+async function loadArtifactUnderReview(workflow, phase) {
+  // "intake" is Intent Acceptance — the first gate of the run, before any decision
+  // can exist. Nothing to judge, so nothing to withhold.
+  if (!phase || phase === "intake") return "";
+  if (phase === "design") {
+    // Every design-phase persona commits its own file and a Design Approval judges
+    // all of them, so the citation may be in any one.
+    if (!ARTIFACT_BUCKET) return "";
+    const listed = await s3.send(new ListObjectsV2Command({
+      Bucket: ARTIFACT_BUCKET,
+      Prefix: `workflows/${workflow.id}/shared/design`,
+    }));
+    const keys = (listed.Contents || []).map((o) => o.Key).filter((k) => k.endsWith(".md")).sort();
+    const parts = [];
+    for (const key of keys) {
+      const raw = await readS3Artifact(workflow.id, key.replace(`workflows/${workflow.id}/`, ""));
+      if (raw) parts.push(raw);
+    }
+    return parts.join("\n\n");
+  }
+  const parts = [];
+  for (const name of DECISION_GATE_ARTIFACTS[phase] || []) {
+    const raw = await readS3Artifact(workflow.id, name);
+    if (raw) parts.push(raw);
+  }
+  return parts.join("\n\n");
+}
+
+/** The "Decisions not honoured" section: package bullets + the prose a rework reads. */
+function decisionsNotHonouredSection(entries) {
+  const bullets = decisionsNotHonouredBullets(entries);
+  const text =
+    `Decisions not honoured (${entries.length}). A human resolved each of these at a review gate on this run, ` +
+    `and the artifact under review cites none of them:\n` +
+    bullets.map((b) => `• ${b}`).join("\n") +
+    `\nFor EVERY id above: either implement the decision and cite it in the artifact, or add a "## Deviations" ` +
+    `row naming it and why you departed from it. To cite, write the id (e.g. TEAM-4174#3) anywhere, or name the ` +
+    `gate ticket on the SAME line or table row as the concern number ("Concern 3", "#3", or a leading "| 3 |" ` +
+    `cell). Citing it is the requirement — you may disagree with a decision, you may not leave it unmentioned.`;
+  return { bullets, text };
+}
+
+/** Put the section in front of the package the reviewer sees (pkg may be null). */
+function prefixDecisionSection(pkg, section) {
+  const base = pkg || { gate: null, summary: "", bullets: [], links: [] };
+  const head = `Decisions not honoured (${section.bullets.length})`;
+  return {
+    ...base,
+    summary: (base.summary ? `${head} · ${base.summary}` : head).slice(0, 500),
+    // Prepended AFTER loadReviewPackage's own clamp, so these bullets widen the
+    // effective cap rather than pushing the agent's own bullets off the end.
+    bullets: [...section.bullets, ...(Array.isArray(base.bullets) ? base.bullets : [])],
+    links: Array.isArray(base.links) ? base.links : [],
+  };
+}
+
+/**
+ * FR-D3.4 — decide whether this gate may be presented at all.
+ *
+ * Lives here rather than inside loadReviewPackage for two reasons: that function
+ * returns null when a run has no package parts (exactly the thin gate a dropped
+ * decision hides behind, so nothing prepended inside it could reach one), and it
+ * cannot reach handleReviewRejection without inverting the call graph.
+ *
+ * Returns { withheld: true } only under enforce with ≥1 unreferenced decision;
+ * { pkg } to present a widened package; null to change nothing. Never throws — a
+ * failure here presents the gate, because withholding a human's gate on a bug
+ * would be strictly worse than the defect being fixed.
+ */
+async function applyDecisionGate(workflow, gateTicketId, pkg) {
+  try {
+    const open = (await readDecisionsLedger(workflow)).filter(isOpenDecision);
+    if (!open.length) return null;
+    const gateTicket = await getTicket(gateTicketId);
+    const phase = pkg?.gate || fallbackReviewPackagePhase(gateTicket);
+    const artifact = await loadArtifactUnderReview(workflow, phase);
+    // No artifact to read is a fail-open: "cites nothing" and "we could not find
+    // the file" are indistinguishable from here, and only one of them is a defect.
+    if (!artifact) return null;
+    const unreferenced = unreferencedDecisions(open, artifact);
+    if (!unreferenced.length) return null;
+
+    const section = decisionsNotHonouredSection(unreferenced);
+    const ids = unreferenced.map((d) => d.id);
+    await publishEvent(gateTicketId, "decision.unhonoured_observed", {
+      workflowId: workflow.id, gateTicketId, phase: phase || null, mode: DECISION_LEDGER, ids,
+    });
+
+    if (DECISION_LEDGER === "enforce") {
+      // Do NOT page a human about an artifact we can already tell is incomplete.
+      // Send it back for rework down the same path a human's "Request changes"
+      // takes; the synthetic reviewComment is handleReviewRejection's first
+      // feedback source, so no comment has to be fabricated on the ticket.
+      await publishEvent(gateTicketId, "decision.gate_withheld", {
+        workflowId: workflow.id, gateTicketId, phase: phase || null, ids,
+      });
+      await handleReviewRejection({
+        ...(gateTicket || {}),
+        ticketId: gateTicketId,
+        workflowId: workflow.id,
+        reviewComment: section.text,
+      });
+      console.log(`[decision-ledger] ${gateTicketId} withheld — ${ids.join(", ")} cited nowhere in the ${phase} artifact; reworking instead of paging a human`);
+      return { withheld: true };
+    }
+    console.log(`[decision-ledger] ${gateTicketId}: ${ids.join(", ")} unreferenced (shadow — gate still presented)`);
+    return { pkg: prefixDecisionSection(pkg, section) };
+  } catch (err) {
+    console.warn(`[decision-ledger] gate check for ${gateTicketId} failed (non-fatal, gate presented): ${err?.message || err}`);
+    return null;
+  }
+}
+
 /**
  * A human review gate went "done" = the reviewer APPROVED. Close the gate's open
  * review_needed notification. The watch scheduler (lambda/workflow-analyzer
@@ -2280,8 +2565,13 @@ async function wakeHeldTicketAfterEscalationGate(workflow, gateTicketId, gateTit
  * 4 of 5 live runs unwatched, all three review_needed gates already done).
  * Best-effort: an ack failure must never block the done cascade.
  */
-async function ackApprovedGateNotification(workflow, ticketId, assignee) {
+async function ackApprovedGateNotification(workflow, ticketId, assignee, ticket) {
   if (!isHumanAssignee(assignee)) return;
+  // TEAM-4248 D3 FR-D3.3: the decision the human just recorded becomes a chain
+  // artifact BEFORE anything downstream is dispatched. Its own boundary, ahead of
+  // the ack's try/catch, because a failure to record must not swallow the ack —
+  // and recordGateDecisions never throws.
+  await recordGateDecisions(workflow, ticket || { ticketId, assignee });
   try {
     await store.ackNotifications(
       workflow.id,
@@ -2747,6 +3037,21 @@ async function handleHumanReviewGate(ticketId, assignee, workflow) {
     // rewrite, no extra call: the verdict was already probed at dispatch.
     if (CI_CHECK_MODE === "enforce" && workflow?.ciCheck?.verdict === "uncertifiable") {
       pkg = prefixCiWarning(pkg, workflow.ciCheck);
+    }
+
+    // TEAM-4248 D3 FR-D3.4 — the last point at which a lost gate decision can be
+    // caught before a human is asked to approve an artifact that ignored one.
+    // dowtdh's TEAM-4178 (Plan Approval) is the case: the engineer approved a plan
+    // that contradicted the product owner's own Concern-3 decision, because the
+    // package never said so. Under shadow the section rides on the front of the
+    // package; under enforce the gate is not presented at all and the artifact goes
+    // back for rework. Before appendReviewNotificationOnce and markGateRequested
+    // deliberately: a gate we withhold was never opened, so nothing must record a
+    // cycle for it.
+    if (DECISION_LEDGER !== "off" && chainFor(getEffectiveWorkflowDef(workflow))) {
+      const decision = await applyDecisionGate(workflow, ticketId, pkg);
+      if (decision?.withheld) return false;
+      if (decision?.pkg) pkg = decision.pkg;
     }
 
     const notification = {
@@ -4252,7 +4557,13 @@ export async function handleTicketDone(ticketId, image) {
 
   // Update agent task status — scoped write (see handleTicketDoneUnified).
   await markTaskComplete(workflow, ticketId, assignee);
-  await ackApprovedGateNotification(workflow, ticketId, assignee);
+  await ackApprovedGateNotification(workflow, ticketId, assignee, {
+    // TEAM-4248 D3: the stream image already carries the gate's comments, so the
+    // ledger hook needs no extra ticket read on this path either.
+    ticketId, assignee,
+    title: unwrapDdbValue(image.title),
+    comments: unwrapDdbValue(image.comments),
+  });
   await wakeHeldTicketAfterEscalationGate(workflow, ticketId, unwrapDdbValue(image.title), assignee, parentId);
 
   // Unblock dependents via the shared cascade (TEAM-3618 D3). Same helper as the
@@ -5443,14 +5754,147 @@ export function formatSourceLine(source) {
   return line;
 }
 
+/**
+ * The branch this persona must look at, plus every branch name it is legitimate
+ * for its ticket to mention (TEAM-4248 D3).
+ *
+ * A development-phase persona PRODUCES a branch, and its name is the harness
+ * convention applied to that persona's own ticket — today's literal exactly,
+ * which is why `canonicalBranchFor` is now the only definition of it (the four
+ * byte-copies are cmp'd by check-fix-kinds-parity.sh, and this file no longer
+ * carries a second copy of the template).
+ *
+ * Everyone else CONSUMES one, and until now was told nothing at all: c2uqki's
+ * reviewer, QA and CI were each handed the invented `chore/dead-code-sweep-
+ * 2026-09-07`, opened a session, found no such branch, and reconciled by hand.
+ * Their branch is the producer's, resolved from the epic's own children: when
+ * exactly one non-advisory sibling is a producer (a sweep run has one sweeper),
+ * that ticket's branch IS the tree to review; with several producers there is no
+ * single tree, so the run's shared integration branch is the honest answer.
+ *
+ * Returns null only when there is nothing to say — no agentDef, or `off` for a
+ * non-producer. A failed sibling read degrades to the feature branch; the block is
+ * never dropped, because dropping it is what produced the defect.
+ */
+async function resolveBranchPlan(ticket, workflow, agentDef, siblingsOnce) {
+  if (!agentDef) return null;
+  const defaultBranch = workflow.repoConfig?.repos?.[0]?.defaultBranch || "main";
+
+  if (agentDef.phase === "development") {
+    // TEAM-4122 FR-7: an advisory ticket is work the humans explicitly declined
+    // for THIS run, so it must not enter the shared integration branch — its
+    // files would otherwise appear in the unified PR's change set and land with
+    // the approved scope. Under enforce it gets its own branch off the repo
+    // default and PRs there; the release manager never reviews it in this run.
+    const advisory = ADVISORY_ROUTING === "enforce" && isAdvisoryTicket(ticket);
+    const canonical = canonicalBranchFor(ticket.ticketId, agentDef.agentId, { advisory });
+    return {
+      producer: true,
+      advisory,
+      canonical,
+      base: advisory ? defaultBranch : workflow.featureBranch || defaultBranch,
+      defaultBranch,
+      degraded: false,
+      knownBranches: [canonical, workflow.featureBranch, defaultBranch].filter(Boolean),
+    };
+  }
+
+  if (TICKET_PLAN_VALIDATOR === "off") return null; // byte-identical to before
+
+  const siblings = await siblingsOnce();
+  const featureBranch = workflow.featureBranch || defaultBranch;
+  const isAdvisorySibling = (t) => ADVISORY_ROUTING === "enforce" && isAdvisoryTicket(t);
+  const branchOf = (t) =>
+    canonicalBranchFor(t.ticketId || t.id || t.key, t.assignee, { advisory: isAdvisorySibling(t) });
+  const producers = (siblings || []).filter((t) => getAgentDef(t.assignee)?.phase === "development");
+  const shared = producers.filter((t) => !isAdvisorySibling(t));
+  return {
+    producer: false,
+    advisory: false,
+    // One producer → its branch. Several (or none, or a failed read) → the shared
+    // integration branch, which always exists and is never wrong, only vaguer.
+    canonical: shared.length === 1 ? branchOf(shared[0]) : featureBranch,
+    base: featureBranch,
+    defaultBranch,
+    degraded: siblings === null,
+    // An advisory producer's branch is a real branch, so mentioning it is not an
+    // invention even though it is never the tree this run reviews.
+    knownBranches: [featureBranch, defaultBranch, ...producers.map(branchOf)].filter(Boolean),
+  };
+}
+
 // Exported solely for cd-handoff.test.mjs (Delivery Mode / roster / gates block).
 export async function buildAgentContext(ticket, workflow) {
   await loadCdRegistry(); // the Delivery Mode block below reads it
   // Pure registry read, hoisted: the phase decides which blocks this persona
   // gets (## Unverified Fixes below, the manifest, the dev branch identity).
   const agentDef = getAgentDef(ticket.assignee);
+
+  // ONE sibling read for the whole function (TEAM-4248 D3). Two blocks want the
+  // epic's children — ## Unverified Fixes (LIVE_REVERIFY) and the ## Branch
+  // block's producer lookup — and on a Jira run that is a JQL search each. Both
+  // await the same promise instead. Never throws: `null` means "the read failed",
+  // `[]` means "no siblings", and each caller degrades on its own terms.
+  let _siblingsPromise = null;
+  const siblingsOnce = () => {
+    if (!_siblingsPromise) {
+      _siblingsPromise = (async () => {
+        try {
+          return (await getChildTickets(workflow.epicId)) || [];
+        } catch (err) {
+          console.warn(`[orchestrator] context sibling read failed (rows degraded): ${err?.message || err}`);
+          return null;
+        }
+      })();
+    }
+    return _siblingsPromise;
+  };
+
+  const branchPlan = await resolveBranchPlan(ticket, workflow, agentDef, siblingsOnce);
+
+  // TEAM-4248 D3 — an invented branch name in the ticket prose is the c2uqki
+  // defect reaching the model. The rewrite is CONTEXT-ONLY in both modes: the one
+  // writer of a description is Tickets___update_ticket, which the orchestrator
+  // never calls and which flattens the whole description into a single ADF
+  // paragraph, so persisting this would destroy the structure of every ticket it
+  // touched in order to fix a branch name.
+  //
+  // CONSUMERS only. A producer's prompt is byte-identical in every mode: it is
+  // told the branch to push in the ## Branch block, which it has always had and
+  // has always followed (c2uqki's sweeper pushed the convention while its own
+  // ticket named the invention), so rewriting its prose would change the prompt of
+  // the one persona that was never confused — for nothing.
+  const branchRewrite =
+    TICKET_PLAN_VALIDATOR !== "off" && branchPlan && !branchPlan.producer
+      ? rewriteBranchNames(ticket.description, {
+          canonical: branchPlan.canonical,
+          knownBranches: branchPlan.knownBranches,
+        })
+      : null;
+  if (branchRewrite?.rewrites.length) {
+    const detail = {
+      workflowId: workflow.id,
+      ticketId: ticket.ticketId,
+      assignee: ticket.assignee || null,
+      phase: agentDef?.phase || null,
+      canonical: branchPlan.canonical,
+      rewrites: branchRewrite.rewrites,
+    };
+    // shadow observes and the prompt is byte-identical; enforce is the only mode
+    // in which the rewritten text actually reaches the model.
+    if (TICKET_PLAN_VALIDATOR === "enforce") {
+      await publishEvent(ticket.ticketId, "ticket_plan.branch_rewritten", detail);
+    } else {
+      await publishEvent(ticket.ticketId, "ticket_plan.branch_rewritten_observed", detail);
+    }
+  }
+  const description =
+    TICKET_PLAN_VALIDATOR === "enforce" && branchRewrite?.rewrites.length
+      ? branchRewrite.text
+      : ticket.description;
+
   let context = `# Your Assignment: ${ticket.title}\n\n`;
-  context += `## Ticket\nID: ${ticket.ticketId}\nDescription: ${ticket.description}\n\n`;
+  context += `## Ticket\nID: ${ticket.ticketId}\nDescription: ${description}\n\n`;
 
   // Workflow identifiers
   context += `## Workflow Context\n`;
@@ -5629,8 +6073,18 @@ export async function buildAgentContext(ticket, workflow) {
   // agent (spec author) additionally gets intent.md inline: it is the run's
   // source of truth and must be committed unchanged.
   if (chainFor(wfDef)) {
+    const chainAgentDef = getAgentDef(ticket.assignee);
+    // TEAM-4248 D3 FR-D3.5 — the open-decision checklist, for the two personas
+    // whose artifact a gate then judges: a design persona and the Plan ticket. One
+    // read, on that branch only, and only under a non-off ledger — a QA verifier
+    // paying an S3 GET for an obligation it cannot discharge would be a cost with
+    // no reader.
+    let openDecisions;
+    if (DECISION_LEDGER !== "off" && (chainAgentDef?.phase === "design" || isPlanTicket(ticket, chainAgentDef))) {
+      openDecisions = (await readDecisionsLedger(workflow)).filter(isOpenDecision);
+    }
     context += sdlcFrameworkContext({
-      def: wfDef, workflow, ticket, agentDef: getAgentDef(ticket.assignee), intakeAgentId: wfDef.intakeAgentId,
+      def: wfDef, workflow, ticket, agentDef: chainAgentDef, intakeAgentId: wfDef.intakeAgentId, openDecisions,
     });
     if (ticket.assignee === wfDef.intakeAgentId) {
       try {
@@ -5702,12 +6156,9 @@ export async function buildAgentContext(ticket, workflow) {
       // ONE sibling read, only on this branch: the titles, the repro strings and
       // the re-verify tickets' live statuses all live on the tickets, not in
       // agentTasks. A failed read degrades the rows, never the block.
-      let siblings = [];
-      try {
-        siblings = (await getChildTickets(workflow.epicId)) || [];
-      } catch (err) {
-        console.warn(`[orchestrator] unverified-fix context: sibling read failed (rows degraded): ${err?.message || err}`);
-      }
+      // TEAM-4248 D3: shared with the ## Branch block's producer lookup via
+      // siblingsOnce, so both features on is still one read, not two.
+      const siblings = (await siblingsOnce()) || [];
       const byId = new Map(siblings.map((t) => [t.ticketId || t.id || t.key, t]));
       const inert = (s) => String(s || "").replace(/[`\r\n]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 300);
       const rows = unverified.map(([fixId, task]) => {
@@ -5746,34 +6197,35 @@ export async function buildAgentContext(ticket, workflow) {
     }
   } catch { /* manifest read failed — non-fatal */ }
 
-  // Dev agents: branch identity (scope, not HOW)
-  if (agentDef?.phase === "development") {
-    // TEAM-4122 FR-7: an advisory ticket is work the humans explicitly declined
-    // for THIS run, so it must not enter the shared integration branch — its
-    // files would otherwise appear in the unified PR's change set and land with
-    // the approved scope. Under enforce it gets its own branch off the repo
-    // default and PRs there; the release manager never reviews it in this run.
-    const advisory = ADVISORY_ROUTING === "enforce" && isAdvisoryTicket(ticket);
-    const defaultBranch = workflow.repoConfig?.repos?.[0]?.defaultBranch || "main";
-    const baseBranch = advisory ? defaultBranch : workflow.featureBranch || defaultBranch;
-    const slug = agentDef.agentId.replace(/^agentcore_hub_/, "").replace(/_/g, "-");
+  // Branch identity (scope, not HOW). Producers are told the branch to PUSH;
+  // every other persona is told the branch to CHECK OUT — TEAM-4248 D3, because
+  // the four c2uqki personas who had to find the branch were the four this block
+  // never reached. Under `off` resolveBranchPlan returns null for them and this
+  // renders for development only, exactly as it did before.
+  if (branchPlan) {
     context += `## Branch\n`;
-    context += `feature_branch: feature/${ticket.ticketId}-${advisory ? "advisory" : slug}\n`;
-    context += `base_branch: ${baseBranch}\n`;
-    if (advisory) {
-      context += `NOTE: ADVISORY ticket. Branch from ${defaultBranch} and open your PR against ${defaultBranch}. It is NOT part of this run's shared integration branch or its unified PR; the release manager will not review it in this run.\n`;
+    context += `feature_branch: ${branchPlan.canonical}\n`;
+    context += `base_branch: ${branchPlan.base}\n`;
+    if (!branchPlan.producer) {
+      context += `NOTE: you do not push to this branch; check it out to verify. This is the branch the ticket's upstream work was pushed to — the ticket text is not authoritative about branch names, this block is. If you cannot find it, say so in your completion instead of guessing another name.\n`;
+    } else if (branchPlan.advisory) {
+      context += `NOTE: ADVISORY ticket. Branch from ${branchPlan.defaultBranch} and open your PR against ${branchPlan.defaultBranch}. It is NOT part of this run's shared integration branch or its unified PR; the release manager will not review it in this run.\n`;
     } else if (workflow.featureBranch) {
       context += `NOTE: base_branch is this run's SHARED integration branch. Branch from it, target your PR at it (never the repo default branch), and merge your PR into it when your evidence is complete — one unified PR to the default branch is opened by the orchestrator at run completion.\n`;
     }
     context += `\n`;
 
-    // Design artifacts content (scope)
-    try {
-      const designDoc = await readS3Artifact(workflow.id, "shared/output.md");
-      if (designDoc) {
-        context += `## Design Artifacts\n${designDoc.slice(0, 8000)}\n\n`;
-      }
-    } catch { /* no design docs yet */ }
+    // Design artifacts content (scope) — DEVELOPMENT ONLY. It was nested in the
+    // same `if` as the branch block above, and widening that block must not turn
+    // one S3 read per dev ticket into one per ticket of every run.
+    if (agentDef?.phase === "development") {
+      try {
+        const designDoc = await readS3Artifact(workflow.id, "shared/output.md");
+        if (designDoc) {
+          context += `## Design Artifacts\n${designDoc.slice(0, 8000)}\n\n`;
+        }
+      } catch { /* no design docs yet */ }
+    }
   }
 
   // Original request + input sources for the workflow's intake agent (any def).
@@ -6253,6 +6705,23 @@ async function readS3Artifact(workflowId, path) {
   }
 }
 
+/** Mirror one artifact into the run's shared prefix (the console viewer reads these). */
+async function writeS3Artifact(workflowId, path, body, contentType = "text/markdown") {
+  if (!ARTIFACT_BUCKET) return false;
+  try {
+    await s3.send(new PutObjectCommand({
+      Bucket: ARTIFACT_BUCKET,
+      Key: `workflows/${workflowId}/${path}`,
+      Body: body,
+      ContentType: contentType,
+    }));
+    return true;
+  } catch (err) {
+    console.warn(`[orchestrator] S3 mirror of ${path} failed (non-fatal): ${err?.message || err}`);
+    return false;
+  }
+}
+
 // ─── Manifest Helpers ──────────────────────────────────────────────────────────
 
 async function readManifest(workflowId) {
@@ -6526,6 +6995,82 @@ async function githubApi(path, method = "GET", body = null) {
     throw err;
   }
   return json;
+}
+
+/**
+ * Read one file's content + blob sha off a branch. Missing file (404) is a normal
+ * answer, not an error: `{ text: "", sha: null }` is exactly what appendDecisions
+ * expects for a run whose first gate has just resolved. Any OTHER error throws —
+ * the caller decides whether to fail open, and silently treating a 500 as "empty
+ * ledger" would let a transient GitHub outage clobber a real file.
+ */
+async function githubReadFile({ owner, repo, path, branch }) {
+  try {
+    const res = await githubApi(
+      `/repos/${owner}/${repo}/contents/${path}?ref=${encodeURIComponent(branch)}`
+    );
+    const text = res?.content ? Buffer.from(res.content, res.encoding || "base64").toString("utf8") : "";
+    return { text, sha: res?.sha || null };
+  } catch (err) {
+    if (err?.status === 404) return { text: "", sha: null };
+    throw err;
+  }
+}
+
+/**
+ * Commit one file to a branch — the orchestrator's only write of FILE CONTENT to
+ * GitHub (everything else it writes is labels, refs and pull requests).
+ *
+ * The blob `sha` is a CAS token. A 409/422 means someone landed a write between
+ * our read and our PUT, so replaying the same body would clobber them: instead we
+ * re-read and let `rebuild` re-derive the body from the CURRENT remote content,
+ * once. `rebuild` returning null means the other writer already added what we
+ * wanted, which is a success with nothing to do.
+ *
+ * Never throws — an orchestrator that cannot commit its own bookkeeping file must
+ * not take the run down with it. A read-only PAT (403) is called out separately
+ * because it is a configuration answer, not a transient one, and the caller's S3
+ * mirror is the intended fallback for it.
+ */
+async function githubPutFile({ owner, repo, path, branch, message, content, sha, rebuild }) {
+  const put = (body, blobSha) =>
+    githubApi(`/repos/${owner}/${repo}/contents/${path}`, "PUT", {
+      message,
+      branch,
+      content: Buffer.from(body, "utf8").toString("base64"),
+      ...(blobSha ? { sha: blobSha } : {}),
+    });
+  try {
+    await put(content, sha);
+    return { ok: true, committed: true };
+  } catch (err) {
+    const status = err?.status;
+    if (status === 401 || status === 403) {
+      console.warn(
+        `[decision-ledger] GITHUB_PAT cannot write ${path} on ${branch} (${status}) — ` +
+        `the S3 mirror is the ledger for this run; grant the PAT contents:write to commit it.`
+      );
+      return { ok: false, reason: "forbidden", status };
+    }
+    if (status !== 409 && status !== 422) {
+      console.warn(`[decision-ledger] PUT ${path} failed (${status ?? "?"}, non-fatal): ${err?.message || err}`);
+      return { ok: false, reason: "error", status };
+    }
+    try {
+      const fresh = await githubReadFile({ owner, repo, path, branch });
+      const next = rebuild ? rebuild(fresh.text) : content;
+      if (next === null || next === undefined) return { ok: true, committed: false, reason: "already-present" };
+      await put(next, fresh.sha);
+      console.log(`[decision-ledger] PUT ${path} retried after a ${status} and landed`);
+      return { ok: true, committed: true, retried: true };
+    } catch (err2) {
+      console.warn(
+        `[decision-ledger] PUT ${path} still conflicting after one retry (${err2?.status ?? status}) — ` +
+        `failing open; the next gate resolution re-appends.`
+      );
+      return { ok: false, reason: "conflict", status: err2?.status ?? status };
+    }
+  }
 }
 
 async function callGitHub(toolName, args) {

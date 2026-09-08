@@ -33,6 +33,11 @@ const h = vi.hoisted(() => ({
     // TEAM-4130 F1: transition_ticket's status write (`SET #s = :s, …`), so the
     // status a transition actually persists is assertable, not just its envelope.
     statusUpdates: /** @type {any[]} */ ([]),
+    // TEAM-4248 D3: the epic's children, as the parentId-index Query sees them
+    // (the requirements-root lookup), and every Query issued — so "one lookup"
+    // and "zero lookups under off" are both assertable.
+    children: /** @type {any[]} */ ([]),
+    queries: /** @type {any[]} */ ([]),
   },
 }));
 
@@ -82,6 +87,13 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
           }
           if (name === "GetCommand") return { Item: h.state.items[cmd.input.Key.ticketId] };
           if (name === "PutCommand") { h.state.puts.push(cmd.input.Item); return {}; }
+          if (name === "QueryCommand") {
+            h.state.queries.push(cmd.input);
+            // `Items: []` rather than `{}` for every other index: each caller
+            // reads `result.Items || []`, so the two are equivalent, and this
+            // way the parentId branch is the only special case.
+            return { Items: cmd.input.IndexName === "parentId-index" ? h.state.children : [] };
+          }
           return {};
         },
       }),
@@ -103,7 +115,13 @@ beforeEach(async () => {
   h.state.condFail.length = 0;
   h.state.statusUpdates.length = 0;
   h.state.items = {};
+  h.state.children.length = 0;
+  h.state.queries.length = 0;
   delete process.env.ARTIFACT_BUCKET;
+  // TEAM-4248 D3: default OFF for the pre-existing suite, so the cases below
+  // that predate the flag keep making exactly the provider calls they always did.
+  // Each D3 case reloads with the mode it is about.
+  process.env.TICKET_PLAN_VALIDATOR = "off";
   vi.resetModules();
   ({ handler } = await import("./index.mjs"));
 });
@@ -770,5 +788,170 @@ describe("transition_ticket — reaching done from in_progress vs from blocked (
     h.state.items[SHIP].status = "in_progress";
     const live = await handler({ name: "Tickets___get_transitions", arguments: { ticket_id: SHIP } });
     expect(live.transitions.map((t) => t.id)).toContain("done");
+  });
+});
+
+/**
+ * create_ticket — the unblocked-non-root guard (TEAM-4248 D3).
+ *
+ * c2uqki's code sweeper TEAM-4230 was minted with `blocked_by=[]` and invoked at
+ * 11:40:37.834Z, 92.3s BEFORE the requirements analyst it depends on published
+ * agent.complete. Nothing rejected it because nothing had ever looked at the
+ * graph. submit_ticket_plan now validates the PLAN; this validates each ticket
+ * actually minted, which is the only path that exists in production (the plan is
+ * a record, the tickets are the run).
+ *
+ * The root is found by ROLE. "Earliest child with no blockers" would pick up the
+ * hub-created Intent Acceptance gate on a playbook run and then exempt the first
+ * agent ticket minted after it — the same class of mistake as the bug.
+ */
+
+const EPIC = "TEAM-4228";
+/** The requirements analyst's own ticket, still open. */
+const ROOT_OPEN = {
+  ticketId: "TEAM-4229", parentId: EPIC, assignee: "agentcore_hub_requirements_analyst",
+  status: "todo", createdAt: "2026-09-07T11:30:00.000Z", blockedBy: [],
+};
+/** The hub-created Intent Acceptance gate: unblocked, earliest, NOT the root. */
+const INTENT_GATE = {
+  ticketId: "TEAM-4227", parentId: EPIC, assignee: "human:product-owner",
+  status: "in_review", createdAt: "2026-09-07T11:00:00.000Z", blockedBy: [],
+};
+/**
+ * The offender, as create_ticket receives it. c2uqki's real assignee was
+ * `agentcore_hub_code_sweeper`, which lives only in the S3 roster overlay — with
+ * no ARTIFACT_BUCKET this Lambda falls back to the hardcoded core roster and
+ * would reject it on assignee grounds before ever reaching the graph check. The
+ * check is role-agnostic, so a core dev persona reproduces it exactly.
+ */
+const SWEEPER = { summary: "Sweep tycenjmccann/ember for dead code", assignee: "agentcore_hub_backend_dev", parent_key: EPIC };
+
+async function reload(mode) {
+  process.env.TICKET_PLAN_VALIDATOR = mode;
+  vi.resetModules();
+  ({ handler } = await import("./index.mjs"));
+}
+const rootQueries = () => h.state.queries.filter((q) => q.IndexName === "parentId-index");
+
+describe("create_ticket — unblocked-non-root (TICKET_PLAN_VALIDATOR)", () => {
+  it("off: no root lookup at all", async () => {
+    await reload("off");
+    h.state.children.push(ROOT_OPEN);
+    const res = await create(SWEEPER);
+    expect(rootQueries()).toHaveLength(0);
+    expect(h.state.puts).toHaveLength(1);
+    expect("warning" in res).toBe(false);
+  });
+
+  it("shadow: mints the ticket and names both the offender and the root", async () => {
+    await reload("shadow");
+    h.state.children.push(ROOT_OPEN);
+    const res = await create(SWEEPER);
+    expect(h.state.puts).toHaveLength(1);
+    expect(res.warning).toContain("TEAM-4229");
+    expect(res.warning).toContain("Sweep tycenjmccann/ember for dead code");
+  });
+
+  it("enforce: rejects and mints NOTHING — the id counter is not touched", async () => {
+    await reload("enforce");
+    h.state.children.push(ROOT_OPEN);
+    const res = await create(SWEEPER);
+    expect(res.content[0].text).toMatch(/^Error:/);
+    expect(res.content[0].text).toContain("TEAM-4229");
+    expect(h.state.puts).toHaveLength(0);
+    expect(h.state.counter).toBe(0);
+  });
+
+  it("finds the root by a phase:requirements stamp as well as by assignee", async () => {
+    await reload("enforce");
+    h.state.children.push({ ...ROOT_OPEN, assignee: "agentcore_hub_backend_designer", phase: "requirements" });
+    expect((await create(SWEEPER)).content[0].text).toMatch(/^Error:/);
+  });
+
+  it("does NOT mistake an earlier unblocked human gate for the root", async () => {
+    // Intent Acceptance is created first, by the HUB, with no blockers. If it
+    // were treated as the root, the sweeper below would be exempt and c2uqki
+    // would reproduce exactly.
+    await reload("enforce");
+    h.state.children.push(INTENT_GATE, ROOT_OPEN);
+    const res = await create(SWEEPER);
+    expect(res.content[0].text).toContain("TEAM-4229");
+    expect(res.content[0].text).not.toContain("TEAM-4227");
+  });
+
+  it("looks the root up ONCE per invocation", async () => {
+    await reload("shadow");
+    h.state.children.push(ROOT_OPEN);
+    await create(SWEEPER);
+    expect(rootQueries()).toHaveLength(1);
+  });
+
+  it("no root under the epic → fails open, silently", async () => {
+    // A bug-fix run, an advisory-only epic, and the window before the
+    // requirements ticket exists are all this case.
+    await reload("enforce");
+    h.state.children.push(INTENT_GATE);
+    const res = await create(SWEEPER);
+    expect(h.state.puts).toHaveLength(1);
+    expect("warning" in res).toBe(false);
+  });
+
+  it("a done root fails open too, so late siblings are not rejected", async () => {
+    await reload("enforce");
+    h.state.children.push({ ...ROOT_OPEN, status: "done" });
+    const res = await create(SWEEPER);
+    expect(h.state.puts).toHaveLength(1);
+    expect("warning" in res).toBe(false);
+  });
+
+  it("a closed root counts as done", async () => {
+    await reload("enforce");
+    h.state.children.push({ ...ROOT_OPEN, status: "closed" });
+    await create(SWEEPER);
+    expect(h.state.puts).toHaveLength(1);
+  });
+
+  it("exempts the root itself, an advisory, a fix ticket and an already-chained ticket", async () => {
+    await reload("enforce");
+    h.state.children.push(ROOT_OPEN);
+    const exempt = [
+      { ...SWEEPER, assignee: "agentcore_hub_requirements_analyst" },      // is the root
+      { ...SWEEPER, phase: "requirements" },                                // is the root, by stamp
+      { ...SWEEPER, labels: ["advisory"] },                                 // declined scope
+      { ...SWEEPER, spawned_by: { kind: "qa_fix", qaTicketId: "TEAM-4231" }, phase: "development" },
+      { ...SWEEPER, blocked_by: ["TEAM-4229"] },                            // already chained
+      { ...SWEEPER, assignee: "human:product-owner" },                      // hub-created gate
+      { ...SWEEPER, parent_key: undefined },                                // no epic to look under
+    ];
+    for (const args of exempt) {
+      h.state.puts.length = 0;
+      const res = await create(args);
+      expect(res.content?.[0]?.text, JSON.stringify(args)).toBeUndefined();
+      expect(h.state.puts, JSON.stringify(args)).toHaveLength(1);
+      // `warning` may still carry a fix-contract advisory on the fix-kind row —
+      // what must be absent is the dependency-chain complaint.
+      expect(res.warning ?? "", JSON.stringify(args)).not.toContain("blocked_by=[]");
+    }
+  });
+
+  it("a failed root lookup fails open rather than blocking the run", async () => {
+    await reload("enforce");
+    h.state.children.push(ROOT_OPEN);
+    // Query throws: the index is missing, throttled, whatever. A ticket must
+    // still be creatable.
+    const spy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    Object.defineProperty(h.state, "children", {
+      get() { throw new Error("ProvisionedThroughputExceededException"); },
+      configurable: true,
+    });
+    try {
+      const res = await create(SWEEPER);
+      expect(h.state.puts).toHaveLength(1);
+      expect("warning" in res).toBe(false);
+      expect(spy.mock.calls.flat().join(" ")).toContain("failing open");
+    } finally {
+      Object.defineProperty(h.state, "children", { value: [], writable: true, configurable: true });
+      spy.mockRestore();
+    }
   });
 });
