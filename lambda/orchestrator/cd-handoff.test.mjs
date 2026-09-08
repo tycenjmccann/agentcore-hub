@@ -160,7 +160,11 @@ const WORKFLOWS_CONFIG = JSON.stringify({
       completionRequiresAgentPhases: ["development", "verification", "review", "ship"],
       reviewGates: [
         { afterPhase: "design", name: "Plan Approval", blocking: true, condition: "flagged", assignee: "human:engineer" },
-        { afterPhase: "ship", name: "Merge Approval", blocking: true, condition: "always", assignee: "human:engineer" },
+        // TEAM-4288 r3-F1: "cdRegistered" is what the real config ships (a ship
+        // gate must never be "always" — lintWorkflowDefShape rejects that), so the
+        // CD/handoff assertions below actually exercise the activation resolver:
+        // ACTIVE on the registered run, auto-absent on the handoff run.
+        { afterPhase: "ship", name: "Merge Approval", blocking: true, condition: "cdRegistered", assignee: "human:engineer" },
       ],
       phases: [
         { agentPhase: "requirements" },

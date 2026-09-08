@@ -13,13 +13,23 @@
 
 import type { IntentBrief, IntakeSource, WorkflowInput } from "./types";
 import type { ReviewGate, WorkflowDef } from "./workflow-defs";
+import { isGateActive } from "./workflow-defs";
 
-/** The hub-created gate that guards the intake phase (playbook defs), if the def declares one. */
-export function intentGateFor(def: WorkflowDef, requestedGates: string[] = []): ReviewGate | null {
+/**
+ * The hub-created gate that guards the intake phase (playbook defs), if the def
+ * declares one AND it is active for this run. Activation goes through the shared
+ * resolver (TEAM-4288 r3-F1), so a condition:"cdRegistered" intake gate needs the
+ * caller to say whether the run's repo is CD-registered; omitting `cdRegistered`
+ * means "not registered", the fail-safe direction.
+ */
+export function intentGateFor(
+  def: WorkflowDef,
+  requestedGates: string[] = [],
+  opts: { cdRegistered?: boolean } = {}
+): ReviewGate | null {
   const gate = (def.reviewGates || []).find((g) => g.afterPhase === "intake" && g.blocking);
   if (!gate) return null;
-  if (gate.condition === "always" || requestedGates.includes("intake")) return gate;
-  return null;
+  return isGateActive(gate, { requestedGates, cdRegistered: opts.cdRegistered }) ? gate : null;
 }
 
 /** Directory of the committed artifact chain for a run, or null for non-playbook defs. */

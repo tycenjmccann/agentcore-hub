@@ -56,6 +56,23 @@ describe("intent gate + chain dir resolution from the effective def", () => {
     expect(artifactChainDir(def, "wf_5")).toBe(".sdlc/wf_5");
     expect(def.featureBranchPhase).toBe("requirements");
   });
+  /**
+   * TEAM-4288 r3-F1 — activation runs through the shared resolver, so a
+   * condition:"cdRegistered" intake gate is honored (and "always"/"flagged"
+   * behavior, plus every existing 2-arg caller, is unchanged).
+   */
+  it("honors a cdRegistered intake gate via the third argument", () => {
+    const defWith = (condition: string) =>
+      ({
+        reviewGates: [{ afterPhase: "intake", name: "Intent Acceptance", blocking: true, condition }],
+      }) as unknown as Parameters<typeof intentGateFor>[0];
+    expect(intentGateFor(defWith("cdRegistered"), [], { cdRegistered: true })?.name).toBe("Intent Acceptance");
+    expect(intentGateFor(defWith("cdRegistered"), [], { cdRegistered: false })).toBeNull();
+    expect(intentGateFor(defWith("cdRegistered"), ["intake"])).toBeNull(); // delivery mode decides
+    expect(intentGateFor(defWith("always"), [], { cdRegistered: false })?.name).toBe("Intent Acceptance");
+    expect(intentGateFor(defWith("flagged"), [])).toBeNull();
+    expect(intentGateFor(defWith("flagged"), ["intake"])?.name).toBe("Intent Acceptance");
+  });
   it("software-delivery standard has neither, and the overlay never mutates the bundled def", () => {
     const def = getWorkflowDef("software-delivery");
     expect(intentGateFor(def)).toBeNull();

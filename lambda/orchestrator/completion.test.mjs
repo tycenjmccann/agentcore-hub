@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   isWorkflowComplete,
+  activeBlockingGatesFor,
   missingEvidenceTickets,
   shipVerdictOf,
   evaluateShipVerdict,
@@ -89,6 +90,75 @@ describe("isWorkflowComplete — config-driven per-phase", () => {
       { ticketId: "D-9", assignee: "designer", status: "in_progress" },
     ]);
     expect(isWorkflowComplete(children, DEF, { getAgentPhase: (a) => (a === "designer" ? "design" : PHASE[a]) })).toBe(true);
+  });
+});
+
+/**
+ * TEAM-4288 r3-F1 — the ship gate the real config ships is condition:"cdRegistered",
+ * not "always" (a ship "always" gate is a phantom human expectation on a handoff
+ * run and lintWorkflowDefShape rejects it). Activation therefore depends on the
+ * run's delivery mode, which arrives as opts.cdRegistered. Before the fix these
+ * gates were invisible here and a CD run completed with NO human merge approval.
+ */
+describe("isWorkflowComplete — cdRegistered ship gate", () => {
+  const CD_DEF = {
+    completionRequiresAgentPhases: ["development", "verification", "review", "ship"],
+    reviewGates: [
+      { afterPhase: "ship", name: "Merge Approval", blocking: true, condition: "cdRegistered", onReject: "rework" },
+    ],
+  };
+  /** The four required phases done; `gate` optionally adds the human gate ticket. */
+  const run = (gateStatus) => [
+    { ticketId: "T-1", assignee: "dev", status: "done" },
+    { ticketId: "T-2", assignee: "qa", status: "done" },
+    { ticketId: "T-3", assignee: "ci", status: "done" },
+    { ticketId: "T-4", assignee: "rm", status: "done" },
+    ...(gateStatus ? [{ ticketId: "G-1", assignee: "human:engineer", phase: "ship", status: gateStatus }] : []),
+  ];
+
+  it("REGISTERED: refuses to complete when no Merge Approval ticket exists", () => {
+    expect(isWorkflowComplete(run(), CD_DEF, { ...opts, cdRegistered: true })).toBe(false);
+  });
+
+  it("REGISTERED: refuses to complete while the Merge Approval ticket is open", () => {
+    expect(isWorkflowComplete(run("in_review"), CD_DEF, { ...opts, cdRegistered: true })).toBe(false);
+  });
+
+  it("REGISTERED: completes once a human has approved the merge", () => {
+    expect(isWorkflowComplete(run("done"), CD_DEF, { ...opts, cdRegistered: true })).toBe(true);
+  });
+
+  it("HANDOFF: the gate is auto-absent, so the run completes with no gate ticket", () => {
+    expect(isWorkflowComplete(run(), CD_DEF, { ...opts, cdRegistered: false })).toBe(true);
+    // Absent opt == not registered (what isCdRegistered returns for no repo).
+    expect(isWorkflowComplete(run(), CD_DEF, opts)).toBe(true);
+  });
+
+  it("requesting the ship phase does not force the gate on for a handoff run", () => {
+    expect(
+      isWorkflowComplete(run(), CD_DEF, { ...opts, cdRegistered: false, requestedGates: ["ship"] })
+    ).toBe(true);
+  });
+});
+
+describe("activeBlockingGatesFor", () => {
+  const gates = [
+    { afterPhase: "ship", name: "Merge Approval", blocking: true, condition: "cdRegistered" },
+    { afterPhase: "ship", name: "Ship FYI", blocking: false, condition: "cdRegistered" },
+    { afterPhase: "requirements", name: "Spec Approval", blocking: true, condition: "flagged" },
+  ];
+  const names = (phase, ctx) => activeBlockingGatesFor(gates, phase, ctx).map((g) => g.name);
+
+  it("returns only ACTIVE + BLOCKING gates for the phase", () => {
+    expect(names("ship", { cdRegistered: true })).toEqual(["Merge Approval"]);
+    expect(names("ship", { cdRegistered: false })).toEqual([]);
+    expect(names("requirements", { requestedGates: ["requirements"] })).toEqual(["Spec Approval"]);
+    expect(names("requirements", { requestedGates: [] })).toEqual([]);
+  });
+
+  it("tolerates a missing gate list and an empty context", () => {
+    expect(activeBlockingGatesFor(undefined, "ship", { cdRegistered: true })).toEqual([]);
+    expect(activeBlockingGatesFor(gates, "ship")).toEqual([]);
   });
 });
 

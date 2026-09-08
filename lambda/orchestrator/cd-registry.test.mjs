@@ -6,6 +6,8 @@ import {
   isCdRegistered,
   stripShipPhases,
   effectiveWorkflowDef,
+  isGateActive,
+  activeGates,
   resolveDelivery,
   deliveryModeContext,
   EMPTY_CD_REGISTRY,
@@ -75,6 +77,64 @@ describe("findCdEntry / isCdRegistered", () => {
     expect(isCdRegistered(REG, { repos: [] })).toBe(false);
     expect(isCdRegistered(REG, { repos: [{ url: "" }] })).toBe(false);
     expect(isCdRegistered(EMPTY_CD_REGISTRY, HUB)).toBe(false);
+  });
+});
+
+describe("isGateActive / activeGates (TEAM-4288 r3-F1)", () => {
+  const gate = (condition) => ({ afterPhase: "ship", name: "Merge Approval", blocking: true, condition });
+
+  it('"always" is active regardless of delivery mode or request', () => {
+    expect(isGateActive(gate("always"), { cdRegistered: false, requestedGates: [] })).toBe(true);
+    expect(isGateActive(gate("always"), { cdRegistered: true })).toBe(true);
+    expect(isGateActive(gate("always"))).toBe(true);
+  });
+
+  it('"cdRegistered" is active ONLY when the repo is CD-registered', () => {
+    expect(isGateActive(gate("cdRegistered"), { cdRegistered: true })).toBe(true);
+    expect(isGateActive(gate("cdRegistered"), { cdRegistered: false })).toBe(false);
+    // Requesting the phase does NOT force a cdRegistered gate on: delivery mode
+    // decides, so a handoff run can never be given a phantom merge gate.
+    expect(isGateActive(gate("cdRegistered"), { cdRegistered: false, requestedGates: ["ship"] })).toBe(false);
+  });
+
+  it('"flagged" (and any other/absent condition) is active only when requested by phase', () => {
+    expect(isGateActive(gate("flagged"), { requestedGates: ["ship"] })).toBe(true);
+    expect(isGateActive(gate("flagged"), { requestedGates: ["design"] })).toBe(false);
+    expect(isGateActive(gate("flagged"), { cdRegistered: true })).toBe(false);
+    expect(isGateActive(gate(undefined), { requestedGates: ["ship"] })).toBe(true);
+    expect(isGateActive(gate(undefined), { requestedGates: [] })).toBe(false);
+  });
+
+  it("defaults to the fail-safe direction: no context, no gate, no throw", () => {
+    expect(isGateActive(gate("cdRegistered"))).toBe(false);
+    expect(isGateActive(gate("flagged"))).toBe(false);
+    expect(isGateActive(null)).toBe(false);
+    expect(isGateActive(undefined)).toBe(false);
+  });
+
+  it("activeGates filters a def's gate list and tolerates a missing list", () => {
+    const gates = [
+      { afterPhase: "requirements", name: "Spec Approval", condition: "flagged" },
+      { afterPhase: "ship", name: "Merge Approval", condition: "cdRegistered" },
+      { afterPhase: "intake", name: "Intent Acceptance", condition: "always" },
+    ];
+    const names = (ctx) => activeGates(gates, ctx).map((g) => g.name);
+    expect(names({ cdRegistered: true })).toEqual(["Merge Approval", "Intent Acceptance"]);
+    expect(names({ cdRegistered: false })).toEqual(["Intent Acceptance"]);
+    expect(names({ cdRegistered: true, requestedGates: ["requirements"] })).toEqual([
+      "Spec Approval", "Merge Approval", "Intent Acceptance",
+    ]);
+    expect(activeGates(undefined, { cdRegistered: true })).toEqual([]);
+  });
+
+  it("agrees with stripShipPhases: a gate dropped on handoff is also inactive", () => {
+    const stripped = stripShipPhases(SHIP_DEF, ["ship"]);
+    for (const g of SHIP_DEF.reviewGates) {
+      const survives = (stripped.reviewGates || []).includes(g);
+      if (!survives && g.condition === "cdRegistered") {
+        expect(isGateActive(g, { cdRegistered: false })).toBe(false);
+      }
+    }
   });
 });
 
