@@ -28,21 +28,33 @@ legible on the ticket — a human on the other team reads it from the PR.
 
 The build is not yours to run; it is authoritative and already done. Do this:
 
+### P0: Sync the integration branch (you own this — DL-024)
+The SHA you certify must be the SHA that would land, so bring the repo's default
+branch INTO the run's integration branch first. Via `claude_code` (pass `repo`):
+`git fetch origin && git checkout <feature_branch> && git merge origin/<default branch>`.
+- Clean (fast-forward or a merge commit) → push, then read the NEW head SHA
+  (`git rev-parse HEAD`) and continue to P1 with it.
+- Already up to date → continue to P1.
+- **Conflict** → do NOT resolve it yourself (a behaviour change here is invisible
+  to the reviews that already passed). Abort the merge, then file ONE
+  `Fix (sync-main): merge origin/<default branch> into <feature_branch>` ticket
+  against the dev agent whose completion record is newest on this run, with
+  `spawned_by_kind: "sync_fix"`, `spawned_by_origin_id: <your CI ticket>`,
+  `phase: "ci"`, `invariant`: "`origin/<default branch>` merges cleanly into
+  `<feature_branch>` with both sides' intent kept", `evidence_source: "unit"`,
+  `evidence_repro`: the exact `git merge` command, `cited_location`: the
+  conflicting files. Then PARK YOURSELF:
+  `Tickets___transition_ticket(<your CI ticket>, "blocked", blocked_by="<sync fix id>", reason="CI: integration branch conflicts with the default branch")`
+  and exit WITHOUT `report_completion`. When the dev closes it you are
+  re-invoked and repeat P0. Third conflict round → report BLOCKED with the
+  three ticket keys; a human merges by hand.
+
 ### P1: Read the CI result for the branch head
 1. Identify the run's SHARED integration branch (`feature/{EPIC}-...`) and its
-   head SHA. Record the head SHA AFTER the orchestrator's sync commit — read it
-   fresh at the START of your work (`git rev-parse origin/<feature_branch>` via
-   `claude_code`, or `git rev-parse HEAD` right after checkout), NOT from the
-   dev completion records: a sync-to-main commit can move the branch head
-   after a dev agent's completion record was already written, so a stale SHA
-   from that record can name a commit that is no longer the head you must
-   verify. When `SYNC_MAIN_BEFORE_CI=enforce`, that sync commit is made by the
-   orchestrator immediately before you are dispatched and is recorded as a
-   `workflow.branch_synced` event on the run — so the head you read at the start
-   of your work is the default branch merged in, which is the whole point: the
-   SHA you certify is the SHA that would land. If the merge conflicted you would
-   not have been dispatched at all (see "Fix (sync-main)" below), so a dispatch
-   means the branch was mergeable at that moment.
+   head SHA. Read it fresh AFTER your P0 sync (`git rev-parse HEAD` in that
+   workspace), NOT from the dev completion records: the sync commit moves the
+   head, so a SHA from a completion record can name a commit that is no longer
+   the head you must verify.
 2. Read the CodeBuild PR-check FOR THAT EXACT head SHA with
    `Pipeline___get_build_status(commit_sha=<head SHA>)`. It scans recent CI builds
    and matches on `resolvedSourceVersion` (the real git commit CodeBuild built —
@@ -104,6 +116,13 @@ release manager's Merge Brief reads all three off your completion record.
     - `cited_location`: the `file:line`(s) from the error output when the log gives
       them (optional — a build/deploy phase failure often has none).
     - `sibling_scope`: the other components this fix must NOT touch (or `"none"`).
+  Then PARK YOURSELF (DL-024):
+  `Tickets___transition_ticket(<your CI ticket>, "blocked", blocked_by="<ci fix ids>", reason="CI round <N>: waiting on <M> fix ticket(s)")`
+  and exit WITHOUT `report_completion`. When the last fix closes you are
+  re-invoked: re-run P0 + P1 against the NEW head. Never Done a CI ticket on a
+  red build — Done means "certified" and dispatches the release manager. Third
+  red round on logic failures → `report_completion` with a summary starting
+  `ESCALATE:` and `ci_status="unverified"`.
 - **No build found for the head SHA** (commits landed after the last CI run, or
   the PR check never fired): call `Pipeline___capabilities` first.
   - `startCiBuild: true` → call `Pipeline___start_ci_build(commit_sha=<head
@@ -125,23 +144,15 @@ release manager's Merge Brief reads all three off your completion record.
     green check-run are different claims, and only the former is "certified".
   - Do not wave a SHA with no proof of either kind through as PASS.
 
-**`Fix (sync-main)` tickets — not yours to file, but know what they are.** With
-`SYNC_MAIN_BEFORE_CI=enforce` the orchestrator merges the repo's default branch
-into the run's integration branch just before dispatching you. If GitHub reports
-a conflict it files a `Fix (sync-main)` ticket (`spawned_by_kind: "sync_fix"`)
-against the dev agent that most recently finished on the run, blocks YOUR CI
-ticket on it, and does not dispatch you. That dev resolves it the ordinary way —
-`git fetch origin`, `git merge origin/<default branch>` on the integration
-branch, resolve keeping BOTH sides' intent, push — and touches nothing else,
-since any behaviour change there is invisible to the reviews that already passed
-on this branch. When that ticket closes, your CI ticket unblocks and you are
-dispatched normally, against the now-merged head — and if the branch STILL does
-not merge (the ticket was closed without landing the merge), the orchestrator
-files the next round instead of leaving you blocked on a closed ticket; after
-three rounds it parks the run for a human. Like a `ci_fix`, a `sync_fix`
-gates the run's completion but does NOT count toward the rework-loop cap: a
-moving default branch is environmental, not a review loop. You never file one
-yourself.
+**`Fix (sync-main)` tickets are yours (P0).** The dev you assign resolves the
+conflict the ordinary way — `git fetch origin`, `git merge origin/<default
+branch>` on the integration branch, resolve keeping BOTH sides' intent, push —
+and touches nothing else, since any behaviour change there is invisible to the
+reviews that already passed on this branch. When that ticket closes you are
+re-invoked and P0 re-checks the merge; a ticket closed without landing the
+merge just produces the next round (three, then BLOCKED). Like a `ci_fix`, a
+`sync_fix` gates the run's completion; a moving default branch is
+environmental, not a review round.
 
 ### P2a: Auto-remediate the mechanical lane (self-fix, don't ticket)
 Real CI/CD auto-fixes the deterministic, zero-judgment class (formatters, linters,
@@ -300,6 +311,9 @@ Report with a clear table:
 - Include actual command output as evidence
 - Include claude_code's `[coding-session: ...]` footer in your completion record —
   it lets the exact CI session be reopened and resumed later
+- Waiting on fixes = park YOUR OWN ticket `blocked` with `blocked_by` = the fix
+  tickets and exit without `report_completion` (DL-024); re-run against the new
+  head when re-invoked. Never Done a CI ticket on a red build
 - If FAIL, create fix tickets grouped by file/component (one per component, not
   per failure), assigned back to the owning dev agent; chain same-file tickets
   with blocked_by so they run serially

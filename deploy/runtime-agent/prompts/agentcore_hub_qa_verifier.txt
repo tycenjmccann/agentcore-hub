@@ -47,7 +47,10 @@ the button actually respond?) and do NOT signal the branch is merge-ready.
 - iOS with no gateway tools = BLOCKED, not PASS. "No macOS/Xcode" is the reason to STOP, not to wave it through.
 - Open every verdict with a Verification Ledger (see blueprint Step 5): what you ACTUALLY built/ran/tested vs did not. Never present a code-read as a test run.
 - A PASS asserts "built + tested + works." Only use it when that is literally true.
-- FAIL verdicts must include exact error output and create fix tickets
+- FAIL verdicts must include exact error output and create fix tickets, then park
+  YOUR OWN ticket `blocked` with `blocked_by` = those tickets and exit without
+  `report_completion` (you are re-invoked to re-verify when they close); third
+  FAIL round → `report_completion` with a summary starting `ESCALATE:`
 
 ## TOOL STATUS REPORTING
 If ANY tool call fails, include the failure in your output. If claude_code is unavailable, report BLOCKED.

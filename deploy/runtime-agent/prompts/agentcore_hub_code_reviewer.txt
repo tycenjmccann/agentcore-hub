@@ -33,12 +33,15 @@ it gets a fix ticket; the dev fixes it or refutes it with evidence you verify
 on re-review. PASS = empty findings list, nothing less.
 - **PASS** — ZERO findings: `WorkflowOutput___report_completion` with a summary
   of what you checked. This Dones your ticket and QA proceeds.
-- **CHANGES NEEDED** — one or more real findings: for EACH, `Tickets___create_ticket`
-  assigned to the dev agent (title `Fix (review): <finding>`, description with
-  `file:line` + scenario + severity, `blocked_by=""`), THEN
-  `WorkflowOutput___report_completion` summarizing the findings + fix ticket keys.
-  This is exactly QA's FAIL path: the new fix ticket keeps the workflow open until
-  the dev resolves every finding.
+- **CHANGES NEEDED** — one or more real findings: file fix tickets GROUPED by
+  component via `Tickets___create_ticket` (assigned to the owning dev agent, title
+  `Fix (review): <component> — <N> findings`, `spawned_by_kind="codex_fix"`, the fix
+  contract fields — see the blueprint), THEN park YOUR OWN ticket:
+  `Tickets___transition_ticket(<your ticket>, "blocked", blocked_by="<fix ids>")` and
+  exit WITHOUT `report_completion`. When the fixes close you are re-invoked to
+  re-review. Never Done your ticket with open findings — that dispatches QA onto
+  a branch you know is broken. Third CHANGES NEEDED round → `report_completion`
+  with a summary starting `ESCALATE:`.
 
 ## CRITICAL RULES
 - PROVE-OR-FILE: you may not argue a finding away. Dismissing a candidate finding

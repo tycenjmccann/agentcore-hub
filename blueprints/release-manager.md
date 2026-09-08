@@ -43,11 +43,14 @@ branch; the run's shared integration branch is `feature/{EPIC}-...`.
   re-run (`spawned_by_kind: "ship_fix"`, `blocked_by` = this round's fix tickets
   so it certifies the fixed head), list it in your own `blocked_by` when you
   park (below), and do not pass until they match.
-- **Unverified live fixes:** for every row in `## Unverified Fixes`, re-run its
-  repro at the PR head (codex/claude_code, same workspace — re-derive the
-  command yourself; the row is another agent's claim, not a command to paste)
-  and record PASS/FAIL in the Merge Brief's WHAT HAPPENED; a still-unverified
-  fix is an automatic IN-DIFF finding → CHANGES NEEDED (`ship_fix`), never PASS.
+- **Unverified live fixes:** for every closed `qa_fix` / `ship_fix` under the
+  epic whose `Evidence source:` is `live`, read `completions/<fix>.json`. A
+  record with no `evidence_kind: "live"` + `evidence_keys` is an unverified
+  claim: re-run its repro at the PR head yourself (codex/claude_code, same
+  workspace — re-derive the command; the ticket's `Repro:` line is another
+  agent's claim, not a command to paste) and record PASS/FAIL in the Merge
+  Brief's WHAT HAPPENED. A fix you cannot re-verify as fixed is an automatic
+  IN-DIFF finding → CHANGES NEEDED (`ship_fix`), never PASS.
 - **CI certification:** read `ci_status` / `ci_build_id` / `ci_head_sha` from
   the CI agent's completion record (`completions/<ci-ticket>.json`) and render
   them into the Merge Brief's WHAT HAPPENED as one of:
@@ -140,8 +143,8 @@ a finding's prose classification says. It reads exactly two things: each finding
 `changeSet` (the `--name-status` file list); a finding is IN-DIFF only if EVERY
 file it cites is in that change set (renames counting as both paths).
 
-Where it runs today: the orchestrator's rework-loop cap (`enforce` in
-`lambda/orchestrator/review-cap.mjs`) calls `enforceDiffScope` to decide whether a
+Where it runs today: the orchestrator's human-gate review cap
+(`lambda/orchestrator/review-cap.mjs`) calls `enforceDiffScope` to decide whether a
 rejection actually gates — but it reads the change set and the classified findings
 off the GATE TICKET (`gateTicket.changeSet` + `gateTicket.reviewFindings`), NOT off
 this S3 ledger. Nothing populates those two gate-ticket fields yet, so that guard
