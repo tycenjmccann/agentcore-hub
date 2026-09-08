@@ -931,9 +931,12 @@ describe("handleReviewRejection (rework) — upstream with unresolved blockers i
       expect(transitionsOn("TEAM-10").map((t) => t.to)).toEqual(["To Do", "Ready", "In Progress"]);
       const invoked = eventsOf("agent.invoked").filter((e) => e.detail.ticketId === "TEAM-10");
       expect(invoked).toHaveLength(1);
-      expect(h.state.lambdaInvokes.filter((i) => i.payload?.ticketId === "TEAM-10")).toHaveLength(1);
+      // main also invokes the GitHub Lambda for the shared feature branch (#391),
+      // so select the agent-invoker dispatch rather than indexing [0].
+      const dispatches = h.state.lambdaInvokes.filter((i) => i.payload?.ticketId === "TEAM-10");
+      expect(dispatches).toHaveLength(1);
       // The stashed feedback rides along on that dispatch (one-time use).
-      expect(h.state.lambdaInvokes[0].payload.prompt).toContain("please fix the null check");
+      expect(dispatches[0].payload.prompt).toContain("please fix the null check");
       expect(h.state.workflow.resumeContexts["TEAM-10"]).toBeUndefined();
     });
 
