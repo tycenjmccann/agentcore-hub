@@ -1743,6 +1743,9 @@ function isHumanAssignee(assignee) {
  *        live agent's — a third-party in_progress → blocked must NOT release
  *        it, or the next Ready duplicate-dispatches beside the running agent.
  *        No release; heartbeat/TTL and the 2×TTL hatch apply as for F1.
+ *   Mixed: one never-completed open blocker is enough to release — it proves the
+ *        ticket is self-parked on new work (DL-024) even if an older, reopened
+ *        blocker sits beside it. Only an ALL-reopened open set keeps the claim.
  *
  * Exported solely so gate-creation-blocked.test.mjs can assert the CAS-lost
  * return value directly (same convention as handleReviewRejection).
@@ -1779,9 +1782,13 @@ export async function releaseClaimOnSelfPark(ticket, oldStatus) {
     // agent's. Only a blocker with NO completion on record proves premature
     // dispatch. agentTasks[blocker].completedAt is written on completion and
     // never cleared by a reopen (the workflow record is already in hand).
-    const reopenedBlockers = openBlockers.filter((bid) => workflow.agentTasks?.[bid]?.completedAt);
-    if (reopenedBlockers.length > 0) {
-      console.log(`[orchestrator] ${ticketId}: in_progress → blocked with a running claim; open blocker(s) [${reopenedBlockers.join(", ")}] were completed then reopened — this ticket was dispatched legitimately, the agent may be live; claim NOT released (lease TTL / stale-claim hatch / nudge apply)`);
+    // Codex review on #452: suppress the release only when EVERY open blocker
+    // has prior completion evidence. One never-completed open blocker (e.g. a
+    // fix ticket the agent just filed and parked on — DL-024) proves the ticket
+    // is waiting on work that has not run, whatever else is in its blockedBy.
+    const neverCompleted = openBlockers.filter((bid) => !workflow.agentTasks?.[bid]?.completedAt);
+    if (neverCompleted.length === 0) {
+      console.log(`[orchestrator] ${ticketId}: in_progress → blocked with a running claim; every open blocker [${openBlockers.join(", ")}] was completed then reopened — this ticket was dispatched legitimately, the agent may be live; claim NOT released (lease TTL / stale-claim hatch / nudge apply)`);
       return false;
     }
     const released = await stealClaim(ddb, WORKFLOWS_TABLE, workflow.id, ticketId, task.startedAt || null);
