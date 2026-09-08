@@ -7,6 +7,7 @@ import {
   thresholdFor,
   computeStaleTickets,
   decideWatch,
+  decideIdleWorkflow,
   buildLivenessTickets,
   activeTicketIds,
   maxThresholdMs,
@@ -444,6 +445,113 @@ describe("decideWatch — fires on the WORST (longest-silent) stale ticket", () 
     const tickets = [{ ticketId: "A", phase: "ship", startedAt: now - 1 * MIN }];
     const d = decideWatch({}, tickets, now, "enforce", DEFAULT_THRESHOLDS);
     expect(d).toMatchObject({ fire: false, ticketId: null, reason: null, staleAgeMs: 0 });
+  });
+});
+
+describe("TEAM-4289 r3-F2 — enforce falls back to the workflow clock when nothing is active", () => {
+  const now = 10_000 * MIN;
+  const iso = (ms) => new Date(ms).toISOString();
+  const STALE = 10 * MIN; // WM_STALE_MINUTES default, as in index.mjs
+
+  /** A run whose only claim already COMPLETED — activeTicketIds sees nothing. */
+  const doneTasks = {
+    "T-1": {
+      agentId: "agentcore_hub_backend_dev", ticketId: "T-1",
+      status: "complete", startedAt: iso(now - 60 * MIN),
+    },
+  };
+  /** Derived through the REAL pure path, not hand-written: the premise is that
+   *  a zero-active-task run produces an EMPTY ticket list, hence no verdicts. */
+  const emptyTickets = () =>
+    buildLivenessTickets({
+      agentTasks: doneTasks, events: [], nowMs: now,
+      phaseOf: (_id, t) => phaseForAgent(t.agentId, "development"),
+    });
+
+  it("the premise — a run with only completed claims has no tickets to judge", () => {
+    expect(activeTicketIds({ agentTasks: doneTasks })).toEqual([]);
+    expect(emptyTickets()).toEqual([]);
+  });
+
+  it("(1) fires stale:idle on a non-terminal, non-parked run past the legacy threshold", () => {
+    const wf = { workflowId: "wf-idle", phase: "development", agentTasks: doneTasks };
+    const d = decideWatch(wf, emptyTickets(), now, "enforce", DEFAULT_THRESHOLDS, {
+      ageMs: 30 * MIN, thresholdMs: STALE,
+    });
+    expect(d.fire).toBe(true);
+    expect(d.reason).toBe("stale:idle"); // distinguishable from stale:<phase>
+    expect(d.ticketId).toBeNull();       // workflow-level: no ticket to blame
+    expect(d.staleAgeMs).toBe(30 * MIN); // index.mjs reports this age in the prompt
+    expect(d.verdicts).toEqual([]);
+  });
+
+  it("(2) does NOT fire when the run is parked on a real human gate", () => {
+    const wf = {
+      workflowId: "wf-parked", phase: "development", agentTasks: doneTasks,
+      humanNotifications: [
+        { type: "review_needed", ticketId: "T-1", humanAssignee: "human:engineer", acknowledged: false },
+      ],
+    };
+    expect(isParkedOnHuman(wf)).toBe(true); // the gate is real
+    const d = decideWatch(wf, emptyTickets(), now, "enforce", DEFAULT_THRESHOLDS, {
+      ageMs: 5 * 60 * MIN, thresholdMs: STALE, // silent for HOURS, legitimately
+    });
+    expect(d.fire).toBe(false);
+    expect(decideIdleWorkflow(wf, { ageMs: 5 * 60 * MIN, thresholdMs: STALE })).toBeNull();
+    // …and an ACKNOWLEDGED gate no longer parks, so the fallback resumes.
+    const acked = {
+      ...wf,
+      humanNotifications: [{ ...wf.humanNotifications[0], acknowledged: true }],
+    };
+    expect(decideWatch(acked, emptyTickets(), now, "enforce", DEFAULT_THRESHOLDS, {
+      ageMs: 5 * 60 * MIN, thresholdMs: STALE,
+    }).fire).toBe(true);
+  });
+
+  it("(3) does not fire under the threshold, and fires at exactly the threshold", () => {
+    const wf = { workflowId: "wf-idle", phase: "development", agentTasks: doneTasks };
+    const at = (ageMs) =>
+      decideWatch(wf, emptyTickets(), now, "enforce", DEFAULT_THRESHOLDS, { ageMs, thresholdMs: STALE });
+    expect(at(STALE - 1).fire).toBe(false);
+    expect(at(STALE).fire).toBe(true); // >= , matching the per-ticket convention
+    expect(at(STALE).staleAgeMs).toBe(STALE);
+  });
+
+  it("(4) backwards compat — empty tickets with NO idle ctx stay fire:false", () => {
+    const wf = { workflowId: "wf-idle", phase: "development", agentTasks: doneTasks };
+    expect(decideWatch(wf, emptyTickets(), now, "enforce", DEFAULT_THRESHOLDS)).toMatchObject({
+      fire: false, reason: null, staleAgeMs: 0, ticketId: null,
+    });
+    expect(decideWatch(wf, [], now, "enforce", DEFAULT_THRESHOLDS).fire).toBe(false);
+    // A malformed idle ctx is no ctx at all (fail toward not firing).
+    for (const idle of [{}, { ageMs: NaN, thresholdMs: STALE }, { ageMs: 30 * MIN },
+                        { thresholdMs: STALE }, { ageMs: "soon", thresholdMs: STALE },
+                        { ageMs: Infinity, thresholdMs: STALE }]) {
+      expect(decideWatch(wf, [], now, "enforce", DEFAULT_THRESHOLDS, idle).fire).toBe(false);
+      expect(decideIdleWorkflow(wf, idle)).toBeNull();
+    }
+    expect(decideIdleWorkflow(wf, undefined)).toBeNull();
+  });
+
+  it("(5) with an ACTIVE ticket the per-ticket verdicts decide and idle is ignored", () => {
+    const wf = { workflowId: "wf-live", phase: "development" };
+    // Span-fresh: streaming 20s ago → NEVER stale, whatever the workflow clock says.
+    const tickets = [{
+      ticketId: "T-live", phase: "development",
+      lastStreamAt: now - 20_000, lastSpanAt: now - 20_000, lastEventAt: now - 20_000,
+      startedAt: now - 3 * 60 * MIN,
+    }];
+    const d = decideWatch(wf, tickets, now, "enforce", DEFAULT_THRESHOLDS, {
+      ageMs: 5 * 60 * MIN, thresholdMs: STALE, // huge — and irrelevant
+    });
+    expect(d.fire).toBe(false);
+    expect(d.verdicts).toHaveLength(1);
+    expect(d.verdicts[0].spanFresh).toBe(true);
+    // Also true for a non-stale ticket that is not span-fresh.
+    const quiet = [{ ticketId: "T-q", phase: "development", startedAt: now - 5 * MIN }];
+    expect(decideWatch(wf, quiet, now, "enforce", DEFAULT_THRESHOLDS, {
+      ageMs: 5 * 60 * MIN, thresholdMs: STALE,
+    }).fire).toBe(false);
   });
 });
 

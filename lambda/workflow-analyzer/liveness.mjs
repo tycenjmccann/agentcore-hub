@@ -217,12 +217,52 @@ export function computeStaleTickets(tickets, nowMs, thresholds) {
 }
 
 /**
+ * TEAM-4289 r3-F2 — the WORKFLOW-level fallback, for a run with nothing to judge.
+ *
+ * WHY it exists: every per-ticket verdict comes from buildLivenessTickets, whose
+ * candidates are activeTicketIds — status running/in_progress, or a live lease.
+ * A non-terminal run can legitimately have ZERO of those and still be broken: a
+ * completed task whose dependent's Ready webhook was dropped, or a run sitting
+ * idle between dispatches. Such a run yields an EMPTY verdict list, and an empty
+ * list is not evidence of health — it is the ABSENCE of evidence. Before this
+ * fallback, `enforce` read that absence as "nothing stale" and never fired,
+ * while the legacy workflow-level clock (legacySignificantEventAge over the
+ * 25-row window, else now − startedAt, vs WM_STALE_MINUTES) WOULD have fired —
+ * so switching the watchdog to enforce silently LOST coverage on exactly the
+ * runs nobody was watching. The reviewer's scratch run is the proof:
+ * `legacyFire:true, decision.fire:false` on a non-terminal run with no active
+ * tasks.
+ *
+ * The caller supplies the clock (`idle = { ageMs, thresholdMs }`) rather than
+ * this module inventing one — index.mjs passes its EXISTING legacyAge + STALE_MS,
+ * which makes enforce a provable SUPERSET of the legacy watchdog's coverage and
+ * adds no new threshold knob.
+ *
+ * Returns null (not a decision) whenever it does not engage, so decideWatch's
+ * existing fall-through stays untouched. A run parked on a real human gate is
+ * NOT unattended, so isParkedOnHuman vetoes the fallback here as well as in
+ * watchScan's pre-filter — the veto is then provable through the pure decision.
+ */
+export function decideIdleWorkflow(workflow, idle) {
+  const ageMs = Number(idle?.ageMs);
+  const thresholdMs = Number(idle?.thresholdMs);
+  if (!Number.isFinite(ageMs) || !Number.isFinite(thresholdMs)) return null;
+  if (isParkedOnHuman(workflow)) return null; // a real human gate is not unattended
+  if (ageMs < thresholdMs) return null;
+  return { fire: true, reason: "stale:idle", staleAgeMs: ageMs, ticketId: null, verdicts: [] };
+}
+
+/**
  * The WATCH decision for one workflow. Returns whether to intervene, and on
  * which ticket (the WORST — longest-silent — stale ticket wins, so a single
  * scan surfaces the most-stalled agent). `verdicts` carries the per-ticket
  * computation for shadow logging + tests.
+ *
+ * `idle` (TEAM-4289 r3-F2, OPTIONAL) is the workflow-level clock consulted ONLY
+ * when there are zero verdicts — see decideIdleWorkflow. Omit it and the
+ * behaviour is exactly as before: fire:false on an empty ticket list.
  */
-export function decideWatch(workflow, tickets, nowMs, mode, thresholds) {
+export function decideWatch(workflow, tickets, nowMs, mode, thresholds, idle) {
   const verdicts = (tickets || []).map((t) => {
     const thresholdMs = thresholdFor(
       t.phase,
@@ -237,6 +277,16 @@ export function decideWatch(workflow, tickets, nowMs, mode, thresholds) {
 
   const stale = verdicts.filter((v) => v.stale);
   if (!stale.length) {
+    // TEAM-4289 r3-F2: NO verdicts at all means nothing was ACTIVE to judge, not
+    // that the run is healthy — fall back to the caller's workflow-level clock so
+    // the run is never left unattended. Gated on verdicts (not on the caller's
+    // active-id count) deliberately: a ticket buildLivenessTickets dropped for
+    // carrying no timestamp at all is equally unjudged, and equally unattended.
+    // With even ONE verdict the per-ticket clocks decide and `idle` is ignored.
+    if (!verdicts.length && idle) {
+      const idleDecision = decideIdleWorkflow(workflow, idle);
+      if (idleDecision) return idleDecision;
+    }
     return { fire: false, reason: null, staleAgeMs: 0, ticketId: null, verdicts };
   }
   const worst = stale.reduce((a, b) => (b.staleAgeMs > a.staleAgeMs ? b : a));
