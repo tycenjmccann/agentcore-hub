@@ -25,15 +25,3 @@ fix-contract.mjs
 gate-state.mjs
 review-cap.mjs
 ship-review.mjs
-dead-session-escalation.mjs
-ticket-blockers.mjs
-
-# dark in prod, scheduled for deletion (cleanup PR 2 — remove these lines with the files)
-ci-check.mjs
-live-reverify.mjs
-merge-on-green.mjs
-model-router.mjs
-rework-loop-cap.mjs
-ship-dispatch-gate.mjs
-ship-head-stability.mjs
-sync-main.mjs

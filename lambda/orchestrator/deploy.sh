@@ -56,7 +56,7 @@ cp "$REPO_ROOT/src/config/lease-constants.json" ./lease-constants.json
 # agent-invoker.mjs, events-writer.mjs (TEAM-3696) — a module missing here dies
 # at cold start with ERR_MODULE_NOT_FOUND. Verify with
 # ./scripts/check-lambda-zip-manifest.sh before changing this line.
-zip -rq function.zip index.mjs agent-invoker.mjs events-writer.mjs workflow-store.mjs lease.mjs lease-constants.json watchdog.mjs dead-session-detector.mjs cascade.mjs review-cap.mjs ship-review.mjs completion.mjs pipeline-enabled.mjs cd-registry.mjs reconcile-sweep.mjs sweep-scan.mjs merge-on-green.mjs ship-head-stability.mjs ship-dispatch-gate.mjs rework-loop-cap.mjs live-reverify.mjs repo-check.mjs ci-check.mjs sync-main.mjs event-id.mjs gate-state.mjs dead-session-escalation.mjs ticket-blockers.mjs fix-contract.mjs artifact-chain.mjs package.json node_modules/
+zip -rq function.zip index.mjs agent-invoker.mjs events-writer.mjs workflow-store.mjs lease.mjs lease-constants.json watchdog.mjs dead-session-detector.mjs cascade.mjs review-cap.mjs ship-review.mjs completion.mjs pipeline-enabled.mjs cd-registry.mjs reconcile-sweep.mjs sweep-scan.mjs repo-check.mjs event-id.mjs gate-state.mjs fix-contract.mjs artifact-chain.mjs package.json node_modules/
 rm -f lease-constants.json
 
 SIZE=$(ls -lh function.zip | awk '{print $5}')
@@ -143,36 +143,9 @@ if [ -n "${LEVEL_TRIGGER_DISPATCH:-}" ]; then
   LEVEL_DISPATCH_VARS=",LEVEL_TRIGGER_DISPATCH=${LEVEL_TRIGGER_DISPATCH}"
 fi
 
-# Merge-on-green (TEAM-4110) — forwarded only when explicitly set so an unset
-# install stays default off (byte-identical; instant rollback = set to off).
-MERGE_ON_GREEN_VARS=""
-if [ -n "${MERGE_ON_GREEN:-}" ]; then
-  MERGE_ON_GREEN_VARS=",MERGE_ON_GREEN=${MERGE_ON_GREEN}"
-fi
 
-# Ship-head stability gate (TEAM-4111): only forwarded when explicitly set, so a
-# plain install stays default off (byte-identical; instant rollback = set off).
-SHIP_HEAD_STABILITY_VARS=""
-if [ -n "${SHIP_HEAD_STABILITY:-}" ]; then
-  SHIP_HEAD_STABILITY_VARS=",SHIP_HEAD_STABILITY=${SHIP_HEAD_STABILITY}"
-fi
 
-# Ship-dispatch prerequisite gate (TEAM-4112): only forwarded when explicitly
-# set, so a plain install stays default off (byte-identical; instant rollback =
-# set off). Strict allow-list in code — a garbage value coalesces to off.
-SHIP_DISPATCH_GATE_VARS=""
-if [ -n "${SHIP_DISPATCH_GATE:-}" ]; then
-  SHIP_DISPATCH_GATE_VARS=",SHIP_DISPATCH_GATE=${SHIP_DISPATCH_GATE}"
-fi
 
-# Rework-loop cap (TEAM-4113): only forwarded when explicitly set, so a plain
-# install stays default off (byte-identical). Unlike the ship gates, a PRESENT-
-# but-garbage value coalesces to SHADOW in code (observe-only) — an unbounded
-# rework loop is the dangerous failure, so an unknown mode still measures.
-REWORK_LOOP_CAP_VARS=""
-if [ -n "${REWORK_LOOP_CAP:-}" ]; then
-  REWORK_LOOP_CAP_VARS=",REWORK_LOOP_CAP=${REWORK_LOOP_CAP}"
-fi
 
 # Events-table double-write collapse (TEAM-4120 FR-2): only forwarded when
 # explicitly set, so a plain install stays default off (byte-identical; instant
@@ -198,33 +171,7 @@ if [ -n "${GATE_STATE_GUARD:-}" ]; then
   echo "  GATE_STATE_GUARD=${GATE_STATE_GUARD} forwarded to orchestrator"
 fi
 
-# Dead-session escalation tree (TEAM-4120 FR-3) — page → synthesize → park on an
-# exhausted dead-session retry. Forwarded ONLY when explicitly set, so a plain
-# install stays default OFF and both exhausted-retry emitters keep appending the
-# bare manager_escalation notification (byte-identical). NOTE the asymmetry with
-# the gate/ship guards: unset → off, but a PRESENT garbage value coalesces to
-# SHADOW in code (normalizeEscalationMode), like REWORK_LOOP_CAP — the dangerous
-# failure here is a silent no-op on a dead run, not an unwanted action.
-# Instant rollback = set off.
-DEAD_SESSION_ESCALATION_VARS=""
-if [ -n "${DEAD_SESSION_ESCALATION_MODE:-}" ]; then
-  DEAD_SESSION_ESCALATION_VARS=",DEAD_SESSION_ESCALATION_MODE=${DEAD_SESSION_ESCALATION_MODE}"
-  echo "  DEAD_SESSION_ESCALATION_MODE=${DEAD_SESSION_ESCALATION_MODE} forwarded to orchestrator"
-fi
 
-# Live-evidence re-verification (TEAM-4121 FR-9) — files a Re-verify (QA)
-# ticket per live-evidence fix at its head sha and marks a live fix with no live
-# artifact `unverified` for the release manager's ## Unverified Fixes block.
-# Forwarded ONLY when explicitly set, so a plain install stays default off
-# (byte-identical: the module is never constructed and the done twins take no
-# extra read). STRICT allow-list in code — a garbage value coalesces to OFF, not
-# shadow, because enforce CREATES REAL TICKETS that dispatch an agent and block
-# the run's ship tickets. Instant rollback = set off.
-LIVE_REVERIFY_VARS=""
-if [ -n "${LIVE_REVERIFY:-}" ]; then
-  LIVE_REVERIFY_VARS=",LIVE_REVERIFY=${LIVE_REVERIFY}"
-  echo "  LIVE_REVERIFY=${LIVE_REVERIFY} forwarded to orchestrator"
-fi
 
 # Repo URL pre-flight (repo-check.mjs reads env.REPO_CHECK_MODE, default
 # process.env) — "off" disables the submit-time + dispatch-time GitHub check.
@@ -238,87 +185,10 @@ if [ -n "${REPO_CHECK_MODE:-}" ]; then
   echo "  REPO_CHECK_MODE=${REPO_CHECK_MODE} forwarded to orchestrator"
 fi
 
-# CI reachability pre-flight (TEAM-4122 FR-5): off | shadow | enforce. shadow
-# probes CodeBuild + the pipeline-tools Lambda once per workflow and states the
-# verdict in every persona's `## CI Certification` context; enforce additionally
-# labels the epic `ci:uncertifiable` and prefixes the human merge-gate package.
-# Forwarded ONLY when explicitly set, so a plain install stays default off —
-# byte-identical: no probe, no CodeBuild/IAM SDK load (dynamic import), no
-# context block. STRICT allow-list in code (garbage → off, not shadow) because
-# enforce WRITES to a real ticket. The companions are only meaningful with a
-# mode set, so they ride the same forward-when-set rule:
-#   CI_CHECK_TTL_MS          override the 6h settled-verdict cache (unknown is
-#                            always re-probed after 30min)
-#   CI_CHECK_USE_IAM_SIMULATE=1  read the pipeline-tools ROLE's real policy for
-#                            codebuild:StartBuild instead of trusting its
-#                            self-reported capability. Needs the optional
-#                            CiCheckSimulate grant (deploy/setup-lambda-role.sh).
-#   CI_PROJECT_NAME          the CodeBuild PR-check project when it is not
-#                            `agentcore-hub-ci` and the CD registry entry carries
-#                            no `ciProject`.
-#   PIPELINE_TOOLS_ROLE_ARN  the simulate target — without it simulate is skipped.
-#   PIPELINE_TOOLS_LAMBDA    the capabilities probe target (default
-#                            agentcore-hub-pipeline-tools).
-# Instant rollback = set off (or unset and redeploy).
-CI_CHECK_VARS=""
-if [ -n "${CI_CHECK_MODE:-}" ]; then
-  CI_CHECK_VARS=",CI_CHECK_MODE=${CI_CHECK_MODE}"
-  echo "  CI_CHECK_MODE=${CI_CHECK_MODE} forwarded to orchestrator"
-fi
-if [ -n "${CI_CHECK_TTL_MS:-}" ]; then
-  CI_CHECK_VARS="${CI_CHECK_VARS},CI_CHECK_TTL_MS=${CI_CHECK_TTL_MS}"
-fi
-if [ -n "${CI_CHECK_USE_IAM_SIMULATE:-}" ]; then
-  CI_CHECK_VARS="${CI_CHECK_VARS},CI_CHECK_USE_IAM_SIMULATE=${CI_CHECK_USE_IAM_SIMULATE}"
-fi
-if [ -n "${CI_PROJECT_NAME:-}" ]; then
-  CI_CHECK_VARS="${CI_CHECK_VARS},CI_PROJECT_NAME=${CI_PROJECT_NAME}"
-fi
-if [ -n "${PIPELINE_TOOLS_ROLE_ARN:-}" ]; then
-  CI_CHECK_VARS="${CI_CHECK_VARS},PIPELINE_TOOLS_ROLE_ARN=${PIPELINE_TOOLS_ROLE_ARN}"
-fi
-if [ -n "${PIPELINE_TOOLS_LAMBDA:-}" ]; then
-  CI_CHECK_VARS="${CI_CHECK_VARS},PIPELINE_TOOLS_LAMBDA=${PIPELINE_TOOLS_LAMBDA}"
-fi
 
-# Pre-CI default-branch sync (TEAM-4122 FR-6): off | shadow | enforce. The CI
-# agent certifies the integration branch's head SHA, but the default branch has
-# moved since the devs branched — so a green build certifies code that is not
-# what would land. shadow = one compare read + a `workflow.sync_dry_run` event
-# (it CANNOT tell whether the merge would conflict — only a merge can); enforce
-# = merge the default branch INTO the feature branch immediately before the CI
-# agent is dispatched, and on a 409 file a `Fix (sync-main)` sync_fix ticket that
-# blocks the CI ticket until a dev resolves it. Needs GITHUB_PAT (no PAT = no-op).
-# Forwarded ONLY when explicitly set, so a plain install stays default off —
-# byte-identical: no GitHub call, no event, no write. STRICT allow-list in code
-# (garbage → off, not shadow) because enforce PUSHES A COMMIT to a shared branch.
-# Instant rollback = set off (or unset and redeploy).
-SYNC_MAIN_BEFORE_CI_VARS=""
-if [ -n "${SYNC_MAIN_BEFORE_CI:-}" ]; then
-  SYNC_MAIN_BEFORE_CI_VARS=",SYNC_MAIN_BEFORE_CI=${SYNC_MAIN_BEFORE_CI}"
-  echo "  SYNC_MAIN_BEFORE_CI=${SYNC_MAIN_BEFORE_CI} forwarded to orchestrator"
-fi
 
-# Advisory-ticket routing (TEAM-4122 FR-7): off | enforce. An "advisory" ticket is
-# out-of-scope-but-worth-doing work the reviewers file as backlog. enforce makes
-# the label mean what the blueprints promise: the ticket is excluded from every
-# completion/open-fix gate, its dev is told to branch from and PR against the repo
-# DEFAULT branch (`feature/<id>-advisory`), and such a branch is never adopted as
-# a run's shared integration branch — so declined scope cannot ride into the
-# unified PR. There is NO shadow: the routing IS the prompt the agent acts on, so
-# observe-only would either lie to the agent or do nothing. Needs the `labels`
-# param deployed on both ticket Lambdas and the runtime image (a run whose tickets
-# carry no labels reads as non-advisory, i.e. exactly today's behaviour).
-# Forwarded ONLY when explicitly set, so a plain install stays default off —
-# byte-identical. STRICT allow-list in code (garbage → off).
-# Instant rollback = set off (or unset and redeploy).
-ADVISORY_ROUTING_VARS=""
-if [ -n "${ADVISORY_ROUTING:-}" ]; then
-  ADVISORY_ROUTING_VARS=",ADVISORY_ROUTING=${ADVISORY_ROUTING}"
-  echo "  ADVISORY_ROUTING=${ADVISORY_ROUTING} forwarded to orchestrator"
-fi
 
-ENV_VARS_ORCH="Variables={ARTIFACT_BUCKET=${ARTIFACT_BUCKET},TICKETS_TABLE=${TICKETS_TABLE},WORKFLOWS_TABLE=${WORKFLOWS_TABLE},EVENTS_TABLE=${EVENTS_TABLE},TICKET_PROVIDER=${TICKET_PROVIDER},TICKET_TOOLS_LAMBDA=${TICKET_TOOLS_LAMBDA}${JIRA_VARS}${GITHUB_VARS}${LEASE_VARS}${DETECTOR_VARS}${CASCADE_VARS}${RECONCILE_VARS}${PIPELINE_VARS}${LEVEL_DISPATCH_VARS}${MERGE_ON_GREEN_VARS}${SHIP_HEAD_STABILITY_VARS}${SHIP_DISPATCH_GATE_VARS}${REWORK_LOOP_CAP_VARS}${EVENT_DEDUPE_VARS}${GATE_STATE_GUARD_VARS}${DEAD_SESSION_ESCALATION_VARS}${LIVE_REVERIFY_VARS}${REPO_CHECK_MODE_VARS}${CI_CHECK_VARS}${SYNC_MAIN_BEFORE_CI_VARS}${ADVISORY_ROUTING_VARS}}"
+ENV_VARS_ORCH="Variables={ARTIFACT_BUCKET=${ARTIFACT_BUCKET},TICKETS_TABLE=${TICKETS_TABLE},WORKFLOWS_TABLE=${WORKFLOWS_TABLE},EVENTS_TABLE=${EVENTS_TABLE},TICKET_PROVIDER=${TICKET_PROVIDER},TICKET_TOOLS_LAMBDA=${TICKET_TOOLS_LAMBDA}${JIRA_VARS}${GITHUB_VARS}${LEASE_VARS}${DETECTOR_VARS}${CASCADE_VARS}${RECONCILE_VARS}${PIPELINE_VARS}${LEVEL_DISPATCH_VARS}${EVENT_DEDUPE_VARS}${GATE_STATE_GUARD_VARS}${REPO_CHECK_MODE_VARS}}"
 ENV_VARS_INVOKER="Variables={ARTIFACT_BUCKET=${ARTIFACT_BUCKET},TICKETS_TABLE=${TICKETS_TABLE},WORKFLOWS_TABLE=${WORKFLOWS_TABLE},EVENTS_TABLE=${EVENTS_TABLE},TICKET_PROVIDER=${TICKET_PROVIDER},TICKET_TOOLS_LAMBDA=${TICKET_TOOLS_LAMBDA}${EVENT_DEDUPE_VARS}}"
 ENV_VARS_EVENTS="Variables={EVENTS_TABLE=${EVENTS_TABLE}${EVENT_DEDUPE_VARS}}"
 

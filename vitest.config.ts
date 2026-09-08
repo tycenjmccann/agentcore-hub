@@ -82,36 +82,6 @@ export default defineConfig({
       // off|shadow|enforce, the already-Ready in-process dispatch, and non-fatal
       // isolation when dispatchReady (the claim-CAS webhook path) loses a race.
       "lambda/orchestrator/level-trigger-dispatch.test.mjs",
-      // merge-on-green.mjs (TEAM-4110) — DI coverage for the auto-merge of a
-      // human-approved, clean+green final PR: off | shadow | enforce (default
-      // off, byte-identical), gate-must-be-done, mergeable_state:"clean" only,
-      // exact-head-SHA merge, and non-fatal GitHub-refusal handling.
-      "lambda/orchestrator/merge-on-green.test.mjs",
-      // ship-head-stability.mjs (TEAM-4111) — DI coverage for the dispatch-time
-      // head-stability gate: off (no probe, byte-identical) | shadow (measures
-      // would-defer, always dispatches) | enforce (defer until head quiet +
-      // CI green on that exact head). CI-red passes through, probe-throw and
-      // maxDeferrals both fail open, unknown mode fails safe to off.
-      "lambda/orchestrator/ship-head-stability.test.mjs",
-      // ship-dispatch-gate.mjs (TEAM-4112) — DI coverage for the ship-dispatch
-      // prerequisite gate: ship is gated iff a non-epic, completion-required,
-      // present pre-ship-phase sibling is not terminal. Epics/other-ship-phase/
-      // unclassifiable (human-gate) tickets never gate (fail-safe), absent phases
-      // never wedge, repairBlocker prefers verification/CI, and mode normalization
-      // is the same strict allow-list as ship-head (legacy on/true/1 → off).
-      "lambda/orchestrator/ship-dispatch-gate.test.mjs",
-      // rework-loop-cap.mjs (TEAM-4113) — the per-(workflow,phase) lineage
-      // backstop the per-gate review-cap can't provide: counts fix tickets per
-      // PHASE so a loop hopping ticket ids still accumulates. DI coverage of
-      // off|shadow|enforce (fail-safe to SHADOW, opposite of the ship gates),
-      // distinct-id round counting, DECISION: continue reset, idempotent
-      // escalation, and ledger-failure fail-open.
-      "lambda/orchestrator/rework-loop-cap.test.mjs",
-      // rework-loop-replay (TEAM-4113) — a 9-round QA→dev runaway that files a
-      // fresh fix ticket (new gate id) each round, replayed through the REAL
-      // cap: asserts the lineage cap trips at maxRounds and signals ONCE, while
-      // a per-gate-id ledger (the review-cap's keying) never reaches the cap.
-      "lambda/orchestrator/rework-loop-replay.test.mjs",
       // jira-fix-label (TEAM-4113) — mapJiraIssueToTicket reconstructs an agent-
       // filed fix ticket's spawnedBy.kind from the `fix:<kind>` label the jira
       // tools Lambda stamps, so Jira-mode fixes gate completion + the rework cap
@@ -248,34 +218,6 @@ export default defineConfig({
       // human actually filed (zero, in every dossier we have), that the
       // creation-time block still costs no I/O, and that off is unchanged.
       "lambda/orchestrator/replay-gate-state.test.mjs",
-      // dead-session-escalation (TEAM-4120 FR-3) — the page→synthesize→park tree,
-      // fully DI: the mode normalizer's shadow-coalescing fail-safe, the redaction
-      // table one vector per pattern (including a secret straddling the 600-char
-      // clip boundary), child selection replayed against the REAL yteqfl ticket
-      // set, the decision order (agent error > fresh record > children > park,
-      // never Done on a stale/blank record), shadow's single write, and that no
-      // dep failure can make it reject mid-sweep.
-      "lambda/orchestrator/dead-session-escalation.test.mjs",
-      // dead-session gate wake (TEAM-4120 FR-3) — index.mjs REAL, AWS/store seams
-      // mocked: a human Done'ing an `Escalation: dead session on TEAM-x (agent)`
-      // gate hands that ticket's retry budget back and announces the decision
-      // WITHOUT re-dispatching anything (the gate's own cascade unblocks it), and
-      // the release-manager escalation title still takes the TEAM-3971 branch.
-      "lambda/orchestrator/dead-session-gate-wake.test.mjs",
-      // replay-yteqfl-dead-session (TEAM-4120 FR-3 acceptance) — the real yteqfl
-      // slice 06:51→07:36Z replayed through the REAL sweep → cascade → escalation
-      // tree: the dead release manager's TEAM-4066 gets blocked on the six tickets
-      // it spawned (both the AC's literal 4101/4102 pair and the full closure) and
-      // ONE reconcile tick re-drives it when the last child lands — versus mode
-      // off, where escalationHeld reproduces the 3h26m stall prod actually took.
-      "lambda/orchestrator/replay-yteqfl-dead-session.test.mjs",
-      // contract-warning (TEAM-4121 FR-8) — index.mjs REAL, AWS/store seams
-      // mocked: a fix ticket filed under FIX_TICKET_CONTRACT=shadow republishes
-      // its incompleteness as ONE `ticket.contract_warning` event on the run's own
-      // stream (so shadow is measurable before enforce is switched on), in both
-      // creation twins — the DDB-stream INSERT and the Jira webhook's todo — and
-      // never fails to ROUTE the ticket when that advisory can't be published.
-      "lambda/orchestrator/contract-warning.test.mjs",
       // workflow-output report_completion (TEAM-4121 FR-9) — the completion record
       // is what live-reverify.mjs reads to decide whether a "live" fix actually
       // produced live evidence, so the two new fields must be additive (a record
@@ -283,85 +225,6 @@ export default defineConfig({
       // unrecognized evidence_kind is dropped with a warning, never stored). REAL
       // handler, AWS SDK mocked at the module seam.
       "lambda/workflow-output/index.test.mjs",
-      // live-reverify (TEAM-4121 FR-9), unit level — the module is fully DI'd, so
-      // this drives the REAL decision logic with hand-built deps and asserts the
-      // CALLS: exactly one `Re-verify (QA): <fix> @ <sha7>` per (fix, head) with
-      // the exact params, the independent `verification: "unverified"` mark when a
-      // "live" fix closes with no live artifact, ship tickets blocked only while
-      // open, shadow writing nothing, and the STRICT mode allow-list (garbage →
-      // off, unlike every other flag) that keeps a typo from minting tickets.
-      "lambda/orchestrator/live-reverify.test.mjs",
-      // ticket-blockers.mjs (TEAM-4130 F1) — the blocker-edge write extracted out
-      // of index.mjs's addBlockers so its two-attempt conditional write is
-      // testable at all. Zero imports (the AWS command is constructed by the
-      // caller and handed in as `send`), so the test's fake actually EVALUATES
-      // the ConditionExpression against a row — the only way to assert that the
-      // park-it and preserve-the-status conditions are mutually exclusive and
-      // jointly exhaustive, which a read-then-write could not be.
-      "lambda/orchestrator/ticket-blockers.test.mjs",
-      // yteqfl loop 2 replay (TEAM-4121 FR-9) — the real prod failure this FR
-      // exists for, from the dossier fixture: TEAM-4089 closed claiming live
-      // evidence with none, QA re-verify TEAM-4092 caught it 48m later and filed
-      // TEAM-4105 as a fresh loop. Under enforce the re-verification is filed at
-      // Done (sha 0949f9d), the fix is marked unverified, the open ship ticket
-      // TEAM-4066 is blocked, and re-running the trigger is `already` — so
-      // TEAM-4105's loop never starts. Off mode reproduces prod byte-identically.
-      "lambda/orchestrator/replay-yteqfl-reverify.test.mjs",
-      // `## Unverified Fixes` ship context (TEAM-4121 FR-9) — REAL buildAgentContext
-      // from index.mjs: the block renders for a ship-phase agent under enforce with
-      // the ticket id, sha7, re-verify id and a SANITIZED repro (it is another
-      // agent's claim, so backticks/newlines are stripped and it is labelled as one),
-      // and is absent for non-ship agents, for mode off, and when nothing is
-      // unverified — the "off costs nothing in the prompt" half of the flag.
-      "lambda/orchestrator/unverified-fixes-context.test.mjs",
-      // ci-check.mjs (TEAM-4122 FR-5) — the dispatch-time "can a CodeBuild build
-      // for this head SHA exist at all?" probe. Fully DI'd (plain deps + fake
-      // clock + stub store), so every branch runs with no AWS: the strict mode
-      // allow-list (garbage → off, because enforce labels a real epic), the
-      // never-warn-on-unknown direction, the 6h/30min TTL cache that keeps a
-      // 14-ticket run to one probe, and the F10 boundary — a project description
-      // carries webhook.url/secret + every env var, and the assertion is on
-      // JSON.stringify(result) because that record is persisted, logged AND
-      // rendered into every agent's prompt.
-      "lambda/orchestrator/ci-check.test.mjs",
-      // ci-check wiring (TEAM-4122 FR-5) — index.mjs REAL, AWS/store seams
-      // mocked: the ## CI Certification block only appears on a pipeline-mode
-      // run, mode off does ZERO extra I/O (asserted as zero calls on the
-      // codebuild/lambda/setCiCheck seams, i.e. byte-identical to pre-4122),
-      // enforce labels the epic ci:uncertifiable exactly ONCE per workflow while
-      // shadow never writes, and the human merge gate's ping/comment/package
-      // carries the ⚠ CI UNCERTIFIABLE prefix.
-      "lambda/orchestrator/ci-check-context.test.mjs",
-      // sync-main.mjs (TEAM-4122 FR-6) — merge the default branch INTO the run's
-      // integration branch before CI certifies its head. Fully DI'd (plain deps +
-      // a recording GitHub fake keyed by `METHOD path`), which is what makes the
-      // dangerous matrix cheap to pin: the F9 direction lock (base is always the
-      // feature branch, so this can never push to main) and its refusals, the
-      // percent-encoding of every path segment, the merge-head idempotency key,
-      // 201/204/409 and the fail-OPEN behaviour of every other status, and the
-      // 409 path end to end — one sync_fix ticket whose fix_contract is checked
-      // with the tickets Lambda's own validateFixContract.
-      "lambda/orchestrator/sync-main.test.mjs",
-      // pre-CI sync replay (TEAM-4122 FR-6 acceptance) — index.mjs REAL on its
-      // Jira-webhook entry (handleTicketReadyUnified), only fetch/AWS/store
-      // mocked, driven with the wf_1788582225496_yteqfl loop-6 fixture where the
-      // run's CI agent had to file TEAM-4106 ("merge origin/main into
-      // feature/TEAM-4054…") by hand. Under enforce a conflict files EXACTLY ONE
-      // sync_fix ticket, blocks TEAM-4065 on it and never reaches the agent-invoke
-      // seam (no green certification of a SHA that would not land); a webhook
-      // REDELIVERY files no second ticket; landing the fix dispatches CI once.
-      "lambda/orchestrator/replay-yteqfl-sync-main.test.mjs",
-      // ADVISORY_ROUTING wiring (TEAM-4122 FR-7) — index.mjs REAL, AWS/store/cap
-      // seams mocked. completion.test.mjs owns the pure filter; what only shows
-      // up here is the plumbing: the `## Branch` block an advisory ticket's dev
-      // is handed (`feature/<id>-advisory` off the DEFAULT branch, advisory NOTE,
-      // no shared-integration NOTE) versus a non-advisory block asserted
-      // BYTE-IDENTICAL to mode off by string comparison, the refusal to ever adopt
-      // a `-advisory` branch as a run's shared integration branch (the ported-
-      // session path, the one place a branch name comes from outside), and that
-      // the ship review's change set enumerates its own PR's files only — so an
-      // advisory branch's files cannot enter the reviewed diff.
-      "lambda/orchestrator/advisory-routing.test.mjs",
     ],
     // Keep unit tests away from the Playwright specs under tests/.
     exclude: ["tests/**", "node_modules/**", "demo/**"],

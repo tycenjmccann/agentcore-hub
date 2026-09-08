@@ -10,14 +10,9 @@ import {
   markDeadSessionDetected,
   clearDeadSessionDetected,
   incrementDeadSessionRetry,
-  claimDeadSessionSynthesis,
-  claimReverifySlot,
-  releaseReverifySlot,
   advancePhase,
   setResumeContext,
   setRepoCheck,
-  setCiCheck,
-  setSyncMain,
   appendNotification,
   appendReviewNotificationOnce,
   ackNotifications,
@@ -27,10 +22,6 @@ import {
   appendReviewRound,
   appendReviewCapEscalation,
   appendReviewAuthorization,
-  setShipHeadDeferrals,
-  appendReworkRound,
-  appendReworkEscalation,
-  appendReworkAuthorization,
   markGateRequested,
   markGateRejected,
   markGateRejectedFromLegacy,
@@ -297,26 +288,6 @@ describe("incrementDeadSessionRetry", () => {
     );
     expect(bump.input.ExpressionAttributeNames["#tid"]).toBe("TEAM-2");
     expect(bump.input.ReturnValues).toBe("UPDATED_NEW");
-  });
-});
-
-describe("claimDeadSessionSynthesis (TEAM-4120 FR-3)", () => {
-  it("seeds the map, then claims the per-ticket leaf with attribute_not_exists", async () => {
-    const ok = await claimDeadSessionSynthesis("wf_1", "TEAM-2");
-    expect(ok).toBe(true);
-    // Step 1 has NO condition (idempotent seed — DynamoDB rejects SET a.b when a
-    // is missing), step 2 carries the CAS.
-    expect(writes()[0].input.UpdateExpression).toContain("if_not_exists(deadSessionSynthesized, :empty)");
-    expect(writes()[0].input.ConditionExpression).toBeUndefined();
-    const claim = writes()[1];
-    expect(claim.input.UpdateExpression).toBe("SET deadSessionSynthesized.#tid = :one");
-    expect(claim.input.ConditionExpression).toBe("attribute_not_exists(deadSessionSynthesized.#tid)");
-    expect(claim.input.ExpressionAttributeNames["#tid"]).toBe("TEAM-2");
-  });
-
-  it("returns false when the synthesis was already spent (CCFE), never throws", async () => {
-    failNextCondition = true;
-    await expect(claimDeadSessionSynthesis("wf_1", "TEAM-2")).resolves.toBe(false);
   });
 });
 
@@ -682,138 +653,6 @@ describe("setRepoCheck (repo URL pre-flight)", () => {
 });
 
 
-describe("setCiCheck (CI reachability pre-flight, TEAM-4122)", () => {
-  it("is a scoped SET of the single ciCheck attribute — no full-row put", async () => {
-    initWorkflowStore(stubDdb, "wf");
-    sent.length = 0;
-    const cc = {
-      checkedAt: "2026-09-06T00:00:00Z",
-      projectName: "agentcore-hub-ci",
-      webhook: false,
-      startBuild: false,
-      githubHook: "unknown",
-      certifiable: false,
-      verdict: "uncertifiable",
-      reason: "no PR webhook and no StartBuild",
-      mode: "enforce",
-    };
-    await setCiCheck("wf_1", cc);
-    expect(sent.length).toBe(1);
-    expect(sent[0].input.UpdateExpression).toBe("SET ciCheck = :cc");
-    expect(sent[0].input.ExpressionAttributeValues[":cc"]).toEqual(cc);
-    expect(sent[0].input.Key).toEqual({ workflowId: "wf_1" });
-  });
-});
-
-describe("setSyncMain (pre-CI default-branch sync, TEAM-4122)", () => {
-  it("is a scoped SET of the single syncMain attribute — no full-row put", async () => {
-    initWorkflowStore(stubDdb, "wf");
-    sent.length = 0;
-    const sm = {
-      at: "2026-09-06T00:00:00Z",
-      sha: "abc1234",
-      baseHeadSha: "def5678",
-      status: "synced",
-      ciTicketId: "TEAM-9",
-    };
-    await setSyncMain("wf_1", sm);
-    expect(sent.length).toBe(1);
-    expect(sent[0].input.UpdateExpression).toBe("SET syncMain = :sm");
-    expect(sent[0].input.ExpressionAttributeValues[":sm"]).toEqual(sm);
-    expect(sent[0].input.Key).toEqual({ workflowId: "wf_1" });
-  });
-});
-
-
-describe("setShipHeadDeferrals (ship-head stability, TEAM-4111)", () => {
-  it("count > 0 → scoped SET of the two attrs, no full-row put", async () => {
-    initWorkflowStore(stubDdb, "wf");
-    sent.length = 0;
-    await setShipHeadDeferrals("wf_1", 2, "TEAM-SHIP");
-    expect(sent.length).toBe(1);
-    expect(sent[0].input.UpdateExpression).toBe("SET shipHeadDeferrals = :n, shipHeadTicketId = :t");
-    expect(sent[0].input.ExpressionAttributeValues).toEqual({ ":n": 2, ":t": "TEAM-SHIP" });
-    expect(sent[0].input.Key).toEqual({ workflowId: "wf_1" });
-  });
-
-  it("count <= 0 → REMOVEs both attrs (dispatched run carries no ship-head state)", async () => {
-    initWorkflowStore(stubDdb, "wf");
-    sent.length = 0;
-    await setShipHeadDeferrals("wf_1", 0);
-    expect(sent.length).toBe(1);
-    expect(sent[0].input.UpdateExpression).toBe("REMOVE shipHeadDeferrals, shipHeadTicketId");
-    expect(sent[0].input.ExpressionAttributeValues).toBeUndefined();
-  });
-});
-
-
-describe("rework lineage ledger (TEAM-4113)", () => {
-  const round = { ticketId: "TEAM-90", at: "2026-09-05T00:00:00Z" };
-
-  it("seeds reworkLineage + the per-lineage entry with if_not_exists, then list_appends the round", async () => {
-    initWorkflowStore(stubDdb, "wf");
-    sent.length = 0;
-    await appendReworkRound("wf_1", "wf_1:development", round);
-    const w = writes();
-    expect(w[0].input.UpdateExpression).toContain("if_not_exists(reworkLineage, :empty)");
-    expect(w[1].input.UpdateExpression).toBe(
-      "SET reworkLineage.#k = if_not_exists(reworkLineage.#k, :seed)"
-    );
-    expect(w[1].input.ExpressionAttributeValues[":seed"]).toEqual({
-      rounds: [], authorizations: [], escalations: [],
-    });
-    expect(w[1].input.ExpressionAttributeNames["#k"]).toBe("wf_1:development");
-    // A lost round is a cap that trips late — append, never rewrite the array.
-    expect(w[2].input.UpdateExpression).toBe(
-      "SET reworkLineage.#k.rounds = list_append(if_not_exists(reworkLineage.#k.rounds, :empty), :r)"
-    );
-    expect(w[2].input.ExpressionAttributeValues[":r"]).toEqual([round]);
-    expect(w[2].input.ReturnValues).toBe("ALL_NEW");
-  });
-
-  it("returns the POST-write lineage ledger so a concurrent round is counted", async () => {
-    const ledger = { rounds: [round], authorizations: [], escalations: [] };
-    initWorkflowStore(
-      {
-        async send(cmd) {
-          sent.push({ type: cmd.constructor.name, input: cmd.input });
-          return cmd.input.ReturnValues === "ALL_NEW"
-            ? { Attributes: { workflowId: "wf_1", reworkLineage: { "wf_1:development": ledger } } }
-            : {};
-        },
-      },
-      "wf"
-    );
-    expect(await appendReworkRound("wf_1", "wf_1:development", round)).toEqual(ledger);
-  });
-
-  it("returns null when the row is gone rather than inventing an empty ledger", async () => {
-    initWorkflowStore(stubDdb, "wf");
-    expect(await appendReworkRound("wf_1", "wf_1:development", round)).toBeNull();
-  });
-
-  it("append-onlys escalations and authorizations under the same lineage key", async () => {
-    initWorkflowStore(stubDdb, "wf");
-    sent.length = 0;
-    await appendReworkEscalation("wf_1", "wf_1:development", { escalatedAtRound: 4, decision: null });
-    expect(writes()[2].input.UpdateExpression).toBe(
-      "SET reworkLineage.#k.escalations = list_append(if_not_exists(reworkLineage.#k.escalations, :empty), :e)"
-    );
-    sent.length = 0;
-    await appendReworkAuthorization("wf_1", "wf_1:development", { decision: "continue", resetAtRound: 4 });
-    expect(writes()[2].input.UpdateExpression).toBe(
-      "SET reworkLineage.#k.authorizations = list_append(if_not_exists(reworkLineage.#k.authorizations, :empty), :a)"
-    );
-  });
-});
-
-
-/**
- * Review-gate state machine (TEAM-4120 FR-1). Same two-seed-then-CAS shape as the
- * ledgers above, but the CAS is the POINT here, not an optimization: it is what
- * makes "one human decision = one recorded transition" true when the Jira-webhook
- * and DDB-stream twins both fire for the same `→ blocked`.
- */
 describe("gate state machine (TEAM-4120 FR-1)", () => {
   const AT = "2026-09-05T12:00:00.000Z";
   const REQ_AT = "2026-09-05T10:00:00.000Z";
@@ -1052,121 +891,5 @@ describe("gate state machine (TEAM-4120 FR-1)", () => {
         "ProvisionedThroughputExceededException"
       );
     });
-  });
-});
-
-describe("re-verify slot CAS (TEAM-4130 F2)", () => {
-  const SHA = "abc1234";
-  const NOW = "2026-09-06T12:00:00.000Z";
-  const FIX = "TEAM-4130-7";
-  /** A row whose one task entry holds whatever slot state a test needs. */
-  const rowWith = (entry) => ({ workflowId: "wf_1", agentTasks: { [FIX]: entry } });
-
-  it("claims a free slot with a scoped CAS that also clears any stale ticket id", async () => {
-    expect(await claimReverifySlot("wf_1", FIX, SHA, NOW)).toBe("claimed");
-    expect(writes()).toHaveLength(1);
-    const { input } = writes()[0];
-    expect(input.UpdateExpression).toContain("SET agentTasks.#tid.reverifySha = :sha");
-    expect(input.UpdateExpression).toContain("agentTasks.#tid.reverifyClaimedAt = :now");
-    // Without the REMOVE, the PREVIOUS head's ticket id would survive into this
-    // head's claim and read as if this head were already filed.
-    expect(input.UpdateExpression).toContain("REMOVE agentTasks.#tid.reverifyTicketId");
-    expect(input.ConditionExpression).toBe(
-      "attribute_exists(agentTasks.#tid) AND (attribute_not_exists(agentTasks.#tid.reverifySha)" +
-      " OR agentTasks.#tid.reverifySha <> :sha)"
-    );
-    expect(input.ExpressionAttributeNames["#tid"]).toBe(FIX);
-    expect(input.ExpressionAttributeValues).toEqual({ ":sha": SHA, ":now": NOW });
-    // No read on the winning path — the CAS is the whole decision.
-    expect(sent.filter((c) => c.type === "GetCommand")).toHaveLength(0);
-  });
-
-  it("returns taken when the winner has already filed the ticket", async () => {
-    condOutcomes.push("fail");
-    stubItem = rowWith({ reverifySha: SHA, reverifyTicketId: "TEAM-4130-9", reverifyClaimedAt: NOW });
-    expect(await claimReverifySlot("wf_1", FIX, SHA, NOW)).toBe("taken");
-    expect(writes()).toHaveLength(1);   // no takeover attempted
-  });
-
-  it("returns taken while another caller's claim is still fresh", async () => {
-    condOutcomes.push("fail");
-    stubItem = rowWith({ reverifySha: SHA, reverifyClaimedAt: "2026-09-06T11:59:00.000Z" });
-    expect(await claimReverifySlot("wf_1", FIX, SHA, NOW)).toBe("taken");
-    expect(writes()).toHaveLength(1);
-  });
-
-  it("returns taken when the slot raced onto a third sha", async () => {
-    condOutcomes.push("fail");
-    stubItem = rowWith({ reverifySha: "deadbee", reverifyClaimedAt: NOW });
-    expect(await claimReverifySlot("wf_1", FIX, SHA, NOW)).toBe("taken");
-  });
-
-  it("returns untracked (fail-open) when there is no task entry to claim on", async () => {
-    condOutcomes.push("fail");
-    stubItem = { workflowId: "wf_1", agentTasks: {} };
-    expect(await claimReverifySlot("wf_1", FIX, SHA, NOW)).toBe("untracked");
-    expect(sent.filter((c) => c.type === "GetCommand")).toHaveLength(1);
-    expect(sent.find((c) => c.type === "GetCommand").input.ProjectionExpression)
-      .toBe("agentTasks.#tid");
-  });
-
-  it("takes over a claim whose winner died, conditioned on the generation it read", async () => {
-    const stale = "2026-09-06T11:40:00.000Z";   // 20 min old, past the 10 min default
-    condOutcomes.push("fail", "ok");
-    stubItem = rowWith({ reverifySha: SHA, reverifyClaimedAt: stale });
-    expect(await claimReverifySlot("wf_1", FIX, SHA, NOW)).toBe("claimed");
-    const takeover = writes()[1].input;
-    expect(takeover.ConditionExpression).toBe(
-      "agentTasks.#tid.reverifySha = :sha AND attribute_not_exists(agentTasks.#tid.reverifyTicketId)" +
-      " AND agentTasks.#tid.reverifyClaimedAt = :oldClaimedAt"
-    );
-    expect(takeover.ExpressionAttributeValues[":oldClaimedAt"]).toBe(stale);
-    // The takeover must leave the SAME state as a fresh claim, or readers would
-    // have to distinguish two shapes of "claim held".
-    expect(takeover.UpdateExpression).toBe(writes()[0].input.UpdateExpression);
-  });
-
-  it("yields to whoever else took over the same stale claim", async () => {
-    condOutcomes.push("fail", "fail");
-    stubItem = rowWith({ reverifySha: SHA, reverifyClaimedAt: "2026-09-06T11:00:00.000Z" });
-    expect(await claimReverifySlot("wf_1", FIX, SHA, NOW)).toBe("taken");
-    expect(writes()).toHaveLength(2);
-  });
-
-  it("honours an explicit staleAfterMs", async () => {
-    condOutcomes.push("fail", "ok");
-    stubItem = rowWith({ reverifySha: SHA, reverifyClaimedAt: "2026-09-06T11:59:00.000Z" });
-    expect(await claimReverifySlot("wf_1", FIX, SHA, NOW, { staleAfterMs: 30_000 })).toBe("claimed");
-  });
-
-  it("rethrows a non-CCFE claim error instead of guessing", async () => {
-    const boom = new Error("throttled");
-    boom.name = "ProvisionedThroughputExceededException";
-    throwOnce = boom;
-    await expect(claimReverifySlot("wf_1", FIX, SHA, NOW)).rejects.toThrow("throttled");
-  });
-
-  it("releases the slot after a failed create so it is not wedged", async () => {
-    expect(await releaseReverifySlot("wf_1", FIX, SHA)).toBe(true);
-    const { input } = writes()[0];
-    expect(input.UpdateExpression).toBe(
-      "REMOVE agentTasks.#tid.reverifySha, agentTasks.#tid.reverifyClaimedAt"
-    );
-    expect(input.ConditionExpression).toBe(
-      "agentTasks.#tid.reverifySha = :sha AND attribute_not_exists(agentTasks.#tid.reverifyTicketId)"
-    );
-    expect(input.ExpressionAttributeValues).toEqual({ ":sha": SHA });
-  });
-
-  it("refuses to release once a ticket id is linked (CCFE is normal, not an error)", async () => {
-    condOutcomes.push("fail");
-    expect(await releaseReverifySlot("wf_1", FIX, SHA)).toBe(false);
-  });
-
-  it("rethrows a non-CCFE release error", async () => {
-    const boom = new Error("network");
-    boom.name = "TimeoutError";
-    throwOnce = boom;
-    await expect(releaseReverifySlot("wf_1", FIX, SHA)).rejects.toThrow("network");
   });
 });
