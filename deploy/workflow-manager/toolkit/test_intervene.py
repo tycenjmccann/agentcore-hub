@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Unit tests for intervene.py `start` and `file-bug` — hermetic, no AWS/network.
+"""Unit tests for intervene.py `start`, `file-bug` and `mark-done` — hermetic, no
+AWS/network.
 
 TEAM-3911: `start` gained a mutually-exclusive --def/--type pipeline selector and
 `file-bug` gained a free-form mode (no --agent → a plain bug with an
@@ -289,6 +290,73 @@ def test_file_bug_missing_title_or_description_refuses(rec, argv):
         run(argv)
     assert "REFUSED: file-bug requires" in str(exc.value)
     assert rec.posts == []
+
+
+# --------------------------------------------------------------------------
+# mark-done — TEAM-4266: the transition body must carry the evidence
+# --------------------------------------------------------------------------
+#
+# The bug: mark-done recorded the operator's proof as prose only (a ticket
+# comment + a manager.intervention event) and transitioned the ticket. Nothing
+# ever wrote completions/{ticketId}.json, the record BOTH completion evidence
+# gates read, so a run whose agent died before report_completion emitted
+# workflow.completion_blocked reason=missing_evidence forever. The route now
+# writes that record — but only if mark-done actually SENDS the evidence, which
+# is what these pin.
+
+
+@pytest.fixture
+def open_ticket(monkeypatch):
+    """A plain unprotected ticket, so refuse_if_protected passes on a real dict
+    rather than on whatever the boto3 MagicMock happens to return."""
+    monkeypatch.setattr(
+        intervene, "get_ticket",
+        lambda tid: {"ticketId": tid, "status": "in_progress", "assignee": "agentcore_hub_backend_dev"},
+    )
+
+
+def test_mark_done_transition_body_carries_evidence(rec, open_ticket, capsys):
+    run(["mark-done", "wf_1", "TEAM-X", "--evidence", "PR #87"])
+
+    # Two posts, in order: the audit comment, then the transition.
+    assert [p for p, _ in rec.posts] == [
+        "/api/workflow/wf_1/tickets/comment",
+        "/api/workflow/wf_1/tickets/transition",
+    ]
+    # only_post() assumes a single POST — mark-done makes two, so index directly.
+    assert rec.posts[1][1] == {
+        "ticketId": "TEAM-X",
+        "targetStatus": "done",
+        "comment": "Closed by Workflow Manager (agent finished, no report_completion). Evidence: PR #87",
+        "evidence": "PR #87",
+    }
+    # The evidence still lands in the comment + the intervention event too — the
+    # record is additive, not a replacement for the audit trail.
+    assert "PR #87" in rec.posts[0][1]["content"]
+    assert rec.events[0][1] == "mark_done"
+    assert rec.events[0][2]["evidence"] == "PR #87"
+
+
+def test_mark_done_reports_whether_the_record_was_written(rec, open_ticket, monkeypatch, capsys):
+    # The route answers `completionRecordWritten`; the printed summary splats
+    # **result, so the operator sees it without any extra plumbing.
+    monkeypatch.setattr(
+        intervene, "api_post",
+        lambda path, body=None: {"success": True, "completionRecordWritten": True},
+    )
+    run(["mark-done", "wf_1", "TEAM-X", "--evidence", "PR #87"])
+    assert '"completionRecordWritten": true' in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("evidence", ["", "   "])
+def test_mark_done_blank_evidence_refuses_before_any_post(rec, open_ticket, evidence):
+    # Unchanged guard — no evidence means no proof, so nothing is sent and no
+    # completion record can be minted from an empty string.
+    with pytest.raises(SystemExit) as exc:
+        run(["mark-done", "wf_1", "TEAM-X", "--evidence", evidence])
+    assert "REFUSED: mark-done requires --evidence" in str(exc.value)
+    assert rec.posts == []
+    assert rec.events == []
 
 
 if __name__ == "__main__":

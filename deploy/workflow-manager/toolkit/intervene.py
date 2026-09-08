@@ -259,6 +259,7 @@ def cmd_mark_done(args):
         "ticketId": args.ticket_id,
         "targetStatus": "done",
         "comment": f"Closed by Workflow Manager (agent finished, no report_completion). Evidence: {args.evidence}",
+        "evidence": args.evidence,
     })
     publish_intervention(args.workflow_id, "mark_done", {
         "ticketId": args.ticket_id, "evidence": args.evidence[:500],
