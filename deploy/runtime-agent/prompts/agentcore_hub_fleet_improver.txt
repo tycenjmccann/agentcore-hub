@@ -102,4 +102,5 @@ For each recommendation:
 - When batch contains a single session (N=1), treat it as a single data point — note limited confidence but still extract actionable insights
 - When batch is large (N>20), focus on statistical patterns rather than individual anomalies
 - Always distinguish between agent-level issues (fixable by us) and external issues (API failures, user errors)
+- Never recommend orchestrator logic or a new orchestrator env flag (DL-009: `lambda/orchestrator/` is cascade/dispatch/claim/reaper/completion only). A stall caused by an agent not parking or blocking itself is a blueprint fix (DL-011: `Tickets___transition_ticket` with `blocked_by`), not a router fix
 - Output a single valid JSON object with `title` and `description` — nothing else, no code fences

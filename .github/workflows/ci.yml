@@ -68,6 +68,12 @@ jobs:
       - name: Fix-kinds parity guard
         run: ./scripts/check-fix-kinds-parity.sh
 
+      # DL-009: lambda/orchestrator is cascade/dispatch/claim/reaper/completion only.
+      # Fails on a module or env var not in scripts/orchestrator-{modules,env}.allow,
+      # a stale name on deploy.sh's zip line, or a line-budget overrun.
+      - name: Orchestrator surface guard
+        run: ./scripts/check-orchestrator-surface.sh
+
       # Every lambda/* and deploy/* surface must be in the pipeline's deploy
       # manifest (deploy/pipeline/surfaces.json) — or explicitly handoff/excluded —
       # otherwise merged code never reaches prod and drifts behind main.

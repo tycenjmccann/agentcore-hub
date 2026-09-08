@@ -58,6 +58,9 @@ phases:
       # compute_metrics.py); a kind forgotten in one fails SILENTLY. Mirrors
       # .github/workflows/ci.yml's "Fix-kinds parity guard" step (TEAM-4130 F3).
       - "./scripts/check-fix-kinds-parity.sh"
+      # DL-009 thin-orchestrator guard: module + env allow-lists, zip-line names,
+      # line budget. Mirrors ci.yml's "Orchestrator surface guard" step.
+      - "./scripts/check-orchestrator-surface.sh"
       - "./scripts/check-workflow-writes.sh"
       # Every lambda/* and deploy/* surface must be in the Deploy stage's manifest
       # (or explicitly handoff/excluded) — otherwise it silently drifts behind main.
