@@ -20,13 +20,19 @@ interface ModelCost {
   model: string;
   input: number;
   output: number;
+  cacheRead?: number;
+  cacheWrite?: number;
+  calls?: number;
   cost: number;
 }
 
 interface AgentMetrics {
   sessions: number;
-  tokensIn: number;
+  tokensIn: number;   // full prompt tokens, cache reads/writes included
   tokensOut: number;
+  cacheRead?: number;
+  cacheWrite?: number;
+  calls?: number;
   cost: number;
   costPerSession: number;
   models?: ModelCost[];
@@ -37,6 +43,8 @@ interface EvalData {
   scorecard: Record<string, Record<string, ScorecardEntry>>;
   metrics: Record<string, AgentMetrics>;
   evaluators: string[];
+  // Every row (sessions, scores, tokens, cost) covers this same rolling window.
+  window?: { days: number; start: string; end: string; timezone: string };
   lastUpdated: string;
 }
 
@@ -207,10 +215,16 @@ export default function EvaluationsPage() {
     sessions: agents.reduce((s, a) => s + (data?.metrics[a]?.sessions || 0), 0),
     tokensIn: agents.reduce((s, a) => s + (data?.metrics[a]?.tokensIn || 0), 0),
     tokensOut: agents.reduce((s, a) => s + (data?.metrics[a]?.tokensOut || 0), 0),
+    cacheRead: agents.reduce((s, a) => s + (data?.metrics[a]?.cacheRead || 0), 0),
     cost: agents.reduce((s, a) => s + (data?.metrics[a]?.cost || 0), 0),
     costPerSession: 0,
   };
   totals.costPerSession = totals.sessions > 0 ? totals.cost / totals.sessions : 0;
+  const cacheHitPct = (m?: { tokensIn?: number; cacheRead?: number }) =>
+    m?.tokensIn && m.cacheRead ? Math.round((m.cacheRead / m.tokensIn) * 100) : 0;
+  const windowLabel = data?.window
+    ? `rolling ${data.window.days} days (${data.window.start} → ${data.window.end} UTC)`
+    : "rolling 7 days (UTC)";
 
   // Compute per-model totals across all agents
   const modelTotals: Record<string, number> = {};
@@ -283,7 +297,7 @@ export default function EvaluationsPage() {
             Evaluations
           </h1>
           <p className="text-[11px] font-semibold text-info-fg uppercase tracking-[0.15em] mt-1.5">
-            {agents.length} {agents.length === 1 ? "agent" : "agents"} &nbsp;·&nbsp; {(data?.evaluators?.length ?? 0)} evaluators &nbsp;·&nbsp; Opus 4.7 judge &nbsp;·&nbsp; 100% sampling &nbsp;·&nbsp; last 7 days
+            {agents.length} {agents.length === 1 ? "agent" : "agents"} &nbsp;·&nbsp; {(data?.evaluators?.length ?? 0)} evaluators &nbsp;·&nbsp; Opus 4.7 judge &nbsp;·&nbsp; 100% sampling &nbsp;·&nbsp; {windowLabel}
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -423,6 +437,15 @@ export default function EvaluationsPage() {
                   total={formatTokens(totals.tokensOut)}
                   agents={agents}
                   renderCell={(agent) => formatTokens(data.metrics[agent]?.tokensOut)}
+                />
+                <OpsRow
+                  label="Cache Hit"
+                  total={totals.cacheRead ? `${cacheHitPct(totals)}%` : "—"}
+                  agents={agents}
+                  renderCell={(agent) => {
+                    const m = data.metrics[agent];
+                    return m?.cacheRead ? `${cacheHitPct(m)}%` : "—";
+                  }}
                 />
                 {/* Per-model cost sub-rows */}
                 {usedModels.map((model) => (

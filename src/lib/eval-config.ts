@@ -8,6 +8,9 @@ import {
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const TABLE = process.env.EVAL_CONFIG_TABLE || "agentcore-hub-eval-config";
+// Per-agent per-UTC-day metric buckets (PK agentId / SK day), written by the
+// token-aggregator + eval-packager Lambdas; see src/lib/eval-metrics.ts.
+const DAILY_TABLE = process.env.EVAL_DAILY_TABLE || "agentcore-hub-eval-daily";
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: REGION }), {
   marshallOptions: { removeUndefinedValues: true },
@@ -19,6 +22,20 @@ export async function getAllEvalConfigs() {
   do {
     const result = await ddb.send(new ScanCommand({
       TableName: TABLE,
+      ExclusiveStartKey: lastKey,
+    }));
+    items.push(...(result.Items || []));
+    lastKey = result.LastEvaluatedKey;
+  } while (lastKey);
+  return items;
+}
+
+export async function getAllEvalDaily() {
+  const items: Record<string, unknown>[] = [];
+  let lastKey: Record<string, unknown> | undefined;
+  do {
+    const result = await ddb.send(new ScanCommand({
+      TableName: DAILY_TABLE,
       ExclusiveStartKey: lastKey,
     }));
     items.push(...(result.Items || []));
