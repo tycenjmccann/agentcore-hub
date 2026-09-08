@@ -1662,3 +1662,186 @@ describe("verdict gate (TEAM-4246 D1)", () => {
     });
   });
 });
+
+/**
+ * TEAM-4264 F2 belt 2 — the reconcile sweep re-asks the gate.
+ *
+ * The cascade's hold is a blocker EDGE, and an edge can fail to be written: an
+ * unpinnable re-verify, create_ticket down, addBlockers throwing. Before this,
+ * `reconcileDependent` decided on `allBlockersResolved` + lease + parked-long-enough
+ * and nothing else, so a hold that existed only in the completing invocation's
+ * memory was released by the next sweep five minutes later — the same fail-open
+ * F1 closed, arriving by a different door.
+ *
+ * The verdict these read is the LINEAGE-LATEST one (amendment A1): a FAIL whose
+ * round-2 re-verify came back PASS has passed, and holding on the stale FAIL would
+ * wedge the run forever.
+ */
+describe("reconcile consults the gate (TEAM-4264 F2 belt 2)", () => {
+  const GATE = "TEAM-4180";  // the gate root (code reviewer), done
+  const RV = "TEAM-4290";    // its round-2 re-verify, done
+  const SUCC = "TEAM-4181";  // the QA successor parked on GATE
+
+  const succ = (over = {}) => ({
+    ticketId: SUCC, status: "ready", assignee: "qa", blockedBy: [GATE], ...over,
+  });
+  const gateRow = (over = {}) => ({
+    ticketId: GATE, status: "done", assignee: "agentcore_hub_code_reviewer",
+    completedAt: "2026-09-01T10:00:00Z", ...over,
+  });
+  const reverifyRow = (over = {}) => ({
+    ticketId: RV, status: "done", assignee: "agentcore_hub_code_reviewer",
+    spawnedBy: { kind: "review_fix", reverify: true, rearmOf: GATE, round: 2 },
+    completedAt: "2026-09-01T11:00:00Z", ...over,
+  });
+  const gateInfo = (verdict, over = {}) => ({
+    isGatePersona: true, verdict, verdictSource: verdict ? "declared" : "none", ...over,
+  });
+
+  function harness({ mode = "enforce", verdicts = {}, verdictGateImpl, snapshot = [] } = {}) {
+    const ext = makeExtDeps({ getChildTickets: vi.fn(async () => snapshot) });
+    const verdictGate = vi.fn(verdictGateImpl || (async ({ ticketId }) => verdicts[ticketId] ?? null));
+    Object.assign(ext.deps, { verdictGate, verdictGateMode: mode });
+    const { reconcileDependent } = createCascade(ext.deps);
+    return { ...ext, verdictGate, reconcileDependent };
+  }
+
+  const run = (h, sibling, snapshot, mode = "enforce") =>
+    h.reconcileDependent(sibling, "reconcile-sweep", workflow, newMetrics(), mode, { snapshot });
+
+  it("a FAIL gate whose re-verify came back PASS no longer holds", async () => {
+    // Lineage-latest, the rule that keeps this from being a permanent wedge: the
+    // newest statement by the same persona about the same gate is the one that counts.
+    const snapshot = [gateRow(), reverifyRow(), succ()];
+    const h = harness({ verdicts: { [GATE]: gateInfo("FAIL"), [RV]: gateInfo("PASS") }, snapshot });
+
+    expect(await run(h, snapshot[2], snapshot)).toBe("redispatched");
+    expect(h.redispatch).toHaveBeenCalledTimes(1);
+  });
+
+  it("a FAIL gate whose re-verify ALSO failed still holds", async () => {
+    const snapshot = [gateRow(), reverifyRow(), succ()];
+    const h = harness({ verdicts: { [GATE]: gateInfo("FAIL"), [RV]: gateInfo("FAIL") }, snapshot });
+    const m = newMetrics();
+
+    const outcome = await h.reconcileDependent(snapshot[2], "reconcile-sweep", workflow, m, "enforce", { snapshot });
+
+    expect(outcome).toBe("verdict-held");
+    expect(m.verdictHeld).toBe(1);
+    expect(h.redispatch).not.toHaveBeenCalled();
+    expect(h.lease.stealClaim).not.toHaveBeenCalled();
+  });
+
+  it("an UNKNOWN (null) verdict holds — silence is not consent here either", async () => {
+    const snapshot = [gateRow(), succ()];
+    const h = harness({ verdicts: { [GATE]: gateInfo(null) }, snapshot });
+
+    expect(await run(h, snapshot[1], snapshot)).toBe("verdict-held");
+    expect(h.redispatch).not.toHaveBeenCalled();
+  });
+
+  it("a done NON-GATE blocker is untouched — the sweep behaves exactly as before", async () => {
+    const snapshot = [
+      { ticketId: GATE, status: "done", assignee: "agentcore_hub_backend_dev" },
+      succ(),
+    ];
+    const h = harness({ verdicts: { [GATE]: { isGatePersona: false, verdict: "FAIL" } }, snapshot });
+
+    expect(await run(h, snapshot[1], snapshot)).toBe("redispatched");
+    expect(h.redispatch).toHaveBeenCalledTimes(1);
+  });
+
+  it("an OPEN blocker is not consulted at all (its verdict does not exist yet)", async () => {
+    const snapshot = [gateRow({ status: "in_progress" }), succ({ status: "blocked" })];
+    const h = harness({ verdicts: { [GATE]: gateInfo("FAIL") }, snapshot });
+
+    await run(h, snapshot[1], snapshot);
+
+    expect(h.verdictGate).not.toHaveBeenCalled();
+  });
+
+  it("a re-verify blocker in its OWN right is skipped — its root already answered", async () => {
+    // Both the root and its re-verify can appear in blockedBy. Evaluating the
+    // re-verify separately would ask the same lineage twice.
+    const snapshot = [gateRow(), reverifyRow(), succ({ blockedBy: [GATE, RV] })];
+    const h = harness({ verdicts: { [GATE]: gateInfo("FAIL"), [RV]: gateInfo("PASS") }, snapshot });
+
+    expect(await run(h, snapshot[2], snapshot)).toBe("redispatched");
+    expect(h.verdictGate.mock.calls.map((c) => c[0].ticketId)).toEqual([GATE, RV]);
+  });
+
+  it("a predicate that THROWS holds under enforce — fail closed", async () => {
+    // The opposite posture from resolveVerdictHold's, deliberately: there a throw
+    // is a throw for every completion of every persona; here it is one parked
+    // ticket that a gate already gated once, and the next sweep asks again.
+    const snapshot = [gateRow(), succ()];
+    const h = harness({ verdictGateImpl: async () => { throw new Error("S3 500"); }, snapshot });
+
+    expect(await run(h, snapshot[1], snapshot)).toBe("verdict-held");
+    expect(h.redispatch).not.toHaveBeenCalled();
+  });
+
+  it("shadow observes and proceeds — one event, zero writes", async () => {
+    const snapshot = [gateRow(), succ()];
+    const h = harness({ mode: "shadow", verdicts: { [GATE]: gateInfo("FAIL") }, snapshot });
+    const m = newMetrics();
+
+    // Sweep mode enforce, GATE mode shadow: the sweep's mode says whether the sweep
+    // may write, the gate's flag says whether a verdict binds.
+    const outcome = await h.reconcileDependent(snapshot[1], "reconcile-sweep", workflow, m, "enforce", { snapshot });
+
+    expect(outcome).toBe("redispatched");
+    expect(m.verdictHeld).toBe(0);
+    const observed = eventsOfType(h.publishEvent, "orchestrator.verdict_observed");
+    expect(observed).toHaveLength(1);
+    expect(observed[0][2]).toMatchObject({
+      path: "reconcile", verdict: "FAIL", gateTicketId: GATE, blockerId: GATE,
+      wouldSuppress: [SUCC], workflowId: "wf_1",
+    });
+  });
+
+  it("a shadow UNKNOWN reports verdict:null on the wire (the D1 shape)", async () => {
+    const snapshot = [gateRow(), succ()];
+    const h = harness({ mode: "shadow", verdicts: { [GATE]: gateInfo(null) }, snapshot });
+
+    await run(h, snapshot[1], snapshot);
+
+    const [detail] = eventsOfType(h.publishEvent, "orchestrator.verdict_observed").map((c) => c[2]);
+    expect(detail).toMatchObject({ verdict: null, verdictSource: "none", reason: "no-verdict" });
+  });
+
+  it("off never asks", async () => {
+    const snapshot = [gateRow(), succ()];
+    const h = harness({ mode: "off", verdicts: { [GATE]: gateInfo("FAIL") }, snapshot });
+
+    expect(await run(h, snapshot[1], snapshot)).toBe("redispatched");
+    expect(h.verdictGate).not.toHaveBeenCalled();
+  });
+
+  it("with no snapshot passed it reads the children itself", async () => {
+    const snapshot = [gateRow(), succ()];
+    const h = harness({ verdicts: { [GATE]: gateInfo("FAIL") }, snapshot });
+
+    const outcome = await h.reconcileDependent(
+      succ(), "reconcile-sweep", { ...workflow, epicId: "EPIC-1" }, newMetrics(), "enforce"
+    );
+
+    expect(outcome).toBe("verdict-held");
+    expect(h.getChildTickets).toHaveBeenCalledWith("EPIC-1");
+  });
+
+  it("the ESCALATION hold still wins — it needs no completion record to decide", async () => {
+    const snapshot = [gateRow(), succ()];
+    const h = harness({ verdicts: { [GATE]: gateInfo("FAIL") }, snapshot });
+    const escalated = {
+      ...workflow,
+      agentTasks: { [SUCC]: { status: "error" } },
+      deadSessionRetries: { [SUCC]: 1 },
+    };
+
+    const outcome = await h.reconcileDependent(succ(), "reconcile-sweep", escalated, newMetrics(), "enforce", { snapshot });
+
+    expect(outcome).toBe("escalation-held");
+    expect(h.verdictGate).not.toHaveBeenCalled();
+  });
+});

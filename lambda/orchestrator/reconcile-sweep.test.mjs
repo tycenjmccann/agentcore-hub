@@ -85,6 +85,11 @@ function makeCascade(overrides = {}) {
     // TEAM-4120 FR-3: unwired by default, exactly as production is with
     // DEAD_SESSION_ESCALATION_MODE off, so every existing case is unchanged.
     ...(overrides.escalate ? { escalate: overrides.escalate } : {}),
+    // TEAM-4264 F2 belt 2: unwired by default (VERDICT_GATE off), so every case
+    // above sweeps with no verdict check at all, exactly as production does today.
+    ...(overrides.verdictGate
+      ? { verdictGate: overrides.verdictGate, verdictGateMode: overrides.verdictGateMode || "enforce" }
+      : {}),
   });
   return { cascade, publishEvent, lease, redispatch, reawakenGate };
 }
@@ -751,5 +756,68 @@ describe("TEAM-3973 — an escalated ticket is HELD for the human in every statu
 
     expect(m.escalationHeld).toBe(0);
     expect(m.escalated).toBe(1); // second death → escalate, unchanged (TEAM-3969)
+  });
+});
+
+/**
+ * TEAM-4264 F2 belt 2 — the sweep does not undo the cascade's verdict hold.
+ *
+ * The end-to-end case the finding describes: a gate persona returned a non-PASS
+ * verdict, the cascade held its successor in memory but wrote no durable edge (an
+ * unpinnable re-verify, or create_ticket down), and five minutes later THIS sweep
+ * saw a ready candidate whose only blocker reads done, parked well past the TTL,
+ * and re-dispatched it. The verdict is re-asked here so that release cannot happen.
+ */
+describe("TEAM-4264 F2 — a held gate verdict survives the sweep", () => {
+  const GATE = "TEAM-4180";
+  const QA = "TEAM-4181";
+
+  // The board as the sweep finds it: the hold left NO edge, so the candidate's
+  // blockers all read resolved. Only the gate's verdict stands in the way.
+  const heldBoard = [
+    { ticketId: GATE, status: "done", assignee: "agentcore_hub_code_reviewer", type: "task" },
+    { ticketId: QA, status: "ready", assignee: "qa", type: "task", blockedBy: [GATE], updatedAt: STALE_STARTED },
+  ];
+
+  it("dispatches nothing and tallies verdictHeld", async () => {
+    const verdictGate = vi.fn(async () => ({
+      isGatePersona: true, verdict: "BLOCKED", verdictSource: "declared",
+    }));
+    const s = makeSweep({ workflows: [workflow()], siblings: heldBoard, verdictGate });
+    const cap = captureMetrics();
+
+    const m = await s.runSweep("enforce");
+    const records = cap.records();
+    cap.restore();
+
+    expect(m.candidates).toBe(1);
+    expect(m.verdictHeld).toBe(1);
+    expect(records[0].ReconcileVerdictHeld).toBe(1);
+    expect(m.redispatched).toBe(0);
+    expect(s.redispatch).not.toHaveBeenCalled();
+    expect(s.lease.stealClaim).not.toHaveBeenCalled();
+    // The sibling page the sweep already read is what the check runs against —
+    // one children read per workflow, not one per candidate.
+    expect(s.getChildTickets).toHaveBeenCalledTimes(1);
+    expect(verdictGate.mock.calls[0][0].ticketId).toBe(GATE);
+  });
+
+  it("a PASS on the same board re-dispatches as it always did", async () => {
+    const verdictGate = vi.fn(async () => ({ isGatePersona: true, verdict: "PASS" }));
+    const s = makeSweep({ workflows: [workflow()], siblings: heldBoard, verdictGate });
+
+    const m = await s.runSweep("enforce");
+
+    expect(m.verdictHeld).toBe(0);
+    expect(m.redispatched).toBe(1);
+  });
+
+  it("VERDICT_GATE unwired = today's sweep, byte for byte", async () => {
+    const s = makeSweep({ workflows: [workflow()], siblings: heldBoard });
+
+    const m = await s.runSweep("enforce");
+
+    expect(m.verdictHeld).toBe(0);
+    expect(m.redispatched).toBe(1);
   });
 });

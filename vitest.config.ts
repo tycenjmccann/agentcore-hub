@@ -371,6 +371,15 @@ export default defineConfig({
       // rung added to read more summaries can flip a real PASS to FAIL and stall
       // a run — the first attempt at F1's widening flipped 11 of 12.
       "lambda/orchestrator/verdict-ladder-corpus.test.mjs",
+      // gate-reverify-cap (TEAM-4264 F4) — the cap on the ONE loop in the run that
+      // shipped with no ceiling: every non-PASS verdict files a re-verify, the
+      // review cap only counts human rejections, and rework-loop-cap.mjs excludes
+      // the reverify/rearmOf lineage by design. Separate from cascade.test.mjs
+      // because the boards are lineage CHAINS (rearmOf points at the previous
+      // round, not the root) and the property under test is that reaching the cap
+      // HOLDS and pages rather than releasing — a cap that failed open at the
+      // ceiling would re-open the hole F1 just closed.
+      "lambda/orchestrator/gate-reverify-cap.test.mjs",
       // fix-before-verify (TEAM-4246 D1, FR-D1.7) — the creation-time half of the
       // verdict hole: dowtdh filed fix TEAM-4183 with `blockedBy: []` and invoked QA
       // TEAM-4181 78 seconds later, against code the fix had not landed on. Pins the

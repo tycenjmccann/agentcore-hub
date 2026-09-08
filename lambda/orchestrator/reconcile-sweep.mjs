@@ -135,6 +135,9 @@ export function createReconcileSweep(deps) {
       redispatched: 0,
       reviewReawakened: 0,
       wouldRedispatch: 0,
+      // TEAM-4264 F2 belt 2 — candidates the gate verdict held instead of
+      // re-dispatching. Its own counter, not noop: a hold is a decision.
+      verdictHeld: 0,
       noop: 0,
       candidateErrors: 0,
       truncated: false,
@@ -182,14 +185,17 @@ export function createReconcileSweep(deps) {
           if (mode === "shadow") {
             // Observe only — run the same routing to learn the outcome shape,
             // but reconcileDependent honors shadow mode and performs no writes.
-            const outcome = await cascade.reconcileDependent(sibling, "reconcile-sweep", workflow, newCascadeMetrics(), "shadow");
+            const outcome = await cascade.reconcileDependent(sibling, "reconcile-sweep", workflow, newCascadeMetrics(), "shadow", { snapshot: siblings });
             tally(m, outcome);
             log(`reconcile.would_recover (shadow) — ${sibling.ticketId} status=${sibling.status} → ${outcome} (sweep ${sweepId})`);
             continue;
           }
 
           // enforce — re-drive through the ONE implementation of the invariant.
-          const outcome = await cascade.reconcileDependent(sibling, "reconcile-sweep", workflow, newCascadeMetrics(), "enforce");
+          // The snapshot we already hold is handed down (TEAM-4264 F2 belt 2): the
+          // verdict check needs the same sibling page allBlockersResolved just read,
+          // and re-fetching it per candidate would multiply this sweep's reads.
+          const outcome = await cascade.reconcileDependent(sibling, "reconcile-sweep", workflow, newCascadeMetrics(), "enforce", { snapshot: siblings });
           tally(m, outcome);
           log(`reconcile.recover — ${sibling.ticketId} status=${sibling.status} → ${outcome} (sweep ${sweepId})`);
         } catch (err) {
@@ -201,7 +207,7 @@ export function createReconcileSweep(deps) {
 
     m.durationMs = now() - startedAtMs;
     emitReconcileMetrics(m);
-    log(`reconcile sweep done — mode=${mode} candidates=${m.candidates} skippedLiveLease=${m.skippedLiveLease} redispatched=${m.redispatched} escalated=${m.escalated || 0} escalationHeld=${m.escalationHeld || 0} reviewReawakened=${m.reviewReawakened} wouldRedispatch=${m.wouldRedispatch} noop=${m.noop} candidateErrors=${m.candidateErrors} truncated=${m.truncated} durationMs=${m.durationMs} (sweep ${sweepId})`);
+    log(`reconcile sweep done — mode=${mode} candidates=${m.candidates} skippedLiveLease=${m.skippedLiveLease} redispatched=${m.redispatched} escalated=${m.escalated || 0} escalationHeld=${m.escalationHeld || 0} verdictHeld=${m.verdictHeld || 0} reviewReawakened=${m.reviewReawakened} wouldRedispatch=${m.wouldRedispatch} noop=${m.noop} candidateErrors=${m.candidateErrors} truncated=${m.truncated} durationMs=${m.durationMs} (sweep ${sweepId})`);
     return m;
   }
 
@@ -226,6 +232,9 @@ function tally(m, outcome) {
       break;
     case "escalation-held":
       m.escalationHeld++;
+      break;
+    case "verdict-held":
+      m.verdictHeld++;
       break;
     case "redispatched":
       m.redispatched++;
@@ -266,6 +275,7 @@ export function emitReconcileMetrics(m) {
           { Name: "ReconcileRedispatch", Unit: "Count" },
           { Name: "ReconcileEscalations", Unit: "Count" },
           { Name: "ReconcileEscalationHeld", Unit: "Count" },
+          { Name: "ReconcileVerdictHeld", Unit: "Count" },
           { Name: "ReconcileReviewReawaken", Unit: "Count" },
           { Name: "ReconcileWouldRedispatch", Unit: "Count" },
           { Name: "ReconcileNoop", Unit: "Count" },
@@ -281,6 +291,7 @@ export function emitReconcileMetrics(m) {
     ReconcileRedispatch: m.redispatched,
     ReconcileEscalations: m.escalated || 0,
     ReconcileEscalationHeld: m.escalationHeld || 0,
+    ReconcileVerdictHeld: m.verdictHeld || 0,
     ReconcileReviewReawaken: m.reviewReawakened,
     ReconcileWouldRedispatch: m.wouldRedispatch,
     ReconcileNoop: m.noop,

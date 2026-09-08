@@ -929,6 +929,12 @@ function getCascade() {
           // reported no tested_head. Memoized, null-on-anything, so the cascade
           // pays at most one GitHub read per invocation and never throws.
           headResolver: (workflow) => featureBranchHeadSha(workflow),
+          // TEAM-4264 F4 — the cap on gate re-verify rounds is the review gate's
+          // own maxRounds, so an operator tunes ONE number per gate for both loops
+          // it can drive. No gate def for the persona's phase ⇒ the shared default.
+          reviewGateFor: gateDefForPersona,
+          // Same human page rework-loop-cap.mjs uses when ITS cap trips.
+          parkRunEscalationGate,
           addBlockers,
         }
       : { verdictGate: null }),
@@ -997,6 +1003,23 @@ function getReworkLoopCap() {
     log: (msg) => console.log(`[orchestrator] ${msg}`),
   });
   return _reworkLoopCap;
+}
+
+/**
+ * The ReviewGate def that governs a GATE PERSONA's own phase (TEAM-4264 F4), or
+ * null. Only `maxRounds` is read from it — the cap on how many times that persona
+ * may re-verify one gate before a human is paged — so a def that declares no gate
+ * for the phase degrades to REVIEW_GATE_CAP_DEFAULTS rather than to no cap.
+ */
+function gateDefForPersona(workflow, persona) {
+  try {
+    const phase = getAgentDef(persona)?.phase;
+    if (!phase) return null;
+    const wfDef = getEffectiveWorkflowDef(workflow);
+    return (wfDef?.reviewGates || []).find((g) => g?.afterPhase === phase) || null;
+  } catch {
+    return null;
+  }
 }
 
 /**
