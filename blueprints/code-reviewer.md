@@ -144,9 +144,10 @@ verdict, the review round, every finding (severity, file, scenario, status),
 the plan-compliance result (files in/out of plan, deviations recorded/unrecorded),
 and the spec-coverage result (criteria with/without tests). Commit it
 (`review: findings round <n> (<workflow_id>)`) and push. Mirror the text to
-`workflows/{workflow_id}/shared/findings.md`. The orchestrator blocks your ticket
-at close if `<artifact_dir>/findings.md` is not on the branch. Re-reviews
-APPEND a new round to the same file.
+`workflows/{workflow_id}/shared/findings.md`. Verify the push landed before you
+report — nothing checks it for you, and a run whose findings.md is missing has
+no audit trail for the merge gate. Re-reviews APPEND a new round to the same
+file.
 
 ### Step 4: (Optional) Harvest External PR Reviews
 Only if the repo has external review bots (Codex, Devin) configured. Your

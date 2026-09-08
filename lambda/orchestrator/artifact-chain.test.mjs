@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
-  normalizeChainGateMode, chainFor, chainDir, requiredArtifactsForTicket, sdlcFrameworkContext,
-  gateInstructionOverride, fallbackReviewPackagePhase, artifactRepoPath, missingArtifactNote, isPlanTicket,
+  chainFor, chainDir, requiredArtifactsForTicket, sdlcFrameworkContext,
+  gateInstructionOverride, fallbackReviewPackagePhase, isPlanTicket,
   applyFramework, resolveFramework, frameworkOfWorkflow, designArtifactName,
 } from "./artifact-chain.mjs";
 import workflows from "../../src/config/workflows.json";
@@ -128,17 +128,5 @@ describe("context + gate helpers", () => {
     expect(fallbackReviewPackagePhase({ title: "Intent Acceptance: x", blockedBy: [] })).toBe("intake");
     expect(fallbackReviewPackagePhase({ title: "Merge Approval", blockedBy: [] })).toBe("intake");
     expect(fallbackReviewPackagePhase({ title: "Spec Approval", blockedBy: ["T-2"] })).toBeUndefined();
-  });
-  it("repo path + missing note", () => {
-    expect(artifactRepoPath(playbook, "wf_9", "spec.md")).toBe(".sdlc/wf_9/spec.md");
-    expect(artifactRepoPath(standard, "wf_9", "spec.md")).toBeNull();
-    const note = missingArtifactNote({ missing: ["plan.md"], dir: ".sdlc/wf_9", branch: "feature/x" });
-    expect(note).toContain(".sdlc/wf_9/plan.md");
-    expect(note).toContain("feature/x");
-  });
-  it("gate mode normalizes to enforce unless explicitly off", () => {
-    expect(normalizeChainGateMode(undefined)).toBe("enforce");
-    expect(normalizeChainGateMode("OFF")).toBe("off");
-    expect(normalizeChainGateMode("shadow")).toBe("enforce");
   });
 });
