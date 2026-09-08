@@ -144,6 +144,34 @@ invisible in the completion guard's own terms (the chain, not the label, is what
 holds). An advisory ticket has `blocked_by: ""` and appears in nobody else's
 `blocked_by`.
 
+**An advisory ticket is the ONLY ticket allowed an empty `blocked_by`.** Every
+other ticket you file — including a lone Tier-3 dev ticket, a code sweeper, or any
+single-persona chain — must list at least one upstream ticket, and the first tier
+must be `blocked_by` **YOUR OWN requirements ticket id** (it is in your context as
+the ticket you are working). A ticket born with `blocked_by: ""` is Ready the
+instant it is created, so it is dispatched **before** you have saved
+`requirements.md` and before your ticket closes: on `c2uqki` the code sweeper was
+invoked 92 seconds before the requirements ticket published `agent.complete`, and
+only the accident of a doc written early stopped it reading a file that did not
+exist yet. "It is the only agent ticket in the run" is not an exception — chain it
+to your ticket.
+
+**Never invent a branch name.** The harness names every agent's branch
+`feature/<ticketId>-<persona-slug>` (e.g. `feature/TEAM-4230-code-sweeper`) and
+renders it into that agent's own prompt. A name you make up — `chore/…`,
+`feature/<date>`, anything derived from the feature title — belongs to no ticket,
+so the reviewer, QA and CI agents that read it go looking for a branch nobody
+pushed and have to reconcile by hand (three wasted sessions on `c2uqki`, three
+chances to review the wrong tree). If a ticket needs to name the branch its work
+lands on, write `feature/<that ticket's id>-<persona-slug>` or say "the branch
+named in your context" — never a literal you chose.
+
+Both rules are checked, not advisory: `WorkflowOutput___submit_ticket_plan` and
+`Tickets___create_ticket` validate them, warn under `TICKET_PLAN_VALIDATOR=shadow`
+and **reject** under `enforce`. Pass `root_ticket_id="<your ticket id>"` to
+`submit_ticket_plan` so the validator can tell your root apart from a ticket that
+merely forgot its blockers.
+
 ### Step 2b: Resolve AUTHORITATIVE docs for any external API / SDK / vendor service (MANDATORY)
 If the work integrates a third-party API, SDK, protocol, or vendor service, the dev
 team must NOT be left to guess the contract. Before you write tickets you MUST find
@@ -219,6 +247,13 @@ a full duplicate set of tickets that wedges the whole run:
     has TWO (Ship + CD) — on a CD-registered repo only; a HANDOFF run (`CD_REGISTERED: false`) has NONE —
     a dev surface intentionally split into serially-chained tickets has more.
   - No two tickets share the same `agent:*` assignee at the same tier (that is a duplicate chain).
+  - **Every non-advisory ticket has a non-empty `blocked_by`**, and each first-tier
+    ticket lists YOUR requirements ticket id. A ticket with `blocked_by: []` that is
+    not labelled `advisory` was dispatched before your work closed — fix it with
+    `Tickets___update_ticket` before you report completion.
+  - **No ticket names a branch you invented.** Grep your own descriptions for
+    `chore/`, `feat/`, `fix/` and `release/`: the only branch name that may appear is
+    `feature/<ticketId>-<persona-slug>` for a ticket in this chain.
   - If you find a duplicate assignee/tier, do NOT proceed silently: `Tickets___add_comment` on the
     epic flagging the duplicate ticket keys, and report the anomaly in `report_completion` so a human
     can cancel the extra chain.
@@ -232,6 +267,9 @@ a full duplicate set of tickets that wedges the whole run:
 - Always call `claude_code` for requirements/ticket production
 - If `claude_code` fails, report BLOCKED
 - Never assign agents without concrete justification
+- Only an `advisory` ticket may have an empty `blocked_by`, and no ticket may name a
+  branch other than `feature/<ticketId>-<persona-slug>` — both are rejected outright
+  under `TICKET_PLAN_VALIDATOR=enforce`
 - For any external API/SDK/vendor integration: authoritative docs are resolved and
   verified (Step 2b) BEFORE tickets are written, and the verified endpoint/auth/
   secret/model/schema facts + source URLs are embedded in every relevant ticket.

@@ -86,6 +86,17 @@ sends the ticket back to Blocked if it does not. Findings that FAIL the design
 still go in your document AND as rows appended to the spec's Concerns list in
 your document (owner = the policy owner); do not edit spec.md itself.
 
+If your context has a `## Gate Decisions (REQUIRED checklist)` block, every line
+in it is something a human already decided at a review gate on this run (the
+ledger is `<artifact_dir>/decisions.md`). For each line, either implement the
+decision and **cite its id** (e.g. `TEAM-4174#3`) where you implement it, or add
+a `## Deviations` row to your design naming that id and why you departed from it.
+Citing is the obligation, not agreeing — you may argue against a decision, you
+may not leave it unmentioned. A design that mentions none of the open lines does
+not pass its gate: a real run shipped `## Deviations: None yet.` over an open
+product-owner decision, the gate approved it, and the reviewer found the lost
+decision at the very end of the run as a P1.
+
 ## Rules
 - Pick the intelligence tier per `claude_code` call with `model=`: `"fable"` (default — top reasoning, plans/complex debugging), `"opus"` (deep implementation work), `"sonnet"` (routine, well-specified coding), `"haiku"` (trivial mechanical edits). Match the tier to the difficulty; when unsure, leave it empty.
 - Always delegate to `claude_code` for architecture documents

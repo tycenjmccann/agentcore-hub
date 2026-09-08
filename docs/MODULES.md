@@ -182,6 +182,73 @@ garbage → `off` rule.
   scheduled starts a week, off the hot human path; a very large workflows table
   would want an index.
 
+**Ticket-plan + decision flags (TEAM-4248 D3)** — two more `off | shadow | enforce`
+flags, same convention, different defaults, and the first one in this family that
+is read by **four** Lambdas.
+- `TICKET_PLAN_VALIDATOR` (unset → `shadow`, unrecognized → `off`) — read by
+  `lambda/orchestrator/`, `lambda/workflow-output/`,
+  `lambda/agentcore-hub-jira/` **and** `lambda/agentcore-hub-tickets/`, because
+  `Tickets___create_ticket` is served by whichever provider Lambda the fleet points
+  at (`deploy/runtime-agent/deploy-one.sh` ships `TICKET_TOOLS_LAMBDA=agentcore-hub-jira`
+  by default, so a tickets-only copy would be a production no-op). The rule module
+  `ticket-plan-validator.mjs` is zero-import and **byte-copied to all four**,
+  guarded by a `cmp` block in `scripts/check-fix-kinds-parity.sh` — edit the
+  orchestrator copy and `cp` it to the other three in the same commit. Two checks:
+  a non-advisory, non-fix ticket with an empty `blocked_by` while the requirements
+  root is still open (the root is found by **role** — `agentcore_hub_requirements_analyst`
+  or `phase: "requirements"` — never by position, since a submitted plan does not
+  contain its own root), and a branch token that is neither known nor
+  `feature/<ticketId>-<persona-slug>`. `shadow` warns (a `warnings[]` on
+  `submit_ticket_plan`, a `warning` field on the created ticket) and still writes;
+  `enforce` rejects before anything is minted. No root resolvable → **fail open**,
+  silently. The branch rewrite is **context-only in both modes** — the orchestrator
+  never rewrites a stored description, only the prompt it renders. Non-`off` also
+  renders `## Branch` for **every** persona (with a "you do not push to this
+  branch" note off the development phase), because the reviewer, QA and CI are
+  exactly the personas that previously had to guess.
+- `DECISION_LEDGER` (unset **and** unrecognized → `shadow`) — orchestrator only,
+  and the one flag in the family whose unknown mode still **writes**: losing a
+  human decision is the defect, and an empty ledger would give an `enforce` flip
+  nothing to check (the same argument `gateRejectionAdmitted` makes in code).
+  `shadow` and `enforce` both extract resolutions from gate comments
+  (`extractGateDecisions` in `lambda/orchestrator/artifact-chain.mjs`), append them
+  idempotently **by id** to `.sdlc/<workflowId>/decisions.md` on the run's feature
+  branch via a new `githubPutFile` (`PUT /contents`, the read `sha` as the CAS
+  token, one retry on 409/422, then warn and fail open), mirror the same bytes to
+  `workflows/<id>/shared/decisions.md`, publish `decision.recorded`, lead the
+  review package with a `Decisions not honoured` section, and emit
+  `## Gate Decisions (REQUIRED checklist)` to design-phase personas and the Plan
+  ticket. A decision counts as honoured when the artifact cites its id, or cites
+  the gate key **and** the concern number — so a `## Deviations` row naming the id
+  passes; the rule is "cite it or deviate from it explicitly", never "obey it".
+  `enforce` adds one thing: when an artifact cites none of the open decisions the
+  gate is **withheld** rather than presented — `handleReviewRejection` reopens the
+  authoring ticket, no human is paged, and `gateStates` is left **untouched**
+  (`markGateRequested` / `markGateRejected` / `appendReviewNotificationOnce` are
+  all skipped, so the human's later genuine Request-changes on the re-presented
+  gate cannot be dropped as a duplicate under `GATE_STATE_GUARD=enforce`).
+  `off` is byte-identical to pre-D3: nothing read, written or published.
+  Needs `contents: write` on `GITHUB_PAT`; a read-only token degrades to the S3
+  mirror plus a warning, never to a failed run.
+- **Deploy order, same reason as `SWEEP_DETECTION_PHASE`:** the `decisions.md`
+  chain member lives in `src/config/workflows.json`, which the Lambdas read from S3
+  on cold start. Ship the code → `aws s3 cp src/config/workflows.json
+  "s3://$ARTIFACT_BUCKET/config/workflows.json"` (`ARTIFACT_BUCKET` from
+  `deploy/config.sh` — never hardcoded) → only then set the flags. Syncing the
+  config first is harmless: `decisions.md` is owed by nobody (see the chain note
+  below), so it can never block a ticket.
+
+**`decisions.md` joins the playbook artifact chain (TEAM-4248 D3)** — the playbook
+overlay's `artifactChain.artifacts` gains `{ name: "decisions.md", owner:
+"orchestrator" }` after `intent.md`, making the chain
+`intent.md → decisions.md → spec.md → design/<agent>.md → plan.md → findings.md`.
+It has **no `gate`** and is deliberately absent from `requiredArtifactsForTicket`
+(`src/lib/workflow/workflow-defs.ts`), so `enforceArtifactChain` can never send a
+ticket back to Blocked over a file only the orchestrator writes. `"orchestrator"`
+is a new `owner` value — the field is a plain `string`, so no type change was
+needed. The visible effect is one line: every persona's `chain:` context now names
+it, which is what makes the checklist citable.
+
 **The `nothing-to-remove` terminal outcome (TEAM-4247 D2)** — a sixth terminal
 `WorkflowPhase`, deliberately **not** folded into `SHIP_BLOCKED_OUTCOMES`: a no-op
 sweep is a healthy run, not a blocked one, so it must not enter the ship-verdict
@@ -217,6 +284,13 @@ gates, the blocked-run EventBridge rule or the blocked-run alerting.
   `verified_removable=<n>` + `candidates=<n>` and stops. The pre-D2 Step 2.5 had
   the model hand-`skip` every downstream ticket in reverse dependency order — a
   mass ticket mutation as the run's only termination mechanism.
+
+**New events (TEAM-4248 D3)**
+- `ticket_plan.branch_rewritten_observed { workflowId, ticketId, assignee, phase, canonical, rewrites: [{ from, to }] }` — `TICKET_PLAN_VALIDATOR=shadow` found an invented branch name in a ticket description; the prompt is left byte-identical
+- `ticket_plan.branch_rewritten { …identical detail… }` — `enforce`, the same finding, and the only mode in which the rewritten text reaches the model. Neither event ever means a stored ticket changed
+- `decision.recorded { workflowId, gateTicketId, mode, added, ids, committed }` — `DECISION_LEDGER` non-`off`, published only when `added > 0` (a redelivered webhook appends nothing and publishes nothing). `committed: false` = the GitHub PUT failed and only the S3 mirror exists
+- `decision.unhonoured_observed { workflowId, gateTicketId, phase, mode, ids }` — the artifact under review cites none of those open decisions; published in **both** non-`off` modes, subject = the gate ticket
+- `decision.gate_withheld { workflowId, gateTicketId, phase, ids }` — `enforce` only: the gate was **not** presented, the authoring ticket was reopened for rework, no human was paged, and `gateStates` was left untouched. This event is the sole record of a presentation that never happened
 
 **New events (TEAM-4247 D2)**
 - `workflow.nothing_to_remove { workflowId, outcome, verifiedRemovable, candidates, prUrl, featureBranch, ticketId }` — `SWEEP_DETECTION_PHASE=enforce` closed a zero-yield sweep. Published **instead of** `workflow.complete`, never alongside it, and deliberately **not** added to the analyzer's EventBridge rule (auto-analysis of no-op sweeps is out of D2)

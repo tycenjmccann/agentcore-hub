@@ -276,7 +276,10 @@ const zipBuffer = readFileSync(zipPath);
 
 // FIX_TICKET_CONTRACT is forwarded ONLY when set in the deploying shell, so an
 // existing install that has never heard of it keeps the code default (off) and
-// its config is unchanged by a redeploy.
+// its config is unchanged by a redeploy. TICKET_PLAN_VALIDATOR (TEAM-4248 D3 —
+// create_ticket refuses to mint an unblocked non-root agent ticket while the
+// requirements root is still open) is forwarded the same way; unset leaves the
+// code default (shadow: the ticket is created with a `warning` field).
 const lambdaEnvVars =
   TICKET_PROVIDER === "jira"
     ? {
@@ -287,6 +290,7 @@ const lambdaEnvVars =
         AWS_REGION_OVERRIDE: REGION,
         ...(ARTIFACT_BUCKET && { ARTIFACT_BUCKET }),
         ...(process.env.FIX_TICKET_CONTRACT && { FIX_TICKET_CONTRACT: process.env.FIX_TICKET_CONTRACT }),
+        ...(process.env.TICKET_PLAN_VALIDATOR && { TICKET_PLAN_VALIDATOR: process.env.TICKET_PLAN_VALIDATOR }),
       }
     : {
         TICKETS_TABLE: TABLE_NAME,
@@ -294,6 +298,7 @@ const lambdaEnvVars =
         AWS_REGION_OVERRIDE: REGION,
         ...(ARTIFACT_BUCKET && { ARTIFACT_BUCKET }),
         ...(process.env.FIX_TICKET_CONTRACT && { FIX_TICKET_CONTRACT: process.env.FIX_TICKET_CONTRACT }),
+        ...(process.env.TICKET_PLAN_VALIDATOR && { TICKET_PLAN_VALIDATOR: process.env.TICKET_PLAN_VALIDATOR }),
       };
 
 const lambdaDescription =
