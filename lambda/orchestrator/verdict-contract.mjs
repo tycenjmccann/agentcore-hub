@@ -131,15 +131,29 @@ const VERDICT_LADDER = [
  *           Two is what the corpus needs and no more: the cap is the difference
  *           between reading a headline and reading a sentence.
  *   VERDICT one of the four enum values, optionally bolded
- *   END     a TERMINATOR — ":", an em/en dash, "-", "(", "," or end of line.
+ *   END     a TERMINATOR — ":", an em/en dash, "-", "(", "," or end of line,
+ *           and NOT followed by a bare count (HEADLINE_NOT_COUNT).
  *
- * The terminator is the half that does the real work. It is why none of
- * "0 FAIL", "FAILURES: 0", "8 FAIL in live Chromium" or "191 PASS / 8 FAIL"
- * can match — either a digit precedes the token (so the line does not START
- * with it) or what follows is prose rather than a break. No count parsing and
- * no zero-guard is needed anywhere in this module, which is the point: a rule
- * that reads "0 FAIL" correctly by NOT matching it cannot be fooled by "00
- * FAIL" or "zero FAIL".
+ * The terminator does most of the work. It is why none of "0 FAIL",
+ * "FAILURES: 0", "8 FAIL in live Chromium" or "191 PASS / 8 FAIL" can match —
+ * either a digit precedes the token (so the line does not START with it) or
+ * what follows is prose rather than a break.
+ *
+ * What the anchor alone did NOT cover is the metric line "FAIL: 0" (TEAM-4285):
+ * there the token IS what the line starts with and ":" IS a real terminator, so
+ * the rung read it as a FAIL headline — and via most-severe-wins below, a QA
+ * summary that printed its zero-fail count under an explicit "QA PASS — …"
+ * resolved to FAIL. The giveaway is not the anchor but the PAYLOAD: a verdict
+ * token followed by nothing except a number is a COUNT, and a count is not an
+ * answer. So HEADLINE_NOT_COUNT rejects a payload that is an integer, decimal or
+ * percentage terminated by end-of-line or a count separator ("/", "|", ",", ";")
+ * — "FAIL: 0", "PASS: 0", "PASS: 100%", "FAIL: 3 / PASS: 191".
+ *
+ * That is a payload-SHAPE rule, deliberately not a zero-guard: "FAIL: 3" is
+ * excluded for the same reason "FAIL: 0" is, so there is no threshold to get
+ * wrong and "00" reads like "0". And a number followed by a WORD is still prose,
+ * which is why "QA FAIL: 191 PASS / 8 FAIL in live Chromium." keeps reading FAIL
+ * — the count rule only fires when the number is ALL the line has to say.
  *
  * Every line is scanned and the MOST SEVERE hit wins (BLOCKED > FAIL >
  * CHANGES_NEEDED > PASS), because a persona that writes "PASS on the unit
@@ -148,8 +162,10 @@ const VERDICT_LADDER = [
  */
 const HEADLINE_DECOR = "[\\s>*#_`\\u2705\\u274C\\u26A0\\uFE0F\\u{1F7E2}\\u{1F534}\\u{1F7E1}]*";
 const HEADLINE_LABEL = "(?:[A-Za-z]{1,12}\\s*[:\\u2014\\u2013-]?\\s+){0,2}";
+/** TEAM-4285 — a payload that is only a number is a count, so the line is a metric. */
+const HEADLINE_NOT_COUNT = "(?!\\s*\\d+(?:[.,]\\d+)*\\s*%?\\s*(?:$|[/|,;]))";
 const HEADLINE_RE = new RegExp(
-  `^${HEADLINE_DECOR}${HEADLINE_LABEL}${HEADLINE_DECOR}\\*{0,2}${VERDICT_ALT}\\*{0,2}\\s*(?:[:\\u2014\\u2013-]|\\(|,|$)`,
+  `^${HEADLINE_DECOR}${HEADLINE_LABEL}${HEADLINE_DECOR}\\*{0,2}${VERDICT_ALT}\\*{0,2}\\s*(?:[:\\u2014\\u2013-]|\\(|,|$)${HEADLINE_NOT_COUNT}`,
   "iu"
 );
 

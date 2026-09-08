@@ -109,7 +109,11 @@ The single prose→verdict ladder they all read lives in the zero-import
   terminated by `:`, an em/en dash, `-`, `(`, `,` or end-of-line; the most severe
   hit across all lines wins (`BLOCKED` > `FAIL` > `CHANGES_NEEDED` > `PASS`). The
   line-anchoring is what lets `0 FAIL`, `FAILURES: 0` and `191 PASS / 8 FAIL`
-  resolve to nothing rather than flipping a real pass to a fail. **A held
+  resolve to nothing rather than flipping a real pass to a fail. Count lines are
+  excluded from the headline rung as well (TEAM-4285): a verdict token whose
+  payload is only a number — `FAIL: 0`, `PASS: 0`, `FAIL: 3 / PASS: 191` — is a
+  metric rather than a headline, so a zero-fail count can no longer out-severe a
+  real `PASS` stated on the line above it. **A held
   non-`PASS` verdict is durable, not just in-memory (TEAM-4264 F2):** the
   re-verify `live-reverify.mjs` files is always pinnable to a head — `testedHead`
   when the gate declared one, else the orchestrator's own
