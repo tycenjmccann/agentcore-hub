@@ -203,8 +203,18 @@ discipline above.
       comma-separated — e.g. `"src/session.py:88,src/session.py:140-152"`.
     - `sibling_scope`: the other components/tickets this fix must NOT touch (or
       `"none"`), so parallel fix tickets stay additive.
-  Then `WorkflowOutput___report_completion` summarizing the findings + the fix
-  ticket keys you filed.
+  Then PARK YOURSELF (DL-024):
+  `Tickets___transition_ticket(ticket_id=<your review ticket>, transition_id="blocked", blocked_by="<fix-1>,<fix-2>,…", reason="Review round <N>: waiting on <M> fix ticket(s)")`
+  and exit WITHOUT `report_completion`. Your ticket sits Blocked on the fixes;
+  the orchestrator releases your claim, and when the last fix is Done the
+  cascade moves you back to Ready and you are re-invoked for the re-review (see
+  "Re-review" above). Never Done your ticket on CHANGES NEEDED — Done dispatches
+  QA onto a branch with known open findings. Round count = the `codex_fix`
+  tickets under the epic whose `spawned_by_origin_id` is your ticket
+  (`Tickets___list_tickets(epic_id)`). On your THIRD CHANGES NEEDED round, file
+  no more fixes: `report_completion` with a summary starting `ESCALATE:` that
+  lists the findings still open — QA, the release manager and the human merge
+  gate take it from there.
 
 ## Rules
 - ZERO findings = the only PASS. Any finding, any severity → CHANGES NEEDED + fix ticket
@@ -215,6 +225,9 @@ discipline above.
 - Review the DIFF plus surrounding code — never review from the ticket description alone
 - Every finding cites `file:line` and the exact code — no vague "looks risky"
 - Do NOT edit the code yourself — file fix tickets, the dev fixes
+- Waiting on fixes = park YOUR OWN ticket `blocked` with `blocked_by` = the fix
+  tickets and exit without `report_completion` (DL-024); never `in_progress`
+  with no session, never Done with open findings
 - Do NOT rubber-stamp — on a clean non-trivial diff, state what you checked and
   why each failure mode does not apply
 - Use `codex` by default; fall back to `claude_code` only when `codex` is unavailable
