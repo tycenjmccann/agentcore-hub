@@ -135,7 +135,7 @@ jobs:
           deploy/pipeline/test_plan_surfaces.py
 
   cloud-code-ui:
-    name: Cloud Code UI (mocked, no AWS)
+    name: Mocked UI (Cloud Code + workflow board, no AWS)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -156,8 +156,10 @@ jobs:
       - name: Build
         run: npm run build
 
-      # Every backend call in this spec is intercepted with page.route, so a plain
-      # `next start` with zero credentials serves it. Boot, wait for ready, test.
+      # Every backend call in these specs is intercepted with page.route, so a plain
+      # `next start` with zero credentials serves them. Boot, wait for ready, test.
+      # TEAM-4276: the hermetic tier now covers the workflow board (FR-D2.9) as well
+      # as Cloud Code — see the test:ui-mocked script.
       # Detach + redirect output: a bare `&` leaves next start holding the step's
       # stdout/stderr pipe open, so the runner's output reader can block on EOF and
       # hang the step until the job timeout. nohup + file redirect frees the pipe.
@@ -177,8 +179,8 @@ jobs:
       # --trace retain-on-failure overrides the config's on-first-retry: this job
       # runs no retries, so on-first-retry would never capture a trace on a
       # first-attempt failure — the artifact upload below would have nothing.
-      - name: Cloud Code UI regression suite
-        run: npm run test:cloud-code -- --trace retain-on-failure
+      - name: Mocked UI regression suite
+        run: npm run test:ui-mocked -- --trace retain-on-failure
         env:
           PLAYWRIGHT_BASE_URL: http://localhost:3737
 

@@ -539,6 +539,11 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
             catchUpCompleteRef.current = true;
             setCatchingUp(false);
             setReplayMode(false);
+          } else {
+            // TEAM-4276 QA-2a: playback ran to the end of the timeline — the DVR is
+            // back at the live edge. With the QA-2b transition detection below this
+            // also fires one final reconstruction, so notice + state match the last event.
+            setAtLiveEdge(true);
           }
         }
         return;
@@ -643,10 +648,20 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
 
   // Apply events up to replayIndex when it changes
   // Runs in replay mode OR when user scrubs back during live (DVR)
+  // TEAM-4276 QA-2b: tracks atLiveEdge as of the PREVIOUS run of the effect below.
+  const wasAtLiveEdgeRef = useRef(true);
   useEffect(() => {
     if (replayEvents.length === 0) return;
+    // TEAM-4276 QA-2b: the early return below exists so a live event append does not
+    // re-run a full reconstruction (and double-apply the event) on every event. But
+    // seekTo(last) sets atLiveEdge true, so RETURNING to the edge after a scrub never
+    // re-ran it and left the notice (and the reconstructed state) at the earlier scrub
+    // position. Detect the TRANSITION and reconstruct exactly once; subsequent live
+    // appends fall through to the early return as before.
+    const returnedToLiveEdge = !replayMode && atLiveEdge && !wasAtLiveEdgeRef.current;
+    wasAtLiveEdgeRef.current = atLiveEdge;
     // In live mode at the live edge, state is driven by handleEvent — skip reconstruction
-    if (!replayMode && atLiveEdge) return;
+    if (!replayMode && atLiveEdge && !returnedToLiveEdge) return;
     // If scrubber is at the very end, just set phase to "complete" directly
     // This avoids any reconstruction race that could flash a non-complete state
     const atEnd = replayIndex >= replayEvents.length - 1;
@@ -719,6 +734,12 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
       replayPhaseHighWaterRef.current = 0;
       setReplayIndex(0);
       setIsPlaying(true);
+      // TEAM-4276 QA-2a: restarting from 0 is by definition leaving the live edge.
+      // The speed select now invites replay on a finished run loaded via the LIVE
+      // path (replayMode === false), where a true atLiveEdge made the reconstruction
+      // effect early-return on every tick — replay looked frozen. Also fixes the same
+      // freeze on a live run whose replay was restarted from the edge.
+      setAtLiveEdge(false);
     } else {
       setIsPlaying((p) => !p);
     }
@@ -964,10 +985,32 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
     }
   }, [activeConnector]);
 
+  // TEAM-4276 QA-2a: a FINISHED run must not hold an EventSource open (nor show a
+  // Live/Reconnecting pill) — it can never emit again. Derived HERE, above the hook,
+  // because the SSE gate needs it; it is a plain derived value, not a hook, so hook
+  // order is unchanged. outcome.finished is already true for every terminal phase
+  // EXCEPT "complete" with open fix-it tickets, which must stay live so ticket_update
+  // keeps flowing — so do NOT widen this to `|| isTerminalPhase(state.phase)`.
+  const outcome = describeRunOutcome(state?.phase, { hasOpenTickets });
+  const runFinished = outcome.finished;
+
   // SSE connection — managed by useWorkflowStream hook (must be after handleEvent definition)
   const { streamStatus, streamingText } = useWorkflowStream({
     workflowId,
-    enabled: !replayMode && !catchingUp,
+    // TEAM-4276 QA-2a — three clauses, three reasons:
+    //   !!state        — until the first /state fetch lands we don't know whether the
+    //                    run is finished; opening a stream on mount only to close it a
+    //                    tick later IS the connection this fix is about. Nothing is
+    //                    lost: with no state the board renders "Loading pipeline..."
+    //                    and drops events anyway, and /state re-polls every 3s.
+    //   !replayMode
+    //   && !catchingUp — pre-existing: replay/catch-up owns the timeline (unchanged).
+    //   !runFinished   — a terminal run emits nothing more. This also closes the
+    //                    stream for a run that reaches "complete" (no open fix-it
+    //                    tickets) DURING the session — accepted: the tickets poller
+    //                    already stops in that exact state and the completion gate
+    //                    refuses to close a run with open fix tickets.
+    enabled: !!state && !replayMode && !catchingUp && !runFinished,
     initialCursor: lastEventIdRef.current,
     onEvent: handleEvent,
     onStateRecovered: (data) => { if (data && data.id) setState(data); },
@@ -1014,7 +1057,8 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
   // A run isn't visually "complete" while fix-it tickets are still open — QA can
   // file follow-ups after every phase has passed once — which is why
   // hasOpenTickets is passed in and isComplete keeps its exact old meaning.
-  const outcome = describeRunOutcome(state?.phase, { hasOpenTickets });
+  // TEAM-4276 QA-2a: `outcome` is now derived above the useWorkflowStream call — the
+  // SSE gate needs it. isComplete keeps its exact old meaning.
   const isComplete = outcome.tone === "complete" && outcome.finished;
   const isSettled = isComplete && !celebrating;
   // Amber for cancelled + the ship-blocked closes (unchanged); sky for a no-op.
@@ -1466,12 +1510,19 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
                     onChange={(e) => seekTo(Number(e.target.value))}
                   />
                   <span className="replay-counter">{replayIndex + 1} / {replayEvents.length}</span>
-                  {!atLiveEdge && !isComplete && (
+                  {/* TEAM-4276 QA-2a: runFinished, not isComplete — a cancelled /
+                      error / ship-blocked / no-op close has no live edge to jump to. */}
+                  {!atLiveEdge && !runFinished && (
                     <button className="live-btn" onClick={snapToLive} title="Jump to live">LIVE</button>
                   )}
-                  {isComplete ? (
+                  {/* TEAM-4276 QA-2a: a finished run gets the replay affordance; only a
+                      still-live run gets the stream pill. Keyed on runFinished so the
+                      no-op / cancelled / error / ship-blocked closes stop reading as
+                      "Live"/"Reconnecting..." on a run that already ended. */}
+                  {runFinished ? (
                     <select
                       className="replay-speed"
+                      data-testid="replay-finished"
                       value={playbackSpeed}
                       onChange={(e) => setPlaybackSpeed(Number(e.target.value))}
                     >
@@ -1483,7 +1534,7 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
                       <option value={50}>50x</option>
                     </select>
                   ) : (
-                    <span className={`flex items-center gap-1.5 text-[11px] font-medium px-2 py-0.5 rounded ${
+                    <span data-testid="stream-status" className={`flex items-center gap-1.5 text-[11px] font-medium px-2 py-0.5 rounded ${
                       streamStatus === "live" ? "text-green-400" :
                       streamStatus === "reconnecting" ? "text-yellow-400" :
                       streamStatus === "connecting" ? "text-blue-400" : "text-zinc-500"

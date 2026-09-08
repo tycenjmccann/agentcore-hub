@@ -10,14 +10,14 @@ Runs in `.github/workflows/ci.yml` on every push/PR. Nothing here touches AWS.
 | Command | What it covers |
 |---------|----------------|
 | `npm run test:unit` | Vitest. Pure logic that's easy to break and expensive to break in prod: tenant S3-key layout + `..` traversal guard, GitHub HMAC state round-trip (SSO emails carry `.`, the token delimiter) + purpose separation, SSE frame plumbing, the `mutateSession` optimistic-concurrency CAS (`/stop` vs `/message` write race). |
-| `npm run test:cloud-code` | Playwright with every backend call intercepted via `page.route`. Composer mic ⇄ send ⇄ stop state machine, Artifacts gallery + empty state + upload affordance, GitHub App connect/disconnect section, pull-to-laptop command copy. Needs a running server (CI boots `next start`; locally set `PLAYWRIGHT_BASE_URL`). |
+| `npm run test:ui-mocked` | Playwright with every backend call intercepted via `page.route` — the `cloud-code-ui` + `workflow-board-ui` specs (run one alone with `npm run test:cloud-code`). Composer mic ⇄ send ⇄ stop state machine, Artifacts gallery + empty state + upload affordance, GitHub App connect/disconnect section, pull-to-laptop command copy; workflow board `nothing-to-remove` outcome, no stream on a finished run, orchestrator notice vs scrub position. Needs a running server (CI boots `next start`; locally set `PLAYWRIGHT_BASE_URL`). |
 
 Run the UI suite locally:
 
 ```bash
 npm run build
 npm run start -- -p 3737 &
-PLAYWRIGHT_BASE_URL=http://localhost:3737 npm run test:cloud-code
+PLAYWRIGHT_BASE_URL=http://localhost:3737 npm run test:ui-mocked
 ```
 
 ## Tier 2 — integration (needs staging AWS + a test GitHub App)
