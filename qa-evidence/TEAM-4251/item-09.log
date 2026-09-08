@@ -1,0 +1,354 @@
+=== ITEM 9 — SWEEP_CADENCE_GATE: open-sweep-pr / recent-sweep / off; tombstone shape; F10 ===
+Named tests: src/app/api/workflow/start/route.cadence.test.ts (+ src/lib/workflow/sweep-cadence.test.ts)
+
+--- vitest run --reporter=verbose: src/app/api/workflow/start/route.cadence.test.ts src/lib/workflow/sweep-cadence.test.ts ---
+[33mThe CJS build of Vite's Node API is deprecated. See https://vite.dev/guide/troubleshooting.html#vite-cjs-node-api-deprecated for more details.[39m
+
+ RUN  v2.1.9 /mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub
+
+(node:13358) Warning: NodeVersionSupportWarning: The AWS SDK for JavaScript (v3)
+versions published after the first week of January 2027
+will require node >=22. You are running node v20.19.2.
+
+To continue receiving updates to AWS services, bug fixes,
+and security updates please upgrade to node >=22.
+
+More information can be found at: https://a.co/c895JFp
+(Use `node --trace-warnings ...` to show where the warning was created)
+stdout | src/app/api/workflow/start/route.cadence.test.ts > POST /api/workflow/start — sweep cadence gate (TEAM-4247 D2) > skips a scheduled sweep on a repo swept 3 days ago (recent-sweep)
+[start] sweep cadence: SKIPPED tycenjmccann/ember (recent-sweep)
+
+ ✓ src/app/api/workflow/start/route.cadence.test.ts > POST /api/workflow/start — sweep cadence gate (TEAM-4247 D2) > skips a scheduled sweep on a repo swept 3 days ago (recent-sweep) 562ms
+stdout | src/app/api/workflow/start/route.cadence.test.ts > POST /api/workflow/start — sweep cadence gate (TEAM-4247 D2) > skips when an open sweep PR is still in review (ember #56), writing no run row
+[start] sweep cadence: SKIPPED tycenjmccann/ember (open-sweep-pr)
+
+ ✓ src/app/api/workflow/start/route.cadence.test.ts > POST /api/workflow/start — sweep cadence gate (TEAM-4247 D2) > skips when an open sweep PR is still in review (ember #56), writing no run row
+stdout | src/app/api/workflow/start/route.cadence.test.ts > POST /api/workflow/start — sweep cadence gate (TEAM-4247 D2) > runs a scheduled sweep when the last one was 21 days ago and no sweep PR is open
+[start] Workflow wf_1788845625974_r74qp4 created. Epic: TEAM-100. Requirements ticket TEAM-101 will trigger first.
+
+stdout | src/app/api/workflow/start/route.cadence.test.ts > POST /api/workflow/start — sweep cadence gate (TEAM-4247 D2) > paginates the scan — a prior sweep behind a page boundary still skips
+[start] sweep cadence: SKIPPED tycenjmccann/ember (recent-sweep)
+
+stdout | src/app/api/workflow/start/route.cadence.test.ts > POST /api/workflow/start — sweep cadence gate (TEAM-4247 D2) > does not gate a MANUAL run of the same routine, even with a 3-day-old sweep
+[start] Workflow wf_1788845626000_hbq4rd created. Epic: TEAM-100. Requirements ticket TEAM-101 will trigger first.
+
+stdout | src/app/api/workflow/start/route.cadence.test.ts > POST /api/workflow/start — sweep cadence gate (TEAM-4247 D2) > does not gate a scheduled run of a DIFFERENT def
+[start] Workflow wf_1788845626012_bcbu1y created. Epic: TEAM-100. Requirements ticket TEAM-101 will trigger first.
+
+ ✓ src/app/api/workflow/start/route.cadence.test.ts > POST /api/workflow/start — sweep cadence gate (TEAM-4247 D2) > runs a scheduled sweep when the last one was 21 days ago and no sweep PR is open
+ ✓ src/app/api/workflow/start/route.cadence.test.ts > POST /api/workflow/start — sweep cadence gate (TEAM-4247 D2) > paginates the scan — a prior sweep behind a page boundary still skips
+ ✓ src/app/api/workflow/start/route.cadence.test.ts > POST /api/workflow/start — sweep cadence gate (TEAM-4247 D2) > does not gate a MANUAL run of the same routine, even with a 3-day-old sweep
+ ✓ src/app/api/workflow/start/route.cadence.test.ts > POST /api/workflow/start — sweep cadence gate (TEAM-4247 D2) > does not gate a scheduled run of a DIFFERENT def
+stdout | src/app/api/workflow/start/route.cadence.test.ts > POST /api/workflow/start — sweep cadence gate (TEAM-4247 D2) > shadow: creates the run, emits sweep.cadence_observed, writes no tombstone
+[start] Workflow wf_1788845626037_lhmumx created. Epic: TEAM-100. Requirements ticket TEAM-101 will trigger first.
+
+stderr | src/app/api/workflow/start/route.cadence.test.ts > POST /api/workflow/start — sweep cadence gate (TEAM-4247 D2) > shadow: creates the run, emits sweep.cadence_observed, writes no tombstone
+[start] sweep cadence (shadow): would skip tycenjmccann/ember — recent-sweep
+
+stdout | src/app/api/workflow/start/route.cadence.test.ts > POST /api/workflow/start — sweep cadence gate (TEAM-4247 D2) > off: scans nothing, probes nothing, runs
+[start] Workflow wf_1788845626060_9lixhr created. Epic: TEAM-100. Requirements ticket TEAM-101 will trigger first.
+
+stdout | src/app/api/workflow/start/route.cadence.test.ts > POST /api/workflow/start — sweep cadence gate (TEAM-4247 D2) > the tombstone id is deterministic per (repo, day) — a repeat tick writes one row
+[start] sweep cadence: SKIPPED tycenjmccann/ember (recent-sweep)
+[start] sweep cadence: skip_tycenjmccann-ember_20260908 already recorded today — skipping again, no new row
+[start] sweep cadence: SKIPPED tycenjmccann/ember (recent-sweep)
+
+ ✓ src/app/api/workflow/start/route.cadence.test.ts > POST /api/workflow/start — sweep cadence gate (TEAM-4247 D2) > shadow: creates the run, emits sweep.cadence_observed, writes no tombstone
+ ✓ src/app/api/workflow/start/route.cadence.test.ts > POST /api/workflow/start — sweep cadence gate (TEAM-4247 D2) > off: scans nothing, probes nothing, runs
+ ✓ src/app/api/workflow/start/route.cadence.test.ts > POST /api/workflow/start — sweep cadence gate (TEAM-4247 D2) > the tombstone id is deterministic per (repo, day) — a repeat tick writes one row
+stdout | src/app/api/workflow/start/route.cadence.test.ts > POST /api/workflow/start — sweep cadence gate (TEAM-4247 D2) > without a GITHUB_PAT the PR probe is skipped but the cadence check still decides
+[start] Workflow wf_1788845626097_k9pvq7 created. Epic: TEAM-100. Requirements ticket TEAM-101 will trigger first.
+[start] sweep cadence: SKIPPED tycenjmccann/ember (recent-sweep)
+
+stdout | src/app/api/workflow/start/route.cadence.test.ts > POST /api/workflow/start — sweep cadence gate (TEAM-4247 D2) > this gate's own tombstones never justify the next skip
+[start] Workflow wf_1788845626110_1a387r created. Epic: TEAM-100. Requirements ticket TEAM-101 will trigger first.
+
+ ✓ src/app/api/workflow/start/route.cadence.test.ts > POST /api/workflow/start — sweep cadence gate (TEAM-4247 D2) > without a GITHUB_PAT the PR probe is skipped but the cadence check still decides
+ ✓ src/app/api/workflow/start/route.cadence.test.ts > POST /api/workflow/start — sweep cadence gate (TEAM-4247 D2) > this gate's own tombstones never justify the next skip
+ ✓ src/lib/workflow/sweep-cadence.test.ts > normalizeSweepCadenceMode > unset → shadow (observe a new install before it refuses scheduled work)
+ ✓ src/lib/workflow/sweep-cadence.test.ts > normalizeSweepCadenceMode > garbage → off (a typo must never silently start skipping runs)
+ ✓ src/lib/workflow/sweep-cadence.test.ts > normalizeSweepCadenceMode > accepts the three modes case- and space-insensitively
+ ✓ src/lib/workflow/sweep-cadence.test.ts > sweepRepoKey > normalizes url spellings to one owner/name key
+ ✓ src/lib/workflow/sweep-cadence.test.ts > sweepRepoKey > is empty when there is no parseable GitHub repo — the caller must skip the gate
+ ✓ src/lib/workflow/sweep-cadence.test.ts > evaluateSweepCadence > skips inside the window and runs outside it
+ ✓ src/lib/workflow/sweep-cadence.test.ts > evaluateSweepCadence > reports the newest run as the evidence
+ ✓ src/lib/workflow/sweep-cadence.test.ts > evaluateSweepCadence > counts a still-RUNNING sweep — the strongest reason not to start another
+ ✓ src/lib/workflow/sweep-cadence.test.ts > evaluateSweepCadence > counts a nothing-to-remove sweep (it did happen; it just found nothing)
+ ✓ src/lib/workflow/sweep-cadence.test.ts > evaluateSweepCadence > ignores this gate's own tombstones, deleted rows, other repos and other defs
+ ✓ src/lib/workflow/sweep-cadence.test.ts > evaluateSweepCadence > ignores unusable and future timestamps — an unaged row cannot justify a skip
+ ✓ src/lib/workflow/sweep-cadence.test.ts > evaluateSweepCadence > does nothing without a repo key (every repo-less run would look like one repo)
+ ✓ src/lib/workflow/sweep-cadence.test.ts > findOpenSweepPr > matches on head branch, title or label
+ ✓ src/lib/workflow/sweep-cadence.test.ts > findOpenSweepPr > counts a draft sweep PR — unreviewed work in flight either way
+ ✓ src/lib/workflow/sweep-cadence.test.ts > findOpenSweepPr > ignores unrelated PRs and an empty list
+ ✓ src/lib/workflow/sweep-cadence.test.ts > findOpenSweepPr > returns the PR as evidence
+ ✓ src/lib/workflow/sweep-cadence.test.ts > evaluateSweepGate > cadence wins over the probe (one DDB read decides before any network claim)
+ ✓ src/lib/workflow/sweep-cadence.test.ts > evaluateSweepGate > falls through to the open PR when the cadence is satisfied
+ ✓ src/lib/workflow/sweep-cadence.test.ts > evaluateSweepGate > never skips on an UNPROBED PR list — the probe fails open
+ ✓ src/lib/workflow/sweep-cadence.test.ts > evaluateSweepGate > carries the cadence evidence on a run it lets through (what shadow reads)
+ ✓ src/lib/workflow/sweep-cadence.test.ts > evaluateSweepGate > reports empty evidence on a repo that was never swept
+ ✓ src/lib/workflow/sweep-cadence.test.ts > skipTombstoneId / buildSkipTombstone > is deterministic per (repo, day) and changes the next day
+ ✓ src/lib/workflow/sweep-cadence.test.ts > skipTombstoneId / buildSkipTombstone > builds the amendment-2 tombstone shape
+
+ Test Files  2 passed (2)
+      Tests  34 passed (34)
+   Start at  05:33:42
+   Duration  3.77s (transform 272ms, setup 0ms, collect 368ms, tests 755ms, environment 1ms, prepare 254ms)
+
+VITEST_EXIT=0
+
+--- (2) assertion audit ---
+
+(2a) ember PR #56 open -> workflow.skipped {reason:'open-sweep-pr', evidence}, NO run created
+     route.cadence.test.ts:291-307
+  it("skips when an open sweep PR is still in review (ember #56), writing no run row", async () => {
+    h.prs = [{ number: 12, html_url: "u", title: "Bump deps", head: { ref: "chore/deps" }, labels: [] }, emberSweepPr];
+
+    const res = await post(sweepBody());
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.reason).toBe("open-sweep-pr");
+    expect(body.evidence.pr).toBe(56);
+    expect(body.evidence.headRef).toBe("feature/TEAM-9001-dead-code-sweep");
+    expect(body.evidence.url).toBe(`${REPO}/pull/56`);
+
+    expect(h.invokes).toEqual([]);
+    expect(runRows()).toEqual([]);
+    expect(tombstones()).toHaveLength(1);
+    expect(tombstones()[0].item.reason).toBe("open-sweep-pr");
+    // The probe really asked GitHub for the repo's open PRs.
+    expect(h.fetches.some((u) => u.includes("/repos/tycenjmccann/ember/pulls?state=open"))).toBe(true);
+  });
+
+     ...and the shared skip-path assertions proved on the recent-sweep sibling (:253-289),
+     which is the test that spells out the whole event+tombstone shape:
+  it("skips a scheduled sweep on a repo swept 3 days ago (recent-sweep)", async () => {
+    const prior = priorSweep(3);
+    h.store.set(prior.workflowId, prior);
+
+    const res = await post(sweepBody());
+    expect(res.status).toBe(200); // a skip is a successful no-op, not a 4xx
+    const body = await res.json();
+    expect(body).toMatchObject({ status: "skipped", reason: "recent-sweep" });
+    expect(body.evidence).toMatchObject({ repo: REPO_KEY, lastRunId: prior.workflowId, minIntervalDays: 14 });
+    expect(body.evidence.ageDays).toBeCloseTo(3, 1);
+
+    // Nothing was created: no epic/ticket Lambda call, no run row.
+    expect(h.invokes).toEqual([]);
+    expect(runRows()).toEqual([]);
+
+    // One tombstone, in the amendment-2 shape.
+    expect(tombstones()).toHaveLength(1);
+    expect(tombstones()[0].item).toMatchObject({
+      type: "skipped",
+      reason: "recent-sweep",
+      repo: REPO_KEY,
+      defId: "dead-code-sweep",
+      deleted: true,
+      phase: "cancelled",
+      skipReason: "sweep-cadence",
+      trigger: "scheduled",
+    });
+    expect(String(tombstones()[0].item.workflowId)).toMatch(/^skip_tycenjmccann-ember_\d{8}$/);
+    expect(typeof tombstones()[0].item.at).toBe("string");
+
+    // One workflow.skipped event, keyed on the tombstone id.
+    const skipped = events().filter((e) => e.type === "workflow.skipped");
+    expect(skipped).toHaveLength(1);
+    expect(skipped[0].workflowId).toBe(tombstones()[0].item.workflowId);
+    expect(skipped[0].detail).toMatchObject({
+      workflowId: tombstones()[0].item.workflowId,
+      reason: "recent-sweep",
+      repo: REPO_KEY,
+      defId: "dead-code-sweep",
+      mode: "enforce",
+    });
+  });
+
+(2b) sweep merged <14d -> {reason:'recent-sweep'}   [same block, :255-257]
+     expect(body).toMatchObject({ status: 'skipped', reason: 'recent-sweep' });
+     expect(body.evidence).toMatchObject({ repo: REPO_KEY, lastRunId: prior.workflowId, minIntervalDays: 14 });
+     expect(body.evidence.ageDays).toBeCloseTo(3, 1);
+
+(2c) SWEEP_CADENCE_GATE=off -> no skip, and the gate does not even look   [:344-352]
+  it("does not gate a MANUAL run of the same routine, even with a 3-day-old sweep", async () => {
+    const prior = priorSweep(3);
+    h.store.set(prior.workflowId, prior);
+
+    const body = await (await post(sweepBody({ trigger: "manual" }))).json();
+    expect(body.workflowId).toMatch(/^wf_/);
+    expect(h.scans).toEqual([]); // the gate never even looked
+    expect(h.fetches).toEqual([]);
+    expect(tombstones()).toEqual([]);
+  });
+
+(2d) tombstone has deleted:true (asked)   [:265-276]  -- quoted in (2a) above:
+       type: 'skipped', reason, repo, defId, deleted: true, phase: 'cancelled',
+       skipReason: 'sweep-cadence', trigger: 'scheduled'
+     ...and is excluded by dynamo-read.ts:
+35:  // deleted workflow's type from its tickets — never list them.
+36:  items = items.filter(item => item.deleted !== true);
+53:  if (result.Item?.deleted === true) return null;
+
+--- (3) sweep-cadence.ts — the F10 question, quoted ---
+sweep-cadence.ts:122-146 (doc + decision) and :163-170 (THE FILTER):
+/**
+ * Was this repo swept too recently?
+ *
+ * Counts any row for the sweep def on the same repo — INCLUDING one still
+ * running, which is the strongest reason not to start another, and including one
+ * that closed `nothing-to-remove` (the sweep did happen; it just found nothing,
+ * and nothing will have changed by next week either).
+ *
+ * Deliberately NOT counted:
+ *   - this gate's own tombstones (`type: "skipped"`), or a skip would make the
+ *     next 14 days of ticks skip on the evidence of a skip, and
+ *   - `deleted` rows (the metrics-only tombstones the DELETE route leaves).
+ */
+export function evaluateSweepCadence(args: {
+  repo: string;
+  rows: SweepWorkflowRow[];
+  now: number;
+  minIntervalDays?: number;
+}): { skip: SweepSkipReason; evidence: RecentSweepEvidence } | null {
+  if (!args.repo) return null;
+  const evidence = sweepHistoryEvidence(args);
+  if (evidence.lastRunAt === null) return null;
+  const age = args.now - Date.parse(evidence.lastRunAt);
+  return age < evidence.minIntervalDays * DAY_MS ? { skip: "recent-sweep", evidence } : null;
+}
+   ...
+  const { repo, rows, now } = args;
+  const minIntervalDays = args.minIntervalDays ?? SWEEP_CADENCE_DAYS;
+
+  const mine = rows.filter(
+    (r) =>
+      r &&
+      r.deleted !== true &&
+      r.type !== "skipped" &&
+      (r.workflowDefId || SWEEP_DEF_ID) === SWEEP_DEF_ID &&
+      rowRepoKey(r) === repo
+  );
+
+  let newest: SweepWorkflowRow | null = null;
+  let newestAt = -Infinity;
+  for (const r of mine) {
+    const at = rowAt(r);
+    // A row with no usable timestamp cannot be aged, so it cannot justify a skip.
+    if (at === null || at > now) continue;
+    if (at > newestAt) {
+      newestAt = at;
+      newest = r;
+    }
+  }
+
+  return {
+    repo,
+    lastRunId: newest?.workflowId ?? null,
+    lastRunAt: newest ? new Date(newestAt).toISOString() : null,
+    ageDays: newest ? Math.round(((now - newestAt) / DAY_MS) * 10) / 10 : null,
+    minIntervalDays,
+    runsConsidered: mine.length,
+  };
+}
+
+--- (4) independent probe: npx vite-node probes/item-09-cadence-errored.ts ---
+SWEEP_CADENCE_DAYS = 14   SWEEP_DEF_ID = dead-code-sweep
+now = 2026-09-08T00:00:00.000Z   every prior row below is 3 days old
+
+=== 9.1  F10 — which prior-run PHASES count as a recent sweep? ===
+  phase=complete           skip=recent-sweep  runsConsidered=1  ageDays=3
+  phase=nothing-to-remove  skip=recent-sweep  runsConsidered=1  ageDays=3
+  phase=error              skip=recent-sweep  runsConsidered=1  ageDays=3
+  phase=cancelled          skip=recent-sweep  runsConsidered=1  ageDays=3
+  phase=deploy-blocked     skip=recent-sweep  runsConsidered=1  ageDays=3
+  phase=static-ci-only     skip=recent-sweep  runsConsidered=1  ageDays=3
+  phase=development        skip=recent-sweep  runsConsidered=1  ageDays=3
+  phase=undefined          skip=recent-sweep  runsConsidered=1  ageDays=3
+  --> EVERY phase counts. sweepHistoryEvidence's filter (sweep-cadence.ts:163-170)
+      tests deleted!==true, type!=='skipped', workflowDefId and repo — NEVER phase.
+
+=== 9.2  the failure F10 describes, end to end ===
+  a sweep that CRASHED 1 day ago -> skip=recent-sweep  lastRunId=wf_crashed
+  so the next 14 days of scheduled ticks are skipped on the evidence of a run
+  that produced nothing. Recovery is manual: 'Run now' (trigger!=='scheduled' is ungated).
+
+=== 9.3  control — what IS excluded ===
+  this gate's own tombstone (type:'skipped')   skip=null
+  a DELETE-route tombstone (deleted:true)      skip=null
+  another def                                  skip=null
+  another repo                                 skip=null
+  no usable timestamp                          skip=null
+  a FUTURE timestamp                           skip=null
+
+=== 9.4  is the tombstone itself excluded from a later cadence read? ===
+  tombstone: {
+    "workflowId": "skip_tycenjmccann-ember_20260908",
+    "type": "skipped",
+    "reason": "recent-sweep",
+    "evidence": {
+      "repo": "tycenjmccann/ember",
+      "lastRunId": "x",
+      "lastRunAt": "2026-09-05T00:00:00.000Z",
+      "ageDays": 3,
+      "minIntervalDays": 14,
+      "runsConsidered": 1
+    },
+    "repo": "tycenjmccann/ember",
+    "defId": "dead-code-sweep",
+    "at": "2026-09-08T00:00:00.000Z",
+    "deleted": true,
+    "phase": "cancelled",
+    "skipReason": "sweep-cadence",
+    "workflowDefId": "dead-code-sweep",
+    "trigger": "scheduled"
+  }
+  fed back as a row -> skip=null
+  EXCLUDED TWICE: deleted:true AND type:'skipped'. deleted:true is also what
+  dynamo-read.ts:36 filters on, so it never appears in the workflow list.
+  id determinism: skip_tycenjmccann-ember_20260908 vs next day skip_tycenjmccann-ember_20260909
+
+=== 9.5  mode normaliser ===
+  undefined    -> shadow
+  null         -> shadow
+  ""           -> shadow
+  "   "        -> shadow
+  "off"        -> off
+  "OFF"        -> off
+  " Enforce "  -> enforce
+  "shadow"     -> shadow
+  "banana"     -> off
+  "1"          -> off
+  "true"       -> off
+
+=== ITEM 9 / F10 VERDICT ===
+  F10 REPRODUCED: an errored or cancelled prior sweep counts as a recent sweep.
+  No test in sweep-cadence.test.ts exercises phase 'error' or 'cancelled' as a
+  real prior run — only 'complete', 'development' (running) and 'nothing-to-remove'.
+PROBE_EXIT=0
+
+--- (5) VERDICT: item 9 VERIFIED; reviewer finding F10 REPRODUCED ---
+All three acceptance clauses are asserted, by value, with "no run created" proved
+four ways (h.invokes==[], runRows()==[], no epic/ticket Lambda call, 200-not-4xx).
+The tombstone carries deleted:true and IS excluded by dynamo-read.ts:36
+(`items.filter(item => item.deleted !== true)`) and :53 (getWorkflow -> null).
+
+F10 REPRODUCED. evaluateSweepCadence counts ANY prior sweep row for the def+repo.
+The filter at :163-170 tests four things -- deleted!==true, type!=='skipped',
+workflowDefId and repo key -- and NEVER phase. So a sweep that ERRORED or was
+CANCELLED one day ago suppresses the next 14 days of scheduled ticks exactly as a
+clean delivery would. The doc comment at :125-128 enumerates the inclusions it
+means to make ("including one still running... including one that closed
+nothing-to-remove") and the exclusions ("Deliberately NOT counted: ... tombstones
+... deleted rows") -- error/cancelled appear in neither list, so this reads as an
+oversight rather than a decision.
+
+COVERAGE GAP: sweep-cadence.test.ts covers phase 'complete', 'development'
+(running) and 'nothing-to-remove'. No test uses 'error' or 'cancelled' as a real
+prior run, so nothing pins today's behaviour either way.
+
+SEVERITY: low-moderate and self-limiting. A crashed sweep blocks only SCHEDULED
+starts; "Run now" (trigger !== 'scheduled') is ungated (:12-13, and the test
+"does not gate a MANUAL run of the same routine, even with a 3-day-old sweep").
+Under the shipped shadow default nothing is skipped at all.
+
+EXIT=0

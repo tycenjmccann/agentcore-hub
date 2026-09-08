@@ -1,0 +1,534 @@
+=== ITEM 16: flag-by-flag off == baseline, and every normaliser's fallback ===
+=== commit: 1f5458dbeeaff116c10e57cbe2a77ac23a5da0b8 ===
+
+=== 16.A  off == baseline, per flag (7 flags, 5 normalisers) ===
+
+The seven acceptance flags do NOT have seven normalisers. Four D1 flags share
+normalizeVerdictMode; VERIFIED_HEAD_COMPLETION additionally has a TS twin on the
+/complete route. Read-sites:
+
+  VERDICT_GATE               lambda/orchestrator/index.mjs:303  normalizeVerdictMode
+  FIX_BEFORE_VERIFY          lambda/orchestrator/index.mjs:309  normalizeVerdictMode
+  VERIFIED_HEAD_COMPLETION   lambda/orchestrator/index.mjs:315  normalizeVerdictMode
+                             src/app/api/workflow/[id]/complete/route.ts:703  normalizeVerifiedHeadMode
+  SWEEP_DETECTION_PHASE      lambda/orchestrator/index.mjs:339  normalizeVerdictMode
+  SWEEP_CADENCE_GATE         src/app/api/workflow/start/route.ts:373  normalizeSweepCadenceMode
+  TICKET_PLAN_VALIDATOR      lambda/orchestrator/index.mjs:362  normalizeTicketPlanValidatorMode
+                             (+ agentcore-hub-tickets:290, agentcore-hub-jira:54, workflow-output:35)
+  DECISION_LEDGER            lambda/orchestrator/index.mjs:385  normalizeDecisionLedgerMode
+
+--- 1. VERDICT_GATE -- OFF-PATH TEST PRESENT
+    replay-dowtdh-verdict-gate.test.mjs:578  "(e) all three flags off: the event
+    sequence equals the pre-D1 baseline, with zero writes"
+      :579  await loadWith({ verdict: "off", fixBefore: "off", verifiedHead: "off" });
+      :584  expect(cascadeShape()).toEqual(fixtureCascadeShape());
+      :587  expect(h.state.createdTickets).toEqual([]);
+      :588  expect(h.state.blockerWrites).toEqual([]);
+      :594  expect(d1).toEqual([]);   // no verdict/completion_blocked/fix_before_verify event
+    Unit floor: verdict-contract.test.mjs:295-296
+      expect(evaluateGate({ ...gateArgs, mode: "off" })).toEqual({
+        reason: "off", wouldSuppress: false, suppress: false, blockOn: [], needsGateReverify: false });
+    NOTE: this is the STRONGEST form of off==baseline in the suite -- equality against
+    a fixture shape captured from the real dossier run, not a hand-written expectation.
+
+--- 2. FIX_BEFORE_VERIFY -- OFF-PATH TEST PRESENT (shared, plus isolated)
+    Same assertion as above (:579 sets fixBefore:"off" as part of the triple).
+    ISOLATED off: replay-dowtdh-verdict-gate.test.mjs:669
+      const ENFORCE_VERDICT_ONLY = { verdict: "enforce", fixBefore: "off", verifiedHead: "off" };
+      -- pins that VERDICT_GATE=enforce alone produces no FIX_BEFORE_VERIFY effect,
+      which is what makes the triple-off result attributable rather than confounded.
+    Also replay-f50ucz-ship-review-regression.test.mjs:357  ALL_OFF, used at :720/736/778/805/820.
+    Also replay-c2uqki-sweep-noop.test.mjs:999  loadWith({ sweep:"off", fixBefore:"enforce" })
+      -- the reverse isolation.
+
+--- 3. VERIFIED_HEAD_COMPLETION -- OFF-PATH TEST PRESENT (both surfaces)
+    Orchestrator: replay-dowtdh-verdict-gate.test.mjs:579 (the triple) and :834
+      await loadWith({ verdict: "off", fixBefore: "off", verifiedHead: "enforce" });
+      -- isolates the head check from the verdict gate.
+    Route twin: probe 16.4 below shows normalizeVerifiedHeadMode agrees with
+    normalizeVerdictMode on all 14 inputs, so the two surfaces cannot diverge on
+    mode parsing. (CLAUDE.md's claim that the route "enforces identically".)
+
+--- 4. SWEEP_DETECTION_PHASE -- OFF-PATH TEST PRESENT
+    replay-c2uqki-sweep-noop.test.mjs:919  describe("off -- byte-identical to the
+    run the dossier recorded")
+      :920  it("reproduces the fixture's own cascade shape, paying nothing")
+      :927  expect(cascadeShape()).toEqual(fixtureCascadeShape());
+      :931  allEvents().filter(/^sweep\./ or workflow.nothing_to_remove) -> toEqual([])
+      :932  terminalClaims.filter(outcome === "nothing-to-remove")      -> toEqual([])
+      :933  githubCalls.filter(/\/labels$/)                             -> toEqual([])
+      :934-935  createdTickets / blockerWrites                          -> toEqual([])
+      :938  "does not read the detection record beyond the harvest's own read"
+    Def-shaping floor: sweep-noop-close.test.mjs:558 "strips the REQUIREMENT under off"
+      expect(effective().completionRequiresAgentPhases).not.toContain("detection");
+    and :573 "NEVER strips the phase itself, in any mode" (off|shadow|enforce).
+    Productive-sweep control: replay-iczquj-sweep-full-chain.test.mjs:970/984
+      expect(cascadeHops()).toEqual(off);   // shadow is cascade-identical to off
+
+--- 5. SWEEP_CADENCE_GATE -- OFF-PATH TEST PRESENT
+    src/app/api/workflow/start/route.cadence.test.ts:384
+      it("off: scans nothing, probes nothing, runs")
+      expect(h.scans).toEqual([]);   // the gate never even looks at history
+    Strong form: off does not merely allow the run, it performs no DynamoDB scan
+    and no GitHub PR probe -- so `off` costs nothing, not just "changes nothing".
+
+--- 6. TICKET_PLAN_VALIDATOR -- OFF-PATH TEST PRESENT
+    branch-context.test.mjs:234  describe("TICKET_PLAN_VALIDATOR=off -- today, byte for byte")
+      :236  await load("off");
+      :238  expect(ctx).not.toContain("## Branch");
+      :241  expect(ctx).toContain(INVENTED);   // the defect, deliberately reproduced
+      :242  expect(ctx).not.toContain(REAL);
+      :243  expect(h.state.childQueries, "off must not read the board").toHaveLength(0);
+      :244  expect(h.state.events).toHaveLength(0);
+      :248  it("the sweeper's own block is exactly the pre-D3 one") -- exact string equality
+    unverified-fixes-context.test.mjs:150-153 additionally PINS the flag off so an
+    unrelated test's `childReads === 0` claim cannot be broken by the D3 default.
+    NOTE: the four byte-identical copies are NOT each given an off test; only the
+    orchestrator copy is exercised through buildAgentContext. The tickets/jira/
+    workflow-output copies are covered by their own mode tests
+    (agentcore-hub-tickets/index.test.mjs:836, workflow-output/index.test.mjs:373,
+    agentcore-hub-jira/index.test.mjs:847) and by branch-name-parity.test.mjs.
+
+--- 7. DECISION_LEDGER -- OFF-PATH TEST PRESENT
+    decision-ledger.test.mjs:401  describe("DECISION_LEDGER=off -- byte-identical to before D3")
+      :402  "an approved gate with two decisions in its comments writes NOTHING, anywhere"
+        :404  expect(h.state.gh, "off must not talk to GitHub at all").toHaveLength(0);
+        :405  s3Puts.map(key) -> not.toContain(MIRROR_KEY)
+        :406  events starting "decision." -> toHaveLength(0)
+      :409  "the dowtdh Plan Approval gate opens on a plan that honours nothing"
+        :414  expect(h.state.storeCalls).toContain("appendReviewNotificationOnce");
+              // the defect, reproduced: a human IS paged under off
+        :416  expect(h.state.s3Gets, "off must not even read the ledger").not.toContain(MIRROR_KEY);
+      :424  "a QA persona's context is unchanged and pays no ledger read"
+      :435  "the Plan ticket's own context is byte-identical with and without a ledger present"
+        :439  expect(await buildAgentContext(planTicket, ...)).toBe(bare);   // exact equality
+    replay-dowtdh-decision-loss.test.mjs:429 / :469 add the replay-level off path.
+
+=== 16.A VERDICT: all 7 flags HAVE an off-path test. NO flag is missing one. ===
+    Coverage is uneven in KIND, not in presence:
+      - VERDICT_GATE / FIX_BEFORE_VERIFY / SWEEP_DETECTION_PHASE get fixture-equality
+        against the real dossier cascade (strongest).
+      - DECISION_LEDGER / TICKET_PLAN_VALIDATOR get byte-identical context equality.
+      - SWEEP_CADENCE_GATE gets a "spends nothing" assertion.
+      - VERIFIED_HEAD_COMPLETION's /complete-route twin has NO route-level off test
+        of its own; its off behaviour is inferred from normaliser parity (16.4).
+        That is the one soft spot -- see the caveat in 16.4.
+
+=== 16.B  probe: every normaliser vs banana / "" / undefined / "ENFORCE " / "Shadow" ===
+=== 16.1  fallback of every normaliser, on the real modules ===
+
+--- normalizeVerdictMode  (lambda/orchestrator/verdict-contract.mjs:214)
+      flags: VERDICT_GATE, FIX_BEFORE_VERIFY, VERIFIED_HEAD_COMPLETION, SWEEP_DETECTION_PHASE
+      "banana"           -> "off"
+      ""                 -> "shadow"
+      undefined          -> "shadow"
+      "ENFORCE "         -> "enforce"
+      "Shadow"           -> "shadow"
+      null               -> "shadow"
+      "   "              -> "shadow"
+      "on"               -> "off"
+      "true"             -> "off"
+      "1"                -> "off"
+      1 (number)         -> "off"
+      "OFF"              -> "off"
+      "enfroce" (typo)   -> "off"
+      "shdaow" (typo)    -> "off"
+
+--- normalizeVerifiedHeadMode  (src/lib/workflow/verified-heads.ts:186)
+      flags: VERIFIED_HEAD_COMPLETION (the /complete route's own twin)
+      "banana"           -> "off"
+      ""                 -> "shadow"
+      undefined          -> "shadow"
+      "ENFORCE "         -> "enforce"
+      "Shadow"           -> "shadow"
+      null               -> "shadow"
+      "   "              -> "shadow"
+      "on"               -> "off"
+      "true"             -> "off"
+      "1"                -> "off"
+      1 (number)         -> "off"
+      "OFF"              -> "off"
+      "enfroce" (typo)   -> "off"
+      "shdaow" (typo)    -> "off"
+
+--- normalizeSweepCadenceMode  (src/lib/workflow/sweep-cadence.ts:86)
+      flags: SWEEP_CADENCE_GATE
+      "banana"           -> "off"
+      ""                 -> "shadow"
+      undefined          -> "shadow"
+      "ENFORCE "         -> "enforce"
+      "Shadow"           -> "shadow"
+      null               -> "shadow"
+      "   "              -> "shadow"
+      "on"               -> "off"
+      "true"             -> "off"
+      "1"                -> "off"
+      1 (number)         -> "off"
+      "OFF"              -> "off"
+      "enfroce" (typo)   -> "off"
+      "shdaow" (typo)    -> "off"
+
+--- normalizeTicketPlanValidatorMode  (lambda/orchestrator/ticket-plan-validator.mjs:68 (x4 byte-identical copies))
+      flags: TICKET_PLAN_VALIDATOR
+      "banana"           -> "off"
+      ""                 -> "shadow"
+      undefined          -> "shadow"
+      "ENFORCE "         -> "enforce"
+      "Shadow"           -> "shadow"
+      null               -> "shadow"
+      "   "              -> "shadow"
+      "on"               -> "off"
+      "true"             -> "off"
+      "1"                -> "off"
+      1 (number)         -> "off"
+      "OFF"              -> "off"
+      "enfroce" (typo)   -> "off"
+      "shdaow" (typo)    -> "off"
+
+--- normalizeDecisionLedgerMode  (lambda/orchestrator/artifact-chain.mjs:251)
+      flags: DECISION_LEDGER
+      "banana"           -> "shadow"
+      ""                 -> "shadow"
+      undefined          -> "shadow"
+      "ENFORCE "         -> "enforce"
+      "Shadow"           -> "shadow"
+      null               -> "shadow"
+      "   "              -> "shadow"
+      "on"               -> "shadow"
+      "true"             -> "shadow"
+      "1"                -> "shadow"
+      1 (number)         -> "shadow"
+      "OFF"              -> "off"
+      "enfroce" (typo)   -> "shadow"
+      "shdaow" (typo)    -> "shadow"
+
+=== 16.2  the two answers that matter ===
+
+  flag value UNSET (a deploy that never sets it):
+      normalizeVerdictMode               -> shadow
+      normalizeVerifiedHeadMode          -> shadow
+      normalizeSweepCadenceMode          -> shadow
+      normalizeTicketPlanValidatorMode   -> shadow
+      normalizeDecisionLedgerMode        -> shadow
+
+  flag value UNRECOGNIZED (a typo in the task definition):
+      normalizeVerdictMode               -> off  <-- FAILS OPEN: the gate silently stops running
+      normalizeVerifiedHeadMode          -> off  <-- FAILS OPEN: the gate silently stops running
+      normalizeSweepCadenceMode          -> off  <-- FAILS OPEN: the gate silently stops running
+      normalizeTicketPlanValidatorMode   -> off  <-- FAILS OPEN: the gate silently stops running
+      normalizeDecisionLedgerMode        -> shadow  <-- still writes
+
+=== 16.3  whitespace + case tolerance ===
+
+      normalizeVerdictMode               "ENFORCE "/"Shadow" handled: YES
+      normalizeVerifiedHeadMode          "ENFORCE "/"Shadow" handled: YES
+      normalizeSweepCadenceMode          "ENFORCE "/"Shadow" handled: YES
+      normalizeTicketPlanValidatorMode   "ENFORCE "/"Shadow" handled: YES
+      normalizeDecisionLedgerMode        "ENFORCE "/"Shadow" handled: YES
+
+=== 16.4  do the two VERIFIED_HEAD_COMPLETION twins agree? ===
+
+      "banana"           orchestrator=off      route=off      
+      ""                 orchestrator=shadow   route=shadow   
+      undefined          orchestrator=shadow   route=shadow   
+      "ENFORCE "         orchestrator=enforce  route=enforce  
+      "Shadow"           orchestrator=shadow   route=shadow   
+      null               orchestrator=shadow   route=shadow   
+      "   "              orchestrator=shadow   route=shadow   
+      "on"               orchestrator=off      route=off      
+      "true"             orchestrator=off      route=off      
+      "1"                orchestrator=off      route=off      
+      1 (number)         orchestrator=off      route=off      
+      "OFF"              orchestrator=off      route=off      
+      "enfroce" (typo)   orchestrator=off      route=off      
+      "shdaow" (typo)    orchestrator=off      route=off      
+
+      AGREE on every input — one flag, one meaning on both surfaces.
+
+=== ITEM 16 VERDICT ===
+  Four of the five normalisers fall an unrecognized value to `off`, so a typo
+  in VERDICT_GATE / FIX_BEFORE_VERIFY / VERIFIED_HEAD_COMPLETION /
+  SWEEP_DETECTION_PHASE / SWEEP_CADENCE_GATE / TICKET_PLAN_VALIDATOR silently
+  disables that gate with no log line. DECISION_LEDGER is the exception:
+  anything unrecognized lands on `shadow`, so it keeps writing. Unset is
+  `shadow` everywhere — no flag ships enforcing.
+PROBE_EXIT=0
+
+=== 16.C  the off-path tests, run ===
+[33mThe CJS build of Vite's Node API is deprecated. See https://vite.dev/guide/troubleshooting.html#vite-cjs-node-api-deprecated for more details.[39m
+
+ RUN  v2.1.9 /mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub
+
+ ✓ lambda/orchestrator/replay-dowtdh-verdict-gate.test.mjs > dowtdh replay — the fixture still says what this replay claims > records three different heads and not one structured verdict
+ ✓ lambda/orchestrator/replay-dowtdh-verdict-gate.test.mjs > dowtdh replay — the fixture still says what this replay claims > published workflow.complete with the cascade unblocking every gate in turn
+
+ ✓ lambda/orchestrator/replay-dowtdh-verdict-gate.test.mjs > dowtdh replay — the D1 flags > (e) all three flags off: the event sequence equals the pre-D1 baseline, with zero writes 1081ms
+
+ ✓ lambda/orchestrator/replay-dowtdh-verdict-gate.test.mjs > dowtdh replay — the D1 flags > (e) all three flags off: agent.complete carries the four keys on every ticket, at off defaults for non-gate personas 421ms
+
+ ✓ lambda/orchestrator/replay-dowtdh-verdict-gate.test.mjs > dowtdh replay — the D1 flags > (f) shadow (the default): verdict_observed x2 + completion_blocked, workflow.complete still published, zero writes 330ms
+
+ ✓ lambda/orchestrator/replay-dowtdh-verdict-gate.test.mjs > dowtdh replay — the D1 flags > (f) shadow: the inferred ladder observes the same two verdicts from the fixture's prose alone 375ms
+
+ ✓ lambda/orchestrator/replay-dowtdh-verdict-gate.test.mjs > dowtdh replay — the D1 flags > (a) enforce: after TEAM-4180 CHANGES_NEEDED no orchestrator.unblocked names TEAM-4181, TEAM-4181 is not dispatched, and verdict_suppressed's blockers hold TEAM-4183 + a re-verify id
+
+ ✓ lambda/orchestrator/replay-dowtdh-verdict-gate.test.mjs > dowtdh replay — the D1 flags > (a) enforce: TEAM-4181.blockedBy gained TEAM-4183 and the reviewer re-verify, and TEAM-4183 completing releases the re-verify — not TEAM-4181 361ms
+
+ ✓ lambda/orchestrator/replay-dowtdh-verdict-gate.test.mjs > dowtdh replay — the D1 flags > (a) enforce: TEAM-4181's FAIL holds TEAM-4182 on TEAM-4183 too, though QA filed no fix itself
+
+ ✓ lambda/orchestrator/replay-dowtdh-verdict-gate.test.mjs > dowtdh replay — the D1 flags > (a) enforce: the inferred ladder holds TEAM-4181 identically from the fixture's prose alone
+
+
+ ✓ lambda/orchestrator/replay-dowtdh-verdict-gate.test.mjs > dowtdh replay — the D1 flags > (b) a Re-verify ticket owned by agentcore_hub_qa_verifier AND one owned by agentcore_hub_ci_agent exist, tied to TEAM-4183 364ms
+
+ ✓ lambda/orchestrator/replay-dowtdh-verdict-gate.test.mjs > dowtdh replay — the D1 flags > (c) enforce: workflow.complete count 0 and exactly ONE orchestrator.completion_blocked with heads.qa 933ea6f, heads.pr 001259d, reason head-divergence
+
+ ✓ lambda/orchestrator/replay-dowtdh-verdict-gate.test.mjs > dowtdh replay — the D1 flags > (d) the TEAM-4181 agent.complete delivered twice creates exactly one QA re-verify and leaves the blocker-edge writes unchanged
+
+ ✓ lambda/orchestrator/replay-dowtdh-verdict-gate.test.mjs > dowtdh replay — the D1 flags > (d) …and still exactly one when the marker write was lost, on the CAS alone
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > SWEEP_DETECTION_PHASE=enforce — the orchestrator ends the run > closes nothing-to-remove from the webhook twin, dispatching nobody
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > SWEEP_DETECTION_PHASE=enforce — the orchestrator ends the run > closes nothing-to-remove from the stream twin, dispatching nobody
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > SWEEP_DETECTION_PHASE=enforce — the orchestrator ends the run > blocks the open agent siblings and leaves the human gate alone
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > SWEEP_DETECTION_PHASE=enforce — the orchestrator ends the run > labels the PR when the record carries one
+
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > SWEEP_DETECTION_PHASE=enforce — the orchestrator ends the run > a failing label never blocks the close (best-effort by contract)
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > SWEEP_DETECTION_PHASE=enforce — the orchestrator ends the run > closes exactly ONCE across the two twins — the CAS is the only arbiter
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > SWEEP_DETECTION_PHASE=enforce — the orchestrator ends the run > matches the detection ticket by the def's phase agent when the stamp is missing
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > SWEEP_DETECTION_PHASE=enforce — the orchestrator ends the run > does NOT close a productive sweep — 8 removals cascade as always
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > SWEEP_DETECTION_PHASE=enforce — the orchestrator ends the run > does NOT close on a record with no yield field at all (every pre-D2 record)
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > SWEEP_DETECTION_PHASE=enforce — the orchestrator ends the run > does NOT close a run on another def, even at zero yield
+
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > SWEEP_DETECTION_PHASE=enforce — the orchestrator ends the run > degrades to today's behaviour when the record read throws
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > SWEEP_DETECTION_PHASE=shadow — observe, change nothing > publishes sweep.detection_observed and still cascades as today
+
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > SWEEP_DETECTION_PHASE=shadow — observe, change nothing > is the UNSET default — a fresh deploy observes rather than acts
+
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > SWEEP_DETECTION_PHASE=shadow — observe, change nothing > garbage coalesces to off, never to enforce
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > SWEEP_DETECTION_PHASE=off — byte-identical to pre-4247 > does not read the completion record for the gate, and publishes nothing new
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > the detection required-phase strip (config can be synced at any time) > strips the REQUIREMENT under shadow, keeping every other phase in order
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > the detection required-phase strip (config can be synced at any time) > strips the REQUIREMENT under off
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > the detection required-phase strip (config can be synced at any time) > KEEPS the requirement under enforce — the gate and the requirement arm together
+
+
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > the detection required-phase strip (config can be synced at any time) > NEVER strips the phase itself, in any mode
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > the detection required-phase strip (config can be synced at any time) > does not mutate the def it is given (the defs cache is shared)
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > the detection required-phase strip (config can be synced at any time) > leaves a def with no detection requirement untouched, by identity
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > no dispatch AFTER the close (the level-trigger paths) > refuses a late "ready" delivery for the reviewer once the run is closed
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > no dispatch AFTER the close (the level-trigger paths) > refuses a late "todo" delivery for the reviewer once the run is closed
+
+If you need to partially mock a module, you can use "importOriginal" helper inside:
+
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > no dispatch AFTER the close (the level-trigger paths) > DOES dispatch the same delivery while the run is open (the guard is the only difference)
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > no dispatch AFTER the close (the level-trigger paths) > the reconcile sweep does not even SEE a closed run (the scan's terminal filter)
+
+If you need to partially mock a module, you can use "importOriginal" helper inside:
+
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > no dispatch AFTER the close (the level-trigger paths) > …and DOES see the same run while it is open (non-vacuous)
+
+If you need to partially mock a module, you can use "importOriginal" helper inside:
+
+If you need to partially mock a module, you can use "importOriginal" helper inside:
+
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > yield-aware gate depth (FR-D2.6) > tells the QA verifier and the CI agent that the diff is deletion-free
+
+If you need to partially mock a module, you can use "importOriginal" helper inside:
+
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > yield-aware gate depth (FR-D2.6) > tells the code reviewer the opposite — nothing about the ledger review is relaxed
+
+If you need to partially mock a module, you can use "importOriginal" helper inside:
+
+If you need to partially mock a module, you can use "importOriginal" helper inside:
+
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > yield-aware gate depth (FR-D2.6) > says nothing at all to the personas whose depth it does not set
+
+If you need to partially mock a module, you can use "importOriginal" helper inside:
+
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > yield-aware gate depth (FR-D2.6) > says nothing when the sweep DID remove code — 8 removals get the full battery
+
+If you need to partially mock a module, you can use "importOriginal" helper inside:
+
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > yield-aware gate depth (FR-D2.6) > says nothing on a run whose record predates the field entirely
+
+If you need to partially mock a module, you can use "importOriginal" helper inside:
+
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > yield-aware gate depth (FR-D2.6) > says nothing on another def, even at zero yield
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > yield-aware gate depth (FR-D2.6) > respects the 200-char package-bullet clamp, and drops the count when it is absent
+
+ ✓ lambda/orchestrator/sweep-noop-close.test.mjs > yield-aware gate depth (FR-D2.6) > leads the human merge gate's package with the same line
+
+
+ ✓ lambda/orchestrator/decision-ledger.test.mjs > DECISION_LEDGER=off — byte-identical to before D3 > an approved gate with two decisions in its comments writes NOTHING, anywhere
+
+ ✓ lambda/orchestrator/decision-ledger.test.mjs > DECISION_LEDGER=off — byte-identical to before D3 > the dowtdh Plan Approval gate opens on a plan that honours nothing
+
+ ✓ lambda/orchestrator/decision-ledger.test.mjs > DECISION_LEDGER=off — byte-identical to before D3 > a QA persona's context is unchanged and pays no ledger read
+
+ ✓ lambda/orchestrator/decision-ledger.test.mjs > DECISION_LEDGER=off — byte-identical to before D3 > the Plan ticket's own context is byte-identical with and without a ledger present
+
+
+ ✓ lambda/orchestrator/decision-ledger.test.mjs > appends one inert entry per gate resolution, idempotently > shadow commits both decisions on the branch, mirrors them, and emits decision.recorded
+
+
+ ✓ lambda/orchestrator/decision-ledger.test.mjs > appends one inert entry per gate resolution, idempotently > a webhook redelivery of the same gate performs ZERO writes
+
+
+ ✓ lambda/orchestrator/decision-ledger.test.mjs > appends one inert entry per gate resolution, idempotently > an approval with no decision line records nothing — 'Approved.' is not a decision
+
+
+ ✓ lambda/orchestrator/decision-ledger.test.mjs > appends one inert entry per gate resolution, idempotently > a non-human assignee records nothing — only a gate resolution is a decision
+
+
+ ✓ lambda/orchestrator/decision-ledger.test.mjs > appends one inert entry per gate resolution, idempotently > enforce records exactly as shadow does — the gate check is all it adds
+
+
+ ✓ lambda/orchestrator/decision-ledger.test.mjs > appends one inert entry per gate resolution, idempotently > a 409 is retried once against the winner's file and lands
+
+
+ ✓ lambda/orchestrator/decision-ledger.test.mjs > appends one inert entry per gate resolution, idempotently > a 409 whose winner already recorded our ids is a success with nothing to write
+
+ ✓ lambda/orchestrator/decision-ledger.test.mjs > appends one inert entry per gate resolution, idempotently > 409 then 409 fails open — a warn, the S3 mirror, and no throw
+
+ ✓ lambda/orchestrator/decision-ledger.test.mjs > appends one inert entry per gate resolution, idempotently > a read-only PAT (403) writes the S3 mirror only, and says why
+
+ ✓ lambda/orchestrator/decision-ledger.test.mjs > Plan Approval cannot pass with an unreferenced open decision > enforce withholds TEAM-4178: no human is paged, the plan goes back for rework
+
+ ✓ lambda/orchestrator/decision-ledger.test.mjs > Plan Approval cannot pass with an unreferenced open decision > shadow presents the same gate, with what was dropped at the FRONT of the package
+
+ ✓ lambda/orchestrator/decision-ledger.test.mjs > Plan Approval cannot pass with an unreferenced open decision > a gate with no review package at all still carries the section
+
+
+ ✓ lambda/orchestrator/decision-ledger.test.mjs > Plan Approval cannot pass with an unreferenced open decision > the post-fix plan passes the same gate untouched, in both non-off modes
+
+ ✓ lambda/orchestrator/decision-ledger.test.mjs > Plan Approval cannot pass with an unreferenced open decision > a decision already marked resolved never withholds anything
+
+ ✓ lambda/orchestrator/decision-ledger.test.mjs > Plan Approval cannot pass with an unreferenced open decision > a missing plan.md fails OPEN — 'cites nothing' and 'we cannot read it' are not the same
+
+ ✓ lambda/orchestrator/decision-ledger.test.mjs > design and plan context carry the open-decision checklist > the Plan ticket is told to cite or deviate, by id
+
+ ✓ lambda/orchestrator/decision-ledger.test.mjs > design and plan context carry the open-decision checklist > a design persona gets it too — the design that contradicted the PO is where it started
+
+ ✓ lambda/orchestrator/decision-ledger.test.mjs > design and plan context carry the open-decision checklist > an implementation dev and a QA verifier get no checklist and pay no ledger read
+
+ ✓ lambda/orchestrator/decision-ledger.test.mjs > design and plan context carry the open-decision checklist > the checklist comes from the S3 mirror — no GitHub round trip on the dispatch path
+
+ ✓ lambda/orchestrator/decision-ledger.test.mjs > design and plan context carry the open-decision checklist > an empty ledger emits no block at all
+(node:15283) Warning: NodeVersionSupportWarning: The AWS SDK for JavaScript (v3)
+versions published after the first week of January 2027
+will require node >=22. You are running node v20.19.2.
+
+To continue receiving updates to AWS services, bug fixes,
+and security updates please upgrade to node >=22.
+
+More information can be found at: https://a.co/c895JFp
+(Use `node --trace-warnings ...` to show where the warning was created)
+[start] sweep cadence: SKIPPED tycenjmccann/ember (recent-sweep)
+
+ ✓ src/app/api/workflow/start/route.cadence.test.ts > POST /api/workflow/start — sweep cadence gate (TEAM-4247 D2) > skips a scheduled sweep on a repo swept 3 days ago (recent-sweep) 632ms
+[start] sweep cadence: SKIPPED tycenjmccann/ember (open-sweep-pr)
+
+ ✓ src/app/api/workflow/start/route.cadence.test.ts > POST /api/workflow/start — sweep cadence gate (TEAM-4247 D2) > skips when an open sweep PR is still in review (ember #56), writing no run row
+[start] Workflow wf_1788846553487_vr5uib created. Epic: TEAM-100. Requirements ticket TEAM-101 will trigger first.
+
+ ✓ src/app/api/workflow/start/route.cadence.test.ts > POST /api/workflow/start — sweep cadence gate (TEAM-4247 D2) > runs a scheduled sweep when the last one was 21 days ago and no sweep PR is open
+[start] sweep cadence: SKIPPED tycenjmccann/ember (recent-sweep)
+
+[start] Workflow wf_1788846553514_nb507f created. Epic: TEAM-100. Requirements ticket TEAM-101 will trigger first.
+
+[start] Workflow wf_1788846553525_v1lals created. Epic: TEAM-100. Requirements ticket TEAM-101 will trigger first.
+
+ ✓ src/app/api/workflow/start/route.cadence.test.ts > POST /api/workflow/start — sweep cadence gate (TEAM-4247 D2) > paginates the scan — a prior sweep behind a page boundary still skips
+ ✓ src/app/api/workflow/start/route.cadence.test.ts > POST /api/workflow/start — sweep cadence gate (TEAM-4247 D2) > does not gate a MANUAL run of the same routine, even with a 3-day-old sweep
+ ✓ src/app/api/workflow/start/route.cadence.test.ts > POST /api/workflow/start — sweep cadence gate (TEAM-4247 D2) > does not gate a scheduled run of a DIFFERENT def
+[start] Workflow wf_1788846553550_flw426 created. Epic: TEAM-100. Requirements ticket TEAM-101 will trigger first.
+
+[start] sweep cadence (shadow): would skip tycenjmccann/ember — recent-sweep
+
+[start] Workflow wf_1788846553573_yqei30 created. Epic: TEAM-100. Requirements ticket TEAM-101 will trigger first.
+
+[start] sweep cadence: SKIPPED tycenjmccann/ember (recent-sweep)
+[start] sweep cadence: skip_tycenjmccann-ember_20260908 already recorded today — skipping again, no new row
+[start] sweep cadence: SKIPPED tycenjmccann/ember (recent-sweep)
+
+ ✓ src/app/api/workflow/start/route.cadence.test.ts > POST /api/workflow/start — sweep cadence gate (TEAM-4247 D2) > shadow: creates the run, emits sweep.cadence_observed, writes no tombstone
+ ✓ src/app/api/workflow/start/route.cadence.test.ts > POST /api/workflow/start — sweep cadence gate (TEAM-4247 D2) > off: scans nothing, probes nothing, runs
+ ✓ src/app/api/workflow/start/route.cadence.test.ts > POST /api/workflow/start — sweep cadence gate (TEAM-4247 D2) > the tombstone id is deterministic per (repo, day) — a repeat tick writes one row
+[start] Workflow wf_1788846553607_d71iz5 created. Epic: TEAM-100. Requirements ticket TEAM-101 will trigger first.
+[start] sweep cadence: SKIPPED tycenjmccann/ember (recent-sweep)
+
+[start] Workflow wf_1788846553619_wp49dw created. Epic: TEAM-100. Requirements ticket TEAM-101 will trigger first.
+
+ ✓ src/app/api/workflow/start/route.cadence.test.ts > POST /api/workflow/start — sweep cadence gate (TEAM-4247 D2) > without a GITHUB_PAT the PR probe is skipped but the cadence check still decides
+ ✓ src/app/api/workflow/start/route.cadence.test.ts > POST /api/workflow/start — sweep cadence gate (TEAM-4247 D2) > this gate's own tombstones never justify the next skip
+
+ ✓ lambda/orchestrator/branch-context.test.mjs > TICKET_PLAN_VALIDATOR=off — today, byte for byte > a reviewer gets NO ## Branch block, no sibling read and the invented name intact
+
+ ✓ lambda/orchestrator/branch-context.test.mjs > TICKET_PLAN_VALIDATOR=off — today, byte for byte > the sweeper's own block is exactly the pre-D3 one
+
+ ✓ lambda/orchestrator/branch-context.test.mjs > TICKET_PLAN_VALIDATOR=shadow — every persona is told, nothing is changed > the reviewer gets the producer's real branch and the read-only NOTE
+
+ ✓ lambda/orchestrator/branch-context.test.mjs > TICKET_PLAN_VALIDATOR=shadow — every persona is told, nothing is changed > QA gets it too — the consumers are the whole point
+
+ ✓ lambda/orchestrator/branch-context.test.mjs > TICKET_PLAN_VALIDATOR=shadow — every persona is told, nothing is changed > the description reaches the model byte-identical, and ONE observed event records what would have changed
+
+ ✓ lambda/orchestrator/branch-context.test.mjs > TICKET_PLAN_VALIDATOR=shadow — every persona is told, nothing is changed > a ticket that names no branch emits no event at all
+
+ ✓ lambda/orchestrator/branch-context.test.mjs > TICKET_PLAN_VALIDATOR=shadow — every persona is told, nothing is changed > a ticket that names the REAL branch is not treated as an invention
+
+ ✓ lambda/orchestrator/branch-context.test.mjs > TICKET_PLAN_VALIDATOR=enforce — the invented name never reaches the model > the reviewer's prompt has feature/TEAM-4230-code-sweeper and NOT chore/dead-code-sweep-2026-09-07
+
+ ✓ lambda/orchestrator/branch-context.test.mjs > TICKET_PLAN_VALIDATOR=enforce — the invented name never reaches the model > nothing is persisted — the rewrite is context-only
+
+
+
+ ✓ lambda/orchestrator/branch-context.test.mjs > the dev-phase prompt is unchanged in all three modes > byte-identical across off / shadow / enforce
+
+
+ ✓ lambda/orchestrator/branch-context.test.mjs > degradation and I/O budget > a failed sibling read degrades to the feature branch and still renders the block
+
+ ✓ lambda/orchestrator/branch-context.test.mjs > degradation and I/O budget > several producers → the shared integration branch, not a guess
+
+ ✓ lambda/orchestrator/branch-context.test.mjs > degradation and I/O budget > the board is read at most ONCE per context build
+
+
+
+ ✓ lambda/orchestrator/branch-context.test.mjs > degradation and I/O budget > shared/output.md is read for development only, in every mode
+
+ Test Files  5 passed (5)
+      Tests  97 passed (97)
+   Start at  05:49:02
+   Duration  12.57s (transform 819ms, setup 0ms, collect 732ms, tests 8.28s, environment 1ms, prepare 618ms)
+
+VITEST_EXIT=0

@@ -1,0 +1,143 @@
+=== ITEM 12: TICKET_PLAN_VALIDATOR — unblocked-non-root + invented-branch ===
+=== commit: 1f5458dbeeaff116c10e57cbe2a77ac23a5da0b8 ===
+
+=== PART A: probe (real module, real dossier text) ===
+=== 12.1  the plan as submitted, from the real dossier ===
+  TEAM-4230  assignee=agentcore_hub_code_sweeper  blocked_by=[]
+      title: chore(sweep): dead-code sweep of tycenjmccann/ember — detect, verify, remove, ledger, PR
+  TEAM-4229  assignee=agentcore_hub_requirements_analyst  blocked_by=[]
+      title: Sweep: agentcore_hub_requirements_analyst — Dead Code Sweep — tycenjmccann/ember — 2026-
+
+=== 12.2  validateTicketPlan with TEAM-4229 as the OPEN root ===
+  ok = false   violations = 2
+  [unblocked-non-root] TEAM-4230
+      TEAM-4230 has blocked_by=[] but the requirements root TEAM-4229 is not done — a non-root ticket must be blocked_by at least one upstream ticket.
+  [invented-branch] TEAM-4230
+      TEAM-4230 names the branch "chore/dead-code-sweep-2026-09-07", which does not exist and does not follow the harness convention feature/<ticketId>-<persona-slug>. Do not invent branch names — the orchestrator tells each persona its branch in the ## Branch block.
+  unblocked-non-root count = 1   (TEAM-4229 is exempt as the root)
+  the ONE message names BOTH ids? true
+
+=== 12.3  controls ===
+  root status 'done'  -> unblocked-non-root: 0  (fails open)
+  no resolvable root  -> 1 violation(s), message says: "the requirements ticket"
+  advisory, no blockers -> ok=true, violations=0  (EXEMPT)
+  fix lineage, no blockers -> ok=true  (chained by the fix contract instead)
+
+=== 12.4  F8 — which branch-shaped tokens does the rule REJECT under enforce? ===
+  CANONICAL_BRANCH_RE = /^feature\/[A-Z][A-Z0-9]+-\d+-[a-z0-9-]+$/
+  BRANCH_TOKEN_RE     = /(?<![\w/.-])(chore|feature|feat|fix|hotfix|release|bugfix)\/[A-Za-z0-9._/-]+/g
+
+  chore/dead-code-sweep-2026-08-31                           tokenised=true  canonical=false REJECTED=true
+  release/v1.2                                               tokenised=true  canonical=false REJECTED=true
+  chore/dead-code-sweep-2026-09-07                           tokenised=true  canonical=false REJECTED=true
+  feature/TEAM-4230-code-sweeper                             tokenised=true  canonical=true  REJECTED=false
+  feature/TEAM-4243--si-system-binding-gate-verdicts-verifie tokenised=true  canonical=true  REJECTED=false
+  feature/team-4230-code-sweeper                             tokenised=true  canonical=false REJECTED=true
+  feature/TEAM-4230-Code-Sweeper                             tokenised=true  canonical=false REJECTED=true
+  hotfix/prod-outage                                         tokenised=true  canonical=false REJECTED=true
+  bugfix/JIRA-1-thing                                        tokenised=true  canonical=false REJECTED=true
+  fix/TEAM-1-x                                               tokenised=true  canonical=false REJECTED=true
+  main                                                       tokenised=false canonical=false REJECTED=false
+  origin/main                                                tokenised=false canonical=false REJECTED=false
+  renovate/lodash-4.x                                        tokenised=false canonical=false REJECTED=false
+
+=== 12.5  F8 — does knownBranches save a legitimate release branch? ===
+  no knownBranches      -> invented-branch: 1
+  knownBranches supplied -> invented-branch: 0
+  So the escape hatch WORKS -- the question is whether the caller uses it.
+
+=== 12.6  do the three production callers pass knownBranches? ===
+  --- lambda/workflow-output/index.mjs:73  (submit_ticket_plan (the whole plan, both codes))
+        if (TICKET_PLAN_VALIDATOR !== "off") {
+          const { violations } = validateTicketPlan(parsed, {
+            rootTicketId: root_ticket_id || null,
+            rootStatus: root_status || null,
+          });
+          for (const v of violations) warnings.push(v.message);
+      passes knownBranches? NO
+      filters to unblocked-non-root only? NO
+  --- lambda/agentcore-hub-tickets/index.mjs:362  (create_ticket, DDB provider)
+        if (!root?.ticketId) return null; // fail open, silently — see findRequirementsRoot
+        const { violations } = validateTicketPlan([candidate], {
+          rootTicketId: root.ticketId,
+          rootStatus: root.status,
+        });
+        return violations.find((v) => v.code === "unblocked-non-root")?.message || null;
+      passes knownBranches? NO
+      filters to unblocked-non-root only? YES
+  --- lambda/agentcore-hub-jira/index.mjs:395  (create_ticket, Jira provider)
+        if (!root?.ticketId) return null; // fail open, silently — see findRequirementsRoot
+        const { violations } = validateTicketPlan([candidate], {
+          rootTicketId: root.ticketId,
+          rootStatus: root.status,
+        });
+        return violations.find((v) => v.code === "unblocked-non-root")?.message || null;
+      passes knownBranches? NO
+      filters to unblocked-non-root only? YES
+
+=== 12.7  canonicalBranchFor + rewriteBranchNames on the real c2uqki text ===
+  canonicalBranchFor("TEAM-4230","agentcore_hub_code_sweeper") = feature/TEAM-4230-code-sweeper
+  advisory variant = feature/TEAM-4230-advisory
+  branch tokens in TEAM-4230's REAL description: ["chore/dead-code-sweep-2026-09-07"]
+  rewrites: [{"from":"chore/dead-code-sweep-2026-09-07","to":"feature/TEAM-4230-code-sweeper"}]
+  text changed? true
+
+=== 12.8  mode normaliser ===
+  undefined    -> shadow
+  null         -> shadow
+  ""           -> shadow
+  "   "        -> shadow
+  "off"        -> off
+  "OFF"        -> off
+  " Enforce "  -> enforce
+  "shadow"     -> shadow
+  "banana"     -> off
+  "1"          -> off
+  "true"       -> off
+  "on"         -> off
+
+=== ITEM 12 / F8 VERDICT ===
+  Item 12: both clauses reproduce on the real module against real dossier data.
+  F8 REPRODUCED, with a scope limit: the invented-branch code fires on ANY
+  chore/ feature/ feat/ fix/ hotfix/ release/ bugfix/ token that is not the
+  harness convention and not in knownBranches -- including release/v1.2 and a
+  dated chore/ sweep branch. The one caller that surfaces that code
+  (workflow-output submit_ticket_plan) passes NO knownBranches, so under
+  enforce a plan that legitimately cites a release branch is rejected.
+PROBE_EXIT=0
+
+=== PART B: npx vitest run lambda/orchestrator/ticket-plan-validator.test.mjs --reporter=verbose ===
+[33mThe CJS build of Vite's Node API is deprecated. See https://vite.dev/guide/troubleshooting.html#vite-cjs-node-api-deprecated for more details.[39m
+
+ RUN  v2.1.9 /mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub
+
+ ✓ lambda/orchestrator/ticket-plan-validator.test.mjs > normalizeTicketPlanValidatorMode > defaults UNSET to shadow and falls unrecognized values to off
+ ✓ lambda/orchestrator/ticket-plan-validator.test.mjs > normalizeTicketPlanValidatorMode > accepts every mode case- and whitespace-insensitively
+ ✓ lambda/orchestrator/ticket-plan-validator.test.mjs > parseTicketPlanTickets > returns the array for an array, a JSON string and a {tickets} wrapper
+ ✓ lambda/orchestrator/ticket-plan-validator.test.mjs > parseTicketPlanTickets > counts TICKETS, not the characters of the JSON string main.py sends
+ ✓ lambda/orchestrator/ticket-plan-validator.test.mjs > parseTicketPlanTickets > returns [] for nothing sent and null for something unusable
+ ✓ lambda/orchestrator/ticket-plan-validator.test.mjs > isRequirementsRoot > matches the analyst assignee or an explicit requirements phase
+ ✓ lambda/orchestrator/ticket-plan-validator.test.mjs > isAdvisoryTicket > requires the exact label word
+ ✓ lambda/orchestrator/ticket-plan-validator.test.mjs > isAdvisoryTicket > never applies to a fix ticket or a human gate, whatever the label says
+ ✓ lambda/orchestrator/ticket-plan-validator.test.mjs > validateTicketPlan — unblocked-non-root > names TEAM-4230 and TEAM-4229
+ ✓ lambda/orchestrator/ticket-plan-validator.test.mjs > validateTicketPlan — unblocked-non-root > fails open entirely once the requirements root is done
+ ✓ lambda/orchestrator/ticket-plan-validator.test.mjs > validateTicketPlan — unblocked-non-root > exempts a root found by ROLE inside the plan and flags the rest
+ ✓ lambda/orchestrator/ticket-plan-validator.test.mjs > validateTicketPlan — unblocked-non-root > says 'the requirements ticket' when no root can be resolved at all
+ ✓ lambda/orchestrator/ticket-plan-validator.test.mjs > validateTicketPlan — unblocked-non-root > advisory tickets are exempt
+ ✓ lambda/orchestrator/ticket-plan-validator.test.mjs > validateTicketPlan — unblocked-non-root > never throws and passes an empty plan
+ ✓ lambda/orchestrator/ticket-plan-validator.test.mjs > branch tokens > finds the invented name even inside backticks, and not the real one
+ ✓ lambda/orchestrator/ticket-plan-validator.test.mjs > branch tokens > is a global regex that does not leak lastIndex between calls
+ ✓ lambda/orchestrator/ticket-plan-validator.test.mjs > branch tokens > flags an invented branch on the real c2uqki review ticket
+ ✓ lambda/orchestrator/ticket-plan-validator.test.mjs > branch tokens > does not flag a branch it was told exists
+ ✓ lambda/orchestrator/ticket-plan-validator.test.mjs > canonicalBranchFor > slugs the agent id the way the harness does
+ ✓ lambda/orchestrator/ticket-plan-validator.test.mjs > canonicalBranchFor > produces the branch c2uqki's sweeper actually pushed
+ ✓ lambda/orchestrator/ticket-plan-validator.test.mjs > rewriteBranchNames > rewrites an invented branch to the harness convention
+ ✓ lambda/orchestrator/ticket-plan-validator.test.mjs > rewriteBranchNames > leaves text untouched when there is nothing to rewrite
+ ✓ lambda/orchestrator/ticket-plan-validator.test.mjs > rewriteBranchNames > is a no-op without a canonical target, and never throws on junk
+
+ Test Files  1 passed (1)
+      Tests  23 passed (23)
+   Start at  05:45:51
+   Duration  2.94s (transform 66ms, setup 0ms, collect 72ms, tests 21ms, environment 0ms, prepare 193ms)
+
+VITEST_EXIT=0

@@ -1,0 +1,377 @@
+=== ITEM 17: twin delivery — exactly ONE effect per logical event ===
+=== commit: 1f5458dbeeaff116c10e57cbe2a77ac23a5da0b8 ===
+
+The orchestrator has TWO "ticket done" entry paths that can both fire for one
+logical transition: handleTicketDoneUnified (Jira webhook) and handleTicketDone
+(DynamoDB stream). Item 17 asks for the count===1 assertion that proves a twin
+delivery does not double-act. Three layers assert it, at three different grains.
+
+--- LAYER 1 / shape: the two paths PUBLISH the same detail ---
+lambda/orchestrator/verdict-contract.test.mjs:507
+  describe("verdict-contract — the agent.complete twins stay identical (TEAM-4246 D1)")
+
+  :519  it("produce byte-identical agent.complete details for the same input")
+  :521  expect(enrichCompleteDetail(webhookTwinBase, info))
+          .toEqual(enrichCompleteDetail(streamTwinBase, info));
+
+  and the count===1-style structural pin that keeps that meaningful:
+  :523  it("both agent.complete publish sites in index.mjs route through enrichCompleteDetail")
+  :538  expect(sites.length).toBe(2);          <-- EXACTLY TWO publish sites, no third
+  :540-542  for (const at of sites) {
+              expect(window).toContain("enrichCompleteDetail(");
+              expect(window).toContain("resolveVerdictInfo(");
+            }
+  This is a source grep over index.mjs, deliberately: cost-report and the twins
+  cannot import each other (deploy.sh ships single-file zips), so drift is caught
+  by reading the file rather than by importing it. `sites.length).toBe(2)` is the
+  assertion that fails if someone adds a third agent.complete publish that skips
+  enrichment.
+
+--- LAYER 2 / effect: concurrent twins create exactly ONE ticket ---
+lambda/orchestrator/live-reverify.test.mjs:565
+  it("two concurrent Dones for the same fix → file exactly ONE re-verify ticket")
+
+  :569-573  two onFixDone calls in Promise.all, sharing the DynamoDB fake but NOT
+            the in-memory workflow row — "which is how a stream redelivery and
+            its webhook twin actually arrive"
+  :575  expect(created(calls)).toHaveLength(1);      <-- THE count===1 ASSERTION
+  :576  expect(calls.claims).toHaveLength(2);        <-- both DID race for the slot
+  :578  expect(winner).toEqual({ action: "created", reverifyTicketId: REVERIFY,
+                                sha7: SHA7, unverified: false });
+  :579  expect(loser.action).toBe("already");
+  :582  expect(loser.pendingClaim).toBe(true);
+  :583  expect(calls.addBlockers).toHaveLength(0);
+  Non-vacuity is the :576 line: the test proves BOTH invocations reached the
+  claim (2 claims) and only one created (1 ticket). A test that merely asserted
+  "1 created" could pass if the second call never ran at all.
+
+  :586  it("a redelivery after the winner persisted returns the winner's ticket, not a new one")
+  :604  expect(second).toEqual({ action: "already", reverifyTicketId: REVERIFY,
+                                 sha7: SHA7, unverified: false, pendingClaim: false });
+  :605  expect(created(calls)).toHaveLength(1);      <-- count===1, COLD container
+  The cold-invocation variant matters because the in-memory free check cannot
+  help there: only the DynamoDB claim can, which is the path a real redelivery
+  minutes later takes.
+
+--- LAYER 3 / cascade: a concurrent last-blocker re-wake fires once ---
+lambda/orchestrator/cascade.test.mjs:518
+  "TEAM-3684 Finding 2 — idempotent in_review re-wake. Concurrent last-blocker …"
+  :523  describe("Finding 2 — idempotent in_review re-wake")
+  :546  it("reawakenGate truthy → EXACTLY one review.reawakened + metric counts one")
+  :561  expect(eventsOfType(publishEvent, "review.reawakened")).toHaveLength(1);
+  :562  expect(records[0].CascadeReviewReawaken).toBe(1);
+  Two independent count===1s: the event AND the CloudWatch metric. The metric one
+  is the stronger of the pair — an event deduped downstream would still show 1
+  event, but a double-executed code path would emit the metric twice.
+
+=== ITEM 17 VERDICT: ASSERTED at all three grains ===
+  shape (detail equality + exactly-2-publish-sites), effect (1 ticket from 2
+  racing claims, warm AND cold), cascade (1 event + 1 metric datapoint).
+  The twin-delivery contract is genuinely pinned, not assumed.
+
+  Honest limit: layer 1 compares enrichCompleteDetail applied to two literal
+  objects that the test itself declares (:516-517), copied by hand from the two
+  call sites. They are identical BY CONSTRUCTION in the test file, so :521 can
+  never fail on its own — its value is entirely in the :538 grep that keeps the
+  literals honest. The comment at :513-515 says so outright ("if either site's
+  literal drifts, this test's copy goes stale FIRST"). So the real guard against
+  twin drift is the source grep, not the equality.
+
+=== the three files, run verbose ===
+[33mThe CJS build of Vite's Node API is deprecated. See https://vite.dev/guide/troubleshooting.html#vite-cjs-node-api-deprecated for more details.[39m
+
+ RUN  v2.1.9 /mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub
+
+
+
+
+
+
+
+
+
+
+
+ ✓ lambda/orchestrator/cascade.test.mjs > commit 4a — union {blocked, todo} → Ready (DDB provider) > Readies a BLOCKED dependent whose last blocker just closed
+ ✓ lambda/orchestrator/cascade.test.mjs > commit 4a — union {blocked, todo} → Ready (DDB provider) > Readies a parked TODO dependent too — the stream-path divergence fix
+ ✓ lambda/orchestrator/cascade.test.mjs > commit 4a — union {blocked, todo} → Ready (DDB provider) > Readies BOTH a blocked and a todo dependent in one cascade
+ ✓ lambda/orchestrator/cascade.test.mjs > blocker-resolution predicate (unchanged) > does NOT unblock while another blocker is still open
+ ✓ lambda/orchestrator/cascade.test.mjs > blocker-resolution predicate (unchanged) > unblocks once the LAST blocker resolves (cancelled counts as resolved)
+ ✓ lambda/orchestrator/cascade.test.mjs > blocker-resolution predicate (unchanged) > ignores the closed ticket itself and non-dependents
+ ✓ lambda/orchestrator/cascade.test.mjs > commit 4a leaves NON-{blocked,todo} dependents untouched > does not touch in_progress / in_review dependents (extended states are 4b)
+ ✓ lambda/orchestrator/cascade.test.mjs > provider branching > Jira provider transitions to Ready (no DDB status write)
+ ✓ lambda/orchestrator/cascade.test.mjs > commit 4b — in_progress dependent, LIVE lease (AC-D3.3) > nudges only — ZERO steal, ZERO claim, ZERO re-dispatch
+ ✓ lambda/orchestrator/cascade.test.mjs > commit 4b — in_progress dependent, STALE lease > steals on the exact generation then re-dispatches through the claim CAS
+ ✓ lambda/orchestrator/cascade.test.mjs > commit 4b — in_progress dependent, STALE lease > does NOT re-dispatch when the steal loses (claim moved)
+ ✓ lambda/orchestrator/cascade.test.mjs > commit 4b — in_progress dependent, STALE lease > tolerates a re-dispatch refused by the claim CAS (returns false)
+ ✓ lambda/orchestrator/cascade.test.mjs > commit 4b — in_review gate re-wake (AC-D3.1 / AC-D3.2) > AC-D3.1: last blocker done → review.reawakened + gate re-invoked in the same cascade
+ ✓ lambda/orchestrator/cascade.test.mjs > commit 4b — in_review gate re-wake (AC-D3.1 / AC-D3.2) > AC-D3.2: reopened gate blocked by fix children — last child done re-dispatches the SAME cycle
+ ✓ lambda/orchestrator/cascade.test.mjs > commit 4b — flag OFF leaves extended-state dependents untouched > in_progress + in_review are no-ops when extendedStates is false
+ ✓ lambda/orchestrator/cascade.test.mjs > commit 4b — terminal-state dependent is a no-op even with the flag ON > done / cancelled dependents whose blockers resolved fall through untouched
+ ✓ lambda/orchestrator/cascade.test.mjs > both call sites exercise identical helper behavior > two independent cascade instances (webhook + stream wiring) produce identical output
+ ✓ lambda/orchestrator/cascade.test.mjs > Finding 1 — per-dependent error isolation > a dependent whose Ready transition throws is skipped; later dependents still Ready
+ ✓ lambda/orchestrator/cascade.test.mjs > Finding 1 — per-dependent error isolation > a throwing in_progress (extended-state) handler is isolated too
+ ✓ lambda/orchestrator/cascade.test.mjs > Finding 1 — per-dependent error isolation > never rejects for a per-dependent failure (protects the caller's completion check)
+ ✓ lambda/orchestrator/cascade.test.mjs > Finding 2 — idempotent in_review re-wake > reawakenGate falsy (CAS lost / already open) → NO event, metric not incremented
+ ✓ lambda/orchestrator/cascade.test.mjs > Finding 2 — idempotent in_review re-wake > reawakenGate truthy → EXACTLY one review.reawakened + metric counts one
+ ✓ lambda/orchestrator/cascade.test.mjs > Finding 3 — bounded stale-GSI retry > re-fetches once and Readies the dependent when the blocker resolves on the retry
+ ✓ lambda/orchestrator/cascade.test.mjs > Finding 3 — bounded stale-GSI retry > still-unresolved after the retry → skipped, with EXACTLY one re-fetch
+ ✓ lambda/orchestrator/cascade.test.mjs > Finding 3 — bounded stale-GSI retry > no retry / no sleep when every dependent resolves on the first pass
+ ✓ lambda/orchestrator/cascade.test.mjs > TEAM-3747 D1 — normalizeExtendedMode coercion table > legacy boolean true → enforce
+ ✓ lambda/orchestrator/cascade.test.mjs > TEAM-3747 D1 — normalizeExtendedMode coercion table > unset (undefined / null / empty string) and false → off
+ ✓ lambda/orchestrator/cascade.test.mjs > TEAM-3747 D1 — normalizeExtendedMode coercion table > legacy string truthies on / true / 1 → enforce (case + whitespace tolerant)
+ ✓ lambda/orchestrator/cascade.test.mjs > TEAM-3747 D1 — normalizeExtendedMode coercion table > canonical off / shadow / enforce pass through (case + whitespace tolerant)
+ ✓ lambda/orchestrator/cascade.test.mjs > TEAM-3747 D1 — normalizeExtendedMode coercion table > anything unrecognized fails SAFE to shadow (observe-only)
+ ✓ lambda/orchestrator/cascade.test.mjs > TEAM-3747 D1 — normalizeExtendedMode coercion table > createCascade surfaces the normalized mode on extendedMode
+ ✓ lambda/orchestrator/cascade.test.mjs > TEAM-3747 D1 — AC-D1.1: enforce re-dispatches a parked in_progress dependent exactly once > last blocker done → steal the stale generation + redispatch once; CascadeRedispatch == 1
+ ✓ lambda/orchestrator/cascade.test.mjs > TEAM-3747 D1 — AC-D1.3: a LIVE lease is nudge-only (never re-dispatched) > live lease → zero steal, zero redispatch, exactly one nudge; CascadeRedispatch == 0
+ ✓ lambda/orchestrator/cascade.test.mjs > TEAM-3747 D1 — shadow mode evaluates + emits would-* metrics but writes NOTHING > stale in_progress → would-steal + would-redispatch metrics, ZERO writes
+ ✓ lambda/orchestrator/cascade.test.mjs > TEAM-3747 D1 — shadow mode evaluates + emits would-* metrics but writes NOTHING > live in_progress → would-nudge + skipped-live-lease metrics, ZERO nudge published
+ ✓ lambda/orchestrator/cascade.test.mjs > TEAM-3747 D1 — shadow mode evaluates + emits would-* metrics but writes NOTHING > shadow in_review → would-reawaken metric, reawakenGate never called, no event
+ ✓ lambda/orchestrator/cascade.test.mjs > TEAM-3755 F7 — liveness is re-checked immediately before the steal > event path: an agent that heart-beats in the read→steal window is NOT stolen
+ ✓ lambda/orchestrator/cascade.test.mjs > TEAM-3755 F7 — liveness is re-checked immediately before the steal > a lease still stale on the re-check steals + re-dispatches exactly once
+ ✓ lambda/orchestrator/cascade.test.mjs > TEAM-3755 F7 — liveness is re-checked immediately before the steal > sweep path (reconcileDependent) gets the same guard
+ ✓ lambda/orchestrator/cascade.test.mjs > TEAM-3755 F7 — liveness is re-checked immediately before the steal > shadow mode still performs ZERO liveness re-checks and zero writes
+ ✓ lambda/orchestrator/cascade.test.mjs > TEAM-3755 F9 — blockers are confirmed by consistent point-read before an extended-state action > a blocker reopened for rework (stale snapshot) → NO steal, NO redispatch, NO nudge
+ ✓ lambda/orchestrator/cascade.test.mjs > TEAM-3755 F9 — blockers are confirmed by consistent point-read before an extended-state action > a blocker the point-read cannot find counts as UNRESOLVED (fail safe)
+ ✓ lambda/orchestrator/cascade.test.mjs > TEAM-3755 F9 — blockers are confirmed by consistent point-read before an extended-state action > EVERY blocker is confirmed, and a genuinely resolved set proceeds to the steal
+ ✓ lambda/orchestrator/cascade.test.mjs > TEAM-3755 F9 — blockers are confirmed by consistent point-read before an extended-state action > shadow mode confirms too, so would-* metrics predict enforce honestly
+ ✓ lambda/orchestrator/cascade.test.mjs > TEAM-3755 F9 — blockers are confirmed by consistent point-read before an extended-state action > a dependent with NO blockers needs no confirm (no point-read at all)
+ ✓ lambda/orchestrator/cascade.test.mjs > TEAM-3755 F9 — blockers are confirmed by consistent point-read before an extended-state action > unwired getTicketConsistent → pre-F9 behavior (no confirm, steal proceeds)
+ ✓ lambda/orchestrator/cascade.test.mjs > TEAM-3755 F9 — blockers are confirmed by consistent point-read before an extended-state action > the SWEEP path is deliberately not confirmed (its quiet period is the guard)
+ ✓ lambda/orchestrator/cascade.test.mjs > verdict gate (TEAM-4246 D1) > off — pre-4246 behaviour, byte for byte > never even asks: the resolver and every new dep are untouched
+ ✓ lambda/orchestrator/cascade.test.mjs > verdict gate (TEAM-4246 D1) > off — pre-4246 behaviour, byte for byte > an unrecognized mode (enfroce) is off
+ ✓ lambda/orchestrator/cascade.test.mjs > verdict gate (TEAM-4246 D1) > off — pre-4246 behaviour, byte for byte > an unrecognized mode () is off
+ ✓ lambda/orchestrator/cascade.test.mjs > verdict gate (TEAM-4246 D1) > off — pre-4246 behaviour, byte for byte > an unrecognized mode (   ) is off
+ ✓ lambda/orchestrator/cascade.test.mjs > verdict gate (TEAM-4246 D1) > off — pre-4246 behaviour, byte for byte > an unrecognized mode (on) is off
+ ✓ lambda/orchestrator/cascade.test.mjs > verdict gate (TEAM-4246 D1) > off — pre-4246 behaviour, byte for byte > an unrecognized mode (true) is off
+ ✓ lambda/orchestrator/cascade.test.mjs > verdict gate (TEAM-4246 D1) > off — pre-4246 behaviour, byte for byte > a cascade built with NO verdictGateMode dep at all is off
+ ✓ lambda/orchestrator/cascade.test.mjs > verdict gate (TEAM-4246 D1) > off — pre-4246 behaviour, byte for byte > enforce with NO resolver wired is off — not a hold on nothing
+ ✓ lambda/orchestrator/cascade.test.mjs > verdict gate (TEAM-4246 D1) > shadow — observe, write nothing > cascades exactly as before AND reports what enforce would have held
+ ✓ lambda/orchestrator/cascade.test.mjs > verdict gate (TEAM-4246 D1) > shadow — observe, write nothing > wouldSuppress is empty when there was nothing to unblock anyway
+ ✓ lambda/orchestrator/cascade.test.mjs > verdict gate (TEAM-4246 D1) > enforce — a non-PASS verdict holds the successor > holds on a fix this persona did NOT file, and files the re-verify behind it too (FR-D1.5/D1.6)
+ ✓ lambda/orchestrator/cascade.test.mjs > verdict gate (TEAM-4246 D1) > enforce — a non-PASS verdict holds the successor > unions the persona's own fixes with the epic's, without duplicating either
+ ✓ lambda/orchestrator/cascade.test.mjs > verdict gate (TEAM-4246 D1) > enforce — a non-PASS verdict holds the successor > suppresses the transition, the dispatch and the journal event together
+ ✓ lambda/orchestrator/cascade.test.mjs > verdict gate (TEAM-4246 D1) > enforce — a non-PASS verdict holds the successor > holds on the fixes AND the gate's own re-verify ticket
+ ✓ lambda/orchestrator/cascade.test.mjs > verdict gate (TEAM-4246 D1) > enforce — a non-PASS verdict holds the successor > holds every successor, one edge per (successor, blocker) pair
+ ✓ lambda/orchestrator/cascade.test.mjs > verdict gate (TEAM-4246 D1) > enforce — a non-PASS verdict holds the successor > no fix ticket filed → the re-verify alone holds it (the blueprint-gap case)
+ ✓ lambda/orchestrator/cascade.test.mjs > verdict gate (TEAM-4246 D1) > enforce — a non-PASS verdict holds the successor > a re-verify that could not be filed leaves the fixes holding it
+ ✓ lambda/orchestrator/cascade.test.mjs > verdict gate (TEAM-4246 D1) > enforce — a non-PASS verdict holds the successor > NOTHING to hold on still refuses to unblock
+ ✓ lambda/orchestrator/cascade.test.mjs > verdict gate (TEAM-4246 D1) > enforce — a non-PASS verdict holds the successor > a throw anywhere in the hold falls back to HOLDING, never to unblocking
+ ✓ lambda/orchestrator/cascade.test.mjs > verdict gate (TEAM-4246 D1) > enforce — a non-PASS verdict holds the successor > a resolver that throws before it knows anything cascades as before
+ ✓ lambda/orchestrator/cascade.test.mjs > verdict gate (TEAM-4246 D1) > enforce — a non-PASS verdict holds the successor > does not re-add an edge the successor already has
+ ✓ lambda/orchestrator/cascade.test.mjs > verdict gate (TEAM-4246 D1) > enforce — a non-PASS verdict holds the successor > never re-blocks a successor that already finished
+ ✓ lambda/orchestrator/cascade.test.mjs > verdict gate (TEAM-4246 D1) > enforce — a non-PASS verdict holds the successor > a LIVE successor keeps its status — the edge is the point
+ ✓ lambda/orchestrator/cascade.test.mjs > verdict gate (TEAM-4246 D1) > enforce — a non-PASS verdict holds the successor > a held successor is not a stale-GSI victim: no re-fetch, no sleep
+ ✓ lambda/orchestrator/cascade.test.mjs > verdict gate (TEAM-4246 D1) > enforce — a non-PASS verdict holds the successor > counts the rounds already on the board so a re-hold reads as the next one
+ ✓ lambda/orchestrator/cascade.test.mjs > verdict gate (TEAM-4246 D1) > what does NOT hold > a PASS verdict cascades and publishes nothing
+ ✓ lambda/orchestrator/cascade.test.mjs > verdict gate (TEAM-4246 D1) > what does NOT hold > no verdict at all cascades and publishes nothing
+ ✓ lambda/orchestrator/cascade.test.mjs > verdict gate (TEAM-4246 D1) > what does NOT hold > a non-gate persona cascades and publishes nothing
+ ✓ lambda/orchestrator/cascade.test.mjs > verdict gate (TEAM-4246 D1) > what does NOT hold > a resolver that returns nothing means 'nothing known'
+ ✓ lambda/orchestrator/cascade.test.mjs > verdict gate (TEAM-4246 D1) > what does NOT hold > FAIL holds
+ ✓ lambda/orchestrator/cascade.test.mjs > verdict gate (TEAM-4246 D1) > what does NOT hold > BLOCKED holds
+ ✓ lambda/orchestrator/cascade.test.mjs > verdict gate (TEAM-4246 D1) > what does NOT hold > CHANGES_NEEDED holds
+ ✓ lambda/orchestrator/live-reverify.test.mjs > normalizeLiveReverifyMode — STRICT allow-list (garbage → off) > undefined → off
+ ✓ lambda/orchestrator/live-reverify.test.mjs > normalizeLiveReverifyMode — STRICT allow-list (garbage → off) > null → off
+ ✓ lambda/orchestrator/live-reverify.test.mjs > normalizeLiveReverifyMode — STRICT allow-list (garbage → off) >  → off
+ ✓ lambda/orchestrator/live-reverify.test.mjs > normalizeLiveReverifyMode — STRICT allow-list (garbage → off) >     → off
+ ✓ lambda/orchestrator/live-reverify.test.mjs > normalizeLiveReverifyMode — STRICT allow-list (garbage → off) > on → off
+ ✓ lambda/orchestrator/live-reverify.test.mjs > normalizeLiveReverifyMode — STRICT allow-list (garbage → off) > true → off
+ ✓ lambda/orchestrator/live-reverify.test.mjs > normalizeLiveReverifyMode — STRICT allow-list (garbage → off) > 1 → off
+ ✓ lambda/orchestrator/live-reverify.test.mjs > normalizeLiveReverifyMode — STRICT allow-list (garbage → off) > bogus → off
+ ✓ lambda/orchestrator/live-reverify.test.mjs > normalizeLiveReverifyMode — STRICT allow-list (garbage → off) > shadow → shadow
+ ✓ lambda/orchestrator/live-reverify.test.mjs > normalizeLiveReverifyMode — STRICT allow-list (garbage → off) > Shadow  → shadow
+ ✓ lambda/orchestrator/live-reverify.test.mjs > normalizeLiveReverifyMode — STRICT allow-list (garbage → off) > ENFORCE → enforce
+ ✓ lambda/orchestrator/live-reverify.test.mjs > normalizeLiveReverifyMode — STRICT allow-list (garbage → off) > enforce → enforce
+ ✓ lambda/orchestrator/live-reverify.test.mjs > normalizeLiveReverifyMode — STRICT allow-list (garbage → off) > off → off
+ ✓ lambda/orchestrator/live-reverify.test.mjs > normalizeLiveReverifyMode — STRICT allow-list (garbage → off) > garbage does NOT coalesce to shadow (unlike REWORK_LOOP_CAP)
+ ✓ lambda/orchestrator/live-reverify.test.mjs > hasLiveArtifact > explicit evidence_kind → { evidence_kind: 'live' }
+ ✓ lambda/orchestrator/live-reverify.test.mjs > hasLiveArtifact > evidence_kind cased/padded → { evidence_kind: ' LIVE ' }
+ ✓ lambda/orchestrator/live-reverify.test.mjs > hasLiveArtifact > evidence_kind static → { evidence_kind: 'static' }
+ ✓ lambda/orchestrator/live-reverify.test.mjs > hasLiveArtifact > a qa-evidence key mid-path → { artifacts: 'workflows/w/shared/qa-evidence/x.png' }
+ ✓ lambda/orchestrator/live-reverify.test.mjs > hasLiveArtifact > a qa-evidence key at the root → { artifacts: 'qa-evidence/x.png' }
+ ✓ lambda/orchestrator/live-reverify.test.mjs > hasLiveArtifact > evidence_keys instead of artifacts → { evidence_keys: 'workflows/w/shared/qa-evidence/x.md' }
+ ✓ lambda/orchestrator/live-reverify.test.mjs > hasLiveArtifact > a comma list where only one entry qualifies → { artifacts: 'notes.md, workflows/w/shared/qa-evidence/x.har' }
+ ✓ lambda/orchestrator/live-reverify.test.mjs > hasLiveArtifact > artifacts as a JSON array → { artifacts: [ 'notes.md', 'qa-evidence/y.log' ] }
+ ✓ lambda/orchestrator/live-reverify.test.mjs > hasLiveArtifact > artifacts as manifest objects → { artifacts: [ { s3Key: 'workflows/w/shared/qa-evidence/z.png' } ] }
+ ✓ lambda/orchestrator/live-reverify.test.mjs > hasLiveArtifact > prose only → { summary: 'it works now' }
+ ✓ lambda/orchestrator/live-reverify.test.mjs > hasLiveArtifact > a non-qa artifact → { artifacts: 'workflows/w/agents/dev/notes.md' }
+ ✓ lambda/orchestrator/live-reverify.test.mjs > hasLiveArtifact > a lookalike filename → { artifacts: 'workflows/w/shared/my-qa-evidence.png' }
+ ✓ lambda/orchestrator/live-reverify.test.mjs > hasLiveArtifact > missing record → null
+ ✓ lambda/orchestrator/live-reverify.test.mjs > hasLiveArtifact > a string instead of a record → live
+ ✓ lambda/orchestrator/live-reverify.test.mjs > not a live fix — zero calls on every dep > static evidence → not-live, nothing touched
+ ✓ lambda/orchestrator/live-reverify.test.mjs > not a live fix — zero calls on every dep > unit evidence → not-live, nothing touched
+ ✓ lambda/orchestrator/live-reverify.test.mjs > not a live fix — zero calls on every dep > no evidence_source → not-live, nothing touched
+ ✓ lambda/orchestrator/live-reverify.test.mjs > not a live fix — zero calls on every dep > no contract at all → not-live, nothing touched
+ ✓ lambda/orchestrator/live-reverify.test.mjs > not a live fix — zero calls on every dep > a missing workflow id or ticket id is also inert
+ ✓ lambda/orchestrator/live-reverify.test.mjs > enforce — a live fix WITH live evidence gets exactly one re-verify ticket > creates the ticket with the exact params, then records the marker
+ ✓ lambda/orchestrator/live-reverify.test.mjs > enforce — a live fix WITH live evidence gets exactly one re-verify ticket > the description carries the invariant + repro as an inert claim, never a command to paste
+ ✓ lambda/orchestrator/live-reverify.test.mjs > enforce — a live fix WITH live evidence gets exactly one re-verify ticket > the re-verify ticket is NOT a new rework round (isReworkFix === false)
+ ✓ lambda/orchestrator/live-reverify.test.mjs > enforce — originQa comes from the fix's own lineage > a QA-filed fix → qaTicketId { kind: 'qa_fix', qaTicketId: 'TEAM-4064' }
+ ✓ lambda/orchestrator/live-reverify.test.mjs > enforce — originQa comes from the fix's own lineage > a codex_fix (codexTicketId) → qaTicketId { kind: 'codex_fix', codexTicketId: 'TEAM-4300' }
+ ✓ lambda/orchestrator/live-reverify.test.mjs > enforce — originQa comes from the fix's own lineage > a ship_fix (shipTicketId) → qaTicketId { kind: 'ship_fix', shipTicketId: 'TEAM-4066' }
+ ✓ lambda/orchestrator/live-reverify.test.mjs > enforce — originQa comes from the fix's own lineage > a review_fix (gateTicketId) → qaTicketId { kind: 'review_fix', gateTicketId: 'TEAM-4063' }
+ ✓ lambda/orchestrator/live-reverify.test.mjs > enforce — originQa comes from the fix's own lineage > a ci_fix (ciTicketId) → qaTicketId { kind: 'ci_fix', ciTicketId: 'TEAM-4065' }
+ ✓ lambda/orchestrator/live-reverify.test.mjs > enforce — originQa comes from the fix's own lineage > falls back to the fix's own id when the lineage carries no origin
+ ✓ lambda/orchestrator/live-reverify.test.mjs > enforce — blocking the run's OPEN ship tickets > blocks an open ship-phase sibling
+ ✓ lambda/orchestrator/live-reverify.test.mjs > enforce — blocking the run's OPEN ship tickets > passes preserveStatusIf for a LIVE (in_progress) ship ticket
+ ✓ lambda/orchestrator/live-reverify.test.mjs > enforce — blocking the run's OPEN ship tickets > passes the SAME option for a ready ship ticket — the decision is not made here
+ ✓ lambda/orchestrator/live-reverify.test.mjs > enforce — blocking the run's OPEN ship tickets > an in_review human gate on a ship phase is blocked, not parked
+ ✓ lambda/orchestrator/live-reverify.test.mjs > enforce — blocking the run's OPEN ship tickets > does not reopen a done ship ticket
+ ✓ lambda/orchestrator/live-reverify.test.mjs > enforce — blocking the run's OPEN ship tickets > does not reopen a cancelled ship ticket
+ ✓ lambda/orchestrator/live-reverify.test.mjs > enforce — blocking the run's OPEN ship tickets > does not reopen a DONE ship ticket
+ ✓ lambda/orchestrator/live-reverify.test.mjs > enforce — blocking the run's OPEN ship tickets > blocks EVERY open ship ticket (Ship + CD are two)
+ ✓ lambda/orchestrator/live-reverify.test.mjs > enforce — blocking the run's OPEN ship tickets > non-ship siblings and human gates are never blocked
+ ✓ lambda/orchestrator/live-reverify.test.mjs > enforce — the board after a live fix blocks the ship tickets (TEAM-4130 F1) > a release manager mid-run keeps in_progress and gains the edge
+ ✓ lambda/orchestrator/live-reverify.test.mjs > enforce — the board after a live fix blocks the ship tickets (TEAM-4130 F1) > a ready ship ticket IS parked to blocked (cascadeUnblock re-readies it)
+ ✓ lambda/orchestrator/live-reverify.test.mjs > enforce — the board after a live fix blocks the ship tickets (TEAM-4130 F1) > a mixed ship phase: the live one is preserved, the queued one is parked
+ ✓ lambda/orchestrator/live-reverify.test.mjs > enforce — idempotent per (fix, head sha) > a second Done at the SAME sha files nothing (in-memory marker)
+ ✓ lambda/orchestrator/live-reverify.test.mjs > enforce — idempotent per (fix, head sha) > an existing sibling with the same rearmOf+headSha is found even when the marker write was lost
+ ✓ lambda/orchestrator/live-reverify.test.mjs > enforce — idempotent per (fix, head sha) > a sibling re-armed off a DIFFERENT head does not suppress this one
+ ✓ lambda/orchestrator/live-reverify.test.mjs > enforce — idempotent per (fix, head sha) > a NEW head is a new claim → a fresh re-verify ticket
+ ✓ lambda/orchestrator/live-reverify.test.mjs > enforce — the (fix, sha7) slot is CAS-claimed before create_ticket (TEAM-4130 F2) > two concurrent Dones for the same fix file exactly ONE re-verify ticket
+ ✓ lambda/orchestrator/live-reverify.test.mjs > enforce — the (fix, sha7) slot is CAS-claimed before create_ticket (TEAM-4130 F2) > a redelivery after the winner persisted returns the winner's ticket, not a new one
+ ✓ lambda/orchestrator/live-reverify.test.mjs > enforce — the (fix, sha7) slot is CAS-claimed before create_ticket (TEAM-4130 F2) > a re-Done at a NEW head takes the slot from the previous head (documented behaviour)
+ ✓ lambda/orchestrator/live-reverify.test.mjs > enforce — the (fix, sha7) slot is CAS-claimed before create_ticket (TEAM-4130 F2) > a failed create_ticket RELEASES the slot, so the next Done can file it
+ ✓ lambda/orchestrator/live-reverify.test.mjs > enforce — the (fix, sha7) slot is CAS-claimed before create_ticket (TEAM-4130 F2) > 'taken' with no sibling on the board yet creates nothing and blocks nothing
+ ✓ lambda/orchestrator/live-reverify.test.mjs > enforce — the (fix, sha7) slot is CAS-claimed before create_ticket (TEAM-4130 F2) > a PENDING claim in memory no longer short-circuits (sha alone is not evidence)
+ ✓ lambda/orchestrator/live-reverify.test.mjs > enforce — the (fix, sha7) slot is CAS-claimed before create_ticket (TEAM-4130 F2) > a store without claimReverifySlot degrades to the pre-F2 behaviour
+ ✓ lambda/orchestrator/live-reverify.test.mjs > enforce — the (fix, sha7) slot is CAS-claimed before create_ticket (TEAM-4130 F2) > an untracked task entry fails OPEN: the CAS is skipped, the ticket is still filed
+ ✓ lambda/orchestrator/live-reverify.test.mjs > enforce — the (fix, sha7) slot is CAS-claimed before create_ticket (TEAM-4130 F2) > a claim that finds a pre-F2 ticket links it instead of filing a second one
+ ✓ lambda/orchestrator/live-reverify.test.mjs > enforce — the (fix, sha7) slot is CAS-claimed before create_ticket (TEAM-4130 F2) > a claim failure (ddb down) degrades to the best-effort path, never to silence
+ ✓ lambda/orchestrator/live-reverify.test.mjs > enforce — the (fix, sha7) slot is CAS-claimed before create_ticket (TEAM-4130 F2) > board-level: the winner's re-verify blocks the run's open ship tickets, the loser touches nothing
+ ✓ lambda/orchestrator/live-reverify.test.mjs > enforce — where the head sha comes from > prefers the tracked task's commitSha
+ ✓ lambda/orchestrator/live-reverify.test.mjs > enforce — where the head sha comes from > falls back to the completion record's commit_sha when the task has none
+ ✓ lambda/orchestrator/live-reverify.test.mjs > enforce — where the head sha comes from > no sha anywhere → no-sha, a warning, and no ticket
+ ✓ lambda/orchestrator/live-reverify.test.mjs > enforce — (2) the unverified mark, independent of (1) > a prose-only completion record marks the fix AND still files the re-verify ticket
+ ✓ lambda/orchestrator/live-reverify.test.mjs > enforce — (2) the unverified mark, independent of (1) > a missing completion record is unverified too (the least-verified case)
+ ✓ lambda/orchestrator/live-reverify.test.mjs > enforce — (2) the unverified mark, independent of (1) > marks even when there is no sha to pin a re-verification to → unverified-only
+ ✓ lambda/orchestrator/live-reverify.test.mjs > enforce — (2) the unverified mark, independent of (1) > evidence_kind:'live' alone is enough — no mark
+ ✓ lambda/orchestrator/live-reverify.test.mjs > enforce — (2) the unverified mark, independent of (1) > a qa-evidence/ key in evidence_keys is enough — no mark
+ ✓ lambda/orchestrator/live-reverify.test.mjs > enforce — (2) the unverified mark, independent of (1) > the published repro is inert (one line, no backticks)
+ ✓ lambda/orchestrator/live-reverify.test.mjs > shadow — observe only > publishes fix.reverify_planned and writes NOTHING
+ ✓ lambda/orchestrator/live-reverify.test.mjs > shadow — observe only > wouldMarkUnverified:false when the record does carry live evidence
+ ✓ lambda/orchestrator/live-reverify.test.mjs > shadow — observe only > wouldCreate:false when there is no head sha to pin to
+ ✓ lambda/orchestrator/live-reverify.test.mjs > shadow — observe only > wouldCreate:false when this head already has a re-verify ticket
+ ✓ lambda/orchestrator/live-reverify.test.mjs > shadow — observe only > a non-live fix is still inert in shadow
+ ✓ lambda/orchestrator/live-reverify.test.mjs > never throws — a broken dep narrows the action, it never fails the done cascade > create_ticket throwing leaves no reverify marker and no crash
+ ✓ lambda/orchestrator/live-reverify.test.mjs > never throws — a broken dep narrows the action, it never fails the done cascade > create_ticket returning no key is the same as failing
+ ✓ lambda/orchestrator/live-reverify.test.mjs > never throws — a broken dep narrows the action, it never fails the done cascade > a failed unverified mark still lets the re-verify ticket be filed
+ ✓ lambda/orchestrator/live-reverify.test.mjs > never throws — a broken dep narrows the action, it never fails the done cascade > a failed sibling read degrades to 'create it' rather than skipping
+ ✓ lambda/orchestrator/live-reverify.test.mjs > never throws — a broken dep narrows the action, it never fails the done cascade > a failed addBlockers still records the created ticket
+ ✓ lambda/orchestrator/live-reverify.test.mjs > never throws — a broken dep narrows the action, it never fails the done cascade > every dep missing entirely → still resolves
+ ✓ lambda/orchestrator/live-reverify.test.mjs > mode off (the default) — the module is inert even if it is constructed > off does not create, mark, or publish
+ ✓ lambda/orchestrator/live-reverify.test.mjs > TEAM-4156 — the re-verify ticket's id is read under BOTH providers > DYNAMODB { key } — the shape this suite has always used
+ ✓ lambda/orchestrator/live-reverify.test.mjs > TEAM-4156 — the re-verify ticket's id is read under BOTH providers > JIRA fresh create { ticketId, status } — the shape that silently no-op'd in prod
+ ✓ lambda/orchestrator/live-reverify.test.mjs > TEAM-4156 — the re-verify ticket's id is read under BOTH providers > JIRA summary-dedupe hit { ticketId, deduplicated } — the existing ticket is the one to block on
+ ✓ lambda/orchestrator/live-reverify.test.mjs > TEAM-4156 — the re-verify ticket's id is read under BOTH providers > the nested dynamodb shapes are read too ({ ticket: { key } } / { ticket: { ticketId } })
+ ✓ lambda/orchestrator/live-reverify.test.mjs > TEAM-4156 — the re-verify ticket's id is read under BOTH providers > a bare { error } that RESOLVES is not a ticket — defence in depth behind the seam's throw
+ ✓ lambda/orchestrator/live-reverify.test.mjs > TEAM-4156 — the re-verify ticket's id is read under BOTH providers > a REJECTED create (the seam's throw) hands the slot back the same way
+ ✓ lambda/orchestrator/live-reverify.test.mjs > TEAM-4156 — the re-verify ticket's id is read under BOTH providers > a non-string id is garbage, not an id — it must never reach a blocker edge
+ ✓ lambda/orchestrator/live-reverify.test.mjs > reverify({ kind: 'gate' }) — a gate persona's own re-verification > files ONE ticket for the gate persona itself, in its own fix lineage
+ ✓ lambda/orchestrator/live-reverify.test.mjs > reverify({ kind: 'gate' }) — a gate persona's own re-verification > qa_verifier → kind agentcore_hub_qa_verifier on qa_fix
+ ✓ lambda/orchestrator/live-reverify.test.mjs > reverify({ kind: 'gate' }) — a gate persona's own re-verification > ci_agent → kind agentcore_hub_ci_agent on ci_fix
+ ✓ lambda/orchestrator/live-reverify.test.mjs > reverify({ kind: 'gate' }) — a gate persona's own re-verification > release_manager → kind agentcore_hub_release_manager on ship_fix
+ ✓ lambda/orchestrator/live-reverify.test.mjs > reverify({ kind: 'gate' }) — a gate persona's own re-verification > code_reviewer → kind agentcore_hub_code_reviewer on review_fix
+ ✓ lambda/orchestrator/live-reverify.test.mjs > reverify({ kind: 'gate' }) — a gate persona's own re-verification > is NOT gated on LIVE_REVERIFY — the cascade's VERDICT_GATE drives it
+ ✓ lambda/orchestrator/live-reverify.test.mjs > reverify({ kind: 'gate' }) — a gate persona's own re-verification > leaves every successor edge to the cascade — zero addBlockers calls
+ ✓ lambda/orchestrator/live-reverify.test.mjs > reverify({ kind: 'gate' }) — a gate persona's own re-verification > claims a NAMESPACED slot so it can never be confused with a live re-verify
+ ✓ lambda/orchestrator/live-reverify.test.mjs > reverify({ kind: 'gate' }) — a gate persona's own re-verification > a LIVE claim already on that entry does not satisfy the gate
+ ✓ lambda/orchestrator/live-reverify.test.mjs > reverify({ kind: 'gate' }) — a gate persona's own re-verification > is idempotent per (gate ticket, head): a redelivered decision files nothing
+ ✓ lambda/orchestrator/live-reverify.test.mjs > reverify({ kind: 'gate' }) — a gate persona's own re-verification > a new head IS a new claim — the gate was re-stated somewhere else
+ ✓ lambda/orchestrator/live-reverify.test.mjs > reverify({ kind: 'gate' }) — a gate persona's own re-verification > the CAS loser files nothing (concurrent cascade + stream twin)
+ ✓ lambda/orchestrator/live-reverify.test.mjs > reverify({ kind: 'gate' }) — a gate persona's own re-verification > an existing gate re-verify on the board is adopted, not duplicated
+ ✓ lambda/orchestrator/live-reverify.test.mjs > reverify({ kind: 'gate' }) — a gate persona's own re-verification > hands the slot back when create_ticket fails, so the next decision retries
+ ✓ lambda/orchestrator/live-reverify.test.mjs > reverify({ kind: 'gate' }) — a gate persona's own re-verification > publishes fix.reverify_created with the gate's own shape
+ ✓ lambda/orchestrator/live-reverify.test.mjs > reverify({ kind: 'gate' }) — a gate persona's own re-verification > does not count as a rework round (the cap must not fire on a re-check)
+ ✓ lambda/orchestrator/live-reverify.test.mjs > reverify({ kind: 'gate' }) — a gate persona's own re-verification > renders the gate title inert — it is agent-authored text
+ ✓ lambda/orchestrator/live-reverify.test.mjs > reverify({ kind: 'gate' }) — a gate persona's own re-verification > de-duplicates and trims the fix ids it is told to block on
+ ✓ lambda/orchestrator/live-reverify.test.mjs > reverify({ kind: 'gate' }) — a gate persona's own re-verification > says so in the body when NOTHING was filed for the verdict
+ ✓ lambda/orchestrator/live-reverify.test.mjs > reverify({ kind: 'gate' }) — a gate persona's own re-verification > round 1 when the caller has no round to report
+ ✓ lambda/orchestrator/live-reverify.test.mjs > reverify({ kind: 'gate' }) — a gate persona's own re-verification > no head sha → { headSha: '' }, and nothing is written
+ ✓ lambda/orchestrator/live-reverify.test.mjs > reverify({ kind: 'gate' }) — a gate persona's own re-verification > a non-string head → { headSha: null }, and nothing is written
+ ✓ lambda/orchestrator/live-reverify.test.mjs > reverify({ kind: 'gate' }) — a gate persona's own re-verification > an unknown owner → { owner: 'agentcore_hub_bug_fixer' }, and nothing is written
+ ✓ lambda/orchestrator/live-reverify.test.mjs > reverify({ kind: 'gate' }) — a gate persona's own re-verification > no owner → { owner: undefined }, and nothing is written
+ ✓ lambda/orchestrator/live-reverify.test.mjs > reverify({ kind: 'gate' }) — a gate persona's own re-verification > no gate ticket → { gateTicket: {} }, and nothing is written
+ ✓ lambda/orchestrator/live-reverify.test.mjs > reverify({ kind: 'gate' }) — a gate persona's own re-verification > no workflow → { workflow: undefined }, and nothing is written
+ ✓ lambda/orchestrator/live-reverify.test.mjs > reverify({ kind: 'gate' }) — a gate persona's own re-verification > a kind this factory does not own → { kind: 'ship' }, and nothing is written
+ ✓ lambda/orchestrator/live-reverify.test.mjs > reverify({ kind: 'gate' }) — a gate persona's own re-verification > never throws — the cascade's hold must not depend on this succeeding
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > verdict-contract — the real fixture summaries > dowtdh TEAM-4180 → CHANGES_NEEDED (inferred)
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > verdict-contract — the real fixture summaries > dowtdh TEAM-4181 → FAIL (inferred)
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > verdict-contract — the real fixture summaries > dowtdh TEAM-4182 → PASS (inferred)
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > verdict-contract — the real fixture summaries > dowtdh TEAM-4179 → null (null)
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > verdict-contract — the real fixture summaries > dowtdh TEAM-4183 → null (null)
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > verdict-contract — the real fixture summaries > f50ucz TEAM-4123 → CHANGES_NEEDED (inferred)
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > verdict-contract — the real fixture summaries > f50ucz TEAM-4124 → PASS (inferred)
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > verdict-contract — the real fixture summaries > f50ucz TEAM-4125 → PASS (inferred)
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > verdict-contract — the real fixture summaries > f50ucz TEAM-4126 → PASS (inferred)
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > verdict-contract — the real fixture summaries > f50ucz TEAM-4157 → PASS (inferred)
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > verdict-contract — the real fixture summaries > f50ucz TEAM-4128 → null (none)
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > verdict-contract — the real fixture summaries > f50ucz TEAM-4119 → null (null)
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > verdict-contract — the real fixture summaries > covers every gate-persona completion in both dossiers — no silent gaps
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > verdict-contract — the real fixture summaries > no gate completion resolves to a verdict outside the enum
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > verdict-contract — null is not PASS > an unreadable summary from a gate persona is `none`, never PASS
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > verdict-contract — null is not PASS > `none` does not suppress the cascade under enforce
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > verdict-contract — null is not PASS > prose about someone else's PASS is not this ticket's verdict
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > verdict-contract — declared beats inferred > a declared verdict wins over the prose ladder, even in contradiction
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > verdict-contract — declared beats inferred > falls back to the ladder when the declared value is absent or unusable
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > verdict-contract — declared beats inferred > reports the matched substring so an operator can see why
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > verdict-contract — declared beats inferred > non-gate personas get null/null even with a declared verdict
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > verdict-contract — all three CHANGES_NEEDED spellings > "CHANGES NEEDED" → CHANGES_NEEDED
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > verdict-contract — all three CHANGES_NEEDED spellings > "CHANGES-NEEDED" → CHANGES_NEEDED
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > verdict-contract — all three CHANGES_NEEDED spellings > "CHANGES_NEEDED" → CHANGES_NEEDED
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > verdict-contract — all three CHANGES_NEEDED spellings > "changes needed" → CHANGES_NEEDED
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > verdict-contract — all three CHANGES_NEEDED spellings > "  Changes-Needed  " → CHANGES_NEEDED
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > verdict-contract — all three CHANGES_NEEDED spellings > "changes   needed" → CHANGES_NEEDED
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > verdict-contract — all three CHANGES_NEEDED spellings > the ladder reads "VERDICT: CHANGES NEEDED (round 1)."
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > verdict-contract — all three CHANGES_NEEDED spellings > the ladder reads "Verdict: changes-needed"
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > verdict-contract — all three CHANGES_NEEDED spellings > the ladder reads "**VERDICT: CHANGES_NEEDED** — 8 blocking findings"
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > verdict-contract — all three CHANGES_NEEDED spellings > maps PASS-with-known-findings to PASS (review-cap's own spelling)
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > verdict-contract — all three CHANGES_NEEDED spellings > accepts FAIL and BLOCKED, and rejects everything else
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > verdict-contract — all three CHANGES_NEEDED spellings > does not read a bare verdict word out of surrounding prose
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > verdict-contract — a SHA is never scraped from prose > reads the FIELD, not the five SHAs in TEAM-4180's summary
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > verdict-contract — a SHA is never scraped from prose > ignores a hex-looking token that is not a commit at all
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > verdict-contract — a SHA is never scraped from prose > returns null when no structured field carries a head, however rich the prose
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > verdict-contract — a SHA is never scraped from prose > precedence: tested_head → ci_head_sha → commit_sha, snake or camel
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > verdict-contract — a SHA is never scraped from prose > a non-SHA in a SHA field is dropped, not passed through
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > verdict-contract — normalizeVerdictMode > unset or blank is shadow
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > verdict-contract — normalizeVerdictMode > the three modes round-trip, case- and space-insensitively
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > verdict-contract — normalizeVerdictMode > anything unrecognized is off
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > verdict-contract — evaluateGate > off decides nothing at all
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > verdict-contract — evaluateGate > shadow computes the decision but does not act on it
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > verdict-contract — evaluateGate > enforce suppresses and holds on the fix ticket
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > verdict-contract — evaluateGate > a non-PASS with no fix ticket still suppresses, and asks for a gate re-verify
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > verdict-contract — evaluateGate > trims and de-duplicates blockOn
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > verdict-contract — evaluateGate > PASS and non-gate personas never suppress
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > verdict-contract — evaluateGate > every gate persona in the set is gated, and FAIL/BLOCKED gate too
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > verdict-contract — evaluateGate > gates exactly the four personas — not security_reviewer, not the devs
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > verdict-contract — enrichCompleteDetail > always emits all four keys, with off-defaults, when nothing is known
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > verdict-contract — enrichCompleteDetail > defaults the two collection-shaped keys to the empty value of their OWN type
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > verdict-contract — enrichCompleteDetail > never carries wouldSuppress — that belongs to orchestrator.verdict_observed alone
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > verdict-contract — enrichCompleteDetail > carries a resolved verdict through, normalized
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > verdict-contract — enrichCompleteDetail > normalizes hyphen/space spellings and uppercase SHAs on the way onto the event
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > verdict-contract — enrichCompleteDetail > leaves the base detail's own keys untouched
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > verdict-contract — spawnedTickets sanitisation > uses the SAME ticket-key regex as fix-contract.mjs:140
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > verdict-contract — spawnedTickets sanitisation > keeps only ticket keys, trimmed and de-duplicated, order preserved
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > verdict-contract — spawnedTickets sanitisation > never invents ids from prose or from a non-array
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > verdict-contract — spawnedTickets sanitisation > accepts sanitizeTicketIds output as its own input unchanged (idempotent)
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > selectOpenEpicFixes — what a non-PASS verdict waits for (FR-D1.5/D1.6) > includes an open fix filed by SOMEONE ELSE — the dowtdh case
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > selectOpenEpicFixes — what a non-PASS verdict waits for (FR-D1.5/D1.6) > includes every open fix kind, in board order, without duplicates
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > selectOpenEpicFixes — what a non-PASS verdict waits for (FR-D1.5/D1.6) > excludes done and cancelled fixes — nothing waits on a landed fix
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > selectOpenEpicFixes — what a non-PASS verdict waits for (FR-D1.5/D1.6) > excludes advisory fixes — by definition the run does not wait on them
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > selectOpenEpicFixes — what a non-PASS verdict waits for (FR-D1.5/D1.6) > excludes re-verify tickets, or round N would block round N+1 forever
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > selectOpenEpicFixes — what a non-PASS verdict waits for (FR-D1.5/D1.6) > excludes the gate ticket itself, even when it carries a fix kind
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > selectOpenEpicFixes — what a non-PASS verdict waits for (FR-D1.5/D1.6) > excludes non-fix tickets and degrades to [] on junk input
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > verdict-contract — the agent.complete twins stay identical (TEAM-4246 D1) > produce byte-identical agent.complete details for the same input
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > verdict-contract — the agent.complete twins stay identical (TEAM-4246 D1) > both agent.complete publish sites in index.mjs route through enrichCompleteDetail
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > verdict-contract — the cost-report mirror (TEAM-4246 D1 FR-D1.11) > mirrors GATE_PERSONAS exactly — same ids, no extras, no omissions
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > verdict-contract — the cost-report mirror (TEAM-4246 D1 FR-D1.11) > mirrors the VERDICTS vocabulary exactly, in the same order
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > verdict-contract — the cost-report mirror (TEAM-4246 D1 FR-D1.11) > its rework personas and verdicts are a subset of the contract's
+ ✓ lambda/orchestrator/verdict-contract.test.mjs > verdict-contract — the cost-report mirror (TEAM-4246 D1 FR-D1.11) > reads the verdict off the event and never re-derives one
+
+ Test Files  3 passed (3)
+      Tests  276 passed (276)
+   Start at  05:49:58
+   Duration  4.54s (transform 228ms, setup 0ms, collect 685ms, tests 246ms, environment 1ms, prepare 376ms)
+
+VITEST_EXIT=0

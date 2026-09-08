@@ -1,0 +1,360 @@
+=== ITEM 11 — nothing-to-remove is TERMINAL and EXCLUDED from baselines (compute_metrics.py + cost-report + performance.ts) ===
+
+--- (1a) pytest: the Python side ---
+$ /tmp/qa-venv/bin/python -m pytest test_metrics.py -v -k 'no_op or nothing or baseline_analyses or terminal_phase or shared_lists'
+============================= test session starts ==============================
+platform linux -- Python 3.13.15, pytest-9.1.1, pluggy-1.6.0 -- /tmp/qa-venv/bin/python
+cachedir: .pytest_cache
+rootdir: /mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub/deploy/workflow-manager/toolkit
+plugins: asyncio-1.4.0, anyio-4.15.1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collecting ... collected 64 items / 60 deselected / 4 selected
+
+test_metrics.py::NoOpRunOutcomes::test_a_terminal_phase_change_ends_the_run_instead_of_billing_the_tail PASSED [ 25%]
+test_metrics.py::NoOpRunOutcomes::test_baseline_analyses_keeps_everything_it_cannot_disqualify PASSED [ 50%]
+test_metrics.py::NoOpRunOutcomes::test_nothing_to_remove_is_terminal_and_excluded_from_baselines PASSED [ 75%]
+test_metrics.py::NoOpRunOutcomes::test_the_shared_lists_are_what_the_toolkit_thinks_they_are PASSED [100%]
+
+======================= 4 passed, 60 deselected in 0.14s =======================
+PYTEST_EXIT=0
+
+--- (1b) node --test: the cost-report side (already captured in item-06.log: 21/21) ---
+✔ the shared fixture yields the same fix tickets as the Python toolkit (4.408416ms)
+✔ the intake-planned 'Fix:' ticket is excluded, the later one is not (1.246426ms)
+✔ no intake signal at all → nothing is excluded (overcount by one beats dropping a fix) (0.877481ms)
+✔ intake completion falls back to the first task completing when agentId is gone (0.551725ms)
+✔ ticket.created events alone are enough (a run whose workflow row was trimmed) (0.545365ms)
+✔ computed task rows are a title source too (0.269057ms)
+✔ spawnedBy.kind outranks the title — provenance beats prose (0.224221ms)
+✔ every title shape the fleet actually mints is recognized (0.607874ms)
+✔ the regression this replaced: the real titles never started with 'Fix:' (0.562206ms)
+✔ ids are deduped across the three sources and ordered by creation (0.760536ms)
+✔ enriched events: dowtdh's three gate verdicts → 2 reworks, 3 rounds, no first-pass yield (0.708445ms)
+✔ enriched events: every gate PASSing first look yields 1 (0.317755ms)
+✔ the FIRST verdict decides the yield — a re-verify PASS does not retroactively earn it (0.29455ms)
+✔ only gate personas and only recognized verdicts count (0.453617ms)
+✔ legacy events without a verdict: the reviewGateHistory numbers, unchanged (0.333516ms)
+✔ gateReworks stays review-request-derived even when verdicts are present (0.688502ms)
+✔ a nothing-to-remove summary is not baseline-eligible; a complete one is (0.371593ms)
+✔ a $5 no-op sweep in the index does not move the next real sweep's medians (2.767201ms)
+✔ without the exclusion the same no-op WOULD have moved the median (the test is not vacuous) (0.824339ms)
+✔ the no-op run's OWN card raises nothing: status ok, noOp flagged, no anomalies, no alert (0.802554ms)
+✔ the SAME numbers under a complete outcome DO alert (the gate is the outcome, not the size) (0.519006ms)
+✔ cache-read tokens are billed at the discounted input rate (1.859812ms)
+✔ cache-write is billed at the per-TTL surcharge multiple of the input rate (0.263044ms)
+✔ missing or unknown ttl falls back to the default write multiplier (0.268539ms)
+✔ tokens accumulate across rows and byModel tracks read/write (0.261165ms)
+✔ back-compat: cachedInputTokens mirrors cacheReadInputTokens (0.424287ms)
+✔ plain rows (no cache fields) are unchanged by cache logic (0.277428ms)
+✔ persona chat-span filter matches the exact strands >=1.53 span name (0.392535ms)
+✔ persona chat-span filter still matches the legacy 'chat <model>' shape (0.201621ms)
+✔ persona chat-span filter still ORs in the api_request event-name branch (0.474348ms)
+NODE_TEST_EXIT=0
+
+--- (1c) vitest: the UI side (src/lib/workflow/performance.test.ts) ---
+--- vitest run --reporter=verbose: src/lib/workflow/performance.test.ts ---
+[33mThe CJS build of Vite's Node API is deprecated. See https://vite.dev/guide/troubleshooting.html#vite-cjs-node-api-deprecated for more details.[39m
+
+ RUN  v2.1.9 /mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub
+
+ ✓ src/lib/workflow/performance.test.ts > robust stats > median handles odd/even
+ ✓ src/lib/workflow/performance.test.ts > robust stats > mad is zero for a flat series
+ ✓ src/lib/workflow/performance.test.ts > robust stats > bandFor floors sigma and classifies z
+ ✓ src/lib/workflow/performance.test.ts > robust stats > bandFor flips the sign for lower-is-worse KPIs
+ ✓ src/lib/workflow/performance.test.ts > robust stats > bandFor needs the minimum baseline
+ ✓ src/lib/workflow/performance.test.ts > buildFleetView > splits current vs prior windows and flags a cost spike
+ ✓ src/lib/workflow/performance.test.ts > buildFleetView > aggregates agents and engines over the current window
+ ✓ src/lib/workflow/performance.test.ts > buildFleetView > reports insufficient when the baseline is thin
+ ✓ src/lib/workflow/performance.test.ts > cache-aware cost metrics > bands cost.personaCacheHitRate as lower-is-worse through buildFleetView
+ ✓ src/lib/workflow/performance.test.ts > cache-aware cost metrics > does not flag a HIGHER persona cache hit rate
+ ✓ src/lib/workflow/performance.test.ts > cache-aware cost metrics > accumulates cacheRead / cacheWrite across runs in the window
+ ✓ src/lib/workflow/performance.test.ts > cache-aware cost metrics > back-compat: cards without cache fields pass through with no NaN
+ ✓ src/lib/workflow/performance.test.ts > formatKpi > formats units
+ ✓ src/lib/workflow/performance.test.ts > no-op runs and the baseline (TEAM-4247 D2) > isBaselineCard rejects a no-op card and a $0 card, accepts a real one
+ ✓ src/lib/workflow/performance.test.ts > no-op runs and the baseline (TEAM-4247 D2) > a $4 no-op sweep in the window does not move the baseline median or the band
+ ✓ src/lib/workflow/performance.test.ts > no-op runs and the baseline (TEAM-4247 D2) > the SAME cards under a complete outcome wreck the band (not a vacuous test)
+ ✓ src/lib/workflow/performance.test.ts > no-op runs and the baseline (TEAM-4247 D2) > a no-op run in the CURRENT window is still listed and still counted in the totals
+
+ Test Files  1 passed (1)
+      Tests  17 passed (17)
+   Start at  05:34:20
+   Duration  1.89s (transform 133ms, setup 0ms, collect 141ms, tests 29ms, environment 0ms, prepare 116ms)
+
+VITEST_EXIT=0
+
+--- (2) assertion audit ---
+
+(2a) PYTHON — terminal AND excluded, test_metrics.py:1106-1144
+    def test_nothing_to_remove_is_terminal_and_excluded_from_baselines(self):
+        real = compute_metrics(self.load())
+        noop = compute_metrics(self.load("nothing-to-remove"))
+
+        # TERMINAL: the run is bounded exactly as the real one is — same start, same
+        # end, same duration — because claimTerminalOutcome writes completedAt with
+        # the phase. A no-op close must not read as a run still in flight.
+        self.assertEqual(noop["runOutcome"], "nothing-to-remove")
+        self.assertEqual(real["runOutcome"], "complete")
+        self.assertEqual(noop["completedAt"], real["completedAt"])
+        self.assertEqual(noop["totalDurationMs"], real["totalDurationMs"])
+        self.assertGreater(noop["totalDurationMs"], 0)
+
+        # NOT A COMPARABLE: the flag the analysis and the trend both read.
+        self.assertTrue(noop["noOp"])
+        self.assertFalse(real["noOp"])
+
+        # EXCLUDED FROM BASELINES: this run's own five prior analyses are all real
+        # deliveries, so they all stay — the exclusion is about the runs being
+        # compared against, and it must not quietly shrink an honest sample.
+        self.assertEqual(len(self.load()["priorAnalyses"]), 5)
+        self.assertEqual(real["trendBaseline"]["priorRuns"], 5)
+        self.assertEqual(real["trendBaseline"]["excludedNoOp"], 0)
+
+        # Now the case D2 exists for: a repo swept on a cadence that keeps finding
+        # nothing. Two of the five priors closed nothing-to-remove, so the trend is
+        # cited over three — and says so, rather than reporting five.
+        d = self.load("nothing-to-remove")
+        for a in d["priorAnalyses"][:2]:
+            a["runOutcome"] = "nothing-to-remove"
+        m = compute_metrics(d)
+        self.assertEqual(m["trendBaseline"]["priorRuns"], 3)
+        self.assertEqual(m["trendBaseline"]["excludedNoOp"], 2)
+        self.assertNotIn(
+            d["priorAnalyses"][0]["workflowId"], m["trendBaseline"]["workflowIds"]
+        )
+        self.assertIn(d["priorAnalyses"][4]["workflowId"], m["trendBaseline"]["workflowIds"])
+
+    def test_baseline_analyses_keeps_everything_it_cannot_disqualify(self):
+
+(2b) PYTHON — the shared lists are non-empty and mean what the toolkit thinks, :1091-1104
+    def test_the_shared_lists_are_what_the_toolkit_thinks_they_are(self):
+        # One Python copy, imported by save_analysis (the write path) and
+        # compute_metrics (the numbers). Pinned here because everything below is
+        # vacuous if the no-op list is empty.
+        self.assertEqual(NO_OP_OUTCOMES, ("nothing-to-remove",))
+        self.assertTrue(NO_OP_OUTCOMES[0] in RUN_OUTCOMES)
+        self.assertTrue(is_terminal_phase("nothing-to-remove"))
+        self.assertTrue(is_no_op_outcome("nothing-to-remove"))
+        # A ship-blocked run DID the work and then failed to ship — still a comparable.
+        self.assertTrue(is_terminal_phase("deploy-blocked"))
+        self.assertFalse(is_no_op_outcome("deploy-blocked"))
+        # And a live run is neither.
+        self.assertFalse(is_terminal_phase("detection"))
+        self.assertFalse(is_no_op_outcome(None))
+
+(2c) PYTHON — baseline_analyses keeps what it cannot disqualify, :1145-1155
+        # An analysis written before runOutcome existed, or a malformed row, is not
+        # a no-op — dropping it would silently shrink the sample the verdict cites.
+        rows = [{"workflowId": "a"}, {"workflowId": "b", "runOutcome": "complete"},
+                {"workflowId": "c", "runOutcome": "nothing-to-remove"},
+                {"workflowId": "d", "runOutcome": "cancelled"}, None]
+        kept = baseline_analyses(rows)
+        self.assertEqual([r.get("workflowId") if isinstance(r, dict) else r for r in kept],
+                         ["a", "b", "d", None])
+        self.assertEqual(baseline_analyses(None), [])
+
+    def test_a_terminal_phase_change_ends_the_run_instead_of_billing_the_tail(self):
+
+(2d) ASKED: quote the computeBands filter — lambda/cost-report/index.mjs:541-554
+
+/**
+ * Baseline = same def's cards that completed within BASELINE_DAYS before this
+ * card (strictly earlier, never itself) — so recomputing in any order converges.
+ */
+export function computeBands(card, summaries) {
+  const completedAt = card.run?.completedAt || card.generatedAt;
+  const endMs = Date.parse(completedAt);
+  const startMs = endMs - BASELINE_DAYS * 86_400_000;
+  const baseline = summaries.filter((s) =>
+    s.workflowId !== card.workflowId &&
+    s.workflowDefId === card.workflowDefId &&
+    s.completedAt && Date.parse(s.completedAt) < endMs && Date.parse(s.completedAt) >= startMs &&
+    isBaselineEligible(s));
+
+  const kpis = {};
+  const anomalies = [];
+
+(2e) ASKED: quote the workflow.performance ALERT SKIP — index.mjs:172-178
+
+  // TEAM-4247 D2: the card and the CloudWatch datapoints are written for every
+  // terminal run, but a no-op run publishes no workflow.performance event — that
+  // event IS the anomaly alerting's input, and a zero-yield sweep has no honest
+  // z-score to alert on (see shouldAlert).
+  await Promise.all([publishMetrics(card), shouldAlert(card) ? putPerformanceEvent(card, cardKey) : Promise.resolve()]);
+  if (!shouldAlert(card)) console.log(`${LOG} ${workflowId} outcome ${card.run?.outcome} — no workflow.performance event (no-op run)`);
+
+  console.log(`${LOG} ${workflowId} → $${card.cost.totalUsd} ${card.bands.status} (${cardKey})`);
+     ...and the predicate it calls, :525-539:
+
+/**
+ * Should this card raise an anomaly (band status + the workflow.performance
+ * event the alerting reads)?
+ *
+ * A no-op run cannot produce an honest z-score: one task and a few cents against
+ * a baseline of full sweeps is an "alert" on every KPI at once, which is noise,
+ * not a finding. The card is still written in full — the numbers stay visible —
+ * but its top-level status is forced non-alerting and no event is published.
+ * KNOWN CONSEQUENCE: anything counting runs by `workflow.performance` rows
+ * under-counts no-op sweeps, by design.
+ */
+export function shouldAlert(card) {
+  return !isNoOpOutcome(card);
+}
+     ...and the band short-circuit that forces status ok + noOp:true, :567-580:
+    }
+  }
+  // TEAM-4247 D2: a no-op run's KPIs are still computed and shown (they are the
+  // honest numbers for that run), but it raises nothing: every KPI is low against
+  // a baseline of real runs, so the anomalies would all fire at once. `noOp: true`
+  // says WHY the status is ok, so a reader never mistakes it for "compared, fine".
+  if (!shouldAlert(card)) {
+    return {
+      baseline: { workflowDefId: card.workflowDefId, n: baseline.length, windowDays: BASELINE_DAYS, minSamples: BASELINE_MIN },
+      status: "ok",
+      noOp: true,
+      anomalies: [],
+      kpis,
+    };
+  }
+
+
+(2f) cost-report's own assertions — index.test.mjs:352-360 and :394-421
+test("a nothing-to-remove summary is not baseline-eligible; a complete one is", () => {
+  assert.equal(isBaselineEligible(REAL_SWEEPS[0]), true);
+  assert.equal(
+    isBaselineEligible(summaryOf("wf_noop", { cost: 5, tokens: 90_000, tasks: 1, wall: 300_000, outcome: "nothing-to-remove", at: new Date(T0 - DAY).toISOString() })),
+    false,
+  );
+  // The pre-existing zero-cost rule still applies (a card built before its spans landed).
+  assert.equal(isBaselineEligible(summaryOf("wf_zero", { cost: 0, tokens: 0, tasks: 3, wall: 10, at: new Date(T0).toISOString() })), false);
+});
+
+test("a $5 no-op sweep in the index does not move the next real sweep's medians", () => {
+  const noop = summaryOf("wf_noop", {
+    cost: 5, tokens: 90_000, tasks: 1, wall: 300_000, outcome: "nothing-to-remove",
+    at: new Date(T0 - 0.5 * DAY).toISOString(),
+  });
+test("the no-op run's OWN card raises nothing: status ok, noOp flagged, no anomalies, no alert", () => {
+  const noopCard = cardOf("wf_noop", {
+    cost: 5, tokens: 90_000, tasks: 1, wall: 300_000, outcome: "nothing-to-remove", at: new Date(T0).toISOString(),
+  });
+  const bands = computeBands(noopCard, REAL_SWEEPS);
+  assert.equal(bands.status, "ok");
+  assert.equal(bands.noOp, true);
+  assert.deepEqual(bands.anomalies, []);
+  // The numbers are still there — the card is honest, it just does not alert.
+  assert.equal(bands.kpis["cost.totalUsd"].value, 5);
+  assert.equal(bands.kpis["cost.personaCacheHitRate"].value, 0);
+  assert.equal(bands.baseline.n, REAL_SWEEPS.length);
+  // And the handler publishes no workflow.performance event for it.
+  assert.equal(shouldAlert(noopCard), false);
+  assert.equal(shouldAlert(cardOf("wf_real", { cost: 120, tokens: 1, tasks: 14, wall: 1, outcome: "complete", at: new Date(T0).toISOString() })), true);
+});
+
+test("the SAME numbers under a complete outcome DO alert (the gate is the outcome, not the size)", () => {
+  // Identical KPIs, only the outcome differs: a one-agent run's cold persona cache
+  // is 7 sigma below a baseline of full sweeps on a lower-is-worse KPI. That is a
+  // real finding on a run that claimed to ship, and noise on one that closed
+  // nothing-to-remove — which is exactly the distinction shouldAlert draws.
+  const tiny = cardOf("wf_tiny", {
+    cost: 5, tokens: 90_000, tasks: 1, wall: 300_000, outcome: "complete", at: new Date(T0).toISOString(),
+  });
+  const bands = computeBands(tiny, REAL_SWEEPS);
+  assert.equal(shouldAlert(tiny), true);
+  assert.equal(bands.noOp, undefined);
+
+(2g) ASKED: the SAME exclusion in src/lib/workflow/performance.ts — :246-262
+/** Did this card's run close on a no-op outcome (TEAM-4247 D2)? */
+export function isNoOpCard(c: Pick<CardSummary, "outcome">): boolean {
+  return (NO_OP_OUTCOMES as readonly string[]).includes(c?.outcome ?? "");
+}
+
+/**
+ * May this card be a BASELINE comparable? Same predicate as
+ * `isBaselineEligible` in lambda/cost-report/index.mjs, so the fleet view and a
+ * run's own card never disagree about what "anomalous" means.
+ *
+ * A no-op run did happen and is worth looking at, but it did no delivery work:
+ * one detection agent, a few cents, one task. As a comparable it drags every
+ * median down and then flags the next real run as the anomaly.
+ */
+export function isBaselineCard(c: CardSummary): boolean {
+  return isValidCard(c) && !isNoOpCard(c);
+}
+
+     ...asserted at performance.test.ts:213-221:
+
+  const noop = (over: Partial<CardSummary> = {}) =>
+    card({
+      completedAt: day(9), total: 4, workflowId: "noop", workflowDefId: "dead-code-sweep",
+      outcome: "nothing-to-remove", ...over,
+    });
+
+  it("isBaselineCard rejects a no-op card and a $0 card, accepts a real one", () => {
+    expect(isBaselineCard(cards[0])).toBe(true);
+    expect(isBaselineCard(noop())).toBe(false);
+    expect(isBaselineCard(card({ completedAt: day(9), total: 0 }))).toBe(false);
+    expect(isNoOpCard(noop())).toBe(true);
+    expect(isNoOpCard(cards[0])).toBe(false);
+    // Every other terminal outcome is still a comparable — this is not a
+    // "small runs don't count" rule, it is one named outcome.
+    expect(isNoOpCard(card({ completedAt: day(9), outcome: "deploy-blocked" }))).toBe(false);
+  });
+
+(2h) and the Python source of truth all three mirror — run_outcomes.py:26-36
+# TEAM-3747 D2 added the ship-blocked pair so a run closed as deploy-blocked /
+# static-ci-only is recorded HONESTLY instead of masquerading as "complete".
+# TEAM-4247 D2 adds "nothing-to-remove" on the same terms: a dead-code sweep that
+# verified its candidates and found none removable really did finish.
+RUN_OUTCOMES = {"complete", "cancelled", "error", "deploy-blocked", "static-ci-only", "nothing-to-remove"}
+
+# Terminal, but no delivery work happened: no branch, no PR, nothing for a
+# reviewer/QA/CI gate to act on. Such a run is worth READING (it is why the sweep
+# cost what it cost) and worthless as a COMPARABLE — one detection agent and a few
+# cents next to a full sweep drags every median down and then makes the next real
+# run look like the anomaly.
+#
+# NOT the same list as the ship-blocked outcomes: a deploy-blocked run did the
+# work and then failed to ship, so it stays in the baseline.
+NO_OP_OUTCOMES = ("nothing-to-remove",)
+
+--- (3) probe ---
+None added. The three predicates were already driven for real from a live orchestrator
+replay in item 8 (replay-c2uqki-sweep-noop.test.mjs:1029-1048 imports ../cost-report/index.mjs
+and feeds it the outcome read off the published workflow.nothing_to_remove event) and in
+item 10 (:1110-1126, the productive-sweep control). probes/item-06-performance-mirror.mjs
+already diffs BAND_KPIS against FLEET_KPIS. A fourth restatement would add nothing.
+
+--- (4) VERDICT: item 11 VERIFIED, on all three surfaces ---
+TERMINAL. compute_metrics reports runOutcome 'nothing-to-remove' with completedAt and
+totalDurationMs IDENTICAL to the real run's (:1113-1117) -- the assertion that makes
+"terminal" mean something, since the cheap failure here is a no-op close reading as a
+run still in flight. is_terminal_phase('nothing-to-remove') is true, and a phase_change
+into it is credited 0ms rather than the rest of the window (:1156-1180).
+
+EXCLUDED FROM BASELINES, in all three implementations, and the exclusion is the same
+predicate spelled three times:
+  python   run_outcomes.baseline_analyses (imported by compute_metrics + save_analysis)
+           -> trendBaseline.priorRuns 5->3 with excludedNoOp: 2 (:1131-1144)
+  lambda   isBaselineEligible = (cost.total ?? 0) > 0 && !isNoOpOutcome(summary),
+           called inside computeBands' baseline filter (index.mjs:553)
+  UI       isBaselineCard = isValidCard(c) && !isNoOpCard(c) (performance.ts:261),
+           whose doc comment names the lambda function as its parity partner
+
+ALERT SKIPPED at the publish site, not merely down-weighted: index.mjs:176 is
+`shouldAlert(card) ? putPerformanceEvent(card, cardKey) : Promise.resolve()`, so the
+events-table row is never written, while publishMetrics(card) still runs -- the
+CloudWatch datapoints and the card itself survive, only the alerting input drops.
+computeBands additionally returns status 'ok', noOp: true and anomalies: [] (:567-580),
+so a reader cannot mistake "not compared" for "compared, fine".
+
+NON-VACUITY throughout: 'deploy-blocked' is terminal and NOT a no-op on all three
+surfaces (a run that did the work then failed to ship stays a comparable), a $0 card is
+rejected for the pre-existing reason, and a genuinely tiny 'complete' run still alerts
+(index.test.mjs:415-421) -- so the exclusion keys on the outcome, not on smallness.
+
+ONE DOCUMENTED CONSEQUENCE, stated in the source rather than found by me
+(index.mjs:533-535): "anything counting runs by workflow.performance rows under-counts
+no-op sweeps, by design." Anyone building run-volume dashboards off that event type
+will be short by the number of no-op sweeps. It is written down; it is not tested.
+
+EXIT=0

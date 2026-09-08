@@ -1,0 +1,373 @@
+=== ITEM 13: DECISION_LEDGER — TEAM-4178 Concern 3 + Plan Approval deviations gate ===
+=== commit: 1f5458dbeeaff116c10e57cbe2a77ac23a5da0b8 ===
+
+[33mThe CJS build of Vite's Node API is deprecated. See https://vite.dev/guide/troubleshooting.html#vite-cjs-node-api-deprecated for more details.[39m
+
+ RUN  v2.1.9 /mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub
+
+stdout | lambda/orchestrator/decision-ledger.test.mjs > DECISION_LEDGER=off — byte-identical to before D3 > an approved gate with two decisions in its comments writes NOTHING, anywhere
+[orchestrator] Loaded 4 agents from S3 config
+[orchestrator] Loaded 2 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+[orchestrator] TEAM-4174: human gate approved — review_needed acknowledged
+
+stderr | lambda/orchestrator/decision-ledger.test.mjs > DECISION_LEDGER=off — byte-identical to before D3 > an approved gate with two decisions in its comments writes NOTHING, anywhere
+[orchestrator] evidence harvest skipped for TEAM-4174: no readable completions/TEAM-4174.json
+
+ ✓ lambda/orchestrator/decision-ledger.test.mjs > DECISION_LEDGER=off — byte-identical to before D3 > an approved gate with two decisions in its comments writes NOTHING, anywhere 644ms
+stdout | lambda/orchestrator/decision-ledger.test.mjs > DECISION_LEDGER=off — byte-identical to before D3 > the dowtdh Plan Approval gate opens on a plan that honours nothing
+[orchestrator] Loaded 4 agents from S3 config
+[orchestrator] Loaded 2 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4178: blocked → ready
+[orchestrator] TEAM-4178 parked for human review (engineer) — not invoking an agent.
+
+ ✓ lambda/orchestrator/decision-ledger.test.mjs > DECISION_LEDGER=off — byte-identical to before D3 > the dowtdh Plan Approval gate opens on a plan that honours nothing
+stdout | lambda/orchestrator/decision-ledger.test.mjs > DECISION_LEDGER=off — byte-identical to before D3 > a QA persona's context is unchanged and pays no ledger read
+[orchestrator] Loaded 4 agents from S3 config
+[orchestrator] Loaded 2 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+
+ ✓ lambda/orchestrator/decision-ledger.test.mjs > DECISION_LEDGER=off — byte-identical to before D3 > a QA persona's context is unchanged and pays no ledger read
+stdout | lambda/orchestrator/decision-ledger.test.mjs > DECISION_LEDGER=off — byte-identical to before D3 > the Plan ticket's own context is byte-identical with and without a ledger present
+[orchestrator] Loaded 4 agents from S3 config
+[orchestrator] Loaded 2 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+
+ ✓ lambda/orchestrator/decision-ledger.test.mjs > DECISION_LEDGER=off — byte-identical to before D3 > the Plan ticket's own context is byte-identical with and without a ledger present
+stdout | lambda/orchestrator/decision-ledger.test.mjs > appends one inert entry per gate resolution, idempotently > shadow commits both decisions on the branch, mirrors them, and emits decision.recorded
+[orchestrator] Loaded 4 agents from S3 config
+[orchestrator] Loaded 2 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+[decision-ledger] TEAM-4174: recorded TEAM-4174#3, TEAM-4174#4
+[orchestrator] TEAM-4174: human gate approved — review_needed acknowledged
+
+stderr | lambda/orchestrator/decision-ledger.test.mjs > appends one inert entry per gate resolution, idempotently > shadow commits both decisions on the branch, mirrors them, and emits decision.recorded
+[orchestrator] evidence harvest skipped for TEAM-4174: no readable completions/TEAM-4174.json
+
+ ✓ lambda/orchestrator/decision-ledger.test.mjs > appends one inert entry per gate resolution, idempotently > shadow commits both decisions on the branch, mirrors them, and emits decision.recorded
+stdout | lambda/orchestrator/decision-ledger.test.mjs > appends one inert entry per gate resolution, idempotently > a webhook redelivery of the same gate performs ZERO writes
+[orchestrator] Loaded 4 agents from S3 config
+[orchestrator] Loaded 2 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+[decision-ledger] TEAM-4174: recorded TEAM-4174#3, TEAM-4174#4
+[orchestrator] TEAM-4174: human gate approved — review_needed acknowledged
+[decision-ledger] TEAM-4174: 2 decision(s) already in the ledger — nothing to write
+[orchestrator] TEAM-4174: human gate approved — review_needed acknowledged
+
+stderr | lambda/orchestrator/decision-ledger.test.mjs > appends one inert entry per gate resolution, idempotently > a webhook redelivery of the same gate performs ZERO writes
+[orchestrator] evidence harvest skipped for TEAM-4174: no readable completions/TEAM-4174.json
+[orchestrator] evidence harvest skipped for TEAM-4174: no readable completions/TEAM-4174.json
+
+ ✓ lambda/orchestrator/decision-ledger.test.mjs > appends one inert entry per gate resolution, idempotently > a webhook redelivery of the same gate performs ZERO writes
+stdout | lambda/orchestrator/decision-ledger.test.mjs > appends one inert entry per gate resolution, idempotently > an approval with no decision line records nothing — 'Approved.' is not a decision
+[orchestrator] Loaded 4 agents from S3 config
+[orchestrator] Loaded 2 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+[orchestrator] TEAM-4174: human gate approved — review_needed acknowledged
+
+stderr | lambda/orchestrator/decision-ledger.test.mjs > appends one inert entry per gate resolution, idempotently > an approval with no decision line records nothing — 'Approved.' is not a decision
+[orchestrator] evidence harvest skipped for TEAM-4174: no readable completions/TEAM-4174.json
+
+ ✓ lambda/orchestrator/decision-ledger.test.mjs > appends one inert entry per gate resolution, idempotently > an approval with no decision line records nothing — 'Approved.' is not a decision
+stdout | lambda/orchestrator/decision-ledger.test.mjs > appends one inert entry per gate resolution, idempotently > a non-human assignee records nothing — only a gate resolution is a decision
+[orchestrator] Loaded 4 agents from S3 config
+[orchestrator] Loaded 2 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+
+stderr | lambda/orchestrator/decision-ledger.test.mjs > appends one inert entry per gate resolution, idempotently > a non-human assignee records nothing — only a gate resolution is a decision
+[orchestrator] artifact-chain: TEAM-4177 missing plan.md on feature/TEAM-4162-undo-window — sending back.
+
+ ✓ lambda/orchestrator/decision-ledger.test.mjs > appends one inert entry per gate resolution, idempotently > a non-human assignee records nothing — only a gate resolution is a decision
+stdout | lambda/orchestrator/decision-ledger.test.mjs > appends one inert entry per gate resolution, idempotently > enforce records exactly as shadow does — the gate check is all it adds
+[orchestrator] Loaded 4 agents from S3 config
+[orchestrator] Loaded 2 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+[decision-ledger] TEAM-4174: recorded TEAM-4174#3, TEAM-4174#4
+[orchestrator] TEAM-4174: human gate approved — review_needed acknowledged
+
+stderr | lambda/orchestrator/decision-ledger.test.mjs > appends one inert entry per gate resolution, idempotently > enforce records exactly as shadow does — the gate check is all it adds
+[orchestrator] evidence harvest skipped for TEAM-4174: no readable completions/TEAM-4174.json
+
+ ✓ lambda/orchestrator/decision-ledger.test.mjs > appends one inert entry per gate resolution, idempotently > enforce records exactly as shadow does — the gate check is all it adds
+stdout | lambda/orchestrator/decision-ledger.test.mjs > appends one inert entry per gate resolution, idempotently > a 409 is retried once against the winner's file and lands
+[orchestrator] Loaded 4 agents from S3 config
+[orchestrator] Loaded 2 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+[decision-ledger] PUT .sdlc/wf_1788731227559_dowtdh/decisions.md retried after a 409 and landed
+[decision-ledger] TEAM-4174: recorded TEAM-4174#3, TEAM-4174#4
+[orchestrator] TEAM-4174: human gate approved — review_needed acknowledged
+
+stderr | lambda/orchestrator/decision-ledger.test.mjs > appends one inert entry per gate resolution, idempotently > a 409 is retried once against the winner's file and lands
+[orchestrator] evidence harvest skipped for TEAM-4174: no readable completions/TEAM-4174.json
+
+ ✓ lambda/orchestrator/decision-ledger.test.mjs > appends one inert entry per gate resolution, idempotently > a 409 is retried once against the winner's file and lands
+stdout | lambda/orchestrator/decision-ledger.test.mjs > appends one inert entry per gate resolution, idempotently > a 409 whose winner already recorded our ids is a success with nothing to write
+[orchestrator] Loaded 4 agents from S3 config
+[orchestrator] Loaded 2 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+[decision-ledger] TEAM-4174: recorded TEAM-4174#3, TEAM-4174#4 (S3 mirror only)
+[orchestrator] TEAM-4174: human gate approved — review_needed acknowledged
+
+stderr | lambda/orchestrator/decision-ledger.test.mjs > appends one inert entry per gate resolution, idempotently > a 409 whose winner already recorded our ids is a success with nothing to write
+[orchestrator] evidence harvest skipped for TEAM-4174: no readable completions/TEAM-4174.json
+
+ ✓ lambda/orchestrator/decision-ledger.test.mjs > appends one inert entry per gate resolution, idempotently > a 409 whose winner already recorded our ids is a success with nothing to write
+stdout | lambda/orchestrator/decision-ledger.test.mjs > appends one inert entry per gate resolution, idempotently > 409 then 409 fails open — a warn, the S3 mirror, and no throw
+[orchestrator] Loaded 4 agents from S3 config
+[orchestrator] Loaded 2 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+[decision-ledger] TEAM-4174: recorded TEAM-4174#3, TEAM-4174#4 (S3 mirror only)
+[orchestrator] TEAM-4174: human gate approved — review_needed acknowledged
+
+ ✓ lambda/orchestrator/decision-ledger.test.mjs > appends one inert entry per gate resolution, idempotently > 409 then 409 fails open — a warn, the S3 mirror, and no throw
+stdout | lambda/orchestrator/decision-ledger.test.mjs > appends one inert entry per gate resolution, idempotently > a read-only PAT (403) writes the S3 mirror only, and says why
+[orchestrator] Loaded 4 agents from S3 config
+[orchestrator] Loaded 2 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+[decision-ledger] TEAM-4174: recorded TEAM-4174#3, TEAM-4174#4 (S3 mirror only)
+[orchestrator] TEAM-4174: human gate approved — review_needed acknowledged
+
+ ✓ lambda/orchestrator/decision-ledger.test.mjs > appends one inert entry per gate resolution, idempotently > a read-only PAT (403) writes the S3 mirror only, and says why
+stdout | lambda/orchestrator/decision-ledger.test.mjs > Plan Approval cannot pass with an unreferenced open decision > enforce withholds TEAM-4178: no human is paged, the plan goes back for rework
+[orchestrator] Loaded 4 agents from S3 config
+[orchestrator] Loaded 2 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4178: blocked → ready
+[decision-ledger] TEAM-4178 withheld — TEAM-4174#3 cited nowhere in the plan artifact; reworking instead of paging a human
+
+ ✓ lambda/orchestrator/decision-ledger.test.mjs > Plan Approval cannot pass with an unreferenced open decision > enforce withholds TEAM-4178: no human is paged, the plan goes back for rework
+stdout | lambda/orchestrator/decision-ledger.test.mjs > Plan Approval cannot pass with an unreferenced open decision > shadow presents the same gate, with what was dropped at the FRONT of the package
+[orchestrator] Loaded 4 agents from S3 config
+[orchestrator] Loaded 2 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4178: blocked → ready
+[decision-ledger] TEAM-4178: TEAM-4174#3 unreferenced (shadow — gate still presented)
+[orchestrator] TEAM-4178 parked for human review (engineer) — not invoking an agent.
+
+ ✓ lambda/orchestrator/decision-ledger.test.mjs > Plan Approval cannot pass with an unreferenced open decision > shadow presents the same gate, with what was dropped at the FRONT of the package
+stdout | lambda/orchestrator/decision-ledger.test.mjs > Plan Approval cannot pass with an unreferenced open decision > a gate with no review package at all still carries the section
+[orchestrator] Loaded 4 agents from S3 config
+[orchestrator] Loaded 2 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4178: blocked → ready
+[decision-ledger] TEAM-4178: TEAM-4174#3 unreferenced (shadow — gate still presented)
+[orchestrator] TEAM-4178 parked for human review (engineer) — not invoking an agent.
+
+ ✓ lambda/orchestrator/decision-ledger.test.mjs > Plan Approval cannot pass with an unreferenced open decision > a gate with no review package at all still carries the section
+stdout | lambda/orchestrator/decision-ledger.test.mjs > Plan Approval cannot pass with an unreferenced open decision > the post-fix plan passes the same gate untouched, in both non-off modes
+[orchestrator] Loaded 4 agents from S3 config
+[orchestrator] Loaded 2 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4178: blocked → ready
+[orchestrator] TEAM-4178 parked for human review (engineer) — not invoking an agent.
+
+stdout | lambda/orchestrator/decision-ledger.test.mjs > Plan Approval cannot pass with an unreferenced open decision > the post-fix plan passes the same gate untouched, in both non-off modes
+[orchestrator] Loaded 4 agents from S3 config
+[orchestrator] Loaded 2 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4178: blocked → ready
+[orchestrator] TEAM-4178 parked for human review (engineer) — not invoking an agent.
+
+ ✓ lambda/orchestrator/decision-ledger.test.mjs > Plan Approval cannot pass with an unreferenced open decision > the post-fix plan passes the same gate untouched, in both non-off modes
+stdout | lambda/orchestrator/decision-ledger.test.mjs > Plan Approval cannot pass with an unreferenced open decision > a decision already marked resolved never withholds anything
+[orchestrator] Loaded 4 agents from S3 config
+[orchestrator] Loaded 2 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4178: blocked → ready
+[orchestrator] TEAM-4178 parked for human review (engineer) — not invoking an agent.
+
+ ✓ lambda/orchestrator/decision-ledger.test.mjs > Plan Approval cannot pass with an unreferenced open decision > a decision already marked resolved never withholds anything
+stdout | lambda/orchestrator/decision-ledger.test.mjs > Plan Approval cannot pass with an unreferenced open decision > a missing plan.md fails OPEN — 'cites nothing' and 'we cannot read it' are not the same
+[orchestrator] Loaded 4 agents from S3 config
+[orchestrator] Loaded 2 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4178: blocked → ready
+[orchestrator] TEAM-4178 parked for human review (engineer) — not invoking an agent.
+
+ ✓ lambda/orchestrator/decision-ledger.test.mjs > Plan Approval cannot pass with an unreferenced open decision > a missing plan.md fails OPEN — 'cites nothing' and 'we cannot read it' are not the same
+stdout | lambda/orchestrator/decision-ledger.test.mjs > design and plan context carry the open-decision checklist > the Plan ticket is told to cite or deviate, by id
+[orchestrator] Loaded 4 agents from S3 config
+[orchestrator] Loaded 2 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+
+ ✓ lambda/orchestrator/decision-ledger.test.mjs > design and plan context carry the open-decision checklist > the Plan ticket is told to cite or deviate, by id
+stdout | lambda/orchestrator/decision-ledger.test.mjs > design and plan context carry the open-decision checklist > a design persona gets it too — the design that contradicted the PO is where it started
+[orchestrator] Loaded 4 agents from S3 config
+[orchestrator] Loaded 2 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+
+ ✓ lambda/orchestrator/decision-ledger.test.mjs > design and plan context carry the open-decision checklist > a design persona gets it too — the design that contradicted the PO is where it started
+stdout | lambda/orchestrator/decision-ledger.test.mjs > design and plan context carry the open-decision checklist > an implementation dev and a QA verifier get no checklist and pay no ledger read
+[orchestrator] Loaded 4 agents from S3 config
+[orchestrator] Loaded 2 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+
+ ✓ lambda/orchestrator/decision-ledger.test.mjs > design and plan context carry the open-decision checklist > an implementation dev and a QA verifier get no checklist and pay no ledger read
+stdout | lambda/orchestrator/decision-ledger.test.mjs > design and plan context carry the open-decision checklist > the checklist comes from the S3 mirror — no GitHub round trip on the dispatch path
+[orchestrator] Loaded 4 agents from S3 config
+[orchestrator] Loaded 2 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+
+ ✓ lambda/orchestrator/decision-ledger.test.mjs > design and plan context carry the open-decision checklist > the checklist comes from the S3 mirror — no GitHub round trip on the dispatch path
+stdout | lambda/orchestrator/decision-ledger.test.mjs > design and plan context carry the open-decision checklist > an empty ledger emits no block at all
+[orchestrator] Loaded 4 agents from S3 config
+[orchestrator] Loaded 2 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+
+ ✓ lambda/orchestrator/decision-ledger.test.mjs > design and plan context carry the open-decision checklist > an empty ledger emits no block at all
+stdout | lambda/orchestrator/replay-dowtdh-decision-loss.test.mjs > DECISION_LEDGER=off — dowtdh happens again, byte for byte > TEAM-4178 is presented and approved with the dossier's own event shapes
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 1 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4178: blocked → ready
+[orchestrator] TEAM-4178 parked for human review (engineer) — not invoking an agent.
+[orchestrator] TEAM-4178: human gate approved — review_needed acknowledged
+
+stderr | lambda/orchestrator/replay-dowtdh-decision-loss.test.mjs > DECISION_LEDGER=off — dowtdh happens again, byte for byte > TEAM-4178 is presented and approved with the dossier's own event shapes
+[orchestrator] evidence harvest skipped for TEAM-4178: no readable completions/TEAM-4178.json
+
+ ✓ lambda/orchestrator/replay-dowtdh-decision-loss.test.mjs > DECISION_LEDGER=off — dowtdh happens again, byte for byte > TEAM-4178 is presented and approved with the dossier's own event shapes
+stdout | lambda/orchestrator/replay-dowtdh-decision-loss.test.mjs > DECISION_LEDGER=off — dowtdh happens again, byte for byte > costs nothing: no GitHub call, no ledger read, no decision event
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 1 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+[orchestrator] TEAM-4174: human gate approved — review_needed acknowledged
+[orchestrator] TEAM-4176: human gate approved — review_needed acknowledged
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4178: blocked → ready
+[orchestrator] TEAM-4178 parked for human review (engineer) — not invoking an agent.
+
+stderr | lambda/orchestrator/replay-dowtdh-decision-loss.test.mjs > DECISION_LEDGER=off — dowtdh happens again, byte for byte > costs nothing: no GitHub call, no ledger read, no decision event
+[orchestrator] evidence harvest skipped for TEAM-4174: no readable completions/TEAM-4174.json
+[orchestrator] evidence harvest skipped for TEAM-4176: no readable completions/TEAM-4176.json
+
+ ✓ lambda/orchestrator/replay-dowtdh-decision-loss.test.mjs > DECISION_LEDGER=off — dowtdh happens again, byte for byte > costs nothing: no GitHub call, no ledger read, no decision event
+stdout | lambda/orchestrator/replay-dowtdh-decision-loss.test.mjs > the ledger the run never had > both gate approvals commit their decisions to the run's own branch
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 1 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+[decision-ledger] TEAM-4174: recorded TEAM-4174#1, TEAM-4174#2, TEAM-4174#3, TEAM-4174#4, TEAM-4174#5, TEAM-4174#6
+[orchestrator] TEAM-4174: human gate approved — review_needed acknowledged
+[orchestrator] TEAM-4176: human gate approved — review_needed acknowledged
+
+stderr | lambda/orchestrator/replay-dowtdh-decision-loss.test.mjs > the ledger the run never had > both gate approvals commit their decisions to the run's own branch
+[orchestrator] evidence harvest skipped for TEAM-4174: no readable completions/TEAM-4174.json
+[orchestrator] evidence harvest skipped for TEAM-4176: no readable completions/TEAM-4176.json
+
+ ✓ lambda/orchestrator/replay-dowtdh-decision-loss.test.mjs > the ledger the run never had > both gate approvals commit their decisions to the run's own branch
+stdout | lambda/orchestrator/replay-dowtdh-decision-loss.test.mjs > TEAM-4178 package lists Concern 3 as not honoured > shadow presents the same gate, with the dropped decisions at the front
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 1 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+[decision-ledger] TEAM-4174: recorded TEAM-4174#1, TEAM-4174#2, TEAM-4174#3, TEAM-4174#4, TEAM-4174#5, TEAM-4174#6
+[orchestrator] TEAM-4174: human gate approved — review_needed acknowledged
+[orchestrator] TEAM-4176: human gate approved — review_needed acknowledged
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4178: blocked → ready
+[decision-ledger] TEAM-4178: TEAM-4174#1, TEAM-4174#2, TEAM-4174#3, TEAM-4174#4, TEAM-4174#5, TEAM-4174#6 unreferenced (shadow — gate still presented)
+[orchestrator] TEAM-4178 parked for human review (engineer) — not invoking an agent.
+
+stderr | lambda/orchestrator/replay-dowtdh-decision-loss.test.mjs > TEAM-4178 package lists Concern 3 as not honoured > shadow presents the same gate, with the dropped decisions at the front
+[orchestrator] evidence harvest skipped for TEAM-4174: no readable completions/TEAM-4174.json
+[orchestrator] evidence harvest skipped for TEAM-4176: no readable completions/TEAM-4176.json
+
+ ✓ lambda/orchestrator/replay-dowtdh-decision-loss.test.mjs > TEAM-4178 package lists Concern 3 as not honoured > shadow presents the same gate, with the dropped decisions at the front
+stdout | lambda/orchestrator/replay-dowtdh-decision-loss.test.mjs > TEAM-4178 package lists Concern 3 as not honoured > enforce never presents it: the plan goes back to TEAM-4177 and no human is paged
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 1 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+[decision-ledger] TEAM-4174: recorded TEAM-4174#1, TEAM-4174#2, TEAM-4174#3, TEAM-4174#4, TEAM-4174#5, TEAM-4174#6
+[orchestrator] TEAM-4174: human gate approved — review_needed acknowledged
+[orchestrator] TEAM-4176: human gate approved — review_needed acknowledged
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4178: blocked → ready
+{"_aws":{"Timestamp":1788846366797,"CloudWatchMetrics":[{"Namespace":"AgentCoreHub/Orchestrator","Dimensions":[[]],"Metrics":[{"Name":"ReviewCapEscalations","Unit":"Count"},{"Name":"ReviewEffectiveRounds","Unit":"Count"},{"Name":"ReviewRegressionRounds","Unit":"Count"},{"Name":"ReviewCapFailOpen","Unit":"Count"}]}]},"ReviewGateTicket":"TEAM-4178","ReviewGatePhase":"development","ReviewCapEscalations":0,"ReviewEffectiveRounds":1,"ReviewRegressionRounds":0,"ReviewMaxRounds":3,"ReviewCapFailOpen":0}
+[orchestrator] [review-cap] TEAM-4178 round 1: effective 1/3 — rework proceeds.
+[orchestrator] Review gate TEAM-4178 rejected (rework) — re-opened: [TEAM-4177]
+[decision-ledger] TEAM-4178 withheld — TEAM-4174#1, TEAM-4174#2, TEAM-4174#3, TEAM-4174#4, TEAM-4174#5, TEAM-4174#6 cited nowhere in the plan artifact; reworking instead of paging a human
+
+stderr | lambda/orchestrator/replay-dowtdh-decision-loss.test.mjs > TEAM-4178 package lists Concern 3 as not honoured > enforce never presents it: the plan goes back to TEAM-4177 and no human is paged
+[orchestrator] evidence harvest skipped for TEAM-4174: no readable completions/TEAM-4174.json
+[orchestrator] evidence harvest skipped for TEAM-4176: no readable completions/TEAM-4176.json
+
+ ✓ lambda/orchestrator/replay-dowtdh-decision-loss.test.mjs > TEAM-4178 package lists Concern 3 as not honoured > enforce never presents it: the plan goes back to TEAM-4177 and no human is paged
+stdout | lambda/orchestrator/replay-dowtdh-decision-loss.test.mjs > TEAM-4178 package lists Concern 3 as not honoured > the post-fix plan passes the same gate untouched, in both non-off modes
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 1 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+[decision-ledger] TEAM-4174: recorded TEAM-4174#1, TEAM-4174#2, TEAM-4174#3, TEAM-4174#4, TEAM-4174#5, TEAM-4174#6
+[orchestrator] TEAM-4174: human gate approved — review_needed acknowledged
+[orchestrator] TEAM-4176: human gate approved — review_needed acknowledged
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4178: blocked → ready
+[orchestrator] TEAM-4178 parked for human review (engineer) — not invoking an agent.
+
+stderr | lambda/orchestrator/replay-dowtdh-decision-loss.test.mjs > TEAM-4178 package lists Concern 3 as not honoured > the post-fix plan passes the same gate untouched, in both non-off modes
+[orchestrator] evidence harvest skipped for TEAM-4174: no readable completions/TEAM-4174.json
+[orchestrator] evidence harvest skipped for TEAM-4176: no readable completions/TEAM-4176.json
+
+stdout | lambda/orchestrator/replay-dowtdh-decision-loss.test.mjs > TEAM-4178 package lists Concern 3 as not honoured > the post-fix plan passes the same gate untouched, in both non-off modes
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 1 workflow definitions from S3
+[orchestrator] CD registry: none in S3 — every repo is HANDOFF (PR left open, no merge/deploy)
+[orchestrator] Received 0 stream records
+[decision-ledger] TEAM-4174: 6 decision(s) already in the ledger — nothing to write
+[orchestrator] TEAM-4174: human gate approved — review_needed acknowledged
+[orchestrator] TEAM-4176: human gate approved — review_needed acknowledged
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-4178: blocked → ready
+[orchestrator] TEAM-4178 parked for human review (engineer) — not invoking an agent.
+
+stderr | lambda/orchestrator/replay-dowtdh-decision-loss.test.mjs > TEAM-4178 package lists Concern 3 as not honoured > the post-fix plan passes the same gate untouched, in both non-off modes
+[orchestrator] evidence harvest skipped for TEAM-4174: no readable completions/TEAM-4174.json
+[orchestrator] evidence harvest skipped for TEAM-4176: no readable completions/TEAM-4176.json
+
+ ✓ lambda/orchestrator/replay-dowtdh-decision-loss.test.mjs > TEAM-4178 package lists Concern 3 as not honoured > the post-fix plan passes the same gate untouched, in both non-off modes
+
+ Test Files  2 passed (2)
+      Tests  30 passed (30)
+   Start at  05:46:01
+   Duration  5.00s (transform 611ms, setup 0ms, collect 285ms, tests 2.32s, environment 1ms, prepare 244ms)
+
+VITEST_EXIT=0

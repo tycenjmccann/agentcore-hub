@@ -689,5 +689,255 @@ stdout | lambda/orchestrator/sweep-noop-close.test.mjs > yield-aware gate depth 
 
 VITEST_EXIT=0
 
-*** INCOMPLETE — HALF 1 covered items 1-7 only. This log holds the vitest run for
-*** item 8 as a checkpoint; its assertion audit and probe belong to HALF 2.
+--- (2) assertion audit ---
+
+(2a) runOutcome=nothing-to-remove, and NOT a completion
+     replay-c2uqki-sweep-noop.test.mjs:729-765
+    it("closes the run as nothing-to-remove, carrying the yield on the event", async () => {
+      process.env.GITHUB_PAT = "ghp_test";
+      await loadWith({ sweep: "enforce" });
+      await replayToDetection();
+
+      // The terminal claim, with the honest outcome — not "complete".
+      expect(h.state.terminalClaims).toHaveLength(1);
+      expect(h.state.terminalClaims[0]).toMatchObject({ workflowId: WF_ID, outcome: "nothing-to-remove" });
+      expect(h.state.terminalClaims[0].reason).toMatch(/zero removals/i);
+      expect(h.state.finalized).toEqual([WF_ID]);
+
+      // Exactly one run-closing event, carrying the yield so no consumer has to
+      // re-read S3 to know why the run ended.
+      const closed = detailsOfType("workflow.nothing_to_remove");
+      expect(closed).toHaveLength(1);
+      expect(closed[0]).toMatchObject({
+        workflowId: WF_ID,
+        outcome: "nothing-to-remove",
+        verifiedRemovable: 0,
+        candidates: CANDIDATES,
+        ticketId: DETECT,
+        featureBranch: DOSSIER.workflow.featureBranch,
+      });
+      // The PR the DETECTION record names (note 4) — the unified #60 does not exist
+      // on this path, because completeWorkflow is never reached.
+      expect(closed[0].prUrl).toBe(DETECT_PR);
+      expect(closed[0].prUrl).not.toBe(UNIFIED_PR);
+
+      // NOT a completion. This is the assertion the whole gate exists for.
+      expect(countOfType("workflow.complete")).toBe(0);
+      expect(h.state.storeCompletions).toEqual([]);
+
+      // The ticket still finished, and in the right order — the UI's own signal.
+      const complete = detailsOfType("agent.complete");
+      expect(complete.map((d) => d.ticketId)).toEqual([ANALYST, DETECT]);
+      expect(indexOfType("agent.complete")).toBeLessThan(indexOfType("workflow.nothing_to_remove"));
+    });
+
+(2b) 0 reviewer/QA/CI tasks — counted as DISPATCHES, not tickets (the asked-for check)
+     :779-796 — three independent names a dispatch would leave behind, per persona
+    it("dispatches NOBODY — no reviewer, no QA verifier, no CI agent", async () => {
+      await loadWith({ sweep: "enforce" });
+      await replayToDetection();
+
+      // The cascade never ran, so nothing was unblocked…
+      expect(countOfType("orchestrator.unblocked")).toBe(0);
+      expect(allEvents().filter((e) => e.detail?.unblockedBy)).toEqual([]);
+      // …no successor was made runnable (the write a dispatch is triggered off)…
+      expect(madeRunnable().filter((w) => [REVIEW, QA, CI].includes(w.ticketId))).toEqual([]);
+      // …and nothing was invoked on this hop either, by any of the three names a
+      // dispatch would leave behind.
+      for (const agentId of [REVIEWER_ID, QA_ID, CI_ID]) {
+        expect(dispatchedTo(agentId), agentId).toEqual([]);
+        expect(detailsOfType("orchestrator.agent_invoked").filter((d) => d.agentId === agentId), agentId).toEqual([]);
+        expect(detailsOfType("agent.invoked").filter((d) => d.agentId === agentId), agentId).toEqual([]);
+      }
+      expect(detailsOfType("orchestrator.unblocked").map((d) => d.ticketId)).toEqual([]);
+    });
+     ...and a LATE ready/todo delivery for the reviewer is still refused after close, :798-814
+    it("refuses a late ready/todo delivery for the reviewer once the run is closed", async () => {
+      await loadWith({ sweep: "enforce" });
+      await replayToDetection();
+      expect(h.state.finalized).toEqual([WF_ID]);
+
+      for (const status of ["ready", "todo"]) {
+        h.state.ebEvents.length = 0;
+        h.state.invokes.length = 0;
+        h.state.statusWrites.length = 0;
+
+        await deliver(readyRecord(REVIEW, status));
+
+        expect(dispatchedTo(REVIEWER_ID), status).toEqual([]);
+        expect(countOfType("orchestrator.agent_invoked"), status).toBe(0);
+        expect(h.state.statusWrites.filter((w) => w.status === "in_progress"), status).toEqual([]);
+      }
+    });
+
+(2c) no workflow.performance alert
+     :1022-1048 — the card is written by cost-report, which is not in this harness, so the
+     assertion feeds the REAL predicates the WIRE outcome the orchestrator just published:
+  // ── FR-D2.8 — the card side of the same outcome ────────────────────────────
+  /**
+   * There is no workflow.performance event in this replay: the card is written by the
+   * cost-report Lambda, which is not in this harness. So the assertion is made against
+   * the predicate the card side actually uses, fed the outcome the orchestrator just
+   * published — the wire value, not a literal typed twice.
+   */
+  it("the published outcome is not baseline-eligible and raises no performance alert", async () => {
+    process.env.GITHUB_PAT = "ghp_test";
+    await loadWith({ sweep: "enforce" });
+    await deliver(doneRecord(ANALYST));
+    await deliver(doneRecord(DETECT));
+    const outcome = detailsOfType("workflow.nothing_to_remove")[0].outcome;
+
+    // cost-report constructs AWS clients at module load, but the constructors do no
+    // I/O, so a plain import is safe here (same precedent as event-id.test.mjs).
+    const { isBaselineEligible, shouldAlert, isNoOpOutcome } = await import("../cost-report/index.mjs");
+
+    expect(isNoOpOutcome({ outcome })).toBe(true);
+    expect(isBaselineEligible({ outcome, cost: { total: 4.12 } })).toBe(false);
+    expect(shouldAlert({ run: { outcome } })).toBe(false);
+
+    // Non-vacuous: the SAME shapes with the outcome this run used to borrow are
+    // both eligible and alertable.
+    expect(isBaselineEligible({ outcome: "complete", cost: { total: 4.12 } })).toBe(true);
+    expect(shouldAlert({ run: { outcome: "complete" } })).toBe(true);
+  });
+
+(2d) non-vacuity — the fixture really did the opposite in production, :666-676
+  it("spent four personas and two fix tickets on it, then reported a completed delivery", () => {
+    const shape = fixtureCascadeShape();
+    expect(shape.filter((s) => s.type === "orchestrator.unblocked").map((s) => s.ticketId))
+      .toEqual([REVIEW, QA, CI]);
+    expect(shape.filter((s) => s.type === "workflow.complete")).toHaveLength(1);
+    expect(fixtureTicket(REVIEW).assignee).toBe(REVIEWER_ID);
+    expect(fixtureTicket(QA).assignee).toBe(QA_ID);
+    expect(fixtureTicket(CI).assignee).toBe(CI_ID);
+    // …and its zero-task cost card went into the sweep def's baselines.
+    expect((DOSSIER.events || []).filter((e) => e.type === "workflow.performance")).toHaveLength(1);
+  });
+
+(2e) idempotency — one close whichever twin delivers it, :816-836
+    it("one close, whichever twin delivers it (redelivery + the webhook twin)", async () => {
+      await loadWith({ sweep: "enforce" });
+      await deliver(doneRecord(ANALYST));
+
+      const record = doneRecord(DETECT);
+      await deliver(record);
+      await deliver(record);              // the stream's own at-least-once redelivery
+      await handleTicketDoneUnified(DETECT); // the jira-mode twin, on the same board
+
+      // The redelivery reached the CAS and LOST there — not because the caller
+      // remembered what it had already written. (The webhook twin never gets that
+      // far: its own markTaskComplete idempotency guard sees the task entry already
+      // done and skips the whole tail, cascade included, which is why there are two
+      // claims for three deliveries and not three.)
+      expect(h.state.terminalClaims).toHaveLength(2);
+      expect(h.state.terminalClaims.every((c) => c.outcome === "nothing-to-remove")).toBe(true);
+      expect(countOfType("workflow.nothing_to_remove")).toBe(1);
+      expect(h.state.finalized).toEqual([WF_ID]);
+      expect(countOfType("workflow.complete")).toBe(0);
+      expect(dispatchedTo(REVIEWER_ID)).toEqual([]);
+    });
+
+--- (3) ASKED: what happens under the default 'shadow'? THE FULL CHAIN STILL RUNS. ---
+     :839-864
+  // ── (2) shadow ─────────────────────────────────────────────────────────────
+  describe("shadow (the default) — observed, and the run goes on", () => {
+    it("publishes sweep.detection_observed once and still cascades", async () => {
+      await loadWith({ sweep: undefined });   // unset → shadow
+      await replay();
+
+      const observed = detailsOfType("sweep.detection_observed");
+      expect(observed).toHaveLength(1);
+      expect(observed[0]).toMatchObject({
+        workflowId: WF_ID,
+        ticketId: DETECT,
+        verifiedRemovable: 0,
+        candidates: CANDIDATES,
+        wouldClose: true,
+      });
+
+      // Nothing was claimed and nothing was labelled — shadow only watches.
+      expect(h.state.terminalClaims.filter((c) => c.outcome === "nothing-to-remove")).toEqual([]);
+      expect(h.state.githubCalls.filter((c) => /\/labels$/.test(c.url))).toEqual([]);
+
+      // …and the chain the fixture recorded still happened: the reviewer was
+      // released by the detection ticket, exactly as it was in production.
+      expect(detailsOfType("orchestrator.unblocked").map((d) => d.ticketId)).toEqual([REVIEW, QA, CI]);
+      expect(detailsOfType("orchestrator.unblocked")[0].unblockedBy).toBe(DETECT);
+      expect(countOfType("workflow.complete")).toBe(1);
+    });
+
+     and the gates ARE dispatched under shadow (:892-914) — one each:
+    it("tells the QA verifier and the CI agent the diff is deletion-free, and the reviewer the opposite", async () => {
+      await loadWith({ sweep: undefined });
+      await replayWithDispatches();
+
+      // Non-vacuity: commit 1's harvest is what put the yield on the task entry.
+      expect(h.state.workflow.agentTasks[DETECT]).toMatchObject({ verifiedRemovable: 0, candidates: CANDIDATES });
+
+      for (const agentId of [QA_ID, CI_ID]) {
+        const prompt = promptFor(agentId);
+        expect(dispatchedTo(agentId), agentId).toHaveLength(1);
+        expect(prompt, agentId).toContain("## Sweep Yield");
+        expect(prompt, agentId).toContain(`Detection: ${CANDIDATES} candidates, 0 verified removable`);
+        expect(prompt, agentId).toContain(LEDGER_ONLY);
+        expect(prompt, agentId).not.toContain(RETAINED);
+      }
+
+      // The reviewer's line says the opposite on purpose: blueprints/code-reviewer.md
+      // is untouched by D2 and its removal-ledger re-verification is retained.
+      const reviewerPrompt = promptFor(REVIEWER_ID);
+      expect(reviewerPrompt).toContain("## Sweep Yield");
+      expect(reviewerPrompt).toContain(RETAINED);
+      expect(reviewerPrompt).not.toContain("no fresh-clone build");
+    });
+
+    it("dispatches exactly one CI ticket", async () => {
+      await loadWith({ sweep: undefined });
+      await replayWithDispatches();
+
+      expect(dispatchedTo(CI_ID)).toHaveLength(1);
+      expect(dispatchedTo(CI_ID)[0].ticketId).toBe(CI);
+      expect(detailsOfType("orchestrator.agent_invoked").filter((d) => d.agentId === CI_ID)).toHaveLength(1);
+
+--- (4) sweep-noop-close.test.mjs is present and ran (2 files / 51 tests above) ---
+33
+
+--- (5) VERDICT: item 8 VERIFIED (all four clauses), with the shadow caveat stated ---
+Under SWEEP_DETECTION_PHASE=enforce every clause is asserted by value:
+
+  runOutcome            terminalClaims length 1, outcome 'nothing-to-remove',
+                        reason /zero removals/i, finalized == [WF_ID], and exactly
+                        one workflow.nothing_to_remove carrying verifiedRemovable:0,
+                        candidates, ticketId and featureBranch.
+  0 reviewer/QA/CI       counted as DISPATCHES as asked: dispatchedTo(agentId) == []
+                        for all three personas, plus orchestrator.agent_invoked == []
+                        and agent.invoked == [], plus orchestrator.unblocked count 0,
+                        plus madeRunnable() == [] for REVIEW/QA/CI. Five signals.
+  no performance alert   shouldAlert({run:{outcome}}) === false and
+                        isBaselineEligible(...) === false, on the outcome READ OFF
+                        THE PUBLISHED EVENT (not a literal typed twice), with the
+                        non-vacuous control that outcome 'complete' is true for both.
+  no workflow.complete   countOfType('workflow.complete') === 0 and
+                        storeCompletions == [], and again at :834 on the twin path.
+
+ONE HONEST QUALIFICATION on the performance clause: the assertion is made against
+cost-report's PREDICATES, not against an absent workflow.performance event, because
+the cost-report Lambda is not in this harness. The test says so itself (:1023-1028).
+That is the right call for a unit replay, but it means no single test proves the
+end-to-end "no event was published" — that link rests on cost-report's own
+index.test.mjs, and on the KNOWN CONSEQUENCE its source documents at index.mjs:531-534
+("anything counting runs by workflow.performance rows under-counts no-op sweeps, by
+design").
+
+UNDER THE SHIPPED DEFAULT (shadow) THE FULL CHAIN STILL RUNS -- this is the answer
+to the asked question, and it is asserted, not inferred:
+  - one sweep.detection_observed with wouldClose:true (so the intent is recorded),
+  - terminalClaims for nothing-to-remove == [] and no PR label written,
+  - orchestrator.unblocked == [REVIEW, QA, CI] with unblockedBy == DETECT,
+  - countOfType('workflow.complete') === 1,
+  - and each of the reviewer/QA/CI personas dispatched exactly once (:894).
+So on a default deploy c2uqki's four wasted personas are still spent. D2 only
+observes. That is the documented design, but it means the acceptance item's
+headline behaviour is off by default.
+
+EXIT=0

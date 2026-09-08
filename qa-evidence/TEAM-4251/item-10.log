@@ -1,0 +1,548 @@
+=== ITEM 10 — iczquj: full chain still dispatches under SWEEP_DETECTION_PHASE=enforce; no nothing-to-remove close ===
+Named test: lambda/orchestrator/replay-iczquj-sweep-full-chain.test.mjs
+
+--- vitest run --reporter=verbose: lambda/orchestrator/replay-iczquj-sweep-full-chain.test.mjs ---
+[33mThe CJS build of Vite's Node API is deprecated. See https://vite.dev/guide/troubleshooting.html#vite-cjs-node-api-deprecated for more details.[39m
+
+ RUN  v2.1.9 /mnt/efs/sessions/cc-6a97fb669da54ea2a10d5bcd0eea493b/tycenjmccann-agentcore-hub
+
+ ✓ lambda/orchestrator/replay-iczquj-sweep-full-chain.test.mjs > iczquj replay — the fixture still says what this replay claims > records a productive sweep that shipped through the human merge gate
+ ✓ lambda/orchestrator/replay-iczquj-sweep-full-chain.test.mjs > iczquj replay — the fixture still says what this replay claims > the dossier's event stream is doubled, and its chain has one hole in it
+stdout | lambda/orchestrator/replay-iczquj-sweep-full-chain.test.mjs > iczquj replay — SWEEP_DETECTION_PHASE is inert on a productive sweep > enforce — the gate looks, and lets the whole chain run > never closes the run as nothing-to-remove
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 6 workflow definitions from S3
+[orchestrator] CD registry: 1 repo(s) registered for merge+deploy
+[orchestrator] Received 0 stream records
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3583: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3585: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3592: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3586: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3587: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3588: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3589: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3590: todo → done
+[orchestrator] TEAM-3590: human gate approved — review_needed acknowledged
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3591: todo → done
+
+stdout | lambda/orchestrator/replay-iczquj-sweep-full-chain.test.mjs > iczquj replay — SWEEP_DETECTION_PHASE is inert on a productive sweep > enforce — the gate looks, and lets the whole chain run > never closes the run as nothing-to-remove
+[orchestrator] wf_1788175925679_iczquj: GitHub proves sweep/dead-code-2026-08-31 merged (f754cd36618f9b2adad03217bb4705d443ca8dd8) — ship verdict taken from ground truth
+[orchestrator] Workflow wf_1788175925679_iczquj complete!
+
+ ✓ lambda/orchestrator/replay-iczquj-sweep-full-chain.test.mjs > iczquj replay — SWEEP_DETECTION_PHASE is inert on a productive sweep > enforce — the gate looks, and lets the whole chain run > never closes the run as nothing-to-remove 2060ms
+stdout | lambda/orchestrator/replay-iczquj-sweep-full-chain.test.mjs > iczquj replay — SWEEP_DETECTION_PHASE is inert on a productive sweep > enforce — the gate looks, and lets the whole chain run > dispatches the full chain and completes the run
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 6 workflow definitions from S3
+[orchestrator] CD registry: 1 repo(s) registered for merge+deploy
+[orchestrator] Received 0 stream records
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3583: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3585: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3592: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3586: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3587: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3588: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3589: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3590: todo → done
+[orchestrator] TEAM-3590: human gate approved — review_needed acknowledged
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3591: todo → done
+
+stdout | lambda/orchestrator/replay-iczquj-sweep-full-chain.test.mjs > iczquj replay — SWEEP_DETECTION_PHASE is inert on a productive sweep > enforce — the gate looks, and lets the whole chain run > dispatches the full chain and completes the run
+[orchestrator] wf_1788175925679_iczquj: GitHub proves sweep/dead-code-2026-08-31 merged (f754cd36618f9b2adad03217bb4705d443ca8dd8) — ship verdict taken from ground truth
+[orchestrator] Workflow wf_1788175925679_iczquj complete!
+
+ ✓ lambda/orchestrator/replay-iczquj-sweep-full-chain.test.mjs > iczquj replay — SWEEP_DETECTION_PHASE is inert on a productive sweep > enforce — the gate looks, and lets the whole chain run > dispatches the full chain and completes the run 1556ms
+stdout | lambda/orchestrator/replay-iczquj-sweep-full-chain.test.mjs > iczquj replay — SWEEP_DETECTION_PHASE is inert on a productive sweep > enforce — the gate looks, and lets the whole chain run > tells no persona anything about the yield — verified_removable is 8
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 6 workflow definitions from S3
+[orchestrator] CD registry: 1 repo(s) registered for merge+deploy
+[orchestrator] Received 0 stream records
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3583: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3585: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3592: blocked → ready
+[orchestrator] Initialized manifest for wf_1788175925679_iczquj
+[orchestrator] Invoking agent agentcore_hub_code_sweeper for ticket TEAM-3592
+[orchestrator] Using Harness for agentcore_hub_code_sweeper
+[orchestrator] Async invoke sent for agentcore_hub_code_sweeper (session: TEAM-3592_wf_1788175925679_iczquj-agentcore_hub_code_sweeper-1788845633160)
+[orchestrator] Recorded session for agentcore_hub_code_sweeper in manifest
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3592: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3586: blocked → ready
+[orchestrator] Initialized manifest for wf_1788175925679_iczquj
+[orchestrator] Invoking agent agentcore_hub_code_reviewer for ticket TEAM-3586
+[orchestrator] Using Harness for agentcore_hub_code_reviewer
+[orchestrator] Async invoke sent for agentcore_hub_code_reviewer (session: TEAM-3586_wf_1788175925679_iczquj-agentcore_hub_code_reviewer-1788845633163)
+[orchestrator] Recorded session for agentcore_hub_code_reviewer in manifest
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3586: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3587: blocked → ready
+[orchestrator] Initialized manifest for wf_1788175925679_iczquj
+[orchestrator] Invoking agent agentcore_hub_qa_verifier for ticket TEAM-3587
+[orchestrator] Using Harness for agentcore_hub_qa_verifier
+[orchestrator] Async invoke sent for agentcore_hub_qa_verifier (session: TEAM-3587_wf_1788175925679_iczquj-agentcore_hub_qa_verifier-1788845633164)
+[orchestrator] Recorded session for agentcore_hub_qa_verifier in manifest
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3587: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3588: blocked → ready
+[orchestrator] Initialized manifest for wf_1788175925679_iczquj
+[orchestrator] Invoking agent agentcore_hub_ci_agent for ticket TEAM-3588
+[orchestrator] Using Harness for agentcore_hub_ci_agent
+[orchestrator] Async invoke sent for agentcore_hub_ci_agent (session: TEAM-3588_wf_1788175925679_iczquj-agentcore_hub_ci_agent-1788845633165)
+[orchestrator] Recorded session for agentcore_hub_ci_agent in manifest
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3588: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3589: blocked → ready
+[orchestrator] Initialized manifest for wf_1788175925679_iczquj
+[orchestrator] Invoking agent agentcore_hub_release_manager for ticket TEAM-3589
+[orchestrator] Using Harness for agentcore_hub_release_manager
+[orchestrator] Async invoke sent for agentcore_hub_release_manager (session: TEAM-3589_wf_1788175925679_iczquj-agentcore_hub_release_manager-1788845633167)
+[orchestrator] Recorded session for agentcore_hub_release_manager in manifest
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3589: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3590: blocked → ready
+[orchestrator] TEAM-3590 parked for human review (engineer) — not invoking an agent.
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3590: in_review → done
+[orchestrator] TEAM-3590: human gate approved — review_needed acknowledged
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3591: blocked → ready
+[orchestrator] Initialized manifest for wf_1788175925679_iczquj
+[orchestrator] Invoking agent agentcore_hub_release_manager for ticket TEAM-3591
+[orchestrator] Using Harness for agentcore_hub_release_manager
+[orchestrator] Async invoke sent for agentcore_hub_release_manager (session: TEAM-3591_wf_1788175925679_iczquj-agentcore_hub_release_manager-1788845633170)
+[orchestrator] Recorded session for agentcore_hub_release_manager in manifest
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3591: in_progress → done
+
+stdout | lambda/orchestrator/replay-iczquj-sweep-full-chain.test.mjs > iczquj replay — SWEEP_DETECTION_PHASE is inert on a productive sweep > enforce — the gate looks, and lets the whole chain run > tells no persona anything about the yield — verified_removable is 8
+[orchestrator] wf_1788175925679_iczquj: GitHub proves sweep/dead-code-2026-08-31 merged (f754cd36618f9b2adad03217bb4705d443ca8dd8) — ship verdict taken from ground truth
+[orchestrator] Workflow wf_1788175925679_iczquj complete!
+
+ ✓ lambda/orchestrator/replay-iczquj-sweep-full-chain.test.mjs > iczquj replay — SWEEP_DETECTION_PHASE is inert on a productive sweep > enforce — the gate looks, and lets the whole chain run > tells no persona anything about the yield — verified_removable is 8 1563ms
+stdout | lambda/orchestrator/replay-iczquj-sweep-full-chain.test.mjs > iczquj replay — SWEEP_DETECTION_PHASE is inert on a productive sweep > shadow (the default) — nothing to observe, nothing observed > is cascade-identical to off, and publishes no D2 event
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 6 workflow definitions from S3
+[orchestrator] CD registry: 1 repo(s) registered for merge+deploy
+[orchestrator] Received 0 stream records
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3583: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3585: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3592: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3586: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3587: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3588: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3589: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3590: todo → done
+[orchestrator] TEAM-3590: human gate approved — review_needed acknowledged
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3591: todo → done
+
+stdout | lambda/orchestrator/replay-iczquj-sweep-full-chain.test.mjs > iczquj replay — SWEEP_DETECTION_PHASE is inert on a productive sweep > shadow (the default) — nothing to observe, nothing observed > is cascade-identical to off, and publishes no D2 event
+[orchestrator] wf_1788175925679_iczquj: GitHub proves sweep/dead-code-2026-08-31 merged (f754cd36618f9b2adad03217bb4705d443ca8dd8) — ship verdict taken from ground truth
+[orchestrator] Workflow wf_1788175925679_iczquj complete!
+
+stdout | lambda/orchestrator/replay-iczquj-sweep-full-chain.test.mjs > iczquj replay — SWEEP_DETECTION_PHASE is inert on a productive sweep > shadow (the default) — nothing to observe, nothing observed > is cascade-identical to off, and publishes no D2 event
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 6 workflow definitions from S3
+[orchestrator] CD registry: 1 repo(s) registered for merge+deploy
+[orchestrator] Received 0 stream records
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3583: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3585: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3592: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3586: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3587: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3588: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3589: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3590: todo → done
+[orchestrator] TEAM-3590: human gate approved — review_needed acknowledged
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3591: todo → done
+
+stdout | lambda/orchestrator/replay-iczquj-sweep-full-chain.test.mjs > iczquj replay — SWEEP_DETECTION_PHASE is inert on a productive sweep > shadow (the default) — nothing to observe, nothing observed > is cascade-identical to off, and publishes no D2 event
+[orchestrator] wf_1788175925679_iczquj: GitHub proves sweep/dead-code-2026-08-31 merged (f754cd36618f9b2adad03217bb4705d443ca8dd8) — ship verdict taken from ground truth
+[orchestrator] Workflow wf_1788175925679_iczquj complete!
+
+ ✓ lambda/orchestrator/replay-iczquj-sweep-full-chain.test.mjs > iczquj replay — SWEEP_DETECTION_PHASE is inert on a productive sweep > shadow (the default) — nothing to observe, nothing observed > is cascade-identical to off, and publishes no D2 event 3113ms
+stdout | lambda/orchestrator/replay-iczquj-sweep-full-chain.test.mjs > iczquj replay — SWEEP_DETECTION_PHASE is inert on a productive sweep > off — the run the dossier recorded > reproduces the fixture's own cascade, paying nothing
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 6 workflow definitions from S3
+[orchestrator] CD registry: 1 repo(s) registered for merge+deploy
+[orchestrator] Received 0 stream records
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3583: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3585: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3592: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3586: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3587: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3588: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3589: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3590: todo → done
+[orchestrator] TEAM-3590: human gate approved — review_needed acknowledged
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3591: todo → done
+
+stdout | lambda/orchestrator/replay-iczquj-sweep-full-chain.test.mjs > iczquj replay — SWEEP_DETECTION_PHASE is inert on a productive sweep > off — the run the dossier recorded > reproduces the fixture's own cascade, paying nothing
+[orchestrator] wf_1788175925679_iczquj: GitHub proves sweep/dead-code-2026-08-31 merged (f754cd36618f9b2adad03217bb4705d443ca8dd8) — ship verdict taken from ground truth
+[orchestrator] Workflow wf_1788175925679_iczquj complete!
+
+ ✓ lambda/orchestrator/replay-iczquj-sweep-full-chain.test.mjs > iczquj replay — SWEEP_DETECTION_PHASE is inert on a productive sweep > off — the run the dossier recorded > reproduces the fixture's own cascade, paying nothing 1588ms
+stdout | lambda/orchestrator/replay-iczquj-sweep-full-chain.test.mjs > iczquj replay — SWEEP_DETECTION_PHASE is inert on a productive sweep > off — the run the dossier recorded > does not read the detection record beyond the harvest's own read
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 6 workflow definitions from S3
+[orchestrator] CD registry: 1 repo(s) registered for merge+deploy
+[orchestrator] Received 0 stream records
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3583: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3585: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3592: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3586: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3587: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3588: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3589: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3590: todo → done
+[orchestrator] TEAM-3590: human gate approved — review_needed acknowledged
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3591: todo → done
+
+stdout | lambda/orchestrator/replay-iczquj-sweep-full-chain.test.mjs > iczquj replay — SWEEP_DETECTION_PHASE is inert on a productive sweep > off — the run the dossier recorded > does not read the detection record beyond the harvest's own read
+[orchestrator] wf_1788175925679_iczquj: GitHub proves sweep/dead-code-2026-08-31 merged (f754cd36618f9b2adad03217bb4705d443ca8dd8) — ship verdict taken from ground truth
+[orchestrator] Workflow wf_1788175925679_iczquj complete!
+
+ ✓ lambda/orchestrator/replay-iczquj-sweep-full-chain.test.mjs > iczquj replay — SWEEP_DETECTION_PHASE is inert on a productive sweep > off — the run the dossier recorded > does not read the detection record beyond the harvest's own read 1552ms
+stdout | lambda/orchestrator/replay-iczquj-sweep-full-chain.test.mjs > iczquj replay — SWEEP_DETECTION_PHASE is inert on a productive sweep > the detection phase does not wedge a productive sweep > completes under enforce with a stamped detection ticket AND a removal ticket
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 6 workflow definitions from S3
+[orchestrator] CD registry: 1 repo(s) registered for merge+deploy
+[orchestrator] Received 0 stream records
+
+ ✓ lambda/orchestrator/replay-iczquj-sweep-full-chain.test.mjs > iczquj replay — SWEEP_DETECTION_PHASE is inert on a productive sweep > the detection phase does not wedge a productive sweep > completes under enforce with a stamped detection ticket AND a removal ticket
+stdout | lambda/orchestrator/replay-iczquj-sweep-full-chain.test.mjs > iczquj replay — SWEEP_DETECTION_PHASE is inert on a productive sweep > the detection phase does not wedge a productive sweep > holds the run open until the human merge gate is approved
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 6 workflow definitions from S3
+[orchestrator] CD registry: 1 repo(s) registered for merge+deploy
+[orchestrator] Received 0 stream records
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3583: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3585: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3592: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3586: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3587: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3588: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3589: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3590: todo → done
+[orchestrator] TEAM-3590: human gate approved — review_needed acknowledged
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3591: todo → done
+
+stdout | lambda/orchestrator/replay-iczquj-sweep-full-chain.test.mjs > iczquj replay — SWEEP_DETECTION_PHASE is inert on a productive sweep > the detection phase does not wedge a productive sweep > holds the run open until the human merge gate is approved
+[orchestrator] wf_1788175925679_iczquj: GitHub proves sweep/dead-code-2026-08-31 merged (f754cd36618f9b2adad03217bb4705d443ca8dd8) — ship verdict taken from ground truth
+[orchestrator] Workflow wf_1788175925679_iczquj complete!
+
+ ✓ lambda/orchestrator/replay-iczquj-sweep-full-chain.test.mjs > iczquj replay — SWEEP_DETECTION_PHASE is inert on a productive sweep > the detection phase does not wedge a productive sweep > holds the run open until the human merge gate is approved 1562ms
+stdout | lambda/orchestrator/replay-iczquj-sweep-full-chain.test.mjs > iczquj replay — SWEEP_DETECTION_PHASE is inert on a productive sweep > VERDICT_GATE=enforce does not hold this chain — no gate persona says anything but PASS
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 6 workflow definitions from S3
+[orchestrator] CD registry: 1 repo(s) registered for merge+deploy
+[orchestrator] Received 0 stream records
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3583: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3585: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3592: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3586: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3587: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3588: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3589: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3590: todo → done
+[orchestrator] TEAM-3590: human gate approved — review_needed acknowledged
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3591: todo → done
+
+stdout | lambda/orchestrator/replay-iczquj-sweep-full-chain.test.mjs > iczquj replay — SWEEP_DETECTION_PHASE is inert on a productive sweep > VERDICT_GATE=enforce does not hold this chain — no gate persona says anything but PASS
+[orchestrator] wf_1788175925679_iczquj: GitHub proves sweep/dead-code-2026-08-31 merged (f754cd36618f9b2adad03217bb4705d443ca8dd8) — ship verdict taken from ground truth
+[orchestrator] Workflow wf_1788175925679_iczquj complete!
+
+ ✓ lambda/orchestrator/replay-iczquj-sweep-full-chain.test.mjs > iczquj replay — SWEEP_DETECTION_PHASE is inert on a productive sweep > VERDICT_GATE=enforce does not hold this chain — no gate persona says anything but PASS 1563ms
+stdout | lambda/orchestrator/replay-iczquj-sweep-full-chain.test.mjs > iczquj replay — SWEEP_DETECTION_PHASE is inert on a productive sweep > the published outcome IS baseline-eligible — no-op exclusion does not catch it
+[orchestrator] Loaded 44 agents from S3 config
+[orchestrator] Loaded 6 workflow definitions from S3
+[orchestrator] CD registry: 1 repo(s) registered for merge+deploy
+[orchestrator] Received 0 stream records
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3583: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3585: in_progress → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3592: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3586: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3587: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3588: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3589: todo → done
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3590: todo → done
+[orchestrator] TEAM-3590: human gate approved — review_needed acknowledged
+[orchestrator] Received 1 stream records
+[orchestrator] TEAM-3591: todo → done
+
+stdout | lambda/orchestrator/replay-iczquj-sweep-full-chain.test.mjs > iczquj replay — SWEEP_DETECTION_PHASE is inert on a productive sweep > the published outcome IS baseline-eligible — no-op exclusion does not catch it
+[orchestrator] wf_1788175925679_iczquj: GitHub proves sweep/dead-code-2026-08-31 merged (f754cd36618f9b2adad03217bb4705d443ca8dd8) — ship verdict taken from ground truth
+[orchestrator] Workflow wf_1788175925679_iczquj complete!
+
+(node:13453) Warning: NodeVersionSupportWarning: The AWS SDK for JavaScript (v3)
+versions published after the first week of January 2027
+will require node >=22. You are running node v20.19.2.
+
+To continue receiving updates to AWS services, bug fixes,
+and security updates please upgrade to node >=22.
+
+More information can be found at: https://a.co/c895JFp
+(Use `node --trace-warnings ...` to show where the warning was created)
+ ✓ lambda/orchestrator/replay-iczquj-sweep-full-chain.test.mjs > iczquj replay — SWEEP_DETECTION_PHASE is inert on a productive sweep > the published outcome IS baseline-eligible — no-op exclusion does not catch it 2211ms
+
+ Test Files  1 passed (1)
+      Tests  12 passed (12)
+   Start at  05:33:47
+   Duration  18.74s (transform 597ms, setup 0ms, collect 227ms, tests 16.84s, environment 0ms, prepare 127ms)
+
+VITEST_EXIT=0
+
+--- (2) assertion audit ---
+
+(2a) 'no nothing-to-remove close' — :887-908
+    it("never closes the run as nothing-to-remove", async () => {
+      await loadWith({ sweep: "enforce" });
+      await replay();
+
+      // Not one D2 close, not one D2 event, not one D2 side effect.
+      expect(h.state.terminalClaims.filter((c) => c.outcome === "nothing-to-remove")).toEqual([]);
+      expect(countOfType("workflow.nothing_to_remove")).toBe(0);
+      // There is no wouldClose:false observation to assert: observeSweepDetection
+      // returns null on `record.verified_removable !== 0` BEFORE it publishes, so a
+      // productive sweep is never observed in any mode. The observer exists to watch
+      // the close it would have made, and here there is no close to watch.
+      expect(detailsOfType("sweep.detection_observed")).toEqual([]);
+      expect(allEvents().filter((e) => /^sweep\./.test(e.type))).toEqual([]);
+      // No PR label either — sweep:no-op is the close's own side effect.
+      expect(h.state.githubCalls.filter((c) => /\/labels$/.test(c.url))).toEqual([]);
+
+      // Non-vacuity: the gate really did read the yield off the detection record.
+      expect(h.state.workflow.agentTasks[DETECT]).toMatchObject({
+        verifiedRemovable: VERIFIED_REMOVABLE, candidates: CANDIDATES,
+      });
+      expect(h.state.s3Gets).toContain(`completions/${DETECT}.json`);
+    });
+
+(2b) 'full chain still dispatches' — :910-941
+    it("dispatches the full chain and completes the run", async () => {
+      await loadWith({ sweep: "enforce" });
+      await replay();
+
+      // Every successor released, in the fixture's order — with the removal row's
+      // hop (note 2) and the dossier's dropped Ship unblock repaired (note 4).
+      expect(detailsOfType("orchestrator.unblocked").map((d) => d.ticketId)).toEqual([
+        SWEEP, REVIEW, QA, CI, SHIP, APPROVAL, CD,
+      ]);
+      expect(madeRunnable().map((w) => w.ticketId)).toEqual(
+        expect.arrayContaining([SWEEP, REVIEW, QA, CI, SHIP, APPROVAL, CD]),
+      );
+
+      // The run's real terminal outcome, exactly as the dossier recorded it: one
+      // workflow.complete, on the epic, last.
+      const complete = detailsOfType("workflow.complete");
+      expect(complete).toHaveLength(1);
+      expect(complete[0]).toMatchObject({ workflowId: WF_ID, ticketId: EPIC, delivery: "cd" });
+      expect(allEvents().at(-1).type).toBe("workflow.complete");
+      expect(indexOfType("workflow.complete")).toBeGreaterThan(indexOfType("agent.complete"));
+      expect(h.state.storeCompletions.map((c) => c.id)).toEqual([WF_ID]);
+      expect(h.state.finalized).toEqual([WF_ID]);
+
+      // …and it closed on GitHub's merge proof, not on a shortcut: the ship-verdict
+      // gate stamped both ship tickets from the probe (note 6).
+      for (const id of [SHIP, CD]) {
+        expect(h.state.workflow.agentTasks[id], id).toMatchObject({
+          mergeCommit: MERGE_COMMIT, mergeVerifiedBy: "github",
+        });
+      }
+      expect(h.state.githubCalls.some((c) => /\/pulls\?head=/.test(c.url))).toBe(true);
+    }, 20_000);
+
+(2c) shadow == off, trace-identical — :969-989
+    it("is cascade-identical to off, and publishes no D2 event", async () => {
+      await loadWith({ sweep: "off" });
+      await replay();
+      const off = cascadeHops();
+
+      // A fresh board for the second pass — beforeEach only runs once per `it`.
+      Object.assign(h.state, {
+        board: buildBoard(), workflow: buildWorkflow(), completions: buildCompletions(),
+        ebEvents: [], invokes: [], statusWrites: [], blockerWrites: [], createdTickets: [],
+        terminalClaims: [], storeCompletions: [], finalized: [], terminalOutcome: null,
+        blockedKeys: new Map(), reverifySlots: new Set(),
+      });
+      await loadWith({ sweep: undefined });   // unset → shadow
+      await replay();
+
+      expect(cascadeHops()).toEqual(off);
+      expect(allEvents().filter((e) => /^sweep\./.test(e.type))).toEqual([]);
+      expect(countOfType("workflow.nothing_to_remove")).toBe(0);
+      expect(countOfType("workflow.complete")).toBe(1);
+      expect(h.state.terminalClaims.filter((c) => c.outcome === "nothing-to-remove")).toEqual([]);
+    }, 30_000);
+
+(2d) the card side: this outcome IS baseline-eligible — :1110-1126
+  it("the published outcome IS baseline-eligible — no-op exclusion does not catch it", async () => {
+    await loadWith({ sweep: "enforce" });
+    await replay();
+    expect(countOfType("workflow.complete")).toBe(1);
+
+    // cost-report constructs AWS clients at module load, but the constructors do no
+    // I/O, so a plain import is safe here (same precedent as event-id.test.mjs).
+    const { isBaselineEligible, shouldAlert, isNoOpOutcome } = await import("../cost-report/index.mjs");
+    const outcome = "complete";   // the phase this run's completion claims
+
+    expect(isNoOpOutcome({ outcome })).toBe(false);
+    expect(isBaselineEligible({ outcome, cost: { total: 12.4 } })).toBe(true);
+    expect(shouldAlert({ run: { outcome } })).toBe(true);
+    // Non-vacuous: the SAME shapes with c2uqki's outcome are excluded.
+    expect(isBaselineEligible({ outcome: "nothing-to-remove", cost: { total: 12.4 } })).toBe(false);
+    expect(shouldAlert({ run: { outcome: "nothing-to-remove" } })).toBe(false);
+  }, 20_000);
+
+(2e) and the run is held open until the HUMAN merge gate is approved (the strongest
+     form of 'the chain really ran'):
+1064:    it("holds the run open until the human merge gate is approved", async () => {
+1065-      await loadWith({ sweep: "enforce" });
+1066-      for (const id of [ANALYST, DETECT, SWEEP, REVIEW, QA, CI, SHIP]) await deliver(doneRecord(id));
+1067-
+1068-      // Ship is done and the PR is merged on GitHub, but the blocking Merge
+1069-      // Approval gate is still open — no completion.
+1070-      expect(countOfType("workflow.complete")).toBe(0);
+1071-      expect(h.state.storeCompletions).toEqual([]);
+1072-      expect(detailsOfType("orchestrator.unblocked").map((d) => d.ticketId)).toEqual([
+1073-        SWEEP, REVIEW, QA, CI, SHIP, APPROVAL,
+1074-      ]);
+1075-
+1076-      await deliver(doneRecord(APPROVAL));
+1077-      await deliver(doneRecord(CD));
+1078-      expect(countOfType("workflow.complete")).toBe(1);
+1079-    }, 20_000);
+1080-  });
+1081-
+1082-  // ── (5) D1 stays where D1 was ──────────────────────────────────────────────
+1083-  it("VERDICT_GATE=enforce does not hold this chain — no gate persona says anything but PASS", async () => {
+1084-    const { deriveVerdict } = await import("./verdict-contract.mjs");
+1085-    await loadWith({ sweep: "enforce", verdict: "enforce" });
+1086-    await replay();
+1087-
+1088-    // Three PASS verdicts, mapped off the personas' own prose by the shared ladder.
+1089-    const verdicts = Object.fromEntries(
+1090-      detailsOfType("agent.complete").filter((d) => d.verdict).map((d) => [d.ticketId, d.verdict]),
+1091-    );
+1092-    expect(verdicts).toEqual({ [REVIEW]: "PASS", [QA]: "PASS", [SHIP]: "PASS" });
+1093-
+1094-    // The fourth, TEAM-3588, resolves NO verdict — and that is the ladder's rule 1,
+
+--- (3) no independent probe added ---
+The gate's decision point (observeSweepDetection) is not exported from index.mjs, and
+the discriminating input is verified_removable !== 0, which the replay already drives
+through the real handler against the real vendored dossier. A probe would restate it.
+The one importable half — the cost-report predicates — the test already imports for real
+(:1117), and probes/item-06-performance-mirror.mjs covers the card arithmetic separately.
+
+--- (4) VERDICT: item 10 VERIFIED ---
+Both clauses asserted, and the negative is asserted five ways rather than once:
+terminalClaims for nothing-to-remove == [], countOfType('workflow.nothing_to_remove')
+=== 0, sweep.detection_observed == [], EVERY event matching /^sweep\./ == [], and no
+GitHub label call.
+
+Non-vacuity is explicit and is the part that matters here: agentTasks[DETECT] really
+carries verifiedRemovable: 8 (not 0) and s3Gets contains completions/<DETECT>.json,
+so the gate demonstrably READ the yield and then declined to act on it -- rather
+than the code path simply never being reached.
+
+'Full chain still dispatches' is proved by the exact unblock sequence
+[SWEEP, REVIEW, QA, CI, SHIP, APPROVAL, CD] in order, one workflow.complete on the
+epic with delivery 'cd' as the LAST event, storeCompletions == [WF_ID], and the run
+closing on GitHub's own merge proof (mergeCommit + mergeVerifiedBy: 'github' on both
+ship tickets, with a real /pulls?head= call). A separate test holds the run open at
+the human Merge Approval, so 'completes' is not a bypass.
+
+USEFUL DETAIL, honestly documented in the test at :894-897: there is no
+wouldClose:false observation to look for. observeSweepDetection returns null on
+verified_removable !== 0 BEFORE it publishes anything, so a productive sweep is
+never observed in ANY mode. The gate is not "observing and allowing" here -- it is
+short-circuiting. Sound, but it means shadow-mode telemetry on a productive sweep is
+silent, so an operator cannot distinguish "gate ran and approved" from "gate never
+loaded". The mode-parity test (:969) closes that by comparing full traces instead.
+
+EXIT=0
