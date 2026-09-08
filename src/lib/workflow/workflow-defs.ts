@@ -281,11 +281,6 @@ export function sdlcFrameworkForDef(def: WorkflowDef): SdlcFramework {
   return def.sdlcFramework === "playbook" || def.sdlcFramework === "aidlc" ? def.sdlcFramework : "standard";
 }
 
-/** Whether a ticket assignee refers to a human reviewer rather than an agent. */
-export function isHumanAssignee(assignee?: string | null): boolean {
-  return !!assignee && assignee.startsWith("human:");
-}
-
 /** The agentPhase ordering for a workflow, including terminal "complete". */
 export function getPhaseOrder(def: WorkflowDef): string[] {
   const order = ["intake", ...def.phases.filter((p) => p.agentPhase !== "intake").map((p) => p.agentPhase)];

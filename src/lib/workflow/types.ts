@@ -129,10 +129,6 @@ export interface Artifact {
   timestamp: string;
 }
 
-// ─── Agent Definitions ───────────────────────────────────────────────────────
-
-export type AgentPhase = "requirements" | "design" | "development" | "verification" | "review" | "ship";
-
 // ─── Workflow State ──────────────────────────────────────────────────────────
 
 // TEAM-3747 D2 — lifecycle-integrity terminal outcomes ("no green close over
