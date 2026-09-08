@@ -16,10 +16,23 @@ import { NextRequest } from "next/server";
  * agent's authoritative record is never clobbered, BEFORE the transition so the
  * orchestrator's done cascade harvests it in the same pass.
  *
+ * TEAM-4282 fixes the four defects TEAM-4269 found in that change, and the fake S3
+ * below grew into a real little bucket to pin them, because IfNoneMatch / IfMatch /
+ * ETag semantics ARE the behaviour under test:
+ *   F1  a refused transition arrives as a 200 Lambda payload (textResult in dynamodb
+ *       mode, { error } in jira mode) → the route must 409 and undo its own write.
+ *   F1b ticketId is an S3 key segment and, in jira mode, was never proved to belong
+ *       to this workflow.
+ *   F2  a non-412 write failure must fail the request, not close the ticket blind.
+ *   F3  a 412 against a BLANK record (reportCompletion writes summary verbatim and
+ *       unconditionally) must be filled, conditionally on the ETag just read.
+ *
  * We mock only the seams: the S3 + Lambda clients (every command lands in ONE ordered
  * call log so relative ordering is assertable) and the two ticket readers.
  * gate-decision is left real — it is pure, and case "escalation gate" pins that the
- * new write did not disturb its DECISION defaulting.
+ * new write did not disturb its DECISION defaulting. completion-evidence is left real
+ * too: the route imports the gates' own completionRecordHasEvidence, and "has evidence"
+ * must mean the same thing here as it does at the gate.
  */
 
 const h = vi.hoisted(() => {
@@ -29,27 +42,79 @@ const h = vi.hoisted(() => {
     // Every S3/Lambda command, in the order the route issued them: proves the
     // PutObject happens BEFORE the tickets-Lambda InvokeCommand.
     calls: Array<{ client: "s3" | "lambda"; command: string; input: Record<string, unknown> }>;
-    // Objects the fake bucket actually holds after the run — a 412 must leave it empty.
-    stored: Record<string, string>;
+    // The fake bucket: key -> { body, etag }. A 412 must leave it as it was.
+    bucket: Record<string, { body: string; etag: string }>;
     // When set, the next PutObject rejects with this error.
     s3PutError: Error | null;
-  } = { tickets: [], workflow: { workflowId: "wf_1" }, calls: [], stored: {}, s3PutError: null };
-  return { state };
+    // When set, GetObjectCommand rejects with this error.
+    s3GetError: Error | null;
+    // Runs right after a successful GetObjectCommand — lets a test mutate the bucket
+    // in the window between the read and the conditional write, i.e. the real race.
+    afterGet: (() => void) | null;
+    // What the tickets Lambda replies with (dynamodb-mode success by default).
+    lambdaPayload: unknown;
+    // When set, getTicketsForWorkflowFromJira throws it.
+    jiraListError: Error | null;
+    etagSeq: number;
+  } = {
+    tickets: [], workflow: { workflowId: "wf_1" }, calls: [], bucket: {},
+    s3PutError: null, s3GetError: null, afterGet: null,
+    lambdaPayload: { status: "transitioned" }, jiraListError: null, etagSeq: 0,
+  };
+  const precondition = () => {
+    const e = new Error("At least one of the pre-conditions you specified did not hold");
+    e.name = "PreconditionFailed";
+    return e;
+  };
+  const noSuchKey = () => {
+    const e = new Error("The specified key does not exist.");
+    e.name = "NoSuchKey";
+    return e;
+  };
+  return { state, precondition, noSuchKey };
 });
 
 vi.mock("@aws-sdk/client-s3", () => {
   class PutObjectCommand {
     constructor(public input: Record<string, unknown>) {}
   }
+  class GetObjectCommand {
+    constructor(public input: Record<string, unknown>) {}
+  }
+  class DeleteObjectCommand {
+    constructor(public input: Record<string, unknown>) {}
+  }
   class S3Client {
     async send(cmd: { constructor: { name: string }; input: Record<string, unknown> }) {
-      h.state.calls.push({ client: "s3", command: cmd.constructor.name, input: cmd.input });
+      const name = cmd.constructor.name;
+      h.state.calls.push({ client: "s3", command: name, input: cmd.input });
+      const key = String(cmd.input.Key);
+      const held = h.state.bucket[key];
+
+      if (name === "GetObjectCommand") {
+        if (h.state.s3GetError) throw h.state.s3GetError;
+        if (!held) throw h.noSuchKey();
+        h.state.afterGet?.();
+        return { Body: { transformToString: async () => held.body }, ETag: held.etag };
+      }
+
+      if (name === "DeleteObjectCommand") {
+        // Conditional delete: only removes the exact version the caller saw.
+        if (cmd.input.IfMatch !== undefined && held?.etag !== cmd.input.IfMatch) throw h.precondition();
+        delete h.state.bucket[key];
+        return {};
+      }
+
+      // PutObjectCommand
       if (h.state.s3PutError) throw h.state.s3PutError;
-      h.state.stored[String(cmd.input.Key)] = String(cmd.input.Body);
-      return {};
+      if (cmd.input.IfNoneMatch === "*" && held) throw h.precondition();
+      if (cmd.input.IfMatch !== undefined && held?.etag !== cmd.input.IfMatch) throw h.precondition();
+      const etag = `"etag-${++h.state.etagSeq}"`;
+      h.state.bucket[key] = { body: String(cmd.input.Body), etag };
+      return { ETag: etag };
     }
   }
-  return { S3Client, PutObjectCommand };
+  return { S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand };
 });
 
 vi.mock("@aws-sdk/client-lambda", () => {
@@ -59,7 +124,7 @@ vi.mock("@aws-sdk/client-lambda", () => {
   class LambdaClient {
     async send(cmd: { constructor: { name: string }; input: Record<string, unknown> }) {
       h.state.calls.push({ client: "lambda", command: cmd.constructor.name, input: cmd.input });
-      return { Payload: Buffer.from(JSON.stringify({ status: "transitioned" })) };
+      return { Payload: Buffer.from(JSON.stringify(h.state.lambdaPayload)) };
     }
   }
   return { LambdaClient, InvokeCommand };
@@ -70,7 +135,10 @@ vi.mock("@/lib/workflow/dynamo-read", () => ({
   getTicketsForWorkflowFromDynamo: vi.fn(async () => h.state.tickets),
 }));
 vi.mock("@/lib/workflow/jira-read", () => ({
-  getTicketsForWorkflowFromJira: vi.fn(async () => h.state.tickets),
+  getTicketsForWorkflowFromJira: vi.fn(async () => {
+    if (h.state.jiraListError) throw h.state.jiraListError;
+    return h.state.tickets;
+  }),
 }));
 
 let POST: typeof import("./route").POST;
@@ -85,11 +153,32 @@ async function load() {
 }
 
 const EVIDENCE = "PR #87 open+green / streamed QA VERDICT: PASS";
+const KEY = "completions/TEAM-X.json";
+
+/** The refusal shapes the two ticket Lambdas actually return (both HTTP 200). */
+const DDB_REFUSAL = {
+  content: [{ text: 'Invalid transition "done" from status "done". Available: reopen (→ todo)' }],
+};
+const JIRA_REFUSAL = { error: 'No transition to "Done" found. Available: Reopen (-> To Do)' };
+/** …and their success shapes — note jira's `status` is NOT "transitioned". */
+const DDB_SUCCESS = { key: "TEAM-X", status: "transitioned", from: "in_progress", to: "done", transition: "Done" };
+const JIRA_SUCCESS = { ticketId: "TEAM-X", status: "done", message: "Transitioned to done" };
+
+/** Seed the fake bucket as if an agent's report_completion had already written. */
+function seed(key: string, record: Record<string, unknown>, etag = '"etag-seed"') {
+  h.state.bucket[key] = { body: JSON.stringify(record, null, 2), etag };
+  return h.state.bucket[key].body;
+}
 
 beforeEach(() => {
   h.state.calls.length = 0;
-  h.state.stored = {};
+  h.state.bucket = {};
   h.state.s3PutError = null;
+  h.state.s3GetError = null;
+  h.state.afterGet = null;
+  h.state.lambdaPayload = { status: "transitioned" };
+  h.state.jiraListError = null;
+  h.state.etagSeq = 0;
   h.state.workflow = { workflowId: "wf_1" };
   h.state.tickets = [
     { ticketId: "TEAM-X", status: "in_progress", assignee: "agentcore_hub_backend_dev", title: "Build the thing" },
@@ -116,8 +205,13 @@ function post(body: Record<string, unknown>, id = "wf_1") {
   );
 }
 
+const s3calls = () => h.state.calls.filter((c) => c.client === "s3");
 const puts = () => h.state.calls.filter((c) => c.client === "s3" && c.command === "PutObjectCommand");
+const gets = () => h.state.calls.filter((c) => c.client === "s3" && c.command === "GetObjectCommand");
+const dels = () => h.state.calls.filter((c) => c.client === "s3" && c.command === "DeleteObjectCommand");
 const invokes = () => h.state.calls.filter((c) => c.client === "lambda");
+const stored = () =>
+  Object.fromEntries(Object.entries(h.state.bucket).map(([k, v]) => [k, v.body]));
 
 describe("transition route — completion evidence record (TEAM-4266)", () => {
   it("done + evidence + no existing record → writes completions/{ticketId}.json BEFORE the transition", async () => {
@@ -128,11 +222,14 @@ describe("transition route — completion evidence record (TEAM-4266)", () => {
     expect(res.status).toBe(200);
     expect(json).toMatchObject({ success: true, ticketId: "TEAM-X", newStatus: "done", completionRecordWritten: true });
 
-    // Exactly one PUT, at the documented key, create-only.
+    // Exactly one PUT, at the documented key, create-only — and nothing else: a
+    // clean create never reads or deletes (TEAM-4282).
     expect(puts()).toHaveLength(1);
+    expect(gets()).toHaveLength(0);
+    expect(dels()).toHaveLength(0);
     const put = puts()[0].input;
     expect(put.Bucket).toBe("test-bucket");
-    expect(put.Key).toBe("completions/TEAM-X.json");
+    expect(put.Key).toBe(KEY);
     expect(put.IfNoneMatch).toBe("*");
     expect(put.ContentType).toBe("application/json");
 
@@ -173,26 +270,9 @@ describe("transition route — completion evidence record (TEAM-4266)", () => {
     const json = await res.json();
 
     expect(puts()).toHaveLength(0);
-    expect(h.state.calls.filter((c) => c.client === "s3")).toHaveLength(0);
+    expect(s3calls()).toHaveLength(0);
     expect(json).toEqual({ success: true, ticketId: "TEAM-X", newStatus: "done" });
     expect(json).not.toHaveProperty("completionRecordWritten");
-    expect(invokes()).toHaveLength(1);
-  });
-
-  it("record already exists (412 PreconditionFailed) → nothing overwritten, transition still happens", async () => {
-    await load();
-    const exists = new Error("At least one of the pre-conditions you specified did not hold");
-    exists.name = "PreconditionFailed";
-    h.state.s3PutError = exists;
-
-    const res = await post({ ticketId: "TEAM-X", targetStatus: "done", evidence: EVIDENCE });
-    const json = await res.json();
-
-    // The create-only PUT was attempted and refused — the agent's authoritative
-    // record survives (the fake bucket holds nothing our PUT could have written).
-    expect(puts()).toHaveLength(1);
-    expect(h.state.stored).toEqual({});
-    expect(json).toMatchObject({ success: true, completionRecordWritten: false });
     expect(invokes()).toHaveLength(1);
   });
 
@@ -201,33 +281,8 @@ describe("transition route — completion evidence record (TEAM-4266)", () => {
     const res = await post({ ticketId: "TEAM-X", targetStatus: "blocked", evidence: EVIDENCE });
     const json = await res.json();
 
-    expect(h.state.calls.filter((c) => c.client === "s3")).toHaveLength(0);
+    expect(s3calls()).toHaveLength(0);
     expect(json).toEqual({ success: true, ticketId: "TEAM-X", newStatus: "blocked" });
-    expect(invokes()).toHaveLength(1);
-  });
-
-  it("a generic S3 failure never blocks the transition", async () => {
-    await load();
-    h.state.s3PutError = new Error("kaboom");
-
-    const res = await post({ ticketId: "TEAM-X", targetStatus: "done", evidence: EVIDENCE });
-    const json = await res.json();
-
-    expect(res.status).toBe(200);
-    expect(json).toMatchObject({ success: true, newStatus: "done", completionRecordWritten: false });
-    expect(invokes()).toHaveLength(1);
-  });
-
-  it("ARTIFACT_BUCKET unset → skips the write, no 500", async () => {
-    delete process.env.ARTIFACT_BUCKET;
-    await load();
-
-    const res = await post({ ticketId: "TEAM-X", targetStatus: "done", evidence: EVIDENCE });
-    const json = await res.json();
-
-    expect(res.status).toBe(200);
-    expect(h.state.calls.filter((c) => c.client === "s3")).toHaveLength(0);
-    expect(json).toMatchObject({ success: true, completionRecordWritten: false });
     expect(invokes()).toHaveLength(1);
   });
 
@@ -238,7 +293,7 @@ describe("transition route — completion evidence record (TEAM-4266)", () => {
       const res = await post({ ticketId: "TEAM-X", targetStatus: "done", evidence: value });
       const json = await res.json();
       expect(res.status).toBe(200);
-      expect(h.state.calls.filter((c) => c.client === "s3")).toHaveLength(0);
+      expect(s3calls()).toHaveLength(0);
       expect(json).not.toHaveProperty("completionRecordWritten");
     }
   });
@@ -275,9 +330,11 @@ describe("transition route — completion evidence record (TEAM-4266)", () => {
     const res = await post({ ticketId: "TEAM-X", targetStatus: "done", evidence: EVIDENCE });
     const json = await res.json();
 
+    // TEAM-4282 F1b: TEAM-X IS in the workflow's Jira tickets, so the ownership
+    // proof resolves and the write proceeds exactly as before.
     expect(json).toMatchObject({ success: true, completionRecordWritten: true });
     expect(puts()).toHaveLength(1);
-    expect(puts()[0].input.Key).toBe("completions/TEAM-X.json");
+    expect(puts()[0].input.Key).toBe(KEY);
   });
 
   it("evidence longer than the gate's own cap is truncated to 10000 chars", async () => {
@@ -285,5 +342,380 @@ describe("transition route — completion evidence record (TEAM-4266)", () => {
     await post({ ticketId: "TEAM-X", targetStatus: "done", evidence: "x".repeat(20000) });
     const record = JSON.parse(String(puts()[0].input.Body));
     expect(record.summary).toHaveLength(10000);
+  });
+});
+
+/**
+ * TEAM-4282 F1 — a refused transition is reported INSIDE a 200 Lambda payload
+ * (lambda/agentcore-hub-tickets/index.mjs:748 textResult / agentcore-hub-jira
+ * index.mjs:1074 { error }), so checking response.FunctionError alone reported
+ * success:true for a ticket that never moved AND left the evidence record behind.
+ */
+describe("transition route — a refused transition is not a success (TEAM-4282 F1)", () => {
+  it("dynamodb-mode textResult refusal → 409 and the record this call created is deleted", async () => {
+    await load();
+    h.state.lambdaPayload = DDB_REFUSAL;
+
+    const res = await post({ ticketId: "TEAM-X", targetStatus: "done", evidence: EVIDENCE });
+    const json = await res.json();
+
+    expect(res.status).toBe(409);
+    expect(json).not.toHaveProperty("success");
+    expect(json.error).toBe("Ticket transition rejected");
+    expect(json.details).toContain("Invalid transition");
+    expect(json).toMatchObject({
+      ticketId: "TEAM-X", targetStatus: "done",
+      completionRecordWritten: false, completionRecordReverted: true,
+    });
+
+    // The orphan is compensated with a CONDITIONAL delete on the version we wrote.
+    expect(puts()).toHaveLength(1);
+    expect(dels()).toHaveLength(1);
+    expect(dels()[0].input).toMatchObject({ Bucket: "test-bucket", Key: KEY, IfMatch: '"etag-1"' });
+    expect(stored()).toEqual({});
+  });
+
+  it("jira-mode { error } refusal → 409 and the record this call created is deleted", async () => {
+    process.env.TICKET_PROVIDER = "jira";
+    await load();
+    h.state.lambdaPayload = JIRA_REFUSAL;
+
+    const res = await post({ ticketId: "TEAM-X", targetStatus: "done", evidence: EVIDENCE });
+    const json = await res.json();
+
+    expect(res.status).toBe(409);
+    expect(json.error).toBe("Ticket transition rejected");
+    expect(json.details).toContain('No transition to "Done" found');
+    expect(json).toMatchObject({ completionRecordWritten: false, completionRecordReverted: true });
+    expect(dels()).toHaveLength(1);
+    expect(dels()[0].input.IfMatch).toBe('"etag-1"');
+    expect(stored()).toEqual({});
+  });
+
+  it("a refusal with NO evidence → 409 with zero S3 traffic (detection is independent of the write)", async () => {
+    await load();
+    h.state.lambdaPayload = DDB_REFUSAL;
+    // in_progress → in_review is legal locally; the Lambda is what refuses.
+    h.state.tickets = [{ ticketId: "TEAM-X", status: "in_progress", assignee: "human:reviewer", title: "Gate" }];
+
+    const res = await post({ ticketId: "TEAM-X", targetStatus: "in_review" });
+    const json = await res.json();
+
+    expect(res.status).toBe(409);
+    expect(json.error).toBe("Ticket transition rejected");
+    expect(json).not.toHaveProperty("completionRecordWritten");
+    expect(json).not.toHaveProperty("completionRecordReverted");
+    expect(s3calls()).toHaveLength(0);
+  });
+
+  it("positive control: the dynamodb success payload is still a success", async () => {
+    await load();
+    h.state.lambdaPayload = DDB_SUCCESS;
+
+    const res = await post({ ticketId: "TEAM-X", targetStatus: "done", evidence: EVIDENCE });
+    const json = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(json).toMatchObject({ success: true, completionRecordWritten: true });
+    expect(dels()).toHaveLength(0);
+    expect(Object.keys(stored())).toEqual([KEY]);
+  });
+
+  it("positive control: the jira success payload (status \"done\", not \"transitioned\") is a success", async () => {
+    // The regression guard for a success ALLOW-list: a `status === "transitioned"`
+    // check would 409 here and delete a record for a ticket that really did move.
+    process.env.TICKET_PROVIDER = "jira";
+    await load();
+    h.state.lambdaPayload = JIRA_SUCCESS;
+
+    const res = await post({ ticketId: "TEAM-X", targetStatus: "done", evidence: EVIDENCE });
+    const json = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(json).toMatchObject({ success: true, completionRecordWritten: true });
+    expect(dels()).toHaveLength(0);
+    expect(Object.keys(stored())).toEqual([KEY]);
+  });
+
+  it("refusal after a 412 kept somebody else's record → NO DeleteObject", async () => {
+    await load();
+    const body = seed(KEY, { ticket_id: "TEAM-X", summary: "agent shipped PR #87", pr_url: "https://x/pr/87" });
+    h.state.lambdaPayload = DDB_REFUSAL;
+
+    const res = await post({ ticketId: "TEAM-X", targetStatus: "done", evidence: EVIDENCE });
+    const json = await res.json();
+
+    expect(res.status).toBe(409);
+    expect(json).toMatchObject({ completionRecordWritten: false, completionRecordReverted: false });
+    // This call wrote nothing, so it may not remove anything.
+    expect(dels()).toHaveLength(0);
+    expect(stored()).toEqual({ [KEY]: body });
+  });
+
+  it("refusal after FILLING a blank record → the original bytes are restored, not deleted", async () => {
+    await load();
+    const original = seed(KEY, {
+      ticket_id: "TEAM-X", summary: "", artifacts: "", branch: "feature/TEAM-X",
+      commit_sha: null, pr_url: null, completed_at: "2026-09-01T00:00:00.000Z",
+    });
+    h.state.lambdaPayload = JIRA_REFUSAL;
+
+    const res = await post({ ticketId: "TEAM-X", targetStatus: "done", evidence: EVIDENCE });
+    const json = await res.json();
+
+    expect(res.status).toBe(409);
+    expect(json).toMatchObject({ completionRecordWritten: false, completionRecordReverted: true });
+    // create-only PUT (412) → refill PUT → restore PUT; never a delete, because the
+    // record pre-existed this call.
+    expect(puts()).toHaveLength(3);
+    expect(dels()).toHaveLength(0);
+    expect(puts()[2].input.IfMatch).toBe('"etag-1"'); // the version our refill wrote
+    expect(stored()).toEqual({ [KEY]: original });
+  });
+});
+
+/**
+ * TEAM-4282 F1b — ticketId becomes an S3 key segment, and in jira mode nothing
+ * proved it belongs to THIS workflow before PR #430 used it.
+ */
+describe("transition route — ticketId shape + ownership (TEAM-4282 F1b)", () => {
+  it.each(["../../etc/passwd", "a/b", "has space", "__COUNTER__", "TEAM-X.json", ""])(
+    "rejects ticketId %j with 400 and no AWS traffic",
+    async (bad) => {
+      await load();
+      const res = await post({ ticketId: bad, targetStatus: "done", evidence: EVIDENCE });
+      const json = await res.json();
+
+      expect(res.status).toBe(400);
+      expect(json.error).toMatch(/ticketId/);
+      expect(s3calls()).toHaveLength(0);
+      expect(invokes()).toHaveLength(0);
+    }
+  );
+
+  it("accepts the id shapes the system actually mints", async () => {
+    await load();
+    for (const good of ["TEAM-4266", "AGENTCORE-1", "B2", "CLEAN-1", "wf_1-3"]) {
+      h.state.calls.length = 0;
+      h.state.bucket = {};
+      h.state.tickets = [{ ticketId: good, status: "in_progress", assignee: "dev", title: "t" }];
+      const res = await post({ ticketId: good, targetStatus: "done", evidence: EVIDENCE });
+      expect(res.status).toBe(200);
+      expect(puts()[0].input.Key).toBe(`completions/${good}.json`);
+    }
+  });
+
+  it("jira mode + evidence, ticket not in this workflow → 404, no PUT, no transition", async () => {
+    process.env.TICKET_PROVIDER = "jira";
+    await load();
+    h.state.tickets = [{ ticketId: "OTHER-9", status: "in_progress", assignee: "dev", title: "someone else's" }];
+
+    const res = await post({ ticketId: "TEAM-X", targetStatus: "done", evidence: EVIDENCE });
+    const json = await res.json();
+
+    expect(res.status).toBe(404);
+    expect(json).toEqual({ error: "Ticket not found" });
+    expect(s3calls()).toHaveLength(0);
+    expect(invokes()).toHaveLength(0);
+  });
+
+  it("jira mode + evidence, the ownership lookup THROWS → 502 fail-closed, no PUT, no transition", async () => {
+    process.env.TICKET_PROVIDER = "jira";
+    await load();
+    h.state.jiraListError = new Error("Jira search failed: 503 Service Unavailable");
+
+    const res = await post({ ticketId: "TEAM-X", targetStatus: "done", evidence: EVIDENCE });
+    const json = await res.json();
+
+    expect(res.status).toBe(502);
+    expect(json.error).toBe("could not verify the ticket belongs to this workflow");
+    expect(json.details).toContain("503");
+    expect(s3calls()).toHaveLength(0);
+    expect(invokes()).toHaveLength(0);
+  });
+
+  it("jira mode WITHOUT evidence keeps the best-effort lookup: a throw never blocks the approve", async () => {
+    process.env.TICKET_PROVIDER = "jira";
+    await load();
+    h.state.jiraListError = new Error("Jira search failed: 503 Service Unavailable");
+
+    const res = await post({ ticketId: "TEAM-X", targetStatus: "done", comment: "Approved from console" });
+    const json = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(json).toMatchObject({ success: true, newStatus: "done" });
+    expect(s3calls()).toHaveLength(0);
+    expect(invokes()).toHaveLength(1);
+  });
+});
+
+/**
+ * TEAM-4282 F2 — the write is no longer best-effort. Closing the ticket with no
+ * record is unrecoverable: mark-done again is a done→done the Lambda refuses.
+ */
+describe("transition route — a failed evidence write blocks the transition (TEAM-4282 F2)", () => {
+  it("a non-412 S3 failure with evidence → 502 and the transition never fires", async () => {
+    await load();
+    h.state.s3PutError = new Error("kaboom");
+
+    const res = await post({ ticketId: "TEAM-X", targetStatus: "done", evidence: EVIDENCE });
+    const json = await res.json();
+
+    expect(res.status).toBe(502);
+    expect(json).toEqual({ error: "completion evidence record write failed", details: "kaboom" });
+    expect(invokes()).toHaveLength(0);
+  });
+
+  it("ARTIFACT_BUCKET unset with evidence → fails closed with a self-diagnosing message", async () => {
+    delete process.env.ARTIFACT_BUCKET;
+    await load();
+
+    const res = await post({ ticketId: "TEAM-X", targetStatus: "done", evidence: EVIDENCE });
+    const json = await res.json();
+
+    expect(res.status).toBe(502);
+    expect(json).toEqual({
+      error: "completion evidence record write failed",
+      details: "ARTIFACT_BUCKET is not configured",
+    });
+    expect(s3calls()).toHaveLength(0);
+    expect(invokes()).toHaveLength(0);
+  });
+
+  it("ARTIFACT_BUCKET unset WITHOUT evidence → unaffected, the approve still lands", async () => {
+    delete process.env.ARTIFACT_BUCKET;
+    await load();
+
+    const res = await post({ ticketId: "TEAM-X", targetStatus: "done", comment: "Approved from console" });
+    const json = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(json).toEqual({ success: true, ticketId: "TEAM-X", newStatus: "done" });
+    expect(s3calls()).toHaveLength(0);
+    expect(invokes()).toHaveLength(1);
+  });
+
+  it("a failed READ of the existing record also fails closed", async () => {
+    await load();
+    seed(KEY, { ticket_id: "TEAM-X", summary: "" });
+    h.state.s3GetError = new Error("AccessDenied");
+
+    const res = await post({ ticketId: "TEAM-X", targetStatus: "done", evidence: EVIDENCE });
+    const json = await res.json();
+
+    expect(res.status).toBe(502);
+    expect(json).toEqual({ error: "completion evidence record write failed", details: "AccessDenied" });
+    expect(invokes()).toHaveLength(0);
+  });
+});
+
+/**
+ * TEAM-4282 F3 — a 412 is not automatically "the agent's record wins".
+ * reportCompletion (lambda/workflow-output) writes `summary` verbatim and PUTs
+ * unconditionally, so an agent can leave an all-blank record that is NOT evidence
+ * per completionRecordHasEvidence yet 412s the create-only PUT forever.
+ */
+describe("transition route — 412 fill-if-blank (TEAM-4282 F3)", () => {
+  it("existing record has evidence → read it, keep it, transition anyway", async () => {
+    await load();
+    const body = seed(KEY, {
+      ticket_id: "TEAM-X", summary: "agent shipped it", artifacts: "", branch: "feature/TEAM-X",
+      commit_sha: "abc1234", pr_url: "https://github.com/x/y/pull/87",
+    });
+
+    const res = await post({ ticketId: "TEAM-X", targetStatus: "done", evidence: EVIDENCE });
+    const json = await res.json();
+
+    // The create-only PUT was attempted and refused; we read the record, saw real
+    // evidence, and wrote nothing — the agent's authoritative record survives.
+    expect(puts()).toHaveLength(1);
+    expect(gets()).toHaveLength(1);
+    expect(stored()).toEqual({ [KEY]: body });
+    expect(json).toMatchObject({ success: true, completionRecordWritten: false });
+    expect(invokes()).toHaveLength(1);
+  });
+
+  it("existing record is BLANK → refilled with IfMatch on the ETag just read", async () => {
+    await load();
+    seed(KEY, {
+      ticket_id: "TEAM-X", summary: "", artifacts: "", branch: "feature/TEAM-X",
+      commit_sha: null, pr_url: null, completed_at: "2026-09-01T00:00:00.000Z",
+    });
+
+    const res = await post({ ticketId: "TEAM-X", targetStatus: "done", evidence: EVIDENCE });
+    const json = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(json).toMatchObject({ success: true, completionRecordWritten: true });
+    expect(puts()).toHaveLength(2);
+    expect(gets()).toHaveLength(1);
+    // Conditional on exactly the version we read, so a real agent record landing in
+    // between wins instead of being clobbered.
+    expect(puts()[1].input.IfMatch).toBe('"etag-seed"');
+    expect(puts()[1].input.IfNoneMatch).toBeUndefined();
+
+    const merged = JSON.parse(stored()[KEY]);
+    expect(merged).toMatchObject({
+      ticket_id: "TEAM-X",
+      summary: EVIDENCE,
+      source: "workflow-manager",
+      evidence_kind: "static",
+      branch: "feature/TEAM-X",              // non-evidence field preserved
+      completed_at: "2026-09-01T00:00:00.000Z", // the agent's own timestamp preserved
+    });
+    // And the filled record now satisfies the gate.
+    const { completionRecordHasEvidence } = await import("@/lib/workflow/completion-evidence");
+    expect(completionRecordHasEvidence(merged)).toBe(true);
+  });
+
+  it("a concurrent agent record lands during the refill (IfMatch 412) → it wins", async () => {
+    await load();
+    seed(KEY, { ticket_id: "TEAM-X", summary: "" }, '"etag-stale"');
+    // The race, exactly as S3 serialises it: our GET sees the blank record, then the
+    // agent's real report_completion lands, so our IfMatch refill is refused.
+    let winner = "";
+    h.state.afterGet = () => {
+      winner = seed(KEY, { ticket_id: "TEAM-X", summary: "the real thing" }, '"etag-newer"');
+      h.state.afterGet = null;
+    };
+
+    const res = await post({ ticketId: "TEAM-X", targetStatus: "done", evidence: EVIDENCE });
+    const json = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(json).toMatchObject({ success: true, completionRecordWritten: false });
+    // Two PUTs attempted (create-only, then the refill), both refused; the agent's
+    // record is untouched and no revert is owed.
+    expect(puts()).toHaveLength(2);
+    expect(dels()).toHaveLength(0);
+    expect(stored()).toEqual({ [KEY]: winner });
+    expect(invokes()).toHaveLength(1);
+  });
+
+  it("an unparseable existing record is not evidence → refilled", async () => {
+    await load();
+    h.state.bucket[KEY] = { body: "not json at all", etag: '"etag-junk"' };
+
+    const res = await post({ ticketId: "TEAM-X", targetStatus: "done", evidence: EVIDENCE });
+    const json = await res.json();
+
+    expect(json).toMatchObject({ success: true, completionRecordWritten: true });
+    expect(puts()).toHaveLength(2);
+    expect(puts()[1].input.IfMatch).toBe('"etag-junk"');
+    expect(JSON.parse(stored()[KEY])).toMatchObject({ ticket_id: "TEAM-X", summary: EVIDENCE });
+  });
+
+  it("the record vanishes between the create-only PUT and the read → nothing written, transition proceeds", async () => {
+    await load();
+    // 412 on the create-only PUT, then a 404 on the read.
+    h.state.s3PutError = h.precondition();
+    const res = await post({ ticketId: "TEAM-X", targetStatus: "done", evidence: EVIDENCE });
+    const json = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(json).toMatchObject({ success: true, completionRecordWritten: false });
+    expect(gets()).toHaveLength(1);
+    expect(stored()).toEqual({});
+    expect(invokes()).toHaveLength(1);
   });
 });
