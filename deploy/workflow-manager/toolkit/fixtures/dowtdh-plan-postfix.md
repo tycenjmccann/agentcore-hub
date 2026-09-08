@@ -14,6 +14,12 @@ finally reconciled into (TEAM-4174 comment 2026-09-06 15:09), and the Deviations
 section names the decision id. Only the sections `unreferencedDecisions` reads are
 reproduced — this is a fixture for the citation rule, not a replica of the 180-line
 original.
+
+The Concern-4 row is here for the same reason: the product owner resolved TWO
+concerns in that one TEAM-4174 comment, so a plan that cites only Concern 3 still
+drops a decision. It cites the id directly (rule 1); Concern 3 is cited both ways
+(the id in Deviations D1, and "TEAM-4174" + "Concern 3" in the row above it), and
+TEAM-4176#3 by rule 2 — the gate key plus the concern number, both in D1.
 -->
 
 # Plan: Clear the Activity feed with an undo window
@@ -29,6 +35,7 @@ follows the product owner's gate decision.
 | # | Concern | Policy | Owner | Proposed resolution | Status |
 | --- | --- | --- | --- | --- | --- |
 | 3 | (spec) Undo auto-dismisses at 5000 ms, not persistent. | UX | human:design-lead | 5000 ms window; pause the countdown while Undo has focus or hover (PO). Implemented as hover-pause on the notice row; focus-pause omitted — see Deviations D1. (PO, TEAM-4174 comment 2026-09-06 15:09.) | resolved |
+| 4 | (spec) A reload inside the undo window loses the pending clear. | Data | human:product-owner | Accept commit-at-click; the snapshot stays memory-only (PO, TEAM-4174#4). | resolved |
 
 ## Deviations
 

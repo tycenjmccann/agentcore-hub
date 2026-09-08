@@ -463,6 +463,14 @@ export default defineConfig({
       // TEAM-4178 approved a plan contradicting the product owner's own Concern-3
       // decision because nothing in the package said so.
       "lambda/orchestrator/decision-ledger.test.mjs",
+      // replay-dowtdh-decision-loss (TEAM-4248 D3, acceptance 4) — the run itself,
+      // driven through the REAL gate path with the REAL review-cap: the two gate
+      // approvals that carried the product owner's decisions, then TEAM-4178. Its
+      // fixtures are dowtdh's own record (workflow row, workflow def, the six
+      // review-package bullets the engineer saw, the review.needed / agent.complete
+      // events), so `off` reproduces the defect exactly, shadow leads the same package
+      // with what was dropped, and enforce reopens TEAM-4177 instead of paging anyone.
+      "lambda/orchestrator/replay-dowtdh-decision-loss.test.mjs",
     ],
     // Keep unit tests away from the Playwright specs under tests/.
     exclude: ["tests/**", "node_modules/**", "demo/**"],
