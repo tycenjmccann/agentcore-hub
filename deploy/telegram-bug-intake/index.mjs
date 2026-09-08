@@ -861,8 +861,16 @@ const ESC_DETAIL_MAX = 700;
 // A finished run cannot be "parked" — its leftover escalations are history, not
 // work. Paging them would only flood the chat (first rollout pinged ~40 stale
 // ones from completed runs). Terminal phases per the orchestrator's
-// claimTerminalOutcome: complete / cancelled / deploy-blocked / static-ci-only.
-const TERMINAL_PHASES = new Set(["complete", "completed", "cancelled", "canceled", "failed", "deploy-blocked", "static-ci-only"]);
+// claimTerminalOutcome: complete / cancelled / deploy-blocked / static-ci-only /
+// nothing-to-remove / error. This is a SUPERSET of the canonical list —
+// src/lib/workflow/types.ts TERMINAL_PHASES / lambda/orchestrator/completion.mjs
+// TERMINAL_WORKFLOW_PHASES — carrying three legacy aliases ("completed",
+// "canceled", "failed") this file has always also treated as finished; see
+// run-outcome-parity.test.ts for the superset assertion that keeps it that way.
+const TERMINAL_PHASES = new Set([
+  "complete", "completed", "cancelled", "canceled", "failed", "error",
+  "deploy-blocked", "static-ci-only", "nothing-to-remove",
+]);
 
 // TEAM-4120 FR-3 — a dead-session escalation is a different DECISION from a
 // Workflow Manager escalation: the run is not asking "what should I do", it is

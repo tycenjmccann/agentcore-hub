@@ -144,6 +144,26 @@ describe("the .mjs literal mirrors ≡ types.ts", () => {
   }
 });
 
+describe("the Telegram bug-intake TERMINAL_PHASES — a SUPERSET, not equality (TEAM-4264 F6)", () => {
+  // Unlike the three .mjs mirrors above, this file's set is not required to match
+  // TERMINAL_PHASES exactly: it also carries three legacy aliases ("completed",
+  // "canceled", "failed") the intake has always additionally treated as finished,
+  // so an equality assertion here would fail on values the canonical list was
+  // never meant to gain. What D2/F6 require is the one-directional guarantee —
+  // every canonical terminal phase must be in the intake's set, or a finished run
+  // (a no-op sweep close, an "error") reads as still-live and keeps getting paged.
+  it("the intake's literal contains every canonical terminal phase", () => {
+    const values = setLiteral(
+      read("deploy/telegram-bug-intake/index.mjs"),
+      "TERMINAL_PHASES",
+      "deploy/telegram-bug-intake/index.mjs"
+    );
+    for (const phase of TERMINAL_PHASES) {
+      expect(values, phase).toContain(phase);
+    }
+  });
+});
+
 describe("the Python toolkit ≡ types.ts", () => {
   const TOOLKIT = "deploy/workflow-manager/toolkit";
   const outcomes = read(`${TOOLKIT}/run_outcomes.py`);
