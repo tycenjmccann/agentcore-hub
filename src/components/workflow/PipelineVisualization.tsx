@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useRef, useCallback } from "react";
 import { type WorkflowState, type WorkflowPhase, type AgentTask, type WorkflowEvent, SHIP_BLOCKED_OUTCOMES } from "@/lib/workflow/types";
+import { describeRunOutcome } from "@/lib/workflow/run-outcome-display";
 import awsIcons from "@/lib/aws-icons.json";
 import { BRAND_NAME } from "@/config/brand";
 
@@ -323,6 +324,13 @@ function getStatusDescription(phase: WorkflowPhase): { label: string; text: stri
       return { label: "Deploy Blocked", text: "CI passed but the deploy/preflight was blocked — nothing shipped." };
     case "static-ci-only":
       return { label: "CI-Only (Not Shipped)", text: "CI was green but no merge/deploy happened — work is not shipped." };
+    case "nothing-to-remove": {
+      // TEAM-4249 D2.9 — a no-op close used to fall through to "Idle / Waiting to
+      // start...", i.e. a FINISHED run rendered as one that had not begun. Sourced
+      // from the shared helper so this and WorkflowBoard cannot drift again.
+      const outcome = describeRunOutcome(phase);
+      return { label: outcome.label ?? "Nothing to Remove", text: outcome.text };
+    }
     default:
       return { label: "Idle", text: "Waiting to start..." };
   }

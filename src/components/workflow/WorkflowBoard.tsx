@@ -6,9 +6,14 @@ import {
   type WorkflowEvent,
   type TicketStatus,
   type AgentRun,
-  SHIP_BLOCKED_OUTCOMES,
+  NO_OP_OUTCOMES,
   isTerminalPhase,
 } from "@/lib/workflow/types";
+import {
+  describeOrchestratorEvent,
+  describeRunOutcome,
+  isNoOpPhase,
+} from "@/lib/workflow/run-outcome-display";
 import awsIcons from "@/lib/aws-icons.json";
 import { getPipelinePhases, resolveToolIcon, getPhaseToolCount, type PipelinePhaseConfig } from "@/lib/pipeline-config";
 import { DEFAULT_WORKFLOW_DEF_ID, getWorkflowDef } from "@/lib/workflow/workflow-defs";
@@ -56,6 +61,9 @@ function buildPhaseOrder(phases: PipelinePhaseConfig[]): Record<string, number> 
   order["complete"] = phases.length;
   order["error"] = -1;
   order["cancelled"] = -1;
+  // A no-op close (nothing-to-remove) never reached ship — order it with the
+  // other non-advancing terminals so the progress bar does not read as shipped.
+  order[NO_OP_OUTCOMES[0]] = -1;
   return order;
 }
 
@@ -77,8 +85,18 @@ function applyEventToState(s: WorkflowState, event: WorkflowEvent): WorkflowStat
       return { ...s, phase: "complete" };
     case "ticket_update":
       return s;
-    default:
+    default: {
+      // The orchestrator also publishes events that are NOT members of the closed
+      // WorkflowEvent union (orchestrator.completion_blocked, workflow.skipped,
+      // workflow.nothing_to_remove) — they arrive via transform-event.ts's
+      // passthrough, so they cannot be `case` labels here and are narrowed
+      // structurally instead. This reducer is the SINGLE owner of the phase for
+      // replay (fireReplayVisuals stays visual-only), so a terminal one closes
+      // the run at exactly the scrub position where it was published.
+      const orch = describeOrchestratorEvent(event);
+      if (orch?.phase) return { ...s, phase: orch.phase };
       return s;
+    }
   }
 }
 
@@ -189,6 +207,11 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
   const [nudgePulse, setNudgePulse] = useState(false);
   // Workflow Manager intervention/escalation — sky toast on the board.
   const [managerPulse, setManagerPulse] = useState<string | null>(null);
+  // TEAM-4249 D2.9 — persistent one-line explanation from the orchestrator's
+  // out-of-band events (completion blocked / run skipped / nothing to remove).
+  // The toast above is transient; this line stays up because it is the only
+  // account a human gets of why the run closed or stalled.
+  const [orchestratorNotice, setOrchestratorNotice] = useState<string | null>(null);
 
   // Catch-up replay state for live/in-progress workflows
   const [catchingUp, setCatchingUp] = useState(false);
@@ -466,8 +489,11 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
     // TEAM-3747 D2: a ship-blocked run is terminal with no open tickets — stop
     // polling it, exactly as a settled "complete" run. error/cancelled polling is
     // left unchanged (additive).
-    const phaseBlocked = state?.phase && (SHIP_BLOCKED_OUTCOMES as readonly string[]).includes(state.phase);
-    const isActive = state?.phase && !phaseBlocked && (state.phase !== "complete" || hasOpenTickets);
+    // TEAM-4249 D2.9: a no-op close (nothing-to-remove) is the same case — no
+    // branch, no PR, no ticket anyone can act on — so it stops polling too.
+    const phaseClosed =
+      isNoOpPhase(state?.phase) || describeRunOutcome(state?.phase).tone === "ship-blocked";
+    const isActive = state?.phase && !phaseClosed && (state.phase !== "complete" || hasOpenTickets);
     if (!isActive) return;
     const interval = setInterval(fetchTickets, 15_000);
     return () => clearInterval(interval);
@@ -599,6 +625,17 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
       // Sky pulse + toast when the Workflow Manager acts on this run.
       setManagerPulse(managerPulseText(event));
       setTimeout(() => setManagerPulse(null), 4000);
+    } else {
+      // The orchestrator's non-WorkflowEvent events (completion_blocked / skipped
+      // / nothing_to_remove). VISUAL ONLY on purpose: applyEventToState runs from
+      // the same replay effect and owns the phase, so writing it here too would be
+      // a second, competing write while scrubbing.
+      const orch = describeOrchestratorEvent(event);
+      if (orch) {
+        setOrchestratorNotice(orch.text);
+        setManagerPulse(orch.text);
+        setTimeout(() => setManagerPulse(null), 4000);
+      }
     }
   }, []);
 
@@ -608,6 +645,10 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
     if (replayEvents.length === 0) return;
     // In live mode at the live edge, state is driven by handleEvent — skip reconstruction
     if (!replayMode && atLiveEdge) return;
+    // TEAM-4249 D2.9: the notice is reconstructed like the rest of replay state —
+    // clear it so scrubbing back before the orchestrator event hides the line
+    // again (fireReplayVisuals re-sets it when the scrubber reaches the event).
+    setOrchestratorNotice(null);
     // If scrubber is at the very end, just set phase to "complete" directly
     // This avoids any reconstruction race that could flash a non-complete state
     const atEnd = replayIndex >= replayEvents.length - 1;
@@ -892,8 +933,23 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
         setManagerPulse(managerPulseText(event));
         setTimeout(() => setManagerPulse(null), 4000);
         break;
-      default:
+      default: {
+        // WorkflowEvent is a CLOSED union, so the orchestrator's out-of-band
+        // events (orchestrator.completion_blocked, workflow.skipped,
+        // workflow.nothing_to_remove) cannot be `case` labels — they arrive
+        // through transform-event.ts's passthrough and are narrowed structurally.
+        // A terminal one also closes the run here, because live mode has no
+        // reducer pass over the event.
+        const orch = describeOrchestratorEvent(event);
+        if (orch) {
+          setOrchestratorNotice(orch.text);
+          setManagerPulse(orch.text);
+          setTimeout(() => setManagerPulse(null), 4000);
+          const closingPhase = orch.phase;
+          if (closingPhase) setState((s) => (s ? { ...s, phase: closingPhase } : s));
+        }
         break;
+      }
     }
   }, [activeConnector]);
 
@@ -939,21 +995,22 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
 
   // Derive visual states from workflow state
   const currentPhaseIndex = state ? (phaseOrder[state.phase] ?? -1) : -1;
-  // A run isn't visually "complete" while fix-it tickets are still open —
-  // QA can file follow-ups after every phase has passed once.
-  const isComplete = state?.phase === "complete" && !hasOpenTickets;
+  // TEAM-4249 D2.9: one description of the run's outcome for the whole board —
+  // header label, tone class, and whether pollers should stop. It covers the
+  // lifecycle-integrity ship outcomes (TEAM-3747 D2, previously a local
+  // ship-blocked label chain here) and the no-op outcomes (TEAM-4247 D2), so a run
+  // closed as nothing-to-remove no longer reads "In Progress: nothing-to-remove".
+  // A run isn't visually "complete" while fix-it tickets are still open — QA can
+  // file follow-ups after every phase has passed once — which is why
+  // hasOpenTickets is passed in and isComplete keeps its exact old meaning.
+  const outcome = describeRunOutcome(state?.phase, { hasOpenTickets });
+  const isComplete = outcome.tone === "complete" && outcome.finished;
   const isSettled = isComplete && !celebrating;
-  // TEAM-3747 D2: a run closed on a lifecycle-integrity ship outcome. Rendered as
-  // its own terminal state in the header (NOT "In Progress: deploy-blocked") with
-  // a human label. Legacy runs never carry these phases, so this is inert for them.
-  const shipBlockedPhase =
-    state?.phase && (SHIP_BLOCKED_OUTCOMES as readonly string[]).includes(state.phase)
-      ? state.phase
-      : null;
-  const shipBlockedLabel =
-    shipBlockedPhase === "deploy-blocked" ? "Deploy Blocked"
-    : shipBlockedPhase === "static-ci-only" ? "CI-Only (Not Shipped)"
-    : null;
+  // Amber for cancelled + the ship-blocked closes (unchanged); sky for a no-op.
+  const headerToneClass =
+    state?.phase === "cancelled" || outcome.tone === "ship-blocked" ? "cancelled"
+    : outcome.tone === "no-op" ? "noop"
+    : "";
 
   // Trigger connector animation when activeConnector changes
   useEffect(() => {
@@ -1008,7 +1065,8 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
   // Update activity timestamp only on ACTUAL new streaming (not just status="running" in DDB)
   // A dead agent still has status="running" and stale keys in streamingText.
   useEffect(() => {
-    if (!state || state.phase === "complete" || state.phase === "error") return;
+    // TEAM-4249 D2.9: a no-op close is finished too — no agent can stream again.
+    if (!state || state.phase === "complete" || state.phase === "error" || isNoOpPhase(state.phase)) return;
     const totalLen = Object.values(streamingText).reduce((sum, t) => sum + t.length, 0);
     // First run: seed baseline from whatever is already in streamingText (stale content from dead agent)
     if (prevStreamingLenRef.current === -1) {
@@ -1052,7 +1110,8 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
   }, [managerWatch, workflowId]);
 
   useEffect(() => {
-    if (!state || state.phase === "complete" || state.phase === "error" || replayMode) return;
+    // TEAM-4249 D2.9: never auto-nudge a no-op close — there is nothing to nudge.
+    if (!state || state.phase === "complete" || state.phase === "error" || isNoOpPhase(state.phase) || replayMode) return;
     const check = setInterval(() => {
       const idle = Date.now() - lastActivityRef.current;
       // Read the CURRENT task set via the ref (F2): this interval outlives
@@ -1309,6 +1368,17 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
         </div>
       )}
 
+      {/* Orchestrator notice — why completion was blocked, why the run was
+          skipped, or why it closed with nothing to remove. One persistent line
+          (last event wins); the transient toast above fires alongside it. */}
+      {orchestratorNotice && (
+        <div className="review-banner" role="status" data-testid="orchestrator-notice">
+          {/* Plain label, not a .review-banner-item pill: the item class carries
+              cursor:pointer/hover, and this line is not clickable. */}
+          <span className="review-banner-label">{orchestratorNotice}</span>
+        </div>
+      )}
+
       {/* Deploy gate — the post-merge production deploy is waiting on a human
           approval in CodePipeline (no ticket, so it would otherwise look stalled). */}
       {deployGate && (
@@ -1422,11 +1492,11 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
             </div>
           )}
 
-          <div className={`pipeline-status-header ${isComplete ? "settled" : ""} ${(state.phase === "cancelled" || shipBlockedPhase) ? "cancelled" : ""}`}>
+          <div className={`pipeline-status-header ${isComplete ? "settled" : ""} ${headerToneClass}`}>
             <span className={SDLC_BADGE_META[fw].boardClassName} title={SDLC_BADGE_META[fw].tooltip} aria-label={SDLC_BADGE_META[fw].tooltip}>
               {SDLC_BADGE_META[fw].label}
             </span>
-            {isComplete ? "Complete" : shipBlockedLabel ? shipBlockedLabel : state.phase === "cancelled" ? "Cancelled" : state.phase === "error" ? "Error" : `In Progress: ${
+            {isComplete ? "Complete" : outcome.label ?? `In Progress: ${
               // Phase "complete" with open fix-it tickets → name the phase still working
               (state.phase === "complete"
                 ? pipelinePhases.find((p) => p.agents.some((a) => openTicketByAgent.has(a.agentId)))?.name
@@ -1846,7 +1916,9 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
           </div>
         )}
 
-        {(isComplete || state.phase === "cancelled" || state.phase === "error") && (
+        {/* TEAM-4249 D2.9: a no-op close is a finished run too — it gets the same
+            post-run analysis panel (a sweep that found nothing is worth analyzing). */}
+        {(isComplete || state.phase === "cancelled" || state.phase === "error" || isNoOpPhase(state.phase)) && (
           <WorkflowManagerPanel workflowId={workflowId} onAskAboutRun={onAskManager} />
         )}
 
@@ -2047,6 +2119,7 @@ export const PIPELINE_STYLES = `
 .pipeline-status-header{position:absolute;left:50%;transform:translateX(-50%);font-size:16px;font-weight:700;color:var(--color-text-primary);letter-spacing:0.5px;text-transform:capitalize;transition:color .4s;white-space:nowrap}
 .pipeline-status-header.settled{color:#f97316;animation:settledHeaderGlow 6s ease-in-out infinite}
 .pipeline-status-header.cancelled{color:#f59e0b}
+.pipeline-status-header.noop{color:#38bdf8}
 .sdlc-badge{position:absolute;right:calc(100% + 10px);top:50%;transform:translateY(-50%);font-size:10px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;line-height:1;padding:3px 8px;border-radius:5px;border:1px solid currentColor;white-space:nowrap;transition:none}
 .sdlc-badge--playbook{color:var(--accent-fg);background:var(--accent-subtle)}
 .sdlc-badge--aidlc{color:var(--violet-fg);background:var(--violet-subtle)}
