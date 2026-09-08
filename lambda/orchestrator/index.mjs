@@ -495,8 +495,30 @@ export async function announcePhaseTransition(workflow, wfDef, agentDef, ticketI
       // the run opened at "intake" (anchored at run start), then the initial
       // agent phase (now). workflow.startedAt is the run's own creation stamp;
       // if it is somehow absent publishEvent falls back to now.
-      await publishEvent(ticketId, "workflow.phase_change", { phase: "intake", workflowId: workflow.id, timestamp: workflow.startedAt });
-      await publishEvent(ticketId, "workflow.phase_change", { phase: agentDef.phase, workflowId: workflow.id });
+      //
+      // TEAM-4288 r3-F4: the CAS stays FIRST (that is what keeps concurrent
+      // deliveries from double-emitting), but these two rows are published
+      // { requireDurable: true } so an events-table failure is REPORTED, and the
+      // claim is released on failure — otherwise a single transient DDB error
+      // loses the pair permanently (the claim can never be re-won) and
+      // cost-report's computePhases has no opening interval to measure.
+      try {
+        await publishEvent(ticketId, "workflow.phase_change", { phase: "intake", workflowId: workflow.id, timestamp: workflow.startedAt }, { requireDurable: true });
+        await publishEvent(ticketId, "workflow.phase_change", { phase: agentDef.phase, workflowId: workflow.id }, { requireDurable: true });
+      } catch (err) {
+        // Accepted rare duplicate: if row 1 landed and row 2 failed, the retry
+        // re-publishes row 1. It is anchored at workflow.startedAt, so its
+        // deterministic eventId makes that an idempotent OVERWRITE of the same
+        // events-table item (and the intake row carries a ticketId, so
+        // EVENT_DEDUPE_MODE=enforce collapses it) — strictly better than the
+        // alternative of keeping the claim and losing BOTH rows forever.
+        console.warn(`[orchestrator] initial-phase lifecycle rows failed to persist for ${workflow.id}, releasing the claim so a re-dispatch retries:`, err?.message || err);
+        await store.clearInitialPhaseAnnounced(workflow.id, agentDef.phase).catch((e) => {
+          console.warn(`[orchestrator] could not release the initial-phase claim for ${workflow.id}:`, e?.message || e);
+        });
+        // Deliberately swallowed here: this is a journal/metric write, and
+        // throwing would fail the agent dispatch that called us.
+      }
     }
   }
 }
@@ -6236,7 +6258,22 @@ async function emitContractWarning(ticketId, ticket) {
   }
 }
 
-async function publishEvent(ticketId, detailType, detail) {
+/**
+ * TEAM-4288 r3-F4: `opts.requireDurable` makes the events-table write REPORT its
+ * failure by rethrowing instead of swallowing it. Strictly opt-in — every
+ * existing caller passes nothing and keeps the historical fully-non-fatal
+ * behaviour. It is for the few rows that are load-bearing DATA rather than a
+ * dashboard nicety (the initial-phase lifecycle pair, which cost-report's
+ * computePhases reads to build contiguous phase intervals) and whose emit sits
+ * behind a once-only claim, so a silently dropped write is unrecoverable.
+ * EventBridge stays best-effort either way: the events table is the read path.
+ *
+ * @param {string} ticketId
+ * @param {string} detailType
+ * @param {Record<string, any>} detail
+ * @param {{ requireDurable?: boolean }} [opts]
+ */
+async function publishEvent(ticketId, detailType, detail, opts = {}) {
   // ONE timestamp for both writes (and inside detail): the anomaly-watcher
   // dedupes the EventBridge copy against the direct copy by
   // (workflowId, type, timestamp, ticketId, agentId) — two generated
@@ -6284,7 +6321,10 @@ async function publishEvent(ticketId, detailType, detail) {
           timestamp,
         },
       }));
-    } catch { /* non-fatal */ }
+    } catch (err) {
+      if (opts?.requireDurable) throw err;
+      /* non-fatal */
+    }
   }
 }
 
