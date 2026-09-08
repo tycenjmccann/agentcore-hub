@@ -54,10 +54,52 @@ blockers:
   `completions/<ticketId>.json` (the record the gate reads), so a mark-done from
   here on prevents this. It cannot heal a run already blocked, because
   `done → done` is rejected — for those, write the record out of band
-  (`aws s3 cp - s3://$ARTIFACT_BUCKET/completions/<ticketId>.json` with
-  `{"ticket_id":"<id>","summary":"<evidence>"}`), then `complete` the run. Note a
-  SHIP-phase ticket healed this way closes honestly as `static-ci-only` rather
-  than `complete`, because operator prose is not proof anything merged.
+  **create-only**, then `complete` the run. **NEVER replace an existing record**:
+  it may be the agent's own authoritative record carrying `pr_url` /
+  `commit_sha`, the ship-verdict signals operator prose cannot reproduce. So do
+  not `aws s3 cp` over it — use a conditional write (the `aws` CLI's presence and
+  version are not guaranteed in this sandbox, so boto3 is the primary path):
+
+  ```bash
+  python3 - <<'PY'
+  import json, os, boto3
+  from datetime import datetime, timezone
+  from botocore.exceptions import ClientError
+  tid, evidence = "<ticketId>", "<evidence>"
+  b, key = os.environ["ARTIFACT_BUCKET"], f"completions/{tid}.json"
+  rec = {"ticket_id": tid, "summary": evidence, "artifacts": "", "branch": None,
+         "commit_sha": None, "pr_url": None,
+         "completed_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+         "source": "workflow-manager", "evidence_kind": "static"}
+  s3 = boto3.client("s3")
+  try:
+      s3.put_object(Bucket=b, Key=key, Body=json.dumps(rec, indent=2),
+                    ContentType="application/json", IfNoneMatch="*")
+      print("wrote", key)
+  except ClientError as e:
+      err, meta = e.response.get("Error", {}), e.response.get("ResponseMetadata", {})
+      if err.get("Code") != "PreconditionFailed" and meta.get("HTTPStatusCode") != 412:
+          raise
+      print("EXISTS — not overwritten:", s3.get_object(Bucket=b, Key=key)["Body"].read().decode())
+  PY
+  ```
+
+  (CLI equivalent: `aws s3api put-object --if-none-match '*' …` needs AWS CLI
+  v2 ≥ 2.17 — on anything older do an `aws s3api head-object` existence check
+  first, and never a plain `aws s3 cp`.) If the printed existing record already
+  has a `summary` / `pr_url` / `commit_sha`, leave it and just `complete`; only a
+  blank one may be filled, after reading it. Note a SHIP-phase ticket healed this
+  way closes honestly as `static-ci-only` rather than `complete`, because
+  operator prose is not proof anything merged.
+- **What `mark-done` now reports.** Its JSON summary carries
+  `completionRecordCheck`: `written` (the route wrote the record), `kept-existing`
+  (a record already proved the deliverable — a real success), `missing` / `blank`
+  (nothing usable), or `unverified` (no `ARTIFACT_BUCKET` or an S3 error — exit 0,
+  check by hand). A `WARNING` on stderr **plus exit 1** means the ticket DID move
+  but the record is missing/blank: apply the create-only remedy above, then
+  `complete`. Different failure: `API 502: {"error":"completion evidence record
+  write failed"…}` means the ticket did **not** move and nothing was recorded —
+  fix the cause (bucket config / IAM) and re-run `mark-done`.
 
 ## 3. THE STUCK-AGENT TEST — "did the work actually ship?"
 

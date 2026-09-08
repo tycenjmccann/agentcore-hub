@@ -41,7 +41,9 @@ Usage:
   python3 intervene.py bugs-on   [--note "..."]
 
 Env: WORKFLOW_API_URL (app base URL), EVENTS_TABLE, TICKETS_TABLE,
-     WORKFLOWS_TABLE, TICKET_PROVIDER (dynamodb|jira), AWS_REGION.
+     WORKFLOWS_TABLE, ARTIFACT_BUCKET (mark-done verifies
+     completions/{ticketId}.json here), TICKET_PROVIDER (dynamodb|jira),
+     AWS_REGION.
 """
 
 import argparse
@@ -62,6 +64,9 @@ EVENTS_TABLE = os.environ.get("EVENTS_TABLE", "agentcore-hub-events")
 TICKETS_TABLE = os.environ.get("TICKETS_TABLE", "agentcore-hub-tickets")
 WORKFLOWS_TABLE = os.environ.get("WORKFLOWS_TABLE", "agentcore-hub-workflows")
 TICKET_PROVIDER = os.environ.get("TICKET_PROVIDER", "dynamodb")
+# mark-done reads completions/{ticketId}.json back out of here to verify the
+# transition route really left an evidence record (see verify_completion_record).
+ARTIFACT_BUCKET = os.environ.get("ARTIFACT_BUCKET", "")
 
 dynamodb = boto3.resource("dynamodb", region_name=REGION)
 
@@ -115,6 +120,151 @@ def api_post(path, body=None):
                 "If genuinely dead, re-run with --force."
             )
         raise SystemExit(f"API {e.code}: {detail}")
+
+
+# ─── mark-done completion-record verification (TEAM-4283) ────────────────────
+#
+# The transition route (src/app/api/workflow/[id]/tickets/transition/route.ts)
+# writes completions/{ticketId}.json for a mark-done and answers
+# `completionRecordWritten`. Since TEAM-4282 it fails CLOSED on a write failure
+# (502 → api_post raises above, before anything is recorded), so a 2xx with
+# completionRecordWritten=false is not a failure — it is the route's "kept"
+# outcome. Two of the three kept sub-cases still leave no usable record and the
+# response cannot tell them apart:
+#   - the record vanished between the create-only PUT and the read-back (race)
+#   - a concurrent writer won the refill's IfMatch, contents unknown
+# Either way the completion gate 409s missing_evidence forever, and done→done is
+# refused so mark-done cannot be retried. So we read the record ourselves.
+
+_s3_client = None
+
+
+def _s3():
+    """Lazily built S3 client — NEVER at import time (the unit tests stub boto3
+    in sys.modules and the CI toolkit job installs no boto3 wheel)."""
+    global _s3_client
+    if _s3_client is None:
+        _s3_client = boto3.client("s3", region_name=REGION)
+    return _s3_client
+
+
+def _is_not_found(err):
+    """404/NoSuchKey, duck-typed off the botocore error so this module keeps
+    importing without botocore (mirrors isNotFound in the transition route)."""
+    response = getattr(err, "response", None)
+    if not isinstance(response, dict):
+        return False
+    code = (response.get("Error") or {}).get("Code")
+    status = (response.get("ResponseMetadata") or {}).get("HTTPStatusCode")
+    return code in ("NoSuchKey", "NotFound", "404") or status == 404
+
+
+def fetch_completion_record(ticket_id):
+    """Read completions/{ticket_id}.json from ARTIFACT_BUCKET.
+
+    Returns the parsed record dict; {} when the body is unparseable or is not a
+    JSON object (present but cannot be evidence — the same call the route makes);
+    None when the object does not exist. Any other error is raised to the caller.
+    """
+    try:
+        body = _s3().get_object(
+            Bucket=ARTIFACT_BUCKET, Key=f"completions/{ticket_id}.json"
+        )["Body"].read()
+    except Exception as err:  # noqa: BLE001 — only "absent" is handled here
+        if _is_not_found(err):
+            return None
+        raise
+    try:
+        parsed = json.loads(body)
+    except (ValueError, TypeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _non_empty_str(value):
+    return isinstance(value, str) and value.strip() != ""
+
+
+def completion_record_has_evidence(record):
+    """Does a completions/{ticketId}.json record prove a deliverable?
+
+    PARITY: a straight port of completionRecordHasEvidence,
+    src/lib/workflow/completion-evidence.ts:59-76 (itself the twin of
+    lambda/orchestrator/completion.mjs). Same field set, same order, same
+    non-empty-string semantics, and a blank record is NOT evidence. Keep the two
+    in agreement — no extra heuristics here.
+    """
+    if not isinstance(record, dict):
+        return False
+    if _non_empty_str(record.get("summary")):
+        return True
+    if _non_empty_str(record.get("pr_url")):
+        return True
+    if _non_empty_str(record.get("commit_sha")):
+        return True
+    artifacts = record.get("artifacts")
+    if _non_empty_str(artifacts):
+        return True
+    if isinstance(artifacts, list) and any(_non_empty_str(a) for a in artifacts):
+        return True
+    return False
+
+
+def _missing_evidence_warning(ticket_id, state):
+    key = f"completions/{ticket_id}.json"
+    return (
+        f"WARNING: mark-done closed {ticket_id} but s3://{ARTIFACT_BUCKET or '$ARTIFACT_BUCKET'}/{key} "
+        f"is {state} — the completion evidence gate will refuse the run with "
+        f"409 missing_evidence, and mark-done cannot be retried (done → done is rejected).\n"
+        f"Remedy: write the record out of band CREATE-ONLY — boto3 "
+        f"put_object(..., IfNoneMatch=\"*\") so an agent's authoritative record is never "
+        f"overwritten; see the watch-triage skill §2 for the exact snippet. Then `complete` the run.\n"
+        f"Re-check with: aws s3 cp s3://$ARTIFACT_BUCKET/{key} - "
+        f"(or the boto3 get_object equivalent)."
+    )
+
+
+def verify_completion_record(ticket_id, result):
+    """→ (check, note, fatal) for the transition response `result`.
+
+    check  — the `completionRecordCheck` value reported in mark-done's summary
+    note   — an advisory line for stderr (exit stays 0)
+    fatal  — a SystemExit message (the record is unusable; exit 1)
+    """
+    if result.get("completionRecordWritten") is True:
+        # The route wrote it this call — nothing to verify, no S3 read.
+        return "written", None, None
+    if not ARTIFACT_BUCKET:
+        return (
+            "unverified",
+            f"WARNING: ARTIFACT_BUCKET unset — could not verify "
+            f"completions/{ticket_id}.json. The transition succeeded; check the record "
+            f"by hand: aws s3 cp s3://<artifact-bucket>/completions/{ticket_id}.json -",
+            None,
+        )
+    try:
+        record = fetch_completion_record(ticket_id)
+    except Exception as err:  # noqa: BLE001 — any S3 failure is inconclusive
+        # A transient S3/permission error is NOT a failed intervention: the
+        # ticket did move. Report it and let the operator look.
+        return (
+            "unverified",
+            f"WARNING: could not verify completions/{ticket_id}.json ({err}). "
+            f"The transition succeeded; check by hand: "
+            f"aws s3 cp s3://$ARTIFACT_BUCKET/completions/{ticket_id}.json -",
+            None,
+        )
+    if record is None:
+        return "missing", None, _missing_evidence_warning(ticket_id, "missing")
+    if completion_record_has_evidence(record):
+        # Route outcome "kept": a record already proved the deliverable (usually
+        # the agent's own report_completion landing first). A real success.
+        return (
+            "kept-existing",
+            f"NOTE: completions/{ticket_id}.json already carried evidence — kept as is.",
+            None,
+        )
+    return "blank", None, _missing_evidence_warning(ticket_id, "evidence-less (blank)")
 
 
 def get_ticket(ticket_id):
@@ -234,7 +384,14 @@ def cmd_mark_done(args):
 
       1. Posts `--evidence` as a ticket comment (the audit trail: WHY this was
          safe to close), then
-      2. Transitions the ticket to done, which cascades the next phase.
+      2. Transitions the ticket to done, which cascades the next phase, then
+      3. Verifies completions/<ticketId>.json really exists and carries
+         evidence. The route reports `completionRecordWritten`, but its "kept"
+         outcome covers two races in which nothing usable was written and the
+         response cannot say which. The outcome is reported as
+         `completionRecordCheck`; a missing/blank record exits 1 with the
+         out-of-band remedy, because the completion gate would otherwise refuse
+         the run forever and done → done cannot be retried.
 
     The evidence is not optional — closing a ticket with no proof the work
     shipped is exactly the false-green this guards against. If you cannot cite
@@ -261,13 +418,25 @@ def cmd_mark_done(args):
         "comment": f"Closed by Workflow Manager (agent finished, no report_completion). Evidence: {args.evidence}",
         "evidence": args.evidence,
     })
+    # The transition landed, so the intervention is recorded FIRST and
+    # unconditionally — the verification below reports on the evidence record,
+    # not on whether the ticket moved.
     publish_intervention(args.workflow_id, "mark_done", {
         "ticketId": args.ticket_id, "evidence": args.evidence[:500],
     })
+    # 3. Verify the evidence record the completion gate will read.
+    check, note, fatal = verify_completion_record(args.ticket_id, result)
     print(json.dumps({
         "action": "mark_done", "ticketId": args.ticket_id,
-        "commented": comment.get("success", False), **result,
+        "commented": comment.get("success", False),
+        "completionRecordCheck": check, **result,
     }, indent=2))
+    if note:
+        print(note, file=sys.stderr)
+    if fatal:
+        # The ticket DID move (summary printed above) — this exits non-zero
+        # purely so the missing record cannot be missed.
+        raise SystemExit(fatal)
 
 
 def cmd_cancel(args):
