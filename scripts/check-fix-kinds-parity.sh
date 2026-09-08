@@ -27,6 +27,11 @@
 # workflow-output) — so section 1b below guards it the same way section 1 guards
 # fix-contract.mjs.
 #
+# Byte-parity is not packaging: whether a copy is actually zipped into its
+# Lambda is guarded separately by scripts/check-lambda-zip-manifest.sh
+# (lambda/orchestrator only) and by deploy/pipeline/plan-surfaces.py --check's
+# import-closure assertion (every pipeline Lambda surface, TEAM-4278).
+#
 # This guard normalizes every kind list to a sorted set and fails on ANY
 # difference. It also (a) byte-compares the three fix-contract.mjs copies (cmp),
 # the only thing keeping the duplicated module from drifting, and (b) compares the
