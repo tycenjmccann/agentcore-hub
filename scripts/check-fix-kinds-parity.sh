@@ -52,8 +52,12 @@ done
 # Each extractor prints the kinds it found, one per line. Empty output = the
 # pattern stopped matching (a refactor moved/renamed the literal), which is
 # itself a failure — a silently-empty list would make every set "agree".
+# `\(x\)\?` is a GNU-sed extension: BSD/macOS sed silently matches nothing, so
+# this guard "failed" on every local run (extracted NO fix kinds) while passing in
+# CI. `\{0,1\}` is portable POSIX BRE. A gate nobody can run locally gets
+# ignored locally, which is how the treadmill starts.
 extract_mjs_fix_kinds() {  # FIX_KINDS = ["a","b"] or new Set(["a","b"])
-  sed -n 's/.*FIX_KINDS *= *\(new Set(\)\?\[\([^]]*\)\].*/\2/p' "$1" \
+  sed -n 's/.*FIX_KINDS *= *\(new Set(\)\{0,1\}\[\([^]]*\)\].*/\2/p' "$1" \
     | head -1 | tr ',' '\n' | sed 's/[^a-z_]//g' | grep -v '^$' || true
 }
 
@@ -212,7 +216,7 @@ done
 
 # ─── 4. the REWORK subset must agree, and must be a real subset ───────────────
 extract_rework() {
-  sed -n 's/.*REWORK_FIX_KINDS *= *\(new Set(\)\?\[\([^]]*\)\].*/\2/p' "$1" \
+  sed -n 's/.*REWORK_FIX_KINDS *= *\(new Set(\)\{0,1\}\[\([^]]*\)\].*/\2/p' "$1" \
     | head -1 | tr ',' '\n' | sed 's/[^a-z_]//g' | grep -v '^$' | sort -u | paste -sd, - || true
 }
 rw_contract="$(extract_rework "$CANON")"
