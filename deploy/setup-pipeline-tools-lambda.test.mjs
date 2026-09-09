@@ -75,11 +75,13 @@ describe("buildInlinePolicy — the CiStartBuild grant", () => {
 
     expect(sid(policy, "CiStartBuild")).toBeUndefined();
     expect(allActions(policy)).not.toContain("codebuild:StartBuild");
-    // The four statements that were there before FR-4, in order.
+    // The statements that were there before FR-4, in order, plus the
+    // read-only handoff-marker grant.
     expect(policy.Statement.map((s) => s.Sid)).toEqual([
       "Logs",
       "PipelineReadAndTrigger",
       "BuildRead",
+      "HandoffMarkerRead",
       "BuildLogRead",
     ]);
   });
@@ -92,6 +94,7 @@ describe("buildInlinePolicy — the CiStartBuild grant", () => {
       "PipelineReadAndTrigger",
       "BuildRead",
       "CiStartBuild",
+      "HandoffMarkerRead",
       "BuildLogRead",
     ]);
     expect(sid(policy, "CiStartBuild")).toEqual({
@@ -141,6 +144,7 @@ describe("buildInlinePolicy — the CiStartBuild grant", () => {
       // Nor any other approval/write verb sneaking in via a prefix.
       expect(actions.filter((a) => /Approval/i.test(a)), flag).toEqual([]);
       expect(actions.filter((a) => a.startsWith("codepipeline:")).sort(), flag).toEqual([
+        "codepipeline:GetPipelineExecution",
         "codepipeline:GetPipelineState",
         "codepipeline:ListActionExecutions",
         "codepipeline:StartPipelineExecution",
@@ -152,6 +156,13 @@ describe("buildInlinePolicy — the CiStartBuild grant", () => {
     const policy = buildInlinePolicy({ ...BASE, REGION: "eu-west-2", ACCOUNT: "999988887777", PIPELINE_CI_START_BUILD: "1" });
     for (const resource of allResources(policy)) {
       if (resource === "*") continue;
+      // S3 ARNs carry neither region nor account as ARN fields — the bucket NAME
+      // carries both under the deploy/config.sh convention.
+      if (resource.startsWith("arn:aws:s3:::")) {
+        expect(resource).toContain("-999988887777-eu-west-2/");
+        expect(resource).not.toContain(ACCOUNT);
+        continue;
+      }
       expect(resource).toContain(":eu-west-2:");
       expect(resource).toContain(":999988887777:");
       expect(resource).not.toContain(ACCOUNT);
@@ -192,6 +203,8 @@ describe("resolveEnv", () => {
       CI_PROJECT: "agentcore-hub-ci",
       DEPLOY_PROJECT: "agentcore-hub-deploy",
       PIPELINE_CI_START_BUILD: "0",
+      // Derived from ACCOUNT at deploy time when unset (deploy/config.sh convention).
+      ARTIFACT_BUCKET: "",
     });
     expect(resolveEnv({ PIPELINE_CI_START_BUILD: "1" }).PIPELINE_CI_START_BUILD).toBe("1");
     expect(resolveEnv({ PIPELINE_CI_START_BUILD: "true" }).PIPELINE_CI_START_BUILD).toBe("0");
@@ -270,5 +283,34 @@ describe("importing the deploy script is inert", () => {
     const mod = await import("./setup-pipeline-tools-lambda.mjs");
     expect(typeof mod.buildInlinePolicy).toBe("function");
     expect(mod.main).toBeUndefined(); // not exported — nothing can call it by hand
+  });
+});
+
+describe("buildInlinePolicy — the handoff-marker read", () => {
+  it("is scoped to ONE prefix of the artifact bucket", () => {
+    const statement = sid(buildInlinePolicy(BASE), "HandoffMarkerRead");
+    expect(statement.Action).toEqual(["s3:GetObject"]);
+    expect(statement.Resource).toEqual([
+      `arn:aws:s3:::agentcore-hub-artifacts-${ACCOUNT}-us-east-1/pipeline-artifacts/handoff/*`,
+    ]);
+    // Never the roster, blueprints, rollback snapshots or deploy baselines.
+    for (const forbidden of ["config/", "blueprints/", "orchestrator-current", "last-deployed"]) {
+      expect(statement.Resource[0]).not.toContain(forbidden);
+    }
+  });
+
+  it("grants no S3 WRITE of any kind", () => {
+    const actions = allActions(buildInlinePolicy({ ...BASE, PIPELINE_CI_START_BUILD: "1" }));
+    expect(actions.filter((a) => a.startsWith("s3:"))).toEqual(["s3:GetObject"]);
+  });
+
+  it("honours an explicit ARTIFACT_BUCKET and is omitted when there is none", () => {
+    expect(
+      sid(buildInlinePolicy({ ...BASE, ARTIFACT_BUCKET: "explicit-bucket" }), "HandoffMarkerRead")
+        .Resource
+    ).toEqual(["arn:aws:s3:::explicit-bucket/pipeline-artifacts/handoff/*"]);
+    expect(
+      sid(buildInlinePolicy({ ...BASE, ACCOUNT: undefined }), "HandoffMarkerRead")
+    ).toBeUndefined();
   });
 });

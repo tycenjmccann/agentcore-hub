@@ -42,6 +42,13 @@ const h = vi.hoisted(() => ({
     getPipelineStateImpl: async () => ({ stageStates: [] }),
     listActionExecutionsImpl: async () => ({ actionExecutionDetails: [] }),
     startPipelineExecutionImpl: async () => ({ pipelineExecutionId: "exec-new" }),
+    getPipelineExecutionImpl: async () => ({ pipelineExecution: { artifactRevisions: [] } }),
+    s3Calls: [], // { Bucket, Key } for every GetObject
+    getObjectImpl: async () => {
+      const err = new Error("NoSuchKey");
+      err.name = "NoSuchKey";
+      throw err;
+    },
     listBuildsImpl: async () => ({ ids: [] }),
     startBuildImpl: async () => ({
       build: {
@@ -71,10 +78,12 @@ vi.mock("@aws-sdk/client-codepipeline", () => ({
       if (type === "GetPipelineState") return h.state.getPipelineStateImpl(cmd.input);
       if (type === "ListActionExecutions") return h.state.listActionExecutionsImpl(cmd.input);
       if (type === "StartPipelineExecution") return h.state.startPipelineExecutionImpl(cmd.input);
+      if (type === "GetPipelineExecution") return h.state.getPipelineExecutionImpl(cmd.input);
       return {};
     }
   },
   GetPipelineStateCommand: class { constructor(i) { this.input = i; this.__type = "GetPipelineState"; } },
+  GetPipelineExecutionCommand: class { constructor(i) { this.input = i; this.__type = "GetPipelineExecution"; } },
   StartPipelineExecutionCommand: class { constructor(i) { this.input = i; this.__type = "StartPipelineExecution"; } },
   ListActionExecutionsCommand: class { constructor(i) { this.input = i; this.__type = "ListActionExecutions"; } },
 }));
@@ -93,6 +102,16 @@ vi.mock("@aws-sdk/client-codebuild", () => ({
   ListBuildsForProjectCommand: class { constructor(i) { this.input = i; this.__type = "ListBuildsForProject"; } },
   BatchGetBuildsCommand: class { constructor(i) { this.input = i; this.__type = "BatchGetBuilds"; } },
   StartBuildCommand: class { constructor(i) { this.input = i; this.__type = "StartBuild"; } },
+}));
+
+vi.mock("@aws-sdk/client-s3", () => ({
+  S3Client: class {
+    async send(cmd) {
+      h.state.s3Calls.push(cmd.input);
+      return h.state.getObjectImpl(cmd.input);
+    }
+  },
+  GetObjectCommand: class { constructor(i) { this.input = i; } },
 }));
 
 vi.mock("@aws-sdk/client-cloudwatch-logs", () => ({
@@ -178,6 +197,15 @@ beforeEach(() => {
   h.state.getPipelineStateImpl = async () => ({ stageStates: [] });
   h.state.listActionExecutionsImpl = async () => ({ actionExecutionDetails: [] });
   h.state.startPipelineExecutionImpl = async () => ({ pipelineExecutionId: "exec-new" });
+  h.state.getPipelineExecutionImpl = async () => ({
+    pipelineExecution: { artifactRevisions: [] },
+  });
+  h.state.s3Calls = [];
+  h.state.getObjectImpl = async () => {
+    const err = new Error("NoSuchKey");
+    err.name = "NoSuchKey";
+    throw err;
+  };
   h.state.listBuildsImpl = async () => ({ ids: [] });
   h.state.batchGetBuildsImpl = DEFAULT_BATCH_GET;
   h.state.startBuildImpl = async () => DEFAULT_START_BUILD();
@@ -896,5 +924,86 @@ describe("validateCiProjectName", () => {
       expect(typeof out.reason, String(bad)).toBe("string");
       expect(out.reason.length, String(bad)).toBeGreaterThan(0);
     }
+  });
+});
+
+// ─── Infra handoff on a SUCCEEDED run ────────────────────────────────────────
+// The Deploy stage used to `exit 2` when a changeset also touched infra-only
+// files: a green deploy reported as a Failed action. "Failed" then meant either
+// a real failure or a clean deploy with a follow-up, and only a build log could
+// tell them apart — six straight Failed executions (2026-09-08/09) is what made
+// the pipeline unreadable. It now succeeds and records the file list in S3;
+// get_state reports that as `handoff` data.
+
+describe("get_state infra handoff marker", () => {
+  const sha = "a7679ed62d8af7251518fcb21e154698f09e9242";
+
+  function withRevision(revisionId) {
+    h.state.getPipelineExecutionImpl = async () => ({
+      pipelineExecution: { artifactRevisions: [{ revisionId }] },
+    });
+  }
+
+  it("reports handoff files on a run whose Deploy stage wrote a marker", async () => {
+    h.state.getPipelineStateImpl = async () => allGreenStages("exec-1");
+    withRevision(sha);
+    h.state.getObjectImpl = async () => ({
+      Body: {
+        transformToString: async () =>
+          "deploy/setup-pipeline-tools-lambda.mjs\ndeploy/setup-lambda-role.sh\n",
+      },
+    });
+
+    const out = await withEnv({ ARTIFACT_BUCKET: "bucket-x" }, (mod) =>
+      invokeOn(mod.handler, "get_state", { execution_id: "exec-1" })
+    );
+
+    expect(out.succeeded).toBe(true);
+    expect(out.failed).toBe(false);
+    expect(out.handoff.files).toEqual([
+      "deploy/setup-pipeline-tools-lambda.mjs",
+      "deploy/setup-lambda-role.sh",
+    ]);
+    // Keyed on the 12-char GIT_SHA the Build stage uses, under the one prefix
+    // this role can read.
+    expect(h.state.s3Calls.at(-1)).toEqual({
+      Bucket: "bucket-x",
+      Key: `pipeline-artifacts/handoff/${sha.slice(0, 12)}.txt`,
+    });
+  });
+
+  it("returns handoff null when the deploy had nothing to hand off", async () => {
+    h.state.getPipelineStateImpl = async () => allGreenStages("exec-1");
+    withRevision(sha);
+    const out = await withEnv({ ARTIFACT_BUCKET: "bucket-x" }, (mod) =>
+      invokeOn(mod.handler, "get_state", { execution_id: "exec-1" })
+    );
+    expect(out.succeeded).toBe(true);
+    expect(out.handoff).toBe(null);
+  });
+
+  it("never fails get_state when the marker lookup errors", async () => {
+    h.state.getPipelineStateImpl = async () => allGreenStages("exec-1");
+    withRevision(sha);
+    h.state.getObjectImpl = async () => {
+      const err = new Error("AccessDenied");
+      err.name = "AccessDenied";
+      throw err;
+    };
+    const out = await withEnv({ ARTIFACT_BUCKET: "bucket-x" }, (mod) =>
+      invokeOn(mod.handler, "get_state", { execution_id: "exec-1" })
+    );
+    expect(out.succeeded).toBe(true);
+    expect(out.handoff).toBe(null);
+  });
+
+  it("does not call S3 at all when no artifact bucket is configured", async () => {
+    h.state.getPipelineStateImpl = async () => allGreenStages("exec-1");
+    withRevision(sha);
+    const out = await withEnv({ ARTIFACT_BUCKET: undefined }, (mod) =>
+      invokeOn(mod.handler, "get_state", { execution_id: "exec-1" })
+    );
+    expect(out.handoff).toBe(null);
+    expect(h.state.s3Calls).toEqual([]);
   });
 });

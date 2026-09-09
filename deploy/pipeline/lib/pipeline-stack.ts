@@ -385,6 +385,11 @@ export class PipelineStack extends Stack {
           ],
         },
         {
+          // Both actions SUCCEED on a clean deploy. An infra-only follow-up is a
+          // marker in S3 (Pipeline___get_state -> `handoff`), not a failed action:
+          // the old `exit 2` made "Failed" mean either a real failure or a green
+          // deploy with a follow-up, which is what made six consecutive
+          // executions unreadable (2026-09-08/09).
           stageName: "Deploy",
           actions: [
             new cpactions.CodeBuildAction({

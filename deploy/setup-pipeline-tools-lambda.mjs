@@ -109,6 +109,10 @@ export function resolveEnv(env = process.env) {
     // constants distinct; do not collapse them.
     DEPLOY_PROJECT: env.DEPLOY_PROJECT || "agentcore-hub-deploy",
     PIPELINE_CI_START_BUILD: env.PIPELINE_CI_START_BUILD === "1" ? "1" : "0",
+    // Where the Deploy stage records its infra handoff list (get_state reports
+    // it as `handoff`). Same convention as deploy/config.sh; ACCOUNT is only
+    // known at deploy time, so buildInlinePolicy derives the ARN from it.
+    ARTIFACT_BUCKET: env.ARTIFACT_BUCKET || "",
   };
 }
 
@@ -133,6 +137,9 @@ export function buildInlinePolicy(env) {
     DEPLOY_PROJECT,
     PIPELINE_CI_START_BUILD,
   } = env;
+  const artifactBucket =
+    env.ARTIFACT_BUCKET ||
+    (ACCOUNT ? `agentcore-hub-artifacts-${ACCOUNT}-${REGION}` : "");
 
   const pipelineArn = `arn:aws:codepipeline:${REGION}:${ACCOUNT}:${PIPELINE_NAME}`;
   const buildArn = `arn:aws:codebuild:${REGION}:${ACCOUNT}:project/${BUILD_PROJECT}`;
@@ -170,6 +177,9 @@ export function buildInlinePolicy(env) {
         Action: [
           "codepipeline:GetPipelineState",
           "codepipeline:ListActionExecutions",
+          // Resolves an execution's source revision so get_state can look up
+          // that commit's infra-handoff marker.
+          "codepipeline:GetPipelineExecution",
           "codepipeline:StartPipelineExecution",
         ],
         Resource: pipelineArn,
@@ -196,6 +206,18 @@ export function buildInlinePolicy(env) {
             },
           ]
         : []),
+      // Read ONE prefix of the artifact bucket: the Deploy stage's handoff
+      // markers. Never the roster, blueprints, rollback snapshots or baselines.
+      ...(artifactBucket
+        ? [
+            {
+              Sid: "HandoffMarkerRead",
+              Effect: "Allow",
+              Action: ["s3:GetObject"],
+              Resource: [`arn:aws:s3:::${artifactBucket}/pipeline-artifacts/handoff/*`],
+            },
+          ]
+        : []),
       {
         Sid: "BuildLogRead",
         Effect: "Allow",
@@ -219,6 +241,7 @@ async function main() {
     CI_PROJECT,
     DEPLOY_PROJECT,
     PIPELINE_CI_START_BUILD,
+    ARTIFACT_BUCKET,
   } = cfg;
 
   // Fail on a bad CI_PROJECT before touching AWS at all (buildInlinePolicy
@@ -307,6 +330,7 @@ async function main() {
     CI_PROJECT,
     DEPLOY_PROJECT,
     PIPELINE_CI_START_BUILD,
+    ARTIFACT_BUCKET: ARTIFACT_BUCKET || `agentcore-hub-artifacts-${ACCOUNT}-${REGION}`,
   };
 
   // ─── 3. Create/update the function ───────────────────────────────────────────

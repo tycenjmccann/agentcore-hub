@@ -79,24 +79,24 @@ phases:
         # ── Snapshot CURRENT prod for rollback BEFORE touching anything ──
         # DEPLOY.md manual rollback = re-point Lambda at prior zip + ECS at prior
         # image. rollback.sh restores from these; run on ANY failure via trap.
-        mkdir -p /tmp/rollback
-        if aws s3api get-object --bucket "$ARTIFACT_BUCKET" --key "pipeline-artifacts/orchestrator-current.zip" \
-             /tmp/rollback/orchestrator-prev.zip --region "$AWS_REGION_HUB" >/dev/null 2>&1; then
-          echo "captured prior orchestrator zip from snapshot"
-        else
-          # FIRST pipeline run: no snapshot yet, but a prod orchestrator already
-          # exists. Seed the rollback source from the LIVE Lambda code so a failed
-          # first deploy can still restore pre-pipeline code (Codex #263 round-4 P1).
-          echo "no prior snapshot — seeding rollback from LIVE orchestrator code"
-          LIVE_URL="$(aws lambda get-function --function-name agentcore-hub-orchestrator \
+        # Snapshot each trio function's OWN LIVE code, exactly as Target 1b does
+        # for every other Lambda. The old path read the S3 snapshot
+        # (pipeline-artifacts/orchestrator-current.zip) instead — i.e. the last
+        # SUCCESSFUL pipeline deploy, which is NOT what is live whenever anyone
+        # hand-deployed since. On 2026-09-09 two failed runs rolled the trio back
+        # to a two-day-old build twice, each time undoing a hand-deployed fix.
+        # Rollback must restore what it replaced, nothing else.
+        mkdir -p /tmp/rollback/trio
+        for FN in agentcore-hub-orchestrator agentcore-hub-agent-invoker agentcore-hub-events-writer; do
+          LIVE_URL="$(aws lambda get-function --function-name "$FN" \
             --region "$AWS_REGION_HUB" --query 'Code.Location' --output text 2>/dev/null || true)"
-          if [ -n "$LIVE_URL" ] && [ "$LIVE_URL" != "None" ]; then
-            curl -sf "$LIVE_URL" -o /tmp/rollback/orchestrator-prev.zip && echo "seeded rollback from live Lambda" \
-              || echo "WARN: could not download live Lambda code — rollback of orchestrator unavailable this run"
+          if [ -n "$LIVE_URL" ] && [ "$LIVE_URL" != "None" ] && curl -sf "$LIVE_URL" -o "/tmp/rollback/trio/$FN.zip"; then
+            echo "  $FN: rollback snapshot captured from LIVE code"
           else
-            echo "WARN: no live orchestrator to seed from — rollback of orchestrator unavailable this run"
+            rm -f "/tmp/rollback/trio/$FN.zip"
+            echo "  WARN: $FN: no rollback snapshot (live code not downloadable)"
           fi
-        fi
+        done
         if [ -n "${ECS_SERVICE_ARN:-}" ]; then
           aws ecs describe-express-gateway-service --service-arn "$ECS_SERVICE_ARN" --region "$AWS_REGION_HUB" --output json 2>/dev/null \
             | python3 -c "import json,sys; d=json.load(sys.stdin); pc=(d.get('service',{}).get('activeConfigurations') or [{}])[0].get('primaryContainer',{}); print(pc.get('image',''))" \
@@ -265,20 +265,22 @@ phases:
         echo "── App deploy complete ──"
 
         # ── Infra/runtime handoff: everything deployable shipped + baseline
-        # advanced; NOW fail the action (no rollback — the deploy is good and
-        # permanent) so the release manager reports the remaining files as a
-        # human step. Because the baseline already moved to this SHA, the NEXT
-        # run starts from here and will NOT re-block these commits (Codex #263
-        # round-5). What lands here: runtime images (deploy/runtime-agent,
-        # deploy/coding-agent-runtime) and infra scripts (IAM/env/tables) — see
-        # surfaces.json "handoff". Code-only surfaces are NOT here anymore.
+        # advanced. The remaining files need a human to run their owning script,
+        # so record them as a MARKER in S3 and exit 0.
+        #
+        # This used to `exit 2` — a deliberately Failed action for a successful
+        # deploy. That made "Failed" mean two opposite things: every operator and
+        # every release-manager poll had to read a build log to tell a real
+        # failure from a clean deploy with a follow-up. Six consecutive Failed
+        # executions (2026-09-08/09) is what made the pipeline unreadable. The
+        # marker carries the same information without lying about the outcome;
+        # Pipeline___get_state surfaces it as `handoff` on a succeeded run.
+        # What lands here: runtime create/setup scripts and infra scripts
+        # (IAM/env/tables) — see surfaces.json "handoff".
         if [ "$(cat /tmp/eval-handoff 2>/dev/null)" = "1" ]; then
-          echo "── HANDOFF: app + code surfaces deployed OK, but the changeset also touched infra-only files ──" >&2
-          echo "The pipeline deploys code (Lambda zips, harness prompts/models, S3 toolkits) — not" >&2
-          echo "runtime images, IAM, env vars or tables. A human must run the owning script for:" >&2
-          sed 's/^/  - /' /tmp/eval-files >&2
-          echo "(DEPLOY.md 'Not covered by the app pipeline' maps each path to its command.)" >&2
-          echo "Everything else is deployed + verified and the baseline has advanced, so" >&2
-          echo "re-running will not re-block these commits." >&2
-          exit 2
+          echo "── HANDOFF: app + code surfaces deployed OK; these files need a human to run their owning script ──"
+          sed 's/^/  - /' /tmp/eval-files
+          echo "(DEPLOY.md 'What the pipeline deploys, and what it hands off' maps each path to its command.)"
+          aws s3 cp /tmp/eval-files "s3://$ARTIFACT_BUCKET/pipeline-artifacts/handoff/${GIT_SHA}.txt" --region "$AWS_REGION_HUB" \
+            || echo "WARN: could not write the handoff marker — the list above is the record"
         fi
