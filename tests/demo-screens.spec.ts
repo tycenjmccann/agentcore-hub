@@ -14,6 +14,7 @@ const PAGES: { name: string; path: string; waitFor?: string }[] = [
   { name: "05-tickets", path: "/tickets" },
   { name: "06-invoke", path: "/invoke" },
   { name: "07-evaluations", path: "/evaluations" },
+  { name: "07b-evaluations-mock", path: "/evaluations?mock=1" },
   { name: "08-evaluations-config", path: "/evaluations/config" },
 ];
 

@@ -4,49 +4,13 @@ import { useState, useEffect, useCallback } from "react";
 import { BarChart3, Loader2, RefreshCw, ExternalLink, Settings } from "lucide-react";
 import Link from "next/link";
 import agentsConfig from "@/config/agents.json";
+import type { EvalData } from "./types";
+import { MOCK_AGENTS, MOCK_EVAL_DATA } from "./mock-data";
 
 // Map agent display names → agent IDs for API calls
 const AGENT_ID_MAP = new Map<string, string>(
   agentsConfig.agents.map((a) => [a.displayName, a.agentId])
 );
-
-interface ScorecardEntry {
-  avg: number;
-  count: number;
-  passing: number;
-}
-
-interface ModelCost {
-  model: string;
-  input: number;
-  output: number;
-  cacheRead?: number;
-  cacheWrite?: number;
-  calls?: number;
-  cost: number;
-}
-
-interface AgentMetrics {
-  sessions: number;
-  tokensIn: number;   // full prompt tokens, cache reads/writes included
-  tokensOut: number;
-  cacheRead?: number;
-  cacheWrite?: number;
-  calls?: number;
-  cost: number;
-  costPerSession: number;
-  models?: ModelCost[];
-}
-
-interface EvalData {
-  agents: string[];
-  scorecard: Record<string, Record<string, ScorecardEntry>>;
-  metrics: Record<string, AgentMetrics>;
-  evaluators: string[];
-  // Every row (sessions, scores, tokens, cost) covers this same rolling window.
-  window?: { days: number; start: string; end: string; timezone: string };
-  lastUpdated: string;
-}
 
 const AGENT_COLORS: Record<string, string> = {
   "Requirements Analyst": "#8b5cf6",
@@ -79,7 +43,7 @@ function scoreBg(score: number): string {
 
 function formatTokens(n?: number): string {
   if (!n) return "—";
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000_000) return `${(n / 1_000_000).toLocaleString("en-US", { minimumFractionDigits: 1, maximumFractionDigits: 1 })}M`;
   if (n >= 1_000) return `${(n / 1_000).toFixed(0)}K`;
   return String(n);
 }
@@ -124,6 +88,8 @@ export default function EvaluationsPage() {
   const [error, setError] = useState("");
   const [agentEnabled, setAgentEnabled] = useState<Record<string, boolean>>({});
   const [agentToggling, setAgentToggling] = useState<Record<string, boolean>>({});
+  // ?mock=1 (or ?demo=1) swaps the live API for a trimmed fixture — demo/screenshot mode.
+  const [mock, setMock] = useState(false);
 
   const fetchData = useCallback(async () => {
     setLoading((prev) => prev); // keep current loading state
@@ -157,6 +123,7 @@ export default function EvaluationsPage() {
   }, []);
 
   const toggleAgent = async (agentName: string) => {
+    if (mock) return;
     const agentId = AGENT_ID_MAP.get(agentName);
     if (!agentId) return;
     const current = agentEnabled[agentId];
@@ -177,6 +144,14 @@ export default function EvaluationsPage() {
   };
 
   useEffect(() => {
+    const q = new URLSearchParams(window.location.search);
+    if (q.get("mock") === "1" || q.get("demo") === "1") {
+      setMock(true);
+      setData(MOCK_EVAL_DATA);
+      setAgentEnabled(Object.fromEntries(MOCK_AGENTS.map((n) => [AGENT_ID_MAP.get(n) || n, true])));
+      setLoading(false);
+      return;
+    }
     const cached = getCachedData();
     if (cached) { setData(cached); setLoading(false); }
     fetchData();
@@ -207,7 +182,7 @@ export default function EvaluationsPage() {
     }
     return cols;
   })();
-  const agents = runtimeCols.length ? runtimeCols : (data?.agents ?? []);
+  const agents = mock ? MOCK_AGENTS : runtimeCols.length ? runtimeCols : (data?.agents ?? []);
   const hasScores = !!(data?.scorecard && Object.keys(data.scorecard).length > 0);
 
   // Compute totals for operational metrics
@@ -226,16 +201,27 @@ export default function EvaluationsPage() {
     ? `rolling ${data.window.days} days (${data.window.start} → ${data.window.end} UTC)`
     : "rolling 7 days (UTC)";
 
-  // Compute per-model totals across all agents
+  // Per-model cost rows collapse to one row per family (Fable/Opus/Sonnet/Haiku):
+  // point releases and 1m-context variants would otherwise show as duplicate
+  // identically-labelled rows.
+  const familyCost = (agent: string, family: string) =>
+    (data?.metrics[agent]?.models || [])
+      .filter((m) => shortModelName(m.model) === family)
+      .reduce((s, m) => s + m.cost, 0);
   const modelTotals: Record<string, number> = {};
   if (data) {
     for (const agent of agents) {
       for (const m of data.metrics[agent]?.models || []) {
-        modelTotals[m.model] = (modelTotals[m.model] || 0) + m.cost;
+        const family = shortModelName(m.model);
+        modelTotals[family] = (modelTotals[family] || 0) + m.cost;
       }
     }
   }
-  const usedModels = Object.keys(modelTotals).sort();
+  const FAMILY_ORDER = ["Fable", "Opus", "Sonnet", "Haiku"];
+  const usedModels = Object.keys(modelTotals).sort((a, b) => {
+    const ia = FAMILY_ORDER.indexOf(a), ib = FAMILY_ORDER.indexOf(b);
+    return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib) || a.localeCompare(b);
+  });
 
   // Compute overall average per evaluator (across all agents that have scores)
   function evalTotal(ev: string): number | null {
@@ -296,9 +282,11 @@ export default function EvaluationsPage() {
             <BarChart3 className="w-5 h-5 text-brand-400" />
             Evaluations
           </h1>
+          {!mock && (
           <p className="text-[11px] font-semibold text-info-fg uppercase tracking-[0.15em] mt-1.5">
             {agents.length} {agents.length === 1 ? "agent" : "agents"} &nbsp;·&nbsp; {(data?.evaluators?.length ?? 0)} evaluators &nbsp;·&nbsp; Opus 4.7 judge &nbsp;·&nbsp; 100% sampling &nbsp;·&nbsp; {windowLabel}
           </p>
+          )}
         </div>
         <div className="flex items-center gap-2">
           <a
@@ -310,8 +298,8 @@ export default function EvaluationsPage() {
             <ExternalLink className="w-3 h-3" /> Console
           </a>
           <button
-            onClick={fetchData}
-            disabled={loading}
+            onClick={mock ? undefined : fetchData}
+            disabled={loading || mock}
             className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-brand-600/20 border border-brand-600/30 text-brand-400 text-xs hover:bg-brand-600/30 transition-colors"
           >
             <RefreshCw className={`w-3 h-3 ${loading ? "animate-spin" : ""}`} />
@@ -334,7 +322,11 @@ export default function EvaluationsPage() {
       {agents.length > 0 && (
         <div className="bg-surface-2 border border-surface-4 rounded-xl overflow-hidden w-fit max-w-full">
           <div className="overflow-x-auto">
-            <table style={{ tableLayout: "fixed", width: "max-content" }}>
+            <table
+              style={{ tableLayout: "fixed", width: "max-content" }}
+              // Tighter rows in mock mode so ops metrics + evaluator scores fit one screen.
+              className={mock ? "[&_tbody_td]:py-1.5 [&_th]:py-2 [&_thead>tr:first-child>td]:pt-3" : undefined}
+            >
               <colgroup>
                 <col style={{ width: "160px", minWidth: "160px" }} />
                 <col style={{ width: "65px", minWidth: "65px" }} />
@@ -375,7 +367,7 @@ export default function EvaluationsPage() {
                       <td key={agent} className="text-center py-3">
                         <button
                           onClick={() => toggleAgent(agent)}
-                          disabled={toggling || enabled === undefined}
+                          disabled={mock || toggling || enabled === undefined}
                           className="group relative inline-block"
                           title={enabled ? "ON — click to disable" : "OFF — click to enable"}
                         >
@@ -451,19 +443,16 @@ export default function EvaluationsPage() {
                 {usedModels.map((model) => (
                   <tr key={model} className="border-b border-white/[0.04]">
                     <td className="px-3 py-2 text-[var(--color-text-secondary)] sticky left-0 bg-surface-2 z-10 pl-6">
-                      {shortModelName(model)}
+                      {model}
                     </td>
                     <td className="text-center py-2 text-[var(--color-text-secondary)]">
                       {formatCost(modelTotals[model])}
                     </td>
-                    {agents.map((agent) => {
-                      const modelEntry = data.metrics[agent]?.models?.find((m) => m.model === model);
-                      return (
-                        <td key={agent} className="text-center py-2 text-[var(--color-text-secondary)]">
-                          {formatCost(modelEntry?.cost)}
-                        </td>
-                      );
-                    })}
+                    {agents.map((agent) => (
+                      <td key={agent} className="text-center py-2 text-[var(--color-text-secondary)]">
+                        {formatCost(familyCost(agent, model))}
+                      </td>
+                    ))}
                   </tr>
                 ))}
                 {/* Total Cost row — bold */}
