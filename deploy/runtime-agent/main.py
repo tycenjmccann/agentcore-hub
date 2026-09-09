@@ -2233,7 +2233,10 @@ def _apply_connectors(agent_id: str, payload_connectors):
 def _create_mcp_clients(extra_servers=None, extra_gateways=None):
     """Create MCPClient instances for each configured MCP server."""
     from strands.tools.mcp import MCPClient
-    from mcp.client.streamable_http import streamablehttp_client
+    try:
+        from mcp.client.streamable_http import streamablehttp_client
+    except ImportError:  # mcp >= 2.0 renamed it (fleet v41 outage, 2026-09-09)
+        from mcp.client.streamable_http import streamable_http_client as streamablehttp_client
 
     servers = _parse_mcp_servers() + list(extra_servers or [])
     clients = []

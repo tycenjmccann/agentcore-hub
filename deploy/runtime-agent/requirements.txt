@@ -4,7 +4,11 @@ strands-agents-tools>=0.2.0
 boto3>=1.43.0
 # Codex routes through Bedrock Mantle using a short-term bearer token.
 aws-bedrock-token-generator>=1.0.0
-mcp>=1.0.0
+# <2: mcp 2.0 renamed streamable_http.streamablehttp_client → streamable_http_client
+# (main.py has the compat import); the unpinned rebuild on 2026-09-09 (fleet v41)
+# pulled 2.x and every persona died at import. Lift only with a Dockerfile-verified
+# build (see the RUN import assertion) and strands-agents' own mcp range.
+mcp>=1.23.0,<2
 # Explicit: SigV4-signed MCP gateway auth imports httpx directly (also a mcp dep).
 httpx>=0.27.0
 playwright>=1.40.0
