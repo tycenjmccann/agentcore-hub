@@ -1,18 +1,23 @@
-strands-agents>=1.53.0
-bedrock-agentcore>=0.2.0
-strands-agents-tools>=0.2.0
-boto3>=1.43.0
+# Every line carries a <next-major ceiling. The image is rebuilt from scratch on
+# every pipeline run that touches a baked file, so an unbounded `>=` means "take
+# whatever the ecosystem publishes that minute": fleet v41 (2026-09-09) pulled a
+# fresh mcp 2.x major and every persona died at import. A ceiling turns a major
+# bump into a deliberate, reviewed edit here (plus the Dockerfile import asserts).
+strands-agents>=1.53.0,<2
+bedrock-agentcore>=0.2.0,<1
+strands-agents-tools>=0.2.0,<1
+boto3>=1.43.0,<2
 # Codex routes through Bedrock Mantle using a short-term bearer token.
-aws-bedrock-token-generator>=1.0.0
+aws-bedrock-token-generator>=1.0.0,<2
 # <2: mcp 2.0 renamed streamable_http.streamablehttp_client → streamable_http_client
 # (main.py has the compat import); the unpinned rebuild on 2026-09-09 (fleet v41)
 # pulled 2.x and every persona died at import. Lift only with a Dockerfile-verified
 # build (see the RUN import assertion) and strands-agents' own mcp range.
 mcp>=1.23.0,<2
 # Explicit: SigV4-signed MCP gateway auth imports httpx directly (also a mcp dep).
-httpx>=0.27.0
-playwright>=1.40.0
-nest-asyncio>=1.5.0
-opentelemetry-distro>=0.50b0
-opentelemetry-exporter-otlp>=1.29.0
-aws-opentelemetry-distro>=0.18.0
+httpx>=0.27.0,<1
+playwright>=1.40.0,<2
+nest-asyncio>=1.5.0,<2
+opentelemetry-distro>=0.50b0,<1
+opentelemetry-exporter-otlp>=1.29.0,<2
+aws-opentelemetry-distro>=0.18.0,<1
