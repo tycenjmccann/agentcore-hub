@@ -164,6 +164,12 @@ cp "$SCRIPT_DIR/main.py" "$DEPLOY_DIR/"
 cp "$SCRIPT_DIR/requirements.txt" "$DEPLOY_DIR/"
 cd "$DEPLOY_DIR"
 
+# maxLifetime is the HARD session cap: AgentCore kills a persona mid-tool-call at
+# that mark with no completion reported. 3600 here is what silently reverted three
+# hand-applied 8h fixes ("workflows never finish", 2026-09-04) because this is the
+# DEFAULT deploy path (DEPLOY_MODE=lightweight, used by deploy-fleet.sh and
+# deploy.sh) and every run re-sends the block. 28800 is the platform max and
+# matches deploy-one-robust.py + what the pipeline's image swap preserves.
 agentcore configure \
   -e "main.py" \
   -n "$AGENT_NAME" \
@@ -173,7 +179,7 @@ agentcore configure \
   -dt direct_code_deploy \
   --runtime PYTHON_3_10 \
   --idle-timeout 3600 \
-  --max-lifetime 3600 \
+  --max-lifetime 28800 \
   --disable-memory \
   --non-interactive > /dev/null 2>&1
 

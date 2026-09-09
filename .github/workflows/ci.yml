@@ -128,15 +128,18 @@ jobs:
           deploy/runtime-agent/tests
           deploy/runtime-agent/test_telemetry_init.py
           deploy/runtime-agent/test_build_env_vars.py
+          deploy/runtime-agent/test_fleet_healthcheck.py
           deploy/coding-agent-runtime/test_plan_mode_args.py
           deploy/coding-agent-runtime/test_setup_failure_response.py
           deploy/coding-agent-runtime/test_session_busy.py
+          deploy/coding-agent-runtime/test_coding_healthcheck.py
           deploy/coding-agent-runtime/test_turn_timeout.py
           deploy/coding-agent-runtime/test_codex_sqlite_home.py
           deploy/workflow-manager/toolkit
           deploy/pipeline/test_ecs_primary_container.py
           deploy/pipeline/test_plan_surfaces.py
           deploy/pipeline/test_prune_apt_sources.py
+          deploy/pipeline/test_update_runtime_image.py
 
   cloud-code-ui:
     name: Cloud Code UI (mocked, no AWS)
@@ -153,6 +156,15 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+
+      # Same prune the CodeBuild Build stage runs (TEAM-4311): `--with-deps`
+      # shells out to `apt-get update && apt-get install`, and apt-get update
+      # exits 100 if ANY configured source fails — the hosted runner bakes in
+      # Google's Chrome repo, which served a Hash Sum mismatch for hours on
+      # 2026-09-09 and reddened this job on every commit. We use Playwright's
+      # bundled Chromium, so that source may not be able to fail the build.
+      - name: Prune unused third-party apt sources
+        run: bash deploy/pipeline/prune-apt-sources.sh
 
       - name: Install Playwright browser
         run: npx playwright install --with-deps chromium

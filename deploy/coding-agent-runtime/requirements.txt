@@ -1,6 +1,8 @@
-fastapi>=0.115.0
-uvicorn>=0.34.0
-boto3>=1.35.0
-requests>=2.31.0
+# <next-major ceilings on every line — see deploy/runtime-agent/requirements.txt
+# for why (fleet v41 import outage, 2026-09-09). A major bump is a reviewed edit.
+fastapi>=0.115.0,<1
+uvicorn>=0.34.0,<1
+boto3>=1.35.0,<2
+requests>=2.31.0,<3
 # Codex routes through Bedrock Mantle using a short-term bearer token.
-aws-bedrock-token-generator>=1.0.0
+aws-bedrock-token-generator>=1.0.0,<2

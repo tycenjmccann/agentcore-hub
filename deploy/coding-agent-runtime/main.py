@@ -2736,6 +2736,53 @@ def _setup_failure_response(payload: dict, cli: str, session_id: str | None,
     return JSONResponse(body, status_code=200)
 
 
+# Marker strings the pipeline smoke greps for (mirrors the fleet runtime).
+HEALTHCHECK_OK = "AGENTCORE_HUB_HEALTHCHECK_OK"
+HEALTHCHECK_FAIL = "AGENTCORE_HUB_HEALTHCHECK_FAIL"
+
+# Every CLI the server can launch. A broken install here presents as "the coding
+# turn vanished" mid-workflow, never as a failed deploy — unless we check.
+_HEALTHCHECK_CLIS = (
+    ("claude", [os.path.expanduser("~/.local/bin/claude"), "--version"]),
+    ("codex", ["codex", "--version"]),
+    ("kiro", [os.path.expanduser("~/.local/bin/kiro-cli"), "--version"]),
+)
+
+
+def _healthcheck() -> dict:
+    """Cold-start self-test: CLI binaries + a real write to the shared workspace.
+
+    No clone, no prompt, no tokens. Called by the pipeline right after the image
+    swap so a broken image is rolled back before any agent picks it up."""
+    result: dict = {"ok": True, "marker": HEALTHCHECK_OK, "clis": {},
+                    "workspace_root": WORKSPACE_ROOT}
+    for name, argv in _HEALTHCHECK_CLIS:
+        try:
+            proc = subprocess.run(argv, capture_output=True, text=True, timeout=20)
+            out = (proc.stdout or proc.stderr or "").strip().splitlines()
+            result["clis"][name] = {
+                "ok": proc.returncode == 0,
+                "version": (out[0][:120] if out else ""),
+            }
+        except Exception as exc:  # noqa: BLE001 — a missing/hung binary is the finding
+            result["clis"][name] = {"ok": False, "error": f"{type(exc).__name__}: {str(exc)[:200]}"}
+        if not result["clis"][name]["ok"]:
+            result["ok"] = False
+
+    try:
+        result["workspace_writable"] = _ensure_sessions_writable()
+    except Exception as exc:  # noqa: BLE001
+        result["workspace_writable"] = False
+        result["workspace_error"] = f"{type(exc).__name__}: {str(exc)[:200]}"
+    if not result["workspace_writable"]:
+        result["ok"] = False
+
+    if not result["ok"]:
+        result["marker"] = HEALTHCHECK_FAIL
+        logger.error("healthcheck_failed", extra={"result": json.dumps(result)[:800]})
+    return result
+
+
 @app.post("/invocations")
 async def invocations(request: Request):
     """Run one coding turn.
@@ -2767,6 +2814,12 @@ async def invocations(request: Request):
     # rmtree can't be torn down mid-flight. Reclaims the session's EFS dir,
     # transcript files, and S3 resume/checkpoint objects.
     purge = bool(payload.get("purge"))
+    # Healthcheck: the pipeline's post-promote smoke. Prove the image can
+    # actually do work — every CLI binary starts, the EFS workspace is writable —
+    # without cloning a repo or spending a token. A non-ok body rolls the image
+    # back automatically (buildspec-runtime-images.yml's trap).
+    if payload.get("healthcheck"):
+        return JSONResponse(_healthcheck())
     if purge:
         sid = payload.get("session_id")
         if not sid:

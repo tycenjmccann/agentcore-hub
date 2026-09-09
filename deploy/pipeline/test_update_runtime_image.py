@@ -64,3 +64,75 @@ def test_public_network_mode_passes_through_untouched():
     assert kw["networkConfiguration"] == {"networkMode": "PUBLIC"}
     assert "protocolConfiguration" not in kw
     assert "filesystemConfigurations" not in kw
+
+
+# ── Post-promote smoke (fleet v41, 2026-09-09) ───────────────────────────────
+# READY is a control-plane status. The image that killed every persona at import
+# was READY. _smoke is what turns "accepted" into "verified", and its failure is
+# what fires the buildspec's rollback trap.
+import io
+import pytest
+
+
+class _FakeBody:
+    def __init__(self, text):
+        self._text = text
+
+    def read(self):
+        return self._text.encode()
+
+
+class _FakeDataPlane:
+    def __init__(self, bodies):
+        self._bodies = list(bodies)
+        self.calls = []
+
+    def invoke_agent_runtime(self, **kwargs):
+        self.calls.append(kwargs)
+        nxt = self._bodies.pop(0)
+        if isinstance(nxt, Exception):
+            raise nxt
+        return {"response": _FakeBody(nxt)}
+
+
+def _patch(monkeypatch, client):
+    monkeypatch.setattr(uri.boto3, "client", lambda *a, **k: client)
+    monkeypatch.setattr(uri.time, "sleep", lambda _s: None)
+
+
+def test_smoke_passes_on_ok_marker(monkeypatch):
+    client = _FakeDataPlane(['{"ok": true, "marker": "AGENTCORE_HUB_HEALTHCHECK_OK"}'])
+    _patch(monkeypatch, client)
+    uri._smoke("us-east-1", "arn:rt", "agentcore_hub_agent")
+    assert len(client.calls) == 1
+    assert len(client.calls[0]["runtimeSessionId"]) >= 33
+    assert b'"healthcheck"' in client.calls[0]["payload"]
+
+
+def test_smoke_fails_hard_on_fail_marker(monkeypatch):
+    body = '{"ok": false, "marker": "AGENTCORE_HUB_HEALTHCHECK_FAIL", "error": "ImportError"}'
+    client = _FakeDataPlane([body, body, body])
+    _patch(monkeypatch, client)
+    with pytest.raises(SystemExit) as e:
+        uri._smoke("us-east-1", "arn:rt", "agentcore_hub_agent")
+    assert e.value.code == 1
+    assert len(client.calls) == 3  # every attempt used before failing
+
+
+def test_smoke_retries_a_cold_start_error_then_passes(monkeypatch):
+    client = _FakeDataPlane([
+        RuntimeError("read timeout on cold start"),
+        '{"marker": "AGENTCORE_HUB_HEALTHCHECK_OK"}',
+    ])
+    _patch(monkeypatch, client)
+    uri._smoke("us-east-1", "arn:rt", "agentcore_hub_agent")
+    assert len(client.calls) == 2
+    # fresh session id per attempt — never reuse a half-dead session
+    assert client.calls[0]["runtimeSessionId"] != client.calls[1]["runtimeSessionId"]
+
+
+def test_smoke_treats_a_body_with_no_marker_as_failure(monkeypatch):
+    client = _FakeDataPlane(['{"error": "Received error (500)"}'] * 3)
+    _patch(monkeypatch, client)
+    with pytest.raises(SystemExit):
+        uri._smoke("us-east-1", "arn:rt", "agentcore_hub_agent", attempts=3)

@@ -326,9 +326,11 @@ reason).
 | **Runtime images** — fleet baked source (`deploy/runtime-agent/main.py`, `requirements.txt`, `install-skills.sh`, `Dockerfile`) and coding baked source (`deploy/coding-agent-runtime/main.py`, `requirements.txt`, `otel-collector-config.yaml`, `log.py`, `run-codex.sh`, `merge-codex-config.py`, `shell-init.sh`, `Dockerfile`) | **`Deploy_runtime_images`** — a parallel arm64 CodeBuild action (`buildspec-runtime-images.yml`) that rebuilds only the changed runtime, pushes by digest, and does an image-only `UpdateAgentRuntime` (`update-runtime-image.py`) preserving env/lifecycle/role/EFS. Emits a `runtime.deploy` marker to the events table so the performance card can attribute a step-change to a prompt/tool deploy. This is the PR-2 "merge = live" close on **agent tools** (prompts already ship via the S3 row above). |
 | The Next.js app | ECS roll-by-digest, Target 3 |
 
-**Handed off (Deploy stage exits 2 AFTER everything above shipped and the
-baseline advanced — the release manager reports it, a human runs the owning
-script):**
+**Handed off (the Deploy stage SUCCEEDS, records the file list at
+`pipeline-artifacts/handoff/<sha>.txt`, and `Pipeline___get_state` reports it as
+`handoff` — a human runs the owning script). Until 2026-09-09 this exited 2, so a
+green deploy looked Failed and "Failed" meant two opposite things; a Failed Deploy
+stage is now always a real failure:**
 
 | Path in repo | Command |
 |---|---|

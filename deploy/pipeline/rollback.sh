@@ -10,21 +10,26 @@ set -uo pipefail
 
 echo "── ROLLBACK ──"
 
-# 1. Orchestrator Lambdas → prior zip (same zip feeds orchestrator, agent-invoker
-#    and events-writer — mirror Target 1 in buildspec-deploy.yml).
+# 1. Orchestrator trio → each function's OWN pre-deploy code
+#    (buildspec-deploy.yml snapshots the LIVE zip per function, like Target 1b).
+#    Restoring one shared S3 snapshot instead undid hand-deploys twice on
+#    2026-09-09 — a rollback may only put back what this run replaced.
 # --output text --query suppresses the full-config dump: update-function-code
 # otherwise echoes plaintext env vars (JIRA_API_TOKEN, GITHUB_PAT) into the log.
-if [ -f /tmp/rollback/orchestrator-prev.zip ]; then
-  for FN in agentcore-hub-orchestrator agentcore-hub-agent-invoker agentcore-hub-events-writer; do
-    echo "restoring $FN to prior zip"
-    aws lambda update-function-code --function-name "$FN" \
-      --zip-file fileb:///tmp/rollback/orchestrator-prev.zip --region "$AWS_REGION_HUB" \
-      --output text --query 'LastUpdateStatus' >/dev/null \
-      && aws lambda wait function-updated --function-name "$FN" --region "$AWS_REGION_HUB" \
-      && echo "$FN rolled back" || echo "$FN rollback FAILED — inspect"
-  done
-else
-  echo "no prior orchestrator zip — orchestrator Lambdas not rolled back (were they deployed this run?)"
+TRIO_RESTORED=0
+for FN in agentcore-hub-orchestrator agentcore-hub-agent-invoker agentcore-hub-events-writer; do
+  Z="/tmp/rollback/trio/$FN.zip"
+  [ -f "$Z" ] || continue
+  TRIO_RESTORED=1
+  echo "restoring $FN to its own pre-deploy code"
+  aws lambda update-function-code --function-name "$FN" \
+    --zip-file "fileb://$Z" --region "$AWS_REGION_HUB" \
+    --output text --query 'LastUpdateStatus' >/dev/null \
+    && aws lambda wait function-updated --function-name "$FN" --region "$AWS_REGION_HUB" \
+    && echo "$FN rolled back" || echo "$FN rollback FAILED — inspect"
+done
+if [ "$TRIO_RESTORED" = "0" ]; then
+  echo "no per-function trio snapshots — orchestrator Lambdas not rolled back (were they deployed this run?)"
 fi
 
 # 1b. Manifest surface Lambdas → the live code captured before each update

@@ -40,6 +40,20 @@ if [ ! -d "$dir" ]; then
   exit 0
 fi
 
+# CodeBuild runs as root; GitHub's hosted runners do not, and they bake in the
+# same google-chrome source (this script serves BOTH Playwright callers, so the
+# GH CI job is protected by the same prune). An unwritable dir means we need
+# sudo; a writable one (root, or the test's temp dir) means we must not use it.
+SUDO=""
+if [ ! -w "$dir" ]; then
+  if command -v sudo >/dev/null 2>&1; then
+    SUDO="sudo"
+  else
+    echo "prune-apt-sources: $dir is not writable and sudo is unavailable - nothing pruned" >&2
+    exit 0
+  fi
+fi
+
 pruned=0
 kept=0
 for f in "$dir"/*; do
@@ -52,7 +66,7 @@ for f in "$dir"/*; do
   # Report what is being dropped: first deb/deb-src line, or deb822 URIs line.
   line="$(grep -m1 -iE '^[[:space:]]*(deb(-src)?[[:space:]]|URIs:)' "$f" || true)"
   echo "prune-apt-sources: pruned $(basename "$f")${line:+ -> ${line}}"
-  rm -f "$f"
+  $SUDO rm -f "$f"
   pruned=$((pruned + 1))
 done
 

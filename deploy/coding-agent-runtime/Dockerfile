@@ -81,11 +81,19 @@ RUN curl --proto '=https' --tlsv1.2 -fsSL -o /tmp/kirocli.zip "${KIRO_CLI_URL}" 
     && KIRO_CLI_SKIP_SETUP=1 bash /tmp/kirocli-extract/kirocli/install.sh \
     && rm -rf /tmp/kirocli.zip /tmp/kirocli-extract \
     && "$HOME/.local/bin/kiro-cli" --version
+# Every CLI the server can launch must at least start — a broken install is a
+# fleet-wide "coding turn vanished", not a build failure, unless asserted here.
+RUN "$HOME/.local/bin/claude" --version && codex --version
 USER root
 
 # Python deps (health server + OTel + codex bedrock token generator)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+# Exact resolved versions in the build log + import assertion, so a dependency
+# API break fails the image build rather than the first /invocations (the fleet
+# runtime learned this the hard way on 2026-09-09).
+RUN pip freeze \
+ && python -c "import fastapi, uvicorn, boto3, requests, aws_bedrock_token_generator"
 
 # Resumable /invocations server, OTel config, structured logging. The server
 # runs `claude` directly; Codex still goes through its Mantle launcher script.

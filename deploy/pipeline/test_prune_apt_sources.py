@@ -137,3 +137,49 @@ def test_playwright_install_is_not_softened():
     for line in BUILDSPEC.read_text(encoding="utf-8").splitlines():
         if "playwright install" in line:
             assert "|| true" not in line, line
+
+
+def test_uses_sudo_when_the_directory_is_not_writable(tmp_path):
+    """GitHub's hosted runners are non-root and bake in the same google-chrome
+    source, so this script serves that caller too — but `rm` there needs sudo,
+    and under `set -e` a permission-denied rm would abort the job it is meant to
+    protect. A read-only dir must route through sudo (stubbed here), never a bare
+    rm, and must not touch anything when sudo is missing either."""
+    d = tmp_path / "sources.list.d"
+    d.mkdir()
+    (d / "google-chrome.list").write_text("deb https://dl.google.com/linux/chrome-stable/deb stable main\n")
+    d.chmod(0o555)
+    try:
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        # A sudo that records its argv instead of escalating.
+        log = tmp_path / "sudo.log"
+        sudo = bin_dir / "sudo"
+        sudo.write_text(f'#!/usr/bin/env bash\necho "$@" >> "{log}"\n')
+        sudo.chmod(0o755)
+
+        env = dict(os.environ, APT_SOURCES_DIR=str(d), PATH=f"{bin_dir}:{os.environ['PATH']}")
+        proc = subprocess.run(["bash", str(SCRIPT)], capture_output=True, text=True, env=env)
+        assert proc.returncode == 0, proc.stderr
+        assert "pruned google-chrome.list" in proc.stdout
+        assert log.read_text().strip().startswith("rm -f ")
+    finally:
+        d.chmod(0o755)
+
+
+def test_no_sudo_and_no_write_access_exits_clean_without_pruning(tmp_path):
+    """Better to leave the sources alone and let apt speak than to abort a build
+    on a `sudo: not found`."""
+    d = tmp_path / "sources.list.d"
+    d.mkdir()
+    (d / "google-chrome.list").write_text("deb https://dl.google.com/linux/chrome-stable/deb stable main\n")
+    d.chmod(0o555)
+    try:
+        empty_bin = tmp_path / "empty"
+        empty_bin.mkdir()
+        env = dict(os.environ, APT_SOURCES_DIR=str(d), PATH=str(empty_bin))
+        proc = subprocess.run(["/bin/bash", str(SCRIPT)], capture_output=True, text=True, env=env)
+        assert proc.returncode == 0, proc.stderr
+        assert (d / "google-chrome.list").exists()
+    finally:
+        d.chmod(0o755)

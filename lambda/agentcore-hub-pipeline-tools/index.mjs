@@ -57,9 +57,11 @@
 import {
   CodePipelineClient,
   GetPipelineStateCommand,
+  GetPipelineExecutionCommand,
   StartPipelineExecutionCommand,
   ListActionExecutionsCommand,
 } from "@aws-sdk/client-codepipeline";
+import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
 import {
   CodeBuildClient,
   BatchGetBuildsCommand,
@@ -76,6 +78,7 @@ const PIPELINE_NAME = process.env.PIPELINE_NAME || "agentcore-hub-deploy";
 const BUILD_PROJECT = process.env.BUILD_PROJECT || "agentcore-hub-build";
 const CI_PROJECT = process.env.CI_PROJECT || "agentcore-hub-ci";
 const DEPLOY_PROJECT = process.env.DEPLOY_PROJECT || "agentcore-hub-deploy";
+const ARTIFACT_BUCKET = process.env.ARTIFACT_BUCKET || "";
 
 // A CodeBuild project that deploys, but is not the pipeline's Deploy stage, so
 // the DEPLOY_PROJECT/PIPELINE_NAME comparisons below would not catch it.
@@ -145,6 +148,7 @@ if (!CI_PROJECT_CHECK.ok) {
 const cp = new CodePipelineClient({ region: REGION });
 const cb = new CodeBuildClient({ region: REGION });
 const logs = new CloudWatchLogsClient({ region: REGION });
+const s3 = new S3Client({ region: REGION });
 
 export const handler = async (event) => {
   let toolName =
@@ -200,6 +204,45 @@ export const handler = async (event) => {
     return textResult(`Error: ${err.name || "Error"}: ${err.message}`);
   }
 };
+
+// ─── handoff marker ───────────────────────────────────────────────────────────
+// A Deploy stage that shipped every code surface but also touched infra-only
+// files (runtime create/setup scripts, IAM/env/table scripts) writes the file
+// list to pipeline-artifacts/handoff/<sha>.txt and SUCCEEDS. It used to exit 2 —
+// a green deploy reported as Failed — so "Failed" meant either a real failure or
+// a clean deploy with a follow-up, and only a build log could tell them apart.
+// get_state now reports it as data on a succeeded run.
+async function handoffForExecution(pipelineName, pipelineExecutionId) {
+  if (!ARTIFACT_BUCKET || !pipelineExecutionId) return null;
+  let sha = "";
+  try {
+    const ex = await cp.send(
+      new GetPipelineExecutionCommand({ pipelineName, pipelineExecutionId })
+    );
+    sha = ex.pipelineExecution?.artifactRevisions?.[0]?.revisionId || "";
+  } catch (e) {
+    console.warn("get-pipeline-execution failed (non-fatal):", e.message);
+    return null;
+  }
+  if (!sha) return null;
+  // The Build stage truncates the source revision to 12 chars for GIT_SHA, and
+  // the Deploy stage keys the marker on that.
+  const key = `pipeline-artifacts/handoff/${sha.slice(0, 12)}.txt`;
+  try {
+    const obj = await s3.send(
+      new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: key })
+    );
+    const body = await obj.Body.transformToString();
+    const files = body.split("\n").map((l) => l.trim()).filter(Boolean);
+    return { sha: sha.slice(0, 12), files };
+  } catch (e) {
+    // NoSuchKey is the normal case: this deploy had nothing to hand off.
+    if (e.name !== "NoSuchKey" && e.name !== "NotFound") {
+      console.warn("handoff marker read failed (non-fatal):", e.name, e.message);
+    }
+    return null;
+  }
+}
 
 // ─── get_state ────────────────────────────────────────────────────────────────
 // Returns whether a pipeline is configured, each stage's latest status, and the
@@ -308,10 +351,15 @@ async function getState(args = {}) {
     }
   }
 
+  // Present (non-null) when this execution's Deploy stage recorded infra files a
+  // human must still deploy. It is NOT a failure — the code deploy succeeded.
+  const handoff = await handoffForExecution(name, pipelineExecutionId);
+
   return jsonResult({
     configured: true,
     pipelineName: name,
     pipelineExecutionId,
+    handoff,
     // Present only when execution_id was passed: true iff ≥1 stage's latest
     // execution is that execution. When false, terminal/succeeded describe
     // NOTHING about the requested run — keep polling.

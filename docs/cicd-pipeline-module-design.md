@@ -133,9 +133,9 @@ review. So they get **separate pipelines from the same parameterized CDK stack**
   bucket, `ecs:UpdateExpressGatewayService`. Triggered by `src/`,
   `lambda/orchestrator/`, `deploy/ecs-express/`, `src/config/*.json`. A changeset
   that also touches fleet/eval files **deploys the app targets, advances the
-  baseline SHA, then fails the action as a terminal non-rollback handoff** — a
-  human runs DEPLOY.md steps 4-9 (the documented deploy-contract handoff), never
-  a silent skip. (See §6 for why the deploy-then-signal ordering is deliberate.)
+  baseline SHA, then records a handoff marker in S3 and SUCCEEDS** — a human runs
+  DEPLOY.md steps 4-9 (the documented deploy-contract handoff), never a silent
+  skip. (See §6 for why the deploy-then-signal ordering is deliberate.)
 - **Fleet + eval pipeline (follow-up).** A second `cdk deploy` of the same stack
   with `{component: "fleet-eval"}`: its own buildspec, its own broader-but-
   isolated role (AgentCore control-plane, fleet-role PassRole, GitHub/MCP secrets
@@ -177,8 +177,8 @@ GitHub: tycenjmccann/agentcore-hub
                                                (Lambda code + S3 config + ECS roll,
                                                 promote-by-digest; fleet/eval change
                                                 → deploy app targets, advance baseline,
-                                                  then FAIL as a terminal handoff to
-                                                  the fleet+eval pipeline)
+                                                  then SUCCEED with a handoff marker
+                                                  for the human-run infra scripts)
 ```
 
 - **Approval notification (as implemented):** a **poll-based Telegram bridge**,
@@ -316,8 +316,10 @@ Notes (implemented):
   belong to the separate fleet+eval pipeline (its own role/secrets/CLI). The app
   pipeline detects a fleet/eval change (`pipeline-out/changed-files.txt`) but does
   NOT block up front — it **deploys the app targets, advances the baseline SHA,
-  then fails the action as a terminal non-rollback handoff** so a human runs steps
-  4-9. This ordering is deliberate: the baseline only advances on a successful app
+  then writes `pipeline-artifacts/handoff/<sha>.txt` and SUCCEEDS** so a human runs
+  steps 4-9 (`Pipeline___get_state` surfaces the list as `handoff`; it used to
+  `exit 2`, which made a green deploy indistinguishable from a broken one —
+  2026-09-09). This ordering is deliberate: the baseline only advances on a successful app
   deploy, so blocking *before* the deploy would wedge the pipeline (same range
   re-blocks forever). Deploying-then-signalling means the app always ships and the
   same commits never re-block. The changed-file list is computed from the last

@@ -3044,6 +3044,68 @@ app = BedrockAgentCoreApp()
 _DETACHED_TASKS: set = set()
 
 
+# Marker strings the pipeline's post-promote smoke greps for in the response body.
+# A marker (not a JSON shape) because the entrypoint is a streaming generator and
+# the transport wraps each yield — the marker survives any wrapping.
+HEALTHCHECK_OK = "AGENTCORE_HUB_HEALTHCHECK_OK"
+HEALTHCHECK_FAIL = "AGENTCORE_HUB_HEALTHCHECK_FAIL"
+
+
+def _healthcheck() -> dict:
+    """Cold-start self-test: exercise every import the first real invocation
+    needs, without calling a model or spending a token.
+
+    WHY: the fleet's heavy imports are LAZY (MCP transport inside the tool-mount
+    function, strands_tools per tool). A dependency API break therefore passes
+    `docker build`, passes UpdateAgentRuntime's READY check, and only surfaces
+    when a persona cold-starts in prod — fleet v41 (2026-09-09) killed every
+    persona in <1s at the MCP transport import and stayed live for ten hours.
+    The pipeline promotes the image, then calls this; a non-OK body rolls the
+    image back automatically."""
+    versions = {}
+    try:
+        for dist in ("mcp", "strands-agents", "strands-agents-tools", "boto3",
+                     "bedrock-agentcore"):
+            try:
+                versions[dist] = importlib.metadata.version(dist)
+            except Exception:  # noqa: BLE001 — a missing version is not a failure
+                versions[dist] = "unknown"
+
+        # The lazy imports, in the same order a real cold start hits them.
+        from strands.tools.mcp import MCPClient  # noqa: F401
+        try:
+            from mcp.client.streamable_http import streamablehttp_client  # noqa: F401
+        except ImportError:
+            from mcp.client.streamable_http import streamable_http_client  # noqa: F401
+        import strands_tools  # noqa: F401
+        from strands_tools import (  # noqa: F401
+            http_request, current_time, calculator, file_read, file_write,
+            editor, shell, environment, python_repl, retrieve,
+        )
+        from strands_tools.code_interpreter import AgentCoreCodeInterpreter  # noqa: F401
+        from strands_tools.browser import AgentCoreBrowser  # noqa: F401
+        from aws_bedrock_token_generator import provide_token  # noqa: F401
+
+        # The roster read every cold start does (also proves S3 + the IAM role).
+        roster = -1
+        if ARTIFACT_BUCKET:
+            body = (
+                boto3.client("s3", region_name=REGION)
+                .get_object(Bucket=ARTIFACT_BUCKET, Key="config/agents.json")["Body"]
+                .read()
+            )
+            doc = json.loads(body)
+            agents = doc if isinstance(doc, list) else doc.get("agents", [])
+            roster = len(agents)
+
+        return {"ok": True, "marker": HEALTHCHECK_OK, "versions": versions,
+                "roster": roster, "region": REGION}
+    except Exception as exc:  # noqa: BLE001 — the whole point is to report it
+        logger.error(f"healthcheck failed: {type(exc).__name__}: {str(exc)[:500]}")
+        return {"ok": False, "marker": HEALTHCHECK_FAIL, "versions": versions,
+                "error": f"{type(exc).__name__}: {str(exc)[:500]}"}
+
+
 @app.entrypoint
 async def agent_invocation(payload, context):
     """Route an invocation: workflow runs detach to a background task, chat runs
@@ -3065,6 +3127,13 @@ async def agent_invocation(payload, context):
     agent-invoker sends it. Anything that reads the response synchronously
     (chat, verify-fleet-invoke.py healthchecks, ad-hoc invokes) keeps the
     streaming path by default."""
+    # Post-promote smoke (the pipeline's runtime-image action). Must come before
+    # anything that touches a model, the roster cache or the events table.
+    if payload.get("healthcheck"):
+        result = _healthcheck()
+        yield {"event": {"contentBlockDelta": {"delta": {"text": json.dumps(result)}}}}
+        return
+
     workflow_id = payload.get("workflow_id", "unknown")
     agent_id = payload.get("agent_id", "unknown")
 
