@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Unit tests for intervene.py `start` and `file-bug` — hermetic, no AWS/network.
+"""Unit tests for intervene.py `start`, `file-bug` and `mark-done` — hermetic, no
+AWS/network.
 
 TEAM-3911: `start` gained a mutually-exclusive --def/--type pipeline selector and
 `file-bug` gained a free-form mode (no --agent → a plain bug with an
@@ -15,6 +16,13 @@ The network/AWS seams are mocked at the module boundary: `intervene.api_post`
 stubbed in sys.modules BEFORE import (intervene builds a dynamodb resource at
 module load and the CI toolkit job installs no boto3); WORKFLOW_API_URL is set
 before import for good measure though api_post is fully mocked.
+
+TEAM-4283 adds a third seam for mark-done's completion-record verification:
+`intervene.fetch_completion_record` (the only S3 read) plus
+`intervene.ARTIFACT_BUCKET`, both patched by the `record_fetch` fixture with
+`raising=False` so this suite still RUNS against the pre-fix module (where
+neither name exists) and fails on its assertions rather than erroring at setup —
+that is what makes the fail-on-base proof meaningful.
 
 Run: python3 -m pytest deploy/workflow-manager/toolkit/test_intervene.py -v
 """
@@ -289,6 +297,231 @@ def test_file_bug_missing_title_or_description_refuses(rec, argv):
         run(argv)
     assert "REFUSED: file-bug requires" in str(exc.value)
     assert rec.posts == []
+
+
+# --------------------------------------------------------------------------
+# mark-done — TEAM-4266: the transition body must carry the evidence
+# --------------------------------------------------------------------------
+#
+# The bug: mark-done recorded the operator's proof as prose only (a ticket
+# comment + a manager.intervention event) and transitioned the ticket. Nothing
+# ever wrote completions/{ticketId}.json, the record BOTH completion evidence
+# gates read, so a run whose agent died before report_completion emitted
+# workflow.completion_blocked reason=missing_evidence forever. The route now
+# writes that record — but only if mark-done actually SENDS the evidence, which
+# is what these pin.
+
+
+@pytest.fixture
+def open_ticket(monkeypatch):
+    """A plain unprotected ticket, so refuse_if_protected passes on a real dict
+    rather than on whatever the boto3 MagicMock happens to return."""
+    monkeypatch.setattr(
+        intervene, "get_ticket",
+        lambda tid: {"ticketId": tid, "status": "in_progress", "assignee": "agentcore_hub_backend_dev"},
+    )
+
+
+class RecordFetch:
+    """Counting stub for the ONE S3 read mark-done makes. `.result` is returned
+    (or raised, when it is an exception); `.calls` records the ticket ids."""
+
+    def __init__(self, result=None):
+        self.result = result
+        self.calls = []
+
+    def __call__(self, ticket_id):
+        self.calls.append(ticket_id)
+        if isinstance(self.result, BaseException):
+            raise self.result
+        return self.result
+
+
+@pytest.fixture
+def record_fetch(monkeypatch):
+    # raising=False: on the pre-fix intervene.py neither name exists, and the
+    # new tests must fail on their assertions, not error in fixture setup.
+    fetch = RecordFetch({"ticket_id": "TEAM-X", "summary": "PR #87"})
+    monkeypatch.setattr(intervene, "ARTIFACT_BUCKET", "test-artifacts", raising=False)
+    monkeypatch.setattr(intervene, "fetch_completion_record", fetch, raising=False)
+    return fetch
+
+
+def transition_returns(rec, payload):
+    """api_post that answers `payload` for the transition and a plain ack for the
+    audit comment, while still recording both posts."""
+    def api_post(path, body=None):
+        rec.posts.append((path, body))
+        return dict(payload) if path.endswith("/tickets/transition") else {"success": True}
+    return api_post
+
+
+def test_mark_done_transition_body_carries_evidence(rec, open_ticket, record_fetch, capsys):
+    run(["mark-done", "wf_1", "TEAM-X", "--evidence", "PR #87"])
+
+    # Two posts, in order: the audit comment, then the transition.
+    assert [p for p, _ in rec.posts] == [
+        "/api/workflow/wf_1/tickets/comment",
+        "/api/workflow/wf_1/tickets/transition",
+    ]
+    # only_post() assumes a single POST — mark-done makes two, so index directly.
+    assert rec.posts[1][1] == {
+        "ticketId": "TEAM-X",
+        "targetStatus": "done",
+        "comment": "Closed by Workflow Manager (agent finished, no report_completion). Evidence: PR #87",
+        "evidence": "PR #87",
+    }
+    # The evidence still lands in the comment + the intervention event too — the
+    # record is additive, not a replacement for the audit trail.
+    assert "PR #87" in rec.posts[0][1]["content"]
+    assert rec.events[0][1] == "mark_done"
+    assert rec.events[0][2]["evidence"] == "PR #87"
+
+
+def test_mark_done_reports_whether_the_record_was_written(rec, open_ticket, monkeypatch, capsys):
+    # The route answers `completionRecordWritten`; the printed summary splats
+    # **result, so the operator sees it without any extra plumbing.
+    monkeypatch.setattr(
+        intervene, "api_post",
+        lambda path, body=None: {"success": True, "completionRecordWritten": True},
+    )
+    run(["mark-done", "wf_1", "TEAM-X", "--evidence", "PR #87"])
+    assert '"completionRecordWritten": true' in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("evidence", ["", "   "])
+def test_mark_done_blank_evidence_refuses_before_any_post(rec, open_ticket, evidence):
+    # Unchanged guard — no evidence means no proof, so nothing is sent and no
+    # completion record can be minted from an empty string.
+    with pytest.raises(SystemExit) as exc:
+        run(["mark-done", "wf_1", "TEAM-X", "--evidence", evidence])
+    assert "REFUSED: mark-done requires --evidence" in str(exc.value)
+    assert rec.posts == []
+    assert rec.events == []
+
+
+# --------------------------------------------------------------------------
+# mark-done — TEAM-4283: verify the record when the route did not write it
+# --------------------------------------------------------------------------
+#
+# Post-TEAM-4282 the route fails CLOSED on a write failure (502 → api_post
+# raises), so completionRecordWritten=false inside a 2xx is the route's "kept"
+# outcome — and two of its three sub-cases (the record vanished between the
+# create-only PUT and the read-back; a concurrent writer won the refill's
+# IfMatch, contents unknown) leave nothing the completion gate can use. The
+# response cannot distinguish them, so mark-done reads the record itself and
+# reports `completionRecordCheck`. A legitimate kept record must stay exit 0 —
+# exiting non-zero there would read as a failed intervention and escalate.
+
+
+def test_mark_done_written_true_skips_the_s3_verification(rec, open_ticket, record_fetch, monkeypatch, capsys):
+    # (a) The route wrote the record this call — nothing to verify, no S3 read.
+    monkeypatch.setattr(intervene, "api_post", transition_returns(rec, {"success": True, "completionRecordWritten": True}))
+    run(["mark-done", "wf_1", "TEAM-X", "--evidence", "PR #87"])
+    assert '"completionRecordCheck": "written"' in capsys.readouterr().out
+    assert record_fetch.calls == []
+
+
+def test_mark_done_kept_existing_evidence_record_is_a_success(rec, open_ticket, record_fetch, monkeypatch, capsys):
+    # (b) Route outcome "kept" where the existing record DOES prove the
+    # deliverable (usually the agent's own report_completion landing first).
+    # A real success: exit 0, and the intervention is still recorded.
+    record_fetch.result = {"ticket_id": "TEAM-X", "summary": "agent record", "pr_url": "https://x/pr/87"}
+    monkeypatch.setattr(intervene, "api_post", transition_returns(rec, {"success": True, "completionRecordWritten": False}))
+    run(["mark-done", "wf_1", "TEAM-X", "--evidence", "PR #87"])
+    assert '"completionRecordCheck": "kept-existing"' in capsys.readouterr().out
+    assert record_fetch.calls == ["TEAM-X"]
+    assert rec.events[0][1] == "mark_done"
+
+
+def test_mark_done_missing_record_warns_and_exits_nonzero(rec, open_ticket, record_fetch, monkeypatch, capsys):
+    # (c) The "vanished between the PUT and the read-back" race: the ticket is
+    # done and NO record exists, so the completion gate will 409 forever and
+    # done → done blocks a retry. Exit non-zero with the create-only remedy —
+    # but the summary is still printed and the intervention still published,
+    # because the transition itself DID land.
+    record_fetch.result = None
+    monkeypatch.setattr(intervene, "api_post", transition_returns(rec, {"success": True, "completionRecordWritten": False}))
+    with pytest.raises(SystemExit) as exc:
+        run(["mark-done", "wf_1", "TEAM-X", "--evidence", "PR #87"])
+    message = str(exc.value)
+    assert "WARNING" in message
+    assert "IfNoneMatch" in message
+    assert "TEAM-X" in message
+    assert "completions/TEAM-X.json" in message
+    assert "missing_evidence" in message
+    assert '"completionRecordCheck": "missing"' in capsys.readouterr().out
+    assert rec.events[0][1] == "mark_done"
+
+
+def test_mark_done_blank_record_warns_and_exits_nonzero(rec, open_ticket, record_fetch, monkeypatch, capsys):
+    # (d) A record exists but is not evidence per completionRecordHasEvidence
+    # (the concurrent-writer race can leave exactly this). Same answer as (c).
+    record_fetch.result = {"ticket_id": "TEAM-X", "summary": ""}
+    monkeypatch.setattr(intervene, "api_post", transition_returns(rec, {"success": True, "completionRecordWritten": False}))
+    with pytest.raises(SystemExit) as exc:
+        run(["mark-done", "wf_1", "TEAM-X", "--evidence", "PR #87"])
+    assert "WARNING" in str(exc.value)
+    assert "IfNoneMatch" in str(exc.value)
+    assert '"completionRecordCheck": "blank"' in capsys.readouterr().out
+
+
+def test_mark_done_absent_written_key_still_verifies(rec, open_ticket, record_fetch, monkeypatch, capsys):
+    # (e) Version skew: an older route that answers no completionRecordWritten
+    # at all must NOT be read as "written". The toolkit ships to S3 before the
+    # app rolls, and deploy/workflow-manager/deploy.sh can be hand-run alone, so
+    # this skew is not merely transient.
+    record_fetch.result = None
+    monkeypatch.setattr(intervene, "api_post", transition_returns(rec, {"success": True}))
+    with pytest.raises(SystemExit) as exc:
+        run(["mark-done", "wf_1", "TEAM-X", "--evidence", "PR #87"])
+    assert "WARNING" in str(exc.value)
+    assert record_fetch.calls == ["TEAM-X"]
+    assert '"completionRecordCheck": "missing"' in capsys.readouterr().out
+
+
+def test_mark_done_unset_artifact_bucket_is_unverified_not_a_failure(rec, open_ticket, record_fetch, monkeypatch, capsys):
+    # (f) No bucket configured = inconclusive, NOT a failed intervention: the
+    # transition succeeded, so warn on stderr and exit 0.
+    monkeypatch.setattr(intervene, "ARTIFACT_BUCKET", "", raising=False)
+    monkeypatch.setattr(intervene, "api_post", transition_returns(rec, {"success": True, "completionRecordWritten": False}))
+    run(["mark-done", "wf_1", "TEAM-X", "--evidence", "PR #87"])
+    captured = capsys.readouterr()
+    assert '"completionRecordCheck": "unverified"' in captured.out
+    assert "WARNING" in captured.err
+    assert record_fetch.calls == []
+
+
+def test_mark_done_s3_error_is_unverified_not_a_failure(rec, open_ticket, record_fetch, monkeypatch, capsys):
+    # Same reasoning as (f) for a transient S3/permission failure.
+    record_fetch.result = RuntimeError("throttled")
+    monkeypatch.setattr(intervene, "api_post", transition_returns(rec, {"success": True, "completionRecordWritten": False}))
+    run(["mark-done", "wf_1", "TEAM-X", "--evidence", "PR #87"])
+    captured = capsys.readouterr()
+    assert '"completionRecordCheck": "unverified"' in captured.out
+    assert "WARNING" in captured.err
+
+
+def test_mark_done_evidence_write_failure_publishes_no_event(rec, open_ticket, monkeypatch):
+    # (g) PIN — passes on the pre-fix module too. The route fails closed on a
+    # failed evidence write (502), api_post raises before publish_intervention,
+    # so nothing is recorded for a ticket that never moved. The audit comment
+    # posted first still stands.
+    def api_post(path, body=None):
+        rec.posts.append((path, body))
+        if path.endswith("/tickets/transition"):
+            raise SystemExit('API 502: {"error":"completion evidence record write failed"}')
+        return {"success": True}
+
+    monkeypatch.setattr(intervene, "api_post", api_post)
+    with pytest.raises(SystemExit) as exc:
+        run(["mark-done", "wf_1", "TEAM-X", "--evidence", "PR #87"])
+    assert "completion evidence record write failed" in str(exc.value)
+    assert rec.events == []
+    assert [p for p, _ in rec.posts] == [
+        "/api/workflow/wf_1/tickets/comment",
+        "/api/workflow/wf_1/tickets/transition",
+    ]
 
 
 if __name__ == "__main__":
