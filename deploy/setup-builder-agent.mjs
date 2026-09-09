@@ -317,7 +317,9 @@ console.log("  " + "=".repeat(50) + "\n");
 // --- Check if already exists ---
 const list = await agentcore.send(new ListHarnessesCommand({}));
 const existingReady = (list.harnesses || []).find(
-  (h) => h.harnessName === "agentcore_hub_builder" && h.status === "READY"
+  // UPDATE_FAILED is retryable in place (a refused update leaves the last good
+  // config serving) — same rule as setup-workflow-manager.mjs.
+  (h) => h.harnessName === "agentcore_hub_builder" && (h.status === "READY" || h.status === "UPDATE_FAILED")
 );
 
 if (existingReady) {
