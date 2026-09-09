@@ -7,6 +7,7 @@ ENV PYTHONUNBUFFERED=1 \
     CLAUDE_CODE_ENABLE_TELEMETRY=1 \
     CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1 \
     OTEL_LOG_TOOL_DETAILS=1 \
+    CODEX_SQLITE_HOME=/tmp/codex-sqlite \
     HOME=/home/bedrock_agentcore \
     PATH=/home/bedrock_agentcore/.local/bin:$PATH
 

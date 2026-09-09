@@ -30,8 +30,17 @@ resume = same runtimeSessionId  → same warm microVM + /mnt/workspace
        + claude_session_id       → same Claude Code conversation
 ```
 
-- **Workspace persistence:** `filesystemConfigurations=[{sessionStorage:{mountPath:"/mnt/workspace"}}]`.
-  A re-invoke with the same session id finds the repo already cloned.
+- **Workspace persistence:** an EFS access point mounted at `/mnt/efs`
+  (`WORKSPACE_ROOT`), shared by every session microVM; each session checks out
+  under `/mnt/efs/sessions/<id>`. A re-invoke with the same session id finds the
+  repo already cloned.
+- **Codex state DBs live off EFS.** `CODEX_HOME=/mnt/efs/.codex` holds the
+  transcripts (`sessions/**/rollout-*.jsonl`) and `config.toml`, but Codex's
+  SQLite state/log DBs are WAL-mode and WAL across NFS clients corrupts them
+  ("file is not a database" + a repair prompt on every start). `CODEX_SQLITE_HOME`
+  therefore defaults to container-local `/tmp/codex-sqlite` (Dockerfile ENV,
+  `run-codex.sh`, `shell-init.sh`, `main.py`). `codex resume <id>` falls back to
+  the rollout files when the DB is fresh, so resume is unaffected.
 - **Conversation resume:** Claude Code's own `--resume <session_id>`. Claude scopes
   a conversation to its working directory, so the server persists a
   `{claude_session_id → repo}` map (`/mnt/workspace/.sessions.json`) and recovers

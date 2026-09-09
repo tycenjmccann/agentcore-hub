@@ -158,6 +158,15 @@ def _tenant_root(tenant_id: str | None) -> str:
     return "cloud-code" if tid == DEFAULT_TENANT_ID else f"cloud-code/t/{tid}"
 CLAUDE_CONFIG_DIR = os.environ.get("CLAUDE_CONFIG_DIR", os.path.join(WORKSPACE_ROOT, ".claude-data"))
 CODEX_HOME = os.environ.get("CODEX_HOME", os.path.join(WORKSPACE_ROOT, ".codex"))
+# Codex keeps its state/log/goals/memories SQLite DBs under CODEX_HOME in WAL mode.
+# WAL needs a shared-memory mmap that does not work across NFS clients, and
+# CODEX_HOME is one EFS directory shared by every session microVM, so parallel
+# codex runs corrupted it ("file is not a database" + repair prompt on every
+# start). Park the DBs on container-local disk instead: one microVM per session
+# makes /tmp private. Transcripts stay on EFS (rollout JSONL under
+# CODEX_HOME/sessions) and `codex resume <id>` falls back to them when the DB is
+# fresh, so nothing the hub relies on is lost.
+CODEX_SQLITE_HOME = os.environ.get("CODEX_SQLITE_HOME", "/tmp/codex-sqlite")
 # Kiro keeps sessions in a SQLite DB under its data dir; KIRO_HOME relocates it.
 KIRO_HOME = os.environ.get("KIRO_HOME", os.path.join(WORKSPACE_ROOT, ".kiro-data"))
 # Marker so we only materialize a given (user, version) once per warm microVM.
@@ -2138,6 +2147,7 @@ def _run_codex(prompt: str, workdir: str, codex_session_id: str | None,
     We surface codex's thread_id through the same `claude_session_id` field the
     server returns, so the caller's resume handle is CLI-agnostic."""
     env = {**os.environ, "WORKSPACE_DIR": workdir, **_otel_turn_env(session_id)}
+    env.setdefault("CODEX_SQLITE_HOME", CODEX_SQLITE_HOME)
     if model:
         env["CODEX_MODEL"] = model  # run-codex.sh reads CODEX_MODEL
     args = ["/app/run-codex.sh", prompt]
@@ -2212,6 +2222,7 @@ def _stream_codex(prompt: str, workdir: str, codex_session_id: str | None,
         return f"data: {json.dumps(obj)}\n\n"
 
     env = {**os.environ, "WORKSPACE_DIR": workdir}
+    env.setdefault("CODEX_SQLITE_HOME", CODEX_SQLITE_HOME)
     args = ["/app/run-codex.sh", prompt]
     if codex_session_id:
         args.append(codex_session_id)
@@ -3159,7 +3170,7 @@ def _export_runtime_env() -> None:
     keys = [
         "GITHUB_PAT", "GIT_AUTHOR_EMAIL", "GIT_AUTHOR_NAME",
         "AWS_REGION", "BEDROCK_MANTLE_REGION", "ANTHROPIC_MODEL", "CLAUDE_MODEL",
-        "CODEX_MODEL", "ARTIFACT_BUCKET", "WORKSPACE_ROOT",
+        "CODEX_MODEL", "CODEX_SQLITE_HOME", "ARTIFACT_BUCKET", "WORKSPACE_ROOT",
         "KIRO_API_KEY", "KIRO_MODEL", "KIRO_HOME",
     ]
     body = "".join(
