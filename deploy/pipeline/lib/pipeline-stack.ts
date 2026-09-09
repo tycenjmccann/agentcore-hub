@@ -550,6 +550,22 @@ function grantDeployPerms(
         `arn:aws:bedrock-agentcore:${ctx.region}:${ctx.account}:harness/*`,
       ],
     }),
+    // UpdateHarness is ALSO authorized as UpdateAgentRuntime on the harness's
+    // backing runtime (run ee8bb64d, 2026-09-09: "not authorized to perform
+    // bedrock-agentcore:UpdateAgentRuntime on runtime/*" from
+    // setup-workflow-manager.mjs's in-place prompt/skills update — and the
+    // rollback's restore-harness failed the same way). Runtime IMAGES are still
+    // a handoff (surfaces.json); this only lets the harness update complete.
+    new iam.PolicyStatement({
+      sid: "HarnessBackingRuntime",
+      actions: [
+        "bedrock-agentcore:GetAgentRuntime",
+        "bedrock-agentcore:UpdateAgentRuntime",
+      ],
+      resources: [
+        `arn:aws:bedrock-agentcore:${ctx.region}:${ctx.account}:runtime/*`,
+      ],
+    }),
     new iam.PolicyStatement({
       sid: "HarnessList",
       actions: ["bedrock-agentcore:ListHarnesses"],
