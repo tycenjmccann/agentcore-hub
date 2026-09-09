@@ -541,6 +541,13 @@ _CODING_SESSION = {
     "branch": None,
     "git_mode": None,
     "clone_url": None,
+    # Session-sharing guard: `adopted` = this task took its session id from
+    # resume_session (another agent-task minted it); `turns` = turns THIS task
+    # completed in it. An adopted session that answers session_busy on its first
+    # turn belongs to a task that is still running — we move to a fresh one.
+    "adopted": False,
+    "turns": 0,
+    "fallback_note": None,
 }
 
 
@@ -572,6 +579,10 @@ def _record_coding_session(cli: str) -> None:
             "workflowId": {"S": _CURRENT_WORKFLOW_ID},
             "agentId": {"S": _CURRENT_AGENT_ID},
         }
+        if _CURRENT_TICKET_ID:
+            # The orchestrator offers a session back ONLY to this ticket (reopen /
+            # re-dispatch) — never to a sibling of the same agent (findCodingSession).
+            item["ticketId"] = {"S": _CURRENT_TICKET_ID}
         if _CODING_SESSION.get("repo"):
             item["repo"] = {"S": _CODING_SESSION["repo"]}
         if conversation_id:
@@ -628,6 +639,7 @@ def _maybe_resume_session(resume_session: str) -> None:
         return
     _CODING_SESSION["session_id"] = resume_session
     _CODING_SESSION["recorded"] = True  # row exists (or existed) — update, don't re-put
+    _CODING_SESSION["adopted"] = True
     try:
         row = boto3.client("dynamodb", region_name=REGION).get_item(
             TableName=CLOUD_CODE_TABLE,
@@ -1089,6 +1101,31 @@ def _remote_coding_turn(task: str, cli: str, repo: str = "", model: str = "",
                 logger.warning(f"[remote-coding] {result.get('error')} — resubmitting once")
                 result = _submit_and_poll(client, payload, turn_deadline, eff_budget)
             result.pop("retryable_vm_death", None)
+        # The coding runtime refused: another turn is live in this session's
+        # checkout. If we ADOPTED the session (resume_session) and have not run
+        # in it yet, it is a sibling task's — mint our own session and go again
+        # (fresh conversation: the transcript belongs to that other task's cwd).
+        if result.get("session_busy"):
+            if _CODING_SESSION.get("adopted") and not _CODING_SESSION.get("turns") \
+                    and time.monotonic() < turn_deadline:
+                busy_id = _CODING_SESSION["session_id"]
+                fresh_id = f"cc-{uuid.uuid4().hex}"
+                logger.warning(f"[remote-coding] resumed session {busy_id} is busy "
+                               f"(turn {result.get('busy_turn_id')}) — falling back to "
+                               f"fresh session {fresh_id}")
+                _CODING_SESSION.update({
+                    "session_id": fresh_id, "conversation_ids": {}, "recorded": False,
+                    "adopted": False, "resume_transcript": None, "resume_session_id": None,
+                    "fallback_note": (f"NOTE: the session you asked to resume ({busy_id}) "
+                                      f"is mid-turn for another ticket, so this task runs in "
+                                      f"its own fresh session {fresh_id}. Your context is the "
+                                      f"branch, not that conversation — pull base_branch and "
+                                      f"re-read what you need."),
+                })
+                payload["session_id"] = fresh_id
+                for k in ("claude_session_id", "resume_transcript", "resume_session_id"):
+                    payload.pop(k, None)
+                result = _submit_and_poll(client, payload, turn_deadline, eff_budget)
     except Exception as e:  # noqa: BLE001
         # Do NOT fall back to a local CLI run: the session's workspace lives on
         # the coding runtime, and a local run would fork it (split-brain).
@@ -1103,6 +1140,16 @@ def _remote_coding_turn(task: str, cli: str, repo: str = "", model: str = "",
         _publish_agent_error(_CURRENT_WORKFLOW_ID, _CURRENT_AGENT_ID,
                              f"remote {cli} turn failed: {str(result['error'])[:600]}",
                              ticket_id=_CURRENT_TICKET_ID)
+        if result.get("session_busy"):
+            # OUR session (minted here, or adopted and already worked in) is
+            # still running an earlier turn — a poll gave up before the CLI did.
+            # Never fork a second session for the same ticket: the work is in
+            # THAT checkout. Wait for it, then retry the identical call.
+            return (f"ERROR: remote {cli} turn refused: your coding session is still "
+                    f"running a previous turn ({result.get('busy_turn_id') or 'unknown'}). "
+                    f"Do NOT start a new session or switch engines — the work is in this "
+                    f"workspace. Wait about 60 seconds, then retry the same {cli} call; "
+                    f"if it is refused again, wait longer before retrying.")
         if result.get("setup_failed"):
             # The workspace never came up, so nothing pins this session to the
             # bad target: release every field that decides WHAT gets cloned so a
@@ -1134,10 +1181,13 @@ def _remote_coding_turn(task: str, cli: str, repo: str = "", model: str = "",
 
     if result.get("claude_session_id"):
         _CODING_SESSION["conversation_ids"][cli] = result["claude_session_id"]
+    _CODING_SESSION["turns"] = int(_CODING_SESSION.get("turns") or 0) + 1
     _record_coding_session(cli)
 
     footer = (f"\n\n[coding-session: {_CODING_SESSION['session_id']} cli={cli}"
               f" conversation={_CODING_SESSION['conversation_ids'].get(cli) or 'n/a'}]")
+    if _CODING_SESSION.get("fallback_note"):
+        footer += f"\n[{_CODING_SESSION.pop('fallback_note')}]"
     # Deliverables the turn produced (mockups, screenshots, diagrams) are
     # harvested to S3 by the coding runtime — these keys are how you reach files
     # in the remote workspace: download_s3_file(key) → image_reader / file ops.
@@ -2273,16 +2323,17 @@ def claude_code(task: str, working_directory: str = "/tmp", repo: str = "", mode
               (routine coding, faster/cheaper), "haiku" (trivial mechanical
               edits). YOU decide per call: match the tier to the difficulty of
               the task. Leave empty for the default.
-        resume_session: A PRIOR task's coding-session id (the "cc-..." value
-              from a [coding-session: ...] footer in your ticket history) to
-              continue that conversation instead of starting fresh. Use on
-              REWORK — when a reviewer rejected your recent work and you are
-              revising it: the session already holds the repo, your changes,
-              and your reasoning, so revision is faster and better informed.
-              Start fresh (leave empty) when the task differs from the prior
-              one, the feedback says start over, or a resumed session errors —
-              resume is best-effort and falls back to a fresh workspace.
-              Only honored on your FIRST coding call of this task.
+        resume_session: THIS ticket's prior coding-session id — the "cc-..."
+              value the `## Prior Coding Session` block in your Workflow Context
+              hands you (a reopened or re-dispatched ticket). It continues that
+              conversation and workspace instead of starting fresh. Never pass a
+              session id you found elsewhere (a sibling's or parent ticket's
+              [coding-session] footer): one session is one git checkout and one
+              CLI, and that session may be mid-turn for another ticket. If it
+              is, the runtime refuses and you are moved to a fresh session
+              automatically (the response footer says so). Start fresh (leave
+              empty) when the feedback says start over. Only honored on your
+              FIRST coding call of this task.
         plan_only: True = PLAN-ONLY turn. Claude Code reads the repo and returns
               an implementation plan but is blocked from editing files or
               running mutating commands — nothing is written. Review the plan
@@ -2513,11 +2564,13 @@ def codex(task: str, working_directory: str = "/tmp", repo: str = "", resume_ses
               the coding runtime hosts the session)
         repo: Repository as owner/name or clone URL. Pass on your FIRST call so
               the workspace is cloned; later calls reuse it automatically.
-        resume_session: A PRIOR task's coding-session id ("cc-..." from a
-              [coding-session: ...] footer in your ticket history) to continue
-              that conversation on rework instead of rebuilding context. Leave
-              empty for a fresh session; best-effort. Only honored on your
-              FIRST coding call of this task.
+        resume_session: THIS ticket's prior coding-session id — the "cc-..."
+              value your `## Prior Coding Session` context block hands you
+              (reopened / re-dispatched ticket). Never a sibling's or parent's
+              [coding-session] footer id: one session = one checkout = one
+              CLI; a busy session is refused and you get a fresh one. Leave
+              empty for a fresh session. Only honored on your FIRST coding
+              call of this task.
     """
     import subprocess
     import shutil
@@ -2671,11 +2724,13 @@ def kiro(task: str, working_directory: str = "/tmp", repo: str = "", resume_sess
               the coding runtime hosts the session)
         repo: Repository as owner/name or clone URL. Pass on your FIRST call so
               the workspace is cloned; later calls reuse it automatically.
-        resume_session: A PRIOR task's coding-session id ("cc-..." from a
-              [coding-session: ...] footer in your ticket history) to continue
-              that conversation on rework instead of rebuilding context. Leave
-              empty for a fresh session; best-effort. Only honored on your
-              FIRST coding call of this task.
+        resume_session: THIS ticket's prior coding-session id — the "cc-..."
+              value your `## Prior Coding Session` context block hands you
+              (reopened / re-dispatched ticket). Never a sibling's or parent's
+              [coding-session] footer id: one session = one checkout = one
+              CLI; a busy session is refused and you get a fresh one. Leave
+              empty for a fresh session. Only honored on your FIRST coding
+              call of this task.
     """
     # Kiro has no in-container fallback: the CLI is only installed on the coding
     # runtime image and needs its access key from that runtime's env.
@@ -3166,7 +3221,8 @@ async def _run_agent_invocation(payload, context):
         _CODING_SESSION.update(
             {"session_id": None, "conversation_ids": {}, "repo": None, "recorded": False,
              "resume_transcript": None, "resume_session_id": None, "branch": None,
-             "git_mode": None, "clone_url": None}
+             "git_mode": None, "clone_url": None, "adopted": False, "turns": 0,
+             "fallback_note": None}
         )
 
         logger.info(f"[{agent_id}] Starting invocation for workflow {workflow_id}")

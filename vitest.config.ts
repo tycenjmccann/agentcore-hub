@@ -78,6 +78,9 @@ export default defineConfig({
       // publisher + fake clock), so the union + extended-state logic is
       // unit-testable with no AWS.
       "lambda/orchestrator/cascade.test.mjs",
+      // coding-session-hint.mjs (DL-025) — pure selection of a ticket's OWN prior
+      // coding session + the dispatch-context block; no AWS.
+      "lambda/orchestrator/coding-session-hint.test.mjs",
       // level-trigger-dispatch (TEAM-4060) — DI coverage for the dead-zone fix:
       // off|shadow|enforce, the already-Ready in-process dispatch, and non-fatal
       // isolation when dispatchReady (the claim-CAS webhook path) loses a race.

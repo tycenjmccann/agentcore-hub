@@ -18,12 +18,13 @@ base_branch is the run's SHARED integration branch — branch from it (never the
 default branch), PR **into it**, and merge your PR once tests pass so sibling and fix
 tickets build on your work. The orchestrator opens the single unified PR to the
 default branch at run completion. Fix tickets: the code under fix is on base_branch —
-pull it and fix it there, and **RESUME YOUR PRIOR SESSION by default**: your context
-includes a `## Prior Coding Session` block (or the fix ticket carries a
-`[coding-session: ...]` footer) — pass that id as `resume_session=` on your FIRST
-coding call. You wrote this code; the session holds the decisions and file map a
-fresh session re-derives at full token cost. Start fresh ONLY when the feedback
-explicitly demands a clean-slate redo.
+pull it and fix it there. A fix ticket is a NEW ticket and starts in its OWN fresh
+coding session (siblings run in parallel; one session = one checkout = one CLI).
+Never pass another ticket's `[coding-session: ...]` footer id as `resume_session=`.
+**RESUME only when your Workflow Context carries a `## Prior Coding Session`
+block** — THIS ticket's own session (reopened / re-dispatched); pass that id on
+your FIRST coding call. Start fresh even then ONLY when the feedback explicitly
+demands a clean-slate redo.
 
 ## Process
 
