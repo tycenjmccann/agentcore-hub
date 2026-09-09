@@ -157,6 +157,15 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # Same prune the CodeBuild Build stage runs (TEAM-4311): `--with-deps`
+      # shells out to `apt-get update && apt-get install`, and apt-get update
+      # exits 100 if ANY configured source fails — the hosted runner bakes in
+      # Google's Chrome repo, which served a Hash Sum mismatch for hours on
+      # 2026-09-09 and reddened this job on every commit. We use Playwright's
+      # bundled Chromium, so that source may not be able to fail the build.
+      - name: Prune unused third-party apt sources
+        run: bash deploy/pipeline/prune-apt-sources.sh
+
       - name: Install Playwright browser
         run: npx playwright install --with-deps chromium
 
