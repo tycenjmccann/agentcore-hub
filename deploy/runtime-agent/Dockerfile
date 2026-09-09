@@ -15,6 +15,12 @@ RUN bash install-skills.sh && rm install-skills.sh
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+# Build-time smoke: the MCP transport import is lazy (inside a tool-mount
+# function), so a dependency API break only surfaces when a persona cold-starts
+# in prod (fleet v41, 2026-09-09: every session died in <1s at this import).
+# Fail the image build instead.
+RUN python -c "from mcp.client.streamable_http import streamablehttp_client" \
+ || python -c "from mcp.client.streamable_http import streamable_http_client"
 COPY main.py .
 EXPOSE 8080
 # Wrap with opentelemetry-instrument so the runtime emits GenAI-semantic OTel
