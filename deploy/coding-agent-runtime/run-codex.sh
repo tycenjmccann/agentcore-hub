@@ -70,6 +70,11 @@ fi
 # the user's mcp_servers / profiles / prefs.
 export CODEX_HOME="${CODEX_HOME:-$WORKSPACE_DIR/.codex}"
 mkdir -p "$CODEX_HOME"
+# Codex's SQLite DBs (WAL mode) must NOT sit on the shared EFS CODEX_HOME: WAL
+# across NFS clients corrupts them. Container-local /tmp is private per microVM;
+# transcripts (sessions/) stay on EFS and resume falls back to them.
+export CODEX_SQLITE_HOME="${CODEX_SQLITE_HOME:-/tmp/codex-sqlite}"
+mkdir -p "$CODEX_SQLITE_HOME"
 python3 /app/merge-codex-config.py "$CODEX_HOME/config.toml" "$MODEL" "$BASE_URL" "$PROJECT"
 
 echo "[codex] base_url=${BASE_URL} model=${MODEL} project=${PROJECT} resume=${RESUME_ID:-no}" >&2

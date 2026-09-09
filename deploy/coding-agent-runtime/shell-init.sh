@@ -44,6 +44,9 @@ export BEDROCK_MANTLE_REGION="${BEDROCK_MANTLE_REGION:-us-east-2}"
 export CODEX_HOME="${CODEX_HOME:-$WORKSPACE_ROOT/.codex}"
 export CODEX_MODEL="${CODEX_MODEL:-openai.gpt-5.5}"
 mkdir -p "$CODEX_HOME" 2>/dev/null || true
+# SQLite state DBs off the shared EFS (WAL over NFS corrupts them; see run-codex.sh).
+export CODEX_SQLITE_HOME="${CODEX_SQLITE_HOME:-/tmp/codex-sqlite}"
+mkdir -p "$CODEX_SQLITE_HOME" 2>/dev/null || true
 
 # Ensure the Bedrock provider block is present (merges, never clobbers a
 # user-uploaded config.toml). Quiet — don't spam the terminal on every shell.
