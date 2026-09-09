@@ -96,6 +96,40 @@
   transition: background-color 0.2s ease, color 0.2s ease, border-color 0.2s ease;
 }
 
+/* ===== Global sleek scrollbars (TEAM-4316) =====
+   Token-driven so it is correct in both light and dark themes without a class.
+   Kept OUTSIDE @layer so pseudo-element rules are not deprioritized by layer
+   ordering. .scrollbar-thin (below, in @layer utilities) is intentionally left
+   untouched. The `*` transition rule above does NOT match ::-webkit-scrollbar-*
+   pseudo-elements, so the thumb has no background-color transition (no artifact)
+   — deliberately not broadened. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-surface-4) transparent;
+}
+
+*::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: var(--color-surface-4);
+  border-radius: 3px;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--color-surface-4) 70%, var(--color-text-muted));
+}
+
+*::-webkit-scrollbar-button {
+  display: none;
+}
+
 @layer base {
   html {
     background-color: var(--color-surface-0);
