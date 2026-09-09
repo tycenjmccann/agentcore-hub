@@ -4,7 +4,7 @@
 # fresh mcp 2.x major and every persona died at import. A ceiling turns a major
 # bump into a deliberate, reviewed edit here (plus the Dockerfile import asserts).
 strands-agents>=1.53.0,<2
-bedrock-agentcore>=0.2.0,<1
+bedrock-agentcore>=1.0.0,<2
 strands-agents-tools>=0.2.0,<1
 boto3>=1.43.0,<2
 # Codex routes through Bedrock Mantle using a short-term bearer token.
