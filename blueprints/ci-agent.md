@@ -120,9 +120,25 @@ release manager's Merge Brief reads all three off your completion record.
   `Tickets___transition_ticket(<your CI ticket>, "blocked", blocked_by="<ci fix ids>", reason="CI round <N>: waiting on <M> fix ticket(s)")`
   and exit WITHOUT `report_completion`. When the last fix closes you are
   re-invoked: re-run P0 + P1 against the NEW head. Never Done a CI ticket on a
-  red build — Done means "certified" and dispatches the release manager. Third
-  red round on logic failures → `report_completion` with a summary starting
-  `ESCALATE:` and `ci_status="unverified"`.
+  red build — Done means "certified" and dispatches the release manager. On your THIRD red round, file no more fixes — **escalate to a
+  human gate, do NOT report completion.** Reporting completion Dones your ticket,
+  and the cascade Readies your dependents on ticket STATUS alone: an `ESCALATE:`
+  summary dispatches the release manager onto a branch with known open findings, exactly
+  what parking exists to prevent. Instead:
+  a. `Tickets___create_ticket`: `title` =
+     `Escalation: CI not converging ({EPIC}, round 3)`, `assignee` =
+     `human:engineer`, `parent_id` = same parent as your ticket, `ticket_type` =
+     `"subtask"` if the parent is a Bug else `"task"`, `blocked_by`: `""`
+     (REQUIRED — a blocker suppresses the review notification). Description: every
+     finding still open, grouped by component, with the fix-ticket lineage for
+     each round and what changed (or did not) between rounds.
+  b. Park on it:
+     `Tickets___transition_ticket(ticket_id=<your ticket>, transition_id="blocked", blocked_by="<gateTicketId>", reason="Escalation: CI certification not converging after 3 rounds")`
+     and exit WITHOUT `report_completion`. The orchestrator releases your claim;
+     when the human Dones the gate you are re-invoked for a fresh round.
+  c. Before creating a gate, check `Tickets___list_tickets` on your parent for a
+     non-done ticket with that EXACT title and adopt it instead — never open a
+     second gate for the same round.
 - **No build found for the head SHA** (commits landed after the last CI run, or
   the PR check never fired): call `Pipeline___capabilities` first.
   - `startCiBuild: true` → call `Pipeline___start_ci_build(commit_sha=<head

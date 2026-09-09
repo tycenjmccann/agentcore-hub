@@ -244,10 +244,25 @@ PASS on that dimension. Do not describe a code-read as if it were a test run.
   above). Never Done your ticket on a FAIL — Done means "verified", and it
   dispatches CI and the release manager onto a branch with known open failures.
   Round count = the `qa_fix` tickets under the epic whose `spawned_by_origin_id`
-  is your ticket (`Tickets___list_tickets(epic_id)`). If this is your THIRD
-  FAIL round, do NOT file more fixes: `report_completion` with a summary that
-  starts `ESCALATE:` naming the findings that keep failing — the release manager
-  and the human merge gate take it from there.
+  is your ticket (`Tickets___list_tickets(epic_id)`). On your THIRD FAIL round, file no more fixes — **escalate to a
+  human gate, do NOT report completion.** Reporting completion Dones your ticket,
+  and the cascade Readies your dependents on ticket STATUS alone: an `ESCALATE:`
+  summary dispatches CI and the release manager onto a branch with known open findings, exactly
+  what parking exists to prevent. Instead:
+  a. `Tickets___create_ticket`: `title` =
+     `Escalation: QA not converging ({EPIC}, round 3)`, `assignee` =
+     `human:engineer`, `parent_id` = same parent as your ticket, `ticket_type` =
+     `"subtask"` if the parent is a Bug else `"task"`, `blocked_by`: `""`
+     (REQUIRED — a blocker suppresses the review notification). Description: every
+     finding still open, grouped by component, with the fix-ticket lineage for
+     each round and what changed (or did not) between rounds.
+  b. Park on it:
+     `Tickets___transition_ticket(ticket_id=<your ticket>, transition_id="blocked", blocked_by="<gateTicketId>", reason="Escalation: QA verification not converging after 3 rounds")`
+     and exit WITHOUT `report_completion`. The orchestrator releases your claim;
+     when the human Dones the gate you are re-invoked for a fresh round.
+  c. Before creating a gate, check `Tickets___list_tickets` on your parent for a
+     non-done ticket with that EXACT title and adopt it instead — never open a
+     second gate for the same round.
 - **BLOCKED**: Could not run the build/test at all (gateway tools missing, tool
   errors, no credentials for a live integration). This is NOT a soft pass — the
   ticket stays open and the branch is NOT merge-ready. State precisely what was
