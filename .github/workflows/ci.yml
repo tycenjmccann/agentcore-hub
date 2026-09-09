@@ -134,6 +134,7 @@ jobs:
           deploy/workflow-manager/toolkit
           deploy/pipeline/test_ecs_primary_container.py
           deploy/pipeline/test_plan_surfaces.py
+          deploy/pipeline/test_prune_apt_sources.py
 
   cloud-code-ui:
     name: Cloud Code UI (mocked, no AWS)

@@ -33,8 +33,19 @@ phases:
       # Mirrors .github/workflows/ci.yml, which sets nothing. (PR #263 pilot fix.)
       - "node --version && npm --version"
       - "npm ci --include=dev"
+      # TEAM-4311: the `--with-deps` line below runs, as root,
+      # `sh -c "apt-get update && apt-get install -y --no-install-recommends ..."`,
+      # and `apt-get update` exits 100 if ANY configured source fails to fetch --
+      # which short-circuits the `&&` and fails INSTALL. This image bakes in four
+      # third-party repos we do not use (Google Chrome, mozillateam PPA, corretto,
+      # github-cli); on 2026-09-09 dl.google.com served a Hash Sum mismatch and
+      # killed the Build stage twice. Playwright pulls Chromium from Microsoft's
+      # CDN and install-deps only needs Ubuntu main/universe, so drop those
+      # sources first. Nothing is uninstalled -- only the source files go.
+      - "bash deploy/pipeline/prune-apt-sources.sh"
       # Playwright needs a real browser + OS deps on the clean CodeBuild image
       # (mirrors .github/workflows/ci.yml). Without this the test gates error.
+      # Deliberately NO `|| true` -- a missing browser must still fail the build.
       - "npx playwright install --with-deps chromium"
 
   pre_build:
@@ -97,7 +108,8 @@ phases:
           deploy/coding-agent-runtime/test_setup_failure_response.py \
           deploy/workflow-manager/toolkit \
           deploy/pipeline/test_ecs_primary_container.py \
-          deploy/pipeline/test_plan_surfaces.py
+          deploy/pipeline/test_plan_surfaces.py \
+          deploy/pipeline/test_prune_apt_sources.py
         deactivate
       # HARD GATE: lambda-zip manifest integrity (the guard DEPLOY.md's inline zip bypassed)
       - "bash scripts/check-lambda-zip-manifest.sh"
