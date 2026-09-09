@@ -286,10 +286,13 @@ const list = await agentcore.send(new ListHarnessesCommand({}));
 const existing = (list.harnesses || []).find((h) => h.harnessName === HARNESS_NAME);
 let harnessId;
 let harnessArn;
-if (existing && existing.status === "READY") {
+// UPDATE_FAILED is retryable: the harness keeps serving its last good config
+// and a fresh UpdateHarness (e.g. after an IAM fix — pipeline run f5be9564
+// left it there) moves it back to READY. Only CREATING/DELETING/etc. block.
+if (existing && (existing.status === "READY" || existing.status === "UPDATE_FAILED")) {
   harnessId = existing.harnessId;
   harnessArn = existing.arn;
-  console.log(`   ✓ Harness exists: ${harnessId} (READY) — updating in place`);
+  console.log(`   ✓ Harness exists: ${harnessId} (${existing.status}) — updating in place`);
   await snapshotHarness(agentcore, GetHarnessCommand, harnessId, HARNESS_NAME);
   // Update prompt + skills + model in place. The model MUST be included: a
   // model-bump deploy that omitted it would be a silent no-op on an existing

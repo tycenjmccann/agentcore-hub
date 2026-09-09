@@ -566,6 +566,19 @@ function grantDeployPerms(
         `arn:aws:bedrock-agentcore:${ctx.region}:${ctx.account}:runtime/*`,
       ],
     }),
+    // ...and that backing-runtime update passes the harness's EXISTING
+    // execution role back to the service even though UpdateHarness never sets
+    // executionRoleArn (run f5be9564: harness went UPDATE_FAILED with
+    // "iam:PassRole on role/agentcore-hub-harness-role"). Scoped to that one
+    // role and to the bedrock-agentcore service principal — no role creation.
+    new iam.PolicyStatement({
+      sid: "HarnessPassExecutionRole",
+      actions: ["iam:PassRole"],
+      resources: [`arn:aws:iam::${ctx.account}:role/agentcore-hub-harness-role`],
+      conditions: {
+        StringEquals: { "iam:PassedToService": "bedrock-agentcore.amazonaws.com" },
+      },
+    }),
     new iam.PolicyStatement({
       sid: "HarnessList",
       actions: ["bedrock-agentcore:ListHarnesses"],

@@ -264,7 +264,8 @@ const list = await agentcore.send(new ListHarnessesCommand({}));
 const existing = (list.harnesses || []).find((h) => h.harnessName === HARNESS_NAME);
 let harnessId;
 let harnessArn;
-if (existing && existing.status === "READY") {
+// UPDATE_FAILED is retryable in place (same rule as setup-workflow-manager.mjs).
+if (existing && (existing.status === "READY" || existing.status === "UPDATE_FAILED")) {
   harnessId = existing.harnessId;
   harnessArn = existing.arn;
   console.log(`   ✓ Harness exists: ${harnessId} (READY) — updating model + system prompt in place`);
