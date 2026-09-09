@@ -676,6 +676,36 @@ QA re-verifies (same checks)
 
 ---
 
+### DL-025: One Coding Session per Ticket (No Session Sharing)
+
+**Status**: ACTIVE (2026-09-08)
+
+**Context**: A Cloud Code session (`cc-…` runtimeSessionId) is ONE microVM, ONE
+EFS checkout and ONE CLI on the coding runtime. The dispatch context hinted every
+ticket to "resume by default" the *agent's most recent session in the run*
+(`findCodingSession(workflowId, agentId)`), and dev blueprints told fix tickets to
+lift a `[coding-session]` footer id from the parent ticket. On 2026-09-04 two
+parallel backend_dev fix tickets (TEAM-3963/3964) both resumed the same session:
+two Claude Code processes flipped HEAD under each other in one working tree.
+
+**Decision**:
+1. **Orchestrator** offers a prior session back ONLY to the ticket that created
+   it — a reopen or a re-dispatch of the same ticket id, which cannot run in
+   parallel with itself (`coding-session-hint.mjs`, pure; session rows carry
+   `ticketId`, legacy rows are matched on the `[wf] <ticket>` title).
+2. **Coding runtime** refuses a second async turn on a session whose runner is
+   still live (`session_busy`, 200 body — AgentCore drops non-2xx bodies).
+3. **Fleet** treats `session_busy` on an *adopted* session (came from
+   `resume_session`, no turns run yet) as "not mine": mints a fresh session,
+   drops the conversation id, retries once, and tells the persona in the footer.
+   A busy session this task already ran in is surfaced as a wait-and-retry error.
+4. **Blueprints/tools**: fix tickets start fresh on `base_branch`; the only
+   legitimate `resume_session` value is the one the `## Prior Coding Session`
+   block hands you.
+
+**Not in scope**: per-ticket git worktrees inside one session — a fresh session
+per ticket already gives each ticket its own checkout.
+
 ### DL-012: System Prompts Baked at Deploy Time (Not Passed at Invocation)
 
 **Date**: 2026-05-19

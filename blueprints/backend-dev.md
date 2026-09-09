@@ -25,13 +25,15 @@ every dev ticket in this run builds on it, additively:
 
 If your ticket is a FIX ticket (from code review or QA), the code under fix is
 already on base_branch — pull it and fix it there. Never "fix" code on a branch
-that doesn't contain the code being fixed. **RESUME YOUR PRIOR SESSION by
-default:** your context includes a `## Prior Coding Session` block (or the fix
-ticket carries a `[coding-session: ...]` footer) — pass that id as
-`resume_session=` on your FIRST coding call. You wrote this code; the session
-holds the design decisions, file map, and test knowledge a fresh session
-re-derives at full token cost. Start fresh ONLY when the feedback explicitly
-demands a clean-slate redo.
+that doesn't contain the code being fixed. A fix ticket is a NEW ticket: it
+starts in its OWN fresh coding session (sibling fix tickets run in parallel, and
+one session is one checkout + one CLI — sharing it interleaves two CLIs in one
+working tree). Do NOT pass another ticket's `[coding-session: ...]` footer id as
+`resume_session=`. **RESUME only when your Workflow Context carries a
+`## Prior Coding Session` block** — that is THIS ticket's own session (you were
+reopened or re-dispatched); pass that id on your FIRST coding call, it holds
+your design decisions, file map, and test knowledge. Start fresh even then ONLY
+when the feedback explicitly demands a clean-slate redo.
 
 Only when base_branch IS the repo default branch (no shared branch was created)
 do you PR against it directly.

@@ -46,6 +46,7 @@ import { createReviewCap, parseDecision } from "./review-cap.mjs";
 import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, SHIP_PHASES, SHIP_BLOCKED_OUTCOMES, TERMINAL_WORKFLOW_PHASES } from "./completion.mjs";
 import { isPipelineEnabled } from "./pipeline-enabled.mjs";
 import { CD_REGISTRY_KEY, EMPTY_CD_REGISTRY, parseCdRegistry, isCdRegistered, effectiveWorkflowDef, resolveDelivery, deliveryModeContext } from "./cd-registry.mjs";
+import { pickTicketSession, renderPriorSessionBlock, renderRejectionSessionHint } from "./coding-session-hint.mjs";
 import { ensureRepoCheck, formatRepoCheckWarning } from "./repo-check.mjs";
 import { eventIdFor, normalizeEventDedupeMode } from "./event-id.mjs";
 import { GATE_STATES, classifyRejection, normalizeGateGuardMode } from "./gate-state.mjs";
@@ -2431,16 +2432,12 @@ export async function handleReviewRejection(gateTicket) {
       console.log(`[orchestrator] Review gate ${gateTicket.ticketId}: upstream ${up.ticketId} still has unresolved blockers [${upBlockers.join(", ")}] — reopening WITHOUT Ready (cascade Readies it when they close)`);
     }
     plan.push({ up, blockersOpen });
-    // Surface the agent's prior coding session so it can CHOOSE to continue
+    // Surface THIS ticket's prior coding session so it can CHOOSE to continue
     // that conversation (claude_code/codex resume_session=...) instead of
     // rebuilding context. Scope, not a command — the resume decision is the
     // agent's (fresh may be right if the feedback says start over).
-    const priorSession = await findCodingSession(workflow.id, up.assignee);
-    const sessionHint = priorSession
-      ? `\n\nYour previous coding session for this work: ${priorSession}. ` +
-        `DEFAULT: pass it as resume_session on your first claude_code/codex/kiro call — it continues that ` +
-        `conversation with its context intact. Start fresh only if the feedback demands a restart. Resume is best-effort.`
-      : "";
+    const priorSession = await findCodingSession(workflow.id, up.assignee, up.ticketId);
+    const sessionHint = renderRejectionSessionHint(priorSession);
     const resumeNote = `## Review feedback (changes requested)\n${feedback}\n\nAddress this feedback and redo your work.${sessionHint}`;
     await store.setResumeContext(workflow.id, up.ticketId, resumeNote);
   }
@@ -2515,23 +2512,24 @@ export async function handleReviewRejection(gateTicket) {
 }
 
 /**
- * Most recent Cloud Code session for (workflow, agent) — the runtime records
- * one row per agent-task (origin "workflow"). Used only to HINT the reworking
- * agent about its prior session; null on any failure (hint is optional).
+ * THIS TICKET's own prior Cloud Code session in (workflow, agent), else null.
+ * The runtime records one row per agent-task (origin "workflow"). DL-025: a
+ * session is one checkout + one CLI, so it is offered back only to the ticket
+ * that created it (reopen / re-dispatch) — never to a sibling ticket of the
+ * same agent, which may run in parallel (coding-session-hint.mjs). Used only
+ * to HINT; null on any failure (hint is optional).
  */
-async function findCodingSession(workflowId, agentId) {
-  if (!workflowId || !agentId) return null;
+async function findCodingSession(workflowId, agentId, ticketId) {
+  if (!workflowId || !agentId || !ticketId) return null;
   try {
     const res = await ddb.send(new ScanCommand({
       TableName: CLOUD_CODE_TABLE,
       FilterExpression: "workflowId = :w AND agentId = :a AND #or = :o",
       ExpressionAttributeNames: { "#or": "origin" },
       ExpressionAttributeValues: { ":w": workflowId, ":a": agentId, ":o": "workflow" },
-      ProjectionExpression: "sessionId, updatedAt",
+      ProjectionExpression: "sessionId, updatedAt, ticketId, title",
     }));
-    const rows = (res.Items || []).sort((x, y) =>
-      String(y.updatedAt || "").localeCompare(String(x.updatedAt || "")));
-    return rows[0]?.sessionId || null;
+    return pickTicketSession(res.Items || [], ticketId);
   } catch (err) {
     console.warn(`[orchestrator] findCodingSession failed (non-fatal): ${err.message}`);
     return null;
@@ -3856,23 +3854,15 @@ export async function buildAgentContext(ticket, workflow) {
     context += `Review/QA: verify the branch independently — do NOT resume the dev conversation; inspect the code and run your own checks.\n\n`;
   }
 
-  // This agent's OWN prior coding session in this workflow (fix tickets,
-  // re-reviews, serially-chained tickets). Default = resume: the conversation
-  // already holds the repo context, findings, and decisions — rebuilding it
-  // from scratch every loop burns tokens and loses what the agent knew.
-  // findCodingSession is per (workflow, agentId), so a reviewer only ever gets
-  // its own review session back, never the dev's conversation.
+  // THIS TICKET's own prior coding session (reopened after a rejection,
+  // re-dispatched after self-park / a dead-session retry). Default = resume:
+  // the conversation already holds the repo context, findings, and decisions.
+  // DL-025: never the agent's latest session in the run — a NEW fix ticket
+  // starts fresh, because its siblings may be running right now in that
+  // session's checkout (TEAM-3963/3964 collision).
   try {
-    const priorSession = await findCodingSession(workflow.id, ticket.assignee);
-    if (priorSession) {
-      context += `## Prior Coding Session (resume by DEFAULT)\n`;
-      context += `You already have a coding session in this workflow: ${priorSession}\n`;
-      context += `Pass resume_session="${priorSession}" on your FIRST claude_code/codex/kiro call — it restores YOUR prior conversation and workspace (the code you wrote or reviewed, your findings, your decisions) instead of rebuilding that context from scratch.\n`;
-      context += `- Fix ticket from review/QA: ALWAYS resume — you are continuing the same work.\n`;
-      context += `- Re-review / re-verify after fixes: resume — you know what you found; verify it was fixed.\n`;
-      context += `- Start fresh ONLY if the ticket explicitly calls for a clean-slate redo of a rejected approach.\n`;
-      context += `Resume is best-effort: if the session is gone you start fresh automatically. This supersedes any Ported Session instruction above — your own session already contains it.\n\n`;
-    }
+    const priorSession = await findCodingSession(workflow.id, ticket.assignee, ticket.ticketId);
+    if (priorSession) context += renderPriorSessionBlock(ticket.ticketId, priorSession);
   } catch { /* hint is optional */ }
 
   // For the intake agent only: provide the valid agent roster (registry data),

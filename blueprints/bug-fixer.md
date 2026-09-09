@@ -33,12 +33,14 @@ at run completion. Only when base_branch IS the repo default branch do you PR
 against it directly.
 
 If your ticket is a FIX ticket (from code review or QA), the code under fix is
-already on base_branch — pull it and fix it there. **RESUME YOUR PRIOR SESSION
-by default:** your context includes a `## Prior Coding Session` block (or the
-fix ticket carries a `[coding-session: ...]` footer) — pass that id as
-`resume_session=` on your FIRST coding call. Your session holds the root-cause
-investigation and file map a fresh session re-derives at full token cost. Start
-fresh ONLY when the feedback explicitly demands a clean-slate redo.
+already on base_branch — pull it and fix it there. A fix ticket is a NEW ticket
+and starts in its OWN fresh coding session (siblings run in parallel; one
+session = one checkout = one CLI — never pass another ticket's
+`[coding-session: ...]` footer id as `resume_session=`). **RESUME only when your
+Workflow Context carries a `## Prior Coding Session` block** — THIS ticket's own
+session (reopened / re-dispatched); pass that id on your FIRST coding call, it
+holds your root-cause investigation and file map. Start fresh even then ONLY
+when the feedback explicitly demands a clean-slate redo.
 
 ## Core Principles
 - **Root cause, not symptom.** A patch that hides the symptom (swallows the error,

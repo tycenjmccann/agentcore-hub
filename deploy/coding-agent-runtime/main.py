@@ -2467,6 +2467,24 @@ def _stream_kiro(prompt: str, workdir: str, kiro_session_id: str | None,
 _ACTIVE_TURNS: dict = {}
 
 
+def _session_busy_turn(session_id: str | None, turn_id: str) -> str | None:
+    """turn_id of a DIFFERENT turn still running on `session_id`, else None.
+
+    One session = one checkout = one CLI. A second live turn on the same
+    session means two agent-tasks adopted one session id (a parallel fix
+    ticket "resuming" a sibling's session, 2026-09-04 TEAM-3963/3964): both
+    CLIs would flip HEAD and carry each other's uncommitted files in a single
+    working tree. Same runtimeSessionId always lands on this VM, so the
+    in-process table is authoritative — a runner that died with its VM is gone
+    from memory too, and a finished one is "done"."""
+    if not session_id:
+        return None
+    for tid, rec in _ACTIVE_TURNS.items():
+        if tid != turn_id and rec.get("status") == "running" and rec.get("session_id") == session_id:
+            return tid
+    return None
+
+
 def _turn_journal_path(session_id: str | None, turn_id: str) -> str:
     safe = re.sub(r"[^A-Za-z0-9._-]", "-", turn_id)[:80]
     return os.path.join(_session_dir(session_id), ".turns", f"{safe}.json")
@@ -2785,6 +2803,20 @@ async def invocations(request: Request):
     config_version = payload.get("config_version")
     session_id = payload.get("session_id")  # isolates this session's checkout
     origin = payload.get("origin")  # "workflow" = fleet-driven session, GC-eligible
+    # Refuse a second CLI in this workspace BEFORE any workspace/git work: the
+    # other turn's CLI owns the checkout right now. 200 body (AgentCore drops
+    # non-2xx bodies) flagged session_busy so the fleet can move an ADOPTED
+    # session to a fresh one instead of interleaving two CLIs in one tree.
+    if payload.get("mode") == "async":
+        busy_turn = _session_busy_turn(session_id, payload.get("turn_id") or "")
+        if busy_turn:
+            logger.warning("turn_submit_session_busy", extra={
+                "turn_id": payload.get("turn_id"), "busy_turn_id": busy_turn,
+                "session_id": session_id})
+            return JSONResponse({"error": f"session is already running turn {busy_turn}; "
+                                          f"one CLI per workspace",
+                                 "session_busy": True, "busy_turn_id": busy_turn,
+                                 "turn_id": payload.get("turn_id"), "cli": cli})
     # Repopulate the private /tmp resume hint from the durable per-session copy if
     # this microVM was recycled — so even a config-only prepare leaves the
     # Terminal able to auto-resume the conversation.

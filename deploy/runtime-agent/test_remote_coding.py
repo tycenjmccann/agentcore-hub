@@ -135,6 +135,9 @@ class RemoteCodingTestCase(unittest.TestCase):
             "branch": None,
             "git_mode": None,
             "clone_url": None,
+            "adopted": False,
+            "turns": 0,
+            "fallback_note": None,
         })
         main._CURRENT_WORKFLOW_ID = "wf-test"
         main._CURRENT_AGENT_ID = "frontend_dev"
@@ -673,3 +676,113 @@ class TestSetupFailureIsTerminal(RemoteCodingTestCase):
             out = main._remote_coding_turn("fix the bug", "codex")
         self.assertTrue(out.startswith("ERROR: remote codex turn could not START:"), out)
         self.assertEqual(calls["n"], 1, "no resubmit after a journaled setup failure")
+
+
+class TestSessionBusyFallback(RemoteCodingTestCase):
+    """DL-025 — the coding runtime refuses a second CLI on a session whose
+    runner is live (session_busy). An ADOPTED session (resume_session from
+    another agent-task) that is busy on our first turn is a sibling's: mint our
+    own session and go again. Our OWN busy session is a wait-and-retry error."""
+
+    def _client(self, responses):
+        client = mock.MagicMock()
+        seen = []
+
+        def side_effect(**kw):
+            seen.append((kw["runtimeSessionId"], json.loads(kw["payload"])))
+            return _invoke_response(responses[len(seen) - 1])
+        client.invoke_agent_runtime.side_effect = side_effect
+        return client, seen
+
+    def _adopt(self, session_id, conversation="conv-sibling"):
+        row = {"Item": {"sessionId": {"S": session_id}, "cli": {"S": "claude"},
+                        "claudeSessionId": {"S": conversation}}}
+        ddb = mock.MagicMock()
+        ddb.get_item.return_value = row
+        with mock.patch.object(main.boto3, "client", return_value=ddb):
+            main._maybe_resume_session(session_id)
+        self.assertTrue(main._CODING_SESSION["adopted"])
+
+    def test_adopted_busy_session_falls_back_to_fresh_session(self):
+        self._adopt("cc-sibling-session")
+        client, seen = self._client([
+            {"error": "session is already running turn turn-other", "session_busy": True,
+             "busy_turn_id": "turn-other", "turn_id": "turn-1", "cli": "claude"},
+            {"submitted": True, "turn_id": "turn-2"},
+        ])
+        poll_client = mock.MagicMock()
+        poll_client.invoke_agent_runtime.side_effect = lambda **kw: _invoke_response(
+            {"status": "done", "response": "fixed it", "claude_session_id": "conv-new"})
+        events_client = mock.MagicMock()
+        with mock.patch.object(main.boto3, "client", return_value=client), \
+             mock.patch.object(main, "_POLL_CLIENT", poll_client, create=True), \
+             mock.patch.object(main, "_ddb_events_client", events_client), \
+             mock.patch.object(main, "REMOTE_CODING_POLL_S", 0.01), \
+             mock.patch.object(main, "_record_coding_session"):
+            out = main._remote_coding_turn("fix the bug", "claude")
+
+        self.assertEqual(len(seen), 2, "one refused submit, one fresh submit")
+        busy_sid, busy_payload = seen[0]
+        fresh_sid, fresh_payload = seen[1]
+        self.assertEqual(busy_sid, "cc-sibling-session")
+        self.assertEqual(busy_payload["claude_session_id"], "conv-sibling")
+        self.assertNotEqual(fresh_sid, "cc-sibling-session")
+        self.assertTrue(fresh_sid.startswith("cc-"))
+        self.assertEqual(fresh_payload["session_id"], fresh_sid)
+        self.assertNotIn("claude_session_id", fresh_payload, "sibling's conversation is not ours")
+        self.assertEqual(main._CODING_SESSION["session_id"], fresh_sid)
+        self.assertFalse(main._CODING_SESSION["adopted"])
+        self.assertEqual(main._CODING_SESSION["turns"], 1)
+        self.assertIn("fixed it", out)
+        self.assertIn(f"[coding-session: {fresh_sid}", out)
+        self.assertIn("mid-turn for another ticket", out)
+        self.assertNotIn("ERROR", out)
+        agent_errors = [c for c in events_client.put_item.call_args_list
+                        if c.kwargs.get("Item", {}).get("type", {}).get("S") == "agent.error"]
+        self.assertEqual(agent_errors, [], "fallback is not a failure")
+
+    def test_own_busy_session_is_a_wait_and_retry_error(self):
+        # Not adopted: this task minted the session; a busy answer means our own
+        # earlier turn is still running (poll gave up) — never fork a new session.
+        main._CODING_SESSION["session_id"] = "cc-mine"
+        main._CODING_SESSION["turns"] = 1
+        client, seen = self._client([
+            {"error": "session is already running turn turn-prev", "session_busy": True,
+             "busy_turn_id": "turn-prev", "cli": "claude"},
+        ])
+        events_client = mock.MagicMock()
+        with mock.patch.object(main.boto3, "client", return_value=client), \
+             mock.patch.object(main, "_ddb_events_client", events_client):
+            out = main._remote_coding_turn("continue", "claude")
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(main._CODING_SESSION["session_id"], "cc-mine")
+        self.assertTrue(out.startswith("ERROR: remote claude turn"), out)
+        self.assertIn("still running", out)
+        self.assertIn("wait", out.lower())
+        self.assertNotIn("Retry this same claude call — the session workspace is preserved", out)
+
+    def test_adopted_session_after_first_turn_is_ours(self):
+        # Adopted but we already ran a turn in it → it is ours now; a busy answer
+        # is our own turn, not a sibling's — no fallback.
+        self._adopt("cc-reopened", conversation="conv-mine")
+        main._CODING_SESSION["turns"] = 2
+        client, seen = self._client([
+            {"error": "busy", "session_busy": True, "busy_turn_id": "turn-x", "cli": "codex"},
+        ])
+        with mock.patch.object(main.boto3, "client", return_value=client), \
+             mock.patch.object(main, "_ddb_events_client", mock.MagicMock()):
+            out = main._remote_coding_turn("continue", "codex")
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(main._CODING_SESSION["session_id"], "cc-reopened")
+        self.assertTrue(out.startswith("ERROR"), out)
+
+    def test_session_row_carries_ticket_id(self):
+        # The orchestrator matches a session to its ticket by this column.
+        main._CODING_SESSION["session_id"] = "cc-row"
+        ddb = mock.MagicMock()
+        with mock.patch.object(main.boto3, "client", return_value=ddb):
+            main._record_coding_session("claude")
+        item = ddb.put_item.call_args.kwargs["Item"]
+        self.assertEqual(item["ticketId"]["S"], "TEAM-3119")
+        self.assertEqual(item["agentId"]["S"], "frontend_dev")
+        self.assertEqual(item["title"]["S"], "[wf] TEAM-3119 frontend_dev")
