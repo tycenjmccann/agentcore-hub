@@ -105,11 +105,15 @@ phases:
           deploy/runtime-agent/test_telemetry_init.py \
           deploy/runtime-agent/test_build_env_vars.py \
           deploy/runtime-agent/test_remote_coding.py \
+          deploy/runtime-agent/test_fleet_healthcheck.py \
           deploy/coding-agent-runtime/test_setup_failure_response.py \
+          deploy/coding-agent-runtime/test_session_busy.py \
+          deploy/coding-agent-runtime/test_coding_healthcheck.py \
           deploy/workflow-manager/toolkit \
           deploy/pipeline/test_ecs_primary_container.py \
           deploy/pipeline/test_plan_surfaces.py \
-          deploy/pipeline/test_prune_apt_sources.py
+          deploy/pipeline/test_prune_apt_sources.py \
+          deploy/pipeline/test_update_runtime_image.py
         deactivate
       # HARD GATE: lambda-zip manifest integrity (the guard DEPLOY.md's inline zip bypassed)
       - "bash scripts/check-lambda-zip-manifest.sh"

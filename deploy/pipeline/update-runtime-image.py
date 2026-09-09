@@ -33,9 +33,11 @@ never fails the deploy (the image is already live).
 from __future__ import annotations
 
 import datetime as _dt
+import json
 import os
 import sys
 import time
+import uuid
 
 import boto3
 from botocore.exceptions import ClientError
@@ -134,6 +136,65 @@ def _swap(control, name: str, new_image: str) -> tuple[str, str]:
     return runtime_id, prior_image
 
 
+# The runtime's own healthcheck markers (deploy/runtime-agent/main.py,
+# deploy/coding-agent-runtime/main.py). Grepped in the response body rather than
+# JSON-parsed: the fleet entrypoint is a streaming generator, so the transport
+# wraps each yield.
+_SMOKE_OK = "AGENTCORE_HUB_HEALTHCHECK_OK"
+_SMOKE_FAIL = "AGENTCORE_HUB_HEALTHCHECK_FAIL"
+_SMOKE_ATTEMPTS = 3
+_SMOKE_BACKOFF_S = 20
+
+
+def _smoke(region: str, runtime_arn: str, name: str, attempts: int = _SMOKE_ATTEMPTS) -> None:
+    """Post-promote cold-start check: invoke the runtime we just swapped with
+    {"healthcheck": true} and require its OK marker back.
+
+    WHY this exists: READY from UpdateAgentRuntime is a CONTROL-PLANE status — it
+    says the image was accepted, not that a session can start. The fleet's heavy
+    imports are lazy, so a dependency API break passes the build AND passes READY,
+    then kills every persona at cold start (fleet v41, 2026-09-09: ten hours
+    fleet-wide, including bug_fixer, so the pipeline could not self-heal).
+    Failing here is what makes the buildspec trap restore the prior image.
+
+    Retries: the first session on a fresh image is a cold start (image pull +
+    interpreter boot), so a timeout on attempt 1 is expected, not a verdict."""
+    from botocore.config import Config as _BotoConfig
+
+    client = boto3.client(
+        "bedrock-agentcore",
+        region_name=region,
+        config=_BotoConfig(read_timeout=420, connect_timeout=20, retries={"max_attempts": 0}),
+    )
+    last = ""
+    for attempt in range(1, attempts + 1):
+        # runtimeSessionId must be >= 33 chars; a fresh id per attempt so a
+        # half-dead session from a previous attempt is never reused.
+        session_id = f"smoke-{os.environ.get('GIT_SHA', 'nogit')}-{uuid.uuid4().hex}"
+        try:
+            resp = client.invoke_agent_runtime(
+                agentRuntimeArn=runtime_arn,
+                runtimeSessionId=session_id,
+                payload=json.dumps({"healthcheck": True}).encode(),
+                contentType="application/json",
+                accept="application/json",
+            )
+            body = resp.get("response")
+            text = body.read().decode("utf-8", "replace") if hasattr(body, "read") else str(body)
+        except Exception as exc:  # noqa: BLE001 — any failure is a smoke failure
+            last = f"{type(exc).__name__}: {str(exc)[:300]}"
+            print(f"  smoke attempt {attempt}/{attempts} errored: {last}", file=sys.stderr)
+        else:
+            if _SMOKE_OK in text and _SMOKE_FAIL not in text:
+                print(f"  smoke ok ({name}): {text[:400]}")
+                return
+            last = text[:600]
+            print(f"  smoke attempt {attempt}/{attempts} not ok: {last}", file=sys.stderr)
+        if attempt < attempts:
+            time.sleep(_SMOKE_BACKOFF_S)
+    _fail(name, f"post-promote healthcheck failed: {last or 'no OK marker in response'}")
+
+
 def _emit_marker(region: str, name: str, new_image: str, prior_image: str) -> None:
     """Write a runtime.deploy marker to the events table so the performance
     analysis can correlate an agent prompt/tool change with the workflows that
@@ -151,6 +212,9 @@ def _emit_marker(region: str, name: str, new_image: str, prior_image: str) -> No
         "image": {"S": new_image},
         "prevImage": {"S": prior_image or "(none)"},
         "gitSha": {"S": os.environ.get("GIT_SHA", "unknown")},
+        # Only written after _smoke passed — a marker means "live AND cold-start
+        # verified", which is what the performance card should attribute against.
+        "smoke": {"S": "ok"},
     }
     if digest:
         item["imageDigest"] = {"S": digest}
@@ -195,6 +259,15 @@ def main(argv: list[str]) -> int:
             fh.write(prior_image)
 
     runtime_id, prior_image = _swap(control, name, image)
+    # READY is not "works" — invoke the new image once before calling it deployed.
+    # A failure exits non-zero, which fires the buildspec's rollback trap.
+    runtime_arn = control.get_agent_runtime(agentRuntimeId=runtime_id).get("agentRuntimeArn", "")
+    if not runtime_arn:
+        _fail(name, "runtime has no ARN after update — cannot run the post-promote smoke")
+    if os.environ.get("RUNTIME_SMOKE", "").lower() in ("off", "false", "0"):
+        print(f"  smoke SKIPPED for {name} (RUNTIME_SMOKE=off)")
+    else:
+        _smoke(region, runtime_arn, name)
     _emit_marker(region, name, image, prior_image)
     print(f"OK {name} → {image}")
     return 0

@@ -757,6 +757,19 @@ function grantRuntimeImagePerms(
           actions: ["bedrock-agentcore:ListAgentRuntimes"],
           resources: ["*"], // ListAgentRuntimes has no resource scope
         }),
+        // Post-promote cold-start smoke: update-runtime-image.py invokes the
+        // runtime it just swapped with {"healthcheck": true} and rolls the image
+        // back if the OK marker is missing. READY alone is a control-plane
+        // status — fleet v41 (2026-09-09) was READY and killed every persona at
+        // import for ten hours. Data-plane invoke only; no Create/Delete.
+        new iam.PolicyStatement({
+          sid: "RuntimeSmokeInvoke",
+          actions: ["bedrock-agentcore:InvokeAgentRuntime"],
+          resources: [
+            `arn:aws:bedrock-agentcore:${ctx.region}:${ctx.account}:runtime/*`,
+            `arn:aws:bedrock-agentcore:${ctx.region}:${ctx.account}:runtime/*/runtime-endpoint/*`,
+          ],
+        }),
         // UpdateAgentRuntime re-passes the runtime's OWN execution role; scope to
         // exactly the two runtime roles + the bedrock-agentcore service.
         new iam.PolicyStatement({
