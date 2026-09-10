@@ -96,6 +96,37 @@
   transition: background-color 0.2s ease, color 0.2s ease, border-color 0.2s ease;
 }
 
+/* ===== Sleek dark scrollbars, app-wide (TEAM-4320) =====
+   Declared at `*` level, not just on the root: scrollbar-color inherits but
+   scrollbar-width does NOT, so a root-only rule leaves every nested scroll
+   container computing `auto`. The ::-webkit-* block is a fallback for engines
+   without standard support - Chromium >= 121 ignores it once scrollbar-width is
+   not `auto`. Tokens only; both themes define them. Specificity stays at 0-0-0
+   so the .scrollbar-thin utility and component rules still win. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-surface-4) transparent;
+}
+
+*::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+  background: transparent;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--color-surface-4);
+  border-radius: 3px;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--color-text-muted);
+}
+*::-webkit-scrollbar-button {
+  display: none;
+}
+
 @layer base {
   html {
     background-color: var(--color-surface-0);
