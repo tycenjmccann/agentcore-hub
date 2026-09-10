@@ -181,6 +181,82 @@ describe("AC-D1.4 — a parked in_progress dependent with a satisfied blocker bu
   });
 });
 
+/**
+ * TEAM-4391 — cascade.mjs's handleInReviewDependent now checks gateAwaitingHuman()
+ * FIRST: if an open (unacknowledged) review_needed notification already exists
+ * for this exact gate ticket, the sweep must treat it as a no-op and never call
+ * reawakenGate at all. Before this guard the sweep re-drove an already-presented
+ * gate every cycle it stayed parked, and reawakenGate (handleHumanReviewGate)
+ * writes the ticket status BEFORE its own idempotency CAS — so even a call that
+ * ultimately no-ops still burns a real Jira/DDB write every sweep.
+ */
+describe("TEAM-4391 — a gate already presented to a human is never re-saved", () => {
+  const gateSiblings = [
+    { ticketId: DONE, status: "done", type: "task" },
+    {
+      ticketId: "GATE-1", status: "in_review", assignee: "human:engineer", type: "task",
+      blockedBy: [DONE], updatedAt: STALE_STARTED,
+    },
+  ];
+
+  it("AC1: an open review_needed notification for this gate → review-noop, ZERO writes", async () => {
+    const wf = workflow({
+      humanNotifications: [
+        { id: "n1", type: "review_needed", ticketId: "GATE-1", reviewer: "engineer", acknowledged: false, timestamp: STALE_STARTED },
+      ],
+    });
+    // The fake reawakenGate asserts its OWN non-invocation: the real reawakenGate
+    // (handleHumanReviewGate) writes the ticket status BEFORE its own CAS check,
+    // so the only way to prove zero writes happen for an already-open gate is to
+    // never call it at all — not just to assert its return value is unused.
+    const s = makeSweep({
+      workflows: [wf],
+      siblings: gateSiblings,
+      reawakenGate: vi.fn(async () => {
+        throw new Error("reawakenGate must not be called when a review_needed notification is already open");
+      }),
+    });
+
+    const m = await s.runSweep("enforce");
+
+    expect(m.candidates).toBe(1);
+    expect(m.noop).toBe(1);
+    expect(m.reviewReawakened).toBe(0);
+    expect(s.reawakenGate).toHaveBeenCalledTimes(0); // redundant with the throw-guard, but explicit
+    expect(eventsOfType(s.publishEvent, "review.reawakened")).toHaveLength(0);
+  });
+
+  it("AC2a: the notification for this gate is already acknowledged → the gate still re-wakes", async () => {
+    const wf = workflow({
+      humanNotifications: [
+        { id: "n1", type: "review_needed", ticketId: "GATE-1", reviewer: "engineer", acknowledged: true, timestamp: STALE_STARTED },
+      ],
+    });
+    const s = makeSweep({ workflows: [wf], siblings: gateSiblings });
+
+    const m = await s.runSweep("enforce");
+
+    expect(s.reawakenGate).toHaveBeenCalledWith("GATE-1", "human:engineer", wf);
+    expect(eventsOfType(s.publishEvent, "review.reawakened")).toHaveLength(1);
+    expect(m.reviewReawakened).toBe(1);
+  });
+
+  it("AC2b: an open notification exists but for a DIFFERENT ticket → this gate still re-wakes", async () => {
+    const wf = workflow({
+      humanNotifications: [
+        { id: "n1", type: "review_needed", ticketId: "SOME-OTHER-GATE", reviewer: "engineer", acknowledged: false, timestamp: STALE_STARTED },
+      ],
+    });
+    const s = makeSweep({ workflows: [wf], siblings: gateSiblings });
+
+    const m = await s.runSweep("enforce");
+
+    expect(s.reawakenGate).toHaveBeenCalledWith("GATE-1", "human:engineer", wf);
+    expect(eventsOfType(s.publishEvent, "review.reawakened")).toHaveLength(1);
+    expect(m.reviewReawakened).toBe(1);
+  });
+});
+
 describe("R3 — a live lease is gated FIRST: nudge at most, ZERO steal", () => {
   it("live in_progress candidate → nudge only, ReconcileSkippedLiveLease == 1", async () => {
     const s = makeSweep({
