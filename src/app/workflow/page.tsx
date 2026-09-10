@@ -77,7 +77,12 @@ export default function WorkflowPage() {
   const [historyWidth, setHistoryWidth] = useState(HISTORY_DEFAULT_WIDTH);
   const [historyMax, setHistoryMax] = useState(HISTORY_MAX_WIDTH);
   const [isResizing, setIsResizing] = useState(false);
-  const dragRef = useRef<{ startX: number; startWidth: number; max: number } | null>(null);
+  const dragRef = useRef<{
+    startX: number;
+    startWidth: number;
+    max: number;
+    pointerId: number;
+  } | null>(null);
   const widthRef = useRef(HISTORY_DEFAULT_WIDTH); // latest width, for persist-on-drop
   const bodyStyleRef = useRef<{ cursor: string; userSelect: string } | null>(null);
   const [testDefId, setTestDefId] = useState<string>(DEFAULT_WORKFLOW_DEF_ID);
@@ -130,7 +135,7 @@ export default function WorkflowPage() {
     if (dragRef.current || !e.isPrimary || e.button !== 0) return;
     const max = historyMaxWidth(); // read once per gesture, never inside pointermove
     setHistoryMax(max);
-    dragRef.current = { startX: e.clientX, startWidth: historyWidth, max };
+    dragRef.current = { startX: e.clientX, startWidth: historyWidth, max, pointerId: e.pointerId };
     e.currentTarget.setPointerCapture(e.pointerId);
     // Belt and braces: only snapshot when nothing is saved (restoreBodyStyles nulls
     // it), so the saved values are always the pre-drag ones.
@@ -147,7 +152,12 @@ export default function WorkflowPage() {
 
   const handleResizeMove = (e: React.PointerEvent<HTMLDivElement>) => {
     const drag = dragRef.current;
-    if (!drag) return;
+    // Only the pointer that started the gesture may drive it. setPointerCapture
+    // redirects *that* pointer's events to the handle, but it does not stop any
+    // other pointer that is physically over this 6px separator from hit-testing
+    // to it - a second finger's move would otherwise drag the width from its
+    // clientX, and its up would end the primary drag early.
+    if (!drag || e.pointerId !== drag.pointerId) return;
     const next = clampHistoryWidth(drag.startWidth + (e.clientX - drag.startX), drag.max);
     // Written synchronously: pointermove is continuous-priority in React 18, so the
     // mirroring effect can still be queued when pointerup persists - it would then
@@ -158,7 +168,9 @@ export default function WorkflowPage() {
 
   const handleResizeEnd = (e: React.PointerEvent<HTMLDivElement>) => {
     const drag = dragRef.current;
-    if (!drag) return;
+    // Same ownership check as handleResizeMove. pointercancel carries the captured
+    // pointer's own id, so onPointerCancel still ends the drag.
+    if (!drag || e.pointerId !== drag.pointerId) return;
     dragRef.current = null;
     if (e.currentTarget.hasPointerCapture(e.pointerId)) {
       e.currentTarget.releasePointerCapture(e.pointerId);
@@ -170,8 +182,11 @@ export default function WorkflowPage() {
   };
 
   const handleResizeDoubleClick = () => {
-    setHistoryWidth(HISTORY_DEFAULT_WIDTH);
-    persistHistoryWidth(HISTORY_DEFAULT_WIDTH);
+    const max = historyMaxWidth();
+    setHistoryMax(max);
+    const next = clampHistoryWidth(HISTORY_DEFAULT_WIDTH, max);
+    setHistoryWidth(next);
+    persistHistoryWidth(next);
   };
 
   const handleResizeKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
@@ -429,7 +444,8 @@ export default function WorkflowPage() {
           </div>
         ) : (
           <>
-            {/* Drag handle — resize the list; double-click resets, arrows nudge by 16px */}
+            {/* Drag handle — resize the list; double-click resets (clamped to the
+                viewport max), arrows nudge by 16px */}
             <div
               data-testid="workflow-history-resize-handle"
               role="separator"
