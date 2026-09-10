@@ -252,6 +252,54 @@
       "sdlcFramework": "standard"
     },
     {
+      "id": "operator",
+      "type": "feature",
+      "name": "Operator",
+      "displayName": "Operator",
+      "description": "Single-agent express flow: one operator persona shapes the work, drives a Claude Code worker (plan first, then execute with worktree fan-out), gets an independent cross-model review, opens the PR, watches CI and briefs the human. A human approves the merge, then the same operator merges and deploys. For bug fixes, features and laptop /plan handoffs.",
+      "icon": "Zap",
+      "intakeAgentId": "agentcore_hub_operator",
+      "requiresRepo": true,
+      "featureBranchPhase": "development",
+      "createsPullRequest": true,
+      "completionRequiresAgentPhases": [
+        "development",
+        "ship"
+      ],
+      "reviewGates": [
+        {
+          "afterPhase": "development",
+          "name": "Merge Approval",
+          "blocking": true,
+          "condition": "always",
+          "onReject": "rework",
+          "reviewerRole": "Code Owner",
+          "assignee": "human:engineer"
+        }
+      ],
+      "phases": [
+        {
+          "id": "intake",
+          "name": "Intake",
+          "type": "app",
+          "agentPhase": "intake"
+        },
+        {
+          "id": "build",
+          "name": "Build",
+          "type": "agent",
+          "agentPhase": "development"
+        },
+        {
+          "id": "ship",
+          "name": "Ship",
+          "type": "agent",
+          "agentPhase": "ship"
+        }
+      ],
+      "sdlcFramework": "standard"
+    },
+    {
       "id": "dead-code-sweep",
       "type": "feature",
       "name": "Dead Code Sweep",
