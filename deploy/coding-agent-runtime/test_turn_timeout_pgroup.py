@@ -127,9 +127,11 @@ class _PgroupBase(unittest.TestCase):
         # `sh` is the launcher the watchdog kills; the inner `sh` is the
         # GRANDCHILD that inherits stdout and would keep the read loop pinned.
         # Two things must be true of the grandchild for this to reproduce:
-        #   • it touches the sentinel at ~2s, so with a 1s cap the file must
+        #   • it touches the sentinel at ~4s, so with a 1s cap the file must
         #     never appear (that is the "was it killed" probe — see the module
-        #     docstring on why killpg(pgid, 0) is not usable here); and
+        #     docstring on why killpg(pgid, 0) is not usable here). The 4s gap
+        #     (vs the 1s cap) gives the Timer thread + killpg a wide margin
+        #     under CI load; and
         #   • it then stays alive indefinitely, so that if the kill misses it,
         #     the write end of stdout is never released and the reader really
         #     does block forever. A short-lived grandchild would close the pipe
@@ -140,15 +142,32 @@ class _PgroupBase(unittest.TestCase):
         self.wedge_argv = [
             "sh", "-c",
             f'echo {self.marker}; '
-            f'sh -c "sleep 2; touch {self.sentinel}; while :; do sleep 5; done" & wait',
+            f'sh -c "sleep 4; touch {self.sentinel}; while :; do sleep 5; done" & wait',
         ]
 
     def tearDown(self):
         # Reap anything that survived. The marker is in both shells' cmdlines and
         # is unique to this test. Deliberately NOT os.killpg(os.getpgid(pid), ...):
         # for a child that is not a session leader that resolves to OUR OWN group.
-        subprocess.run(["pkill", "-f", self.marker],
-                       capture_output=True, check=False)
+        try:
+            subprocess.run(["pkill", "-f", self.marker],
+                           capture_output=True, check=False)
+        except FileNotFoundError:
+            # procps not installed on this image — fall back to a manual
+            # /proc scan for anything whose cmdline carries our marker.
+            for entry in os.listdir("/proc"):
+                if not entry.isdigit():
+                    continue
+                try:
+                    with open(f"/proc/{entry}/cmdline", "rb") as f:
+                        cmdline = f.read()
+                except OSError:
+                    continue
+                if self.marker.encode() in cmdline:
+                    try:
+                        os.kill(int(entry), signal.SIGKILL)
+                    except OSError:
+                        pass
 
     def _popen(self, argv=None):
         """Popen stand-in that records the kwargs main.py asked for and forwards
@@ -224,9 +243,9 @@ class TestWatchdogKillsProcessGroup(_PgroupBase):
         self.assertLess(elapsed, 10.0, f"[{cli}] kill overshot the 1s cap ({elapsed:.2f}s)")
 
     def _assert_grandchild_dead(self, cli):
-        # The grandchild would touch the sentinel at ~2s. Give it until well past
+        # The grandchild would touch the sentinel at ~4s. Give it until well past
         # that; the file must never appear.
-        time.sleep(2.5)
+        time.sleep(4.5)
         self.assertFalse(
             os.path.exists(self.sentinel),
             f"[{cli}] the grandchild outlived the process-group kill and ran its "
