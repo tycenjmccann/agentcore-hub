@@ -20,11 +20,21 @@
  * Importing the deploy script must NOT deploy: main() is behind an
  * import.meta.url/process.argv[1] check, which the last test asserts by importing
  * it with no AWS credentials and observing that no client was ever used.
+ *
+ * TEAM-4337 widens the grant ONCE by naming convention (hub-<slug>-{ci,build,
+ * deploy}) so registering a repo in the CD registry needs no IAM edit. That makes
+ * the wildcard SHAPE the thing to pin: every action class gets the narrowest
+ * suffix it needs, and codebuild:StartBuild gets project/hub-*-ci and nothing
+ * else. The suite therefore asserts what the wildcards ARE, per PIPELINE_REGIONS
+ * region, and — more importantly — what they can never be.
  */
 import { describe, it, expect, vi } from "vitest";
 
+import { readFileSync } from "node:fs";
+
 import {
   buildInlinePolicy,
+  parsePipelineRegions,
   resolveEnv,
   validateCiProjectName as validateInDeployScript,
 } from "./setup-pipeline-tools-lambda.mjs";
@@ -64,10 +74,18 @@ const BASE = {
   PIPELINE_CI_START_BUILD: "0",
 };
 
-const arn = (project) => `arn:aws:codebuild:${REGION}:${ACCOUNT}:project/${project}`;
+const arn = (project, region = REGION) =>
+  `arn:aws:codebuild:${region}:${ACCOUNT}:project/${project}`;
 const sid = (policy, name) => policy.Statement.find((s) => s.Sid === name);
 const allActions = (policy) => policy.Statement.flatMap((s) => [].concat(s.Action));
 const allResources = (policy) => policy.Statement.flatMap((s) => [].concat(s.Resource));
+/** Every statement granting `action`, whatever its Sid. */
+const statementsWith = (policy, action) =>
+  policy.Statement.filter((s) => [].concat(s.Action).includes(action));
+const SOURCE = readFileSync(
+  new URL("./setup-pipeline-tools-lambda.mjs", import.meta.url),
+  "utf8"
+);
 
 describe("buildInlinePolicy — the CiStartBuild grant", () => {
   it("is ABSENT with the flag off (today's policy, unchanged)", () => {
@@ -75,13 +93,14 @@ describe("buildInlinePolicy — the CiStartBuild grant", () => {
 
     expect(sid(policy, "CiStartBuild")).toBeUndefined();
     expect(allActions(policy)).not.toContain("codebuild:StartBuild");
-    // The statements that were there before FR-4, in order, plus the
-    // read-only handoff-marker grant.
+    // The statements that were there before FR-4, in order, plus the two
+    // read-only S3 grants (handoff markers, CD registry).
     expect(policy.Statement.map((s) => s.Sid)).toEqual([
       "Logs",
       "PipelineReadAndTrigger",
       "BuildRead",
       "HandoffMarkerRead",
+      "CdRegistryRead",
       "BuildLogRead",
     ]);
   });
@@ -95,26 +114,31 @@ describe("buildInlinePolicy — the CiStartBuild grant", () => {
       "BuildRead",
       "CiStartBuild",
       "HandoffMarkerRead",
+      "CdRegistryRead",
       "BuildLogRead",
     ]);
     expect(sid(policy, "CiStartBuild")).toEqual({
       Sid: "CiStartBuild",
       Effect: "Allow",
       Action: ["codebuild:StartBuild"],
-      Resource: [arn("agentcore-hub-ci")],
+      // The hub's exact PR-check project + the ONE wildcard a StartBuild grant
+      // may ever carry (TEAM-4337).
+      Resource: [arn("agentcore-hub-ci"), arn("hub-*-ci")],
     });
   });
 
-  it("grants StartBuild on the CI project ARN and NOTHING else", () => {
+  it("grants StartBuild on CI project ARNs and NOTHING else", () => {
     const policy = buildInlinePolicy({ ...BASE, PIPELINE_CI_START_BUILD: "1" });
     const statement = sid(policy, "CiStartBuild");
 
-    expect(statement.Resource).toEqual([arn("agentcore-hub-ci")]);
+    expect(statement.Resource).toEqual([arn("agentcore-hub-ci"), arn("hub-*-ci")]);
     expect(statement.Resource).not.toContain(arn("agentcore-hub-deploy"));
     expect(statement.Resource).not.toContain(arn("agentcore-hub-build"));
     expect(statement.Resource).not.toContain(arn("agentcore-hub-runtime-image-deploy"));
-    for (const resource of statement.Resource) {
-      expect(resource).not.toContain("*");
+    // Every wildcard in this statement is suffix-scoped to a CI project. A bare
+    // project/hub-* here would grant StartBuild on hub-<slug>-deploy.
+    for (const resource of statement.Resource.filter((r) => r.includes("*"))) {
+      expect(resource).toMatch(/project\/hub-\*-ci$/);
     }
     // The ONLY StartBuild in the whole document.
     expect(allActions(policy).filter((a) => a === "codebuild:StartBuild")).toHaveLength(1);
@@ -127,7 +151,10 @@ describe("buildInlinePolicy — the CiStartBuild grant", () => {
       PIPELINE_CI_START_BUILD: "1",
     });
 
-    expect(sid(policy, "CiStartBuild").Resource).toEqual([arn("other-repo-ci")]);
+    expect(sid(policy, "CiStartBuild").Resource).toEqual([
+      arn("other-repo-ci"),
+      arn("hub-*-ci"),
+    ]);
   });
 
   it("treats anything but the exact string \"1\" as off", () => {
@@ -203,6 +230,8 @@ describe("resolveEnv", () => {
       CI_PROJECT: "agentcore-hub-ci",
       DEPLOY_PROJECT: "agentcore-hub-deploy",
       PIPELINE_CI_START_BUILD: "0",
+      // Just the Lambda's own region until an operator registers a repo elsewhere.
+      PIPELINE_REGIONS: "us-east-1",
       // Derived from ACCOUNT at deploy time when unset (deploy/config.sh convention).
       ARTIFACT_BUCKET: "",
     });
@@ -301,7 +330,13 @@ describe("buildInlinePolicy — the handoff-marker read", () => {
 
   it("grants no S3 WRITE of any kind", () => {
     const actions = allActions(buildInlinePolicy({ ...BASE, PIPELINE_CI_START_BUILD: "1" }));
-    expect(actions.filter((a) => a.startsWith("s3:"))).toEqual(["s3:GetObject"]);
+    // Two S3 statements since TEAM-4337 (handoff markers, CD registry) and both
+    // are read-only. Listed rather than deduped so a third one cannot appear
+    // unnoticed.
+    expect(actions.filter((a) => a.startsWith("s3:"))).toEqual([
+      "s3:GetObject",
+      "s3:GetObject",
+    ]);
   });
 
   it("honours an explicit ARTIFACT_BUCKET and is omitted when there is none", () => {
@@ -312,5 +347,258 @@ describe("buildInlinePolicy — the handoff-marker read", () => {
     expect(
       sid(buildInlinePolicy({ ...BASE, ACCOUNT: undefined }), "HandoffMarkerRead")
     ).toBeUndefined();
+  });
+});
+
+// ─── TEAM-4337: the hub-* convention grants ──────────────────────────────────
+
+describe("buildInlinePolicy — the hub-* convention wildcards", () => {
+  const ON = { ...BASE, PIPELINE_CI_START_BUILD: "1" };
+  const cpArn = (name, region = REGION) =>
+    `arn:aws:codepipeline:${region}:${ACCOUNT}:${name}`;
+  const logArn = (group, region = REGION) =>
+    `arn:aws:logs:${region}:${ACCOUNT}:log-group:/aws/codebuild/${group}`;
+
+  it("keeps a deterministic Sid order with the flag on and off", () => {
+    // A reviewer diffing two deploys must see statements move only when they
+    // actually change - order is part of the contract.
+    expect(buildInlinePolicy(BASE).Statement.map((s) => s.Sid)).toEqual([
+      "Logs",
+      "PipelineReadAndTrigger",
+      "BuildRead",
+      "HandoffMarkerRead",
+      "CdRegistryRead",
+      "BuildLogRead",
+    ]);
+    expect(buildInlinePolicy(ON).Statement.map((s) => s.Sid)).toEqual([
+      "Logs",
+      "PipelineReadAndTrigger",
+      "BuildRead",
+      "CiStartBuild",
+      "HandoffMarkerRead",
+      "CdRegistryRead",
+      "BuildLogRead",
+    ]);
+  });
+
+  it("adds hub-*-deploy to read+trigger, keeping the hub's exact pipeline ARN", () => {
+    const statement = sid(buildInlinePolicy(BASE), "PipelineReadAndTrigger");
+    expect(statement.Resource).toEqual([
+      cpArn("agentcore-hub-deploy"),
+      cpArn("hub-*-deploy"),
+    ]);
+  });
+
+  it("adds project/hub-* to BuildRead, keeping the three exact project ARNs", () => {
+    const statement = sid(buildInlinePolicy(BASE), "BuildRead");
+    expect(statement.Resource).toEqual([
+      arn("agentcore-hub-build"),
+      arn("agentcore-hub-ci"),
+      arn("agentcore-hub-deploy"),
+      arn("hub-*"),
+    ]);
+    // Read-only: a broad project wildcard is only safe because these two actions
+    // are the only ones it carries.
+    expect(statement.Action).toEqual([
+      "codebuild:BatchGetBuilds",
+      "codebuild:ListBuildsForProject",
+    ]);
+  });
+
+  it("adds both hub-* log-group forms to BuildLogRead", () => {
+    const statement = sid(buildInlinePolicy(BASE), "BuildLogRead");
+    expect(statement.Action).toEqual(["logs:GetLogEvents"]);
+    expect(statement.Resource).toEqual([
+      logArn("agentcore-hub-build:*"),
+      logArn("agentcore-hub-ci:*"),
+      logArn("agentcore-hub-deploy:*"),
+      logArn("hub-*"),
+      logArn("hub-*:*"),
+    ]);
+  });
+
+  // ─── the StartBuild blast radius, the one that matters ────────────────────
+
+  it("hub-*-ci is the ONLY wildcard in any statement granting StartBuild", () => {
+    for (const env of [ON, { ...ON, PIPELINE_REGIONS: "us-east-1,eu-west-1" }]) {
+      const statements = statementsWith(buildInlinePolicy(env), "codebuild:StartBuild");
+      expect(statements).toHaveLength(1);
+      for (const resource of [].concat(statements[0].Resource)) {
+        if (!resource.includes("*")) continue;
+        expect(resource).toMatch(/^arn:aws:codebuild:[a-z0-9-]+:\d+:project\/hub-\*-ci$/);
+      }
+    }
+  });
+
+  it("no form of hub-*-deploy ever appears in a StartBuild statement", () => {
+    for (const regions of ["us-east-1", "us-east-1,eu-west-1,ap-southeast-2"]) {
+      const statements = statementsWith(
+        buildInlinePolicy({ ...ON, PIPELINE_REGIONS: regions }),
+        "codebuild:StartBuild"
+      );
+      const resources = statements.flatMap((s) => [].concat(s.Resource));
+      for (const resource of resources) {
+        // Neither the pipeline form nor the CodeBuild project form, and not the
+        // bare project wildcard that would subsume them.
+        expect(resource, regions).not.toMatch(/hub-\*-deploy/);
+        expect(resource, regions).not.toMatch(/project\/hub-\*$/);
+        expect(resource, regions).not.toBe("*");
+      }
+      // The hub's own exact PR-check ARN is still there.
+      expect(resources).toContain(arn("agentcore-hub-ci"));
+    }
+  });
+
+  // ─── PIPELINE_REGIONS fan-out ─────────────────────────────────────────────
+
+  it("fans every wildcard out per PIPELINE_REGIONS region", () => {
+    const policy = buildInlinePolicy({ ...ON, PIPELINE_REGIONS: "us-east-1,eu-west-1" });
+
+    expect(sid(policy, "PipelineReadAndTrigger").Resource).toEqual([
+      cpArn("agentcore-hub-deploy"),
+      cpArn("hub-*-deploy", "us-east-1"),
+      cpArn("hub-*-deploy", "eu-west-1"),
+    ]);
+    expect(sid(policy, "BuildRead").Resource.slice(-2)).toEqual([
+      arn("hub-*", "us-east-1"),
+      arn("hub-*", "eu-west-1"),
+    ]);
+    expect(sid(policy, "CiStartBuild").Resource).toEqual([
+      arn("agentcore-hub-ci"),
+      arn("hub-*-ci", "us-east-1"),
+      arn("hub-*-ci", "eu-west-1"),
+    ]);
+    expect(sid(policy, "BuildLogRead").Resource.slice(-4)).toEqual([
+      logArn("hub-*", "us-east-1"),
+      logArn("hub-*:*", "us-east-1"),
+      logArn("hub-*", "eu-west-1"),
+      logArn("hub-*:*", "eu-west-1"),
+    ]);
+    // A region nobody asked for gets nothing.
+    for (const resource of allResources(policy)) {
+      expect(resource).not.toContain(":ap-southeast-2:");
+    }
+  });
+
+  it("defaults to the Lambda region alone", () => {
+    const policy = buildInlinePolicy({ ...ON, REGION: "eu-west-2" });
+    expect(sid(policy, "CiStartBuild").Resource).toEqual([
+      arn("agentcore-hub-ci", "eu-west-2"),
+      arn("hub-*-ci", "eu-west-2"),
+    ]);
+  });
+
+  it("dedupes, trims and drops empties in PIPELINE_REGIONS", () => {
+    expect(parsePipelineRegions("us-east-1, eu-west-1 ,us-east-1,,", "zz")).toEqual([
+      "us-east-1",
+      "eu-west-1",
+    ]);
+    expect(parsePipelineRegions("", "us-east-1")).toEqual(["us-east-1"]);
+    expect(parsePipelineRegions(undefined, "us-east-1")).toEqual(["us-east-1"]);
+    expect(parsePipelineRegions("  ,  ", "us-east-1")).toEqual(["us-east-1"]);
+
+    // A duplicated region must not duplicate the grant.
+    const policy = buildInlinePolicy({ ...ON, PIPELINE_REGIONS: "us-east-1,us-east-1" });
+    expect(sid(policy, "CiStartBuild").Resource).toEqual([
+      arn("agentcore-hub-ci"),
+      arn("hub-*-ci"),
+    ]);
+    expect(resolveEnv({ PIPELINE_REGIONS: "eu-west-1, eu-west-1 " }).PIPELINE_REGIONS).toBe(
+      "eu-west-1"
+    );
+  });
+
+  // ─── CdRegistryRead ───────────────────────────────────────────────────────
+
+  it("reads the CD registry as ONE exact key, never a prefix", () => {
+    const statement = sid(buildInlinePolicy(BASE), "CdRegistryRead");
+    expect(statement.Action).toEqual(["s3:GetObject"]);
+    expect(statement.Resource).toEqual([
+      `arn:aws:s3:::agentcore-hub-artifacts-${ACCOUNT}-us-east-1/config/cd-registry.json`,
+    ]);
+    // config/ also holds agents.json and the workflow definitions - this role has
+    // no business reading either.
+    expect(statement.Resource[0]).not.toContain("*");
+    for (const forbidden of ["agents.json", "workflows", "config/*"]) {
+      expect(statement.Resource[0]).not.toContain(forbidden);
+    }
+  });
+
+  it("honours an explicit ARTIFACT_BUCKET, and both S3 grants vanish without one", () => {
+    expect(
+      sid(buildInlinePolicy({ ...BASE, ARTIFACT_BUCKET: "explicit-bucket" }), "CdRegistryRead")
+        .Resource
+    ).toEqual(["arn:aws:s3:::explicit-bucket/config/cd-registry.json"]);
+
+    const noBucket = buildInlinePolicy({ ...BASE, ACCOUNT: undefined });
+    expect(sid(noBucket, "CdRegistryRead")).toBeUndefined();
+    expect(sid(noBucket, "HandoffMarkerRead")).toBeUndefined();
+    // The handoff marker keeps its own prefix - the two grants are separate on
+    // purpose, so neither can widen the other.
+    expect(sid(buildInlinePolicy(BASE), "HandoffMarkerRead").Resource).toEqual([
+      `arn:aws:s3:::agentcore-hub-artifacts-${ACCOUNT}-us-east-1/pipeline-artifacts/handoff/*`,
+    ]);
+  });
+
+  // ─── the invariant that survives every widening ───────────────────────────
+
+  it("PutApprovalResult is absent from every statement in every combination", () => {
+    for (const flag of ["0", "1"]) {
+      for (const regions of [undefined, "us-east-1", "us-east-1,eu-west-1"]) {
+        for (const bucket of ["", "explicit-bucket"]) {
+          const policy = buildInlinePolicy({
+            ...BASE,
+            PIPELINE_CI_START_BUILD: flag,
+            PIPELINE_REGIONS: regions,
+            ARTIFACT_BUCKET: bucket,
+          });
+          const label = `${flag}/${regions}/${bucket}`;
+          const actions = allActions(policy);
+          expect(actions, label).not.toContain("codepipeline:PutApprovalResult");
+          expect(actions.filter((a) => /Approval/i.test(a)), label).toEqual([]);
+          expect(actions.filter((a) => a.startsWith("codepipeline:")).sort(), label).toEqual([
+            "codepipeline:GetPipelineExecution",
+            "codepipeline:GetPipelineState",
+            "codepipeline:ListActionExecutions",
+            "codepipeline:StartPipelineExecution",
+          ]);
+        }
+      }
+    }
+  });
+});
+
+describe("the deploy package and the function env", () => {
+  it("zips cd-registry.mjs alongside index.mjs", () => {
+    // index.mjs imports ./cd-registry.mjs, so a zip of index.mjs alone deploys a
+    // Lambda that cannot load. The zip is built inline in main(), so this reads
+    // the source - it is the only guard on that line
+    // (scripts/check-lambda-zip-manifest.sh is orchestrator-only).
+    const zipLine = SOURCE.split("\n").find((l) => l.includes("zip -qr function.zip"));
+    expect(zipLine).toBeDefined();
+    expect(zipLine).toContain("index.mjs");
+    expect(zipLine).toContain("cd-registry.mjs");
+  });
+
+  it("sets PIPELINE_REGIONS and ARTIFACT_BUCKET on the function, and merges env", () => {
+    const cfg = resolveEnv({ PIPELINE_REGIONS: "us-east-1, eu-west-1" });
+    expect(cfg.PIPELINE_REGIONS).toBe("us-east-1,eu-west-1");
+
+    // The env block main() builds, asserted from the source: the same keys the
+    // Lambda reads, and a MERGE over the live function's variables so an
+    // operator-set var this script does not know about survives a redeploy.
+    const envBlock = SOURCE.slice(SOURCE.indexOf("const envVars = {"));
+    for (const key of [
+      "PIPELINE_NAME",
+      "BUILD_PROJECT",
+      "CI_PROJECT",
+      "DEPLOY_PROJECT",
+      "PIPELINE_CI_START_BUILD",
+      "PIPELINE_REGIONS",
+      "ARTIFACT_BUCKET",
+    ]) {
+      expect(envBlock.slice(0, envBlock.indexOf("};"))).toContain(key);
+    }
+    expect(SOURCE).toContain("Variables: { ...existingEnv, ...envVars }");
   });
 });

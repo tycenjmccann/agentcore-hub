@@ -3993,10 +3993,16 @@ export async function buildAgentContext(ticket, workflow) {
   if (deliveryForContext.pipelineMode) {
     context += `## Pipeline Mode\nPIPELINE_ENABLED: true\n`;
     context += `pipeline_name: ${deliveryForContext.pipeline}\n`;
+    if (deliveryForContext.region) context += `pipeline_region: ${deliveryForContext.region}\n`;
+    if (deliveryForContext.ciProject) context += `ci_project: ${deliveryForContext.ciProject}\n`;
+    if (deliveryForContext.buildProject) context += `build_project: ${deliveryForContext.buildProject}\n`;
+    if (deliveryForContext.deployProject) context += `deploy_project: ${deliveryForContext.deployProject}\n`;
     context += `A CodeBuild PR-check + CodePipeline deploy own this repo's `;
     context += `deterministic build/test/deploy. Follow the PIPELINE_ENABLED path `;
     context += `in your blueprint (read CI/pipeline results via the Pipeline___* tools, `;
-    context += `passing pipeline_name; do NOT shell builds or run DEPLOY.md yourself).\n\n`;
+    context += `passing pipeline_name; do NOT shell builds or run DEPLOY.md yourself). `;
+    context += `Pass pipeline_name on EVERY Pipeline___get_state / start_deploy call, and `;
+    context += `project=<ci_project> on EVERY get_build_status / start_ci_build call.\n\n`;
   }
 
   // S3 workspace paths (scope)

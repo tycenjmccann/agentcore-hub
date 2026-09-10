@@ -208,12 +208,17 @@ echo "   ✓ Attached Lambda invoke (agentcore-hub-* functions)"
 # whether the PR-check project has a PR-triggering webhook, so it can tell every
 # persona whether a build for the head SHA can exist at all.
 #
-# F10: scoped to the CI project, NOT project/*. BatchGetProjects returns the
-# project's webhook.url, webhook.secret and its full environment-variable list —
-# read access to every project in the account would be a genuine secret-exposure
-# widening for a probe that only ever needs one name. Widen this deliberately (and
-# only to the specific extra project) if you register a repo whose CD entry names
-# a different `ciProject`.
+# F10: scoped to the hub's own CI project plus the hub-*-ci naming convention
+# (TEAM-4337), NOT project/*. BatchGetProjects returns the project's
+# webhook.url, webhook.secret and its full environment-variable list — read
+# access to every project in the account would be a genuine secret-exposure
+# widening for a probe that only ever needs the PR-check projects a CD registry
+# entry can name by convention. A registry entry's `ciProject` MAY name a
+# project outside this pattern (explicit ciProject wins over the derived
+# hub-<slug>-ci name — see pipelineProjects() in cd-registry.mjs); the CI check
+# for such an entry then has no read access and degrades the same way a missing
+# grant does today. Widen this Resource list deliberately if that repo's CI
+# reachability probe needs to work.
 CI_PROJECT_FOR_IAM="${CI_PROJECT_NAME:-agentcore-hub-ci}"
 aws iam put-role-policy \
   --role-name "$ROLE_NAME" \
@@ -224,10 +229,13 @@ aws iam put-role-policy \
       \"Sid\": \"ReadCiProjectWebhookState\",
       \"Effect\": \"Allow\",
       \"Action\": \"codebuild:BatchGetProjects\",
-      \"Resource\": \"arn:aws:codebuild:${REGION}:${ACCOUNT_ID}:project/${CI_PROJECT_FOR_IAM}\"
+      \"Resource\": [
+        \"arn:aws:codebuild:${REGION}:${ACCOUNT_ID}:project/${CI_PROJECT_FOR_IAM}\",
+        \"arn:aws:codebuild:${REGION}:${ACCOUNT_ID}:project/hub-*-ci\"
+      ]
     }]
   }"
-echo "   ✓ Attached CI check read (codebuild:BatchGetProjects on ${CI_PROJECT_FOR_IAM} only)"
+echo "   ✓ Attached CI check read (codebuild:BatchGetProjects on ${CI_PROJECT_FOR_IAM} + project/hub-*-ci only)"
 
 # ─── Optional: simulate the pipeline-tools role's StartBuild grant ───────────
 # Only created when PIPELINE_TOOLS_ROLE_ARN is set. With CI_CHECK_USE_IAM_SIMULATE=1
