@@ -218,8 +218,3 @@ def test_no_sudo_and_no_write_access_exits_clean_without_pruning(tmp_path):
         assert (d / "google-chrome.list").exists()
     finally:
         d.chmod(0o755)
-
-
-def test_team4385_canary_must_fail_ci():
-    """TEMPORARY canary (TEAM-4385): proves the fail-fast pytest block now fails the build. Reverted in the next commit."""
-    assert False, "TEAM-4385 canary: this failure must turn the CodeBuild build RED"
