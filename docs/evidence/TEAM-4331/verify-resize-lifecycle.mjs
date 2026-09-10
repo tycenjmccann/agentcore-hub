@@ -171,6 +171,52 @@ function dispatchAtHandle(page, type) {
   );
 }
 
+/**
+ * Direct PointerEvent dispatch for a second/subsequent drag in the SAME test.
+ * A real page.mouse pointerdown requires hitting the handle's 4px-wide strip,
+ * whose position is a moving target once a prior drag (possibly still leaking
+ * a listener) has repositioned it — geometry that is fragile to reproduce with
+ * Playwright's mouse and irrelevant to the logic under test. Dispatching the
+ * PointerEvent directly on the handle (bubbles:true reaches React's synthetic
+ * delegation exactly as a real event would) tests the state-machine logic
+ * deterministically, independent of hit-testing.
+ */
+// A dispatched (not real-input) event is processed by React at a lower
+// scheduler priority than a genuine OS-level event, so the DOM does not
+// necessarily reflect the resulting state update by the time the dispatching
+// evaluate() call resolves. Each helper waits one tick past dispatch so every
+// call site gets a consistent, already-flushed DOM to read next.
+async function dispatchPointerDownAtHandle(page, clientX, clientY, pointerId = 1) {
+  await page.evaluate(
+    ({ sel, x, y, id }) => {
+      const el = document.querySelector(sel);
+      if (!el) throw new Error("handle not found for dispatch");
+      el.dispatchEvent(
+        new PointerEvent("pointerdown", {
+          bubbles: true, cancelable: true, pointerId: id,
+          clientX: x, clientY: y, button: 0, buttons: 1, pointerType: "mouse",
+        })
+      );
+    },
+    { sel: HANDLE, x: clientX, y: clientY, id: pointerId }
+  );
+  await page.waitForTimeout(40);
+}
+async function dispatchWindowPointer(page, type, clientX, clientY, pointerId = 1) {
+  await page.evaluate(
+    ({ t, x, y, id }) => {
+      window.dispatchEvent(
+        new PointerEvent(t, {
+          bubbles: true, cancelable: true, pointerId: id,
+          clientX: x, clientY: y, buttons: t === "pointerup" ? 0 : 1, pointerType: "mouse",
+        })
+      );
+    },
+    { t: type, x: clientX, y: clientY, id: pointerId }
+  );
+  await page.waitForTimeout(40);
+}
+
 /** The sidebar's left edge in viewport coords. The app's left nav offsets it
  *  (~256px) and the page uses a `-m-6` negative margin, so a drag target must be
  *  expressed as sidebarLeft + desiredWidth, never as a bare screen x. */
@@ -358,44 +404,69 @@ async function c4NoListenerLeak(browser) {
   await setup(page, { clearWidth: true });
   await resetLog(page);
 
-  // --- drag A, left STUCK (lost capture, no pointerup) ---
-  const c = await startDragToWidth(page, 480);
+  // All three drags below use DIRECT PointerEvent dispatch (not page.mouse):
+  // once drag A is deliberately left stuck (no pointerup, ever — that is the
+  // whole point of B2), the handle's on-screen position is whatever a leaked
+  // listener says it is, which is exactly the moving target a real mouse would
+  // have to re-hit. Direct dispatch on the handle (pointerdown) and window
+  // (pointermove/pointerup) reaches the same React synthetic-event delegation
+  // a real event would, so it tests the state machine, not hit-testing.
+  const left = await sidebarLeft(page);
+  const y = (await handleCenter(page)).y;
+
+  // --- drag A, left STUCK (lost capture, NO pointerup — ever) ---
+  await dispatchPointerDownAtHandle(page, left + DEFAULT_WIDTH, y);
+  await dispatchWindowPointer(page, "pointermove", left + 480, y);
   await dispatchAtHandle(page, "lostpointercapture");
   await page.waitForTimeout(100);
   const afterA = await widthWrites(page);
   assert(afterA.length === 1, "drag A (stuck) persisted exactly once", `${afterA.length}`);
-  await page.mouse.up(); // release the harness's button state
-  await page.waitForTimeout(60);
+  const draggedA = await renderedWidth(page);
+  assert(near(draggedA, 480, 4), "drag A actually reached ~480px before sticking", `${Math.round(draggedA)}px`);
   await resetLog(page);
 
-  // --- drag B, a full normal drag ---
-  await startDragToWidth(page, 560);
+  // --- drag B, a full normal drag, started WITHOUT drag A ever releasing ---
+  await dispatchPointerDownAtHandle(page, left + 480, y);
+  await dispatchWindowPointer(page, "pointermove", left + 560, y);
   const midB = await renderedWidth(page);
-  assert(midB > 500, "drag B is tracking the pointer", `${Math.round(midB)}px`);
-  await page.mouse.up();
+  assert(near(midB, 560, 4), "drag B is tracking its own pointer to ~560px", `${Math.round(midB)}px`);
+  await dispatchWindowPointer(page, "pointerup", left + 560, y);
   await page.waitForTimeout(120);
 
   const afterB = await widthWrites(page);
   assert(afterB.length === 1,
     "drag B's release produced exactly ONE write (a leaked drag-A onEnd would make 2)",
     `${afterB.length}: ${JSON.stringify(afterB.map((w) => w.value))}`);
+  assert(afterB.length === 1 && afterB[0].value === "560",
+    "the one write is drag B's width, not a stale drag-A value", afterB[0]?.value);
 
   const styles = await bodyStyles(page);
   assert(styles.userSelect === "" && styles.cursor === "", "body styles clean after drag B");
 
-  const t = await widthTracksBareMoves(page, c.y);
-  assert(!t.tracked, "after drag B, bare pointermoves change nothing (drag A's onMove is gone)",
-    `rendered ${Math.round(t.before)}->${Math.round(t.after)}`);
+  // Bare moves (no button) via window dispatch: a live orphaned onMove from
+  // EITHER drag would still respond to these, since onMove never checks buttons.
+  const beforeBare = await settledWidth(page);
+  await dispatchWindowPointer(page, "pointermove", left + 300, y);
+  await page.waitForTimeout(60);
+  const afterBare = await renderedWidth(page);
+  assert(near(afterBare, beforeBare, 3), "after drag B, a bare pointermove changes nothing (drag A's onMove is gone)",
+    `${Math.round(beforeBare)}->${Math.round(afterBare)}`);
 
   // --- a third clean drag, to show writes stay 1:1 with completed drags ---
   await resetLog(page);
-  await startDragToWidth(page, 420);
-  await page.mouse.up();
+  await dispatchPointerDownAtHandle(page, left + 560, y);
+  await dispatchWindowPointer(page, "pointermove", left + 420, y);
+  await dispatchWindowPointer(page, "pointerup", left + 420, y);
   await page.waitForTimeout(120);
   const afterC = await widthWrites(page);
   assert(afterC.length === 1, "drag C also persisted exactly once (writes stay 1:1 with drags)", `${afterC.length}`);
-  const t2 = await widthTracksBareMoves(page, c.y);
-  assert(!t2.tracked, "after drag C, bare pointermoves still change nothing");
+
+  const beforeBare2 = await settledWidth(page);
+  await dispatchWindowPointer(page, "pointermove", left + 500, y);
+  await page.waitForTimeout(60);
+  const afterBare2 = await renderedWidth(page);
+  assert(near(afterBare2, beforeBare2, 3), "after drag C, bare pointermoves still change nothing",
+    `${Math.round(beforeBare2)}->${Math.round(afterBare2)}`);
 
   await ctx.close();
 }

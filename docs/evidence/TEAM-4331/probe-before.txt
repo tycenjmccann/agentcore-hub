@@ -1,17 +1,17 @@
 ===== TEAM-4331 resize-lifecycle probe against http://localhost:3000 =====
-label: AFTER (TEAM-4331 fix applied — commit f159402)
+label: BEFORE (base page.tsx, feature/TEAM-4314--kiro-opus-workflow-tab-sidebar-dark-sle @ b3f392c)
 chromium: 148.0.7778.0
 
 ----- C1 (B1): lost pointer capture == mouse released OUTSIDE the window -----
   PASS  drag widened the sidebar before the interruption (520px)
   PASS  mid-drag: transition suppressed (isResizing true)
-  PASS  mid-drag: the handle HOLDS the pointer capture (setPointerCapture took effect)
-  PASS  body.style.userSelect restored to "" ("")
-  PASS  body.style.cursor restored to "" ("")
-  PASS  isResizing cleared (transition class back)
-  PASS  bare pointermoves after lost capture do NOT resize the sidebar (rendered 520->520, aria 520->520)
-  PASS  exactly ONE width write for the interrupted drag (1: ["520"])
-  PASS  the persisted value equals the width at interruption (520)
+  FAIL  mid-drag: the handle HOLDS the pointer capture (setPointerCapture took effect)
+  FAIL  body.style.userSelect restored to "" ("none")
+  FAIL  body.style.cursor restored to "" ("col-resize")
+  FAIL  isResizing cleared (transition class back)
+  FAIL  bare pointermoves after lost capture do NOT resize the sidebar (rendered 520->260, aria 520->260)
+  FAIL  exactly ONE width write for the interrupted drag (0: [])
+  FAIL  the persisted value equals the width at interruption
   PASS  a late pointerup adds NO second write (idempotent onEnd) (1)
   PASS  body styles still clean after the late pointerup
 
@@ -28,22 +28,22 @@ chromium: 148.0.7778.0
   PASS  stored preference is the dragged ~600 (600)
   PASS  aria-valuenow tracks the rendered width (600 vs 600)
   PASS  aria-valuemax is the 640 ceiling at 1600px (640)
-  PASS  ZERO width writes fired during the viewport resize (0: [])
-  PASS  stored preference is STILL ~600 after narrowing (600)
+  FAIL  ZERO width writes fired during the viewport resize (1: ["450"])
+  FAIL  stored preference is STILL ~600 after narrowing (450)
   PASS  RENDERED width clamped down to the new max 450 (450px)
   PASS  aria-valuenow tracks the clamped rendered width (450)
   PASS  aria-valuemax honestly reports 450 (450)
-  PASS  widening RESTORES the ~600 preference to the rendered width (600px)
-  PASS  stored preference untouched throughout (600)
-  PASS  still ZERO width writes across both viewport changes (0)
-  PASS  after reload the sidebar renders the preserved ~600 (600px)
+  FAIL  widening RESTORES the ~600 preference to the rendered width (450px)
+  FAIL  stored preference untouched throughout (450)
+  FAIL  still ZERO width writes across both viewport changes (1)
+  FAIL  after reload the sidebar renders the preserved ~600 (450px)
 
 ----- C4 (B2): stuck drag then a normal drag — no leaked listeners -----
-  PASS  drag A (stuck) persisted exactly once (1)
+  FAIL  drag A (stuck) persisted exactly once (0)
   PASS  drag A actually reached ~480px before sticking (480px)
   PASS  drag B is tracking its own pointer to ~560px (560px)
-  PASS  drag B's release produced exactly ONE write (a leaked drag-A onEnd would make 2) (1: ["560"])
-  PASS  the one write is drag B's width, not a stale drag-A value (560)
+  FAIL  drag B's release produced exactly ONE write (a leaked drag-A onEnd would make 2) (2: ["560","560"])
+  FAIL  the one write is drag B's width, not a stale drag-A value (560)
   PASS  body styles clean after drag B
   PASS  after drag B, a bare pointermove changes nothing (drag A's onMove is gone) (560->560)
   PASS  drag C also persisted exactly once (writes stay 1:1 with drags) (1)
@@ -53,7 +53,7 @@ chromium: 148.0.7778.0
   PASS  stored 600 renders clamped to 450 at a 900px viewport (450px)
   PASS  stored preference still 600 on load (mount read does not persist) (600)
   PASS  the zero-movement press persisted once (1)
-  PASS  zero-movement press did NOT downgrade the stored 600 to the clamped 450 (600)
+  FAIL  zero-movement press did NOT downgrade the stored 600 to the clamped 450 (450)
   PASS  rendered width still the clamped 450 after the press
   PASS  dblclick reset the RENDERED width to 288 (capture did not break dblclick) (288px)
   PASS  dblclick persisted 288 (288)
@@ -61,7 +61,4 @@ chromium: 148.0.7778.0
   PASS  body styles clean after the dblclick
   PASS  after widening, width stays 288 — the reset replaced the 600 preference (288px)
 
------ screenshot: sidebar dragged wide, dark mode -----
-  saved docs/evidence/TEAM-4331/sidebar-resized-dark.png (sidebar rendered at 600px, theme=dark)
-
-===== ALL ASSERTIONS PASSED =====
+===== 17 ASSERTION(S) FAILED =====

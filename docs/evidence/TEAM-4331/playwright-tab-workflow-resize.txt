@@ -1,0 +1,38 @@
+
+Running 6 tests using 1 worker
+
+  ✓  1 [chromium] › tests/tab-workflow-resize.spec.ts:69:7 › Workflow sidebar resize (TEAM-4316) › 1: default expanded width is 288px (2.4s)
+  ✓  2 [chromium] › tests/tab-workflow-resize.spec.ts:76:7 › Workflow sidebar resize (TEAM-4316) › 2: dragging the handle right widens >= 400px and survives reload (3.7s)
+  ✓  3 [chromium] › tests/tab-workflow-resize.spec.ts:103:7 › Workflow sidebar resize (TEAM-4316) › 3: double-click on the handle resets to 288px (3.0s)
+  ✓  4 [chromium] › tests/tab-workflow-resize.spec.ts:123:7 › Workflow sidebar resize (TEAM-4316) › 4: collapse then expand restores the persisted (wide) width, not 288 (3.4s)
+scrollbar computed: scrollbarWidth="auto" webkitWidth="6px"
+  ✘  5 [chromium] › tests/tab-workflow-resize.spec.ts:139:7 › Workflow sidebar resize (TEAM-4316) › 5: scrollbar styling — thin + 6px webkit width (no default white bar) (2.4s)
+  -  6 [chromium] › tests/tab-workflow-resize.spec.ts:161:7 › Workflow sidebar resize (TEAM-4316) › 6: widening reveals a previously-truncated epic title
+
+
+  1) [chromium] › tests/tab-workflow-resize.spec.ts:139:7 › Workflow sidebar resize (TEAM-4316) › 5: scrollbar styling — thin + 6px webkit width (no default white bar) 
+
+    Error: [2mexpect([22m[31mreceived[39m[2m).[22mtoBe[2m([22m[32mexpected[39m[2m) // Object.is equality[22m
+
+    Expected: [32m"thin"[39m
+    Received: [31m"auto"[39m
+
+      151 |     // Report exact values so an empty return is visible, not silently loosened.
+      152 |     console.log(`scrollbar computed: scrollbarWidth=${JSON.stringify(result.scrollbarWidth)} webkitWidth=${JSON.stringify(result.webkitWidth)}`);
+    > 153 |     expect(result.scrollbarWidth).toBe("thin");
+          |                                   ^
+      154 |     expect(result.webkitWidth).toBe("6px");
+      155 |     // R2.8 (data-independent): the list never grows a horizontal scrollbar at
+      156 |     // the default 288px width, regardless of whether any rows are present.
+        at /mnt/efs/sessions/cc-ac54a5c0fad84e72adb56b6c097e9641/tycenjmccann-agentcore-hub/tests/tab-workflow-resize.spec.ts:153:35
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/tab-workflow-resize-Workfl-a8a47-width-no-default-white-bar--chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/tab-workflow-resize-Workfl-a8a47-width-no-default-white-bar--chromium/error-context.md
+
+  1 failed
+    [chromium] › tests/tab-workflow-resize.spec.ts:139:7 › Workflow sidebar resize (TEAM-4316) › 5: scrollbar styling — thin + 6px webkit width (no default white bar) 
+  1 skipped
+  4 passed (20.6s)
