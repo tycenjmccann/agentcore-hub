@@ -23,3 +23,9 @@ Gates run below (verbatim summaries appended as each completes).
 - `next lint` exits 0 (warnings do not fail the gate).
 
 ---
+
+## Gate 2 — `npx tsc --noEmit`
+
+**Exit code: 0 (PASS).** No output (no type errors).
+
+---
