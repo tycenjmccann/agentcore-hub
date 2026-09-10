@@ -15,6 +15,7 @@ import DeleteConfirmationModal from "@/components/workflow/DeleteConfirmationMod
 const HISTORY_DEFAULT_WIDTH = 288; // w-72 equivalent
 const HISTORY_MIN_WIDTH = 240;
 const HISTORY_MAX_CEILING = 640;
+const HISTORY_KEY_STEP = 16; // keyboard resize increment (mirrors KEY_STEP in tests/helpers/workflow-resize.ts)
 const HISTORY_WIDTH_KEY = "workflow-history-width";
 
 // Live clamp — the single source of truth for the width bounds. Reads
@@ -223,16 +224,50 @@ export default function WorkflowPage() {
   // this fires and overwrites with the default — width is never corrupted.
   const handleResizeReset = useCallback(() => applyWidth(HISTORY_DEFAULT_WIDTH, true), [applyWidth]);
 
-  // Keyboard resize: ±16px with the same clamp, persisted once per keypress.
+  // Keyboard resize: ±16px with the same clamp, persisted once per EFFECTIVE keypress.
+  //
+  // TEAM-4352 (F1): step the user's INTENT (preferredWidthRef), not the viewport-clamped
+  // RENDERED width. Stepping the render width meant that on a 900px viewport (max 450)
+  // with a stored preference of 600, one ArrowRight computed clamp(450 + 16) === 450 and
+  // then PERSISTED it: nothing moved on screen, yet the saved preference silently
+  // NARROWED 600 -> 450, so a later maximise rendered 450 instead of 600. That is the
+  // same failure class the pointer path already avoids in onEnd above, which persists
+  // preferredWidthRef rather than the clamped render width (see case E5).
+  //
+  // The rule, in order:
+  //   1. step the intent;
+  //   2. if that lands exactly on the current rendered width the step was fully absorbed
+  //      by the clamp and nothing would move — retry from the RENDERED width instead.
+  //      Still no movement => we are at a genuine clamp bound in this direction: bail out
+  //      with NO state change and NO localStorage write, so the wider preference survives;
+  //   3. otherwise apply + persist exactly once.
+  //
+  // The rendered-width fallback is deliberate and asymmetric. From pref 600 / rendered
+  // 450: ArrowRight is a silent no-op (600 is preserved), but ArrowLeft yields
+  // clamp(450 - 16) === 434, which VISIBLY narrows the sidebar, so 434 becomes the honest
+  // new intent. Stepping the preference there (600 -> 584 -> ...) would be ~10 dead
+  // keypresses with zero feedback — a worse defect. The invariant is narrower than "never
+  // overwrite the preference": a keypress that changes NOTHING VISIBLE must not rewrite
+  // it; one that moves the sidebar may.
+  const stepWidth = useCallback((delta: number) => {
+    let next = clampHistoryWidth(preferredWidthRef.current + delta);
+    if (next === widthRef.current) {
+      const fromRendered = clampHistoryWidth(widthRef.current + delta);
+      if (fromRendered === widthRef.current) return; // at a clamp bound — silent no-op
+      next = fromRendered;
+    }
+    applyWidth(next, true);
+  }, [applyWidth]);
+
   const handleResizeKeyDown = useCallback((e: React.KeyboardEvent) => {
     if (e.key === "ArrowLeft") {
       e.preventDefault();
-      applyWidth(clampHistoryWidth(widthRef.current - 16), true);
+      stepWidth(-HISTORY_KEY_STEP);
     } else if (e.key === "ArrowRight") {
       e.preventDefault();
-      applyWidth(clampHistoryWidth(widthRef.current + 16), true);
+      stepWidth(HISTORY_KEY_STEP);
     }
-  }, [applyWidth]);
+  }, [stepWidth]);
 
   const toggleHistory = () => {
     const next = !historyCollapsed;

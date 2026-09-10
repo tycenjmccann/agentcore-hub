@@ -3,6 +3,7 @@ import {
   ABSURD_TITLE,
   DEFAULT_WIDTH,
   HANDLE,
+  KEY_STEP,
   LIST,
   LONG_ROWS,
   MAX_CEILING,
@@ -750,6 +751,120 @@ test.describe("E: drag lifecycle (TEAM-4331)", () => {
       await page.waitForTimeout(400);
       expect(near(await settledWidth(page), DEFAULT_WIDTH, 3)).toBe(true);
       expect(await storedWidth(page)).toBe(String(DEFAULT_WIDTH));
+    });
+  });
+
+  test.describe("on a 900px viewport with a stored preference above the ceiling (TEAM-4352)", () => {
+    test.use({ viewport: { width: 900, height: 900 } });
+
+    // E6 is the KEYBOARD twin of E5. E5 proves the POINTER path persists the
+    // user's intent (preferredWidthRef) rather than the viewport-clamped render
+    // width; the keyboard path stepped widthRef and persisted the result, so it
+    // still carried TEAM-4331's B3 defect on its own channel — one ArrowRight
+    // computed clamp(450 + 16) === 450 and wrote it, silently narrowing the
+    // stored 600 to 450 while nothing moved on screen.
+    //
+    // Three INDEPENDENT channels discriminate, deliberately:
+    //   - the WRITE COUNT (0 vs 1). Counted, not compared: a value-only check is
+    //     exactly the assertion shape TEAM-4331 already showed passes on broken
+    //     code.
+    //   - the stored value ("600" vs "450").
+    //   - the width RESTORED when the viewport grows back (600 vs 450) — the
+    //     actual user-visible consequence of the lost preference, and the one
+    //     channel that still fails if someone "fixes" only the write count.
+    //
+    // Those three are `expect.soft` for the reason group A already documents: a
+    // hard expect aborts the test at the FIRST failure, so the differential run
+    // would only ever record the write count and the other two channels — which
+    // exist precisely so the evidence is not single-channel — would never
+    // execute. The PRECONDITIONS stay hard: if 600/450/450 is not the starting
+    // state, the rest of the test is measuring nothing and should stop.
+    test("E6: an ArrowRight absorbed by the clamp writes nothing and keeps the 600 preference", async ({
+      page,
+    }) => {
+      await setup(page, { rows: SMALL_ROWS, seedWidth: 600 });
+
+      // Precondition: max = min(640, 900 * 0.5) = 450, so the stored 600 is
+      // deliberately unrenderable here. That render/preference split is the only
+      // state in which the defect is observable at all.
+      expect(near(await settledWidth(page), 450, 3)).toBe(true);
+      expect(await storedWidth(page)).toBe("600");
+      expect(await aria(page, "aria-valuemax")).toBe(450);
+      expect(await aria(page, "aria-valuenow")).toBe(450);
+
+      await resetLog(page);
+      const seen = await pressKey(page, "ArrowRight", 1);
+      const writes = await widthWrites(page);
+      console.log(
+        `[E6] ArrowRight at the clamped ceiling: seen=${seen.join(",")} ` +
+          `writes=${JSON.stringify(writes)} stored=${await storedWidth(page)}`
+      );
+
+      // Nothing moved on screen, so nothing may be persisted.
+      expect.soft(writes.length).toBe(0);
+      expect.soft(await storedWidth(page)).toBe("600");
+      expect.soft(near(await settledWidth(page), 450, 3)).toBe(true);
+      // aria stays honest — it reports the RENDERED width, never the preference.
+      expect.soft(await aria(page, "aria-valuenow")).toBe(450);
+
+      // The consequence the user actually feels: maximise the window and the 600
+      // preference comes back. The unfixed handler renders 450 forever.
+      await page.setViewportSize({ width: 1600, height: 900 });
+      await page.waitForTimeout(400);
+      const restored = await settledWidth(page);
+      console.log(
+        `[E6] widened to 1600: rendered=${restored} valuenow=${await aria(page, "aria-valuenow")} ` +
+          `stored=${await storedWidth(page)} writes=${(await widthWrites(page)).length}`
+      );
+      expect.soft(near(restored, 600, 3)).toBe(true);
+      expect.soft(await aria(page, "aria-valuenow")).toBe(600);
+      expect.soft(await storedWidth(page)).toBe("600");
+      expect.soft((await widthWrites(page)).length).toBe(0); // restoring a preference is render-only
+    });
+
+    // The deliberate ASYMMETRY, pinned. From pref 600 / rendered 450, ArrowLeft
+    // is NOT absorbed once it falls back to the rendered width: 450 - 16 = 434
+    // VISIBLY narrows the sidebar, so 434 is allowed to become the new intent.
+    // The alternative — stepping the 600 preference down 600 -> 584 -> ... —
+    // would be ~10 keypresses with zero visible feedback, a worse defect. The
+    // invariant this group protects is "a keypress that changes NOTHING VISIBLE
+    // must not rewrite the preference", not "never rewrite it".
+    //
+    // This case passes on the UNFIXED handler too, so it is not a detector for
+    // the TEAM-4352 defect. It exists to catch the OVER-fix (step the preference
+    // with no rendered fallback), which would store "584", render 450 and leave
+    // aria-valuenow at 450 — failing all three channels below. See
+    // docs/evidence/TEAM-4352/differential.md.
+    test("E6b: an ArrowLeft that VISIBLY narrows may replace the preference — exactly one write", async ({
+      page,
+    }) => {
+      await setup(page, { rows: SMALL_ROWS, seedWidth: 600 });
+      expect(near(await settledWidth(page), 450, 3)).toBe(true);
+      expect(await storedWidth(page)).toBe("600");
+
+      await resetLog(page);
+      const seen = await pressKey(page, "ArrowLeft", 1);
+      const writes = await widthWrites(page);
+      console.log(
+        `[E6b] ArrowLeft from pref 600 / rendered 450: seen=${seen.join(",")} ` +
+          `writes=${JSON.stringify(writes)} rendered=${await settledWidth(page)}`
+      );
+
+      expect(writes.length).toBe(1);
+      expect(writes[0].value).toBe(String(450 - KEY_STEP)); // "434"
+      expect(await aria(page, "aria-valuenow")).toBe(450 - KEY_STEP);
+      expect(near(await settledWidth(page), 450 - KEY_STEP, 3)).toBe(true);
+      expect(await storedWidth(page)).toBe(String(450 - KEY_STEP));
+
+      // 434 really is the new INTENT, not just a transient render: widening the
+      // viewport must not resurrect the old 600.
+      await page.setViewportSize({ width: 1600, height: 900 });
+      await page.waitForTimeout(400);
+      console.log(
+        `[E6b] widened to 1600: rendered=${await settledWidth(page)} stored=${await storedWidth(page)}`
+      );
+      expect(near(await settledWidth(page), 450 - KEY_STEP, 3)).toBe(true);
+      expect(await storedWidth(page)).toBe(String(450 - KEY_STEP));
     });
   });
 });
