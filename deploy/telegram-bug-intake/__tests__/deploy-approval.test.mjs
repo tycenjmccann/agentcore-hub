@@ -122,12 +122,15 @@ vi.mock("@aws-sdk/client-codepipeline", () => {
 
 // Key-aware S3: the bridge reads exactly ONE key (the CD registry). `registry`
 // null → NoSuchKey, which is also what an install with no registry yet sees.
-const s3 = vi.hoisted(() => ({ calls: [], inits: [], registry: null }));
+// `error` (TEAM-4377) throws it instead — the read failures that are NOT "no
+// document yet" take a different branch in the loader.
+const s3 = vi.hoisted(() => ({ calls: [], inits: [], registry: null, error: null }));
 vi.mock("@aws-sdk/client-s3", () => ({
   S3Client: class {
     constructor(cfg) { this.region = cfg?.region; s3.inits.push(cfg?.region); }
     async send(c) {
       s3.calls.push(c.input);
+      if (c.input?.Key === CD_REGISTRY_KEY && s3.error) throw s3.error;
       if (c.input?.Key === CD_REGISTRY_KEY && s3.registry) {
         const doc = s3.registry;
         return { Body: { transformToString: async () => (typeof doc === "string" ? doc : JSON.stringify(doc)) } };
@@ -181,6 +184,23 @@ function makeNet(ctx, overrides = {}) {
 
 function makeCtx(startMs) { return { remainingMs: startMs, getRemainingTimeInMillis() { return this.remainingMs; } }; }
 
+/**
+ * The clock the registry TTL is measured against (TEAM-4377). Fake timers would
+ * break the poll loop's real awaits, and CD_REGISTRY_TTL_MS is a constant in
+ * index.mjs — only Date.now can move. Advance BETWEEN invocations only: each
+ * invocation re-stamps lastGateScan at entry (index.mjs:185), so a skew applied
+ * between two handler calls expires the registry TTL without injecting an extra
+ * in-loop gate scan.
+ */
+const realNow = Date.now.bind(Date);
+let clockSkewMs = 0;
+vi.spyOn(Date, "now").mockImplementation(() => realNow() + clockSkewMs);
+const advanceClock = (ms) => { clockSkewMs += ms; };
+/** Just the CD-registry reads — the bridge's only S3 key. */
+const registryReads = () => s3.calls.filter((c) => c.Key === CD_REGISTRY_KEY);
+/** The pipelines GetPipelineState was called on, in call order. */
+const polled = () => cp.sends.filter((s) => s.op === "state").map((s) => s.input.name);
+
 const ENV = {
   TELEGRAM_BOT_TOKEN: TG_TOKEN,
   JIRA_SITE_URL: "example.atlassian.net", JIRA_EMAIL: "bot@example.com",
@@ -206,10 +226,12 @@ beforeEach(() => {
   db.items.clear(); db.puts.length = 0; db.deletes.length = 0;
   cp.states.clear(); cp.stateErrors.clear(); cp.putErrors.clear();
   cp.approvals.length = 0; cp.approvalCalls.length = 0; cp.sends.length = 0; cp.inits.length = 0;
-  s3.calls.length = 0; s3.inits.length = 0; s3.registry = null;
+  s3.calls.length = 0; s3.inits.length = 0; s3.registry = null; s3.error = null;
   cp.state = { stageStates: [] }; cp.stateError = null; cp.putError = null;
+  clockSkewMs = 0;
 });
 afterAll(() => {
+  vi.restoreAllMocks();
   global.fetch = realFetch;
   for (const k of [...Object.keys(ENV), "ALLOWED_CHAT_IDS", "DEPLOY_PIPELINE_NAME", "ARTIFACT_BUCKET"]) delete process.env[k];
 });
@@ -466,6 +488,76 @@ describe("deploy-approval bridge", () => {
     expect(net.sent.length, "the env fallback must not duplicate a registered pipeline").toBe(1);
     expect(cp.sends.filter((s) => s.op === "state").length).toBe(1);
     expect(db.puts.filter((i) => i.id.S.startsWith("dep#")).length).toBe(1);
+  });
+
+  // ─── r3-F2: registry loader failure directions (TEAM-4377) ─────────────────
+  // Mirrors lambda/agentcore-hub-pipeline-tools/index.test.mjs §8.8b: the
+  // registry is a runtime ALLOW-LIST, so "the read failed" must never be allowed
+  // to read as "nothing is registered".
+
+  it("a malformed registry body keeps the last good copy - the widget gate is still watched", async () => {
+    const handler = await loadHandler({
+      allowed: "555", pipeline: PIPELINE, bucket: BUCKET, registry: REGISTRY_TWO,
+    });
+    registerChat(555);
+    cp.states.set(PIPELINE, pendingState(TOKEN));
+    cp.states.set(WIDGET, pendingState(TOKEN2));
+
+    const net = makeNet(makeCtx(100_000), { batches: [[]] });
+    global.fetch = net.fetch;
+    await handler({}, net.ctx);
+    expect(polled().sort(), "both registered pipelines watched on the good read").toEqual(
+      [PIPELINE, WIDGET].sort(),
+    );
+
+    // The object is now truncated mid-write, and the TTL has expired on this same
+    // warm container. Fresh tokens so the claim doesn't dedupe the pings away.
+    s3.registry = "{not json";
+    cp.sends.length = 0;
+    advanceClock(61_000);
+    cp.states.set(PIPELINE, pendingState(`${TOKEN}-2`));
+    cp.states.set(WIDGET, pendingState(`${TOKEN2}-2`));
+
+    const net2 = makeNet(makeCtx(100_000), { batches: [[]] });
+    global.fetch = net2.fetch;
+    await handler({}, net2.ctx);
+
+    expect(polled().sort(), "a bad read must not un-watch a registered gate").toEqual(
+      [PIPELINE, WIDGET].sort(),
+    );
+    // The retained copy keeps the entry's REGION too, not just its name.
+    const widget = cp.sends.find((s) => s.op === "state" && s.input.name === WIDGET);
+    expect(widget.region).toBe("us-west-2");
+    // It really re-read: this is a RETAINED copy, not a TTL cache hit.
+    expect(registryReads(), "TTL expired → a second GetObject").toHaveLength(2);
+    expect(net2.sent.length, "both gates still ping").toBe(2);
+  });
+
+  it("a denied registry read opens the TTL window - one GetObject, not one per scan", async () => {
+    const handler = await loadHandler({ allowed: "555", pipeline: PIPELINE, bucket: BUCKET });
+    // Worded like the real denial, and deliberately NOT matching the
+    // NoSuchKey/NotFound/404 branch — this is an outage, not an empty registry.
+    s3.error = Object.assign(
+      new Error("User: arn:aws:sts::…:assumed-role/x is not authorized to perform: s3:GetObject"),
+      { name: "AccessDenied" },
+    );
+    registerChat(555);
+    cp.state = pendingState();
+
+    const net = makeNet(makeCtx(100_000), { batches: [[]] });
+    global.fetch = net.fetch;
+    await handler({}, net.ctx);
+
+    // Second scan on the same container, well inside the 60s TTL (no clock skew).
+    const net2 = makeNet(makeCtx(100_000), { batches: [[]] });
+    global.fetch = net2.fetch;
+    cp.state = pendingState();
+    await handler({}, net2.ctx);
+
+    expect(registryReads(), "a failed read must still open the TTL window").toHaveLength(1);
+    expect(s3.inits, "one client, reused").toHaveLength(1);
+    // The env fallback target only, both scans — a denial invents no targets.
+    expect(polled()).toEqual([PIPELINE, PIPELINE]);
   });
 
   it("a foreign repo's brief is enriched from THAT repo, and the ping names pipeline + repo", async () => {

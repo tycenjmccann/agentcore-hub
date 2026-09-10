@@ -16,10 +16,13 @@
 # grant anywhere — do not add one there. This inline policy is the only place
 # in the account where an identity may resolve that gate; widen it with care.
 #
-#   PipelineStateRead    codepipeline:GetPipelineState on the configured deploy
-#                         pipeline (its own region) plus hub-*-deploy in every
-#                         region in PIPELINE_REGIONS (the CD-registry convention
-#                         — see src/lib/cd-registry.ts / cd-registry.mjs).
+#   PipelineStateRead    codepipeline:GetPipelineState on the pipeline the
+#                         function will ACTUALLY poll — its EFFECTIVE
+#                         DEPLOY_PIPELINE_NAME, read back after the env merge
+#                         (step 1b, TEAM-4377), NOT this shell's default — in its
+#                         own region, plus hub-*-deploy in every region in
+#                         PIPELINE_REGIONS (the CD-registry convention — see
+#                         src/lib/cd-registry.ts / cd-registry.mjs).
 #                         GetPipelineState is authorized at the PIPELINE level.
 #   DeployApprovalWrite  codepipeline:PutApprovalResult on the SAME pipelines,
 #                         but PutApprovalResult is authorized at the ACTION
@@ -39,14 +42,17 @@ FUNCTION="${TELEGRAM_INTAKE_FUNCTION:-telegram-bug-intake}"
 # Comma list — IAM fan-out ONLY. index.mjs never reads this; the multi-target
 # poll list comes entirely from config/cd-registry.json at runtime.
 PIPELINE_REGIONS="${PIPELINE_REGIONS:-$AWS_REGION}"
-DEPLOY_PIPELINE="${DEPLOY_PIPELINE_NAME:-agentcore-hub-deploy}"
+# The DEFAULT ONLY. The env merge below never overwrites the function's own
+# DEPLOY_PIPELINE_NAME, so this is not necessarily the pipeline the function
+# polls — the IAM policy is built from the EFFECTIVE value read back in step 1b.
+DEPLOY_PIPELINE_DEFAULT="${DEPLOY_PIPELINE_NAME:-agentcore-hub-deploy}"
 POLICY_NAME="telegram-bug-intake-deploy-approval"
 
 echo "Function:         $FUNCTION"
 echo "Region:           $AWS_REGION"
 echo "Account:          $ACCOUNT_ID"
 echo "Artifact bucket:  $ARTIFACT_BUCKET"
-echo "Deploy pipeline:  $DEPLOY_PIPELINE"
+echo "Deploy pipeline:  $DEPLOY_PIPELINE_DEFAULT (default - the function's existing value wins)"
 echo "IAM fan-out:      hub-*-deploy in $PIPELINE_REGIONS"
 echo
 
@@ -67,7 +73,7 @@ aws lambda get-function-configuration \
   --function-name "$FUNCTION" --region "$AWS_REGION" \
   --query 'Environment.Variables' --output json |
   ARTIFACT_BUCKET="$ARTIFACT_BUCKET" \
-  DEPLOY_PIPELINE_NAME="$DEPLOY_PIPELINE" \
+  DEPLOY_PIPELINE_DEFAULT="$DEPLOY_PIPELINE_DEFAULT" \
   python3 -c '
 import json, os, sys
 
@@ -75,9 +81,13 @@ existing = json.load(sys.stdin) or {}
 merged = dict(existing)
 # ARTIFACT_BUCKET is always refreshed to the account'"'"'s current bucket — it
 # is derived config, not an operator choice. DEPLOY_PIPELINE_NAME is only
-# DEFAULTED, never overwritten, so an operator override survives a re-run.
+# DEFAULTED, never overwritten, so an operator override survives a re-run. A
+# present-but-BLANK value counts as unset: it would otherwise flow into step 1b
+# and put a pipeline-less ARN in the policy.
 merged["ARTIFACT_BUCKET"] = os.environ["ARTIFACT_BUCKET"]
-merged.setdefault("DEPLOY_PIPELINE_NAME", os.environ["DEPLOY_PIPELINE_NAME"])
+merged["DEPLOY_PIPELINE_NAME"] = (
+    (existing.get("DEPLOY_PIPELINE_NAME") or "").strip() or os.environ["DEPLOY_PIPELINE_DEFAULT"]
+)
 json.dump({"Variables": merged}, sys.stdout)
 ' > "$ENV_FILE"
 
@@ -86,7 +96,26 @@ aws lambda update-function-configuration \
   --environment "file://$ENV_FILE" > /dev/null
 
 aws lambda wait function-updated --function-name "$FUNCTION" --region "$AWS_REGION"
+
+# ─── 1b. The EFFECTIVE pipeline the policy must cover (TEAM-4377) ─────────────
+# The policy below used to be built from the SHELL default. An operator who set
+# DEPLOY_PIPELINE_NAME=custom-x on the function once (it survives the merge above)
+# and later re-ran this script WITHOUT re-exporting it got a policy covering only
+# agentcore-hub-deploy + hub-*-deploy: every GetPipelineState poll and every
+# approval tap on custom-x then AccessDenied - fail-closed, but a silently dead
+# deploy gate, from a script whose whole contract is "idempotent, re-runnable".
+# $ENV_FILE is the document we just applied, so it IS the function's env.
+DEPLOY_PIPELINE="$(ENV_FILE="$ENV_FILE" python3 -c '
+import json, os
+print(json.load(open(os.environ["ENV_FILE"]))["Variables"]["DEPLOY_PIPELINE_NAME"])
+')"
+[ -n "$DEPLOY_PIPELINE" ] || {
+  echo "DEPLOY_PIPELINE_NAME is empty after the merge - refusing to write a pipeline-less policy" >&2
+  exit 1
+}
+
 echo "Env updated: ARTIFACT_BUCKET set, DEPLOY_PIPELINE_NAME defaulted (existing keys preserved)."
+echo "Effective deploy pipeline: $DEPLOY_PIPELINE (script default was $DEPLOY_PIPELINE_DEFAULT)"
 
 # ─── 2. Inline role policy (idempotent put-role-policy) ───────────────────────
 POLICY_DOC=$(
@@ -143,6 +172,6 @@ aws iam put-role-policy \
   --policy-document "$POLICY_DOC"
 
 echo "IAM inline policy '$POLICY_NAME' applied to $ROLE_NAME:"
-echo "  PipelineStateRead (pipeline-level) on $DEPLOY_PIPELINE ($AWS_REGION) + hub-*-deploy ($PIPELINE_REGIONS)"
+echo "  PipelineStateRead (pipeline-level) on $DEPLOY_PIPELINE (effective, $AWS_REGION) + hub-*-deploy ($PIPELINE_REGIONS)"
 echo "  DeployApprovalWrite (action-level, <pipeline>/*) on the same pipelines"
 echo "  CdRegistryRead on s3://$ARTIFACT_BUCKET/config/cd-registry.json"
