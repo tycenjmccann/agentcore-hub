@@ -50,24 +50,39 @@
  *
  * Every tool resolves exactly one target before touching AWS, and REFUSES
  * structurally (never throws, never falls back to the env default) when the
- * caller names something outside the allow-list. The three refusal reasons:
+ * caller names something outside the allow-list. The four refusal reasons:
  *
  *   pipeline_not_registered  args.pipeline_name is not any target's pipeline.
  *                            { ok:false, reason, requested, known:[pipelines] }
- *   project_not_registered   args.project is not any target's ci/build/deploy
- *                            project. { ok:false, reason, requested, known:[projects] }
+ *   project_not_registered   the project we landed on — args.project, OR (for
+ *                            get_build_log) the project a build_id names, OR
+ *                            (for get_build_status/start_ci_build) a project
+ *                            resolved some other way — is not any target's
+ *                            ci/build/deploy project.
+ *                            { ok:false, reason, requested, known:[projects] }
+ *   project_mismatch        (TEAM-4348, get_build_log only) args.project and
+ *                            the project build_id names ("<project>:<uuid>")
+ *                            disagree. Refused rather than picking one, so a
+ *                            caller never gets a DIFFERENT build's log than it
+ *                            thinks it asked for.
+ *                            { ok:false, reason, requested, buildIdProject }
  *   pipeline_name_required   >1 target and a WRITE tool (start_deploy) was called
  *                            without pipeline_name — refusing to guess which repo
- *                            to deploy. { ok:false, reason, known:[pipelines] }
+ *                            to deploy. args.project cannot substitute (TEAM-4348:
+ *                            start_deploy does not take a project at all).
+ *                            { ok:false, reason, known:[pipelines] }
  *
  * A refusal makes ZERO AWS calls. With a single target (the pre-TEAM-4337 shape:
  * empty/absent registry) a call that names nothing resolves to the env default,
  * so the single-pipeline behavior is byte-identical to before.
  *
  * Clients are per-region (clientsFor): a target in us-west-2 gets its own
- * CodePipeline/CodeBuild/Logs clients. The S3 client is deliberately NOT
- * fanned out — both S3 reads (the registry and the handoff marker) live in the
- * one artifact bucket in THIS Lambda's region.
+ * CodePipeline/CodeBuild/Logs clients, and (TEAM-4348) the region used is always
+ * the OWNER of the project a call actually names, not just whichever target the
+ * args happened to resolve — a pipeline_name naming one repo plus a project
+ * belonging to another must still reach the project's own region. The S3 client
+ * is deliberately NOT fanned out — both S3 reads (the registry and the handoff
+ * marker) live in the one artifact bucket in THIS Lambda's region.
  *
  * DELIBERATELY ABSENT: PutApprovalResult. The in-pipeline ManualApproval (deploy
  * gate) is a HUMAN decision, bridged to Telegram (telegram-bug-intake). An agent
@@ -372,8 +387,13 @@ function targetForProject(targets, name) {
  *
  *   args.pipeline_name  → the target whose `pipeline` matches EXACTLY, else a
  *                         pipeline_not_registered refusal.
- *   args.project        → the target owning that ci/build/deploy project, else a
- *                         project_not_registered refusal.
+ *   args.project        → READ TOOLS ONLY (requirePipelineName false): the
+ *                         target owning that ci/build/deploy project, else a
+ *                         project_not_registered refusal. Skipped entirely when
+ *                         requirePipelineName is true (TEAM-4348) — start_deploy
+ *                         does not take a project, and honouring one here would
+ *                         let it substitute for the pipeline_name this tool
+ *                         refuses to guess.
  *   neither             → the only target, if there is only one (the
  *                         single-pipeline shape). With more than one:
  *                         requirePipelineName → pipeline_name_required refusal;
@@ -408,22 +428,28 @@ async function resolveTarget(args = {}, { requirePipelineName = false } = {}) {
     return { target, targets, refusal: null };
   }
 
-  const requestedProject = String(args.project ?? "").trim();
-  if (requestedProject) {
-    const target = targetForProject(targets, requestedProject);
-    if (!target) {
-      return {
-        target: null,
-        targets,
-        refusal: {
-          ok: false,
-          reason: "project_not_registered",
-          requested: requestedProject,
-          known: targets.flatMap(projectsOf),
-        },
-      };
+  // TEAM-4348: args.project only resolves a target for the READ tools. A WRITE
+  // tool (start_deploy, requirePipelineName:true) does not accept a project at
+  // all, so this branch is skipped for it rather than letting project stand in
+  // for the pipeline_name check below.
+  if (!requirePipelineName) {
+    const requestedProject = String(args.project ?? "").trim();
+    if (requestedProject) {
+      const target = targetForProject(targets, requestedProject);
+      if (!target) {
+        return {
+          target: null,
+          targets,
+          refusal: {
+            ok: false,
+            reason: "project_not_registered",
+            requested: requestedProject,
+            known: targets.flatMap(projectsOf),
+          },
+        };
+      }
+      return { target, targets, refusal: null };
     }
-    return { target, targets, refusal: null };
   }
 
   if (targets.length === 1) return { target: targets[0], targets, refusal: null };
@@ -492,7 +518,7 @@ export const handler = async (event) => {
       case "get_build_log":
         return await onTarget(args, {}, (t, all) => getBuildLog(args, t, all));
       case "get_build_status":
-        return await onTarget(args, {}, (t) => getBuildStatus(args, t));
+        return await onTarget(args, {}, (t, all) => getBuildStatus(args, t, all));
       case "start_ci_build":
         return await onTarget(args, {}, (t, all) => startCiBuild(args, t, all));
       case "capabilities":
@@ -704,6 +730,9 @@ async function getState(args = {}, target) {
 // With more than one target this REFUSES without pipeline_name
 // (pipeline_name_required) rather than defaulting: deploying the wrong repo is
 // not a recoverable mistake, and the env default is the hub itself.
+// start_deploy takes no `project` argument, and (TEAM-4348) resolveTarget skips
+// the args.project branch for this call entirely — an args.project cannot
+// substitute for pipeline_name here, it is simply ignored.
 async function startDeploy(args = {}, target) {
   const name = target.pipeline;
   const { cp } = clientsFor(target.region);
@@ -733,22 +762,48 @@ async function startDeploy(args = {}, target) {
 // (from get_state's actionDetails.externalExecutionId) or falls back to the
 // project's most recent build.
 //
-// Project resolution, in order: an explicit args.project (already validated
-// against the allow-list by resolveTarget) → the project named INSIDE build_id
-// (CodeBuild ids are literally "<projectName>:<uuid>") → the resolved target's
-// build project → env BUILD_PROJECT. The build_id step matters because
-// get_state's actionDetails.externalExecutionId is the only handle an agent has
-// after a failure, and it already carries the project — so a cross-region build
-// log works without the caller knowing which target owns it.
+// Project resolution, in order: an explicit args.project → the project named
+// INSIDE build_id (CodeBuild ids are literally "<projectName>:<uuid>") → the
+// resolved target's build project → env BUILD_PROJECT. The build_id step
+// matters because get_state's actionDetails.externalExecutionId is the only
+// handle an agent has after a failure, and it already carries the project — so
+// a cross-region build log works without the caller knowing which target owns
+// it.
+//
+// TEAM-4348: args.project is NOT pre-validated by resolveTarget for this tool
+// (a build_id's project bypasses resolveTarget entirely — it never sees args.
+// build_id), so BOTH names are checked here, before any client is constructed:
+//   - if args.project and the build_id's project disagree, refuse
+//     project_mismatch rather than silently picking one (the caller would get a
+//     DIFFERENT build's log than it thinks it asked for);
+//   - whatever project we land on must be a REGISTERED one — project_not_
+//     registered otherwise. This closes the gap where an unregistered
+//     build_id project used to fall back to the resolved target and still run
+//     BatchGetBuilds + GetLogEvents, in that target's region.
 async function getBuildLog(args = {}, target, targets = []) {
-  const project =
-    String(args.project ?? "").trim() ||
-    parseBuildIdProject(args.build_id) ||
-    target.buildProject ||
-    BUILD_PROJECT;
-  // Region follows whoever owns that project, not the (possibly unrelated)
-  // target we resolved from the args.
-  const owner = targetForProject(targets, project) || target;
+  const explicit = String(args.project ?? "").trim();
+  const fromId = parseBuildIdProject(args.build_id);
+  if (explicit && fromId && explicit !== fromId) {
+    return jsonResult({
+      ok: false,
+      reason: "project_mismatch",
+      requested: explicit,
+      buildIdProject: fromId,
+    });
+  }
+  const project = explicit || fromId || target.buildProject || BUILD_PROJECT;
+  // Region follows whoever owns that project — never the `|| target` fallback:
+  // an unregistered project must be refused, not silently read in whichever
+  // region the (possibly unrelated) resolved target happens to sit in.
+  const owner = targetForProject(targets, project);
+  if (!owner) {
+    return jsonResult({
+      ok: false,
+      reason: "project_not_registered",
+      requested: project,
+      known: targets.flatMap(projectsOf),
+    });
+  }
   const { cb, logs } = clientsFor(owner.region);
   let buildId = args.build_id;
 
@@ -822,9 +877,27 @@ async function getBuildLog(args = {}, target, targets = []) {
 // builds of the project and returns each with its resolvedSourceVersion (the real
 // git commit CodeBuild built — sourceVersion may be a pr/<id> ref). If commit_sha
 // is given, also returns the matching build + a boolean succeededForCommit.
-async function getBuildStatus(args = {}, target) {
+//
+// TEAM-4348: when args.pipeline_name is also passed, resolveTarget resolves on
+// the PIPELINE and never validates args.project against the allow-list (the
+// project branch only runs when pipeline_name is absent) — the sibling of the
+// get_build_log gap. So the project this function lands on is allow-listed
+// here too, and the region used is that project's OWNER, not the
+// pipeline_name-resolved target: scanning the wrong region silently returns
+// "no builds", which a merge gate reads as "CI never ran" rather than as an
+// error.
+async function getBuildStatus(args = {}, target, targets = []) {
   const project = String(args.project ?? "").trim() || target.ciProject || CI_PROJECT;
-  const { cb } = clientsFor(target.region);
+  const owner = targetForProject(targets, project);
+  if (!owner) {
+    return jsonResult({
+      ok: false,
+      reason: "project_not_registered",
+      requested: project,
+      known: targets.flatMap(projectsOf),
+    });
+  }
+  const { cb } = clientsFor(owner.region);
   const commit = (args.commit_sha || "").trim();
   // Clamp scan to an integer in [1, 50]. A negative value would turn
   // ids.slice(0, n) into a from-end slice (silently dropping the NEWEST builds)
@@ -839,7 +912,7 @@ async function getBuildStatus(args = {}, target) {
   );
   const ids = (list.ids || []).slice(0, scan);
   if (ids.length === 0) {
-    return jsonResult({ project, region: target.region, builds: [], match: null });
+    return jsonResult({ project, region: owner.region, builds: [], match: null });
   }
 
   const { builds } = await cb.send(new BatchGetBuildsCommand({ ids }));
@@ -865,7 +938,7 @@ async function getBuildStatus(args = {}, target) {
 
   return jsonResult({
     project,
-    region: target.region,
+    region: owner.region,
     requestedCommit: commit || null,
     match,
     succeededForCommit: !!(match && match.buildStatus === "SUCCEEDED"),
@@ -911,7 +984,16 @@ async function startCiBuild(args = {}, target, targets = []) {
       detail: check.reason,
     });
   }
-  const { cb } = clientsFor(target.region);
+  // TEAM-4348: region follows the project's OWNER, not the (possibly
+  // unrelated) target pipeline_name resolved — a pipeline_name naming one repo
+  // plus a ciProject belonging to another used to send the dedupe scan and
+  // StartBuild to a region where the project does not exist. The `|| target`
+  // fallback is safe HERE and only here: `project` is already constrained to
+  // knownCiProjects and re-validated above, so it can never be an unregistered
+  // name reaching AWS (contrast get_build_log/get_build_status, which refuse
+  // instead of falling back).
+  const owner = targetForProject(targets, project) || target;
+  const { cb } = clientsFor(owner.region);
 
   const rawSha = String(args.commit_sha ?? "").trim();
   if (!rawSha) {
@@ -961,6 +1043,7 @@ async function startCiBuild(args = {}, target, targets = []) {
       buildStatus: existing.buildStatus,
       resolvedSourceVersion: existing.resolvedSourceVersion || null,
       project,
+      region: owner.region,
     });
   }
 
@@ -1016,6 +1099,7 @@ async function startCiBuild(args = {}, target, targets = []) {
     buildId: build.id || null,
     arn: build.arn || null,
     project,
+    region: owner.region,
     sourceVersion,
     // Null on a fresh start (CodeBuild has not resolved the ref yet) — poll
     // get_build_status to prove the build belongs to this commit.
