@@ -32,10 +32,15 @@ const HISTORY_MAX_WIDTH = 640; // hard cap; also capped at half the viewport
 const HISTORY_KEY_STEP = 16;
 const HISTORY_WIDTH_KEY = "workflow-history-width";
 
-/** Hard cap, never wider than half the viewport. SSR-safe. */
+/**
+ * Hard cap, never wider than half the viewport - but never below the minimum:
+ * under 480px of viewport half the viewport is < HISTORY_MIN_WIDTH, and letting
+ * that win would clamp the sidebar under its own floor and render the handle with
+ * aria-valuemax < aria-valuemin. SSR-safe.
+ */
 function historyMaxWidth(): number {
   if (typeof window === "undefined") return HISTORY_MAX_WIDTH;
-  return Math.min(HISTORY_MAX_WIDTH, Math.floor(window.innerWidth / 2));
+  return Math.max(HISTORY_MIN_WIDTH, Math.min(HISTORY_MAX_WIDTH, Math.floor(window.innerWidth / 2)));
 }
 
 function clampHistoryWidth(value: number, max: number): number {
@@ -118,14 +123,23 @@ export default function WorkflowPage() {
   const persistHistoryWidth = (w: number) => localStorage.setItem(HISTORY_WIDTH_KEY, String(w));
 
   const handleResizeStart = (e: React.PointerEvent<HTMLDivElement>) => {
+    // Refuse re-entry and non-primary input: a second pointerdown mid-drag (second
+    // finger, pen+touch, non-primary button) would re-snapshot the *already mutated*
+    // body styles - the restore then leaks col-resize / user-select:none permanently
+    // - and would clobber startWidth, defeating the persist-on-drop diff check.
+    if (dragRef.current || !e.isPrimary || e.button !== 0) return;
     const max = historyMaxWidth(); // read once per gesture, never inside pointermove
     setHistoryMax(max);
     dragRef.current = { startX: e.clientX, startWidth: historyWidth, max };
     e.currentTarget.setPointerCapture(e.pointerId);
-    bodyStyleRef.current = {
-      cursor: document.body.style.cursor,
-      userSelect: document.body.style.userSelect,
-    };
+    // Belt and braces: only snapshot when nothing is saved (restoreBodyStyles nulls
+    // it), so the saved values are always the pre-drag ones.
+    if (bodyStyleRef.current === null) {
+      bodyStyleRef.current = {
+        cursor: document.body.style.cursor,
+        userSelect: document.body.style.userSelect,
+      };
+    }
     document.body.style.cursor = 'col-resize';
     document.body.style.userSelect = 'none';
     setIsResizing(true);
@@ -134,7 +148,12 @@ export default function WorkflowPage() {
   const handleResizeMove = (e: React.PointerEvent<HTMLDivElement>) => {
     const drag = dragRef.current;
     if (!drag) return;
-    setHistoryWidth(clampHistoryWidth(drag.startWidth + (e.clientX - drag.startX), drag.max));
+    const next = clampHistoryWidth(drag.startWidth + (e.clientX - drag.startX), drag.max);
+    // Written synchronously: pointermove is continuous-priority in React 18, so the
+    // mirroring effect can still be queued when pointerup persists - it would then
+    // save the previous move's width.
+    widthRef.current = next;
+    setHistoryWidth(next);
   };
 
   const handleResizeEnd = (e: React.PointerEvent<HTMLDivElement>) => {
