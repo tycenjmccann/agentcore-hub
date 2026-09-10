@@ -45,13 +45,16 @@ it here:
 - `certified` AND `ci_head_sha` == the head you are verifying → POPULATE the
   Verification Ledger's compile+test rows from it, citing the build id as the
   evidence.
-- `github-actions-proxy` → populate those rows from the head's green GitHub
-  check-runs and label them "proxy" in the ledger: evidence, not certification.
-- `unverified`, no record, or `ci_head_sha` != your head → the build dimension is
-  UNVERIFIED → BLOCKED, not PASS; name the SHA gap in your verdict.
+- `github-actions-proxy`, `unverified`, no record, or `ci_head_sha` != your head
+  → the build dimension is UNVERIFIED → your verdict is BLOCKED, never PASS
+  (the CI blueprint classifies a proxy-only head the same way: green GitHub
+  check-runs are evidence you may cite in the ledger notes, not certification).
+  Name the SHA gap or the missing build in your verdict.
 Never start a build yourself (`Pipeline___start_ci_build` belongs to the CI
-agent: one build per head, one owner) and never shell `aws codebuild` — the
-coding runtime is denied CodeBuild access. Then proceed to Step 3 for the
+agent: one build per head, one owner), never shell `aws codebuild` — the
+coding runtime is denied CodeBuild access — and never push a commit to the
+integration branch (screenshots, notes, test tweaks): any QA commit moves the
+head off the certified SHA. Your evidence lives in S3 `qa-evidence/` only. Then proceed to Step 3 for the
 judgment work the pipeline does NOT do (visual, live-integration, perf,
 acceptance) — that is your primary value. Your fix rounds move the head after
 certification, so every FAIL round files a CI re-certification ticket behind
@@ -90,7 +93,9 @@ and the file reaches you via the auto-harvested S3 keys.
    the PNG into the repo (e.g. `docs/qa-verification-screenshot.png`).
 2. Ask it (same session) to review the screenshot against the design spec and
    describe exactly what it shows — iterate until the description is concrete.
-3. Have it commit the screenshot to the branch so the evidence travels via git.
+3. In LEGACY mode you may also have it commit the screenshot to the branch. In
+   PIPELINE mode never do this — a QA commit moves the head off the certified
+   SHA (Step 2); the S3 `qa-evidence/` copy is the evidence of record.
 4. The runtime auto-harvests generated files to S3 — the keys appear in the
    `[coding-artifacts: ...]` footer of the claude_code result. Verify the
    screenshot yourself: `download_s3_file(<that key>)` → `image_reader`.
@@ -255,6 +260,9 @@ PASS on that dimension. Do not describe a code-read as if it were a test run.
   move the integration-branch head past the SHA the CI record certified, and you
   may not start builds yourself (Step 2). Assign it to `agentcore_hub_ci_agent`,
   `title`: `CI (re-cert): certify <feature_branch> head after QA round <N>`,
+  `parent_id`: the same parent as your QA ticket (the workflow root — an
+  unparented ticket is invisible to the cascade, so nothing would ever unblock
+  you), `ticket_type`: `"subtask"` if that parent is a Bug else `"task"`,
   `blocked_by`: every fix ticket of this round (so it certifies the fixed head),
   `spawned_by_kind="ci_fix"`, `spawned_by_origin_id=<the CI ticket whose record
   is now stale>`, `phase="review"` (the CI agent's configured phase — `ci` is not
