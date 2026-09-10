@@ -98,7 +98,15 @@ phases:
       # from GH CI. This is the UI gate; the AWS-backed tab/api specs are not.
       - "PLAYWRIGHT_BASE_URL=http://localhost:3000 npm run test:cloud-code -- --trace retain-on-failure"
       # runtime-agent telemetry pytest (hermetic, no AWS)
+      # TEAM-4385: `set -eo pipefail` MUST be the first line. A CodeBuild command
+      # block exits with its LAST command's status -- here `deactivate`, which always
+      # returns 0 -- so a red pytest run left the BUILD phase SUCCEEDED (one run
+      # logged "2 failed, 377 passed" and still went green). Keep `deactivate` last;
+      # the `set -e` is what makes pytest's non-zero abort the block. `env: shell:
+      # bash` above already guarantees bash for `pipefail`. Deliberately NO `-u`:
+      # venv activate scripts read unset vars (PS1) and would abort on line 2.
       - |
+        set -eo pipefail
         python3 -m venv /tmp/pyci && . /tmp/pyci/bin/activate
         pip install -q -r deploy/runtime-agent/tests/requirements-test.txt
         pytest -q deploy/runtime-agent/tests \
