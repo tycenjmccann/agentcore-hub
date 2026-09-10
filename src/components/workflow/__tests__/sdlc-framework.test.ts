@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   resolveSdlcFramework,
+  sdlcBadgeFor,
   SDLC_BADGE_META,
 } from '@/lib/workflow/sdlc-framework';
 import type { WorkflowState } from '@/lib/workflow/types';
@@ -52,7 +53,6 @@ describe('SDLC framework helper (TEAM-3048)', () => {
 
   describe('SDLC_BADGE_META', () => {
     it('has the correct labels', () => {
-      expect(SDLC_BADGE_META.standard.label).toBe('STANDARD');
       expect(SDLC_BADGE_META.playbook.label).toBe('PLAYBOOK');
       expect(SDLC_BADGE_META.aidlc.label).toBe('AI-DLC');
     });
@@ -83,6 +83,24 @@ describe('SDLC framework helper (TEAM-3048)', () => {
     });
   });
 
+  // ─── sdlcBadgeFor — the render-gate helper ─────────────────────────────────
+
+  describe('sdlcBadgeFor', () => {
+    // "standard" is the absence of an overlay, not a framework — the badge
+    // must not render for it in either the board header or the list row.
+    it('returns null for "standard"', () => {
+      expect(sdlcBadgeFor('standard')).toBeNull();
+    });
+
+    it('returns the playbook meta for "playbook"', () => {
+      expect(sdlcBadgeFor('playbook')).toBe(SDLC_BADGE_META.playbook);
+    });
+
+    it('returns the aidlc meta for "aidlc"', () => {
+      expect(sdlcBadgeFor('aidlc')).toBe(SDLC_BADGE_META.aidlc);
+    });
+  });
+
   // ─── Type-level fixture — both shapes compile ──────────────────────────────
 
   describe('WorkflowState fixture compatibility', () => {
@@ -106,19 +124,19 @@ describe('SDLC framework helper (TEAM-3048)', () => {
     it('a state with sdlcFramework: "aidlc" compiles and yields the AI-DLC label', () => {
       const withField: WorkflowState = { ...base, sdlcFramework: 'aidlc' };
       const fw = resolveSdlcFramework(withField.sdlcFramework ?? withField.input?.sdlcFramework);
-      expect(SDLC_BADGE_META[fw].label).toBe('AI-DLC');
+      expect(sdlcBadgeFor(fw)?.label).toBe('AI-DLC');
     });
 
-    it('a state without the field compiles and defaults to the STANDARD label', () => {
+    it('a state without the field compiles and defaults to standard — no badge', () => {
       const withoutField: WorkflowState = { ...base };
       const fw = resolveSdlcFramework(withoutField.sdlcFramework ?? withoutField.input?.sdlcFramework);
-      expect(SDLC_BADGE_META[fw].label).toBe('STANDARD');
+      expect(sdlcBadgeFor(fw)).toBeNull();
     });
 
     it('a state with sdlcFramework: "playbook" yields the PLAYBOOK label', () => {
       const playbook: WorkflowState = { ...base, sdlcFramework: 'playbook' };
       const fw = resolveSdlcFramework(playbook.sdlcFramework ?? playbook.input?.sdlcFramework);
-      expect(SDLC_BADGE_META[fw].label).toBe('PLAYBOOK');
+      expect(sdlcBadgeFor(fw)?.label).toBe('PLAYBOOK');
     });
   });
 });
