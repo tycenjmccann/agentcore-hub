@@ -13,6 +13,14 @@ So there are exactly three things worth pinning down here:
      the attributes the evaluator matches on. This is an assertion about the
      installed Strands version, and it is meant to break loudly on upgrade if
      the span shape changes.
+
+     That fired for real: 1.55.1 relocated the system prompt from a
+     ``system_prompt`` span attribute (a ``**kwargs`` passthrough accident) to
+     the semconv ``gen_ai.system.message`` event. The prompt assertion is
+     therefore version-aware — it pins the exact text on whichever carrier the
+     installed version contracts to use — and the SDK is minor-ceilinged in
+     ``requirements-test.txt`` so the next such move is a reviewed edit, not an
+     overnight red. See ``docs/evidence/TEAM-4355/system-prompt-span-contract.md``.
   2. That ``_init_telemetry()`` makes the correct decision in all three states
      it can find the process in: a real provider already installed by
      auto-instrumentation, no provider with observability enabled, and no
@@ -34,6 +42,8 @@ import ast
 import asyncio
 import logging
 import os
+import re
+from importlib.metadata import version as _installed_version
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, AsyncGenerator
@@ -50,6 +60,24 @@ from strands.hooks import HookProvider
 from strands.models.model import Model
 
 MAIN_PY = Path(__file__).resolve().parent.parent / "main.py"
+
+
+def _strands_version() -> tuple[int, int, int]:
+    """(major, minor, patch) of the INSTALLED strands-agents.
+
+    ``strands`` exposes no ``__version__``, so this reads the distribution
+    metadata. The regex tolerates suffixes (``1.55.1rc1`` -> ``(1, 55, 1)``).
+    """
+    raw = _installed_version("strands-agents")
+    m = re.match(r"(\d+)\.(\d+)\.(\d+)", raw)
+    assert m, f"unparseable strands-agents version: {raw!r}"
+    return int(m[1]), int(m[2]), int(m[3])
+
+
+# 1.55.1 moved the system prompt off the span attribute it had only ever
+# occupied by **kwargs accident and onto the OTel-GenAI carrier. See
+# docs/evidence/TEAM-4355/system-prompt-span-contract.md.
+SYSTEM_PROMPT_EVENT_SINCE = (1, 55, 1)
 
 
 # ─── Test doubles ────────────────────────────────────────────────────────────
@@ -189,9 +217,6 @@ async def test_stream_async_emits_invoke_agent_span(span_exporter: InMemorySpanE
     assert attrs["gen_ai.agent.name"] == "test_agent"
     assert attrs["gen_ai.system"] == "strands-agents"
     assert attrs["gen_ai.request.model"] == "mock-model"
-    # Passed through as a **kwarg by _start_agent_trace_span, so it lands as a
-    # plain span attribute rather than a gen_ai.* one.
-    assert attrs["system_prompt"] == "You are a test agent."
 
     # Under the default (legacy) GenAI conventions the message content rides on
     # span events. The evaluator reads the prompt and the response from these.
@@ -199,6 +224,25 @@ async def test_stream_async_emits_invoke_agent_span(span_exporter: InMemorySpanE
     assert "gen_ai.user.message" in events_by_name, f"span events: {list(events_by_name)}"
     assert "content" in events_by_name["gen_ai.user.message"]
     assert "hello" in events_by_name["gen_ai.user.message"]["content"]
+
+    # The system prompt is a real telemetry contract; WHERE it rides is not.
+    # Through 1.55.0 it arrived as a plain `system_prompt` span attribute, purely
+    # because Agent._start_agent_trace_span passed it as a **kwarg and
+    # Tracer.start_agent_span copied unknown scalar kwargs onto the span. 1.55.1
+    # made system_prompt/system_prompt_content explicit parameters, so they no
+    # longer land in **kwargs, and the prompt moved to the semconv carrier: a
+    # `gen_ai.system.message` event under the default (legacy) conventions, or the
+    # `gen_ai.system_instructions` attribute under use_latest_genai_conventions.
+    # A relocation, not a regression. Assert the contract on exactly the carrier
+    # the INSTALLED version is contracted to use — one branch runs, both are exact,
+    # so the test still fails loudly if the prompt leaves telemetry altogether.
+    if _strands_version() < SYSTEM_PROMPT_EVENT_SINCE:
+        assert attrs["system_prompt"] == "You are a test agent."
+    else:
+        assert "gen_ai.system.message" in events_by_name, f"span events: {list(events_by_name)}"
+        assert "content" in events_by_name["gen_ai.system.message"]
+        assert "You are a test agent." in events_by_name["gen_ai.system.message"]["content"]
+
     assert "gen_ai.choice" in events_by_name, f"span events: {list(events_by_name)}"
     assert "message" in events_by_name["gen_ai.choice"]
     assert "hello back" in events_by_name["gen_ai.choice"]["message"]

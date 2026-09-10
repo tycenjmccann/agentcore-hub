@@ -3,7 +3,20 @@
 # whatever the ecosystem publishes that minute": fleet v41 (2026-09-09) pulled a
 # fresh mcp 2.x major and every persona died at import. A ceiling turns a major
 # bump into a deliberate, reviewed edit here (plus the Dockerfile import asserts).
-strands-agents>=1.53.0,<2
+# strands-agents is tighter than <next-major - see its note.
+#
+# <1.55: a minor SDK bump can move SPAN shape, and the fleet image is rebuilt from
+# scratch, so an unbounded minor is an unreviewed telemetry change in prod. 1.55.1
+# relocated the system prompt from a plain `system_prompt` span attribute to the
+# semconv `gen_ai.system.message` event (`gen_ai.system_instructions` under latest
+# conventions). To be precise about what that is and is not: it is a RELOCATION,
+# not a drop - the prompt is still exported, and nothing in this repo ever read the
+# old attribute (eval-packager reads gen_ai.evaluation.* / gen_ai.response.id /
+# session.id only). Kept in lockstep with tests/requirements-test.txt so prod and
+# CI resolve the same minor. Lifting to 1.55.x is a deliberate, test-verified edit,
+# and the test is already ready for it (TEAM-4355;
+# docs/evidence/TEAM-4355/system-prompt-span-contract.md).
+strands-agents>=1.53.0,<1.55
 bedrock-agentcore>=1.0.0,<2
 strands-agents-tools>=0.2.0,<1
 boto3>=1.43.0,<2
