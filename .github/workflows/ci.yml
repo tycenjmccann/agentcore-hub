@@ -193,17 +193,23 @@ jobs:
       # --trace retain-on-failure overrides the config's on-first-retry: this job
       # runs no retries, so on-first-retry would never capture a trace on a
       # first-attempt failure — the artifact upload below would have nothing.
-      - name: Cloud Code UI regression suite
+      #
+      # TEAM-4353: the workflow sidebar resize + scrollbar suite (TEAM-4332) used to
+      # be a SECOND step here, invoking `npx playwright test tests/...` directly. It
+      # is now folded into the `test:cloud-code` script itself, because
+      # deploy/pipeline/buildspec-ci.yml is the AUTHORITATIVE required check and it
+      # runs that npm script and nothing else — so a gate added only here ran ZERO
+      # times in CodeBuild, and a resize/scrollbar regression could merge on a green
+      # check. One npm script means one place to add the next hermetic UI spec, and
+      # both surfaces pick it up. Do NOT re-add a separate step; extend the script.
+      #
+      # Both specs are hermetic (every /api/** call is page.route-mocked, no AWS
+      # credentials) and share the `next start` above. The launch option that makes
+      # the 6px scrollbar gutter measurable (ignoreDefaultArgs: --hide-scrollbars) is
+      # a file-level test.use in the resize spec, so it needs nothing here; it only
+      # puts that file in its own Playwright worker group.
+      - name: Hermetic UI suites (Cloud Code + workflow sidebar resize/scrollbar)
         run: npm run test:cloud-code -- --trace retain-on-failure
-        env:
-          PLAYWRIGHT_BASE_URL: http://localhost:3737
-
-      # Hermetic (every /api/** call is intercepted in the spec), so it needs no
-      # AWS credentials and reuses the next start already listening on 3737.
-      # The launch option that makes the 6px scrollbar gutter measurable
-      # (ignoreDefaultArgs: --hide-scrollbars) lives in the spec, not here.
-      - name: Workflow sidebar resize + scrollbar suite
-        run: npx playwright test tests/tab-workflow-resize.spec.ts --trace retain-on-failure
         env:
           PLAYWRIGHT_BASE_URL: http://localhost:3737
 

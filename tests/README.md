@@ -5,13 +5,24 @@ no AWS). Tiers 2–3 are opt-in against a deployed environment.
 
 ## Tier 1 — merge gate (hermetic, no credentials)
 
-Runs in `.github/workflows/ci.yml` on every push/PR. Nothing here touches AWS.
+Runs on every push/PR in BOTH CI surfaces, and nothing here touches AWS:
+`.github/workflows/ci.yml` (GitHub Actions) and `deploy/pipeline/buildspec-ci.yml`
+(CodeBuild `agentcore-hub-ci` — the *authoritative* required check branch protection
+blocks merge on). A gate wired into only one of the two is not a gate: TEAM-4332's
+resize suite was GH-only and CodeBuild ran zero of it (TEAM-4353). That is why every
+hermetic UI spec is reached through the single `test:cloud-code` script below — add
+new ones there, in `package.json`, never as a new CI step.
 
 | Command | What it covers |
 |---------|----------------|
 | `npm run test:unit` | Vitest. Pure logic that's easy to break and expensive to break in prod: tenant S3-key layout + `..` traversal guard, GitHub HMAC state round-trip (SSO emails carry `.`, the token delimiter) + purpose separation, SSE frame plumbing, the `mutateSession` optimistic-concurrency CAS (`/stop` vs `/message` write race). |
-| `npm run test:cloud-code` | Playwright with every backend call intercepted via `page.route`. Composer mic ⇄ send ⇄ stop state machine, Artifacts gallery + empty state + upload affordance, GitHub App connect/disconnect section, pull-to-laptop command copy. Needs a running server (CI boots `next start`; locally set `PLAYWRIGHT_BASE_URL`). |
-| `npx playwright test tests/tab-workflow-resize.spec.ts` | Playwright, workflow list fixtured via `page.route` (see `tests/helpers/workflow-resize.ts`). Workflows-sidebar drag/dblclick/collapse persistence, both `clampHistoryWidth` bounds by drag **and** keyboard (±16px, 240 floor, 640 / viewport-half ceiling), truncation reveal at 288 vs 640 with no horizontal overflow, the TEAM-4331 drag lifecycle (`pointercancel`, `lostpointercapture` with no `pointerup`, viewport resize writing nothing), and the TEAM-4330 scrollbar paint — the reserved gutter must be **6px**, not the 10px `scrollbar-width: thin` path, plus a pixel decode of the gutter strip. Suppresses Playwright's default `--hide-scrollbars` in-spec, so the gutter is measurable. Needs a running server. |
+| `npm run test:cloud-code` | Playwright, every backend call intercepted via `page.route` — the single entrypoint for hermetic UI specs, run by both CI surfaces. `tests/cloud-code-ui.spec.ts`: composer mic ⇄ send ⇄ stop, Artifacts gallery/empty state, GitHub App connect/disconnect, pull-to-laptop copy. `tests/tab-workflow-resize.spec.ts`: workflows-sidebar drag/keyboard resize + clamp bounds, drag lifecycle, and the dark-scrollbar paint. Needs a running server (CI boots `next start`; locally set `PLAYWRIGHT_BASE_URL`). |
+
+Both spec files above run in one `playwright test` invocation, pinned to
+`--workers=1` — see the comment on the script in `package.json` (TEAM-4353) for why.
+The resize spec's bound/clamp values, its 6px-vs-10px scrollbar gutter discriminator,
+and the TEAM-4331 drag-lifecycle cases are documented in the spec's own file comments
+and in `docs/evidence/TEAM-4332/`; not repeated here to keep this table scannable.
 
 Run the UI suite locally:
 
