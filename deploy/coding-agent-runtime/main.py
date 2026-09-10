@@ -148,12 +148,19 @@ TURN_STALE_S = _safe_int_env("TURN_STALE_S", 120)
 #   15*4 = the terminal-write retry loop in _run_turn_async (15 tries x 4s sleep)
 #   +30  = the post-loop proc.wait(timeout=30) reap inside the stream generators
 #   +TURN_STALE_S = the bar a poll uses to call a silent journal dead
-# A runner still alive past turn_timeout_s + this has provably escaped its own
-# watchdog, so beating "running" is a lie — the 2026-09-09 incident heartbeated
-# `running` for 2h20m because nothing bounded this thread. Sized to stay well
-# under the fleet's post-cap headroom (REMOTE_CODING_TURN_BUDGET_S - 1500 =
-# 1200s in deploy/runtime-agent/main.py) so the runtime's own verdict always
-# reaches the poller before the poller gives up on the budget.
+# A runner whose CLI is still UN-EXITED past turn_timeout_s + this has provably
+# escaped its own watchdog, so beating "running" is a lie — the 2026-09-09
+# incident heartbeated `running` for 2h20m because nothing bounded this thread.
+# Sized to stay well under the fleet's post-cap headroom
+# (REMOTE_CODING_TURN_BUDGET_S - 1500 = 1200s in deploy/runtime-agent/main.py) so
+# the runtime's own verdict always reaches the poller before the poller gives up
+# on the budget.
+# Note what is deliberately NOT in the derivation: _sync_turn_artifacts, which
+# every stream generator runs AFTER the CLI exits and which is unbounded (a git
+# probe per untracked candidate, up to 200 files / 2 GiB uploaded). Rather than
+# widen the grace to guess at that, the bound is gated on the `cli_exited` signal
+# the generators set at their proc.wait — an exited CLI's real result must never
+# be replaced by a forced timeout (TEAM-4379).
 _TURN_TERMINAL_GRACE_S = 15 * 4 + 30 + TURN_STALE_S
 
 # Per-user coding-CLI config bundle (MCP servers, skills, custom agents, prefs).
@@ -2059,7 +2066,8 @@ def _killpg_on_timeout(proc, cli: str) -> None:
 def _stream_claude(prompt: str, workdir: str, claude_session_id: str | None, repo: str | None = None,
                    session_id: str | None = None, tenant_id: str | None = None,
                    model: str | None = None, turn_timeout_s: int = TURN_TIMEOUT_S,
-                   permission_mode: str | None = None):
+                   permission_mode: str | None = None,
+                   cli_exited: threading.Event | None = None):
     """Generator yielding SSE lines for a Claude turn as it runs.
 
     Parses claude stream-json line-by-line: assistant text deltas → 'text'
@@ -2130,6 +2138,13 @@ def _stream_claude(prompt: str, workdir: str, claude_session_id: str | None, rep
                 if obj.get("session_id"):
                     new_session_id = obj["session_id"]
         proc.wait(timeout=30)
+        if cli_exited is not None:
+            # The CLI is reaped INSIDE its cap. Everything below — the artifact
+            # harvest above all, which is unbounded — is our own terminal work,
+            # so _run_turn_async's bound must stand down (TEAM-4379). Set here,
+            # not in the `finally`: that also runs on the except path, where the
+            # process may still be alive and the generator returns at once anyway.
+            cli_exited.set()
     except Exception as exc:  # noqa: BLE001
         yield sse({"type": "error", "error": str(exc)[:600]})
         return
@@ -2254,7 +2269,8 @@ def _run_codex(prompt: str, workdir: str, codex_session_id: str | None,
 
 def _stream_codex(prompt: str, workdir: str, codex_session_id: str | None,
                   repo: str | None = None, session_id: str | None = None,
-                  tenant_id: str | None = None, turn_timeout_s: int = TURN_TIMEOUT_S):
+                  tenant_id: str | None = None, turn_timeout_s: int = TURN_TIMEOUT_S,
+                  cli_exited: threading.Event | None = None):
     """Generator yielding SSE lines for a Codex turn as it runs.
 
     codex exec --json emits per-STEP JSONL (not token deltas): thread.started,
@@ -2346,6 +2362,8 @@ def _stream_codex(prompt: str, workdir: str, codex_session_id: str | None,
                 if note:
                     yield sse({"type": "text", "text": f"\n_{note[:300]}_\n"})
         proc.wait(timeout=30)
+        if cli_exited is not None:
+            cli_exited.set()  # see _stream_claude: signal the reap before the harvest
     except Exception as exc:  # noqa: BLE001
         yield sse({"type": "error", "error": str(exc)[:600]})
         return
@@ -2433,7 +2451,8 @@ def _run_kiro(prompt: str, workdir: str, kiro_session_id: str | None,
 
 def _stream_kiro(prompt: str, workdir: str, kiro_session_id: str | None,
                  repo: str | None = None, session_id: str | None = None,
-                 tenant_id: str | None = None, turn_timeout_s: int = TURN_TIMEOUT_S):
+                 tenant_id: str | None = None, turn_timeout_s: int = TURN_TIMEOUT_S,
+                 cli_exited: threading.Event | None = None):
     """Generator yielding SSE lines for a Kiro turn as it runs.
 
     Kiro chat has no JSON event stream — it prints the reply to stdout as it
@@ -2468,6 +2487,8 @@ def _stream_kiro(prompt: str, workdir: str, kiro_session_id: str | None,
             full_text.append(clean)
             yield sse({"type": "text", "text": clean})
         proc.wait(timeout=30)
+        if cli_exited is not None:
+            cli_exited.set()  # see _stream_claude: signal the reap before the harvest
     except Exception as exc:  # noqa: BLE001
         yield sse({"type": "error", "error": str(exc)[:600]})
         return
@@ -2606,12 +2627,18 @@ def _run_turn_async(turn_id: str, journal: str, cli: str, prompt: str, workdir: 
     # caller has already been told this turn timed out, so a late real result
     # must not be published over it.
     forced = threading.Event()
+    # Set by the stream runner the moment its CLI process is reaped (TEAM-4379).
+    # Everything it does after that — above all _sync_turn_artifacts, whose cost
+    # _TURN_TERMINAL_GRACE_S does NOT budget for — is our own terminal work, not
+    # a wedged read, and must not be mistaken for a timeout.
+    cli_exited = threading.Event()
 
     def _force_timeout_record():
         """Terminal record for a runner that outlived turn_timeout_s + grace.
 
         The generators' own watchdog should have produced a done frame long
-        before this; reaching here means the CLI escaped it (TEAM-4359). Same
+        before this; reaching here means the CLI escaped it AND never exited
+        (TEAM-4359, narrowed by TEAM-4379 — see the `cli_exited` gate). Same
         keys as the normal `done` record below so _poll_turn can return it
         verbatim. Called under journal_lock with `finished` still clear."""
         err = f"{cli} timed out after {turn_timeout_s}s"
@@ -2641,7 +2668,17 @@ def _run_turn_async(turn_id: str, journal: str, cli: str, prompt: str, workdir: 
                 # Bound the beat to the turn's own cap. Without this the journal
                 # never goes stale, so _poll_turn never says dead and no terminal
                 # record is ever written — the 2h20m `running` incident.
-                if time.time() - beat["started_at"] > turn_timeout_s + _TURN_TERMINAL_GRACE_S:
+                # Only while the CLI is still UN-EXITED, though (TEAM-4379): that
+                # is the incident shape (a grandchild holding stdout, so
+                # `for line in proc.stdout` never returns). Once the CLI is reaped
+                # the runner is doing real terminal work the grace does not budget
+                # for — _sync_turn_artifacts forks a git probe per untracked
+                # candidate and uploads up to 200 files / 2 GiB — so forcing here
+                # would throw away a result the CLI produced INSIDE its cap. Keep
+                # beating `running` (that is the truth) and let the fleet's turn
+                # budget be the outer bound.
+                if (time.time() - beat["started_at"] > turn_timeout_s + _TURN_TERMINAL_GRACE_S
+                        and not cli_exited.is_set()):
                     _force_timeout_record()
                     return
                 beat["heartbeat"] = int(time.time())
@@ -2655,14 +2692,14 @@ def _run_turn_async(turn_id: str, journal: str, cli: str, prompt: str, workdir: 
     try:
         if cli == "codex":
             gen = _stream_codex(prompt, workdir, claude_session_id, repo, session_id, tenant_id,
-                                turn_timeout_s)
+                                turn_timeout_s, cli_exited=cli_exited)
         elif cli == "kiro":
             gen = _stream_kiro(prompt, workdir, claude_session_id, repo, session_id, tenant_id,
-                               turn_timeout_s)
+                               turn_timeout_s, cli_exited=cli_exited)
         else:
             gen = _stream_claude(prompt, workdir, claude_session_id, repo,
                                  session_id, tenant_id, model, turn_timeout_s,
-                                 permission_mode=permission_mode)
+                                 permission_mode=permission_mode, cli_exited=cli_exited)
         for line in gen:
             if not line.startswith("data:"):
                 continue
