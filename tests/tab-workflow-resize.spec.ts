@@ -184,21 +184,26 @@ test.describe("A: scrollbar actually paints at 6px (TEAM-4330)", () => {
         `| scrollbarWidth=${JSON.stringify(m.scrollbarWidth)} scrollbarColor=${JSON.stringify(m.scrollbarColor)}`
     );
 
+    // expect.soft throughout: these are four INDEPENDENT measurements of the
+    // same fact, and a hard expect on the first one aborts the test so the rest
+    // never report. When this regresses, the failure should name every channel
+    // that moved, not just the gutter.
+    //
     // THE assertion. 10 -> 6 is exactly the broken -> fixed flip; under the
     // TEAM-4330 mutation this line reads "expected 6, received 10".
-    expect(m.gutter).toBe(6);
+    expect.soft(m.gutter).toBe(6);
     // The un-fixed thin path, measured live in the same page and the same run.
-    expect(thinGutter).toBe(10);
+    expect.soft(thinGutter).toBe(10);
     // Ordering rather than a hard pin: native is a platform metric.
-    expect(native).toBeGreaterThan(thinGutter);
+    expect.soft(native).toBeGreaterThan(thinGutter);
     // Stated directly: in the broken state the app container and the thin path
     // COLLAPSE to the same 10px, because the webkit width is dead code.
-    expect(m.gutter).not.toBe(thinGutter);
+    expect.soft(m.gutter).not.toBe(thinGutter);
 
     // Both computed channels, kept ALONGSIDE the gutter rather than instead of
     // it. Broken state: "thin" and "rgb(42, 42, 58) rgba(0, 0, 0, 0)".
-    expect(m.scrollbarWidth).toBe("auto");
-    expect(m.scrollbarColor).toBe("auto");
+    expect.soft(m.scrollbarWidth).toBe("auto");
+    expect.soft(m.scrollbarColor).toBe("auto");
   });
 
   test("A2: webkit pseudo-element geometry and thumb token are declared as specified", async ({
@@ -252,15 +257,24 @@ test.describe("A: scrollbar actually paints at 6px (TEAM-4330)", () => {
       el.scrollTop = 0;
     });
     await page.waitForTimeout(200);
-    expect(await gutterOf(list)).toBe(6);
+
+    // Clip the ACTUAL reserved gutter, and assert its width softly. A hard
+    // expect here would abort the test before a single pixel was examined,
+    // which would make A4 add nothing over A1 in exactly the regression it
+    // exists to catch. Clipping the measured width also means the strip is the
+    // real scrollbar in both states, so the raster channels below are compared
+    // like for like rather than sampling 6px of a 10px scrollbar.
+    const gutter = await gutterOf(list);
+    expect.soft(gutter).toBe(6);
 
     // Screenshot -> base64 data URL -> Image -> canvas -> getImageData, all
     // in-page. No PNG decoder and no new dependency.
     const s = await analyseGutterStrip(page, list, {
-      gutterPx: 6,
+      gutterPx: gutter,
       thumb: TOKENS.dark.thumb,
       background: TOKENS.dark.surface1,
       edgeRows: 4,
+      savePath: `${SCREENSHOT_DIR}/A4-gutter-strip-dark.png`,
     });
     console.log(`[A4] dark strip ${JSON.stringify(s.dims)} palette=${JSON.stringify(s.palette)}`);
     console.log(
@@ -268,18 +282,27 @@ test.describe("A: scrollbar actually paints at 6px (TEAM-4330)", () => {
         `topRowsHaveThumb=${s.topRowsHaveThumb} bottomRowsAllBackground=${s.bottomRowsAllBackground}`
     );
 
-    // R1.5 literal: never a solid white bar in dark theme.
-    expect(s.anyNearWhite).toBe(false);
+    // R1.5 literal: never a solid white bar in dark theme. CORROBORATING ONLY —
+    // it also holds in the broken state (the thin scrollbar paints the same dark
+    // token), so it documents the requirement rather than detecting a regression.
+    expect.soft(s.anyNearWhite).toBe(false);
     // Non-vacuity: the thumb really is composited into the raster, so the
     // near-white check above cannot pass just because nothing was captured.
-    expect(s.thumbTokenPixels).toBeGreaterThan(50);
-    // DISCRIMINATING. At scrollTop 0 the thumb sits flush against the top of
-    // the track only when ::-webkit-scrollbar-button{display:none} is honoured;
-    // on the standard thin path the top rows are track/arrow chrome instead.
-    expect(s.topRowsHaveThumb).toBe(true);
-    // DISCRIMINATING, and pixels are the ONLY way to see it: the bottom of the
-    // strip is plain container background, i.e. there is no bottom arrow button.
-    expect(s.bottomRowsAllBackground).toBe(true);
+    // Also corroborating — a thumb is painted in both states.
+    expect.soft(s.thumbTokenPixels).toBeGreaterThan(50);
+    // DISCRIMINATING, and pixels are the only way to see it. At scrollTop 0 the
+    // thumb sits flush against row 0 only when the ::-webkit-scrollbar rules
+    // govern the paint; on the standard thin path it is inset behind ~9 rows of
+    // track. Measured under the TEAM-4330 mutation: false (see
+    // docs/evidence/TEAM-4332/differential.md, M1).
+    expect.soft(s.topRowsHaveThumb).toBe(true);
+    // CORROBORATING ONLY — measured `true` under the M1 mutation as well, so it
+    // does NOT detect this regression. Chromium's thin scrollbar turns out to
+    // paint no bottom arrow button here, so there is no ▼ chrome to lose. Kept
+    // because it still pins ::-webkit-scrollbar-button{display:none} against a
+    // future change that reintroduces arrow chrome, but it must not be counted
+    // as coverage for TEAM-4330.
+    expect.soft(s.bottomRowsAllBackground).toBe(true);
   });
 
   test("A5: light theme — thumb token follows the theme and the gutter is still 6px", async ({
@@ -290,24 +313,25 @@ test.describe("A: scrollbar actually paints at 6px (TEAM-4330)", () => {
     const m = await listMetrics(list);
 
     expect(m.overflowsVertically).toBe(true);
-    expect(m.gutter).toBe(6);
-    expect(m.scrollbarWidth).toBe("auto");
-    expect(m.scrollbarColor).toBe("auto");
-    expect(m.wkThumbBg).toBe("rgb(206, 212, 218)"); // --color-surface-4, light
+    expect.soft(m.gutter).toBe(6);
+    expect.soft(m.scrollbarWidth).toBe("auto");
+    expect.soft(m.scrollbarColor).toBe("auto");
+    expect.soft(m.wkThumbBg).toBe("rgb(206, 212, 218)"); // --color-surface-4, light
 
     // POSITIVE CONTROL for the A4 decode. The light container background is
     // itself near-white (--color-surface-1 #f1f3f5), so near-white pixels MUST
     // be present here. If A4's `anyNearWhite === false` were passing because
     // the decode sampled the wrong region or an empty buffer, this fails.
+    // Clip the measured gutter for the same reason A4 does.
     const s = await analyseGutterStrip(page, list, {
-      gutterPx: 6,
+      gutterPx: m.gutter,
       thumb: TOKENS.light.thumb,
       background: TOKENS.light.surface1,
       edgeRows: 4,
     });
     console.log(`[A5] light strip palette=${JSON.stringify(s.palette)}`);
-    expect(s.anyNearWhite).toBe(true);
-    expect(s.thumbTokenPixels).toBeGreaterThan(50);
+    expect.soft(s.anyNearWhite).toBe(true);
+    expect.soft(s.thumbTokenPixels).toBeGreaterThan(50);
   });
 });
 

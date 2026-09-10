@@ -579,7 +579,15 @@ export interface StripAnalysis {
 export async function analyseGutterStrip(
   page: Page,
   locator: Locator,
-  opts: { gutterPx: number; thumb: RGB; background: RGB; edgeRows?: number; tol?: number }
+  opts: {
+    gutterPx: number;
+    thumb: RGB;
+    background: RGB;
+    edgeRows?: number;
+    tol?: number;
+    /** Also write the decoded strip to disk, as committable evidence. */
+    savePath?: string;
+  }
 ): Promise<StripAnalysis> {
   const box = await locator.boundingBox();
   if (!box) throw new Error("scroll container has no bounding box");
@@ -590,6 +598,7 @@ export async function analyseGutterStrip(
       width: opts.gutterPx,
       height: Math.round(box.height),
     },
+    ...(opts.savePath ? { path: opts.savePath } : {}),
   });
   const dataUrl = `data:image/png;base64,${buf.toString("base64")}`;
   return await page.evaluate(
@@ -673,7 +682,14 @@ export interface TitleMetric {
  */
 export async function titleMetric(page: Page, text: string): Promise<TitleMetric> {
   await page.evaluate(() => document.fonts.ready);
-  const m = await page.locator(`${LIST} p.truncate`).evaluateAll((els, wanted) => {
+  // Deliberately `p`, NOT `p.truncate`: selecting on the class under test makes
+  // the element merely *disappear* when `truncate` is removed, so D1 would fail
+  // with "not found" instead of on the measured clip margin — it would be proving
+  // the class string exists, not that the title is actually being clipped.
+  // Matching every title <p> and picking by exact textContent keeps the element
+  // findable in BOTH states, so the failure is the real behavioural consequence:
+  // a wrapping <p> has scrollWidth === clientWidth, hence clippedBy 0.
+  const m = await page.locator(`${LIST} p`).evaluateAll((els, wanted) => {
     const el = els.find((e) => (e.textContent || "") === wanted);
     if (!el) {
       throw new Error(
