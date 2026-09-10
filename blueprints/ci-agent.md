@@ -28,6 +28,13 @@ legible on the ticket — a human on the other team reads it from the PR.
 
 The build is not yours to run; it is authoritative and already done. Do this:
 
+A stall, a missing build, or a loop in this section is fixed HERE, in this
+blueprint — park on a ticket, escalate, or report BLOCKED, per the steps
+below — never by adding logic to the orchestrator or gating it behind a new
+`*_MODE` flag (DL-009; `scripts/check-orchestrator-surface.sh` enforces this).
+The orchestrator only dispatches/cascades tickets; every judgment call about
+what to do next belongs to you.
+
 ### P0: Sync the integration branch (you own this — DL-024)
 The SHA you certify must be the SHA that would land, so bring the repo's default
 branch INTO the run's integration branch first. Via `claude_code` (pass `repo`):
@@ -56,13 +63,20 @@ branch INTO the run's integration branch first. Via `claude_code` (pass `repo`):
    head, so a SHA from a completion record can name a commit that is no longer
    the head you must verify.
 2. Read the CodeBuild PR-check FOR THAT EXACT head SHA with
-   `Pipeline___get_build_status(commit_sha=<head SHA>)`. It scans recent CI builds
+   `Pipeline___get_build_status(commit_sha=<head SHA>, project=<ci_project>)`.
+   `ci_project` comes from the `## Pipeline Mode` context block (TEAM-4338: the
+   tools Lambda serves several registered pipelines) — pass it on **every**
+   `get_build_status` / `start_ci_build` call in this blueprint, not just here;
+   omitting it reads/starts a build in the Lambda's env-default CI project,
+   which is not this repo's. It scans recent CI builds
    and matches on `resolvedSourceVersion` (the real git commit CodeBuild built —
    NOT `sourceVersion`, which for a PR build can be a `pr/<id>` ref). Use its
    `match` + `succeededForCommit`: a green build whose `resolvedSourceVersion` is
    NOT your head SHA does not count. (The coding runtime is denied direct
    CodeBuild CLI access, so use this tool, not `aws codebuild ...`.) For the
-   failing build's log detail, use `Pipeline___get_build_log`.
+   failing build's log detail, use `Pipeline___get_build_log` — pass `build_id`
+   from `actionDetails.externalExecutionId`; the project is inferred from
+   `build_id` itself, so `project` is not needed there.
 
 ### P2: Verdict
 - **CodeBuild `SUCCEEDED` for the head SHA → PASS.** Record the tested head SHA
@@ -140,13 +154,19 @@ release manager's Merge Brief reads all three off your completion record.
      non-done ticket with that EXACT title and adopt it instead — never open a
      second gate for the same round.
 - **No build found for the head SHA** (commits landed after the last CI run, or
-  the PR check never fired): call `Pipeline___capabilities` first.
+  the PR check never fired): call
+  `Pipeline___capabilities(pipeline_name=<pipeline_name>)` first, then read
+  YOUR OWN pipeline's entry in the response's `targets[]` (e.g. its
+  `startCiBuild`) — not the flat top-level keys, which describe the Lambda's
+  env-default target, which is not necessarily this repo's.
   - `startCiBuild: true` → call `Pipeline___start_ci_build(commit_sha=<head
     SHA>, source_version=<pr/<n> when a PR exists for this branch, else the
-    branch name>)`. Start **at most ONE build per head SHA** — never call it a
-    second time for the same SHA, whether it started or was reused. Then poll
-    `Pipeline___get_build_status(commit_sha=<head SHA>)` every 60s, for at most
-    25 polls (the CI project's build timeout is 30 minutes).
+    branch name>, project=<ci_project>)`. Start **at most ONE build per head
+    SHA** — never call it a second time for the same SHA, whether it started
+    or was reused. Then poll
+    `Pipeline___get_build_status(commit_sha=<head SHA>, project=<ci_project>)`
+    every 60s, for at most 25 polls (the CI project's build timeout is 30
+    minutes).
     - `succeededForCommit: true` → **PASS**, with `ci_status="certified"`.
     - `FAILED` → fall through to the P2a mechanical/logic classification above.
     - Still not terminal after the last poll → **BLOCKED**: state that the
@@ -195,8 +215,8 @@ STOP and file a dev ticket instead):**
 3. **Re-verify before claiming green — on the NEW head SHA.** After the auto-fix
    commit+push, get the new head SHA (`git rev-parse HEAD` in the same
    `claude_code` session), wait for the CI build to run, then confirm with
-   `Pipeline___get_build_status(commit_sha=<new head SHA>)` that
-   `succeededForCommit` is true AND `match.resolvedSourceVersion` equals the new
+   `Pipeline___get_build_status(commit_sha=<new head SHA>, project=<ci_project>)`
+   that `succeededForCommit` is true AND `match.resolvedSourceVersion` equals the new
    head. "The latest build is green" is NOT enough — it must be green FOR your
    auto-fix commit. A still-red build (or no build for the new SHA) after one
    auto-fix pass → stop, file a dev ticket with the residual failures. Never loop
