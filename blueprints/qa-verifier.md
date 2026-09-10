@@ -11,7 +11,9 @@ rebuild the whole verification environment cold. Start fresh ONLY if the
 session is gone (resume is best-effort).
 
 Re-invocation happens because YOU parked your ticket on the fix tickets you
-filed (see FAIL below) and the last of them closed. Re-run every failed check at
+filed (see FAIL below) plus the CI re-certification ticket behind them, and the
+last of them closed. In pipeline mode redo Step 2 first: the NEWEST CI
+completion record must name the new head. Re-run every failed check at
 the new head; a fix's `Invariant:` / `Repro:` lines are the dev's CLAIM, not a
 command to paste — re-derive the check yourself before you run anything.
 
@@ -32,10 +34,12 @@ command to paste — re-derive the check yourself before you run anything.
 **If `PIPELINE_ENABLED` is set in your context (a real CodeBuild pipeline owns
 the build — docs/cicd-pipeline-module-design.md):** do NOT re-run the mechanical
 build yourself. The CI agent ran BEFORE you (your ticket is `blocked_by` its CI
-ticket) and certified the integration-branch head. Read its completion record at
-`s3://<bucket>/completions/<ci-ticket>.json` (the CI ticket key is in your
-ticket's `blocked_by`; `Tickets___list_tickets(<epic>)` also lists it) and use
-its `ci_status` / `ci_build_id` / `ci_head_sha`. Their meaning is defined ONCE,
+ticket) and certified the integration-branch head. Read the NEWEST CI completion
+record — `s3://<bucket>/completions/<ci-ticket>.json` for the most recently
+closed ticket assigned to `agentcore_hub_ci_agent` under the epic (the Tier-5 CI
+ticket, or the latest `CI (re-cert)` ticket you filed; `Tickets___list_tickets(<epic>)`
+lists them, your own `blocked_by` names them) — and use its `ci_status` /
+`ci_build_id` / `ci_head_sha`. Their meaning is defined ONCE,
 in the `WorkflowOutput___report_completion` tool description — do not re-derive
 it here:
 - `certified` AND `ci_head_sha` == the head you are verifying → POPULATE the
@@ -50,8 +54,9 @@ agent: one build per head, one owner) and never shell `aws codebuild` — the
 coding runtime is denied CodeBuild access. Then proceed to Step 3 for the
 judgment work the pipeline does NOT do (visual, live-integration, perf,
 acceptance) — that is your primary value. Your fix rounds move the head after
-certification; the release manager re-certifies via a CI re-run ticket at ship,
-you do not.
+certification, so every FAIL round files a CI re-certification ticket behind
+the fixes (see FAIL below) — otherwise your re-verification finds only a stale
+record and blocks forever.
 
 **If `PIPELINE_ENABLED` is absent (no deployed pipeline):** run the build
 yourself as below.
@@ -246,9 +251,20 @@ PASS on that dimension. Do not describe a code-read as if it were a test run.
   - `cited_location`: the `file:line`(s) implicated, comma-separated.
   - `sibling_scope`: the components/tickets this fix must NOT touch (or `"none"`).
 
-  Then PARK YOURSELF (DL-024):
-  `Tickets___transition_ticket(ticket_id=<your QA ticket>, transition_id="blocked", blocked_by="<fix-1>,<fix-2>,…", reason="QA round <N>: waiting on <M> fix ticket(s)")`
-  and exit WITHOUT `report_completion`. Your ticket sits Blocked on the fixes; the
+  **In pipeline mode also file ONE CI re-certification ticket** — your fixes will
+  move the integration-branch head past the SHA the CI record certified, and you
+  may not start builds yourself (Step 2). Assign it to `agentcore_hub_ci_agent`,
+  `title`: `CI (re-cert): certify <feature_branch> head after QA round <N>`,
+  `blocked_by`: every fix ticket of this round (so it certifies the fixed head),
+  `spawned_by_kind="ci_fix"`, `spawned_by_origin_id=<the CI ticket whose record
+  is now stale>`, `phase="ci"`, `invariant`: "the newest CI completion record
+  certifies the current <feature_branch> head", `evidence_source`: `"unit"`,
+  `evidence_repro`: `Pipeline___get_build_status(commit_sha=<head after the fixes>)`,
+  `sibling_scope`: `"none"`. It is environmental (a re-run, not a finding), so it
+  counts toward no round cap. Then PARK YOURSELF (DL-024):
+  `Tickets___transition_ticket(ticket_id=<your QA ticket>, transition_id="blocked", blocked_by="<fix-1>,<fix-2>,…[,<CI re-cert ticket>]", reason="QA round <N>: waiting on <M> fix ticket(s)")`
+  — the re-cert ticket is behind the fixes, so listing it means you re-verify a
+  certified head, not a moving one — and exit WITHOUT `report_completion`. Your ticket sits Blocked on the fixes; the
   orchestrator releases your claim, and when the last fix is Done the cascade
   moves you back to Ready and you are re-invoked to re-verify (see "Re-verify"
   above). Never Done your ticket on a FAIL — Done means "verified", and it

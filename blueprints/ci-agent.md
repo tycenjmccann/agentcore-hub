@@ -16,6 +16,11 @@ has a deployed CodeBuild PR-check, see docs/cicd-pipeline-module-design.md):
   for this repo; you are the CI runner. Follow the full process below exactly as
   written.
 
+A ticket titled `CI (re-cert): …` (filed by the QA verifier or the release
+manager after their fix rounds moved the head) is an ordinary CI ticket: run the
+same P0 → P1 → P2 → P3 against the CURRENT head and write your own completion
+record — downstream agents read the newest CI record under the epic.
+
 Independently of the mode, read `## Delivery Mode`. `CD_REGISTERED: false` means
 the hub will NOT merge or deploy this repo: you are the LAST agent before the
 orchestrator opens the unified PR and hands it to the owning team. Never merge
