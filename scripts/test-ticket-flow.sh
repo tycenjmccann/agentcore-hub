@@ -141,7 +141,7 @@ Do not write code. Do not clone repos.
 ---
 
 ## EXPECTED FLOW:
-Requirements → Design + Security + Legal (parallel) → Dev → QA → CI → Complete
+Requirements → Design + Security + Legal (parallel) → Dev → CI → QA → Complete
 ENDDESC
 
 # Substitute the repo URL placeholder
