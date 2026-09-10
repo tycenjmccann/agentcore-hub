@@ -101,6 +101,43 @@ export function deliveryModeFor(registry: CdRegistry, repoUrl: unknown): Deliver
   return findCdEntry(registry, repoUrl) ? "cd" : "handoff";
 }
 
+export interface PipelineProjects {
+  /** The CodePipeline that deploys the repo (the entry's `pipeline`). */
+  pipeline: string;
+  region: string;
+  ciProject: string;
+  buildProject: string;
+  deployProject: string;
+}
+
+/**
+ * The AWS project names implied by an entry's `pipeline`, by convention:
+ * `hub-<slug>-deploy` → `hub-<slug>-ci` / `hub-<slug>-build` / `hub-<slug>-deploy`
+ * (the hub's own resources keep the `agentcore-hub-*` names: `agentcore-hub-deploy`
+ * → `agentcore-hub-ci` / `agentcore-hub-build`).
+ *
+ * TS mirror of pipelineProjects() in lambda/orchestrator/cd-registry.mjs — same
+ * derivation, so the UI names the same resources the tools Lambda drives. An
+ * explicit `ciProject` on the entry always wins (a repo whose PR-check project
+ * predates the convention). No pipeline → null (that repo has no CD target).
+ */
+export function pipelineProjectsFor(entry: CdRegistryEntry): PipelineProjects | null {
+  const pipeline = (entry.pipeline || "").trim();
+  if (!pipeline) return null;
+  const SUFFIX = "-deploy";
+  const base = pipeline.endsWith(SUFFIX) ? pipeline.slice(0, -SUFFIX.length) : pipeline;
+  return {
+    pipeline,
+    // Definite string: every caller here has to hand it to an AWS client. The
+    // canonical Lambda helper may instead leave an absent region to its caller's
+    // default — the resolved value is the same (AWS_REGION, else us-east-1).
+    region: entry.region || REGION,
+    ciProject: entry.ciProject || `${base}-ci`,
+    buildProject: `${base}-build`,
+    deployProject: pipeline,
+  };
+}
+
 /** Upsert by repo key (returns a new registry). */
 export function upsertCdEntry(registry: CdRegistry, input: Partial<Omit<CdRegistryEntry, "repo">> & { repo: unknown }): CdRegistry {
   const key = normalizeRepoKey(input.repo);

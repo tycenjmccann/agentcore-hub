@@ -30,6 +30,61 @@ on a foreign repo either chased the hub's own pipeline or blocked on a deploy it
 had no credentials for (TEAM-4044). Other teams own their merge + deploy; the hub
 hands them a reviewed, tested PR.
 
+### The registry is a runtime allow-list, not just intake config
+
+The same document is read at runtime by every surface that can move code to
+production: the orchestrator (ship phase or handoff), the
+`agentcore-hub-pipeline-tools` Lambda (which pipeline/projects a `Pipeline___*`
+call may touch), the Telegram deploy-gate bridge (which pipelines it polls and
+offers Approve/Reject for), and the hub UI (`/pipeline`, the board's deploy-gate
+banner). So: **registry write access now equals deploy-trigger authority.** Adding
+an entry with a `pipeline` is what grants agents the ability to start a deploy of
+that repo — treat `POST /api/workflow/cd-registry` and `scripts/cd-registry.sh` as
+privileged, and review registry diffs the way you'd review an IAM change.
+
+### Per-entry fields and the naming convention
+
+An entry carries `pipeline` (the CodePipeline that deploys the repo), `region`
+(where that pipeline lives — absent means the hub's own region), and optionally
+`ciProject` (the repo's CodeBuild PR-check project). Everything else is derived
+from the pipeline name, by one rule shared by every surface —
+`pipelineProjects()` in `lambda/orchestrator/cd-registry.mjs` and its TS mirror
+`pipelineProjectsFor()` in `src/lib/cd-registry.ts`:
+
+```
+pipeline: hub-<slug>-deploy
+  → ciProject     hub-<slug>-ci      (unless the entry names one explicitly)
+  → buildProject  hub-<slug>-build
+  → deployProject hub-<slug>-deploy
+```
+
+`slug` = the repo name, lowercased, every run of `[^a-z0-9]+` collapsed to `-`,
+trimmed of leading/trailing `-`, truncated to 40 chars. A pipeline name that does
+not end in `-deploy` is used as the base as-is (`juno` → `juno-ci` / `juno-build`).
+`hub-` is a **reserved prefix** for hub-managed pipelines; the hub's own resources
+keep their historical `agentcore-hub-*` names, so `agentcore-hub-deploy` derives
+`agentcore-hub-ci` / `agentcore-hub-build`.
+
+Regions: `node deploy/setup-pipeline-tools-lambda.mjs` reads `PIPELINE_REGIONS`
+(comma-separated; default = the Lambda's own region) to fan the tools Lambda's IAM
+grants (pipeline + project ARNs) out to those regions - it is not a runtime check
+in the Lambda. An entry whose region is outside that list was simply never granted
+access, so its calls fail at AWS with `AccessDenied`: operator misconfiguration
+surfaced as the tool's normal error text, the same shape as the `ciProject` note
+below, rather than a silent resolve to the wrong account-local pipeline.
+
+An explicit `ciProject` outside the `hub-*-ci` convention is still checked by
+`validateCiProjectName`: it is refused outright when it collides with the entry's
+build/deploy/pipeline names or a reserved deploy project (an agent must never be
+able to aim `start_ci_build` at a deploy project). Anything else passes the
+allow-list and, under convention-scoped IAM, simply fails at AWS with
+`AccessDenied` — operator misconfiguration surfaced as the tool's normal error
+text, not a silent build of the wrong project.
+
+Onboarding a new repo today means creating its pipeline out of band and adding the
+entry. A generic per-repo CDK stack plus onboarding scripts/templates is a
+follow-up (PR B).
+
 ## The RM loop (trigger → watch → fix ticket → re-trigger)
 
 1. **Merge.** After the human merge gate approves, RM merges the PR
@@ -86,6 +141,15 @@ legitimate completion. Opt-out: `SHIP_MERGE_VERIFY=off`.
 ## Deploy-gate banner in the UI
 
 While a ship-phase run is active, the Workflow board polls
-`/api/pipeline/status` and shows a banner when a ManualApproval is waiting
-(with a link to approve). The poll silent-catches when the Pipeline module is
-absent, so the board needs no change in non-pipeline deployments.
+`/api/pipeline/status?repo=<the run's repo>` and shows a banner when a
+ManualApproval is waiting on **that repo's own pipeline**, naming it (`Deploy gate
+— hub-juno-deploy awaiting approval`) with a link to approve. The banner is
+derived only from the target whose `repo` matches the run, so a ship run on one
+repo can never surface another repo's gate, and a handoff run (unregistered repo,
+no matching target) shows nothing. The poll silent-catches when the Pipeline module
+is absent, so the board needs no change in non-pipeline deployments.
+
+`/pipeline` shows the same data for every target at once: one section per
+registered pipeline plus the env default, each with its region, CI project, stages
+and recent builds. Errors are per-target — one repo's missing or AccessDenied
+pipeline renders an amber block inside its own section and leaves the rest intact.

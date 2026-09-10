@@ -55,6 +55,10 @@ export default function IntakeForm({ onSubmit, isLoading }: IntakeFormProps) {
   const [cdRegistry, setCdRegistry] = useState<CdRegistry | null>(null);
   const [showCdManager, setShowCdManager] = useState(false);
   const [cdPipeline, setCdPipeline] = useState("");
+  // Per-entry deploy region + PR-check project. Blank ciProject = derive it from
+  // the pipeline name by convention (hub-<slug>-deploy → hub-<slug>-ci).
+  const [cdRegion, setCdRegion] = useState("");
+  const [cdCiProject, setCdCiProject] = useState("");
   const [cdBusy, setCdBusy] = useState(false);
   const [cdError, setCdError] = useState<string | null>(null);
 
@@ -121,7 +125,7 @@ export default function IntakeForm({ onSubmit, isLoading }: IntakeFormProps) {
         const s = await fetch(`/api/workflow/cd-registry?repo=${encodeURIComponent(repoUrl.trim())}&fresh=1`);
         if (s.ok) { const sd = await s.json(); setCdStatus({ repo: sd.repo, registered: !!sd.registered, entry: sd.entry ?? null }); }
       }
-      setCdPipeline("");
+      setCdPipeline(""); setCdRegion(""); setCdCiProject("");
     } catch (err) {
       setCdError(err instanceof Error ? err.message : "CD registry update failed");
     } finally { setCdBusy(false); }
@@ -550,7 +554,21 @@ export default function IntakeForm({ onSubmit, isLoading }: IntakeFormProps) {
                   placeholder="pipeline name (optional)"
                   className="w-44 px-2 py-1 bg-surface-1 border border-theme rounded text-primary placeholder-muted text-xs focus:outline-none focus:border-brand-500"
                 />
-                <button type="button" disabled={cdBusy || !cdStatus.repo} onClick={() => cdMutate("POST", { repo: cdStatus.repo, pipeline: cdPipeline })}
+                <input
+                  type="text"
+                  value={cdRegion}
+                  onChange={(e) => setCdRegion(e.target.value)}
+                  placeholder="us-east-1"
+                  className="w-24 px-2 py-1 bg-surface-1 border border-theme rounded text-primary placeholder-muted text-xs focus:outline-none focus:border-brand-500"
+                />
+                <input
+                  type="text"
+                  value={cdCiProject}
+                  onChange={(e) => setCdCiProject(e.target.value)}
+                  placeholder="hub-<slug>-ci (optional)"
+                  className="w-44 px-2 py-1 bg-surface-1 border border-theme rounded text-primary placeholder-muted text-xs focus:outline-none focus:border-brand-500"
+                />
+                <button type="button" disabled={cdBusy || !cdStatus.repo} onClick={() => cdMutate("POST", { repo: cdStatus.repo, pipeline: cdPipeline, region: cdRegion, ciProject: cdCiProject })}
                   className="px-2 py-1 rounded bg-brand-500/20 text-brand-300 hover:bg-brand-500/30 disabled:opacity-50">
                   Register for CD
                 </button>
@@ -577,7 +595,7 @@ export default function IntakeForm({ onSubmit, isLoading }: IntakeFormProps) {
                 {cdRegistry.repos.map((e) => (
                   <li key={e.repo} className="flex items-center justify-between gap-2">
                     <span className="font-mono text-primary">{e.repo}</span>
-                    <span className="text-muted flex-1 truncate">{e.pipeline ? `pipeline: ${e.pipeline}${e.region ? ` (${e.region})` : ""}` : `deploy doc: ${e.deployDoc || "DEPLOY.md"}`}</span>
+                    <span className="text-muted flex-1 truncate">{e.pipeline ? `pipeline: ${e.pipeline}${e.region ? ` (${e.region})` : ""} · ci: ${e.ciProject || "derived from pipeline"}` : `deploy doc: ${e.deployDoc || "DEPLOY.md"}`}</span>
                     <button type="button" disabled={cdBusy} onClick={() => cdMutate("DELETE", { repo: e.repo })} className="text-muted hover:text-red-400 underline disabled:opacity-50">remove</button>
                   </li>
                 ))}

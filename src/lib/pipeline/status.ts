@@ -1,9 +1,16 @@
 /**
  * Pipeline module (bolt-on) — server-side status reads.
  *
- * Reads the CI CodeBuild project's recent builds and the deploy CodePipeline's
- * state. Pure reads; no triggers here. Core never imports this — it lives under
- * the optional `pipeline` module surface only.
+ * Reads each CD target's CI CodeBuild project (recent builds) and its deploy
+ * CodePipeline (stage state). Pure reads; no triggers here. Core never imports
+ * this — it lives under the optional `pipeline` module surface only.
+ *
+ * Multi-target (TEAM-4336): the hub merges + deploys every repo in the CD
+ * registry, each with its own pipeline in its own region, so this returns a LIST
+ * of targets rather than one global status. Targets come from the registry
+ * (derived via pipelineProjectsFor) plus the env default pipeline when no entry
+ * already names it. One target's AWS failure populates only that target's
+ * `error` — the rest still render.
  */
 import {
   CodeBuildClient,
@@ -15,6 +22,12 @@ import {
   GetPipelineStateCommand,
 } from "@aws-sdk/client-codepipeline";
 import { DEFAULT_REGION } from "@/lib/agentcore-sdk";
+import {
+  loadCdRegistry,
+  normalizeRepoKey,
+  pipelineProjectsFor,
+  type CdRegistry,
+} from "@/lib/cd-registry";
 
 const CI_PROJECT = process.env.PIPELINE_CI_PROJECT || "agentcore-hub-ci";
 const DEPLOY_PIPELINE =
@@ -41,14 +54,21 @@ export interface StageState {
   approvalUrl?: string; // the action's entityUrl (view-commit / review link)
 }
 
-export interface PipelineStatus {
-  enabled: boolean;
+/** One CD target: a registered repo's pipeline, or the env default pipeline. */
+export interface PipelineTargetStatus {
+  /** Registry repo key (`owner/repo`); "" for the env default target. */
+  repo: string;
+  pipeline: string;
   region: string;
   ciProject: string;
-  deployPipeline: string;
   recentBuilds: CiBuildSummary[];
   stages: StageState[];
   error?: string;
+}
+
+export interface PipelineStatus {
+  enabled: boolean;
+  pipelines: PipelineTargetStatus[];
 }
 
 export function isPipelineEnabled(value = process.env.PIPELINE_ENABLED): boolean {
@@ -56,39 +76,114 @@ export function isPipelineEnabled(value = process.env.PIPELINE_ENABLED): boolean
   return raw === "1" || raw === "true";
 }
 
-export async function getPipelineStatus(): Promise<PipelineStatus> {
-  const region = DEFAULT_REGION;
-  const base: PipelineStatus = {
-    enabled: isPipelineEnabled(),
-    region,
+/** The resource names of one target, before its AWS state is read. */
+interface PipelineTarget {
+  repo: string;
+  pipeline: string;
+  region: string;
+  ciProject: string;
+}
+
+function envTarget(registry: CdRegistry): PipelineTarget {
+  // Attribute the env default pipeline to a registry entry that names it, so the
+  // target is self-describing. Unreachable while targets are deduped by pipeline
+  // name (such an entry already produced its own target) — kept so the field
+  // stays honest if that rule ever changes.
+  const owner = registry.repos.find((e) => e.pipeline === DEPLOY_PIPELINE);
+  return {
+    repo: owner?.repo || "",
+    pipeline: DEPLOY_PIPELINE,
+    region: DEFAULT_REGION,
     ciProject: CI_PROJECT,
-    deployPipeline: DEPLOY_PIPELINE,
-    recentBuilds: [],
-    stages: [],
+  };
+}
+
+/**
+ * Every CD target, or just one repo's when `repo` is given (an unknown or
+ * unregistered repo narrows to the env default target — the caller is expected
+ * to check the returned `repo` before acting on it).
+ */
+export async function getPipelineStatus(
+  { repo }: { repo?: string } = {}
+): Promise<PipelineStatus> {
+  // The registry lives in S3; a fresh/offline install still gets the env target.
+  let registry: CdRegistry = { version: 1, repos: [] };
+  try {
+    registry = await loadCdRegistry();
+  } catch {
+    /* no registry reachable — env default only */
+  }
+
+  const targets: PipelineTarget[] = [];
+  for (const entry of registry.repos) {
+    const projects = pipelineProjectsFor(entry);
+    if (!projects) continue; // registered, but no pipeline (legacy DEPLOY.md path)
+    targets.push({
+      repo: entry.repo,
+      pipeline: projects.pipeline,
+      region: projects.region,
+      ciProject: projects.ciProject,
+    });
+  }
+  // Dedupe by pipeline name: a registry entry naming the env default pipeline
+  // owns it (its region/ciProject win over the env defaults).
+  const fallback =
+    targets.find((t) => t.pipeline === DEPLOY_PIPELINE) || envTarget(registry);
+  if (!targets.some((t) => t.pipeline === DEPLOY_PIPELINE)) targets.push(fallback);
+
+  let selected = targets;
+  if (repo !== undefined && String(repo).trim()) {
+    const key = normalizeRepoKey(repo);
+    const mine = key ? targets.filter((t) => t.repo === key) : [];
+    selected = mine.length > 0 ? mine : [fallback];
+  }
+
+  const clients = new Map<
+    string,
+    { cb: CodeBuildClient; cp: CodePipelineClient }
+  >();
+  const clientsFor = (region: string) => {
+    let pair = clients.get(region);
+    if (!pair) {
+      pair = {
+        cb: new CodeBuildClient({ region }),
+        cp: new CodePipelineClient({ region }),
+      };
+      clients.set(region, pair);
+    }
+    return pair;
   };
 
-  const cb = new CodeBuildClient({ region });
-  const cp = new CodePipelineClient({ region });
+  const pipelines = await Promise.all(
+    selected.map(async (t): Promise<PipelineTargetStatus> => {
+      const status: PipelineTargetStatus = { ...t, recentBuilds: [], stages: [] };
+      try {
+        const { cb, cp } = clientsFor(t.region);
+        const [builds, state] = await Promise.all([
+          recentBuilds(cb, t.region, t.ciProject),
+          pipelineStages(cp, t.pipeline),
+        ]);
+        status.recentBuilds = builds;
+        status.stages = state;
+      } catch (e) {
+        // Per-target isolation: one repo's missing pipeline / AccessDenied must
+        // not blank out every other target on the board.
+        status.error = e instanceof Error ? e.message : String(e);
+      }
+      return status;
+    })
+  );
 
-  try {
-    const [builds, state] = await Promise.all([
-      recentBuilds(cb, region),
-      pipelineStages(cp),
-    ]);
-    base.recentBuilds = builds;
-    base.stages = state;
-  } catch (e) {
-    base.error = e instanceof Error ? e.message : String(e);
-  }
-  return base;
+  return { enabled: isPipelineEnabled(), pipelines };
 }
 
 async function recentBuilds(
   cb: CodeBuildClient,
-  region: string
+  region: string,
+  ciProject: string
 ): Promise<CiBuildSummary[]> {
   const list = await cb.send(
-    new ListBuildsForProjectCommand({ projectName: CI_PROJECT })
+    new ListBuildsForProjectCommand({ projectName: ciProject })
   );
   const ids = (list.ids || []).slice(0, 8);
   if (ids.length === 0) return [];
@@ -109,10 +204,11 @@ async function recentBuilds(
   }));
 }
 
-async function pipelineStages(cp: CodePipelineClient): Promise<StageState[]> {
-  const st = await cp.send(
-    new GetPipelineStateCommand({ name: DEPLOY_PIPELINE })
-  );
+async function pipelineStages(
+  cp: CodePipelineClient,
+  pipelineName: string
+): Promise<StageState[]> {
+  const st = await cp.send(new GetPipelineStateCommand({ name: pipelineName }));
   return (st.stageStates || []).map((s) => {
     // A ManualApproval action awaiting a decision has a token + InProgress status.
     const approvalAction = (s.actionStates || []).find(
