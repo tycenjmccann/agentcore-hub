@@ -459,12 +459,34 @@ export function createCascade(deps) {
   }
 
   /**
+   * TEAM-4368 — is this gate ALREADY in front of a human? EXACTLY the predicate
+   * the store's CAS uses (workflow-store.mjs appendReviewNotificationOnce): an
+   * unacknowledged review_needed for this ticket. Read from the workflow row we
+   * were already handed (the sweep's full-row Scan item / the done handler's
+   * load), so it costs no extra I/O.
+   */
+  function hasOpenReviewNotification(workflow, ticketId) {
+    const list = workflow?.humanNotifications;
+    if (!Array.isArray(list)) return false;
+    return list.some(
+      (n) => n.ticketId === ticketId && n.type === "review_needed" && !n.acknowledged
+    );
+  }
+
+  /**
    * A dependent parked in_review (a human-review gate) whose last blocker just
    * resolved — e.g. a reopened gate whose rework fix children have all closed.
    * Re-wake the gate: emit review.reawakened and re-run the EXISTING gate
    * readiness path (re-parks in_review idempotently + refreshes the reviewer
    * notification if none is open). No ticket-status write beyond what that gate
    * logic itself decides. In shadow mode: observe only (reawakenGate not called).
+   *
+   * TEAM-4368 — a gate whose review_needed is still OPEN has already been
+   * presented to a human and needs nothing, so we return review-noop BEFORE the
+   * gate runs. reawakenGate (index.mjs handleHumanReviewGate) writes the
+   * "In Review" status BEFORE consulting its notification CAS, so calling it for
+   * an already-presented gate re-transitioned In Review -> In Review on every
+   * reconcile sweep (rate(1 minute)) only to reach the same review-noop.
    */
   async function handleInReviewDependent(sibling, unblockedBy, workflow, m, mode = "enforce") {
     if (mode !== "enforce") {
@@ -472,13 +494,18 @@ export function createCascade(deps) {
       log(`[orchestrator] cascade would-reawaken (shadow) — ${sibling.ticketId}`);
       return "would-review";
     }
-    // Idempotent re-wake (Finding 2 / TEAM-3684). Concurrent last-blocker
-    // completions each carry a stale in-memory snapshot, so both could re-notify
-    // and re-emit review.reawakened for the SAME gate. Run the gate FIRST and let
-    // it be the single arbiter: reawakenGate creates the reviewer notification
-    // under a CAS keyed on "no open review_needed for this gate" and returns
-    // whether THIS call actually (re)notified. Only the winner publishes
-    // review.reawakened + counts the metric, so a duplicate is a silent no-op.
+    // TEAM-4368 — zero side effects when a human already holds this gate: no
+    // gate call, so no status write, no notification CAS, no event, no metric.
+    if (hasOpenReviewNotification(workflow, sibling.ticketId)) {
+      log(`[orchestrator] cascade review re-wake skipped (open review notification — gate already with a human) — ${sibling.ticketId}`);
+      return "review-noop";
+    }
+    // Idempotent re-wake (Finding 2 / TEAM-3684). The guard above is a snapshot
+    // pre-filter, NOT the arbiter: a snapshot that misses a notification still
+    // falls through to reawakenGate's CAS ("no open review_needed for this
+    // gate"), which reports whether THIS call actually (re)notified. Only that
+    // winner publishes review.reawakened + counts the metric, so concurrent
+    // last-blocker completions still yield exactly one re-wake.
     // reawakenGate still never invokes an agent — it only parks + notifies.
     const notified = reawakenGate
       ? await reawakenGate(sibling.ticketId, sibling.assignee, workflow)

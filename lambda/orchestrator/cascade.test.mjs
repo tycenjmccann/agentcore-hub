@@ -1102,3 +1102,192 @@ describe("TEAM-3755 F9 — blockers are confirmed by consistent point-read befor
     expect(redispatch).toHaveBeenCalledTimes(1);
   });
 });
+
+/**
+ * TEAM-4368 — a gate that is ALREADY in front of a human (an open,
+ * unacknowledged review_needed notification) must not be re-woken at all.
+ * reawakenGate (index.mjs handleHumanReviewGate) writes the provider's
+ * "In Review" status BEFORE consulting its own notification CAS, so calling it
+ * for an already-presented gate self-transitioned In Review -> In Review on
+ * every reconcile sweep (rate(1 minute)) only to land on the same review-noop.
+ * handleInReviewDependent now checks the SAME open-notification predicate the
+ * store's CAS uses (workflow-store.mjs appendReviewNotificationOnce) against the
+ * workflow row it was already handed, and skips the gate call entirely.
+ */
+describe("TEAM-4368 — an already-presented in_review gate is never re-woken", () => {
+  const GATE = "GATE-1";
+  const siblings = [
+    { ticketId: DONE, status: "done" },
+    { ticketId: GATE, status: "in_review", assignee: "human:reviewer", blockedBy: [DONE] },
+  ];
+  const openNotification = { id: "n1", type: "review_needed", ticketId: GATE, acknowledged: false };
+
+  // Faithful mini-fake of index.mjs handleHumanReviewGate: the "In Review"
+  // provider write happens FIRST, the notification CAS SECOND — the exact
+  // ordering that made an already-presented gate self-transition on every
+  // sweep. Mutates the SAME workflow.humanNotifications array the guard reads,
+  // matching the real store's read-your-own-write shape.
+  function gateFake(jiraTransition) {
+    return vi.fn(async (ticketId, assignee, wf) => {
+      await jiraTransition(ticketId, "In Review");
+      const list = Array.isArray(wf?.humanNotifications) ? wf.humanNotifications : [];
+      if (list.some((n) => n.ticketId === ticketId && n.type === "review_needed" && !n.acknowledged)) {
+        return false;
+      }
+      list.push({ id: `n_${ticketId}`, type: "review_needed", ticketId, acknowledged: false });
+      return true;
+    });
+  }
+
+  it("sweep path (reconcileDependent enforce): open review_needed → review-noop with ZERO side effects", async () => {
+    const jiraTransition = vi.fn(async () => {});
+    const { deps, ddb, publishEvent } = makeExtDeps({
+      getChildTickets: vi.fn(async () => siblings),
+      reawakenGate: gateFake(jiraTransition),
+    });
+    const workflow = { ...extWorkflow, humanNotifications: [openNotification] };
+    const { reconcileDependent } = createCascade(deps);
+    const m = newMetrics();
+
+    const outcome = await reconcileDependent(siblings[1], "reconcile-sweep", workflow, m, "enforce");
+
+    expect(outcome).toBe("review-noop");
+    expect(deps.reawakenGate).not.toHaveBeenCalled();
+    expect(jiraTransition).not.toHaveBeenCalled();
+    expect(statusWrites(ddb)).toHaveLength(0);
+    expect(eventsOfType(publishEvent, "review.reawakened")).toHaveLength(0);
+    expect(m.reviewReawakened).toBe(0);
+  });
+
+  it("…and it does not accumulate: 5 enforce sweeps → still zero gate calls, zero transitions", async () => {
+    const jiraTransition = vi.fn(async () => {});
+    const { deps } = makeExtDeps({
+      getChildTickets: vi.fn(async () => siblings),
+      reawakenGate: gateFake(jiraTransition),
+    });
+    const workflow = { ...extWorkflow, humanNotifications: [openNotification] };
+    const { reconcileDependent } = createCascade(deps);
+
+    for (let i = 0; i < 5; i++) {
+      const outcome = await reconcileDependent(siblings[1], "reconcile-sweep", workflow, newMetrics(), "enforce");
+      expect(outcome).toBe("review-noop");
+    }
+
+    expect(jiraTransition).not.toHaveBeenCalled();
+    expect(deps.reawakenGate).not.toHaveBeenCalled();
+  });
+
+  it("event path (cascadeUnblock enforce): same workflow → gate not re-woken", async () => {
+    const jiraTransition = vi.fn(async () => {});
+    const { deps, ddb, publishEvent } = makeExtDeps({
+      getChildTickets: vi.fn(async () => siblings),
+      reawakenGate: gateFake(jiraTransition),
+    });
+    const workflow = { ...extWorkflow, humanNotifications: [openNotification] };
+    const { cascadeUnblock } = createCascade(deps);
+
+    const unblocked = await cascadeUnblock(DONE, "EPIC-1", workflow);
+
+    expect(unblocked).toEqual([]);
+    expect(deps.reawakenGate).not.toHaveBeenCalled();
+    expect(jiraTransition).not.toHaveBeenCalled();
+    expect(statusWrites(ddb)).toHaveLength(0);
+    expect(eventsOfType(publishEvent, "review.reawakened")).toHaveLength(0);
+  });
+
+  describe("controls — every one of these must still re-wake exactly as before", () => {
+    it.each([
+      ["no humanNotifications key (undefined)", undefined],
+      ["an empty humanNotifications array", []],
+    ])("%s → re-wakes exactly as before", async (_label, humanNotifications) => {
+      const jiraTransition = vi.fn(async () => {});
+      const { deps, publishEvent } = makeExtDeps({
+        getChildTickets: vi.fn(async () => siblings),
+        reawakenGate: gateFake(jiraTransition),
+      });
+      const workflow = { ...extWorkflow, ...(humanNotifications !== undefined ? { humanNotifications } : {}) };
+      const { reconcileDependent } = createCascade(deps);
+      const m = newMetrics();
+
+      const outcome = await reconcileDependent(siblings[1], "reconcile-sweep", workflow, m, "enforce");
+
+      expect(outcome).toBe("review-reawakened");
+      expect(deps.reawakenGate).toHaveBeenCalledWith(GATE, "human:reviewer", workflow);
+      expect(eventsOfType(publishEvent, "review.reawakened")).toHaveLength(1);
+      expect(m.reviewReawakened).toBe(1);
+    });
+
+    it("acknowledged review_needed (post-rework loop-back) → still re-wakes", async () => {
+      const jiraTransition = vi.fn(async () => {});
+      const { deps, publishEvent } = makeExtDeps({
+        getChildTickets: vi.fn(async () => siblings),
+        reawakenGate: gateFake(jiraTransition),
+      });
+      const workflow = { ...extWorkflow, humanNotifications: [{ ...openNotification, acknowledged: true }] };
+      const { reconcileDependent } = createCascade(deps);
+      const m = newMetrics();
+
+      const outcome = await reconcileDependent(siblings[1], "reconcile-sweep", workflow, m, "enforce");
+
+      expect(outcome).toBe("review-reawakened");
+      expect(deps.reawakenGate).toHaveBeenCalledWith(GATE, "human:reviewer", workflow);
+      expect(eventsOfType(publishEvent, "review.reawakened")).toHaveLength(1);
+    });
+
+    it("open review_needed for a DIFFERENT ticketId → still re-wakes", async () => {
+      const jiraTransition = vi.fn(async () => {});
+      const { deps, publishEvent } = makeExtDeps({
+        getChildTickets: vi.fn(async () => siblings),
+        reawakenGate: gateFake(jiraTransition),
+      });
+      const workflow = { ...extWorkflow, humanNotifications: [{ ...openNotification, ticketId: "GATE-OTHER" }] };
+      const { reconcileDependent } = createCascade(deps);
+      const m = newMetrics();
+
+      const outcome = await reconcileDependent(siblings[1], "reconcile-sweep", workflow, m, "enforce");
+
+      expect(outcome).toBe("review-reawakened");
+      expect(deps.reawakenGate).toHaveBeenCalledWith(GATE, "human:reviewer", workflow);
+      expect(eventsOfType(publishEvent, "review.reawakened")).toHaveLength(1);
+    });
+
+    it("an open notification of a DIFFERENT type (manager_escalation) for this ticket → still re-wakes", async () => {
+      const jiraTransition = vi.fn(async () => {});
+      const { deps, publishEvent } = makeExtDeps({
+        getChildTickets: vi.fn(async () => siblings),
+        reawakenGate: gateFake(jiraTransition),
+      });
+      const workflow = { ...extWorkflow, humanNotifications: [{ ...openNotification, type: "manager_escalation" }] };
+      const { reconcileDependent } = createCascade(deps);
+      const m = newMetrics();
+
+      const outcome = await reconcileDependent(siblings[1], "reconcile-sweep", workflow, m, "enforce");
+
+      expect(outcome).toBe("review-reawakened");
+      expect(deps.reawakenGate).toHaveBeenCalledWith(GATE, "human:reviewer", workflow);
+      expect(eventsOfType(publishEvent, "review.reawakened")).toHaveLength(1);
+    });
+  });
+
+  it("shadow + open review_needed → still would-review, gate never called (guard sits BELOW the shadow branch)", async () => {
+    const jiraTransition = vi.fn(async () => {});
+    const { deps } = makeExtDeps({
+      getChildTickets: vi.fn(async () => siblings),
+      reawakenGate: gateFake(jiraTransition),
+      extendedStates: "shadow",
+    });
+    const workflow = { ...extWorkflow, humanNotifications: [openNotification] };
+    const { cascadeUnblock } = createCascade(deps);
+    const cap = captureMetrics();
+
+    await cascadeUnblock(DONE, "EPIC-1", workflow);
+    const records = cap.records();
+    cap.restore();
+
+    expect(deps.reawakenGate).not.toHaveBeenCalled();
+    expect(jiraTransition).not.toHaveBeenCalled();
+    expect(records).toHaveLength(1);
+    expect(records[0].CascadeWouldReviewReawaken).toBe(1);
+    expect(records[0].CascadeReviewReawaken).toBe(0);
+  });
+});

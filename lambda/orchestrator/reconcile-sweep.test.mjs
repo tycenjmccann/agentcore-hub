@@ -751,3 +751,78 @@ describe("TEAM-3973 — an escalated ticket is HELD for the human in every statu
     expect(m.escalated).toBe(1); // second death → escalate, unchanged (TEAM-3969)
   });
 });
+
+/**
+ * TEAM-4368 — the reconcile sweep must not re-drive an in_review gate that
+ * already has an open review_needed notification. Every sweep cycle
+ * (rate(1 minute)) previously routed such a gate through reawakenGate
+ * (index.mjs handleHumanReviewGate), which writes the provider's "In Review"
+ * status BEFORE consulting its own notification CAS — an unbounded
+ * In Review -> In Review self-transition. cascade.mjs's handleInReviewDependent
+ * now checks the open-notification predicate against the sweep's full-row
+ * workflow snapshot before ever calling the gate.
+ */
+describe("TEAM-4368 — a gate already presented to a human is a candidate but a no-op", () => {
+  const GATE = "GATE-1";
+  const gateSiblings = [
+    { ticketId: DONE, status: "done", type: "task" },
+    { ticketId: GATE, status: "in_review", assignee: "human:reviewer", type: "task", blockedBy: [DONE], updatedAt: STALE_STARTED },
+  ];
+
+  // Same write-first mini-fake as cascade.test.mjs: the "In Review" provider
+  // write happens BEFORE the notification CAS — the ordering that caused the bug.
+  function gateFake(jiraTransition) {
+    return vi.fn(async (ticketId, assignee, wf) => {
+      await jiraTransition(ticketId, "In Review");
+      const list = Array.isArray(wf?.humanNotifications) ? wf.humanNotifications : [];
+      if (list.some((n) => n.ticketId === ticketId && n.type === "review_needed" && !n.acknowledged)) {
+        return false;
+      }
+      list.push({ id: `n_${ticketId}`, type: "review_needed", ticketId, acknowledged: false });
+      return true;
+    });
+  }
+
+  it("an in_review gate with an open review_needed is a candidate but a NO-OP (no gate call, no transition)", async () => {
+    const jiraTransition = vi.fn(async () => {});
+    const s = makeSweep({
+      workflows: [workflow({
+        humanNotifications: [{ id: "n1", type: "review_needed", ticketId: GATE, acknowledged: false }],
+      })],
+      siblings: gateSiblings,
+      reawakenGate: gateFake(jiraTransition),
+    });
+    const cap = captureMetrics();
+
+    const m = await s.runSweep("enforce");
+    const records = cap.records();
+    cap.restore();
+
+    expect(m.candidates).toBe(1);
+    expect(m.noop).toBe(1);
+    expect(m.reviewReawakened).toBe(0);
+    expect(s.reawakenGate).not.toHaveBeenCalled();
+    expect(jiraTransition).not.toHaveBeenCalled();
+    expect(eventsOfType(s.publishEvent, "review.reawakened")).toHaveLength(0);
+    expect(records[0].ReconcileReviewReawaken).toBe(0);
+    expect(records[0].ReconcileNoop).toBe(1);
+  });
+
+  it("positive control — same gate with no open notification → re-woken once", async () => {
+    const jiraTransition = vi.fn(async () => {});
+    const s = makeSweep({
+      workflows: [workflow({ humanNotifications: [] })],
+      siblings: gateSiblings,
+      reawakenGate: gateFake(jiraTransition),
+    });
+
+    const m = await s.runSweep("enforce");
+
+    expect(m.candidates).toBe(1);
+    expect(s.reawakenGate).toHaveBeenCalledTimes(1);
+    expect(s.reawakenGate.mock.calls[0][0]).toBe(GATE);
+    expect(m.reviewReawakened).toBe(1);
+    expect(eventsOfType(s.publishEvent, "review.reawakened")).toHaveLength(1);
+    expect(m.noop).toBe(0);
+  });
+});
