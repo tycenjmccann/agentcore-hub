@@ -493,7 +493,8 @@ REMOTE_CODING_HEARTBEAT_S = int(os.getenv("REMOTE_CODING_HEARTBEAT_S", "60"))
 REMOTE_CODING_TURN_BUDGET_S = int(os.getenv("REMOTE_CODING_TURN_BUDGET_S", "2700"))
 # Outer wall-clock deadline on ONE ENTIRE nested coding turn: submit (including
 # lost-submit recovery probes), every poll, and the single automatic vm-death
-# resubmit. The poll loop bounds each CYCLE (budget, 2x hard stop), but cycles
+# resubmit. The poll loop bounds each CYCLE at one budget (heartbeat extensions
+# are clamped to that hard stop — TEAM-4389), but cycles
 # and recovery sleeps stack — worst case ran to hours of silent blocking with
 # no event emitted (TEAM-3119). The default sits above one full worst-case
 # cycle (submit read timeout + the poll loop's hard stop) so it never preempts
@@ -691,12 +692,20 @@ def _coding_invoke(client, payload: dict) -> dict:
     return json.loads(resp["response"].read().decode("utf-8"))
 
 
-def _deadline_expired_error() -> dict:
+def _deadline_expired_error(elapsed_s: int | None = None) -> dict:
     """The terminal record for a turn cut off by REMOTE_CODING_TURN_DEADLINE_S —
     shared by the poll loop and the pre-submit guard so both exits carry the
-    same verify-first instructions (TEAM-3307)."""
+    same verify-first instructions (TEAM-3307).
+
+    elapsed_s, when the caller knows it, names WHICH bound fired and how long
+    the turn really ran: a give-up message that quotes only a configured limit
+    reads as if that limit elapsed, which sent postmortems chasing the wrong
+    timeout (TEAM-4389). Optional so the pre-submit guard — which has no turn
+    clock yet — keeps calling it bare."""
+    bound = (f" (outer deadline bound; {elapsed_s}s elapsed)"
+             if elapsed_s is not None else "")
     return {"error": f"coding turn exceeded the {REMOTE_CODING_TURN_DEADLINE_S}s "
-                     f"overall deadline with no verdict. Its work may already "
+                     f"overall deadline{bound} with no verdict. Its work may already "
                      f"exist and a runner may still be finishing. Do NOT re-run "
                      f"the task and do NOT start another coding call yet: wait a "
                      f"few minutes, then check the branch on GitHub "
@@ -731,8 +740,13 @@ def _poll_coding_turn(client, turn_id: str, outer_deadline: float | None = None,
     budget = REMOTE_CODING_TURN_BUDGET_S if budget_s is None else budget_s
     deadline = time.time() + budget
     # Live heartbeats extend the deadline (terminal work is unbounded), but a
-    # wedged-yet-heartbeating runner must not pin this persona forever.
-    hard_stop = time.time() + 2 * budget
+    # wedged-yet-heartbeating runner must not pin this persona forever, so the
+    # extension is clamped to this hard stop. The stop is ONE budget, not two: a
+    # wedged-but-heartbeating runner used to hold the persona for 2x the budget
+    # (9600s on a 3600s turn cap) and then blame the 1x budget in its error
+    # (TEAM-4389). The budget already carries the runner's terminal-work
+    # headroom, so 1x is the honest bound.
+    hard_stop = time.time() + budget
     unknowns = 0
     turn_start = time.time()
     last_heartbeat = time.time()
@@ -787,8 +801,9 @@ def _poll_coding_turn(client, turn_id: str, outer_deadline: float | None = None,
             if now - last_heartbeat >= REMOTE_CODING_HEARTBEAT_S:
                 _publish_coding_heartbeat(cli, int(now - turn_start))
                 last_heartbeat = now
-            deadline = max(deadline,
-                           time.time() + max(3 * REMOTE_CODING_POLL_S, 120))
+            deadline = min(hard_stop,
+                           max(deadline,
+                               time.time() + max(3 * REMOTE_CODING_POLL_S, 120)))
     # Budget spent with no live heartbeat seen recently and no verdict. The
     # turn may STILL have completed its work — a blind re-run is not safe.
     # Probe once more, then tell the persona to VERIFY STATE WITHOUT running a
@@ -797,7 +812,7 @@ def _poll_coding_turn(client, turn_id: str, outer_deadline: float | None = None,
     # deadline is a HARD bound, and one more blocking call (up to the poll
     # client's ~40s connect+read window) would overshoot it (TEAM-3307).
     if outer_deadline is not None and time.monotonic() >= outer_deadline:
-        return _deadline_expired_error()
+        return _deadline_expired_error(int(time.time() - turn_start))
     try:
         final = _poll_once(client, turn_id)
         if final.get("status") == "done":
@@ -805,8 +820,10 @@ def _poll_coding_turn(client, turn_id: str, outer_deadline: float | None = None,
     except Exception:  # noqa: BLE001
         pass
     if outer_deadline is not None and time.monotonic() >= outer_deadline:
-        return _deadline_expired_error()
-    return {"error": f"coding turn exceeded {budget}s budget "
+        return _deadline_expired_error(int(time.time() - turn_start))
+    elapsed = int(time.time() - turn_start)
+    return {"error": f"coding turn gave up after {elapsed}s "
+                     f"(budget bound: {budget}s) "
                      f"with no verdict. Its work may already exist and a runner "
                      f"may still be finishing. Do NOT re-run the task and do NOT "
                      f"start another coding call yet: wait a few minutes, then "
