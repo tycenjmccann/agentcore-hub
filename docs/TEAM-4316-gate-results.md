@@ -29,3 +29,14 @@ Gates run below (verbatim summaries appended as each completes).
 **Exit code: 0 (PASS).** No output (no type errors).
 
 ---
+
+## Gate 3 — `npm run build`
+
+**Exit code: 0 (PASS).**
+
+```
+ ✓ Compiled successfully
+└ ○ /workflow                                                         173 kB          318 kB
+```
+
+---
