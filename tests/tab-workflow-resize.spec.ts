@@ -138,18 +138,23 @@ test.describe("Workflow sidebar resize (TEAM-4316)", () => {
 
   test("5: scrollbar styling — thin + 6px webkit width (no default white bar)", async ({ page }) => {
     await setup(page, { clearWidth: true });
-    // The workflows list scroll container: the flex-1 overflow-y-auto inside the sidebar.
-    const listContainer = page.locator(HANDLE).locator("xpath=..").locator(".flex-1.overflow-y-auto").first();
+    // The workflows list scroll container, addressed by a stable test id
+    // (decoupled from Tailwind class names).
+    const listContainer = page.getByTestId("workflow-history-list");
     await expect(listContainer).toBeAttached();
 
     const result = await listContainer.evaluate((el) => ({
       scrollbarWidth: getComputedStyle(el).scrollbarWidth,
       webkitWidth: getComputedStyle(el, "::-webkit-scrollbar").width,
+      noHorizontalScroll: el.scrollWidth <= el.clientWidth,
     }));
     // Report exact values so an empty return is visible, not silently loosened.
     console.log(`scrollbar computed: scrollbarWidth=${JSON.stringify(result.scrollbarWidth)} webkitWidth=${JSON.stringify(result.webkitWidth)}`);
     expect(result.scrollbarWidth).toBe("thin");
     expect(result.webkitWidth).toBe("6px");
+    // R2.8 (data-independent): the list never grows a horizontal scrollbar at
+    // the default 288px width, regardless of whether any rows are present.
+    expect(result.noHorizontalScroll).toBe(true);
     await page.screenshot({ path: `${SCREENSHOT_DIR}/05-scrollbar.png`, fullPage: true });
   });
 

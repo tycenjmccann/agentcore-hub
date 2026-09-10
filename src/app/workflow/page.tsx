@@ -132,6 +132,7 @@ export default function WorkflowPage() {
       document.body.style.cursor = "";
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onEnd);
+      window.removeEventListener("pointercancel", onEnd);
     };
     // Forward-declared so `cleanup` can reference it without no-use-before-define.
     function onEnd() {
@@ -143,6 +144,7 @@ export default function WorkflowPage() {
     dragCleanupRef.current = cleanup;
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", onEnd);
+    window.addEventListener("pointercancel", onEnd);
   }, [applyWidth]);
 
   // Unmount safety net: removes any live drag listeners and restores body styles.
@@ -453,7 +455,7 @@ export default function WorkflowPage() {
             </div>
 
             {/* Workflow List */}
-            <div className="flex-1 overflow-y-auto">
+            <div data-testid="workflow-history-list" className="flex-1 overflow-y-auto">
               {/* Active Runs */}
               {activeWorkflows.length > 0 && (
                 <div className="p-2">
@@ -513,7 +515,7 @@ export default function WorkflowPage() {
               onPointerDown={handleResizeStart}
               onDoubleClick={handleResizeReset}
               onKeyDown={handleResizeKeyDown}
-              className="absolute top-0 right-0 h-full w-1 cursor-col-resize z-10 hover:bg-[var(--color-border-hover)] focus:bg-[var(--color-border-hover)] focus:outline-none transition-colors"
+              className="absolute top-0 right-0 h-full w-1 cursor-col-resize touch-none select-none z-10 hover:bg-[var(--color-border-hover)] focus:bg-[var(--color-border-hover)] focus:outline-none transition-colors"
             />
           </>
         )}
