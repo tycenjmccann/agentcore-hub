@@ -31,17 +31,27 @@ command to paste — re-derive the check yourself before you run anything.
 
 **If `PIPELINE_ENABLED` is set in your context (a real CodeBuild pipeline owns
 the build — docs/cicd-pipeline-module-design.md):** do NOT re-run the mechanical
-build yourself. It is authoritative and already ran in a hermetic container.
-Instead, read the CodeBuild PR-check result for the branch head SHA (via the
-`Pipeline___*` tools, or `claude_code` with `aws codebuild
-batch-get-builds`) and POPULATE the Verification Ledger's compile+test rows from
-it — cite the CodeBuild build id / log link as the evidence. If CodeBuild is red
-for the head SHA, stop here and report FAIL referencing the failing build (the
-CI agent owns filing the build-failure fix tickets; note the overlap and do not
-double-file). If no build exists for the head SHA, that dimension is UNVERIFIED →
-BLOCKED, not PASS. Then proceed to Step 3 for the judgment work that the
-pipeline does NOT do (visual, live-integration, perf, acceptance) — that is now
-your primary value.
+build yourself. The CI agent ran BEFORE you (your ticket is `blocked_by` its CI
+ticket) and certified the integration-branch head. Read its completion record at
+`s3://<bucket>/completions/<ci-ticket>.json` (the CI ticket key is in your
+ticket's `blocked_by`; `Tickets___list_tickets(<epic>)` also lists it) and use
+its `ci_status` / `ci_build_id` / `ci_head_sha`. Their meaning is defined ONCE,
+in the `WorkflowOutput___report_completion` tool description — do not re-derive
+it here:
+- `certified` AND `ci_head_sha` == the head you are verifying → POPULATE the
+  Verification Ledger's compile+test rows from it, citing the build id as the
+  evidence.
+- `github-actions-proxy` → populate those rows from the head's green GitHub
+  check-runs and label them "proxy" in the ledger: evidence, not certification.
+- `unverified`, no record, or `ci_head_sha` != your head → the build dimension is
+  UNVERIFIED → BLOCKED, not PASS; name the SHA gap in your verdict.
+Never start a build yourself (`Pipeline___start_ci_build` belongs to the CI
+agent: one build per head, one owner) and never shell `aws codebuild` — the
+coding runtime is denied CodeBuild access. Then proceed to Step 3 for the
+judgment work the pipeline does NOT do (visual, live-integration, perf,
+acceptance) — that is your primary value. Your fix rounds move the head after
+certification; the release manager re-certifies via a CI re-run ticket at ship,
+you do not.
 
 **If `PIPELINE_ENABLED` is absent (no deployed pipeline):** run the build
 yourself as below.

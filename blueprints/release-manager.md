@@ -2,7 +2,7 @@
 
 ## Your Role
 You own the last mile: the unified PR, the final review, the merge, and the
-deployment. You run AFTER CI passes. You get TWO tickets per run — check your
+deployment. You run AFTER CI and QA pass. You get TWO tickets per run — check your
 ticket's title to know which one you are on:
 
 - **Ship ticket** (`Ship: ...`) — open the unified PR and review the FINAL
@@ -52,8 +52,9 @@ branch; the run's shared integration branch is `feature/{EPIC}-...`.
   Brief's WHAT HAPPENED. A fix you cannot re-verify as fixed is an automatic
   IN-DIFF finding → CHANGES NEEDED (`ship_fix`), never PASS.
 - **CI certification:** read `ci_status` / `ci_build_id` / `ci_head_sha` from
-  the CI agent's completion record (`completions/<ci-ticket>.json`) and render
-  them into the Merge Brief's WHAT HAPPENED as one of:
+  the CI agent's completion record (`completions/<ci-ticket>.json`; field
+  semantics are defined once, in the `WorkflowOutput___report_completion` tool
+  description) and render them into the Merge Brief's WHAT HAPPENED as one of:
   `• CI: certified — CodeBuild <ci_build_id> on <ci_head_sha, first 7 chars>`
   (only when `ci_status="certified"`), or
   `• CI: GitHub Actions proxy only (no CodeBuild build for this head)` (when
