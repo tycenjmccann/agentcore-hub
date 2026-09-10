@@ -1,7 +1,13 @@
 import { test, expect } from "@playwright/test";
 import {
   ABSURD_TITLE,
+  CANVAS_BAR_HEIGHT,
+  CODE_BAR_HEIGHT,
+  CSS_SOURCES,
   DEFAULT_WIDTH,
+  GLOBALS_BAR,
+  GLOBALS_THUMB_DARK,
+  GLOBALS_TRACK,
   HANDLE,
   KEY_STEP,
   LIST,
@@ -9,7 +15,10 @@ import {
   MAX_CEILING,
   MEDIUM_TITLE,
   MIN_WIDTH,
+  MODAL_BAR_WIDTH,
   OVERFLOW_ROWS,
+  PIPELINE_CANVAS_TRACK_DARK,
+  PIPELINE_THUMB_DARK,
   SCREENSHOT_DIR,
   SHORT_TITLE,
   SMALL_ROWS,
@@ -27,9 +36,11 @@ import {
   keyboardToWidth,
   listMetrics,
   makeRows,
+  mountBoardProbes,
   nativeGutter,
   near,
   pressKey,
+  probeStyleEnv,
   renderedWidth,
   resetLog,
   settledWidth,
@@ -866,6 +877,477 @@ test.describe("E: drag lifecycle (TEAM-4331)", () => {
       expect(near(await settledWidth(page), 450 - KEY_STEP, 3)).toBe(true);
       expect(await storedWidth(page)).toBe(String(450 - KEY_STEP));
     });
+  });
+});
+
+// ════════════ F — the board scrollbars survive the global block (TEAM-4357) ═══
+//
+// The gap this closes: Group A proves globals.css's own scrollbar block paints,
+// on `[data-testid=workflow-history-list]` — an element that carries NO
+// pipeline.css class. Nothing anywhere named `.pipeline-canvas`,
+// `.code-block-content`, `.modal-content`, `.s3-modal-content` or
+// `.artifact-viewer-body`, so a re-broadened globals block (the pre-TEAM-4330
+// state) or a globals `!important` would kill all five board scrollbars and the
+// whole suite would stay green. See tests/helpers/workflow-resize.ts for the two
+// mechanisms under test and why the real CSS is read off disk.
+//
+// Every value below was MEASURED with a throwaway probe before being pinned
+// (Chromium 148, the ladder recorded at the top of this file), not copied from
+// docs/TEAM-4330-scrollbar-verification.md — that doc's single `gutterPx` field
+// does not say which axis it measured, and for `.code-block-content` its 6
+// cannot be the horizontal gutter, which measures 4.
+
+test.describe("F: pipeline.css board scrollbars survive globals.css (TEAM-4357)", () => {
+  /** L1 for any board scroller: webkit painting is enabled at all. Identical
+   *  logic and identical stakes for all three probes, so it is shared — but the
+   *  message always names the class, because the failure output is the product. */
+  const expectL1Auto = (
+    m: { scrollbarWidth: string; scrollbarColor: string },
+    cls: string
+  ): void => {
+    const why =
+      `webkit scrollbar painting is DISABLED for ${cls}. Per MDN a computed ` +
+      "`scrollbar-width`/`scrollbar-color` of anything other than `auto` suppresses " +
+      "every ::-webkit-scrollbar-* rule, so the `@supports selector(::-webkit-scrollbar)` " +
+      "auto-reset in src/styles/globals.css is missing, no longer matches, or has been " +
+      "re-broadened. This kills ALL FIVE pipeline.css board scrollbar groups at once, " +
+      "not just this one. Context: TEAM-4330 / docs/TEAM-4330-scrollbar-verification.md.";
+    expect.soft(m.scrollbarWidth, `L1 ${cls}: ${why}`).toBe("auto");
+    expect.soft(m.scrollbarColor, `L1 ${cls}: ${why}`).toBe("auto");
+  };
+
+  /** The message for "globals reclaimed the pseudo-element", parameterised. */
+  const reclaimed = (cls: string, decl: string, line: string): string =>
+    `L2 ${cls}: globals' \`*::-webkit-scrollbar\` has RECLAIMED the pseudo-element — ` +
+    "either via !important or via a selector of equal-or-higher specificity than " +
+    `(0,1,1). pipeline.css's own \`${decl}\` no longer governs. Compare ${line} ` +
+    "against the `*::-webkit-scrollbar` rule in src/styles/globals.css.";
+
+  test("F0: the injected sheets ARE the real files and both survival mechanisms are live", async ({
+    page,
+  }) => {
+    await mountBoardProbes(page);
+    const env = await probeStyleEnv(page);
+    console.log(`[F0] sources ${JSON.stringify(CSS_SOURCES)}`);
+    console.log(`[F0] env ${JSON.stringify(env)}`);
+
+    // Hard, not soft: every other assertion in Group F is meaningless if the
+    // harness did not actually load the files or the engine lacks the selector.
+    expect(
+      env.supportsWebkitSelector,
+      "F0 engine gate: this Chromium does not support `selector(::-webkit-scrollbar)`, so " +
+        "the @supports reset never applies and `auto` below would mean something else entirely."
+    ).toBe(true);
+    expect(env.themeAttr, "F0: mountBoardProbes failed to set data-theme=dark").toBe("dark");
+
+    // Token pins, so the rgb() constants stay self-explaining if a token moves.
+    expect(
+      env.surface4,
+      "F0: globals' dark --color-surface-4 moved. GLOBALS_THUMB_DARK in " +
+        "tests/helpers/workflow-resize.ts is derived from it and must be updated together."
+    ).toBe("#2a2a3a");
+    expect(
+      env.pipelineBorder,
+      "F0: pipeline.css's --pipeline-border moved. PIPELINE_THUMB_DARK is derived from it. " +
+        "NOTE it is declared in `:root` (dark is the default), not in a [data-theme=dark] block."
+    ).toBe("#1e293b");
+
+    // ── mechanism (a): the auto-reset ──────────────────────────────────────────
+    expect(
+      env.supportsGroupCount,
+      "F0 mechanism (a): expected exactly ONE `@supports selector(::-webkit-scrollbar)` group " +
+        "in src/styles/globals.css. Zero means the auto-reset was deleted and every " +
+        "::-webkit-scrollbar rule in the app is now dead code (the pre-TEAM-4330 bug); more " +
+        "than one means the reset was duplicated and source order now decides the outcome."
+    ).toBe(1);
+    expect(
+      env.supportsResetDecls,
+      "F0 mechanism (a): the @supports group must reset BOTH standard properties on `*`. " +
+        "scrollbar-color is inherited and scrollbar-width is not, so resetting only one leaves " +
+        "the outcome dependent on which MDN sentence you read."
+    ).toEqual([{ selector: "*", scrollbarWidth: "auto", scrollbarColor: "auto" }]);
+
+    // Baseline pin: what the global bar declares, i.e. what a reclaimed board
+    // scroller would fall back to.
+    expect(
+      env.starBarDecls,
+      "F0: globals' universal `*::-webkit-scrollbar` geometry changed (or the rule is gone). " +
+        "GLOBALS_BAR and the F2 negative assertion both depend on it being 6px/6px."
+    ).toEqual({ width: "6px", height: "6px" });
+
+    // ── mechanism (b): the five class-qualified groups ────────────────────────
+    // Renaming or deleting one reddens HERE, instead of silently shrinking the
+    // coverage of the three probes below to a subset of the board.
+    expect(
+      env.pipelineWebkitGroupSelectors,
+      "F0 mechanism (b): the set of `::-webkit-scrollbar` groups in " +
+        "src/components/workflow/pipeline.css changed. F1-F3 probe three of these five " +
+        "directly; the other two (.s3-modal-content, .artifact-viewer-body) are structurally " +
+        "identical to .modal-content and are guarded by this assertion alone."
+    ).toEqual([
+      ".artifact-viewer-body::-webkit-scrollbar",
+      ".code-block-content::-webkit-scrollbar",
+      ".modal-content::-webkit-scrollbar",
+      ".pipeline-canvas::-webkit-scrollbar",
+      ".s3-modal-content::-webkit-scrollbar",
+    ]);
+
+    // Non-contamination: the probe harness must not be the reason F1-F3 pass.
+    expect(
+      env.harnessMentionsScrollbar,
+      "F0: the probe harness CSS now mentions `scrollbar`. It styles wrapper IDs only, " +
+        "deliberately — a scrollbar declaration in the harness would make Group F assert the " +
+        "harness rather than the shipped stylesheets."
+    ).toBe(false);
+
+    // Non-vacuity on BOTH axes: if a future runner hides scrollbars (Playwright
+    // passes --hide-scrollbars by default; see the test.use at the top of this
+    // file), every gutter collapses to 0 and F1-F3 would pass by measuring
+    // nothing. These fail loudly instead.
+    const nativeY = await nativeGutter(page, "y");
+    const nativeX = await nativeGutter(page, "x");
+    console.log(`[F0] bare control nativeY=${nativeY} nativeX=${nativeX}`);
+    const vacuity =
+      "F0 non-vacuity: a bare page with NO author CSS reserves a 0px gutter, so scrollbars are " +
+      "hidden in this run (a lost `ignoreDefaultArgs: [--hide-scrollbars]`, or a headless " +
+      "default change). Every L3 gutter assertion in F1-F3 would then pass vacuously.";
+    expect.soft(nativeY, `${vacuity} (vertical axis)`).toBeGreaterThan(0);
+    expect.soft(nativeX, `${vacuity} (horizontal axis)`).toBeGreaterThan(0);
+  });
+
+  test("F1: .pipeline-canvas keeps its own 6px bar and --pipeline-bg track", async ({ page }) => {
+    await mountBoardProbes(page);
+    const m = await listMetrics(page.locator(".pipeline-canvas"));
+    console.log(
+      `[F1] .pipeline-canvas hGutter=${m.hGutter} vGutter=${m.gutter} ` +
+        `wkHeight=${JSON.stringify(m.wkHeight)} thumb=${JSON.stringify(m.wkThumbBg)} ` +
+        `track=${JSON.stringify(m.wkTrackBg)} sbW=${JSON.stringify(m.scrollbarWidth)}`
+    );
+
+    expect(
+      m.overflowsHorizontally,
+      "F1 precondition: the canvas probe does not overflow horizontally, so there is no " +
+        "horizontal scrollbar to measure and the FIXTURE is what is wrong, not the app. " +
+        "8 × .phase-box (290px) inside a 600px wrapper must overflow."
+    ).toBe(true);
+
+    expectL1Auto(m, ".pipeline-canvas");
+
+    // L2. NOTE: `height: 6px` is the SAME value globals declares, so geometry
+    // alone does NOT discriminate here — a reclaim by globals would still read
+    // 6px. The colours below are the real discriminators for this group.
+    expect.soft(
+      m.wkHeight,
+      reclaimed(
+        ".pipeline-canvas",
+        ".pipeline-canvas::-webkit-scrollbar { height: 6px }",
+        "src/components/workflow/pipeline.css:619"
+      ) + " (pinned, but NOT discriminating: globals declares 6px too.)"
+    ).toBe(CANVAS_BAR_HEIGHT);
+    expect.soft(
+      m.wkThumbBg,
+      reclaimed(
+        ".pipeline-canvas",
+        ".pipeline-canvas::-webkit-scrollbar-thumb { background: var(--pipeline-border) }",
+        "src/components/workflow/pipeline.css:621"
+      )
+    ).toBe(PIPELINE_THUMB_DARK);
+    // The negative form of the same fact. Redundant today by construction, kept
+    // because THIS is the line whose failure message names the regression: the
+    // board bar is now wearing globals' --color-surface-4.
+    expect.soft(
+      m.wkThumbBg,
+      "L2 .pipeline-canvas: the thumb is now globals' --color-surface-4 (#2a2a3a) instead of " +
+        "pipeline.css's --pipeline-border (#1e293b) — the board scrollbar has been repainted " +
+        "by src/styles/globals.css's `*::-webkit-scrollbar-thumb`."
+    ).not.toBe(GLOBALS_THUMB_DARK);
+    expect.soft(
+      m.wkThumbRadius,
+      reclaimed(
+        ".pipeline-canvas",
+        ".pipeline-canvas::-webkit-scrollbar-thumb { border-radius: 3px }",
+        "src/components/workflow/pipeline.css:621"
+      )
+    ).toBe("3px");
+    // THE canvas discriminator: it is the only one of the five groups with its
+    // own track colour, so this channel cannot be confused with globals'.
+    expect.soft(
+      m.wkTrackBg,
+      reclaimed(
+        ".pipeline-canvas",
+        ".pipeline-canvas::-webkit-scrollbar-track { background: var(--pipeline-bg) }",
+        "src/components/workflow/pipeline.css:620"
+      ) + " This is the canvas's strongest signal — no other board group sets a track colour."
+    ).toBe(PIPELINE_CANVAS_TRACK_DARK);
+    expect.soft(
+      m.wkTrackBg,
+      "L2 .pipeline-canvas: the track is now TRANSPARENT, i.e. globals' " +
+        "`*::-webkit-scrollbar-track { background: transparent }` has won over pipeline.css's " +
+        "opaque var(--pipeline-bg) track."
+    ).not.toBe(GLOBALS_TRACK);
+
+    // L3 — the only proof the rule actually PAINTS. Chromium reports the L2
+    // strings from the declaration even when painting is suppressed, which is
+    // exactly how the old case 5 passed against the broken code.
+    expect.soft(
+      m.hGutter,
+      "L3 .pipeline-canvas: the reserved HORIZONTAL gutter (offsetHeight - clientHeight) is " +
+        "not 6px, so pipeline.css's `.pipeline-canvas::-webkit-scrollbar { height: 6px }` is " +
+        "not governing the paint. 10 means the standard `scrollbar-width: thin` path took over " +
+        "(the @supports auto-reset is gone); 15 means the platform-native bar; 0 means " +
+        "scrollbars are hidden in this run."
+    ).toBe(6);
+    expect.soft(
+      m.gutter,
+      "L3 .pipeline-canvas: a VERTICAL gutter appeared. The canvas is `overflow-x: auto` with " +
+        "`min-height: 840px`, so it must overflow horizontally only — a vertical bar means the " +
+        "probe geometry changed and the horizontal measurement above is no longer attributable " +
+        "to one axis."
+    ).toBe(0);
+  });
+
+  test("F2: .code-block-content keeps pipeline.css's 4px bar, NOT globals' 6px", async ({
+    page,
+  }) => {
+    await mountBoardProbes(page);
+    const m = await listMetrics(page.locator(".code-block-content"));
+    console.log(
+      `[F2] .code-block-content hGutter=${m.hGutter} vGutter=${m.gutter} ` +
+        `wkHeight=${JSON.stringify(m.wkHeight)} wkWidth=${JSON.stringify(m.wkWidth)} ` +
+        `thumb=${JSON.stringify(m.wkThumbBg)} sbW=${JSON.stringify(m.scrollbarWidth)}`
+    );
+
+    expect(
+      m.overflowsHorizontally,
+      "F2 precondition: the <pre> probe does not overflow horizontally. `white-space: pre` " +
+        "comes from the UA stylesheet (pipeline.css sets none), so one long unwrapped line " +
+        "must overflow a 600px wrapper — if it does not, the FIXTURE is wrong."
+    ).toBe(true);
+
+    expectL1Auto(m, ".code-block-content");
+
+    // L2. This is the ONE genuinely discriminating geometry channel on the whole
+    // board: 4px is a value globals does not declare anywhere, so a reclaim by
+    // globals is visible here and nowhere else in the geometry.
+    expect.soft(
+      m.wkHeight,
+      reclaimed(
+        ".code-block-content",
+        ".code-block-content::-webkit-scrollbar { height: 4px }",
+        "src/components/workflow/pipeline.css:498"
+      ) + " 4px is the only board geometry globals does not also declare, so this is the " +
+        "sharpest geometric signal in Group F."
+    ).toBe(CODE_BAR_HEIGHT);
+    expect.soft(
+      m.wkHeight,
+      "L2 .code-block-content: the bar is now 6px — globals' universal " +
+        "`*::-webkit-scrollbar { height: 6px }` has replaced pipeline.css's 4px code-block bar."
+    ).not.toBe(GLOBALS_BAR);
+    expect.soft(
+      m.wkThumbBg,
+      reclaimed(
+        ".code-block-content",
+        ".code-block-content::-webkit-scrollbar-thumb { background: var(--pipeline-border) }",
+        "src/components/workflow/pipeline.css:500"
+      )
+    ).toBe(PIPELINE_THUMB_DARK);
+    expect.soft(
+      m.wkThumbBg,
+      "L2 .code-block-content: the thumb is now globals' --color-surface-4 (#2a2a3a) instead " +
+        "of pipeline.css's --pipeline-border (#1e293b) — globals' " +
+        "`*::-webkit-scrollbar-thumb` has repainted the code-block scrollbar."
+    ).not.toBe(GLOBALS_THUMB_DARK);
+    expect.soft(
+      m.wkThumbRadius,
+      reclaimed(
+        ".code-block-content",
+        ".code-block-content::-webkit-scrollbar-thumb { border-radius: 2px }",
+        "src/components/workflow/pipeline.css:500"
+      )
+    ).toBe("2px");
+    // Deliberately asserts globals' value: pipeline.css declares no `width` for
+    // this group, so globals legitimately governs that axis. A PIN, not a
+    // discriminator — it states that the guard means "pipeline wins where it
+    // declares", not "globals is dead".
+    expect.soft(
+      m.wkWidth,
+      "L2 .code-block-content: the vertical bar WIDTH is expected to come from globals " +
+        "(pipeline.css declares only `height` for this group), so 6px here is correct and " +
+        "intended. A different value means globals' universal bar geometry changed — update " +
+        "GLOBALS_BAR and re-check F0's starBarDecls pin."
+    ).toBe(GLOBALS_BAR);
+
+    // L3 — the paint. 4 vs 6 is the flip both negative controls target.
+    expect.soft(
+      m.hGutter,
+      "L3 .code-block-content: the reserved HORIZONTAL gutter (offsetHeight - clientHeight) " +
+        "is not 4px, so pipeline.css's 4px rule is not governing the paint. 6 means globals " +
+        "reclaimed it; 10 means the standard thin path took over (the @supports auto-reset is " +
+        "gone); 0 means scrollbars are hidden in this run."
+    ).toBe(4);
+    expect.soft(
+      m.hGutter,
+      "L3 .code-block-content: the horizontal gutter is 6px — globals' universal 6px bar is " +
+        "now painting on the code block instead of pipeline.css's 4px one."
+    ).not.toBe(6);
+    // Axis attribution. docs/TEAM-4330-scrollbar-verification.md records a single
+    // `gutterPx: 6` for this class, which CANNOT be the horizontal gutter measured
+    // above (4) — it is the width-axis/globals-governed reading. Pinning the cross
+    // axis explicitly is what keeps that ambiguity out of this file.
+    expect.soft(
+      m.gutter,
+      "L3 .code-block-content: a VERTICAL gutter appeared on the <pre> probe. It holds one " +
+        "unwrapped line, so it must overflow horizontally only; a vertical bar means the " +
+        "horizontal measurement above is no longer attributable to a single axis."
+    ).toBe(0);
+  });
+
+  test("F3: .modal-content's 6px bar carries pipeline.css's thumb, NOT globals'", async ({
+    page,
+  }) => {
+    await mountBoardProbes(page);
+    const m = await listMetrics(page.locator(".modal-content"));
+    console.log(
+      `[F3] .modal-content vGutter=${m.gutter} hGutter=${m.hGutter} ` +
+        `wkWidth=${JSON.stringify(m.wkWidth)} thumb=${JSON.stringify(m.wkThumbBg)} ` +
+        `sbW=${JSON.stringify(m.scrollbarWidth)}`
+    );
+
+    expect(
+      m.overflowsVertically,
+      "F3 precondition: the modal body does not overflow vertically. `.modal-content { flex: 1 }` " +
+        "needs `.agent-output-modal`'s `display:flex; flex-direction:column; max-height:80vh` " +
+        "to have a height to overflow — if it does not, the FIXTURE lost that wrapper."
+    ).toBe(true);
+
+    expectL1Auto(m, ".modal-content");
+
+    // L2. NOTE: `width: 6px` is identical to globals', so geometry does NOT
+    // discriminate for this group either, and its track is transparent in BOTH
+    // sheets. The thumb colour is the ONLY channel that can tell the two apart —
+    // which is precisely why the negative assertion below is the load-bearing one.
+    expect.soft(
+      m.wkWidth,
+      reclaimed(
+        ".modal-content",
+        ".modal-content::-webkit-scrollbar { width: 6px }",
+        "src/components/workflow/pipeline.css:510"
+      ) + " (pinned, but NOT discriminating: globals declares 6px too.)"
+    ).toBe(MODAL_BAR_WIDTH);
+    expect.soft(
+      m.wkThumbBg,
+      reclaimed(
+        ".modal-content",
+        ".modal-content::-webkit-scrollbar-thumb { background: var(--pipeline-border) }",
+        "src/components/workflow/pipeline.css:512"
+      ) + " This is the ONLY discriminating channel for this group."
+    ).toBe(PIPELINE_THUMB_DARK);
+    expect.soft(
+      m.wkThumbBg,
+      "L2 .modal-content: the thumb is now globals' --color-surface-4 (#2a2a3a) instead of " +
+        "pipeline.css's --pipeline-border (#1e293b). For this group the thumb colour is the " +
+        "ONLY signal — its 6px width and transparent track are identical in both sheets — so " +
+        "this assertion is the whole guard for .modal-content (and, via F0, for the " +
+        "structurally identical .s3-modal-content and .artifact-viewer-body)."
+    ).not.toBe(GLOBALS_THUMB_DARK);
+    expect.soft(
+      m.wkThumbRadius,
+      reclaimed(
+        ".modal-content",
+        ".modal-content::-webkit-scrollbar-thumb { border-radius: 3px }",
+        "src/components/workflow/pipeline.css:512"
+      )
+    ).toBe("3px");
+    expect.soft(
+      m.wkTrackBg,
+      "L2 .modal-content: the track colour changed. pipeline.css declares `transparent` here " +
+        "and so does globals, so this value is expected to be identical either way — it is a " +
+        "pin on the design, NOT a discriminator between the two sheets."
+    ).toBe(GLOBALS_TRACK);
+
+    // L3 — the paint, on the VERTICAL axis for this group.
+    expect.soft(
+      m.gutter,
+      "L3 .modal-content: the reserved VERTICAL gutter (offsetWidth - clientWidth) is not 6px, " +
+        "so `.modal-content::-webkit-scrollbar { width: 6px }` is not governing the paint. " +
+        "10 means the standard thin path took over (the @supports auto-reset is gone); " +
+        "15 means the platform-native bar; 0 means scrollbars are hidden in this run."
+    ).toBe(6);
+    expect.soft(
+      m.hGutter,
+      "L3 .modal-content: a HORIZONTAL gutter appeared. The modal body is `overflow-y: auto` " +
+        "with narrow content, so it must overflow vertically only."
+    ).toBe(0);
+  });
+});
+
+// ═════════════ G — the corrupt stored-width path (TEAM-4357) ══════════════════
+//
+// `Number.isFinite` guards the mount read (src/app/workflow/page.tsx:108) and was
+// only ever exercised indirectly. These four cases pin BOTH of its branches, and
+// the storage value is asserted unchanged in each: the read path must never
+// rewrite what it just read.
+
+test.describe("G: a corrupt stored width falls back safely (TEAM-4357)", () => {
+  for (const seed of ["abc", "NaN", "1e999"]) {
+    test(`G: a stored width of ${JSON.stringify(seed)} renders the ${DEFAULT_WIDTH} default`, async ({
+      page,
+    }) => {
+      // "abc"/"NaN" -> Number(...) is NaN; "1e999" -> Infinity. Both are rejected
+      // by Number.isFinite, but they are DIFFERENT rejection paths, and "abc"
+      // alone never reaches the Infinity one.
+      await setup(page, { rows: SMALL_ROWS, seedWidthRaw: seed });
+
+      expect(
+        await aria(page, "aria-valuenow"),
+        `G(${seed}): a non-finite stored width must leave the width at the ${DEFAULT_WIDTH} ` +
+          "default. The Number.isFinite guard at src/app/workflow/page.tsx:108 either accepted " +
+          "a non-finite value (NaN/Infinity would then flow into clampHistoryWidth) or the " +
+          "SSR-safe seed changed."
+      ).toBe(DEFAULT_WIDTH);
+      expect(
+        near(await settledWidth(page), DEFAULT_WIDTH),
+        `G(${seed}): the RENDERED sidebar width does not match the ${DEFAULT_WIDTH} default, ` +
+          "even though aria-valuenow does — state and layout have diverged."
+      ).toBe(true);
+      expect(
+        await storedWidth(page),
+        `G(${seed}): the mount READ rewrote localStorage. It must be side-effect free — ` +
+          "silently normalising a corrupt value would destroy the evidence of the corruption " +
+          "and make this class of bug unreproducible."
+      ).toBe(seed);
+    });
+  }
+
+  test(`G: an EMPTY stored width clamps to the ${MIN_WIDTH} floor, not the ${DEFAULT_WIDTH} default`, async ({
+    page,
+  }) => {
+    // NOT the 288 default, and this is the ticket's own brief being wrong rather
+    // than the app: `Number("") === 0` and `Number.isFinite(0) === true`, so the
+    // guard at src/app/workflow/page.tsx:108 ACCEPTS an empty string. That sets
+    // preferredWidthRef to 0 and renders clampHistoryWidth(0), which is
+    // HISTORY_MIN_WIDTH === 240. So for "" it is the CLAMP FLOOR, not the
+    // Number.isFinite guard, that keeps a broken width off the screen. Pinned at
+    // 240 deliberately — asserting 288 here would encode a wrong mental model of
+    // which guard is doing the work.
+    await setup(page, { rows: SMALL_ROWS, seedWidthRaw: "" });
+
+    expect(
+      await aria(page, "aria-valuenow"),
+      `G(""): an empty stored width must render the ${MIN_WIDTH} clamp floor. Number("") is 0, ` +
+        "which IS finite, so page.tsx:108 accepts it and clampHistoryWidth(0) yields " +
+        `${MIN_WIDTH}. Receiving ${DEFAULT_WIDTH} would mean the guard started rejecting "" ` +
+        "(a behaviour change, not necessarily a bug — but this test must then be re-decided, " +
+        "not silently re-pinned)."
+    ).toBe(MIN_WIDTH);
+    expect(
+      near(await settledWidth(page), MIN_WIDTH),
+      `G(""): the RENDERED width does not match the ${MIN_WIDTH} floor that aria-valuenow reports.`
+    ).toBe(true);
+    expect(
+      await storedWidth(page),
+      'G(""): the mount read rewrote the empty stored value instead of leaving it alone.'
+    ).toBe("");
   });
 });
 
