@@ -137,6 +137,19 @@ test.describe("Workflow list sidebar — resize", () => {
     await page.setViewportSize({ width: 1400, height: 900 });
     await page.waitForTimeout(SETTLE_MS);
     expect(await sidebarWidth(page)).toBeGreaterThanOrEqual(630);
+
+    // Shrink again: an arrow-key nudge must step from the *rendered* 400px, not
+    // from the stored 640px, so the keypress visibly moves the edge — and that
+    // explicit adjustment becomes the new chosen (persisted) width.
+    await page.setViewportSize({ width: 800, height: 900 });
+    await page.waitForTimeout(SETTLE_MS);
+    await page.locator(HANDLE).focus();
+    await page.keyboard.press("ArrowLeft");
+    await page.waitForTimeout(SETTLE_MS);
+    const nudged = await sidebarWidth(page);
+    expect(nudged).toBeGreaterThanOrEqual(383);
+    expect(nudged).toBeLessThanOrEqual(385);
+    expect(await page.evaluate(() => localStorage.getItem("workflow-history-width"))).toBe("384");
   });
 
   test("collapse then expand restores the persisted width", async ({ page }) => {

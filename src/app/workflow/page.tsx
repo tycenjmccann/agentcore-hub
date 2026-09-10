@@ -53,21 +53,25 @@ export default function WorkflowPage() {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [nudgeToast, setNudgeToast] = useState<{ message: string; type: "success" | "info" | "error" } | null>(null);
   const [historyCollapsed, setHistoryCollapsed] = useState(true);
-  const [historyWidth, setHistoryWidth] = useState(HISTORY_DEFAULT_WIDTH);
-  // Viewport-dependent upper bound, kept in state so aria-valuemax re-renders
-  // when the window resizes. Starts at the absolute max so SSR and the first
-  // client render agree (the resize effect corrects it on mount).
+  // The width the user chose, clamped to the absolute bounds only — this is what
+  // gets persisted, so a temporarily narrow window never destroys it.
+  const [chosenWidth, setChosenWidth] = useState(HISTORY_DEFAULT_WIDTH);
+  // Viewport-dependent upper bound, kept in state so the rendered width and
+  // aria-valuemax re-render when the window resizes. Starts at the absolute max
+  // so SSR and the first client render agree (the resize effect fixes it on mount).
   const [historyMaxWidth, setHistoryMaxWidth] = useState(HISTORY_MAX_WIDTH);
   const [dragging, setDragging] = useState(false);
   const sidebarRef = useRef<HTMLDivElement>(null);
-  // The width the user chose, clamped only to the absolute bounds. Handlers that
-  // need the latest value synchronously (persisting on pointerup/
-  // lostpointercapture) read this: a setState functional updater is the wrong
+  // Mirrors chosenWidth for handlers that need it synchronously (persisting on
+  // pointerup/lostpointercapture): a setState functional updater is the wrong
   // tool there since React can defer/replay it, and this handle fires both
   // onPointerUp and onLostPointerCapture per click, so a side effect inside the
-  // updater can persist a stale value. It is also the source of truth the
-  // viewport clamp is re-applied to, so widening the window restores the choice.
+  // updater can persist a stale value.
   const widthRef = useRef(HISTORY_DEFAULT_WIDTH);
+  // What actually renders: the choice, clamped to the current viewport bound.
+  // Derived rather than stored so widening the window restores the choice with
+  // no extra state to keep in sync.
+  const historyWidth = Math.min(Math.max(chosenWidth, HISTORY_MIN_WIDTH), historyMaxWidth);
   const [testDefId, setTestDefId] = useState<string>(DEFAULT_WORKFLOW_DEF_ID);
   const [deleteTargetId, setDeleteTargetId] = useState<string | null>(null);
   const [deleteLoading, setDeleteLoading] = useState(false);
@@ -83,24 +87,21 @@ export default function WorkflowPage() {
     if (storedWidth !== null) {
       const parsed = parseInt(storedWidth, 10);
       if (!Number.isNaN(parsed)) {
-        // Absolute clamp only — the viewport clamp is applied by the resize
-        // effect below, which runs on mount too.
+        // Absolute clamp only — the viewport clamp is applied on render via
+        // historyMaxWidth, which the resize effect below seeds on mount.
         widthRef.current = Math.min(Math.max(parsed, HISTORY_MIN_WIDTH), HISTORY_MAX_WIDTH);
-        setHistoryWidth(widthRef.current);
+        setChosenWidth(widthRef.current);
       }
     }
   }, []);
 
   // min(640, 50vw) moves with the viewport, so a shrinking window must re-clamp
-  // both the rendered width and aria-valuemax. widthRef (the user's choice) and
-  // localStorage are deliberately left alone: a temporarily narrow window should
-  // not overwrite the chosen width, and widening back restores it.
+  // the rendered width and aria-valuemax. Only the bound is tracked here: the
+  // chosen width (widthRef/chosenWidth) and localStorage are deliberately left
+  // alone so a temporarily narrow window does not overwrite the user's choice,
+  // and widening back restores it.
   useEffect(() => {
-    const applyViewportBound = () => {
-      const max = viewportMaxWidth();
-      setHistoryMaxWidth(max);
-      setHistoryWidth(Math.min(Math.max(widthRef.current, HISTORY_MIN_WIDTH), max));
-    };
+    const applyViewportBound = () => setHistoryMaxWidth(viewportMaxWidth());
     applyViewportBound();
     window.addEventListener('resize', applyViewportBound);
     return () => window.removeEventListener('resize', applyViewportBound);
@@ -126,7 +127,7 @@ export default function WorkflowPage() {
     const rectLeft = sidebarRef.current.getBoundingClientRect().left;
     const next = clampWidth(e.clientX - rectLeft);
     widthRef.current = next;
-    setHistoryWidth(next);
+    setChosenWidth(next);
   };
 
   // Fires on both onPointerUp and onLostPointerCapture for a single click —
@@ -139,7 +140,7 @@ export default function WorkflowPage() {
 
   const handleResizeDoubleClick = () => {
     widthRef.current = HISTORY_DEFAULT_WIDTH;
-    setHistoryWidth(HISTORY_DEFAULT_WIDTH);
+    setChosenWidth(HISTORY_DEFAULT_WIDTH);
     localStorage.setItem('workflow-history-width', String(HISTORY_DEFAULT_WIDTH));
   };
 
@@ -147,9 +148,14 @@ export default function WorkflowPage() {
     if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
     e.preventDefault();
     const delta = e.key === 'ArrowLeft' ? -16 : 16;
-    const next = clampWidth(widthRef.current + delta);
+    // Nudge relative to what is currently *rendered*, not to the stored choice:
+    // after a viewport shrink those differ, and stepping from the unclamped
+    // choice would produce a keypress that visibly does nothing. clampWidth on
+    // the ref gives the rendered width synchronously, so repeated keypresses in
+    // one React batch still step correctly.
+    const next = clampWidth(clampWidth(widthRef.current) + delta);
     widthRef.current = next;
-    setHistoryWidth(next);
+    setChosenWidth(next);
     localStorage.setItem('workflow-history-width', String(next));
   };
 
