@@ -85,8 +85,11 @@ this one and its files, so do NOT reference absolute paths like `/tmp/...`; say
    then proceed with the best plan and record the residual gap in your report.
 3. **Approve + execute** — same conversation, NO `plan_only`, NO `resume_session`:
    `claude_code(model="sonnet", task="Plan approved. Implement it exactly as
-   planned, run npx tsc --noEmit and npm run build, and commit.")`. Use
+   planned, run npx tsc --noEmit and npm run lint, and commit.")`. Use
    `model="opus"` when the plan flags high complexity. Never plan on `"haiku"`.
+   Keep this turn to implement + typecheck + lint + commit — `npm run build`,
+   tests, and the screenshot are a SEPARATE turn (Step 4), so a single turn is
+   never long enough to approach the wall-clock cap.
 4. If compilation fails, have it fix the errors (same conversation) before
    proceeding.
 
@@ -95,17 +98,21 @@ setup / implementation / tests / build) gets its own plan → approve → execut
 Fix tickets and rework still plan first; the resumed session already holds the
 context, so the plan turn is short.
 
-### Step 4: Visual Verification (MANDATORY for UI changes)
-After implementation, you MUST verify your work visually. claude_code has its
-own workspace, so the screenshot and its review both happen INSIDE claude_code —
-you don't read the file yourself.
+### Step 4: Build & Visual Verification (SEPARATE claude_code turn, MANDATORY for UI changes)
+Verification is its OWN turn — never fold build/tests into the implement turn
+above. Run it as a fresh `claude_code` call in the SAME session. claude_code has
+its own workspace, so the build, tests, and screenshot all happen INSIDE
+claude_code — you don't read files yourself.
 
 Ask `claude_code` (same session) to:
-1. Start the dev server, install chromium, and screenshot the changed view with
-   Playwright, saving it INTO the repo (e.g. `docs/implementation-screenshot.png`).
-2. Review the screenshot against the design spec and describe what it shows in
+1. Run `npm run build` and the project's tests, fixing any failures (same
+   session) before proceeding.
+2. Start the dev server and screenshot the changed view with Playwright, saving
+   it INTO the repo (e.g. `docs/implementation-screenshot.png`). The browser is
+   pre-baked into the runtime image — do NOT run `playwright install`.
+3. Review the screenshot against the design spec and describe what it shows in
    its response — iterate until it matches.
-3. **Commit the screenshot to the branch** so the evidence travels via git (this
+4. **Commit the screenshot to the branch** so the evidence travels via git (this
    is how it reaches you, QA, and the PR — no local file handoff).
 The runtime also auto-harvests generated files to S3, but the committed-to-branch
 copy is the source of truth. Reference the committed path in your PR.
