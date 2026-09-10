@@ -2608,12 +2608,18 @@ def _run_turn_async(turn_id: str, journal: str, cli: str, prompt: str, workdir: 
                     claude_session_id: str | None, repo: str | None,
                     session_id: str | None, tenant_id: str | None,
                     model: str | None, turn_timeout_s: int = TURN_TIMEOUT_S,
-                    permission_mode: str | None = None) -> None:
+                    permission_mode: str | None = None,
+                    wedge_grace_s: int = 300) -> None:
     """Runner thread body: drive one CLI turn via the existing streaming
     generators (they carry the watchdog, artifact harvest, and session-id
     bookkeeping), heartbeat the journal while it runs, then journal the terminal
     frame. The generator's SSE framing is an implementation detail here — we
-    consume frames directly, no HTTP involved."""
+    consume frames directly, no HTTP involved.
+
+    wedge_grace_s is how long past the CLI cap a silent generator may run before
+    we abandon it and journal an error anyway (belt and braces for the frames
+    the generators now always emit). A parameter, not an env knob: tests pass a
+    small value and production never tunes it."""
     # Prune finished entries older than an hour so a long-lived VM doesn't
     # accumulate every done record it ever served.
     cutoff = int(time.time()) - 3600
@@ -2646,31 +2652,63 @@ def _run_turn_async(turn_id: str, journal: str, cli: str, prompt: str, workdir: 
 
     result: dict = {}
     last_error = ""
-    try:
-        if cli == "codex":
-            gen = _stream_codex(prompt, workdir, claude_session_id, repo, session_id, tenant_id,
-                                turn_timeout_s)
-        elif cli == "kiro":
-            gen = _stream_kiro(prompt, workdir, claude_session_id, repo, session_id, tenant_id,
-                               turn_timeout_s)
-        else:
-            gen = _stream_claude(prompt, workdir, claude_session_id, repo,
-                                 session_id, tenant_id, model, turn_timeout_s,
-                                 permission_mode=permission_mode)
-        for line in gen:
-            if not line.startswith("data:"):
-                continue
-            try:
-                frame = json.loads(line[5:].strip())
-            except (json.JSONDecodeError, ValueError):
-                continue
-            ftype = frame.get("type")
-            if ftype == "error":
-                last_error = str(frame.get("error") or "")[:600]
-            elif ftype == "done":
-                result = frame
-    except Exception as exc:  # noqa: BLE001 — journal the failure, never raise
-        last_error = str(exc)[:600]
+    # Belt and braces (TEAM-4389). The generators now always emit terminal frames
+    # after a watchdog kill, but a generator that never RETURNS (a grandchild
+    # that escaped the group kill still holding the pipe, a wedged artifact
+    # harvest) would leave this thread with nothing to journal — the turn reads
+    # "running" forever and the caller's heartbeat keeps believing it. So drain
+    # on a sub-thread and bound the WAIT here: no frame for the CLI cap plus the
+    # grace means we abandon the drain and journal an error, so a verdict is
+    # ALWAYS written. Only THIS thread writes the journal, so an abandoned drain
+    # can never overwrite that verdict later.
+    drained = threading.Event()
+    progress = {"at": time.time()}
+
+    def _drain() -> None:
+        nonlocal result, last_error
+        try:
+            if cli == "codex":
+                gen = _stream_codex(prompt, workdir, claude_session_id, repo, session_id,
+                                    tenant_id, turn_timeout_s)
+            elif cli == "kiro":
+                gen = _stream_kiro(prompt, workdir, claude_session_id, repo, session_id,
+                                   tenant_id, turn_timeout_s)
+            else:
+                gen = _stream_claude(prompt, workdir, claude_session_id, repo,
+                                     session_id, tenant_id, model, turn_timeout_s,
+                                     permission_mode=permission_mode)
+            for line in gen:
+                progress["at"] = time.time()
+                if not line.startswith("data:"):
+                    continue
+                try:
+                    frame = json.loads(line[5:].strip())
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                ftype = frame.get("type")
+                if ftype == "error":
+                    last_error = str(frame.get("error") or "")[:600]
+                elif ftype == "done":
+                    result = frame
+        except Exception as exc:  # noqa: BLE001 — journal the failure, never raise
+            last_error = str(exc)[:600]
+        finally:
+            drained.set()
+
+    drainer = threading.Thread(target=_drain, daemon=True)
+    drainer.start()
+    wedge_after = turn_timeout_s + wedge_grace_s
+    while not drained.wait(1):
+        if time.time() - progress["at"] > wedge_after:
+            # Abandon the drain thread (a Python thread cannot be killed; the
+            # CLI process group is already SIGKILLed by the generator's
+            # watchdog) and fall through to the terminal write.
+            last_error = (f"runner wedged after watchdog: no frame for {wedge_after}s "
+                          f"(CLI cap {turn_timeout_s}s + {wedge_grace_s}s grace) — "
+                          f"abandoned the runner without a verdict of its own")
+            logger.error("turn_runner_wedged", extra={"turn_id": turn_id, "cli": cli,
+                                                      "wedge_after_s": wedge_after})
+            break
 
     done = {"status": "done", "turn_id": turn_id, "cli": cli,
             "finished_at": int(time.time()),
