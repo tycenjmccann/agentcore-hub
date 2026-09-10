@@ -199,47 +199,83 @@ describe("TEAM-4391 — a gate already presented to a human is never re-saved", 
     },
   ];
 
-  it("AC1: an open review_needed notification for this gate → review-noop, ZERO writes", async () => {
-    const wf = workflow({
-      humanNotifications: [
-        { id: "n1", type: "review_needed", ticketId: "GATE-1", reviewer: "engineer", acknowledged: false, timestamp: STALE_STARTED },
-      ],
+  /**
+   * The zero-write seam. cascade.mjs injects reawakenGate = index.mjs's
+   * handleHumanReviewGate, so this fake mirrors that function's DOCUMENTED write
+   * order (index.mjs:1441-1489): the ticket status write happens FIRST —
+   * jiraTransition("In Review") when TICKET_PROVIDER=jira, a DDB UpdateCommand
+   * otherwise — and only THEN the appendReviewNotificationOnce CAS that discovers
+   * the notification is already open and returns false. That ordering is exactly
+   * why "the CAS refuses the duplicate" was never a fix: by the time it refuses,
+   * the Jira/DDB self-transition has already been written. Asserting these three
+   * spies at zero is therefore a direct assertion that the sweep performs no
+   * ticket write at all for an already-presented gate.
+   */
+  function gateWriteSpies({ provider, notified = false } = {}) {
+    const jiraTransition = vi.fn(async () => {});
+    const ddbUpdate = vi.fn(async () => {});
+    const appendReviewNotificationOnce = vi.fn(async () => notified);
+    const reawakenGate = vi.fn(async (ticketId) => {
+      if (provider === "jira") await jiraTransition(ticketId, "In Review");
+      else await ddbUpdate({ ticketId, status: "in_review" });
+      return await appendReviewNotificationOnce("wf_1", ticketId, {
+        type: "review_needed", ticketId, reviewer: "engineer", acknowledged: false,
+      });
     });
-    // The fake reawakenGate asserts its OWN non-invocation: the real reawakenGate
-    // (handleHumanReviewGate) writes the ticket status BEFORE its own CAS check,
-    // so the only way to prove zero writes happen for an already-open gate is to
-    // never call it at all — not just to assert its return value is unused.
-    const s = makeSweep({
-      workflows: [wf],
-      siblings: gateSiblings,
-      reawakenGate: vi.fn(async () => {
-        throw new Error("reawakenGate must not be called when a review_needed notification is already open");
-      }),
-    });
+    return { jiraTransition, ddbUpdate, appendReviewNotificationOnce, reawakenGate };
+  }
 
-    const m = await s.runSweep("enforce");
+  it.each(["jira", "dynamodb"])(
+    "AC1 (%s): an open review_needed notification for this gate → review-noop, ZERO writes",
+    async (provider) => {
+      const wf = workflow({
+        humanNotifications: [
+          { id: "n1", type: "review_needed", ticketId: "GATE-1", reviewer: "engineer", acknowledged: false, timestamp: STALE_STARTED },
+        ],
+      });
+      const spies = gateWriteSpies({ provider });
+      const s = makeSweep({ workflows: [wf], siblings: gateSiblings, reawakenGate: spies.reawakenGate });
 
-    expect(m.candidates).toBe(1);
-    expect(m.noop).toBe(1);
-    expect(m.reviewReawakened).toBe(0);
-    expect(s.reawakenGate).toHaveBeenCalledTimes(0); // redundant with the throw-guard, but explicit
-    expect(eventsOfType(s.publishEvent, "review.reawakened")).toHaveLength(0);
-  });
+      const m = await s.runSweep("enforce");
 
-  it("AC2a: the notification for this gate is already acknowledged → the gate still re-wakes", async () => {
-    const wf = workflow({
-      humanNotifications: [
-        { id: "n1", type: "review_needed", ticketId: "GATE-1", reviewer: "engineer", acknowledged: true, timestamp: STALE_STARTED },
-      ],
-    });
-    const s = makeSweep({ workflows: [wf], siblings: gateSiblings });
+      expect(m.candidates).toBe(1);
+      expect(m.noop).toBe(1);
+      expect(m.reviewReawakened).toBe(0);
+      // Zero ticket writes, asserted on each write handleHumanReviewGate makes:
+      expect(spies.jiraTransition).toHaveBeenCalledTimes(0);
+      expect(spies.ddbUpdate).toHaveBeenCalledTimes(0);
+      expect(spies.appendReviewNotificationOnce).toHaveBeenCalledTimes(0);
+      // …and on the gate function itself, which is what cascade.mjs controls.
+      expect(s.reawakenGate).toHaveBeenCalledTimes(0);
+      expect(eventsOfType(s.publishEvent, "review.reawakened")).toHaveLength(0);
+    },
+  );
 
-    const m = await s.runSweep("enforce");
+  it.each(["jira", "dynamodb"])(
+    "AC2a (%s): the notification for this gate is already acknowledged → the gate still re-wakes, writes and all",
+    async (provider) => {
+      const wf = workflow({
+        humanNotifications: [
+          { id: "n1", type: "review_needed", ticketId: "GATE-1", reviewer: "engineer", acknowledged: true, timestamp: STALE_STARTED },
+        ],
+      });
+      // notified: true — no OPEN notification exists, so the real CAS would append.
+      const spies = gateWriteSpies({ provider, notified: true });
+      const s = makeSweep({ workflows: [wf], siblings: gateSiblings, reawakenGate: spies.reawakenGate });
 
-    expect(s.reawakenGate).toHaveBeenCalledWith("GATE-1", "human:engineer", wf);
-    expect(eventsOfType(s.publishEvent, "review.reawakened")).toHaveLength(1);
-    expect(m.reviewReawakened).toBe(1);
-  });
+      const m = await s.runSweep("enforce");
+
+      expect(s.reawakenGate).toHaveBeenCalledWith("GATE-1", "human:engineer", wf);
+      // The mirror image of AC1: this gate genuinely missed its wake-up, so every
+      // write handleHumanReviewGate makes DOES happen — the guard is not a blanket
+      // suppression of the re-wake path.
+      expect(spies.jiraTransition).toHaveBeenCalledTimes(provider === "jira" ? 1 : 0);
+      expect(spies.ddbUpdate).toHaveBeenCalledTimes(provider === "jira" ? 0 : 1);
+      expect(spies.appendReviewNotificationOnce).toHaveBeenCalledTimes(1);
+      expect(eventsOfType(s.publishEvent, "review.reawakened")).toHaveLength(1);
+      expect(m.reviewReawakened).toBe(1);
+    },
+  );
 
   it("AC2b: an open notification exists but for a DIFFERENT ticket → this gate still re-wakes", async () => {
     const wf = workflow({
