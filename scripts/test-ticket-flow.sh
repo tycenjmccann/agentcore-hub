@@ -250,16 +250,18 @@ while true; do
     echo "$STATE" | jq '{phase, completedAt, taskCount: (.agentTasks | length), tasks: [.agentTasks | to_entries[] | {ticket: .key, agent: .value.agentId, status: .value.status}]}' 2>/dev/null
     echo ""
 
-    # Check if all dynamic tickets were created (should be 9: 6 req + 3 from QA)
-    if [ "$TASK_COUNT" -ge 9 ]; then
-      echo "  ✓ Full fix-it loop validated! (fix-it → QA rerun → CI)"
-    elif [ "$TASK_COUNT" -ge 8 ]; then
-      echo "  ⚠ Partial: got $TASK_COUNT tickets (expected 9: 6 initial + 3 from QA)"
-    else
-      echo "  ⚠ Expected 9 tickets but got $TASK_COUNT"
+    # Expect 7 tasks: the requirements ticket + its 6 children (design, security,
+    # legal, dev, CI, QA). CI must be Done and QA must have run after it.
+    CI_DONE=$(echo "$STATE" | jq -r '[.agentTasks | to_entries[] | select(.value.agentId=="agentcore_hub_ci_agent" and .value.status=="done")] | length' 2>/dev/null || echo 0)
+    QA_DONE=$(echo "$STATE" | jq -r '[.agentTasks | to_entries[] | select(.value.agentId=="agentcore_hub_qa_verifier" and .value.status=="done")] | length' 2>/dev/null || echo 0)
+    if [ "$TASK_COUNT" -ge 7 ] && [ "$CI_DONE" -ge 1 ] && [ "$QA_DONE" -ge 1 ]; then
+      echo "  ✓ Chain validated: Dev → CI → QA ($TASK_COUNT tickets, CI done=$CI_DONE, QA done=$QA_DONE)"
+      echo ""
+      exit 0
     fi
+    echo "  ✗ Expected 7 tickets with CI and QA both done; got $TASK_COUNT tickets (CI done=$CI_DONE, QA done=$QA_DONE)"
     echo ""
-    exit 0
+    exit 1
   fi
 
   # Timeout after 15 minutes
