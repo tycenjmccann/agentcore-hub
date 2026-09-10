@@ -246,6 +246,7 @@
     "deploy/setup-runtime-role.sh",
     "deploy/setup-tickets-lambda.mjs",
     "deploy/setup-pipeline-tools-lambda.mjs",
+    "deploy/telegram-bug-intake/update-config.sh",
     "deploy/workflow-manager/deploy.sh",
     "deploy/routine-builder/deploy.sh",
     "deploy/session-reaper/deploy.sh",

@@ -123,6 +123,13 @@ vi.mock("@aws-sdk/client-dynamodb", () => {
   };
 });
 
+// TEAM-4338: an ambient ARTIFACT_BUCKET (e.g. CodeBuild's CI env) must never
+// reach real S3 from this suite — force loadDeployRegistry() to see NoSuchKey.
+vi.mock("@aws-sdk/client-s3", () => ({
+  S3Client: class { async send() { const e = new Error("NoSuchKey"); e.name = "NoSuchKey"; throw e; } },
+  GetObjectCommand: class { constructor(input) { this.input = input; } },
+}));
+
 // index.mjs resolves every credential at import time via requireEnv().
 const ENV = {
   TELEGRAM_BOT_TOKEN: TG_TOKEN,
@@ -141,6 +148,7 @@ let realFetch;
 
 beforeAll(async () => {
   Object.assign(process.env, ENV);
+  delete process.env.ARTIFACT_BUCKET; // TEAM-4338: never inherit CI's real bucket
   realFetch = global.fetch;
   global.fetch = async (url) => {
     const u = String(url);
@@ -161,7 +169,7 @@ beforeAll(async () => {
 
 afterAll(() => {
   global.fetch = realFetch;
-  for (const k of Object.keys(ENV)) delete process.env[k];
+  for (const k of [...Object.keys(ENV), "ARTIFACT_BUCKET"]) delete process.env[k];
 });
 
 function resetRecorder(mode = "final") {

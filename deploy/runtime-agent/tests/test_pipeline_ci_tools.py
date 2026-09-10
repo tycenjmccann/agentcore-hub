@@ -1,8 +1,15 @@
-"""TEAM-4122 FR-4 — `Pipeline___start_ci_build` / `Pipeline___capabilities`
+"""TEAM-4122 FR-4 / TEAM-4338 — `Pipeline___start_ci_build` / `Pipeline___capabilities`
 harness wrappers must forward exactly what the Lambda contract expects:
-commit_sha always, source_version only when the agent supplied one (never as
-""), and both tools must be registered in LAMBDA_TOOLS so the fleet actually
-gets them.
+commit_sha always, source_version and project only when the agent supplied one
+(never as ""), and all six Pipeline___* tools must be registered in
+LAMBDA_TOOLS so the fleet actually gets them.
+
+TEAM-4338 (Multi-CD Lane 2) taught the pipeline-tools Lambda to serve more than
+one CodePipeline: `start_ci_build` gained a `project` argument and
+`capabilities` gained `pipeline_name`, both omitted from the payload when
+blank exactly like the pre-existing `source_version` omission — a blank
+project/pipeline_name must read the Lambda's env-default target, not an
+explicit-but-empty one.
 
 main.py cannot be imported (module top-level installs Node.js, fetches from S3,
 chdirs), so — matching test_create_ticket_tool.py / test_report_completion_evidence.py
@@ -79,6 +86,20 @@ def test_blank_source_version_is_omitted_like_default():
     assert payload == {"commit_sha": "abc1234"}
 
 
+def test_forwards_project_when_supplied():
+    fn, calls = _load_tool("Pipeline___start_ci_build")
+    fn(commit_sha="abc1234", project="hub-widget-ci")
+    _, _, payload = calls[0]
+    assert payload == {"commit_sha": "abc1234", "project": "hub-widget-ci"}
+
+
+def test_blank_project_is_omitted_like_default():
+    fn, calls = _load_tool("Pipeline___start_ci_build")
+    fn(commit_sha="abc1234", project="")
+    _, _, payload = calls[0]
+    assert payload == {"commit_sha": "abc1234"}  # equals the no-project payload
+
+
 # ─── capabilities ─────────────────────────────────────────────────────────────
 
 def test_capabilities_forwards_no_args():
@@ -91,9 +112,23 @@ def test_capabilities_forwards_no_args():
     assert payload == {}
 
 
+def test_capabilities_forwards_pipeline_name_when_supplied():
+    fn, calls = _load_tool("Pipeline___capabilities")
+    fn(pipeline_name="hub-widget-deploy")
+    _, _, payload = calls[0]
+    assert payload == {"pipeline_name": "hub-widget-deploy"}
+
+
+def test_capabilities_blank_pipeline_name_is_omitted_like_default():
+    fn, calls = _load_tool("Pipeline___capabilities")
+    fn(pipeline_name="")
+    _, _, payload = calls[0]
+    assert payload == {}
+
+
 # ─── LAMBDA_TOOLS registration ────────────────────────────────────────────────
 
-def test_both_tools_registered_in_lambda_tools():
+def test_all_six_pipeline_tools_registered_in_lambda_tools():
     source = MAIN_PY.read_text()
     tree = ast.parse(source)
     lambda_tools_node = next(
@@ -107,5 +142,12 @@ def test_both_tools_registered_in_lambda_tools():
     )
     assert lambda_tools_node is not None, "LAMBDA_TOOLS assignment not found in main.py"
     names = {elt.id for elt in lambda_tools_node.value.elts if isinstance(elt, ast.Name)}
-    assert "Pipeline___start_ci_build" in names
-    assert "Pipeline___capabilities" in names
+    for tool_name in (
+        "Pipeline___get_state",
+        "Pipeline___start_deploy",
+        "Pipeline___get_build_status",
+        "Pipeline___get_build_log",
+        "Pipeline___start_ci_build",
+        "Pipeline___capabilities",
+    ):
+        assert tool_name in names
