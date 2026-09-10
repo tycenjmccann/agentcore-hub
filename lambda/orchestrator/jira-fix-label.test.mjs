@@ -3,12 +3,19 @@ import { mapJiraIssueToTicket } from "./index.mjs";
 import { renderFixContractBlock } from "./fix-contract.mjs";
 
 /**
+ * mapJiraIssueToTicket (index.mjs) unit tests — this file holds them all, not
+ * just the fix-label ones its name suggests.
+ *
  * TEAM-4113 (prod-Jira fix) — a fix ticket's origin `kind` rides a `fix:<kind>`
  * label in Jira (createTicket in agentcore-hub-jira; Jira has no arbitrary
  * columns). mapJiraIssueToTicket must reconstruct `spawnedBy` from it so the
  * rework-loop cap + completion open-fix re-verify see fix tickets in Jira mode
  * exactly as they do in DynamoDB mode. Without this, isReworkFix is always
  * false in prod and the cap counts zero rounds forever.
+ *
+ * TEAM-4384 — the mapper must also carry `updatedAt` (Jira's `updated` field),
+ * since reconcile-sweep.mjs's parkedLongEnough() reads it and a Jira-mode row
+ * that never had it made that predicate vacuously true. See the describe below.
  */
 
 const issue = (labels) => ({
@@ -176,5 +183,39 @@ describe("mapJiraIssueToTicket — the FR-8 contract carriers", () => {
     expect("phase" in t).toBe(false);
     expect("fixContract" in t).toBe(false);
     expect(t.description).toBe("");
+  });
+});
+
+/**
+ * TEAM-4384 — Jira's `updated` field maps onto updatedAt, ISO-normalised, so a
+ * Jira-mode ticket carries the same last-touched timestamp DynamoDB-mode rows
+ * always have. reconcile-sweep.mjs's parkedLongEnough() reads exactly this
+ * field; without it, every Jira-mode sibling took its fail-open branch.
+ */
+describe("mapJiraIssueToTicket — TEAM-4384: Jira `updated` → updatedAt", () => {
+  const issueWithUpdated = (updated) => ({
+    key: "TEAM-9",
+    fields: { summary: "s", status: { name: "Done" }, labels: [], issuetype: { name: "Task" }, description: null, updated },
+  });
+
+  it("maps fields.updated onto updatedAt, normalised to ISO", () => {
+    const t = mapJiraIssueToTicket(issueWithUpdated("2026-09-10T12:34:56.789+0000"));
+    expect(t.updatedAt).toBe("2026-09-10T12:34:56.789Z");
+  });
+
+  it("converts a non-zero offset rather than truncating it", () => {
+    const t = mapJiraIssueToTicket(issueWithUpdated("2026-09-10T12:34:56.789+0100"));
+    expect(t.updatedAt).toBe("2026-09-10T11:34:56.789Z");
+  });
+
+  it("omits updatedAt when the issue carries no `updated` field", () => {
+    const t = mapJiraIssueToTicket(issueWithUpdated(undefined));
+    expect(t.updatedAt).toBeUndefined();
+  });
+
+  it("omits updatedAt for an unparsable `updated` (no RangeError from toISOString)", () => {
+    expect(() => mapJiraIssueToTicket(issueWithUpdated("not a date"))).not.toThrow();
+    const t = mapJiraIssueToTicket(issueWithUpdated("not a date"));
+    expect(t.updatedAt).toBeUndefined();
   });
 });

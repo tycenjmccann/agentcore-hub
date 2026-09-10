@@ -103,7 +103,23 @@ export function createReconcileSweep(deps) {
     });
   }
 
-  /** Parked long enough to be a stall, not an in-flight cascade. */
+  /**
+   * Parked long enough to be a stall, not an in-flight cascade.
+   *
+   * `updatedAt` is the row's last-touched time in BOTH provider modes:
+   * agentcore-hub-tickets stamps it on every mutation in DynamoDB mode, and
+   * TEAM-4384 maps Jira's `updated` onto it in mapJiraIssueToTicket. Before that
+   * mapping existed, every Jira-mode sibling took the no-timestamp branch below,
+   * so this predicate was vacuously true and every parked gate was a candidate
+   * on every 1-minute sweep (one leaseIsLive events Query each — cascade.mjs
+   * leaseIsLive runs before any status branch in reconcileDependent).
+   *
+   * A row with NO parsable timestamp still fails OPEN (TEAM-4384: kept on
+   * purpose). That branch is now the rare exception rather than the norm, and
+   * the asymmetry hasn't changed: fail-open costs one read-only routing per
+   * sweep, while fail-closed would hide the row from the ONLY safety net that
+   * re-drives a missed unblock — a permanent stall.
+   */
   function parkedLongEnough(ticket, nowMs) {
     const updated = ticket.updatedAt ? Date.parse(ticket.updatedAt) : NaN;
     if (!Number.isFinite(updated)) return true; // no timestamp → it's been around
