@@ -11,7 +11,23 @@
 # from 1.53.0; on 1.52.0 the tools cachePoint ships without ttl (defaults 5m),
 # which breaks test_prompt_cache's ttl=="1h" assertion and yields a mixed-TTL
 # request Bedrock extended-TTL validation can reject (TEAM-3961, F1).
-strands-agents>=1.53.0
+#
+# Ceiling is <1.55, matching deploy/runtime-agent/requirements.txt EXACTLY so the
+# tests and the deployed image always resolve the same minor and can never assert
+# different span shapes than prod emits. The ceiling exists because a minor SDK
+# bump can MOVE span shape: 1.55.1 relocated the system prompt from a plain
+# `system_prompt` span attribute (which it only ever occupied by **kwargs
+# passthrough) to the semconv `gen_ai.system.message` event, and the unbounded
+# `>=` this line used to carry picked that up overnight and reddened an unrelated
+# PR. Same doctrine as mcp<2 / bedrock-agentcore<2: a version bump is a
+# deliberate, test-verified edit here, not whatever pip resolves that minute.
+#
+# 1.55 is NOT a telemetry regression and this ceiling is not a quarantine:
+# test_telemetry_spans.py asserts the prompt on whichever carrier the installed
+# version is contracted to use, so lifting to 1.55.x is a one-line change when
+# someone wants it (TEAM-4355;
+# docs/evidence/TEAM-4355/system-prompt-span-contract.md).
+strands-agents>=1.53.0,<1.55
 boto3>=1.43.0
 opentelemetry-sdk>=1.29.0
 # StrandsTelemetry.setup_otlp_exporter() imports the OTLP/HTTP span exporter at
