@@ -74,10 +74,13 @@ describe("resolveWatchdogFrom", () => {
 });
 
 describe("resolveWatchdog (agents.json-backed)", () => {
-  it("fleet default matches the committed defaults.watchdog block (== legacy today)", () => {
-    // The committed agents.json defaults.watchdog mirrors the legacy constants,
-    // so the fleet default with no per-agent override must equal them.
-    expect(resolveWatchdog()).toEqual(LEGACY_WATCHDOG);
+  it("fleet default matches the committed defaults.watchdog block", () => {
+    // The committed agents.json defaults.watchdog mirrors the legacy constants
+    // EXCEPT turnTimeoutSecs, deliberately raised to 3600s: the per-turn cap is a
+    // wedge-killer, and the coding-turn heartbeat (fleet _publish_coding_heartbeat)
+    // now proves a long polled turn is alive, so an honest long turn no longer needs
+    // to die at 25 min. Enforcement stays on. Bump this in lockstep with agents.json.
+    expect(resolveWatchdog()).toEqual({ ...LEGACY_WATCHDOG, turnTimeoutSecs: 3600 });
   });
 
   it("unknown agentId falls back to the fleet default", () => {
