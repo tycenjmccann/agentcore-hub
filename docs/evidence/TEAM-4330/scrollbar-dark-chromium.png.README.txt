@@ -1,0 +1,14 @@
+scrollbar-dark-chromium.png — what this image actually shows
+============================================================
+A ~20px-wide vertical strip clipped from the RIGHT EDGE of a dark styled panel,
+captured in dark mode by verify-scrollbar.mjs. It depicts: a rounded top-left
+corner, a thin --color-border edge, and the near-black --color-surface-1 panel
+fill against a slightly lighter dark page background.
+
+It does NOT show a painted scrollbar thumb. Headless Chromium uses overlay
+scrollbars that fade at rest and are not composited into screenshots (see
+probe-headed.txt and probe-chromium.txt). The thumb's applied style is proven
+by computed values (::-webkit-scrollbar width=6px, thumb=rgb(42,42,58),
+radius=3px) and by differential-before-after.txt — NOT by this bitmap. The image
+is retained only to document the honest limitation; do not caption it as showing
+the sleek thumb.

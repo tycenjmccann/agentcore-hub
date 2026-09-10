@@ -24,6 +24,17 @@ import { chromium, firefox } from "playwright";
 const arg = process.argv.find((a) => a.startsWith("--browser="));
 const BROWSER = arg ? arg.split("=")[1] : "chromium";
 const BASE_URL = process.env.PLAYWRIGHT_BASE_URL || "http://localhost:3000";
+// --diagnostic (alias --pre-fix): report-only mode. Measures dark-theme computed
+// values on the real container and NEVER asserts/exits non-zero. Used to capture
+// the PRE-fix (broken) vs AFTER-fix state for the before/after differential.
+const DIAGNOSTIC =
+  process.argv.includes("--diagnostic") || process.argv.includes("--pre-fix");
+// --headed: launch a headed browser (under xvfb) so Linux renders classic
+// (space-taking) scrollbars that composite a visible thumb into screenshots.
+const HEADED = process.argv.includes("--headed");
+// Optional label printed in diagnostic output (e.g. "BEFORE (base globals.css)").
+const labelArg = process.argv.find((a) => a.startsWith("--label="));
+const LABEL = labelArg ? labelArg.slice("--label=".length) : "";
 
 // Expected resolved tokens (from src/styles/globals.css :root / [data-theme=dark]).
 const EXPECT = {
@@ -308,9 +319,10 @@ async function main() {
   // visible, space-taking scrollbar) over headless-shell (overlay, not painted
   // into screenshots). Fall back to the default executable if not found.
   const launchOpts = {
+    headless: !HEADED,
     args: [
       "--force-device-scale-factor=3",
-      "--disable-features=OverlayScrollbar,OverlayScrollbars",
+      "--disable-features=FluentOverlayScrollbar,OverlayScrollbars,OverlayScrollbar,FluentScrollbar",
     ],
   };
   if (BROWSER !== "firefox") {
@@ -339,7 +351,9 @@ async function main() {
   }
   const browser = await engine.launch(launchOpts);
   try {
-    if (BROWSER === "firefox") {
+    if (DIAGNOSTIC) {
+      await runDiagnostic(browser);
+    } else if (BROWSER === "firefox") {
       await runFirefox(browser);
     } else {
       // deviceScaleFactor for crisp screenshots is set per-context below via a
@@ -349,8 +363,51 @@ async function main() {
   } finally {
     await browser.close();
   }
+  if (DIAGNOSTIC) {
+    // Report-only: never fail.
+    log(`\n===== DIAGNOSTIC COMPLETE (report-only, no assertions) =====`);
+    process.exit(0);
+  }
   log(`\n===== RESULT: ${failures === 0 ? "ALL PASS" : failures + " FAILURE(S)"} =====`);
   process.exit(failures ? 1 : 0);
+}
+
+// Report-only measurement of the dark-theme state on the real app scroll
+// container + injected node. Prints raw computed values; asserts NOTHING. This
+// is deliberately used to capture the PRE-fix (broken) state as well as the
+// AFTER-fix state for the before/after differential — the whole point is to
+// record whatever is actually there, including a "broken" reading.
+async function runDiagnostic(browser) {
+  log(`\n===== DIAGNOSTIC (report-only) ${LABEL ? "— " + LABEL : ""} against ${BASE_URL} =====`);
+  const context = await browser.newContext({ viewport: { width: 1440, height: 900 }, deviceScaleFactor: 1 });
+  await context.addInitScript(() => {
+    try {
+      localStorage.setItem("theme", "dark");
+    } catch {}
+  });
+  const page = await context.newPage();
+  await page.goto(`${BASE_URL}/workflow`, { waitUntil: "networkidle" });
+  await page
+    .waitForFunction(() => document.documentElement.getAttribute("data-theme") === "dark", null, { timeout: 10000 })
+    .catch(() => {});
+  const m = await measure(page);
+  log(`  theme       = ${m.theme}`);
+  log(`  userAgent   = ${m.userAgent}`);
+  log(`  headless    = ${!HEADED}`);
+  log(`  real container = ${m.realSelectorInfo}`);
+  const r = m.real || m.injected;
+  log(`  [${r.label}] scrollbarWidth      = ${r.scrollbarWidth}`);
+  log(`  [${r.label}] scrollbarColor      = ${r.scrollbarColor}`);
+  log(`  [${r.label}] ::-webkit-scrollbar width       = ${r.webkitWidth}`);
+  log(`  [${r.label}] ::-webkit-scrollbar-thumb bg    = ${r.thumbBg}`);
+  log(`  [${r.label}] ::-webkit-scrollbar-thumb radius= ${r.thumbRadius}`);
+  log(`  [injected] scrollbarWidth      = ${m.injected.scrollbarWidth}`);
+  log(`  [injected] scrollbarColor      = ${m.injected.scrollbarColor}`);
+  log(`  [injected] ::-webkit-scrollbar width       = ${m.injected.webkitWidth}`);
+  log(`  [injected] ::-webkit-scrollbar-thumb bg    = ${m.injected.thumbBg}`);
+  log(`  [injected] ::-webkit-scrollbar-thumb radius= ${m.injected.thumbRadius}`);
+  log(`  [injected] gutter (offsetWidth-clientWidth)= ${m.injected.gutter}`);
+  await context.close();
 }
 
 // Wrap runChromium so the screenshot context gets deviceScaleFactor:3.
