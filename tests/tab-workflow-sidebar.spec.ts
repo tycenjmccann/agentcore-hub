@@ -497,4 +497,122 @@ test.describe("Workflow sidebar — resize + scrollbars", () => {
       Number(await handle.getAttribute("aria-valuemin"))
     );
   });
+
+  /**
+   * TEAM-4346 F5. The double-click reset wrote HISTORY_DEFAULT_WIDTH (288) straight
+   * through with no clamp. Under 576px of viewport the effective max is below 288
+   * (375px -> the 240 floor), so the reset rendered a sidebar wider than its own
+   * maximum and the handle published aria-valuenow > aria-valuemax (invalid ARIA);
+   * the next reload re-clamped to 240, so the reset did not even stick.
+   */
+  test("14. double-click reset is clamped to the viewport max", async ({ page }) => {
+    await page.setViewportSize({ width: 375, height: 800 }); // half = 187 -> max is the 240 floor
+    await open(page, "240");
+    await expectWidth(page, MIN, 1);
+
+    // Count writes of the width key only, so the seed and the collapsed-flag write
+    // don't pollute the "exactly one persist per gesture" assertion. Installed after
+    // load, so nothing the mount did is counted.
+    await page.evaluate(() => {
+      const w = window as unknown as { __wfWrites: number };
+      w.__wfWrites = 0;
+      const original = Storage.prototype.setItem;
+      Storage.prototype.setItem = function (this: Storage, key: string, value: string) {
+        if (key === "workflow-history-width") w.__wfWrites += 1;
+        return original.call(this, key, value);
+      };
+    });
+
+    await page.locator(HANDLE).dblclick();
+
+    // The reset lands on the clamped max, not the raw 288 default.
+    await expectWidth(page, MIN, 1);
+    const handle = page.locator(HANDLE);
+    await expect(handle).toHaveAttribute("aria-valuenow", String(MIN));
+    expect(Number(await handle.getAttribute("aria-valuenow"))).toBeLessThanOrEqual(
+      Number(await handle.getAttribute("aria-valuemax"))
+    );
+    // expectWidth polls for "becomes true", so on its own it would also pass on a
+    // width that merely animates *through* 240 on its way to an unclamped 288. By
+    // now the 300ms transition has settled, so read it once more, directly.
+    expect(Math.round(await widthOf(page)), "settled width").toBeLessThanOrEqual(MIN + 1);
+    // Persisted clamped, so a reload is a no-op instead of silently re-clamping.
+    expect(await stored(page)).toBe(String(MIN));
+    expect(await page.evaluate(() => (window as unknown as { __wfWrites: number }).__wfWrites)).toBe(
+      1
+    );
+    await page.screenshot({ path: `${SCREENSHOT_DIR}/14-dblclick-clamped.png` });
+  });
+
+  /**
+   * TEAM-4346 F6. Neither pointermove nor pointerup checked the event's pointerId
+   * against the captured one. setPointerCapture only redirects *that* pointer's
+   * events; any other pointer physically over the 6px separator still hit-tests to
+   * it. So a second finger's move drove the width from the wrong clientX, and its
+   * up tore the live drag down early - restoring the body styles and persisting a
+   * width the user never released at.
+   */
+  test("15. a second pointer over the handle cannot hijack or end the drag", async ({ page }) => {
+    const pageErrors: string[] = [];
+    page.on("pageerror", (e) => pageErrors.push(e.message));
+
+    await open(page);
+    await expectWidth(page, DEFAULT, 1);
+
+    const box = await page.locator(HANDLE).boundingBox();
+    expect(box).not.toBeNull();
+    if (!box) return;
+    const x = box.x + box.width / 2;
+    const y = box.y + box.height / 2;
+
+    // Playwright's mouse is pointerId 1 (same assumption as case 11).
+    await page.mouse.move(x, y);
+    await page.mouse.down();
+    await page.mouse.move(x + 180, y, { steps: 12 });
+    expect(await bodyStyles(page)).toEqual({ cursor: "col-resize", userSelect: "none" });
+    const dragged = Math.round(await widthOf(page));
+    expect(dragged).toBeGreaterThanOrEqual(400);
+
+    // Finger 2 moves across the separator: must not move the sidebar.
+    await page.locator(HANDLE).dispatchEvent("pointermove", {
+      pointerId: 2,
+      isPrimary: false,
+      button: -1,
+      buttons: 1,
+      pointerType: "touch",
+      clientX: x + 40,
+      clientY: y,
+      bubbles: true,
+      cancelable: true,
+    });
+    expect(Math.round(await widthOf(page)), "foreign pointermove moved the sidebar").toBe(dragged);
+
+    // Finger 2 lifts: must not end the mouse's drag.
+    await page.locator(HANDLE).dispatchEvent("pointerup", {
+      pointerId: 2,
+      isPrimary: false,
+      button: 0,
+      pointerType: "touch",
+      clientX: x + 40,
+      clientY: y,
+      bubbles: true,
+      cancelable: true,
+    });
+    expect(await bodyStyles(page), "foreign pointerup ended the drag").toEqual({
+      cursor: "col-resize",
+      userSelect: "none",
+    });
+    expect(Math.round(await widthOf(page))).toBe(dragged);
+
+    // Pointer 1 still owns the gesture, so the sidebar still tracks it.
+    await page.mouse.move(x + 200, y, { steps: 4 });
+    const final = Math.round(await widthOf(page));
+    expect(final).toBeGreaterThan(dragged);
+
+    await page.mouse.up();
+    expect(await bodyStyles(page)).toEqual({ cursor: "", userSelect: "" });
+    await expectWidth(page, final, 1);
+    expect(await stored(page)).toBe(String(final));
+    expect(pageErrors, `pageerrors: ${pageErrors.join(" | ")}`).toEqual([]);
+  });
 });
