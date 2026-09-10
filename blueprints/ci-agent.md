@@ -45,7 +45,7 @@ branch INTO the run's integration branch first. Via `claude_code` (pass `repo`):
   `Fix (sync-main): merge origin/<default branch> into <feature_branch>` ticket
   against the dev agent whose completion record is newest on this run, with
   `spawned_by_kind: "sync_fix"`, `spawned_by_origin_id: <your CI ticket>`,
-  `phase: "ci"`, `invariant`: "`origin/<default branch>` merges cleanly into
+  `phase: "review"` (your configured phase; `ci` is not a known phase), `invariant`: "`origin/<default branch>` merges cleanly into
   `<feature_branch>` with both sides' intent kept", `evidence_source: "unit"`,
   `evidence_repro`: the exact `git merge` command, `cited_location`: the
   conflicting files. Then PARK YOURSELF:

@@ -257,7 +257,8 @@ PASS on that dimension. Do not describe a code-read as if it were a test run.
   `title`: `CI (re-cert): certify <feature_branch> head after QA round <N>`,
   `blocked_by`: every fix ticket of this round (so it certifies the fixed head),
   `spawned_by_kind="ci_fix"`, `spawned_by_origin_id=<the CI ticket whose record
-  is now stale>`, `phase="ci"`, `invariant`: "the newest CI completion record
+  is now stale>`, `phase="review"` (the CI agent's configured phase — `ci` is not
+  a known phase and the ticket tools reject it), `invariant`: "the newest CI completion record
   certifies the current <feature_branch> head", `evidence_source`: `"unit"`,
   `evidence_repro`: `Pipeline___get_build_status(commit_sha=<head after the fixes>)`,
   `sibling_scope`: `"none"`. It is environmental (a re-run, not a finding), so it
