@@ -324,3 +324,134 @@ test.describe("Workflow Page — replay scrubber", () => {
     await page.waitForTimeout(300);
   });
 });
+
+// ─── SDLC framework badge — hermetic (page.route, no live backend) ─────────
+//
+// "Standard" is the absence of a framework overlay, not a framework: a run
+// with no sdlcFramework (or "standard") must render NO badge in the list row
+// or the board header. A run with an overlay (e.g. "playbook") must still
+// show it in both places (TEAM-4399).
+
+test.describe("Workflow Page — SDLC badge", () => {
+  const STANDARD_ID = "wf-sdlc-standard-001";
+  const PLAYBOOK_ID = "wf-sdlc-playbook-001";
+
+  function workflowSummary(id: string, sdlcFramework?: string) {
+    return {
+      id,
+      phase: "complete",
+      epicId: "TEAM-4399",
+      input: { title: `SDLC badge fixture ${id}`, description: "fixture" },
+      workflowDefId: "software-delivery",
+      startedAt: new Date(Date.now() - 3600000).toISOString(),
+      completedAt: new Date().toISOString(),
+      ...(sdlcFramework ? { sdlcFramework } : {}),
+    };
+  }
+
+  function workflowState(id: string, sdlcFramework?: string) {
+    return {
+      id,
+      workflowId: id,
+      phase: "complete",
+      epicId: "TEAM-4399",
+      workflowDefId: "software-delivery",
+      repoConfig: { repos: [] },
+      input: {
+        title: `SDLC badge fixture ${id}`,
+        description: "fixture",
+        workflowDefId: "software-delivery",
+        sources: [],
+      },
+      agentTasks: {},
+      messages: [],
+      humanNotifications: [],
+      startedAt: new Date(Date.now() - 3600000).toISOString(),
+      completedAt: new Date().toISOString(),
+      ...(sdlcFramework ? { sdlcFramework } : {}),
+    };
+  }
+
+  // Mirrors tests/workflow-manager-panel.spec.ts's mockBoardEndpoints — the
+  // minimal set of routes WorkflowBoard needs to reach a settled render.
+  async function mockBoardEndpoints(page: Page, workflows: unknown[], states: Record<string, unknown>) {
+    await page.route("**/api/workflow/list", (r) =>
+      r.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ workflows }) }));
+    await page.route("**/api/workflow/*/state**", (r) => {
+      const id = new URL(r.request().url()).pathname.split("/")[3];
+      r.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(states[id] || {}) });
+    });
+    await page.route("**/api/workflow/*/events", (r) =>
+      r.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ events: [] }) }));
+    await page.route("**/api/workflow/*/tickets", (r) =>
+      r.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ tickets: [] }) }));
+    await page.route("**/api/workflow/*/analysis", (r) =>
+      r.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ latest: null, history: [], trend: [] }) }));
+    await page.route("**/api/workflow/*/watch", (r) =>
+      r.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ watch: false }) }));
+  }
+
+  async function openSidebarAndSelect(page: Page, title: string) {
+    await page.goto("/workflow");
+    await page.waitForLoadState("networkidle");
+    const expandBtn = page.locator("button[aria-label='Expand workflow history sidebar']");
+    if (await expandBtn.isVisible().catch(() => false)) await expandBtn.click();
+    await page.getByText(title).first().click();
+    await page.waitForSelector(".pipeline-viz", { timeout: 15_000 });
+  }
+
+  test("a run with no sdlcFramework renders no badge in the list row or board header", async ({ page }) => {
+    // Force dark mode: the app bootstraps `data-theme` from localStorage (or
+    // prefers-color-scheme) before paint, and Chromium's default colorScheme
+    // is "light".
+    await page.addInitScript(() => localStorage.setItem("theme", "dark"));
+
+    const workflows = [workflowSummary(STANDARD_ID)];
+    const states = { [STANDARD_ID]: workflowState(STANDARD_ID) };
+    await mockBoardEndpoints(page, workflows, states);
+
+    await openSidebarAndSelect(page, `SDLC badge fixture ${STANDARD_ID}`);
+
+    // No badge element anywhere, and no leftover "STANDARD" text.
+    await expect(page.locator(".sdlc-badge")).toHaveCount(0);
+    await expect(page.locator(".pipeline-status-header")).not.toContainText("STANDARD");
+    // Scope by the row's epicId (unique, unlike the title which the page
+    // header also echoes as "Workflow: <title>") up to the container that
+    // also holds the def pill + badge row.
+    const sidebarRow = page.locator("text=TEAM-4399").locator("..").locator("..");
+    await expect(sidebarRow).not.toContainText("STANDARD");
+
+    await page.screenshot({
+      path: `${SCREENSHOT_DIR}/40-sdlc-badge-absent-standard.png`,
+      fullPage: true,
+    });
+  });
+
+  test("a run with sdlcFramework: playbook renders the PLAYBOOK badge in both the list and the board", async ({ page }) => {
+    await page.addInitScript(() => localStorage.setItem("theme", "dark"));
+
+    const workflows = [workflowSummary(PLAYBOOK_ID, "playbook")];
+    const states = { [PLAYBOOK_ID]: workflowState(PLAYBOOK_ID, "playbook") };
+    await mockBoardEndpoints(page, workflows, states);
+
+    await openSidebarAndSelect(page, `SDLC badge fixture ${PLAYBOOK_ID}`);
+
+    // Board header badge.
+    const boardBadge = page.locator(".pipeline-status-header .sdlc-badge");
+    await expect(boardBadge).toBeVisible();
+    await expect(boardBadge).toHaveText("PLAYBOOK");
+    await expect(boardBadge).toHaveAttribute(
+      "title",
+      "Playbook framework — expect intent, spec, and plan artifacts."
+    );
+
+    // Sidebar list-row badge (scoped by the row's unique epicId text).
+    const sidebarRow = page.locator("text=TEAM-4399").locator("..").locator("..");
+    await expect(sidebarRow).toContainText("PLAYBOOK");
+
+    await page.screenshot({
+      path: `${SCREENSHOT_DIR}/41-sdlc-badge-playbook.png`,
+      fullPage: true,
+    });
+  });
+});
