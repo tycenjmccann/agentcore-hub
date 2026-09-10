@@ -83,10 +83,75 @@ invocation in the repo, not just this one hermetic UI gate. Scoping the pin
 to the `--workers=1` CLI flag on the `test:cloud-code` script keeps the
 change local to the surface this ticket is actually about.
 
-## Evidence to follow (separate turn)
+## Evidence — measured
 
-- `raw/gate-run.txt` — verbatim output of
-  `PLAYWRIGHT_BASE_URL=http://localhost:3000 npm run test:cloud-code -- --trace retain-on-failure`
-  against a production build, expected tail `34 passed` (7 + 27).
-- `raw/yaml-parse.txt` — verbatim output of the YAML/command-scalar sanity
-  parse of both changed YAML files.
+Both changed YAML files parse, and every buildspec phase command is still a
+string (the CodeBuild hazard the file's own header warns about — an unquoted
+`echo foo: bar` would parse as a mapping and reject the commands array).
+Verbatim in `raw/yaml-parse.txt`; tail:
+
+```
+.github/workflows/ci.yml parsed OK
+ALL YAML OK
+```
+
+`npm run build` succeeded (both `/workflow` and `/cloud-code` compiled). A
+production server was booted exactly as the buildspec does
+(`nohup npm run start -- -p 3000 …` + poll on `/`), then the EXACT CodeBuild
+gate command was run against it:
+
+```
+PLAYWRIGHT_BASE_URL=http://localhost:3000 npm run test:cloud-code -- --trace retain-on-failure
+```
+
+Full unedited output in `raw/gate-run.txt`. Both spec files execute in the one
+invocation — proof line for the resize spec:
+
+```
+  ✓  34 [chromium] › tests/tab-workflow-resize.spec.ts:874:5 › fixture sanity: the calibrated titles are distinct and the expected lengths (4ms)
+```
+
+and the summary tail:
+
+```
+  34 passed (1.3m)
+```
+
+Measured: **`Running 34 tests using 1 worker`**, 7 from `cloud-code-ui.spec.ts`
++ 27 from `tab-workflow-resize.spec.ts` = 34, zero skips, zero failures, 1
+worker as `--workers=1` intended.
+
+One environment note, not a code finding: the first run of the gate command
+in this sandbox failed all 34 tests in ~5ms each with
+`browserType.launch: Executable doesn't exist at .../chromium_headless_shell-1223/...`
+— a fresh `npm ci` in this workspace had never fetched Playwright's browser
+binary. `npx playwright install chromium` (no code change) fixed it, and the
+re-run is the `34 passed` result above. Flagging this because a uniform
+~5ms failure across every test, including ones with unrelated assertions, is
+the signature of a missing-browser/harness problem, not a real regression —
+worth recognizing quickly if it recurs.
+
+Negative check — no hermetic UI spec may be invoked directly as a command in
+either CI file (every one must run only through `test:cloud-code`):
+
+```
+$ grep -n "playwright test" .github/workflows/ci.yml deploy/pipeline/buildspec-ci.yml
+.github/workflows/ci.yml:198:      # be a SECOND step here, invoking `npx playwright test tests/...` directly. It
+deploy/pipeline/buildspec-ci.yml: (no match)
+
+$ grep -n "\.spec\.ts" .github/workflows/ci.yml deploy/pipeline/buildspec-ci.yml
+deploy/pipeline/buildspec-ci.yml:101:      # tests/cloud-code-ui.spec.ts and tests/tab-workflow-resize.spec.ts (workflow
+```
+
+Both hits are inside `#` comments this fix added (one narrating the deleted
+GH step, one describing what `test:cloud-code` now runs) — neither is a live
+`run:`/buildspec command line. No `.spec.ts` path is invoked directly as a
+command in either file; the check passes.
+
+## Result: before → after (measured, not projected)
+
+| | before | after |
+|---|---|---|
+| `cloud-code-ui.spec.ts` tests the authoritative CodeBuild check runs | 7 | 7 |
+| `tab-workflow-resize.spec.ts` tests the authoritative CodeBuild check runs | **0** | **27** |
+| Total | 7 | **34** |
