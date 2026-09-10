@@ -48,8 +48,12 @@
  * inline ✅ Approve / ❌ Request changes buttons. Approve transitions the gate
  * ticket to done (downstream phases unblock); Request changes asks for a note
  * in the next message, then transitions to blocked with that note as the
- * rework context. Dedupe per gate ticket lives in PENDING_TABLE (gate#<id>),
- * chat registry in chat#<chatId> (any chat that ever messaged the bot).
+ * rework context. Dedupe is per REVIEW CYCLE, not per ticket: the orchestrator
+ * acks a gate's review_needed when the review concludes and appends a fresh
+ * notification (new notif.id) when the gate is re-parked after rework, so the
+ * claim lives in PENDING_TABLE as gate#<notif.id> (legacy gate#<ticketId> when
+ * a notification carries no id). Chat registry in chat#<chatId> (any chat that
+ * ever messaged the bot).
  *
  * MANAGER ESCALATIONS: the same scan also pages every allowlisted chat when the
  * Workflow Manager records an unacknowledged manager_escalation. An open
@@ -550,6 +554,10 @@ async function handleCallback(cb) {
 // same write path a human clicking the board uses.
 
 const GATE_KEY_PREFIX = "gate#";
+// Runs in a terminal phase can still carry unacknowledged review_needed rows
+// (legacy runs pre-date the approve-time ack). Nobody can act on those gates,
+// so neither the gate nor the escalation scan pings for them.
+const TERMINAL_PHASES = new Set(["complete", "completed", "cancelled", "canceled", "failed", "deploy-blocked", "static-ci-only"]);
 // Release-manager convergence escalation gate — summary shape fixed by
 // blueprints/release-manager.md ("Escalation gate ticket"); the orchestrator
 // and the transition API match the same shape (TEAM-3971).
@@ -622,6 +630,7 @@ async function scanReviewGates() {
 
   const pending = [];
   for (const wf of workflows) {
+    if (TERMINAL_PHASES.has(String(wf.phase || wf.status || "").toLowerCase())) continue;
     for (const n of wf.humanNotifications || []) {
       if (n.type === "review_needed" && !n.acknowledged) {
         pending.push({ wf, notif: n });
@@ -631,9 +640,11 @@ async function scanReviewGates() {
   if (!pending.length) return;
 
   let chats = null; // fetched lazily — most scans find nothing new
+  let pinged = 0;
   for (const { wf, notif } of pending) {
-    const claimed = await claimGate(notif.ticketId);
+    const claimed = await claimGate(notif);
     if (!claimed) continue;
+    pinged++;
 
     // The claim is written before delivery is proven, so ANY throw between
     // here and a delivered ping (e.g. a transient listChats Scan failure)
@@ -646,7 +657,7 @@ async function scanReviewGates() {
       chats = chats || (await listChats()).filter((c) => ALLOWED_CHAT_IDS.includes(String(c)));
       if (!chats.length) {
         console.warn("[telegram-bug-intake] gate ticket but no allowlisted chats to notify");
-        await releaseGate(notif.ticketId); // nobody was pinged — let a later scan retry
+        await releaseGate(notif); // nobody was pinged — let a later scan retry
         continue;
       }
 
@@ -751,22 +762,34 @@ async function scanReviewGates() {
       }
       // The claim was written before delivery was proven; if every send failed,
       // keeping it would silently skip this gate for 30 days.
-      if (!delivered) await releaseGate(notif.ticketId);
+      if (!delivered) await releaseGate(notif);
     } catch (err) {
-      await releaseGate(notif.ticketId).catch((relErr) =>
+      await releaseGate(notif).catch((relErr) =>
         console.error("[telegram-bug-intake] releaseGate after gate failure", relErr.message));
       throw err;
     }
   }
+  if (pinged) console.log(`[telegram-bug-intake] review gates: ${pending.length} open, ${pinged} newly pinged`);
 }
 
-/** Atomically claim a gate ticket for notification. False = already pinged. */
-async function claimGate(ticketId) {
+/**
+ * Dedupe key for ONE review cycle. The orchestrator mints a new notif.id every
+ * time it parks a gate (notif_<ticket>_<ISO>) and acks the old one when the
+ * review concludes; keying on the ticket alone silenced every cycle after the
+ * first (a rework → re-park of the same gate never pinged, TEAM-4343 Merge
+ * Approval). Notifications without an id (older runs) fall back to the ticket.
+ */
+function gateClaimKey(notif) {
+  return `${GATE_KEY_PREFIX}${notif.id || notif.ticketId}`;
+}
+
+/** Atomically claim a review cycle for notification. False = already pinged. */
+async function claimGate(notif) {
   try {
     await ddb.send(new PutItemCommand({
       TableName: PENDING_TABLE,
       Item: {
-        id: { S: `${GATE_KEY_PREFIX}${ticketId}` },
+        id: { S: gateClaimKey(notif) },
         ttl: { N: String(Math.floor(Date.now() / 1000) + 30 * 86400) },
       },
       ConditionExpression: "attribute_not_exists(id)",
@@ -778,11 +801,11 @@ async function claimGate(ticketId) {
   }
 }
 
-/** Drop a gate's notification claim so a later scan can retry the ping. */
-async function releaseGate(ticketId) {
+/** Drop a review cycle's claim so a later scan can retry the ping. */
+async function releaseGate(notif) {
   await ddb.send(new DeleteItemCommand({
     TableName: PENDING_TABLE,
-    Key: { id: { S: `${GATE_KEY_PREFIX}${ticketId}` } },
+    Key: { id: { S: gateClaimKey(notif) } },
   }));
 }
 
@@ -899,7 +922,6 @@ const ESC_DETAIL_MAX = 700;
 // work. Paging them would only flood the chat (first rollout pinged ~40 stale
 // ones from completed runs). Terminal phases per the orchestrator's
 // claimTerminalOutcome: complete / cancelled / deploy-blocked / static-ci-only.
-const TERMINAL_PHASES = new Set(["complete", "completed", "cancelled", "canceled", "failed", "deploy-blocked", "static-ci-only"]);
 
 // TEAM-4120 FR-3 — a dead-session escalation is a different DECISION from a
 // Workflow Manager escalation: the run is not asking "what should I do", it is
