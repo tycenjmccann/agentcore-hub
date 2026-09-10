@@ -114,6 +114,31 @@ test.describe("Workflow list sidebar — resize", () => {
     expect(afterLeft).toBeLessThanOrEqual(afterRight - 14);
   });
 
+  test("shrinking the viewport re-clamps the width and aria-valuemax to min(640, 50vw)", async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width: 1400, height: 900 });
+    await gotoExpanded(page, { "workflow-history-width": "640" });
+    expect(await sidebarWidth(page)).toBeGreaterThanOrEqual(630);
+    await expect(page.locator(HANDLE)).toHaveAttribute("aria-valuemax", "640");
+
+    // 50vw of an 800px viewport is 400px, below the stored 640.
+    await page.setViewportSize({ width: 800, height: 900 });
+    await page.waitForTimeout(SETTLE_MS);
+    const clamped = await sidebarWidth(page);
+    expect(clamped).toBeGreaterThanOrEqual(399);
+    expect(clamped).toBeLessThanOrEqual(401);
+    await expect(page.locator(HANDLE)).toHaveAttribute("aria-valuemax", "400");
+
+    // The chosen width is not persisted away by a temporarily narrow window, so
+    // widening back restores it.
+    const stored = await page.evaluate(() => localStorage.getItem("workflow-history-width"));
+    expect(stored).toBe("640");
+    await page.setViewportSize({ width: 1400, height: 900 });
+    await page.waitForTimeout(SETTLE_MS);
+    expect(await sidebarWidth(page)).toBeGreaterThanOrEqual(630);
+  });
+
   test("collapse then expand restores the persisted width", async ({ page }) => {
     await gotoExpanded(page, { "workflow-history-width": "450" });
     const wide = await sidebarWidth(page);

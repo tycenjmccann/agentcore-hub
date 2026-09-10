@@ -11,6 +11,18 @@ import { WORKFLOW_DEFS, DEFAULT_WORKFLOW_DEF_ID, getWorkflowDef } from "@/lib/wo
 import { resolveSdlcFramework, SDLC_BADGE_META } from "@/lib/workflow/sdlc-framework";
 import DeleteConfirmationModal from "@/components/workflow/DeleteConfirmationModal";
 
+// Workflows-list sidebar resize bounds. The upper bound is viewport-dependent
+// (min(MAX, 50vw)) and is applied separately from the absolute bound so that a
+// temporarily narrow window clamps what is *rendered* without destroying the
+// width the user actually chose.
+const HISTORY_MIN_WIDTH = 240;
+const HISTORY_MAX_WIDTH = 640;
+const HISTORY_DEFAULT_WIDTH = 288;
+
+function viewportMaxWidth() {
+  return Math.min(HISTORY_MAX_WIDTH, window.innerWidth / 2);
+}
+
 interface WorkflowSummary {
   id: string;
   phase: string;
@@ -41,15 +53,21 @@ export default function WorkflowPage() {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [nudgeToast, setNudgeToast] = useState<{ message: string; type: "success" | "info" | "error" } | null>(null);
   const [historyCollapsed, setHistoryCollapsed] = useState(true);
-  const [historyWidth, setHistoryWidth] = useState(288);
+  const [historyWidth, setHistoryWidth] = useState(HISTORY_DEFAULT_WIDTH);
+  // Viewport-dependent upper bound, kept in state so aria-valuemax re-renders
+  // when the window resizes. Starts at the absolute max so SSR and the first
+  // client render agree (the resize effect corrects it on mount).
+  const [historyMaxWidth, setHistoryMaxWidth] = useState(HISTORY_MAX_WIDTH);
   const [dragging, setDragging] = useState(false);
   const sidebarRef = useRef<HTMLDivElement>(null);
-  // Mirrors historyWidth for handlers that need the latest value synchronously
-  // (persisting on pointerup/lostpointercapture) — a setState functional
-  // updater is the wrong tool here since React can defer/replay it, and this
-  // handle fires both onPointerUp and onLostPointerCapture per click, so a
-  // side effect inside the updater can persist a stale value.
-  const widthRef = useRef(288);
+  // The width the user chose, clamped only to the absolute bounds. Handlers that
+  // need the latest value synchronously (persisting on pointerup/
+  // lostpointercapture) read this: a setState functional updater is the wrong
+  // tool there since React can defer/replay it, and this handle fires both
+  // onPointerUp and onLostPointerCapture per click, so a side effect inside the
+  // updater can persist a stale value. It is also the source of truth the
+  // viewport clamp is re-applied to, so widening the window restores the choice.
+  const widthRef = useRef(HISTORY_DEFAULT_WIDTH);
   const [testDefId, setTestDefId] = useState<string>(DEFAULT_WORKFLOW_DEF_ID);
   const [deleteTargetId, setDeleteTargetId] = useState<string | null>(null);
   const [deleteLoading, setDeleteLoading] = useState(false);
@@ -65,11 +83,27 @@ export default function WorkflowPage() {
     if (storedWidth !== null) {
       const parsed = parseInt(storedWidth, 10);
       if (!Number.isNaN(parsed)) {
-        const clamped = clampWidth(parsed);
-        widthRef.current = clamped;
-        setHistoryWidth(clamped);
+        // Absolute clamp only — the viewport clamp is applied by the resize
+        // effect below, which runs on mount too.
+        widthRef.current = Math.min(Math.max(parsed, HISTORY_MIN_WIDTH), HISTORY_MAX_WIDTH);
+        setHistoryWidth(widthRef.current);
       }
     }
+  }, []);
+
+  // min(640, 50vw) moves with the viewport, so a shrinking window must re-clamp
+  // both the rendered width and aria-valuemax. widthRef (the user's choice) and
+  // localStorage are deliberately left alone: a temporarily narrow window should
+  // not overwrite the chosen width, and widening back restores it.
+  useEffect(() => {
+    const applyViewportBound = () => {
+      const max = viewportMaxWidth();
+      setHistoryMaxWidth(max);
+      setHistoryWidth(Math.min(Math.max(widthRef.current, HISTORY_MIN_WIDTH), max));
+    };
+    applyViewportBound();
+    window.addEventListener('resize', applyViewportBound);
+    return () => window.removeEventListener('resize', applyViewportBound);
   }, []);
 
   const toggleHistory = () => {
@@ -79,7 +113,7 @@ export default function WorkflowPage() {
   };
 
   function clampWidth(px: number) {
-    return Math.min(Math.max(px, 240), Math.min(640, window.innerWidth / 2));
+    return Math.min(Math.max(px, HISTORY_MIN_WIDTH), viewportMaxWidth());
   }
 
   const handleResizePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
@@ -104,9 +138,9 @@ export default function WorkflowPage() {
   };
 
   const handleResizeDoubleClick = () => {
-    widthRef.current = 288;
-    setHistoryWidth(288);
-    localStorage.setItem('workflow-history-width', '288');
+    widthRef.current = HISTORY_DEFAULT_WIDTH;
+    setHistoryWidth(HISTORY_DEFAULT_WIDTH);
+    localStorage.setItem('workflow-history-width', String(HISTORY_DEFAULT_WIDTH));
   };
 
   const handleResizeKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
@@ -447,8 +481,8 @@ export default function WorkflowPage() {
               role="separator"
               aria-orientation="vertical"
               aria-valuenow={historyWidth}
-              aria-valuemin={240}
-              aria-valuemax={Math.min(640, typeof window !== 'undefined' ? window.innerWidth / 2 : 640)}
+              aria-valuemin={HISTORY_MIN_WIDTH}
+              aria-valuemax={historyMaxWidth}
               aria-label="Resize workflows list"
               tabIndex={0}
               data-testid="workflow-history-resize"
