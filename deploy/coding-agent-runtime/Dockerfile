@@ -95,8 +95,13 @@ USER root
 # @playwright/test 1.60.0) so a checked-out `playwright test` finds the exact
 # browser revision and skips the download. Installed to a world-readable path
 # (PLAYWRIGHT_BROWSERS_PATH) so the non-root runtime user can use it.
+# NO `--with-deps`: it shells out to apt, which re-configures the half-installed
+# otelcol-contrib package whose systemd postinstall fails in a Docker build (no
+# PID 1) and aborts the whole install (exit 100). The apt `chromium` above
+# already pulls chromium's shared libs (libnss3/libatk/…), so Playwright's own
+# browser binary runs against them — we only need the browser download here.
 RUN mkdir -p /opt/pw-browsers \
- && npx --yes playwright@1.60.0 install --with-deps chromium \
+ && npx --yes playwright@1.60.0 install chromium \
  && chmod -R a+rx /opt/pw-browsers
 
 # Python deps (health server + OTel + codex bedrock token generator)
