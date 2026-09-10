@@ -176,10 +176,14 @@ evidence links.
 
 ### B4. REVIEW (independent, read-only, different model)
 Fresh session; NEVER `resume_session` the worker's id. Default `codex`; if codex
-is unavailable use `kiro`; if both are unavailable use
-`claude_code(model="opus", repo=...)` as a NEW session by starting the task with
-"FRESH REVIEW SESSION" (you still get a fresh context; note the same-model
-review in the brief).
+is unavailable use `kiro`. If BOTH are unavailable there is no independent
+engine: every `claude_code` call in this invocation shares the worker's
+conversation, so a `claude_code` "review" would be the author grading its own
+work. Instead run the FALLBACK REVIEW PROMPT through the worker, which spawns a
+fresh-context read-only subagent (the Agent tool) with the REVIEW PROMPT and
+returns its output verbatim. Same model, fresh context: label it "fresh-context
+subagent review (codex/kiro unavailable)" in `review.md` and under NEEDS YOUR
+ATTENTION in the brief. Never call it independent.
 ```
 codex(repo="<owner/repo>", task=<REVIEW PROMPT>)
 ```
@@ -293,14 +297,24 @@ covers exactly the SHA in the brief.
 3. **Deploy:** `Pipeline___start_deploy(pipeline_name=..., commit_sha=<merge
    sha>)`; record `pipelineExecutionId`.
 4. **Watch:** poll `Pipeline___get_state(pipeline_name, execution_id)` every
-   ~60s until `terminal:true` AND `matchesExecution:true`. Build/Deploy failure
-   -> `Pipeline___get_build_log(build_id=<externalExecutionId>)`, then resume the
-   worker to fix at the root on `base_branch` via a NEW small PR (same
-   verify/CI discipline, no review round needed for a deploy-config fix under 20
-   lines; otherwise run B4), merge it, `Pipeline___start_deploy` again. A
-   `ManualApproval` stage waiting is the human's deploy gate: surface it, never
-   approve it yourself. `handoff: {files}` on a SUCCEEDED run = infra scripts a
-   human must run: list them in your summary, do not run them.
+   ~60s until `terminal:true` AND `matchesExecution:true`. A `ManualApproval`
+   stage waiting is the human's deploy gate: surface it, never approve it
+   yourself. `handoff: {files}` on a SUCCEEDED run = infra scripts a human must
+   run: list them in your summary, do not run them.
+   **Build/Deploy FAILED:** `Pipeline___get_build_log(build_id=
+   <externalExecutionId>)`, read the cause, then STOP deploying. The human's
+   approval covered exactly one SHA; a recovery commit is new production code
+   and goes through the full loop again, never straight to merge:
+   - Have the worker open a recovery PR against `base_branch` and run it through
+     B3 (verify) -> B4 (independent review) -> B5 -> B6 (CI) -> a recovery
+     merge brief at `shared/merge-brief-recovery-<n>.md`. No size exemption.
+   - Create a human ticket `Merge Approval (recovery): {goal}` (assignee = the
+     Merge Approval reviewer string, `blocked_by: ""`) carrying that brief, park
+     the SHIP ticket `blocked` on it, and exit without `report_completion`.
+   - On re-dispatch after approval: merge the recovery PR at the approved SHA
+     (MERGE PROMPT), `Pipeline___start_deploy(commit_sha=<new merge sha>)`,
+     and watch again. If the human does not approve, `report_completion` with
+     `outcome="deploy-blocked"` and the failing stage's log link.
 5. **Report:** `WorkflowOutput___report_completion(ticket_id=<ship ticket>,
    summary=<merge sha, pipelineExecutionId, each stage's terminal status, smoke
    result, handoff files>, merge_commit=<merge sha>, outcome="shipped")`.
@@ -373,6 +387,12 @@ PLAN:
 <plan.md>
 ```
 
+**FALLBACK REVIEW PROMPT** (worker, only when codex AND kiro are unavailable)
+```
+Do NOT review this yourself and do NOT edit anything in this turn. Spawn ONE fresh-context read-only subagent with the Agent tool (a Claude Code subagent starts with an empty context; if worktree isolation is available use it so the subagent cannot touch this checkout) and give it EXACTLY the following prompt. Return its output verbatim, prefixed with the line "REVIEW ENGINE: fresh-context claude subagent (codex/kiro unavailable)".
+<REVIEW PROMPT, filled in>
+```
+
 **RESPONSE PROMPT** (worker, same conversation)
 ```
 An independent reviewer returned the findings below for PR #<n>. For EACH P0-P2: FIX it (change + test, commit) or REJECT it with evidence (a test you ran, a file:line showing the reviewer's assumption is wrong, or the plan clause it contradicts). No silent skips. P3 suggestions: apply if trivial and in scope; otherwise post each as an inline PR comment (`gh api repos/<owner>/<repo>/pulls/<n>/comments` with path/line, or `gh pr comment` when not line-anchorable). Push. Update .operator/checkpoint.md.
@@ -422,7 +442,9 @@ Reply: each check -> pass/fail (+ run URL), whether you pushed any commit, final
   leave a ticket `in_progress` with no live session; never mark Done with an
   unresolved P0/P1.
 - `PR head == reviewed SHA == CI SHA` at brief time, and `== approved SHA` at
-  merge time. Drift = re-check / do-not-merge, never "probably fine".
+  merge time. Drift = re-check / do-not-merge, never "probably fine". Every
+  merge to `base_branch`, including a deploy-recovery PR, has its own human
+  Merge Approval; no size exemption, no "just a config fix".
 - `report_completion` every time carries what you ACTUALLY ran (commands,
   results) and the coding-session footers. Never imply a build, test or deploy
   that did not happen. `merge_commit` + `outcome="shipped"` only for a confirmed
