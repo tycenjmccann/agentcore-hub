@@ -136,7 +136,8 @@ hub_arns = [f"arn:aws:codepipeline:{r}:{account}:hub-*-deploy" for r in regions]
 pipeline_resources = [pipeline_arn] + hub_arns
 # PutApprovalResult is authorized at the ACTION level
 # (arn:...:<pipeline>/<stage>/<action>) - same pipelines, "/*" appended so the
-# grant still can't reach any OTHER pipeline's actions.
+# grant still cannot reach the actions of any OTHER pipeline. (No apostrophes
+# in this python: the whole program is one single-quoted shell string.)
 action_resources = [f"{pipeline_arn}/*"] + [f"{arn}/*" for arn in hub_arns]
 
 policy = {
@@ -165,6 +166,13 @@ policy = {
 print(json.dumps(policy))
 '
 )
+# An apostrophe anywhere in the python above would split the single-quoted
+# program and yield an empty document (put-role-policy then fails on length 0,
+# or worse, a partial policy). Refuse to write anything that is not a policy.
+[ -n "$POLICY_DOC" ] && printf '%s' "$POLICY_DOC" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["Statement"]' || {
+  echo "policy builder produced no valid document - refusing put-role-policy" >&2
+  exit 1
+}
 
 aws iam put-role-policy \
   --role-name "$ROLE_NAME" \
