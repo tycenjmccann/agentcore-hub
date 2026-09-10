@@ -3,7 +3,10 @@
 # whatever the ecosystem publishes that minute": fleet v41 (2026-09-09) pulled a
 # fresh mcp 2.x major and every persona died at import. A ceiling turns a major
 # bump into a deliberate, reviewed edit here (plus the Dockerfile import asserts).
-strands-agents>=1.53.0,<2
+# <1.55: strands 1.55 stopped emitting the system_prompt span attribute the UI
+# evaluator + test_telemetry_spans expect. Lift to 1.55+ only as a deliberate,
+# test-verified upgrade (span-attribute contract), not a silent rebuild bump.
+strands-agents>=1.53.0,<1.55
 bedrock-agentcore>=1.0.0,<2
 strands-agents-tools>=0.2.0,<1
 boto3>=1.43.0,<2
