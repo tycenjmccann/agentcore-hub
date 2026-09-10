@@ -11,3 +11,15 @@ Evidence for the follow-up work merged via PR #469 into
 Gates run below (verbatim summaries appended as each completes).
 
 ---
+
+## Gate 1 — `npm run lint`
+
+**Exit code: 0 (PASS).**
+
+- 19 pre-existing warnings across other files (`no-img-element`,
+  `react-hooks/exhaustive-deps` in agents/build/cloud-code/workflow-board/etc.).
+- **Zero warnings in the files this work changed**
+  (`src/app/workflow/page.tsx`, `tests/tab-workflow-resize.spec.ts`).
+- `next lint` exits 0 (warnings do not fail the gate).
+
+---
