@@ -495,10 +495,10 @@ REMOTE_CODING_TURN_BUDGET_S = int(os.getenv("REMOTE_CODING_TURN_BUDGET_S", "2700
 # lost-submit recovery probes), every poll, and the single automatic vm-death
 # resubmit. The poll loop bounds each CYCLE at the budget, but cycles
 # and recovery sleeps stack — worst case ran to hours of silent blocking with
-# no event emitted (TEAM-3119). The default (read timeout + 2*budget) sits above
-# one full worst-case cycle — the poll loop now gives up at budget, so the
-# default leaves room for a submit plus two cycles — so it never preempts
-# a provably-live runner; on expiry the turn fails loudly (agent.error event +
+# no event emitted (TEAM-3119). The default (read timeout + 2*budget) leaves
+# room for one worst-case submit plus two full budget-length poll cycles (the
+# original cycle and the one vm-death resubmit), so it never preempts a
+# provably-live runner; on expiry the turn fails loudly (agent.error event +
 # ERROR string to the persona) instead of pinning it. The poll loop also emits
 # periodic agent.streaming heartbeats (REMOTE_CODING_HEARTBEAT_S) so a long turn
 # never looks silent to the UI or WM.
@@ -720,12 +720,12 @@ def _poll_coding_turn(client, turn_id: str, outer_deadline: float | None = None,
     (journal gone) both mean the turn will never finish — fail fast, don't wait
     out the budget.
 
-    The budget is the give-up point: a turn that reports "running" forever is
-    abandoned at turn_start + budget. A live heartbeat can push `deadline`
-    forward within that window (terminal work after the CLI is unbounded) but is
-    clamped to it — before TEAM-4359 the hard stop was 2*budget and the
-    per-poll extension meant nothing else ever fired, so a wedged turn held the
-    persona for twice its budget (9600s on 4800s, 2026-09-09).
+    The loop polls until turn_start + budget and then stops, whatever the runner
+    reports. A "running" poll (fresh heartbeat) proves the runner is alive but
+    does NOT move that give-up point. Before TEAM-4359 every running poll pushed
+    a per-poll deadline forward and the only bound that ever fired was a hard
+    stop at 2*budget, so a wedged turn held the persona for twice its budget
+    (9600s on 4800s, 2026-09-09).
 
     outer_deadline is a time.monotonic() timestamp bounding the whole turn
     (REMOTE_CODING_TURN_DEADLINE_S) across cycles and recovery sleeps: it is
@@ -737,16 +737,14 @@ def _poll_coding_turn(client, turn_id: str, outer_deadline: float | None = None,
     existing callers are unchanged."""
     budget = REMOTE_CODING_TURN_BUDGET_S if budget_s is None else budget_s
     turn_start = time.time()
+    # The single give-up point (TEAM-4359): nothing below moves it. It used to be
+    # a per-poll deadline that every "running" poll pushed forward, bounded only
+    # by a hard stop at turn_start + 2*budget — so a wedged kiro turn kept the
+    # persona waiting 9600s on a 4800s budget.
     deadline = turn_start + budget
-    # The budget IS the give-up point (TEAM-4359). This used to be
-    # turn_start + 2*budget, and because every "running" poll re-extended
-    # `deadline`, the hard stop was the only bound that ever fired: a wedged kiro
-    # turn kept the persona waiting 9600s on a 4800s budget. A live heartbeat
-    # proves the runner is alive — it does not buy time past the budget.
-    hard_stop = turn_start + budget
     unknowns = 0
     last_heartbeat = time.time()
-    while time.time() < min(deadline, hard_stop) and (
+    while time.time() < deadline and (
             outer_deadline is None or time.monotonic() < outer_deadline):
         time.sleep(REMOTE_CODING_POLL_S)
         try:
@@ -782,14 +780,14 @@ def _poll_coding_turn(client, turn_id: str, outer_deadline: float | None = None,
             continue
         unknowns = 0
         # "running" or "transient" (degraded EFS read / torn read racing the
-        # journal's tmp+rename): the turn may still be live — keep polling.
-        # A provably-live runner (fresh heartbeat / in-memory answer) extends
-        # the deadline, but only up to hard_stop: terminal work after the CLI
-        # (artifact harvest can be GBs) has no fixed bound, yet a runner that
-        # heartbeats forever must not outlive the budget. The runner's own
-        # watchdog bounds the CLI and its _TURN_TERMINAL_GRACE_S bound forces a
-        # terminal record, so its verdict arrives well inside the budget; a
-        # runner that dies mid-harvest stops heartbeating and 'dead' fires.
+        # journal's tmp+rename): the turn may still be live — keep polling, but
+        # only until `deadline`. A fresh heartbeat proves the runner is alive; it
+        # does not buy time past the budget. Terminal work after the CLI
+        # (artifact harvest can be GBs) has no fixed bound of its own, but the
+        # runner's watchdog bounds the CLI and its _TURN_TERMINAL_GRACE_S forces
+        # a terminal record, so a live runner's verdict arrives inside the
+        # budget; a runner that dies mid-harvest stops heartbeating and 'dead'
+        # fires.
         if state == "running":
             now = time.time()
             # Prove-alive pulse: the runner heartbeats its journal, but nothing
@@ -798,13 +796,9 @@ def _poll_coding_turn(client, turn_id: str, outer_deadline: float | None = None,
             if now - last_heartbeat >= REMOTE_CODING_HEARTBEAT_S:
                 _publish_coding_heartbeat(cli, int(now - turn_start))
                 last_heartbeat = now
-            # Clamped to hard_stop: the extension can keep a live turn polling
-            # inside its budget, never past it.
-            deadline = min(max(deadline,
-                               time.time() + max(3 * REMOTE_CODING_POLL_S, 120)),
-                           hard_stop)
-    # Budget spent with no live heartbeat seen recently and no verdict. The
-    # turn may STILL have completed its work — a blind re-run is not safe.
+    # Budget spent (or the outer deadline hit) with no verdict — the runner may
+    # well still be heartbeating. The turn may STILL have completed its work — a
+    # blind re-run is not safe.
     # Probe once more, then tell the persona to VERIFY STATE WITHOUT running a
     # coding turn (a fresh CLI call would race a still-live runner in the same
     # workspace). Skip the probe once the outer deadline has expired: the
@@ -838,7 +832,7 @@ def _poll_once(client, turn_id: str) -> dict:
     """client is the submit client (600s read timeout, sized for cold-clone
     setup). Polls answer in under a second server-side, so they get their own
     short-timeout client — otherwise one accepted-but-silent poll connection
-    blocks 600s and blows straight past the loop's hard stop."""
+    blocks 600s and blows straight past the loop's budget."""
     global _POLL_CLIENT
     if _POLL_CLIENT is None:
         _POLL_CLIENT = boto3.client(
