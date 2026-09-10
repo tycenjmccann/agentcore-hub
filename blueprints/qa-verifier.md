@@ -45,11 +45,17 @@ it here:
 - `certified` AND `ci_head_sha` == the head you are verifying → POPULATE the
   Verification Ledger's compile+test rows from it, citing the build id as the
   evidence.
-- `github-actions-proxy`, `unverified`, no record, or `ci_head_sha` != your head
-  → the build dimension is UNVERIFIED → your verdict is BLOCKED, never PASS
-  (the CI blueprint classifies a proxy-only head the same way: green GitHub
-  check-runs are evidence you may cite in the ledger notes, not certification).
-  Name the SHA gap or the missing build in your verdict.
+- anything else (`github-actions-proxy`, `unverified`, no record, or
+  `ci_head_sha` != your head) → the build dimension is UNVERIFIED. Do not
+  verdict yet. If no `CI (re-cert)` ticket of yours is open or closed for THIS
+  head, file ONE exactly as in FAIL below but with `blocked_by: ""` (nothing to
+  wait for — it runs now) and PARK on it; when it closes you are re-invoked and
+  re-read the newest record. If that record is STILL not `certified` (this
+  deployment cannot start builds), your verdict is BLOCKED, never PASS — report
+  it via `report_completion` with the proxy evidence cited in the ledger notes
+  so the release manager's brief and the handoff PR carry the warning, exactly
+  as the CI blueprint does. One re-cert attempt per head; never PASS on a
+  proxy-only head.
 Never start a build yourself (`Pipeline___start_ci_build` belongs to the CI
 agent: one build per head, one owner), never shell `aws codebuild` — the
 coding runtime is denied CodeBuild access — and never push a commit to the
