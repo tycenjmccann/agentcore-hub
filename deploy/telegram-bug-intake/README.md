@@ -50,6 +50,11 @@ Changes on top of the imported baseline:
   summary, file scope) via the GitHub API; the approval ping gains "View PR" /
   "View commit" link buttons. All best-effort — failures fall back to the terse
   message.
+- **TEAM-4338 (multi-CD deploy gate)** — the bridge no longer watches one
+  hardcoded pipeline. It now reads `config/cd-registry.json` from
+  `ARTIFACT_BUCKET` and polls EVERY registered pipeline (its own region, its
+  own repo in the brief), in addition to the `DEPLOY_PIPELINE_NAME` fallback.
+  See "Secrets and config" and "Multi-target behaviour" below.
 
 ## Architecture
 
@@ -84,14 +89,35 @@ populated for the bot to do anything.
 
 Optional: `BEDROCK_MODEL_ID`, `CONFIDENCE_THRESHOLD`,
 `TRANSCRIBE_LANGUAGE`, `CHAT_SETTLE_MS`, `CHAT_BUFFER_MAX_MS`,
-`WM_MIN_BUDGET_MS`, `WM_RELAY_TIMEOUT_MS`, `DEPLOY_PIPELINE_NAME`.
+`WM_MIN_BUDGET_MS`, `WM_RELAY_TIMEOUT_MS`, `DEPLOY_PIPELINE_NAME`,
+`ARTIFACT_BUCKET`, `PIPELINE_REGIONS`.
 
-`DEPLOY_PIPELINE_NAME` enables the CI/CD deploy-approval bridge (TEAM-3740):
-the poller watches this CodePipeline for a `ManualApproval` action awaiting a
-decision, pings allowlisted chats with Approve / Reject buttons, and maps the
-tap to `codepipeline:PutApprovalResult`. It is **fail-closed**: unset (OSS /
-accounts without the pipeline) makes the whole path a no-op, so the variable is
-purely additive. Set it to the deploy pipeline name (`agentcore-hub-deploy`).
+`DEPLOY_PIPELINE_NAME` and `ARTIFACT_BUCKET` together enable the CI/CD
+deploy-approval bridge (TEAM-3740, multi-target since TEAM-4338): the poller
+watches, for EVERY CodePipeline it can see, for a `ManualApproval` action
+awaiting a decision, pings allowlisted chats with Approve / Reject buttons, and
+maps the tap to `codepipeline:PutApprovalResult` on that pipeline, in its own
+region. Both unset is the OSS default and makes the whole path a **true
+no-op** — zero AWS calls, not even a client constructed — so both variables are
+purely additive:
+
+- `ARTIFACT_BUCKET` — when set, the poller reads `config/cd-registry.json`
+  from this bucket (60s TTL) and adds every entry that names a `pipeline` as a
+  target, in that entry's own `region`. A read failure other than "the key
+  doesn't exist yet" — including a **malformed/truncated body** — keeps the last
+  good copy rather than going empty, and every attempted read opens the TTL
+  window, so a persistent failure costs one GetObject per TTL, not one per scan
+  (TEAM-4377, same loader contract as the orchestrator and the `Pipeline___*`
+  tools Lambda).
+- `DEPLOY_PIPELINE_NAME` — a fallback target in the function's own region,
+  deduped against the registry (naming the same pipeline in both places is not
+  a double watch). `update-config.sh` only **defaults** this on the function, so
+  an operator override survives a re-run — and the inline policy below follows
+  the effective value, not the script's default.
+- `PIPELINE_REGIONS` — **not read by this Lambda at all.** It exists purely as
+  the IAM fan-out list for `update-config.sh` below (which region(s) to grant
+  `hub-*-deploy` access in); the poller's actual target list always comes from
+  the registry at runtime, so registering a repo never requires an IAM edit.
 
 ## IAM
 
@@ -99,14 +125,53 @@ This function is account-local — its execution role is managed out of band (se
 Provenance), not by a repo-tracked SAM/CDK stack — so the role's statements are
 documented here rather than declared in infra. Beyond the DynamoDB /
 Bedrock / Transcribe access the intake paths need, the deploy-approval bridge
-requires two CodePipeline actions, scoped least-privilege to the deploy pipeline
-ARN (`arn:aws:codepipeline:<region>:<account>:agentcore-hub-deploy`):
+requires three statements: two CodePipeline actions, scoped to the function's
+**effective** `DEPLOY_PIPELINE_NAME` ARN — `update-config.sh` reads that value
+back out of the env document it just applied, so a re-run without re-exporting
+still grants an operator's custom pipeline (TEAM-4377) — plus the `hub-*-deploy`
+convention per `PIPELINE_REGIONS`, and one S3 read:
 
 - `codepipeline:GetPipelineState` — poll for an approval action awaiting a decision.
-- `codepipeline:PutApprovalResult` — record the Approve / Reject tap.
+- `codepipeline:PutApprovalResult` — record the Approve / Reject tap. This
+  function is the ONE place in the account that legitimately holds this
+  action — the `Pipeline___*` tools Lambda never gets it (the deploy gate is
+  human-only).
+- `s3:GetObject` on exactly `config/cd-registry.json` in `ARTIFACT_BUCKET` —
+  one key, not a prefix.
 
-Both are unused while `DEPLOY_PIPELINE_NAME` is unset; grant them only where the
-pipeline exists.
+`GetPipelineState` is authorized at the PIPELINE level, but `PutApprovalResult`
+is authorized at the ACTION level (`arn:...:<pipeline>/<stage>/<action>`), so
+its resource is `<pipeline-arn>/*` for each pipeline above, not the bare
+pipeline ARN — `update-config.sh` grants them accordingly.
+
+`./update-config.sh` is the tracked, idempotent, re-runnable way to apply both
+the env vars above and this inline policy — it **supersedes** the untracked
+`deploy/local/telegram-bug-intake/deploy.sh` for that job. Like the zip-and-
+`update-function-code` deploy below, it is a **handoff** step: a human runs it;
+the pipeline's Deploy stage never touches IAM or env vars.
+
+All three IAM statements are unused while both `DEPLOY_PIPELINE_NAME` and
+`ARTIFACT_BUCKET` are unset.
+
+## Multi-target behaviour (TEAM-4338)
+
+Each target the poller finds — one per CD-registry entry with a `pipeline`,
+plus the `DEPLOY_PIPELINE_NAME` fallback — gets its own per-region
+`CodePipelineClient`, its own claim row (`pipelineName`/`region`/`repo`), and
+its own ping: the message names both the pipeline and the repo, and
+`buildDeployBrief` is enriched from THAT repo's GitHub history, not the hub's.
+One target failing (e.g. a deleted pipeline) never costs another target its
+ping. The Approve/Reject callback resolves the pipeline from the claim row and
+calls `PutApprovalResult` in that pipeline's own region; a claim row written
+before TEAM-4338 (no `region` attribute) still approves, via the function's
+default region.
+
+The claim key folds the pipeline name into the hash, so two different
+pipelines waiting on tokens that happen to collide get two different claims.
+One consequence: on the deploy that ships this change, a wait that is already
+mid-flight resolves to a different key than before, so its FIRST scan after
+the new code lands can send one duplicate ping for that same wait — the stale
+claim row simply TTLs out (7 days) and nothing else is affected.
 
 ## Deploy
 
@@ -115,15 +180,15 @@ which the `nodejs20.x` runtime provides. So a deploy is the zip and nothing else
 
 ```bash
 cd deploy/telegram-bug-intake
-zip function.zip index.mjs
+zip function.zip index.mjs cd-registry.mjs
 aws lambda update-function-code \
   --function-name telegram-bug-intake \
   --zip-file fileb://function.zip
 rm function.zip
 ```
 
-`update-function-code` does not touch environment variables — config changes need
-a separate `update-function-configuration`.
+`update-function-code` does not touch environment variables or IAM — config
+changes need `./update-config.sh` (above), a separate, human-run handoff step.
 
 ## Tests
 

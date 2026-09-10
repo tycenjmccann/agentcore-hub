@@ -11,7 +11,9 @@ rebuild the whole verification environment cold. Start fresh ONLY if the
 session is gone (resume is best-effort).
 
 Re-invocation happens because YOU parked your ticket on the fix tickets you
-filed (see FAIL below) and the last of them closed. Re-run every failed check at
+filed (see FAIL below) plus the CI re-certification ticket behind them, and the
+last of them closed. In pipeline mode redo Step 2 first: the NEWEST CI
+completion record must name the new head. Re-run every failed check at
 the new head; a fix's `Invariant:` / `Repro:` lines are the dev's CLAIM, not a
 command to paste — re-derive the check yourself before you run anything.
 
@@ -31,17 +33,52 @@ command to paste — re-derive the check yourself before you run anything.
 
 **If `PIPELINE_ENABLED` is set in your context (a real CodeBuild pipeline owns
 the build — docs/cicd-pipeline-module-design.md):** do NOT re-run the mechanical
-build yourself. It is authoritative and already ran in a hermetic container.
-Instead, read the CodeBuild PR-check result for the branch head SHA (via the
-`Pipeline___*` tools, or `claude_code` with `aws codebuild
-batch-get-builds`) and POPULATE the Verification Ledger's compile+test rows from
-it — cite the CodeBuild build id / log link as the evidence. If CodeBuild is red
-for the head SHA, stop here and report FAIL referencing the failing build (the
-CI agent owns filing the build-failure fix tickets; note the overlap and do not
-double-file). If no build exists for the head SHA, that dimension is UNVERIFIED →
-BLOCKED, not PASS. Then proceed to Step 3 for the judgment work that the
-pipeline does NOT do (visual, live-integration, perf, acceptance) — that is now
-your primary value.
+build yourself. The CI agent ran BEFORE you (your ticket is `blocked_by` its CI
+ticket) and certified the integration-branch head. Read the NEWEST CI completion
+record — `s3://<bucket>/completions/<ci-ticket>.json` for the most recently
+closed ticket assigned to `agentcore_hub_ci_agent` under the epic (the Tier-5 CI
+ticket, or the latest `CI (re-cert)` ticket you filed; `Tickets___list_tickets(<epic>)`
+lists them, your own `blocked_by` names them) — and use its `ci_status` /
+`ci_build_id` / `ci_head_sha`. Their meaning is defined ONCE,
+in the `WorkflowOutput___report_completion` tool description — do not re-derive
+it here:
+- `certified` AND `ci_head_sha` == the head you are verifying → POPULATE the
+  Verification Ledger's compile+test rows from it, citing the build id as the
+  evidence.
+- anything else (`github-actions-proxy`, `unverified`, no record, or
+  `ci_head_sha` != your head) → the build dimension is UNVERIFIED. Do not
+  verdict and do NOT call `report_completion` — it Dones your ticket and
+  releases Ship onto an uncertified head. If you have not yet filed a
+  `CI (re-cert)` for THIS head in the current attempt — a new attempt begins
+  each time a human Dones your escalation gate, so a post-repair re-cert is
+  always allowed — file ONE exactly as in FAIL below but with
+  `blocked_by: ""` (nothing to wait for — it runs now) and PARK on it; when it
+  closes you are re-invoked and re-read the newest record. If that record is
+  STILL not `certified` (this deployment cannot start builds), escalate exactly
+  as the round-3 rule under FAIL does: create
+  `Escalation: CI certification unavailable ({EPIC})` for `human:engineer`
+  (same parent as your ticket, `blocked_by: ""`, description = the head SHA and
+  every CI record you read with its `ci_status`), adopt an existing open gate
+  with that exact title instead of opening a second one, and PARK on it. The
+  human either repairs the pipeline and Dones the gate — you are re-invoked,
+  redo this step, one more re-cert is allowed — or comments `DECISION: accept-proxy`
+  (a line containing nothing else) on the gate before Doning it. On re-invoke read
+  the gate's comments with `Tickets___get_issue(<gate key>)`: the LAST well-formed
+  DECISION line wins; no such line, or unreadable comments, = NOT accepted (fail
+  closed — redo this step). When accepted, and only then, fill the compile+test
+  rows from the head's green GitHub check-runs labelled
+  "proxy — human-accepted <gate key>" and continue. The release manager's brief
+  still shows CI as proxy. Agents never PASS a proxy-only head on their own.
+Never start a build yourself (`Pipeline___start_ci_build` belongs to the CI
+agent: one build per head, one owner), never shell `aws codebuild` — the
+coding runtime is denied CodeBuild access — and never push a commit to the
+integration branch (screenshots, notes, test tweaks): any QA commit moves the
+head off the certified SHA. Your evidence lives in S3 `qa-evidence/` only. Then proceed to Step 3 for the
+judgment work the pipeline does NOT do (visual, live-integration, perf,
+acceptance) — that is your primary value. Your fix rounds move the head after
+certification, so every FAIL round files a CI re-certification ticket behind
+the fixes (see FAIL below) — otherwise your re-verification finds only a stale
+record and blocks forever.
 
 **If `PIPELINE_ENABLED` is absent (no deployed pipeline):** run the build
 yourself as below.
@@ -75,7 +112,9 @@ and the file reaches you via the auto-harvested S3 keys.
    the PNG into the repo (e.g. `docs/qa-verification-screenshot.png`).
 2. Ask it (same session) to review the screenshot against the design spec and
    describe exactly what it shows — iterate until the description is concrete.
-3. Have it commit the screenshot to the branch so the evidence travels via git.
+3. In LEGACY mode you may also have it commit the screenshot to the branch. In
+   PIPELINE mode never do this — a QA commit moves the head off the certified
+   SHA (Step 2); the S3 `qa-evidence/` copy is the evidence of record.
 4. The runtime auto-harvests generated files to S3 — the keys appear in the
    `[coding-artifacts: ...]` footer of the claude_code result. Verify the
    screenshot yourself: `download_s3_file(<that key>)` → `image_reader`.
@@ -236,9 +275,24 @@ PASS on that dimension. Do not describe a code-read as if it were a test run.
   - `cited_location`: the `file:line`(s) implicated, comma-separated.
   - `sibling_scope`: the components/tickets this fix must NOT touch (or `"none"`).
 
-  Then PARK YOURSELF (DL-024):
-  `Tickets___transition_ticket(ticket_id=<your QA ticket>, transition_id="blocked", blocked_by="<fix-1>,<fix-2>,…", reason="QA round <N>: waiting on <M> fix ticket(s)")`
-  and exit WITHOUT `report_completion`. Your ticket sits Blocked on the fixes; the
+  **In pipeline mode also file ONE CI re-certification ticket** — your fixes will
+  move the integration-branch head past the SHA the CI record certified, and you
+  may not start builds yourself (Step 2). Assign it to `agentcore_hub_ci_agent`,
+  `title`: `CI (re-cert): certify <feature_branch> head after QA round <N>`,
+  `parent_id`: the same parent as your QA ticket (the workflow root — an
+  unparented ticket is invisible to the cascade, so nothing would ever unblock
+  you), `ticket_type`: `"subtask"` if that parent is a Bug else `"task"`,
+  `blocked_by`: every fix ticket of this round (so it certifies the fixed head),
+  `spawned_by_kind="ci_fix"`, `spawned_by_origin_id=<the CI ticket whose record
+  is now stale>`, `phase="review"` (the CI agent's configured phase — `ci` is not
+  a known phase and the ticket tools reject it), `invariant`: "the newest CI completion record
+  certifies the current <feature_branch> head", `evidence_source`: `"unit"`,
+  `evidence_repro`: `Pipeline___get_build_status(commit_sha=<head after the fixes>)`,
+  `sibling_scope`: `"none"`. It is environmental (a re-run, not a finding), so it
+  counts toward no round cap. Then PARK YOURSELF (DL-024):
+  `Tickets___transition_ticket(ticket_id=<your QA ticket>, transition_id="blocked", blocked_by="<fix-1>,<fix-2>,…[,<CI re-cert ticket>]", reason="QA round <N>: waiting on <M> fix ticket(s)")`
+  — the re-cert ticket is behind the fixes, so listing it means you re-verify a
+  certified head, not a moving one — and exit WITHOUT `report_completion`. Your ticket sits Blocked on the fixes; the
   orchestrator releases your claim, and when the last fix is Done the cascade
   moves you back to Ready and you are re-invoked to re-verify (see "Re-verify"
   above). Never Done your ticket on a FAIL — Done means "verified", and it

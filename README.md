@@ -518,7 +518,7 @@ To configure:
 **Three intake paths** (all converge on the same orchestrator):
 1. **In-app form** — `POST /api/workflow/start` (UI submission)
 2. **Programmatic API** — `POST /api/workflow/start` with the same payload (Claude Code, scripts, CI)
-3. **Jira-native bug** — file a `Bug` issue in Jira directly. The `issue_created` webhook bootstraps a workflow keyed off the Bug, creates a requirements-analyst sub-task under it, and the analyst loads the `bug-fix-requirements` blueprint to produce a 3-subtask chain (Fix → QA → CI).
+3. **Jira-native bug** — file a `Bug` issue in Jira directly. The `issue_created` webhook bootstraps a workflow keyed off the Bug, creates a requirements-analyst sub-task under it, and the analyst loads the `bug-fix-requirements` blueprint to produce the sub-task chain (Fix → Review → CI → QA).
 
 **Agent Jira Lambda** (separate infra, agents call Jira through this):
 - Function: `agentcore-hub-jira` — SAM-deployed Lambda (for Jira mode) or `agentcore-hub-tickets` (for DynamoDB mode)

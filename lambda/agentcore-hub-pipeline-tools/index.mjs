@@ -19,38 +19,118 @@
  *   - start_ci_build: (TEAM-4122 FR-4) Start the PR-CHECK build for one commit,
  *                     so the CI agent can re-run CI on a head it just pushed
  *                     instead of waiting for a webhook that may never fire. The
- *                     project is ALWAYS CI_PROJECT — never a caller argument —
- *                     and the StartBuild input is an allow-list of three keys,
- *                     so no override (buildspec/env/image/privileged/role/source)
- *                     can ride in from the agent's args.
+ *                     project is ALWAYS a PR-check project this deployment knows
+ *                     (env CI_PROJECT or a target's ciProject) — an args.project
+ *                     naming anything else is IGNORED, not honored — and the
+ *                     StartBuild input is an allow-list of three keys, so no
+ *                     override (buildspec/env/image/privileged/role/source) can
+ *                     ride in from the agent's args.
  *   - capabilities:   What this Lambda will actually do in THIS deployment, so an
  *                     agent can branch without probing with a real StartBuild.
+ *                     Also enumerates every target (see below).
+ *
+ * ─── TARGETS: the CD registry IS the allow-list (TEAM-4337) ──────────────────
+ *
+ * This Lambda used to be pinned to ONE pipeline by env. It now resolves the
+ * pipeline/projects a call acts on from the CD registry
+ * (config/cd-registry.json in ARTIFACT_BUCKET — the same document the
+ * orchestrator reads to decide CD vs handoff), so registering a repo is enough
+ * to make its pipeline drivable. A TARGET is one such resolved set:
+ *
+ *   { repo, pipeline, region, ciProject, buildProject, deployProject, isEnvDefault }
+ *
+ * Targets come from (a) every registry entry that names a `pipeline`, expanded by
+ * the hub-<slug>-{ci,build,deploy} naming convention via pipelineProjects(), plus
+ * (b) the env default (PIPELINE_NAME/CI_PROJECT/BUILD_PROJECT/DEPLOY_PROJECT in
+ * REGION) unless a registry entry already names that pipeline. Registry order
+ * first, env default last — deterministic, but ORDER IS NOT MEANING (TEAM-4358):
+ * the env default is the target whose `pipeline === PIPELINE_NAME`, flagged
+ * `isEnvDefault`, never `targets[0]`. When the registry names this deployment's
+ * own pipeline (the hub's own entry normally does), THAT entry is the env default
+ * target — carrying the registry's region/ciProject rather than env's.
+ *
+ * A registry entry with NO pipeline (a DEPLOY.md-mode CD repo) yields no target:
+ * there is nothing here to drive for it.
+ *
+ * Every tool resolves exactly one target before touching AWS, and REFUSES
+ * structurally (never throws, never falls back to the env default) when the
+ * caller names something outside the allow-list. The four refusal reasons:
+ *
+ *   pipeline_not_registered  args.pipeline_name is not any target's pipeline.
+ *                            { ok:false, reason, requested, known:[pipelines] }
+ *   project_not_registered   the project we landed on — args.project, OR (for
+ *                            get_build_log) the project a build_id names, OR
+ *                            (for get_build_status/start_ci_build) a project
+ *                            resolved some other way — is not any target's
+ *                            ci/build/deploy project.
+ *                            { ok:false, reason, requested, known:[projects] }
+ *   project_mismatch        (TEAM-4348, get_build_log only) args.project and
+ *                            the project build_id names ("<project>:<uuid>")
+ *                            disagree. Refused rather than picking one, so a
+ *                            caller never gets a DIFFERENT build's log than it
+ *                            thinks it asked for.
+ *                            { ok:false, reason, requested, buildIdProject }
+ *   pipeline_name_required   >1 target and a WRITE tool (start_deploy) was called
+ *                            without pipeline_name — refusing to guess which repo
+ *                            to deploy. args.project cannot substitute (TEAM-4348:
+ *                            start_deploy does not take a project at all).
+ *                            { ok:false, reason, known:[pipelines] }
+ *
+ * A refusal makes ZERO AWS calls. With a single target (the pre-TEAM-4337 shape:
+ * empty/absent registry) a call that names nothing resolves to the env default,
+ * so the single-pipeline behavior is byte-identical to before.
+ *
+ * Clients are per-region (clientsFor): a target in us-west-2 gets its own
+ * CodePipeline/CodeBuild/Logs clients, and (TEAM-4348) the region used is always
+ * the OWNER of the project a call actually names, not just whichever target the
+ * args happened to resolve — a pipeline_name naming one repo plus a project
+ * belonging to another must still reach the project's own region. The S3 client
+ * is deliberately NOT fanned out — both S3 reads (the registry and the handoff
+ * marker) live in the one artifact bucket in THIS Lambda's region.
  *
  * DELIBERATELY ABSENT: PutApprovalResult. The in-pipeline ManualApproval (deploy
  * gate) is a HUMAN decision, bridged to Telegram (telegram-bug-intake). An agent
  * must never approve its own deploy. This Lambda is read + trigger only. Still
- * true after FR-4: start_ci_build starts a PR CHECK, which deploys nothing, and
- * capabilities reports approveDeploy:false unconditionally.
+ * true after FR-4 and after multi-target: start_ci_build starts a PR CHECK, which
+ * deploys nothing; capabilities reports approveDeploy:false unconditionally; and
+ * widening the registry can only ever add a pipeline to READ and TRIGGER, never
+ * an approval path.
  *
  * Env:
- *   PIPELINE_NAME       default "agentcore-hub-deploy"  (the CodePipeline)
+ *   PIPELINE_NAME       default "agentcore-hub-deploy"  (the env default target's
+ *                       CodePipeline)
  *   BUILD_PROJECT       default "agentcore-hub-build"
- *   CI_PROJECT          default "agentcore-hub-ci" — the PR-check project, and the
- *                       ONLY project start_ci_build can ever start. Validated at
- *                       module load (validateCiProjectName): a wildcard, or a name
- *                       that collides with the build/deploy/runtime-image project
- *                       or the pipeline, disables start_ci_build rather than
- *                       pointing agent-triggerable StartBuild at a deploy
+ *   CI_PROJECT          default "agentcore-hub-ci" — the env default target's
+ *                       PR-check project. Validated at MODULE LOAD
+ *                       (validateCiProjectName): a wildcard, or a name that
+ *                       collides with the build/deploy/runtime-image project or
+ *                       the pipeline, disables start_ci_build rather than pointing
+ *                       agent-triggerable StartBuild at a deploy. A REGISTRY
+ *                       target's ciProject cannot be checked at load (the registry
+ *                       is not read yet), so start_ci_build re-validates the
+ *                       project it is about to start against EVERY target's
+ *                       build/deploy/pipeline names + RESERVED_CI_PROJECTS on each
+ *                       call. Same rule, applied later.
  *   PIPELINE_CI_START_BUILD  "1" iff the deploy granted codebuild:StartBuild on
- *                       CI_PROJECT. Read ONLY to advertise the capability — the
- *                       IAM grant is the actual gate, so a lie in either
- *                       direction cannot start (or block) a build by itself
+ *                       the PR-check projects. Read ONLY to advertise the
+ *                       capability — the IAM grant is the actual gate, so a lie in
+ *                       either direction cannot start (or block) a build by itself
  *   DEPLOY_PROJECT      set on this Lambda by deploy/setup-pipeline-tools-lambda.mjs
  *                       (which also uses it for IAM scoping); read here ONLY to
  *                       refuse a CI_PROJECT that names it. To reach the Deploy
  *                       stage's CodeBuild project (same name as the pipeline,
  *                       different resource kind), callers pass
  *                       project="agentcore-hub-deploy" explicitly to get_build_log
+ *   ARTIFACT_BUCKET     the artifact bucket, in this Lambda's region. Source of
+ *                       BOTH the CD registry (config/cd-registry.json) and the
+ *                       Deploy stage's handoff markers. Unset → no S3 call at all:
+ *                       the registry is empty and the env default is the only
+ *                       target (single-pipeline mode)
+ *   CD_REGISTRY_TTL_MS  default 60000 — how long a warm container reuses the
+ *                       registry it read. A read failure keeps the last good copy
+ *   PIPELINE_REPO       optional "owner/repo" label for the env default target, so
+ *                       capabilities() can name the repo it deploys. Cosmetic —
+ *                       nothing resolves on it
  *   REGION              default from AWS_REGION
  */
 
@@ -72,6 +152,11 @@ import {
   CloudWatchLogsClient,
   GetLogEventsCommand,
 } from "@aws-sdk/client-cloudwatch-logs";
+// Byte copy of lambda/orchestrator/cd-registry.mjs (each Lambda zips from its own
+// directory). Pinned identical by scripts/check-cd-registry-parity.sh — edit the
+// canonical file in lambda/orchestrator/ and re-copy, never this one. Zero imports,
+// so it constructs nothing at load.
+import { parseCdRegistry, pipelineProjects } from "./cd-registry.mjs";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const PIPELINE_NAME = process.env.PIPELINE_NAME || "agentcore-hub-deploy";
@@ -79,6 +164,8 @@ const BUILD_PROJECT = process.env.BUILD_PROJECT || "agentcore-hub-build";
 const CI_PROJECT = process.env.CI_PROJECT || "agentcore-hub-ci";
 const DEPLOY_PROJECT = process.env.DEPLOY_PROJECT || "agentcore-hub-deploy";
 const ARTIFACT_BUCKET = process.env.ARTIFACT_BUCKET || "";
+// Cosmetic label for the env default target only — see the Env block above.
+const PIPELINE_REPO = (process.env.PIPELINE_REPO || "").trim();
 
 // A CodeBuild project that deploys, but is not the pipeline's Deploy stage, so
 // the DEPLOY_PROJECT/PIPELINE_NAME comparisons below would not catch it.
@@ -132,10 +219,12 @@ export function validateCiProjectName(name, opts = {}) {
   return { ok: true, reason: null };
 }
 
-// Validated ONCE at module load, but never thrown: get_state/get_build_log/
-// get_build_status are read-only and must keep working on a deployment whose
-// CI_PROJECT is wrong. Only start_ci_build (and the capability it advertises)
-// depends on this verdict.
+// The ENV DEFAULT's verdict, computed once at module load but never thrown:
+// get_state/get_build_log/get_build_status are read-only and must keep working on
+// a deployment whose CI_PROJECT is wrong. Only capabilities' flat `startCiBuild`
+// depends on this value now — start_ci_build re-validates the project it is about
+// to start against every target on each call (validateCiProjectAcrossTargets),
+// because a registry-derived ciProject does not exist yet at module load.
 const CI_PROJECT_CHECK = validateCiProjectName(CI_PROJECT, {
   buildProject: BUILD_PROJECT,
   deployProject: DEPLOY_PROJECT,
@@ -145,10 +234,304 @@ if (!CI_PROJECT_CHECK.ok) {
   console.warn(`start_ci_build disabled: ${CI_PROJECT_CHECK.reason}`);
 }
 
-const cp = new CodePipelineClient({ region: REGION });
-const cb = new CodeBuildClient({ region: REGION });
-const logs = new CloudWatchLogsClient({ region: REGION });
+/**
+ * Re-validate a PR-check project against EVERY target this deployment knows, not
+ * just the env default. A registry-derived ciProject reaches us after module load
+ * (see the CI_PROJECT env note), so this is where the "start_ci_build may only
+ * start a PR check" rule is enforced for it: the name must not be any target's
+ * build project, deploy project or pipeline, nor a reserved deploy project.
+ */
+function validateCiProjectAcrossTargets(name, targets = []) {
+  const base = validateCiProjectName(name, {
+    buildProject: BUILD_PROJECT,
+    deployProject: DEPLOY_PROJECT,
+    pipelineName: PIPELINE_NAME,
+  });
+  if (!base.ok) return base;
+  for (const t of targets) {
+    const verdict = validateCiProjectName(name, {
+      buildProject: t.buildProject,
+      deployProject: t.deployProject,
+      pipelineName: t.pipeline,
+    });
+    if (!verdict.ok) return verdict;
+  }
+  return { ok: true, reason: null };
+}
+
+// The S3 client is a single module instance on purpose: the registry and the
+// handoff markers both live in the ONE artifact bucket in this Lambda's region.
+// Fanning it out per pipeline region would read a bucket that does not exist.
 const s3 = new S3Client({ region: REGION });
+
+// CodePipeline/CodeBuild/Logs, memoized per region — a target in another region
+// needs its own clients, and a warm container should not rebuild them per call.
+const clientsByRegion = new Map();
+
+/** @returns {{cp: CodePipelineClient, cb: CodeBuildClient, logs: CloudWatchLogsClient}} */
+function clientsFor(region) {
+  const key = region || REGION;
+  let set = clientsByRegion.get(key);
+  if (!set) {
+    set = {
+      cp: new CodePipelineClient({ region: key }),
+      cb: new CodeBuildClient({ region: key }),
+      logs: new CloudWatchLogsClient({ region: key }),
+    };
+    clientsByRegion.set(key, set);
+  }
+  return set;
+}
+
+// ─── CD registry ──────────────────────────────────────────────────────────────
+// The same document the orchestrator reads (lambda/orchestrator/index.mjs
+// loadCdRegistry) with the same TTL cache and the same failure directions.
+
+const CD_REGISTRY_KEY = "config/cd-registry.json";
+const CD_REGISTRY_TTL_MS = Number(process.env.CD_REGISTRY_TTL_MS) || 60_000;
+
+let registryCache = { version: 1, repos: [] };
+let registryLoadedAt = 0;
+
+/**
+ * The CD registry, cached for CD_REGISTRY_TTL_MS per warm container.
+ *
+ * Failure directions, all non-fatal — a registry problem must never take the
+ * read-only tools down:
+ *   no ARTIFACT_BUCKET → the current (empty) registry, with NO S3 command
+ *                        constructed at all. Single-pipeline mode.
+ *   NoSuchKey / 404    → empty registry (nothing is registered yet).
+ *   MALFORMED body     → the LAST GOOD copy (TEAM-4358). A truncated or
+ *                        half-written document is a failed read, not "nothing is
+ *                        registered".
+ *   any other error    → the LAST GOOD copy is kept and a warning logged, so a
+ *                        transient S3 error cannot un-register a live repo
+ *                        mid-deploy.
+ *
+ * EVERY path opens the TTL window, same as the orchestrator
+ * (lambda/orchestrator/index.mjs:259) — including the failing ones.
+ */
+async function loadRegistry({ force = false } = {}) {
+  if (!ARTIFACT_BUCKET) return registryCache;
+  const now = Date.now();
+  if (!force && registryLoadedAt && now - registryLoadedAt < CD_REGISTRY_TTL_MS) {
+    return registryCache;
+  }
+  try {
+    const obj = await s3.send(
+      new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: CD_REGISTRY_KEY })
+    );
+    // JSON.parse HERE rather than letting parseCdRegistry do it (TEAM-4358).
+    // parseCdRegistry is tolerant BY DESIGN — a malformed document becomes an
+    // EMPTY registry — and assigning that would DISCARD the last good copy and
+    // cache "nothing registered" for the whole TTL: one truncated S3 read
+    // un-registers every repo. Parsing first turns a malformed body into a
+    // SyntaxError the catch treats like any other read failure. parseCdRegistry
+    // takes the already-parsed object, so tolerant per-ENTRY handling is
+    // unchanged.
+    const doc = JSON.parse(await obj.Body.transformToString());
+    registryCache = parseCdRegistry(doc);
+  } catch (e) {
+    if (e?.name === "NoSuchKey" || e?.name === "NotFound" || e?.$metadata?.httpStatusCode === 404) {
+      registryCache = { version: 1, repos: [] };
+    } else {
+      console.warn("cd-registry read failed (keeping last copy, non-fatal):", e?.name, e?.message);
+    }
+  }
+  // Stamped on EVERY path, failures included (TEAM-4358). Without this, a
+  // persistent AccessDenied or network fault meant an S3 GetObject on every
+  // single tool invocation for the life of the container.
+  registryLoadedAt = now;
+  return registryCache;
+}
+
+/**
+ * @typedef {{repo: string|null, pipeline: string, region: string,
+ *            ciProject: string, buildProject: string, deployProject: string,
+ *            isEnvDefault: boolean}} Target
+ */
+
+/**
+ * Every target this deployment can act on: one per registry entry that names a
+ * pipeline (expanded by pipelineProjects), then the env default unless a registry
+ * entry already names that pipeline. Order is deterministic (registry order, env
+ * default last), but callers must NOT read `targets[0]` as "the default"
+ * (TEAM-4358) — that made an unqualified call act on whichever repo an operator
+ * happened to register first. Exactly one target always carries
+ * `isEnvDefault: true`: the one whose `pipeline === PIPELINE_NAME`, whether it
+ * came from the registry or from env.
+ *
+ * @returns {Promise<Target[]>}
+ */
+async function listTargets() {
+  const registry = await loadRegistry();
+  const targets = [];
+  const seen = new Set();
+  for (const entry of registry?.repos || []) {
+    const projects = pipelineProjects(entry);
+    // No pipeline → a DEPLOY.md-mode CD repo. Nothing here can drive it.
+    if (!projects || seen.has(projects.pipeline)) continue;
+    seen.add(projects.pipeline);
+    targets.push({
+      repo: entry.repo || null,
+      pipeline: projects.pipeline,
+      region: projects.region || REGION,
+      ciProject: projects.ciProject,
+      buildProject: projects.buildProject,
+      deployProject: projects.deployProject,
+      // The registry may name the deployment's OWN pipeline, and normally does.
+      // That entry IS the env default — it just carries the registry's
+      // region/ciProject instead of env's. Stamping false here (TEAM-4358) left
+      // NO target flagged, and resolveTarget's fallback then degraded to registry
+      // ORDER.
+      isEnvDefault: projects.pipeline === PIPELINE_NAME,
+    });
+  }
+  if (!seen.has(PIPELINE_NAME)) {
+    targets.push({
+      repo: PIPELINE_REPO || null,
+      pipeline: PIPELINE_NAME,
+      region: REGION,
+      ciProject: CI_PROJECT,
+      buildProject: BUILD_PROJECT,
+      deployProject: DEPLOY_PROJECT,
+      isEnvDefault: true,
+    });
+  }
+  return targets;
+}
+
+/** Every CodeBuild project name a target owns. */
+function projectsOf(target) {
+  return [target.ciProject, target.buildProject, target.deployProject].filter(Boolean);
+}
+
+/** The target that owns CodeBuild project `name`, or null. */
+function targetForProject(targets, name) {
+  if (!name) return null;
+  return targets.find((t) => projectsOf(t).includes(name)) || null;
+}
+
+/**
+ * Which target does this invocation act on?
+ *
+ *   args.pipeline_name  → the target whose `pipeline` matches EXACTLY, else a
+ *                         pipeline_not_registered refusal.
+ *   args.project        → READ TOOLS ONLY (requirePipelineName false): the
+ *                         target owning that ci/build/deploy project, else a
+ *                         project_not_registered refusal. Skipped entirely when
+ *                         requirePipelineName is true (TEAM-4348) — start_deploy
+ *                         does not take a project, and honouring one here would
+ *                         let it substitute for the pipeline_name this tool
+ *                         refuses to guess.
+ *   neither             → the only target, if there is only one (the
+ *                         single-pipeline shape). With more than one:
+ *                         requirePipelineName → pipeline_name_required refusal;
+ *                         otherwise the env default (read-only tools stay usable).
+ *
+ * The refusal path makes NO AWS call — the point is that an unregistered pipeline
+ * is answered from the allow-list, not by asking AWS and leaking whether it
+ * exists. The resolved target is returned, never stashed: the caller keeps it in
+ * its own scope so two concurrent invocations can never see each other's.
+ *
+ * @returns {Promise<{target: Target|null, refusal: object|null, targets: Target[]}>}
+ */
+async function resolveTarget(args = {}, { requirePipelineName = false } = {}) {
+  const targets = await listTargets();
+  const pipelines = targets.map((t) => t.pipeline);
+
+  const requestedPipeline = String(args.pipeline_name ?? "").trim();
+  if (requestedPipeline) {
+    const target = targets.find((t) => t.pipeline === requestedPipeline) || null;
+    if (!target) {
+      return {
+        target: null,
+        targets,
+        refusal: {
+          ok: false,
+          reason: "pipeline_not_registered",
+          requested: requestedPipeline,
+          known: pipelines,
+        },
+      };
+    }
+    return { target, targets, refusal: null };
+  }
+
+  // TEAM-4348: args.project only resolves a target for the READ tools. A WRITE
+  // tool (start_deploy, requirePipelineName:true) does not accept a project at
+  // all, so this branch is skipped for it rather than letting project stand in
+  // for the pipeline_name check below.
+  if (!requirePipelineName) {
+    const requestedProject = String(args.project ?? "").trim();
+    if (requestedProject) {
+      const target = targetForProject(targets, requestedProject);
+      if (!target) {
+        return {
+          target: null,
+          targets,
+          refusal: {
+            ok: false,
+            reason: "project_not_registered",
+            requested: requestedProject,
+            known: targets.flatMap(projectsOf),
+          },
+        };
+      }
+      return { target, targets, refusal: null };
+    }
+  }
+
+  if (targets.length === 1) return { target: targets[0], targets, refusal: null };
+  if (requirePipelineName) {
+    return {
+      target: null,
+      targets,
+      refusal: { ok: false, reason: "pipeline_name_required", known: pipelines },
+    };
+  }
+  // The env default, BY NAME. `|| targets[0]` used to stand here and was a silent
+  // bug (TEAM-4358): with this deployment's own pipeline listed in the registry no
+  // target carried the flag, so an unqualified call acted on whichever repo was
+  // registered FIRST — a read, or a start_ci_build, against another repo's
+  // project in another repo's region. listTargets guarantees one flagged target;
+  // the second find states that invariant structurally, so a future change there
+  // degrades to the CONFIGURED pipeline rather than back to list order.
+  const envDefault =
+    targets.find((t) => t.isEnvDefault) || targets.find((t) => t.pipeline === PIPELINE_NAME);
+  if (!envDefault) {
+    // Unreachable while listTargets appends the env default (see above). Refuse
+    // rather than return an undefined target: guessing one is the whole thing
+    // this block exists to prevent.
+    return {
+      target: null,
+      targets,
+      refusal: { ok: false, reason: "pipeline_name_required", known: pipelines },
+    };
+  }
+  return { target: envDefault, targets, refusal: null };
+}
+
+/**
+ * Resolve the target for one tool call and run the tool under it. A refusal
+ * short-circuits before any AWS call. On the way out, an error is annotated with
+ * the pipeline/region that was actually REQUESTED, so the handler's catch can
+ * name them without any long-lived module state — the target exists only in this
+ * call's scope.
+ */
+async function onTarget(args, opts, fn) {
+  const { target, refusal, targets } = await resolveTarget(args, opts);
+  if (refusal) return jsonResult(refusal);
+  try {
+    return await fn(target, targets);
+  } catch (err) {
+    if (err && typeof err === "object" && err.pipeline === undefined) {
+      err.pipeline = target.pipeline;
+      err.region = target.region;
+    }
+    throw err;
+  }
+}
 
 export const handler = async (event) => {
   let toolName =
@@ -175,17 +558,19 @@ export const handler = async (event) => {
   try {
     switch (toolName) {
       case "get_state":
-        return await getState(args);
+        return await onTarget(args, {}, (t) => getState(args, t));
+      // The one WRITE against a pipeline: with more than one target it refuses
+      // rather than guessing which repo to deploy.
       case "start_deploy":
-        return await startDeploy(args);
+        return await onTarget(args, { requirePipelineName: true }, (t) => startDeploy(args, t));
       case "get_build_log":
-        return await getBuildLog(args);
+        return await onTarget(args, {}, (t, all) => getBuildLog(args, t, all));
       case "get_build_status":
-        return await getBuildStatus(args);
+        return await onTarget(args, {}, (t, all) => getBuildStatus(args, t, all));
       case "start_ci_build":
-        return await startCiBuild(args);
+        return await onTarget(args, {}, (t, all) => startCiBuild(args, t, all));
       case "capabilities":
-        return capabilities();
+        return await capabilities(args);
       default: {
         const message = `Unknown tool: "${toolName}". Available: get_state, start_deploy, get_build_log, get_build_status, start_ci_build, capabilities`;
         return { error: message, content: [{ text: message }] };
@@ -194,11 +579,14 @@ export const handler = async (event) => {
   } catch (err) {
     console.error("Tool execution error:", err);
     // A missing pipeline surfaces as a structured, non-throwing signal so the
-    // agent's preflight can BLOCK cleanly (vs. an opaque runtime error).
+    // agent's preflight can BLOCK cleanly (vs. an opaque runtime error). The name
+    // and region come from the annotation onTarget put on the error, so the
+    // message describes what the caller ASKED FOR, not the env default; env is
+    // the fallback for an error raised outside a resolved target.
     if (err?.name === "PipelineNotFoundException") {
       return jsonResult({
         configured: false,
-        error: `Pipeline "${PIPELINE_NAME}" not found in ${REGION}`,
+        error: `Pipeline "${err.pipeline || PIPELINE_NAME}" not found in ${err.region || REGION}`,
       });
     }
     return textResult(`Error: ${err.name || "Error"}: ${err.message}`);
@@ -212,7 +600,9 @@ export const handler = async (event) => {
 // a green deploy reported as Failed — so "Failed" meant either a real failure or
 // a clean deploy with a follow-up, and only a build log could tell them apart.
 // get_state now reports it as data on a succeeded run.
-async function handoffForExecution(pipelineName, pipelineExecutionId) {
+// `cp` is the CALLER's region-correct CodePipeline client; `s3` is always this
+// Lambda's own, because the marker lives in the one artifact bucket.
+async function handoffForExecution(pipelineName, pipelineExecutionId, cp) {
   if (!ARTIFACT_BUCKET || !pipelineExecutionId) return null;
   let sha = "";
   try {
@@ -256,8 +646,11 @@ async function handoffForExecution(pipelineName, pipelineExecutionId) {
 // ONLY from stages whose latestExecution matches; matchesExecution:false means
 // the new run is not yet visible on any stage (keep polling — never read the
 // old run as this run's completion).
-async function getState(args = {}) {
-  const name = args.pipeline_name || PIPELINE_NAME;
+async function getState(args = {}, target) {
+  // The pipeline is the RESOLVED target's — args.pipeline_name was already
+  // validated against the allow-list (or refused) before we got here.
+  const name = target.pipeline;
+  const { cp } = clientsFor(target.region);
   const executionId = String(args.execution_id || "").trim();
   const state = await cp.send(new GetPipelineStateCommand({ name }));
 
@@ -353,11 +746,15 @@ async function getState(args = {}) {
 
   // Present (non-null) when this execution's Deploy stage recorded infra files a
   // human must still deploy. It is NOT a failure — the code deploy succeeded.
-  const handoff = await handoffForExecution(name, pipelineExecutionId);
+  const handoff = await handoffForExecution(name, pipelineExecutionId, cp);
 
   return jsonResult({
     configured: true,
     pipelineName: name,
+    // Which target answered — so a multi-repo agent can prove it polled the
+    // pipeline it meant to.
+    region: target.region,
+    repo: target.repo,
     pipelineExecutionId,
     handoff,
     // Present only when execution_id was passed: true iff ≥1 stage's latest
@@ -377,8 +774,16 @@ async function getState(args = {}) {
 // re-run after a build-failure fix has landed on the default branch.
 // Pass commit_sha (the merge SHA) so the request carries an idempotency token —
 // a retried tool call for the same SHA then cannot double-trigger the pipeline.
-async function startDeploy(args = {}) {
-  const name = args.pipeline_name || PIPELINE_NAME;
+//
+// With more than one target this REFUSES without pipeline_name
+// (pipeline_name_required) rather than defaulting: deploying the wrong repo is
+// not a recoverable mistake, and the env default is the hub itself.
+// start_deploy takes no `project` argument, and (TEAM-4348) resolveTarget skips
+// the args.project branch for this call entirely — an args.project cannot
+// substitute for pipeline_name here, it is simply ignored.
+async function startDeploy(args = {}, target) {
+  const name = target.pipeline;
+  const { cp } = clientsFor(target.region);
   const input = { name };
   // clientRequestToken constraints: ^[a-zA-Z0-9-]+$, 1–128 chars. Sanitize the
   // SHA to that charset; if nothing valid remains (or no SHA was given), OMIT
@@ -392,6 +797,8 @@ async function startDeploy(args = {}) {
   return jsonResult({
     started: true,
     pipelineName: name,
+    region: target.region,
+    repo: target.repo,
     pipelineExecutionId: res.pipelineExecutionId,
     note: "Deploy stage has an in-pipeline ManualApproval (deploy gate) that a HUMAN approves (Telegram). Poll get_state with execution_id=<this pipelineExecutionId> until terminal:true AND matchesExecution:true.",
   });
@@ -402,8 +809,50 @@ async function startDeploy(args = {}) {
 // command failed) + a tail of its CloudWatch log. Accepts an explicit build_id
 // (from get_state's actionDetails.externalExecutionId) or falls back to the
 // project's most recent build.
-async function getBuildLog(args = {}) {
-  const project = args.project || BUILD_PROJECT;
+//
+// Project resolution, in order: an explicit args.project → the project named
+// INSIDE build_id (CodeBuild ids are literally "<projectName>:<uuid>") → the
+// resolved target's build project → env BUILD_PROJECT. The build_id step
+// matters because get_state's actionDetails.externalExecutionId is the only
+// handle an agent has after a failure, and it already carries the project — so
+// a cross-region build log works without the caller knowing which target owns
+// it.
+//
+// TEAM-4348: args.project is NOT pre-validated by resolveTarget for this tool
+// (a build_id's project bypasses resolveTarget entirely — it never sees args.
+// build_id), so BOTH names are checked here, before any client is constructed:
+//   - if args.project and the build_id's project disagree, refuse
+//     project_mismatch rather than silently picking one (the caller would get a
+//     DIFFERENT build's log than it thinks it asked for);
+//   - whatever project we land on must be a REGISTERED one — project_not_
+//     registered otherwise. This closes the gap where an unregistered
+//     build_id project used to fall back to the resolved target and still run
+//     BatchGetBuilds + GetLogEvents, in that target's region.
+async function getBuildLog(args = {}, target, targets = []) {
+  const explicit = String(args.project ?? "").trim();
+  const fromId = parseBuildIdProject(args.build_id);
+  if (explicit && fromId && explicit !== fromId) {
+    return jsonResult({
+      ok: false,
+      reason: "project_mismatch",
+      requested: explicit,
+      buildIdProject: fromId,
+    });
+  }
+  const project = explicit || fromId || target.buildProject || BUILD_PROJECT;
+  // Region follows whoever owns that project — never the `|| target` fallback:
+  // an unregistered project must be refused, not silently read in whichever
+  // region the (possibly unrelated) resolved target happens to sit in.
+  const owner = targetForProject(targets, project);
+  if (!owner) {
+    return jsonResult({
+      ok: false,
+      reason: "project_not_registered",
+      requested: project,
+      known: targets.flatMap(projectsOf),
+    });
+  }
+  const { cb, logs } = clientsFor(owner.region);
   let buildId = args.build_id;
 
   if (!buildId) {
@@ -454,6 +903,7 @@ async function getBuildLog(args = {}) {
   return jsonResult({
     buildId,
     project,
+    region: owner.region,
     // resolvedSourceVersion is the actual commit SHA CodeBuild built (the AWS SDK
     // documents this — NOT sourceVersion, which for a PR build can be a pr/<id>
     // ref). Callers proving "green belongs to the new head" must match on this.
@@ -475,8 +925,27 @@ async function getBuildLog(args = {}) {
 // builds of the project and returns each with its resolvedSourceVersion (the real
 // git commit CodeBuild built — sourceVersion may be a pr/<id> ref). If commit_sha
 // is given, also returns the matching build + a boolean succeededForCommit.
-async function getBuildStatus(args = {}) {
-  const project = args.project || CI_PROJECT;
+//
+// TEAM-4348: when args.pipeline_name is also passed, resolveTarget resolves on
+// the PIPELINE and never validates args.project against the allow-list (the
+// project branch only runs when pipeline_name is absent) — the sibling of the
+// get_build_log gap. So the project this function lands on is allow-listed
+// here too, and the region used is that project's OWNER, not the
+// pipeline_name-resolved target: scanning the wrong region silently returns
+// "no builds", which a merge gate reads as "CI never ran" rather than as an
+// error.
+async function getBuildStatus(args = {}, target, targets = []) {
+  const project = String(args.project ?? "").trim() || target.ciProject || CI_PROJECT;
+  const owner = targetForProject(targets, project);
+  if (!owner) {
+    return jsonResult({
+      ok: false,
+      reason: "project_not_registered",
+      requested: project,
+      known: targets.flatMap(projectsOf),
+    });
+  }
+  const { cb } = clientsFor(owner.region);
   const commit = (args.commit_sha || "").trim();
   // Clamp scan to an integer in [1, 50]. A negative value would turn
   // ids.slice(0, n) into a from-end slice (silently dropping the NEWEST builds)
@@ -490,7 +959,9 @@ async function getBuildStatus(args = {}) {
     new ListBuildsForProjectCommand({ projectName: project, sortOrder: "DESCENDING" })
   );
   const ids = (list.ids || []).slice(0, scan);
-  if (ids.length === 0) return jsonResult({ project, builds: [], match: null });
+  if (ids.length === 0) {
+    return jsonResult({ project, region: owner.region, builds: [], match: null });
+  }
 
   const { builds } = await cb.send(new BatchGetBuildsCommand({ ids }));
   const rows = (builds || []).map((b) => ({
@@ -515,6 +986,7 @@ async function getBuildStatus(args = {}) {
 
   return jsonResult({
     project,
+    region: owner.region,
     requestedCommit: commit || null,
     match,
     succeededForCommit: !!(match && match.buildStatus === "SUCCEEDED"),
@@ -529,9 +1001,13 @@ async function getBuildStatus(args = {}) {
 // from "build pending" to get_build_status.
 //
 // Three invariants, in the order they are enforced:
-//   1. The project is CI_PROJECT — an env value, validated at module load. args
-//      .project is IGNORED, not rejected: a fix-then-retry loop must not learn
-//      that naming a different project is even a category of request (F2/F3).
+//   1. The project is a PR-CHECK project this deployment KNOWS: env CI_PROJECT or
+//      some target's ciProject. args.project naming anything else (a build or
+//      deploy project, say) is IGNORED, not rejected: a fix-then-retry loop must
+//      not learn that naming a different project is even a category of request
+//      (F2/F3). Whatever project we land on is then re-validated against EVERY
+//      target's build/deploy/pipeline names, so a registry entry cannot smuggle a
+//      deploy project in as a "ciProject" either.
 //   2. commit_sha is REQUIRED. It is what makes this tool idempotent — it is both
 //      the dedupe key against builds already running and the StartBuild
 //      idempotencyToken. A sourceVersion-only call (a branch name) can name a
@@ -540,14 +1016,32 @@ async function getBuildStatus(args = {}) {
 //      *Override inputs can replace the buildspec, the image, the service role and
 //      privileged mode — i.e. turn a PR check into arbitrary privileged execution.
 //      They are never read from args at all.
-async function startCiBuild(args = {}) {
-  if (!CI_PROJECT_CHECK.ok) {
+async function startCiBuild(args = {}, target, targets = []) {
+  // Step 1: which PR-check project. An args.project that is not a known PR-check
+  // project falls back to the resolved target's — silently, by design.
+  const knownCiProjects = new Set([CI_PROJECT, ...targets.map((t) => t.ciProject)].filter(Boolean));
+  const requested = String(args.project ?? "").trim();
+  const project =
+    requested && knownCiProjects.has(requested) ? requested : target.ciProject || CI_PROJECT;
+
+  const check = validateCiProjectAcrossTargets(project, targets);
+  if (!check.ok) {
     return jsonResult({
       ok: false,
       reason: "ci_project_invalid",
-      detail: CI_PROJECT_CHECK.reason,
+      detail: check.reason,
     });
   }
+  // TEAM-4348: region follows the project's OWNER, not the (possibly
+  // unrelated) target pipeline_name resolved — a pipeline_name naming one repo
+  // plus a ciProject belonging to another used to send the dedupe scan and
+  // StartBuild to a region where the project does not exist. The `|| target`
+  // fallback is safe HERE and only here: `project` is already constrained to
+  // knownCiProjects and re-validated above, so it can never be an unregistered
+  // name reaching AWS (contrast get_build_log/get_build_status, which refuse
+  // instead of falling back).
+  const owner = targetForProject(targets, project) || target;
+  const { cb } = clientsFor(owner.region);
 
   const rawSha = String(args.commit_sha ?? "").trim();
   if (!rawSha) {
@@ -580,12 +1074,12 @@ async function startCiBuild(args = {}) {
   // several agents (CI agent + release manager both watch it), and a duplicate
   // build costs minutes of pipeline time and produces a second, racing verdict
   // for one commit.
-  const existing = await findRecentBuildForCommit(CI_PROJECT, sha, 30);
+  const existing = await findRecentBuildForCommit(cb, project, sha, 30);
   if (existing) {
     console.log(
       "start_ci_build: reusing build",
       JSON.stringify({
-        project: CI_PROJECT,
+        project,
         buildId: existing.id,
         buildStatus: existing.buildStatus,
       })
@@ -596,13 +1090,14 @@ async function startCiBuild(args = {}) {
       buildId: existing.id,
       buildStatus: existing.buildStatus,
       resolvedSourceVersion: existing.resolvedSourceVersion || null,
-      project: CI_PROJECT,
+      project,
+      region: owner.region,
     });
   }
 
   // The allow-list. Do not spread args into this object, ever.
   const input = {
-    projectName: CI_PROJECT,
+    projectName: project,
     sourceVersion,
     idempotencyToken: `ci-${sha}`.slice(0, 64),
   };
@@ -619,12 +1114,25 @@ async function startCiBuild(args = {}) {
       return jsonResult({
         ok: false,
         reason: "start_build_not_granted",
-        project: CI_PROJECT,
-        detail: "This Lambda's role has no codebuild:StartBuild on the CI project. Deploy with PIPELINE_CI_START_BUILD=1 to grant it.",
+        project,
+        // TEAM-4358: with the StartBuild grant fanned out per region over the
+        // project/hub-*-ci convention, WHICH project in WHICH region was refused
+        // is half the diagnosis — and the old single-cause remediation text was
+        // wrong for two of the three ways this denial happens.
+        region: owner.region,
+        detail:
+          `This Lambda's role has no codebuild:StartBuild on ${project} in ${owner.region}. ` +
+          "Three deploy-side causes: (1) the deployment was not given " +
+          "PIPELINE_CI_START_BUILD=1, so the CiStartBuild statement is absent entirely; " +
+          "(2) this target's region is not in PIPELINE_REGIONS, so the project/hub-*-ci " +
+          "grant was never fanned out to it; (3) the registry entry sets an explicit " +
+          "ciProject outside the hub-*-ci convention, which that wildcard cannot match. " +
+          "All three are operator changes, not retryable — fall back to waiting on the " +
+          "repo's own webhook build.",
       });
     }
     if (err?.name === "ResourceNotFoundException") {
-      return jsonResult({ ok: false, reason: "project_not_found", project: CI_PROJECT });
+      return jsonResult({ ok: false, reason: "project_not_found", project });
     }
     if (err?.name === "InvalidInputException") {
       // CodeBuild rejects a source version this Lambda's shape check accepted
@@ -633,7 +1141,7 @@ async function startCiBuild(args = {}) {
       return jsonResult({
         ok: false,
         reason: "invalid_source_version",
-        project: CI_PROJECT,
+        project,
         sourceVersion,
         detail: err.message,
       });
@@ -644,14 +1152,15 @@ async function startCiBuild(args = {}) {
   const build = res?.build || {};
   console.log(
     "start_ci_build: started",
-    JSON.stringify({ project: CI_PROJECT, sourceVersion, buildId: build.id || null })
+    JSON.stringify({ project, sourceVersion, buildId: build.id || null })
   );
   return jsonResult({
     ok: true,
     started: true,
     buildId: build.id || null,
     arn: build.arn || null,
-    project: CI_PROJECT,
+    project,
+    region: owner.region,
     sourceVersion,
     // Null on a fresh start (CodeBuild has not resolved the ref yet) — poll
     // get_build_status to prove the build belongs to this commit.
@@ -671,6 +1180,16 @@ function isAllowedSourceVersion(value) {
   return /^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$/.test(value);
 }
 
+/** The project a CodeBuild build id names. Build ids are "<projectName>:<uuid>",
+ * so the id an agent already holds from get_state's actionDetails carries the
+ * project — no extra lookup needed to fetch its log. Null when there is no colon
+ * or nothing before it. */
+function parseBuildIdProject(buildId) {
+  const value = String(buildId ?? "").trim();
+  if (!value.includes(":")) return null;
+  return value.split(":")[0] || null;
+}
+
 /** Is `resolved` (a build's resolvedSourceVersion) the commit `sha` names? Same
  * prefix rule get_build_status matches on, but restricted to hex values so a
  * short branch name can never prefix-match a SHA. */
@@ -685,7 +1204,7 @@ function commitMatches(resolved, sha) {
  * BatchGetBuilds does not promise input order, so the ids (which ARE newest-first)
  * drive the walk. A FAILED build is NOT a reuse — re-running a red build for the
  * same commit is exactly what the CI agent calls this tool to do. */
-async function findRecentBuildForCommit(project, sha, scan = 30) {
+async function findRecentBuildForCommit(cb, project, sha, scan = 30) {
   const list = await cb.send(
     new ListBuildsForProjectCommand({ projectName: project, sortOrder: "DESCENDING" })
   );
@@ -709,14 +1228,47 @@ async function findRecentBuildForCommit(project, sha, scan = 30) {
 // real StartBuild (whose only failure signal would be an AccessDenied it cannot
 // distinguish from a transient error). approveDeploy is a hard false: there is no
 // PutApprovalResult in this Lambda and there is not going to be one.
-function capabilities() {
+//
+// version 3 adds `targets` — every pipeline/project set this deployment can act
+// on, so an agent can discover the right pipeline_name instead of assuming the
+// env default. The flat startCiBuild/ciProject/buildProject/deployPipeline keys
+// describe the ENV DEFAULT and are kept for callers written against version 2.
+// Optional args.pipeline_name narrows `targets` to that one (and refuses with
+// pipeline_not_registered if it is not a target at all).
+async function capabilities(args = {}) {
+  const targets = await listTargets();
+  const requested = String(args.pipeline_name ?? "").trim();
+  let listed = targets;
+  if (requested) {
+    listed = targets.filter((t) => t.pipeline === requested);
+    if (listed.length === 0) {
+      return jsonResult({
+        ok: false,
+        reason: "pipeline_not_registered",
+        requested,
+        known: targets.map((t) => t.pipeline),
+      });
+    }
+  }
+  const flagOn = process.env.PIPELINE_CI_START_BUILD === "1";
   return jsonResult({
-    startCiBuild: process.env.PIPELINE_CI_START_BUILD === "1" && CI_PROJECT_CHECK.ok,
+    startCiBuild: flagOn && CI_PROJECT_CHECK.ok,
     ciProject: CI_PROJECT,
     buildProject: BUILD_PROJECT,
     deployPipeline: PIPELINE_NAME,
     approveDeploy: false,
-    version: 2,
+    version: 3,
+    targets: listed.map((t) => ({
+      repo: t.repo,
+      pipeline: t.pipeline,
+      region: t.region,
+      ciProject: t.ciProject,
+      buildProject: t.buildProject,
+      deployProject: t.deployProject,
+      // Per target: the flag is deployment-wide, but a target whose ciProject
+      // fails validation cannot be started even so.
+      startCiBuild: flagOn && validateCiProjectAcrossTargets(t.ciProject, targets).ok,
+    })),
   });
 }
 

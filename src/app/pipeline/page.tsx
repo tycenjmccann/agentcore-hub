@@ -17,14 +17,19 @@ interface StageState {
   lastUpdated?: string;
   revisionSummary?: string;
 }
-interface PipelineStatus {
-  enabled: boolean;
+/** One CD target — a registered repo's pipeline, or the env default ({repo: ""}). */
+interface PipelineTarget {
+  repo: string;
+  pipeline: string;
   region: string;
   ciProject: string;
-  deployPipeline: string;
   recentBuilds: CiBuild[];
   stages: StageState[];
   error?: string;
+}
+interface PipelineStatus {
+  enabled: boolean;
+  pipelines: PipelineTarget[];
 }
 
 function statusIcon(s: string) {
@@ -63,7 +68,7 @@ export default function PipelinePage() {
           <div>
             <h1 className="text-xl font-bold text-[var(--color-text-primary)]">CI/CD Pipeline</h1>
             <p className="text-sm text-[var(--color-text-secondary)]">
-              CodeBuild PR checks + CodePipeline deploy. AWS-native, build-once/promote-by-digest.
+              CodeBuild PR checks + CodePipeline deploy, one per repo in the CD registry. AWS-native, build-once/promote-by-digest.
             </p>
           </div>
         </div>
@@ -82,26 +87,42 @@ export default function PipelinePage() {
         </div>
       )}
 
-      {data?.error && (
-        <div className="mb-6 rounded-lg border border-yellow-600/30 bg-yellow-600/10 p-4 text-sm text-yellow-300">
-          Pipeline infra not reachable in <code>{data.region}</code>: {data.error}
-          <div className="mt-1 text-[var(--color-text-muted)]">
-            Deploy it with <code>deploy/pipeline/deploy.sh</code> (optional module).
-          </div>
+      {data && data.pipelines.length === 0 && (
+        <div className="text-sm text-[var(--color-text-muted)]">
+          No pipelines registered — add one in Workflow → CD registry….
         </div>
       )}
 
-      {data && (
-        <>
-          <section className="mb-8">
-            <h2 className="text-sm font-semibold text-[var(--color-text-secondary)] uppercase tracking-wide mb-3">
-              Deploy pipeline — {data.deployPipeline}
+      {data?.pipelines.map((t) => (
+        <div key={`${t.pipeline}:${t.region}`} className="mb-10" data-testid="pipeline-target">
+          <div className="mb-3">
+            <h2 className="text-sm font-semibold text-[var(--color-text-primary)] uppercase tracking-wide">
+              {t.repo || "hub default"} — {t.pipeline}
             </h2>
+            <div className="mt-1 flex flex-wrap items-center gap-3 text-xs text-[var(--color-text-muted)] font-mono">
+              <span>{t.region}</span>
+              <span>ci: {t.ciProject}</span>
+            </div>
+          </div>
+
+          {t.error && (
+            <div className="mb-4 rounded-lg border border-yellow-600/30 bg-yellow-600/10 p-4 text-sm text-yellow-300">
+              Pipeline infra not reachable in <code>{t.region}</code>: {t.error}
+              <div className="mt-1 text-[var(--color-text-muted)]">
+                Deploy it with <code>deploy/pipeline/deploy.sh</code> (optional module).
+              </div>
+            </div>
+          )}
+
+          <section className="mb-6">
+            <h3 className="text-xs font-semibold text-[var(--color-text-secondary)] uppercase tracking-wide mb-3">
+              Deploy pipeline — {t.pipeline}
+            </h3>
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
-              {data.stages.length === 0 && (
+              {t.stages.length === 0 && (
                 <div className="text-sm text-[var(--color-text-muted)]">No stage state yet.</div>
               )}
-              {data.stages.map((s) => (
+              {t.stages.map((s) => (
                 <div key={s.name} className="rounded-lg border border-surface-4 bg-surface-2 p-4">
                   <div className="flex items-center justify-between mb-2">
                     <span className="font-medium text-[var(--color-text-primary)]">{s.name}</span>
@@ -117,9 +138,9 @@ export default function PipelinePage() {
           </section>
 
           <section>
-            <h2 className="text-sm font-semibold text-[var(--color-text-secondary)] uppercase tracking-wide mb-3">
-              CI checks — {data.ciProject}
-            </h2>
+            <h3 className="text-xs font-semibold text-[var(--color-text-secondary)] uppercase tracking-wide mb-3">
+              CI checks — {t.ciProject}
+            </h3>
             <div className="rounded-lg border border-surface-4 overflow-hidden">
               <table className="w-full text-sm">
                 <thead className="bg-surface-3 text-[var(--color-text-secondary)]">
@@ -131,14 +152,14 @@ export default function PipelinePage() {
                   </tr>
                 </thead>
                 <tbody>
-                  {data.recentBuilds.length === 0 && (
+                  {t.recentBuilds.length === 0 && (
                     <tr>
                       <td colSpan={4} className="px-4 py-6 text-center text-[var(--color-text-muted)]">
                         No builds yet.
                       </td>
                     </tr>
                   )}
-                  {data.recentBuilds.map((b) => (
+                  {t.recentBuilds.map((b) => (
                     <tr key={b.id} className="border-t border-surface-4">
                       <td className="px-4 py-2">
                         <span className="flex items-center gap-2">{statusIcon(b.status)} {b.status}</span>
@@ -167,8 +188,8 @@ export default function PipelinePage() {
               </table>
             </div>
           </section>
-        </>
-      )}
+        </div>
+      ))}
     </div>
   );
 }

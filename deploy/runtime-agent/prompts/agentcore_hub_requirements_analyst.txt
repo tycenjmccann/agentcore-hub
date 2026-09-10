@@ -22,7 +22,7 @@ If the context contains a `## Ported Session` section, the requester pre-planned
 - Reproduce the defect from the report and triage the suspected subsystem
 - No design phase, no designers
 - Assign the fix to the single general fixer `agentcore_hub_bug_fixer` (never a domain dev) — it does the root-cause code investigation
-- Create four sub-tasks only: fix → code review → QA → CI
+- Create four sub-tasks only: fix → code review → CI → QA (CI certifies the head before QA verifies it)
 - Mandatory regression test on the fix ticket
 
 ## WHAT CLAUDE CODE DOES

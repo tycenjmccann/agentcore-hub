@@ -1539,15 +1539,16 @@ def Tickets___create_ticket(title: str, description: str, parent_id: str = "", a
 
     MANDATORY TICKETS (create these for EVERY workflow, no exceptions):
       - agentcore_hub_code_reviewer: "Review: [feature]" — blocked_by=ALL dev ticket IDs
-      - agentcore_hub_qa_verifier: "QA: Verify [feature]" — blocked_by=code reviewer ticket ID
-      - agentcore_hub_ci_agent: "CI: Validate build and tests for [feature]" — blocked_by=QA ticket ID
+      - agentcore_hub_ci_agent: "CI: Validate build and tests for [feature]" — blocked_by=code reviewer ticket ID
+      - agentcore_hub_qa_verifier: "QA: Verify [feature]" — blocked_by=CI ticket ID
+        (CI certifies the head BEFORE QA, so QA reads one certified build instead of re-running it)
 
     Example complete ticket set for a frontend feature:
       1. create_ticket(assignee="agentcore_hub_frontend_designer", blocked_by="")
       2. create_ticket(assignee="agentcore_hub_frontend_dev", blocked_by="TEAM-101")
       3. create_ticket(assignee="agentcore_hub_code_reviewer", blocked_by="TEAM-102") ← ALWAYS
-      4. create_ticket(assignee="agentcore_hub_qa_verifier", blocked_by="TEAM-103")   ← ALWAYS
-      5. create_ticket(assignee="agentcore_hub_ci_agent", blocked_by="TEAM-104")      ← ALWAYS
+      4. create_ticket(assignee="agentcore_hub_ci_agent", blocked_by="TEAM-103")      ← ALWAYS
+      5. create_ticket(assignee="agentcore_hub_qa_verifier", blocked_by="TEAM-104")   ← ALWAYS
 
     TICKET TYPE — pick by what the PARENT is (this is the #1 thing to get right):
       - Parent is an EPIC  → ticket_type="task"     (the DEFAULT — almost every run)
@@ -1770,7 +1771,11 @@ def Pipeline___get_state(pipeline_name: str = "", execution_id: str = "") -> str
     means your run is not visible on any stage yet (keep polling).
 
     Args:
-        pipeline_name: Override the pipeline name (defaults to the deploy pipeline).
+        pipeline_name: In Pipeline Mode this is REQUIRED — pass the
+            pipeline_name from the `## Pipeline Mode` context block on EVERY
+            call. The tools Lambda serves several pipelines; omitting this
+            reads the hub's own pipeline, not this repo's. Only omit it
+            outside Pipeline Mode, where it defaults to the deploy pipeline.
         execution_id: Scope terminal/succeeded/failed to this pipelineExecutionId
             (from Pipeline___start_deploy). Omit for the unscoped legacy view.
     """
@@ -1798,7 +1803,11 @@ def Pipeline___start_deploy(pipeline_name: str = "", commit_sha: str = "") -> st
     Pipeline___get_state until terminal and report the result as CD evidence.
 
     Args:
-        pipeline_name: Override the pipeline name (defaults to the deploy pipeline).
+        pipeline_name: In Pipeline Mode this is REQUIRED — pass the
+            pipeline_name from the `## Pipeline Mode` context block on EVERY
+            call. The tools Lambda serves several pipelines; omitting this
+            triggers the hub's own pipeline, not this repo's. Only omit it
+            outside Pipeline Mode, where it defaults to the deploy pipeline.
         commit_sha: The merge commit SHA; derives the idempotency token
             (omitted from the AWS call when not provided).
     """
@@ -1822,7 +1831,11 @@ def Pipeline___get_build_status(commit_sha: str = "", project: str = "", scan: i
 
     Args:
         commit_sha: The head SHA to match against resolvedSourceVersion.
-        project: CodeBuild project (defaults to the CI project).
+        project: In Pipeline Mode this is REQUIRED — pass the ci_project from
+            the `## Pipeline Mode` context block on EVERY call. Omitting it
+            reads the Lambda's env-default CI project, which is not this
+            repo's. Only omit it outside Pipeline Mode, where it defaults to
+            the CI project.
         scan: How many recent builds to scan (max 50).
     """
     args = {"scan": scan}
@@ -1847,7 +1860,12 @@ def Pipeline___get_build_log(build_id: str = "", project: str = "", tail_lines: 
 
     Args:
         build_id: CodeBuild build id (from get_state actionDetails.externalExecutionId).
-        project: CodeBuild project (defaults to the build project).
+            The project is inferred from build_id itself (`<project>:<uuid>`),
+            so in Pipeline Mode this is normally enough on its own — project
+            is optional here even when it is required elsewhere.
+        project: CodeBuild project (defaults to the build project). Only
+            needed when you have no build_id (e.g. reading the most recent
+            build of a known project).
         tail_lines: How many trailing log lines to return (max 300).
     """
     args = {"tail_lines": tail_lines}
@@ -1859,7 +1877,7 @@ def Pipeline___get_build_log(build_id: str = "", project: str = "", tail_lines: 
 
 
 @tool
-def Pipeline___start_ci_build(commit_sha: str, source_version: str = "") -> str:
+def Pipeline___start_ci_build(commit_sha: str, source_version: str = "", project: str = "") -> str:
     """Start ONE CodeBuild CI (PR-check) build for a specific commit. Call this
     when Pipeline___get_build_status finds no build for your head SHA (a push
     may not re-trigger the webhook) — do NOT call it speculatively, and never
@@ -1868,7 +1886,7 @@ def Pipeline___start_ci_build(commit_sha: str, source_version: str = "") -> str:
     This always builds the CI project — there is no way to point it at the
     deploy/build project. Dedupes: if a build already exists for commit_sha it
     is reused (reused:true) instead of starting a second one. After calling,
-    poll Pipeline___get_build_status(commit_sha=...) until terminal.
+    poll Pipeline___get_build_status(commit_sha=..., project=...) until terminal.
 
     On ok:false with reason "start_build_not_granted", this deployment has not
     granted the tool codebuild:StartBuild — report BLOCKED (head SHA unverified
@@ -1880,23 +1898,42 @@ def Pipeline___start_ci_build(commit_sha: str, source_version: str = "") -> str:
             also the dedupe + idempotency key.
         source_version: What CodeBuild checks out — "pr/<number>" or a branch
             name. Omit to build the bare SHA directly.
+        project: In Pipeline Mode this is REQUIRED — pass the ci_project from
+            the `## Pipeline Mode` context block on EVERY call. Omitting it
+            starts a build in the Lambda's env-default CI project, which is
+            not this repo's. Only omit it outside Pipeline Mode, where it
+            defaults to the CI project.
     """
     args = {"commit_sha": commit_sha}
     if source_version:
         args["source_version"] = source_version
+    if project:
+        args["project"] = project
     return _invoke_lambda(PIPELINE_TOOLS_LAMBDA, "Pipeline___start_ci_build", args)
 
 
 @tool
-def Pipeline___capabilities() -> str:
+def Pipeline___capabilities(pipeline_name: str = "") -> str:
     """Report what this deployment's pipeline tools Lambda will actually do —
     whether Pipeline___start_ci_build can start a build (startCiBuild), the CI/
     build/deploy project + pipeline names, and confirmation that deploy approval
     is never agent-controlled (approveDeploy is always false). Call this before
     Pipeline___start_ci_build so a denied deployment is a clean BLOCKED verdict
     instead of a failed StartBuild call.
+
+    Args:
+        pipeline_name: In Pipeline Mode, pass the pipeline_name from the
+            `## Pipeline Mode` context block to narrow the response to your
+            pipeline's own entry in targets[] (read startCiBuild etc. there,
+            not the flat top-level keys — those describe the Lambda's
+            env-default target, not necessarily this repo's). An unknown
+            name comes back as ok:false, reason pipeline_not_registered.
+            Omit it to see every registered target.
     """
-    return _invoke_lambda(PIPELINE_TOOLS_LAMBDA, "Pipeline___capabilities", {})
+    args = {}
+    if pipeline_name:
+        args["pipeline_name"] = pipeline_name
+    return _invoke_lambda(PIPELINE_TOOLS_LAMBDA, "Pipeline___capabilities", args)
 
 
 # ─── Workflow Output Tools ────────────────────────────────────────────────────

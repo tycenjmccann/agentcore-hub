@@ -63,6 +63,12 @@ vi.mock("@aws-sdk/client-codepipeline", () => ({
   GetPipelineStateCommand: class { constructor(input) { this.input = input; } },
   PutApprovalResultCommand: class { constructor(input) { this.input = input; } },
 }));
+// TEAM-4338: an ambient ARTIFACT_BUCKET (e.g. CodeBuild's CI env) must never
+// reach real S3 from this suite — force loadDeployRegistry() to see NoSuchKey.
+vi.mock("@aws-sdk/client-s3", () => ({
+  S3Client: class { async send() { const e = new Error("NoSuchKey"); e.name = "NoSuchKey"; throw e; } },
+  GetObjectCommand: class { constructor(input) { this.input = input; } },
+}));
 
 const jsonRes = (body, ok = true, status = 200) => ({
   ok, status, json: async () => body, text: async () => JSON.stringify(body),
@@ -118,6 +124,7 @@ const ENV = {
 async function loadHandler(allowedChatIds) {
   vi.resetModules();
   Object.assign(process.env, ENV);
+  delete process.env.ARTIFACT_BUCKET; // TEAM-4338: never inherit CI's real bucket
   if (allowedChatIds == null) delete process.env.ALLOWED_CHAT_IDS;
   else process.env.ALLOWED_CHAT_IDS = allowedChatIds;
   const mod = await import("../index.mjs");
@@ -128,7 +135,7 @@ const realFetch = global.fetch;
 beforeEach(() => { db.items.clear(); db.puts.length = 0; db.deletes.length = 0; });
 afterAll(() => {
   global.fetch = realFetch;
-  for (const k of [...Object.keys(ENV), "ALLOWED_CHAT_IDS"]) delete process.env[k];
+  for (const k of [...Object.keys(ENV), "ALLOWED_CHAT_IDS", "ARTIFACT_BUCKET"]) delete process.env[k];
 });
 
 const registerChat = (id) => db.items.set(`chat#${id}`, { id: { S: `chat#${id}` }, chatId: { N: String(id) } });
