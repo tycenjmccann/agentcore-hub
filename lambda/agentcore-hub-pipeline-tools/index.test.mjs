@@ -32,23 +32,73 @@
  * to a three-key allow-list, because every defect this tool could have is a key
  * that reached CodeBuild — an override that replaces the buildspec, or a project
  * name that came from an agent's args instead of from env.
+ *
+ * TEAM-4337 makes the CD registry the runtime allow-list, so the mocks now
+ * record WHICH CLIENT a command went to, not just which command was sent:
+ *  - the S3 mock is KEY-AWARE (config/cd-registry.json vs the handoff marker),
+ *  - the CodePipeline/CodeBuild/Logs mocks capture their constructor region and
+ *    tag every recorded call with it.
+ * Multi-target tests therefore assert two things a single-target suite could
+ * not: that a request reached the RIGHT REGION, and that a refusal reached no
+ * AWS client at all. Section 8 holds them; every mock addition is additive, so
+ * sections 1-7 read `.type`/`.input` exactly as before.
+ *
+ * TEAM-4348 (code review of TEAM-4337/4338) closes three places where the
+ * RESOLVED target and the resource actually touched could diverge:
+ *  5. get_build_log fell back to the resolved target (`|| target`) when the
+ *     project parsed out of build_id was not any target's, so an unregistered
+ *     build_id project still drove BatchGetBuilds + GetLogEvents. Now:
+ *     project_not_registered, zero AWS calls; a disagreeing args.project +
+ *     build_id project is project_mismatch, also zero AWS calls.
+ *  6. resolveTarget resolved args.project BEFORE the requirePipelineName
+ *     check, so start_deploy({project, commit_sha}) could start a pipeline
+ *     execution without ever passing pipeline_name. Now: the project branch is
+ *     skipped entirely for requirePipelineName calls.
+ *  7. start_ci_build and get_build_status built their clients from the
+ *     pipeline_name-resolved target while the project came from elsewhere, so
+ *     a cross-region call reached the wrong region. Now: region follows the
+ *     project's OWNER, and get_build_status allow-lists its project too.
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
+// Section 8.10 asserts on the SOURCE of index.mjs, not on its behaviour: no
+// runtime test can prove an approval path is absent from every code path.
+import { readFile } from "node:fs/promises";
+
+/** NoSuchKey, the way S3 raises it — the default for BOTH mocked keys. */
+function noSuchKey() {
+  const err = new Error("NoSuchKey");
+  err.name = "NoSuchKey";
+  return err;
+}
 
 const h = vi.hoisted(() => ({
+  // The S3 key the Lambda reads the CD registry from. Hoisted so the key-aware
+  // S3 mock factory can see it (mock factories run before top-level consts).
+  CD_REGISTRY_KEY: "config/cd-registry.json",
   state: {
-    cpCalls: [], // { type, input } for every CodePipeline command sent
-    cbCalls: [], // { type, input } for every CodeBuild command sent
+    cpCalls: [], // { region, name, type, input } for every CodePipeline command sent
+    cbCalls: [], // { region, name, type, input } for every CodeBuild command sent
+    logsCalls: [], // { region, name, type, input } for every Logs command sent
+    clientInits: [], // { kind, region } for every AWS client CONSTRUCTED
     getPipelineStateImpl: async () => ({ stageStates: [] }),
     listActionExecutionsImpl: async () => ({ actionExecutionDetails: [] }),
     startPipelineExecutionImpl: async () => ({ pipelineExecutionId: "exec-new" }),
     getPipelineExecutionImpl: async () => ({ pipelineExecution: { artifactRevisions: [] } }),
-    s3Calls: [], // { Bucket, Key } for every GetObject
+    s3Calls: [], // { Bucket, Key } for every GetObject, registry reads included
+    // config/cd-registry.json. Default NoSuchKey = "no registry" = env target only,
+    // which is what every pre-TEAM-4337 test assumes.
+    registryImpl: async () => {
+      const err = new Error("NoSuchKey");
+      err.name = "NoSuchKey";
+      throw err;
+    },
+    // Every other key (the handoff marker).
     getObjectImpl: async () => {
       const err = new Error("NoSuchKey");
       err.name = "NoSuchKey";
       throw err;
     },
+    getLogEventsImpl: async () => ({ events: [] }),
     listBuildsImpl: async () => ({ ids: [] }),
     startBuildImpl: async () => ({
       build: {
@@ -72,9 +122,18 @@ const h = vi.hoisted(() => ({
 
 vi.mock("@aws-sdk/client-codepipeline", () => ({
   CodePipelineClient: class {
+    constructor(cfg) {
+      this.region = cfg?.region;
+      h.state.clientInits.push({ kind: "codepipeline", region: cfg?.region });
+    }
     async send(cmd) {
       const type = cmd?.__type;
-      h.state.cpCalls.push({ type, input: cmd.input });
+      h.state.cpCalls.push({
+        region: this.region,
+        name: cmd.input?.name ?? cmd.input?.pipelineName ?? null,
+        type,
+        input: cmd.input,
+      });
       if (type === "GetPipelineState") return h.state.getPipelineStateImpl(cmd.input);
       if (type === "ListActionExecutions") return h.state.listActionExecutionsImpl(cmd.input);
       if (type === "StartPipelineExecution") return h.state.startPipelineExecutionImpl(cmd.input);
@@ -90,9 +149,18 @@ vi.mock("@aws-sdk/client-codepipeline", () => ({
 
 vi.mock("@aws-sdk/client-codebuild", () => ({
   CodeBuildClient: class {
+    constructor(cfg) {
+      this.region = cfg?.region;
+      h.state.clientInits.push({ kind: "codebuild", region: cfg?.region });
+    }
     async send(cmd) {
       const type = cmd?.__type;
-      h.state.cbCalls.push({ type, input: cmd.input });
+      h.state.cbCalls.push({
+        region: this.region,
+        name: cmd.input?.projectName ?? null,
+        type,
+        input: cmd.input,
+      });
       if (type === "ListBuildsForProject") return h.state.listBuildsImpl(cmd.input);
       if (type === "BatchGetBuilds") return h.state.batchGetBuildsImpl(cmd.input);
       if (type === "StartBuild") return h.state.startBuildImpl(cmd.input);
@@ -106,8 +174,16 @@ vi.mock("@aws-sdk/client-codebuild", () => ({
 
 vi.mock("@aws-sdk/client-s3", () => ({
   S3Client: class {
+    constructor(cfg) {
+      this.region = cfg?.region;
+      h.state.clientInits.push({ kind: "s3", region: cfg?.region });
+    }
     async send(cmd) {
       h.state.s3Calls.push(cmd.input);
+      // KEY-AWARE: the CD registry and the handoff marker share one bucket and
+      // one client, so only the Key distinguishes them. Keeping both in s3Calls
+      // preserves the existing `.at(-1)` and `toEqual([])` assertions.
+      if (cmd.input?.Key === h.CD_REGISTRY_KEY) return h.state.registryImpl(cmd.input);
       return h.state.getObjectImpl(cmd.input);
     }
   },
@@ -116,7 +192,19 @@ vi.mock("@aws-sdk/client-s3", () => ({
 
 vi.mock("@aws-sdk/client-cloudwatch-logs", () => ({
   CloudWatchLogsClient: class {
-    async send() { return { events: [] }; }
+    constructor(cfg) {
+      this.region = cfg?.region;
+      h.state.clientInits.push({ kind: "logs", region: cfg?.region });
+    }
+    async send(cmd) {
+      h.state.logsCalls.push({
+        region: this.region,
+        name: cmd.input?.logGroupName ?? null,
+        type: "GetLogEvents",
+        input: cmd.input,
+      });
+      return h.state.getLogEventsImpl(cmd.input);
+    }
   },
   GetLogEventsCommand: class { constructor(i) { this.input = i; } },
 }));
@@ -191,9 +279,84 @@ const DEFAULT_START_BUILD = () => ({
   },
 });
 
+// ─── TEAM-4337 multi-target fixtures + helpers ───────────────────────────────
+
+/**
+ * Two pipelines in two regions plus a DEPLOY.md-mode CD repo (no pipeline, so
+ * pipelineProjects() yields nothing and it must NOT become a target). The first
+ * entry deliberately names the env default pipeline, so the env target is
+ * de-duplicated rather than appended — targets are exactly these two.
+ */
+const MULTI_REGISTRY = {
+  version: 1,
+  repos: [
+    { repo: "tycenjmccann/agentcore-hub", pipeline: "agentcore-hub-deploy", region: "us-east-1" },
+    { repo: "acme/widget", pipeline: "hub-widget-deploy", region: "us-west-2" },
+    { repo: "acme/legacy", deployDoc: "docs/DEPLOY.md" },
+  ],
+};
+
+/**
+ * TEAM-4358 F1 — the same two targets as MULTI_REGISTRY with the hub entry
+ * SECOND. Registry ORDER must not decide which target an unqualified call acts
+ * on; only PIPELINE_NAME does. Pre-fix, `isEnvDefault` was stamped false on every
+ * registry entry, so no target carried it and resolveTarget fell to `targets[0]`
+ * — routing every unqualified read AND start_ci_build below to hub-widget-* in
+ * us-west-2.
+ */
+const HUB_SECOND_REGISTRY = {
+  version: 1,
+  repos: [
+    { repo: "acme/widget", pipeline: "hub-widget-deploy", region: "us-west-2" },
+    { repo: "tycenjmccann/agentcore-hub", pipeline: "agentcore-hub-deploy", region: "us-east-1" },
+  ],
+};
+
+/** Serve `doc` (object or raw string) for the registry key. */
+function serveRegistry(doc) {
+  h.state.registryImpl = async () => ({
+    Body: {
+      transformToString: async () => (typeof doc === "string" ? doc : JSON.stringify(doc)),
+    },
+  });
+}
+
+/**
+ * A fresh module instance whose CD registry is `doc`.
+ *
+ * The registry is fetched per invocation but CACHED in module scope, so a test
+ * that needs a different registry must re-import — which is exactly what
+ * withEnv's vi.resetModules() gives us. There is deliberately no test-only
+ * reset export on index.mjs.
+ *
+ * Client constructions and S3 calls made while the module was loading are
+ * discarded, so a test can assert exactly what ONE INVOCATION touched.
+ */
+async function withRegistry(doc, fn, env = {}) {
+  if (doc !== null) serveRegistry(doc);
+  return withEnv({ ARTIFACT_BUCKET: "hub-artifacts-test", ...env }, async (mod) => {
+    h.state.clientInits = [];
+    h.state.s3Calls = [];
+    return fn(mod);
+  });
+}
+
+/** Regions of every client of `kind` constructed since the last reset. */
+function initRegions(kind) {
+  return h.state.clientInits.filter((c) => c.kind === kind).map((c) => c.region);
+}
+
 beforeEach(() => {
   h.state.cpCalls = [];
   h.state.cbCalls = [];
+  h.state.logsCalls = [];
+  h.state.clientInits = [];
+  // Back to "no registry", so the shared top-level `handler` resolves the env
+  // default target and every pre-TEAM-4337 suite behaves exactly as before.
+  h.state.registryImpl = async () => {
+    throw noSuchKey();
+  };
+  h.state.getLogEventsImpl = async () => ({ events: [] });
   h.state.getPipelineStateImpl = async () => ({ stageStates: [] });
   h.state.listActionExecutionsImpl = async () => ({ actionExecutionDetails: [] });
   h.state.startPipelineExecutionImpl = async () => ({ pipelineExecutionId: "exec-new" });
@@ -810,6 +973,18 @@ describe("start_ci_build error mapping (a denial is an answer, not a crash)", ()
     });
     // The IAM message itself is not echoed — only the actionable remediation.
     expect(out.detail).toContain("PIPELINE_CI_START_BUILD=1");
+    expect(out.detail).not.toContain("not authorized to perform");
+
+    // TEAM-4358: after TEAM-4337's convention IAM, three causes produce this
+    // denial — the flag being unset is only one of them, and the text used to
+    // name it as if it were the only one.
+    expect(out.detail).toContain("PIPELINE_REGIONS");
+    expect(out.detail).toContain("hub-*-ci");
+    // Which region was refused is half the diagnosis: the grant is fanned out
+    // per region, so the same project name can be granted in one and not another.
+    // The env target's region, resolved the same way index.mjs does (no registry
+    // here, so this is the module-load REGION).
+    expect(out.region).toBe(process.env.AWS_REGION || "us-east-1");
   });
 
   it("ResourceNotFound → project_not_found", async () => {
@@ -881,11 +1056,14 @@ describe("capabilities", () => {
   it("reports the projects it is wired to, and its version", async () => {
     const out = await invoke("capabilities");
 
+    // The flat keys describe the ENV DEFAULT and are kept verbatim for callers
+    // written against version 2. version 3 (TEAM-4337) adds `targets` — asserted
+    // in the multi-target suite, not here.
     expect(out).toMatchObject({
       ciProject: "agentcore-hub-ci",
       buildProject: "agentcore-hub-build",
       deployPipeline: "agentcore-hub-deploy",
-      version: 2,
+      version: 3,
     });
     // Read-only: capabilities never talks to AWS.
     expect(h.state.cpCalls).toEqual([]);
@@ -1005,5 +1183,703 @@ describe("get_state infra handoff marker", () => {
     );
     expect(out.handoff).toBe(null);
     expect(h.state.s3Calls).toEqual([]);
+  });
+});
+
+// ─── 8. Multi-target resolution off the CD registry (TEAM-4337) ──────────────
+
+/**
+ * The registry — not env, and not the caller's args — is the allow-list. These
+ * cases pin the three properties that make that safe:
+ *
+ *   1. ROUTING. A registered pipeline in another region is reached with a client
+ *      constructed for THAT region, and the env default still reaches REGION.
+ *   2. REFUSAL COSTS NOTHING. An unregistered pipeline/project, or an ambiguous
+ *      deploy, is answered from the registry alone: zero AWS commands, and for
+ *      a pipeline refusal not even a CodePipeline client construction.
+ *   3. (TEAM-4348) THE PROJECT'S OWNER WINS THE REGION. When a call names a
+ *      project some OTHER way than pipeline_name (a build_id's embedded
+ *      project, or an explicit project alongside an unrelated pipeline_name),
+ *      the client region and the response `region` follow that project's own
+ *      target — never the pipeline_name-resolved one, and never a silent
+ *      `|| target` fallback into an unregistered name.
+ *
+ * Every case goes through withRegistry -> withEnv, because both the env values
+ * and the registry cache are per-module-instance.
+ */
+describe("multi-target registry resolution", () => {
+  const WIDGET = "hub-widget-deploy";
+  const HUB = "agentcore-hub-deploy";
+
+  // 8.1 region routing ──────────────────────────────────────────────────────
+
+  it("routes a registry target's get_state to that target's region", async () => {
+    h.state.getPipelineStateImpl = async () => ({ stageStates: [] });
+    const out = await withRegistry(MULTI_REGISTRY, (mod) =>
+      invokeOn(mod.handler, "get_state", { pipeline_name: WIDGET })
+    );
+
+    expect(out.pipelineName).toBe(WIDGET);
+    expect(out.region).toBe("us-west-2");
+    expect(out.repo).toBe("acme/widget");
+
+    const call = h.state.cpCalls.find((c) => c.type === "GetPipelineState");
+    expect(call.region).toBe("us-west-2");
+    expect(call.name).toBe(WIDGET);
+    // The pipeline's region, and ONLY that region, got a client.
+    expect(initRegions("codepipeline")).toEqual(["us-west-2"]);
+  });
+
+  it("routes the env default target to REGION, not to a registry region", async () => {
+    h.state.getPipelineStateImpl = async () => ({ stageStates: [] });
+    // Registry absent -> the env default is the only target.
+    await withRegistry(null, (mod) => invokeOn(mod.handler, "get_state", {}), {
+      AWS_REGION: "us-east-1",
+    });
+
+    const call = h.state.cpCalls.find((c) => c.type === "GetPipelineState");
+    expect(call.region).toBe("us-east-1");
+    expect(call.name).toBe(HUB);
+  });
+
+  // 8.1b (TEAM-4358) registry ORDER never picks the default target ──────────
+  //
+  // Every case here is UNQUALIFIED (no pipeline_name, no project, no build_id):
+  // the tool must fall back to the target this deployment is CONFIGURED for
+  // (PIPELINE_NAME), which in HUB_SECOND_REGISTRY is the second entry. Each
+  // asserts both halves — the hub resource was used, AND no client was ever even
+  // constructed for the other target's region. `initRegions` is emptied by
+  // withRegistry after module load, so these counts are one invocation's.
+
+  it("resolves an unqualified get_state to PIPELINE_NAME, not to the first registry entry", async () => {
+    h.state.getPipelineStateImpl = async () => ({ stageStates: [] });
+
+    const out = await withRegistry(HUB_SECOND_REGISTRY, (mod) => invokeOn(mod.handler, "get_state", {}), {
+      AWS_REGION: "us-east-1",
+    });
+
+    expect(out.pipelineName).toBe(HUB);
+    expect(out.region).toBe("us-east-1");
+    expect(out.repo).toBe("tycenjmccann/agentcore-hub");
+
+    const call = h.state.cpCalls.find((c) => c.type === "GetPipelineState");
+    expect(call.name).toBe(HUB);
+    expect(call.region).toBe("us-east-1");
+    // The other target's region never got a client at all.
+    expect(initRegions("codepipeline")).toEqual(["us-east-1"]);
+  });
+
+  it("starts an unqualified CI build on the hub's CI project, with the 3-key allow-list intact", async () => {
+    const sha = "9".repeat(40);
+
+    const out = await withRegistry(
+      HUB_SECOND_REGISTRY,
+      (mod) => invokeOn(mod.handler, "start_ci_build", { commit_sha: sha }),
+      { AWS_REGION: "us-east-1" }
+    );
+
+    expect(out.ok).toBe(true);
+    expect(out.region).toBe("us-east-1");
+    // Pre-fix this StartBuild went to hub-widget-ci in us-west-2 — another repo's
+    // PR check, started off another repo's registry position.
+    const start = h.state.cbCalls.find((c) => c.type === "StartBuild");
+    expect(start.input).toEqual({
+      projectName: "agentcore-hub-ci",
+      sourceVersion: sha,
+      idempotencyToken: `ci-${sha}`,
+    });
+    expect(start.region).toBe("us-east-1");
+    // Every CodeBuild call of this invocation (the dedupe scan included).
+    expect([...new Set(h.state.cbCalls.map((c) => c.region))]).toEqual(["us-east-1"]);
+    expect(h.state.cbCalls.some((c) => /^hub-widget-/.test(c.name || ""))).toBe(false);
+  });
+
+  it("scans the hub's CI project for an unqualified get_build_status", async () => {
+    h.state.listBuildsImpl = async () => ({
+      ids: ["agentcore-hub-ci:33333333-2222-3333-4444-555555555555"],
+    });
+
+    const out = await withRegistry(
+      HUB_SECOND_REGISTRY,
+      (mod) => invokeOn(mod.handler, "get_build_status", {}),
+      { AWS_REGION: "us-east-1" }
+    );
+
+    expect(out.project).toBe("agentcore-hub-ci");
+    expect(out.region).toBe("us-east-1");
+    const list = h.state.cbCalls.find((c) => c.type === "ListBuildsForProject");
+    expect(list.name).toBe("agentcore-hub-ci");
+    expect(initRegions("codebuild")).toEqual(["us-east-1"]);
+  });
+
+  it("reads the hub's build project for an unqualified get_build_log (no build_id)", async () => {
+    h.state.listBuildsImpl = async () => ({
+      ids: ["agentcore-hub-build:44444444-2222-3333-4444-555555555555"],
+    });
+
+    const out = await withRegistry(
+      HUB_SECOND_REGISTRY,
+      (mod) => invokeOn(mod.handler, "get_build_log", {}),
+      { AWS_REGION: "us-east-1" }
+    );
+
+    expect(out.project).toBe("agentcore-hub-build");
+    expect(out.region).toBe("us-east-1");
+    const list = h.state.cbCalls.find((c) => c.type === "ListBuildsForProject");
+    expect(list.name).toBe("agentcore-hub-build");
+    expect(h.state.cbCalls.some((c) => /^hub-widget-/.test(c.name || ""))).toBe(false);
+    expect(initRegions("codebuild")).toEqual(["us-east-1"]);
+    expect(initRegions("logs")).not.toContain("us-west-2");
+  });
+
+  it("still refuses an unqualified start_deploy — the fix widens no write path", async () => {
+    const out = await withRegistry(
+      HUB_SECOND_REGISTRY,
+      (mod) => invokeOn(mod.handler, "start_deploy", { commit_sha: "a".repeat(40) }),
+      { AWS_REGION: "us-east-1" }
+    );
+
+    // A default target for the READ tools must never become a default DEPLOY.
+    expect(out).toEqual({
+      ok: false,
+      reason: "pipeline_name_required",
+      known: [WIDGET, HUB],
+    });
+    expect(h.state.cpCalls).toEqual([]);
+    expect(initRegions("codepipeline")).toEqual([]);
+  });
+
+  // 8.2 refusals make no AWS call ───────────────────────────────────────────
+
+  it("refuses an unregistered pipeline_name with zero CodePipeline traffic", async () => {
+    const out = await withRegistry(MULTI_REGISTRY, (mod) =>
+      invokeOn(mod.handler, "get_state", { pipeline_name: "someone-elses-deploy" })
+    );
+
+    expect(out).toEqual({
+      ok: false,
+      reason: "pipeline_not_registered",
+      requested: "someone-elses-deploy",
+      known: [HUB, WIDGET],
+    });
+    expect(h.state.cpCalls).toEqual([]);
+    // Not even a client: resolution happens before any client is asked for.
+    expect(initRegions("codepipeline")).toEqual([]);
+  });
+
+  it("refuses an unregistered project with zero CodeBuild traffic", async () => {
+    const out = await withRegistry(MULTI_REGISTRY, (mod) =>
+      invokeOn(mod.handler, "get_build_status", { project: "someone-elses-ci" })
+    );
+
+    expect(out.ok).toBe(false);
+    expect(out.reason).toBe("project_not_registered");
+    expect(out.requested).toBe("someone-elses-ci");
+    // Every project of every target, so the caller can correct itself.
+    expect(out.known).toEqual(
+      expect.arrayContaining(["agentcore-hub-ci", "hub-widget-ci", "hub-widget-build", WIDGET])
+    );
+    expect(h.state.cbCalls).toEqual([]);
+    expect(initRegions("codebuild")).toEqual([]);
+  });
+
+  it("refuses start_deploy without pipeline_name when more than one target exists", async () => {
+    const out = await withRegistry(MULTI_REGISTRY, (mod) =>
+      invokeOn(mod.handler, "start_deploy", { commit_sha: "a".repeat(40) })
+    );
+
+    expect(out).toEqual({
+      ok: false,
+      reason: "pipeline_name_required",
+      known: [HUB, WIDGET],
+    });
+    // The one WRITE this Lambda can make never happens on a guess. A project
+    // cannot substitute for pipeline_name either — see 8.2b below.
+    expect(h.state.cpCalls).toEqual([]);
+  });
+
+  // 8.2b (TEAM-4348) args.project cannot substitute for pipeline_name ───────
+
+  it("refuses start_deploy that names only a project — project is not a deploy input", async () => {
+    for (const project of ["agentcore-hub-ci", "hub-widget-build"]) {
+      h.state.cpCalls = [];
+      h.state.clientInits = [];
+      const out = await withRegistry(MULTI_REGISTRY, (mod) =>
+        invokeOn(mod.handler, "start_deploy", { project, commit_sha: "a".repeat(40) })
+      );
+
+      expect(out, project).toEqual({
+        ok: false,
+        reason: "pipeline_name_required",
+        known: [HUB, WIDGET],
+      });
+      expect(h.state.cpCalls, project).toEqual([]);
+      expect(initRegions("codepipeline"), project).toEqual([]);
+    }
+  });
+
+  // 8.3 the env default path is unchanged ───────────────────────────────────
+
+  it("sends byte-identical inputs for the env default when no registry exists", async () => {
+    h.state.getPipelineStateImpl = async () => ({ stageStates: [] });
+    const sha = "b".repeat(40);
+
+    await withRegistry(
+      null,
+      async (mod) => {
+        await invokeOn(mod.handler, "get_state", {});
+        await invokeOn(mod.handler, "start_deploy", { commit_sha: sha });
+      },
+      { AWS_REGION: "us-east-1" }
+    );
+
+    // Exactly the pre-TEAM-4337 payloads — no extra key, no target metadata.
+    expect(h.state.cpCalls.find((c) => c.type === "GetPipelineState").input).toEqual({
+      name: HUB,
+    });
+    expect(h.state.cpCalls.find((c) => c.type === "StartPipelineExecution").input).toEqual({
+      name: HUB,
+      clientRequestToken: `deploy-${sha}`,
+    });
+  });
+
+  it("routes start_deploy to the requested target's region", async () => {
+    const out = await withRegistry(MULTI_REGISTRY, (mod) =>
+      invokeOn(mod.handler, "start_deploy", { pipeline_name: WIDGET })
+    );
+
+    expect(out.pipelineName).toBe(WIDGET);
+    expect(out.region).toBe("us-west-2");
+    const call = h.state.cpCalls.find((c) => c.type === "StartPipelineExecution");
+    expect(call.region).toBe("us-west-2");
+    expect(call.name).toBe(WIDGET);
+  });
+
+  // 8.4 error text names the REQUESTED pipeline ─────────────────────────────
+
+  it("names the requested pipeline and region in the not-found error", async () => {
+    h.state.getPipelineStateImpl = async () => {
+      const err = new Error("nope");
+      err.name = "PipelineNotFoundException";
+      throw err;
+    };
+
+    const out = await withRegistry(MULTI_REGISTRY, (mod) =>
+      invokeOn(mod.handler, "get_state", { pipeline_name: WIDGET })
+    );
+
+    // Not the env defaults: an operator reading this must see what was asked for.
+    expect(out.configured).toBe(false);
+    expect(out.error).toBe(`Pipeline "${WIDGET}" not found in us-west-2`);
+    expect(out.error).not.toContain(HUB);
+    expect(out.error).not.toContain("us-east-1");
+  });
+
+  // 8.5 get_build_log infers the project, and the region, from the build id ──
+
+  it("infers the owning project and region from a build_id", async () => {
+    h.state.batchGetBuildsImpl = async (input) => ({
+      builds: [
+        {
+          id: input.ids[0],
+          buildStatus: "FAILED",
+          phases: [],
+          logs: { groupName: "/aws/codebuild/hub-widget-build", streamName: "stream-1" },
+        },
+      ],
+    });
+    h.state.getLogEventsImpl = async () => ({ events: [{ message: "boom" }] });
+
+    const out = await withRegistry(MULTI_REGISTRY, (mod) =>
+      invokeOn(mod.handler, "get_build_log", {
+        build_id: "hub-widget-build:11111111-2222-3333-4444-555555555555",
+      })
+    );
+
+    // `project` is optional: the id carries it as "<projectName>:<uuid>".
+    expect(out.project).toBe("hub-widget-build");
+    expect(out.region).toBe("us-west-2");
+
+    const batch = h.state.cbCalls.find((c) => c.type === "BatchGetBuilds");
+    expect(batch.region).toBe("us-west-2");
+    // A known build id needs no scan of the project's history.
+    expect(h.state.cbCalls.some((c) => c.type === "ListBuildsForProject")).toBe(false);
+    expect(h.state.logsCalls.map((c) => c.region)).toEqual(["us-west-2"]);
+  });
+
+  // 8.5b (TEAM-4348) the build_id's project is allow-listed too ─────────────
+
+  it("refuses a build_id whose project is not registered, with zero CodeBuild and Logs traffic", async () => {
+    const out = await withRegistry(MULTI_REGISTRY, (mod) =>
+      invokeOn(mod.handler, "get_build_log", {
+        build_id: "hub-unregistered-build:11111111-2222-3333-4444-555555555555",
+      })
+    );
+
+    expect(out).toEqual({
+      ok: false,
+      reason: "project_not_registered",
+      requested: "hub-unregistered-build",
+      known: expect.arrayContaining([
+        "agentcore-hub-ci",
+        "agentcore-hub-build",
+        HUB,
+        "hub-widget-ci",
+        "hub-widget-build",
+        WIDGET,
+      ]),
+    });
+    expect(h.state.cbCalls).toEqual([]);
+    expect(h.state.logsCalls).toEqual([]);
+    // Not even a client: the refusal happens before clientsFor is ever called.
+    expect(initRegions("codebuild")).toEqual([]);
+    expect(initRegions("logs")).toEqual([]);
+  });
+
+  it("refuses a project that disagrees with the build_id's project instead of picking one", async () => {
+    const out = await withRegistry(MULTI_REGISTRY, (mod) =>
+      invokeOn(mod.handler, "get_build_log", {
+        project: "agentcore-hub-build",
+        build_id: "hub-widget-build:11111111-2222-3333-4444-555555555555",
+      })
+    );
+
+    expect(out).toEqual({
+      ok: false,
+      reason: "project_mismatch",
+      requested: "agentcore-hub-build",
+      buildIdProject: "hub-widget-build",
+    });
+    expect(h.state.cbCalls).toEqual([]);
+    expect(h.state.logsCalls).toEqual([]);
+    expect(initRegions("codebuild")).toEqual([]);
+    expect(initRegions("logs")).toEqual([]);
+  });
+
+  it("reads the build_id's OWNER region even when pipeline_name names another target", async () => {
+    h.state.batchGetBuildsImpl = async (input) => ({
+      builds: [
+        {
+          id: input.ids[0],
+          buildStatus: "FAILED",
+          phases: [],
+          logs: { groupName: "/aws/codebuild/hub-widget-build", streamName: "stream-1" },
+        },
+      ],
+    });
+    h.state.getLogEventsImpl = async () => ({ events: [{ message: "boom" }] });
+
+    const out = await withRegistry(MULTI_REGISTRY, (mod) =>
+      invokeOn(mod.handler, "get_build_log", {
+        pipeline_name: HUB,
+        build_id: "hub-widget-build:11111111-2222-3333-4444-555555555555",
+      })
+    );
+
+    expect(out.project).toBe("hub-widget-build");
+    expect(out.region).toBe("us-west-2");
+    const batch = h.state.cbCalls.find((c) => c.type === "BatchGetBuilds");
+    expect(batch.region).toBe("us-west-2");
+    expect(h.state.logsCalls.map((c) => c.region)).toEqual(["us-west-2"]);
+  });
+
+  // 8.6 start_ci_build on a registry target ─────────────────────────────────
+
+  it("starts a registry target's CI project with the 3-key allow-list in its region", async () => {
+    const sha = "c".repeat(40);
+    const out = await withRegistry(MULTI_REGISTRY, (mod) =>
+      invokeOn(mod.handler, "start_ci_build", { project: "hub-widget-ci", commit_sha: sha })
+    );
+
+    expect(out.ok).toBe(true);
+    const start = h.state.cbCalls.find((c) => c.type === "StartBuild");
+    expect(start.region).toBe("us-west-2");
+    // Deep-equal, not toMatchObject: a fourth key is the defect.
+    expect(start.input).toEqual({
+      projectName: "hub-widget-ci",
+      sourceVersion: sha,
+      idempotencyToken: `ci-${sha}`,
+    });
+  });
+
+  // 8.7 start_ci_build can never reach a deploy project ─────────────────────
+
+  it("never starts a deploy project, even when asked for one by name", async () => {
+    const sha = "d".repeat(40);
+    const out = await withRegistry(MULTI_REGISTRY, (mod) =>
+      invokeOn(mod.handler, "start_ci_build", { project: WIDGET, commit_sha: sha })
+    );
+
+    // A registered name resolves the TARGET, then the CI project is taken from
+    // the target - a non-CI project is ignored, never honoured (and never
+    // rejected, so a retry loop cannot probe for one).
+    expect(out.ok).toBe(true);
+    const start = h.state.cbCalls.find((c) => c.type === "StartBuild");
+    expect(start.input.projectName).toBe("hub-widget-ci");
+    expect(h.state.cbCalls.some((c) => c.name === WIDGET)).toBe(false);
+    expect(h.state.cbCalls.some((c) => /-deploy$/.test(c.name || ""))).toBe(false);
+  });
+
+  it("refuses a registry ciProject that collides with another target's deploy project", async () => {
+    const out = await withRegistry(
+      {
+        version: 1,
+        repos: [
+          { repo: "acme/widget", pipeline: WIDGET, region: "us-west-2", ciProject: HUB },
+        ],
+      },
+      (mod) =>
+        invokeOn(mod.handler, "start_ci_build", {
+          pipeline_name: WIDGET,
+          commit_sha: "e".repeat(40),
+        })
+    );
+
+    // Validated per call, against EVERY target's names - the module-load check
+    // could not see this value.
+    expect(out.ok).toBe(false);
+    expect(out.reason).toBe("ci_project_invalid");
+    expect(h.state.cbCalls.filter((c) => c.type === "StartBuild")).toEqual([]);
+  });
+
+  it("refuses the reserved runtime-image project, with zero AWS traffic", async () => {
+    const out = await withRegistry(MULTI_REGISTRY, (mod) =>
+      invokeOn(mod.handler, "start_ci_build", {
+        project: "agentcore-hub-runtime-image-deploy",
+        commit_sha: "f".repeat(40),
+      })
+    );
+
+    // Not any target's project, so it is refused at resolution - the reserved
+    // list never even has to be consulted.
+    expect(out.ok).toBe(false);
+    expect(out.reason).toBe("project_not_registered");
+    expect(h.state.cbCalls).toEqual([]);
+  });
+
+  // 8.6b (TEAM-4348) region follows the project's owner, not the ─────────────
+  // pipeline_name-resolved target ────────────────────────────────────────────
+
+  it("start_ci_build sends every CodeBuild call to the CI project's own region", async () => {
+    const sha = "1".repeat(40);
+    const out = await withRegistry(MULTI_REGISTRY, (mod) =>
+      invokeOn(mod.handler, "start_ci_build", {
+        pipeline_name: HUB,
+        project: "hub-widget-ci",
+        commit_sha: sha,
+      })
+    );
+
+    expect(out.ok).toBe(true);
+    expect(out.region).toBe("us-west-2");
+    // Every CodeBuild call this invocation made — the dedupe scan AND
+    // StartBuild — went to the project's own region, not HUB's (us-east-1).
+    expect(h.state.cbCalls.length).toBeGreaterThan(0);
+    expect([...new Set(h.state.cbCalls.map((c) => c.region))]).toEqual(["us-west-2"]);
+    const start = h.state.cbCalls.find((c) => c.type === "StartBuild");
+    expect(start.input).toEqual({
+      projectName: "hub-widget-ci",
+      sourceVersion: sha,
+      idempotencyToken: `ci-${sha}`,
+    });
+  });
+
+  it("get_build_status scans the project's own region, and refuses an unregistered project even with a pipeline_name", async () => {
+    h.state.listBuildsImpl = async () => ({ ids: ["hub-widget-ci:22222222-2222-3333-4444-555555555555"] });
+
+    const ok = await withRegistry(MULTI_REGISTRY, (mod) =>
+      invokeOn(mod.handler, "get_build_status", {
+        pipeline_name: HUB,
+        project: "hub-widget-ci",
+      })
+    );
+    expect(ok.region).toBe("us-west-2");
+    const list = h.state.cbCalls.find((c) => c.type === "ListBuildsForProject");
+    expect(list.region).toBe("us-west-2");
+
+    h.state.cbCalls = [];
+    const bad = await withRegistry(MULTI_REGISTRY, (mod) =>
+      invokeOn(mod.handler, "get_build_status", {
+        pipeline_name: HUB,
+        project: "someone-elses-ci",
+      })
+    );
+    expect(bad.ok).toBe(false);
+    expect(bad.reason).toBe("project_not_registered");
+    expect(h.state.cbCalls).toEqual([]);
+  });
+
+  // 8.8 registry read failures degrade to the env target ────────────────────
+
+  it("falls back to the env target when the registry read is denied", async () => {
+    h.state.registryImpl = async () => {
+      const err = new Error("AccessDenied");
+      err.name = "AccessDenied";
+      throw err;
+    };
+
+    const out = await withRegistry(null, (mod) => invokeOn(mod.handler, "capabilities"), {
+      AWS_REGION: "us-east-1",
+    });
+
+    expect(out.targets).toHaveLength(1);
+    expect(out.targets[0].pipeline).toBe(HUB);
+    expect(out.targets[0].region).toBe("us-east-1");
+  });
+
+  it("treats a missing registry object as an empty registry", async () => {
+    // beforeEach already installs the NoSuchKey default; assert it explicitly.
+    const out = await withRegistry(null, (mod) => invokeOn(mod.handler, "capabilities"));
+
+    expect(out.targets).toHaveLength(1);
+    expect(out.targets[0].pipeline).toBe(HUB);
+    expect(h.state.s3Calls.map((c) => c.Key)).toEqual(["config/cd-registry.json"]);
+  });
+
+  it("keeps the last good registry copy when a later read fails", async () => {
+    await withRegistry(
+      MULTI_REGISTRY,
+      async (mod) => {
+        const first = await invokeOn(mod.handler, "capabilities");
+        expect(first.targets.map((t) => t.pipeline)).toEqual([HUB, WIDGET]);
+
+        // Expire the 1ms TTL, then break the read.
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        h.state.registryImpl = async () => {
+          const err = new Error("AccessDenied");
+          err.name = "AccessDenied";
+          throw err;
+        };
+
+        const second = await invokeOn(mod.handler, "capabilities");
+        expect(second.targets.map((t) => t.pipeline)).toEqual([HUB, WIDGET]);
+        // It really did re-read - this is a retained copy, not a cache hit.
+        expect(h.state.s3Calls).toHaveLength(2);
+      },
+      { CD_REGISTRY_TTL_MS: "1" }
+    );
+  });
+
+  // 8.8b (TEAM-4358) a malformed body is a failed read, not "nothing registered"
+
+  it("keeps the last good registry copy when a later read returns a malformed body", async () => {
+    await withRegistry(
+      MULTI_REGISTRY,
+      async (mod) => {
+        const first = await invokeOn(mod.handler, "capabilities");
+        expect(first.targets.map((t) => t.pipeline)).toEqual([HUB, WIDGET]);
+
+        // Expire the 1ms TTL, then serve a truncated document. parseCdRegistry is
+        // tolerant, so pre-fix this became an EMPTY registry, was assigned over
+        // the cache, and un-registered acme/widget for the whole TTL.
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        serveRegistry("{not json");
+
+        const second = await invokeOn(mod.handler, "capabilities");
+        expect(second.targets.map((t) => t.pipeline)).toEqual([HUB, WIDGET]);
+        // It really did re-read — a retained copy, not a cache hit.
+        expect(h.state.s3Calls).toHaveLength(2);
+      },
+      { CD_REGISTRY_TTL_MS: "1" }
+    );
+  });
+
+  it("does not re-read S3 on every invocation after a denied read (the TTL window opens anyway)", async () => {
+    h.state.registryImpl = async () => {
+      const err = new Error("AccessDenied");
+      err.name = "AccessDenied";
+      throw err;
+    };
+
+    // Default 60s TTL: two invocations, one read. Pre-fix the failing branch never
+    // stamped registryLoadedAt, so every tool call for the container's life paid an
+    // S3 GetObject — and every one of them could fail again.
+    await withRegistry(
+      null,
+      async (mod) => {
+        const first = await invokeOn(mod.handler, "capabilities");
+        const second = await invokeOn(mod.handler, "capabilities");
+
+        for (const out of [first, second]) {
+          expect(out.targets).toHaveLength(1);
+          expect(out.targets[0].pipeline).toBe(HUB);
+          expect(out.targets[0].region).toBe("us-east-1");
+        }
+        expect(h.state.s3Calls).toHaveLength(1);
+      },
+      { AWS_REGION: "us-east-1" }
+    );
+  });
+
+  // 8.9 capabilities v3 ─────────────────────────────────────────────────────
+
+  it("reports version 3 with one entry per target and the flat keys intact", async () => {
+    const out = await withRegistry(MULTI_REGISTRY, (mod) => invokeOn(mod.handler, "capabilities"), {
+      AWS_REGION: "us-east-1",
+    });
+
+    expect(out.version).toBe(3);
+    // Version-2 callers keep reading exactly what they read before.
+    expect(out).toMatchObject({
+      startCiBuild: false,
+      ciProject: "agentcore-hub-ci",
+      buildProject: "agentcore-hub-build",
+      deployPipeline: HUB,
+      approveDeploy: false,
+    });
+
+    // The DEPLOY.md-mode repo has no pipeline, so it is NOT a target.
+    expect(out.targets.map((t) => t.pipeline)).toEqual([HUB, WIDGET]);
+    for (const target of out.targets) {
+      expect(Object.keys(target).sort()).toEqual([
+        "buildProject",
+        "ciProject",
+        "deployProject",
+        "pipeline",
+        "region",
+        "repo",
+        "startCiBuild",
+      ]);
+    }
+    expect(out.targets[1]).toEqual({
+      repo: "acme/widget",
+      pipeline: WIDGET,
+      region: "us-west-2",
+      ciProject: "hub-widget-ci",
+      buildProject: "hub-widget-build",
+      deployProject: WIDGET,
+      startCiBuild: false,
+    });
+  });
+
+  it("narrows capabilities to one target with pipeline_name, and refuses an unknown one", async () => {
+    await withRegistry(MULTI_REGISTRY, async (mod) => {
+      const one = await invokeOn(mod.handler, "capabilities", { pipeline_name: WIDGET });
+      expect(one.targets.map((t) => t.pipeline)).toEqual([WIDGET]);
+      // The flat env-default keys are NOT filtered - they describe this Lambda.
+      expect(one.deployPipeline).toBe(HUB);
+
+      const bad = await invokeOn(mod.handler, "capabilities", { pipeline_name: "nope-deploy" });
+      expect(bad).toEqual({
+        ok: false,
+        reason: "pipeline_not_registered",
+        requested: "nope-deploy",
+        known: [HUB, WIDGET],
+      });
+    });
+  });
+
+  // 8.10 the invariant that survives every widening ─────────────────────────
+
+  it("the source contains no PutApprovalResult command, only comments about its absence", async () => {
+    const source = await readFile(new URL("./index.mjs", import.meta.url), "utf8");
+
+    // Widening the allow-list may add pipelines to READ and TRIGGER. It must
+    // never add an approval path: the deploy gate is human-only.
+    expect(source).not.toMatch(/PutApprovalResultCommand/);
+    expect(source).not.toMatch(/new\s+PutApproval/);
+    expect(source).not.toMatch(/putApprovalResult/);
+    // The only mentions left are the comments asserting it is absent.
+    expect(source).toMatch(/DELIBERATELY ABSENT: PutApprovalResult/);
   });
 });

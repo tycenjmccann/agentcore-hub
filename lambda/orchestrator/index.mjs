@@ -231,8 +231,9 @@ let _agentRoster = null;
 // semantics. Re-read every CD_REGISTRY_TTL_MS (default 60s) so registering a
 // repo in the UI takes effect on warm containers too — a run that is mid-flight
 // when its repo is registered picks the ship phase up at its next dispatch.
-// A failed read keeps the last good copy; a never-loaded registry is EMPTY
-// (nothing registered → HANDOFF), the fail-safe direction: no merge, no deploy.
+// A failed read OR a malformed body keeps the last good copy; a never-loaded
+// registry is EMPTY (nothing registered → HANDOFF), the fail-safe direction:
+// no merge, no deploy.
 const CD_REGISTRY_TTL_MS = Number(process.env.CD_REGISTRY_TTL_MS) || 60_000;
 let _cdRegistry = { ...EMPTY_CD_REGISTRY };
 let _cdRegistryLoadedAt = 0;
@@ -243,7 +244,12 @@ export async function loadCdRegistry({ force = false } = {}) {
   if (!ARTIFACT_BUCKET) { _cdRegistryLoadedAt = now; return _cdRegistry; }
   try {
     const res = await s3.send(new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: CD_REGISTRY_KEY }));
-    _cdRegistry = parseCdRegistry(await res.Body.transformToString());
+    // JSON.parse HERE, not inside parseCdRegistry (TEAM-4378, parity with the
+    // tools Lambda): parseCdRegistry is tolerant by design, so a truncated body
+    // would become an EMPTY registry and DISCARD the last good copy for the
+    // whole TTL. Parsing first makes it a SyntaxError the catch already handles.
+    const doc = JSON.parse(await res.Body.transformToString());
+    _cdRegistry = parseCdRegistry(doc);
     if (!_cdRegistryLoadedAt) {
       console.log(`[orchestrator] CD registry: ${_cdRegistry.repos.length} repo(s) registered for merge+deploy`);
     }
@@ -3993,10 +3999,16 @@ export async function buildAgentContext(ticket, workflow) {
   if (deliveryForContext.pipelineMode) {
     context += `## Pipeline Mode\nPIPELINE_ENABLED: true\n`;
     context += `pipeline_name: ${deliveryForContext.pipeline}\n`;
+    if (deliveryForContext.region) context += `pipeline_region: ${deliveryForContext.region}\n`;
+    if (deliveryForContext.ciProject) context += `ci_project: ${deliveryForContext.ciProject}\n`;
+    if (deliveryForContext.buildProject) context += `build_project: ${deliveryForContext.buildProject}\n`;
+    if (deliveryForContext.deployProject) context += `deploy_project: ${deliveryForContext.deployProject}\n`;
     context += `A CodeBuild PR-check + CodePipeline deploy own this repo's `;
     context += `deterministic build/test/deploy. Follow the PIPELINE_ENABLED path `;
     context += `in your blueprint (read CI/pipeline results via the Pipeline___* tools, `;
-    context += `passing pipeline_name; do NOT shell builds or run DEPLOY.md yourself).\n\n`;
+    context += `passing pipeline_name; do NOT shell builds or run DEPLOY.md yourself). `;
+    context += `Pass pipeline_name on EVERY Pipeline___get_state / start_deploy call, and `;
+    context += `project=<ci_project> on EVERY get_build_status / start_ci_build call.\n\n`;
   }
 
   // S3 workspace paths (scope)
@@ -4218,7 +4230,7 @@ async function bootstrapBugWorkflow(bugTicket) {
   // Jira hard-caps issue summary at 255 chars — long bug titles (users paste the
   // whole complaint) otherwise 400 the create and the workflow never starts.
   const analystSummary = `Requirements: requirements analyst — ${bugTicket.title || bugKey}`.slice(0, 255);
-  const analystDescription = `Analyze the bug report (${bugKey}) and create the bug-fix sub-task chain (Fix → QA → CI). The orchestrator has injected a "THIS IS A BUG REPORT" directive — load the bug-fix-requirements blueprint.\n\n${bugTicket.description || ""}`;
+  const analystDescription = `Analyze the bug report (${bugKey}) and create the bug-fix sub-task chain (Fix → Review → CI → QA). The orchestrator has injected a "THIS IS A BUG REPORT" directive — load the bug-fix-requirements blueprint.\n\n${bugTicket.description || ""}`;
 
   const subtaskFields = {
     project: { key: process.env.JIRA_PROJECT_KEY || "TEAM" },

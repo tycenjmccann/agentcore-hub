@@ -55,7 +55,7 @@ The orchestration pipeline. Self-contained surface.
 - `src/components/workflow/`
 - `src/lib/workflow/` (~30 modules: types, ticket providers (`ticket-provider*.ts`), board state, leases, ship-review, event transforms, jira-client, model-config, watchdog, performance (fleet performance card — see `docs/performance-card.md`), …)
 - `src/lib/pipeline-config.ts`
-- `src/lib/cd-registry.ts` (core lib, no module imports) + `src/config/cd-registry.json` (first-deploy seed; ships empty) — mirror of `lambda/orchestrator/cd-registry.mjs`. Unregistered repo = **handoff**: no Ship / Merge Approval / CD tickets, the orchestrator opens the unified PR at completion and leaves it open for the owning team (`workflow.delivery = { mode: "handoff", prUrl }`). Registered = full ship phase; an entry with a `pipeline` also turns on Pipeline Mode for that repo's agents.
+- `src/lib/cd-registry.ts` (core lib, no module imports) + `src/config/cd-registry.json` (first-deploy seed; ships empty) — mirror of `lambda/orchestrator/cd-registry.mjs`. Unregistered repo = **handoff**: no Ship / Merge Approval / CD tickets, the orchestrator opens the unified PR at completion and leaves it open for the owning team (`workflow.delivery = { mode: "handoff", prUrl }`). Registered = full ship phase; an entry with a `pipeline` also turns on Pipeline Mode for that repo's agents. `pipelineProjectsFor(entry)` is the TS mirror of the canonical `pipelineProjects(entry)` — it derives `<base>-ci` / `<base>-build` / `<base>-deploy` from the entry's `pipeline` (`hub-<slug>-deploy` convention; an explicit `ciProject` wins), so the UI names exactly the resources the tools Lambda drives. Because the registry is read at runtime by more than the orchestrator, `cd-registry.mjs` is **byte-copied** to `lambda/agentcore-hub-pipeline-tools/cd-registry.mjs` (which pipeline a `Pipeline___*` call may touch) and `deploy/telegram-bug-intake/cd-registry.mjs` (which pipelines the deploy-gate bridge polls); `scripts/check-cd-registry-parity.sh` fails CI when the copies drift, and `deploy/telegram-bug-intake/update-config.sh` is the handoff script that points the bridge at the registered pipelines. Registry write access = deploy-trigger authority (see [`agents-own-cd.md`](./agents-own-cd.md)).
 
 **Lambdas** (`lambda/`)
 - `orchestrator` — drives the pipeline state machine
@@ -274,13 +274,13 @@ AND set the enable flags. With them unset the `/pipeline` nav entry is hidden an
 the CI/QA/release-manager blueprints run their legacy self-build path unchanged.
 
 **UI routes**
-- `src/app/pipeline/` — read-only status board (CI builds + deploy pipeline stages).
+- `src/app/pipeline/` — read-only status board, one section per CD target (CI builds + deploy pipeline stages, with the target's repo/region/CI project in its header and its own error block).
 
 **API routes** (under `src/app/api/pipeline/`)
-- `/status` — recent CodeBuild builds + CodePipeline stage state (pure reads).
+- `/status` — per-target recent CodeBuild builds + CodePipeline stage state (pure reads): `{ enabled, pipelines[] }`. `?repo=<url|owner/repo>` narrows to that repo's target (an unknown/unregistered repo falls back to the env default, so callers must check the returned `repo` before attributing state to a run — that check is what keeps the board's deploy-gate banner repo-scoped).
 
 **Lib**
-- `src/lib/pipeline/status.ts` — CodeBuild + CodePipeline SDK reads (server-side).
+- `src/lib/pipeline/status.ts` — CodeBuild + CodePipeline SDK reads (server-side), multi-target: registry entries with a `pipeline` (resolved via `pipelineProjectsFor`) plus the env default pipeline when no entry names it, deduped by pipeline name, one client pair per region, per-target error isolation.
 
 **Lambdas** (`lambda/`)
 - `agentcore-hub-pipeline-tools` (`lambda/agentcore-hub-pipeline-tools/index.mjs`)
@@ -316,7 +316,14 @@ CloudWatch Logs. Deploy role is deliberately narrow (Lambda code-only, no
   `pipeline_name`) only when its repo is registered with a `pipeline`. A registered
   repo without one takes the legacy DEPLOY.md path; an unregistered repo is a
   handoff (no ship phase at all). `CD_REGISTRY_TTL_MS` (orchestrator, default 60000)
-  is the re-read interval.
+  is the re-read interval. Each entry's `region` + derived project names are what
+  make the module multi-target: several repos, several pipelines, several regions.
+- `PIPELINE_REGIONS` — read by `node deploy/setup-pipeline-tools-lambda.mjs` (not the
+  Lambda at runtime): comma-separated regions to fan the tools Lambda's IAM grants
+  (pipeline + project ARNs) out to (default = its own region). A registry entry
+  whose region is outside that list was never granted access, so its calls fail at
+  AWS with `AccessDenied` - operator misconfiguration, not a runtime region check.
+  `ARTIFACT_BUCKET` — where it reads `config/cd-registry.json`.
 - `PIPELINE_TOOLS_LAMBDA` — fleet runtime: name of the tools Lambda (default
   `agentcore-hub-pipeline-tools`).
 - `PIPELINE_NAME` / `BUILD_PROJECT` / `CI_PROJECT` — on the tools Lambda

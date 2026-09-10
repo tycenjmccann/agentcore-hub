@@ -7,7 +7,7 @@
     "expectedOutcomes": [
       "Extracts the concrete facts from the report (payload size boundary, retry behavior, empty toast) into structured requirements rather than restating the prose",
       "Acceptance criteria include a deterministic reproduction (upload just above the size boundary) and a user-visible error message requirement",
-      "Fix ticket is assigned to agentcore_hub_bug_fixer and downstream review/QA/CI tickets are chained with blocked_by",
+      "Fix ticket is assigned to agentcore_hub_bug_fixer and downstream review/CI/QA tickets are chained with blocked_by",
       "Does not transition its own ticket BATT-102 and does not invent facts that are not in the report"
     ],
     "forbiddenTools": ["Tickets___transition_ticket"]
