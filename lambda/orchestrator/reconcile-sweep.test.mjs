@@ -826,3 +826,127 @@ describe("TEAM-4368 — a gate already presented to a human is a candidate but a
     expect(m.noop).toBe(0);
   });
 });
+
+/**
+ * TEAM-4384 — parkedLongEnough() reads ticket.updatedAt, but mapJiraIssueToTicket
+ * (index.mjs) never emitted it and neither Jira field list requested a
+ * timestamp, so in TICKET_PROVIDER=jira mode every parked sibling took the
+ * no-timestamp branch and the predicate returned true VACUOUSLY. Every
+ * rate(1 minute) sweep therefore routed every parked gate through
+ * cascade.reconcileDependent, whose leaseIsLive (cascade.mjs) runs before any
+ * status branch — one events-table Query per parked gate per sweep, even
+ * though TEAM-4368 already made the in_review case a read-only no-op.
+ *
+ * index.mjs now requests Jira's `updated` field and maps it onto updatedAt, so
+ * these fixtures use exactly the row shape the mapper produces: an ISO string
+ * with Jira's basic-format `+0000` offset instead of `Z`.
+ */
+describe("TEAM-4384 — the Jira-mode parked window is a real predicate, not vacuously true", () => {
+  const GATE_J = "GATE-J1";
+  const FRESH_UPDATED = "2026-09-01T11:59:00.000+0000"; // 60s before NOW
+
+  const jiraGate = (updatedAt) => [
+    { ticketId: DONE, status: "done", type: "task" },
+    { ticketId: GATE_J, status: "in_review", assignee: "human:reviewer", type: "task", blockedBy: [DONE], updatedAt },
+  ];
+
+  // Same write-first mini-fake as the TEAM-4368 block above.
+  function gateFake(jiraTransition) {
+    return vi.fn(async (ticketId, assignee, wf) => {
+      await jiraTransition(ticketId, "In Review");
+      const list = Array.isArray(wf?.humanNotifications) ? wf.humanNotifications : [];
+      if (list.some((n) => n.ticketId === ticketId && n.type === "review_needed" && !n.acknowledged)) {
+        return false;
+      }
+      list.push({ id: `n_${ticketId}`, type: "review_needed", ticketId, acknowledged: false });
+      return true;
+    });
+  }
+
+  it("a Jira-mode gate parked 60s ago is NOT a candidate — no reconcileDependent, no lease Query", async () => {
+    const jiraTransition = vi.fn(async () => {});
+    const s = makeSweep({
+      workflows: [workflow({ humanNotifications: [] })],
+      siblings: jiraGate(FRESH_UPDATED),
+      reawakenGate: gateFake(jiraTransition),
+    });
+    const cap = captureMetrics();
+
+    const m = await s.runSweep("enforce");
+    const records = cap.records();
+    cap.restore();
+
+    expect(m.candidates).toBe(0);
+    expect(s.lease.lastAgentActivity).not.toHaveBeenCalled();
+    expect(s.reawakenGate).not.toHaveBeenCalled();
+    expect(records[0].ReconcileSweepCandidates).toBe(0);
+  });
+
+  it("the SAME row IS a candidate once now advances past the lease-TTL window", async () => {
+    const jiraTransition = vi.fn(async () => {});
+    const s = makeSweep({
+      workflows: [workflow({ humanNotifications: [] })],
+      siblings: jiraGate(FRESH_UPDATED),
+      reawakenGate: gateFake(jiraTransition),
+      now: () => NOW + TTL_MS + 60_000,
+    });
+
+    const m = await s.runSweep("enforce");
+
+    expect(m.candidates).toBe(1);
+  });
+
+  it("past the window with an open review_needed → still the TEAM-4368 no-op (review-noop)", async () => {
+    const jiraTransition = vi.fn(async () => {});
+    const s = makeSweep({
+      workflows: [workflow({
+        humanNotifications: [{ id: "n1", type: "review_needed", ticketId: GATE_J, acknowledged: false }],
+      })],
+      siblings: jiraGate(FRESH_UPDATED),
+      reawakenGate: gateFake(jiraTransition),
+      now: () => NOW + TTL_MS + 60_000,
+    });
+
+    const m = await s.runSweep("enforce");
+
+    expect(m.candidates).toBe(1);
+    expect(m.noop).toBe(1);
+    expect(m.reviewReawakened).toBe(0);
+    expect(s.reawakenGate).not.toHaveBeenCalled();
+  });
+
+  it("past the window with no open notification → re-woken exactly once (positive control)", async () => {
+    const jiraTransition = vi.fn(async () => {});
+    const s = makeSweep({
+      workflows: [workflow({ humanNotifications: [] })],
+      siblings: jiraGate(FRESH_UPDATED),
+      reawakenGate: gateFake(jiraTransition),
+      now: () => NOW + TTL_MS + 60_000,
+    });
+
+    const m = await s.runSweep("enforce");
+
+    expect(m.candidates).toBe(1);
+    expect(s.reawakenGate).toHaveBeenCalledTimes(1);
+    expect(s.reawakenGate.mock.calls[0][0]).toBe(GATE_J);
+    expect(m.reviewReawakened).toBe(1);
+  });
+
+  it("parkedLongEnough parses Jira's basic-format offset (+0000), not NaN", () => {
+    const s = makeSweep({});
+    expect(s.parkedLongEnough({ updatedAt: "2026-09-01T11:59:00.000+0000" }, NOW)).toBe(false);
+    expect(s.parkedLongEnough({ updatedAt: "2026-09-01T00:00:00.000+0000" }, NOW)).toBe(true);
+  });
+
+  it("a sibling with NO timestamp at all still fails OPEN — one candidate, not a stall", async () => {
+    const noTimestamp = [
+      { ticketId: DONE, status: "done", type: "task" },
+      { ticketId: "TEAM-99", status: "ready", assignee: "dev", type: "task", blockedBy: [DONE] },
+    ];
+    const s = makeSweep({ workflows: [workflow()], siblings: noTimestamp });
+
+    const m = await s.runSweep("shadow");
+
+    expect(m.candidates).toBe(1);
+  });
+});

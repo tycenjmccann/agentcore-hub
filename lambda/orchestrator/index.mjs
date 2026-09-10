@@ -4427,6 +4427,13 @@ export function mapJiraIssueToTicket(issue) {
   }));
   const reviewComment = jiraComments.length ? jiraComments[jiraComments.length - 1].content : undefined;
 
+  // TEAM-4384: Jira's `updated` is the row's last-touched time — the one field
+  // DynamoDB-mode rows always carry (agentcore-hub-tickets writes it on every
+  // mutation) and Jira-mode rows did not, which made reconcile-sweep's
+  // parkedLongEnough() vacuously true for every parked Jira sibling. Normalised
+  // to ISO so both providers' rows compare identically.
+  const updatedMs = Date.parse(f.updated || "");
+
   const rawIssueType = f.issuetype?.name || "Task";
   return {
     ticketId: issue.key,
@@ -4446,6 +4453,7 @@ export function mapJiraIssueToTicket(issue) {
     labels,
     blockedBy,
     comments: jiraComments,
+    ...(Number.isFinite(updatedMs) ? { updatedAt: new Date(updatedMs).toISOString() } : {}),
     ...(reviewComment ? { reviewComment } : {}),
     // TEAM-4113: agent-filed fix ticket → spawnedBy.kind (mirrors DynamoDB mode).
     // TEAM-4121 FR-8: …plus the origin id, reverify/rearmOf, phase and contract.
@@ -4465,7 +4473,7 @@ function extractAdfText(adf) {
 }
 
 async function getTicketFromJira(ticketId) {
-  const issue = await jiraFetch(`/rest/api/3/issue/${ticketId}?fields=summary,description,status,issuetype,parent,labels,issuelinks,assignee,comment`);
+  const issue = await jiraFetch(`/rest/api/3/issue/${ticketId}?fields=summary,description,status,issuetype,parent,labels,issuelinks,assignee,comment,updated`);
   if (!issue) return null;
   return mapJiraIssueToTicket(issue);
 }
@@ -4479,7 +4487,7 @@ async function getChildTicketsFromJira(parentId) {
     throw new Error(`Invalid 'parentId' ${JSON.stringify(parentId)} — expected an issue key like TEAM-123`);
   }
   const jql = encodeURIComponent(`parent = ${parentId} ORDER BY created ASC`);
-  const data = await jiraFetch(`/rest/api/3/search/jql?jql=${jql}&fields=summary,status,labels,issuetype,parent,issuelinks,assignee,description&maxResults=100`);
+  const data = await jiraFetch(`/rest/api/3/search/jql?jql=${jql}&fields=summary,status,labels,issuetype,parent,issuelinks,assignee,description,updated&maxResults=100`);
   return (data?.issues || []).map(mapJiraIssueToTicket);
 }
 
