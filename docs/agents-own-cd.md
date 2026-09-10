@@ -81,6 +81,51 @@ allow-list and, under convention-scoped IAM, simply fails at AWS with
 `AccessDenied` — operator misconfiguration surfaced as the tool's normal error
 text, not a silent build of the wrong project.
 
+### `start_ci_build`: `project` resolution and refusal reasons (TEAM-4351)
+
+`Pipeline___start_ci_build` (granted to the CI agent only) never issues
+`StartBuild` against anything but a PR-check project. `args.project` is resolved
+in two steps, and the outcome differs by what the name IS:
+
+- **A REGISTERED non-CI project** (e.g. `hub-widget-deploy`, or the hub's own
+  `agentcore-hub-build`) resolves the target that owns it, then is **silently
+  remapped** to that target's `ciProject` — `StartBuild` runs against the CI
+  project, never against the build/deploy project the caller named (pinned:
+  `index.test.mjs` §8.7 "never starts a deploy project, even when asked for one
+  by name"). This is deliberate (TEAM-4122 F2/F3): a non-CI project name is
+  **ignored, not rejected**, because rejecting it would teach a fix-then-retry
+  loop that naming a different project is even a category of request it could
+  probe. The security invariant is unaffected either way — `StartBuild` only
+  ever fires on a name in `knownCiProjects`, re-validated per call by
+  `validateCiProjectAcrossTargets`, under IAM scoped to `project/hub-*-ci`.
+- **An UNREGISTERED name** (owned by no target at all) is refused
+  `project_not_registered` by `resolveTarget` before any AWS call is made — see
+  the table below.
+
+**TEAM-4351 resolution:** the remap is retained as-is (no behaviour change). An
+earlier requirements doc for this feature described the deploy-project case as
+"refused" — that wording is superseded by this section; the correct statement is
+*"a registered non-CI project is remapped to that target's `ciProject` and never
+started as a deploy project; only an unregistered project name is refused."*
+
+Every `ok:false` reason `start_ci_build` can return, and what to do on each:
+
+| `reason` | Meaning | Agent action |
+|---|---|---|
+| `pipeline_not_registered` | `pipeline_name` given, matches no target | Not reachable via the fleet tool (it has no `pipeline_name` arg) — only via a direct Lambda call. If seen, treat as misconfiguration: BLOCKED, do not retry. |
+| `project_not_registered` | `project` given, owned by no target (typo, or an unregistered repo's project) | Misconfiguration — BLOCKED, do not retry with the same value. |
+| `ci_project_invalid` | The PR-check project this call resolved to fails validation (collides with a build/deploy/pipeline name, or a reserved deploy project, on ANY target) | Deployment misconfiguration — BLOCKED, do not retry. |
+| `missing_commit_sha` | `commit_sha` was empty | Caller error — supply it and retry once. |
+| `invalid_commit_sha` | `commit_sha` is not 7-40 hex chars | Caller error — fix and retry once. |
+| `invalid_source_version` | Either the shape check rejected `source_version`/`commit_sha` (`refs/…` prefix, `..`, bad charset), or CodeBuild itself rejected a ref this Lambda's shape check accepted (e.g. a branch that does not exist) | Caller error — fix and retry once; if CodeBuild rejected it, the ref itself is bad. |
+| `start_build_not_granted` | `StartBuild` denied — this deployment has not set `PIPELINE_CI_START_BUILD=1` | Not a caller error — report BLOCKED (head SHA unverified by CI), never retry. |
+| `project_not_found` | `StartBuild` → CodeBuild says the project does not exist in that region | Deployment misconfiguration — BLOCKED, do not retry. |
+
+Two more outcomes that are not in the table because they are not `ok:false`:
+**`ok:true, reused:true`** (a build for that `commit_sha` already exists —
+success, do not start another), and an **unexpected error**, which comes back as
+plain text `Error: <Name>: <message>`, not JSON (no `reason` field at all).
+
 Onboarding a new repo today means creating its pipeline out of band and adding the
 entry. A generic per-repo CDK stack plus onboarding scripts/templates is a
 follow-up (PR B).

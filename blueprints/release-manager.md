@@ -539,9 +539,26 @@ known — `pipeline_region`, `ci_project`, `build_project`, `deploy_project`
 (TEAM-4338: the tools Lambda serves several registered pipelines, not just the
 hub's own). Pass `pipeline_name` from that block on **every**
 `Pipeline___get_state` / `Pipeline___start_deploy` call in this section, not
-just the preflight — omitting it reads/triggers the hub's own pipeline, and an
-unrecognized name comes back `ok:false` with reason `pipeline_name_required`
-or `pipeline_not_registered`.
+just the preflight — omitting it reads/triggers the hub's own pipeline. You do
+NOT hold `Pipeline___start_ci_build` (the CI agent's tool, not yours) — every
+reason below is what YOUR tools can return:
+
+- `Pipeline___get_state` / `Pipeline___start_deploy`: an unrecognized
+  `pipeline_name` comes back `ok:false` with reason `pipeline_not_registered`;
+  omitting `pipeline_name` with more than one pipeline registered comes back
+  `pipeline_name_required` (the tool refuses to guess which repo to deploy).
+- `Pipeline___get_build_log`: `project_not_registered` (the project it landed
+  on — explicit or inferred from `build_id` — is not a known project), or
+  `project_mismatch` (you passed both `project` and a `build_id` naming a
+  DIFFERENT project — fix the call, do not assume which one is right; this is
+  why step 4 below says not to pass `project` alongside `build_id`).
+- `Pipeline___get_build_status`: `project_not_registered`.
+- `Pipeline___capabilities`: `pipeline_not_registered` if you pass a
+  `pipeline_name` it doesn't know.
+
+Any of these means deployment/config is broken, not a mistake in your call
+(except `project_mismatch`, which IS your call) — report BLOCKED, do not retry
+unchanged. Full detail: `docs/agents-own-cd.md`.
 
 1. **Preflight:** call `Pipeline___get_state` passing `pipeline_name` from `## Pipeline Mode`
    (the registry entry's pipeline for THIS repo — never assume the hub's own). `configured:false` → **BLOCKED**,

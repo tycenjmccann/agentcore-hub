@@ -178,6 +178,22 @@ release manager's Merge Brief reads all three off your completion record.
     `ci_status="github-actions-proxy"` in your completion record — but this
     NEVER upgrades the verdict past BLOCKED; CodeBuild certification and a
     green check-run are different claims, and only the former is "certified".
+  - Every other `ok:false` reason `Pipeline___start_ci_build` can return, and
+    what it means:
+    - `project_not_registered`, `ci_project_invalid`, `project_not_found` —
+      this deployment's registry/config is broken, not your call. **BLOCKED**,
+      same as `start_build_not_granted`; do not retry unchanged.
+    - `missing_commit_sha`, `invalid_commit_sha`, `invalid_source_version` —
+      your own arguments were malformed. Fix the call and retry it — but this
+      still counts as your ONE build attempt for the SHA; do not loop retries.
+    - `pipeline_not_registered` — not reachable through this tool call (it has
+      no `pipeline_name` argument); ignore.
+  - `ok:true, reused:true` is success, not a new build — a build for this SHA
+    already exists. Do not start a second one and do not treat it as a failure.
+  - A `project` you pass that names a REGISTERED build or deploy project (not a
+    CI project) is silently remapped to that target's own CI project rather
+    than rejected — always pass the `ci_project` from `## Pipeline Mode` /
+    `capabilities` `targets[]` so this never comes up.
   - Do not wave a SHA with no proof of either kind through as PASS.
 
 **`Fix (sync-main)` tickets are yours (P0).** The dev you assign resolves the

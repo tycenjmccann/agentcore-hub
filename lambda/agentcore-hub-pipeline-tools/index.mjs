@@ -20,11 +20,17 @@
  *                     so the CI agent can re-run CI on a head it just pushed
  *                     instead of waiting for a webhook that may never fire. The
  *                     project is ALWAYS a PR-check project this deployment knows
- *                     (env CI_PROJECT or a target's ciProject) — an args.project
- *                     naming anything else is IGNORED, not honored — and the
- *                     StartBuild input is an allow-list of three keys, so no
- *                     override (buildspec/env/image/privileged/role/source) can
- *                     ride in from the agent's args.
+ *                     (env CI_PROJECT or a target's ciProject): an args.project
+ *                     naming a REGISTERED build/deploy project is REMAPPED to
+ *                     that target's ciProject (never started as-is, and never
+ *                     rejected either — TEAM-4351: rejecting it would teach a
+ *                     retry loop that naming a different project is even a
+ *                     category of request); a project no target owns at all is
+ *                     refused project_not_registered before this remap ever
+ *                     runs. The StartBuild input is an allow-list of three keys,
+ *                     so no override (buildspec/env/image/privileged/role/
+ *                     source) can ride in from the agent's args. Full ok:false
+ *                     reason table: docs/agents-own-cd.md.
  *   - capabilities:   What this Lambda will actually do in THIS deployment, so an
  *                     agent can branch without probing with a real StartBuild.
  *                     Also enumerates every target (see below).
@@ -60,6 +66,11 @@
  *                            resolved some other way — is not any target's
  *                            ci/build/deploy project.
  *                            { ok:false, reason, requested, known:[projects] }
+ *                            For start_ci_build specifically: this fires ONLY
+ *                            when no target owns the name at all. A project
+ *                            that IS registered but is a build/deploy project
+ *                            (not a CI project) never reaches this refusal —
+ *                            see start_ci_build's own remap, above.
  *   project_mismatch        (TEAM-4348, get_build_log only) args.project and
  *                            the project build_id names ("<project>:<uuid>")
  *                            disagree. Refused rather than picking one, so a
@@ -968,6 +979,24 @@ async function getBuildStatus(args = {}, target, targets = []) {
 //      *Override inputs can replace the buildspec, the image, the service role and
 //      privileged mode — i.e. turn a PR check into arbitrary privileged execution.
 //      They are never read from args at all.
+//
+// Every ok:false this function (or resolveTarget, on its behalf) can return:
+//   project_not_registered  args.project is not any target's ci/build/deploy
+//                            project at all (resolveTarget, before this runs).
+//   ci_project_invalid      the CI project landed on fails validation against
+//                            SOME target's build/deploy/pipeline name or a
+//                            reserved deploy project (validateCiProjectAcrossTargets).
+//   missing_commit_sha      commit_sha absent/blank.
+//   invalid_commit_sha      commit_sha is not 7-40 hex chars.
+//   invalid_source_version  bad shape (refs/, "..", charset) OR CodeBuild's own
+//                           InvalidInputException on a ref this Lambda accepted.
+//   start_build_not_granted  StartBuild → AccessDeniedException.
+//   project_not_found       StartBuild → ResourceNotFoundException.
+// (pipeline_not_registered and pipeline_name_required cannot occur here: this
+// tool takes no pipeline_name and onTarget calls it with requirePipelineName:false.)
+// KEEP IN SYNC (TEAM-4351) — same list, prose form, in three places docs are
+// copied to: deploy/runtime-agent/main.py (Pipeline___start_ci_build docstring),
+// blueprints/ci-agent.md (the only agent granted this tool), docs/agents-own-cd.md.
 async function startCiBuild(args = {}, target, targets = []) {
   // Step 1: which PR-check project. An args.project that is not a known PR-check
   // project falls back to the resolved target's — silently, by design.

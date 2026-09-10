@@ -1769,6 +1769,10 @@ def Pipeline___get_state(pipeline_name: str = "", execution_id: str = "") -> str
     terminal/succeeded when matchesExecution is true; matchesExecution:false
     means your run is not visible on any stage yet (keep polling).
 
+    An unrecognized pipeline_name comes back ok:false with reason
+    pipeline_not_registered — not configured:false, which means "no pipeline for
+    this deployment at all". Either way, BLOCKED; never retry with the same name.
+
     Args:
         pipeline_name: In Pipeline Mode this is REQUIRED — pass the
             pipeline_name from the `## Pipeline Mode` context block on EVERY
@@ -1801,6 +1805,11 @@ def Pipeline___start_deploy(pipeline_name: str = "", commit_sha: str = "") -> st
     HUMAN approves via Telegram — you do NOT approve it. After starting, poll
     Pipeline___get_state until terminal and report the result as CD evidence.
 
+    ok:false reasons: pipeline_not_registered (bad pipeline_name), or, with more
+    than one pipeline registered and pipeline_name omitted, pipeline_name_required
+    — this tool never guesses which repo to deploy. Either way, BLOCKED; fix the
+    pipeline_name and retry once, never repeat the same call unchanged.
+
     Args:
         pipeline_name: In Pipeline Mode this is REQUIRED — pass the
             pipeline_name from the `## Pipeline Mode` context block on EVERY
@@ -1827,6 +1836,9 @@ def Pipeline___get_build_status(commit_sha: str = "", project: str = "", scan: i
 
     Use this to confirm a green build belongs to the EXACT head SHA (e.g. after a
     CI auto-remediation push) instead of trusting "the latest build is green".
+
+    ok:false reason: project_not_registered (project is not any known ci/build/
+    deploy project) — misconfiguration, report BLOCKED rather than retrying.
 
     Args:
         commit_sha: The head SHA to match against resolvedSourceVersion.
@@ -1857,6 +1869,11 @@ def Pipeline___get_build_log(build_id: str = "", project: str = "", tail_lines: 
     as build_id, or project="agentcore-hub-deploy" (e.g. to read the intentional
     exit-2 "HANDOFF" signal vs a genuine deploy failure).
 
+    ok:false reasons: project_mismatch (project and the project build_id names
+    disagree — fix the caller, do not guess which one is right) or
+    project_not_registered (the project landed on is not any known one).
+    Either way, misconfiguration — report BLOCKED, do not retry unchanged.
+
     Args:
         build_id: CodeBuild build id (from get_state actionDetails.externalExecutionId).
             The project is inferred from build_id itself (`<project>:<uuid>`),
@@ -1882,15 +1899,28 @@ def Pipeline___start_ci_build(commit_sha: str, source_version: str = "", project
     may not re-trigger the webhook) — do NOT call it speculatively, and never
     call it more than once per head SHA.
 
-    This always builds the CI project — there is no way to point it at the
-    deploy/build project. Dedupes: if a build already exists for commit_sha it
-    is reused (reused:true) instead of starting a second one. After calling,
-    poll Pipeline___get_build_status(commit_sha=..., project=...) until terminal.
+    This always builds a CI (PR-check) project — there is no way to point it at
+    a deploy/build project. A project you pass that names a REGISTERED build or
+    deploy project is silently remapped to that target's own CI project (never
+    started as-is); only a project this deployment does not know at all is
+    refused. Dedupes: if a build already exists for commit_sha it is reused
+    (reused:true) instead of starting a second one. After calling, poll
+    Pipeline___get_build_status(commit_sha=..., project=...) until terminal.
 
-    On ok:false with reason "start_build_not_granted", this deployment has not
-    granted the tool codebuild:StartBuild — report BLOCKED (head SHA unverified
-    by CI), do not retry. Other ok:false reasons: missing_commit_sha,
-    invalid_source_version, project_not_found, ci_project_invalid.
+    Every ok:false reason, and what to do:
+      - start_build_not_granted: this deployment has not granted
+        codebuild:StartBuild — report BLOCKED (head SHA unverified by CI), do
+        not retry.
+      - project_not_registered, ci_project_invalid, project_not_found: this
+        deployment's registry/config is broken (not your call's fault) —
+        report BLOCKED, do not retry unchanged.
+      - missing_commit_sha, invalid_commit_sha, invalid_source_version: your
+        arguments — fix and retry at most once.
+      - pipeline_not_registered: not reachable through this tool (it has no
+        pipeline_name argument); only possible via a direct Lambda call.
+    ok:true with reused:true is success (a build for this SHA already exists —
+    do not start another). Any other error comes back as plain text
+    ("Error: <Name>: <message>"), not JSON — no reason field at all.
 
     Args:
         commit_sha: The exact head SHA to build (required; 7-40 hex chars) —
