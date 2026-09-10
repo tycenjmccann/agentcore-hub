@@ -20,7 +20,12 @@
 #                         pipeline (its own region) plus hub-*-deploy in every
 #                         region in PIPELINE_REGIONS (the CD-registry convention
 #                         — see src/lib/cd-registry.ts / cd-registry.mjs).
-#   DeployApprovalWrite  codepipeline:PutApprovalResult on the same resources.
+#                         GetPipelineState is authorized at the PIPELINE level.
+#   DeployApprovalWrite  codepipeline:PutApprovalResult on the SAME pipelines,
+#                         but PutApprovalResult is authorized at the ACTION
+#                         level (arn:...:<pipeline>/<stage>/<action>), so the
+#                         resource is <pipeline-arn>/* for each — never a bare
+#                         pipeline ARN, or every approval tap AccessDenies.
 #   CdRegistryRead        s3:GetObject on exactly config/cd-registry.json in
 #                         ARTIFACT_BUCKET — one key, not a prefix.
 #
@@ -98,7 +103,12 @@ bucket = os.environ["ARTIFACT_BUCKET"]
 
 pipeline_arn = f"arn:aws:codepipeline:{home_region}:{account}:{pipeline}"
 hub_arns = [f"arn:aws:codepipeline:{r}:{account}:hub-*-deploy" for r in regions]
-resources = [pipeline_arn] + hub_arns
+# GetPipelineState is authorized at the PIPELINE level.
+pipeline_resources = [pipeline_arn] + hub_arns
+# PutApprovalResult is authorized at the ACTION level
+# (arn:...:<pipeline>/<stage>/<action>) - same pipelines, "/*" appended so the
+# grant still can't reach any OTHER pipeline's actions.
+action_resources = [f"{pipeline_arn}/*"] + [f"{arn}/*" for arn in hub_arns]
 
 policy = {
     "Version": "2012-10-17",
@@ -107,13 +117,13 @@ policy = {
             "Sid": "PipelineStateRead",
             "Effect": "Allow",
             "Action": ["codepipeline:GetPipelineState"],
-            "Resource": resources,
+            "Resource": pipeline_resources,
         },
         {
             "Sid": "DeployApprovalWrite",
             "Effect": "Allow",
             "Action": ["codepipeline:PutApprovalResult"],
-            "Resource": resources,
+            "Resource": action_resources,
         },
         {
             "Sid": "CdRegistryRead",
@@ -133,5 +143,6 @@ aws iam put-role-policy \
   --policy-document "$POLICY_DOC"
 
 echo "IAM inline policy '$POLICY_NAME' applied to $ROLE_NAME:"
-echo "  PipelineStateRead + DeployApprovalWrite on $DEPLOY_PIPELINE ($AWS_REGION) + hub-*-deploy ($PIPELINE_REGIONS)"
+echo "  PipelineStateRead (pipeline-level) on $DEPLOY_PIPELINE ($AWS_REGION) + hub-*-deploy ($PIPELINE_REGIONS)"
+echo "  DeployApprovalWrite (action-level, <pipeline>/*) on the same pipelines"
 echo "  CdRegistryRead on s3://$ARTIFACT_BUCKET/config/cd-registry.json"

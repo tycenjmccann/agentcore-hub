@@ -131,6 +131,11 @@ and one S3 read:
 - `s3:GetObject` on exactly `config/cd-registry.json` in `ARTIFACT_BUCKET` —
   one key, not a prefix.
 
+`GetPipelineState` is authorized at the PIPELINE level, but `PutApprovalResult`
+is authorized at the ACTION level (`arn:...:<pipeline>/<stage>/<action>`), so
+its resource is `<pipeline-arn>/*` for each pipeline above, not the bare
+pipeline ARN — `update-config.sh` grants them accordingly.
+
 `./update-config.sh` is the tracked, idempotent, re-runnable way to apply both
 the env vars above and this inline policy — it **supersedes** the untracked
 `deploy/local/telegram-bug-intake/deploy.sh` for that job. Like the zip-and-
