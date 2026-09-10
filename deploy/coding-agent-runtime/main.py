@@ -32,6 +32,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import socket
 import sqlite3
 import subprocess
@@ -188,7 +189,10 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 # are kiro's only usage unit — it never reports token counts.
 _KIRO_CREDITS_RE = re.compile(r"Credits:\s*([0-9.]+)")
 
-_CODING_PROC_NAMES = ("claude", "codex", "kiro", "kiro-cli", "node")
+# kiro-cli re-execs itself as kiro-cli-chat for the chat subcommand, so the
+# launcher name alone made /health report Healthy (not HealthyBusy) for the
+# whole of a live kiro turn — the session was reapable mid-turn (TEAM-4389).
+_CODING_PROC_NAMES = ("claude", "codex", "kiro", "kiro-cli", "kiro-cli-chat", "node")
 COLLECTOR_BIN = "/usr/bin/otelcol-contrib"
 COLLECTOR_CFG = "/app/otel-collector-config.yaml"
 
@@ -2010,6 +2014,51 @@ def _build_claude_args(config_dir: str, claude_session_id: str | None, stream: b
     return args
 
 
+def _kill_coding_proc_group(proc) -> None:
+    """SIGKILL the CLI's ENTIRE process group, not just the launcher PID.
+
+    Every CLI here spawns children that inherit our stdout pipe: kiro-cli
+    re-execs as kiro-cli-chat, claude and codex start MCP servers. Killing one
+    PID leaves those children holding the write end open, so `for line in
+    proc.stdout` never reaches EOF, the runner never yields its timeout frames,
+    and the turn is journalled as "running" forever (TEAM-4389). The group kill
+    closes every copy of the pipe, which is what actually unwedges the reader.
+
+    Requires start_new_session=True at Popen: the child then leads its own
+    group, so this can never signal the server. The pgid guard and the
+    proc.kill() fallback keep a non-real proc (or a race where the child already
+    exited) from turning the watchdog into an exception."""
+    try:
+        pgid = os.getpgid(proc.pid)
+        if pgid != os.getpgid(0):
+            os.killpg(pgid, signal.SIGKILL)
+            return
+    except Exception:  # noqa: BLE001 — fall through to the single-PID kill
+        pass
+    try:
+        proc.kill()
+    except Exception:  # noqa: BLE001 — already dead is the outcome we wanted
+        pass
+
+
+def _reap_after_kill(proc, wait_s: float = 5.0) -> None:
+    """Bounded cleanup after a watchdog kill: reap the child, then drop the
+    pipes. The wait is bounded because a runner thread that blocks here is the
+    very failure we are fixing, and the pipes are closed explicitly so a
+    surviving grandchild (one that escaped the group kill) cannot keep this
+    thread's fds — or the thread itself — alive. Never raises."""
+    try:
+        proc.wait(timeout=wait_s)
+    except Exception:  # noqa: BLE001
+        pass
+    for pipe in (getattr(proc, "stdout", None), getattr(proc, "stderr", None)):
+        try:
+            if pipe is not None:
+                pipe.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def _stream_claude(prompt: str, workdir: str, claude_session_id: str | None, repo: str | None = None,
                    session_id: str | None = None, tenant_id: str | None = None,
                    model: str | None = None, turn_timeout_s: int = TURN_TIMEOUT_S,
@@ -2031,17 +2080,20 @@ def _stream_claude(prompt: str, workdir: str, claude_session_id: str | None, rep
         return f"data: {json.dumps(obj)}\n\n"
 
     proc = subprocess.Popen(args, cwd=workdir, env=env, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, text=True, stdin=subprocess.DEVNULL, bufsize=1)
+                            stderr=subprocess.PIPE, text=True, stdin=subprocess.DEVNULL,
+                            bufsize=1, start_new_session=True)
     # Same watchdog as _stream_codex: the loop blocks on readline, so a wedged
     # claude (or a command it spawned holding stdout) would pin the microVM
     # HealthyBusy forever — and now that workflow personas ride this path, it
     # would strand their agent-task claim too. Kill at the cap so the loop
-    # unwinds and a terminal frame reaches the caller.
+    # unwinds and a terminal frame reaches the caller. The kill takes the whole
+    # process group (claude's MCP children inherit this pipe) — see
+    # _kill_coding_proc_group.
     timed_out = threading.Event()
 
     def _kill_on_timeout():
         timed_out.set()
-        proc.kill()
+        _kill_coding_proc_group(proc)
     watchdog = threading.Timer(turn_timeout_s, _kill_on_timeout)
     watchdog.start()
     new_session_id: str | None = claude_session_id
@@ -2049,6 +2101,10 @@ def _stream_claude(prompt: str, workdir: str, claude_session_id: str | None, rep
     block_has_text = False  # did the current text block emit anything?
     try:
         for line in proc.stdout:  # line-buffered: yields as claude emits
+            # Never keep reading past the watchdog: a child that survived the
+            # group kill could otherwise stream forever past the cap.
+            if timed_out.is_set():
+                break
             line = line.strip()
             if not line:
                 continue
@@ -2084,10 +2140,17 @@ def _stream_claude(prompt: str, workdir: str, claude_session_id: str | None, rep
                     new_session_id = obj["session_id"]
         proc.wait(timeout=30)
     except Exception as exc:  # noqa: BLE001
-        yield sse({"type": "error", "error": str(exc)[:600]})
-        return
+        # A watchdog kill can itself raise here as the read unwinds (closed /
+        # errored pipe). Returning then would swallow the timeout verdict and
+        # leave the caller with no done frame — the exact hang this fixes. Only
+        # a failure with NO kill behind it is terminal on its own.
+        if not timed_out.is_set():
+            yield sse({"type": "error", "error": str(exc)[:600]})
+            return
     finally:
         watchdog.cancel()
+        if timed_out.is_set():
+            _reap_after_kill(proc)
     if timed_out.is_set():
         err = f"claude timed out after {turn_timeout_s}s"
         yield sse({"type": "error", "error": err})
@@ -2228,16 +2291,19 @@ def _stream_codex(prompt: str, workdir: str, codex_session_id: str | None,
         args.append(codex_session_id)
 
     proc = subprocess.Popen(args, cwd=workdir, env=env, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, text=True, stdin=subprocess.DEVNULL, bufsize=1)
+                            stderr=subprocess.PIPE, text=True, stdin=subprocess.DEVNULL,
+                            bufsize=1, start_new_session=True)
     # Watchdog: the buffered runner enforced TURN_TIMEOUT_S via subprocess.run;
     # this loop blocks on readline, so a codex (or an invoked command) that wedges
     # without closing stdout would pin the microVM HealthyBusy forever. Kill the
-    # process at the cap so the loop unwinds and a terminal frame is emitted.
+    # whole process group at the cap (run-codex.sh's codex child and its MCP
+    # servers all hold this pipe) so the loop unwinds and a terminal frame is
+    # emitted — see _kill_coding_proc_group.
     timed_out = threading.Event()
 
     def _kill_on_timeout():
         timed_out.set()
-        proc.kill()
+        _kill_coding_proc_group(proc)
     watchdog = threading.Timer(turn_timeout_s, _kill_on_timeout)
     watchdog.start()
     thread_id: str | None = codex_session_id
@@ -2246,6 +2312,9 @@ def _stream_codex(prompt: str, workdir: str, codex_session_id: str | None,
     fail_detail: str | None = None
     try:
         for line in proc.stdout:  # line-buffered: yields as codex emits each frame
+            # Never keep reading past the watchdog (see _stream_claude).
+            if timed_out.is_set():
+                break
             line = line.strip()
             if not line:
                 continue
@@ -2296,10 +2365,15 @@ def _stream_codex(prompt: str, workdir: str, codex_session_id: str | None,
                     yield sse({"type": "text", "text": f"\n_{note[:300]}_\n"})
         proc.wait(timeout=30)
     except Exception as exc:  # noqa: BLE001
-        yield sse({"type": "error", "error": str(exc)[:600]})
-        return
+        # A kill-driven unwind must still reach the timeout frames below
+        # (see _stream_claude).
+        if not timed_out.is_set():
+            yield sse({"type": "error", "error": str(exc)[:600]})
+            return
     finally:
         watchdog.cancel()
+        if timed_out.is_set():
+            _reap_after_kill(proc)
     if timed_out.is_set():
         err = f"codex timed out after {turn_timeout_s}s"
         yield sse({"type": "error", "error": err})
@@ -2398,17 +2472,23 @@ def _stream_kiro(prompt: str, workdir: str, kiro_session_id: str | None,
     env = _kiro_env(workdir)
     proc = subprocess.Popen(_kiro_args(prompt, kiro_session_id), cwd=workdir, env=env,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                            stdin=subprocess.DEVNULL, bufsize=1)
+                            stdin=subprocess.DEVNULL, bufsize=1, start_new_session=True)
+    # Group kill, not proc.kill(): `kiro-cli chat` re-execs as a kiro-cli-chat
+    # CHILD which inherits this stdout pipe, so killing the launcher alone left
+    # the read loop waiting on an EOF that never came (TEAM-4389).
     timed_out = threading.Event()
 
     def _kill_on_timeout():
         timed_out.set()
-        proc.kill()
+        _kill_coding_proc_group(proc)
     watchdog = threading.Timer(turn_timeout_s, _kill_on_timeout)
     watchdog.start()
     full_text: list[str] = []
     try:
         for line in proc.stdout:
+            # Never keep reading past the watchdog (see _stream_claude).
+            if timed_out.is_set():
+                break
             clean = _ANSI_RE.sub("", line)
             if not clean.strip():
                 continue
@@ -2416,10 +2496,15 @@ def _stream_kiro(prompt: str, workdir: str, kiro_session_id: str | None,
             yield sse({"type": "text", "text": clean})
         proc.wait(timeout=30)
     except Exception as exc:  # noqa: BLE001
-        yield sse({"type": "error", "error": str(exc)[:600]})
-        return
+        # A kill-driven unwind must still reach the timeout frames below
+        # (see _stream_claude).
+        if not timed_out.is_set():
+            yield sse({"type": "error", "error": str(exc)[:600]})
+            return
     finally:
         watchdog.cancel()
+        if timed_out.is_set():
+            _reap_after_kill(proc)
     if timed_out.is_set():
         err = f"kiro timed out after {turn_timeout_s}s"
         yield sse({"type": "error", "error": err})
