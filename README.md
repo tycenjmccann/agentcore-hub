@@ -503,7 +503,15 @@ The project workflow must have exactly these 6 statuses with transitions between
 To configure:
 1. Go to **Project Settings → Board → Workflow**
 2. Add all 6 statuses as columns
-3. Every status must be able to transition to every other status (all-to-all)
+3. Every status must be able to transition to every other status (all-to-all). In the team-managed workflow editor that means each status — **including `Blocked`** — is a *global* transition ("Allow all statuses to move to this status"). A team-managed project created from the default template gives `Blocked` only a `To Do → Blocked` transition; with that, ticket creation works but every human **Request changes** (`In Review → Blocked`) is refused with `No transition to "Blocked" found` and the gate cannot be sent back (incident 2026-09-10, TEAM-4343).
+
+Verify on any ticket that is `In Review` (or `In Progress`):
+
+```bash
+curl -s -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
+  "https://$JIRA_SITE_URL/rest/api/3/issue/<KEY>/transitions" | jq -r '.transitions[].to.name'
+# must list all six, Blocked included
+```
 
 > **Note:** This is the only supported workflow configuration. Other Jira workflow setups will not work.
 

@@ -51,6 +51,16 @@ Changes on top of the imported baseline:
   "View commit" link buttons. All best-effort — failures fall back to the terse
   message.
 
+- **Gate rework notes (2026-09-10)** — a ❌ Request changes tap parks a 24h
+  marker; the chat's next plain message(s) — or a reply to the gate ping at any
+  time, keyboard or not (`wf:` label fallback) — are buffered like a report and
+  delivered as ONE `in_review → blocked` comment. The marker is cleared only
+  after the transition lands; a refusal (e.g. Jira workflow missing a `→ Blocked`
+  transition) parks the note WITH the marker and offers Retry / Drop, so a
+  re-typed note can never fall through to bug intake. A stray `DECISION:` line
+  with no gate waiting gets a hint instead of being filed. See
+  `__tests__/gate-rework-note.test.mjs`.
+
 ## Architecture
 
 Polling, not webhook — the account blocks public Lambda URLs (and an open webhook
