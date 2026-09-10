@@ -48,8 +48,10 @@ it here:
 - anything else (`github-actions-proxy`, `unverified`, no record, or
   `ci_head_sha` != your head) → the build dimension is UNVERIFIED. Do not
   verdict and do NOT call `report_completion` — it Dones your ticket and
-  releases Ship onto an uncertified head. If no `CI (re-cert)` ticket of yours
-  exists for THIS head, file ONE exactly as in FAIL below but with
+  releases Ship onto an uncertified head. If you have not yet filed a
+  `CI (re-cert)` for THIS head in the current attempt — a new attempt begins
+  each time a human Dones your escalation gate, so a post-repair re-cert is
+  always allowed — file ONE exactly as in FAIL below but with
   `blocked_by: ""` (nothing to wait for — it runs now) and PARK on it; when it
   closes you are re-invoked and re-read the newest record. If that record is
   STILL not `certified` (this deployment cannot start builds), escalate exactly
