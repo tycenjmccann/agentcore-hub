@@ -115,6 +115,14 @@ export function createCascade(deps) {
     workflowsTable,
     redispatch,
     reawakenGate,
+    // TEAM-4368 F1 — the ONE thing handleHumanReviewGate does BEFORE it touches
+    // the board (index.mjs skipShipGateForHandoff): resolve a ship gate whose repo
+    // is not in the CD registry. A gate can stop applying WHILE it sits in front
+    // of a human (the registry is re-read every 60s), so the open-notification
+    // short-circuit below has to give it a chance — it is the same function, not a
+    // second copy of the rule. Returns true when it resolved the gate Done.
+    // Unwired = plain review-noop (PR #497 behaviour).
+    resolveGateIfObsolete,
     // TEAM-3755 F9 — STRONGLY-CONSISTENT single-ticket read, used to confirm a
     // dependent's blockers really are resolved before the event path steals a
     // lease and re-dispatches (the snapshot that got us here is an eventually-
@@ -489,16 +497,27 @@ export function createCascade(deps) {
    * reconcile sweep (rate(1 minute)) only to reach the same review-noop.
    */
   async function handleInReviewDependent(sibling, unblockedBy, workflow, m, mode = "enforce") {
+    // TEAM-4368 — read-only (the workflow row we were handed), so it is evaluated
+    // in BOTH modes and ABOVE the mode branch: enforce does not re-wake a gate a
+    // human already holds, so a shadow would-review for it is a false
+    // CascadeWouldReviewReawaken / ReconcileWouldRedispatch (F2). Same rule the F9
+    // blocker confirm follows. Zero side effects on this path: no gate call, so no
+    // status write, no notification CAS, no event, no metric.
+    if (hasOpenReviewNotification(workflow, sibling.ticketId)) {
+      // F1 — ...but the gate may no longer APPLY. Resolving it is a WRITE, so only
+      // enforce does it; both modes then report the same no-op outcome.
+      if (mode === "enforce" && resolveGateIfObsolete
+          && (await resolveGateIfObsolete(sibling.ticketId, workflow))) {
+        log(`[orchestrator] cascade gate resolved without a re-wake (no longer applies — CD handoff) — ${sibling.ticketId}`);
+        return "review-noop";
+      }
+      log(`[orchestrator] cascade review re-wake skipped (open review notification — gate already with a human) — ${sibling.ticketId}`);
+      return "review-noop";
+    }
     if (mode !== "enforce") {
       m.wouldReviewReawaken++;
       log(`[orchestrator] cascade would-reawaken (shadow) — ${sibling.ticketId}`);
       return "would-review";
-    }
-    // TEAM-4368 — zero side effects when a human already holds this gate: no
-    // gate call, so no status write, no notification CAS, no event, no metric.
-    if (hasOpenReviewNotification(workflow, sibling.ticketId)) {
-      log(`[orchestrator] cascade review re-wake skipped (open review notification — gate already with a human) — ${sibling.ticketId}`);
-      return "review-noop";
     }
     // Idempotent re-wake (Finding 2 / TEAM-3684). The guard above is a snapshot
     // pre-filter, NOT the arbiter: a snapshot that misses a notification still

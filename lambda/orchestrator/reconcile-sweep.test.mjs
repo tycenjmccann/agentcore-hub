@@ -80,6 +80,9 @@ function makeCascade(overrides = {}) {
     workflowsTable: "workflows",
     redispatch,
     reawakenGate,
+    // TEAM-4368 F1 (index.mjs skipShipGateForHandoff) — unwired unless a test asks
+    // for it, so every existing case behaves exactly as before.
+    ...(overrides.resolveGateIfObsolete ? { resolveGateIfObsolete: overrides.resolveGateIfObsolete } : {}),
     ...(overrides.store ? { store: overrides.store } : {}),
     ...(overrides.blockTicket ? { blockTicket: overrides.blockTicket } : {}),
     // TEAM-4120 FR-3: unwired by default, exactly as production is with
@@ -806,6 +809,36 @@ describe("TEAM-4368 — a gate already presented to a human is a candidate but a
     expect(eventsOfType(s.publishEvent, "review.reawakened")).toHaveLength(0);
     expect(records[0].ReconcileReviewReawaken).toBe(0);
     expect(records[0].ReconcileNoop).toBe(1);
+  });
+
+  // TEAM-4368 F1 (TEAM-4382) — the no-op above must still give the gate's own
+  // handoff resolution (index.mjs skipShipGateForHandoff, injected as
+  // resolveGateIfObsolete) a chance: a Merge Approval gate whose repo left the CD
+  // registry AFTER it was paged is resolved Done by that call, not stranded
+  // in_review. Still tallied as a no-op — the resolution journals itself
+  // (cd.handoff_skip) and the sweep re-drove nothing.
+  it("B6 …and a gate that no longer applies is resolved by the injected handoff check, still tallied noop", async () => {
+    const jiraTransition = vi.fn(async () => {});
+    const resolveGateIfObsolete = vi.fn(async () => true);
+    const s = makeSweep({
+      workflows: [workflow({
+        humanNotifications: [{ id: "n1", type: "review_needed", ticketId: GATE, acknowledged: false }],
+      })],
+      siblings: gateSiblings,
+      reawakenGate: gateFake(jiraTransition),
+      resolveGateIfObsolete,
+    });
+
+    const m = await s.runSweep("enforce");
+
+    expect(m.candidates).toBe(1);
+    expect(m.noop).toBe(1);
+    expect(m.reviewReawakened).toBe(0);
+    expect(resolveGateIfObsolete).toHaveBeenCalledTimes(1);
+    expect(resolveGateIfObsolete.mock.calls[0][0]).toBe(GATE);
+    expect(s.reawakenGate).not.toHaveBeenCalled();
+    expect(jiraTransition).not.toHaveBeenCalled();
+    expect(eventsOfType(s.publishEvent, "review.reawakened")).toHaveLength(0);
   });
 
   it("positive control — same gate with no open notification → re-woken once", async () => {

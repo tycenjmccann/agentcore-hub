@@ -484,6 +484,11 @@ function getCascade() {
     workflowsTable: WORKFLOWS_TABLE,
     redispatch: redispatchTicket,
     reawakenGate: handleHumanReviewGate,
+    // TEAM-4368 F1 — the gate's own first action, reachable from the cascade's
+    // open-notification short-circuit: an already-paged Merge Approval gate whose
+    // repo has since left the CD registry is still resolved Done (+ cd.handoff_skip)
+    // instead of being stranded in_review.
+    resolveGateIfObsolete: skipShipGateForHandoff,
     // TEAM-3755 F9 — the strongly-consistent blocker confirm the extended-state
     // event path runs before it steals a lease and re-dispatches.
     getTicketConsistent,
@@ -1435,6 +1440,10 @@ async function handleHumanReviewGate(ticketId, assignee, workflow) {
 
   // CD HANDOFF: a Merge Approval gate on a repo the hub does not deploy has
   // nothing to approve — nobody here merges. Resolve it instead of paging a human.
+  // ORDERING CONTRACT (TEAM-4368 F1): this runs BEFORE the "In Review" write, and
+  // the cascade short-circuits an already-paged gate before it ever calls this
+  // function — so it is injected there separately (getCascade resolveGateIfObsolete).
+  // Anything added ahead of the status write must be reachable from that guard too.
   if (workflow && (await skipShipGateForHandoff(ticketId, workflow))) return false;
 
   // Park the ticket in "in_review" (idempotent — setting it again is a no-op).
