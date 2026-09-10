@@ -6,7 +6,8 @@ import WorkflowBoard from "@/components/workflow/WorkflowBoard";
 import WorkflowManagerChat from "@/components/workflow/WorkflowManagerChat";
 import IntakeForm from "@/components/workflow/IntakeForm";
 import PerformanceCard from "@/components/workflow/PerformanceCard";
-import { type WorkflowState, type WorkflowInput, isTerminalPhase } from "@/lib/workflow/types";
+import { type WorkflowState, type WorkflowInput, type HumanNotification, isTerminalPhase } from "@/lib/workflow/types";
+import { mergeCommitOf, isAwaitingHuman, waitingApprovalShas } from "@/lib/workflow/deploy-gate";
 import { WORKFLOW_DEFS, DEFAULT_WORKFLOW_DEF_ID, getWorkflowDef } from "@/lib/workflow/workflow-defs";
 import { resolveSdlcFramework, SDLC_BADGE_META } from "@/lib/workflow/sdlc-framework";
 import DeleteConfirmationModal from "@/components/workflow/DeleteConfirmationModal";
@@ -21,6 +22,10 @@ interface WorkflowSummary {
   workflowType?: "feature" | "bug";
   workflowDefId?: string;
   sdlcFramework?: "playbook" | "aidlc";
+  /** Open human gates on this run (TEAM-4403) — the phase pill lies while one is open. */
+  humanNotifications?: HumanNotification[];
+  /** Ship-phase merge commit, matched against a parked CD execution (TEAM-4403). */
+  mergeCommit?: string;
 }
 
 function BugIcon({ className }: { className?: string }) {
@@ -89,6 +94,11 @@ export default function WorkflowPage() {
           // The summary is a client-side pick of the raw DDB item (the list API
           // returns items unprojected) — carry sdlcFramework so the badge has data.
           sdlcFramework: w.sdlcFramework ?? w.input?.sdlcFramework,
+          // TEAM-4403: both are already on the wire for the same reason (the list
+          // API projects nothing), so the sidebar can tell a run is waiting on a
+          // human without a per-run fetch and without any API change.
+          humanNotifications: w.humanNotifications,
+          mergeCommit: mergeCommitOf(w.agentTasks),
         }))
         .filter((w: WorkflowSummary) => w.id);
       // Sort: active first, then by date descending
@@ -108,6 +118,31 @@ export default function WorkflowPage() {
     const interval = setInterval(fetchWorkflows, 5000);
     return () => clearInterval(interval);
   }, [fetchWorkflows]);
+
+  // TEAM-4403 signal (b): source commits of every CD execution currently parked at
+  // a ManualApproval. A run whose merge commit is in this set is waiting on a human
+  // even though no ticket says so, and its phase pill would otherwise read
+  // "verification". One unscoped read serves the whole sidebar — a commit SHA is
+  // globally unique, so it attributes an execution to a run on its own without any
+  // repo scoping. Only fetched while some active run has actually merged, so an
+  // install with no pipeline module (or no shipped run) makes no request at all.
+  const [approvalShas, setApprovalShas] = useState<string[]>([]);
+  const anyMerged = workflows.some((w) => w.mergeCommit && !isTerminalPhase(w.phase));
+  useEffect(() => {
+    if (!anyMerged) { setApprovalShas([]); return; }
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const res = await fetch("/api/pipeline/status", { cache: "no-store" });
+        if (!res.ok) return;
+        const data = await res.json();
+        if (!cancelled) setApprovalShas(waitingApprovalShas(data.pipelines));
+      } catch { /* pipeline module may be absent — silent */ }
+    };
+    poll();
+    const id = setInterval(poll, 20000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, [anyMerged]);
 
   // Check URL for pre-selected workflow
   useEffect(() => {
@@ -157,7 +192,19 @@ export default function WorkflowPage() {
     );
   });
 
-  const activeWorkflows = filtered.filter((w) => !isTerminalPhase(w.phase));
+  // TEAM-4403: runs blocked on a person float to the top of Active. They are the
+  // only ones that will not move on their own, so they are the only ones worth
+  // scanning for. Sorted here rather than in fetchWorkflows because the parked-
+  // execution SHAs arrive from a second, slower poll; ties keep the list's existing
+  // date-descending order.
+  const activeWorkflows = filtered
+    .filter((w) => !isTerminalPhase(w.phase))
+    .sort((a, b) => {
+      const aWaiting = isAwaitingHuman(a, approvalShas) ? 1 : 0;
+      const bWaiting = isAwaitingHuman(b, approvalShas) ? 1 : 0;
+      if (aWaiting !== bWaiting) return bWaiting - aWaiting;
+      return new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime();
+    });
   const pastWorkflows = filtered.filter((w) => isTerminalPhase(w.phase));
 
   const handleSelectWorkflow = (id: string) => {
@@ -345,6 +392,7 @@ export default function WorkflowPage() {
                       workflow={w}
                       isSelected={selectedId === w.id}
                       isActive
+                      awaitingHuman={isAwaitingHuman(w, approvalShas)}
                       onClick={() => handleSelectWorkflow(w.id)}
                       onNudge={handleNudge}
                       onArchive={handleArchive}
@@ -488,6 +536,7 @@ function WorkflowListItem({
   workflow,
   isSelected,
   isActive,
+  awaitingHuman,
   onClick,
   onNudge,
   onArchive,
@@ -496,6 +545,8 @@ function WorkflowListItem({
   workflow: WorkflowSummary;
   isSelected: boolean;
   isActive?: boolean;
+  /** TEAM-4403 — an open review gate, or this run's own parked deploy execution. */
+  awaitingHuman?: boolean;
   onClick: () => void;
   onNudge?: (id: string) => void;
   onArchive?: (id: string) => void;
@@ -503,6 +554,11 @@ function WorkflowListItem({
 }) {
   const isBug = workflow.workflowType === "bug";
   const isRunning = !isTerminalPhase(workflow.phase);
+  // A run parked on a person is not "running" in any sense a human cares about, so
+  // it reads "approval" in the deploy-gate's amber rather than its phase in green.
+  // Same palette as .deploy-gate-item on the board, so the sidebar and the banner
+  // are recognisably the same signal (TEAM-4403).
+  const waiting = !!awaitingHuman && isRunning;
   const timeStr = formatRelativeTime(workflow.startedAt);
   const def = getWorkflowDef(workflow.workflowDefId);
   const defLabel = def.displayName || def.name;
@@ -522,9 +578,9 @@ function WorkflowListItem({
         <div className="mt-1 flex-shrink-0">
           {isRunning ? (
             <div className="relative">
-              <Radio className="w-3.5 h-3.5 text-green-400" />
+              <Radio className={`w-3.5 h-3.5 ${waiting ? "text-amber-400" : "text-green-400"}`} />
               <div className="absolute inset-0 animate-ping">
-                <Radio className="w-3.5 h-3.5 text-green-400 opacity-30" />
+                <Radio className={`w-3.5 h-3.5 opacity-30 ${waiting ? "text-amber-400" : "text-green-400"}`} />
               </div>
             </div>
           ) : workflow.phase === "error" ? (
@@ -549,9 +605,23 @@ function WorkflowListItem({
           </div>
           {isRunning && (
             <div className="flex items-center gap-1.5 mt-1">
-              <span className="text-[9px] px-1.5 py-0.5 rounded bg-green-500/10 text-green-400 border border-green-500/20 font-medium uppercase tracking-wider">
-                {workflow.phase}
-              </span>
+              {waiting ? (
+                <span
+                  className="text-[9px] px-1.5 py-0.5 rounded font-medium uppercase tracking-wider"
+                  style={{
+                    border: "1px solid rgba(245,158,11,0.55)",
+                    background: "rgba(245,158,11,0.10)",
+                    color: "#fbbf24",
+                  }}
+                  title="Waiting on a human — an open review gate or a parked production deploy"
+                >
+                  approval
+                </span>
+              ) : (
+                <span className="text-[9px] px-1.5 py-0.5 rounded bg-green-500/10 text-green-400 border border-green-500/20 font-medium uppercase tracking-wider">
+                  {workflow.phase}
+                </span>
+              )}
               {onNudge && (
                 <button
                   onClick={(e) => { e.stopPropagation(); onNudge(workflow.id); }}
