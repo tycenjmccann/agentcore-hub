@@ -458,7 +458,7 @@ Fixing the internal bug makes Harness viable for simple agents. Fixing the LB ti
    (Only tickets that become "todo" with empty blockedBy get invoked)
 
 5. Design agents complete → mark "done" → Stream cascades to dev agents
-   ... and so on through QA → CI → workflow complete
+   ... and so on through CI → QA → workflow complete
 ```
 
 **Race condition fix (free)**:
@@ -503,7 +503,7 @@ Switch: disable Streams, point Jira webhooks at `/api/workflow/webhook`, set `TI
 **Solution**: Workflow start creates ONLY epic + requirements ticket. The requirements agent:
 - Analyzes the feature scope
 - Creates tickets for ONLY the agents whose domains are relevant
-- Sets `blocked_by` dependencies between phases (design → dev → QA → CI)
+- Sets `blocked_by` dependencies between phases (design → dev → review → CI → QA)
 - Each ticket INSERT fires the DynamoDB Stream → orchestrator invokes that agent
 
 **Key principle**: Ticket = work assignment. No ticket = no work. The requirements agent is the PM.

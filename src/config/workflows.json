@@ -6,7 +6,7 @@
       "type": "feature",
       "name": "Software Delivery",
       "displayName": "SDLC",
-      "description": "Autonomous feature/bug pipeline: requirements analysis, parallel design, development, QA verification, CI, and a release manager that reviews the final PR \u2014 a human approves the merge, then it merges and deploys per the repo's DEPLOY.md.",
+      "description": "Autonomous feature/bug pipeline: requirements analysis, parallel design, development, CI certification, QA verification, and a release manager that reviews the final PR \u2014 a human approves the merge, then it merges and deploys per the repo's DEPLOY.md.",
       "icon": "GitPullRequest",
       "intakeAgentId": "agentcore_hub_requirements_analyst",
       "requiresRepo": true,

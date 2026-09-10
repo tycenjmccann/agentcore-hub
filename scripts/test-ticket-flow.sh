@@ -62,17 +62,18 @@ This is a workflow end-to-end test. Each agent is being given a minimal task to 
 ## REQUIREMENTS AGENT — YOUR STEPS:
 
 1. Load skill `requirements-analysis`
-2. Create EXACTLY these 5 tickets using `Tickets___create_ticket`. Each ticket's description must contain the exact instructions for that agent shown in the section below — copy-paste the relevant block.
+2. Create EXACTLY these 6 tickets using `Tickets___create_ticket`. Each ticket's description must contain the exact instructions for that agent shown in the section below — copy-paste the relevant block.
 
    **Ticket 1:** summary="Design: Frontend Designer", assignee="agentcore_hub_frontend_designer", blocked_by=[YOUR_TICKET_ID]
    **Ticket 2:** summary="Review: Security Reviewer", assignee="agentcore_hub_security_reviewer", blocked_by=[YOUR_TICKET_ID]
    **Ticket 3:** summary="Review: Legal Compliance", assignee="agentcore_hub_legal_compliance", blocked_by=[YOUR_TICKET_ID]
    **Ticket 4:** summary="Dev: Frontend Dev", assignee="agentcore_hub_frontend_dev", blocked_by=[TICKET_1, TICKET_2, TICKET_3]
-   **Ticket 5:** summary="QA: Verifier", assignee="agentcore_hub_qa_verifier", blocked_by=[TICKET_4]
+   **Ticket 5:** summary="CI: Agent — connectivity check", assignee="agentcore_hub_ci_agent", blocked_by=[TICKET_4]
+   **Ticket 6:** summary="QA: Verifier", assignee="agentcore_hub_qa_verifier", blocked_by=[TICKET_5]
 
-   Do NOT create a CI ticket — QA will create it.
+   CI runs BEFORE QA (CI certifies the head, QA reads the certified build) — the same order the real chain uses.
 
-3. Save artifact to S3: `workflows/{workflowId}/agents/agentcore_hub_requirements_analyst/test-pass.md` with content "Requirements connectivity check — created 5 tickets"
+3. Save artifact to S3: `workflows/{workflowId}/agents/agentcore_hub_requirements_analyst/test-pass.md` with content "Requirements connectivity check — created 6 tickets"
 4. Call `WorkflowOutput___report_completion`
 
 ---
@@ -119,21 +120,21 @@ Connectivity check — Frontend Dev:
 Do not write code. Do not clone repos.
 ```
 
-### For QA Verifier (Ticket 5):
+### For CI Agent (Ticket 5):
+```
+Connectivity check — CI Agent:
+1. Load skill `ci-verification`
+2. Save to S3: workflows/{workflowId}/agents/agentcore_hub_ci_agent/test-pass.md — content: "CI connectivity check passed"
+3. Call WorkflowOutput___report_completion
+Do not write code. Do not clone repos.
+```
+
+### For QA Verifier (Ticket 6):
 ```
 Connectivity check — QA Verifier:
 1. Load skill `qa-verification`
-2. Create the CI ticket using Tickets___create_ticket:
-   - summary: "CI: Agent — connectivity check"
-   - assignee: "agentcore_hub_ci_agent"
-   - blocked_by: [YOUR_TICKET_ID]
-   - description: |
-     Connectivity check — CI Agent:
-     1. Load skill `ci-verification`
-     2. Save to S3: workflows/{workflowId}/agents/agentcore_hub_ci_agent/test-pass.md — content: "CI connectivity check passed"
-     3. Call WorkflowOutput___report_completion
-     Do not write code. Do not clone repos.
-3. Save to S3: workflows/{workflowId}/agents/agentcore_hub_qa_verifier/test-pass.md — content: "QA connectivity check passed — CI ticket created"
+2. Confirm the CI ticket (your blocker) is Done and its completion record exists at completions/<ci-ticket>.json
+3. Save to S3: workflows/{workflowId}/agents/agentcore_hub_qa_verifier/test-pass.md — content: "QA connectivity check passed — CI record read"
 4. Call WorkflowOutput___report_completion
 Do not write code. Do not clone repos.
 ```
@@ -141,7 +142,7 @@ Do not write code. Do not clone repos.
 ---
 
 ## EXPECTED FLOW:
-Requirements → Design + Security + Legal (parallel) → Dev → QA → CI → Complete
+Requirements → Design + Security + Legal (parallel) → Dev → CI → QA → Complete
 ENDDESC
 
 # Substitute the repo URL placeholder
@@ -249,16 +250,18 @@ while true; do
     echo "$STATE" | jq '{phase, completedAt, taskCount: (.agentTasks | length), tasks: [.agentTasks | to_entries[] | {ticket: .key, agent: .value.agentId, status: .value.status}]}' 2>/dev/null
     echo ""
 
-    # Check if all dynamic tickets were created (should be 9: 6 req + 3 from QA)
-    if [ "$TASK_COUNT" -ge 9 ]; then
-      echo "  ✓ Full fix-it loop validated! (fix-it → QA rerun → CI)"
-    elif [ "$TASK_COUNT" -ge 8 ]; then
-      echo "  ⚠ Partial: got $TASK_COUNT tickets (expected 9: 6 initial + 3 from QA)"
-    else
-      echo "  ⚠ Expected 9 tickets but got $TASK_COUNT"
+    # Expect 7 tasks: the requirements ticket + its 6 children (design, security,
+    # legal, dev, CI, QA). CI must be Done and QA must have run after it.
+    CI_DONE=$(echo "$STATE" | jq -r '[.agentTasks | to_entries[] | select(.value.agentId=="agentcore_hub_ci_agent" and .value.status=="done")] | length' 2>/dev/null || echo 0)
+    QA_DONE=$(echo "$STATE" | jq -r '[.agentTasks | to_entries[] | select(.value.agentId=="agentcore_hub_qa_verifier" and .value.status=="done")] | length' 2>/dev/null || echo 0)
+    if [ "$TASK_COUNT" -ge 7 ] && [ "$CI_DONE" -ge 1 ] && [ "$QA_DONE" -ge 1 ]; then
+      echo "  ✓ Chain validated: Dev → CI → QA ($TASK_COUNT tickets, CI done=$CI_DONE, QA done=$QA_DONE)"
+      echo ""
+      exit 0
     fi
+    echo "  ✗ Expected 7 tickets with CI and QA both done; got $TASK_COUNT tickets (CI done=$CI_DONE, QA done=$QA_DONE)"
     echo ""
-    exit 0
+    exit 1
   fi
 
   # Timeout after 15 minutes

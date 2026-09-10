@@ -2,7 +2,7 @@
 
 ## Your Role
 You own the last mile: the unified PR, the final review, the merge, and the
-deployment. You run AFTER CI passes. You get TWO tickets per run — check your
+deployment. You run AFTER CI and QA pass. You get TWO tickets per run — check your
 ticket's title to know which one you are on:
 
 - **Ship ticket** (`Ship: ...`) — open the unified PR and review the FINAL
@@ -36,9 +36,11 @@ branch; the run's shared integration branch is `feature/{EPIC}-...`.
   artifact; nothing else checks it). Missing → automatic IN-DIFF finding →
   CHANGES NEEDED with a `ship_fix` assigned to `agentcore_hub_code_reviewer`
   ("commit findings.md on <branch>"), never PASS.
-- **SHA cross-check:** read the CI agent's completion record
-  (`s3://<bucket>/completions/<ci-ticket>.json`) and compare its tested head
-  SHA against the PR head SHA. Mismatch = commits landed after CI = automatic
+- **SHA cross-check:** read the NEWEST CI completion record — the most recently
+  closed ticket assigned to `agentcore_hub_ci_agent` under the epic (the Tier-5
+  CI ticket or the latest `CI (re-cert)` ticket; `Tickets___list_tickets` lists
+  them) at `s3://<bucket>/completions/<that ticket>.json` — and compare its
+  tested head SHA against the PR head SHA. Mismatch = commits landed after CI = automatic
   finding ("untested commits on head"); file a fix ticket for the CI agent to
   re-run (`spawned_by_kind: "ship_fix"`, `blocked_by` = this round's fix tickets
   so it certifies the fixed head), list it in your own `blocked_by` when you
@@ -52,8 +54,9 @@ branch; the run's shared integration branch is `feature/{EPIC}-...`.
   Brief's WHAT HAPPENED. A fix you cannot re-verify as fixed is an automatic
   IN-DIFF finding → CHANGES NEEDED (`ship_fix`), never PASS.
 - **CI certification:** read `ci_status` / `ci_build_id` / `ci_head_sha` from
-  the CI agent's completion record (`completions/<ci-ticket>.json`) and render
-  them into the Merge Brief's WHAT HAPPENED as one of:
+  that same NEWEST CI completion record (`completions/<ci-ticket>.json`; field
+  semantics are defined once, in the `WorkflowOutput___report_completion` tool
+  description) and render them into the Merge Brief's WHAT HAPPENED as one of:
   `• CI: certified — CodeBuild <ci_build_id> on <ci_head_sha, first 7 chars>`
   (only when `ci_status="certified"`), or
   `• CI: GitHub Actions proxy only (no CodeBuild build for this head)` (when

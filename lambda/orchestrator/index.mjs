@@ -4218,7 +4218,7 @@ async function bootstrapBugWorkflow(bugTicket) {
   // Jira hard-caps issue summary at 255 chars — long bug titles (users paste the
   // whole complaint) otherwise 400 the create and the workflow never starts.
   const analystSummary = `Requirements: requirements analyst — ${bugTicket.title || bugKey}`.slice(0, 255);
-  const analystDescription = `Analyze the bug report (${bugKey}) and create the bug-fix sub-task chain (Fix → QA → CI). The orchestrator has injected a "THIS IS A BUG REPORT" directive — load the bug-fix-requirements blueprint.\n\n${bugTicket.description || ""}`;
+  const analystDescription = `Analyze the bug report (${bugKey}) and create the bug-fix sub-task chain (Fix → Review → CI → QA). The orchestrator has injected a "THIS IS A BUG REPORT" directive — load the bug-fix-requirements blueprint.\n\n${bugTicket.description || ""}`;
 
   const subtaskFields = {
     project: { key: process.env.JIRA_PROJECT_KEY || "TEAM" },

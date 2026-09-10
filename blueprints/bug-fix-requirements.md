@@ -30,7 +30,7 @@ The **Bug ticket itself is the workflow root.** There is no separate Epic wrappe
 - Extract: expected behavior, actual behavior, repro steps, environment, error messages, stack traces.
 - If the report is missing repro steps, comment on the Bug requesting them and STOP. Do not guess.
 
-**Exception — synthetic pipeline-test tickets:** If the Bug ticket explicitly requests creation of the sub-task chain, or carries a synthetic/pipeline-test label, there is no defect to reproduce: proceed to create the standard fix → review → QA → CI sub-task chain and note in bug-analysis.md that repro steps are N/A for a synthetic ticket. This exception applies ONLY when one of those objective triggers is present — a genuine bug report that merely lacks repro steps still gets the comment-and-STOP treatment above.
+**Exception — synthetic pipeline-test tickets:** If the Bug ticket explicitly requests creation of the sub-task chain, or carries a synthetic/pipeline-test label, there is no defect to reproduce: proceed to create the standard fix → review → CI → QA sub-task chain and note in bug-analysis.md that repro steps are N/A for a synthetic ticket. This exception applies ONLY when one of those objective triggers is present — a genuine bug report that merely lacks repro steps still gets the comment-and-STOP treatment above.
 
 ### Step 2: Triage and Hypothesize
 You do NOT have code-reading tools — your job is triage and dispatch, not root-cause-in-code. The dev agent will do the deep code investigation.
@@ -80,7 +80,7 @@ assignees already present:
 - If none exist, create the full chain below.
 
 Create the sub-tasks — no design phase, no top-level tickets. The chain
-is fix → code review → QA → CI → ship → merge approval → CD:
+is fix → code review → CI → QA → ship → merge approval → CD:
 
 1. **Fix sub-task**
    - `assignee`: `agentcore_hub_bug_fixer`
@@ -113,7 +113,17 @@ is fix → code review → QA → CI → ship → merge approval → CD:
    - `ticket_type`: `"subtask"`
    - `blocked_by`: `{dev-fix-subtask-key}`
 
-3. **QA verification sub-task**
+3. **CI sub-task**
+   - `assignee`: `agentcore_hub_ci_agent`
+   - `title`: `CI: {one-line description}`
+   - `description`: sync the default branch into the fix branch, then certify
+     the head on the CodeBuild PR-check and record `ci_status` in the completion
+     record. Runs BEFORE QA so QA reads one certified build instead of re-running it.
+   - `parent_id`: the Bug's key
+   - `ticket_type`: `"subtask"`
+   - `blocked_by`: `{code-review-subtask-key}`
+
+4. **QA verification sub-task**
    - `assignee`: `agentcore_hub_qa_verifier`
    - `title`: `Verify fix: {one-line description}`
    - `description`:
@@ -123,17 +133,11 @@ is fix → code review → QA → CI → ship → merge approval → CD:
      - **Required for performance bugs:** independently reproduce the dev's
        before/after measurement and count the whole symptom surface — the
        measured delta is the acceptance criterion, not the test suite
-     - Standard build + visual checks
+     - Visual + acceptance checks; the compile/test proof comes from the CI
+       sub-task's completion record (`completions/{ci-key}.json`), not a re-run
    - `parent_id`: the Bug's key
    - `ticket_type`: `"subtask"`
-   - `blocked_by`: `{code-review-subtask-key}`
-
-4. **CI sub-task**
-   - `assignee`: `agentcore_hub_ci_agent`
-   - `title`: `CI: {one-line description}`
-   - `parent_id`: the Bug's key
-   - `ticket_type`: `"subtask"`
-   - `blocked_by`: `{qa-subtask-key}`
+   - `blocked_by`: `{ci-subtask-key}`
 
 5. **Ship sub-task** (final PR review)
    - `assignee`: `agentcore_hub_release_manager`
@@ -142,7 +146,7 @@ is fix → code review → QA → CI → ship → merge approval → CD:
      the final assembled diff per the release-manager blueprint
    - `parent_id`: the Bug's key
    - `ticket_type`: `"subtask"`
-   - `blocked_by`: `{ci-subtask-key}`
+   - `blocked_by`: `{qa-subtask-key}`
 
 6. **Merge Approval gate sub-task** (from ## Human Review Gates in your context)
    - `assignee`: the exact `human:<…>` string given for the "Merge Approval" gate
@@ -165,7 +169,7 @@ is fix → code review → QA → CI → ship → merge approval → CD:
   sub-task per assignee (exception: `agentcore_hub_release_manager` has TWO — Ship + CD). If any
   assignee appears twice, you created a duplicate chain: `Tickets___add_comment` on the Bug flagging
   the duplicate keys and report the anomaly in `report_completion` instead of leaving it silent.
-- Comment on the Bug ticket: "Bug-fix flow — assigned to {dev-agent}. Root cause hypothesis: {one-line}. Sub-task chain: {fix-key} (fix) → {review-key} (review) → {qa-key} (QA) → {ci-key} (CI) → {ship-key} (ship) → {gate-key} (merge approval) → {cd-key} (CD)."
+- Comment on the Bug ticket: "Bug-fix flow — assigned to {dev-agent}. Root cause hypothesis: {one-line}. Sub-task chain: {fix-key} (fix) → {review-key} (review) → {ci-key} (CI) → {qa-key} (QA) → {ship-key} (ship) → {gate-key} (merge approval) → {cd-key} (CD)."
 - Transition your own sub-task to `done`
 - `WorkflowOutput___report_completion`
 
@@ -183,4 +187,4 @@ is fix → code review → QA → CI → ship → merge approval → CD:
 - DO NOT default to "rewrite the component" — surgical change first
 
 ## Output Format Recap
-Four sub-tasks created under the Bug (fix → code review → QA → CI), all assigned as: fix → `agentcore_hub_bug_fixer`, review → `agentcore_hub_code_reviewer`, QA → `agentcore_hub_qa_verifier`, CI → `agentcore_hub_ci_agent`. One bug-analysis.md saved to S3, one comment on the Bug, your sub-task transitioned to done.
+Four sub-tasks created under the Bug (fix → code review → CI → QA), all assigned as: fix → `agentcore_hub_bug_fixer`, review → `agentcore_hub_code_reviewer`, CI → `agentcore_hub_ci_agent`, QA → `agentcore_hub_qa_verifier`. One bug-analysis.md saved to S3, one comment on the Bug, your sub-task transitioned to done.

@@ -254,8 +254,8 @@ export function createRegistry({ caseDef, repoRoot, workspaceDir }) {
       "Create a new ticket in the project tracker.\n\n" +
         "MANDATORY TICKETS (create these for EVERY workflow, no exceptions):\n" +
         '  - agentcore_hub_code_reviewer: "Review: [feature]" — blocked_by=ALL dev ticket IDs\n' +
-        '  - agentcore_hub_qa_verifier: "QA: Verify [feature]" — blocked_by=code reviewer ticket ID\n' +
-        '  - agentcore_hub_ci_agent: "CI: Validate build and tests for [feature]" — blocked_by=QA ticket ID\n\n' +
+        '  - agentcore_hub_ci_agent: "CI: Validate build and tests for [feature]" — blocked_by=code reviewer ticket ID\n' +
+        '  - agentcore_hub_qa_verifier: "QA: Verify [feature]" — blocked_by=CI ticket ID\n\n' +
         "TICKET TYPE — pick by what the PARENT is: parent is an EPIC → ticket_type=\"task\" " +
         "(the default); parent is a BUG → ticket_type=\"subtask\" (bug-fix runs ONLY). " +
         "Jira REJECTS the wrong pairing. When unsure, the parent is an Epic → use \"task\".",

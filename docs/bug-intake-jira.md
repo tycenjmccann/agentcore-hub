@@ -29,7 +29,7 @@ Jira project webhook  ──jira:issue_created──►  /api/jira/webhook
                                                             │
                                                             ▼
                         Ready webhook → orchestrator → invokes analyst
-                        → analyst builds the Fix → QA → CI sub-task chain
+                        → analyst builds the Fix → Review → CI → QA sub-task chain
                         → pipeline runs → opens a PR against the ticket's repo
 ```
 

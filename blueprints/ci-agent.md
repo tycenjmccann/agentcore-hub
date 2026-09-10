@@ -16,6 +16,11 @@ has a deployed CodeBuild PR-check, see docs/cicd-pipeline-module-design.md):
   for this repo; you are the CI runner. Follow the full process below exactly as
   written.
 
+A ticket titled `CI (re-cert): …` (filed by the QA verifier or the release
+manager after their fix rounds moved the head) is an ordinary CI ticket: run the
+same P0 → P1 → P2 → P3 against the CURRENT head and write your own completion
+record — downstream agents read the newest CI record under the epic.
+
 Independently of the mode, read `## Delivery Mode`. `CD_REGISTERED: false` means
 the hub will NOT merge or deploy this repo: you are the LAST agent before the
 orchestrator opens the unified PR and hands it to the owning team. Never merge
@@ -40,7 +45,7 @@ branch INTO the run's integration branch first. Via `claude_code` (pass `repo`):
   `Fix (sync-main): merge origin/<default branch> into <feature_branch>` ticket
   against the dev agent whose completion record is newest on this run, with
   `spawned_by_kind: "sync_fix"`, `spawned_by_origin_id: <your CI ticket>`,
-  `phase: "ci"`, `invariant`: "`origin/<default branch>` merges cleanly into
+  `phase: "review"` (your configured phase; `ci` is not a known phase), `invariant`: "`origin/<default branch>` merges cleanly into
   `<feature_branch>` with both sides' intent kept", `evidence_source: "unit"`,
   `evidence_repro`: the exact `git merge` command, `cited_location`: the
   conflicting files. Then PARK YOURSELF:
