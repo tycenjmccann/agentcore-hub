@@ -372,9 +372,40 @@ test.describe("Workflow Page — SDLC badge", () => {
     };
   }
 
-  // Mirrors tests/workflow-manager-panel.spec.ts's mockBoardEndpoints — the
-  // minimal set of routes WorkflowBoard needs to reach a settled render.
-  async function mockBoardEndpoints(page: Page, workflows: unknown[], states: Record<string, unknown>) {
+  // Mirrors tests/workflow-manager-panel.spec.ts's mockBoardEndpoints — every
+  // route the page + board can call on the way to a settled render.
+  //
+  // Hermeticity is *proven*, not asserted: the catch-all below is registered
+  // FIRST (Playwright matches the most recently registered route first, so the
+  // specific routes that follow win) and records + hard-fails any
+  // /api/workflow/** request this block does not explicitly mock. `unmocked`
+  // is checked at the end of each test.
+  async function mockBoardEndpoints(
+    page: Page,
+    workflows: unknown[],
+    states: Record<string, unknown>,
+    unmocked: string[]
+  ) {
+    await page.route("**/api/workflow/**", (r) => {
+      const u = new URL(r.request().url());
+      unmocked.push(`${r.request().method()} ${u.pathname}${u.search}`);
+      r.fulfill({
+        status: 599,
+        contentType: "application/json",
+        body: JSON.stringify({ error: "unmocked request — this spec must be hermetic" }),
+      });
+    });
+
+    // Fleet card (empty state, ?days=&defId=) and RunPerformanceCard
+    // (?workflowId=, rendered for a terminal phase). 404 => the run card
+    // renders nothing, which keeps the board deterministic.
+    await page.route("**/api/workflow/performance**", (r) =>
+      r.fulfill({ status: 404, contentType: "application/json", body: JSON.stringify({ error: "no performance data (fixture)" }) }));
+    // Board SSE (useWorkflowStream, enabled whenever not replaying/catching up):
+    // an empty event-stream body — the board keeps rendering the header from the
+    // mocked state, and no live backend is touched.
+    await page.route("**/api/workflow/*/stream**", (r) =>
+      r.fulfill({ status: 200, contentType: "text/event-stream", body: "" }));
     await page.route("**/api/workflow/list", (r) =>
       r.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ workflows }) }));
     await page.route("**/api/workflow/*/state**", (r) => {
@@ -406,9 +437,10 @@ test.describe("Workflow Page — SDLC badge", () => {
     // is "light".
     await page.addInitScript(() => localStorage.setItem("theme", "dark"));
 
+    const unmocked: string[] = [];
     const workflows = [workflowSummary(STANDARD_ID)];
     const states = { [STANDARD_ID]: workflowState(STANDARD_ID) };
-    await mockBoardEndpoints(page, workflows, states);
+    await mockBoardEndpoints(page, workflows, states, unmocked);
 
     await openSidebarAndSelect(page, `SDLC badge fixture ${STANDARD_ID}`);
 
@@ -425,14 +457,17 @@ test.describe("Workflow Page — SDLC badge", () => {
       path: `${SCREENSHOT_DIR}/40-sdlc-badge-absent-standard.png`,
       fullPage: true,
     });
+
+    expect(unmocked, `unmocked /api/workflow calls: ${unmocked.join(" | ")}`).toEqual([]);
   });
 
   test("a run with sdlcFramework: playbook renders the PLAYBOOK badge in both the list and the board", async ({ page }) => {
     await page.addInitScript(() => localStorage.setItem("theme", "dark"));
 
+    const unmocked: string[] = [];
     const workflows = [workflowSummary(PLAYBOOK_ID, "playbook")];
     const states = { [PLAYBOOK_ID]: workflowState(PLAYBOOK_ID, "playbook") };
-    await mockBoardEndpoints(page, workflows, states);
+    await mockBoardEndpoints(page, workflows, states, unmocked);
 
     await openSidebarAndSelect(page, `SDLC badge fixture ${PLAYBOOK_ID}`);
 
@@ -453,5 +488,7 @@ test.describe("Workflow Page — SDLC badge", () => {
       path: `${SCREENSHOT_DIR}/41-sdlc-badge-playbook.png`,
       fullPage: true,
     });
+
+    expect(unmocked, `unmocked /api/workflow calls: ${unmocked.join(" | ")}`).toEqual([]);
   });
 });
