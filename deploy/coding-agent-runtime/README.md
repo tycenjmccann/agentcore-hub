@@ -34,6 +34,22 @@ resume = same runtimeSessionId  → same warm microVM + /mnt/workspace
   (`WORKSPACE_ROOT`), shared by every session microVM; each session checks out
   under `/mnt/efs/sessions/<id>`. A re-invoke with the same session id finds the
   repo already cloned.
+- **Dependencies are provisioned, never installed per session.** At workspace
+  setup `main.py` (`_provision_deps`) hashes the checkout's `package-lock.json`
+  and makes `node_modules` a **symlink** to a per-microVM copy under `/tmp/deps/
+  <lockhash>/`, extracted once from the shared EFS tarball
+  `/mnt/efs/.deps/<lockhash>.tar`. The first session ever to see a lock runs the
+  one `npm ci` (on local disk), publishes the tarball, and keeps its copy; every
+  later VM just unpacks (~700 MB sequential read, seconds). No local room →
+  the tarball is unpacked once into `.deps/<lockhash>/` on EFS and linked from
+  there. A `post-checkout` hook makes every `git worktree add` inherit the link,
+  and `node_modules` goes into `.git/info/exclude` (the `node_modules/`
+  gitignore rule does not match a symlink). Before this, each session's CLI ran
+  `npm ci` on EFS (3-8 min over NFS, again per worktree) — 50-75% of a coding
+  turn's wall clock. Not baked into the image: AgentCore caps runtime images at
+  2 GB and this one is ~1.85 GB. Kill switch: `WORKSPACE_DEPS_ENABLED=0`. A
+  `warm` call reports `deps` (`local` / `efs_tar` / `efs` / `built` / `linked` /
+  `present` / `skipped` / `unavailable`).
 - **Codex state DBs live off EFS.** `CODEX_HOME=/mnt/efs/.codex` holds the
   transcripts (`sessions/**/rollout-*.jsonl`) and `config.toml`, but Codex's
   SQLite state/log DBs are WAL-mode and WAL across NFS clients corrupts them
