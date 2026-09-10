@@ -106,12 +106,16 @@ authoritative docs — never from memory, a blog/launch post, or a plausible gue
   your completion record.
 - **Approve + execute** — same conversation, NO `plan_only`, NO `resume_session`:
   `claude_code(model="sonnet", task="Plan approved. Apply the fix exactly as
-  planned, add the regression test, and run the test + build/lint commands.")`.
+  planned, add the regression test, typecheck/lint, and commit. Do NOT run the
+  full suite or build in this turn — that is the separate verify turn below.")`.
   Use `model="opus"` when the plan flags high complexity. Never plan on `"haiku"`.
 - Make the minimal change that removes the defect at the root.
 - Add/extend the regression test. Run it: show it FAILS on base_branch (stash your
   fix or run on a clean checkout) and PASSES with your fix applied.
-- Run the project's existing test + build/lint commands and confirm they still pass.
+- **Verify — SEPARATE turn** (same session): `claude_code(model="sonnet",
+  task="Run the project's full test + build/lint commands and confirm they pass;
+  fix any failures, then commit and push.")`. Keeping build/tests off the fix turn
+  means no single turn runs long enough to approach the wall-clock cap.
 - **Lambda zip manifest (agentcore-hub only):** if you ADD a new local module
   imported by a Lambda entrypoint (e.g. a new `.mjs` under `lambda/orchestrator/`),
   you MUST add it to that Lambda's `deploy.sh` zip file list AND run

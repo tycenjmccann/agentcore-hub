@@ -11,7 +11,7 @@
 # from 1.53.0; on 1.52.0 the tools cachePoint ships without ttl (defaults 5m),
 # which breaks test_prompt_cache's ttl=="1h" assertion and yields a mixed-TTL
 # request Bedrock extended-TTL validation can reject (TEAM-3961, F1).
-strands-agents>=1.53.0
+strands-agents>=1.53.0,<1.55
 boto3>=1.43.0
 opentelemetry-sdk>=1.29.0
 # StrandsTelemetry.setup_otlp_exporter() imports the OTLP/HTTP span exporter at

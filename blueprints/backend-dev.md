@@ -100,15 +100,24 @@ with the best plan and record the residual gap in your completion record.
 ```
 claude_code(
     model="sonnet",
-    task="Plan approved. Implement it exactly as planned, write the tests, run them, and commit."
+    task="Plan approved. Implement it exactly as planned, write the tests, run a typecheck/compile, and commit. Do NOT run the full test suite or build in this turn — that is the separate verify turn (2d)."
 )
 ```
 Use `model="opus"` for the execute turn when the plan itself flags high
 complexity or touches many subsystems. Never plan on `"haiku"`.
 
+**2d. Verify — SEPARATE turn** (same session): keep build/tests off the implement
+turn so no single turn runs long enough to approach the wall-clock cap.
+```
+claude_code(
+    model="sonnet",
+    task="Run the full test suite and the build; fix any failures (same session), then commit and push."
+)
+```
+
 Splitting the work across several claude_code calls (see Organizing Work) is
-fine — each new category of work gets its own plan → approve → execute. Fix
-tickets and rework still plan first; the resumed session already holds the
+fine — each new category of work gets its own plan → approve → execute → verify.
+Fix tickets and rework still plan first; the resumed session already holds the
 context, so the plan turn is short.
 
 ### Step 3: Review
