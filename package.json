@@ -15,7 +15,7 @@
     "battery:dry-run": "node evals/battery/run-battery.mjs --dry-run",
     "battery:mock": "node evals/battery/run-battery.mjs --mock --results /tmp/battery-mock-results.json",
     "battery:baseline": "node evals/battery/run-battery.mjs --baseline-mode --repeat 3 --out evals/battery/baseline.json",
-    "test:cloud-code": "playwright test tests/cloud-code-ui.spec.ts",
+    "test:cloud-code": "playwright test tests/cloud-code-ui.spec.ts tests/tab-workflow-resize.spec.ts --workers=1",
     "test": "npx playwright test tests/tab-*.spec.ts tests/e2e-api-routes.spec.ts",
     "test:full": "./tests/run-all.sh --full"
   },

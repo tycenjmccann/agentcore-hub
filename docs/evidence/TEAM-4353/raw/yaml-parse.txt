@@ -1,0 +1,7 @@
+deploy/pipeline/buildspec-ci.yml parsed OK
+  phase install - 4 commands, non-string: 0
+  phase pre_build - 10 commands, non-string: 0
+  phase build - 6 commands, non-string: 0
+  phase post_build - 2 commands, non-string: 0
+.github/workflows/ci.yml parsed OK
+ALL YAML OK

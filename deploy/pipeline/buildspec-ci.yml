@@ -54,6 +54,8 @@ phases:
       # workflow runs, else the blueprints skip their own mechanical tests on a
       # green result and unit/race/telemetry regressions merge (Codex #263 r2).
       # Kept in lockstep with .github/workflows/ci.yml.
+      # For the hermetic UI specs that lockstep is MECHANICAL, via the shared
+      # `test:cloud-code` npm script (see the build phase) — not a hand-copied list.
       - "npm run lint"
       - "npx tsc --noEmit"
       - "npm run test:unit"
@@ -94,8 +96,16 @@ phases:
           sleep 2
           if [ "$i" = "30" ]; then echo "server did not come up"; cat /tmp/next-server.log; exit 1; fi
         done
-      # Cloud Code UI regression suite — the hermetic (mocked) blocking UI job
-      # from GH CI. This is the UI gate; the AWS-backed tab/api specs are not.
+      # Hermetic UI gate — the blocking Playwright job from GH CI. `test:cloud-code`
+      # is the SINGLE entrypoint for hermetic UI specs and today runs BOTH
+      # tests/cloud-code-ui.spec.ts and tests/tab-workflow-resize.spec.ts (workflow
+      # sidebar resize + dark scrollbars). TEAM-4353 — that resize suite was wired
+      # only as an extra step in .github/workflows/ci.yml, so this authoritative
+      # required check ran none of its 27 tests and a regression could merge green.
+      # Parity is now kept by ONE npm script, not by duplicated command lines: add
+      # the next hermetic UI spec to that script in package.json, do NOT add a
+      # second command here. The AWS-backed tab/api specs stay excluded — they need
+      # live credentials.
       - "PLAYWRIGHT_BASE_URL=http://localhost:3000 npm run test:cloud-code -- --trace retain-on-failure"
       # runtime-agent telemetry pytest (hermetic, no AWS)
       - |
