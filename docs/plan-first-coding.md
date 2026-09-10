@@ -68,7 +68,7 @@ in all of them.
 `permission_mode` payload field. Only `"plan"` is honored, swapping
 `--dangerously-skip-permissions` for `--permission-mode plan`; anything else
 (absent, unknown, typo) runs a normal full-autonomy turn. Threaded through the
-sync, streaming, and async (submit+poll) paths.
+sync, streaming, and async (submit + command-API wait, DL-026) paths.
 
 **Fleet** (`deploy/runtime-agent/main.py`) — `claude_code(..., plan_only: bool
 = False)`. Remote path → `permission_mode: "plan"` in the payload (claude only;

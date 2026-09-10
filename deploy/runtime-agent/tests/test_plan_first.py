@@ -77,7 +77,7 @@ class _Client:
 
 
 def _remote_ns(captured):
-    def _submit_and_poll(client, payload, outer_deadline=None, budget=None):
+    def _submit_and_wait(client, payload, outer_deadline=None, cli_bound_s=None):
         captured.append(payload)
         return {"response": "PLAN: 1) add apply_discount 2) tests", "claude_session_id": "conv-1"}
 
@@ -87,9 +87,9 @@ def _remote_ns(captured):
         "BotocoreConfig": lambda **k: None, "REGION": "us-east-1",
         "_CODING_SESSION": _fresh_session(),
         "_WATCHDOG": {"turnTimeoutSecs": 1500}, "_WATCHDOG_LEGACY": {"turnTimeoutSecs": 1500},
-        "REMOTE_CODING_READ_TIMEOUT": 600, "REMOTE_CODING_TURN_BUDGET_S": 2700,
-        "REMOTE_CODING_TURN_DEADLINE_S": 6000,
-        "_submit_and_poll": _submit_and_poll, "_publish_agent_error": mock.Mock(),
+        "REMOTE_CODING_READ_TIMEOUT": 600, "REMOTE_CODING_KILL_GRACE_S": 60,
+        "REMOTE_CODING_TURN_DEADLINE_S": 10800,
+        "_submit_and_wait": _submit_and_wait, "_publish_agent_error": mock.Mock(),
         "_record_coding_session": mock.Mock(),
         "_CURRENT_WORKFLOW_ID": "wf", "_CURRENT_AGENT_ID": "agentcore_hub_backend_dev",
         "_CURRENT_TICKET_ID": "T-1",

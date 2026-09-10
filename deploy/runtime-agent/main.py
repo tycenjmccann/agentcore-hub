@@ -68,10 +68,13 @@ if not os.path.exists(_node_marker):
 else:
     os.environ["PATH"] = f"/tmp/node-v20.18.0-linux-arm64/bin:/tmp/.npm-global/bin:{os.environ.get('PATH', '')}"
 
+import base64
+import hashlib
 import importlib.metadata
 import json
 import logging
 import re
+import shlex
 import time
 import uuid
 from datetime import datetime, timezone
@@ -475,36 +478,44 @@ CLOUD_CODE_TABLE = os.getenv("CLOUD_CODE_TABLE", "agentcore-hub-cloud-code-sessi
 # checkout (60s) + config/artifact install. Submits are idempotent (turn_id is
 # client-generated), so even a timeout here can't double-run a turn.
 REMOTE_CODING_READ_TIMEOUT = int(os.getenv("REMOTE_CODING_READ_TIMEOUT", "600"))
-# Poll cadence + overall turn budget. The budget must exceed the coding
-# runtime's TURN_TIMEOUT_S (1500s) PLUS its post-CLI terminal work — artifact
-# harvest (can be GBs) and the journal-write retry loop — so the runner's own
-# verdict reaches us via the journal instead of us giving up first.
-REMOTE_CODING_POLL_S = int(os.getenv("REMOTE_CODING_POLL_S", "20"))
-# Cadence for the prove-alive pulse emitted while a coding turn is being polled
-# (see _poll_coding_turn). One agent.streaming event ~every minute is enough for
-# the UI to look live and to reset WM's silence timer, without spamming the
-# events table on multi-hour turns.
+# One wait SLICE: how long a single InvokeAgentRuntimeCommand blocks inside the
+# coding session waiting for the turn to finish (DL-026). Short enough to stay
+# far under the platform's 15-min byte-idle kill with no keepalive tricks, and to
+# emit one prove-alive pulse per slice; long enough that the per-slice overhead
+# (~0.3s measured) is noise. A finished turn returns within ~2s regardless.
+REMOTE_CODING_WAIT_SLICE_S = int(os.getenv("REMOTE_CODING_WAIT_SLICE_S", "60"))
+# Cadence for the prove-alive pulse emitted while a coding turn is being waited
+# on (see _wait_coding_turn). One agent.streaming event ~every minute keeps the
+# UI live and the orchestrator's lease fresh (lease.mjs lastAgentActivity reads
+# agent.streaming; its TTL is 30 min) without spamming the events table.
 REMOTE_CODING_HEARTBEAT_S = int(os.getenv("REMOTE_CODING_HEARTBEAT_S", "60"))
-# The 2700 default is exactly the legacy 1500s turn cap + ~1200s of terminal-work
-# headroom (artifact harvest — can be GBs — plus the journal-write retry loop).
-# When a per-agent turnTimeoutSecs is forwarded ABOVE 1500 (TEAM-3687), the
-# effective budget in _remote_coding_turn widens by the excess so the runner's
-# own verdict still reaches us via the journal before we give up.
-REMOTE_CODING_TURN_BUDGET_S = int(os.getenv("REMOTE_CODING_TURN_BUDGET_S", "2700"))
+# Grace past the CLI's own wall-clock cap (turnTimeoutSecs) before we KILL its
+# process group from outside. The runtime's watchdog should have fired already;
+# this covers the case where it could not (2026-09-10: the kill missed a
+# grandchild holding the pipe, so nothing rendered a verdict for 2h40m).
+REMOTE_CODING_KILL_GRACE_S = int(os.getenv("REMOTE_CODING_KILL_GRACE_S", "60"))
+# The CLI process is gone but done.json has not appeared: the runner is still
+# doing post-turn work (artifact harvest can be GBs). Wait this long, then treat
+# the turn as failed.
+REMOTE_CODING_HARVEST_GRACE_S = int(os.getenv("REMOTE_CODING_HARVEST_GRACE_S", "900"))
+# meta.json exists but no pid yet: the submit is still cloning/checking out. Must
+# cover the same worst case as the submit read timeout.
+REMOTE_CODING_START_GRACE_S = int(os.getenv("REMOTE_CODING_START_GRACE_S",
+                                            str(REMOTE_CODING_READ_TIMEOUT)))
+# How long every wait probe may fail in a row before the turn is abandoned.
+# A probe failure says nothing about the turn (it is running in a container we
+# could not reach), so these are never treated as death — but they cannot be
+# tolerated forever either, or an unreachable runtime pins the persona.
+REMOTE_CODING_PROBE_FAIL_S = int(os.getenv("REMOTE_CODING_PROBE_FAIL_S", "600"))
 # Outer wall-clock deadline on ONE ENTIRE nested coding turn: submit (including
-# lost-submit recovery probes), every poll, and the single automatic vm-death
-# resubmit. The poll loop bounds each CYCLE (budget, 2x hard stop), but cycles
-# and recovery sleeps stack — worst case ran to hours of silent blocking with
-# no event emitted (TEAM-3119). The default sits above one full worst-case
-# cycle (submit read timeout + the poll loop's hard stop) so it never preempts
-# a provably-live runner; on expiry the turn fails loudly (agent.error event +
-# ERROR string to the persona) instead of pinning it. The poll loop also emits
-# periodic agent.streaming heartbeats (REMOTE_CODING_HEARTBEAT_S) so a long turn
-# never looks silent to the UI or WM.
-REMOTE_CODING_TURN_DEADLINE_S = int(os.getenv(
-    "REMOTE_CODING_TURN_DEADLINE_S",
-    str(REMOTE_CODING_READ_TIMEOUT + 2 * REMOTE_CODING_TURN_BUDGET_S),
-))
+# lost-submit recovery probes), every wait slice, and the single automatic
+# vm-death resubmit. Each phase is separately bounded, but they stack — worst
+# case ran to hours of silent blocking with no event emitted (TEAM-3119). Never
+# extended by anything; on expiry the turn fails loudly (agent.error event +
+# ERROR string to the persona) instead of pinning the persona. Default clears one
+# worst-case submit + a full CLI cap at the 3600s ceiling + both graces, with
+# room for the single resubmit.
+REMOTE_CODING_TURN_DEADLINE_S = int(os.getenv("REMOTE_CODING_TURN_DEADLINE_S", "10800"))
 
 # Tenant the workflow session rows belong to. Multi-tenant deployments must set
 # this to the tenant that owns the fleet, or the Cloud Code tab (which scopes
@@ -706,212 +717,447 @@ def _deadline_expired_error() -> dict:
             "no_retry_hint": True}
 
 
-def _poll_coding_turn(client, turn_id: str, outer_deadline: float | None = None,
-                      budget_s: int | None = None, cli: str = "") -> dict:
-    """Poll an async coding turn to its terminal state. Returns the done record
-    ({response, claude_session_id, artifacts?} or {error}).
+# ── Waiting on a coding turn (DL-026) ────────────────────────────────────────
+# The coding runtime acks a turn immediately and runs the CLI in the background,
+# keeping its state in <turn_dir> on ITS OWN disk. We learn the outcome by running
+# a short shell probe INSIDE that same container via InvokeAgentRuntimeCommand,
+# which the platform documents (and we verified in prod) as running concurrently
+# with an in-flight invocation on the same session.
+#
+# Why not the old EFS journal + poll: liveness was inferred from a file the runner
+# wrote about itself, so a wedged CLI whose heartbeat thread was healthy read as
+# "running" for 2h40m, and an unwritable EFS root 503'd every turn on the VM for
+# 16 minutes (2026-09-10 RCA D1/D2). The probe asks the kernel instead — is this
+# pid alive, is it a zombie, is it gone — and the answer cannot be stale.
+#
+# Both scripts are SELF-BOUNDED and always exit 0 with a VERDICT= line: letting
+# the platform's own `timeout` fire returns TIMED_OUT *and leaks the wait loop*
+# inside the container (measured). They are shipped base64-encoded so nothing in
+# them meets the command API's shell tokenizer.
+#
+# Verdicts, in the order the script decides them:
+#   done            done.json exists — carries the result (DONE_B64/DONE_SHA256)
+#   missing         no turn dir: fresh microVM, or the turn never started
+#   starting        meta.json but no pid: still cloning / pre-Popen
+#   running         pid alive (prints ETIMES= for the error message)
+#   exited_no_done  pid zombie or gone, no done.json: harvesting, or runner dead
+#
+# `kill -0` is NOT usable for liveness: a SIGKILLed CLI stays a zombie while its
+# parent thread is wedged (PID 1 here does not reap), so kill -0 keeps saying
+# "alive" — that is exactly how D1 hid. /proc/<pid>/stat's state field is read
+# after the LAST ')' because comm can contain spaces and parentheses.
+_TURN_PROBE_LIB = r"""
+exec 2>/dev/null
+D="$1"
+# State field of /proc/<pid>/stat, read after the LAST ')' because comm can
+# contain spaces and parentheses. Z = zombie = exited.
+proc_state() {
+  S=$(cat /proc/"$1"/stat) || { echo gone; return; }
+  S=${S##*") "}
+  echo "${S%% *}"
+}
+# Seconds the process has been alive. stat field 22 is its start time in clock
+# ticks since boot (NOT an elapsed time — printing it raw reported an age of 5005
+# for a 5-second-old process), so subtract it from uptime. USER_HZ is 100 on every
+# Linux we run on; a bad read just yields 0, which only affects a log line.
+proc_age() {
+  S=$(cat /proc/"$1"/stat) || { echo 0; return; }
+  S=${S##*") "}
+  START=$(echo "$S" | awk '{print int($20/100)}')
+  UP=$(cut -d. -f1 /proc/uptime)
+  echo $(( UP - START ))
+}
+emit_done() {
+  B=$(wc -c < "$D/done.json")
+  echo "DONE_BYTES=$B"
+  echo "DONE_SHA256=$(sha256sum "$D/done.json" | cut -d' ' -f1)"
+  if [ "$B" -le 262144 ]; then echo "DONE_B64=$(base64 -w0 "$D/done.json")"; fi
+  echo "VERDICT=done"
+}
+classify() {
+  [ -f "$D/done.json" ] && { emit_done; return; }
+  [ -d "$D" ] || { echo VERDICT=missing; return; }
+  [ -f "$D/pid" ] || { echo VERDICT=starting; return; }
+  P=$(cat "$D/pid")
+  ST=$(proc_state "$P")
+  if [ "$ST" = gone ] || [ "$ST" = Z ]; then
+    echo "STATE=$ST"; echo VERDICT=exited_no_done
+  else
+    echo "STATE=$ST"; echo "ETIMES=$(proc_age "$P")"
+    echo VERDICT=running
+  fi
+}
+"""
 
-    Long silent stretches (builds, big writes) are NORMAL for coding turns — the
-    connection-per-turn transport died on exactly those (idle >15 min = silent
-    kill, stuck-fleet postmortems 2026-08-27 ×2). Each poll here is a fresh
-    sub-second invocation, so wall-clock turn length no longer matters. A poll
-    also confirms the microVM is alive: 'dead' (stale heartbeat) and 'unknown'
-    (journal gone) both mean the turn will never finish — fail fast, don't wait
-    out the budget.
+# Wait up to $2 seconds for the turn to finish, then report where it stands.
+_WAIT_SCRIPT = _TURN_PROBE_LIB + r"""
+T="$2"
+END=$(( $(date +%s) + T ))
+while :; do
+  [ -f "$D/done.json" ] && break
+  [ "$(date +%s)" -ge "$END" ] && break
+  sleep 2
+done
+classify
+"""
 
-    outer_deadline is a time.monotonic() timestamp bounding the whole turn
-    (REMOTE_CODING_TURN_DEADLINE_S): unlike the budget, it is NEVER extended by
-    a live heartbeat, so a runner that reports "running" forever cannot pin the
-    persona past it (TEAM-3119).
+# Re-read done.json with no inline size cap: used when the wait script withheld
+# the payload (too big) or delivered one that did not verify.
+_FETCH_SCRIPT = _TURN_PROBE_LIB + r"""
+if [ -f "$D/done.json" ]; then
+  echo "DONE_SHA256=$(sha256sum "$D/done.json" | cut -d' ' -f1)"
+  echo "DONE_B64=$(base64 -w0 "$D/done.json")"
+  echo VERDICT=done
+else
+  classify
+fi
+"""
 
-    budget_s overrides the fleet REMOTE_CODING_TURN_BUDGET_S for this turn — the
-    caller scales it up when a per-agent turnTimeoutSecs was forwarded above the
-    1500s the default budget assumes (TEAM-3687). Defaults to the global so
-    existing callers are unchanged."""
-    budget = REMOTE_CODING_TURN_BUDGET_S if budget_s is None else budget_s
-    deadline = time.time() + budget
-    # Live heartbeats extend the deadline (terminal work is unbounded), but a
-    # wedged-yet-heartbeating runner must not pin this persona forever.
-    hard_stop = time.time() + 2 * budget
-    unknowns = 0
-    turn_start = time.time()
-    last_heartbeat = time.time()
-    while time.time() < min(deadline, hard_stop) and (
-            outer_deadline is None or time.monotonic() < outer_deadline):
-        time.sleep(REMOTE_CODING_POLL_S)
-        try:
-            status = _poll_once(client, turn_id)
-        except Exception as e:  # noqa: BLE001
-            # Throttle / network / AgentCore blip — says nothing about the
-            # runner, which may be mid-turn writing heartbeats. Never terminal:
-            # bailing here would make the persona resubmit into a workspace
-            # where the original turn is still executing. Keep polling until
-            # the budget expires or the journal renders a verdict.
-            logger.warning(f"[remote-coding] poll error (non-terminal): {str(e)[:200]}")
+# Kill the CLI's whole process group, then give the runner a moment to notice EOF
+# and write its own record before reporting.
+_KILL_SCRIPT = _TURN_PROBE_LIB + r"""
+if [ -f "$D/pid" ]; then
+  P=$(cat "$D/pid")
+  kill -KILL -- -"$P" || kill -KILL "$P"
+  echo "KILLED=$P"
+  END=$(( $(date +%s) + 30 ))
+  while [ ! -f "$D/done.json" ] && [ "$(date +%s)" -lt "$END" ]; do sleep 2; done
+fi
+classify
+"""
+
+
+# Mirrors the coding runtime's TURNS_ROOT default. The submit response carries the
+# real path (`turn_dir`), which is what the probes use; this is only the fallback
+# for a runtime that answered without it.
+REMOTE_CODING_TURNS_ROOT = os.getenv("REMOTE_CODING_TURNS_ROOT", "/tmp/turns")
+
+
+def _default_turn_dir(turn_id: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9._-]", "-", turn_id)[:80]
+    return f"{REMOTE_CODING_TURNS_ROOT}/{safe}"
+
+
+def _probe_command(script: str, turn_id: str, secs: int = 0,
+                   turn_dir: str | None = None) -> str:
+    """Wrap a probe for the command API. The API exec's argv directly, so the shell
+    is explicit; the script itself rides base64 so its quoting never reaches the
+    API's tokenizer."""
+    blob = base64.b64encode(script.encode()).decode()
+    return (f"bash -c \"echo {blob} | base64 -d | bash -s -- "
+            f"{shlex.quote(turn_dir or _default_turn_dir(turn_id))} {int(secs)}\"")
+
+
+_CMD_CLIENT = None
+
+
+def _command_client():
+    """Client for the wait/kill probes. Its own read timeout: a slice blocks
+    server-side for REMOTE_CODING_WAIT_SLICE_S, and botocore must not give up
+    first. No retries — a lost probe is just the next slice."""
+    global _CMD_CLIENT
+    if _CMD_CLIENT is None:
+        _CMD_CLIENT = boto3.client(
+            "bedrock-agentcore", region_name=REGION,
+            config=BotocoreConfig(read_timeout=REMOTE_CODING_WAIT_SLICE_S + 90,
+                                  connect_timeout=30, retries={"max_attempts": 0}))
+    return _CMD_CLIENT
+
+
+def _run_probe(script: str, turn_id: str, secs: int = 0,
+               turn_dir: str | None = None) -> dict:
+    """One probe inside the coding session. Returns the parsed verdict, or
+    {"verdict": "error"} — never raises, because a failed probe says nothing about
+    the turn and the next slice will ask again.
+
+    stdout arrives in arbitrarily-chunked contentDelta events, so everything is
+    concatenated before it is split into lines."""
+    resp = _command_client().invoke_agent_runtime_command(
+        agentRuntimeArn=CODING_AGENT_RUNTIME_ARN,
+        runtimeSessionId=_CODING_SESSION["session_id"],
+        body={"command": _probe_command(script, turn_id, secs, turn_dir),
+              "timeout": max(30, secs + 30)})
+    out, stop, api_error = [], None, None
+    for event in resp["stream"]:
+        chunk = event.get("chunk")
+        if chunk is None:
+            api_error = next(iter(event)) if event else "unknown"
             continue
-        state = status.get("status")
-        if state == "done":
-            return status
-        if state == "dead":
-            # Heartbeat provably stale — the runner is gone. Only this and a
-            # repeatedly-absent journal may trigger a resubmit: anything softer
-            # risks racing a still-live runner and executing the task twice.
-            return {"error": f"coding turn died mid-run (heartbeat stale "
-                             f"{status.get('stale_s')}s — microVM likely recycled)",
-                    "retryable_vm_death": True}
-        if state == "unknown":
-            # Journal missing. It's seeded before submit returns and lives on
-            # shared EFS, so this should be definitive — but demand consecutive
-            # confirmations before declaring death, in case the read raced a
-            # slow first write or a flaky mount.
-            unknowns += 1
-            if unknowns >= 3:
-                return {"error": "coding turn vanished (no journal across 3 "
-                                 "consecutive polls)",
-                        "retryable_vm_death": True}
-            continue
-        unknowns = 0
-        # "running" or "transient" (degraded EFS read / torn read racing the
-        # journal's tmp+rename): the turn may still be live — keep polling.
-        # A provably-live runner (fresh heartbeat / in-memory answer) extends
-        # the deadline: terminal work after the CLI (artifact harvest can be
-        # GBs) has no fixed bound, and expiring against a live runner would
-        # push the persona toward re-running work that already happened. The
-        # runner's own watchdog (TURN_TIMEOUT_S) bounds the CLI; a runner that
-        # dies mid-harvest stops heartbeating and the dead verdict fires.
-        if state == "running":
-            now = time.time()
-            # Prove-alive pulse: the runner heartbeats its journal, but nothing
-            # reaches the UI/WM while we poll. Emit an agent.streaming event
-            # ~every minute so the view looks live and WM's silence timer resets.
-            if now - last_heartbeat >= REMOTE_CODING_HEARTBEAT_S:
-                _publish_coding_heartbeat(cli, int(now - turn_start))
-                last_heartbeat = now
-            deadline = max(deadline,
-                           time.time() + max(3 * REMOTE_CODING_POLL_S, 120))
-    # Budget spent with no live heartbeat seen recently and no verdict. The
-    # turn may STILL have completed its work — a blind re-run is not safe.
-    # Probe once more, then tell the persona to VERIFY STATE WITHOUT running a
-    # coding turn (a fresh CLI call would race a still-live runner in the same
-    # workspace). Skip the probe once the outer deadline has expired: the
-    # deadline is a HARD bound, and one more blocking call (up to the poll
-    # client's ~40s connect+read window) would overshoot it (TEAM-3307).
-    if outer_deadline is not None and time.monotonic() >= outer_deadline:
-        return _deadline_expired_error()
+        delta = chunk.get("contentDelta") or {}
+        if delta.get("stdout"):
+            out.append(delta["stdout"])
+        if "contentStop" in chunk:
+            stop = chunk["contentStop"]
+    fields: dict = {"verdict": "error", "raw_status": (stop or {}).get("status"),
+                    "api_error": api_error}
+    for line in "".join(out).splitlines():
+        key, _, value = line.strip().partition("=")
+        if key == "VERDICT":
+            fields["verdict"] = value
+        elif key in ("STATE", "ETIMES", "DONE_B64", "DONE_SHA256", "DONE_BYTES", "KILLED"):
+            fields[key.lower()] = value
+    return fields
+
+
+def _decode_done_payload(fields: dict) -> dict | None:
+    """The turn record out of a probe's DONE_B64, or None if it is absent, fails
+    its checksum (truncated stream) or is not the json we expect."""
+    blob, want = fields.get("done_b64"), fields.get("done_sha256")
+    if not blob:
+        return None
     try:
-        final = _poll_once(client, turn_id)
-        if final.get("status") == "done":
-            return final
-    except Exception:  # noqa: BLE001
-        pass
-    if outer_deadline is not None and time.monotonic() >= outer_deadline:
-        return _deadline_expired_error()
-    return {"error": f"coding turn exceeded {budget}s budget "
-                     f"with no verdict. Its work may already exist and a runner "
-                     f"may still be finishing. Do NOT re-run the task and do NOT "
-                     f"start another coding call yet: wait a few minutes, then "
-                     f"check the branch on GitHub (get_file_contents / list "
-                     f"commits) to see whether the work landed before deciding "
-                     f"anything",
+        raw = base64.b64decode(blob, validate=True)
+    except (ValueError, TypeError) as exc:
+        logger.warning(f"[remote-coding] done.json not decodable ({str(exc)[:120]})")
+        return None
+    if want and hashlib.sha256(raw).hexdigest() != want:
+        logger.warning("[remote-coding] done.json checksum mismatch")
+        return None
+    try:
+        record = json.loads(raw.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        logger.warning(f"[remote-coding] done.json not parseable ({str(exc)[:120]})")
+        return None
+    return record if isinstance(record, dict) else None
+
+
+def _probe_done_record(fields: dict, turn_id: str, turn_dir: str | None = None) -> dict:
+    """The turn's terminal record out of a `done` verdict.
+
+    The wait script inlines the record as checksummed base64 when it is small
+    enough. A record that is too big to inline, or one that fails its checksum
+    (truncated stdout), is refetched once with no size cap. Never guesses: an
+    unreadable result becomes a verify-first error, because reporting a coding
+    turn as failed when it actually landed commits is worse than saying so."""
+    record = _decode_done_payload(fields)
+    if record is not None:
+        return record
+    logger.warning(f"[remote-coding] refetching done.json for {turn_id} "
+                   f"({fields.get('done_bytes')} bytes)")
+    try:
+        record = _decode_done_payload(_run_probe(_FETCH_SCRIPT, turn_id, 0, turn_dir))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"[remote-coding] done.json refetch failed: {str(exc)[:200]}")
+        record = None
+    if record is not None:
+        return record
+    return {"error": "the coding turn finished but its result could not be read "
+                     "back from the runtime. The work itself may be complete: "
+                     "check the branch on GitHub (get_file_contents / list "
+                     "commits) before deciding anything, and do NOT re-run.",
             "no_retry_hint": True}
 
 
-_POLL_CLIENT = None
+def _turn_killed_error(cli: str, elapsed_s: int, bound_s: int) -> dict:
+    return {"error": f"coding turn exceeded its {bound_s}s wall-clock cap (killed "
+                     f"after {elapsed_s}s). Work done before the kill may already "
+                     f"be on the branch and the session is still usable: check the "
+                     f"branch on GitHub (get_file_contents / list commits) and "
+                     f"continue from there. Do NOT blindly re-run the same task.",
+            "no_retry_hint": True}
 
 
-def _poll_once(client, turn_id: str) -> dict:
-    """client is the submit client (600s read timeout, sized for cold-clone
-    setup). Polls answer in under a second server-side, so they get their own
-    short-timeout client — otherwise one accepted-but-silent poll connection
-    blocks 600s and blows straight past the loop's hard stop."""
-    global _POLL_CLIENT
-    if _POLL_CLIENT is None:
-        _POLL_CLIENT = boto3.client(
-            "bedrock-agentcore", region_name=REGION,
-            config=BotocoreConfig(read_timeout=30, connect_timeout=10,
-                                  retries={"max_attempts": 0}),
-        )
-    return _coding_invoke(_POLL_CLIENT, {
-        "action": "poll",
-        "turn_id": turn_id,
-        "session_id": _CODING_SESSION["session_id"],
-    })
+def _wait_coding_turn(turn_id: str, outer_deadline: float | None = None,
+                      cli: str = "", cli_bound_s: int | None = None,
+                      turn_dir: str | None = None) -> dict:
+    """Wait for one async coding turn and return its terminal record
+    ({response, claude_session_id, artifacts?} or {error}).
+
+    Bounds, none of them extendable:
+      cli_bound_s   the CLI's own cap + REMOTE_CODING_KILL_GRACE_S. Still alive
+                    past it → we kill its process group and fail the turn.
+      START/HARVEST graces bound the two phases where no CLI process exists yet
+                    (workspace setup) or any more (post-turn harvest).
+      outer_deadline (REMOTE_CODING_TURN_DEADLINE_S) bounds the whole nested turn
+                    including submit and the one vm-death resubmit.
+      a self-computed hard stop guarantees this function returns even when the
+                    caller passed no deadline at all."""
+    bound = (cli_bound_s if cli_bound_s is not None
+             else _WATCHDOG["turnTimeoutSecs"] + REMOTE_CODING_KILL_GRACE_S)
+    started = time.time()
+    last_pulse = started
+    exited_at: float | None = None
+    missing_probes = 0
+    probe_failing_since: float | None = None
+    # Every phase above is separately bounded, so their sum plus one slice is an
+    # upper bound on a well-behaved wait. Enforced anyway: no loop in the coding
+    # path may depend on a caller remembering to pass a deadline (TEAM-3119).
+    hard_stop = (started + bound + REMOTE_CODING_START_GRACE_S
+                 + REMOTE_CODING_HARVEST_GRACE_S + REMOTE_CODING_WAIT_SLICE_S)
+
+    def _elapsed() -> int:
+        return int(time.time() - started)
+
+    while True:
+        if outer_deadline is not None and time.monotonic() >= outer_deadline:
+            return _deadline_expired_error()
+        if time.time() >= hard_stop:
+            logger.error(f"[remote-coding] wait hard stop after {_elapsed()}s ({cli})")
+            return {"error": f"coding turn did not reach a verdict within "
+                             f"{int(hard_stop - started)}s. Its work may already "
+                             f"exist: check the branch on GitHub "
+                             f"(get_file_contents / list commits) before deciding "
+                             f"anything, and do NOT re-run.",
+                    "no_retry_hint": True}
+        try:
+            fields = _run_probe(_WAIT_SCRIPT, turn_id, REMOTE_CODING_WAIT_SLICE_S,
+                                turn_dir)
+            probe_failing_since = None
+        except Exception as exc:  # noqa: BLE001
+            # Throttle, network blip, platform TIMED_OUT: says nothing about the
+            # turn, which is running inside a container we just failed to reach.
+            # Not death — bailing to a retry here would push the persona to re-run
+            # work that may be in flight — but not tolerated forever either.
+            probe_failing_since = probe_failing_since or time.time()
+            if time.time() - probe_failing_since > REMOTE_CODING_PROBE_FAIL_S:
+                return {"error": f"lost contact with the coding runtime for "
+                                 f"{REMOTE_CODING_PROBE_FAIL_S}s while waiting on "
+                                 f"this turn ({str(exc)[:160]}). The turn may have "
+                                 f"completed: check the branch on GitHub before "
+                                 f"deciding anything, and do NOT re-run.",
+                        "no_retry_hint": True}
+            logger.warning(f"[remote-coding] wait probe failed (non-terminal): {str(exc)[:200]}")
+            time.sleep(min(REMOTE_CODING_WAIT_SLICE_S, 20))
+            continue
+        verdict = fields["verdict"]
+
+        if verdict == "done":
+            logger.info(f"[remote-coding] wait verdict=done after {_elapsed()}s ({cli})")
+            return _probe_done_record(fields, turn_id, turn_dir)
+
+        if verdict == "missing":
+            # The turn dir is created before workspace setup and lives on the
+            # microVM's disk, so "no dir" means this is not the VM that accepted
+            # the turn: it recycled. Confirm across two probes (a probe can land
+            # during a restart) before declaring it, since the caller resubmits.
+            missing_probes += 1
+            if missing_probes >= 2:
+                return {"error": f"coding turn vanished (no turn state on the "
+                                 f"coding runtime after {_elapsed()}s — microVM "
+                                 f"recycled)",
+                        "retryable_vm_death": True}
+            continue
+        missing_probes = 0
+
+        if verdict == "starting":
+            if _elapsed() > REMOTE_CODING_START_GRACE_S:
+                return {"error": f"coding turn never started its CLI within "
+                                 f"{REMOTE_CODING_START_GRACE_S}s (workspace setup "
+                                 f"appears wedged)",
+                        "retryable_vm_death": True}
+        elif verdict == "running":
+            if _elapsed() > bound:
+                logger.error(f"[remote-coding] killing {cli} turn {turn_id}: alive "
+                             f"{_elapsed()}s past a {bound}s bound")
+                try:
+                    _run_probe(_KILL_SCRIPT, turn_id, 0, turn_dir)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(f"[remote-coding] kill probe failed: {str(exc)[:200]}")
+                    _stop_coding_session("kill probe unreachable")
+                # The record the runtime writes after a kill is NOT trustworthy as
+                # a result: codex/kiro emit a `done` frame with a "⚠ timed out"
+                # response and no error key, which reads as success. Our own
+                # terminal record is the answer; done.json stays diagnostic.
+                return _turn_killed_error(cli, _elapsed(), bound)
+        elif verdict == "exited_no_done":
+            # CLI gone, no record yet: the runner is harvesting artifacts (can be
+            # GBs) or died mid-teardown. Its own backstop writes a record either
+            # way; if neither happens the session is wedged and must be reaped.
+            exited_at = exited_at or time.time()
+            if time.time() - exited_at > REMOTE_CODING_HARVEST_GRACE_S:
+                _stop_coding_session("runner never rendered a verdict after the CLI exited")
+                return {"error": f"the coding CLI exited but its runner never "
+                                 f"reported a result within "
+                                 f"{REMOTE_CODING_HARVEST_GRACE_S}s. Its work may "
+                                 f"already be on the branch: check GitHub "
+                                 f"(get_file_contents / list commits) before "
+                                 f"deciding anything, and do NOT re-run.",
+                        "no_retry_hint": True}
+        else:
+            logger.warning(f"[remote-coding] unparsed probe verdict "
+                           f"{verdict!r} (status={fields.get('raw_status')}, "
+                           f"api_error={fields.get('api_error')})")
+
+        now = time.time()
+        if now - last_pulse >= REMOTE_CODING_HEARTBEAT_S:
+            _publish_coding_heartbeat(cli, int(now - started))
+            last_pulse = now
+
+
+def _stop_coding_session(why: str) -> None:
+    """Reap the coding session. Used when a runner is wedged in a way we cannot
+    clear from outside (a grandchild still holding its stdout pipe): the session's
+    in-memory turn table would keep answering session_busy until the microVM aged
+    out. The workspace and transcript are on EFS, so the next turn simply lands on
+    a fresh VM. Best-effort."""
+    try:
+        _command_client().stop_runtime_session(
+            agentRuntimeArn=CODING_AGENT_RUNTIME_ARN,
+            runtimeSessionId=_CODING_SESSION["session_id"])
+        logger.warning(f"[remote-coding] stopped coding session "
+                       f"{_CODING_SESSION['session_id']}: {why}")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"[remote-coding] stop_runtime_session failed: {str(exc)[:200]}")
 
 
 def _recover_lost_submit(client, payload: dict, outer_deadline: float | None = None):
-    """The submit's response was lost client-side. What the server did is
-    unknown — AND the server itself may be a legacy build that ignores
-    mode/turn_id and is still executing the turn synchronously (no dedupe, so a
-    blind resubmit would double-run it). Probe with a poll on the turn_id we
-    sent:
-      - async runtime that accepted the submit → running/done → treat as
-        submitted and let the normal poll loop take over;
-      - async runtime that never started it → unknown (journal seeded pre-return
-        means accepted turns always journal) → resubmit same id (deduped);
-      - legacy runtime → poll comes back an error/no-status → NOT safe to
-        resubmit; give up with an explicit error (the persona's retry guidance
-        stands, and the workspace is preserved).
-    Returns a submit-shaped dict, or None when recovery is unsafe.
+    """The submit's response was lost client-side. What the server did is unknown,
+    so ask the coding runtime directly with a zero-wait probe on the turn_id we
+    sent (DL-026):
+      - starting / running / done / exited_no_done → it accepted the turn; hand
+        the id to the wait loop;
+      - missing → the turn dir was never created, so nothing started: resubmit the
+        same id (deduped server-side if we are wrong);
+      - probe unreachable → no evidence either way. Hand the id to the wait loop,
+        which tolerates probe failures; never resubmit off ignorance, and never
+        abandon (abandoning advises a fresh-id retry that could race a live runner).
 
-    outer_deadline bounds recovery just like the poll loop (TEAM-3307): a
-    submit that times out AFTER the deadline lands here, and without the check
-    the probe loop (5 × ~40s) plus a recovery resubmit (up to ~630s) would blow
-    straight past the supposedly hard bound. On expiry, hand the turn_id back
-    as submitted — _poll_coding_turn re-checks the deadline immediately and
-    returns the deadline-expired error without another blocking call."""
+    outer_deadline bounds recovery just like the wait loop (TEAM-3307): a submit
+    that times out AFTER the deadline lands here, and without the check the probes
+    plus a recovery resubmit (up to ~630s) would blow past a supposedly hard
+    bound. On expiry, hand the turn_id back as submitted — the wait loop re-checks
+    the deadline immediately and returns the deadline-expired error."""
     def _expired() -> bool:
         return outer_deadline is not None and time.monotonic() >= outer_deadline
 
+    turn_id = payload["turn_id"]
+    turn_dir = None
     probe = None
-    for attempt in range(5):  # a throttled probe is transient — keep asking
+    for attempt in range(3):
         if _expired():
-            return {"submitted": True, "turn_id": payload["turn_id"]}
+            return {"submitted": True, "turn_id": turn_id}
         try:
-            probe = _poll_once(client, payload["turn_id"])
-            break
-        except Exception as e:  # noqa: BLE001
+            probe = _run_probe(_WAIT_SCRIPT, turn_id, 0, turn_dir)
+            if probe.get("verdict") != "error":
+                break
+            probe = None
+        except Exception as exc:  # noqa: BLE001
             logger.warning(f"[remote-coding] recovery probe failed "
-                           f"({attempt + 1}/5): {str(e)[:200]}")
-            # Backoff capped to the time left: a probe that failed just past
-            # the deadline must not tack a full poll interval onto the
-            # overshoot before the loop's own expiry check runs.
-            if _expired():
-                return {"submitted": True, "turn_id": payload["turn_id"]}
-            sleep_s = REMOTE_CODING_POLL_S
-            if outer_deadline is not None:
-                sleep_s = min(sleep_s, max(0.0, outer_deadline - time.monotonic()))
-            time.sleep(sleep_s)
-    if probe is None:
-        # Every probe hit a transient failure — still zero evidence about the
-        # runner. The poll loop tolerates transient errors until its budget, so
-        # hand it the turn_id rather than abandoning (abandoning advises a
-        # fresh-id retry that could race an accepted runner).
-        return {"submitted": True, "turn_id": payload["turn_id"]}
-    state = probe.get("status")
-    if state in ("running", "done", "transient"):
-        return {"submitted": True, "turn_id": payload["turn_id"]}
-    if state == "unknown":
+                           f"({attempt + 1}/3): {str(exc)[:200]}")
         if _expired():
-            # No evidence the turn started and no time left to start it — the
-            # poll loop's deadline check turns this into the expired error.
-            return {"submitted": True, "turn_id": payload["turn_id"]}
+            return {"submitted": True, "turn_id": turn_id}
+        time.sleep(5)
+    if probe is None:
+        return {"submitted": True, "turn_id": turn_id}
+    verdict = probe["verdict"]
+    if verdict in ("done", "running", "starting", "exited_no_done"):
+        logger.warning(f"[remote-coding] lost submit recovered: turn is {verdict}")
+        return {"submitted": True, "turn_id": turn_id}
+    if verdict == "missing":
+        if _expired():
+            return {"submitted": True, "turn_id": turn_id}
+        logger.warning("[remote-coding] lost submit never started — resubmitting same id")
         try:
             return _coding_invoke(client, payload)  # deduped server-side
-        except Exception as e:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             # The resubmit may have been ACCEPTED with only its response lost —
-            # the same ambiguity we're recovering from. Accepted turns journal
-            # before the response is sent, so hand the turn_id to the poll loop
-            # to resolve: running/done if it started, three consecutive
-            # 'unknown's → the retryable death verdict if it never did. Never
-            # abandon here — that advises a fresh-id retry that could race an
-            # accepted runner.
+            # the same ambiguity. The turn dir is created before the response is
+            # sent, so let the wait loop resolve it.
             logger.warning(f"[remote-coding] recovery resubmit response lost — "
-                           f"polling turn_id anyway: {str(e)[:200]}")
-            return {"submitted": True, "turn_id": payload["turn_id"]}
-    # No parseable status → legacy runtime mid-synchronous-turn. Resubmitting
-    # would run the task twice; surface the loss instead.
+                           f"waiting on turn_id anyway: {str(exc)[:200]}")
+            return {"submitted": True, "turn_id": turn_id}
     logger.warning(f"[remote-coding] recovery probe unrecognized: {str(probe)[:200]}")
-    return None
+    return {"submitted": True, "turn_id": turn_id}
 
 
 _RUNTIME_HTTP_ERR = re.compile(r"Received error \((\d{3})\) from runtime")
@@ -923,20 +1169,20 @@ def _runtime_rejection(exc: Exception) -> dict | None:
     RuntimeClientError whose message carries only the status — the body (the
     actual reason) is dropped. It is still an answer: the turn was refused
     before it started and nothing is running, so lost-submit recovery must NOT
-    run — it would poll an unjournaled turn into a bogus VM-death verdict and
-    resubmit the same doomed setup (TEAM-3790/3799: 158 loops per run). A
-    current coding runtime returns setup failures as a 200 body instead, so
-    this only fires against a legacy runtime — still terminal. 503 is the
-    runtime's own "journal unwritable, turn not started": transient, the
-    persona may retry the same call. Returns None when the exception says
-    nothing about the runtime (timeout, connection drop, throttle)."""
+    run — it would probe a turn that never registered into a bogus VM-death
+    verdict and resubmit the same doomed setup (TEAM-3790/3799: 158 loops per
+    run). A current coding runtime returns setup failures as a 200 body instead,
+    so this only fires against a legacy runtime — still terminal. 503 is the
+    runtime's own "turn not started": transient, the persona may retry the same
+    call. Returns None when the exception says nothing about the runtime
+    (timeout, connection drop, throttle)."""
     m = _RUNTIME_HTTP_ERR.search(str(exc))
     if not m:
         return None
     code = int(m.group(1))
     if code == 503:
-        return {"error": "coding runtime refused the turn (HTTP 503: turn "
-                         "journal unwritable, turn not started) — transient"}
+        return {"error": "coding runtime refused the turn (HTTP 503 — turn not "
+                         "started) — transient"}
     if code < 500:
         # 4xx is only ever pre-CLI on the coding runtime: an invalid body, a
         # missing prompt/session id, or the workspace-setup ValueError for a
@@ -967,23 +1213,23 @@ def _runtime_rejection(exc: Exception) -> dict | None:
             "no_retry_hint": True}
 
 
-def _submit_and_poll(client, payload: dict, outer_deadline: float | None = None,
-                     budget_s: int | None = None) -> dict:
-    """Submit one async coding turn and poll it to a terminal record.
+def _submit_and_wait(client, payload: dict, outer_deadline: float | None = None,
+                     cli_bound_s: int | None = None) -> dict:
+    """Submit one async coding turn and wait for its terminal record.
 
     The turn_id is generated HERE and sent with the submit, making submission
     idempotent: if the submit's response is lost client-side (read timeout on a
     slow cold-clone setup) while the server accepted and started the turn, the
-    re-submit with the same id is acknowledged as a dedupe instead of running
-    the prompt a second time in the same workspace.
+    re-submit with the same id is acknowledged as a dedupe instead of running the
+    prompt a second time in the same workspace.
 
-    budget_s is forwarded to the poll loop so a turn with an elevated per-agent
-    turnTimeoutSecs gets a proportionally larger poll budget (TEAM-3687)."""
+    cli_bound_s is the wall-clock after which a still-running CLI is killed —
+    the per-agent turnTimeoutSecs plus a kill grace (TEAM-3687)."""
     payload = {**payload, "turn_id": f"turn-{uuid.uuid4().hex}"}
-    # HARD deadline check before the blocking submit: this client's
-    # connect+read window is ~630s, all of which would land PAST an
-    # already-expired deadline (worst case: a vm-death resubmit racing the
-    # deadline). Expired means don't start the call at all (TEAM-3307).
+    # HARD deadline check before the blocking submit: this client's connect+read
+    # window is ~630s, all of which would land PAST an already-expired deadline
+    # (worst case: a vm-death resubmit racing the deadline). Expired means don't
+    # start the call at all (TEAM-3307).
     if outer_deadline is not None and time.monotonic() >= outer_deadline:
         return _deadline_expired_error()
     try:
@@ -995,19 +1241,19 @@ def _submit_and_poll(client, payload: dict, outer_deadline: float | None = None,
             return rejected
         logger.warning(f"[remote-coding] submit response lost: {str(e)[:200]}")
         submitted = _recover_lost_submit(client, payload, outer_deadline)
-        if submitted is None:
-            return {"error": "submit response lost and could not be safely "
-                             "recovered (see logs)"}
     if submitted.get("error"):
         # Setup failure (bad repo, clone, auth) — answered synchronously, the
-        # turn never started. setup_failed (current runtimes) marks it terminal.
+        # turn never started. setup_failed marks it terminal.
         return submitted
     if not submitted.get("turn_id"):
-        # Runtime predates async mode (or ran a legacy path) and executed the
-        # turn synchronously — its result is already complete.
+        # Runtime ran the turn synchronously (legacy path) — its result is
+        # already complete.
         return submitted
-    return _poll_coding_turn(client, submitted["turn_id"], outer_deadline, budget_s,
-                             cli=payload.get("cli", ""))
+    return _wait_coding_turn(submitted["turn_id"], outer_deadline,
+                             cli=payload.get("cli", ""), cli_bound_s=cli_bound_s,
+                             # The runtime reports where it put this turn's state;
+                             # only fall back to the default when it did not.
+                             turn_dir=submitted.get("turn_dir"))
 
 
 def _remote_coding_turn(task: str, cli: str, repo: str = "", model: str = "",
@@ -1066,14 +1312,14 @@ def _remote_coding_turn(task: str, cli: str, repo: str = "", model: str = "",
         if _CODING_SESSION.get("clone_url"):
             payload["clone_url"] = _CODING_SESSION["clone_url"]
 
-    # Submit + poll instead of one long-lived call: ANY invocation whose
-    # response goes quiet for ~15 min is killed silently by the platform, and
-    # coding turns are routinely silent that long (builds, big writes) — both
-    # the sync AND the SSE transport died this way (stuck-fleet postmortems
-    # 2026-08-27 ×2). Submit returns a turn_id in seconds; the turn journals to
-    # EFS; each poll is a fresh sub-second invocation. No connection lives long
-    # enough to idle out, and a result written right before a microVM recycle
-    # is still collected from the journal.
+    # Submit + wait instead of one long-lived call: ANY invocation whose response
+    # goes quiet for ~15 min is killed by the platform (verified again 2026-09-10:
+    # "didn't have a response byte in last 15 mins"), and coding turns are
+    # routinely silent that long — both the sync AND the SSE transport died this
+    # way (stuck-fleet postmortems 2026-08-27 ×2). Submit returns a turn_id in
+    # seconds, then _wait_coding_turn blocks in short slices inside the coding
+    # container via the command API (DL-026). No connection lives long enough to
+    # idle out, and liveness is the CLI process itself rather than a file.
     payload["mode"] = "async"
 
     logger.info(
@@ -1081,25 +1327,16 @@ def _remote_coding_turn(task: str, cli: str, repo: str = "", model: str = "",
         f"(resume={bool(conversation_id)}, repo={_CODING_SESSION.get('repo')}, mode=async"
         f"{', plan_only' if payload.get('permission_mode') == 'plan' else ''})"
     )
-    # Scale the poll budget + outer deadline when the forwarded per-agent turn
-    # cap exceeds the 1500s the fleet defaults already assume (TEAM-3687). The
-    # far side's CLI may now run up to turnTimeoutSecs, so widen both bounds by
-    # exactly the EXCESS above that baseline: the budget carries its terminal-work
-    # headroom (already baked into REMOTE_CODING_TURN_BUDGET_S = 1500 + margin),
-    # and the deadline clears the wider budget (2x, matching its own default
-    # READ_TIMEOUT + 2*budget shape). A delta — not max(turnTimeoutSecs+margin,
-    # …) — keeps this a TRUE no-op at the default cap: the fleet globals
-    # (REMOTE_CODING_TURN_BUDGET_S / _DEADLINE_S, both env-tunable) stay
-    # authoritative and an operator can still lower them, whereas a hardcoded
-    # 1500+margin floor would silently clamp any override below ~2700/6000.
-    _budget_excess = max(0, _WATCHDOG["turnTimeoutSecs"]
-                         - _WATCHDOG_LEGACY["turnTimeoutSecs"])
-    eff_budget = REMOTE_CODING_TURN_BUDGET_S + _budget_excess
-    eff_deadline_s = REMOTE_CODING_TURN_DEADLINE_S + 2 * _budget_excess
-    # One monotonic deadline for the WHOLE nested turn — submit, recovery,
-    # polls, and the automatic vm-death resubmit all check against it, so no
+    # The CLI's own wall-clock cap comes from the per-agent watchdog and is
+    # forwarded in the payload (TEAM-3687); the wait loop kills the process group
+    # a kill-grace later if it is still alive. No budget arithmetic and no
+    # heartbeat-driven extension: the bound is the cap the agent was configured
+    # with, and the only other bound is the outer deadline.
+    cli_bound_s = _WATCHDOG["turnTimeoutSecs"] + REMOTE_CODING_KILL_GRACE_S
+    # One monotonic deadline for the WHOLE nested turn — submit, recovery, every
+    # wait slice, and the automatic vm-death resubmit all check against it, so no
     # combination of inner retries can silently block this persona past it.
-    turn_deadline = time.monotonic() + eff_deadline_s
+    turn_deadline = time.monotonic() + REMOTE_CODING_TURN_DEADLINE_S
     try:
         client = boto3.client(
             "bedrock-agentcore", region_name=REGION,
@@ -1107,7 +1344,7 @@ def _remote_coding_turn(task: str, cli: str, repo: str = "", model: str = "",
                                   connect_timeout=30,
                                   retries={"max_attempts": 0}),
         )
-        result = _submit_and_poll(client, payload, turn_deadline, eff_budget)
+        result = _submit_and_wait(client, payload, turn_deadline, cli_bound_s)
         # A dead/vanished verdict means the microVM recycled mid-turn — the
         # workspace and transcript are on EFS, so one automatic resubmit (same
         # conversation id) is cheap and usually completes. A second death is a
@@ -1115,7 +1352,7 @@ def _remote_coding_turn(task: str, cli: str, repo: str = "", model: str = "",
         if result.get("retryable_vm_death"):
             if time.monotonic() < turn_deadline:
                 logger.warning(f"[remote-coding] {result.get('error')} — resubmitting once")
-                result = _submit_and_poll(client, payload, turn_deadline, eff_budget)
+                result = _submit_and_wait(client, payload, turn_deadline, cli_bound_s)
             result.pop("retryable_vm_death", None)
         # The coding runtime refused: another turn is live in this session's
         # checkout. If we ADOPTED the session (resume_session) and have not run
@@ -1141,7 +1378,7 @@ def _remote_coding_turn(task: str, cli: str, repo: str = "", model: str = "",
                 payload["session_id"] = fresh_id
                 for k in ("claude_session_id", "resume_transcript", "resume_session_id"):
                     payload.pop(k, None)
-                result = _submit_and_poll(client, payload, turn_deadline, eff_budget)
+                result = _submit_and_wait(client, payload, turn_deadline, cli_bound_s)
     except Exception as e:  # noqa: BLE001
         # Do NOT fall back to a local CLI run: the session's workspace lives on
         # the coding runtime, and a local run would fork it (split-brain).
@@ -2949,12 +3186,13 @@ def _publish_operator_delivery(workflow_id: str, agent_id: str, message: str):
 
 
 def _publish_coding_heartbeat(cli: str, elapsed_s: int):
-    """Prove-alive pulse for a long polled coding turn. The runner journals a
-    heartbeat every ~15s, but the fleet emits nothing while polling — so the UI
-    looks frozen and the Workflow Manager false-pages "stream silent" on healthy
-    turns. Ride the same agent.streaming path as model text (stamped with the
-    current ticket) so both the live view and WM's silence timer see the CLI is
-    working. Best-effort: never raises, never blocks the poll loop."""
+    """Prove-alive pulse for a long coding turn. Nothing else reaches the events
+    table while we sit in a wait slice, so the UI would look frozen and the
+    orchestrator's dead-session sweep — whose only liveness signal is an
+    agent.streaming event inside the lease TTL (lambda/orchestrator/lease.mjs
+    lastAgentActivity, 30 min) — would declare the persona dead and re-dispatch
+    its ticket. Ride the same agent.streaming path as model text, stamped with the
+    current ticket. Best-effort: never raises, never blocks the wait loop."""
     import time, random, string
     try:
         label = (cli or "coding CLI").strip()

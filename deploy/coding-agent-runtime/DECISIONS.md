@@ -87,3 +87,25 @@ Code's own resume, not an extracted text summary.
 - **Claude only** — Codex resume is a different `thread_id` mechanism, deferred.
 - **[CONFIRM]** terminal-tab auto-resume (`claude --resume` in the PTY) rides the
   same installed transcript; wired next.
+
+## Turn state is VM-local; the caller waits via the command API
+
+See DL-026 in `docs/workflow-pipeline-architecture.md` for the full decision.
+Short version, because it is the thing most likely to be "simplified" back:
+
+- A turn's status is NOT on `/mnt/efs`. It is `TURNS_ROOT/<turn_id>/` on this
+  microVM's disk. When the EFS access point lost write permission for 16 minutes
+  on 2026-09-10, every turn on the VM 503'd purely because status lived there.
+- There is no heartbeat. The previous design had the runner write `running` every
+  15s and the fleet poll for staleness; a wedged CLI whose heartbeat thread was
+  healthy advertised `running` for 2h40m. Liveness is now the CLI process, read by
+  the caller from `/proc/<pid>/stat` through `InvokeAgentRuntimeCommand`.
+- `kill -0` must never be used for that check. PID 1 here does not reap, so a
+  SIGKILLed CLI lingers as a zombie and `kill -0` keeps answering "alive".
+  `test_turn_probe_scripts.py` pins this against real processes.
+- CLI stderr goes to a FILE, not a pipe. `proc.stderr.read()` after the CLI exits
+  blocks forever if a grandchild that escaped the process-group kill still holds
+  the write end.
+- `meta.json` is written BEFORE workspace setup. A submit whose response is lost
+  mid-clone must probe as `starting`; if it probed as "no such turn" the caller
+  would resubmit and two clones would race in one checkout.

@@ -708,6 +708,88 @@ two Claude Code processes flipped HEAD under each other in one working tree.
 **Not in scope**: per-ticket git worktrees inside one session — a fresh session
 per ticket already gives each ticket its own checkout.
 
+---
+
+### DL-026: Coding-Turn Transport is Submit + Command-API Wait (No Turn State on EFS)
+
+**Status**: ACTIVE (2026-09-10)
+
+**Context**: AgentCore kills any `InvokeAgentRuntime` response that goes 15
+minutes without a byte (re-verified 2026-09-10 in prod: *"Request timed out as the
+agent didn't have a response byte in last 15 mins"*; streaming is capped at 60
+minutes total, and neither is adjustable). Coding turns routinely run 20-60
+minutes with long silent stretches, so a persona cannot hold a connection open
+for one. The first answer (PR #109) was submit + poll over a **journal**: the
+coding runtime wrote a per-turn status file to shared EFS with a 15s heartbeat and
+the fleet polled it every 20s.
+
+That layer, not the CLIs, produced the largest losses in the 2026-09-10 twin-run
+RCA:
+
+- **D1** a wedged kiro turn: the watchdog's `proc.kill()` reaped the launcher pid
+  only, a grandchild kept the stdout pipe open, so the reader never saw EOF and
+  never wrote a verdict — while the heartbeat thread happily advertised `running`
+  for 2h40m. The fleet's own rule (a live heartbeat extends the deadline, hard
+  stop at `2 x budget`) then burned 9600s and reported a bound of 4800s.
+- **D2** the EFS access point lost write permission for 16 minutes; because turn
+  status lived there, every turn on that microVM 503'd and the self-heal (`chmod`,
+  which needs ownership) failed identically.
+
+Two research passes over the AWS docs, SDK and samples confirmed there is **no
+native completion signal** a caller can read: `add_async_task`/`HealthyBusy` only
+stop the platform reaping the microVM, there is no Get/List RuntimeSession API, no
+EventBridge session event, and metrics are per runtime, never per session. AWS's
+own long-running samples either poll the same way or have the agent **call back**.
+
+**Decision**: keep submit + wait (the platform forces it), but stop inferring
+liveness from a file the runner writes about itself.
+
+1. **Turn state is VM-local**: `TURNS_ROOT/<turn_id>/{meta.json,pid,stderr.log,done.json}`
+   on the microVM's own disk, created **before** workspace setup so a lost submit
+   response reads as `starting`, never as "no such turn".
+2. **The fleet waits by asking the kernel.** One `InvokeAgentRuntimeCommand` per
+   ~60s slice runs a short shell probe *inside the same container* — documented,
+   and verified in prod, to run concurrently with an in-flight invocation. It
+   reports `done` / `missing` / `starting` / `running` / `exited_no_done` from
+   `/proc/<pid>/stat`, and returns the moment `done.json` appears.
+3. **`kill -0` is not liveness.** A SIGKILLed CLI lingers as a zombie because PID
+   1 in that container does not reap, so `kill -0` keeps answering "alive" — that
+   is precisely how D1 hid for 2h40m. The probe reads the process STATE and treats
+   `Z` as exited.
+4. **Bounds are numbers decided in advance, never extended**: the CLI's own
+   `turnTimeoutSecs` plus a kill grace (then the fleet kills the process **group**
+   from outside and returns its own verdict), a start grace for workspace setup, a
+   harvest grace for post-CLI work, a probe-failure bound, and one absolute outer
+   deadline. A wait cannot outlive its bound even if the caller passes no deadline.
+5. **A killed turn's own record is diagnostic only.** codex and kiro emit a `done`
+   frame whose response is "⚠ … timed out" with no `error` key; publishing that as
+   a result would tell the persona its work succeeded.
+6. **Results are checksummed.** `done.json` rides back as base64 with a sha256;
+   over 256 KB, or on mismatch, it is refetched by a second probe. An unreadable
+   result is a verify-first error, never a silent failure.
+7. **`{action:"poll"}` survives only as a rollback shim** so a rolled-back fleet
+   still works against a new runtime. Nothing else in the repo ever spoke it.
+
+**Consequences**: the EFS permission failure class disappears from the turn
+control path; a hung CLI is a positive verdict in seconds instead of a timeout
+guess; the heartbeat thread, stale detector, deadline extension and `2 x budget`
+hard stop are deleted rather than tuned. Completion is detected within ~2s instead
+of up to 20s. Cost: a result written in the ~60s window between completion and a
+microVM recycle is lost and the turn is resubmitted in the same conversation
+(rare, bounded, and the price of keeping turn state off shared storage).
+
+**Rejected**: keeping the journal but moving it to DynamoDB — still infers
+liveness from a self-report, so D1 recurs. Callback completion (Step Functions
+task token / Lambda durable functions) is AWS's sanctioned shape and the right
+long-term target, but it requires the orchestrator to change and DL-009 keeps the
+orchestrator thin.
+
+**Rollout**: IAM (`InvokeAgentRuntimeCommand`, `StopRuntimeSession` on the fleet
+role) → coding-runtime image → fleet image, as two merges in that order.
+`surfaces.json` promotes the fleet before the coding runtime, so shipping both in
+one merge would put the new fleet live against an old runtime. Rollback: fleet
+image first, or both together.
+
 ### DL-012: System Prompts Baked at Deploy Time (Not Passed at Invocation)
 
 **Date**: 2026-05-19
@@ -1217,19 +1299,17 @@ If a bad URL still reaches a coding turn (waiver, non-GitHub host, branch or
 auth problem), the coding runtime fails the `git clone` **before any CLI
 starts**. It used to answer with a bare HTTP 500; AgentCore drops the body of
 non-2xx runtime responses, so the fleet only saw `Received error (500)`, could
-not tell a refusal from a dead microVM, ran lost-submit recovery, polled a turn
-that was never journaled, and after three `unknown`s declared a VM death and
-resubmitted (158 identical loops per run, surfaced as "all coding engines
-down" — TEAM-3790/3799). Now:
+not tell a refusal from a dead microVM, ran lost-submit recovery, probed a turn
+that had never registered, declared a VM death and resubmitted (158 identical
+loops per run, surfaced as "all coding engines down" — TEAM-3790/3799). Now:
 
 - **Coding runtime** (`_setup_failure_response`): for `mode:"async"` submits the
-  reason is returned as a **200 body** flagged `setup_failed:true` and journaled
-  as a terminal `done` record under the caller's `turn_id`, so a lost response
-  still resolves on the next poll. Synchronous callers (Cloud Code UI) keep the
-  HTTP status.
-  If the journal write itself fails (degraded EFS) there is no durable record, so
-  the response falls back to the `503` "turn not started" contract instead of
-  claiming one.
+  reason is returned as a **200 body** flagged `setup_failed:true` and recorded as
+  a terminal `done.json` in the turn dir (DL-026), so a lost response still
+  resolves on the next probe and a same-id resubmit dedupes onto the finished
+  turn. The record also lands in the in-memory turn table, which releases the
+  session claim — a failed setup must not leave the session answering
+  `session_busy`. Synchronous callers (Cloud Code UI) keep the HTTP status.
 - **Fleet wrapper** (`_runtime_rejection`, `_remote_coding_turn`): a
   `setup_failed` record is terminal — no recovery, no VM-death resubmit, and the
   persona is told it is a repo/branch/auth problem, not an outage. Every field

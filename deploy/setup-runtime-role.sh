@@ -206,8 +206,12 @@ aws iam put-role-policy \
 echo "   ✓ Attached Code Interpreter + Browser"
 
 # ─── Remote coding runtime (Cloud Code) ──────────────────────────────────────
-# Lets fleet personas run claude_code/codex turns on the standalone coding
+# Lets fleet personas run claude_code/codex/kiro turns on the standalone coding
 # runtime (persistent EFS sessions, resumable from the Cloud Code tab).
+# InvokeAgentRuntimeCommand: the fleet waits on a turn by running a short shell
+# probe inside the coding session (reads the turn dir, kills a runaway CLI's
+# process group) instead of polling an EFS journal (DL-026).
+# StopRuntimeSession: reaper for a session whose runner is wedged after a kill.
 aws iam put-role-policy \
   --role-name "$ROLE_NAME" \
   --policy-name "InvokeCodingRuntime" \
@@ -216,7 +220,11 @@ aws iam put-role-policy \
     \"Statement\": [{
       \"Sid\": \"InvokeCodingRuntime\",
       \"Effect\": \"Allow\",
-      \"Action\": [\"bedrock-agentcore:InvokeAgentRuntime\"],
+      \"Action\": [
+        \"bedrock-agentcore:InvokeAgentRuntime\",
+        \"bedrock-agentcore:InvokeAgentRuntimeCommand\",
+        \"bedrock-agentcore:StopRuntimeSession\"
+      ],
       \"Resource\": \"arn:aws:bedrock-agentcore:${REGION}:${ACCOUNT_ID}:runtime/*\"
     }]
   }"

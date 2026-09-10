@@ -27,6 +27,7 @@ Run: python3 -m pytest deploy/coding-agent-runtime/test_turn_timeout.py -v
 import importlib.util
 import json
 import os
+import signal
 import sys
 import tempfile
 import threading
@@ -98,6 +99,11 @@ class FakeProc:
 
     def __init__(self, lines=None, block_until_killed=False, returncode=0):
         self.killed = False
+        # The watchdog now kills the process GROUP (os.killpg(proc.pid, SIGKILL),
+        # TEAM-4359), so a Popen stand-in must carry a pid. Tests that let the
+        # timer fire patch os.killpg rather than let this bogus pid reach the
+        # kernel — see test_cli_outliving_tiny_cap_is_killed_with_that_value.
+        self.pid = 424242
         self.returncode = returncode
         self.stdout = FakeStdout(self, lines or [], block_until_killed)
         self.stderr = None
@@ -228,12 +234,18 @@ class TestStreamClaudeEnforcesTimeout(_StreamTimeoutBase):
 
     def test_cli_outliving_tiny_cap_is_killed_with_that_value(self):
         fake = FakeProc(lines=[], block_until_killed=True)
-        with mock.patch.object(main.subprocess, "Popen", return_value=fake):
+        # killpg is tried first now; make it miss so this fake proc's bogus pid
+        # never reaches the kernel AND the guarded proc.kill() fallback in
+        # _killpg_on_timeout is the path under test (TEAM-4359).
+        with mock.patch.object(main.subprocess, "Popen", return_value=fake), \
+             mock.patch.object(main.os, "killpg",
+                               side_effect=ProcessLookupError) as killpg:
             t0 = time.monotonic()
             events = _drain(main._stream_claude(
                 "hang forever", self._tmp, None, turn_timeout_s=1))
             elapsed = time.monotonic() - t0
 
+        killpg.assert_called_once_with(fake.pid, signal.SIGKILL)
         self.assertTrue(fake.killed, "the watchdog must have killed the wedged CLI")
         self.assertLess(elapsed, 5.0, f"kill overshot the 1s cap badly ({elapsed:.2f}s)")
         errors = [e for e in events if e.get("type") == "error"]

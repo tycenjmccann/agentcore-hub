@@ -109,10 +109,13 @@ phases:
           deploy/runtime-agent/test_telemetry_init.py \
           deploy/runtime-agent/test_build_env_vars.py \
           deploy/runtime-agent/test_remote_coding.py \
+          deploy/runtime-agent/test_turn_probe_scripts.py \
           deploy/runtime-agent/test_fleet_healthcheck.py \
           deploy/coding-agent-runtime/test_setup_failure_response.py \
           deploy/coding-agent-runtime/test_session_busy.py \
           deploy/coding-agent-runtime/test_coding_healthcheck.py \
+          deploy/coding-agent-runtime/test_turn_timeout.py \
+          deploy/coding-agent-runtime/test_turn_timeout_pgroup.py \
           deploy/workflow-manager/toolkit \
           deploy/pipeline/test_ecs_primary_container.py \
           deploy/pipeline/test_plan_surfaces.py \

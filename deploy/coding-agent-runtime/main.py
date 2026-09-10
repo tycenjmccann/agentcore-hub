@@ -32,6 +32,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import socket
 import sqlite3
 import subprocess
@@ -135,12 +136,21 @@ def _resolve_turn_timeout(payload_val) -> int:
     except (ValueError, TypeError):
         return TURN_TIMEOUT_S
     return n if n > 0 else TURN_TIMEOUT_S
-# Async (submit+poll) turns: journal heartbeat cadence and the staleness bar a
-# poll uses to declare a running turn dead (VM crashed mid-turn). The heartbeat
-# is written by the runner thread; 120s of silence >> one 15s beat, so a stale
-# read means the thread is gone, not slow.
-TURN_HEARTBEAT_S = _safe_int_env("TURN_HEARTBEAT_S", 15)
-TURN_STALE_S = _safe_int_env("TURN_STALE_S", 120)
+# Async turns keep their state on THIS VM, never on EFS (DL-026). One directory
+# per turn under TURNS_ROOT holding meta.json (written at submit, before any
+# workspace work), pid (the CLI's process-group leader, written right after
+# Popen), stderr.log, and done.json (the terminal record). The fleet reads them
+# through the AgentCore command API from inside the same container, so there is
+# no heartbeat to keep alive and no shared filesystem in the control path — the
+# 2026-09-10 incidents (EFS EACCES 503s, a wedged CLI heartbeating `running` for
+# 2h20m) were both this layer.
+TURNS_ROOT = os.getenv("TURNS_ROOT", "/tmp/turns")
+# Backstop for a runner thread that never unwinds after its watchdog fired
+# (a grandchild still holding the stdout pipe). Past turn_timeout_s + this, the
+# runner writes a terminal done.json itself so the session can never stay
+# `session_busy` forever. The fleet's own bound (turnTimeoutSecs + kill grace)
+# fires first; this only matters if the fleet is gone.
+TURN_RUNNER_GRACE_S = _safe_int_env("TURN_RUNNER_GRACE_S", 300)
 
 # Per-user coding-CLI config bundle (MCP servers, skills, custom agents, prefs).
 # The app uploads a zip under the tenant prefix (see _tenant_root); we materialize
@@ -188,7 +198,7 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 # are kiro's only usage unit — it never reports token counts.
 _KIRO_CREDITS_RE = re.compile(r"Credits:\s*([0-9.]+)")
 
-_CODING_PROC_NAMES = ("claude", "codex", "kiro", "kiro-cli", "node")
+_CODING_PROC_NAMES = ("claude", "codex", "kiro", "kiro-cli", "kiro-cli-chat", "node")
 COLLECTOR_BIN = "/usr/bin/otelcol-contrib"
 COLLECTOR_CFG = "/app/otel-collector-config.yaml"
 
@@ -2010,10 +2020,84 @@ def _build_claude_args(config_dir: str, claude_session_id: str | None, stream: b
     return args
 
 
+def _turn_stderr_target(turn_dir: str | None):
+    """Where a turn's CLI writes stderr. Async turns (turn_dir set) get a FILE:
+    a PIPE is read only after the CLI exits, and a grandchild that outlived the
+    process-group kill keeps the write end open — so proc.stderr.read() blocks
+    forever and the runner never writes its terminal record (TEAM-4359 follow-up,
+    DL-026). Sync/stream callers keep the pipe: they read it inline."""
+    if not turn_dir:
+        return subprocess.PIPE
+    return open(os.path.join(turn_dir, "stderr.log"), "a", encoding="utf-8", errors="replace")
+
+
+def _turn_stderr_read(proc, turn_dir: str | None, limit: int) -> str:
+    """Last `limit` chars of the CLI's stderr, from the file for async turns or
+    the pipe otherwise. Never blocks on a file; never raises."""
+    try:
+        if turn_dir:
+            path = os.path.join(turn_dir, "stderr.log")
+            if not os.path.exists(path):
+                return ""
+            with open(path, encoding="utf-8", errors="replace") as f:
+                data = f.read()
+            return data[-limit:] if limit else data
+        if proc.stderr:
+            data = proc.stderr.read() or ""
+            return data[:limit] if limit else data
+    except Exception:  # noqa: BLE001 — diagnostics only
+        pass
+    return ""
+
+
+def _turn_note_pid(turn_dir: str | None, pid: int) -> None:
+    """Publish the CLI's pid (== its pgid, start_new_session=True) for the
+    fleet's wait/kill scripts. Best-effort: a failure here degrades the fleet's
+    verdict to `starting` until done.json appears, it never fails the turn."""
+    if not turn_dir:
+        return
+    try:
+        _turn_write_text(turn_dir, "pid", str(pid))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("turn_pid_write_failed", extra={"error": str(exc)[:200]})
+
+
+def _killpg_on_timeout(proc, cli: str) -> None:
+    """SIGKILL a timed-out CLI's whole process group, not just its launcher.
+
+    TEAM-4359: `proc.kill()` alone reaped only the launcher PID, and every CLI
+    launcher spawns grandchildren that INHERITED our stdout pipe (run-codex.sh →
+    codex; anything claude/kiro shells out to). With the launcher dead but a
+    grandchild still holding the write end, the reader's `for line in proc.stdout`
+    never sees EOF and blocks forever — so the timed_out branch, the terminal
+    frame and watchdog.cancel() were all unreachable, and a kiro turn heartbeated
+    `running` for 2h20m. Closing the pipe from this thread is NOT an alternative:
+    BufferedReader.close() blocks on the buffer lock the stuck read holds, and
+    os.close() does not wake an in-flight read(2) on Linux (both measured).
+
+    Every streaming Popen passes start_new_session=True, so proc.pid IS the pgid
+    and killpg can only ever hit this turn's own group. Deliberately NOT
+    os.killpg(os.getpgid(proc.pid), ...): for a child that is not a session
+    leader that resolves to OUR group and SIGKILLs the runtime itself.
+    """
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError) as exc:
+        # No such group (already reaped), or start_new_session did not take.
+        # Fall back to the launcher-only kill — better than nothing, and the
+        # async runner's TURN_RUNNER_GRACE_S bound is the real backstop.
+        logger.warning("turn_timeout_killpg_failed",
+                       extra={"cli": cli, "error": str(exc)[:200]})
+        try:
+            proc.kill()
+        except (ProcessLookupError, OSError):
+            pass
+
+
 def _stream_claude(prompt: str, workdir: str, claude_session_id: str | None, repo: str | None = None,
                    session_id: str | None = None, tenant_id: str | None = None,
                    model: str | None = None, turn_timeout_s: int = TURN_TIMEOUT_S,
-                   permission_mode: str | None = None):
+                   permission_mode: str | None = None, turn_dir: str | None = None):
     """Generator yielding SSE lines for a Claude turn as it runs.
 
     Parses claude stream-json line-by-line: assistant text deltas → 'text'
@@ -2030,8 +2114,13 @@ def _stream_claude(prompt: str, workdir: str, claude_session_id: str | None, rep
     def sse(obj: dict) -> str:
         return f"data: {json.dumps(obj)}\n\n"
 
+    stderr_target = _turn_stderr_target(turn_dir)
     proc = subprocess.Popen(args, cwd=workdir, env=env, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, text=True, stdin=subprocess.DEVNULL, bufsize=1)
+                            stderr=stderr_target, text=True, stdin=subprocess.DEVNULL,
+                            bufsize=1, start_new_session=True)
+    if stderr_target is not subprocess.PIPE:
+        stderr_target.close()  # the child holds its own descriptor
+    _turn_note_pid(turn_dir, proc.pid)
     # Same watchdog as _stream_codex: the loop blocks on readline, so a wedged
     # claude (or a command it spawned holding stdout) would pin the microVM
     # HealthyBusy forever — and now that workflow personas ride this path, it
@@ -2041,7 +2130,7 @@ def _stream_claude(prompt: str, workdir: str, claude_session_id: str | None, rep
 
     def _kill_on_timeout():
         timed_out.set()
-        proc.kill()
+        _killpg_on_timeout(proc, "claude")
     watchdog = threading.Timer(turn_timeout_s, _kill_on_timeout)
     watchdog.start()
     new_session_id: str | None = claude_session_id
@@ -2090,11 +2179,13 @@ def _stream_claude(prompt: str, workdir: str, claude_session_id: str | None, rep
         watchdog.cancel()
     if timed_out.is_set():
         err = f"claude timed out after {turn_timeout_s}s"
+        logger.error("turn_timeout", extra={"cli": "claude", "turn_timeout_s": turn_timeout_s,
+                                            "session_id": session_id, "stream": True})
         yield sse({"type": "error", "error": err})
         yield sse({"type": "done", "response": f"⚠ {err}", "claude_session_id": new_session_id})
         return
     if proc.returncode not in (0, None):
-        err = (proc.stderr.read() or "")[:600] if proc.stderr else ""
+        err = _turn_stderr_read(proc, turn_dir, 600)
         yield sse({"type": "error", "error": f"claude exited {proc.returncode}: {err}"})
         return
     # Persist {claude_session_id → repo} so a later resume recovers the cwd.
@@ -2205,7 +2296,8 @@ def _run_codex(prompt: str, workdir: str, codex_session_id: str | None,
 
 def _stream_codex(prompt: str, workdir: str, codex_session_id: str | None,
                   repo: str | None = None, session_id: str | None = None,
-                  tenant_id: str | None = None, turn_timeout_s: int = TURN_TIMEOUT_S):
+                  tenant_id: str | None = None, turn_timeout_s: int = TURN_TIMEOUT_S,
+                  turn_dir: str | None = None):
     """Generator yielding SSE lines for a Codex turn as it runs.
 
     codex exec --json emits per-STEP JSONL (not token deltas): thread.started,
@@ -2227,17 +2319,23 @@ def _stream_codex(prompt: str, workdir: str, codex_session_id: str | None,
     if codex_session_id:
         args.append(codex_session_id)
 
+    stderr_target = _turn_stderr_target(turn_dir)
     proc = subprocess.Popen(args, cwd=workdir, env=env, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, text=True, stdin=subprocess.DEVNULL, bufsize=1)
+                            stderr=stderr_target, text=True, stdin=subprocess.DEVNULL,
+                            bufsize=1, start_new_session=True)
+    if stderr_target is not subprocess.PIPE:
+        stderr_target.close()
+    _turn_note_pid(turn_dir, proc.pid)
     # Watchdog: the buffered runner enforced TURN_TIMEOUT_S via subprocess.run;
     # this loop blocks on readline, so a codex (or an invoked command) that wedges
     # without closing stdout would pin the microVM HealthyBusy forever. Kill the
-    # process at the cap so the loop unwinds and a terminal frame is emitted.
+    # whole group at the cap so the loop unwinds and a terminal frame is emitted —
+    # `args` is run-codex.sh, so the codex binary itself is always a GRANDCHILD.
     timed_out = threading.Event()
 
     def _kill_on_timeout():
         timed_out.set()
-        proc.kill()
+        _killpg_on_timeout(proc, "codex")
     watchdog = threading.Timer(turn_timeout_s, _kill_on_timeout)
     watchdog.start()
     thread_id: str | None = codex_session_id
@@ -2302,11 +2400,13 @@ def _stream_codex(prompt: str, workdir: str, codex_session_id: str | None,
         watchdog.cancel()
     if timed_out.is_set():
         err = f"codex timed out after {turn_timeout_s}s"
+        logger.error("turn_timeout", extra={"cli": "codex", "turn_timeout_s": turn_timeout_s,
+                                            "session_id": session_id, "stream": True})
         yield sse({"type": "error", "error": err})
         yield sse({"type": "done", "response": f"⚠ {err}", "claude_session_id": thread_id})
         return
     if proc.returncode not in (0, None) or fail_detail:
-        banner = ((proc.stderr.read() or "")[:200] if proc.stderr else "")
+        banner = _turn_stderr_read(proc, turn_dir, 200)
         err = fail_detail or banner or f"codex exited {proc.returncode}"
         yield sse({"type": "error", "error": f"codex: {err}"})
         yield sse({"type": "done", "response": f"⚠ codex: {err}",
@@ -2380,7 +2480,8 @@ def _run_kiro(prompt: str, workdir: str, kiro_session_id: str | None,
 
 def _stream_kiro(prompt: str, workdir: str, kiro_session_id: str | None,
                  repo: str | None = None, session_id: str | None = None,
-                 tenant_id: str | None = None, turn_timeout_s: int = TURN_TIMEOUT_S):
+                 tenant_id: str | None = None, turn_timeout_s: int = TURN_TIMEOUT_S,
+                 turn_dir: str | None = None):
     """Generator yielding SSE lines for a Kiro turn as it runs.
 
     Kiro chat has no JSON event stream — it prints the reply to stdout as it
@@ -2396,14 +2497,18 @@ def _stream_kiro(prompt: str, workdir: str, kiro_session_id: str | None,
         yield sse({"type": "done", "response": f"⚠ {err}", "claude_session_id": kiro_session_id})
         return
     env = _kiro_env(workdir)
+    stderr_target = _turn_stderr_target(turn_dir)
     proc = subprocess.Popen(_kiro_args(prompt, kiro_session_id), cwd=workdir, env=env,
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                            stdin=subprocess.DEVNULL, bufsize=1)
+                            stdout=subprocess.PIPE, stderr=stderr_target, text=True,
+                            stdin=subprocess.DEVNULL, bufsize=1, start_new_session=True)
+    if stderr_target is not subprocess.PIPE:
+        stderr_target.close()
+    _turn_note_pid(turn_dir, proc.pid)
     timed_out = threading.Event()
 
     def _kill_on_timeout():
         timed_out.set()
-        proc.kill()
+        _killpg_on_timeout(proc, "kiro")
     watchdog = threading.Timer(turn_timeout_s, _kill_on_timeout)
     watchdog.start()
     full_text: list[str] = []
@@ -2422,19 +2527,18 @@ def _stream_kiro(prompt: str, workdir: str, kiro_session_id: str | None,
         watchdog.cancel()
     if timed_out.is_set():
         err = f"kiro timed out after {turn_timeout_s}s"
+        logger.error("turn_timeout", extra={"cli": "kiro", "turn_timeout_s": turn_timeout_s,
+                                            "session_id": session_id, "stream": True})
         yield sse({"type": "error", "error": err})
         yield sse({"type": "done", "response": f"⚠ {err}", "claude_session_id": kiro_session_id})
         return
     if proc.returncode not in (0, None):
-        err = ((proc.stderr.read() or "")[:400] if proc.stderr else "") or f"kiro exited {proc.returncode}"
+        err = _turn_stderr_read(proc, turn_dir, 400) or f"kiro exited {proc.returncode}"
         yield sse({"type": "error", "error": f"kiro: {err}"})
         yield sse({"type": "done", "response": f"⚠ kiro: {err}", "claude_session_id": kiro_session_id})
         return
     # The "▸ Credits: N" billing footer goes to STDERR, not the reply stream.
-    try:
-        stderr_tail = _ANSI_RE.sub("", proc.stderr.read() or "") if proc.stderr else ""
-    except Exception:  # noqa: BLE001
-        stderr_tail = ""
+    stderr_tail = _ANSI_RE.sub("", _turn_stderr_read(proc, turn_dir, 0))
     m = _KIRO_CREDITS_RE.search(stderr_tail) or _KIRO_CREDITS_RE.search("".join(full_text))
     if m:
         _log_coding_usage("kiro", session_id, model=KIRO_MODEL or "auto",
@@ -2496,82 +2600,159 @@ def _session_busy_turn(session_id: str | None, turn_id: str) -> str | None:
     return None
 
 
-def _turn_journal_path(session_id: str | None, turn_id: str) -> str:
+def _turn_dir(turn_id: str) -> str:
     safe = re.sub(r"[^A-Za-z0-9._-]", "-", turn_id)[:80]
-    return os.path.join(_session_dir(session_id), ".turns", f"{safe}.json")
+    return os.path.join(TURNS_ROOT, safe)
 
 
-def _journal_write(path: str, record: dict) -> bool:
-    """Atomic-enough journal write (tmp + rename; EFS rename is atomic within a
-    directory). Never raises — a failed beat must not kill the runner thread —
-    but reports success so the submit path can refuse to start a turn whose
-    journal can't be seeded (an accepted turn with no journal reads as 'unknown'
-    and would get resubmitted while still running)."""
+def _turn_write_text(turn_dir: str, name: str, text: str) -> None:
+    """tmp + rename on local disk, so a concurrent reader (the fleet's wait
+    script) never sees a torn file. Raises: callers decide what a failure means."""
+    os.makedirs(turn_dir, exist_ok=True)
+    path = os.path.join(turn_dir, name)
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+def _turn_write_json(turn_dir: str, name: str, record: dict) -> bool:
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        tmp = f"{path}.tmp"
-        with open(tmp, "w") as f:
-            json.dump(record, f)
-        os.replace(tmp, path)
+        _turn_write_text(turn_dir, name, json.dumps(record))
         return True
     except OSError as exc:
-        logger.warning("turn_journal_write_failed", extra={"error": str(exc)[:200]})
+        logger.error("turn_state_write_failed", extra={"file": name, "error": str(exc)[:200]})
         return False
 
 
-def _run_turn_async(turn_id: str, journal: str, cli: str, prompt: str, workdir: str,
+def _turn_read_done(turn_dir: str) -> dict | None:
+    try:
+        with open(os.path.join(turn_dir, "done.json"), encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _prune_turn_dirs(max_age_s: int = 86400) -> None:
+    """A microVM can live 8h and serve many turns; drop dirs older than a day.
+    Best-effort."""
+    try:
+        cutoff = time.time() - max_age_s
+        for name in os.listdir(TURNS_ROOT):
+            path = os.path.join(TURNS_ROOT, name)
+            try:
+                if os.path.isdir(path) and os.path.getmtime(path) < cutoff:
+                    shutil.rmtree(path, ignore_errors=True)
+            except OSError:
+                continue
+    except OSError:
+        pass
+
+
+def _register_turn(turn_id: str, cli: str, session_id: str | None,
+                   turn_timeout_s: int) -> str | None:
+    """Claim a turn BEFORE any workspace work: meta.json on disk and a `running`
+    entry in _ACTIVE_TURNS. Two reasons it must happen this early:
+      - a same-id resubmit while this one is still cloning must dedupe onto it,
+        not start a second clone into the same workdir;
+      - the fleet's wait script must read `starting` (meta, no pid yet), never
+        `missing` (which means "no such turn on this VM" and triggers a resubmit).
+    Returns the turn dir, or None if /tmp itself is unwritable (a genuine 500)."""
+    _prune_turn_dirs()
+    d = _turn_dir(turn_id)
+    meta = {"turn_id": turn_id, "cli": cli, "session_id": session_id, "phase": "setup",
+            "started_at": int(time.time()), "turn_timeout_s": turn_timeout_s}
+    if not _turn_write_json(d, "meta.json", meta):
+        return None
+    _ACTIVE_TURNS[turn_id] = {"status": "running", **meta}
+    return d
+
+
+def _abandon_turn(payload: dict) -> None:
+    """A registered async turn is leaving the handler without a runner thread
+    (config-only / warm / checkpoint answers). Release the claim so the session
+    is not `session_busy` for a turn that never ran."""
+    if payload.get("mode") == "async" and payload.get("turn_id"):
+        _ACTIVE_TURNS.pop(payload["turn_id"], None)
+
+
+def _finish_turn(turn_id: str, turn_dir: str, record: dict) -> dict:
+    """Publish the terminal record where each reader looks: done.json on disk
+    (the fleet's wait script) and _ACTIVE_TURNS in memory (the busy check and
+    the poll shim). In memory even if the disk write failed, so a session can
+    never stay busy behind a finished turn."""
+    rec = {**record, "status": "done", "turn_id": turn_id}
+    rec.setdefault("finished_at", int(time.time()))
+    _turn_write_json(turn_dir, "done.json", rec)
+    _ACTIVE_TURNS[turn_id] = rec
+    return rec
+
+
+def _run_turn_async(turn_id: str, turn_dir: str, cli: str, prompt: str, workdir: str,
                     claude_session_id: str | None, repo: str | None,
                     session_id: str | None, tenant_id: str | None,
                     model: str | None, turn_timeout_s: int = TURN_TIMEOUT_S,
                     permission_mode: str | None = None) -> None:
-    """Runner thread body: drive one CLI turn via the existing streaming
-    generators (they carry the watchdog, artifact harvest, and session-id
-    bookkeeping), heartbeat the journal while it runs, then journal the terminal
-    frame. The generator's SSE framing is an implementation detail here — we
-    consume frames directly, no HTTP involved."""
-    # Prune finished entries older than an hour so a long-lived VM doesn't
-    # accumulate every done record it ever served.
+    """Runner thread body: drive one CLI turn through the streaming generator
+    (watchdog, artifact harvest and session-id bookkeeping live there), then
+    write the terminal record to <turn_dir>/done.json. No heartbeat: liveness
+    is the CLI process itself, which the fleet inspects directly (DL-026)."""
     cutoff = int(time.time()) - 3600
     for tid in [t for t, r in _ACTIVE_TURNS.items()
                 if r.get("status") == "done" and int(r.get("finished_at") or 0) < cutoff]:
         _ACTIVE_TURNS.pop(tid, None)
-    _ACTIVE_TURNS[turn_id] = {"status": "running", "turn_id": turn_id, "cli": cli,
-                              "session_id": session_id, "started_at": int(time.time())}
-    beat = {"status": "running", "turn_id": turn_id, "cli": cli,
-            "started_at": int(time.time()), "heartbeat": int(time.time())}
-    stop_beating = threading.Event()
-    # Serializes heartbeat vs terminal writes: once `finished` flips under the
-    # lock, a delayed beat can never overwrite the done record with "running"
-    # (which a poll would later read as a stale heartbeat → dead → duplicate
-    # resubmit of a completed turn). A bounded join can't guarantee that
-    # ordering — an EFS write can outlast any timeout we'd pick.
-    journal_lock = threading.Lock()
+    meta = {**_ACTIVE_TURNS.get(turn_id, {}), "status": "running", "phase": "cli",
+            "turn_id": turn_id, "cli": cli, "session_id": session_id,
+            "cli_started_at": int(time.time())}
+    _ACTIVE_TURNS[turn_id] = meta
+    _turn_write_json(turn_dir, "meta.json", {k: v for k, v in meta.items() if k != "status"})
+
+    lock = threading.Lock()
     finished = threading.Event()
+    forced = threading.Event()
 
-    def _heartbeat():
-        while not stop_beating.wait(TURN_HEARTBEAT_S):
-            with journal_lock:
-                if finished.is_set():
-                    return
-                beat["heartbeat"] = int(time.time())
-                _journal_write(journal, beat)
+    def _force_terminal():
+        # The generator's watchdog fired at turn_timeout_s and the runner STILL
+        # has not unwound: a grandchild that escaped the group kill is holding
+        # the stdout pipe. Publish the verdict ourselves (same keys as a normal
+        # done record) and kill the group once more. Without this the session
+        # would answer session_busy until the VM recycled.
+        with lock:
+            if finished.is_set():
+                return
+            err = (f"{cli} runner did not unwind within {TURN_RUNNER_GRACE_S}s of its "
+                   f"{turn_timeout_s}s cap")
+            _finish_turn(turn_id, turn_dir, {"cli": cli, "response": f"⚠ {err}",
+                                             "claude_session_id": claude_session_id,
+                                             "error": err, "forced": True})
+            finished.set()
+            forced.set()
+        try:
+            with open(os.path.join(turn_dir, "pid")) as f:
+                os.killpg(int(f.read().strip()), signal.SIGKILL)
+        except Exception:  # noqa: BLE001 — group already gone, or no pid yet
+            pass
+        logger.error("turn_timeout_forced", extra={
+            "cli": cli, "turn_id": turn_id, "turn_timeout_s": turn_timeout_s,
+            "grace_s": TURN_RUNNER_GRACE_S})
 
-    beater = threading.Thread(target=_heartbeat, daemon=True)
-    beater.start()
+    backstop = threading.Timer(turn_timeout_s + TURN_RUNNER_GRACE_S, _force_terminal)
+    backstop.daemon = True
+    backstop.start()
 
     result: dict = {}
     last_error = ""
     try:
         if cli == "codex":
             gen = _stream_codex(prompt, workdir, claude_session_id, repo, session_id, tenant_id,
-                                turn_timeout_s)
+                                turn_timeout_s, turn_dir=turn_dir)
         elif cli == "kiro":
             gen = _stream_kiro(prompt, workdir, claude_session_id, repo, session_id, tenant_id,
-                               turn_timeout_s)
+                               turn_timeout_s, turn_dir=turn_dir)
         else:
             gen = _stream_claude(prompt, workdir, claude_session_id, repo,
                                  session_id, tenant_id, model, turn_timeout_s,
-                                 permission_mode=permission_mode)
+                                 permission_mode=permission_mode, turn_dir=turn_dir)
         for line in gen:
             if not line.startswith("data:"):
                 continue
@@ -2584,11 +2765,12 @@ def _run_turn_async(turn_id: str, journal: str, cli: str, prompt: str, workdir: 
                 last_error = str(frame.get("error") or "")[:600]
             elif ftype == "done":
                 result = frame
-    except Exception as exc:  # noqa: BLE001 — journal the failure, never raise
+    except Exception as exc:  # noqa: BLE001 — record the failure, never raise
         last_error = str(exc)[:600]
+    finally:
+        backstop.cancel()
 
-    done = {"status": "done", "turn_id": turn_id, "cli": cli,
-            "finished_at": int(time.time()),
+    done = {"cli": cli,
             "response": result.get("response") or "",
             "claude_session_id": result.get("claude_session_id")}
     if result.get("artifacts"):
@@ -2597,64 +2779,35 @@ def _run_turn_async(turn_id: str, journal: str, cli: str, prompt: str, workdir: 
         done["error"] = last_error or "turn produced no done frame"
     elif last_error and not (done["response"] or "").strip():
         done["error"] = last_error
-    # Heartbeats stay alive UNTIL the terminal record is durably written: if
-    # this write fails transiently (degraded EFS) and beats had already
-    # stopped, the last durable record would go stale → dead → the caller
-    # resubmits a turn that actually completed. Retry under liveness; only a
-    # persistent failure (result truly undeliverable) lets the journal go
-    # stale, and then a resubmit IS the right outcome.
-    for _ in range(15):
-        with journal_lock:
-            if _journal_write(journal, done):
-                finished.set()
-                break
-        time.sleep(4)
-    else:
-        logger.error("turn_done_write_failed", extra={"turn_id": turn_id})
-    stop_beating.set()
-    # Keep the result reachable in memory even if EFS never accepted the done
-    # record — a poll on this VM serves it from here (see _poll_turn).
-    _ACTIVE_TURNS[turn_id] = done
+    with lock:
+        if finished.is_set():
+            # The backstop already published a verdict the caller acted on; a
+            # late real result must not overwrite it.
+            logger.warning("turn_done_after_forced_timeout",
+                           extra={"cli": cli, "turn_id": turn_id,
+                                  "chars": len(done["response"]), "turn_timeout_s": turn_timeout_s})
+            return
+        _finish_turn(turn_id, turn_dir, done)
+        finished.set()
     logger.info("turn_done", extra={"cli": cli, "chars": len(done["response"]),
                                     "async": True, "turn_id": turn_id})
 
 
 def _poll_turn(session_id: str | None, turn_id: str) -> dict:
-    """Classify a turn. Read-only — a poll can never touch the CLI process or
-    start work.
-
-    Order of authority: the in-process _ACTIVE_TURNS table first (session
-    affinity means a live runner is on THIS VM — its word beats any EFS state,
-    including a journal gone stale because EFS write attempts are failing while
-    the CLI is alive), then the EFS journal (which is what survives a VM
-    recycle — the case where 'dead'/'unknown' verdicts are actually true)."""
+    """Rollback shim for fleets that still poll {action:"poll"} instead of
+    reading the turn dir through the command API. Read-only. In-memory table
+    first, then done.json, else `unknown`. There is no heartbeat any more, so
+    there is no `dead` or `transient` verdict: a turn that is not in memory and
+    has no done.json is simply not on this VM."""
     live = _ACTIVE_TURNS.get(turn_id)
     if live is not None:
         if live.get("status") == "done":
-            return live  # terminal result, even if EFS never accepted it
+            return live
         return {"status": "running", "turn_id": turn_id, "source": "memory"}
-    journal = _turn_journal_path(session_id, turn_id)
-    try:
-        with open(journal) as f:
-            record = json.load(f)
-    except FileNotFoundError:
-        # Not in memory and no journal: the VM recycled before the seed was
-        # durable, or the runner died pre-write. Either way the turn is gone.
-        return {"status": "unknown", "turn_id": turn_id}
-    except (OSError, json.JSONDecodeError) as exc:
-        # Degraded EFS read or a torn read racing the tmp+rename — the turn may
-        # well still be running on another incarnation's clock. NOT death:
-        # callers must keep polling, never resubmit off this.
-        return {"status": "transient", "turn_id": turn_id, "detail": str(exc)[:200]}
-    if record.get("status") == "running":
-        # Journal says running but the turn is NOT in this VM's memory: with
-        # session affinity that means the VM restarted mid-turn. The stale bar
-        # guards the brief window where a poll raced the submit on a healthy VM.
-        age = int(time.time()) - int(record.get("heartbeat") or 0)
-        if age > TURN_STALE_S:
-            return {"status": "dead", "turn_id": turn_id, "stale_s": age}
-        return {"status": "running", "turn_id": turn_id, "heartbeat_age_s": age}
-    return record  # done record verbatim (response / error / artifacts)
+    rec = _turn_read_done(_turn_dir(turn_id))
+    if rec:
+        return rec
+    return {"status": "unknown", "turn_id": turn_id}
 
 
 # ─── Server ───────────────────────────────────────────────────────────────────
@@ -2714,24 +2867,11 @@ def _setup_failure_response(payload: dict, cli: str, session_id: str | None,
         return JSONResponse(body, status_code=status_code)
     turn_id = payload.get("turn_id")
     if turn_id:
-        journaled = _journal_write(
-            _turn_journal_path(session_id, turn_id),
-            {"status": "done", "turn_id": turn_id, "cli": cli,
-             "finished_at": int(time.time()), "response": "",
-             "error": error, "setup_failed": True})
-        if not journaled:
-            # EFS is unwritable, so the terminal record does NOT exist. Returning
-            # 200 here would claim a durable verdict that a lost response could
-            # not recover: the poll would read 'unknown' and the caller would
-            # resubmit — the exact loop this path exists to stop. Degraded EFS is
-            # also a plausible CAUSE of the setup failure itself. Use the same
-            # 503 contract as an unseedable normal turn: transient, turn not
-            # started, caller may retry the same call.
-            return JSONResponse(
-                {"error": f"turn journal unwritable (EFS degraded) — turn not "
-                          f"started; setup had already failed with: {error}",
-                 "cli": cli},
-                status_code=503)
+        # Terminal record under the caller's turn_id: a lost 200 body is then
+        # resolved by the fleet's wait script (done.json) and a same-id resubmit
+        # dedupes onto the finished turn instead of re-running the doomed setup.
+        _finish_turn(turn_id, _turn_dir(turn_id),
+                     {"cli": cli, "response": "", "error": error, "setup_failed": True})
         body["turn_id"] = turn_id
     return JSONResponse(body, status_code=200)
 
@@ -2881,6 +3021,22 @@ async def invocations(request: Request):
                                           f"one CLI per workspace",
                                  "session_busy": True, "busy_turn_id": busy_turn,
                                  "turn_id": payload.get("turn_id"), "cli": cli})
+        # Claim the turn NOW, before clone/checkout: the caller-supplied turn_id
+        # makes submission idempotent (a lost response + same-id resubmit dedupes
+        # onto this one instead of cloning twice into one workdir), and the fleet's
+        # wait script must find meta.json (`starting`) from the first second.
+        turn_id = payload.get("turn_id") or f"turn-{uuid.uuid4().hex}"
+        payload["turn_id"] = turn_id
+        if turn_id in _ACTIVE_TURNS or os.path.isdir(_turn_dir(turn_id)):
+            logger.info("turn_submit_dedupe", extra={"turn_id": turn_id})
+            return JSONResponse({"submitted": True, "turn_id": turn_id, "cli": cli,
+                                 "deduped": True})
+        if cli in ("claude", "codex", "kiro"):
+            if _register_turn(turn_id, cli, session_id, turn_timeout_s) is None:
+                # /tmp unwritable is a broken VM, not a transient: a real 5xx so the
+                # platform recycles it and the fleet's rejection path answers.
+                return JSONResponse({"error": "turn state directory unwritable — turn not started",
+                                     "cli": cli}, status_code=500)
     # Repopulate the private /tmp resume hint from the durable per-session copy if
     # this microVM was recycled — so even a config-only prepare leaves the
     # Terminal able to auto-resume the conversation.
@@ -2958,6 +3114,7 @@ async def invocations(request: Request):
         resume_ready = os.path.exists(RESUME_HINT_PATH)
         logger.info("prepare_done", extra={"user": user_id, "version": config_version,
                                            "ok": config_ok, "resume_ready": resume_ready})
+        _abandon_turn(payload)
         return JSONResponse({"prepared": config_ok, "config_error": config_err or None,
                              "resume_ready": resume_ready})
 
@@ -3064,6 +3221,7 @@ async def invocations(request: Request):
     # Checkpoint: upload the grown transcript back to S3 for the laptop to pull.
     # The session id to checkpoint is the resume id (the conversation's real id).
     if checkpoint:
+        _abandon_turn(payload)
         cp_id = resume_session_id or claude_session_id
         if not cp_id:
             return JSONResponse({"error": "checkpoint needs a session id"}, status_code=400)
@@ -3089,67 +3247,29 @@ async def invocations(request: Request):
     # Pre-warm done: workspace cloned, branch checked out, transcript installed.
     # No CLI runs — the first real turn (on open) will be instant + warm.
     if warm:
+        _abandon_turn(payload)
         logger.info("warm_done", extra={"repo": _scrub_git_url(repo) if repo else repo, "workspace": workdir,
                                         "resume_ready": resume_ready})
         return JSONResponse({"warmed": True, "workspace": workdir, "cli": cli,
                              "resume_ready": resume_ready})
 
-    # Async path (workflow personas): kick the CLI off on a runner thread and
-    # return a turn_id immediately. The caller polls with {action:"poll",
-    # turn_id, session_id} — no connection stays open during the turn, so the
-    # ~15-min idle-stream kill can't strand anyone. Setup errors above still
-    # fail THIS call synchronously (bad repo, clone failure), which is what the
-    # caller can act on.
+    # Async path (workflow personas): the turn was claimed and its dir created
+    # before workspace setup (see the mode=="async" block above); setup errors
+    # fail THIS call synchronously through _setup_failure_response, which also
+    # writes done.json. Here we only start the runner and return the turn_id.
+    # The caller waits by inspecting <turn_dir> on this VM through the AgentCore
+    # command API (DL-026) — no connection stays open, nothing is journaled to EFS.
     if payload.get("mode") == "async" and cli in ("claude", "codex", "kiro"):
-        # Idempotency: the caller supplies turn_id so a client-side timeout +
-        # resubmit of the same turn can't double-run it — if this id is already
-        # live (or already finished), acknowledge the existing turn instead of
-        # starting a second runner on the same workspace.
-        turn_id = payload.get("turn_id") or f"turn-{uuid.uuid4().hex}"
-        if turn_id in _ACTIVE_TURNS:
-            logger.info("turn_submit_dedupe", extra={"turn_id": turn_id})
-            return JSONResponse({"submitted": True, "turn_id": turn_id, "cli": cli,
-                                 "workspace": workdir, "deduped": True})
-        journal = _turn_journal_path(session_id, turn_id)
-        # Same id journaled on EFS (this VM already ran it, possibly pre-recycle
-        # with a durable result): acknowledge, let the caller's poll collect it.
-        if os.path.exists(journal):
-            logger.info("turn_submit_dedupe_journal", extra={"turn_id": turn_id})
-            return JSONResponse({"submitted": True, "turn_id": turn_id, "cli": cli,
-                                 "workspace": workdir, "deduped": True})
-        # Seed the journal BEFORE returning so an immediate poll can never see
-        # "unknown" for a turn we accepted. If the seed can't be written the
-        # turn must NOT start: an accepted-but-unjournaled turn polls as
-        # "unknown" and gets resubmitted while the original still runs.
-        def _seed() -> bool:
-            return _journal_write(journal, {"status": "running", "turn_id": turn_id,
-                                            "cli": cli, "started_at": int(time.time()),
-                                            "heartbeat": int(time.time())})
-        seeded = _seed()
-        if not seeded:
-            # One self-heal attempt: a transient EFS/ownership degrade on this VM
-            # makes every journal write EACCES and would 503 the turn to death.
-            # Re-establish a writable sessions/ root and retry once before giving up.
-            healed = _ensure_sessions_writable()
-            seeded = _seed() if healed else False
-            if not seeded:
-                # Distinct, alarmable signal: this VM's EFS is degraded and the
-                # run is NOT silently stalling — it's a visible failure to page on.
-                logger.error("efs_write_degraded", extra={"turn_id": turn_id,
-                                                           "session_id": session_id,
-                                                           "healed": healed})
-                return JSONResponse(
-                    {"error": "turn journal unwritable (EFS degraded) — turn not started"},
-                    status_code=503)
+        turn_id = payload["turn_id"]
         threading.Thread(
             target=_run_turn_async,
-            args=(turn_id, journal, cli, prompt, workdir, claude_session_id,
+            args=(turn_id, _turn_dir(turn_id), cli, prompt, workdir, claude_session_id,
                   repo, session_id, tenant_id, model, turn_timeout_s, permission_mode),
             daemon=True,
         ).start()
         logger.info("turn_submitted", extra={"cli": cli, "turn_id": turn_id})
         return JSONResponse({"submitted": True, "turn_id": turn_id, "cli": cli,
-                             "workspace": workdir})
+                             "workspace": workdir, "turn_dir": _turn_dir(turn_id)})
 
     # Streaming path: yield SSE as the turn runs. The runtime forwards an
     # async/sync generator response as text/event-stream through InvokeAgentRuntime.

@@ -5,26 +5,28 @@ pure fixtures, no AWS.
 Run: cd deploy/runtime-agent && python3 -m pytest test_remote_coding.py -v
 (also runs under: python3 -m unittest test_remote_coding.py)
 
-Covers the silent-hang class from the stuck-fleet postmortems on the
-submit+poll transport:
-  A. A nested coding turn that never reaches a verdict — the runner reports
-     "running" on every poll, which EXTENDS the inner budget each time — must
-     be cut off by the overall wall-clock deadline
-     (REMOTE_CODING_TURN_DEADLINE_S), return an ERROR string, and emit an
-     agent.error event instead of blocking the persona.
+Covers the silent-hang class from the stuck-fleet postmortems, now on the
+submit + command-API-wait transport (DL-026): the coding runtime acks a turn and
+the fleet learns the outcome by running a short shell probe inside that same
+container, which reports one of done / missing / starting / running /
+exited_no_done.
+  A. A nested coding turn that never reaches a verdict — every probe answers
+     "running" — must be cut off, return an ERROR string, and emit an agent.error
+     event instead of blocking the persona.
   B. Both failure exits of _remote_coding_turn (exception escaping the
-     submit+poll, and an {error} result) must publish an agent.error event
+     submit+wait, and an {error} result) must publish an agent.error event
      (same events table the dashboard/Workflow Manager read) while still
      returning the ERROR string to the LLM.
   C. A healthy turn finishing under the deadline is untouched — no agent.error,
      response text + session footer intact.
-  D. (TEAM-3307 F1) The deadline is a HARD bound: no blocking
-     InvokeAgentRuntime call (final poll probe, vm-death resubmit) may be
-     STARTED once it has expired — worst-case overshoot is the one call
-     already in flight, never deadline + another connect/read window.
+  D. (TEAM-3307 F1) The deadline is a HARD bound: no blocking call (recovery
+     probe, vm-death resubmit) may be STARTED once it has expired — worst-case
+     overshoot is the one call already in flight.
   E. (TEAM-3307 F2) agent.error publishing retries transient put_item
      failures (bounded, short backoff) and, when exhausted, logs
      workflow_id + ticket_id without raising.
+  F. Every probe verdict maps to exactly one outcome, a CLI alive past its cap is
+     KILLED from outside, and no loop can outlive its bound.
 
 main.py needs strands / bedrock_agentcore / httpx at import time; those are
 stubbed below so this suite runs hermetically (boto3 is real but never called
@@ -123,6 +125,73 @@ def _invoke_response(obj):
     return {"contentType": "application/json", "response": FakeJsonBody(obj)}
 
 
+def _probe_stream(lines, exit_code=0, status="COMPLETED"):
+    """One InvokeAgentRuntimeCommand response: stdout split across chunks the way
+    the platform actually delivers it (arbitrary boundaries, so the parser must
+    concatenate before splitting lines), then a contentStop."""
+    text = "".join(f"{line}\n" for line in lines)
+    mid = len(text) // 2
+    return {"stream": [
+        {"chunk": {"contentDelta": {"stdout": text[:mid]}}},
+        {"chunk": {"contentDelta": {"stdout": text[mid:]}}},
+        {"chunk": {"contentStop": {"exitCode": exit_code, "status": status}}},
+    ]}
+
+
+def _done_lines(record):
+    """The lines the wait script prints for a finished turn."""
+    import base64 as _b64, hashlib as _hl
+    raw = json.dumps(record).encode()
+    return [f"DONE_BYTES={len(raw)}",
+            f"DONE_SHA256={_hl.sha256(raw).hexdigest()}",
+            f"DONE_B64={_b64.b64encode(raw).decode()}",
+            "VERDICT=done"]
+
+
+def _verdict_lines(verdict, **fields):
+    lines = [f"{k.upper()}={v}" for k, v in fields.items()]
+    return lines + [f"VERDICT={verdict}"]
+
+
+class FakeCommandClient:
+    """Scripted stand-in for the bedrock-agentcore command client.
+
+    `script` is a list of responses (or exceptions to raise) consumed in order;
+    the last entry repeats forever, so a test can say "running, then done" or
+    "running for ever" without counting slices."""
+
+    def __init__(self, script):
+        self.script = list(script)
+        self.calls: list = []
+        self.stopped: list = []
+
+    def invoke_agent_runtime_command(self, **kwargs):
+        self.calls.append(kwargs)
+        item = self.script[min(len(self.calls) - 1, len(self.script) - 1)]
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+    def stop_runtime_session(self, **kwargs):
+        self.stopped.append(kwargs)
+        return {"statusCode": 200}
+
+    # convenience for assertions
+    @property
+    def commands(self):
+        return [c["body"]["command"] for c in self.calls]
+
+    def decoded_scripts(self):
+        """The base64 payload of every command, decoded — proves what actually
+        ran inside the container."""
+        import base64 as _b64, re as _re
+        out = []
+        for cmd in self.commands:
+            m = _re.search(r"echo ([A-Za-z0-9+/=]+) \| base64 -d", cmd)
+            out.append(_b64.b64decode(m.group(1)).decode() if m else "")
+        return out
+
+
 class RemoteCodingTestCase(unittest.TestCase):
     def setUp(self):
         main._CODING_SESSION.update({
@@ -167,17 +236,14 @@ class TestOverallTurnDeadline(RemoteCodingTestCase):
 
     def test_never_completing_turn_hits_deadline_and_emits_agent_error(self):
         # Pathological live-forever runner: submit is accepted instantly, then
-        # every poll answers "running" — which extends the poll loop's inner
-        # budget on each iteration. Only the overall wall-clock deadline can
-        # end this turn.
+        # every probe answers "running" with the CLI's cap far in the future, so
+        # neither the kill bound nor the hard stop fires. The overall wall-clock
+        # deadline is the bound that must end this turn.
         submit_client = mock.MagicMock()
         submit_client.invoke_agent_runtime.side_effect = lambda **kw: _invoke_response(
             {"submitted": True, "turn_id": json.loads(kw["payload"])["turn_id"]}
         )
-        poll_client = mock.MagicMock()
-        poll_client.invoke_agent_runtime.side_effect = lambda **kw: _invoke_response(
-            {"status": "running"}
-        )
+        cmd = FakeCommandClient([_probe_stream(_verdict_lines("running", state="S", etimes=1))])
         events_client = mock.MagicMock()
 
         box = {}
@@ -186,19 +252,19 @@ class TestOverallTurnDeadline(RemoteCodingTestCase):
             box["result"] = main._remote_coding_turn("implement the widget", "claude")
 
         with mock.patch.object(main.boto3, "client", return_value=submit_client), \
-             mock.patch.object(main, "_POLL_CLIENT", poll_client, create=True), \
+             mock.patch.object(main, "_CMD_CLIENT", cmd, create=True), \
              mock.patch.object(main, "_ddb_events_client", events_client), \
-             mock.patch.object(main, "REMOTE_CODING_POLL_S", 0.01), \
-             mock.patch.object(main, "REMOTE_CODING_TURN_BUDGET_S", 5), \
+             mock.patch.object(main, "REMOTE_CODING_WAIT_SLICE_S", 0.01), \
+             mock.patch.dict(main._WATCHDOG, {"turnTimeoutSecs": 3600}), \
              mock.patch.object(main, "REMOTE_CODING_TURN_DEADLINE_S", 0.5, create=True):
             worker = threading.Thread(target=run, daemon=True)
             worker.start()
             worker.join(timeout=3.0)
             still_blocked = worker.is_alive()
             if still_blocked:
-                # Pre-fix code blocks until the inner budget's hard stop —
-                # drain the leaked worker before the patches lift so it can't
-                # touch real clients, then fail the assertions below.
+                # Pre-fix code blocks until an inner bound — drain the leaked
+                # worker before the patches lift so it can't touch real clients,
+                # then fail the assertions below.
                 worker.join(timeout=15.0)
 
         self.assertFalse(
@@ -220,7 +286,7 @@ class TestFailureExitsSurfaceAgentError(RemoteCodingTestCase):
         events_client = mock.MagicMock()
         with mock.patch.object(main.boto3, "client", return_value=mock.MagicMock()), \
              mock.patch.object(main, "_ddb_events_client", events_client), \
-             mock.patch.object(main, "_submit_and_poll",
+             mock.patch.object(main, "_submit_and_wait",
                                side_effect=RuntimeError("connection reset by peer")):
             out = main._remote_coding_turn("do the thing", "codex")
 
@@ -230,7 +296,7 @@ class TestFailureExitsSurfaceAgentError(RemoteCodingTestCase):
 
     def test_error_result_publishes_agent_error(self):
         # Synchronous setup failure (bad repo / clone) — submit itself answers
-        # with {error}; no polling happens.
+        # with {error}; no waiting happens.
         submit_client = mock.MagicMock()
         submit_client.invoke_agent_runtime.side_effect = lambda **kw: _invoke_response(
             {"error": "workspace-fatal: clone failed"}
@@ -253,15 +319,13 @@ class TestHealthyTurnUnaffected(RemoteCodingTestCase):
         submit_client.invoke_agent_runtime.side_effect = lambda **kw: _invoke_response(
             {"submitted": True, "turn_id": json.loads(kw["payload"])["turn_id"]}
         )
-        poll_client = mock.MagicMock()
-        poll_client.invoke_agent_runtime.side_effect = lambda **kw: _invoke_response(
-            {"status": "done", "response": "all done", "claude_session_id": "s-1"}
-        )
+        cmd = FakeCommandClient([_probe_stream(_done_lines(
+            {"status": "done", "response": "all done", "claude_session_id": "s-1"}))])
         events_client = mock.MagicMock()
         with mock.patch.object(main.boto3, "client", return_value=submit_client), \
-             mock.patch.object(main, "_POLL_CLIENT", poll_client, create=True), \
+             mock.patch.object(main, "_CMD_CLIENT", cmd, create=True), \
              mock.patch.object(main, "_ddb_events_client", events_client), \
-             mock.patch.object(main, "REMOTE_CODING_POLL_S", 0.01):
+             mock.patch.object(main, "REMOTE_CODING_WAIT_SLICE_S", 0.01):
             out = main._remote_coding_turn("implement the widget", "claude")
 
         self.assertIn("all done", out)
@@ -282,50 +346,49 @@ class TestDeadlineIsHardBound(RemoteCodingTestCase):
     STARTED after (or across) the deadline and pin the persona for a full
     connect+read window (~630s in prod) past REMOTE_CODING_TURN_DEADLINE_S."""
 
-    def test_blocking_polls_do_not_overshoot_deadline_by_more_than_one_call(self):
-        # Every poll BLOCKS for 2s before answering "running" (a slow/hung
-        # poll transport). Deadline is 0.5s. A poll already in flight when the
+    def test_blocking_probes_do_not_overshoot_deadline_by_more_than_one_call(self):
+        # Every probe BLOCKS for 2s before answering "running" (a slice that runs
+        # its full length). Deadline is 0.5s. A probe already in flight when the
         # deadline expires cannot be interrupted — that one call is the
-        # permissible overshoot. Pre-fix, the loop exit was followed by one
-        # MORE unconditional blocking probe, doubling the overshoot.
-        # Invariant: wall time <= deadline + ~one blocking call, and the
-        # failure is still loud (ERROR string + agent.error event).
-        poll_block_s = 2.0
+        # permissible overshoot; nothing else may be started after it.
+        probe_block_s = 2.0
         submit_client = mock.MagicMock()
         submit_client.invoke_agent_runtime.side_effect = lambda **kw: _invoke_response(
             {"submitted": True, "turn_id": json.loads(kw["payload"])["turn_id"]}
         )
 
-        def blocking_running_poll(**kw):
-            time.sleep(poll_block_s)
-            return _invoke_response({"status": "running"})
+        class _SlowCommandClient(FakeCommandClient):
+            def invoke_agent_runtime_command(self, **kwargs):
+                time.sleep(probe_block_s)
+                return super().invoke_agent_runtime_command(**kwargs)
 
-        poll_client = mock.MagicMock()
-        poll_client.invoke_agent_runtime.side_effect = blocking_running_poll
+        cmd = _SlowCommandClient([_probe_stream(_verdict_lines("running", state="S"))])
         events_client = mock.MagicMock()
 
         with mock.patch.object(main.boto3, "client", return_value=submit_client), \
-             mock.patch.object(main, "_POLL_CLIENT", poll_client, create=True), \
+             mock.patch.object(main, "_CMD_CLIENT", cmd, create=True), \
              mock.patch.object(main, "_ddb_events_client", events_client), \
-             mock.patch.object(main, "REMOTE_CODING_POLL_S", 0.01), \
-             mock.patch.object(main, "REMOTE_CODING_TURN_BUDGET_S", 5), \
+             mock.patch.object(main, "REMOTE_CODING_WAIT_SLICE_S", 0.01), \
+             mock.patch.dict(main._WATCHDOG, {"turnTimeoutSecs": 3600}), \
              mock.patch.object(main, "REMOTE_CODING_TURN_DEADLINE_S", 0.5, create=True):
             t0 = time.monotonic()
             result = main._remote_coding_turn("implement the widget", "claude")
             elapsed = time.monotonic() - t0
 
         self.assertLess(
-            elapsed, 0.5 + poll_block_s + 0.5,
+            elapsed, 0.5 + probe_block_s + 0.5,
             f"turn took {elapsed:.2f}s — a blocking call was started after the "
             f"0.5s deadline expired (TEAM-3307 F1 overshoot)",
         )
+        self.assertEqual(len(cmd.calls), 1,
+                         "only the probe already in flight may run past the deadline")
         self.assertTrue(result.startswith("ERROR: remote claude turn"),
                         f"expected a loud ERROR return, got: {result[:120]!r}")
         self.assertIn("deadline", result)
         self._assert_agent_error_published(events_client, "deadline")
 
     def test_submit_is_not_started_once_deadline_expired(self):
-        # The vm-death resubmit race: by the time _submit_and_poll runs again,
+        # The vm-death resubmit race: by the time _submit_and_wait runs again,
         # the deadline has expired. The submit invoke here would block for the
         # full read timeout (mocked as 5s; ~630s in prod) — it must not be
         # STARTED at all, and the caller must get the deadline-expired error.
@@ -337,23 +400,20 @@ class TestDeadlineIsHardBound(RemoteCodingTestCase):
 
         submit_client = mock.MagicMock()
         submit_client.invoke_agent_runtime.side_effect = blocking_submit
-        poll_client = mock.MagicMock()
-        poll_client.invoke_agent_runtime.side_effect = lambda **kw: _invoke_response(
-            {"status": "running"}
-        )
+        cmd = FakeCommandClient([_probe_stream(_verdict_lines("running", state="S"))])
         main._CODING_SESSION["session_id"] = "cc-test-deadline-expired-session"
 
         expired_deadline = time.monotonic() - 0.001
-        with mock.patch.object(main, "_POLL_CLIENT", poll_client, create=True), \
-             mock.patch.object(main, "REMOTE_CODING_POLL_S", 0.01):
+        with mock.patch.object(main, "_CMD_CLIENT", cmd, create=True), \
+             mock.patch.object(main, "REMOTE_CODING_WAIT_SLICE_S", 0.01):
             t0 = time.monotonic()
-            result = main._submit_and_poll(
+            result = main._submit_and_wait(
                 submit_client, {"prompt": "x", "cli": "claude"}, expired_deadline)
             elapsed = time.monotonic() - t0
 
         self.assertLess(
             elapsed, 2.0,
-            f"_submit_and_poll took {elapsed:.2f}s with an already-expired "
+            f"_submit_and_wait took {elapsed:.2f}s with an already-expired "
             f"deadline — the blocking submit was started past it (TEAM-3307 F1)",
         )
         self.assertIn("deadline", result.get("error", ""))
@@ -433,17 +493,15 @@ class TestTurnTimeoutForwarded(RemoteCodingTestCase):
 
         submit_client = mock.MagicMock()
         submit_client.invoke_agent_runtime.side_effect = submit
-        poll_client = mock.MagicMock()
-        poll_client.invoke_agent_runtime.side_effect = lambda **kw: _invoke_response(
-            {"status": "done", "response": "ok", "claude_session_id": "s-1"}
-        )
+        cmd = FakeCommandClient([_probe_stream(_done_lines(
+            {"status": "done", "response": "ok", "claude_session_id": "s-1"}))])
         events_client = mock.MagicMock()
         with mock.patch.object(main.boto3, "client", return_value=submit_client), \
-             mock.patch.object(main, "_POLL_CLIENT", poll_client, create=True), \
+             mock.patch.object(main, "_CMD_CLIENT", cmd, create=True), \
              mock.patch.object(main, "_ddb_events_client", events_client), \
-             mock.patch.object(main, "REMOTE_CODING_POLL_S", 0.01):
+             mock.patch.object(main, "REMOTE_CODING_WAIT_SLICE_S", 0.01):
             main._remote_coding_turn("implement the widget", "claude")
-        # poll rides _POLL_CLIENT, so submit_client only ever sees the submit.
+        # Waiting rides the command client, so submit_client only sees the submit.
         self.assertTrue(captured, "no submit payload was sent")
         return captured[-1]
 
@@ -462,87 +520,93 @@ class TestTurnTimeoutForwarded(RemoteCodingTestCase):
                          "a per-agent override must be forwarded verbatim")
 
 
-class TestPollBudgetScaling(RemoteCodingTestCase):
-    """TEAM-3687 — a per-agent turnTimeoutSecs above the 1500s the fleet budget
-    assumes must widen BOTH the poll budget and the outer deadline by the excess,
-    so the persona doesn't declare the turn dead while the far side's CLI is
-    still legitimately running. It's a DELTA off the fleet globals, so the
-    default cap is byte-identical AND those globals stay authoritative (a
-    hardcoded floor would clamp an operator-lowered override)."""
+class TestCliBoundFromWatchdog(RemoteCodingTestCase):
+    """TEAM-3687 / DL-026 — the only per-turn bound the fleet computes is the
+    CLI's own cap (per-agent turnTimeoutSecs) plus a kill grace. No budget
+    arithmetic, no heartbeat-driven extension: the pre-DL-026 code derived a
+    budget from the cap and then let every "running" poll push it forward, so the
+    only bound that ever fired was 2x budget (9600s on a 4800s budget, 2026-09-09)."""
 
-    def _capture_scaling(self):
+    def _capture_bound(self):
         captured = {}
 
-        def fake_submit_and_poll(client, payload, outer_deadline=None,
-                                 budget_s=None):
-            captured["budget_s"] = budget_s
+        def fake_submit_and_wait(client, payload, outer_deadline=None,
+                                 cli_bound_s=None):
+            captured["cli_bound_s"] = cli_bound_s
             captured["outer_deadline"] = outer_deadline
             return {"status": "done", "response": "ok", "claude_session_id": "s-1"}
 
         events_client = mock.MagicMock()
         with mock.patch.object(main.boto3, "client", return_value=mock.MagicMock()), \
-             mock.patch.object(main, "_submit_and_poll",
-                               side_effect=fake_submit_and_poll), \
+             mock.patch.object(main, "_submit_and_wait",
+                               side_effect=fake_submit_and_wait), \
              mock.patch.object(main, "_ddb_events_client", events_client):
             t0 = time.monotonic()
             main._remote_coding_turn("implement the widget", "claude")
         captured["deadline_from_now"] = captured["outer_deadline"] - t0
         return captured
 
-    def test_default_budget_and_deadline_are_byte_identical(self):
-        cap = self._capture_scaling()
-        # excess = 0 at the default cap → the fleet globals pass through verbatim.
-        self.assertEqual(cap["budget_s"], main.REMOTE_CODING_TURN_BUDGET_S)
-        self.assertEqual(cap["budget_s"], 2700,
-                         "default turnTimeoutSecs must not shrink the fleet budget")
-        self.assertAlmostEqual(cap["deadline_from_now"],
-                               main.REMOTE_CODING_TURN_DEADLINE_S, delta=1.0)
+    def test_default_bound_is_the_cap_plus_kill_grace(self):
+        cap = self._capture_bound()
+        self.assertEqual(cap["cli_bound_s"],
+                         main._WATCHDOG["turnTimeoutSecs"] + main.REMOTE_CODING_KILL_GRACE_S)
+        self.assertEqual(cap["cli_bound_s"], 1560, "1500s cap + 60s kill grace")
 
-    def test_override_widens_budget_and_deadline_by_the_excess(self):
+    def test_override_raises_the_bound_by_exactly_the_override(self):
         with mock.patch.object(main, "_WATCHDOG",
                                {**main._WATCHDOG, "turnTimeoutSecs": 3600}):
-            cap = self._capture_scaling()
-        excess = 3600 - main._WATCHDOG_LEGACY["turnTimeoutSecs"]  # 3600 - 1500
-        # eff_budget = 2700 + 2100 = 4800 (== turnTimeoutSecs + 1200 headroom).
-        self.assertEqual(cap["budget_s"], 4800)
-        self.assertEqual(cap["budget_s"], main.REMOTE_CODING_TURN_BUDGET_S + excess)
-        # eff_deadline = 6000 + 2*2100 = 10200.
-        self.assertAlmostEqual(cap["deadline_from_now"],
-                               main.REMOTE_CODING_TURN_DEADLINE_S + 2 * excess,
-                               delta=1.0)
-        # The deadline must clear the scaled budget (else the outer bound would
-        # cut off a turn the budget still considers live).
-        self.assertGreater(cap["deadline_from_now"],
-                           main.REMOTE_CODING_TURN_DEADLINE_S)
+            cap = self._capture_bound()
+        self.assertEqual(cap["cli_bound_s"], 3600 + main.REMOTE_CODING_KILL_GRACE_S)
+
+    def test_outer_deadline_does_not_scale_with_the_cap(self):
+        """It is an absolute ceiling on the whole nested turn, so it must be the
+        same number whatever the per-agent cap is — and must clear the largest
+        supported cap plus both graces."""
+        default = self._capture_bound()
+        with mock.patch.object(main, "_WATCHDOG",
+                               {**main._WATCHDOG, "turnTimeoutSecs": 3600}):
+            raised = self._capture_bound()
+        self.assertAlmostEqual(default["deadline_from_now"],
+                               raised["deadline_from_now"], delta=1.0)
+        self.assertAlmostEqual(default["deadline_from_now"],
+                               main.REMOTE_CODING_TURN_DEADLINE_S, delta=1.0)
+        self.assertGreater(
+            main.REMOTE_CODING_TURN_DEADLINE_S,
+            3600 + main.REMOTE_CODING_KILL_GRACE_S + main.REMOTE_CODING_HARVEST_GRACE_S
+            + main.REMOTE_CODING_START_GRACE_S,
+            "the outer deadline must not preempt a legitimately long turn")
 
 
-class TestPolledTurnHeartbeat(RemoteCodingTestCase):
-    """A long polled coding turn must emit prove-alive agent.streaming events so
-    the UI never looks frozen and WM's silence timer resets on healthy turns."""
+class TestWaitHeartbeat(RemoteCodingTestCase):
+    """A long coding turn must emit prove-alive agent.streaming events: they are
+    the ONLY liveness signal the orchestrator's dead-session sweep reads
+    (lambda/orchestrator/lease.mjs lastAgentActivity), so without them a healthy
+    turn gets its ticket re-dispatched, and the UI looks frozen."""
 
-    def test_running_polls_emit_throttled_heartbeats(self):
+    def _wait(self, script, heartbeat_s):
         events_client = mock.MagicMock()
-        # running, running, running, then done — with the interval at 0 every
-        # running poll fires one heartbeat.
-        statuses = [
-            {"status": "running"},
-            {"status": "running"},
-            {"status": "running"},
-            {"status": "done", "response": "ok", "claude_session_id": "s-9"},
-        ]
-        with mock.patch.object(main, "_poll_once", side_effect=statuses), \
+        cmd = FakeCommandClient(script)
+        with mock.patch.object(main, "_CMD_CLIENT", cmd, create=True), \
              mock.patch.object(main, "_ddb_events_client", events_client), \
-             mock.patch.object(main, "REMOTE_CODING_POLL_S", 0.001), \
-             mock.patch.object(main, "REMOTE_CODING_HEARTBEAT_S", 0):
-            out = main._poll_coding_turn(mock.MagicMock(), "turn-x", cli="kiro")
-
-        self.assertEqual(out.get("status"), "done")
+             mock.patch.object(main, "REMOTE_CODING_WAIT_SLICE_S", 0.001), \
+             mock.patch.object(main, "REMOTE_CODING_HEARTBEAT_S", heartbeat_s):
+            out = main._wait_coding_turn("turn-x", cli="kiro", cli_bound_s=9999)
         beats = [
             c for c in events_client.put_item.call_args_list
             if c.kwargs.get("Item", {}).get("type", {}).get("S") == "agent.streaming"
             and "still working" in c.kwargs["Item"]["detail"]["M"]["content"]["S"]
         ]
-        self.assertEqual(len(beats), 3, "one heartbeat per running poll expected")
+        return out, beats
+
+    def test_running_slices_emit_throttled_heartbeats(self):
+        running = _probe_stream(_verdict_lines("running", state="S", etimes=5))
+        out, beats = self._wait(
+            [running, running, running,
+             _probe_stream(_done_lines({"status": "done", "response": "ok",
+                                        "claude_session_id": "s-9"}))],
+            heartbeat_s=0)
+        self.assertEqual(out.get("response"), "ok")
+        self.assertEqual(len(beats), 3, "one heartbeat per running slice expected")
         detail = beats[0].kwargs["Item"]["detail"]["M"]
         self.assertEqual(detail["agentId"]["S"], "frontend_dev")
         self.assertEqual(detail["workflowId"]["S"], "wf-test")
@@ -550,29 +614,23 @@ class TestPolledTurnHeartbeat(RemoteCodingTestCase):
         self.assertIn("kiro", detail["content"]["S"])
 
     def test_heartbeat_is_throttled(self):
-        events_client = mock.MagicMock()
-        statuses = [
-            {"status": "running"},
-            {"status": "running"},
-            {"status": "done", "response": "ok"},
-        ]
-        # A large interval means no running poll in this short turn crosses it.
-        with mock.patch.object(main, "_poll_once", side_effect=statuses), \
-             mock.patch.object(main, "_ddb_events_client", events_client), \
-             mock.patch.object(main, "REMOTE_CODING_POLL_S", 0.001), \
-             mock.patch.object(main, "REMOTE_CODING_HEARTBEAT_S", 9999):
-            main._poll_coding_turn(mock.MagicMock(), "turn-x", cli="claude")
+        running = _probe_stream(_verdict_lines("running", state="S"))
+        _, beats = self._wait(
+            [running, running,
+             _probe_stream(_done_lines({"status": "done", "response": "ok"}))],
+            heartbeat_s=9999)
+        self.assertEqual(len(beats), 0,
+                         "throttle must suppress heartbeats within the interval")
 
-        beats = [
-            c for c in events_client.put_item.call_args_list
-            if c.kwargs.get("Item", {}).get("type", {}).get("S") == "agent.streaming"
-            and "still working" in c.kwargs["Item"]["detail"]["M"]["content"]["S"]
-        ]
-        self.assertEqual(len(beats), 0, "throttle must suppress heartbeats within the interval")
-
-
-if __name__ == "__main__":
-    unittest.main()
+    def test_starting_slices_also_pulse(self):
+        """Workspace setup (clone + checkout) can outlast the lease TTL on its
+        own, so the pulse cannot wait for the CLI to exist."""
+        _, beats = self._wait(
+            [_probe_stream(_verdict_lines("starting")),
+             _probe_stream(_verdict_lines("starting")),
+             _probe_stream(_done_lines({"status": "done", "response": "ok"}))],
+            heartbeat_s=0)
+        self.assertEqual(len(beats), 2)
 
 
 class TestSetupFailureIsTerminal(RemoteCodingTestCase):
@@ -705,32 +763,36 @@ class TestSetupFailureIsTerminal(RemoteCodingTestCase):
         client = self._submit_client(RuntimeError("Connection was closed before we received a valid response"))
         with mock.patch.object(main.boto3, "client", return_value=client), \
              mock.patch.object(main, "_ddb_events_client", mock.MagicMock()), \
-             mock.patch.object(main, "_recover_lost_submit", return_value=None) as rec, \
+             mock.patch.object(main, "_recover_lost_submit",
+                               return_value={"submitted": True, "turn_id": "turn-r"}) as rec, \
+             mock.patch.object(main, "_wait_coding_turn",
+                               return_value={"error": "recovered then failed"}), \
              mock.patch.object(main.time, "sleep"):
             out = main._remote_coding_turn("fix the bug", "claude")
         rec.assert_called_once()
-        self.assertIn("could not be safely recovered", out)
+        self.assertIn("recovered then failed", out)
 
-    def test_done_record_with_setup_failed_from_poll_is_terminal(self):
-        # Response lost, then the poll returns the journaled setup failure.
+    def test_done_record_with_setup_failed_is_terminal(self):
+        # Submit response lost, then the wait probe finds the setup failure the
+        # runtime recorded in done.json — terminal, and no resubmit.
         calls = {"n": 0}
 
         def side_effect(**kw):
-            body = json.loads(kw["payload"].decode("utf-8"))
-            if body.get("action") == "poll":
-                return _invoke_response({"status": "done", "turn_id": body["turn_id"],
-                                         "error": "git clone failed: Repository not found.",
-                                         "setup_failed": True, "response": ""})
             calls["n"] += 1
             raise RuntimeError("Connection was closed before we received a valid response")
 
         client = self._submit_client(side_effect)
+        cmd = FakeCommandClient([_probe_stream(_done_lines(
+            {"status": "done", "error": "git clone failed: Repository not found.",
+             "setup_failed": True, "response": ""}))])
         with mock.patch.object(main.boto3, "client", return_value=client), \
+             mock.patch.object(main, "_CMD_CLIENT", cmd, create=True), \
+             mock.patch.object(main, "REMOTE_CODING_WAIT_SLICE_S", 0.01), \
              mock.patch.object(main, "_ddb_events_client", mock.MagicMock()), \
              mock.patch.object(main.time, "sleep"):
             out = main._remote_coding_turn("fix the bug", "codex")
         self.assertTrue(out.startswith("ERROR: remote codex turn could not START:"), out)
-        self.assertEqual(calls["n"], 1, "no resubmit after a journaled setup failure")
+        self.assertEqual(calls["n"], 1, "no resubmit after a recorded setup failure")
 
 
 class TestSessionBusyFallback(RemoteCodingTestCase):
@@ -765,14 +827,13 @@ class TestSessionBusyFallback(RemoteCodingTestCase):
              "busy_turn_id": "turn-other", "turn_id": "turn-1", "cli": "claude"},
             {"submitted": True, "turn_id": "turn-2"},
         ])
-        poll_client = mock.MagicMock()
-        poll_client.invoke_agent_runtime.side_effect = lambda **kw: _invoke_response(
-            {"status": "done", "response": "fixed it", "claude_session_id": "conv-new"})
+        cmd = FakeCommandClient([_probe_stream(_done_lines(
+            {"status": "done", "response": "fixed it", "claude_session_id": "conv-new"}))])
         events_client = mock.MagicMock()
         with mock.patch.object(main.boto3, "client", return_value=client), \
-             mock.patch.object(main, "_POLL_CLIENT", poll_client, create=True), \
+             mock.patch.object(main, "_CMD_CLIENT", cmd, create=True), \
              mock.patch.object(main, "_ddb_events_client", events_client), \
-             mock.patch.object(main, "REMOTE_CODING_POLL_S", 0.01), \
+             mock.patch.object(main, "REMOTE_CODING_WAIT_SLICE_S", 0.01), \
              mock.patch.object(main, "_record_coding_session"):
             out = main._remote_coding_turn("fix the bug", "claude")
 
@@ -841,3 +902,281 @@ class TestSessionBusyFallback(RemoteCodingTestCase):
         self.assertEqual(item["ticketId"]["S"], "TEAM-3119")
         self.assertEqual(item["agentId"]["S"], "frontend_dev")
         self.assertEqual(item["title"]["S"], "[wf] TEAM-3119 frontend_dev")
+
+
+class _FakeClock:
+    """Stand-in for the `time` module inside main: sleep() ADVANCES the clock, so a
+    multi-thousand-second wait runs in milliseconds of real time. Only the wait
+    loop's own time calls are affected (_publish_coding_heartbeat does its own
+    `import time`), so heartbeat behaviour is unchanged."""
+
+    def __init__(self, start=1_000_000.0):
+        self._t = start
+        self._mono = 0.0
+        self.slept = 0.0
+        self.sleeps = 0
+
+    def time(self):
+        return self._t
+
+    def monotonic(self):
+        return self._mono
+
+    def sleep(self, seconds):
+        self._t += seconds
+        self._mono += seconds
+        self.slept += seconds
+        self.sleeps += 1
+
+
+class _ClockedCommandClient(FakeCommandClient):
+    """Command client that advances a fake clock by the slice length on every
+    probe, the way a real blocking slice would. Lets a 3600s bound be exercised
+    without waiting an hour."""
+
+    def __init__(self, script, clock, slice_s):
+        super().__init__(script)
+        self.clock = clock
+        self.slice_s = slice_s
+
+    def invoke_agent_runtime_command(self, **kwargs):
+        resp = super().invoke_agent_runtime_command(**kwargs)
+        self.clock.sleep(self.slice_s)
+        return resp
+
+
+class TestWaitVerdicts(RemoteCodingTestCase):
+    """Test F — every probe verdict maps to exactly one outcome, and every phase
+    is bounded by a number the fleet decided in advance.
+
+    Before DL-026 this logic read a heartbeat file the runner wrote about itself:
+    a wedged CLI whose heartbeat thread was healthy read as "running" forever, and
+    each running poll pushed the deadline out, so the only bound that ever fired
+    was 2x budget (9600s on a 4800s budget, 2026-09-09). Now the probe reports the
+    CLI process state and the fleet kills it at a fixed bound.
+
+    Driven through _wait_coding_turn directly on a fake clock, so the assertions
+    are about the decisions, not about wall time."""
+
+    SLICE_S = 60
+
+    def _wait(self, script, cli_bound_s=1560, events_client=None):
+        clock = _FakeClock()
+        cmd = _ClockedCommandClient(script, clock, self.SLICE_S)
+        with mock.patch.object(main, "_CMD_CLIENT", cmd, create=True), \
+             mock.patch.object(main, "time", clock), \
+             mock.patch.object(main, "REMOTE_CODING_WAIT_SLICE_S", self.SLICE_S), \
+             mock.patch.object(main, "_ddb_events_client",
+                               events_client or mock.MagicMock()):
+            result = main._wait_coding_turn("turn-x", cli="kiro", cli_bound_s=cli_bound_s)
+        return result, cmd, clock
+
+    # ── done ────────────────────────────────────────────────────────────────
+    def test_done_returns_the_record_and_stops_probing(self):
+        record = {"status": "done", "response": "the work", "claude_session_id": "s-1",
+                  "artifacts": ["a.png"]}
+        result, cmd, clock = self._wait([_probe_stream(_done_lines(record))])
+        self.assertEqual(result["response"], "the work")
+        self.assertEqual(result["claude_session_id"], "s-1")
+        self.assertEqual(result["artifacts"], ["a.png"])
+        self.assertEqual(len(cmd.calls), 1, "a finished turn must not be probed twice")
+
+    def test_done_payload_is_verified_against_its_checksum(self):
+        """A truncated stream must not be parsed as a result: the script prints a
+        sha256 of done.json and a mismatch triggers a refetch."""
+        record = {"status": "done", "response": "the work"}
+        bad = _done_lines(record)
+        bad[1] = "DONE_SHA256=" + "0" * 64
+        result, cmd, _ = self._wait([_probe_stream(bad),
+                                     _probe_stream(_done_lines(record))])
+        self.assertEqual(len(cmd.calls), 2, "a checksum mismatch must refetch")
+        self.assertEqual(result["response"], "the work")
+
+    def test_oversized_done_record_is_fetched_with_a_second_command(self):
+        """Over the inline cap the script prints only the checksum, so the record
+        comes back on its own probe rather than being lost."""
+        record = {"status": "done", "response": "x" * 100}
+        lines = [l for l in _done_lines(record) if not l.startswith("DONE_B64=")]
+        result, cmd, _ = self._wait([_probe_stream(lines),
+                                     _probe_stream(_done_lines(record))])
+        self.assertEqual(len(cmd.calls), 2)
+        self.assertEqual(result["response"], "x" * 100)
+
+    def test_unreadable_done_record_is_terminal_and_verify_first(self):
+        lines = ["DONE_BYTES=3", "DONE_SHA256=" + "0" * 64, "DONE_B64=!!!not-base64!!!",
+                 "VERDICT=done"]
+        result, _, _ = self._wait([_probe_stream(lines)])
+        self.assertTrue(result.get("no_retry_hint"),
+                        "an unreadable result must never advise a blind re-run")
+        self.assertIn("check the branch", result["error"].lower())
+
+    # ── running / the kill bound ─────────────────────────────────────────────
+    def test_perpetual_running_is_killed_at_the_bound_not_at_twice_it(self):
+        running = _probe_stream(_verdict_lines("running", state="S", etimes=99))
+        result, cmd, clock = self._wait([running], cli_bound_s=1560)
+        self.assertLessEqual(clock.slept, 1560 + 2 * self.SLICE_S,
+                             f"waited {clock.slept}s against a 1560s bound — the "
+                             f"pre-DL-026 code ran to 2x its bound")
+        self.assertLess(clock.slept, 2 * 1560,
+                        "the give-up point must be the bound, never twice it")
+        self.assertGreaterEqual(clock.slept, 1560 - self.SLICE_S,
+                        "must not give up before the CLI's own cap")
+        scripts = cmd.decoded_scripts()
+        self.assertTrue(any("kill -KILL" in sc for sc in scripts),
+                        "a CLI alive past its bound must be killed from outside")
+        self.assertTrue(result.get("no_retry_hint"))
+        self.assertIn("1560s", result["error"])
+
+    def test_kill_error_reports_the_real_elapsed_time(self):
+        """D1c — the old message named a bound that had not fired ('exceeded
+        4800s' after 9600s), so every downstream RCA reasoned about the wrong
+        number."""
+        running = _probe_stream(_verdict_lines("running", state="S"))
+        result, _, clock = self._wait([running], cli_bound_s=600)
+        self.assertIn("600s", result["error"], "the bound that fired must be named")
+        self.assertRegex(result["error"], r"killed after \d+s",
+                         "the actual elapsed time must be reported")
+
+    def test_a_late_done_after_the_kill_is_not_reported_as_success(self):
+        """A killed codex/kiro turn writes a done record whose response is
+        '⚠ ... timed out' with no error key — reading that as a result would tell
+        the persona its work succeeded."""
+        running = _probe_stream(_verdict_lines("running", state="S"))
+        killed = _probe_stream(_verdict_lines("done") if False else
+                               _done_lines({"status": "done",
+                                            "response": "⚠ kiro timed out after 600s",
+                                            "claude_session_id": "s-2"}))
+        result, _, _ = self._wait([running, killed], cli_bound_s=1)
+        self.assertTrue(result.get("no_retry_hint"))
+        self.assertIn("exceeded its", result["error"])
+        self.assertNotIn("response", result)
+
+    # ── starting ─────────────────────────────────────────────────────────────
+    def test_starting_is_tolerated_then_bounded(self):
+        starting = _probe_stream(_verdict_lines("starting"))
+        result, _, clock = self._wait([starting])
+        self.assertLessEqual(clock.slept,
+                             main.REMOTE_CODING_START_GRACE_S + 2 * self.SLICE_S)
+        self.assertTrue(result.get("retryable_vm_death"),
+                        "a turn whose CLI never started is worth one resubmit")
+        self.assertIn("never started", result["error"])
+
+    def test_starting_then_running_then_done_is_a_normal_turn(self):
+        result, cmd, _ = self._wait([
+            _probe_stream(_verdict_lines("starting")),
+            _probe_stream(_verdict_lines("running", state="S")),
+            _probe_stream(_done_lines({"status": "done", "response": "ok"})),
+        ])
+        self.assertEqual(result["response"], "ok")
+        self.assertEqual(len(cmd.calls), 3)
+
+    # ── missing ──────────────────────────────────────────────────────────────
+    def test_missing_needs_two_probes_then_is_retryable(self):
+        missing = _probe_stream(_verdict_lines("missing"))
+        result, cmd, _ = self._wait([missing])
+        self.assertTrue(result.get("retryable_vm_death"))
+        self.assertEqual(len(cmd.calls), 2,
+                         "one missing probe could be a restart race; two is a verdict")
+
+    def test_single_missing_between_runnings_is_not_death(self):
+        result, _, _ = self._wait([
+            _probe_stream(_verdict_lines("running", state="S")),
+            _probe_stream(_verdict_lines("missing")),
+            _probe_stream(_verdict_lines("running", state="S")),
+            _probe_stream(_done_lines({"status": "done", "response": "ok"})),
+        ])
+        self.assertEqual(result["response"], "ok")
+        self.assertNotIn("retryable_vm_death", result)
+
+    # ── exited_no_done ───────────────────────────────────────────────────────
+    def test_exited_then_done_is_the_normal_harvest_window(self):
+        result, _, _ = self._wait([
+            _probe_stream(_verdict_lines("exited_no_done", state="Z")),
+            _probe_stream(_verdict_lines("exited_no_done", state="gone")),
+            _probe_stream(_done_lines({"status": "done", "response": "harvested"})),
+        ])
+        self.assertEqual(result["response"], "harvested")
+
+    def test_exited_without_a_record_is_bounded_and_reaps_the_session(self):
+        """The zombie case that hid D1: kill -0 says a SIGKILLed CLI is alive, so
+        the old code waited out its budget. A zombie is EXITED, and if the runner
+        never renders a verdict the session is wedged and must be stopped, or its
+        in-memory turn table answers session_busy until the microVM ages out."""
+        result, cmd, clock = self._wait(
+            [_probe_stream(_verdict_lines("exited_no_done", state="Z"))])
+        self.assertLessEqual(clock.slept,
+                             main.REMOTE_CODING_HARVEST_GRACE_S + 2 * self.SLICE_S)
+        self.assertTrue(result.get("no_retry_hint"))
+        self.assertIn("check github", result["error"].lower())
+        self.assertEqual(len(cmd.stopped), 1, "the wedged session must be reaped")
+
+    # ── probe failures ───────────────────────────────────────────────────────
+    def test_probe_failures_are_non_terminal_and_a_later_done_wins(self):
+        result, _, _ = self._wait([
+            RuntimeError("ThrottlingException"),
+            RuntimeError("connection reset"),
+            _probe_stream(_done_lines({"status": "done", "response": "eventually"})),
+        ])
+        self.assertEqual(result["response"], "eventually")
+
+    def test_sustained_probe_failure_is_bounded_and_verify_first(self):
+        result, _, clock = self._wait([RuntimeError("runtime unreachable")])
+        self.assertLessEqual(clock.slept,
+                             main.REMOTE_CODING_PROBE_FAIL_S + 2 * self.SLICE_S)
+        self.assertTrue(result.get("no_retry_hint"))
+        self.assertIn("lost contact", result["error"])
+
+    def test_unparsable_probe_output_does_not_end_the_turn(self):
+        """A verdict we cannot read is not evidence of anything; keep waiting."""
+        result, _, _ = self._wait([
+            _probe_stream(["something unexpected"]),
+            _probe_stream(_done_lines({"status": "done", "response": "ok"})),
+        ])
+        self.assertEqual(result["response"], "ok")
+
+    # ── bounds that hold regardless of the caller ────────────────────────────
+    def test_outer_deadline_still_preempts_everything(self):
+        clock = _FakeClock()
+        cmd = _ClockedCommandClient(
+            [_probe_stream(_verdict_lines("running", state="S"))], clock, self.SLICE_S)
+        with mock.patch.object(main, "_CMD_CLIENT", cmd, create=True), \
+             mock.patch.object(main, "time", clock), \
+             mock.patch.object(main, "REMOTE_CODING_WAIT_SLICE_S", self.SLICE_S), \
+             mock.patch.object(main, "_ddb_events_client", mock.MagicMock()):
+            result = main._wait_coding_turn("turn-x", outer_deadline=clock.monotonic() + 120,
+                                            cli="kiro", cli_bound_s=99999)
+        self.assertTrue(result.get("deadline_exceeded"))
+        self.assertLessEqual(clock.slept, 120 + self.SLICE_S)
+
+    def test_probes_use_the_turn_dir_the_runtime_reported(self):
+        """The runtime's turn root is configurable, so the fleet must not assume a
+        path: the submit response says where the state is."""
+        clock = _FakeClock()
+        cmd = _ClockedCommandClient(
+            [_probe_stream(_done_lines({"status": "done", "response": "ok"}))],
+            clock, self.SLICE_S)
+        with mock.patch.object(main, "_CMD_CLIENT", cmd, create=True), \
+             mock.patch.object(main, "time", clock), \
+             mock.patch.object(main, "REMOTE_CODING_WAIT_SLICE_S", self.SLICE_S), \
+             mock.patch.object(main, "_ddb_events_client", mock.MagicMock()):
+            main._wait_coding_turn("turn-x", cli="kiro", cli_bound_s=999,
+                                   turn_dir="/mnt/scratch/turns/turn-x")
+        self.assertIn("/mnt/scratch/turns/turn-x", cmd.commands[0])
+        self.assertNotIn("/tmp/turns/turn-x", cmd.commands[0])
+
+    def test_probes_fall_back_to_the_default_turn_dir(self):
+        _, cmd, _ = self._wait([_probe_stream(_done_lines({"status": "done"}))])
+        self.assertIn(main.REMOTE_CODING_TURNS_ROOT, cmd.commands[0])
+
+    def test_wait_terminates_even_with_no_deadline_and_a_huge_bound(self):
+        """No loop in the coding path may depend on the caller remembering to
+        pass a deadline (TEAM-3119): the wait computes its own hard stop."""
+        starting = _probe_stream(_verdict_lines("starting"))
+        result, _, clock = self._wait([starting], cli_bound_s=10 ** 9)
+        self.assertTrue(result.get("error"))
+        self.assertLess(clock.slept, 10 ** 9,
+                        "the hard stop must bound an absurd cli_bound_s")
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -4,8 +4,9 @@ A pre-CLI workspace failure (clone 404, bad repo field) used to be a bare
 HTTP 500/400. AgentCore drops the body of non-2xx runtime responses, so the
 fleet only ever saw "Received error (500)" — indistinguishable from a VM
 death — and looped resubmits. For async submits the reason now travels as a
-200 body flagged setup_failed AND is journaled under the caller's turn_id so a
-poll resolves it too. Synchronous callers keep the HTTP status.
+200 body flagged setup_failed AND is written to <turn_dir>/done.json under the
+caller's turn_id, so the fleet's wait probe resolves it too (DL-026).
+Synchronous callers keep the HTTP status.
 
 Hermetic: main.py is exec'd with WORKSPACE_ROOT pointed at a temp dir; no AWS,
 no git, no CLI.
@@ -45,7 +46,8 @@ def _load_main(module_name: str, env_overrides: dict | None = None):
         ctx.stop()
 
 
-main = _load_main("coding_agent_main_setupfail", {"WORKSPACE_ROOT": _TMP})
+main = _load_main("coding_agent_main_setupfail",
+                  {"WORKSPACE_ROOT": _TMP, "TURNS_ROOT": os.path.join(_TMP, "turns")})
 
 CLONE_404 = ("git clone failed: remote: Repository not found.\n"
              "fatal: repository 'https://github.com/tycenj/agentcore-hub.git/' not found")
@@ -66,9 +68,10 @@ class TestSyncCallersKeepHttpStatus(unittest.TestCase):
         resp = main._setup_failure_response({"prompt": "x"}, "codex", None, "repo 'tycenj' is not clonable", 400)
         self.assertEqual(resp.status_code, 400)
 
-    def test_sync_failure_writes_no_journal(self):
+    def test_sync_failure_writes_no_turn_record(self):
         main._setup_failure_response({"prompt": "x", "turn_id": "turn-sync"}, "claude", "sess-sync", CLONE_404, 500)
-        self.assertFalse(os.path.exists(main._turn_journal_path("sess-sync", "turn-sync")))
+        self.assertIsNone(main._turn_read_done(main._turn_dir("turn-sync")))
+        self.assertNotIn("turn-sync", main._ACTIVE_TURNS)
 
 
 class TestAsyncSubmitsGetA200Body(unittest.TestCase):
@@ -82,18 +85,27 @@ class TestAsyncSubmitsGetA200Body(unittest.TestCase):
         self.assertEqual(b["turn_id"], "turn-a1")
         self.assertEqual(b["cli"], "codex")
 
-    def test_async_setup_failure_is_journaled_as_terminal_done(self):
+    def test_async_setup_failure_is_recorded_as_terminal_done(self):
         payload = {"prompt": "x", "mode": "async", "turn_id": "turn-a2"}
         main._setup_failure_response(payload, "claude", "sess-a2", CLONE_404, 500)
-        with open(main._turn_journal_path("sess-a2", "turn-a2")) as f:
+        with open(os.path.join(main._turn_dir("turn-a2"), "done.json")) as f:
             rec = json.load(f)
         self.assertEqual(rec["status"], "done")
         self.assertEqual(rec["error"], CLONE_404)
         self.assertTrue(rec["setup_failed"])
 
-    def test_poll_after_lost_response_resolves_to_done_error_not_unknown(self):
-        # The 200 body can still be lost client-side; the poll must then say
-        # done+error, never 'unknown' (which is what fed the VM-death loop).
+    def test_async_setup_failure_releases_the_session_claim(self):
+        """A registered turn whose setup failed is DONE, not running — otherwise
+        the next turn on that session answers session_busy forever."""
+        payload = {"prompt": "x", "mode": "async", "turn_id": "turn-a5"}
+        main._register_turn("turn-a5", "claude", "sess-a5", 1500)
+        self.assertEqual(main._session_busy_turn("sess-a5", "other"), "turn-a5")
+        main._setup_failure_response(payload, "claude", "sess-a5", CLONE_404, 500)
+        self.assertIsNone(main._session_busy_turn("sess-a5", "other"))
+
+    def test_lookup_after_lost_response_resolves_to_done_error_not_unknown(self):
+        # The 200 body can still be lost client-side; the turn record must then
+        # say done+error, never 'unknown' (which is what fed the VM-death loop).
         payload = {"prompt": "x", "mode": "async", "turn_id": "turn-a3"}
         main._setup_failure_response(payload, "kiro", "sess-a3", CLONE_404, 500)
         status = main._poll_turn("sess-a3", "turn-a3")
@@ -108,31 +120,39 @@ class TestAsyncSubmitsGetA200Body(unittest.TestCase):
         self.assertNotIn("turn_id", _body(resp))
 
 
-class TestUnwritableJournalIsNotClaimedDurable(unittest.TestCase):
-    """Codex #346 P1 — a 200 setup_failed body asserts a durable terminal
-    record. If the journal write failed there is none: a lost response would
-    poll as 'unknown' and the caller would resubmit, restoring the very loop
-    this path removes. Degraded EFS can also be what broke setup."""
+class TestVerdictSurvivesAnUnwritableDisk(unittest.TestCase):
+    """Codex #346 P1 — a 200 setup_failed body asserts a terminal verdict the
+    caller can still find after a lost response. On EFS that needed a 503 escape
+    hatch, because an unwritable journal meant no record existed at all. The
+    record now lives on the VM's own /tmp AND in _ACTIVE_TURNS, so even a failed
+    write leaves the in-memory verdict the wait probe and the poll shim read —
+    hence a plain 200, and no EFS in this path at all (DL-026)."""
 
-    def test_journal_failure_returns_503_not_200(self):
+    def test_unwritable_turn_dir_still_returns_200_with_setup_failed(self):
         payload = {"prompt": "x", "mode": "async", "turn_id": "turn-nj"}
-        with mock.patch.object(main, "_journal_write", return_value=False):
+        with mock.patch.object(main, "_turn_write_json", return_value=False):
             resp = main._setup_failure_response(payload, "claude", "sess-nj", CLONE_404, 500)
-        self.assertEqual(resp.status_code, 503)
+        self.assertEqual(resp.status_code, 200)
         b = _body(resp)
-        self.assertNotIn("setup_failed", b, "must not claim a durable terminal verdict")
-        self.assertIn("turn not started", b["error"])
+        self.assertTrue(b["setup_failed"])
         self.assertIn("Repository not found", b["error"], "the setup reason must survive")
 
-    def test_journal_success_still_returns_200(self):
+    def test_unwritable_turn_dir_still_leaves_a_terminal_in_memory_verdict(self):
+        payload = {"prompt": "x", "mode": "async", "turn_id": "turn-nj3"}
+        with mock.patch.object(main, "_turn_write_json", return_value=False):
+            main._setup_failure_response(payload, "claude", "sess-nj3", CLONE_404, 500)
+        status = main._poll_turn("sess-nj3", "turn-nj3")
+        self.assertEqual(status["status"], "done")
+        self.assertEqual(status["error"], CLONE_404)
+
+    def test_writable_turn_dir_still_returns_200(self):
         payload = {"prompt": "x", "mode": "async", "turn_id": "turn-nj2"}
-        with mock.patch.object(main, "_journal_write", return_value=True):
-            resp = main._setup_failure_response(payload, "claude", "sess-nj2", CLONE_404, 500)
+        resp = main._setup_failure_response(payload, "claude", "sess-nj2", CLONE_404, 500)
         self.assertEqual(resp.status_code, 200)
         self.assertTrue(_body(resp)["setup_failed"])
 
-    def test_sync_callers_unaffected_by_journal_state(self):
-        with mock.patch.object(main, "_journal_write", return_value=False):
+    def test_sync_callers_unaffected_by_disk_state(self):
+        with mock.patch.object(main, "_turn_write_json", return_value=False):
             resp = main._setup_failure_response({"prompt": "x"}, "claude", "s", CLONE_404, 500)
         self.assertEqual(resp.status_code, 500)
         self.assertTrue(_body(resp)["setup_failed"])
