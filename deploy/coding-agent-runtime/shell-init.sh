@@ -27,11 +27,13 @@ export WORKSPACE_ROOT="${WORKSPACE_ROOT:-/mnt/efs}"
 # + /usr/local/bin where uv/uvx live).
 export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
 
-# Browser-automation MCP servers (puppeteer/playwright) use the system chromium
-# baked into the image instead of downloading one per session.
+# Puppeteer/MCP browser servers use the system chromium baked into the image
+# instead of downloading one per session. Playwright (used by the repo's own
+# `npm test`) reads its own build from the baked, version-pinned browser cache
+# so a checked-out `playwright test` never downloads mid-run.
 export PUPPETEER_EXECUTABLE_PATH="${PUPPETEER_EXECUTABLE_PATH:-/usr/bin/chromium}"
 export PUPPETEER_SKIP_DOWNLOAD="${PUPPETEER_SKIP_DOWNLOAD:-1}"
-export PLAYWRIGHT_BROWSERS_PATH="${PLAYWRIGHT_BROWSERS_PATH:-0}"
+export PLAYWRIGHT_BROWSERS_PATH="${PLAYWRIGHT_BROWSERS_PATH:-/opt/pw-browsers}"
 
 # ── Claude Code → Bedrock (no key) ──
 export CLAUDE_CODE_USE_BEDROCK=1

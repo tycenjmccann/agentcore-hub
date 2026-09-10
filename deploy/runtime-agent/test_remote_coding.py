@@ -516,6 +516,61 @@ class TestPollBudgetScaling(RemoteCodingTestCase):
                            main.REMOTE_CODING_TURN_DEADLINE_S)
 
 
+class TestPolledTurnHeartbeat(RemoteCodingTestCase):
+    """A long polled coding turn must emit prove-alive agent.streaming events so
+    the UI never looks frozen and WM's silence timer resets on healthy turns."""
+
+    def test_running_polls_emit_throttled_heartbeats(self):
+        events_client = mock.MagicMock()
+        # running, running, running, then done — with the interval at 0 every
+        # running poll fires one heartbeat.
+        statuses = [
+            {"status": "running"},
+            {"status": "running"},
+            {"status": "running"},
+            {"status": "done", "response": "ok", "claude_session_id": "s-9"},
+        ]
+        with mock.patch.object(main, "_poll_once", side_effect=statuses), \
+             mock.patch.object(main, "_ddb_events_client", events_client), \
+             mock.patch.object(main, "REMOTE_CODING_POLL_S", 0.001), \
+             mock.patch.object(main, "REMOTE_CODING_HEARTBEAT_S", 0):
+            out = main._poll_coding_turn(mock.MagicMock(), "turn-x", cli="kiro")
+
+        self.assertEqual(out.get("status"), "done")
+        beats = [
+            c for c in events_client.put_item.call_args_list
+            if c.kwargs.get("Item", {}).get("type", {}).get("S") == "agent.streaming"
+            and "still working" in c.kwargs["Item"]["detail"]["M"]["content"]["S"]
+        ]
+        self.assertEqual(len(beats), 3, "one heartbeat per running poll expected")
+        detail = beats[0].kwargs["Item"]["detail"]["M"]
+        self.assertEqual(detail["agentId"]["S"], "frontend_dev")
+        self.assertEqual(detail["workflowId"]["S"], "wf-test")
+        self.assertEqual(detail["ticketId"]["S"], "TEAM-3119")
+        self.assertIn("kiro", detail["content"]["S"])
+
+    def test_heartbeat_is_throttled(self):
+        events_client = mock.MagicMock()
+        statuses = [
+            {"status": "running"},
+            {"status": "running"},
+            {"status": "done", "response": "ok"},
+        ]
+        # A large interval means no running poll in this short turn crosses it.
+        with mock.patch.object(main, "_poll_once", side_effect=statuses), \
+             mock.patch.object(main, "_ddb_events_client", events_client), \
+             mock.patch.object(main, "REMOTE_CODING_POLL_S", 0.001), \
+             mock.patch.object(main, "REMOTE_CODING_HEARTBEAT_S", 9999):
+            main._poll_coding_turn(mock.MagicMock(), "turn-x", cli="claude")
+
+        beats = [
+            c for c in events_client.put_item.call_args_list
+            if c.kwargs.get("Item", {}).get("type", {}).get("S") == "agent.streaming"
+            and "still working" in c.kwargs["Item"]["detail"]["M"]["content"]["S"]
+        ]
+        self.assertEqual(len(beats), 0, "throttle must suppress heartbeats within the interval")
+
+
 if __name__ == "__main__":
     unittest.main()
 

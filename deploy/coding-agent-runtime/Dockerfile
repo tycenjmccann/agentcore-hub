@@ -8,6 +8,7 @@ ENV PYTHONUNBUFFERED=1 \
     CLAUDE_CODE_ENHANCED_TELEMETRY_BETA=1 \
     OTEL_LOG_TOOL_DETAILS=1 \
     CODEX_SQLITE_HOME=/tmp/codex-sqlite \
+    PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers \
     HOME=/home/bedrock_agentcore \
     PATH=/home/bedrock_agentcore/.local/bin:$PATH
 
@@ -85,6 +86,18 @@ RUN curl --proto '=https' --tlsv1.2 -fsSL -o /tmp/kirocli.zip "${KIRO_CLI_URL}" 
 # fleet-wide "coding turn vanished", not a build failure, unless asserted here.
 RUN "$HOME/.local/bin/claude" --version && codex --version
 USER root
+
+# Playwright's own Chromium build, baked once so dev/QA coding turns never
+# download a browser mid-run. The apt `chromium` above is only for puppeteer/MCP
+# (via PUPPETEER_EXECUTABLE_PATH); Playwright's node client ignores a system
+# browser without a `channel`, so `npm test` used to `playwright install` on
+# every fresh checkout. Pinned to the version the hub repo locks (package-lock
+# @playwright/test 1.60.0) so a checked-out `playwright test` finds the exact
+# browser revision and skips the download. Installed to a world-readable path
+# (PLAYWRIGHT_BROWSERS_PATH) so the non-root runtime user can use it.
+RUN mkdir -p /opt/pw-browsers \
+ && npx --yes playwright@1.60.0 install --with-deps chromium \
+ && chmod -R a+rx /opt/pw-browsers
 
 # Python deps (health server + OTel + codex bedrock token generator)
 COPY requirements.txt .
