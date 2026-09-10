@@ -12,15 +12,34 @@ These tests pin: the four third-party sources go, the Ubuntu ones stay (both the
 the prune BEFORE playwright without softening the playwright line.
 
 Hermetic: APT_SOURCES_DIR points at tmp_path, so no system apt config is touched.
+
+TEAM-4385: the two sudo-branch behavioural tests skip under root (CodeBuild) -- root
+ignores directory mode bits, so the "not writable" branch cannot be exercised there;
+a static test keeps the guard covered in CodeBuild instead. See requires_non_root below.
 """
 import os
 import re
 import subprocess
+
+import pytest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 SCRIPT = REPO / "deploy" / "pipeline" / "prune-apt-sources.sh"
 BUILDSPEC = REPO / "deploy" / "pipeline" / "buildspec-ci.yml"
+
+# CodeBuild runs the pipeline's pytest gate as root, and root's writes ignore
+# directory mode bits (CAP_DAC_OVERRIDE): chmod 0o555 cannot make a dir unwritable
+# for uid 0, so `[ ! -w "$dir" ]` is FALSE and the two tests below cannot exercise
+# the sudo / no-sudo branch at all -- they were the "2 failed" the buildspec's
+# missing `set -e` was swallowing (TEAM-4385). GitHub's hosted runners and dev
+# machines are non-root, so the branch is still really exercised there; as root the
+# static guard test below keeps the sudo path from going entirely unchecked.
+requires_non_root = pytest.mark.skipif(
+    os.geteuid() == 0,
+    reason="root ignores directory mode bits, so the not-writable branch cannot be "
+           "exercised as root (CodeBuild runs as root; GH runners / dev boxes do not)",
+)
 
 # Verbatim-shaped sources from aws/aws-codebuild-docker-images ubuntu/standard/7.0.
 THIRD_PARTY = {
@@ -139,6 +158,21 @@ def test_playwright_install_is_not_softened():
             assert "|| true" not in line, line
 
 
+def test_script_guards_unwritable_dir_before_removing():
+    """Root-safe half of the sudo coverage: the two behavioural tests below skip as
+    root (CodeBuild), so pin the guard's SHAPE from the source text -- an unwritable
+    dir must route rm through sudo, and a missing sudo must exit clean."""
+    code = "\n".join(
+        l for l in SCRIPT.read_text(encoding="utf-8").splitlines()
+        if not l.lstrip().startswith("#")
+    )
+    assert '[ ! -w "$dir" ]' in code
+    assert "command -v sudo" in code
+    assert 'SUDO="sudo"' in code
+    assert "$SUDO rm -f" in code
+
+
+@requires_non_root
 def test_uses_sudo_when_the_directory_is_not_writable(tmp_path):
     """GitHub's hosted runners are non-root and bake in the same google-chrome
     source, so this script serves that caller too — but `rm` there needs sudo,
@@ -167,6 +201,7 @@ def test_uses_sudo_when_the_directory_is_not_writable(tmp_path):
         d.chmod(0o755)
 
 
+@requires_non_root
 def test_no_sudo_and_no_write_access_exits_clean_without_pruning(tmp_path):
     """Better to leave the sources alone and let apt speak than to abort a build
     on a `sudo: not found`."""
