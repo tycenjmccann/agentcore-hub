@@ -47,7 +47,8 @@
       "function": "agentcore-hub-pipeline-tools",
       "dir": "lambda/agentcore-hub-pipeline-tools",
       "files": [
-        "index.mjs"
+        "index.mjs",
+        "cd-registry.mjs"
       ],
       "npm": false
     },
@@ -133,10 +134,12 @@
       "function": "telegram-bug-intake",
       "dir": "deploy/telegram-bug-intake",
       "paths": [
-        "deploy/telegram-bug-intake/index.mjs"
+        "deploy/telegram-bug-intake/index.mjs",
+        "deploy/telegram-bug-intake/cd-registry.mjs"
       ],
       "files": [
-        "index.mjs"
+        "index.mjs",
+        "cd-registry.mjs"
       ],
       "npm": false
     }
