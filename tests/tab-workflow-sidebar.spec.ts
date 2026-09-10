@@ -10,8 +10,10 @@ import { test, expect, type Page } from "@playwright/test";
  * Run: npx playwright test tests/tab-workflow-sidebar.spec.ts
  */
 
-// Playwright wipes test-results/ between runs, so write screenshots to a sibling dir.
-const SCREENSHOT_DIR = "docs/screenshots/team-4320";
+// Playwright wipes test-results/ between runs, so write evidence to a sibling dir.
+// It has to stay under the gitignored playwright-screenshots/ (same convention as
+// tests/tab-workflow.spec.ts): a tracked path dirties the tree on every `npm test`.
+const SCREENSHOT_DIR = "playwright-screenshots/team-4320";
 
 const SIDEBAR = "[data-testid=workflow-history-sidebar]";
 const HANDLE = "[data-testid=workflow-history-resize-handle]";
@@ -174,6 +176,13 @@ async function dragBy(page: Page, dx: number, midAssert?: () => Promise<void>) {
 
 const stored = (page: Page): Promise<string | null> =>
   page.evaluate(() => localStorage.getItem("workflow-history-width"));
+
+/** The two body styles a drag mutates - both must be back to "" after any gesture. */
+const bodyStyles = (page: Page): Promise<{ cursor: string; userSelect: string }> =>
+  page.evaluate(() => ({
+    cursor: document.body.style.cursor,
+    userSelect: document.body.style.userSelect,
+  }));
 
 /** scrollbarWidth / scrollbarColor / overflow / gutter for a scroll region. */
 async function scrollMetrics(page: Page, sel: string) {
@@ -363,5 +372,129 @@ test.describe("Workflow sidebar — resize + scrollbars", () => {
 
     await open(page, "12");
     await expectWidth(page, MIN, 1);
+  });
+
+  /**
+   * TEAM-4345 F1. A second pointerdown mid-drag (second finger, pen+touch, or a
+   * non-primary mouse button) must be refused outright. Re-entering the start
+   * handler re-snapshots the *already mutated* body styles, so the restore writes
+   * back cursor:col-resize / user-select:none and wedges the whole document; it
+   * also clobbers dragRef.startWidth, which silently skips the persist-on-drop.
+   *
+   * Trusted input cannot express this: per the Pointer Events chorded-button rules
+   * a second mouse button pressed while one is already down fires pointermove, not
+   * pointerdown. Hence dispatchEvent. Two of the three legs use pointerId 1 - the
+   * live captured mouse pointer - because with an id that is not an active pointer
+   * the unguarded handler throws inside setPointerCapture() *before* it re-snapshots
+   * and the leak does not reproduce. The pointerId 2 leg is the reviewer's literal
+   * criterion ("different pointerId, isPrimary:false"); pre-fix it still clobbers
+   * startWidth before that throw, so the persist is skipped.
+   */
+  test("11. second non-primary pointerdown mid-drag does not leak body styles", async ({
+    page,
+  }) => {
+    const pageErrors: string[] = [];
+    page.on("pageerror", (e) => pageErrors.push(e.message));
+
+    await open(page);
+    await expectWidth(page, DEFAULT, 1);
+
+    const box = await page.locator(HANDLE).boundingBox();
+    expect(box).not.toBeNull();
+    if (!box) return;
+    const x = box.x + box.width / 2;
+    const y = box.y + box.height / 2;
+
+    await page.mouse.move(x, y);
+    await page.mouse.down();
+    await page.mouse.move(x + 180, y, { steps: 12 });
+
+    // Mid-drag the body is mutated on purpose - proves the gesture is live.
+    expect(await bodyStyles(page)).toEqual({ cursor: "col-resize", userSelect: "none" });
+    const dragged = Math.round(await widthOf(page));
+    expect(dragged).toBeGreaterThanOrEqual(400);
+
+    for (const extra of [
+      { pointerId: 1, isPrimary: false, button: 0, pointerType: "touch" }, // second finger
+      { pointerId: 1, isPrimary: true, button: 2, pointerType: "mouse" }, // second button
+      { pointerId: 2, isPrimary: false, button: 0, pointerType: "touch" }, // different id
+    ]) {
+      await page.locator(HANDLE).dispatchEvent("pointerdown", {
+        ...extra,
+        clientX: x + 180,
+        clientY: y,
+        bubbles: true,
+        cancelable: true,
+      });
+      // The original gesture is untouched: still at the dragged width.
+      expect(Math.round(await widthOf(page)), `width after ${JSON.stringify(extra)}`).toBe(dragged);
+    }
+
+    await page.mouse.up();
+
+    expect(await bodyStyles(page)).toEqual({ cursor: "", userSelect: "" });
+    await expectWidth(page, dragged, 1);
+    // startWidth survived, so the one-write-per-gesture persist still fired.
+    expect(await stored(page)).toBe(String(dragged));
+    expect(pageErrors, `pageerrors: ${pageErrors.join(" | ")}`).toEqual([]);
+  });
+
+  /**
+   * TEAM-4345 F1, the other half: with no button down, a non-primary or
+   * right-button pointerdown must not arm a drag at all. Unguarded it sets
+   * dragRef, and the sidebar then follows a *buttonless* pointermove.
+   */
+  test("12. a stray non-primary pointerdown never arms a drag", async ({ page }) => {
+    const pageErrors: string[] = [];
+    page.on("pageerror", (e) => pageErrors.push(e.message));
+
+    await open(page);
+    await expectWidth(page, DEFAULT, 1);
+
+    const box = await page.locator(HANDLE).boundingBox();
+    expect(box).not.toBeNull();
+    if (!box) return;
+    const x = box.x + box.width / 2;
+    const y = box.y + box.height / 2;
+
+    for (const extra of [
+      { pointerId: 9, isPrimary: false, button: 0, pointerType: "touch" },
+      { pointerId: 1, isPrimary: true, button: 2, pointerType: "mouse" },
+    ]) {
+      await page.locator(HANDLE).dispatchEvent("pointerdown", {
+        ...extra,
+        clientX: x,
+        clientY: y,
+        bubbles: true,
+        cancelable: true,
+      });
+      await page.mouse.move(x + 120, y, { steps: 6 }); // no button is down
+      expect(await bodyStyles(page), `body after ${JSON.stringify(extra)}`).toEqual({
+        cursor: "",
+        userSelect: "",
+      });
+      await expectWidth(page, DEFAULT, 1);
+      expect(await stored(page), `persisted after ${JSON.stringify(extra)}`).toBeNull();
+      await page.mouse.move(x, y);
+    }
+    expect(pageErrors, `pageerrors: ${pageErrors.join(" | ")}`).toEqual([]);
+  });
+
+  /**
+   * TEAM-4345 F3. Under 480px of viewport, half the viewport is below the 240px
+   * floor - the floor has to win, or the sidebar clamps under its own minimum and
+   * the handle renders aria-valuemax < aria-valuemin (invalid ARIA).
+   */
+  test("13. narrow viewport keeps the 240px floor (max never dips below min)", async ({ page }) => {
+    await page.setViewportSize({ width: 375, height: 800 }); // half = 187, below the floor
+    await open(page, "288");
+    await expectWidth(page, MIN, 1);
+
+    const handle = page.locator(HANDLE);
+    await expect(handle).toHaveAttribute("aria-valuemax", String(MIN));
+    await expect(handle).toHaveAttribute("aria-valuenow", String(MIN));
+    expect(Number(await handle.getAttribute("aria-valuemax"))).toBeGreaterThanOrEqual(
+      Number(await handle.getAttribute("aria-valuemin"))
+    );
   });
 });
