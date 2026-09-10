@@ -44,6 +44,12 @@ export default function WorkflowPage() {
   const [historyWidth, setHistoryWidth] = useState(288);
   const [dragging, setDragging] = useState(false);
   const sidebarRef = useRef<HTMLDivElement>(null);
+  // Mirrors historyWidth for handlers that need the latest value synchronously
+  // (persisting on pointerup/lostpointercapture) — a setState functional
+  // updater is the wrong tool here since React can defer/replay it, and this
+  // handle fires both onPointerUp and onLostPointerCapture per click, so a
+  // side effect inside the updater can persist a stale value.
+  const widthRef = useRef(288);
   const [testDefId, setTestDefId] = useState<string>(DEFAULT_WORKFLOW_DEF_ID);
   const [deleteTargetId, setDeleteTargetId] = useState<string | null>(null);
   const [deleteLoading, setDeleteLoading] = useState(false);
@@ -58,7 +64,11 @@ export default function WorkflowPage() {
     const storedWidth = localStorage.getItem('workflow-history-width');
     if (storedWidth !== null) {
       const parsed = parseInt(storedWidth, 10);
-      if (!Number.isNaN(parsed)) setHistoryWidth(clampWidth(parsed));
+      if (!Number.isNaN(parsed)) {
+        const clamped = clampWidth(parsed);
+        widthRef.current = clamped;
+        setHistoryWidth(clamped);
+      }
     }
   }, []);
 
@@ -80,18 +90,21 @@ export default function WorkflowPage() {
   const handleResizePointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
     if (!dragging || !sidebarRef.current) return;
     const rectLeft = sidebarRef.current.getBoundingClientRect().left;
-    setHistoryWidth(clampWidth(e.clientX - rectLeft));
+    const next = clampWidth(e.clientX - rectLeft);
+    widthRef.current = next;
+    setHistoryWidth(next);
   };
 
+  // Fires on both onPointerUp and onLostPointerCapture for a single click —
+  // read/write the ref rather than deriving from React state so a duplicate
+  // call is a harmless no-op instead of a stale write.
   const handleResizePointerUp = () => {
     setDragging(false);
-    setHistoryWidth((current) => {
-      localStorage.setItem('workflow-history-width', String(current));
-      return current;
-    });
+    localStorage.setItem('workflow-history-width', String(widthRef.current));
   };
 
   const handleResizeDoubleClick = () => {
+    widthRef.current = 288;
     setHistoryWidth(288);
     localStorage.setItem('workflow-history-width', '288');
   };
@@ -99,12 +112,11 @@ export default function WorkflowPage() {
   const handleResizeKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
     if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
     e.preventDefault();
-    setHistoryWidth((current) => {
-      const delta = e.key === 'ArrowLeft' ? -16 : 16;
-      const next = clampWidth(current + delta);
-      localStorage.setItem('workflow-history-width', String(next));
-      return next;
-    });
+    const delta = e.key === 'ArrowLeft' ? -16 : 16;
+    const next = clampWidth(widthRef.current + delta);
+    widthRef.current = next;
+    setHistoryWidth(next);
+    localStorage.setItem('workflow-history-width', String(next));
   };
 
   // Update header with selected workflow title
@@ -337,6 +349,7 @@ export default function WorkflowPage() {
       {/* Left Sidebar — Epic History */}
       <div
         ref={sidebarRef}
+        data-testid="workflow-history-sidebar"
         className={`${historyCollapsed ? 'w-8' : ''} ${dragging ? '' : 'transition-all duration-300'} relative border-r border-[var(--color-border)] bg-[var(--color-bg-secondary)] flex flex-col flex-shrink-0 overflow-hidden`}
         style={historyCollapsed ? undefined : { width: historyWidth }}
       >
@@ -383,7 +396,7 @@ export default function WorkflowPage() {
             </div>
 
             {/* Workflow List */}
-            <div className="flex-1 overflow-y-auto">
+            <div className="flex-1 overflow-y-auto" data-testid="workflow-history-list">
               {/* Active Runs */}
               {activeWorkflows.length > 0 && (
                 <div className="p-2">
