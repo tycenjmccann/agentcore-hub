@@ -65,10 +65,13 @@ not end in `-deploy` is used as the base as-is (`juno` → `juno-ci` / `juno-bui
 keep their historical `agentcore-hub-*` names, so `agentcore-hub-deploy` derives
 `agentcore-hub-ci` / `agentcore-hub-build`.
 
-Regions: the tools Lambda reads `PIPELINE_REGIONS` (comma-separated; default = the
-Lambda's own region) to decide which regions it may read and trigger in, so an
-entry pointing at a region outside that list fails fast rather than silently
-resolving to the wrong account-local pipeline.
+Regions: `node deploy/setup-pipeline-tools-lambda.mjs` reads `PIPELINE_REGIONS`
+(comma-separated; default = the Lambda's own region) to fan the tools Lambda's IAM
+grants (pipeline + project ARNs) out to those regions - it is not a runtime check
+in the Lambda. An entry whose region is outside that list was simply never granted
+access, so its calls fail at AWS with `AccessDenied`: operator misconfiguration
+surfaced as the tool's normal error text, the same shape as the `ciProject` note
+below, rather than a silent resolve to the wrong account-local pipeline.
 
 An explicit `ciProject` outside the `hub-*-ci` convention is still checked by
 `validateCiProjectName`: it is refused outright when it collides with the entry's

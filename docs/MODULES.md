@@ -318,9 +318,12 @@ CloudWatch Logs. Deploy role is deliberately narrow (Lambda code-only, no
   handoff (no ship phase at all). `CD_REGISTRY_TTL_MS` (orchestrator, default 60000)
   is the re-read interval. Each entry's `region` + derived project names are what
   make the module multi-target: several repos, several pipelines, several regions.
-- `PIPELINE_REGIONS` — on the tools Lambda: comma-separated regions it may read and
-  trigger in (default = its own region), so a registry entry pointing outside that
-  list fails fast. `ARTIFACT_BUCKET` — where it reads `config/cd-registry.json`.
+- `PIPELINE_REGIONS` — read by `node deploy/setup-pipeline-tools-lambda.mjs` (not the
+  Lambda at runtime): comma-separated regions to fan the tools Lambda's IAM grants
+  (pipeline + project ARNs) out to (default = its own region). A registry entry
+  whose region is outside that list was never granted access, so its calls fail at
+  AWS with `AccessDenied` - operator misconfiguration, not a runtime region check.
+  `ARTIFACT_BUCKET` — where it reads `config/cd-registry.json`.
 - `PIPELINE_TOOLS_LAMBDA` — fleet runtime: name of the tools Lambda (default
   `agentcore-hub-pipeline-tools`).
 - `PIPELINE_NAME` / `BUILD_PROJECT` / `CI_PROJECT` — on the tools Lambda
