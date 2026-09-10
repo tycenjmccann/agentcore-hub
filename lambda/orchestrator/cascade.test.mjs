@@ -565,6 +565,74 @@ describe("Finding 2 — idempotent in_review re-wake", () => {
 });
 
 /**
+ * TEAM-4391 — a gate already presented to a human (an open, unacknowledged
+ * review_needed notification for it) must be skipped by the cascade BEFORE
+ * reawakenGate is ever called — reawakenGate (handleHumanReviewGate) writes
+ * ticket status ahead of its own idempotency CAS, so calling it at all for an
+ * already-open gate is a real Jira/DDB write every sweep even though the CAS
+ * then correctly no-ops. The guard is checked first in handleInReviewDependent,
+ * ahead of the shadow branch, so shadow must predict the exact same skip.
+ */
+describe("TEAM-4391 — a gate already presented to a human is skipped by the cascade too", () => {
+  it("event path: open review_needed → no reawakenGate call, no write, no event", async () => {
+    const siblings = [
+      { ticketId: DONE, status: "done" },
+      { ticketId: "GATE-1", status: "in_review", assignee: "human:reviewer", blockedBy: [DONE] },
+    ];
+    const wf = {
+      ...extWorkflow,
+      humanNotifications: [
+        { id: "n1", type: "review_needed", ticketId: "GATE-1", reviewer: "reviewer", acknowledged: false, timestamp: "2026-09-01T00:00:00Z" },
+      ],
+    };
+    const { deps, ddb, publishEvent, reawakenGate } = makeExtDeps({
+      getChildTickets: vi.fn(async () => siblings),
+    });
+    const { cascadeUnblock } = createCascade(deps);
+
+    const unblocked = await cascadeUnblock(DONE, "EPIC-1", wf);
+
+    expect(unblocked).toEqual([]);
+    expect(reawakenGate).not.toHaveBeenCalled();
+    expect(eventsOfType(publishEvent, "review.reawakened")).toHaveLength(0);
+    expect(statusWrites(ddb)).toHaveLength(0);
+  });
+
+  it("shadow path: open review_needed → still no reawakenGate call, no would-reawaken metric bump either", async () => {
+    const siblings = [
+      { ticketId: DONE, status: "done" },
+      { ticketId: "GATE-1", status: "in_review", assignee: "human:reviewer", blockedBy: [DONE] },
+    ];
+    const wf = {
+      ...extWorkflow,
+      humanNotifications: [
+        { id: "n1", type: "review_needed", ticketId: "GATE-1", reviewer: "reviewer", acknowledged: false, timestamp: "2026-09-01T00:00:00Z" },
+      ],
+    };
+    const { deps, publishEvent, reawakenGate } = makeExtDeps({
+      getChildTickets: vi.fn(async () => siblings),
+      extendedStates: "shadow",
+    });
+    const cap = captureMetrics();
+    const { cascadeUnblock } = createCascade(deps);
+
+    await cascadeUnblock(DONE, "EPIC-1", wf);
+    const records = cap.records();
+    cap.restore();
+
+    expect(reawakenGate).not.toHaveBeenCalled();
+    expect(eventsOfType(publishEvent, "review.reawakened")).toHaveLength(0);
+    // The TEAM-4391 guard fires before the shadow would-reawaken bump, so the
+    // metrics accumulator never advances at all here — contrast with the
+    // "shadow in_review" test above (no open notification), which DOES bump
+    // CascadeWouldReviewReawaken to 1 and emits a record. Here nothing in `m`
+    // moves, so hasCascadeActivity is false and no EMF record is emitted at
+    // all — the strongest possible "no bump" signal (both counters read as 0).
+    expect(records).toHaveLength(0);
+  });
+});
+
+/**
  * TEAM-3684 Finding 3 — bounded single retry against the eventually-consistent
  * parentId-index GSI. A blocker that already closed but hasn't propagated to the
  * snapshot would otherwise permanently miss the last unblock. One re-fetch (after
