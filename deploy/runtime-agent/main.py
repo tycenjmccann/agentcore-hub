@@ -480,6 +480,11 @@ REMOTE_CODING_READ_TIMEOUT = int(os.getenv("REMOTE_CODING_READ_TIMEOUT", "600"))
 # harvest (can be GBs) and the journal-write retry loop — so the runner's own
 # verdict reaches us via the journal instead of us giving up first.
 REMOTE_CODING_POLL_S = int(os.getenv("REMOTE_CODING_POLL_S", "20"))
+# Cadence for the prove-alive pulse emitted while a coding turn is being polled
+# (see _poll_coding_turn). One agent.streaming event ~every minute is enough for
+# the UI to look live and to reset WM's silence timer, without spamming the
+# events table on multi-hour turns.
+REMOTE_CODING_HEARTBEAT_S = int(os.getenv("REMOTE_CODING_HEARTBEAT_S", "60"))
 # The 2700 default is exactly the legacy 1500s turn cap + ~1200s of terminal-work
 # headroom (artifact harvest — can be GBs — plus the journal-write retry loop).
 # When a per-agent turnTimeoutSecs is forwarded ABOVE 1500 (TEAM-3687), the
@@ -493,8 +498,9 @@ REMOTE_CODING_TURN_BUDGET_S = int(os.getenv("REMOTE_CODING_TURN_BUDGET_S", "2700
 # no event emitted (TEAM-3119). The default sits above one full worst-case
 # cycle (submit read timeout + the poll loop's hard stop) so it never preempts
 # a provably-live runner; on expiry the turn fails loudly (agent.error event +
-# ERROR string to the persona) instead of pinning it. Follow-up (not here):
-# periodic agent.streaming heartbeats while a coding turn is being polled.
+# ERROR string to the persona) instead of pinning it. The poll loop also emits
+# periodic agent.streaming heartbeats (REMOTE_CODING_HEARTBEAT_S) so a long turn
+# never looks silent to the UI or WM.
 REMOTE_CODING_TURN_DEADLINE_S = int(os.getenv(
     "REMOTE_CODING_TURN_DEADLINE_S",
     str(REMOTE_CODING_READ_TIMEOUT + 2 * REMOTE_CODING_TURN_BUDGET_S),
@@ -701,7 +707,7 @@ def _deadline_expired_error() -> dict:
 
 
 def _poll_coding_turn(client, turn_id: str, outer_deadline: float | None = None,
-                      budget_s: int | None = None) -> dict:
+                      budget_s: int | None = None, cli: str = "") -> dict:
     """Poll an async coding turn to its terminal state. Returns the done record
     ({response, claude_session_id, artifacts?} or {error}).
 
@@ -728,6 +734,8 @@ def _poll_coding_turn(client, turn_id: str, outer_deadline: float | None = None,
     # wedged-yet-heartbeating runner must not pin this persona forever.
     hard_stop = time.time() + 2 * budget
     unknowns = 0
+    turn_start = time.time()
+    last_heartbeat = time.time()
     while time.time() < min(deadline, hard_stop) and (
             outer_deadline is None or time.monotonic() < outer_deadline):
         time.sleep(REMOTE_CODING_POLL_S)
@@ -772,6 +780,13 @@ def _poll_coding_turn(client, turn_id: str, outer_deadline: float | None = None,
         # runner's own watchdog (TURN_TIMEOUT_S) bounds the CLI; a runner that
         # dies mid-harvest stops heartbeating and the dead verdict fires.
         if state == "running":
+            now = time.time()
+            # Prove-alive pulse: the runner heartbeats its journal, but nothing
+            # reaches the UI/WM while we poll. Emit an agent.streaming event
+            # ~every minute so the view looks live and WM's silence timer resets.
+            if now - last_heartbeat >= REMOTE_CODING_HEARTBEAT_S:
+                _publish_coding_heartbeat(cli, int(now - turn_start))
+                last_heartbeat = now
             deadline = max(deadline,
                            time.time() + max(3 * REMOTE_CODING_POLL_S, 120))
     # Budget spent with no live heartbeat seen recently and no verdict. The
@@ -991,7 +1006,8 @@ def _submit_and_poll(client, payload: dict, outer_deadline: float | None = None,
         # Runtime predates async mode (or ran a legacy path) and executed the
         # turn synchronously — its result is already complete.
         return submitted
-    return _poll_coding_turn(client, submitted["turn_id"], outer_deadline, budget_s)
+    return _poll_coding_turn(client, submitted["turn_id"], outer_deadline, budget_s,
+                             cli=payload.get("cli", ""))
 
 
 def _remote_coding_turn(task: str, cli: str, repo: str = "", model: str = "",
@@ -2893,6 +2909,40 @@ def _publish_operator_delivery(workflow_id: str, agent_id: str, message: str):
         )
     except Exception as e:
         logger.warning(f"[{agent_id}] Failed to publish operator delivery: {e}")
+
+
+def _publish_coding_heartbeat(cli: str, elapsed_s: int):
+    """Prove-alive pulse for a long polled coding turn. The runner journals a
+    heartbeat every ~15s, but the fleet emits nothing while polling — so the UI
+    looks frozen and the Workflow Manager false-pages "stream silent" on healthy
+    turns. Ride the same agent.streaming path as model text (stamped with the
+    current ticket) so both the live view and WM's silence timer see the CLI is
+    working. Best-effort: never raises, never blocks the poll loop."""
+    import time, random, string
+    try:
+        label = (cli or "coding CLI").strip()
+        mins = max(1, elapsed_s // 60)
+        event_id = f"{int(time.time() * 1000)}-hb-{''.join(random.choices(string.ascii_lowercase, k=4))}"
+        detail = {
+            "agentId": {"S": _CURRENT_AGENT_ID},
+            "type": {"S": "text"},
+            "content": {"S": f"\n\n> ⏳ {label} still working ({mins}m elapsed)…\n\n"},
+            "workflowId": {"S": _CURRENT_WORKFLOW_ID},
+        }
+        if _CURRENT_TICKET_ID:
+            detail["ticketId"] = {"S": _CURRENT_TICKET_ID}
+        _ddb_events_client.put_item(
+            TableName=_EVENTS_TABLE,
+            Item={
+                "workflowId": {"S": _CURRENT_WORKFLOW_ID},
+                "eventId": {"S": event_id},
+                "type": {"S": "agent.streaming"},
+                "detail": {"M": detail},
+                "timestamp": {"S": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())},
+            },
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"[{_CURRENT_AGENT_ID}] Failed to publish coding heartbeat: {e}")
 
 
 class _OperatorMailbox:

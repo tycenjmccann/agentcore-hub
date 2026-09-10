@@ -1845,7 +1845,7 @@
       "enabled": true,
       "heartbeatIntervalMs": 15000,
       "toolDeadlineSecs": 600,
-      "turnTimeoutSecs": 1500
+      "turnTimeoutSecs": 3600
     }
   }
 }
