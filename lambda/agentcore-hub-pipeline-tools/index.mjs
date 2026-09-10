@@ -43,7 +43,11 @@
  * the hub-<slug>-{ci,build,deploy} naming convention via pipelineProjects(), plus
  * (b) the env default (PIPELINE_NAME/CI_PROJECT/BUILD_PROJECT/DEPLOY_PROJECT in
  * REGION) unless a registry entry already names that pipeline. Registry order
- * first, env default last — deterministic, so `targets[0]` is stable.
+ * first, env default last — deterministic, but ORDER IS NOT MEANING (TEAM-4358):
+ * the env default is the target whose `pipeline === PIPELINE_NAME`, flagged
+ * `isEnvDefault`, never `targets[0]`. When the registry names this deployment's
+ * own pipeline (the hub's own entry normally does), THAT entry is the env default
+ * target — carrying the registry's region/ciProject rather than env's.
  *
  * A registry entry with NO pipeline (a DEPLOY.md-mode CD repo) yields no target:
  * there is nothing here to drive for it.
@@ -297,9 +301,15 @@ let registryLoadedAt = 0;
  *   no ARTIFACT_BUCKET → the current (empty) registry, with NO S3 command
  *                        constructed at all. Single-pipeline mode.
  *   NoSuchKey / 404    → empty registry (nothing is registered yet).
+ *   MALFORMED body     → the LAST GOOD copy (TEAM-4358). A truncated or
+ *                        half-written document is a failed read, not "nothing is
+ *                        registered".
  *   any other error    → the LAST GOOD copy is kept and a warning logged, so a
  *                        transient S3 error cannot un-register a live repo
  *                        mid-deploy.
+ *
+ * EVERY path opens the TTL window, same as the orchestrator
+ * (lambda/orchestrator/index.mjs:259) — including the failing ones.
  */
 async function loadRegistry({ force = false } = {}) {
   if (!ARTIFACT_BUCKET) return registryCache;
@@ -311,16 +321,27 @@ async function loadRegistry({ force = false } = {}) {
     const obj = await s3.send(
       new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: CD_REGISTRY_KEY })
     );
-    registryCache = parseCdRegistry(await obj.Body.transformToString());
-    registryLoadedAt = now;
+    // JSON.parse HERE rather than letting parseCdRegistry do it (TEAM-4358).
+    // parseCdRegistry is tolerant BY DESIGN — a malformed document becomes an
+    // EMPTY registry — and assigning that would DISCARD the last good copy and
+    // cache "nothing registered" for the whole TTL: one truncated S3 read
+    // un-registers every repo. Parsing first turns a malformed body into a
+    // SyntaxError the catch treats like any other read failure. parseCdRegistry
+    // takes the already-parsed object, so tolerant per-ENTRY handling is
+    // unchanged.
+    const doc = JSON.parse(await obj.Body.transformToString());
+    registryCache = parseCdRegistry(doc);
   } catch (e) {
     if (e?.name === "NoSuchKey" || e?.name === "NotFound" || e?.$metadata?.httpStatusCode === 404) {
       registryCache = { version: 1, repos: [] };
-      registryLoadedAt = now;
     } else {
       console.warn("cd-registry read failed (keeping last copy, non-fatal):", e?.name, e?.message);
     }
   }
+  // Stamped on EVERY path, failures included (TEAM-4358). Without this, a
+  // persistent AccessDenied or network fault meant an S3 GetObject on every
+  // single tool invocation for the life of the container.
+  registryLoadedAt = now;
   return registryCache;
 }
 
@@ -334,7 +355,11 @@ async function loadRegistry({ force = false } = {}) {
  * Every target this deployment can act on: one per registry entry that names a
  * pipeline (expanded by pipelineProjects), then the env default unless a registry
  * entry already names that pipeline. Order is deterministic (registry order, env
- * default last) so callers and tests can rely on targets[0].
+ * default last), but callers must NOT read `targets[0]` as "the default"
+ * (TEAM-4358) — that made an unqualified call act on whichever repo an operator
+ * happened to register first. Exactly one target always carries
+ * `isEnvDefault: true`: the one whose `pipeline === PIPELINE_NAME`, whether it
+ * came from the registry or from env.
  *
  * @returns {Promise<Target[]>}
  */
@@ -354,7 +379,12 @@ async function listTargets() {
       ciProject: projects.ciProject,
       buildProject: projects.buildProject,
       deployProject: projects.deployProject,
-      isEnvDefault: false,
+      // The registry may name the deployment's OWN pipeline, and normally does.
+      // That entry IS the env default — it just carries the registry's
+      // region/ciProject instead of env's. Stamping false here (TEAM-4358) left
+      // NO target flagged, and resolveTarget's fallback then degraded to registry
+      // ORDER.
+      isEnvDefault: projects.pipeline === PIPELINE_NAME,
     });
   }
   if (!seen.has(PIPELINE_NAME)) {
@@ -460,7 +490,25 @@ async function resolveTarget(args = {}, { requirePipelineName = false } = {}) {
       refusal: { ok: false, reason: "pipeline_name_required", known: pipelines },
     };
   }
-  const envDefault = targets.find((t) => t.isEnvDefault) || targets[0];
+  // The env default, BY NAME. `|| targets[0]` used to stand here and was a silent
+  // bug (TEAM-4358): with this deployment's own pipeline listed in the registry no
+  // target carried the flag, so an unqualified call acted on whichever repo was
+  // registered FIRST — a read, or a start_ci_build, against another repo's
+  // project in another repo's region. listTargets guarantees one flagged target;
+  // the second find states that invariant structurally, so a future change there
+  // degrades to the CONFIGURED pipeline rather than back to list order.
+  const envDefault =
+    targets.find((t) => t.isEnvDefault) || targets.find((t) => t.pipeline === PIPELINE_NAME);
+  if (!envDefault) {
+    // Unreachable while listTargets appends the env default (see above). Refuse
+    // rather than return an undefined target: guessing one is the whole thing
+    // this block exists to prevent.
+    return {
+      target: null,
+      targets,
+      refusal: { ok: false, reason: "pipeline_name_required", known: pipelines },
+    };
+  }
   return { target: envDefault, targets, refusal: null };
 }
 
@@ -1067,7 +1115,20 @@ async function startCiBuild(args = {}, target, targets = []) {
         ok: false,
         reason: "start_build_not_granted",
         project,
-        detail: "This Lambda's role has no codebuild:StartBuild on the CI project. Deploy with PIPELINE_CI_START_BUILD=1 to grant it.",
+        // TEAM-4358: with the StartBuild grant fanned out per region over the
+        // project/hub-*-ci convention, WHICH project in WHICH region was refused
+        // is half the diagnosis — and the old single-cause remediation text was
+        // wrong for two of the three ways this denial happens.
+        region: owner.region,
+        detail:
+          `This Lambda's role has no codebuild:StartBuild on ${project} in ${owner.region}. ` +
+          "Three deploy-side causes: (1) the deployment was not given " +
+          "PIPELINE_CI_START_BUILD=1, so the CiStartBuild statement is absent entirely; " +
+          "(2) this target's region is not in PIPELINE_REGIONS, so the project/hub-*-ci " +
+          "grant was never fanned out to it; (3) the registry entry sets an explicit " +
+          "ciProject outside the hub-*-ci convention, which that wildcard cannot match. " +
+          "All three are operator changes, not retryable — fall back to waiting on the " +
+          "repo's own webhook build.",
       });
     }
     if (err?.name === "ResourceNotFoundException") {
