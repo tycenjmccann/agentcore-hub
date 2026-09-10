@@ -1,0 +1,119 @@
+TEAM-4330 — BEFORE/AFTER computed-style differential
+=====================================================
+Generated: 2026-09-10 (dev server, same session)
+
+Purpose: empirically prove the PRE-fix state was actually broken in THIS engine,
+rebutting "R1.4 is merely declared." Controlled experiment — everything held
+constant, ONLY src/styles/globals.css differs:
+
+  * Same Chromium build .... full chromium-1243, HeadlessChrome/153.0.0.0
+  * Same page .............. http://localhost:3000/workflow (dev server, CSS
+                             compiled on the fly — no production rebuild)
+  * Same theme ............. dark (localStorage.theme='dark' via addInitScript)
+  * Same real selector ..... div.flex-1.overflow-y-auto.overflow-x-hidden
+  * Same probe ............. verify-scrollbar.mjs --diagnostic (report-only)
+
+  BEFORE = git show origin/feature/TEAM-4314--...:src/styles/globals.css
+           (the pre-fix version: `* { scrollbar-width: thin; scrollbar-color:
+            var(--color-surface-4) transparent }` + bare *::-webkit-scrollbar-*)
+  AFTER  = committed fix 03e2ce8 (@supports split)
+
+-----------------------------------------------------------------------------
+                                   BEFORE (base)        AFTER (fixed)
+-----------------------------------------------------------------------------
+getComputedStyle(el).scrollbarWidth        thin                 auto
+getComputedStyle(el).scrollbarColor        rgb(42,42,58) +      auto
+                                           rgba(0,0,0,0)
+getComputedStyle(el,'::-webkit-scrollbar')
+                            .width         6px                  6px
+::-webkit-scrollbar-thumb backgroundColor  rgb(42,42,58)        rgb(42,42,58)
+::-webkit-scrollbar-thumb borderRadius     3px                  3px
+injected node gutter (offset-client)       0                    0
+-----------------------------------------------------------------------------
+(identical readings on the injected forced-overflow node — see raw logs below.)
+
+HONEST INTERPRETATION
+=====================
+1. The DISCRIMINATING signal is scrollbarWidth / scrollbarColor:
+     BEFORE: thin / rgb(42,42,58) transparent   → both NON-auto.
+     AFTER:  auto / auto                          → both auto.
+   Per MDN (https://developer.mozilla.org/en-US/docs/Web/CSS/::-webkit-scrollbar):
+   "If an element's computed scrollbar-color and scrollbar-width values are
+   anything other than auto, they will override ::-webkit-scrollbar-* styling."
+   BEFORE, those values are non-auto (thin + a token color) on every element via
+   the inherited `*` rule → the override condition is ACTIVE → the webkit rules,
+   though present, do not govern the painted scrollbar. AFTER, the @supports
+   split removes the standard `*` rule on this (WebKit) engine, so both revert to
+   `auto` → the override condition is GONE → the ::-webkit-scrollbar-* rules
+   govern. This flip is exactly the mechanism the ticket describes, and it is
+   observed here as a real BEFORE≠AFTER delta.
+
+2. IMPORTANT CAVEAT — the pseudo-element computed values are NOT discriminating:
+   getComputedStyle(el,'::-webkit-scrollbar').width reads 6px, and the thumb bg
+   (rgb(42,42,58)) and radius (3px) read the authored values, in BOTH the broken
+   BEFORE state and the fixed AFTER state. Chromium returns the authored
+   ::-webkit-scrollbar-* declarations in computed style regardless of whether the
+   scrollbar-color/width override actually suppresses their PAINTING. So a probe
+   that only checked `::-webkit-scrollbar width == 6px` would pass in BOTH states
+   and prove nothing. The primary verification probe (probe-chromium.txt) is
+   therefore sound specifically because it also asserts scrollbarWidth == auto AND
+   scrollbarColor == auto — the two values that actually change between broken and
+   fixed. This differential is what justifies that choice of assertions.
+
+3. gutter == 0 in both states: headless Chromium uses overlay scrollbars (no
+   space-taking gutter), independent of the fix. Not discriminating; recorded for
+   completeness, not relied upon.
+
+CONCLUSION: the differential CONFIRMS the ticket's override theory on the
+discriminating axis (scrollbarWidth/scrollbarColor: thin/token → auto/auto), and
+simultaneously shows that the ::-webkit-scrollbar computed width is a non-
+discriminating signal — which is why the acceptance probe keys on the standard
+properties reverting to `auto`, not on the pseudo-element width alone.
+
+=============================================================================
+RAW LOG — BEFORE
+=============================================================================
+  using full chromium build: /mnt/efs/sessions/cc-683598e7f8ad4ae683a0ed4d66aefb17/tycenjmccann-agentcore-hub/node_modules/playwright-core/.local-browsers/chromium-1243/chrome-linux-arm64/chrome
+
+===== DIAGNOSTIC (report-only) — BEFORE (base globals.css — pre-fix, * sets scrollbar-color) against http://localhost:3000 =====
+  theme       = dark
+  userAgent   = Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/153.0.0.0 Safari/537.36
+  headless    = true
+  real container = div.flex-1.overflow-y-auto.overflow-x-hidden
+  [div.flex-1.overflow-y-auto.overflow-x-hidden] scrollbarWidth      = thin
+  [div.flex-1.overflow-y-auto.overflow-x-hidden] scrollbarColor      = rgb(42, 42, 58) rgba(0, 0, 0, 0)
+  [div.flex-1.overflow-y-auto.overflow-x-hidden] ::-webkit-scrollbar width       = 6px
+  [div.flex-1.overflow-y-auto.overflow-x-hidden] ::-webkit-scrollbar-thumb bg    = rgb(42, 42, 58)
+  [div.flex-1.overflow-y-auto.overflow-x-hidden] ::-webkit-scrollbar-thumb radius= 3px
+  [injected] scrollbarWidth      = thin
+  [injected] scrollbarColor      = rgb(42, 42, 58) rgba(0, 0, 0, 0)
+  [injected] ::-webkit-scrollbar width       = 6px
+  [injected] ::-webkit-scrollbar-thumb bg    = rgb(42, 42, 58)
+  [injected] ::-webkit-scrollbar-thumb radius= 3px
+  [injected] gutter (offsetWidth-clientWidth)= 0
+
+===== DIAGNOSTIC COMPLETE (report-only, no assertions) =====
+
+=============================================================================
+RAW LOG — AFTER
+=============================================================================
+  using full chromium build: /mnt/efs/sessions/cc-683598e7f8ad4ae683a0ed4d66aefb17/tycenjmccann-agentcore-hub/node_modules/playwright-core/.local-browsers/chromium-1243/chrome-linux-arm64/chrome
+
+===== DIAGNOSTIC (report-only) — AFTER (fixed globals.css — @supports split) against http://localhost:3000 =====
+  theme       = dark
+  userAgent   = Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/153.0.0.0 Safari/537.36
+  headless    = true
+  real container = div.flex-1.overflow-y-auto.overflow-x-hidden
+  [div.flex-1.overflow-y-auto.overflow-x-hidden] scrollbarWidth      = auto
+  [div.flex-1.overflow-y-auto.overflow-x-hidden] scrollbarColor      = auto
+  [div.flex-1.overflow-y-auto.overflow-x-hidden] ::-webkit-scrollbar width       = 6px
+  [div.flex-1.overflow-y-auto.overflow-x-hidden] ::-webkit-scrollbar-thumb bg    = rgb(42, 42, 58)
+  [div.flex-1.overflow-y-auto.overflow-x-hidden] ::-webkit-scrollbar-thumb radius= 3px
+  [injected] scrollbarWidth      = auto
+  [injected] scrollbarColor      = auto
+  [injected] ::-webkit-scrollbar width       = 6px
+  [injected] ::-webkit-scrollbar-thumb bg    = rgb(42, 42, 58)
+  [injected] ::-webkit-scrollbar-thumb radius= 3px
+  [injected] gutter (offsetWidth-clientWidth)= 0
+
+===== DIAGNOSTIC COMPLETE (report-only, no assertions) =====

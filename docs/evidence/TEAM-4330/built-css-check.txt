@@ -1,0 +1,14 @@
+TEAM-4330 — Built-CSS verification (§A)
+Generated: 2026-09-10T00:25:56Z
+Built stylesheet: .next/static/css/a203f8b7c921fa42.css
+
+This proves the @supports split survives PostCSS/Tailwind/Next minification and
+actually ships. Note: the minifier rewrites '*::-webkit-scrollbar' -> '::-webkit-scrollbar'
+(semantically identical — a bare pseudo-element selector matches all elements),
+and preserves the selector() feature-query conditions verbatim.
+
+=== ASSERTION 1: webkit @supports block present with ::-webkit-scrollbar{width:6px ===
+@supports selector(::-webkit-scrollbar){::-webkit-scrollbar{width:6px;height:6px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:var(--color-surface-4);border-radius:3px}::-webkit-scrollbar-thumb:hover{background:color-mix(in srgb,var(--color-surface-4) 70%,var(--color-text-muted))}::-webkit-scrollbar-button{display:none}}
+
+=== ASSERTION 2: standard-path @supports block present (Firefox path) ===
+@supports (scrollbar-width:thin) and (not selector(::-webkit-scrollbar)){*{scrollbar-width:thin;scrollbar-color:var(--color-surface-4) transparent}}

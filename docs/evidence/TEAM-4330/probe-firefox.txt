@@ -1,0 +1,11 @@
+
+===== FIREFOX PROBE against http://localhost:3000 =====
+  userAgent = Mozilla/5.0 (X11; Linux x86_64; rv:155.0) Gecko/20100101 Firefox/155.0
+  supportsWebkit=false supportsScrollbarWidth=true
+  [div.flex-1.overflow-y-auto.overflow-x-hidden] scrollbarWidth=none scrollbarColor=rgb(42, 42, 58) rgba(0, 0, 0, 0)
+  PASS  Firefox: CSS.supports(selector(::-webkit-scrollbar)) === false (false)
+  PASS  Firefox: CSS.supports(scrollbar-width: thin) === true (standard path engine) (true)
+  PASS  Firefox: scrollbar-color === surface-4 token rgb(42,42,58) (proves @supports standard block applied) (rgb(42, 42, 58) rgba(0, 0, 0, 0))
+  PASS  Firefox: scrollbar-width is non-default (thin from our rule, or none if pinned by the Playwright FF harness profile — see note) (none)
+
+===== RESULT: ALL PASS =====
