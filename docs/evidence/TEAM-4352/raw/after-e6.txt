@@ -1,0 +1,11 @@
+
+Running 2 tests using 1 worker
+
+[E6] ArrowRight at the clamped ceiling: seen=450 writes=[] stored=600
+[E6] widened to 1600: rendered=600 valuenow=600 stored=600 writes=0
+  ✓  1 [chromium] › tests/tab-workflow-resize.spec.ts:782:9 › E: drag lifecycle (TEAM-4331) › on a 900px viewport with a stored preference above the ceiling (TEAM-4352) › E6: an ArrowRight absorbed by the clamp writes nothing and keeps the 600 preference (2.4s)
+[E6b] ArrowLeft from pref 600 / rendered 450: seen=434 writes=[{"key":"workflow-history-width","value":"434"}] rendered=434
+[E6b] widened to 1600: rendered=434 stored=434
+  ✓  2 [chromium] › tests/tab-workflow-resize.spec.ts:838:9 › E: drag lifecycle (TEAM-4331) › on a 900px viewport with a stored preference above the ceiling (TEAM-4352) › E6b: an ArrowLeft that VISIBLY narrows may replace the preference — exactly one write (2.8s)
+
+  2 passed (6.3s)

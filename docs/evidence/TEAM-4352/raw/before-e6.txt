@@ -1,0 +1,106 @@
+
+Running 2 tests using 1 worker
+
+[E6] ArrowRight at the clamped ceiling: seen=450 writes=[{"key":"workflow-history-width","value":"450"}] stored=450
+[E6] widened to 1600: rendered=450 valuenow=450 stored=450 writes=1
+  ✘  1 [chromium] › tests/tab-workflow-resize.spec.ts:782:9 › E: drag lifecycle (TEAM-4331) › on a 900px viewport with a stored preference above the ceiling (TEAM-4352) › E6: an ArrowRight absorbed by the clamp writes nothing and keeps the 600 preference (2.3s)
+[E6b] ArrowLeft from pref 600 / rendered 450: seen=434 writes=[{"key":"workflow-history-width","value":"434"}] rendered=434
+[E6b] widened to 1600: rendered=434 stored=434
+  ✓  2 [chromium] › tests/tab-workflow-resize.spec.ts:838:9 › E: drag lifecycle (TEAM-4331) › on a 900px viewport with a stored preference above the ceiling (TEAM-4352) › E6b: an ArrowLeft that VISIBLY narrows may replace the preference — exactly one write (2.8s)
+
+
+  1) [chromium] › tests/tab-workflow-resize.spec.ts:782:9 › E: drag lifecycle (TEAM-4331) › on a 900px viewport with a stored preference above the ceiling (TEAM-4352) › E6: an ArrowRight absorbed by the clamp writes nothing and keeps the 600 preference 
+
+    Error: [2mexpect([22m[31mreceived[39m[2m).[22mtoBe[2m([22m[32mexpected[39m[2m) // Object.is equality[22m
+
+    Expected: [32m0[39m
+    Received: [31m1[39m
+
+      802 |
+      803 |       // Nothing moved on screen, so nothing may be persisted.
+    > 804 |       expect.soft(writes.length).toBe(0);
+          |                                  ^
+      805 |       expect.soft(await storedWidth(page)).toBe("600");
+      806 |       expect.soft(near(await settledWidth(page), 450, 3)).toBe(true);
+      807 |       // aria stays honest — it reports the RENDERED width, never the preference.
+        at /mnt/efs/sessions/cc-66648be8211e449ab7c9b5572ebb7ce6/tycenjmccann-agentcore-hub/tests/tab-workflow-resize.spec.ts:804:34
+
+    Error: [2mexpect([22m[31mreceived[39m[2m).[22mtoBe[2m([22m[32mexpected[39m[2m) // Object.is equality[22m
+
+    Expected: [32m"[7m60[27m0"[39m
+    Received: [31m"[7m45[27m0"[39m
+
+      803 |       // Nothing moved on screen, so nothing may be persisted.
+      804 |       expect.soft(writes.length).toBe(0);
+    > 805 |       expect.soft(await storedWidth(page)).toBe("600");
+          |                                            ^
+      806 |       expect.soft(near(await settledWidth(page), 450, 3)).toBe(true);
+      807 |       // aria stays honest — it reports the RENDERED width, never the preference.
+      808 |       expect.soft(await aria(page, "aria-valuenow")).toBe(450);
+        at /mnt/efs/sessions/cc-66648be8211e449ab7c9b5572ebb7ce6/tycenjmccann-agentcore-hub/tests/tab-workflow-resize.spec.ts:805:44
+
+    Error: [2mexpect([22m[31mreceived[39m[2m).[22mtoBe[2m([22m[32mexpected[39m[2m) // Object.is equality[22m
+
+    Expected: [32mtrue[39m
+    Received: [31mfalse[39m
+
+      817 |           `stored=${await storedWidth(page)} writes=${(await widthWrites(page)).length}`
+      818 |       );
+    > 819 |       expect.soft(near(restored, 600, 3)).toBe(true);
+          |                                           ^
+      820 |       expect.soft(await aria(page, "aria-valuenow")).toBe(600);
+      821 |       expect.soft(await storedWidth(page)).toBe("600");
+      822 |       expect.soft((await widthWrites(page)).length).toBe(0); // restoring a preference is render-only
+        at /mnt/efs/sessions/cc-66648be8211e449ab7c9b5572ebb7ce6/tycenjmccann-agentcore-hub/tests/tab-workflow-resize.spec.ts:819:43
+
+    Error: [2mexpect([22m[31mreceived[39m[2m).[22mtoBe[2m([22m[32mexpected[39m[2m) // Object.is equality[22m
+
+    Expected: [32m600[39m
+    Received: [31m450[39m
+
+      818 |       );
+      819 |       expect.soft(near(restored, 600, 3)).toBe(true);
+    > 820 |       expect.soft(await aria(page, "aria-valuenow")).toBe(600);
+          |                                                      ^
+      821 |       expect.soft(await storedWidth(page)).toBe("600");
+      822 |       expect.soft((await widthWrites(page)).length).toBe(0); // restoring a preference is render-only
+      823 |     });
+        at /mnt/efs/sessions/cc-66648be8211e449ab7c9b5572ebb7ce6/tycenjmccann-agentcore-hub/tests/tab-workflow-resize.spec.ts:820:54
+
+    Error: [2mexpect([22m[31mreceived[39m[2m).[22mtoBe[2m([22m[32mexpected[39m[2m) // Object.is equality[22m
+
+    Expected: [32m"[7m60[27m0"[39m
+    Received: [31m"[7m45[27m0"[39m
+
+      819 |       expect.soft(near(restored, 600, 3)).toBe(true);
+      820 |       expect.soft(await aria(page, "aria-valuenow")).toBe(600);
+    > 821 |       expect.soft(await storedWidth(page)).toBe("600");
+          |                                            ^
+      822 |       expect.soft((await widthWrites(page)).length).toBe(0); // restoring a preference is render-only
+      823 |     });
+      824 |
+        at /mnt/efs/sessions/cc-66648be8211e449ab7c9b5572ebb7ce6/tycenjmccann-agentcore-hub/tests/tab-workflow-resize.spec.ts:821:44
+
+    Error: [2mexpect([22m[31mreceived[39m[2m).[22mtoBe[2m([22m[32mexpected[39m[2m) // Object.is equality[22m
+
+    Expected: [32m0[39m
+    Received: [31m1[39m
+
+      820 |       expect.soft(await aria(page, "aria-valuenow")).toBe(600);
+      821 |       expect.soft(await storedWidth(page)).toBe("600");
+    > 822 |       expect.soft((await widthWrites(page)).length).toBe(0); // restoring a preference is render-only
+          |                                                     ^
+      823 |     });
+      824 |
+      825 |     // The deliberate ASYMMETRY, pinned. From pref 600 / rendered 450, ArrowLeft
+        at /mnt/efs/sessions/cc-66648be8211e449ab7c9b5572ebb7ce6/tycenjmccann-agentcore-hub/tests/tab-workflow-resize.spec.ts:822:53
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/tab-workflow-resize-E-drag-8baad-nd-keeps-the-600-preference-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/tab-workflow-resize-E-drag-8baad-nd-keeps-the-600-preference-chromium/error-context.md
+
+  1 failed
+    [chromium] › tests/tab-workflow-resize.spec.ts:782:9 › E: drag lifecycle (TEAM-4331) › on a 900px viewport with a stored preference above the ceiling (TEAM-4352) › E6: an ArrowRight absorbed by the clamp writes nothing and keeps the 600 preference 
+  1 passed (7.8s)
