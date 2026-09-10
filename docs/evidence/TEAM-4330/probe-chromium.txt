@@ -1,0 +1,52 @@
+  using full chromium build: /mnt/efs/sessions/cc-683598e7f8ad4ae683a0ed4d66aefb17/tycenjmccann-agentcore-hub/node_modules/playwright-core/.local-browsers/chromium-1243/chrome-linux-arm64/chrome
+
+===== CHROMIUM PROBE against http://localhost:3000 =====
+
+----- theme: dark -----
+  data-theme = dark
+  userAgent  = Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/153.0.0.0 Safari/537.36
+  candidate scroll containers on page: 1
+  real container: div.flex-1.overflow-y-auto.overflow-x-hidden
+  REAL  computed: webkitWidth=6px thumbBg=rgb(42, 42, 58) radius=3px scrollbarWidth=auto scrollbarColor=auto
+  INJ   computed: webkitWidth=6px thumbBg=rgb(42, 42, 58) radius=3px scrollbarWidth=auto scrollbarColor=auto gutter=0
+  PASS  CSS.supports(selector(::-webkit-scrollbar)) === true (true)
+  PASS  CSS.supports(scrollbar-width: thin) === true (true)
+  PASS  real app scroll container located (read-only) (div.flex-1.overflow-y-auto.overflow-x-hidden)
+  PASS  [div.flex-1.overflow-y-auto.overflow-x-hidden] ::-webkit-scrollbar width === 6px (6px)
+  PASS  [div.flex-1.overflow-y-auto.overflow-x-hidden] ::-webkit-scrollbar-thumb radius === 3px (3px)
+  PASS  [div.flex-1.overflow-y-auto.overflow-x-hidden] thumb bg === rgb(42, 42, 58) (surface-4 for dark) (rgb(42, 42, 58))
+  PASS  [div.flex-1.overflow-y-auto.overflow-x-hidden] scrollbarWidth === auto (webkit not overridden) (auto)
+  PASS  [div.flex-1.overflow-y-auto.overflow-x-hidden] scrollbarColor === auto (A2: styling not foreclosed) (auto)
+  PASS  [injected] ::-webkit-scrollbar width === 6px (6px)
+  PASS  [injected] ::-webkit-scrollbar-thumb radius === 3px (3px)
+  PASS  [injected] thumb bg === rgb(42, 42, 58) (surface-4 for dark) (rgb(42, 42, 58))
+  PASS  [injected] scrollbarWidth === auto (webkit not overridden) (auto)
+  PASS  [injected] scrollbarColor === auto (A2: styling not foreclosed) (auto)
+  NOTE  injected gutter === 0 → OVERLAY scrollbars in this environment (headless Chromium default). Not a failure: the binding proof is computed ::-webkit-scrollbar width === 6px, asserted above.
+  PASS  R1.5 dark thumb not white/near-white (each channel < 100) (r=42 g=42 b=58)
+  screenshot saved (deviceScaleFactor=3, clip={"x":240,"y":40,"width":20,"height":280}); panel styled ::-webkit-scrollbar width=6px thumbBg=rgb(42, 42, 58) radius=3px
+  NOTE  This environment runs headless Chromium on Linux, which uses OVERLAY scrollbars that fade out at rest and are not composited into screenshots — so the PNG shows the dark styled panel but the 6px thumb is not painted into the bitmap. Verified: full chromium build (not just headless-shell), --disable-features=OverlayScrollbar(s), immediate post-scroll capture — none force a composited classic thumb in headless. The thumb's applied style is proven by the computed values above (width=6px, thumbBg=rgb(42, 42, 58), radius=3px) and the per-theme computed-style assertions. A headed browser / classic-scrollbar OS would render the slim rounded dark thumb visibly.
+
+----- theme: light -----
+  data-theme = light
+  userAgent  = Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/153.0.0.0 Safari/537.36
+  candidate scroll containers on page: 1
+  real container: div.flex-1.overflow-y-auto.overflow-x-hidden
+  REAL  computed: webkitWidth=6px thumbBg=rgb(206, 212, 218) radius=3px scrollbarWidth=auto scrollbarColor=auto
+  INJ   computed: webkitWidth=6px thumbBg=rgb(206, 212, 218) radius=3px scrollbarWidth=auto scrollbarColor=auto gutter=0
+  PASS  CSS.supports(selector(::-webkit-scrollbar)) === true (true)
+  PASS  CSS.supports(scrollbar-width: thin) === true (true)
+  PASS  real app scroll container located (read-only) (div.flex-1.overflow-y-auto.overflow-x-hidden)
+  PASS  [div.flex-1.overflow-y-auto.overflow-x-hidden] ::-webkit-scrollbar width === 6px (6px)
+  PASS  [div.flex-1.overflow-y-auto.overflow-x-hidden] ::-webkit-scrollbar-thumb radius === 3px (3px)
+  PASS  [div.flex-1.overflow-y-auto.overflow-x-hidden] thumb bg === rgb(206, 212, 218) (surface-4 for light) (rgb(206, 212, 218))
+  PASS  [div.flex-1.overflow-y-auto.overflow-x-hidden] scrollbarWidth === auto (webkit not overridden) (auto)
+  PASS  [div.flex-1.overflow-y-auto.overflow-x-hidden] scrollbarColor === auto (A2: styling not foreclosed) (auto)
+  PASS  [injected] ::-webkit-scrollbar width === 6px (6px)
+  PASS  [injected] ::-webkit-scrollbar-thumb radius === 3px (3px)
+  PASS  [injected] thumb bg === rgb(206, 212, 218) (surface-4 for light) (rgb(206, 212, 218))
+  PASS  [injected] scrollbarWidth === auto (webkit not overridden) (auto)
+  PASS  [injected] scrollbarColor === auto (A2: styling not foreclosed) (auto)
+  NOTE  injected gutter === 0 → OVERLAY scrollbars in this environment (headless Chromium default). Not a failure: the binding proof is computed ::-webkit-scrollbar width === 6px, asserted above.
+
+===== RESULT: ALL PASS =====
