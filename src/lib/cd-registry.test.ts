@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { normalizeRepoKey, parseCdRegistry, findCdEntry, deliveryModeFor, upsertCdEntry, removeCdEntry, pipelineProjectsFor } from "./cd-registry";
+import { normalizeRepoKey, parseCdRegistry, findCdEntry, deliveryModeFor, upsertCdEntry, removeCdEntry, pipelineProjectsFor, resolveRegistryTtlMs } from "./cd-registry";
 
 /** App-side mirror of lambda/orchestrator/cd-registry.mjs — same matching rules. */
 describe("cd-registry (app)", () => {
@@ -93,5 +93,28 @@ describe("pipelineProjectsFor (app mirror of pipelineProjects)", () => {
     expect(pipelineProjectsFor({ repo: "acme/juno" })).toBeNull();
     expect(pipelineProjectsFor({ repo: "acme/juno", pipeline: "   " })).toBeNull();
     expect(pipelineProjectsFor({ repo: "acme/juno", deployDoc: "DEPLOY.md" })).toBeNull();
+  });
+});
+
+/**
+ * TEAM-4350 — one TTL contract across all four readers of config/cd-registry.json.
+ * Asserts the LITERAL 60000, not a constant imported from the module, so the test
+ * pins the requirement rather than whatever the implementation currently says.
+ */
+describe("resolveRegistryTtlMs (registry cache window)", () => {
+  it("defaults to the 60s window the orchestrator, tools Lambda and bridge use", () => {
+    // Explicit env objects: immune to a CD_REGISTRY_TTL_MS set in the ambient shell.
+    expect(resolveRegistryTtlMs({})).toBe(60_000);
+    expect(resolveRegistryTtlMs({ CD_REGISTRY_TTL_MS: undefined })).toBe(60_000);
+  });
+
+  it("an explicit override wins, and a useless value falls back to 60s", () => {
+    expect(resolveRegistryTtlMs({ CD_REGISTRY_TTL_MS: "5000" })).toBe(5_000);
+    expect(resolveRegistryTtlMs({ CD_REGISTRY_TTL_MS: "1" })).toBe(1); // the Lambda tests' TTL=1 trick
+    // 0/negative would mean an S3 GET per request; Infinity would pin a stale
+    // registry for the life of the process; the rest are operator typos.
+    for (const bad of ["", "   ", "0", "-1", "-60000", "abc", "Infinity", "NaN"]) {
+      expect(resolveRegistryTtlMs({ CD_REGISTRY_TTL_MS: bad })).toBe(60_000);
+    }
   });
 });
