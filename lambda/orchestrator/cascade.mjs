@@ -459,14 +459,38 @@ export function createCascade(deps) {
   }
 
   /**
+   * TEAM-4391 — this gate is already presented to a human: an OPEN review_needed
+   * notification exists for it (same predicate as workflow-store.mjs's
+   * appendReviewNotificationOnce). A gate sitting still for hours with an open
+   * notification is correctly parked on a human, not stalled — it must never be
+   * mistaken for the "missed unblock event" case reconcileDependent exists to fix.
+   */
+  function gateAwaitingHuman(sibling, workflow) {
+    return (workflow?.humanNotifications || []).some(
+      (n) => n?.type === "review_needed" && n?.ticketId === sibling.ticketId && !n?.acknowledged
+    );
+  }
+
+  /**
    * A dependent parked in_review (a human-review gate) whose last blocker just
    * resolved — e.g. a reopened gate whose rework fix children have all closed.
    * Re-wake the gate: emit review.reawakened and re-run the EXISTING gate
    * readiness path (re-parks in_review idempotently + refreshes the reviewer
    * notification if none is open). No ticket-status write beyond what that gate
    * logic itself decides. In shadow mode: observe only (reawakenGate not called).
+   *
+   * TEAM-4391: checked FIRST, before the shadow branch, so shadow keeps
+   * predicting exactly what enforce does. reawakenGate (handleHumanReviewGate)
+   * writes the ticket status BEFORE its own idempotency CAS, so calling it at
+   * all for an already-presented gate means a real Jira/DDB write every sweep
+   * even though the CAS then correctly reports "already open" — the fix is to
+   * never call it for this case, not to reorder that function.
    */
   async function handleInReviewDependent(sibling, unblockedBy, workflow, m, mode = "enforce") {
+    if (gateAwaitingHuman(sibling, workflow)) {
+      log(`[orchestrator] cascade review re-wake skipped — ${sibling.ticketId} already awaiting a human (open review_needed)`);
+      return "review-noop";
+    }
     if (mode !== "enforce") {
       m.wouldReviewReawaken++;
       log(`[orchestrator] cascade would-reawaken (shadow) — ${sibling.ticketId}`);
