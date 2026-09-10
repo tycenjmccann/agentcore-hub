@@ -26,6 +26,24 @@ function clampHistoryWidth(proposed: number): number {
   return Math.max(HISTORY_MIN_WIDTH, Math.min(proposed, max));
 }
 
+// TEAM-4357: every localStorage WRITE in this file goes through here. setItem
+// throws when the quota is exhausted or storage is disabled (private-mode
+// Safari, a locked-down profile), and all three call sites sit inside pointer /
+// keyboard handlers, where that surfaces as an uncaught error mid-interaction.
+// The only thing lost on failure is a UI preference — the sidebar reopens at
+// whatever the mount read returns — so swallowing it is the right trade.
+// The READS are deliberately NOT wrapped — they are already null-tolerant and
+// out of this ticket's scope. Same idiom as
+// src/components/layout/sidebar/SidebarContext.tsx.
+function safeSetItem(key: string, value: string): void {
+  try {
+    localStorage.setItem(key, value);
+  } catch {
+    // Storage unavailable — a lost width/collapse preference is not worth
+    // breaking the drag or the keypress over.
+  }
+}
+
 interface WorkflowSummary {
   id: string;
   phase: string;
@@ -81,7 +99,7 @@ export default function WorkflowPage() {
     preferredWidthRef.current = next;
     widthRef.current = next;
     setHistoryWidth(next);
-    if (persist) localStorage.setItem(HISTORY_WIDTH_KEY, String(next));
+    if (persist) safeSetItem(HISTORY_WIDTH_KEY, String(next));
   }, []);
 
   // TEAM-4331 (B3): VIEWPORT-DRIVEN width change — affects the rendered width
@@ -199,7 +217,7 @@ export default function WorkflowPage() {
       // that never moved (the dblclick's zero-movement pointerdown/up) must not
       // downgrade a stored 600 to a clamped 450. After a real drag the two are
       // identical, because onMove sets both refs.
-      localStorage.setItem(HISTORY_WIDTH_KEY, String(preferredWidthRef.current));
+      safeSetItem(HISTORY_WIDTH_KEY, String(preferredWidthRef.current));
     }
 
     dragCleanupRef.current = cleanup;
@@ -272,7 +290,7 @@ export default function WorkflowPage() {
   const toggleHistory = () => {
     const next = !historyCollapsed;
     setHistoryCollapsed(next);
-    localStorage.setItem('workflow-history-collapsed', String(next));
+    safeSetItem('workflow-history-collapsed', String(next));
   };
 
   // Update header with selected workflow title

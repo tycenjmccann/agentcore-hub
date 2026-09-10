@@ -15,6 +15,8 @@
  * so the ported cases prove the same thing that ticket's evidence proved.
  */
 import { expect, type Locator, type Page } from "@playwright/test";
+import { readFileSync } from "node:fs";
+import { join, resolve } from "node:path";
 
 export const SCREENSHOT_DIR = "playwright-screenshots/workflow-resize";
 export const HANDLE = "[role='separator'][aria-label='Resize workflows sidebar']";
@@ -149,6 +151,11 @@ export interface SetupOptions {
   rows: FixtureRow[];
   clearWidth?: boolean;
   seedWidth?: number;
+  /** TEAM-4357: seed the width key with a RAW string, bypassing the `number`
+   *  type, so Group G can exercise the `Number.isFinite` guard on the mount read
+   *  with values a number literal cannot express ("abc", "", "1e999"). Ignored
+   *  when `clearWidth` is set; takes precedence over `seedWidth`. */
+  seedWidthRaw?: string;
   theme?: "dark" | "light";
 }
 
@@ -185,7 +192,7 @@ export async function setup(page: Page, opts: SetupOptions): Promise<void> {
   );
 
   await page.addInitScript(
-    (o: { theme: string; clearWidth?: boolean; seedWidth?: number }) => {
+    (o: { theme: string; clearWidth?: boolean; seedWidth?: number; seedWidthRaw?: string }) => {
       // Instrument EVERY write before the app can make one. Assertions count
       // writes rather than compare the final stored value, because TEAM-4331's
       // listener leak wrote the same value twice — a value-only check passes on
@@ -209,12 +216,21 @@ export async function setup(page: Page, opts: SetupOptions): Promise<void> {
       if (!sessionStorage.getItem("__t4332_width_seeded")) {
         sessionStorage.setItem("__t4332_width_seeded", "1");
         if (o.clearWidth) localStorage.removeItem("workflow-history-width");
-        else if (typeof o.seedWidth === "number") {
+        else if (typeof o.seedWidthRaw === "string") {
+          // TEAM-4357: written verbatim, NOT via String(Number(...)) — the whole
+          // point is to hand the app a value its Number() call cannot parse.
+          localStorage.setItem("workflow-history-width", o.seedWidthRaw);
+        } else if (typeof o.seedWidth === "number") {
           localStorage.setItem("workflow-history-width", String(o.seedWidth));
         }
       }
     },
-    { theme, clearWidth: opts.clearWidth, seedWidth: opts.seedWidth }
+    {
+      theme,
+      clearWidth: opts.clearWidth,
+      seedWidth: opts.seedWidth,
+      seedWidthRaw: opts.seedWidthRaw,
+    }
   );
 
   // NOT networkidle: /workflow polls on a 5s timer, so networkidle is never
@@ -491,12 +507,21 @@ export const listMetrics = (locator: Locator) =>
     const wk = (pseudo: string) => getComputedStyle(el, pseudo);
     return {
       gutter: (el as HTMLElement).offsetWidth - el.clientWidth,
+      // TEAM-4357: the HORIZONTAL bar's reserved gutter — a height difference,
+      // because a bottom scrollbar eats vertical space. `gutter` above is the
+      // vertical bar's. The two are NOT interchangeable, and conflating them is
+      // how docs/TEAM-4330-scrollbar-verification.md ended up recording a single
+      // ambiguous `gutterPx: 6` for `.code-block-content`, whose horizontal
+      // gutter actually measures 4 (see Group F2).
+      hGutter: (el as HTMLElement).offsetHeight - el.clientHeight,
       offsetWidth: (el as HTMLElement).offsetWidth,
+      offsetHeight: (el as HTMLElement).offsetHeight,
       clientWidth: el.clientWidth,
       scrollWidth: el.scrollWidth,
       scrollHeight: el.scrollHeight,
       clientHeight: el.clientHeight,
       overflowsVertically: el.scrollHeight > el.clientHeight,
+      overflowsHorizontally: el.scrollWidth > el.clientWidth,
       noHorizontalScroll: el.scrollWidth <= el.clientWidth,
       scrollbarWidth: cs.scrollbarWidth,
       scrollbarColor: cs.scrollbarColor,
@@ -540,17 +565,253 @@ export async function injectThinControl(page: Page, thumb: string): Promise<Loca
  * scrollbar CSS at all. It cannot be measured on /workflow: globals.css applies
  * its rules via `*`, so every element there is already styled. A second page in
  * the same context keeps the app page intact.
+ *
+ * TEAM-4357 added the axis parameter (default "y", so every existing caller is
+ * unchanged). "x" measures the HORIZONTAL bar, which is what Group F's canvas
+ * and code-block probes need: their non-vacuity control has to be on the same
+ * axis as the gutter under test, or a runner that hid only one axis' scrollbars
+ * would still pass.
  */
-export async function nativeGutter(page: Page): Promise<number> {
+export async function nativeGutter(page: Page, axis: "x" | "y" = "y"): Promise<number> {
   const bare = await page.context().newPage();
   await bare.setContent(
-    `<style>html,body{margin:0}#n{width:200px;height:120px;overflow-y:scroll}</style>
-     <div id="n"><div style="height:2000px"></div></div>`
+    `<style>html,body{margin:0}
+     #n{width:200px;height:120px;overflow-${axis === "y" ? "y" : "x"}:scroll}</style>
+     <div id="n"><div style="${axis === "y" ? "height:2000px" : "width:2000px;height:20px"}"></div></div>`
   );
-  const g = await bare.$eval("#n", (el) => (el as HTMLElement).offsetWidth - el.clientWidth);
+  const g = await bare.$eval("#n", (el, a) =>
+    a === "y"
+      ? (el as HTMLElement).offsetWidth - el.clientWidth
+      : (el as HTMLElement).offsetHeight - el.clientHeight,
+    axis
+  );
   await bare.close();
   return g;
 }
+
+// ══════════════════════════ TEAM-4357 — board scrollbar cascade (Group F) ═════
+//
+// globals.css styles scrollbars app-wide through `*`; pipeline.css then styles
+// five board scrollers through their own class selectors. Those five survive the
+// global block only because of TWO INDEPENDENT mechanisms, and nothing in the
+// suite covered either one for a pipeline.css class:
+//
+//   (a) the `@supports selector(::-webkit-scrollbar)` block resets
+//       scrollbar-width/scrollbar-color back to `auto`. Per MDN a computed value
+//       other than `auto` SUPPRESSES ::-webkit-scrollbar-* painting outright, so
+//       without this reset all five groups are dead code — which is exactly the
+//       pre-TEAM-4330 state (globals.css at fde1de8).
+//   (b) specificity: `.code-block-content::-webkit-scrollbar` (0,1,1) outranks
+//       `*::-webkit-scrollbar` (0,0,1). An `!important` in the global block, or a
+//       selector of equal-or-higher specificity, silently reclaims the bar.
+//
+// Group F is hermetic by construction: no server, no navigation, no network. It
+// reads the two REAL stylesheets off disk and injects them, so the assertions are
+// about the SHIPPED files rather than about a copy that would drift.
+
+const REPO_ROOT = resolve(__dirname, "..", "..");
+
+/**
+ * The two REAL stylesheets under test, by absolute path.
+ *
+ * Exported so F0 can log the resolved paths: if the repo layout moves, the
+ * failure names the path it tried instead of silently guarding nothing. NEVER
+ * inline a copy of these declarations into the test — a copy would assert only
+ * that the test agrees with itself, and neither negative control (restoring
+ * globals.css from fde1de8, or adding an `!important` to it) could turn it red.
+ */
+export const CSS_SOURCES = {
+  globals: join(REPO_ROOT, "src/styles/globals.css"),
+  pipeline: join(REPO_ROOT, "src/components/workflow/pipeline.css"),
+};
+
+function readRealCss(which: keyof typeof CSS_SOURCES): string {
+  const path = CSS_SOURCES[which];
+  const css = readFileSync(path, "utf8"); // ENOENT names the resolved path
+  if (!css.includes("::-webkit-scrollbar")) {
+    throw new Error(
+      `${path} contains no ::-webkit-scrollbar rule — wrong path, or the block was deleted`
+    );
+  }
+  return css;
+}
+
+// ── Token values, each tied to the declaration it comes from ──────────────────
+/** globals.css `*::-webkit-scrollbar-thumb { background: var(--color-surface-4) }`
+ *  with `[data-theme="dark"] { --color-surface-4: #2a2a3a }`. THE regression
+ *  colour: seeing this on a board scroller means globals has reclaimed it. */
+export const GLOBALS_THUMB_DARK = "rgb(42, 42, 58)";
+/** globals.css `*::-webkit-scrollbar-track { background: transparent }`. */
+export const GLOBALS_TRACK = "rgba(0, 0, 0, 0)";
+/** globals.css `*::-webkit-scrollbar { width: 6px; height: 6px }`. */
+export const GLOBALS_BAR = "6px";
+/** pipeline.css `:root { --pipeline-border: #1e293b }`. NOTE: `:root`, not a
+ *  `[data-theme="dark"]` block — pipeline.css treats dark as the DEFAULT and only
+ *  overrides for `[data-theme="light"]` (#e2e8f0). */
+export const PIPELINE_THUMB_DARK = "rgb(30, 41, 59)";
+/** pipeline.css `.pipeline-canvas::-webkit-scrollbar-track { background: var(--pipeline-bg) }`
+ *  with `:root { --pipeline-bg: #0f1419 }`. The canvas is the ONLY group with its
+ *  own track colour, which is what makes it distinguishable from globals at all. */
+export const PIPELINE_CANVAS_TRACK_DARK = "rgb(15, 20, 25)";
+
+/** MEASURED, not assumed — see the values pinned in Group F. */
+export const CANVAS_BAR_HEIGHT = "6px"; // .pipeline-canvas::-webkit-scrollbar { height: 6px }
+export const CODE_BAR_HEIGHT = "4px"; //   .code-block-content::-webkit-scrollbar { height: 4px }
+export const MODAL_BAR_WIDTH = "6px"; //   .modal-content::-webkit-scrollbar { width: 6px }
+
+/**
+ * Harness CSS: sizes the wrapper IDs only. Declares no scrollbar property of any
+ * kind, and F0 asserts that, so the harness can never be what makes Group F pass.
+ */
+const HARNESS_CSS = `
+html,body{margin:0;padding:0}
+#f-canvas-wrap{width:600px}
+#f-code-wrap{width:600px}
+#f-modal-wrap{width:760px}
+`;
+
+/**
+ * Probe markup using the REAL class names, the real nesting, and the real
+ * overflow axis of each scroller:
+ *
+ *  - `.pipeline-canvas` > `.pipeline-scroll-container` > 8 × `.phase-box`
+ *    (`overflow-x: auto` + `min-width: max-content` + 290px boxes ⇒ HORIZONTAL
+ *    overflow only; `min-height: 840px` means the short content never overflows
+ *    vertically) — src/components/workflow/WorkflowBoard.tsx.
+ *  - `<pre class="code-block-content">` with one long unwrapped line. The
+ *    no-wrap comes from the `pre` UA style, exactly as in
+ *    src/components/workflow/CodeBlock.tsx:77 ⇒ HORIZONTAL overflow only.
+ *  - `.agent-output-modal` > `.modal-content`. The wrapper is required, not
+ *    decoration: `.modal-content { flex: 1 }` needs the modal's
+ *    `display:flex; flex-direction:column; max-height:80vh` to have a height to
+ *    overflow ⇒ VERTICAL overflow only — src/components/workflow/AgentOutputPanel.tsx:447.
+ */
+const PROBE_HTML = `
+<div id="f-canvas-wrap">
+  <div class="pipeline-canvas">
+    <div class="pipeline-scroll-container">${
+      '<div class="phase-box"><div>Requirements</div></div>'.repeat(8)
+    }</div>
+  </div>
+</div>
+<div id="f-code-wrap">
+  <pre class="code-block-content"><code>${"const x = 1; ".repeat(40)}</code></pre>
+</div>
+<div id="f-modal-wrap">
+  <div class="agent-output-modal">
+    <div class="modal-content">${"<p>tall content line</p>".repeat(200)}</div>
+  </div>
+</div>
+`;
+
+/**
+ * Mount the board probes with the two real stylesheets injected in the order
+ * Next.js loads them.
+ *
+ * That order is load-bearing: globals.css arrives via the root layout
+ * (src/app/layout.tsx) and pipeline.css via
+ * src/components/workflow/AgentOutputPanel.tsx:8, and ties between two rules of
+ * EQUAL specificity are broken by source order. Injecting pipeline.css first
+ * would make Group F pass for the wrong reason.
+ *
+ * Injecting the raw (un-processed) globals.css means Tailwind's `@tailwind`
+ * at-rules are dropped and its `@layer base/components/utilities` blocks become
+ * NATIVE cascade layers. Neither affects this guard: the whole scrollbar block is
+ * deliberately outside `@layer` (globals.css says so in its own comment) and
+ * `.scrollbar-thin` — the one layered scrollbar rule — is not used by any probe.
+ * F0 asserts the injected CSSOM really does contain the rules under test, so the
+ * group cannot pass or fail vacuously on a parse difference.
+ */
+export async function mountBoardProbes(page: Page): Promise<void> {
+  await page.setContent(
+    `<style id="globals">${readRealCss("globals")}</style>` +
+      `<style id="pipeline">${readRealCss("pipeline")}</style>` +
+      `<style id="probe-harness">${HARNESS_CSS}</style>` +
+      PROBE_HTML
+  );
+  // Set as an attribute after the fact rather than baked into the markup string,
+  // so the theme switch is observable in isolation and F0 can assert it.
+  await page.evaluate(() => document.documentElement.setAttribute("data-theme", "dark"));
+  await page.evaluate(() => new Promise(requestAnimationFrame)); // one frame to lay out
+}
+
+export interface ProbeStyleEnv {
+  themeAttr: string | undefined;
+  surface4: string;
+  pipelineBorder: string;
+  supportsWebkitSelector: boolean;
+  /** Count of `@supports selector(::-webkit-scrollbar)` groups in globals.css — the
+   *  mechanism (a) reset. Exactly one is expected. */
+  supportsGroupCount: number;
+  /** The declarations inside that group, per selector. */
+  supportsResetDecls: { selector: string; scrollbarWidth: string; scrollbarColor: string }[];
+  /** globals' universal bar rule. Chromium serialises `*::-webkit-scrollbar` as
+   *  `::-webkit-scrollbar` (it drops a redundant universal, as with `*::before`),
+   *  so the lookup normalises a leading `*` rather than matching it literally. */
+  starBarDecls: { width: string; height: string } | null;
+  /** Every class-qualified `::-webkit-scrollbar` group selector in pipeline.css,
+   *  sorted — mechanism (b)'s surface area. */
+  pipelineWebkitGroupSelectors: string[];
+  harnessMentionsScrollbar: boolean;
+}
+
+/** Introspect the injected CSSOM: what F0 asserts instead of trusting the mount. */
+export const probeStyleEnv = (page: Page): Promise<ProbeStyleEnv> =>
+  page.evaluate(() => {
+    const rs = getComputedStyle(document.documentElement);
+    const sheetById = (id: string) =>
+      [...document.styleSheets].find((s) => (s.ownerNode as HTMLElement | null)?.id === id);
+    const isGrouping = (r: CSSRule): r is CSSGroupingRule =>
+      typeof (r as CSSGroupingRule).cssRules !== "undefined";
+    // @layer / @supports / @media nest their children, so a flat scan would miss
+    // the reset rule entirely.
+    const flatten = (rules: CSSRuleList): CSSRule[] =>
+      [...rules].flatMap((r) => (isGrouping(r) ? [r, ...flatten(r.cssRules)] : [r]));
+
+    const gSheet = sheetById("globals");
+    const pSheet = sheetById("pipeline");
+    const gRules = gSheet ? flatten(gSheet.cssRules) : [];
+    const pRules = pSheet ? flatten(pSheet.cssRules) : [];
+
+    const supportsGroups = gRules.filter(
+      (r): r is CSSSupportsRule =>
+        r instanceof CSSSupportsRule && r.conditionText.includes("::-webkit-scrollbar")
+    );
+    const starBar = gRules.find(
+      (r): r is CSSStyleRule =>
+        r instanceof CSSStyleRule &&
+        r.selectorText.replace(/^\*/, "") === "::-webkit-scrollbar"
+    );
+
+    return {
+      themeAttr: document.documentElement.dataset.theme,
+      surface4: rs.getPropertyValue("--color-surface-4").trim(),
+      pipelineBorder: rs.getPropertyValue("--pipeline-border").trim(),
+      supportsWebkitSelector: CSS.supports("selector(::-webkit-scrollbar)"),
+      supportsGroupCount: supportsGroups.length,
+      supportsResetDecls: supportsGroups.flatMap((sr) =>
+        [...sr.cssRules].filter((r): r is CSSStyleRule => r instanceof CSSStyleRule).map((r) => ({
+          selector: r.selectorText,
+          scrollbarWidth: r.style.getPropertyValue("scrollbar-width"),
+          scrollbarColor: r.style.getPropertyValue("scrollbar-color"),
+        }))
+      ),
+      starBarDecls: starBar
+        ? { width: starBar.style.getPropertyValue("width"), height: starBar.style.getPropertyValue("height") }
+        : null,
+      pipelineWebkitGroupSelectors: pRules
+        .filter(
+          (r): r is CSSStyleRule =>
+            r instanceof CSSStyleRule &&
+            /^\.[a-z0-9-]+::-webkit-scrollbar$/.test(r.selectorText)
+        )
+        .map((r) => r.selectorText)
+        .sort(),
+      harnessMentionsScrollbar: (
+        document.getElementById("probe-harness")?.textContent || ""
+      ).includes("scrollbar"),
+    };
+  });
 
 // ─────────────────────────────────────────────────────────── pixel decode (R1.5)
 
