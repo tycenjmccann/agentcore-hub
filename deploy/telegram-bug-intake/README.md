@@ -104,10 +104,16 @@ purely additive:
 - `ARTIFACT_BUCKET` — when set, the poller reads `config/cd-registry.json`
   from this bucket (60s TTL) and adds every entry that names a `pipeline` as a
   target, in that entry's own `region`. A read failure other than "the key
-  doesn't exist yet" keeps the last good copy rather than going empty.
+  doesn't exist yet" — including a **malformed/truncated body** — keeps the last
+  good copy rather than going empty, and every attempted read opens the TTL
+  window, so a persistent failure costs one GetObject per TTL, not one per scan
+  (TEAM-4377, same loader contract as the orchestrator and the `Pipeline___*`
+  tools Lambda).
 - `DEPLOY_PIPELINE_NAME` — a fallback target in the function's own region,
   deduped against the registry (naming the same pipeline in both places is not
-  a double watch).
+  a double watch). `update-config.sh` only **defaults** this on the function, so
+  an operator override survives a re-run — and the inline policy below follows
+  the effective value, not the script's default.
 - `PIPELINE_REGIONS` — **not read by this Lambda at all.** It exists purely as
   the IAM fan-out list for `update-config.sh` below (which region(s) to grant
   `hub-*-deploy` access in); the poller's actual target list always comes from
@@ -119,9 +125,11 @@ This function is account-local — its execution role is managed out of band (se
 Provenance), not by a repo-tracked SAM/CDK stack — so the role's statements are
 documented here rather than declared in infra. Beyond the DynamoDB /
 Bedrock / Transcribe access the intake paths need, the deploy-approval bridge
-requires three statements: two CodePipeline actions, scoped to the configured
-deploy pipeline ARN plus the `hub-*-deploy` convention per `PIPELINE_REGIONS`,
-and one S3 read:
+requires three statements: two CodePipeline actions, scoped to the function's
+**effective** `DEPLOY_PIPELINE_NAME` ARN — `update-config.sh` reads that value
+back out of the env document it just applied, so a re-run without re-exporting
+still grants an operator's custom pipeline (TEAM-4377) — plus the `hub-*-deploy`
+convention per `PIPELINE_REGIONS`, and one S3 read:
 
 - `codepipeline:GetPipelineState` — poll for an approval action awaiting a decision.
 - `codepipeline:PutApprovalResult` — record the Approve / Reject tap. This

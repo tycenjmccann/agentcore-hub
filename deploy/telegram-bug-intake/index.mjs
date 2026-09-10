@@ -1199,8 +1199,12 @@ let _registryLoadedAt = 0;
  * failure is non-fatal — a registry problem must never stop deploy pings:
  *   no ARTIFACT_BUCKET → the empty registry, with NO S3 command constructed.
  *   NoSuchKey / 404    → empty registry (nothing registered yet).
+ *   MALFORMED body     → the LAST GOOD copy (TEAM-4377): the tolerant parser
+ *                        would turn it into an EMPTY registry and un-watch every
+ *                        registered gate for a whole TTL.
  *   any other error    → the LAST GOOD copy, so a transient S3 error cannot
  *                        silently stop watching a live pipeline mid-deploy.
+ * Every path that ATTEMPTED a read opens the TTL window, failures included.
  */
 async function loadDeployRegistry() {
   if (!ARTIFACT_BUCKET) return _registry;
@@ -1210,19 +1214,32 @@ async function loadDeployRegistry() {
     const res = await s3Client().send(
       new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: CD_REGISTRY_KEY }),
     );
-    _registry = parseCdRegistry(await res.Body.transformToString());
+    // JSON.parse HERE rather than letting parseCdRegistry do it (TEAM-4377,
+    // mirroring lambda/agentcore-hub-pipeline-tools/index.mjs loadRegistry from
+    // TEAM-4358). parseCdRegistry is tolerant BY DESIGN — a malformed document
+    // becomes an EMPTY registry — and assigning that would DISCARD the last good
+    // copy and cache "nothing registered" for the whole TTL: one truncated S3
+    // read stops watching every registered pipeline's deploy gate. Parsing first
+    // turns a malformed body into a SyntaxError the catch treats like any other
+    // read failure. parseCdRegistry takes the already-parsed object
+    // (cd-registry.mjs:52-56), so tolerant per-ENTRY handling is unchanged.
+    const doc = JSON.parse(await res.Body.transformToString());
+    _registry = parseCdRegistry(doc);
     if (!_registryLoadedAt) {
       console.log(`[telegram-bug-intake] CD registry: ${_registry.repos.length} repo(s) registered`);
     }
-    _registryLoadedAt = now;
   } catch (err) {
     if (/NoSuchKey|NotFound|404/i.test(String(err?.name || err?.message))) {
       _registry = { version: 1, repos: [] };
-      _registryLoadedAt = now;
     } else {
       console.warn(`[telegram-bug-intake] CD registry read failed: ${err.message} — keeping ${_registryLoadedAt ? "last good copy" : "empty registry"}`);
     }
   }
+  // Stamped on EVERY path that attempted a read, failures included (TEAM-4377),
+  // same as the orchestrator (lambda/orchestrator/index.mjs:259) and the tools
+  // Lambda. Without it a persistent AccessDenied or network fault meant an S3
+  // GetObject on every 60s scan for the life of the container.
+  _registryLoadedAt = now;
   return _registry;
 }
 
