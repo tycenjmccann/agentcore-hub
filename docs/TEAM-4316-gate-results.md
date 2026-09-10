@@ -138,3 +138,63 @@ follow-up cannot introduce a test regression; the failing/variable tests are
 backend-permission and server-timing artifacts of the sandbox.
 
 ---
+
+## Diff scope, dependencies, CSS, and screenshots
+
+### `git diff --stat origin/feature/TEAM-4314--kiro-opus-workflow-tab-sidebar-dark-sle...HEAD`
+
+```
+ docs/TEAM-4316-gate-results.md | 140 +++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 140 insertions(+)
+```
+
+Only this evidence doc differs from the base now, because the A/B/C code
+(`src/app/workflow/page.tsx`, `tests/tab-workflow-resize.spec.ts`) was already
+merged into the base via PR #469. For reference, the A/B/C code delta itself was:
+
+```
+ src/app/workflow/page.tsx         | 6 ++++--
+ tests/tab-workflow-resize.spec.ts | 9 +++++++--
+```
+
+### Dependencies
+
+`package.json` and `package-lock.json` are **untouched** vs base — **no new
+dependencies** (no react-resizable-panels or anything else).
+
+### CSS
+
+**No raw hex** in the TEAM-4316 global scrollbar block in `src/styles/globals.css`
+— colors are theme tokens only (`var(--color-surface-4)`,
+`color-mix(... var(--color-text-muted))`). This follow-up made **zero** changes
+to `globals.css` (R1 was already correct in PR #466).
+
+### Screenshots — synthetic vs real data
+
+Confirmed (your read is correct):
+
+- **`docs/TEAM-4316-workflow-no-white-scrollbar.png`** — **synthetic / injected
+  rows** ("Workflow run 1 … 17 — sample epic title for …"), seeded to force a
+  scrollable list so the thin, non-white scrollbar is visible/testable.
+- **`docs/TEAM-4316-sidebar-truncated-288.png`** and
+  **`docs/TEAM-4316-sidebar-dragged-wide.png`** (the 288 / wide pair) — **real
+  workflow data**: the genuine "TEAM-4316 Drag-to-resize workflows history
+  sidebar …" row tagged `TEAM-4316`.
+- (`docs/TEAM-4316-dashboard-scrollbar.png` shows the real dashboard scrollbar.)
+
+No solid white scrollbar appears anywhere in dark mode across the set — the bar
+is a thin, low-contrast overlay.
+
+---
+
+## Summary
+
+| Gate | Result |
+|------|--------|
+| `npm run lint` | exit 0 (no warnings in changed files) |
+| `npx tsc --noEmit` | exit 0 |
+| `npm run build` | Compiled successfully |
+| `tests/tab-workflow-resize.spec.ts` | 5 passed, 1 skipped (case 6 data-dependent); `scrollbarWidth="thin" webkitWidth="6px"` |
+| `npm test` (full) | 28 passed, 9 skipped, 7 failed — all 7 environmental (AWS AccessDenied); no code delta vs base, so no regression |
+
+HEAD under test: `bca5d34448a2a68146e956c78d0dbb7e00797181` (application code identical to base tip `697ac22`).
