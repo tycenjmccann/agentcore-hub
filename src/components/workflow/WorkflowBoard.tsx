@@ -97,6 +97,22 @@ function managerPulseText(
   return `Workflow Manager ${what}${event.ticketId ? ` (${event.ticketId})` : ""}`;
 }
 
+/**
+ * Does the server's canonical `owner/repo` key (normalizeRepoKey in
+ * @/lib/cd-registry) name the same repo as this run's git remote?
+ *
+ * Kept local, deliberately NOT imported: cd-registry.ts lazy-imports
+ * @aws-sdk/client-s3, and pulling the AWS SDK into the browser bundle for four
+ * lines of string matching is the trade src/config/modules.ts already refused
+ * for isPipelineEnabled. The server still does the real normalization — this
+ * only has to recognize the key it hands back.
+ */
+function isSameRepo(url: string | undefined, key: string): boolean {
+  if (!url || !key) return false;
+  const u = url.trim().toLowerCase().replace(/\.git$/, "").replace(/\/+$/, "");
+  return u === key || u.endsWith(`/${key}`) || u.endsWith(`:${key}`);
+}
+
 // ─── Component ───────────────────────────────────────────────────────────────
 
 export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoardProps) {
@@ -106,8 +122,11 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
   // ManualApproval that lives in CodePipeline, NOT in the ticket system — so it
   // was invisible on the board (a run looked "stalled" while it was really just
   // waiting for a human to approve the deploy). Poll the pipeline status while a
-  // ship-phase run is active and surface it as a banner.
-  const [deployGate, setDeployGate] = useState<{ stage: string; url?: string } | null>(null);
+  // ship-phase run is active and surface it as a banner. TEAM-4336: the banner
+  // names the pipeline and is scoped to THIS run's repo — with several registered
+  // repos, an unscoped read would show repo Y's gate on repo X's run and invite a
+  // human to approve the wrong deploy.
+  const [deployGate, setDeployGate] = useState<{ stage: string; pipeline: string; url?: string } | null>(null);
 
   // Phases + ordering are derived from the running workflow's definition so the
   // board reflects the actual workflow (e.g. social-media) instead of the
@@ -137,23 +156,32 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
   // still stops (no weakening of #293). Active ship-phase runs are unaffected:
   // !isTerminalPhase("ship") stays true, so they poll + banner exactly as before.
   const runActive = !!state && !isTerminalPhase(state.phase) && !state.cancelledAt;
+  const runRepoUrl = state?.repoConfig?.repos?.[0]?.url;
   useEffect(() => {
     if (!defHasShip || !runActive) { setDeployGate(null); return; }
     let cancelled = false;
     const poll = async () => {
       try {
-        const res = await fetch("/api/pipeline/status", { cache: "no-store" });
+        // Ask for THIS run's repo; the API narrows to its target when registered.
+        const q = runRepoUrl ? `?repo=${encodeURIComponent(runRepoUrl)}` : "";
+        const res = await fetch(`/api/pipeline/status${q}`, { cache: "no-store" });
         if (!res.ok) return;
         const data = await res.json();
         if (cancelled) return;
-        const waiting = (data.stages || []).find((s: { awaitingApproval?: boolean }) => s.awaitingApproval);
-        setDeployGate(waiting ? { stage: waiting.name, url: waiting.approvalUrl } : null);
+        // Only this run's own pipeline may raise this run's banner: an unknown or
+        // unregistered repo gets the env default target back, which cannot match
+        // (handoff run → no banner), and a def with no repo matches nothing.
+        const mine = (data.pipelines || []).find(
+          (p: { repo?: string }) => isSameRepo(runRepoUrl, p.repo || "")
+        );
+        const waiting = (mine?.stages || []).find((s: { awaitingApproval?: boolean }) => s.awaitingApproval);
+        setDeployGate(mine && waiting ? { stage: waiting.name, pipeline: mine.pipeline, url: waiting.approvalUrl } : null);
       } catch { /* pipeline module may be absent — silent */ }
     };
     poll();
     const id = setInterval(poll, 20000);
     return () => { cancelled = true; clearInterval(id); };
-  }, [defHasShip, runActive]);
+  }, [defHasShip, runActive, runRepoUrl]);
   const [celebrating, setCelebrating] = useState(false);
   // Workflow Manager watchdog toggle for this run (default on).
   const [managerWatch, setManagerWatch] = useState(true);
@@ -1319,7 +1347,7 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
           >
             <span className="review-avatar" aria-hidden>🚀</span>
             <span className="review-banner-text">
-              <span className="review-banner-label">Deploy gate — awaiting approval</span>
+              <span className="review-banner-label">Deploy gate — {deployGate.pipeline} awaiting approval</span>
               <span className="review-banner-detail">
                 {deployGate.stage} stage · production deploy · approve in Telegram or console
               </span>

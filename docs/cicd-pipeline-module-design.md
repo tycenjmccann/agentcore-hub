@@ -476,6 +476,17 @@ so the module stays truly optional.
   Default-deny: anything off-whitelist (or touching logic) still files a dev
   ticket.
 - **Deploy-gate surfaces.** The Telegram approval bridge (§5) plus a deploy-gate
-  banner on the Workflow board: `WorkflowBoard.tsx` polls `/api/pipeline/status`
-  during a ship-phase run and shows when a ManualApproval is waiting
+  banner on the Workflow board: `WorkflowBoard.tsx` polls
+  `/api/pipeline/status?repo=<the run's repo>` during a ship-phase run and shows
+  when a ManualApproval is waiting on that repo's own pipeline, naming it
   (silent-catch when the Pipeline module is absent).
+- **Multi-target (TEAM-4336).** The pilot's one pipeline generalizes to one
+  CodePipeline per repo in the CD registry (`hub-<slug>-deploy`, possibly in
+  another region). The tools Lambda resolves a call's target from the registry
+  rather than a single `PIPELINE_NAME`, and every surface derives the CI/build
+  project names from the entry's `pipeline` through one shared helper
+  (`pipelineProjects` / `pipelineProjectsFor`). `/api/pipeline/status` returns a
+  target list with per-target error isolation, `/pipeline` renders a section per
+  target, and the board's banner is scoped to the run's own repo so it can never
+  invite approval of another repo's deploy. `PutApprovalResult` remains absent
+  from the tools Lambda — the gate stays human at any number of targets.

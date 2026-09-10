@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { normalizeRepoKey, parseCdRegistry, findCdEntry, deliveryModeFor, upsertCdEntry, removeCdEntry } from "./cd-registry";
+import { normalizeRepoKey, parseCdRegistry, findCdEntry, deliveryModeFor, upsertCdEntry, removeCdEntry, pipelineProjectsFor } from "./cd-registry";
 
 /** App-side mirror of lambda/orchestrator/cd-registry.mjs — same matching rules. */
 describe("cd-registry (app)", () => {
@@ -37,5 +37,61 @@ describe("cd-registry (app)", () => {
 
     expect(removeCdEntry(cleared, "ACME/JUNO").repos.map((e) => e.repo)).toEqual(["acme/hub"]);
     expect(() => upsertCdEntry(reg, { repo: "nope" })).toThrow(/owner\/repo/);
+  });
+});
+
+/**
+ * TEAM-4336 — the multi-CD naming convention as CODE. Every surface that names a
+ * repo's CI/build/deploy resources (the tools Lambda, the Telegram deploy-gate
+ * bridge, /pipeline, the board's deploy-gate banner) derives them from the ONE
+ * `pipeline` field, so a repo can be onboarded by naming its pipeline alone. TS
+ * mirror of pipelineProjects() in lambda/orchestrator/cd-registry.mjs.
+ */
+describe("pipelineProjectsFor (app mirror of pipelineProjects)", () => {
+  const DEFAULT_REGION = process.env.AWS_REGION || "us-east-1";
+
+  it("the hub's own pipeline derives the hub's own projects", () => {
+    // agentcore-hub-* is NOT renamed to hub-*: the convention strips "-deploy"
+    // from whatever the entry names, so the hub keeps its historical resources.
+    expect(pipelineProjectsFor({ repo: "a/b", pipeline: "agentcore-hub-deploy" })).toEqual({
+      pipeline: "agentcore-hub-deploy",
+      region: DEFAULT_REGION,
+      ciProject: "agentcore-hub-ci",
+      buildProject: "agentcore-hub-build",
+      deployProject: "agentcore-hub-deploy",
+    });
+  });
+
+  it("a hub-<slug>-deploy pipeline derives hub-<slug>-ci / -build / -deploy", () => {
+    const p = pipelineProjectsFor({ repo: "acme/juno", pipeline: "hub-juno-deploy", region: "eu-west-1" })!;
+    expect(p.ciProject).toBe("hub-juno-ci");
+    expect(p.buildProject).toBe("hub-juno-build");
+    expect(p.deployProject).toBe("hub-juno-deploy");
+    expect(p.region).toBe("eu-west-1");
+  });
+
+  it("a pipeline NOT ending in -deploy is its own base (no suffix invented away)", () => {
+    const p = pipelineProjectsFor({ repo: "acme/juno", pipeline: "juno" })!;
+    expect(p.ciProject).toBe("juno-ci");
+    expect(p.buildProject).toBe("juno-build");
+    expect(p.deployProject).toBe("juno");
+  });
+
+  it("an explicit ciProject wins over the derived name; buildProject stays derived", () => {
+    // A repo whose PR-check project predates the convention must still work.
+    const p = pipelineProjectsFor({ repo: "acme/juno", pipeline: "hub-juno-deploy", ciProject: "juno-pr-checks" })!;
+    expect(p.ciProject).toBe("juno-pr-checks");
+    expect(p.buildProject).toBe("hub-juno-build");
+  });
+
+  it("region falls back to the module default when the entry omits it", () => {
+    // A definite string either way — every caller hands it to an AWS client.
+    expect(pipelineProjectsFor({ repo: "acme/juno", pipeline: "hub-juno-deploy" })!.region).toBe(DEFAULT_REGION);
+  });
+
+  it("no pipeline → null (registered, but the legacy DEPLOY.md path)", () => {
+    expect(pipelineProjectsFor({ repo: "acme/juno" })).toBeNull();
+    expect(pipelineProjectsFor({ repo: "acme/juno", pipeline: "   " })).toBeNull();
+    expect(pipelineProjectsFor({ repo: "acme/juno", deployDoc: "DEPLOY.md" })).toBeNull();
   });
 });

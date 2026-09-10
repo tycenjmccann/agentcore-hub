@@ -79,6 +79,8 @@ Env (all optional except the owner; defaults derive from `deploy/config.sh`):
 | `PIPELINE_APPROVAL_EMAILS` | — | comma-separated email approvers |
 | `PIPELINE_CI_WEBHOOK` | off | `1` enables the CodeBuild PR-check webhook + commit status. PREREQ: the CodeConnections GitHub App must be installed on the repo WITH webhook permission — a repo-level step done AFTER the OAuth handshake in "One-time after first deploy" below. Without it, `CreateWebhook` fails the deploy. |
 | `PIPELINE_CI_START_BUILD` | off | `1` grants the pipeline-tools Lambda `codebuild:StartBuild` on the CI project ONLY (via `node deploy/setup-pipeline-tools-lambda.mjs`, NOT this CDK stack). The fallback for when the webhook cannot be installed: agents can trigger CI builds themselves, bounded by `concurrentBuildLimit` on the CI project and the calling agent's poll cap. |
+| `PIPELINE_REGIONS` | the Lambda's own region | On the **tools Lambda**: comma-separated list of regions it may read and trigger pipelines in. Multi-CD — a CD-registry entry whose `region` is outside this list fails fast instead of resolving to a same-named pipeline in the wrong region. |
+| `ARTIFACT_BUCKET` | derived (`deploy/config.sh`) | On the **tools Lambda**: bucket holding `config/cd-registry.json`, which it reads to resolve a repo → pipeline / CI project / build project (`pipelineProjects`). Without it the Lambda falls back to its single `PIPELINE_NAME` / `CI_PROJECT` / `BUILD_PROJECT` env values. |
 
 ### One-time after first deploy
 
