@@ -231,8 +231,9 @@ let _agentRoster = null;
 // semantics. Re-read every CD_REGISTRY_TTL_MS (default 60s) so registering a
 // repo in the UI takes effect on warm containers too — a run that is mid-flight
 // when its repo is registered picks the ship phase up at its next dispatch.
-// A failed read keeps the last good copy; a never-loaded registry is EMPTY
-// (nothing registered → HANDOFF), the fail-safe direction: no merge, no deploy.
+// A failed read OR a malformed body keeps the last good copy; a never-loaded
+// registry is EMPTY (nothing registered → HANDOFF), the fail-safe direction:
+// no merge, no deploy.
 const CD_REGISTRY_TTL_MS = Number(process.env.CD_REGISTRY_TTL_MS) || 60_000;
 let _cdRegistry = { ...EMPTY_CD_REGISTRY };
 let _cdRegistryLoadedAt = 0;
@@ -243,7 +244,12 @@ export async function loadCdRegistry({ force = false } = {}) {
   if (!ARTIFACT_BUCKET) { _cdRegistryLoadedAt = now; return _cdRegistry; }
   try {
     const res = await s3.send(new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: CD_REGISTRY_KEY }));
-    _cdRegistry = parseCdRegistry(await res.Body.transformToString());
+    // JSON.parse HERE, not inside parseCdRegistry (TEAM-4378, parity with the
+    // tools Lambda): parseCdRegistry is tolerant by design, so a truncated body
+    // would become an EMPTY registry and DISCARD the last good copy for the
+    // whole TTL. Parsing first makes it a SyntaxError the catch already handles.
+    const doc = JSON.parse(await res.Body.transformToString());
+    _cdRegistry = parseCdRegistry(doc);
     if (!_cdRegistryLoadedAt) {
       console.log(`[orchestrator] CD registry: ${_cdRegistry.repos.length} repo(s) registered for merge+deploy`);
     }
