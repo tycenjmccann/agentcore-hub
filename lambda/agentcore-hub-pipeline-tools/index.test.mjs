@@ -881,11 +881,14 @@ describe("capabilities", () => {
   it("reports the projects it is wired to, and its version", async () => {
     const out = await invoke("capabilities");
 
+    // The flat keys describe the ENV DEFAULT and are kept verbatim for callers
+    // written against version 2. version 3 (TEAM-4337) adds `targets` — asserted
+    // in the multi-target suite, not here.
     expect(out).toMatchObject({
       ciProject: "agentcore-hub-ci",
       buildProject: "agentcore-hub-build",
       deployPipeline: "agentcore-hub-deploy",
-      version: 2,
+      version: 3,
     });
     // Read-only: capabilities never talks to AWS.
     expect(h.state.cpCalls).toEqual([]);
