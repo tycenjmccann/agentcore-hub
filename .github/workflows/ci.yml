@@ -134,6 +134,7 @@ jobs:
           deploy/coding-agent-runtime/test_session_busy.py
           deploy/coding-agent-runtime/test_coding_healthcheck.py
           deploy/coding-agent-runtime/test_turn_timeout.py
+          deploy/coding-agent-runtime/test_watchdog_kill_group.py
           deploy/coding-agent-runtime/test_codex_sqlite_home.py
           deploy/workflow-manager/toolkit
           deploy/pipeline/test_ecs_primary_container.py
