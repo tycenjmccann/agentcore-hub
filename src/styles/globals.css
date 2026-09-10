@@ -96,63 +96,84 @@
   transition: background-color 0.2s ease, color 0.2s ease, border-color 0.2s ease;
 }
 
-/* ===== Global sleek scrollbars (TEAM-4316; TEAM-4330 fix) =====
+/* ===== Global sleek scrollbars (TEAM-4316; guard fixed in TEAM-4330) =====
    Token-driven so it is correct in both light and dark themes without a class.
-   Kept OUTSIDE @layer so the pseudo-element rules are not deprioritized by
-   layer ordering (original TEAM-4316 rationale, preserved).
-
-   Why the two mechanisms are @supports-gated to be MUTUALLY EXCLUSIVE
-   (TEAM-4330): per MDN, if an element's computed `scrollbar-color`/`scrollbar-
-   width` are anything other than `auto`, they OVERRIDE `::-webkit-scrollbar-*`
-   styling — and because `scrollbar-color` is inherited, setting it on `*`
-   propagates to every element. Chromium shipped the standard `scrollbar-width`/
-   `scrollbar-color` properties in Chrome 121, so on current Chrome AND current
-   Electron (our R1.4 targets) a `* { scrollbar-color: … }` rule made all five
-   webkit rules dead code — the 6px width, transparent track, 3px radius, hover
-   brighten, and hidden buttons never painted. The fix gates each path with
-   @supports so they can never coexist on one engine:
-     • WebKit path runs wherever ::-webkit-scrollbar exists (Chromium, Electron,
-       Safari) — R1.4's 6px / 3px radius / hover / no-buttons requirements.
-     • Standard path runs ONLY where ::-webkit-scrollbar does NOT exist
-       (Firefox) — R1.3's scrollbar-width/scrollbar-color requirement.
-   Because the standard `*` rule no longer applies on WebKit engines, the webkit
-   block can no longer be overridden, and (TEAM-4330 A2) `::-webkit-scrollbar`
-   styling elsewhere in the app is no longer foreclosed by an inherited non-auto
-   `scrollbar-color` on `*`.
-
-   Ref: https://developer.chrome.com/docs/css-ui/scrollbar-styling
-   The `*` transition rule above does NOT match ::-webkit-scrollbar-*
+   Kept OUTSIDE @layer so pseudo-element rules are not deprioritized by layer
+   ordering. .scrollbar-thin (below, in @layer utilities) is intentionally left
+   untouched. The `*` transition rule above does NOT match ::-webkit-scrollbar-*
    pseudo-elements, so the thumb has no background-color transition (no artifact)
-   — deliberately not broadened. */
+   — deliberately not broadened.
+
+   The standard properties and the pseudo-elements MUST stay mutually exclusive.
+   Per MDN, a computed `scrollbar-color`/`scrollbar-width` of anything other than
+   `auto` OVERRIDES ::-webkit-scrollbar-* styling, and `scrollbar-color` is
+   inherited, so an element is affected when an ancestor sets it. Chromium shipped
+   the standard properties in 121 — so declaring them unconditionally on `*` (as
+   this block first did) made every rule below dead code on Chrome/Edge/Electron
+   and also killed every other ::-webkit-scrollbar rule in the app (the five in
+   src/components/workflow/pipeline.css). MDN's documented remedy is to set the
+   properties back to `auto`, which "restores its ::-webkit-scrollbar-* styling if
+   it was previously removed by a scrollbar-color setting on an ancestor" — that is
+   what the @supports block below does. Both properties are reset: `scrollbar-color`
+   is inherited, `scrollbar-width` is not, and MDN's wording covers the pair, so
+   resetting only one would leave the outcome dependent on reading it a particular
+   way. Note the pairing shown in MDN's and Chrome's own docs
+   (`@supports (scrollbar-width: auto)` + `@supports selector(::-webkit-scrollbar)`)
+   does NOT work here: both are true on Chromium >= 121.
+
+   PR #470 first shipped this fix as an INVERTED guard instead (webkit path under
+   `@supports selector(::-webkit-scrollbar)`, standard path under
+   `@supports (scrollbar-width: thin) and (not selector(::-webkit-scrollbar))`)
+   without probing the `auto`-reset variant below. The reset variant is probed and
+   green on Chromium (see docs/TEAM-4330-scrollbar-verification.md) and, unlike the
+   inverted guard, does not drop scrollbar-width/scrollbar-color on Firefox 64-68
+   (which has the standard properties but not `@supports selector()` — the inverted
+   guard's `not selector()` branch is exactly as unsupported there as the plain
+   condition, so that engine got the platform-native bar under PR #470, a real
+   regression vs the pre-TEAM-4316 base). This revision replaces the inverted guard
+   with the reset variant for that reason.
+   https://developer.mozilla.org/en-US/docs/Web/CSS/::-webkit-scrollbar
+   https://developer.chrome.com/docs/css-ui/scrollbar-styling */
+
+/* Baseline: the standard properties. Unguarded, so any engine that supports them
+   but not @supports selector() (notably Firefox 64-68) still gets a thin dark bar. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-surface-4) transparent;
+}
+
+/* Where the legacy pseudo-elements exist (Chrome, Edge, Electron, Safari), reset
+   to `auto` so the rules below govern the paint instead. MUST come after the `*`
+   rule above — equal specificity, so source order decides. */
 @supports selector(::-webkit-scrollbar) {
-  *::-webkit-scrollbar {
-    width: 6px;
-    height: 6px;
-  }
-
-  *::-webkit-scrollbar-track {
-    background: transparent;
-  }
-
-  *::-webkit-scrollbar-thumb {
-    background: var(--color-surface-4);
-    border-radius: 3px;
-  }
-
-  *::-webkit-scrollbar-thumb:hover {
-    background: color-mix(in srgb, var(--color-surface-4) 70%, var(--color-text-muted));
-  }
-
-  *::-webkit-scrollbar-button {
-    display: none;
+  * {
+    scrollbar-width: auto;
+    scrollbar-color: auto;
   }
 }
 
-@supports (scrollbar-width: thin) and (not selector(::-webkit-scrollbar)) {
-  * {
-    scrollbar-width: thin;
-    scrollbar-color: var(--color-surface-4) transparent;
-  }
+/* Legacy WebKit/Blink path: the custom 6px thumb. Firefox drops these rules
+   entirely (unknown pseudo-element) and keeps the baseline above. */
+*::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: var(--color-surface-4);
+  border-radius: 3px;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--color-surface-4) 70%, var(--color-text-muted));
+}
+
+*::-webkit-scrollbar-button {
+  display: none;
 }
 
 @layer base {
