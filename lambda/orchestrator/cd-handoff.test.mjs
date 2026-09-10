@@ -31,6 +31,9 @@ const h = vi.hoisted(() => ({
     tickets: /** @type {Record<string, any>} */ ({}),
     children: /** @type {any[]} */ ([]),
     workflow: /** @type {any} */ (null),
+    // Rows the reconcile sweep's non-terminal workflow Scan returns. Empty by
+    // default, so every test that does not drive the sweep is unaffected.
+    sweepWorkflows: /** @type {any[]} */ ([]),
     s3Objects: /** @type {Record<string, string>} */ ({}),
     updates: /** @type {any[]} */ ([]),
     events: /** @type {any[]} */ ([]),
@@ -62,7 +65,7 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
             if (cmd.input.TableName === "agentcore-hub-events") return { Items: [] };
             return { Items: h.state.children };
           }
-          if (name === "ScanCommand") return { Items: [] };
+          if (name === "ScanCommand") return { Items: h.state.sweepWorkflows || [] };
           if (name === "UpdateCommand") {
             h.state.updates.push(cmd.input);
             // keep the in-memory ticket honest for follow-up reads
@@ -190,7 +193,7 @@ function makeWorkflow(extra = {}) {
   };
 }
 
-let handler, buildAgentContext, completeWorkflow, isWorkflowComplete;
+let handler, buildAgentContext, completeWorkflow, isWorkflowComplete, handleTicketDoneUnified;
 
 async function load(registry) {
   h.state.s3Objects = {
@@ -199,7 +202,7 @@ async function load(registry) {
     ...(registry === undefined ? {} : { "config/cd-registry.json": registry }),
   };
   vi.resetModules();
-  ({ handler, buildAgentContext, completeWorkflow, isWorkflowComplete } = await import("./index.mjs"));
+  ({ handler, buildAgentContext, completeWorkflow, isWorkflowComplete, handleTicketDoneUnified } = await import("./index.mjs"));
   await handler({ Records: [] }); // primes roster / defs / registry caches
 }
 
@@ -233,6 +236,7 @@ beforeEach(() => {
   h.state.deliveries.length = 0;
   h.state.githubCalls.length = 0;
   h.state.children = [];
+  h.state.sweepWorkflows = [];
   h.state.workflow = makeWorkflow();
   h.state.tickets = {
     "TEAM-7": { ticketId: "TEAM-7", parentId: EPIC, workflowId: "wf_1", assignee: RM, type: "task", status: "ready", title: "Ship: Highlight reel", blockedBy: [] },
@@ -442,5 +446,111 @@ describe("4. completion — HANDOFF run ends at the PR", () => {
     expect(await isWorkflowComplete(EPIC, h.state.workflow, DEV)).toBe(false);
     expect(h.state.completions).toHaveLength(0);
     expect(h.state.githubCalls.filter((c) => c.method === "POST" && /\/pulls$/.test(c.url))).toHaveLength(0);
+  });
+});
+
+/**
+ * TEAM-4368 F1 (TEAM-4382) — the review-noop guard must not swallow the handoff.
+ *
+ * The gate handoff above is asserted on the READY path (describe 2), i.e. the
+ * FIRST time the gate is presented. But a gate can stop applying while it already
+ * sits in front of a human: the CD registry is re-read every 60s, so a repo
+ * de-registered after the page leaves an in_review Merge Approval gate with an
+ * OPEN review_needed. Both paths that re-visit such a gate — the done cascade and
+ * the reconcile sweep — short-circuit on that open notification (PR #497, so the
+ * gate is not re-transitioned In Review → In Review on every sweep), and must
+ * STILL run the gate's own handoff resolution before they do.
+ *
+ * These tests drive the REAL index.mjs skipShipGateForHandoff through the real
+ * cascade (no faked predicate), so the getCascade() wiring is proven end to end.
+ * Both extended-state paths need their rollout modes on, and both are read at
+ * module load — hence the env is set before load() inside this describe only.
+ */
+describe("5. TEAM-4368 — a gate already in front of a human still gets its handoff resolution", () => {
+  beforeEach(() => {
+    process.env.CASCADE_EXTENDED_STATES = "enforce";
+    process.env.RECONCILE_SWEEP_MODE = "enforce";
+  });
+  afterEach(() => {
+    delete process.env.CASCADE_EXTENDED_STATES;
+    delete process.env.RECONCILE_SWEEP_MODE;
+  });
+
+  /** Ship gate parked in_review, already paged, its release-manager blocker done. */
+  function parkedShipGate() {
+    h.state.tickets["TEAM-7"].status = "done";
+    h.state.tickets["TEAM-8"].status = "in_review";
+    h.state.children = [h.state.tickets["TEAM-7"], h.state.tickets["TEAM-8"]];
+    h.state.workflow.humanNotifications = [
+      { id: "n1", type: "review_needed", ticketId: "TEAM-8", acknowledged: false },
+    ];
+  }
+
+  /** The gate was resolved as a handoff, and never re-paged. */
+  function expectResolvedAsHandoff() {
+    expect(statusWrites("TEAM-8", "done")).toHaveLength(1);
+    const ev = eventsOf("cd.handoff_skip");
+    expect(ev).toHaveLength(1);
+    expect(ev[0].detail).toMatchObject({ ticketId: "TEAM-8", kind: "ship_gate", phase: "ship" });
+    // The bug this guards: reawakenGate writes "In Review" BEFORE its notification
+    // CAS, so a re-wake here would both re-transition the gate and page again.
+    expect(statusWrites("TEAM-8", "in_review")).toHaveLength(0);
+    expect(eventsOf("review.needed")).toHaveLength(0);
+    expect(h.state.notifications).toHaveLength(0);
+    expect(comments("TEAM-8")[0].ExpressionAttributeValues[":n"][0].content)
+      .toContain("merge-approval gate does not apply");
+  }
+
+  it("A1 event path (cascadeUnblock enforce): de-registered repo → gate resolved Done, not re-woken", async () => {
+    await load(EMPTY);
+    parkedShipGate();
+
+    await handleTicketDoneUnified("TEAM-7");
+
+    expectResolvedAsHandoff();
+  });
+
+  it("A2 sweep path (reconcileDependent enforce): same resolution, tallied as a no-op", async () => {
+    await load(EMPTY);
+    parkedShipGate();
+    h.state.sweepWorkflows = [h.state.workflow];
+
+    const summary = await handler({ source: "orchestrator.sweep", action: "reconcile_sweep" });
+
+    expectResolvedAsHandoff();
+    expect(summary).toMatchObject({ candidates: 1, reviewReawakened: 0, noop: 1 });
+  });
+
+  it("A3 control — registered repo: the gate is left exactly as it is (no resolution, no re-wake)", async () => {
+    await load(REGISTERED);
+    parkedShipGate();
+
+    await handleTicketDoneUnified("TEAM-7");
+
+    expect(eventsOf("cd.handoff_skip")).toHaveLength(0);
+    expect(statusWrites("TEAM-8", "done")).toHaveLength(0);
+    expect(statusWrites("TEAM-8", "in_review")).toHaveLength(0);
+    expect(h.state.notifications).toHaveLength(0);
+  });
+
+  it("A4 control — non-ship gate on a HANDOFF run: still left with its human, never resolved", async () => {
+    await load(EMPTY);
+    h.state.tickets["TEAM-3"].status = "done";
+    h.state.tickets["TEAM-9"] = {
+      ticketId: "TEAM-9", parentId: EPIC, workflowId: "wf_1", assignee: "human:engineer",
+      type: "task", status: "in_review", title: "Plan Approval",
+      labels: ["human-review", "reviewer:engineer"], blockedBy: ["TEAM-3"],
+    };
+    h.state.children = [h.state.tickets["TEAM-3"], h.state.tickets["TEAM-9"]];
+    h.state.workflow.humanNotifications = [
+      { id: "n1", type: "review_needed", ticketId: "TEAM-9", acknowledged: false },
+    ];
+
+    await handleTicketDoneUnified("TEAM-3");
+
+    expect(eventsOf("cd.handoff_skip")).toHaveLength(0);
+    expect(statusWrites("TEAM-9", "done")).toHaveLength(0);
+    expect(statusWrites("TEAM-9", "in_review")).toHaveLength(0);
+    expect(h.state.notifications).toHaveLength(0);
   });
 });

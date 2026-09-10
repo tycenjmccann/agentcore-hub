@@ -235,6 +235,9 @@ function makeExtDeps(overrides = {}) {
     workflowsTable: "workflows",
     redispatch,
     reawakenGate,
+    // TEAM-4368 F1 (index.mjs skipShipGateForHandoff) — only wired when a test
+    // asks for it, so every pre-4382 expectation in this file is unchanged.
+    ...(overrides.resolveGateIfObsolete ? { resolveGateIfObsolete: overrides.resolveGateIfObsolete } : {}),
     ...(overrides.getTicketConsistent === null ? {} : { getTicketConsistent }),
   };
   return { ...base, deps, lease, redispatch, reawakenGate, getTicketConsistent };
@@ -1269,7 +1272,11 @@ describe("TEAM-4368 — an already-presented in_review gate is never re-woken", 
     });
   });
 
-  it("shadow + open review_needed → still would-review, gate never called (guard sits BELOW the shadow branch)", async () => {
+  // TEAM-4382 F2 — the guard is read-only, so it sits ABOVE the mode branch and
+  // shadow reports exactly what enforce reports. Predicting a would-review for a
+  // gate enforce no-ops on published a false CascadeWouldReviewReawaken (and, via
+  // the sweep's tally of "would-review", a false ReconcileWouldRedispatch).
+  it("shadow + open review_needed → the SAME review-noop enforce reports, and NO would-review", async () => {
     const jiraTransition = vi.fn(async () => {});
     const { deps } = makeExtDeps({
       getChildTickets: vi.fn(async () => siblings),
@@ -1277,7 +1284,7 @@ describe("TEAM-4368 — an already-presented in_review gate is never re-woken", 
       extendedStates: "shadow",
     });
     const workflow = { ...extWorkflow, humanNotifications: [openNotification] };
-    const { cascadeUnblock } = createCascade(deps);
+    const { cascadeUnblock, handleInReviewDependent } = createCascade(deps);
     const cap = captureMetrics();
 
     await cascadeUnblock(DONE, "EPIC-1", workflow);
@@ -1286,8 +1293,155 @@ describe("TEAM-4368 — an already-presented in_review gate is never re-woken", 
 
     expect(deps.reawakenGate).not.toHaveBeenCalled();
     expect(jiraTransition).not.toHaveBeenCalled();
+    // A shadow cascade over an already-presented gate touches NO counter, so
+    // hasCascadeActivity is false and no EMF record is emitted at all.
+    expect(records).toHaveLength(0);
+
+    const m = newMetrics();
+    const outcome = await handleInReviewDependent(siblings[1], DONE, workflow, m, "shadow");
+    expect(outcome).toBe("review-noop");
+    expect(m.wouldReviewReawaken).toBe(0);
+  });
+});
+
+/**
+ * TEAM-4368 F1 (TEAM-4382) — the short-circuit above must not swallow the ONE
+ * thing reawakenGate does BEFORE it touches the board: index.mjs
+ * skipShipGateForHandoff, injected here as `resolveGateIfObsolete`. The CD
+ * registry is re-read every 60s, so a Merge Approval gate can stop applying while
+ * it already sits in front of a human; before #497 the next sweep resolved it
+ * Done (+ cd.handoff_skip), after #497 the review-noop return stranded it
+ * in_review forever. The predicate is consulted inside the open-notification
+ * branch, and only in enforce (resolving the gate is a write).
+ */
+describe("TEAM-4368 F1 — an already-presented gate that no longer applies is still resolved", () => {
+  const GATE = "GATE-1";
+  const siblings = [
+    { ticketId: DONE, status: "done" },
+    { ticketId: GATE, status: "in_review", assignee: "human:reviewer", blockedBy: [DONE] },
+  ];
+  const openNotification = { id: "n1", type: "review_needed", ticketId: GATE, acknowledged: false };
+  const parked = () => ({ ...extWorkflow, humanNotifications: [openNotification] });
+
+  it("B1 sweep path (reconcileDependent enforce): predicate resolves the gate → review-noop, no re-wake", async () => {
+    const resolveGateIfObsolete = vi.fn(async () => true);
+    const { deps, ddb, publishEvent, jiraTransition } = makeExtDeps({
+      getChildTickets: vi.fn(async () => siblings),
+      resolveGateIfObsolete,
+    });
+    const workflow = parked();
+    const { reconcileDependent } = createCascade(deps);
+    const m = newMetrics();
+
+    const outcome = await reconcileDependent(siblings[1], "reconcile-sweep", workflow, m, "enforce");
+
+    expect(outcome).toBe("review-noop");
+    expect(resolveGateIfObsolete).toHaveBeenCalledTimes(1);
+    expect(resolveGateIfObsolete).toHaveBeenCalledWith(GATE, workflow);
+    // The gate's own resolution owns every write + the cd.handoff_skip journal;
+    // the cascade adds nothing of its own on this path.
+    expect(deps.reawakenGate).not.toHaveBeenCalled();
+    expect(jiraTransition).not.toHaveBeenCalled();
+    expect(statusWrites(ddb)).toHaveLength(0);
+    expect(eventsOfType(publishEvent, "review.reawakened")).toHaveLength(0);
+    expect(m.reviewReawakened).toBe(0);
+  });
+
+  it("B2 event path (cascadeUnblock enforce): same predicate, same outcome", async () => {
+    const resolveGateIfObsolete = vi.fn(async () => true);
+    const { deps, publishEvent, jiraTransition } = makeExtDeps({
+      getChildTickets: vi.fn(async () => siblings),
+      resolveGateIfObsolete,
+    });
+    const workflow = parked();
+    const { cascadeUnblock } = createCascade(deps);
+
+    const unblocked = await cascadeUnblock(DONE, "EPIC-1", workflow);
+
+    expect(unblocked).toEqual([]);
+    expect(resolveGateIfObsolete).toHaveBeenCalledTimes(1);
+    expect(resolveGateIfObsolete).toHaveBeenCalledWith(GATE, workflow);
+    expect(deps.reawakenGate).not.toHaveBeenCalled();
+    expect(jiraTransition).not.toHaveBeenCalled();
+    expect(eventsOfType(publishEvent, "review.reawakened")).toHaveLength(0);
+  });
+
+  it("B3 the gate still applies (predicate false) → exactly the #497 review-noop, nothing after it", async () => {
+    const resolveGateIfObsolete = vi.fn(async () => false);
+    const { deps, ddb, jiraTransition } = makeExtDeps({
+      getChildTickets: vi.fn(async () => siblings),
+      resolveGateIfObsolete,
+    });
+    const { reconcileDependent } = createCascade(deps);
+    const m = newMetrics();
+
+    const outcome = await reconcileDependent(siblings[1], "reconcile-sweep", parked(), m, "enforce");
+
+    expect(outcome).toBe("review-noop");
+    expect(resolveGateIfObsolete).toHaveBeenCalledTimes(1);
+    expect(deps.reawakenGate).not.toHaveBeenCalled();
+    expect(jiraTransition).not.toHaveBeenCalled();
+    expect(statusWrites(ddb)).toHaveLength(0);
+  });
+
+  it("B4 shadow never consults it — resolving the gate is a WRITE (same outcome, zero side effects)", async () => {
+    const resolveGateIfObsolete = vi.fn(async () => true);
+    const { deps, ddb, jiraTransition } = makeExtDeps({
+      getChildTickets: vi.fn(async () => siblings),
+      resolveGateIfObsolete,
+      extendedStates: "shadow",
+    });
+    const { reconcileDependent } = createCascade(deps);
+    const m = newMetrics();
+
+    const outcome = await reconcileDependent(siblings[1], "reconcile-sweep", parked(), m, "shadow");
+
+    expect(outcome).toBe("review-noop");
+    expect(resolveGateIfObsolete).not.toHaveBeenCalled();
+    expect(deps.reawakenGate).not.toHaveBeenCalled();
+    expect(jiraTransition).not.toHaveBeenCalled();
+    expect(statusWrites(ddb)).toHaveLength(0);
+    expect(m.wouldReviewReawaken).toBe(0);
+  });
+
+  it("B5 a THROWING predicate is isolated per dependent — the cascade is not stranded", async () => {
+    const resolveGateIfObsolete = vi.fn(async () => { throw new Error("registry read failed"); });
+    const { deps } = makeExtDeps({
+      getChildTickets: vi.fn(async () => siblings),
+      resolveGateIfObsolete,
+    });
+    const { cascadeUnblock, reconcileDependent } = createCascade(deps);
+    const cap = captureMetrics();
+
+    // Event path: cascadeUnblock's per-dependent try/catch counts it and moves on.
+    await expect(cascadeUnblock(DONE, "EPIC-1", parked())).resolves.toEqual([]);
+    const records = cap.records();
+    cap.restore();
     expect(records).toHaveLength(1);
-    expect(records[0].CascadeWouldReviewReawaken).toBe(1);
-    expect(records[0].CascadeReviewReawaken).toBe(0);
+    expect(records[0].CascadeDependentErrors).toBe(1);
+    expect(deps.reawakenGate).not.toHaveBeenCalled();
+
+    // Sweep path: it surfaces, which is what reconcile-sweep.mjs counts as a
+    // candidateError (one bad candidate never aborts the rest of the sweep).
+    await expect(
+      reconcileDependent(siblings[1], "reconcile-sweep", parked(), newMetrics(), "enforce")
+    ).rejects.toThrow("registry read failed");
+  });
+
+  it("no open notification → the predicate is irrelevant, the gate re-wakes as before", async () => {
+    const resolveGateIfObsolete = vi.fn(async () => true);
+    const { deps, publishEvent } = makeExtDeps({
+      getChildTickets: vi.fn(async () => siblings),
+      resolveGateIfObsolete,
+    });
+    const { reconcileDependent } = createCascade(deps);
+    const m = newMetrics();
+
+    const outcome = await reconcileDependent(siblings[1], "reconcile-sweep", extWorkflow, m, "enforce");
+
+    expect(outcome).toBe("review-reawakened");
+    expect(resolveGateIfObsolete).not.toHaveBeenCalled();
+    expect(deps.reawakenGate).toHaveBeenCalledWith(GATE, "human:reviewer", extWorkflow);
+    expect(eventsOfType(publishEvent, "review.reawakened")).toHaveLength(1);
   });
 });
