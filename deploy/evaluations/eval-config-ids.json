@@ -8,7 +8,7 @@
     "Builtin.InstructionFollowing (TRACE)",
     "Builtin.Correctness (TRACE)",
     "Builtin.GoalSuccessRate (SESSION)",
-    "5th slot: dependency_chain_compliance_online-mbLh2kEFhw (SESSION, custom) for requirements_analyst; Builtin.Helpfulness (TRACE) for all other agents"
+    "5th slot: dependency_chain_compliance_online_v3-M1N0o94Jsa (SESSION, custom) for requirements_analyst; Builtin.Helpfulness (TRACE) for all other agents"
   ],
   "evaluators_dropped": [
     "Builtin.ToolParameterAccuracy",
@@ -18,9 +18,10 @@
     "Builtin.Conciseness"
   ],
   "custom_evaluators": {
-    "dependency_chain_compliance_online": "dependency_chain_compliance_online-mbLh2kEFhw",
+    "dependency_chain_compliance_online": "dependency_chain_compliance_online_v3-M1N0o94Jsa",
+    "dependency_chain_compliance_online_previous": "dependency_chain_compliance_online-mbLh2kEFhw (locked, superseded 2026-09-10; still attached nowhere — delete when convenient)",
     "dependency_chain_compliance_ondemand": "dependency_chain_compliance-VyBv7H2bCi",
-    "_note": "TEAM-3103: dependency_chain_evaluator.json rubric corrected to route QA through code_reviewer (design -> dev -> code_reviewer -> qa_verifier -> ci/security), matching the actual pipeline. Applied via in-place 'agentcore eval evaluator update' where the IDs above are unchanged. If the evaluator was instead recreated (new account-generated ID), refresh the IDs above and CUSTOM_EVALUATOR in setup-evaluations.sh — see that script's re-registration comment block."
+    "_note": "PR #496 (2026-09-10): rubric moved to dev -> [code_reviewer] -> CI -> QA. The live evaluator was LOCKED (attached to an online config), so in-place update was refused; created _v3 from the merged JSON and swapped it into eval_agentcore_hub_requirements_analyst-HbkURg7M1P via update-online-evaluation-config (only that config touched). Earlier: TEAM-3103: dependency_chain_evaluator.json rubric corrected to route QA through code_reviewer (design -> dev -> code_reviewer -> qa_verifier -> ci/security), matching the actual pipeline. Applied via in-place 'agentcore eval evaluator update' where the IDs above are unchanged. If the evaluator was instead recreated (new account-generated ID), refresh the IDs above and CUSTOM_EVALUATOR in setup-evaluations.sh — see that script's re-registration comment block."
   },
   "_configs_note": "Snapshot only — not load-bearing. The '-XXXX' suffixes are account-specific and regenerated on each setup-evaluations.sh run; consumers read evalConfigName from agents.json, which refresh-agents-json.sh repopulates by querying live CW log groups. Keys use the canonical long form 'eval_<agentId>' (e.g. eval_agentcore_hub_requirements_analyst), matching what setup-evaluations.sh creates.",
   "_reapply_note": "TEAM-3376: the live account configs still carry the OLD 10-evaluator/100% matrix until an operator runs the reconciliation procedure in setup-evaluations.sh (list -> delete mismatched -> refresh-agents-json.sh -> re-run script). Re-record the resulting config ids here afterwards — do not paste ids that haven't been created.",

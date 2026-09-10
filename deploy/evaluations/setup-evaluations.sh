@@ -36,7 +36,7 @@ REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 source "${REPO_ROOT}/deploy/config.sh"
 
 # Custom evaluator (online-compatible, no reference inputs needed)
-CUSTOM_EVALUATOR="dependency_chain_compliance_online-mbLh2kEFhw"
+CUSTOM_EVALUATOR="dependency_chain_compliance_online_v3-M1N0o94Jsa"
 
 # --- Re-registering a corrected evaluator rubric (e.g. TEAM-3103) ----------
 # This script only PROBES for CUSTOM_EVALUATOR above — it never creates or
