@@ -112,10 +112,41 @@ python3 deploy/coding-agent-runtime/invoke.py --cli kiro --repo owner/name "..."
 | `warm` | no | Setup-only: clone + checkout + install transcript, **no CLI run**. Pre-warms the microVM at port time. Pass `user_id`+`config_version` so it also materializes the config bundle |
 | `prepare` | no | Config-only: materialize the user's bundle (skills/agents/`.mcp.json`) + default MCP, then return. No clone, no CLI. Fired by `/shell` so a terminal-only session gets the user's tools without a chat turn. Needs `user_id`+`config_version` |
 | `checkpoint` | no | Upload the grown transcript back to S3 (the return leg). Returns `{key, bytes, branch}` |
+| `mode` | no | `async` → ack with a `turn_id` and run the CLI on a background thread (how fleet personas call in; see below) |
+| `turn_id` | no | Caller-generated id for an `async` submit. Makes submission idempotent: a resubmit of the same id is acknowledged, never run twice |
+| `turn_timeout_secs` | no | Per-turn wall-clock cap for the CLI (the orchestrator resolves it per agent). Falls back to the runtime's own default |
+| `action: "poll"` | no | Legacy status read for an `async` turn. Rollback shim only — current callers wait via the command API |
 
 Response: `{ response, claude_session_id, cli, workspace }`, or for the
 setup-only modes `{ warmed, workspace }` / `{ checkpointed, key, bytes, branch }`,
-or `{ error }`.
+or `{ error }`. An `async` submit answers `{ submitted, turn_id, workspace, turn_dir }`.
+
+### Async turns: how a caller learns the outcome
+
+The platform kills any invocation whose response is silent for 15 minutes, and
+coding turns are routinely silent for longer, so a fleet persona cannot hold the
+connection open. It submits with `mode:"async"` and gets a `turn_id` in seconds.
+
+The turn's state lives on **this microVM's own disk**, never on the shared
+filesystem (`TURNS_ROOT`, default `/tmp/turns/<turn_id>/`):
+
+| File | Written | Holds |
+|---|---|---|
+| `meta.json` | at submit, before workspace setup | cli, session, cap, phase |
+| `pid` | right after `Popen` | the CLI's pid, which is also its process-group id |
+| `stderr.log` | by the CLI | stderr (a file, not a pipe: a grandchild that outlives a kill would otherwise keep the pipe open and block the reader forever) |
+| `done.json` | once, when the turn ends | the terminal record: `response`, `claude_session_id`, `artifacts`, `error` |
+
+The caller then waits by running a short shell probe **inside this container** via
+`InvokeAgentRuntimeCommand`, which runs concurrently with the in-flight
+invocation. The probe reports `done` / `missing` / `starting` / `running` /
+`exited_no_done` and returns as soon as `done.json` appears. There is no
+heartbeat: liveness is the CLI process itself, read from `/proc/<pid>/stat`. A
+runner that outlives `turn_timeout_secs + TURN_RUNNER_GRACE_S` writes its own
+terminal record, so a wedged turn can never leave the session `session_busy`.
+
+See DL-026 in [docs/workflow-pipeline-architecture.md](../../docs/workflow-pipeline-architecture.md)
+for why the earlier EFS-journal + poll design was replaced.
 
 ### Port / pull round trip
 

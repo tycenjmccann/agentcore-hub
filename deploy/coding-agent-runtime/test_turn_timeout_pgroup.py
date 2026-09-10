@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """TEAM-4359 — a timed-out CLI must die WITH ITS GRANDCHILDREN, and a runner that
-outlives its cap must still journal a terminal record.
+outlives its cap must still publish a terminal record.
 
-The 2026-09-09 incident: a kiro turn wedged, the journal heartbeated `running`
-for 2h20m, and no terminal record was ever written. Two defects made that
+The 2026-09-09 incident: a kiro turn wedged, the turn advertised `running` for
+2h20m, and no terminal record was ever written. Two defects made that
 possible, and this suite covers both.
 
   1. `_kill_on_timeout` did `proc.kill()` on the LAUNCHER pid only, and Popen had
@@ -15,9 +15,10 @@ possible, and this suite covers both.
      fix: BufferedReader.close() blocks on the buffer lock the stuck read holds,
      and os.close() does not wake an in-flight read(2) on Linux (both measured).
      Fix = start_new_session=True + os.killpg(proc.pid, SIGKILL).
-  2. `_run_turn_async`'s heartbeat had no bound tied to turn_timeout_s, so the
-     journal never went stale and _poll_turn never said dead. Fix =
-     _TURN_TERMINAL_GRACE_S, after which the runner FORCES a terminal record.
+  2. `_run_turn_async` had no bound tied to turn_timeout_s, so nothing ever
+     rendered a verdict for a runner that escaped its own watchdog. Fix =
+     TURN_RUNNER_GRACE_S, after which the runner FORCES done.json itself
+     (the turn state moved off EFS to <TURNS_ROOT>/<turn_id>/ — DL-026).
 
 Unlike test_turn_timeout.py (which fakes Popen to stay fast), the process-group
 tests here launch REAL `sh` processes with a REAL grandchild — the bug is
@@ -51,6 +52,9 @@ from unittest import mock
 
 _HERE = Path(__file__).resolve().parent
 _TMP = tempfile.mkdtemp(prefix="coding-pgroup-")
+# Deliberately OUTSIDE the workspace root: turn state is VM-local, never on
+# the shared filesystem (DL-026), and the assertions below check that.
+_TURNS_TMP = tempfile.mkdtemp(prefix="coding-turns-")
 
 # Bound on how long we wait for a generator that SHOULD have unwound at its cap.
 # Generous vs the 1s caps used below; the point is to fail rather than hang.
@@ -82,6 +86,7 @@ def _load_main(module_name: str, env_overrides: dict | None = None):
 
 main = _load_main("coding_agent_main_pgroup", {
     "WORKSPACE_ROOT": _TMP,
+    "TURNS_ROOT": _TURNS_TMP,
     "CLAUDE_CONFIG_DIR": os.path.join(_TMP, ".claude-data"),
     "KIRO_HOME": os.path.join(_TMP, ".kiro-data"),
     # kiro's runner returns a canned error frame with no key, never reaching Popen.
@@ -399,21 +404,21 @@ class TestStreamingPopenFlags(_PgroupBase):
 
 class TestAsyncRunnerForcesTerminalRecord(unittest.TestCase):
     """Defence in depth: whatever the CLI's descendants do, _run_turn_async must
-    journal a TERMINAL record within turn_timeout_s + _TURN_TERMINAL_GRACE_S.
+    write a TERMINAL done.json within turn_timeout_s + TURN_RUNNER_GRACE_S.
 
     The generator is stubbed to never yield — exactly the post-kill-scope-bug
-    state — with the cap, grace and beat interval shrunk so the bound fires in
-    ~2s instead of ~1h."""
+    state — with the cap and grace shrunk so the bound fires in ~2s not ~30m."""
 
     TIMEOUT_S = 1
     GRACE_S = 1
-    BEAT_S = 0.2
 
     def setUp(self):
         main._ACTIVE_TURNS.clear()
         self.turn_id = f"turn-{uuid.uuid4().hex[:8]}"
         self.session_id = f"cc-{uuid.uuid4().hex[:8]}"
-        self.journal = main._turn_journal_path(self.session_id, self.turn_id)
+        self.turn_dir = main._register_turn(self.turn_id, "kiro", self.session_id,
+                                            self.TIMEOUT_S)
+        self.done_path = os.path.join(self.turn_dir, "done.json")
         self.release = threading.Event()
 
     def tearDown(self):
@@ -431,28 +436,27 @@ class TestAsyncRunnerForcesTerminalRecord(unittest.TestCase):
         patches = [
             mock.patch.object(main, "_stream_kiro",
                               side_effect=gen_factory or self._wedged_gen),
-            mock.patch.object(main, "TURN_HEARTBEAT_S", self.BEAT_S),
-            mock.patch.object(main, "_TURN_TERMINAL_GRACE_S", self.GRACE_S),
+            mock.patch.object(main, "TURN_RUNNER_GRACE_S", self.GRACE_S),
         ]
         for p in patches:
             p.start()
         self.addCleanup(lambda: [p.stop() for p in patches])
         runner = threading.Thread(
             target=main._run_turn_async,
-            args=(self.turn_id, self.journal, "kiro", "do it", _TMP, "conv-prev",
+            args=(self.turn_id, self.turn_dir, "kiro", "do it", _TMP, "conv-prev",
                   None, self.session_id, None, None, self.TIMEOUT_S),
             daemon=True)
         runner.start()
         return runner
 
-    def _wait_for_terminal_journal(self, seconds=8.0):
-        """Poll the journal until it holds a terminal record. Pre-fix this never
-        happens and the test fails on the returned record still being running."""
+    def _wait_for_terminal_record(self, seconds=8.0):
+        """Poll done.json until it holds a terminal record. Pre-fix this never
+        appears and the test fails on an empty record."""
         end = time.monotonic() + seconds
         record: dict = {}
         while time.monotonic() < end:
             try:
-                with open(self.journal) as f:
+                with open(self.done_path) as f:
                     record = json.load(f)
             except (FileNotFoundError, json.JSONDecodeError):
                 pass
@@ -463,60 +467,62 @@ class TestAsyncRunnerForcesTerminalRecord(unittest.TestCase):
 
     def test_wedged_generator_gets_forced_done_record(self):
         self._start_runner()
-        record = self._wait_for_terminal_journal()
+        record = self._wait_for_terminal_record()
         self.assertEqual(record.get("status"), "done",
-                         f"runner never journaled a terminal record; got {record}")
-        self.assertIn("kiro timed out after 1s", record.get("error", ""))
+                         f"runner never wrote a terminal record; got {record}")
+        self.assertIn("did not unwind", record.get("error", ""))
+        self.assertIn("1s cap", record.get("error", ""))
         self.assertTrue(record.get("response", "").startswith("⚠"))
         self.assertEqual(record.get("cli"), "kiro")
         self.assertEqual(record.get("turn_id"), self.turn_id)
 
     def test_forced_record_has_the_same_keys_as_a_normal_done_record(self):
-        """_poll_turn returns the journal record verbatim and the fleet parses it,
-        so a forced record must not be a different shape."""
+        """The fleet parses this record verbatim, so a forced one must not be a
+        different shape."""
         self._start_runner()
-        forced = self._wait_for_terminal_journal()
+        forced = self._wait_for_terminal_record()
         self.assertEqual(
-            set(forced) - {"error"},
+            set(forced) - {"error", "forced"},
             {"status", "turn_id", "cli", "finished_at", "response", "claude_session_id"},
             f"forced record keys diverge from the normal done record: {sorted(forced)}")
         self.assertEqual(forced.get("claude_session_id"), "conv-prev",
                          "the resume id we were given must survive the timeout")
+        self.assertTrue(forced.get("forced"), "the record must be self-identifying")
 
-    def test_forced_record_visible_to_poll_turn_and_active_turns(self):
+    def test_forced_record_releases_the_session_and_is_visible_to_the_poll_shim(self):
         self._start_runner()
-        self._wait_for_terminal_journal()
-        # _ACTIVE_TURNS is the authority a poll consults first; it must agree.
+        self._wait_for_terminal_record()
         live = main._ACTIVE_TURNS.get(self.turn_id)
         self.assertIsInstance(live, dict)
         self.assertEqual(live.get("status"), "done")
+        # The busy check reads _ACTIVE_TURNS: a wedged runner must not keep the
+        # session claimed, or every later turn on it answers session_busy.
+        self.assertIsNone(main._session_busy_turn(self.session_id, "other-turn"),
+                          "session stayed busy behind a forced-terminal turn")
         verdict = main._poll_turn(self.session_id, self.turn_id)
         self.assertEqual(verdict.get("status"), "done",
-                         "a poll must see a terminal verdict, not 'running' forever")
-        self.assertIn("timed out", verdict.get("error", ""))
+                         "a lookup must see a terminal verdict, not 'running' forever")
+        self.assertIn("did not unwind", verdict.get("error", ""))
 
-    def test_no_further_running_beats_after_the_forced_record(self):
+    def test_terminal_record_is_stable_after_the_bound_fires(self):
         self._start_runner()
-        first = self._wait_for_terminal_journal()
+        first = self._wait_for_terminal_record()
         self.assertEqual(first.get("status"), "done")
-        # Several beat intervals later the journal must be byte-identical: a
-        # delayed beat overwriting "done" with "running" would read as stale →
-        # dead → a duplicate resubmit of a turn we already reported.
-        time.sleep(self.BEAT_S * 6)
-        with open(self.journal) as f:
+        time.sleep(1.0)
+        with open(self.done_path) as f:
             again = json.load(f)
-        self.assertEqual(again, first, "a heartbeat overwrote the terminal record")
+        self.assertEqual(again, first, "something rewrote the terminal record")
 
     def test_late_real_result_does_not_clobber_the_forced_record(self):
         runner = self._start_runner()
-        forced = self._wait_for_terminal_journal()
+        forced = self._wait_for_terminal_record()
         self.assertEqual(forced.get("status"), "done")
         # Now let the wedged CLI finally deliver. The caller has already been
         # told the turn timed out, so this result must not be published.
         self.release.set()
         runner.join(20)
         self.assertFalse(runner.is_alive(), "runner thread never exited")
-        with open(self.journal) as f:
+        with open(self.done_path) as f:
             after = json.load(f)
         self.assertEqual(after, forced,
                          "a late result overwrote the forced terminal record")
@@ -525,25 +531,25 @@ class TestAsyncRunnerForcesTerminalRecord(unittest.TestCase):
         self.assertNotIn("late real result", json.dumps(after))
 
     def test_forced_terminal_record_is_written_only_once(self):
-        real_write = main._journal_write
+        real_write = main._turn_write_json
         terminal: list = []
 
-        def _spy(path, record):
-            if record.get("status") == "done":
+        def _spy(turn_dir, name, record):
+            if name == "done.json":
                 terminal.append(dict(record))
-            return real_write(path, record)
+            return real_write(turn_dir, name, record)
 
-        with mock.patch.object(main, "_journal_write", side_effect=_spy):
+        with mock.patch.object(main, "_turn_write_json", side_effect=_spy):
             runner = self._start_runner()
-            self._wait_for_terminal_journal()
-            time.sleep(self.BEAT_S * 6)
+            self._wait_for_terminal_record()
+            time.sleep(1.0)
             self.release.set()
             runner.join(20)
         self.assertEqual(len(terminal), 1,
                          f"expected exactly one terminal write; got {terminal}")
 
     def test_healthy_turn_is_unaffected_by_the_bound(self):
-        """A generator that completes promptly journals its REAL result — the
+        """A generator that completes promptly records its REAL result — the
         bound must not turn fast turns into timeouts."""
         def _fast_gen(*a, **kw):
             yield 'data: {"type": "done", "response": "real work", ' \
@@ -552,46 +558,86 @@ class TestAsyncRunnerForcesTerminalRecord(unittest.TestCase):
         runner = self._start_runner(gen_factory=_fast_gen)
         runner.join(20)
         self.assertFalse(runner.is_alive())
-        with open(self.journal) as f:
+        with open(self.done_path) as f:
             record = json.load(f)
         self.assertEqual(record.get("status"), "done")
         self.assertEqual(record.get("response"), "real work")
         self.assertNotIn("error", record)
+        self.assertNotIn("forced", record)
         self.assertEqual(main._ACTIVE_TURNS[self.turn_id]["response"], "real work")
 
 
-class TestGraceConstant(unittest.TestCase):
-    """The bound is DERIVED from constants that already exist, not a new knob."""
+class TestRunnerGrace(unittest.TestCase):
+    """The bound exists, is generous enough for a healthy turn, and lands after
+    the FLEET's own kill (the fleet is the primary bound now — this is a
+    backstop for a runner whose caller is gone)."""
 
-    def test_grace_is_derived_from_existing_constants(self):
-        # 15 retries x 4s terminal-write loop + the 30s proc.wait reap + the
-        # staleness bar a poll uses. No env var reads this.
-        self.assertEqual(main._TURN_TERMINAL_GRACE_S, 15 * 4 + 30 + main.TURN_STALE_S)
-        self.assertEqual(main._TURN_TERMINAL_GRACE_S, 210)
+    def test_grace_default(self):
+        self.assertEqual(main.TURN_RUNNER_GRACE_S, 300)
 
-    def test_grace_exceeds_a_single_heartbeat_interval(self):
-        # Otherwise the very first beat of a healthy turn could force a timeout.
-        self.assertGreater(main._TURN_TERMINAL_GRACE_S, main.TURN_HEARTBEAT_S)
+    def test_grace_is_env_tunable_and_degrades_safely(self):
+        reloaded = _load_main("coding_agent_main_grace_env", {
+            "WORKSPACE_ROOT": _TMP, "TURN_RUNNER_GRACE_S": "60"})
+        self.assertEqual(reloaded.TURN_RUNNER_GRACE_S, 60)
+        garbage = _load_main("coding_agent_main_grace_bad", {
+            "WORKSPACE_ROOT": _TMP, "TURN_RUNNER_GRACE_S": "not-a-number"})
+        self.assertEqual(garbage.TURN_RUNNER_GRACE_S, 300)
 
-    def test_grace_is_not_env_tunable(self):
-        with mock.patch.dict(os.environ, {"TURN_TERMINAL_GRACE_S": "7"}, clear=False):
-            reloaded = _load_main("coding_agent_main_grace_env",
-                                  {"WORKSPACE_ROOT": _TMP})
-        self.assertEqual(reloaded._TURN_TERMINAL_GRACE_S,
-                         15 * 4 + 30 + reloaded.TURN_STALE_S)
+    def test_grace_clears_the_post_cli_reap_window(self):
+        """The generators do proc.wait(timeout=30) then harvest artifacts after
+        the watchdog fires; the bound must not preempt that teardown."""
+        self.assertGreater(main.TURN_RUNNER_GRACE_S, 30)
 
-    def test_runtime_verdict_beats_the_fleet_budget(self):
-        """Cross-runtime invariant, asserted so it can't silently rot: the
-        runtime's forced verdict must land before the fleet poller gives up.
 
-            turn_timeout_s + grace + TURN_STALE_S < effective budget
+class TestTurnStateStaysOffSharedStorage(unittest.TestCase):
+    """DL-026 — the D2 guard. An unwritable sessions/ root on EFS used to 503
+    every turn on the VM (2026-09-10, 16 minutes, 8 retries across two CLIs)
+    because the turn's status record lived there. Turn state is now VM-local, so
+    a turn must still reach a terminal verdict with EFS read-only."""
 
-        Fleet default budget 2700s (deploy/runtime-agent/main.py
-        REMOTE_CODING_TURN_BUDGET_S) with a 1500s cap; the incident's per-agent
-        3600s cap widens the budget to 2700 + (3600-1500) = 4800s."""
-        grace, stale = main._TURN_TERMINAL_GRACE_S, main.TURN_STALE_S
-        self.assertLess(1500 + grace + stale, 2700)
-        self.assertLess(3600 + grace + stale, 4800)
+    def setUp(self):
+        main._ACTIVE_TURNS.clear()
+        self.turn_id = f"turn-{uuid.uuid4().hex[:8]}"
+        self.session_id = f"cc-{uuid.uuid4().hex[:8]}"
+
+    def tearDown(self):
+        main._ACTIVE_TURNS.clear()
+
+    def test_turn_dir_is_not_under_the_efs_workspace(self):
+        d = main._turn_dir(self.turn_id)
+        self.assertTrue(d.startswith(main.TURNS_ROOT))
+        self.assertFalse(d.startswith(main.WORKSPACE_ROOT),
+                         f"turn state must not live on shared storage: {d}")
+
+    def test_default_turns_root_is_container_local(self):
+        """With no override, turn state lands on the microVM's own disk — not
+        under /mnt/efs, whose ownership breaking is what caused the outage."""
+        fresh = _load_main("coding_agent_main_default_turns",
+                           {"WORKSPACE_ROOT": "/mnt/efs"})
+        self.assertEqual(fresh.TURNS_ROOT, "/tmp/turns")
+        self.assertFalse(fresh.TURNS_ROOT.startswith(fresh.WORKSPACE_ROOT))
+
+    def test_turn_completes_with_the_sessions_root_unwritable(self):
+        sessions_root = os.path.join(main.WORKSPACE_ROOT, "sessions")
+        os.makedirs(sessions_root, exist_ok=True)
+        original = os.stat(sessions_root).st_mode
+        os.chmod(sessions_root, 0o500)
+        self.addCleanup(os.chmod, sessions_root, original)
+
+        turn_dir = main._register_turn(self.turn_id, "kiro", self.session_id, 5)
+        self.assertIsNotNone(turn_dir, "registration must not depend on EFS")
+
+        def _fast_gen(*a, **kw):
+            yield 'data: {"type": "done", "response": "work despite EFS", ' \
+                  '"claude_session_id": "conv-efs"}\n\n'
+
+        with mock.patch.object(main, "_stream_kiro", side_effect=_fast_gen):
+            main._run_turn_async(self.turn_id, turn_dir, "kiro", "do it", _TMP,
+                                 None, None, self.session_id, None, None, 5)
+        with open(os.path.join(turn_dir, "done.json")) as f:
+            record = json.load(f)
+        self.assertEqual(record.get("status"), "done")
+        self.assertEqual(record.get("response"), "work despite EFS")
 
 
 if __name__ == "__main__":
