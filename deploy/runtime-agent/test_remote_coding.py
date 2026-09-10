@@ -8,10 +8,10 @@ Run: cd deploy/runtime-agent && python3 -m pytest test_remote_coding.py -v
 Covers the silent-hang class from the stuck-fleet postmortems on the
 submit+poll transport:
   A. A nested coding turn that never reaches a verdict — the runner reports
-     "running" on every poll, which EXTENDS the inner budget each time — must
-     be cut off by the overall wall-clock deadline
-     (REMOTE_CODING_TURN_DEADLINE_S), return an ERROR string, and emit an
-     agent.error event instead of blocking the persona.
+     "running" on every poll, which pushes the inner deadline forward (clamped
+     to the budget since TEAM-4359) — must be cut off by the overall wall-clock
+     deadline (REMOTE_CODING_TURN_DEADLINE_S), return an ERROR string, and emit
+     an agent.error event instead of blocking the persona.
   B. Both failure exits of _remote_coding_turn (exception escaping the
      submit+poll, and an {error} result) must publish an agent.error event
      (same events table the dashboard/Workflow Manager read) while still
@@ -167,9 +167,10 @@ class TestOverallTurnDeadline(RemoteCodingTestCase):
 
     def test_never_completing_turn_hits_deadline_and_emits_agent_error(self):
         # Pathological live-forever runner: submit is accepted instantly, then
-        # every poll answers "running" — which extends the poll loop's inner
-        # budget on each iteration. Only the overall wall-clock deadline can
-        # end this turn.
+        # every poll answers "running" — which pushes the poll loop's inner
+        # deadline forward on each iteration (clamped to the budget since
+        # TEAM-4359). With the budget at 5s and the deadline at 0.5s, the
+        # overall wall-clock deadline is the bound that must end this turn.
         submit_client = mock.MagicMock()
         submit_client.invoke_agent_runtime.side_effect = lambda **kw: _invoke_response(
             {"submitted": True, "turn_id": json.loads(kw["payload"])["turn_id"]}
@@ -841,3 +842,161 @@ class TestSessionBusyFallback(RemoteCodingTestCase):
         self.assertEqual(item["ticketId"]["S"], "TEAM-3119")
         self.assertEqual(item["agentId"]["S"], "frontend_dev")
         self.assertEqual(item["title"]["S"], "[wf] TEAM-3119 frontend_dev")
+
+
+class _FakeClock:
+    """Stand-in for the `time` module inside main: sleep() ADVANCES the clock, so
+    a multi-thousand-second poll loop runs in milliseconds of real time. Only the
+    poll loop's own time calls are affected (_publish_coding_heartbeat does its
+    own `import time`), so heartbeat behaviour is unchanged."""
+
+    def __init__(self, start=1_000_000.0):
+        self._t = start
+        self._mono = 0.0
+        self.slept = 0.0
+        self.sleeps = 0
+
+    def time(self):
+        return self._t
+
+    def monotonic(self):
+        return self._mono
+
+    def sleep(self, seconds):
+        self._t += seconds
+        self._mono += seconds
+        self.slept += seconds
+        self.sleeps += 1
+
+
+class TestPollBudgetIsTheHardStop(RemoteCodingTestCase):
+    """TEAM-4359 — the budget IS the give-up point for _poll_coding_turn.
+
+    A wedged kiro turn heartbeated "running" for 2h20m and the poller waited
+    exactly 9600s on a 4800s budget: hard_stop was turn_start + 2*budget, and
+    because every "running" poll re-extended `deadline`, nothing else ever fired.
+    These tests pin the bound at 1x budget and keep the other exits terminal.
+
+    Driven through _poll_coding_turn directly, on a fake clock, so the assertions
+    are about elapsed BUDGET rather than real seconds.
+    """
+
+    def _poll(self, statuses, budget=4800, poll_s=20, outer_deadline_s=None):
+        """Run the poll loop against a status callable/list on a fake clock.
+        Returns (result, clock, poll_count)."""
+        clock = _FakeClock()
+        calls = {"n": 0}
+
+        def _next(_client, _turn_id):
+            calls["n"] += 1
+            if callable(statuses):
+                return statuses(calls["n"])
+            idx = min(calls["n"] - 1, len(statuses) - 1)
+            return statuses[idx]
+
+        outer = None if outer_deadline_s is None else clock.monotonic() + outer_deadline_s
+        with mock.patch.object(main, "time", clock), \
+             mock.patch.object(main, "_poll_once", side_effect=_next), \
+             mock.patch.object(main, "REMOTE_CODING_POLL_S", poll_s), \
+             mock.patch.object(main, "_publish_coding_heartbeat"):
+            result = main._poll_coding_turn(mock.MagicMock(), "turn-x",
+                                            outer_deadline=outer, budget_s=budget,
+                                            cli="kiro")
+        return result, clock, calls["n"]
+
+    def test_perpetual_running_gives_up_at_budget_not_double(self):
+        budget = 4800  # the incident's effective budget (2700 + (3600-1500))
+        result, clock, polls = self._poll([{"status": "running", "heartbeat_age_s": 1}],
+                                          budget=budget)
+        self.assertIn("error", result)
+        self.assertGreater(polls, 1, "the loop must actually have polled")
+        # One poll interval of overshoot is inherent (the sleep precedes the
+        # check); 2x budget is the regression.
+        self.assertLessEqual(
+            clock.slept, budget + main.REMOTE_CODING_POLL_S + 1,
+            f"gave up after {clock.slept}s on a {budget}s budget "
+            f"({clock.slept / budget:.2f}x) — the 2x hard stop is back")
+        self.assertGreaterEqual(clock.slept, budget - main.REMOTE_CODING_POLL_S,
+                                "gave up EARLY — a live runner must get its full budget")
+
+    def test_running_extension_never_pushes_past_the_budget(self):
+        # A budget SHORTER than one extension quantum (120s) is where an
+        # unclamped `deadline = max(deadline, now + 120)` shows up most starkly:
+        # pre-fix a single running poll already carried the loop past the budget.
+        budget = 60
+        _, clock, _ = self._poll([{"status": "running"}], budget=budget, poll_s=1)
+        self.assertLessEqual(clock.slept, budget + 1,
+                             f"the per-poll extension outlived the {budget}s budget "
+                             f"({clock.slept}s)")
+
+    def test_budget_error_keeps_the_verify_first_text_and_no_retry_hint(self):
+        result, clock, _ = self._poll([{"status": "running"}], budget=120, poll_s=20)
+        self.assertIn("exceeded", result["error"])
+        self.assertIn("120s budget", result["error"])
+        # Verify-first guidance (TEAM-3307) must survive this change: a blind
+        # re-run would race a runner that may still be finishing.
+        self.assertIn("Do NOT re-run", result["error"])
+        self.assertIn("check the branch on GitHub", result["error"])
+        self.assertIs(result.get("no_retry_hint"), True)
+        self.assertNotIn("retryable_vm_death", result)
+        # The elapsed figure helps read the incident from a log line alone.
+        self.assertIn(f"{int(clock.slept)}s", result["error"])
+
+    def test_done_status_returns_immediately(self):
+        done = {"status": "done", "response": "shipped", "claude_session_id": "s-1"}
+        result, clock, polls = self._poll([done], budget=4800)
+        self.assertEqual(result, done)
+        self.assertEqual(polls, 1)
+        self.assertLessEqual(clock.slept, main.REMOTE_CODING_POLL_S,
+                             "a done turn must not consume any budget")
+
+    def test_dead_status_is_retryable_vm_death(self):
+        result, clock, polls = self._poll(
+            [{"status": "dead", "stale_s": 300}], budget=4800)
+        self.assertIs(result.get("retryable_vm_death"), True)
+        self.assertIn("died mid-run", result["error"])
+        self.assertIn("300s", result["error"])
+        self.assertEqual(polls, 1, "death must be reported on the first stale read")
+        self.assertLess(clock.slept, 4800)
+
+    def test_three_consecutive_unknowns_are_retryable_vm_death(self):
+        result, _, polls = self._poll([{"status": "unknown"}], budget=4800)
+        self.assertIs(result.get("retryable_vm_death"), True)
+        self.assertIn("vanished", result["error"])
+        self.assertEqual(polls, 3, "must demand 3 consecutive confirmations")
+
+    def test_single_unknown_between_runnings_is_not_death(self):
+        # The counter resets on any non-unknown status, so a lone flaky read must
+        # not be mistaken for a vanished turn.
+        def _statuses(n):
+            if n == 2:
+                return {"status": "unknown"}
+            if n >= 5:
+                return {"status": "done", "response": "ok"}
+            return {"status": "running"}
+
+        result, _, polls = self._poll(_statuses, budget=4800)
+        self.assertEqual(result.get("response"), "ok")
+        self.assertNotIn("retryable_vm_death", result)
+        self.assertEqual(polls, 5)
+
+    def test_poll_exception_is_non_terminal_and_a_later_done_wins(self):
+        # A throttle/network blip says nothing about the runner; bailing here
+        # would make the persona resubmit into a live workspace.
+        def _statuses(n):
+            if n <= 3:
+                raise RuntimeError("ThrottlingException")
+            return {"status": "done", "response": "landed", "claude_session_id": "s-2"}
+
+        result, _, polls = self._poll(_statuses, budget=4800)
+        self.assertEqual(result.get("response"), "landed")
+        self.assertEqual(polls, 4)
+
+    def test_outer_deadline_still_preempts_the_budget(self):
+        # The overall bound (TEAM-3119/3307) is unchanged and still wins when it
+        # is tighter than the budget — and no final probe is issued past it.
+        result, clock, _ = self._poll([{"status": "running"}], budget=4800,
+                                      poll_s=20, outer_deadline_s=100)
+        self.assertIs(result.get("deadline_exceeded"), True)
+        self.assertIn("overall deadline", result["error"])
+        self.assertLessEqual(clock.slept, 120)

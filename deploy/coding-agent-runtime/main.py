@@ -32,6 +32,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import socket
 import sqlite3
 import subprocess
@@ -141,6 +142,19 @@ def _resolve_turn_timeout(payload_val) -> int:
 # read means the thread is gone, not slow.
 TURN_HEARTBEAT_S = _safe_int_env("TURN_HEARTBEAT_S", 15)
 TURN_STALE_S = _safe_int_env("TURN_STALE_S", 120)
+
+# How long a runner thread may live PAST its own turn cap before _run_turn_async
+# FORCES a terminal record into the journal (TEAM-4359). Derived, not tunable:
+#   15*4 = the terminal-write retry loop in _run_turn_async (15 tries x 4s sleep)
+#   +30  = the post-loop proc.wait(timeout=30) reap inside the stream generators
+#   +TURN_STALE_S = the bar a poll uses to call a silent journal dead
+# A runner still alive past turn_timeout_s + this has provably escaped its own
+# watchdog, so beating "running" is a lie — the 2026-09-09 incident heartbeated
+# `running` for 2h20m because nothing bounded this thread. Sized to stay well
+# under the fleet's post-cap headroom (REMOTE_CODING_TURN_BUDGET_S - 1500 =
+# 1200s in deploy/runtime-agent/main.py) so the runtime's own verdict always
+# reaches the poller before the poller gives up on the budget.
+_TURN_TERMINAL_GRACE_S = 15 * 4 + 30 + TURN_STALE_S
 
 # Per-user coding-CLI config bundle (MCP servers, skills, custom agents, prefs).
 # The app uploads a zip under the tenant prefix (see _tenant_root); we materialize
@@ -2010,6 +2024,38 @@ def _build_claude_args(config_dir: str, claude_session_id: str | None, stream: b
     return args
 
 
+def _killpg_on_timeout(proc, cli: str) -> None:
+    """SIGKILL a timed-out CLI's whole process group, not just its launcher.
+
+    TEAM-4359: `proc.kill()` alone reaped only the launcher PID, and every CLI
+    launcher spawns grandchildren that INHERITED our stdout pipe (run-codex.sh →
+    codex; anything claude/kiro shells out to). With the launcher dead but a
+    grandchild still holding the write end, the reader's `for line in proc.stdout`
+    never sees EOF and blocks forever — so the timed_out branch, the terminal
+    frame and watchdog.cancel() were all unreachable, and a kiro turn heartbeated
+    `running` for 2h20m. Closing the pipe from this thread is NOT an alternative:
+    BufferedReader.close() blocks on the buffer lock the stuck read holds, and
+    os.close() does not wake an in-flight read(2) on Linux (both measured).
+
+    Every streaming Popen passes start_new_session=True, so proc.pid IS the pgid
+    and killpg can only ever hit this turn's own group. Deliberately NOT
+    os.killpg(os.getpgid(proc.pid), ...): for a child that is not a session
+    leader that resolves to OUR group and SIGKILLs the runtime itself.
+    """
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError) as exc:
+        # No such group (already reaped), or start_new_session did not take.
+        # Fall back to the launcher-only kill — better than nothing, and the
+        # async runner's _TURN_TERMINAL_GRACE_S bound is the real backstop.
+        logger.warning("turn_timeout_killpg_failed",
+                       extra={"cli": cli, "error": str(exc)[:200]})
+        try:
+            proc.kill()
+        except (ProcessLookupError, OSError):
+            pass
+
+
 def _stream_claude(prompt: str, workdir: str, claude_session_id: str | None, repo: str | None = None,
                    session_id: str | None = None, tenant_id: str | None = None,
                    model: str | None = None, turn_timeout_s: int = TURN_TIMEOUT_S,
@@ -2031,7 +2077,8 @@ def _stream_claude(prompt: str, workdir: str, claude_session_id: str | None, rep
         return f"data: {json.dumps(obj)}\n\n"
 
     proc = subprocess.Popen(args, cwd=workdir, env=env, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, text=True, stdin=subprocess.DEVNULL, bufsize=1)
+                            stderr=subprocess.PIPE, text=True, stdin=subprocess.DEVNULL,
+                            bufsize=1, start_new_session=True)
     # Same watchdog as _stream_codex: the loop blocks on readline, so a wedged
     # claude (or a command it spawned holding stdout) would pin the microVM
     # HealthyBusy forever — and now that workflow personas ride this path, it
@@ -2041,7 +2088,7 @@ def _stream_claude(prompt: str, workdir: str, claude_session_id: str | None, rep
 
     def _kill_on_timeout():
         timed_out.set()
-        proc.kill()
+        _killpg_on_timeout(proc, "claude")
     watchdog = threading.Timer(turn_timeout_s, _kill_on_timeout)
     watchdog.start()
     new_session_id: str | None = claude_session_id
@@ -2090,6 +2137,8 @@ def _stream_claude(prompt: str, workdir: str, claude_session_id: str | None, rep
         watchdog.cancel()
     if timed_out.is_set():
         err = f"claude timed out after {turn_timeout_s}s"
+        logger.error("turn_timeout", extra={"cli": "claude", "turn_timeout_s": turn_timeout_s,
+                                            "session_id": session_id, "stream": True})
         yield sse({"type": "error", "error": err})
         yield sse({"type": "done", "response": f"⚠ {err}", "claude_session_id": new_session_id})
         return
@@ -2228,16 +2277,18 @@ def _stream_codex(prompt: str, workdir: str, codex_session_id: str | None,
         args.append(codex_session_id)
 
     proc = subprocess.Popen(args, cwd=workdir, env=env, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, text=True, stdin=subprocess.DEVNULL, bufsize=1)
+                            stderr=subprocess.PIPE, text=True, stdin=subprocess.DEVNULL,
+                            bufsize=1, start_new_session=True)
     # Watchdog: the buffered runner enforced TURN_TIMEOUT_S via subprocess.run;
     # this loop blocks on readline, so a codex (or an invoked command) that wedges
     # without closing stdout would pin the microVM HealthyBusy forever. Kill the
-    # process at the cap so the loop unwinds and a terminal frame is emitted.
+    # whole group at the cap so the loop unwinds and a terminal frame is emitted —
+    # `args` is run-codex.sh, so the codex binary itself is always a GRANDCHILD.
     timed_out = threading.Event()
 
     def _kill_on_timeout():
         timed_out.set()
-        proc.kill()
+        _killpg_on_timeout(proc, "codex")
     watchdog = threading.Timer(turn_timeout_s, _kill_on_timeout)
     watchdog.start()
     thread_id: str | None = codex_session_id
@@ -2302,6 +2353,8 @@ def _stream_codex(prompt: str, workdir: str, codex_session_id: str | None,
         watchdog.cancel()
     if timed_out.is_set():
         err = f"codex timed out after {turn_timeout_s}s"
+        logger.error("turn_timeout", extra={"cli": "codex", "turn_timeout_s": turn_timeout_s,
+                                            "session_id": session_id, "stream": True})
         yield sse({"type": "error", "error": err})
         yield sse({"type": "done", "response": f"⚠ {err}", "claude_session_id": thread_id})
         return
@@ -2398,12 +2451,12 @@ def _stream_kiro(prompt: str, workdir: str, kiro_session_id: str | None,
     env = _kiro_env(workdir)
     proc = subprocess.Popen(_kiro_args(prompt, kiro_session_id), cwd=workdir, env=env,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                            stdin=subprocess.DEVNULL, bufsize=1)
+                            stdin=subprocess.DEVNULL, bufsize=1, start_new_session=True)
     timed_out = threading.Event()
 
     def _kill_on_timeout():
         timed_out.set()
-        proc.kill()
+        _killpg_on_timeout(proc, "kiro")
     watchdog = threading.Timer(turn_timeout_s, _kill_on_timeout)
     watchdog.start()
     full_text: list[str] = []
@@ -2422,6 +2475,8 @@ def _stream_kiro(prompt: str, workdir: str, kiro_session_id: str | None,
         watchdog.cancel()
     if timed_out.is_set():
         err = f"kiro timed out after {turn_timeout_s}s"
+        logger.error("turn_timeout", extra={"cli": "kiro", "turn_timeout_s": turn_timeout_s,
+                                            "session_id": session_id, "stream": True})
         yield sse({"type": "error", "error": err})
         yield sse({"type": "done", "response": f"⚠ {err}", "claude_session_id": kiro_session_id})
         return
@@ -2547,11 +2602,47 @@ def _run_turn_async(turn_id: str, journal: str, cli: str, prompt: str, workdir: 
     # ordering — an EFS write can outlast any timeout we'd pick.
     journal_lock = threading.Lock()
     finished = threading.Event()
+    # Set when the bound below wrote the terminal record instead of the CLI: the
+    # caller has already been told this turn timed out, so a late real result
+    # must not be published over it.
+    forced = threading.Event()
+
+    def _force_timeout_record():
+        """Terminal record for a runner that outlived turn_timeout_s + grace.
+
+        The generators' own watchdog should have produced a done frame long
+        before this; reaching here means the CLI escaped it (TEAM-4359). Same
+        keys as the normal `done` record below so _poll_turn can return it
+        verbatim. Called under journal_lock with `finished` still clear."""
+        err = f"{cli} timed out after {turn_timeout_s}s"
+        rec = {"status": "done", "turn_id": turn_id, "cli": cli,
+               "finished_at": int(time.time()),
+               "response": f"⚠ {err}",
+               "claude_session_id": claude_session_id,
+               "error": err}
+        wrote = _journal_write(journal, rec)
+        # Flip `finished` and publish to memory even if EFS refused the write:
+        # continuing to beat "running" is the exact failure being fixed, and a
+        # poll on this VM is served from _ACTIVE_TURNS anyway. If the VM later
+        # dies, the journal goes stale and the fleet's dead → retryable_vm_death
+        # path is the correct outcome.
+        finished.set()
+        forced.set()
+        _ACTIVE_TURNS[turn_id] = rec
+        logger.error("turn_timeout_forced", extra={
+            "cli": cli, "turn_id": turn_id, "turn_timeout_s": turn_timeout_s,
+            "grace_s": _TURN_TERMINAL_GRACE_S, "journal_written": wrote})
 
     def _heartbeat():
         while not stop_beating.wait(TURN_HEARTBEAT_S):
             with journal_lock:
                 if finished.is_set():
+                    return
+                # Bound the beat to the turn's own cap. Without this the journal
+                # never goes stale, so _poll_turn never says dead and no terminal
+                # record is ever written — the 2h20m `running` incident.
+                if time.time() - beat["started_at"] > turn_timeout_s + _TURN_TERMINAL_GRACE_S:
+                    _force_timeout_record()
                     return
                 beat["heartbeat"] = int(time.time())
                 _journal_write(journal, beat)
@@ -2605,6 +2696,10 @@ def _run_turn_async(turn_id: str, journal: str, cli: str, prompt: str, workdir: 
     # stale, and then a resubmit IS the right outcome.
     for _ in range(15):
         with journal_lock:
+            # The bound above already published a terminal record for this turn —
+            # never clobber it with a late result the caller has stopped waiting for.
+            if finished.is_set():
+                break
             if _journal_write(journal, done):
                 finished.set()
                 break
@@ -2612,6 +2707,11 @@ def _run_turn_async(turn_id: str, journal: str, cli: str, prompt: str, workdir: 
     else:
         logger.error("turn_done_write_failed", extra={"turn_id": turn_id})
     stop_beating.set()
+    if forced.is_set():
+        logger.warning("turn_done_after_forced_timeout",
+                       extra={"cli": cli, "turn_id": turn_id,
+                              "chars": len(done["response"]), "turn_timeout_s": turn_timeout_s})
+        return
     # Keep the result reachable in memory even if EFS never accepted the done
     # record — a poll on this VM serves it from here (see _poll_turn).
     _ACTIVE_TURNS[turn_id] = done
