@@ -1,0 +1,72 @@
+==============================================================================
+E0.1  headless-shell + hide-scrollbars SUPPRESSED
+  chromium version: 148.0.7778.0 | launch: {"ignoreDefaultArgs":["--hide-scrollbars"]}
+  CSS.supports(selector(::-webkit-scrollbar)): true
+  NATIVE   (bare page, no app CSS)   : {"gutter":15,"scrollbarWidth":"auto","scrollbarColor":"auto"}
+  THIN     (inline scrollbar-width)  : {"gutter":10,"scrollbarWidth":"thin","scrollbarColor":"rgb(42, 42, 58) rgba(0, 0, 0, 0)"}
+  APP-PLAIN(injected, app CSS only)  : {"gutter":6,"scrollbarWidth":"auto","scrollbarColor":"auto"}
+  APP      (workflow-history-list)   : {
+  "gutter": 6,
+  "offsetWidth": 287,
+  "clientWidth": 281,
+  "scrollHeight": 4139,
+  "clientHeight": 735,
+  "overflows": true,
+  "scrollbarWidth": "auto",
+  "scrollbarColor": "auto",
+  "wkWidth": "6px",
+  "wkHeight": "6px",
+  "wkThumbBg": "rgb(42, 42, 58)",
+  "wkThumbRadius": "3px",
+  "wkTrackBg": "rgba(0, 0, 0, 0)",
+  "wkButtonDisplay": "none"
+}
+  LADDER native=15 thin=10 app=6
+==============================================================================
+ref    headless-shell + playwright DEFAULT args
+  chromium version: 148.0.7778.0 | launch: {}
+  CSS.supports(selector(::-webkit-scrollbar)): true
+  NATIVE   (bare page, no app CSS)   : {"gutter":0,"scrollbarWidth":"auto","scrollbarColor":"auto"}
+  THIN     (inline scrollbar-width)  : {"gutter":0,"scrollbarWidth":"thin","scrollbarColor":"rgb(42, 42, 58) rgba(0, 0, 0, 0)"}
+  APP-PLAIN(injected, app CSS only)  : {"gutter":0,"scrollbarWidth":"auto","scrollbarColor":"auto"}
+  APP      (workflow-history-list)   : {
+  "gutter": 0,
+  "offsetWidth": 287,
+  "clientWidth": 287,
+  "scrollHeight": 4139,
+  "clientHeight": 735,
+  "overflows": true,
+  "scrollbarWidth": "auto",
+  "scrollbarColor": "auto",
+  "wkWidth": "6px",
+  "wkHeight": "6px",
+  "wkThumbBg": "rgb(42, 42, 58)",
+  "wkThumbRadius": "3px",
+  "wkTrackBg": "rgba(0, 0, 0, 0)",
+  "wkButtonDisplay": "none"
+}
+  LADDER native=0 thin=0 app=0
+==============================================================================
+E0.2  channel:chromium + hide-scrollbars SUPPRESSED
+  chromium version: 148.0.7778.0 | launch: {"channel":"chromium","ignoreDefaultArgs":["--hide-scrollbars"]}
+  CSS.supports(selector(::-webkit-scrollbar)): true
+  NATIVE   (bare page, no app CSS)   : {"gutter":15,"scrollbarWidth":"auto","scrollbarColor":"auto"}
+  THIN     (inline scrollbar-width)  : {"gutter":10,"scrollbarWidth":"thin","scrollbarColor":"rgb(42, 42, 58) rgba(0, 0, 0, 0)"}
+  APP-PLAIN(injected, app CSS only)  : {"gutter":6,"scrollbarWidth":"auto","scrollbarColor":"auto"}
+  APP      (workflow-history-list)   : {
+  "gutter": 6,
+  "offsetWidth": 287,
+  "clientWidth": 281,
+  "scrollHeight": 4139,
+  "clientHeight": 735,
+  "overflows": true,
+  "scrollbarWidth": "auto",
+  "scrollbarColor": "auto",
+  "wkWidth": "6px",
+  "wkHeight": "6px",
+  "wkThumbBg": "rgb(42, 42, 58)",
+  "wkThumbRadius": "3px",
+  "wkTrackBg": "rgba(0, 0, 0, 0)",
+  "wkButtonDisplay": "none"
+}
+  LADDER native=15 thin=10 app=6

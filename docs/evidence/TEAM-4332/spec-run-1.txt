@@ -1,0 +1,46 @@
+
+Running 25 tests using 1 worker
+
+  ✓   1 [chromium] › tests/tab-workflow-resize.spec.ts:95:7 › Workflow sidebar resize (TEAM-4316) › 1: default expanded width is 288px (1.5s)
+  ✓   2 [chromium] › tests/tab-workflow-resize.spec.ts:102:7 › Workflow sidebar resize (TEAM-4316) › 2: dragging the handle right widens >= 400px and survives reload (2.0s)
+  ✓   3 [chromium] › tests/tab-workflow-resize.spec.ts:129:7 › Workflow sidebar resize (TEAM-4316) › 3: double-click on the handle resets to 288px (1.9s)
+  ✓   4 [chromium] › tests/tab-workflow-resize.spec.ts:146:7 › Workflow sidebar resize (TEAM-4316) › 4: collapse then expand restores the persisted (wide) width, not 288 (2.2s)
+[A1] gutter ladder: native=15 thin=10 app=6 | scrollbarWidth="auto" scrollbarColor="auto"
+  ✓   5 [chromium] › tests/tab-workflow-resize.spec.ts:165:7 › A: scrollbar actually paints at 6px (TEAM-4330) › A1: the overflowing list reserves a 6px gutter, not the 10px thin-path gutter (1.1s)
+  ✓   6 [chromium] › tests/tab-workflow-resize.spec.ts:209:7 › A: scrollbar actually paints at 6px (TEAM-4330) › A2: webkit pseudo-element geometry and thumb token are declared as specified (911ms)
+  ✓   7 [chromium] › tests/tab-workflow-resize.spec.ts:231:7 › A: scrollbar actually paints at 6px (TEAM-4330) › A3: control — an element that opts back into scrollbar-width:thin reserves 10px (970ms)
+[A4] dark strip {"width":6,"height":735} palette=[["18,18,26",3624],["42,42,58",766],["20,20,28",4],["32,32,45",4],["39,39,54",4],["33,33,47",4],["40,40,55",4]]
+[A4] anyNearWhite=false thumbTokenPixels=774 topRowsHaveThumb=true bottomRowsAllBackground=true
+  ✓   8 [chromium] › tests/tab-workflow-resize.spec.ts:251:7 › A: scrollbar actually paints at 6px (TEAM-4330) › A4: R1.5 — the gutter strip carries the token thumb, no white bar, no arrow buttons (1.2s)
+[A5] light strip palette=[["241,243,245",3624],["206,212,218",766],["238,240,243",4],["219,223,227",4],["209,214,220",4],["218,223,228",4],["208,214,220",4]]
+  ✓   9 [chromium] › tests/tab-workflow-resize.spec.ts:308:7 › A: scrollbar actually paints at 6px (TEAM-4330) › A5: light theme — thumb token follows the theme and the gutter is still 6px (979ms)
+  ✓  10 [chromium] › tests/tab-workflow-resize.spec.ts:341:7 › B: drag clamps to both bounds (TEAM-4316 R2.3) › B1: dragging past the floor clamps to 240 and persists exactly one write of 240 (1.4s)
+  ✓  11 [chromium] › tests/tab-workflow-resize.spec.ts:364:7 › B: drag clamps to both bounds (TEAM-4316 R2.3) › B2: dragging past the ceiling clamps to 640 on a 1440px viewport (1.3s)
+  ✓  12 [chromium] › tests/tab-workflow-resize.spec.ts:395:9 › B: drag clamps to both bounds (TEAM-4316 R2.3) › on a 900px viewport › B3: dragging past the ceiling clamps to 450, not 640 (1.3s)
+[C1] tabs=5 trail=1:BUTTON/-/Archive workflow | 2:BUTTON/-/Delete workflow: Refactor the workflow sidebarx | 3:BUTTON/-/Archive workflow | 4:BUTTON/-/Delete workflow: Second row | 5:DIV/separator/Resize workflows sidebar
+  ✓  13 [chromium] › tests/tab-workflow-resize.spec.ts:416:7 › C: keyboard resize (TEAM-4316 R2.9) › C1: the handle is reachable by Tab from the search input (975ms)
+  ✓  14 [chromium] › tests/tab-workflow-resize.spec.ts:428:7 › C: keyboard resize (TEAM-4316 R2.9) › C2: ArrowRight/ArrowLeft move exactly 16px, one write each (1.9s)
+[C3] observed tail=240,240,240,240,240,240 min=240
+  ✓  15 [chromium] › tests/tab-workflow-resize.spec.ts:448:7 › C: keyboard resize (TEAM-4316 R2.9) › C3: ArrowLeft clamps at the 240 floor (1.4s)
+[C4] observed tail=640,640,640,640,640,640 max=640
+  ✓  16 [chromium] › tests/tab-workflow-resize.spec.ts:460:7 › C: keyboard resize (TEAM-4316 R2.9) › C4: ArrowRight clamps at the 640 ceiling on a 1440px viewport (1.6s)
+[C5] observed tail=450,450,450,450,450,450 max=450
+  ✓  17 [chromium] › tests/tab-workflow-resize.spec.ts:474:9 › C: keyboard resize (TEAM-4316 R2.9) › on a 900px viewport › C5: ArrowRight clamps at 450, the viewport half-width (1.2s)
+[D1] fonts.check('12px Inter')=true @288 medium={"text":"Refactor the workflow sidebar resize handle and persist width acr","clientWidth":223,"scrollWidth":393,"availableWidth":223,"clipped":true,"clippedBy":170,"headroom":0} short={"text":"Refactor the workflow sidebarx","clientWidth":189,"scrollWidth":189,"availableWidth":223,"clipped":false,"clippedBy":0,"headroom":34}
+[D1] @640 medium={"text":"Refactor the workflow sidebar resize handle and persist width acr","clientWidth":393,"scrollWidth":393,"availableWidth":575,"clipped":false,"clippedBy":0,"headroom":182} absurd={"text":"Refactor the workflow sidebar resize handle and persist width across reloads for operators Refactor the workflow sidebar resize handle and persist width across reloads for operators Refactor the workflow sidebar resize handle and persist width across reloads for operators Refactor the workflow sideb","clientWidth":575,"scrollWidth":1823,"availableWidth":575,"clipped":true,"clippedBy":1248,"headroom":0}
+  ✓  18 [chromium] › tests/tab-workflow-resize.spec.ts:492:7 › D: truncation reveal and no horizontal overflow (TEAM-4316 R2.8) › D1: widening 288 -> 640 reveals the medium title; the 300-char title stays clipped (1.7s)
+[D2] width=240 gutter=6 clientWidth=233 scrollWidth=233 overflowsVertically=true
+[D2] width=288 gutter=6 clientWidth=281 scrollWidth=281 overflowsVertically=true
+[D2] width=640 gutter=6 clientWidth=633 scrollWidth=633 overflowsVertically=true
+  ✓  19 [chromium] › tests/tab-workflow-resize.spec.ts:532:7 › D: truncation reveal and no horizontal overflow (TEAM-4316 R2.8) › D2: no horizontal overflow in the list at 240, 288 and 640 (2.7s)
+[E1] bare-move tracking after pointercancel: {"tracked":false,"before":480,"after":480,"beforeAria":480,"afterAria":480}
+  ✓  20 [chromium] › tests/tab-workflow-resize.spec.ts:558:7 › E: drag lifecycle (TEAM-4331) › E1: pointercancel mid-drag restores body styles and tears down the drag (2.1s)
+  ✓  21 [chromium] › tests/tab-workflow-resize.spec.ts:581:7 › E: drag lifecycle (TEAM-4331) › E2: lostpointercapture with no pointerup ends the drag exactly once (2.1s)
+  ✓  22 [chromium] › tests/tab-workflow-resize.spec.ts:625:9 › E: drag lifecycle (TEAM-4331) › on a 1600px viewport › E3: a viewport resize clamps the RENDERED width with ZERO localStorage writes (3.1s)
+[E4] drag B writes=[{"key":"workflow-history-width","value":"560"}]
+  ✓  23 [chromium] › tests/tab-workflow-resize.spec.ts:663:7 › E: drag lifecycle (TEAM-4331) › E4: a stuck drag followed by a full drag leaks no listeners and writes drag B's width (2.4s)
+[E5] zero-movement press writes=[{"key":"workflow-history-width","value":"600"}]
+  ✓  24 [chromium] › tests/tab-workflow-resize.spec.ts:714:9 › E: drag lifecycle (TEAM-4331) › on a 900x900 viewport with a stored width above the ceiling › E5: a zero-movement press keeps the stored 600; double-click still resets to 288 (2.5s)
+  ✓  25 [chromium] › tests/tab-workflow-resize.spec.ts:759:5 › fixture sanity: the calibrated titles are distinct and the expected lengths (4ms)
+
+  25 passed (42.0s)
