@@ -17,7 +17,10 @@ possible, and this suite covers both.
      Fix = start_new_session=True + os.killpg(proc.pid, SIGKILL).
   2. `_run_turn_async`'s heartbeat had no bound tied to turn_timeout_s, so the
      journal never went stale and _poll_turn never said dead. Fix =
-     _TURN_TERMINAL_GRACE_S, after which the runner FORCES a terminal record.
+     _TURN_TERMINAL_GRACE_S, after which the runner FORCES a terminal record —
+     but only while the CLI has not exited (TEAM-4379: the grace does not budget
+     for the artifact harvest that follows a legitimate exit, so an unconditional
+     bound discarded real results).
 
 Unlike test_turn_timeout.py (which fakes Popen to stay fast), the process-group
 tests here launch REAL `sh` processes with a REAL grandchild — the bug is
@@ -197,15 +200,18 @@ class _PgroupBase(unittest.TestCase):
             mock.patch.object(main, "_kiro_newest_id", return_value="conv-test"),
         ]
 
-    def _stream(self, cli, turn_timeout_s=1):
+    def _stream(self, cli, turn_timeout_s=1, cli_exited=None):
+        # Only forward cli_exited when a test actually wants it, so every other
+        # test here still exercises the runners' default (no signal) signature.
+        kw = {} if cli_exited is None else {"cli_exited": cli_exited}
         if cli == "claude":
             return main._stream_claude("do it", _TMP, None, None, "cc-sess", None,
-                                       None, turn_timeout_s)
+                                       None, turn_timeout_s, **kw)
         if cli == "codex":
             return main._stream_codex("do it", _TMP, None, None, "cc-sess", None,
-                                      turn_timeout_s)
+                                      turn_timeout_s, **kw)
         return main._stream_kiro("do it", _TMP, None, None, "cc-sess", None,
-                                 turn_timeout_s)
+                                 turn_timeout_s, **kw)
 
     def _drive_wedge(self, cli):
         with self._popen():
@@ -396,10 +402,45 @@ class TestStreamingPopenFlags(_PgroupBase):
         self.assertEqual(done[0]["response"], "shipped")
         self.assertFalse(any("timed out" in str(f.get("error", "")) for f in frames))
 
+    def test_each_runner_signals_exit_before_harvesting_artifacts(self):
+        """cli_exited must already be set by the time the (unbounded) artifact
+        harvest starts — that ordering is the whole point of the signal, since the
+        harvest is exactly the work _TURN_TERMINAL_GRACE_S does not budget for
+        (TEAM-4379)."""
+        frame = json.dumps({"type": "result", "result": "shipped", "session_id": "s-1"})
+        argv = ["sh", "-c", f"printf '%s\\n' '{frame}'"]
+        for cli in ("claude", "codex", "kiro"):
+            with self.subTest(cli=cli):
+                ev = threading.Event()
+                seen: list = []
+
+                def _harvest(*a, **kw):
+                    seen.append(ev.is_set())
+                    return {"keys": []}
+
+                with self._popen(argv=argv), \
+                     mock.patch.object(main, "_remember_session"), \
+                     mock.patch.object(main, "_write_resume_launch_hint"), \
+                     mock.patch.object(main, "_kiro_newest_id", return_value="conv-test"), \
+                     mock.patch.object(main, "_sync_turn_artifacts", side_effect=_harvest):
+                    frames, outcome, _ = _drain_in_thread(
+                        self._stream(cli, turn_timeout_s=3600, cli_exited=ev))
+                self.assertEqual(outcome, "finished", f"[{cli}] did not unwind: {frames}")
+                self.assertTrue(ev.is_set(),
+                                f"[{cli}] cli_exited was never set on a clean CLI exit")
+                self.assertEqual(seen, [True],
+                                 f"[{cli}] the harvest ran without the exit signal: {seen}")
+
 
 class TestAsyncRunnerForcesTerminalRecord(unittest.TestCase):
-    """Defence in depth: whatever the CLI's descendants do, _run_turn_async must
-    journal a TERMINAL record within turn_timeout_s + _TURN_TERMINAL_GRACE_S.
+    """Defence in depth: while the CLI is still UN-EXITED, _run_turn_async must
+    journal a TERMINAL record within turn_timeout_s + _TURN_TERMINAL_GRACE_S,
+    whatever the CLI's descendants are doing to its stdout.
+
+    Un-exited is the WHOLE scope of the bound (TEAM-4379). Once the CLI is reaped
+    the runner sets `cli_exited` and the bound stands down: the grace does not
+    budget for _sync_turn_artifacts, so forcing a record there would discard a
+    real result — see TestExitedCliKeepsItsRealResult.
 
     The generator is stubbed to never yield — exactly the post-kill-scope-bug
     state — with the cap, grace and beat interval shrunk so the bound fires in
@@ -558,6 +599,181 @@ class TestAsyncRunnerForcesTerminalRecord(unittest.TestCase):
         self.assertEqual(record.get("response"), "real work")
         self.assertNotIn("error", record)
         self.assertEqual(main._ACTIVE_TURNS[self.turn_id]["response"], "real work")
+
+
+class TestExitedCliKeepsItsRealResult(unittest.TestCase):
+    """TEAM-4379 — the bound must NOT fire once the CLI has exited.
+
+    _TURN_TERMINAL_GRACE_S budgets for the terminal-write retry loop, the 30s
+    proc.wait reap and the stale bar — NOT for _sync_turn_artifacts, which every
+    stream runner calls AFTER the CLI exits and BEFORE yielding its done frame,
+    and which is unbounded (a `git ls-files` subprocess per untracked candidate,
+    up to 200 files / 2 GiB uploaded). So a CLI that finished at 3550s of a 3600s
+    cap with a 300s harvest had its REAL result replaced by a forced "timed out"
+    record, and the persona was told the turn timed out.
+
+    Harness mirrors TestAsyncRunnerForcesTerminalRecord and is deliberately
+    copied, not inherited: subclassing would re-run all seven of its tests here.
+    """
+
+    TIMEOUT_S = 1
+    GRACE_S = 1
+    BEAT_S = 0.2
+    # Must outlast TIMEOUT_S + GRACE_S (2.0s) so the bound is REACHED mid-harvest.
+    # The margin is deliberate: the gate is only evaluated on a beat, and CI can
+    # stretch a 0.2s beat.
+    HARVEST_S = 3.5
+
+    def setUp(self):
+        main._ACTIVE_TURNS.clear()
+        self.turn_id = f"turn-{uuid.uuid4().hex[:8]}"
+        self.session_id = f"cc-{uuid.uuid4().hex[:8]}"
+        self.journal = main._turn_journal_path(self.session_id, self.turn_id)
+        self.handed: list = []   # the cli_exited object the runner handed over
+        self.writes: list = []   # (elapsed_s, record) for EVERY journal write
+
+    def tearDown(self):
+        main._ACTIVE_TURNS.clear()
+
+    def _spy_journal_write(self, t0):
+        """Record every write, so "a forced record was never written" can be
+        asserted rather than inferred from the final file."""
+        real = main._journal_write
+
+        def _spy(path, record):
+            self.writes.append((time.monotonic() - t0, dict(record)))
+            return real(path, record)
+
+        return mock.patch.object(main, "_journal_write", side_effect=_spy)
+
+    def _start_runner(self, gen_factory):
+        patches = [
+            mock.patch.object(main, "_stream_kiro", side_effect=gen_factory),
+            mock.patch.object(main, "TURN_HEARTBEAT_S", self.BEAT_S),
+            mock.patch.object(main, "_TURN_TERMINAL_GRACE_S", self.GRACE_S),
+        ]
+        for p in patches:
+            p.start()
+        self.addCleanup(lambda: [p.stop() for p in patches])
+        runner = threading.Thread(
+            target=main._run_turn_async,
+            args=(self.turn_id, self.journal, "kiro", "do it", _TMP, "conv-prev",
+                  None, self.session_id, None, None, self.TIMEOUT_S),
+            daemon=True)
+        runner.start()
+        return runner
+
+    def _exited_then_slow_harvest(self, *a, **kw):
+        """The legitimate shape: CLI reaped inside the cap, then a harvest that
+        runs long past cap + grace, then the REAL done frame.
+
+        `kw.get` (not `kw[...]`) keeps this fake signature-agnostic, which is how
+        the test fails on PRE-FIX main.py for the right reason: the runner simply
+        never hands a signal over, nothing is set, the unconditional bound fires,
+        and the assertions below fail on SUBSTANCE — not with a TypeError."""
+        ev = kw.get("cli_exited")
+        self.handed.append(ev)
+        if ev is not None:
+            ev.set()                    # == proc.wait(timeout=30) returned
+        time.sleep(self.HARVEST_S)      # == _sync_turn_artifacts
+        yield ('data: {"type": "done", "response": "REAL-4379 harvest finished", '
+               '"claude_session_id": "conv-real-4379", "artifacts": ["k1"]}\n\n')
+
+    def test_real_result_survives_a_harvest_that_outlasts_cap_plus_grace(self):
+        t0 = time.monotonic()
+        with self._spy_journal_write(t0), \
+             self.assertLogs(main.logger, level="INFO") as cap:
+            runner = self._start_runner(self._exited_then_slow_harvest)
+            runner.join(30)
+        self.assertFalse(runner.is_alive(), "runner thread never exited")
+
+        with open(self.journal) as f:
+            record = json.load(f)
+        self.assertEqual(record.get("response"), "REAL-4379 harvest finished",
+                         f"the real result was replaced by a forced record: {record}")
+        self.assertEqual(record.get("claude_session_id"), "conv-real-4379",
+                         "the CLI's own session id must survive")
+        self.assertEqual(record.get("artifacts"), ["k1"],
+                         "the harvested artifact keys must survive")
+        self.assertNotIn("error", record,
+                         f"a turn whose CLI exited in its cap has no error: {record}")
+        self.assertEqual(main._ACTIVE_TURNS.get(self.turn_id), record,
+                         "_ACTIVE_TURNS is what a poll serves first; it must agree")
+
+        # A forced record was never written — not merely overwritten afterwards.
+        terminal = [r for _, r in self.writes if r.get("status") == "done"]
+        self.assertEqual(len(terminal), 1,
+                         f"expected exactly one terminal write; got {terminal}")
+        self.assertFalse(
+            [r for _, r in self.writes if "timed out" in str(r.get("error", ""))],
+            f"a timeout record was journaled for a CLI that exited: {self.writes}")
+
+        msgs = [r.getMessage() for r in cap.records]
+        self.assertNotIn("turn_timeout_forced", msgs)
+        self.assertNotIn("turn_done_after_forced_timeout", msgs)
+
+        # Positive statement of the new behaviour: past the bound the runner keeps
+        # telling the truth ("running") instead of forcing a verdict.
+        bound = self.TIMEOUT_S + self.GRACE_S
+        self.assertTrue(
+            [e for e, r in self.writes if r.get("status") == "running" and e > bound],
+            f"expected `running` beats after cap+grace ({bound}s); got "
+            f"{[(round(e, 2), r.get('status')) for e, r in self.writes]}")
+
+        # The plumbing itself, named so a refactor that drops the kwarg fails
+        # with a message instead of a mystery.
+        self.assertTrue(self.handed and isinstance(self.handed[0], threading.Event),
+                        "_run_turn_async did not hand the runner a cli_exited Event")
+
+    def test_unexited_cli_is_still_forced(self):
+        """The gate must be a GATE, not a switch-off: a runner that receives the
+        signal and never sets it (the incident shape — a grandchild holds stdout,
+        so proc.wait is never reached) still gets a forced terminal record."""
+        released = threading.Event()
+        self.addCleanup(released.set)
+
+        def _never_exits(*a, **kw):
+            self.handed.append(kw.get("cli_exited"))  # received, deliberately NOT set
+            released.wait(30)
+            yield 'data: {"type": "done", "response": "too late"}\n\n'
+
+        self._start_runner(_never_exits)
+        end, record = time.monotonic() + 8.0, {}
+        while time.monotonic() < end:
+            try:
+                with open(self.journal) as f:
+                    record = json.load(f)
+            except (FileNotFoundError, json.JSONDecodeError):
+                pass
+            if record.get("status") == "done":
+                break
+            time.sleep(0.1)
+        self.assertEqual(record.get("status"), "done",
+                         f"the bound stopped firing for a wedged CLI; got {record}")
+        self.assertIn("kiro timed out after 1s", record.get("error", ""))
+        self.assertTrue(record.get("response", "").startswith("⚠"))
+
+    def test_runner_hands_every_cli_an_exit_signal(self):
+        """All three cli branches must plumb the signal, not just kiro's."""
+        for cli, fname in (("claude", "_stream_claude"), ("codex", "_stream_codex"),
+                           ("kiro", "_stream_kiro")):
+            with self.subTest(cli=cli):
+                got: list = []
+
+                def _gen(*a, **kw):
+                    got.append(kw.get("cli_exited"))
+                    yield 'data: {"type": "done", "response": "ok"}\n\n'
+
+                turn_id = f"{self.turn_id}-{cli}"
+                journal = main._turn_journal_path(self.session_id, turn_id)
+                with mock.patch.object(main, fname, side_effect=_gen):
+                    main._run_turn_async(turn_id, journal, cli, "do it", _TMP,
+                                         "conv-prev", None, self.session_id, None,
+                                         None, self.TIMEOUT_S)
+                self.assertEqual(len(got), 1, f"[{cli}] runner did not call {fname}")
+                self.assertIsInstance(
+                    got[0], threading.Event,
+                    f"[{cli}] _run_turn_async must hand {fname} a cli_exited Event")
 
 
 class TestGraceConstant(unittest.TestCase):
