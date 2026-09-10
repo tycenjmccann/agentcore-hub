@@ -20,22 +20,17 @@ export function resolveSdlcFramework(value: unknown): SdlcFramework {
   return "standard";
 }
 
-export const SDLC_BADGE_META: Record<
-  SdlcFramework,
-  {
-    label: string;
-    tooltip: string;
-    boardClassName: string;
-    listClassName: string;
-  }
-> = {
-  standard: {
-    label: "STANDARD",
-    tooltip: "Standard pipeline — requirements, parallel design, development, QA and ship.",
-    boardClassName: "sdlc-badge sdlc-badge--standard",
-    listClassName:
-      "text-[9px] px-1.5 py-0.5 rounded border font-medium uppercase tracking-wider whitespace-nowrap flex-shrink-0 text-[var(--color-text-muted)] bg-[var(--color-bg-tertiary)] border-current",
-  },
+/** The two framework overlays — "standard" is their absence, not a member. */
+export type SdlcOverlay = Exclude<SdlcFramework, "standard">;
+
+export type SdlcBadgeMeta = {
+  label: string;
+  tooltip: string;
+  boardClassName: string;
+  listClassName: string;
+};
+
+export const SDLC_BADGE_META: Record<SdlcOverlay, SdlcBadgeMeta> = {
   playbook: {
     label: "PLAYBOOK",
     tooltip: "Playbook framework — expect intent, spec, and plan artifacts.",
@@ -52,3 +47,14 @@ export const SDLC_BADGE_META: Record<
       "text-[9px] px-1.5 py-0.5 rounded border font-medium uppercase tracking-wider whitespace-nowrap flex-shrink-0 text-[var(--violet-fg)] bg-[var(--violet-subtle)] border-current",
   },
 };
+
+/**
+ * Badge metadata for a resolved framework, or null for "standard". The badge
+ * exists to announce an overlay (Playbook / AI-DLC) — "standard" is the
+ * absence of an overlay, not a framework, so it renders nothing. Render sites
+ * must go through this rather than indexing SDLC_BADGE_META directly.
+ */
+export function sdlcBadgeFor(fw: SdlcFramework): SdlcBadgeMeta | null {
+  if (fw === "standard") return null;
+  return SDLC_BADGE_META[fw];
+}
