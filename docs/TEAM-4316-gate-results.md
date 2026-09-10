@@ -40,3 +40,40 @@ Gates run below (verbatim summaries appended as each completes).
 ```
 
 ---
+
+## Gate 4 — `npx playwright test tests/tab-workflow-resize.spec.ts`
+
+Dev server (`npm run dev`, localhost:3000) started first. Dark mode is set
+before navigation via `addInitScript`.
+
+**Result: 5 passed, 1 skipped.**
+
+| # | Case | Result |
+|---|------|--------|
+| 1 | default expanded width is 288px | ✓ passed |
+| 2 | dragging the handle right widens ≥ 400px and survives reload | ✓ passed |
+| 3 | double-click on the handle resets to 288px | ✓ passed |
+| 4 | collapse then expand restores the persisted (wide) width, not 288 | ✓ passed |
+| 5 | scrollbar styling — thin + 6px webkit width (no default white bar) | ✓ passed |
+| 6 | widening reveals a previously-truncated epic title | **– skipped** |
+
+**Case 5 console line (verbatim), the actual values Chromium reported:**
+
+```
+scrollbar computed: scrollbarWidth="thin" webkitWidth="6px"
+```
+
+So Chromium reported `scrollbarWidth = "thin"` and the `::-webkit-scrollbar`
+pseudo-element `width = "6px"` — both hard-asserted and passing. Case 5 also
+includes the data-independent `scrollWidth <= clientWidth` assertion at the
+default 288px width (added by this follow-up), which passed.
+
+**Case 6 explicitly SKIPPED (not passed).** Reason: the workflow list is empty
+in this sandbox — `/api/workflow/list` returns no rows because the runtime role
+lacks DynamoDB access here — so there is no clipped title to reveal. The spec
+guards this with `test.skip(true, "No workflow titles in local data")` (and, if
+rows existed but none were clipped, `"No sufficiently long (clipped) title in
+local data"`). Case 6 is inherently data-dependent; the data-independent portion
+of R2.8 is covered by the case-5 no-horizontal-scroll assertion above.
+
+---
