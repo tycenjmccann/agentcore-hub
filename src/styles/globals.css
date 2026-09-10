@@ -105,6 +105,44 @@
     background-color: var(--color-surface-0);
     color: var(--color-text-primary);
   }
+
+  /* Overlay-style scrollbars everywhere: a low-contrast thumb on a
+     transparent track, no clickable arrows, and no visible corner. Uses
+     the theme tokens (--color-surface-4, --color-border-hover) which are
+     redefined per-theme via [data-theme="dark"] above, so this single
+     rule set adapts automatically in both light and dark without any
+     [data-theme] duplication. The .scrollbar-thin utility below still
+     wins wherever it's explicitly applied. */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--color-surface-4) transparent;
+  }
+
+  *::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+
+  *::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  *::-webkit-scrollbar-thumb {
+    background-color: var(--color-surface-4);
+    border-radius: 3px;
+  }
+
+  *::-webkit-scrollbar-thumb:hover {
+    background-color: var(--color-border-hover);
+  }
+
+  *::-webkit-scrollbar-corner {
+    background: transparent;
+  }
+
+  *::-webkit-scrollbar-button {
+    display: none;
+  }
 }
 
 @layer components {
