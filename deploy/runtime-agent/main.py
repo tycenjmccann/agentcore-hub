@@ -493,10 +493,11 @@ REMOTE_CODING_HEARTBEAT_S = int(os.getenv("REMOTE_CODING_HEARTBEAT_S", "60"))
 REMOTE_CODING_TURN_BUDGET_S = int(os.getenv("REMOTE_CODING_TURN_BUDGET_S", "2700"))
 # Outer wall-clock deadline on ONE ENTIRE nested coding turn: submit (including
 # lost-submit recovery probes), every poll, and the single automatic vm-death
-# resubmit. The poll loop bounds each CYCLE (budget, 2x hard stop), but cycles
+# resubmit. The poll loop bounds each CYCLE at the budget, but cycles
 # and recovery sleeps stack — worst case ran to hours of silent blocking with
-# no event emitted (TEAM-3119). The default sits above one full worst-case
-# cycle (submit read timeout + the poll loop's hard stop) so it never preempts
+# no event emitted (TEAM-3119). The default (read timeout + 2*budget) sits above
+# one full worst-case cycle — the poll loop now gives up at budget, so the
+# default leaves room for a submit plus two cycles — so it never preempts
 # a provably-live runner; on expiry the turn fails loudly (agent.error event +
 # ERROR string to the persona) instead of pinning it. The poll loop also emits
 # periodic agent.streaming heartbeats (REMOTE_CODING_HEARTBEAT_S) so a long turn
@@ -719,22 +720,31 @@ def _poll_coding_turn(client, turn_id: str, outer_deadline: float | None = None,
     (journal gone) both mean the turn will never finish — fail fast, don't wait
     out the budget.
 
+    The budget is the give-up point: a turn that reports "running" forever is
+    abandoned at turn_start + budget. A live heartbeat can push `deadline`
+    forward within that window (terminal work after the CLI is unbounded) but is
+    clamped to it — before TEAM-4359 the hard stop was 2*budget and the
+    per-poll extension meant nothing else ever fired, so a wedged turn held the
+    persona for twice its budget (9600s on 4800s, 2026-09-09).
+
     outer_deadline is a time.monotonic() timestamp bounding the whole turn
-    (REMOTE_CODING_TURN_DEADLINE_S): unlike the budget, it is NEVER extended by
-    a live heartbeat, so a runner that reports "running" forever cannot pin the
-    persona past it (TEAM-3119).
+    (REMOTE_CODING_TURN_DEADLINE_S) across cycles and recovery sleeps: it is
+    never extended either, so nothing can pin the persona past it (TEAM-3119).
 
     budget_s overrides the fleet REMOTE_CODING_TURN_BUDGET_S for this turn — the
     caller scales it up when a per-agent turnTimeoutSecs was forwarded above the
     1500s the default budget assumes (TEAM-3687). Defaults to the global so
     existing callers are unchanged."""
     budget = REMOTE_CODING_TURN_BUDGET_S if budget_s is None else budget_s
-    deadline = time.time() + budget
-    # Live heartbeats extend the deadline (terminal work is unbounded), but a
-    # wedged-yet-heartbeating runner must not pin this persona forever.
-    hard_stop = time.time() + 2 * budget
-    unknowns = 0
     turn_start = time.time()
+    deadline = turn_start + budget
+    # The budget IS the give-up point (TEAM-4359). This used to be
+    # turn_start + 2*budget, and because every "running" poll re-extended
+    # `deadline`, the hard stop was the only bound that ever fired: a wedged kiro
+    # turn kept the persona waiting 9600s on a 4800s budget. A live heartbeat
+    # proves the runner is alive — it does not buy time past the budget.
+    hard_stop = turn_start + budget
+    unknowns = 0
     last_heartbeat = time.time()
     while time.time() < min(deadline, hard_stop) and (
             outer_deadline is None or time.monotonic() < outer_deadline):
@@ -774,11 +784,12 @@ def _poll_coding_turn(client, turn_id: str, outer_deadline: float | None = None,
         # "running" or "transient" (degraded EFS read / torn read racing the
         # journal's tmp+rename): the turn may still be live — keep polling.
         # A provably-live runner (fresh heartbeat / in-memory answer) extends
-        # the deadline: terminal work after the CLI (artifact harvest can be
-        # GBs) has no fixed bound, and expiring against a live runner would
-        # push the persona toward re-running work that already happened. The
-        # runner's own watchdog (TURN_TIMEOUT_S) bounds the CLI; a runner that
-        # dies mid-harvest stops heartbeating and the dead verdict fires.
+        # the deadline, but only up to hard_stop: terminal work after the CLI
+        # (artifact harvest can be GBs) has no fixed bound, yet a runner that
+        # heartbeats forever must not outlive the budget. The runner's own
+        # watchdog bounds the CLI and its _TURN_TERMINAL_GRACE_S bound forces a
+        # terminal record, so its verdict arrives well inside the budget; a
+        # runner that dies mid-harvest stops heartbeating and 'dead' fires.
         if state == "running":
             now = time.time()
             # Prove-alive pulse: the runner heartbeats its journal, but nothing
@@ -787,8 +798,11 @@ def _poll_coding_turn(client, turn_id: str, outer_deadline: float | None = None,
             if now - last_heartbeat >= REMOTE_CODING_HEARTBEAT_S:
                 _publish_coding_heartbeat(cli, int(now - turn_start))
                 last_heartbeat = now
-            deadline = max(deadline,
-                           time.time() + max(3 * REMOTE_CODING_POLL_S, 120))
+            # Clamped to hard_stop: the extension can keep a live turn polling
+            # inside its budget, never past it.
+            deadline = min(max(deadline,
+                               time.time() + max(3 * REMOTE_CODING_POLL_S, 120)),
+                           hard_stop)
     # Budget spent with no live heartbeat seen recently and no verdict. The
     # turn may STILL have completed its work — a blind re-run is not safe.
     # Probe once more, then tell the persona to VERIFY STATE WITHOUT running a
@@ -806,7 +820,8 @@ def _poll_coding_turn(client, turn_id: str, outer_deadline: float | None = None,
         pass
     if outer_deadline is not None and time.monotonic() >= outer_deadline:
         return _deadline_expired_error()
-    return {"error": f"coding turn exceeded {budget}s budget "
+    return {"error": f"coding turn exceeded its {budget}s budget (gave up after "
+                     f"{int(time.time() - turn_start)}s) "
                      f"with no verdict. Its work may already exist and a runner "
                      f"may still be finishing. Do NOT re-run the task and do NOT "
                      f"start another coding call yet: wait a few minutes, then "
