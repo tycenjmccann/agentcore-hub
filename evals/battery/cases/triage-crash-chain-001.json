@@ -6,7 +6,7 @@
   "referenceInputs": {
     "expectedOutcomes": [
       "Creates exactly one fix ticket assigned to agentcore_hub_bug_fixer with no blockers",
-      "Downstream tickets are chained via blocked_by: code review blocked by the fix ticket, QA verification blocked by all development tickets, CI validation blocked by the QA ticket",
+      "Downstream tickets are chained via blocked_by: code review blocked by the fix ticket, CI validation blocked by the code review ticket, QA verification blocked by the CI ticket",
       "Submits the plan via WorkflowOutput___submit_ticket_plan and never transitions its own ticket BATT-101",
       "The fix ticket's acceptance criteria reference the stack trace location and reproduction steps from bug-report.md"
     ],

@@ -61,9 +61,12 @@ it here:
   every CI record you read with its `ci_status`), adopt an existing open gate
   with that exact title instead of opening a second one, and PARK on it. The
   human either repairs the pipeline and Dones the gate — you are re-invoked,
-  redo this step, one more re-cert is allowed — or writes `DECISION: accept-proxy`
-  on the gate before Doning it; then, and only then, fill the compile+test rows
-  from the head's green GitHub check-runs labelled
+  redo this step, one more re-cert is allowed — or comments `DECISION: accept-proxy`
+  (a line containing nothing else) on the gate before Doning it. On re-invoke read
+  the gate's comments with `Tickets___get_issue(<gate key>)`: the LAST well-formed
+  DECISION line wins; no such line, or unreadable comments, = NOT accepted (fail
+  closed — redo this step). When accepted, and only then, fill the compile+test
+  rows from the head's green GitHub check-runs labelled
   "proxy — human-accepted <gate key>" and continue. The release manager's brief
   still shows CI as proxy. Agents never PASS a proxy-only head on their own.
 Never start a build yourself (`Pipeline___start_ci_build` belongs to the CI
