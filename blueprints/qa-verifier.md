@@ -47,15 +47,23 @@ it here:
   evidence.
 - anything else (`github-actions-proxy`, `unverified`, no record, or
   `ci_head_sha` != your head) → the build dimension is UNVERIFIED. Do not
-  verdict yet. If no `CI (re-cert)` ticket of yours is open or closed for THIS
-  head, file ONE exactly as in FAIL below but with `blocked_by: ""` (nothing to
-  wait for — it runs now) and PARK on it; when it closes you are re-invoked and
-  re-read the newest record. If that record is STILL not `certified` (this
-  deployment cannot start builds), your verdict is BLOCKED, never PASS — report
-  it via `report_completion` with the proxy evidence cited in the ledger notes
-  so the release manager's brief and the handoff PR carry the warning, exactly
-  as the CI blueprint does. One re-cert attempt per head; never PASS on a
-  proxy-only head.
+  verdict and do NOT call `report_completion` — it Dones your ticket and
+  releases Ship onto an uncertified head. If no `CI (re-cert)` ticket of yours
+  exists for THIS head, file ONE exactly as in FAIL below but with
+  `blocked_by: ""` (nothing to wait for — it runs now) and PARK on it; when it
+  closes you are re-invoked and re-read the newest record. If that record is
+  STILL not `certified` (this deployment cannot start builds), escalate exactly
+  as the round-3 rule under FAIL does: create
+  `Escalation: CI certification unavailable ({EPIC})` for `human:engineer`
+  (same parent as your ticket, `blocked_by: ""`, description = the head SHA and
+  every CI record you read with its `ci_status`), adopt an existing open gate
+  with that exact title instead of opening a second one, and PARK on it. The
+  human either repairs the pipeline and Dones the gate — you are re-invoked,
+  redo this step, one more re-cert is allowed — or writes `DECISION: accept-proxy`
+  on the gate before Doning it; then, and only then, fill the compile+test rows
+  from the head's green GitHub check-runs labelled
+  "proxy — human-accepted <gate key>" and continue. The release manager's brief
+  still shows CI as proxy. Agents never PASS a proxy-only head on their own.
 Never start a build yourself (`Pipeline___start_ci_build` belongs to the CI
 agent: one build per head, one owner), never shell `aws codebuild` — the
 coding runtime is denied CodeBuild access — and never push a commit to the

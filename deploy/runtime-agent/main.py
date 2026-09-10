@@ -1539,15 +1539,16 @@ def Tickets___create_ticket(title: str, description: str, parent_id: str = "", a
 
     MANDATORY TICKETS (create these for EVERY workflow, no exceptions):
       - agentcore_hub_code_reviewer: "Review: [feature]" — blocked_by=ALL dev ticket IDs
-      - agentcore_hub_qa_verifier: "QA: Verify [feature]" — blocked_by=code reviewer ticket ID
-      - agentcore_hub_ci_agent: "CI: Validate build and tests for [feature]" — blocked_by=QA ticket ID
+      - agentcore_hub_ci_agent: "CI: Validate build and tests for [feature]" — blocked_by=code reviewer ticket ID
+      - agentcore_hub_qa_verifier: "QA: Verify [feature]" — blocked_by=CI ticket ID
+        (CI certifies the head BEFORE QA, so QA reads one certified build instead of re-running it)
 
     Example complete ticket set for a frontend feature:
       1. create_ticket(assignee="agentcore_hub_frontend_designer", blocked_by="")
       2. create_ticket(assignee="agentcore_hub_frontend_dev", blocked_by="TEAM-101")
       3. create_ticket(assignee="agentcore_hub_code_reviewer", blocked_by="TEAM-102") ← ALWAYS
-      4. create_ticket(assignee="agentcore_hub_qa_verifier", blocked_by="TEAM-103")   ← ALWAYS
-      5. create_ticket(assignee="agentcore_hub_ci_agent", blocked_by="TEAM-104")      ← ALWAYS
+      4. create_ticket(assignee="agentcore_hub_ci_agent", blocked_by="TEAM-103")      ← ALWAYS
+      5. create_ticket(assignee="agentcore_hub_qa_verifier", blocked_by="TEAM-104")   ← ALWAYS
 
     TICKET TYPE — pick by what the PARENT is (this is the #1 thing to get right):
       - Parent is an EPIC  → ticket_type="task"     (the DEFAULT — almost every run)
