@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { Search, Plus, Play, Radio, Zap, ChevronLeft, ChevronRight, FlaskConical, Archive, Trash2, ClipboardCheck } from "lucide-react";
 import WorkflowBoard from "@/components/workflow/WorkflowBoard";
 import WorkflowManagerChat from "@/components/workflow/WorkflowManagerChat";
@@ -41,6 +41,9 @@ export default function WorkflowPage() {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [nudgeToast, setNudgeToast] = useState<{ message: string; type: "success" | "info" | "error" } | null>(null);
   const [historyCollapsed, setHistoryCollapsed] = useState(true);
+  const [historyWidth, setHistoryWidth] = useState(288);
+  const [dragging, setDragging] = useState(false);
+  const sidebarRef = useRef<HTMLDivElement>(null);
   const [testDefId, setTestDefId] = useState<string>(DEFAULT_WORKFLOW_DEF_ID);
   const [deleteTargetId, setDeleteTargetId] = useState<string | null>(null);
   const [deleteLoading, setDeleteLoading] = useState(false);
@@ -52,12 +55,56 @@ export default function WorkflowPage() {
   useEffect(() => {
     const stored = localStorage.getItem('workflow-history-collapsed');
     if (stored !== null) setHistoryCollapsed(stored === 'true');
+    const storedWidth = localStorage.getItem('workflow-history-width');
+    if (storedWidth !== null) {
+      const parsed = parseInt(storedWidth, 10);
+      if (!Number.isNaN(parsed)) setHistoryWidth(clampWidth(parsed));
+    }
   }, []);
 
   const toggleHistory = () => {
     const next = !historyCollapsed;
     setHistoryCollapsed(next);
     localStorage.setItem('workflow-history-collapsed', String(next));
+  };
+
+  function clampWidth(px: number) {
+    return Math.min(Math.max(px, 240), Math.min(640, window.innerWidth / 2));
+  }
+
+  const handleResizePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    e.currentTarget.setPointerCapture(e.pointerId);
+    setDragging(true);
+  };
+
+  const handleResizePointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!dragging || !sidebarRef.current) return;
+    const rectLeft = sidebarRef.current.getBoundingClientRect().left;
+    setHistoryWidth(clampWidth(e.clientX - rectLeft));
+  };
+
+  const handleResizePointerUp = () => {
+    setDragging(false);
+    setHistoryWidth((current) => {
+      localStorage.setItem('workflow-history-width', String(current));
+      return current;
+    });
+  };
+
+  const handleResizeDoubleClick = () => {
+    setHistoryWidth(288);
+    localStorage.setItem('workflow-history-width', '288');
+  };
+
+  const handleResizeKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+    e.preventDefault();
+    setHistoryWidth((current) => {
+      const delta = e.key === 'ArrowLeft' ? -16 : 16;
+      const next = clampWidth(current + delta);
+      localStorage.setItem('workflow-history-width', String(next));
+      return next;
+    });
   };
 
   // Update header with selected workflow title
@@ -288,7 +335,11 @@ export default function WorkflowPage() {
   return (
     <div className="flex h-[calc(100vh-64px)] -m-6">
       {/* Left Sidebar — Epic History */}
-      <div className={`${historyCollapsed ? 'w-8' : 'w-72'} transition-all duration-300 border-r border-[var(--color-border)] bg-[var(--color-bg-secondary)] flex flex-col flex-shrink-0 overflow-hidden`}>
+      <div
+        ref={sidebarRef}
+        className={`${historyCollapsed ? 'w-8' : ''} ${dragging ? '' : 'transition-all duration-300'} relative border-r border-[var(--color-border)] bg-[var(--color-bg-secondary)] flex flex-col flex-shrink-0 overflow-hidden`}
+        style={historyCollapsed ? undefined : { width: historyWidth }}
+      >
         {historyCollapsed ? (
           <div className="flex flex-col items-center pt-3 h-full">
             <button onClick={toggleHistory} className="p-1 rounded hover:bg-[var(--color-bg-tertiary)]" aria-label="Expand workflow history sidebar">
@@ -378,6 +429,24 @@ export default function WorkflowPage() {
                 </div>
               )}
             </div>
+
+            <div
+              role="separator"
+              aria-orientation="vertical"
+              aria-valuenow={historyWidth}
+              aria-valuemin={240}
+              aria-valuemax={Math.min(640, typeof window !== 'undefined' ? window.innerWidth / 2 : 640)}
+              aria-label="Resize workflows list"
+              tabIndex={0}
+              data-testid="workflow-history-resize"
+              className="absolute top-0 right-0 h-full w-1.5 cursor-col-resize z-10 hover:bg-[var(--color-border-hover)] focus:bg-[var(--color-border-hover)] focus:outline-none"
+              onPointerDown={handleResizePointerDown}
+              onPointerMove={handleResizePointerMove}
+              onPointerUp={handleResizePointerUp}
+              onLostPointerCapture={handleResizePointerUp}
+              onDoubleClick={handleResizeDoubleClick}
+              onKeyDown={handleResizeKeyDown}
+            />
           </>
         )}
       </div>
