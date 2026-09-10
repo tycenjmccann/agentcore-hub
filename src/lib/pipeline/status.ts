@@ -52,6 +52,16 @@ export interface StageState {
   // workflow board — otherwise the post-merge deploy gate is invisible in the UI.
   awaitingApproval?: boolean;
   approvalUrl?: string; // the action's entityUrl (view-commit / review link)
+  // Execution identity (TEAM-4403): WHICH pipeline execution is parked here, and
+  // which source commit produced it. The board's deploy-gate banner was
+  // repo-scoped, so one parked approval leaked onto every active run of that
+  // repo; with these the banner is scoped to the run whose commit is actually at
+  // the gate. `sourceSha` is derived from `actionStates[].currentRevision` on the
+  // state we already fetched because the task role is granted only
+  // codepipeline:GetPipelineState — GetPipelineExecution is not available to us.
+  executionId?: string;
+  /** Full 40-char source commit SHA; undefined when it cannot be tied to `executionId`. */
+  sourceSha?: string;
 }
 
 /** One CD target: a registered repo's pipeline, or the env default pipeline. */
@@ -204,16 +214,68 @@ async function recentBuilds(
   }));
 }
 
+/**
+ * The subset of a GetPipelineState stage this module reads. Structural on
+ * purpose: the SDK shape satisfies it, and the pure helper below stays directly
+ * testable without constructing SDK types.
+ */
+interface RawStageState {
+  stageName?: string;
+  latestExecution?: { pipelineExecutionId?: string; status?: string };
+  actionStates?: Array<{
+    entityUrl?: string;
+    currentRevision?: { revisionId?: string };
+    latestExecution?: { token?: string; status?: string; lastStatusChange?: Date };
+  }>;
+}
+
+/** A source commit SHA, as opposed to the 12-char `revisionSummary` digest. */
+const FULL_SHA = /^[0-9a-f]{40}$/i;
+
+const fullShaIn = (stage: RawStageState | undefined): string | undefined =>
+  (stage?.actionStates || [])
+    .map((a) => a.currentRevision?.revisionId)
+    .find((id): id is string => !!id && FULL_SHA.test(id));
+
+/**
+ * The full source commit SHA behind one pipeline execution, from GetPipelineState
+ * alone (the task role has no codepipeline:GetPipelineExecution).
+ *
+ * `ownStage` wins when it carries a full SHA of its own; otherwise the SHA comes
+ * from any stage still reporting the SAME `pipelineExecutionId` — that is how the
+ * Source stage's revision is tied to the parked execution. A superseded execution,
+ * whose Source stage has already advanced to a newer commit, legitimately yields
+ * undefined rather than a wrong SHA; callers must treat that conservatively.
+ */
+export function sourceShaForExecution(
+  stageStates: RawStageState[],
+  executionId?: string,
+  ownStage?: RawStageState
+): string | undefined {
+  const own = fullShaIn(ownStage);
+  if (own) return own;
+  if (!executionId) return undefined;
+  for (const s of stageStates || []) {
+    if (s === ownStage) continue;
+    if (s.latestExecution?.pipelineExecutionId !== executionId) continue;
+    const sha = fullShaIn(s);
+    if (sha) return sha;
+  }
+  return undefined;
+}
+
 async function pipelineStages(
   cp: CodePipelineClient,
   pipelineName: string
 ): Promise<StageState[]> {
   const st = await cp.send(new GetPipelineStateCommand({ name: pipelineName }));
-  return (st.stageStates || []).map((s) => {
+  const stageStates: RawStageState[] = st.stageStates || [];
+  return stageStates.map((s) => {
     // A ManualApproval action awaiting a decision has a token + InProgress status.
     const approvalAction = (s.actionStates || []).find(
       (a) => a.latestExecution?.token && a.latestExecution?.status === "InProgress"
     );
+    const executionId = s.latestExecution?.pipelineExecutionId;
     return {
       name: s.stageName || "",
       status: s.latestExecution?.status || "Unknown",
@@ -223,6 +285,8 @@ async function pipelineStages(
         s.actionStates?.[0]?.currentRevision?.revisionId?.slice(0, 12),
       awaitingApproval: !!approvalAction,
       approvalUrl: approvalAction?.entityUrl,
+      executionId,
+      sourceSha: sourceShaForExecution(stageStates, executionId, s),
     };
   });
 }
