@@ -198,6 +198,15 @@ jobs:
         env:
           PLAYWRIGHT_BASE_URL: http://localhost:3737
 
+      # Hermetic (every /api/** call is intercepted in the spec), so it needs no
+      # AWS credentials and reuses the next start already listening on 3737.
+      # The launch option that makes the 6px scrollbar gutter measurable
+      # (ignoreDefaultArgs: --hide-scrollbars) lives in the spec, not here.
+      - name: Workflow sidebar resize + scrollbar suite
+        run: npx playwright test tests/tab-workflow-resize.spec.ts --trace retain-on-failure
+        env:
+          PLAYWRIGHT_BASE_URL: http://localhost:3737
+
       - name: Upload traces on failure
         if: failure()
         uses: actions/upload-artifact@v4

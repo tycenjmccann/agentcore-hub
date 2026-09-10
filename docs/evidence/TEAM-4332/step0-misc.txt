@@ -1,0 +1,72 @@
+SHORT  (30) = "Refactor the workflow sidebarx"
+MEDIUM (65) = "Refactor the workflow sidebar resize handle and persist width acr"
+ABSURD(300) = "Refactor the workflow sidebar resize handle and persist width across reloads for operators Refactor the workflow sidebar resize handle and persist width across reloads for operators Refactor the workflow sidebar resize handle and persist width across reloads for operators Refactor the workflow sideb"
+
+(a) @640 : [
+ {
+  "len": 30,
+  "clientWidth": 189,
+  "scrollWidth": 189,
+  "parentClientWidth": 581,
+  "grandClientWidth": 581,
+  "clipped": false
+ },
+ {
+  "len": 65,
+  "clientWidth": 393,
+  "scrollWidth": 393,
+  "parentClientWidth": 581,
+  "grandClientWidth": 581,
+  "clipped": false
+ },
+ {
+  "len": 300,
+  "clientWidth": 581,
+  "scrollWidth": 1823,
+  "parentClientWidth": 581,
+  "grandClientWidth": 581,
+  "clipped": true
+ }
+]
+
+(a) @288 : [
+ {
+  "len": 30,
+  "clientWidth": 189,
+  "scrollWidth": 189,
+  "parentClientWidth": 229,
+  "grandClientWidth": 229,
+  "clipped": false
+ },
+ {
+  "len": 65,
+  "clientWidth": 229,
+  "scrollWidth": 393,
+  "parentClientWidth": 229,
+  "grandClientWidth": 229,
+  "clipped": true
+ },
+ {
+  "len": 300,
+  "clientWidth": 229,
+  "scrollWidth": 1823,
+  "parentClientWidth": 229,
+  "grandClientWidth": 229,
+  "clipped": true
+ }
+]
+
+(b) tab trail: 1:BUTTON/-/Archive workflow  |  2:BUTTON/-/Delete workflow: Refactor the workflow sidebarx  |  3:BUTTON/-/Archive workflow  |  4:BUTTON/-/Delete workflow: Second row  |  5:DIV/separator/Resize workflows sidebar
+(b) handle reached after tabs: 5
+
+(c) viewport=1440 innerWidth=1440 initial= {"now":288,"max":640}
+  after 1x ArrowRight: {"now":304,"max":640} writes: [{"key":"workflow-history-width","value":"304"}]
+  after 1x ArrowLeft : {"now":288,"max":640} writes: [{"key":"workflow-history-width","value":"288"}]
+  30x ArrowRight -> {"now":640,"max":640} max seen: 640 tail: 640,640,640,640,640,640
+  40x ArrowLeft  -> {"now":240,"max":640} min seen: 240 tail: 240,240,240,240,240,240
+
+(c) viewport=900 innerWidth=900 initial= {"now":288,"max":450}
+  after 1x ArrowRight: {"now":304,"max":450} writes: [{"key":"workflow-history-width","value":"304"}]
+  after 1x ArrowLeft : {"now":288,"max":450} writes: [{"key":"workflow-history-width","value":"288"}]
+  30x ArrowRight -> {"now":450,"max":450} max seen: 450 tail: 450,450,450,450,450,450
+  40x ArrowLeft  -> {"now":240,"max":450} min seen: 240 tail: 240,240,240,240,240,240

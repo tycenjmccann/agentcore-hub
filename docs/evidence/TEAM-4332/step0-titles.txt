@@ -1,0 +1,60 @@
+==============================================================================
+SIDEBAR width=240
+  env : {"innerWidth":1440,"outerWidth":1440,"docScrolls":false,"docGutter":0,"clampMax":640,"fontsInter":true,"renderedSidebar":240,"aria":"240","ariaMax":"640"}
+  list: {"offsetWidth":239,"clientWidth":233,"gutter":6,"horizOverflow":0}
+  len | clientW | scrollW | overflow(+clipped/-fits)
+   30 |     175 |     189 | +14
+   35 |     175 |     215 | +40
+   40 |     175 |     247 | +72
+   45 |     175 |     276 | +101
+   50 |     175 |     310 | +135
+   55 |     175 |     336 | +161
+   60 |     175 |     364 | +189
+   65 |     175 |     393 | +218
+   70 |     175 |     423 | +248
+   75 |     175 |     457 | +282
+   80 |     175 |     485 | +310
+   90 |     175 |     548 | +373
+  100 |     175 |     610 | +435
+  110 |     175 |     666 | +491
+  300 |     175 |    1823 | +1648
+==============================================================================
+SIDEBAR width=288
+  env : {"innerWidth":1440,"outerWidth":1440,"docScrolls":false,"docGutter":0,"clampMax":640,"fontsInter":true,"renderedSidebar":288,"aria":"288","ariaMax":"640"}
+  list: {"offsetWidth":287,"clientWidth":281,"gutter":6,"horizOverflow":0}
+  len | clientW | scrollW | overflow(+clipped/-fits)
+   55 |     223 |     336 | +113
+   60 |     223 |     364 | +141
+   65 |     223 |     393 | +170
+   70 |     223 |     423 | +200
+   75 |     223 |     457 | +234
+   80 |     223 |     485 | +262
+   90 |     223 |     548 | +325
+  100 |     223 |     610 | +387
+  110 |     223 |     666 | +443
+  300 |     223 |    1823 | +1600
+   30 |     189 |     189 | 0
+   35 |     215 |     215 | 0
+   40 |     223 |     247 | +24
+   45 |     223 |     276 | +53
+   50 |     223 |     310 | +87
+==============================================================================
+SIDEBAR width=640
+  env : {"innerWidth":1440,"outerWidth":1440,"docScrolls":false,"docGutter":0,"clampMax":640,"fontsInter":true,"renderedSidebar":640,"aria":"640","ariaMax":"640"}
+  list: {"offsetWidth":639,"clientWidth":633,"gutter":6,"horizOverflow":0}
+  len | clientW | scrollW | overflow(+clipped/-fits)
+   60 |     364 |     364 | 0
+   65 |     393 |     393 | 0
+   70 |     423 |     423 | 0
+   75 |     457 |     457 | 0
+   80 |     485 |     485 | 0
+   90 |     548 |     548 | 0
+  100 |     575 |     610 | +35
+  110 |     575 |     666 | +91
+  300 |     575 |    1823 | +1248
+   30 |     189 |     189 | 0
+   35 |     215 |     215 | 0
+   40 |     247 |     247 | 0
+   45 |     276 |     276 | 0
+   50 |     310 |     310 | 0
+   55 |     336 |     336 | 0
