@@ -122,24 +122,18 @@ jobs:
       # only, and the fixtures are files in toolkit/fixtures/. test_pull_dossier
       # stubs boto3 in sys.modules like test_save_analysis does and feeds
       # get_events canned DynamoDB pages.
+      #
+      # TEAM-4354: the target list is no longer hand-copied here. It used to be a
+      # literal `pytest -q` list that had DIVERGED from the buildspec's copy — a
+      # test wired into only one surface is not a gate, and the CodeBuild
+      # buildspec is the AUTHORITATIVE required check. Both surfaces now invoke
+      # scripts/run-python-tests.sh, which reads the SINGLE shared list at
+      # deploy/pipeline/pytest-targets.txt. Add the next hermetic pytest target
+      # to that list, NOT to a command line here (same single-source-of-truth
+      # shape TEAM-4353 gave the Playwright suite via one npm script). The list's
+      # order is load-bearing — see its header before editing it.
       - name: Python unit tests (hermetic — no AWS)
-        run: >
-          pytest -q
-          deploy/runtime-agent/tests
-          deploy/runtime-agent/test_telemetry_init.py
-          deploy/runtime-agent/test_build_env_vars.py
-          deploy/runtime-agent/test_fleet_healthcheck.py
-          deploy/coding-agent-runtime/test_plan_mode_args.py
-          deploy/coding-agent-runtime/test_setup_failure_response.py
-          deploy/coding-agent-runtime/test_session_busy.py
-          deploy/coding-agent-runtime/test_coding_healthcheck.py
-          deploy/coding-agent-runtime/test_turn_timeout.py
-          deploy/coding-agent-runtime/test_codex_sqlite_home.py
-          deploy/workflow-manager/toolkit
-          deploy/pipeline/test_ecs_primary_container.py
-          deploy/pipeline/test_plan_surfaces.py
-          deploy/pipeline/test_prune_apt_sources.py
-          deploy/pipeline/test_update_runtime_image.py
+        run: ./scripts/run-python-tests.sh
 
   cloud-code-ui:
     name: Cloud Code UI (mocked, no AWS)

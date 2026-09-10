@@ -107,23 +107,19 @@ phases:
       # second command here. The AWS-backed tab/api specs stay excluded — they need
       # live credentials.
       - "PLAYWRIGHT_BASE_URL=http://localhost:3000 npm run test:cloud-code -- --trace retain-on-failure"
-      # runtime-agent telemetry pytest (hermetic, no AWS)
+      # runtime-agent telemetry pytest (hermetic, no AWS). TEAM-4354: the target
+      # list is no longer inlined here — it had DIVERGED from .github/workflows/
+      # ci.yml's copy (a test wired into only one surface is not a gate, and this
+      # buildspec is the AUTHORITATIVE required check). Both surfaces now run
+      # scripts/run-python-tests.sh, which reads the SINGLE shared list
+      # deploy/pipeline/pytest-targets.txt (order is load-bearing — see its
+      # header). Same single-source-of-truth shape TEAM-4353 gave the Playwright
+      # suite. The runner MUST stay inside this venv (after the pip install,
+      # before deactivate) — the deps are venv-scoped and that must not change.
       - |
         python3 -m venv /tmp/pyci && . /tmp/pyci/bin/activate
         pip install -q -r deploy/runtime-agent/tests/requirements-test.txt
-        pytest -q deploy/runtime-agent/tests \
-          deploy/runtime-agent/test_telemetry_init.py \
-          deploy/runtime-agent/test_build_env_vars.py \
-          deploy/runtime-agent/test_remote_coding.py \
-          deploy/runtime-agent/test_fleet_healthcheck.py \
-          deploy/coding-agent-runtime/test_setup_failure_response.py \
-          deploy/coding-agent-runtime/test_session_busy.py \
-          deploy/coding-agent-runtime/test_coding_healthcheck.py \
-          deploy/workflow-manager/toolkit \
-          deploy/pipeline/test_ecs_primary_container.py \
-          deploy/pipeline/test_plan_surfaces.py \
-          deploy/pipeline/test_prune_apt_sources.py \
-          deploy/pipeline/test_update_runtime_image.py
+        ./scripts/run-python-tests.sh
         deactivate
       # HARD GATE: lambda-zip manifest integrity (the guard DEPLOY.md's inline zip bypassed)
       - "bash scripts/check-lambda-zip-manifest.sh"
