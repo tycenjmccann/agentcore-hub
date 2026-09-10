@@ -312,6 +312,15 @@ Notes (implemented):
   because with `PIPELINE_ENABLED` the blueprints skip their own mechanical tests
   on a green result; a missing gate here would let unit/race/telemetry
   regressions merge. Kept in lockstep with `.github/workflows/ci.yml`.
+  For two of these gates the lockstep is MECHANICAL, not a hand-copied list:
+  the hermetic UI specs go through the shared `test:cloud-code` npm script
+  (TEAM-4353), and the telemetry pytest goes through `scripts/run-python-tests.sh`,
+  which reads the SINGLE shared target list `deploy/pipeline/pytest-targets.txt`
+  (TEAM-4354). Before that, the two pytest lists had drifted — three targets ran
+  only in GitHub Actions and one only in CodeBuild, so a test wired into just one
+  surface was not really a gate. Add the next hermetic pytest target to that list
+  (its order is load-bearing — see its header), NOT to a command line in either
+  surface.
 - **Eval-infra targets (DEPLOY.md steps 4–9) are OUT of the app pipeline.** They
   belong to the separate fleet+eval pipeline (its own role/secrets/CLI). The app
   pipeline detects a fleet/eval change (`pipeline-out/changed-files.txt`) but does

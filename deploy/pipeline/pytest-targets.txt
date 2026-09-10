@@ -1,0 +1,32 @@
+# Shared pytest target list — the SINGLE SOURCE OF TRUTH for the hermetic
+# Python unit-test gate (TEAM-4354). Consumed by scripts/run-python-tests.sh,
+# which is invoked identically by BOTH CI surfaces:
+#   - .github/workflows/ci.yml           (job python-telemetry-tests)
+#   - deploy/pipeline/buildspec-ci.yml   (build phase, inside the /tmp/pyci venv)
+# CodeBuild's buildspec is the AUTHORITATIVE required check; a test wired into
+# only one surface is not a gate. Same fix shape as TEAM-4353 did for the
+# hermetic Playwright suite (one npm script), applied to pytest.
+#
+# One target per line. Blank lines and `#` comments are ignored.
+#
+# ORDER IS LOAD-BEARING — DO NOT SORT. deploy/coding-agent-runtime/
+# test_setup_failure_response.py exec's the coding runtime's main.py and stubs
+# sys.modules; if it imports before deploy/runtime-agent/tests it poisons
+# sys.modules['strands'] and the telemetry tests fail to collect. Keep
+# runtime-agent/tests first and the coding-agent tests grouped together.
+deploy/runtime-agent/tests
+deploy/runtime-agent/test_telemetry_init.py
+deploy/runtime-agent/test_build_env_vars.py
+deploy/runtime-agent/test_remote_coding.py
+deploy/runtime-agent/test_fleet_healthcheck.py
+deploy/coding-agent-runtime/test_plan_mode_args.py
+deploy/coding-agent-runtime/test_setup_failure_response.py
+deploy/coding-agent-runtime/test_session_busy.py
+deploy/coding-agent-runtime/test_coding_healthcheck.py
+deploy/coding-agent-runtime/test_turn_timeout.py
+deploy/coding-agent-runtime/test_codex_sqlite_home.py
+deploy/workflow-manager/toolkit
+deploy/pipeline/test_ecs_primary_container.py
+deploy/pipeline/test_plan_surfaces.py
+deploy/pipeline/test_prune_apt_sources.py
+deploy/pipeline/test_update_runtime_image.py
