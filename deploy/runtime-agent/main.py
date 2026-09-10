@@ -782,12 +782,20 @@ def _poll_coding_turn(client, turn_id: str, outer_deadline: float | None = None,
         # "running" or "transient" (degraded EFS read / torn read racing the
         # journal's tmp+rename): the turn may still be live — keep polling, but
         # only until `deadline`. A fresh heartbeat proves the runner is alive; it
-        # does not buy time past the budget. Terminal work after the CLI
-        # (artifact harvest can be GBs) has no fixed bound of its own, but the
-        # runner's watchdog bounds the CLI and its _TURN_TERMINAL_GRACE_S forces
-        # a terminal record, so a live runner's verdict arrives inside the
-        # budget; a runner that dies mid-harvest stops heartbeating and 'dead'
-        # fires.
+        # does not buy time past the budget. What the runtime DOES bound: its
+        # watchdog kills the CLI at turn_timeout_s, and _TURN_TERMINAL_GRACE_S
+        # forces a terminal record ONLY for a CLI that never exited (the
+        # 2026-09-09 wedged-read shape — a grandchild holding stdout), gated on
+        # the runner's `cli_exited` signal (TEAM-4379). What it does NOT bound:
+        # the post-CLI artifact harvest (can be GBs; S3 client on botocore
+        # defaults). A live runner whose CLI exited on time and is still
+        # harvesting may legitimately outlast this budget, and it keeps
+        # heartbeating `running` because that is the truth. That case is the
+        # designed outcome of the give-up below: the loop stops at `deadline`,
+        # probes once more, and returns the verify-first / no_retry_hint error
+        # so the persona checks the branch instead of re-running into a live
+        # workspace. A runner that dies mid-harvest stops heartbeating, the
+        # journal goes stale, and 'dead' fires above.
         if state == "running":
             now = time.time()
             # Prove-alive pulse: the runner heartbeats its journal, but nothing
