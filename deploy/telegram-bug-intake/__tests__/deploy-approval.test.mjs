@@ -256,6 +256,13 @@ const btnData = (msg) => msg.reply_markup.inline_keyboard.flat().map((b) => b.ca
 /** The dok key on a ping. */
 const dokKey = (msg) => btnData(msg).find((d) => d.startsWith("dok|")).split("|")[1];
 
+/** hashToken() from index.mjs (djb2), copied so the tests pin the KEY SHAPE
+ *  rather than whatever the implementation currently produces. */
+const djb2 = (s) => { let h = 5381; for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0; return (h >>> 0).toString(36); };
+const legacyKey = (token) => `dp${djb2(token)}`;                        // pre-TEAM-4338 shape
+const targetKey = (pipeline, token) => `dp${djb2(`${pipeline} ${token}`)}`;
+const claimIds = () => db.puts.filter((i) => i.id.S.startsWith("dep#")).map((i) => i.id.S);
+
 describe("deploy-approval bridge", () => {
   it("pings allowlisted chat once with dok/dno buttons; re-scan doesn't re-ping", async () => {
     const handler = await loadHandler({ allowed: "555", pipeline: PIPELINE });
@@ -564,5 +571,189 @@ describe("deploy-approval bridge", () => {
     }
     // Two targets → two DIFFERENT keys (the pipeline is part of the hash input).
     expect(new Set(all.map((d) => d.split("|")[1])).size).toBe(2);
+  });
+
+  // ─── F4: registry repo can't steer the GitHub call (TEAM-4347) ────────────
+
+  it.each(["acme/widget?per_page=1", "acme/..", "acme/widget#x", "acme/re po"])(
+    "a registry repo containing metacharacters (%s) never reaches the GitHub API",
+    async (badRepo) => {
+      const handler = await loadHandler({
+        allowed: "555", bucket: BUCKET,
+        registry: { version: 1, repos: [{ repo: badRepo, pipeline: WIDGET, region: "us-west-2" }] },
+      });
+      registerChat(555);
+      cp.states.set(WIDGET, pendingState(TOKEN2, { revision: "abc1234def567" }));
+
+      const net = makeNet(makeCtx(100_000), { batches: [[]] });
+      global.fetch = net.fetch;
+      await handler({}, net.ctx);
+
+      const ghUrls = net.fetched.filter((u) => u.startsWith("https://api.github.com/"));
+      expect(ghUrls, "an unsafe repo must never reach the GitHub API").toEqual([]);
+      expect(net.sent.length, "the approval ping still goes out on the terse path").toBe(1);
+    },
+  );
+
+  it("an unsafe repo skips enrichment but the gate still pings on the terse path", async () => {
+    const badRepo = "acme/widget?per_page=1";
+    const handler = await loadHandler({
+      allowed: "555", bucket: BUCKET,
+      registry: { version: 1, repos: [{ repo: badRepo, pipeline: WIDGET, region: "us-west-2" }] },
+    });
+    registerChat(555);
+    cp.states.set(WIDGET, pendingState(TOKEN2, { revision: "abc1234def567" }));
+
+    const net = makeNet(makeCtx(100_000), { batches: [[]] });
+    global.fetch = net.fetch;
+    await handler({}, net.ctx);
+
+    expect(net.sent.length).toBe(1);
+    const text = net.sent[0].text;
+    expect(text).not.toMatch(/Workflow:/);
+    expect(text).not.toMatch(/Scope:/);
+    expect(text).not.toMatch(/Commit:/);
+    expect(text).toContain(WIDGET);
+  });
+
+  it("a valid registry repo with dots/underscores still enriches from that repo", async () => {
+    const goodRepo = "acme/widget_v2.0";
+    const handler = await loadHandler({
+      allowed: "555", bucket: BUCKET,
+      registry: { version: 1, repos: [{ repo: goodRepo, pipeline: WIDGET, region: "us-west-2" }] },
+    });
+    registerChat(555);
+    cp.states.set(WIDGET, pendingState(TOKEN2, { revision: "abc1234def567" }));
+
+    const net = makeNet(makeCtx(100_000), {
+      batches: [[]],
+      github: {
+        commit: { commit: { message: "feat(widget): bump" }, stats: { additions: 1, deletions: 1 }, files: [{}] },
+        pulls: [{ number: 1, title: "feat(widget): bump", html_url: "https://github.com/acme/widget_v2.0/pull/1", body: "## Summary\nBumps the widget." }],
+      },
+    });
+    global.fetch = net.fetch;
+    await handler({}, net.ctx);
+
+    const ghUrls = net.fetched.filter((u) => u.startsWith("https://api.github.com/"));
+    expect(ghUrls.length).toBeGreaterThan(0);
+    for (const u of ghUrls) expect(u.startsWith(`https://api.github.com/repos/${goodRepo}/`)).toBe(true);
+  });
+
+  it("the env fallback repo (GITHUB_USER/agentcore-hub) is accepted", async () => {
+    const handler = await loadHandler({ allowed: "555", pipeline: PIPELINE });
+    registerChat(555);
+    const st = pendingState();
+    st.stageStates[0].actionStates[0].currentRevision = { revisionId: "abc1234def567" };
+    cp.state = st;
+
+    const net = makeNet(makeCtx(100_000), {
+      batches: [[]],
+      github: {
+        commit: { commit: { message: "chore: bump" }, stats: { additions: 1, deletions: 1 }, files: [{}] },
+        pulls: [],
+      },
+    });
+    global.fetch = net.fetch;
+    await handler({}, net.ctx);
+
+    const ghUrls = net.fetched.filter((u) => u.startsWith("https://api.github.com/"));
+    expect(ghUrls.length).toBeGreaterThan(0);
+    for (const u of ghUrls) expect(u.startsWith("https://api.github.com/repos/test-user/agentcore-hub/")).toBe(true);
+  });
+
+  it("warns once per bad repo, not once per scan", async () => {
+    const badRepo = "acme/widget?x=1";
+    const handler = await loadHandler({
+      allowed: "555", bucket: BUCKET,
+      registry: { version: 1, repos: [{ repo: badRepo, pipeline: WIDGET, region: "us-west-2" }] },
+    });
+    registerChat(555);
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      cp.states.set(WIDGET, pendingState(TOKEN2, { revision: "abc1234def567" }));
+      const net1 = makeNet(makeCtx(100_000), { batches: [[]] });
+      global.fetch = net1.fetch;
+      await handler({}, net1.ctx);
+
+      // Second scan, same wait would be deduped by the claim — use a fresh token
+      // so the ping (and therefore buildDeployBrief) actually runs again.
+      cp.states.set(WIDGET, pendingState("approval-token-widget-second-9999999999-also-way-too-long"));
+      const net2 = makeNet(makeCtx(100_000), { batches: [[]] });
+      global.fetch = net2.fetch;
+      await handler({}, net2.ctx);
+
+      expect(net1.sent.length + net2.sent.length, "both scans still ping").toBe(2);
+      const unsafeWarnings = warnSpy.mock.calls.filter((args) => /unsafe repo/.test(args[0]));
+      expect(unsafeWarnings.length, "warn once per bad repo per container, not once per scan").toBe(1);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  // ─── F5: no double ping across the claim-key upgrade (TEAM-4347) ──────────
+
+  it("an approval claimed under the legacy key shape does not re-ping after the upgrade", async () => {
+    const handler = await loadHandler({ allowed: "555", pipeline: PIPELINE });
+    registerChat(555);
+    db.items.set(`dep#${legacyKey(TOKEN)}`, {
+      id: { S: `dep#${legacyKey(TOKEN)}` },
+      pipelineName: { S: PIPELINE },
+      stageName: { S: "Approval" },
+      actionName: { S: "Approve_deploy" },
+      token: { S: TOKEN },
+    });
+    cp.state = pendingState();
+
+    const net = makeNet(makeCtx(100_000), { batches: [[]] });
+    global.fetch = net.fetch;
+    await handler({}, net.ctx);
+
+    expect(net.sent.length, "already claimed under the legacy key — must not re-ping").toBe(0);
+    expect(claimIds()).toEqual([]);
+  });
+
+  it("the hub registered in the registry still uses the legacy key, so a widget ping is the only one", async () => {
+    const handler = await loadHandler({ allowed: "555", pipeline: PIPELINE, bucket: BUCKET, registry: REGISTRY_TWO });
+    registerChat(555);
+    db.items.set(`dep#${legacyKey(TOKEN)}`, {
+      id: { S: `dep#${legacyKey(TOKEN)}` },
+      pipelineName: { S: PIPELINE },
+      stageName: { S: "Approval" },
+      actionName: { S: "Approve_deploy" },
+      token: { S: TOKEN },
+    });
+    cp.states.set(PIPELINE, pendingState(TOKEN));
+    cp.states.set(WIDGET, pendingState(TOKEN2));
+
+    const net = makeNet(makeCtx(100_000), { batches: [[]] });
+    global.fetch = net.fetch;
+    await handler({}, net.ctx);
+
+    expect(net.sent.length, "only the widget pings — the hub wait was already claimed under the legacy key").toBe(1);
+    expect(claimIds()).toEqual([`dep#${targetKey(WIDGET, TOKEN2)}`]);
+    const widgetClaim = db.puts.find((i) => i.id.S === `dep#${targetKey(WIDGET, TOKEN2)}`);
+    expect(widgetClaim.pipelineName.S).toBe(WIDGET);
+  });
+
+  it("claim keys: legacy shape for the env pipeline, pipeline-scoped for the rest", async () => {
+    const handler = await loadHandler({ allowed: "555", pipeline: PIPELINE, bucket: BUCKET, registry: REGISTRY_TWO });
+    registerChat(555);
+    cp.states.set(PIPELINE, pendingState(TOKEN));
+    cp.states.set(WIDGET, pendingState(TOKEN2));
+
+    const net = makeNet(makeCtx(100_000), { batches: [[]] });
+    global.fetch = net.fetch;
+    await handler({}, net.ctx);
+
+    expect(claimIds().sort()).toEqual(
+      [`dep#${legacyKey(TOKEN)}`, `dep#${targetKey(WIDGET, TOKEN2)}`].sort(),
+    );
+    const all = net.sent.flatMap(btnData);
+    expect(all.length).toBe(4);
+    for (const d of all) {
+      expect(d).toMatch(/^d(ok|no)\|dp[0-9a-z]+$/);
+      expect(Buffer.byteLength(d, "utf8"), "Telegram's 64-byte callback_data cap").toBeLessThanOrEqual(64);
+    }
   });
 });

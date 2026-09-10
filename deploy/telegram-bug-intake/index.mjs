@@ -1437,6 +1437,25 @@ function cleanSubject(title) {
   return t || null;
 }
 
+// A registry `repo` reaches the GitHub API as a URL PATH SEGMENT. normalizeRepoKey
+// (cd-registry.mjs) only guarantees two non-empty "/"-separated segments, so
+// "owner/repo?per_page=1", "owner/repo#x", "owner/re po" and "owner/.." all survive
+// parsing — and each one changes the REQUEST rather than the repo it describes
+// ("?" adds a query, "#" truncates, ".." walks the path up, all with GITHUB_TOKEN
+// attached). Registry write access must not be a way to steer an authenticated
+// GitHub call, so anything outside GitHub's own owner/name charset is refused here,
+// at the point of use. NOTE: the regex alone allows ".." (a dot is a legal repo-name
+// char) — dot-only segments are rejected separately because fetch NORMALISES them.
+const SAFE_REPO_PATH = /^[a-z0-9_.-]+\/[a-z0-9_.-]+$/i;
+const DOT_SEGMENT = /^\.+$/;
+function isSafeRepoPath(repo) {
+  if (!SAFE_REPO_PATH.test(String(repo || ""))) return false;
+  return !String(repo).split("/").some((seg) => DOT_SEGMENT.test(seg));
+}
+// One warning per bad repo per warm container: the scan runs every 60s, and a
+// registry typo must not turn into a log flood.
+const _unsafeRepoWarned = new Set();
+
 /**
  * Build a rich "what's shipping" brief for the deploy-approval ping from the
  * commit being deployed: the commit subject, its associated PR (title + body),
@@ -1452,6 +1471,13 @@ function cleanSubject(title) {
 async function buildDeployBrief(commitSha, targetRepo = null) {
   if (!commitSha) return null;
   const repo = targetRepo || `${GITHUB_USER}/agentcore-hub`;
+  if (!isSafeRepoPath(repo)) {
+    if (!_unsafeRepoWarned.has(repo)) {
+      _unsafeRepoWarned.add(repo);
+      console.warn(`[telegram-bug-intake] deploy brief skipped: unsafe repo "${repo}" (not owner/name) — fix the CD registry entry`);
+    }
+    return null;                 // terse ping still goes out; the gate must reach a human
+  }
   const gh = async (path) => {
     const r = await fetch(`https://api.github.com/repos/${repo}${path}`, {
       headers: {
@@ -1515,11 +1541,22 @@ async function buildDeployBrief(commitSha, targetRepo = null) {
  * callback_data can't carry the token itself.
  */
 async function claimDeployApproval(pending, target) {
-  // A short, callback_data-safe key derived from the pipeline + token (the token
-  // alone can exceed Telegram's 64-byte callback_data budget). The token stays in
-  // the DDB item. Hashing the PIPELINE in too means two targets can never
+  // A short, callback_data-safe key derived from the target + the approval TOKEN
+  // (the token alone can exceed Telegram's 64-byte callback_data budget). The token
+  // stays in the DDB item. Hashing the PIPELINE in means two targets can never
   // collide on one claim row, whatever their tokens look like.
-  const key = `dp${hashToken(`${target.pipeline} ${pending.token}`)}`;
+  //
+  // MIGRATION (TEAM-4347): before TEAM-4338 the key was hash(token) alone, and that
+  // code watched exactly ONE pipeline — DEPLOY_PIPELINE_NAME. So legacy-shaped rows
+  // can only ever exist for that pipeline; keeping the legacy shape for it means an
+  // approval already paused on the gate when this zip lands still hashes to the row
+  // that claimed it, instead of claiming a second row and pinging twice. Matching on
+  // the pipeline NAME (not on "came from the env fallback") is deliberate: the hub is
+  // normally in the registry too, so its target is a REGISTRY target that happens to
+  // name DEPLOY_PIPELINE_NAME — the exact configuration the double-ping would hit.
+  const key = DEPLOY_PIPELINE_NAME && target.pipeline === DEPLOY_PIPELINE_NAME
+    ? `dp${hashToken(pending.token)}`
+    : `dp${hashToken(`${target.pipeline} ${pending.token}`)}`;
   try {
     await ddb.send(new PutItemCommand({
       TableName: PENDING_TABLE,
