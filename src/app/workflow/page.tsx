@@ -69,15 +69,26 @@ export default function WorkflowPage() {
   // TEAM-4316: refs for the resize handle
   const sidebarRef = useRef<HTMLDivElement>(null);
   const isDraggingRef = useRef(false);
-  const widthRef = useRef(HISTORY_DEFAULT_WIDTH);           // mirror of width for side-effect-free reads
+  const widthRef = useRef(HISTORY_DEFAULT_WIDTH);           // mirror of the RENDERED width for side-effect-free reads
+  const preferredWidthRef = useRef(HISTORY_DEFAULT_WIDTH);  // TEAM-4331: last user-intent width, viewport-independent
   const dragCleanupRef = useRef<(() => void) | null>(null); // teardown for window listeners
 
-  // Single width mutator — keeps state + ref in lockstep, no side effects in
-  // React state updaters. `persist` writes localStorage exactly once.
+  // USER-INTENT width change (drag move, keyboard, dbl-click reset). Records the
+  // intent, keeps state + refs in lockstep, no side effects in React state
+  // updaters. `persist` writes localStorage exactly once.
   const applyWidth = useCallback((next: number, persist: boolean) => {
+    preferredWidthRef.current = next;
     widthRef.current = next;
     setHistoryWidth(next);
     if (persist) localStorage.setItem(HISTORY_WIDTH_KEY, String(next));
+  }, []);
+
+  // TEAM-4331 (B3): VIEWPORT-DRIVEN width change — affects the rendered width
+  // only. Never touches preferredWidthRef and never persists, so a transient
+  // window resize cannot destroy the stored preference.
+  const applyEffectiveWidth = useCallback((next: number) => {
+    widthRef.current = next;
+    setHistoryWidth(next);
   }, []);
 
   useEffect(() => {
@@ -85,28 +96,33 @@ export default function WorkflowPage() {
     if (stored !== null) setHistoryCollapsed(stored === 'true');
   }, []);
 
-  // Read persisted width on mount; clamp defensively (NaN / out-of-range from a
-  // tampered value). Keeps widthRef in sync so it never drifts from state.
+  // Read persisted width on mount. The raw stored value becomes the user's
+  // preference (viewport-independent); the RENDERED width is clamped to this
+  // viewport. Every consumer of preferredWidthRef re-clamps, so a tampered
+  // out-of-range value can still never render out of bounds.
   useEffect(() => {
     const stored = localStorage.getItem(HISTORY_WIDTH_KEY);
     if (stored !== null) {
       const n = Number(stored);
-      if (Number.isFinite(n)) applyWidth(clampHistoryWidth(n), false);
+      if (Number.isFinite(n)) {
+        preferredWidthRef.current = n;
+        applyEffectiveWidth(clampHistoryWidth(n));
+      }
     }
-  }, [applyWidth]);
+  }, [applyEffectiveWidth]);
 
-  // Track the honest dynamic max for ARIA, and re-clamp the current width down
-  // if the window shrinks so a persisted 640 can't outlive a narrow viewport.
+  // Track the honest dynamic max for ARIA and re-apply the user's preferred width
+  // clamped to the current viewport: narrowing clamps down, widening restores.
+  // TEAM-4331 (B3): render-only — NO localStorage write on a resize event, ever.
   useEffect(() => {
     const recompute = () => {
-      const max = Math.min(HISTORY_MAX_CEILING, window.innerWidth * 0.5);
-      setMaxWidth(max);
-      if (widthRef.current > max) applyWidth(max, true);
+      setMaxWidth(Math.min(HISTORY_MAX_CEILING, window.innerWidth * 0.5));
+      applyEffectiveWidth(clampHistoryWidth(preferredWidthRef.current));
     };
     recompute();
     window.addEventListener("resize", recompute);
     return () => window.removeEventListener("resize", recompute);
-  }, [applyWidth]);
+  }, [applyEffectiveWidth]);
 
   // Pointer drag (mouse + touch). NOTE: intentionally NOT calling
   // e.preventDefault() — cancelling pointerdown suppresses the compat
@@ -114,6 +130,31 @@ export default function WorkflowPage() {
   // (R2.4). Text selection is prevented via body.userSelect below instead.
   const handleResizeStart = useCallback((e: React.PointerEvent) => {
     if (e.pointerType === "mouse" && e.button !== 0) return; // ignore secondary buttons
+
+    // TEAM-4331 (B2): tear down any drag that never ended (e.g. a mouse-up lost
+    // outside the window) BEFORE installing a new one, so at most one drag's
+    // listener set is ever attached.
+    dragCleanupRef.current?.();
+    dragCleanupRef.current = null;
+
+    // Snapshot the handle now — React nulls synthetic currentTarget after dispatch.
+    const handle = e.currentTarget;
+    const pointerId = e.pointerId;
+
+    // TEAM-4331 (B1): capture the pointer so a mouse-up released OUTSIDE the
+    // browser window still reaches us (as pointerup and/or lostpointercapture).
+    // Guarded: an environment without the API (jsdom, older browsers) or an
+    // already-dead pointer must not throw and abort the drag — the window
+    // listeners below still work without capture.
+    let captured = false;
+    try {
+      if (typeof handle.setPointerCapture === "function") {
+        handle.setPointerCapture(pointerId);
+        captured = true;
+      }
+    } catch {
+      // capture unavailable — degrade to plain window listeners
+    }
 
     isDraggingRef.current = true;
     setIsResizing(true);
@@ -123,28 +164,48 @@ export default function WorkflowPage() {
     const onMove = (ev: PointerEvent) => {
       if (!isDraggingRef.current || !sidebarRef.current) return;
       const left = sidebarRef.current.getBoundingClientRect().left;
-      applyWidth(clampHistoryWidth(ev.clientX - left), false); // no localStorage write per move
+      applyWidth(clampHistoryWidth(ev.clientX - left), false); // intent path: moves BOTH refs, no localStorage write per move
     };
     const cleanup = () => {
       isDraggingRef.current = false;
       setIsResizing(false);
       document.body.style.userSelect = "";
       document.body.style.cursor = "";
+      if (captured) {
+        captured = false;
+        try {
+          handle.releasePointerCapture(pointerId);
+        } catch {
+          // already released implicitly by pointerup/pointercancel
+        }
+      }
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onEnd);
       window.removeEventListener("pointercancel", onEnd);
+      handle.removeEventListener("lostpointercapture", onEnd);
     };
     // Forward-declared so `cleanup` can reference it without no-use-before-define.
+    // TEAM-4331 (B1): idempotent — lostpointercapture fires AFTER pointerup on a
+    // normal release, so the body must run exactly once per drag (one localStorage
+    // write, and no second write racing the double-click reset).
+    let finished = false;
     function onEnd() {
+      if (finished) return;
+      finished = true;
       cleanup();
       dragCleanupRef.current = null;
-      localStorage.setItem(HISTORY_WIDTH_KEY, String(widthRef.current)); // persist final once
+      // Persist the user's INTENT, not the viewport-clamped render width: a drag
+      // that never moved (the dblclick's zero-movement pointerdown/up) must not
+      // downgrade a stored 600 to a clamped 450. After a real drag the two are
+      // identical, because onMove sets both refs.
+      localStorage.setItem(HISTORY_WIDTH_KEY, String(preferredWidthRef.current));
     }
 
     dragCleanupRef.current = cleanup;
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", onEnd);
     window.addEventListener("pointercancel", onEnd);
+    handle.addEventListener("lostpointercapture", onEnd); // B1: third drag-end path
   }, [applyWidth]);
 
   // Unmount safety net: removes any live drag listeners and restores body styles.
