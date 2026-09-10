@@ -68,6 +68,14 @@ jobs:
       - name: Fix-kinds parity guard
         run: ./scripts/check-fix-kinds-parity.sh
 
+      # TEAM-4337: cd-registry.mjs is byte-copied (never imported) into the
+      # pipeline-tools Lambda and the Telegram bridge, since each ships as a
+      # self-contained zip built from its own dir. A drifted copy is a silent
+      # split-brain — the tools Lambda would resolve a different pipeline/
+      # project set than the orchestrator's agent context promised.
+      - name: CD-registry parity guard
+        run: ./scripts/check-cd-registry-parity.sh
+
       # DL-009: lambda/orchestrator is cascade/dispatch/claim/reaper/completion only.
       # Fails on a module or env var not in scripts/orchestrator-{modules,env}.allow,
       # a stale name on deploy.sh's zip line, or a line-budget overrun.

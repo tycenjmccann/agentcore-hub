@@ -32,6 +32,7 @@ const h = vi.hoisted(() => ({
     children: /** @type {any[]} */ ([]),
     workflow: /** @type {any} */ (null),
     s3Objects: /** @type {Record<string, string>} */ ({}),
+    s3Gets: /** @type {string[]} */ ([]),
     updates: /** @type {any[]} */ ([]),
     events: /** @type {any[]} */ ([]),
     lambdaInvokes: /** @type {any[]} */ ([]),
@@ -93,6 +94,7 @@ vi.mock("@aws-sdk/client-s3", () => ({
   S3Client: class {
     async send(cmd) {
       if (cmd.constructor.name !== "GetObjectCommand") return {};
+      h.state.s3Gets.push(cmd.input.Key); // every attempt, failures included
       const body = h.state.s3Objects[cmd.input.Key];
       if (body === undefined) { const e = new Error("The specified key does not exist."); e.name = "NoSuchKey"; throw e; }
       return { Body: { transformToString: async () => body } };
@@ -232,6 +234,7 @@ beforeEach(() => {
   h.state.completions.length = 0;
   h.state.deliveries.length = 0;
   h.state.githubCalls.length = 0;
+  h.state.s3Gets.length = 0;
   h.state.children = [];
   h.state.workflow = makeWorkflow();
   h.state.tickets = {
@@ -380,6 +383,36 @@ describe("3. intake context — Delivery Mode, roster, gates, Pipeline Mode", ()
     ctx = await buildAgentContext(intakeTicket(), h.state.workflow);
     expect(ctx).toContain("CD_REGISTERED: true");
     delete process.env.CD_REGISTRY_TTL_MS;
+  });
+
+  // r3-F3 (TEAM-4378): parseCdRegistry is TOLERANT, so pre-fix a truncated body
+  // succeeded the try, replaced the last-good registry with an empty one, and
+  // cached "nothing registered" for the TTL — every run in that window finalized
+  // as HANDOFF. Parity with the tools Lambda's §8.8b (TEAM-4358).
+  it("a malformed registry body keeps the last-good copy and stamps the attempt (r3-F3 parity with the tools Lambda)", async () => {
+    process.env.CD_REGISTRY_TTL_MS = "200";
+    const cdGets = () => h.state.s3Gets.filter((k) => k === "config/cd-registry.json").length;
+    try {
+      await load(REGISTERED); // read #1 (handler primes the cache)
+      let ctx = await buildAgentContext(intakeTicket(), h.state.workflow);
+      expect(ctx).toContain("CD_REGISTERED: true"); // still inside the TTL: cache hit
+      expect(cdGets()).toBe(1);
+
+      // Expire the TTL, then serve a truncated document.
+      h.state.s3Objects["config/cd-registry.json"] = '{"version":1,"repos":[{"repo":"acme/ju';
+      await new Promise((r) => setTimeout(r, 250));
+
+      ctx = await buildAgentContext(intakeTicket(), h.state.workflow);
+      expect(ctx).toContain("CD_REGISTERED: true"); // last good kept — the r3-F3 assertion
+      expect(cdGets()).toBe(2); // it really re-read: a retained copy, not a cache hit
+
+      // The failed attempt was stamped, so the next call inside the TTL does NOT re-read.
+      ctx = await buildAgentContext(intakeTicket(), h.state.workflow);
+      expect(ctx).toContain("CD_REGISTERED: true");
+      expect(cdGets()).toBe(2);
+    } finally {
+      delete process.env.CD_REGISTRY_TTL_MS;
+    }
   });
 });
 

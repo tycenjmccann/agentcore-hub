@@ -47,7 +47,32 @@ export const CD_REGISTRY_KEY = "config/cd-registry.json";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const ARTIFACT_BUCKET = process.env.ARTIFACT_BUCKET || "";
-const TTL_MS = 15_000;
+/**
+ * Registry cache TTL. Aligned with every other reader of this document
+ * (requirements §3.1): the orchestrator (lambda/orchestrator/index.mjs) and the
+ * Pipeline___* tools Lambda (lambda/agentcore-hub-pipeline-tools/index.mjs) both
+ * read CD_REGISTRY_TTL_MS with a 60000 default; the deploy-gate bridge
+ * (deploy/telegram-bug-intake/index.mjs) pins the same 60s. The app used 15s —
+ * and the app is the reader whose job is to DESCRIBE what the other three will
+ * do, so a shorter window meant the console could show a registry state the
+ * enforcers had not adopted yet.
+ *
+ * A zero/negative/NaN/Infinity override falls back to 60s instead of through:
+ * same rule as firstNum() in src/lib/workflow/watchdog.ts and resolveTtlMs() in
+ * src/lib/workflow/lease.ts. Here a nonpositive TTL would mean an S3 GET on
+ * every request, and an infinite one would pin a stale registry for the life of
+ * the server process.
+ *
+ * The env is a parameter (defaulting to process.env) purely so the unit test
+ * needs no process.env mutation and no module reset — same shape as
+ * resolveWatchdogFrom() in src/lib/workflow/watchdog.ts.
+ */
+export function resolveRegistryTtlMs(env: Record<string, string | undefined> = process.env): number {
+  const n = Number(env.CD_REGISTRY_TTL_MS);
+  return Number.isFinite(n) && n > 0 ? n : 60_000;
+}
+
+const TTL_MS = resolveRegistryTtlMs();
 let _cache: { registry: CdRegistry; at: number } | null = null;
 
 /** `https://github.com/O/R.git` | `git@github.com:O/R.git` | `O/R` → `o/r`; null if not a repo ref. */
@@ -101,6 +126,43 @@ export function deliveryModeFor(registry: CdRegistry, repoUrl: unknown): Deliver
   return findCdEntry(registry, repoUrl) ? "cd" : "handoff";
 }
 
+export interface PipelineProjects {
+  /** The CodePipeline that deploys the repo (the entry's `pipeline`). */
+  pipeline: string;
+  region: string;
+  ciProject: string;
+  buildProject: string;
+  deployProject: string;
+}
+
+/**
+ * The AWS project names implied by an entry's `pipeline`, by convention:
+ * `hub-<slug>-deploy` → `hub-<slug>-ci` / `hub-<slug>-build` / `hub-<slug>-deploy`
+ * (the hub's own resources keep the `agentcore-hub-*` names: `agentcore-hub-deploy`
+ * → `agentcore-hub-ci` / `agentcore-hub-build`).
+ *
+ * TS mirror of pipelineProjects() in lambda/orchestrator/cd-registry.mjs — same
+ * derivation, so the UI names the same resources the tools Lambda drives. An
+ * explicit `ciProject` on the entry always wins (a repo whose PR-check project
+ * predates the convention). No pipeline → null (that repo has no CD target).
+ */
+export function pipelineProjectsFor(entry: CdRegistryEntry): PipelineProjects | null {
+  const pipeline = (entry.pipeline || "").trim();
+  if (!pipeline) return null;
+  const SUFFIX = "-deploy";
+  const base = pipeline.endsWith(SUFFIX) ? pipeline.slice(0, -SUFFIX.length) : pipeline;
+  return {
+    pipeline,
+    // Definite string: every caller here has to hand it to an AWS client. The
+    // canonical Lambda helper may instead leave an absent region to its caller's
+    // default — the resolved value is the same (AWS_REGION, else us-east-1).
+    region: entry.region || REGION,
+    ciProject: entry.ciProject || `${base}-ci`,
+    buildProject: `${base}-build`,
+    deployProject: pipeline,
+  };
+}
+
 /** Upsert by repo key (returns a new registry). */
 export function upsertCdEntry(registry: CdRegistry, input: Partial<Omit<CdRegistryEntry, "repo">> & { repo: unknown }): CdRegistry {
   const key = normalizeRepoKey(input.repo);
@@ -122,7 +184,17 @@ export function removeCdEntry(registry: CdRegistry, repo: unknown): CdRegistry {
 
 const BUNDLED: CdRegistry = parseCdRegistry(bundled);
 
-/** Live registry from S3 (15s cache); bundled seed when S3 is unreachable or the key is absent. */
+/**
+ * Live registry from S3, cached 60s (env `CD_REGISTRY_TTL_MS`) — the same window
+ * the orchestrator, the Pipeline___* tools Lambda and the deploy-gate bridge use.
+ * `force: true` bypasses the cache, so a UI edit is visible immediately.
+ *
+ *   missing key  → EMPTY registry, cached as such (a fresh install has registered
+ *                  nothing; that IS the registry, not an outage).
+ *   read error   → the LAST GOOD cached copy.
+ *   bundled seed → only on a cold start with no cache (no ARTIFACT_BUCKET, or the
+ *                  process's first read failed).
+ */
 export async function loadCdRegistry(opts: { force?: boolean } = {}): Promise<CdRegistry> {
   const now = Date.now();
   if (!opts.force && _cache && now - _cache.at < TTL_MS) return _cache.registry;

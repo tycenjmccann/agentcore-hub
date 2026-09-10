@@ -1,19 +1,25 @@
 /**
- * CI/CD deploy-approval bridge: the bot polls the AWS-native deploy pipeline
- * (agentcore-hub-deploy) for a ManualApproval action awaiting a decision, pings
- * Telegram with Approve/Reject buttons, and maps the tap back to
+ * CI/CD deploy-approval bridge: the bot polls the AWS-native deploy pipelines
+ * for a ManualApproval action awaiting a decision, pings Telegram with
+ * Approve/Reject buttons, and maps the tap back to
  * codepipeline:PutApprovalResult. The account blocks public Lambda endpoints,
  * so SNS→HTTPS is out — this reuses the review-gate poll pattern.
+ *
+ * Which pipelines it watches (TEAM-4338): every CD-registry entry that names a
+ * pipeline, in that entry's own region, plus the DEPLOY_PIPELINE_NAME fallback.
  *
  * Invariants:
  *  1. A pending approval → exactly one ping per allowlisted chat, with dok/dno
  *     buttons; the claim (dep#<key>) dedupes so a re-scan of the same wait
  *     doesn't re-ping.
  *  2. Approve/Reject tap → one PutApprovalResult with the stashed token and the
- *     right status; the claim row is cleared (one-shot token).
+ *     right status, sent to the claim's OWN region; the claim row is cleared
+ *     (one-shot token).
  *  3. A non-allowlisted chat tapping the button → only an answerCallbackQuery,
  *     never a PutApprovalResult.
- *  4. DEPLOY_PIPELINE_NAME unset → no pipeline calls at all (OSS / no pipeline).
+ *  4. DEPLOY_PIPELINE_NAME *and* ARTIFACT_BUCKET unset → no AWS calls at all
+ *     (OSS / no pipeline): not one GetPipelineState, not one registry read.
+ *  5. One target's failure never costs another target its ping.
  */
 import { describe, it, expect, beforeEach, afterAll, vi } from "vitest";
 
@@ -21,6 +27,12 @@ const TG_TOKEN = "111111:test-bot-token";
 const HUB = "https://hub.example.invalid";
 const PIPELINE = "agentcore-hub-deploy";
 const TOKEN = "approval-token-abcdef-0123456789-way-too-long-for-callback-data-field";
+// A second registered repo's pipeline, in another region (TEAM-4338).
+const WIDGET = "hub-widget-deploy";
+const WIDGET_REPO = "acme/widget";
+const TOKEN2 = "approval-token-widget-9876543210-also-way-too-long-for-callback-data";
+const BUCKET = "test-artifact-bucket";
+const CD_REGISTRY_KEY = "config/cd-registry.json";
 
 // ─── AWS SDK mocks ────────────────────────────────────────────────────────────
 
@@ -56,20 +68,50 @@ vi.mock("@aws-sdk/client-dynamodb", () => {
   };
 });
 
-// cp.state = what GetPipelineState returns; cp.approvals = captured PutApprovalResult;
-// cp.stateError (name) = make GetPipelineState throw; cp.putError (name) = make Put throw.
-const cp = vi.hoisted(() => ({ state: { stageStates: [] }, approvals: [], stateError: null, putError: null }));
+/**
+ * CodePipeline state is keyed BY PIPELINE NAME now, with a `"*"` wildcard entry
+ * that answers for every pipeline — which is what the single-pipeline accessors
+ * (`cp.state = …`, `cp.stateError = …`, `cp.putError = …`) write, so a test that
+ * only cares about "the" pipeline reads exactly as it did before.
+ *   cp.states / cp.stateErrors / cp.putErrors — per-name overrides (Maps).
+ *   cp.approvals     — raw PutApprovalResult inputs (unchanged shape).
+ *   cp.approvalCalls — the same calls tagged with the CLIENT's region, which is
+ *                      how "the right region approved it" is asserted.
+ *   cp.sends / cp.inits — every send / every client construction, for the
+ *                      "nothing configured → no AWS calls" invariant.
+ */
+const cp = vi.hoisted(() => {
+  const s = {
+    states: new Map(), stateErrors: new Map(), putErrors: new Map(),
+    approvals: [], approvalCalls: [], sends: [], inits: [],
+  };
+  for (const [prop, map] of [["state", "states"], ["stateError", "stateErrors"], ["putError", "putErrors"]]) {
+    Object.defineProperty(s, prop, {
+      get: () => s[map].get("*"),
+      set: (v) => { s[map].set("*", v); },
+    });
+  }
+  return s;
+});
+/** A per-name override when present, else the `"*"` wildcard. */
+const pick = (map, name) => (map.has(name) ? map.get(name) : map.get("*"));
+
 vi.mock("@aws-sdk/client-codepipeline", () => {
   const cmd = (op) => class { constructor(input) { this.input = input; this.op = op; } };
   class CodePipelineClient {
+    constructor(cfg) { this.region = cfg?.region; cp.inits.push(cfg?.region); }
     async send(c) {
+      cp.sends.push({ op: c.op, region: this.region, input: c.input });
       if (c.op === "state") {
-        if (cp.stateError) { const e = new Error(cp.stateError); e.name = cp.stateError; throw e; }
-        return cp.state;
+        const err = pick(cp.stateErrors, c.input?.name);
+        if (err) { const e = new Error(err); e.name = err; throw e; }
+        return pick(cp.states, c.input?.name) || { stageStates: [] };
       }
       if (c.op === "put") {
-        if (cp.putError) { const e = new Error(cp.putError); e.name = cp.putError; throw e; }
+        const err = pick(cp.putErrors, c.input?.pipelineName);
+        if (err) { const e = new Error(err); e.name = err; throw e; }
         cp.approvals.push(c.input);
+        cp.approvalCalls.push({ region: this.region, pipelineName: c.input?.pipelineName, input: c.input });
         return {};
       }
       throw new Error(`unexpected cp op ${c.op}`);
@@ -77,6 +119,29 @@ vi.mock("@aws-sdk/client-codepipeline", () => {
   }
   return { CodePipelineClient, GetPipelineStateCommand: cmd("state"), PutApprovalResultCommand: cmd("put") };
 });
+
+// Key-aware S3: the bridge reads exactly ONE key (the CD registry). `registry`
+// null → NoSuchKey, which is also what an install with no registry yet sees.
+// `error` (TEAM-4377) throws it instead — the read failures that are NOT "no
+// document yet" take a different branch in the loader.
+const s3 = vi.hoisted(() => ({ calls: [], inits: [], registry: null, error: null }));
+vi.mock("@aws-sdk/client-s3", () => ({
+  S3Client: class {
+    constructor(cfg) { this.region = cfg?.region; s3.inits.push(cfg?.region); }
+    async send(c) {
+      s3.calls.push(c.input);
+      if (c.input?.Key === CD_REGISTRY_KEY && s3.error) throw s3.error;
+      if (c.input?.Key === CD_REGISTRY_KEY && s3.registry) {
+        const doc = s3.registry;
+        return { Body: { transformToString: async () => (typeof doc === "string" ? doc : JSON.stringify(doc)) } };
+      }
+      const e = new Error("NoSuchKey");
+      e.name = "NoSuchKey";
+      throw e;
+    }
+  },
+  GetObjectCommand: class { constructor(i) { this.input = i; } },
+}));
 
 vi.mock("@aws-sdk/client-transcribe-streaming", () => ({
   StartStreamTranscriptionCommand: class { constructor(i) { this.input = i; } },
@@ -92,9 +157,10 @@ vi.mock("@aws-sdk/client-bedrock-runtime", () => ({
 const jsonRes = (body, ok = true, status = 200) => ({ ok, status, json: async () => body, text: async () => JSON.stringify(body) });
 
 function makeNet(ctx, overrides = {}) {
-  const net = { ctx, polls: 0, batches: [], afterPoll: [], workflows: [], sent: [], answered: [], edited: [], ...overrides };
+  const net = { ctx, polls: 0, batches: [], afterPoll: [], workflows: [], sent: [], answered: [], edited: [], fetched: [], ...overrides };
   net.fetch = async (url, opts) => {
     const u = String(url);
+    net.fetched.push(u);
     // GitHub enrichment for buildDeployBrief — served from net.github when set.
     if (u.startsWith("https://api.github.com/")) {
       if (u.includes("/pulls")) return jsonRes(net.github?.pulls ?? []);
@@ -118,40 +184,75 @@ function makeNet(ctx, overrides = {}) {
 
 function makeCtx(startMs) { return { remainingMs: startMs, getRemainingTimeInMillis() { return this.remainingMs; } }; }
 
+/**
+ * The clock the registry TTL is measured against (TEAM-4377). Fake timers would
+ * break the poll loop's real awaits, and CD_REGISTRY_TTL_MS is a constant in
+ * index.mjs — only Date.now can move. Advance BETWEEN invocations only: each
+ * invocation re-stamps lastGateScan at entry (index.mjs:185), so a skew applied
+ * between two handler calls expires the registry TTL without injecting an extra
+ * in-loop gate scan.
+ */
+const realNow = Date.now.bind(Date);
+let clockSkewMs = 0;
+vi.spyOn(Date, "now").mockImplementation(() => realNow() + clockSkewMs);
+const advanceClock = (ms) => { clockSkewMs += ms; };
+/** Just the CD-registry reads — the bridge's only S3 key. */
+const registryReads = () => s3.calls.filter((c) => c.Key === CD_REGISTRY_KEY);
+/** The pipelines GetPipelineState was called on, in call order. */
+const polled = () => cp.sends.filter((s) => s.op === "state").map((s) => s.input.name);
+
 const ENV = {
   TELEGRAM_BOT_TOKEN: TG_TOKEN,
   JIRA_SITE_URL: "example.atlassian.net", JIRA_EMAIL: "bot@example.com",
   JIRA_API_TOKEN: "tok", JIRA_PROJECT_KEY: "TEST",
   GITHUB_TOKEN: "gh", GITHUB_USER: "test-user",
   PENDING_TABLE: "test-pending-table", HUB_API_URL: HUB,
+  // Pinned so the default-region client (legacy claims, env target) is deterministic.
+  AWS_REGION: "us-east-1",
 };
 
-async function loadHandler({ allowed, pipeline } = {}) {
+async function loadHandler({ allowed, pipeline, bucket, registry } = {}) {
   vi.resetModules();
   Object.assign(process.env, ENV);
   if (allowed == null) delete process.env.ALLOWED_CHAT_IDS; else process.env.ALLOWED_CHAT_IDS = allowed;
   if (pipeline == null) delete process.env.DEPLOY_PIPELINE_NAME; else process.env.DEPLOY_PIPELINE_NAME = pipeline;
+  if (bucket == null) delete process.env.ARTIFACT_BUCKET; else process.env.ARTIFACT_BUCKET = bucket;
+  s3.registry = registry ?? null;
   return (await import("../index.mjs")).handler;
 }
 
 const realFetch = global.fetch;
 beforeEach(() => {
   db.items.clear(); db.puts.length = 0; db.deletes.length = 0;
-  cp.state = { stageStates: [] }; cp.approvals.length = 0; cp.stateError = null; cp.putError = null;
+  cp.states.clear(); cp.stateErrors.clear(); cp.putErrors.clear();
+  cp.approvals.length = 0; cp.approvalCalls.length = 0; cp.sends.length = 0; cp.inits.length = 0;
+  s3.calls.length = 0; s3.inits.length = 0; s3.registry = null; s3.error = null;
+  cp.state = { stageStates: [] }; cp.stateError = null; cp.putError = null;
+  clockSkewMs = 0;
 });
 afterAll(() => {
+  vi.restoreAllMocks();
   global.fetch = realFetch;
-  for (const k of [...Object.keys(ENV), "ALLOWED_CHAT_IDS", "DEPLOY_PIPELINE_NAME"]) delete process.env[k];
+  for (const k of [...Object.keys(ENV), "ALLOWED_CHAT_IDS", "DEPLOY_PIPELINE_NAME", "ARTIFACT_BUCKET"]) delete process.env[k];
 });
 
 const registerChat = (id) => db.items.set(`chat#${id}`, { id: { S: `chat#${id}` }, chatId: { N: String(id) } });
-const pendingState = () => ({
+/**
+ * A pipeline state with one ManualApproval action awaiting a decision. `token`
+ * defaults to TOKEN (so existing no-arg callers are unchanged); a second target
+ * needs its own token, since the claim key is derived from pipeline + token.
+ */
+const pendingState = (token = TOKEN, { revision } = {}) => ({
   stageStates: [
-    { stageName: "Build", actionStates: [{ actionName: "Build", latestExecution: { status: "Succeeded" } }] },
+    { stageName: "Build", actionStates: [{
+      actionName: "Build",
+      latestExecution: { status: "Succeeded" },
+      ...(revision ? { currentRevision: { revisionId: revision } } : {}),
+    }] },
     { stageName: "Approval", actionStates: [{
       actionName: "Approve_deploy",
       entityUrl: "https://github.com/o/r/commits/main",
-      latestExecution: { status: "InProgress", token: TOKEN },
+      latestExecution: { status: "InProgress", token },
     }] },
     { stageName: "Deploy", actionStates: [{ actionName: "Deploy_three_targets", latestExecution: {} }] },
   ],
@@ -160,6 +261,29 @@ const cbUpdate = (updateId, chatId, data) => ({
   update_id: updateId,
   callback_query: { id: `cb-${updateId}`, data, message: { message_id: 9, chat: { id: chatId }, text: "🚀 Deploy approval — agentcore-hub-deploy" } },
 });
+
+/** Two registered pipelines in two regions, plus a DEPLOY.md-mode repo that has
+ * no pipeline and must therefore NOT become a target. */
+const REGISTRY_TWO = {
+  version: 1,
+  repos: [
+    { repo: "test-user/agentcore-hub", pipeline: PIPELINE, region: "us-east-1" },
+    { repo: WIDGET_REPO, pipeline: WIDGET, region: "us-west-2" },
+    { repo: "acme/legacy", deployDoc: "docs/DEPLOY.md" },
+  ],
+};
+
+/** The dok/dno callback_data values on a ping. */
+const btnData = (msg) => msg.reply_markup.inline_keyboard.flat().map((b) => b.callback_data).filter(Boolean);
+/** The dok key on a ping. */
+const dokKey = (msg) => btnData(msg).find((d) => d.startsWith("dok|")).split("|")[1];
+
+/** hashToken() from index.mjs (djb2), copied so the tests pin the KEY SHAPE
+ *  rather than whatever the implementation currently produces. */
+const djb2 = (s) => { let h = 5381; for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0; return (h >>> 0).toString(36); };
+const legacyKey = (token) => `dp${djb2(token)}`;                        // pre-TEAM-4338 shape
+const targetKey = (pipeline, token) => `dp${djb2(`${pipeline} ${token}`)}`;
+const claimIds = () => db.puts.filter((i) => i.id.S.startsWith("dep#")).map((i) => i.id.S);
 
 describe("deploy-approval bridge", () => {
   it("pings allowlisted chat once with dok/dno buttons; re-scan doesn't re-ping", async () => {
@@ -308,5 +432,420 @@ describe("deploy-approval bridge", () => {
     await handler({}, ctx);
     expect(net.sent.length).toBe(0);
     expect(cp.approvals.length).toBe(0);
+  });
+
+  // ─── multi-target off the CD registry (TEAM-4338) ───────────────────────────
+
+  it("two registered pipelines in two regions → two pings, each approved in its own region", async () => {
+    const handler = await loadHandler({ allowed: "555", bucket: BUCKET, registry: REGISTRY_TWO });
+    registerChat(555);
+    cp.states.set(PIPELINE, pendingState(TOKEN));
+    cp.states.set(WIDGET, pendingState(TOKEN2));
+
+    const net = makeNet(makeCtx(100_000), { batches: [[]] });
+    global.fetch = net.fetch;
+    await handler({}, net.ctx);
+
+    expect(net.sent.length, "one ping per registered pipeline").toBe(2);
+    const claims = db.puts.filter((i) => i.id.S.startsWith("dep#"));
+    expect(claims.length).toBe(2);
+    expect(claims.map((c) => c.pipelineName.S).sort()).toEqual([PIPELINE, WIDGET]);
+    expect(claims.map((c) => c.region.S).sort()).toEqual(["us-east-1", "us-west-2"]);
+    // The DEPLOY.md-mode repo has no pipeline, so it was never polled.
+    const polled = cp.sends.filter((s) => s.op === "state").map((s) => s.input.name);
+    expect(polled.sort()).toEqual([PIPELINE, WIDGET]);
+
+    // Tap Approve on both pings; each must be recorded on its own pipeline, by a
+    // client constructed for that pipeline's region.
+    const keys = net.sent.map(dokKey);
+    const net2 = makeNet(makeCtx(100_000), {
+      batches: [keys.map((k, i) => cbUpdate(500 + i, 555, `dok|${k}`))],
+    });
+    global.fetch = net2.fetch;
+    cp.states.clear();
+    await handler({}, net2.ctx);
+
+    expect(cp.approvalCalls.length).toBe(2);
+    const byPipeline = Object.fromEntries(cp.approvalCalls.map((c) => [c.pipelineName, c]));
+    expect(byPipeline[PIPELINE].region).toBe("us-east-1");
+    expect(byPipeline[PIPELINE].input.token).toBe(TOKEN);
+    expect(byPipeline[WIDGET].region).toBe("us-west-2");
+    expect(byPipeline[WIDGET].input.token).toBe(TOKEN2);
+  });
+
+  it("env DEPLOY_PIPELINE_NAME and a registry entry naming it are ONE target", async () => {
+    const handler = await loadHandler({
+      allowed: "555", pipeline: PIPELINE, bucket: BUCKET,
+      registry: { version: 1, repos: [{ repo: "test-user/agentcore-hub", pipeline: PIPELINE, region: "us-east-1" }] },
+    });
+    registerChat(555);
+    cp.state = pendingState();
+
+    const net = makeNet(makeCtx(100_000), { batches: [[]] });
+    global.fetch = net.fetch;
+    await handler({}, net.ctx);
+
+    expect(net.sent.length, "the env fallback must not duplicate a registered pipeline").toBe(1);
+    expect(cp.sends.filter((s) => s.op === "state").length).toBe(1);
+    expect(db.puts.filter((i) => i.id.S.startsWith("dep#")).length).toBe(1);
+  });
+
+  // ─── r3-F2: registry loader failure directions (TEAM-4377) ─────────────────
+  // Mirrors lambda/agentcore-hub-pipeline-tools/index.test.mjs §8.8b: the
+  // registry is a runtime ALLOW-LIST, so "the read failed" must never be allowed
+  // to read as "nothing is registered".
+
+  it("a malformed registry body keeps the last good copy - the widget gate is still watched", async () => {
+    const handler = await loadHandler({
+      allowed: "555", pipeline: PIPELINE, bucket: BUCKET, registry: REGISTRY_TWO,
+    });
+    registerChat(555);
+    cp.states.set(PIPELINE, pendingState(TOKEN));
+    cp.states.set(WIDGET, pendingState(TOKEN2));
+
+    const net = makeNet(makeCtx(100_000), { batches: [[]] });
+    global.fetch = net.fetch;
+    await handler({}, net.ctx);
+    expect(polled().sort(), "both registered pipelines watched on the good read").toEqual(
+      [PIPELINE, WIDGET].sort(),
+    );
+
+    // The object is now truncated mid-write, and the TTL has expired on this same
+    // warm container. Fresh tokens so the claim doesn't dedupe the pings away.
+    s3.registry = "{not json";
+    cp.sends.length = 0;
+    advanceClock(61_000);
+    cp.states.set(PIPELINE, pendingState(`${TOKEN}-2`));
+    cp.states.set(WIDGET, pendingState(`${TOKEN2}-2`));
+
+    const net2 = makeNet(makeCtx(100_000), { batches: [[]] });
+    global.fetch = net2.fetch;
+    await handler({}, net2.ctx);
+
+    expect(polled().sort(), "a bad read must not un-watch a registered gate").toEqual(
+      [PIPELINE, WIDGET].sort(),
+    );
+    // The retained copy keeps the entry's REGION too, not just its name.
+    const widget = cp.sends.find((s) => s.op === "state" && s.input.name === WIDGET);
+    expect(widget.region).toBe("us-west-2");
+    // It really re-read: this is a RETAINED copy, not a TTL cache hit.
+    expect(registryReads(), "TTL expired → a second GetObject").toHaveLength(2);
+    expect(net2.sent.length, "both gates still ping").toBe(2);
+  });
+
+  it("a denied registry read opens the TTL window - one GetObject, not one per scan", async () => {
+    const handler = await loadHandler({ allowed: "555", pipeline: PIPELINE, bucket: BUCKET });
+    // Worded like the real denial, and deliberately NOT matching the
+    // NoSuchKey/NotFound/404 branch — this is an outage, not an empty registry.
+    s3.error = Object.assign(
+      new Error("User: arn:aws:sts::…:assumed-role/x is not authorized to perform: s3:GetObject"),
+      { name: "AccessDenied" },
+    );
+    registerChat(555);
+    cp.state = pendingState();
+
+    const net = makeNet(makeCtx(100_000), { batches: [[]] });
+    global.fetch = net.fetch;
+    await handler({}, net.ctx);
+
+    // Second scan on the same container, well inside the 60s TTL (no clock skew).
+    const net2 = makeNet(makeCtx(100_000), { batches: [[]] });
+    global.fetch = net2.fetch;
+    cp.state = pendingState();
+    await handler({}, net2.ctx);
+
+    expect(registryReads(), "a failed read must still open the TTL window").toHaveLength(1);
+    expect(s3.inits, "one client, reused").toHaveLength(1);
+    // The env fallback target only, both scans — a denial invents no targets.
+    expect(polled()).toEqual([PIPELINE, PIPELINE]);
+  });
+
+  it("a foreign repo's brief is enriched from THAT repo, and the ping names pipeline + repo", async () => {
+    const handler = await loadHandler({
+      allowed: "555", bucket: BUCKET,
+      registry: { version: 1, repos: [{ repo: WIDGET_REPO, pipeline: WIDGET, region: "us-west-2" }] },
+    });
+    registerChat(555);
+    cp.states.set(WIDGET, pendingState(TOKEN2, { revision: "abc1234def567" }));
+
+    const net = makeNet(makeCtx(100_000), {
+      batches: [[]],
+      github: {
+        commit: { commit: { message: "feat(widget): add sprocket cache" }, stats: { additions: 12, deletions: 3 }, files: new Array(2).fill({}) },
+        pulls: [{ number: 7, title: "feat(widget): add sprocket cache", html_url: "https://github.com/acme/widget/pull/7", body: "## Summary\nCaches sprockets between builds." }],
+      },
+    });
+    global.fetch = net.fetch;
+    await handler({}, net.ctx);
+
+    expect(net.sent.length).toBe(1);
+    // The GitHub enrichment hit the REGISTERED repo, not the hub's own.
+    const ghUrls = net.fetched.filter((u) => u.startsWith("https://api.github.com/"));
+    expect(ghUrls.length).toBeGreaterThan(0);
+    for (const u of ghUrls) expect(u.startsWith(`https://api.github.com/repos/${WIDGET_REPO}/`)).toBe(true);
+    expect(ghUrls.some((u) => u.includes("/commits/abc1234def567"))).toBe(true);
+    // …and a human can see WHICH pipeline and WHICH repo they are shipping.
+    expect(net.sent[0].text).toContain(WIDGET);
+    expect(net.sent[0].text).toContain(WIDGET_REPO);
+    expect(net.sent[0].text).toMatch(/Caches sprockets between builds/);
+  });
+
+  it("one target's GetPipelineState failure does not cost the other target its ping", async () => {
+    const handler = await loadHandler({ allowed: "555", bucket: BUCKET, registry: REGISTRY_TWO });
+    registerChat(555);
+    cp.stateErrors.set(PIPELINE, "PipelineNotFoundException");
+    cp.states.set(WIDGET, pendingState(TOKEN2));
+
+    const net = makeNet(makeCtx(100_000), { batches: [[]] });
+    global.fetch = net.fetch;
+    await handler({}, net.ctx);
+
+    expect(net.sent.length, "the healthy pipeline still pings").toBe(1);
+    const claims = db.puts.filter((i) => i.id.S.startsWith("dep#"));
+    expect(claims.map((c) => c.pipelineName.S)).toEqual([WIDGET]);
+  });
+
+  it("a legacy claim row with no region still approves, via the default-region client", async () => {
+    const handler = await loadHandler({ allowed: "555" }); // nothing configured; only the callback matters
+    registerChat(555);
+    // Exactly the item shape written before TEAM-4338: no region, no repo.
+    db.items.set("dep#dplegacy", {
+      id: { S: "dep#dplegacy" },
+      pipelineName: { S: PIPELINE },
+      stageName: { S: "Approval" },
+      actionName: { S: "Approve_deploy" },
+      token: { S: TOKEN },
+    });
+
+    const net = makeNet(makeCtx(100_000), { batches: [[cbUpdate(601, 555, "dok|dplegacy")]] });
+    global.fetch = net.fetch;
+    await handler({}, net.ctx);
+
+    expect(cp.approvalCalls.length).toBe(1);
+    expect(cp.approvalCalls[0].region, "falls back to the region the only pipeline lived in").toBe("us-east-1");
+    expect(cp.approvalCalls[0].input).toMatchObject({ pipelineName: PIPELINE, token: TOKEN });
+    expect(cp.approvalCalls[0].input.result.status).toBe("Approved");
+    expect(db.deletes).toContain("dep#dplegacy");
+  });
+
+  it("nothing configured (no ARTIFACT_BUCKET, no DEPLOY_PIPELINE_NAME) → zero S3 and CodePipeline calls", async () => {
+    const handler = await loadHandler({ allowed: "555" });
+    registerChat(555);
+    cp.state = pendingState();
+    const net = makeNet(makeCtx(100_000), { batches: [[]] });
+    global.fetch = net.fetch;
+    await handler({}, net.ctx);
+
+    expect(s3.calls, "no registry read without a bucket").toEqual([]);
+    expect(cp.sends, "no pipeline call without a target").toEqual([]);
+    // Not even a client: the deploy path is inert on an OSS install.
+    expect(s3.inits).toEqual([]);
+    expect(cp.inits).toEqual([]);
+    expect(net.sent.length).toBe(0);
+  });
+
+  it("callback_data stays dok|/dno| and within 64 bytes for registry targets", async () => {
+    const handler = await loadHandler({ allowed: "555", bucket: BUCKET, registry: REGISTRY_TWO });
+    registerChat(555);
+    cp.states.set(PIPELINE, pendingState(TOKEN));
+    cp.states.set(WIDGET, pendingState(TOKEN2));
+
+    const net = makeNet(makeCtx(100_000), { batches: [[]] });
+    global.fetch = net.fetch;
+    await handler({}, net.ctx);
+
+    expect(net.sent.length).toBe(2);
+    const all = net.sent.flatMap(btnData);
+    expect(all.length).toBe(4);
+    for (const d of all) {
+      expect(d).toMatch(/^d(ok|no)\|dp[0-9a-z]+$/);
+      expect(Buffer.byteLength(d, "utf8"), "Telegram's 64-byte callback_data cap").toBeLessThanOrEqual(64);
+    }
+    // Two targets → two DIFFERENT keys (the pipeline is part of the hash input).
+    expect(new Set(all.map((d) => d.split("|")[1])).size).toBe(2);
+  });
+
+  // ─── F4: registry repo can't steer the GitHub call (TEAM-4347) ────────────
+
+  it.each(["acme/widget?per_page=1", "acme/..", "acme/widget#x", "acme/re po"])(
+    "a registry repo containing metacharacters (%s) never reaches the GitHub API",
+    async (badRepo) => {
+      const handler = await loadHandler({
+        allowed: "555", bucket: BUCKET,
+        registry: { version: 1, repos: [{ repo: badRepo, pipeline: WIDGET, region: "us-west-2" }] },
+      });
+      registerChat(555);
+      cp.states.set(WIDGET, pendingState(TOKEN2, { revision: "abc1234def567" }));
+
+      const net = makeNet(makeCtx(100_000), { batches: [[]] });
+      global.fetch = net.fetch;
+      await handler({}, net.ctx);
+
+      const ghUrls = net.fetched.filter((u) => u.startsWith("https://api.github.com/"));
+      expect(ghUrls, "an unsafe repo must never reach the GitHub API").toEqual([]);
+      expect(net.sent.length, "the approval ping still goes out on the terse path").toBe(1);
+    },
+  );
+
+  it("an unsafe repo skips enrichment but the gate still pings on the terse path", async () => {
+    const badRepo = "acme/widget?per_page=1";
+    const handler = await loadHandler({
+      allowed: "555", bucket: BUCKET,
+      registry: { version: 1, repos: [{ repo: badRepo, pipeline: WIDGET, region: "us-west-2" }] },
+    });
+    registerChat(555);
+    cp.states.set(WIDGET, pendingState(TOKEN2, { revision: "abc1234def567" }));
+
+    const net = makeNet(makeCtx(100_000), { batches: [[]] });
+    global.fetch = net.fetch;
+    await handler({}, net.ctx);
+
+    expect(net.sent.length).toBe(1);
+    const text = net.sent[0].text;
+    expect(text).not.toMatch(/Workflow:/);
+    expect(text).not.toMatch(/Scope:/);
+    expect(text).not.toMatch(/Commit:/);
+    expect(text).toContain(WIDGET);
+  });
+
+  it("a valid registry repo with dots/underscores still enriches from that repo", async () => {
+    const goodRepo = "acme/widget_v2.0";
+    const handler = await loadHandler({
+      allowed: "555", bucket: BUCKET,
+      registry: { version: 1, repos: [{ repo: goodRepo, pipeline: WIDGET, region: "us-west-2" }] },
+    });
+    registerChat(555);
+    cp.states.set(WIDGET, pendingState(TOKEN2, { revision: "abc1234def567" }));
+
+    const net = makeNet(makeCtx(100_000), {
+      batches: [[]],
+      github: {
+        commit: { commit: { message: "feat(widget): bump" }, stats: { additions: 1, deletions: 1 }, files: [{}] },
+        pulls: [{ number: 1, title: "feat(widget): bump", html_url: "https://github.com/acme/widget_v2.0/pull/1", body: "## Summary\nBumps the widget." }],
+      },
+    });
+    global.fetch = net.fetch;
+    await handler({}, net.ctx);
+
+    const ghUrls = net.fetched.filter((u) => u.startsWith("https://api.github.com/"));
+    expect(ghUrls.length).toBeGreaterThan(0);
+    for (const u of ghUrls) expect(u.startsWith(`https://api.github.com/repos/${goodRepo}/`)).toBe(true);
+  });
+
+  it("the env fallback repo (GITHUB_USER/agentcore-hub) is accepted", async () => {
+    const handler = await loadHandler({ allowed: "555", pipeline: PIPELINE });
+    registerChat(555);
+    const st = pendingState();
+    st.stageStates[0].actionStates[0].currentRevision = { revisionId: "abc1234def567" };
+    cp.state = st;
+
+    const net = makeNet(makeCtx(100_000), {
+      batches: [[]],
+      github: {
+        commit: { commit: { message: "chore: bump" }, stats: { additions: 1, deletions: 1 }, files: [{}] },
+        pulls: [],
+      },
+    });
+    global.fetch = net.fetch;
+    await handler({}, net.ctx);
+
+    const ghUrls = net.fetched.filter((u) => u.startsWith("https://api.github.com/"));
+    expect(ghUrls.length).toBeGreaterThan(0);
+    for (const u of ghUrls) expect(u.startsWith("https://api.github.com/repos/test-user/agentcore-hub/")).toBe(true);
+  });
+
+  it("warns once per bad repo, not once per scan", async () => {
+    const badRepo = "acme/widget?x=1";
+    const handler = await loadHandler({
+      allowed: "555", bucket: BUCKET,
+      registry: { version: 1, repos: [{ repo: badRepo, pipeline: WIDGET, region: "us-west-2" }] },
+    });
+    registerChat(555);
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      cp.states.set(WIDGET, pendingState(TOKEN2, { revision: "abc1234def567" }));
+      const net1 = makeNet(makeCtx(100_000), { batches: [[]] });
+      global.fetch = net1.fetch;
+      await handler({}, net1.ctx);
+
+      // Second scan, same wait would be deduped by the claim — use a fresh token
+      // so the ping (and therefore buildDeployBrief) actually runs again.
+      cp.states.set(WIDGET, pendingState("approval-token-widget-second-9999999999-also-way-too-long"));
+      const net2 = makeNet(makeCtx(100_000), { batches: [[]] });
+      global.fetch = net2.fetch;
+      await handler({}, net2.ctx);
+
+      expect(net1.sent.length + net2.sent.length, "both scans still ping").toBe(2);
+      const unsafeWarnings = warnSpy.mock.calls.filter((args) => /unsafe repo/.test(args[0]));
+      expect(unsafeWarnings.length, "warn once per bad repo per container, not once per scan").toBe(1);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  // ─── F5: no double ping across the claim-key upgrade (TEAM-4347) ──────────
+
+  it("an approval claimed under the legacy key shape does not re-ping after the upgrade", async () => {
+    const handler = await loadHandler({ allowed: "555", pipeline: PIPELINE });
+    registerChat(555);
+    db.items.set(`dep#${legacyKey(TOKEN)}`, {
+      id: { S: `dep#${legacyKey(TOKEN)}` },
+      pipelineName: { S: PIPELINE },
+      stageName: { S: "Approval" },
+      actionName: { S: "Approve_deploy" },
+      token: { S: TOKEN },
+    });
+    cp.state = pendingState();
+
+    const net = makeNet(makeCtx(100_000), { batches: [[]] });
+    global.fetch = net.fetch;
+    await handler({}, net.ctx);
+
+    expect(net.sent.length, "already claimed under the legacy key — must not re-ping").toBe(0);
+    expect(claimIds()).toEqual([]);
+  });
+
+  it("the hub registered in the registry still uses the legacy key, so a widget ping is the only one", async () => {
+    const handler = await loadHandler({ allowed: "555", pipeline: PIPELINE, bucket: BUCKET, registry: REGISTRY_TWO });
+    registerChat(555);
+    db.items.set(`dep#${legacyKey(TOKEN)}`, {
+      id: { S: `dep#${legacyKey(TOKEN)}` },
+      pipelineName: { S: PIPELINE },
+      stageName: { S: "Approval" },
+      actionName: { S: "Approve_deploy" },
+      token: { S: TOKEN },
+    });
+    cp.states.set(PIPELINE, pendingState(TOKEN));
+    cp.states.set(WIDGET, pendingState(TOKEN2));
+
+    const net = makeNet(makeCtx(100_000), { batches: [[]] });
+    global.fetch = net.fetch;
+    await handler({}, net.ctx);
+
+    expect(net.sent.length, "only the widget pings — the hub wait was already claimed under the legacy key").toBe(1);
+    expect(claimIds()).toEqual([`dep#${targetKey(WIDGET, TOKEN2)}`]);
+    const widgetClaim = db.puts.find((i) => i.id.S === `dep#${targetKey(WIDGET, TOKEN2)}`);
+    expect(widgetClaim.pipelineName.S).toBe(WIDGET);
+  });
+
+  it("claim keys: legacy shape for the env pipeline, pipeline-scoped for the rest", async () => {
+    const handler = await loadHandler({ allowed: "555", pipeline: PIPELINE, bucket: BUCKET, registry: REGISTRY_TWO });
+    registerChat(555);
+    cp.states.set(PIPELINE, pendingState(TOKEN));
+    cp.states.set(WIDGET, pendingState(TOKEN2));
+
+    const net = makeNet(makeCtx(100_000), { batches: [[]] });
+    global.fetch = net.fetch;
+    await handler({}, net.ctx);
+
+    expect(claimIds().sort()).toEqual(
+      [`dep#${legacyKey(TOKEN)}`, `dep#${targetKey(WIDGET, TOKEN2)}`].sort(),
+    );
+    const all = net.sent.flatMap(btnData);
+    expect(all.length).toBe(4);
+    for (const d of all) {
+      expect(d).toMatch(/^d(ok|no)\|dp[0-9a-z]+$/);
+      expect(Buffer.byteLength(d, "utf8"), "Telegram's 64-byte callback_data cap").toBeLessThanOrEqual(64);
+    }
   });
 });

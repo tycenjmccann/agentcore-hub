@@ -6,6 +6,7 @@ import {
   isCdRegistered,
   stripShipPhases,
   effectiveWorkflowDef,
+  pipelineProjects,
   resolveDelivery,
   deliveryModeContext,
   EMPTY_CD_REGISTRY,
@@ -106,26 +107,74 @@ describe("stripShipPhases / effectiveWorkflowDef", () => {
   });
 });
 
+describe("pipelineProjects", () => {
+  it("derives ci/build/deploy from a -deploy pipeline name (the hub itself)", () => {
+    expect(pipelineProjects({ pipeline: "agentcore-hub-deploy" })).toEqual({
+      pipeline: "agentcore-hub-deploy",
+      region: null,
+      ciProject: "agentcore-hub-ci",
+      buildProject: "agentcore-hub-build",
+      deployProject: "agentcore-hub-deploy",
+    });
+  });
+  it("derives from a hub-<slug>-deploy pipeline name and carries the region", () => {
+    expect(pipelineProjects({ pipeline: "hub-foo-deploy", region: "us-west-2" })).toEqual({
+      pipeline: "hub-foo-deploy",
+      region: "us-west-2",
+      ciProject: "hub-foo-ci",
+      buildProject: "hub-foo-build",
+      deployProject: "hub-foo-deploy",
+    });
+  });
+  it("an explicit entry.ciProject overrides the derived name; build/deploy stay derived", () => {
+    const p = pipelineProjects({ pipeline: "hub-foo-deploy", ciProject: "custom-checks" });
+    expect(p.ciProject).toBe("custom-checks");
+    expect(p.buildProject).toBe("hub-foo-build");
+    expect(p.deployProject).toBe("hub-foo-deploy");
+  });
+  it("a pipeline name not ending in -deploy uses the whole name as the base", () => {
+    expect(pipelineProjects({ pipeline: "hub-foo-pipeline" })).toEqual({
+      pipeline: "hub-foo-pipeline",
+      region: null,
+      ciProject: "hub-foo-pipeline-ci",
+      buildProject: "hub-foo-pipeline-build",
+      deployProject: "hub-foo-pipeline",
+    });
+  });
+  it("no pipeline → null", () => {
+    expect(pipelineProjects({})).toBeNull();
+    expect(pipelineProjects({ deployDoc: "DEPLOY.md" })).toBeNull();
+    expect(pipelineProjects(undefined)).toBeNull();
+  });
+});
+
 describe("resolveDelivery", () => {
   it("unregistered → handoff, never pipeline mode", () => {
     expect(resolveDelivery(REG, JUNO, { pipelineEnabled: true })).toEqual({
       mode: "handoff", entry: null, pipelineMode: false, pipeline: null, region: null,
+      ciProject: null, buildProject: null, deployProject: null,
     });
   });
-  it("registered with a pipeline → cd; pipeline mode only when PIPELINE_ENABLED is on", () => {
+  it("registered with a pipeline → cd; pipeline mode only when PIPELINE_ENABLED is on; spreads the derived projects", () => {
     const on = resolveDelivery(REG, HUB, { pipelineEnabled: true });
     expect(on.mode).toBe("cd");
     expect(on.pipelineMode).toBe(true);
     expect(on.pipeline).toBe("agentcore-hub-deploy");
     expect(on.region).toBe("us-east-1");
+    expect(on.ciProject).toBe("agentcore-hub-ci");
+    expect(on.buildProject).toBe("agentcore-hub-build");
+    expect(on.deployProject).toBe("agentcore-hub-deploy");
     expect(resolveDelivery(REG, HUB, { pipelineEnabled: false }).pipelineMode).toBe(false);
   });
-  it("registered WITHOUT a pipeline → cd via DEPLOY.md (legacy), never pipeline mode", () => {
+  it("registered WITHOUT a pipeline → cd via DEPLOY.md (legacy), never pipeline mode, no derived projects", () => {
     const reg = parseCdRegistry({ repos: [{ repo: "o/r", deployDoc: "docs/DEPLOY.md" }] });
     const d = resolveDelivery(reg, { repos: [{ url: "https://github.com/o/r" }] }, { pipelineEnabled: true });
     expect(d.mode).toBe("cd");
     expect(d.pipelineMode).toBe(false);
     expect(d.pipeline).toBeNull();
+    expect(d.ciProject).toBeNull();
+    expect(d.buildProject).toBeNull();
+    expect(d.deployProject).toBeNull();
     expect(d.entry.deployDoc).toBe("docs/DEPLOY.md");
   });
 });

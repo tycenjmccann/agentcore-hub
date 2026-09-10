@@ -10,10 +10,31 @@
  *
  * CI_PROJECT must name a PR-check project with no deploy permissions. Enabling
  * PIPELINE_CI_START_BUILD grants agent-triggerable CI execution: the role gets
- * codebuild:StartBuild on THAT ONE project ARN and nothing else, and the name is
- * validated (validateCiProjectName, below) before any AWS call — a wildcard, or a
- * name that collides with the build/deploy/runtime-image project or the pipeline,
- * aborts the deploy rather than handing an agent a way to start a deploy.
+ * codebuild:StartBuild on THAT ONE project ARN plus the hub-*-ci convention
+ * wildcard and nothing else, and the name is validated (validateCiProjectName,
+ * below) before any AWS call — a wildcard, or a name that collides with the
+ * build/deploy/runtime-image project or the pipeline, aborts the deploy rather
+ * than handing an agent a way to start a deploy.
+ *
+ * ─── The hub-* naming convention (TEAM-4337) ──────────────────────────────────
+ * The Lambda can now drive MORE than the hub's own pipeline: it reads the CD
+ * registry (config/cd-registry.json in the artifact bucket) at runtime and
+ * resolves a per-repo target from it. IAM is widened ONCE, by CONVENTION, so
+ * registering a repo needs no IAM change and no redeploy:
+ *
+ *   CodePipeline      hub-<slug>-deploy
+ *   CodeBuild         hub-<slug>-ci  /  hub-<slug>-build  /  hub-<slug>-deploy
+ *   CloudWatch Logs   /aws/codebuild/hub-<slug>-*
+ *
+ * `hub-` is therefore a RESERVED prefix: anything named hub-* in a
+ * PIPELINE_REGIONS region is readable and triggerable by this role. The hub's own
+ * resources keep the agentcore-hub-* prefix and stay pinned as exact ARNs.
+ *
+ * The wildcard is suffix-scoped per action class, which is the whole safety
+ * argument: codebuild:StartBuild gets ONLY project/hub-*-ci, never project/hub-*
+ * and never hub-*-deploy. There is still NO codepipeline:PutApprovalResult —
+ * widening the allow-list can only add a pipeline to READ and TRIGGER, never an
+ * approval path.
  *
  * Idempotent / re-runnable. Account-guarded via deploy/config.sh conventions.
  *
@@ -31,6 +52,10 @@
  *                   Anything else — including unset — omits the grant entirely.
  *   DEPLOY_PROJECT  default agentcore-hub-deploy   (the Deploy stage's CodeBuild
  *                   project — same NAME as the pipeline, different resource kind)
+ *   PIPELINE_REGIONS  comma list of regions holding hub-*-deploy pipelines.
+ *                   Default: AWS_REGION alone. The list is taken LITERALLY — set
+ *                   it to every region you register repos in, the Lambda's own
+ *                   region included, or those repos get AccessDenied.
  *   AWS_REGION      default us-east-1
  */
 
@@ -96,11 +121,29 @@ export function validateCiProjectName(name, opts = {}) {
   return { ok: true, reason: null };
 }
 
+/**
+ * Normalize a PIPELINE_REGIONS comma list: trim, drop empties, dedupe, keep the
+ * operator's order. Empty/absent → [fallback] (the Lambda's own region).
+ *
+ * Exported because both the policy builder and the function's env var must agree
+ * on the SAME list — a mismatch would grant one region and route to another.
+ */
+export function parsePipelineRegions(value, fallback) {
+  const seen = new Set();
+  for (const part of String(value ?? "").split(",")) {
+    const region = part.trim();
+    if (region) seen.add(region);
+  }
+  if (seen.size === 0 && fallback) seen.add(fallback);
+  return [...seen];
+}
+
 /** Env → the values this script deploys with. Defaults live here so the policy
  * builder and main() can never disagree about them. */
 export function resolveEnv(env = process.env) {
+  const REGION = env.AWS_REGION || "us-east-1";
   return {
-    REGION: env.AWS_REGION || "us-east-1",
+    REGION,
     PIPELINE_NAME: env.PIPELINE_NAME || "agentcore-hub-deploy",
     BUILD_PROJECT: env.BUILD_PROJECT || "agentcore-hub-build",
     CI_PROJECT: env.CI_PROJECT || "agentcore-hub-ci",
@@ -109,9 +152,14 @@ export function resolveEnv(env = process.env) {
     // constants distinct; do not collapse them.
     DEPLOY_PROJECT: env.DEPLOY_PROJECT || "agentcore-hub-deploy",
     PIPELINE_CI_START_BUILD: env.PIPELINE_CI_START_BUILD === "1" ? "1" : "0",
-    // Where the Deploy stage records its infra handoff list (get_state reports
-    // it as `handoff`). Same convention as deploy/config.sh; ACCOUNT is only
-    // known at deploy time, so buildInlinePolicy derives the ARN from it.
+    // Every region holding a hub-*-deploy pipeline this role may read + trigger.
+    // Normalized to a comma string so the same value can go straight onto the
+    // function as an env var; buildInlinePolicy re-parses it.
+    PIPELINE_REGIONS: parsePipelineRegions(env.PIPELINE_REGIONS, REGION).join(","),
+    // Both the registry source (config/cd-registry.json) and where the Deploy
+    // stage records its infra handoff list (get_state reports it as `handoff`).
+    // Same convention as deploy/config.sh; ACCOUNT is only known at deploy time,
+    // so buildInlinePolicy derives the ARN from it.
     ARTIFACT_BUCKET: env.ARTIFACT_BUCKET || "",
   };
 }
@@ -146,6 +194,24 @@ export function buildInlinePolicy(env) {
   const ciArn = `arn:aws:codebuild:${REGION}:${ACCOUNT}:project/${CI_PROJECT}`;
   const deployArn = `arn:aws:codebuild:${REGION}:${ACCOUNT}:project/${DEPLOY_PROJECT}`;
 
+  // ─── the hub-* convention wildcards, one set per PIPELINE_REGIONS region ─────
+  // Registering a repo in the CD registry must not require an IAM edit, so the
+  // grant is by NAME CONVENTION. Each wildcard is suffix-scoped to the narrowest
+  // form that action class needs:
+  //   read + trigger  hub-*-deploy      (pipelines)
+  //   read            project/hub-*     (ci + build + deploy projects)
+  //   StartBuild      project/hub-*-ci  ONLY - see the CiStartBuild statement
+  const REGIONS = parsePipelineRegions(env.PIPELINE_REGIONS, REGION);
+  const hubPipelineArns = REGIONS.map((r) => `arn:aws:codepipeline:${r}:${ACCOUNT}:hub-*-deploy`);
+  const hubProjectArns = REGIONS.map((r) => `arn:aws:codebuild:${r}:${ACCOUNT}:project/hub-*`);
+  const hubCiArns = REGIONS.map((r) => `arn:aws:codebuild:${r}:${ACCOUNT}:project/hub-*-ci`);
+  // Both forms, matching the exact-name log statement below: the group itself and
+  // its streams.
+  const hubLogArns = REGIONS.flatMap((r) => [
+    `arn:aws:logs:${r}:${ACCOUNT}:log-group:/aws/codebuild/hub-*`,
+    `arn:aws:logs:${r}:${ACCOUNT}:log-group:/aws/codebuild/hub-*:*`,
+  ]);
+
   const ciStartBuild = PIPELINE_CI_START_BUILD === "1";
   if (ciStartBuild) {
     const check = validateCiProjectName(CI_PROJECT, {
@@ -170,8 +236,11 @@ export function buildInlinePolicy(env) {
         Resource: "*",
       },
       {
-        // Read + trigger only. NO codepipeline:PutApprovalResult — the deploy gate
-        // is a human decision (Telegram bridge). Do not add it here.
+        // Read + trigger only, on the hub's own pipeline and on every registered
+        // hub-*-deploy pipeline. NO codepipeline:PutApprovalResult — the deploy
+        // gate is a human decision (Telegram bridge). Do not add it here, and note
+        // that widening this Resource list can only ever add a pipeline to read
+        // and trigger, never an approval path.
         Sid: "PipelineReadAndTrigger",
         Effect: "Allow",
         Action: [
@@ -182,27 +251,33 @@ export function buildInlinePolicy(env) {
           "codepipeline:GetPipelineExecution",
           "codepipeline:StartPipelineExecution",
         ],
-        Resource: pipelineArn,
+        Resource: [pipelineArn, ...hubPipelineArns],
       },
       {
         // Read-only build visibility, incl. the Deploy stage's own CodeBuild
         // project (agentcore-hub-deploy) so get_build_log can read the intentional
-        // exit-2 "HANDOFF" signal. Still NO approval/write action of any kind.
+        // exit-2 "HANDOFF" signal. project/hub-* covers a registered repo's ci,
+        // build AND deploy projects — reading a deploy build's log is how the CI
+        // agent sees why a deploy failed. Still NO approval/write action of any
+        // kind.
         Sid: "BuildRead",
         Effect: "Allow",
         Action: ["codebuild:BatchGetBuilds", "codebuild:ListBuildsForProject"],
-        Resource: [buildArn, ciArn, deployArn],
+        Resource: [buildArn, ciArn, deployArn, ...hubProjectArns],
       },
       // The ONLY write this role ever gets, and only when asked for: StartBuild on
-      // the validated PR-check project ARN — never the build, deploy or
-      // runtime-image project, never a wildcard.
+      // the validated PR-check project ARN plus project/hub-*-ci — never the
+      // build, deploy or runtime-image project. hub-*-ci is the ONE wildcard
+      // permitted in a StartBuild grant anywhere in this repo; project/hub-* and
+      // hub-*-deploy must never appear in this statement, because that would hand
+      // an agent a way to start a deploy directly and bypass the human gate.
       ...(ciStartBuild
         ? [
             {
               Sid: "CiStartBuild",
               Effect: "Allow",
               Action: ["codebuild:StartBuild"],
-              Resource: [ciArn],
+              Resource: [ciArn, ...hubCiArns],
             },
           ]
         : []),
@@ -218,6 +293,19 @@ export function buildInlinePolicy(env) {
             },
           ]
         : []),
+      // The CD registry — which repos this deployment may merge + deploy. ONE
+      // exact key, not a prefix: the rest of config/ holds the agent roster and
+      // workflow definitions, which this role has no business reading.
+      ...(artifactBucket
+        ? [
+            {
+              Sid: "CdRegistryRead",
+              Effect: "Allow",
+              Action: ["s3:GetObject"],
+              Resource: [`arn:aws:s3:::${artifactBucket}/config/cd-registry.json`],
+            },
+          ]
+        : []),
       {
         Sid: "BuildLogRead",
         Effect: "Allow",
@@ -226,6 +314,7 @@ export function buildInlinePolicy(env) {
           `arn:aws:logs:${REGION}:${ACCOUNT}:log-group:/aws/codebuild/${BUILD_PROJECT}:*`,
           `arn:aws:logs:${REGION}:${ACCOUNT}:log-group:/aws/codebuild/${CI_PROJECT}:*`,
           `arn:aws:logs:${REGION}:${ACCOUNT}:log-group:/aws/codebuild/${DEPLOY_PROJECT}:*`,
+          ...hubLogArns,
         ],
       },
     ],
@@ -241,6 +330,7 @@ async function main() {
     CI_PROJECT,
     DEPLOY_PROJECT,
     PIPELINE_CI_START_BUILD,
+    PIPELINE_REGIONS,
     ARTIFACT_BUCKET,
   } = cfg;
 
@@ -272,6 +362,7 @@ async function main() {
   console.log(`Account:  ${ACCOUNT}`);
   console.log(`Region:   ${REGION}`);
   console.log(`Pipeline: ${PIPELINE_NAME}`);
+  console.log(`hub-*:    read + trigger in ${PIPELINE_REGIONS} (CD-registry targets)`);
   console.log(
     `CI build: ${
       PIPELINE_CI_START_BUILD === "1"
@@ -280,7 +371,8 @@ async function main() {
     }`
   );
 
-  // ─── 1. IAM role (scoped to exactly this pipeline + its three CodeBuild projects) ─
+  // ─── 1. IAM role (this pipeline + its three CodeBuild projects, exact ARNs, ──
+  //        plus the hub-* convention wildcards per PIPELINE_REGIONS) ────────────
   const inlinePolicy = buildInlinePolicy({ ...cfg, ACCOUNT });
 
   let roleArn;
@@ -321,7 +413,12 @@ async function main() {
   const srcDir = join(__dirname, "..", "lambda", FUNCTION_NAME);
   const zipPath = join(srcDir, "function.zip");
   rmSync(zipPath, { force: true });
-  execSync(`cd "${srcDir}" && zip -qr function.zip index.mjs`, { stdio: "inherit" });
+  // cd-registry.mjs is a BYTE COPY of lambda/orchestrator/cd-registry.mjs
+  // (scripts/check-cd-registry-parity.sh pins them identical) and index.mjs
+  // imports it, so the zip must carry both files or the Lambda fails to load.
+  execSync(`cd "${srcDir}" && zip -qr function.zip index.mjs cd-registry.mjs`, {
+    stdio: "inherit",
+  });
   const zipBuffer = readFileSync(zipPath);
 
   const envVars = {
@@ -330,14 +427,21 @@ async function main() {
     CI_PROJECT,
     DEPLOY_PROJECT,
     PIPELINE_CI_START_BUILD,
+    PIPELINE_REGIONS,
     ARTIFACT_BUCKET: ARTIFACT_BUCKET || `agentcore-hub-artifacts-${ACCOUNT}-${REGION}`,
   };
 
   // ─── 3. Create/update the function ───────────────────────────────────────────
   let exists = false;
+  let existingEnv = {};
   try {
-    await lambda.send(new GetFunctionCommand({ FunctionName: FUNCTION_NAME }));
+    const got = await lambda.send(new GetFunctionCommand({ FunctionName: FUNCTION_NAME }));
     exists = true;
+    // UpdateFunctionConfiguration REPLACES the whole Variables map, so an
+    // operator-set var this script does not know about (CD_REGISTRY_TTL_MS,
+    // PIPELINE_REPO) would be silently dropped. Merge, with this script's values
+    // winning for the keys it owns.
+    existingEnv = got.Configuration?.Environment?.Variables || {};
   } catch {
     /* not found */
   }
@@ -351,7 +455,7 @@ async function main() {
     await lambda.send(
       new UpdateFunctionConfigurationCommand({
         FunctionName: FUNCTION_NAME,
-        Environment: { Variables: envVars },
+        Environment: { Variables: { ...existingEnv, ...envVars } },
         Timeout: 60,
         MemorySize: 256,
       })

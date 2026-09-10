@@ -64,6 +64,8 @@ import { BedrockRuntimeClient, ConverseCommand } from "@aws-sdk/client-bedrock-r
 import { DynamoDBClient, GetItemCommand, PutItemCommand, DeleteItemCommand, ScanCommand } from "@aws-sdk/client-dynamodb";
 import { TranscribeStreamingClient, StartStreamTranscriptionCommand } from "@aws-sdk/client-transcribe-streaming";
 import { CodePipelineClient, GetPipelineStateCommand, PutApprovalResultCommand } from "@aws-sdk/client-codepipeline";
+import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
+import { parseCdRegistry, pipelineProjects } from "./cd-registry.mjs";
 
 const TELEGRAM_BOT_TOKEN = requireEnv("TELEGRAM_BOT_TOKEN");
 const ALLOWED_CHAT_IDS   = (process.env.ALLOWED_CHAT_IDS || "").split(",").map((s) => s.trim()).filter(Boolean);
@@ -81,7 +83,18 @@ const PENDING_TABLE = requireEnv("PENDING_TABLE");
 const HUB_API_URL = requireEnv("HUB_API_URL"); // e.g. https://ag-....ecs.us-east-1.on.aws
 // Optional: the CI/CD deploy pipeline whose ManualApproval gate this bot bridges
 // to Telegram. Unset (OSS / accounts without the pipeline) = no deploy pings.
+// With ARTIFACT_BUCKET set this is only the FALLBACK target — the CD registry
+// names the rest (see "CD registry deploy targets" below).
 const DEPLOY_PIPELINE_NAME = process.env.DEPLOY_PIPELINE_NAME || "";
+// Optional: the artifact bucket holding config/cd-registry.json, the list of
+// repos the hub may merge + deploy. Set → the deploy-approval bridge watches
+// EVERY registered repo's pipeline, in that repo's region. Unset → the single
+// DEPLOY_PIPELINE_NAME target only, exactly as before.
+const ARTIFACT_BUCKET = process.env.ARTIFACT_BUCKET || "";
+// The region every legacy client used implicitly (AWS_REGION is always set in
+// Lambda). Registry entries carry their own region; this is the fallback for
+// the env target, the registry read and pre-multi-target claim rows.
+const DEFAULT_REGION = process.env.AWS_REGION || "us-east-1";
 const MODEL_ID = process.env.BEDROCK_MODEL_ID || "us.anthropic.claude-sonnet-5";
 const CONFIDENCE_THRESHOLD = parseFloat(process.env.CONFIDENCE_THRESHOLD || "0.75");
 const TRANSCRIBE_LANGUAGE = process.env.TRANSCRIBE_LANGUAGE || "en-US";
@@ -119,7 +132,31 @@ const OFFSET_KEY = "tg#offset";
 const bedrock = new BedrockRuntimeClient({});
 const ddb = new DynamoDBClient({});
 const transcribe = new TranscribeStreamingClient({});
-const codepipeline = new CodePipelineClient({});
+
+// CodePipeline is per-REGION now (a registered repo's pipeline can live
+// anywhere), memoized so a warm container builds each client once. There is
+// deliberately no module-level default instance: with nothing configured the
+// deploy-approval path must construct no client at all.
+const _cpByRegion = new Map();
+function codepipelineFor(region) {
+  const key = region || DEFAULT_REGION;
+  let client = _cpByRegion.get(key);
+  if (!client) {
+    client = new CodePipelineClient({ region: key });
+    _cpByRegion.set(key, client);
+  }
+  return client;
+}
+
+// S3 is only ever used to read the CD registry, which lives in the ONE artifact
+// bucket in this Lambda's own region — so one lazy client, not one per region.
+// Lazy on purpose: unconfigured installs (and the sibling test suites, which
+// mock only the four SDK packages the intake paths use) never construct it.
+let _s3 = null;
+function s3Client() {
+  if (!_s3) _s3 = new S3Client({ region: DEFAULT_REGION });
+  return _s3;
+}
 
 // ─── Entry: poll loop ────────────────────────────────────────────────────────
 
@@ -1125,28 +1162,148 @@ async function scanAllPages(input) {
 }
 
 // ─── CI/CD deploy approval bridge ────────────────────────────────────────────
-// The AWS-native deploy pipeline (agentcore-hub-deploy) pauses on a
-// ManualApproval action — the irreversible production act. The account blocks
-// public Lambda endpoints, so an SNS→HTTPS subscription is out; instead this
-// poller reuses the review-gate pattern: it polls the pipeline state for an
-// approval action stuck "in progress", pings Telegram with Approve / Reject
-// buttons, and maps the tap back to codepipeline:PutApprovalResult. The claim
-// key (dep#<token>) both dedupes the ping and carries the token the button
-// callback needs (callback_data can't hold the full token). Unset
-// DEPLOY_PIPELINE_NAME (OSS / no pipeline) makes this a no-op.
+// A hub-managed deploy pipeline pauses on a ManualApproval action — the
+// irreversible production act. The account blocks public Lambda endpoints, so an
+// SNS→HTTPS subscription is out; instead this poller reuses the review-gate
+// pattern: it polls each pipeline's state for an approval action stuck "in
+// progress", pings Telegram with Approve / Reject buttons, and maps the tap back
+// to codepipeline:PutApprovalResult. The claim key (dep#<hash>) both dedupes the
+// ping and carries the token the button callback needs (callback_data can't hold
+// the full token).
+//
+// TARGETS (TEAM-4338): every repo in the CD registry that names a pipeline, in
+// that repo's own region, PLUS the DEPLOY_PIPELINE_NAME fallback. Both
+// ARTIFACT_BUCKET and DEPLOY_PIPELINE_NAME unset (OSS / no pipeline) makes this
+// a total no-op — not one AWS call.
 
 const DEPLOY_KEY_PREFIX = "dep#";
 
-async function scanDeployApprovals() {
-  if (!DEPLOY_PIPELINE_NAME) return;
+// ─── CD registry deploy targets ──────────────────────────────────────────────
+// The same document the orchestrator and the Pipeline___* tools Lambda read
+// (lambda/orchestrator/index.mjs loadCdRegistry), with the same TTL cache and
+// the same failure directions. Registry write access equals deploy-trigger
+// authority, which is exactly why this bridge — the only holder of
+// PutApprovalResult — reads the SAME allow-list rather than its own list.
 
+const CD_REGISTRY_KEY = "config/cd-registry.json";
+const CD_REGISTRY_TTL_MS = 60_000;
+// Sanity bound on the fan-out: each target costs a GetPipelineState per 60s
+// scan, and a runaway registry must not eat the poll loop's budget.
+const MAX_DEPLOY_TARGETS = 25;
+
+let _registry = { version: 1, repos: [] };
+let _registryLoadedAt = 0;
+
+/**
+ * The CD registry, cached for CD_REGISTRY_TTL_MS per warm container. Every
+ * failure is non-fatal — a registry problem must never stop deploy pings:
+ *   no ARTIFACT_BUCKET → the empty registry, with NO S3 command constructed.
+ *   NoSuchKey / 404    → empty registry (nothing registered yet).
+ *   MALFORMED body     → the LAST GOOD copy (TEAM-4377): the tolerant parser
+ *                        would turn it into an EMPTY registry and un-watch every
+ *                        registered gate for a whole TTL.
+ *   any other error    → the LAST GOOD copy, so a transient S3 error cannot
+ *                        silently stop watching a live pipeline mid-deploy.
+ * Every path that ATTEMPTED a read opens the TTL window, failures included.
+ */
+async function loadDeployRegistry() {
+  if (!ARTIFACT_BUCKET) return _registry;
+  const now = Date.now();
+  if (_registryLoadedAt && now - _registryLoadedAt < CD_REGISTRY_TTL_MS) return _registry;
+  try {
+    const res = await s3Client().send(
+      new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: CD_REGISTRY_KEY }),
+    );
+    // JSON.parse HERE rather than letting parseCdRegistry do it (TEAM-4377,
+    // mirroring lambda/agentcore-hub-pipeline-tools/index.mjs loadRegistry from
+    // TEAM-4358). parseCdRegistry is tolerant BY DESIGN — a malformed document
+    // becomes an EMPTY registry — and assigning that would DISCARD the last good
+    // copy and cache "nothing registered" for the whole TTL: one truncated S3
+    // read stops watching every registered pipeline's deploy gate. Parsing first
+    // turns a malformed body into a SyntaxError the catch treats like any other
+    // read failure. parseCdRegistry takes the already-parsed object
+    // (cd-registry.mjs:52-56), so tolerant per-ENTRY handling is unchanged.
+    const doc = JSON.parse(await res.Body.transformToString());
+    _registry = parseCdRegistry(doc);
+    if (!_registryLoadedAt) {
+      console.log(`[telegram-bug-intake] CD registry: ${_registry.repos.length} repo(s) registered`);
+    }
+  } catch (err) {
+    if (/NoSuchKey|NotFound|404/i.test(String(err?.name || err?.message))) {
+      _registry = { version: 1, repos: [] };
+    } else {
+      console.warn(`[telegram-bug-intake] CD registry read failed: ${err.message} — keeping ${_registryLoadedAt ? "last good copy" : "empty registry"}`);
+    }
+  }
+  // Stamped on EVERY path that attempted a read, failures included (TEAM-4377),
+  // same as the orchestrator (lambda/orchestrator/index.mjs:259) and the tools
+  // Lambda. Without it a persistent AccessDenied or network fault meant an S3
+  // GetObject on every 60s scan for the life of the container.
+  _registryLoadedAt = now;
+  return _registry;
+}
+
+/**
+ * Every pipeline whose deploy gate this bridge watches:
+ * `[{ pipeline, region, repo }]` — one per registry entry that names a pipeline
+ * (expanded by the shared pipelineProjects(), never by re-deriving names here),
+ * then the DEPLOY_PIPELINE_NAME fallback unless the registry already named it.
+ * Registry order is preserved so the output is deterministic.
+ */
+async function loadDeployTargets() {
+  const registry = await loadDeployRegistry();
+  const targets = [];
+  const seen = new Set();
+  for (const entry of registry?.repos || []) {
+    const projects = pipelineProjects(entry);
+    // No pipeline → a DEPLOY.md-mode CD repo: nothing here has a gate to watch.
+    if (!projects || seen.has(projects.pipeline)) continue;
+    seen.add(projects.pipeline);
+    targets.push({
+      pipeline: projects.pipeline,
+      region: projects.region || DEFAULT_REGION,
+      repo: entry.repo || null,
+    });
+  }
+  if (DEPLOY_PIPELINE_NAME && !seen.has(DEPLOY_PIPELINE_NAME)) {
+    targets.push({
+      pipeline: DEPLOY_PIPELINE_NAME,
+      region: DEFAULT_REGION,
+      repo: `${GITHUB_USER}/agentcore-hub`,
+    });
+  }
+  if (targets.length > MAX_DEPLOY_TARGETS) {
+    console.warn(`[telegram-bug-intake] ${targets.length} deploy targets — watching the first ${MAX_DEPLOY_TARGETS}`);
+    return targets.slice(0, MAX_DEPLOY_TARGETS);
+  }
+  return targets;
+}
+
+async function scanDeployApprovals() {
+  const targets = await loadDeployTargets();
+  if (!targets.length) return;
+  // One target's problem is that target's problem: a torn-down pipeline, a
+  // GitHub hiccup or a failed ping must not stop the OTHER repos' deploy gates
+  // from being surfaced this scan.
+  for (const target of targets) {
+    try {
+      await scanDeployApprovalsForTarget(target);
+    } catch (err) {
+      console.error(`[telegram-bug-intake] deploy approval scan ${target.pipeline}`, err);
+    }
+  }
+}
+
+async function scanDeployApprovalsForTarget(target) {
   let state;
   try {
-    state = await codepipeline.send(new GetPipelineStateCommand({ name: DEPLOY_PIPELINE_NAME }));
+    state = await codepipelineFor(target.region).send(
+      new GetPipelineStateCommand({ name: target.pipeline }),
+    );
   } catch (err) {
-    // A missing pipeline (wrong account, torn down) must not spam the log every
-    // 60s — warn once-ish and bail. Any other error propagates to the caller's
-    // try/catch, which already logs and continues the poll loop.
+    // A missing pipeline (wrong account, torn down, registry typo) must not spam
+    // the log every 60s — bail quietly. Any other error propagates to the
+    // per-target catch, which logs it and moves on to the next target.
     if (err.name === "PipelineNotFoundException") return;
     throw err;
   }
@@ -1176,9 +1333,9 @@ async function scanDeployApprovals() {
   }
   if (!pending) return;
 
-  // Claim on the token: a new pipeline execution mints a fresh token, so this
-  // naturally re-pings each run while never double-pinging the same wait.
-  const claimed = await claimDeployApproval(pending);
+  // Claim on the pipeline + token: a new pipeline execution mints a fresh token,
+  // so this naturally re-pings each run while never double-pinging the same wait.
+  const claimed = await claimDeployApproval(pending, target);
   if (!claimed) return;
 
   try {
@@ -1192,7 +1349,7 @@ async function scanDeployApprovals() {
     // Enrich the ping with what's actually shipping: the commit subject, the PR
     // (title + workflow/epic + one-line summary from the body), and the file
     // scope. Best-effort — a GitHub hiccup falls back to the terse message.
-    const brief = await buildDeployBrief(pending.commitSha).catch((e) => {
+    const brief = await buildDeployBrief(pending.commitSha, target.repo).catch((e) => {
       console.warn("[telegram-bug-intake] deploy brief enrich failed:", e.message);
       return null;
     });
@@ -1200,24 +1357,28 @@ async function scanDeployApprovals() {
     const deployAsk =
       "This is the irreversible production deploy — the merge is already approved. " +
       "Approve to ship, or Reject to stop.";
+    // Which pipeline, and which REPO's pipeline: with several registered repos a
+    // bare pipeline name is not enough for a human to know what they are shipping.
+    const meta = [`🏷 ${esc(target.pipeline)}`];
+    if (target.repo) meta.push(`📦 ${esc(target.repo)}`);
     const text = brief
       ? execPing({
           kicker: "🚀 PRODUCTION DEPLOY — approval needed",
-          subject: brief.prTitle || brief.commitSubject || DEPLOY_PIPELINE_NAME,
+          subject: brief.prTitle || brief.commitSubject || target.pipeline,
           summary: brief.summary || "",                       // one-line what/why from the PR body
           bullets: [
             brief.workflowLine,                               // "Workflow: TEAM-3721 (bug-fix)"
             brief.scopeLine,                                  // "Scope: 8 files (+147/-4)"
             brief.commitLine && brief.commitLine.replace(/`/g, ""), // "Commit: a1b2c3d"
           ].filter(Boolean),
-          meta: [`🏷 ${esc(DEPLOY_PIPELINE_NAME)}`],
+          meta,
           ask: deployAsk,
         })
       : execPing({
           kicker: "🚀 PRODUCTION DEPLOY — approval needed",
-          subject: DEPLOY_PIPELINE_NAME,
+          subject: target.pipeline,
           summary: "The build passed every gate and is waiting on you to ship it to prod.",
-          meta: [`🏷 ${esc(DEPLOY_PIPELINE_NAME)}`],
+          meta,
           ask: deployAsk,
         });
 
@@ -1293,6 +1454,25 @@ function cleanSubject(title) {
   return t || null;
 }
 
+// A registry `repo` reaches the GitHub API as a URL PATH SEGMENT. normalizeRepoKey
+// (cd-registry.mjs) only guarantees two non-empty "/"-separated segments, so
+// "owner/repo?per_page=1", "owner/repo#x", "owner/re po" and "owner/.." all survive
+// parsing — and each one changes the REQUEST rather than the repo it describes
+// ("?" adds a query, "#" truncates, ".." walks the path up, all with GITHUB_TOKEN
+// attached). Registry write access must not be a way to steer an authenticated
+// GitHub call, so anything outside GitHub's own owner/name charset is refused here,
+// at the point of use. NOTE: the regex alone allows ".." (a dot is a legal repo-name
+// char) — dot-only segments are rejected separately because fetch NORMALISES them.
+const SAFE_REPO_PATH = /^[a-z0-9_.-]+\/[a-z0-9_.-]+$/i;
+const DOT_SEGMENT = /^\.+$/;
+function isSafeRepoPath(repo) {
+  if (!SAFE_REPO_PATH.test(String(repo || ""))) return false;
+  return !String(repo).split("/").some((seg) => DOT_SEGMENT.test(seg));
+}
+// One warning per bad repo per warm container: the scan runs every 60s, and a
+// registry typo must not turn into a log flood.
+const _unsafeRepoWarned = new Set();
+
 /**
  * Build a rich "what's shipping" brief for the deploy-approval ping from the
  * commit being deployed: the commit subject, its associated PR (title + body),
@@ -1300,10 +1480,21 @@ function cleanSubject(title) {
  * the file scope (count + additions/deletions). All best-effort against the
  * GitHub API with GITHUB_TOKEN; any failure returns partial/null and the caller
  * falls back to the terse message. Returns null if no commit SHA is known.
+ *
+ * `repo` is the TARGET's repo ("owner/name") — a registered repo's pipeline
+ * deploys that repo, not the hub, so enriching from the hub would describe the
+ * wrong commit entirely. Falls back to the hub only when the target has no repo.
  */
-async function buildDeployBrief(commitSha) {
+async function buildDeployBrief(commitSha, targetRepo = null) {
   if (!commitSha) return null;
-  const repo = `${GITHUB_USER}/agentcore-hub`;
+  const repo = targetRepo || `${GITHUB_USER}/agentcore-hub`;
+  if (!isSafeRepoPath(repo)) {
+    if (!_unsafeRepoWarned.has(repo)) {
+      _unsafeRepoWarned.add(repo);
+      console.warn(`[telegram-bug-intake] deploy brief skipped: unsafe repo "${repo}" (not owner/name) — fix the CD registry entry`);
+    }
+    return null;                 // terse ping still goes out; the gate must reach a human
+  }
   const gh = async (path) => {
     const r = await fetch(`https://api.github.com/repos/${repo}${path}`, {
       headers: {
@@ -1360,21 +1551,39 @@ async function buildDeployBrief(commitSha) {
 }
 
 /**
- * Atomically claim a deploy approval for notification, keyed by the approval
- * TOKEN (unique per pipeline wait). Returns { key, ... } on first claim, false
- * if already pinged. The DDB row stores the pipeline/stage/action/token the
- * button callback needs, since callback_data can't carry the token itself.
+ * Atomically claim a deploy approval for notification, keyed by the target
+ * pipeline + the approval TOKEN (unique per pipeline wait). Returns { key, ... }
+ * on first claim, false if already pinged. The DDB row stores the
+ * pipeline/region/repo/stage/action/token the button callback needs, since
+ * callback_data can't carry the token itself.
  */
-async function claimDeployApproval(pending) {
-  // A short, callback_data-safe key derived from the token (which can exceed
-  // Telegram's 64-byte callback_data budget). The token stays in the DDB item.
-  const key = `dp${hashToken(pending.token)}`;
+async function claimDeployApproval(pending, target) {
+  // A short, callback_data-safe key derived from the target + the approval TOKEN
+  // (the token alone can exceed Telegram's 64-byte callback_data budget). The token
+  // stays in the DDB item. Hashing the PIPELINE in means two targets can never
+  // collide on one claim row, whatever their tokens look like.
+  //
+  // MIGRATION (TEAM-4347): before TEAM-4338 the key was hash(token) alone, and that
+  // code watched exactly ONE pipeline — DEPLOY_PIPELINE_NAME. So legacy-shaped rows
+  // can only ever exist for that pipeline; keeping the legacy shape for it means an
+  // approval already paused on the gate when this zip lands still hashes to the row
+  // that claimed it, instead of claiming a second row and pinging twice. Matching on
+  // the pipeline NAME (not on "came from the env fallback") is deliberate: the hub is
+  // normally in the registry too, so its target is a REGISTRY target that happens to
+  // name DEPLOY_PIPELINE_NAME — the exact configuration the double-ping would hit.
+  const key = DEPLOY_PIPELINE_NAME && target.pipeline === DEPLOY_PIPELINE_NAME
+    ? `dp${hashToken(pending.token)}`
+    : `dp${hashToken(`${target.pipeline} ${pending.token}`)}`;
   try {
     await ddb.send(new PutItemCommand({
       TableName: PENDING_TABLE,
       Item: {
         id: { S: `${DEPLOY_KEY_PREFIX}${key}` },
-        pipelineName: { S: DEPLOY_PIPELINE_NAME },
+        pipelineName: { S: target.pipeline },
+        // The region to send PutApprovalResult to. Claim rows written before
+        // TEAM-4338 have no region; the callback falls back to DEFAULT_REGION.
+        region: { S: target.region },
+        ...(target.repo ? { repo: { S: target.repo } } : {}),
         stageName: { S: pending.stageName },
         actionName: { S: pending.actionName },
         token: { S: pending.token },
@@ -1396,7 +1605,7 @@ async function releaseDeployApproval(key) {
   }));
 }
 
-/** Small non-crypto hash → short stable key for the token. */
+/** Small non-crypto hash → short stable key for a claim (pipeline + token). */
 function hashToken(token) {
   let h = 5381;
   for (let i = 0; i < token.length; i++) h = ((h << 5) + h + token.charCodeAt(i)) | 0;
@@ -1418,8 +1627,12 @@ async function handleDeployApprovalCallback(cb, chatId, action, key) {
     return;
   }
   const approve = action === "dok";
+  // The pipeline's own region, from the claim row. A row written before
+  // TEAM-4338 carries no region attribute — those approve via the default
+  // region, which is where the only pipeline was.
+  const cp = codepipelineFor(item.Item.region?.S || DEFAULT_REGION);
   try {
-    await codepipeline.send(new PutApprovalResultCommand({
+    await cp.send(new PutApprovalResultCommand({
       pipelineName: item.Item.pipelineName.S,
       stageName: item.Item.stageName.S,
       actionName: item.Item.actionName.S,

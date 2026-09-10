@@ -95,7 +95,9 @@ describe('F8 — deploy-gate polling gates on the SHARED terminal set (TEAM-3767
     // `if (!defHasShip || !runActive) { setDeployGate(null); return; }` — so a
     // terminal run neither fetches /api/pipeline/status nor keeps a banner; the
     // amber banner only renders from the deployGate state this clears.
-    const effectIdx = boardContent.indexOf('fetch("/api/pipeline/status"');
+    // TEAM-4336 turned the URL into a template literal (`?repo=` is appended per
+    // run), so the anchor is the backtick form — still the fetch call itself.
+    const effectIdx = boardContent.indexOf('fetch(`/api/pipeline/status');
     expect(effectIdx).toBeGreaterThan(-1);
     const before = boardContent.slice(0, effectIdx);
     const guard = before.slice(before.lastIndexOf('if (!defHasShip'));
@@ -120,6 +122,74 @@ describe('F8 — deploy-gate polling gates on the SHARED terminal set (TEAM-3767
     // "ship" is not terminal → runActive stays true for a live ship run, so the
     // deploy-gate poll + amber banner behave exactly as #293 shipped them.
     expect(isTerminalPhase('ship')).toBe(false);
+  });
+});
+
+/**
+ * TEAM-4336 — the deploy-gate banner is scoped to the run's OWN pipeline.
+ *
+ * The #293 poll read the ONE global pipeline (`data.stages`), which was correct
+ * only while the hub deployed exactly one repo. With several repos in the CD
+ * registry — each with its own CodePipeline, possibly in another region — that
+ * read would surface repo Y's ManualApproval on repo X's board and invite a human
+ * to approve the wrong production deploy. The poll now asks for the run's own
+ * repo and matches the returned target by repo key before raising the banner, so
+ * an unregistered-repo handoff run (whose only target is the env default, repo "")
+ * shows nothing at all.
+ *
+ * Same source-content convention as F6/F8 above (no render harness for the 4k-line
+ * board).
+ */
+describe('TEAM-4336 — the deploy-gate banner is scoped to the run\'s own pipeline', () => {
+  /** The poll effect: from the guard through the setDeployGate call. */
+  const pollEffect = (() => {
+    const start = boardContent.indexOf('if (!defHasShip');
+    expect(start).toBeGreaterThan(-1);
+    const end = boardContent.indexOf('const id = setInterval(poll, 20000)', start);
+    expect(end).toBeGreaterThan(start);
+    return boardContent.slice(start, end);
+  })();
+
+  it('polls for the RUN\'s repo (state.repoConfig.repos[0].url), url-encoded', () => {
+    expect(boardContent).toMatch(
+      /const runRepoUrl = state\?\.repoConfig\?\.repos\?\.\[0\]\?\.url/
+    );
+    expect(pollEffect).toContain('?repo=${encodeURIComponent(runRepoUrl)}');
+    // The param is omitted rather than sent empty when the def carries no repo.
+    expect(pollEffect).toContain('runRepoUrl ?');
+  });
+
+  it('derives the gate from the MATCHING target only, never a global stage list', () => {
+    expect(pollEffect).toContain('data.pipelines');
+    expect(pollEffect).toContain('isSameRepo(runRepoUrl');
+    expect(pollEffect).toContain('mine && waiting');
+    // The exact pre-4336 cross-repo bug shape: any stage of the one global pipeline.
+    expect(boardContent).not.toContain('(data.stages || [])');
+  });
+
+  it('re-polls when the run\'s repo changes (effect dependency)', () => {
+    const depsIdx = boardContent.indexOf('}, [defHasShip, runActive');
+    expect(depsIdx).toBeGreaterThan(-1);
+    expect(boardContent.slice(depsIdx, boardContent.indexOf(']', depsIdx))).toContain('runRepoUrl');
+  });
+
+  it('the banner NAMES the pipeline it is asking a human to approve', () => {
+    const bannerIdx = boardContent.indexOf('{deployGate && (');
+    expect(bannerIdx).toBeGreaterThan(-1);
+    const banner = boardContent.slice(bannerIdx, bannerIdx + 1200);
+    expect(banner).toContain('deployGate.pipeline');
+    expect(banner).toContain('deployGate.stage');
+    // ...and the state it renders from carries that pipeline name.
+    expect(boardContent).toContain('{ stage: string; pipeline: string; url?: string }');
+  });
+
+  it('isSameRepo is a LOCAL mirror — cd-registry is never value-imported client-side', () => {
+    // src/lib/cd-registry.ts lazy-imports @aws-sdk/client-s3; importing it into a
+    // client component would ship the AWS SDK to the browser (the same trade
+    // src/config/modules.ts refused for isPipelineEnabled).
+    expect(boardContent).toMatch(/function isSameRepo\(url: string \| undefined, key: string\): boolean/);
+    expect(boardContent).not.toMatch(/^import\s+\{[^}]*normalizeRepoKey/m);
+    expect(boardContent).not.toContain('from "@/lib/cd-registry"');
   });
 });
 
