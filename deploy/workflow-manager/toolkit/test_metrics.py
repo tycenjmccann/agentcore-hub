@@ -8,6 +8,7 @@ import json
 import os
 import sys
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -19,6 +20,9 @@ from compute_metrics import (  # noqa: E402
     intake_completed_at,
     is_outside_hours,
     jaccard,
+    ms_between,
+    parse_ts,
+    split_wait_by_window,
     title_fix_kind,
     title_paths,
     title_slot_tokens,
@@ -943,6 +947,128 @@ class OutsideHours(unittest.TestCase):
         # The 7-hour wait RealDossierFixtures pins is unchanged — this only
         # explains it, it does not restate it.
         self.assertEqual(review["waitMs"], 25255120)
+
+
+def la(year, month, day, hour=0, minute=0):
+    """A UTC-tzinfo instant for the given America/Los_Angeles wall-clock time —
+    matching what parse_ts actually hands split_wait_by_window in production
+    (a fixed-offset datetime, never the window's own ZoneInfo object)."""
+    from zoneinfo import ZoneInfo
+    return datetime(year, month, day, hour, minute, tzinfo=ZoneInfo("America/Los_Angeles")).astimezone(timezone.utc)
+
+
+class WaitSplit(unittest.TestCase):
+    """split_wait_by_window (TEAM-4453 D3) — the same fix for the same defect
+    OutsideHours documents above, one level deeper: a review that straddles the
+    window boundary should attribute only its own outside slice, not have its
+    whole wait bucketed by the instant it was requested."""
+
+    LA_WINDOW = business_window(tz_name="America/Los_Angeles", hours_spec="09-18")
+
+    def test_fully_inside_a_business_day(self):
+        start, end = la(2026, 7, 1, 10, 0), la(2026, 7, 1, 14, 0)  # Wed
+        self.assertEqual(split_wait_by_window(start, end, self.LA_WINDOW), (14_400_000, 0))
+
+    def test_wholly_on_a_weekend(self):
+        start, end = la(2026, 7, 4, 10, 0), la(2026, 7, 4, 14, 0)  # Sat
+        self.assertEqual(split_wait_by_window(start, end, self.LA_WINDOW), (0, 14_400_000))
+
+    def test_the_ztg2xj_example(self):
+        # Requested 2026-09-09T06:30:00Z = Tue 23:30 PDT (after hours); resolved
+        # 2026-09-09T16:22:00Z = Wed 09:22 PDT — 22 minutes into the window.
+        requested = parse_ts("2026-09-09T06:30:00Z")
+        resolved = parse_ts("2026-09-09T16:22:00Z")
+        self.assertEqual(ms_between(requested, resolved), 35_520_000)
+        self.assertEqual(
+            split_wait_by_window(requested, resolved, self.LA_WINDOW),
+            (1_320_000, 34_200_000),
+        )
+
+    def test_multi_day_friday_evening_to_tuesday_morning(self):
+        # Fri 17:00 (inside; closes at 18:00) through the weekend to Mon (a full
+        # 9-18 business day) into Tue 10:00 (inside; opened at 09:00).
+        start, end = la(2026, 7, 3, 17, 0), la(2026, 7, 7, 10, 0)
+        in_ms, out_ms = split_wait_by_window(start, end, self.LA_WINDOW)
+        self.assertEqual((in_ms, out_ms), (39_600_000, 280_800_000))
+        self.assertEqual(in_ms + out_ms, ms_between(start, end))
+
+    def test_end_at_or_before_start_is_zero_zero_not_none(self):
+        now = la(2026, 7, 1, 12, 0)
+        self.assertEqual(split_wait_by_window(now, now, self.LA_WINDOW), (0, 0))
+        self.assertEqual(
+            split_wait_by_window(now, now - timedelta(minutes=5), self.LA_WINDOW), (0, 0)
+        )
+
+    def test_a_missing_bound_is_none_none(self):
+        now = la(2026, 7, 1, 12, 0)
+        self.assertEqual(split_wait_by_window(None, now, self.LA_WINDOW), (None, None))
+        self.assertEqual(split_wait_by_window(now, None, self.LA_WINDOW), (None, None))
+
+    def test_end_hour_24_is_open_through_midnight(self):
+        window = (self.LA_WINDOW[0], 0, 24)
+        start, end = la(2026, 7, 1, 1, 0), la(2026, 7, 2, 1, 0)  # Wed 01:00 -> Thu 01:00
+        self.assertEqual(split_wait_by_window(start, end, window), (86_400_000, 0))
+
+    def test_a_dst_day_splits_on_real_elapsed_time_not_wall_clock(self):
+        """2026-03-08 is the America/Los_Angeles spring-forward Sunday (2am ->
+        3am skipped). Two aware datetimes sharing the SAME ZoneInfo object hit
+        Python's "same tzinfo attribute, subtract naively" fast path, which
+        answers with wall-clock elapsed time instead of real elapsed time
+        across the jump — ms_between converts both sides to UTC first
+        specifically to avoid that. This pins the whole-span invariant across
+        a Saturday that runs into the Monday after the transition."""
+        start, end = la(2026, 3, 7, 8, 0), la(2026, 3, 9, 10, 0)  # Sat -> Mon
+        in_ms, out_ms = split_wait_by_window(start, end, self.LA_WINDOW)
+        self.assertEqual((in_ms, out_ms), (3_600_000, 172_800_000))
+        self.assertEqual(in_ms + out_ms, ms_between(start, end))
+        # A DST day is 23 real hours, not 24 — the invariant catches a
+        # regression to naive subtraction even without knowing the split.
+        self.assertEqual(ms_between(la(2026, 3, 8, 0, 0), la(2026, 3, 9, 0, 0)), 82_800_000)
+
+
+class WaitSplitEndToEnd(unittest.TestCase):
+    """compute_metrics wiring: humanReviews[].inHoursMs/outsideHoursMs and the
+    humanWaitInHoursMs/humanWaitOutsideHoursMs totals, driven through the real
+    pipeline rather than calling split_wait_by_window directly."""
+
+    def with_window(self, requested_at, resolved_at, tz="America/Los_Angeles", hours="09-18"):
+        env = {"WM_BUSINESS_TZ": tz, "WM_BUSINESS_HOURS": hours}
+        with mock.patch.dict(os.environ, env, clear=False):
+            return compute_metrics(gate_dossier(requested_at, resolved_at))
+
+    def test_the_ztg2xj_example_end_to_end(self):
+        m = self.with_window("2026-09-09T06:30:00Z", "2026-09-09T16:22:00Z")
+        review = m["humanReviews"][0]
+        self.assertEqual(review["waitMs"], 35_520_000)
+        self.assertEqual(review["inHoursMs"], 1_320_000)
+        self.assertEqual(review["outsideHoursMs"], 34_200_000)
+        self.assertEqual(m["humanWaitInHoursMs"], 1_320_000)
+        self.assertEqual(m["humanWaitOutsideHoursMs"], 34_200_000)
+        self.assertEqual(
+            m["humanWaitInHoursMs"] + m["humanWaitOutsideHoursMs"], m["humanWaitTotalMs"]
+        )
+
+    def test_per_review_split_sums_to_wait_across_a_rework_cycle(self):
+        m = compute_metrics(rejection_rework_dossier())
+        for review in m["humanReviews"]:
+            if review["waitMs"] is None:
+                self.assertIsNone(review["inHoursMs"])
+                self.assertIsNone(review["outsideHoursMs"])
+            else:
+                self.assertEqual(review["inHoursMs"] + review["outsideHoursMs"], review["waitMs"])
+        self.assertEqual(
+            m["humanWaitInHoursMs"],
+            sum(r["inHoursMs"] for r in m["humanReviews"] if r["inHoursMs"] is not None),
+        )
+        self.assertEqual(
+            m["humanWaitInHoursMs"] + m["humanWaitOutsideHoursMs"], m["humanWaitTotalMs"]
+        )
+
+    def test_a_legacy_fixture_with_no_reviews_is_zero_zero(self):
+        m = compute_metrics(happy_path_dossier())
+        self.assertEqual(m["humanReviews"], [])
+        self.assertEqual(m["humanWaitInHoursMs"], 0)
+        self.assertEqual(m["humanWaitOutsideHoursMs"], 0)
 
 
 if __name__ == "__main__":

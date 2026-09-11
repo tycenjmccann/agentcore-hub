@@ -198,7 +198,10 @@ describe("POST /api/workflow/start — stillborn-run marking (TEAM-3686 F5, ddb)
     await load("dynamodb");
     const res = await post();
     expect(res.status).toBe(500);
-    expect((await res.json()).error).toContain("Failed to create requirements ticket: intake exploded");
+    // TEAM-4453: the create failure now names the PLAN KEY of the ticket that
+    // failed ("phase:requirements" for an agent-mode def's item 0), because one
+    // shared executePlan can be creating any item of the skeleton.
+    expect((await res.json()).error).toContain("Failed to create phase:requirements ticket: intake exploded");
     const row = workflowRow();
     expect(row?.phase).toBe("error");
     expect(String(row?.startError)).toContain("intake exploded");
@@ -227,7 +230,8 @@ describe("POST /api/workflow/start — stillborn-run marking (TEAM-3686 F5, ddb)
     // The original failure, not the mark write's.
     expect((await res.json()).error).toContain("intake exploded");
     // Row untouched (still the intake phase) — and the double failure is logged.
-    expect(workflowRow()?.phase).toBe("requirements");
+    // TEAM-4453 R6a: that seeded phase is now "intake" for every def.
+    expect(workflowRow()?.phase).toBe("intake");
     const logged = error.mock.calls.map((c) => String(c[0])).join("\n");
     expect(logged).toContain("mark write failed");
     expect(logged).toContain("intake exploded");
@@ -239,7 +243,9 @@ describe("POST /api/workflow/start — stillborn-run marking (TEAM-3686 F5, ddb)
     const res = await post();
     expect(res.status).toBe(200);
     const row = workflowRow();
-    expect(row?.phase).toBe("requirements");
+    // TEAM-4453 R6a: the row is seeded in "intake", not in the first agent phase,
+    // so the first dispatch genuinely advances it.
+    expect(row?.phase).toBe("intake");
     expect(row?.startError).toBeUndefined();
   });
 });
