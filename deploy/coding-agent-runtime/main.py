@@ -2048,8 +2048,13 @@ def _npm_ci_into(workdir: str, dest: str, lock_hash: str) -> str | None:
             src = os.path.join(workdir, name)
             if os.path.isfile(src):
                 shutil.copy2(src, os.path.join(dest, name))
+        # Own npm cache on the local disk: ~/.npm carried root-owned files from the
+        # image build (npx as root), which makes `npm ci` exit 243 before it starts.
+        npm_cache = os.path.join(DEPS_LOCAL_ROOT, ".npm-cache")
+        os.makedirs(npm_cache, exist_ok=True)
         env = {**os.environ, "CI": "1", "PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD": "1",
-               "PUPPETEER_SKIP_DOWNLOAD": "1", "npm_config_update_notifier": "false"}
+               "PUPPETEER_SKIP_DOWNLOAD": "1", "npm_config_update_notifier": "false",
+               "npm_config_cache": npm_cache}
         res = subprocess.run(["npm", "ci", "--no-audit", "--no-fund", "--loglevel=error"],
                              cwd=dest, env=env, capture_output=True, text=True,
                              timeout=DEPS_BUILD_TIMEOUT_S)
