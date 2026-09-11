@@ -140,9 +140,21 @@ phases:
       # from GH CI. This is the UI gate; the AWS-backed tab/api specs are not.
       - "PLAYWRIGHT_BASE_URL=http://localhost:3000 npm run test:cloud-code -- --trace retain-on-failure"
       # runtime-agent telemetry pytest (hermetic, no AWS)
+      #
+      # TEAM-4464: this block's status is its LAST statement's, and that used to be
+      # `deactivate` -- which always exits 0. So agentcore-hub-ci b93c4479 printed
+      # "2 failed, 523 passed" and then "Phase complete BUILD State SUCCEEDED", and a
+      # red battery could merge behind a green required check. Same trap and same fix
+      # as TEAM-4462 F1 in install above -- guard the command that matters with an
+      # EXPLICIT exit. A bare `set -e` is NOT the fix here either: CodeBuild runs every
+      # command of a build in ONE shared shell, so it would change the semantics of
+      # every later command. venv/pip are guarded for the same reason -- a failed pip
+      # would otherwise run the battery against missing deps, and a failed venv would
+      # leave `.` sourcing a file that does not exist.
       - |
-        python3 -m venv /tmp/pyci && . /tmp/pyci/bin/activate
-        pip install -q -r deploy/runtime-agent/tests/requirements-test.txt
+        python3 -m venv /tmp/pyci || { echo "runtime-agent pytest venv creation FAILED"; exit 1; }
+        . /tmp/pyci/bin/activate || { echo "runtime-agent pytest venv activate FAILED"; exit 1; }
+        pip install -q -r deploy/runtime-agent/tests/requirements-test.txt || { rc=$?; deactivate; echo "runtime-agent pytest dep install FAILED (exit $rc)"; exit "$rc"; }
         pytest -q deploy/runtime-agent/tests \
           deploy/runtime-agent/test_telemetry_init.py \
           deploy/runtime-agent/test_build_env_vars.py \
@@ -161,7 +173,8 @@ phases:
           deploy/pipeline/test_ecs_primary_container.py \
           deploy/pipeline/test_plan_surfaces.py \
           deploy/pipeline/test_prune_apt_sources.py \
-          deploy/pipeline/test_update_runtime_image.py
+          deploy/pipeline/test_update_runtime_image.py \
+          deploy/pipeline/test_buildspec_ci_exit_codes.py || { rc=$?; deactivate; echo "runtime-agent pytest battery FAILED (exit $rc)"; exit "$rc"; }
         deactivate
       # HARD GATE: lambda-zip manifest integrity (the guard DEPLOY.md's inline zip bypassed)
       - "bash scripts/check-lambda-zip-manifest.sh"
