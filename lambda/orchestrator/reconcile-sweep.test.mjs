@@ -751,3 +751,81 @@ describe("TEAM-3973 — an escalated ticket is HELD for the human in every statu
     expect(m.escalated).toBe(1); // second death → escalate, unchanged (TEAM-3969)
   });
 });
+
+/**
+ * TEAM-4410 — the sweep re-visits every parked in_review gate once a minute
+ * forever. When the gate already has an OPEN review_needed notification it is
+ * correctly parked on a human, not stalled — recovering it must be a pure
+ * no-op with ZERO ticket writes. Before the fix, reconcileDependent →
+ * handleInReviewDependent called reawakenGate unconditionally; reawakenGate
+ * (handleHumanReviewGate in production) writes the ticket to "In Review"
+ * (jiraTransition / DDB UpdateCommand) BEFORE its own idempotency CAS
+ * (appendReviewNotificationOnce) declines — so the redundant write happened
+ * every sweep even though the outcome was already review-noop.
+ *
+ * The `reawakenGate` stub below models that EXACT production ordering (write
+ * first, then a CAS that declines) so a regression in the guard is caught by
+ * the write-count assertions, not just the outcome string.
+ */
+describe("TEAM-4410 — a gate already parked on a human is not re-saved", () => {
+  const inReviewGate = [
+    { ticketId: DONE, status: "done", type: "task" },
+    { ticketId: "GATE-1", status: "in_review", assignee: "human:reviewer", type: "task", blockedBy: [DONE], updatedAt: STALE_STARTED },
+  ];
+
+  function makeProdOrderedReawakenGate({ alreadyOpen }) {
+    const jiraTransition = vi.fn(async () => {});
+    const appendReviewNotificationOnce = vi.fn(async () => !alreadyOpen);
+    const reawakenGate = vi.fn(async (ticketId) => {
+      // Mirrors index.mjs handleHumanReviewGate: park the ticket FIRST...
+      await jiraTransition(ticketId, "In Review");
+      // ...then the idempotency CAS, which declines when a notification is
+      // already open.
+      return appendReviewNotificationOnce(ticketId);
+    });
+    return { reawakenGate, jiraTransition, appendReviewNotificationOnce };
+  }
+
+  it("open review_needed notification: outcome review-noop, reawakenGate/jiraTransition/appendReviewNotificationOnce never called", async () => {
+    const { reawakenGate, jiraTransition, appendReviewNotificationOnce } =
+      makeProdOrderedReawakenGate({ alreadyOpen: true });
+    const s = makeSweep({
+      workflows: [workflow({
+        humanNotifications: [
+          { id: "n1", type: "review_needed", ticketId: "GATE-1", acknowledged: false },
+        ],
+      })],
+      siblings: inReviewGate,
+      reawakenGate,
+    });
+
+    const m = await s.runSweep("enforce");
+
+    expect(m.candidates).toBe(1);
+    expect(m.noop).toBe(1);
+    expect(m.reviewReawakened).toBe(0);
+    expect(reawakenGate).not.toHaveBeenCalled();
+    expect(jiraTransition).not.toHaveBeenCalled();
+    expect(appendReviewNotificationOnce).not.toHaveBeenCalled();
+    expect(eventsOfType(s.publishEvent, "review.reawakened")).toHaveLength(0);
+  });
+
+  it("no open notification: gate still re-wakes (notification created, review.reawakened published)", async () => {
+    const { reawakenGate, jiraTransition, appendReviewNotificationOnce } =
+      makeProdOrderedReawakenGate({ alreadyOpen: false });
+    const s = makeSweep({
+      workflows: [workflow({ humanNotifications: [] })],
+      siblings: inReviewGate,
+      reawakenGate,
+    });
+
+    const m = await s.runSweep("enforce");
+
+    expect(m.candidates).toBe(1);
+    expect(m.reviewReawakened).toBe(1);
+    expect(reawakenGate).toHaveBeenCalledTimes(1);
+    expect(jiraTransition).toHaveBeenCalledWith("GATE-1", "In Review");
+    expect(appendReviewNotificationOnce).toHaveBeenCalledTimes(1);
+    expect(eventsOfType(s.publishEvent, "review.reawakened")).toHaveLength(1);
+  });
+});
