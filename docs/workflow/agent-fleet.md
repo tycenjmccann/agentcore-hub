@@ -4,7 +4,7 @@ The Strands personas, their tools/skills, and how they delegate to the coding CL
 
 ## Fleet Overview
 
-20 specialized agents make up the software-delivery fleet, deployed on AWS Bedrock AgentCore Runtime. Each agent is a Strands-based Python process with a baked-in system prompt, shared toolset (40 tools per agent), and model configuration (personas run on Claude Fable 5.1; `claude_code` delegations pick opus/sonnet/haiku per call — see Plan-first delegation below).
+20 specialized agents make up the delivery fleet (16 form the software-delivery pipeline — see below; the other 4 serve the bug-fix, operator, sweep, and self-improvement flows), deployed on AWS Bedrock AgentCore Runtime. 15 run as dedicated runtimes; `release_manager`, `fleet_improver`, `bug_fixer`, `operator`, and `code_sweeper` run on the shared runtime. Each agent is a Strands-based Python process with a baked-in system prompt, shared toolset (38 tools per agent, plus the GitHub MCP tools), and model configuration (personas run on Claude Fable 5.1; `claude_code` delegations pick opus/sonnet/haiku per call — see Plan-first delegation below).
 
 The pipeline flows Requirements → 8 parallel Design → 3 Dev → Review (code review + CI) → Verification (QA) → Ship (release manager). `bug_fixer`, `operator`, and `code_sweeper` are development-phase personas used by the bug-fix / operator / sweep flows; `fleet_improver` closes the self-improvement loop by turning low eval scores into PRDs that re-enter the same pipeline.
 
@@ -40,8 +40,8 @@ The pipeline flows Requirements → 8 parallel Design → 3 Dev → Review (code
 │  AgentCore Runtime (us-east-1)                              │
 │                                                             │
 │  ┌─────────────────┐  ┌─────────────────┐                  │
-│  │ agentcore_hub_frontend │  │ agentcore_hub_backend │  ... x14         │
-│  │     _dev         │  │     _dev        │                  │
+│  │ agentcore_hub_frontend │  │ agentcore_hub_backend │                   │
+│  │     _dev         │  │     _dev        │  …×15 runtimes    │
 │  │                  │  │                 │                  │
 │  │ main.py (shared) │  │ main.py (shared)│                  │
 │  │ SYSTEM_PROMPT=.. │  │ SYSTEM_PROMPT=..│                  │
@@ -88,28 +88,38 @@ The pipeline flows Requirements → 8 parallel Design → 3 Dev → Review (code
 | `code_interpreter` | AgentCore sandboxed code execution |
 | `browser` | AgentCore managed Playwright browser |
 
-### Claude Code SDK Tool (1)
+### Coding CLI Tools (3)
 | Tool | Purpose |
 |------|---------|
-| `claude_code` | Delegate complex coding tasks to Claude Code CLI |
+| `claude_code` | Delegate a coding task to the Claude Code CLI (plan-first — see below) |
+| `codex` | Delegate to the Codex CLI on Bedrock Mantle (independent engine, used for adversarial review) |
+| `kiro` | Delegate to the Kiro CLI |
 
-### Lambda-Backed Tools (14)
+### Lambda-Backed Tools (22)
 | Tool | Lambda | Purpose |
 |------|--------|---------|
-| `download_s3_file` | direct boto3 | Download S3 files to /tmp |
-| `S3Storage___read_object` | agentcore-hub-s3-tools | Read text from S3 |
-| `S3Storage___write_object` | agentcore-hub-s3-tools | Write text to S3 |
-| `S3Storage___list_objects` | agentcore-hub-s3-tools | List S3 objects |
-| `Tickets___create_ticket` | agentcore-hub-jira-mcp | Create tickets |
-| `Tickets___transition_ticket` | agentcore-hub-jira-mcp | Change ticket status |
-| `Tickets___update_ticket` | agentcore-hub-jira-mcp | Update ticket fields |
-| `Tickets___list_tickets` | agentcore-hub-jira-mcp | List child tickets |
-| `Tickets___add_comment` | agentcore-hub-jira-mcp | Comment on tickets |
-| `Tickets___search_issues` | agentcore-hub-jira-mcp | Search tickets |
-| `WorkflowOutput___report_completion` | agentcore-hub-workflow-output | Mark work done |
-| `WorkflowOutput___save_design_doc` | agentcore-hub-workflow-output | Save artifacts |
-| `WorkflowOutput___submit_ticket_plan` | agentcore-hub-workflow-output | Batch create tickets |
-| `SkillLoader___load_skill` | agentcore-hub-skill-loader | Load role instructions |
+| `download_s3_file` | direct boto3 | Download an S3 object to /tmp (feeds `image_reader`) |
+| `upload_file_to_s3` | direct boto3 | Upload any-media-type local file to S3 |
+| `load_blueprint` | direct boto3 (S3) | Fetch the agent's role blueprint from the artifact bucket |
+| `S3Storage___read_object` | agentcore-hub-workflow-output | Read text from S3 |
+| `S3Storage___write_object` | agentcore-hub-workflow-output | Write text to S3 |
+| `S3Storage___list_objects` | agentcore-hub-workflow-output | List S3 objects |
+| `Tickets___create_ticket` | agentcore-hub-tickets / -jira | Create a ticket |
+| `Tickets___transition_ticket` | agentcore-hub-tickets / -jira | Change ticket status (with `blocked_by`) |
+| `Tickets___update_ticket` | agentcore-hub-tickets / -jira | Update ticket fields |
+| `Tickets___list_tickets` | agentcore-hub-tickets / -jira | List child tickets |
+| `Tickets___add_comment` | agentcore-hub-tickets / -jira | Comment on a ticket |
+| `Tickets___get_issue` | agentcore-hub-tickets / -jira | Read one ticket |
+| `Tickets___search_issues` | agentcore-hub-tickets / -jira | Search tickets |
+| `Pipeline___get_state` | agentcore-hub-pipeline-tools | Read pipeline/deploy state |
+| `Pipeline___start_deploy` | agentcore-hub-pipeline-tools | Trigger the deploy pipeline |
+| `Pipeline___get_build_status` | agentcore-hub-pipeline-tools | Poll a build's status |
+| `Pipeline___get_build_log` | agentcore-hub-pipeline-tools | Fetch a build log |
+| `Pipeline___start_ci_build` | agentcore-hub-pipeline-tools | Trigger a CI build |
+| `Pipeline___capabilities` | agentcore-hub-pipeline-tools | Report which pipeline actions are available |
+| `WorkflowOutput___report_completion` | agentcore-hub-workflow-output | Mark the agent's work done |
+| `WorkflowOutput___save_design_doc` | agentcore-hub-workflow-output | Save a design artifact |
+| `WorkflowOutput___submit_ticket_plan` | agentcore-hub-workflow-output | Batch-create the ticket plan |
 
 ### MCP Tools (GitHub)
 Connected via `GITHUB_PAT` env var to `https://api.githubcopilot.com/mcp/` (9 tools verified):

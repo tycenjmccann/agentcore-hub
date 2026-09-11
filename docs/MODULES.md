@@ -189,7 +189,7 @@ A standalone, user-facing coding agent — the AWS "safe to close your laptop"
 pattern (`awslabs/agentcore-samples` 04-coding-agents). Claude Code and Codex
 (GPT-5.5 via Bedrock Mantle) run **server-side** in a dedicated AgentCore
 Runtime; the browser is a thin client. Sessions are resumable from any device.
-This module is **not** part of the 14-agent workflow fleet — it's Git-native and
+This module is **not** part of the 16-agent workflow fleet — it's Git-native and
 conversational.
 
 **UI routes**

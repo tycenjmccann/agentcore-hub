@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-AgentCore Hub — a Next.js 14 (App Router) + TypeScript web console for Amazon Bedrock AgentCore. It **dynamically discovers** deployed agents in the configured AWS account at runtime (no hardcoded ARNs/account IDs) and lets you invoke them, watch metrics/traces, build new agents, and run a 14-agent autonomous software-delivery pipeline.
+AgentCore Hub — a Next.js 14 (App Router) + TypeScript web console for Amazon Bedrock AgentCore. It **dynamically discovers** deployed agents in the configured AWS account at runtime (no hardcoded ARNs/account IDs) and lets you invoke them, watch metrics/traces, build new agents, and run a 16-agent autonomous software-delivery pipeline.
 
 Config is environment-driven (`.env.local`, copied from `.env.example`). `deploy/config.sh` derives account ID, role ARNs, bucket, and table names from credentials + conventions — never hardcode those.
 
@@ -28,7 +28,7 @@ Infra/deploy entry points (each is idempotent / re-runnable):
 ./scripts/verify-infra.sh ; ./scripts/verify-all.sh  # verification suites
 node deploy/setup-tickets-lambda.mjs                 # deploys jira OR tickets Lambda per TICKET_PROVIDER
 node deploy/setup-builder-agent.mjs                  # builder harness
-cd deploy/runtime-agent && ./deploy-fleet.sh         # all 14 fleet runtime agents (needs AgentCore CLI)
+cd deploy/runtime-agent && ./deploy-fleet.sh         # all 15 fleet runtime agents (needs AgentCore CLI)
 node deploy/setup-pipeline-tools-lambda.mjs          # Pipeline___* tools Lambda (pipeline module)
 ./deploy/pipeline/deploy.sh                          # CI/CD pipeline CDK stack (pipeline module)
 ```
@@ -57,7 +57,7 @@ Agents expect different payload shapes. `src/lib/agentcore-sdk.ts` has a `PAYLOA
 `src/config/agents.json` defines all valid agents. It is **synced to S3** at deploy and loaded by every Lambda on cold start. To change agents: edit the file, then `aws s3 cp src/config/agents.json s3://{ARTIFACT_BUCKET}/config/agents.json` — Lambdas pick it up on next cold start, no redeploy. The orchestrator resolves `agentId` → runtime ARN via the `RUNTIME_ARN_<HARNESS_NAME_UPPER>` env convention (or explicit `runtimeArn`).
 
 ### Workflow pipeline orchestration
-Submit a feature request → 14 Strands agents on AgentCore **Runtime** (requirements → 8 parallel design → 3 dev → CI certification → QA verification → code review → ship) produce a PR. Cascade is driven by ticket status changes:
+Submit a feature request → 16 Strands agents on AgentCore **Runtime** (requirements → 8 parallel design → 3 dev → CI certification → QA verification → code review → ship) produce a PR. Cascade is driven by ticket status changes:
 - **`TICKET_PROVIDER=dynamodb`** (code default when unset): DynamoDB Streams on the tickets table trigger the orchestrator Lambda.
 - **`TICKET_PROVIDER=jira`** (what `.env.example`/`Dockerfile` ship): real Jira Cloud; Jira webhooks hit `/api/jira/webhook`. Requires a specific 6-status team-managed workflow (see README "Jira Integration").
 
@@ -77,7 +77,7 @@ It is a **runtime allow-list**, not just intake config: the orchestrator, the `P
 Agents own CD via the `Pipeline___*` tools (`get_state`/`start_deploy`/`start_ci_build`/`get_build_status`/`get_build_log`/`capabilities`) on a narrow Lambda (`lambda/agentcore-hub-pipeline-tools/`) — deliberately **no `PutApprovalResult`**: the in-pipeline ManualApproval deploy gate is human-only, bridged to Telegram. Merge does not auto-trigger the pipeline; the release manager calls `Pipeline___start_deploy`. The orchestrator's ship merge-verify gate blocks a ship-phase run from completing while its feature branch is provably unmerged (`SHIP_MERGE_VERIFY=off` to opt out). The CI agent auto-remediates whitelisted mechanical failures (prettier/eslint --fix/lockfile — `blueprints/ci-agent.md` P2a) and tickets logic failures to dev. See `docs/pipeline/design.md`.
 
 ### Evaluations / self-improvement (optional)
-AgentCore online evaluations score invocations; low scores trigger `eval-packager` (via CloudWatch Logs subscription filters) → fleet improver agent writes a PRD → `prd-submitter` re-enters the same 14-agent pipeline. Toggle = set `eval-packager` Lambda concurrency to 0 (paused) vs unlimited.
+AgentCore online evaluations score invocations; low scores trigger `eval-packager` (via CloudWatch Logs subscription filters) → fleet improver agent writes a PRD → `prd-submitter` re-enters the same 16-agent pipeline. Toggle = set `eval-packager` Lambda concurrency to 0 (paused) vs unlimited.
 
 ### Metrics & traces
 Per-agent token usage comes from `aws/spans` OTEL trace data; invocations/latency from `AWS/Bedrock-AgentCore` CloudWatch metrics; full execution traces from the `aws/spans` Logs group.

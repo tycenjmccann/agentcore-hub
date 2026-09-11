@@ -8,7 +8,7 @@ from [awslabs/agentcore-samples](https://github.com/awslabs/agentcore-samples)
 microVM, the workspace survives, and you **resume a conversation by invoking
 again with the same `runtimeSessionId`**.
 
-> This is a standalone, user-facing coding agent — NOT wired into the 14-agent
+> This is a standalone, user-facing coding agent — NOT wired into the 16-agent
 > workflow fleet. (An earlier attempt to force coding-CLI output through the
 > workflow pipeline failed because the pipeline assumes local files; this model
 > is Git-native and conversational instead.)

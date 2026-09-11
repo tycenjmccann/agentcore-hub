@@ -276,7 +276,7 @@ before this synthesis step existed.
      enabled on `expiresAt`. Both the create and the TTL enable are idempotent:
      a re-run skips an existing table and an already-`ENABLED` TTL rather than
      aborting under `set -e`.
-2. **Seeds 14 agent rows** from `src/config/agents.json` with default eval configuration:
+2. **Seeds one eval-config row per agent** from `src/config/agents.json` with default eval configuration:
    - `enabled: true`
    - `sampleRate: 100` (100%)
    - `batchSize: 10`

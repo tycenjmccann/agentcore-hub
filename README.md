@@ -157,7 +157,7 @@ Add the output to `.env.local`:
 BUILDER_AGENT_ID=agentcore_hub_builder-xxxxxxxxxx
 ```
 
-### Stage 6: Agent Fleet (14 Agents)
+### Stage 6: Agent Fleet (15 Runtime Agents)
 
 See [Deploying the Agent Fleet](#deploying-the-agent-fleet) below for full details.
 
@@ -386,7 +386,7 @@ its `## Available Agents` roster at runtime and fans out the ticket graph.
 
 ### Architecture
 
-- **Agents:** Strands agents on AgentCore Runtime (configurable 600s timeout); the software-delivery fleet is 14 agents
+- **Agents:** Strands agents on AgentCore Runtime (configurable 600s timeout); the software-delivery fleet is 16 agents (15 on dedicated runtimes plus the release manager on the shared runtime)
 - **Orchestration:** ticket-status cascade — DynamoDB Streams (dynamodb mode) or Jira webhooks (jira mode) trigger the next phase
 - **Tools:** Agents connect to external tools via MCP (GitHub, GitLab, Jira, etc.) — configurable per deployment
 - **Model:** per-agent in `src/config/agents.json` (default Claude Fable 5; fleet-wide fallback via `MODEL_ID` env var)
@@ -581,7 +581,7 @@ The script automatically creates the IAM execution role (`agentcore-hub-agentcor
 - `GITHUB_PAT` — read from `.env.local` and passed to each agent for GitHub MCP access
 
 ```bash
-# Deploy all 14 agents (reads GITHUB_PAT from .env.local automatically)
+# Deploy all 15 agents (reads GITHUB_PAT from .env.local automatically)
 cd deploy/runtime-agent
 ./deploy-fleet.sh
 
@@ -590,9 +590,9 @@ MCP_SERVERS='[{"url":"https://api.githubcopilot.com/mcp/","headers":{"Authorizat
   ./deploy-fleet.sh
 ```
 
-The script deploys all 14 agents (3 concurrent), then runs a health check that invokes each agent to verify it responds.
+The script deploys all 15 agents (3 concurrent), then runs a health check that invokes each agent to verify it responds.
 
-Expected output: `Results: 14/14 passed, 0 failed`
+Expected output: `Results: 15/15 passed, 0 failed`
 
 ### MCP Flexibility
 
@@ -641,7 +641,7 @@ The Fleet Improver runtime must be deployed for synthesis to run
 (`cd deploy/runtime-agent && ./deploy-one.sh agentcore_hub_fleet_improver`).
 Without it, eval-packager archives batches but skips the workflow trigger.
 
-Every agent invocation is evaluated by 5 criteria — four shared built-ins (tool selection, instruction following, correctness, goal success) plus a fifth slot that is the custom dependency-chain evaluator for ticket agents or Helpfulness otherwise — using a judge model. When scores drop, the fleet improver agent determines whether the fix is a prompt change, a missing tool, a permissions issue, or an infrastructure problem — then creates a PRD that triggers the same 14-agent pipeline to produce a fix PR.
+Every agent invocation is evaluated by 5 criteria — four shared built-ins (tool selection, instruction following, correctness, goal success) plus a fifth slot that is the custom dependency-chain evaluator for ticket agents or Helpfulness otherwise — using a judge model. When scores drop, the fleet improver agent determines whether the fix is a prompt change, a missing tool, a permissions issue, or an infrastructure problem — then creates a PRD that triggers the same 16-agent pipeline to produce a fix PR.
 
 ### One-Command Setup
 
@@ -651,7 +651,7 @@ cd deploy/continuous-improvement
 ./deploy-all.sh
 ```
 
-This sets up: XRay indexing (100%), online eval configs for all 14 agents, the eval-packager and prd-submitter Lambdas, CW Logs subscription filters, and EventBridge wiring.
+This sets up: XRay indexing (100%), online eval configs for every agent in `src/config/agents.json`, the eval-packager and prd-submitter Lambdas, CW Logs subscription filters, and EventBridge wiring.
 
 ### Verification
 
@@ -932,7 +932,7 @@ To restrict to specific agents or regions:
 
 ### Agent Runtime Role (`agentcore-hub-agentcore-role`)
 
-The 14 pipeline agents run on AgentCore Runtime with their own execution role. This role needs:
+The pipeline's Strands agents run on AgentCore Runtime with their own execution role. This role needs:
 
 ```json
 {
@@ -1025,7 +1025,7 @@ After deploying the fleet (Stage 6), run the comprehensive integration test that
 cd deploy/runtime-agent
 ./setup-healthcheck.sh
 
-# Run full integration test (14 agents × 40 tests, ~10 minutes)
+# Run full integration test (15 agents × 40 tests, ~10 minutes)
 python3 verify-fleet-invoke.py \
   --fleet-file fleet-runtime-ids.json \
   --timeout 540 \

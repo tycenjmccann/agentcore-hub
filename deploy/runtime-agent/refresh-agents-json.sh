@@ -13,7 +13,7 @@
 # The runtime resource name IS agent.agentId (convention) — no separate
 # harnessName field is stored.
 #
-# All 14 fleet agents load an identical 37-tool capability set in main.py,
+# All 15 fleet agents load an identical 38-tool capability set in main.py,
 # so the same canonical list is written to every agent. The event processor
 # in the UI reads agents.json to map tool_use events to icons.
 #

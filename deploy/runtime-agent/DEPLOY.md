@@ -6,7 +6,7 @@
 2. `agentcore` CLI installed
 3. Environment variables set (see below)
 
-## Quick Deploy (all 14 agents)
+## Quick Deploy (all 15 agents)
 
 ```bash
 cd deploy/runtime-agent
@@ -227,4 +227,4 @@ deploy-one.sh
 
 ## Fleet Runtime ARNs
 
-See `fleet-runtime-ids.json` (generated at deploy time, gitignored) for all 14 agent ARNs.
+See `fleet-runtime-ids.json` (generated at deploy time, gitignored) for all 15 agent ARNs.

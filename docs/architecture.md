@@ -5,7 +5,7 @@
 > **Purpose**: Single source of truth for architecture decisions in the workflow pipeline. Prevents circular revisiting of solved problems.
 >
 > **Component**: `src/components/workflow/WorkflowBoard.tsx` + backend event system
-> **Runtime**: `deploy/runtime-agent/main.py` (all 14 agents)
+> **Runtime**: `deploy/runtime-agent/main.py` (all 15 fleet runtime agents)
 > **Orchestrator**: `lambda/orchestrator/index.mjs` (handles both DynamoDB Stream events and Jira webhook invocations)
 > **Provider switch**: `TICKET_PROVIDER=dynamodb|jira` (env var on the orchestrator Lambda)
 
