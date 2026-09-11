@@ -53,7 +53,10 @@
  * notification (new notif.id) when the gate is re-parked after rework, so the
  * claim lives in PENDING_TABLE as gate#<notif.id> (legacy gate#<ticketId> when
  * a notification carries no id). Chat registry in chat#<chatId> (any chat that
- * ever messaged the bot).
+ * ever messaged the bot). Each delivered page also publishes a `gate.requested`
+ * EventBridge event tagged with business-hours context, and a page that landed
+ * outside WM_BUSINESS_HOURS earns ONE reminder when the window opens
+ * (repage#<notif.id>) — see "Working-hours gate paging".
  *
  * MANAGER ESCALATIONS: the same scan also pages every allowlisted chat when the
  * Workflow Manager records an unacknowledged manager_escalation. An open
@@ -69,6 +72,7 @@ import { DynamoDBClient, GetItemCommand, PutItemCommand, DeleteItemCommand, Scan
 import { TranscribeStreamingClient, StartStreamTranscriptionCommand } from "@aws-sdk/client-transcribe-streaming";
 import { CodePipelineClient, GetPipelineStateCommand, PutApprovalResultCommand } from "@aws-sdk/client-codepipeline";
 import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
+import { EventBridgeClient, PutEventsCommand } from "@aws-sdk/client-eventbridge";
 import { parseCdRegistry, pipelineProjects } from "./cd-registry.mjs";
 
 const TELEGRAM_BOT_TOKEN = requireEnv("TELEGRAM_BOT_TOKEN");
@@ -160,6 +164,15 @@ let _s3 = null;
 function s3Client() {
   if (!_s3) _s3 = new S3Client({ region: DEFAULT_REGION });
   return _s3;
+}
+
+// EventBridge carries ONE event out of this function: gate.requested (TEAM-4453
+// D3). Lazy for the same reason as S3 — an install that never opens a gate
+// constructs no client, and the sibling suites need not mock the package.
+let _events = null;
+function eventsClient() {
+  if (!_events) _events = new EventBridgeClient({ region: DEFAULT_REGION });
+  return _events;
 }
 
 // ─── Entry: poll loop ────────────────────────────────────────────────────────
@@ -659,6 +672,257 @@ function gateLabel(gate, title) {
   return String(title || "REVIEW").toUpperCase().slice(0, 24);
 }
 
+// ─── Working-hours gate paging (TEAM-4453 D3) ────────────────────────────────
+// A gate page fires the moment the gate opens, including 02:00 on a Saturday.
+// Two things follow from that: (1) every page is tagged with business-hours
+// context and published as `gate.requested`, so the metrics side can tell "the
+// reviewer was asleep" from "the reviewer was slow"; (2) a gate first paged
+// outside the window gets ONE reminder when the window opens.
+//
+// The request-time page is NEVER suppressed or delayed by any of this — a gate
+// that opens at 02:00 still pages at 02:00. The window only adds a reminder.
+//
+// Window semantics are the WM's: half-open [start, end) LOCAL hours, 24h clock,
+// Sat/Sun always outside, same WM_BUSINESS_HOURS / WM_BUSINESS_TZ vars and the
+// same HH-HH regex as compute_metrics.business_window(). The DEFAULTS differ on
+// purpose: paging a human is a push, so it assumes the operator's own working
+// day (09-18 America/Los_Angeles) rather than the analyzer's 08-18 UTC.
+const BUSINESS_WINDOW_DEFAULTS = { timeZone: "America/Los_Angeles", start: 9, end: 18, days: [1, 2, 3, 4, 5] };
+const BUSINESS_HOURS_RE = /^\s*(\d{1,2})\s*-\s*(\d{1,2})\s*$/;
+const DAY_MS = 24 * 3600 * 1000;
+const WEEKDAY_NUM = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+
+let _businessWindow = null;
+/**
+ * The configured window, resolved once per container on the FIRST scan (not at
+ * module load: a bad value must not break the import for the intake paths that
+ * never look at it). Anything unparseable falls back to the documented defaults
+ * with exactly one warn — a typo'd zone must not silently re-page every gate.
+ */
+function businessWindow(env = process.env) {
+  if (_businessWindow) return _businessWindow;
+  const w = { ...BUSINESS_WINDOW_DEFAULTS };
+  try {
+    const tz = env.WM_BUSINESS_TZ;
+    if (tz !== undefined && tz !== null) {
+      try {
+        new Intl.DateTimeFormat("en-US", { timeZone: String(tz) });
+        w.timeZone = String(tz);
+      } catch {
+        console.warn(`[telegram-bug-intake] WM_BUSINESS_TZ="${tz}" is not a known time zone — using ${w.timeZone} for the business-hours reminder; request-time gate pages are unaffected`);
+      }
+    }
+    const spec = env.WM_BUSINESS_HOURS;
+    if (spec !== undefined && spec !== null) {
+      const m = BUSINESS_HOURS_RE.exec(String(spec));
+      const start = m ? Number(m[1]) : NaN;
+      const end = m ? Number(m[2]) : NaN;
+      if (m && start >= 0 && start < end && end <= 24) {
+        w.start = start;
+        w.end = end;
+      } else {
+        console.warn(`[telegram-bug-intake] WM_BUSINESS_HOURS="${spec}" is not HH-HH — using ${w.start}-${w.end} for the business-hours reminder; request-time gate pages are unaffected`);
+      }
+    }
+  } catch (err) {
+    console.warn(`[telegram-bug-intake] business window fell back to defaults: ${err.message}; request-time gate pages are unaffected`);
+    Object.assign(w, BUSINESS_WINDOW_DEFAULTS);
+  }
+  _businessWindow = w;
+  return w;
+}
+
+/** Test seam: drop the memo so a suite can re-evaluate the env. */
+export function _resetBusinessWindowForTests() {
+  _businessWindow = null;
+}
+
+/** Wall-clock parts of `date` in `timeZone` (dow: 0 = Sunday). */
+function localParts(date, timeZone) {
+  const parts = {};
+  for (const { type, value } of new Intl.DateTimeFormat("en-US", {
+    timeZone, hour12: false, weekday: "short",
+    year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", second: "2-digit",
+  }).formatToParts(date)) parts[type] = value;
+  return {
+    y: Number(parts.year), mo: Number(parts.month), d: Number(parts.day),
+    // Some ICU builds render local midnight as hour "24" under hour12:false.
+    h: Number(parts.hour) % 24, mi: Number(parts.minute), s: Number(parts.second),
+    dow: WEEKDAY_NUM[parts.weekday],
+  };
+}
+
+/**
+ * Was the human ASKED outside their window? `null` when there is no usable
+ * timestamp — an unknown answer must never read as "inside" (which would emit a
+ * misleading outsideHours:false) nor as "outside" (which would re-page).
+ */
+export function isOutsideHours(ts, w = businessWindow()) {
+  const t = ts ? new Date(ts) : null;
+  if (!t || Number.isNaN(t.getTime())) return null;
+  const p = localParts(t, w.timeZone);
+  return !(w.days.includes(p.dow) && p.h >= w.start && p.h < w.end);
+}
+
+/**
+ * The UTC instant of local wall time `hour:00` on y-mo-d in `timeZone`.
+ * DST-safe by MEASURING the zone's offset instead of assuming one: take the
+ * offset at the naive instant, correct, then re-measure at the corrected
+ * instant (one iteration is enough for every real zone, including a jump).
+ */
+function zonedInstant(y, mo, d, hour, timeZone) {
+  const target = Date.UTC(y, mo - 1, d, hour, 0, 0);
+  const offsetAt = (ms) => {
+    const p = localParts(new Date(ms), timeZone);
+    return Date.UTC(p.y, p.mo - 1, p.d, p.h, p.mi, p.s) - ms;
+  };
+  return new Date(target - offsetAt(target - offsetAt(target)));
+}
+
+/**
+ * The earliest window OPEN at or after `ts` — `ts` itself when it is already
+ * in-hours. Walks forward a local day at a time so a weekend hops to Monday.
+ * Fail-safe: anything unexpected yields ts+24h, which delays a reminder by a
+ * day rather than firing it at the wrong hour or crashing the scan.
+ */
+export function nextBusinessOpenAt(ts, w = businessWindow()) {
+  const t = ts ? new Date(ts) : null;
+  if (!t || Number.isNaN(t.getTime())) return null;
+  try {
+    const here = localParts(t, w.timeZone);
+    if (w.days.includes(here.dow) && here.h >= w.start && here.h < w.end) return t;
+    for (let i = 0; i < 8; i++) {
+      const day = i === 0 ? here : localParts(new Date(t.getTime() + i * DAY_MS), w.timeZone);
+      if (!w.days.includes(day.dow)) continue;
+      const open = zonedInstant(day.y, day.mo, day.d, w.start, w.timeZone);
+      if (open.getTime() >= t.getTime()) return open;
+    }
+  } catch (err) {
+    console.warn(`[telegram-bug-intake] nextBusinessOpenAt(${ts}) failed: ${err.message} — deferring the reminder 24h`);
+  }
+  return new Date(t.getTime() + DAY_MS);
+}
+
+// One re-page per NOTIFICATION (not per ticket, and not per scan): a gate
+// re-parked after rework mints a fresh notif.id and earns its own reminder.
+const REPAGE_KEY_PREFIX = "repage#";
+// The gate is only acked at approve time, so a gate resolved from the board
+// still looks pending here. Ask the ticket itself before nagging about it.
+const REPAGE_SKIP_STATUSES = new Set(["done", "blocked", "cancelled", "canceled"]);
+
+/** The gate's own ticket row, or null when the tickets view is unavailable. */
+async function gateTicketOf(wf, notif) {
+  try {
+    const res = await fetch(`${HUB_API_URL}/api/workflow/${wf.workflowId}/tickets`);
+    if (!res.ok) return null;
+    const { tickets = [] } = await res.json();
+    return tickets.find((t) => t.ticketId === notif.ticketId) || null;
+  } catch {
+    return null; // a reminder is cheap; a missed one is not
+  }
+}
+
+/**
+ * Publish `gate.requested` for a page that has just gone out. Best-effort by
+ * construction: the page is already delivered and the gate# claim is already
+ * held, so a publish failure is logged and nothing else — it must never release
+ * the claim (that would re-send the page) and never re-send by itself.
+ */
+async function publishGateRequested(wf, notif, w) {
+  try {
+    const outsideHours = isOutsideHours(notif.timestamp, w);
+    const openAt = outsideHours === null ? null : nextBusinessOpenAt(notif.timestamp, w);
+    await eventsClient().send(new PutEventsCommand({
+      Entries: [{
+        EventBusName: process.env.EVENT_BUS || "default",
+        Source: "agentcore-hub.orchestrator",
+        DetailType: "gate.requested",
+        Detail: JSON.stringify({
+          ticketId: notif.ticketId,
+          workflowId: wf.workflowId,
+          reviewer: notif.reviewer || null,
+          requestedAt: notif.timestamp ?? null,
+          outsideHours,
+          nextBusinessOpenAt: openAt ? openAt.toISOString() : null,
+          producer: "telegram-bug-intake",
+          timestamp: new Date().toISOString(),
+        }),
+      }],
+    }));
+  } catch (err) {
+    console.error("[telegram-bug-intake] gate.requested publish", err.message);
+  }
+}
+
+/**
+ * The gate# claim already exists (this notification was paged on an earlier
+ * scan). If that page landed outside the window and the window has since
+ * opened, send exactly ONE reminder, deduped on repage#<notif>. Never throws:
+ * a failure here must not cost the remaining pending gates their pages.
+ */
+async function repageIfWindowOpened(wf, notif, w) {
+  let holding = null;
+  try {
+    if (isOutsideHours(notif.timestamp, w) !== true) return;
+    const openAt = nextBusinessOpenAt(notif.timestamp, w);
+    if (!openAt || Date.now() < openAt.getTime()) return;
+
+    const key = `${REPAGE_KEY_PREFIX}${notif.id || notif.ticketId}`;
+    if (!(await claimKey(key))) return; // already reminded
+    holding = key;
+
+    // Resolved in the meantime → keep the claim: there is nothing to remind
+    // about and re-checking on every later scan would be pure noise.
+    const gateTicket = await gateTicketOf(wf, notif);
+    const status = String(gateTicket?.status || "").toLowerCase();
+    if (REPAGE_SKIP_STATUSES.has(status)) return;
+
+    const chats = (await listChats()).filter((c) => ALLOWED_CHAT_IDS.includes(String(c)));
+    if (!chats.length) {
+      console.warn("[telegram-bug-intake] business-hours reminder but no allowlisted chats to notify");
+      return; // the request-time page already went out; do not retry forever
+    }
+
+    const title = gateTicket?.title || notif.ticketId;
+    const reviewer = notif.reviewer || "reviewer";
+    const text = execPing({
+      kicker: `${gateLabel(notif.gate, title)} REVIEW · business-hours reminder`,
+      subject: wf.input?.title || wf.workflowId,
+      summary: `${title} was sent for review outside working hours and is still open. Your window is open now.`,
+      meta: [
+        `👤 ${esc(reviewer)}`,
+        `🎫 [${notif.ticketId}](https://${JIRA_SITE_URL}/browse/${notif.ticketId})`,
+        "⏸ pipeline paused on you",
+      ],
+      ask: "Approve to continue, or Request changes to send it back.",
+    });
+    const keyboard = { inline_keyboard: [
+      [
+        { text: "✅ Approve", callback_data: `gok|${notif.ticketId}|${wf.workflowId}` },
+        { text: "❌ Request changes", callback_data: `gno|${notif.ticketId}|${wf.workflowId}` },
+      ],
+      [{
+        text: "📱 Open approval in hub",
+        url: `${HUB_API_URL}/workflow?id=${encodeURIComponent(wf.workflowId)}&ticket=${encodeURIComponent(notif.ticketId)}`,
+      }],
+    ] };
+
+    let delivered = 0;
+    for (const chatId of chats) {
+      await tgSend(chatId, text, { reply_markup: keyboard });
+      delivered++;
+    }
+    if (!delivered) await releaseKey(holding);
+  } catch (err) {
+    console.error(`[telegram-bug-intake] business-hours reminder for ${notif.ticketId}`, err.message);
+    if (holding) {
+      await releaseKey(holding).catch((relErr) =>
+        console.error("[telegram-bug-intake] releaseKey after reminder failure", relErr.message));
+    }
+  }
+}
+
 async function scanReviewGates() {
   const res = await fetch(`${HUB_API_URL}/api/workflow/list`);
   if (!res.ok) throw new Error(`workflow/list ${res.status}`);
@@ -675,11 +939,17 @@ async function scanReviewGates() {
   }
   if (!pending.length) return;
 
+  const window = businessWindow(); // resolved once per container, on the first scan
   let chats = null; // fetched lazily — most scans find nothing new
   let pinged = 0;
   for (const { wf, notif } of pending) {
     const claimed = await claimGate(notif);
-    if (!claimed) continue;
+    if (!claimed) {
+      // Already paged. The only thing left to do for this gate is the
+      // once-per-notification reminder, if its page landed out of hours.
+      await repageIfWindowOpened(wf, notif, window);
+      continue;
+    }
     pinged++;
 
     // The claim is written before delivery is proven, so ANY throw between
@@ -799,6 +1069,9 @@ async function scanReviewGates() {
       // The claim was written before delivery was proven; if every send failed,
       // keeping it would silently skip this gate for 30 days.
       if (!delivered) await releaseGate(notif);
+      // Exactly one gate.requested per notification, and only for a page that
+      // actually landed — it is the metrics record of "the human was asked".
+      else await publishGateRequested(wf, notif, window);
     } catch (err) {
       await releaseGate(notif).catch((relErr) =>
         console.error("[telegram-bug-intake] releaseGate after gate failure", relErr.message));

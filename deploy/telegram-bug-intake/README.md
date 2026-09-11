@@ -100,7 +100,8 @@ populated for the bot to do anything.
 Optional: `BEDROCK_MODEL_ID`, `CONFIDENCE_THRESHOLD`,
 `TRANSCRIBE_LANGUAGE`, `CHAT_SETTLE_MS`, `CHAT_BUFFER_MAX_MS`,
 `WM_MIN_BUDGET_MS`, `WM_RELAY_TIMEOUT_MS`, `DEPLOY_PIPELINE_NAME`,
-`ARTIFACT_BUCKET`, `PIPELINE_REGIONS`.
+`ARTIFACT_BUCKET`, `PIPELINE_REGIONS`, `EVENT_BUS`, `WM_BUSINESS_TZ`,
+`WM_BUSINESS_HOURS` (the last three: "Working-hours paging" below).
 
 `DEPLOY_PIPELINE_NAME` and `ARTIFACT_BUCKET` together enable the CI/CD
 deploy-approval bridge (TEAM-3740, multi-target since TEAM-4338): the poller
@@ -149,6 +150,11 @@ convention per `PIPELINE_REGIONS`, and one S3 read:
 - `s3:GetObject` on exactly `config/cd-registry.json` in `ARTIFACT_BUCKET` —
   one key, not a prefix.
 
+Plus one statement for the gate event ("Working-hours paging" below):
+
+- `events:PutEvents` on exactly the effective `EVENT_BUS` (read back the same
+  way as the pipeline name). The only event published is `gate.requested`.
+
 `GetPipelineState` is authorized at the PIPELINE level, but `PutApprovalResult`
 is authorized at the ACTION level (`arn:...:<pipeline>/<stage>/<action>`), so
 its resource is `<pipeline-arn>/*` for each pipeline above, not the bare
@@ -182,6 +188,26 @@ One consequence: on the deploy that ships this change, a wait that is already
 mid-flight resolves to a different key than before, so its FIRST scan after
 the new code lands can send one duplicate ping for that same wait — the stale
 claim row simply TTLs out (7 days) and nothing else is affected.
+
+## Working-hours paging (TEAM-4453 D3)
+
+A review-gate page still fires the instant the gate opens — 02:00 Saturday
+included — and nothing here delays or suppresses it. What the window adds is
+context and one nudge: every delivered page publishes a `gate.requested` event
+(`Source: agentcore-hub.orchestrator`, bus `EVENT_BUS`, default `"default"`)
+carrying `outsideHours` and `nextBusinessOpenAt` so the dashboard can tell "the
+reviewer was asleep" from "the reviewer was slow", and a page that landed
+outside the window earns exactly **one** reminder page when the window next
+opens, if the gate is still open — one per notification, not per day, keyed by
+`repage#<notif.id>` (a gate re-parked after rework has a new id, so it gets a
+fresh page and a fresh reminder). The window is `WM_BUSINESS_TZ` /
+`WM_BUSINESS_HOURS` (same names and `HH-HH` half-open format as
+`deploy/workflow-manager/toolkit/compute_metrics.py`), but the defaults here are
+deliberately the operator's own working day — `America/Los_Angeles` and `09-18`,
+Mon–Fri — not the analyzer's `UTC` / `08-18`; an unparseable value warns once
+and falls back. Publishing is best-effort: until `update-config.sh` has granted
+`events:PutEvents` on the bus, every publish fails and is logged, and paging is
+unaffected.
 
 ## Deploy
 
