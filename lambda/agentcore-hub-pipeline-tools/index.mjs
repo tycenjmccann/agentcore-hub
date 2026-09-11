@@ -1041,13 +1041,23 @@ async function getBuildStatus(args = {}, target, targets = []) {
   }
 
   const { builds } = await cb.send(new BatchGetBuildsCommand({ ids }));
-  const rows = (builds || []).map((b) => ({
-    buildId: b.id,
-    buildStatus: b.buildStatus,
-    resolvedSourceVersion: b.resolvedSourceVersion || null,
-    sourceVersion: b.sourceVersion || null,
-    endTime: b.endTime,
-  }));
+  // BatchGetBuilds makes no ordering promise, so `ids` (which IS newest-first)
+  // drives the walk -- the same reason findBuildsForCommit indexes by id. Reading
+  // the response array as if it were ordered made `match` below (the FIRST row for
+  // the commit, i.e. "newest") whichever build AWS happened to return first: a SHA
+  // carrying a FAILED build plus a green D2 retry could report the FAILED one and
+  // succeededForCommit:false for a head CI had actually certified.
+  const byId = new Map((builds || []).filter((b) => b?.id).map((b) => [b.id, b]));
+  const rows = ids
+    .map((id) => byId.get(id))
+    .filter(Boolean)
+    .map((b) => ({
+      buildId: b.id,
+      buildStatus: b.buildStatus,
+      resolvedSourceVersion: b.resolvedSourceVersion || null,
+      sourceVersion: b.sourceVersion || null,
+      endTime: b.endTime,
+    }));
 
   let match = null;
   if (commit) {
