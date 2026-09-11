@@ -6,6 +6,7 @@ Run: python3 -m unittest deploy/workflow-manager/toolkit/test_metrics.py
 
 import json
 import os
+import random
 import sys
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -1026,6 +1027,87 @@ class WaitSplit(unittest.TestCase):
         self.assertEqual(ms_between(la(2026, 3, 8, 0, 0), la(2026, 3, 9, 0, 0)), 82_800_000)
 
 
+class SubMillisecondPrecision(unittest.TestCase):
+    """TEAM-4457 F-1 / R15 — every fixture above uses whole-second timestamps,
+    which is exactly why int(total_seconds() * 1000) truncation survived: a
+    real span of 33,126,484 ms comes back from total_seconds() as
+    33126483.999999996, and int() throws away the last millisecond. A fuzz of
+    20,000 random microsecond-precision spans violated
+    in_ms + out_ms == ms_between(start, end) 46.9% of the time before the fix
+    to ms_between and split_wait_by_window."""
+
+    def test_ms_between_floors_and_never_loses_a_whole_millisecond(self):
+        a = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        # Exactly 1.9999ms: floors to 1, not 2 — floor, not round.
+        self.assertEqual(ms_between(a, a + timedelta(microseconds=1999)), 1)
+        # The real ztg2xj span, expressed in microseconds: the old
+        # int(total_seconds() * 1000) route gave 33_126_483 here.
+        self.assertEqual(
+            ms_between(a, a + timedelta(microseconds=33_126_484_000)), 33_126_484
+        )
+
+    def test_the_real_ztg2xj_gate_span_is_exact_in_both_windows(self):
+        requested = parse_ts("2026-09-11T07:10:41.385Z")
+        resolved = parse_ts("2026-09-11T16:22:47.869Z")
+        self.assertEqual(requested.weekday(), 4)  # Friday
+
+        self.assertEqual(ms_between(requested, resolved), 33_126_484)
+
+        utc_window = business_window(tz_name="UTC", hours_spec="08-18")
+        self.assertEqual(
+            split_wait_by_window(requested, resolved, utc_window),
+            (30_167_869, 2_958_615),
+        )
+        la_window = WaitSplit.LA_WINDOW
+        self.assertEqual(
+            split_wait_by_window(requested, resolved, la_window),
+            (1_367_869, 31_758_615),
+        )
+        for window in (utc_window, la_window):
+            in_ms, out_ms = split_wait_by_window(requested, resolved, window)
+            self.assertEqual(in_ms + out_ms, ms_between(requested, resolved))
+
+    def test_sub_millisecond_residues_either_side_of_a_segment_boundary(self):
+        """Flooring ms_between PER SEGMENT (the old approach) loses precision
+        even when each floor looks harmless alone: a start 0.5ms before the
+        09:00 window opens and an end 0.7ms after it opens split into two
+        segments at that boundary, each of which floors away its own
+        sub-millisecond residue — 0.5ms + 0.7ms discarded independently — for
+        a segment sum 1ms short of the true 1000ms span."""
+        tz = WaitSplit.LA_WINDOW[0]
+        start = datetime(2026, 9, 11, 8, 59, 59, 500, tzinfo=tz).astimezone(timezone.utc)
+        end = datetime(2026, 9, 11, 9, 0, 0, 700, tzinfo=tz).astimezone(timezone.utc)
+        self.assertEqual(ms_between(start, end), 1000)
+        in_ms, out_ms = split_wait_by_window(start, end, WaitSplit.LA_WINDOW)
+        self.assertEqual(in_ms + out_ms, 1000)
+
+    def test_the_split_is_exact_for_random_microsecond_precision_spans(self):
+        rng = random.Random(4465)
+        windows = {
+            "UTC 08-18": business_window(tz_name="UTC", hours_spec="08-18"),
+            "LA 09-18": WaitSplit.LA_WINDOW,
+            "UTC 00-24": (WaitSplit.LA_WINDOW[0], 0, 24),
+        }
+        year_start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        for _ in range(500):
+            start = year_start + timedelta(
+                seconds=rng.randrange(0, 365 * 86400),
+                microseconds=rng.randrange(0, 1_000_000),
+            )
+            end = start + timedelta(
+                seconds=rng.randrange(0, 10 * 86400),
+                microseconds=rng.randrange(0, 1_000_000),
+            )
+            total = ms_between(start, end)
+            for name, window in windows.items():
+                with self.subTest(window=name, start=start, end=end):
+                    in_ms, out_ms = split_wait_by_window(start, end, window)
+                    self.assertEqual(in_ms + out_ms, total)
+                    self.assertGreaterEqual(in_ms, 0)
+                    self.assertGreaterEqual(out_ms, 0)
+                    self.assertLessEqual(in_ms, total)
+
+
 class WaitSplitEndToEnd(unittest.TestCase):
     """compute_metrics wiring: humanReviews[].inHoursMs/outsideHoursMs and the
     humanWaitInHoursMs/humanWaitOutsideHoursMs totals, driven through the real
@@ -1069,6 +1151,33 @@ class WaitSplitEndToEnd(unittest.TestCase):
         self.assertEqual(m["humanReviews"], [])
         self.assertEqual(m["humanWaitInHoursMs"], 0)
         self.assertEqual(m["humanWaitOutsideHoursMs"], 0)
+
+    def test_the_real_ztg2xj_gate_span_end_to_end_in_both_windows(self):
+        """The same real span SubMillisecondPrecision pins directly, driven
+        through compute_metrics instead — the fix has to hold at the wiring
+        layer, not just inside split_wait_by_window."""
+        requested_at = "2026-09-11T07:10:41.385Z"
+        resolved_at = "2026-09-11T16:22:47.869Z"
+
+        m = self.with_window(requested_at, resolved_at, tz="UTC", hours="08-18")
+        review = m["humanReviews"][0]
+        self.assertEqual(review["waitMs"], 33_126_484)
+        self.assertEqual(review["inHoursMs"], 30_167_869)
+        self.assertEqual(review["outsideHoursMs"], 2_958_615)
+        self.assertEqual(review["inHoursMs"] + review["outsideHoursMs"], review["waitMs"])
+        self.assertEqual(
+            m["humanWaitInHoursMs"] + m["humanWaitOutsideHoursMs"], m["humanWaitTotalMs"]
+        )
+
+        m = self.with_window(requested_at, resolved_at, tz="America/Los_Angeles", hours="09-18")
+        review = m["humanReviews"][0]
+        self.assertEqual(review["waitMs"], 33_126_484)
+        self.assertEqual(review["inHoursMs"], 1_367_869)
+        self.assertEqual(review["outsideHoursMs"], 31_758_615)
+        self.assertEqual(review["inHoursMs"] + review["outsideHoursMs"], review["waitMs"])
+        self.assertEqual(
+            m["humanWaitInHoursMs"] + m["humanWaitOutsideHoursMs"], m["humanWaitTotalMs"]
+        )
 
 
 if __name__ == "__main__":
