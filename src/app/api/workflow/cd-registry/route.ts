@@ -6,6 +6,7 @@ import {
   normalizeRepoKey,
   upsertCdEntry,
   removeCdEntry,
+  validateCdEntryInput,
   type CdRegistryEntry,
 } from "@/lib/cd-registry";
 
@@ -41,13 +42,9 @@ export async function GET(req: NextRequest) {
 export async function POST(req: NextRequest) {
   let body: Record<string, unknown>;
   try { body = await req.json(); } catch { return NextResponse.json({ error: "Invalid JSON" }, { status: 400 }); }
-  if (!normalizeRepoKey(body.repo)) {
-    return NextResponse.json({ error: "repo must be owner/repo or a GitHub URL" }, { status: 400 });
-  }
-  for (const f of ["pipeline", "region", "ciProject", "deployDoc", "notes"]) {
-    if (body[f] !== undefined && typeof body[f] !== "string") {
-      return NextResponse.json({ error: `${f} must be a string` }, { status: 400 });
-    }
+  const fields = validateCdEntryInput(body);
+  if (fields) {
+    return NextResponse.json({ error: "invalid_field", fields }, { status: 400 });
   }
   try {
     const current = await loadCdRegistry({ force: true });

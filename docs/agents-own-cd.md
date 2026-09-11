@@ -65,6 +65,13 @@ not end in `-deploy` is used as the base as-is (`juno` → `juno-ci` / `juno-bui
 keep their historical `agentcore-hub-*` names, so `agentcore-hub-deploy` derives
 `agentcore-hub-ci` / `agentcore-hub-build`.
 
+`POST /api/workflow/cd-registry` shape-validates every field (`repo`, `region`,
+`pipeline`, `ciProject`, `deployDoc`, `notes`) before it reaches S3 —
+`validateCdEntryInput` in `src/lib/cd-registry.ts` — and rejects with
+`400 { error: "invalid_field", fields }` naming every failing field at once, so
+a typo'd region or path traversal in `deployDoc` fails here instead of as an
+opaque AWS error inside a Lambda later.
+
 Regions: `node deploy/setup-pipeline-tools-lambda.mjs` reads `PIPELINE_REGIONS`
 (comma-separated; default = the Lambda's own region) to fan the tools Lambda's IAM
 grants (pipeline + project ARNs) out to those regions - it is not a runtime check
