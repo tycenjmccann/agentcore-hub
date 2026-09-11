@@ -221,6 +221,12 @@ export default defineConfig({
       // human actually filed (zero, in every dossier we have), that the
       // creation-time block still costs no I/O, and that off is unchanged.
       "lambda/orchestrator/replay-gate-state.test.mjs",
+      // replay-intake-materialize (TEAM-4453 D1) — the ztg2xj write sequence of a
+      // hub-materialized operator skeleton replayed through the REAL twins: the
+      // sentinel release dispatches the build exactly once, ticket.phase (not the
+      // persona's roster phase) advances intake → development → ship, a junk stamp
+      // is ignored, and the human gate is published without an agentTasks entry.
+      "lambda/orchestrator/replay-intake-materialize.test.mjs",
       // workflow-output report_completion (TEAM-4121 FR-9) — the completion record
       // is what live-reverify.mjs reads to decide whether a "live" fix actually
       // produced live evidence, so the two new fields must be additive (a record

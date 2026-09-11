@@ -2638,7 +2638,8 @@ async function handleTicketReadyUnified(ticketId, ticket) {
   // Phase advancement (workflow-def driven, with software-delivery fallback)
   const wfDef = getEffectiveWorkflowDef(workflow); // framework overlay decides featureBranchPhase
   const phaseOrder = wfDef.phaseOrder;
-  const agentPhaseIdx = phaseOrder.indexOf(agentDef.phase);
+  const ticketPhase = (ticket.phase && phaseOrder.includes(ticket.phase)) ? ticket.phase : agentDef.phase; // TEAM-4453: hub-stamped phase wins (junk ignored)
+  const agentPhaseIdx = phaseOrder.indexOf(ticketPhase);
   const currentPhaseIdx = phaseOrder.indexOf(workflow.phase);
   // Shared feature branch on the def's branch phase (repo-backed workflows only).
   // Independent of the phase ADVANCE below: the playbook def's branch phase is
@@ -2649,8 +2650,8 @@ async function handleTicketReadyUnified(ticketId, ticket) {
     workflow.featureBranch = await ensureFeatureBranch(workflow);
   }
   if (agentPhaseIdx > currentPhaseIdx) {
-    workflow.phase = agentDef.phase;
-    await publishEvent(ticketId, "workflow.phase_change", { phase: agentDef.phase, workflowId: workflow.id });
+    workflow.phase = ticketPhase;
+    await publishEvent(ticketId, "workflow.phase_change", { phase: ticketPhase, workflowId: workflow.id });
     await store.advancePhase(workflow.id, workflow.phase, workflow.featureBranch);
   }
 
@@ -2678,7 +2679,7 @@ async function handleTicketReadyUnified(ticketId, ticket) {
   }
 
   console.log(`[orchestrator] Invoking agent ${assignee} for ticket ${ticketId}${resumed ? " (SESSION RESUME)" : ""}`);
-  await publishEvent(ticketId, "agent.invoked", { ticketId, assignee, agentId: assignee, phase: agentDef.phase, workflowId: workflow.id });
+  await publishEvent(ticketId, "agent.invoked", { ticketId, assignee, agentId: assignee, phase: ticketPhase, workflowId: workflow.id });
 
   await invokeAgent(agentDef, context, workflow, ticketId);
 }
@@ -2905,9 +2906,10 @@ export function isCreationTimeBlock(oldStatus) {
 async function trackTicketCreation(ticketId, assignee, workflowId, parentId) {
   if (!assignee || !parentId) return;
 
-  // Skip epics — they're containers, not agent tasks
+  // Skip epics — containers, not agent tasks. TEAM-4453: a human gate has no agent
+  // def but still gets ticket.created below (board renders it); never agentTasks.
   const agentDef = getAgentDef(assignee);
-  if (!agentDef) return;
+  if (!agentDef && !isHumanAssignee(assignee)) return;
 
   const workflow = await resolveWorkflow(workflowId, parentId);
   if (!workflow) return;
@@ -2915,18 +2917,20 @@ async function trackTicketCreation(ticketId, assignee, workflowId, parentId) {
   // Already tracked (e.g., from a retry/re-delivery) — don't overwrite
   if (workflow.agentTasks?.[ticketId]) return;
 
-  const entry = {
-    id: `task_${Date.now()}_${assignee}`,
-    agentId: assignee,
-    ticketId,
-    status: "pending",
-    createdAt: new Date().toISOString(),
-  };
-  const created = await store.trackTicket(workflow.id, ticketId, entry);
-  if (!created) return; // concurrently tracked — keep the existing entry
-  if (!workflow.agentTasks) workflow.agentTasks = {};
-  workflow.agentTasks[ticketId] = entry;
-  console.log(`[orchestrator] Tracked new ticket ${ticketId} (${assignee}) in workflow ${workflow.id}`);
+  if (agentDef) {
+    const entry = {
+      id: `task_${Date.now()}_${assignee}`,
+      agentId: assignee,
+      ticketId,
+      status: "pending",
+      createdAt: new Date().toISOString(),
+    };
+    const created = await store.trackTicket(workflow.id, ticketId, entry);
+    if (!created) return; // concurrently tracked — keep the existing entry
+    if (!workflow.agentTasks) workflow.agentTasks = {};
+    workflow.agentTasks[ticketId] = entry;
+    console.log(`[orchestrator] Tracked new ticket ${ticketId} (${assignee}) in workflow ${workflow.id}`);
+  }
 
   // Fan out a ticket.created event so the UI can render the badge without polling.
   // Keep the publish best-effort — failure here must not block tracking.
@@ -2939,6 +2943,7 @@ async function trackTicketCreation(ticketId, assignee, workflowId, parentId) {
         title: t?.title || ticketId,
         status: t?.status || "todo",
         assignee,
+        agentId: agentDef ? assignee : null, // null = human gate, no agent will run it
         parent: parentId,
         type: t?.type || "task",
         updatedAt: t?.updatedAt || new Date().toISOString(),
@@ -3075,7 +3080,8 @@ async function handleTicketReady(ticketId, image) {
   // Advance phase if needed (workflow-def driven, with software-delivery fallback)
   const wfDef = getEffectiveWorkflowDef(workflow); // framework overlay decides featureBranchPhase
   const phaseOrder = wfDef.phaseOrder;
-  const agentPhaseIdx = phaseOrder.indexOf(agentDef.phase);
+  const p = unwrapDdbValue(image.phase); const ticketPhase = (p && phaseOrder.includes(p)) ? p : agentDef.phase; // TEAM-4453: hub-stamped phase wins (junk ignored)
+  const agentPhaseIdx = phaseOrder.indexOf(ticketPhase);
   const currentPhaseIdx = phaseOrder.indexOf(workflow.phase);
   // Shared feature branch on the def's branch phase — independent of the phase
   // advance (see handleTicketReadyUnified for why). ensureFeatureBranch persists itself.
@@ -3083,8 +3089,8 @@ async function handleTicketReady(ticketId, image) {
     workflow.featureBranch = await ensureFeatureBranch(workflow);
   }
   if (agentPhaseIdx > currentPhaseIdx) {
-    workflow.phase = agentDef.phase;
-    await publishEvent(ticketId, "workflow.phase_change", { phase: agentDef.phase, workflowId: workflow.id });
+    workflow.phase = ticketPhase;
+    await publishEvent(ticketId, "workflow.phase_change", { phase: ticketPhase, workflowId: workflow.id });
     await store.advancePhase(workflow.id, workflow.phase, workflow.featureBranch);
   }
 
@@ -3113,7 +3119,7 @@ async function handleTicketReady(ticketId, image) {
   }
 
   console.log(`[orchestrator] Invoking agent ${assignee} for ticket ${ticketId}${resumed ? " (SESSION RESUME)" : ""}`);
-  await publishEvent(ticketId, "agent.invoked", { ticketId, assignee, agentId: assignee, phase: agentDef.phase, workflowId: workflow.id });
+  await publishEvent(ticketId, "agent.invoked", { ticketId, assignee, agentId: assignee, phase: ticketPhase, workflowId: workflow.id });
 
   // Fire-and-forget: invoke agent via AgentCore Harness
   // The agent will call report_completion when done → writes "done" to DynamoDB → triggers this Lambda again
