@@ -460,7 +460,8 @@ so the module stays truly optional.
 - **`agentcore-hub-pipeline-tools` Lambda.** The fleet drives the pipeline
   through a narrow Lambda (`lambda/agentcore-hub-pipeline-tools/`, deployed via
   `deploy/setup-pipeline-tools-lambda.mjs`) exposing `Pipeline___get_state` /
-  `start_deploy` / `get_build_status` / `get_build_log` — read + trigger only.
+  `start_deploy` / `get_build_status` / `get_build_log` / `start_ci_build`
+  (PR #388) / `capabilities` — six tools, read + trigger only.
   **Invariant: no `codepipeline:PutApprovalResult`** — an agent must never
   approve its own deploy; the ManualApproval gate stays human (Telegram bridge).
   This exists because the coding-runtime role is AccessDenied on CodePipeline by
@@ -483,7 +484,9 @@ so the module stays truly optional.
   (silent-catch when the Pipeline module is absent).
 - **Multi-target (TEAM-4336).** The pilot's one pipeline generalizes to one
   CodePipeline per repo in the CD registry (`hub-<slug>-deploy`, possibly in
-  another region). The tools Lambda resolves a call's target from the registry
+  another region OR another AWS account — via an assumed `hub-cd-trigger-<slug>`
+  role plus `externalId`, PR #535). The tools Lambda resolves a call's target
+  from the registry
   rather than a single `PIPELINE_NAME`, and every surface derives the CI/build
   project names from the entry's `pipeline` through one shared helper
   (`pipelineProjects` / `pipelineProjectsFor`). `/api/pipeline/status` returns a

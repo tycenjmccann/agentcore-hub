@@ -100,9 +100,12 @@ Rollback is a blueprint edit: restore the previous delegation step and re-sync
   bug-fixer and code-sweeper blueprints tell the persona to ask codex for a text
   plan and approve it before the write/delete turn. A read-only sandbox turn
   (`codex exec --sandbox read-only`) could enforce it later.
-- **Remaining personas.** `playbook-build` keeps its current delegation; adopt
-  by copying the delegation step. Designers, CI, and release-manager are not
-  code implementers and stay as-is.
+- **Remaining personas.** The `operator` persona (added after this doc) is now
+  covered: it is a plan-first Claude Code driver — a plan turn (`plan_only=True`,
+  `model="opus"`, `fable` when ambiguous/architecture-heavy), the persona
+  approves, then an execute turn on the same conversation. `playbook-build` keeps
+  its current delegation; adopt by copying the delegation step. Designers, CI,
+  and release-manager are not code implementers and stay as-is.
 - **Plan artifacts.** Claude Code persists plans under its config dir on the
   coding runtime's EFS; they are not yet harvested to S3 or surfaced in the
   workflow artifact viewer.

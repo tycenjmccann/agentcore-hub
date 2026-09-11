@@ -2,24 +2,32 @@
 
 ## Fleet Overview
 
-14 specialized agents deployed on AWS Bedrock AgentCore Runtime. Each agent is a Strands-based Python process with a baked-in system prompt, shared toolset (40 tools per agent), and model configuration (Claude Opus 4.6).
+20 specialized agents make up the software-delivery fleet, deployed on AWS Bedrock AgentCore Runtime. Each agent is a Strands-based Python process with a baked-in system prompt, shared toolset (40 tools per agent), and model configuration (personas run on Claude Fable 5.1; `claude_code` delegations pick opus/sonnet/haiku per call — see Plan-first delegation below).
+
+The pipeline flows Requirements → 8 parallel Design → 3 Dev → Review (code review + CI) → Verification (QA) → Ship (release manager). `bug_fixer`, `operator`, and `code_sweeper` are development-phase personas used by the bug-fix / operator / sweep flows; `fleet_improver` closes the self-improvement loop by turning low eval scores into PRDs that re-enter the same pipeline.
 
 | Agent | Role | Phase | Skills Loaded |
 |-------|------|-------|---------------|
 | `agentcore_hub_requirements_analyst` | Analyzes inputs, creates tickets for relevant agents | Requirements | requirements-analysis |
-| `agentcore_hub_frontend_designer` | Designs UI/UX for web features | Design | frontend-design, ios-architecture |
+| `agentcore_hub_frontend_designer` | Designs UI/UX for web features | Design | frontend-design |
 | `agentcore_hub_backend_designer` | Designs backend systems & APIs | Design | backend-systems |
 | `agentcore_hub_ios_designer` | Designs native iOS features | Design | ios-architecture |
 | `agentcore_hub_android_designer` | Designs Android features | Design | general-design |
 | `agentcore_hub_analytics_designer` | Designs analytics/tracking | Design | general-design |
+| `agentcore_hub_security_reviewer` | Threat modeling, auth flows, OWASP, security architecture review | Design | security-review |
+| `agentcore_hub_legal_compliance` | Privacy/compliance review (GDPR/CCPA, data handling) | Design | privacy-compliance |
+| `agentcore_hub_localization` | i18n strategy, string extraction, RTL, locale handling | Design | localization, i18n-tooling |
 | `agentcore_hub_frontend_dev` | Implements web UI features | Development | full-stack, code-simplifier, feature-dev |
 | `agentcore_hub_backend_dev` | Implements backend services | Development | node-typescript, feature-dev |
 | `agentcore_hub_api_dev` | Implements API endpoints | Development | node-typescript, feature-dev |
-| `agentcore_hub_qa_verifier` | Runs builds, tests, static analysis | Verification | qa-verification |
-| `agentcore_hub_ci_agent` | CI pipeline validation | Verification | ci-verification |
-| `agentcore_hub_security_reviewer` | Security audit of code changes | Review | code-review |
-| `agentcore_hub_legal_compliance` | Privacy/compliance review | Review | privacy-compliance |
-| `agentcore_hub_localization` | i18n implementation | Development | localization, i18n-tooling |
+| `agentcore_hub_bug_fixer` | Locates the root cause and fixes a bug in one flow (plan-first) | Development | feature-dev |
+| `agentcore_hub_operator` | Owns an operator-workflow run end to end; plan-first Claude Code driver | Development | full-stack |
+| `agentcore_hub_code_sweeper` | Detects and surgically removes unused/dead code (language-aware) | Development | code-simplifier |
+| `agentcore_hub_code_reviewer` | Adversarial diff review of a dev branch, runs BEFORE QA (on `codex`) | Review | code-review |
+| `agentcore_hub_ci_agent` | CI pipeline validation / build-failure triage; certifies the head | Review | ci-verification |
+| `agentcore_hub_qa_verifier` | Visual/E2E verification, design-to-implementation checks | Verification | qa-verification |
+| `agentcore_hub_release_manager` | Owns the last mile: unified PR, final review, merge, deploy | Ship | — (blueprint-driven) |
+| `agentcore_hub_fleet_improver` | Turns low eval scores into PRDs for the delivery pipeline | Self-improvement | — (blueprint-driven) |
 
 ---
 
@@ -136,25 +144,42 @@ The `claude_code` tool runs `claude --print` as a subprocess. When Claude Code o
 
 ### How Agents Should Use Claude Code
 
-**Dev agents** (frontend, backend, API):
+**Dev agents** (frontend, backend, API, bug_fixer) — **plan-first** (see
+`docs/plan-first-coding.md`). The persona splits the delegation into a plan turn
+and an execute turn on one shared conversation: plan on a strong model, approve,
+then execute on a cheaper one.
 ```
+# 1. Plan turn — reads the repo, returns a plan, writes nothing:
 claude_code(task="Clone https://github.com/org/repo, checkout -b feature/TEAM-123-sidebar.
-Implement the collapsible sidebar per the design doc at workflows/wf_xxx/shared/design.md in S3.
-Use /feature-dev workflow. Commit and push when done.")
+Plan the collapsible sidebar per the design doc at workflows/wf_xxx/shared/design.md in S3.",
+            plan_only=True, model="opus")
+# 2. Persona reviews the plan against the design + acceptance criteria (revise if deficient).
+# 3. Execute turn — same conversation (--resume), full autonomy:
+claude_code(task="Plan approved. Implement it exactly as planned. Commit and push when done.",
+            model="sonnet")
 ```
 
-**QA agent**:
+**QA agent** — QA does the judgment work the mechanical build does NOT: visual,
+live-integration, perf, and acceptance verification. In **pipeline mode** the CI
+agent has already certified the integration-branch head (QA's ticket is
+`blocked_by` the CI ticket), so QA reads the newest CI completion record and does
+**not** re-run `npm run build`. QA never runs `npm install` / `npm ci`
+(`node_modules` is a provisioned symlink to a per-lockfile cache) and never runs
+`playwright install` (Chromium is baked into the image).
 ```
 claude_code(task="Clone https://github.com/org/repo, checkout branch feature/TEAM-123-sidebar.
-Run /code-review on the diff vs main. Then run npm test and npm run build.
-Report all findings.")
+Start the dev server and screenshot the changed view with Playwright (viewport 1440x900),
+save to .cloud-code/artifacts/qa-verification-screenshot.png. Describe what it shows vs the design.")
 ```
 
-**Security reviewer**:
+**Code reviewer** (separate `code_reviewer` agent, runs AFTER dev and BEFORE QA)
+— an adversarial diff review on `codex` (an independent engine from the
+`claude_code` the dev used), falling back to `claude_code` only if codex is
+unavailable.
 ```
-claude_code(task="Clone https://github.com/org/repo, checkout branch feature/TEAM-123-sidebar.
-Run the pr-review-toolkit security analysis. Check for OWASP Top 10 issues.
-Report findings with file:line references.")
+codex(task="Clone https://github.com/org/repo, checkout branch feature/TEAM-123-sidebar.
+Diff it against origin/main and reason about how the change fails — the failure
+modes the author's own tests never exercise. Report findings with file:line references.")
 ```
 
 ### Plugin Loading — No Redeploy Needed
@@ -206,7 +231,7 @@ All 3 Lambdas load the roster from S3 at cold start and cache it in memory. If S
       "description": "Implement UI from...",     // Role description
       "phase": "development",                    // Pipeline phase
       "type": "developer",                       // Agent type
-      "model": "claude-sonnet-4-5",              // Model choice
+      "model": "Claude Fable 5.1",               // Persona model (Fable 5.1 fleet-wide)
       "evaluationsEnabled": true,                // Online evals on/off
       "tools": [...],                            // Tool list (synced from main.py)
       "skills": [...],                           // Claude Code skills loaded from S3
@@ -240,7 +265,7 @@ All 3 Lambdas load the roster from S3 at cold start and cache it in memory. If S
 
 | Variable | Value | Purpose |
 |----------|-------|---------|
-| `MODEL_ID` | `us.anthropic.claude-opus-4-6-v1` | LLM model |
+| `MODEL_ID` | `us.anthropic.claude-fable-5-1` | Persona LLM model (Fable 5.1 fleet-wide) |
 | `AWS_REGION` | `us-east-1` | AWS region |
 | `READ_TIMEOUT` | `600` | Boto3 read timeout (10 min) |
 | `GATEWAY_ARN` | `arn:aws:bedrock-agentcore:...` | AgentCore gateway |
@@ -311,7 +336,7 @@ User Input → Requirements Agent → Creates Tickets → DynamoDB Stream
 Orchestrator Lambda → Invokes Agent via Runtime ARN
     │
     ▼
-Agent executes → Uses tools → Writes artifacts → Marks ticket "done"
+Agent executes → Uses tools → Writes artifacts → ships, then reports completion
     │
     ▼ (DynamoDB Stream fires on status change)
 Orchestrator checks → Unblocks downstream tickets → Invokes next agents
@@ -320,11 +345,33 @@ Orchestrator checks → Unblocks downstream tickets → Invokes next agents
 Workflow Complete
 ```
 
+**Completion contract (ship-then-report).** The moment the deliverable exists
+(commit pushed / PR opened, merged where the step requires it), the agent
+persists its evidence to `workflows/{workflowId}/shared/…-evidence/` in S3 and
+then calls `WorkflowOutput___report_completion` **immediately** — same turn,
+before any summary or reflective text (#457). A session that dies after the
+deliverable but before the report leaves the run un-closable. Agents do **not**
+loop in place waiting on other work: an agent that needs a fix (QA/CI/reviewer
+filing a fix ticket) self-parks by setting `blocked_by` on
+`Tickets___transition_ticket`, releasing its invocation claim, and is
+re-invoked when the blocker closes (#452/#455, DL-024). The orchestrator only
+dispatches and cascades tickets; every "what happens next" decision lives in the
+blueprint.
+
 ### Dependency Chain
 
 ```
-Design agents (no blockers) → Dev agents (blocked by design) → QA (blocked by ALL dev) → CI (blocked by QA)
+Design agents (no blockers) → Dev agents (blocked by design)
+    → Code review (code_reviewer, runs after dev) + CI (certifies the integration-branch head)
+    → QA (blocked_by the CI ticket; reads the CI completion record, does not re-run the build)
+    → Ship (release_manager: unified PR + final review + human merge gate)
 ```
+
+CI certifies **first**: the CI agent syncs and certifies the head SHA, and the
+QA ticket is `blocked_by` the CI ticket, so QA reads the newest CI completion
+record rather than re-compiling. Ship review is **one round** — round 1 raises
+every in-diff finding, and mergeability (`gh pr view --json mergeable`) is
+checked before the change reaches the human merge gate (#537).
 
 ---
 
@@ -346,7 +393,7 @@ See `docs/workflow-pipeline-architecture.md` § "Starting Test Workflows" for fu
 Local test script at `deploy/runtime-agent/local-ab-test.py`:
 - Variant A: Agent codes directly (shell, editor, file_write)
 - Variant B: Agent delegates to Claude Code SDK
-- Same model (Opus 4.6), same prompt — only difference is the `claude_code` tool
+- Same model (Fable 5.1), same prompt — only difference is the `claude_code` tool
 - Both clone repo, branch, code, commit, push, create PRs
 - Compare: time, tool calls, code quality, test quality
 

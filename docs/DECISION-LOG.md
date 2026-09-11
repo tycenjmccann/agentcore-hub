@@ -1,5 +1,11 @@
 # Decision Log
 
+> ## NOTE - this is NOT the canonical decision log
+>
+> **The authoritative / canonical decision log is [`docs/workflow-pipeline-architecture.md`](./workflow-pipeline-architecture.md).** Any `DL-NNN` reference anywhere else in this repo (CLAUDE.md, `scripts/check-orchestrator-surface.sh`, blueprints, code comments) resolves against THAT file, not this one.
+>
+> This file is a legacy / early log retained for history. Its `DL-NNN` numbers are LOCAL to this file and may collide with - and mean something entirely different from - the same numbers in the canonical log. For example, this file's DL-009 / DL-010 / DL-011 / DL-012 are unrelated to the canonical DL-009 / DL-010 / DL-011 / DL-012.
+
 Architectural decisions and their rationale. Newest first.
 
 ---

@@ -63,6 +63,8 @@ The orchestration pipeline. Self-contained surface.
 - `agentcore-hub-tickets` — DynamoDB-backed ticket tools (deployed when `TICKET_PROVIDER=dynamodb`)
 - `workflow-output` — collects agent artifacts
 - `cost-report` — per-run performance card (cost / time / quality + anomaly bands) on `workflow.complete`; writes `workflows/{id}/shared/performance-card.{json,md}`, `performance/index.json`, `workflow.performance` events and `AgentCoreHub/Performance` CloudWatch metrics (`docs/performance-card.md`)
+- `anomaly-watcher` — scheduled workflow-observability Lambda (EventBridge Scheduler, ~10 min): folds live-run events into hourly metric buckets, detects anomalies against the bundled `bands.yaml`, and takes highest-tier action (log / diagnose + page / file one bug workflow under a fleet-wide cap); no function URL or API
+- `workflow-analyzer` — thin dispatcher that invokes the Workflow Manager harness (`agentcore_hub_workflow_manager`) on terminal workflow outcomes or a schedule to ANALYZE completed runs / WATCH stale ones; all analysis + intervention logic lives in the harness
 
 **DynamoDB tables** (defaults in `deploy/config.sh`)
 - `agentcore-hub-workflows` (`WORKFLOWS_TABLE`)
@@ -264,6 +266,93 @@ See [mcp/hub/README.md](../mcp/hub/README.md).
 
 ---
 
+## Module: Routines (optional)
+
+Scheduled / recurring workflow runs. A routine is a saved workflow-start template
+plus a schedule; each fire re-enters the Workflow pipeline. Self-contained surface.
+
+**UI routes**
+- `src/app/routines/` — routines list + chat-based routine builder
+
+**API routes** (under `src/app/api/routines/`)
+- `/api/routines` — list / create routines
+- `/api/routines/[id]` — get / update / delete a single routine (+ enable/disable, run-now)
+- `/api/routines/chat` — the conversational routine builder
+- `/api/routines/definitions` — workflow definitions the builder can schedule
+
+**Lib**
+- `src/lib/routines/{types,store,schedule,cron,payload,format}.ts` — routine model,
+  the (tenant-scoped) DynamoDB store, EventBridge Scheduler wiring, cron parsing,
+  and the workflow-start payload builder (kept in sync with `lambda/routines-runner`)
+
+**Lambdas** (`lambda/`)
+- `routines-runner` — EventBridge Scheduler target (one schedule per routine,
+  `input = {routineId}`); on each fire it loads the routine, builds the
+  `/api/workflow/start` payload and submits the run
+
+**DynamoDB tables** (defaults in `deploy/config.sh`)
+- `agentcore-hub-routines` (`ROUTINES_TABLE`) — one row per routine
+
+**Deploy scripts**
+- `lambda/routines-runner/deploy.sh` — runner Lambda + scheduler role + DLQ
+- `deploy/routine-builder/` — the routine-builder agent assets (`deploy.sh`,
+  `setup-routine-builder.mjs`, `system-prompt.md`, `toolkit/`)
+
+**Env vars** — `ROUTINES_TABLE`, `ROUTINES_SCHEDULE_GROUP`, `ROUTINES_RUNNER_ARN`,
+`ROUTINES_SCHEDULER_ROLE_ARN`, `ROUTINES_DLQ_ARN`, `ARTIFACT_BUCKET`.
+
+**Removing the module**
+- Delete the `/routines` nav entry tagged `module: "routines"` in `src/config/modules.ts`
+- `rm -rf src/app/routines src/app/api/routines src/lib/routines lambda/routines-runner deploy/routine-builder`
+- If deployed, delete the `agentcore-hub-routines` table, the routine EventBridge
+  schedules / schedule group, and the runner Lambda + its scheduler role and DLQ
+- `npx tsc --noEmit && npm run build`
+
+---
+
+## Module: Connectors (optional)
+
+A reusable **connector** primitive — saved config for an external service, with
+secret values kept out of the LLM's reach. The registry (metadata + secret-key
+names only) lives in `config/connectors.json` in the artifact bucket; secret
+values go to AWS Secrets Manager (under the `connectors/` prefix) and are never
+returned to the model. Self-contained surface — **no DynamoDB tables, no Lambdas**.
+
+**UI routes**
+- `src/app/connectors/` — connectors list + editor
+
+**API routes** (under `src/app/api/connectors/`)
+- `/api/connectors` — list / create connectors
+- `/api/connectors/[id]` — get / update / delete a single connector
+
+**Lib**
+- `src/lib/connectors/{types,store,secrets}.ts` — connector model, the S3 registry
+  store (`config/connectors.json`), and the Secrets Manager helper (create / put /
+  delete secret values; the registry keeps only the secret key names)
+
+**AWS services**
+- S3 (`ARTIFACT_BUCKET`) — the connector registry doc
+- Secrets Manager — secret values under the `connectors/` prefix
+
+**Lambdas** — none.
+
+**DynamoDB tables** — none.
+
+**Deploy scripts**
+- `deploy/connectors/deploy.sh` — grants the app/runtime roles the scoped
+  Secrets Manager permissions on `connectors/*`
+
+**Env vars** — `ARTIFACT_BUCKET`, `AWS_REGION`.
+
+**Removing the module**
+- Delete the `/connectors` nav entry tagged `module: "connectors"` in `src/config/modules.ts`
+- `rm -rf src/app/connectors src/app/api/connectors src/lib/connectors deploy/connectors`
+- If deployed, delete `config/connectors.json` from the artifact bucket, the
+  `connectors/*` secrets, and revert the scoped Secrets Manager IAM grants
+- `npx tsc --noEmit && npm run build`
+
+---
+
 ## Module: Pipeline (optional)
 
 AWS-native CI/CD for a repo the hub builds into (pilot: the hub's own repo). A
@@ -277,7 +366,7 @@ AND set the enable flags. With them unset the `/pipeline` nav entry is hidden an
 the CI/QA/release-manager blueprints run their legacy self-build path unchanged.
 
 **UI routes**
-- `src/app/pipeline/` — read-only status board, one section per CD target (CI builds + deploy pipeline stages, with the target's repo/region/CI project in its header and its own error block).
+- `src/app/pipeline/` — read-only status board, one section per CD target (CI builds + deploy pipeline stages, with the target's repo/region/CI project in its header and its own error block). It also surfaces the waiting deploy gate: when a deploy is awaiting approval the target shows an amber approval card (waitingSince, commit link, approve link) and a run-scoped banner.
 
 **API routes** (under `src/app/api/pipeline/`)
 - `/status` — per-target recent CodeBuild builds + CodePipeline stage state (pure reads): `{ enabled, pipelines[] }`. `?repo=<url|owner/repo>` narrows to that repo's target (an unknown/unregistered repo falls back to the env default, so callers must check the returned `repo` before attributing state to a run — that check is what keeps the board's deploy-gate banner repo-scoped).
@@ -398,7 +487,7 @@ rm -rf src/app/workflow src/app/tickets \
 
 # 2. Lambdas (if already deployed, also delete the AWS functions/tables)
 rm -rf lambda/orchestrator lambda/agentcore-hub-jira \
-       lambda/agentcore-hub-tickets lambda/workflow-output
+       lambda/agentcore-hub-tickets lambda/workflow-output lambda/cost-report
 
 # 3. Nav: delete the two entries tagged module: "workflow" in src/config/modules.ts
 #    (Workflow + Ticket History)

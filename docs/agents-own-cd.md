@@ -45,8 +45,16 @@ privileged, and review registry diffs the way you'd review an IAM change.
 ### Per-entry fields and the naming convention
 
 An entry carries `pipeline` (the CodePipeline that deploys the repo), `region`
-(where that pipeline lives — absent means the hub's own region), and optionally
-`ciProject` (the repo's CodeBuild PR-check project). Everything else is derived
+(where that pipeline lives — absent means the hub's own region), optionally
+`ciProject` (the repo's CodeBuild PR-check project), and — for a pipeline in a
+**different AWS account** — an optional cross-account triple: `account` (the
+12-digit account the pipeline lives in), `roleArn` (the
+`arn:aws:iam::<account>:role/hub-cd-trigger-<slug>` trigger-only role the
+`Pipeline___*` tools Lambda `AssumeRole`s there) and `externalId` (the
+confused-deputy guard on that AssumeRole). The triple is honored only as a
+complete, valid set — `roleArn`'s embedded account cross-checked against
+`account`, `roleArn` naming the reserved `hub-cd-trigger-*` role — else it is
+dropped and the entry falls back to same-account. Everything else is derived
 from the pipeline name, by one rule shared by every surface —
 `pipelineProjects()` in `lambda/orchestrator/cd-registry.mjs` and its TS mirror
 `pipelineProjectsFor()` in `src/lib/cd-registry.ts`:
@@ -66,8 +74,10 @@ keep their historical `agentcore-hub-*` names, so `agentcore-hub-deploy` derives
 `agentcore-hub-ci` / `agentcore-hub-build`.
 
 `POST /api/workflow/cd-registry` shape-validates every field (`repo`, `region`,
-`pipeline`, `ciProject`, `deployDoc`, `notes`) before it reaches S3 —
-`validateCdEntryInput` in `src/lib/cd-registry.ts` — and rejects with
+`pipeline`, `ciProject`, `deployDoc`, `notes`, plus the cross-account
+`account`, `roleArn`, `externalId` — with `roleArn`'s embedded account
+cross-checked against `account`, and the triple accepted only whole) before it
+reaches S3 — `validateCdEntryInput` in `src/lib/cd-registry.ts` — and rejects with
 `400 { error: "invalid_field", fields }` naming every failing field at once, so
 a typo'd region or path traversal in `deployDoc` fails here instead of as an
 opaque AWS error inside a Lambda later.

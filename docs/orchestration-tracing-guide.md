@@ -1,6 +1,8 @@
 # Orchestration Tracing Guide
 
 > **Purpose**: Step-by-step operational reference for tracing a workflow execution through all components. Use this when debugging stuck, out-of-order, or duplicated ticket behavior.
+>
+> **Ticket backend**: this guide walks the **Jira** path (`TICKET_PROVIDER=jira`), which is what `.env.example` / the Dockerfile ship. `TICKET_PROVIDER=dynamodb` is the code default when the var is unset - DynamoDB Streams replace Jira webhooks as the trigger, but the orchestrator handlers, the agent-invoker hop, and the events table are the same. See `docs/workflow-pipeline-architecture.md`.
 
 ---
 
@@ -75,10 +77,12 @@
                                     ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │ STEP 5: Agent Invocation (fire-and-forget)                                   │
-│ Who:   Orchestrator → Bedrock AgentCore Runtime                              │
-│ What:  Async invoke of the agent's Runtime session                           │
-│ Does:  Sends POST to AgentCore invoke_async endpoint, returns on HTTP 200    │
-│ Logs:  orchestrator log: "Async invoke sent for ... (session: ...)"          │
+│ Who:   Orchestrator → agent-invoker Lambda → AgentCore Runtime               │
+│ What:  Orchestrator async-invokes the agentcore-hub-agent-invoker            │
+│        Lambda (InvokeCommand, InvocationType=Event); that Lambda             │
+│        then invoke_async's the agent's Runtime session (HTTP 200)            │
+│ Logs:  orchestrator: "Async invoke sent for ... (session: ...)"              │
+│        agent-invoker: /aws/lambda/agentcore-hub-agent-invoker                │
 │ Session ID format: {ticketId}_{workflowId}-{agentId}-{timestamp}             │
 │                                                                              │
 │ ⚠️  After this point, the orchestrator Lambda EXITS.                         │
@@ -155,7 +159,7 @@
 
 | Component | CloudWatch Log Group | Correlation ID |
 |-----------|---------------------|----------------|
-| App Runner (Next.js) | `/aws/apprunner/agentcore-hub-hub/application` | workflowId in URL params |
+| Hub app (ECS Fargate service `agentcore-hub`) | ECS service's CloudWatch logs (ECS Express Mode-managed log group; steady-state CD deploys the hub here via `deploy/ecs-express` + `deploy/pipeline/ecs-primary-container.py`). Legacy/alternate path: App Runner under `/aws/apprunner/...` (`deploy/apprunner/` still exists). | workflowId in URL params |
 | Jira Tool Lambda | `/aws/lambda/agentcore-hub-tickets` | Ticket IDs (TEAM-XXX) in log messages |
 | Orchestrator Lambda | `/aws/lambda/agentcore-hub-orchestrator` | Ticket IDs + "workflowId=" in handleTicketReady |
 | Agent Invoker | `/aws/lambda/agentcore-hub-agent-invoker` | Session ID (contains workflowId) |
@@ -187,11 +191,12 @@
 
 ### 3. Duplicate agent sessions
 **Symptom**: Same agent runs 2-3x simultaneously
-**Root cause**: Nudge reset `in_progress` → `ready`, or DDB stream re-delivery
+**Root cause**: DDB stream at-least-once re-delivery (or a duplicated/re-fired webhook) racing the invocation claim. The old auto-nudge `in_progress` -> `ready` reset that used to cause this was REMOVED in DL-021: nudge is now event-only and never touches `in_progress`.
+**Guard**: two layers (DL-021) - (1) an atomic conditional-write idempotency claim (`ConditionExpression: "#s <> :inprog"` in `handleTicketReady` / `handleTicketReadyUnified`) so only the FIRST invocation wins; (2) the dead-session detector sweep (`dead-session-detector.mjs`, `rate(5 minutes)`) is the only path that recovers a truly crashed session, by lease-guarded stale-claim steal - not nudge.
 **How to trace**:
-1. Check orchestrator logs — multiple "Invoking agent X for ticket Y" entries?
-2. Check if a nudge event preceded the duplicate invocation
-3. Check if `ConditionalCheckFailedException` was logged (idempotency guard worked)
+1. Check orchestrator logs - multiple "Invoking agent X for ticket Y" entries?
+2. Check for `ConditionalCheckFailedException` in orchestrator logs: present = the idempotency guard rejected the duplicate (working as designed); absent on a genuine duplicate = the claim write is being bypassed.
+3. Check dead-session / reconcile events (`agent.escalated`, `dead_session.shadow`, `orchestrator.claim_released`) - a stolen stale claim can also legitimately re-dispatch.
 
 ### 4. Workflow never completes (stuck at last phase)
 **Symptom**: All agents done but workflow shows "review" not "complete"

@@ -9,9 +9,9 @@ A platform for getting the most out of Amazon Bedrock AgentCore — run all your
 - **Agent Detail** — Model, tools, memory, logs + live chat with sessions and full OTEL execution trace
 - **Registry** — Browse, search, and manage records in the Amazon Bedrock AgentCore Registry (MCP servers, A2A agents, custom resources, agent skills): full CRUD, semantic search, and the approval lifecycle
 - **Builder** — Chat-based agent creation (harness with code_interpreter + MCP)
-- **Workflow** — Config-driven multi-agent pipelines: submit a request and a roster of agents produce the deliverable. Ships four workflows (Software Delivery → a PR; Marketing; Sales; Legal), each defined in `src/config/workflows.json`. Real-time pipeline visualization with animated phases, timeline replay/scrubber, S3 artifact browsing, optional **human review gates**, and dynamic header titles
+- **Workflow** — Config-driven multi-agent pipelines: submit a request and a roster of agents produce the deliverable. Ships seven workflows (Software Delivery → a PR; Bug Fix; Operator; Dead Code Sweep; Marketing; Sales; Legal), each defined in `src/config/workflows.json`. Real-time pipeline visualization with animated phases, timeline replay/scrubber, S3 artifact browsing, optional **human review gates**, and dynamic header titles
 - **Cloud Code** — A coding agent that lives in the cloud ("safe to close your laptop"): Claude Code / Codex run server-side on a dedicated AgentCore Runtime with an EFS workspace. Streaming chat + a live terminal, per-session isolated checkouts, resumable from any device, MCP-gateway tools, and per-user CLI config bundles. **Port a live local session to the cloud and pull it back** — a [local MCP](mcp/hub/README.md) ships your raw transcript so `claude --resume` continues losslessly, laptop↔cloud. Opens PRs from a clone — Git-native, separate from the workflow fleet
-- **Pipeline** — AWS-native CI/CD (CodeBuild + CodePipeline) with a read-only `/pipeline` status board. Agents own CD through narrow `Pipeline___*` tools (trigger + watch + read build logs — never approve); the deploy gate is a human decision delivered to Telegram. See [`docs/cicd-pipeline-module-design.md`](docs/cicd-pipeline-module-design.md), [`docs/pipeline-quickstart.md`](docs/pipeline-quickstart.md), and [`docs/agents-own-cd.md`](docs/agents-own-cd.md)
+- **Pipeline** — AWS-native CI/CD (CodeBuild + CodePipeline) with a read-only `/pipeline` status board. Agents own CD through narrow `Pipeline___*` tools (trigger + watch + read build logs — never approve); the deploy gate is a human decision delivered to Telegram. The `/pipeline` board now also surfaces the waiting deploy gate directly in the UI: an amber "waiting for approval" card showing `waitingSince`, a commit link, and an "Approve in CodePipeline" link, with the deploy-gate banner scoped to the run. See [`docs/cicd-pipeline-module-design.md`](docs/cicd-pipeline-module-design.md), [`docs/pipeline-quickstart.md`](docs/pipeline-quickstart.md), and [`docs/agents-own-cd.md`](docs/agents-own-cd.md)
 
 ### Modular by design
 
@@ -362,17 +362,23 @@ Without `BUILDER_AGENT_ID`, the Build page falls back to a direct Converse API c
 The Workflow tab runs config-driven multi-agent pipelines. A pipeline's **shape**
 (ordered phases, intake agent, completion criteria, review gates) is defined in
 `src/config/workflows.json`; the **agent roster** is derived from
-`src/config/agents.json` (each agent tagged with `workflowDefId` + `phase`). Six
+`src/config/agents.json` (each agent tagged with `workflowDefId` + `phase`). Seven
 workflows ship by default:
 
 | Workflow | Intake → phases | Output |
 |----------|-----------------|--------|
-| **Software Delivery** | requirements → design → development → QA | a pull request |
+| **Software Delivery** | requirements → design → development → CI certification → QA verification → code review → ship (release manager → human Merge Approval → CD) | a pull request |
 | **Bug Fix** | intake → triage → fix → QA | a fix PR |
+| **Operator** | intake → build → ship | a pull request |
 | **Dead Code Sweep** | intake → sweep → QA | a cleanup PR |
 | **Marketing Campaign** | strategy → creative (social/blog/ads) → assets → brand QA → scheduling | a launched campaign |
 | **Sales Proposal** | qualification → drafting → deal review → approval | a routed proposal |
 | **Legal Contract Review** | triage → review → redline → sign-off | redlined contract |
+
+**Operator** is a single-persona express-delivery def: one persona
+(`agentcore_hub_operator`) runs the whole intake → build → ship delivery, with a
+human **Merge Approval** gate after the build phase, and its PR targets the
+repo's default branch.
 
 Adding a workflow is a config edit (a new `workflows.json` def + agents tagged
 with its `workflowDefId`) — no orchestration code changes. The intake agent reads
@@ -429,9 +435,9 @@ every judgment call is a human gate. Standard runs are untouched.
 The blueprints enforce the chain: each producing persona commits its artifact
 to the shared branch before it reports completion, and the code reviewer diffs
 the branch against `plan.md` / `spec.md`, so a missing artifact surfaces as a
-review finding (DL-009 — the orchestrator does not gate on it). The board's
-framework badge (STANDARD / PLAYBOOK) is stamped from the run's resolved
-framework.
+review finding (DL-009 — the orchestrator does not gate on it). The board shows
+a framework badge only for an overlay run (**PLAYBOOK** or **AI-DLC**); standard
+runs render no badge.
 
 ### CD registry — who merges and deploys
 
@@ -455,7 +461,15 @@ via `POST /api/workflow/cd-registry`, or headless:
 scripts/cd-registry.sh list
 scripts/cd-registry.sh add owner/repo --pipeline my-deploy-pipeline --region us-east-1
 scripts/cd-registry.sh remove owner/repo
+
+# Cross-account: the hub assumes a trigger role to run a pipeline in another account
+scripts/cd-registry.sh add owner/repo --pipeline my-deploy-pipeline --region us-west-2 \
+  --account <account> --role-arn arn:aws:iam::<account>:role/hub-cd-trigger-<slug> --external-id <externalId>
 ```
+
+For **cross-account CD**, a registry entry may also carry `account`, `roleArn`
+(an `arn:aws:iam::<account>:role/hub-cd-trigger-<slug>` role) and `externalId`;
+the hub assumes that role to trigger a pipeline in a different AWS account.
 
 Changes apply within a minute (orchestrator re-read, `CD_REGISTRY_TTL_MS`) — no
 redeploy. The pipeline's deploy stage only *seeds* the S3 file when it is
@@ -528,6 +542,11 @@ curl -s -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
 2. **Programmatic API** — `POST /api/workflow/start` with the same payload (Claude Code, scripts, CI)
 3. **Jira-native bug** — file a `Bug` issue in Jira directly. The `issue_created` webhook bootstraps a workflow keyed off the Bug, creates a requirements-analyst sub-task under it, and the analyst loads the `bug-fix-requirements` blueprint to produce the sub-task chain (Fix → Review → CI → QA).
 
+Submitted source URLs are validated by an SSRF-hardened reachability check
+(private and link-local hosts are refused, redirects are not followed, and DNS
+answers are pinned to close the rebinding window), gated by
+`SOURCE_VALIDATION_MODE`.
+
 **Agent Jira Lambda** (separate infra, agents call Jira through this):
 - Function: `agentcore-hub-jira` — SAM-deployed Lambda (for Jira mode) or `agentcore-hub-tickets` (for DynamoDB mode)
 - Only invocable by `bedrock-agentcore.amazonaws.com`
@@ -586,7 +605,9 @@ Each customer plugs in their own tooling via the `MCP_SERVERS` environment varia
 | Requirements | 1 (Requirements Analyst) | Analyze PRD, create tickets, skip irrelevant agents |
 | Design | 8 (Frontend, iOS, Android, Backend, Security, Legal, Localization, Analytics) | Parallel design docs |
 | Development | 3 (Backend Dev, API Dev, Frontend Dev) | Parallel code generation + PR |
-| QA | 2 (QA Verifier, CI Agent) | Test verification + code review |
+| CI Certification | 1 (CI Agent) | Certifies the integration-branch head (build + tests) before QA; auto-remediates whitelisted mechanical failures |
+| QA Verification | 1 (QA Verifier) | Independent test verification; blocked on the CI ticket, reads its completion record |
+| Code Review | 1 (Code Reviewer, on Codex) | Diffs the branch for correctness and quality findings |
 
 The Marketing, Sales, and Legal workflows have their own phase/agent rosters —
 see `src/config/workflows.json` and `src/config/agents.json`.
@@ -604,7 +625,7 @@ The platform includes an optional **self-improvement loop** that automatically e
 ### How It Works
 
 ```
-Agent runs → OTEL traces → XRay → Online Evaluation (10 evaluators)
+Agent runs → OTEL traces → XRay → Online Evaluation (11 evaluators)
     → eval-packager Lambda buffers sessions; on flush it
     → invokes the Fleet Improver runtime → root-cause analysis → JSON PRD {title, description}
     → writes PRD to s3 prd/ → prd-submitter → [SI] Workflow Run → PR
@@ -614,7 +635,7 @@ The Fleet Improver runtime must be deployed for synthesis to run
 (`cd deploy/runtime-agent && ./deploy-one.sh agentcore_hub_fleet_improver`).
 Without it, eval-packager archives batches but skips the workflow trigger.
 
-Every agent invocation is evaluated by 10 criteria (tool selection, instruction following, correctness, etc.) using a judge model. When scores drop, the fleet improver agent determines whether the fix is a prompt change, a missing tool, a permissions issue, or an infrastructure problem — then creates a PRD that triggers the same 14-agent pipeline to produce a fix PR.
+Every agent invocation is evaluated by 11 criteria (tool selection, instruction following, correctness, dependency-chain compliance, etc.) using a judge model. When scores drop, the fleet improver agent determines whether the fix is a prompt change, a missing tool, a permissions issue, or an infrastructure problem — then creates a PRD that triggers the same 14-agent pipeline to produce a fix PR.
 
 ### One-Command Setup
 
