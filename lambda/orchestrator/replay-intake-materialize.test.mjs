@@ -46,6 +46,7 @@ const h = vi.hoisted(() => ({
     lambdaInvokes: /** @type {any[]} */ ([]),
     tracked: /** @type {any[]} */ ([]),
     claims: /** @type {any[]} */ ([]),
+    humanClaims: /** @type {any[]} */ ([]),
     jira: /** @type {any} */ (null),
   },
 }));
@@ -149,6 +150,14 @@ vi.mock("./workflow-store.mjs", () => {
       h.state.claims.push({ ticketId: tid, ok });
       if (ok) t[tid] = { ...entry };
       return ok;
+    }),
+    claimHumanTicket: vi.fn(async (_id, tid) => {
+      const w = h.state.workflow;
+      if (!w.humanTickets) w.humanTickets = {};
+      const first = !w.humanTickets[tid];
+      h.state.humanClaims.push({ ticketId: tid, ok: first });
+      if (first) w.humanTickets[tid] = new Date().toISOString();
+      return first;
     }),
     advancePhase: vi.fn(async (_id, phase, featureBranch) => {
       h.state.workflow.phase = phase;
@@ -276,6 +285,7 @@ beforeEach(() => {
   h.state.lambdaInvokes.length = 0;
   h.state.tracked.length = 0;
   h.state.claims.length = 0;
+  h.state.humanClaims.length = 0;
   h.state.jira = null;
   // R6a: the hub seeds the row in "intake", so the first dispatch genuinely
   // advances the run (and emits the first workflow.phase_change).
@@ -427,6 +437,25 @@ describe("3. the human gate is published but never tracked as an agent task", ()
     expect(h.state.workflow.agentTasks[GATE]).toBeUndefined();
 
     // And the creation-time block is still not read as a "Request changes".
+    expect(eventsOf("review.rejected")).toHaveLength(0);
+  });
+
+  // TEAM-4461 F3: the human path has no agentTasks entry to guard a redelivery
+  // with, so a re-delivered stream INSERT (at-least-once) or a re-sent Jira
+  // "created" webhook must not publish ticket.created twice for the same gate.
+  it("a redelivered gate INSERT (same record twice) publishes ticket.created ONCE", async () => {
+    const rec = record("INSERT", gateImage("blocked"));
+    await handler(rec);
+    await handler(rec);
+
+    expect(eventsOf("ticket.created").filter((e) => e.detail.ticket.id === GATE)).toHaveLength(1);
+    expect(h.state.humanClaims.filter((c) => c.ticketId === GATE)).toEqual([
+      { ticketId: GATE, ok: true },
+      { ticketId: GATE, ok: false },
+    ]);
+    expect(h.state.tracked.filter((t) => t.ticketId === GATE)).toEqual([]);
+    expect(storeMock.trackTicket).not.toHaveBeenCalledWith("wf_1", GATE, expect.anything());
+    expect(h.state.workflow.agentTasks[GATE]).toBeUndefined();
     expect(eventsOf("review.rejected")).toHaveLength(0);
   });
 
