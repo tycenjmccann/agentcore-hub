@@ -15,6 +15,7 @@ import { DEFAULT_WORKFLOW_DEF_ID, getWorkflowDef } from "@/lib/workflow/workflow
 import { resolveSdlcFramework, SDLC_BADGE_META } from "@/lib/workflow/sdlc-framework";
 import { applyAgentStatus, applyAgentComplete, shouldForceTicketDone } from "@/lib/workflow/board-state";
 import { isLivenessEvent, isDispatchEvent, computeStaleAgentIds, isStaleEligibleStatus, seedLastActivityByAgent, seedLastToolByAgent, staleThresholdFor } from "@/lib/workflow/stale";
+import { mergeCommitOf, matchDeployGate } from "@/lib/workflow/deploy-gate";
 import { Square, ClipboardCheck } from "lucide-react";
 import AgentOutputPanel from "./AgentOutputPanel";
 import S3ArtifactsModal from "./S3ArtifactsModal";
@@ -126,6 +127,14 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
   // names the pipeline and is scoped to THIS run's repo — with several registered
   // repos, an unscoped read would show repo Y's gate on repo X's run and invite a
   // human to approve the wrong deploy.
+  //
+  // TEAM-4403: a repo is still not a RUN. Repo scoping alone showed one parked
+  // ManualApproval on agentcore-hub-deploy on EVERY active hub run, including runs
+  // sitting in development that had never merged a line — so the banner asked a
+  // human to approve a production deploy for a change they weren't looking at. The
+  // gate now has to prove it belongs to this run: the waiting execution's source
+  // commit must BE this run's merge commit (matchDeployGate). No merge commit → no
+  // poll and no banner, ever.
   const [deployGate, setDeployGate] = useState<{ stage: string; pipeline: string; url?: string } | null>(null);
 
   // Phases + ordering are derived from the running workflow's definition so the
@@ -157,8 +166,12 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
   // !isTerminalPhase("ship") stays true, so they poll + banner exactly as before.
   const runActive = !!state && !isTerminalPhase(state.phase) && !state.cancelledAt;
   const runRepoUrl = state?.repoConfig?.repos?.[0]?.url;
+  // This run's identity in CD terms. Set by the ship phase (the release manager's
+  // harvested merge_commit) and the only field that proves the run merged, so it
+  // is both the match key and the "has this run even shipped?" guard.
+  const runMergeCommit = mergeCommitOf(state?.agentTasks);
   useEffect(() => {
-    if (!defHasShip || !runActive) { setDeployGate(null); return; }
+    if (!defHasShip || !runActive || !runMergeCommit) { setDeployGate(null); return; }
     let cancelled = false;
     const poll = async () => {
       try {
@@ -174,14 +187,17 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
         const mine = (data.pipelines || []).find(
           (p: { repo?: string }) => isSameRepo(runRepoUrl, p.repo || "")
         );
-        const waiting = (mine?.stages || []).find((s: { awaitingApproval?: boolean }) => s.awaitingApproval);
+        // ...and within that pipeline, only the execution THIS run's merge produced.
+        // An awaiting stage we cannot attribute to a source commit yields null: a
+        // missing banner loses a hint, a wrong one loses a production deploy.
+        const waiting = matchDeployGate(mine?.stages, runMergeCommit);
         setDeployGate(mine && waiting ? { stage: waiting.name, pipeline: mine.pipeline, url: waiting.approvalUrl } : null);
       } catch { /* pipeline module may be absent — silent */ }
     };
     poll();
     const id = setInterval(poll, 20000);
     return () => { cancelled = true; clearInterval(id); };
-  }, [defHasShip, runActive, runRepoUrl]);
+  }, [defHasShip, runActive, runRepoUrl, runMergeCommit]);
   const [celebrating, setCelebrating] = useState(false);
   // Workflow Manager watchdog toggle for this run (default on).
   const [managerWatch, setManagerWatch] = useState(true);

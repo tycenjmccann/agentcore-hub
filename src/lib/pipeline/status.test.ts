@@ -363,3 +363,251 @@ describe("getPipelineStatus — multi-target", () => {
     expect(res.pipelines.length).toBeGreaterThan(0);
   });
 });
+
+// ─── execution identity on StageState (TEAM-4403) ─────────────────────────────
+
+/**
+ * The workflow board's deploy-gate banner was repo-scoped, so a single parked
+ * approval showed up on every active run of that repo. `executionId` + `sourceSha`
+ * let the board scope it to the run whose commit is actually at the gate. Both are
+ * derived from the GetPipelineState response we already fetch: the task role has
+ * codepipeline:GetPipelineState and NOT GetPipelineExecution, so the SHA must come
+ * from `actionStates[].currentRevision` — and never from the 12-char
+ * `revisionSummary`, which is a display digest, not a commit.
+ */
+
+const SHA_A = "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4";
+const SHA_B = "f00dfeeddeadbeefcafebabe0123456789abcdef";
+const EXEC_A = "exec-aaaa-1111";
+const EXEC_B = "exec-bbbb-2222";
+
+/** Source stage: carries the full commit SHA for `execId`. */
+const sourceStage = (execId: string, sha: string, status = "Succeeded") => ({
+  stageName: "Source",
+  latestExecution: { pipelineExecutionId: execId, status },
+  actionStates: [
+    {
+      latestExecution: { status, lastStatusChange: new Date("2026-09-10T00:30:00Z") },
+      currentRevision: { revisionId: sha },
+    },
+  ],
+});
+
+/** ManualApproval stage parked on `execId`; its own revision is only a digest. */
+const gateStage = (execId: string, name = "Approval") => ({
+  stageName: name,
+  latestExecution: { pipelineExecutionId: execId, status: "InProgress" },
+  actionStates: [
+    {
+      latestExecution: {
+        token: "tok-1",
+        status: "InProgress",
+        lastStatusChange: new Date("2026-09-10T01:00:00Z"),
+      },
+      currentRevision: { revisionId: "deadbeefcafebabe" },
+      entityUrl: "https://console.aws.amazon.com/approve",
+    },
+  ],
+});
+
+describe("StageState execution identity (TEAM-4403)", () => {
+  beforeEach(() => {
+    h.registry = { version: 1, repos: [] };
+    h.registryError = null;
+    h.cbRegions.length = 0;
+    h.cpRegions.length = 0;
+    h.listCalls.length = 0;
+    h.stateCalls.length = 0;
+    h.buildsByProject = {};
+    h.stagesByPipeline = {};
+    h.failProjects = new Set();
+    h.failPipelines = new Set();
+    vi.stubEnv("AWS_REGION", "us-east-1");
+    vi.stubEnv("PIPELINE_CI_PROJECT", undefined);
+    vi.stubEnv("PIPELINE_DEPLOY_NAME", undefined);
+    vi.stubEnv("PIPELINE_ENABLED", "1");
+  });
+
+  /** Reads the single env-default target's stages for the given fixture. */
+  const stagesFor = async (fixture: Array<Record<string, unknown>>) => {
+    h.stagesByPipeline["agentcore-hub-deploy"] = fixture;
+    const { getPipelineStatus } = await loadStatus();
+    const res = await getPipelineStatus();
+    expect(res.pipelines[0].error).toBeUndefined();
+    return res.pipelines[0].stages;
+  };
+
+  it("an awaiting-approval stage exposes its latestExecution.pipelineExecutionId", async () => {
+    const stages = await stagesFor([sourceStage(EXEC_A, SHA_A), gateStage(EXEC_A)]);
+    const gate = stages.find((s) => s.awaitingApproval)!;
+
+    expect(gate.name).toBe("Approval");
+    expect(gate.executionId).toBe(EXEC_A);
+    // Set wherever the API reports one, not only on the gate.
+    expect(stages.find((s) => s.name === "Source")!.executionId).toBe(EXEC_A);
+  });
+
+  it("executionId is undefined when GetPipelineState reports none", async () => {
+    const stages = await stagesFor([
+      { stageName: "Source", latestExecution: { status: "Succeeded" }, actionStates: [] },
+    ]);
+    expect(stages[0].executionId).toBeUndefined();
+  });
+
+  it("sourceSha is the FULL 40-char SHA, never the 12-char revisionSummary", async () => {
+    const stages = await stagesFor([sourceStage(EXEC_A, SHA_A), gateStage(EXEC_A)]);
+    const gate = stages.find((s) => s.awaitingApproval)!;
+
+    expect(gate.sourceSha).toBe(SHA_A);
+    expect(gate.sourceSha).toHaveLength(40);
+    expect(gate.revisionSummary).toHaveLength(12);
+    expect(gate.sourceSha).not.toBe(gate.revisionSummary);
+    expect(gate.sourceSha!.startsWith(gate.revisionSummary!)).toBe(false);
+  });
+
+  it("cross-stage lookup: Source carries the SHA and shares the gate's executionId", async () => {
+    // The gate's own revision is only a digest, so the SHA can only come from the
+    // sibling stage on the same execution — this is the GetPipelineExecution-free path.
+    const stages = await stagesFor([
+      sourceStage(EXEC_A, SHA_A),
+      // A stage carrying no revision of its own at all.
+      {
+        stageName: "Build",
+        latestExecution: { pipelineExecutionId: EXEC_A, status: "Succeeded" },
+        actionStates: [{ latestExecution: { status: "Succeeded" } }],
+      },
+      gateStage(EXEC_A),
+    ]);
+
+    expect(stages.find((s) => s.name === "Approval")!.sourceSha).toBe(SHA_A);
+    expect(stages.find((s) => s.name === "Build")!.sourceSha).toBe(SHA_A);
+  });
+
+  it("a superseded execution (Source already on a newer execution) → sourceSha undefined", async () => {
+    // Source has advanced to EXEC_B/SHA_B while the gate is still parked on EXEC_A.
+    // Reporting SHA_B would attribute the gate to the wrong commit, so we report nothing.
+    const stages = await stagesFor([sourceStage(EXEC_B, SHA_B), gateStage(EXEC_A)]);
+    const gate = stages.find((s) => s.awaitingApproval)!;
+
+    expect(gate.executionId).toBe(EXEC_A);
+    expect(gate.sourceSha).toBeUndefined();
+    expect(stages.find((s) => s.name === "Source")!.sourceSha).toBe(SHA_B);
+  });
+
+  it("no regression: revisionSummary / awaitingApproval / approvalUrl / status / lastUpdated", async () => {
+    const stages = await stagesFor([sourceStage(EXEC_A, SHA_A), gateStage(EXEC_A)]);
+    const gate = stages.find((s) => s.name === "Approval")!;
+    const source = stages.find((s) => s.name === "Source")!;
+
+    expect(gate.revisionSummary).toBe("deadbeefcafe"); // still revisionId.slice(0, 12)
+    expect(gate.awaitingApproval).toBe(true);
+    expect(gate.approvalUrl).toBe("https://console.aws.amazon.com/approve");
+    expect(gate.status).toBe("InProgress");
+    expect(gate.lastUpdated).toBe("2026-09-10T01:00:00.000Z");
+    expect(source.awaitingApproval).toBe(false);
+    expect(source.approvalUrl).toBeUndefined();
+    expect(source.revisionSummary).toBe(SHA_A.slice(0, 12));
+    expect(source.status).toBe("Succeeded");
+  });
+
+  it("only ONE GetPipelineState call still backs the whole stage list", async () => {
+    await stagesFor([sourceStage(EXEC_A, SHA_A), gateStage(EXEC_A)]);
+    // No GetPipelineExecution: the task role is granted GetPipelineState only.
+    expect(h.stateCalls).toEqual(["agentcore-hub-deploy"]);
+  });
+});
+
+describe("sourceShaForExecution", () => {
+  const load = async () => (await loadStatus()).sourceShaForExecution;
+
+  it("prefers a full SHA on the own stage over any sibling", async () => {
+    const sourceShaForExecution = await load();
+    const own = sourceStage(EXEC_A, SHA_A);
+    const sibling = sourceStage(EXEC_A, SHA_B);
+
+    expect(sourceShaForExecution([sibling, own], EXEC_A, own)).toBe(SHA_A);
+  });
+
+  it("falls back to a sibling stage on the same pipelineExecutionId", async () => {
+    const sourceShaForExecution = await load();
+    const gate = gateStage(EXEC_A);
+
+    expect(sourceShaForExecution([sourceStage(EXEC_A, SHA_B), gate], EXEC_A, gate)).toBe(SHA_B);
+  });
+
+  it("ignores stages on a different pipelineExecutionId", async () => {
+    const sourceShaForExecution = await load();
+    const gate = gateStage(EXEC_A);
+
+    expect(
+      sourceShaForExecution([sourceStage(EXEC_B, SHA_B), gate], EXEC_A, gate)
+    ).toBeUndefined();
+  });
+
+  it("never matches a non-full-hex revisionId (short digest, over/underlong, non-hex)", async () => {
+    const sourceShaForExecution = await load();
+    const notShas = [
+      "deadbeefcafe", // the 12-char revisionSummary digest
+      "deadbeefcafebabe", // 16 hex
+      SHA_A.slice(0, 39), // 39 hex
+      SHA_A + "0", // 41 hex
+      "z" + SHA_A.slice(1), // 40 chars, not hex
+      "main", // a branch name
+      "", // empty
+    ];
+    for (const revisionId of notShas) {
+      const stage = {
+        stageName: "Source",
+        latestExecution: { pipelineExecutionId: EXEC_A, status: "Succeeded" },
+        actionStates: [{ currentRevision: { revisionId } }],
+      };
+      expect(sourceShaForExecution([stage], EXEC_A, stage)).toBeUndefined();
+    }
+  });
+
+  it("accepts an uppercase 40-char SHA (hex is case-insensitive)", async () => {
+    const sourceShaForExecution = await load();
+    const upper = "ABCDEF0123456789ABCDEF0123456789ABCDEF01";
+    const stage = {
+      stageName: "Source",
+      latestExecution: { pipelineExecutionId: EXEC_A, status: "Succeeded" },
+      actionStates: [{ currentRevision: { revisionId: upper } }],
+    };
+
+    expect(sourceShaForExecution([stage], EXEC_A, stage)).toBe(upper);
+  });
+
+  it("takes the first full SHA among several actions on one stage", async () => {
+    const sourceShaForExecution = await load();
+    const stage = {
+      stageName: "Source",
+      latestExecution: { pipelineExecutionId: EXEC_A, status: "Succeeded" },
+      actionStates: [
+        { currentRevision: { revisionId: "deadbeefcafe" } },
+        { currentRevision: { revisionId: SHA_A } },
+        { currentRevision: { revisionId: SHA_B } },
+      ],
+    };
+
+    expect(sourceShaForExecution([stage], EXEC_A, stage)).toBe(SHA_A);
+  });
+
+  it("undefined executionId cannot match stages that also report none", async () => {
+    const sourceShaForExecution = await load();
+    const orphan = {
+      stageName: "Source",
+      latestExecution: { status: "Succeeded" },
+      actionStates: [{ currentRevision: { revisionId: SHA_A } }],
+    };
+    const gate = { stageName: "Approval", latestExecution: { status: "InProgress" }, actionStates: [] };
+
+    expect(sourceShaForExecution([orphan, gate], undefined, gate)).toBeUndefined();
+  });
+
+  it("empty / missing inputs are undefined, not a throw", async () => {
+    const sourceShaForExecution = await load();
+    expect(sourceShaForExecution([], EXEC_A)).toBeUndefined();
+    expect(sourceShaForExecution([{}], EXEC_A, {})).toBeUndefined();
+    expect(sourceShaForExecution([sourceStage(EXEC_A, SHA_A)], undefined)).toBeUndefined();
+  });
+});

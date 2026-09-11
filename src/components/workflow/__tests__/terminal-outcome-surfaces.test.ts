@@ -254,3 +254,80 @@ describe('F5 — the analyzer EventBridge rule fires on every terminal outcome',
     expect(phases.sort()).toEqual([...TERMINAL_PHASES].sort());
   });
 });
+
+/**
+ * TEAM-4403 — the deploy-gate banner is scoped to the RUN, not just the repo.
+ *
+ * TEAM-4336 (above) stopped repo Y's gate appearing on repo X's run, but within a
+ * single repo the banner was still unscoped: it fired on ANY awaiting stage of that
+ * repo's pipeline, so one parked ManualApproval on agentcore-hub-deploy showed on
+ * every active hub run — including runs still in development that had never merged.
+ * The gate must now prove it belongs to the run: the waiting execution's source
+ * commit has to BE this run's merge commit, and a run with no merge commit must
+ * neither poll nor banner.
+ *
+ * Same source-content convention as F6/F8/4336 above (no render harness for the
+ * 4k-line board). The matching rule itself is unit-tested on the pure helpers in
+ * src/lib/workflow/__tests__/deploy-gate.test.ts — these assertions only pin that
+ * the board actually routes through them.
+ */
+describe('TEAM-4403 — the deploy-gate banner is scoped to the run that merged', () => {
+  /** The poll effect: from the guard through the setDeployGate call. */
+  const pollEffect = (() => {
+    const start = boardContent.indexOf('if (!defHasShip');
+    expect(start).toBeGreaterThan(-1);
+    const end = boardContent.indexOf('const id = setInterval(poll, 20000)', start);
+    expect(end).toBeGreaterThan(start);
+    return boardContent.slice(start, end);
+  })();
+
+  it("derives the run's merge commit from agentTasks via the shared helper", () => {
+    // agentTasks is keyed by ticketId, so there is no agentTasks[<agentId>] read —
+    // mergeCommitOf scans the entries and prefers the release manager's.
+    expect(boardContent).toMatch(/const runMergeCommit = mergeCommitOf\(state\?\.agentTasks\)/);
+    expect(boardContent).toContain('import { mergeCommitOf, matchDeployGate } from "@/lib/workflow/deploy-gate"');
+  });
+
+  it('a run with no merge commit never polls and never banners', () => {
+    // The guard short-circuits before the fetch, so a development-phase run costs
+    // no request every 20s and can never raise the amber banner.
+    expect(pollEffect).toContain('!runMergeCommit');
+    const guard = pollEffect.slice(0, pollEffect.indexOf('let cancelled'));
+    expect(guard).toContain('setDeployGate(null); return;');
+    expect(guard.indexOf('!runMergeCommit')).toBeLessThan(guard.indexOf('setDeployGate(null)'));
+  });
+
+  it('the banner comes from matchDeployGate, never from "first awaiting stage"', () => {
+    expect(pollEffect).toContain('matchDeployGate(mine?.stages, runMergeCommit)');
+    // The exact pre-4403 bug shape: any awaiting stage of the run's pipeline.
+    expect(pollEffect).not.toMatch(/\.find\(\s*\(s: \{ awaitingApproval\?: boolean \}\) => s\.awaitingApproval\s*\)/);
+    // The repo scoping from TEAM-4336 is still in force — this narrows it further.
+    expect(pollEffect).toContain('isSameRepo(runRepoUrl');
+  });
+
+  it('re-polls when the merge commit appears (effect dependency)', () => {
+    // Without this the banner would stay dark for the whole run that just merged:
+    // the guard flips only when the ship phase records the merge commit.
+    const depsIdx = boardContent.indexOf('}, [defHasShip, runActive');
+    expect(depsIdx).toBeGreaterThan(-1);
+    expect(boardContent.slice(depsIdx, boardContent.indexOf(']', depsIdx))).toContain('runMergeCommit');
+  });
+
+  it('the pure helpers carry no AWS SDK into the browser bundle', () => {
+    // Same trade as the board's local isSameRepo mirror (TEAM-4336, above):
+    // @/lib/pipeline/status imports @aws-sdk/client-codepipeline, and CLAUDE.md
+    // forbids one optional module importing another — so the helper lives under
+    // @/lib/workflow and mirrors the pipeline stage shape structurally.
+    expect(boardContent).not.toMatch(/from ['"]@\/lib\/pipeline\/status['"]/);
+    const helper = fs.readFileSync(
+      path.resolve(__dirname, '../../../lib/workflow/deploy-gate.ts'),
+      'utf-8'
+    );
+    // Import statements only — the file's header comment names these modules to
+    // explain why it does NOT import them, and that prose must stay allowed.
+    expect(helper).not.toMatch(
+      /^\s*(?:import|export)\b[^\n]*from\s*['"](?:@aws-sdk\/|@\/lib\/pipeline|@\/lib\/cd-registry)/m
+    );
+    expect(helper).not.toMatch(/require\(\s*['"](?:@aws-sdk\/|@\/lib\/pipeline|@\/lib\/cd-registry)/);
+  });
+});

@@ -189,6 +189,17 @@ export interface AgentTask {
   output?: string;               // agent response
   branch?: string;               // git branch created (dev agents)
   commitSha?: string;            // final commit SHA (dev agents)
+  /**
+   * Merge commit on the default branch — the ONLY field that proves the work
+   * landed (ship phase; harvested from the completion record's `merge_commit` by
+   * the orchestrator, and the sole ship proof accepted by shipVerdictOf).
+   * `commitSha` above is the still-unmerged feature-branch HEAD and must never
+   * be read as a merge signal. Declared here so the UI can match a run against
+   * the CD execution its merge triggered (TEAM-4403).
+   */
+  mergeCommit?: string;
+  /** Ship verdict the agent declared: "shipped" | "deploy-blocked" | "static-ci-only". */
+  outcome?: string;
   startedAt?: string;
   completedAt?: string;
   error?: string;
@@ -211,7 +222,7 @@ export interface WorkflowState {
    *  warns every persona until it resolves. */
   repoCheck?: import("./repo-check").RepoCheck;
   input: WorkflowInput;
-  agentTasks: Record<string, AgentTask>;  // keyed by agent ID
+  agentTasks: Record<string, AgentTask>;  // keyed by ticket ID (entries carry agentId)
   messages: AgentMessage[];
   humanNotifications: HumanNotification[];
   startedAt: string;
