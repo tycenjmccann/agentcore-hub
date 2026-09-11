@@ -57,7 +57,7 @@ Agents expect different payload shapes. `src/lib/agentcore-sdk.ts` has a `PAYLOA
 `src/config/agents.json` defines all valid agents. It is **synced to S3** at deploy and loaded by every Lambda on cold start. To change agents: edit the file, then `aws s3 cp src/config/agents.json s3://{ARTIFACT_BUCKET}/config/agents.json` — Lambdas pick it up on next cold start, no redeploy. The orchestrator resolves `agentId` → runtime ARN via the `RUNTIME_ARN_<HARNESS_NAME_UPPER>` env convention (or explicit `runtimeArn`).
 
 ### Workflow pipeline orchestration
-Submit a feature request → 16 Strands agents on AgentCore **Runtime** (requirements → 8 parallel design → 3 dev → CI certification → QA verification → code review → ship) produce a PR. Cascade is driven by ticket status changes:
+Submit a feature request → 16 Strands agents on AgentCore **Runtime** (requirements → 8 parallel design → 3 dev → code review → CI certification → QA verification → ship) produce a PR. Cascade is driven by ticket status changes:
 - **`TICKET_PROVIDER=dynamodb`** (code default when unset): DynamoDB Streams on the tickets table trigger the orchestrator Lambda.
 - **`TICKET_PROVIDER=jira`** (what `.env.example`/`Dockerfile` ship): real Jira Cloud; Jira webhooks hit `/api/jira/webhook`. Requires a specific 6-status team-managed workflow (see README "Jira Integration").
 
