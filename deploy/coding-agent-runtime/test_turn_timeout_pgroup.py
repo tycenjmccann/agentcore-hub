@@ -567,6 +567,102 @@ class TestAsyncRunnerForcesTerminalRecord(unittest.TestCase):
         self.assertEqual(main._ACTIVE_TURNS[self.turn_id]["response"], "real work")
 
 
+class TestExitedCliKeepsItsRealResult(TestAsyncRunnerForcesTerminalRecord):
+    """Salvaged from PR #510 (TEAM-4379): the backstop exists for a CLI that never
+    unwinds. A CLI that EXITED inside its cap and is merely harvesting artifacts
+    past the grace must keep its real result - the bound stands down."""
+
+    def _exited_then_slow_harvest(self, *a, **kw):
+        kw["cli_exited"].set()          # the runner reaped its CLI in time ...
+        self.release.wait(30)           # ... then the harvest outlives the grace
+        yield 'data: {"type": "done", "response": "harvested real result", ' \
+              '"claude_session_id": "conv-slow"}\n\n'
+
+    def test_wedged_generator_gets_forced_done_record(self):
+        # Inherited control: a generator that never signals exit is still bounded.
+        super().test_wedged_generator_gets_forced_done_record()
+
+    def test_exited_cli_is_not_forced_and_its_late_result_lands(self):
+        runner = self._start_runner(gen_factory=self._exited_then_slow_harvest)
+        time.sleep(self.TIMEOUT_S + self.GRACE_S + 1.5)   # the Timer has fired by now
+        self.assertFalse(os.path.exists(self.done_path),
+                         "backstop forced a record on a CLI that had already exited")
+        self.assertEqual(main._ACTIVE_TURNS[self.turn_id]["status"], "running")
+        self.release.set()
+        runner.join(20)
+        self.assertFalse(runner.is_alive())
+        with open(self.done_path) as f:
+            record = json.load(f)
+        self.assertEqual(record.get("response"), "harvested real result")
+        self.assertNotIn("forced", record)
+        self.assertNotIn("error", record)
+        self.assertEqual(main._ACTIVE_TURNS[self.turn_id]["response"], "harvested real result")
+
+    def test_runner_hands_every_stream_generator_the_event(self):
+        for cli, fname in (("claude", "_stream_claude"), ("codex", "_stream_codex"),
+                           ("kiro", "_stream_kiro")):
+            got: list = []
+
+            def _gen(*a, **kw):
+                got.append(kw.get("cli_exited"))
+                yield 'data: {"type": "done", "response": "ok", "claude_session_id": "c"}\n\n'
+            turn_id = f"turn-{uuid.uuid4().hex[:8]}"
+            turn_dir = main._register_turn(turn_id, cli, self.session_id, self.TIMEOUT_S)
+            with mock.patch.object(main, fname, side_effect=_gen):
+                main._run_turn_async(turn_id, turn_dir, cli, "do it", _TMP, None, None,
+                                     self.session_id, None, None, self.TIMEOUT_S)
+            self.assertIsInstance(got[0], threading.Event,
+                                  f"[{cli}] _run_turn_async must hand {fname} a cli_exited Event")
+
+
+class TestRunnersSignalExitBeforeHarvest(_PgroupBase):
+    """Each real stream runner sets cli_exited after reaping the CLI and BEFORE
+    the artifact harvest - the phase the backstop must not time out."""
+
+    def _stream(self, cli, turn_timeout_s=3600, cli_exited=None):
+        kw = {"cli_exited": cli_exited}
+        if cli == "claude":
+            return main._stream_claude("do it", _TMP, None, None, "cc-sess", None,
+                                       None, turn_timeout_s, **kw)
+        if cli == "codex":
+            return main._stream_codex("do it", _TMP, None, None, "cc-sess", None,
+                                      turn_timeout_s, **kw)
+        return main._stream_kiro("do it", _TMP, None, None, "cc-sess", None,
+                                 turn_timeout_s, **kw)
+
+    def test_each_runner_signals_exit_before_harvesting_artifacts(self):
+        for cli in ("claude", "codex", "kiro"):
+            ev = threading.Event()
+            seen_at_harvest: list = []
+
+            def _harvest(*a, **kw):
+                seen_at_harvest.append(ev.is_set())
+                return {"keys": []}
+            argv = ["sh", "-c", "true"]     # exits 0 immediately, prints nothing
+            with self._popen(argv=argv), \
+                 mock.patch.object(main, "_remember_session"), \
+                 mock.patch.object(main, "_write_resume_launch_hint"), \
+                 mock.patch.object(main, "_kiro_newest_id", return_value="conv-test"), \
+                 mock.patch.object(main, "_sync_turn_artifacts", side_effect=_harvest):
+                frames, outcome, _ = _drain_in_thread(self._stream(cli, cli_exited=ev))
+            self.assertEqual(outcome, "finished", f"[{cli}] {frames}")
+            self.assertEqual(seen_at_harvest, [True],
+                             f"[{cli}] cli_exited must be set before _sync_turn_artifacts runs")
+            self.assertTrue(ev.is_set(), f"[{cli}] cli_exited was never set on a clean exit")
+
+    def test_runner_without_the_event_is_unchanged(self):
+        with self._popen(argv=["sh", "-c", "true"]):
+            stack = self._quiet_side_effects()
+            for p in stack:
+                p.start()
+            try:
+                frames, outcome, _ = _drain_in_thread(self._stream("claude"))
+            finally:
+                for p in stack:
+                    p.stop()
+        self.assertEqual(outcome, "finished")
+
+
 class TestRunnerGrace(unittest.TestCase):
     """The bound exists, is generous enough for a healthy turn, and lands after
     the FLEET's own kill (the fleet is the primary bound now — this is a

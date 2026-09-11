@@ -2489,7 +2489,8 @@ def _killpg_on_timeout(proc, cli: str) -> None:
 def _stream_claude(prompt: str, workdir: str, claude_session_id: str | None, repo: str | None = None,
                    session_id: str | None = None, tenant_id: str | None = None,
                    model: str | None = None, turn_timeout_s: int = TURN_TIMEOUT_S,
-                   permission_mode: str | None = None, turn_dir: str | None = None):
+                   permission_mode: str | None = None, turn_dir: str | None = None,
+                   cli_exited: threading.Event | None = None):
     """Generator yielding SSE lines for a Claude turn as it runs.
 
     Parses claude stream-json line-by-line: assistant text deltas → 'text'
@@ -2564,6 +2565,11 @@ def _stream_claude(prompt: str, workdir: str, claude_session_id: str | None, rep
                 if obj.get("session_id"):
                     new_session_id = obj["session_id"]
         proc.wait(timeout=30)
+        if cli_exited is not None:
+            # Reaped inside the cap: everything after this (stderr read, session
+            # bookkeeping, artifact harvest on EFS) is our own terminal work, not a
+            # wedged read, and the async runner's backstop must not time it out.
+            cli_exited.set()
     except Exception as exc:  # noqa: BLE001
         yield sse({"type": "error", "error": str(exc)[:600]})
         return
@@ -2689,7 +2695,7 @@ def _run_codex(prompt: str, workdir: str, codex_session_id: str | None,
 def _stream_codex(prompt: str, workdir: str, codex_session_id: str | None,
                   repo: str | None = None, session_id: str | None = None,
                   tenant_id: str | None = None, turn_timeout_s: int = TURN_TIMEOUT_S,
-                  turn_dir: str | None = None):
+                  turn_dir: str | None = None, cli_exited: threading.Event | None = None):
     """Generator yielding SSE lines for a Codex turn as it runs.
 
     codex exec --json emits per-STEP JSONL (not token deltas): thread.started,
@@ -2785,6 +2791,11 @@ def _stream_codex(prompt: str, workdir: str, codex_session_id: str | None,
                 if note:
                     yield sse({"type": "text", "text": f"\n_{note[:300]}_\n"})
         proc.wait(timeout=30)
+        if cli_exited is not None:
+            # Reaped inside the cap: everything after this (stderr read, session
+            # bookkeeping, artifact harvest on EFS) is our own terminal work, not a
+            # wedged read, and the async runner's backstop must not time it out.
+            cli_exited.set()
     except Exception as exc:  # noqa: BLE001
         yield sse({"type": "error", "error": str(exc)[:600]})
         return
@@ -2873,7 +2884,7 @@ def _run_kiro(prompt: str, workdir: str, kiro_session_id: str | None,
 def _stream_kiro(prompt: str, workdir: str, kiro_session_id: str | None,
                  repo: str | None = None, session_id: str | None = None,
                  tenant_id: str | None = None, turn_timeout_s: int = TURN_TIMEOUT_S,
-                 turn_dir: str | None = None):
+                 turn_dir: str | None = None, cli_exited: threading.Event | None = None):
     """Generator yielding SSE lines for a Kiro turn as it runs.
 
     Kiro chat has no JSON event stream — it prints the reply to stdout as it
@@ -2912,6 +2923,11 @@ def _stream_kiro(prompt: str, workdir: str, kiro_session_id: str | None,
             full_text.append(clean)
             yield sse({"type": "text", "text": clean})
         proc.wait(timeout=30)
+        if cli_exited is not None:
+            # Reaped inside the cap: everything after this (stderr read, session
+            # bookkeeping, artifact harvest on EFS) is our own terminal work, not a
+            # wedged read, and the async runner's backstop must not time it out.
+            cli_exited.set()
     except Exception as exc:  # noqa: BLE001
         yield sse({"type": "error", "error": str(exc)[:600]})
         return
@@ -3102,6 +3118,12 @@ def _run_turn_async(turn_id: str, turn_dir: str, cli: str, prompt: str, workdir:
     lock = threading.Lock()
     finished = threading.Event()
     forced = threading.Event()
+    # Set by the stream runner the moment the CLI process is reaped. A turn whose
+    # CLI exited inside its cap but whose harvest (_sync_turn_artifacts: a git
+    # probe per untracked file, up to 200 uploads, all on EFS) outlives the grace
+    # is slow, not wedged - forcing a timeout there discards a real result the
+    # caller paid for. The fleet's turn budget is the outer bound in that case.
+    cli_exited = threading.Event()
 
     def _force_terminal():
         # The generator's watchdog fired at turn_timeout_s and the runner STILL
@@ -3111,6 +3133,11 @@ def _run_turn_async(turn_id: str, turn_dir: str, cli: str, prompt: str, workdir:
         # would answer session_busy until the VM recycled.
         with lock:
             if finished.is_set():
+                return
+            if cli_exited.is_set():
+                logger.warning("turn_backstop_stood_down", extra={
+                    "cli": cli, "turn_id": turn_id, "turn_timeout_s": turn_timeout_s,
+                    "grace_s": TURN_RUNNER_GRACE_S})
                 return
             err = (f"{cli} runner did not unwind within {TURN_RUNNER_GRACE_S}s of its "
                    f"{turn_timeout_s}s cap")
@@ -3137,14 +3164,15 @@ def _run_turn_async(turn_id: str, turn_dir: str, cli: str, prompt: str, workdir:
     try:
         if cli == "codex":
             gen = _stream_codex(prompt, workdir, claude_session_id, repo, session_id, tenant_id,
-                                turn_timeout_s, turn_dir=turn_dir)
+                                turn_timeout_s, turn_dir=turn_dir, cli_exited=cli_exited)
         elif cli == "kiro":
             gen = _stream_kiro(prompt, workdir, claude_session_id, repo, session_id, tenant_id,
-                               turn_timeout_s, turn_dir=turn_dir)
+                               turn_timeout_s, turn_dir=turn_dir, cli_exited=cli_exited)
         else:
             gen = _stream_claude(prompt, workdir, claude_session_id, repo,
                                  session_id, tenant_id, model, turn_timeout_s,
-                                 permission_mode=permission_mode, turn_dir=turn_dir)
+                                 permission_mode=permission_mode, turn_dir=turn_dir,
+                                 cli_exited=cli_exited)
         for line in gen:
             if not line.startswith("data:"):
                 continue
