@@ -279,9 +279,10 @@ so do NOT reference absolute paths like `/tmp/...`; say "the same workspace as
 the previous call".
 
 ```bash
-# 1. Checkout and install (workspace is already cloned via the repo arg)
+# 1. Checkout (workspace is already cloned via the repo arg; node_modules is
+#    pre-provisioned — only reinstall when this branch changed the lockfile)
 git checkout <branch> && git pull
-npm install
+git diff --quiet origin/<base_branch>...HEAD -- package-lock.json package.json || npm ci
 
 # 2. TypeScript compilation (BLOCKING)
 npx tsc --noEmit

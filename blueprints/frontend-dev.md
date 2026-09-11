@@ -105,8 +105,9 @@ its own workspace, so the build, tests, and screenshot all happen INSIDE
 claude_code — you don't read files yourself.
 
 Ask `claude_code` (same session) to:
-1. Run `npm run build` and the project's tests, fixing any failures (same
-   session) before proceeding.
+1. Run `npm run build`, the test files covering the changed components, and
+   only the Playwright spec(s) for the changed screens (the full suite is CI's
+   job), fixing any failures (same session) before proceeding. Dependencies are provisioned on checkout (`node_modules` is a symlink to a per-lockfile cache). Never run `npm install` / `npm ci` unless `package.json` or `package-lock.json` changed on this branch, and never run `playwright install` (Chromium is baked into the image).
 2. Start the dev server and screenshot the changed view with Playwright, saving
    it INTO the repo (e.g. `docs/implementation-screenshot.png`). The browser is
    pre-baked into the runtime image — do NOT run `playwright install`.

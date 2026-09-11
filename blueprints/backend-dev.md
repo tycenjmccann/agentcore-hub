@@ -111,7 +111,7 @@ turn so no single turn runs long enough to approach the wall-clock cap.
 ```
 claude_code(
     model="sonnet",
-    task="Run the full test suite and the build; fix any failures (same session), then commit and push."
+    task="Verify (diff-scoped): run `npx tsc --noEmit` (or the project's compile step), lint, and the test files that cover the modules you changed. Run `npm run build` only if the change touches `src/app/**` or `next.config.*`; otherwise skip it — CI (CodeBuild) certifies the full build and suite on the head SHA. Do not run `npm install`/`npm ci` (node_modules is provisioned) unless the lockfile changed. Fix failures at the root, then commit and push."
 )
 ```
 
@@ -153,17 +153,17 @@ A session that dies after the deliverable but before the report leaves the run u
 Each claude_code call should be **one category of work**. Mixing unrelated concerns causes calls to run long and timeout. Splitting across calls is safe — they all share the same workspace and conversation, so a later call builds directly on the earlier ones.
 
 **Separate into different calls:**
-- **Repo setup** — clone (pass `repo`), branch, install dependencies
+- **Repo setup** — clone (pass `repo`), branch. Dependencies are provisioned on checkout (`node_modules` is a symlink to a per-lockfile cache). Never run `npm install` / `npm ci` unless `package.json` or `package-lock.json` changed on this branch, and never run `playwright install` (Chromium is baked into the image).
 - **Implementation** — writing the actual feature code (group related files together)
 - **Content/data generation** — test fixtures, seed data, mock data, config files
 - **Tests** — writing and running tests
 - **Design/docs** — architecture docs, API specs, migration scripts
 - **Build verification & git** — compile, lint, commit, push
 
-Target ~10 minutes of activity per session. Hard timeout is 15 minutes — sessions that exceed it are killed and work is lost.
+Target 10–15 minutes of activity per turn. The hard cap is 60 minutes per `claude_code` call (`turnTimeoutSecs`); a turn that hits it is killed and uncommitted work is lost.
 
 ## Claude Code Limits
-- Each `claude_code` call has a **15-minute hard timeout**. Target ~10 minutes per session.
+- Each `claude_code` call has a **60-minute hard cap** (`turnTimeoutSecs`). Target 10–15 minutes per turn; commit and push before the turn ends.
 - If the work is too large for one session, split by concern (see above).
 - If `claude_code` fails or times out: retry ONCE with a narrower task. If it fails again, report BLOCKED.
 - After 2 consecutive failures, STOP and report BLOCKED with what completed so far.
