@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 import { NextRequest } from "next/server";
 
 /**
- * R1 (docs/race-condition-study.md): the Jira webhook route must enqueue
+ * R1 (the race-condition plan): the Jira webhook route must enqueue
  * commands on the FIFO queue when WORKFLOW_COMMAND_QUEUE_URL is set — with
  * MessageGroupId = workflow root and a redelivery-stable dedup id — and fall
  * back to the direct orchestrator invoke when it is not. Mock only the seams

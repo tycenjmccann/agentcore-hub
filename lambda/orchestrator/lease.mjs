@@ -2,7 +2,7 @@
  * Invocation leases — orchestrator (Lambda) port of src/lib/workflow/lease.ts.
  *
  * TEAM-3618: hand-port of isLeaseLive / lastAgentActivity / stealClaim with
- * IDENTICAL semantics to the app-side module (R3 of docs/race-condition-study.md
+ * IDENTICAL semantics to the app-side module (R3 of the race-condition plan
  * — never re-implement lease semantics). The parity contract test
  * (src/lib/workflow/lease-parity.test.ts) feeds identical fixtures through both
  * copies of isLeaseLive and asserts identical booleans.

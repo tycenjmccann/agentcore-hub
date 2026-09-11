@@ -698,7 +698,7 @@ export const handler = async (event) => {
     return reconcileResult;
   }
 
-  // SQS FIFO command queue (R1 — docs/race-condition-study.md). One message
+  // SQS FIFO command queue (R1). One message
   // group per workflow root, so commands for a run arrive strictly in order
   // and never concurrently. Partial-batch failure reporting keeps a failed
   // command (and everything behind it in its group) on the queue for retry.

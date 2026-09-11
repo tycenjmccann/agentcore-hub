@@ -35,7 +35,7 @@ class LeaseLiveError extends Error {
 }
 
 /**
- * Lease gate + atomic steal (R3 — docs/race-condition-study.md). The old
+ * Lease gate + atomic steal (R3). The old
  * release was unconditional: a retry against a slow-but-alive agent released
  * its claim and re-invoked, putting two agents on one ticket. Now:
  *  1. refuse while the lease is live (any event from the agent within TTL),

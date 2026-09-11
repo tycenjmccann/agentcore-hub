@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ─── Workflow-table write guard (R2 — docs/race-condition-study.md) ───────────
+# ─── Workflow-table write guard (R2) ───────────
 #
 # The workflows table may only be written through lambda/orchestrator/
 # workflow-store.mjs (scoped conditional writes). Full-row puts and ad-hoc

@@ -9,7 +9,7 @@
 #
 # Curated by 14 parallel research agents on 2026-06-01. See:
 #   - .claude-plugin/skills.json (machine-readable manifest)
-#   - docs/skills-research-report.md (research notes)
+#   - internal skills research (research notes)
 #
 # License scope: Apache-2.0 / MIT / MIT-0 / BSD only. Repos declared MIT in
 # README/SKILL.md frontmatter without a top-level LICENSE file are included

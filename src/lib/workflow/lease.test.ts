@@ -3,7 +3,7 @@ import { isLeaseLive, lastAgentActivity, stealClaim } from "./lease";
 import type { DynamoDBDocumentClient } from "@aws-sdk/lib-dynamodb";
 
 /**
- * R3 (docs/race-condition-study.md): the lease is what stops retry/dispatch
+ * R3 (the race-condition plan): the lease is what stops retry/dispatch
  * from stealing a ticket out from under a LIVE agent (duplicate PRs). Pin the
  * liveness math and the CAS steal semantics.
  */

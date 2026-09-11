@@ -120,7 +120,7 @@ async function dispatchJira(ticketKey: string, epicId: string | undefined, workf
 }
 
 /**
- * Lease-aware claim release (R3 — docs/race-condition-study.md). The old
+ * Lease-aware claim release (R3). The old
  * release was unconditional: dispatching a ticket whose agent was slow but
  * ALIVE released its claim and re-invoked — two agents on one ticket. Now a
  * RUNNING claim is only stolen when its lease has expired (no event from the

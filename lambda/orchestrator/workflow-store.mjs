@@ -1,6 +1,6 @@
 /**
  * Workflow store — the ONLY module allowed to write the workflows table
- * (R2 of docs/race-condition-study.md; enforced by scripts/check-workflow-writes.sh).
+ * (R2 of the race-condition plan; enforced by scripts/check-workflow-writes.sh).
  *
  * Every op is a SCOPED conditional write. There is deliberately no "save the
  * whole workflow" function: full-row puts resurrect stale snapshots over
