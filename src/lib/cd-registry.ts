@@ -163,6 +163,62 @@ export function pipelineProjectsFor(entry: CdRegistryEntry): PipelineProjects | 
   };
 }
 
+/**
+ * Shape-validate a POST /api/workflow/cd-registry body before it ever reaches
+ * upsertCdEntry/S3 — a typo here (`us-eat-1`, a pipeline name with spaces, a
+ * deployDoc of `../../etc`) would otherwise be stored as-is and only fail later
+ * inside a Lambda with an opaque AWS error (the registry is a runtime
+ * allow-list read by the tools Lambda, the Telegram deploy-gate bridge and the
+ * orchestrator — see docs/agents-own-cd.md).
+ *
+ * Returns null when the payload is fine, else every failing field's reason at
+ * once (field name → reason), so the caller can report them all in one 400.
+ *
+ * An optional field that is blank/whitespace-only is NOT validated: that is
+ * upsertCdEntry's "clear this field" signal (see the loop below it), not a
+ * value, and parseCdRegistry trims + drops blanks anyway — so this validates
+ * the exact (trimmed) bytes that would end up stored, and never rejects a
+ * payload that is valid today.
+ */
+export function validateCdEntryInput(body: unknown): Record<string, string> | null {
+  const fields: Record<string, string> = {};
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return { repo: "must be owner/repo or a GitHub URL" };
+  }
+  const o = body as Record<string, unknown>;
+
+  if (!normalizeRepoKey(o.repo)) fields.repo = "must be owner/repo or a GitHub URL";
+
+  const RULES: Record<string, { re: RegExp; reason: string }> = {
+    region: { re: /^[a-z]{2}(-gov)?-[a-z]+-\d$/, reason: "must be an AWS region like us-east-1 or us-gov-west-1" },
+    pipeline: { re: /^[A-Za-z0-9.@_-]{1,100}$/, reason: "must be a valid CodePipeline name (1-100 chars of [A-Za-z0-9.@_-])" },
+    ciProject: { re: /^[A-Za-z0-9_-]{2,150}$/, reason: "must be a valid CodeBuild project name (2-150 chars of [A-Za-z0-9_-])" },
+  };
+  for (const f of ["pipeline", "region", "ciProject", "deployDoc", "notes"] as const) {
+    const v = o[f];
+    if (v === undefined) continue;
+    if (typeof v !== "string") { fields[f] = "must be a string"; continue; }
+    const trimmed = v.trim();
+    if (!trimmed) continue; // blank = clear, not a value to validate
+    const rule = RULES[f];
+    if (rule && !rule.re.test(trimmed)) fields[f] = rule.reason;
+  }
+  if (typeof o.deployDoc === "string") {
+    const trimmed = o.deployDoc.trim();
+    if (trimmed && !fields.deployDoc) {
+      if (trimmed.length > 200) fields.deployDoc = "must be at most 200 characters";
+      else if (trimmed.startsWith("/") || trimmed.startsWith("\\")) fields.deployDoc = "must be a relative path (no leading slash)";
+      else if (trimmed.split(/[\\/]+/).includes("..")) fields.deployDoc = "must not contain a .. path segment";
+    }
+  }
+  if (typeof o.notes === "string") {
+    const trimmed = o.notes.trim();
+    if (trimmed && !fields.notes && trimmed.length > 2000) fields.notes = "must be at most 2000 characters";
+  }
+
+  return Object.keys(fields).length ? fields : null;
+}
+
 /** Upsert by repo key (returns a new registry). */
 export function upsertCdEntry(registry: CdRegistry, input: Partial<Omit<CdRegistryEntry, "repo">> & { repo: unknown }): CdRegistry {
   const key = normalizeRepoKey(input.repo);
