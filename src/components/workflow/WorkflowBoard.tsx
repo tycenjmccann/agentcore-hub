@@ -108,9 +108,10 @@ function managerPulseText(
  * for isPipelineEnabled. The server still does the real normalization — this
  * only has to recognize the key it hands back.
  */
-function isSameRepo(url: string | undefined, key: string): boolean {
+export function isSameRepo(url: string | undefined, key: string): boolean {
   if (!url || !key) return false;
-  const u = url.trim().toLowerCase().replace(/\.git$/, "").replace(/\/+$/, "");
+  // Trailing slashes first: `…/repo.git/` leaves `.git` unmatchable otherwise (TEAM-4421).
+  const u = url.trim().toLowerCase().replace(/\/+$/, "").replace(/\.git$/, "");
   return u === key || u.endsWith(`/${key}`) || u.endsWith(`:${key}`);
 }
 
