@@ -1,13 +1,18 @@
 import { test, expect, type Page } from "@playwright/test";
 
 /**
- * /pipeline — the "waiting deploy gate" context (TEAM-4433).
+ * /pipeline — the "waiting deploy gate" context (TEAM-4433, TEAM-4445).
  *
  * Before this, a parked Approval stage showed only name/status/12-char
  * revisionSummary — no wait duration, no commit, no approve link. This pins the
  * amber "waiting" card: how long it has waited, a link to the source commit
  * (only when the target's sourceRepo is known), and the CodePipeline approve
  * deep link.
+ *
+ * The approve link is DERIVED by the page from the target's own `pipeline` +
+ * `region` (TEAM-4445) — not from the stage's `approvalUrl`. `approvalUrl` is
+ * the ManualApproval action's entityUrl, which the hub's pipeline sets to a
+ * GitHub commits URL, so it renders only as a secondary "View commits" link.
  *
  * Fully hermetic — every /api/** call is intercepted in-page (one handler
  * switching on URL, same shape as tests/tab-workflow-sidebar.spec.ts), so this
@@ -24,8 +29,13 @@ const SCREENSHOT_DIR = "playwright-screenshots/team-4419";
 
 const SHA = "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4";
 const WAITED_MS = 15 * 60 * 1000 + 5_000; // → floor(15.08) minutes = "15 min"
+// The ManualApproval action's entityUrl — a GitHub commits URL in the hub's own
+// pipeline (deploy/pipeline/lib/pipeline-stack.ts), never a console URL.
+const COMMITS_URL = "https://github.com/acme/juno/commits/main";
+// Derived by the page from the fixture target's pipeline + region — production
+// never supplies a console URL in approvalUrl.
 const APPROVE_URL =
-  "https://console.aws.amazon.com/codesuite/codepipeline/pipelines/hub-juno-deploy/view?region=us-east-1";
+  "https://us-east-1.console.aws.amazon.com/codesuite/codepipeline/pipelines/hub-juno-deploy/view?region=us-east-1";
 
 interface OpenOpts {
   approvalStatus: string;
@@ -73,7 +83,7 @@ async function stubApi(page: Page, opts: OpenOpts) {
                 revisionSummary: "deadbeefcafe",
                 sourceSha: opts.sourceSha === false ? undefined : SHA,
                 awaitingApproval: opts.approvalStatus === "InProgress",
-                approvalUrl: APPROVE_URL,
+                approvalUrl: COMMITS_URL,
               },
             ],
           },
@@ -117,6 +127,14 @@ test.describe("Pipeline — deploy gate waiting context", () => {
     await expect(approveLink).toContainText("Approve in CodePipeline");
     await expect(approveLink).toHaveAttribute("href", APPROVE_URL);
     await expect(approveLink).toHaveAttribute("rel", "noopener noreferrer");
+    await expect(approveLink).toHaveAttribute("target", "_blank");
+
+    const commitsLink = page.locator('[data-testid="approval-commits-link"]');
+    await expect(commitsLink).toHaveAttribute("href", COMMITS_URL);
+    await expect(commitsLink).toContainText("View commits");
+    await expect(commitsLink).not.toContainText("Approve in CodePipeline");
+    await expect(commitsLink).toHaveAttribute("rel", "noopener noreferrer");
+    await expect(commitsLink).toHaveAttribute("target", "_blank");
 
     await expect(page.locator('[data-testid="approval-waiting-card"]')).toBeVisible();
 
@@ -130,6 +148,7 @@ test.describe("Pipeline — deploy gate waiting context", () => {
     await expect(page.locator('[data-testid="approval-commit-link"]')).toHaveCount(0);
     await expect(page.locator('[data-testid="approval-commit-sha"]')).toHaveCount(0);
     await expect(page.locator('[data-testid="approval-approve-link"]')).toHaveCount(0);
+    await expect(page.locator('[data-testid="approval-commits-link"]')).toHaveCount(0);
     await expect(page.locator('[data-testid="approval-waiting-card"]')).toHaveCount(0);
   });
 
@@ -144,6 +163,7 @@ test.describe("Pipeline — deploy gate waiting context", () => {
     await expect(sourceCard.locator('[data-testid="approval-commit-link"]')).toHaveCount(0);
     await expect(sourceCard.locator('[data-testid="approval-commit-sha"]')).toHaveCount(0);
     await expect(sourceCard.locator('[data-testid="approval-approve-link"]')).toHaveCount(0);
+    await expect(sourceCard.locator('[data-testid="approval-commits-link"]')).toHaveCount(0);
   });
 
   test("4. sourceRepo omitted -> plain SHA text, no link; wait + approve still render", async ({ page }) => {
