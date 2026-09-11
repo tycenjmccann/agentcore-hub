@@ -23,4 +23,17 @@ describe('isSameRepo', () => {
     expect(isSameRepo(undefined, 'owner/repo')).toBe(false);
     expect(isSameRepo('', 'owner/repo')).toBe(false);
   });
+
+  /**
+   * TEAM-4441 (ship-review F1 on #529) — the TEAM-4421 reorder fixed
+   * `.git/` but regressed the mirror-image `/.git` form: slashes were
+   * stripped first (a no-op on this input), then `.git` left a trailing
+   * `/` behind that was never stripped again.
+   */
+  it('matches a slash-before-.git remote (the TEAM-4441 regression)', () => {
+    expect(isSameRepo('https://github.com/owner/repo/.git', 'owner/repo')).toBe(true);
+    expect(isSameRepo('owner/repo/.git', 'owner/repo')).toBe(true);
+    expect(isSameRepo('https://github.com/owner/repo/.git/', 'owner/repo')).toBe(true);
+    expect(isSameRepo('https://github.com/Owner/Repo/.git', 'owner/repo')).toBe(true);
+  });
 });
