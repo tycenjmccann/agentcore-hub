@@ -323,7 +323,11 @@ const clientsByRegion = new Map();
  */
 function clientsFor(region, roleArn = null, externalId = null) {
   const r = region || REGION;
-  const key = `${r}|${roleArn || ""}`;
+  // externalId is part of the identity: rotating it (same role + region) must
+  // build a fresh client whose provider closes over the NEW value, else the
+  // cached provider keeps assuming with the stale ExternalId once its ~15-min
+  // session lapses, and every cross-account call fails until the container recycles.
+  const key = `${r}|${roleArn || ""}|${externalId || ""}`;
   let set = clientsByRegion.get(key);
   if (!set) {
     const cfg = { region: r };

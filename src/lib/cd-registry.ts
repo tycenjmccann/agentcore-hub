@@ -279,6 +279,26 @@ export function validateCdEntryInput(body: unknown): Record<string, string> | nu
     if (trimmed && !fields.notes && trimmed.length > 2000) fields.notes = "must be at most 2000 characters";
   }
 
+  // Cross-account CD is a complete triple or nothing. parseCdRegistry SILENTLY
+  // drops an incomplete or account-mismatched triple (keeping the pipeline), so
+  // without this the POST returns 200 and the operator believes a foreign target
+  // was saved when it was quietly treated as same-account. Reject at the write
+  // boundary instead. A blank field is the "clear it" signal, not a value — so
+  // all-blank (or fields absent) is fine, and only a PARTIAL triple is an error.
+  const xa = (["account", "roleArn", "externalId"] as const).map((f) =>
+    typeof o[f] === "string" ? (o[f] as string).trim() : ""
+  );
+  const [acct, role, extId] = xa;
+  if ((acct || role || extId) && !(acct && role && extId)) {
+    (["account", "roleArn", "externalId"] as const).forEach((f, i) => {
+      if (!xa[i] && !fields[f]) fields[f] = "cross-account CD needs account, roleArn and externalId together";
+    });
+  } else if (acct && role && extId && !fields.account && !fields.roleArn) {
+    // Both individually valid; now the roleArn's embedded account must be `account`.
+    const m = /^arn:aws:iam::([0-9]{12}):role\//.exec(role);
+    if (m && m[1] !== acct) fields.roleArn = "roleArn account must equal account";
+  }
+
   return Object.keys(fields).length ? fields : null;
 }
 
