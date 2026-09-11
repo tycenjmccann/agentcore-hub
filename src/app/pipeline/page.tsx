@@ -60,6 +60,22 @@ function waitedFor(iso?: string): string | undefined {
   return `${Math.floor(diff / 86_400_000)} d`;
 }
 
+/**
+ * The CodePipeline console deep link for this target — the real approve surface.
+ * Deliberately NOT the stage's `approvalUrl`: that is the ManualApproval action's
+ * entityUrl, which the hub's pipeline sets to a GitHub commits URL
+ * (`externalEntityLink` in deploy/pipeline/lib/pipeline-stack.ts), so it never
+ * points at the console. Returns undefined when region/pipeline do not look like
+ * AWS names, rather than building a URL out of unvetted values.
+ */
+function approveConsoleUrl(t: PipelineTarget): string | undefined {
+  if (!/^[a-z0-9-]+$/.test(t.region)) return undefined;
+  if (!/^[A-Za-z0-9.@_-]+$/.test(t.pipeline)) return undefined;
+  return `https://${t.region}.console.aws.amazon.com/codesuite/codepipeline/pipelines/${encodeURIComponent(
+    t.pipeline
+  )}/view?region=${t.region}`;
+}
+
 export default function PipelinePage() {
   const [data, setData] = useState<PipelineStatus | null>(null);
   const [loading, setLoading] = useState(true);
@@ -145,6 +161,7 @@ export default function PipelinePage() {
               {t.stages.map((s) => {
                 const waiting = isWaitingApproval(s);
                 const waited = waiting ? waitedFor(s.waitingSince) : undefined;
+                const approveUrl = waiting ? approveConsoleUrl(t) : undefined;
                 return (
                   <div
                     key={s.name}
@@ -186,15 +203,26 @@ export default function PipelinePage() {
                               {s.sourceSha.slice(0, 7)}
                             </span>
                           ))}
-                        {s.approvalUrl && (
+                        {approveUrl && (
                           <a
                             data-testid="approval-approve-link"
-                            href={s.approvalUrl}
+                            href={approveUrl}
                             target="_blank"
                             rel="noopener noreferrer"
                             className="text-xs text-amber-300 hover:underline flex items-center gap-1"
                           >
                             <ExternalLink className="w-3 h-3" /> Approve in CodePipeline
+                          </a>
+                        )}
+                        {s.approvalUrl && (
+                          <a
+                            data-testid="approval-commits-link"
+                            href={s.approvalUrl}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="text-xs text-amber-300 hover:underline flex items-center gap-1"
+                          >
+                            <ExternalLink className="w-3 h-3" /> View commits
                           </a>
                         )}
                       </>
