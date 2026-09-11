@@ -107,7 +107,8 @@ claude_code — you don't read files yourself.
 Ask `claude_code` (same session) to:
 1. Run `npm run build`, the test files covering the changed components, and
    only the Playwright spec(s) for the changed screens (the full suite is CI's
-   job), fixing any failures (same session) before proceeding. Dependencies are provisioned on checkout (`node_modules` is a symlink to a per-lockfile cache). Never run `npm install` / `npm ci` unless `package.json` or `package-lock.json` changed on this branch, and never run `playwright install` (Chromium is baked into the image).
+   job), fixing any failures (same session) before proceeding.
+   **Never reinstall dependencies to chase a build failure.** `node_modules` is a provisioned symlink to a per-lockfile cache; `npm ci` / `npm install` replaces it with a fresh tree on the shared mount and costs 20-30 minutes, and repeated installs are the known failure loop (they do not fix a missing or corrupt module). Install only when THIS branch changed `package.json` / `package-lock.json`. If a build or test fails on a module that looks missing or corrupt, report it with the exact error instead. Dependencies are provisioned on checkout (`node_modules` is a symlink to a per-lockfile cache). Never run `npm install` / `npm ci` unless `package.json` or `package-lock.json` changed on this branch, and never run `playwright install` (Chromium is baked into the image).
 2. Start the dev server and screenshot the changed view with Playwright, saving
    it INTO the repo (e.g. `docs/implementation-screenshot.png`). The browser is
    pre-baked into the runtime image — do NOT run `playwright install`.

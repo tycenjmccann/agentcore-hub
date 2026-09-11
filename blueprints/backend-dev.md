@@ -111,7 +111,7 @@ turn so no single turn runs long enough to approach the wall-clock cap.
 ```
 claude_code(
     model="sonnet",
-    task="Verify (diff-scoped): run `npx tsc --noEmit` (or the project's compile step), lint, and the test files that cover the modules you changed. Run `npm run build` only if the change touches `src/app/**` or `next.config.*`; otherwise skip it — CI (CodeBuild) certifies the full build and suite on the head SHA. Do not run `npm install`/`npm ci` (node_modules is provisioned) unless the lockfile changed. Fix failures at the root, then commit and push."
+    task="Verify (diff-scoped): run `npx tsc --noEmit` (or the project's compile step), lint, and the test files that cover the modules you changed. Run `npm run build` only if the change touches `src/app/**` or `next.config.*`; otherwise skip it — CI (CodeBuild) certifies the full build and suite on the head SHA. Do not run `npm install`/`npm ci` unless the lockfile changed on this branch: node_modules is a provisioned symlink and installing replaces it with a fresh tree on the shared mount (20-30 min). Repeated installs never fix a missing or corrupt module - report the exact error instead. Fix failures at the root, then commit and push."
 )
 ```
 
