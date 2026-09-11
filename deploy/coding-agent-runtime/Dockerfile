@@ -106,7 +106,8 @@ USER root
 RUN mkdir -p /opt/pw-browsers \
  && npm_config_cache=/tmp/npm-cache-build npx --yes playwright@1.60.0 install chromium \
  && rm -rf /tmp/npm-cache-build \
- && chmod -R a+rx /opt/pw-browsers
+ && chown -R bedrock_agentcore:bedrock_agentcore /opt/pw-browsers \
+ && chmod -R u+rwX,a+rX /opt/pw-browsers
 
 # Python deps (health server + OTel + codex bedrock token generator)
 COPY requirements.txt .

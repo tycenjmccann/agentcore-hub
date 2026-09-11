@@ -2320,15 +2320,17 @@ def _provision_deps(workdir: str | None) -> dict:
                 target, source = _build_deps(workdir, lock_hash)
         if not target:
             info.update(deps="unavailable", reason=source)
-            logger.info("deps_unavailable", extra=info)
+            logger.info("deps_unavailable %s", json.dumps(info, default=str), extra=info)
             return info
         _link_deps(nm, target)
         info.update(deps=source, target=target, secs=round(time.time() - started, 1))
         info["hook"] = _install_deps_hook(workdir)
-        logger.info("deps_provisioned", extra=info)
+        # Fields ride in the message: the OTEL log exporter drops `extra`, so the
+        # tier hit rate (local / efs_tar / efs / npm_ci) was invisible in CloudWatch.
+        logger.info("deps_provisioned %s", json.dumps(info, default=str), extra=info)
         return info
     except Exception as exc:  # noqa: BLE001
-        logger.warning("deps_provision_failed", extra={"error": str(exc)[:200]})
+        logger.warning("deps_provision_failed %s", str(exc)[:200], extra={"error": str(exc)[:200]})
         info["deps"] = "error"
         return info
 
