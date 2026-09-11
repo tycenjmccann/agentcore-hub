@@ -37,7 +37,7 @@ export function normalizeRepoKey(value) {
   let s = String(value ?? "").trim();
   if (!s) return null;
   s = s.replace(/^git@[^:]+:/, "").replace(/^[a-z]+:\/\/[^/]+\//i, "");
-  s = s.replace(/\.git$/i, "").replace(/^\/+|\/+$/g, "");
+  s = s.replace(/^\/+|\/+$/g, "").replace(/\.git$/i, "").replace(/\/+$/, "");
   const parts = s.split("/");
   if (parts.length !== 2 || !parts[0] || !parts[1]) return null;
   return `${parts[0]}/${parts[1]}`.toLowerCase();

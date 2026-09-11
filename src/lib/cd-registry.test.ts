@@ -11,6 +11,15 @@ describe("cd-registry (app)", () => {
     expect(normalizeRepoKey("acme/hub")).toBe("acme/hub");
     expect(normalizeRepoKey("hub")).toBeNull();
     expect(normalizeRepoKey("")).toBeNull();
+    // TEAM-4421/TEAM-4426: trailing slash AFTER .git must not survive the strip.
+    expect(normalizeRepoKey("https://github.com/owner/repo.git/")).toBe("owner/repo");
+    expect(normalizeRepoKey("git@github.com:owner/repo.git/")).toBe("owner/repo");
+    // TEAM-4441 (ship-review F1 on #529): the mirror-image slash-BEFORE-.git
+    // form must survive too — the TEAM-4421 reorder alone regressed this.
+    expect(normalizeRepoKey("https://github.com/owner/repo/.git")).toBe("owner/repo");
+    expect(normalizeRepoKey("owner/repo/.git")).toBe("owner/repo");
+    expect(normalizeRepoKey("https://github.com/owner/repo/.git/")).toBe("owner/repo");
+    expect(normalizeRepoKey("https://github.com/Owner/Repo/.git")).toBe("owner/repo");
   });
 
   it("parses tolerantly and matches by URL", () => {
