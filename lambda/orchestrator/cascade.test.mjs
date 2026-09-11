@@ -565,6 +565,86 @@ describe("Finding 2 — idempotent in_review re-wake", () => {
 });
 
 /**
+ * TEAM-4410 — a gate already parked on a human (an OPEN, unacknowledged
+ * review_needed notification for it) is not stalled; it must not re-invoke
+ * reawakenGate at all, in any mode. Without this guard reawakenGate
+ * (handleHumanReviewGate) re-writes the ticket to "In Review" every time before
+ * its own idempotency CAS declines — the redundant write this bug is about.
+ */
+describe("TEAM-4410 — open review notification short-circuits the re-wake", () => {
+  const openNotifWorkflow = {
+    ...extWorkflow,
+    humanNotifications: [
+      { id: "n1", type: "review_needed", ticketId: "GATE-1", acknowledged: false },
+    ],
+  };
+
+  it("enforce: reawakenGate is never called, outcome is review-noop, zero review.reawakened", async () => {
+    const siblings = [
+      { ticketId: DONE, status: "done" },
+      { ticketId: "GATE-1", status: "in_review", assignee: "human:reviewer", blockedBy: [DONE] },
+    ];
+    const { deps, publishEvent, reawakenGate } = makeExtDeps({
+      getChildTickets: vi.fn(async () => siblings),
+    });
+    const { cascadeUnblock, handleInReviewDependent } = createCascade(deps);
+    const m = newMetrics();
+
+    const outcome = await handleInReviewDependent(siblings[1], DONE, openNotifWorkflow, m, "enforce");
+
+    expect(outcome).toBe("review-noop");
+    expect(reawakenGate).not.toHaveBeenCalled();
+    expect(m.reviewReawakened).toBe(0);
+
+    await cascadeUnblock(DONE, "EPIC-1", openNotifWorkflow);
+    expect(reawakenGate).not.toHaveBeenCalled();
+    expect(eventsOfType(publishEvent, "review.reawakened")).toHaveLength(0);
+  });
+
+  it("shadow: predicts review-noop (not would-review), reawakenGate never called", async () => {
+    const siblings = [
+      { ticketId: DONE, status: "done" },
+      { ticketId: "GATE-1", status: "in_review", assignee: "human:reviewer", blockedBy: [DONE] },
+    ];
+    const { deps, reawakenGate } = makeExtDeps({
+      getChildTickets: vi.fn(async () => siblings),
+    });
+    const { handleInReviewDependent } = createCascade(deps);
+    const m = newMetrics();
+
+    const outcome = await handleInReviewDependent(siblings[1], DONE, openNotifWorkflow, m, "shadow");
+
+    expect(outcome).toBe("review-noop");
+    expect(reawakenGate).not.toHaveBeenCalled();
+    expect(m.wouldReviewReawaken).toBe(0);
+  });
+
+  it("no open notification (acknowledged) still re-wakes normally", async () => {
+    const siblings = [
+      { ticketId: DONE, status: "done" },
+      { ticketId: "GATE-1", status: "in_review", assignee: "human:reviewer", blockedBy: [DONE] },
+    ];
+    const ackedWorkflow = {
+      ...extWorkflow,
+      humanNotifications: [
+        { id: "n1", type: "review_needed", ticketId: "GATE-1", acknowledged: true },
+      ],
+    };
+    const { deps, reawakenGate } = makeExtDeps({
+      getChildTickets: vi.fn(async () => siblings),
+    });
+    const { handleInReviewDependent } = createCascade(deps);
+    const m = newMetrics();
+
+    const outcome = await handleInReviewDependent(siblings[1], DONE, ackedWorkflow, m, "enforce");
+
+    expect(outcome).toBe("review-reawakened");
+    expect(reawakenGate).toHaveBeenCalledWith("GATE-1", "human:reviewer", ackedWorkflow);
+    expect(m.reviewReawakened).toBe(1);
+  });
+});
+
+/**
  * TEAM-3684 Finding 3 — bounded single retry against the eventually-consistent
  * parentId-index GSI. A blocker that already closed but hasn't propagated to the
  * snapshot would otherwise permanently miss the last unblock. One re-fetch (after

@@ -66,6 +66,17 @@ const KNOWN_EXTENDED_MODES = ["off", "shadow", "enforce"];
 const RESOLVED_BLOCKER_STATUSES = new Set(["done", "cancelled"]);
 
 /**
+ * TEAM-4410 — does `workflow` already carry an unacknowledged review_needed
+ * notification for `ticketId`? Same open/closed shape as the store's own CAS
+ * check (workflow-store.mjs appendReviewNotificationOnce), read directly off
+ * the workflow row the caller already has in hand — no extra read.
+ */
+function hasOpenReviewNotification(workflow, ticketId) {
+  const list = Array.isArray(workflow?.humanNotifications) ? workflow.humanNotifications : [];
+  return list.some((n) => n?.ticketId === ticketId && n?.type === "review_needed" && !n?.acknowledged);
+}
+
+/**
  * Normalize the `extendedStates` dep into off | shadow | enforce. Backwards
  * compatible with the legacy boolean (true → enforce, false/unset → off) and
  * with legacy string truthies ("on"/"true"/"1" → enforce). Anything
@@ -467,6 +478,17 @@ export function createCascade(deps) {
    * logic itself decides. In shadow mode: observe only (reawakenGate not called).
    */
   async function handleInReviewDependent(sibling, unblockedBy, workflow, m, mode = "enforce") {
+    // TEAM-4410 — a gate with an OPEN review_needed notification is correctly
+    // parked on a human, not stalled. Checked FIRST and in every mode (read-only,
+    // so shadow predicts what enforce would do — same shape as the F9 blocker
+    // confirm above): without this, reawakenGate (handleHumanReviewGate) writes
+    // the ticket to "In Review" every visit BEFORE its own idempotency CAS
+    // declines, so a parked gate got a redundant Jira/DDB write every sweep
+    // cycle forever even though the outcome was always going to be review-noop.
+    if (hasOpenReviewNotification(workflow, sibling.ticketId)) {
+      log(`[orchestrator] cascade review re-wake skipped (open review notification — parked on a human) — ${sibling.ticketId}`);
+      return "review-noop";
+    }
     if (mode !== "enforce") {
       m.wouldReviewReawaken++;
       log(`[orchestrator] cascade would-reawaken (shadow) — ${sibling.ticketId}`);
