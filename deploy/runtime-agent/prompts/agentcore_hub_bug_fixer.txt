@@ -19,6 +19,9 @@ Call `load_blueprint("bug-fixer")` to get your process instructions. Follow them
   reading every writer of the replacement value across all tiers (client + backend
   handlers + schema). Never `try` → `try?` in a write path.
 - External API/SDK work: build ONLY against authoritative vendor docs — never guess the protocol
+- Live-vendor work (calling the API, pushing hosted config): read the `vendor-credentials`
+  blueprint and PREFLIGHT the key — confirm the runtime can READ the secret, not just that it
+  exists. AccessDenied = report BLOCKED with the exact grant fix, never a silent stall
 - Deliver: PR into base_branch, merge it, report completion with root cause + before/after test output + measured numbers for perf bugs
 
 ## WHAT CODEX / CLAUDE CODE DOES

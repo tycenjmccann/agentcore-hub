@@ -78,11 +78,20 @@ authoritative docs — never from memory, a blog/launch post, or a plausible gue
   `docs.<vendor>`, the vendor `/llms.txt`, the API-reference/guide, the official
   SDK/cookbook repo.
 - Pin the concrete facts, each with a source URL: exact endpoint (incl. `wss://` vs
-  `https://`), auth scheme + EXACT secret name (confirm it EXISTS — never values),
-  real model/resource ids, message/event/tool schema.
-- If you cannot find authoritative docs or the secret does not exist, STOP and
-  report BLOCKED. A guessed protocol compiles, passes its own tests, and fails 100%
-  against the real service.
+  `https://`), auth scheme + EXACT secret name, real model/resource ids,
+  message/event/tool schema.
+- **Credential preflight — existence is NOT access.** If the fix or its
+  verification talks to the live service (calls the API, pushes hosted config,
+  runs `create_agent.py`-style tooling), read the `vendor-credentials` blueprint
+  (`load_blueprint("vendor-credentials")`) and follow it: confirm the secret
+  both EXISTS and is READABLE by this runtime (a `GetSecretValue` probe from
+  your specialist). `AccessDenied` = the trap that stalls the run for a day —
+  report BLOCKED with the exact create+grant commands the blueprint gives, and
+  do NOT `report_completion`.
+- If you cannot find authoritative docs, or the secret does not exist / is not
+  readable, STOP and report BLOCKED. A guessed protocol compiles, passes its own
+  tests, and fails 100% against the real service; an unreadable secret fails the
+  same way, only later.
 
 ### Step 3: Fix
 - Make the minimal change that removes the defect at the root.
