@@ -543,7 +543,16 @@ const REJECT_KEY_PREFIX = "rej#";
 // TTL deletion is lazy, so getPendingRejection checks the stamp itself.
 const REJECT_TTL_SEC = 24 * 3600;
 // Gate pings carry "🎫 <KEY>-<n>" — the handle a reply is matched on.
-const TICKET_KEY_RE = new RegExp(`\\b${JIRA_PROJECT_KEY.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}-\\d+\\b`);
+const JIRA_KEY_SRC = JIRA_PROJECT_KEY.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const TICKET_KEY_RE = new RegExp(`\\b${JIRA_KEY_SRC}-\\d+\\b`);
+// A gate ping's subject and bullets can carry OTHER keys (workflow title,
+// upstream tickets) before the 🎫 handle, so "first key in the text" can route a
+// rework note to the wrong ticket. Anchor on the handle; first match is the
+// fallback for pings without one.
+const GATE_HANDLE_RE = new RegExp(`🎫\\s*\\[?(${JIRA_KEY_SRC}-\\d+)\\b`);
+function gateKeyFromPing(text) {
+  return text.match(GATE_HANDLE_RE)?.[1] || text.match(TICKET_KEY_RE)?.[0] || null;
+}
 // resolveReworkTarget: "told the reviewer how to attach it; do not file this".
 const REWORK_HINTED = Symbol("rework-hinted");
 
@@ -879,7 +888,7 @@ async function gateFromReply(msg) {
   if (!r) return null;
   const rtext = String(r.text || r.caption || "");
   if (!/REVIEW GATE|SHIP-REVIEW ESCALATION|Changes requested/i.test(rtext)) return null;
-  const ticketId = rtext.match(TICKET_KEY_RE)?.[0];
+  const ticketId = gateKeyFromPing(rtext);
   if (!ticketId) return null;
   let workflowId = null;
   for (const row of r.reply_markup?.inline_keyboard || []) {

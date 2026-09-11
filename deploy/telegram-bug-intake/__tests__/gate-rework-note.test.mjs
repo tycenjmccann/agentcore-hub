@@ -422,6 +422,27 @@ describe("reply to a gate ping", () => {
     nothingFiled(net);
   });
 
+  it("routes to the 🎫 handle, not the first key mentioned in the ping's title", async () => {
+    const handler = await loadHandler();
+    const ctx = makeCtx(100_000);
+    const upstream = "TEST-12";
+    const pingText = GATE_PING_TEXT.replace("Multi-CD", `Multi-CD (follow-up to ${upstream})`);
+    const net = makeNet(ctx, {
+      batches: [[msgUpdate(10, "Please split the IAM change out.", {
+        reply_to_message: { message_id: 7, chat: { id: CHAT }, text: pingText, reply_markup: gateKeyboard },
+      })]],
+      afterPoll: [100_000],
+    });
+    global.fetch = net.fetch;
+
+    await handler({}, ctx);
+
+    expect(net.transitions).toHaveLength(1);
+    expect(net.transitions[0]).toMatchObject({ ticketId: GATE, targetStatus: "blocked" });
+    expect(net.transitions[0].ticketId).not.toBe(upstream);
+    nothingFiled(net);
+  });
+
   it("falls back to the ticket's wf: label when the ping's keyboard is gone", async () => {
     const handler = await loadHandler();
     const ctx = makeCtx(100_000);
