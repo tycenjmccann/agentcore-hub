@@ -322,11 +322,22 @@ async function routeMessage(msg, buffers, context) {
     text = text ? `${text}\n\n${transcript}` : transcript;
   }
 
-  // A pending "request changes" is waiting for this chat's next message — it
-  // becomes the rework note for the gate ticket, not a bug report.
-  if (text && !text.startsWith("/")) {
-    const consumed = await consumeRejectionNote(chatId, text);
-    if (consumed) return;
+  // A pending "Request changes" (or a reply to a gate ping) makes this message
+  // the gate's rework note, not a bug report. Notes buffer like reports do:
+  // Telegram splits a long paste into several messages, and a note that
+  // arrives in parts must reach the gate as ONE comment — the old
+  // consume-first-message path delivered part 1 and filed part 2 as a bug.
+  if (text && !text.startsWith("/") && stripWmPrefix(text) == null) {
+    const target = await resolveReworkTarget(chatId, text, msg);
+    if (target === REWORK_HINTED) return;
+    if (target) {
+      const isNew = bufferPart(buffers, chatId, text, null);
+      const b = buffers.get(chatId);
+      b.rework = target;
+      if (isNew) await tgAction(chatId, "typing");
+      await persistBuffer(b);
+      return;
+    }
   }
 
   if (text.startsWith("/start") || text.startsWith("/help")) {
@@ -417,7 +428,9 @@ async function flushSettledBuffers(buffers, context) {
     buffers.delete(chatId);
     await deleteBuffer(chatId);
     try {
-      if (wmDirect != null && !fileIds.length) {
+      if (b.rework) {
+        await deliverReworkNote(b.chatId, b.rework, text);
+      } else if (wmDirect != null && !fileIds.length) {
         await relayToWorkflowManager(chatId, wmDirect, context);
       } else {
         await processBug(b.chatId, text, fileIds, context);
@@ -512,6 +525,12 @@ async function handleCallback(cb) {
     return;
   }
 
+  // Parked rework-note buttons: rjr|<ticketId>|<workflowId> / rjx|<ticketId>
+  if (action === "rjr" || action === "rjx") {
+    await handleReworkRetryCallback(cb, chatId, action, id, idx);
+    return;
+  }
+
   // Manager-escalation button: eok|<workflowId> (resolves every open escalation
   // on the run — the notification id alone overflows Telegram's 64-byte
   // callback_data cap, and one open escalation is enough to park the run).
@@ -564,6 +583,23 @@ const TERMINAL_PHASES = new Set(["complete", "completed", "cancelled", "canceled
 const ESCALATION_GATE_TITLE = /^Escalation #\d+: ship-review not converging/i;
 const CHAT_KEY_PREFIX = "chat#";
 const REJECT_KEY_PREFIX = "rej#";
+// How long a ❌ tap waits for its note. Was 1h: a reviewer who tapped, then
+// wrote the note later, lost the routing and the note was filed as a bug. DDB
+// TTL deletion is lazy, so getPendingRejection checks the stamp itself.
+const REJECT_TTL_SEC = 24 * 3600;
+// Gate pings carry "🎫 <KEY>-<n>" — the handle a reply is matched on.
+const JIRA_KEY_SRC = JIRA_PROJECT_KEY.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const TICKET_KEY_RE = new RegExp(`\\b${JIRA_KEY_SRC}-\\d+\\b`);
+// A gate ping's subject and bullets can carry OTHER keys (workflow title,
+// upstream tickets) before the 🎫 handle, so "first key in the text" can route a
+// rework note to the wrong ticket. Anchor on the handle; first match is the
+// fallback for pings without one.
+const GATE_HANDLE_RE = new RegExp(`🎫\\s*\\[?(${JIRA_KEY_SRC}-\\d+)\\b`);
+function gateKeyFromPing(text) {
+  return text.match(GATE_HANDLE_RE)?.[1] || text.match(TICKET_KEY_RE)?.[0] || null;
+}
+// resolveReworkTarget: "told the reviewer how to attach it; do not file this".
+const REWORK_HINTED = Symbol("rework-hinted");
 
 // ─── Executive gate-ping formatting ──────────────────────────────────────────
 // Every human decision ping (review gate, ship-review escalation, manager
@@ -820,6 +856,10 @@ async function handleGateCallback(cb, chatId, action, ticketId, workflowId) {
   }
   if (action === "gok") {
     const res = await transitionGate(workflowId, ticketId, "done", `Approved via Telegram by chat ${chatId}`);
+    // A ❌ tapped by mistake before this ✅ left a marker that would turn the
+    // chat's next message into a rework note for a gate that is now done.
+    const stale = await getPendingRejection(chatId);
+    if (stale?.ticketId === ticketId) await deletePendingRejection(chatId);
     await tgAnswer(cb.id, `Approved ${ticketId}`);
     // TEAM-3971: the API records a bare approve on an escalation gate as
     // DECISION: merge-with-known-findings — say so, the human should know.
@@ -830,19 +870,12 @@ async function handleGateCallback(cb, chatId, action, ticketId, workflowId) {
     return;
   }
   // Request changes: the ticket needs a rework note. Park the intent; the
-  // chat's next plain message becomes the note (consumeRejectionNote).
-  await ddb.send(new PutItemCommand({
-    TableName: PENDING_TABLE,
-    Item: {
-      id: { S: `${REJECT_KEY_PREFIX}${chatId}` },
-      ticketId: { S: ticketId },
-      workflowId: { S: workflowId },
-      ttl: { N: String(Math.floor(Date.now() / 1000) + 3600) },
-    },
-  }));
+  // chat's next plain message — or a reply to this ping, any time — becomes
+  // the note (resolveReworkTarget → deliverReworkNote).
+  await putPendingRejection(chatId, ticketId, workflowId);
   await tgAnswer(cb.id, "Reply with what needs to change.");
   await tgEdit(chatId, cb.message.message_id,
-    `${cb.message.text}\n\n❌ Changes requested — reply with a note describing what to change. It goes to the agents as rework context. ` +
+    `${cb.message.text}\n\n❌ Changes requested — reply with a note describing what to change (your next message here, or a reply to this message later). It goes to the agents as rework context. ` +
     `(On an escalated gate, a line reading exactly "DECISION: continue" authorizes more rework rounds.)`);
 }
 
@@ -885,17 +918,142 @@ async function handleDecisionCallback(cb, chatId, opt, ticketId, workflowId) {
     `${cb.message.text}\n\n✅ DECISION: ${decision} recorded on ${ticketId}.${tail}`);
 }
 
-/** If this chat has a pending rejection, the message is its rework note. */
-async function consumeRejectionNote(chatId, text) {
-  const key = `${REJECT_KEY_PREFIX}${chatId}`;
-  const item = await ddb.send(new GetItemCommand({ TableName: PENDING_TABLE, Key: { id: { S: key } } }));
-  if (!item.Item) return false;
-  const ticketId = item.Item.ticketId.S;
-  const workflowId = item.Item.workflowId.S;
-  await ddb.send(new DeleteItemCommand({ TableName: PENDING_TABLE, Key: { id: { S: key } } }));
-  await transitionGate(workflowId, ticketId, "blocked", `Changes requested via Telegram: ${text}`);
-  await tgSend(chatId, `❌ *${ticketId}* — changes requested. Your note is on the ticket; upstream work re-opens for rework.`);
+/**
+ * Which gate, if any, is this chat's plain message a rework note for?
+ *  (a) a pending ❌ tap (rej#<chatId>), or
+ *  (b) a Telegram reply to a gate ping — the ping carries the ticket key; the
+ *      workflow id comes from its buttons, or from the ticket's `wf:` label once
+ *      the buttons are gone (the ❌ edit drops the keyboard).
+ * Returns REWORK_HINTED for a DECISION line with no gate waiting: the reviewer
+ * was told how to attach it, and the message must not be filed.
+ */
+async function resolveReworkTarget(chatId, text, msg) {
+  const pending = await getPendingRejection(chatId);
+  if (pending) return { ticketId: pending.ticketId, workflowId: pending.workflowId };
+  const replied = await gateFromReply(msg);
+  if (replied) return replied;
+  // "DECISION:" is the gate vocabulary this bot itself teaches. Filing one as a
+  // bug/feature launders a review verdict into a brand-new pipeline run.
+  if (/^\s*DECISION:\s*\S/im.test(text)) {
+    await tgSend(chatId,
+      "That reads like a review decision, but no gate is waiting on this chat. " +
+      "Tap ❌ Request changes on the gate ping first, or send the note as a reply to that ping.");
+    return REWORK_HINTED;
+  }
+  return null;
+}
+
+async function gateFromReply(msg) {
+  const r = msg?.reply_to_message;
+  if (!r) return null;
+  const rtext = String(r.text || r.caption || "");
+  if (!/REVIEW GATE|SHIP-REVIEW ESCALATION|Changes requested/i.test(rtext)) return null;
+  const ticketId = gateKeyFromPing(rtext);
+  if (!ticketId) return null;
+  let workflowId = null;
+  for (const row of r.reply_markup?.inline_keyboard || []) {
+    for (const btn of row) {
+      const p = String(btn.callback_data || "").split("|");
+      if ((p[0] === "gok" || p[0] === "gno") && p[1] === ticketId) workflowId = p[2];
+      else if (p[0] === "gdc" && p[2] === ticketId) workflowId = p[3];
+    }
+  }
+  if (!workflowId) workflowId = await workflowIdFromTicket(ticketId);
+  return workflowId ? { ticketId, workflowId } : null;
+}
+
+/** The gate ticket's `wf:<id>` label — the hub's own workflow pointer. */
+async function workflowIdFromTicket(ticketId) {
+  try {
+    const res = await fetch(`https://${JIRA_SITE_URL}/rest/api/3/issue/${encodeURIComponent(ticketId)}?fields=labels`, {
+      headers: { Authorization: JIRA_AUTH, Accept: "application/json" },
+    });
+    if (!res.ok) return null;
+    const { fields } = await res.json();
+    const label = (fields?.labels || []).find((l) => typeof l === "string" && l.startsWith("wf:"));
+    return label ? label.slice(3) : null;
+  } catch (err) {
+    console.error(`[telegram-bug-intake] wf label lookup ${ticketId}`, err.message);
+    return null;
+  }
+}
+
+async function getPendingRejection(chatId) {
+  const { Item: item } = await ddb.send(new GetItemCommand({
+    TableName: PENDING_TABLE, Key: { id: { S: `${REJECT_KEY_PREFIX}${chatId}` } },
+  }));
+  if (!item?.ticketId?.S || !item?.workflowId?.S) return null;
+  const ttl = Number(item.ttl?.N);
+  if (Number.isFinite(ttl) && ttl > 0 && ttl <= Math.floor(Date.now() / 1000)) return null;
+  return { ticketId: item.ticketId.S, workflowId: item.workflowId.S, note: item.note?.S || null };
+}
+
+async function putPendingRejection(chatId, ticketId, workflowId, note = null) {
+  await ddb.send(new PutItemCommand({
+    TableName: PENDING_TABLE,
+    Item: {
+      id: { S: `${REJECT_KEY_PREFIX}${chatId}` },
+      ticketId: { S: ticketId },
+      workflowId: { S: workflowId },
+      ...(note ? { note: { S: note } } : {}),
+      ttl: { N: String(Math.floor(Date.now() / 1000) + REJECT_TTL_SEC) },
+    },
+  }));
+}
+
+async function deletePendingRejection(chatId) {
+  await ddb.send(new DeleteItemCommand({
+    TableName: PENDING_TABLE, Key: { id: { S: `${REJECT_KEY_PREFIX}${chatId}` } },
+  }));
+}
+
+/**
+ * Send the rework note to the gate: in_review → blocked, note as the comment
+ * the orchestrator hands to the re-opened agents. The marker is cleared only
+ * AFTER the transition lands. On failure the note is parked ON the marker with
+ * Retry / Drop buttons. (2026-09-10: the Jira workflow had no In Review →
+ * Blocked transition, the hub 409'd, and because the marker had already been
+ * deleted the reviewer's re-typed note went through bug intake as a new report.)
+ */
+async function deliverReworkNote(chatId, { ticketId, workflowId }, text) {
+  try {
+    await transitionGate(workflowId, ticketId, "blocked", `Changes requested via Telegram: ${text}`);
+  } catch (err) {
+    console.error(`[telegram-bug-intake] rework note for ${ticketId} not delivered:`, err.message);
+    await putPendingRejection(chatId, ticketId, workflowId, text);
+    await tgSend(chatId,
+      `⚠️ Couldn't send *${esc(ticketId)}* back for rework: ${esc(err.detail || err.message)}\n\n` +
+      `Your note is saved here — it was NOT filed as a bug. Fix the cause and tap Retry, or Drop it.`,
+      { reply_markup: { inline_keyboard: [[
+        { text: "🔁 Retry", callback_data: `rjr|${ticketId}|${workflowId}` },
+        { text: "🗑 Drop note", callback_data: `rjx|${ticketId}` },
+      ]] } });
+    return false;
+  }
+  await deletePendingRejection(chatId);
+  await tgSend(chatId, `❌ *${esc(ticketId)}* — changes requested. Your note is on the ticket; upstream work re-opens for rework.`);
   return true;
+}
+
+// Parked-note buttons: rjr|<ticketId>|<workflowId> re-sends the saved note;
+// rjx|<ticketId> drops it (the gate stays parked on the human either way).
+async function handleReworkRetryCallback(cb, chatId, action, ticketId, workflowId) {
+  if (action === "rjx") {
+    await deletePendingRejection(chatId);
+    await tgAnswer(cb.id, "Dropped");
+    await tgEdit(chatId, cb.message.message_id,
+      `${cb.message.text}\n\n🗑 Note dropped. ${ticketId} is still waiting on you.`);
+    return;
+  }
+  const pending = await getPendingRejection(chatId);
+  if (!pending || pending.ticketId !== ticketId || !pending.note) {
+    await tgAnswer(cb.id, "Nothing saved to retry — send the note again.");
+    return;
+  }
+  await tgAnswer(cb.id, "Retrying…");
+  const ok = await deliverReworkNote(chatId, { ticketId, workflowId: workflowId || pending.workflowId }, pending.note);
+  await tgEdit(chatId, cb.message.message_id,
+    `${cb.message.text}\n\n${ok ? "✅ Delivered on retry." : "↻ Retry failed — see below."}`);
 }
 
 async function transitionGate(workflowId, ticketId, targetStatus, comment) {
@@ -904,7 +1062,17 @@ async function transitionGate(workflowId, ticketId, targetStatus, comment) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ ticketId, targetStatus, comment }),
   });
-  if (!res.ok) throw new Error(`transition ${res.status}: ${await res.text().catch(() => "")}`);
+  if (!res.ok) {
+    const raw = await res.text().catch(() => "");
+    // A hub refusal carries the ticket Lambda's reason in `details` (e.g. "No
+    // transition to \"Blocked\" found…") — that is what the human needs to see.
+    let detail = raw;
+    try { const j = JSON.parse(raw); detail = j.details || j.error || raw; } catch { /* not JSON */ }
+    const err = new Error(`transition ${res.status}: ${detail}`);
+    err.status = res.status;
+    err.detail = detail;
+    throw err;
+  }
   // Body is informational (e.g. decisionDefaulted, TEAM-3971) — never required.
   try { return await res.json(); } catch { return {}; }
 }
