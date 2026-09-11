@@ -1,0 +1,102 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  hub-cd-trigger-<Slug> — the ONLY IAM identity the AgentCore Hub may assume in
+  THIS account. Read + trigger this repo's CodePipeline(s); NO deploy approval,
+  NO deploy credentials. Deploy this in the account/region that OWNS the
+  pipeline(s), BEFORE either pipeline template. ONE role covers BOTH a repo's
+  backend pipeline (hub-<Slug>-deploy) and its iOS App Store release pipeline
+  (hub-<Slug>-ios-deploy): the grants are scoped to hub-<Slug>-* so the same
+  trigger role serves both with no second role and no registry change.
+
+Parameters:
+  HubAccountId:
+    Type: String
+    Description: >-
+      The AWS account the hub runs in (its pipeline-tools Lambda role lives
+      here). The hub owner gives you this value — it is NOT hardcoded in the
+      template so this kit stays account-agnostic.
+    AllowedPattern: "^[0-9]{12}$"
+  HubToolsRoleName:
+    Type: String
+    Description: The hub's pipeline-tools Lambda role name (the principal that assumes this role).
+    Default: agentcore-hub-pipeline-tools-role
+  Slug:
+    Type: String
+    Description: Short repo slug. Pipelines follow hub-<Slug>-deploy and hub-<Slug>-ios-deploy.
+    AllowedPattern: "^[a-z0-9][a-z0-9-]{1,30}$"
+  ExternalId:
+    Type: String
+    Description: >-
+      STS ExternalId the hub must present (confused-deputy guard). Must match the
+      registry entry's externalId exactly. Pick an unguessable value.
+    NoEcho: true
+    MinLength: 6
+  PipelineRegion:
+    Type: String
+    Description: Region the pipeline(s) + CodeBuild projects live in.
+
+Resources:
+  TriggerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "hub-cd-trigger-${Slug}"
+      Description: !Sub "AgentCore Hub cross-account CD trigger for hub-${Slug}-* pipelines. Read + StartPipelineExecution only."
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              # Only the hub's pipeline-tools Lambda role may assume this — no other
+              # identity in the hub account, and nothing outside it.
+              AWS: !Sub "arn:aws:iam::${HubAccountId}:role/${HubToolsRoleName}"
+            Action: "sts:AssumeRole"
+            Condition:
+              StringEquals:
+                "sts:ExternalId": !Ref ExternalId
+      Policies:
+        - PolicyName: read-and-trigger-only
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # ── READ + TRIGGER this repo's pipeline(s) ───────────────────────
+              # hub-<Slug>-* matches BOTH hub-<Slug>-deploy (backend) and
+              # hub-<Slug>-ios-deploy (App Store release). StartPipelineExecution
+              # is the only write. There is deliberately NO
+              # codepipeline:PutApprovalResult — the ManualApproval deploy gate
+              # AND the iOS App Store submit gate are HUMAN decisions. Adding
+              # PutApprovalResult would let the hub approve its own ship; do not.
+              - Sid: ReadTriggerPipelines
+                Effect: Allow
+                Action:
+                  - "codepipeline:GetPipeline"
+                  - "codepipeline:GetPipelineState"
+                  - "codepipeline:GetPipelineExecution"
+                  - "codepipeline:ListActionExecutions"
+                  - "codepipeline:ListPipelineExecutions"
+                  - "codepipeline:StartPipelineExecution"
+                Resource:
+                  - !Sub "arn:aws:codepipeline:${PipelineRegion}:${AWS::AccountId}:hub-${Slug}-*"
+              # ── READ the CI / build / deploy CodeBuild projects (both pipelines) ─
+              - Sid: ReadBuildProjects
+                Effect: Allow
+                Action:
+                  - "codebuild:BatchGetBuilds"
+                  - "codebuild:ListBuildsForProject"
+                Resource:
+                  - !Sub "arn:aws:codebuild:${PipelineRegion}:${AWS::AccountId}:project/hub-${Slug}-*"
+              # ── READ their build logs (get_build_log) ────────────────────────
+              - Sid: ReadBuildLogs
+                Effect: Allow
+                Action:
+                  - "logs:GetLogEvents"
+                  - "logs:FilterLogEvents"
+                Resource:
+                  - !Sub "arn:aws:logs:${PipelineRegion}:${AWS::AccountId}:log-group:/aws/codebuild/hub-${Slug}-*"
+
+Outputs:
+  TriggerRoleArn:
+    Description: >-
+      Put this in the hub CD registry entry as `roleArn`. account = this account,
+      externalId = the ExternalId you chose.
+    Value: !GetAtt TriggerRole.Arn

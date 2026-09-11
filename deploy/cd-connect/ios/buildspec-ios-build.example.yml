@@ -1,0 +1,58 @@
+# .hub/buildspec-ios-build.yml — Build stage for hub-<slug>-ios-build (macOS).
+# On start_deploy: archive + sign the app, export a signed IPA, and upload it to
+# TestFlight (App Store Connect processes it automatically — NO gate here). The
+# human gate is the NEXT stage (App Store submit). Everything secret is pulled
+# from Secrets Manager at build time and NEVER written to the repo or logs.
+#
+# Secrets (from SigningSecretsPath, LLM-blind):
+#   <path>/dist-cert-p12        base64 .p12 distribution cert
+#   <path>/dist-cert-password   its password
+#   <path>/provisioning-profile base64 .mobileprovision
+#   <path>/asc-api-key-p8       App Store Connect API key (.p8)
+#   <path>/asc-key-id  <path>/asc-issuer-id
+version: 0.2
+env:
+  variables:
+    SIGNING_SECRETS_PATH: ""   # set by the pipeline env or hardcode your path prefix
+phases:
+  install:
+    commands:
+      - xcodebuild -version
+  pre_build:
+    commands:
+      - set -euo pipefail
+      - echo "== load signing material into a throwaway keychain =="
+      # - KDIR=$(mktemp -d); KEYCHAIN=$KDIR/build.keychain; KPW=$(uuidgen)
+      # - security create-keychain -p "$KPW" "$KEYCHAIN"; security set-keychain-settings -lut 3600 "$KEYCHAIN"
+      # - security unlock-keychain -p "$KPW" "$KEYCHAIN"; security list-keychains -d user -s "$KEYCHAIN"
+      # - aws secretsmanager get-secret-value --secret-id "$SIGNING_SECRETS_PATH/dist-cert-p12" --query SecretString --output text | base64 -d > "$KDIR/cert.p12"
+      # - CERTPW=$(aws secretsmanager get-secret-value --secret-id "$SIGNING_SECRETS_PATH/dist-cert-password" --query SecretString --output text)
+      # - security import "$KDIR/cert.p12" -k "$KEYCHAIN" -P "$CERTPW" -T /usr/bin/codesign
+      # - security set-key-partition-list -S apple-tool:,apple: -s -k "$KPW" "$KEYCHAIN"
+      # - aws secretsmanager get-secret-value --secret-id "$SIGNING_SECRETS_PATH/provisioning-profile" --query SecretString --output text | base64 -d > "$KDIR/pp.mobileprovision"
+      # - mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles && cp "$KDIR/pp.mobileprovision" ~/Library/MobileDevice/Provisioning\ Profiles/
+  build:
+    commands:
+      - set -euo pipefail
+      - echo "== archive + export signed IPA =="
+      # - xcodebuild archive -project MyApp.xcodeproj -scheme MyApp \
+      #     -archivePath "$CODEBUILD_SRC_DIR/build/MyApp.xcarchive" \
+      #     -destination 'generic/platform=iOS' | xcpretty
+      # - xcodebuild -exportArchive -archivePath "$CODEBUILD_SRC_DIR/build/MyApp.xcarchive" \
+      #     -exportOptionsPlist .hub/ExportOptions.plist -exportPath "$CODEBUILD_SRC_DIR/build/export" | xcpretty
+  post_build:
+    commands:
+      - set -euo pipefail
+      - echo "== upload to TestFlight (automatic; NOT the App Store submit) =="
+      # Use the App Store Connect API key so no Apple ID password is needed.
+      # - aws secretsmanager get-secret-value --secret-id "$SIGNING_SECRETS_PATH/asc-api-key-p8" --query SecretString --output text > "$KDIR/asc.p8"
+      # - KEY_ID=$(aws secretsmanager get-secret-value --secret-id "$SIGNING_SECRETS_PATH/asc-key-id" --query SecretString --output text)
+      # - ISSUER=$(aws secretsmanager get-secret-value --secret-id "$SIGNING_SECRETS_PATH/asc-issuer-id" --query SecretString --output text)
+      # - xcrun altool --upload-app -f "$CODEBUILD_SRC_DIR/build/export/MyApp.ipa" -t ios \
+      #     --apiKey "$KEY_ID" --apiIssuer "$ISSUER"
+      - echo "{\"uploaded\":true}" > build-meta.json
+      - echo "== scrub secrets =="
+      # - security delete-keychain "$KEYCHAIN" || true; rm -rf "$KDIR"
+artifacts:
+  files:
+    - "**/*"        # pass source + build-meta.json to Deploy

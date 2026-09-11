@@ -1,0 +1,15 @@
+# .hub/buildspec-ci.yml — PR check for hub-<slug>-ci. Deploys NOTHING.
+# Runs on every PR (webhook). Green = safe to merge. Mirror your existing CI
+# (juno: .github/workflows/canvas-ci.yml) so the hub's CI gate certifies the
+# same thing your GitHub checks do.
+version: 0.2
+phases:
+  install:
+    runtime-versions: { python: 3.13, nodejs: 20 }
+  build:
+    commands:
+      - echo "== lint / typecheck / unit tests (no AWS, no deploy) =="
+      # juno: port canvas-ci.yml steps here, e.g.:
+      # - pip install -r mcp_server/requirements.txt && python -m pytest mcp_server -q
+      # - cd apps/web-studio && npm ci && npm run build --if-present && npm test --if-present
+      - echo "CI passed"

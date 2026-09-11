@@ -1,0 +1,36 @@
+# .hub/buildspec-deploy.yml — Deploy stage for hub-<slug>-deploy. Runs AFTER a
+# human approves the ManualApproval gate. This is where your DEPLOY.md path runs,
+# IN THIS ACCOUNT, on the deploy role. It should: deploy every surface in
+# DEPLOY.md order, run a cold-start smoke, and ROLL BACK on failure.
+#
+# juno DEPLOY.md order (Section 8.0): web-studio -> agent runtime -> SAM stacks -> render site.
+version: 0.2
+env:
+  variables:
+    AWS_DEFAULT_REGION: us-west-2
+phases:
+  build:
+    commands:
+      - set -euo pipefail
+      - echo "== capture current state for rollback =="
+      # Record the currently-live image/stack so a failed smoke can restore it.
+      # - PREV_IMAGE=$(aws cloudformation describe-stacks --stack-name juno-web --query "Stacks[0].Parameters[?ParameterKey=='ImageUri'].ParameterValue" --output text)
+      - echo "== 1. juno-web (ECS/CFN) =="
+      - apps/web-studio/deploy/deploy.sh
+      - echo "== 2. agent runtime (DEPLOY.md 8.x) =="
+      # - <agent runtime deploy command>
+      - echo "== 3. SAM Lambda stacks (DEPLOY.md 8.x) =="
+      # - <sam build && sam deploy ...> x2
+      - echo "== 4. Remotion render site (DEPLOY.md 8.x) =="
+      # - <render site deploy command>
+  post_build:
+    commands:
+      - echo "== cold-start smoke =="
+      # Fail the build (non-zero exit) if the deployed product does not answer.
+      - |
+        if ! curl -fsS --max-time 30 https://juno.tjmapps.org/health >/dev/null; then
+          echo "SMOKE FAILED — rolling back";
+          # aws cloudformation deploy --stack-name juno-web --parameter-overrides ImageUri=$PREV_IMAGE ... ;
+          exit 1;
+        fi
+      - echo "deploy verified"

@@ -76,6 +76,16 @@ export function parseCdRegistry(raw) {
       // CI_PROJECT_NAME, then agentcore-hub-ci.
       const ciProject = typeof e.ciProject === "string" ? e.ciProject.trim() : "";
       if (ciProject) entry.ciProject = ciProject;
+      // Optional SECOND pipeline for the same repo: the iOS App Store release
+      // pipeline. Named hub-<slug>-ios-deploy by convention — a hub-*-deploy
+      // name, so it shares the hub-* IAM wildcards and the pipelineProjects()
+      // derivation (base hub-<slug>-ios → ci/build/deploy = hub-<slug>-ios-{ci,
+      // build,deploy}) with `pipeline`. The hub triggers + watches it exactly
+      // like the backend one; the App Store submit stays a HUMAN gate. Absent →
+      // the repo has no iOS release pipeline. Same-account and cross-account
+      // (via the same trigger role) both work with no extra fields.
+      const iosPipeline = typeof e.iosPipeline === "string" ? e.iosPipeline.trim() : "";
+      if (iosPipeline) entry.iosPipeline = iosPipeline;
       // Cross-account CD (optional). The pipeline lives in ANOTHER AWS account;
       // the tools Lambda reaches it by assuming `roleArn` there. Honored ONLY as
       // a complete, valid triple: `account` = 12 digits, `roleArn` =
@@ -198,7 +208,7 @@ export function resolveDelivery(registry, repoConfig, { pipelineEnabled = false 
   if (!entry) {
     return {
       mode: "handoff", entry: null, pipelineMode: false, pipeline: null, region: null,
-      ciProject: null, buildProject: null, deployProject: null,
+      iosPipeline: null, ciProject: null, buildProject: null, deployProject: null,
     };
   }
   const projects = pipelineProjects(entry);
@@ -209,6 +219,11 @@ export function resolveDelivery(registry, repoConfig, { pipelineEnabled = false 
     pipelineMode: Boolean(pipelineEnabled && pipeline),
     pipeline,
     region: entry.region || null,
+    // The iOS App Store release pipeline (hub-<slug>-ios-deploy), or null. It is
+    // NOT what pipelineMode gates — the backend `pipeline` is — but the release
+    // manager reads it from the Delivery Mode block to ship the app after (or
+    // instead of) the backend.
+    iosPipeline: entry.iosPipeline || null,
     roleArn: entry.roleArn || null,
     externalId: entry.externalId || null,
     ciProject: projects?.ciProject || null,
@@ -236,6 +251,15 @@ export function deliveryModeContext(delivery, { repo = null, defaultBranch = "ma
       if (delivery.region) out += `pipeline_region: ${delivery.region}\n`;
     } else {
       out += ` per the repo's ${delivery.entry?.deployDoc || "DEPLOY.md"}.\n`;
+    }
+    if (delivery.iosPipeline) {
+      out += `ios_pipeline_name: ${delivery.iosPipeline}\n`;
+      if (delivery.region) out += `ios_pipeline_region: ${delivery.region}\n`;
+      out += `This repo ALSO has an iOS App Store release pipeline (a separate `;
+      out += `macOS pipeline: build + sign -> TestFlight upload -> human App Store submit gate). `;
+      out += `Trigger + watch it with the Pipeline___* tools exactly like the backend pipeline, `;
+      out += `passing pipeline_name=${delivery.iosPipeline}. NEVER approve the App Store submit gate — `;
+      out += `it is human-only, like every deploy gate.\n`;
     }
     if (delivery.entry?.notes) out += `notes: ${delivery.entry.notes}\n`;
   } else {

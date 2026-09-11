@@ -218,7 +218,7 @@ describe("resolveDelivery", () => {
   it("unregistered → handoff, never pipeline mode", () => {
     expect(resolveDelivery(REG, JUNO, { pipelineEnabled: true })).toEqual({
       mode: "handoff", entry: null, pipelineMode: false, pipeline: null, region: null,
-      ciProject: null, buildProject: null, deployProject: null,
+      iosPipeline: null, ciProject: null, buildProject: null, deployProject: null,
     });
   });
   it("registered with a pipeline → cd; pipeline mode only when PIPELINE_ENABLED is on; spreads the derived projects", () => {
@@ -268,5 +268,48 @@ describe("deliveryModeContext", () => {
     expect(txt).toContain("per the repo's ops/DEPLOY.md");
     expect(txt).toContain("notes: prod is us-west-2");
     expect(txt).not.toContain("pipeline_name");
+  });
+});
+
+/**
+ * iOS App Store release pipeline (the optional SECOND pipeline per repo).
+ * Named hub-<slug>-ios-deploy by convention; carried through resolveDelivery so
+ * the release manager sees it in the Delivery Mode block and drives it with the
+ * same Pipeline___* tools. The App Store submit stays a HUMAN gate.
+ */
+describe("iOS release pipeline (iosPipeline)", () => {
+  const APP = { repos: [{ url: "https://github.com/acme/app" }] };
+  const REG_IOS = parseCdRegistry({
+    version: 1,
+    repos: [{ repo: "acme/app", pipeline: "hub-app-deploy", iosPipeline: "hub-app-ios-deploy", region: "us-west-2" }],
+  });
+
+  it("parseCdRegistry keeps a trimmed iosPipeline; absent stays absent", () => {
+    const e = parseCdRegistry({ repos: [{ repo: "acme/app", pipeline: "hub-app-deploy", iosPipeline: " hub-app-ios-deploy " }] }).repos[0];
+    expect(e.iosPipeline).toBe("hub-app-ios-deploy");
+    const none = parseCdRegistry({ repos: [{ repo: "acme/app", pipeline: "hub-app-deploy" }] }).repos[0];
+    expect(none.iosPipeline).toBeUndefined();
+  });
+
+  it("resolveDelivery carries iosPipeline on a registered repo, null on handoff", () => {
+    expect(resolveDelivery(REG_IOS, APP, { pipelineEnabled: true }).iosPipeline).toBe("hub-app-ios-deploy");
+    // The backend pipeline is still what pipelineMode gates.
+    expect(resolveDelivery(REG_IOS, APP, { pipelineEnabled: true }).pipeline).toBe("hub-app-deploy");
+    expect(resolveDelivery(REG_IOS, JUNO, { pipelineEnabled: true }).iosPipeline).toBeNull();
+  });
+
+  it("deliveryModeContext names the iOS pipeline + region and marks the App Store submit human-only", () => {
+    const txt = deliveryModeContext(resolveDelivery(REG_IOS, APP, { pipelineEnabled: true }), { repo: "acme/app", defaultBranch: "main" });
+    expect(txt).toContain("ios_pipeline_name: hub-app-ios-deploy");
+    expect(txt).toContain("ios_pipeline_region: us-west-2");
+    expect(txt).toContain("App Store submit");
+    expect(txt).toMatch(/human-only/i);
+    // The backend block is still there too.
+    expect(txt).toContain("pipeline_name: hub-app-deploy");
+  });
+
+  it("a repo WITHOUT an iOS pipeline gets no ios_pipeline_name line", () => {
+    const txt = deliveryModeContext(resolveDelivery(REG, HUB, { pipelineEnabled: true }), { repo: "tycenjmccann/agentcore-hub" });
+    expect(txt).not.toContain("ios_pipeline_name");
   });
 });

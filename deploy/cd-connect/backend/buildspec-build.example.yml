@@ -1,0 +1,21 @@
+# .hub/buildspec-build.yml — Build stage for hub-<slug>-build. Build ONCE on
+# merge, emit the deploy artifact by digest so Deploy promotes the exact bytes
+# CI saw (no rebuild between gate and deploy). Push the image here; Deploy only
+# updates the stack to the digest.
+version: 0.2
+phases:
+  install:
+    runtime-versions: { python: 3.13, nodejs: 20 }
+  build:
+    commands:
+      - echo "== build juno-web image, push to ECR by digest =="
+      # - ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+      # - REGION=$AWS_DEFAULT_REGION
+      # - aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $ACCOUNT.dkr.ecr.$REGION.amazonaws.com
+      # - TAG=$(date +%Y%m%d%H%M%S)-$CODEBUILD_RESOLVED_SOURCE_VERSION
+      # - docker build --platform linux/amd64 -f apps/web-studio/deploy/Dockerfile -t $ACCOUNT.dkr.ecr.$REGION.amazonaws.com/juno-web:$TAG .
+      # - docker push $ACCOUNT.dkr.ecr.$REGION.amazonaws.com/juno-web:$TAG
+      # - echo "{\"imageTag\":\"$TAG\"}" > image.json
+artifacts:
+  files:
+    - "**/*"          # pass the checked-out source + image.json to Deploy

@@ -1,0 +1,20 @@
+# .hub/buildspec-ios-ci.yml — PR check for hub-<slug>-ios-ci (macOS, MAC_ARM).
+# Deploys NOTHING and needs NO signing: builds for the simulator and runs your
+# XCTest suite. Green = safe to merge. Mirror your existing iOS CI so the hub's
+# CI gate certifies what your GitHub checks do.
+version: 0.2
+phases:
+  install:
+    commands:
+      - echo "== select Xcode (image ships one; pin if you need a specific ver) =="
+      - xcodebuild -version
+  build:
+    commands:
+      - set -euo pipefail
+      - echo "== resolve packages + build for simulator + run tests (no signing) =="
+      # Fill in your scheme + destination. Example:
+      # - xcodebuild test \
+      #     -project MyApp.xcodeproj -scheme MyApp \
+      #     -destination 'platform=iOS Simulator,name=iPhone 15,OS=latest' \
+      #     CODE_SIGNING_ALLOWED=NO -resultBundlePath TestResults.xcresult | xcpretty
+      - echo "iOS CI passed"

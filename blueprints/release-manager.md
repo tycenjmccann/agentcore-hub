@@ -647,6 +647,32 @@ or `pipeline_not_registered`.
    Never report `shipped` for a merge you did not confirm, and do NOT improvise
    a manual deploy to "help" a failed pipeline.
 
+### iOS App Store release — a SECOND pipeline, when `## Delivery Mode` carries `ios_pipeline_name`
+Some repos ship an iOS app as well as (or instead of) an AWS backend. When the
+`## Delivery Mode` block carries `ios_pipeline_name` (and `ios_pipeline_region`),
+the repo has a separate macOS App Store release pipeline (`hub-<slug>-ios-deploy`:
+build + sign -> TestFlight upload -> **human App Store submit gate** -> submit to
+review). Drive it with the SAME `Pipeline___*` tools and the SAME Steps 1-6
+above, with these differences:
+- Pass `pipeline_name=<ios_pipeline_name>` (from the block) on every
+  `Pipeline___get_state` / `Pipeline___start_deploy` for the app — it is a
+  distinct pipeline from the backend `pipeline_name`. Trigger it AFTER the merge
+  lands, the same as the backend. If the run has BOTH a backend `pipeline_name`
+  and `ios_pipeline_name`, ship the backend first, confirm it SUCCEEDED, then the
+  iOS pipeline; report each separately in `summary`.
+- The iOS pipeline's second gate is the **App Store submit gate** (its Approval
+  stage). It is human-only exactly like the backend deploy gate: surface that it
+  is `Waiting on approval`, NEVER approve it — you have no approval tool and must
+  never submit your own app to review.
+- TestFlight upload happens in the Build stage with no gate, so a SUCCEEDED Build
+  means the build is already on TestFlight; the App Store submission is what the
+  gate + Deploy stage do.
+- Report: in `report_completion`, note the iOS `pipelineExecutionId`, whether it
+  reached the submit gate, and the terminal status of each stage. A backend-less
+  app run reports `outcome="shipped"` on the iOS pipeline reaching its terminal
+  Deploy (submitted to review) or waiting at the human gate — state which in
+  `summary`. Never report `shipped` for a submission you did not confirm.
+
 ---
 
 ### Legacy mode (execute DEPLOY.md yourself) — only when `PIPELINE_ENABLED` is absent

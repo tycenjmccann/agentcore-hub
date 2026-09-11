@@ -11,7 +11,7 @@
 #
 # Usage:
 #   scripts/cd-registry.sh list
-#   scripts/cd-registry.sh add <owner/repo|github url> [--pipeline NAME] [--region R] [--ci-project NAME] [--deploy-doc PATH] [--notes TEXT] \
+#   scripts/cd-registry.sh add <owner/repo|github url> [--pipeline NAME] [--ios-pipeline NAME] [--region R] [--ci-project NAME] [--deploy-doc PATH] [--notes TEXT] \
 #                                                       [--account ID --role-arn ARN --external-id ID]   # cross-account CD (all three)
 #   scripts/cd-registry.sh remove <owner/repo|github url>
 #   scripts/cd-registry.sh seed           # upload src/config/cd-registry.json ONLY if S3 has none
@@ -45,14 +45,19 @@ d=json.load(sys.stdin); repos=d.get("repos",[])
 if not repos: print("(no repos registered — every run is a HANDOFF: PR left open, no merge/deploy)"); sys.exit(0)
 for e in repos:
     how = ("pipeline=" + e["pipeline"] + (" (" + e["region"] + ")" if e.get("region") else "")) if e.get("pipeline") else "deploy-doc=" + e.get("deployDoc", "DEPLOY.md")
+    if e.get("iosPipeline"): how += " ios=" + e["iosPipeline"]
     print(e["repo"].ljust(45), how, ("  # " + e["notes"]) if e.get("notes") else "")'
     ;;
   add)
     repo="${1:?owner/repo or GitHub URL required}"; shift
-    pipeline=""; region=""; ciproject=""; deploydoc=""; notes=""; account=""; rolearn=""; extid=""
+    pipeline=""; iospipeline=""; region=""; ciproject=""; deploydoc=""; notes=""; account=""; rolearn=""; extid=""
     while [ $# -gt 0 ]; do
       case "$1" in
         --pipeline) pipeline="$2"; shift 2 ;;
+        # A SECOND CodePipeline: the iOS App Store release pipeline
+        # (hub-<slug>-ios-deploy). Same shape as --pipeline; the hub triggers +
+        # watches it too, App Store submit stays a human gate.
+        --ios-pipeline) iospipeline="$2"; shift 2 ;;
         --region) region="$2"; shift 2 ;;
         # A CodeBuild PROJECT (the PR check), not a CodePipeline — see
         # src/config/cd-registry.json. Read by the orchestrator's CI_CHECK_MODE probe.
@@ -70,7 +75,7 @@ for e in repos:
         *) echo "unknown flag $1" >&2; usage ;;
       esac
     done
-    fetch | REPO="$repo" PIPELINE="$pipeline" RG="$region" CIP="$ciproject" DD="$deploydoc" NOTES="$notes" ACCT="$account" ROLEARN="$rolearn" EXTID="$extid" python3 -c '
+    fetch | REPO="$repo" PIPELINE="$pipeline" IOSP="$iospipeline" RG="$region" CIP="$ciproject" DD="$deploydoc" NOTES="$notes" ACCT="$account" ROLEARN="$rolearn" EXTID="$extid" python3 -c '
 import json,os,re,sys,datetime
 def key(v):
     s=str(v or "").strip(); s=re.sub(r"^git@[^:]+:","",s); s=re.sub(r"^[a-z]+://[^/]+/","",s,flags=re.I)
@@ -81,7 +86,7 @@ if not k: sys.exit("repo must be owner/repo or a GitHub URL")
 d=json.load(sys.stdin); repos=[e for e in d.get("repos",[]) if e.get("repo")!=k]
 prev=next((e for e in d.get("repos",[]) if e.get("repo")==k),{})
 e={"repo":k,"addedAt":prev.get("addedAt") or datetime.datetime.now(datetime.timezone.utc).isoformat()}
-for f,env in (("pipeline","PIPELINE"),("region","RG"),("ciProject","CIP"),("deployDoc","DD"),("notes","NOTES"),("account","ACCT"),("roleArn","ROLEARN"),("externalId","EXTID")):
+for f,env in (("pipeline","PIPELINE"),("iosPipeline","IOSP"),("region","RG"),("ciProject","CIP"),("deployDoc","DD"),("notes","NOTES"),("account","ACCT"),("roleArn","ROLEARN"),("externalId","EXTID")):
     v=os.environ.get(env,"").strip() or prev.get(f)
     if v: e[f]=v
 repos.append(e); repos.sort(key=lambda x:x["repo"])

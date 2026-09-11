@@ -1,0 +1,345 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  hub-<Slug> CI/CD — the pipeline the AgentCore Hub triggers and watches, owned by
+  and running in THIS (the repo's) account. Source -> Build -> ManualApproval
+  (human deploy gate, bridged to Telegram) -> Deploy. Names follow the hub
+  convention hub-<Slug>-{deploy,ci,build} so the hub can resolve them from the CD
+  registry with no per-repo config. Deploy AFTER hub-cd-trigger-role.cfn.yaml.
+
+Parameters:
+  Slug:
+    Type: String
+    Description: Short repo slug (e.g. juno). Pipeline=hub-<Slug>-deploy, projects=hub-<Slug>-{ci,build,deploy}.
+    AllowedPattern: "^[a-z0-9][a-z0-9-]{1,30}$"
+  GitHubOwner:
+    Type: String
+    Description: GitHub owner/org (e.g. my-org).
+  GitHubRepo:
+    Type: String
+    Description: GitHub repo name (e.g. juno).
+  GitHubBranch:
+    Type: String
+    Default: main
+  GitHubConnectionArn:
+    Type: String
+    Description: >-
+      THIS account's own CodeConnections (CodeStar) GitHub connection ARN. Create
+      it once in the console (Developer Tools -> Connections) and complete the
+      GitHub App handshake; it must be status AVAILABLE before Deploy.
+    AllowedPattern: "^arn:aws:codeconnections:.*|^arn:aws:codestar-connections:.*"
+  ApprovalEmail:
+    Type: String
+    Description: Optional email to also receive the deploy-gate notification (Telegram bridge is separate).
+    Default: ""
+
+Conditions:
+  HasApprovalEmail: !Not [!Equals [!Ref ApprovalEmail, ""]]
+
+Resources:
+  # ── Pipeline artifact store ────────────────────────────────────────────────
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !Sub "hub-${Slug}-pipeline-artifacts-${AWS::AccountId}-${AWS::Region}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-artifacts
+            Status: Enabled
+            ExpirationInDays: 30
+
+  # ── Deploy-gate notification topic (subscribe the hub's Telegram bridge here) ─
+  ApprovalTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "hub-${Slug}-deploy-approval"
+  ApprovalEmailSub:
+    Type: AWS::SNS::Subscription
+    Condition: HasApprovalEmail
+    Properties:
+      TopicArn: !Ref ApprovalTopic
+      Protocol: email
+      Endpoint: !Ref ApprovalEmail
+
+  # ── CI project (PR check, webhook-triggered) ─────────────────────────────────
+  CiProjectRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "hub-${Slug}-ci-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codebuild.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ci
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: Logs
+                Effect: Allow
+                Action: ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/hub-${Slug}-ci:*"
+              - Sid: Connection
+                Effect: Allow
+                Action:
+                  - "codeconnections:GetConnectionToken"
+                  - "codeconnections:GetConnection"
+                  - "codeconnections:UseConnection"
+                  - "codestar-connections:GetConnectionToken"
+                  - "codestar-connections:GetConnection"
+                  - "codestar-connections:UseConnection"
+                Resource: !Ref GitHubConnectionArn
+
+  CiProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "hub-${Slug}-ci"
+      Description: PR check for hub-driven CD. Deploys NOTHING. Reports commit status.
+      ServiceRole: !GetAtt CiProjectRole.Arn
+      Artifacts: { Type: NO_ARTIFACTS }
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/standard:7.0
+        PrivilegedMode: true
+      Source:
+        Type: GITHUB
+        Location: !Sub "https://github.com/${GitHubOwner}/${GitHubRepo}.git"
+        BuildSpec: .hub/buildspec-ci.yml
+        ReportBuildStatus: true
+        Auth:
+          Type: CODECONNECTIONS
+          Resource: !Ref GitHubConnectionArn
+      Triggers:
+        Webhook: true
+        FilterGroups:
+          - - Type: EVENT
+              Pattern: PULL_REQUEST_CREATED,PULL_REQUEST_UPDATED,PULL_REQUEST_REOPENED
+      ConcurrentBuildLimit: 4
+
+  # ── Build project (build-once on merge; emits deploy artifact) ───────────────
+  BuildProjectRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "hub-${Slug}-build-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codebuild.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: build
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: Logs
+                Effect: Allow
+                Action: ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/hub-${Slug}-build:*"
+              - Sid: Artifacts
+                Effect: Allow
+                Action: ["s3:GetObject", "s3:GetObjectVersion", "s3:PutObject", "s3:GetBucketLocation"]
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub "${ArtifactBucket.Arn}/*"
+              # ECR push for the built image (juno-web). Tighten repo name as needed.
+              - Sid: EcrPush
+                Effect: Allow
+                Action:
+                  - "ecr:GetAuthorizationToken"
+                  - "ecr:BatchCheckLayerAvailability"
+                  - "ecr:InitiateLayerUpload"
+                  - "ecr:UploadLayerPart"
+                  - "ecr:CompleteLayerUpload"
+                  - "ecr:PutImage"
+                  - "ecr:BatchGetImage"
+                  - "ecr:DescribeRepositories"
+                  - "ecr:CreateRepository"
+                Resource: "*"
+
+  BuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "hub-${Slug}-build"
+      ServiceRole: !GetAtt BuildProjectRole.Arn
+      Artifacts: { Type: CODEPIPELINE }
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/standard:7.0
+        PrivilegedMode: true
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: .hub/buildspec-build.yml
+
+  # ── Deploy project (runs the repo's DEPLOY.md path; smoke + rollback) ────────
+  # NOTE (juno team): DeployProjectRole below grants the deploy actions DEPLOY.md
+  # names, wildcarded on resource. TIGHTEN these to your real stack/repo/cluster
+  # ARNs. This role is the only broad-permission identity in the pipeline; the
+  # hub NEVER assumes it (the hub only assumes hub-cd-trigger-<Slug>, read+trigger).
+  DeployProjectRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "hub-${Slug}-deploy-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codebuild.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: deploy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: Logs
+                Effect: Allow
+                Action: ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/hub-${Slug}-deploy:*"
+              - Sid: Artifacts
+                Effect: Allow
+                Action: ["s3:GetObject", "s3:GetObjectVersion", "s3:GetBucketLocation"]
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub "${ArtifactBucket.Arn}/*"
+              # ─ Deploy actions per juno DEPLOY.md (ECS/CFN + SAM + ECR + render + agentcore) ─
+              # TIGHTEN RESOURCES before production use.
+              - Sid: DeployJunoSurfaces
+                Effect: Allow
+                Action:
+                  - "cloudformation:*"
+                  - "ecr:*"
+                  - "ecs:*"
+                  - "elasticloadbalancing:*"
+                  - "lambda:*"
+                  - "apigateway:*"
+                  - "s3:*"
+                  - "bedrock-agentcore:*"
+                  - "iam:PassRole"
+                  - "iam:GetRole"
+                  - "iam:CreateRole"
+                  - "iam:AttachRolePolicy"
+                  - "iam:PutRolePolicy"
+                  - "ssm:GetParameter"
+                  - "ssm:GetParameters"
+                  - "secretsmanager:GetSecretValue"
+                Resource: "*"
+
+  DeployProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "hub-${Slug}-deploy"
+      ServiceRole: !GetAtt DeployProjectRole.Arn
+      Artifacts: { Type: CODEPIPELINE }
+      TimeoutInMinutes: 60
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/standard:7.0
+        PrivilegedMode: true
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: .hub/buildspec-deploy.yml
+
+  # ── The pipeline ─────────────────────────────────────────────────────────────
+  PipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "hub-${Slug}-pipeline-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codepipeline.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: pipeline
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: Artifacts
+                Effect: Allow
+                Action: ["s3:GetObject", "s3:GetObjectVersion", "s3:PutObject", "s3:GetBucketLocation", "s3:ListBucket"]
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub "${ArtifactBucket.Arn}/*"
+              - Sid: Connection
+                Effect: Allow
+                Action:
+                  - "codeconnections:UseConnection"
+                  - "codestar-connections:UseConnection"
+                Resource: !Ref GitHubConnectionArn
+              - Sid: RunBuilds
+                Effect: Allow
+                Action: ["codebuild:StartBuild", "codebuild:BatchGetBuilds", "codebuild:StopBuild"]
+                Resource:
+                  - !GetAtt BuildProject.Arn
+                  - !GetAtt DeployProject.Arn
+              - Sid: ApprovalNotify
+                Effect: Allow
+                Action: ["sns:Publish"]
+                Resource: !Ref ApprovalTopic
+
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub "hub-${Slug}-deploy"
+      PipelineType: V2
+      RoleArn: !GetAtt PipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: Source
+              ActionTypeId: { Category: Source, Owner: AWS, Provider: CodeStarSourceConnection, Version: "1" }
+              Configuration:
+                ConnectionArn: !Ref GitHubConnectionArn
+                FullRepositoryId: !Sub "${GitHubOwner}/${GitHubRepo}"
+                BranchName: !Ref GitHubBranch
+                OutputArtifactFormat: CODE_ZIP
+                DetectChanges: "true"
+              OutputArtifacts: [{ Name: SourceOutput }]
+        - Name: Build
+          Actions:
+            - Name: Build
+              ActionTypeId: { Category: Build, Owner: AWS, Provider: CodeBuild, Version: "1" }
+              Configuration: { ProjectName: !Ref BuildProject }
+              InputArtifacts: [{ Name: SourceOutput }]
+              OutputArtifacts: [{ Name: BuildOutput }]
+        - Name: Approval
+          Actions:
+            - Name: DeployGate
+              ActionTypeId: { Category: Approval, Owner: AWS, Provider: Manual, Version: "1" }
+              Configuration:
+                NotificationArn: !Ref ApprovalTopic
+                CustomData: !Sub "Approve to deploy hub-${Slug}-deploy. This is a HUMAN gate; the hub cannot pass it."
+        - Name: Deploy
+          Actions:
+            - Name: Deploy
+              ActionTypeId: { Category: Build, Owner: AWS, Provider: CodeBuild, Version: "1" }
+              Configuration: { ProjectName: !Ref DeployProject }
+              InputArtifacts: [{ Name: BuildOutput }]
+
+Outputs:
+  PipelineName:
+    Description: Register this as `pipeline` in the hub CD registry entry.
+    Value: !Ref Pipeline
+  ApprovalTopicArn:
+    Description: Subscribe the hub's Telegram deploy-approval bridge to this topic.
+    Value: !Ref ApprovalTopic
+  Region:
+    Description: Register this as `region` in the hub CD registry entry.
+    Value: !Ref AWS::Region

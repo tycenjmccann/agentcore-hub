@@ -1,0 +1,28 @@
+# .hub/buildspec-ios-deploy.yml — Deploy stage for hub-<slug>-ios-deploy (macOS).
+# Runs ONLY after a human approves the App Store submit gate. It does NOT
+# re-archive — it submits the build already on TestFlight to App Store review,
+# using the App Store Connect API key. Fail (non-zero) if the submission is
+# rejected so the pipeline shows red.
+version: 0.2
+env:
+  variables:
+    SIGNING_SECRETS_PATH: ""
+phases:
+  build:
+    commands:
+      - set -euo pipefail
+      - echo "== submit the uploaded build to App Store review =="
+      # App Store Connect API key (.p8) from Secrets Manager (LLM-blind).
+      # - KDIR=$(mktemp -d)
+      # - aws secretsmanager get-secret-value --secret-id "$SIGNING_SECRETS_PATH/asc-api-key-p8" --query SecretString --output text > "$KDIR/asc.p8"
+      # - KEY_ID=$(aws secretsmanager get-secret-value --secret-id "$SIGNING_SECRETS_PATH/asc-key-id" --query SecretString --output text)
+      # - ISSUER=$(aws secretsmanager get-secret-value --secret-id "$SIGNING_SECRETS_PATH/asc-issuer-id" --query SecretString --output text)
+      # Create the App Store version + attach the build + submit for review. Use
+      # fastlane `deliver`, the ASC REST API, or your tool of choice, e.g.:
+      # - export APP_STORE_CONNECT_API_KEY_PATH="$KDIR/asc.p8" APP_STORE_CONNECT_API_KEY_ID="$KEY_ID" APP_STORE_CONNECT_API_ISSUER_ID="$ISSUER"
+      # - fastlane deliver submit_for_review --submit_for_review true --automatic_release true --force
+      - echo "submitted to App Store review"
+  post_build:
+    commands:
+      - echo "== scrub secrets =="
+      # - rm -rf "$KDIR"
