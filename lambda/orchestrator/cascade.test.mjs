@@ -642,6 +642,32 @@ describe("TEAM-4410 — open review notification short-circuits the re-wake", ()
     expect(reawakenGate).toHaveBeenCalledWith("GATE-1", "human:reviewer", ackedWorkflow);
     expect(m.reviewReawakened).toBe(1);
   });
+
+  it("an open notification for a DIFFERENT ticket does not suppress this gate's re-wake", async () => {
+    const siblings = [
+      { ticketId: DONE, status: "done" },
+      { ticketId: "GATE-1", status: "in_review", assignee: "human:reviewer", blockedBy: [DONE] },
+    ];
+    const otherTicketOpenWorkflow = {
+      ...extWorkflow,
+      humanNotifications: [
+        { id: "n1", type: "review_needed", ticketId: "OTHER-1", acknowledged: false },
+      ],
+    };
+    const { deps, publishEvent, reawakenGate } = makeExtDeps({
+      getChildTickets: vi.fn(async () => siblings),
+    });
+    const { handleInReviewDependent } = createCascade(deps);
+    const m = newMetrics();
+
+    const outcome = await handleInReviewDependent(siblings[1], DONE, otherTicketOpenWorkflow, m, "enforce");
+
+    expect(outcome).toBe("review-reawakened");
+    expect(reawakenGate).toHaveBeenCalledTimes(1);
+    expect(reawakenGate).toHaveBeenCalledWith("GATE-1", "human:reviewer", otherTicketOpenWorkflow);
+    expect(m.reviewReawakened).toBe(1);
+    expect(eventsOfType(publishEvent, "review.reawakened")).toHaveLength(1);
+  });
 });
 
 /**
