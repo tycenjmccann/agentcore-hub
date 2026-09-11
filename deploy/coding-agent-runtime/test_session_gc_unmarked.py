@@ -144,6 +144,27 @@ class TestCandidateScan(GcUnmarkedTestBase):
         _mkdir(self.sessions_root, "cc-abc123", 20)
         self.assertEqual(self._candidates(human=["cc-abc123"]), [])
 
+    def test_human_session_dirs_spares_both_raw_and_sanitized_key_forms(self):
+        # A .sessions.json key may contain characters _session_dir() rewrites
+        # (`:` → `-`). A dir on disk can legally carry the RAW name, so both
+        # forms must be spared or the sanitized-only set misses it (PR #526 P1).
+        self.main._load_session_map = lambda: {"human:conv": {}}
+        self.assertEqual(self.main._human_session_dirs(), {"human:conv", "human-conv"})
+
+    def test_raw_session_map_key_dir_is_never_a_candidate(self):
+        _mkdir(self.sessions_root, "human:conv", 20)
+        self.main._load_session_map = lambda: {"human:conv": {}}
+        cutoff = self.main.time.time() - self.main.SESSION_TTL_DAYS * DAY
+        out = self.main._unmarked_gc_candidates(
+            self.sessions_root, cutoff, set(), self.main._human_session_dirs())
+        self.assertEqual([os.path.basename(p) for p, _ in out], [])
+
+    def test_unreadable_session_map_yields_no_spares_and_never_raises(self):
+        def boom():
+            raise OSError("EFS degraded")
+        self.main._load_session_map = boom
+        self.assertEqual(self.main._human_session_dirs(), set())
+
     def test_laptop_port_artifacts_spare_a_dir(self):
         _mkdir(self.sessions_root, "ported", 20, extra_files=(".bundle-applied",))
         self.assertEqual(self._candidates(), [])
@@ -241,6 +262,19 @@ class TestSweepEnforce(GcUnmarkedTestBase):
         payload = json.loads(msgs[0].split(" ", 1)[1])
         self.assertEqual(payload["removed"], 1)
         self.assertFalse(payload["capped"])
+
+    def test_enforce_spares_a_dir_named_by_a_raw_session_map_key(self):
+        # PR #526 P1: the map key `human:conv` sanitizes to `human-conv`, so a
+        # sanitized-only spare set would MISS the dir literally named
+        # `human:conv` on disk and delete a human session. Both forms count.
+        _mkdir(self.sessions_root, "human:conv", 20)
+        _mkdir(self.sessions_root, "stale", 20)
+        self.main._load_session_map = lambda: {"human:conv": {}}
+        self.sweep()
+        self.assertTrue(os.path.isdir(os.path.join(self.sessions_root, "human:conv")),
+                        "a dir named by a raw .sessions.json key must survive enforce")
+        self.assertFalse(os.path.exists(os.path.join(self.sessions_root, "stale")),
+                         "the genuinely stale unmarked dir is still reaped")
 
     def test_marker_class_unchanged_under_enforce(self):
         _mkdir(self.sessions_root, "old-marked", 20, marker=True)

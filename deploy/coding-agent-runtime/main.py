@@ -1366,14 +1366,18 @@ def _human_session_dirs() -> set:
     SESSION_MAP (.sessions.json) is keyed by CLI conversation id, not the
     runtimeSessionId that names the dir, and is written on every turn
     regardless of origin — so this is a conservative over-match, not a real
-    signal (there is no positive human marker anywhere in this system). Any
-    key that happens to look like a session id gets its sanitized dir name
-    added; read failures yield an empty set, never an exception."""
+    signal (there is no positive human marker anywhere in this system).
+
+    Spares BOTH forms of every key: the sanitized dir name _session_dir would
+    mint for it, AND the raw key itself. A dir on disk can legally be named
+    with characters _session_dir() rewrites (e.g. `a:b` → `a-b`), so the
+    sanitized form alone would miss a dir whose name matches the raw key.
+    Read failures yield an empty set, never an exception."""
     try:
-        keys = _load_session_map().keys()
+        keys = set(_load_session_map().keys())
     except Exception:  # noqa: BLE001 — sparing logic must never raise
         return set()
-    return {os.path.basename(_session_dir(k)) for k in keys}
+    return {os.path.basename(_session_dir(k)) for k in keys} | keys
 
 
 def _unmarked_gc_candidates(sessions_root: str, cutoff: float, live_dirs: set,
