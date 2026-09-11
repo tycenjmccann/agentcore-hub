@@ -51,7 +51,7 @@ const s3Err = (name: string, status?: number, message = "UnknownError") =>
   Object.assign(new Error(message), { name, $metadata: { httpStatusCode: status } });
 
 const PRESIGNED =
-  "https://agentcore-hub-artifacts-023392223961-us-east-1.s3.amazonaws.com/prd/spec.md" +
+  "https://agentcore-hub-artifacts-123456789012-us-east-1.s3.amazonaws.com/prd/spec.md" +
   "?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20260905%2Fus-east-1%2Fs3%2Faws4_request" +
   "&X-Amz-Date=20260905T000000Z&X-Amz-Expires=604800&X-Amz-SignedHeaders=host&X-Amz-Signature=SECRETSIG";
 
@@ -264,14 +264,14 @@ describe("validateIntakeSources — S3 object missing", () => {
 // ─── (d) AccessDenied is transient, and never reads "UnknownError" ───────────
 
 describe("validateIntakeSources — S3 AccessDenied", () => {
-  // The live case: the hub runs in account 838829463875 and its task role grants
+  // The live case: the hub runs in account 210987654321 and its task role grants
   // s3:GetObject on its OWN bucket only; the reported source lived in
-  // agentcore-hub-artifacts-023392223961-us-east-1 (a different account). A
+  // agentcore-hub-artifacts-123456789012-us-east-1 (a different account). A
   // bodiless HEAD 403 arrives as name="403", message="UnknownError".
   for (const err of [s3Err("403", 403, "UnknownError"), s3Err("AccessDenied", 403), s3Err("Forbidden", 403)]) {
     it(`${err.name} → transient; accepted as unverified in lenient mode`, async () => {
       const r = await validateIntakeSources(
-        [src("s3", "s3://agentcore-hub-artifacts-023392223961-us-east-1/prd/spec.md")],
+        [src("s3", "s3://agentcore-hub-artifacts-123456789012-us-east-1/prd/spec.md")],
         { s3Client: throwingS3(err), env: envOf({ ARTIFACT_BUCKET: "hub-bucket" }) }
       );
       const c = only(r);
@@ -305,7 +305,7 @@ describe("validateIntakeSources — S3 AccessDenied", () => {
  * i.e. the exact meaningless-SDK-artefact text this feature exists to remove.
  */
 describe("validateIntakeSources — S3 error detail carries no SDK placeholder (TEAM-4089)", () => {
-  const CROSS_ACCOUNT = "s3://agentcore-hub-artifacts-023392223961-us-east-1/prd/spec.md";
+  const CROSS_ACCOUNT = "s3://agentcore-hub-artifacts-123456789012-us-east-1/prd/spec.md";
   const denied = (err: unknown) =>
     validateIntakeSources([src("s3", CROSS_ACCOUNT)], {
       s3Client: throwingS3(err),
@@ -506,7 +506,7 @@ describe("validateIntakeSources — transient failures", () => {
 
 describe("redactUrl", () => {
   it("keeps scheme/host/path and parameter names, drops values", () => {
-    expect(redactUrl(PRESIGNED)).toContain("https://agentcore-hub-artifacts-023392223961-us-east-1.s3.amazonaws.com/prd/spec.md?");
+    expect(redactUrl(PRESIGNED)).toContain("https://agentcore-hub-artifacts-123456789012-us-east-1.s3.amazonaws.com/prd/spec.md?");
     expect(redactUrl(PRESIGNED)).toContain("X-Amz-Signature=REDACTED");
     expect(redactUrl(PRESIGNED)).toContain("X-Amz-Credential=REDACTED");
     expect(redactUrl(PRESIGNED)).not.toContain("SECRETSIG");
@@ -1186,7 +1186,7 @@ describe("validateIntakeSources — blocked URL hosts (TEAM-4091 F1)", () => {
  * connection to the very addresses this step vetted (section (j)).
  */
 describe("validateIntakeSources — resolved-address block (TEAM-4101 r2-F2)", () => {
-  const PRESIGNED_HOST = "agentcore-hub-artifacts-023392223961-us-east-1.s3.amazonaws.com";
+  const PRESIGNED_HOST = "agentcore-hub-artifacts-123456789012-us-east-1.s3.amazonaws.com";
   const neverFetch = () =>
     vi.fn(async () => ({ status: 206, ok: true, body: { cancel: async () => undefined } }) as unknown as Response);
   /** A lookup that answers with the given addresses (family inferred from ":"). */

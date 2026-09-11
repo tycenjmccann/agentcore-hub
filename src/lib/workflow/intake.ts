@@ -40,10 +40,10 @@ interface ProcessedSource {
 //     body to parse, so it sets err.message = "UnknownError" and puts the only
 //     real signal on err.name ("403") and err.$metadata.httpStatusCode. The old
 //     catch printed err.message alone, laundering a plain cross-account
-//     AccessDenied into a mystery. (Live: the hub runs in account 838829463875
+//     AccessDenied into a mystery. (Live: the hub runs in account 210987654321
 //     and its task role grants s3:GetObject on
-//     agentcore-hub-artifacts-838829463875-us-east-1 ONLY; the reported source
-//     lived in agentcore-hub-artifacts-023392223961-us-east-1 — a DIFFERENT
+//     agentcore-hub-artifacts-210987654321-us-east-1 ONLY; the reported source
+//     lived in agentcore-hub-artifacts-123456789012-us-east-1 — a DIFFERENT
 //     account. Cross-account AccessDenied, not env drift. Runtime agents in the
 //     hub account cannot read it either without a bucket-policy grant, which is
 //     why the 403 detail says so.)
