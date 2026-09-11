@@ -110,8 +110,10 @@ function managerPulseText(
  */
 export function isSameRepo(url: string | undefined, key: string): boolean {
   if (!url || !key) return false;
-  // Trailing slashes first: `…/repo.git/` leaves `.git` unmatchable otherwise (TEAM-4421).
-  const u = url.trim().toLowerCase().replace(/\/+$/, "").replace(/\.git$/, "");
+  // Strip is order-agnostic: trailing slashes first so `…/repo.git/` leaves
+  // `.git` matchable (TEAM-4421), then trailing slashes again so `…/repo/.git`
+  // doesn't leave a stray `/` behind after the `.git` strip (TEAM-4441).
+  const u = url.trim().toLowerCase().replace(/\/+$/, "").replace(/\.git$/, "").replace(/\/+$/, "");
   return u === key || u.endsWith(`/${key}`) || u.endsWith(`:${key}`);
 }
 
