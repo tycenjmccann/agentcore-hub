@@ -609,7 +609,7 @@ async function startWithJira(body: WorkflowInput, def: WorkflowDef, presetWorkfl
 
     const reqTicket = await jira.createTicket({
       parentId: epicId,
-      title: `${def.phases.find((p) => p.type === "agent")?.name || "Intake"}: ${def.intakeAgentId} — ${body.title}`,
+      title: intakeTicketTitle(def, body.title),
       description: intentGate
         ? `Turn the accepted intent (workflows/${workflowId}/shared/intent.md) into the spec and the ticket plan. Blocked until the product owner approves the Intent Acceptance gate ${gateTicketId}.\n\nTitle: ${body.title}`
         : `Analyze the request and create tickets for the relevant agents.\n\nTitle: ${body.title}\nDescription: ${body.description}`,
@@ -641,7 +641,6 @@ async function startWithJira(body: WorkflowInput, def: WorkflowDef, presetWorkfl
 
 async function startWithDynamoDB(body: WorkflowInput, def: WorkflowDef, presetWorkflowId?: string, markerId?: string, responseMeta: StartResponseMeta = {}, repoCheck?: RepoCheck) {
   const intakePhase = def.phases.find((p) => p.type === "agent")?.agentPhase || "requirements";
-  const intakePhaseName = def.phases.find((p) => p.type === "agent")?.name || "Intake";
   const workflowId = presetWorkflowId || mintWorkflowId();
 
   // 1. Create the epic via ticket tools Lambda
@@ -771,7 +770,7 @@ async function startWithDynamoDB(body: WorkflowInput, def: WorkflowDef, presetWo
       gateTicketId = (gateResult.key || gateResult.ticketId) as string;
     }
     reqResult = await invokeTicketLambda("Tickets___create_ticket", {
-      summary: `${intakePhaseName}: ${def.intakeAgentId} — ${body.title}`,
+      summary: intakeTicketTitle(def, body.title),
       description: intentGate
         ? `Turn the accepted intent (workflows/${workflowId}/shared/intent.md) into the spec and the ticket plan. Blocked until the product owner approves the Intent Acceptance gate ${gateTicketId}.\n\nTitle: ${body.title}`
         : `Analyze the request and create tickets for the relevant agents.\n\nTitle: ${body.title}\nDescription: ${body.description}`,
@@ -800,6 +799,22 @@ async function startWithDynamoDB(body: WorkflowInput, def: WorkflowDef, presetWo
 }
 
 // ─── Helpers ───────────────────────────────────────────────────────────────────
+
+/**
+ * TEAM-4450: the hub-created intake ticket's title prefix must come from the
+ * def's INTAKE (`type:"app"`) phase, not the first `type:"agent"` phase. For
+ * most defs this only changes a cosmetic label ("Requirements:" / "Triage:" →
+ * "Intake:"; no consumer keys on it), but for `operator` the first agent phase
+ * is named "Build" — titling the intake ticket "Build: agentcore_hub_operator —
+ * …" made it indistinguishable from the operator's own BUILD ticket to
+ * blueprints/operator.md's title-prefix dispatch, so the intake ticket got
+ * routed into BUILD and skipped planning. Both backends call this so they can't
+ * drift apart again.
+ */
+function intakeTicketTitle(def: WorkflowDef, title: string): string {
+  const intakePhaseName = def.phases.find((p) => p.type === "app")?.name || "Intake";
+  return `${intakePhaseName}: ${def.intakeAgentId} — ${title}`;
+}
 
 /**
  * Playbook PLAN stage: render the originator's words into intent.md and the
