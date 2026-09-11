@@ -76,6 +76,29 @@ export function parseCdRegistry(raw) {
       // CI_PROJECT_NAME, then agentcore-hub-ci.
       const ciProject = typeof e.ciProject === "string" ? e.ciProject.trim() : "";
       if (ciProject) entry.ciProject = ciProject;
+      // Cross-account CD (optional). The pipeline lives in ANOTHER AWS account;
+      // the tools Lambda reaches it by assuming `roleArn` there. Honored ONLY as
+      // a complete, valid triple: `account` = 12 digits, `roleArn` =
+      // arn:aws:iam::<account>:role/hub-cd-trigger-<slug> (the RESERVED
+      // trigger-role name — a roleArn naming any other role, or a different
+      // account than `account`, is a misconfiguration and DROPPED, never
+      // assumed), and a non-empty `externalId` (the confused-deputy guard the
+      // trust role's policy requires). Any part missing or malformed → all three
+      // dropped, and the entry falls back to same-account behavior (which safely
+      // refuses a foreign pipeline it cannot see). This is the ONLY place a role
+      // the hub will assume is admitted.
+      const account = typeof e.account === "string" ? e.account.trim() : "";
+      const roleArn = typeof e.roleArn === "string" ? e.roleArn.trim() : "";
+      const externalId = typeof e.externalId === "string" ? e.externalId.trim() : "";
+      if (
+        account && roleArn && externalId &&
+        /^[0-9]{12}$/.test(account) &&
+        new RegExp(`^arn:aws:iam::${account}:role/hub-cd-trigger-[a-z0-9-]+$`).test(roleArn)
+      ) {
+        entry.account = account;
+        entry.roleArn = roleArn;
+        entry.externalId = externalId;
+      }
       const deployDoc = typeof e.deployDoc === "string" ? e.deployDoc.trim() : "";
       if (deployDoc) entry.deployDoc = deployDoc;
       const notes = typeof e.notes === "string" ? e.notes.trim() : "";
@@ -149,6 +172,11 @@ export function pipelineProjects(entry) {
   return {
     pipeline,
     region: entry.region || null,
+    // Cross-account: null on a same-account entry (the common case), so
+    // clientsFor() builds plain clients. parseCdRegistry only ever sets these as
+    // a validated triple.
+    roleArn: entry.roleArn || null,
+    externalId: entry.externalId || null,
     ciProject: entry.ciProject || `${base}-ci`,
     buildProject: `${base}-build`,
     deployProject: pipeline,
@@ -181,6 +209,8 @@ export function resolveDelivery(registry, repoConfig, { pipelineEnabled = false 
     pipelineMode: Boolean(pipelineEnabled && pipeline),
     pipeline,
     region: entry.region || null,
+    roleArn: entry.roleArn || null,
+    externalId: entry.externalId || null,
     ciProject: projects?.ciProject || null,
     buildProject: projects?.buildProject || null,
     deployProject: projects?.deployProject || null,

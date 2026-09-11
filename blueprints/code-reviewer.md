@@ -82,6 +82,12 @@ concrete scenario that triggers it:
   Cite the doc URL and the exact mismatch. If the ticket cited only a marketing link
   and no authoritative reference, that itself is a P0 finding.
 
+**COMPLETE-IN-ONE-ROUND — raise every finding you can see now.** Round 1
+covers the whole diff; a re-review after a fix is delta-only. A finding first
+raised on the re-review that was already visible in round 1's diff is a review
+defect (mark it `lateFinding: true` in your verdict), because every extra round
+costs the dev a fix cycle and CI a re-certification.
+
 **PROVE-OR-FILE — you may not argue a finding away.** To dismiss a candidate
 finding as theoretical you must produce EVIDENCE: read the actual code path
 (including other tiers — Lambda handlers, resolvers, schema, every backend

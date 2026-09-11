@@ -121,6 +121,8 @@ describe("pipelineProjects", () => {
     expect(pipelineProjects({ pipeline: "agentcore-hub-deploy" })).toEqual({
       pipeline: "agentcore-hub-deploy",
       region: null,
+      roleArn: null,
+      externalId: null,
       ciProject: "agentcore-hub-ci",
       buildProject: "agentcore-hub-build",
       deployProject: "agentcore-hub-deploy",
@@ -130,6 +132,8 @@ describe("pipelineProjects", () => {
     expect(pipelineProjects({ pipeline: "hub-foo-deploy", region: "us-west-2" })).toEqual({
       pipeline: "hub-foo-deploy",
       region: "us-west-2",
+      roleArn: null,
+      externalId: null,
       ciProject: "hub-foo-ci",
       buildProject: "hub-foo-build",
       deployProject: "hub-foo-deploy",
@@ -145,6 +149,8 @@ describe("pipelineProjects", () => {
     expect(pipelineProjects({ pipeline: "hub-foo-pipeline" })).toEqual({
       pipeline: "hub-foo-pipeline",
       region: null,
+      roleArn: null,
+      externalId: null,
       ciProject: "hub-foo-pipeline-ci",
       buildProject: "hub-foo-pipeline-build",
       deployProject: "hub-foo-pipeline",
@@ -154,6 +160,57 @@ describe("pipelineProjects", () => {
     expect(pipelineProjects({})).toBeNull();
     expect(pipelineProjects({ deployDoc: "DEPLOY.md" })).toBeNull();
     expect(pipelineProjects(undefined)).toBeNull();
+  });
+  it("threads a cross-account roleArn/externalId through", () => {
+    const p = pipelineProjects({
+      pipeline: "hub-juno-deploy", region: "us-west-2",
+      account: "023392223961", roleArn: "arn:aws:iam::023392223961:role/hub-cd-trigger-juno", externalId: "hub-cd-juno-xyz",
+    });
+    expect(p.roleArn).toBe("arn:aws:iam::023392223961:role/hub-cd-trigger-juno");
+    expect(p.externalId).toBe("hub-cd-juno-xyz");
+    expect(p.region).toBe("us-west-2");
+  });
+});
+
+/**
+ * Cross-account CD: the three optional fields are honored ONLY as a complete,
+ * valid triple — the roleArn's embedded account must equal `account` and it must
+ * name a RESERVED hub-cd-trigger-* role (what the tools Lambda will assume). Any
+ * malformed part → all three dropped, same-account. Mirror of the app-side test
+ * in src/lib/cd-registry.test.ts.
+ */
+describe("cross-account CD fields", () => {
+  const OK = {
+    account: "023392223961",
+    roleArn: "arn:aws:iam::023392223961:role/hub-cd-trigger-juno",
+    externalId: "hub-cd-juno-secret",
+  };
+  const parse1 = (extra) =>
+    parseCdRegistry({ repos: [{ repo: "acme/juno", pipeline: "hub-juno-deploy", region: "us-west-2", ...extra }] }).repos[0];
+
+  it("keeps a valid triple", () => {
+    const e = parse1(OK);
+    expect(e.account).toBe(OK.account);
+    expect(e.roleArn).toBe(OK.roleArn);
+    expect(e.externalId).toBe(OK.externalId);
+  });
+  it("drops the triple when the roleArn's account ≠ account", () => {
+    const e = parse1({ ...OK, roleArn: "arn:aws:iam::999999999999:role/hub-cd-trigger-juno" });
+    expect(e.account).toBeUndefined();
+    expect(e.roleArn).toBeUndefined();
+    expect(e.externalId).toBeUndefined();
+  });
+  it("drops the triple when the role is not a hub-cd-trigger-* role", () => {
+    const e = parse1({ ...OK, roleArn: "arn:aws:iam::023392223961:role/AdminAccess" });
+    expect(e.roleArn).toBeUndefined();
+    expect(e.account).toBeUndefined();
+  });
+  it("drops the triple when externalId or account is missing/malformed", () => {
+    expect(parse1({ account: OK.account, roleArn: OK.roleArn }).roleArn).toBeUndefined();
+    expect(parse1({ ...OK, account: "12345" }).roleArn).toBeUndefined();
+    const same = parse1({});
+    expect(same.pipeline).toBe("hub-juno-deploy");
+    expect(same.roleArn).toBeUndefined();
   });
 });
 

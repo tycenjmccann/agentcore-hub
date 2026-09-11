@@ -276,6 +276,15 @@ run one more RECHECK (B5, delta only) so that `PR head == reviewed SHA == CI
 SHA`. Nothing lands on the branch after the brief is written. If something
 does (you will see it on SHIP), the gate approval is void and you re-brief.
 
+**Mergeability rule (before B7):** have the worker run `gh pr view <n> --json
+mergeable,mergeStateStatus`. `CONFLICTING` -> the worker merges
+`origin/<base_branch>` INTO the branch (a merge commit, never a rebase or force
+push), resolves, pushes, and then the Freeze rule applies: one more RECHECK (B5,
+delta only) and a CI turn so `PR head == reviewed SHA == CI SHA`. Only then
+write the brief. A conflict resolved AFTER the human approves moves the head past
+the approved SHA, which voids the approval and costs a second human gate — the
+one thing on this path you can prevent for the price of a CI run.
+
 ### B7. Merge brief + review package + report
 1. `workflows/{workflow_id}/shared/merge-brief.md` (`S3Storage___write_object`,
    text/markdown), pyramid style, decision first:

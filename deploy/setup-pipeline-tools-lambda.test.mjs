@@ -102,6 +102,7 @@ describe("buildInlinePolicy — the CiStartBuild grant", () => {
       "HandoffMarkerRead",
       "CdRegistryRead",
       "BuildLogRead",
+      "CrossAccountAssumeTrigger",
     ]);
   });
 
@@ -116,6 +117,7 @@ describe("buildInlinePolicy — the CiStartBuild grant", () => {
       "HandoffMarkerRead",
       "CdRegistryRead",
       "BuildLogRead",
+      "CrossAccountAssumeTrigger",
     ]);
     expect(sid(policy, "CiStartBuild")).toEqual({
       Sid: "CiStartBuild",
@@ -183,6 +185,11 @@ describe("buildInlinePolicy — the CiStartBuild grant", () => {
     const policy = buildInlinePolicy({ ...BASE, REGION: "eu-west-2", ACCOUNT: "999988887777", PIPELINE_CI_START_BUILD: "1" });
     for (const resource of allResources(policy)) {
       if (resource === "*") continue;
+      // The cross-account trigger-role ARN is a DELIBERATE wildcard on both
+      // account and region: the tools Lambda assumes hub-cd-trigger-* in
+      // whatever account a registry entry names, so it can carry neither this
+      // account nor this region (parseCdRegistry is the real allow-list).
+      if (/^arn:aws:iam::\*:role\/hub-cd-trigger-\*$/.test(resource)) continue;
       // S3 ARNs carry neither region nor account as ARN fields — the bucket NAME
       // carries both under the deploy/config.sh convention.
       if (resource.startsWith("arn:aws:s3:::")) {
@@ -369,6 +376,7 @@ describe("buildInlinePolicy — the hub-* convention wildcards", () => {
       "HandoffMarkerRead",
       "CdRegistryRead",
       "BuildLogRead",
+      "CrossAccountAssumeTrigger",
     ]);
     expect(buildInlinePolicy(ON).Statement.map((s) => s.Sid)).toEqual([
       "Logs",
@@ -378,7 +386,23 @@ describe("buildInlinePolicy — the hub-* convention wildcards", () => {
       "HandoffMarkerRead",
       "CdRegistryRead",
       "BuildLogRead",
+      "CrossAccountAssumeTrigger",
     ]);
+  });
+
+  it("grants sts:AssumeRole ONLY on the reserved hub-cd-trigger-* role, any account", () => {
+    // Cross-account CD: the tools Lambda reaches a pipeline in another account by
+    // assuming that account's trigger role. The grant is a name-scoped wildcard
+    // (hub-cd-trigger-*) across all accounts, and NOTHING but AssumeRole — a
+    // registry entry pointing at any other role is dropped by parseCdRegistry,
+    // never assumed.
+    const statement = sid(buildInlinePolicy(BASE), "CrossAccountAssumeTrigger");
+    expect(statement).toEqual({
+      Sid: "CrossAccountAssumeTrigger",
+      Effect: "Allow",
+      Action: ["sts:AssumeRole"],
+      Resource: ["arn:aws:iam::*:role/hub-cd-trigger-*"],
+    });
   });
 
   it("adds hub-*-deploy to read+trigger, keeping the hub's exact pipeline ARN", () => {

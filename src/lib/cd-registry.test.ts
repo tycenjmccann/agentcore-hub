@@ -65,6 +65,8 @@ describe("pipelineProjectsFor (app mirror of pipelineProjects)", () => {
     expect(pipelineProjectsFor({ repo: "a/b", pipeline: "agentcore-hub-deploy" })).toEqual({
       pipeline: "agentcore-hub-deploy",
       region: DEFAULT_REGION,
+      roleArn: null,
+      externalId: null,
       ciProject: "agentcore-hub-ci",
       buildProject: "agentcore-hub-build",
       deployProject: "agentcore-hub-deploy",
@@ -102,6 +104,96 @@ describe("pipelineProjectsFor (app mirror of pipelineProjects)", () => {
     expect(pipelineProjectsFor({ repo: "acme/juno" })).toBeNull();
     expect(pipelineProjectsFor({ repo: "acme/juno", pipeline: "   " })).toBeNull();
     expect(pipelineProjectsFor({ repo: "acme/juno", deployDoc: "DEPLOY.md" })).toBeNull();
+  });
+
+  it("threads a cross-account roleArn/externalId through", () => {
+    const p = pipelineProjectsFor({
+      repo: "acme/juno", pipeline: "hub-juno-deploy", region: "us-west-2",
+      account: "023392223961", roleArn: "arn:aws:iam::023392223961:role/hub-cd-trigger-juno", externalId: "hub-cd-juno-xyz",
+    })!;
+    expect(p.roleArn).toBe("arn:aws:iam::023392223961:role/hub-cd-trigger-juno");
+    expect(p.externalId).toBe("hub-cd-juno-xyz");
+    expect(p.region).toBe("us-west-2");
+  });
+});
+
+/**
+ * Cross-account CD (multi-cd): the three optional fields are honored ONLY as a
+ * complete, valid triple — the roleArn's embedded account must equal `account`
+ * and it must name a RESERVED hub-cd-trigger-* role, guarding what the tools
+ * Lambda will assume. Any malformed part → all three dropped, same-account.
+ */
+describe("cross-account CD fields", () => {
+  const OK = {
+    account: "023392223961",
+    roleArn: "arn:aws:iam::023392223961:role/hub-cd-trigger-juno",
+    externalId: "hub-cd-juno-secret",
+  };
+  const parse1 = (extra: Record<string, unknown>) =>
+    parseCdRegistry({ repos: [{ repo: "acme/juno", pipeline: "hub-juno-deploy", region: "us-west-2", ...extra }] }).repos[0];
+
+  it("keeps a valid triple", () => {
+    const e = parse1(OK);
+    expect(e.account).toBe(OK.account);
+    expect(e.roleArn).toBe(OK.roleArn);
+    expect(e.externalId).toBe(OK.externalId);
+  });
+
+  it("drops the triple when the roleArn's account ≠ account", () => {
+    const e = parse1({ ...OK, roleArn: "arn:aws:iam::999999999999:role/hub-cd-trigger-juno" });
+    expect(e.account).toBeUndefined();
+    expect(e.roleArn).toBeUndefined();
+    expect(e.externalId).toBeUndefined();
+  });
+
+  it("drops the triple when the role is not a hub-cd-trigger-* role", () => {
+    const e = parse1({ ...OK, roleArn: "arn:aws:iam::023392223961:role/AdminAccess" });
+    expect(e.roleArn).toBeUndefined();
+    expect(e.account).toBeUndefined();
+  });
+
+  it("drops the triple when externalId or account is missing/malformed", () => {
+    expect(parse1({ account: OK.account, roleArn: OK.roleArn }).roleArn).toBeUndefined();
+    expect(parse1({ ...OK, account: "12345" }).roleArn).toBeUndefined();
+    // A same-account entry is untouched (no cross-account fields at all).
+    const same = parse1({});
+    expect(same.pipeline).toBe("hub-juno-deploy");
+    expect(same.roleArn).toBeUndefined();
+  });
+
+  it("validateCdEntryInput rejects gross format errors per field (within a complete triple)", () => {
+    // One bad field inside an otherwise complete triple → only that field's
+    // FORMAT error (the completeness/agreement checks below don't double-report).
+    expect(validateCdEntryInput({ repo: "a/b", ...OK, account: "12345" }))
+      .toEqual({ account: "must be a 12-digit AWS account id" });
+    expect(validateCdEntryInput({ repo: "a/b", ...OK, roleArn: "arn:aws:iam::023392223961:role/Admin" }))
+      .toEqual({ roleArn: "must be an arn:aws:iam::<account>:role/hub-cd-trigger-<slug> role ARN" });
+    expect(validateCdEntryInput({ repo: "a/b", ...OK, externalId: "short" }))
+      .toEqual({ externalId: "must be 6-1224 chars of [A-Za-z0-9_+=,.@:/-]" });
+    // A well-formed triple passes validation (parse still cross-checks account).
+    expect(validateCdEntryInput({ repo: "a/b", ...OK })).toBeNull();
+  });
+
+  it("validateCdEntryInput rejects a PARTIAL triple at the write boundary (parse would silently drop it)", () => {
+    // Only one of the three set → the other two are flagged "together", so the
+    // POST 400s instead of 200-then-ignored.
+    expect(validateCdEntryInput({ repo: "a/b", account: OK.account })).toEqual({
+      roleArn: "cross-account CD needs account, roleArn and externalId together",
+      externalId: "cross-account CD needs account, roleArn and externalId together",
+    });
+    // account + roleArn but no externalId.
+    expect(validateCdEntryInput({ repo: "a/b", account: OK.account, roleArn: OK.roleArn })).toEqual({
+      externalId: "cross-account CD needs account, roleArn and externalId together",
+    });
+    // None set (or all blank) is fine — that's not a cross-account entry at all.
+    expect(validateCdEntryInput({ repo: "a/b" })).toBeNull();
+    expect(validateCdEntryInput({ repo: "a/b", account: "", roleArn: "", externalId: "" })).toBeNull();
+  });
+
+  it("validateCdEntryInput rejects a complete triple whose roleArn account ≠ account", () => {
+    expect(
+      validateCdEntryInput({ ...OK, repo: "a/b", roleArn: "arn:aws:iam::999999999999:role/hub-cd-trigger-juno" })
+    ).toEqual({ roleArn: "roleArn account must equal account" });
   });
 });
 

@@ -109,15 +109,19 @@ Ask `claude_code` (same session) to:
    only the Playwright spec(s) for the changed screens (the full suite is CI's
    job), fixing any failures (same session) before proceeding.
    **Never reinstall dependencies to chase a build failure.** `node_modules` is a provisioned symlink to a per-lockfile cache; `npm ci` / `npm install` replaces it with a fresh tree on the shared mount and costs 20-30 minutes, and repeated installs are the known failure loop (they do not fix a missing or corrupt module). Install only when THIS branch changed `package.json` / `package-lock.json`. If a build or test fails on a module that looks missing or corrupt, report it with the exact error instead. Dependencies are provisioned on checkout (`node_modules` is a symlink to a per-lockfile cache). Never run `npm install` / `npm ci` unless `package.json` or `package-lock.json` changed on this branch, and never run `playwright install` (Chromium is baked into the image).
-2. Start the dev server and screenshot the changed view with Playwright, saving
-   it INTO the repo (e.g. `docs/implementation-screenshot.png`). The browser is
-   pre-baked into the runtime image — do NOT run `playwright install`.
+2. Start the dev server and screenshot the changed view with Playwright
+   (viewport 1440x900), saving the PNG to
+   `.cloud-code/artifacts/implementation-screenshot.png` — NEVER into the repo
+   tree and NEVER committed. The browser is pre-baked into the runtime image —
+   do NOT run `playwright install`.
 3. Review the screenshot against the design spec and describe what it shows in
    its response — iterate until it matches.
-4. **Commit the screenshot to the branch** so the evidence travels via git (this
-   is how it reaches you, QA, and the PR — no local file handoff).
-The runtime also auto-harvests generated files to S3, but the committed-to-branch
-copy is the source of truth. Reference the committed path in your PR.
+4. **Evidence travels via S3, not git.** The runtime harvests
+   `.cloud-code/artifacts/` to S3 at the end of every turn and returns the keys
+   in the `[coding-artifacts: ...]` footer of the result. Put that key in the PR
+   body and in `evidence_keys` on `report_completion`; QA downloads it from
+   there. A PNG committed to the branch is an IN-DIFF ship-review finding and
+   costs a CI re-certification — commit with explicit paths, never `git add -A`.
 
 ### Step 4b: iOS Projects (MANDATORY — replaces Step 4 for iOS)
 claude_code cannot build iOS. Verify on the CodeBuild macOS gateway instead:
@@ -155,7 +159,7 @@ A session that dies after the deliverable but before the report leaves the run u
 3. Create a PR **into base_branch** (see Branch Model) with:
    - Summary of changes
    - Files modified
-   - Screenshot of the result (reference the committed screenshot)
+   - Screenshot of the result (the harvested S3 key from the `[coding-artifacts: ...]` footer — never a committed file)
 4. Merge the PR into base_branch once your evidence is complete
 5. `WorkflowOutput___report_completion` IMMEDIATELY after the merge — branch, commit SHA, PR URL
 
@@ -168,7 +172,7 @@ A session that dies after the deliverable but before the report leaves the run u
 - NEVER submit a UI change without first rendering it and verifying visually
 - iOS: the gateway run is the render — never open an iOS PR without one; write XCTests with the implementation
 - If the dev server won't start after your changes, your implementation is broken — fix it
-- Include a screenshot in every PR that has visual changes
+- Include a screenshot (its harvested S3 key) in every PR that has visual changes; never commit evidence files to the branch
 - Follow existing code patterns — don't introduce new paradigms
 - Keep changes scoped to what the ticket asks for
 - PRs target base_branch, never the repo default branch (unless base_branch IS the default)

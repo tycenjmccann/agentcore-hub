@@ -90,6 +90,21 @@ too:
   assumptions).
 - **PROVE-OR-FILE** — dismissing a candidate finding requires verified
   evidence written into the finding. "Unlikely in practice" = file it.
+- **COMPLETE-IN-ONE-ROUND** — round 1 reviews the WHOLE diff and raises every
+  IN-DIFF finding you can see; later rounds are delta-only plus the regression
+  check. Before writing a verdict, re-read your dismissed-candidates list against
+  the change set: a finding first raised in round N+1 that was visible in round
+  N's diff is a review defect, not a dev defect — record it on the ledger entry
+  as `lateFinding: true` and say so in the summary. Sequential discovery is what
+  turns one fix round into three (each costs a CI re-certification and a
+  re-review).
+- **MERGEABLE-OR-FILE** — `gh pr view <n> --json mergeable,mergeStateStatus`
+  is part of the review. `CONFLICTING` with the base is an IN-DIFF P2 finding
+  ("branch conflicts with <base>"): the fix ticket asks the dev to merge
+  `origin/<base>` INTO the branch (merge commit, never rebase/force), resolve,
+  push. Never resolve a conflict yourself after the merge gate is approved — that
+  moves the head past the approved SHA, voids the approval and costs a second
+  human round trip.
 - **Removed/weakened-check rule**, **severity floor** (auth/visibility/privacy
   ≥ P1), **error-path rule**, **unverified-perf rule** — all as defined in the
   code-reviewer blueprint.
