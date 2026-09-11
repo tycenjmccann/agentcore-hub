@@ -324,3 +324,123 @@ test.describe("Workflow Page — replay scrubber", () => {
     await page.waitForTimeout(300);
   });
 });
+
+// ─── SDLC framework badge (TEAM-4408) ───────────────────────────────────────
+//
+// Hermetic via page.route() — no live harness. "standard" (no sdlcFramework
+// overlay) must render NO badge in the list row or the board header; a real
+// overlay ("playbook") must still render its badge in both places.
+
+async function mockSdlcBoardEndpoints(page: Page) {
+  await page.route("**/api/workflow/*/events", (r) =>
+    r.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ events: [] }) }));
+  await page.route("**/api/workflow/*/tickets", (r) =>
+    r.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ tickets: [] }) }));
+  await page.route("**/api/workflow/*/agent-output**", (r) =>
+    r.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ output: "" }) }));
+  await page.route("**/api/workflow/*/watch", (r) =>
+    r.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ watch: true }) }));
+  await page.route("**/api/pipeline/status**", (r) =>
+    r.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({}) }));
+}
+
+function sdlcMockState(id: string, sdlcFramework?: "playbook" | "aidlc") {
+  return {
+    id,
+    phase: "complete",
+    epicId: "TEAM-4408",
+    repoConfig: { layout: "monorepo", repos: [] },
+    input: {
+      title: "SDLC badge fixture",
+      description: "fixture",
+      repoConfig: { layout: "monorepo", repos: [] },
+      sources: [],
+    },
+    ...(sdlcFramework ? { sdlcFramework } : {}),
+    agentTasks: {},
+    messages: [],
+    humanNotifications: [],
+    startedAt: new Date(Date.now() - 3600000).toISOString(),
+    completedAt: new Date().toISOString(),
+  };
+}
+
+async function selectSdlcWorkflow(page: Page, title: string) {
+  await page.goto("/workflow");
+  await page.waitForLoadState("networkidle");
+  const expandBtn = page.locator("button[aria-label='Expand workflow history sidebar']");
+  if (await expandBtn.isVisible().catch(() => false)) await expandBtn.click();
+  await page.getByText(title).first().click();
+  await page.waitForSelector(".pipeline-status-header", { timeout: 15_000 });
+}
+
+test.describe("SDLC framework badge (TEAM-4408)", () => {
+  test("a run with no sdlcFramework overlay shows no STANDARD badge, in the list or the header", async ({ page }) => {
+    const workflowId = "wf-sdlc-standard-4408";
+    const title = "Operator run — no overlay";
+    await page.route("**/api/workflow/list", (r) =>
+      r.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          workflows: [
+            { id: workflowId, phase: "complete", epicId: "TEAM-4408", input: { title }, startedAt: new Date().toISOString(), completedAt: new Date().toISOString() },
+          ],
+        }),
+      }));
+    await page.route("**/api/workflow/*/state**", (r) =>
+      r.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(sdlcMockState(workflowId)) }));
+    await mockSdlcBoardEndpoints(page);
+
+    await selectSdlcWorkflow(page, title);
+
+    // No .sdlc-badge element anywhere, and no visible "STANDARD" text badge.
+    await expect(page.locator(".sdlc-badge")).toHaveCount(0);
+    await expect(page.getByText("STANDARD", { exact: true })).toHaveCount(0);
+
+    // Sanity: the things around the (absent) badge are still there, so this
+    // isn't passing on a blank page.
+    await expect(page.locator(".pipeline-status-header")).toContainText(/complete/i);
+    await expect(page.getByText(title).first()).toBeVisible();
+
+    await page.screenshot({ path: `${SCREENSHOT_DIR}/sdlc-badge-standard-none.png`, fullPage: true });
+  });
+
+  test('a run with sdlcFramework "playbook" shows the PLAYBOOK badge in both the list and the header', async ({ page }) => {
+    const workflowId = "wf-sdlc-playbook-4408";
+    const title = "Playbook framework run";
+    await page.route("**/api/workflow/list", (r) =>
+      r.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          workflows: [
+            {
+              id: workflowId,
+              phase: "complete",
+              epicId: "TEAM-4408",
+              input: { title },
+              sdlcFramework: "playbook",
+              startedAt: new Date().toISOString(),
+              completedAt: new Date().toISOString(),
+            },
+          ],
+        }),
+      }));
+    await page.route("**/api/workflow/*/state**", (r) =>
+      r.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(sdlcMockState(workflowId, "playbook")) }));
+    await mockSdlcBoardEndpoints(page);
+
+    await selectSdlcWorkflow(page, title);
+
+    // Board header badge
+    const boardBadge = page.locator(".sdlc-badge");
+    await expect(boardBadge).toHaveText("PLAYBOOK");
+
+    // List row badge — a span with the PLAYBOOK text that is NOT the board's .sdlc-badge
+    const listBadge = page.locator("span:not(.sdlc-badge)", { hasText: /^PLAYBOOK$/ });
+    await expect(listBadge.first()).toBeVisible();
+
+    await page.screenshot({ path: `${SCREENSHOT_DIR}/sdlc-badge-playbook.png`, fullPage: true });
+  });
+});
