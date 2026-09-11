@@ -162,9 +162,12 @@ def main() -> None:
         "CODEX_HOME": f"{EFS_MOUNT}/.codex",
         # Browser-automation MCP servers use the image's system chromium (no
         # per-session download). Mirrored in shell-init.sh for the PTY surface.
+        # PLAYWRIGHT_BROWSERS_PATH is deliberately NOT set here: the image bakes
+        # Playwright's Chromium under /opt/pw-browsers (Dockerfile ENV). The old
+        # "0" override made Playwright look inside node_modules instead, so every
+        # verify turn re-downloaded a browser (35 s + a failed test run per VM).
         "PUPPETEER_EXECUTABLE_PATH": "/usr/bin/chromium",
         "PUPPETEER_SKIP_DOWNLOAD": "1",
-        "PLAYWRIGHT_BROWSERS_PATH": "0",
         # Point the CLIs' OTel SDK at the in-container collector sidecar, which
         # SigV4-signs and forwards to AgentCore Observability. The image enables
         # CLAUDE_CODE_ENABLE_TELEMETRY, but without exporters configured the CLI
