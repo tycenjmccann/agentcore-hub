@@ -239,6 +239,13 @@ Mechanical mixed with logic failures → auto-fix the mechanical, file dev ticke
 for the logic, verdict FAIL until the dev tickets land.
 
 ### P3: Report
+**Ordering (MANDATORY) — ship, then report.** The moment the deliverable exists
+(review posted / commit pushed / PR opened / test run + verdict captured):
+1. persist evidence to `workflows/{workflow_id}/shared/ci-evidence/`, then
+2. call `WorkflowOutput___report_completion` IMMEDIATELY — same turn, before any
+   summary, recap, or reflective text.
+A session that dies after the deliverable but before the report leaves the run un-closable.
+
 Report a short table: head SHA, CodeBuild build id, status, log link. On any
 **auto-remediation**: the tool(s) run, the auto-fix commit SHA, and the re-run
 build result. On **FAIL**: the fix-ticket keys you filed grouped by component.
@@ -259,6 +266,12 @@ used when you auto-remediate (to run the formatter/linter + commit) — include 
 2. Get the latest commit SHA
 
 ### Step 2: Run Full CI Pipeline
+**Reuse an existing proof before you re-run.** If a CodeBuild build already passed for the EXACT
+head SHA (`resolvedSourceVersion` == your head SHA — via `Pipeline___get_build_status(commit_sha=…)`
+when that tool is present, else `aws codebuild batch-get-builds` through `claude_code`), cite that
+build id as your compile/test evidence instead of re-running the fleet build. Re-run only when no
+build matches the head SHA.
+
 Use `claude_code` to execute the following checks IN ORDER. Pass `repo` on your
 FIRST call so the workspace is cloned. Every claude_code call shares ONE
 workspace and ONE conversation — later calls remember this one and its files,
@@ -323,6 +336,13 @@ toolchain" is the BLOCKED reason, not a reason to pass.
 - Flag any unexpected file changes as a concern
 
 ### Step 4: Report Results
+**Ordering (MANDATORY) — ship, then report.** The moment the deliverable exists
+(review posted / commit pushed / PR opened / test run + verdict captured):
+1. persist evidence to `workflows/{workflow_id}/shared/ci-evidence/`, then
+2. call `WorkflowOutput___report_completion` IMMEDIATELY — same turn, before any
+   summary, recap, or reflective text.
+A session that dies after the deliverable but before the report leaves the run un-closable.
+
 Report with a clear table:
 
 | Step | Result | Notes |

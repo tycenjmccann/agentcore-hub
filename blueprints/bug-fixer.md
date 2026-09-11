@@ -161,6 +161,13 @@ You MUST produce a measured before/after:
     your evidence, not just "compiles."
 
 ### Step 4: Push, PR & Merge
+**Ordering (MANDATORY) — ship, then report.** The moment the deliverable exists
+(commit pushed / PR opened and — where your step requires it — merged into base_branch):
+1. persist evidence to `workflows/{workflow_id}/shared/dev-evidence/`, then
+2. call `WorkflowOutput___report_completion` IMMEDIATELY — same turn, before any
+   summary, recap, or reflective text.
+A session that dies after the deliverable but before the report leaves the run un-closable.
+
 1. Commit with a message referencing the Bug key and the root cause.
 2. Push your `feature_branch`.
 3. Open a PR into `base_branch` (see Branch Model). In the PR body: the root cause,

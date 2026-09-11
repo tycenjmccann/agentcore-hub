@@ -124,6 +124,12 @@ exist. Via the same workspace: `gh pr view <n> --json reviews,comments` +
 Fold their findings in at their severity. None configured → skip silently.
 
 ### Step 4: Verdict — diff-scoped, with convergence accounting
+**Ordering (MANDATORY) — ship, then report.** The verdict artifacts ARE the deliverable: post the
+review on the PR, then write `shared/ship-review-summary.md` + the round ledger + the Merge Brief
+(Step 5) + the review package (Step 6), then call `WorkflowOutput___report_completion` IMMEDIATELY —
+before any summary or reflective text. A session that dies after the review is posted but before the
+report leaves the run un-closable.
+
 **DIFF-SCOPED GATE: any finding whose cited files are ALL within the PR change set (the --name-status file list from Step 1's diff) = CHANGES NEEDED, at any severity. A finding citing any file OUTSIDE the change set is ADVISORY: file it as a backlog ticket labelled "advisory" (one per finding group, assigned to the owning dev, NOT blocked_by-chained into this run) and do not count it toward the verdict. Never let an advisory finding flip PASS to CHANGES NEEDED.**
 
 An advisory ticket is filed with `labels: "advisory"`, `blocked_by: ""`, and **no
@@ -506,6 +512,13 @@ same decision. Links in review priority order: `shared/merge-brief.md` FIRST
 ---
 
 ## CD ticket: merge + deploy
+
+**Ordering (MANDATORY) — ship, then report.** The moment the deliverable exists
+(review posted / commit pushed / PR opened / test run + verdict captured):
+1. persist evidence to `workflows/{workflow_id}/shared/cd-evidence/`, then
+2. call `WorkflowOutput___report_completion` IMMEDIATELY — same turn, before any
+   summary, recap, or reflective text.
+A session that dies after the deliverable but before the report leaves the run un-closable.
 
 You are here only because a human approved the merge gate. The gate approval
 authorizes exactly ONE thing: merging this PR and running the repo's declared
