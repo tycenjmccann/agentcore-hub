@@ -191,12 +191,15 @@ class TestLinkAndHook(unittest.TestCase):
         self.assertFalse(info["hook"])
         self.assertEqual(hook.read_text(), "#!/bin/sh\necho mine\n")
 
-    def test_real_node_modules_dir_is_left_alone(self):
+    def test_real_node_modules_dir_is_relinked_when_a_copy_exists(self):
+        # Superseded contract: a CLI-run `npm ci` replaces the symlink with a real
+        # tree, which silently put the rest of the session back on NFS. When a copy
+        # for this lockfile is already provisioned we take the link back (the tree
+        # is reconstructible from the lockfile). See test_deps_relink.py.
         os.makedirs(os.path.join(self.wd, "node_modules", "left-by-cli"))
         info = main._provision_deps(self.wd)
-        self.assertEqual(info["deps"], "present")
-        self.assertFalse(os.path.islink(os.path.join(self.wd, "node_modules")))
-        self.assertTrue(os.path.isdir(os.path.join(self.wd, "node_modules", "left-by-cli")))
+        self.assertEqual(info["deps"], "relinked")
+        self.assertTrue(os.path.islink(os.path.join(self.wd, "node_modules")))
 
     def test_warm_rerun_is_idempotent_and_lock_change_relinks(self):
         self.assertEqual(main._provision_deps(self.wd)["deps"], "local")

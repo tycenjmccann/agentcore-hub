@@ -117,6 +117,7 @@ phases:
           deploy/coding-agent-runtime/test_turn_timeout.py \
           deploy/coding-agent-runtime/test_turn_timeout_pgroup.py \
           deploy/coding-agent-runtime/test_playwright_browsers.py \
+          deploy/coding-agent-runtime/test_deps_relink.py \
           deploy/workflow-manager/toolkit \
           deploy/pipeline/test_ecs_primary_container.py \
           deploy/pipeline/test_plan_surfaces.py \

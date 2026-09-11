@@ -204,3 +204,17 @@ The Next.js chat consumes it via the shared SSE reader. See
 - **Codex resume:** each Codex turn is independent (no `--resume` wired) — Claude has full resume.
 - **Single-user:** no auth yet. Session records should carry `userId` (hardcode `"default"` now,
   swap for the Cognito `sub` when app-wide SSO lands).
+
+### Deps cache knobs
+
+| Env | Default | Meaning |
+|---|---|---|
+| `WORKSPACE_DEPS_ENABLED` | `1` | `0` = no provisioning, no post-checkout hook (pre-#515 behaviour) |
+| `DEPS_LOCAL_KEEP` | `2` | Per-VM extracted copies to keep (~1.2 GB each against ~4.3 GB local). Oldest beyond this are evicted on every provision; the current lockfile and any copy a live checkout links to are never evicted. `0` disables eviction. |
+| `DEPS_TAR_TTL_S` | `2592000` | EFS tarballs untouched for this long are swept on the next publish |
+
+A `node_modules` that a coding CLI created with its own `npm ci` / `npm install`
+replaces the provisioned symlink, which silently puts the rest of the session
+back on NFS. The next turn restores the link when a copy for that exact lockfile
+is available (`deps_relinked`) and discards the tree in the background; when
+nothing is provisioned for the lockfile, the CLI's tree is left alone.
