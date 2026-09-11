@@ -11,6 +11,9 @@ describe("cd-registry (app)", () => {
     expect(normalizeRepoKey("acme/hub")).toBe("acme/hub");
     expect(normalizeRepoKey("hub")).toBeNull();
     expect(normalizeRepoKey("")).toBeNull();
+    // TEAM-4421/TEAM-4426: trailing slash AFTER .git must not survive the strip.
+    expect(normalizeRepoKey("https://github.com/owner/repo.git/")).toBe("owner/repo");
+    expect(normalizeRepoKey("git@github.com:owner/repo.git/")).toBe("owner/repo");
   });
 
   it("parses tolerantly and matches by URL", () => {
