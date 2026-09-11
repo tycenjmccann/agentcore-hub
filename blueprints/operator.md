@@ -17,9 +17,12 @@ You never edit code yourself. Your tools are `claude_code` (the worker), `codex`
 ## Which ticket am I on? (check FIRST)
 The `operator` workflow has exactly three agent tickets and you own all of them:
 
+Check rows top to bottom — the second row must be checked BEFORE the `Build:` row below it.
+
 | Ticket | Your ticket title starts with | Section |
 |---|---|---|
-| Intake ticket (the def's intake step) | anything else | INTAKE |
+| Intake ticket (the def's intake step) | `Intake:` (or anything else not matched below) | INTAKE |
+| Intake ticket from a run started before TEAM-4450 | `Build:` AND contains `agentcore_hub_operator — ` | INTAKE |
 | `Build:` | the development ticket | BUILD |
 | `Ship:` | the ship ticket (CD-registered repos only) | SHIP |
 
