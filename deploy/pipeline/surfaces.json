@@ -1,5 +1,5 @@
 {
-  "$comment": "Deploy-surface manifest for the pipeline's Deploy stage (deploy/pipeline/plan-surfaces.py reads it; scripts/check-deploy-surfaces.sh enforces that every lambda/* and deploy/* surface is listed here). A surface deploys when any file in pipeline-out/changed-files.txt starts with one of its `paths`. CODE ONLY: the pipeline updates Lambda code, harness prompt/model/skills and S3 toolkits \u2014 never IAM, env vars or infra. Infra scripts are `handoff` (the Deploy stage exits 2 after a good app deploy so the release manager reports them as a human step).",
+  "$comment": "Deploy-surface manifest for the pipeline's Deploy stage (deploy/pipeline/plan-surfaces.py reads it; scripts/check-deploy-surfaces.sh enforces that every lambda/*, deploy/* and src/config/*.json surface is listed here). A surface deploys when any file in pipeline-out/changed-files.txt starts with one of its `paths`. CODE ONLY: the pipeline updates Lambda code, harness prompt/model/skills and S3 toolkits \u2014 never IAM, env vars or infra. Infra scripts are `handoff` (the Deploy stage exits 2 after a good app deploy so the release manager reports them as a human step).",
   "ignore": [
     "__tests__/",
     "\\.test\\.mjs$",
@@ -193,6 +193,13 @@
       "paths": [
         "src/config/pricing.json"
       ]
+    },
+    {
+      "src": "src/config/workflows.json",
+      "dst": "config/workflows.json",
+      "paths": [
+        "src/config/workflows.json"
+      ]
     }
   ],
   "harnesses": [
@@ -303,6 +310,10 @@
     "deploy/runtime-agent/verify-fleet.sh": "Fleet smoke tool; run by hand.",
     "deploy/runtime-agent/local-ab-test.py": "Local prompt A/B harness; dev-only.",
     "deploy/coding-agent-runtime/invoke.py": "Manual invoke/smoke tool; not deployed.",
-    "deploy/lib": "Sourced shell helpers for the opt-in config-evals deploy guard (require_eval_gate, --force parsing). Library code consumed by the deploy scripts at run time — nothing to deploy."
+    "deploy/lib": "Sourced shell helpers for the opt-in config-evals deploy guard (require_eval_gate, --force parsing). Library code consumed by the deploy scripts at run time — nothing to deploy.",
+    "src/config/agents.json": "NOT a plain cp — Target 2 of buildspec-deploy.yml MERGES the repo copy onto the S3 copy via merge-agents-json.py (the S3 version carries deploy-injected runtimeArns the repo nulls out); it ships on every deploy, unconditionally.",
+    "src/config/cd-registry.json": "Target 2 seeds config/cd-registry.json only when ABSENT — the S3 copy is the live document (edited via the Workflow tab / scripts/cd-registry.sh), so it must never be cp'd over.",
+    "src/config/lease-constants.json": "Baked into pipeline-out/orchestrator.zip by buildspec-ci.yml (copied in beside lease.mjs before the zip, per lambda/orchestrator/deploy.sh's own file list), and Target 1 ships that zip on every run — nothing separate to deploy.",
+    "src/config/liveness-constants.json": "Not an S3 config surface — deploy/workflow-manager/deploy.sh bakes it into the workflow-analyzer zip. NOTE: the analyzer's manifest `files` list does not yet carry it, so a change to this file does not reach prod through the pipeline; tracked as a follow-up against PR #407 / TEAM-4160."
   }
 }

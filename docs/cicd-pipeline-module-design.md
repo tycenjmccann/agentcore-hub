@@ -115,11 +115,11 @@ behave exactly as today. This is the whole opt-out.
 > **Status (2026-09-04):** the app pipeline's Deploy stage now covers every
 > *code* surface, not just the three app targets — see
 > `deploy/pipeline/surfaces.json` (manifest), `plan-surfaces.py` (planner) and
-> `scripts/check-deploy-surfaces.sh` (CI gate: every `lambda/*` and `deploy/*`
-> file must be a surface, a handoff, or explicitly excluded). What remains a
-> handoff is exactly what the narrow role cannot do: runtime images and infra
-> scripts (IAM/env/tables). The "fleet + eval pipeline" below therefore shrinks
-> to an image-build-and-`UpdateAgentRuntime` increment.
+> `scripts/check-deploy-surfaces.sh` (CI gate: every `lambda/*`, `deploy/*` and
+> `src/config/*.json` file must be a surface, a handoff, or explicitly
+> excluded). What remains a handoff is exactly what the narrow role cannot do:
+> runtime images and infra scripts (IAM/env/tables). The "fleet + eval pipeline"
+> below therefore shrinks to an image-build-and-`UpdateAgentRuntime` increment.
 
 The hub is not one deployable — it is an **app** (Next.js + orchestrator Lambda +
 `config/*`) and a **fleet + eval-infra** (14 runtime agents + evaluator config +
@@ -287,7 +287,8 @@ phases:
       # ── Target 2: config/blueprints → S3 (agents.json MERGED, never cp'd) ──
       - aws s3 sync blueprints/ "s3://$ARTIFACT_BUCKET/blueprints/"
       - aws s3 sync deploy/runtime-agent/prompts/ "s3://$ARTIFACT_BUCKET/prompts/"
-      - aws s3 cp src/config/workflows.json "s3://$ARTIFACT_BUCKET/config/workflows.json"
+      # workflows.json + pricing.json ship via the manifest S3CP loop (TEAM-4259 —
+      # this used to be an unconditional cp, outside surfaces.json)
       - aws s3 cp "s3://$ARTIFACT_BUCKET/config/agents.json" /tmp/agents-s3.json
       - python3 deploy/pipeline/merge-agents-json.py   # extracted from DEPLOY.md's inline block
       - aws s3 cp /tmp/agents-merged.json "s3://$ARTIFACT_BUCKET/config/agents.json"

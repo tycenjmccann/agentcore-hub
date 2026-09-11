@@ -7,8 +7,9 @@
 # invisible to the pipeline and drifts behind main until someone notices — the
 # 2026-09-04 audit found eight surfaces 1-7 days behind for exactly that reason.
 #
-# This gate fails CI when any tracked file under lambda/ or deploy/ is covered by
-# no manifest entry: add it as a surface, list it under `handoff` (infra script a
+# This gate fails CI when any tracked file under lambda/, deploy/, or any tracked
+# src/config/*.json (the live S3 config surfaces — TEAM-4259) is covered by no
+# manifest entry: add it as a surface, list it under `handoff` (infra script a
 # human runs), or add it to `excluded` with a reason.
 set -euo pipefail
 cd "$(dirname "$0")/.."

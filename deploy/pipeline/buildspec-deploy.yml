@@ -166,7 +166,6 @@ phases:
         echo "Target 2/3 config + blueprints to S3"
         aws s3 sync blueprints/ "s3://$ARTIFACT_BUCKET/blueprints/"
         aws s3 sync deploy/runtime-agent/prompts/ "s3://$ARTIFACT_BUCKET/prompts/" || true
-        aws s3 cp src/config/workflows.json "s3://$ARTIFACT_BUCKET/config/workflows.json"
         # CD registry (which repos the hub merges + deploys): the S3 copy is the
         # LIVE document (edited in the UI / scripts/cd-registry.sh) — only seed it
         # when absent, never clobber it. Absent + unseeded = every repo is HANDOFF.
@@ -180,8 +179,12 @@ phases:
         python3 deploy/pipeline/merge-agents-json.py /tmp/agents-s3.json src/config/agents.json /tmp/agents-merged.json
         aws s3 cp /tmp/agents-merged.json "s3://$ARTIFACT_BUCKET/config/agents.json"
         # Manifest S3 surfaces (WM toolkit/skills, routine-builder toolkit,
-        # pricing.json). Extra args are the same --delete/--exclude each surface's
-        # deploy.sh uses; set -f keeps the exclude glob literal.
+        # pricing.json, workflows.json). Extra args are the same --delete/--exclude
+        # each surface's deploy.sh uses; set -f keeps the exclude glob literal.
+        # TEAM-4259: workflows.json used to be an unconditional `aws s3 cp` above,
+        # outside the manifest — so surfaces.json did not record that this path
+        # deploys and check-deploy-surfaces.sh could not see the gap. It is an s3[]
+        # entry now: one deploy path, guarded exactly like pricing.json.
         while IFS=$'\t' read -r KIND SRC DST EXTRA <&3; do
           case "$KIND" in
             S3SYNC) set -f; aws s3 sync "$SRC" "s3://$ARTIFACT_BUCKET/$DST" $EXTRA --only-show-errors; set +f; echo "  synced $SRC → $DST" ;;
