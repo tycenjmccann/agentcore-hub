@@ -199,14 +199,16 @@ set -e
 probe() {
   d="$1"; mkdir -p "$d/.fsprobe"; cd "$d/.fsprobe"
   s=$(date +%s.%N); dd if=/dev/zero of=bulk bs=1M count=1024 conv=fsync status=none; e=$(date +%s.%N)
-  bulk=$(echo "$e - $s" | bc)
+  bulk=$(awk "BEGIN{printf \"%.3f\", $e - $s}")
   s=$(date +%s.%N); for i in $(seq 1 2000); do echo x > f$i; done; sync; e=$(date +%s.%N)
-  small=$(echo "$e - $s" | bc)
+  small=$(awk "BEGIN{printf \"%.3f\", $e - $s}")
   s=$(date +%s.%N); rm -rf "$d/.fsprobe"; e=$(date +%s.%N)
-  rmt=$(echo "$e - $s" | bc)
+  rmt=$(awk "BEGIN{printf \"%.3f\", $e - $s}")
   echo "$d bulk_1GiB_s=$bulk small_2000_s=$small rm_s=$rmt"
 }
-probe MOUNT
+# The volume root is nobody:agentcore-runtime-user and the command shell lacks that
+# group; main.py (which carries it) creates sessions/ owned by our uid, so probe there.
+probe MOUNT/sessions
 probe /tmp
 findmnt -no SOURCE,FSTYPE,OPTIONS MOUNT || true
 """.replace("MOUNT", MOUNT)
