@@ -1316,9 +1316,11 @@ function parseBuildIdProject(buildId) {
   return value.split(":")[0] || null;
 }
 
-/** Is `resolved` (a build's resolvedSourceVersion) the commit `sha` names? Same
- * prefix rule get_build_status matches on, but restricted to hex values so a
- * short branch name can never prefix-match a SHA. */
+/** Is `resolved` (a build's resolvedSourceVersion, or the sourceVersion it was
+ * STARTED with) the commit `sha` names? Same prefix rule get_build_status matches
+ * on, but restricted to hex values so a short branch name can never prefix-match a
+ * SHA -- which is what makes it safe to run against a REQUESTED ref too, as the
+ * ledger below now does (TEAM-4462 F2). */
 function commitMatches(resolved, sha) {
   const r = String(resolved || "").toLowerCase();
   if (!/^[0-9a-f]{7,40}$/.test(r)) return false;
@@ -1333,6 +1335,13 @@ function commitMatches(resolved, sha) {
 // source_version). The carve-out below gives the flake exactly ONE retry and makes
 // everything else a structural refusal, with the cap enforced here rather than by
 // agent judgement.
+//
+// TEAM-4462 F2: the ledger keys on resolvedSourceVersion OR, when CodeBuild never got
+// far enough to set one, the sourceVersion the build was STARTED with. Two of the four
+// retryable phases below (PROVISIONING, DOWNLOAD_SOURCE) die BEFORE the source is
+// resolved, so keying on resolvedSourceVersion alone made exactly those builds
+// invisible to the ledger -- attempts stayed 0, every call was a plain first start, and
+// the cap this carve-out exists to enforce could not hold for them.
 
 /** Phases that run BEFORE the buildspec's own commands can fail on the caller's
  * code. A death here is the container/network/apt, not the diff. */
@@ -1380,6 +1389,10 @@ export function classifyPriorBuild(build) {
  * newest failure needs no extra API call and no extra IAM). BatchGetBuilds does not
  * promise input order, so the ids (which ARE newest-first) drive the walk.
  *
+ * Attribution keys on resolvedSourceVersion, or -- when CodeBuild never resolved the
+ * ref (a PROVISIONING/DOWNLOAD_SOURCE death) -- on the sourceVersion the build was
+ * STARTED with. The three rules are stated inline below (TEAM-4462 F2).
+ *
  * Pre-D2 this returned only the newest IN_PROGRESS/SUCCEEDED build, because a
  * FAILED build was simply not a reuse. The whole list is now the point: its LENGTH
  * is the attempt count the retry cap is enforced against. */
@@ -1397,13 +1410,46 @@ async function findBuildsForCommit(cb, project, sha, scan = BUILD_SCAN_WINDOW) {
 
   const { builds } = await cb.send(new BatchGetBuildsCommand({ ids }));
   const byId = new Map((builds || []).filter((b) => b?.id).map((b) => [b.id, b]));
-  const matched = [];
-  for (const id of ids) {
-    const build = byId.get(id);
-    if (!build || !commitMatches(build.resolvedSourceVersion, sha)) continue;
-    matched.push(build);
+  // A build belongs to `sha` when EITHER
+  //  (i)   its resolvedSourceVersion is the sha -- authoritative whenever present;
+  //  (ii)  it has NO resolvedSourceVersion and was STARTED for this exact sha
+  //        (start_ci_build sends `sha` as sourceVersion whenever source_version is
+  //        omitted). commitMatches is hex-only, so a `pr/<n>` or a branch name can
+  //        never land here; or
+  //  (iii) it has NO resolvedSourceVersion, was started with a NON-hex ref, and an
+  //        OLDER build in this ledger resolved to `sha` from the IDENTICAL ref. The
+  //        retry path pins effectiveSourceVersion = retry.prior.sourceVersion, so an
+  //        r1 retry that died pre-resolve sits directly above its prior carrying the
+  //        same ref -- attributing it is exact, not a guess, and it is what makes the
+  //        cap hold for pr/<n> callers too.
+  //
+  // The residual, stated honestly rather than papered over: a FIRST-attempt build
+  // started with a pr/<n> or branch ref that dies before resolve has nothing to
+  // attribute it by, so it stays invisible (bounded only by the ~5-min idempotency-
+  // token dedupe). A caller who wants the full cap on a fresh SHA omits source_version
+  // and lets the bare sha be the ref.
+  //
+  // Walked OLDEST -> NEWEST so rule (iii) can only ever look DOWN the list, at builds
+  // strictly older than the unresolved one: a NEWER build resolving `pr/<n>` to this
+  // sha says nothing about what that ref pointed at earlier. Reversed at the end so the
+  // result stays in newest-first `ids` order -- the retry decision reads priorBuilds[0].
+  const provenRefs = new Set();
+  const oldestFirst = [];
+  for (let i = ids.length - 1; i >= 0; i--) {
+    const build = byId.get(ids[i]);
+    if (!build) continue;
+    const ref = String(build.sourceVersion ?? "").trim();
+    if (commitMatches(build.resolvedSourceVersion, sha)) {
+      if (ref) provenRefs.add(ref); // (iii)'s evidence, for the builds above this one
+      oldestFirst.push(build);
+      continue;
+    }
+    // Resolved to something else entirely -> not this sha, whatever it was started as.
+    if (String(build.resolvedSourceVersion ?? "").trim()) continue;
+    if (!ref) continue;
+    if (commitMatches(ref, sha) || provenRefs.has(ref)) oldestFirst.push(build);
   }
-  return matched;
+  return oldestFirst.reverse();
 }
 
 // ─── capabilities ─────────────────────────────────────────────────────────────

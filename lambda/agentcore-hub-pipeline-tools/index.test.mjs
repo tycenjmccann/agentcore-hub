@@ -67,6 +67,14 @@
  * retry that collides with a concurrent caller (the token or sourceVersion being
  * derived from args instead of from the prior build — SR-3.2). It also tightens
  * three pre-D2 cases on purpose, each labelled at its assertion.
+ *
+ * TEAM-4462 F2 fixes the ledger's blind spot: it keyed on resolvedSourceVersion, which
+ * CodeBuild only sets once the ref is RESOLVED, so PROVISIONING/DOWNLOAD_SOURCE deaths —
+ * two of the four phases D2 treats as retryable — were invisible and the cap could not
+ * hold for them. Section (r) covers it, and the diedAt() fixture no longer hard-codes
+ * resolvedSourceVersion: it derives the key from the phase, so the two pre-existing
+ * PROVISIONING/DOWNLOAD_SOURCE cases now pass because of the FIX rather than because the
+ * fixture asserted the code's own assumption.
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
 // Section 8.10 asserts on the SOURCE of index.mjs, not on its behaviour: no
@@ -989,7 +997,15 @@ describe("start_ci_build retry ledger (TEAM-4448 D2)", () => {
   }
 
   /** A build that got as far as `deadPhase` and died there. Everything before it
-   * SUCCEEDED, which is what makes "the FIRST bad phase is the cause" meaningful. */
+   * SUCCEEDED, which is what makes "the FIRST bad phase is the cause" meaningful.
+   *
+   * TEAM-4462 F2: whether the build carries a resolvedSourceVersion is DERIVED from
+   * the phase it died in, not hard-coded. CodeBuild sets resolvedSourceVersion only
+   * once it has RESOLVED the ref, which happens in DOWNLOAD_SOURCE — so a build that
+   * died in PROVISIONING, or in DOWNLOAD_SOURCE itself, carries none at all, only the
+   * sourceVersion it was STARTED with. The pre-4462 fixture set resolvedSourceVersion
+   * unconditionally and therefore asserted the ledger's own wrong assumption, which is
+   * how the blind spot for exactly those two retryable phases went unnoticed. */
   function diedAt(id, deadPhase, buildStatus = "FAILED", extra = {}) {
     const order = [
       "SUBMITTED",
@@ -1007,10 +1023,13 @@ describe("start_ci_build retry ledger (TEAM-4448 D2)", () => {
     const pairs = order
       .slice(0, cut + 1)
       .map((p) => [p, p === deadPhase ? buildStatus : "SUCCEEDED"]);
+    const resolvedBeforeDeath = cut > order.indexOf("DOWNLOAD_SOURCE");
     return {
       id,
       buildStatus,
-      resolvedSourceVersion: SHA,
+      // Resolved deaths keep NO sourceVersion, so "no prior sourceVersion at all →
+      // the caller's value" below still exercises that fallback.
+      ...(resolvedBeforeDeath ? { resolvedSourceVersion: SHA } : { sourceVersion: SHA }),
       phases: phases(pairs),
       ...extra,
     };
@@ -1482,6 +1501,166 @@ describe("start_ci_build retry ledger (TEAM-4448 D2)", () => {
     ]);
     // Deployment-wide, not per target: the cap is a property of this code.
     expect(h.state.cbCalls).toEqual([]);
+  });
+
+  // ── (r) TEAM-4462 F2: a build that died BEFORE resolve still counts ──────────
+  //
+  // The ledger used to key ONLY on resolvedSourceVersion, which CodeBuild populates
+  // once it has resolved the ref. PROVISIONING and DOWNLOAD_SOURCE deaths carry none,
+  // so the two phases INFRA_RETRY_PHASES deliberately covers were invisible: attempts
+  // stayed 0, every call was a plain first start with token `ci-<sha>`, and
+  // capabilities.ciRetry.maxBuildsPerSha: 2 could not hold for them. `unresolved()`
+  // builds a death with NO resolvedSourceVersion key at all — the CodeBuild contract.
+
+  /** A build that died pre-resolve: no resolvedSourceVersion, only the ref it was
+   * STARTED with. `ref` defaults to the sha (what start_ci_build sends when the caller
+   * omits source_version). */
+  function unresolved(id, deadPhase, buildStatus = "FAILED", ref = SHA) {
+    const build = diedAt(id, deadPhase, buildStatus, { sourceVersion: ref });
+    delete build.resolvedSourceVersion;
+    return build;
+  }
+
+  it("(a) a PROVISIONING death with NO resolvedSourceVersion is counted → retry granted", async () => {
+    ledger([unresolved("b-prov", "PROVISIONING", "FAULT")]);
+
+    const out = await invoke("start_ci_build", { commit_sha: SHA });
+
+    expect(startBuilds().length).toBe(1);
+    // Still the 3-key allow-list, and the retry token — not a plain first start.
+    expect(startBuilds()[0].input).toEqual({
+      projectName: "agentcore-hub-ci",
+      sourceVersion: SHA,
+      idempotencyToken: `ci-${SHA}-r1`,
+    });
+    expect(out).toMatchObject({
+      ok: true,
+      started: true,
+      retry: true,
+      retry_reason: "infra_install_failure",
+      prior_build_id: "b-prov",
+      prior_failed_phase: "PROVISIONING",
+      attempts: 1,
+    });
+  });
+
+  it("(b) two pre-resolve deaths → the cap HOLDS: install_flake_retry_failed, attempts 2", async () => {
+    // The defect in one line: before F2 this was attempts=0 and started a THIRD build.
+    ledger([
+      unresolved("b-dl-2", "DOWNLOAD_SOURCE", "TIMED_OUT"),
+      unresolved("b-prov-1", "PROVISIONING", "FAULT"),
+    ]);
+
+    const out = await invoke("start_ci_build", { commit_sha: SHA });
+
+    expect(startBuilds()).toEqual([]);
+    expect(out).toMatchObject({
+      ok: false,
+      reason: "install_flake_retry_failed",
+      attempts: 2,
+      prior_build_id: "b-dl-2", // the NEWEST, so the agent reads the latest log
+      prior_failed_phase: "DOWNLOAD_SOURCE",
+    });
+  });
+
+  it("(c) an unresolved pr/<n> death with no older resolved same-ref build is NOT attributed", async () => {
+    // The documented residual: a FIRST attempt started with pr/12 that dies pre-resolve
+    // has nothing to attribute it by, so it stays invisible — a plain first start.
+    ledger([unresolved("b-pr-only", "PROVISIONING", "FAULT", "pr/12")]);
+
+    const out = await invoke("start_ci_build", { commit_sha: SHA });
+
+    expect(startBuilds().length).toBe(1);
+    expect(startBuilds()[0].input.idempotencyToken).toBe(`ci-${SHA}`);
+    expect(out).toMatchObject({ ok: true, started: true });
+    expect(out.retry).toBeUndefined();
+    expect(out.attempts).toBeUndefined();
+  });
+
+  it("(d) an unresolved pr/<n> retry ABOVE its resolved pr/<n> prior IS attributed", async () => {
+    // Rule (iii): the retry path pins sourceVersion to the prior's, so an r1 that died
+    // pre-resolve sits directly above a build that PROVED pr/12 resolves to this sha.
+    ledger([
+      unresolved("b-r1", "PROVISIONING", "FAULT", "pr/12"),
+      diedAt("b-first", "INSTALL", "FAILED", { sourceVersion: "pr/12" }),
+    ]);
+
+    const out = await invoke("start_ci_build", { commit_sha: SHA });
+
+    expect(startBuilds()).toEqual([]);
+    expect(out).toMatchObject({
+      ok: false,
+      reason: "install_flake_retry_failed",
+      attempts: 2,
+      prior_build_id: "b-r1",
+    });
+  });
+
+  it("(d') rule (iii) only looks at OLDER builds — a NEWER resolved same-ref build proves nothing", async () => {
+    // pr/12 pointed at a DIFFERENT commit when the older build was started; a newer
+    // build resolving pr/12 to this sha must not retro-attribute it. Otherwise this
+    // sha's legitimate first retry would be refused.
+    ledger([
+      diedAt("b-new", "INSTALL", "FAILED", { sourceVersion: "pr/12" }),
+      unresolved("b-old", "PROVISIONING", "FAULT", "pr/12"),
+    ]);
+
+    const out = await invoke("start_ci_build", { commit_sha: SHA });
+
+    // attempts 1 (the resolved build only) → the retry is still available.
+    expect(out).toMatchObject({ ok: true, retry: true, prior_build_id: "b-new", attempts: 1 });
+  });
+
+  it("(e) an unresolved death started for a DIFFERENT hex sha is NOT attributed", async () => {
+    ledger([
+      unresolved("b-other", "PROVISIONING", "FAULT", "1111111111111111111111111111111111111111"),
+    ]);
+
+    const out = await invoke("start_ci_build", { commit_sha: SHA });
+
+    expect(startBuilds().length).toBe(1);
+    expect(startBuilds()[0].input.idempotencyToken).toBe(`ci-${SHA}`);
+    expect(out.retry).toBeUndefined();
+  });
+
+  it("(f) an unresolved IN_PROGRESS build for the sha is REUSED, not duplicated", async () => {
+    // Consequence of the same fix: a build still sitting in PROVISIONING for this sha
+    // is genuinely live. Pre-F2 it was invisible, so the caller started a second one.
+    ledger([
+      { id: "b-provisioning", buildStatus: "IN_PROGRESS", sourceVersion: SHA },
+    ]);
+
+    const out = await invoke("start_ci_build", { commit_sha: SHA });
+
+    expect(startBuilds()).toEqual([]);
+    expect(out).toMatchObject({
+      ok: true,
+      reused: true,
+      buildId: "b-provisioning",
+      buildStatus: "IN_PROGRESS",
+      // Shape unchanged: null, because CodeBuild has not resolved the ref yet.
+      resolvedSourceVersion: null,
+    });
+  });
+
+  it("(g) the ledger stays newest-first: a resolved BUILD death above an unresolved flake decides", async () => {
+    // Guards the oldest-first walk's reverse(): priorBuilds[0] must remain the NEWEST
+    // build, or an older infra flake would re-open the door after a code failure.
+    ledger([
+      diedAt("b-code", "BUILD"),
+      unresolved("b-flake", "PROVISIONING", "FAULT"),
+    ]);
+
+    const out = await invoke("start_ci_build", { commit_sha: SHA });
+
+    expect(startBuilds()).toEqual([]);
+    expect(out).toMatchObject({
+      ok: false,
+      reason: "build_failed_not_retryable",
+      prior_build_id: "b-code",
+      prior_failed_phase: "BUILD",
+      attempts: 2,
+    });
   });
 });
 

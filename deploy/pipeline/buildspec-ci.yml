@@ -60,11 +60,22 @@ phases:
       #
       # No baked browser => the managed image => the legacy path, unchanged.
       # Deliberately NO `|| true` on either -- a missing browser must fail the build.
+      #
+      # TEAM-4462 F1: the baked branch needs an EXPLICIT exit to keep that promise.
+      # This is a `- |` block under `env.shell: bash` with no `set -e`, so the block's
+      # status is its LAST statement's -- the drift `if`, which returns 0 whenever the
+      # revision set is unchanged. A failed CDN download was therefore swallowed here
+      # and resurfaced in BUILD as "Executable doesn't exist", which start_ci_build's
+      # D2 ledger reads as a CODE failure (build_failed_not_retryable) -- laundering an
+      # infra flake into a verdict on the diff. A bare `set -e` is NOT the fix:
+      # CodeBuild runs every command of a build in ONE shared shell, so it would change
+      # the semantics of every later pre_build/build/post_build command. The legacy
+      # branch below needs no guard -- `npx` IS its last statement.
       - |
         if [ -n "${PLAYWRIGHT_BROWSERS_PATH:-}" ] && ls -d "${PLAYWRIGHT_BROWSERS_PATH}"/chromium-* >/dev/null 2>&1; then
           echo "playwright: baked chromium present ($(ls -d "${PLAYWRIGHT_BROWSERS_PATH}"/chromium-* | head -1)) - no apt, no CDN"
           before="$(ls -d "${PLAYWRIGHT_BROWSERS_PATH}"/chromium-* | sort | tr '\n' ' ')"
-          npx playwright install chromium
+          npx playwright install chromium || { echo "playwright: install chromium FAILED on the baked image - the CDN download is mandatory once the baked revision drifted"; exit 1; }
           after="$(ls -d "${PLAYWRIGHT_BROWSERS_PATH}"/chromium-* | sort | tr '\n' ' ')"
           if [ "$before" != "$after" ]; then
             echo "WARNING playwright: baked chromium revision drifted — run ./deploy/pipeline/deploy.sh to rebuild deploy/pipeline/ci-image (CDN download happened this build)"
