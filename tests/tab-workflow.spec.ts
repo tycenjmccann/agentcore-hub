@@ -375,6 +375,52 @@ async function selectSdlcWorkflow(page: Page, title: string) {
 }
 
 test.describe("SDLC framework badge (TEAM-4408)", () => {
+  test.beforeEach(async ({ page }) => {
+    // Catch-all FIRST, before any test body registers its specific mocks:
+    // Playwright checks the most-recently-registered matching route first, so
+    // registering this now (oldest) and the specific mocks later (newer) means
+    // an unmocked — or a future, not-yet-mocked — API call is fulfilled with a
+    // neutral empty body instead of ever reaching the live backend, while the
+    // specific mocks still win for the URLs they cover.
+    await page.route("**/api/**", (r) =>
+      r.fulfill({ status: 200, contentType: "application/json", body: "{}" }));
+
+    // PerformanceCard mounts unconditionally in the pre-selection empty state
+    // (briefly visible between goto("/workflow") and clicking the row) and
+    // renders detail sections keyed off view.totals.runs — a bare "{}" from
+    // the catch-all above satisfies its `res.ok` check but leaves totals.runs
+    // undefined, which crashes the whole page. Give it a real empty FleetView
+    // (totals.runs: 0) so the catch-all's fallback doesn't take down rendering.
+    await page.route("**/api/workflow/performance**", (r) =>
+      r.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          window: { days: 7, start: "", end: "", priorStart: "", baselineStart: "" },
+          workflowDefId: "all",
+          defIds: [],
+          runs: [],
+          priorRuns: 0,
+          kpis: [],
+          agents: [],
+          engines: {},
+          totals: { runs: 0, cost: 0, persona: 0, coding: 0, tokens: 0, cacheRead: 0, cacheWrite: 0, agentWorkMs: 0, wallMs: 0, loops: 0, reworkRounds: 0 },
+          infra: null,
+          infraPerRun: null,
+          status: "insufficient",
+          anomalies: [],
+          indexUpdatedAt: null,
+        }),
+      }));
+
+    // Dark mode, reproducing the app's own persistence mechanism (theme-provider.tsx /
+    // layout.tsx boot script: localStorage "theme" + data-theme on <html>) rather than
+    // a Playwright-only shortcut, so the screenshots match what a real dark-mode user sees.
+    await page.addInitScript(() => {
+      localStorage.setItem("theme", "dark");
+    });
+  });
+
   test("a run with no sdlcFramework overlay shows no STANDARD badge, in the list or the header", async ({ page }) => {
     const workflowId = "wf-sdlc-standard-4408";
     const title = "Operator run — no overlay";
