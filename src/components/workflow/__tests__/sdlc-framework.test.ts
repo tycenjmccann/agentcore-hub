@@ -1,11 +1,12 @@
 import { describe, it, expect } from 'vitest';
 import {
   resolveSdlcFramework,
+  sdlcBadgeFor,
   SDLC_BADGE_META,
 } from '@/lib/workflow/sdlc-framework';
 import type { WorkflowState } from '@/lib/workflow/types';
 
-describe('SDLC framework helper (TEAM-3048)', () => {
+describe('SDLC framework helper (TEAM-3048 / TEAM-4408)', () => {
   // ─── resolveSdlcFramework — normalization ─────────────────────────────────
 
   describe('resolveSdlcFramework', () => {
@@ -48,11 +49,16 @@ describe('SDLC framework helper (TEAM-3048)', () => {
     });
   });
 
-  // ─── SDLC_BADGE_META — copy of record ──────────────────────────────────────
+  // ─── sdlcBadgeFor / SDLC_BADGE_META (TEAM-4408) ─────────────────────────────
+  // "standard" is the absence of an overlay, not a framework — it must not be
+  // badge-worthy. SDLC_BADGE_META only carries the two real overlays.
 
   describe('SDLC_BADGE_META', () => {
+    it('has exactly the playbook and aidlc keys — no "standard" entry', () => {
+      expect(Object.keys(SDLC_BADGE_META).sort()).toEqual(['aidlc', 'playbook']);
+    });
+
     it('has the correct labels', () => {
-      expect(SDLC_BADGE_META.standard.label).toBe('STANDARD');
       expect(SDLC_BADGE_META.playbook.label).toBe('PLAYBOOK');
       expect(SDLC_BADGE_META.aidlc.label).toBe('AI-DLC');
     });
@@ -83,6 +89,27 @@ describe('SDLC framework helper (TEAM-3048)', () => {
     });
   });
 
+  describe('sdlcBadgeFor', () => {
+    it('returns null for "standard" — no overlay means no badge', () => {
+      expect(sdlcBadgeFor('standard')).toBeNull();
+    });
+
+    it('returns the playbook badge meta for "playbook"', () => {
+      expect(sdlcBadgeFor('playbook')?.label).toBe('PLAYBOOK');
+    });
+
+    it('returns the aidlc badge meta for "aidlc"', () => {
+      expect(sdlcBadgeFor('aidlc')?.label).toBe('AI-DLC');
+    });
+
+    it('composes with resolveSdlcFramework: no raw value → no badge', () => {
+      expect(sdlcBadgeFor(resolveSdlcFramework(undefined))).toBeNull();
+      expect(sdlcBadgeFor(resolveSdlcFramework(null))).toBeNull();
+      expect(sdlcBadgeFor(resolveSdlcFramework(''))).toBeNull();
+      expect(sdlcBadgeFor(resolveSdlcFramework('standard'))).toBeNull();
+    });
+  });
+
   // ─── Type-level fixture — both shapes compile ──────────────────────────────
 
   describe('WorkflowState fixture compatibility', () => {
@@ -103,22 +130,22 @@ describe('SDLC framework helper (TEAM-3048)', () => {
       startedAt: '2026-08-27T00:00:00Z',
     };
 
-    it('a state with sdlcFramework: "aidlc" compiles and yields the AI-DLC label', () => {
+    it('a state with sdlcFramework: "aidlc" compiles and yields the AI-DLC badge', () => {
       const withField: WorkflowState = { ...base, sdlcFramework: 'aidlc' };
       const fw = resolveSdlcFramework(withField.sdlcFramework ?? withField.input?.sdlcFramework);
-      expect(SDLC_BADGE_META[fw].label).toBe('AI-DLC');
+      expect(sdlcBadgeFor(fw)?.label).toBe('AI-DLC');
     });
 
-    it('a state without the field compiles and defaults to the STANDARD label', () => {
+    it('a state without the field compiles and yields NO badge', () => {
       const withoutField: WorkflowState = { ...base };
       const fw = resolveSdlcFramework(withoutField.sdlcFramework ?? withoutField.input?.sdlcFramework);
-      expect(SDLC_BADGE_META[fw].label).toBe('STANDARD');
+      expect(sdlcBadgeFor(fw)).toBeNull();
     });
 
-    it('a state with sdlcFramework: "playbook" yields the PLAYBOOK label', () => {
+    it('a state with sdlcFramework: "playbook" yields the PLAYBOOK badge', () => {
       const playbook: WorkflowState = { ...base, sdlcFramework: 'playbook' };
       const fw = resolveSdlcFramework(playbook.sdlcFramework ?? playbook.input?.sdlcFramework);
-      expect(SDLC_BADGE_META[fw].label).toBe('PLAYBOOK');
+      expect(sdlcBadgeFor(fw)?.label).toBe('PLAYBOOK');
     });
   });
 });

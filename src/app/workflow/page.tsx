@@ -9,7 +9,7 @@ import PerformanceCard from "@/components/workflow/PerformanceCard";
 import { type WorkflowState, type WorkflowInput, type HumanNotification, isTerminalPhase } from "@/lib/workflow/types";
 import { mergeCommitOf, isAwaitingHuman, waitingApprovalShas } from "@/lib/workflow/deploy-gate";
 import { WORKFLOW_DEFS, DEFAULT_WORKFLOW_DEF_ID, getWorkflowDef } from "@/lib/workflow/workflow-defs";
-import { resolveSdlcFramework, SDLC_BADGE_META } from "@/lib/workflow/sdlc-framework";
+import { resolveSdlcFramework, sdlcBadgeFor } from "@/lib/workflow/sdlc-framework";
 import DeleteConfirmationModal from "@/components/workflow/DeleteConfirmationModal";
 
 interface WorkflowSummary {
@@ -727,6 +727,7 @@ function WorkflowListItem({
   const def = getWorkflowDef(workflow.workflowDefId);
   const defLabel = def.displayName || def.name;
   const fw = resolveSdlcFramework(workflow.sdlcFramework);
+  const sdlcBadge = sdlcBadgeFor(fw);
 
   return (
     <div
@@ -834,7 +835,9 @@ function WorkflowListItem({
               >
                 {defLabel}
               </span>
-              <span className={SDLC_BADGE_META[fw].listClassName} title={SDLC_BADGE_META[fw].tooltip} aria-label={SDLC_BADGE_META[fw].tooltip}>{SDLC_BADGE_META[fw].label}</span>
+              {sdlcBadge && (
+                <span className={sdlcBadge.listClassName} title={sdlcBadge.tooltip} aria-label={sdlcBadge.tooltip}>{sdlcBadge.label}</span>
+              )}
             </span>
             {!isRunning && onDelete && (
               <button

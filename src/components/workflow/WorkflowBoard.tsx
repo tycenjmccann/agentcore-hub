@@ -12,7 +12,7 @@ import {
 import awsIcons from "@/lib/aws-icons.json";
 import { getPipelinePhases, resolveToolIcon, getPhaseToolCount, type PipelinePhaseConfig } from "@/lib/pipeline-config";
 import { DEFAULT_WORKFLOW_DEF_ID, getWorkflowDef } from "@/lib/workflow/workflow-defs";
-import { resolveSdlcFramework, SDLC_BADGE_META } from "@/lib/workflow/sdlc-framework";
+import { resolveSdlcFramework, sdlcBadgeFor } from "@/lib/workflow/sdlc-framework";
 import { applyAgentStatus, applyAgentComplete, shouldForceTicketDone } from "@/lib/workflow/board-state";
 import { isLivenessEvent, isDispatchEvent, computeStaleAgentIds, isStaleEligibleStatus, seedLastActivityByAgent, seedLastToolByAgent, staleThresholdFor } from "@/lib/workflow/stale";
 import { mergeCommitOf, matchDeployGate } from "@/lib/workflow/deploy-gate";
@@ -142,6 +142,7 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
   // hardcoded software-delivery pipeline.
   const workflowDefId = state?.input?.workflowDefId;
   const fw = resolveSdlcFramework(state?.sdlcFramework ?? state?.input?.sdlcFramework);
+  const sdlcBadge = sdlcBadgeFor(fw);
   const pipelinePhases = useMemo(() => getPipelinePhases(workflowDefId), [workflowDefId]);
   const phaseOrder = useMemo(() => buildPhaseOrder(pipelinePhases), [pipelinePhases]);
   // Refs so stable useCallback event handlers always see the current def's phases/order.
@@ -1464,9 +1465,11 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
           )}
 
           <div className={`pipeline-status-header ${isComplete ? "settled" : ""} ${(state.phase === "cancelled" || shipBlockedPhase) ? "cancelled" : ""}`}>
-            <span className={SDLC_BADGE_META[fw].boardClassName} title={SDLC_BADGE_META[fw].tooltip} aria-label={SDLC_BADGE_META[fw].tooltip}>
-              {SDLC_BADGE_META[fw].label}
-            </span>
+            {sdlcBadge && (
+              <span className={sdlcBadge.boardClassName} title={sdlcBadge.tooltip} aria-label={sdlcBadge.tooltip}>
+                {sdlcBadge.label}
+              </span>
+            )}
             {isComplete ? "Complete" : shipBlockedLabel ? shipBlockedLabel : state.phase === "cancelled" ? "Cancelled" : state.phase === "error" ? "Error" : `In Progress: ${
               // Phase "complete" with open fix-it tickets → name the phase still working
               (state.phase === "complete"
@@ -2049,7 +2052,6 @@ export const PIPELINE_STYLES = `
 .sdlc-badge{position:absolute;right:calc(100% + 10px);top:50%;transform:translateY(-50%);font-size:10px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;line-height:1;padding:3px 8px;border-radius:5px;border:1px solid currentColor;white-space:nowrap;transition:none}
 .sdlc-badge--playbook{color:var(--accent-fg);background:var(--accent-subtle)}
 .sdlc-badge--aidlc{color:var(--violet-fg);background:var(--violet-subtle)}
-.sdlc-badge--standard{color:var(--color-text-muted);background:var(--color-bg-tertiary)}
 
 .pipeline-canvas{position:relative;width:1720px;min-height:840px;margin-inline:auto}
 .pipeline-connectors{position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:10}
