@@ -164,9 +164,9 @@ describe("pipelineProjects", () => {
   it("threads a cross-account roleArn/externalId through", () => {
     const p = pipelineProjects({
       pipeline: "hub-juno-deploy", region: "us-west-2",
-      account: "023392223961", roleArn: "arn:aws:iam::023392223961:role/hub-cd-trigger-juno", externalId: "hub-cd-juno-xyz",
+      account: "123456789012", roleArn: "arn:aws:iam::123456789012:role/hub-cd-trigger-juno", externalId: "hub-cd-juno-xyz",
     });
-    expect(p.roleArn).toBe("arn:aws:iam::023392223961:role/hub-cd-trigger-juno");
+    expect(p.roleArn).toBe("arn:aws:iam::123456789012:role/hub-cd-trigger-juno");
     expect(p.externalId).toBe("hub-cd-juno-xyz");
     expect(p.region).toBe("us-west-2");
   });
@@ -181,8 +181,8 @@ describe("pipelineProjects", () => {
  */
 describe("cross-account CD fields", () => {
   const OK = {
-    account: "023392223961",
-    roleArn: "arn:aws:iam::023392223961:role/hub-cd-trigger-juno",
+    account: "123456789012",
+    roleArn: "arn:aws:iam::123456789012:role/hub-cd-trigger-juno",
     externalId: "hub-cd-juno-secret",
   };
   const parse1 = (extra) =>
@@ -201,7 +201,7 @@ describe("cross-account CD fields", () => {
     expect(e.externalId).toBeUndefined();
   });
   it("drops the triple when the role is not a hub-cd-trigger-* role", () => {
-    const e = parse1({ ...OK, roleArn: "arn:aws:iam::023392223961:role/AdminAccess" });
+    const e = parse1({ ...OK, roleArn: "arn:aws:iam::123456789012:role/AdminAccess" });
     expect(e.roleArn).toBeUndefined();
     expect(e.account).toBeUndefined();
   });

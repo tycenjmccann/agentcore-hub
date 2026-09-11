@@ -1945,8 +1945,8 @@ describe("cross-account CD (assume-role trigger)", () => {
         repo: "tycenjmccann/juno",
         pipeline: "hub-juno-deploy",
         region: "us-west-2",
-        account: "023392223961",
-        roleArn: "arn:aws:iam::023392223961:role/hub-cd-trigger-juno",
+        account: "123456789012",
+        roleArn: "arn:aws:iam::123456789012:role/hub-cd-trigger-juno",
         externalId: "hub-cd-juno-secret",
       },
       { repo: "tycenjmccann/agentcore-hub", pipeline: "agentcore-hub-deploy", region: "us-east-1" },
@@ -1974,7 +1974,7 @@ describe("cross-account CD (assume-role trigger)", () => {
     // anything from the caller's args.
     expect(h.state.stsCalls).toHaveLength(1);
     expect(h.state.stsCalls[0].input).toMatchObject({
-      RoleArn: "arn:aws:iam::023392223961:role/hub-cd-trigger-juno",
+      RoleArn: "arn:aws:iam::123456789012:role/hub-cd-trigger-juno",
       ExternalId: "hub-cd-juno-secret",
       RoleSessionName: "hub-pipeline-tools",
     });
@@ -2004,6 +2004,6 @@ describe("cross-account CD (assume-role trigger)", () => {
     expect(cbInit.region).toBe("us-west-2");
     expect(cbInit.hasCreds).toBe(true);
     expect(h.state.stsCalls.length).toBeGreaterThanOrEqual(1);
-    expect(h.state.stsCalls[0].input.RoleArn).toBe("arn:aws:iam::023392223961:role/hub-cd-trigger-juno");
+    expect(h.state.stsCalls[0].input.RoleArn).toBe("arn:aws:iam::123456789012:role/hub-cd-trigger-juno");
   });
 });
