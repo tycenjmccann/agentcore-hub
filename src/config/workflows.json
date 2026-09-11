@@ -260,7 +260,7 @@
       "icon": "Zap",
       "intakeAgentId": "agentcore_hub_operator",
       "requiresRepo": true,
-      "featureBranchPhase": "development",
+      "featureBranchPhase": null,
       "createsPullRequest": true,
       "completionRequiresAgentPhases": [
         "development",
