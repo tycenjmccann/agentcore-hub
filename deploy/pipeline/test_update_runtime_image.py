@@ -44,11 +44,13 @@ def test_strips_require_service_s3_endpoint_but_keeps_vpc_wiring():
 
 
 def test_only_image_changes_and_output_fields_are_not_echoed():
-    kw = uri._update_kwargs_from_live(_live_vpc(), NEW)
+    live = _live_vpc()
+    kw = uri._update_kwargs_from_live(live, NEW)
     assert kw["agentRuntimeArtifact"]["containerConfiguration"]["containerUri"] == NEW
     assert kw["agentRuntimeId"] == "rt-1"
     for preserved in uri._PRESERVED:
-        assert preserved in kw
+        # a microVM runtime has no capacityProviderConfiguration — only echo what is live
+        assert (preserved in kw) == (preserved in live)
     assert kw["environmentVariables"] == {"MEMORY_ID": "m", "GITHUB_PAT": "secret"}
     assert kw["lifecycleConfiguration"]["maxLifetime"] == 28800
     for output_only in ("agentRuntimeArn", "status", "agentRuntimeVersion"):
@@ -136,3 +138,18 @@ def test_smoke_treats_a_body_with_no_marker_as_failure(monkeypatch):
     _patch(monkeypatch, client)
     with pytest.raises(SystemExit):
         uri._smoke("us-east-1", "arn:rt", "agentcore_hub_agent", attempts=3)
+
+
+def test_instances_runtime_keeps_capacity_provider_and_has_no_network_block():
+    live = _live_vpc()
+    del live["networkConfiguration"]
+    del live["filesystemConfigurations"]
+    live["capacityProviderConfiguration"] = {
+        "capacityProviderId": "cp-1",
+        "volumeMounts": [{"name": "workspace", "mountPath": "/mnt/workspace"}],
+    }
+    kw = uri._update_kwargs_from_live(live, NEW)
+    assert kw["capacityProviderConfiguration"] == live["capacityProviderConfiguration"]
+    assert "networkConfiguration" not in kw
+    assert "filesystemConfigurations" not in kw
+    assert kw["agentRuntimeArtifact"]["containerConfiguration"]["containerUri"] == NEW
