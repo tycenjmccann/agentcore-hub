@@ -164,10 +164,40 @@ describe("validateCdEntryInput", () => {
 
   it("deployDoc: relative repo path, no leading slash, no .. segment, max 200 chars", () => {
     expect(validateCdEntryInput({ repo: "a/b", deployDoc: "docs/DEPLOY.md" })).toBeNull();
+    expect(validateCdEntryInput({ repo: "a/b", deployDoc: "DEPLOY.md" })).toBeNull();
+    // A dot IN a segment is not a traversal segment ("..foo" / "a..b" are names).
+    expect(validateCdEntryInput({ repo: "a/b", deployDoc: "docs/..deploy.md" })).toBeNull();
+    expect(validateCdEntryInput({ repo: "a/b", deployDoc: "x".repeat(200) })).toBeNull();
     expect(validateCdEntryInput({ repo: "a/b", deployDoc: "/etc/passwd" })).toEqual({ deployDoc: "must be a relative path (no leading slash)" });
+    expect(validateCdEntryInput({ repo: "a/b", deployDoc: "\\etc\\passwd" })).toEqual({ deployDoc: "must be a relative path (no leading slash)" });
     expect(validateCdEntryInput({ repo: "a/b", deployDoc: "../../etc/passwd" })).toEqual({ deployDoc: "must not contain a .. path segment" });
     expect(validateCdEntryInput({ repo: "a/b", deployDoc: "a/../b" })).toEqual({ deployDoc: "must not contain a .. path segment" });
     expect(validateCdEntryInput({ repo: "a/b", deployDoc: "x".repeat(201) })).toEqual({ deployDoc: "must be at most 200 characters" });
+  });
+
+  it("deployDoc: a .. segment is caught however it is spelled — backslash, ./.., bare", () => {
+    // The segment split is on [\\/]+, so a Windows-style separator cannot hide a
+    // traversal from the check (the registry document is consumed by Linux
+    // Lambdas, but the value arrives from an operator's keyboard).
+    for (const bad of ["a\\..\\b", "..\\b", "./..", "docs/./../x", "..", "../", "a//../b"]) {
+      expect(validateCdEntryInput({ repo: "a/b", deployDoc: bad })).toEqual({ deployDoc: "must not contain a .. path segment" });
+    }
+  });
+
+  it("deployDoc: percent-encoding is refused outright, so an encoded .. cannot slip past", () => {
+    // TEAM-4416 review (P2): `%2e%2e/secrets` used to pass the segment check.
+    // A path inside a git repo never needs percent-encoding, so any `%` is
+    // rejected rather than decoded (one decode pass still leaves `%252e`).
+    for (const bad of ["%2e%2e/secrets", "%2E%2E/secrets", "..%2fsecrets", "%252e%252e/x", "docs/%2e%2e/DEPLOY.md", "a%20b/DEPLOY.md"]) {
+      expect(validateCdEntryInput({ repo: "a/b", deployDoc: bad })).toEqual({ deployDoc: "must not be percent-encoded" });
+    }
+  });
+
+  it("deployDoc: a trailing slash is accepted — it is a relative path, and none of the rules forbid it", () => {
+    // Pinned deliberately: the rule set is leading-slash / .. / length. A path
+    // that names a directory is an operator oddity, not a traversal, and
+    // upsertCdEntry stores it verbatim as it does today.
+    expect(validateCdEntryInput({ repo: "a/b", deployDoc: "docs/" })).toBeNull();
   });
 
   it("notes: max 2000 chars", () => {

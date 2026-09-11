@@ -208,6 +208,12 @@ export function validateCdEntryInput(body: unknown): Record<string, string> | nu
     if (trimmed && !fields.deployDoc) {
       if (trimmed.length > 200) fields.deployDoc = "must be at most 200 characters";
       else if (trimmed.startsWith("/") || trimmed.startsWith("\\")) fields.deployDoc = "must be a relative path (no leading slash)";
+      // A path in a git repo never needs percent-encoding, so `%` can only be an
+      // attempt to smuggle a separator or a `..` past the segment check below
+      // (`%2e%2e/x`, `..%2fx`). Rejected outright rather than decoded first:
+      // decodeURIComponent throws on malformed input and one pass still leaves
+      // double-encoded forms (`%252e`), so there is no safe single decode.
+      else if (trimmed.includes("%")) fields.deployDoc = "must not be percent-encoded";
       else if (trimmed.split(/[\\/]+/).includes("..")) fields.deployDoc = "must not contain a .. path segment";
     }
   }
