@@ -55,6 +55,7 @@ export async function POST(request: NextRequest) {
       createdAt: now,
       updatedAt: now,
       turns: [],
+      runtimeArn: process.env.CODING_AGENT_RUNTIME_ARN || undefined,
     };
     await putSession(session);
     return NextResponse.json({ session }, { status: 201 });

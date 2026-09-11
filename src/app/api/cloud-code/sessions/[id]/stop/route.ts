@@ -73,7 +73,7 @@ export async function POST(
     : [];
 
   try {
-    await stopCodingSession({ sessionId: session.sessionId, region });
+    await stopCodingSession({ sessionId: session.sessionId, runtimeArn: session.runtimeArn, region });
   } catch (err) {
     console.error("[cloud-code] stop error:", err);
     return NextResponse.json({ stopped: false, error: (err as Error).message }, { status: 200 });
@@ -133,6 +133,7 @@ export async function POST(
       const configVersion = await currentConfigVersion({ tenantId: sessionTenant, userId });
       await new Promise((r) => setTimeout(r, 1500));
       await prepareCodingSession({
+        runtimeArn: session.runtimeArn,
         sessionId: session.sessionId,
         cli: session.cli,
         userId,

@@ -74,6 +74,8 @@ resume = same runtimeSessionId  → same warm microVM + /mnt/workspace
 | `setup-coding-runtime-role.sh` | IAM execution role (Bedrock + Mantle + ECR + observability) |
 | `build-and-push.sh` | Build/push ARM64 image to ECR (account/region from `config.sh`) |
 | `deploy.py` | Create/update the runtime via the control API (session storage) |
+| `deploy-instances.py` | Create/update/`--delete` the **Instances twin** (`agentcore_hub_coding_runtime_ec2`): EC2 capacity provider + EBS-per-session, copied from the microVM runtime |
+| `probe-instances.py` | Go/no-go probe for the Instances twin (`cold`/`pin`/`fs`/`turn`/`persist`/`cleanup`/`show`) |
 | `invoke.py` | Headless client to fire/resume turns |
 | `log.py` | Structured JSON logging |
 
@@ -174,6 +176,63 @@ drives this for a laptop↔cloud handoff:
 - **pull** calls `checkpoint` → the runtime uploads the now-grown transcript to
   `…/cloud-code/checkpoint/<sid>/…`; the laptop downloads it and resumes locally.
 - Slug rule (must match Claude's): `re.sub(r'[^a-zA-Z0-9]','-', realpath(cwd))`.
+
+## Instances (EC2 + EBS) twin
+
+`deploy-instances.py` stands the same image up a second time on the AgentCore
+**Instances** compute type: an EC2 capacity provider (`agentcore_hub_coding_cp`,
+m7g.xlarge, coding VPC private subnets + existing SG, operator role with
+`BedrockAgentCoreRuntimeInstancesOperatorRolePolicy`) and runtime
+`agentcore_hub_coding_runtime_ec2` whose sessions each get one persistent gp3
+EBS volume (30 GiB, encrypted) mounted at `/mnt/workspace`. Image, execution
+role and env are copied from the microVM runtime (`/mnt/efs` paths rewritten,
+`WORKSPACE_MIRROR_ENABLED=0`). Idempotent create/update; `--delete` removes the
+runtime, then the capacity provider and every session/volume. Knobs are env
+vars documented in the script docstring (`CODING_INSTANCE_TYPES`,
+`CODING_VOLUME_GIB`, `CODING_VOLUME_SNAPSHOT_ID`, `CODING_IDLE_S`,
+`CODING_MAX_LIFETIME_S`, ...). Needs boto3 ≥ 1.43.9x — run from a venv if the
+system one is older.
+
+Why: measured on prod, `npm ci` 13 s vs 20-30 min on EFS, `tsc` 5 s vs 30-95 s,
+2 000 small-file creates 0.07 s vs 22.5 s (317x). Cold session (EC2 launch +
+image pull) p95 ~114 s; warm invoke 0.4 s; `StopRuntimeSession` → re-invoke
+5.5 s with the tree intact; idle-timeout re-attach lands on a new instance with
+the same volume (~85 s). The EFS mirror / deps-tarball tiers are not ported —
+they buy < 90 s per fresh session here. Seed the volume from a snapshot
+(`CODING_VOLUME_SNAPSHOT_ID`) if first-turn latency ever matters.
+
+Gotchas: the volume root is `nobody:agentcore-runtime-user` (setgid) — only
+`main.py` (PID 1) carries that group, so the command shell can only write under
+`sessions/`; the image has no `sudo`/`bc`. A stopped session's volume still
+bills until `DeleteCapacityProviderSession` — the session reaper's sweep does
+that (below).
+
+`probe-instances.py <phase>` measures each gate in isolation (`cold --n 5`,
+`pin`, `fs`, `turn --repo owner/name`, `persist`, `cleanup`, `show`); state
+under `.local-workspace/`. Always finish with `cleanup`.
+
+**Cutover** = env flip, not a redeploy: both runtimes stay up, every
+coding-session row records the `runtimeArn` it was minted on, and the fleet /
+hub read `CODING_AGENT_RUNTIME_ARN` to pick where *new* sessions go.
+```bash
+B="$(cat deploy/coding-agent-runtime/coding-runtime-instances-arn.txt)"
+python3 deploy/runtime-agent/set-runtime-env.py agentcore_hub_agent CODING_AGENT_RUNTIME_ARN="$B"   # fleet
+./deploy/ecs-express/set-env.sh CODING_AGENT_RUNTIME_ARN="$B"                                        # hub
+```
+Rollback = the same two commands with the microVM ARN. Rework on a session
+from the other runtime (or one whose compute was released) starts a fresh
+session instead of resuming.
+
+**Cleanup** — `deploy/session-reaper` sweep (EventBridge, 15 min): for every
+session row without `computeReleasedAt` whose workflow is finished (past a
+grace: 30 min Instances / 6 h EFS), whose workflow row is gone > 24 h, or a
+human Instances session idle > 14 d, it calls `DeleteCapacityProviderSession`
+(Instances) or stop + `purge` (EFS), picking the path from the runtime's
+`capacityProviderConfiguration`, and stamps `computeReleasedAt` /
+`computeRelease` / `computeReleaseReason`. Caps 100 CP / 20 purge per tick;
+`{"sweep":true,"dry_run":true}` plans without acting; fails closed if boto3
+lacks the capacity-provider API. CD swaps the coding image digest into both
+runtimes (`capacityProviderConfiguration` preserved).
 
 ## Session storage GC
 

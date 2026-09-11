@@ -58,6 +58,7 @@ export async function POST(
   const region = request.nextUrl.searchParams.get("region") || undefined;
   try {
     const cp = await checkpointCodingSession({
+      runtimeArn: session.runtimeArn,
       sessionId: session.sessionId,
       cli: session.cli,
       repo: session.repo,
