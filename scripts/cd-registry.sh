@@ -11,7 +11,8 @@
 #
 # Usage:
 #   scripts/cd-registry.sh list
-#   scripts/cd-registry.sh add <owner/repo|github url> [--pipeline NAME] [--region R] [--ci-project NAME] [--deploy-doc PATH] [--notes TEXT]
+#   scripts/cd-registry.sh add <owner/repo|github url> [--pipeline NAME] [--region R] [--ci-project NAME] [--deploy-doc PATH] [--notes TEXT] \
+#                                                       [--account ID --role-arn ARN --external-id ID]   # cross-account CD (all three)
 #   scripts/cd-registry.sh remove <owner/repo|github url>
 #   scripts/cd-registry.sh seed           # upload src/config/cd-registry.json ONLY if S3 has none
 #
@@ -48,7 +49,7 @@ for e in repos:
     ;;
   add)
     repo="${1:?owner/repo or GitHub URL required}"; shift
-    pipeline=""; region=""; ciproject=""; deploydoc=""; notes=""
+    pipeline=""; region=""; ciproject=""; deploydoc=""; notes=""; account=""; rolearn=""; extid=""
     while [ $# -gt 0 ]; do
       case "$1" in
         --pipeline) pipeline="$2"; shift 2 ;;
@@ -58,10 +59,18 @@ for e in repos:
         --ci-project) ciproject="$2"; shift 2 ;;
         --deploy-doc) deploydoc="$2"; shift 2 ;;
         --notes) notes="$2"; shift 2 ;;
+        # Cross-account CD: the pipeline lives in ANOTHER account, reached by
+        # assuming ROLE-ARN (a hub-cd-trigger-* role) with EXTERNAL-ID. Pass all
+        # three together, plus --region for the pipeline's region. The parser
+        # honors them only as a complete, valid triple (roleArn's account must
+        # equal --account and name a hub-cd-trigger-* role).
+        --account) account="$2"; shift 2 ;;
+        --role-arn) rolearn="$2"; shift 2 ;;
+        --external-id) extid="$2"; shift 2 ;;
         *) echo "unknown flag $1" >&2; usage ;;
       esac
     done
-    fetch | REPO="$repo" PIPELINE="$pipeline" RG="$region" CIP="$ciproject" DD="$deploydoc" NOTES="$notes" python3 -c '
+    fetch | REPO="$repo" PIPELINE="$pipeline" RG="$region" CIP="$ciproject" DD="$deploydoc" NOTES="$notes" ACCT="$account" ROLEARN="$rolearn" EXTID="$extid" python3 -c '
 import json,os,re,sys,datetime
 def key(v):
     s=str(v or "").strip(); s=re.sub(r"^git@[^:]+:","",s); s=re.sub(r"^[a-z]+://[^/]+/","",s,flags=re.I)
@@ -72,7 +81,7 @@ if not k: sys.exit("repo must be owner/repo or a GitHub URL")
 d=json.load(sys.stdin); repos=[e for e in d.get("repos",[]) if e.get("repo")!=k]
 prev=next((e for e in d.get("repos",[]) if e.get("repo")==k),{})
 e={"repo":k,"addedAt":prev.get("addedAt") or datetime.datetime.now(datetime.timezone.utc).isoformat()}
-for f,env in (("pipeline","PIPELINE"),("region","RG"),("ciProject","CIP"),("deployDoc","DD"),("notes","NOTES")):
+for f,env in (("pipeline","PIPELINE"),("region","RG"),("ciProject","CIP"),("deployDoc","DD"),("notes","NOTES"),("account","ACCT"),("roleArn","ROLEARN"),("externalId","EXTID")):
     v=os.environ.get(env,"").strip() or prev.get(f)
     if v: e[f]=v
 repos.append(e); repos.sort(key=lambda x:x["repo"])

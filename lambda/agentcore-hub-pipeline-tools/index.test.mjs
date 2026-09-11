@@ -79,7 +79,19 @@ const h = vi.hoisted(() => ({
     cpCalls: [], // { region, name, type, input } for every CodePipeline command sent
     cbCalls: [], // { region, name, type, input } for every CodeBuild command sent
     logsCalls: [], // { region, name, type, input } for every Logs command sent
-    clientInits: [], // { kind, region } for every AWS client CONSTRUCTED
+    stsCalls: [], // { region, input } for every STS AssumeRole (cross-account only)
+    clientInits: [], // { kind, region, hasCreds } for every AWS client CONSTRUCTED
+    // Cross-account: the temp creds AssumeRole hands back. The cp/cb/logs mocks
+    // resolve their `credentials` provider in send() (a real client would, when
+    // signing), so a cross-account tool call actually reaches this stub.
+    assumeRoleImpl: async () => ({
+      Credentials: {
+        AccessKeyId: "ASIA-XACCT",
+        SecretAccessKey: "secret",
+        SessionToken: "token",
+        Expiration: new Date(Date.now() + 900_000),
+      },
+    }),
     getPipelineStateImpl: async () => ({ stageStates: [] }),
     listActionExecutionsImpl: async () => ({ actionExecutionDetails: [] }),
     startPipelineExecutionImpl: async () => ({ pipelineExecutionId: "exec-new" }),
@@ -124,9 +136,11 @@ vi.mock("@aws-sdk/client-codepipeline", () => ({
   CodePipelineClient: class {
     constructor(cfg) {
       this.region = cfg?.region;
-      h.state.clientInits.push({ kind: "codepipeline", region: cfg?.region });
+      this.credentials = cfg?.credentials;
+      h.state.clientInits.push({ kind: "codepipeline", region: cfg?.region, hasCreds: typeof cfg?.credentials === "function" });
     }
     async send(cmd) {
+      if (typeof this.credentials === "function") await this.credentials();
       const type = cmd?.__type;
       h.state.cpCalls.push({
         region: this.region,
@@ -151,9 +165,11 @@ vi.mock("@aws-sdk/client-codebuild", () => ({
   CodeBuildClient: class {
     constructor(cfg) {
       this.region = cfg?.region;
-      h.state.clientInits.push({ kind: "codebuild", region: cfg?.region });
+      this.credentials = cfg?.credentials;
+      h.state.clientInits.push({ kind: "codebuild", region: cfg?.region, hasCreds: typeof cfg?.credentials === "function" });
     }
     async send(cmd) {
+      if (typeof this.credentials === "function") await this.credentials();
       const type = cmd?.__type;
       h.state.cbCalls.push({
         region: this.region,
@@ -194,9 +210,11 @@ vi.mock("@aws-sdk/client-cloudwatch-logs", () => ({
   CloudWatchLogsClient: class {
     constructor(cfg) {
       this.region = cfg?.region;
-      h.state.clientInits.push({ kind: "logs", region: cfg?.region });
+      this.credentials = cfg?.credentials;
+      h.state.clientInits.push({ kind: "logs", region: cfg?.region, hasCreds: typeof cfg?.credentials === "function" });
     }
     async send(cmd) {
+      if (typeof this.credentials === "function") await this.credentials();
       h.state.logsCalls.push({
         region: this.region,
         name: cmd.input?.logGroupName ?? null,
@@ -207,6 +225,23 @@ vi.mock("@aws-sdk/client-cloudwatch-logs", () => ({
     }
   },
   GetLogEventsCommand: class { constructor(i) { this.input = i; } },
+}));
+
+// Cross-account only: the assume-role provider clientsFor() wires onto a
+// cross-account target's clients calls this. Records every AssumeRole so a test
+// can assert the RoleArn + ExternalId that reached STS (the confused-deputy
+// guard), and that a same-account call never touches it.
+vi.mock("@aws-sdk/client-sts", () => ({
+  STSClient: class {
+    constructor(cfg) {
+      this.region = cfg?.region;
+    }
+    async send(cmd) {
+      h.state.stsCalls.push({ region: this.region, input: cmd.input });
+      return h.state.assumeRoleImpl(cmd.input);
+    }
+  },
+  AssumeRoleCommand: class { constructor(i) { this.input = i; } },
 }));
 
 const { handler, validateCiProjectName } = await import("./index.mjs");
@@ -337,6 +372,7 @@ async function withRegistry(doc, fn, env = {}) {
   return withEnv({ ARTIFACT_BUCKET: "hub-artifacts-test", ...env }, async (mod) => {
     h.state.clientInits = [];
     h.state.s3Calls = [];
+    h.state.stsCalls = [];
     return fn(mod);
   });
 }
@@ -350,7 +386,16 @@ beforeEach(() => {
   h.state.cpCalls = [];
   h.state.cbCalls = [];
   h.state.logsCalls = [];
+  h.state.stsCalls = [];
   h.state.clientInits = [];
+  h.state.assumeRoleImpl = async () => ({
+    Credentials: {
+      AccessKeyId: "ASIA-XACCT",
+      SecretAccessKey: "secret",
+      SessionToken: "token",
+      Expiration: new Date(Date.now() + 900_000),
+    },
+  });
   // Back to "no registry", so the shared top-level `handler` resolves the env
   // default target and every pre-TEAM-4337 suite behaves exactly as before.
   h.state.registryImpl = async () => {
@@ -1881,5 +1926,84 @@ describe("multi-target registry resolution", () => {
     expect(source).not.toMatch(/putApprovalResult/);
     // The only mentions left are the comments asserting it is absent.
     expect(source).toMatch(/DELIBERATELY ABSENT: PutApprovalResult/);
+  });
+});
+
+// ─── 9. Cross-account CD (assume a hub-cd-trigger-* role in another account) ──
+//
+// The registry may point a pipeline at ANOTHER AWS account; the tools Lambda
+// reaches it by assuming that account's `hub-cd-trigger-<slug>` role with the
+// entry's ExternalId (the confused-deputy guard). These pin the two things that
+// make that safe and correct: the RoleArn + ExternalId that actually reach STS
+// come from the registry entry (never args), and a SAME-account target never
+// assumes a role at all — its clients use the ambient credential chain.
+describe("cross-account CD (assume-role trigger)", () => {
+  const XACCT_REGISTRY = {
+    version: 1,
+    repos: [
+      {
+        repo: "tycenjmccann/juno",
+        pipeline: "hub-juno-deploy",
+        region: "us-west-2",
+        account: "023392223961",
+        roleArn: "arn:aws:iam::023392223961:role/hub-cd-trigger-juno",
+        externalId: "hub-cd-juno-secret",
+      },
+      { repo: "tycenjmccann/agentcore-hub", pipeline: "agentcore-hub-deploy", region: "us-east-1" },
+    ],
+  };
+
+  it("routes a cross-account get_state through an assumed role with the entry's ExternalId", async () => {
+    h.state.getPipelineStateImpl = async () => ({ stageStates: [] });
+    const out = await withRegistry(XACCT_REGISTRY, (mod) =>
+      invokeOn(mod.handler, "get_state", { pipeline_name: "hub-juno-deploy" }),
+    );
+
+    expect(out.pipelineName).toBe("hub-juno-deploy");
+    expect(out.region).toBe("us-west-2");
+    expect(out.repo).toBe("tycenjmccann/juno");
+
+    // The CodePipeline call reached the cross-account region, on a client built
+    // WITH a credentials provider (the assume-role provider).
+    const call = h.state.cpCalls.find((c) => c.type === "GetPipelineState");
+    expect(call.region).toBe("us-west-2");
+    const init = h.state.clientInits.find((c) => c.kind === "codepipeline");
+    expect(init.hasCreds).toBe(true);
+
+    // Exactly one AssumeRole, carrying the entry's RoleArn + ExternalId — not
+    // anything from the caller's args.
+    expect(h.state.stsCalls).toHaveLength(1);
+    expect(h.state.stsCalls[0].input).toMatchObject({
+      RoleArn: "arn:aws:iam::023392223961:role/hub-cd-trigger-juno",
+      ExternalId: "hub-cd-juno-secret",
+      RoleSessionName: "hub-pipeline-tools",
+    });
+  });
+
+  it("a same-account target in the SAME registry never assumes a role", async () => {
+    h.state.getPipelineStateImpl = async () => ({ stageStates: [] });
+    const out = await withRegistry(XACCT_REGISTRY, (mod) =>
+      invokeOn(mod.handler, "get_state", { pipeline_name: "agentcore-hub-deploy" }),
+    );
+
+    expect(out.region).toBe("us-east-1");
+    const init = h.state.clientInits.find((c) => c.kind === "codepipeline");
+    expect(init.hasCreds).toBe(false);
+    expect(h.state.stsCalls).toEqual([]);
+  });
+
+  it("a cross-account start_ci_build assumes the role for the CodeBuild client too", async () => {
+    const sha = "a".repeat(40);
+    const out = await withRegistry(XACCT_REGISTRY, (mod) =>
+      invokeOn(mod.handler, "start_ci_build", { pipeline_name: "hub-juno-deploy", commit_sha: sha }),
+      { CI_START_BUILD_ENABLED: "1" },
+    );
+
+    expect(out.error).toBeUndefined();
+    const cbInit = h.state.clientInits.find((c) => c.kind === "codebuild");
+    expect(cbInit.region).toBe("us-west-2");
+    expect(cbInit.hasCreds).toBe(true);
+    expect(h.state.stsCalls.length).toBeGreaterThanOrEqual(1);
+    expect(h.state.stsCalls[0].input.RoleArn).toBe("arn:aws:iam::023392223961:role/hub-cd-trigger-juno");
   });
 });

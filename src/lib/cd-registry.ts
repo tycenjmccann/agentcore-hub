@@ -32,6 +32,15 @@ export interface CdRegistryEntry {
   ciProject?: string;
   /** Path of the deploy contract the release manager follows when no pipeline is named. */
   deployDoc?: string;
+  /**
+   * Cross-account CD (optional): the AWS account the pipeline lives in, the
+   * `hub-cd-trigger-<slug>` role the tools Lambda assumes there, and the STS
+   * ExternalId that role requires. Only honored as a complete, valid triple
+   * (see parseCdRegistry); any part missing/malformed falls back to same-account.
+   */
+  account?: string;
+  roleArn?: string;
+  externalId?: string;
   notes?: string;
   addedAt?: string;
 }
@@ -109,6 +118,21 @@ export function parseCdRegistry(raw: unknown): CdRegistry {
         const v = typeof o[f] === "string" ? (o[f] as string).trim() : "";
         if (v) entry[f] = v;
       }
+      // Cross-account triple — honored only if all three present + valid + the
+      // roleArn's account matches `account` and names a hub-cd-trigger-* role.
+      // Mirror of parseCdRegistry() in lambda/orchestrator/cd-registry.mjs.
+      const account = typeof o.account === "string" ? o.account.trim() : "";
+      const roleArn = typeof o.roleArn === "string" ? o.roleArn.trim() : "";
+      const externalId = typeof o.externalId === "string" ? o.externalId.trim() : "";
+      if (
+        account && roleArn && externalId &&
+        /^[0-9]{12}$/.test(account) &&
+        new RegExp(`^arn:aws:iam::${account}:role/hub-cd-trigger-[a-z0-9-]+$`).test(roleArn)
+      ) {
+        entry.account = account;
+        entry.roleArn = roleArn;
+        entry.externalId = externalId;
+      }
       if (typeof o.addedAt === "string") entry.addedAt = o.addedAt;
     }
     repos.push(entry);
@@ -130,6 +154,9 @@ export interface PipelineProjects {
   /** The CodePipeline that deploys the repo (the entry's `pipeline`). */
   pipeline: string;
   region: string;
+  /** Cross-account trigger role + its ExternalId, or null (same-account). */
+  roleArn: string | null;
+  externalId: string | null;
   ciProject: string;
   buildProject: string;
   deployProject: string;
@@ -157,6 +184,8 @@ export function pipelineProjectsFor(entry: CdRegistryEntry): PipelineProjects | 
     // canonical Lambda helper may instead leave an absent region to its caller's
     // default — the resolved value is the same (AWS_REGION, else us-east-1).
     region: entry.region || REGION,
+    roleArn: entry.roleArn || null,
+    externalId: entry.externalId || null,
     ciProject: entry.ciProject || `${base}-ci`,
     buildProject: `${base}-build`,
     deployProject: pipeline,
@@ -216,8 +245,14 @@ export function validateCdEntryInput(body: unknown): Record<string, string> | nu
     region: { re: /^[a-z]{2}(-gov)?-[a-z]+-\d$/, reason: "must be an AWS region like us-east-1 or us-gov-west-1" },
     pipeline: { re: /^[A-Za-z0-9.@_-]{1,100}$/, reason: "must be a valid CodePipeline name (1-100 chars of [A-Za-z0-9.@_-])" },
     ciProject: { re: /^[A-Za-z0-9_-]{2,150}$/, reason: "must be a valid CodeBuild project name (2-150 chars of [A-Za-z0-9_-])" },
+    // Cross-account CD. account/roleArn are also cross-checked at parse time (the
+    // roleArn's embedded account must equal `account`); these rules catch gross
+    // format errors at write time. roleArn MUST name a hub-cd-trigger-* role.
+    account: { re: /^[0-9]{12}$/, reason: "must be a 12-digit AWS account id" },
+    roleArn: { re: /^arn:aws:iam::[0-9]{12}:role\/hub-cd-trigger-[a-z0-9-]+$/, reason: "must be an arn:aws:iam::<account>:role/hub-cd-trigger-<slug> role ARN" },
+    externalId: { re: /^[\w+=,.@:/-]{6,1224}$/, reason: "must be 6-1224 chars of [A-Za-z0-9_+=,.@:/-]" },
   };
-  for (const f of ["pipeline", "region", "ciProject", "deployDoc", "notes"] as const) {
+  for (const f of ["pipeline", "region", "ciProject", "deployDoc", "notes", "account", "roleArn", "externalId"] as const) {
     const v = o[f];
     if (v === undefined) continue;
     if (typeof v !== "string") { fields[f] = "must be a string"; continue; }
@@ -255,7 +290,7 @@ export function upsertCdEntry(registry: CdRegistry, input: Partial<Omit<CdRegist
   const existing = registry.repos.find((e) => e.repo === key);
   const merged: CdRegistryEntry = { ...(existing || {}), ...clean, repo: key, addedAt: existing?.addedAt || new Date().toISOString() };
   // An explicitly blank field clears it (the UI sends "" to unset a pipeline).
-  for (const f of ["pipeline", "region", "ciProject", "deployDoc", "notes"] as const) {
+  for (const f of ["pipeline", "region", "ciProject", "deployDoc", "notes", "account", "roleArn", "externalId"] as const) {
     if (typeof input[f] === "string" && !(input[f] as string).trim()) delete merged[f];
   }
   return { version: registry.version || 1, repos: [...registry.repos.filter((e) => e.repo !== key), merged].sort((a, b) => a.repo.localeCompare(b.repo)) };

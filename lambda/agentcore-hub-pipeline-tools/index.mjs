@@ -152,6 +152,11 @@ import {
   CloudWatchLogsClient,
   GetLogEventsCommand,
 } from "@aws-sdk/client-cloudwatch-logs";
+// STS is a core client in the nodejs20.x runtime-bundled SDK (this Lambda zips
+// index.mjs + cd-registry.mjs ONLY — no node_modules — so every import must be
+// runtime-provided). Used to assume a registry entry's cross-account
+// hub-cd-trigger-* role before reading/triggering a foreign-account pipeline.
+import { STSClient, AssumeRoleCommand } from "@aws-sdk/client-sts";
 // Byte copy of lambda/orchestrator/cd-registry.mjs (each Lambda zips from its own
 // directory). Pinned identical by scripts/check-cd-registry-parity.sh — edit the
 // canonical file in lambda/orchestrator/ and re-copy, never this one. Zero imports,
@@ -264,19 +269,72 @@ function validateCiProjectAcrossTargets(name, targets = []) {
 // Fanning it out per pipeline region would read a bucket that does not exist.
 const s3 = new S3Client({ region: REGION });
 
-// CodePipeline/CodeBuild/Logs, memoized per region — a target in another region
-// needs its own clients, and a warm container should not rebuild them per call.
+// One STS client in this Lambda's own region, using the role's ambient creds —
+// the source identity for every cross-account AssumeRole.
+let stsClient = null;
+function sts() {
+  if (!stsClient) stsClient = new STSClient({ region: REGION });
+  return stsClient;
+}
+
+// A credentials provider that assumes a cross-account hub-cd-trigger-* role with
+// its ExternalId, caching the temp creds until ~1 min before expiry so a warm
+// container re-assumes at most once every ~14 min instead of per request. Passed
+// as the `credentials` option to the CodePipeline/CodeBuild/Logs clients for a
+// cross-account target; a plain-object credentials provider function is the
+// AWS SDK v3 contract. Uses only the runtime-bundled @aws-sdk/client-sts.
+function assumeRoleProvider(roleArn, externalId) {
+  let cached = null; // { creds, expiresAt }
+  return async () => {
+    const now = Date.now();
+    if (cached && cached.expiresAt - 60_000 > now) return cached.creds;
+    const out = await sts().send(
+      new AssumeRoleCommand({
+        RoleArn: roleArn,
+        RoleSessionName: "hub-pipeline-tools",
+        ExternalId: externalId,
+        DurationSeconds: 900,
+      })
+    );
+    const c = out.Credentials || {};
+    cached = {
+      creds: {
+        accessKeyId: c.AccessKeyId,
+        secretAccessKey: c.SecretAccessKey,
+        sessionToken: c.SessionToken,
+        expiration: c.Expiration,
+      },
+      expiresAt: c.Expiration ? new Date(c.Expiration).getTime() : now + 900_000,
+    };
+    return cached.creds;
+  };
+}
+
+// CodePipeline/CodeBuild/Logs, memoized per region|roleArn — a target in another
+// region OR another account (via an assumed role) needs its own clients, and a
+// warm container should not rebuild them per call.
 const clientsByRegion = new Map();
 
-/** @returns {{cp: CodePipelineClient, cb: CodeBuildClient, logs: CloudWatchLogsClient}} */
-function clientsFor(region) {
-  const key = region || REGION;
+/**
+ * @param {string} region
+ * @param {string|null} [roleArn]     cross-account trigger role to assume (null → same-account)
+ * @param {string|null} [externalId]  the role's required ExternalId
+ * @returns {{cp: CodePipelineClient, cb: CodeBuildClient, logs: CloudWatchLogsClient}}
+ */
+function clientsFor(region, roleArn = null, externalId = null) {
+  const r = region || REGION;
+  const key = `${r}|${roleArn || ""}`;
   let set = clientsByRegion.get(key);
   if (!set) {
+    const cfg = { region: r };
+    // roleArn is only ever non-null for an entry parseCdRegistry validated as a
+    // complete cross-account triple (12-digit account + hub-cd-trigger-* name +
+    // externalId), so the assumed role is bounded to read + StartPipelineExecution.
+    if (roleArn) cfg.credentials = assumeRoleProvider(roleArn, externalId);
     set = {
-      cp: new CodePipelineClient({ region: key }),
-      cb: new CodeBuildClient({ region: key }),
-      logs: new CloudWatchLogsClient({ region: key }),
+      cp: new CodePipelineClient(cfg),
+      cb: new CodeBuildClient(cfg),
+      logs: new CloudWatchLogsClient(cfg),
     };
     clientsByRegion.set(key, set);
   }
@@ -347,6 +405,7 @@ async function loadRegistry({ force = false } = {}) {
 
 /**
  * @typedef {{repo: string|null, pipeline: string, region: string,
+ *            roleArn: string|null, externalId: string|null,
  *            ciProject: string, buildProject: string, deployProject: string,
  *            isEnvDefault: boolean}} Target
  */
@@ -376,6 +435,9 @@ async function listTargets() {
       repo: entry.repo || null,
       pipeline: projects.pipeline,
       region: projects.region || REGION,
+      // Cross-account trigger role, or null for the same-account common case.
+      roleArn: projects.roleArn || null,
+      externalId: projects.externalId || null,
       ciProject: projects.ciProject,
       buildProject: projects.buildProject,
       deployProject: projects.deployProject,
@@ -392,6 +454,9 @@ async function listTargets() {
       repo: PIPELINE_REPO || null,
       pipeline: PIPELINE_NAME,
       region: REGION,
+      // The env-default (hub's own) pipeline is always same-account.
+      roleArn: null,
+      externalId: null,
       ciProject: CI_PROJECT,
       buildProject: BUILD_PROJECT,
       deployProject: DEPLOY_PROJECT,
@@ -650,7 +715,7 @@ async function getState(args = {}, target) {
   // The pipeline is the RESOLVED target's — args.pipeline_name was already
   // validated against the allow-list (or refused) before we got here.
   const name = target.pipeline;
-  const { cp } = clientsFor(target.region);
+  const { cp } = clientsFor(target.region, target.roleArn, target.externalId);
   const executionId = String(args.execution_id || "").trim();
   const state = await cp.send(new GetPipelineStateCommand({ name }));
 
@@ -783,7 +848,7 @@ async function getState(args = {}, target) {
 // substitute for pipeline_name here, it is simply ignored.
 async function startDeploy(args = {}, target) {
   const name = target.pipeline;
-  const { cp } = clientsFor(target.region);
+  const { cp } = clientsFor(target.region, target.roleArn, target.externalId);
   const input = { name };
   // clientRequestToken constraints: ^[a-zA-Z0-9-]+$, 1–128 chars. Sanitize the
   // SHA to that charset; if nothing valid remains (or no SHA was given), OMIT
@@ -852,7 +917,7 @@ async function getBuildLog(args = {}, target, targets = []) {
       known: targets.flatMap(projectsOf),
     });
   }
-  const { cb, logs } = clientsFor(owner.region);
+  const { cb, logs } = clientsFor(owner.region, owner.roleArn, owner.externalId);
   let buildId = args.build_id;
 
   if (!buildId) {
@@ -945,7 +1010,7 @@ async function getBuildStatus(args = {}, target, targets = []) {
       known: targets.flatMap(projectsOf),
     });
   }
-  const { cb } = clientsFor(owner.region);
+  const { cb } = clientsFor(owner.region, owner.roleArn, owner.externalId);
   const commit = (args.commit_sha || "").trim();
   // Clamp scan to an integer in [1, 50]. A negative value would turn
   // ids.slice(0, n) into a from-end slice (silently dropping the NEWEST builds)
@@ -1041,7 +1106,7 @@ async function startCiBuild(args = {}, target, targets = []) {
   // name reaching AWS (contrast get_build_log/get_build_status, which refuse
   // instead of falling back).
   const owner = targetForProject(targets, project) || target;
-  const { cb } = clientsFor(owner.region);
+  const { cb } = clientsFor(owner.region, owner.roleArn, owner.externalId);
 
   const rawSha = String(args.commit_sha ?? "").trim();
   if (!rawSha) {
