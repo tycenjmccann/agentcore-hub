@@ -172,12 +172,12 @@ release manager's Merge Brief reads all three off your completion record.
     `Pipeline___get_build_status(commit_sha=<head SHA>, project=<ci_project>)`
     every 60s, for at most 25 polls (the CI project's build timeout is 30
     minutes).
-    - `retry: true` with `retry_reason: "infra_install_failure"` → CI infra died
-      (not your code); the Lambda started ONE retry. Poll its `buildId` — the RETRIED build's result is what `ci_status` reports.
-    - `reason: "install_flake_retry_failed"` → **BLOCKED**: CI infra failed twice
-      for this SHA. Never call again — the SHA is spent; a fix is a new commit.
-    - `reason: "build_failed_not_retryable"` or `"prior_build_stopped"` → the SHA
-      is decided. Classify `prior_build_id`'s log per P2a; do not re-run.
+    - `retry: true` / `retry_reason: "infra_install_failure"` → CI infra died (not your code); the Lambda
+      started ONE retry — poll its `buildId`; that RETRIED build's result is what `ci_status` reports.
+      `reason: "retry_in_flight"` → another caller owns this SHA's retry: poll `get_build_status`, start nothing.
+    - `reason: "install_flake_retry_failed"` → **BLOCKED**: CI infra failed twice, the SHA is spent.
+      `"build_failed_not_retryable"` / `"prior_build_stopped"` → the SHA is decided; classify
+      `prior_build_id`'s log per P2a. Never call again — a fix is a NEW commit.
     - `succeededForCommit: true` → **PASS**, with `ci_status="certified"`.
     - `FAILED` → fall through to the P2a mechanical/logic classification above.
     - Still not terminal after the last poll → **BLOCKED**: state that the
