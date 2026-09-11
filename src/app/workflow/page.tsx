@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { Search, Plus, Play, Radio, Zap, ChevronLeft, ChevronRight, FlaskConical, Archive, Trash2, ClipboardCheck } from "lucide-react";
 import WorkflowBoard from "@/components/workflow/WorkflowBoard";
 import WorkflowManagerChat from "@/components/workflow/WorkflowManagerChat";
@@ -23,6 +23,37 @@ interface WorkflowSummary {
   sdlcFramework?: "playbook" | "aidlc";
 }
 
+// ─── Workflows sidebar sizing (TEAM-4320) ───────────────────────────────────
+// The history sidebar is drag-resizable; width persists in localStorage.
+
+const HISTORY_MIN_WIDTH = 240;
+const HISTORY_DEFAULT_WIDTH = 288; // matches the old w-72
+const HISTORY_MAX_WIDTH = 640; // hard cap; also capped at half the viewport
+const HISTORY_KEY_STEP = 16;
+const HISTORY_WIDTH_KEY = "workflow-history-width";
+
+/**
+ * Hard cap, never wider than half the viewport - but never below the minimum:
+ * under 480px of viewport half the viewport is < HISTORY_MIN_WIDTH, and letting
+ * that win would clamp the sidebar under its own floor and render the handle with
+ * aria-valuemax < aria-valuemin. SSR-safe.
+ */
+function historyMaxWidth(): number {
+  if (typeof window === "undefined") return HISTORY_MAX_WIDTH;
+  return Math.max(HISTORY_MIN_WIDTH, Math.min(HISTORY_MAX_WIDTH, Math.floor(window.innerWidth / 2)));
+}
+
+function clampHistoryWidth(value: number, max: number): number {
+  if (!Number.isFinite(value)) return HISTORY_DEFAULT_WIDTH;
+  return Math.min(max, Math.max(HISTORY_MIN_WIDTH, Math.round(value)));
+}
+
+/** Tolerant of null / "" / "abc" / out-of-range - never throws. */
+function parseHistoryWidth(raw: string | null, max: number): number {
+  if (raw === null || raw.trim() === "") return HISTORY_DEFAULT_WIDTH;
+  return clampHistoryWidth(Number(raw), max);
+}
+
 function BugIcon({ className }: { className?: string }) {
   return (
     <svg className={className} fill="none" height="16" viewBox="0 0 16 16" width="16" xmlns="http://www.w3.org/2000/svg">
@@ -41,6 +72,19 @@ export default function WorkflowPage() {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [nudgeToast, setNudgeToast] = useState<{ message: string; type: "success" | "info" | "error" } | null>(null);
   const [historyCollapsed, setHistoryCollapsed] = useState(true);
+  // Width starts at the constant (never reads localStorage during render — SSR-safe);
+  // the persisted value lands in the mount effect below.
+  const [historyWidth, setHistoryWidth] = useState(HISTORY_DEFAULT_WIDTH);
+  const [historyMax, setHistoryMax] = useState(HISTORY_MAX_WIDTH);
+  const [isResizing, setIsResizing] = useState(false);
+  const dragRef = useRef<{
+    startX: number;
+    startWidth: number;
+    max: number;
+    pointerId: number;
+  } | null>(null);
+  const widthRef = useRef(HISTORY_DEFAULT_WIDTH); // latest width, for persist-on-drop
+  const bodyStyleRef = useRef<{ cursor: string; userSelect: string } | null>(null);
   const [testDefId, setTestDefId] = useState<string>(DEFAULT_WORKFLOW_DEF_ID);
   const [deleteTargetId, setDeleteTargetId] = useState<string | null>(null);
   const [deleteLoading, setDeleteLoading] = useState(false);
@@ -52,12 +96,108 @@ export default function WorkflowPage() {
   useEffect(() => {
     const stored = localStorage.getItem('workflow-history-collapsed');
     if (stored !== null) setHistoryCollapsed(stored === 'true');
+    const max = historyMaxWidth();
+    setHistoryMax(max);
+    setHistoryWidth(parseHistoryWidth(localStorage.getItem(HISTORY_WIDTH_KEY), max));
   }, []);
+
+  // Mirror the committed width so pointerup can persist without a stale closure.
+  useEffect(() => {
+    widthRef.current = historyWidth;
+  }, [historyWidth]);
+
+  const restoreBodyStyles = useCallback(() => {
+    const saved = bodyStyleRef.current;
+    if (!saved) return;
+    document.body.style.cursor = saved.cursor;
+    document.body.style.userSelect = saved.userSelect;
+    bodyStyleRef.current = null;
+  }, []);
+
+  // A drag interrupted by unmount must not leave the body stuck in col-resize.
+  useEffect(() => () => restoreBodyStyles(), [restoreBodyStyles]);
 
   const toggleHistory = () => {
     const next = !historyCollapsed;
     setHistoryCollapsed(next);
     localStorage.setItem('workflow-history-collapsed', String(next));
+  };
+
+  // ─── Sidebar resize (pointer events only, one persist per gesture) ─────────
+
+  const persistHistoryWidth = (w: number) => localStorage.setItem(HISTORY_WIDTH_KEY, String(w));
+
+  const handleResizeStart = (e: React.PointerEvent<HTMLDivElement>) => {
+    // Refuse re-entry and non-primary input: a second pointerdown mid-drag (second
+    // finger, pen+touch, non-primary button) would re-snapshot the *already mutated*
+    // body styles - the restore then leaks col-resize / user-select:none permanently
+    // - and would clobber startWidth, defeating the persist-on-drop diff check.
+    if (dragRef.current || !e.isPrimary || e.button !== 0) return;
+    const max = historyMaxWidth(); // read once per gesture, never inside pointermove
+    setHistoryMax(max);
+    dragRef.current = { startX: e.clientX, startWidth: historyWidth, max, pointerId: e.pointerId };
+    e.currentTarget.setPointerCapture(e.pointerId);
+    // Belt and braces: only snapshot when nothing is saved (restoreBodyStyles nulls
+    // it), so the saved values are always the pre-drag ones.
+    if (bodyStyleRef.current === null) {
+      bodyStyleRef.current = {
+        cursor: document.body.style.cursor,
+        userSelect: document.body.style.userSelect,
+      };
+    }
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+    setIsResizing(true);
+  };
+
+  const handleResizeMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    const drag = dragRef.current;
+    // Only the pointer that started the gesture may drive it. setPointerCapture
+    // redirects *that* pointer's events to the handle, but it does not stop any
+    // other pointer that is physically over this 6px separator from hit-testing
+    // to it - a second finger's move would otherwise drag the width from its
+    // clientX, and its up would end the primary drag early.
+    if (!drag || e.pointerId !== drag.pointerId) return;
+    const next = clampHistoryWidth(drag.startWidth + (e.clientX - drag.startX), drag.max);
+    // Written synchronously: pointermove is continuous-priority in React 18, so the
+    // mirroring effect can still be queued when pointerup persists - it would then
+    // save the previous move's width.
+    widthRef.current = next;
+    setHistoryWidth(next);
+  };
+
+  const handleResizeEnd = (e: React.PointerEvent<HTMLDivElement>) => {
+    const drag = dragRef.current;
+    // Same ownership check as handleResizeMove. pointercancel carries the captured
+    // pointer's own id, so onPointerCancel still ends the drag.
+    if (!drag || e.pointerId !== drag.pointerId) return;
+    dragRef.current = null;
+    if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    }
+    restoreBodyStyles();
+    setIsResizing(false);
+    // Exactly one write per drag that actually moved (a plain click writes nothing).
+    if (widthRef.current !== drag.startWidth) persistHistoryWidth(widthRef.current);
+  };
+
+  const handleResizeDoubleClick = () => {
+    const max = historyMaxWidth();
+    setHistoryMax(max);
+    const next = clampHistoryWidth(HISTORY_DEFAULT_WIDTH, max);
+    setHistoryWidth(next);
+    persistHistoryWidth(next);
+  };
+
+  const handleResizeKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+    e.preventDefault();
+    const max = historyMaxWidth();
+    setHistoryMax(max);
+    const delta = e.key === 'ArrowRight' ? HISTORY_KEY_STEP : -HISTORY_KEY_STEP;
+    const next = clampHistoryWidth(historyWidth + delta, max);
+    setHistoryWidth(next);
+    persistHistoryWidth(next);
   };
 
   // Update header with selected workflow title
@@ -288,7 +428,11 @@ export default function WorkflowPage() {
   return (
     <div className="flex h-[calc(100vh-64px)] -m-6">
       {/* Left Sidebar — Epic History */}
-      <div className={`${historyCollapsed ? 'w-8' : 'w-72'} transition-all duration-300 border-r border-[var(--color-border)] bg-[var(--color-bg-secondary)] flex flex-col flex-shrink-0 overflow-hidden`}>
+      <div
+        data-testid="workflow-history-sidebar"
+        className={`${historyCollapsed ? 'w-8' : ''} ${isResizing ? '' : 'transition-all duration-300'} relative border-r border-[var(--color-border)] bg-[var(--color-bg-secondary)] flex flex-col flex-shrink-0 overflow-hidden`}
+        style={historyCollapsed ? undefined : { width: historyWidth }}
+      >
         {historyCollapsed ? (
           <div className="flex flex-col items-center pt-3 h-full">
             <button onClick={toggleHistory} className="p-1 rounded hover:bg-[var(--color-bg-tertiary)]" aria-label="Expand workflow history sidebar">
@@ -300,6 +444,26 @@ export default function WorkflowPage() {
           </div>
         ) : (
           <>
+            {/* Drag handle — resize the list; double-click resets (clamped to the
+                viewport max), arrows nudge by 16px */}
+            <div
+              data-testid="workflow-history-resize-handle"
+              role="separator"
+              aria-orientation="vertical"
+              aria-label="Resize workflows list"
+              aria-valuemin={HISTORY_MIN_WIDTH}
+              aria-valuemax={historyMax}
+              aria-valuenow={historyWidth}
+              tabIndex={0}
+              onPointerDown={handleResizeStart}
+              onPointerMove={handleResizeMove}
+              onPointerUp={handleResizeEnd}
+              onPointerCancel={handleResizeEnd}
+              onDoubleClick={handleResizeDoubleClick}
+              onKeyDown={handleResizeKeyDown}
+              className="absolute right-0 top-0 h-full w-1.5 z-10 cursor-col-resize touch-none select-none bg-transparent hover:bg-[var(--color-border-hover)] focus:outline-none focus-visible:bg-[var(--color-border-hover)] focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[var(--color-border-hover)]"
+            />
+
             {/* Header */}
             <div className="p-4 border-b border-[var(--color-border)]">
               <div className="flex items-center justify-between mb-3">
@@ -332,7 +496,7 @@ export default function WorkflowPage() {
             </div>
 
             {/* Workflow List */}
-            <div className="flex-1 overflow-y-auto">
+            <div className="flex-1 overflow-y-auto" data-testid="workflow-history-list">
               {/* Active Runs */}
               {activeWorkflows.length > 0 && (
                 <div className="p-2">
@@ -383,7 +547,7 @@ export default function WorkflowPage() {
       </div>
 
       {/* Main Content */}
-      <div className="flex-1 overflow-y-auto overflow-x-hidden">
+      <div className="flex-1 min-w-0 overflow-y-auto overflow-x-hidden" data-testid="workflow-main-region">
         {showIntake ? (
           <div className="p-8">
             <IntakeForm onSubmit={handleSubmit} isLoading={isSubmitting} />
