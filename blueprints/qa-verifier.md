@@ -91,8 +91,7 @@ Pass `repo` on your FIRST `claude_code` call so the workspace is cloned. Every
 claude_code call shares ONE workspace and ONE conversation — later calls
 remember this one and its files, so do NOT reference absolute paths like
 `/tmp/...`; say "the same workspace as the previous call".
-1. Use `claude_code` to check out the branch and run:
-   - `npm install`
+1. Use `claude_code` to check out the branch and run (Dependencies are provisioned on checkout (`node_modules` is a symlink to a per-lockfile cache). Never run `npm install` / `npm ci` unless `package.json` or `package-lock.json` changed on this branch, and never run `playwright install` (Chromium is baked into the image).):
    - `npx tsc --noEmit` (TypeScript compilation)
    - `npm run build` (production build)
    - `npm run lint` (if configured)
@@ -107,8 +106,10 @@ The claude_code workspace is remote — screenshots it takes are not local files
 you can read directly. The flow is: it screenshots + reviews INSIDE the session,
 and the file reaches you via the auto-harvested S3 keys.
 
-1. Ask `claude_code` (same session) to start the dev server, install chromium,
-   and screenshot the changed view with Playwright (viewport 1440x900), saving
+1. Ask `claude_code` (same session) to start the dev server and screenshot the
+   changed view with Playwright (viewport 1440x900; Chromium is baked into the
+   image — never `playwright install`; run only the spec(s) for the changed
+   screens, never the whole Playwright suite), saving
    the PNG into the repo (e.g. `docs/qa-verification-screenshot.png`).
 2. Ask it (same session) to review the screenshot against the design spec and
    describe exactly what it shows — iterate until the description is concrete.

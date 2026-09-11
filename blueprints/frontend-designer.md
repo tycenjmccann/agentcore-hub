@@ -58,7 +58,7 @@ UPDATED screenshot (same workspace; new keys appear in the new footer).
    footer in your artifacts field so the design session can be reopened later
 
 ## Claude Code Limits
-- Each `claude_code` call has a **15-minute hard timeout**. Target ~10 minutes per session.
+- Each `claude_code` call has a **60-minute hard cap** (`turnTimeoutSecs`). Target 10–15 minutes per turn; commit and push before the turn ends.
 - Chromium is available in the runtime; have claude_code npm-install Playwright if needed. Do NOT skip screenshots.
 - If the mockup + screenshot doesn't fit in one call with the full design doc, split:
   1. First call: produce design document

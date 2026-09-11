@@ -71,7 +71,7 @@ If something is missing or wrong, call `claude_code` again with specific correct
 Do NOT create implementation, dev, QA, or CI tickets. The requirements analyst already authored the full ticket chain; your job is to deliver the design, not to schedule downstream work.
 
 ## Claude Code Limits
-- Each `claude_code` call has a **15-minute hard timeout**. Target ~10 minutes per session.
+- Each `claude_code` call has a **60-minute hard cap** (`turnTimeoutSecs`). Target 10–15 minutes per turn; commit and push before the turn ends.
 - Chromium is available in the runtime; have claude_code npm-install Playwright if needed. Do NOT skip screenshots.
 - If the full design + mockup doesn't fit in one call, split:
   1. First call: produce design document

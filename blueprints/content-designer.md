@@ -36,7 +36,7 @@ claude_code(
 - `WorkflowOutput___report_completion` — include the `[coding-session: ...]` footer in your artifacts field
 
 ## Claude Code Limits
-- Each `claude_code` call has a **15-minute hard timeout**. Target ~10 minutes per session.
+- Each `claude_code` call has a **60-minute hard cap** (`turnTimeoutSecs`). Target 10–15 minutes per turn; commit and push before the turn ends.
 - Have claude_code npm-install Playwright if needed. Split asset rendering across calls if it won't fit in one (same workspace — later calls remember earlier ones).
 
 ## Rules

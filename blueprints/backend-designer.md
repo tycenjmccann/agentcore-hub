@@ -63,7 +63,7 @@ Execute these steps IN ORDER — do not skip any:
 Do NOT create implementation, dev, QA, or CI tickets. The requirements analyst already authored the full ticket chain; your job is to deliver the design, not to schedule downstream work.
 
 ## Claude Code Limits
-- Each `claude_code` call has a **15-minute hard timeout**. Target ~10 minutes per session.
+- Each `claude_code` call has a **60-minute hard cap** (`turnTimeoutSecs`). Target 10–15 minutes per turn; commit and push before the turn ends.
 - Architecture diagrams should use Mermaid CDN for rendering; have claude_code npm-install Playwright if needed.
 - If the full design + diagram doesn't fit in one call, split:
   1. First call: produce architecture design document

@@ -336,7 +336,7 @@ Write a plan under 150 lines with exactly these sections:
 ## Approach
 ## Units (each: name, files, done-when; tag INDEPENDENT when it shares no files with another unit)
 ## Tests (existing suites to run; new tests to add, one per acceptance criterion)
-## Verification (exact build / lint / typecheck / test / Playwright commands)
+## Verification (diff-scoped, exact commands: typecheck, lint, the test files covering the changed modules, Playwright spec(s) for changed screens only; `npm run build` only when `src/app/**` or `next.config.*` changed — the full suite runs in CI)
 ## Risks and assumptions
 ## Out of scope
 REQUEST (work order):
@@ -349,7 +349,7 @@ Plan approved (below). Execute it on <feature_branch>: first `git fetch origin &
 Rules:
 1. Create .operator/checkpoint.md now and keep it current: STATUS (IN_PROGRESS | READY_FOR_VERIFY), the plan's units as a checklist, NEXT, BLOCKERS, DEVIATIONS (any file outside the plan's scope, with why). Add `.operator/` to .git/info/exclude; never commit it.
 2. Commit and push after every finished unit: "<TICKET>: <unit name>".
-3. Units tagged INDEPENDENT: run them in parallel with the Agent tool using isolation "worktree" (max 3 at once). If worktree isolation is unavailable, use `git worktree add ../wt-<unit> -b wt/<unit> <feature_branch>` per unit; if that fails, run them sequentially. You integrate every worktree branch back into <feature_branch> yourself, resolve conflicts, and remove the worktree. Every worktree already has `node_modules` (a provisioned symlink, added by the post-checkout hook): never copy node_modules into a worktree and never run `npm ci` / `npm install` anywhere unless this branch changed package.json or package-lock.json.
+3. Units tagged INDEPENDENT: fan out ONLY when the plan has 3+ INDEPENDENT units AND touches 5+ files; below that, run units sequentially in this checkout (worktree setup/teardown costs more than it saves). When fanning out, run them in parallel with the Agent tool using isolation "worktree" (max 3 at once). If worktree isolation is unavailable, use `git worktree add ../wt-<unit> -b wt/<unit> <feature_branch>` per unit; if that fails, run them sequentially. You integrate every worktree branch back into <feature_branch> yourself, resolve conflicts, and remove the worktree. Every worktree already has `node_modules` (a provisioned symlink, added by the post-checkout hook): never copy node_modules into a worktree and never run `npm ci` / `npm install` anywhere unless this branch changed package.json or package-lock.json.
 4. Run only the targeted tests for what you changed in this turn; the full build/test/Playwright pass is a separate verify turn.
 5. Evidence (screenshots, logs, measurements) goes under .operator/evidence/, never into git.
 6. If you are running out of turns or time: commit, push, set STATUS: IN_PROGRESS with a precise NEXT, and stop. You will be resumed with "Continue from .operator/checkpoint.md".
@@ -361,7 +361,7 @@ PLAN:
 
 **VERIFY PROMPT**
 ```
-Verify turn on <feature_branch> (same workspace). Dependencies are already installed (node_modules is provisioned; do not run npm ci / npm install unless the lockfile changed on this branch). Run the plan's ## Verification commands: build, lint, typecheck, the relevant test suites; for UI changes run the Playwright spec(s) covering the changed screens and save screenshots to .operator/evidence/. Fix failures at the root (no test deletion, no skips), commit, push.
+Verify turn on <feature_branch> (same workspace). Dependencies are already installed (node_modules is provisioned; do not run npm ci / npm install unless the lockfile changed on this branch). Run the plan's ## Verification commands exactly (typecheck, lint, the test files covering the changed modules; `npm run build` only if `src/app/**` or `next.config.*` changed — CI certifies the full build and suite); for UI changes run only the Playwright spec(s) covering the changed screens (Chromium is baked — never `playwright install`) and save screenshots to .operator/evidence/. Fix failures at the root (no test deletion, no skips), commit, push.
 Then open a DRAFT PR from <feature_branch> into <base_branch>:
 `gh pr create --draft --base <base_branch> --head <feature_branch> --title "<TICKET>: <goal>" --body-file .operator/pr-body.md`
 Body: Goal; What changed (component level); How verified (each command + result); Evidence (file list); Known limitations / deviations. Reference <TICKET>.
