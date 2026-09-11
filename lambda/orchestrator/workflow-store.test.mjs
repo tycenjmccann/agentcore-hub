@@ -30,7 +30,7 @@ import {
 import { GATE_STATES } from "./gate-state.mjs";
 
 /**
- * R2 (docs/race-condition-study.md): every store op must be a SCOPED
+ * R2 (the race-condition plan): every store op must be a SCOPED
  * conditional write — no full-row puts, no unconditioned map replacement.
  * These tests pin the write shapes with a stub client; the conditional-race
  * semantics (winner/loser) are pinned by simulating

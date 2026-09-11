@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { commandGroupId, commandDedupId } from "./command-queue";
 
 /**
- * R1 (docs/race-condition-study.md): the FIFO grouping/dedup keys are the
+ * R1 (the race-condition plan): the FIFO grouping/dedup keys are the
  * serialization contract — a wrong group id silently re-introduces
  * intra-workflow concurrency, a wrong dedup id either drops real events or
  * lets Jira redeliveries through. Pin both.

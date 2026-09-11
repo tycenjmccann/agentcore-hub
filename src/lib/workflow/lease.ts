@@ -1,5 +1,5 @@
 /**
- * Invocation leases (R3 of docs/race-condition-study.md).
+ * Invocation leases (R3 of the race-condition plan).
  *
  * "Is the agent dead?" was guessed from silence in three places with three
  * thresholds — and retry/dispatch released the invocation claim with NO proof

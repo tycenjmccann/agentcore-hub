@@ -1,5 +1,5 @@
 /**
- * Workflow command queue (R1 of the race-condition plan — docs/race-condition-study.md).
+ * Workflow command queue (R1 of the race-condition plan).
  *
  * Every workflow trigger becomes a COMMAND on an SQS FIFO queue instead of a
  * direct Lambda invoke. MessageGroupId serializes all commands for one

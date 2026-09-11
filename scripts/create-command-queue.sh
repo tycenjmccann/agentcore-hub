@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ─── Workflow command queue (R1 — docs/race-condition-study.md) ──────────────
+# ─── Workflow command queue (R1) ──────────────
 #
 # Creates the SQS FIFO queue that serializes all workflow commands per
 # workflow (MessageGroupId = workflow root issue key), its DLQ, and the

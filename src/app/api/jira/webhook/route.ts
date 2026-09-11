@@ -6,7 +6,7 @@
  * MessageGroupId = the workflow's root issue key, so all commands for one
  * workflow are processed strictly in order by the orchestrator — concurrent
  * webhook deliveries for the same run can no longer race each other
- * (R1 of docs/race-condition-study.md). Content-based dedup on
+ * (R1 of the race-condition plan). Content-based dedup on
  * (issueKey, status, Jira event timestamp) absorbs at-least-once redeliveries.
  *
  * The orchestrator handles ALL logic (context building, agent invocation,

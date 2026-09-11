@@ -54,7 +54,7 @@ jobs:
       - name: Anomaly-watcher lambda unit tests (node --test)
         run: node --test lambda/anomaly-watcher
 
-      # R2 (docs/race-condition-study.md): the workflows table may only be
+      # R2 (the race-condition plan): the workflows table may only be
       # written through lambda/orchestrator/workflow-store.mjs — ad-hoc writes
       # are the read-modify-write clobber class behind most workflow races.
       - name: Workflow-table write guard

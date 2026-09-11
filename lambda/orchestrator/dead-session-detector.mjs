@@ -7,7 +7,7 @@
  * silence has run past a per-agent threshold, then recover them — steal the
  * stale claim, emit agent.error, and either re-dispatch ONCE or escalate.
  *
- * Hard invariants (see docs/race-condition-study.md):
+ * Hard invariants (see the race-condition plan):
  *   R2 — every workflows-table write goes through workflow-store.mjs.
  *   R3 — lease semantics are NEVER re-implemented here; liveness/steal come from
  *        lease.mjs. isLeaseLive is the MANDATORY FIRST guard on every candidate:

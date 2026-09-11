@@ -15,7 +15,7 @@
  * caught up on the one bounded retry — a dependent can stall FOREVER (no other
  * event will ever re-drive it). This periodic sweep is the safety net.
  *
- * Hard invariants (mirrors dead-session-detector.mjs / docs/race-condition-study):
+ * Hard invariants (mirrors dead-session-detector.mjs):
  *   R2 — every workflows-table write goes through workflow-store.mjs (the
  *        recovery here routes through the cascade's redispatch/steal, which use
  *        the store).
