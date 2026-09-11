@@ -2007,3 +2007,98 @@ describe("cross-account CD (assume-role trigger)", () => {
     expect(h.state.stsCalls[0].input.RoleArn).toBe("arn:aws:iam::023392223961:role/hub-cd-trigger-juno");
   });
 });
+
+// ─── 9. iOS App Store release pipeline (a SECOND target per repo) ─────────────
+//
+// An entry's `iosPipeline` (hub-<slug>-ios-deploy) becomes a target alongside
+// its backend `pipeline`, so the release manager can trigger + watch the App
+// Store release with the same Pipeline___* tools. It is a hub-*-deploy name, so
+// it needs NO new IAM grant and pipelineProjects() derives its macOS ci/build/
+// deploy the same way. It is NEVER the env default (its name != PIPELINE_NAME),
+// so it can never win an unqualified write, and it inherits the backend entry's
+// region + cross-account trigger role.
+describe("iOS release pipeline as a second target", () => {
+  const APP_IOS = "hub-app-ios-deploy";
+  const APP_BACKEND = "hub-app-deploy";
+  const HUB = "agentcore-hub-deploy";
+  const IOS_REGISTRY = {
+    version: 1,
+    repos: [
+      { repo: "acme/app", pipeline: APP_BACKEND, iosPipeline: APP_IOS, region: "us-west-2" },
+      { repo: "tycenjmccann/agentcore-hub", pipeline: HUB, region: "us-east-1" },
+    ],
+  };
+
+  it("resolves get_state to the iOS pipeline, in the entry's region", async () => {
+    h.state.getPipelineStateImpl = async () => ({ stageStates: [] });
+    const out = await withRegistry(
+      IOS_REGISTRY,
+      (mod) => invokeOn(mod.handler, "get_state", { pipeline_name: APP_IOS }),
+      { AWS_REGION: "us-east-1" }
+    );
+
+    expect(out.pipelineName).toBe(APP_IOS);
+    expect(out.region).toBe("us-west-2");
+    expect(out.repo).toBe("acme/app");
+    const call = h.state.cpCalls.find((c) => c.type === "GetPipelineState");
+    expect(call.name).toBe(APP_IOS);
+    expect(call.region).toBe("us-west-2");
+  });
+
+  it("accepts start_deploy on the iOS pipeline — it is a known write target", async () => {
+    const sha = "b".repeat(40);
+    const out = await withRegistry(
+      IOS_REGISTRY,
+      (mod) => invokeOn(mod.handler, "start_deploy", { pipeline_name: APP_IOS, commit_sha: sha }),
+      { AWS_REGION: "us-east-1" }
+    );
+
+    expect(out.started).toBe(true);
+    expect(out.pipelineExecutionId).toBe("exec-new");
+    const start = h.state.cpCalls.find((c) => c.type === "StartPipelineExecution");
+    expect(start.name).toBe(APP_IOS);
+    expect(start.region).toBe("us-west-2");
+  });
+
+  it("lists BOTH pipelines of a repo when an unqualified start_deploy is refused", async () => {
+    const out = await withRegistry(
+      IOS_REGISTRY,
+      (mod) => invokeOn(mod.handler, "start_deploy", { commit_sha: "c".repeat(40) }),
+      { AWS_REGION: "us-east-1" }
+    );
+
+    // The iOS pipeline is a target, so it is enumerable — but the App Store
+    // submit is a human gate, so the RM must still name it explicitly.
+    expect(out).toEqual({
+      ok: false,
+      reason: "pipeline_name_required",
+      known: [APP_BACKEND, APP_IOS, HUB],
+    });
+    expect(h.state.cpCalls).toEqual([]);
+  });
+
+  it("never treats the iOS pipeline as the env default (unqualified read is the hub, not the app)", async () => {
+    h.state.getPipelineStateImpl = async () => ({ stageStates: [] });
+    const out = await withRegistry(IOS_REGISTRY, (mod) => invokeOn(mod.handler, "get_state", {}), {
+      AWS_REGION: "us-east-1",
+    });
+
+    expect(out.pipelineName).toBe(HUB);
+    expect(out.repo).toBe("tycenjmccann/agentcore-hub");
+  });
+
+  it("derives the iOS pipeline's macOS ci/build projects (get_build_status reaches them)", async () => {
+    h.state.listBuildsImpl = async () => ({ ids: [] });
+    const out = await withRegistry(
+      IOS_REGISTRY,
+      (mod) => invokeOn(mod.handler, "get_build_status", { project: "hub-app-ios-ci" }),
+      { AWS_REGION: "us-east-1" }
+    );
+
+    // hub-app-ios-ci is derived from the iOS pipeline's base (hub-app-ios), so it
+    // is a known project and the read is not refused.
+    expect(out.reason).not.toBe("project_not_registered");
+    const call = h.state.cbCalls.find((c) => c.type === "ListBuildsForProject");
+    expect(call.region).toBe("us-west-2");
+  });
+});

@@ -1,0 +1,380 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  hub-<Slug>-ios — the iOS App Store RELEASE pipeline the AgentCore Hub triggers
+  and watches, owned by and running in THIS (the app's) account. macOS CodeBuild
+  (MAC_ARM). Source -> Build (xcodebuild archive + sign + export IPA + TestFlight
+  upload) -> Approval (human App Store SUBMIT gate, bridged to Telegram) -> Deploy
+  (submit the uploaded build to App Store review). Names follow the hub
+  convention hub-<Slug>-ios-{deploy,ci,build} — a hub-*-deploy pipeline name — so
+  the hub resolves them from the CD registry's `iosPipeline` field with no extra
+  IAM and the SAME hub-cd-trigger-<Slug> role as the backend pipeline. This is a
+  SECOND pipeline for the repo; the backend/web pipeline is hub-repo-pipeline in
+  ../backend/. Deploy AFTER ../hub-cd-trigger-role.cfn.yaml.
+
+Parameters:
+  Slug:
+    Type: String
+    Description: Short repo slug (e.g. juno). Pipeline=hub-<Slug>-ios-deploy, projects=hub-<Slug>-ios-{ci,build,deploy}.
+    AllowedPattern: "^[a-z0-9][a-z0-9-]{1,30}$"
+  GitHubOwner:
+    Type: String
+    Description: GitHub owner/org.
+  GitHubRepo:
+    Type: String
+    Description: GitHub repo name.
+  GitHubBranch:
+    Type: String
+    Default: main
+  GitHubConnectionArn:
+    Type: String
+    Description: >-
+      THIS account's own CodeConnections (CodeStar) GitHub connection ARN. Create
+      it once in the console (Developer Tools -> Connections) and complete the
+      GitHub App handshake; it must be status AVAILABLE before Deploy.
+    AllowedPattern: "^arn:aws:codeconnections:.*|^arn:aws:codestar-connections:.*"
+  ExistingMacFleetArn:
+    Type: String
+    Description: >-
+      REUSE an existing MAC_ARM reserved CodeBuild fleet (e.g. the fleet already
+      backing your iOS test builds) by ARN. Leave blank to have this stack create
+      a small one. macOS builds REQUIRE a reserved fleet — there is no on-demand
+      macOS compute.
+    Default: ""
+  MacFleetComputeType:
+    Type: String
+    Description: Compute for a fleet created by this stack (ignored when ExistingMacFleetArn is set).
+    Default: BUILD_GENERAL1_MEDIUM
+    AllowedValues: [BUILD_GENERAL1_MEDIUM, BUILD_GENERAL1_LARGE]
+  MacImage:
+    Type: String
+    Description: macOS CodeBuild image (Xcode toolchain). Pin to your target Xcode.
+    Default: aws/codebuild/macos-arm-base:14
+  SigningSecretsPath:
+    Type: String
+    Description: >-
+      Secrets Manager path (may end in *) holding the signing cert/.p12, the
+      provisioning profile, and the App Store Connect API key (.p8). LLM-BLIND:
+      the buildspecs read these at build time; they are NEVER in the repo, the
+      registry, or any agent prompt. The build/deploy roles get GetSecretValue on
+      exactly this path.
+    Default: ""
+  ApprovalEmail:
+    Type: String
+    Description: Optional email to also receive the App Store submit-gate notification (Telegram bridge is separate).
+    Default: ""
+
+Conditions:
+  CreateMacFleet: !Equals [!Ref ExistingMacFleetArn, ""]
+  HasApprovalEmail: !Not [!Equals [!Ref ApprovalEmail, ""]]
+  HasSigningSecrets: !Not [!Equals [!Ref SigningSecretsPath, ""]]
+
+Resources:
+  # ── MAC_ARM reserved fleet (created only when ExistingMacFleetArn is blank) ──
+  MacFleet:
+    Type: AWS::CodeBuild::Fleet
+    Condition: CreateMacFleet
+    Properties:
+      Name: !Sub "hub-${Slug}-ios-fleet"
+      BaseCapacity: 1
+      ComputeType: !Ref MacFleetComputeType
+      EnvironmentType: MAC_ARM
+      OverflowBehavior: QUEUE
+
+  # ── Pipeline artifact store ────────────────────────────────────────────────
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !Sub "hub-${Slug}-ios-pipeline-artifacts-${AWS::AccountId}-${AWS::Region}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-artifacts
+            Status: Enabled
+            ExpirationInDays: 30
+
+  # ── App Store submit-gate notification topic (subscribe the Telegram bridge) ─
+  ApprovalTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "hub-${Slug}-ios-deploy-approval"
+  ApprovalEmailSub:
+    Type: AWS::SNS::Subscription
+    Condition: HasApprovalEmail
+    Properties:
+      TopicArn: !Ref ApprovalTopic
+      Protocol: email
+      Endpoint: !Ref ApprovalEmail
+
+  # ── CI project (PR check: build for simulator + run XCTests; deploys NOTHING) ─
+  CiProjectRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "hub-${Slug}-ios-ci-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codebuild.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ci
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: Logs
+                Effect: Allow
+                Action: ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/hub-${Slug}-ios-ci:*"
+              - Sid: Connection
+                Effect: Allow
+                Action:
+                  - "codeconnections:GetConnectionToken"
+                  - "codeconnections:GetConnection"
+                  - "codeconnections:UseConnection"
+                  - "codestar-connections:GetConnectionToken"
+                  - "codestar-connections:GetConnection"
+                  - "codestar-connections:UseConnection"
+                Resource: !Ref GitHubConnectionArn
+
+  CiProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "hub-${Slug}-ios-ci"
+      Description: iOS PR check (build + XCTest on simulator). Deploys NOTHING. Reports commit status.
+      ServiceRole: !GetAtt CiProjectRole.Arn
+      Artifacts: { Type: NO_ARTIFACTS }
+      Environment:
+        Type: MAC_ARM
+        ComputeType: !Ref MacFleetComputeType
+        Image: !Ref MacImage
+        Fleet:
+          FleetArn: !If [CreateMacFleet, !GetAtt MacFleet.Arn, !Ref ExistingMacFleetArn]
+      Source:
+        Type: GITHUB
+        Location: !Sub "https://github.com/${GitHubOwner}/${GitHubRepo}.git"
+        BuildSpec: .hub/buildspec-ios-ci.yml
+        ReportBuildStatus: true
+        Auth:
+          Type: CODECONNECTIONS
+          Resource: !Ref GitHubConnectionArn
+      Triggers:
+        Webhook: true
+        FilterGroups:
+          - - Type: EVENT
+              Pattern: PULL_REQUEST_CREATED,PULL_REQUEST_UPDATED,PULL_REQUEST_REOPENED
+      ConcurrentBuildLimit: 2
+
+  # ── Build project (archive + sign + export IPA + TestFlight upload) ──────────
+  BuildProjectRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "hub-${Slug}-ios-build-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codebuild.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: build
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: Logs
+                Effect: Allow
+                Action: ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/hub-${Slug}-ios-build:*"
+              - Sid: Artifacts
+                Effect: Allow
+                Action: ["s3:GetObject", "s3:GetObjectVersion", "s3:PutObject", "s3:GetBucketLocation"]
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub "${ArtifactBucket.Arn}/*"
+              # Signing cert/.p12 + provisioning profile + App Store Connect .p8.
+              # LLM-blind: only the build container reads these.
+              - !If
+                - HasSigningSecrets
+                - Sid: SigningSecrets
+                  Effect: Allow
+                  Action: ["secretsmanager:GetSecretValue"]
+                  Resource: !Ref SigningSecretsPath
+                - !Ref AWS::NoValue
+
+  BuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "hub-${Slug}-ios-build"
+      ServiceRole: !GetAtt BuildProjectRole.Arn
+      Artifacts: { Type: CODEPIPELINE }
+      TimeoutInMinutes: 60
+      Environment:
+        Type: MAC_ARM
+        ComputeType: !Ref MacFleetComputeType
+        Image: !Ref MacImage
+        Fleet:
+          FleetArn: !If [CreateMacFleet, !GetAtt MacFleet.Arn, !Ref ExistingMacFleetArn]
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: .hub/buildspec-ios-build.yml
+
+  # ── Deploy project (submit the uploaded build to App Store review) ───────────
+  # Runs AFTER a human approves the App Store submit gate. It does NOT re-archive
+  # — it submits the TestFlight build the Build stage already uploaded, using the
+  # App Store Connect API key.
+  DeployProjectRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "hub-${Slug}-ios-deploy-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codebuild.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: deploy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: Logs
+                Effect: Allow
+                Action: ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/hub-${Slug}-ios-deploy:*"
+              - Sid: Artifacts
+                Effect: Allow
+                Action: ["s3:GetObject", "s3:GetObjectVersion", "s3:GetBucketLocation"]
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub "${ArtifactBucket.Arn}/*"
+              - !If
+                - HasSigningSecrets
+                - Sid: AscApiKey
+                  Effect: Allow
+                  Action: ["secretsmanager:GetSecretValue"]
+                  Resource: !Ref SigningSecretsPath
+                - !Ref AWS::NoValue
+
+  DeployProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "hub-${Slug}-ios-deploy"
+      ServiceRole: !GetAtt DeployProjectRole.Arn
+      Artifacts: { Type: CODEPIPELINE }
+      TimeoutInMinutes: 30
+      Environment:
+        Type: MAC_ARM
+        ComputeType: !Ref MacFleetComputeType
+        Image: !Ref MacImage
+        Fleet:
+          FleetArn: !If [CreateMacFleet, !GetAtt MacFleet.Arn, !Ref ExistingMacFleetArn]
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: .hub/buildspec-ios-deploy.yml
+
+  # ── The pipeline ─────────────────────────────────────────────────────────────
+  PipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "hub-${Slug}-ios-pipeline-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codepipeline.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: pipeline
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: Artifacts
+                Effect: Allow
+                Action: ["s3:GetObject", "s3:GetObjectVersion", "s3:PutObject", "s3:GetBucketLocation", "s3:ListBucket"]
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub "${ArtifactBucket.Arn}/*"
+              - Sid: Connection
+                Effect: Allow
+                Action:
+                  - "codeconnections:UseConnection"
+                  - "codestar-connections:UseConnection"
+                Resource: !Ref GitHubConnectionArn
+              - Sid: RunBuilds
+                Effect: Allow
+                Action: ["codebuild:StartBuild", "codebuild:BatchGetBuilds", "codebuild:StopBuild"]
+                Resource:
+                  - !GetAtt BuildProject.Arn
+                  - !GetAtt DeployProject.Arn
+              - Sid: ApprovalNotify
+                Effect: Allow
+                Action: ["sns:Publish"]
+                Resource: !Ref ApprovalTopic
+
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub "hub-${Slug}-ios-deploy"
+      PipelineType: V2
+      RoleArn: !GetAtt PipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: Source
+              ActionTypeId: { Category: Source, Owner: AWS, Provider: CodeStarSourceConnection, Version: "1" }
+              Configuration:
+                ConnectionArn: !Ref GitHubConnectionArn
+                FullRepositoryId: !Sub "${GitHubOwner}/${GitHubRepo}"
+                BranchName: !Ref GitHubBranch
+                OutputArtifactFormat: CODE_ZIP
+                # Merge does NOT auto-ship the app: the release manager calls
+                # Pipeline___start_deploy. Change detection off so a push cannot.
+                DetectChanges: "false"
+              OutputArtifacts: [{ Name: SourceOutput }]
+        - Name: Build
+          Actions:
+            - Name: Build
+              ActionTypeId: { Category: Build, Owner: AWS, Provider: CodeBuild, Version: "1" }
+              Configuration: { ProjectName: !Ref BuildProject }
+              InputArtifacts: [{ Name: SourceOutput }]
+              OutputArtifacts: [{ Name: BuildOutput }]
+        - Name: Approval
+          Actions:
+            - Name: AppStoreSubmitGate
+              ActionTypeId: { Category: Approval, Owner: AWS, Provider: Manual, Version: "1" }
+              Configuration:
+                NotificationArn: !Ref ApprovalTopic
+                CustomData: !Sub >-
+                  Approve to SUBMIT hub-${Slug}-ios-deploy to App Store review. The
+                  build is already on TestFlight. This is a HUMAN gate; the hub
+                  cannot pass it.
+        - Name: Deploy
+          Actions:
+            - Name: SubmitToAppStore
+              ActionTypeId: { Category: Build, Owner: AWS, Provider: CodeBuild, Version: "1" }
+              Configuration: { ProjectName: !Ref DeployProject }
+              InputArtifacts: [{ Name: BuildOutput }]
+
+Outputs:
+  PipelineName:
+    Description: Register this as `iosPipeline` in the hub CD registry entry (alongside the backend `pipeline`).
+    Value: !Ref Pipeline
+  ApprovalTopicArn:
+    Description: Subscribe the hub's Telegram deploy-approval bridge to this topic for the App Store submit gate.
+    Value: !Ref ApprovalTopic
+  MacFleetArn:
+    Description: The MAC_ARM fleet these projects run on (created here, or the one you passed in).
+    Value: !If [CreateMacFleet, !GetAtt MacFleet.Arn, !Ref ExistingMacFleetArn]
+  Region:
+    Description: The `region` for the registry entry (shared with the backend pipeline).
+    Value: !Ref AWS::Region

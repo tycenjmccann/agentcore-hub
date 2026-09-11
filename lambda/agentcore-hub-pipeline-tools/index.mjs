@@ -431,27 +431,47 @@ async function listTargets() {
   const targets = [];
   const seen = new Set();
   for (const entry of registry?.repos || []) {
-    const projects = pipelineProjects(entry);
-    // No pipeline → a DEPLOY.md-mode CD repo. Nothing here can drive it.
-    if (!projects || seen.has(projects.pipeline)) continue;
-    seen.add(projects.pipeline);
-    targets.push({
-      repo: entry.repo || null,
-      pipeline: projects.pipeline,
-      region: projects.region || REGION,
-      // Cross-account trigger role, or null for the same-account common case.
-      roleArn: projects.roleArn || null,
-      externalId: projects.externalId || null,
-      ciProject: projects.ciProject,
-      buildProject: projects.buildProject,
-      deployProject: projects.deployProject,
-      // The registry may name the deployment's OWN pipeline, and normally does.
-      // That entry IS the env default — it just carries the registry's
-      // region/ciProject instead of env's. Stamping false here (TEAM-4358) left
-      // NO target flagged, and resolveTarget's fallback then degraded to registry
-      // ORDER.
-      isEnvDefault: projects.pipeline === PIPELINE_NAME,
-    });
+    // A repo can name TWO pipelines: `pipeline` (the backend/web deploy) and
+    // `iosPipeline` (the App Store release, hub-<slug>-ios-deploy). Both are
+    // hub-*-deploy names, so pipelineProjects() derives each one's ci/build/
+    // deploy the same way and the hub-* IAM wildcards already cover both — the
+    // iOS pipeline needs no new grant. The synthetic entry for the iOS pipeline
+    // carries the SAME region + cross-account trigger role/externalId as the
+    // backend one (the trigger role is scoped by slug, hub-<slug>-*), and its ci
+    // project is derived (never the backend's explicit ciProject override).
+    const perEntry = [
+      pipelineProjects(entry),
+      pipelineProjects({
+        pipeline: entry.iosPipeline,
+        region: entry.region,
+        roleArn: entry.roleArn,
+        externalId: entry.externalId,
+      }),
+    ];
+    for (const projects of perEntry) {
+      // No pipeline (this slot empty, or a DEPLOY.md-mode CD repo) → nothing to
+      // drive; a name already claimed by an earlier target → skip the dup.
+      if (!projects || seen.has(projects.pipeline)) continue;
+      seen.add(projects.pipeline);
+      targets.push({
+        repo: entry.repo || null,
+        pipeline: projects.pipeline,
+        region: projects.region || REGION,
+        // Cross-account trigger role, or null for the same-account common case.
+        roleArn: projects.roleArn || null,
+        externalId: projects.externalId || null,
+        ciProject: projects.ciProject,
+        buildProject: projects.buildProject,
+        deployProject: projects.deployProject,
+        // The registry may name the deployment's OWN pipeline, and normally does.
+        // That entry IS the env default — it just carries the registry's
+        // region/ciProject instead of env's. Stamping false here (TEAM-4358) left
+        // NO target flagged, and resolveTarget's fallback then degraded to registry
+        // ORDER. An iOS pipeline is never the env default (hub-*-ios-deploy !=
+        // PIPELINE_NAME), so it never wins an unqualified call.
+        isEnvDefault: projects.pipeline === PIPELINE_NAME,
+      });
+    }
   }
   if (!seen.has(PIPELINE_NAME)) {
     targets.push({

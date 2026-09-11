@@ -31,6 +31,15 @@ describe("cd-registry (app)", () => {
     expect(parseCdRegistry("garbage").repos).toEqual([]);
   });
 
+  it("parseCdRegistry keeps iosPipeline; upsert can set and later clear it", () => {
+    const e = parseCdRegistry({ repos: [{ repo: "acme/app", pipeline: "hub-app-deploy", iosPipeline: " hub-app-ios-deploy " }] }).repos[0];
+    expect(e.iosPipeline).toBe("hub-app-ios-deploy");
+    const set = upsertCdEntry(reg, { repo: "acme/app", pipeline: "hub-app-deploy", iosPipeline: "hub-app-ios-deploy" });
+    expect(set.repos.find((r) => r.repo === "acme/app")?.iosPipeline).toBe("hub-app-ios-deploy");
+    const cleared = upsertCdEntry(set, { repo: "acme/app", iosPipeline: "" });
+    expect(cleared.repos.find((r) => r.repo === "acme/app")?.iosPipeline).toBeUndefined();
+  });
+
   it("upsert normalizes, merges, clears blank fields and keeps addedAt; remove drops by key", () => {
     const added = upsertCdEntry(reg, { repo: "https://github.com/Acme/Juno.git", pipeline: "juno-deploy", notes: "n" });
     expect(added.repos.map((e) => e.repo)).toEqual(["acme/hub", "acme/juno"]);
@@ -254,6 +263,14 @@ describe("validateCdEntryInput", () => {
     expect(validateCdEntryInput({ repo: "a/b", pipeline: "my pipeline" })).toEqual({ pipeline: "must be a valid CodePipeline name (1-100 chars of [A-Za-z0-9.@_-])" });
     expect(validateCdEntryInput({ repo: "a/b", pipeline: "bad/name" })).toEqual({ pipeline: "must be a valid CodePipeline name (1-100 chars of [A-Za-z0-9.@_-])" });
     expect(validateCdEntryInput({ repo: "a/b", pipeline: "x".repeat(101) })).toEqual({ pipeline: "must be a valid CodePipeline name (1-100 chars of [A-Za-z0-9.@_-])" });
+  });
+
+  it("iosPipeline: same CodePipeline name rules as pipeline (the second, App Store pipeline)", () => {
+    expect(validateCdEntryInput({ repo: "a/b", iosPipeline: "hub-app-ios-deploy" })).toBeNull();
+    expect(validateCdEntryInput({ repo: "a/b", iosPipeline: "my ios pipeline" })).toEqual({ iosPipeline: "must be a valid CodePipeline name (1-100 chars of [A-Za-z0-9.@_-])" });
+    expect(validateCdEntryInput({ repo: "a/b", iosPipeline: "x".repeat(101) })).toEqual({ iosPipeline: "must be a valid CodePipeline name (1-100 chars of [A-Za-z0-9.@_-])" });
+    // A blank iosPipeline is the "clear it" signal, not a value to validate.
+    expect(validateCdEntryInput({ repo: "a/b", iosPipeline: "" })).toBeNull();
   });
 
   it("ciProject: CodeBuild project name rules", () => {
