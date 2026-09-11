@@ -58,6 +58,14 @@ export interface HumanReviewMetric {
    * or outside the local window). Optional: metrics.json files written before
    * that change do not carry it. */
   outsideHours?: boolean | null;
+  /** TEAM-4453 D3 — waitMs split by whether the clock was inside or outside
+   * the business window, walking local calendar days rather than keying off
+   * requestedAt alone (a review straddling the boundary attributes only its
+   * own outside slice). inHoursMs + outsideHoursMs === waitMs; both null
+   * exactly when waitMs is null. Optional: absent from metrics.json files
+   * written before this change. */
+  inHoursMs?: number | null;
+  outsideHoursMs?: number | null;
 }
 
 /** TEAM-4121 FR-10 — one fix ticket's lineage. `tag` is why the run filed it:
@@ -103,6 +111,11 @@ export interface WorkflowMetrics {
   agentTasks: AgentTaskMetric[];
   humanReviews: HumanReviewMetric[];
   humanWaitTotalMs: number;
+  /** TEAM-4453 D3 — humanWaitTotalMs split the same way as each review's
+   * inHoursMs/outsideHoursMs, summed (nulls ignored). Optional: absent from
+   * metrics.json files written before this change. */
+  humanWaitInHoursMs?: number;
+  humanWaitOutsideHoursMs?: number;
   changeRequests: { count: number; cycles: ChangeRequestCycle[] };
   /** count/ticketIds are unchanged; entries/byKind/byTag are FR-10 additions and
    * absent from metrics.json files written before it. */
