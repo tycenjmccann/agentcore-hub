@@ -97,21 +97,28 @@
 }
 
 /* ===== Sleek dark scrollbars, app-wide (TEAM-4320) =====
-   Declared at `*` level, not just on the root: scrollbar-color inherits but
-   scrollbar-width does NOT, so a root-only rule leaves every nested scroll
-   container computing `auto`. The ::-webkit-* block is a fallback for engines
-   without standard support - Chromium >= 121 ignores it once scrollbar-width is
-   not `auto`. Tokens only; both themes define them. Specificity stays at 0-0-0
-   so the .scrollbar-thin utility and component rules still win. */
+   Two engines, two paths. Chromium/Safari take the ::-webkit-scrollbar rules
+   below (6px, token colours, no buttons); Firefox takes the standard
+   scrollbar-width / scrollbar-color pair. Declared at `*`, not the root, because
+   scrollbar-width does not inherit. The @supports block resets the standard pair
+   on WebKit engines: Chromium >= 121 ignores every ::-webkit-scrollbar rule on an
+   element whose scrollbar-width is not `auto`, which would also switch off the
+   existing component scrollbars in pipeline.css. Tokens only; both themes define
+   them. Specificity stays at 0-0-0 so .scrollbar-thin and component rules win. */
 * {
   scrollbar-width: thin;
   scrollbar-color: var(--color-surface-4) transparent;
+}
+@supports selector(::-webkit-scrollbar) {
+  * {
+    scrollbar-width: auto;
+    scrollbar-color: auto;
+  }
 }
 
 *::-webkit-scrollbar {
   width: 6px;
   height: 6px;
-  background: transparent;
 }
 *::-webkit-scrollbar-track {
   background: transparent;
