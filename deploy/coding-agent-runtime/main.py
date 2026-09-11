@@ -104,6 +104,39 @@ _MIRROR_LOCK_POLL_S = 1.0
 # window where a live build's lock looks stale and gets stolen.
 _MIRROR_LOCK_STALE_S = max(1800, MIRROR_BUILD_TIMEOUT_S + 300)
 
+# ── Shared dependency cache (node_modules) ───────────────────────────────────
+# Every workflow ticket's checkout is a fresh clone, so `node_modules` was absent
+# and the CLI ran `npm ci` on EFS the first time it wanted tsc/vitest/playwright:
+# 3-8 min per attempt over NFS (40k small files), zero-byte packages under load
+# and retry loops, then AGAIN for every git worktree the worker fanned out. The
+# 2026-09-10 operator pilots spent 50-75% of wall clock there.
+# Design: ONE `npm ci` per lockfile hash, ever. The result is packed as a tarball
+# on EFS (.deps/<hash>.tar — one sequential file, the access pattern EFS is good
+# at); each microVM extracts it ONCE onto container-local disk (DEPS_LOCAL_ROOT,
+# ~4 GB free per VM; the 40k files tsc/vitest/next read then come off local disk),
+# and every checkout on that VM gets a `node_modules` SYMLINK to that copy. A
+# post-checkout git hook extends the link to every `git worktree add`, so
+# subagent fan-out no longer copies or re-installs anything. Deliberately NOT
+# baked into the image: AgentCore caps a runtime image at 2 GB and this one is
+# already ~1.85 GB compressed. Kill-switch: WORKSPACE_DEPS_ENABLED=0 → no link,
+# no hook (the old behaviour).
+WORKSPACE_DEPS_ENABLED = os.environ.get("WORKSPACE_DEPS_ENABLED", "1").lower() not in ("0", "false", "no")
+DEPS_ROOT = os.path.join(WORKSPACE_ROOT, ".deps")                       # shared: <hash>.tar (+ <hash>/ fallback dir)
+DEPS_LOCAL_ROOT = os.environ.get("DEPS_LOCAL_ROOT", "/tmp/deps")        # noqa: S108 — per-VM extracted copies
+DEPS_BUILD_TIMEOUT_S = _safe_int_env("DEPS_BUILD_TIMEOUT_S", 900)      # the one npm ci per lock hash
+DEPS_EXTRACT_TIMEOUT_S = _safe_int_env("DEPS_EXTRACT_TIMEOUT_S", 600)  # tar -xf onto local disk
+# Extract locally only with this much free disk relative to the tarball (files
+# expand slightly; leave room for .next/ and the CLI's own scratch).
+DEPS_LOCAL_HEADROOM = 2.0
+# Tarballs for lockfiles nobody has used in this long are swept on the next
+# publish — a lock changes roughly weekly and each tarball is ~700 MB.
+DEPS_TAR_TTL_S = _safe_int_env("DEPS_TAR_TTL_S", 30 * 86400)
+# A session behind another VM's build WAITS for it (the alternative is a second
+# identical build on the same mount); stale is derived from the build timeout
+# for the same reason as the mirror lock.
+_DEPS_LOCK_WAIT_S = DEPS_BUILD_TIMEOUT_S + 60
+_DEPS_LOCK_STALE_S = max(1800, DEPS_BUILD_TIMEOUT_S + 300)
+
 DEFAULT_CLI = "claude"
 CLAUDE_MODEL = os.environ.get("ANTHROPIC_MODEL") or os.environ.get(
     "CLAUDE_MODEL", "us.anthropic.claude-fable-5-1"
@@ -1363,7 +1396,8 @@ def _is_mirror(path: str) -> bool:
     return os.path.isfile(os.path.join(path, "HEAD")) and os.path.isdir(os.path.join(path, "objects"))
 
 
-def _acquire_mirror_lock(lock_path: str) -> str | None:
+def _acquire_mirror_lock(lock_path: str, wait_s: float | None = None,
+                         stale_s: float | None = None) -> str | None:
     """Take this repo's mirror lock; return an ownership token, or None.
 
     O_CREAT|O_EXCL, deliberately NOT fcntl.flock: the lock is shared across
@@ -1378,8 +1412,10 @@ def _acquire_mirror_lock(lock_path: str) -> str | None:
     if this holder's lock was nonetheless stolen (clock skew, an operator's manual
     unlink+relock), its release must not unlink the NEW holder's lock — that would
     admit a third builder onto the same mirror."""
+    wait_s = _MIRROR_LOCK_WAIT_S if wait_s is None else wait_s
+    stale_s = _MIRROR_LOCK_STALE_S if stale_s is None else stale_s
     token = f"{os.getpid()}-{uuid.uuid4().hex}"
-    deadline = time.time() + _MIRROR_LOCK_WAIT_S
+    deadline = time.time() + wait_s
     while True:
         try:
             fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
@@ -1394,7 +1430,7 @@ def _acquire_mirror_lock(lock_path: str) -> str | None:
             logger.warning("mirror_lock_failed", extra={"error": str(exc)[:200]})
             return None
         try:
-            if time.time() - os.path.getmtime(lock_path) > _MIRROR_LOCK_STALE_S:
+            if time.time() - os.path.getmtime(lock_path) > stale_s:
                 victim = f"{lock_path}.stale.{uuid.uuid4().hex[:8]}"
                 os.rename(lock_path, victim)  # atomic — only one racer wins
                 os.unlink(victim)
@@ -1939,6 +1975,357 @@ def _checkout_branch(workdir: str, branch: str) -> None:
         logger.warning("checkout_branch_failed", extra={"branch": safe, "err": res.stderr.strip()[:200]})
     else:
         logger.info("checkout_branch_ok", extra={"branch": safe})
+
+
+# ─── Dependency provisioning (node_modules) ──────────────────────────────────
+
+# Marker line that identifies OUR post-checkout hook, so a re-provision can
+# refresh it and a hook the repo/user installed is never clobbered.
+_DEPS_HOOK_MARK = "coding-runtime deps hook"
+_DEPS_HOOK = """#!/bin/sh
+# %s — installed by deploy/coding-agent-runtime/main.py (_install_deps_hook).
+# `git worktree add` runs post-checkout inside the new worktree: link the main
+# checkout's provisioned node_modules there instead of copying it or letting a
+# subagent run `npm ci` on EFS. A plain `git checkout` in a tree that already
+# has node_modules is a no-op. Never fails the checkout.
+[ -e node_modules ] && exit 0
+[ -f package-lock.json ] || exit 0
+common="$(git rev-parse --git-common-dir 2>/dev/null)" || exit 0
+main="$(cd "$common/.." 2>/dev/null && pwd -P)" || exit 0
+[ "$main" = "$(pwd -P)" ] && exit 0
+cmp -s package-lock.json "$main/package-lock.json" || exit 0
+target="$(readlink -f "$main/node_modules" 2>/dev/null)"
+[ -n "$target" ] && [ -d "$target" ] && ln -s "$target" node_modules
+exit 0
+""" % _DEPS_HOOK_MARK
+
+
+def _lock_hash(lock_path: str) -> str | None:
+    """Cache key for one dependency set: the first 16 hex of sha256(package-lock.json)."""
+    try:
+        with open(lock_path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()[:16]
+    except OSError:
+        return None
+
+
+def _deps_usable(nm: str) -> bool:
+    """A node_modules dir a checkout can be pointed at: present, non-empty and
+    WRITABLE (vitest/vite write caches under node_modules/.vite)."""
+    if not os.path.isdir(nm):
+        return False
+    probe = os.path.join(nm, f".deps-write-probe-{uuid.uuid4().hex[:8]}")
+    try:
+        if not os.listdir(nm):
+            return False
+        with open(probe, "w") as f:
+            f.write("ok")
+        os.unlink(probe)
+        return True
+    except OSError:
+        return False
+
+
+def _deps_tar_path(lock_hash: str) -> str:
+    return os.path.join(DEPS_ROOT, f"{lock_hash}.tar")
+
+
+def _local_has_room(need_bytes: int) -> bool:
+    try:
+        os.makedirs(DEPS_LOCAL_ROOT, exist_ok=True)
+        return shutil.disk_usage(DEPS_LOCAL_ROOT).free >= need_bytes * DEPS_LOCAL_HEADROOM
+    except OSError:
+        return False
+
+
+def _npm_ci_into(workdir: str, dest: str, lock_hash: str) -> str | None:
+    """Run ONE `npm ci` for the checkout's lockfile into `dest` (a fresh dir that
+    receives copies of package.json / package-lock.json / .npmrc). Returns dest on
+    success, None on failure (dest removed). Never raises."""
+    try:
+        os.makedirs(dest, exist_ok=True)
+        for name in ("package.json", "package-lock.json", ".npmrc"):
+            src = os.path.join(workdir, name)
+            if os.path.isfile(src):
+                shutil.copy2(src, os.path.join(dest, name))
+        env = {**os.environ, "CI": "1", "PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD": "1",
+               "PUPPETEER_SKIP_DOWNLOAD": "1", "npm_config_update_notifier": "false"}
+        res = subprocess.run(["npm", "ci", "--no-audit", "--no-fund", "--loglevel=error"],
+                             cwd=dest, env=env, capture_output=True, text=True,
+                             timeout=DEPS_BUILD_TIMEOUT_S)
+        if res.returncode == 0 and os.path.isdir(os.path.join(dest, "node_modules")):
+            return dest
+        logger.warning("deps_npm_ci_failed", extra={
+            "lock_hash": lock_hash, "dest": dest, "rc": res.returncode,
+            "stderr": res.stderr.strip()[-400:]})
+    except subprocess.TimeoutExpired:
+        logger.warning("deps_npm_ci_timeout", extra={"lock_hash": lock_hash, "timeout_s": DEPS_BUILD_TIMEOUT_S})
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("deps_npm_ci_error", extra={"lock_hash": lock_hash, "error": str(exc)[:200]})
+    shutil.rmtree(dest, ignore_errors=True)
+    return None
+
+
+def _extract_deps_tar(tar_path: str, dest_parent: str, lock_hash: str) -> str | None:
+    """Unpack .deps/<hash>.tar (one top-level `node_modules/`) into
+    dest_parent/<hash>/ by staging + atomic rename; return the node_modules path.
+    Idempotent: an already-usable copy is returned as is. Never raises."""
+    final = os.path.join(dest_parent, lock_hash)
+    nm = os.path.join(final, "node_modules")
+    if _deps_usable(nm):
+        return nm
+    staging = f"{final}.tmp.{uuid.uuid4().hex[:8]}"
+    try:
+        os.makedirs(staging, exist_ok=True)
+        res = subprocess.run(["tar", "-xf", tar_path, "-C", staging], capture_output=True,
+                             text=True, timeout=DEPS_EXTRACT_TIMEOUT_S)
+        if res.returncode == 0 and os.path.isdir(os.path.join(staging, "node_modules")):
+            try:
+                os.rename(staging, final)
+            except OSError:
+                shutil.rmtree(staging, ignore_errors=True)  # a racer published first — use theirs
+            return nm if _deps_usable(nm) else None
+        logger.warning("deps_extract_failed", extra={"lock_hash": lock_hash, "dest": dest_parent,
+                                                     "error": res.stderr.strip()[-200:]})
+    except subprocess.TimeoutExpired:
+        logger.warning("deps_extract_timeout", extra={"lock_hash": lock_hash, "timeout_s": DEPS_EXTRACT_TIMEOUT_S})
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("deps_extract_error", extra={"lock_hash": lock_hash, "error": str(exc)[:200]})
+    shutil.rmtree(staging, ignore_errors=True)
+    return None
+
+
+def _publish_deps_tar(build_dir: str, lock_hash: str) -> bool:
+    """Pack build_dir/node_modules to EFS as .deps/<hash>.tar (temp + atomic
+    rename, so a reader never sees a partial tarball). One sequential write is
+    the EFS-friendly shape; the 40k individual files never touch the mount."""
+    tar_path = _deps_tar_path(lock_hash)
+    tmp = f"{tar_path}.tmp.{uuid.uuid4().hex[:8]}"
+    try:
+        res = subprocess.run(["tar", "-cf", tmp, "-C", build_dir, "node_modules"],
+                             capture_output=True, text=True, timeout=DEPS_BUILD_TIMEOUT_S)
+        if res.returncode != 0:
+            logger.warning("deps_publish_failed", extra={"lock_hash": lock_hash, "error": res.stderr.strip()[-200:]})
+            raise OSError(res.stderr.strip()[-100:])
+        os.rename(tmp, tar_path)
+        lock_copy = os.path.join(build_dir, "package-lock.json")
+        if os.path.isfile(lock_copy):  # for humans debugging the cache
+            shutil.copy2(lock_copy, os.path.join(DEPS_ROOT, f"{lock_hash}.package-lock.json"))
+        _sweep_deps_tars()
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("deps_publish_failed", extra={"lock_hash": lock_hash, "error": str(exc)[:200]})
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return False
+
+
+def _sweep_deps_tars() -> None:
+    """Best-effort TTL sweep of tarballs (and their lock copies) nobody has
+    touched in DEPS_TAR_TTL_S. Run only on publish, so a quiet cache costs nothing."""
+    try:
+        now = time.time()
+        for name in os.listdir(DEPS_ROOT):
+            if not name.endswith(".tar"):
+                continue
+            path = os.path.join(DEPS_ROOT, name)
+            try:
+                if now - os.path.getmtime(path) > DEPS_TAR_TTL_S:
+                    os.remove(path)
+                    lock_copy = os.path.join(DEPS_ROOT, name[:-4] + ".package-lock.json")
+                    if os.path.exists(lock_copy):
+                        os.remove(lock_copy)
+                    logger.info("deps_tar_swept", extra={"tar": name})
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def _extract_deps_to_efs(tar_path: str, lock_hash: str) -> str | None:
+    """No local room: unpack the tarball ONCE into the shared .deps/<hash>/ dir
+    (serialized across VMs) and let checkouts link to EFS. Slower reads than a
+    local copy, but still no per-session install."""
+    lock_file = os.path.join(DEPS_ROOT, f"{lock_hash}.lock")
+    token = _acquire_mirror_lock(lock_file, wait_s=_DEPS_LOCK_WAIT_S, stale_s=_DEPS_LOCK_STALE_S)
+    if not token:
+        return None
+    try:
+        return _extract_deps_tar(tar_path, DEPS_ROOT, lock_hash)
+    finally:
+        _release_mirror_lock(lock_file, token)
+
+
+def _build_deps(workdir: str, lock_hash: str) -> tuple[str | None, str]:
+    """First session ever for this lock: `npm ci` ONCE on local disk, publish the
+    tarball to EFS for every later VM, keep the local copy as this VM's cache.
+    Serialized across VMs by an EFS lock; a waiter that wakes to a published
+    tarball extracts it instead of building. If local disk refuses the build,
+    build straight into the shared EFS dir — still once per lock, never per
+    session. Returns (node_modules path or None, source label). Never raises."""
+    try:
+        os.makedirs(DEPS_ROOT, exist_ok=True)
+    except OSError as exc:
+        return None, f"mkdir: {str(exc)[:80]}"
+    lock_file = os.path.join(DEPS_ROOT, f"{lock_hash}.lock")
+    token = _acquire_mirror_lock(lock_file, wait_s=_DEPS_LOCK_WAIT_S, stale_s=_DEPS_LOCK_STALE_S)
+    if not token:
+        return None, "lock_timeout"
+    started = time.time()
+    try:
+        tar_path = _deps_tar_path(lock_hash)
+        if os.path.isfile(tar_path):  # built while we waited
+            return _extract_deps_tar(tar_path, DEPS_LOCAL_ROOT, lock_hash), "efs_tar"
+        efs_nm = os.path.join(DEPS_ROOT, lock_hash, "node_modules")
+        if _deps_usable(efs_nm):      # an earlier on-EFS build
+            return efs_nm, "efs"
+        local_final = os.path.join(DEPS_LOCAL_ROOT, lock_hash)
+        os.makedirs(DEPS_LOCAL_ROOT, exist_ok=True)
+        built = _npm_ci_into(workdir, f"{local_final}.build.{uuid.uuid4().hex[:8]}", lock_hash)
+        if built:
+            published = _publish_deps_tar(built, lock_hash)
+            try:
+                os.rename(built, local_final)
+            except OSError:
+                shutil.rmtree(built, ignore_errors=True)
+            nm = os.path.join(local_final, "node_modules")
+            logger.info("deps_build", extra={"lock_hash": lock_hash, "where": "local", "published": published,
+                                             "secs": round(time.time() - started)})
+            return (nm if _deps_usable(nm) else None), ("built" if published else "built_unpublished")
+        # Local disk refused (ENOSPC, missing) → build once, directly on EFS.
+        staging = os.path.join(DEPS_ROOT, f"{lock_hash}.tmp.{uuid.uuid4().hex[:8]}")
+        built = _npm_ci_into(workdir, staging, lock_hash)
+        if built:
+            os.rename(staging, os.path.join(DEPS_ROOT, lock_hash))
+            logger.info("deps_build", extra={"lock_hash": lock_hash, "where": "efs",
+                                             "secs": round(time.time() - started)})
+            return efs_nm, "built_efs"
+        return None, "build_failed"
+    except Exception as exc:  # noqa: BLE001 — the cache is an optimization, never a failure mode
+        logger.warning("deps_build_error", extra={"lock_hash": lock_hash, "error": str(exc)[:200]})
+        return None, "error"
+    finally:
+        _release_mirror_lock(lock_file, token)
+
+
+def _install_deps_hook(workdir: str) -> bool:
+    """Make worktrees inherit node_modules and keep the link out of `git status`.
+    A symlink is NOT matched by the usual `node_modules/` .gitignore rule (the
+    trailing slash means directories only, and git sees a symlink as a file), so
+    without the info/exclude entry the worker would see `?? node_modules` and
+    could `git add -A` it into the PR. Both files live in the common git dir, so
+    every worktree of this checkout honours them. Best-effort."""
+    try:
+        res = subprocess.run(["git", "rev-parse", "--git-common-dir"], cwd=workdir,
+                             capture_output=True, text=True, timeout=30)
+        if res.returncode != 0:
+            return False
+        gitdir = res.stdout.strip()
+        if not os.path.isabs(gitdir):
+            gitdir = os.path.join(workdir, gitdir)
+        exclude = os.path.join(gitdir, "info", "exclude")
+        os.makedirs(os.path.dirname(exclude), exist_ok=True)
+        try:
+            with open(exclude) as f:
+                lines = [l.strip() for l in f]
+        except OSError:
+            lines = []
+        if "node_modules" not in lines:
+            with open(exclude, "a") as f:
+                f.write("\nnode_modules\n")
+        hp = subprocess.run(["git", "config", "--get", "core.hooksPath"], cwd=workdir,
+                            capture_output=True, text=True, timeout=30)
+        if hp.returncode == 0 and hp.stdout.strip():
+            logger.info("deps_hook_skipped", extra={"reason": "core.hooksPath", "path": hp.stdout.strip()[:120]})
+            return False
+        hook = os.path.join(gitdir, "hooks", "post-checkout")
+        if os.path.exists(hook):
+            with open(hook) as f:
+                if _DEPS_HOOK_MARK not in f.read():
+                    logger.info("deps_hook_skipped", extra={"reason": "foreign_hook"})
+                    return False
+        os.makedirs(os.path.dirname(hook), exist_ok=True)
+        with open(hook, "w") as f:
+            f.write(_DEPS_HOOK)
+        os.chmod(hook, 0o755)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("deps_hook_failed", extra={"error": str(exc)[:200]})
+        return False
+
+
+def _link_deps(nm: str, target: str) -> None:
+    """Point `nm` (the checkout's node_modules) at `target`, replacing a link we
+    made earlier for a different lock. A REAL directory is left alone."""
+    if os.path.islink(nm):
+        if os.path.realpath(nm) == os.path.realpath(target):
+            return
+        os.unlink(nm)
+    os.symlink(target, nm)
+
+
+def _provision_deps(workdir: str | None) -> dict:
+    """Make `node_modules` exist in the checkout BEFORE the CLI runs, without
+    ever running `npm ci` on EFS per session. Order: this VM's local copy →
+    extract the shared tarball locally → (no local room) shared EFS dir → build
+    once. Best-effort and idempotent: a miss leaves the old behaviour (the CLI
+    installs what it needs); a warm session re-links only if the lock changed.
+    Never raises. Returns a small dict for the log / warm response."""
+    info: dict = {"deps": "skipped"}
+    if not WORKSPACE_DEPS_ENABLED or not workdir:
+        return info
+    try:
+        lock = os.path.join(workdir, "package-lock.json")
+        if not (os.path.isfile(lock) and os.path.isfile(os.path.join(workdir, "package.json"))):
+            return info  # not an npm project (pnpm/yarn/python keep today's path)
+        lock_hash = _lock_hash(lock)
+        if not lock_hash:
+            return info
+        info["lock_hash"] = lock_hash
+        nm = os.path.join(workdir, "node_modules")
+        if os.path.islink(nm) and not os.path.exists(nm):
+            os.unlink(nm)  # dangling: a VM-local target that died with its microVM
+        if os.path.lexists(nm) and not os.path.islink(nm):
+            info["deps"] = "present"  # the CLI (or a human) installed a real dir; theirs
+            _install_deps_hook(workdir)
+            return info
+        if os.path.islink(nm) and os.path.basename(os.path.dirname(os.path.realpath(nm))) == lock_hash:
+            info["deps"] = "linked"
+            _install_deps_hook(workdir)
+            return info
+        started = time.time()
+        target: str | None = None
+        source = "unavailable"
+        local_nm = os.path.join(DEPS_LOCAL_ROOT, lock_hash, "node_modules")
+        tar_path = _deps_tar_path(lock_hash)
+        if _deps_usable(local_nm):
+            target, source = local_nm, "local"
+        elif os.path.isfile(tar_path):
+            if _local_has_room(os.path.getsize(tar_path)):
+                target, source = _extract_deps_tar(tar_path, DEPS_LOCAL_ROOT, lock_hash), "efs_tar"
+            if not target:
+                target, source = _extract_deps_to_efs(tar_path, lock_hash), "efs"
+        else:
+            efs_nm = os.path.join(DEPS_ROOT, lock_hash, "node_modules")
+            if _deps_usable(efs_nm):
+                target, source = efs_nm, "efs"
+            else:
+                target, source = _build_deps(workdir, lock_hash)
+        if not target:
+            info.update(deps="unavailable", reason=source)
+            logger.info("deps_unavailable", extra=info)
+            return info
+        _link_deps(nm, target)
+        info.update(deps=source, target=target, secs=round(time.time() - started, 1))
+        info["hook"] = _install_deps_hook(workdir)
+        logger.info("deps_provisioned", extra=info)
+        return info
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("deps_provision_failed", extra={"error": str(exc)[:200]})
+        info["deps"] = "error"
+        return info
 
 
 # ─── CLI runners ──────────────────────────────────────────────────────────────
@@ -3119,6 +3506,7 @@ async def invocations(request: Request):
                              "resume_ready": resume_ready})
 
     # Workspace setup IS fatal — no workdir, no turn.
+    deps_info: dict = {"deps": "skipped"}
     try:
         _configure_git(github_token, app_connected=github_app_connected)
         # Self-contained: no origin — rebuild a standalone repo from the laptop's
@@ -3171,6 +3559,10 @@ async def invocations(request: Request):
                                       "repo": _scrub_git_url(repo) if repo else repo,
                                       "error": _scrub_git_url(str(exc))[:300],
                                       "workdir": workdir})
+        # Dependencies: link the baked / shared node_modules into the checkout so
+        # no CLI turn (or worktree) ever runs `npm ci` on EFS. Best-effort — a miss
+        # is exactly the old behaviour, never a setup failure.
+        deps_info = _provision_deps(workdir)
         # Install a ported transcript and resume it natively. On success the turn
         # runs as `claude --resume` / `codex resume` / `kiro-cli --resume-id` — a
         # true continuation.
@@ -3249,9 +3641,9 @@ async def invocations(request: Request):
     if warm:
         _abandon_turn(payload)
         logger.info("warm_done", extra={"repo": _scrub_git_url(repo) if repo else repo, "workspace": workdir,
-                                        "resume_ready": resume_ready})
+                                        "resume_ready": resume_ready, "deps": deps_info.get("deps")})
         return JSONResponse({"warmed": True, "workspace": workdir, "cli": cli,
-                             "resume_ready": resume_ready})
+                             "resume_ready": resume_ready, "deps": deps_info})
 
     # Async path (workflow personas): the turn was claimed and its dir created
     # before workspace setup (see the mode=="async" block above); setup errors
