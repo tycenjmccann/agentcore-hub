@@ -717,6 +717,69 @@ describe("get_build_status scan clamping", () => {
   });
 });
 
+// ─── 2b. get_build_status newest-match ordering (TEAM-4466 F-3) ───────────────
+// `match` is what the CI agent's verdict is computed from, so which of a SHA's
+// builds it names has to come from the newest-first `ids` list — not from the
+// order AWS happened to answer BatchGetBuilds in. With TEAM-4448 D2's one-retry
+// ledger the two-builds-per-SHA case is now NORMAL, so a response-order read
+// reports the FAILED first attempt for a SHA whose retry is green.
+
+describe("get_build_status newest-match ordering (TEAM-4466 F-3)", () => {
+  const SHA = "0949f9d8814aa3e2b1c4d5f6a7b8c9d0e1f2a3b4";
+
+  /** ids newest-first; BatchGetBuilds answers in the REVERSE (oldest-first) order. */
+  function ledgerReversed(rows) {
+    h.state.listBuildsImpl = async () => ({ ids: rows.map((r) => r.id) });
+    h.state.batchGetBuildsImpl = async (input) => ({
+      builds: [...rows].reverse().filter((r) => input.ids.includes(r.id)),
+    });
+  }
+
+  it("a green D2 retry above a FAILED first attempt certifies the SHA even when BatchGetBuilds answers oldest-first", async () => {
+    ledgerReversed([
+      { id: "b-retry", buildStatus: "SUCCEEDED", resolvedSourceVersion: SHA,
+        endTime: "2026-01-01T00:10:00Z" },
+      // phases are unread by get_build_status; they pin WHICH build this is.
+      { id: "b-first", buildStatus: "FAILED", resolvedSourceVersion: SHA,
+        endTime: "2026-01-01T00:05:00Z",
+        phases: [{ phaseType: "INSTALL", phaseStatus: "FAILED" }] },
+    ]);
+
+    const out = await invoke("get_build_status", { commit_sha: SHA });
+
+    expect(out.match.buildId).toBe("b-retry");
+    expect(out.match.buildStatus).toBe("SUCCEEDED");
+    expect(out.succeededForCommit).toBe(true);
+    // rows follow `ids`, not the response array.
+    expect(out.builds.map((r) => r.buildId)).toEqual(["b-retry", "b-first"]);
+    // The fix reorders; it does not reshape.
+    expect(Object.keys(out).sort()).toEqual([
+      "builds", "match", "project", "region", "requestedCommit", "succeededForCommit",
+    ]);
+  });
+
+  it("a retry that also FAILED is the build match names, not the older first attempt", async () => {
+    ledgerReversed([
+      { id: "b-retry", buildStatus: "FAILED", resolvedSourceVersion: SHA,
+        endTime: "2026-01-01T00:10:00Z",
+        phases: [{ phaseType: "BUILD", phaseStatus: "FAILED" }] },
+      { id: "b-first", buildStatus: "FAILED", resolvedSourceVersion: SHA,
+        endTime: "2026-01-01T00:05:00Z",
+        phases: [{ phaseType: "INSTALL", phaseStatus: "FAILED" }] },
+    ]);
+
+    const out = await invoke("get_build_status", { commit_sha: SHA });
+
+    // Both are red, so succeededForCommit is false either way — but `buildId` is
+    // what the agent feeds get_build_log to classify per P2a, and classifying the
+    // spent INSTALL flake instead of the real BUILD failure is the wrong verdict.
+    expect(out.match.buildId).toBe("b-retry");
+    expect(out.match.buildStatus).toBe("FAILED");
+    expect(out.succeededForCommit).toBe(false);
+    expect(out.builds.map((r) => r.buildId)).toEqual(["b-retry", "b-first"]);
+  });
+});
+
 // ─── 3. start_deploy idempotency token ───────────────────────────────────────
 
 describe("start_deploy clientRequestToken idempotency", () => {
