@@ -494,3 +494,11 @@ so the module stays truly optional.
   target, and the board's banner is scoped to the run's own repo so it can never
   invite approval of another repo's deploy. `PutApprovalResult` remains absent
   from the tools Lambda — the gate stays human at any number of targets.
+  **Known cross-account gap:** only the `Pipeline___*` tools Lambda assumes the
+  `hub-cd-trigger-<slug>` role. The read/observe surfaces — `src/lib/pipeline/status.ts`
+  (behind `/pipeline`) and the Telegram deploy-gate bridge (`deploy/telegram-bug-intake/`)
+  — still build their AWS clients from ambient hub-account credentials and drop the
+  entry's `roleArn`/`externalId`. So a cross-account pipeline can be *triggered*, but
+  `/pipeline` cannot read its status and Telegram cannot discover or approve its
+  ManualApproval gate; that account's deploy can park unnoticed. Closing it means
+  threading assumed-role credentials through both surfaces.

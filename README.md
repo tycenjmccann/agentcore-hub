@@ -367,7 +367,7 @@ workflows ship by default:
 
 | Workflow | Intake → phases | Output |
 |----------|-----------------|--------|
-| **Software Delivery** | requirements → design → development → CI certification → QA verification → code review → ship (release manager → human Merge Approval → CD) | a pull request |
+| **Software Delivery** | requirements → design → development → code review → CI certification → QA verification → ship (release manager → human Merge Approval → CD) | a pull request |
 | **Bug Fix** | intake → triage → fix → QA | a fix PR |
 | **Operator** | intake → build → ship | a pull request |
 | **Dead Code Sweep** | intake → sweep → QA | a cleanup PR |
@@ -469,7 +469,13 @@ scripts/cd-registry.sh add owner/repo --pipeline my-deploy-pipeline --region us-
 
 For **cross-account CD**, a registry entry may also carry `account`, `roleArn`
 (an `arn:aws:iam::<account>:role/hub-cd-trigger-<slug>` role) and `externalId`;
-the hub assumes that role to trigger a pipeline in a different AWS account.
+the hub assumes that role to trigger a pipeline in a different AWS account. Set
+this triple with `scripts/cd-registry.sh` or the API only — the Workflow-tab CD
+registry form exposes `pipeline`/`region`/`ciProject`, not the cross-account
+fields. Note the current limitation: only the `Pipeline___*` tools Lambda
+assumes the trigger role, so a cross-account pipeline can be *triggered*, but the
+`/pipeline` board and the Telegram deploy-gate bridge use ambient credentials —
+they cannot read that pipeline's status or surface its approval gate.
 
 Changes apply within a minute (orchestrator re-read, `CD_REGISTRY_TTL_MS`) — no
 redeploy. The pipeline's deploy stage only *seeds* the S3 file when it is
@@ -625,7 +631,7 @@ The platform includes an optional **self-improvement loop** that automatically e
 ### How It Works
 
 ```
-Agent runs → OTEL traces → XRay → Online Evaluation (11 evaluators)
+Agent runs → OTEL traces → XRay → Online Evaluation (5 evaluators per invocation)
     → eval-packager Lambda buffers sessions; on flush it
     → invokes the Fleet Improver runtime → root-cause analysis → JSON PRD {title, description}
     → writes PRD to s3 prd/ → prd-submitter → [SI] Workflow Run → PR
@@ -635,7 +641,7 @@ The Fleet Improver runtime must be deployed for synthesis to run
 (`cd deploy/runtime-agent && ./deploy-one.sh agentcore_hub_fleet_improver`).
 Without it, eval-packager archives batches but skips the workflow trigger.
 
-Every agent invocation is evaluated by 11 criteria (tool selection, instruction following, correctness, dependency-chain compliance, etc.) using a judge model. When scores drop, the fleet improver agent determines whether the fix is a prompt change, a missing tool, a permissions issue, or an infrastructure problem — then creates a PRD that triggers the same 14-agent pipeline to produce a fix PR.
+Every agent invocation is evaluated by 5 criteria — four shared built-ins (tool selection, instruction following, correctness, goal success) plus a fifth slot that is the custom dependency-chain evaluator for ticket agents or Helpfulness otherwise — using a judge model. When scores drop, the fleet improver agent determines whether the fix is a prompt change, a missing tool, a permissions issue, or an infrastructure problem — then creates a PRD that triggers the same 14-agent pipeline to produce a fix PR.
 
 ### One-Command Setup
 

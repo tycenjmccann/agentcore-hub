@@ -93,7 +93,10 @@ Env (all optional except the owner; defaults derive from `deploy/config.sh`):
 > `hub-cd-trigger-*` role (honored only as a complete, valid triple whose
 > `roleArn` account matches `account`) to reach the pipeline. Set the fields via
 > `scripts/cd-registry.sh ... --account ID --role-arn ARN --external-id ID` or
-> the Workflow tab → CD registry.
+> the API — the Workflow-tab CD-registry form only saves
+> `pipeline`/`region`/`ciProject`, not the cross-account triple. Only the tools
+> Lambda assumes the role, so `/pipeline` and the Telegram deploy-gate bridge
+> (ambient credentials) cannot yet read or approve a cross-account pipeline.
 
 ### One-time after first deploy
 

@@ -195,7 +195,7 @@
 **Guard**: two layers (DL-021) - (1) an atomic conditional-write idempotency claim (`ConditionExpression: "#s <> :inprog"` in `handleTicketReady` / `handleTicketReadyUnified`) so only the FIRST invocation wins; (2) the dead-session detector sweep (`dead-session-detector.mjs`, `rate(5 minutes)`) is the only path that recovers a truly crashed session, by lease-guarded stale-claim steal - not nudge.
 **How to trace**:
 1. Check orchestrator logs - multiple "Invoking agent X for ticket Y" entries?
-2. Check for `ConditionalCheckFailedException` in orchestrator logs: present = the idempotency guard rejected the duplicate (working as designed); absent on a genuine duplicate = the claim write is being bypassed.
+2. Check for the guard's own log lines — the conditional-write failure is caught, not surfaced as `ConditionalCheckFailedException`: the claim guard emits `already claimed (running)` and the ticket-row guard emits `already in_progress`. Either line = the duplicate was rejected (working as designed). Their absence on a genuine duplicate = the claim write is being bypassed.
 3. Check dead-session / reconcile events (`agent.escalated`, `dead_session.shadow`, `orchestrator.claim_released`) - a stolen stale claim can also legitimately re-dispatch.
 
 ### 4. Workflow never completes (stuck at last phase)

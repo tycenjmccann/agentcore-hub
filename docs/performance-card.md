@@ -85,9 +85,11 @@ prefix instead of re-billing it as fresh input. Two runtime knobs control it
 As of `reportVersion: 4`, cache tokens are no longer double-billed.
 Strands reports an `inputTokens` count that already **includes** the cached
 tokens; earlier versions billed that full count at the fresh-input rate and then
-added the cache-read/write cost on top. v4 prices the uncached input only —
-`inputTokens` is reduced by the cached tokens before pricing, and cache reads and
-writes are priced separately at their own rates:
+added the cache-read/write cost on top. The subtraction is **pricing-only**: the
+stored `inputTokens` / `byModel.inputTokens` counters keep the raw
+engine-provided value (which, for persona spans, still includes cache traffic);
+only the temporary value used for the USD calculation is reduced by the cached
+tokens, and cache reads and writes are then priced separately at their own rates:
 
 - **Cache reads** are billed at the model's input rate × `cachedInputDiscount`
   (`0.1×`) — a cached input token costs a tenth of a fresh one.

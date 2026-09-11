@@ -276,7 +276,8 @@ plus a schedule; each fire re-enters the Workflow pipeline. Self-contained surfa
 
 **API routes** (under `src/app/api/routines/`)
 - `/api/routines` — list / create routines
-- `/api/routines/[id]` — get / update / delete a single routine (+ enable/disable, run-now)
+- `/api/routines/[id]` — get / update / delete a single routine (PATCH also toggles enable/disable)
+- `/api/routines/[id]/run` — POST to run a routine now (dedicated nested route)
 - `/api/routines/chat` — the conversational routine builder
 - `/api/routines/definitions` — workflow definitions the builder can schedule
 
@@ -487,7 +488,11 @@ rm -rf src/app/workflow src/app/tickets \
 
 # 2. Lambdas (if already deployed, also delete the AWS functions/tables)
 rm -rf lambda/orchestrator lambda/agentcore-hub-jira \
-       lambda/agentcore-hub-tickets lambda/workflow-output lambda/cost-report
+       lambda/agentcore-hub-tickets lambda/workflow-output lambda/cost-report \
+       lambda/anomaly-watcher lambda/workflow-analyzer
+#    anomaly-watcher owns a Lambda, state table, EventBridge Scheduler
+#    schedule/group/role and a DLQ — delete those AWS resources too, or it keeps
+#    bucketing events and filing bug workflows after the UI is gone.
 
 # 3. Nav: delete the two entries tagged module: "workflow" in src/config/modules.ts
 #    (Workflow + Ticket History)

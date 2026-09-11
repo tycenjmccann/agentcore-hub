@@ -362,14 +362,16 @@ blueprint.
 
 ```
 Design agents (no blockers) → Dev agents (blocked by design)
-    → Code review (code_reviewer, runs after dev) + CI (certifies the integration-branch head)
-    → QA (blocked_by the CI ticket; reads the CI completion record, does not re-run the build)
+    → Code review (Tier 4: code_reviewer, blocked_by all dev tickets)
+    → CI (Tier 5: ci_agent, blocked_by the code-review ticket; certifies the integration-branch head)
+    → QA (Tier 6: qa_verifier, blocked_by the CI ticket; reads the CI completion record, does not re-run the build)
     → Ship (release_manager: unified PR + final review + human merge gate)
 ```
 
-CI certifies **first**: the CI agent syncs and certifies the head SHA, and the
-QA ticket is `blocked_by` the CI ticket, so QA reads the newest CI completion
-record rather than re-compiling. Ship review is **one round** — round 1 raises
+The chain is strictly sequential: code review (Tier 4) runs first on the dev
+branch, then CI (Tier 5) syncs and certifies the head SHA, then QA (Tier 6) is
+`blocked_by` the CI ticket and reads the newest CI completion record rather than
+re-compiling. Ship review is **one round** — round 1 raises
 every in-diff finding, and mergeability (`gh pr view --json mergeable`) is
 checked before the change reaches the human merge gate (#537).
 
@@ -393,7 +395,7 @@ See `docs/workflow-pipeline-architecture.md` § "Starting Test Workflows" for fu
 Local test script at `deploy/runtime-agent/local-ab-test.py`:
 - Variant A: Agent codes directly (shell, editor, file_write)
 - Variant B: Agent delegates to Claude Code SDK
-- Same model (Fable 5.1), same prompt — only difference is the `claude_code` tool
+- Same model (both variants default to `us.anthropic.claude-opus-5` in the script; override per run), same prompt — only difference is the `claude_code` tool
 - Both clone repo, branch, code, commit, push, create PRs
 - Compare: time, tool calls, code quality, test quality
 
