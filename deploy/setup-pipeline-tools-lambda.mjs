@@ -317,6 +317,22 @@ export function buildInlinePolicy(env) {
           ...hubLogArns,
         ],
       },
+      {
+        // Cross-account CD (TEAM multi-cd): a registry entry may name a pipeline
+        // in ANOTHER account, reached by assuming that account's
+        // hub-cd-trigger-<slug> role. The assumed role's OWN policy (read +
+        // StartPipelineExecution, NO PutApprovalResult) is the ceiling; this
+        // grant only lets the Lambda perform the AssumeRole. The name is a
+        // RESERVED prefix (like hub-* here): the account wildcard reaches a new
+        // installer's role with no IAM edit, and hub-cd-trigger-* means the only
+        // assumable roles are trigger-only ones (enforced again by the role's
+        // trust policy + parseCdRegistry's roleArn validation). Still NO approval
+        // path anywhere in this role's reach.
+        Sid: "CrossAccountAssumeTrigger",
+        Effect: "Allow",
+        Action: ["sts:AssumeRole"],
+        Resource: ["arn:aws:iam::*:role/hub-cd-trigger-*"],
+      },
     ],
   };
 }
