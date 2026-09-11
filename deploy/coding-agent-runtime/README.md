@@ -175,6 +175,49 @@ drives this for a laptop↔cloud handoff:
   `…/cloud-code/checkpoint/<sid>/…`; the laptop downloads it and resumes locally.
 - Slug rule (must match Claude's): `re.sub(r'[^a-zA-Z0-9]','-', realpath(cwd))`.
 
+## Session storage GC
+
+`sessions/<id>/` never gets cleaned up by the CLI — a TTL sweep in
+`_gc_stale_sessions()` runs off the turn path (opportunistic, at most once per
+warm microVM per 6h) and considers two candidate classes:
+
+- **Marker class (always on):** dirs stamped `.workflow-session` — written only
+  when a turn arrives with `origin:"workflow"` (the fleet). Staleness = marker
+  mtime older than `SESSION_TTL_DAYS` (default 14). Human Cloud Code sessions
+  never carry this marker and are never touched by this class.
+- **Unmarked class (`SESSION_GC_UNMARKED`, default `dry-run`):** dirs with NO
+  marker at all. Most session dirs predate the marker or came from an aborted
+  setup, so without this class the volume grows unbounded (~640 dirs / ~330 GB
+  and climbing as of TEAM-4418). There is no positive "this is a human
+  session" signal anywhere in this system, so this class is conservative by
+  construction:
+  - `dry-run` (default) — logs `session_gc_unmarked_candidates` once per
+    sweep (count, oldest age in days, up to 20 example dir names) and deletes
+    nothing.
+  - `enforce` — `rmtree`s the candidates (oldest-first, capped by
+    `SESSION_GC_MAX_DELETES`, default 100 per sweep) and logs
+    `session_gc_unmarked_removed`.
+  - `off` — skips the class entirely; the marker class is unaffected in every
+    mode.
+
+  Staleness = last activity older than `SESSION_TTL_DAYS`, where last activity
+  is the max mtime of the dir itself, its `.session-meta.json` /
+  `.resume-installed` / `.workflow-session` files (whichever exist), and the
+  mtimes of its **top-level** entries from one `os.scandir` — never a
+  recursive walk (EFS walks are too slow for a turn path), so a fresh file
+  buried deep in a checkout does not keep a dir alive.
+
+  A dir is never a candidate if it is running on this VM (`_ACTIVE_TURNS`), is
+  outside `sessions/`, is one of the shared roots (`.mirrors`, `.deps`,
+  `.claude-data`, `.codex`, `.kiro-data`), is a symlink, carries a laptop
+  port/pull artifact (`.bundle-applied`/`.return.bundle`), or is named in
+  `.sessions.json` (the human/CLI conversation-id map — an over-matching,
+  conservative spare, not a real human signal).
+
+  Before flipping to `enforce` on a runtime, read a few sweeps of
+  `session_gc_unmarked_candidates` in CloudWatch to confirm the example names
+  really are disposable.
+
 ## Verified
 
 - Invoke loop, conversation resume (remembers prior turns), clone→edit→commit→push→**real PR**,
