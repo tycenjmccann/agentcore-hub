@@ -35,8 +35,11 @@ class FakeAgentCore:
         self.meta = types.SimpleNamespace(service_model=types.SimpleNamespace(operation_names=ops))
         self.stopped, self.purged, self.deleted = [], [], []
         self.delete_error = None
+        self.stop_error = None
 
     def stop_runtime_session(self, **kw):
+        if self.stop_error:
+            raise self.stop_error
         self.stopped.append((kw["runtimeSessionId"], kw["agentRuntimeArn"]))
 
     def invoke_agent_runtime(self, **kw):
@@ -129,10 +132,21 @@ def _workflow(wid, phase, terminal_at=None):
     return item
 
 
-def _run_sweep(mod, dry_run=False):
+def _run_sweep(mod, dry_run=False, context=None):
     with mock.patch.object(mod, "datetime", wraps=datetime) as dt:
         dt.now.return_value = NOW
-        return mod.handler({"sweep": True, "dry_run": dry_run}, None)
+        return mod.handler({"sweep": True, "dry_run": dry_run}, context)
+
+
+class FakeContext:
+    """Lambda context whose remaining time drops below the margin once
+    `purges_before_deadline` EFS purges have happened."""
+
+    def __init__(self, ac, purges_before_deadline, margin_ms=90000):
+        self.ac, self.n, self.margin_ms = ac, purges_before_deadline, margin_ms
+
+    def get_remaining_time_in_millis(self):
+        return 900_000 if len(self.ac.purged) < self.n else self.margin_ms - 1
 
 
 # ─── sweep ───────────────────────────────────────────────────────────────────────
@@ -262,6 +276,68 @@ def test_old_sdk_fails_closed_instead_of_purging_an_instances_session():
     out = _run_sweep(_load(ac, ctl, ddb))
     assert ac.purged == [] and ac.deleted == [] and ddb.stamped == []
     assert out["errors"] == 1
+
+
+# ─── sweep deadline ──────────────────────────────────────────────────────────────
+
+def test_sweep_defers_remaining_releases_when_the_deadline_nears(capsys):
+    ac, ctl = FakeAgentCore(), FakeControl()
+    sessions = [_session(f"efs-{i}", RUNTIME_A, "wf-1") for i in range(5)]
+    ddb = FakeDynamo(sessions, [_workflow("wf-1", "complete", NOW - timedelta(hours=7))])
+    out = _run_sweep(_load(ac, ctl, ddb), context=FakeContext(ac, 2))
+    assert len(ac.purged) == 2
+    assert len(ddb.stamped) == 2
+    assert out["deadline_hit"] is True
+    assert out["deferred"] == 3
+    assert out["released"]["efs"] + out["deferred"] == 5
+    lines = [line for line in capsys.readouterr().out.splitlines() if line.startswith("[sweep] {")]
+    assert len(lines) == 1
+    assert "deadline_hit" in lines[0]
+
+
+def test_sweep_without_a_context_releases_the_whole_plan():
+    ac, ctl = FakeAgentCore(), FakeControl()
+    sessions = [_session(f"efs-{i}", RUNTIME_A, "wf-1") for i in range(5)]
+    ddb = FakeDynamo(sessions, [_workflow("wf-1", "complete", NOW - timedelta(hours=7))])
+    out = _run_sweep(_load(ac, ctl, ddb))
+    assert len(ac.purged) == 5
+    assert len(ddb.stamped) == 5
+    assert out["deadline_hit"] is False
+    assert out["deferred"] == 0
+
+
+def test_dry_run_plans_everything_even_past_the_deadline():
+    ac, ctl = FakeAgentCore(), FakeControl()
+    sessions = [_session(f"efs-{i}", RUNTIME_A, "wf-1") for i in range(4)]
+    ddb = FakeDynamo(sessions, [_workflow("wf-1", "complete", NOW - timedelta(hours=7))])
+    out = _run_sweep(_load(ac, ctl, ddb), dry_run=True, context=FakeContext(ac, 0))
+    assert len(out["planned"]) == 4
+    assert ac.purged == [] and ac.stopped == [] and ddb.stamped == []
+    assert out["deferred"] == 0
+    assert out["deadline_hit"] is False
+
+
+def test_summary_is_printed_when_an_unexpected_error_escapes_the_loop(capsys):
+    ac, ctl = FakeAgentCore(), FakeControl()
+    ddb = FakeDynamo([_session("cc-1", RUNTIME_B, "wf-1")], [_workflow("wf-1", "complete", NOW - timedelta(days=1))])
+    mod = _load(ac, ctl, ddb)
+    with mock.patch.object(mod, "_decide", side_effect=RuntimeError("boom")):
+        with pytest.raises(RuntimeError):
+            _run_sweep(mod)
+    lines = [line for line in capsys.readouterr().out.splitlines() if line.startswith("[sweep] {")]
+    assert len(lines) == 1
+
+
+def test_stop_of_an_already_gone_session_logs_an_info_line(capsys):
+    ac, ctl = FakeAgentCore(), FakeControl()
+    ac.stop_error = _client_error("ResourceNotFoundException")
+    ddb = FakeDynamo([_session("cc-efs", None, "wf-1", tenantId="t-9")],
+                     [_workflow("wf-1", "complete", NOW - timedelta(hours=7))])
+    _run_sweep(_load(ac, ctl, ddb))
+    assert len(ac.purged) == 1
+    assert ddb.stamped == [("cc-efs", "efs-purged", "workflow-complete")]
+    out = capsys.readouterr().out
+    assert "[reaper] stop cc-efs: runtime session already gone (ResourceNotFoundException)" in out
 
 
 # ─── stream path ─────────────────────────────────────────────────────────────────
