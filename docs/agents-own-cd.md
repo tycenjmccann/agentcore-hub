@@ -46,7 +46,9 @@ privileged, and review registry diffs the way you'd review an IAM change.
 
 An entry carries `pipeline` (the CodePipeline that deploys the repo), `region`
 (where that pipeline lives — absent means the hub's own region), and optionally
-`ciProject` (the repo's CodeBuild PR-check project). Everything else is derived
+`ciProject` (the repo's CodeBuild PR-check project) and `iosPipeline` (an
+optional **second** pipeline for the same repo — the iOS App Store release,
+`hub-<slug>-ios-deploy`; see [`ios-cd-pipeline.md`](ios-cd-pipeline.md)). Everything else is derived
 from the pipeline name, by one rule shared by every surface —
 `pipelineProjects()` in `lambda/orchestrator/cd-registry.mjs` and its TS mirror
 `pipelineProjectsFor()` in `src/lib/cd-registry.ts`:
@@ -58,6 +60,11 @@ pipeline: hub-<slug>-deploy
   → deployProject hub-<slug>-deploy
 ```
 
+`iosPipeline`, when present, derives its own macOS projects by the same rule from
+its base `hub-<slug>-ios`: `hub-<slug>-ios-{ci,build,deploy}`. It is a `hub-*-deploy`
+name so it reuses the same IAM wildcards, and is never the tools Lambda env default,
+so an agent must name it explicitly.
+
 `slug` = the repo name, lowercased, every run of `[^a-z0-9]+` collapsed to `-`,
 trimmed of leading/trailing `-`, truncated to 40 chars. A pipeline name that does
 not end in `-deploy` is used as the base as-is (`juno` → `juno-ci` / `juno-build`).
@@ -66,7 +73,7 @@ keep their historical `agentcore-hub-*` names, so `agentcore-hub-deploy` derives
 `agentcore-hub-ci` / `agentcore-hub-build`.
 
 `POST /api/workflow/cd-registry` shape-validates every field (`repo`, `region`,
-`pipeline`, `ciProject`, `deployDoc`, `notes`) before it reaches S3 —
+`pipeline`, `iosPipeline`, `ciProject`, `deployDoc`, `notes`) before it reaches S3 —
 `validateCdEntryInput` in `src/lib/cd-registry.ts` — and rejects with
 `400 { error: "invalid_field", fields }` naming every failing field at once, so
 a typo'd region or path traversal in `deployDoc` fails here instead of as an
@@ -88,9 +95,10 @@ allow-list and, under convention-scoped IAM, simply fails at AWS with
 `AccessDenied` — operator misconfiguration surfaced as the tool's normal error
 text, not a silent build of the wrong project.
 
-Onboarding a new repo today means creating its pipeline out of band and adding the
-entry. A generic per-repo CDK stack plus onboarding scripts/templates is a
-follow-up (PR B).
+Onboarding a new repo means creating its pipeline(s) and adding the entry.
+`deploy/cd-connect/` ships the templates for a team to stand this up in its own
+account: a cross-account trust role, a backend repo-pipeline stack, and the iOS
+App Store release stack, each with a README.
 
 ## The RM loop (trigger → watch → fix ticket → re-trigger)
 
