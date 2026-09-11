@@ -186,6 +186,10 @@ describe("getPipelineStatus — multi-target", () => {
     vi.stubEnv("PIPELINE_CI_PROJECT", undefined);
     vi.stubEnv("PIPELINE_DEPLOY_NAME", undefined);
     vi.stubEnv("PIPELINE_ENABLED", "1");
+    // sourceRepo (TEAM-4433) falls back to this convention when a target has no
+    // registry-key repo; stubbed here so every test in this describe is hermetic.
+    vi.stubEnv("GITHUB_OWNER", "tycenjmccann");
+    vi.stubEnv("GITHUB_REPO", "agentcore-hub");
   });
 
   const twoRepos = () => {
@@ -362,6 +366,47 @@ describe("getPipelineStatus — multi-target", () => {
     expect(res.enabled).toBe(false);
     expect(res.pipelines.length).toBeGreaterThan(0);
   });
+
+  // ─── sourceRepo (TEAM-4433) — display-only owner/repo for the commit link ────
+
+  it("a registered target's sourceRepo is its own registry key", async () => {
+    twoRepos();
+    const { getPipelineStatus } = await loadStatus();
+    const res = await getPipelineStatus();
+
+    expect(res.pipelines.find((p) => p.repo === "acme/juno")!.sourceRepo).toBe("acme/juno");
+  });
+
+  it("empty registry → the env default target's sourceRepo is GITHUB_OWNER/GITHUB_REPO", async () => {
+    const { getPipelineStatus } = await loadStatus();
+    const res = await getPipelineStatus();
+
+    expect(res.pipelines).toHaveLength(1);
+    expect(res.pipelines[0].repo).toBe("");
+    expect(res.pipelines[0].sourceRepo).toBe("tycenjmccann/agentcore-hub");
+  });
+
+  it("either GITHUB_OWNER/GITHUB_REPO unset → sourceRepo undefined, repo still \"\"", async () => {
+    vi.stubEnv("GITHUB_REPO", undefined);
+    const { getPipelineStatus } = await loadStatus();
+    const res = await getPipelineStatus();
+
+    expect(res.pipelines[0].repo).toBe("");
+    expect(res.pipelines[0].sourceRepo).toBeUndefined();
+  });
+
+  it("a malformed GITHUB_OWNER or GITHUB_REPO → sourceRepo undefined", async () => {
+    vi.stubEnv("GITHUB_OWNER", "a/b");
+    const { getPipelineStatus: loadA } = await loadStatus();
+    const resA = await loadA();
+    expect(resA.pipelines[0].sourceRepo).toBeUndefined();
+
+    vi.stubEnv("GITHUB_OWNER", "tycenjmccann");
+    vi.stubEnv("GITHUB_REPO", "");
+    const { getPipelineStatus: loadB } = await loadStatus();
+    const resB = await loadB();
+    expect(resB.pipelines[0].sourceRepo).toBeUndefined();
+  });
 });
 
 // ─── execution identity on StageState (TEAM-4403) ─────────────────────────────
@@ -494,7 +539,50 @@ describe("StageState execution identity (TEAM-4403)", () => {
     expect(stages.find((s) => s.name === "Source")!.sourceSha).toBe(SHA_B);
   });
 
-  it("no regression: revisionSummary / awaitingApproval / approvalUrl / status / lastUpdated", async () => {
+  // ─── waitingSince (TEAM-4433) ────────────────────────────────────────────
+
+  it("waitingSince on a parked gate is the approval action's own lastStatusChange", async () => {
+    const stages = await stagesFor([sourceStage(EXEC_A, SHA_A), gateStage(EXEC_A)]);
+    const gate = stages.find((s) => s.awaitingApproval)!;
+
+    expect(gate.waitingSince).toBe("2026-09-10T01:00:00.000Z");
+    expect(gate.waitingSince).toBe(gate.lastUpdated);
+  });
+
+  it("waitingSince on a non-gate stage falls back to actionStates[0]", async () => {
+    const stages = await stagesFor([sourceStage(EXEC_A, SHA_A), gateStage(EXEC_A)]);
+    const source = stages.find((s) => s.name === "Source")!;
+
+    expect(source.waitingSince).toBe("2026-09-10T00:30:00.000Z");
+  });
+
+  it("waitingSince is the gate action's change even when it isn't actionStates[0]", async () => {
+    const T0 = new Date("2026-09-10T00:00:00Z");
+    const T1 = new Date("2026-09-10T02:00:00Z");
+    const stages = await stagesFor([
+      {
+        stageName: "Approval",
+        latestExecution: { status: "InProgress" },
+        actionStates: [
+          { latestExecution: { status: "Succeeded", lastStatusChange: T0 } },
+          { latestExecution: { token: "tok-1", status: "InProgress", lastStatusChange: T1 } },
+        ],
+      },
+    ]);
+
+    expect(stages[0].waitingSince).toBe(T1.toISOString());
+    expect(stages[0].lastUpdated).toBe(T0.toISOString());
+  });
+
+  it("waitingSince is undefined (not a throw) when actionStates is empty", async () => {
+    const stages = await stagesFor([
+      { stageName: "Source", latestExecution: { status: "Succeeded" }, actionStates: [] },
+    ]);
+
+    expect(stages[0].waitingSince).toBeUndefined();
+  });
+
+  it("no regression: revisionSummary / awaitingApproval / approvalUrl / status / lastUpdated / sourceSha", async () => {
     const stages = await stagesFor([sourceStage(EXEC_A, SHA_A), gateStage(EXEC_A)]);
     const gate = stages.find((s) => s.name === "Approval")!;
     const source = stages.find((s) => s.name === "Source")!;
@@ -504,10 +592,12 @@ describe("StageState execution identity (TEAM-4403)", () => {
     expect(gate.approvalUrl).toBe("https://console.aws.amazon.com/approve");
     expect(gate.status).toBe("InProgress");
     expect(gate.lastUpdated).toBe("2026-09-10T01:00:00.000Z");
+    expect(gate.sourceSha).toBe(SHA_A);
     expect(source.awaitingApproval).toBe(false);
     expect(source.approvalUrl).toBeUndefined();
     expect(source.revisionSummary).toBe(SHA_A.slice(0, 12));
     expect(source.status).toBe("Succeeded");
+    expect(source.sourceSha).toBe(SHA_A);
   });
 
   it("only ONE GetPipelineState call still backs the whole stage list", async () => {

@@ -16,6 +16,9 @@ interface StageState {
   status: string;
   lastUpdated?: string;
   revisionSummary?: string;
+  waitingSince?: string;
+  sourceSha?: string;
+  approvalUrl?: string;
 }
 /** One CD target — a registered repo's pipeline, or the env default ({repo: ""}). */
 interface PipelineTarget {
@@ -26,6 +29,7 @@ interface PipelineTarget {
   recentBuilds: CiBuild[];
   stages: StageState[];
   error?: string;
+  sourceRepo?: string;
 }
 interface PipelineStatus {
   enabled: boolean;
@@ -38,6 +42,38 @@ function statusIcon(s: string) {
   if (v.includes("fail") || v.includes("fault") || v.includes("timed")) return <XCircle className="w-4 h-4 text-red-400" />;
   if (v.includes("progress")) return <Loader2 className="w-4 h-4 text-brand-400 animate-spin" />;
   return <CircleDashed className="w-4 h-4 text-[var(--color-text-muted)]" />;
+}
+
+/** The human deploy gate: an Approval stage still in progress. */
+const isWaitingApproval = (s: StageState) =>
+  s.status.toLowerCase().includes("progress") && s.name.toLowerCase().includes("approval");
+
+/** How long the gate has waited — undefined when there is no parseable timestamp. */
+function waitedFor(iso?: string): string | undefined {
+  if (!iso) return undefined;
+  const then = new Date(iso).getTime();
+  if (Number.isNaN(then)) return undefined;
+  const diff = Date.now() - then;
+  if (diff < 60_000) return "<1 min";
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)} min`;
+  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)} h`;
+  return `${Math.floor(diff / 86_400_000)} d`;
+}
+
+/**
+ * The CodePipeline console deep link for this target — the real approve surface.
+ * Deliberately NOT the stage's `approvalUrl`: that is the ManualApproval action's
+ * entityUrl, which the hub's pipeline sets to a GitHub commits URL
+ * (`externalEntityLink` in deploy/pipeline/lib/pipeline-stack.ts), so it never
+ * points at the console. Returns undefined when region/pipeline do not look like
+ * AWS names, rather than building a URL out of unvetted values.
+ */
+function approveConsoleUrl(t: PipelineTarget): string | undefined {
+  if (!/^[a-z0-9-]+$/.test(t.region)) return undefined;
+  if (!/^[A-Za-z0-9.@_-]+$/.test(t.pipeline)) return undefined;
+  return `https://${t.region}.console.aws.amazon.com/codesuite/codepipeline/pipelines/${encodeURIComponent(
+    t.pipeline
+  )}/view?region=${t.region}`;
 }
 
 export default function PipelinePage() {
@@ -122,18 +158,78 @@ export default function PipelinePage() {
               {t.stages.length === 0 && (
                 <div className="text-sm text-[var(--color-text-muted)]">No stage state yet.</div>
               )}
-              {t.stages.map((s) => (
-                <div key={s.name} className="rounded-lg border border-surface-4 bg-surface-2 p-4">
-                  <div className="flex items-center justify-between mb-2">
-                    <span className="font-medium text-[var(--color-text-primary)]">{s.name}</span>
-                    {statusIcon(s.status)}
+              {t.stages.map((s) => {
+                const waiting = isWaitingApproval(s);
+                const waited = waiting ? waitedFor(s.waitingSince) : undefined;
+                const approveUrl = waiting ? approveConsoleUrl(t) : undefined;
+                return (
+                  <div
+                    key={s.name}
+                    data-testid={waiting ? "approval-waiting-card" : undefined}
+                    className={
+                      waiting
+                        ? "rounded-lg border border-amber-500/50 bg-amber-500/10 p-4"
+                        : "rounded-lg border border-surface-4 bg-surface-2 p-4"
+                    }
+                  >
+                    <div className="flex items-center justify-between mb-2">
+                      <span className="font-medium text-[var(--color-text-primary)]">{s.name}</span>
+                      {statusIcon(s.status)}
+                    </div>
+                    <div className="text-xs text-[var(--color-text-muted)]">{s.status}</div>
+                    {s.revisionSummary && (
+                      <div className="text-xs text-[var(--color-text-muted)] mt-1 font-mono">{s.revisionSummary}</div>
+                    )}
+                    {waiting && (
+                      <>
+                        {waited && (
+                          <div data-testid="approval-waiting-since" className="text-xs text-amber-400 mt-2">
+                            Waiting since {waited}
+                          </div>
+                        )}
+                        {s.sourceSha &&
+                          (t.sourceRepo ? (
+                            <a
+                              data-testid="approval-commit-link"
+                              href={`https://github.com/${t.sourceRepo}/commit/${s.sourceSha}`}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="text-xs font-mono text-amber-300 hover:underline"
+                            >
+                              {s.sourceSha.slice(0, 7)}
+                            </a>
+                          ) : (
+                            <span data-testid="approval-commit-sha" className="text-xs font-mono text-amber-300">
+                              {s.sourceSha.slice(0, 7)}
+                            </span>
+                          ))}
+                        {approveUrl && (
+                          <a
+                            data-testid="approval-approve-link"
+                            href={approveUrl}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="text-xs text-amber-300 hover:underline flex items-center gap-1"
+                          >
+                            <ExternalLink className="w-3 h-3" /> Approve in CodePipeline
+                          </a>
+                        )}
+                        {s.approvalUrl && (
+                          <a
+                            data-testid="approval-commits-link"
+                            href={s.approvalUrl}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="text-xs text-amber-300 hover:underline flex items-center gap-1"
+                          >
+                            <ExternalLink className="w-3 h-3" /> View commits
+                          </a>
+                        )}
+                      </>
+                    )}
                   </div>
-                  <div className="text-xs text-[var(--color-text-muted)]">{s.status}</div>
-                  {s.revisionSummary && (
-                    <div className="text-xs text-[var(--color-text-muted)] mt-1 font-mono">{s.revisionSummary}</div>
-                  )}
-                </div>
-              ))}
+                );
+              })}
             </div>
           </section>
 
