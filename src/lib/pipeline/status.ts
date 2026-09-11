@@ -62,6 +62,13 @@ export interface StageState {
   executionId?: string;
   /** Full 40-char source commit SHA; undefined when it cannot be tied to `executionId`. */
   sourceSha?: string;
+  /**
+   * When this stage's current wait started (ISO). For a stage with a
+   * ManualApproval action awaiting a human it is THAT action's lastStatusChange —
+   * i.e. when the gate started blocking — otherwise actionStates[0]'s. Distinct
+   * from `lastUpdated`, which is always actionStates[0]'s and stays as-is.
+   */
+  waitingSince?: string;
 }
 
 /** One CD target: a registered repo's pipeline, or the env default pipeline. */
@@ -74,6 +81,8 @@ export interface PipelineTargetStatus {
   recentBuilds: CiBuildSummary[];
   stages: StageState[];
   error?: string;
+  /** Display-only `owner/repo` for commit links; NOT the registry key (`repo`). */
+  sourceRepo?: string;
 }
 
 export interface PipelineStatus {
@@ -106,6 +115,20 @@ function envTarget(registry: CdRegistry): PipelineTarget {
     region: DEFAULT_REGION,
     ciProject: CI_PROJECT,
   };
+}
+
+const REPO_KEY = /^[\w.-]+\/[\w.-]+$/;
+
+// Display-only owner/repo for commit links: the registry key when the target has
+// one, else the GITHUB_OWNER/GITHUB_REPO convention (src/app/api/bugs/route.ts).
+// Read at call time — never at module load — and dropped unless it is a real
+// owner/repo. This must NOT touch `repo`, whose "" for the env default target is
+// load-bearing (the board attributes state by `repo`).
+function displayRepo(repo: string): string | undefined {
+  const { GITHUB_OWNER, GITHUB_REPO } = process.env;
+  const candidate =
+    repo.trim() || (GITHUB_OWNER && GITHUB_REPO ? `${GITHUB_OWNER}/${GITHUB_REPO}` : "");
+  return REPO_KEY.test(candidate) ? candidate : undefined;
 }
 
 /**
@@ -166,7 +189,12 @@ export async function getPipelineStatus(
 
   const pipelines = await Promise.all(
     selected.map(async (t): Promise<PipelineTargetStatus> => {
-      const status: PipelineTargetStatus = { ...t, recentBuilds: [], stages: [] };
+      const status: PipelineTargetStatus = {
+        ...t,
+        sourceRepo: displayRepo(t.repo),
+        recentBuilds: [],
+        stages: [],
+      };
       try {
         const { cb, cp } = clientsFor(t.region);
         const [builds, state] = await Promise.all([
@@ -287,6 +315,9 @@ async function pipelineStages(
       approvalUrl: approvalAction?.entityUrl,
       executionId,
       sourceSha: sourceShaForExecution(stageStates, executionId, s),
+      waitingSince: (
+        approvalAction ?? s.actionStates?.[0]
+      )?.latestExecution?.lastStatusChange?.toISOString(),
     };
   });
 }

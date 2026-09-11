@@ -80,7 +80,7 @@ export function normalizeRepoKey(value: unknown): string | null {
   let s = String(value ?? "").trim();
   if (!s) return null;
   s = s.replace(/^git@[^:]+:/, "").replace(/^[a-z]+:\/\/[^/]+\//i, "");
-  s = s.replace(/\.git$/i, "").replace(/^\/+|\/+$/g, "");
+  s = s.replace(/^\/+|\/+$/g, "").replace(/\.git$/i, "").replace(/\/+$/, "");
   const parts = s.split("/");
   if (parts.length !== 2 || !parts[0] || !parts[1]) return null;
   return `${parts[0]}/${parts[1]}`.toLowerCase();
@@ -161,6 +161,90 @@ export function pipelineProjectsFor(entry: CdRegistryEntry): PipelineProjects | 
     buildProject: `${base}-build`,
     deployProject: pipeline,
   };
+}
+
+/**
+ * Every form of a deployDoc a consumer could end up resolving: the value as
+ * typed, plus up to 3 decodeURIComponent passes (stopping as soon as decoding
+ * changes nothing). `%2e%2e/x` and `%252e%252e/x` are traversals wearing one or
+ * two layers of percent-encoding, so the path rules have to see through them.
+ *
+ * A malformed escape (`docs/100%/DEPLOY.md`, `%zz`) makes decodeURIComponent
+ * throw — that is NOT a rejection, it just means the raw string is the final
+ * form. A literal `%` is legal in a repo path and stays legal here.
+ */
+function deployDocForms(value: string): string[] {
+  const forms = [value];
+  let current = value;
+  for (let pass = 0; pass < 3; pass++) {
+    let decoded: string;
+    try { decoded = decodeURIComponent(current); } catch { break; }
+    if (decoded === current) break;
+    forms.push(decoded);
+    current = decoded;
+  }
+  return forms;
+}
+
+/**
+ * Shape-validate a POST /api/workflow/cd-registry body before it ever reaches
+ * upsertCdEntry/S3 — a typo here (`us-eat-1`, a pipeline name with spaces, a
+ * deployDoc of `../../etc`) would otherwise be stored as-is and only fail later
+ * inside a Lambda with an opaque AWS error (the registry is a runtime
+ * allow-list read by the tools Lambda, the Telegram deploy-gate bridge and the
+ * orchestrator — see docs/agents-own-cd.md).
+ *
+ * Returns null when the payload is fine, else every failing field's reason at
+ * once (field name → reason), so the caller can report them all in one 400.
+ *
+ * An optional field that is blank/whitespace-only is NOT validated: that is
+ * upsertCdEntry's "clear this field" signal (see the loop below it), not a
+ * value, and parseCdRegistry trims + drops blanks anyway — so this validates
+ * the exact (trimmed) bytes that would end up stored, and never rejects a
+ * payload that is valid today.
+ */
+export function validateCdEntryInput(body: unknown): Record<string, string> | null {
+  const fields: Record<string, string> = {};
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return { repo: "must be owner/repo or a GitHub URL" };
+  }
+  const o = body as Record<string, unknown>;
+
+  if (!normalizeRepoKey(o.repo)) fields.repo = "must be owner/repo or a GitHub URL";
+
+  const RULES: Record<string, { re: RegExp; reason: string }> = {
+    region: { re: /^[a-z]{2}(-gov)?-[a-z]+-\d$/, reason: "must be an AWS region like us-east-1 or us-gov-west-1" },
+    pipeline: { re: /^[A-Za-z0-9.@_-]{1,100}$/, reason: "must be a valid CodePipeline name (1-100 chars of [A-Za-z0-9.@_-])" },
+    ciProject: { re: /^[A-Za-z0-9_-]{2,150}$/, reason: "must be a valid CodeBuild project name (2-150 chars of [A-Za-z0-9_-])" },
+  };
+  for (const f of ["pipeline", "region", "ciProject", "deployDoc", "notes"] as const) {
+    const v = o[f];
+    if (v === undefined) continue;
+    if (typeof v !== "string") { fields[f] = "must be a string"; continue; }
+    const trimmed = v.trim();
+    if (!trimmed) continue; // blank = clear, not a value to validate
+    const rule = RULES[f];
+    if (rule && !rule.re.test(trimmed)) fields[f] = rule.reason;
+  }
+  if (typeof o.deployDoc === "string") {
+    const trimmed = o.deployDoc.trim();
+    if (trimmed && !fields.deployDoc) {
+      if (trimmed.length > 200) fields.deployDoc = "must be at most 200 characters";
+      // The two path rules are applied to the value as typed AND to each decoded
+      // form of it, so an encoded traversal (`%2e%2e/x`, `..%2f`) is caught
+      // without outlawing a literal `%` in a filename (`docs/100%/DEPLOY.md`).
+      else for (const form of deployDocForms(trimmed)) {
+        if (form.startsWith("/") || form.startsWith("\\")) { fields.deployDoc = "must be a relative path (no leading slash)"; break; }
+        if (form.split(/[\\/]+/).includes("..")) { fields.deployDoc = "must not contain a .. path segment"; break; }
+      }
+    }
+  }
+  if (typeof o.notes === "string") {
+    const trimmed = o.notes.trim();
+    if (trimmed && !fields.notes && trimmed.length > 2000) fields.notes = "must be at most 2000 characters";
+  }
+
+  return Object.keys(fields).length ? fields : null;
 }
 
 /** Upsert by repo key (returns a new registry). */

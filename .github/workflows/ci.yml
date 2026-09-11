@@ -148,6 +148,7 @@ jobs:
           deploy/coding-agent-runtime/test_codex_sqlite_home.py
           deploy/coding-agent-runtime/test_playwright_browsers.py
           deploy/coding-agent-runtime/test_deps_provision.py
+          deploy/coding-agent-runtime/test_deps_relink.py
           deploy/coding-agent-runtime/test_session_gc_unmarked.py
           deploy/workflow-manager/toolkit
           deploy/pipeline/test_ecs_primary_container.py

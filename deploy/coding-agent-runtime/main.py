@@ -131,6 +131,12 @@ DEPS_LOCAL_HEADROOM = 2.0
 # Tarballs for lockfiles nobody has used in this long are swept on the next
 # publish — a lock changes roughly weekly and each tarball is ~700 MB.
 DEPS_TAR_TTL_S = _safe_int_env("DEPS_TAR_TTL_S", 30 * 86400)
+# Per-VM extracted copies are ~1.2 GB each and a warm VM serves many sessions
+# across lockfile bumps. 4.3 GB of local disk fits 2 comfortably; a third one
+# fills the disk, builds start failing on ENOSPC and the CLI "fixes" that by
+# re-installing onto EFS (the 20-30 min path this whole cache exists to kill).
+# Keep the newest N hashes, evict the rest by mtime.
+DEPS_LOCAL_KEEP = _safe_int_env("DEPS_LOCAL_KEEP", 2)
 # A session behind another VM's build WAITS for it (the alternative is a second
 # identical build on the same mount); stale is derived from the build timeout
 # for the same reason as the mirror lock.
@@ -2274,6 +2280,93 @@ def _publish_deps_tar(build_dir: str, lock_hash: str) -> bool:
         return False
 
 
+def _relink_over_real_deps(nm: str, lock_hash: str, info: dict) -> bool:
+    """Replace a real `node_modules` dir with the provisioned symlink when a copy
+    for `lock_hash` is already available locally or as a tarball. Only ever
+    touches a path inside the workspace root, and only when the replacement is
+    usable — on any doubt the real dir is left exactly as it is. Never raises."""
+    try:
+        if not os.path.realpath(nm).startswith(os.path.realpath(WORKSPACE_ROOT) + os.sep):
+            return False
+        local_nm = os.path.join(DEPS_LOCAL_ROOT, lock_hash, "node_modules")
+        target = local_nm if _deps_usable(local_nm) else None
+        if not target:
+            tar_path = _deps_tar_path(lock_hash)
+            if os.path.isfile(tar_path) and _local_has_room(os.path.getsize(tar_path)):
+                target = _extract_deps_tar(tar_path, DEPS_LOCAL_ROOT, lock_hash)
+        if not target or not _deps_usable(target):
+            return False
+        stale = f"{nm}.stale.{uuid.uuid4().hex[:8]}"
+        os.rename(nm, stale)                      # instant on the same mount
+        _link_deps(nm, target)
+        threading.Thread(target=shutil.rmtree, args=(stale,),
+                         kwargs={"ignore_errors": True}, daemon=True).start()
+        info.update(deps="relinked", target=target, replaced="cli_install")
+        logger.info("deps_relinked %s", json.dumps({"lock_hash": lock_hash, "target": target}),
+                    extra={"lock_hash": lock_hash, "target": target})
+        return True
+    except OSError as exc:
+        logger.warning("deps_relink_failed %s", str(exc)[:200], extra={"error": str(exc)[:200]})
+        return False
+
+
+def _sweep_deps_local(keep_hash: str | None = None) -> None:
+    """Evict per-VM extracted copies beyond DEPS_LOCAL_KEEP, newest-mtime first,
+    never `keep_hash` and never a dir a live checkout still links to. Local disk
+    is 4.3 GB; without this a warm VM accumulates a copy per lockfile bump until
+    builds fail on ENOSPC. Never raises."""
+    if DEPS_LOCAL_KEEP <= 0:
+        return
+    try:
+        entries = []
+        for name in os.listdir(DEPS_LOCAL_ROOT):
+            path = os.path.join(DEPS_LOCAL_ROOT, name)
+            if name.startswith(".") or not os.path.isdir(path) or ".tmp." in name:
+                continue
+            try:
+                entries.append((os.path.getmtime(path), name, path))
+            except OSError:
+                pass
+        entries.sort(reverse=True)
+        linked = _linked_deps_targets()
+        kept = 0
+        for _mtime, name, path in entries:
+            if name == keep_hash or os.path.realpath(path) in linked:
+                kept += 1
+                continue
+            kept += 1
+            if kept <= DEPS_LOCAL_KEEP:
+                continue
+            shutil.rmtree(path, ignore_errors=True)
+            logger.info("deps_local_evicted %s", json.dumps({"lock_hash": name}),
+                        extra={"lock_hash": name})
+    except OSError as exc:
+        logger.warning("deps_local_sweep_failed %s", str(exc)[:200], extra={"error": str(exc)[:200]})
+
+
+def _linked_deps_targets() -> set:
+    """Local deps dirs that some checkout under sessions/ currently symlinks to.
+    One scandir level per session dir (never a recursive walk). Never raises."""
+    out: set = set()
+    try:
+        sessions_root = os.path.join(WORKSPACE_ROOT, "sessions")
+        for sess in os.scandir(sessions_root):
+            if not sess.is_dir(follow_symlinks=False):
+                continue
+            try:
+                for repo in os.scandir(sess.path):
+                    if not repo.is_dir(follow_symlinks=False):
+                        continue
+                    nm = os.path.join(repo.path, "node_modules")
+                    if os.path.islink(nm):
+                        out.add(os.path.realpath(os.path.dirname(os.path.realpath(nm))))
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return out
+
+
 def _sweep_deps_tars() -> None:
     """Best-effort TTL sweep of tarballs (and their lock copies) nobody has
     touched in DEPS_TAR_TTL_S. Run only on publish, so a quiet cache costs nothing."""
@@ -2440,7 +2533,14 @@ def _provision_deps(workdir: str | None) -> dict:
         if os.path.islink(nm) and not os.path.exists(nm):
             os.unlink(nm)  # dangling: a VM-local target that died with its microVM
         if os.path.lexists(nm) and not os.path.islink(nm):
-            info["deps"] = "present"  # the CLI (or a human) installed a real dir; theirs
+            # A real dir where the link used to be: the CLI ran `npm ci`/`npm install`
+            # itself (npm replaces a symlink with a fresh tree), so this session and
+            # every later turn fell back to 40k small files on EFS. If a provisioned
+            # copy for THIS lockfile is already available, restore the link and drop
+            # the tree — it is reconstructible from the lockfile by definition.
+            relinked = _relink_over_real_deps(nm, lock_hash, info)
+            if not relinked:
+                info["deps"] = "present"  # nothing provisioned for this lock yet; theirs
             _install_deps_hook(workdir)
             return info
         if os.path.islink(nm) and os.path.basename(os.path.dirname(os.path.realpath(nm))) == lock_hash:
@@ -2470,6 +2570,7 @@ def _provision_deps(workdir: str | None) -> dict:
             logger.info("deps_unavailable %s", json.dumps(info, default=str), extra=info)
             return info
         _link_deps(nm, target)
+        _sweep_deps_local(keep_hash=lock_hash)
         info.update(deps=source, target=target, secs=round(time.time() - started, 1))
         info["hook"] = _install_deps_hook(workdir)
         # Fields ride in the message: the OTEL log exporter drops `extra`, so the

@@ -285,6 +285,9 @@ git checkout <branch> && git pull
 git diff --quiet origin/<base_branch>...HEAD -- package-lock.json package.json || npm ci
 
 # 2. TypeScript compilation (BLOCKING)
+#    Never reinstall to chase a failure here: node_modules is a provisioned
+#    symlink, `npm ci` replaces it with a fresh tree on the shared mount (20-30
+#    min) and repeated installs never fix a missing/corrupt module - report it.
 npx tsc --noEmit
 # If this fails → FAIL immediately
 

@@ -96,7 +96,7 @@ remember this one and its files, so do NOT reference absolute paths like
    - `npm run build` (production build)
    - `npm run lint` (if configured)
    - `npm test` (if configured)
-2. ALL commands must produce actual output with exit codes
+2. ALL commands must produce actual output with exit codes. **Never reinstall dependencies to chase a build failure.** `node_modules` is a provisioned symlink to a per-lockfile cache; `npm ci` / `npm install` replaces it with a fresh tree on the shared mount and costs 20-30 minutes, and repeated installs are the known failure loop (they do not fix a missing or corrupt module). Install only when THIS branch changed `package.json` / `package-lock.json`. If a build or test fails on a module that looks missing or corrupt, report it with the exact error instead.
 3. If any FAIL, stop here and report FAIL with exact error output
 
 ### Step 3: Visual Verification (MANDATORY for UI changes)
