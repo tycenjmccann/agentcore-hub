@@ -184,12 +184,25 @@ describe("validateCdEntryInput", () => {
     }
   });
 
-  it("deployDoc: percent-encoding is refused outright, so an encoded .. cannot slip past", () => {
-    // TEAM-4416 review (P2): `%2e%2e/secrets` used to pass the segment check.
-    // A path inside a git repo never needs percent-encoding, so any `%` is
-    // rejected rather than decoded (one decode pass still leaves `%252e`).
-    for (const bad of ["%2e%2e/secrets", "%2E%2E/secrets", "..%2fsecrets", "%252e%252e/x", "docs/%2e%2e/DEPLOY.md", "a%20b/DEPLOY.md"]) {
-      expect(validateCdEntryInput({ repo: "a/b", deployDoc: bad })).toEqual({ deployDoc: "must not be percent-encoded" });
+  it("deployDoc: an encoded .. is caught through up to 3 decode passes", () => {
+    // TEAM-4416 review (P2): `%2e%2e/secrets` used to pass the segment check,
+    // because the check only ever saw the bytes as typed. The rules now also run
+    // against each decoded form, so one or two encoding layers cannot hide a
+    // traversal — and the reason is still the `..`-segment one, not a separate
+    // "no encoding" rule (a literal `%` stays legal, see the next test).
+    for (const bad of ["%2e%2e/secrets", "%2E%2E/secrets", "..%2fsecrets", "%252e%252e/x", "%2e%2e%5cx", "docs/%2e%2e/DEPLOY.md"]) {
+      expect(validateCdEntryInput({ repo: "a/b", deployDoc: bad })).toEqual({ deployDoc: "must not contain a .. path segment" });
+    }
+    // An encoded separator that decodes to an ABSOLUTE path fails on that rule.
+    expect(validateCdEntryInput({ repo: "a/b", deployDoc: "%2fetc/passwd" })).toEqual({ deployDoc: "must be a relative path (no leading slash)" });
+  });
+
+  it("deployDoc: a literal % in a filename is legal — decoding is best-effort, never a rule of its own", () => {
+    // The approved rule set is leading-slash / .. segment / 200 chars. `%` is a
+    // legal character in a repo path, and a value whose escapes are malformed
+    // simply has no decoded form (decodeURIComponent throws → raw is final).
+    for (const ok of ["docs/100%/DEPLOY.md", "100%.md", "%zz", "a%20b/DEPLOY.md", "docs/50%-off/DEPLOY.md"]) {
+      expect(validateCdEntryInput({ repo: "a/b", deployDoc: ok })).toBeNull();
     }
   });
 

@@ -164,6 +164,29 @@ export function pipelineProjectsFor(entry: CdRegistryEntry): PipelineProjects | 
 }
 
 /**
+ * Every form of a deployDoc a consumer could end up resolving: the value as
+ * typed, plus up to 3 decodeURIComponent passes (stopping as soon as decoding
+ * changes nothing). `%2e%2e/x` and `%252e%252e/x` are traversals wearing one or
+ * two layers of percent-encoding, so the path rules have to see through them.
+ *
+ * A malformed escape (`docs/100%/DEPLOY.md`, `%zz`) makes decodeURIComponent
+ * throw — that is NOT a rejection, it just means the raw string is the final
+ * form. A literal `%` is legal in a repo path and stays legal here.
+ */
+function deployDocForms(value: string): string[] {
+  const forms = [value];
+  let current = value;
+  for (let pass = 0; pass < 3; pass++) {
+    let decoded: string;
+    try { decoded = decodeURIComponent(current); } catch { break; }
+    if (decoded === current) break;
+    forms.push(decoded);
+    current = decoded;
+  }
+  return forms;
+}
+
+/**
  * Shape-validate a POST /api/workflow/cd-registry body before it ever reaches
  * upsertCdEntry/S3 — a typo here (`us-eat-1`, a pipeline name with spaces, a
  * deployDoc of `../../etc`) would otherwise be stored as-is and only fail later
@@ -207,14 +230,13 @@ export function validateCdEntryInput(body: unknown): Record<string, string> | nu
     const trimmed = o.deployDoc.trim();
     if (trimmed && !fields.deployDoc) {
       if (trimmed.length > 200) fields.deployDoc = "must be at most 200 characters";
-      else if (trimmed.startsWith("/") || trimmed.startsWith("\\")) fields.deployDoc = "must be a relative path (no leading slash)";
-      // A path in a git repo never needs percent-encoding, so `%` can only be an
-      // attempt to smuggle a separator or a `..` past the segment check below
-      // (`%2e%2e/x`, `..%2fx`). Rejected outright rather than decoded first:
-      // decodeURIComponent throws on malformed input and one pass still leaves
-      // double-encoded forms (`%252e`), so there is no safe single decode.
-      else if (trimmed.includes("%")) fields.deployDoc = "must not be percent-encoded";
-      else if (trimmed.split(/[\\/]+/).includes("..")) fields.deployDoc = "must not contain a .. path segment";
+      // The two path rules are applied to the value as typed AND to each decoded
+      // form of it, so an encoded traversal (`%2e%2e/x`, `..%2f`) is caught
+      // without outlawing a literal `%` in a filename (`docs/100%/DEPLOY.md`).
+      else for (const form of deployDocForms(trimmed)) {
+        if (form.startsWith("/") || form.startsWith("\\")) { fields.deployDoc = "must be a relative path (no leading slash)"; break; }
+        if (form.split(/[\\/]+/).includes("..")) { fields.deployDoc = "must not contain a .. path segment"; break; }
+      }
     }
   }
   if (typeof o.notes === "string") {
