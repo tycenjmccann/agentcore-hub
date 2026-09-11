@@ -80,27 +80,38 @@ phases:
         mkdir -p /tmp/rt-rollback
         trap 'rc=$?; if [ $rc -ne 0 ]; then echo "── runtime image deploy failed (rc=$rc) → rolling back ──"; for f in /tmp/rt-rollback/*.prev; do [ -e "$f" ] || continue; n="$(basename "$f" .prev)"; prev="$(cat "$f")"; echo "rollback $n → $prev"; AWS_REGION="$AWS_REGION_HUB" python3 deploy/pipeline/update-runtime-image.py rollback "$n" "$prev" || echo "rollback of $n errored — inspect"; done; fi; exit $rc' EXIT
 
+        # Two runtimes can share one image (the coding runtime and its Instances
+        # twin build from the same context): build + push once per repo|context
+        # and swap the same digest into every runtime that lists the pair.
+        declare -A BUILT_REF=()
         while IFS=$'\t' read -r KIND NAME REPO CTX; do
           [ "$KIND" = "RUNTIME" ] || continue
-          TAG="${GIT_SHA}-$(date -u +%H%M%S)"
-          IMG="${ECR_REG}/${REPO}:${TAG}"
-          echo "── building $NAME image ($REPO) from $CTX ──"
-          docker build --platform linux/arm64 -t "$IMG" "$CTX"
-          docker push "$IMG"
-          # Resolve the immutable digest (ECR describe is eventually-consistent
-          # right after a push — retry, and never promote an empty ref).
-          DIGEST=""
-          for attempt in 1 2 3 4 5 6; do
-            DIGEST="$(aws ecr describe-images --repository-name "$REPO" \
-              --image-ids imageTag="$TAG" --region "$AWS_REGION_HUB" \
-              --query 'imageDetails[0].imageDigest' --output text 2>/dev/null || true)"
-            case "$DIGEST" in
-              sha256:*) break ;;
-              *) echo "digest not ready (attempt $attempt): '$DIGEST' — retrying"; DIGEST=""; sleep 5 ;;
-            esac
-          done
-          if [ -z "$DIGEST" ]; then echo "FATAL: no sha256 digest for $REPO:$TAG" >&2; exit 1; fi
-          REF="${ECR_REG}/${REPO}@${DIGEST}"
+          PAIR="${REPO}|${CTX}"
+          if [ -n "${BUILT_REF[$PAIR]:-}" ]; then
+            REF="${BUILT_REF[$PAIR]}"
+            echo "── $NAME reuses the $REPO image built above ──"
+          else
+            TAG="${GIT_SHA}-$(date -u +%H%M%S)"
+            IMG="${ECR_REG}/${REPO}:${TAG}"
+            echo "── building $NAME image ($REPO) from $CTX ──"
+            docker build --platform linux/arm64 -t "$IMG" "$CTX"
+            docker push "$IMG"
+            # Resolve the immutable digest (ECR describe is eventually-consistent
+            # right after a push — retry, and never promote an empty ref).
+            DIGEST=""
+            for attempt in 1 2 3 4 5 6; do
+              DIGEST="$(aws ecr describe-images --repository-name "$REPO" \
+                --image-ids imageTag="$TAG" --region "$AWS_REGION_HUB" \
+                --query 'imageDetails[0].imageDigest' --output text 2>/dev/null || true)"
+              case "$DIGEST" in
+                sha256:*) break ;;
+                *) echo "digest not ready (attempt $attempt): '$DIGEST' — retrying"; DIGEST=""; sleep 5 ;;
+              esac
+            done
+            if [ -z "$DIGEST" ]; then echo "FATAL: no sha256 digest for $REPO:$TAG" >&2; exit 1; fi
+            REF="${ECR_REG}/${REPO}@${DIGEST}"
+            BUILT_REF[$PAIR]="$REF"
+          fi
           echo "  promoting $NAME → $REF"
           GIT_SHA="$GIT_SHA" EVENTS_TABLE="${EVENTS_TABLE:-agentcore-hub-events}" \
             RT_SNAPSHOT_DIR=/tmp/rt-rollback AWS_REGION="$AWS_REGION_HUB" \

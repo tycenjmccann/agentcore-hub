@@ -44,8 +44,22 @@ export function codingRuntimeConfigured(): boolean {
   return Boolean(CODING_RUNTIME_ARN);
 }
 
+/**
+ * Which runtime a call goes to. A session row records the runtime it was
+ * created on (`runtimeArn`) so it keeps working after the app's default moves
+ * (microVM+EFS → Instances+EBS): its workspace and transcript live on that
+ * runtime's storage, not the new one's. Rows without one predate the field and
+ * belong to the app's configured runtime.
+ */
+export function resolveRuntimeArn(sessionRuntimeArn?: string): string {
+  const arn = sessionRuntimeArn || CODING_RUNTIME_ARN;
+  if (!arn) throw new Error("CODING_AGENT_RUNTIME_ARN is not set");
+  return arn;
+}
+
 export interface CodingTurnParams {
   sessionId: string; // runtimeSessionId — selects the warm microVM
+  runtimeArn?: string; // the session row's runtime; defaults to the app's CODING_AGENT_RUNTIME_ARN
   prompt: string;
   cli: CloudCodeCli;
   repo?: string;
@@ -108,15 +122,13 @@ function buildTurnPayload(params: CodingTurnParams): Record<string, unknown> {
 }
 
 export async function invokeCodingTurn(params: CodingTurnParams): Promise<CodingTurnResult> {
-  if (!CODING_RUNTIME_ARN) {
-    throw new Error("CODING_AGENT_RUNTIME_ARN is not set");
-  }
+  const runtimeArn = resolveRuntimeArn(params.runtimeArn);
   const region = params.region || REGION;
 
   const payload = buildTurnPayload(params);
 
   const command = new InvokeAgentRuntimeCommand({
-    agentRuntimeArn: CODING_RUNTIME_ARN,
+    agentRuntimeArn: runtimeArn,
     runtimeSessionId: params.sessionId,
     payload: new TextEncoder().encode(JSON.stringify(payload)),
     contentType: "application/json",
@@ -151,15 +163,13 @@ export async function invokeCodingTurn(params: CodingTurnParams): Promise<Coding
  * frames as the turn runs — claude token deltas, codex per-step frames.
  */
 export async function invokeCodingTurnStream(params: CodingTurnParams): Promise<ReadableStream<Uint8Array>> {
-  if (!CODING_RUNTIME_ARN) {
-    throw new Error("CODING_AGENT_RUNTIME_ARN is not set");
-  }
+  const runtimeArn = resolveRuntimeArn(params.runtimeArn);
   const region = params.region || REGION;
 
   const payload = { ...buildTurnPayload(params), stream: true };
 
   const command = new InvokeAgentRuntimeCommand({
-    agentRuntimeArn: CODING_RUNTIME_ARN,
+    agentRuntimeArn: runtimeArn,
     runtimeSessionId: params.sessionId,
     payload: new TextEncoder().encode(JSON.stringify(payload)),
     contentType: "application/json",
@@ -181,14 +191,15 @@ export async function invokeCodingTurnStream(params: CodingTurnParams): Promise<
  */
 export async function stopCodingSession(params: {
   sessionId: string; // runtimeSessionId — selects the microVM to tear down
+  runtimeArn?: string; // the session row's runtime; defaults to the app's CODING_AGENT_RUNTIME_ARN
   region?: string;
 }): Promise<void> {
-  if (!CODING_RUNTIME_ARN) throw new Error("CODING_AGENT_RUNTIME_ARN is not set");
+  const runtimeArn = resolveRuntimeArn(params.runtimeArn);
   const region = params.region || REGION;
   await client(region).send(
     new StopRuntimeSessionCommand({
       runtimeSessionId: params.sessionId,
-      agentRuntimeArn: CODING_RUNTIME_ARN,
+      agentRuntimeArn: runtimeArn,
       qualifier: "DEFAULT",
     })
   );
@@ -202,6 +213,7 @@ export async function stopCodingSession(params: {
  */
 export async function warmCodingSession(params: {
   sessionId: string;
+  runtimeArn?: string; // the session row's runtime; defaults to the app's CODING_AGENT_RUNTIME_ARN
   cli: CloudCodeCli;
   repo?: string;
   branch?: string;
@@ -219,7 +231,7 @@ export async function warmCodingSession(params: {
   cloneUrl?: string;
   resumeBundleKey?: string;
 }): Promise<{ resumeReady: boolean }> {
-  if (!CODING_RUNTIME_ARN) throw new Error("CODING_AGENT_RUNTIME_ARN is not set");
+  const runtimeArn = resolveRuntimeArn(params.runtimeArn);
   const region = params.region || REGION;
   const payload: Record<string, unknown> = {
     warm: true,
@@ -240,7 +252,7 @@ export async function warmCodingSession(params: {
   if (params.githubAppConnected) payload.github_app_connected = true;
 
   const command = new InvokeAgentRuntimeCommand({
-    agentRuntimeArn: CODING_RUNTIME_ARN,
+    agentRuntimeArn: runtimeArn,
     runtimeSessionId: params.sessionId,
     payload: new TextEncoder().encode(JSON.stringify(payload)),
     contentType: "application/json",
@@ -275,6 +287,7 @@ async function parseResumeReady(body?: { transformToString(): Promise<string> })
  */
 export async function prepareCodingSession(params: {
   sessionId: string;
+  runtimeArn?: string; // the session row's runtime; defaults to the app's CODING_AGENT_RUNTIME_ARN
   cli: CloudCodeCli;
   userId?: string;
   tenantId?: string;
@@ -286,7 +299,7 @@ export async function prepareCodingSession(params: {
   githubToken?: string;
   githubAppConnected?: boolean;
 }): Promise<{ resumeReady: boolean }> {
-  if (!CODING_RUNTIME_ARN) throw new Error("CODING_AGENT_RUNTIME_ARN is not set");
+  const runtimeArn = resolveRuntimeArn(params.runtimeArn);
   const region = params.region || REGION;
   const payload: Record<string, unknown> = {
     prepare: true,
@@ -300,7 +313,7 @@ export async function prepareCodingSession(params: {
   if (params.githubAppConnected) payload.github_app_connected = true;
 
   const command = new InvokeAgentRuntimeCommand({
-    agentRuntimeArn: CODING_RUNTIME_ARN,
+    agentRuntimeArn: runtimeArn,
     runtimeSessionId: params.sessionId,
     payload: new TextEncoder().encode(JSON.stringify(payload)),
     contentType: "application/json",
@@ -319,6 +332,7 @@ export async function prepareCodingSession(params: {
  */
 export async function checkpointCodingSession(params: {
   sessionId: string;
+  runtimeArn?: string; // the session row's runtime; defaults to the app's CODING_AGENT_RUNTIME_ARN
   cli: CloudCodeCli;
   repo?: string;
   // Workspace resolution on the runtime derives the slug from repo OR cloneUrl —
@@ -342,7 +356,7 @@ export async function checkpointCodingSession(params: {
   returnBundleKey?: string;
   returnBundleBranch?: string;
 }> {
-  if (!CODING_RUNTIME_ARN) throw new Error("CODING_AGENT_RUNTIME_ARN is not set");
+  const runtimeArn = resolveRuntimeArn(params.runtimeArn);
   const region = params.region || REGION;
   const payload: Record<string, unknown> = {
     checkpoint: true,
@@ -356,7 +370,7 @@ export async function checkpointCodingSession(params: {
   if (params.tenantId) payload.tenant_id = params.tenantId;
 
   const command = new InvokeAgentRuntimeCommand({
-    agentRuntimeArn: CODING_RUNTIME_ARN,
+    agentRuntimeArn: runtimeArn,
     runtimeSessionId: params.sessionId,
     payload: new TextEncoder().encode(JSON.stringify(payload)),
     contentType: "application/json",

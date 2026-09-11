@@ -604,11 +604,20 @@ def _record_coding_session(cli: str) -> None:
             item["repo"] = {"S": _CODING_SESSION["repo"]}
         if conversation_id:
             item["claudeSessionId"] = {"S": conversation_id}
+        # Which coding runtime holds this session's workspace. The reaper's sweep
+        # reads it to release the right compute (EBS volume on Instances, EFS dir
+        # on microVM) and a rework agent refuses to resume a row from the other
+        # runtime — the workspace would not be there.
+        if CODING_AGENT_RUNTIME_ARN:
+            item["runtimeArn"] = {"S": CODING_AGENT_RUNTIME_ARN}
         if _CODING_SESSION.get("recorded"):
             # Row exists — only refresh the resume handle + timestamp, never
             # clobber fields the UI may have touched (title edits, turns).
             expr = "SET updatedAt = :u"
             vals = {":u": {"S": now}}
+            if CODING_AGENT_RUNTIME_ARN:
+                expr += ", runtimeArn = if_not_exists(runtimeArn, :r)"
+                vals[":r"] = {"S": CODING_AGENT_RUNTIME_ARN}
             if conversation_id:
                 expr += ", claudeSessionId = :c, cli = :cli"
                 vals[":c"] = {"S": conversation_id}
@@ -654,14 +663,34 @@ def _maybe_resume_session(resume_session: str) -> None:
     CLI simply starts a new conversation there."""
     if not resume_session or _CODING_SESSION["session_id"]:
         return
-    _CODING_SESSION["session_id"] = resume_session
-    _CODING_SESSION["recorded"] = True  # row exists (or existed) — update, don't re-put
-    _CODING_SESSION["adopted"] = True
+    row = None
     try:
         row = boto3.client("dynamodb", region_name=REGION).get_item(
             TableName=CLOUD_CODE_TABLE,
             Key={"sessionId": {"S": resume_session}},
         ).get("Item")
+    except Exception as e:  # noqa: BLE001 — resume is best-effort, never fail the turn
+        logger.warning(f"[remote-coding] session lookup failed (non-fatal): {e}")
+    if (row or {}).get("computeReleasedAt", {}).get("S"):
+        # The reaper released this session's workspace (EBS volume deleted / EFS
+        # dir purged) after its run finished. Nothing to resume into.
+        logger.info(f"[remote-coding] not resuming {resume_session}: compute released "
+                    f"{row['computeReleasedAt']['S']} — fresh session")
+        return
+    row_runtime = (row or {}).get("runtimeArn", {}).get("S")
+    if row_runtime and CODING_AGENT_RUNTIME_ARN and row_runtime != CODING_AGENT_RUNTIME_ARN:
+        # The session's workspace lives on another coding runtime (a cutover
+        # happened between the original turn and this rework). Pinning its id
+        # here would land on an empty VM with a stale conversation handle —
+        # start fresh instead; the branch on GitHub is the context.
+        logger.info(f"[remote-coding] not resuming {resume_session}: it lives on "
+                    f"{row_runtime.rsplit('/', 1)[-1]}, this fleet codes on "
+                    f"{CODING_AGENT_RUNTIME_ARN.rsplit('/', 1)[-1]} — fresh session")
+        return
+    _CODING_SESSION["session_id"] = resume_session
+    _CODING_SESSION["recorded"] = True  # row exists (or existed) — update, don't re-put
+    _CODING_SESSION["adopted"] = True
+    try:
         if row:
             cli = row.get("cli", {}).get("S")
             conv = row.get("claudeSessionId", {}).get("S")
@@ -1267,10 +1296,17 @@ def _remote_coding_turn(task: str, cli: str, repo: str = "", model: str = "",
     plan_only: claude only — run the turn in Claude Code plan mode (reads the
     repo, returns a plan, cannot edit). Same conversation as the execute turn
     that follows, so the runtime's --resume carries the approved plan over."""
+    minted = False
     if not _CODING_SESSION["session_id"]:
         _CODING_SESSION["session_id"] = f"cc-{uuid.uuid4().hex}"  # >=33 chars for AgentCore
+        minted = True
     if repo and not _CODING_SESSION.get("repo"):
         _CODING_SESSION["repo"] = repo
+    if minted:
+        # Row exists from the first byte of compute: a turn that dies before
+        # returning still leaves the session (and its EBS volume / EFS dir) on
+        # record for the reaper's sweep.
+        _record_coding_session(cli)
     # Resume handle is per-CLI: a codex thread id means nothing to `claude
     # --resume` and vice versa (an agent may use both engines in one task).
     conversation_id = _CODING_SESSION["conversation_ids"].get(cli)
@@ -1378,6 +1414,7 @@ def _remote_coding_turn(task: str, cli: str, repo: str = "", model: str = "",
                 payload["session_id"] = fresh_id
                 for k in ("claude_session_id", "resume_transcript", "resume_session_id"):
                     payload.pop(k, None)
+                _record_coding_session(cli)
                 result = _submit_and_wait(client, payload, turn_deadline, cli_bound_s)
     except Exception as e:  # noqa: BLE001
         # Do NOT fall back to a local CLI run: the session's workspace lives on

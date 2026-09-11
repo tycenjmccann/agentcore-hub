@@ -66,7 +66,15 @@ export ROUTINES_DLQ_ARN="${ROUTINES_DLQ_ARN:-arn:aws:sqs:${AWS_REGION}:${ACCOUNT
 # WITHOUT this the gateway MCP tools never mount and iOS tickets ship untested.
 export IOS_TEST_GATEWAY_URL="${IOS_TEST_GATEWAY_URL:-}"
 
-# Cloud Code — the standalone coding-agent runtime (set after deploy.py prints the ARN)
+# Cloud Code — the standalone coding-agent runtime. Unset → the ARN file the
+# Instances deploy wrote (deploy-instances.py, EC2 + per-session EBS), else the
+# microVM deploy's file (deploy.py). Both files are gitignored.
+_CODING_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/coding-agent-runtime"
+if [ -z "${CODING_AGENT_RUNTIME_ARN:-}" ]; then
+  for _f in "$_CODING_DIR/coding-runtime-instances-arn.txt" "$_CODING_DIR/coding-runtime-arn.txt"; do
+    if [ -s "$_f" ]; then CODING_AGENT_RUNTIME_ARN="$(tr -d '[:space:]' < "$_f")"; break; fi
+  done
+fi
 export CODING_AGENT_RUNTIME_ARN="${CODING_AGENT_RUNTIME_ARN:-}"
 # Default MCP gateway wired into Cloud Code CLIs (shared Jira/S3/Skill tools).
 export MCP_GATEWAY_URL="${MCP_GATEWAY_URL:-}"

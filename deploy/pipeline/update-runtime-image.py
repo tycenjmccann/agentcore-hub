@@ -53,6 +53,8 @@ _PRESERVED = [
     "filesystemConfigurations",
     "lifecycleConfiguration",
     "environmentVariables",
+    # Instances runtimes: dropping this would move the runtime back to microVMs.
+    "capacityProviderConfiguration",
 ]
 
 

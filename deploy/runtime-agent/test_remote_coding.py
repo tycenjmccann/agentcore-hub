@@ -904,6 +904,92 @@ class TestSessionBusyFallback(RemoteCodingTestCase):
         self.assertEqual(item["title"]["S"], "[wf] TEAM-3119 frontend_dev")
 
 
+RUNTIME_A = "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/coding-a"
+RUNTIME_B = "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/coding-b"
+
+
+class TestSessionRuntimeAttribution(RemoteCodingTestCase):
+    """Coding runtime cutover (microVM+EFS → Instances+EBS): every session row
+    names the runtime that holds its workspace, the row exists from the moment
+    the id is minted (a failed first turn must still leave the volume on record
+    for the reaper's sweep), and a rework agent never resumes a row whose
+    workspace lives on the other runtime."""
+
+    def test_new_row_carries_runtime_arn(self):
+        main._CODING_SESSION["session_id"] = "cc-row"
+        ddb = mock.MagicMock()
+        with mock.patch.object(main, "CODING_AGENT_RUNTIME_ARN", RUNTIME_B), \
+             mock.patch.object(main.boto3, "client", return_value=ddb):
+            main._record_coding_session("claude")
+        self.assertEqual(ddb.put_item.call_args.kwargs["Item"]["runtimeArn"]["S"], RUNTIME_B)
+
+    def test_update_never_overwrites_an_existing_runtime_arn(self):
+        main._CODING_SESSION["session_id"] = "cc-row"
+        main._CODING_SESSION["recorded"] = True
+        ddb = mock.MagicMock()
+        with mock.patch.object(main, "CODING_AGENT_RUNTIME_ARN", RUNTIME_B), \
+             mock.patch.object(main.boto3, "client", return_value=ddb):
+            main._record_coding_session("claude")
+        kw = ddb.update_item.call_args.kwargs
+        self.assertIn("runtimeArn = if_not_exists(runtimeArn, :r)", kw["UpdateExpression"])
+        self.assertEqual(kw["ExpressionAttributeValues"][":r"]["S"], RUNTIME_B)
+
+    def test_row_is_written_at_mint_before_the_first_turn(self):
+        # A turn that dies before returning must still leave the session on record.
+        recorded = []
+        with mock.patch.object(main.boto3, "client", return_value=mock.MagicMock()), \
+             mock.patch.object(main, "_ddb_events_client", mock.MagicMock()), \
+             mock.patch.object(main, "_submit_and_wait", side_effect=RuntimeError("vm exploded")), \
+             mock.patch.object(main, "_record_coding_session",
+                               side_effect=lambda cli: recorded.append(main._CODING_SESSION["session_id"])):
+            out = main._remote_coding_turn("fix the bug", "claude", repo="o/r")
+        self.assertTrue(out.startswith("ERROR"), out)
+        self.assertEqual(len(recorded), 1, "recorded exactly once, at mint")
+        self.assertTrue(recorded[0].startswith("cc-"))
+        self.assertEqual(main._CODING_SESSION["repo"], "o/r", "repo is set before the record")
+
+    def _resume(self, row_item):
+        ddb = mock.MagicMock()
+        ddb.get_item.return_value = {"Item": row_item} if row_item is not None else {}
+        with mock.patch.object(main, "CODING_AGENT_RUNTIME_ARN", RUNTIME_B), \
+             mock.patch.object(main.boto3, "client", return_value=ddb):
+            main._maybe_resume_session("cc-prior")
+
+    def test_resume_refuses_a_row_from_the_other_runtime(self):
+        self._resume({"sessionId": {"S": "cc-prior"}, "cli": {"S": "claude"},
+                      "claudeSessionId": {"S": "conv-old"}, "runtimeArn": {"S": RUNTIME_A}})
+        self.assertIsNone(main._CODING_SESSION["session_id"], "fresh session will be minted")
+        self.assertFalse(main._CODING_SESSION["adopted"])
+        self.assertEqual(main._CODING_SESSION["conversation_ids"], {})
+
+    def test_resume_adopts_a_row_from_this_runtime(self):
+        self._resume({"sessionId": {"S": "cc-prior"}, "cli": {"S": "claude"},
+                      "claudeSessionId": {"S": "conv-old"}, "runtimeArn": {"S": RUNTIME_B}})
+        self.assertEqual(main._CODING_SESSION["session_id"], "cc-prior")
+        self.assertTrue(main._CODING_SESSION["adopted"])
+        self.assertEqual(main._CODING_SESSION["conversation_ids"]["claude"], "conv-old")
+
+    def test_resume_refuses_a_row_whose_compute_was_released(self):
+        self._resume({"sessionId": {"S": "cc-prior"}, "cli": {"S": "claude"},
+                      "claudeSessionId": {"S": "conv-old"}, "runtimeArn": {"S": RUNTIME_B},
+                      "computeReleasedAt": {"S": "2026-09-11T20:00:00.000Z"}})
+        self.assertIsNone(main._CODING_SESSION["session_id"])
+        self.assertFalse(main._CODING_SESSION["adopted"])
+
+    def test_resume_adopts_a_legacy_row_without_runtime_arn(self):
+        # Rows written before the column existed all live on the runtime the
+        # fleet was pointed at then; a cutover is done with those drained.
+        self._resume({"sessionId": {"S": "cc-prior"}, "cli": {"S": "codex"},
+                      "claudeSessionId": {"S": "thread-1"}})
+        self.assertEqual(main._CODING_SESSION["session_id"], "cc-prior")
+        self.assertTrue(main._CODING_SESSION["adopted"])
+
+    def test_resume_with_no_row_still_pins_the_workspace(self):
+        self._resume(None)
+        self.assertEqual(main._CODING_SESSION["session_id"], "cc-prior")
+        self.assertTrue(main._CODING_SESSION["adopted"])
+
+
 class _FakeClock:
     """Stand-in for the `time` module inside main: sleep() ADVANCES the clock, so a
     multi-thousand-second wait runs in milliseconds of real time. Only the wait

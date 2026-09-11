@@ -71,6 +71,15 @@ export interface CloudCodeSession {
   origin?: "workflow";
   workflowId?: string;
   agentId?: string;
+  // Runtime this session's workspace lives on (microVM+EFS or Instances+EBS).
+  // Written at creation (app or fleet); every later call targets it, so a
+  // session survives the app's default runtime moving. Absent = legacy row on
+  // the app's configured runtime.
+  runtimeArn?: string;
+  // Stamped by the session reaper's sweep once the backing compute (EBS volume
+  // or EFS dir) was released: the row stays for history, a resume starts a
+  // fresh workspace on the current runtime.
+  computeReleasedAt?: string;
   // Soft-delete tombstone. Set (with a short DynamoDB `ttl`) when the user
   // deletes the session: the row vanishes from lists immediately but survives
   // until the TTL lapses; the table stream's REMOVE event then fires the reaper
@@ -93,4 +102,13 @@ export interface CloudCodeSessionSummary {
   origin?: "workflow";
   workflowId?: string;
   agentId?: string;
+  // Runtime this session's workspace lives on (microVM+EFS or Instances+EBS).
+  // Written at creation (app or fleet); every later call targets it, so a
+  // session survives the app's default runtime moving. Absent = legacy row on
+  // the app's configured runtime.
+  runtimeArn?: string;
+  // Stamped by the session reaper's sweep once the backing compute (EBS volume
+  // or EFS dir) was released: the row stays for history, a resume starts a
+  // fresh workspace on the current runtime.
+  computeReleasedAt?: string;
 }
