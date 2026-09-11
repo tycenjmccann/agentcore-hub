@@ -18,9 +18,33 @@ import re
 import subprocess
 from pathlib import Path
 
+import pytest
+
 REPO = Path(__file__).resolve().parents[2]
 SCRIPT = REPO / "deploy" / "pipeline" / "prune-apt-sources.sh"
 BUILDSPEC = REPO / "deploy" / "pipeline" / "buildspec-ci.yml"
+
+# TEAM-4464: both tests below make the sources dir unwritable with `chmod 0555` so the
+# script's `[ ! -w "$dir" ]` probe takes the sudo branch. Root bypasses mode bits, so as
+# root that probe is FALSE no matter the mode and neither branch can be reached: test 1
+# never sees its stub sudo invoked, and test 2 walks into the prune loop with an empty
+# PATH and dies on `grep: command not found` (exit 127). CodeBuild runs as root and so
+# does deploy/pipeline/ci-image (node:20-bookworm, no USER), so these two were red on
+# EVERY CodeBuild run -- silently, until the buildspec masking above was fixed.
+#
+# The sudo branch exists FOR the non-root caller (GitHub's hosted runners), and that is
+# exactly where these tests still run: .github/workflows/ci.yml's python job on
+# ubuntu-latest, plus every developer's laptop. Skipping as root loses no real coverage.
+# Dropping privileges instead (setpriv/runuser to nobody) would keep the assertion on
+# CodeBuild only -- a root-only test path that nothing else ever exercises, i.e. the same
+# silent-rot failure mode this ticket is fixing -- and adds tool + `nobody` assumptions
+# to two different base images.
+requires_non_root = pytest.mark.skipif(
+    os.geteuid() == 0,
+    reason="root bypasses directory mode bits, so `[ ! -w dir ]` cannot be made false -- "
+           "the sudo/no-sudo branches are only reachable as a non-root user "
+           "(GitHub runners, local dev). See TEAM-4464.",
+)
 
 # Verbatim-shaped sources from aws/aws-codebuild-docker-images ubuntu/standard/7.0.
 THIRD_PARTY = {
@@ -139,6 +163,7 @@ def test_playwright_install_is_not_softened():
             assert "|| true" not in line, line
 
 
+@requires_non_root
 def test_uses_sudo_when_the_directory_is_not_writable(tmp_path):
     """GitHub's hosted runners are non-root and bake in the same google-chrome
     source, so this script serves that caller too — but `rm` there needs sudo,
@@ -167,6 +192,7 @@ def test_uses_sudo_when_the_directory_is_not_writable(tmp_path):
         d.chmod(0o755)
 
 
+@requires_non_root
 def test_no_sudo_and_no_write_access_exits_clean_without_pruning(tmp_path):
     """Better to leave the sources alone and let apt speak than to abort a build
     on a `sudo: not found`."""
