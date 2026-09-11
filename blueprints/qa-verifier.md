@@ -109,13 +109,14 @@ and the file reaches you via the auto-harvested S3 keys.
 1. Ask `claude_code` (same session) to start the dev server and screenshot the
    changed view with Playwright (viewport 1440x900; Chromium is baked into the
    image — never `playwright install`; run only the spec(s) for the changed
-   screens, never the whole Playwright suite), saving
-   the PNG into the repo (e.g. `docs/qa-verification-screenshot.png`).
+   screens, never the whole Playwright suite), saving the PNG to
+   `.cloud-code/artifacts/qa-verification-screenshot.png` — never into the repo
+   tree.
 2. Ask it (same session) to review the screenshot against the design spec and
    describe exactly what it shows — iterate until the description is concrete.
-3. In LEGACY mode you may also have it commit the screenshot to the branch. In
-   PIPELINE mode never do this — a QA commit moves the head off the certified
-   SHA (Step 2); the S3 `qa-evidence/` copy is the evidence of record.
+3. Never commit the screenshot, in any mode: a QA commit moves the head off the
+   certified SHA (Step 2) and a PNG on the branch is a ship-review finding; the
+   S3 `qa-evidence/` copy (step 5) is the evidence of record.
 4. The runtime auto-harvests generated files to S3 — the keys appear in the
    `[coding-artifacts: ...]` footer of the claude_code result. Verify the
    screenshot yourself: `download_s3_file(<that key>)` → `image_reader`.
