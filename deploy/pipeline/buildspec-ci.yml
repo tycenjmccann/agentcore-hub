@@ -33,20 +33,47 @@ phases:
       # Mirrors .github/workflows/ci.yml, which sets nothing. (PR #263 pilot fix.)
       - "node --version && npm --version"
       - "npm ci --include=dev"
-      # TEAM-4311: the `--with-deps` line below runs, as root,
+      # TEAM-4311: `playwright install --with-deps` runs, as root,
       # `sh -c "apt-get update && apt-get install -y --no-install-recommends ..."`,
       # and `apt-get update` exits 100 if ANY configured source fails to fetch --
-      # which short-circuits the `&&` and fails INSTALL. This image bakes in four
-      # third-party repos we do not use (Google Chrome, mozillateam PPA, corretto,
-      # github-cli); on 2026-09-09 dl.google.com served a Hash Sum mismatch and
-      # killed the Build stage twice. Playwright pulls Chromium from Microsoft's
-      # CDN and install-deps only needs Ubuntu main/universe, so drop those
-      # sources first. Nothing is uninstalled -- only the source files go.
+      # which short-circuits the `&&` and fails INSTALL. The managed STANDARD_7_0
+      # image bakes in four third-party repos we do not use (Google Chrome,
+      # mozillateam PPA, corretto, github-cli); on 2026-09-09 dl.google.com served
+      # a Hash Sum mismatch and killed the Build stage twice. The next line drops
+      # every non-Ubuntu apt source so none of them can fail this build; nothing
+      # is uninstalled, only the source files go. It stays unconditional: on the
+      # custom image (below) Debian keeps its sources in /etc/apt/sources.list,
+      # which that script never touches, so it is a logged no-op there.
       - "bash deploy/pipeline/prune-apt-sources.sh"
-      # Playwright needs a real browser + OS deps on the clean CodeBuild image
-      # (mirrors .github/workflows/ci.yml). Without this the test gates error.
-      # Deliberately NO `|| true` -- a missing browser must still fail the build.
-      - "npx playwright install --with-deps chromium"
+      # TEAM-4448 R11 removed apt from this hot path for good: the custom CI image
+      # (deploy/pipeline/ci-image/) bakes Chromium AND its shared libs, and sets
+      # PLAYWRIGHT_BROWSERS_PATH. On that image the browser is already there, so
+      # `playwright install chromium` (no `--with-deps`, so apt is never reached)
+      # is a no-op and the log shows no CDN download -- that is the R11 evidence.
+      #
+      # It is still RUN, not skipped: the glob only proves that *some* revision is
+      # baked, not the one the checked-out @playwright/test wants. The image is
+      # rebuilt manually by deploy.sh, so a lockfile bump would otherwise leave a
+      # stale revision behind the guard and the gates would die with "Executable
+      # doesn't exist at ...". Comparing the revision set before and after turns
+      # that silent drift into a loud warning plus a CDN-only download.
+      #
+      # No baked browser => the managed image => the legacy path, unchanged.
+      # Deliberately NO `|| true` on either -- a missing browser must fail the build.
+      - |
+        if [ -n "${PLAYWRIGHT_BROWSERS_PATH:-}" ] && ls -d "${PLAYWRIGHT_BROWSERS_PATH}"/chromium-* >/dev/null 2>&1; then
+          echo "playwright: baked chromium present ($(ls -d "${PLAYWRIGHT_BROWSERS_PATH}"/chromium-* | head -1)) - no apt, no CDN"
+          before="$(ls -d "${PLAYWRIGHT_BROWSERS_PATH}"/chromium-* | sort | tr '\n' ' ')"
+          npx playwright install chromium
+          after="$(ls -d "${PLAYWRIGHT_BROWSERS_PATH}"/chromium-* | sort | tr '\n' ' ')"
+          if [ "$before" != "$after" ]; then
+            echo "WARNING playwright: baked chromium revision drifted — run ./deploy/pipeline/deploy.sh to rebuild deploy/pipeline/ci-image (CDN download happened this build)"
+            echo "WARNING playwright: before [$before] after [$after]"
+          fi
+        else
+          echo "playwright: browser NOT baked - legacy managed-image install path"
+          npx playwright install --with-deps chromium
+        fi
 
   pre_build:
     commands:
@@ -148,6 +175,19 @@ phases:
           echo "Build + push app image to ECR, capture the DIGEST for promote-by-digest"
           ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
           ECR_URI="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION_HUB}.amazonaws.com/${ECR_REPO}"
+          # TEAM-4448 R11: CodeBuild starts a Docker daemon only for its OWN
+          # curated images. The custom CI image carries the static engine but
+          # nothing launches it, so bring it up here — a no-op on the managed
+          # image, where `docker info` already answers. This is the ONLY place a
+          # daemon is needed; PR checks never enter this branch.
+          if ! docker info >/dev/null 2>&1; then
+            echo "docker: no daemon - starting dockerd (custom build image)"
+            nohup dockerd --host=unix:///var/run/docker.sock --storage-driver=overlay2 \
+              >/tmp/dockerd.log 2>&1 &
+            timeout 60 bash -c 'until docker info >/dev/null 2>&1; do sleep 1; done' \
+              || { echo "docker: dockerd failed to come up within 60s"; cat /tmp/dockerd.log; exit 1; }
+            echo "docker: daemon up"
+          fi
           aws ecr get-login-password --region "$AWS_REGION_HUB" \
             | docker login --username AWS --password-stdin "${ACCOUNT_ID}.dkr.ecr.${AWS_REGION_HUB}.amazonaws.com"
           # Build the image from the CANDIDATE roster with only the live runtimeArns

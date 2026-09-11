@@ -58,6 +58,15 @@
  *     pipeline_name-resolved target while the project came from elsewhere, so
  *     a cross-region call reached the wrong region. Now: region follows the
  *     project's OWNER, and get_build_status allow-lists its project too.
+ *
+ * TEAM-4448 D2 gives start_ci_build a bounded RETRY: one extra build per SHA, and
+ * only when the newest prior build died in an infra phase. The suite for it pins
+ * the DECISION, not just the answer — for every case, how many StartBuild calls
+ * happened (usually zero) and which idempotencyToken they carried, because the two
+ * ways this feature fails are an unbounded retry loop (the cap not holding) and a
+ * retry that collides with a concurrent caller (the token or sourceVersion being
+ * derived from args instead of from the prior build — SR-3.2). It also tightens
+ * three pre-D2 cases on purpose, each labelled at its assertion.
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
 // Section 8.10 asserts on the SOURCE of index.mjs, not on its behaviour: no
@@ -209,7 +218,7 @@ vi.mock("@aws-sdk/client-cloudwatch-logs", () => ({
   GetLogEventsCommand: class { constructor(i) { this.input = i; } },
 }));
 
-const { handler, validateCiProjectName } = await import("./index.mjs");
+const { handler, validateCiProjectName, classifyPriorBuild } = await import("./index.mjs");
 
 /** The hoisted default BatchGetBuilds stub, so a suite that installs its own can
  * be restored between tests. */
@@ -911,13 +920,24 @@ describe("start_ci_build dedupe (one build per commit)", () => {
     expect(out).toMatchObject({ reused: true, buildId: "b-3" });
   });
 
-  it("a FAILED build for the same commit is NOT a reuse — re-running red CI is the use case", async () => {
+  it("a FAILED build with no phase evidence is REFUSED, not re-run (TEAM-4448 D2 tightening)", async () => {
+    // Pre-D2 this started a fresh build: "a FAILED build is not a reuse, and
+    // re-running red CI is the use case". D2 narrows that to infra-phase deaths
+    // only — with no `phases` there is no evidence the failure was infra, and the
+    // carve-out fires on positive evidence only. NOT a regression: the retry suite
+    // below pins the cases that DO get a second build.
     recentBuilds([{ id: "b-4", buildStatus: "FAILED", resolvedSourceVersion: SHA }]);
 
     const out = await invoke("start_ci_build", { commit_sha: SHA });
 
-    expect(out).toMatchObject({ ok: true, started: true });
-    expect(h.state.cbCalls.find((c) => c.type === "StartBuild")).toBeDefined();
+    expect(out).toMatchObject({
+      ok: false,
+      reason: "build_failed_not_retryable",
+      prior_build_id: "b-4",
+      prior_failed_phase: null,
+      attempts: 1,
+    });
+    expect(h.state.cbCalls.find((c) => c.type === "StartBuild")).toBeUndefined();
   });
 
   it("a build for a DIFFERENT commit never dedupes this one", async () => {
@@ -933,7 +953,11 @@ describe("start_ci_build dedupe (one build per commit)", () => {
     expect(out).toMatchObject({ ok: true, started: true });
   });
 
-  it("scans the 30 most recent builds only", async () => {
+  it("scans a bounded window of recent builds, newest first", async () => {
+    // TEAM-4448 D2 widened the window from 30 to BatchGetBuilds' max of 100: the
+    // scan now has to find every ATTEMPT for the sha, not just a live one, and a
+    // busy PR-check project can bury the first attempt below 30. 60 ids fit inside
+    // the window, so all 60 are fetched; the 100 clamp is pinned in the retry suite.
     recentBuilds(
       Array.from({ length: 60 }, (_, i) => ({
         id: `b-${i}`,
@@ -945,8 +969,519 @@ describe("start_ci_build dedupe (one build per commit)", () => {
     await invoke("start_ci_build", { commit_sha: SHA });
 
     const batch = h.state.cbCalls.find((c) => c.type === "BatchGetBuilds");
-    expect(batch.input.ids.length).toBe(30);
+    expect(batch.input.ids.length).toBe(60);
     expect(batch.input.ids[0]).toBe("b-0");
+  });
+});
+
+// ─── 4b. start_ci_build retry ledger (TEAM-4448 D2) ──────────────────────────
+
+describe("start_ci_build retry ledger (TEAM-4448 D2)", () => {
+  const SHA = "0949f9d8814aa3e2b1c4d5f6a7b8c9d0e1f2a3b4";
+
+  /** CodeBuild's phases[] shape, from `[phaseType, phaseStatus]` pairs. */
+  function phases(pairs) {
+    return pairs.map(([phaseType, phaseStatus]) => ({
+      phaseType,
+      phaseStatus,
+      durationInSeconds: 1,
+    }));
+  }
+
+  /** A build that got as far as `deadPhase` and died there. Everything before it
+   * SUCCEEDED, which is what makes "the FIRST bad phase is the cause" meaningful. */
+  function diedAt(id, deadPhase, buildStatus = "FAILED", extra = {}) {
+    const order = [
+      "SUBMITTED",
+      "QUEUED",
+      "PROVISIONING",
+      "DOWNLOAD_SOURCE",
+      "INSTALL",
+      "PRE_BUILD",
+      "BUILD",
+      "POST_BUILD",
+      "UPLOAD_ARTIFACTS",
+      "FINALIZING",
+    ];
+    const cut = order.indexOf(deadPhase);
+    const pairs = order
+      .slice(0, cut + 1)
+      .map((p) => [p, p === deadPhase ? buildStatus : "SUCCEEDED"]);
+    return {
+      id,
+      buildStatus,
+      resolvedSourceVersion: SHA,
+      phases: phases(pairs),
+      ...extra,
+    };
+  }
+
+  /** The project's recent builds, newest first (same fixture shape the dedupe
+   * suite uses: BatchGetBuilds answers in a DIFFERENT order on purpose). */
+  function ledger(rows) {
+    h.state.listBuildsImpl = async () => ({ ids: rows.map((r) => r.id) });
+    h.state.batchGetBuildsImpl = async (input) => ({
+      builds: [...rows].reverse().filter((r) => input.ids.includes(r.id)),
+    });
+  }
+
+  function startBuilds() {
+    return h.state.cbCalls.filter((c) => c.type === "StartBuild");
+  }
+
+  // ── (a) the unchanged first-start path ───────────────────────────────────────
+
+  it("no prior build for the sha → one plain start, token ci-<sha>", async () => {
+    ledger([]);
+
+    const out = await invoke("start_ci_build", { commit_sha: SHA });
+
+    expect(startBuilds().length).toBe(1);
+    expect(startBuilds()[0].input.idempotencyToken).toBe(`ci-${SHA}`);
+    expect(out).toMatchObject({ ok: true, started: true });
+    // A first start must not look like a retry to the caller.
+    expect(out.retry).toBeUndefined();
+    expect(out.retry_reason).toBeUndefined();
+  });
+
+  // ── (b,c,d) the carve-out: ONE retry after an infra-phase death ──────────────
+
+  it("newest FAILED in INSTALL → exactly one retry, token ci-<sha>-r1, 3-key input", async () => {
+    ledger([diedAt("b-install", "INSTALL")]);
+
+    const out = await invoke("start_ci_build", { commit_sha: SHA });
+
+    expect(startBuilds().length).toBe(1);
+    // Deep-equal, not toMatchObject: a fourth key is the defect, retry or not.
+    expect(startBuilds()[0].input).toEqual({
+      projectName: "agentcore-hub-ci",
+      sourceVersion: SHA,
+      idempotencyToken: `ci-${SHA}-r1`,
+    });
+    expect(out).toMatchObject({
+      ok: true,
+      started: true,
+      retry: true,
+      retry_reason: "infra_install_failure",
+      prior_build_id: "b-install",
+      prior_failed_phase: "INSTALL",
+      attempts: 1,
+    });
+  });
+
+  it("newest FAILED in PRE_BUILD → granted, prior_failed_phase PRE_BUILD", async () => {
+    ledger([diedAt("b-pre", "PRE_BUILD")]);
+
+    const out = await invoke("start_ci_build", { commit_sha: SHA });
+
+    expect(startBuilds().length).toBe(1);
+    expect(out).toMatchObject({ ok: true, retry: true, prior_failed_phase: "PRE_BUILD" });
+  });
+
+  it("newest FAULT in PROVISIONING → granted (a FAULT is the platform, not the diff)", async () => {
+    ledger([diedAt("b-prov", "PROVISIONING", "FAULT")]);
+
+    const out = await invoke("start_ci_build", { commit_sha: SHA });
+
+    expect(startBuilds().length).toBe(1);
+    expect(out).toMatchObject({ ok: true, retry: true, prior_failed_phase: "PROVISIONING" });
+  });
+
+  it("TIMED_OUT in DOWNLOAD_SOURCE → granted", async () => {
+    ledger([diedAt("b-dl", "DOWNLOAD_SOURCE", "TIMED_OUT")]);
+
+    const out = await invoke("start_ci_build", { commit_sha: SHA });
+
+    expect(startBuilds().length).toBe(1);
+    expect(out).toMatchObject({ ok: true, retry: true, prior_failed_phase: "DOWNLOAD_SOURCE" });
+  });
+
+  // ── (e) the cap — the whole point of the feature ─────────────────────────────
+
+  it("two INSTALL failures for one sha → ZERO StartBuild, install_flake_retry_failed", async () => {
+    ledger([diedAt("b-install-2", "INSTALL"), diedAt("b-install-1", "INSTALL")]);
+
+    const out = await invoke("start_ci_build", { commit_sha: SHA });
+
+    expect(startBuilds()).toEqual([]);
+    expect(out).toMatchObject({
+      ok: false,
+      reason: "install_flake_retry_failed",
+      attempts: 2,
+      prior_build_id: "b-install-2", // the NEWEST, so the agent reads the latest log
+      prior_failed_phase: "INSTALL",
+      project: "agentcore-hub-ci",
+    });
+    expect(out.detail).toContain("INSTALL");
+    expect(out.detail).toContain("prior_build_id");
+  });
+
+  it("the cap cannot be dodged with a different source_version", async () => {
+    ledger([diedAt("b-2", "INSTALL"), diedAt("b-1", "INSTALL")]);
+
+    // The dedupe key is the SHA, and source_version does not enter it — otherwise
+    // "call again with pr/<n> instead of the branch" would buy a third build.
+    for (const source_version of [undefined, "main", "pr/7", SHA]) {
+      h.state.cbCalls = [];
+      const out = await invoke("start_ci_build", { commit_sha: SHA, source_version });
+      expect(out.reason, String(source_version)).toBe("install_flake_retry_failed");
+      expect(startBuilds(), String(source_version)).toEqual([]);
+    }
+  });
+
+  // ── (f,g) code-phase failures are never re-run ───────────────────────────────
+
+  it("newest FAILED in BUILD → ZERO StartBuild, build_failed_not_retryable", async () => {
+    ledger([diedAt("b-build", "BUILD")]);
+
+    const out = await invoke("start_ci_build", { commit_sha: SHA });
+
+    expect(startBuilds()).toEqual([]);
+    expect(out).toMatchObject({
+      ok: false,
+      reason: "build_failed_not_retryable",
+      prior_build_id: "b-build",
+      prior_failed_phase: "BUILD",
+      attempts: 1,
+    });
+  });
+
+  it("newest POST_BUILD failure wins over an older INSTALL flake", async () => {
+    // The dangerous ordering bug: an older infra flake must not re-open the retry
+    // door after a later attempt failed in the caller's own code.
+    ledger([diedAt("b-post", "POST_BUILD"), diedAt("b-install", "INSTALL")]);
+
+    const out = await invoke("start_ci_build", { commit_sha: SHA });
+
+    expect(startBuilds()).toEqual([]);
+    expect(out).toMatchObject({
+      ok: false,
+      reason: "build_failed_not_retryable",
+      prior_build_id: "b-post",
+      prior_failed_phase: "POST_BUILD",
+      attempts: 2,
+    });
+  });
+
+  // ── (h) a stop is a decision ─────────────────────────────────────────────────
+
+  it("newest STOPPED → prior_build_stopped, zero StartBuild", async () => {
+    ledger([diedAt("b-stopped", "BUILD", "STOPPED")]);
+
+    const out = await invoke("start_ci_build", { commit_sha: SHA });
+
+    expect(startBuilds()).toEqual([]);
+    expect(out).toMatchObject({
+      ok: false,
+      reason: "prior_build_stopped",
+      prior_build_id: "b-stopped",
+      attempts: 1,
+    });
+  });
+
+  it("a STOPPED build that died in INSTALL is still not retried", async () => {
+    // STOPPED is absent from RETRYABLE_STATUSES, so the infra phase is irrelevant.
+    ledger([diedAt("b-stopped-install", "INSTALL", "STOPPED")]);
+
+    const out = await invoke("start_ci_build", { commit_sha: SHA });
+
+    expect(startBuilds()).toEqual([]);
+    expect(out.reason).toBe("prior_build_stopped");
+  });
+
+  // ── (i,j) a live build always wins over the ledger ───────────────────────────
+
+  it("an IN_PROGRESS build wins over an older INSTALL failure (reuse, not retry)", async () => {
+    ledger([
+      { id: "b-live", buildStatus: "IN_PROGRESS", resolvedSourceVersion: SHA },
+      diedAt("b-install", "INSTALL"),
+    ]);
+
+    const out = await invoke("start_ci_build", { commit_sha: SHA });
+
+    expect(startBuilds()).toEqual([]);
+    expect(out).toMatchObject({ ok: true, reused: true, buildId: "b-live" });
+    expect(out.retry).toBeUndefined();
+  });
+
+  it("a SUCCEEDED build for the sha is still a plain reuse", async () => {
+    ledger([
+      { id: "b-green", buildStatus: "SUCCEEDED", resolvedSourceVersion: SHA },
+      diedAt("b-install", "INSTALL"),
+    ]);
+
+    const out = await invoke("start_ci_build", { commit_sha: SHA });
+
+    expect(startBuilds()).toEqual([]);
+    expect(out).toMatchObject({ ok: true, reused: true, buildId: "b-green" });
+  });
+
+  // ── (k) classifyPriorBuild, directly ─────────────────────────────────────────
+
+  it("classifyPriorBuild: the FIRST bad phase is the cause", () => {
+    const out = classifyPriorBuild({
+      buildStatus: "FAILED",
+      phases: phases([
+        ["SUBMITTED", "SUCCEEDED"],
+        ["INSTALL", "FAILED"],
+        ["BUILD", "FAILED"], // a consequence, not the cause
+      ]),
+    });
+    expect(out).toEqual({ status: "FAILED", failedPhase: "INSTALL", isInfraFailure: true });
+  });
+
+  it("classifyPriorBuild: no phases → no failedPhase and NO retry", () => {
+    // The carve-out fires on positive evidence only: no phases means we cannot
+    // prove the failure was infra, so it is not treated as one.
+    expect(classifyPriorBuild({ buildStatus: "FAILED", phases: [] })).toEqual({
+      status: "FAILED",
+      failedPhase: null,
+      isInfraFailure: false,
+    });
+    expect(classifyPriorBuild({ buildStatus: "FAILED" })).toEqual({
+      status: "FAILED",
+      failedPhase: null,
+      isInfraFailure: false,
+    });
+    expect(classifyPriorBuild(undefined)).toEqual({
+      status: null,
+      failedPhase: null,
+      isInfraFailure: false,
+    });
+  });
+
+  it("classifyPriorBuild: an infra phase does not override a non-retryable status", () => {
+    for (const status of ["STOPPED", "SUCCEEDED", "IN_PROGRESS"]) {
+      const out = classifyPriorBuild({
+        buildStatus: status,
+        phases: phases([["INSTALL", "FAILED"]]),
+      });
+      expect(out.failedPhase, status).toBe("INSTALL");
+      expect(out.isInfraFailure, status).toBe(false);
+    }
+  });
+
+  it("classifyPriorBuild: all-green phases → failedPhase null", () => {
+    const out = classifyPriorBuild({
+      buildStatus: "SUCCEEDED",
+      phases: phases([["INSTALL", "SUCCEEDED"], ["BUILD", "SUCCEEDED"]]),
+    });
+    expect(out).toEqual({ status: "SUCCEEDED", failedPhase: null, isInfraFailure: false });
+  });
+
+  // ── (l) the scan window is clamped to BatchGetBuilds' max ────────────────────
+
+  it("clamps the ledger scan to 100 ids (BatchGetBuilds' hard maximum)", async () => {
+    ledger(
+      Array.from({ length: 250 }, (_, i) => ({
+        id: `b-${i}`,
+        buildStatus: "SUCCEEDED",
+        resolvedSourceVersion: `3333333333333333333333333333333333333${String(i).padStart(3, "0")}`,
+      }))
+    );
+
+    await invoke("start_ci_build", { commit_sha: SHA });
+
+    const batch = h.state.cbCalls.find((c) => c.type === "BatchGetBuilds");
+    expect(batch.input.ids.length).toBe(100);
+    expect(batch.input.ids[0]).toBe("b-0"); // newest first
+  });
+
+  // ── (m) one token per attempt ────────────────────────────────────────────────
+
+  it("the retry token differs from the first attempt's, and both fit in 64 chars", async () => {
+    ledger([]);
+    await invoke("start_ci_build", { commit_sha: SHA });
+    const first = startBuilds()[0].input.idempotencyToken;
+
+    h.state.cbCalls = [];
+    ledger([diedAt("b-install", "INSTALL")]);
+    await invoke("start_ci_build", { commit_sha: SHA });
+    const second = startBuilds()[0].input.idempotencyToken;
+
+    expect(first).toBe(`ci-${SHA}`);
+    expect(second).toBe(`ci-${SHA}-r1`);
+    expect(second).not.toBe(first);
+    expect(second.length).toBe(46);
+    for (const token of [first, second]) expect(token.length).toBeLessThanOrEqual(64);
+  });
+
+  // ── (n) a denial on the retry is still the same denial ───────────────────────
+
+  it("AccessDenied on the RETRY StartBuild → start_build_not_granted, same text", async () => {
+    ledger([diedAt("b-install", "INSTALL")]);
+    h.state.startBuildImpl = async () => {
+      const err = new Error("not authorized to perform: codebuild:StartBuild");
+      err.name = "AccessDeniedException";
+      throw err;
+    };
+
+    const out = await invoke("start_ci_build", { commit_sha: SHA });
+
+    expect(out).toMatchObject({
+      ok: false,
+      reason: "start_build_not_granted",
+      project: "agentcore-hub-ci",
+      prior_build_id: "b-install",
+    });
+    // Byte-identical remediation to the non-retry denial — the grant being absent
+    // has nothing to do with why we were retrying.
+    expect(out.detail).toContain("PIPELINE_CI_START_BUILD=1");
+    expect(out.detail).toContain("PIPELINE_REGIONS");
+    expect(out.detail).toContain("hub-*-ci");
+    expect(out.detail).not.toContain("not authorized to perform");
+    // The text says nothing about the retry — a missing grant is an operator fix
+    // either way, so the remediation must not fork on how we got here.
+    expect(out.detail).toContain("fall back to waiting on the repo's own webhook build");
+    expect(out.detail).not.toContain("INSTALL");
+    expect(out.detail).not.toContain("prior_build_id");
+  });
+
+  // ── (o) SR-3.2: sourceVersion comes from SHARED state on a retry ─────────────
+
+  it("the retry pins sourceVersion to the prior build's pr/<n>", async () => {
+    ledger([diedAt("b-install", "INSTALL", "FAILED", { sourceVersion: "pr/42" })]);
+
+    const out = await invoke("start_ci_build", { commit_sha: SHA });
+
+    expect(startBuilds()[0].input.sourceVersion).toBe("pr/42");
+    // The response must report what was SENT, not what was asked for.
+    expect(out.sourceVersion).toBe("pr/42");
+  });
+
+  it("the retry's pin beats an explicit caller source_version (concurrent-safe)", async () => {
+    // Two agents retrying one commit share the token `ci-<sha>-r1`; CodeBuild
+    // refuses that token with different parameters, so both MUST derive
+    // sourceVersion from the prior build rather than from their own args.
+    ledger([diedAt("b-install", "INSTALL", "FAILED", { sourceVersion: "pr/42" })]);
+
+    const out = await invoke("start_ci_build", { commit_sha: SHA, source_version: "main" });
+
+    expect(startBuilds()[0].input.sourceVersion).toBe("pr/42");
+    expect(out.sourceVersion).toBe("pr/42");
+  });
+
+  it("a prior sourceVersion this Lambda would refuse falls back to the caller's", async () => {
+    // `refs/pull/9/head` is exactly what isAllowedSourceVersion rejects (a ref can
+    // resolve to something other than the branch it names). An older build started
+    // outside this tool must not smuggle one back in through the retry pin.
+    ledger([
+      diedAt("b-install", "INSTALL", "FAILED", { sourceVersion: "refs/pull/9/head" }),
+    ]);
+
+    const out = await invoke("start_ci_build", { commit_sha: SHA, source_version: "pr/12" });
+
+    expect(startBuilds()[0].input.sourceVersion).toBe("pr/12");
+    expect(out.sourceVersion).toBe("pr/12");
+  });
+
+  it("no prior sourceVersion at all → the caller's value (default: the sha)", async () => {
+    ledger([diedAt("b-install", "INSTALL")]); // diedAt sets no sourceVersion
+
+    const out = await invoke("start_ci_build", { commit_sha: SHA });
+
+    expect(startBuilds()[0].input.sourceVersion).toBe(SHA);
+    expect(out.sourceVersion).toBe(SHA);
+  });
+
+  // ── SR-3.2: the token race, as CodeBuild reports it ─────────────────────────
+
+  it("an idempotency-token InvalidInput → retry_in_flight (wait, do not fix)", async () => {
+    ledger([diedAt("b-install", "INSTALL")]);
+    h.state.startBuildImpl = async () => {
+      const err = new Error("Idempotency token 'ci-...-r1' was already used");
+      err.name = "InvalidInputException";
+      throw err;
+    };
+
+    const out = await invoke("start_ci_build", { commit_sha: SHA });
+
+    expect(out).toMatchObject({
+      ok: false,
+      reason: "retry_in_flight",
+      prior_build_id: "b-install",
+      project: "agentcore-hub-ci",
+    });
+  });
+
+  it("a non-idempotency InvalidInput still maps to invalid_source_version", async () => {
+    ledger([]);
+    h.state.startBuildImpl = async () => {
+      const err = new Error("Unable to resolve version: pr/999");
+      err.name = "InvalidInputException";
+      throw err;
+    };
+
+    const out = await invoke("start_ci_build", { commit_sha: SHA, source_version: "pr/999" });
+
+    expect(out).toMatchObject({
+      ok: false,
+      reason: "invalid_source_version",
+      sourceVersion: "pr/999",
+    });
+  });
+
+  // ── (p) multi-target: the retry goes to the project OWNER's region ───────────
+
+  it("a retry StartBuild goes to the CI project's own region", async () => {
+    ledger([diedAt("b-install", "INSTALL")]);
+
+    const out = await withRegistry(MULTI_REGISTRY, (mod) =>
+      invokeOn(mod.handler, "start_ci_build", {
+        pipeline_name: "agentcore-hub-deploy",
+        project: "hub-widget-ci",
+        commit_sha: SHA,
+      })
+    );
+
+    expect(out).toMatchObject({ ok: true, retry: true, region: "us-west-2" });
+    const start = h.state.cbCalls.find((c) => c.type === "StartBuild");
+    expect(start.input).toEqual({
+      projectName: "hub-widget-ci",
+      sourceVersion: SHA,
+      idempotencyToken: `ci-${SHA}-r1`,
+    });
+    // The ledger scan AND the retry both went to the project's region, not the
+    // pipeline_name-resolved target's (us-east-1).
+    expect([...new Set(h.state.cbCalls.map((c) => c.region))]).toEqual(["us-west-2"]);
+  });
+
+  it("a refused retry on a registry target makes zero StartBuild calls", async () => {
+    ledger([diedAt("b-2", "INSTALL"), diedAt("b-1", "INSTALL")]);
+
+    const out = await withRegistry(MULTI_REGISTRY, (mod) =>
+      invokeOn(mod.handler, "start_ci_build", { project: "hub-widget-ci", commit_sha: SHA })
+    );
+
+    expect(out).toMatchObject({ reason: "install_flake_retry_failed", region: "us-west-2" });
+    expect(h.state.cbCalls.filter((c) => c.type === "StartBuild")).toEqual([]);
+  });
+
+  // ── (q) the contract is discoverable without tripping over a refusal ────────
+
+  it("capabilities advertises the retry contract at top level (version 4)", async () => {
+    const out = await invoke("capabilities");
+
+    expect(out.version).toBe(4);
+    expect(out.ciRetry.maxBuildsPerSha).toBe(2);
+    expect(out.ciRetry.infraRetryPhases.sort()).toEqual([
+      "DOWNLOAD_SOURCE",
+      "INSTALL",
+      "PRE_BUILD",
+      "PROVISIONING",
+    ]);
+    expect(out.ciRetry.scanWindow).toBe(100);
+    expect(out.ciRetry.retryReason).toBe("infra_install_failure");
+    // Every refusal an agent can receive, so ci-agent.md's branches are complete.
+    expect(out.ciRetry.refusalReasons).toEqual([
+      "install_flake_retry_failed",
+      "build_failed_not_retryable",
+      "prior_build_stopped",
+      "retry_in_flight",
+      "start_build_not_granted",
+    ]);
+    // Deployment-wide, not per target: the cap is a property of this code.
+    expect(h.state.cbCalls).toEqual([]);
   });
 });
 
@@ -1058,12 +1593,13 @@ describe("capabilities", () => {
 
     // The flat keys describe the ENV DEFAULT and are kept verbatim for callers
     // written against version 2. version 3 (TEAM-4337) adds `targets` — asserted
-    // in the multi-target suite, not here.
+    // in the multi-target suite, not here. version 4 (TEAM-4448 D2) adds the
+    // top-level `ciRetry` contract — asserted in the retry suite.
     expect(out).toMatchObject({
       ciProject: "agentcore-hub-ci",
       buildProject: "agentcore-hub-build",
       deployPipeline: "agentcore-hub-deploy",
-      version: 3,
+      version: 4,
     });
     // Read-only: capabilities never talks to AWS.
     expect(h.state.cpCalls).toEqual([]);
@@ -1811,14 +2347,16 @@ describe("multi-target registry resolution", () => {
     );
   });
 
-  // 8.9 capabilities v3 ─────────────────────────────────────────────────────
+  // 8.9 capabilities v3 targets (v4 keeps them byte-identical) ──────────────
 
-  it("reports version 3 with one entry per target and the flat keys intact", async () => {
+  it("reports one entry per target and the flat keys intact (version 4)", async () => {
     const out = await withRegistry(MULTI_REGISTRY, (mod) => invokeOn(mod.handler, "capabilities"), {
       AWS_REGION: "us-east-1",
     });
 
-    expect(out.version).toBe(3);
+    // TEAM-4448 D2 bumped 3 → 4 by ADDING top-level `ciRetry`; `targets` and the
+    // flat keys below are unchanged, which is the point of asserting them here.
+    expect(out.version).toBe(4);
     // Version-2 callers keep reading exactly what they read before.
     expect(out).toMatchObject({
       startCiBuild: false,
