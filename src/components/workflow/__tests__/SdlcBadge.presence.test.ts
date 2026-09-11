@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 
-describe('SDLC framework badge presence (TEAM-3048)', () => {
+describe('SDLC framework badge presence (TEAM-3048 / TEAM-4408)', () => {
   // ─── Board badge — source-content assertions (convention: TEAM-2141) ──────
 
   describe('WorkflowBoard.tsx badge markup', () => {
@@ -11,10 +11,11 @@ describe('SDLC framework badge presence (TEAM-3048)', () => {
       'utf-8'
     );
 
-    it('renders the badge via SDLC_BADGE_META (no raw-value branching)', () => {
-      expect(boardContent).toContain('SDLC_BADGE_META[fw].boardClassName');
-      expect(boardContent).toContain('SDLC_BADGE_META[fw].tooltip');
-      expect(boardContent).toContain('SDLC_BADGE_META[fw].label');
+    it('renders the badge via sdlcBadgeFor (no raw SDLC_BADGE_META[fw] access)', () => {
+      expect(boardContent).toContain('sdlcBadgeFor(fw)');
+      expect(boardContent).toContain('sdlcBadge.boardClassName');
+      expect(boardContent).toContain('sdlcBadge.tooltip');
+      expect(boardContent).toContain('sdlcBadge.label');
     });
 
     it('reads state.sdlcFramework with fallback to state.input.sdlcFramework', () => {
@@ -23,24 +24,26 @@ describe('SDLC framework badge presence (TEAM-3048)', () => {
       );
     });
 
-    it('places the badge as the first child inside pipeline-status-header, ungated', () => {
+    it('places the badge as the first child inside pipeline-status-header, gated only on overlay presence', () => {
       const headerIdx = boardContent.indexOf('className={`pipeline-status-header');
       expect(headerIdx).toBeGreaterThan(-1);
       const afterHeader = boardContent.slice(headerIdx, headerIdx + 600);
       // Badge span comes before the status text expression...
-      const badgeIdx = afterHeader.indexOf('SDLC_BADGE_META[fw].boardClassName');
+      const badgeIdx = afterHeader.indexOf('sdlcBadge.boardClassName');
       const statusTextIdx = afterHeader.indexOf('isComplete ? "Complete"');
       expect(badgeIdx).toBeGreaterThan(-1);
       expect(statusTextIdx).toBeGreaterThan(badgeIdx);
-      // ...and is not conditionally gated (no `&&` / ternary guard around the span)
+      // ...and is gated ONLY on overlay presence (sdlcBadge && ...) — never on
+      // isComplete / streamStatus / replayEvents / catchingUp.
       const between = afterHeader.slice(0, badgeIdx);
+      expect(between).toContain('sdlcBadge && ');
       expect(between).not.toContain('isComplete &&');
       expect(between).not.toContain('streamStatus');
       expect(between).not.toContain('replayEvents');
       expect(between).not.toContain('catchingUp');
     });
 
-    it('defines the .sdlc-badge CSS rules in PIPELINE_STYLES', () => {
+    it('defines the .sdlc-badge CSS rules in PIPELINE_STYLES, with no dead --standard variant', () => {
       expect(boardContent).toContain(
         '.sdlc-badge{position:absolute;right:calc(100% + 10px);top:50%;transform:translateY(-50%);'
       );
@@ -50,6 +53,7 @@ describe('SDLC framework badge presence (TEAM-3048)', () => {
       expect(boardContent).toContain(
         '.sdlc-badge--aidlc{color:var(--violet-fg);background:var(--violet-subtle)}'
       );
+      expect(boardContent).not.toContain('.sdlc-badge--standard');
     });
   });
 
@@ -61,16 +65,18 @@ describe('SDLC framework badge presence (TEAM-3048)', () => {
       'utf-8'
     );
 
-    it('renders the list badge via SDLC_BADGE_META adjacent to the def pill', () => {
-      expect(pageContent).toContain('SDLC_BADGE_META[fw].listClassName');
+    it('renders the list badge via sdlcBadgeFor adjacent to the def pill, gated on overlay presence', () => {
+      expect(pageContent).toContain('sdlcBadgeFor(fw)');
+      expect(pageContent).toContain('sdlcBadge.listClassName');
       const wrapIdx = pageContent.indexOf('className="flex items-center gap-1 min-w-0"');
       expect(wrapIdx).toBeGreaterThan(-1);
       const group = pageContent.slice(wrapIdx, wrapIdx + 900);
-      // def pill first, badge right after, inside the same wrapper span
+      // def pill first, badge right after, inside the same wrapper span, gated on sdlcBadge
       expect(group.indexOf('{defLabel}')).toBeGreaterThan(-1);
-      expect(group.indexOf('SDLC_BADGE_META[fw].listClassName')).toBeGreaterThan(
+      expect(group.indexOf('sdlcBadge.listClassName')).toBeGreaterThan(
         group.indexOf('{defLabel}')
       );
+      expect(group).toContain('sdlcBadge && ');
     });
 
     it('leaves the def pill markup intact', () => {
