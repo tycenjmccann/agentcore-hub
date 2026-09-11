@@ -100,8 +100,12 @@ USER root
 # PID 1) and aborts the whole install (exit 100). The apt `chromium` above
 # already pulls chromium's shared libs (libnss3/libatk/…), so Playwright's own
 # browser binary runs against them — we only need the browser download here.
+# npm_config_cache: this runs as root with HOME=/home/bedrock_agentcore, so a bare
+# npx would leave root-owned files in the runtime user's ~/.npm and every later
+# `npm ci`/`npx` as that user fails with "cache folder contains root-owned files".
 RUN mkdir -p /opt/pw-browsers \
- && npx --yes playwright@1.60.0 install chromium \
+ && npm_config_cache=/tmp/npm-cache-build npx --yes playwright@1.60.0 install chromium \
+ && rm -rf /tmp/npm-cache-build \
  && chmod -R a+rx /opt/pw-browsers
 
 # Python deps (health server + OTel + codex bedrock token generator)

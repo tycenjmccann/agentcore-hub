@@ -28,6 +28,7 @@ Run: python3 -m pytest deploy/coding-agent-runtime/test_deps_provision.py -v
 import hashlib
 import importlib.util
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -298,6 +299,25 @@ class TestFirstBuild(unittest.TestCase):
         m.assert_not_called()
         self.assertTrue(os.path.isfile(os.path.join(wd2, "node_modules", "next", "package.json")))
 
+    def test_npm_ci_uses_its_own_local_cache(self):
+        # Prod 2026-09-11: ~/.npm had root-owned files from the image build and
+        # npm ci exited 243 ("cache folder contains root-owned files").
+        seen = {}
+
+        def fake_run(cmd, **kw):
+            seen["cmd"], seen["env"], seen["cwd"] = cmd, kw["env"], kw["cwd"]
+            _fake_node_modules(kw["cwd"], "next")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        dest = os.path.join(LOCAL, "h.build.x")
+        with mock.patch.object(main.subprocess, "run", side_effect=fake_run):
+            out = main._npm_ci_into(self.wd, dest, "h")
+        self.assertEqual(out, dest)
+        self.assertEqual(seen["cmd"][:2], ["npm", "ci"])
+        cache = seen["env"]["npm_config_cache"]
+        self.assertEqual(cache, os.path.join(LOCAL, ".npm-cache"))
+        self.assertTrue(os.path.isdir(cache), "cache dir created before npm runs")
+        self.assertNotEqual(cache, os.path.expanduser("~/.npm"))
+
     def test_failed_install_leaves_old_behaviour(self):
         with mock.patch.object(main, "_npm_ci_into", return_value=None):
             info = main._provision_deps(self.wd)
@@ -357,6 +377,16 @@ class TestKillSwitch(unittest.TestCase):
         self.assertEqual(off._provision_deps(wd)["deps"], "skipped")
         self.assertFalse(os.path.lexists(os.path.join(wd, "node_modules")))
         self.assertFalse(os.path.exists(os.path.join(wd, ".git", "hooks", "post-checkout")))
+
+
+class TestDockerfileNpmAsRoot(unittest.TestCase):
+    def test_root_stage_npm_calls_isolate_their_cache(self):
+        user = None
+        for line in (_HERE / "Dockerfile").read_text().splitlines():
+            if line.startswith("USER "):
+                user = line.split()[1]
+            if user == "root" and re.search(r"\bnpx?\s", line) and not line.lstrip().startswith("#"):
+                self.assertIn("npm_config_cache=", line, f"root-stage npm without isolated cache: {line.strip()}")
 
 
 class TestNoImageBake(unittest.TestCase):
