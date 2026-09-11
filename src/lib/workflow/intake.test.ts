@@ -1,13 +1,19 @@
-import { describe, it, expect, vi, afterEach } from "vitest";
+import { describe, it, expect, vi, afterEach, beforeAll, afterAll } from "vitest";
+import type { Agent } from "undici";
 import {
   validateIntakeSources,
   getSourceValidationMode,
   shouldRejectSubmission,
   resolveHubBucket,
+  buildPinnedLookup,
+  createPinnedDispatcher,
+  PINNED_META,
   HUB_BUCKET_PROBE_TIMEOUT_MS,
   DNS_LOOKUP_TIMEOUT_MS,
   type SourceValidationResult,
   type SourceCheckResult,
+  type LookupImpl,
+  type PinnedMeta,
 } from "./intake";
 import { redactUrl } from "./redact";
 import type { IntakeSource } from "./types";
@@ -949,8 +955,9 @@ describe("validateIntakeSources — hub-bucket probe is bounded (F3)", () => {
  *
  * LITERAL hosts are blocked outright by urlGate; a NON-literal host is resolved
  * (TEAM-4101 r2-F2) and rejected if any answer is private/link-local/loopback.
- * The residual is DNS-rebinding TOCTOU (record changes between lookup and connect)
- * — accepted because the oracle is status-only. See the comment on urlGate.
+ * DNS-rebinding TOCTOU (record changes between lookup and connect) was the
+ * accepted residual; TEAM-4115 closed it by pinning the connection to the vetted
+ * address set — see section (j). See the comment on urlGate.
  */
 describe("validateIntakeSources — URL redirects are not followed (TEAM-4091 F1)", () => {
   it("a 302 on the ranged GET → transient 'URL redirected', with redirect:manual", async () => {
@@ -1175,7 +1182,8 @@ describe("validateIntakeSources — blocked URL hosts (TEAM-4091 F1)", () => {
  * persisted into verification.detail. checkUrlSource now resolves every
  * non-literal host and refuses it if ANY answer is blocked, BEFORE the GET and
  * before the trusted-owner shortcut. Literal hosts (already vetted by urlGate)
- * skip the resolver. The residual is rebinding TOCTOU — accepted, status-only.
+ * skip the resolver. Rebinding TOCTOU is no longer a residual: TEAM-4115 pins the
+ * connection to the very addresses this step vetted (section (j)).
  */
 describe("validateIntakeSources — resolved-address block (TEAM-4101 r2-F2)", () => {
   const PRESIGNED_HOST = "agentcore-hub-artifacts-023392223961-us-east-1.s3.amazonaws.com";
@@ -1393,5 +1401,471 @@ describe("validateIntakeSources — resolved-address block (TEAM-4101 r2-F2)", (
     expect(c.outcome).toBe("definitive");
     expect(c.detail).toContain("X-Amz-Signature=REDACTED");
     expect(c.detail).not.toContain("SECRETSIG");
+  });
+});
+
+// ─── (i) TEAM-4115: classifier completeness — the non-unicast/special space ────
+
+/**
+ * The blocked-range classifier only covered the private/loopback/link-local
+ * classics. Everything else in the special-purpose space was a legal source host
+ * and therefore a legal target for the server-side GET: multicast (224/4 — a
+ * connect to 239.255.255.250 is an SSDP probe of the local segment), the reserved
+ * 240/4 incl. the 255.255.255.255 broadcast, 192.0.0.0/24 (IETF protocol
+ * assignments — 192.0.0.192 and friends), and 198.18/15 (benchmarking).
+ *
+ * On the v6 side the gap mattered more, because two prefixes are just an IPv4
+ * address in a v6 costume and a translator hands them straight back: 64:ff9b::/96
+ * (well-known NAT64) and 2002::/16 (6to4). 64:ff9b::7f00:1 IS 127.0.0.1;
+ * 2002:7f00:1:: IS 127.0.0.1. Both are now decided by the embedded IPv4, exactly
+ * like the ::ffff: mapped case, so a NAT64/6to4 spelling of the metadata endpoint
+ * is refused for the same reason the dotted spelling is. ff00::/8 (multicast) and
+ * 64:ff9b:1::/48 (local-use NAT64, RFC 8215) are refused outright.
+ *
+ * Every range is pinned TWICE — as a literal URL host (urlGate) and as a resolver
+ * answer (resolveHostGuard) — because those are two different call sites into the
+ * same classifier and only the literal path has a reason string in the detail.
+ */
+describe("blocked address ranges — TEAM-4115 additions", () => {
+  const neverFetch = () =>
+    vi.fn(async () => ({ status: 206, ok: true, body: { cancel: async () => undefined } }) as unknown as Response);
+  const lookupTo = (...addrs: string[]) =>
+    vi.fn(async () => addrs.map((address) => ({ address, family: address.includes(":") ? 6 : 4 })));
+
+  /** [url host as written, bare address for the resolver, expected reason]. */
+  const NEW_BLOCKED: Array<[string, string, string]> = [
+    ["224.0.0.1", "224.0.0.1", "multicast address 224.0.0.0/4"],
+    ["239.255.255.250", "239.255.255.250", "multicast address 224.0.0.0/4"],
+    ["240.0.0.1", "240.0.0.1", "reserved address 240.0.0.0/4"],
+    ["255.255.255.255", "255.255.255.255", "reserved address 240.0.0.0/4"],
+    ["192.0.0.1", "192.0.0.1", "IETF protocol assignments 192.0.0.0/24"],
+    ["198.18.0.1", "198.18.0.1", "benchmarking address 198.18.0.0/15"],
+    ["198.19.255.255", "198.19.255.255", "benchmarking address 198.18.0.0/15"],
+    ["[ff02::1]", "ff02::1", "multicast address ff00::/8"],
+    // NAT64 / 6to4 decided by the embedded IPv4 — the reason names the inner range.
+    ["[64:ff9b::7f00:1]", "64:ff9b::7f00:1", "NAT64 loopback address 127.0.0.0/8"],
+    ["[64:ff9b::a00:1]", "64:ff9b::a00:1", "NAT64 private address 10.0.0.0/8"],
+    ["[64:ff9b:1::1]", "64:ff9b:1::1", "local-use NAT64 prefix 64:ff9b:1::/48"],
+    ["[2002:7f00:1::]", "2002:7f00:1::", "6to4 loopback address 127.0.0.0/8"],
+  ];
+
+  it.each(NEW_BLOCKED)("literal %s → definitive, no socket opened", async (host, _addr, reason) => {
+    const fetchImpl = neverFetch();
+    const lookupImpl = lookupTo("93.184.216.34");
+    const r = await validateIntakeSources([src("url", `https://${host}/spec.md`)], {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      lookupImpl,
+      env: envOf({}),
+    });
+    const c = only(r);
+    expect(c.outcome).toBe("definitive");
+    expect(c.method).toBe("parse");
+    expect(c.detail!.startsWith("Blocked URL host")).toBe(true);
+    expect(c.detail).toContain(reason);
+    expect(fetchImpl).not.toHaveBeenCalled();
+    // A literal is decided without the resolver at all.
+    expect(lookupImpl).not.toHaveBeenCalled();
+    // Definitive → 422 in BOTH modes; never merely "unverified".
+    expect(shouldRejectSubmission(r, "lenient").reject).toBe(true);
+    expect(shouldRejectSubmission(r, "strict").reject).toBe(true);
+  });
+
+  it.each(NEW_BLOCKED)("a name RESOLVING to %s is blocked before the GET", async (_host, addr) => {
+    const fetchImpl = neverFetch();
+    const lookupImpl = lookupTo(addr);
+    const c = only(
+      await validateIntakeSources([src("url", "https://attacker.example/x")], {
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        lookupImpl,
+        env: envOf({}),
+      })
+    );
+    expect(c.outcome).toBe("definitive");
+    expect(c.method).toBe("parse");
+    // The resolved-answer path deliberately keeps ONE fixed detail (never the IP).
+    expect(c.detail).toContain("resolves to a private/link-local address");
+    expect(lookupImpl).toHaveBeenCalledTimes(1);
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  /**
+   * The controls that keep the new ranges from becoming a blanket ban. Each of
+   * these is public space that MUST still be fetchable — in particular the NAT64
+   * and 6to4 spellings of a PUBLIC IPv4 (93.184.216.34), which prove the
+   * embedded-v4 decision is a real classification and not "any 64:ff9b/2002 is
+   * bad", and 223.255.255.255 / 200.1.1.1 which sit just outside 224/4.
+   */
+  const STILL_ALLOWED: Array<[string, string]> = [
+    ["223.255.255.255", "223.255.255.255"],
+    ["200.1.1.1", "200.1.1.1"],
+    ["[64:ff9b::5db8:d822]", "64:ff9b::5db8:d822"], // NAT64 of 93.184.216.34
+    ["[2002:5db8:d822::]", "2002:5db8:d822::"], // 6to4 of 93.184.216.34
+  ];
+
+  it.each(STILL_ALLOWED)("literal %s is still allowed and IS fetched", async (host) => {
+    const calls: FetchCall[] = [];
+    const { impl } = fakeFetch([{ status: 206 }], calls);
+    const c = only(
+      await validateIntakeSources([src("url", `https://${host}/spec.md`)], { fetchImpl: impl, env: envOf({}) })
+    );
+    expect(c.outcome).toBe("verified");
+    expect(calls).toHaveLength(1);
+  });
+
+  it.each(STILL_ALLOWED)("a name resolving to %s is still allowed and IS fetched", async (_host, addr) => {
+    const calls: FetchCall[] = [];
+    const { impl } = fakeFetch([{ status: 206 }], calls);
+    const c = only(
+      await validateIntakeSources([src("url", "https://example.com/spec.md")], {
+        fetchImpl: impl,
+        lookupImpl: lookupTo(addr),
+        env: envOf({}),
+      })
+    );
+    expect(c.outcome).toBe("verified");
+    expect(calls).toHaveLength(1);
+  });
+});
+
+// ─── (j) TEAM-4115: the connect-time pin (DNS-rebinding TOCTOU, r3-F1) ────────
+
+/**
+ * The residual sections (g) and (h) documented and accepted: the pre-flight
+ * dns.lookup vetted the answers, then `fetch` resolved the name AGAIN, on its
+ * own, and connected to whatever came back. A TTL-0 attacker zone answers
+ * 93.184.216.34 to our lookup and 169.254.169.254 to undici's, and the hub issues
+ * one server-side GET to the metadata endpoint whose status class is persisted on
+ * the source row — a blind status oracle inside the VPC.
+ *
+ * The fix is to stop letting the connect step resolve anything: both GETs ride an
+ * undici Agent whose connector `lookup` returns EXACTLY the vetted address set for
+ * EXACTLY the vetted hostname, and consults system DNS never. There is no second
+ * resolution to win, so there is no window.
+ *
+ * These tests attack the pin at all three levels: the lookup hook in isolation
+ * (the acceptance criterion), the checkUrlSource wiring that must actually hand it
+ * to fetch, and a real socket — because a pin that Node quietly ignores is
+ * indistinguishable from no pin at all from inside a stubbed fetch.
+ */
+describe("connect-time address pin — TEAM-4115", () => {
+  const neverFetch = () =>
+    vi.fn(async () => ({ status: 206, ok: true, body: { cancel: async () => undefined } }) as unknown as Response);
+
+  /** Drive the lookup hook the way undici's connector does. */
+  const askLookup = (
+    lookup: ReturnType<typeof buildPinnedLookup>,
+    hostname: string,
+    options?: { all?: boolean }
+  ) =>
+    new Promise<{ err: Error | null; addressOrAll: unknown; family?: number }>((resolve) => {
+      lookup(hostname, options, (err, addressOrAll, family) => resolve({ err, addressOrAll, family }));
+    });
+
+  // ── the acceptance criterion ───────────────────────────────────────────────
+
+  it("returns ONLY the vetted address for the vetted host — the rebind answer is unreachable", async () => {
+    // The vetted set is what OUR resolver saw. The attacker's zone has since
+    // flipped to 169.254.169.254; the pin has no code path that could ask.
+    const lookup = buildPinnedLookup("evil.example", ["93.184.216.34"]);
+
+    const single = await askLookup(lookup, "evil.example");
+    expect(single.err).toBeNull();
+    expect(single.addressOrAll).toBe("93.184.216.34");
+    expect(single.family).toBe(4);
+
+    const all = await askLookup(lookup, "evil.example", { all: true });
+    expect(all.err).toBeNull();
+    expect(all.addressOrAll).toEqual([{ address: "93.184.216.34", family: 4 }]);
+
+    // Asked a hundred times it never drifts — there is no TTL to expire.
+    for (let i = 0; i < 100; i++) {
+      const again = await askLookup(lookup, "evil.example");
+      expect(again.addressOrAll).toBe("93.184.216.34");
+      expect(JSON.stringify(again.addressOrAll)).not.toContain("169.254");
+    }
+  });
+
+  it("refuses a DIFFERENT hostname and hands back no address at all", async () => {
+    const lookup = buildPinnedLookup("example.com", ["93.184.216.34"]);
+    for (const other of ["metadata.google.internal", "evil.example", "127.0.0.1", ""]) {
+      const { err, addressOrAll } = await askLookup(lookup, other);
+      expect(err).toBeInstanceOf(Error);
+      expect(err!.message).toBe("Blocked URL host — connect to unvetted host refused");
+      // Not "an empty list" — no address is offered on the error path.
+      expect(addressOrAll).toBe("");
+    }
+  });
+
+  it("host matching ignores case and a trailing dot (the same normalisation urlGate does)", async () => {
+    const lookup = buildPinnedLookup("Example.COM.", ["93.184.216.34"]);
+    for (const spelling of ["example.com", "EXAMPLE.com", "example.com.", "Example.Com."]) {
+      const { err, addressOrAll } = await askLookup(lookup, spelling);
+      expect(err).toBeNull();
+      expect(addressOrAll).toBe("93.184.216.34");
+    }
+    // Still not a suffix match: a longer name is a different host.
+    expect((await askLookup(lookup, "notexample.com")).err).toBeInstanceOf(Error);
+  });
+
+  it.each([
+    ["169.254.169.254", "link-local address 169.254.0.0/16 (instance metadata)"],
+    ["169.254.170.2", "link-local address 169.254.0.0/16 (instance metadata)"],
+    ["127.0.0.1", "loopback address 127.0.0.0/8"],
+    ["10.1.2.3", "private address 10.0.0.0/8"],
+    ["[::1]", "loopback address ::1"],
+    ["64:ff9b::a9fe:a9fe", "NAT64 link-local address 169.254.0.0/16 (instance metadata)"],
+  ])("refuses a pin BUILT with %s — defence in depth against a bad vetted set", async (address, reason) => {
+    // Nothing in the app can produce this (resolveHostGuard filters first), which
+    // is exactly why it is worth pinning: the pin stays safe on its own terms if a
+    // future caller forgets to.
+    const lookup = buildPinnedLookup("evil.example", [address.replace(/^\[|\]$/g, "")]);
+    const { err, addressOrAll } = await askLookup(lookup, "evil.example");
+    expect(err).toBeInstanceOf(Error);
+    expect(err!.message).toBe(`Blocked URL host — ${reason}`);
+    expect(addressOrAll).toBe("");
+  });
+
+  it("refuses a non-IP or empty vetted set rather than falling back to DNS", async () => {
+    const notAnIp = await askLookup(buildPinnedLookup("h.example", ["not-an-ip"]), "h.example");
+    expect(notAnIp.err!.message).toBe("Blocked URL host — non-IP DNS answer");
+
+    const empty = await askLookup(buildPinnedLookup("h.example", []), "h.example");
+    expect(empty.err!.message).toBe("Blocked URL host — no vetted address");
+  });
+
+  it("a multi-address vetted set is preserved in order, and one bad member poisons the whole set", async () => {
+    const lookup = buildPinnedLookup("example.com", ["93.184.216.34", "93.184.216.35"]);
+    expect((await askLookup(lookup, "example.com", { all: true })).addressOrAll).toEqual([
+      { address: "93.184.216.34", family: 4 },
+      { address: "93.184.216.35", family: 4 },
+    ]);
+    // Round-robin A records where ONE is internal is the classic partial rebind;
+    // there is no "use the good ones" mode.
+    const mixed = buildPinnedLookup("example.com", ["93.184.216.34", "169.254.169.254"]);
+    expect((await askLookup(mixed, "example.com")).err).toBeInstanceOf(Error);
+  });
+
+  it("createPinnedDispatcher records what it pinned and installs the same lookup", async () => {
+    const dispatcher = createPinnedDispatcher("example.com", ["93.184.216.34"]);
+    try {
+      const meta = (dispatcher as unknown as Record<symbol, PinnedMeta>)[PINNED_META];
+      expect(meta.host).toBe("example.com");
+      expect(meta.addresses).toEqual(["93.184.216.34"]);
+      expect((await askLookup(meta.lookup, "example.com")).addressOrAll).toBe("93.184.216.34");
+      // Not enumerable — it must never end up in a JSON log line.
+      expect(Object.keys(dispatcher)).not.toContain("PINNED_META");
+    } finally {
+      await dispatcher.close();
+    }
+  });
+
+  // ── the wiring: checkUrlSource must actually hand the pin to fetch ─────────
+
+  /** fetchImpl that also records the non-standard `init.dispatcher`. */
+  function dispatcherRecordingFetch(statuses: number[]) {
+    const dispatchers: unknown[] = [];
+    const impl = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      dispatchers.push((init as { dispatcher?: unknown } | undefined)?.dispatcher);
+      const status = statuses[Math.min(dispatchers.length - 1, statuses.length - 1)];
+      return { status, ok: status < 400, body: { cancel: async () => undefined } } as unknown as Response;
+    }) as unknown as typeof fetch;
+    return { impl, dispatchers };
+  }
+
+  it("passes a dispatcher pinned to the RESOLVED set, and closes it afterwards", async () => {
+    const lookupImpl = vi.fn(async () => [
+      { address: "93.184.216.34", family: 4 },
+      { address: "2606:2800:220:1:248:1893:25c8:1946", family: 6 },
+    ]);
+    const { impl, dispatchers } = dispatcherRecordingFetch([206]);
+
+    const c = only(
+      await validateIntakeSources([src("url", "https://example.com/spec.md")], {
+        fetchImpl: impl,
+        lookupImpl,
+        env: envOf({}),
+      })
+    );
+    expect(c.outcome).toBe("verified");
+
+    expect(dispatchers).toHaveLength(1);
+    const dispatcher = dispatchers[0] as Agent;
+    expect(dispatcher).toBeDefined();
+    const meta = (dispatcher as unknown as Record<symbol, PinnedMeta>)[PINNED_META];
+    // The pin is the resolver's answer, verbatim — not a re-resolution.
+    expect(meta.host).toBe("example.com");
+    expect(meta.addresses).toEqual(["93.184.216.34", "2606:2800:220:1:248:1893:25c8:1946"]);
+    // Closed on the way out — an Agent left open holds a keep-alive timer.
+    expect(dispatcher.closed).toBe(true);
+  });
+
+  it("pins a LITERAL host to itself — no resolver, but still no re-resolution at connect", async () => {
+    const lookupImpl: LookupImpl = vi.fn(async () => [{ address: "169.254.169.254", family: 4 }]);
+    const { impl, dispatchers } = dispatcherRecordingFetch([200]);
+
+    const c = only(
+      await validateIntakeSources([src("url", "https://93.184.216.34/spec.md")], {
+        fetchImpl: impl,
+        lookupImpl,
+        env: envOf({}),
+      })
+    );
+    expect(c.outcome).toBe("verified");
+    expect(lookupImpl).not.toHaveBeenCalled();
+    const meta = (dispatchers[0] as unknown as Record<symbol, PinnedMeta>)[PINNED_META];
+    expect(meta.host).toBe("93.184.216.34");
+    expect(meta.addresses).toEqual(["93.184.216.34"]);
+  });
+
+  it("the 403 → plain-GET retry reuses the SAME dispatcher (a second pin could vet a second answer)", async () => {
+    const { impl, dispatchers } = dispatcherRecordingFetch([403, 200]);
+    const c = only(
+      await validateIntakeSources([src("url", PRESIGNED)], { fetchImpl: impl, env: envOf({}) })
+    );
+    expect(c.outcome).toBe("verified");
+    expect(c.method).toBe("GET");
+    expect(dispatchers).toHaveLength(2);
+    expect(dispatchers[1]).toBe(dispatchers[0]);
+    expect((dispatchers[0] as Agent).closed).toBe(true);
+  });
+
+  it("closes the dispatcher even when the fetch throws", async () => {
+    let captured: Agent | undefined;
+    const impl = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      captured = (init as { dispatcher?: Agent } | undefined)?.dispatcher;
+      throw Object.assign(new TypeError("fetch failed"), {
+        cause: { message: "Blocked URL host — connect to unvetted host refused" },
+      });
+    }) as unknown as typeof fetch;
+
+    const c = only(
+      await validateIntakeSources([src("url", "https://example.com/spec.md")], { fetchImpl: impl, env: envOf({}) })
+    );
+    // A pin refusal is the SAME definitive verdict as a literal/resolved blocked
+    // host, not a network hiccup — see the dedicated test below for the full
+    // acceptance criterion; this one only pins that the dispatcher still closes.
+    expect(c.outcome).toBe("definitive");
+    expect(c.method).toBe("parse");
+    // The opaque TypeError alone would say only "fetch failed"; the cause is the reason.
+    expect(c.detail).toContain("connect to unvetted host refused");
+    expect(captured!.closed).toBe(true);
+  });
+
+  it("a pin refusal classifies as definitive/parse, never as a transient TypeError (the acceptance criterion)", async () => {
+    // The dispatcherFactory stub hands back a REAL pinned dispatcher (so its
+    // lookup genuinely refuses), but fetchImpl is what actually throws — same
+    // shape as fetch's real behaviour when init.dispatcher's connector errors:
+    // an opaque TypeError with the real reason one level down on `cause`.
+    const dispatcherFactory = vi.fn((host: string, addresses: readonly string[]) =>
+      createPinnedDispatcher(host, addresses)
+    );
+    const impl = (async () => {
+      throw Object.assign(new TypeError("fetch failed"), {
+        cause: new Error("Blocked URL host — connect to unvetted host refused"),
+      });
+    }) as unknown as typeof fetch;
+
+    const c = only(
+      await validateIntakeSources([src("url", PRESIGNED)], { fetchImpl: impl, dispatcherFactory, env: envOf({}) })
+    );
+    expect(c.outcome).toBe("definitive");
+    expect(c.method).toBe("parse");
+    expect(c.detail!.startsWith("Blocked URL host —")).toBe(true);
+    expect(c.detail).toContain(redactUrl(PRESIGNED));
+    // The redacted url, not the raw one — the presigned signature must not leak.
+    expect(c.detail).not.toContain("X-Amz-Signature=SECRETSIG");
+    // Definitive → 422 in both modes, exactly like every other blocked-host case.
+    const r = await validateIntakeSources([src("url", PRESIGNED)], { fetchImpl: impl, dispatcherFactory, env: envOf({}) });
+    expect(shouldRejectSubmission(r, "lenient").reject).toBe(true);
+    expect(shouldRejectSubmission(r, "strict").reject).toBe(true);
+  });
+
+  it("a blocked resolver answer never builds a dispatcher at all", async () => {
+    const dispatcherFactory = vi.fn(createPinnedDispatcher);
+    const c = only(
+      await validateIntakeSources([src("url", "https://rebind.example/x")], {
+        fetchImpl: neverFetch() as unknown as typeof fetch,
+        lookupImpl: vi.fn(async () => [{ address: "169.254.169.254", family: 4 }]),
+        env: envOf({}),
+        dispatcherFactory,
+      })
+    );
+    expect(c.outcome).toBe("definitive");
+    expect(dispatcherFactory).not.toHaveBeenCalled();
+  });
+
+  // ── the real socket: proof Node honours init.dispatcher ────────────────────
+
+  /**
+   * The regression guard for the whole mechanism. Everything above is stubbed at
+   * the fetch seam, so it would all still pass if Node silently ignored
+   * `init.dispatcher` and resolved the name itself — the exact failure mode that
+   * would turn the pin into decoration. So: a real HTTP server on a random
+   * loopback port, and a hostname ("pinned.test", RFC 6761 — guaranteed NXDOMAIN)
+   * that NOTHING can resolve. If the connection lands, the only possible source of
+   * the address was the pin.
+   */
+  describe("real socket", () => {
+    let server: import("node:http").Server;
+    let port = 0;
+    let hits = 0;
+
+    beforeAll(async () => {
+      const http = await import("node:http");
+      server = http.createServer((_req, res) => {
+        hits++;
+        res.writeHead(200, { "content-type": "text/plain" });
+        res.end("ok");
+      });
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+      port = (server.address() as import("node:net").AddressInfo).port;
+    });
+
+    afterAll(async () => {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    });
+
+    it("an UNRESOLVABLE host connects through the pin — so the pin is really in effect", async () => {
+      hits = 0;
+      // skipRangeRecheck ONLY because the test server must live on loopback, which
+      // the classifier (correctly) refuses. Nothing in the app sets it.
+      const dispatcher = createPinnedDispatcher("pinned.test", ["127.0.0.1"], { skipRangeRecheck: true });
+      try {
+        const res = await fetch(`http://pinned.test:${port}/spec.md`, { dispatcher } as RequestInit);
+        expect(res.status).toBe(200);
+        expect(await res.text()).toBe("ok");
+        expect(hits).toBe(1);
+      } finally {
+        await dispatcher.close();
+      }
+    });
+
+    it("a dispatcher pinned to a DIFFERENT host refuses, and the server sees nothing", async () => {
+      hits = 0;
+      const dispatcher = createPinnedDispatcher("other.test", ["127.0.0.1"], { skipRangeRecheck: true });
+      try {
+        await expect(fetch(`http://pinned.test:${port}/spec.md`, { dispatcher } as RequestInit)).rejects.toThrow();
+        // The refusal happens before any socket: zero requests reach the origin.
+        expect(hits).toBe(0);
+      } finally {
+        await dispatcher.close();
+      }
+    });
+
+    it("checkUrlSource end-to-end over a real socket, with the pin as its only address source", async () => {
+      hits = 0;
+      const c = only(
+        await validateIntakeSources([src("url", `http://pinned.test:${port}/spec.md`)], {
+          // No fetchImpl: the REAL global fetch, the real pin, a real connection.
+          lookupImpl: vi.fn(async () => [{ address: "93.184.216.34", family: 4 }]),
+          dispatcherFactory: (host) => createPinnedDispatcher(host, ["127.0.0.1"], { skipRangeRecheck: true }),
+          env: envOf({}),
+        })
+      );
+      expect(c.outcome).toBe("verified");
+      // Range 0-0 against a non-range server → 200, satisfied on the first GET.
+      expect(c.method).toBe("GET (Range 0-0)");
+      expect(hits).toBe(1);
+    });
   });
 });
