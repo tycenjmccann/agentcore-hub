@@ -1254,6 +1254,30 @@ _GC_MARKER = os.path.join(WORKSPACE_ROOT, ".last-session-gc")
 _GC_INTERVAL_S = 6 * 3600  # at most one sweep per warm VM per 6h
 _WF_ORIGIN_MARKER = ".workflow-session"
 
+# Second GC class (TEAM-4418): most dirs under sessions/ never got the marker
+# above — older workflow sessions, aborted setups, sessions created before the
+# marker existed — so the marker-only sweep left the volume growing (~640 dirs,
+# ~330 GB and climbing). These UNMARKED dirs are a second, separately-gated
+# candidate class: there is no positive "this is a human session" signal (see
+# _human_session_dirs), so this class defaults to observe-only. Modes:
+#   dry-run (default) — log a candidates summary each sweep, delete nothing.
+#   enforce            — rmtree the candidates (oldest-first, capped).
+#   off                 — skip the class entirely; marker class is unaffected
+#                         in every mode.
+SESSION_GC_UNMARKED = os.environ.get("SESSION_GC_UNMARKED", "dry-run").strip().lower()
+if SESSION_GC_UNMARKED not in ("dry-run", "enforce", "off"):
+    SESSION_GC_UNMARKED = "dry-run"
+# EFS rmtree is not free over NFS, and the marker sweep runs on the same warm
+# VM's turn-adjacent thread — cap how many unmarked dirs one sweep deletes so a
+# first enforce run against ~640 stale dirs can't starve a live turn's mount.
+SESSION_GC_MAX_DELETES = _safe_int_env("SESSION_GC_MAX_DELETES", 100)
+# Dirs a workflow/human turn writes that a bare `os.scandir` would otherwise
+# miss as "no activity" signal; also used to spare a dir even when unmarked.
+_SESSION_META_FILES = (".session-meta.json", ".resume-installed", _WF_ORIGIN_MARKER)
+# Written only by the laptop port/pull round trip (never by a workflow turn) —
+# an extra conservative "this looks like a human session" spare.
+_HUMAN_ARTIFACT_FILES = (".bundle-applied", ".return.bundle")
+
 
 def _touch_workflow_marker(session_id: str | None) -> None:
     """Stamp a session dir as workflow-origin and record activity. Called on
@@ -1298,10 +1322,103 @@ def _ensure_sessions_writable() -> bool:
     return _probe()
 
 
+# Top-level dirs under WORKSPACE_ROOT that are shared infrastructure, not a
+# session — the unmarked-class scan must never wander into these even though
+# they can sit next to sessions/ on the same mount.
+_GC_SPECIAL_ROOTS = {
+    os.path.basename(MIRROR_ROOT), os.path.basename(DEPS_ROOT),
+    os.path.basename(CLAUDE_CONFIG_DIR), os.path.basename(CODEX_HOME),
+    os.path.basename(KIRO_HOME),
+}
+
+
+def _last_activity(path: str) -> float:
+    """Last-activity mtime for an unmarked session dir: the dir itself, its
+    known per-session marker files, and the mtimes of its TOP-LEVEL entries
+    (one os.scandir, never a recursive walk — EFS walks are too slow for a turn
+    path). Returns `now` (never stale) on any read error so an unreadable dir
+    is conservatively never a GC candidate."""
+    try:
+        best = os.lstat(path).st_mtime
+    except OSError:
+        return time.time()
+    for name in _SESSION_META_FILES:
+        try:
+            best = max(best, os.stat(os.path.join(path, name)).st_mtime)
+        except OSError:
+            pass
+    try:
+        with os.scandir(path) as it:
+            for entry in it:
+                try:
+                    best = max(best, entry.stat(follow_symlinks=False).st_mtime)
+                except OSError:
+                    continue
+    except OSError:
+        return time.time()
+    return best
+
+
+def _human_session_dirs() -> set:
+    """Best-effort set of session-dir basenames to treat as human, purely to
+    SPARE a dir from the unmarked class — never a reason to delete one.
+
+    SESSION_MAP (.sessions.json) is keyed by CLI conversation id, not the
+    runtimeSessionId that names the dir, and is written on every turn
+    regardless of origin — so this is a conservative over-match, not a real
+    signal (there is no positive human marker anywhere in this system). Any
+    key that happens to look like a session id gets its sanitized dir name
+    added; read failures yield an empty set, never an exception."""
+    try:
+        keys = _load_session_map().keys()
+    except Exception:  # noqa: BLE001 — sparing logic must never raise
+        return set()
+    return {os.path.basename(_session_dir(k)) for k in keys}
+
+
+def _unmarked_gc_candidates(sessions_root: str, cutoff: float, live_dirs: set,
+                            human_dirs: set) -> list:
+    """Pure scan (no deletes): dirs under sessions_root with no workflow-origin
+    marker whose last activity is older than `cutoff`. Returns [(path, age_s), ...]
+    oldest-first. See _gc_stale_sessions for the guard rails this enforces."""
+    sroot_real = os.path.realpath(sessions_root)
+    now = time.time()
+    out = []
+    try:
+        names = os.listdir(sessions_root)
+    except OSError:
+        return out
+    for name in names:
+        if name.startswith(".") or name in _GC_SPECIAL_ROOTS or name in live_dirs \
+                or name in human_dirs:
+            continue
+        path = os.path.join(sessions_root, name)
+        if os.path.islink(path) or not os.path.isdir(path):
+            continue
+        real = os.path.realpath(path)
+        if real != path and os.path.dirname(real) != sroot_real:
+            continue  # a component resolved outside sessions/ — never touch
+        if os.path.isfile(os.path.join(path, _WF_ORIGIN_MARKER)):
+            continue  # marker class owns this dir
+        if any(os.path.isfile(os.path.join(path, f)) for f in _HUMAN_ARTIFACT_FILES):
+            continue  # laptop port/pull artifact — looks human, spare it
+        last = _last_activity(path)
+        if last < cutoff:
+            out.append((path, now - last))
+    out.sort(key=lambda t: t[1], reverse=True)
+    return out
+
+
 def _gc_stale_sessions() -> None:
-    """Best-effort TTL sweep of {WORKSPACE_ROOT}/sessions/*. Only dirs carrying
-    the workflow-origin marker are candidates — human Cloud Code sessions must
-    stay resumable indefinitely. Staleness = marker mtime older than the TTL.
+    """Best-effort TTL sweep of {WORKSPACE_ROOT}/sessions/*.
+
+    Marker class (unchanged): only dirs carrying the workflow-origin marker are
+    candidates — human Cloud Code sessions must stay resumable indefinitely.
+    Staleness = marker mtime older than the TTL.
+
+    Unmarked class (TEAM-4418, see SESSION_GC_UNMARKED): dirs with NO marker,
+    gated dry-run/enforce/off — see _unmarked_gc_candidates for its guard rails.
+
     Never touches a session that is running on THIS VM (in _ACTIVE_TURNS), never
     the sessions/ root itself. Never raises."""
     if SESSION_TTL_DAYS <= 0:
@@ -1345,6 +1462,32 @@ def _gc_stale_sessions() -> None:
                 continue
         if removed:
             logger.info("session_gc", extra={"removed": removed, "ttl_days": SESSION_TTL_DAYS})
+
+        if SESSION_GC_UNMARKED == "off":
+            return
+        human_dirs = _human_session_dirs()
+        candidates = _unmarked_gc_candidates(sessions_root, cutoff, live_dirs, human_dirs)
+        if not candidates:
+            return
+        oldest_age_days = round(candidates[0][1] / 86400, 1)
+        examples = [os.path.basename(p) for p, _ in candidates[:20]]
+        if SESSION_GC_UNMARKED == "dry-run":
+            info = {"count": len(candidates), "oldest_age_days": oldest_age_days,
+                    "mode": "dry-run", "ttl_days": SESSION_TTL_DAYS, "examples": examples}
+            logger.info("session_gc_unmarked_candidates %s", json.dumps(info, default=str),
+                        extra=info)
+            return
+        # enforce
+        to_remove = candidates[:SESSION_GC_MAX_DELETES]
+        removed_unmarked = 0
+        for path, _age in to_remove:
+            shutil.rmtree(path, ignore_errors=True)
+            removed_unmarked += 1
+        info = {"removed": removed_unmarked, "count": len(candidates),
+                "capped": len(candidates) > SESSION_GC_MAX_DELETES,
+                "oldest_age_days": oldest_age_days, "ttl_days": SESSION_TTL_DAYS,
+                "examples": examples}
+        logger.info("session_gc_unmarked_removed %s", json.dumps(info, default=str), extra=info)
     except Exception as exc:  # noqa: BLE001 — GC must never affect a turn
         logger.warning("session_gc_failed", extra={"error": str(exc)[:200]})
 
