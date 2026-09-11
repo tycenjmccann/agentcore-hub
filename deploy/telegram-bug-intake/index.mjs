@@ -868,6 +868,17 @@ async function repageIfWindowOpened(wf, notif, w) {
     const openAt = nextBusinessOpenAt(notif.timestamp, w);
     if (!openAt || Date.now() < openAt.getTime()) return;
 
+    // TEAM-4461: the request-time page itself may have landed INSIDE the window —
+    // a gate requested 08:59 and paged by the 09:00 scan, or a page delayed past
+    // the opening by a notifier outage. The human already has it, in hours; a
+    // "your window is open now" nudge 60s later is noise. A claim with no
+    // pagedAt was written by an older deployment → fall through as before.
+    const { Item: claim } = await ddb.send(new GetItemCommand({
+      TableName: PENDING_TABLE, Key: { id: { S: gateClaimKey(notif) } },
+    }));
+    const pagedAt = Date.parse(claim?.pagedAt?.S || "");
+    if (Number.isFinite(pagedAt) && pagedAt >= openAt.getTime()) return;
+
     const key = `${REPAGE_KEY_PREFIX}${notif.id || notif.ticketId}`;
     if (!(await claimKey(key))) return; // already reminded
     holding = key;
@@ -1100,6 +1111,9 @@ async function claimGate(notif) {
       Item: {
         id: { S: gateClaimKey(notif) },
         ttl: { N: String(Math.floor(Date.now() / 1000) + 30 * 86400) },
+        // TEAM-4461: the claim is written milliseconds before delivery in the same
+        // scan (and released when nobody received it), so this IS the page time.
+        pagedAt: { S: new Date().toISOString() },
       },
       ConditionExpression: "attribute_not_exists(id)",
     }));
