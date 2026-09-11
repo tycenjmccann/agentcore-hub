@@ -20,22 +20,17 @@ export function resolveSdlcFramework(value: unknown): SdlcFramework {
   return "standard";
 }
 
-export const SDLC_BADGE_META: Record<
-  SdlcFramework,
-  {
-    label: string;
-    tooltip: string;
-    boardClassName: string;
-    listClassName: string;
-  }
-> = {
-  standard: {
-    label: "STANDARD",
-    tooltip: "Standard pipeline — requirements, parallel design, development, QA and ship.",
-    boardClassName: "sdlc-badge sdlc-badge--standard",
-    listClassName:
-      "text-[9px] px-1.5 py-0.5 rounded border font-medium uppercase tracking-wider whitespace-nowrap flex-shrink-0 text-[var(--color-text-muted)] bg-[var(--color-bg-tertiary)] border-current",
-  },
+/** The two real framework overlays — "standard" is the absence of one, not a badge-worthy value. */
+export type SdlcOverlay = Exclude<SdlcFramework, "standard">;
+
+export interface SdlcBadgeMeta {
+  label: string;
+  tooltip: string;
+  boardClassName: string;
+  listClassName: string;
+}
+
+export const SDLC_BADGE_META: Record<SdlcOverlay, SdlcBadgeMeta> = {
   playbook: {
     label: "PLAYBOOK",
     tooltip: "Playbook framework — expect intent, spec, and plan artifacts.",
@@ -52,3 +47,12 @@ export const SDLC_BADGE_META: Record<
       "text-[9px] px-1.5 py-0.5 rounded border font-medium uppercase tracking-wider whitespace-nowrap flex-shrink-0 text-[var(--violet-fg)] bg-[var(--violet-subtle)] border-current",
   },
 };
+
+/**
+ * Badge metadata for a resolved framework, or null when there is no overlay
+ * to badge. "standard" means no overlay was selected — it is not itself a
+ * framework, so render sites must show nothing rather than a "STANDARD" badge.
+ */
+export function sdlcBadgeFor(fw: SdlcFramework): SdlcBadgeMeta | null {
+  return fw === "standard" ? null : SDLC_BADGE_META[fw];
+}
