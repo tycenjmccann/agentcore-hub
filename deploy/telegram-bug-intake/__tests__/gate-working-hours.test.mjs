@@ -274,6 +274,47 @@ describe("business-hours reminder", () => {
     expect(JSON.stringify(reminder.sent[0].reply_markup)).toContain("gok|TEAM-2|wf-1");
     expect(db.items.has("repage#notif_TEAM-2_a")).toBe(true);
     expect(requested(), "the reminder is not a new request").toHaveLength(1);
+    // TEAM-4461: the request-time page's own claim is stamped BEFORE the window
+    // opened, which is exactly what makes this a genuine (reminder-worthy) case.
+    expect(db.items.get("gate#notif_TEAM-2_a").pagedAt.S).toBe("2026-09-09T07:11:00.000Z");
+  });
+
+  // TEAM-4461 F4 — the request-time page itself landed inside the window, either
+  // because the gate opened just before it (A) or because delivery was delayed
+  // past the opening, e.g. a notifier outage (B). Neither earns a reminder: the
+  // human already has the page, in hours.
+  it("(A) a gate requested 08:59 and paged by the 09:00 scan earns no reminder", async () => {
+    const handler = await loadHandler();
+    const REQUESTED_08_59 = "2026-09-09T15:59:00.000Z"; // Wed 08:59 PDT — outside
+    const n = notif("TEAM-15", "notif_TEAM-15_a", REQUESTED_08_59);
+    const w = [wf([n])];
+
+    const first = await scanAt(handler, "2026-09-09T16:00:30.000Z", w); // Wed 09:00:30 PDT
+    expect(first.sent).toHaveLength(1);
+    expect(db.items.get("gate#notif_TEAM-15_a").pagedAt.S).toBe("2026-09-09T16:00:30.000Z");
+    const d = detailOf(requested()[0]);
+    expect(d.outsideHours).toBe(true);
+    expect(d.nextBusinessOpenAt).toBe(WINDOW_OPENS);
+
+    const later = await scanAt(handler, "2026-09-09T16:01:00.000Z", w);
+    expect(later.sent).toHaveLength(0);
+    expect(keys("repage#")).toEqual([]);
+  });
+
+  it("(B) a request-time page delayed past the opening (e.g. notifier outage) earns no reminder", async () => {
+    const handler = await loadHandler();
+    const REQUESTED_03_00 = "2026-09-09T10:00:00.000Z"; // Wed 03:00 PDT — outside
+    const n = notif("TEAM-16", "notif_TEAM-16_a", REQUESTED_03_00);
+    const w = [wf([n])];
+
+    // Delivery didn't happen until the 10:00 PDT scan — already inside the window.
+    const first = await scanAt(handler, "2026-09-09T17:00:00.000Z", w);
+    expect(first.sent).toHaveLength(1);
+    expect(db.items.get("gate#notif_TEAM-16_a").pagedAt.S).toBe("2026-09-09T17:00:00.000Z");
+
+    const later = await scanAt(handler, "2026-09-09T17:01:00.000Z", w);
+    expect(later.sent).toHaveLength(0);
+    expect(keys("repage#")).toEqual([]);
   });
 
   it("(3) a later scan in the same window sends nothing", async () => {

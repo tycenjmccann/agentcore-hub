@@ -2930,6 +2930,12 @@ async function trackTicketCreation(ticketId, assignee, workflowId, parentId) {
     if (!workflow.agentTasks) workflow.agentTasks = {};
     workflow.agentTasks[ticketId] = entry;
     console.log(`[orchestrator] Tracked new ticket ${ticketId} (${assignee}) in workflow ${workflow.id}`);
+  } else if (!(await store.claimHumanTicket(workflow.id, ticketId))) {
+    // TEAM-4461: a human gate is never written to agentTasks (see above), so the
+    // agentTasks / trackTicket redelivery guards do not cover it. This claim is its
+    // idempotency marker — a re-delivered stream INSERT (at-least-once) or a re-sent
+    // Jira "created" webhook stops here instead of publishing a second ticket.created.
+    return;
   }
 
   // Fan out a ticket.created event so the UI can render the badge without polling.

@@ -209,6 +209,14 @@ and falls back. Publishing is best-effort: until `update-config.sh` has granted
 `events:PutEvents` on the bus, every publish fails and is logged, and paging is
 unaffected.
 
+The `gate#<notif.id>` claim carries `pagedAt`, the instant the request-time page
+was written (TEAM-4461). The reminder is suppressed when `pagedAt` is already at
+or after `nextBusinessOpenAt` — the page landed inside the window on its own
+(e.g. requested 08:59, delivered by the 09:00 scan; or a notifier outage delayed
+delivery past the opening) — so a "your window is open now" nudge is never sent
+for a page the human already received in hours. A claim with no `pagedAt`
+(written by an older deployment) falls through to the prior behaviour.
+
 ## Deploy
 
 The function has no dependencies to bundle — it imports only AWS SDK v3 clients,
