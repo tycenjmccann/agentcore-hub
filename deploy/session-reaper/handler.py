@@ -58,6 +58,11 @@ SWEEP_IDLE_CP_S = int(os.environ.get("SWEEP_IDLE_CP_S", str(14 * 86400)))
 SWEEP_MISSING_WORKFLOW_S = int(os.environ.get("SWEEP_MISSING_WORKFLOW_S", "86400"))
 SWEEP_MAX_CP = int(os.environ.get("SWEEP_MAX_CP", "100"))
 SWEEP_MAX_PURGE = int(os.environ.get("SWEEP_MAX_PURGE", "20"))
+# Wall clock kept in reserve so the last release started can finish and the
+# summary line can print. One EFS purge cold-boots a microVM (20-40 s); the
+# check happens BEFORE a release starts, so this must exceed the slowest
+# single release.
+SWEEP_DEADLINE_MARGIN_MS = int(os.environ.get("SWEEP_DEADLINE_MARGIN_MS", "90000"))
 
 # Workflow phases after which no agent will touch the session again
 # (lambda/orchestrator: completeWorkflow / claimTerminalOutcome / cancel route).
@@ -130,6 +135,11 @@ def _stop_session(session_id: str, runtime_arn: str) -> None:
             agentRuntimeArn=runtime_arn,
             qualifier="DEFAULT",
         )
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") == "ResourceNotFoundException":
+            print(f"[reaper] stop {session_id}: runtime session already gone (ResourceNotFoundException)")
+        else:
+            print(f"[reaper] stop {session_id}: {type(exc).__name__}: {str(exc)[:200]}")
     except Exception as exc:  # noqa: BLE001 — stop is best-effort; purge is the goal
         print(f"[reaper] stop {session_id}: {type(exc).__name__}: {str(exc)[:200]}")
 
@@ -316,57 +326,68 @@ def _stamp_released(session_id: str, kind: str, reason: str) -> None:
             raise
 
 
-def _sweep(dry_run: bool = False) -> dict:
+def _sweep(dry_run: bool = False, context=None) -> dict:
     now = datetime.now(timezone.utc)
     rows = _scan_candidates()
     workflows = _workflow_rows([w for w in (_ddb_str(r.get("workflowId")) for r in rows) if w])
     summary = {"scanned": len(rows), "released": {"cp": 0, "efs": 0}, "planned": [],
-               "skipped": 0, "errors": 0, "dry_run": dry_run}
+               "skipped": 0, "errors": 0, "dry_run": dry_run,
+               "deadline_hit": False, "deferred": 0}
     budget = {"cp": SWEEP_MAX_CP, "efs": SWEEP_MAX_PURGE}
+    # No context (or a context without the method) → no deadline, behaviour
+    # unchanged from before this Lambda-context awareness existed.
+    remaining_ms = getattr(context, "get_remaining_time_in_millis", None)
 
-    for row in rows:
-        session_id = _ddb_str(row.get("sessionId"))
-        runtime_arn = _ddb_str(row.get("runtimeArn")) or DEFAULT_RUNTIME_ARN
-        if not session_id or not runtime_arn:
-            summary["skipped"] += 1
-            continue
-        try:
-            cp_id = _capacity_provider_id(runtime_arn)
-        except Exception as exc:  # noqa: BLE001 — unknown runtime → leave the row for next time
-            print(f"[sweep] {session_id}: runtime lookup failed, skipping: {type(exc).__name__}: {str(exc)[:200]}")
-            summary["errors"] += 1
-            continue
-        reason = _decide(row, workflows, bool(cp_id), now)
-        if not reason:
-            continue
-        lane = "cp" if cp_id else "efs"
-        if budget[lane] <= 0:
-            summary["skipped"] += 1
-            continue
-        budget[lane] -= 1
-        if dry_run:
-            summary["planned"].append({"sessionId": session_id, "lane": lane, "reason": reason})
-            continue
-        try:
-            kind = _release_compute(session_id, runtime_arn, _ddb_str(row.get("cli")) or "claude",
-                                    _ddb_str(row.get("claudeSessionId")), _ddb_str(row.get("tenantId")))
-            _stamp_released(session_id, kind, reason)
-            summary["released"][lane] += 1
-            print(f"[sweep] released {session_id}: {kind} ({reason})")
-        except Exception as exc:  # noqa: BLE001 — one bad row must not stop the sweep
-            summary["errors"] += 1
-            print(f"[sweep] {session_id}: release failed: {type(exc).__name__}: {str(exc)[:300]}")
-
-    print(f"[sweep] {json.dumps({k: v for k, v in summary.items() if k != 'planned'})}"
-          + (f" planned={len(summary['planned'])}" if dry_run else ""))
+    try:
+        for row in rows:
+            session_id = _ddb_str(row.get("sessionId"))
+            runtime_arn = _ddb_str(row.get("runtimeArn")) or DEFAULT_RUNTIME_ARN
+            if not session_id or not runtime_arn:
+                summary["skipped"] += 1
+                continue
+            try:
+                cp_id = _capacity_provider_id(runtime_arn)
+            except Exception as exc:  # noqa: BLE001 — unknown runtime → leave the row for next time
+                print(f"[sweep] {session_id}: runtime lookup failed, skipping: {type(exc).__name__}: {str(exc)[:200]}")
+                summary["errors"] += 1
+                continue
+            reason = _decide(row, workflows, bool(cp_id), now)
+            if not reason:
+                continue
+            lane = "cp" if cp_id else "efs"
+            if budget[lane] <= 0:
+                summary["skipped"] += 1
+                continue
+            budget[lane] -= 1
+            if dry_run:
+                summary["planned"].append({"sessionId": session_id, "lane": lane, "reason": reason})
+                continue
+            if not summary["deadline_hit"] and remaining_ms and remaining_ms() < SWEEP_DEADLINE_MARGIN_MS:
+                summary["deadline_hit"] = True
+            if summary["deadline_hit"]:
+                # Next tick re-plans this row: it is still unstamped, so the scan finds it.
+                summary["deferred"] += 1
+                continue
+            try:
+                kind = _release_compute(session_id, runtime_arn, _ddb_str(row.get("cli")) or "claude",
+                                        _ddb_str(row.get("claudeSessionId")), _ddb_str(row.get("tenantId")))
+                _stamp_released(session_id, kind, reason)
+                summary["released"][lane] += 1
+                print(f"[sweep] released {session_id}: {kind} ({reason})")
+            except Exception as exc:  # noqa: BLE001 — one bad row must not stop the sweep
+                summary["errors"] += 1
+                print(f"[sweep] {session_id}: release failed: {type(exc).__name__}: {str(exc)[:300]}")
+    finally:
+        print(f"[sweep] {json.dumps({k: v for k, v in summary.items() if k != 'planned'})}"
+              + (f" planned={len(summary['planned'])}" if dry_run else ""))
     return summary
 
 
-def handler(event, _context):
+def handler(event, context):
     """Stream records → reap each tombstoned REMOVE (raises so the batch is
     retried/bisected). {"sweep": true[, "dry_run": true]} → one sweep pass."""
     if event.get("Records"):
         return _handle_stream(event)
     if event.get("sweep"):
-        return _sweep(dry_run=bool(event.get("dry_run")))
+        return _sweep(dry_run=bool(event.get("dry_run")), context=context)
     raise ValueError("unrecognised event: expected DynamoDB stream Records or {\"sweep\": true}")
