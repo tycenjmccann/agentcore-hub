@@ -2,7 +2,7 @@
 
 > **Purpose**: Step-by-step operational reference for tracing a workflow execution through all components. Use this when debugging stuck, out-of-order, or duplicated ticket behavior.
 >
-> **Ticket backend**: this guide walks the **Jira** path (`TICKET_PROVIDER=jira`), which is what `.env.example` / the Dockerfile ship. `TICKET_PROVIDER=dynamodb` is the code default when the var is unset - DynamoDB Streams replace Jira webhooks as the trigger, but the orchestrator handlers, the agent-invoker hop, and the events table are the same. See `docs/workflow-pipeline-architecture.md`.
+> **Ticket backend**: this guide walks the **Jira** path (`TICKET_PROVIDER=jira`), which is what `.env.example` / the Dockerfile ship. `TICKET_PROVIDER=dynamodb` is the code default when the var is unset - DynamoDB Streams replace Jira webhooks as the trigger, but the orchestrator handlers, the agent-invoker hop, and the events table are the same. See `docs/architecture.md`.
 
 ---
 
@@ -329,7 +329,7 @@ dropped for out-of-scope roles — TEAM-3368 §3.2 config-drift guard.)
 > drops plus the drops made by the TEAM-3376 DynamoDB seen-set
 > (`agentcore-hub-eval-seen`, conditional writes, fail-open), which closed the
 > DDB-rolling-aggregate exposure TEAM-3381 had deferred — see
-> [eval-infrastructure-reliability-design.md §2.2](./eval-infrastructure-reliability-design.md#ac-2-ddb-aggregate-deferral-disposition-team-3381)
+> [evaluations/reliability-design.md §2.2](./evaluations/reliability-design.md#ac-2-ddb-aggregate-disposition-team-3381-closed-by-team-3376team-3385)
 > for the original disposition. Flush-time dedup independently logs any
 > stragglers (`eval.batch.cross_delivery_duplicates_dropped`, e.g. records the
 > seen-set failed OPEN on); to verify the seen-set end-to-end, use that

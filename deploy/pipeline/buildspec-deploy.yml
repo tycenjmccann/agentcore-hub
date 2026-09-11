@@ -4,7 +4,7 @@
 # pipeline's NARROW IAM role (no laptop, no tycenj-prod profile, Jira creds never
 # touched — the role literally cannot UpdateFunctionConfiguration). Consumes the
 # Build stage's artifacts by digest; it never rebuilds. See
-# docs/cicd-pipeline-module-design.md.
+# docs/pipeline/design.md.
 #
 # Which surfaces deploy is decided by deploy/pipeline/plan-surfaces.py from the
 # Build stage's changed-files.txt — code pushes only. Infra scripts (IAM, env,

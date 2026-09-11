@@ -11,7 +11,7 @@ A platform for getting the most out of Amazon Bedrock AgentCore — run all your
 - **Builder** — Chat-based agent creation (harness with code_interpreter + MCP)
 - **Workflow** — Config-driven multi-agent pipelines: submit a request and a roster of agents produce the deliverable. Ships seven workflows (Software Delivery → a PR; Bug Fix; Operator; Dead Code Sweep; Marketing; Sales; Legal), each defined in `src/config/workflows.json`. Real-time pipeline visualization with animated phases, timeline replay/scrubber, S3 artifact browsing, optional **human review gates**, and dynamic header titles
 - **Cloud Code** — A coding agent that lives in the cloud ("safe to close your laptop"): Claude Code / Codex run server-side on a dedicated AgentCore Runtime with an EFS workspace. Streaming chat + a live terminal, per-session isolated checkouts, resumable from any device, MCP-gateway tools, and per-user CLI config bundles. **Port a live local session to the cloud and pull it back** — a [local MCP](mcp/hub/README.md) ships your raw transcript so `claude --resume` continues losslessly, laptop↔cloud. Opens PRs from a clone — Git-native, separate from the workflow fleet
-- **Pipeline** — AWS-native CI/CD (CodeBuild + CodePipeline) with a read-only `/pipeline` status board. Agents own CD through narrow `Pipeline___*` tools (trigger + watch + read build logs — never approve); the deploy gate is a human decision delivered to Telegram. The `/pipeline` board now also surfaces the waiting deploy gate directly in the UI: an amber "waiting for approval" card showing `waitingSince`, a commit link, and an "Approve in CodePipeline" link, with the deploy-gate banner scoped to the run. See [`docs/cicd-pipeline-module-design.md`](docs/cicd-pipeline-module-design.md), [`docs/pipeline-quickstart.md`](docs/pipeline-quickstart.md), and [`docs/agents-own-cd.md`](docs/agents-own-cd.md)
+- **Pipeline** — AWS-native CI/CD (CodeBuild + CodePipeline) with a read-only `/pipeline` status board. Agents own CD through narrow `Pipeline___*` tools (trigger + watch + read build logs — never approve); the deploy gate is a human decision delivered to Telegram. The `/pipeline` board now also surfaces the waiting deploy gate directly in the UI: an amber "waiting for approval" card showing `waitingSince`, a commit link, and an "Approve in CodePipeline" link, with the deploy-gate banner scoped to the run. See [`docs/pipeline/design.md`](docs/pipeline/design.md)
 
 ### Modular by design
 
@@ -567,7 +567,7 @@ The roster of valid agents is defined in `src/config/agents.json` — the single
 2. Sync to S3: `aws s3 cp src/config/agents.json s3://{ARTIFACT_BUCKET}/config/agents.json`
 3. Lambdas pick up changes on next cold start — no redeployment needed
 
-The orchestrator uses this to resolve agent ID → Runtime ARN mapping. The ticket Lambdas use it to validate assignees before accepting a ticket (rejects unknown agent IDs with a helpful error). See `docs/agent-fleet-documentation.md` § "Agent Roster" for full details.
+The orchestrator uses this to resolve agent ID → Runtime ARN mapping. The ticket Lambdas use it to validate assignees before accepting a ticket (rejects unknown agent IDs with a helpful error). See `docs/workflow/agent-fleet.md` § "Agent Roster" for full details.
 
 ### Deploying the Agent Fleet
 

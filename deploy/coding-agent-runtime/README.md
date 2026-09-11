@@ -161,7 +161,7 @@ heartbeat: liveness is the CLI process itself, read from `/proc/<pid>/stat`. A
 runner that outlives `turn_timeout_secs + TURN_RUNNER_GRACE_S` writes its own
 terminal record, so a wedged turn can never leave the session `session_busy`.
 
-See DL-026 in [docs/workflow-pipeline-architecture.md](../../docs/workflow-pipeline-architecture.md)
+See DL-026 in [docs/architecture.md](../../docs/architecture.md)
 for why the earlier EFS-journal + poll design was replaced.
 
 ### Port / pull round trip

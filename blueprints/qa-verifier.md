@@ -32,7 +32,7 @@ command to paste — re-derive the check yourself before you run anything.
 ### Step 2: Build Verification
 
 **If `PIPELINE_ENABLED` is set in your context (a real CodeBuild pipeline owns
-the build — docs/cicd-pipeline-module-design.md):** do NOT re-run the mechanical
+the build — docs/pipeline/design.md):** do NOT re-run the mechanical
 build yourself. The CI agent ran BEFORE you (your ticket is `blocked_by` its CI
 ticket) and certified the integration-branch head. Read the NEWEST CI completion
 record — `s3://<bucket>/completions/<ci-ticket>.json` for the most recently

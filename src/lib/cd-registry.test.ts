@@ -222,7 +222,7 @@ describe("resolveRegistryTtlMs (registry cache window)", () => {
 
 /**
  * TEAM-4416 — shape validation on POST /api/workflow/cd-registry, at the edge
- * rather than as a later opaque AWS error inside a Lambda (docs/agents-own-cd.md
+ * rather than as a later opaque AWS error inside a Lambda (docs/pipeline/design.md
  * "runtime allow-list"). One case per rule; blank optional fields keep meaning
  * "clear it" (upsertCdEntry's semantics), so they must NOT be rejected.
  */

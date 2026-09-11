@@ -53,16 +53,16 @@ The orchestration pipeline. Self-contained surface.
 
 **Frontend code**
 - `src/components/workflow/`
-- `src/lib/workflow/` (~30 modules: types, ticket providers (`ticket-provider*.ts`), board state, leases, ship-review, event transforms, jira-client, model-config, watchdog, performance (fleet performance card — see `docs/performance-card.md`), …)
+- `src/lib/workflow/` (~30 modules: types, ticket providers (`ticket-provider*.ts`), board state, leases, ship-review, event transforms, jira-client, model-config, watchdog, performance (fleet performance card — see `docs/workflow/performance-card.md`), …)
 - `src/lib/pipeline-config.ts`
-- `src/lib/cd-registry.ts` (core lib, no module imports) + `src/config/cd-registry.json` (first-deploy seed; ships empty) — mirror of `lambda/orchestrator/cd-registry.mjs`. Unregistered repo = **handoff**: no Ship / Merge Approval / CD tickets, the orchestrator opens the unified PR at completion and leaves it open for the owning team (`workflow.delivery = { mode: "handoff", prUrl }`). Registered = full ship phase; an entry with a `pipeline` also turns on Pipeline Mode for that repo's agents. `pipelineProjectsFor(entry)` is the TS mirror of the canonical `pipelineProjects(entry)` — it derives `<base>-ci` / `<base>-build` / `<base>-deploy` from the entry's `pipeline` (`hub-<slug>-deploy` convention; an explicit `ciProject` wins), so the UI names exactly the resources the tools Lambda drives. Because the registry is read at runtime by more than the orchestrator, `cd-registry.mjs` is **byte-copied** to `lambda/agentcore-hub-pipeline-tools/cd-registry.mjs` (which pipeline a `Pipeline___*` call may touch) and `deploy/telegram-bug-intake/cd-registry.mjs` (which pipelines the deploy-gate bridge polls); `scripts/check-cd-registry-parity.sh` fails CI when the copies drift, and `deploy/telegram-bug-intake/update-config.sh` is the handoff script that points the bridge at the registered pipelines. Registry write access = deploy-trigger authority (see [`agents-own-cd.md`](./agents-own-cd.md)).
+- `src/lib/cd-registry.ts` (core lib, no module imports) + `src/config/cd-registry.json` (first-deploy seed; ships empty) — mirror of `lambda/orchestrator/cd-registry.mjs`. Unregistered repo = **handoff**: no Ship / Merge Approval / CD tickets, the orchestrator opens the unified PR at completion and leaves it open for the owning team (`workflow.delivery = { mode: "handoff", prUrl }`). Registered = full ship phase; an entry with a `pipeline` also turns on Pipeline Mode for that repo's agents. `pipelineProjectsFor(entry)` is the TS mirror of the canonical `pipelineProjects(entry)` — it derives `<base>-ci` / `<base>-build` / `<base>-deploy` from the entry's `pipeline` (`hub-<slug>-deploy` convention; an explicit `ciProject` wins), so the UI names exactly the resources the tools Lambda drives. Because the registry is read at runtime by more than the orchestrator, `cd-registry.mjs` is **byte-copied** to `lambda/agentcore-hub-pipeline-tools/cd-registry.mjs` (which pipeline a `Pipeline___*` call may touch) and `deploy/telegram-bug-intake/cd-registry.mjs` (which pipelines the deploy-gate bridge polls); `scripts/check-cd-registry-parity.sh` fails CI when the copies drift, and `deploy/telegram-bug-intake/update-config.sh` is the handoff script that points the bridge at the registered pipelines. Registry write access = deploy-trigger authority (see [`pipeline/design.md`](./pipeline/design.md)).
 
 **Lambdas** (`lambda/`)
 - `orchestrator` — drives the pipeline state machine
 - `agentcore-hub-jira` — Jira Cloud ticket tools (deployed when `TICKET_PROVIDER=jira`)
 - `agentcore-hub-tickets` — DynamoDB-backed ticket tools (deployed when `TICKET_PROVIDER=dynamodb`)
 - `workflow-output` — collects agent artifacts
-- `cost-report` — per-run performance card (cost / time / quality + anomaly bands) on `workflow.complete`; writes `workflows/{id}/shared/performance-card.{json,md}`, `performance/index.json`, `workflow.performance` events and `AgentCoreHub/Performance` CloudWatch metrics (`docs/performance-card.md`)
+- `cost-report` — per-run performance card (cost / time / quality + anomaly bands) on `workflow.complete`; writes `workflows/{id}/shared/performance-card.{json,md}`, `performance/index.json`, `workflow.performance` events and `AgentCoreHub/Performance` CloudWatch metrics (`docs/workflow/performance-card.md`)
 - `anomaly-watcher` — scheduled workflow-observability Lambda (EventBridge Scheduler, ~10 min): folds live-run events into hourly metric buckets, detects anomalies against the bundled `bands.yaml`, and takes highest-tier action (log / diagnose + page / file one bug workflow under a fleet-wide cap); no function URL or API
 - `workflow-analyzer` — thin dispatcher that invokes the Workflow Manager harness (`agentcore_hub_workflow_manager`) on terminal workflow outcomes or a schedule to ANALYZE completed runs / WATCH stale ones; all analysis + intervention logic lives in the harness
 
@@ -359,8 +359,8 @@ returned to the model. Self-contained surface — **no DynamoDB tables, no Lambd
 AWS-native CI/CD for a repo the hub builds into (pilot: the hub's own repo). A
 bolt-on that moves the deterministic build/test/deploy work OUT of the SDLC
 agents and INTO CodeBuild + CodePipeline, so the agents only author/judge/react.
-Full design + rationale: [`cicd-pipeline-module-design.md`](./cicd-pipeline-module-design.md).
-Operator-facing operating model (agents own CD): [`agents-own-cd.md`](./agents-own-cd.md).
+Full design + rationale: [`pipeline/design.md`](./pipeline/design.md).
+Operator-facing operating model (agents own CD): [`pipeline/design.md`](./pipeline/design.md#operating-model--agents-own-cd).
 
 **Gated + inert by default.** Nothing runs unless you both deploy the CDK stack
 AND set the enable flags. With them unset the `/pipeline` nav entry is hidden and

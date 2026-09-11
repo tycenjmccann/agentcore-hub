@@ -1,4 +1,6 @@
-# AgentCore Hub Pipeline — Agent Fleet Documentation
+# Agent Fleet (workflow module)
+
+The Strands personas, their tools/skills, and how they delegate to the coding CLIs on the coding-agent runtime. Runtime infra: `deploy/coding-agent-runtime/README.md`. System topology + decision log: [`../architecture.md`](../architecture.md).
 
 ## Fleet Overview
 
@@ -144,10 +146,23 @@ The `claude_code` tool runs `claude --print` as a subprocess. When Claude Code o
 
 ### How Agents Should Use Claude Code
 
-**Dev agents** (frontend, backend, API, bug_fixer) — **plan-first** (see
-`docs/plan-first-coding.md`). The persona splits the delegation into a plan turn
-and an execute turn on one shared conversation: plan on a strong model, approve,
-then execute on a cheaper one.
+**Dev agents** (frontend, backend, API, bug_fixer) — **plan-first** (the
+standard for every coding persona; always on, no flag). The persona splits the
+delegation into two turns on one shared `claude_code` conversation (only the
+session id is shared, so the model split is free):
+
+1. **Plan turn** — `plan_only=True` runs the CLI in `--permission-mode plan`: it
+   reads the repo and returns an implementation plan, writing nothing.
+2. **Review** — the persona checks the plan against the design + acceptance
+   criteria; a deficient plan goes back for revision (same conversation), capped
+   at two rounds.
+3. **Execute turn** — `--resume`s the plan turn with full autonomy.
+
+Model split (pinned per blueprint): plan on `opus` (`fable` for ambiguous or
+architecture-heavy work), execute on `sonnet` (`opus` when the plan flags high
+complexity); never plan on `haiku`. `codex` has no plan mode — codex-default
+personas (code-sweeper, code-reviewer) get the plan as text and approve it
+before the write turn.
 ```
 # 1. Plan turn — reads the repo, returns a plan, writes nothing:
 claude_code(task="Clone https://github.com/org/repo, checkout -b feature/TEAM-123-sidebar.
@@ -386,22 +401,7 @@ Use `scripts/start-test-workflow.sh` to start workflows for testing. This is the
 ./scripts/start-test-workflow.sh --scope full         # Full pipeline exercise
 ```
 
-See `docs/workflow-pipeline-architecture.md` § "Starting Test Workflows" for full usage.
-
----
-
-## A/B Testing
-
-Local test script at `deploy/runtime-agent/local-ab-test.py`:
-- Variant A: Agent codes directly (shell, editor, file_write)
-- Variant B: Agent delegates to Claude Code SDK
-- Same model (both variants default to `us.anthropic.claude-opus-5` in the script; override per run), same prompt — only difference is the `claude_code` tool
-- Both clone repo, branch, code, commit, push, create PRs
-- Compare: time, tool calls, code quality, test quality
-
-```bash
-python3 deploy/runtime-agent/local-ab-test.py --parallel
-```
+See `docs/architecture.md` § "Starting Test Workflows" for full usage.
 
 ---
 
@@ -432,17 +432,3 @@ Note: `in_progress` tickets are never reset by nudge — an agent session is act
 `GET /api/workflow/[id]/events` — Returns all events for timeline replay with scrubber.
 
 ---
-
-## Fleet Health Status (Last Validated: 2026-05-21)
-
-Full integration test: 40 tests × 14 agents (560 total assertions).
-
-| Agent | Result | Notes |
-|-------|--------|-------|
-| All 14 agents | 40/40 tools | All built-in, SDK, Lambda, and GitHub MCP tools verified |
-| `agentcore_hub_frontend_designer` | 39✓ 1✗ | `retrieve` KB threshold issue (non-blocking) |
-| `agentcore_hub_localization` | 39✓ 1✗ | `retrieve` KB threshold issue (non-blocking) |
-
-All agents have required role-based tools. Fleet is healthy.
-
-Validate with: `python3 deploy/runtime-agent/verify-fleet-invoke.py`

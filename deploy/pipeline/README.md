@@ -4,7 +4,7 @@ AWS-native CI/CD for a repo the hub cares about (pilot: the hub's own repo).
 **Entirely optional** — a forker who never runs `deploy.sh` here gets the hub
 with no pipeline, and the app still passes `npx tsc --noEmit` + `npm run build`.
 
-Design + rationale: [`docs/cicd-pipeline-module-design.md`](../../docs/cicd-pipeline-module-design.md).
+Design + rationale: [`docs/pipeline/design.md`](../../docs/pipeline/design.md).
 
 ## What it stands up
 

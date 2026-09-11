@@ -1,4 +1,6 @@
-# Workflow Pipeline — Architecture & Decision Log
+# AgentCore Hub — Architecture & Decision Log
+
+> Agent fleet detail (personas, tools, skills, coding-CLI delegation): [`workflow/agent-fleet.md`](workflow/agent-fleet.md). Module map: [`MODULES.md`](MODULES.md).
 
 > **Purpose**: Single source of truth for architecture decisions in the workflow pipeline. Prevents circular revisiting of solved problems.
 >
@@ -9,7 +11,7 @@
 
 ---
 
-## Current Architecture (as of 2026-05-19)
+## Current Architecture
 
 ### Mode: DynamoDB (TICKET_PROVIDER=dynamodb)
 
@@ -149,6 +151,8 @@ All orchestration decisions happen in the Lambda, triggered by DynamoDB Streams.
 ---
 
 ## Decision Log
+
+> **Parked idea** (from the retired legacy log): consolidate the two ticket Lambdas (`agentcore-hub-jira`, `agentcore-hub-tickets`) — which today expose an identical `Tickets___*` interface — into a single router that picks the backend by `TICKET_PROVIDER`. Proposed 2026-05-26, never adopted; the dual-Lambda design is still current.
 
 ### DL-001: Non-Streaming Agent Invocation
 
