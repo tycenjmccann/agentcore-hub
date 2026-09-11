@@ -803,12 +803,13 @@ async function startWithDynamoDB(body: WorkflowInput, def: WorkflowDef, presetWo
 /**
  * TEAM-4450: the hub-created intake ticket's title prefix must come from the
  * def's INTAKE (`type:"app"`) phase, not the first `type:"agent"` phase. For
- * most defs those happen to read the same ("Requirements", "Triage", …), but
- * for `operator` the first agent phase is named "Build" — titling the intake
- * ticket "Build: agentcore_hub_operator — …" made it indistinguishable from
- * the operator's own BUILD ticket to blueprints/operator.md's title-prefix
- * dispatch, so the intake ticket got routed into BUILD and skipped planning.
- * Both backends call this so they can't drift apart again.
+ * most defs this only changes a cosmetic label ("Requirements:" / "Triage:" →
+ * "Intake:"; no consumer keys on it), but for `operator` the first agent phase
+ * is named "Build" — titling the intake ticket "Build: agentcore_hub_operator —
+ * …" made it indistinguishable from the operator's own BUILD ticket to
+ * blueprints/operator.md's title-prefix dispatch, so the intake ticket got
+ * routed into BUILD and skipped planning. Both backends call this so they can't
+ * drift apart again.
  */
 function intakeTicketTitle(def: WorkflowDef, title: string): string {
   const intakePhaseName = def.phases.find((p) => p.type === "app")?.name || "Intake";
