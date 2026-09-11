@@ -91,7 +91,8 @@ def test_install_phase_playwright_guard_survives():
     """TEAM-4462 F1's guard in the install phase is the pattern this fix mirrors --
     pin that it is still there so the two don't drift apart again."""
     install_block = _literal_block(
-        BUILDSPEC.read_text(encoding="utf-8"), "PLAYWRIGHT_BROWSERS_PATH"
+        BUILDSPEC.read_text(encoding="utf-8"),
+        'if [ -n "${PLAYWRIGHT_BROWSERS_PATH:-}" ]',
     )
     assert re.search(r"npx playwright install chromium\s*\|\|\s*\{[^}]*exit 1", install_block)
 
