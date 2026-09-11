@@ -88,6 +88,13 @@ jobs:
       - name: Deploy-surface manifest guard
         run: ./scripts/check-deploy-surfaces.sh
 
+      # Open-source repo: real account ids/ARNs/buckets must never be committed
+      # (they leaked via autonomous-pipeline PRs #371/#395/#535 into test
+      # fixtures + a doc + source comments). Fails on either real account id in
+      # any tracked file. See scripts/check-no-hardcoded-accounts.sh.
+      - name: Hardcoded-account guard
+        run: ./scripts/check-no-hardcoded-accounts.sh
+
       - name: Build
         run: npm run build
 
@@ -150,6 +157,7 @@ jobs:
           deploy/coding-agent-runtime/test_deps_provision.py
           deploy/coding-agent-runtime/test_deps_relink.py
           deploy/coding-agent-runtime/test_session_gc_unmarked.py
+          deploy/session-reaper/test_handler.py
           deploy/workflow-manager/toolkit
           deploy/pipeline/test_ecs_primary_container.py
           deploy/pipeline/test_plan_surfaces.py

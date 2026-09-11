@@ -55,6 +55,7 @@ export async function POST(
   );
   try {
     await warmCodingSession({
+      runtimeArn: session.runtimeArn,
       sessionId: session.sessionId,
       cli: session.cli,
       repo: session.repo,

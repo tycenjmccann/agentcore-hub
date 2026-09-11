@@ -78,6 +78,7 @@ export async function POST(
     if (session.resumeTranscriptKey) {
       const warmed = await Promise.race([
         warmCodingSession({
+          runtimeArn: session.runtimeArn,
           sessionId: session.sessionId,
           cli: session.cli,
           repo: session.repo,
@@ -100,6 +101,7 @@ export async function POST(
     } else {
       const prepared = await Promise.race([
         prepareCodingSession({
+          runtimeArn: session.runtimeArn,
           sessionId: session.sessionId,
           cli: session.cli,
           userId,
@@ -123,7 +125,8 @@ export async function POST(
   // A shell id is the reconnect handle for this PTY; one per attach is fine.
   const shellId = `sh-${params.id}`.slice(0, 60);
   const host = `bedrock-agentcore.${REGION}.amazonaws.com`;
-  const path = `/runtimes/${encodeURIComponent(RUNTIME_ARN)}/ws/shells`;
+  // The PTY must open on the runtime that holds this session's workspace.
+  const path = `/runtimes/${encodeURIComponent(session.runtimeArn || RUNTIME_ARN)}/ws/shells`;
 
   const signer = new SignatureV4({
     service: "bedrock-agentcore",
