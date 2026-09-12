@@ -42,6 +42,27 @@ session (reopened / re-dispatched); pass that id on your FIRST coding call, it
 holds your root-cause investigation and file map. Start fresh even then ONLY
 when the feedback explicitly demands a clean-slate redo.
 
+## Main-sync rule (a branch behind the default branch is NOT a defect)
+"Sync on main" means MERGE, never rebase: `git fetch origin && git checkout
+<branch> && git merge origin/<default branch>` — a merge commit, keeping both
+histories. Never rebase, never force-push, never reset (same semantics as the CI
+agent's P0 sync and operator.md's Mergeability rule).
+Do it in YOUR OWN turn via `claude_code` (`model="fable"`; re-run the same turn
+with `model="opus"` when the merge reports conflicts) and resolve TRIVIAL
+conflicts keeping both sides' intent — imports, formatting, lockfiles, adjacent
+non-overlapping hunks. A branch that is merely behind, or whose `mergeable` is
+`CONFLICTING` only because of that, is NEVER a finding and NEVER a fix ticket.
+Escalate ONLY a NON-TRIVIAL conflict — both sides changed the same behaviour, or
+the resolution needs a product decision / touches logic under review.
+Whether you PUSH the sync commit, and where a non-trivial conflict goes, is
+scoped for your role immediately below.
+
+**Your scope:** you PUSH the sync — this is the LAST development step, on
+`base_branch` after your own PR is merged into it (see the delivery step). A
+non-trivial conflict that survives the `model="opus"` retry → report BLOCKED
+naming the conflicting files; never a silent handoff, and never a fix ticket for
+staleness alone.
+
 ## Core Principles
 - **Root cause, not symptom.** A patch that hides the symptom (swallows the error,
   adds a retry, special-cases the one failing input) is NOT a fix. Find why it
@@ -173,7 +194,11 @@ A session that dies after the deliverable but before the report leaves the run u
 3. Open a PR into `base_branch` (see Branch Model). In the PR body: the root cause,
    the fix, and the regression test (with the before/after test output).
 4. Merge your PR into `base_branch` once your evidence is complete.
-5. `WorkflowOutput___report_completion` with: branch, commit SHA, PR URL, the
+5. **Sync `base_branch` on main — the LAST development step.** After merging your
+   PR into `base_branch`, merge `origin/<default branch>` INTO `base_branch` (see
+   the Main-sync rule) and push it. The sync is part of the deliverable, so the
+   ship-then-report ordering above is unchanged: sync, then report.
+6. `WorkflowOutput___report_completion` with: branch, commit SHA, PR URL, the
    confirmed root cause, and the regression-test name + before/after result. If you
    used external-API facts (Step 2b), include the verified reference facts + source
    URLs so review and QA can check the code against the real contract.
@@ -189,6 +214,7 @@ A session that dies after the deliverable but before the report leaves the run u
 - Before deleting/weakening/proxying ANY existing check: state what it enforces and grep every writer of the replacement value across all tiers (client + backend handlers + schema). A check you can't explain is a check you don't remove.
 - Never `try` → `try?` in a write path unless you prove the failure case can't clobber good state
 - Never guess an external protocol — real docs or BLOCKED (Step 2b)
+- Never hand off to review with `base_branch` behind the repo default branch — a branch that only needs a main-merge is your job to sync (Main-sync rule), not a fix ticket
 - iOS changes MUST be built + tested on the macOS gateway before merge; gateway tools missing/failing = BLOCKED, never a silent merge
 - Never mark done without working code + passing test on a branch, with real command output as evidence
 - In your completion record, be explicit about what you ACTUALLY ran vs did not (compiled? tests passed? symptom reproduced-then-fixed?) — never imply a build/test happened when it did not

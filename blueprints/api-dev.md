@@ -26,6 +26,27 @@ block** — THIS ticket's own session (reopened / re-dispatched); pass that id o
 your FIRST coding call. Start fresh even then ONLY when the feedback explicitly
 demands a clean-slate redo.
 
+## Main-sync rule (a branch behind the default branch is NOT a defect)
+"Sync on main" means MERGE, never rebase: `git fetch origin && git checkout
+<branch> && git merge origin/<default branch>` — a merge commit, keeping both
+histories. Never rebase, never force-push, never reset (same semantics as the CI
+agent's P0 sync and operator.md's Mergeability rule).
+Do it in YOUR OWN turn via `claude_code` (`model="fable"`; re-run the same turn
+with `model="opus"` when the merge reports conflicts) and resolve TRIVIAL
+conflicts keeping both sides' intent — imports, formatting, lockfiles, adjacent
+non-overlapping hunks. A branch that is merely behind, or whose `mergeable` is
+`CONFLICTING` only because of that, is NEVER a finding and NEVER a fix ticket.
+Escalate ONLY a NON-TRIVIAL conflict — both sides changed the same behaviour, or
+the resolution needs a product decision / touches logic under review.
+Whether you PUSH the sync commit, and where a non-trivial conflict goes, is
+scoped for your role immediately below.
+
+**Your scope:** you PUSH the sync — this is the LAST development step, on
+`base_branch` after your own PR is merged into it (see the delivery step). A
+non-trivial conflict that survives the `model="opus"` retry → report BLOCKED
+naming the conflicting files; never a silent handoff, and never a fix ticket for
+staleness alone.
+
 ## Process
 
 ### Step 1: Understand the Work
@@ -112,6 +133,10 @@ A session that dies after the deliverable but before the report leaves the run u
 - Verify all endpoints from design are implemented
 - Confirm tests pass
 - Open the PR **into base_branch** and merge it once tests pass (see Branch Model)
+- **Sync base_branch on main — LAST development step.** Once your PR is merged into
+  base_branch, merge `origin/<default branch>` INTO `base_branch` (see the Main-sync
+  rule) and push. The sync is part of the deliverable, so the ship-then-report
+  ordering above is unchanged: sync, then report.
 - `WorkflowOutput___report_completion` with branch name, PR URL, and summary.
   Include claude_code's `[coding-session: ...]` footer in your artifacts field.
 
@@ -141,6 +166,7 @@ Target 10–15 minutes of activity per turn. The hard cap is 60 minutes per `cla
 - Never `try` → `try?` (or swallow errors) in a write path unless you prove the failure case can't clobber good state
 - Performance work: measured before/after numbers (operation counts / latency) on the same scenario are mandatory evidence; tests assert the invariant (count/latency bound), never the implementation choice
 - Model tiers per `claude_code` call (`model=`): PLAN turns on `"opus"` (`"fable"` for ambiguous / architecture-heavy work); EXECUTE turns on `"sonnet"` for well-specified plans, `"opus"` for complex ones; `"haiku"` only for trivial mechanical edits. Never plan on haiku.
+- Never hand off to review with `base_branch` behind the repo default branch — a branch that only needs a main-merge is your job to sync (Main-sync rule), not a fix ticket
 - Never let `claude_code` write code before you have read and approved its plan (Step 2).
 - Always delegate to `claude_code`
 - If `claude_code` fails or times out, break the task smaller and retry
