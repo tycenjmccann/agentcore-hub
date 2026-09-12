@@ -562,6 +562,44 @@ export class PipelineStack extends Stack {
 
 // ── IAM helpers ────────────────────────────────────────────────────────────
 
+/**
+ * An explicit DENY on writing ship-approval records (TEAM-4525 review P1).
+ *
+ * The conditional deploy gate is only as strong as the claim "a record under
+ * pipeline-artifacts/ship-approvals/ was written by the tools Lambda after it
+ * verified CI + the GitHub merge binding". Every CodeBuild role in this pipeline
+ * otherwise has a broad enough PutObject grant to forge one — the Build role has
+ * `pipeline-artifacts/*`, the app Deploy role has the whole bucket — and the
+ * commands they run come from the source branch, i.e. from the very change under
+ * review. A forged record would let a build skip its own human approval.
+ *
+ * An explicit Deny beats every Allow in the same policy (and any bucket policy),
+ * so attaching this to all three roles makes the tools Lambda the only writer
+ * regardless of how the Allow statements are later widened.
+ *
+ * GetObject is deliberately NOT denied: both Deploy roles must still READ the
+ * record to re-verify it before touching prod (Sid ReadShipApprovalRecord).
+ */
+function denyShipApprovalWrites(artifactBucket: s3.IBucket): iam.PolicyStatement {
+  return new iam.PolicyStatement({
+    sid: "DenyShipApprovalRecordWrites",
+    effect: iam.Effect.DENY,
+    actions: [
+      "s3:PutObject",
+      "s3:PutObjectAcl",
+      "s3:PutObjectTagging",
+      "s3:DeleteObject",
+      "s3:DeleteObjectVersion",
+      "s3:DeleteObjectTagging",
+      "s3:AbortMultipartUpload",
+      "s3:RestoreObject",
+      "s3:ReplicateObject",
+      "s3:ReplicateDelete",
+    ],
+    resources: [`${artifactBucket.bucketArn}/pipeline-artifacts/ship-approvals/*`],
+  });
+}
+
 function grantBuildArtifactPerms(
   scope: Construct,
   role: iam.IRole,
@@ -621,6 +659,11 @@ function grantBuildArtifactPerms(
             `${ctx.artifactBucket.bucketArn}/config/*`,
           ],
         }),
+        // ...but NOT a ship-approval record: PutBuildArtifacts above covers that
+        // prefix, and this build runs source-controlled commands BEFORE
+        // DEPLOY_PREAPPROVED is decided, so without this Deny a change could write
+        // its own approval and skip its own human gate.
+        denyShipApprovalWrites(ctx.artifactBucket),
       ],
     })
   );
@@ -818,6 +861,11 @@ function grantDeployPerms(
   // then exits 2 so the release manager reports the human step (surfaces.json
   // "handoff").
 
+  // S3ConfigAndBlueprints grants PutObject on the WHOLE bucket, which includes the
+  // ship-approval prefix. Deny it explicitly: this role must READ a record to
+  // re-verify it (ReadShipApprovalRecord), never write one (TEAM-4525 review P1).
+  statements.push(denyShipApprovalWrites(ctx.artifactBucket));
+
   role.attachInlinePolicy(
     new iam.Policy(scope, "DeployPerms", { statements })
   );
@@ -940,6 +988,10 @@ function grantRuntimeImagePerms(
             `${ctx.artifactBucket.bucketArn}/pipeline-artifacts/ship-approvals/*`,
           ],
         }),
+        // Read to re-verify, never write. This role's AdvanceRuntimeBaseline grant
+        // is one key so it could not forge a record today, but the Deny keeps that
+        // true if the baseline grant is ever widened to a prefix.
+        denyShipApprovalWrites(ctx.artifactBucket),
       ],
     })
   );

@@ -351,6 +351,14 @@ phases:
       #
       # The full 40-hex sha becomes its own artifact: git-sha.txt stays 12 chars
       # because it is the image tag and the changed-files baseline.
+      #
+      # This project's role CANNOT write a ship-approval record: pipeline-stack.ts
+      # attaches an explicit DenyShipApprovalRecordWrites on
+      # pipeline-artifacts/ship-approvals/* to it (and to both Deploy roles), so no
+      # command in this buildspec -- which comes from the branch under review, and
+      # runs before DEPLOY_PREAPPROVED is decided -- can forge its own approval.
+      # Only the Pipeline___start_deploy tools Lambda writes records. Read-only
+      # access is intact, which is all `decide` needs.
       - |
         DEPLOY_PREAPPROVED=0
         export DEPLOY_PREAPPROVED

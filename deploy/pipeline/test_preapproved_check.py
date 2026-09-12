@@ -392,6 +392,34 @@ def test_both_deploy_actions_recheck_before_touching_prod(spec):
     assert pre < text.index("preapproved-check.sh gate") < build
 
 
+def test_no_codebuild_role_may_write_a_ship_approval_record():
+    """TEAM-4525 review P1: the gate is only as strong as "only the tools Lambda
+    writes records". The Build role has s3:PutObject on pipeline-artifacts/*, and
+    the app Deploy role has it on the whole bucket, so BOTH could forge one — and
+    the Build stage runs source-controlled commands before DEPLOY_PREAPPROVED is
+    even decided. An explicit Deny beats every Allow, so all three CodeBuild roles
+    carry one."""
+    src = STACK.read_text()
+    assert "denyShipApprovalWrites" in src
+    assert 'sid: "DenyShipApprovalRecordWrites"' in src
+    assert "effect: iam.Effect.DENY" in src
+    # Attached to the Build role, the app Deploy role and the runtime-image role.
+    assert src.count("denyShipApprovalWrites(ctx.artifactBucket)") == 3, (
+        "every CodeBuild role in this pipeline must carry the Deny — a role that "
+        "can write a record can skip its own human approval"
+    )
+    # The Deny covers writes but NOT GetObject: both Deploy actions must still be
+    # able to READ the record to re-verify it before touching prod.
+    deny = src[src.index('sid: "DenyShipApprovalRecordWrites"') :][:1200]
+    for action in ("s3:PutObject", "s3:DeleteObject", "s3:PutObjectAcl"):
+        assert action in deny, action
+    assert "s3:GetObject" not in deny.split("resources:")[0], (
+        "denying GetObject would break the Deploy stage's own re-verification"
+    )
+    # Scoped to exactly the one prefix — a bucket-wide Deny would break the build.
+    assert "pipeline-artifacts/ship-approvals/*" in deny
+
+
 def test_both_deploy_actions_receive_the_variable():
     src = STACK.read_text()
     assert src.count('DEPLOY_PREAPPROVED: {') == 2, (

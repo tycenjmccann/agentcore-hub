@@ -52,9 +52,14 @@ next increment.
 ### The deploy gate is skipped only for an already-approved SHA
 
 The `Approve_deploy` ManualApproval is a **conditional** stage. When the release
-manager passes `approved_head_sha` to `Pipeline___start_deploy`, and CI certifies
-that SHA, the tools Lambda first writes a ship-approval record to
+manager passes `approved_head_sha` and `pr_url` to `Pipeline___start_deploy`, CI
+certifies that SHA, **and** the GitHub API confirms that the PR is merged with
+`head.sha == approved_head_sha` and `merge_commit_sha == commit_sha`, the tools
+Lambda writes a ship-approval record to
 `s3://$ARTIFACT_BUCKET/pipeline-artifacts/ship-approvals/<merge_commit>.json`.
+That last check is what binds the commit being deployed to the head SHA a human
+actually approved; it needs a read-only `GITHUB_TOKEN` on the tools Lambda, and
+with no token no record can be written, so every deploy keeps its human gate.
 `preapproved-check.sh` is the only reader: `decide <full-sha>` runs in the Build
 stage and prints `1` (exported as `DEPLOY_PREAPPROVED`) only when the record for
 that exact commit exists, parses and matches it — every other outcome prints `0`
@@ -70,7 +75,19 @@ Telegram ping — that is expected, not a broken bridge. **To force the gate bac
 for one run, simply do not pass `approved_head_sha`** to `Pipeline___start_deploy`
 (the tool returns `preapproval:{recorded:false, reason:"approved_head_sha_missing"}`,
 writes no record, and the human gate fires). There is no flag to unset: no record
-means no skip.
+means no skip. The other refusal reasons are `invalid_sha`, `ci_not_certified`,
+`pr_url_missing`, `pr_url_invalid`, `merge_binding_mismatch` (GitHub disagrees
+with the claimed head/merge commit) and `merge_binding_unverified` (no token, or
+GitHub unreachable) — each starts the pipeline and pages the human.
+
+**The tools Lambda is the only thing that may write a record.** Every CodeBuild
+role in this stack carries an explicit `DenyShipApprovalRecordWrites` statement on
+`pipeline-artifacts/ship-approvals/*` (an explicit Deny beats every Allow), because
+the Build stage runs commands from the branch under review *before*
+`DEPLOY_PREAPPROVED` is decided — without the Deny, its broad
+`pipeline-artifacts/*` PutObject grant would let a change forge its own approval.
+`GetObject` stays allowed so the Deploy stage can still re-verify. If you widen a
+CodeBuild role's S3 grant, do not remove that Deny.
 
 ## Files
 
