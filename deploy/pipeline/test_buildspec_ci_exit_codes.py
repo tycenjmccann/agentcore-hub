@@ -208,7 +208,9 @@ _GUARDED_COMMANDS = [
     (r"\( cd lambda/orchestrator && npm ci --omit=dev \)", "orchestrator npm ci"),
     (r"\( cd lambda/orchestrator && zip -rq /tmp/orchestrator\.zip \$ZIP_ARGS \)", "orchestrator zip"),
     (r"bash scripts/check-lambda-zip-manifest\.sh --zip /tmp/orchestrator\.zip", "orchestrator zip manifest check"),
-    (r'docker login --username AWS --password-stdin "\$\{ACCOUNT_ID\}[^"]*"', "ECR docker login"),
+    # TEAM-4493 wrapped this pipe in `( set -o pipefail; ... )`, so the guard now hangs
+    # off the subshell's closing paren -- the `\)` is load-bearing, not cosmetic.
+    (r'docker login --username AWS --password-stdin "\$\{ACCOUNT_ID\}[^"]*"\s*\)', "ECR docker login"),
     (r"cp src/config/agents\.json /tmp/agents\.git\.json", "agents.json git backup"),
     (r"python3 deploy/pipeline/merge-agents-json\.py \S+ \S+ \S+", "agents.json roster merge"),
     (r"cp /tmp/agents\.merged\.json src/config/agents\.json", "agents.json merged install"),
@@ -220,6 +222,8 @@ _GUARDED_COMMANDS = [
     (r"git diff --name-only \"\$\{LAST_DEPLOYED\}\.\.HEAD\" > pipeline-out/changed-files\.txt", "changed-files.txt git diff"),
     (r"git diff --name-only \"\$\{LAST_RT\}\.\.HEAD\" > pipeline-out/changed-files-runtime\.txt", "changed-files-runtime.txt git diff"),
     (r"cp /tmp/agents\.git\.json src/config/agents\.json", "agents.json git roster restore"),
+    (r'echo "deploy/runtime-agent/FORCE-UNKNOWN-RANGE" > pipeline-out/changed-files\.txt', "changed-files.txt fallback write"),
+    (r'echo "deploy/runtime-agent/FORCE-UNKNOWN-RANGE" > pipeline-out/changed-files-runtime\.txt', "changed-files-runtime.txt fallback write"),
 ]
 
 
@@ -245,6 +249,24 @@ def test_build_image_block_does_not_use_set_e():
     block = _build_image_block()
     assert "set -e" not in block
     assert "set -o errexit" not in block
+
+
+def test_ecr_login_pipe_uses_a_scoped_pipefail_subshell():
+    """TEAM-4493: without pipefail the `||` guard sees only `docker login`'s status, so a
+    failed `aws ecr get-login-password` was masked. The pipefail must be scoped to that ONE
+    pipe -- a block-wide `set -o pipefail` (like `set -e`) would change the semantics of
+    every later command in CodeBuild's single shared shell."""
+    block = _build_image_block()
+    assert re.search(
+        r"\(\s*set -o pipefail;\s*aws ecr get-login-password[\s\S]*?"
+        r'docker login --username AWS --password-stdin "\$\{ACCOUNT_ID\}[^"]*"\s*\)'
+        r"\s*(\\\n\s*)?\|\|\s*\{[^}]*exit 1[^}]*\}",
+        block,
+    ), f"the ECR login pipe must be `( set -o pipefail; ... ) || {{ ... exit 1; }}`:\n{block}"
+    # scoped, not block-wide: the only `set -o` in the block is the one inside that subshell
+    assert block.count("set -o pipefail") == 1, "no second/block-wide `set -o pipefail`"
+    assert not re.search(r"^\s*set -o pipefail", block, re.M), \
+        "`set -o pipefail` must not stand on its own line (that would be block-wide)"
 
 
 def test_build_image_block_dockerd_bootstrap_guard_survives():
@@ -290,15 +312,22 @@ esac
 _STUB_AWS = """#!/usr/bin/env bash
 case "$1$2" in
   stsget-caller-identity) echo 123456789012 ;;
-  ecrget-login-password) echo stub-token ;;
+  # TEAM-4493: rc!=0 prints NOTHING and fails, like a real credential failure. The
+  # `docker` stub still exits 0, so only pipefail can surface this.
+  ecrget-login-password)
+    if [ "${AWS_ECR_LOGIN_STUB_RC:-0}" != "0" ]; then exit "${AWS_ECR_LOGIN_STUB_RC}"; fi
+    echo stub-token ;;
   ecrdescribe-images) echo sha256:abc ;;
-  s3cp) if [ "$4" = "-" ]; then echo 1111111111111111111111111111111111111111; fi ;;
+  # TEAM-4493: LAST_DEPLOYED_STUB_EMPTY=1 blanks BOTH `aws s3 cp ... -` baseline reads,
+  # so both `if/else` fallbacks take their sentinel-write else branch.
+  s3cp) if [ "$4" = "-" ] && [ "${LAST_DEPLOYED_STUB_EMPTY:-0}" != "1" ]; then echo 1111111111111111111111111111111111111111; fi ;;
 esac
 exit 0
 """
 
 
-def _run_build_image_block(tmp_path, manifest_rc=0, zip_rc=0):
+def _run_build_image_block(tmp_path, manifest_rc=0, zip_rc=0, ecr_login_rc=0,
+                            last_deployed_empty=False, sentinel_path=None):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     for name, content in (
@@ -324,6 +353,14 @@ def _run_build_image_block(tmp_path, manifest_rc=0, zip_rc=0):
         .replace("/tmp/", f"{tmp_path}/")
         .replace("scripts/check-lambda-zip-manifest.sh", str(manifest_stub))
     )
+    # TEAM-4493: must come AFTER the "/tmp/" rewrite above -- tmp_path itself typically
+    # lives under /tmp, so doing this first would mangle the injected sentinel_path the
+    # same way it would mangle the manifest-stub path (same reason that replace is last).
+    if sentinel_path:
+        block = block.replace(
+            '"deploy/runtime-agent/FORCE-UNKNOWN-RANGE" > pipeline-out/changed-files.txt',
+            f'"deploy/runtime-agent/FORCE-UNKNOWN-RANGE" > {sentinel_path}',
+        )
 
     env = dict(
         os.environ,
@@ -336,6 +373,10 @@ def _run_build_image_block(tmp_path, manifest_rc=0, zip_rc=0):
     env.pop("CODEBUILD_RESOLVED_SOURCE_VERSION", None)
     if zip_rc:
         env["ZIP_STUB_RC"] = str(zip_rc)
+    if ecr_login_rc:
+        env["AWS_ECR_LOGIN_STUB_RC"] = str(ecr_login_rc)
+    if last_deployed_empty:
+        env["LAST_DEPLOYED_STUB_EMPTY"] = "1"
     return subprocess.run(
         ["bash", "-c", block], capture_output=True, text=True, env=env, cwd=str(tmp_path)
     )
@@ -362,3 +403,36 @@ def test_build_image_block_propagates_a_failing_zip(tmp_path):
     proc = _run_build_image_block(tmp_path, zip_rc=1)
     assert proc.returncode != 0, proc.stderr + proc.stdout
     assert "orchestrator zip FAILED" in proc.stdout
+
+
+def test_build_image_block_fails_when_ecr_get_login_password_fails(tmp_path):
+    """The TEAM-4493 regression test. The `docker` stub exits 0, so on the PRE-change
+    buildspec (no pipefail) the pipeline status is docker's 0, the `||` guard never fires
+    and the block exits 0 -- a credential failure behind a green Build."""
+    proc = _run_build_image_block(tmp_path, ecr_login_rc=1)
+    assert proc.returncode != 0, proc.stderr + proc.stdout
+    assert "ECR docker login FAILED" in proc.stdout
+
+
+def test_build_image_block_fails_when_the_sentinel_fallback_write_fails(tmp_path):
+    """A nonexistent PARENT dir fails the redirect for root too -- CodeBuild runs as root,
+    so a read-only dir would not fail there."""
+    proc = _run_build_image_block(
+        tmp_path, last_deployed_empty=True,
+        sentinel_path=tmp_path / "no-such-dir" / "changed-files.txt",
+    )
+    assert proc.returncode != 0, proc.stderr + proc.stdout
+    assert "changed-files.txt fallback write FAILED" in proc.stdout
+
+
+def test_build_image_block_writes_the_sentinel_on_an_unknown_range(tmp_path):
+    """Control for the test above: same else branch, writable path -> exits 0 and the
+    conservative sentinel really lands (plan-surfaces.py reads a MISSING file as [], i.e.
+    app-only deploy, so a silent write failure under-scopes the deploy)."""
+    sentinel = tmp_path / "sentinel-changed-files.txt"
+    proc = _run_build_image_block(tmp_path, last_deployed_empty=True, sentinel_path=sentinel)
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert sentinel.read_text().strip() == "deploy/runtime-agent/FORCE-UNKNOWN-RANGE"
+    # the runtime sentinel took its else branch too and landed at the real relative path
+    assert (tmp_path / "pipeline-out" / "changed-files-runtime.txt").read_text().strip() \
+        == "deploy/runtime-agent/FORCE-UNKNOWN-RANGE"
