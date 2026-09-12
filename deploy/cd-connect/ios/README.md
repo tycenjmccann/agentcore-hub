@@ -5,6 +5,10 @@ build + sign the app, push it to TestFlight, then — after a human approves —
 submit it to App Store review. macOS CodeBuild (MAC_ARM). Independent of the
 backend pipeline; a run can trigger either or both.
 
+> **First time? Read [ONBOARDING.md](ONBOARDING.md) first.** It has the working
+> keychain-free signing recipe and every trap we hit onboarding the first app
+> (Brush Up). Skipping it costs about a day on the signing step alone.
+
 Flow: **Source → Build** (archive + sign + export IPA + TestFlight upload,
 automatic) **→ Approval** (human "submit to App Store" gate) **→ Deploy** (submit
 the uploaded build to review). The hub cannot pass the gate — like every deploy
@@ -18,7 +22,11 @@ gate, it is human-only.
 
 - **Apple Developer account** with an App Store Connect app record for the bundle id.
 - **App Store Connect API key** (.p8) — Users and Access → Keys → App Manager
-  role. Preferred over an Apple ID (no 2FA in CI).
+  role. Preferred over an Apple ID (no 2FA in CI). Used for BOTH the TestFlight
+  upload and the App Store submit.
+- **A distribution certificate + App Store provisioning profile** for the bundle
+  id (make a dedicated CI cert you can revoke independently). Both can be created
+  via the ASC API.
 - **A MAC_ARM reserved CodeBuild fleet.** macOS has no on-demand compute. Pass an
   existing fleet ARN (e.g. the one already backing your iOS test builds) as
   `ExistingMacFleetArn`, or leave it blank to have the stack create a small one.
@@ -30,31 +38,37 @@ Never in the repo, the registry, or any agent prompt. Under one path prefix (the
 
 | Secret | Contents |
 |---|---|
-| `<path>/dist-cert-p12` | base64 of the distribution cert `.p12` |
-| `<path>/dist-cert-password` | the `.p12` password |
+| `<path>/dist-cert-pem` | distribution **cert + private key as one PEM** (what the build reads) |
 | `<path>/provisioning-profile` | base64 of the `.mobileprovision` (App Store profile) |
 | `<path>/asc-api-key-p8` | the App Store Connect API key `.p8` |
 | `<path>/asc-key-id`, `<path>/asc-issuer-id` | the key's ID + issuer ID |
 
+`rcodesign` reads a cert+key PEM, not a `.p12`. Convert once, on a Mac, with the
+system **LibreSSL** — OpenSSL 3 silently reads "0 keys" from legacy `.p12` files
+(see ONBOARDING.md Gotcha #2):
+
 ```bash
-aws secretsmanager create-secret --name hub-<slug>-ios/dist-cert-p12 \
-  --secret-string "$(base64 -i dist.p12)" --region <your-region>
-# ...repeat for each key above...
+/usr/bin/openssl pkcs12 -in dist.p12 -passin pass:'<pw>' -nodes -out dist.pem  # cert+key+WWDR
+aws secretsmanager create-secret --name hub-<slug>-ios/dist-cert-pem \
+  --secret-string file://dist.pem --region <your-region>
+# ...repeat (raw, no base64) for asc-api-key-p8, asc-key-id, asc-issuer-id;
+#    provisioning-profile is base64 of the .mobileprovision ...
 ```
 
 Pass `SigningSecretsPath=arn:aws:secretsmanager:<region>:<account>:secret:hub-<slug>-ios/*`
 so the build/deploy roles get `GetSecretValue` on exactly these secrets.
 
-## 2. Commit the buildspecs + ExportOptions.plist
+## 2. Commit the buildspecs
 
 At `.hub/`:
 - `.hub/buildspec-ios-ci.yml`     (from `buildspec-ios-ci.example.yml`) — build + XCTest, no signing
-- `.hub/buildspec-ios-build.yml`  (from `buildspec-ios-build.example.yml`) — archive + sign + TestFlight
+- `.hub/buildspec-ios-build.yml`  (from `buildspec-ios-build.example.yml`) — archive UNSIGNED + rcodesign + TestFlight
 - `.hub/buildspec-ios-deploy.yml` (from `buildspec-ios-deploy.example.yml`) — App Store submit
-- `.hub/ExportOptions.plist` — your `app-store` export options (method, team id, signing).
 
-Fill in your scheme/project, bundle id, and secret path prefix. The examples show
-the keychain + upload + submit shape.
+Fill in your workspace/scheme, bundle id, and secret path prefix. **No
+`ExportOptions.plist` is needed** — the build signs keychain-free with rcodesign
+and uploads with altool (see ONBOARDING.md for why the keychain path fails on the
+shared fleet).
 
 ## 3. Pipeline
 

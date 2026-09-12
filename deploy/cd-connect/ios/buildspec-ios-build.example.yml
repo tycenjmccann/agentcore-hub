@@ -1,58 +1,124 @@
 # .hub/buildspec-ios-build.yml — Build stage for hub-<slug>-ios-build (macOS).
-# On start_deploy: archive + sign the app, export a signed IPA, and upload it to
-# TestFlight (App Store Connect processes it automatically — NO gate here). The
-# human gate is the NEXT stage (App Store submit). Everything secret is pulled
-# from Secrets Manager at build time and NEVER written to the repo or logs.
+# On start_deploy: archive the app UNSIGNED, sign the .app with rcodesign
+# (keychain-free), package an IPA, and upload it to TestFlight with altool
+# (App Store Connect processes it automatically — NO gate here). The human gate
+# is the NEXT stage (App Store submit). Everything secret is pulled from Secrets
+# Manager at build time and NEVER written to the repo or logs.
 #
-# Secrets (from SigningSecretsPath, LLM-blind):
-#   <path>/dist-cert-p12        base64 .p12 distribution cert
-#   <path>/dist-cert-password   its password
-#   <path>/provisioning-profile base64 .mobileprovision
-#   <path>/asc-api-key-p8       App Store Connect API key (.p8)
+# WHY keychain-free (read ONBOARDING.md before editing): the hub's shared reserved
+# Mac fleet boots with no login/default keychain and no securityd/GUI session, so
+# `security import` of a private key is ALWAYS refused ("User interaction is not
+# allowed") — even with -A/-T and via fastlane setup_ci. rcodesign signs straight
+# from a cert+key PEM and altool uploads with the ASC API key; neither needs a
+# keychain. If your build runs on a DEDICATED fleet with a login session, the old
+# keychain+exportArchive path also works, but keychain-free works everywhere.
+#
+# WHY unsigned archive: xcodebuild signing overrides are global and the SPM
+# dependencies reject a distribution identity, while automatic signing wants a
+# development cert you should not ship to CI. Sign the built .app instead.
+#
+# Secrets (from SigningSecretsPath, LLM-blind, never logged):
+#   <path>/dist-cert-pem        cert + private key as ONE PEM (see ONBOARDING.md;
+#                               convert a legacy .p12 with LibreSSL `pkcs12 -nodes`)
+#   <path>/provisioning-profile base64 .mobileprovision (App Store profile)
+#   <path>/asc-api-key-p8       App Store Connect API key (.p8, App Manager)
 #   <path>/asc-key-id  <path>/asc-issuer-id
+# Build number = UTC yymmddHHMM (unique + increasing without touching the project).
 version: 0.2
 env:
   variables:
-    SIGNING_SECRETS_PATH: ""   # set by the pipeline env or hardcode your path prefix
+    SIGNING_SECRETS_PATH: ""              # set by the pipeline env or hardcode your path prefix
+    WORKSPACE: MyApp.xcworkspace          # or use -project MyApp.xcodeproj below
+    SCHEME: MyApp
+    APP_NAME: MyApp                        # the .app/.ipa base name (the archived product)
+    # Pin a release; macos-universal runs on the MAC_ARM fleet.
+    RCODESIGN_URL: https://github.com/indygreg/apple-platform-rs/releases/download/apple-codesign/0.29.0/apple-codesign-0.29.0-macos-universal.tar.gz
 phases:
   install:
     commands:
+      - export LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
       - xcodebuild -version
+      - |
+        # Install the keychain-free signer to a dir on the default PATH so the
+        # build phase (a fresh shell) sees it too. Fail fast on a bad download.
+        set -euo pipefail
+        curl -fSL --retry 3 -o /tmp/rcodesign.tar.gz "$RCODESIGN_URL"
+        mkdir -p /tmp/rc && tar xzf /tmp/rcodesign.tar.gz -C /tmp/rc
+        RC=$(find /tmp/rc -type f -name rcodesign -print -quit)
+        test -n "$RC" || { echo "rcodesign binary not found after extract"; exit 1; }
+        sudo install -m 0755 "$RC" /usr/local/bin/rcodesign
+        rcodesign --version
   pre_build:
     commands:
       - set -euo pipefail
-      - echo "== load signing material into a throwaway keychain =="
-      # - KDIR=$(mktemp -d); KEYCHAIN=$KDIR/build.keychain; KPW=$(uuidgen)
-      # - security create-keychain -p "$KPW" "$KEYCHAIN"; security set-keychain-settings -lut 3600 "$KEYCHAIN"
-      # - security unlock-keychain -p "$KPW" "$KEYCHAIN"; security list-keychains -d user -s "$KEYCHAIN"
-      # - aws secretsmanager get-secret-value --secret-id "$SIGNING_SECRETS_PATH/dist-cert-p12" --query SecretString --output text | base64 -d > "$KDIR/cert.p12"
-      # - CERTPW=$(aws secretsmanager get-secret-value --secret-id "$SIGNING_SECRETS_PATH/dist-cert-password" --query SecretString --output text)
-      # - security import "$KDIR/cert.p12" -k "$KEYCHAIN" -P "$CERTPW" -T /usr/bin/codesign
-      # - security set-key-partition-list -S apple-tool:,apple: -s -k "$KPW" "$KEYCHAIN"
-      # - aws secretsmanager get-secret-value --secret-id "$SIGNING_SECRETS_PATH/provisioning-profile" --query SecretString --output text | base64 -d > "$KDIR/pp.mobileprovision"
-      # - mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles && cp "$KDIR/pp.mobileprovision" ~/Library/MobileDevice/Provisioning\ Profiles/
+      # The shared fleet exports stale RCODESIGN_* env vars (a remote-sign config
+      # from another job) that rcodesign merges in and `-C /dev/null` cannot
+      # override. Clear them so only our CLI flags drive signing. Env persists
+      # across phases in CodeBuild, so this holds through the build phase too.
+      - |
+        for v in $(env | sed -nE 's/^(RCODESIGN_[A-Za-z0-9_]*)=.*/\1/p'); do unset "$v"; done; true
+      - KDIR=$(mktemp -d)
+      - echo "== fetch signing material (LLM-blind, from Secrets Manager) =="
+      - aws secretsmanager get-secret-value --secret-id "$SIGNING_SECRETS_PATH/dist-cert-pem" --query SecretString --output text > "$KDIR/dist.pem"
+      - aws secretsmanager get-secret-value --secret-id "$SIGNING_SECRETS_PATH/provisioning-profile" --query SecretString --output text | base64 -d > "$KDIR/pp.mobileprovision"
+      # Distribution entitlements come FROM the profile (application-identifier,
+      # team-identifier, get-task-allow=false, beta-reports-active, keychain groups).
+      - security cms -D -i "$KDIR/pp.mobileprovision" -o "$KDIR/profile.plist"
+      - plutil -extract Entitlements xml1 -o "$KDIR/entitlements.plist" "$KDIR/profile.plist"
+      - |
+        echo "signing cert:"; rcodesign -C /dev/null analyze-certificate --pem-source "$KDIR/dist.pem" 2>&1 | grep "Subject CN" | head -1 || true
+      - aws secretsmanager get-secret-value --secret-id "$SIGNING_SECRETS_PATH/asc-api-key-p8" --query SecretString --output text > "$KDIR/asc.p8"
+      - ASC_KEY_ID=$(aws secretsmanager get-secret-value --secret-id "$SIGNING_SECRETS_PATH/asc-key-id" --query SecretString --output text)
+      - ASC_ISSUER_ID=$(aws secretsmanager get-secret-value --secret-id "$SIGNING_SECRETS_PATH/asc-issuer-id" --query SecretString --output text)
+      # altool with an API key reads the .p8 from ~/.appstoreconnect/private_keys.
+      - mkdir -p "$HOME/.appstoreconnect/private_keys"
+      - cp "$KDIR/asc.p8" "$HOME/.appstoreconnect/private_keys/AuthKey_$ASC_KEY_ID.p8"
+      - BUILD_NO=$(date -u +%y%m%d%H%M)
+      - echo "== build $BUILD_NO from ${CODEBUILD_RESOLVED_SOURCE_VERSION:-unknown} =="
   build:
     commands:
       - set -euo pipefail
-      - echo "== archive + export signed IPA =="
-      # - xcodebuild archive -project MyApp.xcodeproj -scheme MyApp \
-      #     -archivePath "$CODEBUILD_SRC_DIR/build/MyApp.xcarchive" \
-      #     -destination 'generic/platform=iOS' | xcpretty
-      # - xcodebuild -exportArchive -archivePath "$CODEBUILD_SRC_DIR/build/MyApp.xcarchive" \
-      #     -exportOptionsPlist .hub/ExportOptions.plist -exportPath "$CODEBUILD_SRC_DIR/build/export" | xcpretty
+      - mkdir -p build
+      - echo "== archive (unsigned; rcodesign signs afterward) =="
+      - |
+        xcodebuild -workspace "$WORKSPACE" -scheme "$SCHEME" -configuration Release \
+          -destination 'generic/platform=iOS' -archivePath "build/$APP_NAME.xcarchive" archive \
+          CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+          CURRENT_PROJECT_VERSION="$BUILD_NO" > build/archive.log 2>&1 \
+          || { grep -E "error:|error " build/archive.log | tail -40; exit 1; }
+      - APP="build/$APP_NAME.xcarchive/Products/Applications/$APP_NAME.app"
+      - echo "bundle $(plutil -extract CFBundleShortVersionString raw -o - "$APP/Info.plist") ($(plutil -extract CFBundleVersion raw -o - "$APP/Info.plist"))"
+      - echo "== sign (keychain-free, rcodesign) =="
+      # There is no --provisioning-profile flag; embed the profile in the bundle.
+      - cp "$KDIR/pp.mobileprovision" "$APP/embedded.mobileprovision"
+      - |
+        # Re-clear RCODESIGN_* in case the build shell re-sourced them, then sign.
+        # rcodesign signs the main binary AND every nested framework/bundle.
+        for v in $(env | sed -nE 's/^(RCODESIGN_[A-Za-z0-9_]*)=.*/\1/p'); do unset "$v"; done
+        rcodesign -C /dev/null sign --pem-source "$KDIR/dist.pem" -e "$KDIR/entitlements.plist" "$APP"
+      - |
+        codesign -dvvv "$APP" 2>&1 | grep -E 'Authority=Apple Distribution|TeamIdentifier=' \
+          || { echo "rcodesign did not produce a distribution signature - aborting"; exit 1; }
+      - echo "== package IPA =="
+      - rm -rf build/ipa && mkdir -p build/ipa/Payload
+      - cp -R "$APP" build/ipa/Payload/
+      - |
+        (cd build/ipa && zip -qry "../$APP_NAME.ipa" Payload)
+      - echo "== upload to TestFlight (altool + ASC API key, no keychain) =="
+      - |
+        xcrun altool --upload-app -f "build/$APP_NAME.ipa" -t ios \
+          --apiKey "$ASC_KEY_ID" --apiIssuer "$ASC_ISSUER_ID" > build/upload.log 2>&1 \
+          || { tail -40 build/upload.log; exit 1; }
+      - tail -5 build/upload.log
+      - printf '{"build":"%s","commit":"%s","uploaded":true}\n' "$BUILD_NO" "${CODEBUILD_RESOLVED_SOURCE_VERSION:-}" > build-meta.json
+      - cat build-meta.json
   post_build:
     commands:
-      - set -euo pipefail
-      - echo "== upload to TestFlight (automatic; NOT the App Store submit) =="
-      # Use the App Store Connect API key so no Apple ID password is needed.
-      # - aws secretsmanager get-secret-value --secret-id "$SIGNING_SECRETS_PATH/asc-api-key-p8" --query SecretString --output text > "$KDIR/asc.p8"
-      # - KEY_ID=$(aws secretsmanager get-secret-value --secret-id "$SIGNING_SECRETS_PATH/asc-key-id" --query SecretString --output text)
-      # - ISSUER=$(aws secretsmanager get-secret-value --secret-id "$SIGNING_SECRETS_PATH/asc-issuer-id" --query SecretString --output text)
-      # - xcrun altool --upload-app -f "$CODEBUILD_SRC_DIR/build/export/MyApp.ipa" -t ios \
-      #     --apiKey "$KEY_ID" --apiIssuer "$ISSUER"
-      - echo "{\"uploaded\":true}" > build-meta.json
-      - echo "== scrub secrets =="
-      # - security delete-keychain "$KEYCHAIN" || true; rm -rf "$KDIR"
+      - echo "== scrub signing material from the shared fleet =="
+      - rm -rf "${KDIR:-/nonexistent}" "$HOME/.appstoreconnect/private_keys" 2>/dev/null || true
 artifacts:
   files:
-    - "**/*"        # pass source + build-meta.json to Deploy
+    - build-meta.json          # hand the build number to the Deploy stage
+    # add your appstore submit scripts / release notes here, e.g.:
+    # - appstore/scripts/**/*
+    # - appstore/release-notes/**/*
