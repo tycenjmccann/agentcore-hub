@@ -819,3 +819,43 @@ describe("create_ticket / edit_issue — summary clamp (TEAM-4537)", () => {
     expect(res.fields.summary).toBe(EXPECTED_CLAMPED_LONG_TITLE);
   });
 });
+
+// ─── TEAM-4537 review P2: surrogate-safe clamp (mirrors the Jira Lambda) ───────
+//
+// The two clampSummary() copies are byte-identical (proven by a diff in CI), so
+// this suite mirrors the Jira Lambda's astral + 255/256 boundary cases here to
+// catch a one-sided edit that only fixes one twin.
+describe("create_ticket / edit_issue — surrogate-safe clamp (TEAM-4537)", () => {
+  const ASTRAL_TITLE = "x" + "😀".repeat(128);                    // 257 code units, cut falls mid-pair
+  const EXPECTED_CLAMPED_ASTRAL = "x" + "😀".repeat(126) + "…";  // 254 code units, whole code points only
+  const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+
+  it("create_ticket clamps an emoji title without splitting a surrogate pair", async () => {
+    const res = await create({ summary: ASTRAL_TITLE, description: "full text" });
+
+    const item = h.state.puts[0];
+    expect(item.title.length).toBeLessThanOrEqual(255);
+    expect(item.title).toBe(EXPECTED_CLAMPED_ASTRAL);
+    expect(LONE_SURROGATE.test(item.title)).toBe(false);
+    expect(res.ticket.summary).toBe(EXPECTED_CLAMPED_ASTRAL);
+  });
+
+  it("edit_issue clamps an emoji title without splitting a surrogate pair", async () => {
+    h.state.items["TEAM-904"] = { ticketId: "TEAM-904", title: "old", status: "todo", priority: "Medium" };
+
+    await edit({ ticket_id: "TEAM-904", summary: ASTRAL_TITLE });
+
+    const written = h.state.editUpdates[0].ExpressionAttributeValues[":t"];
+    expect(written).toBe(EXPECTED_CLAMPED_ASTRAL);
+    expect(LONE_SURROGATE.test(written)).toBe(false);
+  });
+
+  it("a summary of exactly 255 chars is stored untouched; 256 is clamped", async () => {
+    await create({ summary: "A".repeat(255) });
+    expect(h.state.puts[0].title).toBe("A".repeat(255));
+
+    await create({ summary: "A".repeat(256) });
+    expect(h.state.puts[1].title).toBe("A".repeat(254) + "…");
+    expect(h.state.puts[1].title.length).toBe(255);
+  });
+});

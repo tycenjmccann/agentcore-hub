@@ -318,7 +318,11 @@ async function listReviewers(params = {}) {
  */
 export function clampSummary(s) {
   if (typeof s !== "string" || s.length <= 255) return s;
-  const cut = s.slice(0, 254);
+  let cut = s.slice(0, 254);
+  // Slicing by UTF-16 code units can land inside a surrogate pair (emoji, astral
+  // CJK) and leave a lone high surrogate — a visibly corrupted summary. Back up
+  // one code unit so the cut always falls on a whole code point.
+  if (/[\uD800-\uDBFF]$/.test(cut)) cut = cut.slice(0, -1);
   const lastSpace = cut.lastIndexOf(" ");
   const trimmed = lastSpace >= 200 ? cut.slice(0, lastSpace) : cut;
   return trimmed.trimEnd() + "…";

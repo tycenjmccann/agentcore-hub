@@ -1082,3 +1082,60 @@ test("updateTicket: a >255-char title is clamped on the PUT", async () => {
     globalThis.fetch = originalFetch;
   }
 });
+
+// ─── TEAM-4537 review P2: the clamp must never split a surrogate pair ──────────
+//
+// slice() counts UTF-16 code units, so cutting at 254 can land between the high
+// and low surrogate of an astral character (emoji, astral CJK) and ship a lone
+// high surrogate to Jira — the length passes but the visible title is corrupted.
+// Table-driven so every boundary the rule has is pinned in one place.
+
+const ASTRAL_TITLE = "x" + "😀".repeat(128);                    // 257 code units, cut falls mid-pair
+const EXPECTED_CLAMPED_ASTRAL = "x" + "😀".repeat(126) + "…";  // 254 code units, whole code points only
+
+const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+
+const CLAMP_CASES = [
+  { name: "exactly 255 chars passes through untouched", input: "A".repeat(255), expected: "A".repeat(255) },
+  { name: "256 chars is clamped", input: "A".repeat(256), expected: "A".repeat(254) + "…" },
+  { name: "no whitespace anywhere still clamps (hard cut, 200-char floor)", input: "A".repeat(300), expected: "A".repeat(254) + "…" },
+  // Last space sits at index 150, below the 200 floor → hard cut, not a word cut.
+  { name: "last space before the 200 floor falls back to a hard cut", input: "A".repeat(150) + " " + "B".repeat(200), expected: "A".repeat(150) + " " + "B".repeat(103) + "…" },
+  { name: "space at exactly the 200 floor is used as the word boundary", input: "A".repeat(200) + " " + "B".repeat(200), expected: "A".repeat(200) + "…" },
+  { name: "runs of spaces before the cut leave no trailing whitespace", input: "A".repeat(240) + "   " + "B".repeat(100), expected: "A".repeat(240) + "…" },
+  // lastIndexOf(" ") does not match tab/newline, so this is a hard cut; trimEnd
+  // still guarantees no trailing whitespace whichever branch ran.
+  { name: "tab/newline before the cut still yields no trailing whitespace", input: "A".repeat(240) + "\t\n" + "B".repeat(100), expected: "A".repeat(240) + "\t\n" + "B".repeat(12) + "…" },
+  { name: "astral boundary: never emits a lone surrogate", input: ASTRAL_TITLE, expected: EXPECTED_CLAMPED_ASTRAL },
+];
+
+for (const c of CLAMP_CASES) {
+  test(`clampSummary: ${c.name}`, () => {
+    const out = clampSummary(c.input);
+    assert.equal(out, c.expected);
+    assert.ok(out.length <= 255, `must be <=255 code units, got ${out.length}`);
+    assert.ok(!LONE_SURROGATE.test(out), "must not contain an unpaired surrogate");
+    if (out !== c.input) assert.ok(/\S$/.test(out), "must not end in whitespace");
+  });
+}
+
+test("createTicket: an emoji title whose cut lands mid-surrogate-pair is clamped without corruption", async () => {
+  const cap = captureCreate({ createdKey: "TEAM-910" });
+  try {
+    await handler({
+      tool_name: "Tickets___create_ticket",
+      summary: ASTRAL_TITLE,
+      description: LONG_DESCRIPTION,
+      assignee: "agentcore_hub_requirements_analyst",
+    });
+    assert.equal(cap.posts.length, 1);
+    assert.ok(cap.fields.summary.length <= 255);
+    assert.equal(cap.fields.summary, EXPECTED_CLAMPED_ASTRAL);
+    assert.ok(
+      !LONE_SURROGATE.test(cap.fields.summary),
+      `summary sent to Jira must not contain an unpaired surrogate: ${JSON.stringify(cap.fields.summary.slice(-6))}`
+    );
+  } finally {
+    cap.restore();
+  }
+});

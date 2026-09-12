@@ -18,6 +18,9 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 const LONG_TITLE = "A".repeat(200) + " " + "B".repeat(200); // 401 chars, one space near the middle
 const LONG_DESCRIPTION = "The full text must survive in the description even though the title is long.";
 const EXPECTED_CLAMPED_LONG_TITLE = "A".repeat(200) + "…";
+const ASTRAL_TITLE = "x" + "😀".repeat(128); // 257 code units — the cut lands mid-pair
+const EXPECTED_CLAMPED_ASTRAL = "x" + "😀".repeat(126) + "…"; // 254 code units, whole code points
+const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
 
 type Post = { url: string; fields: Record<string, unknown> };
 
@@ -100,5 +103,40 @@ describe("JiraCloudProvider — summary clamp (TEAM-4537)", () => {
     expect(summary).toBe(EXPECTED_CLAMPED_LONG_TITLE);
     const description = posts[0].fields.description as { content: Array<{ content: Array<{ text: string }> }> };
     expect(description.content[0].content[0].text).toBe(LONG_DESCRIPTION);
+  });
+
+  // ─── TEAM-4537 review P2: surrogate-safe clamp ──────────────────────────────
+  //
+  // slice() counts UTF-16 code units, so a cut at 254 can land between the high
+  // and low surrogate of an astral character and ship a lone high surrogate —
+  // the length check passes but Jira shows a corrupted title. Mirrors the
+  // astral + 255/256 cases pinned in both Lambda test files.
+  it("createTicket clamps an emoji title without splitting a surrogate pair", async () => {
+    const { JiraCloudProvider } = await import("./ticket-provider-jira");
+    const jira = new JiraCloudProvider();
+
+    await jira.createTicket({
+      parentId: "TEAM-1",
+      title: ASTRAL_TITLE,
+      description: LONG_DESCRIPTION,
+      assignee: "agentcore_hub_requirements_analyst",
+    });
+
+    const summary = posts[0].fields.summary as string;
+    expect(summary.length).toBeLessThanOrEqual(255);
+    expect(summary).toBe(EXPECTED_CLAMPED_ASTRAL);
+    expect(LONE_SURROGATE.test(summary)).toBe(false);
+  });
+
+  it("a title of exactly 255 chars is sent untouched; 256 is clamped", async () => {
+    const { JiraCloudProvider } = await import("./ticket-provider-jira");
+    const jira = new JiraCloudProvider();
+
+    await jira.createEpic({ title: "A".repeat(255), description: LONG_DESCRIPTION });
+    expect(posts[0].fields.summary).toBe("A".repeat(255));
+
+    await jira.createEpic({ title: "A".repeat(256), description: LONG_DESCRIPTION });
+    expect(posts[1].fields.summary).toBe("A".repeat(254) + "…");
+    expect((posts[1].fields.summary as string).length).toBe(255);
   });
 });
