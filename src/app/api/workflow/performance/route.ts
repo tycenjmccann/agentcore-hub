@@ -26,6 +26,7 @@ import { ARTIFACT_BUCKET } from "@/lib/workflow/agent-setup";
 import { getWorkflowFromDynamo } from "@/lib/workflow/dynamo-read";
 import { buildFleetView, CURRENT_REPORT_VERSION } from "@/lib/workflow/performance";
 import { getJson, loadIndex } from "@/lib/workflow/performance-index";
+import { INFLIGHT_TTL_MS, sweepAndCheck, claim, release } from "@/lib/workflow/performance-inflight";
 import { isTerminalPhase } from "@/lib/workflow/types";
 
 export const dynamic = "force-dynamic";
@@ -40,31 +41,6 @@ const CARD_KEY = (workflowId: string) => `workflows/${workflowId}/shared/perform
 
 /** How long the client should wait before GETting the recomputed card. */
 const POLL_AFTER_MS = 3000;
-
-/**
- * How long a submitted recompute is assumed to still be running. Sized to the
- * cost-report Lambda's own timeout, not to a client's patience: while an invoke
- * may still be in flight, re-invoking only burns Logs Insights scans to write
- * the same S3 key twice.
- *
- * Best-effort and per-ECS-task BY DESIGN. With more than one task behind the
- * ALB, two concurrent POSTs on different tasks both invoke; that is acceptable
- * because the Lambda is idempotent (it recomputes and overwrites the same key),
- * and a cross-task lock would mean writing the workflows table, which this
- * surface deliberately never does.
- */
-const INFLIGHT_TTL_MS = 600_000;
-const inflight = new Map<string, number>();
-
-/** Test-only: drop every in-flight marker so a spec starts from a clean map. */
-export function __resetInflightForTests(): void {
-  inflight.clear();
-}
-
-/** Test-only: how many markers are held, for asserting the sweep actually sweeps. */
-export function __inflightSizeForTests(): number {
-  return inflight.size;
-}
 
 export async function GET(request: NextRequest) {
   if (!ARTIFACT_BUCKET) {
@@ -143,10 +119,7 @@ export async function POST(request: NextRequest) {
     // without bound on a long-lived task, then claim — only here, after a-e
     // passed, so a bad / unknown / still-running id never leaves a marker.
     const now = Date.now();
-    for (const [id, startedAt] of inflight) {
-      if (now - startedAt >= INFLIGHT_TTL_MS) inflight.delete(id);
-    }
-    const heldSince = inflight.get(workflowId);
+    const heldSince = sweepAndCheck(workflowId, now);
     if (heldSince !== undefined) {
       return NextResponse.json(
         {
@@ -159,7 +132,7 @@ export async function POST(request: NextRequest) {
         { status: 429 }
       );
     }
-    inflight.set(workflowId, now);
+    claim(workflowId, now);
     claimed = true;
 
     // (g) Fire and forget. FunctionName comes from env or the convention —
@@ -177,7 +150,7 @@ export async function POST(request: NextRequest) {
     // (h) Release the claim so a retry isn't locked out by a failure, and answer
     // with a STATIC message: err.message from the Lambda or DynamoDB client
     // embeds the account id and the assumed-role ARN.
-    if (claimed) inflight.delete(workflowId);
+    if (claimed) release(workflowId);
     console.error("[performance] POST failed:", err);
     return NextResponse.json({ error: "failed to start performance report" }, { status: 500 });
   }

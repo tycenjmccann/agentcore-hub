@@ -108,11 +108,19 @@ vi.mock("@aws-sdk/client-lambda", () => ({
 }));
 
 type RouteModule = typeof import("./route");
+type InflightModule = typeof import("@/lib/workflow/performance-inflight");
 let route: RouteModule;
+let inflight: InflightModule;
 
+// The map lives in @/lib/workflow/performance-inflight, not on the route
+// module (a route file may only export GET/POST/config/... — see the header
+// comment on performance-inflight.ts). vi.resetModules() gives route.ts a
+// fresh copy of that module on every load, so the test helpers must be
+// re-imported here too, or they'd poke at a stale, disconnected instance.
 async function load() {
   vi.resetModules();
   route = await import("./route");
+  inflight = await import("@/lib/workflow/performance-inflight");
 }
 
 const SAVED = ["ARTIFACT_BUCKET", "COST_REPORT_FUNCTION"] as const;
@@ -151,7 +159,7 @@ beforeEach(async () => {
   process.env.ARTIFACT_BUCKET = "test-bucket";
   delete process.env.COST_REPORT_FUNCTION;
   await load();
-  route.__resetInflightForTests();
+  inflight.__resetInflightForTests();
 });
 
 afterEach(() => {
@@ -351,13 +359,13 @@ describe("POST in-flight de-dupe", () => {
     vi.useFakeTimers();
     const ids = Array.from({ length: 25 }, (_, i) => seedTerminalRun(`wf_${i}`));
     for (const id of ids) expect((await route.POST(post({ workflowId: id }))).status).toBe(202);
-    expect(route.__inflightSizeForTests()).toBe(25);
+    expect(inflight.__inflightSizeForTests()).toBe(25);
 
     vi.advanceTimersByTime(600_001);
     const fresh = seedTerminalRun("wf_fresh");
     expect((await route.POST(post({ workflowId: fresh }))).status).toBe(202);
     // One POST collapsed all 25 stale markers, leaving only its own.
-    expect(route.__inflightSizeForTests()).toBe(1);
+    expect(inflight.__inflightSizeForTests()).toBe(1);
   });
 
   it("leaves no marker behind for an invalid, unknown or non-terminal id", async () => {
@@ -366,13 +374,13 @@ describe("POST in-flight de-dupe", () => {
     expect((await route.POST(post(undefined, "{nope"))).status).toBe(400);
     expect((await route.POST(post({ workflowId: "wf_missing" }))).status).toBe(404);
     expect((await route.POST(post({ workflowId: "wf_open" }))).status).toBe(409);
-    expect(route.__inflightSizeForTests()).toBe(0);
+    expect(inflight.__inflightSizeForTests()).toBe(0);
 
     // ...and an already-current card doesn't claim either.
     const id = seedTerminalRun();
     h.state.s3Objects[CARD_KEY(id)] = JSON.stringify({ reportVersion: CURRENT_REPORT_VERSION });
     expect((await route.POST(post({ workflowId: id }))).status).toBe(200);
-    expect(route.__inflightSizeForTests()).toBe(0);
+    expect(inflight.__inflightSizeForTests()).toBe(0);
   });
 });
 
@@ -402,7 +410,7 @@ describe("POST failure handling", () => {
     const id = seedTerminalRun();
     h.state.invokeError = new Error(ARN_ERROR);
     expect((await route.POST(post({ workflowId: id }))).status).toBe(500);
-    expect(route.__inflightSizeForTests()).toBe(0);
+    expect(inflight.__inflightSizeForTests()).toBe(0);
 
     h.state.invokeError = null;
     expect((await route.POST(post({ workflowId: id }))).status).toBe(202);
@@ -418,7 +426,7 @@ describe("POST failure handling", () => {
     expect(res.status).toBe(500);
     expect(await res.json()).toEqual({ error: "failed to start performance report" });
     expect(h.state.invokes).toHaveLength(0);
-    expect(route.__inflightSizeForTests()).toBe(0);
+    expect(inflight.__inflightSizeForTests()).toBe(0);
   });
 });
 
