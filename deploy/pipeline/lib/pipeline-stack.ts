@@ -144,6 +144,20 @@ export class PipelineStack extends Stack {
     const buildEnvironment: codebuild.BuildEnvironment = {
       buildImage: ciImage,
       computeType: codebuild.ComputeType.SMALL,
+      privileged: true,
+    };
+
+    // The Build stage (deploy pipeline) stays on the MANAGED image: it builds
+    // the app image with `docker buildx`, and a self-started dockerd inside the
+    // custom image cannot mount overlay2 on CodeBuild's overlay root
+    // ("failed to mount overlay: invalid argument" - both 2026-09-12 releases
+    // after the custom image landed). CodeBuild only runs a working daemon for
+    // its own curated images. Cost: the Build stage takes the legacy Playwright
+    // install path (~1-2 min); PR checks keep the baked image and its R11 win.
+    // Follow-up: a non-overlay --data-root (or vfs) would let it move back.
+    const appBuildEnvironment: codebuild.BuildEnvironment = {
+      buildImage: codebuild.LinuxBuildImage.STANDARD_7_0, // Node 20, Docker available
+      computeType: codebuild.ComputeType.SMALL,
       privileged: true, // needed for `docker buildx build` in the app image step
     };
 
@@ -283,7 +297,7 @@ export class PipelineStack extends Stack {
       buildSpec: codebuild.BuildSpec.fromSourceFilename(
         "deploy/pipeline/buildspec-ci.yml"
       ),
-      environment: buildEnvironment,
+      environment: appBuildEnvironment,
       environmentVariables: {
         ...commonEnvVars,
         ECR_REPO: { value: "agentcore-hub-frontend" },
