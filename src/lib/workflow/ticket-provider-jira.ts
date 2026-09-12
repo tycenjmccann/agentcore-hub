@@ -36,6 +36,27 @@ const INTERNAL_TO_JIRA_STATUS: Record<string, string> = {
   backlog: "Backlog",
 };
 
+/**
+ * TEAM-4537: Jira hard-caps issue summary at 255 chars — a long auto-generated
+ * title (e.g. `Intake: <analyst> — <request title>`) otherwise 400s the create
+ * and the workflow dies at intake (wf_1789190697687_fxrs67 / epic TEAM-4518).
+ * Trims to a word boundary when that keeps at least 200 chars, so a title with
+ * no whitespace near the cut still clamps instead of growing unbounded. The
+ * full text always survives separately in the description — this only
+ * shortens what Jira shows as the summary.
+ *
+ * Byte-identical in spirit to the copies in lambda/agentcore-hub-jira/index.mjs
+ * and lambda/agentcore-hub-tickets/index.mjs — kept local here because this
+ * provider is a separate deploy unit (the Next.js server), not a Lambda.
+ */
+function clampSummary(s: string): string {
+  if (s.length <= 255) return s;
+  const cut = s.slice(0, 254);
+  const lastSpace = cut.lastIndexOf(" ");
+  const trimmed = lastSpace >= 200 ? cut.slice(0, lastSpace) : cut;
+  return trimmed.trimEnd() + "…";
+}
+
 // ─── Provider Implementation ────────────────────────────────────────────────
 
 export class JiraCloudProvider implements TicketProvider {
@@ -66,7 +87,7 @@ export class JiraCloudProvider implements TicketProvider {
     const body = {
       fields: {
         project: { key: this.projectKey },
-        summary: input.title,
+        summary: clampSummary(input.title),
         description: this.toADF(input.description),
         issuetype: { name: "Epic" },
         labels: ["agentcore-hub-workflow"],
@@ -82,7 +103,7 @@ export class JiraCloudProvider implements TicketProvider {
     const body: Record<string, unknown> = {
       fields: {
         project: { key: this.projectKey },
-        summary: input.title,
+        summary: clampSummary(input.title),
         description: this.toADF(input.description),
         issuetype: { name: "Task" },
         parent: { key: input.parentId },
