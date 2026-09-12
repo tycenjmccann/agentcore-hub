@@ -2,8 +2,8 @@ import { describe, it, expect } from "vitest";
 import {
   bandFor, buildFleetView, median, mad, formatKpi, type CardSummary, type PerformanceIndex,
   computeKpi, readKpi, hasCostData, isValidCard, round4,
-  CURRENT_REPORT_VERSION, FLEET_KPIS, KPI_CONFIG,
-  type KpiCap, type PerformanceCardInput, type Kpi, type KpiConfig, type KpiComponentKind,
+  CURRENT_REPORT_VERSION, FLEET_KPIS, KPI_CONFIG, TOLERANCE_KINDS,
+  type KpiCap, type PerformanceCardInput, type Kpi, type KpiConfig, type KpiComponentKind, type KpiComponentDef,
 } from "./performance";
 // The rubric fixture is OWNED BY THE LAMBDA SIDE (TEAM-4484) precisely so both
 // scorers are pinned by the same bytes. Importing it across the boundary is the
@@ -372,6 +372,67 @@ describe("kpi rubric contract", () => {
     // crash. Pin the set so adding one is a deliberate, reviewed edit.
     const kinds = new Set(KPI_CONFIG.quality.components.map((c) => c.kind));
     expect([...kinds].sort()).toEqual(["count", "excess", "rate", "ratio", "sum", "verdict"]);
+  });
+
+  /**
+   * Keys of tolerance-kind components whose `tolerance` isn't a finite positive number.
+   * Filters on TOLERANCE_KINDS — the very set `measure` branches on — so the guard can
+   * never drift from the code path it protects.
+   */
+  function missingTolerances(config: KpiConfig): string[] {
+    return config.quality.components
+      .filter((c) => TOLERANCE_KINDS.has(c.kind))
+      .filter((c) => !(typeof c.tolerance === "number" && Number.isFinite(c.tolerance) && c.tolerance > 0))
+      .map((c) => c.key);
+  }
+
+  /** The first tolerance-kind line in rubric order — picked BY KIND, never named. */
+  const toleranceLine = KPI_CONFIG.quality.components.find((c) => TOLERANCE_KINDS.has(c.kind))!;
+
+  /** KPI_CONFIG with one component's `tolerance` replaced, or dropped when `undefined`. */
+  function withTolerance(key: string, tolerance: number | undefined): KpiConfig {
+    return {
+      ...KPI_CONFIG,
+      quality: {
+        ...KPI_CONFIG.quality,
+        components: KPI_CONFIG.quality.components.map((c) => {
+          if (c.key !== key) return c;
+          const patched: KpiComponentDef = { ...c, tolerance };
+          if (tolerance === undefined) delete patched.tolerance; // a real kpi.json omission
+          return patched;
+        }),
+      },
+    };
+  }
+
+  it("every rate/count/sum/excess component carries a finite positive tolerance", () => {
+    // D-4: kpi.json is shared with lambda/cost-report (its copy is a symlink), and the two
+    // mirrors part ways on a MISSING tolerance. This side excludes the line with an explicit
+    // "no tolerance in kpi.json" note; the Lambda's normalizeComponent computes
+    // `1 - raw / undefined`, gets NaN, and excludes it with note: null and the raw it
+    // computed. Score and grade still agree — components[] does not. Since both tiers read
+    // this one file and this suite runs in CI, guarding the file here makes the divergence
+    // unreachable, which is cheaper than chasing byte-identical note text.
+    const lines = KPI_CONFIG.quality.components.filter((c) => TOLERANCE_KINDS.has(c.kind));
+    expect(lines.length, "no tolerance-kind lines — the guard would pass vacuously").toBeGreaterThan(0);
+    expect(missingTolerances(KPI_CONFIG)).toEqual([]);
+  });
+
+  it("the guard bites: a stripped tolerance is reported, by key", () => {
+    // The negative proof — without it, the assertion above would pass just as happily
+    // against a helper that never returns anything.
+    expect(missingTolerances(withTolerance(toleranceLine.key, undefined))).toEqual([toleranceLine.key]);
+  });
+
+  it("…and so are non-finite or non-positive tolerances", () => {
+    // ARITHMETIC edge values, not rubric numbers: `1 - raw/0` is ±Infinity (NaN at raw 0)
+    // and `1 - raw/NaN` is NaN — both land in computeKpi's !Number.isFinite exclusion just
+    // like a missing tolerance. Infinity and a negative tolerance are degenerate the other
+    // way (the line can never lose points), so they're misconfiguration too.
+    for (const bad of [0, -1, NaN, Infinity]) {
+      expect(missingTolerances(withTolerance(toleranceLine.key, bad)), String(bad))
+        .toEqual([toleranceLine.key]);
+    }
   });
 });
 
