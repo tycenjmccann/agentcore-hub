@@ -9,9 +9,9 @@
  *
  * Rules this file exists to keep:
  *  - never show a fabricated number. A missing value is an em dash, never 0,
- *    never grade F. The single hand-written numeric literal in here is the
- *    cost-missing "$0" (see COST_MISSING_VALUE) — everything else goes through
- *    formatKpi from @/lib/workflow/performance.
+ *    never grade F. The one hand-written cost literal lives in ./cost-missing
+ *    (COST_MISSING_VALUE, shared with the full card) — everything else goes
+ *    through formatKpi from @/lib/workflow/performance.
  *  - a v4 card (no `kpi` block) must render without throwing, and must say so
  *    rather than implying a score of zero.
  *  - colour never carries status on its own: every band chip spells its word.
@@ -28,14 +28,8 @@ import {
   type KpiUnit,
 } from "@/lib/workflow/performance";
 import { BAND_TEXT, GRADE_STYLE, STATUS_STYLE, type Grade } from "./band-style";
+import { COST_MISSING_VALUE, isCostMissing } from "./cost-missing";
 import { usePerformanceCard, type CardState, type RunCard, type RunCardKpi } from "./use-performance-card";
-
-/**
- * The one permitted literal. formatKpi("usd", 0) is "$0.00" — a precise, real
- * looking bill — and formatKpi("usd", null) is "—", which loses the fact that
- * we know spend was not measured. The tile has to read "$0 · no usage data".
- */
-const COST_MISSING_VALUE = "$0";
 
 const POLL_MS = 3000;
 /** 30 polls x 3s = 90s per window; two windows maximum, then we stop. */
@@ -151,13 +145,10 @@ export function deriveTiles(state: CardState, card: RunCard | null): TileModel[]
   const kpi = card.kpi;
   const bandOf = (path: string) => card.bands?.kpis?.[path]?.status ?? null;
 
-  // 5: cost was not measured. A v5 card says so with `kpi.cost.usd === null`; a
-  // v4 card has neither that nor dataQuality.costMissing, so fall back to the
-  // same test the lib and the Lambda use — a $0 total means the spans did not
-  // match, not a free run (hasCostData / NFR-5). Never a $0.00 that reads as a bill.
-  const costMissing =
-    card.dataQuality?.costMissing === true ||
-    (kpi ? kpi.cost.usd === null : !((card.cost?.totalUsd ?? 0) > 0));
+  // 5: cost was not measured — never a $0.00 that reads as a bill. The predicate
+  // is shared with the full performance card below the fold (./cost-missing), so
+  // the two surfaces cannot disagree about the same card.
+  const costMissing = isCostMissing(card);
   const cost: TileModel = {
     ...SHELLS.cost,
     value: costMissing ? COST_MISSING_VALUE : formatKpi("usd", kpi ? kpi.cost.usd : card.cost.totalUsd),
