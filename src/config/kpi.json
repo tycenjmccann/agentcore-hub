@@ -1,0 +1,16 @@
+{
+  "kpiVersion": 1,
+  "grades": [ {"grade":"A","min":90}, {"grade":"B","min":80}, {"grade":"C","min":70}, {"grade":"D","min":60}, {"grade":"F","min":0} ],
+  "outcomeCaps": { "deploy-blocked": 69, "static-ci-only": 69, "error": 69, "cancelled": 69 },
+  "quality": {
+    "minEvidenceWeight": 51,
+    "components": [
+      { "key":"firstPass", "label":"First-pass yield", "weight":30, "kind":"ratio",   "source":"quality.firstPassYield" },
+      { "key":"rework",    "label":"Rework intensity",  "weight":20, "kind":"rate",    "source":"quality.reworkRounds", "per":"quality.tasks", "tolerance":0.6 },
+      { "key":"loops",     "label":"Loops",             "weight":20, "kind":"count",   "source":"quality.loops", "tolerance":8 },
+      { "key":"stability", "label":"Stability",         "weight":15, "kind":"sum",     "sources":["quality.errors","quality.nudges","quality.interventions"], "tolerance":6 },
+      { "key":"gates",     "label":"Review efficiency", "weight":10, "kind":"excess",  "source":"quality.gateRounds", "baseline":"time.humanGates", "tolerance":4 },
+      { "key":"ci",        "label":"CI verdict",        "weight":5,  "kind":"verdict", "source":"quality.ci.verdict", "values":{"pass":1,"fail":0}, "neutralOn":["unknown",null] }
+    ]
+  }
+}

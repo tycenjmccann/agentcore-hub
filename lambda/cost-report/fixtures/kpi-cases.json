@@ -1,0 +1,596 @@
+{
+  "reportVersion": 5,
+  "kpiVersion": 1,
+  "_fixture": {
+    "ticket": "TEAM-4477 (Hero KPIs) — shared by TEAM-4483 (TS mirror) and TEAM-4484 (Lambda)",
+    "ownedBy": "TEAM-4484 (backend_dev)",
+    "note": "The single source of truth for computeKpi. Both implementations feed each `card` through their scorer and must reproduce `expected` exactly, so a drift between the Lambda and the TS mirror fails a test instead of silently disagreeing about a run's grade. Every `expected` value is hand-derived from src/config/kpi.json v1 — see each case's `derivation`. Cards carry the identity fields plus exactly the fields the scorer reads, with values shaped the way buildCard emits them (firstPassYield is round4'd, so 15/18 appears as 0.8333). `kind: \"compute\"` cases go through computeKpi; `kind: \"tolerate\"` cases only have to not throw.",
+    "scorerReads": [
+      "quality.firstPassYield", "quality.reworkRounds", "quality.tasks", "quality.loops",
+      "quality.errors", "quality.nudges", "quality.interventions", "quality.gateRounds",
+      "quality.ci.verdict", "time.humanGates", "run.outcome",
+      "cost.totalUsd", "dataQuality.costMissing", "generatedAt",
+      "time.wallMs", "time.activeMs", "time.humanWaitMs"
+    ]
+  },
+  "cases": [
+    {
+      "name": "worked-example",
+      "kind": "compute",
+      "derivation": "firstPass 30*0.8333=24.999 | rework 20*(1-(3/18)/0.6)=14.4444444 | loops 20*(1-3/8)=12.5 | stability 15*(1-2/6)=10 | gates 10*(1-(3-2)/4)=7.5 | ci 5*1=5 → Sigma=74.4434444, evidenceWeight 100 → floor(74.4434444+0.5)=74 → C",
+      "card": {
+        "reportVersion": 5,
+        "generatedAt": "2026-09-10T00:00:00.000Z",
+        "workflowId": "wf_kpi_worked",
+        "epicId": "TEAM-4477",
+        "workflowDefId": "software-delivery",
+        "title": "worked example",
+        "run": { "phase": "complete", "outcome": "complete", "startedAt": "2026-09-09T23:00:00.000Z", "completedAt": "2026-09-10T00:00:00.000Z", "prUrl": null },
+        "cost": { "totalUsd": 42.5 },
+        "time": { "wallMs": 3600000, "activeMs": 3000000, "humanWaitMs": 600000, "humanGates": 2 },
+        "quality": { "tasks": 18, "reworkRounds": 3, "loops": 3, "errors": 1, "nudges": 1, "interventions": 0, "gateRounds": 3, "firstPassYield": 0.8333, "ci": { "verdict": "pass" } },
+        "dataQuality": { "costMissing": false }
+      },
+      "expected": {
+        "score": 74,
+        "grade": "C",
+        "confidence": "full",
+        "evidenceWeight": 100,
+        "excluded": [],
+        "capsApplied": [],
+        "costUsd": 42.5,
+        "components": [
+          { "key": "firstPass", "points": 24.999 },
+          { "key": "rework", "points": 14.4444 },
+          { "key": "loops", "points": 12.5 },
+          { "key": "stability", "points": 10 },
+          { "key": "gates", "points": 7.5 },
+          { "key": "ci", "points": 5 }
+        ]
+      }
+    },
+    {
+      "name": "worked-example-ci-unknown",
+      "kind": "compute",
+      "derivation": "worked example with ci.verdict \"unknown\" → ci is in neutralOn, excluded (points null). Sigma=69.4434444 over evidenceWeight 95 → floor(100*69.4434444/95+0.5)=floor(73.5983...)=73 → C, confidence partial",
+      "card": {
+        "reportVersion": 5,
+        "generatedAt": "2026-09-10T01:00:00.000Z",
+        "workflowId": "wf_kpi_worked_ci_unknown",
+        "epicId": "TEAM-4477",
+        "workflowDefId": "software-delivery",
+        "title": "worked example, CI verdict unknown",
+        "run": { "phase": "complete", "outcome": "complete", "startedAt": "2026-09-10T00:00:00.000Z", "completedAt": "2026-09-10T01:00:00.000Z", "prUrl": null },
+        "cost": { "totalUsd": 42.5 },
+        "time": { "wallMs": 3600000, "activeMs": 3000000, "humanWaitMs": 600000, "humanGates": 2 },
+        "quality": { "tasks": 18, "reworkRounds": 3, "loops": 3, "errors": 1, "nudges": 1, "interventions": 0, "gateRounds": 3, "firstPassYield": 0.8333, "ci": { "verdict": "unknown" } },
+        "dataQuality": { "costMissing": false }
+      },
+      "expected": {
+        "score": 73,
+        "grade": "C",
+        "confidence": "partial",
+        "evidenceWeight": 95,
+        "excluded": ["ci"],
+        "capsApplied": [],
+        "costUsd": 42.5,
+        "components": [
+          { "key": "firstPass", "points": 24.999 },
+          { "key": "rework", "points": 14.4444 },
+          { "key": "loops", "points": 12.5 },
+          { "key": "stability", "points": 10 },
+          { "key": "gates", "points": 7.5 },
+          { "key": "ci", "points": null, "included": false }
+        ]
+      }
+    },
+    {
+      "name": "worked-example-deploy-blocked",
+      "kind": "compute",
+      "derivation": "worked example (raw score 74) with run.outcome \"deploy-blocked\" → outcomeCaps lowers it to 69 → D. Components are untouched by the cap.",
+      "card": {
+        "reportVersion": 5,
+        "generatedAt": "2026-09-10T02:00:00.000Z",
+        "workflowId": "wf_kpi_worked_deploy_blocked",
+        "epicId": "TEAM-4477",
+        "workflowDefId": "software-delivery",
+        "title": "worked example, deploy blocked",
+        "run": { "phase": "deploy-blocked", "outcome": "deploy-blocked", "startedAt": "2026-09-10T01:00:00.000Z", "completedAt": "2026-09-10T02:00:00.000Z", "prUrl": null },
+        "cost": { "totalUsd": 42.5 },
+        "time": { "wallMs": 3600000, "activeMs": 3000000, "humanWaitMs": 600000, "humanGates": 2 },
+        "quality": { "tasks": 18, "reworkRounds": 3, "loops": 3, "errors": 1, "nudges": 1, "interventions": 0, "gateRounds": 3, "firstPassYield": 0.8333, "ci": { "verdict": "pass" } },
+        "dataQuality": { "costMissing": false }
+      },
+      "expected": {
+        "score": 69,
+        "grade": "D",
+        "confidence": "full",
+        "evidenceWeight": 100,
+        "excluded": [],
+        "capsApplied": [{ "kind": "outcome", "outcome": "deploy-blocked", "cap": 69 }],
+        "costUsd": 42.5,
+        "components": [
+          { "key": "firstPass", "points": 24.999 },
+          { "key": "rework", "points": 14.4444 },
+          { "key": "loops", "points": 12.5 },
+          { "key": "stability", "points": 10 },
+          { "key": "gates", "points": 7.5 },
+          { "key": "ci", "points": 5 }
+        ]
+      }
+    },
+    {
+      "name": "worked-example-ci-fail",
+      "kind": "compute",
+      "derivation": "worked example with ci.verdict \"fail\" → values.fail = 0, so ci is INCLUDED at 0 points (evidenceWeight stays 100). Sigma=69.4434444 → floor(69.9434444)=69 → D. Same score as the deploy-blocked cap, reached without a cap.",
+      "card": {
+        "reportVersion": 5,
+        "generatedAt": "2026-09-10T03:00:00.000Z",
+        "workflowId": "wf_kpi_worked_ci_fail",
+        "epicId": "TEAM-4477",
+        "workflowDefId": "software-delivery",
+        "title": "worked example, CI failed",
+        "run": { "phase": "complete", "outcome": "complete", "startedAt": "2026-09-10T02:00:00.000Z", "completedAt": "2026-09-10T03:00:00.000Z", "prUrl": null },
+        "cost": { "totalUsd": 42.5 },
+        "time": { "wallMs": 3600000, "activeMs": 3000000, "humanWaitMs": 600000, "humanGates": 2 },
+        "quality": { "tasks": 18, "reworkRounds": 3, "loops": 3, "errors": 1, "nudges": 1, "interventions": 0, "gateRounds": 3, "firstPassYield": 0.8333, "ci": { "verdict": "fail" } },
+        "dataQuality": { "costMissing": false }
+      },
+      "expected": {
+        "score": 69,
+        "grade": "D",
+        "confidence": "full",
+        "evidenceWeight": 100,
+        "excluded": [],
+        "capsApplied": [],
+        "costUsd": 42.5,
+        "components": [
+          { "key": "firstPass", "points": 24.999 },
+          { "key": "rework", "points": 14.4444 },
+          { "key": "loops", "points": 12.5 },
+          { "key": "stability", "points": 10 },
+          { "key": "gates", "points": 7.5 },
+          { "key": "ci", "points": 0 }
+        ]
+      }
+    },
+    {
+      "name": "clean-run",
+      "kind": "compute",
+      "derivation": "Every component at its best: fpy 1.0 → 30 | rework 0/10 → 20 | loops 0 → 20 | stability 0 → 15 | gates 2-2=0 → 10 | ci pass → 5. Sigma=100 → 100 → A",
+      "card": {
+        "reportVersion": 5,
+        "generatedAt": "2026-09-10T04:00:00.000Z",
+        "workflowId": "wf_kpi_clean",
+        "epicId": "TEAM-4477",
+        "workflowDefId": "software-delivery",
+        "title": "clean run",
+        "run": { "phase": "complete", "outcome": "complete", "startedAt": "2026-09-10T03:00:00.000Z", "completedAt": "2026-09-10T04:00:00.000Z", "prUrl": null },
+        "cost": { "totalUsd": 42.5 },
+        "time": { "wallMs": 3600000, "activeMs": 3000000, "humanWaitMs": 600000, "humanGates": 2 },
+        "quality": { "tasks": 10, "reworkRounds": 0, "loops": 0, "errors": 0, "nudges": 0, "interventions": 0, "gateRounds": 2, "firstPassYield": 1, "ci": { "verdict": "pass" } },
+        "dataQuality": { "costMissing": false }
+      },
+      "expected": {
+        "score": 100,
+        "grade": "A",
+        "confidence": "full",
+        "evidenceWeight": 100,
+        "excluded": [],
+        "capsApplied": [],
+        "costUsd": 42.5,
+        "components": [
+          { "key": "firstPass", "points": 30 },
+          { "key": "rework", "points": 20 },
+          { "key": "loops", "points": 20 },
+          { "key": "stability", "points": 15 },
+          { "key": "gates", "points": 10 },
+          { "key": "ci", "points": 5 }
+        ]
+      }
+    },
+    {
+      "name": "clamp-loops-12",
+      "kind": "compute",
+      "derivation": "worked example with loops 12 → normalized = 1-12/8 = -0.5, which CLAMPS to 0 for points but is reported UNCLAMPED as -0.5. Sigma=74.4434444-12.5=61.9434444 → floor(62.4434444)=62 → D",
+      "card": {
+        "reportVersion": 5,
+        "generatedAt": "2026-09-10T05:00:00.000Z",
+        "workflowId": "wf_kpi_clamp_loops",
+        "epicId": "TEAM-4477",
+        "workflowDefId": "software-delivery",
+        "title": "worked example, loops past tolerance",
+        "run": { "phase": "complete", "outcome": "complete", "startedAt": "2026-09-10T04:00:00.000Z", "completedAt": "2026-09-10T05:00:00.000Z", "prUrl": null },
+        "cost": { "totalUsd": 42.5 },
+        "time": { "wallMs": 3600000, "activeMs": 3000000, "humanWaitMs": 600000, "humanGates": 2 },
+        "quality": { "tasks": 18, "reworkRounds": 3, "loops": 12, "errors": 1, "nudges": 1, "interventions": 0, "gateRounds": 3, "firstPassYield": 0.8333, "ci": { "verdict": "pass" } },
+        "dataQuality": { "costMissing": false }
+      },
+      "expected": {
+        "score": 62,
+        "grade": "D",
+        "confidence": "full",
+        "evidenceWeight": 100,
+        "excluded": [],
+        "capsApplied": [],
+        "costUsd": 42.5,
+        "components": [
+          { "key": "firstPass", "points": 24.999 },
+          { "key": "rework", "points": 14.4444 },
+          { "key": "loops", "points": 0, "normalized": -0.5 },
+          { "key": "stability", "points": 10 },
+          { "key": "gates", "points": 7.5 },
+          { "key": "ci", "points": 5 }
+        ]
+      }
+    },
+    {
+      "name": "boundary-90",
+      "kind": "compute",
+      "derivation": "clean run + loops 4 → loops 20*(1-4/8)=10, losing 10. Sigma=90 → floor(90.5)=90, the exact A/B boundary",
+      "card": {
+        "reportVersion": 5,
+        "generatedAt": "2026-09-10T06:00:00.000Z",
+        "workflowId": "wf_kpi_boundary_90",
+        "epicId": "TEAM-4477",
+        "workflowDefId": "software-delivery",
+        "title": "grade boundary 90 (A)",
+        "run": { "phase": "complete", "outcome": "complete", "startedAt": "2026-09-10T05:00:00.000Z", "completedAt": "2026-09-10T06:00:00.000Z", "prUrl": null },
+        "cost": { "totalUsd": 42.5 },
+        "time": { "wallMs": 3600000, "activeMs": 3000000, "humanWaitMs": 600000, "humanGates": 2 },
+        "quality": { "tasks": 10, "reworkRounds": 0, "loops": 4, "errors": 0, "nudges": 0, "interventions": 0, "gateRounds": 2, "firstPassYield": 1, "ci": { "verdict": "pass" } },
+        "dataQuality": { "costMissing": false }
+      },
+      "expected": {
+        "score": 90,
+        "grade": "A",
+        "confidence": "full",
+        "evidenceWeight": 100,
+        "excluded": [],
+        "capsApplied": [],
+        "costUsd": 42.5,
+        "components": [
+          { "key": "firstPass", "points": 30 },
+          { "key": "rework", "points": 20 },
+          { "key": "loops", "points": 10 },
+          { "key": "stability", "points": 15 },
+          { "key": "gates", "points": 10 },
+          { "key": "ci", "points": 5 }
+        ]
+      }
+    },
+    {
+      "name": "boundary-80",
+      "kind": "compute",
+      "derivation": "clean run + loops 8 → loops normalized 0 → 0 points, losing 20. Sigma=80 → 80, the exact B/C boundary",
+      "card": {
+        "reportVersion": 5,
+        "generatedAt": "2026-09-10T07:00:00.000Z",
+        "workflowId": "wf_kpi_boundary_80",
+        "epicId": "TEAM-4477",
+        "workflowDefId": "software-delivery",
+        "title": "grade boundary 80 (B)",
+        "run": { "phase": "complete", "outcome": "complete", "startedAt": "2026-09-10T06:00:00.000Z", "completedAt": "2026-09-10T07:00:00.000Z", "prUrl": null },
+        "cost": { "totalUsd": 42.5 },
+        "time": { "wallMs": 3600000, "activeMs": 3000000, "humanWaitMs": 600000, "humanGates": 2 },
+        "quality": { "tasks": 10, "reworkRounds": 0, "loops": 8, "errors": 0, "nudges": 0, "interventions": 0, "gateRounds": 2, "firstPassYield": 1, "ci": { "verdict": "pass" } },
+        "dataQuality": { "costMissing": false }
+      },
+      "expected": {
+        "score": 80,
+        "grade": "B",
+        "confidence": "full",
+        "evidenceWeight": 100,
+        "excluded": [],
+        "capsApplied": [],
+        "costUsd": 42.5,
+        "components": [
+          { "key": "firstPass", "points": 30 },
+          { "key": "rework", "points": 20 },
+          { "key": "loops", "points": 0, "normalized": 0 },
+          { "key": "stability", "points": 15 },
+          { "key": "gates", "points": 10 },
+          { "key": "ci", "points": 5 }
+        ]
+      }
+    },
+    {
+      "name": "boundary-70",
+      "kind": "compute",
+      "derivation": "boundary-80 + errors 4 → stability 15*(1-4/6)=5, losing another 10. Sigma=70 → 70, the exact C/D boundary",
+      "card": {
+        "reportVersion": 5,
+        "generatedAt": "2026-09-10T08:00:00.000Z",
+        "workflowId": "wf_kpi_boundary_70",
+        "epicId": "TEAM-4477",
+        "workflowDefId": "software-delivery",
+        "title": "grade boundary 70 (C)",
+        "run": { "phase": "complete", "outcome": "complete", "startedAt": "2026-09-10T07:00:00.000Z", "completedAt": "2026-09-10T08:00:00.000Z", "prUrl": null },
+        "cost": { "totalUsd": 42.5 },
+        "time": { "wallMs": 3600000, "activeMs": 3000000, "humanWaitMs": 600000, "humanGates": 2 },
+        "quality": { "tasks": 10, "reworkRounds": 0, "loops": 8, "errors": 4, "nudges": 0, "interventions": 0, "gateRounds": 2, "firstPassYield": 1, "ci": { "verdict": "pass" } },
+        "dataQuality": { "costMissing": false }
+      },
+      "expected": {
+        "score": 70,
+        "grade": "C",
+        "confidence": "full",
+        "evidenceWeight": 100,
+        "excluded": [],
+        "capsApplied": [],
+        "costUsd": 42.5,
+        "components": [
+          { "key": "firstPass", "points": 30 },
+          { "key": "rework", "points": 20 },
+          { "key": "loops", "points": 0 },
+          { "key": "stability", "points": 5 },
+          { "key": "gates", "points": 10 },
+          { "key": "ci", "points": 5 }
+        ]
+      }
+    },
+    {
+      "name": "boundary-60",
+      "kind": "compute",
+      "derivation": "boundary-80 + errors 6 → stability 0 (losing 15) + gateRounds 4 vs humanGates 2 → gates 10*(1-2/4)=5 (losing 5). Sigma=60 → 60, the exact D/F boundary",
+      "card": {
+        "reportVersion": 5,
+        "generatedAt": "2026-09-10T09:00:00.000Z",
+        "workflowId": "wf_kpi_boundary_60",
+        "epicId": "TEAM-4477",
+        "workflowDefId": "software-delivery",
+        "title": "grade boundary 60 (D)",
+        "run": { "phase": "complete", "outcome": "complete", "startedAt": "2026-09-10T08:00:00.000Z", "completedAt": "2026-09-10T09:00:00.000Z", "prUrl": null },
+        "cost": { "totalUsd": 42.5 },
+        "time": { "wallMs": 3600000, "activeMs": 3000000, "humanWaitMs": 600000, "humanGates": 2 },
+        "quality": { "tasks": 10, "reworkRounds": 0, "loops": 8, "errors": 6, "nudges": 0, "interventions": 0, "gateRounds": 4, "firstPassYield": 1, "ci": { "verdict": "pass" } },
+        "dataQuality": { "costMissing": false }
+      },
+      "expected": {
+        "score": 60,
+        "grade": "D",
+        "confidence": "full",
+        "evidenceWeight": 100,
+        "excluded": [],
+        "capsApplied": [],
+        "costUsd": 42.5,
+        "components": [
+          { "key": "firstPass", "points": 30 },
+          { "key": "rework", "points": 20 },
+          { "key": "loops", "points": 0 },
+          { "key": "stability", "points": 0 },
+          { "key": "gates", "points": 5 },
+          { "key": "ci", "points": 5 }
+        ]
+      }
+    },
+    {
+      "name": "boundary-F",
+      "kind": "compute",
+      "derivation": "boundary-60 + ci fail → ci 0 points, losing the last 5. Sigma=55 → 55 → F (grades bottom out at min 0)",
+      "card": {
+        "reportVersion": 5,
+        "generatedAt": "2026-09-10T10:00:00.000Z",
+        "workflowId": "wf_kpi_boundary_f",
+        "epicId": "TEAM-4477",
+        "workflowDefId": "software-delivery",
+        "title": "grade boundary F",
+        "run": { "phase": "complete", "outcome": "complete", "startedAt": "2026-09-10T09:00:00.000Z", "completedAt": "2026-09-10T10:00:00.000Z", "prUrl": null },
+        "cost": { "totalUsd": 42.5 },
+        "time": { "wallMs": 3600000, "activeMs": 3000000, "humanWaitMs": 600000, "humanGates": 2 },
+        "quality": { "tasks": 10, "reworkRounds": 0, "loops": 8, "errors": 6, "nudges": 0, "interventions": 0, "gateRounds": 4, "firstPassYield": 1, "ci": { "verdict": "fail" } },
+        "dataQuality": { "costMissing": false }
+      },
+      "expected": {
+        "score": 55,
+        "grade": "F",
+        "confidence": "full",
+        "evidenceWeight": 100,
+        "excluded": [],
+        "capsApplied": [],
+        "costUsd": 42.5,
+        "components": [
+          { "key": "firstPass", "points": 30 },
+          { "key": "rework", "points": 20 },
+          { "key": "loops", "points": 0 },
+          { "key": "stability", "points": 0 },
+          { "key": "gates", "points": 5 },
+          { "key": "ci", "points": 0 }
+        ]
+      }
+    },
+    {
+      "name": "round-half-up",
+      "kind": "compute",
+      "derivation": "clean run + loops 3 → loops 12.5, Sigma=92.5 exactly. floor(92.5+0.5)=93 pins round-HALF-UP (a banker's-rounding or truncating implementation returns 92)",
+      "card": {
+        "reportVersion": 5,
+        "generatedAt": "2026-09-10T11:00:00.000Z",
+        "workflowId": "wf_kpi_round_half_up",
+        "epicId": "TEAM-4477",
+        "workflowDefId": "software-delivery",
+        "title": "exact .5 sum",
+        "run": { "phase": "complete", "outcome": "complete", "startedAt": "2026-09-10T10:00:00.000Z", "completedAt": "2026-09-10T11:00:00.000Z", "prUrl": null },
+        "cost": { "totalUsd": 42.5 },
+        "time": { "wallMs": 3600000, "activeMs": 3000000, "humanWaitMs": 600000, "humanGates": 2 },
+        "quality": { "tasks": 10, "reworkRounds": 0, "loops": 3, "errors": 0, "nudges": 0, "interventions": 0, "gateRounds": 2, "firstPassYield": 1, "ci": { "verdict": "pass" } },
+        "dataQuality": { "costMissing": false }
+      },
+      "expected": {
+        "score": 93,
+        "grade": "A",
+        "confidence": "full",
+        "evidenceWeight": 100,
+        "excluded": [],
+        "capsApplied": [],
+        "costUsd": 42.5,
+        "components": [
+          { "key": "firstPass", "points": 30 },
+          { "key": "rework", "points": 20 },
+          { "key": "loops", "points": 12.5 },
+          { "key": "stability", "points": 15 },
+          { "key": "gates", "points": 10 },
+          { "key": "ci", "points": 5 }
+        ]
+      }
+    },
+    {
+      "name": "tasks-zero",
+      "kind": "compute",
+      "derivation": "tasks 0 → firstPassYield null so firstPass (ratio, source null) is excluded and rework (rate, per=0) is excluded; ci unknown is excluded. Included: loops 20 + stability 15 + gates 10 = evidenceWeight 45 < minEvidenceWeight 51 → confidence insufficient, score null, grade null, capsApplied [] (the outcome cap is never even considered)",
+      "card": {
+        "reportVersion": 5,
+        "generatedAt": "2026-09-10T12:00:00.000Z",
+        "workflowId": "wf_kpi_tasks_zero",
+        "epicId": "TEAM-4477",
+        "workflowDefId": "software-delivery",
+        "title": "no agent tasks ran",
+        "run": { "phase": "complete", "outcome": "complete", "startedAt": "2026-09-10T11:00:00.000Z", "completedAt": "2026-09-10T12:00:00.000Z", "prUrl": null },
+        "cost": { "totalUsd": 42.5 },
+        "time": { "wallMs": 3600000, "activeMs": 3000000, "humanWaitMs": 600000, "humanGates": 0 },
+        "quality": { "tasks": 0, "reworkRounds": 0, "loops": 0, "errors": 0, "nudges": 0, "interventions": 0, "gateRounds": 0, "firstPassYield": null, "ci": { "verdict": "unknown" } },
+        "dataQuality": { "costMissing": false }
+      },
+      "expected": {
+        "score": null,
+        "grade": null,
+        "confidence": "insufficient",
+        "evidenceWeight": 45,
+        "excluded": ["firstPass", "rework", "ci"],
+        "capsApplied": [],
+        "costUsd": 42.5,
+        "components": [
+          { "key": "firstPass", "points": null, "included": false },
+          { "key": "rework", "points": null, "included": false },
+          { "key": "loops", "points": 20 },
+          { "key": "stability", "points": 15 },
+          { "key": "gates", "points": 10 },
+          { "key": "ci", "points": null, "included": false }
+        ]
+      }
+    },
+    {
+      "name": "cancelled-clean",
+      "kind": "compute",
+      "derivation": "clean-run inputs (raw score 100) with run.outcome \"cancelled\" → outcomeCaps lowers it to 69 → D. A cancelled run can never look good, however clean its counters are.",
+      "card": {
+        "reportVersion": 5,
+        "generatedAt": "2026-09-10T13:00:00.000Z",
+        "workflowId": "wf_kpi_cancelled",
+        "epicId": "TEAM-4477",
+        "workflowDefId": "software-delivery",
+        "title": "cancelled but clean",
+        "run": { "phase": "cancelled", "outcome": "cancelled", "startedAt": "2026-09-10T12:00:00.000Z", "completedAt": "2026-09-10T13:00:00.000Z", "prUrl": null },
+        "cost": { "totalUsd": 42.5 },
+        "time": { "wallMs": 3600000, "activeMs": 3000000, "humanWaitMs": 600000, "humanGates": 2 },
+        "quality": { "tasks": 10, "reworkRounds": 0, "loops": 0, "errors": 0, "nudges": 0, "interventions": 0, "gateRounds": 2, "firstPassYield": 1, "ci": { "verdict": "pass" } },
+        "dataQuality": { "costMissing": false }
+      },
+      "expected": {
+        "score": 69,
+        "grade": "D",
+        "confidence": "full",
+        "evidenceWeight": 100,
+        "excluded": [],
+        "capsApplied": [{ "kind": "outcome", "outcome": "cancelled", "cap": 69 }],
+        "costUsd": 42.5,
+        "components": [
+          { "key": "firstPass", "points": 30 },
+          { "key": "rework", "points": 20 },
+          { "key": "loops", "points": 20 },
+          { "key": "stability", "points": 15 },
+          { "key": "gates", "points": 10 },
+          { "key": "ci", "points": 5 }
+        ]
+      }
+    },
+    {
+      "name": "static-ci-only",
+      "kind": "compute",
+      "derivation": "worked-example inputs (raw score 74) with run.outcome \"static-ci-only\" → capped to 69 → D. Green CI on static checks alone is not a shipped run.",
+      "card": {
+        "reportVersion": 5,
+        "generatedAt": "2026-09-10T14:00:00.000Z",
+        "workflowId": "wf_kpi_static_ci_only",
+        "epicId": "TEAM-4477",
+        "workflowDefId": "software-delivery",
+        "title": "static CI only",
+        "run": { "phase": "static-ci-only", "outcome": "static-ci-only", "startedAt": "2026-09-10T13:00:00.000Z", "completedAt": "2026-09-10T14:00:00.000Z", "prUrl": null },
+        "cost": { "totalUsd": 42.5 },
+        "time": { "wallMs": 3600000, "activeMs": 3000000, "humanWaitMs": 600000, "humanGates": 2 },
+        "quality": { "tasks": 18, "reworkRounds": 3, "loops": 3, "errors": 1, "nudges": 1, "interventions": 0, "gateRounds": 3, "firstPassYield": 0.8333, "ci": { "verdict": "pass" } },
+        "dataQuality": { "costMissing": false }
+      },
+      "expected": {
+        "score": 69,
+        "grade": "D",
+        "confidence": "full",
+        "evidenceWeight": 100,
+        "excluded": [],
+        "capsApplied": [{ "kind": "outcome", "outcome": "static-ci-only", "cap": 69 }],
+        "costUsd": 42.5,
+        "components": [
+          { "key": "firstPass", "points": 24.999 },
+          { "key": "rework", "points": 14.4444 },
+          { "key": "loops", "points": 12.5 },
+          { "key": "stability", "points": 10 },
+          { "key": "gates", "points": 7.5 },
+          { "key": "ci", "points": 5 }
+        ]
+      }
+    },
+    {
+      "name": "zero-cost-card",
+      "kind": "compute",
+      "derivation": "clean-run inputs, but cost.totalUsd 0 and dataQuality.costMissing true (the spans never matched). Quality is INDEPENDENT of cost data: score stays 100/A. Only kpi.cost.usd goes null — never 0, which would read as a free run.",
+      "card": {
+        "reportVersion": 5,
+        "generatedAt": "2026-09-10T15:00:00.000Z",
+        "workflowId": "wf_kpi_zero_cost",
+        "epicId": "TEAM-4477",
+        "workflowDefId": "software-delivery",
+        "title": "clean run with no cost data",
+        "run": { "phase": "complete", "outcome": "complete", "startedAt": "2026-09-10T14:00:00.000Z", "completedAt": "2026-09-10T15:00:00.000Z", "prUrl": null },
+        "cost": { "totalUsd": 0 },
+        "time": { "wallMs": 3600000, "activeMs": 3000000, "humanWaitMs": 600000, "humanGates": 2 },
+        "quality": { "tasks": 10, "reworkRounds": 0, "loops": 0, "errors": 0, "nudges": 0, "interventions": 0, "gateRounds": 2, "firstPassYield": 1, "ci": { "verdict": "pass" } },
+        "dataQuality": { "costMissing": true }
+      },
+      "expected": {
+        "score": 100,
+        "grade": "A",
+        "confidence": "full",
+        "evidenceWeight": 100,
+        "excluded": [],
+        "capsApplied": [],
+        "costUsd": null,
+        "components": [
+          { "key": "firstPass", "points": 30 },
+          { "key": "rework", "points": 20 },
+          { "key": "loops", "points": 20 },
+          { "key": "stability", "points": 15 },
+          { "key": "gates", "points": 10 },
+          { "key": "ci", "points": 5 }
+        ]
+      }
+    },
+    {
+      "name": "v4-card-no-kpi",
+      "kind": "tolerate",
+      "derivation": "A pre-Hero-KPI (reportVersion 4) card: no `kpi` block, no `quality.score`, no `quality.ci`, no `dataQuality.costMissing`. readKpi must return null and never throw, and the fleet view must aggregate the run without a NaN.",
+      "card": {
+        "reportVersion": 4,
+        "generatedAt": "2026-08-20T00:00:00.000Z",
+        "workflowId": "wf_kpi_v4",
+        "epicId": "TEAM-4000",
+        "workflowDefId": "software-delivery",
+        "title": "pre-KPI card",
+        "run": { "phase": "complete", "outcome": "complete", "startedAt": "2026-08-19T23:00:00.000Z", "completedAt": "2026-08-20T00:00:00.000Z", "prUrl": null },
+        "cost": { "totalUsd": 12.5, "personaUsd": 11.25, "codingUsd": 1.25 },
+        "time": { "wallMs": 3600000, "activeMs": 3000000, "humanWaitMs": 600000, "agentWorkMs": 1800000, "humanGates": 2 },
+        "quality": { "tasks": 8, "reworkRounds": 1, "changeRequests": 1, "fixTickets": 0, "loops": 1, "errors": 0, "nudges": 0, "interventions": 0, "gateRounds": 2, "firstPassYield": 0.875 },
+        "dataQuality": { "gaps": [] }
+      }
+    }
+  ]
+}
