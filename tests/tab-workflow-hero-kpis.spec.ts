@@ -368,24 +368,41 @@ test.describe("Hero KPI strip (TEAM-4482)", () => {
     expect(stripText).not.toContain("0/100");
     expect(stripText).not.toMatch(/\bF\b/);
 
+    // TEAM-4515 D-3: the full card sits directly below the strip and must not
+    // contradict it. This fixture keeps v4Card's real cost block (41.27 / 30.27 /
+    // 11 / 1.2) and only flags dataQuality.costMissing, so a card that ignored the
+    // flag would happily print those numbers.
+    const runCard = page.locator("#run-performance-card");
+    await expect(runCard).toContainText(/\$0\s*·\s*no usage data/);
+    await expect(runCard).not.toContainText("$41");
+    await expect(runCard).not.toContainText("$1.20");
+    // Time is measured and stays measured — only the cost rows go blank.
+    await expect(runCard).toContainText("2h 33m");
+
     await page.screenshot({ path: `${SCREENSHOT_DIR}/07-missing-data.png` });
   });
 
   // ─── Sidebar chips + sort/filter ─────────────────────────────────────────
 
-  // Explicit descending startedAt: the sidebar's default order is date-descending,
-  // so the rows must not share a timestamp or "newest" order would be arbitrary.
+  // Explicit descending startedAt AND completedAt: Past is ordered by FINISH time
+  // (byFinishedDesc — TEAM-4504), so listRow's `new Date()` completedAt default
+  // would make the default order depend on which millisecond each row happened to
+  // be constructed in. Both keys descend together here, so these three rows have
+  // the one unambiguous order the cases below expect.
   const CHIP_ROWS = [
     listRow("wf-a", "Cheap run A", {
       startedAt: new Date(Date.UTC(2026, 0, 3)).toISOString(),
+      completedAt: new Date(Date.UTC(2026, 0, 3, 1)).toISOString(),
       kpi: { version: 5, cost: { usd: 41.27 }, time: { wallMs: 9180000 }, quality: { score: 74, grade: "C", confidence: "full" } },
     }),
     listRow("wf-b", "Expensive run B", {
       startedAt: new Date(Date.UTC(2026, 0, 2)).toISOString(),
+      completedAt: new Date(Date.UTC(2026, 0, 2, 1)).toISOString(),
       kpi: { version: 5, cost: { usd: 182 }, time: { wallMs: 259200000 }, quality: { score: 58, grade: "F", confidence: "full" } },
     }),
     listRow("wf-c", "Uncomputed run C", {
       startedAt: new Date(Date.UTC(2026, 0, 1)).toISOString(),
+      completedAt: new Date(Date.UTC(2026, 0, 1, 1)).toISOString(),
       kpi: null,
     }),
   ];
@@ -517,6 +534,14 @@ test.describe("Hero KPI strip (TEAM-4482)", () => {
     await expect(cost).not.toContainText("personas");
     await expect(page.locator(TIME)).toContainText("2h 33m");
     await expect(page.locator(QUALITY)).toContainText("no deterministic score");
+
+    // TEAM-4515 D-3: the full card read "$0.00" for the total and every cost row
+    // while the strip above it said "no usage data" — a v4 $0 is an unmatched span,
+    // not a free run, and $0.00 is the rendering that reads as a real bill.
+    const runCard = page.locator("#run-performance-card");
+    await expect(runCard).toContainText(/\$0\s*·\s*no usage data/);
+    await expect(runCard).not.toContainText("$0.00");
+    await expect(runCard).toContainText("2h 33m");
     expect(errors).toEqual([]);
 
     await page.screenshot({ path: `${SCREENSHOT_DIR}/13-v4-zero-cost.png` });
@@ -551,5 +576,50 @@ test.describe("Hero KPI strip (TEAM-4482)", () => {
     await expect(runCard).toContainText("2 priced");
 
     await page.screenshot({ path: `${SCREENSHOT_DIR}/14-thin-cost-baseline.png` });
+  });
+
+  // ─── Past order is finish-time based (TEAM-4515 D-1 / TEAM-4504) ──────────
+
+  /**
+   * A run that started FIRST but finished LAST, and one that started later but
+   * finished earlier. Handed to the page in startedAt-descending order — exactly
+   * the order the list API returns — so a "newest" that passed its input through,
+   * or sorted on startedAt, would put the wrong row first.
+   */
+  const FINISH_ORDER_ROWS = [
+    listRow("wf-late-start", "Started late, finished early", {
+      startedAt: new Date(Date.UTC(2026, 0, 5)).toISOString(),
+      completedAt: new Date(Date.UTC(2026, 0, 6)).toISOString(),
+      kpi: { version: 5, cost: { usd: 88 }, time: { wallMs: 3600000 }, quality: { score: 90, grade: "A", confidence: "full" } },
+    }),
+    listRow("wf-early-start", "Started early, finished late", {
+      startedAt: new Date(Date.UTC(2026, 0, 1)).toISOString(),
+      completedAt: new Date(Date.UTC(2026, 0, 10)).toISOString(),
+      kpi: { version: 5, cost: { usd: 12 }, time: { wallMs: 3600000 }, quality: { score: 80, grade: "B", confidence: "full" } },
+    }),
+  ];
+
+  const LATE_START = "$88 1h 0m 90 A";
+  const EARLY_START = "$12 1h 0m 80 B";
+
+  test("15. the default 'newest' order is newest-FINISHED, not newest-started", async ({ page }) => {
+    await mockList(page, FINISH_ORDER_ROWS);
+    await mockBoard(page, mockState(WF));
+    await mockPerformance(page, perfMock([{ status: 404 }]));
+    await page.goto("/workflow");
+    await page.waitForSelector("[data-testid=wf-sort]", { timeout: 15_000 });
+
+    await expect(page.locator("[data-testid=wf-sort]")).toHaveValue("newest");
+    // The run that started 4 days EARLIER but finished 4 days LATER leads.
+    expect(await chipRows(page)).toEqual([EARLY_START, LATE_START]);
+
+    // Round-trip through another sort: "newest" must RE-DERIVE finish order rather
+    // than inherit whatever order the list was last left in.
+    await page.locator("[data-testid=wf-sort]").selectOption("cost");
+    expect(await chipRows(page)).toEqual([LATE_START, EARLY_START]);
+    await page.locator("[data-testid=wf-sort]").selectOption("newest");
+    expect(await chipRows(page)).toEqual([EARLY_START, LATE_START]);
+
+    await page.screenshot({ path: `${SCREENSHOT_DIR}/15-finish-time-order.png` });
   });
 });
