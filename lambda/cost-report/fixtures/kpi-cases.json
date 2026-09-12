@@ -3,7 +3,7 @@
   "kpiVersion": 1,
   "_fixture": {
     "ticket": "TEAM-4477 / TEAM-4479 / TEAM-4484",
-    "what": "The deterministic quality score, case by case. Every `expected` block is hand-derived from src/config/kpi.json (the arithmetic is written out in each case's `derivation`) and is authoritative: if the scorer disagrees with this file, the scorer is wrong. Cards carry values exactly as buildCard emits them — firstPassYield has already been through round4, so 15/18 appears as 0.8333 and firstPass earns 24.999 rather than a clean 25. Cards are minimal (only the paths the scorer and the card-level kpi block read) except `real-full-card`, which is a full v5 card shape so the scorer is proven against the real thing. kind \"compute\" → computeKpi(card, KPI_CONFIG) must deep-equal `expected`; kind \"tolerate\" → readKpi(card) === null, summarize(card).kpi === null, no throw.",
+    "what": "The deterministic quality score, case by case. Every `expected` block is hand-derived from src/config/kpi.json (the arithmetic is written out in each case's `derivation`) and is authoritative: if the scorer disagrees with this file, the scorer is wrong. Cards carry values exactly as buildCard emits them — firstPassYield has already been through round4, so 15/18 appears as 0.8333 and firstPass earns 24.999 rather than a clean 25. Cards are minimal (only the paths the scorer and the card-level kpi block read) except `real-full-card`, which is a full v5 card shape so the scorer is proven against the real thing. kind \"compute\" → computeKpi(card, KPI_CONFIG) must deep-equal `expected`; kind \"tolerate\" → readKpi(card) === null, summarize(card).kpi === null, no throw. `expected.costUsd` is the card-level `kpi.cost.usd` (null when dataQuality.costMissing), so the TS mirror can assert the cost slot from the same file rather than restating the card.",
     "readBy": ["lambda/cost-report/kpi.test.mjs", "src/lib/workflow/performance.test.ts"]
   },
   "cases": [
@@ -27,6 +27,7 @@
       "expected": {
         "score": 74, "grade": "C", "confidence": "full", "evidenceWeight": 100,
         "outcome": "complete", "excluded": [], "capsApplied": [],
+        "costUsd": 18.42,
         "components": [
           { "key": "firstPass", "points": 24.999 },
           { "key": "rework", "points": 14.4444 },
@@ -57,6 +58,7 @@
       "expected": {
         "score": 73, "grade": "C", "confidence": "partial", "evidenceWeight": 95,
         "outcome": "complete", "excluded": ["ci"], "capsApplied": [],
+        "costUsd": 18.42,
         "components": [
           { "key": "firstPass", "points": 24.999 },
           { "key": "rework", "points": 14.4444 },
@@ -88,6 +90,7 @@
         "score": 69, "grade": "D", "confidence": "full", "evidenceWeight": 100,
         "outcome": "deploy-blocked", "excluded": [],
         "capsApplied": [{ "kind": "outcome", "outcome": "deploy-blocked", "cap": 69 }],
+        "costUsd": 18.42,
         "components": [
           { "key": "firstPass", "points": 24.999 },
           { "key": "rework", "points": 14.4444 },
@@ -118,6 +121,7 @@
       "expected": {
         "score": 69, "grade": "D", "confidence": "full", "evidenceWeight": 100,
         "outcome": "complete", "excluded": [], "capsApplied": [],
+        "costUsd": 18.42,
         "components": [
           { "key": "firstPass", "points": 24.999 },
           { "key": "rework", "points": 14.4444 },
@@ -148,6 +152,7 @@
       "expected": {
         "score": 100, "grade": "A", "confidence": "full", "evidenceWeight": 100,
         "outcome": "complete", "excluded": [], "capsApplied": [],
+        "costUsd": 7.15,
         "components": [
           { "key": "firstPass", "points": 30, "normalized": 1 },
           { "key": "rework", "points": 20, "normalized": 1 },
@@ -178,6 +183,7 @@
       "expected": {
         "score": 62, "grade": "D", "confidence": "full", "evidenceWeight": 100,
         "outcome": "complete", "excluded": [], "capsApplied": [],
+        "costUsd": 18.42,
         "components": [
           { "key": "firstPass", "points": 24.999 },
           { "key": "rework", "points": 14.4444 },
@@ -208,6 +214,7 @@
       "expected": {
         "score": 90, "grade": "A", "confidence": "full", "evidenceWeight": 100,
         "outcome": "complete", "excluded": [], "capsApplied": [],
+        "costUsd": 7.15,
         "components": [
           { "key": "firstPass", "points": 30 },
           { "key": "rework", "points": 20 },
@@ -238,6 +245,7 @@
       "expected": {
         "score": 80, "grade": "B", "confidence": "full", "evidenceWeight": 100,
         "outcome": "complete", "excluded": [], "capsApplied": [],
+        "costUsd": 7.15,
         "components": [
           { "key": "firstPass", "points": 30 },
           { "key": "rework", "points": 20 },
@@ -268,6 +276,7 @@
       "expected": {
         "score": 70, "grade": "C", "confidence": "full", "evidenceWeight": 100,
         "outcome": "complete", "excluded": [], "capsApplied": [],
+        "costUsd": 7.15,
         "components": [
           { "key": "firstPass", "points": 30 },
           { "key": "rework", "points": 20 },
@@ -298,6 +307,7 @@
       "expected": {
         "score": 60, "grade": "D", "confidence": "full", "evidenceWeight": 100,
         "outcome": "complete", "excluded": [], "capsApplied": [],
+        "costUsd": 7.15,
         "components": [
           { "key": "firstPass", "points": 30 },
           { "key": "rework", "points": 20 },
@@ -328,6 +338,7 @@
       "expected": {
         "score": 55, "grade": "F", "confidence": "full", "evidenceWeight": 100,
         "outcome": "complete", "excluded": [], "capsApplied": [],
+        "costUsd": 7.15,
         "components": [
           { "key": "firstPass", "points": 30 },
           { "key": "rework", "points": 20 },
@@ -358,6 +369,7 @@
       "expected": {
         "score": 93, "grade": "A", "confidence": "full", "evidenceWeight": 100,
         "outcome": "complete", "excluded": [], "capsApplied": [],
+        "costUsd": 7.15,
         "components": [
           { "key": "firstPass", "points": 30 },
           { "key": "rework", "points": 20 },
@@ -388,6 +400,7 @@
       "expected": {
         "score": null, "grade": null, "confidence": "insufficient", "evidenceWeight": 45,
         "outcome": "complete", "excluded": ["firstPass", "rework", "ci"], "capsApplied": [],
+        "costUsd": 0.42,
         "components": [
           { "key": "firstPass", "points": null },
           { "key": "rework", "points": null },
@@ -419,6 +432,7 @@
         "score": 69, "grade": "D", "confidence": "full", "evidenceWeight": 100,
         "outcome": "cancelled", "excluded": [],
         "capsApplied": [{ "kind": "outcome", "outcome": "cancelled", "cap": 69 }],
+        "costUsd": 7.15,
         "components": [
           { "key": "firstPass", "points": 30 },
           { "key": "rework", "points": 20 },
@@ -450,6 +464,7 @@
         "score": 69, "grade": "D", "confidence": "full", "evidenceWeight": 100,
         "outcome": "static-ci-only", "excluded": [],
         "capsApplied": [{ "kind": "outcome", "outcome": "static-ci-only", "cap": 69 }],
+        "costUsd": 18.42,
         "components": [
           { "key": "firstPass", "points": 24.999 },
           { "key": "rework", "points": 14.4444 },
@@ -481,7 +496,7 @@
         "score": 100, "grade": "A", "confidence": "full", "evidenceWeight": 100,
         "outcome": "complete", "excluded": [], "capsApplied": [],
         "costMissing": true,
-        "kpiCostUsd": null,
+        "costUsd": null,
         "components": [
           { "key": "firstPass", "points": 30 },
           { "key": "rework", "points": 20 },
@@ -634,6 +649,7 @@
       "expected": {
         "score": 77, "grade": "C", "confidence": "full", "evidenceWeight": 100,
         "outcome": "complete", "excluded": [], "capsApplied": [],
+        "costUsd": 21.7433,
         "components": [
           { "key": "firstPass", "points": 24.999, "normalized": 0.8333 },
           { "key": "rework", "points": 14.4444, "normalized": 0.7222 },

@@ -6,7 +6,12 @@
  * (median + MAD, warn at 2σ, alert at 3σ, sigma floored at max(floor, 10% of
  * |median|)) deliberately mirrors lambda/cost-report/index.mjs so a run's card
  * and the fleet view never disagree about what "anomalous" means.
+ *
+ * It also holds the TS mirror of the deterministic quality score (`computeKpi`,
+ * bottom of the file) — same rubric file, same arithmetic as the Lambda.
  */
+
+import kpiConfig from "@/config/kpi.json";
 
 export type BandStatus = "ok" | "warn" | "alert" | "insufficient" | "unknown";
 export type KpiUnit = "usd" | "ms" | "tokens" | "count" | "ratio";
@@ -35,11 +40,20 @@ export interface CardSummary {
     tasks: number; reworkRounds: number; changeRequests: number; fixTickets: number;
     loops: number; nudges: number; errors: number; gateRounds: number;
     firstPassYield: number | null; humanGates: number;
+    /** Deterministic 0-100 quality score (report v5+). Absent on older summaries. */
+    score?: number | null;
   };
   agents: Record<string, { usd: number; workMs: number; tasks: number; reworkRounds: number }>;
   status: BandStatus;
   anomalies: { kpi: string; status: BandStatus; z: number | null }[];
   gaps: number;
+  /** Hero KPI headline (report v5+); `null`/absent means "not scored", never zero. */
+  kpi?: {
+    version: number;
+    quality: { score: number | null; grade: string | null; confidence: string };
+  } | null;
+  /** True when the run's cost spans never matched — a $0 total is unknown, not free. */
+  costMissing?: boolean;
 }
 
 export interface InfraSnapshot {
@@ -96,6 +110,10 @@ export const FLEET_KPIS: KpiDef[] = [
   { key: "quality.errors", label: "Errors", unit: "count", group: "quality", floor: 1, help: "agent.error events" },
   { key: "quality.firstPassYield", label: "First-pass yield", unit: "ratio", group: "quality", floor: 0.1, direction: "lower", help: "Share of agent tasks that needed no rework (higher is better)" },
   { key: "cost.personaCacheHitRate", label: "Persona cache hit rate", unit: "ratio", group: "cost", floor: 0.1, direction: "lower", help: "Share of persona input tokens served from the Bedrock prompt cache (higher is better)" },
+  // `floor: 5` is the BAND floor (mirrors the Lambda's BAND_KPIS row for this
+  // path), not a kpi.json rubric value — the rubric never appears as a literal
+  // anywhere in this file. See the R-3 note in the quality-score section below.
+  { key: "quality.score", label: "Quality score", unit: "count", group: "quality", floor: 5, direction: "lower", help: "Deterministic 0-100 quality score (higher is better)" },
 ];
 
 export const BASELINE_DAYS = 28;
@@ -213,10 +231,22 @@ function stat(xs: number[]): KpiStat | null {
 
 const ms = (d: number) => d * 86_400_000;
 
-/** Cards with cost data — a $0 card means the spans didn't match, not a free run. */
+/**
+ * Cards we can place on a timeline. A run is real as soon as it has a terminal
+ * timestamp — cost is a SEPARATE axis (FR-4.2). Before TEAM-4483 a $0 card was
+ * dropped here, which silently under-reported `totals.runs` and every time and
+ * quality KPI for any run whose cost spans never matched.
+ */
 export function isValidCard(c: CardSummary): boolean {
-  return (c.cost?.total ?? 0) > 0 && !!c.completedAt;
+  return !!c.completedAt;
 }
+
+/**
+ * Cards we actually priced. A $0 total means the spans didn't match, not a free
+ * run, so cost KPIs / cost totals must exclude these rather than average a zero
+ * into the median.
+ */
+export const hasCostData = (c: CardSummary): boolean => (c.cost?.total ?? 0) > 0;
 
 export function buildFleetView(
   index: PerformanceIndex,
@@ -238,15 +268,26 @@ export function buildFleetView(
   const prior = scoped.filter((c) => at(c) >= priorStart && at(c) < start);
   const baseline = scoped.filter((c) => at(c) >= baselineStart && at(c) < start);
 
+  // FR-4.2: cost KPIs and cost totals see only the runs we actually priced, so a
+  // cost KPI's `n` is "runs with cost data" and an unpriced run can't drag the
+  // median to zero. Everything else (time, quality, run counts) sees every run.
+  const costRuns = runs.filter(hasCostData);
+  const costPrior = prior.filter(hasCostData);
+  const costBaseline = baseline.filter(hasCostData);
+
   const kpis: FleetKpi[] = FLEET_KPIS.map((k) => {
-    const cur = runs.map((c) => getPath(c, k.key)).filter((v): v is number => v != null);
-    const pri = prior.map((c) => getPath(c, k.key)).filter((v): v is number => v != null);
+    const isCost = k.group === "cost";
+    const curSrc = isCost ? costRuns : runs;
+    const priSrc = isCost ? costPrior : prior;
+    const baseSrc = isCost ? costBaseline : baseline;
+    const cur = curSrc.map((c) => getPath(c, k.key)).filter((v): v is number => v != null);
+    const pri = priSrc.map((c) => getPath(c, k.key)).filter((v): v is number => v != null);
     const current = stat(cur), priorStat = stat(pri);
-    const band = bandFor(baseline.map((c) => getPath(c, k.key)), current?.median ?? null, k.floor, k.direction || "upper");
+    const band = bandFor(baseSrc.map((c) => getPath(c, k.key)), current?.median ?? null, k.floor, k.direction || "upper");
     const deltaPct = current && priorStat && priorStat.median !== 0
       ? (current.median - priorStat.median) / Math.abs(priorStat.median)
       : null;
-    const series = [...runs].reverse()
+    const series = [...curSrc].reverse()
       .map((c) => ({ t: c.completedAt, v: getPath(c, k.key), workflowId: c.workflowId }))
       .filter((p): p is { t: string; v: number; workflowId: string } => p.v != null);
     return { ...k, current, prior: priorStat, deltaPct, band, status: band?.status ?? (current ? "insufficient" : "unknown"), series };
@@ -256,14 +297,19 @@ export function buildFleetView(
   const engines: Record<string, number> = {};
   const totals = { runs: runs.length, cost: 0, persona: 0, coding: 0, tokens: 0, cacheRead: 0, cacheWrite: 0, agentWorkMs: 0, wallMs: 0, loops: 0, reworkRounds: 0 };
   for (const c of runs) {
-    totals.cost += c.cost.total; totals.persona += c.cost.persona; totals.coding += c.cost.coding;
-    totals.tokens += c.cost.tokens; totals.cacheRead += c.cost.cacheRead ?? 0; totals.cacheWrite += c.cost.cacheWrite ?? 0;
+    const priced = hasCostData(c);
+    // Money rollups from priced runs only; work/count rollups from every run.
+    if (priced) {
+      totals.cost += c.cost.total; totals.persona += c.cost.persona; totals.coding += c.cost.coding;
+      totals.tokens += c.cost.tokens; totals.cacheRead += c.cost.cacheRead ?? 0; totals.cacheWrite += c.cost.cacheWrite ?? 0;
+      for (const [e, usd] of Object.entries(c.cost.byEngine || {})) engines[e] = (engines[e] || 0) + usd;
+    }
     totals.agentWorkMs += c.time.agentWork; totals.wallMs += c.time.wall ?? 0;
     totals.loops += c.quality.loops; totals.reworkRounds += c.quality.reworkRounds;
-    for (const [e, usd] of Object.entries(c.cost.byEngine || {})) engines[e] = (engines[e] || 0) + usd;
     for (const [agentId, a] of Object.entries(c.agents || {})) {
       const agg = agentMap.get(agentId) || { agentId, usd: 0, workMs: 0, tasks: 0, reworkRounds: 0, runs: 0, usdPerTask: null };
-      agg.usd += a.usd; agg.workMs += a.workMs; agg.tasks += a.tasks; agg.reworkRounds += a.reworkRounds; agg.runs++;
+      if (priced) agg.usd += a.usd;
+      agg.workMs += a.workMs; agg.tasks += a.tasks; agg.reworkRounds += a.reworkRounds; agg.runs++;
       agentMap.set(agentId, agg);
     }
   }
@@ -322,4 +368,266 @@ export function formatKpi(unit: KpiUnit, v: number | null | undefined, compact =
     case "ratio": return `${Math.round(v * 100)}%`;
     default: return Number.isInteger(v) ? String(v) : v.toFixed(1);
   }
+}
+
+// ─── Deterministic quality score (src/config/kpi.json) ────────────────────────
+//
+// `computeKpi` is the TS mirror of the cost-report Lambda's scorer. Both read the
+// SAME rubric file and must produce byte-identical output for the same card —
+// lambda/cost-report/fixtures/kpi-cases.json is the shared fixture that proves
+// it (performance.test.ts runs every case through this copy).
+//
+// R-3: NOT ONE weight, tolerance, outcome cap, grade threshold or
+// minEvidenceWeight may appear here as a numeric literal — every rubric value is
+// read from `config`. The only numeric literals below are the clamp bounds (0, 1),
+// the percentage base (100), round4's factor, and the +0.5 of the explicit
+// round-half-up; all four are arithmetic, not policy. Changing the rubric means
+// editing kpi.json, never this file.
+//
+// PURE: no AWS, no clock. `computedAt` is the card's own `generatedAt`, so
+// recomputing a card twice yields the same bytes.
+
+export type KpiComponentKind = "ratio" | "rate" | "count" | "sum" | "excess" | "verdict";
+export type KpiConfidence = "full" | "partial" | "insufficient";
+
+export interface KpiGradeDef { grade: string; min: number }
+
+/**
+ * One weighted line of the rubric. Which optional fields matter depends on
+ * `kind`: `rate` uses source+per, `sum` uses sources, `excess` uses
+ * source+baseline, `verdict` uses source+values+neutralOn, and every arithmetic
+ * kind except `ratio` uses `tolerance` (the value at which the line scores 0).
+ *
+ * Not to be confused with `KpiDef` above — that's a fleet BAND definition
+ * (median + MAD anomaly detection). This is a scoring component.
+ */
+export interface KpiComponentDef {
+  key: string;
+  label: string;
+  weight: number;
+  kind: KpiComponentKind;
+  source?: string;
+  sources?: string[];
+  per?: string;
+  baseline?: string;
+  tolerance?: number;
+  values?: Record<string, number>;
+  neutralOn?: (string | null)[];
+}
+
+export interface KpiConfig {
+  kpiVersion: number;
+  /** Highest `min` first — the first entry a score reaches wins. */
+  grades: KpiGradeDef[];
+  /** Outcome → ceiling. A run that didn't ship can't grade above its cap. */
+  outcomeCaps: Record<string, number>;
+  quality: { minEvidenceWeight: number; components: KpiComponentDef[] };
+}
+
+export const KPI_CONFIG = kpiConfig as KpiConfig;
+
+/** Card schema this build reads/writes. Bumped with any card shape change. */
+export const CURRENT_REPORT_VERSION = 5;
+
+export interface KpiComponent {
+  key: string;
+  label: string;
+  weight: number;
+  /** The measured input (a string for `verdict` kinds), or null when absent. */
+  raw: number | string | null;
+  /** UNCLAMPED, so an over-tolerance input is visibly negative. */
+  normalized: number | null;
+  /** round4(weight x clamp(normalized, 0, 1)), or null when excluded. */
+  points: number | null;
+  included: boolean;
+  /** Why the component was excluded. Only set when `included` is false. */
+  note?: string;
+}
+
+export interface KpiCap { kind: "outcome"; outcome: string; cap: number }
+
+export interface Kpi {
+  version: number;
+  computedAt: string | null;
+  cost: { usd: number | null; band: BandStatus; z: number | null };
+  time: { wallMs: number | null; activeMs: number | null; humanWaitMs: number | null; band: BandStatus; z: number | null };
+  quality: {
+    score: number | null;
+    grade: string | null;
+    confidence: KpiConfidence;
+    evidenceWeight: number;
+    outcome: string;
+    band: BandStatus;
+    z: number | null;
+    components: KpiComponent[];
+    excluded: string[];
+    capsApplied: KpiCap[];
+  };
+}
+
+/**
+ * The shape `computeKpi` reads. Deliberately all-optional with an index
+ * signature: a report-v4 card, or a card with a data gap, must typecheck and
+ * score without throwing.
+ */
+export interface PerformanceCardInput {
+  reportVersion?: number;
+  generatedAt?: string;
+  run?: { outcome?: string | null;[k: string]: unknown } | null;
+  cost?: { totalUsd?: number | null;[k: string]: unknown } | null;
+  time?: { [k: string]: unknown } | null;
+  quality?: { [k: string]: unknown } | null;
+  dataQuality?: { costMissing?: boolean;[k: string]: unknown } | null;
+  kpi?: unknown;
+  [k: string]: unknown;
+}
+
+/** Byte-parity with the Lambda's round4 — 4 dp is the card's money/ratio precision. */
+export function round4(n: number): number {
+  return Math.round(n * 10000) / 10000;
+}
+
+/** The non-numeric sibling of `getPath` — walks a dotted path to any value. */
+function getRaw(obj: unknown, path: string): unknown {
+  return path.split(".").reduce<unknown>((o, k) => (o == null ? undefined : (o as Record<string, unknown>)[k]), obj);
+}
+
+const UNKNOWN_OUTCOME = "unknown";
+
+interface Measured { raw: number | string | null; normalized: number | null; note?: string }
+
+/** Per-kind measurement. `normalized === null` means "no evidence" → excluded. */
+function measure(card: PerformanceCardInput, def: KpiComponentDef): Measured {
+  const num = (path: string | undefined) => (path ? getPath(card, path) : null);
+  const tolerance = def.tolerance;
+  // A rubric line whose tolerance is missing is misconfigured, not zero-scoring:
+  // excluding it keeps one bad edit from silently grading every run down.
+  const needsTolerance = def.kind !== "ratio" && def.kind !== "verdict";
+  if (needsTolerance && tolerance === undefined) {
+    return { raw: null, normalized: null, note: `${def.key}: no tolerance in kpi.json` };
+  }
+  const decay = (raw: number) => 1 - raw / (tolerance as number);
+
+  switch (def.kind) {
+    case "ratio": {
+      const raw = num(def.source);
+      return raw === null ? { raw, normalized: null, note: `no ${def.source}` } : { raw, normalized: raw };
+    }
+    case "rate": {
+      const per = num(def.per);
+      if (!(per !== null && per > 0)) return { raw: null, normalized: null, note: `no ${def.per}` };
+      const hits = num(def.source);
+      if (hits === null) return { raw: null, normalized: null, note: `no ${def.source}` };
+      const raw = hits / per;
+      return { raw, normalized: decay(raw) };
+    }
+    case "count": {
+      const raw = num(def.source);
+      return raw === null ? { raw, normalized: null, note: `no ${def.source}` } : { raw, normalized: decay(raw) };
+    }
+    case "sum": {
+      const sources = def.sources ?? [];
+      const values = sources.map((s) => num(s));
+      // Only a card missing EVERY source has no evidence; a missing sibling is 0.
+      if (!values.some((v) => v !== null)) return { raw: null, normalized: null, note: `no ${sources.join(" / ") || def.key}` };
+      const raw = values.reduce<number>((s, v) => s + (v ?? 0), 0);
+      return { raw, normalized: decay(raw) };
+    }
+    case "excess": {
+      const value = num(def.source), floor = num(def.baseline);
+      if (value === null || floor === null) return { raw: null, normalized: null, note: `no ${def.source} or ${def.baseline}` };
+      const raw = Math.max(0, value - floor);
+      return { raw, normalized: decay(raw) };
+    }
+    case "verdict": {
+      const found = getRaw(card, def.source ?? "");
+      const raw = typeof found === "string" ? found : null;
+      const values = def.values ?? {};
+      const neutral = (def.neutralOn ?? []).some((n) => n === raw);
+      if (neutral || raw === null || !Object.prototype.hasOwnProperty.call(values, raw)) {
+        return { raw, normalized: null, note: `${def.source} is ${raw ?? "absent"}` };
+      }
+      return { raw, normalized: values[raw] };
+    }
+  }
+}
+
+/**
+ * Score a performance card against the rubric. Deterministic and total: any card
+ * shape scores or reports `insufficient`, and nothing here throws.
+ */
+export function computeKpi(card: PerformanceCardInput, config: KpiConfig = KPI_CONFIG): Kpi {
+  const components: KpiComponent[] = [];
+  const excluded: string[] = [];
+  const capsApplied: KpiCap[] = [];
+  let evidenceWeight = 0;
+  // Σ of UNROUNDED points. The rounded per-component values are for display only
+  // — summing those instead would drift the score by up to a point.
+  let earned = 0;
+
+  for (const def of config.quality.components) {
+    const { raw, normalized, note } = measure(card, def);
+    if (normalized === null || !Number.isFinite(normalized)) {
+      excluded.push(def.key);
+      components.push({ key: def.key, label: def.label, weight: def.weight, raw, normalized: null, points: null, included: false, note });
+      continue;
+    }
+    const clamped = Math.min(1, Math.max(0, normalized));
+    earned += def.weight * clamped;
+    evidenceWeight += def.weight;
+    components.push({ key: def.key, label: def.label, weight: def.weight, raw, normalized, points: round4(def.weight * clamped), included: true });
+  }
+
+  const outcome = typeof card.run?.outcome === "string" ? card.run.outcome : UNKNOWN_OUTCOME;
+  let score: number | null = null;
+  let grade: string | null = null;
+  let confidence: KpiConfidence = "insufficient";
+
+  if (evidenceWeight >= config.quality.minEvidenceWeight) {
+    // Round HALF UP explicitly: Math.round is half-up only for positives, and the
+    // Lambda twin must agree on the .5 case (see the round-half-up fixture).
+    score = Math.floor((100 * earned) / evidenceWeight + 0.5);
+    const cap = config.outcomeCaps[outcome];
+    // Record the cap only when it actually lowered the score, so capsApplied
+    // reads as "this is why the grade is what it is".
+    if (cap !== undefined && score > cap) {
+      capsApplied.push({ kind: "outcome", outcome, cap });
+      score = cap;
+    }
+    confidence = evidenceWeight === 100 ? "full" : "partial";
+    grade = config.grades.find((g) => (score as number) >= g.min)?.grade ?? null;
+  }
+
+  // A $0 total is unknown cost, never a free run — the hero strip must show "—".
+  const costMissing = !!card.dataQuality?.costMissing || !((card.cost?.totalUsd ?? 0) > 0);
+
+  return {
+    version: config.kpiVersion,
+    computedAt: card.generatedAt ?? null,
+    cost: { usd: costMissing ? null : (card.cost?.totalUsd ?? null), band: "unknown", z: null },
+    time: {
+      wallMs: getPath(card, "time.wallMs"),
+      activeMs: getPath(card, "time.activeMs"),
+      humanWaitMs: getPath(card, "time.humanWaitMs"),
+      band: "unknown",
+      z: null,
+    },
+    quality: {
+      score, grade, confidence, evidenceWeight, outcome,
+      band: "unknown", z: null,
+      components, excluded, capsApplied,
+    },
+  };
+}
+
+/**
+ * Read a card's stored `kpi` block. Returns null for anything that isn't a
+ * versioned KPI — a report-v4 card, a half-written card, a null. Never throws:
+ * callers render every run in the same list.
+ */
+export function readKpi(card: PerformanceCardInput | null | undefined): Kpi | null {
+  const stored = card?.kpi;
+  if (!stored || typeof stored !== "object") return null;
+  const version = (stored as { version?: unknown }).version;
+  return typeof version === "number" && Number.isFinite(version) ? (stored as Kpi) : null;
 }

@@ -47,13 +47,16 @@ The orchestration pipeline. Self-contained surface.
 
 **API routes**
 - `src/app/api/workflow/` — start/state/list/events/stream/cancel/retry/artifacts/webhook/agent-output/complete/nudge/performance (plus definitions, tickets, watch, escalations, analysis under `[id]/`)
+- `src/app/api/workflow/performance/` — `GET` fleet view (`?days=&defId=`) or one run's card (`?workflowId=`); `POST {workflowId}` recomputes a **terminal** run's card by invoking `COST_REPORT_FUNCTION` with `InvocationType: "Event"` → `202 {accepted,pollAfterMs}`, or `200 {card}` when the stored card is already at the current report version. `400` malformed id, `404` unknown run, `409` run not terminal, `429` a recompute is already in flight (in-memory, per-ECS-task, 10 min TTL). Read-only against DynamoDB
+- `src/app/api/workflow/list/` — joins each row's hero KPI headline (`kpi: {version, cost.usd, time.wallMs, quality.{score,grade,confidence}}`) off `performance/index.json`. Best effort: an unreadable index degrades every row to `kpi: null` rather than failing the list, and unknown cost is `null`, never `0`
 - `src/app/api/workflow/cd-registry/` — the **CD registry** (which repos the hub merges + deploys): GET list / `?repo=` lookup, POST upsert, DELETE remove → `s3://ARTIFACT_BUCKET/config/cd-registry.json`
 - `src/app/api/jira/` — Jira webhook + metrics
 - `src/app/api/models/` — model picker (used only by the workflow intake form)
 
 **Frontend code**
-- `src/components/workflow/`
-- `src/lib/workflow/` (~30 modules: types, ticket providers (`ticket-provider*.ts`), board state, leases, ship-review, event transforms, jira-client, model-config, watchdog, performance (fleet performance card — see `docs/performance-card.md`), …)
+- `src/components/workflow/` — incl. `HeroKpiStrip.tsx` (the run's cost / time / quality hero strip, driven by the card's `kpi` block)
+- `src/lib/workflow/` (~30 modules: types, ticket providers (`ticket-provider*.ts`), board state, leases, ship-review, event transforms, jira-client, model-config, watchdog, performance (fleet performance card + `computeKpi`, the TS mirror of the Lambda scorer — see `docs/performance-card.md`), …)
+- `src/lib/workflow/performance-index.ts` — the one `performance/index.json` read + 60 s cache, shared by the performance and list routes so they cost one S3 GET per TTL between them (read-only)
 - `src/lib/pipeline-config.ts`
 - `src/lib/cd-registry.ts` (core lib, no module imports) + `src/config/cd-registry.json` (first-deploy seed; ships empty) — mirror of `lambda/orchestrator/cd-registry.mjs`. Unregistered repo = **handoff**: no Ship / Merge Approval / CD tickets, the orchestrator opens the unified PR at completion and leaves it open for the owning team (`workflow.delivery = { mode: "handoff", prUrl }`). Registered = full ship phase; an entry with a `pipeline` also turns on Pipeline Mode for that repo's agents. `pipelineProjectsFor(entry)` is the TS mirror of the canonical `pipelineProjects(entry)` — it derives `<base>-ci` / `<base>-build` / `<base>-deploy` from the entry's `pipeline` (`hub-<slug>-deploy` convention; an explicit `ciProject` wins), so the UI names exactly the resources the tools Lambda drives. Because the registry is read at runtime by more than the orchestrator, `cd-registry.mjs` is **byte-copied** to `lambda/agentcore-hub-pipeline-tools/cd-registry.mjs` (which pipeline a `Pipeline___*` call may touch) and `deploy/telegram-bug-intake/cd-registry.mjs` (which pipelines the deploy-gate bridge polls); `scripts/check-cd-registry-parity.sh` fails CI when the copies drift, and `deploy/telegram-bug-intake/update-config.sh` is the handoff script that points the bridge at the registered pipelines. Registry write access = deploy-trigger authority (see [`agents-own-cd.md`](./agents-own-cd.md)).
 
@@ -64,6 +67,9 @@ The orchestration pipeline. Self-contained surface.
 - `workflow-output` — collects agent artifacts
 - `cost-report` — per-run performance card (cost / time / quality + anomaly bands) on `workflow.complete`; writes `workflows/{id}/shared/performance-card.{json,md}`, `performance/index.json`, `workflow.performance` events and `AgentCoreHub/Performance` CloudWatch metrics (`docs/performance-card.md`)
 
+**Config**
+- `src/config/kpi.json` — the deterministic quality rubric (`kpiVersion`, grade thresholds, outcome caps, `minEvidenceWeight`, weighted components summing to 100). Single source of truth for the 0-100 score; read identically by `lambda/cost-report/index.mjs` and `src/lib/workflow/performance.ts` (`computeKpi`), and both sides are pinned to the same expected values by `lambda/cost-report/fixtures/kpi-cases.json`. Change the rubric here only — never inline a weight, tolerance or threshold in either scorer
+
 **DynamoDB tables** (defaults in `deploy/config.sh`)
 - `agentcore-hub-workflows` (`WORKFLOWS_TABLE`)
 - `agentcore-hub-events` (`EVENTS_TABLE`)
@@ -71,7 +77,7 @@ The orchestration pipeline. Self-contained surface.
 
 **Deploy scripts**
 - `deploy/setup-tickets-lambda.mjs` and the orchestrator/Jira/output Lambdas
-- `lambda/cost-report/deploy.sh` (`--backfill` / `--rebuild-index`)
+- `lambda/cost-report/deploy.sh` (`--backfill [--since-days N]` / `--rebuild-index`)
 
 **`agents.json` fields it reads**
 - `harnessName` — maps an agent to its AgentCore runtime via the `RUNTIME_ARN_<HARNESS_NAME_UPPER>` convention
@@ -79,7 +85,9 @@ The orchestration pipeline. Self-contained surface.
 
 **Env vars** — `WORKFLOWS_TABLE`, `EVENTS_TABLE`, `TICKETS_TABLE`, `ARTIFACT_BUCKET`,
 `RUNTIME_ARN_<HARNESS>` (one per agent harness), `LAMBDA_ROLE_ARN`; performance card:
-`PERFORMANCE_INDEX_KEY` (default `performance/index.json`), `PUBLISH_CW_METRICS`, `INFRA_REGION`;
+`PERFORMANCE_INDEX_KEY` (default `performance/index.json`), `PUBLISH_CW_METRICS`, `INFRA_REGION`,
+`COST_REPORT_FUNCTION` (default `agentcore-hub-cost-report`) — the Lambda that
+`POST /api/workflow/performance` invokes to recompute a card;
 intake source validation: `SOURCE_VALIDATION_MODE` (`lenient` default | `strict`, see `src/lib/workflow/intake.ts`).
 The mode only controls whether an unverified source blocks the submit; the SSRF gate on the reachability
 GET is unconditional — blocked-range hosts refused, redirects never followed, and the connection pinned
