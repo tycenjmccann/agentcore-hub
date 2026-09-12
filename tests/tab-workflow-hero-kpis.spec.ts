@@ -802,4 +802,175 @@ test.describe("Hero KPI strip (TEAM-4482)", () => {
       }
     });
   }
+
+  // ─── Review fixes (TEAM-4521) ────────────────────────────────────────────
+
+  /**
+   * A complete WorkflowAnalysis record. WM_ANALYSIS above carries only what the hero
+   * tile reads; the PANEL dereferences a good deal more (runOutcome, trigger,
+   * analyzedAt, every sub-score, findings / recommendations / trend), so the case
+   * that drives the panel builds from this. Existing fixtures are untouched.
+   */
+  function fullAnalysis(over: Json = {}): Json {
+    return {
+      workflowId: WF,
+      analysisId: "a2",
+      schemaVersion: 1,
+      kpiVersion: 2,
+      workflowDefId: "sdlc-14",
+      epicId: "TEAM-4482",
+      analyzedAt: new Date(Date.UTC(2026, 0, 2, 12)).toISOString(),
+      trigger: "manual",
+      runOutcome: "complete",
+      model: "us.anthropic.claude-opus-5",
+      s3Prefix: `workflows/${WF}/analysis/a2/`,
+      metrics: {
+        startedAt: new Date(Date.UTC(2026, 0, 2)).toISOString(),
+        completedAt: new Date(Date.UTC(2026, 0, 2, 2, 33)).toISOString(),
+        totalDurationMs: 9180000,
+        phases: [], agentTasks: [], humanReviews: [],
+        humanWaitTotalMs: 1200000,
+        changeRequests: { count: 1, cycles: [] },
+        fixTickets: { count: 1, ticketIds: ["TEAM-4482-1"] },
+        nudgeCount: 0, managerInterventions: [], errors: [],
+        tokens: { totalInput: 900000, totalOutput: 120000, byAgent: {} },
+        evalSummaries: [],
+        counts: { tickets: 14, events: 120, artifacts: 20, completions: 14 },
+        dataQuality: { ticketProvider: "dynamodb", missingSignals: [], notes: [] },
+      },
+      scores: { overall: 81, planning: 84, execution: 78, reviewEfficiency: 72, reworkDiscipline: 86 },
+      verdict: "Solid run — two avoidable rework loops.",
+      findings: [],
+      recommendations: [],
+      trend: {
+        priorRunsCompared: 0,
+        deltas: { totalDurationMs: null, humanWaitTotalMs: null, changeRequests: null, overallScore: null },
+        notes: "First analyzed run for this definition.",
+      },
+      summaryMarkdown: "",
+      ...over,
+    };
+  }
+
+  /** A v5 card whose deterministic rubric version the case controls (F2). */
+  function cardWithKpiVersion(version: number): Json {
+    const card = v5Card();
+    return { ...card, kpi: { ...(card.kpi as Json), version } };
+  }
+
+  /**
+   * The board scrolls INSIDE this element (src/app/workflow/page.tsx — a flex-1
+   * overflow-y-auto region inside h-[calc(100vh-64px)]), not the window: however far
+   * scrollIntoView moves the panel, window.scrollY stays 0.
+   */
+  const SCROLL_REGION = "[data-testid=workflow-main-region]";
+
+  /**
+   * F1: the Workflow Manager tile's only action is scrolling to
+   * #workflow-manager-panel, so it must only ever be offered where the board mounts
+   * that panel. Both ship-blocked terminal phases DO get analyses, and used to get a
+   * tile whose click silently did nothing under an aria-label promising to jump.
+   */
+  for (const phase of ["deploy-blocked", "static-ci-only"] as const) {
+    const key = phase === "deploy-blocked" ? "a" : "b";
+    test(`17${key}. a ${phase} run's Workflow Manager tile really scrolls to the panel`, async ({ page }) => {
+      const errors: string[] = [];
+      page.on("pageerror", (e) => errors.push(e.message));
+      // scrollIntoView is instant under reduce, so nothing below races an animation.
+      await page.emulateMedia({ reducedMotion: "reduce" });
+
+      await mockList(page, [listRow(WF, "Hero KPI fixture", { phase })]);
+      await mockBoard(page, mockState(WF, phase), WM_ANALYSIS);
+      await mockPerformance(page, perfMock([{ card: v5Card() }]));
+      await openRun(page);
+
+      const tile = page.locator("[data-testid=hero-kpi-wm]");
+      const panel = page.locator("#workflow-manager-panel");
+      await expect(tile).toBeVisible();
+      await expect(panel).toBeAttached();
+
+      const region = page.locator(SCROLL_REGION);
+      const scrollTop = () => region.evaluate((el) => el.scrollTop);
+      expect(await scrollTop()).toBe(0);
+      const viewport = page.viewportSize()!.height;
+      const before = (await panel.boundingBox())!;
+      // .pipeline-viz is min-height:100vh and the panel lives at its foot, so the
+      // scroll target starts below the fold — a click that did nothing would leave
+      // it there, which is exactly the bug.
+      expect(before.y).toBeGreaterThan(viewport);
+
+      await tile.click();
+
+      await expect.poll(scrollTop).toBeGreaterThan(0);
+      const after = (await panel.boundingBox())!;
+      expect(after.y).toBeLessThan(before.y);
+      expect(after.y).toBeLessThan(viewport);
+      expect(after.y + after.height).toBeGreaterThan(0);
+      expect(errors).toEqual([]);
+
+      if (phase === "deploy-blocked") {
+        await page.screenshot({ path: `${SCREENSHOT_DIR}/17-wm-tile-scrolled.png` });
+      }
+    });
+  }
+
+  test("18. a complete run with open fix-it tickets offers no tile, mounts no panel, and never fetches the analysis", async ({ page }) => {
+    await mockList(page, [listRow(WF, "Hero KPI fixture")]);
+    await mockBoard(page, mockState(WF), WM_ANALYSIS);
+    // Registered AFTER mockBoard, so these win (Playwright tries the most recently
+    // registered matching route first).
+    let analysisCalls = 0;
+    await page.route("**/api/workflow/*/analysis", (r) => { analysisCalls += 1; return json(r, WM_ANALYSIS); });
+    await page.route("**/api/workflow/*/tickets", (r) => json(r, {
+      tickets: [{
+        ticketId: "TEAM-4482-fix", status: "in_progress", title: "QA fix-it",
+        // Not a human:* assignee, so openTicketByAgent counts it; mockState's empty
+        // agentTasks means nothing can force it back to "done".
+        assignee: "qa", updatedAt: new Date().toISOString(),
+      }],
+    }));
+    await mockPerformance(page, perfMock([{ card: v5Card() }]));
+    await openRun(page);
+
+    // The run is still terminal for KPI purposes — the three tiles stay put.
+    await expect(page.locator(STRIP)).toBeVisible();
+    await expect(page.locator(COST)).toContainText("$41");
+    await expect(page.locator(QUALITY)).toContainText("74/100");
+    // ...but a run with open fix-it tickets isn't settled, so the board mounts no
+    // panel — and then the 4th tile must not be offered, nor its score requested.
+    await expect(page.locator("#workflow-manager-panel")).toHaveCount(0);
+    await expect(page.locator("[data-testid=hero-kpi-wm]")).toHaveCount(0);
+    expect(analysisCalls).toBe(0);
+  });
+
+  test("19. the deterministic chip prints a score only for the kpi version it was scored under", async ({ page }) => {
+    const a2 = fullAnalysis();
+    const a1 = fullAnalysis({
+      analysisId: "a1",
+      kpiVersion: 1,
+      analyzedAt: new Date(Date.UTC(2026, 0, 1, 9)).toISOString(),
+      scores: { overall: 63, planning: 70, execution: 60, reviewEfficiency: 58, reworkDiscipline: 65 },
+      verdict: "Earlier pass, scored under the previous rubric.",
+    });
+    await mockList(page, [listRow(WF, "Hero KPI fixture")]);
+    await mockBoard(page, mockState(WF), { latest: a2, history: [a2, a1], trend: [] });
+    await mockPerformance(page, perfMock([{ card: cardWithKpiVersion(2) }]));
+    await openRun(page);
+
+    const chip = page.locator("[data-testid=wm-det-chip]");
+    await expect(chip).toHaveAttribute("data-kpi-match", "true");
+    await expect(chip).toContainText("Deterministic: 74/100 C");
+
+    // The same run's earlier analysis, scored under kpi v1: the current card's
+    // 74/100 is NOT its deterministic score and must not be printed as one.
+    await page.locator(".wm-history select").selectOption("a1");
+
+    await expect(chip).toHaveAttribute("data-kpi-match", "false");
+    await expect(chip).toContainText("not comparable");
+    await expect(chip).toContainText("kpi v1");
+    await expect(chip).toContainText("kpi v2");
+    await expect(chip).not.toContainText("74/100");
+
+    await page.screenshot({ path: `${SCREENSHOT_DIR}/19-det-chip-provenance.png` });
+  });
 });

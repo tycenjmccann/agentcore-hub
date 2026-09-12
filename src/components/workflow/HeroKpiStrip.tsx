@@ -15,6 +15,10 @@
  *  - a v4 card (no `kpi` block) must render without throwing, and must say so
  *    rather than implying a score of zero.
  *  - colour never carries status on its own: every band chip spells its word.
+ *  - the agent-authored Workflow Manager tile is offered ONLY when the board says
+ *    it mounted the tile's scroll target (`wmPanelMounted` — showWorkflowManager in
+ *    WorkflowBoard.tsx). A tile whose click does nothing, under an aria-label that
+ *    promises to jump to a panel, is worse than no tile at all.
  */
 
 import { Fragment, useEffect, useRef, useState } from "react";
@@ -383,10 +387,16 @@ interface WmAssessment {
 /**
  * The agent-authored score, read separately from the deterministic card. Fetched
  * here rather than inside the tile so the grid knows whether it has a 4th column.
+ *
+ * `enabled` is the board's answer to whether a 4th column is ALLOWED at all: the
+ * tile's only action is scrolling to the Workflow Manager panel, so when the board
+ * did not mount that panel there is nothing to show and nothing to ask for.
  */
-function useWmAssessment(workflowId: string): WmAssessment | null {
+function useWmAssessment(workflowId: string, enabled: boolean): WmAssessment | null {
   const [wm, setWm] = useState<WmAssessment | null>(null);
   useEffect(() => {
+    // No panel on the page → no tile, and no request for a score we would not show.
+    if (!enabled) { setWm(null); return; }
     let alive = true;
     setWm(null);
     fetch(`/api/workflow/${workflowId}/analysis`)
@@ -400,7 +410,7 @@ function useWmAssessment(workflowId: string): WmAssessment | null {
       })
       .catch(() => { /* the panel below reports analysis failures */ });
     return () => { alive = false; };
-  }, [workflowId]);
+  }, [workflowId, enabled]);
   return wm;
 }
 
@@ -512,6 +522,11 @@ function KpiTile({ model, onActivate }: { model: TileModel; onActivate: () => vo
   );
 }
 
+/**
+ * Rendered only when the board mounted #workflow-manager-panel (see the strip's
+ * `wmPanelMounted` prop), so the scroll target below always exists — the `if (!el)
+ * return` in scrollToAnchor is defence in depth, not this tile's normal path.
+ */
 function WmAssessmentTile({ assessment }: { assessment: WmAssessment }) {
   return (
     <button
@@ -547,10 +562,19 @@ function WmAssessmentTile({ assessment }: { assessment: WmAssessment }) {
 
 // ─── Strip ───────────────────────────────────────────────────────────────────
 
-export default function HeroKpiStrip({ workflowId }: { workflowId: string }) {
+export default function HeroKpiStrip({
+  workflowId,
+  wmPanelMounted,
+}: {
+  workflowId: string;
+  /** Does the board mount #workflow-manager-panel for this run? Required, not
+   *  optional: the caller must state it, so the tile and its scroll target cannot
+   *  drift apart by omission. */
+  wmPanelMounted: boolean;
+}) {
   const { card, state, setCard, refetch } = usePerformanceCard(workflowId);
   const { compute, start, checkAgain } = useComputeNow(workflowId, setCard);
-  const wm = useWmAssessment(workflowId);
+  const wm = useWmAssessment(workflowId, wmPanelMounted);
 
   const tiles = deriveTiles(state, card);
   const busy = compute.kind === "posting" || compute.kind === "polling";

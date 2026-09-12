@@ -1,10 +1,14 @@
 "use client";
 
 /**
- * Workflow Manager analysis panel — shown on terminal (complete/cancelled/error)
- * runs. Self-contained: fetches GET /api/workflow/[id]/analysis, renders the
- * latest analysis (verdict, scores, metric cards, findings, recommendations,
- * def-level trend), and can trigger POST /api/workflow/[id]/analyze.
+ * Workflow Manager analysis panel — shown on every terminal run EXCEPT a
+ * "complete" one that still has open fix-it tickets. The board owns that rule
+ * (showWorkflowManager in WorkflowBoard.tsx) and only offers the hero KPI strip's
+ * agent-authored tile, whose click scrolls here, when it mounts this panel.
+ *
+ * Self-contained: fetches GET /api/workflow/[id]/analysis, renders the latest
+ * analysis (verdict, scores, metric cards, findings, recommendations, def-level
+ * trend), and can trigger POST /api/workflow/[id]/analyze.
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -159,14 +163,27 @@ export default function WorkflowManagerPanel({ workflowId, onAskAboutRun }: Prop
 
   // The deterministic score, next to the agent-authored one. Shares the hero
   // strip's cached card, so this costs no extra request.
+  //
+  // TEAM-4521 F2 — provenance: `selected` may be an OLDER analysis picked from the
+  // history <select> and scored under an older kpi.json rubric, while `card.kpi` is
+  // always the CURRENT card. card.kpi.version IS kpi.json's kpiVersion
+  // (performance.ts: `version: config.kpiVersion`), so the two are directly
+  // comparable — print the number only when they match, and say why not when they
+  // don't rather than attributing today's score to an older rubric.
   const kpiVersion = selected?.kpiVersion;
+  const cardKpiVersion = card?.kpi?.version;
   const detQuality = card?.kpi?.quality;
-  const detChip =
-    typeof kpiVersion === "number" && detQuality?.score != null ? (
-      <span className="wm-det-chip">
-        Deterministic: {detQuality.score}/100 {detQuality.grade}
-      </span>
-    ) : null;
+  const versionsDiffer =
+    typeof kpiVersion === "number" && typeof cardKpiVersion === "number" && cardKpiVersion !== kpiVersion;
+  const detChip = versionsDiffer ? (
+    <span className="wm-det-chip" data-testid="wm-det-chip" data-kpi-match="false">
+      Deterministic score not comparable — card is kpi v{cardKpiVersion}, analysis scored under kpi v{kpiVersion}
+    </span>
+  ) : typeof kpiVersion === "number" && cardKpiVersion === kpiVersion && detQuality?.score != null ? (
+    <span className="wm-det-chip" data-testid="wm-det-chip" data-kpi-match="true">
+      Deterministic: {detQuality.score}/100 {detQuality.grade}
+    </span>
+  ) : null;
 
   return (
     <div className="wm-panel">
