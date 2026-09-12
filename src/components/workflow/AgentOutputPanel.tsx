@@ -4,7 +4,10 @@ import { useEffect, useRef, useState, useCallback } from "react";
 import { createPortal } from "react-dom";
 import { X, AlertCircle, FileText, TerminalSquare, Send } from "lucide-react";
 import type { AgentTask, AgentRun } from "@/lib/workflow/types";
+import { isStaleEligibleStatus } from "@/lib/workflow/stale";
+import { isChatablePersona } from "@/lib/workflow/personas";
 import { MarkdownRenderer } from "./MarkdownRenderer";
+import { AgentIdleChat } from "./AgentIdleChat";
 import "./pipeline.css";
 
 interface AgentOutputPanelProps {
@@ -505,7 +508,7 @@ export default function AgentOutputPanel({
         </div>
 
         {/* Operator message composer — only for a live agent */}
-        {task && workflowId && (task.status === "running" || task.status === "waiting_response") && (
+        {task && workflowId && isStaleEligibleStatus(task.status) && (
           <div
             className="flex items-center gap-2 px-4 py-2 border-t"
             style={{ borderColor: "var(--pipeline-border)", background: "rgba(15, 15, 20, 0.6)" }}
@@ -544,6 +547,20 @@ export default function AgentOutputPanel({
               {messageState === "sending" ? "Queuing…" : messageState === "queued" ? "Queued ✓" : messageState === "error" ? "Failed — retry" : "Send"}
             </button>
           </div>
+        )}
+
+        {/* Idle persona chat — the mailbox composer's counterpart, rendered for
+            Strands personas only (the coding CLIs are reached through the Cloud
+            Code link in the footer instead). It stays visible while the agent
+            works, disabled, so the operator can see chat exists and why it is
+            unavailable rather than watching a control appear and vanish. */}
+        {task && workflowId && isChatablePersona(task.agentId) && (
+          <AgentIdleChat
+            workflowId={workflowId}
+            agentId={task.agentId}
+            isIdle={!isStaleEligibleStatus(task.status)}
+            isOpen={isOpen}
+          />
         )}
 
         {/* Footer */}

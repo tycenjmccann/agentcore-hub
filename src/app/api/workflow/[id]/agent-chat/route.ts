@@ -47,6 +47,7 @@ import {
 } from "@/lib/workflow/dynamo-read";
 import { isStaleEligibleStatus } from "@/lib/workflow/stale";
 import { isChatablePersona, personaDisplayName } from "@/lib/workflow/personas";
+import { CHAT_MARKER, QUESTION_MARKER } from "@/lib/workflow/persona-chat";
 import type { AgentTask } from "@/lib/workflow/types";
 
 export const runtime = "nodejs";
@@ -79,6 +80,7 @@ function buildPreamble(
 ): string {
   const input = workflow.input as { description?: string; title?: string } | undefined;
   const lines = [
+    CHAT_MARKER,
     `You are ${personaDisplayName(agentId)} (${agentId}), being asked questions by a human operator`,
     `about work you already did. This is a READ-ONLY conversation, not a new assignment.`,
     ``,
@@ -98,7 +100,7 @@ function buildPreamble(
     if (task.outcome) lines.push(`- your outcome: ${task.outcome}`);
     if (task.error) lines.push(`- your last error: ${task.error}`);
   }
-  lines.push(``, `Operator's question:`);
+  lines.push(``, QUESTION_MARKER);
   return lines.join("\n");
 }
 
@@ -146,6 +148,73 @@ function sanitizeErrorFrames(source: ReadableStream, context: string): ReadableS
   );
 }
 
+type Target =
+  | { error: NextResponse }
+  | { workflow: Record<string, unknown>; task: AgentTask | undefined; active: boolean };
+
+/**
+ * The checks GET and POST share, in the order that keeps every AWS call behind a
+ * validated input. `active` is returned rather than rejected here because GET
+ * reports it (so the modal can render a disabled composer) while POST refuses it.
+ */
+async function resolveTarget(workflowId: string, agentId: string): Promise<Target> {
+  if (!ID_PATTERN.test(workflowId)) {
+    return { error: NextResponse.json({ error: "Invalid workflow id" }, { status: 400 }) };
+  }
+  if (!ID_PATTERN.test(agentId)) {
+    return { error: NextResponse.json({ error: "Invalid agentId" }, { status: 400 }) };
+  }
+  if (!isChatablePersona(agentId)) {
+    return {
+      error: NextResponse.json(
+        { error: "Chat is only available for pipeline agents", code: "not_a_persona" },
+        { status: 400 }
+      ),
+    };
+  }
+
+  const workflow = await getWorkflowFromDynamo(workflowId);
+  if (!workflow) {
+    return { error: NextResponse.json({ error: "Workflow not found" }, { status: 404 }) };
+  }
+
+  // agentTasks is keyed by ticketId, so find this persona's entries by agentId.
+  // A persona can hold more than one ticket in a run (rework); ANY live one
+  // means it is mid-turn.
+  const tasks = Object.values(
+    (workflow.agentTasks as Record<string, AgentTask> | undefined) || {}
+  ).filter(t => t?.agentId === agentId);
+
+  // Newest task first — the one the operator is looking at in the modal.
+  const task = [...tasks].sort((a, b) =>
+    String(b.startedAt || "").localeCompare(String(a.startedAt || ""))
+  )[0];
+
+  return { workflow, task, active: tasks.some(t => isStaleEligibleStatus(t.status)) };
+}
+
+/**
+ * GET /api/workflow/[id]/agent-chat?agentId=… → { sessionId, active }
+ *
+ * `sessionId` is the memory session the modal reads prior chat turns back from
+ * (via /api/agentcore/memory/events); null when this persona was never
+ * dispatched in this run, which simply means there is nothing to replay.
+ */
+export async function GET(
+  req: NextRequest,
+  { params }: { params: { id: string } }
+) {
+  const agentId = (req.nextUrl.searchParams.get("agentId") || "").trim();
+  const target = await resolveTarget(params.id, agentId);
+  if ("error" in target) return target.error;
+
+  const invocation = await getLatestAgentInvocation(params.id, agentId).catch(() => null);
+  return NextResponse.json({
+    sessionId: invocation?.sessionId || null,
+    active: target.active,
+  });
+}
+
 export async function POST(
   req: NextRequest,
   { params }: { params: { id: string } }
@@ -163,12 +232,6 @@ export async function POST(
   const agentId = typeof body.agentId === "string" ? body.agentId.trim() : "";
   const message = typeof body.message === "string" ? body.message.trim() : "";
 
-  if (!ID_PATTERN.test(workflowId)) {
-    return NextResponse.json({ error: "Invalid workflow id" }, { status: 400 });
-  }
-  if (!ID_PATTERN.test(agentId)) {
-    return NextResponse.json({ error: "Invalid agentId" }, { status: 400 });
-  }
   if (!message) {
     return NextResponse.json({ error: "message is required" }, { status: 400 });
   }
@@ -178,26 +241,10 @@ export async function POST(
       { status: 400 }
     );
   }
-  if (!isChatablePersona(agentId)) {
-    return NextResponse.json(
-      { error: "Chat is only available for pipeline agents", code: "not_a_persona" },
-      { status: 400 }
-    );
-  }
 
-  const workflow = await getWorkflowFromDynamo(workflowId);
-  if (!workflow) {
-    return NextResponse.json({ error: "Workflow not found" }, { status: 404 });
-  }
-
-  // agentTasks is keyed by ticketId, so find this persona's entries by agentId.
-  // A persona can hold more than one ticket in a run (rework); ANY live one
-  // means it is mid-turn.
-  const tasks = Object.values(
-    (workflow.agentTasks as Record<string, AgentTask> | undefined) || {}
-  ).filter(t => t?.agentId === agentId);
-
-  if (tasks.some(t => isStaleEligibleStatus(t.status))) {
+  const target = await resolveTarget(workflowId, agentId);
+  if ("error" in target) return target.error;
+  if (target.active) {
     return NextResponse.json(
       {
         error: "This agent is working. Chat is available when it is idle.",
@@ -206,11 +253,7 @@ export async function POST(
       { status: 409 }
     );
   }
-
-  // Newest task first — the one the operator is looking at in the modal.
-  const task = tasks.sort((a, b) =>
-    String(b.startedAt || "").localeCompare(String(a.startedAt || ""))
-  )[0];
+  const { workflow, task } = target;
 
   const invocation = await getLatestAgentInvocation(workflowId, agentId).catch(() => null);
 
