@@ -17,7 +17,7 @@
  *  - colour never carries status on its own: every band chip spells its word.
  */
 
-import { useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 import { CheckCircle2, ClipboardCheck, Clock, Coins, type LucideIcon } from "lucide-react";
 import {
   BASELINE_DAYS,
@@ -406,8 +406,28 @@ function useWmAssessment(workflowId: string): WmAssessment | null {
 
 // ─── Presentation ────────────────────────────────────────────────────────────
 
+/**
+ * ONE height for every tile (TEAM-4519). `.pipeline-viz` sits directly below the
+ * strip, so a strip that grows when the performance GET resolves pushes the whole
+ * pipeline down — the skeleton and every ready variant must reserve the same box.
+ * The old min-h-[104px] was BELOW the tallest populated tile, so it pinned nothing.
+ *
+ * 140 is the tallest tile measured in a browser at 1440x900 (dark, sidebar
+ * expanded), rounded up for headroom. The worst case is 135: a quality tile in the
+ * 4-column layout (the Workflow Manager tile is present, so each column is ~205px)
+ * whose sub-line wraps to two lines —
+ *   24 p-3 + 2 border + 16 label (text-xs/1rem) + 3x4 gap-1
+ *   + 24 value row (text-2xl/leading-none) + 33 two-line sub (11px x 1.5)
+ *   + 21 band chip + 3 grade-chip baseline = 135.
+ * The Workflow Manager tile itself measures 127.5 (2-line label, text-xl value) and
+ * the skeleton 131, so both fit the same grid row. Case 16 in
+ * tests/tab-workflow-hero-kpis.spec.ts fails if any of that drifts.
+ */
+const TILE_MIN_H = "min-h-[140px]";
+/** Two lines of SUB_CLASS text (11px x 1.5) — a 1-line sub and a 2-line sub then leave the tile the same height. */
+const SUB_RESERVE = "min-h-[33px]";
 const TILE_CLASS =
-  "group relative flex flex-col items-start gap-1 text-left min-h-[104px] rounded-lg border border-[var(--color-border)] p-3 transition-colors hover:border-[var(--color-border-hover)] focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[var(--color-border-hover)] disabled:cursor-default";
+  `group relative flex flex-col items-start gap-1 text-left ${TILE_MIN_H} rounded-lg border border-[var(--color-border)] p-3 transition-colors hover:border-[var(--color-border-hover)] focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[var(--color-border-hover)] disabled:cursor-default`;
 const LABEL_CLASS = "text-xs uppercase tracking-wider text-[var(--color-text-muted)] flex items-center gap-1.5";
 const SUB_CLASS = "text-[11px] text-[var(--color-text-muted)] tabular-nums";
 const CHIP_CLASS = "inline-flex items-center rounded-full border px-2 py-0.5 text-[10px] font-medium";
@@ -439,13 +459,26 @@ function KpiTile({ model, onActivate }: { model: TileModel; onActivate: () => vo
         {model.label}
       </span>
       {model.skeleton ? (
-        <>
-          <span className={`${SKELETON_CLASS} h-7 w-20`} />
-          <span className={`${SKELETON_CLASS} h-3 w-32`} />
-          <span className={`${SKELETON_CLASS} h-4 w-24 rounded-full`} />
-        </>
+        // Mirrors the populated layout row for row — value bar at the height of a
+        // text-2xl/leading-none number, the same reserved two-line sub block, and
+        // the mt-auto chip — so loading and ready are the SAME height, not merely
+        // both under TILE_MIN_H.
+        //
+        // key="skeleton"/"ready": without it, React reuses each child slot's DOM
+        // node across this ternary (same tag, same position) and only patches its
+        // className — so a skeleton bar's bg-tertiary background, or the grey it
+        // starts a band chip from, animates out under globals.css's blanket
+        // `* { transition: background-color .2s }` instead of never applying,
+        // leaving a fading ghost box for ~200ms. The key forces a fresh mount.
+        <Fragment key="skeleton">
+          <span className={`${SKELETON_CLASS} h-6 w-20`} />
+          <span className={SUB_RESERVE}>
+            <span className={`${SKELETON_CLASS} block h-3 w-32`} />
+          </span>
+          <span className={`${SKELETON_CLASS} mt-auto h-5 w-24 rounded-full`} />
+        </Fragment>
       ) : (
-        <>
+        <Fragment key="ready">
           <span className="flex flex-wrap items-baseline gap-1.5">
             <span
               className={`text-2xl font-semibold tabular-nums leading-none ${
@@ -466,11 +499,13 @@ function KpiTile({ model, onActivate }: { model: TileModel; onActivate: () => vo
             )}
             {model.inlineSub && model.sub && <span className={SUB_CLASS}>· {model.sub}</span>}
           </span>
-          {!model.inlineSub && model.sub && <span className={SUB_CLASS}>{model.sub}</span>}
+          {/* Rendered even when there is no sub-line, and two lines tall either
+              way: the tile's height must not depend on whether this wraps. */}
+          {!model.inlineSub && <span className={`${SUB_CLASS} ${SUB_RESERVE}`}>{model.sub}</span>}
           {/* mt-auto: the chips line up along the bottom of the row even when one
               tile's sub-line wraps to two lines and another's does not. */}
           {model.band && <span className={`${CHIP_CLASS} mt-auto ${STATUS_STYLE[model.band]}`}>{BAND_TEXT[model.band]}</span>}
-        </>
+        </Fragment>
       )}
       <span id={hintId} className="sr-only">{model.hover}</span>
     </button>
@@ -548,69 +583,80 @@ export default function HeroKpiStrip({ workflowId }: { workflowId: string }) {
         {wm && <WmAssessmentTile assessment={wm} />}
       </div>
 
-      {card && (
-        <p className="mt-2 text-[11px] text-[var(--color-text-muted)]">
-          {card.workflowDefId}
-          {baseline?.n
-            ? ` · baseline ${baseline.n} runs / ${baseline.windowDays}d${
-                baseline.nCost !== undefined && baseline.nCost !== baseline.n ? ` · ${baseline.nCost} priced` : ""
-              }`
-            : ""}
-        </p>
-      )}
-
-      {(computeLabel || busy || state === "error" || compute.kind === "timeout" || compute.kind === "error") && (
-        <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
-          {computeLabel && (
-            <button
-              type="button"
-              data-testid="hero-kpi-compute-now"
-              onClick={start}
-              disabled={busy}
-              className="inline-flex items-center rounded-md border border-[var(--color-border)] bg-[var(--color-bg-tertiary)] px-2 py-1 font-medium text-[var(--color-text-primary)] transition-colors hover:border-[var(--color-border-hover)] disabled:opacity-60"
-            >
-              {computeLabel}
-            </button>
-          )}
-          {compute.kind === "posting" && <span className="text-[var(--color-text-muted)]">computing…</span>}
-          {compute.kind === "polling" && (
-            <span className="text-[var(--color-text-muted)]">
-              {compute.note === "already" ? "already computing" : "computing…"}
-            </span>
-          )}
-          {compute.kind === "timeout" && (
-            <>
-              <span className="text-amber-400">still computing — the card usually appears within a minute</span>
-              {compute.canRetry && (
-                <button
-                  type="button"
-                  data-testid="hero-kpi-check-again"
-                  onClick={checkAgain}
-                  className="inline-flex items-center rounded-md border border-[var(--color-border)] px-2 py-1 font-medium text-[var(--color-text-primary)] hover:border-[var(--color-border-hover)]"
-                >
-                  Check again
-                </button>
-              )}
-            </>
-          )}
-          {compute.kind === "error" && (
-            <span className={compute.tone === "red" ? "text-red-400" : "text-amber-400"}>{compute.message}</span>
-          )}
-          {state === "error" && (
-            <>
-              <span className="text-red-400">{READ_ERROR}</span>
+      {/* ONE always-rendered footer row (TEAM-4519). The meta line and the action
+          controls used to be two independently-conditional blocks, so the strip was
+          ~29px shorter while the GET was in flight and pushed .pipeline-viz down the
+          moment it resolved. min-h is one button tall — measured 26px (text-xs 16px
+          line box + py-1 + 1px border), against 12px for the loading bar and 16px
+          for the meta line — so loading / ready / missing / error all reserve the
+          same strip footer at 1440. */}
+      <div className="mt-2 min-h-[26px] flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
+        {card ? (
+          // key: forces a fresh DOM node instead of patching the skeleton bar's
+          // className in place. Without it React reuses the same <span>, and
+          // globals.css's `* { transition: background-color .2s }` animates that
+          // node's now-stale bg-tertiary background out instead of never applying
+          // it, leaving a fading ghost box behind the meta text for ~200ms.
+          <span key="meta" className="text-[11px] text-[var(--color-text-muted)]">
+            {card.workflowDefId}
+            {baseline?.n
+              ? ` · baseline ${baseline.n} runs / ${baseline.windowDays}d${
+                  baseline.nCost !== undefined && baseline.nCost !== baseline.n ? ` · ${baseline.nCost} priced` : ""
+                }`
+              : ""}
+          </span>
+        ) : state === "loading" ? (
+          <span key="skeleton" className={`${SKELETON_CLASS} h-3 w-40`} aria-hidden />
+        ) : null}
+        {computeLabel && (
+          <button
+            type="button"
+            data-testid="hero-kpi-compute-now"
+            onClick={start}
+            disabled={busy}
+            className="inline-flex items-center rounded-md border border-[var(--color-border)] bg-[var(--color-bg-tertiary)] px-2 py-1 font-medium text-[var(--color-text-primary)] transition-colors hover:border-[var(--color-border-hover)] disabled:opacity-60"
+          >
+            {computeLabel}
+          </button>
+        )}
+        {compute.kind === "posting" && <span className="text-[var(--color-text-muted)]">computing…</span>}
+        {compute.kind === "polling" && (
+          <span className="text-[var(--color-text-muted)]">
+            {compute.note === "already" ? "already computing" : "computing…"}
+          </span>
+        )}
+        {compute.kind === "timeout" && (
+          <>
+            <span className="text-amber-400">still computing — the card usually appears within a minute</span>
+            {compute.canRetry && (
               <button
                 type="button"
-                data-testid="hero-kpi-retry"
-                onClick={refetch}
+                data-testid="hero-kpi-check-again"
+                onClick={checkAgain}
                 className="inline-flex items-center rounded-md border border-[var(--color-border)] px-2 py-1 font-medium text-[var(--color-text-primary)] hover:border-[var(--color-border-hover)]"
               >
-                Retry
+                Check again
               </button>
-            </>
-          )}
-        </div>
-      )}
+            )}
+          </>
+        )}
+        {compute.kind === "error" && (
+          <span className={compute.tone === "red" ? "text-red-400" : "text-amber-400"}>{compute.message}</span>
+        )}
+        {state === "error" && (
+          <>
+            <span className="text-red-400">{READ_ERROR}</span>
+            <button
+              type="button"
+              data-testid="hero-kpi-retry"
+              onClick={refetch}
+              className="inline-flex items-center rounded-md border border-[var(--color-border)] px-2 py-1 font-medium text-[var(--color-text-primary)] hover:border-[var(--color-border-hover)]"
+            >
+              Retry
+            </button>
+          </>
+        )}
+      </div>
 
       <div aria-live="polite" className="sr-only">{liveMessage}</div>
     </section>
