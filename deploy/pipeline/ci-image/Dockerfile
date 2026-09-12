@@ -44,6 +44,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
       git curl ca-certificates jq zip unzip \
       python3 python3-venv python3-pip \
+      iptables \
  && rm -rf /var/lib/apt/lists/*
 
 # AWS CLI v2 from the official installer (Debian has no v2 package). The
@@ -57,12 +58,15 @@ RUN curl -fsSL -o /tmp/awscliv2.zip "https://awscli.amazonaws.com/awscli-exe-lin
 # Docker engine + CLI + buildx, from the static bundle. CodeBuild only starts a
 # daemon for its OWN curated images, so a custom image has to carry the engine
 # and start it itself (buildspec-ci.yml's post_build bootstraps dockerd in the
-# BUILD_APP_IMAGE branch). containerd/runc/the shim are all required by dockerd.
+# BUILD_APP_IMAGE branch). containerd/runc/the shim are all required by dockerd;
+# docker-proxy + iptables (above) let a default-config daemon start too, though
+# the buildspec runs it with networking off (--bridge=none, buildx --network=host).
 RUN curl -fsSL -o /tmp/docker.tgz \
       "https://download.docker.com/linux/static/stable/x86_64/docker-${DOCKER_VERSION}.tgz" \
  && tar -xzf /tmp/docker.tgz -C /tmp \
  && install -m 0755 /tmp/docker/docker /tmp/docker/dockerd /tmp/docker/containerd \
-      /tmp/docker/containerd-shim-runc-v2 /tmp/docker/runc /tmp/docker/ctr /usr/local/bin/ \
+      /tmp/docker/containerd-shim-runc-v2 /tmp/docker/runc /tmp/docker/ctr \
+      /tmp/docker/docker-proxy /usr/local/bin/ \
  && rm -rf /tmp/docker.tgz /tmp/docker \
  && mkdir -p /usr/local/lib/docker/cli-plugins \
  && curl -fsSL -o /usr/local/lib/docker/cli-plugins/docker-buildx \

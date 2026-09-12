@@ -44,7 +44,11 @@ as part of `cdk deploy`.
    pushes the asset and repoints the `ci` and `build` projects at it.
 2. Open (or re-run) any PR. Read the **INSTALL** phase of the CI log — see below.
 3. Watch the first deploy-pipeline Build stage too: that is the only place `dockerd` gets
-   bootstrapped, and `BUILD_APP_IMAGE=true` never runs on PR checks.
+   bootstrapped, and `BUILD_APP_IMAGE=true` never runs on PR checks. (2026-09-12: the first
+   such Build failed - the static bundle lacks `docker-proxy` and the image had no `iptables`,
+   so dockerd exited at config validation. The buildspec now starts it with
+   `--userland-proxy=false --iptables=false --ip6tables=false --bridge=none` and builds with
+   `--network=host`; the image also ships both binaries so a default daemon works.)
 
 ### Reading the INSTALL log
 
