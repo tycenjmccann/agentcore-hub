@@ -22,6 +22,7 @@ import { CheckCircle2, ClipboardCheck, Clock, Coins, type LucideIcon } from "luc
 import {
   BASELINE_DAYS,
   BASELINE_MIN,
+  CURRENT_REPORT_VERSION,
   formatKpi,
   type BandStatus,
   type KpiUnit,
@@ -43,6 +44,18 @@ const MAX_POLLS = 30;
 const COST_PATH = "cost.totalUsd";
 const TIME_PATH = "time.wallMs";
 const QUALITY_PATH = "quality.score";
+
+/**
+ * A card we can stop polling for. The POST route only answers 200 with the
+ * stored card when it is already at CURRENT_REPORT_VERSION; a pre-v5 card gets a
+ * 202 and a Lambda that runs for minutes, during which the OLD card is still the
+ * one on S3. Accepting any 200 {card} would end the poll on that stale read
+ * (R-4's post-version-bump backfill gap) and leave the strip on the v4 card it
+ * was asked to replace — the Recompute button would do nothing, forever.
+ */
+function isCurrentCard(card: RunCard): boolean {
+  return card.reportVersion === CURRENT_REPORT_VERSION && !!card.kpi;
+}
 
 interface TileModel {
   testId: string;
@@ -76,8 +89,16 @@ function bandHover(card: RunCard | null, path: string, unit: KpiUnit): string {
   if (k && k.median != null && k.z != null) {
     return `${formatKpi(unit, k.value)} vs median ${formatKpi(unit, k.median)} (z=${k.z})`;
   }
-  const min = bands?.baseline?.minSamples ?? BASELINE_MIN;
-  const days = bands?.baseline?.windowDays ?? BASELINE_DAYS;
+  const baseline = bands?.baseline;
+  const min = baseline?.minSamples ?? BASELINE_MIN;
+  const days = baseline?.windowDays ?? BASELINE_DAYS;
+  // D-16: a cost KPI bands against the runs we actually priced (`nCost`), not
+  // every run (`n`), so an unpriced run cannot make the cost band look better
+  // evidenced than it is. `nCost` is absent on v4 cards — fall back to `n`.
+  if (path.startsWith("cost.")) {
+    const nCost = baseline?.nCost ?? baseline?.n ?? 0;
+    return `No cost baseline yet — ${nCost} of ${min} priced runs in the last ${days} days`;
+  }
   return `No baseline yet — needs ${min} runs in the last ${days} days`;
 }
 
@@ -131,8 +152,12 @@ export function deriveTiles(state: CardState, card: RunCard | null): TileModel[]
   const bandOf = (path: string) => card.bands?.kpis?.[path]?.status ?? null;
 
   // 5: cost was not measured. A v5 card says so with `kpi.cost.usd === null`; a
-  // v4 card only via dataQuality. Either way it is not a $0.00 bill.
-  const costMissing = card.dataQuality?.costMissing === true || (!!kpi && kpi.cost.usd === null);
+  // v4 card has neither that nor dataQuality.costMissing, so fall back to the
+  // same test the lib and the Lambda use — a $0 total means the spans did not
+  // match, not a free run (hasCostData / NFR-5). Never a $0.00 that reads as a bill.
+  const costMissing =
+    card.dataQuality?.costMissing === true ||
+    (kpi ? kpi.cost.usd === null : !((card.cost?.totalUsd ?? 0) > 0));
   const cost: TileModel = {
     ...SHELLS.cost,
     value: costMissing ? COST_MISSING_VALUE : formatKpi("usd", kpi ? kpi.cost.usd : card.cost.totalUsd),
@@ -278,11 +303,14 @@ function useComputeNow(workflowId: string, setCard: (card: RunCard) => void) {
       if (r.ok) {
         const j = await r.json().catch(() => null);
         if (!alive.current) return;
-        if (j?.card) {
-          setCard(j.card as RunCard);
+        const next = j?.card as RunCard | undefined;
+        if (next && isCurrentCard(next)) {
+          setCard(next);
           setCompute({ kind: "done" });
           return;
         }
+        // else: a stale (pre-current) card is a "not written yet" — fall
+        // through to the same retry path as a 404.
       } else if (r.status !== 404) {
         setCompute({ kind: "error", tone: "red", message: READ_ERROR });
         return;
@@ -315,8 +343,9 @@ function useComputeNow(workflowId: string, setCard: (card: RunCard) => void) {
       });
       const j = await r.json().catch(() => null);
       if (!alive.current) return;
-      if (r.status === 200 && j?.card) {
-        setCard(j.card as RunCard);
+      const card = j?.card as RunCard | undefined;
+      if (r.status === 200 && card && isCurrentCard(card)) {
+        setCard(card);
         setCompute({ kind: "done" });
         return;
       }
@@ -531,7 +560,11 @@ export default function HeroKpiStrip({ workflowId }: { workflowId: string }) {
       {card && (
         <p className="mt-2 text-[11px] text-[var(--color-text-muted)]">
           {card.workflowDefId}
-          {baseline?.n ? ` · baseline ${baseline.n} runs / ${baseline.windowDays}d` : ""}
+          {baseline?.n
+            ? ` · baseline ${baseline.n} runs / ${baseline.windowDays}d${
+                baseline.nCost !== undefined && baseline.nCost !== baseline.n ? ` · ${baseline.nCost} priced` : ""
+              }`
+            : ""}
         </p>
       )}
 

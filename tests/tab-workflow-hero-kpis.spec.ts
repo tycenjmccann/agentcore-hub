@@ -456,4 +456,100 @@ test.describe("Hero KPI strip (TEAM-4482)", () => {
     await expect(page.locator("[data-testid=wf-grade]")).toHaveValue("all");
     expect(await chipRows(page)).toEqual(before);
   });
+
+  // ─── Review fixes (TEAM-4509) ────────────────────────────────────────────
+
+  test("12. Recompute on a v4 card keeps polling past stale v4 reads until the v5 card lands", async ({ page }) => {
+    test.setTimeout(60_000);
+    const mock = perfMock(
+      [{ card: v4Card() }, { card: v4Card() }, { card: v4Card() }, { card: v5Card() }],
+      { status: 202, body: { status: "accepted", pollAfterMs: 500 } },
+    );
+    await mockList(page, [listRow(WF, "Hero KPI fixture")]);
+    await mockBoard(page, mockState(WF));
+    await mockPerformance(page, mock);
+    await openRun(page);
+
+    await expect(page.locator(STRIP)).toBeVisible();
+    await expect(page.locator(QUALITY)).toContainText("no deterministic score");
+    const button = page.locator("[data-testid=hero-kpi-compute-now]");
+    await expect(button).toHaveText("Recompute");
+    await button.click();
+
+    await expect(page.locator(QUALITY)).toContainText("74/100", { timeout: 30_000 });
+    await expect(page.locator(COST)).toContainText("$41");
+    // The button disappears once the card has a kpi block — nothing left to fix.
+    await expect(button).toHaveCount(0);
+    expect(mock.counts.post).toBe(1);
+    // Proves polling continued past the two stale v4 reads instead of stopping
+    // on the first one.
+    expect(mock.counts.get).toBeGreaterThanOrEqual(4);
+
+    await page.screenshot({ path: `${SCREENSHOT_DIR}/12-recompute-v4.png` });
+  });
+
+  test("13. a v4 $0 card (span gap) reads '$0 · no usage data' with no band chip", async ({ page }) => {
+    const errors: string[] = [];
+    page.on("pageerror", (e) => errors.push(e.message));
+
+    await mockList(page, [listRow(WF, "Hero KPI fixture")]);
+    await mockBoard(page, mockState(WF));
+    await mockPerformance(page, perfMock([
+      {
+        card: v4Card({
+          cost: {
+            totalUsd: 0, personaUsd: 0, codingUsd: 0, perTaskUsd: null,
+            tokens: { input: 0, output: 0, cached: 0, total: 0 },
+            personaCacheHitRate: null, byEngine: {},
+          },
+        }),
+      },
+    ]));
+    await openRun(page);
+
+    const cost = page.locator(COST);
+    await expect(page.locator(STRIP)).toBeVisible();
+    await expect(cost).toHaveText(/\$0\s*·\s*no usage data/);
+    // bands.kpis["cost.totalUsd"] is still "ok" here — the chip is suppressed by
+    // costMissing, not by an absent band.
+    await expect(cost).not.toContainText("within bands");
+    await expect(cost).not.toContainText("no baseline");
+    await expect(cost).not.toContainText("personas");
+    await expect(page.locator(TIME)).toContainText("2h 33m");
+    await expect(page.locator(QUALITY)).toContainText("no deterministic score");
+    expect(errors).toEqual([]);
+
+    await page.screenshot({ path: `${SCREENSHOT_DIR}/13-v4-zero-cost.png` });
+  });
+
+  test("14. a thin cost baseline shows the priced-run count, not the full n", async ({ page }) => {
+    const bands = {
+      status: "ok",
+      baseline: { workflowDefId: "sdlc-14", n: 7, nCost: 2, windowDays: 28, minSamples: 5 },
+      anomalies: [],
+      kpis: {
+        "cost.totalUsd": { label: "Cost", unit: "usd", status: "insufficient", value: 41.27 },
+        "time.wallMs": { label: "Wall time", unit: "ms", status: "warn", value: 9180000, median: 7200000, z: 1.6 },
+        "quality.score": { label: "Quality", unit: "count", status: "ok", value: 74, median: 71, z: 0.2 },
+      },
+    };
+    await mockList(page, [listRow(WF, "Hero KPI fixture")]);
+    await mockBoard(page, mockState(WF));
+    await mockPerformance(page, perfMock([{ card: v5Card({}, { band: "insufficient", z: null }, { bands }) }]));
+    await openRun(page);
+
+    const cost = page.locator(COST);
+    await expect(page.locator(STRIP)).toBeVisible();
+    await expect(cost).toHaveAttribute("title", /2 of 5 priced runs/);
+    await expect(page.locator(STRIP)).toContainText("baseline 7 runs / 28d · 2 priced");
+    // BAND_TEXT.insufficient spells "insufficient" as "no baseline" (band-style.ts).
+    await expect(cost).toContainText("no baseline");
+    await expect(cost).not.toContainText("within bands");
+
+    const runCard = page.locator("#run-performance-card");
+    await expect(runCard).toContainText("no cost baseline (2/5 priced runs)");
+    await expect(runCard).toContainText("2 priced");
+
+    await page.screenshot({ path: `${SCREENSHOT_DIR}/14-thin-cost-baseline.png` });
+  });
 });
