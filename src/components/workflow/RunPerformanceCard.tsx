@@ -8,7 +8,7 @@
 
 import Link from "next/link";
 import { Gauge, Coins, Clock, CheckCircle2, ExternalLink, Loader2 } from "lucide-react";
-import { formatKpi, type BandStatus } from "@/lib/workflow/performance";
+import { BASELINE_DAYS, BASELINE_MIN, formatKpi, type BandStatus } from "@/lib/workflow/performance";
 import { STATUS_STYLE } from "./band-style";
 import { usePerformanceCard } from "./use-performance-card";
 
@@ -33,6 +33,14 @@ export default function RunPerformanceCard({ workflowId }: { workflowId: string 
   const b = card?.bands;
   const k = (path: string) => b?.kpis?.[path]?.status;
   const q5 = card?.kpi?.quality;
+  // D-16: cost KPIs band against priced runs only. `nCost` is absent on v4 cards.
+  const nCost = b?.baseline?.nCost ?? b?.baseline?.n ?? 0;
+  // The header chip is keyed off the FULL baseline by design; a cost band can be
+  // starved while the overall status says "within bands", which is the case
+  // this line exists to name.
+  const thinCostBaseline =
+    !!b && b.status !== "insufficient" &&
+    Object.entries(b.kpis ?? {}).some(([path, v]) => path.startsWith("cost.") && v.status === "insufficient");
 
   return (
     <section id="run-performance-card" className="mt-6 rounded-xl border border-[var(--color-border)] bg-[var(--color-bg-secondary)]">
@@ -47,7 +55,12 @@ export default function RunPerformanceCard({ workflowId }: { workflowId: string 
         )}
         {card && (
           <span className="text-xs text-[var(--color-text-muted)]">
-            {card.workflowDefId}{b?.baseline?.n ? ` · baseline ${b.baseline.n} runs / ${b.baseline.windowDays}d` : ""}
+            {card.workflowDefId}
+            {b?.baseline?.n
+              ? ` · baseline ${b.baseline.n} runs / ${b.baseline.windowDays}d${
+                  b.baseline.nCost !== undefined && b.baseline.nCost !== b.baseline.n ? ` · ${b.baseline.nCost} priced` : ""
+                }`
+              : ""}
           </span>
         )}
         <Link href={`/workflow?id=${workflowId}&artifact=${encodeURIComponent(`workflows/${workflowId}/shared/performance-card.md`)}`}
@@ -72,12 +85,22 @@ export default function RunPerformanceCard({ workflowId }: { workflowId: string 
 
           <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
             <div className="rounded-lg border border-[var(--color-border)] p-3 space-y-1.5">
-              <div className="flex items-center gap-2 mb-1"><Coins className="w-4 h-4 text-amber-400" /><span className="text-sm font-medium text-[var(--color-text-primary)]">Cost</span><span className="ml-auto text-base font-semibold tabular-nums">{formatKpi("usd", card.cost.totalUsd)}</span></div>
+              <div
+                className="flex items-center gap-2 mb-1"
+                title={`cost baseline: ${nCost}/${b?.baseline?.minSamples ?? BASELINE_MIN} priced runs / ${b?.baseline?.windowDays ?? BASELINE_DAYS}d`}
+              >
+                <Coins className="w-4 h-4 text-amber-400" /><span className="text-sm font-medium text-[var(--color-text-primary)]">Cost</span><span className="ml-auto text-base font-semibold tabular-nums">{formatKpi("usd", card.cost.totalUsd)}</span>
+              </div>
               <Row label="Persona LLM" value={formatKpi("usd", card.cost.personaUsd)} band={k("cost.personaUsd")} />
               <Row label="Coding CLIs" value={formatKpi("usd", card.cost.codingUsd)} band={k("cost.codingUsd")} hint={Object.entries(card.cost.byEngine).filter(([e]) => e !== "persona").map(([e, v]) => `${e}: ${formatKpi("usd", v.usd)}`).join(", ")} />
               <Row label="Per agent task" value={formatKpi("usd", card.cost.perTaskUsd)} />
               <Row label="Tokens (in / out / cache r / cache w)" value={`${formatKpi("tokens", card.cost.tokens.input)} / ${formatKpi("tokens", card.cost.tokens.output)} / ${formatKpi("tokens", card.cost.tokens.cacheRead ?? card.cost.tokens.cached)} / ${formatKpi("tokens", card.cost.tokens.cacheWrite ?? 0)}`} band={k("cost.tokens.total")} />
               <Row label="Cache hit rate (persona)" value={formatKpi("ratio", card.cost.personaCacheHitRate ?? null)} band={k("cost.personaCacheHitRate")} hint="persona input tokens served from the Bedrock prompt cache" />
+              {thinCostBaseline && (
+                <p className="text-[10px] text-[var(--color-text-muted)]">
+                  no cost baseline ({nCost}/{b!.baseline.minSamples} priced runs)
+                </p>
+              )}
             </div>
             <div className="rounded-lg border border-[var(--color-border)] p-3 space-y-1.5">
               <div className="flex items-center gap-2 mb-1"><Clock className="w-4 h-4 text-sky-400" /><span className="text-sm font-medium text-[var(--color-text-primary)]">Time</span><span className="ml-auto text-base font-semibold tabular-nums">{formatKpi("ms", card.time.wallMs)}</span></div>
