@@ -262,6 +262,7 @@
       "requiresRepo": true,
       "featureBranchPhase": null,
       "createsPullRequest": true,
+      "intakeMaterialization": "hub",
       "completionRequiresAgentPhases": [
         "development",
         "ship"
@@ -294,7 +295,8 @@
           "id": "ship",
           "name": "Ship",
           "type": "agent",
-          "agentPhase": "ship"
+          "agentPhase": "ship",
+          "agentId": "agentcore_hub_operator"
         }
       ],
       "sdlcFramework": "standard"

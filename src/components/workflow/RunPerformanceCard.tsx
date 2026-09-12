@@ -10,6 +10,7 @@ import Link from "next/link";
 import { Gauge, Coins, Clock, CheckCircle2, ExternalLink, Loader2 } from "lucide-react";
 import { BASELINE_DAYS, BASELINE_MIN, formatKpi, type BandStatus } from "@/lib/workflow/performance";
 import { STATUS_STYLE } from "./band-style";
+import { COST_MISSING_VALUE, isCostMissing } from "./cost-missing";
 import { usePerformanceCard } from "./use-performance-card";
 
 function Row({ label, value, band, hint }: { label: string; value: string; band?: BandStatus; hint?: string }) {
@@ -33,6 +34,10 @@ export default function RunPerformanceCard({ workflowId }: { workflowId: string 
   const b = card?.bands;
   const k = (path: string) => b?.kpis?.[path]?.status;
   const q5 = card?.kpi?.quality;
+  // TEAM-4515 D-3: same predicate as the hero KPI strip directly above this card
+  // (./cost-missing). Cost that was never measured must not render as $0.00 here
+  // while the strip says "$0 · no usage data" — the card's number reads as a bill.
+  const costMissing = !!card && isCostMissing(card);
   // D-16: cost KPIs band against priced runs only. `nCost` is absent on v4 cards.
   const nCost = b?.baseline?.nCost ?? b?.baseline?.n ?? 0;
   // The header chip is keyed off the FULL baseline by design; a cost band can be
@@ -89,11 +94,19 @@ export default function RunPerformanceCard({ workflowId }: { workflowId: string 
                 className="flex items-center gap-2 mb-1"
                 title={`cost baseline: ${nCost}/${b?.baseline?.minSamples ?? BASELINE_MIN} priced runs / ${b?.baseline?.windowDays ?? BASELINE_DAYS}d`}
               >
-                <Coins className="w-4 h-4 text-amber-400" /><span className="text-sm font-medium text-[var(--color-text-primary)]">Cost</span><span className="ml-auto text-base font-semibold tabular-nums">{formatKpi("usd", card.cost.totalUsd)}</span>
+                <Coins className="w-4 h-4 text-amber-400" /><span className="text-sm font-medium text-[var(--color-text-primary)]">Cost</span>
+                {costMissing ? (
+                  /* Word-for-word the hero strip's tile — the two cannot disagree. */
+                  <span className="ml-auto text-xs text-[var(--color-text-muted)] tabular-nums">{COST_MISSING_VALUE} · no usage data</span>
+                ) : (
+                  <span className="ml-auto text-base font-semibold tabular-nums">{formatKpi("usd", card.cost.totalUsd)}</span>
+                )}
               </div>
-              <Row label="Persona LLM" value={formatKpi("usd", card.cost.personaUsd)} band={k("cost.personaUsd")} />
-              <Row label="Coding CLIs" value={formatKpi("usd", card.cost.codingUsd)} band={k("cost.codingUsd")} hint={Object.entries(card.cost.byEngine).filter(([e]) => e !== "persona").map(([e, v]) => `${e}: ${formatKpi("usd", v.usd)}`).join(", ")} />
-              <Row label="Per agent task" value={formatKpi("usd", card.cost.perTaskUsd)} />
+              {/* Unmeasured cost is an em dash with no band: there is nothing to
+                  compare, and a band chip would dress up an absent measurement. */}
+              <Row label="Persona LLM" value={costMissing ? formatKpi("usd", null) : formatKpi("usd", card.cost.personaUsd)} band={costMissing ? undefined : k("cost.personaUsd")} />
+              <Row label="Coding CLIs" value={costMissing ? formatKpi("usd", null) : formatKpi("usd", card.cost.codingUsd)} band={costMissing ? undefined : k("cost.codingUsd")} hint={costMissing ? undefined : Object.entries(card.cost.byEngine).filter(([e]) => e !== "persona").map(([e, v]) => `${e}: ${formatKpi("usd", v.usd)}`).join(", ")} />
+              <Row label="Per agent task" value={costMissing ? formatKpi("usd", null) : formatKpi("usd", card.cost.perTaskUsd)} />
               <Row label="Tokens (in / out / cache r / cache w)" value={`${formatKpi("tokens", card.cost.tokens.input)} / ${formatKpi("tokens", card.cost.tokens.output)} / ${formatKpi("tokens", card.cost.tokens.cacheRead ?? card.cost.tokens.cached)} / ${formatKpi("tokens", card.cost.tokens.cacheWrite ?? 0)}`} band={k("cost.tokens.total")} />
               <Row label="Cache hit rate (persona)" value={formatKpi("ratio", card.cost.personaCacheHitRate ?? null)} band={k("cost.personaCacheHitRate")} hint="persona input tokens served from the Bedrock prompt cache" />
               {thinCostBaseline && (

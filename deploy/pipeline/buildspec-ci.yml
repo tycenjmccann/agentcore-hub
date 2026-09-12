@@ -33,20 +33,58 @@ phases:
       # Mirrors .github/workflows/ci.yml, which sets nothing. (PR #263 pilot fix.)
       - "node --version && npm --version"
       - "npm ci --include=dev"
-      # TEAM-4311: the `--with-deps` line below runs, as root,
+      # TEAM-4311: `playwright install --with-deps` runs, as root,
       # `sh -c "apt-get update && apt-get install -y --no-install-recommends ..."`,
       # and `apt-get update` exits 100 if ANY configured source fails to fetch --
-      # which short-circuits the `&&` and fails INSTALL. This image bakes in four
-      # third-party repos we do not use (Google Chrome, mozillateam PPA, corretto,
-      # github-cli); on 2026-09-09 dl.google.com served a Hash Sum mismatch and
-      # killed the Build stage twice. Playwright pulls Chromium from Microsoft's
-      # CDN and install-deps only needs Ubuntu main/universe, so drop those
-      # sources first. Nothing is uninstalled -- only the source files go.
+      # which short-circuits the `&&` and fails INSTALL. The managed STANDARD_7_0
+      # image bakes in four third-party repos we do not use (Google Chrome,
+      # mozillateam PPA, corretto, github-cli); on 2026-09-09 dl.google.com served
+      # a Hash Sum mismatch and killed the Build stage twice. The next line drops
+      # every non-Ubuntu apt source so none of them can fail this build; nothing
+      # is uninstalled, only the source files go. It stays unconditional: on the
+      # custom image (below) Debian keeps its sources in /etc/apt/sources.list,
+      # which that script never touches, so it is a logged no-op there.
       - "bash deploy/pipeline/prune-apt-sources.sh"
-      # Playwright needs a real browser + OS deps on the clean CodeBuild image
-      # (mirrors .github/workflows/ci.yml). Without this the test gates error.
-      # Deliberately NO `|| true` -- a missing browser must still fail the build.
-      - "npx playwright install --with-deps chromium"
+      # TEAM-4448 R11 removed apt from this hot path for good: the custom CI image
+      # (deploy/pipeline/ci-image/) bakes Chromium AND its shared libs, and sets
+      # PLAYWRIGHT_BROWSERS_PATH. On that image the browser is already there, so
+      # `playwright install chromium` (no `--with-deps`, so apt is never reached)
+      # is a no-op and the log shows no CDN download -- that is the R11 evidence.
+      #
+      # It is still RUN, not skipped: the glob only proves that *some* revision is
+      # baked, not the one the checked-out @playwright/test wants. The image is
+      # rebuilt manually by deploy.sh, so a lockfile bump would otherwise leave a
+      # stale revision behind the guard and the gates would die with "Executable
+      # doesn't exist at ...". Comparing the revision set before and after turns
+      # that silent drift into a loud warning plus a CDN-only download.
+      #
+      # No baked browser => the managed image => the legacy path, unchanged.
+      # Deliberately NO `|| true` on either -- a missing browser must fail the build.
+      #
+      # TEAM-4462 F1: the baked branch needs an EXPLICIT exit to keep that promise.
+      # This is a `- |` block under `env.shell: bash` with no `set -e`, so the block's
+      # status is its LAST statement's -- the drift `if`, which returns 0 whenever the
+      # revision set is unchanged. A failed CDN download was therefore swallowed here
+      # and resurfaced in BUILD as "Executable doesn't exist", which start_ci_build's
+      # D2 ledger reads as a CODE failure (build_failed_not_retryable) -- laundering an
+      # infra flake into a verdict on the diff. A bare `set -e` is NOT the fix:
+      # CodeBuild runs every command of a build in ONE shared shell, so it would change
+      # the semantics of every later pre_build/build/post_build command. The legacy
+      # branch below needs no guard -- `npx` IS its last statement.
+      - |
+        if [ -n "${PLAYWRIGHT_BROWSERS_PATH:-}" ] && ls -d "${PLAYWRIGHT_BROWSERS_PATH}"/chromium-* >/dev/null 2>&1; then
+          echo "playwright: baked chromium present ($(ls -d "${PLAYWRIGHT_BROWSERS_PATH}"/chromium-* | head -1)) - no apt, no CDN"
+          before="$(ls -d "${PLAYWRIGHT_BROWSERS_PATH}"/chromium-* | sort | tr '\n' ' ')"
+          npx playwright install chromium || { echo "playwright: install chromium FAILED on the baked image - the CDN download is mandatory once the baked revision drifted"; exit 1; }
+          after="$(ls -d "${PLAYWRIGHT_BROWSERS_PATH}"/chromium-* | sort | tr '\n' ' ')"
+          if [ "$before" != "$after" ]; then
+            echo "WARNING playwright: baked chromium revision drifted — run ./deploy/pipeline/deploy.sh to rebuild deploy/pipeline/ci-image (CDN download happened this build)"
+            echo "WARNING playwright: before [$before] after [$after]"
+          fi
+        else
+          echo "playwright: browser NOT baked - legacy managed-image install path"
+          npx playwright install --with-deps chromium
+        fi
 
   pre_build:
     commands:
@@ -102,10 +140,28 @@ phases:
       # from GH CI. This is the UI gate; the AWS-backed tab/api specs are not.
       - "PLAYWRIGHT_BASE_URL=http://localhost:3000 npm run test:cloud-code -- --trace retain-on-failure"
       # runtime-agent telemetry pytest (hermetic, no AWS)
+      #
+      # TEAM-4464: this block's status is its LAST statement's, and that used to be
+      # `deactivate` -- which always exits 0. So agentcore-hub-ci b93c4479 printed
+      # "2 failed, 523 passed" and then "Phase complete BUILD State SUCCEEDED", and a
+      # red battery could merge behind a green required check. Same trap and same fix
+      # as TEAM-4462 F1 in install above -- guard the command that matters with an
+      # EXPLICIT exit. A bare `set -e` is NOT the fix here either: CodeBuild runs every
+      # command of a build in ONE shared shell, so it would change the semantics of
+      # every later command. venv/pip are guarded for the same reason -- a failed pip
+      # would otherwise run the battery against missing deps, and a failed venv would
+      # leave `.` sourcing a file that does not exist.
+      #
+      # TEAM-4501: --junitxml writes the machine-readable result to /tmp so the LAST
+      # post_build command can re-emit just the failed ids at the very END of the log.
+      # The agent-visible CloudWatch tail is 300 lines, and npm audit plus CodeBuild's
+      # echo of the BUILD_APP_IMAGE block fill all of it -- cf9317e6's red battery left
+      # no readable "short test summary info" at all. Nothing here is status-bearing.
       - |
-        python3 -m venv /tmp/pyci && . /tmp/pyci/bin/activate
-        pip install -q -r deploy/runtime-agent/tests/requirements-test.txt
-        pytest -q deploy/runtime-agent/tests \
+        python3 -m venv /tmp/pyci || { echo "runtime-agent pytest venv creation FAILED"; exit 1; }
+        . /tmp/pyci/bin/activate || { echo "runtime-agent pytest venv activate FAILED"; exit 1; }
+        pip install -q -r deploy/runtime-agent/tests/requirements-test.txt || { rc=$?; deactivate; echo "runtime-agent pytest dep install FAILED (exit $rc)"; exit "$rc"; }
+        pytest -q --junitxml=/tmp/pytest-battery-junit.xml deploy/runtime-agent/tests \
           deploy/runtime-agent/test_telemetry_init.py \
           deploy/runtime-agent/test_build_env_vars.py \
           deploy/runtime-agent/test_remote_coding.py \
@@ -123,7 +179,8 @@ phases:
           deploy/pipeline/test_ecs_primary_container.py \
           deploy/pipeline/test_plan_surfaces.py \
           deploy/pipeline/test_prune_apt_sources.py \
-          deploy/pipeline/test_update_runtime_image.py
+          deploy/pipeline/test_update_runtime_image.py \
+          deploy/pipeline/test_buildspec_ci_exit_codes.py || { rc=$?; deactivate; echo "runtime-agent pytest battery FAILED (exit $rc)"; exit "$rc"; }
         deactivate
       # HARD GATE: lambda-zip manifest integrity (the guard DEPLOY.md's inline zip bypassed)
       - "bash scripts/check-lambda-zip-manifest.sh"
@@ -133,31 +190,63 @@ phases:
       # dependency scan (report-only until baselined)
       - "npm audit --audit-level=high || true"
       # ── Deploy-pipeline Build stage only: emit artifacts by digest ──
+      #
+      # TEAM-4491: this block also has no `set -e`, and its status is its LAST
+      # statement's -- the changed-files-runtime.txt `if/else` below, which
+      # essentially always succeeds. Every gate ahead of it was maskable,
+      # including `check-lambda-zip-manifest.sh --zip /tmp/orchestrator.zip`,
+      # the ONLY guard on the orchestrator zip the Deploy stage promotes -- a
+      # zip failing manifest validation was promoted behind a green Build.
+      # Same trap and same fix as TEAM-4462 F1 / TEAM-4464 above: guard every
+      # status-bearing command with an EXPLICIT exit. A bare `set -e` is NOT
+      # the fix here either -- CodeBuild runs every command of a build in ONE
+      # shared shell, so it would change the semantics of every later command.
       - |
         if [ "${BUILD_APP_IMAGE:-false}" = "true" ]; then
           echo "Build stage: packaging orchestrator zip via lambda/orchestrator/deploy.sh's OWN file list"
           # Reuse deploy.sh's exact `zip -rq function.zip ...` line — do NOT keep a
           # second copy of the file list here (Codex #263 P2: two lists drift).
           cp src/config/lease-constants.json lambda/orchestrator/lease-constants.json
-          ( cd lambda/orchestrator && npm ci --omit=dev )
+          ( cd lambda/orchestrator && npm ci --omit=dev ) || { echo "orchestrator npm ci FAILED"; exit 1; }
           ZIP_ARGS="$(grep -oE 'zip -rq function\.zip .*' lambda/orchestrator/deploy.sh | sed 's/^zip -rq function\.zip //')"
-          ( cd lambda/orchestrator && zip -rq /tmp/orchestrator.zip $ZIP_ARGS )
+          ( cd lambda/orchestrator && zip -rq /tmp/orchestrator.zip $ZIP_ARGS ) || { echo "orchestrator zip FAILED"; exit 1; }
           rm -f lambda/orchestrator/lease-constants.json
           echo "Validate the ACTUAL built archive (not just deploy.sh's line)"
-          bash scripts/check-lambda-zip-manifest.sh --zip /tmp/orchestrator.zip
+          bash scripts/check-lambda-zip-manifest.sh --zip /tmp/orchestrator.zip || { echo "orchestrator zip manifest check FAILED"; exit 1; }
           echo "Build + push app image to ECR, capture the DIGEST for promote-by-digest"
           ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
           ECR_URI="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION_HUB}.amazonaws.com/${ECR_REPO}"
-          aws ecr get-login-password --region "$AWS_REGION_HUB" \
-            | docker login --username AWS --password-stdin "${ACCOUNT_ID}.dkr.ecr.${AWS_REGION_HUB}.amazonaws.com"
+          # TEAM-4448 R11: CodeBuild starts a Docker daemon only for its OWN
+          # curated images. The custom CI image carries the static engine but
+          # nothing launches it, so bring it up here — a no-op on the managed
+          # image, where `docker info` already answers. This is the ONLY place a
+          # daemon is needed; PR checks never enter this branch.
+          if ! docker info >/dev/null 2>&1; then
+            echo "docker: no daemon - starting dockerd (custom build image)"
+            nohup dockerd --host=unix:///var/run/docker.sock --storage-driver=overlay2 \
+              >/tmp/dockerd.log 2>&1 &
+            timeout 60 bash -c 'until docker info >/dev/null 2>&1; do sleep 1; done' \
+              || { echo "docker: dockerd failed to come up within 60s"; cat /tmp/dockerd.log; exit 1; }
+            echo "docker: daemon up"
+          fi
+          # TEAM-4493: pipefail scoped to THIS pipe via a subshell. Without it the `||`
+          # guard sees only `docker login`'s status, so a failed
+          # `aws ecr get-login-password` was masked (safe today only because docker/cli
+          # rejects an empty --password-stdin). Deliberately scoped to only this one
+          # pipe, not a block-wide pipefail option, and not errexit either -- as the
+          # comments above say, CodeBuild runs every command of a build in ONE shared
+          # shell, so a block-wide flag would change the semantics of every later command.
+          ( set -o pipefail; aws ecr get-login-password --region "$AWS_REGION_HUB" \
+              | docker login --username AWS --password-stdin "${ACCOUNT_ID}.dkr.ecr.${AWS_REGION_HUB}.amazonaws.com" ) \
+            || { echo "ECR docker login FAILED"; exit 1; }
           # Build the image from the CANDIDATE roster with only the live runtimeArns
           # merged in — NOT the stale deployed S3 doc (Codex #263 round-4 P1). This
           # is the same merge the Deploy stage uploads, so the baked bundle and the
           # deployed S3 config agree on the roster.
           if aws s3 cp "s3://${ARTIFACT_BUCKET}/config/agents.json" /tmp/agents.s3.json --region "$AWS_REGION_HUB"; then
-            cp src/config/agents.json /tmp/agents.git.json
-            python3 deploy/pipeline/merge-agents-json.py /tmp/agents.s3.json src/config/agents.json /tmp/agents.merged.json
-            cp /tmp/agents.merged.json src/config/agents.json
+            cp src/config/agents.json /tmp/agents.git.json || { echo "agents.json git backup FAILED"; exit 1; }
+            python3 deploy/pipeline/merge-agents-json.py /tmp/agents.s3.json src/config/agents.json /tmp/agents.merged.json || { echo "agents.json roster merge FAILED"; exit 1; }
+            cp /tmp/agents.merged.json src/config/agents.json || { echo "agents.json merged install FAILED"; exit 1; }
           fi
           # CodePipeline's CodeStar source is a ZIP artifact with no .git — use the
           # pipeline-resolved source revision, not `git rev-parse` (Codex #263 P1).
@@ -166,8 +255,8 @@ phases:
           docker buildx build --platform linux/amd64 \
             --build-arg NEXT_PUBLIC_PIPELINE_ENABLED="${NEXT_PUBLIC_PIPELINE_ENABLED:-}" \
             --tag "${ECR_URI}:${GIT_SHA}" --tag "${ECR_URI}:latest" \
-            --push --file Dockerfile . --provenance=false
-          if [ -f /tmp/agents.git.json ]; then cp /tmp/agents.git.json src/config/agents.json; fi
+            --push --file Dockerfile . --provenance=false || { echo "docker buildx build/push FAILED"; exit 1; }
+          if [ -f /tmp/agents.git.json ]; then cp /tmp/agents.git.json src/config/agents.json || { echo "agents.json git roster restore FAILED"; exit 1; }; fi
           # Resolve the pushed image's digest. ECR describe-images is
           # eventually-consistent right after a push and can briefly return
           # nothing / "None" — writing that empty string through to the Deploy
@@ -191,10 +280,10 @@ phases:
           fi
           echo "Resolved image digest: $IMAGE_DIGEST"
           # Hand the exact artifacts to the Deploy stage.
-          mkdir -p pipeline-out
-          cp /tmp/orchestrator.zip pipeline-out/orchestrator.zip
-          printf '%s' "$IMAGE_DIGEST" > pipeline-out/image-digest.txt
-          printf '%s' "$GIT_SHA" > pipeline-out/git-sha.txt
+          mkdir -p pipeline-out || { echo "pipeline-out mkdir FAILED"; exit 1; }
+          cp /tmp/orchestrator.zip pipeline-out/orchestrator.zip || { echo "orchestrator zip artifact copy FAILED"; exit 1; }
+          printf '%s' "$IMAGE_DIGEST" > pipeline-out/image-digest.txt || { echo "image-digest.txt write FAILED"; exit 1; }
+          printf '%s' "$GIT_SHA" > pipeline-out/git-sha.txt || { echo "git-sha.txt write FAILED"; exit 1; }
           # Changed-file list the Deploy stage uses for the fleet/eval scope guard.
           # Must cover the WHOLE push, not just the tip: a multi-commit push where
           # an EARLIER commit touched eval files would be missed by HEAD~1..HEAD
@@ -204,9 +293,9 @@ phases:
           # (forces a human to confirm scope) rather than under-reporting.
           LAST_DEPLOYED="$(aws s3 cp "s3://${ARTIFACT_BUCKET}/pipeline-artifacts/last-deployed-sha.txt" - --region "$AWS_REGION_HUB" 2>/dev/null || true)"
           if [ -n "$LAST_DEPLOYED" ] && git cat-file -e "${LAST_DEPLOYED}^{commit}" 2>/dev/null; then
-            git diff --name-only "${LAST_DEPLOYED}..HEAD" > pipeline-out/changed-files.txt
+            git diff --name-only "${LAST_DEPLOYED}..HEAD" > pipeline-out/changed-files.txt || { echo "changed-files.txt git diff FAILED"; exit 1; }
           else
-            echo "deploy/runtime-agent/FORCE-UNKNOWN-RANGE" > pipeline-out/changed-files.txt
+            echo "deploy/runtime-agent/FORCE-UNKNOWN-RANGE" > pipeline-out/changed-files.txt || { echo "changed-files.txt fallback write FAILED"; exit 1; }
           fi
           # The runtime-image Deploy action runs in PARALLEL and advances its OWN
           # baseline (last-deployed-runtime-sha.txt) only on its own success — so a
@@ -216,10 +305,27 @@ phases:
           # clone). First run / unknown → sentinel = rebuild every runtime.
           LAST_RT="$(aws s3 cp "s3://${ARTIFACT_BUCKET}/pipeline-artifacts/last-deployed-runtime-sha.txt" - --region "$AWS_REGION_HUB" 2>/dev/null || true)"
           if [ -n "$LAST_RT" ] && git cat-file -e "${LAST_RT}^{commit}" 2>/dev/null; then
-            git diff --name-only "${LAST_RT}..HEAD" > pipeline-out/changed-files-runtime.txt
+            git diff --name-only "${LAST_RT}..HEAD" > pipeline-out/changed-files-runtime.txt || { echo "changed-files-runtime.txt git diff FAILED"; exit 1; }
           else
-            echo "deploy/runtime-agent/FORCE-UNKNOWN-RANGE" > pipeline-out/changed-files-runtime.txt
+            echo "deploy/runtime-agent/FORCE-UNKNOWN-RANGE" > pipeline-out/changed-files-runtime.txt || { echo "changed-files-runtime.txt fallback write FAILED"; exit 1; }
           fi
+        fi
+      # TEAM-4501: re-emit the battery's failed test ids at the very END of the log.
+      # post_build runs even when BUILD failed (cf9317e6: npm audit ran after the
+      # pytest failure), so this is the last thing in the 300-line tail. Read-only,
+      # `|| true`, no `exit` -- it can never change the build result. System python3
+      # (the venv is deactivated by then); both the managed image and the custom CI
+      # image bake python3 -- deploy/pipeline/ci-image/Dockerfile line 46.
+      - |
+        if [ -f /tmp/pytest-battery-junit.xml ]; then
+          python3 - /tmp/pytest-battery-junit.xml <<'PY' || true
+        import sys, xml.etree.ElementTree as ET
+        root = ET.parse(sys.argv[1]).getroot()
+        bad = [(tc, n) for tc in root.iter("testcase") for n in tc if n.tag in ("failure", "error")]
+        print(f"pytest battery summary (from junit xml): {len(bad)} failed/errored")
+        for tc, n in bad:
+            print(f"FAILED {tc.get('classname')}::{tc.get('name')} -- {(n.get('message') or '')[:200]}")
+        PY
         fi
 
 # For the deploy pipeline Build stage, these are the promote-by-digest artifacts.

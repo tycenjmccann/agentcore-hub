@@ -35,6 +35,15 @@ export interface WorkflowDefPhase {
    * order is derived solely from `agentPhase`, so these never affect it.
    */
   extraAgentPhases?: string[];
+  /**
+   * TEAM-4453: the agent that owns this phase's ticket when the hub materializes
+   * the run's skeleton (`WorkflowDef.intakeMaterialization: "hub"`). Set it when
+   * the roster is ambiguous or the phase is run by an agent whose roster `phase`
+   * is something else — e.g. `operator`'s ship phase is run by
+   * agentcore_hub_operator, whose roster phase is "development". Absent → the
+   * planner resolves the assignee from the roster (see resolvePhaseAssignee).
+   */
+  agentId?: string;
 }
 
 /**
@@ -212,6 +221,20 @@ export interface WorkflowDef {
   completionRequiresAgentPhases: string[];
   /** Optional human-review gates keyed by the agent phase they guard. */
   reviewGates?: ReviewGate[];
+  /**
+   * TEAM-4453: WHO creates the run's ticket skeleton.
+   *
+   *   "agent" (default, absent → this) — the hub creates ONE intake ticket and
+   *     the intake agent plans the rest from inside its first turn. Unchanged
+   *     legacy behaviour.
+   *   "hub" — the hub materializes the whole skeleton at start (phase tickets,
+   *     review gates, dependencies) from this def + the CD registry + the roster.
+   *     The intake agent's first ticket is then its real work ticket, and its
+   *     blueprint's intake path becomes a verify-only fallback.
+   *
+   * See src/lib/workflow/intake-materialize.ts for the planner.
+   */
+  intakeMaterialization?: "hub" | "agent";
   /** SDLC methodology this def implements when no overlay is selected. Absent → "standard". */
   sdlcFramework?: SdlcFramework;
   /** The committed artifact chain (set by a framework overlay, e.g. playbook). */

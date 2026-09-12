@@ -24,6 +24,10 @@ import type { WorkflowDef } from "@/lib/workflow/workflow-defs";
 import { workflowTypeForDef, resolveFramework, applyFramework } from "@/lib/workflow/workflow-defs";
 import { intentGateFor, renderIntentMarkdown, intentReviewPackage, intentGateDescription } from "@/lib/workflow/intent";
 import { resolveWorkflowDef } from "@/lib/workflow/defs-loader";
+import { planIntakeTickets } from "@/lib/workflow/intake-materialize";
+import type { DeferredPhase, TicketPlan, TicketPlanItem } from "@/lib/workflow/intake-materialize";
+import { loadRoster } from "@/lib/workflow/roster-loader";
+import { deliveryModeFor, loadCdRegistry } from "@/lib/cd-registry";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const TICKETS_TABLE = process.env.TICKETS_TABLE || "agentcore-hub-tickets";
@@ -449,6 +453,20 @@ export async function POST(req: NextRequest) {
       }
     }
 
+    // TEAM-4453 SR-1.4: `reviewGates` activates this def's `condition:"flagged"`
+    // gates, and from D1 on it also decides which gate TICKETS the hub creates.
+    // The route has no auth under AUTH_MODE=none and takes req.json() straight
+    // into WorkflowInput, so validate the shape at the front door: a non-array,
+    // a non-string element, or a phase this def does not declare is a 400 rather
+    // than a silently-ignored value or an unbounded list of junk labels. The gate
+    // ASSIGNEE is never taken from here (see intake-materialize.ts) — only which
+    // of the def's own gates are switched on.
+    const gatesError = validateReviewGates(body.reviewGates, def);
+    if (gatesError) {
+      return NextResponse.json({ error: gatesError }, { status: 400 });
+    }
+    body.reviewGates = body.reviewGates ?? [];
+
     if (!body.sources) body.sources = [];
     if (!body.description) body.description = "";
 
@@ -512,11 +530,24 @@ export async function POST(req: NextRequest) {
  *  contradicted the resolved def and was overridden (the def always wins). */
 type StartResponseMeta = { workflowTypeOverridden?: true; note?: string; repoCheck?: RepoCheck };
 
+/**
+ * TEAM-4453 D1: the success body of a start. `materialized` is the ticket ids the
+ * hub created, in creation order (item 0 first — the ticket that starts the run);
+ * `deferred` names the phases the hub deliberately left to the intake agent, so a
+ * caller can tell a partial skeleton from a complete one without re-deriving it.
+ * Agent-mode defs report exactly one materialized ticket and nothing deferred.
+ */
+type StartSuccess = StartResponseMeta & {
+  workflowId: string;
+  epicId: string;
+  materialized: string[];
+  deferred: DeferredPhase[];
+};
+
 async function startWithJira(body: WorkflowInput, def: WorkflowDef, presetWorkflowId?: string, markerId?: string, responseMeta: StartResponseMeta = {}, repoCheck?: RepoCheck) {
   const { JiraCloudProvider } = await import("@/lib/workflow/ticket-provider-jira");
   const jira = new JiraCloudProvider();
 
-  const intakePhase = def.phases.find((p) => p.type === "agent")?.agentPhase || "requirements";
   const workflowId = presetWorkflowId || mintWorkflowId();
 
   // 1. Create epic in Jira
@@ -531,7 +562,12 @@ async function startWithJira(body: WorkflowInput, def: WorkflowDef, presetWorkfl
   const fence = await putWorkflowRowFenced({
     workflowId,
     id: workflowId,
-    phase: intakePhase,
+    // TEAM-4453 R6a: the run starts in the "intake" phase, not in its first agent
+    // phase. The first dispatch then genuinely ADVANCES the row (and emits
+    // workflow.phase_change), which is what makes the hub-materialized skeleton's
+    // phase progression readable; seeding the first agent phase made the first
+    // advance a no-op. getPhaseOrder puts "intake" first for every def.
+    phase: "intake",
     epicId,
     repoConfig: body.repoConfig,
     // Only present when a repo URL did NOT verify — the orchestrator prepends
@@ -607,41 +643,66 @@ async function startWithJira(body: WorkflowInput, def: WorkflowDef, presetWorkfl
       console.log(`[start/jira] ${workflowId}: Intent Acceptance gate ${gate.id} → Ready (playbook).`);
     }
 
-    const reqTicket = await jira.createTicket({
-      parentId: epicId,
-      title: `${def.phases.find((p) => p.type === "agent")?.name || "Intake"}: ${def.intakeAgentId} — ${body.title}`,
-      description: intentGate
-        ? `Turn the accepted intent (workflows/${workflowId}/shared/intent.md) into the spec and the ticket plan. Blocked until the product owner approves the Intent Acceptance gate ${gateTicketId}.\n\nTitle: ${body.title}`
-        : `Analyze the request and create tickets for the relevant agents.\n\nTitle: ${body.title}\nDescription: ${body.description}`,
-      assignee: def.intakeAgentId,
-      blockedBy: gateTicketId ? [gateTicketId] : [],
-      // wfdef stamp keeps the ticket classifiable on the dashboard even if the
-      // workflow row is later deleted.
-      extraLabels: [`wfdef:${def.id}`],
-    }, workflowId);
-
-    if (gateTicketId) {
-      // Blocked behind the human gate — the cascade moves it to Ready on approval.
-      console.log(`[start/jira] Workflow ${workflowId} created. Epic: ${epicId}. Intake ticket ${reqTicket.id} waits on gate ${gateTicketId}.`);
-    } else {
-      // Requirements ticket has no blockers — transition to "Ready" so the webhook fires
-      // and the orchestrator invokes the agent (same flow as all other tickets in the pipeline)
-      await jira.transitionTo(reqTicket.id, "Ready");
-      console.log(`[start/jira] Workflow ${workflowId} created. Epic: ${epicId}. Req ticket: ${reqTicket.id} → Ready.`);
-    }
+    // TEAM-4453 D1: the skeleton the hub writes. Agent-mode defs plan exactly one
+    // item — the intake ticket, with the same TEAM-4450 title, description,
+    // assignee and blockers as before — so this is the old code path for them.
+    const plan = await buildIntakePlan(def, body, { workflowId, epicId, intentGateTicketId: gateTicketId });
+    const ids = await executePlan(plan, {
+      create: async (item, blockedBy) => {
+        // The wfdef/phase stamps keep a ticket classifiable on the dashboard even
+        // if the workflow row is later deleted. Jira labels survive verbatim (the
+        // DynamoDB backend sanitizes them, which is why it stamps `phase` instead).
+        const ticket = await jira.createTicket({
+          parentId: epicId,
+          title: item.summary,
+          description: item.description,
+          assignee: item.assignee,
+          blockedBy,
+          extraLabels: item.labels,
+        }, workflowId);
+        return ticket.id;
+      },
+      // Jira needs no sentinel and cannot have one: createTicket's "Blocks" links
+      // have no unlink on the provider, and only `case "ready"` dispatches in Jira
+      // mode, so a child resting in To Do cannot self-dispatch. Ordering is the
+      // guard — see executePlan.
+      sentinel: () => [],
+      park: async (id) => {
+        // Best-effort resting status so the board shows the wait. cascade.mjs
+        // unblocks from {blocked, todo}, so a failure here costs display only.
+        try {
+          await jira.transitionTo(id, "Blocked");
+        } catch (parkErr) {
+          console.warn(
+            `[start/jira] ${workflowId}: could not park ${id} in Blocked ` +
+              `(${(parkErr as Error).message}) — it stays in To Do; the cascade unblocks from either status.`
+          );
+        }
+      },
+      release: async (id, item) => {
+        if (item.externalBlockedBy.length > 0) {
+          // Blocked behind the human gate — the cascade moves it to Ready on approval.
+          console.log(`[start/jira] Workflow ${workflowId} created. Epic: ${epicId}. Intake ticket ${id} waits on gate ${item.externalBlockedBy.join(", ")}.`);
+          return;
+        }
+        // No blockers — transition to "Ready" so the webhook fires and the
+        // orchestrator invokes the agent (same flow as every other ticket).
+        await jira.transitionTo(id, "Ready");
+        console.log(`[start/jira] Workflow ${workflowId} created. Epic: ${epicId}. Req ticket: ${id} → Ready.`);
+      },
+    });
+    logPlan(plan, ids);
+    const success: StartSuccess = { workflowId, epicId, materialized: ids, deferred: plan.deferred, ...responseMeta };
+    return NextResponse.json(success);
   } catch (err) {
     await markWorkflowStartError(workflowId, err);
     throw err;
   }
-
-  return NextResponse.json({ workflowId, epicId, ...responseMeta });
 }
 
 // ─── DynamoDB Backend (via ticket tools Lambda) ──────────────────────────────
 
 async function startWithDynamoDB(body: WorkflowInput, def: WorkflowDef, presetWorkflowId?: string, markerId?: string, responseMeta: StartResponseMeta = {}, repoCheck?: RepoCheck) {
-  const intakePhase = def.phases.find((p) => p.type === "agent")?.agentPhase || "requirements";
-  const intakePhaseName = def.phases.find((p) => p.type === "agent")?.name || "Intake";
   const workflowId = presetWorkflowId || mintWorkflowId();
 
   // 1. Create the epic via ticket tools Lambda
@@ -671,7 +732,12 @@ async function startWithDynamoDB(body: WorkflowInput, def: WorkflowDef, presetWo
   const fence = await putWorkflowRowFenced({
     workflowId,
     id: workflowId,
-    phase: intakePhase,
+    // TEAM-4453 R6a: the run starts in the "intake" phase, not in its first agent
+    // phase. The first dispatch then genuinely ADVANCES the row (and emits
+    // workflow.phase_change), which is what makes the hub-materialized skeleton's
+    // phase progression readable; seeding the first agent phase made the first
+    // advance a no-op. getPhaseOrder puts "intake" first for every def.
+    phase: "intake",
     epicId,
     repoConfig: body.repoConfig,
     // Only present when a repo URL did NOT verify — the orchestrator prepends
@@ -752,7 +818,6 @@ async function startWithDynamoDB(body: WorkflowInput, def: WorkflowDef, presetWo
   //    TEAM-3686: the workflow row above already exists — if this fails, mark
   //    the row terminal before rethrowing, or the dedup marker coalesces every
   //    future trigger onto a stillborn run with zero tickets.
-  let reqResult: Record<string, unknown>;
   try {
     // Playbook defs: hub-created Intent Acceptance gate first (see startWithJira).
     const intentGate = intentGateFor(def, body.reviewGates || []);
@@ -770,36 +835,243 @@ async function startWithDynamoDB(body: WorkflowInput, def: WorkflowDef, presetWo
       if (gateResult.error) throw new Error(`Failed to create Intent Acceptance gate: ${gateResult.error}`);
       gateTicketId = (gateResult.key || gateResult.ticketId) as string;
     }
-    reqResult = await invokeTicketLambda("Tickets___create_ticket", {
-      summary: `${intakePhaseName}: ${def.intakeAgentId} — ${body.title}`,
-      description: intentGate
-        ? `Turn the accepted intent (workflows/${workflowId}/shared/intent.md) into the spec and the ticket plan. Blocked until the product owner approves the Intent Acceptance gate ${gateTicketId}.\n\nTitle: ${body.title}`
-        : `Analyze the request and create tickets for the relevant agents.\n\nTitle: ${body.title}\nDescription: ${body.description}`,
-      issue_type: "Task",
-      parent_key: epicId,
-      assignee: def.intakeAgentId,
-      workflow_id: workflowId,
-      ...(gateTicketId ? { blocked_by: [gateTicketId] } : {}),
+    // TEAM-4453 D1: the skeleton the hub writes. Agent-mode defs plan exactly one
+    // item — the intake ticket, with the same TEAM-4450 title, description,
+    // assignee and blockers as before — so this is the old code path for them.
+    const plan = await buildIntakePlan(def, body, { workflowId, epicId, intentGateTicketId: gateTicketId });
+    const ids = await executePlan(plan, {
+      create: async (item, blockedBy) => {
+        const res = await invokeTicketLambda("Tickets___create_ticket", {
+          summary: item.summary,
+          description: item.description,
+          issue_type: "Task",
+          parent_key: epicId,
+          assignee: item.assignee,
+          workflow_id: workflowId,
+          // The phase this ticket's work belongs to. The orchestrator dispatches
+          // on it, which is the only way a ticket can run a phase its assignee's
+          // roster phase is not (operator's ship ticket). No `labels`: the
+          // tickets Lambda's sanitizeUserLabels rewrites ":" to "-", so
+          // `phase:ship` would land as `phase-ship`; the field is the stamp here
+          // and the labels stay a Jira-mode affordance.
+          phase: item.phase,
+          ...(blockedBy.length > 0 ? { blocked_by: blockedBy } : {}),
+        });
+        if (res.error) throw new Error(`Failed to create ${item.key} ticket: ${res.error}`);
+        const id = (res.key || res.ticketId) as string;
+        if (!id) throw new Error(`Failed to create ${item.key} ticket: no ticket id in ${toolFailureDetail(res).slice(0, 300)}`);
+        return id;
+      },
+      // SR-1.1: the epic is the sentinel. It exists, it is in_progress (never
+      // done), so it is a real blocker until releaseSentinelBlocker clears it.
+      sentinel: () => [epicId],
+      // A DynamoDB ticket created with blockers is INSERTed straight into
+      // "blocked" (and an INSERT has no OldImage, so it is never read as a
+      // rejection) — there is nothing to transition.
+      park: async () => {},
+      release: async (id, _item, withheld) => {
+        if (!withheld) return; // single-item plan, or held by an external gate
+        await releaseSentinelBlocker(id, workflowId);
+      },
     });
+    logPlan(plan, ids);
+    console.log(`[start] Workflow ${workflowId} created. Epic: ${epicId}. Ticket ${ids[0]} will trigger first.`);
+    const success: StartSuccess = { workflowId, epicId, materialized: ids, deferred: plan.deferred, ...responseMeta };
+    return NextResponse.json(success);
   } catch (err) {
     await markWorkflowStartError(workflowId, err);
     throw err;
   }
-
-  if (reqResult.error) {
-    const err = new Error(`Failed to create requirements ticket: ${reqResult.error}`);
-    await markWorkflowStartError(workflowId, err);
-    throw err;
-  }
-
-  const reqTicketId = (reqResult.key || reqResult.ticketId) as string;
-
-  console.log(`[start] Workflow ${workflowId} created. Epic: ${epicId}. Requirements ticket ${reqTicketId} will trigger first.`);
-
-  return NextResponse.json({ workflowId, epicId, ...responseMeta });
 }
 
 // ─── Helpers ───────────────────────────────────────────────────────────────────
+
+/**
+ * TEAM-4453 SR-1.4: upper bound on requested review gates. A def declares a
+ * handful; anything larger is junk (and, from D1 on, would be an unbounded list
+ * of gate tickets), so it is a 400 rather than something to iterate over.
+ */
+const MAX_REQUESTED_REVIEW_GATES = 20;
+
+/**
+ * Validate `input.reviewGates` — the run's list of `condition:"flagged"` gates to
+ * switch on. Returns an error message, or null when the value is acceptable.
+ *
+ * A name is accepted when THIS def declares it, either as an agent phase or as
+ * the `afterPhase` of one of its own gates (software-delivery declares a ship
+ * gate but no ship phase, so both sources are needed). Absent/null → null: the
+ * caller then defaults it to `[]`, which is today's behaviour.
+ */
+function validateReviewGates(gates: unknown, def: WorkflowDef): string | null {
+  if (gates === undefined || gates === null) return null;
+  if (!Array.isArray(gates)) return "reviewGates must be an array of phase names";
+  if (gates.length > MAX_REQUESTED_REVIEW_GATES) {
+    return `reviewGates accepts at most ${MAX_REQUESTED_REVIEW_GATES} entries (got ${gates.length})`;
+  }
+  const known = new Set<string>(
+    [
+      ...def.phases.map((p) => p.agentPhase),
+      ...(def.reviewGates || []).map((g) => g?.afterPhase),
+    ].filter((p): p is string => typeof p === "string" && p.length > 0)
+  );
+  for (const gate of gates) {
+    if (typeof gate !== "string" || gate.trim() === "") {
+      return "reviewGates entries must be non-empty phase names";
+    }
+    if (!known.has(gate)) {
+      return (
+        `reviewGates entry "${gate}" is not a phase of the "${def.id}" workflow def ` +
+        `(known: ${[...known].sort().join(", ")})`
+      );
+    }
+  }
+  return null;
+}
+
+/**
+ * TEAM-4453 D1: the ticket skeleton for a run. Agent-mode defs (every def except
+ * those with `intakeMaterialization: "hub"`) plan EXACTLY one item and take a
+ * byte-identical path to before, so the roster and the CD registry — both S3
+ * reads — are only resolved for hub-mode defs.
+ */
+async function buildIntakePlan(
+  def: WorkflowDef,
+  body: WorkflowInput,
+  opts: { workflowId: string; epicId: string; intentGateTicketId?: string }
+): Promise<TicketPlan> {
+  const hub = def.intakeMaterialization === "hub";
+  const roster = hub ? await loadRoster() : [];
+  // deliveryModeFor takes the repo URL (findCdEntry's arg), not the repoConfig.
+  // Unregistered/absent → "handoff", which is exactly what the orchestrator
+  // decides for the same run, so the plan and the effective def agree.
+  const cdRegistered = hub
+    ? deliveryModeFor(await loadCdRegistry(), body.repoConfig?.repos?.[0]?.url) === "cd"
+    : false;
+  return planIntakeTickets(def, body, {
+    workflowId: opts.workflowId,
+    epicId: opts.epicId,
+    roster,
+    cdRegistered,
+    intentGateTicketId: opts.intentGateTicketId,
+  });
+}
+
+/** Per-backend primitives {@link executePlan} drives. */
+interface PlanOps {
+  /** Create one ticket blocked by `blockedBy` (ticket ids) and return its id. Throws on failure. */
+  create(item: TicketPlanItem, blockedBy: string[]): Promise<string>;
+  /**
+   * Extra blocker ids to hold item 0 back until the whole skeleton is written
+   * (DynamoDB's SR-1.1 sentinel). `[]` when the backend does not need one.
+   */
+  sentinel(): string[];
+  /** Put a created-blocked item at its resting status (Jira's Blocked transition). */
+  park(id: string, item: TicketPlanItem): Promise<void>;
+  /** Let item 0 run. `withheld` = a sentinel was applied at create time. */
+  release(id: string, item: TicketPlanItem, withheld: boolean): Promise<void>;
+}
+
+/**
+ * TEAM-4453 D1: create a {@link TicketPlan}'s tickets, in plan order, wiring
+ * `blocked_by` through a key→ticketId map. One loop for both backends (NFR-3):
+ * only the four primitives above differ.
+ *
+ * SR-1.1 — item 0 is the last ticket RELEASED, always. In DynamoDB mode a ticket
+ * with no blockers dispatches as soon as its stream record lands, which can be
+ * before the rest of the skeleton exists; the agent would then look at an epic
+ * with one child and re-plan the run itself. So item 0 is created behind a
+ * sentinel blocker (the epic) and released only after every other create, and in
+ * Jira mode — which has no removable blocker link — the same ordering is the
+ * guard: `transitionTo("Ready")` is the very last call.
+ *
+ * Returns the created ticket ids in plan order.
+ */
+async function executePlan(plan: TicketPlan, ops: PlanOps): Promise<string[]> {
+  const keyToId: Record<string, string> = {};
+  const ids: string[] = [];
+  const item0 = plan.items[0];
+  // Nothing to withhold for a single-item plan, and an item 0 already held by an
+  // external gate (Intent Acceptance) needs no second blocker.
+  const withhold = plan.items.length > 1 && item0.externalBlockedBy.length === 0;
+
+  for (let i = 0; i < plan.items.length; i++) {
+    const item = plan.items[i];
+    const blockedBy = [
+      ...item.blockedByKeys.map((key) => {
+        const id = keyToId[key];
+        // The planner's write-order invariant (assertWriteOrder) makes this
+        // unreachable; if it ever fires, fail before writing a half-wired
+        // skeleton — the caller marks the run phase=error.
+        if (!id) throw new Error(`intake plan: "${item.key}" is blocked by "${key}", which was not created`);
+        return id;
+      }),
+      ...item.externalBlockedBy,
+      ...(i === 0 && withhold ? ops.sentinel() : []),
+    ];
+    const id = await ops.create(item, blockedBy);
+    keyToId[item.key] = id;
+    ids.push(id);
+    if (i > 0 && blockedBy.length > 0) await ops.park(id, item);
+  }
+
+  await ops.release(ids[0], item0, withhold);
+  return ids;
+}
+
+/** One line per start describing the skeleton the hub wrote, and what it left out. */
+function logPlan(plan: TicketPlan, ids: string[]): void {
+  const parts = [
+    `[start] ${plan.workflowId} materialized ${ids.length} ticket(s) for def ${plan.defId} ` +
+      `(${plan.mode === "hub" ? (plan.cdRegistered ? "hub, cd" : "hub, handoff") : "agent-planned"}): ` +
+      plan.items.map((it, i) => `${it.key}=${ids[i]}`).join(", "),
+  ];
+  if (plan.deferred.length > 0) {
+    parts.push(`deferred: ${plan.deferred.map((d) => `${d.phase} (${d.reason})`).join(", ")}`);
+  }
+  if (plan.warnings.length > 0) parts.push(`warnings: ${plan.warnings.join("; ")}`);
+  console.log(parts.join("; "));
+}
+
+/** The failure detail of a ticket-tools result: `{error}`, else a textResult, else the raw body. */
+function toolFailureDetail(res: Record<string, unknown>): string {
+  return String(
+    res.error || (res.content as Array<{ text?: string }> | undefined)?.[0]?.text || JSON.stringify(res)
+  );
+}
+
+/**
+ * TEAM-4453 SR-1.1 (DynamoDB): drop the sentinel blocker off item 0 so the
+ * orchestrator dispatches it, now that the whole skeleton exists.
+ *
+ * Two calls, in this order and neither optional:
+ *   1. `edit_issue { blocked_by: [] }` clears the blocker list and leaves the
+ *      status alone (the tickets Lambda only rewrites status when the new list is
+ *      non-empty), so the resulting stream MODIFY has newStatus === oldStatus and
+ *      is swallowed — it is not read as a "Request changes" rejection.
+ *   2. `transition_ticket { unblock }` moves blocked → todo, which IS a dispatch
+ *      trigger. It must come second because `transition_ticket`'s own blocked_by
+ *      is additive, so it can never clear the list.
+ * `transition_ticket` reports an invalid transition as a textResult, not
+ * `{error}`, so both results are checked on their success `status` — otherwise a
+ * failed unblock would leave item 0 blocked forever with nothing in the log.
+ */
+async function releaseSentinelBlocker(ticketId: string, workflowId: string): Promise<void> {
+  const cleared = await invokeTicketLambda("Tickets___edit_issue", {
+    ticket_id: ticketId,
+    blocked_by: [],
+  });
+  if (cleared.status !== "updated") {
+    throw new Error(`Failed to clear the sentinel blocker on ${ticketId}: ${toolFailureDetail(cleared)}`);
+  }
+  const moved = await invokeTicketLambda("Tickets___transition_ticket", {
+    ticket_id: ticketId,
+    transition_id: "unblock",
+  });
+  if (moved.status !== "transitioned") {
+    throw new Error(`Failed to unblock ${ticketId} after clearing the sentinel: ${toolFailureDetail(moved)}`);
+  }
+  console.log(`[start] ${workflowId}: sentinel released on ${ticketId} — blockers cleared, unblocked → todo.`);
+}
 
 /**
  * Playbook PLAN stage: render the originator's words into intent.md and the

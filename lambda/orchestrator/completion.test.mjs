@@ -191,6 +191,54 @@ describe("isWorkflowComplete — guards", () => {
 });
 
 /**
+ * TEAM-4453 D1 — the operator run, hub-materialized. Its whole skeleton now
+ * exists from the first second (build → Merge Approval → ship), so completion is
+ * asked the question on a child list that is fully populated and mostly OPEN —
+ * the opposite of the agent-mode runs above, where a phase's ticket does not
+ * exist until the upstream agent creates it. One persona (phase "development")
+ * owns both agent tickets, so the ship ticket is only recognized as the ship
+ * phase through its hub-stamped `phase` — the same stamp the dispatcher reads.
+ */
+describe("isWorkflowComplete — hub-materialized operator skeleton", () => {
+  const OPERATOR_DEF = {
+    completionRequiresAgentPhases: ["development", "ship"],
+    reviewGates: [{ afterPhase: "development", blocking: true, condition: "always", onReject: "rework" }],
+  };
+  // The def's ship phase is stripped for a handoff (cd-registry.mjs), and the
+  // hub's planner plans no ship ticket to match.
+  const HANDOFF_DEF = {
+    completionRequiresAgentPhases: ["development"],
+    reviewGates: OPERATOR_DEF.reviewGates,
+  };
+  const OP = "agentcore_hub_operator";
+  const operatorOpts = { getAgentPhase: (a) => (a === OP ? "development" : undefined) };
+
+  const build = (status) => ({ ticketId: "TEAM-101", assignee: OP, phase: "development", status });
+  const gate = (status) => ({ ticketId: "TEAM-102", assignee: "human:engineer", phase: "development", status });
+  const ship = (status) => ({ ticketId: "TEAM-103", assignee: OP, phase: "ship", status });
+
+  it("build done, gate still open → not complete", () => {
+    expect(isWorkflowComplete([build("done"), gate("in_review"), ship("blocked")], OPERATOR_DEF, operatorOpts)).toBe(false);
+  });
+
+  it("build done, gate approved, ship still open → not complete", () => {
+    expect(isWorkflowComplete([build("done"), gate("done"), ship("todo")], OPERATOR_DEF, operatorOpts)).toBe(false);
+  });
+
+  it("build done, gate approved, NO ship ticket at all → not complete", () => {
+    expect(isWorkflowComplete([build("done"), gate("done")], OPERATOR_DEF, operatorOpts)).toBe(false);
+  });
+
+  it("build done, gate approved, ship done → complete", () => {
+    expect(isWorkflowComplete([build("done"), gate("done"), ship("done")], OPERATOR_DEF, operatorOpts)).toBe(true);
+  });
+
+  it("a handoff run (ship stripped from the def) completes on build + gate alone", () => {
+    expect(isWorkflowComplete([build("done"), gate("done")], HANDOFF_DEF, operatorOpts)).toBe(true);
+  });
+});
+
+/**
  * Advisory tickets: out-of-scope work the reviewers file as backlog. The label
  * is the only marker; a fix ticket or a human gate is never advisory
  * (TEAM-4131 F2). Completion no longer routes on it (DL-009) — these pin the

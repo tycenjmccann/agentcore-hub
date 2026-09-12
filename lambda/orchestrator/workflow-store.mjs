@@ -139,6 +139,41 @@ export async function trackTicket(workflowId, ticketId, entry) {
   }
 }
 
+/**
+ * Mark a HUMAN gate ticket as SEEN, exactly once per (workflow, ticket).
+ *
+ * A human gate is deliberately never written to agentTasks (a pending entry no
+ * dispatcher will ever advance holds completion open forever), so trackTicket's
+ * first-writer-wins CAS does not cover it. This is the equivalent marker for the
+ * human path: true for the call that created it, false for a re-delivered
+ * DynamoDB-stream INSERT or a re-sent Jira "created" webhook.
+ *
+ * Two writes for the same reason as ensureGateState: DynamoDB rejects `SET a.b`
+ * when `a` is missing.
+ */
+export async function claimHumanTicket(workflowId, ticketId) {
+  await _ddb.send(new UpdateCommand({
+    TableName: _table,
+    Key: { workflowId },
+    UpdateExpression: "SET humanTickets = if_not_exists(humanTickets, :empty)",
+    ExpressionAttributeValues: { ":empty": {} },
+  }));
+  try {
+    await _ddb.send(new UpdateCommand({
+      TableName: _table,
+      Key: { workflowId },
+      UpdateExpression: "SET humanTickets.#tid = :at",
+      ConditionExpression: "attribute_not_exists(humanTickets.#tid)",
+      ExpressionAttributeNames: { "#tid": ticketId },
+      ExpressionAttributeValues: { ":at": new Date().toISOString() },
+    }));
+    return true;
+  } catch (err) {
+    if (err.name === "ConditionalCheckFailedException") return false;
+    throw err;
+  }
+}
+
 /** Replace one task entry (completion cascade). Scoped to its map key. */
 export async function putTaskEntry(workflowId, ticketId, entry) {
   await ensureAgentTasksMap(workflowId);
