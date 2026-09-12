@@ -269,9 +269,33 @@ export const handler = async (event) => {
 // incomplete contract. Read once at module load — a mode change is a deploy.
 const FIX_TICKET_CONTRACT = normalizeContractMode(process.env.FIX_TICKET_CONTRACT);
 
+/**
+ * TEAM-4537: DynamoDB has no summary-length limit, but create_ticket/edit_issue
+ * must return the same `summary`/`title` under either ticket backend — parity
+ * at the tool interface is the contract (TEAM-4131 F2's twins doctrine), so a
+ * title that would 400 in Jira mode is clamped identically here. Byte-identical
+ * to the copy in lambda/agentcore-hub-jira/index.mjs.
+ *
+ * Trims to a word boundary when that keeps at least 200 chars, so a title with
+ * no whitespace near the cut still clamps instead of growing unbounded. The
+ * full text always survives separately in the description — this only shortens
+ * what's stored/returned as the summary.
+ *
+ * Kept local rather than added to fix-contract.mjs — that module is byte-compared
+ * across three copies by CI, and this clamp needs no cross-Lambda contract.
+ */
+export function clampSummary(s) {
+  if (typeof s !== "string" || s.length <= 255) return s;
+  const cut = s.slice(0, 254);
+  const lastSpace = cut.lastIndexOf(" ");
+  const trimmed = lastSpace >= 200 ? cut.slice(0, lastSpace) : cut;
+  return trimmed.trimEnd() + "…";
+}
+
 async function createTicket(args) {
-  const { summary, project_key, issue_type, description, assignee, priority, parent_key, blocked_by, workflow_id, spawned_by, phase, fix_contract, labels } = args;
-  if (!summary) return textResult("Error: 'summary' is required");
+  const { summary: rawSummary, project_key, issue_type, description, assignee, priority, parent_key, blocked_by, workflow_id, spawned_by, phase, fix_contract, labels } = args;
+  if (!rawSummary) return textResult("Error: 'summary' is required");
+  const summary = clampSummary(rawSummary);
 
   // TEAM-3619 D4c: optional fix-ticket provenance. Validate before minting so a
   // bad marker is a clear error, not a silently-dropped/garbage field.
@@ -461,7 +485,7 @@ async function editIssue(args) {
   if (args.summary !== undefined) {
     updates.push("#t = :t");
     names["#t"] = "title";
-    values[":t"] = args.summary;
+    values[":t"] = clampSummary(args.summary);
   }
   if (args.description !== undefined) {
     updates.push("#d = :d");

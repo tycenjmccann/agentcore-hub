@@ -997,6 +997,11 @@ test("getIssue: requests issuelinks and returns blockedBy from the inward side o
 
 const LONG_TITLE = "A".repeat(200) + " " + "B".repeat(200); // 401 chars, one space near the middle
 const LONG_DESCRIPTION = "The full text must survive in the description even though the title is long. " + "x".repeat(300);
+// TEAM-4537: pinned so the Jira Lambda and the DynamoDB twin
+// (lambda/agentcore-hub-tickets/index.test.mjs) are asserted against the
+// IDENTICAL clamped string for the IDENTICAL input — a drift in either
+// clampSummary() copy fails a test instead of silently diverging.
+const EXPECTED_CLAMPED_LONG_TITLE = "A".repeat(200) + "…";
 
 test("createTicket: a >255-char summary is clamped to <=255 chars on the create POST, description kept in full", async () => {
   const cap = captureCreate({ createdKey: "TEAM-900" });
@@ -1009,6 +1014,7 @@ test("createTicket: a >255-char summary is clamped to <=255 chars on the create 
     assert.ok(cap.fields, "expected a create POST");
     assert.ok(cap.fields.summary.length <= 255, `summary too long: ${cap.fields.summary.length} chars`);
     assert.ok(/\S$/.test(cap.fields.summary), "summary must not end in whitespace");
+    assert.equal(cap.fields.summary, EXPECTED_CLAMPED_LONG_TITLE);
     assert.ok(LONG_TITLE.startsWith(cap.fields.summary.replace(/…$/, "")), "clamped summary must be a prefix of the original title");
     const description = cap.fields.description.content[0].content[0].text;
     assert.equal(description, LONG_DESCRIPTION, "description must carry the full text, unclamped");
