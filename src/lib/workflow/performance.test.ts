@@ -3,7 +3,7 @@ import {
   bandFor, buildFleetView, median, mad, formatKpi, type CardSummary, type PerformanceIndex,
   computeKpi, readKpi, hasCostData, isValidCard, round4,
   CURRENT_REPORT_VERSION, FLEET_KPIS, KPI_CONFIG,
-  type KpiCap, type PerformanceCardInput,
+  type KpiCap, type PerformanceCardInput, type Kpi, type KpiConfig, type KpiComponentKind,
 } from "./performance";
 // The rubric fixture is OWNED BY THE LAMBDA SIDE (TEAM-4484) precisely so both
 // scorers are pinned by the same bytes. Importing it across the boundary is the
@@ -343,6 +343,86 @@ describe("kpi rubric contract", () => {
   it("minEvidenceWeight is a real bar (>0) and reachable (<=100)", () => {
     expect(KPI_CONFIG.quality.minEvidenceWeight).toBeGreaterThan(0);
     expect(KPI_CONFIG.quality.minEvidenceWeight).toBeLessThanOrEqual(100);
+  });
+
+  it("only the six v1 component kinds are in play", () => {
+    // A seventh kind in the config is now EXCLUDED with a note and the rest
+    // renormalized (see the unknown-kind test) — a quiet score change, not a
+    // crash. Pin the set so adding one is a deliberate, reviewed edit.
+    const kinds = new Set(KPI_CONFIG.quality.components.map((c) => c.kind));
+    expect([...kinds].sort()).toEqual(["count", "excess", "rate", "ratio", "sum", "verdict"]);
+  });
+});
+
+describe("computeKpi — unrecognised component kind", () => {
+  // The Lambda's note text as DATA: lambda/cost-report/index.mjs builds AWS SDK
+  // clients at module scope, so it cannot be imported into vitest — this literal is
+  // the mirror the two sides are reviewed against (same pattern as LAMBDA_BAND_KPI).
+  const lambdaNote = (kind: string) => `unknown component kind "${kind}"`;
+  const BOGUS_KIND: string = "seventh-kind";
+
+  /** KPI_CONFIG with one component's kind swapped for an unknown one. */
+  function withBogusKind(key: string): KpiConfig {
+    return {
+      ...KPI_CONFIG,
+      quality: {
+        ...KPI_CONFIG.quality,
+        components: KPI_CONFIG.quality.components.map((c) =>
+          c.key === key ? { ...c, kind: BOGUS_KIND as KpiComponentKind } : c),
+      },
+    };
+  }
+
+  // The lightest rubric line, so the surviving evidence stays above
+  // minEvidenceWeight and the run still scores. Derived, never named.
+  const lightest = [...KPI_CONFIG.quality.components].sort((a, b) => a.weight - b.weight)[0];
+
+  it("excludes the component with the Lambda's note instead of throwing", () => {
+    const card = computeCase("worked-example").card;
+    const base = computeKpi(card);
+    let kpi!: Kpi;
+    expect(() => { kpi = computeKpi(card, withBogusKind(lightest.key)); }).not.toThrow();
+
+    const got = kpi.quality.components.find((x) => x.key === lightest.key)!;
+    expect(got.included).toBe(false);
+    expect(got.points).toBeNull();
+    expect(got.normalized).toBeNull();
+    expect(got.raw).toBeNull();
+    expect(got.note).toBe(lambdaNote(BOGUS_KIND));
+    expect(kpi.quality.excluded).toEqual([lightest.key]);
+
+    // …and the remaining lines still score, renormalized over the weight left.
+    expect(kpi.quality.evidenceWeight).toBe(base.quality.evidenceWeight - lightest.weight);
+    expect(kpi.quality.score).not.toBeNull();
+    expect(kpi.quality.grade).not.toBeNull();
+    expect(kpi.quality.confidence).toBe("partial");
+    const others = (k: Kpi) => k.quality.components.filter((x) => x.key !== lightest.key);
+    expect(others(kpi)).toStrictEqual(others(base)); // byte-identical, unaffected
+  });
+
+  it("scores exactly as the fixture's neutral-ci case — an excluded line is an excluded line", () => {
+    // worked-example and worked-example-ci-unknown differ ONLY in quality.ci, and
+    // the ci line contributes to neither earned nor evidenceWeight in either run:
+    // so an unknown-kind ci must land on the ci-unknown case's published numbers.
+    const e = computeCase("worked-example-ci-unknown").expected!;
+    const kpi = computeKpi(computeCase("worked-example").card, withBogusKind("ci"));
+    expect(kpi.quality.score).toBe(e.score);
+    expect(kpi.quality.grade).toBe(e.grade);
+    expect(kpi.quality.confidence).toBe(e.confidence);
+    expect(kpi.quality.evidenceWeight).toBe(e.evidenceWeight);
+    expect(kpi.quality.excluded).toEqual(e.excluded);
+    expect(kpi.quality.capsApplied).toEqual(e.capsApplied);
+  });
+
+  it("reports the unknown kind whether or not the line carries a tolerance", () => {
+    // `ci` has no tolerance, `loops` does. Both must reach the mirrored note —
+    // the Lambda has no tolerance pre-check, so neither may be reported as one.
+    for (const key of ["ci", "loops"]) {
+      const kpi = computeKpi(computeCase("worked-example").card, withBogusKind(key));
+      const got = kpi.quality.components.find((x) => x.key === key)!;
+      expect(got.note, key).toBe(lambdaNote(BOGUS_KIND));
+      expect(got.included, key).toBe(false);
+    }
   });
 });
 
