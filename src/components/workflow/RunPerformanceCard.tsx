@@ -89,14 +89,15 @@ export default function RunPerformanceCard({ workflowId }: { workflowId: string 
               <Row label="Agent utilization" value={formatKpi("ratio", card.time.agentUtilization)} hint="busy ÷ active" />
             </div>
             <div className="rounded-lg border border-[var(--color-border)] p-3 space-y-1.5">
-              <div className="flex items-center gap-2 mb-1"><CheckCircle2 className="w-4 h-4 text-emerald-400" /><span className="text-sm font-medium text-[var(--color-text-primary)]">Quality</span><span className="ml-auto text-base font-semibold tabular-nums">
+              <div className="flex items-center gap-2 mb-1"><CheckCircle2 className="w-4 h-4 text-emerald-400" /><span className="text-sm font-medium text-[var(--color-text-primary)]">Quality</span><span className="ml-auto text-base font-semibold tabular-nums text-right leading-tight">
                 {q5 ? (
                   <>
                     {/* No score means no grade — never show an "F" the evidence can't back. */}
                     <span className={q5.confidence === "insufficient" ? "opacity-60" : undefined}>
                       {q5.score == null ? "—" : `${q5.score}/100${q5.grade ? ` · ${q5.grade}` : ""}`}
                     </span>
-                    <span className="text-[var(--color-text-muted)] font-normal"> · {card.quality.loops} loop{card.quality.loops === 1 ? "" : "s"}</span>
+                    {/* text-xs so "74/100 · C · 3 loops" still fits the header row on one line */}
+                    <span className="text-[var(--color-text-muted)] font-normal text-xs whitespace-nowrap"> · {card.quality.loops} loop{card.quality.loops === 1 ? "" : "s"}</span>
                   </>
                 ) : (
                   <>{card.quality.loops} loop{card.quality.loops === 1 ? "" : "s"}</>

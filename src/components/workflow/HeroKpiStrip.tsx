@@ -442,7 +442,9 @@ function KpiTile({ model, onActivate }: { model: TileModel; onActivate: () => vo
             {model.inlineSub && model.sub && <span className={SUB_CLASS}>· {model.sub}</span>}
           </span>
           {!model.inlineSub && model.sub && <span className={SUB_CLASS}>{model.sub}</span>}
-          {model.band && <span className={`${CHIP_CLASS} ${STATUS_STYLE[model.band]}`}>{BAND_TEXT[model.band]}</span>}
+          {/* mt-auto: the chips line up along the bottom of the row even when one
+              tile's sub-line wraps to two lines and another's does not. */}
+          {model.band && <span className={`${CHIP_CLASS} mt-auto ${STATUS_STYLE[model.band]}`}>{BAND_TEXT[model.band]}</span>}
         </>
       )}
       <span id={hintId} className="sr-only">{model.hover}</span>
@@ -455,8 +457,13 @@ function WmAssessmentTile({ assessment }: { assessment: WmAssessment }) {
     <button
       type="button"
       data-testid="hero-kpi-wm"
-      aria-label={`Workflow Manager assessment ${assessment.overall} out of 100, agent-authored — jump to the Workflow Manager panel`}
-      title="The Workflow Manager agent's own judgement of this run — not the deterministic score"
+      aria-label={`Workflow Manager assessment ${assessment.overall} out of 100, agent-authored${
+        assessment.verdict ? `: ${assessment.verdict}` : ""
+      } — jump to the Workflow Manager panel`}
+      title={
+        assessment.verdict ||
+        "The Workflow Manager agent's own judgement of this run — not the deterministic score"
+      }
       onClick={() => scrollToAnchor("workflow-manager-panel")}
       className={`${TILE_CLASS} border-dashed bg-transparent opacity-90 col-span-2 md:col-span-1`}
     >
@@ -467,12 +474,13 @@ function WmAssessmentTile({ assessment }: { assessment: WmAssessment }) {
       <span className="text-xl font-semibold tabular-nums leading-none text-[var(--color-text-primary)]">
         {assessment.overall}/100
       </span>
-      {assessment.verdict && (
-        <p className="text-[11px] text-[var(--color-text-muted)] truncate w-full" title={assessment.verdict}>
-          {assessment.verdict}
-        </p>
-      )}
-      <span className={`${CHIP_CLASS} ${STATUS_STYLE.insufficient}`}>agent judgement</span>
+      {/*
+        The verdict itself lives in the panel below (and in this tile's title +
+        aria-label). Repeating the sentence here would duplicate it in the DOM,
+        which is both visual noise and ambiguous for anything selecting by text.
+      */}
+      {assessment.verdict && <span className={SUB_CLASS}>read the full assessment</span>}
+      <span className={`${CHIP_CLASS} mt-auto ${STATUS_STYLE.insufficient}`}>agent judgement</span>
     </button>
   );
 }
