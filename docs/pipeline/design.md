@@ -188,6 +188,85 @@ buttons that map to `PutApprovalResult`. The tools Lambda **deliberately has
 no `PutApprovalResult`** — an agent can never approve its own deploy. The
 bridge is gated by `DEPLOY_PIPELINE_NAME` on that Lambda (unset = no-op).
 
+**…and conditional, never auto-approved.** Held unconditionally, that gate asked
+the human to approve byte-identical code twice: in `wf_1789170903227_c3x6k1` the
+Merge Approval gate cleared PR head SHA X at 10:38Z and the `Approve_deploy`
+ManualApproval cleared the merge of that same X at 16:03Z — 5.1h later, after the
+release manager had polled ~2h50m and filed deploy-gate ticket TEAM-4523. The
+second ask carries information in exactly one case: the thing about to deploy is
+**not** what the human approved. So `Approve_deploy` is now a CONDITIONAL stage,
+skipped when — and only when — the pipeline can prove it is deploying the merge of
+a SHA a human already approved. The gate is made *unnecessary* for one specific
+commit; it is never approved by software. Four moving parts:
+
+1. **Record, before the pipeline starts.** `Pipeline___start_deploy` takes an
+   optional `approved_head_sha` (plus `ci_build_id`, `pr_url`, `workflow_id`,
+   `ticket_id`). A record is written only when all three of these are proven, in
+   this order: `commit_sha` and `approved_head_sha` are both 40-hex; a SUCCEEDED
+   build of the target's CI project certifies `approved_head_sha`; and the GitHub
+   API, asked about the `pr_url` the caller passed, reports `merged: true` with
+   `head.sha == approved_head_sha` and `merge_commit_sha == commit_sha`. That
+   third check is the **merge binding** — without it the caller's `commit_sha` is
+   an unverified claim, and any commit on `main` could be paired with a certified
+   head (review finding on PR #576). It needs a read-only `GITHUB_TOKEN` on the
+   tools Lambda (plumbed by `deploy/setup-pipeline-tools-lambda.mjs`, optional,
+   5s timeout); with no token nothing is ever recorded, which is exactly the
+   pre-TEAM-4525 behaviour. `pr_url` is therefore mandatory for recording, and
+   the token grants no approval capability of any kind.
+   The record lands at
+   `s3://$ARTIFACT_BUCKET/pipeline-artifacts/ship-approvals/<merge_commit>.json`
+   — `{version, merge_commit, approved_head_sha, ci_build_id, pipeline, repo,
+   pr_url, workflow_id, ticket_id, recorded_at,
+   recorded_by:"Pipeline___start_deploy"}` — then the pipeline starts exactly as
+   before. Otherwise it starts the pipeline **without** a record and returns
+   `preapproval:{recorded:false, reason}`, where `reason` is
+   `approved_head_sha_missing` | `invalid_sha` | `ci_not_certified` |
+   `pr_url_missing` | `pr_url_invalid` | `merge_binding_mismatch` |
+   `merge_binding_unverified` | `record_write_failed`. One new IAM statement on
+   the tools Lambda: `s3:PutObject` on exactly that prefix. Symmetrically, all
+   three CodeBuild roles in the stack carry an explicit **Deny** on writing that
+   prefix (`DenyShipApprovalRecordWrites`, `denyShipApprovalWrites()` in
+   `pipeline-stack.ts`), because their commands come from the branch under review
+   and the Build role's `pipeline-artifacts/*` grant would otherwise let a change
+   forge its own approval; `GetObject` stays allowed so Deploy can re-verify.
+2. **Decide, in the Build stage.** `buildspec-ci.yml` declares
+   `DEPLOY_PREAPPROVED` in `env.exported-variables`, sets it to `0` in
+   `pre_build`, and in the `BUILD_APP_IMAGE` block (after the artifacts are
+   emitted) sets it to the output of
+   `deploy/pipeline/preapproved-check.sh decide "$FULL_SHA"`. That script prints
+   `1` only when the record exists for that exact commit, parses, its
+   `merge_commit` equals the resolved source commit, and its `approved_head_sha`
+   is 40-hex; every other outcome prints `0`, and it never fails the build. The
+   Build also emits `pipeline-out/git-sha-full.txt` (the existing 12-char
+   `git-sha.txt` is the image tag and is unchanged), and the Build action carries
+   `variablesNamespace: "BuildVars"`.
+3. **Skip only on the literal `1`.** The Approval stage carries a CodePipeline V2
+   stage-entry condition: `beforeEntry` → one `Rule` of provider `VariableCheck`,
+   `configuration: { Variable: "#{BuildVars.DEPLOY_PREAPPROVED}", Operator: "NE",
+   Value: "1" }`, `result: Result.SKIP`. Anything other than that literal `1` —
+   empty, unresolved, `0`, garbage — enters the stage and pages the human exactly
+   as today.
+4. **Re-verify, in the Deploy stage.** Both Deploy actions receive
+   `DEPLOY_PREAPPROVED` and their buildspecs run `preapproved-check.sh gate
+   "$DEPLOY_PREAPPROVED" "$(cat pipeline-out/git-sha-full.txt)"` before touching
+   prod: exit 0 for `0` (a human approved) or for `1` when an independent re-read
+   of the record still agrees; anything else refuses.
+
+Three checkpoints — decide, skip, re-verify — all fail closed in the same
+direction: a missing, stale, unreadable or misread record can only produce a
+needless human gate, never a silent deploy. Drift falls out of the same property.
+A post-approval `main` sync produces a new head SHA, so the operator's MERGE
+worker replies `DRIFT` and refuses to merge — no record is written and the gate
+fires (the lesson from the earlier "needed a 2nd approval after a post-gate main
+sync" incident). A commit landing on `main` between the merge and `start_deploy`
+means the resolved source version no longer matches the record, so the gate fires.
+The human-only invariant is untouched: the tools Lambda still has no approval
+action of any kind, the Telegram bridge stays the only holder, and no agent gains
+any approval capability. The decision logic lives in the blueprints, the tools
+Lambda and the pipeline definition — never in the orchestrator (DL-009) and behind
+no new `*_MODE` flag. `Pipeline___get_state` reports `approvalSkipped: boolean`,
+and the ship/completion record carries `approved_head_sha`.
+
 ### CI two-lane policy (summary)
 
 On a red build, the CI agent classifies the failure
@@ -661,9 +740,13 @@ so the module stays truly optional.
 
 ## 10. Open decisions (all resolved)
 
-1. **One approval or two** — RESOLVED: **both**. The merge gate authorizes the
-   merge; the in-pipeline ManualApproval (Telegram-bridged, §5) authorizes the
-   deploy.
+1. **One approval or two** — RESOLVED: **both, but the second only when it can
+   change the answer** (TEAM-4525). The merge gate authorizes the merge; the
+   in-pipeline ManualApproval (Telegram-bridged, §5) authorizes the deploy, and
+   is SKIPPED for the one commit that is provably the merge of the SHA the merge
+   gate approved (ship-approval record → `DEPLOY_PREAPPROVED` → `VariableCheck`
+   stage-entry condition → Deploy-stage re-verify). Never auto-approved, and
+   fail-closed: anything unproven pages the human as before.
 2. **CI-agent disposition** — RESOLVED: **kept as thin CI-fixer**, now with the
    §11 mechanical-lane auto-remediation.
 3. **Rollback automation** — RESOLVED: **shipped in the Deploy stage**

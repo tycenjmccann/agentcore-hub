@@ -437,18 +437,72 @@ export class PipelineStack extends Stack {
               project: buildProject,
               input: sourceOutput,
               outputs: [buildOutput],
+              // TEAM-4525: namespace for the one variable the Approval stage's
+              // entry condition reads. buildspec-ci.yml declares
+              // DEPLOY_PREAPPROVED under env.exported-variables.
+              variablesNamespace: "BuildVars",
             }),
           ],
         },
         {
           stageName: "Approval",
+          // ── TEAM-4525: the human deploy gate is CONDITIONAL, never auto-approved ──
+          //
+          // A ship run used to ask the human twice for byte-identical code: once
+          // at the Merge Approval gate (PR head SHA X) and again here (the merge
+          // of that same X). wf_1789170903227_c3x6k1 spent ~5.1h between the two
+          // (approved 10:38Z, deployed 16:03Z). The second ask only carries
+          // information when the thing about to deploy is NOT what was approved.
+          //
+          // So: the release manager records a ship-approval record binding the
+          // merge commit to the human-approved head SHA before calling
+          // Pipeline___start_deploy (which writes it only when a SUCCEEDED CI
+          // build certifies that head SHA); the Build stage checks the record
+          // against its own resolved source version and exports the answer as
+          // DEPLOY_PREAPPROVED (deploy/pipeline/preapproved-check.sh); and this
+          // native V2 stage-entry condition skips the stage on the literal "1".
+          //
+          // Nothing approves anything. There is still NO PutApprovalResult
+          // reachable by an agent -- the Telegram bridge remains the only holder.
+          // The gate is made UNNECESSARY for one specific commit, never cleared.
+          //
+          // FAIL-CLOSED ORIENTATION -- do not invert this. `Operator: NE` means
+          // the rule PASSES (and the stage is entered, paging the human exactly as
+          // before) for every value that is not the literal "1": "0", empty, an
+          // unresolved variable, a build that died before exporting it. Only an
+          // exact "1" fails the rule and applies `Result.SKIP`. And even that is
+          // not the last word: both Deploy actions re-read the record themselves
+          // (preapproved-check.sh gate) before touching prod, so a misread here
+          // can only cost a needless human gate, never a silent deploy.
+          beforeEntry: {
+            conditions: [
+              {
+                result: codepipeline.Result.SKIP,
+                rules: [
+                  new codepipeline.Rule({
+                    name: "GateUnlessMergeApproved",
+                    provider: "VariableCheck",
+                    version: "1",
+                    configuration: {
+                      Variable: "#{BuildVars.DEPLOY_PREAPPROVED}",
+                      Operator: "NE",
+                      Value: "1",
+                    },
+                  }),
+                ],
+              },
+            ],
+          },
           actions: [
             new cpactions.ManualApprovalAction({
               actionName: "Approve_deploy",
               notificationTopic: approvalTopic,
               additionalInformation:
                 "Approve to deploy the built artifacts (orchestrator zip + app image by digest) to prod. " +
-                "This is the irreversible production act; the merge gate already approved the code.",
+                "This is the irreversible production act. You are being asked because this commit is NOT " +
+                "the recorded merge of a head SHA approved at the Merge Approval gate (no ship-approval " +
+                "record, CI not certified on that head, or the source moved since) - so the code here is " +
+                "not provably the code that was approved.",
               externalEntityLink: `https://github.com/${githubOwner}/${githubRepo}/commits/${branch}`,
             }),
           ],
@@ -466,6 +520,13 @@ export class PipelineStack extends Stack {
               project: deployProject,
               input: buildOutput, // promote-by-digest: deploy consumes Build's artifacts
               runOrder: 1,
+              // TEAM-4525: the Build stage's answer, re-checked against the
+              // ship-approval record in pre_build before anything touches prod.
+              environmentVariables: {
+                DEPLOY_PREAPPROVED: {
+                  value: "#{BuildVars.DEPLOY_PREAPPROVED}",
+                },
+              },
             }),
             // Parallel (same runOrder) so the app action's exit-2 HANDOFF for
             // still-manual infra scripts never blocks the runtime image roll, and
@@ -476,6 +537,11 @@ export class PipelineStack extends Stack {
               project: runtimeImageProject,
               input: buildOutput,
               runOrder: 1,
+              environmentVariables: {
+                DEPLOY_PREAPPROVED: {
+                  value: "#{BuildVars.DEPLOY_PREAPPROVED}",
+                },
+              },
             }),
           ],
         },
@@ -509,6 +575,44 @@ export class PipelineStack extends Stack {
 }
 
 // ── IAM helpers ────────────────────────────────────────────────────────────
+
+/**
+ * An explicit DENY on writing ship-approval records (TEAM-4525 review P1).
+ *
+ * The conditional deploy gate is only as strong as the claim "a record under
+ * pipeline-artifacts/ship-approvals/ was written by the tools Lambda after it
+ * verified CI + the GitHub merge binding". Every CodeBuild role in this pipeline
+ * otherwise has a broad enough PutObject grant to forge one — the Build role has
+ * `pipeline-artifacts/*`, the app Deploy role has the whole bucket — and the
+ * commands they run come from the source branch, i.e. from the very change under
+ * review. A forged record would let a build skip its own human approval.
+ *
+ * An explicit Deny beats every Allow in the same policy (and any bucket policy),
+ * so attaching this to all three roles makes the tools Lambda the only writer
+ * regardless of how the Allow statements are later widened.
+ *
+ * GetObject is deliberately NOT denied: both Deploy roles must still READ the
+ * record to re-verify it before touching prod (Sid ReadShipApprovalRecord).
+ */
+function denyShipApprovalWrites(artifactBucket: s3.IBucket): iam.PolicyStatement {
+  return new iam.PolicyStatement({
+    sid: "DenyShipApprovalRecordWrites",
+    effect: iam.Effect.DENY,
+    actions: [
+      "s3:PutObject",
+      "s3:PutObjectAcl",
+      "s3:PutObjectTagging",
+      "s3:DeleteObject",
+      "s3:DeleteObjectVersion",
+      "s3:DeleteObjectTagging",
+      "s3:AbortMultipartUpload",
+      "s3:RestoreObject",
+      "s3:ReplicateObject",
+      "s3:ReplicateDelete",
+    ],
+    resources: [`${artifactBucket.bucketArn}/pipeline-artifacts/ship-approvals/*`],
+  });
+}
 
 function grantBuildArtifactPerms(
   scope: Construct,
@@ -569,6 +673,11 @@ function grantBuildArtifactPerms(
             `${ctx.artifactBucket.bucketArn}/config/*`,
           ],
         }),
+        // ...but NOT a ship-approval record: PutBuildArtifacts above covers that
+        // prefix, and this build runs source-controlled commands BEFORE
+        // DEPLOY_PREAPPROVED is decided, so without this Deny a change could write
+        // its own approval and skip its own human gate.
+        denyShipApprovalWrites(ctx.artifactBucket),
       ],
     })
   );
@@ -766,6 +875,11 @@ function grantDeployPerms(
   // then exits 2 so the release manager reports the human step (surfaces.json
   // "handoff").
 
+  // S3ConfigAndBlueprints grants PutObject on the WHOLE bucket, which includes the
+  // ship-approval prefix. Deny it explicitly: this role must READ a record to
+  // re-verify it (ReadShipApprovalRecord), never write one (TEAM-4525 review P1).
+  statements.push(denyShipApprovalWrites(ctx.artifactBucket));
+
   role.attachInlinePolicy(
     new iam.Policy(scope, "DeployPerms", { statements })
   );
@@ -876,6 +990,22 @@ function grantRuntimeImagePerms(
             `${ctx.artifactBucket.bucketArn}/pipeline-artifacts/last-deployed-runtime-sha.txt`,
           ],
         }),
+        // TEAM-4525: read-only, one prefix. This action's pre_build re-reads the
+        // ship-approval record itself rather than trusting a skipped Approval
+        // stage (preapproved-check.sh gate). The app deploy role already has
+        // bucket-wide GetObject; this role deliberately has almost none, so grant
+        // exactly the one prefix and nothing else.
+        new iam.PolicyStatement({
+          sid: "ReadShipApprovalRecord",
+          actions: ["s3:GetObject"],
+          resources: [
+            `${ctx.artifactBucket.bucketArn}/pipeline-artifacts/ship-approvals/*`,
+          ],
+        }),
+        // Read to re-verify, never write. This role's AdvanceRuntimeBaseline grant
+        // is one key so it could not forge a record today, but the Deny keeps that
+        // true if the baseline grant is ever widened to a prefix.
+        denyShipApprovalWrites(ctx.artifactBucket),
       ],
     })
   );

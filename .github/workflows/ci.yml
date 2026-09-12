@@ -164,6 +164,7 @@ jobs:
           deploy/pipeline/test_prune_apt_sources.py
           deploy/pipeline/test_update_runtime_image.py
           deploy/pipeline/test_buildspec_ci_exit_codes.py
+          deploy/pipeline/test_preapproved_check.py
 
   cloud-code-ui:
     name: Cloud Code UI (mocked, no AWS)

@@ -353,12 +353,35 @@ covers exactly the SHA in the brief.
    the BUILD flow by filing nothing: simply report `outcome="deploy-blocked"`,
    `block_reason="head drifted after approval"`, and stop (the human decides).
 3. **Deploy:** `Pipeline___start_deploy(pipeline_name=..., commit_sha=<merge
-   sha>)`; record `pipelineExecutionId`.
+   sha>)`; record `pipelineExecutionId`. Add `approved_head_sha=<approved sha>`,
+   `ci_build_id=<the certifying CodeBuild build id>` and `pr_url=<the PR you
+   merged>` (all three - the Lambda asks GitHub whether that PR is merged with
+   `head.sha` == the approved sha and `merge_commit_sha` == `commit_sha`, and
+   records nothing it cannot confirm) ONLY when BOTH hold:
+   (a) the MERGE PROMPT worker replied `MERGED <merge sha>` - it replies
+   `DRIFT <sha>` and refuses unless the head at merge time was exactly the
+   approved SHA; AND (b) CI certified that SAME head SHA (`ci_status=
+   "certified"` with `ci_head_sha` == the approved SHA). Either false -> omit
+   `approved_head_sha` and expect the human deploy gate: any post-approval
+   `main` sync makes a NEW head SHA (hence the `DRIFT` reply), and the human
+   approved specific bytes, not a new SHA. Then read `preapproval` from the
+   result and state it in your summary: `recorded:true` = the record for this
+   merge commit is written; `recorded:false` -> name `preapproval.reason`
+   (`approved_head_sha_missing` | `invalid_sha` | `ci_not_certified` |
+   `pr_url_missing` | `pr_url_invalid` | `merge_binding_mismatch` |
+   `merge_binding_unverified` | `record_write_failed`) and expect the gate.
+   That is the safe outcome, not an
+   error - never re-trigger `start_deploy` to chase a record.
 4. **Watch:** poll `Pipeline___get_state(pipeline_name, execution_id)` every
-   ~60s until `terminal:true` AND `matchesExecution:true`. A `ManualApproval`
-   stage waiting is the human's deploy gate: surface it, never approve it
-   yourself. `handoff: {files}` on a SUCCEEDED run = infra scripts a human must
-   run: list them in your summary, do not run them.
+   ~60s until `terminal:true` AND `matchesExecution:true`. A waiting
+   `ManualApproval` stage is the human's deploy gate; it fires only when the
+   commit about to deploy is not the recorded merge of the approved head SHA (no
+   record, a different SHA, or an unreadable record - it fails closed): surface
+   it and file the deploy-gate ticket per the existing policy, never approve it
+   yourself - you have no tool that can. `approvalSkipped: true` = this run
+   needed only the single Merge Approval; say so. `handoff: {files}` on a
+   SUCCEEDED run = infra scripts a human must run: list them in your summary, do
+   not run them.
    **Build/Deploy FAILED:** `Pipeline___get_build_log(build_id=
    <externalExecutionId>)`, read the cause, then STOP deploying. The human's
    approval covered exactly one SHA; a recovery commit is new production code
@@ -374,8 +397,10 @@ covers exactly the SHA in the brief.
      and watch again. If the human does not approve, `report_completion` with
      `outcome="deploy-blocked"` and the failing stage's log link.
 5. **Report:** `WorkflowOutput___report_completion(ticket_id=<ship ticket>,
-   summary=<merge sha, pipelineExecutionId, each stage's terminal status, smoke
-   result, handoff files>, merge_commit=<merge sha>, outcome="shipped")`.
+   summary=<merge sha, pipelineExecutionId, each stage's terminal status,
+   preapproval.recorded (+ reason if false), smoke result, handoff files>,
+   merge_commit=<merge sha>, approved_head_sha=<the approved sha, when you passed
+   one to start_deploy>, outcome="shipped")`.
    Could not merge or deploy -> `outcome="deploy-blocked"`, `block_reason`, no
    `merge_commit`. Never report `shipped` for a merge you did not confirm.
 

@@ -196,3 +196,52 @@ describe("report_completion — merge_commit / outcome / block_reason", () => {
     expect(h.warns.join("\n")).toMatch(/oversized merge_commit/);
   });
 });
+
+// TEAM-4525 AC-3 — the head SHA a human approved at the Merge Approval gate is
+// recorded on the ship record, so the deploy gate's "is this the merge of what a
+// human approved?" question has a durable answer. Same additive contract as
+// merge_commit, but stricter: anything that is not a full 40-hex git SHA is
+// dropped, because a half-recorded SHA would be read as an approval it isn't.
+describe("report_completion — approved_head_sha", () => {
+  const SHA = "1f0c3b8ad4e5f60718293a4b5c6d7e8f90a1b2c3";
+
+  it("persists a valid 40-hex sha alongside merge_commit", async () => {
+    await report({ approved_head_sha: SHA, merge_commit: "0ef5892abc", outcome: "shipped" });
+    const r = record();
+    expect(r.approved_head_sha).toBe(SHA);
+    expect(r.merge_commit).toBe("0ef5892abc");
+  });
+
+  it("trims and lowercases", async () => {
+    await report({ approved_head_sha: `  ${SHA.toUpperCase()}  ` });
+    expect(record().approved_head_sha).toBe(SHA);
+  });
+
+  it("drops a value that is not a git sha with a warning", async () => {
+    await report({ approved_head_sha: "abc", merge_commit: "0ef5892abc" });
+    const r = record();
+    expect("approved_head_sha" in r).toBe(false);
+    // The merge commit still lands — the malformed field is dropped alone.
+    expect(r.merge_commit).toBe("0ef5892abc");
+    expect(h.warns.join("\n")).toMatch(/malformed approved_head_sha/);
+  });
+
+  it("drops an oversized value with a warning", async () => {
+    await report({ approved_head_sha: "a".repeat(129) });
+    expect("approved_head_sha" in record()).toBe(false);
+    expect(h.warns.join("\n")).toMatch(/malformed approved_head_sha/);
+  });
+
+  it("an absent value produces no key at all", async () => {
+    await report({});
+    const r = record();
+    expect("approved_head_sha" in r).toBe(false);
+    expect(Object.keys(r).sort()).toEqual([...BASE_KEYS].sort());
+  });
+
+  it("a blank value is the same as absent — no key, no warning", async () => {
+    await report({ approved_head_sha: "   " });
+    expect("approved_head_sha" in record()).toBe(false);
+    expect(h.warns.join("\n")).not.toMatch(/approved_head_sha/);
+  });
+});

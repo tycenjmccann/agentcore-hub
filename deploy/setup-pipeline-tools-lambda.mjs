@@ -36,6 +36,23 @@
  * widening the allow-list can only add a pipeline to READ and TRIGGER, never an
  * approval path.
  *
+ * ─── The ship-approval record (TEAM-4525) ─────────────────────────────────────
+ * start_deploy records the head SHA a human already approved at Merge Approval,
+ * keyed on the merge commit, under pipeline-artifacts/ship-approvals/ in the
+ * artifact bucket, so the pipeline can skip re-asking that same human for
+ * byte-identical code. That adds ONE statement — ShipApprovalRecordWrite,
+ * s3:PutObject on that ONE prefix and nothing else: the only S3 write this role
+ * has. It is not an approval grant. codepipeline:PutApprovalResult remains absent
+ * in every combination (asserted, not just reviewed, in this script's test), and
+ * a role that can write evidence but cannot release a gate is exactly what makes
+ * the conditional gate safe.
+ *
+ * A record is only written when the Lambda can PROVE the commit being deployed is
+ * the merge of that approved head — it asks GitHub about the caller's pr_url
+ * (merged / head.sha / merge_commit_sha), which is what GITHUB_TOKEN below is for.
+ * The token is read-only and optional: with none, no record is ever written and
+ * every deploy keeps its human gate.
+ *
  * Idempotent / re-runnable. Account-guarded via deploy/config.sh conventions.
  *
  * Usage:
@@ -50,6 +67,17 @@
  *                   (adds the CiStartBuild statement + sets the same var on the
  *                   function, so Pipeline___capabilities advertises the tool).
  *                   Anything else — including unset — omits the grant entirely.
+ *   GITHUB_TOKEN    a READ-ONLY GitHub token (public_repo / repo:read is enough).
+ *                   Used for one thing: proving pr_url's PR is merged with
+ *                   head.sha == approved_head_sha and merge_commit_sha ==
+ *                   commit_sha before a ship-approval record may be written.
+ *                   Unset (or empty) = no record can ever be written, so every
+ *                   deploy keeps its human gate — the pre-TEAM-4525 behaviour.
+ *                   Only sent when non-empty, so it never clobbers a token an
+ *                   operator set out of band.
+ *                   (GITHUB_TIMEOUT_MS, read by the Lambda itself, defaults to
+ *                   5000: that call is on a 60s Lambda's critical path, so a slow
+ *                   API must fail closed rather than burn the whole budget.)
  *   DEPLOY_PROJECT  default agentcore-hub-deploy   (the Deploy stage's CodeBuild
  *                   project — same NAME as the pipeline, different resource kind)
  *   PIPELINE_REGIONS  comma list of regions holding hub-*-deploy pipelines.
@@ -161,6 +189,12 @@ export function resolveEnv(env = process.env) {
     // Same convention as deploy/config.sh; ACCOUNT is only known at deploy time,
     // so buildInlinePolicy derives the ARN from it.
     ARTIFACT_BUCKET: env.ARTIFACT_BUCKET || "",
+    // TEAM-4525: read-only GitHub credential used ONLY to prove that a
+    // start_deploy's commit_sha really is the merge of the head SHA a human
+    // approved (verifyMergeBinding). Optional: with no token no ship-approval
+    // record can be written, so every deploy keeps its human gate — the safe
+    // default. It confers no approval capability.
+    GITHUB_TOKEN: env.GITHUB_TOKEN || "",
   };
 }
 
@@ -240,7 +274,12 @@ export function buildInlinePolicy(env) {
         // hub-*-deploy pipeline. NO codepipeline:PutApprovalResult — the deploy
         // gate is a human decision (Telegram bridge). Do not add it here, and note
         // that widening this Resource list can only ever add a pipeline to read
-        // and trigger, never an approval path.
+        // and trigger, never an approval path. Still true after TEAM-4525's
+        // conditional deploy gate: the tools Lambda writes a ship-approval RECORD
+        // (Sid ShipApprovalRecordWrite, s3:PutObject on one prefix) and the
+        // pipeline decides whether that record makes a second human ask
+        // redundant. Recording is not approving, and there is still no
+        // PutApprovalResult anywhere in this role's reach.
         Sid: "PipelineReadAndTrigger",
         Effect: "Allow",
         Action: [
@@ -306,6 +345,27 @@ export function buildInlinePolicy(env) {
             },
           ]
         : []),
+      // TEAM-4525 — the ONE S3 write this role ever gets: start_deploy records the
+      // head SHA a human already approved at Merge Approval, keyed on the merge
+      // commit, so the pipeline can skip asking that same human a SECOND time for
+      // byte-identical code. Scoped exactly like HandoffMarkerRead is: s3:PutObject
+      // ONLY (no GetObject, no Delete, no ListBucket) on ONE prefix of the hub's own
+      // artifact bucket. It is NOT an approval grant and must never become one — the
+      // record is evidence the PIPELINE evaluates; codepipeline:PutApprovalResult
+      // stays absent from this role in every combination, and a role that can write
+      // a record but cannot approve a gate is the property that makes the skip safe.
+      ...(artifactBucket
+        ? [
+            {
+              Sid: "ShipApprovalRecordWrite",
+              Effect: "Allow",
+              Action: ["s3:PutObject"],
+              Resource: [
+                `arn:aws:s3:::${artifactBucket}/pipeline-artifacts/ship-approvals/*`,
+              ],
+            },
+          ]
+        : []),
       {
         Sid: "BuildLogRead",
         Effect: "Allow",
@@ -348,6 +408,7 @@ async function main() {
     PIPELINE_CI_START_BUILD,
     PIPELINE_REGIONS,
     ARTIFACT_BUCKET,
+    GITHUB_TOKEN,
   } = cfg;
 
   // Fail on a bad CI_PROJECT before touching AWS at all (buildInlinePolicy
@@ -446,6 +507,10 @@ async function main() {
     PIPELINE_REGIONS,
     ARTIFACT_BUCKET: ARTIFACT_BUCKET || `agentcore-hub-artifacts-${ACCOUNT}-${REGION}`,
   };
+  // Only when supplied: envVars is spread OVER existingEnv, so an unconditional
+  // empty string here would wipe a token an operator set out of band and silently
+  // turn every conditional gate back into a human one.
+  if (GITHUB_TOKEN) envVars.GITHUB_TOKEN = GITHUB_TOKEN;
 
   // ─── 3. Create/update the function ───────────────────────────────────────────
   let exists = false;

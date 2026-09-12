@@ -2062,7 +2062,7 @@ def Pipeline___get_state(pipeline_name: str = "", execution_id: str = "") -> str
 
 
 @tool
-def Pipeline___start_deploy(pipeline_name: str = "", commit_sha: str = "") -> str:
+def Pipeline___start_deploy(pipeline_name: str = "", commit_sha: str = "", approved_head_sha: str = "", ci_build_id: str = "", pr_url: str = "", workflow_id: str = "", ticket_id: str = "") -> str:
     """Trigger a deploy pipeline execution. Call this AFTER merging the PR (the
     GitHub push auto-trigger is not wired) and again after a build-failure fix has
     landed on the default branch, to re-run. Returns the pipelineExecutionId.
@@ -2073,7 +2073,11 @@ def Pipeline___start_deploy(pipeline_name: str = "", commit_sha: str = "") -> st
     execution_id on every Pipeline___get_state watch poll.
 
     The Deploy stage has an in-pipeline ManualApproval (the deploy gate) that a
-    HUMAN approves via Telegram — you do NOT approve it. After starting, poll
+    HUMAN approves via Telegram — you do NOT approve it, and there is NO tool
+    (here or anywhere in the fleet) that can approve it. Passing
+    approved_head_sha is not an approval and never substitutes for one: it is
+    evidence the pipeline verifies for itself, and if the pipeline cannot verify
+    it the human gate fires exactly as before. After starting, poll
     Pipeline___get_state until terminal and report the result as CD evidence.
 
     Args:
@@ -2084,12 +2088,51 @@ def Pipeline___start_deploy(pipeline_name: str = "", commit_sha: str = "") -> st
             outside Pipeline Mode, where it defaults to the deploy pipeline.
         commit_sha: The merge commit SHA; derives the idempotency token
             (omitted from the AWS call when not provided).
+        approved_head_sha: The PR head SHA that the HUMAN approved at the Merge
+            Approval gate. Pass it ONLY when BOTH hold: the merge worker
+            confirmed the merge happened at exactly that head SHA (no drift —
+            nothing was pushed to the PR after the approval), AND CI is
+            certified green on that same head SHA. Pass pr_url with it — the
+            Lambda asks GitHub whether that PR is merged with head.sha ==
+            approved_head_sha and merge_commit_sha == commit_sha, and refuses to
+            record anything without that confirmation. When it is passed and the
+            pipeline independently verifies it against commit_sha, the
+            in-pipeline human deploy gate is unnecessary for that one merge
+            commit and is skipped. When it is omitted — or supplied but not
+            verifiable — the human deploy gate fires as before (fail-closed).
+            This does NOT approve anything; guessing or back-filling this value
+            is a false attestation, so leave it out whenever you are unsure.
+        ci_build_id: The CodeBuild build id of the certifying CI build for
+            approved_head_sha (as reported by Pipeline___get_build_status /
+            the CI agent's ci_build_id). Pass it alongside approved_head_sha so
+            the Lambda can verify that build directly instead of searching for
+            it.
+        pr_url: The pull request URL the merge came from
+            (https://github.com/<owner>/<repo>/pull/<n>). REQUIRED whenever you
+            pass approved_head_sha: it is how the Lambda machine-verifies the
+            merge_commit ↔ approved head binding. Without it the record is
+            refused (reason pr_url_missing) and the human gate fires.
+        workflow_id: The workflow this deploy belongs to — audit context.
+        ticket_id: Your CD/ship ticket ID — audit context.
     """
     args = {}
     if pipeline_name:
         args["pipeline_name"] = pipeline_name
     if commit_sha:
         args["commit_sha"] = commit_sha
+    # TEAM-4525: conditional deploy gate. Sent only when the agent supplied
+    # them, never as "" — the pipeline treats absent evidence as "page a human",
+    # so an empty-but-present field must not read as an attestation.
+    if approved_head_sha.strip():
+        args["approved_head_sha"] = approved_head_sha.strip()
+    if ci_build_id.strip():
+        args["ci_build_id"] = ci_build_id.strip()
+    if pr_url.strip():
+        args["pr_url"] = pr_url.strip()
+    if workflow_id.strip():
+        args["workflow_id"] = workflow_id.strip()
+    if ticket_id.strip():
+        args["ticket_id"] = ticket_id.strip()
     return _invoke_lambda(PIPELINE_TOOLS_LAMBDA, "Pipeline___start_deploy", args)
 
 
@@ -2213,7 +2256,7 @@ def Pipeline___capabilities(pipeline_name: str = "") -> str:
 # ─── Workflow Output Tools ────────────────────────────────────────────────────
 
 @tool
-def WorkflowOutput___report_completion(ticket_id: str, summary: str, artifacts: str = "", branch: str = "", commit_sha: str = "", pr_url: str = "", evidence_kind: str = "", evidence_keys: str = "", ci_status: str = "", ci_build_id: str = "", ci_head_sha: str = "", merge_commit: str = "", outcome: str = "", block_reason: str = "") -> str:
+def WorkflowOutput___report_completion(ticket_id: str, summary: str, artifacts: str = "", branch: str = "", commit_sha: str = "", pr_url: str = "", evidence_kind: str = "", evidence_keys: str = "", ci_status: str = "", ci_build_id: str = "", ci_head_sha: str = "", merge_commit: str = "", approved_head_sha: str = "", outcome: str = "", block_reason: str = "") -> str:
     """Report that your work is complete. This saves your completion summary to S3 AND automatically transitions your Jira ticket to Done. Do NOT call Tickets___transition_ticket to mark your own ticket done — this tool handles that for you.
 
     Args:
@@ -2243,6 +2286,15 @@ def WorkflowOutput___report_completion(ticket_id: str, summary: str, artifacts: 
             on the default branch. Together with outcome="shipped" this IS the
             ship verdict the completion gate reads; never set it for a merge you
             did not confirm.
+        approved_head_sha: release manager, CD ticket only — the PR head SHA the
+            HUMAN approved at the Merge Approval gate, recorded alongside
+            merge_commit so the pair "human approved THIS head, which merged as
+            THAT commit" is on the record. Set it ONLY when you confirmed the
+            merge happened at exactly that head SHA (no post-approval drift) and
+            CI is certified green on it. It does NOT approve anything — no tool
+            can approve the in-pipeline human deploy gate — and an unrecorded or
+            unverifiable value simply means the human deploy gate fires as
+            before, so leave it out whenever you are unsure.
         outcome: ship-phase tickets only — "shipped" | "deploy-blocked" |
             "static-ci-only" | "handoff". Anything else is dropped by the Lambda.
         block_reason: one line on why the outcome is not "shipped" (required with
@@ -2275,6 +2327,10 @@ def WorkflowOutput___report_completion(ticket_id: str, summary: str, artifacts: 
     # the record; only the tool and the Lambda lacked the fields.
     if merge_commit.strip():
         payload["merge_commit"] = merge_commit.strip()
+    # TEAM-4525: the human-approved head SHA behind that merge commit, same
+    # additive rule — absent stays absent, never "".
+    if approved_head_sha.strip():
+        payload["approved_head_sha"] = approved_head_sha.strip()
     if outcome.strip():
         payload["outcome"] = outcome.strip().lower()
     if block_reason.strip():

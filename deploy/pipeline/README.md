@@ -11,7 +11,7 @@ Design + rationale: [`docs/pipeline/design.md`](../../docs/pipeline/design.md).
 ```
 GitHub PR push ─► CodeBuild "agentcore-hub-ci"  ─► required commit status ─► branch protection
 merge to main ─► CodePipeline "agentcore-hub-deploy":
-                   Source → Build → ManualApproval(SNS) → Deploy
+                   Source → Build → ManualApproval(SNS, conditional) → Deploy
 ```
 
 - **CI CodeBuild** runs `buildspec-ci.yml`: `tsc --noEmit`, `lint`, `build`,
@@ -49,6 +49,46 @@ the deploy would wedge the pipeline: the baseline only advances on a successful
 deploy, so the same commit range would re-block forever. Runtime-image CD is the
 next increment.
 
+### The deploy gate is skipped only for an already-approved SHA
+
+The `Approve_deploy` ManualApproval is a **conditional** stage. When the release
+manager passes `approved_head_sha` and `pr_url` to `Pipeline___start_deploy`, CI
+certifies that SHA, **and** the GitHub API confirms that the PR is merged with
+`head.sha == approved_head_sha` and `merge_commit_sha == commit_sha`, the tools
+Lambda writes a ship-approval record to
+`s3://$ARTIFACT_BUCKET/pipeline-artifacts/ship-approvals/<merge_commit>.json`.
+That last check is what binds the commit being deployed to the head SHA a human
+actually approved; it needs a read-only `GITHUB_TOKEN` on the tools Lambda, and
+with no token no record can be written, so every deploy keeps its human gate.
+`preapproved-check.sh` is the only reader: `decide <full-sha>` runs in the Build
+stage and prints `1` (exported as `DEPLOY_PREAPPROVED`) only when the record for
+that exact commit exists, parses and matches it — every other outcome prints `0`
+and it never fails the build; `gate <flag> <full-sha>` runs in the Deploy stage and
+re-reads the record itself, refusing to touch prod on anything it cannot verify.
+The stage-entry condition skips the approval only on the literal `1`, so an empty
+or unresolved variable pages the human exactly as before.
+
+To tell what happened on a given run: `Pipeline___get_state` reports
+`approvalSkipped`, and in the console (or `get-pipeline-execution`) the Approval
+stage shows **Skipped** instead of `InProgress`/`Succeeded`. A skipped run has no
+Telegram ping — that is expected, not a broken bridge. **To force the gate back on
+for one run, simply do not pass `approved_head_sha`** to `Pipeline___start_deploy`
+(the tool returns `preapproval:{recorded:false, reason:"approved_head_sha_missing"}`,
+writes no record, and the human gate fires). There is no flag to unset: no record
+means no skip. The other refusal reasons are `invalid_sha`, `ci_not_certified`,
+`pr_url_missing`, `pr_url_invalid`, `merge_binding_mismatch` (GitHub disagrees
+with the claimed head/merge commit) and `merge_binding_unverified` (no token, or
+GitHub unreachable) — each starts the pipeline and pages the human.
+
+**The tools Lambda is the only thing that may write a record.** Every CodeBuild
+role in this stack carries an explicit `DenyShipApprovalRecordWrites` statement on
+`pipeline-artifacts/ship-approvals/*` (an explicit Deny beats every Allow), because
+the Build stage runs commands from the branch under review *before*
+`DEPLOY_PREAPPROVED` is decided — without the Deny, its broad
+`pipeline-artifacts/*` PutObject grant would let a change forge its own approval.
+`GetObject` stays allowed so the Deploy stage can still re-verify. If you widen a
+CodeBuild role's S3 grant, do not remove that Deny.
+
 ## Files
 
 | File | Role |
@@ -57,6 +97,7 @@ next increment.
 | `lib/pipeline-stack.ts` | the stack: CodeConnections, CI + Build + Deploy CodeBuild, CodePipeline, SNS approval, scoped IAM, cdk-nag |
 | `buildspec-ci.yml` | PR check AND the deploy Build stage (gates + artifact emission) |
 | `buildspec-deploy.yml` | Deploy stage: the 3-target `DEPLOY.md`, promote-by-digest, smoke checks |
+| `preapproved-check.sh` | `decide` (Build) / `gate` (Deploy) over the ship-approval record — the conditional deploy gate's only reader |
 | `merge-agents-json.py` | the agents.json merge (extracted from `DEPLOY.md` step 2 — single source) |
 | `ecs-primary-container.py` | builds the ECS roll container JSON, reusing live env, swapping image→digest |
 | `ecs-health.py` | parses `describe-express-gateway-service` → status + ingress URL for the rollout health poll |
