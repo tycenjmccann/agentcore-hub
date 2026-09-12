@@ -24,6 +24,7 @@ import TicketStatusBadge from "./TicketStatusBadge";
 import TicketDetailModal from "./TicketDetailModal";
 import WorkflowManagerPanel from "./WorkflowManagerPanel";
 import RunPerformanceCard from "./RunPerformanceCard";
+import HeroKpiStrip from "./HeroKpiStrip";
 import { useWorkflowStream, runKey } from "./useWorkflowStream";
 
 interface WorkflowBoardProps {
@@ -1398,6 +1399,9 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
         </div>
       )}
 
+      {/* Headline cost/time/quality above the fold — the full card is ~1 screen down, inside .pipeline-viz. */}
+      {isTerminalPhase(state.phase) && <HeroKpiStrip workflowId={workflowId} />}
+
       <div className="pipeline-viz">
         {/* Top bar: scrubber left, status right */}
         <div className="pipeline-top-bar">
@@ -1852,7 +1856,10 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
         )}
 
         {(isComplete || state.phase === "cancelled" || state.phase === "error") && (
-          <WorkflowManagerPanel workflowId={workflowId} onAskAboutRun={onAskManager} />
+          // id is the hero strip's scroll target for the agent-authored score tile
+          <div id="workflow-manager-panel">
+            <WorkflowManagerPanel workflowId={workflowId} onAskAboutRun={onAskManager} />
+          </div>
         )}
 
         {/* Agent Output Pop-Out Card */}

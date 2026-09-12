@@ -28,6 +28,7 @@ import {
   YAxis,
 } from "recharts";
 import { MarkdownRenderer } from "./MarkdownRenderer";
+import { usePerformanceCard } from "./use-performance-card";
 import type {
   AnalysisResponse,
   WorkflowAnalysis,
@@ -94,6 +95,7 @@ export default function WorkflowManagerPanel({ workflowId, onAskAboutRun }: Prop
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const pollUntilRef = useRef(0);
   const baselineIdRef = useRef<string | null>(null);
+  const { card } = usePerformanceCard(workflowId);
 
   const load = useCallback(async () => {
     try {
@@ -155,6 +157,18 @@ export default function WorkflowManagerPanel({ workflowId, onAskAboutRun }: Prop
     data?.latest ||
     null;
 
+  // The deterministic score, next to the agent-authored one. Shares the hero
+  // strip's cached card, so this costs no extra request. `kpiVersion` is written
+  // by the analysis Lambda and is not in WorkflowAnalysis yet — read defensively.
+  const kpiVersion = (selected as { kpiVersion?: number | null } | null)?.kpiVersion;
+  const detQuality = card?.kpi?.quality;
+  const detChip =
+    typeof kpiVersion === "number" && detQuality?.score != null ? (
+      <span className="wm-det-chip">
+        Deterministic: {detQuality.score}/100 {detQuality.grade}
+      </span>
+    ) : null;
+
   return (
     <div className="wm-panel">
       <style>{PANEL_STYLES}</style>
@@ -203,10 +217,14 @@ export default function WorkflowManagerPanel({ workflowId, onAskAboutRun }: Prop
                   {selected.scores?.overall ?? "—"}
                 </div>
                 <div className="wm-verdict">
+                  {/* This score is the agent's own judgement. Name it, so it is never
+                      read as the deterministic KPI score shown alongside it. */}
+                  <p className="wm-verdict-kind">Workflow Manager assessment (agent-authored)</p>
                   <p className="wm-verdict-text">{selected.verdict}</p>
                   <p className="wm-verdict-meta">
                     {selected.runOutcome} · {selected.trigger} ·{" "}
                     {new Date(selected.analyzedAt).toLocaleString()}
+                    {detChip}
                   </p>
                 </div>
                 <div className="wm-actions">
@@ -417,6 +435,10 @@ const PANEL_STYLES = `
 .wm-verdict{flex:1}
 .wm-verdict-text{margin:0;font-weight:500;line-height:1.4}
 .wm-verdict-meta{margin:3px 0 0;font-size:11px;color:var(--pipeline-text-3,#a1a1aa);text-transform:capitalize}
+.wm-verdict-kind{font-size:11px;letter-spacing:.04em;text-transform:uppercase;color:var(--pipeline-text-3,#a1a1aa);margin:0 0 3px}
+/* text-transform:none — .wm-verdict-meta capitalizes, which would mangle "100 C" */
+.wm-det-chip{margin-left:8px;padding:1px 6px;border-radius:5px;border:1px solid var(--pipeline-border,#3f3f46);
+  font-variant-numeric:tabular-nums;text-transform:none}
 .wm-actions{display:flex;gap:6px}
 .wm-icon-btn{width:32px;height:32px;border-radius:8px;border:1px solid var(--pipeline-border,#3f3f46);
   background:none;color:var(--pipeline-text-2,#d4d4d8);cursor:pointer;display:flex;align-items:center;justify-content:center}

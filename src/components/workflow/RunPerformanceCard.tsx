@@ -6,51 +6,11 @@
  * run's anomaly bands against its def baseline.
  */
 
-import { useEffect, useState } from "react";
 import Link from "next/link";
 import { Gauge, Coins, Clock, CheckCircle2, ExternalLink, Loader2 } from "lucide-react";
-import { formatKpi, type BandStatus, type KpiUnit } from "@/lib/workflow/performance";
-
-interface RunCard {
-  reportVersion: number;
-  workflowId: string;
-  epicId: string | null;
-  workflowDefId: string;
-  title: string | null;
-  run: { outcome: string; startedAt: string | null; completedAt: string | null; prUrl: string | null };
-  cost: {
-    totalUsd: number; personaUsd: number; codingUsd: number; perTaskUsd: number | null;
-    tokens: { input: number; output: number; cached: number; total: number; cacheRead?: number; cacheWrite?: number };
-    cacheHitRate?: number | null; personaCacheHitRate?: number | null;
-    byEngine: Record<string, { usd: number }>;
-  };
-  time: {
-    wallMs: number | null; humanWaitMs: number; activeMs: number | null; agentWorkMs: number;
-    busyMs?: number; idleMs: number | null; agentUtilization: number | null; humanGates: number;
-    phases: { phase: string; durationMs: number }[];
-  };
-  quality: {
-    outcome: string; tasks: number; tasksCompleted: number; reworkRounds: number; changeRequests: number;
-    fixTickets: number; gateRounds: number; loops: number; nudges: number; interventions: number;
-    errors: number; retries: number; firstPassYield: number | null; prUrl: string | null;
-  };
-  agents: Record<string, { usd: number; workMs: number; tasks: number; reworkRounds: number }>;
-  bands: {
-    status: BandStatus;
-    baseline: { n: number; windowDays: number; minSamples: number };
-    anomalies: { kpi: string; label: string; status: BandStatus; value: number; median: number; z: number }[];
-    kpis: Record<string, { label: string; unit: KpiUnit; status: BandStatus; value: number | null; median?: number; warnAbove?: number; z?: number | null }>;
-  } | null;
-  dataQuality: { gaps: string[] };
-}
-
-const STATUS_STYLE: Record<BandStatus, string> = {
-  ok: "bg-emerald-500/15 text-emerald-400 border-emerald-500/30",
-  warn: "bg-amber-500/15 text-amber-400 border-amber-500/30",
-  alert: "bg-red-500/15 text-red-400 border-red-500/30",
-  insufficient: "bg-slate-500/15 text-slate-400 border-slate-500/30",
-  unknown: "bg-slate-500/15 text-slate-400 border-slate-500/30",
-};
+import { formatKpi, type BandStatus } from "@/lib/workflow/performance";
+import { STATUS_STYLE } from "./band-style";
+import { usePerformanceCard } from "./use-performance-card";
 
 function Row({ label, value, band, hint }: { label: string; value: string; band?: BandStatus; hint?: string }) {
   const dot = band === "alert" ? "bg-red-400" : band === "warn" ? "bg-amber-400" : band === "ok" ? "bg-emerald-400" : "bg-slate-500/50";
@@ -65,31 +25,17 @@ function Row({ label, value, band, hint }: { label: string; value: string; band?
 }
 
 export default function RunPerformanceCard({ workflowId }: { workflowId: string }) {
-  const [card, setCard] = useState<RunCard | null>(null);
-  const [state, setState] = useState<"loading" | "missing" | "ready" | "error">("loading");
-
-  useEffect(() => {
-    let alive = true;
-    setState("loading");
-    fetch(`/api/workflow/performance?workflowId=${encodeURIComponent(workflowId)}`, { cache: "no-store" })
-      .then(async (r) => {
-        if (!alive) return;
-        if (r.status === 404) { setState("missing"); return; }
-        const j = await r.json();
-        if (!r.ok) throw new Error(j.error);
-        setCard(j.card as RunCard);
-        setState("ready");
-      })
-      .catch(() => alive && setState("error"));
-    return () => { alive = false; };
-  }, [workflowId]);
+  // Shared with the hero KPI strip: one GET per run, and a card computed from the
+  // strip's "Compute now" lands here too without a second request.
+  const { card, state } = usePerformanceCard(workflowId);
 
   if (state === "missing") return null;
   const b = card?.bands;
   const k = (path: string) => b?.kpis?.[path]?.status;
+  const q5 = card?.kpi?.quality;
 
   return (
-    <section className="mt-6 rounded-xl border border-[var(--color-border)] bg-[var(--color-bg-secondary)]">
+    <section id="run-performance-card" className="mt-6 rounded-xl border border-[var(--color-border)] bg-[var(--color-bg-secondary)]">
       <div className="flex flex-wrap items-center gap-2 px-4 py-2.5 border-b border-[var(--color-border)]">
         <Gauge className="w-4 h-4 text-sky-400" />
         <h3 className="text-sm font-semibold text-[var(--color-text-primary)]">Performance Card</h3>
@@ -143,7 +89,19 @@ export default function RunPerformanceCard({ workflowId }: { workflowId: string 
               <Row label="Agent utilization" value={formatKpi("ratio", card.time.agentUtilization)} hint="busy ÷ active" />
             </div>
             <div className="rounded-lg border border-[var(--color-border)] p-3 space-y-1.5">
-              <div className="flex items-center gap-2 mb-1"><CheckCircle2 className="w-4 h-4 text-emerald-400" /><span className="text-sm font-medium text-[var(--color-text-primary)]">Quality</span><span className="ml-auto text-base font-semibold tabular-nums">{card.quality.loops} loop{card.quality.loops === 1 ? "" : "s"}</span></div>
+              <div className="flex items-center gap-2 mb-1"><CheckCircle2 className="w-4 h-4 text-emerald-400" /><span className="text-sm font-medium text-[var(--color-text-primary)]">Quality</span><span className="ml-auto text-base font-semibold tabular-nums">
+                {q5 ? (
+                  <>
+                    {/* No score means no grade — never show an "F" the evidence can't back. */}
+                    <span className={q5.confidence === "insufficient" ? "opacity-60" : undefined}>
+                      {q5.score == null ? "—" : `${q5.score}/100${q5.grade ? ` · ${q5.grade}` : ""}`}
+                    </span>
+                    <span className="text-[var(--color-text-muted)] font-normal"> · {card.quality.loops} loop{card.quality.loops === 1 ? "" : "s"}</span>
+                  </>
+                ) : (
+                  <>{card.quality.loops} loop{card.quality.loops === 1 ? "" : "s"}</>
+                )}
+              </span></div>
               <Row label="Outcome" value={card.quality.outcome} />
               <Row label="Agent tasks (done)" value={`${card.quality.tasks} (${card.quality.tasksCompleted})`} band={k("quality.tasks")} />
               <Row label="First-pass yield" value={formatKpi("ratio", card.quality.firstPassYield)} band={k("quality.firstPassYield")} hint="tasks that needed no rework" />
