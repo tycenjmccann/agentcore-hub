@@ -96,8 +96,16 @@ done
 
 if [[ "$payload" == *rebuildIndex* ]]; then
   touch "$SB/rebuild-ran"
+  if [[ -f "$SB/fixtures/rebuild-clierr" ]]; then
+    echo "An error occurred (AccessDeniedException) when calling the Invoke operation" >&2
+    exit 255
+  fi
+  if [[ -f "$SB/fixtures/rebuild-fnerr" ]]; then
+    printf '{"errorType":"Error","errorMessage":"rebuild boom"}' > "$outfile"
+    echo "Unhandled"; exit 0
+  fi
   printf '{"cards":4,"rewritten":0}' > "$outfile"
-  exit 0
+  echo "None"; exit 0
 fi
 
 id="$(printf '%s' "$payload" | sed -n 's/.*"workflowId":"\\([^"]*\\)".*/\\1/p')"
@@ -136,7 +144,7 @@ function scanItem(workflowId, { phase = "complete", completedAt, deleted } = {})
 }
 
 /** A throwaway REPO_ROOT holding the real deploy.sh + index.mjs and fake everything else. */
-function sandbox({ items = [], indexCards = null } = {}) {
+function sandbox({ items = [], indexCards = null, rebuildFnErr = false, rebuildCliErr = false } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cost-report-deploy-"));
   for (const sub of ["deploy", "lambda/cost-report", "src/config", "bin", "fixtures"]) {
     fs.mkdirSync(path.join(dir, sub), { recursive: true });
@@ -154,6 +162,8 @@ function sandbox({ items = [], indexCards = null } = {}) {
 
   fs.writeFileSync(path.join(dir, "fixtures/scan.json"), JSON.stringify({ Items: items }));
   if (indexCards) fs.writeFileSync(path.join(dir, "fixtures/index.json"), JSON.stringify({ version: 1, cards: indexCards }));
+  if (rebuildFnErr) fs.writeFileSync(path.join(dir, "fixtures/rebuild-fnerr"), "");
+  if (rebuildCliErr) fs.writeFileSync(path.join(dir, "fixtures/rebuild-clierr"), "");
 
   fs.writeFileSync(path.join(dir, "bin/aws"), AWS_SHIM, { mode: 0o755 });
   fs.writeFileSync(path.join(dir, "bin/zip"), ZIP_SHIM, { mode: 0o755 });
@@ -248,6 +258,51 @@ test("an unreadable index degrades to a warning, not a failure", () => {
   assert.equal(code, 0, out);
   assert.match(out, /^WARNING: could not read s3:\/\/fake-artifacts\/performance\/index\.json — coverage unknown/m, out);
   assert.match(out, /✓ .* deployed/, out);
+});
+
+// ─── D-2: an unchecked rebuild invoke must not let a stale index masquerade as fresh ──
+
+test("a rebuild FunctionError marks coverage unknown instead of reading the stale index", () => {
+  const items = [scanItem("wf_ok_1", { completedAt: iso(DAY) }), scanItem("wf_ok_2", { completedAt: iso(2 * DAY) })];
+  // A stale read WOULD print (100%) here — the index already matches both candidates.
+  const dir = sandbox({
+    items,
+    indexCards: [1, 2].map((n) => ({ workflowId: `wf_ok_${n}`, completedAt: iso(n * DAY) })),
+    rebuildFnErr: true,
+  });
+  const { code, out } = run(dir, ["--backfill"]);
+
+  assert.equal(code, 0, out);
+  assert.match(out, /^backfill: invoked 2\/2 ok, 0 failed$/m, out);
+  assert.match(out, /^WARNING: rebuild failed: .*Unhandled.*rebuild boom/m, out);
+  assert.match(out, /^coverage: unknown \(index not rebuilt\)$/m, out);
+  assert.doesNotMatch(out, /^coverage: \d+\/\d+/m, out);
+  assert.doesNotMatch(out, /\(100%\)/, out);
+  assert.doesNotMatch(out, /WARNING: coverage below 95%/, out);
+  assert.match(out, /✓ .* deployed/, out);
+
+  // The stale index was never even downloaded.
+  assert.doesNotMatch(read(dir, "aws-calls.log"), /s3 cp s3:\/\/fake-artifacts\/performance\/index\.json/, out);
+});
+
+test("a rebuild CLI error is also a warning, not a script failure", () => {
+  const items = [scanItem("wf_ok_1", { completedAt: iso(DAY) })];
+  const dir = sandbox({ items, indexCards: [{ workflowId: "wf_ok_1", completedAt: iso(DAY) }], rebuildCliErr: true });
+  const { code, out } = run(dir, ["--backfill"]);
+
+  assert.equal(code, 0, out);
+  assert.match(out, /^WARNING: rebuild failed: cli-exit-255 .*AccessDeniedException/m, out);
+  assert.match(out, /^coverage: unknown \(index not rebuilt\)$/m, out);
+  assert.match(out, /✓ .* deployed/, out);
+});
+
+test("--rebuild-index alone with a failing rebuild warns and exits 0", () => {
+  const dir = sandbox({ items: [], rebuildFnErr: true });
+  const { code, out } = run(dir, ["--rebuild-index"]);
+
+  assert.equal(code, 0, out);
+  assert.match(out, /^WARNING: rebuild failed:/m, out);
+  assert.doesNotMatch(out, /^coverage:/m, out);
 });
 
 test("a throttled invoke is retried with backoff and lands in ok", () => {
