@@ -16,6 +16,27 @@ Every call shares ONE workspace and ONE conversation — later calls remember th
 one and its files, so do NOT reference absolute paths like `/tmp/...`; say "the
 same workspace as the previous call".
 
+## Main-sync rule (a branch behind the default branch is NOT a defect)
+"Sync on main" means MERGE, never rebase: `git fetch origin && git checkout
+<branch> && git merge origin/<default branch>` — a merge commit, keeping both
+histories. Never rebase, never force-push, never reset (same semantics as the CI
+agent's P0 sync and operator.md's Mergeability rule).
+Do it in YOUR OWN turn via `claude_code` (`model="fable"`; re-run the same turn
+with `model="opus"` when the merge reports conflicts) and resolve TRIVIAL
+conflicts keeping both sides' intent — imports, formatting, lockfiles, adjacent
+non-overlapping hunks. A branch that is merely behind, or whose `mergeable` is
+`CONFLICTING` only because of that, is NEVER a finding and NEVER a fix ticket.
+Escalate ONLY a NON-TRIVIAL conflict — both sides changed the same behaviour, or
+the resolution needs a product decision / touches logic under review.
+Whether you PUSH the sync commit, and where a non-trivial conflict goes, is
+scoped for your role immediately below.
+
+**Your scope:** you PUSH the sync on your own `feature_branch`, BEFORE you open
+the PR — you open a PR for human review and never merge into `base_branch`, so
+the sync belongs on the branch the human reviews. A non-trivial conflict that
+survives the `model="opus"` retry → report BLOCKED naming the conflicting files;
+never a silent handoff, and never a fix ticket for staleness alone.
+
 ## The core risk: false positives
 Static dead-code detection is wrong often. Code that LOOKS unused but is live:
 - Reflection / dynamic dispatch (`#selector`, `NSClassFromString`, string-keyed
@@ -138,15 +159,20 @@ still pass with the code gone.
 A session that dies after the deliverable but before the report leaves the run un-closable.
 
 1. Commit referencing the routine + date.
-2. Push `feature_branch`, open a PR into `base_branch`.
-3. PR body MUST contain a **Removal Ledger**:
+2. **Sync `feature_branch` on main FIRST — before the PR exists.** Merge
+   `origin/<default branch>` INTO your `feature_branch` (see the Main-sync rule),
+   so the branch a human reviews is never merely behind main. The sync is part of
+   the deliverable and lands before the PR and the report, so the ship-then-report
+   ordering above is unchanged: sync, PR, then report.
+3. Push `feature_branch`, open a PR into `base_branch`.
+4. PR body MUST contain a **Removal Ledger**:
 
    | Symbol / file | Location | Why safe to remove | Verified by |
    |---|---|---|---|
    | ... | file:line | grep: 0 refs; not reflection/entry-point | build+tests green (build_id) |
 
    Plus a **Candidates NOT removed** section (what was flagged but kept, and why).
-4. `WorkflowOutput___report_completion` with: branch, commit SHA, PR URL, count
+5. `WorkflowOutput___report_completion` with: branch, commit SHA, PR URL, count
    removed vs kept, and the build/test evidence (exit codes or build_id + summary).
    State plainly what you ACTUALLY built and ran vs did not.
 
@@ -161,4 +187,7 @@ A session that dies after the deliverable but before the report leaves the run u
 - Every removal needs an evidence row (grep 0 refs + not a dynamic/entry-point/public API) in the Removal Ledger.
 - iOS removals MUST be built + tested on the macOS gateway before the PR; gateway tools missing/failing = BLOCKED.
 - NEVER auto-merge. Always a PR for human review. When unsure about a candidate, keep it and list it.
+- Never hand off to review with your `feature_branch` behind the repo default
+  branch — a branch that only needs a main-merge is your job to sync (Main-sync
+  rule), not a fix ticket.
 - If detection tools cannot be installed/run, or the build/test cannot run, report BLOCKED — do not open a PR of unverified deletions.
