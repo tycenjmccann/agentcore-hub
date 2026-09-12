@@ -112,6 +112,47 @@ function v5Card(quality: Json = {}, cost: Json = {}, cardOverrides: Json = {}): 
   return { ...v4Card({ reportVersion: 5, ...cardOverrides }), kpi: kpiBlock(quality, cost) };
 }
 
+/**
+ * The three cards that more than one case needs, named so the layout case (16)
+ * and the content cases (3, 7) cannot drift apart and start proving different
+ * things about "the same" card.
+ */
+
+/** An outcome-capped, cancelled run (case 3). Its quality sub-line is the longest
+ *  in the fixture set, so it is also the tile that wraps to two lines first. */
+function cappedCard(): Json {
+  return v5Card({
+    score: 69, grade: "D", outcome: "cancelled", band: "alert",
+    capsApplied: [{ kind: "outcome", outcome: "cancelled", cap: 69 }],
+  });
+}
+
+/** Cost was never measured, and the quality evidence is too thin to score (case 7). */
+function costMissingCard(): Json {
+  return v5Card(
+    { score: null, grade: null, confidence: "insufficient", evidenceWeight: 30, band: "insufficient",
+      excluded: ["CI health (no runs)", "Review depth (no reviews)"] },
+    { usd: null, band: "insufficient", z: null },
+    { dataQuality: { gaps: ["no token usage recorded"], costMissing: true } },
+  );
+}
+
+/** A v5 card with nothing to compare against: every chip reads "no baseline". */
+function noBaselineCard(): Json {
+  return v5Card({ band: "insufficient", z: null }, { band: "insufficient", z: null }, {
+    bands: {
+      status: "insufficient",
+      baseline: { workflowDefId: "sdlc-14", n: 0, nCost: 0, windowDays: 28, minSamples: 5 },
+      anomalies: [],
+      kpis: {
+        "cost.totalUsd": { label: "Cost", unit: "usd", status: "insufficient", value: 41.27 },
+        "time.wallMs": { label: "Wall time", unit: "ms", status: "insufficient", value: 9180000 },
+        "quality.score": { label: "Quality", unit: "count", status: "insufficient", value: 74 },
+      },
+    },
+  });
+}
+
 function mockState(id: string, phase = "complete"): Json {
   return {
     id,
@@ -164,8 +205,12 @@ interface PerfMock {
  * fleet card (no workflowId — the pre-selection empty state mounts it and
  * dereferences view.totals.runs, so it must get a real FleetView) and the
  * per-run card.
+ *
+ * `hold` (case 16) parks the per-run GET until the test releases it, so the
+ * skeleton can be measured. The fleet GET is never held: the board mounts it too,
+ * and holding it would freeze the page instead of just the strip.
  */
-async function mockPerformance(page: Page, mock: PerfMock) {
+async function mockPerformance(page: Page, mock: PerfMock, hold?: Promise<void>) {
   await page.route("**/api/workflow/performance**", async (route) => {
     const request = route.request();
     if (request.method() === "POST") {
@@ -176,6 +221,7 @@ async function mockPerformance(page: Page, mock: PerfMock) {
     }
     const url = new URL(request.url());
     if (!url.searchParams.has("workflowId")) return json(route, EMPTY_FLEET_VIEW);
+    if (hold) await hold;
     const step = mock.gets[Math.min(mock.counts.get, mock.gets.length - 1)];
     mock.counts.get += 1;
     if ("card" in step) return json(route, { card: step.card });
@@ -257,13 +303,9 @@ test.describe("Hero KPI strip (TEAM-4482)", () => {
   });
 
   test("3. an outcome-capped run names the cap and the outcome", async ({ page }) => {
-    const card = v5Card({
-      score: 69, grade: "D", outcome: "cancelled", band: "alert",
-      capsApplied: [{ kind: "outcome", outcome: "cancelled", cap: 69 }],
-    });
     await mockList(page, [listRow(WF, "Hero KPI fixture", { phase: "cancelled" })]);
     await mockBoard(page, mockState(WF, "cancelled"));
-    await mockPerformance(page, perfMock([{ card }]));
+    await mockPerformance(page, perfMock([{ card: cappedCard() }]));
     await openRun(page);
 
     await expect(page.locator(STRIP)).toBeVisible();
@@ -341,16 +383,7 @@ test.describe("Hero KPI strip (TEAM-4482)", () => {
   test("7. missing cost reads '$0 · no usage data' with no band, and thin evidence never invents a score", async ({ page }) => {
     await mockList(page, [listRow(WF, "Hero KPI fixture")]);
     await mockBoard(page, mockState(WF));
-    await mockPerformance(page, perfMock([
-      {
-        card: v5Card(
-          { score: null, grade: null, confidence: "insufficient", evidenceWeight: 30, band: "insufficient",
-            excluded: ["CI health (no runs)", "Review depth (no reviews)"] },
-          { usd: null, band: "insufficient", z: null },
-          { dataQuality: { gaps: ["no token usage recorded"], costMissing: true } },
-        ),
-      },
-    ]));
+    await mockPerformance(page, perfMock([{ card: costMissingCard() }]));
     await openRun(page);
 
     const cost = page.locator(COST);
@@ -622,4 +655,151 @@ test.describe("Hero KPI strip (TEAM-4482)", () => {
 
     await page.screenshot({ path: `${SCREENSHOT_DIR}/15-finish-time-order.png` });
   });
+
+  // ─── The strip must not move the pipeline when the card lands (TEAM-4519) ──
+
+  /**
+   * QA measured the strip growing from 139.5px to 168.5px the moment the
+   * performance GET resolved, which pushed `.pipeline-viz` down by 29px — the
+   * skeleton reserved less space than the card it was standing in for. The design
+   * NFR is that skeleton -> ready moves nothing, so these cases hold the GET open,
+   * measure, release, and measure again.
+   *
+   * `.pipeline-viz` is the strip's next sibling and the full performance card and
+   * Workflow Manager panel both live INSIDE it, so its top is a pure function of
+   * the strip's own height: assert both and a regression names its own cause.
+   */
+
+  /** A hand-held promise: the deferred per-run GET waits here until release(). */
+  function gate() {
+    let release = () => {};
+    const opened = new Promise<void>((resolve) => { release = () => resolve(); });
+    return { opened, release };
+  }
+
+  /**
+   * Both numbers in ONE evaluate, so they come from the same frame — two
+   * round-trips could straddle a re-layout and compare different states. scrollY
+   * comes too: getBoundingClientRect is viewport-relative, so a stray scroll
+   * between the reads would otherwise look like a layout shift.
+   */
+  async function stripGeometry(page: Page) {
+    return page.evaluate(() => {
+      const viz = document.querySelector(".pipeline-viz")!;
+      const strip = document.querySelector("[data-testid=hero-kpi-strip]")!;
+      const round = (n: number) => Math.round(n * 100) / 100;
+      return {
+        vizTop: round(viz.getBoundingClientRect().top),
+        stripHeight: round(strip.getBoundingClientRect().height),
+        scrollY: window.scrollY,
+      };
+    });
+  }
+
+  interface ShiftCase {
+    key: string;
+    name: string;
+    /** What the held GET answers once released. */
+    gets: PerfMock["gets"];
+    /** Board phase, for the cancelled run. */
+    phase?: string;
+    /** A Workflow Manager assessment makes the strip a 4-column grid. */
+    analysis?: Json;
+    /** Proof the resolved state really rendered before the second measurement. */
+    ready: (page: Page) => Promise<void>;
+    screenshots?: boolean;
+  }
+
+  const WM_ANALYSIS = {
+    latest: { scores: { overall: 81 }, verdict: "Solid run — two avoidable rework loops." },
+    history: [],
+  };
+
+  const SHIFT_CASES: ShiftCase[] = [
+    {
+      key: "a", name: "a v5 card with bands",
+      gets: [{ card: v5Card() }],
+      ready: async (page) => { await expect(page.locator(COST)).toContainText("$41"); },
+      screenshots: true,
+    },
+    {
+      key: "b", name: "a v5 card with no baseline",
+      gets: [{ card: noBaselineCard() }],
+      ready: async (page) => {
+        await expect(page.locator(COST)).toContainText("$41");
+        await expect(page.locator(COST)).toContainText("no baseline");
+      },
+    },
+    {
+      key: "c", name: "a v4 card (Recompute)",
+      gets: [{ card: v4Card() }],
+      ready: async (page) => {
+        await expect(page.locator(QUALITY)).toContainText("no deterministic score");
+        await expect(page.locator("[data-testid=hero-kpi-compute-now]")).toHaveText("Recompute");
+      },
+    },
+    {
+      key: "d", name: "a card whose cost was never measured",
+      gets: [{ card: costMissingCard() }],
+      ready: async (page) => { await expect(page.locator(COST)).toHaveText(/\$0\s*·\s*no usage data/); },
+    },
+    {
+      key: "e", name: "a capped, cancelled run",
+      gets: [{ card: cappedCard() }],
+      phase: "cancelled",
+      ready: async (page) => { await expect(page.locator(QUALITY)).toContainText("capped at 69 — outcome cancelled"); },
+    },
+    {
+      key: "f", name: "no card yet (404 — Compute now)",
+      gets: [{ status: 404 }],
+      ready: async (page) => {
+        await expect(page.locator(COST)).toContainText("not computed yet");
+        await expect(page.locator("[data-testid=hero-kpi-compute-now]")).toHaveText("Compute now");
+      },
+    },
+    {
+      key: "g", name: "a v5 card plus a Workflow Manager assessment (4 columns)",
+      gets: [{ card: v5Card() }],
+      analysis: WM_ANALYSIS,
+      ready: async (page) => { await expect(page.locator(COST)).toContainText("$41"); },
+    },
+  ];
+
+  for (const c of SHIFT_CASES) {
+    test(`16${c.key}. skeleton → ready never moves .pipeline-viz: ${c.name}`, async ({ page }) => {
+      const { opened, release } = gate();
+      await mockList(page, [listRow(WF, "Hero KPI fixture", c.phase ? { phase: c.phase } : {})]);
+      await mockBoard(page, mockState(WF, c.phase ?? "complete"), c.analysis ?? { latest: null, history: [] });
+      await mockPerformance(page, perfMock(c.gets), opened);
+
+      try {
+        await openRun(page);
+
+        // The skeleton, on screen and still waiting on the GET.
+        await expect(page.locator(`${STRIP}[aria-busy="true"]`)).toBeVisible();
+        await expect(page.locator(`${COST} .animate-pulse`).first()).toBeVisible();
+        // The Workflow Manager tile is fetched separately, so wait for the 4th
+        // column BEFORE measuring: a tile that appeared between the two reads
+        // would re-flow the grid and fail this for the wrong reason.
+        if (c.analysis) await expect(page.locator("[data-testid=hero-kpi-wm]")).toBeVisible();
+        const before = await stripGeometry(page);
+        if (c.screenshots) await page.screenshot({ path: `${SCREENSHOT_DIR}/16-no-shift-loading.png` });
+
+        release();
+
+        await expect(page.locator(`${STRIP}[aria-busy="false"]`)).toBeVisible();
+        await expect(page.locator(`${COST} .animate-pulse`)).toHaveCount(0);
+        await c.ready(page);
+        const after = await stripGeometry(page);
+        if (c.screenshots) await page.screenshot({ path: `${SCREENSHOT_DIR}/16-no-shift-ready.png` });
+
+        expect(after.vizTop).toBe(before.vizTop);           // the NFR
+        expect(after.stripHeight).toBe(before.stripHeight); // ...and its only cause
+        expect(after.scrollY).toBe(before.scrollY);         // nothing scrolled between the reads
+      } finally {
+        // Never leave the route parked if an assertion above threw.
+        release();
+      }
+    });
+  }
 });
