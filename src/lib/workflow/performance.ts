@@ -502,7 +502,10 @@ function measure(card: PerformanceCardInput, def: KpiComponentDef): Measured {
   const tolerance = def.tolerance;
   // A rubric line whose tolerance is missing is misconfigured, not zero-scoring:
   // excluding it keeps one bad edit from silently grading every run down.
-  const needsTolerance = def.kind !== "ratio" && def.kind !== "verdict";
+  // Positive list, not "everything except ratio/verdict": an UNRECOGNISED kind must
+  // fall through to the default branch's mirrored note rather than be misreported
+  // as a missing tolerance (the Lambda has no tolerance pre-check at all).
+  const needsTolerance = def.kind === "rate" || def.kind === "count" || def.kind === "sum" || def.kind === "excess";
   if (needsTolerance && tolerance === undefined) {
     return { raw: null, normalized: null, note: `${def.key}: no tolerance in kpi.json` };
   }
@@ -548,6 +551,19 @@ function measure(card: PerformanceCardInput, def: KpiComponentDef): Measured {
         return { raw, normalized: null, note: `${def.source} is ${raw ?? "absent"}` };
       }
       return { raw, normalized: values[raw] };
+    }
+    default: {
+      // Unreachable for a valid rubric: `KpiComponentKind` is closed, so `def.kind`
+      // narrows to `never` here. The branch exists because the CONFIG is data — a
+      // kpi.json edit, or a caller passing its own `config`, can carry a seventh
+      // kind at runtime. The Lambda twin's normalizeComponent ends with exactly
+      // this catch-all (index.mjs, last line of the function), excluding the
+      // component with this note; without it here `measure` returned `undefined`
+      // and computeKpi threw on the destructure, breaking its "nothing throws"
+      // contract. Cast to read the kind as data — widening KpiComponentKind
+      // itself would cost every caller its exhaustiveness checking.
+      const kind = (def as { kind: string }).kind;
+      return { raw: null, normalized: null, note: `unknown component kind "${kind}"` };
     }
   }
 }
