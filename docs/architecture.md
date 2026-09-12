@@ -819,6 +819,30 @@ Each flag is a safe-rollout knob for a fix that a blueprint or ticket-tools chan
 
 **Enabling one**: set the var on the orchestrator Lambda (and, for `EVENT_DEDUPE_MODE`, on the agent-invoker and events-writer too - `deploy.sh` forwards it to all three). Instant rollback = set it back to `off`.
 
+---
+
+### DL-028: The Deploy Gate is Conditional on a Recorded Merge-Approved SHA (never auto-approved)
+
+**Date**: 2026-09-12
+**Decision**: The in-pipeline `Approve_deploy` ManualApproval stage becomes CONDITIONAL rather than unconditional: it is SKIPPED only for a commit the pipeline can prove is the merge of the exact head SHA a human already approved at the Merge Approval gate, and is held exactly as it is today in every other case. The gate is made *unnecessary* for one specific commit; it is never approved by software.
+**Status**: ACTIVE - shipped 2026-09-12 (TEAM-4525)
+
+**Context**: a ship-phase run asked the human to approve byte-identical code twice - the Merge Approval gate on PR head SHA X, then the deploy gate on the merge of that same X, paged to Telegram. In `wf_1789170903227_c3x6k1` the two approvals were ~5.1h apart (merge 10:38Z, deploy 16:03Z), with the release manager polling ~2h50m before filing deploy-gate ticket TEAM-4523. The second ask carries information in exactly one case: the thing about to deploy is not what the human approved. Every other case is latency an operator learns to click through.
+
+**Mechanism** (full detail in `docs/pipeline/design.md`):
+
+1. **Record.** `Pipeline___start_deploy` accepts `approved_head_sha` (plus `ci_build_id`, `pr_url`, `workflow_id`, `ticket_id`) and, when both SHAs are 40-hex AND a SUCCEEDED build of the target's CI project certifies the approved head, writes a ship-approval record to `s3://$ARTIFACT_BUCKET/pipeline-artifacts/ship-approvals/<merge_commit>.json` before starting the pipeline. Otherwise it starts the pipeline with no record and reports `preapproval:{recorded:false, reason}`. One new IAM statement: `s3:PutObject` on that one prefix.
+2. **Decide.** The Build stage exports `DEPLOY_PREAPPROVED` (`variablesNamespace: "BuildVars"`), set from `deploy/pipeline/preapproved-check.sh decide`, which prints `1` only when the record exists for that exact commit, parses, and its `merge_commit` matches the resolved source commit.
+3. **Skip.** The Approval stage carries a CodePipeline V2 `beforeEntry` condition - one `VariableCheck` rule, `#{BuildVars.DEPLOY_PREAPPROVED} NE 1` -> `Result.SKIP`.
+4. **Re-verify.** Both Deploy actions run `preapproved-check.sh gate` against an independent re-read of the record before touching prod.
+
+**Where the logic lives, and why not the orchestrator**: the recording decision sits in the `Pipeline___*` tools Lambda, the skip decision in the pipeline definition, and the policy of when to pass `approved_head_sha` in the release-manager/operator blueprint. The orchestrator gains nothing - it neither records nor reads an approval, per DL-009 - and there is no new `*_MODE` flag: the absence of `approved_head_sha` IS the opt-out, per run.
+
+**Fail-closed orientation**: three independent checkpoints all fail in the same direction. Only the literal `1` skips, so an empty, unresolved, `0` or garbage variable enters the stage and pages the human as before; `decide` never fails the build; the Deploy-stage gate refuses anything it cannot re-verify. A misread of the condition's semantics can therefore only produce a needless human gate, never a silent deploy. Drift is covered by the same property: a post-approval `main` sync yields a new head SHA, the merge worker replies `DRIFT` and refuses, so no record exists and the gate fires (the lesson from the earlier post-gate-sync incident); a commit landing on `main` between the merge and `start_deploy` makes the resolved source version differ from the record, so the gate fires.
+
+**No agent gains approval capability**: the tools Lambda still deliberately holds no CodePipeline approval action, and the Telegram bridge remains the only holder of one. `Pipeline___get_state` gained `approvalSkipped: boolean` and the ship/completion record gained `approved_head_sha`, both observational.
+
+---
 
 ### DL-012: System Prompts Baked at Deploy Time (Not Passed at Invocation)
 
