@@ -5,15 +5,35 @@ numbers — it never recomputes them.
 Usage: python3 compute_metrics.py <workflowId> [--workspace DIR]
 Reads {workspace}/dossier.json, writes {workspace}/metrics.json.
 
+CARD-FIRST (TEAM-4484). When the dossier carries a performance card at
+reportVersion >= 5, the card's own cost/time/quality numbers and its `kpi` block
+(the deterministic 0-100 quality score) are carried through VERBATIM under
+`metrics.kpi` / `metrics.time` / `metrics.cost` / `metrics.quality`, and
+`metrics.source` is "performance-card@v5". Two systems must never publish two
+different answers for the same run, and the card — not this module — is the one
+the UI shows. Without a v5 card everything below is computed as it always was
+and `metrics.source` is "computed".
+
+The legacy top-level keys (totalDurationMs, humanWaitTotalMs, changeRequests,
+errors, nudgeCount, managerInterventions, fixTickets, tokens) keep their shape
+and meaning in BOTH modes — they are what save_analysis persists, what
+priorAnalyses compare against, and what the WM's older prompts cite. The card's
+namespaced twins sit beside them, they never overwrite them.
+
 All functions are pure (no AWS calls) so they can be unit-tested locally:
   python3 -m unittest deploy/workflow-manager/toolkit/test_metrics.py
+The one AWS path — request_card(), which nudges the cost-report Lambda when a run
+has no card yet — lives in main() and imports boto3 LAZILY: the CI toolkit job
+installs no boto3 and the tests import this module.
 """
 
 import argparse
+import copy
 import json
 import os
 import re
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -27,6 +47,41 @@ HUMAN_PREFIX = "human:"
 FIX_PREFIX = "Fix:"
 TERMINAL_TASK_EVENTS = ("agent.complete", "workflow.report_completion")
 INVOKE_EVENTS = ("agent.invoked", "agent.started")
+
+# ── Card-first (TEAM-4484) ──────────────────────────────────────────────────
+# The performance card carries the deterministic hero KPIs. v5 is the first
+# version with a `kpi` block (the 0-100 quality score); v4 and older have
+# cost/time/quality counters but no score, so they are NOT card-first — a
+# partial carry-through would publish a card-shaped `metrics.quality` with no
+# score in it and leave the reader guessing which half came from where.
+CARD_MIN_REPORT_VERSION = 5
+SOURCE_CARD = "performance-card@v5"
+SOURCE_COMPUTED = "computed"
+# Exactly the fields the WM is told to cite. Read with .get so a card written by
+# an older/newer Lambda than this toolkit yields None for what it lacks rather
+# than killing the whole analysis with a KeyError.
+CARD_TIME_KEYS = ("wallMs", "activeMs", "agentWorkMs", "humanWaitMs", "humanGates")
+CARD_COST_KEYS = ("totalUsd", "personaUsd", "codingUsd", "tokens")
+CARD_QUALITY_KEYS = (
+    "tasks", "tasksCompleted", "reworkRounds", "firstPassYield", "loops",
+    "changeRequests", "fixTickets", "nudges", "errors", "interventions",
+    "gateRounds", "score", "ci",
+)
+HUMAN_WAIT_NOTE = (
+    "humanWaitTotalMs is the legacy per-review SUM; time.humanWaitMs is the card's "
+    "interval UNION — both kept deliberately (OQ-5)"
+)
+CARD_NAMESPACE_NOTE = (
+    "time.*, cost.* and quality.* are the CARD's numbers (the ones the UI shows); the "
+    "legacy top-level counters (humanWaitTotalMs, changeRequests, fixTickets, nudgeCount, "
+    "errors, managerInterventions, tokens) are computed from this dossier and may differ "
+    "— cite the card-derived values and say so, never average the two"
+)
+# request_card() only (main()'s AWS fallback) — env-overridable, never read at
+# import time so the module stays stdlib-pure.
+COST_REPORT_FUNCTION = "agentcore-hub-cost-report"
+CARD_WAIT_SECONDS = 60
+CARD_POLL_SECONDS = 5
 
 # ── Fix-ticket lineage (TEAM-4121 FR-10) ────────────────────────────────────
 # "How many fix tickets" was `title.startswith("Fix:")`, which by mid-2026 was
@@ -752,7 +807,43 @@ def compute_tokens(events, missing):
     return {"totalInput": total_in, "totalOutput": total_out, "byAgent": by_agent}
 
 
-def compute_metrics(dossier):
+def card_block(card, section, keys):
+    """{key: card[section][key]} for the keys the WM cites — missing keys read
+    None, so a card from a different Lambda version degrades one field at a time
+    instead of failing the analysis."""
+    block = card.get(section) or {}
+    return {k: block.get(k) for k in keys}
+
+
+def apply_card(metrics, card, notes):
+    """Carry a v5 card's own numbers through, verbatim. Adds the namespaced
+    `kpi`/`time`/`cost`/`quality` blocks and does NOT touch a single legacy key:
+    the card's `quality.changeRequests` is a count, the legacy `changeRequests`
+    is a dict of cycles, and a reader that got the count where it expected the
+    cycles would be silently wrong."""
+    kpi = card.get("kpi") if isinstance(card.get("kpi"), dict) else None
+    metrics["kpi"] = copy.deepcopy(kpi)
+    metrics["kpiVersion"] = kpi.get("version") if kpi else None
+    metrics["time"] = card_block(card, "time", CARD_TIME_KEYS)
+    metrics["cost"] = card_block(card, "cost", CARD_COST_KEYS)
+    metrics["quality"] = card_block(card, "quality", CARD_QUALITY_KEYS)
+    metrics["source"] = SOURCE_CARD
+    for gap in (card.get("dataQuality") or {}).get("gaps") or []:
+        # Prefixed, because these are the CARD's gaps about the card's numbers —
+        # a reader must be able to tell them from this module's own notes.
+        notes.append(f"card: {gap}")
+    notes.append(HUMAN_WAIT_NOTE)
+    notes.append(CARD_NAMESPACE_NOTE)
+    return metrics
+
+
+def compute_metrics(dossier, card=None, card_reason=None):
+    """Deterministic metrics for one run.
+
+    `card` — the run's performance card, defaulting to the one pull_dossier
+    attached. Passed explicitly by main() when it had to fetch a fresh one.
+    `card_reason` — why there is no usable card, when the caller already knows
+    (invoke failed, poll timed out). Recorded verbatim in dataQuality.notes."""
     workflow = dossier.get("workflow") or {}
     tickets = dossier.get("tickets") or []
     # Dedupe FIRST, before the sort and before anything counts a row. pull_dossier
@@ -777,7 +868,10 @@ def compute_metrics(dossier):
          "at": e.get("timestamp"), "note": detail(e).get("note")}
         for e in events_of(events, "manager.intervention")
     ]
-    return {
+    notes = [
+        "evalSummaries are fleet-lifetime rolling averages, not per-run scores",
+    ]
+    metrics = {
         "startedAt": iso(started),
         "completedAt": iso(ended),
         "totalDurationMs": ms_between(started, ended),
@@ -816,11 +910,85 @@ def compute_metrics(dossier):
         "dataQuality": {
             "ticketProvider": dossier.get("ticketProvider", "dynamodb"),
             "missingSignals": missing,
-            "notes": [
-                "evalSummaries are fleet-lifetime rolling averages, not per-run scores",
-            ],
+            "notes": notes,
         },
     }
+
+    card = card if card is not None else dossier.get("performanceCard")
+    version = (card or {}).get("reportVersion", 0) or 0
+    if card and version >= CARD_MIN_REPORT_VERSION:
+        return apply_card(metrics, card, notes)
+
+    # No usable card: everything above stands as computed, and the reason is on
+    # the record — "computed" must never look like a card the reader can cite.
+    reason = card_reason
+    if reason is None:
+        reason = (
+            f"performance card reportVersion {version} < {CARD_MIN_REPORT_VERSION}"
+            if card else "no performance card"
+        )
+    metrics["kpi"] = None
+    metrics["kpiVersion"] = None
+    metrics["source"] = SOURCE_COMPUTED
+    notes.append(f"metrics computed from the dossier, not from a performance card: {reason}")
+    return metrics
+
+
+def request_card(workflow_id, wait_seconds=None):
+    """Nudge the cost-report Lambda for a run with no v5 card, then poll S3 for
+    the card it writes. → (card | None, reason | None).
+
+    NEVER fatal: an analysis without a card is degraded, an analysis that died
+    because a Lambda invoke was denied is useless. Every failure mode — no boto3
+    in the container, no credentials, no permission, the Lambda erroring, the
+    poll timing out — returns None plus a reason string the caller records.
+
+    boto3 is imported HERE, not at module scope: the CI toolkit job installs no
+    boto3 and test_metrics imports this module."""
+    try:
+        import boto3  # noqa: PLC0415 — see the docstring
+    except ImportError as e:
+        return None, f"card fetch skipped: boto3 unavailable ({e})"
+
+    bucket = os.environ.get("ARTIFACT_BUCKET")
+    if not bucket:
+        return None, "card fetch skipped: ARTIFACT_BUCKET unset"
+    if wait_seconds is None:
+        try:
+            wait_seconds = int(os.environ.get("KPI_CARD_WAIT_SECONDS") or CARD_WAIT_SECONDS)
+        except ValueError:
+            wait_seconds = CARD_WAIT_SECONDS
+    function = os.environ.get("COST_REPORT_FUNCTION", COST_REPORT_FUNCTION)
+    region = os.environ.get("AWS_REGION", "us-east-1")
+    key = f"workflows/{workflow_id}/shared/performance-card.json"
+
+    try:
+        # Event, not RequestResponse: the card takes tens of seconds to build and
+        # a sync invoke would hold this process for the Lambda's whole timeout.
+        boto3.client("lambda", region_name=region).invoke(
+            FunctionName=function,
+            InvocationType="Event",
+            Payload=json.dumps({"workflowId": workflow_id}).encode(),
+        )
+    except Exception as e:
+        return None, f"card fetch failed: could not invoke {function} ({e})"
+
+    s3 = None
+    deadline = time.monotonic() + max(0, wait_seconds)
+    while True:
+        try:
+            s3 = s3 or boto3.client("s3", region_name=region)
+            card = json.loads(s3.get_object(Bucket=bucket, Key=key)["Body"].read())
+            if (card.get("reportVersion") or 0) >= CARD_MIN_REPORT_VERSION:
+                return card, None
+        except Exception:
+            pass  # not written yet, or unreadable — the deadline decides
+        if time.monotonic() >= deadline:
+            return None, (
+                f"card fetch timed out: no reportVersion >= {CARD_MIN_REPORT_VERSION} card at "
+                f"{key} within {wait_seconds}s of invoking {function}"
+            )
+        time.sleep(CARD_POLL_SECONDS)
 
 
 def main():
@@ -831,12 +999,30 @@ def main():
     workspace = args.workspace or f"/mnt/workspace/{args.workflow_id}"
     with open(os.path.join(workspace, "dossier.json")) as f:
         dossier = json.load(f)
-    metrics = compute_metrics(dossier)
+
+    # The dossier's card is usually already there (pull_dossier fetched it). When
+    # it isn't — a run that completed before the cost-report Lambda saw it, or a
+    # card still at v4 — nudge the Lambda and wait briefly, then compute with
+    # whatever came back. A failed fetch is a note, never an exit.
+    card = dossier.get("performanceCard")
+    reason = None
+    if not (card and (card.get("reportVersion") or 0) >= CARD_MIN_REPORT_VERSION):
+        fresh, reason = request_card(args.workflow_id)
+        if fresh:
+            card, reason = fresh, None
+    metrics = compute_metrics(dossier, card=card, card_reason=reason)
     out = os.path.join(workspace, "metrics.json")
     with open(out, "w") as f:
         json.dump(metrics, f, indent=1)
+    kpi = metrics.get("kpi") or {}
     print(json.dumps({
         "metrics": out,
+        # Which numbers these are — card-first or dossier-computed — and, when
+        # there is a card, the deterministic score the WM must cite.
+        "source": metrics["source"],
+        "kpiVersion": metrics["kpiVersion"],
+        "qualityScore": (kpi.get("quality") or {}).get("score"),
+        "qualityGrade": (kpi.get("quality") or {}).get("grade"),
         "totalDurationMs": metrics["totalDurationMs"],
         "humanWaitTotalMs": metrics["humanWaitTotalMs"],
         "changeRequests": metrics["changeRequests"]["count"],

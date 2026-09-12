@@ -6,51 +6,12 @@
  * run's anomaly bands against its def baseline.
  */
 
-import { useEffect, useState } from "react";
 import Link from "next/link";
 import { Gauge, Coins, Clock, CheckCircle2, ExternalLink, Loader2 } from "lucide-react";
-import { formatKpi, type BandStatus, type KpiUnit } from "@/lib/workflow/performance";
-
-interface RunCard {
-  reportVersion: number;
-  workflowId: string;
-  epicId: string | null;
-  workflowDefId: string;
-  title: string | null;
-  run: { outcome: string; startedAt: string | null; completedAt: string | null; prUrl: string | null };
-  cost: {
-    totalUsd: number; personaUsd: number; codingUsd: number; perTaskUsd: number | null;
-    tokens: { input: number; output: number; cached: number; total: number; cacheRead?: number; cacheWrite?: number };
-    cacheHitRate?: number | null; personaCacheHitRate?: number | null;
-    byEngine: Record<string, { usd: number }>;
-  };
-  time: {
-    wallMs: number | null; humanWaitMs: number; activeMs: number | null; agentWorkMs: number;
-    busyMs?: number; idleMs: number | null; agentUtilization: number | null; humanGates: number;
-    phases: { phase: string; durationMs: number }[];
-  };
-  quality: {
-    outcome: string; tasks: number; tasksCompleted: number; reworkRounds: number; changeRequests: number;
-    fixTickets: number; gateRounds: number; loops: number; nudges: number; interventions: number;
-    errors: number; retries: number; firstPassYield: number | null; prUrl: string | null;
-  };
-  agents: Record<string, { usd: number; workMs: number; tasks: number; reworkRounds: number }>;
-  bands: {
-    status: BandStatus;
-    baseline: { n: number; windowDays: number; minSamples: number };
-    anomalies: { kpi: string; label: string; status: BandStatus; value: number; median: number; z: number }[];
-    kpis: Record<string, { label: string; unit: KpiUnit; status: BandStatus; value: number | null; median?: number; warnAbove?: number; z?: number | null }>;
-  } | null;
-  dataQuality: { gaps: string[] };
-}
-
-const STATUS_STYLE: Record<BandStatus, string> = {
-  ok: "bg-emerald-500/15 text-emerald-400 border-emerald-500/30",
-  warn: "bg-amber-500/15 text-amber-400 border-amber-500/30",
-  alert: "bg-red-500/15 text-red-400 border-red-500/30",
-  insufficient: "bg-slate-500/15 text-slate-400 border-slate-500/30",
-  unknown: "bg-slate-500/15 text-slate-400 border-slate-500/30",
-};
+import { BASELINE_DAYS, BASELINE_MIN, formatKpi, type BandStatus } from "@/lib/workflow/performance";
+import { STATUS_STYLE } from "./band-style";
+import { COST_MISSING_VALUE, isCostMissing } from "./cost-missing";
+import { usePerformanceCard } from "./use-performance-card";
 
 function Row({ label, value, band, hint }: { label: string; value: string; band?: BandStatus; hint?: string }) {
   const dot = band === "alert" ? "bg-red-400" : band === "warn" ? "bg-amber-400" : band === "ok" ? "bg-emerald-400" : "bg-slate-500/50";
@@ -65,31 +26,29 @@ function Row({ label, value, band, hint }: { label: string; value: string; band?
 }
 
 export default function RunPerformanceCard({ workflowId }: { workflowId: string }) {
-  const [card, setCard] = useState<RunCard | null>(null);
-  const [state, setState] = useState<"loading" | "missing" | "ready" | "error">("loading");
-
-  useEffect(() => {
-    let alive = true;
-    setState("loading");
-    fetch(`/api/workflow/performance?workflowId=${encodeURIComponent(workflowId)}`, { cache: "no-store" })
-      .then(async (r) => {
-        if (!alive) return;
-        if (r.status === 404) { setState("missing"); return; }
-        const j = await r.json();
-        if (!r.ok) throw new Error(j.error);
-        setCard(j.card as RunCard);
-        setState("ready");
-      })
-      .catch(() => alive && setState("error"));
-    return () => { alive = false; };
-  }, [workflowId]);
+  // Shared with the hero KPI strip: one GET per run, and a card computed from the
+  // strip's "Compute now" lands here too without a second request.
+  const { card, state } = usePerformanceCard(workflowId);
 
   if (state === "missing") return null;
   const b = card?.bands;
   const k = (path: string) => b?.kpis?.[path]?.status;
+  const q5 = card?.kpi?.quality;
+  // TEAM-4515 D-3: same predicate as the hero KPI strip directly above this card
+  // (./cost-missing). Cost that was never measured must not render as $0.00 here
+  // while the strip says "$0 · no usage data" — the card's number reads as a bill.
+  const costMissing = !!card && isCostMissing(card);
+  // D-16: cost KPIs band against priced runs only. `nCost` is absent on v4 cards.
+  const nCost = b?.baseline?.nCost ?? b?.baseline?.n ?? 0;
+  // The header chip is keyed off the FULL baseline by design; a cost band can be
+  // starved while the overall status says "within bands", which is the case
+  // this line exists to name.
+  const thinCostBaseline =
+    !!b && b.status !== "insufficient" &&
+    Object.entries(b.kpis ?? {}).some(([path, v]) => path.startsWith("cost.") && v.status === "insufficient");
 
   return (
-    <section className="mt-6 rounded-xl border border-[var(--color-border)] bg-[var(--color-bg-secondary)]">
+    <section id="run-performance-card" className="mt-6 rounded-xl border border-[var(--color-border)] bg-[var(--color-bg-secondary)]">
       <div className="flex flex-wrap items-center gap-2 px-4 py-2.5 border-b border-[var(--color-border)]">
         <Gauge className="w-4 h-4 text-sky-400" />
         <h3 className="text-sm font-semibold text-[var(--color-text-primary)]">Performance Card</h3>
@@ -101,7 +60,12 @@ export default function RunPerformanceCard({ workflowId }: { workflowId: string 
         )}
         {card && (
           <span className="text-xs text-[var(--color-text-muted)]">
-            {card.workflowDefId}{b?.baseline?.n ? ` · baseline ${b.baseline.n} runs / ${b.baseline.windowDays}d` : ""}
+            {card.workflowDefId}
+            {b?.baseline?.n
+              ? ` · baseline ${b.baseline.n} runs / ${b.baseline.windowDays}d${
+                  b.baseline.nCost !== undefined && b.baseline.nCost !== b.baseline.n ? ` · ${b.baseline.nCost} priced` : ""
+                }`
+              : ""}
           </span>
         )}
         <Link href={`/workflow?id=${workflowId}&artifact=${encodeURIComponent(`workflows/${workflowId}/shared/performance-card.md`)}`}
@@ -126,12 +90,30 @@ export default function RunPerformanceCard({ workflowId }: { workflowId: string 
 
           <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
             <div className="rounded-lg border border-[var(--color-border)] p-3 space-y-1.5">
-              <div className="flex items-center gap-2 mb-1"><Coins className="w-4 h-4 text-amber-400" /><span className="text-sm font-medium text-[var(--color-text-primary)]">Cost</span><span className="ml-auto text-base font-semibold tabular-nums">{formatKpi("usd", card.cost.totalUsd)}</span></div>
-              <Row label="Persona LLM" value={formatKpi("usd", card.cost.personaUsd)} band={k("cost.personaUsd")} />
-              <Row label="Coding CLIs" value={formatKpi("usd", card.cost.codingUsd)} band={k("cost.codingUsd")} hint={Object.entries(card.cost.byEngine).filter(([e]) => e !== "persona").map(([e, v]) => `${e}: ${formatKpi("usd", v.usd)}`).join(", ")} />
-              <Row label="Per agent task" value={formatKpi("usd", card.cost.perTaskUsd)} />
+              <div
+                className="flex items-center gap-2 mb-1"
+                title={`cost baseline: ${nCost}/${b?.baseline?.minSamples ?? BASELINE_MIN} priced runs / ${b?.baseline?.windowDays ?? BASELINE_DAYS}d`}
+              >
+                <Coins className="w-4 h-4 text-amber-400" /><span className="text-sm font-medium text-[var(--color-text-primary)]">Cost</span>
+                {costMissing ? (
+                  /* Word-for-word the hero strip's tile — the two cannot disagree. */
+                  <span className="ml-auto text-xs text-[var(--color-text-muted)] tabular-nums">{COST_MISSING_VALUE} · no usage data</span>
+                ) : (
+                  <span className="ml-auto text-base font-semibold tabular-nums">{formatKpi("usd", card.cost.totalUsd)}</span>
+                )}
+              </div>
+              {/* Unmeasured cost is an em dash with no band: there is nothing to
+                  compare, and a band chip would dress up an absent measurement. */}
+              <Row label="Persona LLM" value={costMissing ? formatKpi("usd", null) : formatKpi("usd", card.cost.personaUsd)} band={costMissing ? undefined : k("cost.personaUsd")} />
+              <Row label="Coding CLIs" value={costMissing ? formatKpi("usd", null) : formatKpi("usd", card.cost.codingUsd)} band={costMissing ? undefined : k("cost.codingUsd")} hint={costMissing ? undefined : Object.entries(card.cost.byEngine).filter(([e]) => e !== "persona").map(([e, v]) => `${e}: ${formatKpi("usd", v.usd)}`).join(", ")} />
+              <Row label="Per agent task" value={costMissing ? formatKpi("usd", null) : formatKpi("usd", card.cost.perTaskUsd)} />
               <Row label="Tokens (in / out / cache r / cache w)" value={`${formatKpi("tokens", card.cost.tokens.input)} / ${formatKpi("tokens", card.cost.tokens.output)} / ${formatKpi("tokens", card.cost.tokens.cacheRead ?? card.cost.tokens.cached)} / ${formatKpi("tokens", card.cost.tokens.cacheWrite ?? 0)}`} band={k("cost.tokens.total")} />
               <Row label="Cache hit rate (persona)" value={formatKpi("ratio", card.cost.personaCacheHitRate ?? null)} band={k("cost.personaCacheHitRate")} hint="persona input tokens served from the Bedrock prompt cache" />
+              {thinCostBaseline && (
+                <p className="text-[10px] text-[var(--color-text-muted)]">
+                  no cost baseline ({nCost}/{b!.baseline.minSamples} priced runs)
+                </p>
+              )}
             </div>
             <div className="rounded-lg border border-[var(--color-border)] p-3 space-y-1.5">
               <div className="flex items-center gap-2 mb-1"><Clock className="w-4 h-4 text-sky-400" /><span className="text-sm font-medium text-[var(--color-text-primary)]">Time</span><span className="ml-auto text-base font-semibold tabular-nums">{formatKpi("ms", card.time.wallMs)}</span></div>
@@ -143,7 +125,20 @@ export default function RunPerformanceCard({ workflowId }: { workflowId: string 
               <Row label="Agent utilization" value={formatKpi("ratio", card.time.agentUtilization)} hint="busy ÷ active" />
             </div>
             <div className="rounded-lg border border-[var(--color-border)] p-3 space-y-1.5">
-              <div className="flex items-center gap-2 mb-1"><CheckCircle2 className="w-4 h-4 text-emerald-400" /><span className="text-sm font-medium text-[var(--color-text-primary)]">Quality</span><span className="ml-auto text-base font-semibold tabular-nums">{card.quality.loops} loop{card.quality.loops === 1 ? "" : "s"}</span></div>
+              <div className="flex items-center gap-2 mb-1"><CheckCircle2 className="w-4 h-4 text-emerald-400" /><span className="text-sm font-medium text-[var(--color-text-primary)]">Quality</span><span className="ml-auto text-base font-semibold tabular-nums text-right leading-tight">
+                {q5 ? (
+                  <>
+                    {/* No score means no grade — never show an "F" the evidence can't back. */}
+                    <span className={q5.confidence === "insufficient" ? "opacity-60" : undefined}>
+                      {q5.score == null ? "—" : `${q5.score}/100${q5.grade ? ` · ${q5.grade}` : ""}`}
+                    </span>
+                    {/* text-xs so "74/100 · C · 3 loops" still fits the header row on one line */}
+                    <span className="text-[var(--color-text-muted)] font-normal text-xs whitespace-nowrap"> · {card.quality.loops} loop{card.quality.loops === 1 ? "" : "s"}</span>
+                  </>
+                ) : (
+                  <>{card.quality.loops} loop{card.quality.loops === 1 ? "" : "s"}</>
+                )}
+              </span></div>
               <Row label="Outcome" value={card.quality.outcome} />
               <Row label="Agent tasks (done)" value={`${card.quality.tasks} (${card.quality.tasksCompleted})`} band={k("quality.tasks")} />
               <Row label="First-pass yield" value={formatKpi("ratio", card.quality.firstPassYield)} band={k("quality.firstPassYield")} hint="tasks that needed no rework" />

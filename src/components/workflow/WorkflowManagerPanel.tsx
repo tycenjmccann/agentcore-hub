@@ -1,10 +1,14 @@
 "use client";
 
 /**
- * Workflow Manager analysis panel — shown on terminal (complete/cancelled/error)
- * runs. Self-contained: fetches GET /api/workflow/[id]/analysis, renders the
- * latest analysis (verdict, scores, metric cards, findings, recommendations,
- * def-level trend), and can trigger POST /api/workflow/[id]/analyze.
+ * Workflow Manager analysis panel — shown on every terminal run EXCEPT a
+ * "complete" one that still has open fix-it tickets. The board owns that rule
+ * (showWorkflowManager in WorkflowBoard.tsx) and only offers the hero KPI strip's
+ * agent-authored tile, whose click scrolls here, when it mounts this panel.
+ *
+ * Self-contained: fetches GET /api/workflow/[id]/analysis, renders the latest
+ * analysis (verdict, scores, metric cards, findings, recommendations, def-level
+ * trend), and can trigger POST /api/workflow/[id]/analyze.
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -28,6 +32,7 @@ import {
   YAxis,
 } from "recharts";
 import { MarkdownRenderer } from "./MarkdownRenderer";
+import { usePerformanceCard } from "./use-performance-card";
 import type {
   AnalysisResponse,
   WorkflowAnalysis,
@@ -94,6 +99,7 @@ export default function WorkflowManagerPanel({ workflowId, onAskAboutRun }: Prop
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const pollUntilRef = useRef(0);
   const baselineIdRef = useRef<string | null>(null);
+  const { card } = usePerformanceCard(workflowId);
 
   const load = useCallback(async () => {
     try {
@@ -155,6 +161,30 @@ export default function WorkflowManagerPanel({ workflowId, onAskAboutRun }: Prop
     data?.latest ||
     null;
 
+  // The deterministic score, next to the agent-authored one. Shares the hero
+  // strip's cached card, so this costs no extra request.
+  //
+  // TEAM-4521 F2 — provenance: `selected` may be an OLDER analysis picked from the
+  // history <select> and scored under an older kpi.json rubric, while `card.kpi` is
+  // always the CURRENT card. card.kpi.version IS kpi.json's kpiVersion
+  // (performance.ts: `version: config.kpiVersion`), so the two are directly
+  // comparable — print the number only when they match, and say why not when they
+  // don't rather than attributing today's score to an older rubric.
+  const kpiVersion = selected?.kpiVersion;
+  const cardKpiVersion = card?.kpi?.version;
+  const detQuality = card?.kpi?.quality;
+  const versionsDiffer =
+    typeof kpiVersion === "number" && typeof cardKpiVersion === "number" && cardKpiVersion !== kpiVersion;
+  const detChip = versionsDiffer ? (
+    <span className="wm-det-chip" data-testid="wm-det-chip" data-kpi-match="false">
+      Deterministic score not comparable — card is kpi v{cardKpiVersion}, analysis scored under kpi v{kpiVersion}
+    </span>
+  ) : typeof kpiVersion === "number" && cardKpiVersion === kpiVersion && detQuality?.score != null ? (
+    <span className="wm-det-chip" data-testid="wm-det-chip" data-kpi-match="true">
+      Deterministic: {detQuality.score}/100 {detQuality.grade}
+    </span>
+  ) : null;
+
   return (
     <div className="wm-panel">
       <style>{PANEL_STYLES}</style>
@@ -203,10 +233,14 @@ export default function WorkflowManagerPanel({ workflowId, onAskAboutRun }: Prop
                   {selected.scores?.overall ?? "—"}
                 </div>
                 <div className="wm-verdict">
+                  {/* This score is the agent's own judgement. Name it, so it is never
+                      read as the deterministic KPI score shown alongside it. */}
+                  <p className="wm-verdict-kind">Workflow Manager assessment (agent-authored)</p>
                   <p className="wm-verdict-text">{selected.verdict}</p>
                   <p className="wm-verdict-meta">
                     {selected.runOutcome} · {selected.trigger} ·{" "}
                     {new Date(selected.analyzedAt).toLocaleString()}
+                    {detChip}
                   </p>
                 </div>
                 <div className="wm-actions">
@@ -417,6 +451,10 @@ const PANEL_STYLES = `
 .wm-verdict{flex:1}
 .wm-verdict-text{margin:0;font-weight:500;line-height:1.4}
 .wm-verdict-meta{margin:3px 0 0;font-size:11px;color:var(--pipeline-text-3,#a1a1aa);text-transform:capitalize}
+.wm-verdict-kind{font-size:11px;letter-spacing:.04em;text-transform:uppercase;color:var(--pipeline-text-3,#a1a1aa);margin:0 0 3px}
+/* text-transform:none — .wm-verdict-meta capitalizes, which would mangle "100 C" */
+.wm-det-chip{margin-left:8px;padding:1px 6px;border-radius:5px;border:1px solid var(--pipeline-border,#3f3f46);
+  font-variant-numeric:tabular-nums;text-transform:none}
 .wm-actions{display:flex;gap:6px}
 .wm-icon-btn{width:32px;height:32px;border-radius:8px;border:1px solid var(--pipeline-border,#3f3f46);
   background:none;color:var(--pipeline-text-2,#d4d4d8);cursor:pointer;display:flex;align-items:center;justify-content:center}

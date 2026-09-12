@@ -12,6 +12,8 @@ import { mergeCommitOf, isAwaitingHuman, waitingApprovalShas } from "@/lib/workf
 import { WORKFLOW_DEFS, DEFAULT_WORKFLOW_DEF_ID, getWorkflowDef } from "@/lib/workflow/workflow-defs";
 import { resolveSdlcFramework, sdlcBadgeFor } from "@/lib/workflow/sdlc-framework";
 import DeleteConfirmationModal from "@/components/workflow/DeleteConfirmationModal";
+import { GRADE_STYLE, type Grade } from "@/components/workflow/band-style";
+import { formatKpi } from "@/lib/workflow/performance";
 
 interface WorkflowSummary {
   id: string;
@@ -32,6 +34,79 @@ interface WorkflowSummary {
   humanNotifications?: HumanNotification[];
   /** Ship-phase merge commit, matched against a parked CD execution (TEAM-4403). */
   mergeCommit?: string;
+  /**
+   * Deterministic KPI summary for a finished run (TEAM-4482), written onto the
+   * list item by the cost-report Lambda. Absent on runs whose card predates v5,
+   * and any field can be null — never render one as 0.
+   */
+  kpi?: {
+    version: number;
+    cost: { usd: number | null };
+    time: { wallMs: number | null };
+    quality: { score: number | null; grade: Grade | null; confidence: string };
+  } | null;
+}
+
+// ─── Completed-run sort + grade filter (TEAM-4482) ──────────────────────────
+
+type SortKey = "newest" | "cost" | "time" | "quality";
+type GradeFilter = "all" | "ab" | "c" | "df" | "none";
+
+const SORT_LABEL: Record<SortKey, string> = {
+  newest: "Newest",
+  cost: "Cost",
+  time: "Time",
+  quality: "Quality",
+};
+
+const GRADE_LABEL: Record<GradeFilter, string> = {
+  all: "All",
+  ab: "A–B",
+  c: "C",
+  df: "D–F",
+  none: "No score",
+};
+
+const KPI_OF: Record<Exclude<SortKey, "newest">, (w: WorkflowSummary) => number | null> = {
+  cost: (w) => w.kpi?.cost?.usd ?? null,
+  time: (w) => w.kpi?.time?.wallMs ?? null,
+  quality: (w) => w.kpi?.quality?.score ?? null,
+};
+
+/** A run with no card, or a card with no score, is "none" — not an F. */
+function gradeBucket(w: WorkflowSummary): Exclude<GradeFilter, "all"> {
+  const q = w.kpi?.quality;
+  if (!q || q.score == null || !q.grade) return "none";
+  if (q.grade === "A" || q.grade === "B") return "ab";
+  if (q.grade === "C") return "c";
+  return "df";
+}
+
+/**
+ * Descending by the chosen KPI, nulls always last, ties broken by finish time.
+ *
+ * TEAM-4515: "newest" means newest-FINISHED (byFinishedDesc — TEAM-4504), never
+ * newest-started, and it RE-DERIVES that order rather than trusting the order the
+ * caller happened to hand in. A run that started long ago but finished recently
+ * belongs at the top of Past — in the default view, after a round trip through the
+ * cost/time/quality sorts, and under the grade filter alike.
+ */
+function sortPast(list: WorkflowSummary[], key: SortKey): WorkflowSummary[] {
+  if (key === "newest") return [...list].sort(byFinishedDesc);
+  const of = KPI_OF[key];
+  return [...list].sort((x, y) => {
+    const a = of(x);
+    const b = of(y);
+    if (a == null && b == null) return byFinishedDesc(x, y);
+    if (a == null) return 1;
+    if (b == null) return -1;
+    return b - a || byFinishedDesc(x, y);
+  });
+}
+
+function filterPast(list: WorkflowSummary[], filter: GradeFilter): WorkflowSummary[] {
+  if (filter === "all") return list;
+  return list.filter((w) => gradeBucket(w) === filter);
 }
 
 // ─── Workflows sidebar sizing (TEAM-4320) ───────────────────────────────────
@@ -100,6 +175,10 @@ export default function WorkflowPage() {
   const [deleteTargetId, setDeleteTargetId] = useState<string | null>(null);
   const [deleteLoading, setDeleteLoading] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
+  // Deliberately not persisted: this is a "look at the expensive runs" gesture,
+  // not a preference. It survives the 5s list poll because that only setWorkflows.
+  const [sortKey, setSortKey] = useState<SortKey>("newest");
+  const [gradeFilter, setGradeFilter] = useState<GradeFilter>("all");
   const [chatOpen, setChatOpen] = useState(false);
   // Set when the user clicks "Ask about this run" in the analysis panel.
   const [chatSeedWorkflowId, setChatSeedWorkflowId] = useState<string | null>(null);
@@ -228,7 +307,7 @@ export default function WorkflowPage() {
       // `input`) must never throw and blank the entire list. Coerce missing
       // fields and drop records with no usable id.
       const list: WorkflowSummary[] = (data.workflows || [])
-        .map((w: Partial<WorkflowState> & { workflowId?: string; workflowDefId?: string }) => ({
+        .map((w: Partial<WorkflowState> & { workflowId?: string; workflowDefId?: string; kpi?: WorkflowSummary["kpi"] }) => ({
           id: w.id || w.workflowId || "",
           phase: w.phase || "unknown",
           epicId: w.epicId || "",
@@ -248,6 +327,8 @@ export default function WorkflowPage() {
           // human without a per-run fetch and without any API change.
           humanNotifications: w.humanNotifications,
           mergeCommit: mergeCommitOf(w.agentTasks),
+          // TEAM-4482: same unprojected-item pick — the KPI chips need no extra fetch.
+          kpi: w.kpi ?? null,
         }))
         .filter((w: WorkflowSummary) => w.id);
       // Sort: active first, then by date descending
@@ -343,11 +424,13 @@ export default function WorkflowPage() {
   const activeWorkflows = filtered
     .filter((w) => !isTerminalPhase(w.phase))
     .sort(byAwaitingHumanThenStartedDesc((w) => isAwaitingHuman(w, approvalShas)));
-  // TEAM-4504: Past reads newest-finished first, not newest-started — a run
-  // that started long ago but finished recently belongs at the top.
+  // TEAM-4504: Past reads newest-finished first, not newest-started — a run that
+  // started long ago but finished recently belongs at the top. sortPast re-derives
+  // the same order for "newest", so the default view and this pre-sort agree.
   const pastWorkflows = filtered
     .filter((w) => isTerminalPhase(w.phase))
     .sort(byFinishedDesc);
+  const visiblePast = sortPast(filterPast(pastWorkflows, gradeFilter), sortKey);
 
   const handleSelectWorkflow = (id: string) => {
     setSelectedId(id);
@@ -561,22 +644,60 @@ export default function WorkflowPage() {
                 </div>
               )}
 
-              {/* Past Runs */}
+              {/* Past Runs — gated on the UNFILTERED list so the controls that
+                  produced an empty result stay reachable */}
               {pastWorkflows.length > 0 && (
                 <div className="p-2">
-                  <p className="px-2 py-1 text-[10px] font-semibold text-[var(--color-text-muted)] uppercase tracking-wider">
+                  <p className="px-2 py-1 text-[10px] font-semibold text-[var(--color-text-muted)] uppercase tracking-wider flex items-center gap-1.5">
                     Completed
+                    {gradeFilter !== "all" && (
+                      <span aria-live="polite" className="text-[10px] font-normal text-[var(--color-text-muted)] normal-case tracking-normal">
+                        {visiblePast.length} of {pastWorkflows.length}
+                      </span>
+                    )}
                   </p>
-                  {pastWorkflows.map((w) => (
-                    <WorkflowListItem
-                      key={w.id}
-                      workflow={w}
-                      isSelected={selectedId === w.id}
-                      onClick={() => handleSelectWorkflow(w.id)}
-                      onArchive={handleArchive}
-                      onDelete={(id) => { setDeleteTargetId(id); setDeleteError(null); }}
-                    />
-                  ))}
+                  <div className={`px-2 pb-1.5 flex gap-1.5 ${historyWidth < 260 ? "flex-col" : "flex-row"}`}>
+                    <label htmlFor="wf-sort" className="sr-only">Sort</label>
+                    <select
+                      id="wf-sort"
+                      data-testid="wf-sort"
+                      value={sortKey}
+                      onChange={(e) => setSortKey(e.target.value as SortKey)}
+                      className="flex-1 min-w-0 px-2 py-1 bg-[var(--color-bg-tertiary)] border border-[var(--color-border)] rounded-md text-[10px] text-[var(--color-text-primary)] focus:outline-none focus:border-blue-500"
+                    >
+                      {(Object.keys(SORT_LABEL) as SortKey[]).map((k) => (
+                        <option key={k} value={k}>{SORT_LABEL[k]}</option>
+                      ))}
+                    </select>
+                    <label htmlFor="wf-grade" className="sr-only">Grade</label>
+                    <select
+                      id="wf-grade"
+                      data-testid="wf-grade"
+                      value={gradeFilter}
+                      onChange={(e) => setGradeFilter(e.target.value as GradeFilter)}
+                      className="flex-1 min-w-0 px-2 py-1 bg-[var(--color-bg-tertiary)] border border-[var(--color-border)] rounded-md text-[10px] text-[var(--color-text-primary)] focus:outline-none focus:border-blue-500"
+                    >
+                      {(Object.keys(GRADE_LABEL) as GradeFilter[]).map((k) => (
+                        <option key={k} value={k}>{GRADE_LABEL[k]}</option>
+                      ))}
+                    </select>
+                  </div>
+                  {visiblePast.length === 0 ? (
+                    <div className="p-3 text-center text-[11px] text-[var(--color-text-muted)]">
+                      No completed runs match this filter
+                    </div>
+                  ) : (
+                    visiblePast.map((w) => (
+                      <WorkflowListItem
+                        key={w.id}
+                        workflow={w}
+                        isSelected={selectedId === w.id}
+                        onClick={() => handleSelectWorkflow(w.id)}
+                        onArchive={handleArchive}
+                        onDelete={(id) => { setDeleteTargetId(id); setDeleteError(null); }}
+                      />
+                    ))
+                  )}
                 </div>
               )}
 
@@ -691,6 +812,30 @@ export default function WorkflowPage() {
 }
 
 // ─── Sidebar List Item ──────────────────────────────────────────────────────
+
+const CHIP_BASE = "text-[9px] px-1.5 py-0.5 rounded border font-medium tabular-nums flex-shrink-0";
+const CHIP_NEUTRAL = `${CHIP_BASE} bg-[var(--color-bg-tertiary)] text-[var(--color-text-muted)] border-[var(--color-border)]`;
+
+/**
+ * Cost / time / grade for a finished run (TEAM-4482). Every value is an em dash
+ * when it is absent — a run with no card must never read as $0 or grade F.
+ */
+function KpiChips({ kpi }: { kpi: WorkflowSummary["kpi"] }) {
+  const score = kpi?.quality?.score ?? null;
+  const grade = score == null ? null : (kpi?.quality?.grade ?? null);
+  return (
+    <span data-testid="wf-kpi-chips" className="flex flex-wrap items-center gap-1">
+      <span className={CHIP_NEUTRAL} title="Run cost">{formatKpi("usd", kpi?.cost?.usd ?? null)}</span>
+      <span className={CHIP_NEUTRAL} title="Wall-clock time">{formatKpi("ms", kpi?.time?.wallMs ?? null, true)}</span>
+      <span
+        className={`${CHIP_BASE} ${grade ? GRADE_STYLE[grade] : GRADE_STYLE.none}`}
+        title={grade ? `Quality score ${score}/100, grade ${grade}` : "No score computed for this run"}
+      >
+        {grade ? `${score} ${grade}` : "—"}
+      </span>
+    </span>
+  );
+}
 
 function WorkflowListItem({
   workflow,
@@ -824,6 +969,10 @@ function WorkflowListItem({
             </div>
           )}
           <div className="flex items-center justify-between mt-1">
+            {/* The inner span stays byte-identical (pinned by SdlcBadge.presence.test.ts);
+                wrapping is provided by this outer span so the KPI chips can wrap onto
+                a second line in a narrow sidebar. */}
+            <span className="flex flex-wrap items-center gap-1 min-w-0">
             <span className="flex items-center gap-1 min-w-0">
               <span
                 className="text-[9px] px-1.5 py-0.5 rounded bg-[var(--color-bg-tertiary)] text-[var(--color-text-muted)] border border-[var(--color-border)] font-medium uppercase tracking-wider truncate"
@@ -834,6 +983,8 @@ function WorkflowListItem({
               {sdlcBadge && (
                 <span className={sdlcBadge.listClassName} title={sdlcBadge.tooltip} aria-label={sdlcBadge.tooltip}>{sdlcBadge.label}</span>
               )}
+            </span>
+              {!isRunning && <KpiChips kpi={workflow.kpi} />}
             </span>
             {!isRunning && onDelete && (
               <button

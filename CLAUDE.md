@@ -80,7 +80,7 @@ Agents own CD via the `Pipeline___*` tools (`get_state`/`start_deploy`/`start_ci
 AgentCore online evaluations score invocations; low scores trigger `eval-packager` (via CloudWatch Logs subscription filters) → fleet improver agent writes a PRD → `prd-submitter` re-enters the same 16-agent pipeline. Toggle = set `eval-packager` Lambda concurrency to 0 (paused) vs unlimited.
 
 ### Metrics & traces
-Per-agent token usage comes from `aws/spans` OTEL trace data; invocations/latency from `AWS/Bedrock-AgentCore` CloudWatch metrics; full execution traces from the `aws/spans` Logs group.
+Per-agent token usage comes from `aws/spans` OTEL trace data; invocations/latency from `AWS/Bedrock-AgentCore` CloudWatch metrics; full execution traces from the `aws/spans` Logs group. Every terminal run also gets deterministic hero KPIs — cost, wall-clock and a 0-100 quality score whose weights, tolerances and caps live only in `src/config/kpi.json` — which sit alongside, not instead of, the Workflow Manager's agent-authored assessment.
 
 ## Conventions
 - Never hardcode account IDs, ARNs, bucket names, or usernames in deploy scripts — source `deploy/config.sh` and use env/derived values.

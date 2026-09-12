@@ -190,6 +190,9 @@ export interface WorkflowAnalysis {
   workflowId: string;
   analysisId: string;
   schemaVersion: number;
+  /** kpiVersion of src/config/kpi.json this analysis scored against; null on
+   *  analyses written before the deterministic rubric existed. */
+  kpiVersion?: number | null;
   workflowDefId: string;
   epicId: string | null;
   analyzedAt: string;

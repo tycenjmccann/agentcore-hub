@@ -174,6 +174,14 @@ await iam.send(new PutRolePolicyCommand({
         ],
         Resource: "*",
       },
+      {
+        // compute_metrics.py's card-first path: nudge the performance-card
+        // Lambda (async, InvocationType Event) when the run has no v5 card yet.
+        Sid: "InvokeCostReport",
+        Effect: "Allow",
+        Action: "lambda:InvokeFunction",
+        Resource: `arn:aws:lambda:${REGION}:${accountId}:function:agentcore-hub-cost-report`,
+      },
     ],
   }),
 }));
