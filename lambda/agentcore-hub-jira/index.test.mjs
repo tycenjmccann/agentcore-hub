@@ -1124,9 +1124,11 @@ test("createTicket: an emoji title whose cut lands mid-surrogate-pair is clamped
   try {
     await handler({
       tool_name: "Tickets___create_ticket",
-      summary: ASTRAL_TITLE,
-      description: LONG_DESCRIPTION,
-      assignee: "agentcore_hub_requirements_analyst",
+      parameters: {
+        summary: ASTRAL_TITLE,
+        description: LONG_DESCRIPTION,
+        assignee: "agentcore_hub_requirements_analyst",
+      },
     });
     assert.equal(cap.posts.length, 1);
     assert.ok(cap.fields.summary.length <= 255);
