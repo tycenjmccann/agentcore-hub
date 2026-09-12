@@ -286,7 +286,7 @@ prefix instead of re-billing it as fresh input. Two runtime knobs control it
 | `PERSONA_PROMPT_CACHE` | `1` (default on) | Bedrock prompt caching for the persona system prompt + tools; set `0` to disable |
 | `PERSONA_CACHE_TTL` | `1h` (`5m`\|`1h`, default `1h`) | Prompt-cache TTL; invalid values warn and fall back to `1h` |
 
-**Cache-aware pricing** (from `src/config/pricing.json`, `reportVersion: 4`):
+**Cache-aware pricing** (from `src/config/pricing.json`, `reportVersion: 5`):
 
 As of `reportVersion: 4`, cache tokens are no longer double-billed.
 Strands reports an `inputTokens` count that already **includes** the cached
