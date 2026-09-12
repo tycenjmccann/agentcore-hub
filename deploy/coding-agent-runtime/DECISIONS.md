@@ -90,7 +90,7 @@ Code's own resume, not an extracted text summary.
 
 ## Turn state is VM-local; the caller waits via the command API
 
-See DL-026 in `docs/workflow-pipeline-architecture.md` for the full decision.
+See DL-026 in `docs/architecture.md` for the full decision.
 Short version, because it is the thing most likely to be "simplified" back:
 
 - A turn's status is NOT on `/mnt/efs`. It is `TURNS_ROOT/<turn_id>/` on this

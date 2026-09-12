@@ -4,7 +4,7 @@
 
 Two operating modes. Pick by whether a real CI/CD pipeline owns the build for
 this repo — signalled by `PIPELINE_ENABLED` in your context (set when the repo
-has a deployed CodeBuild PR-check, see docs/cicd-pipeline-module-design.md):
+has a deployed CodeBuild PR-check, see docs/pipeline/design.md):
 
 - **`PIPELINE_ENABLED` set → PIPELINE MODE (thin CI-fixer).** You do NOT run the
   build yourself. A hermetic CodeBuild project already compiled/tested/linted

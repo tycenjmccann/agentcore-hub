@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# deploy-fleet.sh — Deploy 14 Strands agents to AgentCore Runtime (direct_code_deploy)
+# deploy-fleet.sh — Deploy 15 Strands agents to AgentCore Runtime (direct_code_deploy)
 #
 # Each agent uses the same main.py but gets its own Runtime resource with a unique
 # SYSTEM_PROMPT env var baked in from deploy/runtime-agent/prompts/{agent_name}.txt.
@@ -92,7 +92,7 @@ GATEWAY_ARN="${GATEWAY_ARN:-}"  # Optional: AgentCore MCP gateway ARN
 MODEL_ID="us.anthropic.claude-fable-5-1"
 
 # Robust mode: build & push the image ONCE before the parallel agent loop.
-# All 14 agents share the same image; deploy-one-robust.py just points
+# All 15 agents share the same image; deploy-one-robust.py just points
 # CreateAgentRuntime/UpdateAgentRuntime at IMAGE_URI.
 if [ "$DEPLOY_MODE" = "robust" ]; then
   if ! command -v docker >/dev/null 2>&1; then
@@ -130,7 +130,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 echo "═══════════════════════════════════════════════════════════════"
-echo "  Deploying AgentCore Hub Fleet — 14 Strands Agents on Runtime"
+echo "  Deploying AgentCore Hub Fleet — 15 Strands Agents on Runtime"
 echo "═══════════════════════════════════════════════════════════════"
 echo "  Region:      $REGION"
 echo "  Role ARN:    $ROLE_ARN"

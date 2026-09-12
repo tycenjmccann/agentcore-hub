@@ -42,7 +42,7 @@ the app. Set `PUBLISH_CW_METRICS=0` on the Lambda to stop publishing.
 
 | Where | What |
 |---|---|
-| `s3://{ARTIFACT_BUCKET}/workflows/{wfId}/shared/performance-card.json` | Full card (schema `reportVersion: 3`) |
+| `s3://{ARTIFACT_BUCKET}/workflows/{wfId}/shared/performance-card.json` | Full card (schema `reportVersion: 4`) |
 | `…/shared/performance-card.md` | Human-readable card, visible in the artifact viewer |
 | `…/shared/cost-report.json` | Alias of the JSON for older readers |
 | `s3://{ARTIFACT_BUCKET}/performance/index.json` | Fleet index: compact summary per run + infra snapshot |
@@ -80,15 +80,25 @@ prefix instead of re-billing it as fresh input. Two runtime knobs control it
 | `PERSONA_PROMPT_CACHE` | `1` (default on) | Bedrock prompt caching for the persona system prompt + tools; set `0` to disable |
 | `PERSONA_CACHE_TTL` | `1h` (`5m`\|`1h`, default `1h`) | Prompt-cache TTL; invalid values warn and fall back to `1h` |
 
-**Cache-aware pricing** (from `src/config/pricing.json`, `reportVersion: 3`):
+**Cache-aware pricing** (from `src/config/pricing.json`, `reportVersion: 4`):
+
+As of `reportVersion: 4`, cache tokens are no longer double-billed.
+Strands reports an `inputTokens` count that already **includes** the cached
+tokens; earlier versions billed that full count at the fresh-input rate and then
+added the cache-read/write cost on top. The subtraction is **pricing-only**: the
+stored `inputTokens` / `byModel.inputTokens` counters keep the raw
+engine-provided value (which, for persona spans, still includes cache traffic);
+only the temporary value used for the USD calculation is reduced by the cached
+tokens, and cache reads and writes are then priced separately at their own rates:
 
 - **Cache reads** are billed at the model's input rate × `cachedInputDiscount`
   (`0.1×`) — a cached input token costs a tenth of a fresh one.
 - **Cache writes** are billed at the input rate × `cacheWriteMultiplier`, keyed
   by the span's `hub.cache_ttl`: `5m → 1.25×`, `1h → 2×`, `default → 1.25×`
   (used when the ttl is absent/unknown, e.g. coding-CLI usage records).
-- `inputTokens` excludes cached tokens; cache-read and cache-write tokens are
-  tracked separately and all three are totaled into `tokens.total`.
+- `inputTokens` excludes cached tokens (uncached input only); cache-read and
+  cache-write tokens are tracked separately and all three are totaled into
+  `tokens.total`.
 
 **Card / summarize fields** — each engine and `byModel` bucket carries
 `cacheRead` and `cacheWrite` (input tokens); the card exposes `cost.cacheHitRate`

@@ -1,15 +1,17 @@
-# Workflow Pipeline — Architecture & Decision Log
+# AgentCore Hub — Architecture & Decision Log
+
+> Agent fleet detail (personas, tools, skills, coding-CLI delegation): [`workflow/agent-fleet.md`](workflow/agent-fleet.md). Module map: [`MODULES.md`](MODULES.md).
 
 > **Purpose**: Single source of truth for architecture decisions in the workflow pipeline. Prevents circular revisiting of solved problems.
 >
 > **Component**: `src/components/workflow/WorkflowBoard.tsx` + backend event system
-> **Runtime**: `deploy/runtime-agent/main.py` (all 14 agents)
+> **Runtime**: `deploy/runtime-agent/main.py` (all 15 fleet runtime agents)
 > **Orchestrator**: `lambda/orchestrator/index.mjs` (handles both DynamoDB Stream events and Jira webhook invocations)
 > **Provider switch**: `TICKET_PROVIDER=dynamodb|jira` (env var on the orchestrator Lambda)
 
 ---
 
-## Current Architecture (as of 2026-05-19)
+## Current Architecture
 
 ### Mode: DynamoDB (TICKET_PROVIDER=dynamodb)
 
@@ -150,6 +152,8 @@ All orchestration decisions happen in the Lambda, triggered by DynamoDB Streams.
 
 ## Decision Log
 
+> **Parked idea** (from the retired legacy log): consolidate the two ticket Lambdas (`agentcore-hub-jira`, `agentcore-hub-tickets`) — which today expose an identical `Tickets___*` interface — into a single router that picks the backend by `TICKET_PROVIDER`. Proposed 2026-05-26, never adopted; the dual-Lambda design is still current.
+
 ### DL-001: Non-Streaming Agent Invocation
 
 **Date**: 2026-05-12 (commit `f311ed5`)
@@ -197,7 +201,7 @@ All orchestration decisions happen in the Lambda, triggered by DynamoDB Streams.
 PK: workflowId (S)
 SK: eventId (S) — format: "{timestamp_ms}-{random_4char}"
 GSI: none (single-workflow queries only)
-TTL: expiresAt (7 days)
+TTL: none - the 7-day TTL shown here was retired (see DL-014); events persist forever
 ```
 
 ---
@@ -631,7 +635,11 @@ QA flips to "todo" → Stream fires → QA re-invoked
 QA re-verifies (same checks)
   - Pass → report_completion
   - Fail → create another fix ticket (up to 3 cycles)
-  - 3 cycles exhausted → report_completion with "ESCALATE:" prefix
+  - 3 cycles exhausted → file ONE `human:engineer` gate ticket, park your own
+    ticket on it, and exit WITHOUT report_completion (SUPERSEDED 2026-09-09
+    by the DL-024 Amendment below; the old "ESCALATE:" report_completion was
+    a verdict-blind hole - workflow-output Dones a reported ticket regardless
+    of the summary, so the cascade shipped the escalation onward)
 ```
 
 **Key design decisions**:
@@ -789,6 +797,28 @@ role) → coding-runtime image → fleet image, as two merges in that order.
 `surfaces.json` promotes the fleet before the coding runtime, so shipping both in
 one merge would put the new fleet live against an old runtime. Rollback: fleet
 image first, or both together.
+
+---
+
+### DL-027: Dark Dispatch / Cascade / Event / Gate Flags (off by default, byte-identical no-ops)
+
+**Date**: 2026-09-11
+**Decision**: Record the four orchestrator env flags added by the 2026-09 resilience / hygiene work that ship DARK - allow-listed in `scripts/orchestrator-env.allow` and wired in code, but resolving to OFF unless an operator explicitly enables them. This satisfies the DL-009 governance rule that every name added to the orchestrator env allow-list carries a DL entry in this file.
+**Status**: ACTIVE - all four default OFF in prod
+
+Each flag is a safe-rollout knob for a fix that a blueprint or ticket-tools change could not fully close on its own. Each is written so the OFF path is BYTE-IDENTICAL to pre-flag behavior (zero extra DynamoDB I/O); the flag exists only so the behavior can be shadowed, then enforced, under an operator's control. None decides *what work happens next* on its own (DL-009) - they harden the dispatch / cascade / event-write / gate plumbing the orchestrator already owns.
+
+| Flag | Purpose (when enabled) | Values (default = off/dark) |
+|------|------------------------|-----------------------------|
+| `CASCADE_EXTENDED_STATES` | When a dependent's LAST blocker resolves while it is ALREADY moving, also handle it: `in_progress` -> lease-guarded nudge (live lease) or steal + re-dispatch (stale lease); `in_review` -> re-wake the parked human-review gate. (TEAM-3618 D3 / TEAM-3747 D1) | `off` (default) \| `shadow` (metrics only, zero writes) \| `enforce`. `off` short-circuits in `cascade.mjs` before any extra read. |
+| `LEVEL_TRIGGER_DISPATCH` | In `enforce`, the done-cascade invokes a newly-unblocked dependent in-process instead of waiting for its Ready webhook - closes the dispatch dead-zone. (TEAM-4060) | `off` (default) \| `shadow` \| `enforce`. |
+| `EVENT_DEDUPE_MODE` | Collapses the events-table double-write: in `enforce` the `eventId` is derived from event CONTENT, so the EventBridge copy (via `events-writer.mjs`) overwrites the direct copy - one row per event instead of two. Must agree across all three writers. (TEAM-4120 FR-2) | `off` (default) \| `enforce`. STRICT allow-list: `shadow` / legacy truthies resolve to `off`. |
+| `GATE_STATE_GUARD` | Human review-gate state machine: record `requested` when a gate is parked for a human, and admit a `-> blocked` as a rejection ONLY for a gate actually sitting in `requested` - drops the creation-time / redelivered / never-presented `blocked` edges that otherwise masquerade as "Request changes". (TEAM-4120 FR-1) | `off` (default) \| `shadow` (records state + `gate.reject_ignored{wouldDrop:true}`, drops nothing) \| `enforce`. STRICT allow-list: the dangerous failure is dropping a real rejection. |
+
+**Why dark by default**: an unset install (prod today) must perform ZERO extra reads/writes and behave exactly as it did before the flag existed, so `off` is the ONLY value guaranteed byte-identical. For the cascade and gate flags `shadow` is deliberately NOT byte-identical (it issues extra reads / populates a ledger), so `shadow` and `enforce` are granted only on an explicit, recognized value; a typo or a legacy truthy can never silently turn a flag on.
+
+**Enabling one**: set the var on the orchestrator Lambda (and, for `EVENT_DEDUPE_MODE`, on the agent-invoker and events-writer too - `deploy.sh` forwards it to all three). Instant rollback = set it back to `off`.
+
 
 ### DL-012: System Prompts Baked at Deploy Time (Not Passed at Invocation)
 

@@ -4,13 +4,15 @@
 # pipeline's NARROW IAM role (no laptop, no tycenj-prod profile, Jira creds never
 # touched — the role literally cannot UpdateFunctionConfiguration). Consumes the
 # Build stage's artifacts by digest; it never rebuilds. See
-# docs/cicd-pipeline-module-design.md.
+# docs/pipeline/design.md.
 #
 # Which surfaces deploy is decided by deploy/pipeline/plan-surfaces.py from the
 # Build stage's changed-files.txt — code pushes only. Infra scripts (IAM, env,
 # tables, runtime images) are HANDOFF: the app + surfaces ship, the baseline
-# advances, then the action exits 2 so the release manager reports the human
-# step. Before the manifest existed the pipeline shipped 3 of ~14 surfaces and
+# advances, then the handoff files are recorded as an S3 marker and the action
+# exits 0 (Pipeline___get_state surfaces it as `handoff` on a succeeded run) so
+# green means deployed-and-verified — it no longer exits 2 (#464). Before the
+# manifest existed the pipeline shipped 3 of ~14 surfaces and
 # everything else drifted behind main for days (audit 2026-09-04).
 #
 # The entire deploy runs inside ONE build-phase block with a bash `trap` so that

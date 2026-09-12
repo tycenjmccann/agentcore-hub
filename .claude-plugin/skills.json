@@ -1,5 +1,5 @@
 {
-  "_comment": "Curated Claude Code skills/plugins per fleet persona. Sourced from 14 parallel research agents (see docs/skills-research-report.md). Edit freely. License followups must be resolved before baking into the redistributed Docker image.",
+  "_comment": "Curated Claude Code skills/plugins per fleet persona. Sourced from 14 parallel research agents. Edit freely. License followups must be resolved before baking into the redistributed Docker image.",
   "_schema_version": "0.1.0",
   "_install_methods": {
     "marketplace_plugin": "/plugin marketplace add <owner>/<repo>; /plugin install <name>@<marketplace>",

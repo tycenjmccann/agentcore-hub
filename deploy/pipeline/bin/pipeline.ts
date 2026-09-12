@@ -5,7 +5,7 @@
  * Self-contained: this CDK app imports NOTHING from the hub's `src/`. Deploying
  * it is entirely optional — a forker who never runs `cdk deploy` here gets the
  * hub with zero pipeline, and the app still passes `tsc --noEmit` + `npm run
- * build`. See docs/cicd-pipeline-module-design.md.
+ * build`. See docs/pipeline/design.md.
  *
  * All account-specific values come from env (mirrors deploy/config.sh):
  *   CDK_DEFAULT_ACCOUNT / CDK_DEFAULT_REGION  — from the active credentials
@@ -39,7 +39,7 @@ if (!account) {
 if (!githubOwner) {
   throw new Error(
     "PIPELINE_GITHUB_OWNER is unset. Set it (and optionally PIPELINE_GITHUB_REPO, default 'agentcore-hub') " +
-      "so the pipeline knows which GitHub repo to build. See docs/cicd-pipeline-module-design.md."
+      "so the pipeline knows which GitHub repo to build. See docs/pipeline/design.md."
   );
 }
 
