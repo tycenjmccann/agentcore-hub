@@ -251,6 +251,10 @@ export interface WorkflowState {
   cancelledAt?: string;
   /** Phase the workflow was in before cancellation (for audit) */
   previousPhase?: WorkflowPhase;
+  /** Timestamp the start route stamped phase=error at (see src/app/api/workflow/start/route.ts). */
+  erroredAt?: string;
+  /** Timestamp the orchestrator's stale-completion takeover CAS is keyed on (see lambda/orchestrator/workflow-store.mjs). */
+  finalizedAt?: string;
   /**
    * How the run was delivered, written by the orchestrator at completion.
    * "cd" — the repo is in the CD registry: the ship phase merged + deployed.

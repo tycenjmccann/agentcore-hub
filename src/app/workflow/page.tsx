@@ -7,6 +7,7 @@ import WorkflowManagerChat from "@/components/workflow/WorkflowManagerChat";
 import IntakeForm from "@/components/workflow/IntakeForm";
 import PerformanceCard from "@/components/workflow/PerformanceCard";
 import { type WorkflowState, type WorkflowInput, type HumanNotification, isTerminalPhase } from "@/lib/workflow/types";
+import { byFinishedDesc, byActiveThenStartedDesc } from "@/lib/workflow/run-order";
 import { mergeCommitOf, isAwaitingHuman, waitingApprovalShas } from "@/lib/workflow/deploy-gate";
 import { WORKFLOW_DEFS, DEFAULT_WORKFLOW_DEF_ID, getWorkflowDef } from "@/lib/workflow/workflow-defs";
 import { resolveSdlcFramework, sdlcBadgeFor } from "@/lib/workflow/sdlc-framework";
@@ -19,6 +20,11 @@ interface WorkflowSummary {
   input: { title: string; description: string };
   startedAt: string;
   completedAt?: string;
+  /** Finish signals for cancelled/errored runs (TEAM-4504) — same "list API projects
+   *  nothing" reasoning as the other fields below; used by byFinishedDesc for Past order. */
+  cancelledAt?: string;
+  erroredAt?: string;
+  finalizedAt?: string;
   workflowType?: "feature" | "bug";
   workflowDefId?: string;
   sdlcFramework?: "playbook" | "aidlc";
@@ -229,6 +235,9 @@ export default function WorkflowPage() {
           input: { title: w.input?.title || "(untitled)", description: w.input?.description || "" },
           startedAt: w.startedAt || "",
           completedAt: w.completedAt,
+          cancelledAt: w.cancelledAt,
+          erroredAt: w.erroredAt,
+          finalizedAt: w.finalizedAt,
           workflowType: w.workflowType,
           workflowDefId: w.workflowDefId,
           // The summary is a client-side pick of the raw DDB item (the list API
@@ -242,13 +251,7 @@ export default function WorkflowPage() {
         }))
         .filter((w: WorkflowSummary) => w.id);
       // Sort: active first, then by date descending
-      list.sort((a, b) => {
-        const aActive = a.phase !== "complete" && a.phase !== "error" && a.phase !== "cancelled";
-        const bActive = b.phase !== "complete" && b.phase !== "error" && b.phase !== "cancelled";
-        if (aActive && !bActive) return -1;
-        if (!aActive && bActive) return 1;
-        return new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime();
-      });
+      list.sort(byActiveThenStartedDesc);
       setWorkflows(list);
     } catch { /* silent */ }
   }, []);
@@ -345,7 +348,11 @@ export default function WorkflowPage() {
       if (aWaiting !== bWaiting) return bWaiting - aWaiting;
       return new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime();
     });
-  const pastWorkflows = filtered.filter((w) => isTerminalPhase(w.phase));
+  // TEAM-4504: Past reads newest-finished first, not newest-started — a run
+  // that started long ago but finished recently belongs at the top.
+  const pastWorkflows = filtered
+    .filter((w) => isTerminalPhase(w.phase))
+    .sort(byFinishedDesc);
 
   const handleSelectWorkflow = (id: string) => {
     setSelectedId(id);
@@ -454,13 +461,7 @@ export default function WorkflowPage() {
         setWorkflows((prev) => {
           const updated = [...prev, targetWorkflow];
           // Re-sort: active first, then by date descending
-          updated.sort((a, b) => {
-            const aActive = a.phase !== "complete" && a.phase !== "error" && a.phase !== "cancelled";
-            const bActive = b.phase !== "complete" && b.phase !== "error" && b.phase !== "cancelled";
-            if (aActive && !bActive) return -1;
-            if (!aActive && bActive) return 1;
-            return new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime();
-          });
+          updated.sort(byActiveThenStartedDesc);
           return updated;
         });
       }
