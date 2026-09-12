@@ -63,6 +63,27 @@ export function byActiveThenStartedDesc(a: RunTimesWithPhase, b: RunTimesWithPha
   return startedAtMs(b) - startedAtMs(a);
 }
 
+/**
+ * Active list order (TEAM-4403): runs blocked on a person float to the top,
+ * then newest-started first within each group. The awaiting-human test is passed
+ * in rather than imported so this stays a pure ordering helper — the caller owns
+ * the parked-execution SHAs (see isAwaitingHuman in ./deploy-gate).
+ *
+ * Behaviour matches the comparator this replaces in src/app/workflow/page.tsx;
+ * `startedAtMs` additionally makes a missing/unparseable `startedAt` sort as 0
+ * instead of NaN, exactly as byActiveThenStartedDesc above already does.
+ */
+export function byAwaitingHumanThenStartedDesc<T extends RunTimes>(
+  isAwaiting: (w: T) => boolean
+): (a: T, b: T) => number {
+  return (a, b) => {
+    const aWaiting = isAwaiting(a) ? 1 : 0;
+    const bWaiting = isAwaiting(b) ? 1 : 0;
+    if (aWaiting !== bWaiting) return bWaiting - aWaiting;
+    return startedAtMs(b) - startedAtMs(a);
+  };
+}
+
 /** Rank used for the Dynamo top-50 cut: a run survives if it's recently active OR recently finished. */
 export function listRankMs(w: RunTimes): number {
   return Math.max(startedAtMs(w), finishedAtMs(w));

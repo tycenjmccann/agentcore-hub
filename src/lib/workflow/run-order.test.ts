@@ -4,10 +4,12 @@ import {
   startedAtMs,
   byFinishedDesc,
   byActiveThenStartedDesc,
+  byAwaitingHumanThenStartedDesc,
   listRankMs,
   type RunTimes,
   type RunTimesWithPhase,
 } from "@/lib/workflow/run-order";
+import { isAwaitingHuman } from "@/lib/workflow/deploy-gate";
 
 describe("finishedAtMs precedence", () => {
   it("completedAt beats startedAt", () => {
@@ -115,6 +117,70 @@ describe("byActiveThenStartedDesc (unchanged Active behaviour)", () => {
     const late: RunTimesWithPhase = { phase: "complete", startedAt: "2026-01-02T00:00:00Z", completedAt: "2026-01-02T01:00:00Z" };
     // late started after early, so late still sorts first — completedAt plays no role.
     expect(byActiveThenStartedDesc(late, early)).toBeLessThan(0);
+  });
+});
+
+describe("byAwaitingHumanThenStartedDesc (Active list order, TEAM-4403)", () => {
+  // Mirrors the Active list in src/app/workflow/page.tsx: rows blocked on a person
+  // float to the top, then newest-started first inside each group.
+  const openGate = { id: "n1", type: "review_needed", acknowledged: false };
+  const SHA = "a".repeat(40);
+
+  /** The subset of WorkflowSummary the Active comparator + isAwaitingHuman read. */
+  type Row = RunTimes & {
+    id: string;
+    humanNotifications?: { id: string; type: string; acknowledged: boolean }[];
+    mergeCommit?: string;
+  };
+
+  it("awaiting-human rows float first even when they started earliest", () => {
+    const waitingOld: Row = { id: "waiting-old", startedAt: "2026-01-01T00:00:00Z", humanNotifications: [openGate] };
+    const runningNew: Row = { id: "running-new", startedAt: "2026-01-09T00:00:00Z" };
+    const sorted = [runningNew, waitingOld]
+      .sort(byAwaitingHumanThenStartedDesc((w) => isAwaitingHuman(w, [])))
+      .map((w) => w.id);
+    expect(sorted).toEqual(["waiting-old", "running-new"]);
+  });
+
+  it("orders startedAt desc within the waiting group and within the running group", () => {
+    const rows: Row[] = [
+      { id: "run-old", startedAt: "2026-01-02T00:00:00Z" },
+      { id: "wait-old", startedAt: "2026-01-01T00:00:00Z", humanNotifications: [openGate] },
+      { id: "run-new", startedAt: "2026-01-04T00:00:00Z" },
+      { id: "wait-new", startedAt: "2026-01-03T00:00:00Z", humanNotifications: [openGate] },
+    ];
+    const sorted = rows
+      .sort(byAwaitingHumanThenStartedDesc((w) => isAwaitingHuman(w, [])))
+      .map((w) => w.id);
+    expect(sorted).toEqual(["wait-new", "wait-old", "run-new", "run-old"]);
+  });
+
+  it("a parked deploy execution (mergeCommit in approvalShas) also floats", () => {
+    const parked: Row = { id: "parked", startedAt: "2026-01-01T00:00:00Z", mergeCommit: SHA };
+    const running: Row = { id: "running", startedAt: "2026-01-09T00:00:00Z" };
+    // Same rows, no parked SHAs → no float, so ordering falls back to startedAt desc.
+    expect(
+      [parked, running].sort(byAwaitingHumanThenStartedDesc((w) => isAwaitingHuman(w, []))).map((w) => w.id)
+    ).toEqual(["running", "parked"]);
+    expect(
+      [running, parked].sort(byAwaitingHumanThenStartedDesc((w) => isAwaitingHuman(w, [SHA]))).map((w) => w.id)
+    ).toEqual(["parked", "running"]);
+  });
+
+  it("ignores completedAt — Active ordering is startedAt-based only", () => {
+    const a = { id: "a", startedAt: "2026-01-01T00:00:00Z", completedAt: "2026-06-01T00:00:00Z" };
+    const b = { id: "b", startedAt: "2026-01-02T00:00:00Z", completedAt: "2026-02-01T00:00:00Z" };
+    // b started later, so b leads despite a's much later completedAt.
+    expect(
+      [a, b].sort(byAwaitingHumanThenStartedDesc(() => false)).map((w) => w.id)
+    ).toEqual(["b", "a"]);
+  });
+
+  it("degenerate startedAt sorts as 0 rather than NaN", () => {
+    const rows = [{ id: "blank", startedAt: "" }, { id: "good", startedAt: "2026-01-01T00:00:00Z" }];
+    const cmp = byAwaitingHumanThenStartedDesc<(typeof rows)[number]>(() => false);
+    for (const a of rows) for (const b of rows) expect(Number.isFinite(cmp(a, b))).toBe(true);
+    expect([...rows].sort(cmp).map((w) => w.id)).toEqual(["good", "blank"]);
   });
 });
 

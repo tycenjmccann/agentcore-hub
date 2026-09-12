@@ -7,7 +7,7 @@ import WorkflowManagerChat from "@/components/workflow/WorkflowManagerChat";
 import IntakeForm from "@/components/workflow/IntakeForm";
 import PerformanceCard from "@/components/workflow/PerformanceCard";
 import { type WorkflowState, type WorkflowInput, type HumanNotification, isTerminalPhase } from "@/lib/workflow/types";
-import { byFinishedDesc, byActiveThenStartedDesc } from "@/lib/workflow/run-order";
+import { byFinishedDesc, byActiveThenStartedDesc, byAwaitingHumanThenStartedDesc } from "@/lib/workflow/run-order";
 import { mergeCommitOf, isAwaitingHuman, waitingApprovalShas } from "@/lib/workflow/deploy-gate";
 import { WORKFLOW_DEFS, DEFAULT_WORKFLOW_DEF_ID, getWorkflowDef } from "@/lib/workflow/workflow-defs";
 import { resolveSdlcFramework, sdlcBadgeFor } from "@/lib/workflow/sdlc-framework";
@@ -342,12 +342,7 @@ export default function WorkflowPage() {
   // date-descending order.
   const activeWorkflows = filtered
     .filter((w) => !isTerminalPhase(w.phase))
-    .sort((a, b) => {
-      const aWaiting = isAwaitingHuman(a, approvalShas) ? 1 : 0;
-      const bWaiting = isAwaitingHuman(b, approvalShas) ? 1 : 0;
-      if (aWaiting !== bWaiting) return bWaiting - aWaiting;
-      return new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime();
-    });
+    .sort(byAwaitingHumanThenStartedDesc((w) => isAwaitingHuman(w, approvalShas)));
   // TEAM-4504: Past reads newest-finished first, not newest-started — a run
   // that started long ago but finished recently belongs at the top.
   const pastWorkflows = filtered
