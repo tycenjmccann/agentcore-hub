@@ -223,8 +223,15 @@ phases:
               || { echo "docker: dockerd failed to come up within 60s"; cat /tmp/dockerd.log; exit 1; }
             echo "docker: daemon up"
           fi
-          aws ecr get-login-password --region "$AWS_REGION_HUB" \
-            | docker login --username AWS --password-stdin "${ACCOUNT_ID}.dkr.ecr.${AWS_REGION_HUB}.amazonaws.com" \
+          # TEAM-4493: pipefail scoped to THIS pipe via a subshell. Without it the `||`
+          # guard sees only `docker login`'s status, so a failed
+          # `aws ecr get-login-password` was masked (safe today only because docker/cli
+          # rejects an empty --password-stdin). Deliberately scoped to only this one
+          # pipe, not a block-wide pipefail option, and not errexit either -- as the
+          # comments above say, CodeBuild runs every command of a build in ONE shared
+          # shell, so a block-wide flag would change the semantics of every later command.
+          ( set -o pipefail; aws ecr get-login-password --region "$AWS_REGION_HUB" \
+              | docker login --username AWS --password-stdin "${ACCOUNT_ID}.dkr.ecr.${AWS_REGION_HUB}.amazonaws.com" ) \
             || { echo "ECR docker login FAILED"; exit 1; }
           # Build the image from the CANDIDATE roster with only the live runtimeArns
           # merged in — NOT the stale deployed S3 doc (Codex #263 round-4 P1). This
@@ -282,7 +289,7 @@ phases:
           if [ -n "$LAST_DEPLOYED" ] && git cat-file -e "${LAST_DEPLOYED}^{commit}" 2>/dev/null; then
             git diff --name-only "${LAST_DEPLOYED}..HEAD" > pipeline-out/changed-files.txt || { echo "changed-files.txt git diff FAILED"; exit 1; }
           else
-            echo "deploy/runtime-agent/FORCE-UNKNOWN-RANGE" > pipeline-out/changed-files.txt
+            echo "deploy/runtime-agent/FORCE-UNKNOWN-RANGE" > pipeline-out/changed-files.txt || { echo "changed-files.txt fallback write FAILED"; exit 1; }
           fi
           # The runtime-image Deploy action runs in PARALLEL and advances its OWN
           # baseline (last-deployed-runtime-sha.txt) only on its own success — so a
@@ -294,7 +301,7 @@ phases:
           if [ -n "$LAST_RT" ] && git cat-file -e "${LAST_RT}^{commit}" 2>/dev/null; then
             git diff --name-only "${LAST_RT}..HEAD" > pipeline-out/changed-files-runtime.txt || { echo "changed-files-runtime.txt git diff FAILED"; exit 1; }
           else
-            echo "deploy/runtime-agent/FORCE-UNKNOWN-RANGE" > pipeline-out/changed-files-runtime.txt
+            echo "deploy/runtime-agent/FORCE-UNKNOWN-RANGE" > pipeline-out/changed-files-runtime.txt || { echo "changed-files-runtime.txt fallback write FAILED"; exit 1; }
           fi
         fi
 
