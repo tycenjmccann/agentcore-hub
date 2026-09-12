@@ -272,8 +272,8 @@ describe("computeKpi — kpi-cases.json parity", () => {
     expect(kpi.quality.capsApplied).toEqual(e.capsApplied);
     expect(kpi.cost.usd).toBe(e.costUsd);
     expect(kpi.version).toBe(FIXTURE.kpiVersion);
-    // PURE: computedAt is the card's own generatedAt, never a clock read — so
-    // rescoring the same card twice is byte-identical.
+    // PURE: computedAt is the card's own generatedAt, never a clock read.
+    // Byte-identical rescoring is proved for real in describe("computeKpi purity").
     expect(kpi.computedAt).toBe(c.card.generatedAt);
     expect(kpi.quality.outcome).toBe(c.card.run?.outcome);
 
@@ -321,6 +321,27 @@ describe("computeKpi — kpi-cases.json parity", () => {
     expect(kpi.quality.outcome).toBe("unknown");
     expect(kpi.cost.usd).toBeNull();
     expect(kpi.computedAt).toBeNull();
+  });
+});
+
+// The NFR-1 pure-function proof, in the second language. The Lambda twin's copy is
+// kpi.test.mjs describe("purity") — same two properties over the same fixture, so a
+// regression on either side fails one of the two suites.
+describe("computeKpi purity", () => {
+  it("the same card scores identically twice, down to every field", () => {
+    for (const c of COMPUTE_CASES) {
+      expect(computeKpi(c.card), c.name).toStrictEqual(computeKpi(c.card));
+    }
+  });
+
+  it("scoring mutates neither the card nor KPI_CONFIG", () => {
+    const configBefore = JSON.stringify(KPI_CONFIG);
+    for (const c of COMPUTE_CASES) {
+      const cardBefore = JSON.stringify(c.card);
+      computeKpi(c.card);
+      expect(JSON.stringify(c.card), c.name).toBe(cardBefore);
+    }
+    expect(JSON.stringify(KPI_CONFIG)).toBe(configBefore);
   });
 });
 
