@@ -674,10 +674,12 @@ const isNum = (v) => typeof v === "number" && Number.isFinite(v);
 /**
  * One component's raw reading and its 0..1 normalization, per §2.1.
  *
- * `normalized` is returned UNCLAMPED on purpose: a run with 12 loops against a
- * tolerance of 8 shows −0.5, which says "half a tolerance past the limit" — the
- * clamp is applied when the points are awarded, so the card can show how far out a
- * run was without letting one bad component eat another's contribution.
+ * `normalized` is returned UNCLAMPED and UNROUNDED on purpose: a run with 12
+ * loops against a tolerance of 8 shows −0.5, which says "half a tolerance past
+ * the limit" — the clamp is applied when the points are awarded, so the card
+ * can show how far out a run was without letting one bad component eat
+ * another's contribution. Per design §3 step 2, only `points` is rounded
+ * (round4); `normalized` is the raw arithmetic result.
  */
 function normalizeComponent(card, c) {
   if (c.kind === "ratio") {
@@ -750,7 +752,7 @@ export function computeKpi(card, config) {
       earned += c.weight * clamped;
       components.push({
         key: c.key, label: c.label, weight: c.weight, raw,
-        normalized: round4(normalized), points: round4(c.weight * clamped), included: true, note: null,
+        normalized, points: round4(c.weight * clamped), included: true, note: null,
       });
     } else {
       excluded.push(c.key);

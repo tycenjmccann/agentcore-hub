@@ -3,7 +3,7 @@
   "kpiVersion": 1,
   "_fixture": {
     "ticket": "TEAM-4477 / TEAM-4479 / TEAM-4484",
-    "what": "The deterministic quality score, case by case. Every `expected` block is hand-derived from src/config/kpi.json (the arithmetic is written out in each case's `derivation`) and is authoritative: if the scorer disagrees with this file, the scorer is wrong. Cards carry values exactly as buildCard emits them — firstPassYield has already been through round4, so 15/18 appears as 0.8333 and firstPass earns 24.999 rather than a clean 25. Cards are minimal (only the paths the scorer and the card-level kpi block read) except `real-full-card`, which is a full v5 card shape so the scorer is proven against the real thing. kind \"compute\" → computeKpi(card, KPI_CONFIG) must deep-equal `expected`; kind \"tolerate\" → readKpi(card) === null, summarize(card).kpi === null, no throw. `expected.costUsd` is the card-level `kpi.cost.usd` (null when dataQuality.costMissing), so the TS mirror can assert the cost slot from the same file rather than restating the card.",
+    "what": "The deterministic quality score, case by case. Every `expected` block is hand-derived from src/config/kpi.json (the arithmetic is written out in each case's `derivation`) and is authoritative: if the scorer disagrees with this file, the scorer is wrong. Cards carry values exactly as buildCard emits them — firstPassYield has already been through round4, so 15/18 appears as 0.8333 and firstPass earns 24.999 rather than a clean 25. Cards are minimal (only the paths the scorer and the card-level kpi block read) except `real-full-card`, which is a full v5 card shape so the scorer is proven against the real thing. kind \"compute\" → computeKpi(card, KPI_CONFIG) must deep-equal `expected`; kind \"tolerate\" → readKpi(card) === null, summarize(card).kpi === null, no throw. `expected.costUsd` is the card-level `kpi.cost.usd` (null when dataQuality.costMissing), so the TS mirror can assert the cost slot from the same file rather than restating the card. `components[].normalized` is UNROUNDED per design §3 step 2 (only `points` is round4'd), so a pin is included only where the exact value is representable in IEEE-754 (e.g. -0.5, 0, 0.5, 0.625, 0.75, 1) — inexact results like 1/3 or 13/18 are asserted via `points` only.",
     "readBy": ["lambda/cost-report/kpi.test.mjs", "src/lib/workflow/performance.test.ts"]
   },
   "cases": [
@@ -281,7 +281,7 @@
           { "key": "firstPass", "points": 30 },
           { "key": "rework", "points": 20 },
           { "key": "loops", "points": 0 },
-          { "key": "stability", "points": 5, "normalized": 0.3333 },
+          { "key": "stability", "points": 5 },
           { "key": "gates", "points": 10 },
           { "key": "ci", "points": 5 }
         ]
@@ -651,8 +651,8 @@
         "outcome": "complete", "excluded": [], "capsApplied": [],
         "costUsd": 21.7433,
         "components": [
-          { "key": "firstPass", "points": 24.999, "normalized": 0.8333 },
-          { "key": "rework", "points": 14.4444, "normalized": 0.7222 },
+          { "key": "firstPass", "points": 24.999 },
+          { "key": "rework", "points": 14.4444 },
           { "key": "loops", "points": 15, "normalized": 0.75 },
           { "key": "stability", "points": 7.5, "normalized": 0.5 },
           { "key": "gates", "points": 10, "normalized": 1 },
