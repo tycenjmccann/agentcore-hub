@@ -29,6 +29,28 @@ legible on the ticket — a human on the other team reads it from the PR.
 
 ---
 
+## Main-sync rule (a branch behind the default branch is NOT a defect)
+"Sync on main" means MERGE, never rebase: `git fetch origin && git checkout
+<branch> && git merge origin/<default branch>` — a merge commit, keeping both
+histories. Never rebase, never force-push, never reset (same semantics as the CI
+agent's P0 sync and operator.md's Mergeability rule).
+Do it in YOUR OWN turn via `claude_code` (`model="fable"`; re-run the same turn
+with `model="opus"` when the merge reports conflicts) and resolve TRIVIAL
+conflicts keeping both sides' intent — imports, formatting, lockfiles, adjacent
+non-overlapping hunks. A branch that is merely behind, or whose `mergeable` is
+`CONFLICTING` only because of that, is NEVER a finding and NEVER a fix ticket.
+Escalate ONLY a NON-TRIVIAL conflict — both sides changed the same behaviour, or
+the resolution needs a product decision / touches logic under review.
+Whether you PUSH the sync commit, and where a non-trivial conflict goes, is
+scoped for your role immediately below.
+
+**Your scope:** you PUSH the sync — it is P0 below, and the SHA you certify must
+be the SHA that would land, so an unpushed merge certifies a commit nobody else
+can see. A NON-TRIVIAL conflict keeps the existing path unchanged: one
+`Fix (sync-main)` ticket with `spawned_by_kind: "sync_fix"` against the newest
+dev, and you park yourself `blocked` on it — a moving default branch is
+environmental, not a review round.
+
 ## Pipeline mode (thin CI-fixer) — only when `PIPELINE_ENABLED`
 
 The build is not yours to run; it is authoritative and already done. Do this:
@@ -47,8 +69,19 @@ branch INTO the run's integration branch first. Via `claude_code` (pass `repo`):
 - Clean (fast-forward or a merge commit) → push, then read the NEW head SHA
   (`git rev-parse HEAD`) and continue to P1 with it.
 - Already up to date → continue to P1.
-- **Conflict** → do NOT resolve it yourself (a behaviour change here is invisible
-  to the reviews that already passed). Abort the merge, then file ONE
+- **Conflict, TRIVIAL** → resolve it in YOUR OWN turn, don't spend a dev round.
+  Re-run the same `claude_code` turn with `model="opus"` (the sync itself runs
+  `model="fable"`) and fix ONLY the tight trivial class: imports, formatting,
+  lockfiles, adjacent non-overlapping hunks. Same default-deny discipline as P2a:
+  whitelist-only, keep BOTH sides' intent, never touch source logic (function
+  bodies, conditionals, test assertions), never hand-edit around a real clash.
+  Commit visibly and attributed
+  (`chore(sync): merge origin/<default branch> into <feature_branch>`), push,
+  re-read the new head SHA (`git rev-parse HEAD`), record it in your report, and
+  continue to P1 with it. If the resolution would touch behaviour the reviews
+  that already passed cannot see, it is NOT trivial — fall to the next lane.
+- **Conflict, NON-TRIVIAL** → do NOT resolve it yourself (a behaviour change here
+  is invisible to the reviews that already passed). Abort the merge, then file ONE
   `Fix (sync-main): merge origin/<default branch> into <feature_branch>` ticket
   against the dev agent whose completion record is newest on this run, with
   `spawned_by_kind: "sync_fix"`, `spawned_by_origin_id: <your CI ticket>`,
@@ -191,7 +224,9 @@ release manager's Merge Brief reads all three off your completion record.
     green check-run are different claims, and only the former is "certified".
   - Do not wave a SHA with no proof of either kind through as PASS.
 
-**`Fix (sync-main)` tickets are yours (P0).** The dev you assign resolves the
+**`Fix (sync-main)` tickets are yours (P0).** A dev only ever receives one for a
+NON-TRIVIAL conflict — a trivial one you resolved yourself in P0, so this ticket
+existing means the merge needs their judgment. The dev you assign resolves the
 conflict the ordinary way — `git fetch origin`, `git merge origin/<default
 branch>` on the integration branch, resolve keeping BOTH sides' intent, push —
 and touches nothing else, since any behaviour change there is invisible to the
@@ -388,3 +423,6 @@ Report with a clear table:
 - If FAIL, create fix tickets grouped by file/component (one per component, not
   per failure), assigned back to the owning dev agent; chain same-file tickets
   with blocked_by so they run serially
+- A branch merely BEHIND the default branch is never a finding and never a fix
+  ticket — P0 syncs it (merge, and resolve the trivial conflicts itself); only a
+  non-trivial conflict becomes a ticket
