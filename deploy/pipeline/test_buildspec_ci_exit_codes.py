@@ -14,6 +14,15 @@ Hermetic: no real venv is created and no pip install runs; python3/pip/pytest ar
 on PATH, and the extracted block's own `/tmp/pyci` is rewritten to a tmp_path before
 execution so a stub `python3 -m venv` can never touch the real venv this test itself may
 be running inside of.
+
+TEAM-4501 adds a second concern to this file: the battery's failures have to be READABLE.
+agentcore-hub-ci cf9317e6 was red on this very block, but the agent-visible CloudWatch tail
+is capped at 300 lines and post_build's `npm audit` report plus CodeBuild's echo of the
+BUILD_APP_IMAGE block consumed all of it, so pytest's own "short test summary info" was
+never visible. The fix is `--junitxml` here plus a final, always-zero post_build command
+that re-prints just the failed ids at the very end of the log; the tests below pin both
+sides of that (including that they agree on the path) and that the summary block can never
+be status-bearing.
 """
 import os
 import re
@@ -25,6 +34,11 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 BUILDSPEC = REPO / "deploy" / "pipeline" / "buildspec-ci.yml"
 CI_WORKFLOW = REPO / ".github" / "workflows" / "ci.yml"
+
+# TEAM-4501: the one path the build-phase battery WRITES and the last post_build command
+# READS. A rename of either side alone silently kills the summary, so the tests below pin
+# that both blocks carry this exact string.
+JUNIT_PATH = "/tmp/pytest-battery-junit.xml"
 
 
 def _literal_block(text, anchor):
@@ -47,6 +61,11 @@ def _literal_block(text, anchor):
 def _build_phase(text):
     start = text.index("\n  build:")
     return text[start:text.index("\n  post_build:", start)]
+
+
+def _post_build_phase(text):
+    start = text.index("\n  post_build:")
+    return text[start:text.index("\nartifacts:", start)]
 
 
 def _pytest_block():
@@ -149,10 +168,18 @@ def _run_block(tmp_path, pytest_rc=0, pip_rc=0):
     _write_stub(bin_dir / "pip", _STUB_PIP)
     _write_stub(bin_dir / "pytest", _STUB_PYTEST)
 
-    # The only rewrite made to the real block: point the venv at tmp_path so a stub
-    # `python3 -m venv` can never write into a venv this test process is itself running
-    # inside of (on CodeBuild this file executes inside the real /tmp/pyci venv).
-    block = _pytest_block().replace("/tmp/pyci", str(tmp_path / "pyci"))
+    # The only rewrites made to the real block, both pointing an absolute /tmp path at
+    # tmp_path: the venv, so a stub `python3 -m venv` can never write into a venv this test
+    # process is itself running inside of (on CodeBuild this file executes inside the real
+    # /tmp/pyci venv), and TEAM-4501's --junitxml, so this cannot clobber the REAL junit xml
+    # the surrounding battery is writing. The pytest stub ignores its args and writes no file
+    # today; the rewrite makes that structural rather than a property of the stub. The two
+    # strings are disjoint prefixes ("/tmp/pyc" vs "/tmp/pyt"), so the order is irrelevant.
+    block = (
+        _pytest_block()
+        .replace(JUNIT_PATH, str(tmp_path / "junit.xml"))
+        .replace("/tmp/pyci", str(tmp_path / "pyci"))
+    )
 
     env = dict(os.environ, PATH=f"{bin_dir}:{os.environ['PATH']}")
     if pytest_rc:
@@ -436,3 +463,120 @@ def test_build_image_block_writes_the_sentinel_on_an_unknown_range(tmp_path):
     # the runtime sentinel took its else branch too and landed at the real relative path
     assert (tmp_path / "pipeline-out" / "changed-files-runtime.txt").read_text().strip() \
         == "deploy/runtime-agent/FORCE-UNKNOWN-RANGE"
+
+
+# ── TEAM-4501: the failed ids must be READABLE in the 300-line tail ──────────
+#
+# cf9317e6 was red on the build-phase battery above, yet nobody could see WHICH tests
+# failed: the tail is 300 lines, npm audit's report (~150) plus CodeBuild's echo of the
+# BUILD_APP_IMAGE block (~120) fill it, and every logs:* / codebuild:BatchGetBuilds API is
+# denied to the agent role. So the battery now writes a junit xml and the LAST post_build
+# command re-prints just the failures at the very end of the log.
+#
+# Anchored on the summary's own print text, NOT on JUNIT_PATH: _literal_block takes the
+# FIRST line containing the anchor and walks BACKWARD to the nearest `- |`, and JUNIT_PATH's
+# first occurrence is the build-phase pytest line -- which would extract the wrong block.
+
+
+def _summary_block():
+    return _literal_block(
+        BUILDSPEC.read_text(encoding="utf-8"), "pytest battery summary (from junit xml)"
+    )
+
+
+# ── static shape assertions ──────────────────────────────────────────────────
+
+def test_pytest_invocation_writes_junit_xml():
+    block = _pytest_block()
+    assert re.search(r"pytest -q[^\n]*--junitxml=/tmp/pytest-battery-junit\.xml", block), (
+        "the battery must emit a junit xml on the SAME line as `pytest -q` -- no pipe, no "
+        f"tee, nothing that could change the block's exit status:\n{block}"
+    )
+
+
+def test_summary_block_reads_the_path_pytest_writes():
+    """The invariant that catches a rename of either side on its own."""
+    assert JUNIT_PATH in _pytest_block(), "the battery must write JUNIT_PATH"
+    assert JUNIT_PATH in _summary_block(), "the post_build summary must read JUNIT_PATH"
+
+
+def test_summary_block_can_never_change_the_build_result():
+    """Diagnostics only. A red BUILD must stay red and a green one green -- this block is
+    read-only and must carry no `exit` and no un-softened status-bearing command."""
+    block = _summary_block()
+    assert "|| true" in block, f"the summary must be softened with `|| true`:\n{block}"
+    assert not re.search(r"\bexit\b", block), f"the summary must never exit:\n{block}"
+
+
+def test_summary_block_is_the_last_post_build_command():
+    """Its whole value is landing INSIDE the 300-line tail. Any command appended after it
+    would push it back up the log behind that command's own echo."""
+    lines = _post_build_phase(BUILDSPEC.read_text(encoding="utf-8")).splitlines()
+    last_marker = max(i for i, l in enumerate(lines) if l.lstrip().startswith("- "))
+    anchor = next(i for i, l in enumerate(lines) if "pytest battery summary" in l)
+    assert lines[last_marker].strip() == "- |", lines[last_marker]
+    assert last_marker < anchor, (
+        "the summary block must be the LAST post_build command:\n"
+        + "\n".join(lines[last_marker:])
+    )
+
+
+# ── executed: the summary block against real junit xml ───────────────────────
+
+_JUNIT_XML = """<?xml version="1.0" encoding="utf-8"?>
+<testsuites><testsuite name="pytest" errors="1" failures="1" skipped="1" tests="4">
+<testcase classname="deploy.runtime-agent.tests.test_spans" name="test_green" time="0.01"/>
+<testcase classname="deploy.runtime-agent.tests.test_spans" name="test_skipped" time="0.0">\
+<skipped message="needs creds">skipped</skipped></testcase>
+<testcase classname="deploy.runtime-agent.tests.test_spans" name="test_red" time="0.02">\
+<failure message="assert 1 == 2">long traceback nobody can see in the tail</failure></testcase>
+<testcase classname="deploy.pipeline.test_boom" name="test_errored" time="0.03">\
+<error message="fixture 'x' not found">collection error</error></testcase>
+</testsuite></testsuites>
+"""
+
+
+def _run_summary_block(tmp_path, junit_xml=None):
+    """Execute the real block with ONLY JUNIT_PATH rewritten to tmp_path -- same technique as
+    _run_block. Deliberately stubs NOTHING on PATH: unlike the pytest block, this one's whole
+    job is to parse the xml with a real interpreter, so a stubbed python3 would test nothing.
+    The rewrite is what keeps it off the REAL junit xml the surrounding battery is writing."""
+    junit = tmp_path / "pytest-battery-junit.xml"
+    if junit_xml is not None:
+        junit.write_text(junit_xml, encoding="utf-8")
+    block = _summary_block().replace(JUNIT_PATH, str(junit))
+    return subprocess.run(
+        ["bash", "-c", block], capture_output=True, text=True, cwd=str(REPO)
+    )
+
+
+def test_summary_block_is_valid_bash():
+    block = _summary_block()
+    proc = subprocess.run(["bash", "-n", "-c", block], capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_summary_block_lists_every_failed_and_errored_test(tmp_path):
+    proc = _run_summary_block(tmp_path, junit_xml=_JUNIT_XML)
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert "pytest battery summary (from junit xml): 2 failed/errored" in proc.stdout
+    assert "FAILED deploy.runtime-agent.tests.test_spans::test_red -- assert 1 == 2" in proc.stdout
+    assert "FAILED deploy.pipeline.test_boom::test_errored -- fixture 'x' not found" in proc.stdout
+    # passing and SKIPPED tests are not failures -- a skip must not be reported as one
+    assert "test_green" not in proc.stdout
+    assert "test_skipped" not in proc.stdout
+
+
+def test_summary_block_is_a_noop_when_the_junit_xml_is_absent(tmp_path):
+    """The battery may never have run at all (a failed venv/pip exits ahead of it), and
+    post_build still runs. That must print nothing and change nothing."""
+    proc = _run_summary_block(tmp_path)
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert proc.stdout == "", proc.stdout
+
+
+def test_summary_block_survives_a_truncated_junit_xml(tmp_path):
+    """pytest killed mid-write (or a usage error) leaves an unparseable file. The `|| true`
+    must absorb that -- the traceback is itself diagnostic, but the rc must stay 0."""
+    proc = _run_summary_block(tmp_path, junit_xml="<testsuites><testsu")
+    assert proc.returncode == 0, proc.stderr + proc.stdout
