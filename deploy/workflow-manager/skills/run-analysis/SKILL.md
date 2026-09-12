@@ -20,6 +20,15 @@ Read your knowledge file for this workflow definition:
 `s3://$ARTIFACT_BUCKET/workflow-manager/knowledge/<workflowDefId>.md`
 (may not exist yet — that's fine).
 
+`compute_metrics.py` prints `source` first. Check it before you assess anything:
+
+- **`"performance-card@v5"`** — the run has a performance card, and
+  `metrics.kpi` / `metrics.time.*` / `metrics.cost.*` / `metrics.quality.*` are
+  the card's own numbers: the same ones the Workflow tab shows. Cite them.
+- **`"computed"`** — no card (or one too old), so the numbers below were derived
+  from the dossier and there is no deterministic score.
+  `metrics.dataQuality.notes` says why.
+
 ## 2. Assess, with evidence
 
 - **Planning quality** — did the intake agent decompose the request well?
@@ -40,6 +49,41 @@ Read your knowledge file for this workflow definition:
 - If the run was cancelled or errored: lead with why it stopped.
 - If `metrics.managerInterventions` is non-empty, evaluate your own watch
   interventions: did they help?
+
+### When `metrics.source == "performance-card@v5"`
+
+The card carries a **deterministic** 0-100 quality score — pure arithmetic over
+the run's counters, with every weight, tolerance and cap in
+`src/config/kpi.json`. It is reproducible; your `scores.overall` is a judgement.
+Both are wanted, so both are on the record:
+
+- **Cite `metrics.kpi.quality.score` and `metrics.kpi.quality.grade` in the
+  verdict**, and say explicitly whether your `scores.overall` agrees with it.
+- **File a finding when they diverge by more than 15 points**
+  (`kind: "risk"`, `severity: "medium"`): what the arithmetic weighed that you
+  did not, or what you saw that no counter captures. A divergence is a real
+  signal — either the run is unusual or the weights are — and hiding it makes
+  both numbers untrustworthy. Do not adjust `scores.overall` to close the gap.
+- `metrics.kpi.quality.confidence` is `full` / `partial` / `insufficient`.
+  `insufficient` means the score is `null` (too little evidence to score the
+  run) — say so instead of citing a score, and never treat `null` as 0.
+- `metrics.kpi.cost.band` / `.time.band` / `.quality.band` are this run against
+  its own workflow def's recent history (`normal` / `warn` / `alert`, with `z`).
+  A `warn`/`alert` band is the strongest "this run was unusual" evidence you have.
+- **Do not re-derive what the card provides.** Read counts and durations from
+  `metrics.quality.*`, `metrics.time.*`, `metrics.cost.*` — not by counting
+  events or tickets yourself. Two numbers for one run is a bug report.
+- Two human-wait numbers exist on purpose and mean different things:
+  `metrics.time.humanWaitMs` is the card's **union** of gate intervals (the real
+  wall-clock the run spent waiting), `metrics.humanWaitTotalMs` is the legacy
+  **sum** over reviews (double-counts overlapping gates). Label whichever you
+  cite. The same holds for the other legacy counters
+  (`changeRequests` is a dict of cycles, `metrics.quality.changeRequests` is the
+  card's count) — cite the card's and say so, never average the two.
+
+When `metrics.source == "computed"`, say so in the verdict ("no performance card
+for this run, so these numbers are dossier-derived and there is no deterministic
+score") and omit the score citation entirely — do not invent one.
 
 ## 3. Write the analysis
 
@@ -85,7 +129,8 @@ EOF
             "deltas": {"totalDurationMs": null, "humanWaitTotalMs": null,
                        "changeRequests": null, "overallScore": null},
             "notes": "markdown"},
-  "summaryMarkdown": "full report, >= 200 chars"
+  "summaryMarkdown": "full report, >= 200 chars",
+  "kpiVersion": 1
 }
 ```
 
@@ -95,6 +140,13 @@ actionable against something concrete: a workflow def's phases/gates
 (`workflow-def`/`gate-config`), an agent prompt (`prompt`), the org's process
 (`process`), or tooling. `trend.deltas` are this run minus the most recent
 prior run (null when no prior).
+
+`kpiVersion` is the only optional field: copy `metrics.kpiVersion` (`null` when
+there was no card). It records which version of the scoring config produced the
+score you cited, so a run scored under v1 is never compared against a v2 run as
+though the two numbers meant the same thing. `scores` still has EXACTLY its five
+keys — the deterministic score is not a sixth one, and `save_analysis.py`
+rejects the row if you add it there.
 
 ## 4. Save
 
@@ -118,4 +170,6 @@ under ~200 lines — it is your working memory, not an archive.
 ## 6. Report
 
 Reply with a 3-5 line summary: verdict, overall score, top bottleneck, top
-recommendation.
+recommendation. When the run had a card, give both numbers — your
+`scores.overall` and `metrics.kpi.quality.score`/`grade` — and one clause on
+whether they agree.

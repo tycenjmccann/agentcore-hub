@@ -12,6 +12,10 @@ Reads (table/bucket names from env, agentcore-hub defaults):
                        `detail.workflowId || ticketId`, so events like
                        agent.started land under the ticket's PK, not the run's.
   - completions        s3://$ARTIFACT_BUCKET/completions/{ticketId}.json
+  - performance card   s3://$ARTIFACT_BUCKET/workflows/{workflowId}/shared/
+                       performance-card.json (deterministic cost/time/quality
+                       scorecard incl. card.kpi — compute_metrics cites it
+                       instead of recomputing; None when the run has none)
   - artifact listing   s3://$ARTIFACT_BUCKET/workflows/{workflowId}/
   - eval summaries     EVAL_CONFIG_TABLE rows for participating agents
                        (fleet-lifetime rolling scores — NOT per-run)
@@ -273,6 +277,26 @@ def get_completions(ticket_ids):
     return completions
 
 
+def get_performance_card(workflow_id, missing):
+    """The run's performance card, or None.
+
+    Best-effort by design: the card is written by the cost-report Lambda on
+    workflow.complete, so a run that is still live, one that predates the
+    Lambda, or one whose card write failed simply has none — and an analysis
+    must still be possible without it (compute_metrics falls back to computing
+    the counters itself and says so in dataQuality). Only a NON-404 failure
+    earns a missingSignals note; an absent card is normal, not a signal."""
+    key = f"workflows/{workflow_id}/shared/performance-card.json"
+    try:
+        return json.loads(s3.get_object(Bucket=ARTIFACT_BUCKET, Key=key)["Body"].read())
+    except s3.exceptions.NoSuchKey:
+        return None
+    except Exception as e:
+        missing.append(f"performance card unavailable ({key}): {e}")
+        print(f"warn: performance card {workflow_id}: {e}", file=sys.stderr)
+        return None
+
+
 def get_artifacts(workflow_id):
     keys, kwargs = [], {"Bucket": ARTIFACT_BUCKET, "Prefix": f"workflows/{workflow_id}/"}
     truncated = False
@@ -368,6 +392,7 @@ def main():
         missing.append("no phase_change events")
 
     completions = get_completions(ticket_ids)
+    performance_card = get_performance_card(args.workflow_id, missing)
     artifacts, artifacts_truncated = get_artifacts(args.workflow_id)
     if artifacts_truncated:
         missing.append(f"artifact listing capped at {ARTIFACT_LISTING_CAP}")
@@ -391,6 +416,7 @@ def main():
         "events": events,
         "streamCounts": stream_counts,
         "completions": completions,
+        "performanceCard": performance_card,
         "artifacts": artifacts,
         "evalSummaries": eval_summaries,
         "priorAnalyses": prior,
@@ -405,6 +431,9 @@ def main():
         "tickets": len(tickets),
         "events": len(events),
         "completions": len(completions),
+        # The card's reportVersion, or None when the run has no card — that is
+        # what decides whether compute_metrics runs card-first (needs >= 5).
+        "performanceCardVersion": performance_card.get("reportVersion") if performance_card else None,
         "artifacts": len(artifacts),
         "priorAnalyses": len(prior),
         "missingSignals": missing,

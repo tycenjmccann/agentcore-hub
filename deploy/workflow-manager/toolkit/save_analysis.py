@@ -95,6 +95,37 @@ def to_ddb(obj):
     return obj
 
 
+def build_item(workflow_id, analysis_id, analysis, metrics, dossier, trigger):
+    """The analyses-table row. Pure (no AWS, no clock beyond analyzedAt) so the
+    mapping decisions in it — the runOutcome fallback and the kpiVersion
+    provenance — are unit-testable without a workspace."""
+    phase = (dossier.get("workflow") or {}).get("phase", "complete")
+    return {
+        "workflowId": workflow_id,
+        "analysisId": analysis_id,
+        "schemaVersion": SCHEMA_VERSION,
+        # Which version of src/config/kpi.json produced metrics.kpi (TEAM-4484).
+        # A weights change bumps it, so a row scored under v1 is never compared
+        # against a v2 row as though the two numbers meant the same thing. None
+        # when the run had no v5 card and the scores are the LLM's alone.
+        "kpiVersion": metrics.get("kpiVersion") or analysis.get("kpiVersion") or None,
+        "workflowDefId": dossier.get("workflowDefId") or "software-delivery",
+        "epicId": dossier.get("epicId"),
+        "analyzedAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "trigger": trigger,
+        "runOutcome": phase if phase in RUN_OUTCOMES else "complete",
+        "model": MODEL_ID,
+        "s3Prefix": f"workflows/{workflow_id}/analysis/{analysis_id}/",
+        "metrics": metrics,
+        "scores": analysis["scores"],
+        "verdict": analysis["verdict"],
+        "findings": analysis["findings"],
+        "recommendations": analysis["recommendations"],
+        "trend": analysis["trend"],
+        "summaryMarkdown": analysis["summaryMarkdown"],
+    }
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("workflow_id")
@@ -112,31 +143,9 @@ def main():
 
     validate(analysis)
 
-    workflow = dossier.get("workflow") or {}
-    phase = workflow.get("phase", "complete")
-    run_outcome = phase if phase in RUN_OUTCOMES else "complete"
     analysis_id = f"{int(time.time() * 1000)}-{''.join(random.choices(string.ascii_lowercase + string.digits, k=4))}"
-    s3_prefix = f"workflows/{args.workflow_id}/analysis/{analysis_id}/"
-
-    item = {
-        "workflowId": args.workflow_id,
-        "analysisId": analysis_id,
-        "schemaVersion": SCHEMA_VERSION,
-        "workflowDefId": dossier.get("workflowDefId") or "software-delivery",
-        "epicId": dossier.get("epicId"),
-        "analyzedAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-        "trigger": args.trigger,
-        "runOutcome": run_outcome,
-        "model": MODEL_ID,
-        "s3Prefix": s3_prefix,
-        "metrics": metrics,
-        "scores": analysis["scores"],
-        "verdict": analysis["verdict"],
-        "findings": analysis["findings"],
-        "recommendations": analysis["recommendations"],
-        "trend": analysis["trend"],
-        "summaryMarkdown": analysis["summaryMarkdown"],
-    }
+    item = build_item(args.workflow_id, analysis_id, analysis, metrics, dossier, args.trigger)
+    s3_prefix = item["s3Prefix"]
 
     s3 = boto3.client("s3", region_name=REGION)
     for name, payload in (
