@@ -14,7 +14,7 @@ import json
 import os
 import re
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 # Sibling module in this same toolkit dir. Running as a script already puts that
@@ -135,10 +135,28 @@ def iso(dt):
     return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z") if dt else None
 
 
+def _utc_span(start, end):
+    # .astimezone(timezone.utc) on BOTH sides before subtracting, always — not
+    # an optional safety net. Two aware datetimes that share the exact same
+    # ZoneInfo object (e.g. two local instants split_wait_by_window derives
+    # from the same business window) hit datetime's "same tzinfo attribute →
+    # ignore it and subtract naively" fast path, which silently answers with
+    # wall-clock elapsed time instead of real elapsed time across a DST
+    # transition — off by exactly the jump (TEAM-4453 D3 caught this on a
+    # Saturday-through-Monday split spanning 2026-03-08). Callers that need
+    # a millisecond count still floor-divide this exact timedelta themselves
+    # (see ms_between) rather than repeating the UTC conversion.
+    return end.astimezone(timezone.utc) - start.astimezone(timezone.utc)
+
+
 def ms_between(start, end):
     if start is None or end is None:
         return None
-    return max(0, int((end - start).total_seconds() * 1000))
+    # Floor-divide the exact timedelta, not int(total_seconds() * 1000) — that
+    # route through a float loses sub-millisecond precision (a real 33,126,484
+    # ms span comes back as 33126483.999999996) and silently truncates the
+    # result down by a whole millisecond (TEAM-4457 F-1 / R15).
+    return max(0, _utc_span(start, end) // timedelta(milliseconds=1))
 
 
 def events_of(events, *types):
@@ -203,6 +221,57 @@ def is_outside_hours(dt, window):
     tz, start, end = window
     local = dt.astimezone(tz)
     return local.weekday() >= 5 or not (start <= local.hour < end)
+
+
+def split_wait_by_window(start, end, window):
+    """Split ms_between(start, end) into (in_ms, out_ms) by walking local
+    calendar days of `window` (the same (tz, start_hour, end_hour) tuple
+    `is_outside_hours` consumes). A day is wholly outside on a weekend;
+    otherwise [00:00, start_hour) and [end_hour, 24:00) are outside and
+    [start_hour, end_hour) is in — end_hour == 24 means open through
+    midnight, so that day has no outside tail.
+
+    None, None when either bound is missing (an unknown split must not read
+    as zero). (0, 0), not None, when both are present and end <= start — a
+    zero-length or inverted span really did spend 0ms either side.
+
+    Invariant: in_ms + out_ms == ms_between(start, end) — true BY
+    CONSTRUCTION, not by coincidence. Flooring ms_between per segment (the
+    old approach) is not exact even though each floor looks harmless on its
+    own: a start at 08:59:59.000500 local and an end at 09:00:00.000700 split
+    into two segments at the 09:00 boundary, each of which floors away its
+    own sub-millisecond residue (0.5ms and 0.7ms), for a segment sum 1ms
+    short of the true 1000ms span. So this walks the calendar accumulating
+    only the IN portion as an exact timedelta, then derives out_ms as the
+    remainder against the one true total — the same total ms_between would
+    give the whole span — rather than as its own independently-floored sum
+    (TEAM-4457 F-1 / R15)."""
+    if start is None or end is None:
+        return None, None
+    if end <= start:
+        return 0, 0
+
+    tz, start_hour, end_hour = window
+    in_span = timedelta()
+    cursor = start
+    while cursor < end:
+        local = cursor.astimezone(tz)
+        midnight = local.replace(hour=0, minute=0, second=0, microsecond=0)
+        next_midnight = midnight + timedelta(days=1)
+        day_end = min(end, next_midnight)
+
+        if local.weekday() < 5:
+            opens = midnight.replace(hour=start_hour)
+            closes = next_midnight if end_hour == 24 else midnight.replace(hour=end_hour)
+            business_start = max(cursor, opens)
+            business_end = min(day_end, closes)
+            if business_start < business_end:
+                in_span += _utc_span(business_start, business_end)
+        cursor = day_end
+
+    total_ms = ms_between(start, end)
+    in_ms = in_span // timedelta(milliseconds=1)
+    return in_ms, total_ms - in_ms
 
 
 def compute_phases(events, started, ended, missing):
@@ -299,6 +368,7 @@ def compute_human_reviews(tickets, events, workflow, ended, missing, window=None
             wait = ms_between(requested, resolved)
             if wait:
                 total_wait += wait
+            in_hours_ms, outside_hours_ms = split_wait_by_window(requested, resolved, window)
             reviews.append({
                 "gateTicketId": tid,
                 "reviewer": ticket.get("assignee"),
@@ -306,6 +376,12 @@ def compute_human_reviews(tickets, events, workflow, ended, missing, window=None
                 "requestedAt": iso(requested),
                 "resolvedAt": iso(resolved),
                 "waitMs": wait,
+                # inHoursMs + outsideHoursMs == waitMs; both None exactly when
+                # waitMs is None (TEAM-4453 D3 — split the wait, don't just
+                # flag the request instant, so a review straddling the window
+                # boundary attributes only its own outside slice).
+                "inHoursMs": in_hours_ms,
+                "outsideHoursMs": outside_hours_ms,
                 "outcome": outcome,
                 "cycle": cycle,
                 # Was the human ASKED outside their working hours? Keyed on
@@ -709,6 +785,14 @@ def compute_metrics(dossier):
         "agentTasks": compute_agent_tasks(tickets, events),
         "humanReviews": reviews,
         "humanWaitTotalMs": human_wait,
+        # Split of humanWaitTotalMs by whether the clock was ticking inside or
+        # outside the reviewer's working window — the fix for the same wait
+        # blending "reviewer was asleep" with "reviewer was slow" (TEAM-4453
+        # D3). Summed from the per-review split above, ignoring the None rows.
+        "humanWaitInHoursMs": sum(r["inHoursMs"] for r in reviews if r.get("inHoursMs") is not None),
+        "humanWaitOutsideHoursMs": sum(
+            r["outsideHoursMs"] for r in reviews if r.get("outsideHoursMs") is not None
+        ),
         # How many gate requests landed on a human outside their working hours —
         # the honest denominator for "why did this run wait 7 hours".
         "humanReviewsOutsideHours": sum(1 for r in reviews if r.get("outsideHours")),

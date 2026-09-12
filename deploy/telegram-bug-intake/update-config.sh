@@ -31,8 +31,26 @@
 #                         pipeline ARN, or every approval tap AccessDenies.
 #   CdRegistryRead        s3:GetObject on exactly config/cd-registry.json in
 #                         ARTIFACT_BUCKET — one key, not a prefix.
+#   GateEventPublish      events:PutEvents on exactly the ONE bus the function
+#                         writes to — its EFFECTIVE EVENT_BUS (read back in step
+#                         1b, same reason as the pipeline). The function emits a
+#                         single event type, gate.requested (TEAM-4453 D3), so the
+#                         metrics side can tell "the reviewer was asleep" from
+#                         "the reviewer was slow". Publishing is best-effort in
+#                         index.mjs: until this statement lands, PutEvents
+#                         AccessDenies, the failure is logged, and paging is
+#                         completely unaffected.
 #
 # Usage: ./update-config.sh   (reads AWS credentials + deploy/config.sh env)
+#
+# Optional overrides read from THIS shell (merged only when exported here; the
+# function's existing values otherwise win, and an unset var stays unset so
+# index.mjs uses its own defaults of America/Los_Angeles and 09-18):
+#   WM_BUSINESS_TZ / WM_BUSINESS_HOURS   the reviewer's working window, used ONLY
+#                                        to tag gate.requested and to schedule the
+#                                        one business-hours reminder page. A
+#                                        request-time page is never delayed by it.
+#   EVENT_BUS                            the EventBridge bus (default "default").
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 # shellcheck disable=SC1091
@@ -46,6 +64,9 @@ PIPELINE_REGIONS="${PIPELINE_REGIONS:-$AWS_REGION}"
 # DEPLOY_PIPELINE_NAME, so this is not necessarily the pipeline the function
 # polls — the IAM policy is built from the EFFECTIVE value read back in step 1b.
 DEPLOY_PIPELINE_DEFAULT="${DEPLOY_PIPELINE_NAME:-agentcore-hub-deploy}"
+# Same contract as DEPLOY_PIPELINE_NAME: a DEFAULT only, and the policy is built
+# from the EFFECTIVE value read back in step 1b.
+EVENT_BUS_DEFAULT="${EVENT_BUS:-default}"
 POLICY_NAME="telegram-bug-intake-deploy-approval"
 
 echo "Function:         $FUNCTION"
@@ -53,6 +74,8 @@ echo "Region:           $AWS_REGION"
 echo "Account:          $ACCOUNT_ID"
 echo "Artifact bucket:  $ARTIFACT_BUCKET"
 echo "Deploy pipeline:  $DEPLOY_PIPELINE_DEFAULT (default - the function's existing value wins)"
+echo "Event bus:        $EVENT_BUS_DEFAULT (default - the function's existing value wins)"
+echo "Business window:  ${WM_BUSINESS_TZ:-<function default>} ${WM_BUSINESS_HOURS:-<function default>} (merged only when exported here)"
 echo "IAM fan-out:      hub-*-deploy in $PIPELINE_REGIONS"
 echo
 
@@ -74,6 +97,9 @@ aws lambda get-function-configuration \
   --query 'Environment.Variables' --output json |
   ARTIFACT_BUCKET="$ARTIFACT_BUCKET" \
   DEPLOY_PIPELINE_DEFAULT="$DEPLOY_PIPELINE_DEFAULT" \
+  EVENT_BUS_DEFAULT="$EVENT_BUS_DEFAULT" \
+  WM_BUSINESS_TZ="${WM_BUSINESS_TZ:-}" \
+  WM_BUSINESS_HOURS="${WM_BUSINESS_HOURS:-}" \
   python3 -c '
 import json, os, sys
 
@@ -88,6 +114,20 @@ merged["ARTIFACT_BUCKET"] = os.environ["ARTIFACT_BUCKET"]
 merged["DEPLOY_PIPELINE_NAME"] = (
     (existing.get("DEPLOY_PIPELINE_NAME") or "").strip() or os.environ["DEPLOY_PIPELINE_DEFAULT"]
 )
+# EVENT_BUS (TEAM-4453 D3) is DEFAULTED the same way, for the same reason: the
+# step 1b read-back builds the PutEvents resource from it, so a blank must not
+# reach the policy as a bus-less ARN.
+merged["EVENT_BUS"] = (
+    (existing.get("EVENT_BUS") or "").strip() or os.environ["EVENT_BUS_DEFAULT"]
+)
+# The business window is an operator preference with a working default in
+# index.mjs, so it is merged ONLY when this shell exported it (blank == unset).
+# Absent from both this shell and the function means absent from the env, which
+# is how the function ends up on America/Los_Angeles 09-18.
+for key in ("WM_BUSINESS_TZ", "WM_BUSINESS_HOURS"):
+    override = os.environ.get(key, "").strip()
+    if override:
+        merged[key] = override
 json.dump({"Variables": merged}, sys.stdout)
 ' > "$ENV_FILE"
 
@@ -113,14 +153,24 @@ print(json.load(open(os.environ["ENV_FILE"]))["Variables"]["DEPLOY_PIPELINE_NAME
   echo "DEPLOY_PIPELINE_NAME is empty after the merge - refusing to write a pipeline-less policy" >&2
   exit 1
 }
+EFFECTIVE_EVENT_BUS="$(ENV_FILE="$ENV_FILE" python3 -c '
+import json, os
+print(json.load(open(os.environ["ENV_FILE"]))["Variables"]["EVENT_BUS"])
+')"
+[ -n "$EFFECTIVE_EVENT_BUS" ] || {
+  echo "EVENT_BUS is empty after the merge - refusing to write a bus-less policy" >&2
+  exit 1
+}
 
-echo "Env updated: ARTIFACT_BUCKET set, DEPLOY_PIPELINE_NAME defaulted (existing keys preserved)."
+echo "Env updated: ARTIFACT_BUCKET set, DEPLOY_PIPELINE_NAME + EVENT_BUS defaulted (existing keys preserved)."
 echo "Effective deploy pipeline: $DEPLOY_PIPELINE (script default was $DEPLOY_PIPELINE_DEFAULT)"
+echo "Effective event bus:       $EFFECTIVE_EVENT_BUS (script default was $EVENT_BUS_DEFAULT)"
 
 # ─── 2. Inline role policy (idempotent put-role-policy) ───────────────────────
 POLICY_DOC=$(
   ACCOUNT_ID="$ACCOUNT_ID" AWS_REGION="$AWS_REGION" \
   DEPLOY_PIPELINE="$DEPLOY_PIPELINE" PIPELINE_REGIONS="$PIPELINE_REGIONS" \
+  EFFECTIVE_EVENT_BUS="$EFFECTIVE_EVENT_BUS" \
   ARTIFACT_BUCKET="$ARTIFACT_BUCKET" python3 -c '
 import json, os
 
@@ -129,6 +179,7 @@ home_region = os.environ["AWS_REGION"]
 pipeline = os.environ["DEPLOY_PIPELINE"]
 regions = [r.strip() for r in os.environ["PIPELINE_REGIONS"].split(",") if r.strip()] or [home_region]
 bucket = os.environ["ARTIFACT_BUCKET"]
+event_bus = os.environ["EFFECTIVE_EVENT_BUS"]
 
 pipeline_arn = f"arn:aws:codepipeline:{home_region}:{account}:{pipeline}"
 hub_arns = [f"arn:aws:codepipeline:{r}:{account}:hub-*-deploy" for r in regions]
@@ -161,6 +212,13 @@ policy = {
             "Action": ["s3:GetObject"],
             "Resource": [f"arn:aws:s3:::{bucket}/config/cd-registry.json"],
         },
+        {
+            # gate.requested only, on the ONE bus this function publishes to.
+            "Sid": "GateEventPublish",
+            "Effect": "Allow",
+            "Action": ["events:PutEvents"],
+            "Resource": [f"arn:aws:events:{home_region}:{account}:event-bus/{event_bus}"],
+        },
     ],
 }
 print(json.dumps(policy))
@@ -183,3 +241,4 @@ echo "IAM inline policy '$POLICY_NAME' applied to $ROLE_NAME:"
 echo "  PipelineStateRead (pipeline-level) on $DEPLOY_PIPELINE (effective, $AWS_REGION) + hub-*-deploy ($PIPELINE_REGIONS)"
 echo "  DeployApprovalWrite (action-level, <pipeline>/*) on the same pipelines"
 echo "  CdRegistryRead on s3://$ARTIFACT_BUCKET/config/cd-registry.json"
+echo "  GateEventPublish (events:PutEvents) on event-bus/$EFFECTIVE_EVENT_BUS ($AWS_REGION) - gate.requested"

@@ -32,6 +32,14 @@ const HUB = "https://hub.example.invalid";
 // db.scanPageSize (when set) makes every Scan paginate: pages of N items with
 // LastEvaluatedKey, resumed via ExclusiveStartKey — like a >1MB real table.
 const db = vi.hoisted(() => ({ items: new Map(), puts: [], deletes: [], scanPageSize: 0 }));
+// Publishing gate.requested (TEAM-4453 D3) is best-effort in index.mjs, so an
+// unmocked EventBridge does not fail a test — it silently reaches real AWS and
+// logs the AccessDenied. Stubbed here to keep this suite hermetic; the event
+// itself is asserted in gate-working-hours.test.mjs.
+vi.mock("@aws-sdk/client-eventbridge", () => ({
+  EventBridgeClient: class { async send() { return { FailedEntryCount: 0 }; } },
+  PutEventsCommand: class { constructor(input) { this.input = input; } },
+}));
 vi.mock("@aws-sdk/client-dynamodb", () => {
   const cmd = (op) => class { constructor(input) { this.input = input; this.op = op; } };
   const GetItemCommand = cmd("get");

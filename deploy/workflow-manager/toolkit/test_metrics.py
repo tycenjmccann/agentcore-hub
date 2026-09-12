@@ -6,8 +6,10 @@ Run: python3 -m unittest deploy/workflow-manager/toolkit/test_metrics.py
 
 import json
 import os
+import random
 import sys
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -19,6 +21,9 @@ from compute_metrics import (  # noqa: E402
     intake_completed_at,
     is_outside_hours,
     jaccard,
+    ms_between,
+    parse_ts,
+    split_wait_by_window,
     title_fix_kind,
     title_paths,
     title_slot_tokens,
@@ -943,6 +948,236 @@ class OutsideHours(unittest.TestCase):
         # The 7-hour wait RealDossierFixtures pins is unchanged — this only
         # explains it, it does not restate it.
         self.assertEqual(review["waitMs"], 25255120)
+
+
+def la(year, month, day, hour=0, minute=0):
+    """A UTC-tzinfo instant for the given America/Los_Angeles wall-clock time —
+    matching what parse_ts actually hands split_wait_by_window in production
+    (a fixed-offset datetime, never the window's own ZoneInfo object)."""
+    from zoneinfo import ZoneInfo
+    return datetime(year, month, day, hour, minute, tzinfo=ZoneInfo("America/Los_Angeles")).astimezone(timezone.utc)
+
+
+class WaitSplit(unittest.TestCase):
+    """split_wait_by_window (TEAM-4453 D3) — the same fix for the same defect
+    OutsideHours documents above, one level deeper: a review that straddles the
+    window boundary should attribute only its own outside slice, not have its
+    whole wait bucketed by the instant it was requested."""
+
+    LA_WINDOW = business_window(tz_name="America/Los_Angeles", hours_spec="09-18")
+
+    def test_fully_inside_a_business_day(self):
+        start, end = la(2026, 7, 1, 10, 0), la(2026, 7, 1, 14, 0)  # Wed
+        self.assertEqual(split_wait_by_window(start, end, self.LA_WINDOW), (14_400_000, 0))
+
+    def test_wholly_on_a_weekend(self):
+        start, end = la(2026, 7, 4, 10, 0), la(2026, 7, 4, 14, 0)  # Sat
+        self.assertEqual(split_wait_by_window(start, end, self.LA_WINDOW), (0, 14_400_000))
+
+    def test_the_ztg2xj_example(self):
+        # Requested 2026-09-09T06:30:00Z = Tue 23:30 PDT (after hours); resolved
+        # 2026-09-09T16:22:00Z = Wed 09:22 PDT — 22 minutes into the window.
+        requested = parse_ts("2026-09-09T06:30:00Z")
+        resolved = parse_ts("2026-09-09T16:22:00Z")
+        self.assertEqual(ms_between(requested, resolved), 35_520_000)
+        self.assertEqual(
+            split_wait_by_window(requested, resolved, self.LA_WINDOW),
+            (1_320_000, 34_200_000),
+        )
+
+    def test_multi_day_friday_evening_to_tuesday_morning(self):
+        # Fri 17:00 (inside; closes at 18:00) through the weekend to Mon (a full
+        # 9-18 business day) into Tue 10:00 (inside; opened at 09:00).
+        start, end = la(2026, 7, 3, 17, 0), la(2026, 7, 7, 10, 0)
+        in_ms, out_ms = split_wait_by_window(start, end, self.LA_WINDOW)
+        self.assertEqual((in_ms, out_ms), (39_600_000, 280_800_000))
+        self.assertEqual(in_ms + out_ms, ms_between(start, end))
+
+    def test_end_at_or_before_start_is_zero_zero_not_none(self):
+        now = la(2026, 7, 1, 12, 0)
+        self.assertEqual(split_wait_by_window(now, now, self.LA_WINDOW), (0, 0))
+        self.assertEqual(
+            split_wait_by_window(now, now - timedelta(minutes=5), self.LA_WINDOW), (0, 0)
+        )
+
+    def test_a_missing_bound_is_none_none(self):
+        now = la(2026, 7, 1, 12, 0)
+        self.assertEqual(split_wait_by_window(None, now, self.LA_WINDOW), (None, None))
+        self.assertEqual(split_wait_by_window(now, None, self.LA_WINDOW), (None, None))
+
+    def test_end_hour_24_is_open_through_midnight(self):
+        window = (self.LA_WINDOW[0], 0, 24)
+        start, end = la(2026, 7, 1, 1, 0), la(2026, 7, 2, 1, 0)  # Wed 01:00 -> Thu 01:00
+        self.assertEqual(split_wait_by_window(start, end, window), (86_400_000, 0))
+
+    def test_a_dst_day_splits_on_real_elapsed_time_not_wall_clock(self):
+        """2026-03-08 is the America/Los_Angeles spring-forward Sunday (2am ->
+        3am skipped). Two aware datetimes sharing the SAME ZoneInfo object hit
+        Python's "same tzinfo attribute, subtract naively" fast path, which
+        answers with wall-clock elapsed time instead of real elapsed time
+        across the jump — ms_between converts both sides to UTC first
+        specifically to avoid that. This pins the whole-span invariant across
+        a Saturday that runs into the Monday after the transition."""
+        start, end = la(2026, 3, 7, 8, 0), la(2026, 3, 9, 10, 0)  # Sat -> Mon
+        in_ms, out_ms = split_wait_by_window(start, end, self.LA_WINDOW)
+        self.assertEqual((in_ms, out_ms), (3_600_000, 172_800_000))
+        self.assertEqual(in_ms + out_ms, ms_between(start, end))
+        # A DST day is 23 real hours, not 24 — the invariant catches a
+        # regression to naive subtraction even without knowing the split.
+        self.assertEqual(ms_between(la(2026, 3, 8, 0, 0), la(2026, 3, 9, 0, 0)), 82_800_000)
+
+
+class SubMillisecondPrecision(unittest.TestCase):
+    """TEAM-4457 F-1 / R15 — every fixture above uses whole-second timestamps,
+    which is exactly why int(total_seconds() * 1000) truncation survived: a
+    real span of 33,126,484 ms comes back from total_seconds() as
+    33126483.999999996, and int() throws away the last millisecond. A fuzz of
+    20,000 random microsecond-precision spans violated
+    in_ms + out_ms == ms_between(start, end) 46.9% of the time before the fix
+    to ms_between and split_wait_by_window."""
+
+    def test_ms_between_floors_and_never_loses_a_whole_millisecond(self):
+        a = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        # Exactly 1.9999ms: floors to 1, not 2 — floor, not round.
+        self.assertEqual(ms_between(a, a + timedelta(microseconds=1999)), 1)
+        # The real ztg2xj span, expressed in microseconds: the old
+        # int(total_seconds() * 1000) route gave 33_126_483 here.
+        self.assertEqual(
+            ms_between(a, a + timedelta(microseconds=33_126_484_000)), 33_126_484
+        )
+
+    def test_the_real_ztg2xj_gate_span_is_exact_in_both_windows(self):
+        requested = parse_ts("2026-09-11T07:10:41.385Z")
+        resolved = parse_ts("2026-09-11T16:22:47.869Z")
+        self.assertEqual(requested.weekday(), 4)  # Friday
+
+        self.assertEqual(ms_between(requested, resolved), 33_126_484)
+
+        utc_window = business_window(tz_name="UTC", hours_spec="08-18")
+        self.assertEqual(
+            split_wait_by_window(requested, resolved, utc_window),
+            (30_167_869, 2_958_615),
+        )
+        la_window = WaitSplit.LA_WINDOW
+        self.assertEqual(
+            split_wait_by_window(requested, resolved, la_window),
+            (1_367_869, 31_758_615),
+        )
+        for window in (utc_window, la_window):
+            in_ms, out_ms = split_wait_by_window(requested, resolved, window)
+            self.assertEqual(in_ms + out_ms, ms_between(requested, resolved))
+
+    def test_sub_millisecond_residues_either_side_of_a_segment_boundary(self):
+        """Flooring ms_between PER SEGMENT (the old approach) loses precision
+        even when each floor looks harmless alone: a start 0.5ms before the
+        09:00 window opens and an end 0.7ms after it opens split into two
+        segments at that boundary, each of which floors away its own
+        sub-millisecond residue — 0.5ms + 0.7ms discarded independently — for
+        a segment sum 1ms short of the true 1000ms span."""
+        tz = WaitSplit.LA_WINDOW[0]
+        start = datetime(2026, 9, 11, 8, 59, 59, 500, tzinfo=tz).astimezone(timezone.utc)
+        end = datetime(2026, 9, 11, 9, 0, 0, 700, tzinfo=tz).astimezone(timezone.utc)
+        self.assertEqual(ms_between(start, end), 1000)
+        in_ms, out_ms = split_wait_by_window(start, end, WaitSplit.LA_WINDOW)
+        self.assertEqual(in_ms + out_ms, 1000)
+
+    def test_the_split_is_exact_for_random_microsecond_precision_spans(self):
+        rng = random.Random(4465)
+        windows = {
+            "UTC 08-18": business_window(tz_name="UTC", hours_spec="08-18"),
+            "LA 09-18": WaitSplit.LA_WINDOW,
+            "UTC 00-24": (WaitSplit.LA_WINDOW[0], 0, 24),
+        }
+        year_start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        for _ in range(500):
+            start = year_start + timedelta(
+                seconds=rng.randrange(0, 365 * 86400),
+                microseconds=rng.randrange(0, 1_000_000),
+            )
+            end = start + timedelta(
+                seconds=rng.randrange(0, 10 * 86400),
+                microseconds=rng.randrange(0, 1_000_000),
+            )
+            total = ms_between(start, end)
+            for name, window in windows.items():
+                with self.subTest(window=name, start=start, end=end):
+                    in_ms, out_ms = split_wait_by_window(start, end, window)
+                    self.assertEqual(in_ms + out_ms, total)
+                    self.assertGreaterEqual(in_ms, 0)
+                    self.assertGreaterEqual(out_ms, 0)
+                    self.assertLessEqual(in_ms, total)
+
+
+class WaitSplitEndToEnd(unittest.TestCase):
+    """compute_metrics wiring: humanReviews[].inHoursMs/outsideHoursMs and the
+    humanWaitInHoursMs/humanWaitOutsideHoursMs totals, driven through the real
+    pipeline rather than calling split_wait_by_window directly."""
+
+    def with_window(self, requested_at, resolved_at, tz="America/Los_Angeles", hours="09-18"):
+        env = {"WM_BUSINESS_TZ": tz, "WM_BUSINESS_HOURS": hours}
+        with mock.patch.dict(os.environ, env, clear=False):
+            return compute_metrics(gate_dossier(requested_at, resolved_at))
+
+    def test_the_ztg2xj_example_end_to_end(self):
+        m = self.with_window("2026-09-09T06:30:00Z", "2026-09-09T16:22:00Z")
+        review = m["humanReviews"][0]
+        self.assertEqual(review["waitMs"], 35_520_000)
+        self.assertEqual(review["inHoursMs"], 1_320_000)
+        self.assertEqual(review["outsideHoursMs"], 34_200_000)
+        self.assertEqual(m["humanWaitInHoursMs"], 1_320_000)
+        self.assertEqual(m["humanWaitOutsideHoursMs"], 34_200_000)
+        self.assertEqual(
+            m["humanWaitInHoursMs"] + m["humanWaitOutsideHoursMs"], m["humanWaitTotalMs"]
+        )
+
+    def test_per_review_split_sums_to_wait_across_a_rework_cycle(self):
+        m = compute_metrics(rejection_rework_dossier())
+        for review in m["humanReviews"]:
+            if review["waitMs"] is None:
+                self.assertIsNone(review["inHoursMs"])
+                self.assertIsNone(review["outsideHoursMs"])
+            else:
+                self.assertEqual(review["inHoursMs"] + review["outsideHoursMs"], review["waitMs"])
+        self.assertEqual(
+            m["humanWaitInHoursMs"],
+            sum(r["inHoursMs"] for r in m["humanReviews"] if r["inHoursMs"] is not None),
+        )
+        self.assertEqual(
+            m["humanWaitInHoursMs"] + m["humanWaitOutsideHoursMs"], m["humanWaitTotalMs"]
+        )
+
+    def test_a_legacy_fixture_with_no_reviews_is_zero_zero(self):
+        m = compute_metrics(happy_path_dossier())
+        self.assertEqual(m["humanReviews"], [])
+        self.assertEqual(m["humanWaitInHoursMs"], 0)
+        self.assertEqual(m["humanWaitOutsideHoursMs"], 0)
+
+    def test_the_real_ztg2xj_gate_span_end_to_end_in_both_windows(self):
+        """The same real span SubMillisecondPrecision pins directly, driven
+        through compute_metrics instead — the fix has to hold at the wiring
+        layer, not just inside split_wait_by_window."""
+        requested_at = "2026-09-11T07:10:41.385Z"
+        resolved_at = "2026-09-11T16:22:47.869Z"
+
+        m = self.with_window(requested_at, resolved_at, tz="UTC", hours="08-18")
+        review = m["humanReviews"][0]
+        self.assertEqual(review["waitMs"], 33_126_484)
+        self.assertEqual(review["inHoursMs"], 30_167_869)
+        self.assertEqual(review["outsideHoursMs"], 2_958_615)
+        self.assertEqual(review["inHoursMs"] + review["outsideHoursMs"], review["waitMs"])
+        self.assertEqual(
+            m["humanWaitInHoursMs"] + m["humanWaitOutsideHoursMs"], m["humanWaitTotalMs"]
+        )
+
+        m = self.with_window(requested_at, resolved_at, tz="America/Los_Angeles", hours="09-18")
+        review = m["humanReviews"][0]
+        self.assertEqual(review["waitMs"], 33_126_484)
+        self.assertEqual(review["inHoursMs"], 1_367_869)
+        self.assertEqual(review["outsideHoursMs"], 31_758_615)
+        self.assertEqual(review["inHoursMs"] + review["outsideHoursMs"], review["waitMs"])
+        self.assertEqual(
+            m["humanWaitInHoursMs"] + m["humanWaitOutsideHoursMs"], m["humanWaitTotalMs"]
+        )
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@ import {
   createWorkflow,
   claimInvocation,
   trackTicket,
+  claimHumanTicket,
   mergeTaskMetadata,
   completeTaskEntry,
   setTaskStatus,
@@ -187,6 +188,45 @@ describe("trackTicket", () => {
     await trackTicket("wf_1", "TEAM-3", { agentId: "qa" });
     const w = writes().find((c) => c.input.ConditionExpression);
     expect(w.input.ConditionExpression).toBe("attribute_not_exists(agentTasks.#tid)");
+  });
+});
+
+describe("claimHumanTicket", () => {
+  it("seeds the humanTickets map then claims first-writer-wins", async () => {
+    const won = await claimHumanTicket("wf_1", "TEAM-9");
+    expect(won).toBe(true);
+    const [seed, claim] = writes();
+    expect(seed.input.UpdateExpression).toBe("SET humanTickets = if_not_exists(humanTickets, :empty)");
+    expect(seed.input.ConditionExpression).toBeUndefined();
+    expect(claim.input.UpdateExpression).toBe("SET humanTickets.#tid = :at");
+    expect(claim.input.ConditionExpression).toBe("attribute_not_exists(humanTickets.#tid)");
+    expect(claim.input.ExpressionAttributeNames).toEqual({ "#tid": "TEAM-9" });
+  });
+
+  it("returns false when the ticket was already claimed (redelivered INSERT / re-sent webhook)", async () => {
+    // Only the conditional (second) write is gated by failNextCondition — the
+    // unconditioned seed write never checks it.
+    failNextCondition = true;
+    expect(await claimHumanTicket("wf_1", "TEAM-9")).toBe(false);
+  });
+
+  it("rethrows a non-conditional error on the claim write instead of reading it as already claimed", async () => {
+    const origSend = stubDdb.send;
+    let calls = 0;
+    stubDdb.send = async (cmd) => {
+      calls++;
+      if (calls === 2) {
+        const err = new Error("throttled");
+        err.name = "ProvisionedThroughputExceededException";
+        throw err;
+      }
+      return origSend.call(stubDdb, cmd);
+    };
+    try {
+      await expect(claimHumanTicket("wf_1", "TEAM-9")).rejects.toThrow("throttled");
+    } finally {
+      stubDdb.send = origSend;
+    }
   });
 });
 
