@@ -950,12 +950,12 @@ class OutsideHours(unittest.TestCase):
 V5_KPI = {
     "version": 1,
     "computedAt": "2026-07-01T12:30:00Z",
-    "cost": {"usd": 12.3456, "band": "normal", "z": 0.4102},
+    "cost": {"usd": 12.3456, "band": "ok", "z": 0.4102},
     "time": {"wallMs": 7200000, "activeMs": 5400000, "humanWaitMs": 1800000,
              "band": "warn", "z": 2.1044},
     "quality": {
         "score": 74, "grade": "C", "confidence": "full", "evidenceWeight": 100,
-        "outcome": "complete", "band": "normal", "z": -0.2,
+        "outcome": "complete", "band": "ok", "z": -0.2,
         "components": [{"key": "firstPass", "points": 24.999}],
         "excluded": [], "capsApplied": [],
     },

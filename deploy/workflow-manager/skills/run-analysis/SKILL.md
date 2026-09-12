@@ -68,7 +68,7 @@ Both are wanted, so both are on the record:
   `insufficient` means the score is `null` (too little evidence to score the
   run) — say so instead of citing a score, and never treat `null` as 0.
 - `metrics.kpi.cost.band` / `.time.band` / `.quality.band` are this run against
-  its own workflow def's recent history (`normal` / `warn` / `alert`, with `z`).
+  its own workflow def's recent history (`ok` / `warn` / `alert`, with `z`).
   A `warn`/`alert` band is the strongest "this run was unusual" evidence you have.
 - **Do not re-derive what the card provides.** Read counts and durations from
   `metrics.quality.*`, `metrics.time.*`, `metrics.cost.*` — not by counting

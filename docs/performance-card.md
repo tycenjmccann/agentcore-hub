@@ -66,7 +66,7 @@ recompute or reconcile them from the card's other sections.
 | `version` | int | no | `config.kpiVersion` (`src/config/kpi.json`) |
 | `computedAt` | ISO string | no | `card.generatedAt` |
 | `cost.usd` | number | yes, when `dataQuality.costMissing` | `card.cost.totalUsd` |
-| `cost.band` | `"normal"\|"warn"\|"alert"\|"insufficient"\|"unknown"` | no | `bands.kpis["cost.totalUsd"]`, copied by `stampKpiBands` |
+| `cost.band` | `"ok"\|"warn"\|"alert"\|"insufficient"\|"unknown"` | no | `bands.kpis["cost.totalUsd"]`, copied by `stampKpiBands` |
 | `cost.z` | number | yes | same, `null` on a thin baseline |
 | `time.wallMs` / `time.activeMs` / `time.humanWaitMs` | number | no | `card.time.*` verbatim |
 | `time.band` / `time.z` | as cost | as cost | `bands.kpis["time.wallMs"]` |
@@ -216,7 +216,7 @@ card's stored precision is the correct input, and the score is unaffected.
 - `POST /api/workflow/performance` → on-demand card generation. Body
   `{workflowId}`; `202 {accepted, workflowId, pollAfterMs:3000}` when a build
   was kicked off, `200 {card}` when one already exists, `400` bad body, `404`
-  unknown workflow, `409` already terminal-but-uncardable / conflicting state,
+  unknown workflow, `409 {error:"run is not terminal"}`,
   `429 {error, retryAfterMs, pollAfterMs}` when one is already in flight for
   that workflow (per-task in-flight dedupe), `500` a static error body.
   Invokes the Lambda with `InvocationType: "Event"`.
