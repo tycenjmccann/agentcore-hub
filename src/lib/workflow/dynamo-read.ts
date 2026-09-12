@@ -5,6 +5,7 @@
 
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, GetCommand, QueryCommand, ScanCommand, BatchGetCommand } from "@aws-sdk/lib-dynamodb";
+import { listRankMs, type RunTimes } from "./run-order";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const TICKETS_TABLE = process.env.TICKETS_TABLE || "agentcore-hub-tickets";
@@ -28,8 +29,10 @@ export async function listWorkflowsFromDynamo(options?: { includeArchived?: bool
     lastKey = result.LastEvaluatedKey;
   } while (lastKey);
 
-  // Sort by startedAt descending
-  items.sort((a, b) => new Date(b.startedAt as string).getTime() - new Date(a.startedAt as string).getTime());
+  // Rank by max(startedAt, finishedAt) descending, not startedAt alone (TEAM-4504):
+  // a long-running run that finishes late must not fall off the top-50 cut below
+  // just because older, quicker runs started more recently.
+  items.sort((a, b) => listRankMs(b as RunTimes) - listRankMs(a as RunTimes));
 
   // Tombstoned rows exist only so dashboard metrics can still resolve a
   // deleted workflow's type from its tickets — never list them.
