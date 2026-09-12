@@ -51,6 +51,21 @@ declare -A ESCALATION_KIND=(
   [ci-agent]="sync_fix"
   [release-manager]="ship_fix"
 )
+# The delivery-step instruction that actually makes a dev sync before handing off.
+# Anchored on the step's own heading, NOT on a count of "Main-sync rule" mentions:
+# a Rules-section mention is not a process step, and the step is what stops a
+# hand-off behind main. code-sweeper differs on purpose — it opens a PR for human
+# review and never merges into base_branch, so it syncs its own feature_branch.
+declare -A DELIVERY_ANCHOR=(
+  [backend-dev]='Sync .?base_branch.? on main — (the )?LAST development step'
+  [api-dev]='Sync .?base_branch.? on main — (the )?LAST development step'
+  [frontend-dev]='Sync .?base_branch.? on main — (the )?LAST development step'
+  [bug-fixer]='Sync .?base_branch.? on main — (the )?LAST development step'
+  [code-sweeper]='Sync .?feature_branch.? on main FIRST — before the PR exists'
+)
+# Lines after the delivery anchor that must still point back at the shared rule,
+# so the step cannot decay into "merge main somehow".
+ANCHOR_WINDOW=6
 
 RULE="TEAM-4529: the Main-sync rule block is duplicated verbatim in every
         blueprint that syncs a branch. Copy it byte-for-byte from
@@ -117,14 +132,32 @@ run_checks() { # $1 = repo root to check (the tree, not just blueprints/)
   done
 
   # ─── 2. dev blueprints wire the sync into their delivery step ───────────────
-  # Two references minimum: the block heading itself, plus the delivery step
-  # pointing back at it. A block nobody's process step invokes is decoration.
+  # The delivery STEP must exist (anchored on its own heading, after the block)
+  # and must point back at the shared rule. A block that only the Rules section
+  # mentions is decoration: nothing in the process makes the dev sync.
+  local anchor_n
   for bp in "${DEV_BPS[@]}"; do
     f="$root/blueprints/${bp}.md"
     [ -f "$f" ] || continue
-    if [ "$(grep -c 'Main-sync rule' "$f")" -lt 2 ]; then
-      echo "FAIL: blueprints/${bp}.md never references the Main-sync rule from its delivery step" >&2
-      echo "      A dev must sync base_branch with origin/<default branch> BEFORE report_completion." >&2
+    anchor_n="$(grep -nE "${DELIVERY_ANCHOR[$bp]}" "$f" | head -1 | cut -d: -f1 || true)"
+    if [ -z "$anchor_n" ]; then
+      echo "FAIL: blueprints/${bp}.md has no delivery-step sync instruction matching:" >&2
+      echo "        ${DELIVERY_ANCHOR[$bp]}" >&2
+      echo "      A dev must merge origin/<default branch> into its branch as the LAST" >&2
+      echo "      development step, BEFORE report_completion — a Rules bullet is not a step." >&2
+      fail=1
+      continue
+    fi
+    n="$(marker_line "$f")"
+    if [ -n "$n" ] && [ "$anchor_n" -lt "$n" ]; then
+      echo "FAIL: blueprints/${bp}.md's delivery-step sync (line $anchor_n) precedes the Main-sync block (line $n)" >&2
+      fail=1
+    fi
+    # Joined into one line first: these files hard-wrap, so the reference is
+    # legitimately split as "…(see the Main-sync\n  rule)".
+    if ! sed -n "${anchor_n},$((anchor_n + ANCHOR_WINDOW))p" "$f" | tr '\n' ' ' | tr -s ' ' | grep -q 'Main-sync rule'; then
+      echo "FAIL: blueprints/${bp}.md's delivery-step sync does not reference the Main-sync rule" >&2
+      echo "      (line $anchor_n + ${ANCHOR_WINDOW} lines) — the step must cite the shared merge-not-rebase semantics." >&2
       fail=1
     fi
   done
@@ -138,7 +171,30 @@ run_checks() { # $1 = repo root to check (the tree, not just blueprints/)
     fail=1
   fi
 
+  # ─── 3b. QA stays pinned to the CI-certified head ───────────────────────────
+  # QA may never push, so a local sync commit can never be certified. If QA's text
+  # lets a local merge become "the head you are verifying", pipeline mode compares
+  # ci_head_sha against a SHA that no CI run can ever produce: QA can neither
+  # verdict (Step 2 forbids it on an uncertified head) nor get the head certified.
+  # The resolution the blueprint must keep: QA verifies the CERTIFIED head as-is
+  # and staleness is not its concern.
+  f="$root/blueprints/qa-verifier.md"
+  if [ -f "$f" ]; then
+    grep -q 'never a reason to withhold a verdict' "$f" || {
+      echo "FAIL: blueprints/qa-verifier.md no longer says branch staleness is never a reason to withhold a verdict" >&2
+      echo "      Without it QA can deadlock: it must not push, so a locally-synced head can never be CI-certified." >&2
+      fail=1
+    }
+    grep -q 'pushed integration-branch head' "$f" || {
+      echo "FAIL: blueprints/qa-verifier.md no longer pins 'the head you are verifying' to the PUSHED integration-branch head" >&2
+      echo "      A local merge commit must never become the head QA compares against ci_head_sha." >&2
+      fail=1
+    }
+  fi
+
   # ─── 4b. each downstream blueprint names its escalation kind ────────────────
+  # For qa-verifier the kind must appear as the thing staleness is NOT filed as
+  # (checked by 3b above); every other downstream agent files it for real.
   for bp in "${DOWNSTREAM_BPS[@]}"; do
     f="$root/blueprints/${bp}.md"
     [ -f "$f" ] || continue
@@ -163,13 +219,27 @@ run_checks() { # $1 = repo root to check (the tree, not just blueprints/)
   done
 
   # ─── 5b. the CI agent's pre-CI P0 sync is the safety net — keep it ──────────
+  # Scoped to the P0 section only: the merge command also appears in the shared
+  # canonical block, so a whole-file grep would stay green while P0 itself stopped
+  # syncing. P0 is the net that proves the certified SHA is the SHA that lands.
   f="$root/blueprints/ci-agent.md"
   if [ -f "$f" ]; then
-    grep -q 'git merge origin/<default branch>' "$f" || {
-      echo "FAIL: blueprints/ci-agent.md lost its P0 'git merge origin/<default branch>' sync" >&2
-      echo "      The dev-side sync is the first line of defence; P0 is the net that proves the certified SHA is the SHA that lands." >&2
+    local p0
+    p0="$(awk '/^### P0:/ { inp0 = 1 } /^### P1:/ { inp0 = 0 } inp0' "$f")"
+    if [ -z "$p0" ]; then
+      echo "FAIL: blueprints/ci-agent.md has no '### P0:' … '### P1:' section — the pre-CI sync step is gone" >&2
       fail=1
-    }
+    else
+      grep -q 'git merge origin/<default branch>' <<<"$p0" || {
+        echo "FAIL: blueprints/ci-agent.md's P0 section lost its 'git merge origin/<default branch>' sync" >&2
+        echo "      The dev-side sync is the first line of defence; P0 is the net that proves the certified SHA is the SHA that lands." >&2
+        fail=1
+      }
+      grep -q 'push' <<<"$p0" || {
+        echo "FAIL: blueprints/ci-agent.md's P0 section no longer pushes the sync — an unpushed sync certifies a SHA that never lands" >&2
+        fail=1
+      }
+    fi
     grep -q 'Fix (sync-main)' "$f" || {
       echo "FAIL: blueprints/ci-agent.md lost its 'Fix (sync-main)' escalation for non-trivial conflicts" >&2
       fail=1
@@ -194,6 +264,11 @@ self_test() {
     "escalation kind removed from a blueprint|sed -i 's/ship_fix/SOME_OTHER_KIND/g' blueprints/release-manager.md"
     "a blueprint instructs a rebase|sed -i 's|git fetch origin \&\& git checkout|git rebase origin/main \&\& git checkout|' blueprints/ci-agent.md"
     "CI agent's P0 pushed sync deleted|sed -i 's|git merge origin/<default branch>|git status|g' blueprints/ci-agent.md"
+    # ── the two holes the PR #575 review found ────────────────────────────────
+    "dev delivery step deleted, Rules mention kept|sed -i '/Sync base_branch on main — LAST development step/,/sync, then report/d' blueprints/backend-dev.md"
+    "P0 stops syncing while the canonical block still shows the command|sed -i '/^### P0:/,/^### P1:/ s|git fetch origin \&\& git checkout <feature_branch> \&\& git merge origin/<default branch>|git status|' blueprints/ci-agent.md"
+    "QA lets a local merge become the verified head (deadlock)|sed -i 's/pushed integration-branch head/locally merged head/' blueprints/qa-verifier.md"
+    "QA may withhold a verdict over staleness|sed -i 's/never a reason to withhold a verdict/a reason to withhold a verdict/' blueprints/qa-verifier.md"
   )
   for case in "${CASES[@]}"; do
     tmp="$(mktemp -d)"

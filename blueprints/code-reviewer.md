@@ -300,7 +300,9 @@ never enters the findings list, and it never blocks the verdict.
 - Every finding cites `file:line` and the exact code — no vague "looks risky"
 - Branch behind the default branch / won't merge cleanly = self-sync in YOUR own
   turn (`fable`, re-run with `opus` on conflicts) — never a finding and never a
-  fix ticket; only a non-trivial semantic conflict is either
+  fix ticket. Only a NON-TRIVIAL semantic conflict — both sides changed the same
+  behaviour — is a finding, and then the finding is the behaviour clash, filed as
+  part of your grouped `codex_fix`, never "won't merge"
 - Do NOT edit the code yourself — file fix tickets, the dev fixes. The ONE
   exception is the mechanical `chore(sync)` main-merge commit (Main-sync rule);
   you still never edit product code

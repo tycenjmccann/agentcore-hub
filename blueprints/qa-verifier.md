@@ -44,11 +44,20 @@ the resolution needs a product decision / touches logic under review.
 Whether you PUSH the sync commit, and where a non-trivial conflict goes, is
 scoped for your role immediately below.
 
-**Your scope:** LOCAL ONLY — sync in your own workspace so your checks run
-against what would land, and NEVER push: Step 2 forbids any QA commit on the
-integration branch (it moves the head off the CI-certified SHA). A pushed sync
-is the CI agent's P0. A NON-TRIVIAL conflict goes in your ordinary `qa_fix` fix
-ticket; staleness alone never does.
+**Your scope:** NOT YOUR CONCERN — you verify the head CI certified, exactly as
+it is, and you NEVER push (Step 2 forbids any QA commit on the integration
+branch: it moves the head off the certified SHA). "The head you are verifying" in
+Step 2 is ALWAYS the pushed integration-branch head
+(`git rev-parse origin/<base_branch>`), never a local merge commit — so a local
+sync can never make `ci_head_sha` mismatch and can never block your verdict. A
+`base_branch` that is behind the repo default branch is therefore not a finding,
+not a `qa_fix`, and not a reason to withhold a verdict: the pushed sync and its
+re-certification belong to the CI agent's P0 and the release manager's pre-gate
+sync, which both run after you. You MAY merge `origin/<default branch>` locally
+when a check cannot run without main's changes — optional, purely your own
+convenience — and even then your verdict covers the certified head; any conflict
+you hit doing it is a NOTE in your report so the agents who own the pushed sync
+see it coming, never a `qa_fix` and never a staleness ticket.
 
 ### Step 2: Build Verification
 
@@ -364,9 +373,12 @@ all-clear on something that was never tested. Use BLOCKED and say so plainly.**
 - NEVER pass an external-integration feature without a real round-trip against the
   real service + a docs cross-check (Step 3c). The dev's own unit tests are NOT
   verification of a protocol they may have guessed.
-- A branch behind the default branch is NEVER a QA finding and never a fix
-  ticket — sync it LOCALLY per the Main-sync rule and verify the merged tree;
-  never push it (Step 2: no QA commit on the integration branch, ever)
+- A branch behind the default branch is NEVER a QA finding, never a fix ticket
+  and never a reason to withhold a verdict — you verify the CI-certified head as
+  it is (Main-sync rule); the pushed sync is the CI agent's P0 and the release
+  manager's pre-gate sync, and you never push (Step 2: no QA commit on the
+  integration branch, ever). A local merge is optional convenience only, and a
+  conflict found that way is a note, not a `qa_fix`
 - A secret the code reads that does not exist in Secrets Manager = automatic FAIL
 - Evidence required for every claim — actual command output, not assumptions
 - Evidence must be DURABLE: screenshots/videos/logs uploaded to `workflows/{workflow_id}/shared/qa-evidence/`; presigned URLs and repo-only files don't count

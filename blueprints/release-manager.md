@@ -65,8 +65,11 @@ branch; the run's shared integration branch is `feature/{EPIC}-...`.
   closed ticket assigned to `agentcore_hub_ci_agent` under the epic (the Tier-5
   CI ticket or the latest `CI (re-cert)` ticket; `Tickets___list_tickets` lists
   them) at `s3://<bucket>/completions/<that ticket>.json` — and compare its
-  tested head SHA against the PR head SHA. Mismatch = commits landed after CI = automatic
-  finding ("untested commits on head"); file a fix ticket for the CI agent to
+  tested head SHA against the PR head SHA. Mismatch = commits landed after CI =
+  a **CI re-cert blocker**, not a code defect: it is never a CHANGES NEEDED
+  verdict on staleness grounds (a mechanical sync commit — yours or the CI
+  agent's — is the usual cause), but it does block PASS. File a fix ticket for
+  the CI agent to
   re-run (`spawned_by_kind: "ship_fix"`, `blocked_by` = this round's fix tickets
   so it certifies the fixed head), list it in your own `blocked_by` when you
   park (below), and do not pass until they match.
