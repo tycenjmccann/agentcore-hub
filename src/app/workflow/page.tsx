@@ -83,20 +83,24 @@ function gradeBucket(w: WorkflowSummary): Exclude<GradeFilter, "all"> {
 }
 
 /**
- * Descending by the chosen KPI, nulls always last. Returns the input order for
- * "newest" — Array.sort is stable, and returning 0 on ties preserves the list's
- * existing active-first / date-descending order.
+ * Descending by the chosen KPI, nulls always last, ties broken by finish time.
+ *
+ * TEAM-4515: "newest" means newest-FINISHED (byFinishedDesc — TEAM-4504), never
+ * newest-started, and it RE-DERIVES that order rather than trusting the order the
+ * caller happened to hand in. A run that started long ago but finished recently
+ * belongs at the top of Past — in the default view, after a round trip through the
+ * cost/time/quality sorts, and under the grade filter alike.
  */
 function sortPast(list: WorkflowSummary[], key: SortKey): WorkflowSummary[] {
-  if (key === "newest") return list;
+  if (key === "newest") return [...list].sort(byFinishedDesc);
   const of = KPI_OF[key];
   return [...list].sort((x, y) => {
     const a = of(x);
     const b = of(y);
-    if (a == null && b == null) return 0;
+    if (a == null && b == null) return byFinishedDesc(x, y);
     if (a == null) return 1;
     if (b == null) return -1;
-    return b - a;
+    return b - a || byFinishedDesc(x, y);
   });
 }
 
