@@ -971,6 +971,11 @@ test.describe("Hero KPI strip (TEAM-4482)", () => {
     await expect(chip).toContainText("kpi v2");
     await expect(chip).not.toContainText("74/100");
 
+    // The chip lives inside the panel, below the fold — bring it into view so the
+    // screenshot is evidence of the chip, not just the top of the page.
+    await page.locator("#workflow-manager-panel").scrollIntoViewIfNeeded();
+    await expect(chip).toBeInViewport();
+
     await page.screenshot({ path: `${SCREENSHOT_DIR}/19-det-chip-provenance.png` });
   });
 });
