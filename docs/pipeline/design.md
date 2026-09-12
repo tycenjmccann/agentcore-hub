@@ -201,18 +201,34 @@ commit; it is never approved by software. Four moving parts:
 
 1. **Record, before the pipeline starts.** `Pipeline___start_deploy` takes an
    optional `approved_head_sha` (plus `ci_build_id`, `pr_url`, `workflow_id`,
-   `ticket_id`). When `commit_sha` and `approved_head_sha` are both 40-hex AND a
-   SUCCEEDED build of the target's CI project certifies `approved_head_sha`, the
-   tools Lambda writes a **ship-approval record** to
+   `ticket_id`). A record is written only when all three of these are proven, in
+   this order: `commit_sha` and `approved_head_sha` are both 40-hex; a SUCCEEDED
+   build of the target's CI project certifies `approved_head_sha`; and the GitHub
+   API, asked about the `pr_url` the caller passed, reports `merged: true` with
+   `head.sha == approved_head_sha` and `merge_commit_sha == commit_sha`. That
+   third check is the **merge binding** — without it the caller's `commit_sha` is
+   an unverified claim, and any commit on `main` could be paired with a certified
+   head (review finding on PR #576). It needs a read-only `GITHUB_TOKEN` on the
+   tools Lambda (plumbed by `deploy/setup-pipeline-tools-lambda.mjs`, optional,
+   5s timeout); with no token nothing is ever recorded, which is exactly the
+   pre-TEAM-4525 behaviour. `pr_url` is therefore mandatory for recording, and
+   the token grants no approval capability of any kind.
+   The record lands at
    `s3://$ARTIFACT_BUCKET/pipeline-artifacts/ship-approvals/<merge_commit>.json`
    — `{version, merge_commit, approved_head_sha, ci_build_id, pipeline, repo,
    pr_url, workflow_id, ticket_id, recorded_at,
-   recorded_by:"Pipeline___start_deploy"}` — then starts the pipeline exactly as
+   recorded_by:"Pipeline___start_deploy"}` — then the pipeline starts exactly as
    before. Otherwise it starts the pipeline **without** a record and returns
    `preapproval:{recorded:false, reason}`, where `reason` is
    `approved_head_sha_missing` | `invalid_sha` | `ci_not_certified` |
-   `record_write_failed`. One new IAM statement on the tools Lambda:
-   `s3:PutObject` on exactly that prefix.
+   `pr_url_missing` | `pr_url_invalid` | `merge_binding_mismatch` |
+   `merge_binding_unverified` | `record_write_failed`. One new IAM statement on
+   the tools Lambda: `s3:PutObject` on exactly that prefix. Symmetrically, all
+   three CodeBuild roles in the stack carry an explicit **Deny** on writing that
+   prefix (`DenyShipApprovalRecordWrites`, `denyShipApprovalWrites()` in
+   `pipeline-stack.ts`), because their commands come from the branch under review
+   and the Build role's `pipeline-artifacts/*` grant would otherwise let a change
+   forge its own approval; `GetObject` stays allowed so Deploy can re-verify.
 2. **Decide, in the Build stage.** `buildspec-ci.yml` declares
    `DEPLOY_PREAPPROVED` in `env.exported-variables`, sets it to `0` in
    `pre_build`, and in the `BUILD_APP_IMAGE` block (after the artifacts are
