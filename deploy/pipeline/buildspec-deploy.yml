@@ -37,6 +37,22 @@ env:
 phases:
   pre_build:
     commands:
+      # ── TEAM-4525: third and last fail-closed check on the deploy gate ──
+      #
+      # The Approval stage is now CONDITIONAL: CodePipeline skips it when the
+      # Build stage exported DEPLOY_PREAPPROVED=1, meaning the commit being
+      # deployed is the recorded merge of a head SHA a human already approved at
+      # the Merge Approval gate (deploy/pipeline/preapproved-check.sh). "0" means
+      # the gate ran and a human approved it. This re-reads the ship-approval
+      # record INDEPENDENTLY and refuses on anything else -- empty, an unresolved
+      # "#{BuildVars...}", a value that no longer matches the record. It runs
+      # FIRST, before the account guard and before anything touches prod, so a
+      # misread of the condition's semantics can only cost a needless human gate,
+      # never a silent deploy. No agent can satisfy this by approving anything;
+      # there is no approval capability outside the human Telegram bridge.
+      - |
+        bash deploy/pipeline/preapproved-check.sh gate "${DEPLOY_PREAPPROVED:-}" "$(cat pipeline-out/git-sha-full.txt 2>/dev/null || true)" \
+          || { echo "TEAM-4525 pre-deploy approval check REFUSED - nothing deployed" >&2; exit 1; }
       - "ACCOUNT_ID=\"$(aws sts get-caller-identity --query Account --output text)\""
       # Account guard — mirror deploy/config.sh: refuse a wrong account.
       - |

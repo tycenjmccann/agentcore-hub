@@ -20,6 +20,17 @@ version: 0.2
 # buildspec-deploy, which MUST have bash (`set -o pipefail` + here-strings).
 env:
   shell: bash
+  # TEAM-4525: the ONE bit the Approval stage's entry condition reads. "1" means
+  # "the commit being built is the recorded merge of the head SHA a human already
+  # approved at the Merge Approval gate, with CI certified on it" -> the
+  # in-pipeline human deploy gate is unnecessary for this commit and CodePipeline
+  # skips it. Anything else -- "0", empty, never exported because the build died
+  # early -- and the gate fires exactly as before. Fail-closed by construction:
+  # the condition is `NE "1"`, so only the literal 1 skips. The PR-check caller of
+  # this same file never enters the BUILD_APP_IMAGE block, so it exports an
+  # unused 0. See deploy/pipeline/preapproved-check.sh.
+  exported-variables:
+    - DEPLOY_PREAPPROVED
 
 phases:
   install:
@@ -181,7 +192,8 @@ phases:
           deploy/pipeline/test_prune_apt_sources.py \
           deploy/pipeline/test_update_runtime_image.py \
           deploy/pipeline/test_discover_live_env.py \
-          deploy/pipeline/test_buildspec_ci_exit_codes.py || { rc=$?; deactivate; echo "runtime-agent pytest battery FAILED (exit $rc)"; exit "$rc"; }
+          deploy/pipeline/test_buildspec_ci_exit_codes.py \
+          deploy/pipeline/test_preapproved_check.py || { rc=$?; deactivate; echo "runtime-agent pytest battery FAILED (exit $rc)"; exit "$rc"; }
         deactivate
       # HARD GATE: lambda-zip manifest integrity (the guard DEPLOY.md's inline zip bypassed)
       - "bash scripts/check-lambda-zip-manifest.sh"
@@ -318,6 +330,41 @@ phases:
             echo "deploy/runtime-agent/FORCE-UNKNOWN-RANGE" > pipeline-out/changed-files-runtime.txt || { echo "changed-files-runtime.txt fallback write FAILED"; exit 1; }
           fi
         fi
+      # ── TEAM-4525: is the in-pipeline HUMAN deploy gate still necessary? ──
+      #
+      # A SEPARATE command, not appended to the block above, for two reasons.
+      # (1) Phase-local env: buildspec-deploy.yml's own comment records that env
+      # does NOT survive a CodeBuild phase boundary, so the default AND the real
+      # answer must be set in the same phase -- and exported-variables are read
+      # after post_build, so this is that phase. (2) A distinct command has its
+      # OWN exit status, so unlike a trailing statement inside the block above it
+      # cannot mask that block's failure (TEAM-4462/4464/4491/4493). If the
+      # artifact block fails, CodeBuild aborts the phase and this never runs:
+      # DEPLOY_PREAPPROVED is then never exported, resolves empty, and the
+      # Approval stage's `NE "1"` condition fires the human gate. Fail-closed.
+      #
+      # `decide` prints 0 or 1 and NEVER exits non-zero -- a missing record is a
+      # normal answer, not a build failure. The `case` re-clamps to 0/1 so a
+      # future bug in the script cannot export a value the condition would have to
+      # interpret. Deploy re-reads the record itself before touching prod
+      # (preapproved-check.sh gate), so this answer is never the only check.
+      #
+      # The full 40-hex sha becomes its own artifact: git-sha.txt stays 12 chars
+      # because it is the image tag and the changed-files baseline.
+      - |
+        DEPLOY_PREAPPROVED=0
+        export DEPLOY_PREAPPROVED
+        if [ "${BUILD_APP_IMAGE:-false}" = "true" ]; then
+          FULL_SHA="${CODEBUILD_RESOLVED_SOURCE_VERSION:-$(git rev-parse HEAD 2>/dev/null || echo nogit)}"
+          printf '%s' "$FULL_SHA" > pipeline-out/git-sha-full.txt || { echo "git-sha-full.txt write FAILED"; exit 1; }
+          DEPLOY_PREAPPROVED="$(bash deploy/pipeline/preapproved-check.sh decide "$FULL_SHA")"
+          case "$DEPLOY_PREAPPROVED" in
+            0|1) ;;
+            *) echo "preapproved-check returned '$DEPLOY_PREAPPROVED' - forcing 0 (human gate)"; DEPLOY_PREAPPROVED=0 ;;
+          esac
+          export DEPLOY_PREAPPROVED
+        fi
+        echo "DEPLOY_PREAPPROVED=$DEPLOY_PREAPPROVED (1 = deploy gate skipped for this commit, 0 = human gate fires)"
       # TEAM-4501: re-emit the battery's failed test ids at the very END of the log.
       # post_build runs even when BUILD failed (cf9317e6: npm audit ran after the
       # pytest failure), so this is the last thing in the 300-line tail. Read-only,
@@ -346,6 +393,9 @@ artifacts:
     - "pipeline-out/orchestrator.zip"
     - "pipeline-out/image-digest.txt"
     - "pipeline-out/git-sha.txt"
+    # TEAM-4525: the full 40-hex source version the Deploy stage re-checks the
+    # ship-approval record against (git-sha.txt is the 12-char image tag).
+    - "pipeline-out/git-sha-full.txt"
     - "pipeline-out/changed-files.txt"
     - "pipeline-out/changed-files-runtime.txt"
     - "blueprints/**/*"

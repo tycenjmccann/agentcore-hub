@@ -25,6 +25,15 @@ env:
 phases:
   pre_build:
     commands:
+      # TEAM-4525: same fail-closed pre-deploy check as buildspec-deploy.yml. The
+      # Approval stage is conditional now, so this parallel action re-reads the
+      # ship-approval record itself rather than trusting the skipped gate. "0" =
+      # a human approved; "1" = the gate was skipped and the record must still
+      # match the commit being rolled; anything else refuses before any runtime
+      # image is pushed or swapped.
+      - |
+        bash deploy/pipeline/preapproved-check.sh gate "${DEPLOY_PREAPPROVED:-}" "$(cat pipeline-out/git-sha-full.txt 2>/dev/null || true)" \
+          || { echo "TEAM-4525 pre-deploy approval check REFUSED - no runtime image rolled" >&2; exit 1; }
       - "ACCOUNT_ID=\"$(aws sts get-caller-identity --query Account --output text)\""
       - |
         if [ -n "${EXPECTED_ACCOUNT_ID:-}" ] && [ "$ACCOUNT_ID" != "$EXPECTED_ACCOUNT_ID" ]; then
