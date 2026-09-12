@@ -288,12 +288,14 @@ export class PipelineStack extends Stack {
         ...commonEnvVars,
         ECR_REPO: { value: "agentcore-hub-frontend" },
         BUILD_APP_IMAGE: { value: "true" },
-        // Baked into the image client bundle; flip to "1" to show the /pipeline
-        // nav tab. Read the SAME documented var name the README + deploy.sh use
-        // (Codex PR #263 round-4 P2). Empty = hidden.
-        NEXT_PUBLIC_PIPELINE_ENABLED: {
-          value: process.env.NEXT_PUBLIC_PIPELINE_ENABLED || "",
-        },
+        // Baked into the image client bundle; shows the /pipeline nav tab.
+        // Hardcoded, NOT read from the deploying shell: this stack only exists
+        // when the CI/CD module is deployed, and that IS the decision to show
+        // the tab. Reading process.env here let a redeploy from a shell without
+        // the var silently blank it and ship every subsequent image tab-less
+        // (2026-09-09 -> 09-12). Deployments without this stack keep the
+        // Dockerfile default (empty = hidden).
+        NEXT_PUBLIC_PIPELINE_ENABLED: { value: "1" },
       },
       timeout: Duration.minutes(40),
     });

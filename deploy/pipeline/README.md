@@ -70,16 +70,20 @@ PIPELINE_GITHUB_OWNER=<gh-owner> ./deploy/pipeline/deploy.sh          # cdk depl
 PIPELINE_GITHUB_OWNER=<gh-owner> ./deploy/pipeline/deploy.sh diff     # cdk diff only
 ```
 
-Env (all optional except the owner; defaults derive from `deploy/config.sh`):
+Env (all optional except the owner; defaults derive from `deploy/config.sh`).
+On a **re-deploy**, `deploy.sh` first runs `discover-live-env.py`, which fills
+any unset optional input from the live stack (imported connection / topic ARN,
+ECS service ARN, CI webhook state) so a bare shell can never re-mint or drop
+what the stack already uses. Explicitly set values always win.
 
 | Var | Default | Meaning |
 | --- | --- | --- |
 | `PIPELINE_GITHUB_OWNER` | `GITHUB_OWNER` | GitHub org/user that owns the repo |
 | `PIPELINE_GITHUB_REPO` | `agentcore-hub` | repo to build |
 | `PIPELINE_BRANCH` | `main` | deploy trigger branch |
-| `PIPELINE_CONNECTION_ARN` | (mint new) | reuse an existing CodeConnections link |
-| `ECS_SERVICE_ARN` | (skip app roll) | the ECS Express service the Deploy stage rolls |
-| `PIPELINE_APPROVAL_SNS_ARN` | (mint new) | reuse an SNS topic (e.g. Telegram-bridged) |
+| `PIPELINE_CONNECTION_ARN` | (mint new; on re-deploy: the live imported link) | reuse an existing CodeConnections link |
+| `ECS_SERVICE_ARN` | (skip app roll; on re-deploy: the live value) | the ECS Express service the Deploy stage rolls |
+| `PIPELINE_APPROVAL_SNS_ARN` | (mint new; on re-deploy: the live imported topic) | reuse an SNS topic (e.g. Telegram-bridged) |
 | `PIPELINE_APPROVAL_EMAILS` | — | comma-separated email approvers |
 | `PIPELINE_CI_WEBHOOK` | off | `1` enables the CodeBuild PR-check webhook + commit status. PREREQ: the CodeConnections GitHub App must be installed on the repo WITH webhook permission — a repo-level step done AFTER the OAuth handshake in "One-time after first deploy" below. Without it, `CreateWebhook` fails the deploy. |
 | `PIPELINE_CI_START_BUILD` | off | `1` grants the pipeline-tools Lambda `codebuild:StartBuild` on the CI project ONLY (via `node deploy/setup-pipeline-tools-lambda.mjs`, NOT this CDK stack). The fallback for when the webhook cannot be installed: agents can trigger CI builds themselves, bounded by `concurrentBuildLimit` on the CI project and the calling agent's poll cap. |
@@ -108,7 +112,9 @@ Env (all optional except the owner; defaults derive from `deploy/config.sh`):
    check + ≥1 approval (GitHub repo settings). This is what makes CI a real
    gate.
 3. **Flip the fleet + UI on** (optional, when ready to re-scope agents):
-   - App/UI: set `NEXT_PUBLIC_PIPELINE_ENABLED=1` (shows the `/pipeline` tab).
+   - App/UI: nothing to set. The stack bakes `NEXT_PUBLIC_PIPELINE_ENABLED=1`
+     into every image it builds, so the `/pipeline` tab is on whenever this
+     module is deployed (the Deploy stage smoke-checks the tab is present).
    - Blueprints: set `PIPELINE_ENABLED=1` on the fleet/orchestrator context —
      the CI, QA, and release-manager blueprints then read pipeline results
      instead of shelling builds. Unset → they behave exactly as before.

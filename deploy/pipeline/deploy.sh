@@ -39,6 +39,14 @@ export PIPELINE_BRANCH="${PIPELINE_BRANCH:-main}"
 export CDK_DEFAULT_ACCOUNT="$ACCOUNT_ID"
 export CDK_DEFAULT_REGION="$AWS_REGION"
 
+# Re-deploy safety: the stack's optional inputs (PIPELINE_CONNECTION_ARN,
+# ECS_SERVICE_ARN, PIPELINE_CI_WEBHOOK, PIPELINE_APPROVAL_SNS_ARN) come from the
+# shell, and a shell that lacks one tells CDK "mint new" / "turn off" — which
+# is how a 2026-09-09 redeploy from a bare shell would have swapped the Source
+# action onto a fresh PENDING connection. Fill in whatever the LIVE stack
+# already imports; anything explicitly set in the environment wins.
+eval "$(python3 "$HERE/discover-live-env.py" --region "$AWS_REGION")"
+
 if [[ -z "${PIPELINE_GITHUB_OWNER}" ]]; then
   echo "ERROR: set PIPELINE_GITHUB_OWNER (or GITHUB_OWNER) — the GitHub repo owner to build." >&2
   exit 1
