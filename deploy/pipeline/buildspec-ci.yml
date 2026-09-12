@@ -151,11 +151,17 @@ phases:
       # every later command. venv/pip are guarded for the same reason -- a failed pip
       # would otherwise run the battery against missing deps, and a failed venv would
       # leave `.` sourcing a file that does not exist.
+      #
+      # TEAM-4501: --junitxml writes the machine-readable result to /tmp so the LAST
+      # post_build command can re-emit just the failed ids at the very END of the log.
+      # The agent-visible CloudWatch tail is 300 lines, and npm audit plus CodeBuild's
+      # echo of the BUILD_APP_IMAGE block fill all of it -- cf9317e6's red battery left
+      # no readable "short test summary info" at all. Nothing here is status-bearing.
       - |
         python3 -m venv /tmp/pyci || { echo "runtime-agent pytest venv creation FAILED"; exit 1; }
         . /tmp/pyci/bin/activate || { echo "runtime-agent pytest venv activate FAILED"; exit 1; }
         pip install -q -r deploy/runtime-agent/tests/requirements-test.txt || { rc=$?; deactivate; echo "runtime-agent pytest dep install FAILED (exit $rc)"; exit "$rc"; }
-        pytest -q deploy/runtime-agent/tests \
+        pytest -q --junitxml=/tmp/pytest-battery-junit.xml deploy/runtime-agent/tests \
           deploy/runtime-agent/test_telemetry_init.py \
           deploy/runtime-agent/test_build_env_vars.py \
           deploy/runtime-agent/test_remote_coding.py \
@@ -303,6 +309,23 @@ phases:
           else
             echo "deploy/runtime-agent/FORCE-UNKNOWN-RANGE" > pipeline-out/changed-files-runtime.txt || { echo "changed-files-runtime.txt fallback write FAILED"; exit 1; }
           fi
+        fi
+      # TEAM-4501: re-emit the battery's failed test ids at the very END of the log.
+      # post_build runs even when BUILD failed (cf9317e6: npm audit ran after the
+      # pytest failure), so this is the last thing in the 300-line tail. Read-only,
+      # `|| true`, no `exit` -- it can never change the build result. System python3
+      # (the venv is deactivated by then); both the managed image and the custom CI
+      # image bake python3 -- deploy/pipeline/ci-image/Dockerfile line 46.
+      - |
+        if [ -f /tmp/pytest-battery-junit.xml ]; then
+          python3 - /tmp/pytest-battery-junit.xml <<'PY' || true
+        import sys, xml.etree.ElementTree as ET
+        root = ET.parse(sys.argv[1]).getroot()
+        bad = [(tc, n) for tc in root.iter("testcase") for n in tc if n.tag in ("failure", "error")]
+        print(f"pytest battery summary (from junit xml): {len(bad)} failed/errored")
+        for tc, n in bad:
+            print(f"FAILED {tc.get('classname')}::{tc.get('name')} -- {(n.get('message') or '')[:200]}")
+        PY
         fi
 
 # For the deploy pipeline Build stage, these are the promote-by-digest artifacts.
