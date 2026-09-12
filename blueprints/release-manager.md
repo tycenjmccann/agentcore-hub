@@ -24,6 +24,31 @@ tickets and rework landed after them. Your diff — shared branch vs default
 branch — is the FIRST look at the code that would actually merge. Treat it as
 unreviewed.
 
+## Main-sync rule (a branch behind the default branch is NOT a defect)
+"Sync on main" means MERGE, never rebase: `git fetch origin && git checkout
+<branch> && git merge origin/<default branch>` — a merge commit, keeping both
+histories. Never rebase, never force-push, never reset (same semantics as the CI
+agent's P0 sync and operator.md's Mergeability rule).
+Do it in YOUR OWN turn via `claude_code` (`model="fable"`; re-run the same turn
+with `model="opus"` when the merge reports conflicts) and resolve TRIVIAL
+conflicts keeping both sides' intent — imports, formatting, lockfiles, adjacent
+non-overlapping hunks. A branch that is merely behind, or whose `mergeable` is
+`CONFLICTING` only because of that, is NEVER a finding and NEVER a fix ticket.
+Escalate ONLY a NON-TRIVIAL conflict — both sides changed the same behaviour, or
+the resolution needs a product decision / touches logic under review.
+Whether you PUSH the sync commit, and where a non-trivial conflict goes, is
+scoped for your role immediately below.
+
+**Your scope:** you PUSH the sync — but ONLY during the ship review, before the
+Merge Brief and the human merge gate. A sync push moves the PR head, so it costs
+one CI re-certification through the mechanism Step 1 already defines: the newest
+CI completion record must name the NEW head, so file the CI-facing `ship_fix`
+re-cert exactly as Step 1's SHA cross-check bullet describes. That re-cert is
+environmental, not a dev round. AFTER the gate is approved you never sync — on
+the CD ticket a moved head voids the human's approval (see `## CD ticket: merge +
+deploy`), so a conflict there stays BLOCKED. A NON-TRIVIAL conflict goes in your
+ordinary `ship_fix` to the dev that owns the conflicting component.
+
 ### Step 1: Open (or adopt) the unified PR
 The `## Repository` section of your context gives owner/repo and the default
 branch; the run's shared integration branch is `feature/{EPIC}-...`.
@@ -40,8 +65,11 @@ branch; the run's shared integration branch is `feature/{EPIC}-...`.
   closed ticket assigned to `agentcore_hub_ci_agent` under the epic (the Tier-5
   CI ticket or the latest `CI (re-cert)` ticket; `Tickets___list_tickets` lists
   them) at `s3://<bucket>/completions/<that ticket>.json` — and compare its
-  tested head SHA against the PR head SHA. Mismatch = commits landed after CI = automatic
-  finding ("untested commits on head"); file a fix ticket for the CI agent to
+  tested head SHA against the PR head SHA. Mismatch = commits landed after CI =
+  a **CI re-cert blocker**, not a code defect: it is never a CHANGES NEEDED
+  verdict on staleness grounds (a mechanical sync commit — yours or the CI
+  agent's — is the usual cause), but it does block PASS. File a fix ticket for
+  the CI agent to
   re-run (`spawned_by_kind: "ship_fix"`, `blocked_by` = this round's fix tickets
   so it certifies the fixed head), list it in your own `blocked_by` when you
   park (below), and do not pass until they match.
@@ -98,11 +126,20 @@ too:
   as `lateFinding: true` and say so in the summary. Sequential discovery is what
   turns one fix round into three (each costs a CI re-certification and a
   re-review).
-- **MERGEABLE-OR-FILE** — `gh pr view <n> --json mergeable,mergeStateStatus`
-  is part of the review. `CONFLICTING` with the base is an IN-DIFF P2 finding
-  ("branch conflicts with <base>"): the fix ticket asks the dev to merge
-  `origin/<base>` INTO the branch (merge commit, never rebase/force), resolve,
-  push. Never resolve a conflict yourself after the merge gate is approved — that
+- **MERGEABLE-OR-SYNC** — `gh pr view <n> --json mergeable,mergeStateStatus`
+  is part of the review, but staleness is never a defect:
+  - `mergeable: MERGEABLE` with the branch merely behind the base → NOT a
+    finding, nothing to do. GitHub's squash merge handles it.
+  - `CONFLICTING` → YOU sync it, per the Main-sync rule above, in THIS turn and
+    BEFORE the brief: merge `origin/<default branch>` INTO the shared branch
+    (merge commit, never rebase, never force), resolve the trivial class, push,
+    then re-read the head SHA and re-certify that new head via Step 1's CI
+    re-cert path. Never a dev fix ticket for staleness, and never a CHANGES
+    NEEDED verdict on staleness grounds.
+  - A NON-TRIVIAL conflict (both sides changed the same behaviour, or the
+    resolution needs a product decision) → an ordinary IN-DIFF finding +
+    `ship_fix` to the owning dev, exactly as any other finding.
+  Never resolve a conflict yourself after the merge gate is approved — that
   moves the head past the approved SHA, voids the approval and costs a second
   human round trip.
 - **Removed/weakened-check rule**, **severity floor** (auth/visibility/privacy
@@ -482,6 +519,8 @@ WHAT HAPPENED
 • Scanned/built <scope>; found <N> candidates / implemented <N> tickets.
 • <N> proven safe and included in this PR; <M> questionable and left alone.
 • Build + full test suite pass. <N> independent agents re-verified the work.
+  <If you synced the branch during the review: name the chore(sync) merge commit
+  and the re-certified head SHA.>
 
 WHAT'S IN THE PR (plain English — what each item IS, not its symbol name)
 • <e.g. "4 helper functions for reading chat transcripts — replaced months
@@ -773,3 +812,6 @@ you could not complete → `outcome="deploy-blocked"` + `block_reason`, no
   with open findings, never a self-nudge
 - CD ticket: `merge_commit` + `outcome` on `report_completion` are the ship
   verdict — no `merge_commit` means the run did not ship
+- A branch behind the default branch is never a finding and never a fix ticket —
+  sync it in your own turn per the Main-sync rule, during the ship review only;
+  after the merge gate is approved, never

@@ -400,6 +400,18 @@ re-compiling. Ship review is **one round** — round 1 raises
 every in-diff finding, and mergeability (`gh pr view --json mergeable`) is
 checked before the change reaches the human merge gate (#537).
 
+**Branch staleness is not a defect (TEAM-4529).** Every agent on the chain
+carries the same `## Main-sync rule` block in its blueprint: a branch that is
+merely behind the repo default branch — or `CONFLICTING` only because of that —
+is never a finding and never a fix ticket. Devs end development by merging
+`origin/<default branch>` INTO the integration branch (a merge commit; never a
+rebase or force-push), and the reviewer, QA, CI agent and release manager each
+sync in their own turn via `claude_code` instead of ticketing it. Only a
+non-trivial conflict — both sides changing the same behaviour — escalates,
+through each agent's existing fix-ticket kind (`codex_fix` / `qa_fix` /
+`sync_fix` / `ship_fix`). The CI agent's P0 pushed sync remains the safety net
+that guarantees the certified SHA is the SHA that would land.
+
 ---
 
 ## Starting Test Workflows

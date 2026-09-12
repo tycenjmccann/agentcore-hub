@@ -35,6 +35,27 @@ when the feedback explicitly demands a clean-slate redo.
 Only when base_branch IS the repo default branch (no shared branch was created)
 do you PR against it directly.
 
+## Main-sync rule (a branch behind the default branch is NOT a defect)
+"Sync on main" means MERGE, never rebase: `git fetch origin && git checkout
+<branch> && git merge origin/<default branch>` — a merge commit, keeping both
+histories. Never rebase, never force-push, never reset (same semantics as the CI
+agent's P0 sync and operator.md's Mergeability rule).
+Do it in YOUR OWN turn via `claude_code` (`model="fable"`; re-run the same turn
+with `model="opus"` when the merge reports conflicts) and resolve TRIVIAL
+conflicts keeping both sides' intent — imports, formatting, lockfiles, adjacent
+non-overlapping hunks. A branch that is merely behind, or whose `mergeable` is
+`CONFLICTING` only because of that, is NEVER a finding and NEVER a fix ticket.
+Escalate ONLY a NON-TRIVIAL conflict — both sides changed the same behaviour, or
+the resolution needs a product decision / touches logic under review.
+Whether you PUSH the sync commit, and where a non-trivial conflict goes, is
+scoped for your role immediately below.
+
+**Your scope:** you PUSH the sync — this is the LAST development step, on
+`base_branch` after your own PR is merged into it (see the delivery step). A
+non-trivial conflict that survives the `model="opus"` retry → report BLOCKED
+naming the conflicting files; never a silent handoff, and never a fix ticket for
+staleness alone.
+
 ## Process
 
 ### Step 1: Gather Context
@@ -161,7 +182,11 @@ A session that dies after the deliverable but before the report leaves the run u
    - Files modified
    - Screenshot of the result (the harvested S3 key from the `[coding-artifacts: ...]` footer — never a committed file)
 4. Merge the PR into base_branch once your evidence is complete
-5. `WorkflowOutput___report_completion` IMMEDIATELY after the merge — branch, commit SHA, PR URL
+5. **Sync base_branch on main — the LAST development step.** After merging your PR
+   into base_branch, merge `origin/<default branch>` INTO `base_branch` (see the
+   Main-sync rule) and push it. The sync is part of the deliverable, so the
+   ship-then-report ordering above is unchanged: sync, then report.
+6. `WorkflowOutput___report_completion` IMMEDIATELY after the sync — branch, commit SHA, PR URL
 
 ## Rules
 - Before deleting/weakening/proxying ANY existing check: state what it enforces and grep every writer of the replacement value across all tiers (client + backend handlers + schema). A check you can't explain is a check you don't remove.
@@ -176,3 +201,4 @@ A session that dies after the deliverable but before the report leaves the run u
 - Follow existing code patterns — don't introduce new paradigms
 - Keep changes scoped to what the ticket asks for
 - PRs target base_branch, never the repo default branch (unless base_branch IS the default)
+- Never hand off to review with `base_branch` behind the repo default branch — a branch that only needs a main-merge is your job to sync (Main-sync rule), not a fix ticket
