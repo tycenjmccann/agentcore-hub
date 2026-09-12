@@ -317,6 +317,19 @@ def test_build_image_block_digest_fatal_exit_survives():
 
 _OK = "#!/usr/bin/env bash\nexit 0\n"
 
+# TEAM-4506: `docker login --password-stdin` is the RIGHT side of the buildspec's
+# scoped-pipefail pipe, and real docker/cli drains stdin before it exits. A plain
+# `exit 0` stub does not: when it exits before `aws ecr get-login-password`'s write
+# lands, `aws` takes SIGPIPE (rc 141), pipefail surfaces that as the pipe's status
+# and the `||` guard prints a false `ECR docker login FAILED` (~1/200 runs, in every
+# test that runs this block). Drain on `login` only -- `docker info` and
+# `docker buildx build` never read stdin, and an unconditional `cat` would block on
+# a real tty under `pytest -s`/`--capture=no`.
+_STUB_DOCKER = """#!/usr/bin/env bash
+if [ "$1" = "login" ]; then cat >/dev/null 2>&1 || true; fi
+exit 0
+"""
+
 _STUB_ZIP = """#!/usr/bin/env bash
 exit "${ZIP_STUB_RC:-0}"
 """
@@ -359,7 +372,8 @@ def _run_build_image_block(tmp_path, manifest_rc=0, zip_rc=0, ecr_login_rc=0,
     bin_dir.mkdir()
     for name, content in (
         ("cp", _OK), ("rm", _OK), ("mkdir", _OK), ("npm", _OK), ("nohup", _OK),
-        ("dockerd", _OK), ("timeout", _OK), ("sleep", _OK), ("python3", _OK), ("docker", _OK),
+        ("dockerd", _OK), ("timeout", _OK), ("sleep", _OK), ("python3", _OK),
+        ("docker", _STUB_DOCKER),
         ("zip", _STUB_ZIP), ("grep", _STUB_GREP), ("git", _STUB_GIT), ("aws", _STUB_AWS),
     ):
         _write_stub(bin_dir / name, content)
@@ -435,7 +449,9 @@ def test_build_image_block_propagates_a_failing_zip(tmp_path):
 def test_build_image_block_fails_when_ecr_get_login_password_fails(tmp_path):
     """The TEAM-4493 regression test. The `docker` stub exits 0, so on the PRE-change
     buildspec (no pipefail) the pipeline status is docker's 0, the `||` guard never fires
-    and the block exits 0 -- a credential failure behind a green Build."""
+    and the block exits 0 -- a credential failure behind a green Build. TEAM-4506: it
+    also drains stdin on `login`, like real `docker login --password-stdin`, so `aws`
+    never dies of SIGPIPE and pipefail only ever sees the injected rc."""
     proc = _run_build_image_block(tmp_path, ecr_login_rc=1)
     assert proc.returncode != 0, proc.stderr + proc.stdout
     assert "ECR docker login FAILED" in proc.stdout
