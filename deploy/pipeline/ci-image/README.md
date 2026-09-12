@@ -48,7 +48,10 @@ as part of `cdk deploy`.
    such Build failed - the static bundle lacks `docker-proxy` and the image had no `iptables`,
    so dockerd exited at config validation. The buildspec now starts it with
    `--userland-proxy=false --iptables=false --ip6tables=false --bridge=none` and builds with
-   `--network=host`; the image also ships both binaries so a default daemon works.)
+   `--network=host`; the image also ships both binaries so a default daemon works. The second
+   attempt then failed on `overlay2` ("failed to mount overlay: invalid argument" - overlay on
+   CodeBuild's overlay root), so the **Build project is back on the managed image** and only
+   the `ci` project uses this image. Moving Build back needs a non-overlay `--data-root`.)
 
 ### Reading the INSTALL log
 
