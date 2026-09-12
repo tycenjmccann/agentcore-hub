@@ -254,6 +254,9 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
 
   // Ticket status map — seeded from fetch, updated via SSE
   const [ticketStatusMap, setTicketStatusMap] = useState<Record<string, { status: TicketStatus; title: string; updatedAt: string; assignee?: string }>>({});
+  // First /tickets response for this run has landed (success or failure) — until
+  // then hasOpenTickets is a guess of false.
+  const [ticketsLoaded, setTicketsLoaded] = useState(false);
 
   // Agents that still have an open (nonterminal) ticket — e.g. QA fix-it
   // tickets filed after the agent's first pass completed, including ones that
@@ -474,6 +477,11 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
 
   // Fetch ticket statuses — re-fetches when agentTasks change (new tickets appear)
   const agentTaskKeys = state?.agentTasks ? Object.keys(state.agentTasks).sort().join(",") : "";
+  // Declared before the fetch effect so a run switch clears the flag first, and the
+  // new run's first response is the one that sets it again.
+  useEffect(() => {
+    setTicketsLoaded(false);
+  }, [workflowId]);
   useEffect(() => {
     const fetchTickets = () => {
       fetch(`/api/workflow/${workflowId}/tickets`)
@@ -503,7 +511,11 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
             setTicketStatusMap(map);
           }
         })
-        .catch(() => {});
+        .catch(() => {})
+        // Success or failure, we now know as much as we are going to: a failing
+        // tickets API degrades to the old behaviour (treated as no open tickets)
+        // rather than withholding the Workflow Manager panel forever.
+        .finally(() => setTicketsLoaded(true));
     };
     fetchTickets();
     // Poll every 15s while workflow is active (no SSE ticket_update events yet).
@@ -1000,6 +1012,23 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
     shipBlockedPhase === "deploy-blocked" ? "Deploy Blocked"
     : shipBlockedPhase === "static-ci-only" ? "CI-Only (Not Shipped)"
     : null;
+  // TEAM-4521 F1 — the Workflow Manager panel's mount rule, named once because the
+  // hero KPI strip has to agree with it: the strip's agent-authored tile scrolls to
+  // #workflow-manager-panel, so offering that tile without this block on the page is
+  // a dead click. Every terminal phase gets the panel — including deploy-blocked /
+  // static-ci-only, which are analyzed too — EXCEPT a "complete" run that still has
+  // open fix-it tickets, which is not settled yet (see isComplete).
+  //
+  // A "complete" run waits for the first /tickets response before deciding, because
+  // hasOpenTickets is false-by-default until then: mounting the panel — and offering
+  // the strip's tile, which fires the analysis GET — on that guess and then tearing
+  // it all down when the open fix-it tickets arrive is a visible flicker plus a
+  // wasted request. Every other terminal phase doesn't consult tickets at all, so it
+  // has nothing to wait for.
+  const showWorkflowManager =
+    state?.phase === "complete"
+      ? ticketsLoaded && !hasOpenTickets
+      : isTerminalPhase(state?.phase);
 
   // Trigger connector animation when activeConnector changes
   useEffect(() => {
@@ -1400,7 +1429,9 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
       )}
 
       {/* Headline cost/time/quality above the fold — the full card is ~1 screen down, inside .pipeline-viz. */}
-      {isTerminalPhase(state.phase) && <HeroKpiStrip workflowId={workflowId} />}
+      {isTerminalPhase(state.phase) && (
+        <HeroKpiStrip workflowId={workflowId} wmPanelMounted={showWorkflowManager} />
+      )}
 
       <div className="pipeline-viz">
         {/* Top bar: scrubber left, status right */}
@@ -1855,8 +1886,11 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
           </div>
         )}
 
-        {(isComplete || state.phase === "cancelled" || state.phase === "error") && (
-          // id is the hero strip's scroll target for the agent-authored score tile
+        {showWorkflowManager && (
+          // Every terminal phase except complete-with-open-tickets (see
+          // showWorkflowManager). The id is the hero strip's scroll target for the
+          // agent-authored score tile, which the strip only offers when this
+          // block is mounted — the two conditions are the same boolean by design.
           <div id="workflow-manager-panel">
             <WorkflowManagerPanel workflowId={workflowId} onAskAboutRun={onAskManager} />
           </div>
