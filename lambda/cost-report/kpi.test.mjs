@@ -33,6 +33,7 @@ import {
   computeBands,
   computeKpi,
   deriveCiVerdict,
+  guardWorkflow,
   readKpi,
   stampKpiBands,
   summarize,
@@ -524,6 +525,41 @@ describe("stampKpiBands", () => {
     assert.equal(JSON.stringify(card), before);
     assert.doesNotThrow(() => stampKpiBands(undefined));
     assert.doesNotThrow(() => stampKpiBands({ kpi: null }));
+  });
+});
+
+// ─── guardWorkflow (A1) ───────────────────────────────────────────────────────
+//
+// Pure by design — no DDB, no S3 — precisely so it can be unit-tested without
+// mocking index.mjs's module-private clients (the handler itself, and the
+// rebuildIndex D-17 re-stamp compare, still need a live-AWS or refactored
+// integration test and are not covered here).
+
+describe("guardWorkflow", () => {
+  test("no workflow row at all → not-found, regardless of trigger", () => {
+    assert.deepStrictEqual(guardWorkflow(undefined, { isEventBridge: false }), { skipped: "not-found" });
+    assert.deepStrictEqual(guardWorkflow(null, { isEventBridge: true }), { skipped: "not-found" });
+  });
+
+  test("a direct invoke on a deleted workflow is refused", () => {
+    const workflow = { phase: "complete", deleted: true };
+    assert.deepStrictEqual(guardWorkflow(workflow, { isEventBridge: false }), { skipped: "deleted" });
+  });
+
+  test("a direct invoke on a still-running workflow is refused", () => {
+    const workflow = { phase: "development" };
+    assert.deepStrictEqual(guardWorkflow(workflow, { isEventBridge: false }), { skipped: "not-terminal" });
+  });
+
+  test("every terminal phase clears a direct invoke", () => {
+    for (const phase of ["complete", "cancelled", "error", "deploy-blocked", "static-ci-only"]) {
+      assert.equal(guardWorkflow({ phase }, { isEventBridge: false }), null, phase);
+    }
+  });
+
+  test("the EventBridge path is untouched by deleted/not-terminal — it only ever fires on workflow.complete", () => {
+    assert.equal(guardWorkflow({ phase: "development" }, { isEventBridge: true }), null);
+    assert.equal(guardWorkflow({ phase: "complete", deleted: true }, { isEventBridge: true }), null);
   });
 });
 

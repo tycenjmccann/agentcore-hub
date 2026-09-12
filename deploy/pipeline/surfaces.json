@@ -14,11 +14,16 @@
     {
       "function": "agentcore-hub-cost-report",
       "dir": "lambda/cost-report",
+      "paths": [
+        "lambda/cost-report/",
+        "src/config/kpi.json"
+      ],
       "files": [
-        "index.mjs"
+        "index.mjs",
+        "kpi.json"
       ],
       "npm": false,
-      "note": "If REPORT_VERSION changed in index.mjs, run lambda/cost-report/deploy.sh --backfill by hand (regenerates every card; --rebuild-index alone empties the fleet index)."
+      "note": "REPORT_VERSION is 5 (card.kpi, kpiVersion 1). If REPORT_VERSION or kpiVersion changed, run lambda/cost-report/deploy.sh --backfill [--since-days N] by hand: --rebuild-index alone drops every card that is not at the current REPORT_VERSION, so a bump REQUIRES --backfill or the fleet index empties."
     },
     {
       "function": "agentcore-hub-anomaly-watcher",
@@ -192,6 +197,13 @@
       "dst": "config/pricing.json",
       "paths": [
         "src/config/pricing.json"
+      ]
+    },
+    {
+      "src": "src/config/kpi.json",
+      "dst": "config/kpi.json",
+      "paths": [
+        "src/config/kpi.json"
       ]
     },
     {

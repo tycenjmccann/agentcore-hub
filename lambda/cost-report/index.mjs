@@ -149,6 +149,24 @@ const LOG = "[performance-card]";
 
 // ─── Handler ──────────────────────────────────────────────────────────────────
 
+/**
+ * A1: should this invoke be allowed to (over)write a card? Pure — no AWS, no
+ * logging — so it unit-tests without mocking the DDB client that owns `workflow`.
+ *
+ * A direct {workflowId} invoke is reachable by anyone who can invoke this
+ * Lambda, and it always overwrites the card. Refuse the two cases where doing so
+ * would publish something wrong: a deleted run (card resurrected after the row
+ * was removed) and a still-running one (a half-run scored as if it had ended).
+ * EventBridge only ever fires on workflow.complete, so its path is untouched.
+ */
+export function guardWorkflow(workflow, { isEventBridge }) {
+  if (!workflow) return { skipped: "not-found" };
+  if (isEventBridge) return null;
+  if (workflow.deleted === true) return { skipped: "deleted" };
+  if (!TERMINAL_PHASES.has(workflow.phase)) return { skipped: "not-terminal" };
+  return null;
+}
+
 export const handler = async (event) => {
   if (!ARTIFACT_BUCKET) throw new Error("ARTIFACT_BUCKET not set");
   if (event?.rebuildIndex) return rebuildIndex(event);
@@ -158,24 +176,10 @@ export const handler = async (event) => {
   if (!workflowId) throw new Error(`No workflowId in event: ${JSON.stringify(event).slice(0, 300)}`);
 
   const workflow = (await ddb.send(new GetCommand({ TableName: WORKFLOWS_TABLE, Key: { workflowId } }))).Item;
-  if (!workflow) {
-    console.warn(`${LOG} workflow ${workflowId} not found — skipping`);
-    return { skipped: "not-found" };
-  }
-  // A1: a direct {workflowId} invoke is reachable by anyone who can invoke this
-  // Lambda, and it always overwrites the card. Refuse the two cases where doing so
-  // would publish something wrong: a deleted run (card resurrected after the row
-  // was removed) and a still-running one (a half-run scored as if it had ended).
-  // EventBridge only ever fires on workflow.complete, so its path is untouched.
-  if (!isEventBridge) {
-    if (workflow.deleted === true) {
-      console.warn(`${LOG} workflow ${workflowId} is deleted — skipping`);
-      return { skipped: "deleted" };
-    }
-    if (!TERMINAL_PHASES.has(workflow.phase)) {
-      console.warn(`${LOG} workflow ${workflowId} phase "${workflow.phase}" is not terminal — skipping`);
-      return { skipped: "not-terminal" };
-    }
+  const guard = guardWorkflow(workflow, { isEventBridge });
+  if (guard) {
+    console.warn(`${LOG} workflow ${workflowId} skipped: ${guard.skipped}`);
+    return guard;
   }
 
   const cardKey = cardKeyOf(workflowId);

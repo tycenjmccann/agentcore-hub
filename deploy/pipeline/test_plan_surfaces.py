@@ -23,7 +23,7 @@ def test_lambda_dir_change_deploys_that_function_only():
     lambdas = kinds(actions, "LAMBDA")
     assert [a[1] for a in lambdas] == ["agentcore-hub-cost-report"]
     fn, d, npm, optional, files, note = lambdas[0][1:]
-    assert d == "lambda/cost-report" and npm == "0" and optional == "0" and files == "index.mjs"
+    assert d == "lambda/cost-report" and npm == "0" and optional == "0" and files == "index.mjs kpi.json"
     assert "REPORT_VERSION" in note
     assert not kinds(actions, "HANDOFF")
 
