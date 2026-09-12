@@ -17,7 +17,7 @@
  *  - colour never carries status on its own: every band chip spells its word.
  */
 
-import { useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 import { CheckCircle2, ClipboardCheck, Clock, Coins, type LucideIcon } from "lucide-react";
 import {
   BASELINE_DAYS,
@@ -463,15 +463,22 @@ function KpiTile({ model, onActivate }: { model: TileModel; onActivate: () => vo
         // text-2xl/leading-none number, the same reserved two-line sub block, and
         // the mt-auto chip — so loading and ready are the SAME height, not merely
         // both under TILE_MIN_H.
-        <>
+        //
+        // key="skeleton"/"ready": without it, React reuses each child slot's DOM
+        // node across this ternary (same tag, same position) and only patches its
+        // className — so a skeleton bar's bg-tertiary background, or the grey it
+        // starts a band chip from, animates out under globals.css's blanket
+        // `* { transition: background-color .2s }` instead of never applying,
+        // leaving a fading ghost box for ~200ms. The key forces a fresh mount.
+        <Fragment key="skeleton">
           <span className={`${SKELETON_CLASS} h-6 w-20`} />
           <span className={SUB_RESERVE}>
             <span className={`${SKELETON_CLASS} block h-3 w-32`} />
           </span>
           <span className={`${SKELETON_CLASS} mt-auto h-5 w-24 rounded-full`} />
-        </>
+        </Fragment>
       ) : (
-        <>
+        <Fragment key="ready">
           <span className="flex flex-wrap items-baseline gap-1.5">
             <span
               className={`text-2xl font-semibold tabular-nums leading-none ${
@@ -498,7 +505,7 @@ function KpiTile({ model, onActivate }: { model: TileModel; onActivate: () => vo
           {/* mt-auto: the chips line up along the bottom of the row even when one
               tile's sub-line wraps to two lines and another's does not. */}
           {model.band && <span className={`${CHIP_CLASS} mt-auto ${STATUS_STYLE[model.band]}`}>{BAND_TEXT[model.band]}</span>}
-        </>
+        </Fragment>
       )}
       <span id={hintId} className="sr-only">{model.hover}</span>
     </button>
@@ -585,7 +592,12 @@ export default function HeroKpiStrip({ workflowId }: { workflowId: string }) {
           same strip footer at 1440. */}
       <div className="mt-2 min-h-[26px] flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
         {card ? (
-          <span className="text-[11px] text-[var(--color-text-muted)]">
+          // key: forces a fresh DOM node instead of patching the skeleton bar's
+          // className in place. Without it React reuses the same <span>, and
+          // globals.css's `* { transition: background-color .2s }` animates that
+          // node's now-stale bg-tertiary background out instead of never applying
+          // it, leaving a fading ghost box behind the meta text for ~200ms.
+          <span key="meta" className="text-[11px] text-[var(--color-text-muted)]">
             {card.workflowDefId}
             {baseline?.n
               ? ` · baseline ${baseline.n} runs / ${baseline.windowDays}d${
@@ -594,7 +606,7 @@ export default function HeroKpiStrip({ workflowId }: { workflowId: string }) {
               : ""}
           </span>
         ) : state === "loading" ? (
-          <span className={`${SKELETON_CLASS} h-3 w-40`} aria-hidden />
+          <span key="skeleton" className={`${SKELETON_CLASS} h-3 w-40`} aria-hidden />
         ) : null}
         {computeLabel && (
           <button
