@@ -3,7 +3,7 @@
 # deploy.sh — Deploy one, some, or all agents to AgentCore Runtime
 #
 # Usage:
-#   ./deploy.sh                     # Deploy all 14 agents
+#   ./deploy.sh                     # Deploy all 15 agents
 #   ./deploy.sh backend_dev         # Deploy one agent (prefix optional)
 #   ./deploy.sh 10                  # Deploy agent #10 (agentcore_hub_backend_dev)
 #   ./deploy.sh 10 11 12            # Deploy agents #10, #11, #12
@@ -66,8 +66,8 @@ for arg in "$@"; do
   elif [ "$arg" = "--help" ] || [ "$arg" = "-h" ]; then
     echo "Usage: ./deploy.sh [--force --force-reason \"<why>\"] [agents...]"
     echo ""
-    echo "  No args               Deploy all 14 agents"
-    echo "  <number>              Deploy by index (1-14)"
+    echo "  No args               Deploy all 15 agents"
+    echo "  <number>              Deploy by index (1-15)"
     echo "  <name>                Deploy by name (agentcore_hub_ prefix optional)"
     echo "  --list, -l            Show numbered agent list"
     eval_gate_force_usage_lines

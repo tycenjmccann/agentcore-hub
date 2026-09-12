@@ -221,7 +221,7 @@ function deployDocForms(value: string): string[] {
  * deployDoc of `../../etc`) would otherwise be stored as-is and only fail later
  * inside a Lambda with an opaque AWS error (the registry is a runtime
  * allow-list read by the tools Lambda, the Telegram deploy-gate bridge and the
- * orchestrator — see docs/agents-own-cd.md).
+ * orchestrator — see docs/pipeline/design.md).
  *
  * Returns null when the payload is fine, else every failing field's reason at
  * once (field name → reason), so the caller can report them all in one 400.

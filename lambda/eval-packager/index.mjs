@@ -282,7 +282,7 @@ export const handler = async (event) => {
   //
   // NOTE from §2.2 still holds: EvalDuplicateResultCount includes seen-set
   // drops, but to VERIFY the seen-set is working use the §2.2 Logs Insights
-  // query grouped by logStream (docs/eval-infrastructure-reliability-design.md).
+  // query grouped by logStream (docs/evaluations/reliability-design.md).
   await aggregateScoresToDdb(agentId, sessionData.evaluatorResults);
 
   // 8. Append to sessionBuffer, counting distinct runs toward batchSize

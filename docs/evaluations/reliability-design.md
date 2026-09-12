@@ -2,7 +2,7 @@
 
 Design record for the eval ingest path (`lambda/eval-packager/index.mjs`) and the
 telemetry it depends on. Companion to the operator runbooks in
-[`orchestration-tracing-guide.md`](./orchestration-tracing-guide.md) (judge-quota
+[`orchestration-tracing-guide.md`](../orchestration-tracing-guide.md) (judge-quota
 change, eval health dashboard/alarm): this file records the *decisions*, that one
 records the *procedures*.
 

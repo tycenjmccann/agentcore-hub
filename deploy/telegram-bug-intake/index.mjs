@@ -2,7 +2,7 @@
  * Telegram Bug Intake Lambda (local/account-specific, not part of OSS core)
  *
  * Screenshot(s) + description sent to a Telegram bot → structured Jira Bug →
- * hub pipeline (bootstrapBugWorkflow). See docs/bug-intake-jira.md for the
+ * hub pipeline (bootstrapBugWorkflow). See docs/workflow/bug-intake-jira.md for the
  * downstream contract this feeds.
  *
  * POLLING architecture — no public endpoint (account blocks public Lambdas,

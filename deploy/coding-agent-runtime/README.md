@@ -1,14 +1,14 @@
 # Coding Agent Runtime (resumable Claude Code + Codex + Kiro)
 
 A dedicated Amazon Bedrock AgentCore Runtime that hosts coding CLIs server-side
-with a **persistent per-repo workspace** (`/mnt/workspace`) and **OTel →
+with a **persistent per-session workspace** (`/mnt/efs`) and **OTel →
 CloudWatch tracing**. This is the official "safe to close your laptop" pattern
 from [awslabs/agentcore-samples](https://github.com/awslabs/agentcore-samples)
 (`04-coding-agents/01-claude-code-with-s3-files`): the CLI runs in a per-session
 microVM, the workspace survives, and you **resume a conversation by invoking
 again with the same `runtimeSessionId`**.
 
-> This is a standalone, user-facing coding agent — NOT wired into the 14-agent
+> This is a standalone, user-facing coding agent — NOT wired into the 16-agent
 > workflow fleet. (An earlier attempt to force coding-CLI output through the
 > workflow pipeline failed because the pipeline assumes local files; this model
 > is Git-native and conversational instead.)
@@ -21,12 +21,12 @@ client ── invoke_agent_runtime(runtimeSessionId, {prompt, repo?, cli?, claud
           ▼
    microVM (one per runtimeSessionId)
      main.py /invocations
-       ├─ git clone repo → /mnt/workspace/<owner-name>   (first turn only; warm after)
+       ├─ git clone repo → /mnt/efs/sessions/<id>        (first turn only; warm after)
        ├─ claude --print --resume <claude_session_id>    (or run-codex.sh for codex)
        └─ commit / push / open PR
      ← { response, claude_session_id, cli, workspace }
 
-resume = same runtimeSessionId  → same warm microVM + /mnt/workspace
+resume = same runtimeSessionId  → same warm microVM + /mnt/efs
        + claude_session_id       → same Claude Code conversation
 ```
 
@@ -59,7 +59,7 @@ resume = same runtimeSessionId  → same warm microVM + /mnt/workspace
   the rollout files when the DB is fresh, so resume is unaffected.
 - **Conversation resume:** Claude Code's own `--resume <session_id>`. Claude scopes
   a conversation to its working directory, so the server persists a
-  `{claude_session_id → repo}` map (`/mnt/workspace/.sessions.json`) and recovers
+  `{claude_session_id → repo}` map (`/mnt/efs/.sessions.json`) and recovers
   the cwd automatically — the caller only needs to pass `claude_session_id`.
 - **Git-native:** works from a clone, not your local files. Output = a pushed branch / PR.
 
@@ -123,7 +123,7 @@ python3 deploy/coding-agent-runtime/invoke.py --cli kiro --repo owner/name "..."
 | `cli` | no | `claude` (default), `codex`, or `kiro` |
 | `claude_session_id` | no | From a prior turn's response → resumes that Claude Code conversation |
 | `session_id` | no | runtimeSessionId — isolates this session's checkout under `/mnt/efs/sessions/<id>` |
-| `stream` | no | `true` → SSE token stream (claude only) |
+| `stream` | no | `true` → SSE token/step stream (claude, codex, kiro) |
 | `branch` | no | `git fetch + checkout` this branch before the turn (the ported in-flight branch) |
 | `resume_transcript` | no | S3 key of a ported `.jsonl`. Installed at the cwd slug → native `claude --resume` |
 | `resume_session_id` | no | The conversation id inside that transcript (its filename) |
@@ -163,7 +163,7 @@ heartbeat: liveness is the CLI process itself, read from `/proc/<pid>/stat`. A
 runner that outlives `turn_timeout_secs + TURN_RUNNER_GRACE_S` writes its own
 terminal record, so a wedged turn can never leave the session `session_busy`.
 
-See DL-026 in [docs/workflow-pipeline-architecture.md](../../docs/workflow-pipeline-architecture.md)
+See DL-026 in [docs/architecture.md](../../docs/architecture.md)
 for why the earlier EFS-journal + poll design was replaced.
 
 ### Port / pull round trip
@@ -289,7 +289,10 @@ runs `claude --output-format stream-json --include-partial-messages` and the
 server returns a `StreamingResponse` of `data:` frames (`{type:text|done|error}`)
 that AgentCore forwards through `InvokeAgentRuntime` (accept `text/event-stream`).
 The Next.js chat consumes it via the shared SSE reader. See
-[docs/streaming-sse.md](../../docs/streaming-sse.md). Codex stays buffered.
+[docs/streaming-sse.md](../../docs/streaming-sse.md). Codex and Kiro stream too:
+`stream:true` with `cli:codex` / `cli:kiro` emits the same
+`{type:text|done|error}` SSE frames — step-level, from codex `exec --json`
+events and kiro's stdout lines — so every CLI streams live in the UI.
 
 ## Kiro notes
 - **Auth is bring-your-own-key ONLY** — set `KIRO_API_KEY` (ksk_… from kiro.dev) in
@@ -303,7 +306,6 @@ The Next.js chat consumes it via the shared SSE reader. See
   into structured `coding_usage` log records for the cost-report Lambda.
 
 ## Known gaps / next
-- **Codex resume:** each Codex turn is independent (no `--resume` wired) — Claude has full resume.
 - **Single-user:** no auth yet. Session records should carry `userId` (hardcode `"default"` now,
   swap for the Cognito `sub` when app-wide SSO lands).
 
