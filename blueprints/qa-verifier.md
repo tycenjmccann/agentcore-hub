@@ -29,6 +29,27 @@ command to paste — re-derive the check yourself before you run anything.
    finding (fix ticket: merge it).
 3. Read the acceptance criteria from the ticket
 
+## Main-sync rule (a branch behind the default branch is NOT a defect)
+"Sync on main" means MERGE, never rebase: `git fetch origin && git checkout
+<branch> && git merge origin/<default branch>` — a merge commit, keeping both
+histories. Never rebase, never force-push, never reset (same semantics as the CI
+agent's P0 sync and operator.md's Mergeability rule).
+Do it in YOUR OWN turn via `claude_code` (`model="fable"`; re-run the same turn
+with `model="opus"` when the merge reports conflicts) and resolve TRIVIAL
+conflicts keeping both sides' intent — imports, formatting, lockfiles, adjacent
+non-overlapping hunks. A branch that is merely behind, or whose `mergeable` is
+`CONFLICTING` only because of that, is NEVER a finding and NEVER a fix ticket.
+Escalate ONLY a NON-TRIVIAL conflict — both sides changed the same behaviour, or
+the resolution needs a product decision / touches logic under review.
+Whether you PUSH the sync commit, and where a non-trivial conflict goes, is
+scoped for your role immediately below.
+
+**Your scope:** LOCAL ONLY — sync in your own workspace so your checks run
+against what would land, and NEVER push: Step 2 forbids any QA commit on the
+integration branch (it moves the head off the CI-certified SHA). A pushed sync
+is the CI agent's P0. A NON-TRIVIAL conflict goes in your ordinary `qa_fix` fix
+ticket; staleness alone never does.
+
 ### Step 2: Build Verification
 
 **If `PIPELINE_ENABLED` is set in your context (a real CodeBuild pipeline owns
@@ -343,6 +364,9 @@ all-clear on something that was never tested. Use BLOCKED and say so plainly.**
 - NEVER pass an external-integration feature without a real round-trip against the
   real service + a docs cross-check (Step 3c). The dev's own unit tests are NOT
   verification of a protocol they may have guessed.
+- A branch behind the default branch is NEVER a QA finding and never a fix
+  ticket — sync it LOCALLY per the Main-sync rule and verify the merged tree;
+  never push it (Step 2: no QA commit on the integration branch, ever)
 - A secret the code reads that does not exist in Secrets Manager = automatic FAIL
 - Evidence required for every claim — actual command output, not assumptions
 - Evidence must be DURABLE: screenshots/videos/logs uploaded to `workflows/{workflow_id}/shared/qa-evidence/`; presigned URLs and repo-only files don't count
