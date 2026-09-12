@@ -217,7 +217,7 @@ echo "   ✓ EFS mount access"
 # secretsmanager:GetSecretValue on that secret. The hub (App Runner / hosting
 # role) mints a short-lived, repo-scoped installation token per turn and passes
 # THAT in the invoke payload; the agent never sees the key. Do not add a
-# Secrets Manager grant here. See docs/github-app-auth.md.
+# Secrets Manager grant here. See docs/pipeline/github-app-auth.md.
 
 echo ""
 echo "   ⏳ Waiting 10s for IAM propagation..."

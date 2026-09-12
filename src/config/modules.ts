@@ -64,7 +64,7 @@ const RAW_NAV_ITEMS: NavItem[] = [
   { href: "/evaluations", label: "Evaluations", icon: BarChart3, module: "evaluations" },
   // CI/CD Pipeline (bolt-on). Hidden unless NEXT_PUBLIC_PIPELINE_ENABLED is set,
   // because its backing infra (deploy/pipeline CDK stack) is deployed
-  // out-of-band and entirely optional. See docs/cicd-pipeline-module-design.md.
+  // out-of-band and entirely optional. See docs/pipeline/design.md.
   { href: "/pipeline", label: "Pipeline", icon: Rocket, module: "pipeline", enabledBy: "NEXT_PUBLIC_PIPELINE_ENABLED" },
   { href: "/tickets", label: "Ticket History", icon: History, module: "workflow" },
 ];

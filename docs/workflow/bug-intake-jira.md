@@ -7,7 +7,7 @@ hub does the rest.
 
 > This path exists **only** in Jira mode. In DynamoDB mode, workflows are created
 > exclusively through `POST /api/workflow/start` (see
-> [`workflow-pipeline-architecture.md`](workflow-pipeline-architecture.md)).
+> [`architecture.md`](../architecture.md)).
 
 ---
 

@@ -8,7 +8,7 @@
 #     so the Deploy stage promotes exactly what was built here (build-once).
 #
 # The gates are the deterministic work that used to run inside the CI agent.
-# Any red here = build fails = no merge. See docs/cicd-pipeline-module-design.md.
+# Any red here = build fails = no merge. See docs/pipeline/design.md.
 #
 # NOTE: every command is a QUOTED YAML scalar. An unquoted "echo foo: bar" parses
 # as a YAML mapping, not a string, and CodeBuild rejects the commands array
