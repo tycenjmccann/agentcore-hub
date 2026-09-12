@@ -597,8 +597,8 @@ or `pipeline_not_registered`.
    keeps orchestrator config (Jira creds) safe and preserves build-once/
    promote-by-digest.
    - **ALSO pass `approved_head_sha=<the head SHA the human approved at the Merge
-     Approval gate>` and `ci_build_id=<the certifying CI build id>` — but ONLY
-     when BOTH of these hold:**
+     Approval gate>`, `ci_build_id=<the certifying CI build id>` and
+     `pr_url=<the PR you merged>` — but ONLY when BOTH of these hold:**
      a. the merge worker replied `MERGED <merge commit sha>` — it merges only when
         the PR head at merge time was exactly the approved SHA, and replies
         `DRIFT <sha>` and refuses otherwise; AND
@@ -611,12 +611,20 @@ or `pipeline_not_registered`.
      to fire. Say plainly why: the human approved specific bytes, and a new SHA is
      not those bytes. Never pass a SHA you inferred, reconstructed, or judged
      "equivalent" — only the SHA that appears in the brief the human approved.
+     `pr_url` is not optional here: the Lambda asks GitHub whether that PR is
+     merged with `head.sha` == your `approved_head_sha` and `merge_commit_sha` ==
+     your `commit_sha`, and refuses to record anything it cannot confirm. Your
+     attestation alone buys nothing — the machine check is the gate.
    - **Read `preapproval` from the result** immediately and state it in your run
      summary. `preapproval.recorded: true` = the ship-approval record for this
      merge commit is written, so the pipeline may skip its Approval stage for this
      one commit. `recorded: false` → name `preapproval.reason`
      (`approved_head_sha_missing` | `invalid_sha` | `ci_not_certified` |
-     `record_write_failed`) and expect the Telegram deploy gate. That is the
+     `pr_url_missing` | `pr_url_invalid` | `merge_binding_mismatch` |
+     `merge_binding_unverified` | `record_write_failed`) and expect the Telegram
+     deploy gate. `merge_binding_mismatch` means GitHub does not agree that this
+     merge commit came from that approved head — treat it as a real signal worth
+     stating, not noise. That is the
      correct, safe outcome, NOT an error to retry around: never call
      `start_deploy` again to chase a record — the execution is already running and
      a second trigger is a second deploy.

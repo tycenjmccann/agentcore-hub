@@ -202,6 +202,15 @@ const DEPLOY_PROJECT = process.env.DEPLOY_PROJECT || "agentcore-hub-deploy";
 const ARTIFACT_BUCKET = process.env.ARTIFACT_BUCKET || "";
 // Cosmetic label for the env default target only — see the Env block above.
 const PIPELINE_REPO = (process.env.PIPELINE_REPO || "").trim();
+// Read-only GitHub credential, used for ONE thing: proving that the commit a
+// start_deploy wants recorded really is the merge of the head SHA a human
+// approved (verifyMergeBinding). Optional — when unset, no ship-approval record
+// can be written and every deploy keeps its human gate, which is the pre-
+// TEAM-4525 behaviour. It grants no approval capability of any kind.
+const GITHUB_TOKEN = (process.env.GITHUB_TOKEN || "").trim();
+/** GitHub is on the critical path of a 60s Lambda; a slow API must fail closed
+ * (unverified → gate fires), not burn the whole budget. */
+const GITHUB_TIMEOUT_MS = Number(process.env.GITHUB_TIMEOUT_MS || 5000);
 
 // A CodeBuild project that deploys, but is not the pipeline's Deploy stage, so
 // the DEPLOY_PROJECT/PIPELINE_NAME comparisons below would not catch it.
@@ -1006,8 +1015,10 @@ async function startDeploy(args = {}, target) {
       "Poll get_state with execution_id=<this pipelineExecutionId> until terminal:true AND matchesExecution:true. " +
       "preapproval.recorded:true means this call recorded the head SHA a human already approved at Merge Approval " +
       "against THIS merge commit, which is what lets the pipeline skip re-asking that same human for byte-identical " +
-      "code — for exactly this merge commit and nothing else. Any other commit, an unverified head, a CI result that " +
-      "is not certified on it, or a failed record write (preapproval.recorded:false with a reason) and the human " +
+      "code — for exactly this merge commit and nothing else. Recording REQUIRES pr_url: GitHub must confirm that PR " +
+      "is merged, that its head is approved_head_sha and that its merge commit is commit_sha. Any other commit, an " +
+      "unverified head, a CI result that is not certified on it, a binding GitHub will not confirm, or a failed record " +
+      "write (preapproval.recorded:false with a reason) and the human " +
       "deploy gate fires as usual, which is the safe outcome, not an error to retry. You have NO approval capability: " +
       "this tool cannot approve a gate, only record what a human already decided — if the gate fires, wait for the human.",
   });
@@ -1051,12 +1062,169 @@ const PREAPPROVAL_REASONS = {
   /** The PutObject failed (or there is no bucket to write to). The deploy still
    * started; the gate fires. */
   WRITE_FAILED: "record_write_failed",
+  // ── the merge binding (TEAM-4525 review P1) ───────────────────────────────
+  // CI certification proves "the head a human approved is green". It says NOTHING
+  // about the commit we are about to deploy actually BEING that head's merge —
+  // the caller supplies both SHAs, so without an independent check an agent could
+  // pass a certified head plus any newer, unapproved main commit and get a record
+  // written for it. These four reasons are that check failing closed.
+  /** No pr_url was supplied. It is REQUIRED to record: it is the only thing that
+   * lets this Lambda ask GitHub whether commit_sha is approved_head_sha's merge. */
+  PR_URL_MISSING: "pr_url_missing",
+  /** pr_url is not a github.com pull URL for THIS target's repo. */
+  PR_URL_INVALID: "pr_url_invalid",
+  /** GitHub says the PR is not merged, its head is not approved_head_sha, or its
+   * merge commit is not commit_sha — the binding the record would assert is false. */
+  BINDING_MISMATCH: "merge_binding_mismatch",
+  /** GitHub could not be asked (no GITHUB_TOKEN, API error, timeout). An
+   * unverifiable binding is treated exactly like a false one. */
+  BINDING_UNVERIFIED: "merge_binding_unverified",
 };
 
 /** Trim + lowercase, so a caller pasting a capitalized or padded SHA is not
  * silently refused as "invalid". */
 function normalizeSha(value) {
   return String(value ?? "").trim().toLowerCase();
+}
+
+/**
+ * Parse a PR URL into `{ owner, repo, number }`, or null.
+ *
+ * DELIBERATELY strict and anchored: this string comes from an agent and decides
+ * which URL we fetch, so no query (`?`), no fragment (`#`), no path traversal
+ * (`..`) and no host but github.com can survive it. Both the human form
+ * (github.com/o/r/pull/N) and the API form (api.github.com/repos/o/r/pulls/N)
+ * are accepted because blueprints paste whichever the merge worker returned.
+ */
+function parsePrUrl(value) {
+  const text = String(value ?? "").trim();
+  let m = /^https:\/\/github\.com\/([A-Za-z0-9._-]+)\/([A-Za-z0-9._-]+)\/pull\/([0-9]{1,10})$/.exec(
+    text
+  );
+  if (!m) {
+    m =
+      /^https:\/\/api\.github\.com\/repos\/([A-Za-z0-9._-]+)\/([A-Za-z0-9._-]+)\/pulls\/([0-9]{1,10})$/.exec(
+        text
+      );
+  }
+  if (!m) return null;
+  const [, owner, repo, number] = m;
+  // A path segment of "." or ".." passes the character class above.
+  if (/^\.+$/.test(owner) || /^\.+$/.test(repo)) return null;
+  return { owner, repo, number };
+}
+
+/**
+ * Ask GitHub whether `mergeCommit` really is the merge of `approvedHead` for the
+ * PR at `prUrl`, in `expectedRepo`.
+ *
+ * This is the check that makes the record mean what the pipeline reads it to
+ * mean. Without it, `recordShipApproval` would attest a binding
+ * (merge_commit ↔ approved_head_sha) that only the CALLER asserted, and the whole
+ * conditional gate would rest on trusting the agent that asked for it — which is
+ * exactly the thing TEAM-4525 may not do.
+ *
+ * Three properties must ALL hold:
+ *   1. the PR is merged (an open PR's merge commit does not exist yet);
+ *   2. its head SHA is the SHA the human approved (no post-approval drift);
+ *   3. its merge_commit_sha is the commit we are about to deploy (squash included
+ *      — GitHub sets merge_commit_sha to the squash commit).
+ * Plus: the PR must live in the target's own repo, so a pr_url pointing at some
+ * other (perhaps attacker-authored) repository proves nothing here.
+ *
+ * @returns {Promise<{ok: true} | {ok: false, reason: string, detail?: string}>}
+ */
+async function verifyMergeBinding({ prUrl, mergeCommit, approvedHead, expectedRepo }) {
+  const parsed = parsePrUrl(prUrl);
+  if (!parsed) {
+    return { ok: false, reason: PREAPPROVAL_REASONS.PR_URL_INVALID, detail: "unparseable" };
+  }
+  const full = `${parsed.owner}/${parsed.repo}`;
+  const want = String(expectedRepo ?? "").trim();
+  // Only enforceable when the registry entry names a repo; when it does, the PR
+  // must be in it. (A registry entry with no repo cannot be cross-checked, and a
+  // record for it still requires all three GitHub properties below.)
+  if (want && full.toLowerCase() !== want.toLowerCase()) {
+    return {
+      ok: false,
+      reason: PREAPPROVAL_REASONS.PR_URL_INVALID,
+      detail: `pr is in ${full}, target repo is ${want}`,
+    };
+  }
+  if (!GITHUB_TOKEN) {
+    return {
+      ok: false,
+      reason: PREAPPROVAL_REASONS.BINDING_UNVERIFIED,
+      detail: "GITHUB_TOKEN is not configured on this Lambda",
+    };
+  }
+
+  let pr;
+  try {
+    const res = await fetch(
+      `https://api.github.com/repos/${parsed.owner}/${parsed.repo}/pulls/${parsed.number}`,
+      {
+        headers: {
+          Authorization: `token ${GITHUB_TOKEN}`,
+          Accept: "application/vnd.github+json",
+          "User-Agent": "agentcore-hub-pipeline-tools",
+        },
+        signal: AbortSignal.timeout(GITHUB_TIMEOUT_MS),
+      }
+    );
+    if (!res.ok) {
+      return {
+        ok: false,
+        reason: PREAPPROVAL_REASONS.BINDING_UNVERIFIED,
+        detail: `GitHub returned ${res.status}`,
+      };
+    }
+    pr = await res.json();
+  } catch (e) {
+    return {
+      ok: false,
+      reason: PREAPPROVAL_REASONS.BINDING_UNVERIFIED,
+      detail: `${e?.name}: ${e?.message}`,
+    };
+  }
+
+  if (!pr || typeof pr !== "object") {
+    return { ok: false, reason: PREAPPROVAL_REASONS.BINDING_UNVERIFIED, detail: "no PR body" };
+  }
+  if (pr.merged !== true) {
+    return {
+      ok: false,
+      reason: PREAPPROVAL_REASONS.BINDING_MISMATCH,
+      detail: "pr is not merged",
+    };
+  }
+  const prHead = normalizeSha(pr.head?.sha);
+  if (prHead !== approvedHead) {
+    return {
+      ok: false,
+      reason: PREAPPROVAL_REASONS.BINDING_MISMATCH,
+      detail: `pr head ${prHead || "(none)"} != approved ${approvedHead}`,
+    };
+  }
+  const prMerge = normalizeSha(pr.merge_commit_sha);
+  if (prMerge !== mergeCommit) {
+    return {
+      ok: false,
+      reason: PREAPPROVAL_REASONS.BINDING_MISMATCH,
+      detail: `pr merge commit ${prMerge || "(none)"} != commit_sha ${mergeCommit}`,
+    };
+  }
+  // Defence in depth: the registry repo check above is skipped when the entry has
+  // no repo, so re-assert against what GitHub itself says the PR belongs to.
+  const apiRepo = normalizeSha(pr.base?.repo?.full_name);
+  if (apiRepo && apiRepo !== full.toLowerCase()) {
+    return {
+      ok: false,
+      reason: PREAPPROVAL_REASONS.PR_URL_INVALID,
+      detail: `GitHub reports the pr in ${apiRepo}, url said ${full}`,
+    };
+  }
+  return { ok: true };
 }
 
 /** Copy `value` onto `record` under `key` only when it is a non-empty string —
@@ -1113,6 +1281,15 @@ async function ciCertifiedBuildId(cb, project, headSha, ciBuildId) {
  *   { recorded: true, key }                — written
  *   { recorded: false, reason }            — not written, and why
  *
+ * "Proven" means all of, in this order:
+ *   1. both SHAs are full 40-hex;
+ *   2. CI is certified on approved_head_sha for this target's PR-check project;
+ *   3. GitHub confirms the PR at `pr_url` (REQUIRED) is merged, its head is
+ *      approved_head_sha, and its merge_commit_sha is commit_sha.
+ *
+ * (3) is what stops the record from being an unverified caller assertion. NOTHING
+ * here can approve a gate; the worst outcome of any failure is a human gate.
+ *
  * @returns {Promise<{recorded: boolean, reason?: string, key?: string}>}
  */
 async function recordShipApproval(args = {}, target, cb) {
@@ -1145,6 +1322,31 @@ async function recordShipApproval(args = {}, target, cb) {
   }
   if (!ciBuildId) {
     return { recorded: false, reason: PREAPPROVAL_REASONS.NOT_CERTIFIED };
+  }
+
+  // ── the binding, machine-verified (TEAM-4525 review P1) ───────────────────
+  // Everything above proves the APPROVED HEAD is green. Nothing above proves
+  // `commit_sha` is that head's merge — both SHAs came from the caller. Ask
+  // GitHub, and refuse to record if it will not confirm all three properties.
+  // Checked AFTER CI so an uncertified head is still reported as
+  // `ci_not_certified` (the more fundamental failure) rather than as a URL problem.
+  const prUrl = String(args.pr_url ?? "").trim();
+  if (!prUrl) {
+    return { recorded: false, reason: PREAPPROVAL_REASONS.PR_URL_MISSING };
+  }
+  const binding = await verifyMergeBinding({
+    prUrl,
+    mergeCommit,
+    approvedHead,
+    expectedRepo: target.repo,
+  });
+  if (!binding.ok) {
+    console.warn(
+      "ship-approval merge binding REFUSED (non-fatal, human deploy gate will fire):",
+      binding.reason,
+      binding.detail || ""
+    );
+    return { recorded: false, reason: binding.reason };
   }
 
   const key = `${SHIP_APPROVAL_PREFIX}${mergeCommit}.json`;

@@ -120,6 +120,10 @@ const h = vi.hoisted(() => ({
     // role in the target's region.
     s3Puts: [], // { region, input }
     putObjectImpl: async () => ({}),
+    // TEAM-4525 review P1: the GitHub API calls that prove commit_sha really is
+    // approved_head_sha's merge. { url, headers } per call; githubImpl answers.
+    githubCalls: [],
+    githubImpl: async () => ({ ok: false, status: 404, json: async () => ({}) }),
     // config/cd-registry.json. Default NoSuchKey = "no registry" = env target only,
     // which is what every pre-TEAM-4337 test assumes.
     registryImpl: async () => {
@@ -449,7 +453,21 @@ beforeEach(() => {
   h.state.listBuildsImpl = async () => ({ ids: [] });
   h.state.batchGetBuildsImpl = DEFAULT_BATCH_GET;
   h.state.startBuildImpl = async () => DEFAULT_START_BUILD();
+  h.state.githubCalls = [];
+  // TEAM-4525 review P1: no test may reach the real GitHub. The default REFUSES,
+  // so a suite that forgets to stub the merge binding gets fail-closed behaviour
+  // (no record) rather than a network call or an accidental pass.
+  h.state.githubImpl = async () => ({ ok: false, status: 404, json: async () => ({}) });
   delete process.env.PIPELINE_CI_START_BUILD;
+});
+
+// The Lambda verifies the merge binding with global fetch (nodejs20.x). Stub it
+// once, here, for the whole file: every call is recorded on h.state.githubCalls so
+// tests can assert WHICH url was fetched and with what auth, and h.state.githubImpl
+// decides the answer.
+vi.stubGlobal("fetch", async (url, init) => {
+  h.state.githubCalls.push({ url: String(url), headers: init?.headers || {} });
+  return h.state.githubImpl(String(url), init);
 });
 
 // ─── 1. Execution-scoped get_state ───────────────────────────────────────────
@@ -898,30 +916,61 @@ describe("start_deploy ship-approval record (TEAM-4525)", () => {
     });
   }
 
+  const PR_URL = "https://github.com/acme/thing/pull/7";
+
+  /** GitHub's answer for the PR at PR_URL. Defaults to the HAPPY binding: merged,
+   * head == the approved SHA, merge_commit_sha == the commit being deployed. Every
+   * argument is an override so a test can break exactly one property. */
+  function serveGithubPr({
+    merged = true,
+    head = HEAD,
+    mergeCommit = MERGE,
+    fullName = "acme/thing",
+    ok = true,
+    status = 200,
+  } = {}) {
+    h.state.githubImpl = async () => ({
+      ok,
+      status,
+      json: async () => ({
+        merged,
+        head: { sha: head },
+        merge_commit_sha: mergeCommit,
+        base: { repo: { full_name: fullName } },
+      }),
+    });
+  }
+
   /** start_deploy on a fresh module with an artifact bucket configured (the record
    * has nowhere to go without one). No registry → the env default is the only
-   * target, so no pipeline_name is needed. */
+   * target, so no pipeline_name is needed. GITHUB_TOKEN is set because recording
+   * now REQUIRES a verified merge binding; tests that want the no-token path pass
+   * `{ GITHUB_TOKEN: undefined }`. */
   function deploy(args, env = {}) {
-    return withEnv({ ARTIFACT_BUCKET: BUCKET, ...env }, async (mod) => {
-      h.state.s3Calls = [];
-      h.state.s3Puts = [];
-      h.state.cpCalls = [];
-      h.state.cbCalls = [];
-      return invokeOn(mod.handler, "start_deploy", args);
-    });
+    return withEnv(
+      { ARTIFACT_BUCKET: BUCKET, GITHUB_TOKEN: "ghp-test-token", ...env },
+      async (mod) => {
+        h.state.s3Calls = [];
+        h.state.s3Puts = [];
+        h.state.cpCalls = [];
+        h.state.cbCalls = [];
+        return invokeOn(mod.handler, "start_deploy", args);
+      }
+    );
   }
 
   const started = () => h.state.cpCalls.find((c) => c.type === "StartPipelineExecution");
   const record = () => JSON.parse(h.state.s3Puts[0].input.Body);
 
-  it("writes the record, then starts the pipeline, when CI is certified on the approved head", async () => {
+  it("writes the record, then starts the pipeline, when CI is certified on the approved head AND GitHub confirms the merge binding", async () => {
     serveCiBuild();
+    serveGithubPr();
 
     const out = await deploy(
       {
         commit_sha: MERGE,
         approved_head_sha: HEAD,
-        pr_url: "https://github.com/acme/thing/pull/7",
+        pr_url: PR_URL,
         workflow_id: "wf-4525",
         ticket_id: "TEAM-4525",
       },
@@ -951,11 +1000,18 @@ describe("start_deploy ship-approval record (TEAM-4525)", () => {
       ci_build_id: CI_BUILD,
       pipeline: "agentcore-hub-deploy",
       repo: "acme/thing",
-      pr_url: "https://github.com/acme/thing/pull/7",
+      pr_url: PR_URL,
       workflow_id: "wf-4525",
       ticket_id: "TEAM-4525",
       recorded_by: "Pipeline___start_deploy",
     });
+    // The binding was verified against the PR the caller named, with the token,
+    // and against GitHub's API host — not some url the caller controlled.
+    expect(h.state.githubCalls).toHaveLength(1);
+    expect(h.state.githubCalls[0].url).toBe(
+      "https://api.github.com/repos/acme/thing/pulls/7"
+    );
+    expect(h.state.githubCalls[0].headers.Authorization).toBe("token ghp-test-token");
     // recorded_at is a real ISO-8601 instant, not a Date object or a local string.
     expect(body.recorded_at).toMatch(/^\d{4}-\d{2}-\d{2}T[\d:.]+Z$/);
     expect(Number.isNaN(Date.parse(body.recorded_at))).toBe(false);
@@ -983,20 +1039,24 @@ describe("start_deploy ship-approval record (TEAM-4525)", () => {
     expect(out.note).toMatch(/no approval capability/i);
   });
 
-  it("omits optional fields the caller did not supply, keeps the five mandatory ones", async () => {
+  // pr_url is NO LONGER optional (TEAM-4525 review P1) — it is the thing that makes
+  // the binding checkable — so the only omittable fields left are the labels.
+  it("omits optional labels the caller did not supply, keeps the mandatory ones", async () => {
     serveCiBuild();
+    serveGithubPr({ fullName: undefined });
 
-    const out = await deploy({ commit_sha: MERGE, approved_head_sha: HEAD });
+    const out = await deploy({ commit_sha: MERGE, approved_head_sha: HEAD, pr_url: PR_URL });
 
     const body = record();
     expect(out.preapproval.recorded).toBe(true);
-    for (const absent of ["pr_url", "workflow_id", "ticket_id", "repo"]) {
+    for (const absent of ["workflow_id", "ticket_id", "repo"]) {
       expect(body, absent).not.toHaveProperty(absent);
     }
     for (const present of [
       "version",
       "merge_commit",
       "approved_head_sha",
+      "pr_url",
       "recorded_at",
       "recorded_by",
     ]) {
@@ -1006,10 +1066,12 @@ describe("start_deploy ship-approval record (TEAM-4525)", () => {
 
   it("normalizes a padded/upper-case SHA pair before recording", async () => {
     serveCiBuild();
+    serveGithubPr();
 
     const out = await deploy({
       commit_sha: `  ${MERGE.toUpperCase()} `,
       approved_head_sha: HEAD.toUpperCase(),
+      pr_url: PR_URL,
     });
 
     // Lower-cased in BOTH the key and the body: the pipeline compares strings.
@@ -1123,6 +1185,7 @@ describe("start_deploy ship-approval record (TEAM-4525)", () => {
   // ── ci_build_id: the precise path ──────────────────────────────────────────
 
   it("verifies a supplied ci_build_id by BatchGetBuilds on that ONE id", async () => {
+    serveGithubPr();
     h.state.batchGetBuildsImpl = async (input) => ({
       builds: (input.ids || []).map((id) => ({
         id,
@@ -1136,6 +1199,7 @@ describe("start_deploy ship-approval record (TEAM-4525)", () => {
       commit_sha: MERGE,
       approved_head_sha: HEAD,
       ci_build_id: CI_BUILD,
+      pr_url: PR_URL,
     });
 
     expect(out.preapproval).toEqual({ recorded: true, key: KEY });
@@ -1196,13 +1260,14 @@ describe("start_deploy ship-approval record (TEAM-4525)", () => {
 
   it("names record_write_failed when PutObject throws, and still starts the pipeline", async () => {
     serveCiBuild();
+    serveGithubPr();
     h.state.putObjectImpl = async () => {
       const err = new Error("AccessDenied");
       err.name = "AccessDenied";
       throw err;
     };
 
-    const out = await deploy({ commit_sha: MERGE, approved_head_sha: HEAD });
+    const out = await deploy({ commit_sha: MERGE, approved_head_sha: HEAD, pr_url: PR_URL });
 
     // No exception escaped: the handler returned a normal start_deploy result.
     expect(out.preapproval).toEqual({ recorded: false, reason: "record_write_failed" });
@@ -1215,14 +1280,16 @@ describe("start_deploy ship-approval record (TEAM-4525)", () => {
 
   it("names record_write_failed when there is no artifact bucket to write to", async () => {
     serveCiBuild();
+    serveGithubPr();
 
-    const out = await withEnv({ ARTIFACT_BUCKET: undefined }, async (mod) => {
+    const out = await withEnv({ ARTIFACT_BUCKET: undefined, GITHUB_TOKEN: "ghp-test-token" }, async (mod) => {
       h.state.s3Calls = [];
       h.state.s3Puts = [];
       h.state.cpCalls = [];
       return invokeOn(mod.handler, "start_deploy", {
         commit_sha: MERGE,
         approved_head_sha: HEAD,
+        pr_url: PR_URL,
       });
     });
 
@@ -1234,34 +1301,272 @@ describe("start_deploy ship-approval record (TEAM-4525)", () => {
 
   // ── the four reasons are the WHOLE vocabulary ──────────────────────────────
 
-  it("every reason it can emit is one of the four documented strings", async () => {
+  it("every reason it can emit is one of the eight documented strings", async () => {
+    // The COMPLETE vocabulary. A new reason string that is not here is a reason the
+    // pipeline side and the blueprints have never heard of.
     const REASONS = new Set([
       "approved_head_sha_missing",
       "invalid_sha",
       "ci_not_certified",
       "record_write_failed",
+      "pr_url_missing",
+      "pr_url_invalid",
+      "merge_binding_mismatch",
+      "merge_binding_unverified",
     ]);
     const cases = [
-      [{ commit_sha: MERGE }, () => serveCiBuild()],
-      [{ commit_sha: MERGE, approved_head_sha: "nope" }, () => serveCiBuild()],
-      [{ commit_sha: MERGE, approved_head_sha: HEAD }, () => serveCiBuild({ buildStatus: "FAILED" })],
+      ["no approved head", { commit_sha: MERGE }, () => serveCiBuild()],
+      ["bad head sha", { commit_sha: MERGE, approved_head_sha: "nope" }, () => serveCiBuild()],
       [
-        { commit_sha: MERGE, approved_head_sha: HEAD },
+        "ci red",
+        { commit_sha: MERGE, approved_head_sha: HEAD, pr_url: PR_URL },
+        () => serveCiBuild({ buildStatus: "FAILED" }),
+      ],
+      [
+        "write fails",
+        { commit_sha: MERGE, approved_head_sha: HEAD, pr_url: PR_URL },
         () => {
           serveCiBuild();
+          serveGithubPr();
           h.state.putObjectImpl = async () => {
             throw new Error("boom");
           };
         },
       ],
+      ["no pr_url", { commit_sha: MERGE, approved_head_sha: HEAD }, () => serveCiBuild()],
+      [
+        "junk pr_url",
+        { commit_sha: MERGE, approved_head_sha: HEAD, pr_url: "not-a-url" },
+        () => serveCiBuild(),
+      ],
+      [
+        "pr not merged",
+        { commit_sha: MERGE, approved_head_sha: HEAD, pr_url: PR_URL },
+        () => {
+          serveCiBuild();
+          serveGithubPr({ merged: false });
+        },
+      ],
+      [
+        "github down",
+        { commit_sha: MERGE, approved_head_sha: HEAD, pr_url: PR_URL },
+        () => {
+          serveCiBuild();
+          h.state.githubImpl = async () => {
+            throw new Error("ECONNRESET");
+          };
+        },
+      ],
     ];
-    for (const [args, arrange] of cases) {
+    for (const [label, args, arrange] of cases) {
       arrange();
       const out = await deploy(args);
-      expect(out.preapproval.recorded).toBe(false);
-      expect(REASONS.has(out.preapproval.reason), out.preapproval.reason).toBe(true);
-      expect(out.started).toBe(true);
+      expect(out.preapproval.recorded, label).toBe(false);
+      expect(REASONS.has(out.preapproval.reason), `${label}: ${out.preapproval.reason}`).toBe(
+        true
+      );
+      expect(out.started, label).toBe(true);
     }
+  });
+
+  // ── the merge binding, machine-verified (TEAM-4525 review P1) ─────────────
+  //
+  // THE defect this section exists for: CI certification proves the approved HEAD
+  // is green and says nothing about the commit being deployed. Both SHAs arrive
+  // from the caller, so without an independent check an agent could pair a
+  // genuinely certified head with ANY newer, unapproved main commit and get a
+  // record written for it — the pipeline would then skip that commit's human gate.
+  // The record must therefore never be written on the caller's word alone.
+
+  it("REFUSES a certified head paired with an unapproved commit — the reviewer's repro", async () => {
+    // CodeBuild genuinely certifies HEAD...
+    serveCiBuild({ resolved: HEAD });
+    // ...but the PR whose head that is was merged as MERGE, not as OTHER. OTHER is
+    // the newer/unapproved main commit the caller is trying to get recorded.
+    serveGithubPr({ head: HEAD, mergeCommit: MERGE });
+
+    const out = await deploy({
+      commit_sha: OTHER,
+      approved_head_sha: HEAD,
+      ci_build_id: CI_BUILD,
+      pr_url: PR_URL,
+    });
+
+    expect(out.preapproval).toEqual({
+      recorded: false,
+      reason: "merge_binding_mismatch",
+    });
+    // Nothing was written, so `decide OTHER` in the Build stage finds no record and
+    // the human gate fires — which is the whole point.
+    expect(h.state.s3Puts).toEqual([]);
+    expect(out.started).toBe(true);
+  });
+
+  it("refuses when the PR's head is not the SHA the human approved (post-approval drift)", async () => {
+    serveCiBuild();
+    serveGithubPr({ head: OTHER });
+
+    const out = await deploy({
+      commit_sha: MERGE,
+      approved_head_sha: HEAD,
+      pr_url: PR_URL,
+    });
+
+    expect(out.preapproval.reason).toBe("merge_binding_mismatch");
+    expect(h.state.s3Puts).toEqual([]);
+  });
+
+  it("refuses an open (unmerged) PR — its merge commit does not exist yet", async () => {
+    serveCiBuild();
+    serveGithubPr({ merged: false });
+
+    const out = await deploy({ commit_sha: MERGE, approved_head_sha: HEAD, pr_url: PR_URL });
+
+    expect(out.preapproval.reason).toBe("merge_binding_mismatch");
+    expect(h.state.s3Puts).toEqual([]);
+  });
+
+  it("requires pr_url: without it there is nothing to verify the binding against", async () => {
+    serveCiBuild();
+    serveGithubPr();
+
+    const out = await deploy({ commit_sha: MERGE, approved_head_sha: HEAD });
+
+    expect(out.preapproval).toEqual({ recorded: false, reason: "pr_url_missing" });
+    expect(h.state.s3Puts).toEqual([]);
+    // Not even asked — a missing url is refused before any network call.
+    expect(h.state.githubCalls).toEqual([]);
+    expect(out.started).toBe(true);
+  });
+
+  it("refuses a pr_url for a DIFFERENT repo than the target's, without calling GitHub", async () => {
+    // Otherwise an agent could point at a PR in a repo it controls, whose head and
+    // merge commit it chose, and have that attest to a hub deploy.
+    serveCiBuild();
+    serveGithubPr();
+
+    const out = await deploy(
+      {
+        commit_sha: MERGE,
+        approved_head_sha: HEAD,
+        pr_url: "https://github.com/attacker/evil/pull/1",
+      },
+      { PIPELINE_REPO: "acme/thing" }
+    );
+
+    expect(out.preapproval).toEqual({ recorded: false, reason: "pr_url_invalid" });
+    expect(h.state.githubCalls).toEqual([]);
+    expect(h.state.s3Puts).toEqual([]);
+  });
+
+  it("refuses every pr_url that is not an exact github.com pull URL", async () => {
+    serveCiBuild();
+    serveGithubPr();
+    for (const prUrl of [
+      "not-a-url",
+      "http://github.com/acme/thing/pull/7", // not https
+      "https://github.com.evil.test/acme/thing/pull/7", // lookalike host
+      "https://evil.test/acme/thing/pull/7",
+      "https://github.com/acme/thing/pull/7?x=1", // query
+      "https://github.com/acme/thing/pull/7#frag", // fragment
+      "https://github.com/acme/../thing/pull/7", // traversal
+      "https://github.com/acme/thing/pull/abc", // not a number
+      "https://github.com/acme/thing/issues/7", // not a PR
+      "https://github.com/acme/thing/pull/7/files", // trailing path
+      "  ", // blank → missing, not invalid
+    ]) {
+      const out = await deploy({ commit_sha: MERGE, approved_head_sha: HEAD, pr_url: prUrl });
+      expect(out.preapproval.recorded, prUrl).toBe(false);
+      expect(["pr_url_invalid", "pr_url_missing"], prUrl).toContain(
+        out.preapproval.reason
+      );
+      expect(h.state.s3Puts, prUrl).toEqual([]);
+      expect(out.started, prUrl).toBe(true);
+    }
+    // None of those reached GitHub: they were all refused by the parser.
+    expect(h.state.githubCalls).toEqual([]);
+  });
+
+  it("accepts the api.github.com form of the same PR", async () => {
+    serveCiBuild();
+    serveGithubPr();
+
+    const out = await deploy({
+      commit_sha: MERGE,
+      approved_head_sha: HEAD,
+      pr_url: "https://api.github.com/repos/acme/thing/pulls/7",
+    });
+
+    expect(out.preapproval.recorded).toBe(true);
+    expect(h.state.githubCalls[0].url).toBe(
+      "https://api.github.com/repos/acme/thing/pulls/7"
+    );
+  });
+
+  it("refuses when GITHUB_TOKEN is not configured — unverifiable is treated as false", async () => {
+    serveCiBuild();
+    serveGithubPr();
+
+    const out = await deploy(
+      { commit_sha: MERGE, approved_head_sha: HEAD, pr_url: PR_URL },
+      { GITHUB_TOKEN: undefined }
+    );
+
+    expect(out.preapproval).toEqual({
+      recorded: false,
+      reason: "merge_binding_unverified",
+    });
+    // No token → no call attempted at all.
+    expect(h.state.githubCalls).toEqual([]);
+    expect(h.state.s3Puts).toEqual([]);
+    expect(out.started).toBe(true);
+  });
+
+  it("refuses on a GitHub error, a non-2xx, or a timeout — never records on ignorance", async () => {
+    for (const [label, arrange] of [
+      ["throws", () => {
+        h.state.githubImpl = async () => {
+          throw new Error("ECONNRESET");
+        };
+      }],
+      ["404", () => serveGithubPr({ ok: false, status: 404 })],
+      ["500", () => serveGithubPr({ ok: false, status: 500 })],
+      ["401", () => serveGithubPr({ ok: false, status: 401 })],
+      ["timeout", () => {
+        h.state.githubImpl = async () => {
+          const err = new Error("The operation was aborted");
+          err.name = "TimeoutError";
+          throw err;
+        };
+      }],
+      ["garbage body", () => {
+        h.state.githubImpl = async () => ({ ok: true, status: 200, json: async () => null });
+      }],
+    ]) {
+      serveCiBuild();
+      arrange();
+
+      const out = await deploy({ commit_sha: MERGE, approved_head_sha: HEAD, pr_url: PR_URL });
+
+      expect(out.preapproval, label).toEqual({
+        recorded: false,
+        reason: "merge_binding_unverified",
+      });
+      expect(h.state.s3Puts, label).toEqual([]);
+      expect(out.started, label).toBe(true);
+    }
+  });
+
+  it("verifies the binding AFTER CI, so an uncertified head is still ci_not_certified", async () => {
+    // Ordering matters for diagnosis: the release manager reading
+    // `ci_not_certified` knows to wait for CI, not to fix a URL.
+    serveCiBuild({ buildStatus: "FAILED" });
+    serveGithubPr();
+
+    const out = await deploy({ commit_sha: MERGE, approved_head_sha: HEAD, pr_url: PR_URL });
+
+    expect(out.preapproval.reason).toBe("ci_not_certified");
+    expect(h.state.githubCalls).toEqual([]);
   });
 
   // ── the record is HUB state, even for a cross-account pipeline ─────────────
@@ -1294,6 +1599,8 @@ describe("start_deploy ship-approval record (TEAM-4525)", () => {
         resolvedSourceVersion: HEAD,
       })),
     });
+    // The binding is verified against the TARGET's repo, not the hub's.
+    serveGithubPr({ fullName: "tycenjmccann/juno" });
 
     const out = await withRegistry(
       registry,
@@ -1302,8 +1609,9 @@ describe("start_deploy ship-approval record (TEAM-4525)", () => {
           pipeline_name: "hub-juno-deploy",
           commit_sha: MERGE,
           approved_head_sha: HEAD,
+          pr_url: "https://github.com/tycenjmccann/juno/pull/12",
         }),
-      { ARTIFACT_BUCKET: BUCKET }
+      { ARTIFACT_BUCKET: BUCKET, GITHUB_TOKEN: "ghp-test-token" }
     );
 
     expect(out.preapproval).toEqual({ recorded: true, key: KEY });

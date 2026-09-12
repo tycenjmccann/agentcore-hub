@@ -2092,7 +2092,10 @@ def Pipeline___start_deploy(pipeline_name: str = "", commit_sha: str = "", appro
             Approval gate. Pass it ONLY when BOTH hold: the merge worker
             confirmed the merge happened at exactly that head SHA (no drift —
             nothing was pushed to the PR after the approval), AND CI is
-            certified green on that same head SHA. When it is passed and the
+            certified green on that same head SHA. Pass pr_url with it — the
+            Lambda asks GitHub whether that PR is merged with head.sha ==
+            approved_head_sha and merge_commit_sha == commit_sha, and refuses to
+            record anything without that confirmation. When it is passed and the
             pipeline independently verifies it against commit_sha, the
             in-pipeline human deploy gate is unnecessary for that one merge
             commit and is skipped. When it is omitted — or supplied but not
@@ -2104,8 +2107,11 @@ def Pipeline___start_deploy(pipeline_name: str = "", commit_sha: str = "", appro
             the CI agent's ci_build_id). Pass it alongside approved_head_sha so
             the Lambda can verify that build directly instead of searching for
             it.
-        pr_url: The pull request URL the merge came from — audit context for the
-            skip decision.
+        pr_url: The pull request URL the merge came from
+            (https://github.com/<owner>/<repo>/pull/<n>). REQUIRED whenever you
+            pass approved_head_sha: it is how the Lambda machine-verifies the
+            merge_commit ↔ approved head binding. Without it the record is
+            refused (reason pr_url_missing) and the human gate fires.
         workflow_id: The workflow this deploy belongs to — audit context.
         ticket_id: Your CD/ship ticket ID — audit context.
     """

@@ -353,8 +353,11 @@ covers exactly the SHA in the brief.
    the BUILD flow by filing nothing: simply report `outcome="deploy-blocked"`,
    `block_reason="head drifted after approval"`, and stop (the human decides).
 3. **Deploy:** `Pipeline___start_deploy(pipeline_name=..., commit_sha=<merge
-   sha>)`; record `pipelineExecutionId`. Add `approved_head_sha=<approved sha>`
-   and `ci_build_id=<the certifying CodeBuild build id>` ONLY when BOTH hold:
+   sha>)`; record `pipelineExecutionId`. Add `approved_head_sha=<approved sha>`,
+   `ci_build_id=<the certifying CodeBuild build id>` and `pr_url=<the PR you
+   merged>` (all three - the Lambda asks GitHub whether that PR is merged with
+   `head.sha` == the approved sha and `merge_commit_sha` == `commit_sha`, and
+   records nothing it cannot confirm) ONLY when BOTH hold:
    (a) the MERGE PROMPT worker replied `MERGED <merge sha>` - it replies
    `DRIFT <sha>` and refuses unless the head at merge time was exactly the
    approved SHA; AND (b) CI certified that SAME head SHA (`ci_status=
@@ -365,7 +368,9 @@ covers exactly the SHA in the brief.
    result and state it in your summary: `recorded:true` = the record for this
    merge commit is written; `recorded:false` -> name `preapproval.reason`
    (`approved_head_sha_missing` | `invalid_sha` | `ci_not_certified` |
-   `record_write_failed`) and expect the gate. That is the safe outcome, not an
+   `pr_url_missing` | `pr_url_invalid` | `merge_binding_mismatch` |
+   `merge_binding_unverified` | `record_write_failed`) and expect the gate.
+   That is the safe outcome, not an
    error - never re-trigger `start_deploy` to chase a record.
 4. **Watch:** poll `Pipeline___get_state(pipeline_name, execution_id)` every
    ~60s until `terminal:true` AND `matchesExecution:true`. A waiting

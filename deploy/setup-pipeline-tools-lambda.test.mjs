@@ -251,9 +251,18 @@ describe("resolveEnv", () => {
       PIPELINE_REGIONS: "us-east-1",
       // Derived from ACCOUNT at deploy time when unset (deploy/config.sh convention).
       ARTIFACT_BUCKET: "",
+      // TEAM-4525: optional. Empty means no ship-approval record can ever be
+      // written, so every deploy keeps its human gate.
+      GITHUB_TOKEN: "",
     });
     expect(resolveEnv({ PIPELINE_CI_START_BUILD: "1" }).PIPELINE_CI_START_BUILD).toBe("1");
     expect(resolveEnv({ PIPELINE_CI_START_BUILD: "true" }).PIPELINE_CI_START_BUILD).toBe("0");
+  });
+
+  it("passes a GITHUB_TOKEN through when the operator set one", () => {
+    // It is the ONLY way the merge binding can be machine-verified; without it
+    // recordShipApproval refuses with merge_binding_unverified (TEAM-4525 review P1).
+    expect(resolveEnv({ GITHUB_TOKEN: "ghp-abc" }).GITHUB_TOKEN).toBe("ghp-abc");
   });
 });
 
