@@ -14,7 +14,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { adfToText, getIssue, handler } from "./index.mjs";
+import { adfToText, getIssue, handler, clampSummary } from "./index.mjs";
 import { parseFixContractBlock } from "./fix-contract.mjs";
 
 // ─── Finding 1: adfToText ──────────────────────────────────────────────────────
@@ -983,6 +983,95 @@ test("getIssue: requests issuelinks and returns blockedBy from the inward side o
     assert.equal(result.assignee, "agentcore_hub_release_manager");
     const issueUrl = requested.find((u) => !u.includes("/comment"));
     assert.ok(/fields=[^&]*issuelinks/.test(issueUrl), `issue GET should request issuelinks: ${issueUrl}`);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+// ─── TEAM-4537: summary clamp — Jira 400s "Summary can't exceed 255 characters" ─
+//
+// wf_1789190697687_fxrs67 / epic TEAM-4518: a self-improvement run's
+// auto-generated title exceeded 255 chars and the create died with a Jira 400.
+// The bug-intake path in the orchestrator already clamps; this Lambda's general
+// create/update paths did not.
+
+const LONG_TITLE = "A".repeat(200) + " " + "B".repeat(200); // 401 chars, one space near the middle
+const LONG_DESCRIPTION = "The full text must survive in the description even though the title is long. " + "x".repeat(300);
+
+test("createTicket: a >255-char summary is clamped to <=255 chars on the create POST, description kept in full", async () => {
+  const cap = captureCreate({ createdKey: "TEAM-900" });
+  try {
+    const result = await handler({
+      tool_name: "Tickets___create_ticket",
+      parameters: { summary: LONG_TITLE, description: LONG_DESCRIPTION, workflow_id: "run1" },
+    });
+    assert.equal(result.ticketId, "TEAM-900");
+    assert.ok(cap.fields, "expected a create POST");
+    assert.ok(cap.fields.summary.length <= 255, `summary too long: ${cap.fields.summary.length} chars`);
+    assert.ok(/\S$/.test(cap.fields.summary), "summary must not end in whitespace");
+    assert.ok(LONG_TITLE.startsWith(cap.fields.summary.replace(/…$/, "")), "clamped summary must be a prefix of the original title");
+    const description = cap.fields.description.content[0].content[0].text;
+    assert.equal(description, LONG_DESCRIPTION, "description must carry the full text, unclamped");
+  } finally {
+    cap.restore();
+  }
+});
+
+test("createTicket: dedupe on a long summary matches against the CLAMPED stored summary, not the raw one", async () => {
+  const originalFetch = globalThis.fetch;
+  const clamped = clampSummary(LONG_TITLE);
+  let posted = false;
+  globalThis.fetch = async (url, options = {}) => {
+    const method = options.method || "GET";
+    const u = String(url);
+    if (u.includes("/rest/api/3/search/jql")) {
+      // The prior create for this same long title stored the CLAMPED summary.
+      return new Response(JSON.stringify({
+        issues: [{
+          key: "TEAM-901",
+          fields: { summary: clamped, status: { name: "To Do" }, labels: ["wf:run1"], issuetype: { name: "Task" } },
+        }],
+      }), { status: 200 });
+    }
+    if (u.includes("/transitions")) return new Response(JSON.stringify({ transitions: [] }), { status: 200 });
+    if (u.endsWith("/rest/api/3/issue") && method === "POST") {
+      posted = true;
+      return new Response(JSON.stringify({ key: "TEAM-902" }), { status: 201 });
+    }
+    return new Response(JSON.stringify({}), { status: 200 });
+  };
+  try {
+    const result = await handler({
+      tool_name: "Tickets___create_ticket",
+      parameters: { summary: LONG_TITLE, workflow_id: "run1" },
+    });
+    assert.equal(result.deduplicated, true, "the retried create of the same long title must dedupe, not duplicate");
+    assert.equal(result.ticketId, "TEAM-901");
+    assert.ok(!posted, "no new issue should be created on a dedupe hit");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("updateTicket: a >255-char title is clamped on the PUT", async () => {
+  const originalFetch = globalThis.fetch;
+  let putFields = null;
+  globalThis.fetch = async (url, options = {}) => {
+    const method = options.method || "GET";
+    if (method === "PUT") {
+      putFields = JSON.parse(options.body).fields;
+      return new Response("", { status: 204 });
+    }
+    return new Response(JSON.stringify({}), { status: 200 });
+  };
+  try {
+    await handler({
+      tool_name: "Tickets___update_ticket",
+      parameters: { ticket_id: "TEAM-903", title: LONG_TITLE },
+    });
+    assert.ok(putFields, "expected a PUT");
+    assert.ok(putFields.summary.length <= 255, `summary too long: ${putFields.summary.length} chars`);
+    assert.ok(/\S$/.test(putFields.summary), "summary must not end in whitespace");
   } finally {
     globalThis.fetch = originalFetch;
   }
