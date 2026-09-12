@@ -256,7 +256,12 @@ phases:
           case "$URL" in http*) : ;; *) URL="https://$URL" ;; esac
           echo "service ACTIVE at $URL — checking app health"
           curl -sf "$URL/api/agentcore/traces/health" >/dev/null || { echo "app health check FAILED"; exit 1; }
-          echo "ECS rollout healthy"
+          # The /pipeline tab is baked into the image at build time from the CI
+          # project's NEXT_PUBLIC_PIPELINE_ENABLED. This pipeline deploying the
+          # app means the module is on, so a tab-less image is a bad build, not
+          # a config choice -> fail the release and roll back.
+          curl -sf "$URL/" | grep -q 'href="/pipeline"' || { echo "nav smoke FAILED: /pipeline tab missing from image (NEXT_PUBLIC_PIPELINE_ENABLED not baked)"; exit 1; }
+          echo "ECS rollout healthy (nav includes /pipeline)"
         fi
 
         # ── APP DEPLOY SUCCEEDED: advance the rollback snapshot + baseline NOW ──

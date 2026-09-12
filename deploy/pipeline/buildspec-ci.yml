@@ -180,6 +180,7 @@ phases:
           deploy/pipeline/test_plan_surfaces.py \
           deploy/pipeline/test_prune_apt_sources.py \
           deploy/pipeline/test_update_runtime_image.py \
+          deploy/pipeline/test_discover_live_env.py \
           deploy/pipeline/test_buildspec_ci_exit_codes.py || { rc=$?; deactivate; echo "runtime-agent pytest battery FAILED (exit $rc)"; exit "$rc"; }
         deactivate
       # HARD GATE: lambda-zip manifest integrity (the guard DEPLOY.md's inline zip bypassed)
