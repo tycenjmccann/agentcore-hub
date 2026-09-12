@@ -11,7 +11,7 @@ import {
 import KPI_FIXTURE from "../../../lambda/cost-report/fixtures/kpi-cases.json";
 
 // ─── kpi-cases.json fixture typing ────────────────────────────────────────────
-// The JSON's inferred type is a union across 17 dissimilar cases, so it is cast
+// The JSON's inferred type is a union across 18 dissimilar cases, so it is cast
 // once here through a hand-written shape. No `any`, and production types stay strict.
 
 interface ExpectedComponent { key: string; points: number | null; included?: boolean; normalized?: number }
@@ -20,6 +20,10 @@ interface ExpectedKpi {
   grade: string | null;
   confidence: string;
   evidenceWeight: number;
+  /** Present on every compute case; the suite asserts it via `card.run.outcome`. */
+  outcome?: string;
+  /** Set on `zero-cost-card`: cost was unresolvable, so `costUsd` is null. */
+  costMissing?: boolean;
   excluded: string[];
   capsApplied: KpiCap[];
   costUsd: number | null;
@@ -37,6 +41,21 @@ interface FixtureFile { reportVersion: number; kpiVersion: number; cases: Fixtur
 const FIXTURE = KPI_FIXTURE as unknown as FixtureFile;
 const COMPUTE_CASES = FIXTURE.cases.filter((c) => c.kind === "compute");
 const TOLERATE_CASES = FIXTURE.cases.filter((c) => c.kind === "tolerate");
+
+/** Fixture cases are addressed BY NAME: a reorder must not silently repoint a test. */
+function computeCase(name: string): FixtureCase {
+  const c = COMPUTE_CASES.find((x) => x.name === name);
+  if (!c) throw new Error(`kpi-cases.json is missing compute case "${name}"`);
+  return c;
+}
+
+/** card.time values are `unknown` by type. Narrow AND assert presence, so an echo
+ *  assertion can never pass vacuously (undefined === undefined). */
+function fixtureMs(card: PerformanceCardInput, key: "wallMs" | "activeMs" | "humanWaitMs"): number {
+  const v = ((card.time ?? {}) as Record<string, unknown>)[key];
+  expect(typeof v, `fixture card.time.${key} must be numeric`).toBe("number");
+  return v as number;
+}
 
 function card(over: Partial<CardSummary> & { completedAt: string; total?: number }): CardSummary {
   const { total: totalOpt, ...rest } = over;
@@ -233,8 +252,12 @@ describe("formatKpi", () => {
 
 describe("computeKpi — kpi-cases.json parity", () => {
   it("runs the whole fixture (a shrinking fixture must fail loudly)", () => {
-    expect(COMPUTE_CASES).toHaveLength(16);
+    expect(COMPUTE_CASES).toHaveLength(17);
     expect(TOLERATE_CASES.length).toBeGreaterThan(0);
+    // Design §3.1/§8: the full v5 card case is what proves the scorer against a
+    // real buildCard object rather than a hand-shaped stub, so pin it BY NAME —
+    // a rename or a drop must fail here, not silently pass on the count.
+    expect(COMPUTE_CASES.map((c) => c.name)).toContain("real-full-card");
   });
 
   it.each(COMPUTE_CASES.map((c) => [c.name, c] as [string, FixtureCase]))("%s", (_name, c) => {
@@ -276,10 +299,13 @@ describe("computeKpi — kpi-cases.json parity", () => {
   });
 
   it("echoes the card's time axis and leaves the bands for the fleet pass", () => {
-    const kpi = computeKpi(COMPUTE_CASES[0].card);
-    expect(kpi.time.wallMs).toBe(3_600_000);
-    expect(kpi.time.activeMs).toBe(3_000_000);
-    expect(kpi.time.humanWaitMs).toBe(600_000);
+    const c = computeCase("worked-example");
+    const kpi = computeKpi(c.card);
+    // Echo, not restate: the expected numbers are READ OFF the fixture card, so the
+    // fixture stays the single source of truth for the time axis.
+    expect(kpi.time.wallMs).toBe(fixtureMs(c.card, "wallMs"));
+    expect(kpi.time.activeMs).toBe(fixtureMs(c.card, "activeMs"));
+    expect(kpi.time.humanWaitMs).toBe(fixtureMs(c.card, "humanWaitMs"));
     expect(kpi.cost.band).toBe("unknown");
     expect(kpi.time.band).toBe("unknown");
     expect(kpi.quality.band).toBe("unknown");
