@@ -75,6 +75,18 @@ export function isPersonaRuntimeArn(arn: string | null | undefined, agentId: str
 }
 
 /**
+ * The deployed runtimes that could host this persona, candidate order preserved
+ * (own runtime → phase anchor → single host) and absent ones dropped.
+ */
+async function matchingFleetRuntimes(agentId: string, region: string) {
+  const agents = await discoverAgents(region).catch(() => []);
+  const runtimes = agents.filter(a => a.type === "runtime");
+  return fleetRuntimeNames(agentId)
+    .map(candidate => runtimes.find(a => nameMatches(a.name, candidate)))
+    .filter((a): a is NonNullable<typeof a> => Boolean(a));
+}
+
+/**
  * The ARN to invoke this persona on, discovered from the live account.
  * Returns null when no runtime in the fleet matches any candidate name.
  */
@@ -82,11 +94,34 @@ export async function resolveFleetRuntimeArn(
   agentId: string,
   region: string
 ): Promise<string | null> {
-  const agents = await discoverAgents(region).catch(() => []);
-  const runtimes = agents.filter(a => a.type === "runtime");
-  for (const candidate of fleetRuntimeNames(agentId)) {
-    const hit = runtimes.find(a => nameMatches(a.name, candidate));
-    if (hit?.arn) return hit.arn;
-  }
-  return null;
+  const hits = await matchingFleetRuntimes(agentId, region);
+  return hits.find(a => a.arn)?.arn || null;
+}
+
+/**
+ * Agent ids to try against `/api/agentcore/memory/events` for this persona's
+ * history, best candidate first.
+ *
+ * These are DISCOVERED ids, not roster names, and the difference is the whole
+ * point of this function. `findMemoryForAgent` (core) resolves the fleet's single
+ * shared memory by `agents.find(a => a.id === agentId)` and then reading the
+ * runtime's `MEMORY_ID` env var — and a discovered runtime's `id` is its
+ * `agentRuntimeId` (`agentcore_hub_qaci-a1B2c3D4e5`), while its `name` is the
+ * bare `agentcore_hub_qaci` (`discoverAgents`: `id: r.agentRuntimeId`,
+ * `name: r.agentRuntimeName`). Handing core a bare name matches no agent, and the
+ * name-based fallbacks then look for `<name>_mem*` while the fleet's memory is
+ * `agentcore_hub_fleet_memory-<suffix>` — so every candidate resolved to null and
+ * history came back empty in ALL topologies, 14-runtime included.
+ *
+ * Resolution stays in core; only the name → id step lives here, because only this
+ * module knows which runtimes a persona can ride. Empty when discovery fails or
+ * the fleet is not deployed: the caller then falls back to the bare agentId,
+ * which is exactly the (harmless) no-history path.
+ */
+export async function resolveFleetMemoryAgentIds(
+  agentId: string,
+  region: string
+): Promise<string[]> {
+  const hits = await matchingFleetRuntimes(agentId, region);
+  return [...new Set(hits.map(a => a.id).filter(Boolean))];
 }

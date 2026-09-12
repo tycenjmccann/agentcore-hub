@@ -22,6 +22,19 @@ import { NextRequest } from "next/server";
 const ACCT = "123456789012";
 const arnFor = (runtimeName: string) =>
   `arn:aws:bedrock-agentcore:us-east-1:${ACCT}:runtime/${runtimeName}-AbCdEf`;
+/**
+ * A discovered runtime's `id` is its agentRuntimeId — the bare name plus the
+ * deployment suffix — while its `name` is the bare name. Memory resolution keys
+ * on the id, so the two must never be conflated in these fixtures.
+ */
+const ridFor = (runtimeName: string) => `${runtimeName}-AbCdEf`;
+const discoveredRuntime = (runtimeName: string) => ({
+  id: ridFor(runtimeName),
+  name: runtimeName,
+  arn: arnFor(runtimeName),
+  type: "runtime",
+  status: "READY",
+});
 
 const h = vi.hoisted(() => {
   const state: {
@@ -31,6 +44,7 @@ const h = vi.hoisted(() => {
     invokes: Array<{ agentRuntimeArn: string; prompt: string; sessionId: string; payloadFormat?: string }>;
     upstreamFrames: string[];
     discoverCalls: number;
+    invocationReads: number;
     discovered: Array<{ id: string; name: string; arn: string; type: string; status: string }>;
   } = {
     workflow: null,
@@ -39,6 +53,7 @@ const h = vi.hoisted(() => {
     invokes: [],
     upstreamFrames: ['data: {"type":"text","content":"ok"}', 'data: {"type":"done"}'],
     discoverCalls: 0,
+    invocationReads: 0,
     discovered: [],
   };
   return { state };
@@ -49,7 +64,10 @@ vi.mock("@/lib/workflow/dynamo-read", () => ({
     h.state.workflowReads.push(id);
     return h.state.workflow;
   },
-  getLatestAgentInvocation: async () => h.state.invocation,
+  getLatestAgentInvocation: async () => {
+    h.state.invocationReads++;
+    return h.state.invocation;
+  },
 }));
 
 vi.mock("@/lib/agentcore-sdk", () => ({
@@ -115,10 +133,8 @@ beforeEach(() => {
   h.state.discoverCalls = 0;
   // Default topology for the fallback path: the 14-runtime fleet (the shipped
   // default), where NO runtime is called agentcore_hub_agent.
-  h.state.discovered = [
-    { id: PERSONA, name: PERSONA, arn: arnFor(PERSONA), type: "runtime", status: "READY" },
-    { id: "other", name: "agentcore_hub_backend_dev", arn: arnFor("agentcore_hub_backend_dev"), type: "runtime", status: "READY" },
-  ];
+  h.state.discovered = [discoveredRuntime(PERSONA), discoveredRuntime("agentcore_hub_backend_dev")];
+  h.state.invocationReads = 0;
   h.state.upstreamFrames = ['data: {"type":"text","content":"ok"}', 'data: {"type":"done"}'];
 });
 
@@ -254,6 +270,17 @@ describe("runtime resolution is topology-aware", () => {
     expect((await post({ agentId: PERSONA, message: "hi" })).status).toBe(200);
     expect(h.state.invokes[0].agentRuntimeArn).toBe(arnFor(PERSONA));
   });
+
+  it("skips the paged event scan for a persona with no task in this run", async () => {
+    // No dispatch means no orchestrator.agent_invoked row to find, so paging the
+    // whole event partition to prove it is pure cost. Chat still works: discovery
+    // supplies the runtime and a fresh session is opened.
+    h.state.workflow = { id: "wf-1", phase: "review", input: { title: "Idle chat" }, agentTasks: {} };
+    expect((await post({ agentId: PERSONA, message: "hi" })).status).toBe(200);
+    expect(h.state.invocationReads).toBe(0);
+    expect(h.state.invokes[0].agentRuntimeArn).toBe(arnFor(PERSONA));
+    expect(h.state.invokes[0].sessionId.length).toBeGreaterThanOrEqual(33);
+  });
 });
 
 describe("input validation happens before any AWS call", () => {
@@ -352,6 +379,27 @@ describe("error hygiene", () => {
     expect(body).not.toContain("arn:");
   });
 
+  /**
+   * `data: null` is valid JSON, so it reaches the field scan — where reading
+   * `.type` off null throws inside the TransformStream and aborts the whole
+   * reply, losing the text already streamed. Non-objects have no error fields to
+   * scrub, so they pass through and the stream survives.
+   */
+  it.each(["null", '"just a string"', "42", "[1,2]"])(
+    "survives a %s payload frame instead of killing the stream",
+    async (payload) => {
+      h.state.upstreamFrames = [
+        'data: {"type":"text","content":"partial answer"}',
+        `data: ${payload}`,
+        'data: {"type":"done"}',
+      ];
+      const res = await post({ agentId: PERSONA, message: "hi" });
+      const body = await readBody(res);
+      expect(body).toContain("partial answer");
+      expect(body).toContain('{"type":"done"}');
+    }
+  );
+
   it("passes normal text frames through untouched", async () => {
     const res = await post({ agentId: PERSONA, message: "hi" });
     const body = await readBody(res);
@@ -387,20 +435,56 @@ describe("GET (session + idle state for the modal)", () => {
   });
 
   /**
-   * Memory candidates, so history replay works in every topology: core resolves
-   * the fleet's shared memory by finding a runtime named after the agent, which
-   * only exists in 14-runtime mode.
+   * Memory candidates, so history replay works in every topology.
+   *
+   * They must be DISCOVERED ids, not roster names: findMemoryForAgent matches
+   * `a.id === agentId` (the agentRuntimeId) and then reads that runtime's
+   * MEMORY_ID. Bare names matched nothing, so history came back empty everywhere.
    */
-  it("returns the topology's memory candidates, persona first", async () => {
+  it("returns discovered runtime ids for memory, best candidate first", async () => {
+    h.state.discovered = [
+      discoveredRuntime(PERSONA), // 14-runtime mode
+      discoveredRuntime("agentcore_hub_qaci"), // 4-runtime mode: review phase anchor
+      discoveredRuntime("agentcore_hub_agent"), // 1-runtime mode
+      discoveredRuntime("agentcore_hub_backend_dev"), // another persona: not a candidate
+    ];
+    const { memoryAgentIds } = await (
+      await GET(
+        new NextRequest(`http://localhost/api/workflow/wf-1/agent-chat?agentId=${PERSONA}`),
+        { params: { id: "wf-1" } }
+      )
+    ).json();
+    expect(memoryAgentIds).toEqual([
+      ridFor(PERSONA),
+      ridFor("agentcore_hub_qaci"),
+      ridFor("agentcore_hub_agent"),
+    ]);
+    // The bug this replaced: bare names, which resolve to no memory at all.
+    expect(memoryAgentIds).not.toContain(PERSONA);
+  });
+
+  it("skips memory candidates the fleet has not deployed", async () => {
+    // 4-runtime fleet: no runtime carries the persona's name.
+    h.state.discovered = [
+      discoveredRuntime("agentcore_hub_requirements"),
+      discoveredRuntime("agentcore_hub_qaci"),
+    ];
     const res = await GET(
       new NextRequest(`http://localhost/api/workflow/wf-1/agent-chat?agentId=${PERSONA}`),
       { params: { id: "wf-1" } }
     );
-    expect((await res.json()).memoryAgentIds).toEqual([
-      PERSONA, // 14-runtime mode
-      "agentcore_hub_qaci", // 4-runtime mode: review phase anchor
-      "agentcore_hub_agent", // 1-runtime mode
-    ]);
+    expect((await res.json()).memoryAgentIds).toEqual([ridFor("agentcore_hub_qaci")]);
+  });
+
+  it("does not scan the run's events for a persona that was never dispatched", async () => {
+    // No agentTasks entry for this persona = no dispatch = no agent_invoked event.
+    h.state.workflow = { id: "wf-1", phase: "review", input: { title: "Idle chat" }, agentTasks: {} };
+    const res = await GET(
+      new NextRequest(`http://localhost/api/workflow/wf-1/agent-chat?agentId=${PERSONA}`),
+      { params: { id: "wf-1" } }
+    );
+    expect((await res.json()).sessionId).toBeNull();
+    expect(h.state.invocationReads).toBe(0);
   });
 
   it("rejects a bad agentId on GET too, before reading DynamoDB", async () => {

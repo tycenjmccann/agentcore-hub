@@ -54,11 +54,11 @@ export function AgentIdleChat({ workflowId, agentId, isIdle, isOpen }: AgentIdle
   // resource, or never have been dispatched in this run).
   //
   // The memory lookup is tried against each id the route hands back. The fleet
-  // shares one memory resource, and core resolves it by finding a runtime named
-  // after the agent — which only exists in 14-runtime mode. `memoryAgentIds`
-  // adds the phase anchor and the single host, so 4- and 1-runtime deployments
-  // replay history too. actorId stays the persona in every attempt, so this only
-  // changes which memory is found, never whose turns come back.
+  // shares one memory resource and core resolves it from a runtime looked up by
+  // its DISCOVERED id, so `memoryAgentIds` carries discovered runtime ids (not
+  // this persona's roster name, which matches nothing) covering the 14-, 4- and
+  // 1-runtime topologies. actorId stays the persona in every attempt, so this
+  // only changes which memory is found, never whose turns come back.
   useEffect(() => {
     if (!isOpen || !workflowId || !agentId) return;
     let cancelled = false;

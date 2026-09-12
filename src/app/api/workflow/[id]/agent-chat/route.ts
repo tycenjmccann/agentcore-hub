@@ -54,8 +54,8 @@ import {
   QUESTION_END_MARKER,
 } from "@/lib/workflow/persona-chat";
 import {
-  fleetRuntimeNames,
   isPersonaRuntimeArn,
+  resolveFleetMemoryAgentIds,
   resolveFleetRuntimeArn,
 } from "@/lib/workflow/fleet-runtime";
 import type { AgentTask } from "@/lib/workflow/types";
@@ -166,18 +166,23 @@ function sanitizeErrorFrames(source: ReadableStream, context: string): ReadableS
 
   const rewrite = (frame: string): string => {
     if (!frame.startsWith("data: ")) return frame;
-    let parsed: Record<string, unknown>;
+    let parsed: unknown;
     try {
       parsed = JSON.parse(frame.slice(6));
     } catch {
       return frame;
     }
-    const isError = parsed.type === "error" || parsed.event === "error";
+    // `data: null` parses fine and then throws on `.type`, which would reject the
+    // TransformStream and kill the whole reply mid-sentence. Anything that is not
+    // a plain object has no error fields to scrub, so pass it through untouched.
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return frame;
+    const fields = parsed as Record<string, unknown>;
+    const isError = fields.type === "error" || fields.event === "error";
     if (!isError) return frame;
     // Log the frame as it arrived — the rewritten copy is useless for debugging.
     console.error(`[agent-chat] ${context} upstream error:`, frame.slice(6));
     const safe: Record<string, unknown> = {};
-    for (const [key, value] of Object.entries(parsed)) {
+    for (const [key, value] of Object.entries(fields)) {
       if (SAFE_ERROR_KEYS.has(key)) safe[key] = value;
       else if (typeof value === "string") safe[key] = OPAQUE_ERROR;
       // Non-string, non-structural values are dropped: nothing downstream reads
@@ -262,27 +267,33 @@ async function resolveTarget(workflowId: string, agentId: string): Promise<Targe
  *
  * `memoryAgentIds` exists because the fleet shares ONE memory resource
  * (`agentcore_hub_fleet_memory`, personas separated by actorId) while
- * `findMemoryForAgent` resolves it by looking up a runtime named after the agent.
- * That works in 14-runtime mode and finds nothing in 1- or 4-runtime mode, where
- * no runtime carries the persona's name. So the candidate runtime names go back
- * with the response and the modal tries them in order — resolution stays in core
- * and untouched, the topology knowledge stays in this module. actorId is always
- * the persona, so a candidate only ever changes which memory is found, never
- * whose turns are read.
+ * `findMemoryForAgent` resolves it from a runtime looked up by DISCOVERED id.
+ * These are therefore discovered `agentRuntimeId`s, not roster names — see
+ * `resolveFleetMemoryAgentIds` for why the difference decides whether any history
+ * comes back at all — ordered persona runtime → phase anchor → single host so one
+ * response covers 14-, 4- and 1-runtime deployments. actorId is always the
+ * persona, so a candidate only ever changes which memory is found, never whose
+ * turns are read.
  */
 export async function GET(
   req: NextRequest,
   { params }: { params: { id: string } }
 ) {
+  const region = req.headers.get("x-aws-region") || DEFAULT_REGION;
   const agentId = (req.nextUrl.searchParams.get("agentId") || "").trim();
   const target = await resolveTarget(params.id, agentId);
   if ("error" in target) return target.error;
 
-  const invocation = await getLatestAgentInvocation(params.id, agentId).catch(() => null);
+  // No task for this persona in this run means it was never dispatched, so there
+  // is no `orchestrator.agent_invoked` event to find — skip the paged scan of the
+  // run's whole event partition rather than spend it proving a negative.
+  const invocation = target.task
+    ? await getLatestAgentInvocation(params.id, agentId).catch(() => null)
+    : null;
   return NextResponse.json({
     sessionId: invocation?.sessionId || null,
     active: target.active,
-    memoryAgentIds: fleetRuntimeNames(agentId),
+    memoryAgentIds: await resolveFleetMemoryAgentIds(agentId, region),
   });
 }
 
@@ -326,7 +337,10 @@ export async function POST(
   }
   const { workflow, task } = target;
 
-  const invocation = await getLatestAgentInvocation(workflowId, agentId).catch(() => null);
+  // Same early exit as GET: never dispatched → no dispatch event to look for.
+  const invocation = task
+    ? await getLatestAgentInvocation(workflowId, agentId).catch(() => null)
+    : null;
 
   // The recorded ARN comes out of a DynamoDB row, so it is checked against the
   // roster before it is invoked rather than trusted (see isPersonaRuntimeArn).

@@ -15,13 +15,23 @@ vi.mock("@/lib/agentcore-sdk", () => ({
 
 let discovered: Array<{ id: string; name: string; arn: string; type: string }> = [];
 
-const { fleetRuntimeNames, isPersonaRuntimeArn, resolveFleetRuntimeArn } = await import(
-  "./fleet-runtime"
-);
+const {
+  fleetRuntimeNames,
+  isPersonaRuntimeArn,
+  resolveFleetRuntimeArn,
+  resolveFleetMemoryAgentIds,
+} = await import("./fleet-runtime");
 
 const arn = (name: string) =>
   `arn:aws:bedrock-agentcore:us-east-1:123456789012:runtime/${name}-AbCdEf`;
-const runtime = (name: string) => ({ id: name, name, arn: arn(name), type: "runtime" });
+/**
+ * A discovered runtime as `discoverAgents` actually returns it: `id` is the
+ * `agentRuntimeId` (name + `-suffix`), `name` is the bare `agentRuntimeName`.
+ * Modelling that difference is the point — conflating the two is what made
+ * history replay come back empty.
+ */
+const rid = (name: string) => `${name}-AbCdEf`;
+const runtime = (name: string) => ({ id: rid(name), name, arn: arn(name), type: "runtime" });
 
 describe("fleetRuntimeNames", () => {
   it.each([
@@ -108,5 +118,54 @@ describe("resolveFleetRuntimeArn", () => {
       runtime("something_else"),
     ];
     expect(await resolveFleetRuntimeArn(persona, "us-east-1")).toBeNull();
+  });
+});
+
+/**
+ * The ids handed to /api/agentcore/memory/events for history replay.
+ *
+ * These MUST be discovered `agentRuntimeId`s. `findMemoryForAgent` looks the agent
+ * up with `agents.find(a => a.id === agentId)` and then reads the runtime's
+ * MEMORY_ID env var; a bare roster name matches no agent, and the name-based
+ * fallbacks then hunt for `<name>_mem*` while the fleet's memory is
+ * `agentcore_hub_fleet_memory-<suffix>` — so a name resolves to no memory at all,
+ * in every topology.
+ */
+describe("resolveFleetMemoryAgentIds", () => {
+  const persona = "agentcore_hub_code_reviewer";
+
+  it("returns discovered runtime ids, not bare roster names", async () => {
+    discovered = [runtime(persona), runtime("agentcore_hub_qaci"), runtime("agentcore_hub_agent")];
+    const ids = await resolveFleetMemoryAgentIds(persona, "us-east-1");
+    expect(ids).toEqual([rid(persona), rid("agentcore_hub_qaci"), rid("agentcore_hub_agent")]);
+    expect(ids).not.toContain(persona);
+  });
+
+  it("skips candidates that are not deployed (4-runtime fleet)", async () => {
+    discovered = [runtime("agentcore_hub_requirements"), runtime("agentcore_hub_qaci")];
+    expect(await resolveFleetMemoryAgentIds(persona, "us-east-1")).toEqual([
+      rid("agentcore_hub_qaci"),
+    ]);
+  });
+
+  it("falls back to the single host (1-runtime fleet)", async () => {
+    discovered = [runtime("agentcore_hub_agent")];
+    expect(await resolveFleetMemoryAgentIds(persona, "us-east-1")).toEqual([
+      rid("agentcore_hub_agent"),
+    ]);
+  });
+
+  it("returns nothing when no fleet runtime is deployed", async () => {
+    discovered = [runtime("something_else")];
+    expect(await resolveFleetMemoryAgentIds(persona, "us-east-1")).toEqual([]);
+  });
+
+  it("drops a runtime that came back without an id", async () => {
+    // discoverAgents maps `id: r.agentRuntimeId!` — a runtime missing that field
+    // must not become an empty agent_id in the memory query.
+    discovered = [{ ...runtime(persona), id: "" }, runtime("agentcore_hub_qaci")];
+    expect(await resolveFleetMemoryAgentIds(persona, "us-east-1")).toEqual([
+      rid("agentcore_hub_qaci"),
+    ]);
   });
 });

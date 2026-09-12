@@ -108,12 +108,12 @@ export interface AgentInvocationRef {
  *
  * MUST paginate. DynamoDB applies `Limit` to rows *scanned*, before
  * `FilterExpression`, and a run's partition is dominated by `agent.streaming`
- * rows — 1000-2000 events for a normal run and 7500+ for a pathological one
- * (docs/workflow-pipeline-architecture.md). A single 400-row window therefore
- * misses the dispatch of every persona but the last few, which silently cost
- * the operator both history replay and the persona's own memory. Walk
- * LastEvaluatedKey newest-first and stop at the page that first matches:
- * descending scan order means every later page is older.
+ * rows — a normal run produces ~1000-2000 events in total
+ * (docs/workflow-pipeline-architecture.md:1179), against 14 dispatches. A single
+ * 400-row window therefore misses the dispatch of every persona but the last few,
+ * which silently cost the operator both history replay and the persona's own
+ * memory. Walk LastEvaluatedKey newest-first and stop at the page that first
+ * matches: descending scan order means every later page is older.
  */
 const INVOCATION_PAGE_SIZE = 500;
 const INVOCATION_MAX_PAGES = 20; // 10k rows — covers the worst run on record

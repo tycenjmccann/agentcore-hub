@@ -125,7 +125,9 @@ async function stubApi(page: Page, status: string, mock: ChatMock = {}, output =
         body: JSON.stringify({
           sessionId: "TEAM-4498_wf-agent-chat-4498-reviewer-1757",
           active: status === "running",
-          memoryAgentIds: [PERSONA_ID, "agentcore_hub_qaci", "agentcore_hub_agent"],
+          // Discovered agentRuntimeIds (name + deployment suffix), which is what
+          // memory resolution keys on — never the bare roster names.
+          memoryAgentIds: [`${PERSONA_ID}-AbCdEf`, "agentcore_hub_qaci-AbCdEf"],
         }),
       });
       return;
