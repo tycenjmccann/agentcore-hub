@@ -36,6 +36,17 @@
  * widening the allow-list can only add a pipeline to READ and TRIGGER, never an
  * approval path.
  *
+ * ─── The ship-approval record (TEAM-4525) ─────────────────────────────────────
+ * start_deploy records the head SHA a human already approved at Merge Approval,
+ * keyed on the merge commit, under pipeline-artifacts/ship-approvals/ in the
+ * artifact bucket, so the pipeline can skip re-asking that same human for
+ * byte-identical code. That adds ONE statement — ShipApprovalRecordWrite,
+ * s3:PutObject on that ONE prefix and nothing else: the only S3 write this role
+ * has. It is not an approval grant. codepipeline:PutApprovalResult remains absent
+ * in every combination (asserted, not just reviewed, in this script's test), and
+ * a role that can write evidence but cannot release a gate is exactly what makes
+ * the conditional gate safe.
+ *
  * Idempotent / re-runnable. Account-guarded via deploy/config.sh conventions.
  *
  * Usage:
@@ -240,7 +251,12 @@ export function buildInlinePolicy(env) {
         // hub-*-deploy pipeline. NO codepipeline:PutApprovalResult — the deploy
         // gate is a human decision (Telegram bridge). Do not add it here, and note
         // that widening this Resource list can only ever add a pipeline to read
-        // and trigger, never an approval path.
+        // and trigger, never an approval path. Still true after TEAM-4525's
+        // conditional deploy gate: the tools Lambda writes a ship-approval RECORD
+        // (Sid ShipApprovalRecordWrite, s3:PutObject on one prefix) and the
+        // pipeline decides whether that record makes a second human ask
+        // redundant. Recording is not approving, and there is still no
+        // PutApprovalResult anywhere in this role's reach.
         Sid: "PipelineReadAndTrigger",
         Effect: "Allow",
         Action: [
@@ -303,6 +319,27 @@ export function buildInlinePolicy(env) {
               Effect: "Allow",
               Action: ["s3:GetObject"],
               Resource: [`arn:aws:s3:::${artifactBucket}/config/cd-registry.json`],
+            },
+          ]
+        : []),
+      // TEAM-4525 — the ONE S3 write this role ever gets: start_deploy records the
+      // head SHA a human already approved at Merge Approval, keyed on the merge
+      // commit, so the pipeline can skip asking that same human a SECOND time for
+      // byte-identical code. Scoped exactly like HandoffMarkerRead is: s3:PutObject
+      // ONLY (no GetObject, no Delete, no ListBucket) on ONE prefix of the hub's own
+      // artifact bucket. It is NOT an approval grant and must never become one — the
+      // record is evidence the PIPELINE evaluates; codepipeline:PutApprovalResult
+      // stays absent from this role in every combination, and a role that can write
+      // a record but cannot approve a gate is the property that makes the skip safe.
+      ...(artifactBucket
+        ? [
+            {
+              Sid: "ShipApprovalRecordWrite",
+              Effect: "Allow",
+              Action: ["s3:PutObject"],
+              Resource: [
+                `arn:aws:s3:::${artifactBucket}/pipeline-artifacts/ship-approvals/*`,
+              ],
             },
           ]
         : []),

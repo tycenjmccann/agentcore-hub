@@ -27,6 +27,14 @@
  * suffix it needs, and codebuild:StartBuild gets project/hub-*-ci and nothing
  * else. The suite therefore asserts what the wildcards ARE, per PIPELINE_REGIONS
  * region, and — more importantly — what they can never be.
+ *
+ * TEAM-4525 adds the FIRST S3 write this role has ever had: ShipApprovalRecordWrite,
+ * s3:PutObject on pipeline-artifacts/ship-approvals/* so start_deploy can record the
+ * head SHA a human already approved and let the pipeline skip asking that same human
+ * twice. A write grant on the artifact bucket is exactly the kind of statement that
+ * quietly becomes a prefix wider than intended, so it is pinned as data too: one
+ * action, one prefix, additive to everything else, and still no approval action
+ * anywhere in the document.
  */
 import { describe, it, expect, vi } from "vitest";
 
@@ -101,6 +109,7 @@ describe("buildInlinePolicy — the CiStartBuild grant", () => {
       "BuildRead",
       "HandoffMarkerRead",
       "CdRegistryRead",
+      "ShipApprovalRecordWrite",
       "BuildLogRead",
       "CrossAccountAssumeTrigger",
     ]);
@@ -116,6 +125,7 @@ describe("buildInlinePolicy — the CiStartBuild grant", () => {
       "CiStartBuild",
       "HandoffMarkerRead",
       "CdRegistryRead",
+      "ShipApprovalRecordWrite",
       "BuildLogRead",
       "CrossAccountAssumeTrigger",
     ]);
@@ -335,15 +345,30 @@ describe("buildInlinePolicy — the handoff-marker read", () => {
     }
   });
 
-  it("grants no S3 WRITE of any kind", () => {
-    const actions = allActions(buildInlinePolicy({ ...BASE, PIPELINE_CI_START_BUILD: "1" }));
-    // Two S3 statements since TEAM-4337 (handoff markers, CD registry) and both
-    // are read-only. Listed rather than deduped so a third one cannot appear
-    // unnoticed.
-    expect(actions.filter((a) => a.startsWith("s3:"))).toEqual([
+  it("grants exactly two S3 reads and ONE S3 write, in that order", () => {
+    const policy = buildInlinePolicy({ ...BASE, PIPELINE_CI_START_BUILD: "1" });
+    // Two reads since TEAM-4337 (handoff markers, CD registry) and, since
+    // TEAM-4525, exactly ONE write (the ship-approval record). Listed rather than
+    // deduped so a fourth S3 grant cannot appear unnoticed.
+    expect(allActions(policy).filter((a) => a.startsWith("s3:"))).toEqual([
       "s3:GetObject",
       "s3:GetObject",
+      "s3:PutObject",
     ]);
+    // The write is on ONE prefix, and it is not the prefix either read covers.
+    const writes = statementsWith(policy, "s3:PutObject");
+    expect(writes).toHaveLength(1);
+    expect(writes[0].Sid).toBe("ShipApprovalRecordWrite");
+    // Nothing that could delete, list or read the bucket rides along.
+    for (const forbidden of [
+      "s3:DeleteObject",
+      "s3:GetObject",
+      "s3:ListBucket",
+      "s3:PutObjectAcl",
+      "s3:*",
+    ]) {
+      expect(writes[0].Action).not.toContain(forbidden);
+    }
   });
 
   it("honours an explicit ARTIFACT_BUCKET and is omitted when there is none", () => {
@@ -354,6 +379,95 @@ describe("buildInlinePolicy — the handoff-marker read", () => {
     expect(
       sid(buildInlinePolicy({ ...BASE, ACCOUNT: undefined }), "HandoffMarkerRead")
     ).toBeUndefined();
+  });
+});
+
+// ─── TEAM-4525: the ship-approval record write ────────────────────────────────
+//
+// start_deploy writes the head SHA a human already approved at Merge Approval,
+// keyed on the merge commit, so the pipeline can skip re-asking that same human
+// for byte-identical code. This is the FIRST write on S3 this role has ever had,
+// so its blast radius is the thing to pin: one action, one prefix, and no
+// approval action anywhere near it.
+
+describe("buildInlinePolicy — the ship-approval record write", () => {
+  it("is exactly s3:PutObject on exactly the ship-approvals prefix", () => {
+    const statement = sid(buildInlinePolicy(BASE), "ShipApprovalRecordWrite");
+    expect(statement).toEqual({
+      Sid: "ShipApprovalRecordWrite",
+      Effect: "Allow",
+      Action: ["s3:PutObject"],
+      Resource: [
+        `arn:aws:s3:::agentcore-hub-artifacts-${ACCOUNT}-us-east-1/pipeline-artifacts/ship-approvals/*`,
+      ],
+    });
+  });
+
+  it("cannot reach the handoff markers, the registry, the roster or the bucket root", () => {
+    const resource = sid(buildInlinePolicy(BASE), "ShipApprovalRecordWrite").Resource[0];
+    for (const forbidden of [
+      "pipeline-artifacts/handoff/",
+      "config/",
+      "cd-registry.json",
+      "agents.json",
+      "blueprints/",
+      "last-deployed",
+    ]) {
+      expect(resource).not.toContain(forbidden);
+    }
+    // Exactly one wildcard, at the END of the one prefix — never the bucket.
+    expect(resource).toMatch(
+      /^arn:aws:s3:::[a-z0-9.-]+\/pipeline-artifacts\/ship-approvals\/\*$/
+    );
+  });
+
+  it("honours an explicit ARTIFACT_BUCKET and vanishes without one", () => {
+    expect(
+      sid(
+        buildInlinePolicy({ ...BASE, ARTIFACT_BUCKET: "explicit-bucket" }),
+        "ShipApprovalRecordWrite"
+      ).Resource
+    ).toEqual(["arn:aws:s3:::explicit-bucket/pipeline-artifacts/ship-approvals/*"]);
+    // No bucket → no grant at all, same as the two read statements. The Lambda
+    // then reports preapproval.recorded:false and the human gate fires.
+    expect(
+      sid(buildInlinePolicy({ ...BASE, ACCOUNT: undefined }), "ShipApprovalRecordWrite")
+    ).toBeUndefined();
+  });
+
+  it("widens nothing else: every other statement is byte-identical with it present", () => {
+    // The record write is additive. Written as a diff of the whole document so a
+    // future edit that also loosens BuildRead or PipelineReadAndTrigger cannot
+    // hide behind "the new statement is fine".
+    for (const flag of ["0", "1"]) {
+      const policy = buildInlinePolicy({ ...BASE, PIPELINE_CI_START_BUILD: flag });
+      const others = policy.Statement.filter((s) => s.Sid !== "ShipApprovalRecordWrite");
+      // No statement other than the record write grants ANY s3 write action.
+      for (const s of others) {
+        for (const action of [].concat(s.Action)) {
+          expect(action, `${flag}/${s.Sid}`).not.toMatch(/^s3:Put/);
+          expect(action, `${flag}/${s.Sid}`).not.toMatch(/^s3:Delete/);
+        }
+      }
+      // And the record write grants no CodePipeline/CodeBuild action at all.
+      const statement = sid(policy, "ShipApprovalRecordWrite");
+      for (const action of statement.Action) {
+        expect(action, flag).toMatch(/^s3:/);
+      }
+    }
+  });
+
+  it("is not an approval grant — PutApprovalResult stays absent with it present", () => {
+    for (const bucket of ["", "explicit-bucket"]) {
+      const policy = buildInlinePolicy({ ...BASE, ARTIFACT_BUCKET: bucket });
+      const actions = allActions(policy);
+      expect(actions, bucket).not.toContain("codepipeline:PutApprovalResult");
+      expect(actions.filter((a) => /Approval/i.test(a)), bucket).toEqual([]);
+      // The Sid says "ship approval" but the Sid is a label, not a permission:
+      // the statement's actions are S3 and nothing else.
+      const statement = sid(policy, "ShipApprovalRecordWrite");
+      if (statement) expect(statement.Action).toEqual(["s3:PutObject"]);
+    }
   });
 });
 
@@ -375,6 +489,7 @@ describe("buildInlinePolicy — the hub-* convention wildcards", () => {
       "BuildRead",
       "HandoffMarkerRead",
       "CdRegistryRead",
+      "ShipApprovalRecordWrite",
       "BuildLogRead",
       "CrossAccountAssumeTrigger",
     ]);
@@ -385,6 +500,7 @@ describe("buildInlinePolicy — the hub-* convention wildcards", () => {
       "CiStartBuild",
       "HandoffMarkerRead",
       "CdRegistryRead",
+      "ShipApprovalRecordWrite",
       "BuildLogRead",
       "CrossAccountAssumeTrigger",
     ]);
@@ -548,7 +664,7 @@ describe("buildInlinePolicy — the hub-* convention wildcards", () => {
     }
   });
 
-  it("honours an explicit ARTIFACT_BUCKET, and both S3 grants vanish without one", () => {
+  it("honours an explicit ARTIFACT_BUCKET, and every S3 grant vanishes without one", () => {
     expect(
       sid(buildInlinePolicy({ ...BASE, ARTIFACT_BUCKET: "explicit-bucket" }), "CdRegistryRead")
         .Resource
@@ -557,6 +673,9 @@ describe("buildInlinePolicy — the hub-* convention wildcards", () => {
     const noBucket = buildInlinePolicy({ ...BASE, ACCOUNT: undefined });
     expect(sid(noBucket, "CdRegistryRead")).toBeUndefined();
     expect(sid(noBucket, "HandoffMarkerRead")).toBeUndefined();
+    expect(sid(noBucket, "ShipApprovalRecordWrite")).toBeUndefined();
+    // Not one s3: action survives — there is no bucket to name in a Resource.
+    expect(allActions(noBucket).filter((a) => a.startsWith("s3:"))).toEqual([]);
     // The handoff marker keeps its own prefix - the two grants are separate on
     // purpose, so neither can widen the other.
     expect(sid(buildInlinePolicy(BASE), "HandoffMarkerRead").Resource).toEqual([

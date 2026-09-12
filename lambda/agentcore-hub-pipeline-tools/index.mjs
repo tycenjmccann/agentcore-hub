@@ -13,6 +13,15 @@
  *   - start_deploy:   StartPipelineExecution. RM calls this after merging (the
  *                     GitHub push auto-trigger is not wired), and after a
  *                     build-failure fix lands, to re-run.
+ *                     (TEAM-4525) It also RECORDS what the human already
+ *                     approved: given approved_head_sha (the head SHA the human
+ *                     approved at Merge Approval) it verifies CI is certified on
+ *                     that head and writes a SHIP-APPROVAL RECORD to
+ *                     pipeline-artifacts/ship-approvals/<merge_commit>.json. The
+ *                     pipeline reads that record to decide whether asking the
+ *                     same human a SECOND time for byte-identical code is
+ *                     necessary. Recording is not approving: see the
+ *                     DELIBERATELY ABSENT block below.
  *   - get_build_log:  For a Failed Build stage — the CodeBuild build's phase
  *                     contexts + a tail of its CloudWatch log, so RM can file a
  *                     precise fix ticket (it does NOT hand-fix).
@@ -93,8 +102,10 @@
  * the OWNER of the project a call actually names, not just whichever target the
  * args happened to resolve — a pipeline_name naming one repo plus a project
  * belonging to another must still reach the project's own region. The S3 client
- * is deliberately NOT fanned out — both S3 reads (the registry and the handoff
- * marker) live in the one artifact bucket in THIS Lambda's region.
+ * is deliberately NOT fanned out — every S3 access (the registry, the handoff
+ * marker, the ship-approval record) is against the HUB's own artifact bucket, in
+ * the hub account, in THIS Lambda's region. A cross-account target's assumed
+ * role is never used for it: the record is hub state, not the foreign account's.
  *
  * DELIBERATELY ABSENT: PutApprovalResult. The in-pipeline ManualApproval (deploy
  * gate) is a HUMAN decision, bridged to Telegram (telegram-bug-intake). An agent
@@ -103,6 +114,16 @@
  * deploys nothing; capabilities reports approveDeploy:false unconditionally; and
  * widening the registry can only ever add a pipeline to READ and TRIGGER, never
  * an approval path.
+ *
+ * Still true after TEAM-4525's ship-approval record, and the distinction is the
+ * whole point: the record is a WITNESS STATEMENT about a decision a human already
+ * made (the Merge Approval on a specific head SHA), written to the hub's own
+ * bucket. It carries no approval token, reaches no CodePipeline API, and cannot
+ * release a gate by itself — the PIPELINE decides, from the record plus its own
+ * source revision, whether re-asking the same human for byte-identical code adds
+ * anything. Anything unexpected (no record, a different merge commit, an
+ * unverified head, a failed write) leaves the human gate firing, which is why
+ * every failure path here is a `recorded:false` reason rather than a throw.
  *
  * Env:
  *   PIPELINE_NAME       default "agentcore-hub-deploy"  (the env default target's
@@ -130,10 +151,12 @@
  *                       different resource kind), callers pass
  *                       project="agentcore-hub-deploy" explicitly to get_build_log
  *   ARTIFACT_BUCKET     the artifact bucket, in this Lambda's region. Source of
- *                       BOTH the CD registry (config/cd-registry.json) and the
- *                       Deploy stage's handoff markers. Unset → no S3 call at all:
- *                       the registry is empty and the env default is the only
- *                       target (single-pipeline mode)
+ *                       the CD registry (config/cd-registry.json) and the Deploy
+ *                       stage's handoff markers, and the destination of the
+ *                       ship-approval records start_deploy writes. Unset → no S3
+ *                       call at all: the registry is empty, the env default is the
+ *                       only target (single-pipeline mode), and no ship-approval
+ *                       record can be recorded (so the human deploy gate fires)
  *   CD_REGISTRY_TTL_MS  default 60000 — how long a warm container reuses the
  *                       registry it read. A read failure keeps the last good copy
  *   PIPELINE_REPO       optional "owner/repo" label for the env default target, so
@@ -149,7 +172,7 @@ import {
   StartPipelineExecutionCommand,
   ListActionExecutionsCommand,
 } from "@aws-sdk/client-codepipeline";
-import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
+import { S3Client, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
 import {
   CodeBuildClient,
   BatchGetBuildsCommand,
@@ -670,28 +693,43 @@ export const handler = async (event) => {
   }
 };
 
-// ─── handoff marker ───────────────────────────────────────────────────────────
-// A Deploy stage that shipped every code surface but also touched infra-only
-// files (runtime create/setup scripts, IAM/env/table scripts) writes the file
-// list to pipeline-artifacts/handoff/<sha>.txt and SUCCEEDS. It used to exit 2 —
-// a green deploy reported as Failed — so "Failed" meant either a real failure or
-// a clean deploy with a follow-up, and only a build log could tell them apart.
-// get_state now reports it as data on a succeeded run.
+// ─── the execution snapshot (status + handoff marker) ─────────────────────────
+// ONE GetPipelineExecution answers two questions, so it is made once and both
+// answers are returned together:
+//
+//  1. `status` — the EXECUTION's own disposition. get_state's stage-level
+//     arithmetic cannot always reach a verdict: a stage CodePipeline SKIPPED (the
+//     TEAM-4525 conditional deploy gate) may keep an older pipelineExecutionId,
+//     so "have all stages caught up to this execution?" stays false forever and a
+//     release manager polls a finished run until it gives up. The execution's own
+//     Succeeded/Failed/Stopped/Cancelled/Superseded is authoritative about that.
+//  2. `handoff` — a Deploy stage that shipped every code surface but also touched
+//     infra-only files (runtime create/setup scripts, IAM/env/table scripts)
+//     writes the file list to pipeline-artifacts/handoff/<sha>.txt and SUCCEEDS.
+//     It used to exit 2 — a green deploy reported as Failed — so "Failed" meant
+//     either a real failure or a clean deploy with a follow-up, and only a build
+//     log could tell them apart. get_state reports it as data on a succeeded run.
+//
 // `cp` is the CALLER's region-correct CodePipeline client; `s3` is always this
-// Lambda's own, because the marker lives in the one artifact bucket.
-async function handoffForExecution(pipelineName, pipelineExecutionId, cp) {
-  if (!ARTIFACT_BUCKET || !pipelineExecutionId) return null;
+// Lambda's own, because the marker lives in the one artifact bucket. The marker
+// read stays gated on ARTIFACT_BUCKET (no bucket → no S3 call at all); the status
+// does not, because it needs no bucket.
+async function executionSnapshot(pipelineName, pipelineExecutionId, cp) {
+  const none = { status: null, handoff: null };
+  if (!pipelineExecutionId) return none;
   let sha = "";
+  let status = null;
   try {
     const ex = await cp.send(
       new GetPipelineExecutionCommand({ pipelineName, pipelineExecutionId })
     );
+    status = ex.pipelineExecution?.status || null;
     sha = ex.pipelineExecution?.artifactRevisions?.[0]?.revisionId || "";
   } catch (e) {
     console.warn("get-pipeline-execution failed (non-fatal):", e.message);
-    return null;
+    return none;
   }
-  if (!sha) return null;
+  if (!ARTIFACT_BUCKET || !sha) return { status, handoff: null };
   // The Build stage truncates the source revision to 12 chars for GIT_SHA, and
   // the Deploy stage keys the marker on that.
   const key = `pipeline-artifacts/handoff/${sha.slice(0, 12)}.txt`;
@@ -701,15 +739,28 @@ async function handoffForExecution(pipelineName, pipelineExecutionId, cp) {
     );
     const body = await obj.Body.transformToString();
     const files = body.split("\n").map((l) => l.trim()).filter(Boolean);
-    return { sha: sha.slice(0, 12), files };
+    return { status, handoff: { sha: sha.slice(0, 12), files } };
   } catch (e) {
     // NoSuchKey is the normal case: this deploy had nothing to hand off.
     if (e.name !== "NoSuchKey" && e.name !== "NotFound") {
       console.warn("handoff marker read failed (non-fatal):", e.name, e.message);
     }
-    return null;
+    return { status, handoff: null };
   }
 }
+
+/** Execution dispositions from which nothing further can happen. A run in any of
+ * them is terminal whatever the stage-level arithmetic says. */
+const FAILED_EXECUTION_STATUSES = new Set([
+  "Failed",
+  "Stopped",
+  "Cancelled",
+  "Superseded",
+]);
+const TERMINAL_EXECUTION_STATUSES = new Set([
+  "Succeeded",
+  ...FAILED_EXECUTION_STATUSES,
+]);
 
 // ─── get_state ────────────────────────────────────────────────────────────────
 // Returns whether a pipeline is configured, each stage's latest status, and the
@@ -723,6 +774,14 @@ async function handoffForExecution(pipelineName, pipelineExecutionId, cp) {
 // ONLY from stages whose latestExecution matches; matchesExecution:false means
 // the new run is not yet visible on any stage (keep polling — never read the
 // old run as this run's completion).
+//
+// TEAM-4525 adds `approvalSkipped` and one safety net. The deploy gate is now
+// CONDITIONAL, so a run can legitimately show an Approval stage the pipeline
+// SKIPPED: that is neither a failure nor work in progress, and a skipped stage may
+// keep an OLDER pipelineExecutionId — which would leave the scoped `allStagesMatch`
+// test false forever. So `terminal` is ALSO taken from the execution's own status
+// (executionSnapshot), and `approvalSkipped` says out loud that no human is being
+// waited on.
 async function getState(args = {}, target) {
   // The pipeline is the RESOLVED target's — args.pipeline_name was already
   // validated against the allow-list (or refused) before we got here.
@@ -754,6 +813,13 @@ async function getState(args = {}, target) {
     : stages;
   const matchesExecution = executionId ? scopedStages.length > 0 : undefined;
 
+  // TEAM-4525: "Skipped" is a THIRD disposition, and it is neither of the two the
+  // arithmetic below tests for. A conditional stage CodePipeline skipped is not
+  // Failed (nothing went wrong) and not InProgress (nothing is running), so the
+  // `=== "InProgress"` / `Failed|Stopped` comparisons already treat it correctly
+  // — stated here because the deploy gate can now be skipped, which makes it a
+  // routine status rather than an exotic one, and because a future "anything not
+  // Succeeded is a problem" refactor would silently break the feature.
   let anyInProgress, anyFailed, terminal;
   if (executionId) {
     // Scoped path: STAGE-LEVEL status only. actionStates carry no execution id,
@@ -821,9 +887,44 @@ async function getState(args = {}, target) {
     }
   }
 
-  // Present (non-null) when this execution's Deploy stage recorded infra files a
-  // human must still deploy. It is NOT a failure — the code deploy succeeded.
-  const handoff = await handoffForExecution(name, pipelineExecutionId, cp);
+  // ONE GetPipelineExecution, two answers (see executionSnapshot):
+  //  - handoff: present (non-null) when this execution's Deploy stage recorded
+  //    infra files a human must still deploy. NOT a failure — the code shipped.
+  //  - executionStatus: the run's own disposition.
+  const { status: executionStatus, handoff } = await executionSnapshot(
+    name,
+    pipelineExecutionId,
+    cp
+  );
+
+  // TEAM-4525: the execution's own terminal disposition OVERRIDES the stage-level
+  // arithmetic, in the one direction that is always safe — it can only ever turn
+  // "keep polling" into "this run is over". A SKIPPED stage may hold an older
+  // pipelineExecutionId, so allStagesMatch never becomes true and the scoped path
+  // would have the release manager poll a finished run forever. A non-Succeeded
+  // terminal status also forces anyFailed, so a Failed/Superseded run can never be
+  // reported as succeeded:true just because no matching stage carried the failure.
+  if (TERMINAL_EXECUTION_STATUSES.has(executionStatus)) {
+    terminal = true;
+    anyInProgress = false;
+    if (FAILED_EXECUTION_STATUSES.has(executionStatus)) anyFailed = true;
+  }
+
+  // The deploy gate, when the pipeline decided it had nothing left to ask
+  // (TEAM-4525): the human already approved this exact code at Merge Approval, so
+  // the in-pipeline ManualApproval was skipped. Reported so a release manager can
+  // tell "no human is being waited on" from "a human has not answered yet" —
+  // the two look identical in the stage list otherwise. Scoped to the requested
+  // execution when one was given; the approval token is still never leaked.
+  const approvalStage = stages.find(
+    (s) => /approv/i.test(s.stage) || s.actions.some((a) => /approv/i.test(a.action))
+  );
+  const approvalSkipped = !!(
+    approvalStage &&
+    (!executionId || approvalStage.executionId === executionId) &&
+    (approvalStage.status === "Skipped" ||
+      approvalStage.actions.some((a) => /approv/i.test(a.action) && a.status === "Skipped"))
+  );
 
   return jsonResult({
     configured: true,
@@ -841,6 +942,8 @@ async function getState(args = {}, target) {
     terminal,
     succeeded: terminal && !anyFailed,
     failed: anyFailed,
+    // True iff the conditional deploy gate did not fire for this run.
+    approvalSkipped,
     stages,
     actionDetails,
   });
@@ -858,9 +961,23 @@ async function getState(args = {}, target) {
 // start_deploy takes no `project` argument, and (TEAM-4348) resolveTarget skips
 // the args.project branch for this call entirely — an args.project cannot
 // substitute for pipeline_name here, it is simply ignored.
+//
+// TEAM-4525 — the OPTIONAL recording args. Pass them and this call also writes a
+// ship-approval record (recordShipApproval below) so the pipeline can skip
+// re-asking the human who already approved this exact code:
+//   approved_head_sha  the head SHA the human approved at Merge Approval. REQUIRED
+//                      for a record: without it there is nothing to record.
+//   ci_build_id        the CI build that certified that head. Optional — it makes
+//                      verification exact instead of a ledger scan.
+//   pr_url, workflow_id, ticket_id
+//                      provenance, copied into the record verbatim when non-empty.
+// Omitting all of them is the pre-TEAM-4525 behaviour exactly: no record, no extra
+// AWS call, `preapproval:{recorded:false, reason:"approved_head_sha_missing"}`, and
+// the human deploy gate fires. Nothing here can FAIL a deploy: recording is
+// best-effort by construction.
 async function startDeploy(args = {}, target) {
   const name = target.pipeline;
-  const { cp } = clientsFor(target.region, target.roleArn, target.externalId);
+  const { cp, cb } = clientsFor(target.region, target.roleArn, target.externalId);
   const input = { name };
   // clientRequestToken constraints: ^[a-zA-Z0-9-]+$, 1–128 chars. Sanitize the
   // SHA to that charset; if nothing valid remains (or no SHA was given), OMIT
@@ -870,6 +987,11 @@ async function startDeploy(args = {}, target) {
   if (sanitized) {
     input.clientRequestToken = `deploy-${sanitized}`.slice(0, 128);
   }
+
+  // BEFORE the start, so the record is already in place when the pipeline's own
+  // Source stage runs and looks for it. Never throws, whatever happens inside.
+  const preapproval = await recordShipApproval(args, target, cb);
+
   const res = await cp.send(new StartPipelineExecutionCommand(input));
   return jsonResult({
     started: true,
@@ -877,8 +999,211 @@ async function startDeploy(args = {}, target) {
     region: target.region,
     repo: target.repo,
     pipelineExecutionId: res.pipelineExecutionId,
-    note: "Deploy stage has an in-pipeline ManualApproval (deploy gate) that a HUMAN approves (Telegram). Poll get_state with execution_id=<this pipelineExecutionId> until terminal:true AND matchesExecution:true.",
+    // { recorded, reason?, key? } — see recordShipApproval.
+    preapproval,
+    note:
+      "Deploy stage has an in-pipeline ManualApproval (deploy gate) that a HUMAN approves (Telegram). " +
+      "Poll get_state with execution_id=<this pipelineExecutionId> until terminal:true AND matchesExecution:true. " +
+      "preapproval.recorded:true means this call recorded the head SHA a human already approved at Merge Approval " +
+      "against THIS merge commit, which is what lets the pipeline skip re-asking that same human for byte-identical " +
+      "code — for exactly this merge commit and nothing else. Any other commit, an unverified head, a CI result that " +
+      "is not certified on it, or a failed record write (preapproval.recorded:false with a reason) and the human " +
+      "deploy gate fires as usual, which is the safe outcome, not an error to retry. You have NO approval capability: " +
+      "this tool cannot approve a gate, only record what a human already decided — if the gate fires, wait for the human.",
   });
+}
+
+// ─── the ship-approval record (TEAM-4525) ─────────────────────────────────────
+// A ship run used to ask its human TWICE for byte-identical code: once at Merge
+// Approval (approve this head SHA) and again at the in-pipeline deploy gate
+// (approve deploying the merge commit of that same head). The second ask carries
+// no new information, so the pipeline may skip it — but ONLY if it can prove the
+// commit it is deploying is the merge commit of the head a human approved, with
+// CI certified on that head. This function writes that proof; the PIPELINE reads
+// it and decides. Nothing here approves anything.
+//
+// Fail-closed in every direction: no record, or a record for another commit, and
+// the gate fires. So every problem below is a `recorded:false` + reason, never a
+// throw and never anything that stops the deploy from starting — a run that
+// cannot be pre-approved is a run with a human gate, which is the status quo.
+//
+// The record's SHAPE is a contract with the pipeline side; do not change a key
+// name, the key path or the bucket without changing the reader in lockstep.
+
+/** The one prefix ship-approval records live under, and the only S3 write this
+ * Lambda's role is granted (Sid ShipApprovalRecordWrite, s3:PutObject only). */
+const SHIP_APPROVAL_PREFIX = "pipeline-artifacts/ship-approvals/";
+/** A record is only ever written for FULL 40-hex SHAs: a short SHA is ambiguous,
+ * and "the pipeline's source revision equals the merge commit in the record" has
+ * to be an exact string comparison on the reader's side. */
+const FULL_SHA = /^[0-9a-f]{40}$/;
+/** The exact `preapproval.reason` vocabulary. Every value is a reason NO record
+ * was written, i.e. a reason the human gate will fire. */
+const PREAPPROVAL_REASONS = {
+  /** No approved_head_sha was supplied — the caller is not attempting to record
+   * anything (every pre-TEAM-4525 caller lands here). */
+  MISSING: "approved_head_sha_missing",
+  /** commit_sha or approved_head_sha is not a 40-hex SHA. */
+  INVALID_SHA: "invalid_sha",
+  /** No SUCCEEDED CI build of this target's PR-check project resolves to
+   * approved_head_sha, so the head a human approved was never certified. */
+  NOT_CERTIFIED: "ci_not_certified",
+  /** The PutObject failed (or there is no bucket to write to). The deploy still
+   * started; the gate fires. */
+  WRITE_FAILED: "record_write_failed",
+};
+
+/** Trim + lowercase, so a caller pasting a capitalized or padded SHA is not
+ * silently refused as "invalid". */
+function normalizeSha(value) {
+  return String(value ?? "").trim().toLowerCase();
+}
+
+/** Copy `value` onto `record` under `key` only when it is a non-empty string —
+ * the contract omits absent optional fields rather than carrying nulls. */
+function putIfPresent(record, key, value) {
+  const text = String(value ?? "").trim();
+  if (text) record[key] = text;
+}
+
+/**
+ * Is CI certified on `headSha` for `target`'s PR-check project?
+ *
+ * Returns the build id that proves it, or null. Two paths, both reusing the
+ * helpers get_build_status / start_ci_build already prove builds with:
+ *
+ *   ci_build_id given → BatchGetBuilds on that ONE build, which must be
+ *                       SUCCEEDED, belong to this target's CI project, and
+ *                       resolve to headSha. Cheapest and most precise: the
+ *                       release manager already holds the id it certified on.
+ *   otherwise         → findBuildsForCommit's per-SHA ledger, and a SUCCEEDED
+ *                       build in it whose RESOLVED source version is headSha.
+ *
+ * The resolved version is what matters in both paths (sourceVersion can be a
+ * pr/<id> ref); an unresolved build is never evidence, so the ledger's
+ * "started-with" attribution rule — which exists to COUNT retry attempts — is
+ * deliberately not enough here.
+ */
+async function ciCertifiedBuildId(cb, project, headSha, ciBuildId) {
+  const explicit = String(ciBuildId ?? "").trim();
+  if (explicit) {
+    const { builds } = await cb.send(new BatchGetBuildsCommand({ ids: [explicit] }));
+    const build = builds?.[0];
+    if (!build) return null;
+    if (build.buildStatus !== "SUCCEEDED") return null;
+    // The id must name THIS target's PR-check project. A green build of some
+    // other project (a build/deploy project, or another repo's CI) proves
+    // nothing about this head.
+    const owner = build.projectName || parseBuildIdProject(build.id || explicit);
+    if (owner !== project) return null;
+    if (!commitMatches(build.resolvedSourceVersion, headSha)) return null;
+    return build.id || explicit;
+  }
+  const ledger = await findBuildsForCommit(cb, project, headSha, BUILD_SCAN_WINDOW);
+  const green = ledger.find(
+    (b) => b.buildStatus === "SUCCEEDED" && commitMatches(b.resolvedSourceVersion, headSha)
+  );
+  return green ? green.id || null : null;
+}
+
+/**
+ * Write the ship-approval record for this start_deploy, if and only if it can be
+ * proven. Returns the `preapproval` block start_deploy reports:
+ *
+ *   { recorded: true, key }                — written
+ *   { recorded: false, reason }            — not written, and why
+ *
+ * @returns {Promise<{recorded: boolean, reason?: string, key?: string}>}
+ */
+async function recordShipApproval(args = {}, target, cb) {
+  const mergeCommit = normalizeSha(args.commit_sha);
+  const approvedHead = normalizeSha(args.approved_head_sha);
+
+  // No approved head → the caller is not claiming a human approved anything.
+  // Reported BEFORE the SHA shape check, so "you did not pass it" is never
+  // reported as "what you passed is malformed".
+  if (!approvedHead) {
+    return { recorded: false, reason: PREAPPROVAL_REASONS.MISSING };
+  }
+  if (!FULL_SHA.test(mergeCommit) || !FULL_SHA.test(approvedHead)) {
+    return { recorded: false, reason: PREAPPROVAL_REASONS.INVALID_SHA };
+  }
+
+  const project = target.ciProject || CI_PROJECT;
+  let ciBuildId = null;
+  try {
+    ciBuildId = await ciCertifiedBuildId(cb, project, approvedHead, args.ci_build_id);
+  } catch (e) {
+    // A CodeBuild read that failed proves nothing, so it is the same answer as
+    // "not certified": no record, human gate fires.
+    console.warn(
+      "ship-approval CI verification failed (non-fatal, gate will fire):",
+      e?.name,
+      e?.message
+    );
+    return { recorded: false, reason: PREAPPROVAL_REASONS.NOT_CERTIFIED };
+  }
+  if (!ciBuildId) {
+    return { recorded: false, reason: PREAPPROVAL_REASONS.NOT_CERTIFIED };
+  }
+
+  const key = `${SHIP_APPROVAL_PREFIX}${mergeCommit}.json`;
+  // The contract. version/merge_commit/approved_head_sha/recorded_at/recorded_by
+  // are ALWAYS present; the rest are provenance for a human reading the record
+  // later and are omitted when the caller had nothing to say.
+  const record = {
+    version: 1,
+    merge_commit: mergeCommit,
+    approved_head_sha: approvedHead,
+  };
+  putIfPresent(record, "ci_build_id", ciBuildId);
+  putIfPresent(record, "pipeline", target.pipeline);
+  putIfPresent(record, "repo", target.repo);
+  putIfPresent(record, "pr_url", args.pr_url);
+  putIfPresent(record, "workflow_id", args.workflow_id);
+  putIfPresent(record, "ticket_id", args.ticket_id);
+  record.recorded_at = new Date().toISOString();
+  // Literal, not derived: the reader uses it to tell this Lambda's records from
+  // anything else that might ever land under the prefix.
+  record.recorded_by = "Pipeline___start_deploy";
+
+  try {
+    if (!ARTIFACT_BUCKET) {
+      // Nowhere to write. Same reason code as a failed PutObject, because the
+      // consequence is identical and there is nothing an agent can do about
+      // either: it is an operator's missing ARTIFACT_BUCKET.
+      throw new Error("ARTIFACT_BUCKET is not set");
+    }
+    // The HUB's own bucket in the HUB's account — the ambient `s3` client, never a
+    // cross-account target's assumed role.
+    await s3.send(
+      new PutObjectCommand({
+        Bucket: ARTIFACT_BUCKET,
+        Key: key,
+        Body: JSON.stringify(record, null, 2),
+        ContentType: "application/json",
+      })
+    );
+  } catch (e) {
+    console.warn(
+      "ship-approval record write failed (non-fatal, human deploy gate will fire):",
+      e?.name,
+      e?.message
+    );
+    return { recorded: false, reason: PREAPPROVAL_REASONS.WRITE_FAILED };
+  }
+
+  console.log(
+    "ship-approval recorded",
+    JSON.stringify({
+      key,
+      merge_commit: mergeCommit,
+      approved_head_sha: approvedHead,
+      ci_build_id: ciBuildId,
+      pipeline: target.pipeline,
+    })
+  );
+  return { recorded: true, key };
 }
 
 // ─── get_build_log ──────────────────────────────────────────────────────────
