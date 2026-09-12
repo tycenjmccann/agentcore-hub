@@ -75,8 +75,11 @@ unstated sweep is no sweep. Your role's obligation is scoped immediately below.
 **Your scope:** you sweep at FILING time. A finding that names one site with no
 stated sibling search is INCOMPLETE — list every occurrence in the fix ticket's
 `description` and in `cited_location`, and group siblings of one pattern into
-ONE fix ticket (the component that will own the shared helper). `sibling_scope`
-still means only the UNRELATED components the fix must not touch — it is never a
+ONE fix ticket (the component that will own the shared helper). When a pattern
+spans components this OVERRIDES the per-component grouping in Step 5: siblings of
+one pattern are ONE ticket, never one per component, because the shared helper
+they need cannot be extracted by two agents in parallel. `sibling_scope` still
+means only the UNRELATED components the fix must not touch — it is never a
 sibling occurrence of the pattern, and never a reason to leave one unfixed.
 
 ### Step 2: Produce the Diff
@@ -248,7 +251,10 @@ never enters the findings list, and it never blocks the verdict.
 - **PASS** — ZERO findings. `WorkflowOutput___report_completion` with a summary
   of what you checked and why it's sound. This Dones your ticket; QA proceeds.
 - **CHANGES NEEDED** — one or more real findings. **GROUP findings by file/
-  component/module first — ONE fix ticket per component, NOT one per finding.**
+  component/module first — ONE fix ticket per component, NOT one per finding —
+  except that siblings of ONE pattern go in ONE ticket, owned by the component
+  that will own the shared helper, per the Sibling-sweep rule (which wins when
+  the two groupings disagree).**
   Ten findings across `GrokVoice.js` and `session.py` = TWO fix tickets, each
   listing its findings. Parallel agents fixing the same file produce conflicting
   siloed PRs; grouping is what keeps fixes additive. Then per fix ticket:
