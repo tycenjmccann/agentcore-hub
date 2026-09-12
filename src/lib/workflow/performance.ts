@@ -494,6 +494,22 @@ function getRaw(obj: unknown, path: string): unknown {
 
 const UNKNOWN_OUTCOME = "unknown";
 
+/**
+ * The component kinds whose arithmetic divides by `tolerance` (the value at which the
+ * line scores 0). `ratio` and `verdict` read their score straight off the card.
+ *
+ * Positive list, not "everything except ratio/verdict": an UNRECOGNISED kind must fall
+ * through to `measure`'s default branch and its mirrored note rather than be misreported
+ * as a missing tolerance (the Lambda has no tolerance pre-check at all).
+ *
+ * Exported so the rubric-contract test guards the SAME list the scorer branches on
+ * (TEAM-4514 / D-4). A tolerance missing from the shared kpi.json diverges the two
+ * mirrors: this side excludes the line with an explicit note, the Lambda's
+ * normalizeComponent divides by `undefined`, gets NaN, and excludes it with `note: null`
+ * and a computed `raw`. Guarding the config makes that unreachable.
+ */
+export const TOLERANCE_KINDS: ReadonlySet<KpiComponentKind> = new Set(["rate", "count", "sum", "excess"]);
+
 interface Measured { raw: number | string | null; normalized: number | null; note?: string }
 
 /** Per-kind measurement. `normalized === null` means "no evidence" → excluded. */
@@ -502,11 +518,8 @@ function measure(card: PerformanceCardInput, def: KpiComponentDef): Measured {
   const tolerance = def.tolerance;
   // A rubric line whose tolerance is missing is misconfigured, not zero-scoring:
   // excluding it keeps one bad edit from silently grading every run down.
-  // Positive list, not "everything except ratio/verdict": an UNRECOGNISED kind must
-  // fall through to the default branch's mirrored note rather than be misreported
-  // as a missing tolerance (the Lambda has no tolerance pre-check at all).
-  const needsTolerance = def.kind === "rate" || def.kind === "count" || def.kind === "sum" || def.kind === "excess";
-  if (needsTolerance && tolerance === undefined) {
+  // TOLERANCE_KINDS is the positive list — see its comment for why.
+  if (TOLERANCE_KINDS.has(def.kind) && tolerance === undefined) {
     return { raw: null, normalized: null, note: `${def.key}: no tolerance in kpi.json` };
   }
   const decay = (raw: number) => 1 - raw / (tolerance as number);
