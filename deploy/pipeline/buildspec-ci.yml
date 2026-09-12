@@ -184,18 +184,29 @@ phases:
       # dependency scan (report-only until baselined)
       - "npm audit --audit-level=high || true"
       # ── Deploy-pipeline Build stage only: emit artifacts by digest ──
+      #
+      # TEAM-4491: this block also has no `set -e`, and its status is its LAST
+      # statement's -- the changed-files-runtime.txt `if/else` below, which
+      # essentially always succeeds. Every gate ahead of it was maskable,
+      # including `check-lambda-zip-manifest.sh --zip /tmp/orchestrator.zip`,
+      # the ONLY guard on the orchestrator zip the Deploy stage promotes -- a
+      # zip failing manifest validation was promoted behind a green Build.
+      # Same trap and same fix as TEAM-4462 F1 / TEAM-4464 above: guard every
+      # status-bearing command with an EXPLICIT exit. A bare `set -e` is NOT
+      # the fix here either -- CodeBuild runs every command of a build in ONE
+      # shared shell, so it would change the semantics of every later command.
       - |
         if [ "${BUILD_APP_IMAGE:-false}" = "true" ]; then
           echo "Build stage: packaging orchestrator zip via lambda/orchestrator/deploy.sh's OWN file list"
           # Reuse deploy.sh's exact `zip -rq function.zip ...` line — do NOT keep a
           # second copy of the file list here (Codex #263 P2: two lists drift).
           cp src/config/lease-constants.json lambda/orchestrator/lease-constants.json
-          ( cd lambda/orchestrator && npm ci --omit=dev )
+          ( cd lambda/orchestrator && npm ci --omit=dev ) || { echo "orchestrator npm ci FAILED"; exit 1; }
           ZIP_ARGS="$(grep -oE 'zip -rq function\.zip .*' lambda/orchestrator/deploy.sh | sed 's/^zip -rq function\.zip //')"
-          ( cd lambda/orchestrator && zip -rq /tmp/orchestrator.zip $ZIP_ARGS )
+          ( cd lambda/orchestrator && zip -rq /tmp/orchestrator.zip $ZIP_ARGS ) || { echo "orchestrator zip FAILED"; exit 1; }
           rm -f lambda/orchestrator/lease-constants.json
           echo "Validate the ACTUAL built archive (not just deploy.sh's line)"
-          bash scripts/check-lambda-zip-manifest.sh --zip /tmp/orchestrator.zip
+          bash scripts/check-lambda-zip-manifest.sh --zip /tmp/orchestrator.zip || { echo "orchestrator zip manifest check FAILED"; exit 1; }
           echo "Build + push app image to ECR, capture the DIGEST for promote-by-digest"
           ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
           ECR_URI="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION_HUB}.amazonaws.com/${ECR_REPO}"
@@ -213,15 +224,16 @@ phases:
             echo "docker: daemon up"
           fi
           aws ecr get-login-password --region "$AWS_REGION_HUB" \
-            | docker login --username AWS --password-stdin "${ACCOUNT_ID}.dkr.ecr.${AWS_REGION_HUB}.amazonaws.com"
+            | docker login --username AWS --password-stdin "${ACCOUNT_ID}.dkr.ecr.${AWS_REGION_HUB}.amazonaws.com" \
+            || { echo "ECR docker login FAILED"; exit 1; }
           # Build the image from the CANDIDATE roster with only the live runtimeArns
           # merged in — NOT the stale deployed S3 doc (Codex #263 round-4 P1). This
           # is the same merge the Deploy stage uploads, so the baked bundle and the
           # deployed S3 config agree on the roster.
           if aws s3 cp "s3://${ARTIFACT_BUCKET}/config/agents.json" /tmp/agents.s3.json --region "$AWS_REGION_HUB"; then
-            cp src/config/agents.json /tmp/agents.git.json
-            python3 deploy/pipeline/merge-agents-json.py /tmp/agents.s3.json src/config/agents.json /tmp/agents.merged.json
-            cp /tmp/agents.merged.json src/config/agents.json
+            cp src/config/agents.json /tmp/agents.git.json || { echo "agents.json git backup FAILED"; exit 1; }
+            python3 deploy/pipeline/merge-agents-json.py /tmp/agents.s3.json src/config/agents.json /tmp/agents.merged.json || { echo "agents.json roster merge FAILED"; exit 1; }
+            cp /tmp/agents.merged.json src/config/agents.json || { echo "agents.json merged install FAILED"; exit 1; }
           fi
           # CodePipeline's CodeStar source is a ZIP artifact with no .git — use the
           # pipeline-resolved source revision, not `git rev-parse` (Codex #263 P1).
@@ -230,8 +242,8 @@ phases:
           docker buildx build --platform linux/amd64 \
             --build-arg NEXT_PUBLIC_PIPELINE_ENABLED="${NEXT_PUBLIC_PIPELINE_ENABLED:-}" \
             --tag "${ECR_URI}:${GIT_SHA}" --tag "${ECR_URI}:latest" \
-            --push --file Dockerfile . --provenance=false
-          if [ -f /tmp/agents.git.json ]; then cp /tmp/agents.git.json src/config/agents.json; fi
+            --push --file Dockerfile . --provenance=false || { echo "docker buildx build/push FAILED"; exit 1; }
+          if [ -f /tmp/agents.git.json ]; then cp /tmp/agents.git.json src/config/agents.json || { echo "agents.json git roster restore FAILED"; exit 1; }; fi
           # Resolve the pushed image's digest. ECR describe-images is
           # eventually-consistent right after a push and can briefly return
           # nothing / "None" — writing that empty string through to the Deploy
@@ -255,10 +267,10 @@ phases:
           fi
           echo "Resolved image digest: $IMAGE_DIGEST"
           # Hand the exact artifacts to the Deploy stage.
-          mkdir -p pipeline-out
-          cp /tmp/orchestrator.zip pipeline-out/orchestrator.zip
-          printf '%s' "$IMAGE_DIGEST" > pipeline-out/image-digest.txt
-          printf '%s' "$GIT_SHA" > pipeline-out/git-sha.txt
+          mkdir -p pipeline-out || { echo "pipeline-out mkdir FAILED"; exit 1; }
+          cp /tmp/orchestrator.zip pipeline-out/orchestrator.zip || { echo "orchestrator zip artifact copy FAILED"; exit 1; }
+          printf '%s' "$IMAGE_DIGEST" > pipeline-out/image-digest.txt || { echo "image-digest.txt write FAILED"; exit 1; }
+          printf '%s' "$GIT_SHA" > pipeline-out/git-sha.txt || { echo "git-sha.txt write FAILED"; exit 1; }
           # Changed-file list the Deploy stage uses for the fleet/eval scope guard.
           # Must cover the WHOLE push, not just the tip: a multi-commit push where
           # an EARLIER commit touched eval files would be missed by HEAD~1..HEAD
@@ -268,7 +280,7 @@ phases:
           # (forces a human to confirm scope) rather than under-reporting.
           LAST_DEPLOYED="$(aws s3 cp "s3://${ARTIFACT_BUCKET}/pipeline-artifacts/last-deployed-sha.txt" - --region "$AWS_REGION_HUB" 2>/dev/null || true)"
           if [ -n "$LAST_DEPLOYED" ] && git cat-file -e "${LAST_DEPLOYED}^{commit}" 2>/dev/null; then
-            git diff --name-only "${LAST_DEPLOYED}..HEAD" > pipeline-out/changed-files.txt
+            git diff --name-only "${LAST_DEPLOYED}..HEAD" > pipeline-out/changed-files.txt || { echo "changed-files.txt git diff FAILED"; exit 1; }
           else
             echo "deploy/runtime-agent/FORCE-UNKNOWN-RANGE" > pipeline-out/changed-files.txt
           fi
@@ -280,7 +292,7 @@ phases:
           # clone). First run / unknown → sentinel = rebuild every runtime.
           LAST_RT="$(aws s3 cp "s3://${ARTIFACT_BUCKET}/pipeline-artifacts/last-deployed-runtime-sha.txt" - --region "$AWS_REGION_HUB" 2>/dev/null || true)"
           if [ -n "$LAST_RT" ] && git cat-file -e "${LAST_RT}^{commit}" 2>/dev/null; then
-            git diff --name-only "${LAST_RT}..HEAD" > pipeline-out/changed-files-runtime.txt
+            git diff --name-only "${LAST_RT}..HEAD" > pipeline-out/changed-files-runtime.txt || { echo "changed-files-runtime.txt git diff FAILED"; exit 1; }
           else
             echo "deploy/runtime-agent/FORCE-UNKNOWN-RANGE" > pipeline-out/changed-files-runtime.txt
           fi

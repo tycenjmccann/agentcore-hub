@@ -185,3 +185,180 @@ def test_block_propagates_a_failing_pip_exit_code(tmp_path):
     proc = _run_block(tmp_path, pip_rc=7)
     assert proc.returncode == 7, proc.stderr + proc.stdout
     assert "runtime-agent pytest dep install FAILED (exit 7)" in proc.stdout
+
+
+# ── TEAM-4491: the BUILD_APP_IMAGE post_build block ──────────────────────────
+#
+# This block has NO `set -e` either, and its last statement is the
+# changed-files-runtime.txt `if/else` -- which essentially always succeeds.
+# Every gate ahead of it, including `check-lambda-zip-manifest.sh --zip
+# /tmp/orchestrator.zip` (the ONLY guard on the artifact the Deploy stage
+# promotes), was maskable. Same fix, same reasoning as above: an explicit
+# `|| { echo "... FAILED"; exit 1; }` on each status-bearing command.
+
+def _build_image_block():
+    return _literal_block(
+        BUILDSPEC.read_text(encoding="utf-8"),
+        'if [ "${BUILD_APP_IMAGE:-false}" = "true" ]',
+    )
+
+
+# (regex fragment, human label) for every status-bearing command TEAM-4491 guards.
+_GUARDED_COMMANDS = [
+    (r"\( cd lambda/orchestrator && npm ci --omit=dev \)", "orchestrator npm ci"),
+    (r"\( cd lambda/orchestrator && zip -rq /tmp/orchestrator\.zip \$ZIP_ARGS \)", "orchestrator zip"),
+    (r"bash scripts/check-lambda-zip-manifest\.sh --zip /tmp/orchestrator\.zip", "orchestrator zip manifest check"),
+    (r'docker login --username AWS --password-stdin "\$\{ACCOUNT_ID\}[^"]*"', "ECR docker login"),
+    (r"cp src/config/agents\.json /tmp/agents\.git\.json", "agents.json git backup"),
+    (r"python3 deploy/pipeline/merge-agents-json\.py \S+ \S+ \S+", "agents.json roster merge"),
+    (r"cp /tmp/agents\.merged\.json src/config/agents\.json", "agents.json merged install"),
+    (r"--push --file Dockerfile \. --provenance=false", "docker buildx build/push"),
+    (r"mkdir -p pipeline-out", "pipeline-out mkdir"),
+    (r"cp /tmp/orchestrator\.zip pipeline-out/orchestrator\.zip", "orchestrator zip artifact copy"),
+    (r'printf \'%s\' "\$IMAGE_DIGEST" > pipeline-out/image-digest\.txt', "image-digest.txt write"),
+    (r'printf \'%s\' "\$GIT_SHA" > pipeline-out/git-sha\.txt', "git-sha.txt write"),
+    (r"git diff --name-only \"\$\{LAST_DEPLOYED\}\.\.HEAD\" > pipeline-out/changed-files\.txt", "changed-files.txt git diff"),
+    (r"git diff --name-only \"\$\{LAST_RT\}\.\.HEAD\" > pipeline-out/changed-files-runtime\.txt", "changed-files-runtime.txt git diff"),
+    (r"cp /tmp/agents\.git\.json src/config/agents\.json", "agents.json git roster restore"),
+]
+
+
+def test_build_image_block_guards_every_status_bearing_command():
+    block = _build_image_block()
+    for command_re, label in _GUARDED_COMMANDS:
+        m = re.search(command_re + r"\s*(\\\n\s*)?\|\|\s*\{[^}]*exit 1[^}]*\}", block)
+        assert m, f"{label!r} ({command_re}) must be followed by `|| {{ ... exit 1; }}`:\n{block}"
+
+
+def test_build_image_block_manifest_check_is_guarded():
+    """The ticket's headline gap: the manifest check is the ONLY guard on the
+    orchestrator zip the Deploy stage promotes."""
+    block = _build_image_block()
+    assert re.search(
+        r"bash scripts/check-lambda-zip-manifest\.sh --zip /tmp/orchestrator\.zip"
+        r"\s*\|\|\s*\{[^}]*echo \"orchestrator zip manifest check FAILED\"[^}]*exit 1[^}]*\}",
+        block,
+    ), f"manifest check must hard-fail the block on a nonzero exit:\n{block}"
+
+
+def test_build_image_block_does_not_use_set_e():
+    block = _build_image_block()
+    assert "set -e" not in block
+    assert "set -o errexit" not in block
+
+
+def test_build_image_block_dockerd_bootstrap_guard_survives():
+    """TEAM-4448 R11's dockerd bootstrap guard is already correct -- pin that it's
+    unchanged so this fix doesn't regress it."""
+    block = _build_image_block()
+    assert "docker: dockerd failed to come up within 60s" in block
+    assert re.search(
+        r"timeout 60 bash -c '[^']*'\s*\\\n\s*\|\|\s*\{[^}]*exit 1[^}]*\}", block
+    )
+
+
+def test_build_image_block_digest_fatal_exit_survives():
+    """The IMAGE_DIGEST retry loop's hard FATAL exit is already correct -- pin
+    that it's unchanged."""
+    block = _build_image_block()
+    assert "FATAL: could not resolve a sha256 image digest for tag" in block
+
+
+# ── executed: the block's shape, against a stubbed AWS/docker/zip toolchain ──
+
+_OK = "#!/usr/bin/env bash\nexit 0\n"
+
+_STUB_ZIP = """#!/usr/bin/env bash
+exit "${ZIP_STUB_RC:-0}"
+"""
+
+_STUB_GREP = """#!/usr/bin/env bash
+# Stands in for `grep -oE 'zip -rq function\\.zip .*' lambda/orchestrator/deploy.sh`;
+# that file does not exist under the tmp_path cwd this test runs in.
+echo "zip -rq function.zip index.mjs lease-constants.json node_modules"
+"""
+
+_STUB_GIT = """#!/usr/bin/env bash
+case "$1" in
+  rev-parse) echo abcdef123456 ;;
+  cat-file) exit 0 ;;
+  diff) exit 0 ;;
+  *) exit 0 ;;
+esac
+"""
+
+_STUB_AWS = """#!/usr/bin/env bash
+case "$1$2" in
+  stsget-caller-identity) echo 123456789012 ;;
+  ecrget-login-password) echo stub-token ;;
+  ecrdescribe-images) echo sha256:abc ;;
+  s3cp) if [ "$4" = "-" ]; then echo 1111111111111111111111111111111111111111; fi ;;
+esac
+exit 0
+"""
+
+
+def _run_build_image_block(tmp_path, manifest_rc=0, zip_rc=0):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for name, content in (
+        ("cp", _OK), ("rm", _OK), ("mkdir", _OK), ("npm", _OK), ("nohup", _OK),
+        ("dockerd", _OK), ("timeout", _OK), ("sleep", _OK), ("python3", _OK), ("docker", _OK),
+        ("zip", _STUB_ZIP), ("grep", _STUB_GREP), ("git", _STUB_GIT), ("aws", _STUB_AWS),
+    ):
+        _write_stub(bin_dir / name, content)
+
+    # `bash scripts/check-lambda-zip-manifest.sh --zip ...` invokes `bash <script>`, so
+    # `bash` itself cannot be stubbed on PATH (the harness IS `bash -c`, and the dockerd
+    # bootstrap guard also needs a real `bash -c` inside the block). Rewrite the SCRIPT
+    # PATH to a stub instead -- same technique as `/tmp/pyci` above.
+    manifest_stub = tmp_path / "manifest-stub.sh"
+    manifest_stub.write_text(f'#!/usr/bin/env bash\nexit {manifest_rc}\n')
+    manifest_stub.chmod(manifest_stub.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
+    (tmp_path / "lambda" / "orchestrator").mkdir(parents=True)
+    (tmp_path / "pipeline-out").mkdir()
+
+    block = (
+        _build_image_block()
+        .replace("/tmp/", f"{tmp_path}/")
+        .replace("scripts/check-lambda-zip-manifest.sh", str(manifest_stub))
+    )
+
+    env = dict(
+        os.environ,
+        PATH=f"{bin_dir}:{os.environ['PATH']}",
+        BUILD_APP_IMAGE="true",
+        AWS_REGION_HUB="us-east-1",
+        ECR_REPO="stub-repo",
+        ARTIFACT_BUCKET="stub-bucket",
+    )
+    env.pop("CODEBUILD_RESOLVED_SOURCE_VERSION", None)
+    if zip_rc:
+        env["ZIP_STUB_RC"] = str(zip_rc)
+    return subprocess.run(
+        ["bash", "-c", block], capture_output=True, text=True, env=env, cwd=str(tmp_path)
+    )
+
+
+def test_build_image_block_is_valid_bash():
+    block = _build_image_block()
+    proc = subprocess.run(["bash", "-n", "-c", block], capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_build_image_block_exits_zero_in_control_case(tmp_path):
+    proc = _run_build_image_block(tmp_path)
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+
+
+def test_build_image_block_propagates_a_failing_manifest_check(tmp_path):
+    proc = _run_build_image_block(tmp_path, manifest_rc=1)
+    assert proc.returncode != 0, proc.stderr + proc.stdout
+    assert "orchestrator zip manifest check FAILED" in proc.stdout
+
+
+def test_build_image_block_propagates_a_failing_zip(tmp_path):
+    proc = _run_build_image_block(tmp_path, zip_rc=1)
+    assert proc.returncode != 0, proc.stderr + proc.stdout
+    assert "orchestrator zip FAILED" in proc.stdout
