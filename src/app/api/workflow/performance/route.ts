@@ -8,41 +8,21 @@
  *
  * Reads only what the cost-report Lambda already wrote to the artifact bucket
  * (performance/index.json + workflows/{id}/shared/performance-card.json); no
- * Logs Insights or Cost Explorer calls happen on the request path.
+ * Logs Insights or Cost Explorer calls happen on the request path. The index
+ * cache lives in @/lib/workflow/performance-index so the list route shares it.
  */
 
 import { NextRequest, NextResponse } from "next/server";
-import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
 import { ARTIFACT_BUCKET } from "@/lib/workflow/agent-setup";
-import { buildFleetView, type PerformanceIndex } from "@/lib/workflow/performance";
+import { buildFleetView } from "@/lib/workflow/performance";
+import { getJson, loadIndex } from "@/lib/workflow/performance-index";
 
 export const dynamic = "force-dynamic";
 
-const REGION = process.env.AWS_REGION || "us-east-1";
-const INDEX_KEY = process.env.PERFORMANCE_INDEX_KEY || "performance/index.json";
-const INDEX_TTL_MS = 60_000;
-
-const s3 = new S3Client({ region: REGION });
-let indexCache: { at: number; value: PerformanceIndex } | null = null;
-
-async function getJson<T>(key: string): Promise<T | null> {
-  try {
-    const res = await s3.send(new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: key }));
-    return JSON.parse(await res.Body!.transformToString()) as T;
-  } catch (err) {
-    const name = (err as { name?: string }).name;
-    if (name === "NoSuchKey" || name === "NotFound") return null;
-    throw err;
-  }
-}
-
-async function loadIndex(): Promise<PerformanceIndex> {
-  if (indexCache && Date.now() - indexCache.at < INDEX_TTL_MS) return indexCache.value;
-  const idx = await getJson<PerformanceIndex>(INDEX_KEY);
-  const value: PerformanceIndex = idx && Array.isArray(idx.cards) ? idx : { version: 1, updatedAt: null, cards: [], infra: null };
-  indexCache = { at: Date.now(), value };
-  return value;
-}
+/** Shared by every branch that takes a workflowId, so the guard can't drift. */
+const WORKFLOW_ID_RE = /^[\w-]+$/;
+const BAD_ID = { error: "invalid workflowId" };
+const CARD_KEY = (workflowId: string) => `workflows/${workflowId}/shared/performance-card.json`;
 
 export async function GET(request: NextRequest) {
   if (!ARTIFACT_BUCKET) {
@@ -52,8 +32,8 @@ export async function GET(request: NextRequest) {
   try {
     const workflowId = params.get("workflowId");
     if (workflowId) {
-      if (!/^[\w-]+$/.test(workflowId)) return NextResponse.json({ error: "invalid workflowId" }, { status: 400 });
-      const card = await getJson<Record<string, unknown>>(`workflows/${workflowId}/shared/performance-card.json`);
+      if (!WORKFLOW_ID_RE.test(workflowId)) return NextResponse.json(BAD_ID, { status: 400 });
+      const card = await getJson<Record<string, unknown>>(CARD_KEY(workflowId));
       if (!card) return NextResponse.json({ error: "no performance card for this run yet" }, { status: 404 });
       return NextResponse.json({ card });
     }
