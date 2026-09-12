@@ -321,9 +321,11 @@ test.describe("Hero KPI strip (TEAM-4482)", () => {
 
   test("6. a 429 means someone else is computing — say so, do not POST again", async ({ page }) => {
     test.setTimeout(60_000);
+    // retryAfterMs is intentionally 60s (the field's real ceiling): if the code
+    // polled on it instead of pollAfterMs, the 30s assertion below would time out.
     const mock = perfMock(
       [{ status: 404 }, { status: 404 }, { card: v5Card() }],
-      { status: 429, body: { error: "already running", retryAfterMs: 500 } },
+      { status: 429, body: { error: "already running", retryAfterMs: 60_000, pollAfterMs: 3000 } },
     );
     await mockList(page, [listRow(WF, "Hero KPI fixture")]);
     await mockBoard(page, mockState(WF));

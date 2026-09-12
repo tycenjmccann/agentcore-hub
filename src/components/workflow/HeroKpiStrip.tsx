@@ -325,9 +325,14 @@ function useComputeNow(workflowId: string, setCard: (card: RunCard) => void) {
         return;
       }
       // Already running for this run — wait for the other computation to land
-      // rather than starting (or reporting) a second one.
+      // rather than starting (or reporting) a second one. retryAfterMs is how
+      // long to hold off re-POSTing (up to 60s); pollAfterMs is when to poll the
+      // GET, which is what we're doing here, so prefer it.
       if (r.status === 429) {
-        beginPolling(typeof j?.retryAfterMs === "number" ? j.retryAfterMs : POLL_MS, "already");
+        beginPolling(
+          typeof j?.pollAfterMs === "number" ? j.pollAfterMs : typeof j?.retryAfterMs === "number" ? j.retryAfterMs : POLL_MS,
+          "already",
+        );
         return;
       }
       if (r.status === 409) {

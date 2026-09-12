@@ -158,9 +158,8 @@ export default function WorkflowManagerPanel({ workflowId, onAskAboutRun }: Prop
     null;
 
   // The deterministic score, next to the agent-authored one. Shares the hero
-  // strip's cached card, so this costs no extra request. `kpiVersion` is written
-  // by the analysis Lambda and is not in WorkflowAnalysis yet — read defensively.
-  const kpiVersion = (selected as { kpiVersion?: number | null } | null)?.kpiVersion;
+  // strip's cached card, so this costs no extra request.
+  const kpiVersion = selected?.kpiVersion;
   const detQuality = card?.kpi?.quality;
   const detChip =
     typeof kpiVersion === "number" && detQuality?.score != null ? (
