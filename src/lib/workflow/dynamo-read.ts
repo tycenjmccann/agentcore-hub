@@ -87,6 +87,83 @@ export async function getLastEventForWorkflow(workflowId: string) {
   return result.Items?.[0] || null;
 }
 
+/** What a persona's last dispatch recorded: the memory session and the runtime it ran on. */
+export interface AgentInvocationRef {
+  sessionId: string;
+  runtimeArn: string | null;
+  ticketId: string | null;
+  timestamp: string | null;
+}
+
+/**
+ * Newest `orchestrator.agent_invoked` event for one persona in one run.
+ *
+ * That event is the only place both the runtime session id AND the exact runtime
+ * ARN the persona actually ran on are recorded together — which matters because
+ * the fleet may be 1, 4 or 14 runtimes (WORKFLOW_RUNTIME_COUNT), so the ARN
+ * cannot be derived. Idle persona chat (agent-chat/route.ts) resumes that
+ * session so its turns land in the same memory the run used.
+ *
+ * The sort key is `eventId`, not a timestamp (and the mailbox writes a `0#…`
+ * key that sorts low), so read newest-first and order by `timestamp` here
+ * rather than trusting the index order. Best-effort by design: no match just
+ * means the caller opens a fresh session.
+ *
+ * MUST paginate. DynamoDB applies `Limit` to rows *scanned*, before
+ * `FilterExpression`, and a run's partition is dominated by `agent.streaming`
+ * rows — a normal run produces ~1000-2000 events in total
+ * (docs/workflow-pipeline-architecture.md:1179), against 14 dispatches. A single
+ * 400-row window therefore misses the dispatch of every persona but the last few,
+ * which silently cost the operator both history replay and the persona's own
+ * memory. Walk LastEvaluatedKey newest-first and stop at the page that first
+ * matches: descending scan order means every later page is older.
+ */
+const INVOCATION_PAGE_SIZE = 500;
+const INVOCATION_MAX_PAGES = 20; // 10k rows — covers the worst run on record
+
+export async function getLatestAgentInvocation(
+  workflowId: string,
+  agentId: string
+): Promise<AgentInvocationRef | null> {
+  let lastKey: Record<string, unknown> | undefined;
+  let matches: Record<string, unknown>[] = [];
+
+  for (let page = 0; page < INVOCATION_MAX_PAGES; page++) {
+    const result = await ddb.send(new QueryCommand({
+      TableName: EVENTS_TABLE,
+      KeyConditionExpression: "workflowId = :wid",
+      FilterExpression: "#type = :invoked AND detail.agentId = :aid",
+      ExpressionAttributeNames: { "#type": "type" },
+      ExpressionAttributeValues: {
+        ":wid": workflowId,
+        ":invoked": "orchestrator.agent_invoked",
+        ":aid": agentId,
+      },
+      ScanIndexForward: false,
+      Limit: INVOCATION_PAGE_SIZE,
+      ExclusiveStartKey: lastKey,
+    }));
+
+    matches = (result.Items || [])
+      .map(item => item.detail as Record<string, unknown> | undefined)
+      .filter((detail): detail is Record<string, unknown> => typeof detail?.sessionId === "string")
+      .sort((a, b) => String(b.timestamp || "").localeCompare(String(a.timestamp || "")));
+
+    if (matches.length) break;
+    lastKey = result.LastEvaluatedKey;
+    if (!lastKey) break;
+  }
+
+  const detail = matches[0];
+  if (!detail) return null;
+  return {
+    sessionId: detail.sessionId as string,
+    runtimeArn: typeof detail.runtimeArn === "string" ? detail.runtimeArn : null,
+    ticketId: typeof detail.ticketId === "string" ? detail.ticketId : null,
+    timestamp: typeof detail.timestamp === "string" ? detail.timestamp : null,
+  };
+}
+
 export async function getTicketsByIds(ticketIds: string[]) {
   if (ticketIds.length === 0) return [];
   // BatchGet supports max 100 keys at a time
