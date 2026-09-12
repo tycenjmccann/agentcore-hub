@@ -4,6 +4,7 @@
 Run: python3 -m unittest deploy/workflow-manager/toolkit/test_metrics.py
 """
 
+import copy
 import json
 import os
 import sys
@@ -14,6 +15,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).parent))
 
 from compute_metrics import (  # noqa: E402
+    CARD_QUALITY_KEYS,
     business_window,
     compute_metrics,
     intake_completed_at,
@@ -943,6 +945,220 @@ class OutsideHours(unittest.TestCase):
         # The 7-hour wait RealDossierFixtures pins is unchanged — this only
         # explains it, it does not restate it.
         self.assertEqual(review["waitMs"], 25255120)
+
+
+V5_KPI = {
+    "version": 1,
+    "computedAt": "2026-07-01T12:30:00Z",
+    "cost": {"usd": 12.3456, "band": "ok", "z": 0.4102},
+    "time": {"wallMs": 7200000, "activeMs": 5400000, "humanWaitMs": 1800000,
+             "band": "warn", "z": 2.1044},
+    "quality": {
+        "score": 74, "grade": "C", "confidence": "full", "evidenceWeight": 100,
+        "outcome": "complete", "band": "ok", "z": -0.2,
+        "components": [{"key": "firstPass", "points": 24.999}],
+        "excluded": [], "capsApplied": [],
+    },
+}
+
+
+def v5_card(**overrides):
+    """A performance card shaped exactly as lambda/cost-report/index.mjs buildCard
+    emits one (REPORT_VERSION 5), trimmed to the blocks compute_metrics reads.
+
+    Its counters deliberately DISAGREE with what the fix-lineage dossier computes
+    (changeRequests 1 vs 0, nudges 2 vs 0, humanWaitMs 1800000 vs 0) everywhere
+    except fixTickets — that agreement is an acceptance criterion, the
+    disagreements are how these tests prove the card's numbers land in the
+    namespaced blocks and the dossier's in the legacy keys."""
+    card = {
+        "reportVersion": 5,
+        "generatedAt": "2026-07-01T12:30:00Z",
+        "workflowId": "wf_fixlineage",
+        "run": {"outcome": "complete"},
+        "cost": {
+            "totalUsd": 12.3456, "personaUsd": 9.0, "codingUsd": 3.3456,
+            "tokens": {"input": 120000, "output": 8000, "total": 128000},
+            "perTaskUsd": 0.6859,  # not carried through — see CARD_COST_KEYS
+        },
+        "time": {"wallMs": 7200000, "activeMs": 5400000, "agentWorkMs": 3600000,
+                 "humanWaitMs": 1800000, "humanGates": 2, "busyMs": 3300000},
+        "quality": {
+            "outcome": "complete", "tasks": 18, "tasksCompleted": 18, "reworkRounds": 3,
+            "firstPassYield": 0.8333, "loops": 17, "changeRequests": 1,
+            # The acceptance: the SAME 16 fix tickets FixLineage pins above.
+            "fixTickets": 16, "nudges": 2, "errors": 0, "interventions": 0,
+            "gateRounds": 2, "score": 74, "ci": "pass",
+        },
+        "kpi": copy.deepcopy(V5_KPI),
+        "dataQuality": {
+            "gaps": ["no persona spans matched this run's session ids — persona LLM cost missing"],
+            "costMissing": False,
+        },
+    }
+    card.update(overrides)
+    return card
+
+
+class CardFirst(unittest.TestCase):
+    """TEAM-4484 — when a run has a v5 performance card, the card's numbers are
+    the answer and this module carries them through instead of recomputing them.
+
+    The dossier is fixtures/fix-lineage.json (the same 16 fix tickets FixLineage
+    pins), so `metrics.fixTickets.count == card.quality.fixTickets` is a real
+    agreement between two independent implementations — the JS scorer in
+    lambda/cost-report/index.mjs and the Python predicate here — not a fixture
+    agreeing with itself."""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(FIXTURES / "fix-lineage.json") as f:
+            cls.dossier = json.load(f)
+
+    def metrics(self, **kwargs):
+        return compute_metrics(copy.deepcopy(self.dossier), **kwargs)
+
+    def notes(self, metrics):
+        return metrics["dataQuality"]["notes"]
+
+    # ── the card's own numbers ──────────────────────────────────────────────
+    def test_kpi_is_carried_through_verbatim(self):
+        card = v5_card()
+        m = self.metrics(card=card)
+        self.assertEqual(m["kpi"], card["kpi"])
+        self.assertEqual(m["kpi"], V5_KPI, "the kpi block must not be recomputed or reshaped")
+        self.assertEqual(m["kpiVersion"], 1)
+
+    def test_kpi_is_a_copy_so_a_reader_cannot_mutate_the_card(self):
+        card = v5_card()
+        m = self.metrics(card=card)
+        m["kpi"]["quality"]["score"] = 0
+        self.assertEqual(card["kpi"]["quality"]["score"], 74)
+
+    def test_source_flips_with_the_card(self):
+        self.assertEqual(self.metrics(card=v5_card())["source"], "performance-card@v5")
+        self.assertEqual(self.metrics()["source"], "computed")
+
+    def test_time_and_cost_and_quality_are_the_cards_blocks(self):
+        card = v5_card()
+        m = self.metrics(card=card)
+        self.assertEqual(m["time"], {"wallMs": 7200000, "activeMs": 5400000,
+                                     "agentWorkMs": 3600000, "humanWaitMs": 1800000,
+                                     "humanGates": 2})
+        self.assertEqual(m["cost"], {"totalUsd": 12.3456, "personaUsd": 9.0,
+                                     "codingUsd": 3.3456,
+                                     "tokens": {"input": 120000, "output": 8000,
+                                                "total": 128000}})
+        self.assertEqual(m["quality"]["score"], 74)
+        self.assertEqual(m["quality"]["ci"], "pass")
+        self.assertEqual(m["quality"]["firstPassYield"], 0.8333)
+        self.assertEqual(set(m["quality"]), set(CARD_QUALITY_KEYS))
+
+    def test_the_two_acceptances(self):
+        """AC: the WM's human-wait number is the card's, and the two independent
+        fix-ticket predicates agree on the count."""
+        card = v5_card()
+        m = self.metrics(card=card)
+        self.assertEqual(m["time"]["humanWaitMs"], card["time"]["humanWaitMs"])
+        self.assertEqual(m["fixTickets"]["count"], card["quality"]["fixTickets"])
+        self.assertEqual(m["fixTickets"]["count"], 16)
+
+    # ── the legacy keys ─────────────────────────────────────────────────────
+    def test_legacy_keys_keep_their_shape_and_are_never_overwritten(self):
+        card = v5_card()
+        m = self.metrics(card=card)
+        # changeRequests is a DICT of cycles here and a COUNT on the card; a
+        # reader handed the count where it expected the cycles is silently wrong.
+        self.assertIsInstance(m["changeRequests"], dict)
+        self.assertIn("count", m["changeRequests"])
+        self.assertEqual(m["changeRequests"]["count"], 0)
+        self.assertEqual(m["quality"]["changeRequests"], 1)
+        self.assertIsInstance(m["errors"], list)
+        self.assertIsInstance(m["nudgeCount"], int)
+        self.assertEqual(m["nudgeCount"], 0)
+        self.assertEqual(m["quality"]["nudges"], 2)
+        self.assertIsInstance(m["managerInterventions"], list)
+        self.assertEqual(m["humanWaitTotalMs"], 0)
+        self.assertIn("totalDurationMs", m)
+        self.assertEqual(set(m["fixTickets"]), {"count", "ticketIds", "entries", "byKind", "byTag"})
+
+    def test_the_legacy_half_is_identical_with_and_without_a_card(self):
+        """The card ADDS blocks. Everything computed from the dossier must be
+        byte-identical either way, or a card appearing would silently change the
+        numbers save_analysis persists and priorAnalyses compare against."""
+        computed, carded = self.metrics(), self.metrics(card=v5_card())
+        added = {"kpi", "kpiVersion", "source", "time", "cost", "quality"}
+        for key in set(computed) - added - {"dataQuality"}:
+            self.assertEqual(computed[key], carded[key], key)
+        self.assertEqual(computed["dataQuality"]["missingSignals"],
+                         carded["dataQuality"]["missingSignals"])
+
+    # ── provenance notes ────────────────────────────────────────────────────
+    def test_card_gaps_are_appended_with_the_card_prefix(self):
+        card = v5_card()
+        card["dataQuality"]["gaps"] = ["gap one", "gap two"]
+        notes = self.notes(self.metrics(card=card))
+        self.assertIn("card: gap one", notes)
+        self.assertIn("card: gap two", notes)
+
+    def test_both_human_wait_numbers_are_labelled(self):
+        notes = self.notes(self.metrics(card=v5_card()))
+        self.assertTrue(any("humanWaitTotalMs" in n and "time.humanWaitMs" in n for n in notes),
+                        f"the OQ-5 two-numbers note is missing: {notes}")
+        self.assertTrue(any("cite the card-derived values" in n for n in notes),
+                        f"the card-vs-legacy divergence note is missing: {notes}")
+
+    def test_a_v4_card_is_not_card_first(self):
+        m = self.metrics(card=v5_card(reportVersion=4))
+        self.assertEqual(m["source"], "computed")
+        self.assertIsNone(m["kpi"])
+        self.assertIsNone(m["kpiVersion"])
+        self.assertNotIn("quality", m)
+        self.assertTrue(any("reportVersion 4 < 5" in n for n in self.notes(m)), self.notes(m))
+
+    def test_an_absent_card_is_computed_and_says_so(self):
+        m = self.metrics()
+        self.assertEqual(m["source"], "computed")
+        self.assertIsNone(m["kpi"])
+        self.assertTrue(any("no performance card" in n for n in self.notes(m)), self.notes(m))
+
+    def test_card_reason_is_recorded_verbatim(self):
+        reason = "card fetch timed out: no reportVersion >= 5 card within 60s"
+        m = self.metrics(card_reason=reason)
+        self.assertEqual(m["source"], "computed")
+        self.assertTrue(any(reason in n for n in self.notes(m)), self.notes(m))
+
+    # ── how the card arrives ────────────────────────────────────────────────
+    def test_the_dossiers_own_card_is_used_when_no_card_is_passed(self):
+        d = copy.deepcopy(self.dossier)
+        d["performanceCard"] = v5_card()
+        m = compute_metrics(d)
+        self.assertEqual(m["source"], "performance-card@v5")
+        self.assertEqual(m["kpi"], V5_KPI)
+
+    def test_an_explicit_card_wins_over_the_dossiers(self):
+        d = copy.deepcopy(self.dossier)
+        d["performanceCard"] = v5_card(reportVersion=4)
+        m = compute_metrics(d, card=v5_card())
+        self.assertEqual(m["source"], "performance-card@v5")
+
+    def test_a_partial_card_yields_nones_not_a_keyerror(self):
+        """A card from a Lambda newer or older than this toolkit is missing
+        fields, not malformed — one None beats a dead analysis."""
+        m = self.metrics(card={"reportVersion": 5})
+        self.assertEqual(m["source"], "performance-card@v5")
+        self.assertIsNone(m["kpi"])
+        self.assertIsNone(m["kpiVersion"])
+        self.assertIsNone(m["time"]["wallMs"])
+        self.assertIsNone(m["quality"]["score"])
+        self.assertEqual(set(m["cost"]), {"totalUsd", "personaUsd", "codingUsd", "tokens"})
+
+    def test_the_pure_signature_is_backward_compatible(self):
+        """compute_metrics(dossier) — the call every existing caller makes — must
+        keep working and stay AWS-free."""
+        m = compute_metrics(copy.deepcopy(self.dossier))
+        self.assertEqual(m["fixTickets"]["count"], 16)
+        self.assertEqual(m["source"], "computed")
 
 
 if __name__ == "__main__":

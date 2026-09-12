@@ -52,6 +52,7 @@ import { CloudWatchLogsClient, StartQueryCommand, GetQueryResultsCommand, Descri
 import { CloudWatchClient, PutMetricDataCommand, GetMetricDataCommand } from "@aws-sdk/client-cloudwatch";
 import { CostExplorerClient, GetCostAndUsageCommand } from "@aws-sdk/client-cost-explorer";
 import { S3Client, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
+import { readFileSync } from "node:fs";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const INFRA_REGION = process.env.INFRA_REGION || REGION;
@@ -65,7 +66,32 @@ const INDEX_KEY = process.env.PERFORMANCE_INDEX_KEY || "performance/index.json";
 const METRIC_NAMESPACE = process.env.METRIC_NAMESPACE || "AgentCoreHub/Performance";
 const PUBLISH_METRICS = (process.env.PUBLISH_CW_METRICS ?? "1") !== "0";
 
-export const REPORT_VERSION = 4; // 4: uncached-input pricing (cache tokens no longer double-billed)
+/**
+ * Quality-score configuration — the ONE home for every weight, tolerance, cap and
+ * grade threshold (R-3). `lambda/cost-report/kpi.json` is a committed symlink to
+ * `src/config/kpi.json`, so the file the Lambda reads and the file the app reads
+ * are the same bytes; the deploy zip stores the symlink's *contents*.
+ *
+ * Read once per cold start with readFileSync (not an import attribute, which
+ * would need a JSON module flag on older runtimes). NEVER from S3 — a scorer that
+ * can silently pick up new weights mid-fleet is not deterministic — and there is
+ * deliberately no in-code default: a missing config must fail loudly rather than
+ * score every run against invented numbers.
+ */
+const KPI_CANDIDATES = ["./kpi.json", "./src/config/kpi.json", "../../src/config/kpi.json"];
+function loadKpiConfig() {
+  for (const url of KPI_CANDIDATES) {
+    try {
+      return JSON.parse(readFileSync(new URL(url, import.meta.url), "utf8"));
+    } catch (e) {
+      if (e.code !== "ENOENT") throw e;
+    }
+  }
+  throw new Error("kpi.json not found next to index.mjs — refusing to score");
+}
+export const KPI_CONFIG = loadKpiConfig();
+
+export const REPORT_VERSION = 5; // 5: card.kpi contract (deterministic quality score); 4: uncached-input pricing (cache tokens no longer double-billed)
 export const BASELINE_DAYS = 28;
 export const BASELINE_MIN = 5;
 const INFRA_WINDOW_DAYS = 30;
@@ -104,6 +130,9 @@ export const BAND_KPIS = [
   { path: "quality.errors", label: "Errors", unit: "count", floor: 1 },
   { path: "quality.firstPassYield", label: "First-pass yield", unit: "ratio", floor: 0.1, direction: "lower" },
   { path: "cost.personaCacheHitRate", label: "Persona cache hit rate", unit: "ratio", floor: 0.1, direction: "lower" },
+  // The deterministic quality score is banded like any other KPI: a run scoring
+  // well below its own def's median is the anomaly, not a fixed threshold.
+  { path: "quality.score", label: "Quality score", unit: "count", floor: 5, direction: "lower" },
 ];
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: REGION }), {
@@ -120,6 +149,24 @@ const LOG = "[performance-card]";
 
 // ─── Handler ──────────────────────────────────────────────────────────────────
 
+/**
+ * A1: should this invoke be allowed to (over)write a card? Pure — no AWS, no
+ * logging — so it unit-tests without mocking the DDB client that owns `workflow`.
+ *
+ * A direct {workflowId} invoke is reachable by anyone who can invoke this
+ * Lambda, and it always overwrites the card. Refuse the two cases where doing so
+ * would publish something wrong: a deleted run (card resurrected after the row
+ * was removed) and a still-running one (a half-run scored as if it had ended).
+ * EventBridge only ever fires on workflow.complete, so its path is untouched.
+ */
+export function guardWorkflow(workflow, { isEventBridge }) {
+  if (!workflow) return { skipped: "not-found" };
+  if (isEventBridge) return null;
+  if (workflow.deleted === true) return { skipped: "deleted" };
+  if (!TERMINAL_PHASES.has(workflow.phase)) return { skipped: "not-terminal" };
+  return null;
+}
+
 export const handler = async (event) => {
   if (!ARTIFACT_BUCKET) throw new Error("ARTIFACT_BUCKET not set");
   if (event?.rebuildIndex) return rebuildIndex(event);
@@ -129,9 +176,10 @@ export const handler = async (event) => {
   if (!workflowId) throw new Error(`No workflowId in event: ${JSON.stringify(event).slice(0, 300)}`);
 
   const workflow = (await ddb.send(new GetCommand({ TableName: WORKFLOWS_TABLE, Key: { workflowId } }))).Item;
-  if (!workflow) {
-    console.warn(`${LOG} workflow ${workflowId} not found — skipping`);
-    return { skipped: "not-found" };
+  const guard = guardWorkflow(workflow, { isEventBridge });
+  if (guard) {
+    console.warn(`${LOG} workflow ${workflowId} skipped: ${guard.skipped}`);
+    return guard;
   }
 
   const cardKey = cardKeyOf(workflowId);
@@ -147,6 +195,9 @@ export const handler = async (event) => {
   const index = await loadIndex();
   const card = await buildCard(workflowId, workflow, pricing);
   card.bands = computeBands(card, index.cards);
+  // card.kpi is built with band "unknown"/z null (the score exists before any
+  // baseline does); the bands are what teach it where the run sits.
+  stampKpiBands(card);
   await writeCard(card);
 
   index.cards = upsertSummary(index.cards, summarize(card));
@@ -172,12 +223,22 @@ async function rebuildIndex(event) {
 
   // Bands are a pure function of the index: recompute for every card so a
   // backfill run in any order converges to the same result.
+  //
+  // D-17: kpi.{cost,time,quality}.band/z are a *copy* of three band statuses, so
+  // the write-if-changed test has to cover the copy too — otherwise a card whose
+  // bands are unchanged but whose stamp was written by an older version (or not at
+  // all) never gets rewritten. Stamp a throwaway probe and compare both, rather
+  // than stamping `card` first and comparing after (which can never differ).
   let rewritten = 0;
   for (const chunk of chunks(cards, 10)) {
     await Promise.all(chunk.map(async (card) => {
+      const before = JSON.stringify({ bands: card.bands, kpi: card.kpi ?? null });
       const next = computeBands(card, summaries);
-      if (JSON.stringify(next) !== JSON.stringify(card.bands)) {
+      const probe = { ...card, bands: next, kpi: card.kpi ? JSON.parse(JSON.stringify(card.kpi)) : null };
+      stampKpiBands(probe);
+      if (JSON.stringify({ bands: next, kpi: probe.kpi }) !== before) {
         card.bands = next;
+        card.kpi = probe.kpi;
         await writeCard(card);
         rewritten++;
       }
@@ -196,7 +257,25 @@ async function rebuildIndex(event) {
 
 // ─── Card assembly ────────────────────────────────────────────────────────────
 
-async function buildCard(workflowId, workflow, pricing) {
+/**
+ * The completion record an agent wrote for one ticket, or null when there is none.
+ *
+ * Flat `completions/{ticketId}.json` — the key lambda/workflow-output/index.mjs
+ * actually writes (there is no per-workflow prefix). A missing object is a fact
+ * (the ticket never reported), so it becomes null; anything else is a real read
+ * failure and rethrown, which deriveCiVerdict turns into an "unknown" verdict plus
+ * a dataQuality gap rather than a silent "no CI evidence".
+ */
+async function defaultGetCompletion(ticketId) {
+  try {
+    return await getJson(`completions/${ticketId}.json`);
+  } catch (e) {
+    if (e?.name === "NoSuchKey" || e?.$metadata?.httpStatusCode === 404) return null;
+    throw e;
+  }
+}
+
+async function buildCard(workflowId, workflow, pricing, getCompletion = defaultGetCompletion) {
   const gaps = [];
   const rawEvents = await fetchEvents(workflowId);
   const events = dedupeEvents(rawEvents);
@@ -308,6 +387,11 @@ async function buildCard(workflowId, workflow, pricing) {
   const firstPass = aiTasks.filter((t) => t.reworkRounds === 0).length;
   const prUrl = findPrUrl(workflow, events, agentTasks);
   const outcome = workflow.phase || "unknown";
+  const ci = await deriveCiVerdict(workflow, agentTasks, getCompletion, gaps);
+  // A run whose telemetry produced no cost at all is not a $0 run — it is a run we
+  // could not price. It still gets a card (its time and quality are real); the cost
+  // KPIs are the only part that has to abstain. §6.
+  const costMissing = !(round4(totalUsd) > 0);
 
   // ── Per-agent rollup (cost + work + rework) ──
   const agents = {};
@@ -321,9 +405,12 @@ async function buildCard(workflowId, workflow, pricing) {
   }
   for (const a of Object.values(agents)) a.usd = round4(a.usd);
 
-  return {
+  // Hoisted: kpi.computedAt is the same instant as the card's own, by contract.
+  const generatedAt = new Date().toISOString();
+
+  const card = {
     reportVersion: REPORT_VERSION,
-    generatedAt: new Date().toISOString(),
+    generatedAt,
     workflowId,
     epicId: workflow.epicId || null,
     workflowDefId: workflow.workflowDefId || workflow.defId || "unknown",
@@ -384,18 +471,27 @@ async function buildCard(workflowId, workflow, pricing) {
       retries: count("agent.retry"),
       unblocks: count("orchestrator.unblocked"),
       firstPassYield: aiTasks.length ? round4(firstPass / aiTasks.length) : null,
+      ci,
+      // Filled from card.kpi.quality.score below — one source of truth, two paths.
+      score: null,
       prUrl,
     },
     agents,
     agentTasks,
     codingSessions: codingSessions.map((s) => ({ sessionId: s.sessionId, cli: s.cli, agentId: s.agentId })),
     bands: null,
+    kpi: null,
     dataQuality: {
       gaps,
+      costMissing,
       pricingSource: PRICING_S3_KEY,
       events: { raw: rawEvents.length, unique: events.length },
     },
   };
+
+  card.kpi = buildKpiBlock(card, KPI_CONFIG);
+  card.quality.score = card.kpi.quality.score;
+  return card;
 }
 
 /**
@@ -500,6 +596,12 @@ export function bandFor(values, current, floor, direction = "upper") {
 /**
  * Baseline = same def's cards that completed within BASELINE_DAYS before this
  * card (strictly earlier, never itself) — so recomputing in any order converges.
+ *
+ * §6: the $0 filter used to sit on the baseline itself, which threw a run's time
+ * and quality history away because its *cost* telemetry was missing. There is one
+ * baseline now, and only the cost KPIs narrow to the runs that were actually
+ * priced (`costBaseline`); a run we could not price also abstains from its own cost
+ * bands rather than banding a fake 0 against real spend.
  */
 export function computeBands(card, summaries) {
   const completedAt = card.run?.completedAt || card.generatedAt;
@@ -508,15 +610,17 @@ export function computeBands(card, summaries) {
   const baseline = summaries.filter((s) =>
     s.workflowId !== card.workflowId &&
     s.workflowDefId === card.workflowDefId &&
-    s.completedAt && Date.parse(s.completedAt) < endMs && Date.parse(s.completedAt) >= startMs &&
-    (s.cost?.total ?? 0) > 0);
+    s.completedAt && Date.parse(s.completedAt) < endMs && Date.parse(s.completedAt) >= startMs);
+  const costBaseline = baseline.filter((s) => (s.cost?.total ?? 0) > 0);
 
   const kpis = {};
   const anomalies = [];
   let worst = baseline.length >= BASELINE_MIN ? "ok" : "insufficient";
   for (const k of BAND_KPIS) {
-    const values = baseline.map((s) => getPath(s, summaryPathOf(k.path)));
-    const current = getPath(card, k.path);
+    const isCost = k.path.startsWith("cost.");
+    const pool = isCost ? costBaseline : baseline;
+    const values = pool.map((s) => getPath(s, summaryPathOf(k.path)));
+    const current = isCost && card.dataQuality?.costMissing ? null : getPath(card, k.path);
     const band = bandFor(values, current, k.floor, k.direction || "upper");
     kpis[k.path] = band ? { label: k.label, unit: k.unit, ...band } : { label: k.label, unit: k.unit, value: current ?? null, status: "insufficient" };
     if (band?.status === "warn" || band?.status === "alert") {
@@ -525,7 +629,10 @@ export function computeBands(card, summaries) {
     }
   }
   return {
-    baseline: { workflowDefId: card.workflowDefId, n: baseline.length, windowDays: BASELINE_DAYS, minSamples: BASELINE_MIN },
+    baseline: {
+      workflowDefId: card.workflowDefId, n: baseline.length, nCost: costBaseline.length,
+      windowDays: BASELINE_DAYS, minSamples: BASELINE_MIN,
+    },
     status: worst,
     anomalies,
     kpis,
@@ -543,6 +650,248 @@ function summaryPathOf(path) {
     .replace("time.activeMs", "time.active")
     .replace("time.agentWorkMs", "time.agentWork")
     .replace("time.humanWaitMs", "time.humanWait");
+}
+
+// ─── Quality score (pure — config-driven, no clock/I/O/randomness) ────────────
+//
+// R-3: every weight, tolerance, cap and grade threshold lives in kpi.json. The only
+// numeric literals below are 0, 1 and 100 (a share of the whole, and the two ends
+// of a normalized scale) plus the 0.5 of round-half-up, which is the rounding rule
+// itself and not a tunable. If you find yourself typing another number here, it
+// belongs in src/config/kpi.json with a kpiVersion bump.
+
+const clamp01 = (x) => (x < 0 ? 0 : x > 1 ? 1 : x);
+
+/**
+ * Round half UP, always — written out rather than Math.round so the tie direction
+ * is explicit and identical in the TypeScript mirror (Math.round in JS rounds
+ * −0.5 to −0, i.e. toward +∞ too, but nothing about the name says so).
+ */
+const roundHalfUp = (x) => Math.floor(x + 0.5);
+
+const isNum = (v) => typeof v === "number" && Number.isFinite(v);
+
+/**
+ * One component's raw reading and its 0..1 normalization, per §2.1.
+ *
+ * `normalized` is returned UNCLAMPED and UNROUNDED on purpose: a run with 12
+ * loops against a tolerance of 8 shows −0.5, which says "half a tolerance past
+ * the limit" — the clamp is applied when the points are awarded, so the card
+ * can show how far out a run was without letting one bad component eat
+ * another's contribution. Per design §3 step 2, only `points` is rounded
+ * (round4); `normalized` is the raw arithmetic result.
+ */
+function normalizeComponent(card, c) {
+  if (c.kind === "ratio") {
+    const raw = getPath(card, c.source);
+    if (!isNum(raw)) return { raw: raw ?? null, normalized: null, note: `${c.source} is not a number` };
+    return { raw, normalized: raw };
+  }
+  if (c.kind === "rate") {
+    const num = getPath(card, c.source);
+    const per = getPath(card, c.per);
+    if (!isNum(num)) return { raw: null, normalized: null, note: `${c.source} is not a number` };
+    if (!isNum(per) || per === 0) return { raw: null, normalized: null, note: `${c.per} is 0 or missing — no denominator` };
+    const raw = num / per;
+    return { raw, normalized: 1 - raw / c.tolerance };
+  }
+  if (c.kind === "count") {
+    const raw = getPath(card, c.source);
+    if (!isNum(raw)) return { raw: raw ?? null, normalized: null, note: `${c.source} is not a number` };
+    return { raw, normalized: 1 - raw / c.tolerance };
+  }
+  if (c.kind === "sum") {
+    const parts = c.sources.map((s) => getPath(card, s));
+    const present = parts.filter(isNum);
+    if (!present.length) return { raw: null, normalized: null, note: `none of ${c.sources.join(", ")} is a number` };
+    const raw = present.reduce((s, v) => s + v, 0);
+    return { raw, normalized: 1 - raw / c.tolerance };
+  }
+  if (c.kind === "excess") {
+    const value = getPath(card, c.source);
+    const base = getPath(card, c.baseline);
+    if (!isNum(value)) return { raw: null, normalized: null, note: `${c.source} is not a number` };
+    if (!isNum(base)) return { raw: null, normalized: null, note: `${c.baseline} is not a number` };
+    const raw = Math.max(0, value - base);
+    return { raw, normalized: 1 - raw / c.tolerance };
+  }
+  if (c.kind === "verdict") {
+    const raw = getPath(card, c.source) ?? null;
+    if ((c.neutralOn || []).includes(raw)) return { raw, normalized: null, note: `${c.source} is "${raw}" — neutral, weight redistributed` };
+    const mapped = c.values?.[raw];
+    if (!isNum(mapped)) return { raw, normalized: null, note: `${c.source} "${raw}" is not a known verdict` };
+    return { raw, normalized: mapped };
+  }
+  return { raw: null, normalized: null, note: `unknown component kind "${c.kind}"` };
+}
+
+/**
+ * The deterministic 0-100 quality score for one card. Pure: same card in, same
+ * object out, forever — no clock, no I/O, no randomness, nothing read from the
+ * environment. That is the whole point of it existing next to the Workflow
+ * Manager's agent-authored `scores.overall`.
+ *
+ * Components a run has no evidence for are EXCLUDED, not scored 0, and the rest are
+ * renormalized over the weight that was actually available (`confidence: "partial"`).
+ * Below `minEvidenceWeight` there is no honest number to report, so the score is
+ * null rather than a guess.
+ */
+export function computeKpi(card, config) {
+  const spec = config.quality;
+  const components = [];
+  const excluded = [];
+  let evidenceWeight = 0;
+  let earned = 0;
+
+  for (const c of spec.components) {
+    const { raw, normalized, note } = normalizeComponent(card, c);
+    const included = isNum(normalized);
+    if (included) {
+      const clamped = clamp01(normalized);
+      evidenceWeight += c.weight;
+      earned += c.weight * clamped;
+      components.push({
+        key: c.key, label: c.label, weight: c.weight, raw,
+        normalized, points: round4(c.weight * clamped), included: true, note: null,
+      });
+    } else {
+      excluded.push(c.key);
+      components.push({
+        key: c.key, label: c.label, weight: c.weight, raw: raw ?? null,
+        normalized: null, points: null, included: false, note: note || null,
+      });
+    }
+  }
+
+  const outcome = card.run?.outcome ?? null;
+  if (evidenceWeight < spec.minEvidenceWeight) {
+    return {
+      score: null, grade: null, confidence: "insufficient", evidenceWeight, outcome,
+      band: "unknown", z: null, components, excluded, capsApplied: [],
+    };
+  }
+
+  // Renormalize over the weight that was actually available, then round once.
+  let score = roundHalfUp(100 * earned / evidenceWeight);
+  const capsApplied = [];
+  const cap = config.outcomeCaps?.[outcome];
+  // Recorded only when the cap actually lowered the score: "capped at 69" on a run
+  // that scored 40 anyway would read as an explanation it isn't.
+  if (isNum(cap) && score > cap) {
+    capsApplied.push({ kind: "outcome", outcome, cap });
+    score = cap;
+  }
+  const confidence = evidenceWeight === 100 ? "full" : "partial";
+  const grade = config.grades.find((g) => score >= g.min)?.grade ?? null;
+
+  return { score, grade, confidence, evidenceWeight, outcome, band: "unknown", z: null, components, excluded, capsApplied };
+}
+
+/**
+ * card.kpi v1 — the three hero KPIs in one place, so a reader never has to know
+ * which of cost/time/quality lives under which card section. Bands are stamped
+ * later (they need the fleet index); see stampKpiBands.
+ */
+export function buildKpiBlock(card, config) {
+  const costMissing = !!card.dataQuality?.costMissing;
+  return {
+    version: config.kpiVersion,
+    computedAt: card.generatedAt,
+    cost: { usd: costMissing ? null : card.cost.totalUsd, band: "unknown", z: null },
+    time: {
+      wallMs: card.time.wallMs, activeMs: card.time.activeMs, humanWaitMs: card.time.humanWaitMs,
+      band: "unknown", z: null,
+    },
+    quality: computeKpi(card, config),
+  };
+}
+
+/** The three band paths card.kpi mirrors, in kpi-block order. */
+const KPI_BAND_PATHS = { cost: "cost.totalUsd", time: "time.wallMs", quality: "quality.score" };
+
+/**
+ * Copy the three band verdicts into card.kpi. Defensive on purpose: a thin baseline
+ * yields `{status:"insufficient"}` with no `z` key at all, and a card built before
+ * the bands existed has no kpi to stamp.
+ */
+export function stampKpiBands(card) {
+  if (!card?.kpi) return card;
+  for (const [slot, path] of Object.entries(KPI_BAND_PATHS)) {
+    const b = card.bands?.kpis?.[path];
+    card.kpi[slot].band = b?.status ?? "unknown";
+    card.kpi[slot].z = b?.z ?? null;
+  }
+  return card;
+}
+
+/** card.kpi or null — the one read a v4 card must survive. */
+export function readKpi(card) {
+  return card?.kpi ?? null;
+}
+
+// ─── CI verdict (§4) ─────────────────────────────────────────────────────────
+
+const CI_AGENT_ID = "agentcore_hub_ci_agent";
+/**
+ * Deliberately narrow, and NOT a replacement for FIX_TITLE_RE: this asks the single
+ * question "is this specific ticket a CI fix?", where FIX_TITLE_RE asks "is this any
+ * kind of fix?" and is pinned by the shared fix-lineage fixture. Keep them apart.
+ */
+const CI_FIX_TITLE_RE = /^Fix \(CI\)/i;
+const DONE_STATUSES = new Set(["complete", "done"]);
+
+/**
+ * Did CI pass for this run? Derived, never asserted by an agent's prose.
+ *
+ * `workflow.agentTasks` (the DynamoDB row's map) is the only place spawnedBy /
+ * mergeCommit / outcome live; the computed `agentTasks` rows carry status and
+ * completedAt. `getCompletion` is injected so this unit-tests with a plain object
+ * map and no S3.
+ *
+ * Rules in order, first match wins — an unresolved CI fix outranks any earlier
+ * "certified" record, because the certification is what the fix exists to redo.
+ */
+export async function deriveCiVerdict(workflow, agentTasks = [], getCompletion, gaps = []) {
+  const rowTasks = (workflow && workflow.agentTasks) || {};
+
+  // 1. A CI fix ticket still open at the terminal state = CI was red and stayed red.
+  const open = Object.entries(rowTasks)
+    .filter(([, t]) => t?.spawnedBy?.kind === "ci_fix" || CI_FIX_TITLE_RE.test(String(t?.title || "")))
+    .filter(([, t]) => !DONE_STATUSES.has(String(t?.status || "").toLowerCase()))
+    .sort((a, b) => String(a[0]).localeCompare(String(b[0])));
+  if (open.length) return { verdict: "fail", source: "fix-ticket:ci-open", ticketId: open[0][0] };
+
+  // The CI agent's own ticket: latest completion wins, ticketId ascending breaks ties.
+  const chosen = (agentTasks || [])
+    .filter((t) => t?.agentId === CI_AGENT_ID)
+    .sort((a, b) => String(b.completedAt || "").localeCompare(String(a.completedAt || ""))
+      || String(a.ticketId).localeCompare(String(b.ticketId)))[0] || null;
+
+  let record = null;
+  if (chosen) {
+    try {
+      record = await getCompletion(chosen.ticketId);
+    } catch {
+      // A read failure is not evidence of anything — say so on the card instead of
+      // reporting "no CI evidence" as though the ticket had been silent.
+      gaps.push(`ci verdict unavailable: could not read completions/${chosen.ticketId}.json`);
+    }
+  }
+  const status = typeof record?.ci_status === "string" ? record.ci_status.trim().toLowerCase() : "";
+
+  // 2 & 3. The CI agent proved a build against the head.
+  if (status === "certified") return { verdict: "pass", source: "completion:certified", ticketId: chosen.ticketId };
+  if (status === "github-actions-proxy") return { verdict: "pass", source: "completion:github-actions-proxy", ticketId: chosen.ticketId };
+
+  // 4. Something merged: the branch protection that let it through is the evidence.
+  //    (`static-ci-only` is NOT a failure — it is a run that never claimed a build.)
+  const merged = Object.values(rowTasks).some((t) =>
+    (typeof t?.mergeCommit === "string" && t.mergeCommit.trim() !== "") || t?.outcome === "shipped");
+  if (merged) return { verdict: "pass", source: "merge-commit", ticketId: null };
+
+  // 5. Explicitly unverified, or nothing to go on at all.
+  if (status === "unverified") return { verdict: "unknown", source: "completion:unverified", ticketId: chosen.ticketId };
+  return { verdict: "unknown", source: "none", ticketId: null };
 }
 
 export function summarize(card) {
@@ -572,7 +921,21 @@ export function summarize(card) {
       fixTickets: card.quality.fixTickets, loops: card.quality.loops, nudges: card.quality.nudges,
       errors: card.quality.errors, gateRounds: card.quality.gateRounds, firstPassYield: card.quality.firstPassYield,
       humanGates: card.time.humanGates,
+      score: card.quality.score ?? null,
     },
+    // Enough of the score for the fleet view and the bands to work from without
+    // fetching every card; the components stay on the card itself.
+    kpi: card.kpi
+      ? {
+        version: card.kpi.version,
+        quality: {
+          score: card.kpi.quality?.score ?? null,
+          grade: card.kpi.quality?.grade ?? null,
+          confidence: card.kpi.quality?.confidence ?? null,
+        },
+      }
+      : null,
+    costMissing: !!card.dataQuality?.costMissing,
     agents: Object.fromEntries(Object.entries(card.agents || {}).map(([k, v]) => [k, {
       usd: v.usd, workMs: v.workMs, tasks: v.tasks, reworkRounds: v.reworkRounds,
     }])),
@@ -798,6 +1161,9 @@ async function publishMetrics(card) {
     ["Loops", card.quality.loops, "Count"],
     ["Nudges", card.quality.nudges, "Count"],
     ["Errors", card.quality.errors, "Count"],
+    // null on an insufficient-evidence run; the finite filter below drops it rather
+    // than publishing a 0 that would drag the def's average down.
+    ["QualityScore", card.quality.score, "None"],
   ].filter(([, v]) => typeof v === "number" && Number.isFinite(v));
   try {
     await cw.send(new PutMetricDataCommand({
@@ -825,6 +1191,7 @@ async function putPerformanceEvent(card, cardKey) {
         wallMs: card.time.wallMs, activeMs: card.time.activeMs, agentWorkMs: card.time.agentWorkMs, humanWaitMs: card.time.humanWaitMs,
         tasks: card.quality.tasks, reworkRounds: card.quality.reworkRounds, loops: card.quality.loops,
         nudges: card.quality.nudges, errors: card.quality.errors,
+        qualityScore: card.quality.score ?? null, qualityGrade: card.kpi?.quality?.grade ?? null,
         status: card.bands.status, anomalies: card.bands.anomalies,
         reportKey: cardKey,
       },
@@ -1252,6 +1619,12 @@ function fmtKpi(unit, v) {
   return String(Math.round(v * 100) / 100);
 }
 const STATUS_ICON = { ok: "🟢", warn: "🟡", alert: "🔴", insufficient: "⚪", unknown: "⚪" };
+/** "74/100 (C)", or why there is no number — never a bare 0. */
+function scoreLabel(c) {
+  return c.quality?.score == null
+    ? "— (insufficient evidence)"
+    : `${c.quality.score}/100 (${c.kpi?.quality?.grade ?? "—"})`;
+}
 
 function renderMarkdown(c) {
   const b = c.bands || {};
@@ -1302,11 +1675,12 @@ function renderMarkdown(c) {
     `|---|---|`,
     ...c.time.phases.map((p) => `| ${p.phase || "?"} | ${dur(p.durationMs)} |`),
     ``,
-    `## ✅ Quality: ${c.quality.loops} loop${c.quality.loops === 1 ? "" : "s"}, ${c.quality.reworkRounds} rework round${c.quality.reworkRounds === 1 ? "" : "s"}`,
+    `## ✅ Quality: ${scoreLabel(c)} — ${c.quality.loops} loop${c.quality.loops === 1 ? "" : "s"}, ${c.quality.reworkRounds} rework round${c.quality.reworkRounds === 1 ? "" : "s"}`,
     ``,
     `| | |`,
     `|---|---|`,
     `| Outcome | ${c.quality.outcome} |`,
+    `| Quality score | ${scoreLabel(c)}${c.kpi?.quality?.confidence ? ` · ${c.kpi.quality.confidence} evidence` : ""} |`,
     `| Agent tasks (completed) | ${c.quality.tasks} (${c.quality.tasksCompleted}) |`,
     `| First-pass yield (tasks with no rework) | ${pct(c.quality.firstPassYield)} |`,
     `| Rework rounds (re-invocations) | ${c.quality.reworkRounds} |`,
