@@ -109,9 +109,9 @@ describe("pipelineProjectsFor (app mirror of pipelineProjects)", () => {
   it("threads a cross-account roleArn/externalId through", () => {
     const p = pipelineProjectsFor({
       repo: "acme/juno", pipeline: "hub-juno-deploy", region: "us-west-2",
-      account: "023392223961", roleArn: "arn:aws:iam::023392223961:role/hub-cd-trigger-juno", externalId: "hub-cd-juno-xyz",
+      account: "123456789012", roleArn: "arn:aws:iam::123456789012:role/hub-cd-trigger-juno", externalId: "hub-cd-juno-xyz",
     })!;
-    expect(p.roleArn).toBe("arn:aws:iam::023392223961:role/hub-cd-trigger-juno");
+    expect(p.roleArn).toBe("arn:aws:iam::123456789012:role/hub-cd-trigger-juno");
     expect(p.externalId).toBe("hub-cd-juno-xyz");
     expect(p.region).toBe("us-west-2");
   });
@@ -125,8 +125,8 @@ describe("pipelineProjectsFor (app mirror of pipelineProjects)", () => {
  */
 describe("cross-account CD fields", () => {
   const OK = {
-    account: "023392223961",
-    roleArn: "arn:aws:iam::023392223961:role/hub-cd-trigger-juno",
+    account: "123456789012",
+    roleArn: "arn:aws:iam::123456789012:role/hub-cd-trigger-juno",
     externalId: "hub-cd-juno-secret",
   };
   const parse1 = (extra: Record<string, unknown>) =>
@@ -147,7 +147,7 @@ describe("cross-account CD fields", () => {
   });
 
   it("drops the triple when the role is not a hub-cd-trigger-* role", () => {
-    const e = parse1({ ...OK, roleArn: "arn:aws:iam::023392223961:role/AdminAccess" });
+    const e = parse1({ ...OK, roleArn: "arn:aws:iam::123456789012:role/AdminAccess" });
     expect(e.roleArn).toBeUndefined();
     expect(e.account).toBeUndefined();
   });
@@ -166,7 +166,7 @@ describe("cross-account CD fields", () => {
     // FORMAT error (the completeness/agreement checks below don't double-report).
     expect(validateCdEntryInput({ repo: "a/b", ...OK, account: "12345" }))
       .toEqual({ account: "must be a 12-digit AWS account id" });
-    expect(validateCdEntryInput({ repo: "a/b", ...OK, roleArn: "arn:aws:iam::023392223961:role/Admin" }))
+    expect(validateCdEntryInput({ repo: "a/b", ...OK, roleArn: "arn:aws:iam::123456789012:role/Admin" }))
       .toEqual({ roleArn: "must be an arn:aws:iam::<account>:role/hub-cd-trigger-<slug> role ARN" });
     expect(validateCdEntryInput({ repo: "a/b", ...OK, externalId: "short" }))
       .toEqual({ externalId: "must be 6-1224 chars of [A-Za-z0-9_+=,.@:/-]" });

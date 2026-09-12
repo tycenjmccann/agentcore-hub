@@ -158,6 +158,7 @@ export async function POST(
     let upstream: ReadableStream<Uint8Array>;
     try {
       upstream = await invokeCodingTurnStream({
+        runtimeArn: session.runtimeArn,
         sessionId: session.sessionId, prompt, cli: session.cli, repo: session.repo,
         claudeSessionId: session.claudeSessionId, userId, tenantId: sessionTenant, configVersion, region,
         githubToken, githubAppConnected, attachments, ...resumeFields,
@@ -223,6 +224,7 @@ export async function POST(
   // ── Buffered path (codex, or stream not requested).
   try {
     const result = await invokeCodingTurn({
+      runtimeArn: session.runtimeArn,
       sessionId: session.sessionId, prompt, cli: session.cli, repo: session.repo,
       claudeSessionId: session.claudeSessionId, userId, tenantId: sessionTenant, configVersion, region,
       githubToken, githubAppConnected, attachments, ...resumeFields,

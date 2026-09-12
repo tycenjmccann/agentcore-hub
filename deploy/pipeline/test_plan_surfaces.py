@@ -103,14 +103,19 @@ def test_model_catalog_change_updates_builder_harness():
 def test_baked_runtime_source_emits_runtime_row_not_handoff():
     # PR 2: a change to baked tool code (main.py) rebuilds + image-swaps the
     # runtime via the parallel arm64 action — it is NOT a human handoff anymore.
-    for f, name, repo, ctx in [
-        ("deploy/runtime-agent/main.py", "agentcore_hub_agent", "runtime-agent", "deploy/runtime-agent"),
-        ("deploy/coding-agent-runtime/main.py", "agentcore_hub_coding_runtime", "coding-agent-runtime", "deploy/coding-agent-runtime"),
-        ("deploy/runtime-agent/Dockerfile", "agentcore_hub_agent", "runtime-agent", "deploy/runtime-agent"),
-        ("deploy/coding-agent-runtime/run-codex.sh", "agentcore_hub_coding_runtime", "coding-agent-runtime", "deploy/coding-agent-runtime"),
+    CODING = ["coding-agent-runtime", "deploy/coding-agent-runtime"]
+    for f, expected in [
+        ("deploy/runtime-agent/main.py", [["RUNTIME", "agentcore_hub_agent", "runtime-agent", "deploy/runtime-agent"]]),
+        ("deploy/runtime-agent/Dockerfile", [["RUNTIME", "agentcore_hub_agent", "runtime-agent", "deploy/runtime-agent"]]),
+        # The coding runtime and its Instances twin share one image: both roll
+        # (the buildspec builds once per repo|context and swaps the digest twice).
+        ("deploy/coding-agent-runtime/main.py", [["RUNTIME", "agentcore_hub_coding_runtime", *CODING],
+                                                 ["RUNTIME", "agentcore_hub_coding_runtime_ec2", *CODING]]),
+        ("deploy/coding-agent-runtime/run-codex.sh", [["RUNTIME", "agentcore_hub_coding_runtime", *CODING],
+                                                      ["RUNTIME", "agentcore_hub_coding_runtime_ec2", *CODING]]),
     ]:
         actions = ps.plan([f], MANIFEST)
-        assert kinds(actions, "RUNTIME") == [["RUNTIME", name, repo, ctx]], f
+        assert kinds(actions, "RUNTIME") == expected, f
         assert not kinds(actions, "HANDOFF"), f
 
 

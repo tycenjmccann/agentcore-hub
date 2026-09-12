@@ -630,7 +630,7 @@ so the module stays truly optional.
 
 1. **CDK stack** in `deploy/pipeline/` — CodeConnections link, CI CodeBuild
    project, deploy CodePipeline, two IAM roles, SNS approval topic. `cdk deploy`
-   to prod (838829463875 / tycenj-prod). Nothing else changes yet.
+   to prod (210987654321 / tycenj-prod). Nothing else changes yet.
 2. **buildspecs** committed to `deploy/pipeline/`; `merge-agents-json.py`
    extracted from DEPLOY.md's inline block (single source of the merge logic).
 3. **Branch protection** on `main`: require the `agentcore-hub-ci` status +

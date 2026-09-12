@@ -237,6 +237,20 @@ See [mcp/hub/README.md](../mcp/hub/README.md).
 - `main.py` resumable `/invocations` server; per-session isolated checkouts;
   no-login terminal (Bedrock env + token); default MCP gateway + user config
   bundle materialized on turn start. See `deploy/coding-agent-runtime/README.md`.
+- **Instances twin** — `agentcore_hub_coding_runtime_ec2` (`deploy-instances.py`):
+  same image/role/env on the AgentCore Instances compute type — an EC2 capacity
+  provider (`agentcore_hub_coding_cp`) in the coding VPC + one EBS volume per
+  session at `/mnt/workspace` (npm ci 13 s vs 20-30 min on EFS). Both runtimes
+  run side by side; `CODING_AGENT_RUNTIME_ARN` picks the active one. CD swaps
+  the coding image digest into both.
+- **Session reaper** (`deploy/session-reaper/`, Lambda
+  `agentcore-hub-session-reaper`): DynamoDB-stream path handles UI soft-delete
+  → TTL → row removal; the scheduled `sweep` (EventBridge, 15 min, payload
+  `{"sweep":true}`, `dry_run` supported) releases compute behind finished
+  workflows — `DeleteCapacityProviderSession` on Instances, stop + purge on
+  EFS — and stamps `computeReleasedAt` / `computeRelease` /
+  `computeReleaseReason`. Rows stay for history. `deploy.sh` ships IAM, boto3
+  layer, env, schedule.
 
 **AWS services**
 - `bedrock-agentcore` (data plane) — `InvokeAgentRuntime` (chat) + the WebSocket
@@ -247,19 +261,30 @@ See [mcp/hub/README.md](../mcp/hub/README.md).
 
 **DynamoDB tables**
 - `agentcore-hub-cloud-code-sessions` — one row per session (turns, cli, repo,
-  claudeSessionId, userId, `defaultView` chat|terminal, and for ported sessions
-  `branch` + `resumeTranscriptKey` + `pendingSeed`); also holds `config:{userId}`
-  rows for config-bundle metadata. Single-user today (`userId:"default"`; swap
+  claudeSessionId, userId, `defaultView` chat|terminal, `runtimeArn` (the
+  coding runtime the session was minted on — every hub call targets it; rows
+  written before it existed fall back to the env), `computeReleasedAt` (set by
+  the reaper sweep; a released session is never resumed), and for ported
+  sessions `branch` + `resumeTranscriptKey` + `pendingSeed`); also holds
+  `config:{userId}` rows for config-bundle metadata. Single-user today (`userId:"default"`; swap
   for the Cognito sub).
 
-**App env** (App Runner) — `CODING_AGENT_RUNTIME_ARN`, `CLOUD_CODE_TABLE`,
-`MCP_GATEWAY_URL`; instance role needs `bedrock-agentcore:InvokeAgentRuntime` +
-`InvokeAgentRuntimeCommandShell`.
+**App env** (ECS service `agentcore-hub`) — `CODING_AGENT_RUNTIME_ARN` (default
+runtime for new sessions), `CLOUD_CODE_TABLE`, `MCP_GATEWAY_URL`; task role needs
+`bedrock-agentcore:InvokeAgentRuntime` + `InvokeAgentRuntimeCommandShell` on both
+coding runtimes. Reaper env: `CODING_AGENT_RUNTIME_ARN` (fallback for legacy
+rows without `runtimeArn`), `CLOUD_CODE_TABLE`, `WORKFLOWS_TABLE`, optional
+`SWEEP_*` knobs (grace/idle/caps). Change env only via
+`deploy/runtime-agent/set-runtime-env.py <runtime> KEY=VALUE` (fleet/coding
+runtimes) and `deploy/ecs-express/set-env.sh KEY=VALUE` (hub service) — both
+merge into the live config; the raw update APIs replace it.
 
 **Removing the module**
 - Delete the `/cloud-code` nav entry tagged `module: "cloud-code"` in `src/config/modules.ts`
 - `rm -rf src/app/cloud-code src/app/api/cloud-code src/lib/cloud-code src/components/cloud-code` and the `cloud-code/` domain in `mcp/hub`
-- Optionally tear down the runtime (`deploy/coding-agent-runtime/`), the
+- Optionally tear down the runtimes (`deploy/coding-agent-runtime/`:
+  `deploy-instances.py --delete` for the Instances twin + capacity provider),
+  the session reaper (`deploy/session-reaper/`), the
   `agentcore-hub-cloud-code-sessions` table, and the VPC/EFS stack
   (`agentcore-hub-coding-vpc-efs`). `src/lib/sse.ts` is shared — keep it.
 - `npx tsc --noEmit && npm run build`
