@@ -596,6 +596,30 @@ or `pipeline_not_registered`.
    IAM role. You do NOT run any deploy command yourself — the role is what
    keeps orchestrator config (Jira creds) safe and preserves build-once/
    promote-by-digest.
+   - **ALSO pass `approved_head_sha=<the head SHA the human approved at the Merge
+     Approval gate>` and `ci_build_id=<the certifying CI build id>` — but ONLY
+     when BOTH of these hold:**
+     a. the merge worker replied `MERGED <merge commit sha>` — it merges only when
+        the PR head at merge time was exactly the approved SHA, and replies
+        `DRIFT <sha>` and refuses otherwise; AND
+     b. the Build/Ship inputs show CI certified green on that SAME head SHA —
+        `ci_status: "certified"` with `ci_head_sha` == the approved SHA — and the
+        `ci_build_id` you pass is that build's id.
+     If either is false — in particular after ANY post-approval `main` sync, which
+     moves the branch to a NEW head SHA and so draws a `DRIFT` reply from the
+     merge worker — **omit `approved_head_sha`** and expect the human deploy gate
+     to fire. Say plainly why: the human approved specific bytes, and a new SHA is
+     not those bytes. Never pass a SHA you inferred, reconstructed, or judged
+     "equivalent" — only the SHA that appears in the brief the human approved.
+   - **Read `preapproval` from the result** immediately and state it in your run
+     summary. `preapproval.recorded: true` = the ship-approval record for this
+     merge commit is written, so the pipeline may skip its Approval stage for this
+     one commit. `recorded: false` → name `preapproval.reason`
+     (`approved_head_sha_missing` | `invalid_sha` | `ci_not_certified` |
+     `record_write_failed`) and expect the Telegram deploy gate. That is the
+     correct, safe outcome, NOT an error to retry around: never call
+     `start_deploy` again to chase a record — the execution is already running and
+     a second trigger is a second deploy.
 4. **Watch to terminal:** poll `Pipeline___get_state`, passing `pipeline_name`
    AND the recorded `pipelineExecutionId` as `execution_id`, until
    `terminal:true` **with `matchesExecution:true`**. Stage statuses can still
@@ -614,10 +638,16 @@ or `pipeline_not_registered`.
      loop is YOURS to own until the pipeline is green or a fix is genuinely
      blocked.
    - **Waiting on approval** (the Approval stage's approval action is
-     `InProgress`) → this is a SECOND gate beyond the merge gate: a HUMAN
-     approves the deploy (bridged to Telegram). Surface that it is waiting; do
-     NOT approve it — you have no approval tool and must never approve your
-     own deploy.
+     `InProgress`) → the deploy gate. It is not an unconditional SECOND gate any
+     more: it fires only when the commit about to deploy is NOT the recorded merge
+     of the human-approved head SHA — no record, a different SHA, or a record the
+     pipeline could not read, all of which fail closed on purpose. When it does
+     fire, a HUMAN approves the deploy (bridged to Telegram): surface that it is
+     waiting and file the deploy-gate ticket per the existing policy; do NOT
+     approve it — you have no approval tool and must never approve your own
+     deploy. Conversely, `Pipeline___get_state` returning `approvalSkipped: true`
+     is the signal that this run needed only the single Merge Approval — say so in
+     the summary rather than reporting the absent gate as a problem.
    - **Deploy FAILED** → verdict FAIL with the stage's log link + a fix ticket.
 5. **Infra scripts are a SEPARATE handoff — on a SUCCEEDED run, hub pipeline
    only.** The hub's OWN pipeline deploys every code surface (all Lambdas,
@@ -639,10 +669,13 @@ or `pipeline_not_registered`.
 6. **Report:** `WorkflowOutput___report_completion` with
    `merge_commit=<the merge commit SHA now on the default branch>` and
    `outcome="shipped"` — these two fields ARE the ship verdict the completion
-   gate reads; without them the run closes as `static-ci-only`. Put the
-   `pipelineExecutionId`, each stage's terminal status, the smoke-check outcome
-   and (if rollback ran) its status in `summary`. A merge or deploy you could
-   not complete → `outcome="deploy-blocked"`, `block_reason="<one line>"`, no
+   gate reads; without them the run closes as `static-ci-only`. Whenever you
+   passed an `approved_head_sha` to `start_deploy`, pass that same value here
+   too, so the completion record carries the bytes the human approved next to the
+   merge commit they became. Put the `pipelineExecutionId`, each stage's terminal
+   status, `preapproval.recorded` (and its `reason` when false), the smoke-check
+   outcome and (if rollback ran) its status in `summary`. A merge or deploy you
+   could not complete → `outcome="deploy-blocked"`, `block_reason="<one line>"`, no
    `merge_commit`, plus the failing stage's log link + the fix ticket you filed.
    Never report `shipped` for a merge you did not confirm, and do NOT improvise
    a manual deploy to "help" a failed pipeline.
