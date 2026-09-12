@@ -2,7 +2,7 @@
 #
 # setup-runtime-role.sh — Create the IAM execution role for AgentCore Runtime agents
 #
-# This role is assumed by the 14 fleet agents at runtime. It includes permissions
+# This role is assumed by the 15 fleet agents at runtime. It includes permissions
 # for all built-in Strands agent tools (code interpreter, browser, memory, gateway,
 # knowledge bases) plus observability (CloudWatch Logs, X-Ray, metrics).
 #

@@ -4,7 +4,7 @@ AWS-native CI/CD for a repo the hub cares about (pilot: the hub's own repo).
 **Entirely optional** — a forker who never runs `deploy.sh` here gets the hub
 with no pipeline, and the app still passes `npx tsc --noEmit` + `npm run build`.
 
-Design + rationale: [`docs/cicd-pipeline-module-design.md`](../../docs/cicd-pipeline-module-design.md).
+Design + rationale: [`docs/pipeline/design.md`](../../docs/pipeline/design.md).
 
 ## What it stands up
 
@@ -39,12 +39,15 @@ What the narrow Deploy role deliberately cannot do stays a **handoff**: runtime
 images (`deploy/runtime-agent/`, `deploy/coding-agent-runtime/`) and infra
 scripts (IAM, env vars, tables, subscriptions — every `deploy.sh` / `setup-*`).
 When a merge touches those, the Deploy stage **deploys everything it can,
-advances the baseline SHA, then fails the action as a terminal non-rollback
-handoff** listing the files — the release manager reports it, a human runs the
-owning script (DEPLOY.md maps path → command). Blocking before the deploy would
-wedge the pipeline: the baseline only advances on a successful deploy, so the
-same commit range would re-block forever. Runtime-image CD is the next
-increment.
+advances the baseline SHA, writes a handoff marker to S3 listing the files, and
+SUCCEEDS (exit 0)** — the release manager reports it, a human runs the owning
+script (DEPLOY.md maps path → command). `Pipeline___get_state` reports `handoff`
+on the green run. (It used to `exit 2` as a terminal non-rollback failure, which
+made a clean deploy-with-a-follow-up indistinguishable from a real failure and
+took six consecutive executions to read as broken — PR #464.) Blocking before
+the deploy would wedge the pipeline: the baseline only advances on a successful
+deploy, so the same commit range would re-block forever. Runtime-image CD is the
+next increment.
 
 ## Files
 
@@ -82,6 +85,18 @@ Env (all optional except the owner; defaults derive from `deploy/config.sh`):
 | `PIPELINE_CI_START_BUILD` | off | `1` grants the pipeline-tools Lambda `codebuild:StartBuild` on the CI project ONLY (via `node deploy/setup-pipeline-tools-lambda.mjs`, NOT this CDK stack). The fallback for when the webhook cannot be installed: agents can trigger CI builds themselves, bounded by `concurrentBuildLimit` on the CI project and the calling agent's poll cap. |
 | `PIPELINE_REGIONS` | the Lambda's own region | Read by `node deploy/setup-pipeline-tools-lambda.mjs` (not by the Lambda at runtime): comma-separated list of regions to fan the tools Lambda's IAM grants (pipeline + project ARNs) out to. A CD-registry entry whose `region` is outside this list was never granted access, so its calls fail at AWS with `AccessDenied` - operator misconfiguration surfaced as the tool's normal error text, not a silent resolve to a same-named pipeline in the wrong region. |
 | `ARTIFACT_BUCKET` | derived (`deploy/config.sh`) | On the **tools Lambda**: bucket holding `config/cd-registry.json`, which it reads to resolve a repo → pipeline / CI project / build project (`pipelineProjects`). Without it the Lambda falls back to its single `PIPELINE_NAME` / `CI_PROJECT` / `BUILD_PROJECT` env values. |
+
+> **Cross-account CD (PR #535).** A pipeline in **another AWS account** needs no
+> env var here — it is configured per-repo on the CD-registry entry, which may
+> carry `account`, `roleArn` (`arn:aws:iam::<account>:role/hub-cd-trigger-<slug>`)
+> and `externalId`. The tools Lambda `AssumeRole`s that trigger-only
+> `hub-cd-trigger-*` role (honored only as a complete, valid triple whose
+> `roleArn` account matches `account`) to reach the pipeline. Set the fields via
+> `scripts/cd-registry.sh ... --account ID --role-arn ARN --external-id ID` or
+> the API — the Workflow-tab CD-registry form only saves
+> `pipeline`/`region`/`ciProject`, not the cross-account triple. Only the tools
+> Lambda assumes the role, so `/pipeline` and the Telegram deploy-gate bridge
+> (ambient credentials) cannot yet read or approve a cross-account pipeline.
 
 ### One-time after first deploy
 

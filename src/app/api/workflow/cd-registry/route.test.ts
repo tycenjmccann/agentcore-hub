@@ -5,7 +5,7 @@ import { NextRequest } from "next/server";
  * TEAM-4416 — POST /api/workflow/cd-registry now shape-validates the body
  * (src/lib/cd-registry.ts validateCdEntryInput) before it ever reaches S3, so a
  * typo'd region/pipeline/deployDoc fails with a 400 here instead of an opaque
- * AWS error deep inside a Lambda later (docs/agents-own-cd.md "runtime
+ * AWS error deep inside a Lambda later (docs/pipeline/design.md "runtime
  * allow-list"). Same S3-mock-at-the-module-seam pattern as
  * src/app/api/workflow/[id]/complete/route.test.ts.
  */

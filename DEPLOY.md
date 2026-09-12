@@ -12,7 +12,7 @@ merge commit — the contract runs from a fresh clone of that merge commit.
 
 > **Pipeline mode.** When the CI/CD pipeline module is deployed
 > (`deploy/pipeline/`), steps 0-3 below are executed by the
-> `agentcore-hub-deploy` CodePipeline (see `docs/pipeline-quickstart.md`) —
+> `agentcore-hub-deploy` CodePipeline (see `docs/pipeline/design.md` → Quickstart) —
 > the commands here are the legacy/manual path and remain the contract source
 > the pipeline's buildspecs are ported from.
 

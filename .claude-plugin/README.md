@@ -18,7 +18,7 @@ The plugin reasons about four modules (see `docs/MODULES.md` for the full breakd
 
 - **Core** — always installed. Discovery, Agents browser, Invoke console.
 - **Builder** — `/build` page + `builder-tools` Lambda.
-- **Workflow** — multi-agent pipeline + Jira/DynamoDB ticket store + 14-agent runtime fleet.
+- **Workflow** — multi-agent pipeline + Jira/DynamoDB ticket store + 15-runtime fleet.
 - **Evaluations** — CloudWatch-driven eval packager + self-improvement loop.
 
 ## File layout
@@ -83,7 +83,7 @@ It does **not** rename:
 - Lambda functions (`agentcore-hub-jira`, `agentcore-hub-tickets`, `orchestrator`, `workflow-output`, `eval-packager`, `builder-tools`, etc.)
 - IAM roles (`agentcore-hub-harness-role`, `agentcore-hub-lambda-role`, runtime roles)
 - S3 artifact bucket (`agentcore-hub-artifacts-<ACCOUNT>-<REGION>`)
-- AgentCore runtime names (`agentcore_hub_builder`, the 14 fleet roles)
+- AgentCore runtime names (`agentcore_hub_builder`, the 15 fleet roles)
 
 These names are part of the application contract — Lambda env vars, IAM trust policies, the `RUNTIME_ARN_<HARNESS>` lookup convention, deploy scripts, and the orchestrator all reference them by literal name. Renaming any of them would require a coordinated refactor across ~30 files plus an end-to-end test on a clean account. Out of scope for v1.
 
@@ -94,7 +94,7 @@ The plugin **never** offers to reuse existing copies of:
 - App Lambdas
 - DynamoDB tables / S3 buckets
 - IAM roles + trust policies
-- The 14 fleet runtimes
+- The 15 fleet runtimes
 - The Builder runtime
 
 Reason: these are tightly coupled to the codebase. Schema, permissions, env-var conventions, and Lambda code all need to match the version of the repo being installed. Letting users substitute their own would mean shipping every variation as supported, which is unwinnable for an OSS project. First-time installs work end-to-end *because* everything is fresh.

@@ -21,7 +21,7 @@
 #   4. total non-test lines and index.mjs lines must stay under the budgets below
 #
 # Lower the budgets freely. Raise them, or add to an allow-list, only in the same
-# PR as a DL entry in docs/workflow-pipeline-architecture.md explaining why the
+# PR as a DL entry in docs/architecture.md explaining why the
 # behaviour is a dispatch/cascade/claim/reaper/completion concern.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -37,7 +37,7 @@ RULE="DL-009: the orchestrator is cascade/dispatch/claim/reaper/completion only.
         Put this behaviour in a blueprint (Tickets___create_ticket /
         Tickets___transition_ticket blocked_by=…) or in the ticket-tools Lambda.
         If it truly belongs here, add the name to the allow-list in the SAME PR
-        as a DL entry in docs/workflow-pipeline-architecture.md."
+        as a DL entry in docs/architecture.md."
 
 fail=0
 

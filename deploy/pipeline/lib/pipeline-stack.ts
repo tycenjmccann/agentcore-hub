@@ -41,7 +41,7 @@ export interface PipelineStackProps extends StackProps {
 /**
  * The CI/CD pipeline for one repo (pilot: the hub itself).
  *
- * Topology (see docs/cicd-pipeline-module-design.md §5):
+ * Topology (see docs/pipeline/design.md §5):
  *   PR push  → CodeBuild "ci"     → commit status → branch protection gate
  *   merge    → CodePipeline "deploy": Source → Build → ManualApproval → Deploy
  *
