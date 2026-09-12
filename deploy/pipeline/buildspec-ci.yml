@@ -107,6 +107,11 @@ phases:
       # compute_metrics.py); a kind forgotten in one fails SILENTLY. Mirrors
       # .github/workflows/ci.yml's "Fix-kinds parity guard" step (TEAM-4130 F3).
       - "./scripts/check-fix-kinds-parity.sh"
+      # TEAM-4529: the Main-sync rule ("a branch behind the default branch is NOT a
+      # defect") is duplicated verbatim in nine blueprints, which are served one
+      # file at a time and cannot include each other. Mirrors ci.yml's "Blueprint
+      # main-sync parity guard" step.
+      - "./scripts/check-blueprint-main-sync.sh"
       # TEAM-4337: cd-registry.mjs is byte-copied into the pipeline-tools Lambda
       # and the Telegram bridge (each ships as a self-contained zip). Mirrors
       # ci.yml's "CD-registry parity guard" step.

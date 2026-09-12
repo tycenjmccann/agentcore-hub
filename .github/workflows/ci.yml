@@ -68,6 +68,14 @@ jobs:
       - name: Fix-kinds parity guard
         run: ./scripts/check-fix-kinds-parity.sh
 
+      # TEAM-4529: blueprints are served one file at a time (`load_blueprint`) and
+      # cannot include each other, so the "a branch behind the default branch is
+      # NOT a defect" rule is duplicated verbatim in nine of them. Drift re-creates
+      # wf_1789170903227_c3x6k1 (staleness filed as a must-fix in two review rounds)
+      # or lets a blueprint say "rebase" and rewrite a live integration branch.
+      - name: Blueprint main-sync parity guard
+        run: ./scripts/check-blueprint-main-sync.sh
+
       # TEAM-4337: cd-registry.mjs is byte-copied (never imported) into the
       # pipeline-tools Lambda and the Telegram bridge, since each ships as a
       # self-contained zip built from its own dir. A drifted copy is a silent
