@@ -224,7 +224,14 @@ phases:
           # daemon is needed; PR checks never enter this branch.
           if ! docker info >/dev/null 2>&1; then
             echo "docker: no daemon - starting dockerd (custom build image)"
+            # The static engine bundle in ci-image has no docker-proxy and the
+            # image has no iptables, so a default-config dockerd exits at
+            # startup ("userland-proxy is enabled, but userland-proxy-path is
+            # not set" - first Build after the image landed, 2026-09-12). The
+            # build needs no container networking of its own: buildx below runs
+            # with --network=host, and the daemon pushes from the host netns.
             nohup dockerd --host=unix:///var/run/docker.sock --storage-driver=overlay2 \
+              --userland-proxy=false --iptables=false --ip6tables=false --bridge=none \
               >/tmp/dockerd.log 2>&1 &
             timeout 60 bash -c 'until docker info >/dev/null 2>&1; do sleep 1; done' \
               || { echo "docker: dockerd failed to come up within 60s"; cat /tmp/dockerd.log; exit 1; }
@@ -253,7 +260,7 @@ phases:
           # pipeline-resolved source revision, not `git rev-parse` (Codex #263 P1).
           GIT_SHA="${CODEBUILD_RESOLVED_SOURCE_VERSION:-$(git rev-parse --short HEAD 2>/dev/null || echo nogit)}"
           GIT_SHA="$(printf '%s' "$GIT_SHA" | cut -c1-12)"
-          docker buildx build --platform linux/amd64 \
+          docker buildx build --platform linux/amd64 --network=host \
             --build-arg NEXT_PUBLIC_PIPELINE_ENABLED="${NEXT_PUBLIC_PIPELINE_ENABLED:-}" \
             --tag "${ECR_URI}:${GIT_SHA}" --tag "${ECR_URI}:latest" \
             --push --file Dockerfile . --provenance=false || { echo "docker buildx build/push FAILED"; exit 1; }
