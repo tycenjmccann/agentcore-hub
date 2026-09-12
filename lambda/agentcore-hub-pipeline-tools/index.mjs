@@ -25,6 +25,14 @@
  *                     StartBuild input is an allow-list of three keys, so no
  *                     override (buildspec/env/image/privileged/role/source) can
  *                     ride in from the agent's args.
+ *                     (TEAM-4448 D2) It also owns the RETRY decision: a SHA gets
+ *                     at most TWO builds, and the second one only when the first
+ *                     died in an infra phase (PROVISIONING/DOWNLOAD_SOURCE/
+ *                     INSTALL/PRE_BUILD) — not the caller's code. A second infra
+ *                     death, or any BUILD-phase failure, is a structural refusal
+ *                     (install_flake_retry_failed / build_failed_not_retryable),
+ *                     never another build: the cap has to live here, because an
+ *                     agent asked to judge "is this flaky?" will always say yes.
  *   - capabilities:   What this Lambda will actually do in THIS deployment, so an
  *                     agent can branch without probing with a real StartBuild.
  *                     Also enumerates every target (see below).
@@ -1033,13 +1041,23 @@ async function getBuildStatus(args = {}, target, targets = []) {
   }
 
   const { builds } = await cb.send(new BatchGetBuildsCommand({ ids }));
-  const rows = (builds || []).map((b) => ({
-    buildId: b.id,
-    buildStatus: b.buildStatus,
-    resolvedSourceVersion: b.resolvedSourceVersion || null,
-    sourceVersion: b.sourceVersion || null,
-    endTime: b.endTime,
-  }));
+  // BatchGetBuilds makes no ordering promise, so `ids` (which IS newest-first)
+  // drives the walk -- the same reason findBuildsForCommit indexes by id. Reading
+  // the response array as if it were ordered made `match` below (the FIRST row for
+  // the commit, i.e. "newest") whichever build AWS happened to return first: a SHA
+  // carrying a FAILED build plus a green D2 retry could report the FAILED one and
+  // succeededForCommit:false for a head CI had actually certified.
+  const byId = new Map((builds || []).filter((b) => b?.id).map((b) => [b.id, b]));
+  const rows = ids
+    .map((id) => byId.get(id))
+    .filter(Boolean)
+    .map((b) => ({
+      buildId: b.id,
+      buildStatus: b.buildStatus,
+      resolvedSourceVersion: b.resolvedSourceVersion || null,
+      sourceVersion: b.sourceVersion || null,
+      endTime: b.endTime,
+    }));
 
   let match = null;
   if (commit) {
@@ -1069,7 +1087,7 @@ async function getBuildStatus(args = {}, target, targets = []) {
 // webhook is repo-side and not guaranteed) and "no build" is indistinguishable
 // from "build pending" to get_build_status.
 //
-// Three invariants, in the order they are enforced:
+// Four invariants, in the order they are enforced:
 //   1. The project is a PR-CHECK project this deployment KNOWS: env CI_PROJECT or
 //      some target's ciProject. args.project naming anything else (a build or
 //      deploy project, say) is IGNORED, not rejected: a fix-then-retry loop must
@@ -1085,6 +1103,16 @@ async function getBuildStatus(args = {}, target, targets = []) {
 //      *Override inputs can replace the buildspec, the image, the service role and
 //      privileged mode — i.e. turn a PR check into arbitrary privileged execution.
 //      They are never read from args at all.
+//   4. (TEAM-4448 D2) A SHA gets at most MAX_BUILDS_PER_SHA builds, and the second
+//      one ONLY when the newest prior build died in an INFRA_RETRY_PHASES phase.
+//      findBuildsForCommit returns the whole per-SHA ledger, so "how many times
+//      have we tried this commit, and why did the last one die?" is answered from
+//      CodeBuild itself rather than from caller-supplied state — there is nothing
+//      for a retry loop to lie about. This TIGHTENS the pre-D2 behaviour on
+//      purpose: a build that failed in BUILD/POST_BUILD is no longer re-startable
+//      at all (it used to get a fresh build on every call), because re-running a
+//      red test suite for an unchanged tree cannot change the answer, and the
+//      agent contract for that case is "a fix is a new SHA".
 async function startCiBuild(args = {}, target, targets = []) {
   // Step 1: which PR-check project. An args.project that is not a known PR-check
   // project falls back to the resolved target's — silently, by design.
@@ -1139,36 +1167,105 @@ async function startCiBuild(args = {}, target, targets = []) {
     });
   }
 
-  // Dedupe BEFORE starting: the same head can be pushed once and re-checked by
-  // several agents (CI agent + release manager both watch it), and a duplicate
-  // build costs minutes of pipeline time and produces a second, racing verdict
-  // for one commit.
-  const existing = await findRecentBuildForCommit(cb, project, sha, 30);
-  if (existing) {
+  // The per-SHA ledger, read BEFORE starting anything: the same head can be
+  // pushed once and re-checked by several agents (CI agent + release manager both
+  // watch it), and a duplicate build costs minutes of pipeline time and produces a
+  // second, racing verdict for one commit. It also carries every FAILED attempt,
+  // which is what bounds the retry below.
+  const priorBuilds = await findBuildsForCommit(cb, project, sha, BUILD_SCAN_WINDOW);
+  const attempts = priorBuilds.length;
+  const live = priorBuilds.find(
+    (b) => b.buildStatus === "IN_PROGRESS" || b.buildStatus === "SUCCEEDED"
+  );
+  if (live) {
     console.log(
       "start_ci_build: reusing build",
       JSON.stringify({
         project,
-        buildId: existing.id,
-        buildStatus: existing.buildStatus,
+        buildId: live.id,
+        buildStatus: live.buildStatus,
       })
     );
     return jsonResult({
       ok: true,
       reused: true,
-      buildId: existing.id,
-      buildStatus: existing.buildStatus,
-      resolvedSourceVersion: existing.resolvedSourceVersion || null,
+      buildId: live.id,
+      buildStatus: live.buildStatus,
+      resolvedSourceVersion: live.resolvedSourceVersion || null,
       project,
       region: owner.region,
     });
   }
 
+  // ── The retry decision (TEAM-4448 D2) ──────────────────────────────────────
+  // Nothing live for this SHA, so every prior build failed. The NEWEST one decides
+  // — an older infra flake does not re-open the door once a later attempt failed
+  // in the caller's own code.
+  let retry = null;
+  if (attempts > 0) {
+    const prior = priorBuilds[0];
+    const { failedPhase, isInfraFailure } = classifyPriorBuild(prior);
+    const refusal = {
+      ok: false,
+      prior_build_id: prior.id || null,
+      prior_failed_phase: failedPhase,
+      attempts,
+      project,
+      region: owner.region,
+    };
+    if (prior.buildStatus === "STOPPED") {
+      return jsonResult({
+        ...refusal,
+        reason: "prior_build_stopped",
+        detail:
+          "A human stopped the prior build for this commit, so nothing was started here. " +
+          "Report BLOCKED and say the prior build was stopped by hand — a stop is a " +
+          "decision, not a flake, and re-running it would override that decision.",
+      });
+    }
+    if (!isInfraFailure) {
+      return jsonResult({
+        ...refusal,
+        reason: "build_failed_not_retryable",
+        detail:
+          `The prior build for this commit failed in ${failedPhase || "an unknown phase"}, ` +
+          "which is the caller's own code, not CI infrastructure. Re-running an unchanged " +
+          "tree cannot change the answer: classify the failure from prior_build_id's log " +
+          "and land a fix. A fix is a NEW commit SHA, which gets its own build.",
+      });
+    }
+    if (attempts >= MAX_BUILDS_PER_SHA) {
+      return jsonResult({
+        ...refusal,
+        reason: "install_flake_retry_failed",
+        detail:
+          `SHA already retried once after an ${failedPhase} failure; push a new commit or ` +
+          "inspect prior_build_id",
+      });
+    }
+    retry = { prior, failedPhase };
+  }
+
+  // SR-3.2: a retry re-uses ONE token per SHA (`ci-<sha>-r1`), and CodeBuild
+  // rejects the same idempotencyToken presented with different parameters. Two
+  // agents retrying the same commit concurrently therefore have to derive
+  // sourceVersion from SHARED state — the prior build's own value — not from
+  // their own args, or the loser gets an InvalidInputException instead of the
+  // winner's build. Only a value this Lambda would have accepted itself is
+  // honoured; anything else (a `refs/...` ref an older build was started with)
+  // falls back to the caller's.
+  const effectiveSourceVersion =
+    retry && retry.prior.sourceVersion && isAllowedSourceVersion(retry.prior.sourceVersion)
+      ? retry.prior.sourceVersion
+      : sourceVersion;
+
   // The allow-list. Do not spread args into this object, ever.
   const input = {
     projectName: project,
-    sourceVersion,
-    idempotencyToken: `ci-${sha}`.slice(0, 64),
+    sourceVersion: effectiveSourceVersion,
+    // `ci-<40 hex>-r1` is 46 chars — the slice is belt-and-braces for a token
+    // shape that is already provably under CodeBuild's 64-char limit.
+    idempotencyToken: (retry ? `ci-${sha}-r1` : `ci-${sha}`).slice(0, 64),
   };
 
   let res;
@@ -1184,6 +1281,10 @@ async function startCiBuild(args = {}, target, targets = []) {
         ok: false,
         reason: "start_build_not_granted",
         project,
+        // The retry path adds WHICH build we were retrying; the reason code and
+        // the remediation text below are byte-identical either way, because
+        // "the grant is missing" has nothing to do with why we were retrying.
+        ...(retry ? { prior_build_id: retry.prior.id || null } : {}),
         // TEAM-4358: with the StartBuild grant fanned out per region over the
         // project/hub-*-ci convention, WHICH project in WHICH region was refused
         // is half the diagnosis — and the old single-cause remediation text was
@@ -1204,6 +1305,23 @@ async function startCiBuild(args = {}, target, targets = []) {
       return jsonResult({ ok: false, reason: "project_not_found", project });
     }
     if (err?.name === "InvalidInputException") {
+      // SR-3.2: the ONE retry token for this SHA is already claimed — another
+      // caller won the race and its build is the one to poll. Distinguished from
+      // a bad ref because the remediation is the opposite: wait, do not fix.
+      if (/idempoten/i.test(String(err.message ?? ""))) {
+        return jsonResult({
+          ok: false,
+          reason: "retry_in_flight",
+          project,
+          region: owner.region,
+          sourceVersion: effectiveSourceVersion,
+          ...(retry ? { prior_build_id: retry.prior.id || null } : {}),
+          detail:
+            "Another caller already started this commit's retry with the same idempotency " +
+            "token. Poll get_build_status for this commit instead of starting anything — " +
+            "the retry that exists IS the one build this SHA gets.",
+        });
+      }
       // CodeBuild rejects a source version this Lambda's shape check accepted
       // (e.g. a branch that does not exist) — same reason code, so the caller
       // has one thing to fix.
@@ -1211,7 +1329,7 @@ async function startCiBuild(args = {}, target, targets = []) {
         ok: false,
         reason: "invalid_source_version",
         project,
-        sourceVersion,
+        sourceVersion: effectiveSourceVersion,
         detail: err.message,
       });
     }
@@ -1221,7 +1339,14 @@ async function startCiBuild(args = {}, target, targets = []) {
   const build = res?.build || {};
   console.log(
     "start_ci_build: started",
-    JSON.stringify({ project, sourceVersion, buildId: build.id || null })
+    JSON.stringify({
+      project,
+      sourceVersion: effectiveSourceVersion,
+      buildId: build.id || null,
+      retry: !!retry,
+      priorBuildId: retry ? retry.prior.id || null : null,
+      priorFailedPhase: retry ? retry.failedPhase : null,
+    })
   );
   return jsonResult({
     ok: true,
@@ -1230,11 +1355,22 @@ async function startCiBuild(args = {}, target, targets = []) {
     arn: build.arn || null,
     project,
     region: owner.region,
-    sourceVersion,
+    sourceVersion: effectiveSourceVersion,
     // Null on a fresh start (CodeBuild has not resolved the ref yet) — poll
     // get_build_status to prove the build belongs to this commit.
     resolvedSourceVersion: build.resolvedSourceVersion || null,
     buildStatus: build.buildStatus || null,
+    // Present ONLY on the retry path, so a caller that never sees `retry` keeps
+    // reading exactly the version-2 success shape.
+    ...(retry
+      ? {
+          retry: true,
+          retry_reason: "infra_install_failure",
+          prior_build_id: retry.prior.id || null,
+          prior_failed_phase: retry.failedPhase,
+          attempts,
+        }
+      : {}),
   });
 }
 
@@ -1259,37 +1395,140 @@ function parseBuildIdProject(buildId) {
   return value.split(":")[0] || null;
 }
 
-/** Is `resolved` (a build's resolvedSourceVersion) the commit `sha` names? Same
- * prefix rule get_build_status matches on, but restricted to hex values so a
- * short branch name can never prefix-match a SHA. */
+/** Is `resolved` (a build's resolvedSourceVersion, or the sourceVersion it was
+ * STARTED with) the commit `sha` names? Same prefix rule get_build_status matches
+ * on, but restricted to hex values so a short branch name can never prefix-match a
+ * SHA -- which is what makes it safe to run against a REQUESTED ref too, as the
+ * ledger below now does (TEAM-4462 F2). */
 function commitMatches(resolved, sha) {
   const r = String(resolved || "").toLowerCase();
   if (!/^[0-9a-f]{7,40}$/.test(r)) return false;
   return r === sha || r.startsWith(sha) || sha.startsWith(r);
 }
 
-/** The newest IN_PROGRESS-or-SUCCEEDED build of `project` for `sha`, or null.
- * Reuses the ListBuildsForProject → BatchGetBuilds scan get_build_status does;
- * BatchGetBuilds does not promise input order, so the ids (which ARE newest-first)
- * drive the walk. A FAILED build is NOT a reuse — re-running a red build for the
- * same commit is exactly what the CI agent calls this tool to do. */
-async function findRecentBuildForCommit(cb, project, sha, scan = 30) {
+// ─── the per-SHA retry ledger (TEAM-4448 D2) ──────────────────────────────────
+// TEAM-4311's apt Hash-Sum flake killed the INSTALL phase twice in one day: a
+// build that never reached the caller's code, reported as a red PR check. There
+// was no sanctioned way to retry it, so the only levers an agent had were the ones
+// this tool exists to remove (call again, push an empty commit, pass a different
+// source_version). The carve-out below gives the flake exactly ONE retry and makes
+// everything else a structural refusal, with the cap enforced here rather than by
+// agent judgement.
+//
+// TEAM-4462 F2: the ledger keys on resolvedSourceVersion OR, when CodeBuild never got
+// far enough to set one, the sourceVersion the build was STARTED with. Two of the four
+// retryable phases below (PROVISIONING, DOWNLOAD_SOURCE) die BEFORE the source is
+// resolved, so keying on resolvedSourceVersion alone made exactly those builds
+// invisible to the ledger -- attempts stayed 0, every call was a plain first start, and
+// the cap this carve-out exists to enforce could not hold for them.
+
+/** Phases that run BEFORE the buildspec's own commands can fail on the caller's
+ * code. A death here is the container/network/apt, not the diff. */
+const INFRA_RETRY_PHASES = new Set([
+  "PROVISIONING",
+  "DOWNLOAD_SOURCE",
+  "INSTALL",
+  "PRE_BUILD",
+]);
+/** buildStatus values a retry may follow. STOPPED is deliberately absent: a human
+ * stopped that build, and re-running it would override their decision. */
+const RETRYABLE_STATUSES = new Set(["FAILED", "FAULT", "TIMED_OUT"]);
+/** Total builds one commit SHA may ever get from this tool: the first, plus one
+ * infra retry. */
+const MAX_BUILDS_PER_SHA = 2;
+/** BatchGetBuilds accepts at most 100 ids, so the ledger scan cannot be wider. */
+const BUILD_SCAN_WINDOW = 100;
+
+/** Why a prior build for this SHA died: `{ status, failedPhase, isInfraFailure }`.
+ *
+ * `failedPhase` is the FIRST phase in CodeBuild's own (chronological) phases order
+ * with a bad phaseStatus — the first thing to break is the cause; every later
+ * phase is either skipped or a consequence. Same phaseType/phaseStatus shape
+ * get_build_log maps. No phases at all (an old build, or a BatchGetBuilds response
+ * without them) → failedPhase null → NOT an infra failure, i.e. no retry: the
+ * carve-out only ever fires on positive evidence. Pure; exported for unit tests. */
+export function classifyPriorBuild(build) {
+  const status = build?.buildStatus ?? null;
+  const bad = new Set(["FAILED", "FAULT", "TIMED_OUT", "STOPPED"]);
+  const failedPhase =
+    (build?.phases || []).find((p) => bad.has(p?.phaseStatus))?.phaseType ?? null;
+  return {
+    status,
+    failedPhase,
+    isInfraFailure:
+      RETRYABLE_STATUSES.has(status) &&
+      failedPhase !== null &&
+      INFRA_RETRY_PHASES.has(failedPhase),
+  };
+}
+
+/** EVERY build of `project` for `sha`, any status, newest first — the retry ledger.
+ * Reuses the ListBuildsForProject → BatchGetBuilds scan get_build_status does (two
+ * calls, no more: BatchGetBuilds already returns `phases`, so classifying the
+ * newest failure needs no extra API call and no extra IAM). BatchGetBuilds does not
+ * promise input order, so the ids (which ARE newest-first) drive the walk.
+ *
+ * Attribution keys on resolvedSourceVersion, or -- when CodeBuild never resolved the
+ * ref (a PROVISIONING/DOWNLOAD_SOURCE death) -- on the sourceVersion the build was
+ * STARTED with. The three rules are stated inline below (TEAM-4462 F2).
+ *
+ * Pre-D2 this returned only the newest IN_PROGRESS/SUCCEEDED build, because a
+ * FAILED build was simply not a reuse. The whole list is now the point: its LENGTH
+ * is the attempt count the retry cap is enforced against. */
+async function findBuildsForCommit(cb, project, sha, scan = BUILD_SCAN_WINDOW) {
+  const requested = Number(scan);
+  const window = Number.isFinite(requested)
+    ? Math.min(BUILD_SCAN_WINDOW, Math.max(1, Math.trunc(requested)))
+    : BUILD_SCAN_WINDOW;
+
   const list = await cb.send(
     new ListBuildsForProjectCommand({ projectName: project, sortOrder: "DESCENDING" })
   );
-  const ids = (list.ids || []).slice(0, scan);
-  if (ids.length === 0) return null;
+  const ids = (list.ids || []).slice(0, window);
+  if (ids.length === 0) return [];
 
   const { builds } = await cb.send(new BatchGetBuildsCommand({ ids }));
   const byId = new Map((builds || []).filter((b) => b?.id).map((b) => [b.id, b]));
-  for (const id of ids) {
-    const build = byId.get(id);
-    if (!build || !commitMatches(build.resolvedSourceVersion, sha)) continue;
-    if (build.buildStatus === "IN_PROGRESS" || build.buildStatus === "SUCCEEDED") {
-      return build;
+  // A build belongs to `sha` when EITHER
+  //  (i)   its resolvedSourceVersion is the sha -- authoritative whenever present;
+  //  (ii)  it has NO resolvedSourceVersion and was STARTED for this exact sha
+  //        (start_ci_build sends `sha` as sourceVersion whenever source_version is
+  //        omitted). commitMatches is hex-only, so a `pr/<n>` or a branch name can
+  //        never land here; or
+  //  (iii) it has NO resolvedSourceVersion, was started with a NON-hex ref, and an
+  //        OLDER build in this ledger resolved to `sha` from the IDENTICAL ref. The
+  //        retry path pins effectiveSourceVersion = retry.prior.sourceVersion, so an
+  //        r1 retry that died pre-resolve sits directly above its prior carrying the
+  //        same ref -- attributing it is exact, not a guess, and it is what makes the
+  //        cap hold for pr/<n> callers too.
+  //
+  // The residual, stated honestly rather than papered over: a FIRST-attempt build
+  // started with a pr/<n> or branch ref that dies before resolve has nothing to
+  // attribute it by, so it stays invisible (bounded only by the ~5-min idempotency-
+  // token dedupe). A caller who wants the full cap on a fresh SHA omits source_version
+  // and lets the bare sha be the ref.
+  //
+  // Walked OLDEST -> NEWEST so rule (iii) can only ever look DOWN the list, at builds
+  // strictly older than the unresolved one: a NEWER build resolving `pr/<n>` to this
+  // sha says nothing about what that ref pointed at earlier. Reversed at the end so the
+  // result stays in newest-first `ids` order -- the retry decision reads priorBuilds[0].
+  const provenRefs = new Set();
+  const oldestFirst = [];
+  for (let i = ids.length - 1; i >= 0; i--) {
+    const build = byId.get(ids[i]);
+    if (!build) continue;
+    const ref = String(build.sourceVersion ?? "").trim();
+    if (commitMatches(build.resolvedSourceVersion, sha)) {
+      if (ref) provenRefs.add(ref); // (iii)'s evidence, for the builds above this one
+      oldestFirst.push(build);
+      continue;
     }
+    // Resolved to something else entirely -> not this sha, whatever it was started as.
+    if (String(build.resolvedSourceVersion ?? "").trim()) continue;
+    if (!ref) continue;
+    if (commitMatches(ref, sha) || provenRefs.has(ref)) oldestFirst.push(build);
   }
-  return null;
+  return oldestFirst.reverse();
 }
 
 // ─── capabilities ─────────────────────────────────────────────────────────────
@@ -1304,6 +1543,12 @@ async function findRecentBuildForCommit(cb, project, sha, scan = 30) {
 // describe the ENV DEFAULT and are kept for callers written against version 2.
 // Optional args.pipeline_name narrows `targets` to that one (and refuses with
 // pipeline_not_registered if it is not a target at all).
+//
+// version 4 (TEAM-4448 D2) adds `ciRetry` — the retry contract start_ci_build
+// enforces. It sits at TOP LEVEL, not per target: the cap, the retryable phases and
+// the refusal reasons are properties of this Lambda's CODE, identical for every
+// pipeline it can drive, so an agent reads them once and does not have to discover
+// them by tripping over a refusal.
 async function capabilities(args = {}) {
   const targets = await listTargets();
   const requested = String(args.pipeline_name ?? "").trim();
@@ -1326,7 +1571,20 @@ async function capabilities(args = {}) {
     buildProject: BUILD_PROJECT,
     deployPipeline: PIPELINE_NAME,
     approveDeploy: false,
-    version: 3,
+    version: 4,
+    ciRetry: {
+      maxBuildsPerSha: MAX_BUILDS_PER_SHA,
+      infraRetryPhases: [...INFRA_RETRY_PHASES],
+      scanWindow: BUILD_SCAN_WINDOW,
+      retryReason: "infra_install_failure",
+      refusalReasons: [
+        "install_flake_retry_failed",
+        "build_failed_not_retryable",
+        "prior_build_stopped",
+        "retry_in_flight",
+        "start_build_not_granted",
+      ],
+    },
     targets: listed.map((t) => ({
       repo: t.repo,
       pipeline: t.pipeline,

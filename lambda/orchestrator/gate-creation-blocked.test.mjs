@@ -195,6 +195,7 @@ vi.mock("./workflow-store.mjs", () => {
       t[tid] = { ...entry };
       return true;
     }),
+    claimHumanTicket: vi.fn(async () => true),
     setTaskStatus: vi.fn(async (_id, tid, status) => {
       const t = tasks();
       if (t[tid]) t[tid].status = status;

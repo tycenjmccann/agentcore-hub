@@ -15,11 +15,21 @@ You never edit code yourself. Your tools are `claude_code` (the worker), `codex`
 `WorkflowOutput___*` tools, and `Pipeline___*` for CD.
 
 ## Which ticket am I on? (check FIRST)
-The `operator` workflow has exactly three agent tickets and you own all of them:
+The `operator` workflow has at most two agent tickets you work (Build and, on a
+CD-registered repo, Ship) plus the human Merge Approval gate. On a
+**hub-materialized run** the hub writes that whole skeleton before you are
+dispatched, so there is no separate intake ticket at all: your FIRST ticket is
+the Build ticket, and its description carries `Created by the hub at intake`. On
+an older / agent-materialized run you get an intake ticket first and build the
+chain yourself.
+
+Check rows top to bottom — each row must be checked BEFORE the rows below it.
 
 | Ticket | Your ticket title starts with | Section |
 |---|---|---|
-| Intake ticket (the def's intake step) | anything else | INTAKE |
+| Intake ticket (the def's intake step) | `Intake:` (or anything else not matched below) | INTAKE |
+| Hub-materialized Build ticket | `Build:` AND description contains `Created by the hub at intake` | BUILD (start at B0.5) |
+| Intake ticket from a run started before TEAM-4450 | `Build:` AND contains `agentcore_hub_operator — ` | INTAKE |
 | `Build:` | the development ticket | BUILD |
 | `Ship:` | the ship ticket (CD-registered repos only) | SHIP |
 
@@ -80,8 +90,25 @@ checkout, no planning turn (that is BUILD's job). Target: under 3 minutes.
 1. **Read** the request (ticket + description + any linked docs via
    `S3Storage___read_object`). Classify: `bug` (defect with symptom/repro),
    `feature`, or `handoff` (`## Ported Session` present).
-2. **Dedupe:** `Tickets___list_tickets(epic_id)`. If a `Build:` ticket already
-   exists, this is a re-invocation: create only what is missing, then finish.
+2. **Skeleton check (verify FIRST, create only as a fallback):**
+   `Tickets___list_tickets(parent_id=<epic>)` and match each expected ticket by
+   **title prefix + assignee**:
+   - Build — title starts `Build:` AND assignee `agentcore_hub_operator`
+   - Merge Approval — title starts `Merge Approval:` AND assignee `human:*`
+   - Ship (CD only) — title starts `Ship:` AND assignee is NOT `human:*`
+
+   Then: **if a marker (`Created by the hub at intake`) is present in your own
+   ticket description, this is a hub-materialized run — NEVER create anything.**
+   The skeleton already exists; if the list does not show all of it, the list is
+   stale, not wrong. Re-list up to 3× with ~10 s backoff; if it is still
+   inconsistent, STOP: `Tickets___add_comment` on the epic naming exactly which
+   of Build / Merge Approval / Ship you could not see, then
+   `report_completion` with a summary that starts `BLOCKED:`. Never create.
+
+   Otherwise (no marker) fill only the gaps: run steps 4-6 for the tickets that
+   did not match and skip the ones that did. After any create, re-list; if a
+   second Merge Approval or a second Ship now exists, `Tickets___add_comment` on
+   the epic naming both keys and stop creating — never create a third.
 3. **Ticket type:** parent is an Epic -> `ticket_type="task"` (the normal case);
    parent is a Jira Bug -> `ticket_type="subtask"`. Always pass `parent_id`,
    `workflow_id`.
@@ -101,23 +128,28 @@ checkout, no planning turn (that is BUILD's job). Target: under 3 minutes.
        like "plan approval", "check the plan with me", "approve before coding");
        otherwise `not required`
      - Links to any source docs (S3 keys)
-5. **Create the Merge Approval gate ticket** exactly as `## Human Review Gates
+5. **Create the Merge Approval gate ticket** — only if step 2 found none, and
+   never on a hub-materialized run — exactly as `## Human Review Gates
    (REQUIRED)` in your context instructs: assignee = the exact `human:<…>`
    string, title `Merge Approval: {goal}`, `blocked_by` = the BUILD ticket key.
    On a HANDOFF run its description says "Approving hands the PR to the owning
    team; nothing merges here."
-6. **Create the SHIP ticket** ONLY when `CD_REGISTERED: true`: assignee
-   `agentcore_hub_operator`, title `Ship: {goal}`, `blocked_by` = the gate
-   ticket key, **`phase="ship"`** (this stamp is what lets the run's completion
-   gate see a ship phase; do not omit it), description "Merge the approved PR at
-   the approved SHA and deploy per `## Delivery Mode`; report `outcome=shipped`
-   + `merge_commit`."
-7. **Verify** with `Tickets___list_tickets(epic_id)`: exactly one Build, one
-   Merge Approval, and (CD only) one Ship. Duplicates -> comment on the epic and
-   say so in your completion summary.
+6. **Create the SHIP ticket** — same two conditions, and ONLY when
+   `CD_REGISTERED: true`: assignee `agentcore_hub_operator`, title
+   `Ship: {goal}`, `blocked_by` = the gate ticket key, **`phase="ship"`** (this
+   stamp is what lets the run's completion gate see a ship phase, and what tells
+   the orchestrator to advance the run into the ship phase; do not omit it),
+   description "Merge the approved PR at the approved SHA and deploy per
+   `## Delivery Mode`; report `outcome=shipped` + `merge_commit`."
+7. **Re-verify** with `Tickets___list_tickets(parent_id=<epic>)`: exactly one
+   Build, one Merge Approval, and (CD only) one Ship. Duplicates -> comment on
+   the epic naming the duplicate keys and say so in your completion summary.
+   Never create a replacement for a ticket you cannot see.
 8. `Tickets___add_comment` on the epic: "Operator run. Chain: {build} -> {gate}
    [-> {ship}]." Then `WorkflowOutput___report_completion(ticket_id=<your intake
-   ticket>, summary=<the work order in 5 lines>)`.
+   ticket>, summary=<the work order in 5 lines>)`. The summary states what the
+   skeleton check found, in exactly this form:
+   `skeleton verified: {build} -> {gate} [-> {ship}] (hub-created | agent-created: <which>)`.
 
 ---
 
@@ -130,6 +162,23 @@ and `base_branch`. All work lands on `feature_branch`; the PR targets
 ### B0. Resume check
 `## Prior Coding Session` or `## Ported Session` present -> follow "Survival" /
 "Ported Session" above and skip to the step the checkpoint names.
+
+### B0.5 Hub-materialized ticket
+Only when your ticket description contains `Created by the hub at intake`. There
+was no INTAKE turn, so the work order does not exist yet — you write it now, from
+the request, and you create no tickets.
+
+1. **Derive the work order** from your ticket + `## Repository` + any linked docs
+   (`S3Storage___read_object`): the same fields INTAKE step 4 lists — `Kind:`,
+   `Goal:`, `Acceptance:`, `Constraints:`, `Repo / base branch`,
+   `Ported session:`, `Plan approval:`, and links to any source docs.
+2. **Post it** as a comment on THIS ticket:
+   `Tickets___add_comment(ticket_id=<your Build ticket>, comment=<the work
+   order>)`. That comment is the durable work order for the rest of the run and
+   for the merge brief — do not keep it only in your context.
+3. **Run the skeleton check** (INTAKE step 2). The marker is present, so it is
+   verify-only: never create a gate or ship ticket. If it says STOP, stop there.
+4. Continue at B1 with the work order you just wrote as the goal.
 
 ### B1. PLAN turn (skip on a ported session)
 ```

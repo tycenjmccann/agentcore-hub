@@ -15,7 +15,37 @@ import * as s3 from "aws-cdk-lib/aws-s3";
 import * as sns from "aws-cdk-lib/aws-sns";
 import * as subs from "aws-cdk-lib/aws-sns-subscriptions";
 import * as logs from "aws-cdk-lib/aws-logs";
+import { Platform } from "aws-cdk-lib/aws-ecr-assets";
 import { NagSuppressions } from "cdk-nag";
+import * as path from "node:path";
+import { readFileSync } from "node:fs";
+
+/**
+ * The @playwright/test version the REPO ROOT lockfile pins, passed to the CI
+ * image as a build arg (TEAM-4448 R11).
+ *
+ * The baked browser has to be the revision the checked-out Playwright client
+ * asks for, or the install phase falls back to a CDN download. Reading the
+ * lockfile — rather than hardcoding a version here — means a `@playwright/test`
+ * bump changes the asset hash and rebuilds the image on the next `deploy.sh`,
+ * instead of silently going stale. Throws rather than guessing: a wrong version
+ * would be a cache miss on every build, which is the bug this whole change
+ * exists to remove.
+ */
+function resolvePlaywrightVersion(): string {
+  // lib/ → pipeline/ → deploy/ → repo root. `__dirname` is available because the
+  // CDK app is CJS (tsconfig module NodeNext, no "type":"module" in package.json).
+  const lockfile = path.join(__dirname, "..", "..", "..", "package-lock.json");
+  const lock = JSON.parse(readFileSync(lockfile, "utf8"));
+  const pinned = lock?.packages?.["node_modules/@playwright/test"]?.version;
+  if (typeof pinned === "string" && pinned) return pinned;
+  const declared = lock?.packages?.[""]?.devDependencies?.["@playwright/test"];
+  if (typeof declared === "string" && declared) return declared.replace(/^[\^~]/, "");
+  throw new Error(
+    `Cannot resolve @playwright/test version from ${lockfile} — ` +
+      "the CI image needs it as a build arg (deploy/pipeline/ci-image/Dockerfile)."
+  );
+}
 
 export interface PipelineStackProps extends StackProps {
   /** GitHub org/user that owns the repo to build (pilot: the hub's own owner). */
@@ -98,10 +128,33 @@ export class PipelineStack extends Stack {
     }
 
     // ── Shared build environment ─────────────────────────────────────────────
+    // The CI and Build projects run on a CUSTOM image (TEAM-4448 R11) that bakes
+    // Playwright's Chromium and its shared libs, so the INSTALL phase touches
+    // neither apt nor the Playwright CDN — see deploy/pipeline/ci-image/. Built
+    // as a CDK asset, so `deploy.sh` now needs Docker (`cdk synth` does not).
+    const ciImage = codebuild.LinuxBuildImage.fromAsset(this, "CiImage", {
+      // The tiny ci-image directory, NOT the repo root: the asset fingerprint is
+      // the directory's contents, and a repo-root context would rebuild (and
+      // re-upload a GB of it) on every unrelated commit.
+      directory: path.join(__dirname, "..", "ci-image"),
+      platform: Platform.LINUX_AMD64,
+      buildArgs: { PLAYWRIGHT_VERSION: resolvePlaywrightVersion() },
+    });
+
     const buildEnvironment: codebuild.BuildEnvironment = {
-      buildImage: codebuild.LinuxBuildImage.STANDARD_7_0, // Node 20, Docker available
+      buildImage: ciImage,
       computeType: codebuild.ComputeType.SMALL,
       privileged: true, // needed for `docker buildx build` in the app image step
+    };
+
+    // The Deploy stage keeps the MANAGED image: buildspec-deploy.yml has no
+    // install phase, runs no Playwright and calls no apt, so it gains nothing
+    // from the custom image and would only inherit its blast radius (a ~3 GB
+    // pull, plus the self-started dockerd).
+    const deployEnvironment: codebuild.BuildEnvironment = {
+      buildImage: codebuild.LinuxBuildImage.STANDARD_7_0, // Node 20, Docker available
+      computeType: codebuild.ComputeType.SMALL,
+      privileged: true,
     };
 
     const commonEnvVars: Record<string, codebuild.BuildEnvironmentVariable> = {
@@ -261,7 +314,7 @@ export class PipelineStack extends Stack {
       buildSpec: codebuild.BuildSpec.fromSourceFilename(
         "deploy/pipeline/buildspec-deploy.yml"
       ),
-      environment: buildEnvironment,
+      environment: deployEnvironment,
       environmentVariables: {
         ...commonEnvVars,
         ECR_REPO: { value: "agentcore-hub-frontend" },
@@ -848,5 +901,23 @@ function applyNagSuppressions(
       },
     ],
     true
+  );
+  // AwsSolutions-CB5 (TEAM-4448 R11): the ci + build projects intentionally use a
+  // custom image (deploy/pipeline/ci-image/), not an `aws/codebuild/*` managed
+  // one — the rule's own doc comment calls this the sanctioned escape hatch
+  // ("...or have a cdk-nag suppression rule explaining the need for a custom
+  // image"). It is scoped to just these two projects: deployProject and
+  // runtimeImageProject still use managed images and need no suppression. Only
+  // r.ciProject and r.buildProject are suppressed here, not applyToChildren —
+  // the resource IS the CfnProject the rule inspects.
+  NagSuppressions.addResourceSuppressions(
+    [r.ciProject, r.buildProject],
+    [
+      {
+        id: "AwsSolutions-CB5",
+        reason:
+          "Custom image built as a CDK asset (deploy/pipeline/ci-image/) so the INSTALL phase can bake Playwright's Chromium + OS deps once instead of hitting apt and the Playwright CDN on every build (TEAM-4311 apt Hash-Sum flake; TEAM-4448 R11). The Dockerfile is source-controlled and reviewed like any other repo file; the deploy + runtime-image projects are unaffected and keep AWS-managed images.",
+      },
+    ]
   );
 }

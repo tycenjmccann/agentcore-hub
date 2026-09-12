@@ -11,6 +11,13 @@ const ARTIFACT_BUCKET = process.env.ARTIFACT_BUCKET || "";
 
 export interface RosterAgent {
   agentId: string;
+  /**
+   * The agent's pipeline phase (agents.json `phase`), e.g. "development".
+   * TEAM-4453: read by the intake planner to resolve a phase ticket's assignee
+   * (see intake-materialize.ts resolvePhaseAssignee). The S3 doc has always
+   * carried it — the orchestrator's loadAgentRoster maps the same field.
+   */
+  phase?: string;
   workflowDefId?: string;
   workflowDefIds?: string[];
   connectors?: string[];

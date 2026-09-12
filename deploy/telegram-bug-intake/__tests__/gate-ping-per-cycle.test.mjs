@@ -21,6 +21,14 @@ const TG_TOKEN = "111111:test-bot-token";
 const HUB = "https://hub.example.invalid";
 
 const db = vi.hoisted(() => ({ items: new Map(), puts: [], deletes: [] }));
+// Publishing gate.requested (TEAM-4453 D3) is best-effort in index.mjs, so an
+// unmocked EventBridge does not fail a test — it silently reaches real AWS and
+// logs the AccessDenied. Stubbed here to keep this suite hermetic; the event
+// itself is asserted in gate-working-hours.test.mjs.
+vi.mock("@aws-sdk/client-eventbridge", () => ({
+  EventBridgeClient: class { async send() { return { FailedEntryCount: 0 }; } },
+  PutEventsCommand: class { constructor(input) { this.input = input; } },
+}));
 vi.mock("@aws-sdk/client-dynamodb", () => {
   const cmd = (op) => class { constructor(input) { this.input = input; this.op = op; } };
   class DynamoDBClient {

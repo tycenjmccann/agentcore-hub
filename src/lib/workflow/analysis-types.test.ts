@@ -4,7 +4,11 @@ import {
   TERMINAL_PHASES,
   isTerminalPhase,
 } from "@/lib/workflow/types";
-import type { RunOutcome } from "@/lib/workflow/analysis-types";
+import type {
+  HumanReviewMetric,
+  RunOutcome,
+  WorkflowMetrics,
+} from "@/lib/workflow/analysis-types";
 
 /**
  * TEAM-3758 / AC-D2.5 — the analyzer RunOutcome type accepts the new values, and
@@ -65,5 +69,74 @@ describe("AC-D2.5 — RunOutcome new values are handled by a real consumer (isTe
     // If either list gains a member without the other, this fails — the
     // single-source-of-truth invariant the D2 parity note (types.ts) documents.
     expect([...RUN_OUTCOMES].sort()).toEqual([...TERMINAL_PHASES].sort());
+  });
+});
+
+/**
+ * TEAM-4453 D3 — the business-hours wait split (compute_metrics.py's
+ * split_wait_by_window) is additive on both shapes it touches. A metrics.json
+ * written before this change has neither the per-review inHoursMs/
+ * outsideHoursMs nor the run-level humanWait*HoursMs totals; both fixtures
+ * below must satisfy the real interfaces so a regression that widens either
+ * field from optional to required fails HERE, at compile time, rather than as
+ * a runtime crash the first time an old file is read.
+ */
+const baseMetrics = (): WorkflowMetrics => ({
+  startedAt: null,
+  completedAt: null,
+  totalDurationMs: null,
+  phases: [],
+  agentTasks: [],
+  humanReviews: [],
+  humanWaitTotalMs: 0,
+  changeRequests: { count: 0, cycles: [] },
+  fixTickets: { count: 0, ticketIds: [] },
+  nudgeCount: 0,
+  managerInterventions: [],
+  errors: [],
+  tokens: null,
+  evalSummaries: [],
+  counts: { tickets: 0, events: 0, artifacts: 0, completions: 0 },
+  dataQuality: { ticketProvider: "dynamodb", missingSignals: [], notes: [] },
+});
+
+const baseReview = (): HumanReviewMetric => ({
+  gateTicketId: "TEAM-9",
+  reviewer: "human:alice@example.com",
+  gateName: "Merge Approval",
+  requestedAt: "2026-09-09T06:30:00Z",
+  resolvedAt: "2026-09-09T16:22:00Z",
+  waitMs: 35_520_000,
+  outcome: "approved",
+  cycle: 1,
+});
+
+describe("TEAM-4453 D3 — the business-hours wait split stays additive", () => {
+  it("HumanReviewMetric compiles and reads correctly WITH the split present", () => {
+    const review: HumanReviewMetric = { ...baseReview(), inHoursMs: 1_320_000, outsideHoursMs: 34_200_000 };
+    expect(review.inHoursMs! + review.outsideHoursMs!).toBe(review.waitMs);
+  });
+
+  it("HumanReviewMetric compiles and reads correctly WITHOUT the split (legacy file)", () => {
+    const review: HumanReviewMetric = baseReview();
+    expect(review.inHoursMs).toBeUndefined();
+    expect(review.outsideHoursMs).toBeUndefined();
+  });
+
+  it("WorkflowMetrics compiles and reads correctly WITH the run-level totals present", () => {
+    const metrics: WorkflowMetrics = {
+      ...baseMetrics(),
+      humanReviews: [{ ...baseReview(), inHoursMs: 1_320_000, outsideHoursMs: 34_200_000 }],
+      humanWaitTotalMs: 35_520_000,
+      humanWaitInHoursMs: 1_320_000,
+      humanWaitOutsideHoursMs: 34_200_000,
+    };
+    expect(metrics.humanWaitInHoursMs! + metrics.humanWaitOutsideHoursMs!).toBe(metrics.humanWaitTotalMs);
+  });
+
+  it("WorkflowMetrics compiles and reads correctly WITHOUT the run-level totals (legacy file)", () => {
+    const metrics: WorkflowMetrics = { ...baseMetrics(), humanReviews: [baseReview()], humanWaitTotalMs: 35_520_000 };
+    expect(metrics.humanWaitInHoursMs).toBeUndefined();
+    expect(metrics.humanWaitOutsideHoursMs).toBeUndefined();
   });
 });
