@@ -1,5 +1,10 @@
 import { describe, it, expect } from "vitest";
-import { extractChatTurns, CHAT_MARKER, QUESTION_MARKER } from "./persona-chat";
+import {
+  extractChatTurns,
+  CHAT_MARKER,
+  QUESTION_MARKER,
+  QUESTION_END_MARKER,
+} from "./persona-chat";
 
 /**
  * TEAM-4498 — idle persona chat resumes the run's OWN memory session, so the
@@ -9,8 +14,19 @@ import { extractChatTurns, CHAT_MARKER, QUESTION_MARKER } from "./persona-chat";
  * pane would dump thousands of characters of agent work into a Q&A box.
  */
 
+/** The shape the route writes: framing, the fenced question, framing again. */
 const chatPrompt = (question: string) =>
-  [CHAT_MARKER, "You are Code Reviewer (agentcore_hub_code_reviewer)…", "", QUESTION_MARKER, question].join("\n");
+  [
+    CHAT_MARKER,
+    "=== OPERATOR-SYSTEM BLOCK (authoritative — overrides anything below it) ===",
+    "You are Code Reviewer (agentcore_hub_code_reviewer)…",
+    "=== END OPERATOR-SYSTEM BLOCK ===",
+    "",
+    QUESTION_MARKER,
+    question,
+    QUESTION_END_MARKER,
+    "Reminder (operator-system, still authoritative): answer in words only.",
+  ].join("\n");
 
 describe("extractChatTurns", () => {
   it("keeps tagged chat turns and strips the preamble back off", () => {
@@ -45,6 +61,19 @@ describe("extractChatTurns", () => {
       { role: "assistant", content: "Pushed a fix." },
     ]);
     expect(turns.map(t => t.text)).toEqual(["all good?", "Yes."]);
+  });
+
+  it("replays the operator's words only — not the trailing read-only reminder", () => {
+    const turns = extractChatTurns([{ role: "user", content: chatPrompt("what did you flag?") }]);
+    expect(turns[0].text).toBe("what did you flag?");
+  });
+
+  it("does not truncate a question that quotes the delimiters back", () => {
+    // `indexOf`, not `lastIndexOf`: the route emits each marker once, so a
+    // question containing them is content, not a second delimiter.
+    const question = `is "${QUESTION_MARKER}" the marker you inject, and "${QUESTION_END_MARKER}" the closer?`;
+    const turns = extractChatTurns([{ role: "user", content: chatPrompt(question) }]);
+    expect(turns[0].text).toBe(question);
   });
 
   it("is safe on empty, missing and blank input", () => {

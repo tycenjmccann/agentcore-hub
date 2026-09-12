@@ -52,6 +52,13 @@ export function AgentIdleChat({ workflowId, agentId, isIdle, isOpen }: AgentIdle
   // Prior chat turns, replayed from persona memory. Entirely best-effort: the
   // composer works whether or not memory answers (the agent may have no memory
   // resource, or never have been dispatched in this run).
+  //
+  // The memory lookup is tried against each id the route hands back. The fleet
+  // shares one memory resource, and core resolves it by finding a runtime named
+  // after the agent — which only exists in 14-runtime mode. `memoryAgentIds`
+  // adds the phase anchor and the single host, so 4- and 1-runtime deployments
+  // replay history too. actorId stays the persona in every attempt, so this only
+  // changes which memory is found, never whose turns come back.
   useEffect(() => {
     if (!isOpen || !workflowId || !agentId) return;
     let cancelled = false;
@@ -61,19 +68,27 @@ export function AgentIdleChat({ workflowId, agentId, isIdle, isOpen }: AgentIdle
           `/api/workflow/${encodeURIComponent(workflowId)}/agent-chat?agentId=${encodeURIComponent(agentId)}`
         );
         if (!meta.ok) return;
-        const { sessionId } = (await meta.json()) as { sessionId?: string | null };
+        const { sessionId, memoryAgentIds } = (await meta.json()) as {
+          sessionId?: string | null;
+          memoryAgentIds?: string[];
+        };
         if (cancelled || !sessionId) return;
-        const params = new URLSearchParams({
-          agent_id: agentId,
-          session_id: sessionId,
-          actor_id: agentId,
-        });
-        const res = await fetch(`/api/agentcore/memory/events?${params}`);
-        if (!res.ok || cancelled) return;
-        const data = (await res.json()) as { messages?: { role?: string; content?: string }[] };
-        const history = extractChatTurns(data.messages);
-        // A reply that arrived while we were fetching wins — never clobber it.
-        if (!cancelled && history.length) setTurns(prev => (prev.length ? prev : history));
+        for (const memoryAgentId of memoryAgentIds?.length ? memoryAgentIds : [agentId]) {
+          if (cancelled) return;
+          const params = new URLSearchParams({
+            agent_id: memoryAgentId,
+            session_id: sessionId,
+            actor_id: agentId,
+          });
+          const res = await fetch(`/api/agentcore/memory/events?${params}`);
+          if (!res.ok || cancelled) continue;
+          const data = (await res.json()) as { messages?: { role?: string; content?: string }[] };
+          const history = extractChatTurns(data.messages);
+          if (!history.length) continue;
+          // A reply that arrived while we were fetching wins — never clobber it.
+          if (!cancelled) setTurns(prev => (prev.length ? prev : history));
+          return;
+        }
       } catch {
         /* no history is a normal state, not an error worth showing */
       }
@@ -184,7 +199,7 @@ export function AgentIdleChat({ workflowId, agentId, isIdle, isOpen }: AgentIdle
           placeholder={
             isIdle && !serverBusy
               ? "Ask this agent about its work…"
-              : "Chat is available when the agent is idle."
+              : "Chat available when the agent is idle."
           }
           maxLength={4000}
           className="flex-1 bg-transparent text-sm outline-none px-2 py-1.5 rounded border disabled:opacity-50"
