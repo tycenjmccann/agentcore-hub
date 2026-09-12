@@ -142,7 +142,7 @@ const CI_FIELD_MAX_LEN = 128;
 const SHIP_OUTCOMES = ["shipped", "deploy-blocked", "static-ci-only", "handoff"];
 const BLOCK_REASON_MAX_LEN = 500;
 
-async function reportCompletion({ ticket_id, summary, artifacts = "", branch, commit_sha, pr_url, workflow_id, agent_id, evidence_kind, evidence_keys, ci_status, ci_build_id, ci_head_sha, merge_commit, outcome, block_reason }) {
+async function reportCompletion({ ticket_id, summary, artifacts = "", branch, commit_sha, pr_url, workflow_id, agent_id, evidence_kind, evidence_keys, ci_status, ci_build_id, ci_head_sha, merge_commit, approved_head_sha, outcome, block_reason }) {
   const key = `completions/${ticket_id}.json`;
   const report = {
     ticket_id,
@@ -180,6 +180,16 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   const mergeCommit = typeof merge_commit === "string" ? merge_commit.trim() : "";
   if (mergeCommit && mergeCommit.length <= CI_FIELD_MAX_LEN) report.merge_commit = mergeCommit;
   else if (mergeCommit) console.warn(`[report_completion] dropping oversized merge_commit (${mergeCommit.length} chars)`);
+  // TEAM-4525: `approved_head_sha` = the PR head SHA a human approved at the
+  // Merge Approval gate, recorded so a ship run's single human approval is
+  // auditable. Same additive drop-rather-than-store rule as merge_commit, plus a
+  // shape check — only a full 40-hex git SHA is stored, lowercased.
+  const approvedHeadSha = typeof approved_head_sha === "string" ? approved_head_sha.trim() : "";
+  if (approvedHeadSha && approvedHeadSha.length <= CI_FIELD_MAX_LEN && /^[0-9a-f]{40}$/i.test(approvedHeadSha)) {
+    report.approved_head_sha = approvedHeadSha.toLowerCase();
+  } else if (approvedHeadSha) {
+    console.warn(`[report_completion] dropping malformed approved_head_sha (${approvedHeadSha.length} chars; expected a 40-hex git SHA)`);
+  }
   const shipOutcome = typeof outcome === "string" ? outcome.trim().toLowerCase() : "";
   if (shipOutcome) {
     if (SHIP_OUTCOMES.includes(shipOutcome)) report.outcome = shipOutcome;
