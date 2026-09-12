@@ -14,8 +14,11 @@
 # --backfill tolerates per-invoke failure: it records every failed workflowId with
 # a reason (CLI error vs the Lambda's own FunctionError), retries throttles with
 # backoff, and always goes on to rebuild the index. The coverage line it prints
-# afterwards is measured from the *rebuilt index* — the cards that actually exist —
-# never from invoke exit codes.
+# afterwards is measured from the *rebuilt index* — the cards that actually exist
+# — never from invoke exit codes, and only when the rebuild invoke itself
+# succeeded: a rebuild that fails (CLI error or FunctionError) prints a WARNING
+# and `coverage: unknown` rather than a percentage measured from the previous,
+# stale index. Neither degradation changes the exit code — the deploy succeeded.
 #
 # Idempotent. Sources deploy/config.sh for account/region/table names — nothing
 # is hardcoded. The EventBridge rule (workflow.complete → this Lambda) is created
@@ -155,12 +158,33 @@ aws s3 cp "$REPO_ROOT/src/config/pricing.json" "s3://$ARTIFACT_BUCKET/config/pri
 echo "==> Sync kpi.json → s3://$ARTIFACT_BUCKET/config/kpi.json"
 aws s3 cp "$REPO_ROOT/src/config/kpi.json" "s3://$ARTIFACT_BUCKET/config/kpi.json" --region "$AWS_REGION" --only-show-errors
 
-invoke() {
-  local payload="$1" out
-  out="$(mktmp out)"
-  aws lambda invoke --function-name "$FN" --region "$AWS_REGION" --cli-read-timeout 620 \
-    --payload "$payload" --cli-binary-format raw-in-base64-out "$out" >/dev/null
-  cat "$out"; echo
+# Rebuild the index + bands + infra, and say whether it actually worked.
+#
+# Same contract as backfill_one: success is the absence of a FunctionError, not
+# the CLI's exit code — `aws lambda invoke` exits 0 on an HTTP 200 whose body
+# carries FunctionError "Unhandled", and `--query FunctionError --output text`
+# prints `None` when the field is absent. A CLI-level failure is captured too
+# (`|| rc=$?`) instead of tripping `set -e`: the deploy itself has already
+# succeeded, so a failed rebuild degrades the coverage report, it does not fail
+# the deploy.
+rebuild_index() {
+  local out err rc=0 fnerr
+  out="$(mktmp rebuild-out)"
+  err="$(mktmp rebuild-err)"
+  fnerr="$(aws lambda invoke --function-name "$FN" --region "$AWS_REGION" --cli-read-timeout 620 \
+    --payload '{"rebuildIndex":true,"refreshInfra":true}' --cli-binary-format raw-in-base64-out \
+    --query FunctionError --output text "$out" 2>"$err")" || rc=$?
+  if (( rc != 0 )); then
+    REBUILD_OK=0
+    REBUILD_ERR="cli-exit-${rc} $(head -c 200 "$err" 2>/dev/null | tr '\n\t' '  ')"
+  elif [[ -n "$fnerr" && "$fnerr" != "None" ]]; then
+    REBUILD_OK=0
+    REBUILD_ERR="FunctionError:${fnerr} $(head -c 200 "$out" 2>/dev/null | tr '\n\t' '  ')"
+  else
+    cat "$out"; echo
+  fi
+  rm -f "$out" "$err"
+  return 0
 }
 
 # One backfill invoke. Writes its verdict to a file under $RESULT_DIR (one file per
@@ -206,6 +230,10 @@ backfill_one() {
 CANDIDATE_COUNT=0
 FAIL_COUNT=0
 RESULT_DIR=""
+# Set here (not just inside rebuild_index) so `set -u` cannot trip on the
+# coverage block's check when --rebuild-index was never requested.
+REBUILD_OK=1
+REBUILD_ERR=""
 cleanup_results() { [[ -n "$RESULT_DIR" && "$FAIL_COUNT" -eq 0 ]] && rm -rf "$RESULT_DIR"; return 0; }
 trap cleanup_results EXIT
 
@@ -256,10 +284,18 @@ fi
 
 if (( DO_REBUILD )); then
   echo "==> Rebuild index + bands + infra"
-  invoke '{"rebuildIndex":true,"refreshInfra":true}'
+  rebuild_index
+  if (( REBUILD_OK == 0 )); then
+    printf 'WARNING: rebuild failed: %s\n' "$REBUILD_ERR"
+    printf '%s\n' "         the deploy itself succeeded; performance/index.json still holds the previous build"
+  fi
 fi
 
-if (( DO_BACKFILL )); then
+if (( DO_BACKFILL )) && (( REBUILD_OK == 0 )); then
+  # A percentage read out of an index the rebuild did not write would describe
+  # the PREVIOUS index — worse than no number at all (D-2).
+  echo "coverage: unknown (index not rebuilt)"
+elif (( DO_BACKFILL )); then
   # Coverage is measured from the rebuilt index, i.e. from cards that provably
   # exist — not from invoke exit codes. rebuildIndex only admits cards whose
   # reportVersion === REPORT_VERSION (index.mjs), so every row in the index is a
