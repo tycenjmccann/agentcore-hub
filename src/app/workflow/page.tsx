@@ -48,16 +48,16 @@ type GradeFilter = "all" | "ab" | "c" | "df" | "none";
 
 const SORT_LABEL: Record<SortKey, string> = {
   newest: "Newest",
-  cost: "Most expensive",
-  time: "Slowest",
-  quality: "Best quality",
+  cost: "Cost",
+  time: "Time",
+  quality: "Quality",
 };
 
 const GRADE_LABEL: Record<GradeFilter, string> = {
-  all: "All grades",
-  ab: "A / B",
+  all: "All",
+  ab: "A–B",
   c: "C",
-  df: "D / F",
+  df: "D–F",
   none: "No score",
 };
 
@@ -656,7 +656,7 @@ export default function WorkflowPage() {
                     )}
                   </p>
                   <div className={`px-2 pb-1.5 flex gap-1.5 ${historyWidth < 260 ? "flex-col" : "flex-row"}`}>
-                    <label htmlFor="wf-sort" className="sr-only">Sort completed runs</label>
+                    <label htmlFor="wf-sort" className="sr-only">Sort</label>
                     <select
                       id="wf-sort"
                       data-testid="wf-sort"
@@ -668,7 +668,7 @@ export default function WorkflowPage() {
                         <option key={k} value={k}>{SORT_LABEL[k]}</option>
                       ))}
                     </select>
-                    <label htmlFor="wf-grade" className="sr-only">Filter completed runs by grade</label>
+                    <label htmlFor="wf-grade" className="sr-only">Grade</label>
                     <select
                       id="wf-grade"
                       data-testid="wf-grade"
