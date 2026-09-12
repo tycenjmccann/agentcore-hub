@@ -164,9 +164,10 @@ fi
 # ─── 4. Lambda function ───────────────────────────────────────────────────────
 # Env: the microVM runtime for legacy rows + both tables. Sweep knobs
 # (SWEEP_GRACE_CP_S / SWEEP_GRACE_EFS_S / SWEEP_IDLE_CP_S / SWEEP_MAX_CP /
-# SWEEP_MAX_PURGE) pass through only when set in the caller's env.
+# SWEEP_MAX_PURGE / SWEEP_DEADLINE_MARGIN_MS) pass through only when set in the
+# caller's env.
 ENV_VARS="CODING_AGENT_RUNTIME_ARN=$CODING_AGENT_RUNTIME_ARN,CLOUD_CODE_TABLE=$CLOUD_CODE_TABLE,WORKFLOWS_TABLE=$WORKFLOWS_TABLE"
-for knob in SWEEP_GRACE_CP_S SWEEP_GRACE_EFS_S SWEEP_IDLE_CP_S SWEEP_MISSING_WORKFLOW_S SWEEP_MAX_CP SWEEP_MAX_PURGE; do
+for knob in SWEEP_GRACE_CP_S SWEEP_GRACE_EFS_S SWEEP_IDLE_CP_S SWEEP_MISSING_WORKFLOW_S SWEEP_MAX_CP SWEEP_MAX_PURGE SWEEP_DEADLINE_MARGIN_MS; do
   if [ -n "${!knob:-}" ]; then ENV_VARS+=",${knob}=${!knob}"; fi
 done
 ZIP="$(mktemp -d)/reaper.zip"
@@ -178,7 +179,7 @@ if aws lambda get-function --function-name "$FN_NAME" --region "$AWS_REGION" >/d
   aws lambda wait function-updated --function-name "$FN_NAME" --region "$AWS_REGION"
   aws lambda update-function-configuration --function-name "$FN_NAME" --region "$AWS_REGION" \
     --environment "Variables={$ENV_VARS}" \
-    --timeout 300 ${LAYER_ARG[@]+"${LAYER_ARG[@]}"} --output text >/dev/null
+    --timeout 900 ${LAYER_ARG[@]+"${LAYER_ARG[@]}"} --output text >/dev/null
   aws lambda wait function-updated --function-name "$FN_NAME" --region "$AWS_REGION"
 else
   echo "  [create] Lambda $FN_NAME"
@@ -186,7 +187,7 @@ else
   for attempt in 1 2 3 4 5; do
     if aws lambda create-function --function-name "$FN_NAME" --region "$AWS_REGION" \
         --runtime python3.12 --handler handler.handler --role "$ROLE_ARN" \
-        --zip-file "fileb://$ZIP" --timeout 300 --memory-size 256 \
+        --zip-file "fileb://$ZIP" --timeout 900 --memory-size 256 \
         --environment "Variables={$ENV_VARS}" \
         ${LAYER_ARG[@]+"${LAYER_ARG[@]}"} \
         --output text >/dev/null 2>&1; then
