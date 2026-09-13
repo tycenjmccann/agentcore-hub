@@ -58,9 +58,12 @@ phases:
       # ./deploy/pipeline/deploy.sh yet. Refusing it blocked three executions that
       # had ALREADY passed the human Approve_deploy gate. An unwired stack cannot
       # have skipped that gate either -- the SKIP condition reads the SAME
-      # variable through the SAME namespace -- so empty proceeds, but ONLY when no
-      # ship-approval record verifies for this commit (a record that verifies is
-      # exactly what a real SKIP requires, so it stays a refusal).
+      # variable through the SAME namespace -- so empty proceeds, but ONLY on a
+      # POSITIVE not-found: S3 must itself report no ship-approval record object
+      # for this commit. A record that is present refuses (that is what a real SKIP
+      # requires), and so does any read that cannot be classified -- AccessDenied,
+      # a throttle, a timeout, no credentials. A transient S3 error must never read
+      # as "no record".
       - |
         bash deploy/pipeline/preapproved-check.sh gate "${DEPLOY_PREAPPROVED:-}" "$(cat pipeline-out/git-sha-full.txt 2>/dev/null || true)" \
           || { echo "TEAM-4525 pre-deploy approval check REFUSED - nothing deployed" >&2; exit 1; }

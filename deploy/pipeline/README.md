@@ -73,10 +73,15 @@ source, so they are live on the next run; the Build action's
 `variablesNamespace`, the Approval stage's `beforeEntry` rule and the Deploy
 actions' `DEPLOY_PREAPPROVED` entries only exist once someone runs
 `./deploy/pipeline/deploy.sh`. Between the two the variable arrives **empty**,
-which `gate` treats as "not wired, so the human gate necessarily fired" and
-allows — unless a ship-approval record verifies for the deployed commit, or the
-record cannot be looked up at all, both of which refuse. Until the handoff runs
-every deploy takes the human gate; nothing is ever skipped without one.
+which `gate` treats as "not wired, so the human gate necessarily fired" — but only
+on a **positive not-found**: S3 must itself report the record object absent (404 /
+`NoSuchKey`) for a 40-hex commit. A record object that is present refuses, and so
+does any read it cannot classify (AccessDenied, 403, throttle, timeout, no
+credentials, no `aws`, no `ARTIFACT_BUCKET`). That is why the empty path uses
+`record_absent` and not `decide` — `decide` collapses every failure to `0` so it
+can never fail the Build, which would have made a transient S3 error read as "no
+record". Until the handoff runs every deploy takes the human gate; nothing is ever
+skipped without one.
 
 To tell what happened on a given run: `Pipeline___get_state` reports
 `approvalSkipped`, and in the console (or `get-pipeline-execution`) the Approval

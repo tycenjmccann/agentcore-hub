@@ -51,6 +51,12 @@ OTHER_SHA = "c" * 40
 # from a local directory, and records every key it was asked for. Anything else
 # is a hard error, so a future rewrite that reaches for a different AWS call
 # cannot quietly pass these tests.
+#
+# TEAM-4527 review P0: a missing key now emits the REAL aws CLI 404 text, and
+# STUB_S3_ERROR / STUB_S3_EXIT inject any other failure (AccessDenied, SlowDown,
+# a timeout). The distinction matters because the real CLI reports 404 and
+# AccessDenied with the SAME exit status, so only the message separates "the
+# object is not there" from "we were not allowed to look".
 AWS_STUB = '''#!/usr/bin/env python3
 import os, sys
 
@@ -72,12 +78,51 @@ if bucket != os.environ["STUB_S3_BUCKET"]:
     sys.stderr.write("stub aws: wrong bucket %r\\n" % (bucket,))
     sys.exit(1)
 
+# Injected transport/permission failure — takes precedence over the store, since
+# a real AccessDenied is returned whether or not the object exists.
+if "STUB_S3_ERROR" in os.environ:
+    injected = os.environ["STUB_S3_ERROR"]
+    if injected:
+        sys.stderr.write(injected + "\\n")
+    sys.exit(int(os.environ.get("STUB_S3_EXIT", "1")))
+
 path = os.path.join(root, key.replace("/", "__"))
 if not os.path.exists(path):
-    sys.stderr.write("stub aws: NoSuchKey %s\\n" % key)
+    # Verbatim shape of a real `aws s3 cp` miss.
+    sys.stderr.write(
+        'fatal error: An error occurred (404) when calling the HeadObject '
+        'operation: Key "%s" does not exist\\n' % key
+    )
     sys.exit(1)
 sys.stdout.write(open(path).read())
 '''
+
+# Failure modes that must NEVER read as "no record exists". Each is (stderr, exit)
+# copied from the shapes the real CLI emits.
+INDETERMINATE_FAILURES = {
+    "access-denied": (
+        "fatal error: An error occurred (AccessDenied) when calling the "
+        "HeadObject operation: Forbidden",
+        1,
+    ),
+    "forbidden-403": (
+        "fatal error: An error occurred (403) when calling the HeadObject "
+        "operation: Forbidden",
+        1,
+    ),
+    "throttled": (
+        "An error occurred (SlowDown) when calling the GetObject operation: "
+        "Please reduce your request rate",
+        1,
+    ),
+    "timeout": (
+        "Connect timeout on endpoint URL: "
+        "https://s3.us-east-1.amazonaws.com/test-artifact-bucket",
+        255,
+    ),
+    "no-credentials": ("Unable to locate credentials", 253),
+    "cli-died": ("", 254),
+}
 
 
 @pytest.fixture
@@ -126,7 +171,8 @@ def s3(tmp_path):
     return Fixture()
 
 
-def run(args, s3=None, bucket=BUCKET, with_aws=True, region="us-east-1"):
+def run(args, s3=None, bucket=BUCKET, with_aws=True, region="us-east-1", fail=None):
+    """`fail` is a key of INDETERMINATE_FAILURES, or an explicit (stderr, exit)."""
     env = {
         "PATH": (f"{s3.path_prefix}:" if (s3 and with_aws) else "")
         + os.environ.get("PATH", "/usr/bin:/bin"),
@@ -136,6 +182,12 @@ def run(args, s3=None, bucket=BUCKET, with_aws=True, region="us-east-1"):
         env["ARTIFACT_BUCKET"] = bucket
     if region:
         env["AWS_REGION_HUB"] = region
+    if fail is not None:
+        message, code = (
+            INDETERMINATE_FAILURES[fail] if isinstance(fail, str) else fail
+        )
+        env["STUB_S3_ERROR"] = message
+        env["STUB_S3_EXIT"] = str(code)
     if s3 is not None:
         env["STUB_S3_DIR"] = str(s3.dir)
         env["STUB_S3_BUCKET"] = bucket or ""
@@ -345,14 +397,20 @@ def test_gate_empty_proceeds_when_the_record_names_a_different_commit(s3):
     assert proc.returncode == 0, proc.stderr
 
 
-def test_gate_empty_proceeds_on_a_missing_git_sha_full(s3):
-    # (a3) Mirror of test_gate_1_refuses_on_a_missing_git_sha_full, opposite
-    # outcome. An absent/empty git-sha-full.txt is safe here for a structural
-    # reason: buildspec-ci.yml writes that artifact and decides DEPLOY_PREAPPROVED
-    # in the SAME block, so no file => no "1" => no SKIP.
+@pytest.mark.parametrize(
+    "sha", ["", "nogit", MERGE_SHA[:12], MERGE_SHA + "a"],
+    ids=["empty", "nogit", "12-char-tag", "41-chars"],
+)
+def test_gate_empty_refuses_a_sha_it_cannot_look_up(s3, sha):
+    # (a3) TEAM-4527 review P0: a commit we cannot form a lookup for can never
+    # yield a POSITIVE not-found, so it cannot license a deploy. (Before the P0
+    # fix this proceeded, on the structural argument that buildspec-ci.yml writes
+    # git-sha-full.txt in the same block that decides DEPLOY_PREAPPROVED. That
+    # argument is true but it is not evidence, and this path must run on evidence.)
     s3.put_record(MERGE_SHA)
-    proc = run(["gate", "", ""], s3=s3)
-    assert proc.returncode == 0, proc.stderr
+    proc = run(["gate", "", sha], s3=s3)
+    assert proc.returncode == 1, f"{sha!r} must refuse: {proc.stderr!r}"
+    assert "refusing to deploy" in proc.stderr.lower()
 
 
 def test_gate_empty_refuses_when_a_verifying_record_exists(s3):
@@ -365,6 +423,61 @@ def test_gate_empty_refuses_when_a_verifying_record_exists(s3):
     proc = run(["gate", "", MERGE_SHA], s3=s3)
     assert proc.returncode == 1, f"must refuse: {proc.stdout!r} {proc.stderr!r}"
     assert "refusing to deploy" in proc.stderr.lower()
+
+
+# ── review P0: only a POSITIVE not-found licenses the empty path ─────────────
+#
+# `decide` collapses EVERY read failure to "0" so it can never fail the Build.
+# Reusing that here made AccessDenied, a throttle, a timeout and a deleted object
+# indistinguishable from "no record exists" -- the reported unapproved-deploy
+# sequence: Build reads a valid record and exports 1, Approval is SKIPPED, the
+# Deploy env is asymmetrically unwired, the re-read gets AccessDenied, and prod
+# deploys with no human. `record_absent` replaces it and returns three outcomes.
+
+
+@pytest.mark.parametrize("mode", sorted(INDETERMINATE_FAILURES), ids=sorted(INDETERMINATE_FAILURES))
+def test_gate_empty_refuses_on_any_indeterminate_lookup(s3, mode):
+    proc = run(["gate", "", MERGE_SHA], s3=s3, fail=mode)
+    assert proc.returncode == 1, f"{mode} must refuse: {proc.stderr!r}"
+    assert "refusing to deploy" in proc.stderr.lower()
+    assert "INDETERMINATE" in proc.stderr, proc.stderr
+
+
+def test_gate_empty_refuses_on_access_denied_even_with_no_record_stored(s3):
+    # The exact reported repro: nothing in the store, so the pre-fix code took the
+    # "no readable record -> not wired -> proceed" path. AccessDenied means we were
+    # not ALLOWED to look, which is not the same as having looked.
+    proc = run(["gate", "", MERGE_SHA], s3=s3, fail="access-denied")
+    assert proc.returncode == 1, proc.stderr
+    assert "not wired" not in proc.stderr, (
+        "an AccessDenied must never be reported as an unwired stack"
+    )
+
+
+def test_gate_empty_refuses_when_the_object_exists_but_is_malformed(s3):
+    # Presence is enough to refuse -- the empty path never parses the body, so a
+    # corrupt or truncated record cannot be mistaken for an absent one.
+    s3.put_raw(MERGE_SHA, "{not json at all")
+    proc = run(["gate", "", MERGE_SHA], s3=s3)
+    assert proc.returncode == 1, proc.stderr
+    assert "EXISTS" in proc.stderr, proc.stderr
+
+
+def test_gate_empty_proceeds_only_on_a_definite_not_found(s3):
+    # The one licence: the stub emits the real CLI's 404 text for a missing key.
+    proc = run(["gate", "", MERGE_SHA], s3=s3)
+    assert proc.returncode == 0, proc.stderr
+    assert "definite not-found" in proc.stderr, proc.stderr
+    assert "not wired" in proc.stderr, proc.stderr
+
+
+def test_decide_contract_is_unchanged_by_the_p0_fix(s3):
+    # `decide` must still swallow every failure and print 0/1 only -- the Build
+    # stage depends on it never failing. The new strictness is gate-only.
+    for mode in INDETERMINATE_FAILURES:
+        assert decide(MERGE_SHA, s3=s3, fail=mode) == "0", mode
+    s3.put_record(MERGE_SHA)
+    assert decide(MERGE_SHA, s3=s3) == "1"
 
 
 def test_gate_0_and_1_are_unchanged_by_the_empty_branch(s3):
