@@ -250,7 +250,25 @@ commit; it is never approved by software. Four moving parts:
    `DEPLOY_PREAPPROVED` and their buildspecs run `preapproved-check.sh gate
    "$DEPLOY_PREAPPROVED" "$(cat pipeline-out/git-sha-full.txt)"` before touching
    prod: exit 0 for `0` (a human approved) or for `1` when an independent re-read
-   of the record still agrees; anything else refuses.
+   of the record still agrees; garbage refuses.
+
+   **Empty is the unwired stack, not garbage (TEAM-4527).** Steps 2-4 ship with
+   the source and are live on the next run; the `variablesNamespace`, the
+   `beforeEntry` rule and the two env entries only exist after a human runs
+   `./deploy/pipeline/deploy.sh`. Until then the variable arrives empty, and
+   refusing it made `main` undeployable for three executions that had already
+   passed the *human* gate. Empty now proceeds — because the SKIP condition reads
+   the same variable through the same namespace, so an unwired stack cannot have
+   skipped anything — but **only on a positive not-found**. Empty proceeds iff S3
+   itself reports the record object absent (404 / `NoSuchKey`) for a 40-hex commit.
+   An object that is *present* refuses (that is the asymmetric-wiring state where a
+   real SKIP could have fired, and the body is never parsed, so a corrupt record
+   cannot pass as an absent one), and so does every **indeterminate** read —
+   AccessDenied, 403, `SlowDown`, connect timeout, absent credentials, a dead CLI —
+   plus an unset `ARTIFACT_BUCKET`, a missing `aws` and a non-40-hex commit. This
+   is why the empty path uses `record_absent` (three outcomes) rather than `decide`
+   (which collapses every failure to `0` and must keep doing so for the Build).
+   See DL-028 "Rollout contract".
 
 Three checkpoints — decide, skip, re-verify — all fail closed in the same
 direction: a missing, stale, unreadable or misread record can only produce a

@@ -51,6 +51,12 @@ OTHER_SHA = "c" * 40
 # from a local directory, and records every key it was asked for. Anything else
 # is a hard error, so a future rewrite that reaches for a different AWS call
 # cannot quietly pass these tests.
+#
+# TEAM-4527 review P0: a missing key now emits the REAL aws CLI 404 text, and
+# STUB_S3_ERROR / STUB_S3_EXIT inject any other failure (AccessDenied, SlowDown,
+# a timeout). The distinction matters because the real CLI reports 404 and
+# AccessDenied with the SAME exit status, so only the message separates "the
+# object is not there" from "we were not allowed to look".
 AWS_STUB = '''#!/usr/bin/env python3
 import os, sys
 
@@ -72,12 +78,51 @@ if bucket != os.environ["STUB_S3_BUCKET"]:
     sys.stderr.write("stub aws: wrong bucket %r\\n" % (bucket,))
     sys.exit(1)
 
+# Injected transport/permission failure — takes precedence over the store, since
+# a real AccessDenied is returned whether or not the object exists.
+if "STUB_S3_ERROR" in os.environ:
+    injected = os.environ["STUB_S3_ERROR"]
+    if injected:
+        sys.stderr.write(injected + "\\n")
+    sys.exit(int(os.environ.get("STUB_S3_EXIT", "1")))
+
 path = os.path.join(root, key.replace("/", "__"))
 if not os.path.exists(path):
-    sys.stderr.write("stub aws: NoSuchKey %s\\n" % key)
+    # Verbatim shape of a real `aws s3 cp` miss.
+    sys.stderr.write(
+        'fatal error: An error occurred (404) when calling the HeadObject '
+        'operation: Key "%s" does not exist\\n' % key
+    )
     sys.exit(1)
 sys.stdout.write(open(path).read())
 '''
+
+# Failure modes that must NEVER read as "no record exists". Each is (stderr, exit)
+# copied from the shapes the real CLI emits.
+INDETERMINATE_FAILURES = {
+    "access-denied": (
+        "fatal error: An error occurred (AccessDenied) when calling the "
+        "HeadObject operation: Forbidden",
+        1,
+    ),
+    "forbidden-403": (
+        "fatal error: An error occurred (403) when calling the HeadObject "
+        "operation: Forbidden",
+        1,
+    ),
+    "throttled": (
+        "An error occurred (SlowDown) when calling the GetObject operation: "
+        "Please reduce your request rate",
+        1,
+    ),
+    "timeout": (
+        "Connect timeout on endpoint URL: "
+        "https://s3.us-east-1.amazonaws.com/test-artifact-bucket",
+        255,
+    ),
+    "no-credentials": ("Unable to locate credentials", 253),
+    "cli-died": ("", 254),
+}
 
 
 @pytest.fixture
@@ -126,7 +171,8 @@ def s3(tmp_path):
     return Fixture()
 
 
-def run(args, s3=None, bucket=BUCKET, with_aws=True, region="us-east-1"):
+def run(args, s3=None, bucket=BUCKET, with_aws=True, region="us-east-1", fail=None):
+    """`fail` is a key of INDETERMINATE_FAILURES, or an explicit (stderr, exit)."""
     env = {
         "PATH": (f"{s3.path_prefix}:" if (s3 and with_aws) else "")
         + os.environ.get("PATH", "/usr/bin:/bin"),
@@ -136,6 +182,12 @@ def run(args, s3=None, bucket=BUCKET, with_aws=True, region="us-east-1"):
         env["ARTIFACT_BUCKET"] = bucket
     if region:
         env["AWS_REGION_HUB"] = region
+    if fail is not None:
+        message, code = (
+            INDETERMINATE_FAILURES[fail] if isinstance(fail, str) else fail
+        )
+        env["STUB_S3_ERROR"] = message
+        env["STUB_S3_EXIT"] = str(code)
     if s3 is not None:
         env["STUB_S3_DIR"] = str(s3.dir)
         env["STUB_S3_BUCKET"] = bucket or ""
@@ -260,11 +312,15 @@ def test_decide_prints_0_when_the_aws_cli_is_missing(s3):
     assert decide(MERGE_SHA, s3=s3, with_aws=False) == "0"
 
 
+# NOTE (TEAM-4527): "" is deliberately NOT in this list any more. Empty is not
+# garbage -- it is what an UNWIRED stack produces, and it has its own rule with
+# its own section below. Every OTHER non-0/1 value still refuses outright, and
+# " " (a single space) stays here precisely so "empty-ish" cannot be conflated
+# with empty: whitespace is garbage, an unset variable is not.
 @pytest.mark.parametrize(
     "value",
-    ["", " ", "yes", "true", "01", "1 ", "#{BuildVars.DEPLOY_PREAPPROVED}", "2", "-1"],
+    [" ", "yes", "true", "01", "1 ", "#{BuildVars.DEPLOY_PREAPPROVED}", "2", "-1"],
     ids=[
-        "empty",
         "space",
         "yes",
         "true",
@@ -301,6 +357,175 @@ def test_gate_1_refuses_on_a_missing_git_sha_full(s3):
 def test_unknown_subcommand_exits_non_zero(s3):
     proc = run(["approve", MERGE_SHA], s3=s3)
     assert proc.returncode != 0
+
+
+# ── The unwired stack: empty is not garbage (TEAM-4527) ─────────────────────
+#
+# TEAM-4525's repo-side gate ships with the source; the stack-side wiring (Build
+# `variablesNamespace`, the Approval stage's beforeEntry SKIP rule, the Deploy
+# actions' DEPLOY_PREAPPROVED env entry) only exists after a human runs
+# ./deploy/pipeline/deploy.sh. In between, the value arrives EMPTY -- and refusing
+# it blocked three executions (agentcore-hub-deploy 1efb42c4 / 7414a982 /
+# aafcbc66) that had ALREADY passed the human Approve_deploy gate.
+#
+# The rule is sound because the SKIP condition and the Deploy env var read the
+# SAME variable through the SAME namespace. Unwired => the condition could not
+# have read "1" either => the human gate fired. The one state where a SKIP could
+# fire while we see empty (asymmetric wiring) requires a record that VERIFIES,
+# which is what test_gate_empty_refuses_when_a_verifying_record_exists pins. The
+# two halves are load-bearing as a PAIR; either alone is unsound.
+
+
+def test_gate_empty_proceeds_when_no_record_exists(s3):
+    # (a) The incident, exactly: no record for the deployed commit, so `decide`
+    # said 0, so nothing could have skipped the human gate.
+    proc = run(["gate", "", MERGE_SHA], s3=s3)
+    assert proc.returncode == 0, proc.stderr
+    assert "not wired" in proc.stderr, proc.stderr
+    # It must have actually LOOKED -- proceeding without checking would be the
+    # unsound half of the rule.
+    assert any(
+        f"s3://{BUCKET}/{PREFIX}/{MERGE_SHA}.json" in line for line in s3.requests
+    ), s3.requests
+
+
+def test_gate_empty_proceeds_when_the_record_names_a_different_commit(s3):
+    # (a2) A record exists for some OTHER merge, so `decide` prints 0 for this
+    # commit and no SKIP can have fired for it.
+    s3.put_record(OTHER_SHA)
+    proc = run(["gate", "", MERGE_SHA], s3=s3)
+    assert proc.returncode == 0, proc.stderr
+
+
+@pytest.mark.parametrize(
+    "sha", ["", "nogit", MERGE_SHA[:12], MERGE_SHA + "a"],
+    ids=["empty", "nogit", "12-char-tag", "41-chars"],
+)
+def test_gate_empty_refuses_a_sha_it_cannot_look_up(s3, sha):
+    # (a3) TEAM-4527 review P0: a commit we cannot form a lookup for can never
+    # yield a POSITIVE not-found, so it cannot license a deploy. (Before the P0
+    # fix this proceeded, on the structural argument that buildspec-ci.yml writes
+    # git-sha-full.txt in the same block that decides DEPLOY_PREAPPROVED. That
+    # argument is true but it is not evidence, and this path must run on evidence.)
+    s3.put_record(MERGE_SHA)
+    proc = run(["gate", "", sha], s3=s3)
+    assert proc.returncode == 1, f"{sha!r} must refuse: {proc.stderr!r}"
+    assert "refusing to deploy" in proc.stderr.lower()
+
+
+def test_gate_empty_refuses_when_a_verifying_record_exists(s3):
+    # (b) THE load-bearing refusal. Asymmetric wiring -- beforeEntry condition
+    # applied but the Deploy actions' env entry missing -- is the only state in
+    # which a SKIP fires while this action sees empty, and a SKIP requires exactly
+    # this: a record that exists, parses, and whose merge_commit is this commit.
+    # Unprovable that a human approved => refuse.
+    s3.put_record(MERGE_SHA)
+    proc = run(["gate", "", MERGE_SHA], s3=s3)
+    assert proc.returncode == 1, f"must refuse: {proc.stdout!r} {proc.stderr!r}"
+    assert "refusing to deploy" in proc.stderr.lower()
+
+
+# ── review P0: only a POSITIVE not-found licenses the empty path ─────────────
+#
+# `decide` collapses EVERY read failure to "0" so it can never fail the Build.
+# Reusing that here made AccessDenied, a throttle, a timeout and a deleted object
+# indistinguishable from "no record exists" -- the reported unapproved-deploy
+# sequence: Build reads a valid record and exports 1, Approval is SKIPPED, the
+# Deploy env is asymmetrically unwired, the re-read gets AccessDenied, and prod
+# deploys with no human. `record_absent` replaces it and returns three outcomes.
+
+
+@pytest.mark.parametrize("mode", sorted(INDETERMINATE_FAILURES), ids=sorted(INDETERMINATE_FAILURES))
+def test_gate_empty_refuses_on_any_indeterminate_lookup(s3, mode):
+    proc = run(["gate", "", MERGE_SHA], s3=s3, fail=mode)
+    assert proc.returncode == 1, f"{mode} must refuse: {proc.stderr!r}"
+    assert "refusing to deploy" in proc.stderr.lower()
+    assert "INDETERMINATE" in proc.stderr, proc.stderr
+
+
+def test_gate_empty_refuses_on_access_denied_even_with_no_record_stored(s3):
+    # The exact reported repro: nothing in the store, so the pre-fix code took the
+    # "no readable record -> not wired -> proceed" path. AccessDenied means we were
+    # not ALLOWED to look, which is not the same as having looked.
+    proc = run(["gate", "", MERGE_SHA], s3=s3, fail="access-denied")
+    assert proc.returncode == 1, proc.stderr
+    assert "not wired" not in proc.stderr, (
+        "an AccessDenied must never be reported as an unwired stack"
+    )
+
+
+def test_gate_empty_refuses_when_the_object_exists_but_is_malformed(s3):
+    # Presence is enough to refuse -- the empty path never parses the body, so a
+    # corrupt or truncated record cannot be mistaken for an absent one.
+    s3.put_raw(MERGE_SHA, "{not json at all")
+    proc = run(["gate", "", MERGE_SHA], s3=s3)
+    assert proc.returncode == 1, proc.stderr
+    assert "EXISTS" in proc.stderr, proc.stderr
+
+
+def test_gate_empty_proceeds_only_on_a_definite_not_found(s3):
+    # The one licence: the stub emits the real CLI's 404 text for a missing key.
+    proc = run(["gate", "", MERGE_SHA], s3=s3)
+    assert proc.returncode == 0, proc.stderr
+    assert "definite not-found" in proc.stderr, proc.stderr
+    assert "not wired" in proc.stderr, proc.stderr
+
+
+def test_gate_empty_refuses_when_key_is_named_without_does_not_exist(s3):
+    # TEAM-4527 review P3: `Key "` alone is too loose to mean not-found -- an
+    # error message can name a key for an unrelated reason (a permission denial
+    # that happens to echo the key back, for instance). Only paired with "does
+    # not exist" (the real `aws s3 cp` 404 shape) is it a positive absence.
+    proc = run(
+        ["gate", "", MERGE_SHA],
+        s3=s3,
+        fail=(
+            'fatal error: An error occurred (AccessDenied) when calling the '
+            'HeadObject operation: Key "%s" is not accessible' % MERGE_SHA,
+            1,
+        ),
+    )
+    assert proc.returncode == 1, proc.stderr
+    assert "INDETERMINATE" in proc.stderr, proc.stderr
+    assert "not wired" not in proc.stderr, proc.stderr
+
+
+def test_decide_contract_is_unchanged_by_the_p0_fix(s3):
+    # `decide` must still swallow every failure and print 0/1 only -- the Build
+    # stage depends on it never failing. The new strictness is gate-only.
+    for mode in INDETERMINATE_FAILURES:
+        assert decide(MERGE_SHA, s3=s3, fail=mode) == "0", mode
+    s3.put_record(MERGE_SHA)
+    assert decide(MERGE_SHA, s3=s3) == "1"
+
+
+def test_gate_0_and_1_are_unchanged_by_the_empty_branch(s3):
+    # (c) The empty branch must not perturb the two wired paths.
+    proc = run(["gate", "0", MERGE_SHA], s3=s3)
+    assert proc.returncode == 0, proc.stderr
+    assert s3.requests == [], "'0' must still not touch S3 at all"
+
+    proc = run(["gate", "1", MERGE_SHA], s3=s3)
+    assert proc.returncode == 1, "'1' with no record must still refuse"
+
+    s3.put_record(MERGE_SHA)
+    proc = run(["gate", "1", MERGE_SHA], s3=s3)
+    assert proc.returncode == 0, proc.stderr
+
+
+@pytest.mark.parametrize(
+    "kw", [{"bucket": None}, {"with_aws": False}], ids=["no-bucket", "no-aws-cli"]
+)
+def test_gate_empty_refuses_when_it_cannot_look(s3, kw):
+    """"No record" must mean WE LOOKED AND FOUND NONE, never "we could not look".
+
+    `decide` collapses "cannot read" into 0 by design (it must never fail the
+    Build). Without this guard, blanking ARTIFACT_BUCKET on the Deploy project
+    would silently convert the refusal above into a deploy."""
+    s3.put_record(MERGE_SHA)
+    proc = run(["gate", "", MERGE_SHA], s3=s3, **kw)
+    assert proc.returncode == 1, f"{kw} must refuse: {proc.stderr!r}"
+    assert "refusing to deploy" in proc.stderr.lower()
 
 
 # ── The script itself: no approval capability, ever ──────────────────────────

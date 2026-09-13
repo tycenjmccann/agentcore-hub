@@ -29,8 +29,17 @@ phases:
       # Approval stage is conditional now, so this parallel action re-reads the
       # ship-approval record itself rather than trusting the skipped gate. "0" =
       # a human approved; "1" = the gate was skipped and the record must still
-      # match the commit being rolled; anything else refuses before any runtime
-      # image is pushed or swapped.
+      # match the commit being rolled; garbage refuses before any runtime image is
+      # pushed or swapped.
+      #
+      # TEAM-4527: EMPTY means the stack wiring is not applied yet
+      # (./deploy/pipeline/deploy.sh), not that something is wrong. An unwired
+      # stack cannot have skipped the human gate either -- same variable, same
+      # namespace -- so empty proceeds, but ONLY on a POSITIVE not-found from S3.
+      # A record object that is present refuses (the one case where a SKIP could
+      # have fired), and so does any unclassifiable read (AccessDenied, throttle,
+      # timeout): a transient failure must never read as "no record". Full argument
+      # in deploy/pipeline/preapproved-check.sh ("THE EMPTY CASE").
       - |
         bash deploy/pipeline/preapproved-check.sh gate "${DEPLOY_PREAPPROVED:-}" "$(cat pipeline-out/git-sha-full.txt 2>/dev/null || true)" \
           || { echo "TEAM-4525 pre-deploy approval check REFUSED - no runtime image rolled" >&2; exit 1; }

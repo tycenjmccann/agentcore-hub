@@ -43,13 +43,27 @@ phases:
       # Build stage exported DEPLOY_PREAPPROVED=1, meaning the commit being
       # deployed is the recorded merge of a head SHA a human already approved at
       # the Merge Approval gate (deploy/pipeline/preapproved-check.sh). "0" means
-      # the gate ran and a human approved it. This re-reads the ship-approval
-      # record INDEPENDENTLY and refuses on anything else -- empty, an unresolved
-      # "#{BuildVars...}", a value that no longer matches the record. It runs
-      # FIRST, before the account guard and before anything touches prod, so a
-      # misread of the condition's semantics can only cost a needless human gate,
-      # never a silent deploy. No agent can satisfy this by approving anything;
-      # there is no approval capability outside the human Telegram bridge.
+      # the gate ran and a human approved it, and "1" makes this re-read the
+      # ship-approval record INDEPENDENTLY and refuse unless it still agrees. A
+      # value that is neither -- an unresolved "#{BuildVars...}", whitespace,
+      # garbage -- refuses outright. It runs FIRST, before the account guard and
+      # before anything touches prod, so a misread of the condition's semantics
+      # can only cost a needless human gate, never a silent deploy. No agent can
+      # satisfy this by approving anything; there is no approval capability
+      # outside the human Telegram bridge.
+      #
+      # TEAM-4527: EMPTY is NOT garbage -- it means the stack-side wiring (the
+      # Build action's variablesNamespace, the Approval stage's beforeEntry SKIP
+      # rule, this action's own DEPLOY_PREAPPROVED entry) has not been applied by
+      # ./deploy/pipeline/deploy.sh yet. Refusing it blocked three executions that
+      # had ALREADY passed the human Approve_deploy gate. An unwired stack cannot
+      # have skipped that gate either -- the SKIP condition reads the SAME
+      # variable through the SAME namespace -- so empty proceeds, but ONLY on a
+      # POSITIVE not-found: S3 must itself report no ship-approval record object
+      # for this commit. A record that is present refuses (that is what a real SKIP
+      # requires), and so does any read that cannot be classified -- AccessDenied,
+      # a throttle, a timeout, no credentials. A transient S3 error must never read
+      # as "no record".
       - |
         bash deploy/pipeline/preapproved-check.sh gate "${DEPLOY_PREAPPROVED:-}" "$(cat pipeline-out/git-sha-full.txt 2>/dev/null || true)" \
           || { echo "TEAM-4525 pre-deploy approval check REFUSED - nothing deployed" >&2; exit 1; }
