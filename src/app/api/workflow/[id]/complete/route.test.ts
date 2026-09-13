@@ -262,6 +262,25 @@ describe("POST complete — cancel/complete race CAS guard (TEAM-3686 F1)", () =
 describe("POST complete — deliverable-evidence gate (D4a)", () => {
   const doneShipTicket = { ticketId: "T-4", type: "task", status: "done", phase: "ship", assignee: "rm" };
 
+  it("a done HUMAN gate stamped phase:<required> with no agentTask is NOT missing evidence (hub-materialized Merge Approval)", async () => {
+    process.env.COMPLETION_EVIDENCE_REQUIRED = "true";
+    h.state.workflow = {
+      workflowId: "wf_1",
+      phase: "ship",
+      workflowDefId: "software-delivery",
+      agentTasks: { "T-4": { ticketId: "T-4", output: "merged #578" } },
+    };
+    h.state.tickets = [
+      doneShipTicket,
+      { ticketId: "G-1", type: "task", status: "done", phase: "ship", assignee: "human:engineer", labels: ["human-review", "phase:ship"] },
+    ];
+    await load();
+    const res = await post();
+    const body = await res.json();
+    expect(body.error).not.toBe("missing_evidence");
+    expect(res.status).not.toBe(409);
+  });
+
   it("409 missing_evidence when the flag is ON and a done ship ticket has an empty task", async () => {
     process.env.COMPLETION_EVIDENCE_REQUIRED = "true";
     h.state.workflow = {
