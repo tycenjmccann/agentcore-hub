@@ -223,19 +223,20 @@ describe("outcome caps", () => {
       assert.equal(computeKpi(cleanCard(), KPI_CONFIG).score, 100, "same inputs, complete → 100");
       assert.equal(kpi.score, cap);
       assert.deepStrictEqual(kpi.capsApplied, [{ kind: "outcome", outcome, cap }]);
-      // The grade is taken AFTER the cap, so a capped run can never read as an A/B/C.
-      assert.ok(["D", "F"].includes(kpi.grade), `grade ${kpi.grade}`);
+      // The grade is taken AFTER the cap, so a capped flawless run reads as the cap's band.
+      const capGrade = KPI_CONFIG.grades.find((g) => cap >= g.min).grade;
+      assert.equal(kpi.grade, capGrade, `grade ${kpi.grade} != cap band ${capGrade}`);
     });
   }
 
   test("the cap is recorded only when it actually bit", () => {
-    // This card earns exactly 69 on its own (Σ 69.4434 → 69) and the cap is 69,
-    // so nothing was taken away and nothing is claimed.
+    // This card earns exactly 69 on its own (Σ 69.4434 → 69), below the
+    // deploy-blocked cap (89), so nothing is taken away and nothing is claimed.
     const card = clone(caseNamed("worked-example-ci-fail").card);
     card.run.outcome = "deploy-blocked";
     const kpi = computeKpi(card, KPI_CONFIG);
     assert.equal(kpi.score, 69);
-    assert.equal(kpi.score, KPI_CONFIG.outcomeCaps["deploy-blocked"]);
+    assert.ok(kpi.score < KPI_CONFIG.outcomeCaps["deploy-blocked"]);
     assert.deepStrictEqual(kpi.capsApplied, []);
   });
 
@@ -701,10 +702,10 @@ describe("deriveCiVerdict", () => {
     const tasks = [ciTask("TEAM-9", "2026-09-05T10:00:00.000Z")];
     const got = await deriveCiVerdict(workflow, tasks, completions({ "TEAM-9": { ci_status: "github-actions-proxy" } }));
     assert.equal(got.verdict, "pass");
-    // The run is still capped at 69 — by its outcome, not by its CI verdict.
     const kpi = computeKpi(caseNamed("static-ci-only").card, KPI_CONFIG);
     assert.equal(kpi.components.find((c) => c.key === "ci").points, 5);
-    assert.equal(kpi.score, KPI_CONFIG.outcomeCaps["static-ci-only"]);
+    // Bounded by its outcome ceiling, never zeroed by CI.
+    assert.ok(kpi.score <= KPI_CONFIG.outcomeCaps["static-ci-only"]);
   });
 
   test("a workflow row with no agentTasks map at all is survivable", async () => {
