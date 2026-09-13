@@ -304,8 +304,33 @@ async function listReviewers(params = {}) {
 
 // ─── Tool Implementations ────────────────────────────────────────────────────
 
+/**
+ * TEAM-4537: Jira hard-caps issue summary at 255 chars — a long auto-generated
+ * title (self-improvement/feature runs paste the whole request) otherwise 400s
+ * the create/update and the workflow dies at intake (wf_1789190697687_fxrs67).
+ * Trims to a word boundary when that keeps at least 200 chars, so a title with
+ * no whitespace near the cut still clamps instead of growing unbounded. The
+ * full text always survives separately in the description — this only shortens
+ * what Jira shows as the summary.
+ *
+ * Kept local rather than added to fix-contract.mjs — that module is byte-compared
+ * across three copies by CI, and this clamp needs no cross-Lambda contract.
+ */
+export function clampSummary(s) {
+  if (typeof s !== "string" || s.length <= 255) return s;
+  let cut = s.slice(0, 254);
+  // Slicing by UTF-16 code units can land inside a surrogate pair (emoji, astral
+  // CJK) and leave a lone high surrogate — a visibly corrupted summary. Back up
+  // one code unit so the cut always falls on a whole code point.
+  if (/[\uD800-\uDBFF]$/.test(cut)) cut = cut.slice(0, -1);
+  const lastSpace = cut.lastIndexOf(" ");
+  const trimmed = lastSpace >= 200 ? cut.slice(0, lastSpace) : cut;
+  return trimmed.trimEnd() + "…";
+}
+
 async function createTicket(params) {
-  const { summary, description, parent_key, assignee, issue_type, blocked_by, workflow_id, spawned_by, fix_contract, phase, labels } = params;
+  const { summary: rawSummary, description, parent_key, assignee, issue_type, blocked_by, workflow_id, spawned_by, fix_contract, phase, labels } = params;
+  const summary = clampSummary(rawSummary);
 
   // TEAM-4121 FR-8: provenance + contract, validated BEFORE anything is created
   // in Jira so a rejected fix ticket leaves no partially-wired issue behind.
@@ -778,7 +803,7 @@ async function updateTicket(params) {
   const { ticket_id, description, title } = params;
 
   const fields = {};
-  if (title) fields.summary = title;
+  if (title) fields.summary = clampSummary(title);
   if (description) {
     fields.description = {
       type: "doc",

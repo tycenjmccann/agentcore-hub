@@ -31,6 +31,8 @@ const h = vi.hoisted(() => ({
     // TEAM-4130 F1: transition_ticket's status write (`SET #s = :s, …`), so the
     // status a transition actually persists is assertable, not just its envelope.
     statusUpdates: /** @type {any[]} */ ([]),
+    // TEAM-4537: edit_issue's title write (`SET #t = :t, …`).
+    editUpdates: /** @type {any[]} */ ([]),
   },
 }));
 
@@ -75,6 +77,14 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
               h.state.statusUpdates.push(cmd.input);
               return {};
             }
+            const title = cmd.input.ExpressionAttributeValues?.[":t"];
+            if (title !== undefined) {
+              // TEAM-4537: editIssue's title write (ReturnValues: ALL_NEW) — echo
+              // back what was actually written, so the clamp is assertable off
+              // the same response editIssue itself maps into `fields.summary`.
+              h.state.editUpdates.push(cmd.input);
+              return { Attributes: { ticketId: cmd.input.Key.ticketId, title, status: "todo", priority: "Medium", updatedAt: cmd.input.ExpressionAttributeValues[":u"] } };
+            }
             h.state.counter += 1;
             return { Attributes: { nextNum: h.state.counter } };
           }
@@ -93,6 +103,10 @@ async function create(args) {
   return handler({ name: "Tickets___create_ticket", arguments: args });
 }
 
+async function edit(args) {
+  return handler({ name: "Tickets___edit_issue", arguments: args });
+}
+
 beforeEach(async () => {
   h.state.puts.length = 0;
   h.state.counter = 0;
@@ -100,6 +114,7 @@ beforeEach(async () => {
   h.state.labelUpdates.length = 0;
   h.state.condFail.length = 0;
   h.state.statusUpdates.length = 0;
+  h.state.editUpdates.length = 0;
   h.state.items = {};
   delete process.env.ARTIFACT_BUCKET;
   vi.resetModules();
@@ -761,5 +776,86 @@ describe("transition_ticket — blocked_by is additive (DL-024 agent self-park)"
     await transition({ ticket_id: SHIP, transition_id: "blocked" });
 
     expect(h.state.statusUpdates[0].UpdateExpression).not.toContain("#bb");
+  });
+});
+
+// ─── TEAM-4537: summary clamp — parity with the Jira Lambda's 255-char cap ─────
+//
+// DynamoDB itself has no summary-length limit, but create_ticket/edit_issue
+// must return the same `ticket.summary`/`fields.summary` under either backend
+// (the twins doctrine, TEAM-4131 F2) — so a title that would 400 in Jira mode
+// is clamped identically here, not just tolerated.
+//
+// EXPECTED_CLAMPED_LONG_TITLE is pinned to the SAME literal as the Jira
+// Lambda's index.test.mjs for the SAME LONG_TITLE input — a drift in either
+// clampSummary() copy fails a test instead of silently diverging.
+describe("create_ticket / edit_issue — summary clamp (TEAM-4537)", () => {
+  const LONG_TITLE = "A".repeat(200) + " " + "B".repeat(200); // 401 chars, one space near the middle
+  const LONG_DESCRIPTION = "The full text must survive in the description even though the title is long. " + "x".repeat(300);
+  const EXPECTED_CLAMPED_LONG_TITLE = "A".repeat(200) + "…";
+
+  it("create_ticket clamps a >255-char summary to <=255 chars, description kept in full", async () => {
+    await create({ summary: LONG_TITLE, description: LONG_DESCRIPTION });
+
+    expect(h.state.puts.length).toBe(1);
+    const item = h.state.puts[0];
+    expect(item.title.length).toBeLessThanOrEqual(255);
+    expect(item.title).toBe(EXPECTED_CLAMPED_LONG_TITLE);
+    expect(item.description).toBe(LONG_DESCRIPTION);
+  });
+
+  it("create_ticket's response ticket.summary is the same clamped string as the stored title", async () => {
+    const res = await create({ summary: LONG_TITLE });
+    expect(res.ticket.summary).toBe(EXPECTED_CLAMPED_LONG_TITLE);
+  });
+
+  it("edit_issue clamps a >255-char summary the same way", async () => {
+    h.state.items["TEAM-903"] = { ticketId: "TEAM-903", title: "old", status: "todo", priority: "Medium" };
+
+    const res = await edit({ ticket_id: "TEAM-903", summary: LONG_TITLE });
+
+    expect(h.state.editUpdates.length).toBe(1);
+    expect(h.state.editUpdates[0].ExpressionAttributeValues[":t"]).toBe(EXPECTED_CLAMPED_LONG_TITLE);
+    expect(res.fields.summary).toBe(EXPECTED_CLAMPED_LONG_TITLE);
+  });
+});
+
+// ─── TEAM-4537 review P2: surrogate-safe clamp (mirrors the Jira Lambda) ───────
+//
+// The two clampSummary() copies are byte-identical (proven by a diff in CI), so
+// this suite mirrors the Jira Lambda's astral + 255/256 boundary cases here to
+// catch a one-sided edit that only fixes one twin.
+describe("create_ticket / edit_issue — surrogate-safe clamp (TEAM-4537)", () => {
+  const ASTRAL_TITLE = "x" + "😀".repeat(128);                    // 257 code units, cut falls mid-pair
+  const EXPECTED_CLAMPED_ASTRAL = "x" + "😀".repeat(126) + "…";  // 254 code units, whole code points only
+  const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+
+  it("create_ticket clamps an emoji title without splitting a surrogate pair", async () => {
+    const res = await create({ summary: ASTRAL_TITLE, description: "full text" });
+
+    const item = h.state.puts[0];
+    expect(item.title.length).toBeLessThanOrEqual(255);
+    expect(item.title).toBe(EXPECTED_CLAMPED_ASTRAL);
+    expect(LONE_SURROGATE.test(item.title)).toBe(false);
+    expect(res.ticket.summary).toBe(EXPECTED_CLAMPED_ASTRAL);
+  });
+
+  it("edit_issue clamps an emoji title without splitting a surrogate pair", async () => {
+    h.state.items["TEAM-904"] = { ticketId: "TEAM-904", title: "old", status: "todo", priority: "Medium" };
+
+    await edit({ ticket_id: "TEAM-904", summary: ASTRAL_TITLE });
+
+    const written = h.state.editUpdates[0].ExpressionAttributeValues[":t"];
+    expect(written).toBe(EXPECTED_CLAMPED_ASTRAL);
+    expect(LONE_SURROGATE.test(written)).toBe(false);
+  });
+
+  it("a summary of exactly 255 chars is stored untouched; 256 is clamped", async () => {
+    await create({ summary: "A".repeat(255) });
+    expect(h.state.puts[0].title).toBe("A".repeat(255));
+
+    await create({ summary: "A".repeat(256) });
+    expect(h.state.puts[1].title).toBe("A".repeat(254) + "…");
+    expect(h.state.puts[1].title.length).toBe(255);
   });
 });

@@ -14,7 +14,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { adfToText, getIssue, handler } from "./index.mjs";
+import { adfToText, getIssue, handler, clampSummary } from "./index.mjs";
 import { parseFixContractBlock } from "./fix-contract.mjs";
 
 // ─── Finding 1: adfToText ──────────────────────────────────────────────────────
@@ -985,5 +985,159 @@ test("getIssue: requests issuelinks and returns blockedBy from the inward side o
     assert.ok(/fields=[^&]*issuelinks/.test(issueUrl), `issue GET should request issuelinks: ${issueUrl}`);
   } finally {
     globalThis.fetch = originalFetch;
+  }
+});
+
+// ─── TEAM-4537: summary clamp — Jira 400s "Summary can't exceed 255 characters" ─
+//
+// wf_1789190697687_fxrs67 / epic TEAM-4518: a self-improvement run's
+// auto-generated title exceeded 255 chars and the create died with a Jira 400.
+// The bug-intake path in the orchestrator already clamps; this Lambda's general
+// create/update paths did not.
+
+const LONG_TITLE = "A".repeat(200) + " " + "B".repeat(200); // 401 chars, one space near the middle
+const LONG_DESCRIPTION = "The full text must survive in the description even though the title is long. " + "x".repeat(300);
+// TEAM-4537: pinned so the Jira Lambda and the DynamoDB twin
+// (lambda/agentcore-hub-tickets/index.test.mjs) are asserted against the
+// IDENTICAL clamped string for the IDENTICAL input — a drift in either
+// clampSummary() copy fails a test instead of silently diverging.
+const EXPECTED_CLAMPED_LONG_TITLE = "A".repeat(200) + "…";
+
+test("createTicket: a >255-char summary is clamped to <=255 chars on the create POST, description kept in full", async () => {
+  const cap = captureCreate({ createdKey: "TEAM-900" });
+  try {
+    const result = await handler({
+      tool_name: "Tickets___create_ticket",
+      parameters: { summary: LONG_TITLE, description: LONG_DESCRIPTION, workflow_id: "run1" },
+    });
+    assert.equal(result.ticketId, "TEAM-900");
+    assert.ok(cap.fields, "expected a create POST");
+    assert.ok(cap.fields.summary.length <= 255, `summary too long: ${cap.fields.summary.length} chars`);
+    assert.ok(/\S$/.test(cap.fields.summary), "summary must not end in whitespace");
+    assert.equal(cap.fields.summary, EXPECTED_CLAMPED_LONG_TITLE);
+    assert.ok(LONG_TITLE.startsWith(cap.fields.summary.replace(/…$/, "")), "clamped summary must be a prefix of the original title");
+    const description = cap.fields.description.content[0].content[0].text;
+    assert.equal(description, LONG_DESCRIPTION, "description must carry the full text, unclamped");
+  } finally {
+    cap.restore();
+  }
+});
+
+test("createTicket: dedupe on a long summary matches against the CLAMPED stored summary, not the raw one", async () => {
+  const originalFetch = globalThis.fetch;
+  const clamped = clampSummary(LONG_TITLE);
+  let posted = false;
+  globalThis.fetch = async (url, options = {}) => {
+    const method = options.method || "GET";
+    const u = String(url);
+    if (u.includes("/rest/api/3/search/jql")) {
+      // The prior create for this same long title stored the CLAMPED summary.
+      return new Response(JSON.stringify({
+        issues: [{
+          key: "TEAM-901",
+          fields: { summary: clamped, status: { name: "To Do" }, labels: ["wf:run1"], issuetype: { name: "Task" } },
+        }],
+      }), { status: 200 });
+    }
+    if (u.includes("/transitions")) return new Response(JSON.stringify({ transitions: [] }), { status: 200 });
+    if (u.endsWith("/rest/api/3/issue") && method === "POST") {
+      posted = true;
+      return new Response(JSON.stringify({ key: "TEAM-902" }), { status: 201 });
+    }
+    return new Response(JSON.stringify({}), { status: 200 });
+  };
+  try {
+    const result = await handler({
+      tool_name: "Tickets___create_ticket",
+      parameters: { summary: LONG_TITLE, workflow_id: "run1" },
+    });
+    assert.equal(result.deduplicated, true, "the retried create of the same long title must dedupe, not duplicate");
+    assert.equal(result.ticketId, "TEAM-901");
+    assert.ok(!posted, "no new issue should be created on a dedupe hit");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("updateTicket: a >255-char title is clamped on the PUT", async () => {
+  const originalFetch = globalThis.fetch;
+  let putFields = null;
+  globalThis.fetch = async (url, options = {}) => {
+    const method = options.method || "GET";
+    if (method === "PUT") {
+      putFields = JSON.parse(options.body).fields;
+      return new Response("", { status: 204 });
+    }
+    return new Response(JSON.stringify({}), { status: 200 });
+  };
+  try {
+    await handler({
+      tool_name: "Tickets___update_ticket",
+      parameters: { ticket_id: "TEAM-903", title: LONG_TITLE },
+    });
+    assert.ok(putFields, "expected a PUT");
+    assert.ok(putFields.summary.length <= 255, `summary too long: ${putFields.summary.length} chars`);
+    assert.ok(/\S$/.test(putFields.summary), "summary must not end in whitespace");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+// ─── TEAM-4537 review P2: the clamp must never split a surrogate pair ──────────
+//
+// slice() counts UTF-16 code units, so cutting at 254 can land between the high
+// and low surrogate of an astral character (emoji, astral CJK) and ship a lone
+// high surrogate to Jira — the length passes but the visible title is corrupted.
+// Table-driven so every boundary the rule has is pinned in one place.
+
+const ASTRAL_TITLE = "x" + "😀".repeat(128);                    // 257 code units, cut falls mid-pair
+const EXPECTED_CLAMPED_ASTRAL = "x" + "😀".repeat(126) + "…";  // 254 code units, whole code points only
+
+const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+
+const CLAMP_CASES = [
+  { name: "exactly 255 chars passes through untouched", input: "A".repeat(255), expected: "A".repeat(255) },
+  { name: "256 chars is clamped", input: "A".repeat(256), expected: "A".repeat(254) + "…" },
+  { name: "no whitespace anywhere still clamps (hard cut, 200-char floor)", input: "A".repeat(300), expected: "A".repeat(254) + "…" },
+  // Last space sits at index 150, below the 200 floor → hard cut, not a word cut.
+  { name: "last space before the 200 floor falls back to a hard cut", input: "A".repeat(150) + " " + "B".repeat(200), expected: "A".repeat(150) + " " + "B".repeat(103) + "…" },
+  { name: "space at exactly the 200 floor is used as the word boundary", input: "A".repeat(200) + " " + "B".repeat(200), expected: "A".repeat(200) + "…" },
+  { name: "runs of spaces before the cut leave no trailing whitespace", input: "A".repeat(240) + "   " + "B".repeat(100), expected: "A".repeat(240) + "…" },
+  // lastIndexOf(" ") does not match tab/newline, so this is a hard cut; trimEnd
+  // still guarantees no trailing whitespace whichever branch ran.
+  { name: "tab/newline before the cut still yields no trailing whitespace", input: "A".repeat(240) + "\t\n" + "B".repeat(100), expected: "A".repeat(240) + "\t\n" + "B".repeat(12) + "…" },
+  { name: "astral boundary: never emits a lone surrogate", input: ASTRAL_TITLE, expected: EXPECTED_CLAMPED_ASTRAL },
+];
+
+for (const c of CLAMP_CASES) {
+  test(`clampSummary: ${c.name}`, () => {
+    const out = clampSummary(c.input);
+    assert.equal(out, c.expected);
+    assert.ok(out.length <= 255, `must be <=255 code units, got ${out.length}`);
+    assert.ok(!LONE_SURROGATE.test(out), "must not contain an unpaired surrogate");
+    if (out !== c.input) assert.ok(/\S$/.test(out), "must not end in whitespace");
+  });
+}
+
+test("createTicket: an emoji title whose cut lands mid-surrogate-pair is clamped without corruption", async () => {
+  const cap = captureCreate({ createdKey: "TEAM-910" });
+  try {
+    await handler({
+      tool_name: "Tickets___create_ticket",
+      parameters: {
+        summary: ASTRAL_TITLE,
+        description: LONG_DESCRIPTION,
+        assignee: "agentcore_hub_requirements_analyst",
+      },
+    });
+    assert.equal(cap.posts.length, 1);
+    assert.ok(cap.fields.summary.length <= 255);
+    assert.equal(cap.fields.summary, EXPECTED_CLAMPED_ASTRAL);
+    assert.ok(
+      !LONE_SURROGATE.test(cap.fields.summary),
+      `summary sent to Jira must not contain an unpaired surrogate: ${JSON.stringify(cap.fields.summary.slice(-6))}`
+    );
+  } finally {
+    cap.restore();
   }
 });
