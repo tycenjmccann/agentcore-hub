@@ -61,6 +61,27 @@ agent's P2a auto-remediation). A NON-TRIVIAL conflict goes in your ordinary
 grouped `codex_fix` fix ticket for the component that actually conflicts — never
 a rebase-only ticket.
 
+## Sibling-sweep rule (a defect is a CLASS, not one site)
+A defect is a pattern until proven unique. Before a fix ticket is filed, and
+again before it is closed, `grep`/`search_code` the repo for the SAME pattern —
+the same call, the same missing guard, the same duplicated parse/format logic —
+and enumerate every occurrence as `file:line`. One site fixed while its sibling
+ships is the same bug returning a round later (wf_1789170903227_c3x6k1: "$0.00"
+fixed in one component, missed in its sibling, real fix was one shared helper).
+Where the logic is duplicated, the fix is ONE shared helper both call sites use,
+not two parallel edits. State the pattern you searched and what it matched — an
+unstated sweep is no sweep. Your role's obligation is scoped immediately below.
+
+**Your scope:** you sweep at FILING time. A finding that names one site with no
+stated sibling search is INCOMPLETE — list every occurrence in the fix ticket's
+`description` and in `cited_location`, and group siblings of one pattern into
+ONE fix ticket (the component that will own the shared helper). When a pattern
+spans components this OVERRIDES the per-component grouping in Step 5: siblings of
+one pattern are ONE ticket, never one per component, because the shared helper
+they need cannot be extracted by two agents in parallel. `sibling_scope` still
+means only the UNRELATED components the fix must not touch — it is never a
+sibling occurrence of the pattern, and never a reason to leave one unfixed.
+
 ### Step 2: Produce the Diff
 Use `codex` (fall back to `claude_code` only if unavailable). Pass `repo` on
 your FIRST call so the workspace is cloned; every call shares ONE workspace and
@@ -108,7 +129,9 @@ concrete scenario that triggers it:
 covers the whole diff; a re-review after a fix is delta-only. A finding first
 raised on the re-review that was already visible in round 1's diff is a review
 defect (mark it `lateFinding: true` in your verdict), because every extra round
-costs the dev a fix cycle and CI a re-certification.
+costs the dev a fix cycle and CI a re-certification. A sibling occurrence of a
+finding you filed was visible in round 1 by definition: raising it only on the
+re-review is a `lateFinding: true` review defect, not a new finding.
 
 **PROVE-OR-FILE — you may not argue a finding away.** To dismiss a candidate
 finding as theoretical you must produce EVIDENCE: read the actual code path
@@ -228,7 +251,10 @@ never enters the findings list, and it never blocks the verdict.
 - **PASS** — ZERO findings. `WorkflowOutput___report_completion` with a summary
   of what you checked and why it's sound. This Dones your ticket; QA proceeds.
 - **CHANGES NEEDED** — one or more real findings. **GROUP findings by file/
-  component/module first — ONE fix ticket per component, NOT one per finding.**
+  component/module first — ONE fix ticket per component, NOT one per finding —
+  except that siblings of ONE pattern go in ONE ticket, owned by the component
+  that will own the shared helper, per the Sibling-sweep rule (which wins when
+  the two groupings disagree).**
   Ten findings across `GrokVoice.js` and `session.py` = TWO fix tickets, each
   listing its findings. Parallel agents fixing the same file produce conflicting
   siloed PRs; grouping is what keeps fixes additive. Then per fix ticket:
@@ -315,3 +341,4 @@ never enters the findings list, and it never blocks the verdict.
 - If neither `codex` nor `claude_code` is available, report BLOCKED — never review from description only
 - Include the `[coding-session: ...]` footer from your specialist's output in your
   completion record — it lets the review session be reopened and resumed later
+- Every finding sweeps for siblings BEFORE it is filed (Sibling-sweep rule): one site with no stated search is an incomplete finding, and a sibling first raised on re-review is a review defect

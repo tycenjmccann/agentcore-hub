@@ -458,6 +458,7 @@ READ-ONLY adversarial code review. Do NOT edit, commit, push, or create anything
 Repo <owner/repo>. Review PR #<n>: `git fetch origin <base_branch> <feature_branch>` then `git diff origin/<base_branch>...origin/<feature_branch>`. Head SHA under review: <sha>. Open every changed file in full, not just the hunks. Run the test suites relevant to the diff and report the results.
 The approved plan is below. The diff must implement it and nothing else: any changed file outside the plan's scope is a finding unless the PR body's deviations explain it; any acceptance criterion without a test is a finding.
 Severities: P0 data loss / security / crash; P1 wrong behaviour on a realistic path; P2 wrong behaviour on an edge path or a missing test for an acceptance criterion; P3 style / suggestion. Every P0-P2 MUST cite file:line AND a concrete reproduction (input -> wrong output, or a command that fails). If you cannot cite and reproduce it, it is a P3.
+A defect is a class: for every P0-P2, grep the repo for the same pattern and list EVERY occurrence as file:line — a one-site finding with no stated search is incomplete, and a sibling raised only on the re-check is a review defect.
 Output exactly:
 ## Verdict: PASS | CHANGES_NEEDED
 ## Findings (P0-P2)
@@ -478,7 +479,7 @@ Do NOT review this yourself and do NOT edit anything in this turn. Spawn ONE fre
 
 **RESPONSE PROMPT** (worker, same conversation)
 ```
-An independent reviewer returned the findings below for PR #<n>. For EACH P0-P2: FIX it (change + test, commit) or REJECT it with evidence (a test you ran, a file:line showing the reviewer's assumption is wrong, or the plan clause it contradicts). No silent skips. P3 suggestions: apply if trivial and in scope; otherwise post each as an inline PR comment (`gh api repos/<owner>/<repo>/pulls/<n>/comments` with path/line, or `gh pr comment` when not line-anchorable). Push. Update .operator/checkpoint.md.
+An independent reviewer returned the findings below for PR #<n>. For EACH P0-P2: FIX it (change + test, commit) or REJECT it with evidence (a test you ran, a file:line showing the reviewer's assumption is wrong, or the plan clause it contradicts). No silent skips. Before each FIX: grep for other occurrences of the same pattern and fix them all in the same commit — one shared helper where the logic is duplicated. A fix that leaves a known sibling is not FIXED. P3 suggestions: apply if trivial and in scope; otherwise post each as an inline PR comment (`gh api repos/<owner>/<repo>/pulls/<n>/comments` with path/line, or `gh pr comment` when not line-anchorable). Push. Update .operator/checkpoint.md.
 Reply with a table: finding -> FIXED (commit sha) | REJECTED (evidence), then the new head SHA.
 FINDINGS:
 <review.md, this round>
@@ -536,3 +537,6 @@ Reply: each check -> pass/fail (+ run URL), whether you pushed any commit, final
   DEPLOY.md / pipeline, iOS work with no gateway tools. Comment the blocker on
   the epic and `report_completion` with `outcome="deploy-blocked"` (ship) or a
   summary starting with `BLOCKED:` (build). Never fake progress.
+- Findings and fixes are class-wide: the reviewer enumerates every occurrence of
+  a pattern, the worker fixes them all (one shared helper where duplicated) — a
+  fix that leaves a known sibling is not FIXED.

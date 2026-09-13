@@ -56,6 +56,24 @@ non-trivial conflict that survives the `model="opus"` retry → report BLOCKED
 naming the conflicting files; never a silent handoff, and never a fix ticket for
 staleness alone.
 
+## Sibling-sweep rule (a defect is a CLASS, not one site)
+A defect is a pattern until proven unique. Before a fix ticket is filed, and
+again before it is closed, `grep`/`search_code` the repo for the SAME pattern —
+the same call, the same missing guard, the same duplicated parse/format logic —
+and enumerate every occurrence as `file:line`. One site fixed while its sibling
+ships is the same bug returning a round later (wf_1789170903227_c3x6k1: "$0.00"
+fixed in one component, missed in its sibling, real fix was one shared helper).
+Where the logic is duplicated, the fix is ONE shared helper both call sites use,
+not two parallel edits. State the pattern you searched and what it matched — an
+unstated sweep is no sweep. Your role's obligation is scoped immediately below.
+
+**Your scope:** you sweep again at CLOSING time — a fix ticket's site list is a
+floor, never a ceiling. Run the search yourself, fix every occurrence, and where
+the logic is duplicated extract ONE shared helper instead of editing each copy.
+List the pattern, the sites found and the sites fixed in your completion record.
+A known sibling left unfixed = the ticket is NOT Done: fix it, or state on the
+ticket the verified reason it is a genuinely different case.
+
 ## Process
 
 ### Step 1: Gather Context
@@ -186,7 +204,10 @@ A session that dies after the deliverable but before the report leaves the run u
    into base_branch, merge `origin/<default branch>` INTO `base_branch` (see the
    Main-sync rule) and push it. The sync is part of the deliverable, so the
    ship-then-report ordering above is unchanged: sync, then report.
-6. `WorkflowOutput___report_completion` IMMEDIATELY after the sync — branch, commit SHA, PR URL
+6. **Fix tickets: sweep before you report.** Re-run the Sibling-sweep rule's
+   search for the pattern you just fixed; every occurrence is fixed (or refuted on
+   the ticket with evidence) BEFORE `report_completion`.
+7. `WorkflowOutput___report_completion` IMMEDIATELY after the sync — branch, commit SHA, PR URL
 
 ## Rules
 - Before deleting/weakening/proxying ANY existing check: state what it enforces and grep every writer of the replacement value across all tiers (client + backend handlers + schema). A check you can't explain is a check you don't remove.
@@ -202,3 +223,4 @@ A session that dies after the deliverable but before the report leaves the run u
 - Keep changes scoped to what the ticket asks for
 - PRs target base_branch, never the repo default branch (unless base_branch IS the default)
 - Never hand off to review with `base_branch` behind the repo default branch — a branch that only needs a main-merge is your job to sync (Main-sync rule), not a fix ticket
+- A fix is class-wide: sweep for siblings of the pattern, fix them all, prefer one shared helper over duplicated edits (Sibling-sweep rule) — a known sibling left behind means the ticket is not Done
