@@ -166,6 +166,10 @@ function missingEvidenceTickets(
   for (const t of tickets) {
     if (t.type === "epic") continue;
     if (String(t.status || "").toLowerCase() !== "done") continue; // cancelled excluded
+    // Human review gates owe no deliverable (PARITY with completion.mjs
+    // isHumanGateTicket): hub-materialized gates carry `phase:<afterPhase>`, so
+    // phaseOfTicket resolves them into a required phase with no agentTask evidence.
+    if (isHumanGateTicket(t)) continue;
     const phase = phaseOfTicket(t);
     if (!phase || !required.has(phase)) continue;
     const ticketId = String(t.ticketId || "");
@@ -175,6 +179,13 @@ function missingEvidenceTickets(
     if (!hasOutput && !hasArtifact) missing.push({ ticketId, phase });
   }
   return missing;
+}
+
+/** Human review gate (assignee `human:<who>` or `human-review` label) — twin of completion.mjs. */
+function isHumanGateTicket(t: Ticket): boolean {
+  if (typeof t.assignee === "string" && t.assignee.startsWith("human:")) return true;
+  const labels = (t as { labels?: unknown }).labels;
+  return Array.isArray(labels) && labels.some((l) => String(l).trim().toLowerCase() === "human-review");
 }
 
 /**

@@ -15,6 +15,7 @@ import {
   REWORK_FIX_KINDS,
   isAdvisoryTicket,
   advisoryNeverApplies,
+  isHumanGateTicket,
 } from "./completion.mjs";
 
 /**
@@ -331,6 +332,25 @@ describe("missingEvidenceTickets — deliverable evidence (TEAM-3686 F3)", () =>
   it("skips epics", () => {
     const children = [{ ticketId: "E-1", type: "epic", assignee: "dev", status: "done" }];
     expect(missingEvidenceTickets(children, {}, REQUIRED, evOpts)).toEqual([]);
+  });
+
+  it("never flags a done HUMAN gate stamped into a required phase (hub-materialized Merge Approval, wf cnyl86/TEAM-4538)", () => {
+    // intake-materialize.ts labels the gate `phase:<afterPhase>`; approving it is its
+    // whole deliverable and no completions/<gate>.json ever exists for it.
+    const children = [
+      { ticketId: "T-1", assignee: "dev", status: "done", phase: "development" },
+      { ticketId: "G-1", assignee: "human:engineer", status: "done", phase: "development", labels: ["human-review", "phase:development"] },
+    ];
+    const tasks = { "T-1": { ticketId: "T-1", output: "opened PR #578" } };
+    expect(missingEvidenceTickets(children, tasks, REQUIRED, evOpts)).toEqual([]);
+  });
+
+  it("recognises a human gate by the human-review label alone (assignee lost/null)", () => {
+    const children = [{ ticketId: "G-1", assignee: null, status: "done", phase: "development", labels: ["human-review"] }];
+    expect(missingEvidenceTickets(children, {}, REQUIRED, evOpts)).toEqual([]);
+    expect(isHumanGateTicket({ assignee: "human:x" })).toBe(true);
+    expect(isHumanGateTicket({ labels: ["HUMAN-REVIEW"] })).toBe(true);
+    expect(isHumanGateTicket({ assignee: "dev", labels: ["phase:development"] })).toBe(false);
   });
 
   it("an explicit phase stamp wins over the assignee's roster phase", () => {

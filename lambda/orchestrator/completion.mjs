@@ -144,6 +144,16 @@ export const SHIP_PHASES = new Set(["ship"]);
  * A ticket's phase is its explicit `phase` stamp when present, else the
  * assignee's roster phase via opts.getAgentPhase — identical to phaseOf above.
  */
+/**
+ * Is this child a HUMAN review gate rather than agent work? Assignee `human:<who>`
+ * (the Jira/DDB mappers derive it from the `reviewer:<who>` label) or the
+ * `human-review` marker label. Exported for the HTTP route's TS twin parity test.
+ */
+export function isHumanGateTicket(t) {
+  if (typeof t?.assignee === "string" && t.assignee.startsWith("human:")) return true;
+  return Array.isArray(t?.labels) && t.labels.some((l) => String(l).trim().toLowerCase() === "human-review");
+}
+
 export function missingEvidenceTickets(children, agentTasks, requiredPhases, opts = {}) {
   if (!Array.isArray(children) || !Array.isArray(requiredPhases) || requiredPhases.length === 0) {
     return [];
@@ -163,6 +173,13 @@ export function missingEvidenceTickets(children, agentTasks, requiredPhases, opt
   for (const t of children) {
     if (t.type === "epic") continue;
     if (String(t.status || "").toLowerCase() !== "done") continue; // cancelled owes no evidence
+    // A human review gate owes no deliverable: approving it IS its work, and no
+    // agent ever writes completions/<gate>.json for it. Hub-materialized gates
+    // (intake-materialize.ts) carry `phase:<afterPhase>`, so without this skip a
+    // done Merge Approval in a required phase strands every run as
+    // CompletionRejectedMissingEvidence (wf cnyl86/TEAM-4538). Mirrors the
+    // human exclusion isWorkflowComplete and the HTTP complete route already apply.
+    if (isHumanGateTicket(t)) continue;
     const phase = phaseOf(t);
     if (!phase || !required.has(phase)) continue;
     const ticketId = String(t.ticketId || "");
