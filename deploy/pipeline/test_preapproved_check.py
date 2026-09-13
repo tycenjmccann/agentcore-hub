@@ -260,11 +260,15 @@ def test_decide_prints_0_when_the_aws_cli_is_missing(s3):
     assert decide(MERGE_SHA, s3=s3, with_aws=False) == "0"
 
 
+# NOTE (TEAM-4527): "" is deliberately NOT in this list any more. Empty is not
+# garbage -- it is what an UNWIRED stack produces, and it has its own rule with
+# its own section below. Every OTHER non-0/1 value still refuses outright, and
+# " " (a single space) stays here precisely so "empty-ish" cannot be conflated
+# with empty: whitespace is garbage, an unset variable is not.
 @pytest.mark.parametrize(
     "value",
-    ["", " ", "yes", "true", "01", "1 ", "#{BuildVars.DEPLOY_PREAPPROVED}", "2", "-1"],
+    [" ", "yes", "true", "01", "1 ", "#{BuildVars.DEPLOY_PREAPPROVED}", "2", "-1"],
     ids=[
-        "empty",
         "space",
         "yes",
         "true",
@@ -301,6 +305,95 @@ def test_gate_1_refuses_on_a_missing_git_sha_full(s3):
 def test_unknown_subcommand_exits_non_zero(s3):
     proc = run(["approve", MERGE_SHA], s3=s3)
     assert proc.returncode != 0
+
+
+# ── The unwired stack: empty is not garbage (TEAM-4527) ─────────────────────
+#
+# TEAM-4525's repo-side gate ships with the source; the stack-side wiring (Build
+# `variablesNamespace`, the Approval stage's beforeEntry SKIP rule, the Deploy
+# actions' DEPLOY_PREAPPROVED env entry) only exists after a human runs
+# ./deploy/pipeline/deploy.sh. In between, the value arrives EMPTY -- and refusing
+# it blocked three executions (agentcore-hub-deploy 1efb42c4 / 7414a982 /
+# aafcbc66) that had ALREADY passed the human Approve_deploy gate.
+#
+# The rule is sound because the SKIP condition and the Deploy env var read the
+# SAME variable through the SAME namespace. Unwired => the condition could not
+# have read "1" either => the human gate fired. The one state where a SKIP could
+# fire while we see empty (asymmetric wiring) requires a record that VERIFIES,
+# which is what test_gate_empty_refuses_when_a_verifying_record_exists pins. The
+# two halves are load-bearing as a PAIR; either alone is unsound.
+
+
+def test_gate_empty_proceeds_when_no_record_exists(s3):
+    # (a) The incident, exactly: no record for the deployed commit, so `decide`
+    # said 0, so nothing could have skipped the human gate.
+    proc = run(["gate", "", MERGE_SHA], s3=s3)
+    assert proc.returncode == 0, proc.stderr
+    assert "not wired" in proc.stderr, proc.stderr
+    # It must have actually LOOKED -- proceeding without checking would be the
+    # unsound half of the rule.
+    assert any(
+        f"s3://{BUCKET}/{PREFIX}/{MERGE_SHA}.json" in line for line in s3.requests
+    ), s3.requests
+
+
+def test_gate_empty_proceeds_when_the_record_names_a_different_commit(s3):
+    # (a2) A record exists for some OTHER merge, so `decide` prints 0 for this
+    # commit and no SKIP can have fired for it.
+    s3.put_record(OTHER_SHA)
+    proc = run(["gate", "", MERGE_SHA], s3=s3)
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_gate_empty_proceeds_on_a_missing_git_sha_full(s3):
+    # (a3) Mirror of test_gate_1_refuses_on_a_missing_git_sha_full, opposite
+    # outcome. An absent/empty git-sha-full.txt is safe here for a structural
+    # reason: buildspec-ci.yml writes that artifact and decides DEPLOY_PREAPPROVED
+    # in the SAME block, so no file => no "1" => no SKIP.
+    s3.put_record(MERGE_SHA)
+    proc = run(["gate", "", ""], s3=s3)
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_gate_empty_refuses_when_a_verifying_record_exists(s3):
+    # (b) THE load-bearing refusal. Asymmetric wiring -- beforeEntry condition
+    # applied but the Deploy actions' env entry missing -- is the only state in
+    # which a SKIP fires while this action sees empty, and a SKIP requires exactly
+    # this: a record that exists, parses, and whose merge_commit is this commit.
+    # Unprovable that a human approved => refuse.
+    s3.put_record(MERGE_SHA)
+    proc = run(["gate", "", MERGE_SHA], s3=s3)
+    assert proc.returncode == 1, f"must refuse: {proc.stdout!r} {proc.stderr!r}"
+    assert "refusing to deploy" in proc.stderr.lower()
+
+
+def test_gate_0_and_1_are_unchanged_by_the_empty_branch(s3):
+    # (c) The empty branch must not perturb the two wired paths.
+    proc = run(["gate", "0", MERGE_SHA], s3=s3)
+    assert proc.returncode == 0, proc.stderr
+    assert s3.requests == [], "'0' must still not touch S3 at all"
+
+    proc = run(["gate", "1", MERGE_SHA], s3=s3)
+    assert proc.returncode == 1, "'1' with no record must still refuse"
+
+    s3.put_record(MERGE_SHA)
+    proc = run(["gate", "1", MERGE_SHA], s3=s3)
+    assert proc.returncode == 0, proc.stderr
+
+
+@pytest.mark.parametrize(
+    "kw", [{"bucket": None}, {"with_aws": False}], ids=["no-bucket", "no-aws-cli"]
+)
+def test_gate_empty_refuses_when_it_cannot_look(s3, kw):
+    """"No record" must mean WE LOOKED AND FOUND NONE, never "we could not look".
+
+    `decide` collapses "cannot read" into 0 by design (it must never fail the
+    Build). Without this guard, blanking ARTIFACT_BUCKET on the Deploy project
+    would silently convert the refusal above into a deploy."""
+    s3.put_record(MERGE_SHA)
+    proc = run(["gate", "", MERGE_SHA], s3=s3, **kw)
+    assert proc.returncode == 1, f"{kw} must refuse: {proc.stderr!r}"
+    assert "refusing to deploy" in proc.stderr.lower()
 
 
 # ── The script itself: no approval capability, ever ──────────────────────────
