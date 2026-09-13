@@ -64,9 +64,19 @@ with no token no record can be written, so every deploy keeps its human gate.
 stage and prints `1` (exported as `DEPLOY_PREAPPROVED`) only when the record for
 that exact commit exists, parses and matches it — every other outcome prints `0`
 and it never fails the build; `gate <flag> <full-sha>` runs in the Deploy stage and
-re-reads the record itself, refusing to touch prod on anything it cannot verify.
-The stage-entry condition skips the approval only on the literal `1`, so an empty
-or unresolved variable pages the human exactly as before.
+re-reads the record itself, refusing to touch prod on any asserted pre-approval it
+cannot verify. The stage-entry condition skips the approval only on the literal
+`1`, so an empty or unresolved variable pages the human exactly as before.
+
+**Two clocks (TEAM-4527).** The script and both buildspec calls are read from the
+source, so they are live on the next run; the Build action's
+`variablesNamespace`, the Approval stage's `beforeEntry` rule and the Deploy
+actions' `DEPLOY_PREAPPROVED` entries only exist once someone runs
+`./deploy/pipeline/deploy.sh`. Between the two the variable arrives **empty**,
+which `gate` treats as "not wired, so the human gate necessarily fired" and
+allows — unless a ship-approval record verifies for the deployed commit, or the
+record cannot be looked up at all, both of which refuse. Until the handoff runs
+every deploy takes the human gate; nothing is ever skipped without one.
 
 To tell what happened on a given run: `Pipeline___get_state` reports
 `approvalSkipped`, and in the console (or `get-pipeline-execution`) the Approval
@@ -97,7 +107,7 @@ CodeBuild role's S3 grant, do not remove that Deny.
 | `lib/pipeline-stack.ts` | the stack: CodeConnections, CI + Build + Deploy CodeBuild, CodePipeline, SNS approval, scoped IAM, cdk-nag |
 | `buildspec-ci.yml` | PR check AND the deploy Build stage (gates + artifact emission) |
 | `buildspec-deploy.yml` | Deploy stage: the 3-target `DEPLOY.md`, promote-by-digest, smoke checks |
-| `preapproved-check.sh` | `decide` (Build) / `gate` (Deploy) over the ship-approval record — the conditional deploy gate's only reader |
+| `preapproved-check.sh` | `decide` (Build) / `gate` (Deploy) over the ship-approval record — the conditional deploy gate's only reader; `gate` tolerates an empty (unwired) `DEPLOY_PREAPPROVED` |
 | `merge-agents-json.py` | the agents.json merge (extracted from `DEPLOY.md` step 2 — single source) |
 | `ecs-primary-container.py` | builds the ECS roll container JSON, reusing live env, swapping image→digest |
 | `ecs-health.py` | parses `describe-express-gateway-service` → status + ingress URL for the rollout health poll |

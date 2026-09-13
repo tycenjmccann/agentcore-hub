@@ -250,7 +250,20 @@ commit; it is never approved by software. Four moving parts:
    `DEPLOY_PREAPPROVED` and their buildspecs run `preapproved-check.sh gate
    "$DEPLOY_PREAPPROVED" "$(cat pipeline-out/git-sha-full.txt)"` before touching
    prod: exit 0 for `0` (a human approved) or for `1` when an independent re-read
-   of the record still agrees; anything else refuses.
+   of the record still agrees; garbage refuses.
+
+   **Empty is the unwired stack, not garbage (TEAM-4527).** Steps 2-4 ship with
+   the source and are live on the next run; the `variablesNamespace`, the
+   `beforeEntry` rule and the two env entries only exist after a human runs
+   `./deploy/pipeline/deploy.sh`. Until then the variable arrives empty, and
+   refusing it made `main` undeployable for three executions that had already
+   passed the *human* gate. Empty now proceeds — because the SKIP condition reads
+   the same variable through the same namespace, so an unwired stack cannot have
+   skipped anything — **unless** a ship-approval record verifies for the deployed
+   commit, which is the one state (asymmetric wiring) where a real SKIP could have
+   fired, and which therefore still refuses. Empty also refuses when the record
+   cannot be looked up at all (no `ARTIFACT_BUCKET`, no `aws`), so "no record"
+   always means *looked and found none*. See DL-028 "Rollout contract".
 
 Three checkpoints — decide, skip, re-verify — all fail closed in the same
 direction: a missing, stale, unreadable or misread record can only produce a
