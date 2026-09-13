@@ -37,9 +37,40 @@
 #     Exit 0 = safe to touch prod, exit 1 = refuse, and it runs BEFORE the
 #     deploy does anything. "0" means the human gate ran and a human approved.
 #     "1" means the gate was skipped, and this re-reads the record INDEPENDENTLY
-#     and refuses unless it still agrees. Any other value refuses. This third
-#     check is what makes a misread of the condition's semantics harmless: the
-#     worst case is a needless human gate, never a silent deploy.
+#     and refuses unless it still agrees. EMPTY means the stack is not wired (see
+#     below). Any other value refuses. This third check is what makes a misread
+#     of the condition's semantics harmless: the worst case is a needless human
+#     gate, never a silent deploy.
+#
+# THE EMPTY CASE — an UNWIRED stack (TEAM-4527, amends TEAM-4525)
+#
+# The repo-side gate above ships with the source; the stack-side wiring (the
+# Build action's `variablesNamespace: "BuildVars"`, the Approval stage's
+# beforeEntry SKIP rule, and the DEPLOY_PREAPPROVED env entry on both Deploy
+# actions) only exists after a human runs `./deploy/pipeline/deploy.sh`. Between
+# the two, DEPLOY_PREAPPROVED arrives here EMPTY. Treating that as garbage
+# refused three consecutive executions AFTER a human had already approved the
+# Approve_deploy gate, making main undeployable (TEAM-4527).
+#
+# So empty is its own case, and it is sound because the SKIP condition and the
+# Deploy actions' env var read the SAME exported variable through the SAME
+# namespace:
+#
+#   * Symmetric wiring (nothing applied): "#{BuildVars.DEPLOY_PREAPPROVED}" is
+#     unresolvable EVERYWHERE, so the beforeEntry rule cannot have evaluated to
+#     the literal "1". The Approval stage was ENTERED and a human approved.
+#   * Asymmetric wiring (condition present, Deploy env entry missing) is the only
+#     state where a SKIP could fire while we see empty. But a SKIP requires
+#     `decide` to have printed "1", i.e. a record that exists, parses and whose
+#     merge_commit equals this commit — exactly what we REFUSE on below.
+#
+# Hence: empty + no verifying record -> proceed (a human necessarily approved);
+# empty + a verifying record -> REFUSE as ambiguous. The two halves are
+# load-bearing as a PAIR; the first alone would be unsound.
+#
+# And "no record" must mean WE LOOKED AND FOUND NONE, never "we could not look":
+# without that guard, blanking ARTIFACT_BUCKET would turn the refuse case into
+# the proceed case. So the empty path refuses unless the lookup was possible.
 #
 # Deliberately NOT `set -e`: `decide` returns an ANSWER, and a missing record is
 # a normal answer ("0"), not an error. pipefail is on so a failed producer in the
@@ -131,6 +162,32 @@ gate() {
       return 0
       ;;
     1) ;;
+    "")
+      # UNWIRED stack: the variable does not reach this action at all, so the
+      # Approval stage's SKIP condition could not have read it either (same
+      # variable, same namespace) - the human gate necessarily fired. Proceed
+      # only if that story holds, i.e. no verifying record exists. See the
+      # header's "THE EMPTY CASE".
+      #
+      # First: "no record" must mean we LOOKED and found none. If we cannot look
+      # at all, refuse - otherwise blanking ARTIFACT_BUCKET would silently
+      # convert the ambiguous case below into a deploy.
+      if [ -z "${ARTIFACT_BUCKET:-}" ]; then
+        log "FATAL refusing to deploy - DEPLOY_PREAPPROVED is empty AND ARTIFACT_BUCKET is unset, so 'no pre-approval record' cannot be established"
+        return 1
+      fi
+      if ! command -v aws >/dev/null 2>&1; then
+        log "FATAL refusing to deploy - DEPLOY_PREAPPROVED is empty AND the aws CLI is missing, so 'no pre-approval record' cannot be established"
+        return 1
+      fi
+      again="$(decide "$sha")"
+      if [ "$again" = "1" ]; then
+        log "FATAL refusing to deploy - DEPLOY_PREAPPROVED is empty but a ship-approval record for '$sha' DOES verify: the Approval stage may have been skipped, so it is unprovable that a human approved"
+        return 1
+      fi
+      log "DEPLOY_PREAPPROVED not wired (empty); no pre-approval record for $sha; human gate must have fired - proceeding"
+      return 0
+      ;;
     *)
       log "FATAL refusing to deploy - DEPLOY_PREAPPROVED is '$value', expected exactly 0 or 1"
       return 1
