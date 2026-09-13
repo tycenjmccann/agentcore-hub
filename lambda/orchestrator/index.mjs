@@ -43,7 +43,7 @@ import { createDetector } from "./dead-session-detector.mjs";
 import { createCascade } from "./cascade.mjs";
 import { createReconcileSweep } from "./reconcile-sweep.mjs";
 import { createReviewCap, parseDecision } from "./review-cap.mjs";
-import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, SHIP_PHASES, SHIP_BLOCKED_OUTCOMES, TERMINAL_WORKFLOW_PHASES } from "./completion.mjs";
+import { isWorkflowComplete as evaluateWorkflowComplete, evaluateShipVerdict, SHIP_PHASES, SHIP_BLOCKED_OUTCOMES, TERMINAL_WORKFLOW_PHASES } from "./completion.mjs";
 import { isPipelineEnabled } from "./pipeline-enabled.mjs";
 import { CD_REGISTRY_KEY, EMPTY_CD_REGISTRY, parseCdRegistry, isCdRegistered, effectiveWorkflowDef, resolveDelivery, deliveryModeContext } from "./cd-registry.mjs";
 import { pickTicketSession, renderPriorSessionBlock, renderRejectionSessionHint } from "./coding-session-hint.mjs";
@@ -1252,17 +1252,15 @@ async function markTaskComplete(workflow, ticketId, assignee) {
  * record the agent's report_completion already writes to S3
  * (completions/{ticketId}.json — summary/branch/commit_sha/pr_url).
  *
- * The completion evidence gate (TEAM-3690, completion.mjs missingEvidenceTickets)
- * requires agentTasks output/artifactKey, but the only other writer of those
- * fields — the agent_completion webhook's metadata merge — has no live caller,
- * so every gated run stranded non-terminal with CompletionRejectedMissingEvidence
- * (first observed: wf coc7es/TEAM-3611). This closes the loop on the done
- * cascade itself: runs before completeWorkflow's fresh agentTasks re-read, so
- * the gate sees it in the same pass.
+ * Lifts outcome/mergeCommit/pr_url/summary from the record into agentTasks so
+ * the ship-verdict gate (TEAM-3747 D2, completion.mjs evaluateShipVerdict) can
+ * read a run's merge/deploy verdict off the ship ticket. Runs on the done
+ * cascade, before completeWorkflow's fresh agentTasks re-read, so the gate sees
+ * it in the same pass.
  *
  * Fills only when the entry has no evidence yet (a webhook merge that DID land
  * wins), and never throws — a missing record (human gates, legacy tickets)
- * just means the gate won't see harvested evidence for this ticket.
+ * just means the ship gate won't see harvested evidence for this ticket.
  */
 async function harvestCompletionEvidence(workflow, ticketId) {
   if (!ARTIFACT_BUCKET) return;
@@ -3198,38 +3196,6 @@ async function evaluateCompletionSnapshot(epicId, workflow) {
   });
 }
 
-// Exported solely so completion-gates.test.mjs can drive the evidence gate.
-/**
- * TEAM-3985 — one manager_escalation per stranded run: "all tickets Done, but
- * completion is refused for missing evidence". Idempotent on notification id;
- * a human re-driving any ticket (re-Done) re-runs the check and, once the
- * evidence is in, the run completes and the escalation is history.
- */
-async function notifyCompletionBlockedOnce(workflow, offenders) {
-  const id = `notif_completion_evidence_${workflow.id}`;
-  const list = Array.isArray(workflow.humanNotifications) ? workflow.humanNotifications : [];
-  if (list.some((n) => n.id === id && !n.acknowledged)) return false;
-  try {
-    await publishEvent(workflow.epicId, "workflow.completion_blocked", {
-      workflowId: workflow.id, reason: "missing_evidence", offenders,
-    });
-    await store.appendNotification(workflow.id, {
-      id,
-      type: "manager_escalation",
-      title: "Run cannot complete: missing completion evidence",
-      details: `Every ticket is Done but the completion evidence gate refused to close the run — no output/artifact recorded for ${offenders}. The agent probably moved its ticket to Done before report_completion wrote completions/<ticket>.json. If the record exists now, re-Done any ticket to re-check; otherwise add the evidence (or set COMPLETION_EVIDENCE_REQUIRED=off) and re-check.`,
-      reviewer: "completion-gate",
-      timestamp: new Date().toISOString(),
-      acknowledged: false,
-    });
-    console.log(`[orchestrator] ${workflow.id}: completion blocked on evidence — manager_escalation appended (${offenders})`);
-    return true;
-  } catch (err) {
-    console.warn(`[orchestrator] ${workflow.id}: completion-blocked notification failed (non-fatal): ${err?.message || err}`);
-    return false;
-  }
-}
-
 /**
  * PR description for a CD HANDOFF run: the hub opened the PR but will not
  * merge or deploy — say so where the owning team will read it.
@@ -3275,97 +3241,6 @@ export async function completeWorkflow(workflow) {
       console.log(`[orchestrator] ${workflow.id}: completion skipped — run is already ${livePhase}`);
     }
     return;
-  }
-
-  // TEAM-3686 Finding 3: deliverable-evidence gate — same semantics as the HTTP
-  // complete route (TEAM-3619 D4a). Every done ticket in a completion-required
-  // phase must have real work behind it (non-empty agentTasks output or an
-  // artifact). Enforced by default (TEAM-3690): missing evidence → abort
-  // completion. Only the explicit opt-out COMPLETION_EVIDENCE_REQUIRED=off|false|0
-  // falls back to shadow-log-and-continue. Read-only (R2): children via the provider read,
-  // agentTasks via a consistent workflow re-read (the in-memory copy can lag
-  // the webhook's output merge). Mirroring the route, a FAILURE of the check
-  // itself never blocks a legitimate completion — it only tightens when it can
-  // prove a phantom deliverable.
-  try {
-    const wfDef = getEffectiveWorkflowDef(workflow);
-    const requiredPhases = wfDef.completionRequiresAgentPhases || [];
-    if (requiredPhases.length > 0) {
-      const children = await getChildTickets(workflow.epicId);
-      const evidenceOpts = { getAgentPhase: (assignee) => getAgentDef(assignee)?.phase };
-      let freshWf = await store.getWorkflow(workflow.id);
-      let missing = missingEvidenceTickets(
-        children, freshWf?.agentTasks || workflow.agentTasks || {}, requiredPhases, evidenceOpts
-      );
-      if (missing.length > 0) {
-        // TEAM-3985 — the done-cascade harvest is a single point-in-time read,
-        // and agents routinely transition their ticket BEFORE report_completion
-        // lands completions/{ticketId}.json (sffzti/TEAM-3790: Done 19:37Z, record
-        // 19:50Z). The record exists by the time the LAST ticket closes, so
-        // re-harvest the offenders here and re-evaluate before rejecting.
-        for (const m of missing) {
-          try { await harvestCompletionEvidence(freshWf || workflow, m.ticketId); }
-          catch (err) { console.warn(`[orchestrator] evidence re-harvest failed for ${m.ticketId}: ${err?.message || err}`); }
-        }
-        freshWf = await store.getWorkflow(workflow.id);
-        missing = missingEvidenceTickets(
-          children, freshWf?.agentTasks || workflow.agentTasks || {}, requiredPhases, evidenceOpts
-        );
-      }
-      // TEAM-3976 — second pass, still needed after the TEAM-3985 re-harvest above:
-      // the harvest only makes the agentTasks-only gate pass when the record has a
-      // non-empty `summary` (it maps summary→output). A record whose deliverable
-      // proof is pr_url / commit_sha / artifacts with a blank summary still fails
-      // that check. This pass is the twin of the HTTP route's rule (summary OR
-      // pr_url OR commit_sha OR non-empty artifacts counts as evidence; a blank
-      // record does not), consulted for the remaining offenders ONLY — no S3 reads
-      // on the happy path. Read/backfill failures keep the offender, so the
-      // escalation below fires only for what survives BOTH passes.
-      if (missing.length > 0 && ARTIFACT_BUCKET) {
-        const before = missing;
-        missing = await resolveMissingEvidenceFromRecords(missing, freshWf?.agentTasks || workflow.agentTasks || {}, {
-          readCompletionRecord: async (tid) => {
-            try {
-              const res = await s3.send(new GetObjectCommand({
-                Bucket: ARTIFACT_BUCKET,
-                Key: `completions/${tid}.json`,
-              }));
-              return JSON.parse(await res.Body.transformToString());
-            } catch (err) {
-              const code = err?.name || err?.Code || "";
-              if (code === "NoSuchKey" || code === "NotFound" || err?.$metadata?.httpStatusCode === 404) return null;
-              throw err; // logged by the resolver; offender stays
-            }
-          },
-          backfill: (tid, fields) => store.mergeTaskMetadata(workflow.id, tid, fields),
-          log: console.warn,
-        });
-        const stillMissing = new Set(missing.map((m) => m.ticketId));
-        for (const m of before) {
-          if (!stillMissing.has(m.ticketId)) {
-            console.log(`[orchestrator] completion evidence resolved from completions record for ${m.ticketId}`);
-          }
-        }
-      }
-      if (missing.length > 0) {
-        const offenders = missing.map((m) => `${m.ticketId}@${m.phase}`).join(", ");
-        if (COMPLETION_EVIDENCE_REQUIRED) {
-          console.error(
-            `[orchestrator] CompletionRejectedMissingEvidence ${workflow.id}: ${offenders}`
-          );
-          // A silent rejection strands the run with no live task, no gate and no
-          // notification — nothing ever revisits it. Escalate ONCE so a human (or
-          // the WM) sees why "every ticket is Done but the run never finished".
-          await notifyCompletionBlockedOnce(freshWf || workflow, offenders);
-          return;
-        }
-        console.warn(
-          `[orchestrator] ${workflow.id} would be blocked for missing evidence (shadow opt-out): ${offenders}`
-        );
-      }
-    }
-  } catch (err) {
-    console.warn(`[orchestrator] evidence check skipped for ${workflow.id}: ${err?.message || err}`);
   }
 
   // ── TEAM-3760: TWO ship gates run here, in this order, both at full strength.

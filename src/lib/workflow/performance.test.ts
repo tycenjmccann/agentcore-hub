@@ -7,7 +7,7 @@ import {
 } from "./performance";
 // The rubric fixture is OWNED BY THE LAMBDA SIDE (TEAM-4484) precisely so both
 // scorers are pinned by the same bytes. Importing it across the boundary is the
-// house pattern for parity tests — see completion-evidence-parity.test.ts.
+// house pattern for parity tests — see fix-contract-parity.test.ts.
 import KPI_FIXTURE from "../../../lambda/cost-report/fixtures/kpi-cases.json";
 
 // ─── kpi-cases.json fixture typing ────────────────────────────────────────────

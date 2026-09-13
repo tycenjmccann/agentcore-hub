@@ -131,20 +131,6 @@ export function notTerminalPhaseFilter(nameRef = "#p") {
 export const SHIP_PHASES = new Set(["ship"]);
 
 /**
- * TEAM-3686 Finding 3: deliverable-evidence check for the orchestrator's
- * completion path. Hand-port of the HTTP route's missingEvidenceTickets
- * (src/app/api/workflow/[id]/complete/route.ts) — same semantics: for every
- * DONE (not cancelled) child ticket whose phase is one the def requires for
- * completion, assert its agentTasks entry carries proof of work — a non-empty
- * string `output` OR an `artifactKey`. A "done" ticket with an empty task is a
- * phantom deliverable. Returns the offenders as [{ ticketId, phase }] (empty =
- * clean). Tickets whose phase can't be resolved, or whose phase isn't
- * required, are left alone — this only tightens, never invents work.
- *
- * A ticket's phase is its explicit `phase` stamp when present, else the
- * assignee's roster phase via opts.getAgentPhase — identical to phaseOf above.
- */
-/**
  * Is this child a HUMAN review gate rather than agent work? Assignee `human:<who>`
  * (the Jira/DDB mappers derive it from the `reviewer:<who>` label) or the
  * `human-review` marker label. Exported for the HTTP route's TS twin parity test.
@@ -152,148 +138,6 @@ export const SHIP_PHASES = new Set(["ship"]);
 export function isHumanGateTicket(t) {
   if (typeof t?.assignee === "string" && t.assignee.startsWith("human:")) return true;
   return Array.isArray(t?.labels) && t.labels.some((l) => String(l).trim().toLowerCase() === "human-review");
-}
-
-export function missingEvidenceTickets(children, agentTasks, requiredPhases, opts = {}) {
-  if (!Array.isArray(children) || !Array.isArray(requiredPhases) || requiredPhases.length === 0) {
-    return [];
-  }
-  const getAgentPhase = opts.getAgentPhase || (() => undefined);
-  const phaseOf = (t) =>
-    typeof t.phase === "string" && t.phase ? t.phase : getAgentPhase(t.assignee);
-  const required = new Set(requiredPhases);
-  const tasks = agentTasks && typeof agentTasks === "object" ? agentTasks : {};
-  // agentTasks may be keyed by ticketId (orchestrator) or by task id with a
-  // ticketId field (route tolerates both) — build the same secondary index.
-  const byTicketId = new Map();
-  for (const entry of Object.values(tasks)) {
-    if (entry && typeof entry.ticketId === "string") byTicketId.set(entry.ticketId, entry);
-  }
-  const missing = [];
-  for (const t of children) {
-    if (t.type === "epic") continue;
-    if (String(t.status || "").toLowerCase() !== "done") continue; // cancelled owes no evidence
-    // A human review gate owes no deliverable: approving it IS its work, and no
-    // agent ever writes completions/<gate>.json for it. Hub-materialized gates
-    // (intake-materialize.ts) carry `phase:<afterPhase>`, so without this skip a
-    // done Merge Approval in a required phase strands every run as
-    // CompletionRejectedMissingEvidence (wf cnyl86/TEAM-4538). Mirrors the
-    // human exclusion isWorkflowComplete and the HTTP complete route already apply.
-    if (isHumanGateTicket(t)) continue;
-    const phase = phaseOf(t);
-    if (!phase || !required.has(phase)) continue;
-    const ticketId = String(t.ticketId || "");
-    const entry = tasks[ticketId] || byTicketId.get(ticketId);
-    const hasOutput = typeof entry?.output === "string" && entry.output.trim().length > 0;
-    const hasArtifact = typeof entry?.artifactKey === "string" && entry.artifactKey.length > 0;
-    if (!hasOutput && !hasArtifact) missing.push({ ticketId, phase });
-  }
-  return missing;
-}
-
-// ─── TEAM-3976: completions-record fallback for the evidence gate ────────────
-// PARITY with src/lib/workflow/completion-evidence.ts (hand-ported TS twin used
-// by the HTTP complete route). Keep the three functions below in agreement —
-// src/lib/workflow/completion-evidence-parity.test.ts pins them.
-//
-// The gap these close: a ticket transitioned to done OUT-OF-BAND (Workflow
-// Manager mark_done) before the agent's report_completion fired. The done
-// cascade's one-shot harvest found no completions/{tid}.json and left the
-// agentTasks entry evidence-less; the later report_completion wrote the record
-// but its transition_ticket(done) was a no-op (done→done), so no second harvest
-// ever ran. Both gates then refused forever on a ticket whose authoritative
-// record proves the deliverable. These helpers let the gates consult that
-// record for the would-be offenders ONLY (zero S3 reads on the happy path).
-
-const nonEmptyString = (v) => typeof v === "string" && v.trim().length > 0;
-
-/**
- * Does a completions/{ticketId}.json record (written by lambda/workflow-output
- * reportCompletion) prove the ticket produced a deliverable? A blank/empty
- * record is NOT evidence (TEAM-3690 / AC-D4.1).
- */
-export function completionRecordHasEvidence(record) {
-  if (!record || typeof record !== "object" || Array.isArray(record)) return false;
-  if (nonEmptyString(record.summary)) return true;
-  if (nonEmptyString(record.pr_url)) return true;
-  if (nonEmptyString(record.commit_sha)) return true;
-  const artifacts = record.artifacts;
-  if (nonEmptyString(artifacts)) return true;
-  if (Array.isArray(artifacts) && artifacts.some((a) => nonEmptyString(a))) return true;
-  return false;
-}
-
-/**
- * Fields to backfill onto an evidence-less agentTasks entry from a completions
- * record. FILL-ONLY-IF-MISSING: never emits a key the entry already has a
- * non-empty value for. Supplies output/branch/commitSha/prUrl ONLY — never
- * mergeCommit/outcome/blockReason (ship-verdict signals, TEAM-3747 D2 /
- * TEAM-3755 F1). commitSha is NOT a merge signal.
- */
-export function evidenceBackfillFields(record, entry) {
-  const fields = {};
-  if (!record || typeof record !== "object") return fields;
-  const e = entry && typeof entry === "object" ? entry : {};
-  if (!nonEmptyString(e.output) && nonEmptyString(record.summary)) {
-    fields.output = record.summary.trim().slice(0, 10000); // same cap as harvestCompletionEvidence
-  }
-  if (!nonEmptyString(e.branch) && nonEmptyString(record.branch)) fields.branch = record.branch;
-  if (!nonEmptyString(e.commitSha) && nonEmptyString(record.commit_sha)) fields.commitSha = record.commit_sha;
-  if (!nonEmptyString(e.prUrl) && nonEmptyString(record.pr_url)) fields.prUrl = record.pr_url;
-  return fields;
-}
-
-/**
- * Second pass over missingEvidenceTickets() offenders: consult the authoritative
- * completions record for each would-be offender ONLY (zero S3 reads on the happy
- * path). Drops offenders whose record proves evidence and backfills their entry
- * so the run self-heals. Any read/backfill failure leaves the offender IN the
- * list (only tightens when it can prove — never a 500).
- *
- * @param missing     [{ ticketId, phase }] from missingEvidenceTickets
- * @param agentTasks  the same agentTasks map the gate evaluated
- * @param deps        { readCompletionRecord(ticketId) → Promise<object|null>,
- *                      backfill(ticketId, fields) → Promise<void>,
- *                      log?: (msg) => void }
- * @returns the remaining offenders (same shape)
- */
-export async function resolveMissingEvidenceFromRecords(missing, agentTasks, deps = {}) {
-  if (!Array.isArray(missing) || missing.length === 0) return missing;
-  const log = typeof deps.log === "function" ? deps.log : () => {};
-  const tasks = agentTasks && typeof agentTasks === "object" ? agentTasks : {};
-  const byTicketId = new Map();
-  for (const entry of Object.values(tasks)) {
-    if (entry && typeof entry.ticketId === "string") byTicketId.set(entry.ticketId, entry);
-  }
-  const remaining = [];
-  for (const offender of missing) {
-    const ticketId = offender?.ticketId;
-    let record = null;
-    try {
-      record = await deps.readCompletionRecord(ticketId);
-    } catch (err) {
-      log(`[completion] completions record read failed for ${ticketId}: ${err?.message || err}`);
-      remaining.push(offender);
-      continue;
-    }
-    if (!completionRecordHasEvidence(record)) {
-      log(`[completion] completions record for ${ticketId} ${record ? "carries no evidence" : "not found"}`);
-      remaining.push(offender);
-      continue;
-    }
-    const entry = tasks[ticketId] || byTicketId.get(ticketId);
-    const fields = evidenceBackfillFields(record, entry);
-    if (Object.keys(fields).length > 0) {
-      try {
-        await deps.backfill(ticketId, fields);
-      } catch (err) {
-        // Evidence is proven by the record itself; a failed backfill only means
-        // the next gate pass re-reads the record. Never re-block on it.
-        log(`[completion] evidence backfill failed for ${ticketId}: ${err?.message || err}`);
-      }
-    }
-  }
-  return remaining;
 }
 
 // ─── TEAM-4122 FR-7: advisory tickets ────────────────────────────────────────
@@ -420,7 +264,7 @@ export function isWorkflowComplete(children, wfDef, opts = {}) {
  *
  * For a ship-phase ticket, "done + non-empty output" is NOT proof the work
  * shipped — only a merge commit / deploy verdict is. This is the crucial
- * difference from missingEvidenceTickets (which accepts any output/artifact).
+ * difference from a mere output/artifact evidence check.
  * Classifies the entry into one of:
  *   "shipped"          → carries a positive merge/deploy signal: a non-empty
  *                        `mergeCommit`, or an EXPLICIT outcome==="shipped".
@@ -471,8 +315,8 @@ export function shipVerdictOf(entry) {
  *     offenders:   [{ ticketId, phase, verdict }] — ship tickets missing a verdict.
  *   }
  *
- * Mirrors the "only tightens when it can prove" discipline of
- * missingEvidenceTickets: with no done ship agent ticket to inspect it returns
+ * Only tightens when it can prove a phantom: with no done ship agent ticket to
+ * inspect it returns
  * shipped=true (it cannot prove a phantom). Human review-gate tickets in a ship
  * phase owe no merge verdict — only agent tickets are inspected. A ticket's phase
  * is its explicit `phase` stamp when present, else the assignee's roster phase.

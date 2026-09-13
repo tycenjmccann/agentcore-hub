@@ -5,11 +5,12 @@ import { NextRequest } from "next/server";
  * TEAM-4266 — the completion evidence record POST /api/workflow/[id]/tickets/transition
  * writes on an out-of-band approve.
  *
- * The bug: when an agent shipped its deliverable and died before report_completion,
+ * The gap: when an agent shipped its deliverable and died before report_completion,
  * the Workflow Manager's `intervene.py mark-done --evidence "..."` recorded the proof
  * as prose only (a ticket comment + a manager.intervention event). Nothing wrote
- * completions/{ticketId}.json — the record BOTH completion evidence gates require —
- * so the run emitted workflow.completion_blocked reason=missing_evidence forever.
+ * completions/{ticketId}.json — the record the done-cascade harvests into agentTasks
+ * for the ship-verdict gate + the KPI / cost-report readers — so a WM-closed ticket
+ * that had shipped carried no deliverable record at all.
  *
  * This route now persists that evidence as the same record shape
  * lambda/workflow-output reportCompletion writes, create-only (IfNoneMatch "*") so an
@@ -31,8 +32,8 @@ import { NextRequest } from "next/server";
  * call log so relative ordering is assertable) and the two ticket readers.
  * gate-decision is left real — it is pure, and case "escalation gate" pins that the
  * new write did not disturb its DECISION defaulting. completion-evidence is left real
- * too: the route imports the gates' own completionRecordHasEvidence, and "has evidence"
- * must mean the same thing here as it does at the gate.
+ * too: the route imports completionRecordHasEvidence to decide whether a record already
+ * proves a deliverable, so it never clobbers a richer agent record with a thinner one.
  */
 
 const h = vi.hoisted(() => {

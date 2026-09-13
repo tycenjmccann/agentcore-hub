@@ -9,9 +9,10 @@ import {
 import { getWorkflowFromDynamo, getTicketsForWorkflowFromDynamo } from "@/lib/workflow/dynamo-read";
 import { getTicketsForWorkflowFromJira } from "@/lib/workflow/jira-read";
 import { withDefaultDecision } from "@/lib/workflow/gate-decision";
-// TEAM-4282 F3: the SAME predicate both completion gates use to decide whether a
-// completions record proves a deliverable. Imported (not replicated) so a blank
-// record we are allowed to fill is defined identically here and at the gate.
+// The predicate the mark-done path uses to decide whether a completions record
+// already proves a deliverable, so we never clobber a richer agent record with a
+// thinner operator one. Imported (not replicated) so it stays identical to the
+// KPI / cost-report readers of the same records.
 import { completionRecordHasEvidence } from "@/lib/workflow/completion-evidence";
 
 export const dynamic = "force-dynamic";
@@ -20,9 +21,9 @@ const TICKET_PROVIDER = process.env.TICKET_PROVIDER || "dynamodb";
 const REGION = process.env.AWS_REGION || "us-east-1";
 const ARTIFACT_BUCKET = process.env.ARTIFACT_BUCKET || "";
 
-// TEAM-4266: cap the operator's evidence string at the same length
-// evidenceBackfillFields (lambda/orchestrator/completion.mjs) slices a record's
-// summary to, so the record can never be larger than what the gate will read.
+// TEAM-4266: cap the operator's evidence string at the same 10000-char slice
+// harvestCompletionEvidence (lambda/orchestrator/index.mjs) applies to a record's
+// summary, so a mark-done record can never be larger than a harvested one.
 const EVIDENCE_MAX_LEN = 10000;
 
 // TEAM-4282 F1b: ticketId becomes an S3 key segment (completions/{ticketId}.json),
@@ -51,17 +52,15 @@ const VALID_TRANSITIONS: Record<string, string[]> = {
  * record the agent's own report_completion would have written
  * (completions/{ticketId}.json, lambda/workflow-output/index.mjs reportCompletion).
  *
- * The bug this closes: when an agent ships its deliverable and then dies before
+ * The gap this closes: when an agent ships its deliverable and then dies before
  * calling report_completion, the Workflow Manager closes the ticket with
  * `intervene.py mark-done --evidence "..."`. That recorded the proof as prose only
  * (a ticket comment + a manager.intervention event), so nothing ever wrote the
- * record BOTH completion evidence gates require — harvestCompletionEvidence /
- * missingEvidenceTickets in lambda/orchestrator, and the twin in
- * POST /api/workflow/[id]/complete. The run then emitted
- * workflow.completion_blocked reason=missing_evidence forever and /complete 409'd.
- * Writing the record here makes mark-done a first-class evidence producer with no
- * change to either gate: a non-empty `summary` is all completionRecordHasEvidence
- * needs, and evidenceBackfillFields maps it onto agentTasks[ticketId].output.
+ * completions record the done-cascade harvests into agentTasks — leaving the
+ * ship-verdict gate and the KPI / cost-report readers with no deliverable record
+ * for a ticket that shipped. Writing the record here makes mark-done a first-class
+ * completion producer: harvestCompletionEvidence lifts its summary/branch/commit
+ * onto agentTasks[ticketId] exactly as it does for an agent's own record.
  *
  * FILL-ONLY-IF-MISSING, atomically: IfNoneMatch "*" makes the PUT fail with 412
  * PreconditionFailed when a record already exists, so an agent's authoritative
