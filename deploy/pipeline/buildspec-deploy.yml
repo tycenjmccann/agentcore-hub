@@ -254,13 +254,31 @@ phases:
             if [ "$i" = "60" ]; then echo "ECS did not reach ACTIVE with an endpoint"; exit 1; fi
           done
           case "$URL" in http*) : ;; *) URL="https://$URL" ;; esac
-          echo "service ACTIVE at $URL — checking app health"
-          curl -sf "$URL/api/agentcore/traces/health" >/dev/null || { echo "app health check FAILED"; exit 1; }
+          echo "service ACTIVE at $URL — waiting for the new revision to serve"
+          # ecs-health.py returns ACTIVE the moment the express-gateway rollout is
+          # registered, NOT when the new task is answering at the edge. The root page
+          # is a full SSR render, so a single curl right after ACTIVE routinely races
+          # the warm-up and gets a transient 5xx/timeout. A one-shot check then rolled
+          # back a provably-good image on every release since 2026-09-12 (TEAM-4527):
+          # the deployed 8f09987 image serves href="/pipeline" fine, but the smoke
+          # curl fired before the task was live. Poll until the app actually serves a
+          # 2xx page, capture that body ONCE, then assert on it — so a failure means
+          # the content is really wrong, not that we raced the rollout.
+          ROOT=""
+          for i in $(seq 1 30); do
+            if curl -sf "$URL/api/agentcore/traces/health" >/dev/null 2>&1 \
+               && ROOT="$(curl -sf "$URL/" 2>/dev/null)" && [ -n "$ROOT" ]; then break; fi
+            ROOT=""
+            sleep 10
+            if [ "$i" = "30" ]; then echo "app health check FAILED: no 2xx page within 5m of ACTIVE"; exit 1; fi
+          done
           # The /pipeline tab is baked into the image at build time from the CI
           # project's NEXT_PUBLIC_PIPELINE_ENABLED. This pipeline deploying the
           # app means the module is on, so a tab-less image is a bad build, not
-          # a config choice -> fail the release and roll back.
-          curl -sf "$URL/" | grep -q 'href="/pipeline"' || { echo "nav smoke FAILED: /pipeline tab missing from image (NEXT_PUBLIC_PIPELINE_ENABLED not baked)"; exit 1; }
+          # a config choice -> fail the release and roll back. Asserted only against
+          # the page we provably fetched above, so this fires on a real tab-less
+          # image (e.g. one built before the flag was baked), never on a rollout race.
+          printf '%s' "$ROOT" | grep -q 'href="/pipeline"' || { echo "nav smoke FAILED: /pipeline tab missing from image (NEXT_PUBLIC_PIPELINE_ENABLED not baked)"; exit 1; }
           echo "ECS rollout healthy (nav includes /pipeline)"
         fi
 
