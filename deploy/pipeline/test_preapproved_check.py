@@ -471,6 +471,25 @@ def test_gate_empty_proceeds_only_on_a_definite_not_found(s3):
     assert "not wired" in proc.stderr, proc.stderr
 
 
+def test_gate_empty_refuses_when_key_is_named_without_does_not_exist(s3):
+    # TEAM-4527 review P3: `Key "` alone is too loose to mean not-found -- an
+    # error message can name a key for an unrelated reason (a permission denial
+    # that happens to echo the key back, for instance). Only paired with "does
+    # not exist" (the real `aws s3 cp` 404 shape) is it a positive absence.
+    proc = run(
+        ["gate", "", MERGE_SHA],
+        s3=s3,
+        fail=(
+            'fatal error: An error occurred (AccessDenied) when calling the '
+            'HeadObject operation: Key "%s" is not accessible' % MERGE_SHA,
+            1,
+        ),
+    )
+    assert proc.returncode == 1, proc.stderr
+    assert "INDETERMINATE" in proc.stderr, proc.stderr
+    assert "not wired" not in proc.stderr, proc.stderr
+
+
 def test_decide_contract_is_unchanged_by_the_p0_fix(s3):
     # `decide` must still swallow every failure and print 0/1 only -- the Build
     # stage depends on it never failing. The new strictness is gate-only.

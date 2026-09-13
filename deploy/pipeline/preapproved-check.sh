@@ -142,8 +142,11 @@ record_absent() {
   # Classify the failure. Only an explicit not-found is a positive absence; the
   # aws CLI reports both 404 and AccessDenied with exit 1, so the exit code alone
   # cannot be trusted here and the message is what distinguishes them.
+  # TEAM-4527 review P3: `Key "` alone is too loose a signal on its own (an
+  # error message could name a key for an unrelated reason) - it only means
+  # not-found paired with "does not exist", the real `aws s3 cp` 404 shape.
   case "$err" in
-    *"(404)"*|*NoSuchKey*|*"does not exist"*|*"Not Found"*|*"Key \""*)
+    *"(404)"*|*NoSuchKey*|*"Not Found"*|*'Key "'*'does not exist'*)
       log "S3 reports NO ship-approval record object for $sha (definite not-found)"
       return 0
       ;;
