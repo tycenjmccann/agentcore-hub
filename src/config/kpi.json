@@ -1,7 +1,7 @@
 {
   "kpiVersion": 1,
   "grades": [ {"grade":"A","min":90}, {"grade":"B","min":80}, {"grade":"C","min":70}, {"grade":"D","min":60}, {"grade":"F","min":0} ],
-  "outcomeCaps": { "deploy-blocked": 69, "static-ci-only": 69, "error": 69, "cancelled": 69 },
+  "outcomeCaps": { "deploy-blocked": 89, "static-ci-only": 79, "error": 59, "cancelled": 69 },
   "quality": {
     "minEvidenceWeight": 51,
     "components": [
