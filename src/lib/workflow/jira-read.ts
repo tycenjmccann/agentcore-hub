@@ -133,6 +133,12 @@ function mapIssueToTicket(issue: Record<string, unknown>) {
   const wfLabel = labels.find((l) => l.startsWith("wf:"));
   const workflowId = wfLabel ? wfLabel.replace("wf:", "") : undefined;
 
+  // Jira has no columns: the ticket Lambda stamps `phase:<p>`, `fix:<kind>` and
+  // `origin:<ticket>` as labels (same carriers the orchestrator's
+  // mapJiraIssueToTicket reads). Surface them so the UI can tell a planned
+  // ticket from a fix filed mid-run and place it under the ticket it unblocks.
+  const { phase, spawnedBy, userLabels } = ticketMetaFromLabels(labels);
+
   const issueTypeName = (issuetype?.name as string)?.toLowerCase() || "task";
 
   return {
@@ -147,7 +153,52 @@ function mapIssueToTicket(issue: Record<string, unknown>) {
     type: issueTypeName,
     createdAt: (fields?.created as string) || new Date().toISOString(),
     updatedAt: (fields?.updated as string) || new Date().toISOString(),
+    ...(phase ? { phase } : {}),
+    ...(spawnedBy ? { spawnedBy } : {}),
+    ...(userLabels.length ? { labels: userLabels } : {}),
   };
+}
+
+// Mirror of lambda/orchestrator/fix-contract.mjs KIND_TO_ORIGIN_KEY — which
+// spawnedBy field the `origin:` label fills for each fix kind.
+const KIND_TO_ORIGIN_KEY: Record<string, string> = {
+  review_fix: "gateTicketId",
+  qa_fix: "qaTicketId",
+  codex_fix: "codexTicketId",
+  ship_fix: "shipTicketId",
+  ci_fix: "ciTicketId",
+  sync_fix: "ciTicketId",
+};
+
+const SYSTEM_LABEL_PREFIXES = ["wf:", "agent:", "reviewer:", "fix:", "origin:", "evidence:", "phase:", "reverify:", "contract:"];
+
+/**
+ * Rebuild the structured ticket fields the Jira provider carries as labels.
+ * Exported for tests.
+ */
+export function ticketMetaFromLabels(labels: string[]): {
+  phase?: string;
+  spawnedBy?: { kind: string; [key: string]: string | boolean };
+  userLabels: string[];
+} {
+  const phaseLabel = labels.find((l) => l.startsWith("phase:"));
+  const fixLabel = labels.find((l) => l.startsWith("fix:"));
+  const originLabel = labels.find((l) => l.startsWith("origin:"));
+  const reverifyLabel = labels.find((l) => l.startsWith("reverify:"));
+  const kind = fixLabel ? fixLabel.slice("fix:".length) : "";
+  let spawnedBy: { kind: string; [key: string]: string | boolean } | undefined;
+  if (kind && KIND_TO_ORIGIN_KEY[kind]) {
+    spawnedBy = { kind };
+    if (originLabel) spawnedBy[KIND_TO_ORIGIN_KEY[kind]] = originLabel.slice("origin:".length);
+    if (reverifyLabel) {
+      spawnedBy.reverify = true;
+      spawnedBy.rearmOf = reverifyLabel.slice("reverify:".length);
+    }
+  }
+  const userLabels = labels.filter(
+    (l) => l !== "human-review" && !SYSTEM_LABEL_PREFIXES.some((p) => l.startsWith(p))
+  );
+  return { ...(phaseLabel ? { phase: phaseLabel.slice("phase:".length) } : {}), ...(spawnedBy ? { spawnedBy } : {}), userLabels };
 }
 
 /**
