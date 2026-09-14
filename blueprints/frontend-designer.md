@@ -49,6 +49,9 @@ UPDATED screenshot (same workspace; new keys appear in the new footer).
    `upload_file_to_s3(local_path=..., key="workflows/{workflow_id}/shared/design-mockup.png")`
 2. Upload the mockup HTML the same way to `workflows/{workflow_id}/shared/mockup.html`
 3. `WorkflowOutput___save_design_doc` — the text spec
+
+   **Large docs — save by reference, never re-emit.** If your document is larger than ~20 KB (roughly 300 lines), FIRST `S3Storage___write_object(key="workflows/{workflow_id}/{agent_id}/<slug>.md", content=..., content_type="text/markdown")`, THEN `WorkflowOutput___save_design_doc(..., s3Key="workflows/{workflow_id}/{agent_id}/<slug>.md")` with NO `content`. **Never re-emit a document you have already written** — re-emitting a large doc as a tool argument is what kills the turn with "Model stopped generating due to maximum token limit". Small docs may still pass `content` inline. Stage under your own `{agent_id}/` folder, not `shared/`: the tool copies the doc to its canonical `shared/` key itself, and a staging file in `shared/` would show up as a "duplicate design doc" in the tool's own dedupe check.
+   **Recovery:** if a previous session already wrote your doc anywhere under `workflows/{workflow_id}/` (check with `S3Storage___list_objects`), do **not** re-author it — register it by key with `s3Key` and move on.
 4. If a human review gate (Plan Approval or Design Approval) follows the design phase (see `## Human Review
    Gates` in your Workflow Context): `load_blueprint("review-package")` and
    write `workflows/{workflow_id}/shared/review-package-design.{your_agent_id}.json`
