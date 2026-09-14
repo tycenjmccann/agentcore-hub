@@ -289,7 +289,7 @@ one thing on this path you can prevent for the price of a CI run.
 **Ticket every declared P1 follow-up FIRST — before you write the brief.**
 Whenever anything in this run declared a P1 follow-up (the plan, a review round,
 your own brief draft, a worker checkpoint), file it as a REAL ticket now:
-`Tickets___create_ticket` with `labels: ["advisory"]`, `blocked_by: ""`, NO
+`Tickets___create_ticket` with `labels: "advisory"`, `blocked_by: ""`, NO
 `spawned_by_kind` (it is backlog, not a fix round), assignee = the agent that
 owns the surface, same parent as your Build ticket. Its key then goes in the
 brief's `WHAT WAS KEPT / NOT DONE`. A declared P1 that ships as a report line
