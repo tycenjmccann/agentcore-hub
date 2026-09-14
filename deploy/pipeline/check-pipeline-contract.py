@@ -28,6 +28,20 @@ they are called and CodeBuild runs all phases of a buildspec in one shell, so a
 read above a later definition of the same name is not a violation. The #576
 class is an arg the stack never provides, not an ordering mistake.
 
+N1 (TEAM-4595): bash quote state is carried across the physical lines of ONE `|`
+literal block and reset at the block's boundaries, never at a line's - a
+double-quoted string may span those lines, so a continuation line starting with `#`
+is data and its reads count. A heredoc body is skipped for both quote tracking and
+comment stripping, because bash expands `# $VAR` inside an unquoted heredoc too. A
+block that ends with a quote still open is an infrastructure error (exit 2): below
+that point the scanner cannot tell a comment from data, and guessing is what fails
+open.
+
+N2 (TEAM-4595): a `$( ... )` / backtick body is scanned with a subshell-scoped copy
+of the definitions - an assignment inside a command substitution never defines the
+parent-shell variable - while reads inside it still count. An explicit `( ... )`
+group is NOT scoped; that known edge is written down in deploy/pipeline/README.md.
+
 Runs on both CI rails (.github/workflows/ci.yml and buildspec-ci.yml) via
 scripts/check-pipeline-contract.sh. Same pass shape as check-deploy-surfaces.sh:
 stdlib only (argparse, glob, json, re, sys, pathlib.Path), no AWS, no network, it
@@ -441,24 +455,32 @@ def _next_content_line(lines, idx):
 
 
 def classify_yaml_lines(text, path_str):
-    """Return (bash_lines, env_defined, exported) -- one bash-view line per file line.
-    A folded (`>`) or plain multi-line scalar is rejected (exit 2): its continuation
-    lines would be scanned as separate statements and an argument such as `X=1`
-    would read as a definition, hiding the read. env.variables / parameter-store /
+    """Return (bash_lines, env_defined, exported, continuation) -- one bash-view line
+    per file line. A folded (`>`) or plain multi-line scalar is rejected (exit 2): its
+    continuation lines would be scanned as separate statements and an argument such as
+    `X=1` would read as a definition, hiding the read. env.variables / parameter-store /
     secrets-manager entries DEFINE a name (added to env_defined); an
     exported-variables entry does not - CodeBuild exports whatever value the name
     holds at end of build, it never assigns one, so a listed-but-never-assigned name
-    stays a graded read (only added to `exported`, for the N2 namespace check)."""
+    stays a graded read (only added to `exported`, for the N2 namespace check).
+
+    `continuation` is one bool per line, True only for a line INSIDE the current `|`
+    literal block (never for the `- |` opener itself). This function is the only one
+    that knows where a scalar begins and ends, and strip_bash_comments needs that to
+    carry bash quote state across the physical lines of one scalar (TEAM-4595 N1)."""
     lines = text.split("\n")
     out = []
+    continuation = []
     block_indent = None
     for idx, line in enumerate(lines):
         ln = idx + 1
         if block_indent is not None:
             if line.strip() == "" or _indent(line) > block_indent:
                 out.append(line)
+                continuation.append(True)
                 continue
             block_indent = None
+        continuation.append(False)
         if RE_FOLD_OPEN.match(line):
             raise Infra("unsupported folded multi-line scalar at %s:%d (use a quoted scalar or a | literal block)" % (path_str, ln))
         m = RE_BLOCK_OPEN.match(line)
@@ -520,20 +542,67 @@ def classify_yaml_lines(text, path_str):
                         exported.append(mk.group(1))
                 j += 1
             break
-    return out, env_defined, exported
+    return out, env_defined, exported, continuation
 
 
-def strip_bash_comments(text):
+def strip_bash_comments(text, continuation=None, path_str=None):
     """D5: '#' starts a comment when it is at line start or after whitespace, the
     next char is not '{', and it is outside BOTH quote kinds - a '"' toggles the
     double-quoted state only outside single quotes and a "'" toggles the
     single-quoted state only outside double quotes, so a '#' inside 'single
     quotes' is data (a backslash escapes only outside single quotes, as in bash).
-    Comment text -> spaces (offsets preserved)."""
+    Comment text -> spaces (offsets preserved).
+
+    N1 (TEAM-4595): quote state is carried across the physical lines of ONE scalar,
+    because a `"..."` string may span the lines of a `- |` literal block and a
+    continuation line that starts with '#' is then DATA - bash expands it, so its
+    reads count. `continuation` is classify_yaml_lines' per-line list; state resets
+    on every line it marks False, never on a line boundary. It stays optional so the
+    function is callable standalone, in which case every line resets as before.
+
+    A heredoc body is skipped entirely - no quote tracking and no comment stripping,
+    because bash expands `# $VAR` inside an unquoted heredoc too. Openers are found
+    with the same RE_HEREDOC over the same comment-stripped line blank_heredocs uses,
+    so the two stay in lockstep; an unterminated one skips to EOF and blank_heredocs
+    raises its own error.
+
+    A scalar that ends with a quote still open is Infra (exit 2): below that point the
+    scanner cannot tell a comment from data, and guessing is what fails open."""
+    lines = text.split("\n")
     out_lines = []
-    for line in text.split("\n"):
-        in_dq = False
-        in_sq = False
+    in_dq = False
+    in_sq = False
+    open_ln = None
+    pending = []      # heredoc terminators still to be matched, in opener order
+    prev_cont = False
+
+    def check_closed():
+        """Raise when a literal block ends with a quote still open. Gated by the
+        caller on prev_cont so a single-line YAML scalar with odd quote parity (a
+        `- 'it''s'` that classify_yaml_lines rewrote to `it's`) cannot trip it."""
+        if in_dq or in_sq:
+            raise Infra("unterminated %s quote in the literal block at %s:%d - the quote"
+                        " opened here is never closed before the block ends - fix: close"
+                        " the quote before the block ends, or move the command into a"
+                        " script file under deploy/pipeline/ and call it from the"
+                        " buildspec" % ("double" if in_dq else "single",
+                                        path_str or "<buildspec>", open_ln))
+
+    for idx, line in enumerate(lines):
+        cont = False if continuation is None else continuation[idx]
+        if pending:
+            out_lines.append(line)
+            if pending[0].match(line):
+                pending.pop(0)
+            prev_cont = cont
+            continue
+        if not cont:
+            if prev_cont:
+                check_closed()
+            in_dq = False
+            in_sq = False
+            open_ln = None
+        prev_cont = cont
         k = 0
         cut = None
         while k < len(line):
@@ -543,8 +612,12 @@ def strip_bash_comments(text):
                 continue
             if ch == '"' and not in_sq:
                 in_dq = not in_dq
+                if in_dq:
+                    open_ln = idx + 1
             elif ch == "'" and not in_dq:
                 in_sq = not in_sq
+                if in_sq:
+                    open_ln = idx + 1
             elif ch == "#" and not in_dq and not in_sq:
                 prev_ws = (k == 0) or line[k - 1].isspace()
                 nxt = line[k + 1] if k + 1 < len(line) else ""
@@ -555,6 +628,10 @@ def strip_bash_comments(text):
         if cut is not None:
             line = line[:cut] + " " * (len(line) - cut)
         out_lines.append(line)
+        for m in RE_HEREDOC.finditer(line):
+            pending.append(re.compile(r"^\s*" + re.escape(m.group(2)) + r"\s*$"))
+    if prev_cont:
+        check_closed()
     return "\n".join(out_lines)
 
 
@@ -763,6 +840,20 @@ class Defs:
         self.selfref = {}   # name -> lines (assignments that were reads)
         self.export_reads = []  # (name, offset)
 
+    def scoped(self):
+        """N2: a `$( ... )` / backtick body runs in a SUBSHELL - an assignment inside a
+        command substitution never defines the parent-shell variable. The recursive scan
+        gets a child whose `defined` is a COPY (it inherits the parent's definitions and
+        its own never flow back), while `selfref` and `export_reads` stay the parent's own
+        objects: those are READS and must still flow up (a bare `export FOO` inside a
+        substitution is a read of FOO). Reads via $NAME are unaffected either way -
+        scan_buildspec extracts them from read_text globally, not from the walk."""
+        child = Defs()
+        child.defined = dict(self.defined)
+        child.selfref = self.selfref
+        child.export_reads = self.export_reads
+        return child
+
 
 def _line_of(text, pos):
     return text.count("\n", 0, pos) + 1
@@ -787,7 +878,9 @@ def _assign(word, w_start, read_text, defs, walk_text):
 
 def scan_statements(walk_text, read_text, lo, hi, defs):
     """D8: definitions only in statement position. Words are consumed by consume_word;
-    $( ... ) / `...` bodies are scanned recursively."""
+    $( ... ) / `...` bodies are scanned recursively, in a SUBSHELL scope (N2,
+    Defs.scoped) - a definition inside a command substitution does not define the
+    parent-shell variable, while reads inside it still count."""
     i = lo
     stmt = True
     pending = None  # builtin handler state: (kind, flagsdone)
@@ -808,7 +901,7 @@ def scan_statements(walk_text, read_text, lo, hi, defs):
         i, subs = consume_word(walk_text, i, hi)
         word = walk_text[w_start:i]
         for s in subs:
-            scan_statements(walk_text, read_text, s[0], s[1], defs)
+            scan_statements(walk_text, read_text, s[0], s[1], defs.scoped())
         if pending is not None:
             kind, state = pending
             if word.startswith("-") and kind != "for" and kind != "select":
@@ -866,9 +959,9 @@ def scan_statements(walk_text, read_text, lo, hi, defs):
 def scan_buildspec(path_str):
     """Full pass pipeline. Returns dict with reads, defined, exported, tokens."""
     text = load_text(path_str)
-    bash_lines, env_defined, exported = classify_yaml_lines(text, path_str)
+    bash_lines, env_defined, exported, continuation = classify_yaml_lines(text, path_str)
     view = "\n".join(bash_lines)
-    stripped = strip_bash_comments(view)
+    stripped = strip_bash_comments(view, continuation, path_str)
     read_base, walk_text = blank_heredocs(stripped, path_str)
     read_text = remove_escapes(read_base)
     assert len(read_text) == len(walk_text)
