@@ -830,6 +830,10 @@ function grantDeployPerms(
       actions: [
         "ecs:UpdateExpressGatewayService",
         "ecs:DescribeExpressGatewayService",
+        // buildspec-deploy.yml waits on the underlying ECS service's PRIMARY
+        // deployment rolloutState — DescribeExpressGatewayService only says
+        // ACTIVE and cannot tell the old revision from the new one.
+        "ecs:DescribeServices",
         "ecs:ListServices",
       ],
       resources: ctx.ecsServiceArn
