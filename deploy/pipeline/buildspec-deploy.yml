@@ -134,6 +134,13 @@ phases:
             | python3 -c "import json,sys; d=json.load(sys.stdin); pc=(d.get('service',{}).get('activeConfigurations') or [{}])[0].get('primaryContainer',{}); print(pc.get('image',''))" \
             > /tmp/rollback/ecs-prev-image.txt 2>/dev/null || true
           echo "captured prior ECS image: $(cat /tmp/rollback/ecs-prev-image.txt 2>/dev/null)"
+          # The rollout wait in Target 3 needs the task definition that was PRIMARY
+          # BEFORE the roll, so "COMPLETED" can be tied to the NEW revision.
+          ECS_CLUSTER="$(printf '%s' "$ECS_SERVICE_ARN" | awk -F/ '{print $(NF-1)}')"; ECS_SVC="${ECS_SERVICE_ARN##*/}"
+          aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SVC" --region "$AWS_REGION_HUB" \
+            --query 'services[0].deployments[?status==`PRIMARY`] | [0].taskDefinition' --output text 2>/dev/null \
+            > /tmp/rollback/ecs-prev-taskdef.txt || true
+          echo "captured prior ECS task definition: $(cat /tmp/rollback/ecs-prev-taskdef.txt 2>/dev/null)"
         fi
 
         # Roll back on ANY failure from here on (deploy target OR smoke check).
@@ -284,30 +291,49 @@ phases:
             if [ "$i" = "60" ]; then echo "ECS did not reach ACTIVE with an endpoint"; exit 1; fi
           done
           case "$URL" in http*) : ;; *) URL="https://$URL" ;; esac
-          echo "service ACTIVE at $URL — waiting for the new revision to serve"
-          # ecs-health.py returns ACTIVE the moment the express-gateway rollout is
-          # registered, NOT when the new task is answering at the edge. The root page
-          # is a full SSR render, so a single curl right after ACTIVE routinely races
-          # the warm-up and gets a transient 5xx/timeout. A one-shot check then rolled
-          # back a provably-good image on every release since 2026-09-12 (TEAM-4527):
-          # the deployed 8f09987 image serves href="/pipeline" fine, but the smoke
-          # curl fired before the task was live. Poll until the app actually serves a
-          # 2xx page, capture that body ONCE, then assert on it — so a failure means
-          # the content is really wrong, not that we raced the rollout.
+          echo "service ACTIVE at $URL — waiting for the ECS rollout to COMPLETE"
+          # describe-express-gateway-service says ACTIVE the moment the roll is
+          # REQUESTED; the previous revision keeps answering at the edge for the
+          # ~10 minutes the underlying ECS deployment takes (the 2026-09-13 rollback
+          # deployment: requested 06:03:12Z, completed 06:13:01Z). Every deploy since
+          # #572 (7414a982 … 9a5eda08) graded the OLD page 0-4s after the roll and
+          # rolled back a good image; #582's 2xx poll could not help because the old
+          # revision answers 2xx instantly. Wait on the ECS service's PRIMARY
+          # deployment instead: done when rolloutState is COMPLETED, the old
+          # deployment is gone, and the task definition is no longer the pre-roll one
+          # (a same-image redeploy keeps the task definition, so only COMPLETED is
+          # required then). FAILED fails now — the EXIT trap rolls back. Deadline 20m.
+          ECS_CLUSTER="$(printf '%s' "$ECS_SERVICE_ARN" | awk -F/ '{print $(NF-1)}')"; ECS_SVC="${ECS_SERVICE_ARN##*/}"
+          PREV_TASKDEF="$(cat /tmp/rollback/ecs-prev-taskdef.txt 2>/dev/null || true)"
+          SAME_IMAGE=0; [ "$(cat /tmp/rollback/ecs-prev-image.txt 2>/dev/null)" = "${ECR_URI}@${IMAGE_DIGEST}" ] && SAME_IMAGE=1
+          ROLLOUT=""; TASKDEF=""; NDEPLOY=""
+          for i in $(seq 1 120); do
+            read -r ROLLOUT TASKDEF NDEPLOY <<<"$(aws ecs describe-services --cluster "$ECS_CLUSTER" --services "$ECS_SVC" --region "$AWS_REGION_HUB" \
+              --query 'services[0] | [deployments[?status==`PRIMARY`] | [0].rolloutState, deployments[?status==`PRIMARY`] | [0].taskDefinition, length(deployments)]' \
+              --output text 2>/dev/null | tr '\t' ' ' || true)"
+            if [ "$ROLLOUT" = "FAILED" ]; then echo "ECS rollout FAILED on ${TASKDEF##*/}"; exit 1; fi
+            if [ "$ROLLOUT" = "COMPLETED" ] && [ "${NDEPLOY:-0}" = "1" ] \
+               && { [ "$SAME_IMAGE" = 1 ] || [ -z "$PREV_TASKDEF" ] || [ "$TASKDEF" != "$PREV_TASKDEF" ]; }; then break; fi
+            [ $((i % 6)) = 0 ] && echo "  rollout ${ROLLOUT:-pending} on ${TASKDEF##*/} (${NDEPLOY:-?} deployments) — $((i * 10))s"
+            sleep 10
+            if [ "$i" = "120" ]; then echo "ECS rollout did not COMPLETE within 20m (last ${ROLLOUT:-none} on ${TASKDEF##*/}, previous ${PREV_TASKDEF##*/})"; exit 1; fi
+          done
+          echo "ECS rollout COMPLETED on ${TASKDEF##*/} (previous ${PREV_TASKDEF##*/}) — checking the app"
+          # The page fetched now is provably the NEW revision. A short retry covers
+          # edge warm-up only; a persistent non-2xx here is a real failure.
           ROOT=""
-          for i in $(seq 1 30); do
-            if curl -sf "$URL/api/agentcore/traces/health" >/dev/null 2>&1 \
-               && ROOT="$(curl -sf "$URL/" 2>/dev/null)" && [ -n "$ROOT" ]; then break; fi
+          for i in $(seq 1 12); do
+            if curl -sf -m 20 "$URL/api/agentcore/traces/health" >/dev/null 2>&1 \
+               && ROOT="$(curl -sf -m 20 "$URL/" 2>/dev/null)" && [ -n "$ROOT" ]; then break; fi
             ROOT=""
             sleep 10
-            if [ "$i" = "30" ]; then echo "app health check FAILED: no 2xx page within 5m of ACTIVE"; exit 1; fi
+            if [ "$i" = "12" ]; then echo "app health check FAILED: no 2xx page within 2m of rollout COMPLETED"; exit 1; fi
           done
-          # The /pipeline tab is baked into the image at build time from the CI
-          # project's NEXT_PUBLIC_PIPELINE_ENABLED. This pipeline deploying the
-          # app means the module is on, so a tab-less image is a bad build, not
-          # a config choice -> fail the release and roll back. Asserted only against
-          # the page we provably fetched above, so this fires on a real tab-less
-          # image (e.g. one built before the flag was baked), never on a rollout race.
+          # The /pipeline tab is baked into the image at build time from the Build
+          # project's NEXT_PUBLIC_PIPELINE_ENABLED. This pipeline deploying the app
+          # means the module is on, so a tab-less image is a bad build, not a config
+          # choice -> fail the release and roll back. Asserted only against the NEW
+          # revision's page (rollout COMPLETED above), never the previous one.
           printf '%s' "$ROOT" | grep -q 'href="/pipeline"' || { echo "nav smoke FAILED: /pipeline tab missing from image (NEXT_PUBLIC_PIPELINE_ENABLED not baked)"; exit 1; }
           echo "ECS rollout healthy (nav includes /pipeline)"
         fi
