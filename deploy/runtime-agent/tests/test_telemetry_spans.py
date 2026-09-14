@@ -48,6 +48,7 @@ from opentelemetry.util._once import Once
 from strands import Agent, tool
 from strands.hooks import HookProvider
 from strands.models.model import Model
+from strands.types.exceptions import MaxTokensReachedException
 
 MAIN_PY = Path(__file__).resolve().parent.parent / "main.py"
 
@@ -440,7 +441,11 @@ def _load_production_entrypoints() -> dict[str, Any]:
     test Agent again.
     """
     tree = ast.parse(MAIN_PY.read_text())
-    wanted = {"_run_agent_invocation", "agent_invocation"}
+    # TEAM-4576: _run_agent_invocation's stream_async call now goes through
+    # _stream_agent_turn, an async generator at module scope — extract the real
+    # one (not a stub) so a regression in the max_tokens continuation/give-up
+    # contract shows up here too, not just in test_max_tokens_continuation.py.
+    wanted = {"_run_agent_invocation", "agent_invocation", "_stream_agent_turn"}
     funcs = [
         node
         for node in tree.body
@@ -448,6 +453,20 @@ def _load_production_entrypoints() -> dict[str, Any]:
     ]
     missing = wanted - {func.name for func in funcs}
     assert not missing, f"{sorted(missing)} not defined at module scope in {MAIN_PY}"
+
+    # _stream_agent_turn's bound + continuation prompt are module-level
+    # constants (TEAM-4576, DL-009: no env var) — extract the real assigns.
+    max_tokens_const_names = {"_MAX_TOKENS_CONTINUATIONS", "_MAX_TOKENS_CONTINUATION_PROMPT"}
+    max_tokens_consts = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id in max_tokens_const_names for t in node.targets)
+    ]
+    missing_mt = max_tokens_const_names - {
+        t.id for node in max_tokens_consts for t in node.targets if isinstance(t, ast.Name)
+    }
+    assert not missing_mt, f"{sorted(missing_mt)} not assigned at module scope in {MAIN_PY}"
 
     # _run_agent_invocation instantiates the STOP-after-completion gate
     # (TEAM-3132); extract the real shipped class rather than stubbing it —
@@ -539,7 +558,9 @@ def _load_production_entrypoints() -> dict[str, Any]:
         # in test_telemetry_init.py and tests/test_telemetry.py.
         "_emit_session_anchor_span": _anchor_stub,
         "_publish_agent_started": lambda workflow_id, agent_id: None,
-        "_publish_agent_error": lambda workflow_id, agent_id, error: None,
+        "_publish_agent_error": lambda workflow_id, agent_id, error, ticket_id="": None,
+        # TEAM-4576: the real exception class _stream_agent_turn catches.
+        "MaxTokensReachedException": MaxTokensReachedException,
         # TEAM-3367: stubbed so the "exactly one invoke_agent span" assertions
         # below keep pinning the SDK loop span alone; the anchor span has its
         # own coverage in tests/test_telemetry.py.
@@ -563,7 +584,8 @@ def _load_production_entrypoints() -> dict[str, Any]:
         "app": _RecordingApp(),
     }
     module = ast.Module(
-        body=[watchdog_legacy, *watchdog_defs, gate_cls, *funcs], type_ignores=[]
+        body=[watchdog_legacy, *watchdog_defs, gate_cls, *max_tokens_consts, *funcs],
+        type_ignores=[],
     )
     exec(compile(module, str(MAIN_PY), "exec"), namespace)  # noqa: S102
     return namespace
