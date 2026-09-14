@@ -83,6 +83,10 @@ import boto3
 
 from strands import Agent, tool
 from strands.models import BedrockModel
+# TEAM-4576: a max_tokens stop is RESUMABLE, and the SDK signals it by raising.
+# Top-level import so a future SDK reshuffle fails the Dockerfile's import
+# assertion at build time rather than mid-turn in prod.
+from strands.types.exceptions import MaxTokensReachedException
 try:
     from strands.models.model import CacheConfig
 except ImportError:
@@ -3554,6 +3558,15 @@ async def agent_invocation(payload, context):
 
     workflow_id = payload.get("workflow_id", "unknown")
     agent_id = payload.get("agent_id", "unknown")
+    # TEAM-4576: read the ticket from the PAYLOAD, never from _CURRENT_TICKET_ID.
+    # agent-invoker always sends it (agent-invoker.mjs ticket_id), this entrypoint
+    # simply never read it — so every detached crash published an agent.error with
+    # an empty detail.ticketId, invisible to every ticket-scoped consumer
+    # (anomaly-watcher's per-ticket grouping, lease.mjs hasAgentErrorSince, the
+    # Workflow tab's error card). The global is module state shared by every
+    # concurrent detached task on a warm microVM, so a sibling can overwrite it
+    # before this task's except runs; the payload is the per-invocation truth.
+    ticket_id = payload.get("ticket_id", "")
 
     if payload.get("detach") and workflow_id and workflow_id != "unknown":
         import asyncio
@@ -3569,9 +3582,36 @@ async def agent_invocation(payload, context):
             except Exception as exc:  # noqa: BLE001 — must never die silently
                 logger.error(f"[{agent_id}] detached run failed: {str(exc)[:500]}")
                 try:
-                    _publish_agent_error(workflow_id, agent_id, str(exc)[:500])
+                    # Name the exception class and mark the give-up. The raw
+                    # str() of a MaxTokensReachedException is only "Model stopped
+                    # generating due to maximum token limit" — it names neither
+                    # the exception nor who stopped trying (TEAM-3125 spent an
+                    # RCA on exactly that ambiguity).
+                    _publish_agent_error(
+                        workflow_id, agent_id,
+                        f"TEAM-4576 harness give-up — {type(exc).__name__}: {exc}"[:500],
+                        ticket_id=ticket_id,
+                    )
                 except Exception:  # noqa: BLE001
                     pass
+                # The ticket is DELIBERATELY left in_progress. Do NOT add a
+                # transition or a comment here:
+                #   - in_progress is the precondition for recovery. The
+                #     dead-session detector — the designated owner of "accepted
+                #     but crashes later" (orchestrator/agent-invoker.mjs) —
+                #     skips any other status outright
+                #     (orchestrator/dead-session-detector.mjs:361:
+                #     `if (ticket.status !== "in_progress") continue;`).
+                #   - the reconcile sweep's in_progress branch steals the stale
+                #     claim on a generation CAS with no age requirement (~1x
+                #     lease TTL); todo/blocked fall to redispatch's 2x-TTL claim
+                #     CAS instead, and the transition would bump ticket.updatedAt
+                #     and reset parkedLongEnough for another lease TTL.
+                #   - blocked with no open blockers is refused by
+                #     releaseClaimOnSelfPark anyway, so it frees nothing.
+                # Releasing the claim is orchestrator-only (R2, workflow-store is
+                # the sole writer); the lease dies by itself once the heartbeats
+                # (agent.streaming / agent.started) stop with this process.
             finally:
                 # Span flush before complete_async_task happens inside
                 # _run_agent_invocation's own finally (which unwinds before we
@@ -3593,6 +3633,60 @@ async def agent_invocation(payload, context):
 
     async for event in _run_agent_invocation(payload, context):
         yield event
+
+
+# ─── TEAM-4576: resume a turn the output-token limit cut off ──────────────────
+# Deliberately module constants, NOT env vars: DL-009 forbids adding a knob for
+# behaviour that belongs in the runtime, and a bound this small has no operator
+# reason to vary per fleet. Cost is bounded at (1 + N) * MAX_OUTPUT_TOKENS.
+_MAX_TOKENS_CONTINUATIONS = 3
+_MAX_TOKENS_CONTINUATION_PROMPT = (
+    "Your previous response was cut off by the output-token limit. Continue from "
+    "where you stopped; do not repeat what you already wrote. If you were emitting "
+    "a large tool argument, write it to S3 with S3Storage___write_object and pass "
+    "it by reference instead."
+)
+
+
+async def _stream_agent_turn(agent, prompt, agent_id="", on_continuation=None):
+    """Drive one persona turn through agent.stream_async, yielding every SDK event.
+
+    A max_tokens stop is RESUMABLE, not terminal. Strands appends the partial
+    assistant message to agent.messages — after
+    recover_message_on_max_tokens_reached rewrites any truncated toolUse block
+    into text — BEFORE raising MaxTokensReachedException, and the documented
+    recovery is to call the agent again. Because the last message is then an
+    ASSISTANT message, the continuation must supply a short user turn; that is
+    _MAX_TOKENS_CONTINUATION_PROMPT.
+
+    Bounded at _MAX_TOKENS_CONTINUATIONS. On exhaustion the exception is
+    re-raised UNCHANGED so the existing terminal-failure path reports it — this
+    never converts a failure into a silent success. Only
+    MaxTokensReachedException is caught; every other exception propagates
+    immediately and untouched (a write path must never swallow errors).
+
+    on_continuation(n, exc) is invoked before each continuation for UI /
+    telemetry. It is called by the caller's closure, so this helper stays
+    hermetic: no workflow_id, no tracker, no DynamoDB client.
+    """
+    turn_prompt = prompt
+    for attempt in range(_MAX_TOKENS_CONTINUATIONS + 1):
+        try:
+            async for event in agent.stream_async(turn_prompt):
+                yield event
+            return
+        except MaxTokensReachedException as exc:
+            if attempt >= _MAX_TOKENS_CONTINUATIONS:
+                logger.error(
+                    f"[{agent_id}] max_tokens stop persisted after "
+                    f"{_MAX_TOKENS_CONTINUATIONS} continuations — giving up: {exc}")
+                raise
+            logger.warning(
+                f"[{agent_id}] max_tokens stop — continuing the turn "
+                f"({attempt + 1}/{_MAX_TOKENS_CONTINUATIONS}): {exc}")
+            if on_continuation is not None:
+                on_continuation(attempt + 1, exc)
+            turn_prompt = _MAX_TOKENS_CONTINUATION_PROMPT
 
 
 # A lost agent.error is an invisible failure — retry the publish a few times.
@@ -3889,7 +3983,36 @@ async def _run_agent_invocation(payload, context):
                 })
                 _text_buffer = ""
 
-        async for event in agent.stream_async(prompt):
+        def _note_max_tokens_continuation(n, exc):
+            """Make a TEAM-4576 continuation visible without inventing a channel."""
+            # Buffered text belongs BEFORE the marker — the cut-off prose was
+            # written first.
+            _flush_text_buffer()
+            # agent.streaming is a lease heartbeat type (lease.mjs) and that is
+            # correct here: work really is continuing. agent.error is not, which
+            # is why the give-up path uses it instead.
+            tracker._publish_event("agent.streaming", {
+                "agentId": agent_id,
+                "type": "trace",
+                "toolName": f"max_tokens_continuation:{n}/{_MAX_TOKENS_CONTINUATIONS}",
+                "workflowId": workflow_id,
+            })
+            # A span EVENT, not a new span — test_telemetry_spans asserts on the
+            # span shape. Fail-open per R1.4: telemetry never breaks a run.
+            try:
+                from opentelemetry import trace as _mt_trace_api
+
+                _mt_trace_api.get_current_span().add_event(
+                    "hub.max_tokens_continuation",
+                    attributes={"n": n, "max": _MAX_TOKENS_CONTINUATIONS,
+                                "agent.id": agent_id},
+                )
+            except Exception:  # noqa: BLE001
+                pass
+
+        async for event in _stream_agent_turn(
+                agent, prompt, agent_id,
+                on_continuation=_note_max_tokens_continuation):
             if "data" in event and event["data"]:
                 # R3.2: post-completion text duplicates the report_completion summary
                 if not completion_gate.engaged:

@@ -26,6 +26,9 @@ RUN pip freeze
 RUN python -c "from mcp.client.streamable_http import streamablehttp_client" \
  || python -c "from mcp.client.streamable_http import streamable_http_client"
 RUN python -c "import strands, strands.tools.mcp, strands_tools, bedrock_agentcore, boto3, httpx, nest_asyncio, playwright, aws_bedrock_token_generator, opentelemetry"
+# TEAM-4576: the max_tokens recovery path depends on this exact symbol. An SDK
+# reshuffle must fail the build, not the first persona that hits the token cap.
+RUN python -c "from strands.types.exceptions import MaxTokensReachedException"
 COPY main.py .
 EXPOSE 8080
 # Wrap with opentelemetry-instrument so the runtime emits GenAI-semantic OTel
