@@ -28,6 +28,20 @@ they are called and CodeBuild runs all phases of a buildspec in one shell, so a
 read above a later definition of the same name is not a violation. The #576
 class is an arg the stack never provides, not an ordering mistake.
 
+N1 (TEAM-4595): bash quote state is carried across the physical lines of ONE `|`
+literal block and reset at the block's boundaries, never at a line's - a
+double-quoted string may span those lines, so a continuation line starting with `#`
+is data and its reads count. A heredoc body is skipped for both quote tracking and
+comment stripping, because bash expands `# $VAR` inside an unquoted heredoc too. A
+block that ends with a quote still open is an infrastructure error (exit 2): below
+that point the scanner cannot tell a comment from data, and guessing is what fails
+open.
+
+N2 (TEAM-4595): a `$( ... )` / backtick body is scanned with a subshell-scoped copy
+of the definitions - an assignment inside a command substitution never defines the
+parent-shell variable - while reads inside it still count. An explicit `( ... )`
+group is NOT scoped; that known edge is written down in deploy/pipeline/README.md.
+
 Runs on both CI rails (.github/workflows/ci.yml and buildspec-ci.yml) via
 scripts/check-pipeline-contract.sh. Same pass shape as check-deploy-surfaces.sh:
 stdlib only (argparse, glob, json, re, sys, pathlib.Path), no AWS, no network, it

@@ -138,6 +138,20 @@ CodeBuild role's S3 grant, do not remove that Deny.
 - `env.exported-variables` is a promise to export, not a definition: a name listed
   there but never assigned is still a graded read (`env.variables` / `parameter-store`
   / `secrets-manager` do define).
+- Quote state carries across the lines of one `|` literal block: a `"..."` string may span
+  them, so a continuation line starting with `#` is data and its reads count. State resets
+  at the block's boundaries, never at a line's.
+- A `|` block that ends with a quote still open is rejected (exit 2): the scanner cannot
+  tell comment from data below it. Close the quote, or move the command into a script.
+- A heredoc body is exempt from comment stripping: bash expands `# $VAR` inside an
+  **unquoted** heredoc, so that read counts (a quoted-tag body stays data, as before).
+- A definition inside `$( ... )` or backticks is **subshell-scoped** and does not define the
+  parent-shell variable; reads inside it still count. Known edge: an explicit `( ... )`
+  subshell group is not scoped, so a definition inside one is still credited to the parent -
+  it has no span to reuse and a matcher for it would have to tell a subshell group from a
+  `case` pattern, `((` arithmetic and `foo () {`, where an over-extended scope would red a
+  merge-blocking gate on a legitimate buildspec. No `( ... )` group in the buildspecs today
+  contains an assignment.
 - A namespace's `action` must actually run its `exporter` buildspec - the guard
   resolves action -> project -> `fromSourceFilename` and fails a mismatch, so a
   `#{Ns.VAR}` token can never be graded against the wrong file's exported-variables.
