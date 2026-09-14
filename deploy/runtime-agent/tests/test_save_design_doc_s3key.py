@@ -1,4 +1,4 @@
-"""TEAM-4569 — `WorkflowOutput___save_design_doc` must be able to register a doc
+"""TEAM-4589 — `WorkflowOutput___save_design_doc` must be able to register a doc
 by REFERENCE, and must send a byte-identical payload when it isn't asked to.
 
 Both halves matter. A 97 KB design doc killed backend_designer with
@@ -66,9 +66,9 @@ BASE = dict(workflow_id="wf_1", agent_id="agentcore_hub_backend_designer")
 DOC = "# Backend design\n\nOne paragraph.\n"
 STAGED = "workflows/wf_1/agentcore_hub_backend_designer/backend-design.md"
 
-# Exactly the payload a pre-4569 harness sent. Asserted WHOLE (not key-by-key) so
+# Exactly the payload a pre-4589 harness sent. Asserted WHOLE (not key-by-key) so
 # an accidental extra field fails here rather than in the Lambda.
-PRE_4569_PAYLOAD = {
+PRE_4589_PAYLOAD = {
     "workflow_id": "wf_1",
     "agent_id": "agentcore_hub_backend_designer",
     "content": DOC,
@@ -82,11 +82,11 @@ def _payload(**kwargs):
     return result, (calls[0][2] if calls else None)
 
 
-# ─── content-only → byte-identical to the pre-4569 payload ────────────────────
+# ─── content-only → byte-identical to the pre-4589 payload ────────────────────
 
-def test_content_only_sends_exactly_the_pre_4569_payload():
+def test_content_only_sends_exactly_the_pre_4589_payload():
     _, payload = _payload(content=DOC)
-    assert payload == PRE_4569_PAYLOAD
+    assert payload == PRE_4589_PAYLOAD
 
 
 def test_content_only_key_set_is_exactly_the_four_original_keys():
@@ -124,7 +124,7 @@ def test_s3key_is_trimmed():
 @pytest.mark.parametrize("blank", ["", "   ", "\n\t "])
 def test_blank_s3key_is_the_same_as_omitted(blank):
     _, payload = _payload(content=DOC, s3Key=blank)
-    assert payload == PRE_4569_PAYLOAD
+    assert payload == PRE_4589_PAYLOAD
 
 
 def test_blank_content_with_an_s3key_sends_no_content_key():

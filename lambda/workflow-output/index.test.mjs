@@ -14,7 +14,7 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
  */
 
 /**
- * save_design_doc's by-reference path (TEAM-4569) is also covered here, which is
+ * save_design_doc's by-reference path (TEAM-4589) is also covered here, which is
  * why the S3 mock below is backed by an in-test object map rather than returning
  * a bare {}: reading a doc by key, the shared/ dedupe listing and the manifest
  * round-trip are all the SAME bucket, so a test that writes then re-saves has to
@@ -290,7 +290,7 @@ describe("report_completion — approved_head_sha", () => {
   });
 });
 
-// ─── TEAM-4569: save_design_doc pass-by-reference ─────────────────────────────
+// ─── TEAM-4589: save_design_doc pass-by-reference ─────────────────────────────
 //
 // The doc used to reach this tool only as an inline `content` string, so an agent
 // had to re-emit the whole document as a tool argument. A 97 KB design doc killed
@@ -334,8 +334,8 @@ const manifestDesignEntries = () => {
   return (JSON.parse(put.Body).phases.design || []).filter((e) => e.type === "design-doc");
 };
 
-// The exact response key set an inline save returned before TEAM-4569.
-const PRE_4569_RESPONSE_KEYS = ["status", "location", "shared_location", "existing_design_docs", "message"];
+// The exact response key set an inline save returned before TEAM-4589.
+const PRE_4589_RESPONSE_KEYS = ["status", "location", "shared_location", "existing_design_docs", "message"];
 
 describe("save_design_doc — s3Key reads the doc instead of taking it inline", () => {
   it("(a) writes BOTH destination keys with the source object's body", async () => {
@@ -350,7 +350,7 @@ describe("save_design_doc — s3Key reads the doc instead of taking it inline", 
   it("(b) returns the five pre-change keys plus source_s3_key", async () => {
     h.objects.set(STAGED, BIG_DOC);
     const r = saved(await saveDoc({ s3Key: STAGED }));
-    expect(Object.keys(r).sort()).toEqual([...PRE_4569_RESPONSE_KEYS, "source_s3_key"].sort());
+    expect(Object.keys(r).sort()).toEqual([...PRE_4589_RESPONSE_KEYS, "source_s3_key"].sort());
     expect(r.source_s3_key).toBe(STAGED);
     expect(r.status).toBe("saved");
     expect(r.location).toBe(`s3://test-bucket/${DEST}`);
@@ -450,7 +450,7 @@ describe("save_design_doc — s3Key reads the doc instead of taking it inline", 
     expect(written(DEST)).toEqual(["# Small design\n\nOne paragraph.\n"]);
     expect(written(SHARED_DEST)).toEqual(["# Small design\n\nOne paragraph.\n"]);
     const r = saved(res);
-    expect(Object.keys(r).sort()).toEqual([...PRE_4569_RESPONSE_KEYS].sort());
+    expect(Object.keys(r).sort()).toEqual([...PRE_4589_RESPONSE_KEYS].sort());
     expect("source_s3_key" in r).toBe(false);
     expect(h.gets.some((g) => g.Key === STAGED)).toBe(false);
   });
@@ -472,7 +472,7 @@ describe("inferToolFromArgs — (j) flat-args routing", () => {
     expect(inferToolFromArgs({ s3Key: STAGED, workflow_id: WF, agent_id: DESIGNER })).toBe("save_design_doc");
   });
 
-  // Every pre-4569 outcome, asserted so the new rule cannot have shadowed one.
+  // Every pre-4589 outcome, asserted so the new rule cannot have shadowed one.
   it("keeps every existing rule's outcome", () => {
     expect(inferToolFromArgs({ ticket_id: "TEAM-1", summary: "done" })).toBe("report_completion");
     expect(inferToolFromArgs({ content: "# doc", workflow_id: WF })).toBe("save_design_doc");

@@ -2365,8 +2365,8 @@ def WorkflowOutput___save_design_doc(workflow_id: str, agent_id: str, content: s
             for any document larger than ~20 KB.
     """
     payload = {"workflow_id": workflow_id, "agent_id": agent_id}
-    # TEAM-4569: additive, same rule as report_completion above — a content-only
-    # call forwards exactly the pre-4569 payload {workflow_id, agent_id, content,
+    # TEAM-4589: additive, same rule as report_completion above — a content-only
+    # call forwards exactly the pre-4589 payload {workflow_id, agent_id, content,
     # doc_type}, so nothing changes for an agent that never passes s3Key. The
     # document's own leading/trailing whitespace is not ours to edit, so `content`
     # is forwarded un-stripped; only the "did you say anything" test strips.

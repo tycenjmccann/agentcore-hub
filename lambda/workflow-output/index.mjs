@@ -39,7 +39,7 @@ async function publishJourneyEvent(workflowId, type, detail) {
   } catch { /* non-fatal */ }
 }
 
-// TEAM-4569: no s3Key here — main.py's WorkflowOutput___submit_ticket_plan wrapper
+// TEAM-4589: no s3Key here — main.py's WorkflowOutput___submit_ticket_plan wrapper
 // forwards no `requirements` body at all, so there is no document body to pass by
 // reference; `tickets` is a short JSON array the agent has to author anyway.
 async function submitTicketPlan({ workflow_id, requirements, tickets }) {
@@ -58,7 +58,7 @@ async function submitTicketPlan({ workflow_id, requirements, tickets }) {
   };
 }
 
-// ─── save_design_doc: pass-by-reference (TEAM-4569) ────────────────────────────
+// ─── save_design_doc: pass-by-reference (TEAM-4589) ────────────────────────────
 // A design doc used to reach this tool only as an inline `content` string, so an
 // agent had to re-emit the whole document as a tool argument — pure output
 // tokens. A 97 KB doc killed backend_designer with MaxTokensReachedException
@@ -128,7 +128,7 @@ async function resolveDesignDocContent({ content, s3Key }) {
 async function saveDesignDoc({ workflow_id, agent_id, title, content, format = "markdown", doc_type, s3Key }) {
   // Resolve the body BEFORE anything below reads or writes: on the by-reference
   // path a bad key must leave the bucket exactly as it was. Everything after
-  // this line is the pre-4569 persist path, unchanged and shared by both paths.
+  // this line is the pre-4589 persist path, unchanged and shared by both paths.
   const source = await resolveDesignDocContent({ content, s3Key });
   content = source.content;
 
@@ -194,8 +194,8 @@ async function saveDesignDoc({ workflow_id, agent_id, title, content, format = "
         (otherDocs.length
           ? ` NOTE: other design docs already exist for this workflow (${otherDocs.join(", ")}). If your ticket duplicates one of them, reference/update the existing doc instead of authoring a parallel one.`
           : ""),
-    // TEAM-4569: only on the by-reference path, so an inline save's response keeps
-    // exactly its pre-4569 key set.
+    // TEAM-4589: only on the by-reference path, so an inline save's response keeps
+    // exactly its pre-4589 key set.
     ...(source.sourceKey ? { source_s3_key: source.sourceKey } : {}),
   };
 }
@@ -461,7 +461,7 @@ export function inferToolFromArgs(args) {
   if (args.ticket_id && args.summary) return "report_completion";
   if (args.tickets) return "submit_ticket_plan";
   if (args.content && args.workflow_id) return "save_design_doc";
-  // TEAM-4569: a by-reference save carries no `content` at all, so the rule above
+  // TEAM-4589: a by-reference save carries no `content` at all, so the rule above
   // can never match it. `s3Key` appears in no other tool's argument set, so this
   // leaves every rule before it with exactly its previous outcome.
   if (args.s3Key && args.workflow_id) return "save_design_doc";
