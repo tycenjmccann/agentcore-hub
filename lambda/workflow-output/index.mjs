@@ -76,7 +76,7 @@ async function submitTicketPlan({ workflow_id, requirements, tickets }) {
 // NoSuchKey. A future reader looking for the access-control boundary will not
 // find it here — there isn't one at this layer, by design.
 function assertPlainWorkflowKey(s3Key) {
-  const shape = `expected a plain object key under workflows/ (e.g. "workflows/<workflow_id>/<agent_id>/design.md") — no s3:// URL, no leading "/", no ".." segment`;
+  const shape = `expected a plain object key under workflows/ (e.g. "workflows/<workflow_id>/<agent_id>/design.md") - no s3:// URL, no leading "/", no ".." segment`;
   const bad = (why) => new Error(`save_design_doc rejected s3Key "${s3Key}": ${why}. ${shape}.`);
   if (/^s3:\/\//i.test(s3Key)) throw bad("it is an s3:// URL, not an object key");
   if (s3Key.startsWith("/")) throw bad("it starts with \"/\"");
@@ -96,7 +96,7 @@ async function resolveDesignDocContent({ content, s3Key }) {
 
   if (!key) {
     if (!inline.trim()) {
-      throw new Error("content or s3Key is required — pass the document inline, or write it to S3 first and pass its key.");
+      throw new Error("content or s3Key is required - pass the document inline, or write it to S3 first and pass its key.");
     }
     return { content: inline, sourceKey: null };
   }
@@ -113,14 +113,14 @@ async function resolveDesignDocContent({ content, s3Key }) {
     const r = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: key }));
     body = await r.Body.transformToString();
   } catch (err) {
-    throw new Error(`save_design_doc could not read s3Key "${key}" from the artifact bucket (${err.name}: ${err.message}) — that object is missing or unreadable, so nothing was saved.`);
+    throw new Error(`save_design_doc could not read s3Key "${key}" from the artifact bucket (${err.name}: ${err.message}) - that object is missing or unreadable, so nothing was saved.`);
   }
   // An empty source is an error, not an empty save. A stranded ticket is
   // recoverable by re-running the agent; a critical:true manifest entry pointing
   // at an empty canonical design doc is not — it silently poisons every
   // downstream reader, which sees a registered ★ design doc and reads nothing.
   if (!body || !body.trim()) {
-    throw new Error(`save_design_doc read s3Key "${key}" but it is empty — nothing was saved. Write the document to that key first, then register it.`);
+    throw new Error(`save_design_doc read s3Key "${key}" but it is empty - nothing was saved. Write the document to that key first, then register it.`);
   }
   return { content: body, sourceKey: key };
 }
