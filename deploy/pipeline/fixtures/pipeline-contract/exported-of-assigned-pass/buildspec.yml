@@ -1,0 +1,15 @@
+version: 0.2
+env:
+  shell: bash
+  exported-variables:
+    - DEPLOY_PREAPPROVED
+    - SOME_VAR
+phases:
+  build:
+    commands:
+      - "echo region $AWS_REGION_HUB bucket ${ARTIFACT_BUCKET} repo ${ECR_REPO:-}"
+      - |
+        DEPLOY_PREAPPROVED=0
+        export DEPLOY_PREAPPROVED
+        SOME_VAR=1
+        echo "some $SOME_VAR"

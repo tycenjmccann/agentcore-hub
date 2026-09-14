@@ -176,6 +176,15 @@ CASES = [
     ("bare-export-is-read", (), 1,
      "FAIL: buildspec.yml:14 reads UNDECL_X which pipeline-contract.json does not declare"),
     ("bare-export-of-provided-pass", (), 0, "OK:"),
+    # F2: exported-variables is a promise to export, not a definition - a name
+    # listed there but never assigned is still a graded read
+    ("exported-passthrough-read", (), 1,
+     'FAIL: buildspec.yml:14 reads UNDECL_X which pipeline-contract.json does not declare for '
+     '[fixture-build/Build_and_gate] - fix: if the deployed stack provides it '
+     '(./deploy/pipeline/deploy.sh has run), add it under buildspecs["buildspec.yml"].provides; '
+     'otherwise make the read tolerate absence or drop it, or add it to allow with a reason'),
+    ("exported-of-assigned-pass", (), 0,
+     "OK: pipeline contract - 2 buildspecs, 5 provided vars, 1 namespace refs checked"),
     ("declare-without-eq-is-definition", (), 0, "OK:"),
     ("read-for-select-definitions", (), 0, "OK:"),
     ("command-prefix-and-build-arg", (), 1,

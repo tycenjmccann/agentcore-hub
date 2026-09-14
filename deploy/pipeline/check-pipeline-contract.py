@@ -444,7 +444,11 @@ def classify_yaml_lines(text, path_str):
     """Return (bash_lines, env_defined, exported) -- one bash-view line per file line.
     A folded (`>`) or plain multi-line scalar is rejected (exit 2): its continuation
     lines would be scanned as separate statements and an argument such as `X=1`
-    would read as a definition, hiding the read."""
+    would read as a definition, hiding the read. env.variables / parameter-store /
+    secrets-manager entries DEFINE a name (added to env_defined); an
+    exported-variables entry does not - CodeBuild exports whatever value the name
+    holds at end of build, it never assigns one, so a listed-but-never-assigned name
+    stays a graded read (only added to `exported`, for the N2 namespace check)."""
     lines = text.split("\n")
     out = []
     block_indent = None
@@ -511,8 +515,9 @@ def classify_yaml_lines(text, path_str):
                 elif section == "exported-variables":
                     mk = RE_ENV_LISTITEM.match(l2)
                     if mk:
+                        # exported-variables is a promise to export, not a
+                        # definition - keep the name for N2 only (F2).
                         exported.append(mk.group(1))
-                        env_defined.add(mk.group(1))
                 j += 1
             break
     return out, env_defined, exported
