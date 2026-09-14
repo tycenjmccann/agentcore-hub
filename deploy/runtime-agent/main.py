@@ -2339,18 +2339,43 @@ def WorkflowOutput___report_completion(ticket_id: str, summary: str, artifacts: 
 
 
 @tool
-def WorkflowOutput___save_design_doc(workflow_id: str, agent_id: str, content: str, doc_type: str = "design") -> str:
+def WorkflowOutput___save_design_doc(workflow_id: str, agent_id: str, content: str = "", doc_type: str = "design", s3Key: str = "") -> str:
     """Save a design document or artifact for the workflow.
+
+    For anything large, write the document to S3 first with S3Storage___write_object
+    (e.g. workflows/{workflow_id}/{agent_id}/<slug>.md) and pass s3Key — this tool
+    then reads the bytes itself and you spend no output tokens re-emitting them.
+    NEVER re-emit a document you have already written: passing a large doc back as
+    `content` is what ends the turn with "Model stopped generating due to maximum
+    token limit". Small documents may still be passed inline as `content`.
+
+    `content` and `s3Key` are mutually exclusive; if you pass both, s3Key wins and
+    the inline content is ignored. The bucket is always the team artifact bucket —
+    there is no bucket argument. Text documents only; upload binaries (images,
+    PDFs, zips) with upload_file_to_s3 instead.
 
     Args:
         workflow_id: Workflow ID this belongs to
         agent_id: Your agent ID
-        content: Document content (markdown)
+        content: Document content (markdown). Leave empty when passing s3Key.
         doc_type: Type of document (design, requirements, spec)
+        s3Key: Key of a document you ALREADY wrote to the artifact bucket, e.g.
+            "workflows/{workflow_id}/{agent_id}/<slug>.md". A plain object key
+            under workflows/ — not an s3:// URL. Use this instead of `content`
+            for any document larger than ~20 KB.
     """
-    return _invoke_lambda(WORKFLOW_OUTPUT_LAMBDA, "WorkflowOutput___save_design_doc", {
-        "workflow_id": workflow_id, "agent_id": agent_id, "content": content, "doc_type": doc_type
-    })
+    payload = {"workflow_id": workflow_id, "agent_id": agent_id}
+    # TEAM-4569: additive, same rule as report_completion above — a content-only
+    # call forwards exactly the pre-4569 payload {workflow_id, agent_id, content,
+    # doc_type}, so nothing changes for an agent that never passes s3Key. The
+    # document's own leading/trailing whitespace is not ours to edit, so `content`
+    # is forwarded un-stripped; only the "did you say anything" test strips.
+    if content.strip():
+        payload["content"] = content
+    payload["doc_type"] = doc_type
+    if s3Key.strip():
+        payload["s3Key"] = s3Key.strip()
+    return _invoke_lambda(WORKFLOW_OUTPUT_LAMBDA, "WorkflowOutput___save_design_doc", payload)
 
 
 @tool
