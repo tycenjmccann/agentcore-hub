@@ -674,6 +674,14 @@ or `pipeline_not_registered`.
    means your run is not visible on any stage yet: it is NOT terminal, keep
    polling. Never trust `terminal`/`succeeded` from a poll where
    `matchesExecution` is false.
+   **Reading a failure's facts:** if `Pipeline___get_state` returns
+   `lastExecution`, read `{id, status, failedStage, failedAction, failedPhase,
+   errorSummary, sourceSha, finishedAt}` from it. If the field is absent
+   (pre-FR-D2.b tools Lambda), derive the same facts from `stages[]` +
+   `actionDetails` — the last Deploy-stage action's `status`, `summary` and
+   `externalExecutionId` — plus `Pipeline___get_build_log(build_id=<that
+   externalExecutionId>)` for the phase and error text. Both bullets below use
+   those facts.
    - **Build FAILED** → call `Pipeline___get_build_log(build_id=<the failing
      action's externalExecutionId from actionDetails>)` — the project is
      inferred from `build_id` itself, so do not also pass `project` here (a
@@ -681,21 +689,62 @@ or `pipeline_not_registered`.
      phase contexts + log tail, then **file a precise fix ticket** (file:line +
      the failing command) routed back to the bug_fixer/dev — do NOT hand-fix the
      deploy yourself. When that fix merges to the default branch, call
-     `Pipeline___start_deploy` again to re-run. This trigger→watch→fix→re-run
-     loop is YOURS to own until the pipeline is green or a fix is genuinely
-     blocked.
-   - **Waiting on approval** (the Approval stage's approval action is
+     `Pipeline___start_deploy` again to re-run — subject to the one-re-trigger
+     cap below. This trigger→watch→fix→re-run loop is YOURS to own until the
+     pipeline is green or a fix is genuinely blocked.
+   - **Waiting on approval** (the Approval stage's `Approve_deploy` action is
      `InProgress`) → the deploy gate. It is not an unconditional SECOND gate any
      more: it fires only when the commit about to deploy is NOT the recorded merge
      of the human-approved head SHA — no record, a different SHA, or a record the
      pipeline could not read, all of which fail closed on purpose. When it does
-     fire, a HUMAN approves the deploy (bridged to Telegram): surface that it is
-     waiting and file the deploy-gate ticket per the existing policy; do NOT
-     approve it — you have no approval tool and must never approve your own
-     deploy. Conversely, `Pipeline___get_state` returning `approvalSkipped: true`
+     fire the execution is waiting on the Telegram bridge and a HUMAN — **not on
+     you**, so PAGE, do not poll on:
+     - **Budget:** after AT MOST 10 polls (~10 min) of `Approve_deploy`
+       `InProgress`, page. 10 is a maximum, not a target — paging on the FIRST
+       confirmed `InProgress` poll is always compliant. Never 2h50m of silent
+       polling (`wf_1789170903227_c3x6k1` polled 2h50m before opening TEAM-4523).
+     - **Page (idempotently):** `Tickets___list_tickets` on your parent first and
+       adopt any non-done ticket whose summary EXACTLY matches the title below for
+       THIS `pipelineExecutionId`; another execution's gate ticket is NOT yours.
+       Otherwise `Tickets___create_ticket`: summary
+       `Deploy gate waiting: {EPIC} (execution {pipelineExecutionId})`, assignee
+       `human:engineer`, same parent as your ticket, `ticket_type "subtask"` if the
+       parent is a Bug else `"task"`, `blocked_by: ""` (REQUIRED — a blocker
+       suppresses the review notification), description = `pipelineExecutionId`,
+       the merge SHA, `preapproval.reason`, and how to approve (the Telegram
+       deploy-gate message).
+     - **Record it, then park:** your context is NOT durable, so
+       `Tickets___add_comment` on your OWN CD ticket with `pipelineExecutionId`,
+       the merge SHA and the paging ticket key BEFORE parking — a re-invocation
+       has no other way to find them. Then
+       `Tickets___transition_ticket(ticket_id=<your CD ticket>,
+       transition_id="blocked", blocked_by="<paging ticket>", reason="Deploy gate
+       waiting on a human")` and exit WITHOUT `report_completion` (DL-024).
+     - **On re-dispatch** (the paging ticket went Done): read your own comment,
+       resume this step's polling with that recorded `execution_id`. If
+       `Approve_deploy` is STILL `InProgress` — an early nudge, the human has not
+       clicked yet — re-park on the SAME paging ticket and exit again. If the stage
+       advanced, continue to terminal as normal.
+     - **DL-028:** the gate stays human-only. This surfaces the wait; it never
+       approves it. You have no approval tool, you must never approve your own
+       deploy, and no agent-reachable `PutApprovalResult` may ever be introduced —
+       the Telegram bridge is the only holder of one.
+     Conversely, `Pipeline___get_state` returning `approvalSkipped: true`
      is the signal that this run needed only the single Merge Approval — say so in
      the summary rather than reporting the absent gate as a problem.
    - **Deploy FAILED** → verdict FAIL with the stage's log link + a fix ticket.
+   - **One re-trigger per identical failure signature.** A **failure signature**
+     is `failedStage` + `failedAction` + `failedPhase` + the `errorSummary` class
+     (from `lastExecution` when present, else the derived facts above). Record the
+     FIRST failure's signature where you can find it again: a comment on your OWN
+     CD ticket (same shape as the paging comment — execution id, merge SHA,
+     signature), because your context is not durable and the comparison happens on
+     a later invocation. If a re-run `Pipeline___start_deploy` fails AGAIN with the
+     same signature, do **NOT** start a third execution: the failure is
+     deterministic and every re-trigger burns another human Telegram approval
+     (`wf qiizre` burned a third). Instead file the `human:engineer` handoff / fix
+     ticket (same shape as the paging ticket, description carrying BOTH
+     executions' signatures and log links) and park your CD ticket on it.
 5. **Infra scripts are a SEPARATE handoff — on a SUCCEEDED run, hub pipeline
    only.** The hub's OWN pipeline deploys every code surface (all Lambdas,
    harness prompts/models, S3 toolkits, the runtime images, the app). If the
@@ -815,3 +864,9 @@ you could not complete → `outcome="deploy-blocked"` + `block_reason`, no
 - A branch behind the default branch is never a finding and never a fix ticket —
   sync it in your own turn per the Main-sync rule, during the ship review only;
   after the merge gate is approved, never
+- A declared P1 follow-up is a real `advisory` ticket (`blocked_by: ""`, no
+  `spawned_by_kind`), never a report line — same rule as operator.md B7; brief
+  and report lines carry the ticket key
+- `Approve_deploy` `InProgress` = waiting on a human, not on you: page and park
+  within ~10 polls, never poll to a timeout, and never start a third execution
+  for an identical failure signature
