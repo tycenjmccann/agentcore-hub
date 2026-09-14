@@ -1143,9 +1143,9 @@ def check_parity(contract, contract_path, stack, scan_targets, explain, strict, 
             declared_by = sorted(p for p in pb if name in effective_vars(stack, p))
             for ln in lines:
                 if declared_by:
-                    viol.add((display, ln, name, "reads %s which pipeline-contract.json does not declare for [%s] - declared in pipeline-stack.ts but not in pipeline-contract.json: deploy the stack (./deploy/pipeline/deploy.sh) then add it to the contract, or make the read tolerate absence (${%s:-})%s" % (name, pb_slash, name, note)))
+                    viol.add((display, ln, name, "reads %s which pipeline-contract.json does not declare for [%s] - declared in pipeline-stack.ts but not in pipeline-contract.json - fix: deploy the stack (./deploy/pipeline/deploy.sh) then add %s under buildspecs[\"%s\"].provides, or add it there with \"absence\": \"tolerated\" and read it as ${%s:-}%s" % (name, pb_slash, name, key, name, note)))
                 else:
-                    viol.add((display, ln, name, "reads %s which pipeline-contract.json does not declare for [%s] - fix: if the deployed stack provides it (./deploy/pipeline/deploy.sh has run), add it under buildspecs[\"%s\"].provides; otherwise make the read tolerate absence or drop it, or add it to allow with a reason%s" % (name, pb_slash, key, note)))
+                    viol.add((display, ln, name, "reads %s which pipeline-contract.json does not declare for [%s] - fix: to keep it as a pipeline arg, add %s to %s and run ./deploy/pipeline/deploy.sh, then add it under buildspecs[\"%s\"].provides; otherwise drop the read or add %s to allow with a reason%s" % (name, pb_slash, name, S, key, name, note)))
         check_tokens(display, s["tokens"], note)
         if strict:
             for name, e in provides.items():

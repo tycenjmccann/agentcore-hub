@@ -279,7 +279,8 @@ commit; it is never approved by software. Four moving parts:
    must exist in `pipeline-stack.ts` (the contract cannot invent an argument), but a
    stack-source argument absent from the contract is legal and means "not yet
    confirmed deployed" - the read fails until `deploy.sh` has run and the entry is
-   added, or the buildspec reads it as `${X:-}`. Nothing is generated from the
+   added - with `"absence": "tolerated"` if the buildspec reads it as `${X:-}`,
+   which on its own does not satisfy the guard. Nothing is generated from the
    stack: a stack-derived contract would have passed #576.
 
 Three checkpoints — decide, skip, re-verify — all fail closed in the same
