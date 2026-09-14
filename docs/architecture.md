@@ -852,6 +852,8 @@ So empty is now its own case, and it is sound for a structural reason rather tha
 
 One residual survives and is deliberately accepted: asymmetric wiring *plus* **deletion** of the record between `decide` and the re-read presents as a genuine 404, so it would proceed without a human. Unlike the failure class above, that one really is admin-only — `s3:DeleteObject` on `pipeline-artifacts/ship-approvals/*` is explicitly Denied to all three CodeBuild roles and absent from the tools Lambda — and an admin who can mis-wire the stack can delete the Approval stage outright, so it grants no new privilege. Closing it would require the Deploy role to read pipeline state (`codepipeline:GetPipelineState`), i.e. a wider role and another stack handoff. The three checkpoints are all still present; the handoff remains required for the *skip* feature, no longer for deploying at all.
 
+**Guarded since TEAM-4563/TEAM-4579.** The two-clock gap above is now caught in CI: `deploy/pipeline/pipeline-contract.json` declares, per buildspec, the env vars the *deployed* stack provides, and `scripts/check-pipeline-contract.sh` fails any buildspec read the contract does not cover - including a var that pipeline-stack.ts already declares in source (the #576 shape), with the fix "deploy the stack, then advance the contract, or read it as `${X:-}`". The contract is a human-advanced declaration, never generated from the stack, precisely because a stack-derived contract would have passed #576.
+
 ---
 
 ### DL-012: System Prompts Baked at Deploy Time (Not Passed at Invocation)

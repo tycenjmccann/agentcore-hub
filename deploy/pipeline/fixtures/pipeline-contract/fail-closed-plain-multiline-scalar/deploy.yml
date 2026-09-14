@@ -1,0 +1,8 @@
+version: 0.2
+env:
+  shell: bash
+phases:
+  build:
+    commands:
+      - docker run
+        UNDECL_C=1 echo "$UNDECL_C"
