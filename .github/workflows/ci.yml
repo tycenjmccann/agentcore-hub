@@ -96,6 +96,14 @@ jobs:
       - name: Deploy-surface manifest guard
         run: ./scripts/check-deploy-surfaces.sh
 
+      # TEAM-4563: the stack PROVIDES pipeline args, the buildspecs CONSUME them,
+      # and pipeline-contract.json is the human-advanced record of what the
+      # DEPLOYED stack provides (PR #576 agreed with its own stack source and
+      # still broke main). Path-filtering a required check is an anti-pattern:
+      # runs unconditionally, <5 s.
+      - name: Pipeline arg contract guard
+        run: ./scripts/check-pipeline-contract.sh
+
       # Open-source repo: real account ids/ARNs/buckets must never be committed
       # (they leaked via autonomous-pipeline PRs #371/#395/#535 into test
       # fixtures + a doc + source comments). Fails on either real account id in
@@ -173,6 +181,7 @@ jobs:
           deploy/pipeline/test_update_runtime_image.py
           deploy/pipeline/test_buildspec_ci_exit_codes.py
           deploy/pipeline/test_preapproved_check.py
+          deploy/pipeline/test_check_pipeline_contract.py
 
   cloud-code-ui:
     name: Cloud Code UI (mocked, no AWS)

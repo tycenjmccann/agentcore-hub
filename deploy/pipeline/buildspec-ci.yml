@@ -134,6 +134,10 @@ phases:
       # Every lambda/* and deploy/* surface must be in the Deploy stage's manifest
       # (or explicitly handoff/excluded) — otherwise it silently drifts behind main.
       - "./scripts/check-deploy-surfaces.sh"
+      # Mirrors ci.yml's 'Pipeline arg contract guard' step (TEAM-4563): what the
+      # deployed pipeline provides vs what the buildspecs read; fails on a read the
+      # contract does not cover, even when the stack SOURCE declares it (#576).
+      - "./scripts/check-pipeline-contract.sh"
 
   build:
     commands:
@@ -198,6 +202,7 @@ phases:
           deploy/pipeline/test_update_runtime_image.py \
           deploy/pipeline/test_discover_live_env.py \
           deploy/pipeline/test_buildspec_ci_exit_codes.py \
+          deploy/pipeline/test_check_pipeline_contract.py \
           deploy/pipeline/test_preapproved_check.py || { rc=$?; deactivate; echo "runtime-agent pytest battery FAILED (exit $rc)"; exit "$rc"; }
         deactivate
       # HARD GATE: lambda-zip manifest integrity (the guard DEPLOY.md's inline zip bypassed)
