@@ -826,6 +826,20 @@ class Defs:
         self.selfref = {}   # name -> lines (assignments that were reads)
         self.export_reads = []  # (name, offset)
 
+    def scoped(self):
+        """N2: a `$( ... )` / backtick body runs in a SUBSHELL - an assignment inside a
+        command substitution never defines the parent-shell variable. The recursive scan
+        gets a child whose `defined` is a COPY (it inherits the parent's definitions and
+        its own never flow back), while `selfref` and `export_reads` stay the parent's own
+        objects: those are READS and must still flow up (a bare `export FOO` inside a
+        substitution is a read of FOO). Reads via $NAME are unaffected either way -
+        scan_buildspec extracts them from read_text globally, not from the walk."""
+        child = Defs()
+        child.defined = dict(self.defined)
+        child.selfref = self.selfref
+        child.export_reads = self.export_reads
+        return child
+
 
 def _line_of(text, pos):
     return text.count("\n", 0, pos) + 1
@@ -850,7 +864,9 @@ def _assign(word, w_start, read_text, defs, walk_text):
 
 def scan_statements(walk_text, read_text, lo, hi, defs):
     """D8: definitions only in statement position. Words are consumed by consume_word;
-    $( ... ) / `...` bodies are scanned recursively."""
+    $( ... ) / `...` bodies are scanned recursively, in a SUBSHELL scope (N2,
+    Defs.scoped) - a definition inside a command substitution does not define the
+    parent-shell variable, while reads inside it still count."""
     i = lo
     stmt = True
     pending = None  # builtin handler state: (kind, flagsdone)
@@ -871,7 +887,7 @@ def scan_statements(walk_text, read_text, lo, hi, defs):
         i, subs = consume_word(walk_text, i, hi)
         word = walk_text[w_start:i]
         for s in subs:
-            scan_statements(walk_text, read_text, s[0], s[1], defs)
+            scan_statements(walk_text, read_text, s[0], s[1], defs.scoped())
         if pending is not None:
             kind, state = pending
             if word.startswith("-") and kind != "for" and kind != "select":

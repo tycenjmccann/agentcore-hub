@@ -239,6 +239,16 @@ CASES = [
      "buildspec.yml:14 - the quote opened here is never closed before the block ends - fix: "
      "close the quote before the block ends, or move the command into a script file under "
      "deploy/pipeline/ and call it from the buildspec"),
+    # N2: a `$( ... )` body runs in a subshell, so its definitions do not define the
+    # parent-shell variable - but reads inside it still count
+    ("subshell-assignment-does-not-define", (), 1,
+     'FAIL: buildspec.yml:15 reads UNDECL_X which pipeline-contract.json does not declare for '
+     '[fixture-build/Build_and_gate] - fix: to keep it as a pipeline arg, add UNDECL_X to '
+     'stack.txt and run ./deploy/pipeline/deploy.sh, then add it under '
+     'buildspecs["buildspec.yml"].provides; otherwise drop the read or add UNDECL_X to allow '
+     'with a reason'),
+    ("subshell-result-assigned-in-parent-pass", (), 0,
+     "OK: pipeline contract - 2 buildspecs, 5 provided vars, 1 namespace refs checked"),
 ]
 
 
@@ -317,6 +327,19 @@ def test_unquoted_heredoc_hash_line_is_a_read_not_a_comment():
     walker, so the line is a read and never a definition."""
     out = output(run_case("heredoc-unquoted-hash-line-read"))
     assert "buildspec.yml:15 reads UNDECL_HH" in out, out
+
+
+def test_subshell_definitions_do_not_leak_but_reads_do():
+    """N2: `echo "$(UNDECL_X=local)"` does not define UNDECL_X for the parent shell, so
+    the read on the next line is graded; a bare `export UNDECL_Y` inside the same kind of
+    subshell is a read and still flows up. The pass sibling proves the scoping did not
+    strip a legitimate parent definition: `X=$(cmd)` assigns in the PARENT."""
+    out = output(run_case("subshell-assignment-does-not-define"))
+    assert "buildspec.yml:15 reads UNDECL_X" in out, out
+    assert "buildspec.yml:16 reads UNDECL_Y" in out, out
+    ok = output(run_case("subshell-result-assigned-in-parent-pass"))
+    for name in ("X", "Y", "v"):
+        assert "reads %s " % name not in ok, ok
 
 
 def test_undeclared_plain_read_via_buildspec_flag(tmp_path):
