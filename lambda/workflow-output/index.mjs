@@ -39,6 +39,9 @@ async function publishJourneyEvent(workflowId, type, detail) {
   } catch { /* non-fatal */ }
 }
 
+// TEAM-4569: no s3Key here — main.py's WorkflowOutput___submit_ticket_plan wrapper
+// forwards no `requirements` body at all, so there is no document body to pass by
+// reference; `tickets` is a short JSON array the agent has to author anyway.
 async function submitTicketPlan({ workflow_id, requirements, tickets }) {
   const key = `workflows/${workflow_id}/shared/ticket-plan.json`;
   await s3.send(new PutObjectCommand({
@@ -55,7 +58,82 @@ async function submitTicketPlan({ workflow_id, requirements, tickets }) {
   };
 }
 
-async function saveDesignDoc({ workflow_id, agent_id, title, content, format = "markdown", doc_type }) {
+// ─── save_design_doc: pass-by-reference (TEAM-4569) ────────────────────────────
+// A design doc used to reach this tool only as an inline `content` string, so an
+// agent had to re-emit the whole document as a tool argument — pure output
+// tokens. A 97 KB doc killed backend_designer with MaxTokensReachedException
+// four times, on a document that was ALREADY in S3. So the doc may now arrive by
+// key: the agent writes it once with S3Storage___write_object and passes s3Key,
+// and this Lambda reads the bytes itself.
+
+// FOOTGUN GUARD — NOT a security boundary, and NOT an authorization check. Do not
+// harden it into one. The calling agent already has bucket-wide read through
+// S3Storage___read_object, and this Lambda's role already holds s3:GetObject on
+// the whole artifact bucket (deploy/setup-lambda-role.sh, Sid "ObjectRW"), so
+// nothing here restricts what an agent can reach. The guard exists only so a
+// model that pastes an s3:// URL, a leading-slash path, or a ../ traversal gets a
+// legible error naming the shape it should have sent instead of an opaque
+// NoSuchKey. A future reader looking for the access-control boundary will not
+// find it here — there isn't one at this layer, by design.
+function assertPlainWorkflowKey(s3Key) {
+  const shape = `expected a plain object key under workflows/ (e.g. "workflows/<workflow_id>/<agent_id>/design.md") - no s3:// URL, no leading "/", no ".." segment`;
+  const bad = (why) => new Error(`save_design_doc rejected s3Key "${s3Key}": ${why}. ${shape}.`);
+  if (/^s3:\/\//i.test(s3Key)) throw bad("it is an s3:// URL, not an object key");
+  if (s3Key.startsWith("/")) throw bad("it starts with \"/\"");
+  // Exact-segment test, not a substring test: "workflows/wf_1/a..b.md" is a fine key.
+  if (s3Key.split("/").includes("..")) throw bad("it contains a \"..\" path segment");
+  if (!s3Key.startsWith("workflows/")) throw bad("it is outside the workflows/ prefix");
+}
+
+/**
+ * Resolve the document body for save_design_doc — the ONE place the
+ * by-reference path lives, so the persist path below stays untouched.
+ * Returns { content, sourceKey }; sourceKey is null on the inline path.
+ */
+async function resolveDesignDocContent({ content, s3Key }) {
+  const key = typeof s3Key === "string" ? s3Key.trim() : "";
+  const inline = typeof content === "string" ? content : "";
+
+  if (!key) {
+    if (!inline.trim()) {
+      throw new Error("content or s3Key is required - pass the document inline, or write it to S3 first and pass its key.");
+    }
+    return { content: inline, sourceKey: null };
+  }
+
+  // Validate BEFORE reading anything: a rejected key must not fall back to
+  // `content` either, or a typo'd key would silently save the wrong document.
+  assertPlainWorkflowKey(key);
+  if (inline.trim()) {
+    console.warn(`[save_design_doc] both content and s3Key were supplied; s3Key "${key}" takes precedence and the inline content is ignored`);
+  }
+
+  let body;
+  try {
+    const r = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: key }));
+    body = await r.Body.transformToString();
+  } catch (err) {
+    throw new Error(`save_design_doc could not read s3Key "${key}" from the artifact bucket (${err.name}: ${err.message}) - that object is missing or unreadable, so nothing was saved.`);
+  }
+  // An empty source is an error, not an empty save. A stranded ticket is
+  // recoverable by re-running the agent; a critical:true manifest entry pointing
+  // at an empty canonical design doc is not — it silently poisons every
+  // downstream reader, which sees a registered ★ design doc and reads nothing.
+  if (!body || !body.trim()) {
+    throw new Error(`save_design_doc read s3Key "${key}" but it is empty - nothing was saved. Write the document to that key first, then register it.`);
+  }
+  return { content: body, sourceKey: key };
+}
+
+async function saveDesignDoc({ workflow_id, agent_id, title, content, format = "markdown", doc_type, s3Key }) {
+  // Resolve the body BEFORE anything below reads or writes: on the by-reference
+  // path a bad key must leave the bucket exactly as it was. Everything after
+  // this line is the pre-4569 persist path, unchanged and shared by both paths.
+  const source = await resolveDesignDocContent({ content, s3Key });
+  content = source.content;
+
+  // `format` decides ext + ContentType — never the source key's extension: a doc
+  // staged as spec.json is still registered as the markdown the caller declared.
   const ext = format === "json" ? "json" : "md";
   // Deterministic filename: an agent re-saving (retry, crash recovery, duplicate
   // ticket) overwrites its own doc in place instead of accreting a new
@@ -116,6 +194,9 @@ async function saveDesignDoc({ workflow_id, agent_id, title, content, format = "
         (otherDocs.length
           ? ` NOTE: other design docs already exist for this workflow (${otherDocs.join(", ")}). If your ticket duplicates one of them, reference/update the existing doc instead of authoring a parallel one.`
           : ""),
+    // TEAM-4569: only on the by-reference path, so an inline save's response keeps
+    // exactly its pre-4569 key set.
+    ...(source.sourceKey ? { source_s3_key: source.sourceKey } : {}),
   };
 }
 
@@ -371,13 +452,19 @@ const TOOLS = {
 
 /**
  * Infer tool from flat args when gateway doesn't include tool name.
+ * Exported for unit tests: routing is pure, and driving it through handler()
+ * with a flat event would run the persist path just to observe a route.
  */
-function inferToolFromArgs(args) {
+export function inferToolFromArgs(args) {
   if (args.requirements && args.tickets) return "submit_ticket_plan";
   if (args.title && args.content && args.agent_id) return "save_design_doc";
   if (args.ticket_id && args.summary) return "report_completion";
   if (args.tickets) return "submit_ticket_plan";
   if (args.content && args.workflow_id) return "save_design_doc";
+  // TEAM-4569: a by-reference save carries no `content` at all, so the rule above
+  // can never match it. `s3Key` appears in no other tool's argument set, so this
+  // leaves every rule before it with exactly its previous outcome.
+  if (args.s3Key && args.workflow_id) return "save_design_doc";
   return null;
 }
 

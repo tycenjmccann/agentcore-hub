@@ -13,12 +13,54 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
  * because a downstream reader must never have to guess what a novel value meant.
  */
 
-const h = vi.hoisted(() => ({ puts: [], warns: [] }));
+/**
+ * save_design_doc's by-reference path (TEAM-4569) is also covered here, which is
+ * why the S3 mock below is backed by an in-test object map rather than returning
+ * a bare {}: reading a doc by key, the shared/ dedupe listing and the manifest
+ * round-trip are all the SAME bucket, so a test that writes then re-saves has to
+ * see its own bytes. `h.puts` still records PutObjectCommand inputs verbatim, so
+ * every report_completion assertion above/below is untouched by the redesign.
+ */
+const h = vi.hoisted(() => ({ puts: [], warns: [], gets: [], objects: new Map() }));
+
+const asString = (body) => (typeof body === "string" ? body : Buffer.from(body).toString("utf8"));
 
 vi.mock("@aws-sdk/client-s3", () => ({
   S3Client: class {
     async send(cmd) {
-      if (cmd?.constructor?.name === "PutObjectCommand") h.puts.push(cmd.input);
+      const name = cmd?.constructor?.name;
+      const input = cmd?.input || {};
+      if (name === "PutObjectCommand") {
+        h.puts.push(input);
+        h.objects.set(input.Key, asString(input.Body));
+        return {};
+      }
+      if (name === "GetObjectCommand") {
+        h.gets.push(input);
+        if (!h.objects.has(input.Key)) {
+          // Real S3 surfaces a missing object this way, and the Lambda's error
+          // message quotes err.name — so the stub has to carry the same name.
+          const err = new Error(`The specified key does not exist: ${input.Key}`);
+          err.name = "NoSuchKey";
+          throw err;
+        }
+        const body = h.objects.get(input.Key);
+        return {
+          ContentType: "text/markdown",
+          Body: {
+            transformToString: async () => body,
+            transformToByteArray: async () => Buffer.from(body),
+          },
+        };
+      }
+      if (name === "ListObjectsV2Command") {
+        const prefix = input.Prefix || "";
+        return {
+          Contents: [...h.objects.keys()]
+            .filter((k) => k.startsWith(prefix))
+            .map((k) => ({ Key: k, Size: h.objects.get(k).length, LastModified: new Date(0) })),
+        };
+      }
       return {};
     }
   },
@@ -39,7 +81,7 @@ vi.mock("@aws-sdk/lib-dynamodb", () => ({
 }));
 
 process.env.ARTIFACT_BUCKET = "test-bucket";
-const { handler } = await import("./index.mjs");
+const { handler, inferToolFromArgs } = await import("./index.mjs");
 
 /** The completion record the call wrote, parsed. */
 const record = () => JSON.parse(h.puts.find((p) => p.Key?.startsWith("completions/")).Body);
@@ -63,6 +105,8 @@ const BASE_KEYS = ["ticket_id", "summary", "artifacts", "branch", "commit_sha", 
 beforeEach(() => {
   h.puts.length = 0;
   h.warns.length = 0;
+  h.gets.length = 0;
+  h.objects.clear();
   vi.spyOn(console, "warn").mockImplementation((...args) => h.warns.push(args.join(" ")));
 });
 
@@ -243,5 +287,198 @@ describe("report_completion — approved_head_sha", () => {
     await report({ approved_head_sha: "   " });
     expect("approved_head_sha" in record()).toBe(false);
     expect(h.warns.join("\n")).not.toMatch(/approved_head_sha/);
+  });
+});
+
+// ─── TEAM-4569: save_design_doc pass-by-reference ─────────────────────────────
+//
+// The doc used to reach this tool only as an inline `content` string, so an agent
+// had to re-emit the whole document as a tool argument. A 97 KB design doc killed
+// backend_designer with MaxTokensReachedException four times — on a document that
+// was ALREADY in S3. So `s3Key` lets the agent register bytes it already wrote.
+//
+// Two properties carry the weight. (1) Nothing may be written before the key
+// validates and the GET succeeds: a half-saved doc leaves a critical:true
+// manifest entry pointing at garbage, which silently poisons every downstream
+// reader, whereas a hard error just strands a recoverable ticket. (2) The inline
+// path must be untouched — same writes, same response key set — because every
+// small-doc caller still uses it.
+
+const WF = "wf_1";
+const DESIGNER = "agentcore_hub_backend_designer";
+// The destination keys saveDesignDoc computes for that agent (no title/format is
+// sent by main.py, so the slug is deterministic).
+const DEST = `workflows/${WF}/${DESIGNER}/design-doc-${DESIGNER}.md`;
+const SHARED_DEST = `workflows/${WF}/shared/design-doc-${DESIGNER}.md`;
+// Where a designer stages a large doc per its blueprint: its OWN agent_id folder,
+// deliberately NOT shared/ — a staging file under shared/ would be picked up by
+// this tool's own dup-doc listing and reported back as a rival design doc.
+const STAGED = `workflows/${WF}/${DESIGNER}/backend-design.md`;
+const BIG_DOC = `# Backend design\n\n${"Section body.\n".repeat(50)}`;
+
+const saveDoc = (args) =>
+  handler({
+    tool_name: "WorkflowOutput___save_design_doc",
+    arguments: { workflow_id: WF, agent_id: DESIGNER, ...args },
+  });
+
+/** The tool's parsed success payload. */
+const saved = (res) => JSON.parse(res.content[0].text);
+const errorText = (res) => res.content[0].text;
+/** Bodies written to the two destination keys, in write order. */
+const written = (key) => h.puts.filter((p) => p.Key === key).map((p) => p.Body);
+/** Design-doc entries the manifest's design phase carries after the last write. */
+const manifestDesignEntries = () => {
+  const put = [...h.puts].reverse().find((p) => p.Key === `workflows/${WF}/shared/manifest.json`);
+  if (!put) return [];
+  return (JSON.parse(put.Body).phases.design || []).filter((e) => e.type === "design-doc");
+};
+
+// The exact response key set an inline save returned before TEAM-4569.
+const PRE_4569_RESPONSE_KEYS = ["status", "location", "shared_location", "existing_design_docs", "message"];
+
+describe("save_design_doc — s3Key reads the doc instead of taking it inline", () => {
+  it("(a) writes BOTH destination keys with the source object's body", async () => {
+    h.objects.set(STAGED, BIG_DOC);
+    await saveDoc({ s3Key: STAGED });
+    expect(written(DEST)).toEqual([BIG_DOC]);
+    expect(written(SHARED_DEST)).toEqual([BIG_DOC]);
+    // The source is registered, never consumed — no delete, no move.
+    expect(h.objects.get(STAGED)).toBe(BIG_DOC);
+  });
+
+  it("(b) returns the five pre-change keys plus source_s3_key", async () => {
+    h.objects.set(STAGED, BIG_DOC);
+    const r = saved(await saveDoc({ s3Key: STAGED }));
+    expect(Object.keys(r).sort()).toEqual([...PRE_4569_RESPONSE_KEYS, "source_s3_key"].sort());
+    expect(r.source_s3_key).toBe(STAGED);
+    expect(r.status).toBe("saved");
+    expect(r.location).toBe(`s3://test-bucket/${DEST}`);
+    expect(r.shared_location).toBe(`s3://test-bucket/${SHARED_DEST}`);
+    expect(r.existing_design_docs).toEqual([]);
+  });
+
+  it("(c) registers ONE critical manifest entry, and a re-save adds no second one", async () => {
+    h.objects.set(STAGED, BIG_DOC);
+    await saveDoc({ s3Key: STAGED });
+    const entries = manifestDesignEntries();
+    expect(entries).toHaveLength(1);
+    expect(entries[0].critical).toBe(true);
+    // The entry must point at the SHARED copy — that is the key downstream
+    // agents are handed in their context, not the per-agent one.
+    expect(entries[0].s3Key).toBe(SHARED_DEST);
+
+    // Re-save over the doc that now exists in shared/: an update in place, and
+    // crucially not a duplicate ★ entry in the next phase's prompt.
+    h.puts.length = 0;
+    h.objects.set(STAGED, `${BIG_DOC}\n## Revised\n`);
+    const r = saved(await saveDoc({ s3Key: STAGED }));
+    expect(r.status).toBe("updated");
+    expect(manifestDesignEntries()).toHaveLength(0); // no manifest write at all
+    expect(written(SHARED_DEST)).toEqual([`${BIG_DOC}\n## Revised\n`]);
+  });
+
+  it("(d) both supplied: s3Key wins, content is ignored, and a warning says so", async () => {
+    h.objects.set(STAGED, BIG_DOC);
+    const res = await saveDoc({ s3Key: STAGED, content: "# The stale inline copy\n" });
+    expect(res.isError).toBeFalsy();
+    expect(written(SHARED_DEST)).toEqual([BIG_DOC]);
+    expect(h.warns.join("\n")).toMatch(/both content and s3Key/);
+    expect(h.warns.join("\n")).toMatch(/precedence/);
+    expect(saved(res).source_s3_key).toBe(STAGED);
+  });
+
+  it("(e) neither, and both blank, is an error that writes nothing", async () => {
+    for (const args of [{}, { content: "", s3Key: "" }, { content: "   ", s3Key: "  \n " }]) {
+      h.puts.length = 0;
+      const res = await saveDoc(args);
+      expect(res.isError).toBe(true);
+      expect(errorText(res)).toMatch(/content or s3Key is required/);
+      expect(h.puts).toHaveLength(0);
+    }
+  });
+
+  it("(f) a missing object names the key and writes nothing", async () => {
+    const res = await saveDoc({ s3Key: STAGED });
+    expect(res.isError).toBe(true);
+    expect(errorText(res)).toContain(STAGED);
+    expect(errorText(res)).toMatch(/NoSuchKey/);
+    expect(h.puts).toHaveLength(0);
+  });
+
+  it("(g) an empty or whitespace-only object names the key and writes nothing", async () => {
+    for (const body of ["", "   \n\t  "]) {
+      h.puts.length = 0;
+      h.objects.set(STAGED, body);
+      const res = await saveDoc({ s3Key: STAGED });
+      expect(res.isError).toBe(true);
+      expect(errorText(res)).toContain(STAGED);
+      expect(errorText(res)).toMatch(/empty/);
+      expect(h.puts).toHaveLength(0);
+    }
+  });
+
+  it("(h) the footgun guard rejects a malformed key with zero reads and zero writes", async () => {
+    const rejected = [
+      [`s3://bucket/workflows/${WF}/x.md`, /s3:\/\/ URL/],
+      [`/workflows/${WF}/x.md`, /starts with/],
+      [`workflows/${WF}/../../secrets.md`, /path segment/],
+      ["blueprints/backend-designer.md", /outside the workflows\/ prefix/],
+    ];
+    for (const [key, why] of rejected) {
+      h.puts.length = 0;
+      h.gets.length = 0;
+      const res = await saveDoc({ s3Key: key });
+      expect(res.isError).toBe(true);
+      expect(errorText(res)).toContain(key);
+      expect(errorText(res)).toMatch(why);
+      // Names the expected shape, not just the rejection.
+      expect(errorText(res)).toMatch(/plain object key under workflows\//);
+      expect(h.gets).toHaveLength(0);
+      expect(h.puts).toHaveLength(0);
+    }
+  });
+
+  it("(h2) an invalid key never falls back to the inline content", async () => {
+    const res = await saveDoc({ s3Key: "/etc/passwd", content: "# a perfectly good doc\n" });
+    expect(res.isError).toBe(true);
+    expect(h.puts).toHaveLength(0);
+  });
+
+  it("(i) the inline path is unchanged — both keys written, no source_s3_key", async () => {
+    const res = await saveDoc({ content: "# Small design\n\nOne paragraph.\n" });
+    expect(written(DEST)).toEqual(["# Small design\n\nOne paragraph.\n"]);
+    expect(written(SHARED_DEST)).toEqual(["# Small design\n\nOne paragraph.\n"]);
+    const r = saved(res);
+    expect(Object.keys(r).sort()).toEqual([...PRE_4569_RESPONSE_KEYS].sort());
+    expect("source_s3_key" in r).toBe(false);
+    expect(h.gets.some((g) => g.Key === STAGED)).toBe(false);
+  });
+
+  it("format decides the extension — never the source key's", async () => {
+    // A doc staged as .json but registered as markdown is stored as the markdown
+    // the caller declared. Inferring from the source key would rename the file
+    // and change its ContentType behind the caller's back.
+    const jsonStaged = `workflows/${WF}/${DESIGNER}/spec.json`;
+    h.objects.set(jsonStaged, '{"ok":true}');
+    await saveDoc({ s3Key: jsonStaged });
+    expect(written(SHARED_DEST)).toEqual(['{"ok":true}']);
+    expect(h.puts.find((p) => p.Key === SHARED_DEST).ContentType).toBe("text/markdown");
+  });
+});
+
+describe("inferToolFromArgs — (j) flat-args routing", () => {
+  it("routes a by-reference save with no content at all", () => {
+    expect(inferToolFromArgs({ s3Key: STAGED, workflow_id: WF, agent_id: DESIGNER })).toBe("save_design_doc");
+  });
+
+  // Every pre-4569 outcome, asserted so the new rule cannot have shadowed one.
+  it("keeps every existing rule's outcome", () => {
+    expect(inferToolFromArgs({ ticket_id: "TEAM-1", summary: "done" })).toBe("report_completion");
+    expect(inferToolFromArgs({ content: "# doc", workflow_id: WF })).toBe("save_design_doc");
+    expect(inferToolFromArgs({ requirements: "r", tickets: "[]" })).toBe("submit_ticket_plan");
+    expect(inferToolFromArgs({ tickets: "[]" })).toBe("submit_ticket_plan");
+    expect(inferToolFromArgs({ title: "T", content: "# doc", agent_id: DESIGNER })).toBe("save_design_doc");
+    expect(inferToolFromArgs({ nothing: "useful" })).toBe(null);
   });
 });

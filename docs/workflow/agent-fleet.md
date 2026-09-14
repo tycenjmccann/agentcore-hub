@@ -118,7 +118,7 @@ The pipeline flows Requirements → 8 parallel Design → 3 Dev → Review (code
 | `Pipeline___start_ci_build` | agentcore-hub-pipeline-tools | Trigger a CI build |
 | `Pipeline___capabilities` | agentcore-hub-pipeline-tools | Report which pipeline actions are available |
 | `WorkflowOutput___report_completion` | agentcore-hub-workflow-output | Mark the agent's work done |
-| `WorkflowOutput___save_design_doc` | agentcore-hub-workflow-output | Save a design artifact |
+| `WorkflowOutput___save_design_doc` | agentcore-hub-workflow-output | Save a design artifact — inline `content`, or by reference with `s3Key` (a doc the agent already wrote to the artifact bucket, so a large doc is never re-emitted as a tool argument) |
 | `WorkflowOutput___submit_ticket_plan` | agentcore-hub-workflow-output | Batch-create the ticket plan |
 
 ### MCP Tools (GitHub)
