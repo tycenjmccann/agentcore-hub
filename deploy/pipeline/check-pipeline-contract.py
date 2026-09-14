@@ -23,6 +23,11 @@ declaration of what the DEPLOYED pipeline provides, and this guard is asymmetric
     source, not yet confirmed deployed" - but any buildspec that READS it fails
     here until a human deploys the stack and advances the contract (rule P4).
 
+D10: DEFINED is whole-file and ORDER-INSENSITIVE - functions are defined before
+they are called and CodeBuild runs all phases of a buildspec in one shell, so a
+read above a later definition of the same name is not a violation. The #576
+class is an arg the stack never provides, not an ordering mistake.
+
 Runs on both CI rails (.github/workflows/ci.yml and buildspec-ci.yml) via
 scripts/check-pipeline-contract.sh. Same pass shape as check-deploy-surfaces.sh:
 stdlib only (argparse, glob, json, re, sys, pathlib.Path), no AWS, no network, it
@@ -196,6 +201,26 @@ def _string_after(code, masked, pos, what, path):
     return m.group(1), m.end()
 
 
+def _split_entries(seg):
+    """Split one depth-1 env-block segment into (offset, text) entries at commas
+    that are not nested. seg comes from the MASKED source, so a comma inside a
+    string literal is already blanked; braces, brackets and parens are tracked so
+    a comma inside `{ value: f(a, b) }` cannot split an entry."""
+    out = []
+    depth = 0
+    start = 0
+    for i, ch in enumerate(seg):
+        if ch in "{[(":
+            depth += 1
+        elif ch in "}])":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            out.append((start, seg[start:i]))
+            start = i + 1
+    out.append((start, seg[start:]))
+    return out
+
+
 def parse_stack(path_str):
     """Return the stack-source view (D19 step 6)."""
     p = Path(path_str)
@@ -259,17 +284,20 @@ def parse_stack(path_str):
                 if line_depth == 1 and line_start < seg_end:
                     seg = masked[line_start:seg_end]
                     if seg.strip():
-                        mk = RE_ENV_KEY.match(seg)
-                        if not mk:
-                            raise Infra("%s:%d: unrecognised entry in %s block: %r" % (path_str, line_of(line_start), what, code[line_start:seg_end].strip()))
-                        if mk.group(1) is not None:
-                            if mk.group(1) != "commonEnvVars":
-                                raise Infra("%s:%d: spread of %s in %s block (only ...commonEnvVars is understood)" % (path_str, line_of(line_start), mk.group(1), what))
-                            keys.append(("...commonEnvVars", line_of(line_start), True))
-                        else:
-                            s, e = (mk.span(2) if mk.group(2) is not None else mk.span(3))
-                            key = code[line_start + s:line_start + e]
-                            keys.append((key, line_of(line_start), False))
+                        for off, piece in _split_entries(seg):
+                            if not piece.strip():
+                                continue
+                            base = line_start + off
+                            mk = RE_ENV_KEY.match(piece)
+                            if not mk:
+                                raise Infra("%s:%d: unrecognised entry in %s block: %r" % (path_str, line_of(base), what, code[base:base + len(piece)].strip()))
+                            if mk.group(1) is not None:
+                                if mk.group(1) != "commonEnvVars":
+                                    raise Infra("%s:%d: spread of %s in %s block (only ...commonEnvVars is understood)" % (path_str, line_of(base), mk.group(1), what))
+                                keys.append(("...commonEnvVars", line_of(base), True))
+                            else:
+                                s, e = (mk.span(2) if mk.group(2) is not None else mk.span(3))
+                                keys.append((code[base + s:base + e], line_of(base), False))
                 line_start = k + 1
                 line_depth = depth
             if ch == "{":
@@ -371,7 +399,11 @@ def parse_stack(path_str):
 # Buildspec scan (D3-D10, D16-D18)
 # -----------------------------------------------------------------------------
 
-RE_BLOCK_OPEN = re.compile(r"^(\s*)(?:-\s*|[A-Za-z_-]+\s*:\s*)[|>][-+0-9]*\s*(#.*)?$")
+RE_BLOCK_OPEN = re.compile(r"^(\s*)(?:-\s*|[A-Za-z_-]+\s*:\s*)\|[-+0-9]*\s*(#.*)?$")
+RE_FOLD_OPEN = re.compile(r"^(\s*)(?:-\s*|[A-Za-z_-]+\s*:\s*)>[-+0-9]*\s*(#.*)?$")
+RE_PLAIN_ITEM = re.compile(r"^(\s*)-\s+(?![\"'|>#])(\S.*)$")
+RE_PLAIN_KEYVAL = re.compile(r"^(\s*)[A-Za-z_][A-Za-z0-9_-]*\s*:[ \t]+(?![\"'|>#])(\S.*)$")
+RE_MAPKEY_ISH = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*\s*:(\s|$)")
 RE_DQ_SCALAR = re.compile(r'^(\s*)-\s*"((?:[^"\\]|\\.)*)"\s*(#.*)?$')
 RE_SQ_SCALAR = re.compile(r"^(\s*)-\s*'((?:[^']|'')*)'\s*(#.*)?$")
 RE_DQ_OPEN = re.compile(r'^(\s*)-\s*"')
@@ -397,8 +429,22 @@ def _indent(line):
     return len(line) - len(line.lstrip(" "))
 
 
+def _next_content_line(lines, idx):
+    """Index of the next non-blank, non-comment-only line after idx, or None."""
+    j = idx + 1
+    while j < len(lines):
+        s = lines[j].strip()
+        if s and not s.startswith("#"):
+            return j
+        j += 1
+    return None
+
+
 def classify_yaml_lines(text, path_str):
-    """Return (bash_lines, env_defined, exported) -- one bash-view line per file line."""
+    """Return (bash_lines, env_defined, exported) -- one bash-view line per file line.
+    A folded (`>`) or plain multi-line scalar is rejected (exit 2): its continuation
+    lines would be scanned as separate statements and an argument such as `X=1`
+    would read as a definition, hiding the read."""
     lines = text.split("\n")
     out = []
     block_indent = None
@@ -409,6 +455,8 @@ def classify_yaml_lines(text, path_str):
                 out.append(line)
                 continue
             block_indent = None
+        if RE_FOLD_OPEN.match(line):
+            raise Infra("unsupported folded multi-line scalar at %s:%d (use a quoted scalar or a | literal block)" % (path_str, ln))
         m = RE_BLOCK_OPEN.match(line)
         if m:
             block_indent = len(m.group(1))
@@ -425,6 +473,14 @@ def classify_yaml_lines(text, path_str):
             continue
         if RE_DQ_OPEN.match(line) or RE_SQ_OPEN.match(line):
             raise Infra("unsupported multi-line quoted scalar at %s:%d" % (path_str, ln))
+        m = RE_PLAIN_ITEM.match(line)
+        plain = bool(m) and not RE_MAPKEY_ISH.match(m.group(2))
+        if not plain:
+            plain = RE_PLAIN_KEYVAL.match(line) is not None
+        if plain:
+            nxt = _next_content_line(lines, idx)
+            if nxt is not None and _indent(lines[nxt]) > _indent(line):
+                raise Infra("unsupported plain multi-line scalar at %s:%d (use a quoted scalar)" % (path_str, ln))
         out.append(line)
 
     # env: block
@@ -463,25 +519,31 @@ def classify_yaml_lines(text, path_str):
 
 
 def strip_bash_comments(text):
-    """D5: '#' starts a comment when at line start / after whitespace, the count of
-    unescaped '"' before it on the line is even, and the next char is not '{'.
+    """D5: '#' starts a comment when it is at line start or after whitespace, the
+    next char is not '{', and it is outside BOTH quote kinds - a '"' toggles the
+    double-quoted state only outside single quotes and a "'" toggles the
+    single-quoted state only outside double quotes, so a '#' inside 'single
+    quotes' is data (a backslash escapes only outside single quotes, as in bash).
     Comment text -> spaces (offsets preserved)."""
     out_lines = []
     for line in text.split("\n"):
-        dq = 0
+        in_dq = False
+        in_sq = False
         k = 0
         cut = None
         while k < len(line):
             ch = line[k]
-            if ch == "\\":
+            if ch == "\\" and not in_sq:
                 k += 2
                 continue
-            if ch == '"':
-                dq += 1
-            elif ch == "#":
+            if ch == '"' and not in_sq:
+                in_dq = not in_dq
+            elif ch == "'" and not in_dq:
+                in_sq = not in_sq
+            elif ch == "#" and not in_dq and not in_sq:
                 prev_ws = (k == 0) or line[k - 1].isspace()
                 nxt = line[k + 1] if k + 1 < len(line) else ""
-                if prev_ws and dq % 2 == 0 and nxt != "{":
+                if prev_ws and nxt != "{":
                     cut = k
                     break
             k += 1
@@ -532,6 +594,9 @@ def remove_escapes(text):
 
 RE_READ_BARE = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*)")
 RE_READ_BRACED = re.compile(r"\$\{[#!]?([A-Za-z_][A-Za-z0-9_]*)")
+RE_ARITH = re.compile(r"\$?\(\((.*?)\)\)", re.S)
+RE_IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+ARITH_SKIP_PREV = set("${#")
 
 
 def _tolerant_at(text, pos, name):
@@ -539,7 +604,9 @@ def _tolerant_at(text, pos, name):
 
 
 def extract_reads(read_text, lo=0, hi=None):
-    """Return list of (name, offset, form) for every $NAME / ${NAME...} in [lo,hi)."""
+    """Return list of (name, offset, form) for every $NAME / ${NAME...} in [lo,hi),
+    plus every bare identifier inside a $(( ... )) / (( ... )) arithmetic span - a
+    bare identifier there IS a variable reference (`(( X > 0 ))` reads X)."""
     if hi is None:
         hi = len(read_text)
     seg = read_text[lo:hi]
@@ -549,6 +616,13 @@ def extract_reads(read_text, lo=0, hi=None):
     for m in RE_READ_BRACED.finditer(seg):
         form = "tolerant" if _tolerant_at(seg, m.start(), m.group(1)) else "bare"
         reads.append((m.group(1), lo + m.start(), form))
+    for m in RE_ARITH.finditer(seg):
+        base = m.start(1)
+        for im in RE_IDENT.finditer(m.group(1)):
+            k = base + im.start()
+            if k > 0 and seg[k - 1] in ARITH_SKIP_PREV:
+                continue
+            reads.append((im.group(0), lo + k, "bare"))
     return reads
 
 
@@ -936,7 +1010,9 @@ def check_parity(contract, contract_path, stack, scan_targets, explain, strict, 
     as `FAIL: <path>:<line> <message>` and a line-less one as `FAIL: <message>`
     (the path is then part of the message text). Every message ends in a one-line
     fix. The contract is always called by its literal basename pipeline-contract.json
-    in the fixed FR-6 phrases, even when --contract points at a fixture file."""
+    in the fixed FR-6 phrases, even when --contract points at a fixture file. P5: a
+    stack fromSourceFilename path missing a contract entry is itself a violation,
+    whatever its name - not just the buildspec-*.yml/*.yaml the CLI globs."""
     viol = set()
     allow = {k for k in contract["allow"] if k != "$comment"}
     names_in_stack = set(stack["providers"])
@@ -995,6 +1071,13 @@ def check_parity(contract, contract_path, stack, scan_targets, explain, strict, 
             viol.add((S, 0, ns, "%s has no variablesNamespace \"%s\" but pipeline-contract.json declares namespace %s - fix: remove the namespace or add variablesNamespace to the exporter action (a HANDOFF)" % (S, ns, ns)))
         elif actual != e["action"]:
             viol.add((S, 0, ns, "%s declares variablesNamespace \"%s\" on action %s but pipeline-contract.json says action %s - fix: correct namespaces[\"%s\"].action" % (S, ns, actual, e["action"], ns)))
+
+    # P5: a buildspec the STACK runs must have a contract entry, whatever its name
+    # (main()'s glob only closes buildspec-*.yml / *.yaml at two fixed locations).
+    for proj, bs in stack["buildspec_of_project"].items():
+        if bs in contract["buildspecs"]:
+            continue
+        viol.add((bs, 0, proj, "%s has no contract entry in pipeline-contract.json buildspecs but %s project %s runs it - fix: add buildspecs[\"%s\"] (providedBy + provides) or fix the stack's fromSourceFilename" % (bs, S, proj, bs)))
 
     scans = {}
     for disp, key, fpath, note in scan_targets:
@@ -1122,7 +1205,8 @@ def main(argv=None):
             for k in sorted(keys):
                 targets.append((k, k, str(root / k), ""))
             globbed = set()
-            for pat in ("deploy/pipeline/buildspec-*.yml", "buildspec-*.yml"):
+            for pat in ("deploy/pipeline/buildspec-*.yml", "deploy/pipeline/buildspec-*.yaml",
+                        "buildspec-*.yml", "buildspec-*.yaml"):
                 for g in glob.glob(str(root / pat)):
                     globbed.add(str(Path(g).resolve().relative_to(root.resolve())))
             extra = sorted(globbed - set(keys))

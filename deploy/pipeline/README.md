@@ -123,6 +123,19 @@ CodeBuild role's S3 grant, do not remove that Deny.
 | `rollback.sh` | on any Deploy-phase failure, restores the prior orchestrator zip + ECS image (snapshotted pre-deploy) |
 | `deploy.sh` | idempotent `cdk deploy` wrapper (sources `deploy/config.sh` for the account guard) |
 
+### What the arg-contract guard counts
+
+- A `#` inside `'single quotes'` is data, not a comment - a read after it still counts.
+- A folded (`>`) or plain multi-line scalar in a buildspec is rejected (exit 2, "use a
+  quoted scalar"): its continuation lines would be scanned as separate statements, so
+  an argument like `X=1` would read as a definition and hide the read.
+- Any path a `fromSourceFilename(...)` in the stack names must have a
+  `buildspecs[...]` entry, whatever the filename - not just `buildspec-*.yml`/`.yaml`.
+- Arithmetic counts: `$(( X + 1 ))` and `(( X > 0 ))` are reads of `X`.
+- D10: `DEFINED` is whole-file and order-insensitive - a read above a later definition
+  of the same name is not a violation. The #576 class is an arg the deployed stack
+  never provides, not an ordering mistake.
+
 ## Deploy
 
 ```bash

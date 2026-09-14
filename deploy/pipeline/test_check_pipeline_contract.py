@@ -98,7 +98,16 @@ CASES = [
     ("fail-closed-globbed-not-in-contract", (), 1,
      "FAIL: buildspec-extra.yml has no contract entry in pipeline-contract.json buildspecs "
      "- fix:"),
+    ("fail-closed-globbed-yaml-not-in-contract", (), 1,
+     "FAIL: buildspec-new.yaml has no contract entry in pipeline-contract.json buildspecs "
+     "- fix:"),
+    # P5: any fromSourceFilename() the stack runs needs a contract entry, whatever
+    # its name - not just buildspec-*.yml/*.yaml
+    ("stack-buildspec-not-in-contract", (), 1,
+     "FAIL: specs/extra.yml has no contract entry in pipeline-contract.json buildspecs"),
     ("fail-closed-multiline-quoted-scalar", (), 2, "unsupported multi-line quoted scalar at"),
+    ("fail-closed-folded-scalar", (), 2, "unsupported folded multi-line scalar at"),
+    ("fail-closed-plain-multiline-scalar", (), 2, "unsupported plain multi-line scalar at"),
     ("fail-closed-unterminated-heredoc", (), 2, "unterminated heredoc <<EOF"),
     ("fail-closed-stack-unknown-spread", (), 2,
      "spread of otherVars in environmentVariables block"),
@@ -108,6 +117,9 @@ CASES = [
     ("fail-closed-stack-env-identifier", (), 2, "environmentVariables bound to 'someOtherVars'"),
     # a declared-and-deployed arg read tolerantly is the shape the contract blesses
     ("tolerant-declared-pass", (), 0, "OK: pipeline contract - 2 buildspecs, 6 provided vars"),
+    # F4: a one-line env block with more than one entry must not drop any of them
+    ("stack-one-line-env-block-pass", (), 0,
+     "OK: pipeline contract - 2 buildspecs, 7 provided vars"),
     ("builtin-pass", (), 0, "OK:"),
     ("lowercase-pass", (), 0, "OK:"),
     # D9: `X="${X:-default}"` is a READ of X, not a definition of it
@@ -120,6 +132,9 @@ CASES = [
      "reads EVENTS_TABLE which pipeline-contract.json does not declare for "
      "[fixture-build/Build_and_gate] - fix:"),
     ("self-referential-defined-elsewhere-pass", (), 0, "OK:"),
+    # D10: DEFINED is whole-file and order-insensitive - a read above a later
+    # definition of the same name is not a violation
+    ("order-insensitive-defined-pass", (), 0, "OK:"),
     # D5/D7/D17: comments, heredocs and escapes
     ("comment-not-definition", (), 1,
      "reads UNDECL_C which pipeline-contract.json does not declare"),
@@ -150,6 +165,9 @@ CASES = [
     ("missing-provider", (), 1,
      'FAIL: stack.txt project fixture-build runs buildspec.yml but is missing from its '
      'providedBy - fix: add fixture-build to buildspecs["buildspec.yml"].providedBy'),
+    # D5: '#' inside 'single quotes' is data, not a comment
+    ("single-quote-hash-then-read", (), 1,
+     "FAIL: deploy.yml:7 reads UNDECL_A which pipeline-contract.json does not declare"),
     # D8: reads count wherever they appear; definitions only in statement position
     ("single-quoted-read-counts", (), 1,
      "FAIL: buildspec.yml:14 reads UNDECL_SQ which pipeline-contract.json does not declare"),
@@ -177,6 +195,9 @@ CASES = [
      "defined=[DEPLOY_PREAPPROVED]"),
     ("determinism", (), 1,
      "FAIL: buildspec.yml:13 reads AA_UNDECL which pipeline-contract.json does not declare"),
+    # F5: $(( X + 1 )) and (( X > 0 )) are reads of X
+    ("arithmetic-read-counts", (), 1,
+     "FAIL: deploy.yml:7 reads UNDECL_F which pipeline-contract.json does not declare"),
 ]
 
 
@@ -210,6 +231,17 @@ def test_command_prefix_assignments_are_definitions():
     out = output(run_case("command-prefix-and-build-arg"))
     assert "UNDECL_BA" in out
     assert "PFX_A" not in out and "PFX_B" not in out
+
+
+def test_arithmetic_reads_count_in_both_forms():
+    """`$(( X + 1 ))` and `(( X > 0 ))` are reads: an arg only ever used in
+    arithmetic is exactly as absent as one used in a string. `(( ! X ))` also
+    counts - unlike `${!X}`, a `!` inside arithmetic is logical NOT, not
+    indirection, so the identifier after it is a genuine read of X."""
+    out = output(run_case("arithmetic-read-counts"))
+    assert "deploy.yml:7 reads UNDECL_F" in out, out
+    assert "deploy.yml:8 reads UNDECL_G" in out, out
+    assert "deploy.yml:9 reads UNDECL_H" in out, out
 
 
 def test_undeclared_plain_read_via_buildspec_flag(tmp_path):
