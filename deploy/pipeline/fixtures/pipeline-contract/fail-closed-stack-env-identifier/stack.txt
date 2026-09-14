@@ -1,0 +1,27 @@
+// fixture stack excerpt (.txt so deploy/pipeline/tsconfig.json never compiles it)
+const commonEnvVars: Record<string, codebuild.BuildEnvironmentVariable> = {
+  AWS_REGION_HUB: { value: region },
+  ARTIFACT_BUCKET: { value: artifactBucketName },
+};
+const buildProject = new codebuild.PipelineProject(this, "BuildProject", {
+  projectName: "fixture-build",
+  buildSpec: codebuild.BuildSpec.fromSourceFilename("buildspec.yml"),
+  environmentVariables: someOtherVars,
+});
+const deployProject = new codebuild.PipelineProject(this, "DeployProject", {
+  projectName: "fixture-deploy",
+  buildSpec: codebuild.BuildSpec.fromSourceFilename("deploy.yml"),
+  environmentVariables: commonEnvVars,
+});
+new cpactions.CodeBuildAction({
+  actionName: "Build_and_gate",
+  project: buildProject,
+  variablesNamespace: "BuildVars",
+});
+new cpactions.CodeBuildAction({
+  actionName: "Deploy_it",
+  project: deployProject,
+  environmentVariables: {
+    DEPLOY_PREAPPROVED: { value: "#{BuildVars.DEPLOY_PREAPPROVED}" },
+  },
+});

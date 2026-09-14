@@ -270,6 +270,18 @@ commit; it is never approved by software. Four moving parts:
    (which collapses every failure to `0` and must keep doing so for the Build).
    See DL-028 "Rollout contract".
 
+   **The arg contract (TEAM-4563 / TEAM-4579).** What this incident generalises to
+   is "a buildspec reads a variable the stack source declares but the deployed
+   stack does not yet provide". `deploy/pipeline/pipeline-contract.json` is the
+   declared, human-advanced record of what the deployed pipeline provides to each
+   buildspec, and `scripts/check-pipeline-contract.sh` (CI + Build stage) fails a
+   read the contract does not cover. It is asymmetric on purpose: a contract entry
+   must exist in `pipeline-stack.ts` (the contract cannot invent an argument), but a
+   stack-source argument absent from the contract is legal and means "not yet
+   confirmed deployed" - the read fails until `deploy.sh` has run and the entry is
+   added, or the buildspec reads it as `${X:-}`. Nothing is generated from the
+   stack: a stack-derived contract would have passed #576.
+
 Three checkpoints — decide, skip, re-verify — all fail closed in the same
 direction: a missing, stale, unreadable or misread record can only produce a
 needless human gate, never a silent deploy. Drift falls out of the same property.

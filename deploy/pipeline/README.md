@@ -112,6 +112,10 @@ CodeBuild role's S3 grant, do not remove that Deny.
 | `lib/pipeline-stack.ts` | the stack: CodeConnections, CI + Build + Deploy CodeBuild, CodePipeline, SNS approval, scoped IAM, cdk-nag |
 | `buildspec-ci.yml` | PR check AND the deploy Build stage (gates + artifact emission) |
 | `buildspec-deploy.yml` | Deploy stage: the 3-target `DEPLOY.md`, promote-by-digest, smoke checks |
+| `buildspec-runtime-images.yml` | Deploy stage (parallel, arm64): rebuild changed fleet/coding runtime images, image-only `UpdateAgentRuntime` |
+| `pipeline-contract.json` | the DECLARED pipeline-arg contract: per buildspec, the env vars the deployed stack provides (project/action, since, comment, optional absence) plus the inline `allow` map; advanced by a human after `deploy.sh`, never generated |
+| `check-pipeline-contract.py` | the guard behind `scripts/check-pipeline-contract.sh` (both CI rails): textual stack parse + buildspec read scan, asymmetric parity (contract must exist in stack source; stack-only args fail any read until the contract is advanced); stdlib only |
+| `test_check_pipeline_contract.py` | pytest battery for the guard + fixtures under `fixtures/pipeline-contract/<case>/` (`stack.txt`, `contract.json`, `buildspec.yml`, `deploy.yml`); runs in both pytest lists (ci.yml and buildspec-ci.yml) |
 | `preapproved-check.sh` | `decide` (Build) / `gate` (Deploy) over the ship-approval record — the conditional deploy gate's only reader; `gate` tolerates an empty (unwired) `DEPLOY_PREAPPROVED` |
 | `merge-agents-json.py` | the agents.json merge (extracted from `DEPLOY.md` step 2 — single source) |
 | `ecs-primary-container.py` | builds the ECS roll container JSON, reusing live env, swapping image→digest |

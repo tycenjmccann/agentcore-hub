@@ -1,0 +1,8 @@
+version: 0.2
+env:
+  shell: bash
+phases:
+  build:
+    commands:
+      - "echo deploy $AWS_REGION_HUB ${ARTIFACT_BUCKET}"
+      - "bash gate.sh \"${DEPLOY_PREAPPROVED:-}\""

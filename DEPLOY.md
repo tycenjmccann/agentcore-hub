@@ -15,6 +15,10 @@ merge commit — the contract runs from a fresh clone of that merge commit.
 > `agentcore-hub-deploy` CodePipeline (see `docs/pipeline/design.md` → Quickstart) —
 > the commands here are the legacy/manual path and remain the contract source
 > the pipeline's buildspecs are ported from.
+> What the pipeline provides to those buildspecs is declared in
+> `deploy/pipeline/pipeline-contract.json` and enforced by
+> `scripts/check-pipeline-contract.sh` (see "What the pipeline provides to its
+> buildspecs (the arg contract)" below).
 
 ## Environment prerequisites
 
@@ -343,6 +347,32 @@ Runtime-image CD landed in PR 2 — a baked source change (persona tool code) no
 deploys automatically. Only runtime env / lifecycle / IAM / EFS changes (which
 need `UpdateFunctionConfiguration`-class perms the narrow roles lack) remain a
 handoff, via the create/setup scripts above.
+
+### What the pipeline provides to its buildspecs (the arg contract)
+
+The CodeBuild projects and CodePipeline actions in
+`deploy/pipeline/lib/pipeline-stack.ts` provide environment variables; the three
+buildspecs consume them. `deploy/pipeline/pipeline-contract.json` records, per
+buildspec, which variables the DEPLOYED pipeline provides (and who provides
+them), and `scripts/check-pipeline-contract.sh` (CI and the Build stage) fails on
+any buildspec read the contract does not cover.
+
+The rule: adding an entry to pipeline-contract.json asserts the deployed pipeline
+provides it - run ./deploy/pipeline/deploy.sh first (or in the same release) - or
+the consuming buildspec must tolerate absence. The check is deliberately
+asymmetric. An entry must exist in the stack source (the contract cannot invent
+an argument), but a stack-source argument missing from the contract is allowed:
+it means "declared in source, not yet confirmed deployed", and a buildspec that
+reads it fails CI until the contract is advanced. That is the gap PR #576 fell
+into: the stack source and the buildspecs agreed, the stack had not been
+redeployed (a HANDOFF), CodePipeline resolved the new `#{BuildVars.DEPLOY_PREAPPROVED}`
+to empty, and every `main` deploy failed at `PRE_BUILD` until PR #579 made the
+gate tolerate empty and a human ran `deploy.sh`.
+
+Reads of names the buildspec defines itself, `CODEBUILD_*` builtins, and names in
+the contract's `allow` map (with a one-line reason each) are not pipeline
+arguments and pass. Run `./scripts/check-pipeline-contract.sh --explain` to see
+what each buildspec consumes.
 
 ## Model bump
 
