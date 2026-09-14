@@ -444,7 +444,11 @@ def classify_yaml_lines(text, path_str):
     """Return (bash_lines, env_defined, exported) -- one bash-view line per file line.
     A folded (`>`) or plain multi-line scalar is rejected (exit 2): its continuation
     lines would be scanned as separate statements and an argument such as `X=1`
-    would read as a definition, hiding the read."""
+    would read as a definition, hiding the read. env.variables / parameter-store /
+    secrets-manager entries DEFINE a name (added to env_defined); an
+    exported-variables entry does not - CodeBuild exports whatever value the name
+    holds at end of build, it never assigns one, so a listed-but-never-assigned name
+    stays a graded read (only added to `exported`, for the N2 namespace check)."""
     lines = text.split("\n")
     out = []
     block_indent = None
@@ -511,8 +515,9 @@ def classify_yaml_lines(text, path_str):
                 elif section == "exported-variables":
                     mk = RE_ENV_LISTITEM.match(l2)
                     if mk:
+                        # exported-variables is a promise to export, not a
+                        # definition - keep the name for N2 only (F2).
                         exported.append(mk.group(1))
-                        env_defined.add(mk.group(1))
                 j += 1
             break
     return out, env_defined, exported
@@ -1071,6 +1076,17 @@ def check_parity(contract, contract_path, stack, scan_targets, explain, strict, 
             viol.add((S, 0, ns, "%s has no variablesNamespace \"%s\" but pipeline-contract.json declares namespace %s - fix: remove the namespace or add variablesNamespace to the exporter action (a HANDOFF)" % (S, ns, ns)))
         elif actual != e["action"]:
             viol.add((S, 0, ns, "%s declares variablesNamespace \"%s\" on action %s but pipeline-contract.json says action %s - fix: correct namespaces[\"%s\"].action" % (S, ns, actual, e["action"], ns)))
+        else:
+            # F3: the action matched namespaces[ns].action - now check it actually
+            # runs the exporter buildspec (action -> project -> fromSourceFilename),
+            # the same binding data P2a-d use. Gated on the action match above so an
+            # operator with both wrong sees one cause at a time.
+            proj = stack["project_of_action"].get(actual)
+            resolved = stack["buildspec_of_project"].get(proj) if proj else None
+            if resolved is None:
+                viol.add((S, 0, ns, "%s action %s (namespace \"%s\") runs no CodeBuild project but pipeline-contract.json says exporter %s - fix: bind the action to the project that runs %s or correct namespaces[\"%s\"].action" % (S, actual, ns, e["exporter"], e["exporter"], ns)))
+            elif resolved != e["exporter"]:
+                viol.add((S, 0, ns, "%s action %s (namespace \"%s\") runs %s but pipeline-contract.json says exporter %s - fix: set namespaces[\"%s\"].exporter to %s or fix the stack's project binding" % (S, actual, ns, resolved, e["exporter"], ns, resolved)))
 
     # P5: a buildspec the STACK runs must have a contract entry, whatever its name
     # (main()'s glob only closes buildspec-*.yml / *.yaml at two fixed locations).
@@ -1127,9 +1143,9 @@ def check_parity(contract, contract_path, stack, scan_targets, explain, strict, 
             declared_by = sorted(p for p in pb if name in effective_vars(stack, p))
             for ln in lines:
                 if declared_by:
-                    viol.add((display, ln, name, "reads %s which pipeline-contract.json does not declare for [%s] - declared in pipeline-stack.ts but not in pipeline-contract.json: deploy the stack (./deploy/pipeline/deploy.sh) then add it to the contract, or make the read tolerate absence (${%s:-})%s" % (name, pb_slash, name, note)))
+                    viol.add((display, ln, name, "reads %s which pipeline-contract.json does not declare for [%s] - declared in pipeline-stack.ts but not in pipeline-contract.json - fix: deploy the stack (./deploy/pipeline/deploy.sh) then add %s under buildspecs[\"%s\"].provides, or add it there with \"absence\": \"tolerated\" and read it as ${%s:-}%s" % (name, pb_slash, name, key, name, note)))
                 else:
-                    viol.add((display, ln, name, "reads %s which pipeline-contract.json does not declare for [%s] - fix: if the deployed stack provides it (./deploy/pipeline/deploy.sh has run), add it under buildspecs[\"%s\"].provides; otherwise make the read tolerate absence or drop it, or add it to allow with a reason%s" % (name, pb_slash, key, note)))
+                    viol.add((display, ln, name, "reads %s which pipeline-contract.json does not declare for [%s] - fix: to keep it as a pipeline arg, add %s to %s and run ./deploy/pipeline/deploy.sh, then add it under buildspecs[\"%s\"].provides; otherwise drop the read or add %s to allow with a reason%s" % (name, pb_slash, name, S, key, name, note)))
         check_tokens(display, s["tokens"], note)
         if strict:
             for name, e in provides.items():

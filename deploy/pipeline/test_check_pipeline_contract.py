@@ -64,8 +64,9 @@ CASES = [
     ("regression-576", (), 1,
      "FAIL: deploy.yml:8 reads DEPLOY_PREAPPROVED which pipeline-contract.json does not "
      "declare for [fixture-deploy/Deploy_it] - declared in pipeline-stack.ts but not in "
-     "pipeline-contract.json: deploy the stack (./deploy/pipeline/deploy.sh) then add it to "
-     "the contract, or make the read tolerate absence (${DEPLOY_PREAPPROVED:-})"),
+     "pipeline-contract.json - fix: deploy the stack (./deploy/pipeline/deploy.sh) then add "
+     "DEPLOY_PREAPPROVED under buildspecs[\"deploy.yml\"].provides, or add it there with "
+     "\"absence\": \"tolerated\" and read it as ${DEPLOY_PREAPPROVED:-}"),
     ("regression-576-fixed", (), 0,
      "OK: pipeline contract - 2 buildspecs, 6 provided vars, 1 namespace refs checked"),
     ("contract-not-in-stack", (), 1,
@@ -84,6 +85,17 @@ CASES = [
      'FAIL: stack.txt declares variablesNamespace "BuildVars" on action Build_and_gate but '
      'pipeline-contract.json says action Deploy_it - fix: correct '
      'namespaces["BuildVars"].action'),
+    # F3: the action matches namespaces[ns].action, but does not run the exporter
+    # buildspec (action -> project -> fromSourceFilename)
+    ("exporter-not-run-by-action", (), 1,
+     'FAIL: stack.txt action Build_and_gate (namespace "BuildVars") runs buildspec.yml but '
+     'pipeline-contract.json says exporter deploy.yml - fix: set '
+     'namespaces["BuildVars"].exporter to buildspec.yml or fix the stack\'s project binding'),
+    # F3: the action matches namespaces[ns].action, but runs no CodeBuild project at all
+    ("exporter-action-runs-no-project", (), 1,
+     'FAIL: stack.txt action Orphan_gate (namespace "OrphanVars") runs no CodeBuild project but '
+     'pipeline-contract.json says exporter buildspec.yml - fix: bind the action to the project '
+     'that runs buildspec.yml or correct namespaces["OrphanVars"].action'),
     # fail-closed: every infrastructure error is exit 2 with one FAIL line
     ("fail-closed-missing-contract", (), 2, "contract file missing"),
     ("fail-closed-unparseable-json", (), 2, "unparseable JSON"),
@@ -125,9 +137,10 @@ CASES = [
     # D9: `X="${X:-default}"` is a READ of X, not a definition of it
     ("self-referential-read", (), 1,
      'FAIL: buildspec.yml:14 reads UNDECL_SELF which pipeline-contract.json does not declare '
-     'for [fixture-build/Build_and_gate] - fix: if the deployed stack provides it '
-     '(./deploy/pipeline/deploy.sh has run), add it under buildspecs["buildspec.yml"].provides; '
-     'otherwise make the read tolerate absence or drop it, or add it to allow with a reason'),
+     'for [fixture-build/Build_and_gate] - fix: to keep it as a pipeline arg, add UNDECL_SELF '
+     'to stack.txt and run ./deploy/pipeline/deploy.sh, then add it under '
+     'buildspecs["buildspec.yml"].provides; otherwise drop the read or add UNDECL_SELF to allow '
+     'with a reason'),
     ("self-referential-events-table", (), 1,
      "reads EVENTS_TABLE which pipeline-contract.json does not declare for "
      "[fixture-build/Build_and_gate] - fix:"),
@@ -176,6 +189,16 @@ CASES = [
     ("bare-export-is-read", (), 1,
      "FAIL: buildspec.yml:14 reads UNDECL_X which pipeline-contract.json does not declare"),
     ("bare-export-of-provided-pass", (), 0, "OK:"),
+    # F2: exported-variables is a promise to export, not a definition - a name
+    # listed there but never assigned is still a graded read
+    ("exported-passthrough-read", (), 1,
+     'FAIL: buildspec.yml:14 reads UNDECL_X which pipeline-contract.json does not declare for '
+     '[fixture-build/Build_and_gate] - fix: to keep it as a pipeline arg, add UNDECL_X to '
+     'stack.txt and run ./deploy/pipeline/deploy.sh, then add it under '
+     'buildspecs["buildspec.yml"].provides; otherwise drop the read or add UNDECL_X to allow '
+     'with a reason'),
+    ("exported-of-assigned-pass", (), 0,
+     "OK: pipeline contract - 2 buildspecs, 5 provided vars, 1 namespace refs checked"),
     ("declare-without-eq-is-definition", (), 0, "OK:"),
     ("read-for-select-definitions", (), 0, "OK:"),
     ("command-prefix-and-build-arg", (), 1,

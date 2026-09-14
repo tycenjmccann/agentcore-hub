@@ -135,6 +135,12 @@ CodeBuild role's S3 grant, do not remove that Deny.
 - D10: `DEFINED` is whole-file and order-insensitive - a read above a later definition
   of the same name is not a violation. The #576 class is an arg the deployed stack
   never provides, not an ordering mistake.
+- `env.exported-variables` is a promise to export, not a definition: a name listed
+  there but never assigned is still a graded read (`env.variables` / `parameter-store`
+  / `secrets-manager` do define).
+- A namespace's `action` must actually run its `exporter` buildspec - the guard
+  resolves action -> project -> `fromSourceFilename` and fails a mismatch, so a
+  `#{Ns.VAR}` token can never be graded against the wrong file's exported-variables.
 
 ## Deploy
 

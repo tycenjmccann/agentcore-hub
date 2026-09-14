@@ -1,0 +1,63 @@
+{
+  "$comment": "fixture",
+  "stack": "stack.txt",
+  "namespaces": {
+    "BuildVars": {
+      "exporter": "buildspec.yml",
+      "action": "Build_and_gate"
+    },
+    "OrphanVars": {
+      "exporter": "buildspec.yml",
+      "action": "Orphan_gate"
+    },
+    "codepipeline": {
+      "builtin": true
+    }
+  },
+  "buildspecs": {
+    "buildspec.yml": {
+      "providedBy": [
+        "fixture-build",
+        "Build_and_gate"
+      ],
+      "provides": {
+        "AWS_REGION_HUB": {
+          "source": "common",
+          "since": "fixture",
+          "comment": "fixture"
+        },
+        "ARTIFACT_BUCKET": {
+          "source": "common",
+          "since": "fixture",
+          "comment": "fixture"
+        },
+        "ECR_REPO": {
+          "source": "project",
+          "since": "fixture",
+          "comment": "fixture"
+        }
+      }
+    },
+    "deploy.yml": {
+      "providedBy": [
+        "fixture-deploy",
+        "Deploy_it"
+      ],
+      "provides": {
+        "AWS_REGION_HUB": {
+          "source": "common",
+          "since": "fixture",
+          "comment": "fixture"
+        },
+        "ARTIFACT_BUCKET": {
+          "source": "common",
+          "since": "fixture",
+          "comment": "fixture"
+        }
+      }
+    }
+  },
+  "allow": {
+    "PLAYWRIGHT_BROWSERS_PATH": "baked into the CI image"
+  }
+}
