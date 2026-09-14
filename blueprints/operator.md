@@ -286,6 +286,15 @@ the approved SHA, which voids the approval and costs a second human gate — the
 one thing on this path you can prevent for the price of a CI run.
 
 ### B7. Merge brief + review package + report
+**Ticket every declared P1 follow-up FIRST — before you write the brief.**
+Whenever anything in this run declared a P1 follow-up (the plan, a review round,
+your own brief draft, a worker checkpoint), file it as a REAL ticket now:
+`Tickets___create_ticket` with `labels: "advisory"`, `blocked_by: ""`, NO
+`spawned_by_kind` (it is backlog, not a fix round), assignee = the agent that
+owns the surface, same parent as your Build ticket. Its key then goes in the
+brief's `WHAT WAS KEPT / NOT DONE`. A declared P1 that ships as a report line
+evaporates — `e7fdjx` (AUTH_MODE), `qiizre` (get_build_log) and `6afpn8`
+(sibling sweep) all did exactly that.
 1. `workflows/{workflow_id}/shared/merge-brief.md` (`S3Storage___write_object`,
    text/markdown), pyramid style, decision first:
    ```
@@ -300,8 +309,15 @@ one thing on this path you can prevent for the price of a CI run.
    WHAT'S IN THE PR (plain English, component level)
    • ...
 
+   WHAT THE LIVE PIPELINE DOES BETWEEN MERGE AND HANDOFF (required)
+   • Stages this merge will run: <source -> build -> approval -> deploy -> smoke, as configured>.
+   • Approve_deploy gate: <expected to fire | expected to be skipped> because <preapproval outcome>.
+   • What the Deploy stage actually deploys: <Lambdas, image digest, prompts, tables - name them>.
+   • Last execution: <Succeeded | application-class failure and why this merge clears it>.
+   • Infra handoff files a human must still run: <paths, or "none">.
+
    WHAT WAS KEPT / NOT DONE (and why)
-   • ...
+   • <item> - <why> - <TICKET-KEY>
 
    ⚠ NEEDS YOUR ATTENTION (omit if empty)
    • <open review disputes with both sides in one line each; unverified CI; pre-existing red checks>
@@ -310,6 +326,12 @@ one thing on this path you can prevent for the price of a CI run.
 
    DETAILS: PR #<n> body; plan workflows/{id}/shared/plan.md; review workflows/{id}/shared/review.md.
    ```
+   **`WHAT THE LIVE PIPELINE DOES` is REQUIRED and "unchanged" is not an
+   acceptable answer** — state concretely what this merge causes in the deployed
+   pipeline (#576's brief said "unchanged", and was wrong fleet-wide). If you
+   cannot state it, read `Pipeline___get_state` and the repo's DEPLOY.md until
+   you can. Every `WHAT WAS KEPT / NOT DONE` bullet carries the ticket key filed
+   above: a follow-up with no key is not allowed in the brief.
 2. `load_blueprint("review-package")` and write
    `workflows/{workflow_id}/shared/review-package-development.json` (that exact
    filename: the gate follows YOUR development ticket) using the `ship`
@@ -344,7 +366,38 @@ covers exactly the SHA in the brief.
    mode (execute DEPLOY.md yourself)" section verbatim, then report as in step 5.
 2. **Preflight (pipeline mode):** `Pipeline___get_state(pipeline_name=<from
    context>)`; `configured:false` -> BLOCKED (do not merge; `report_completion`
-   with `outcome="deploy-blocked"`, `block_reason`). Then:
+   with `outcome="deploy-blocked"`, `block_reason`).
+   - **Read the pipeline's LAST EXECUTION health — never infer it from
+     `configured:true`.** If the result carries `lastExecution`, read
+     `{id, status, failedStage, failedAction, failedPhase, errorSummary,
+     sourceSha, finishedAt}`. If the field is absent (pre-FR-D2.b tools Lambda),
+     derive the same facts from `stages[]` + `actionDetails`: the last
+     Deploy-stage action's `status`, `summary` and `externalExecutionId`, then
+     `Pipeline___get_build_log(build_id=<that externalExecutionId>)` for the
+     phase and the error text. Classify it three ways, and do NOT over-park:
+     - (i) **Succeeded, or no prior execution** -> proceed.
+     - (ii) **APPLICATION class** — a `BUILD` / `POST_BUILD` phase compile, test
+       or smoke failure of the PREVIOUS code -> proceed with the normal flow;
+       your merge plausibly changes that outcome. State it in the brief's
+       `WHAT THE LIVE PIPELINE DOES` section (last run, why it failed, why this
+       merge is expected to clear it).
+     - (iii) **INFRASTRUCTURAL class** — `failedPhase` is `PRE_BUILD` or
+       `INSTALL`, or `errorSummary` is env / config / permission class
+       (`AccessDenied`, a missing env var / secret / SSM parameter, CDK or
+       bootstrap env, IAM, quota) -> **do NOT merge.** A new merge cannot fix
+       (iii): the failure is in the pipeline's environment, not in the code, so
+       merging only buys a second red execution and a spent human gate. Park
+       BEFORE the merge (DL-024): `Tickets___create_ticket` title
+       `Deploy blocked (infra): {goal}`, assignee `human:engineer`, same parent
+       as your Ship ticket, `ticket_type` per INTAKE (`"subtask"` if the parent
+       is a Bug, else `"task"`), `blocked_by: ""`, description carrying the
+       failure facts — execution id, failed stage / action / phase,
+       `errorSummary`, `sourceSha`, `finishedAt`, log link. Then
+       `Tickets___transition_ticket(ship_ticket, "blocked", blocked_by=<that
+       ticket>)` and exit WITHOUT `report_completion`. Never approve or skip
+       anything, and never ask for orchestrator help: this is blueprint
+       behaviour (DL-009).
+   Then:
    ```
    claude_code(repo="<owner/repo>", model="sonnet", task=<MERGE PROMPT>)
    ```
@@ -376,8 +429,15 @@ covers exactly the SHA in the brief.
    ~60s until `terminal:true` AND `matchesExecution:true`. A waiting
    `ManualApproval` stage is the human's deploy gate; it fires only when the
    commit about to deploy is not the recorded merge of the approved head SHA (no
-   record, a different SHA, or an unreadable record - it fails closed): surface
-   it and file the deploy-gate ticket per the existing policy, never approve it
+   record, a different SHA, or an unreadable record - it fails closed): it is
+   waiting on the Telegram bridge and a human, NOT on you, so PAGE and park
+   instead of polling to a timeout - `Tickets___create_ticket` title
+   `Deploy gate waiting: {goal} (execution {id})`, assignee `human:engineer`,
+   `blocked_by: ""`, description = execution id, merge SHA, `preapproval.reason`
+   and how to approve (Telegram); `Tickets___add_comment` those ids on your Ship
+   ticket (your context is not durable); `Tickets___transition_ticket(ship_ticket,
+   "blocked", blocked_by=<that ticket>)`; exit without `report_completion`. On
+   re-dispatch, resume this watch from the recorded execution id. Never approve it
    yourself - you have no tool that can. `approvalSkipped: true` = this run
    needed only the single Merge Approval; say so. `handoff: {files}` on a
    SUCCEEDED run = infra scripts a human must run: list them in your summary, do
@@ -403,6 +463,10 @@ covers exactly the SHA in the brief.
    one to start_deploy>, outcome="shipped")`.
    Could not merge or deploy -> `outcome="deploy-blocked"`, `block_reason`, no
    `merge_commit`. Never report `shipped` for a merge you did not confirm.
+   A terminal deploy-blocked outcome ALSO carries a `human:engineer` handoff
+   ticket (`blocked_by: ""`, the failure facts from step 2's description list),
+   named in the summary: a comment or `operator-status.md` alone is not a handoff -
+   nothing Readies a comment, so the work silently stops there.
 
 ---
 
@@ -515,7 +579,12 @@ Reply: each check -> pass/fail (+ run URL), whether you pushed any commit, final
   re-check, and you put it in front of the human, not under the rug.
 - No fix tickets, no zero-findings gate, no sub-tickets for units. Board shows
   three tickets; `plan.md`, `review.md`, `merge-brief.md` and the PR carry the
-  story. Evidence lives in S3 / the workspace, never in the diff.
+  story. Evidence lives in S3 / the workspace, never in the diff. Two carve-outs
+  only: `advisory` backlog tickets for declared P1 follow-ups (B7), and
+  `human:engineer` tickets you park on or hand off to.
+- Never merge on a pipeline you have not read: check the last execution's health
+  first (SHIP step 2). An infrastructural last Deploy failure parks the Ship
+  ticket BEFORE the merge — a merge cannot fix the pipeline's environment.
 - Plan on `opus` (or `fable`), execute on `sonnet` (or `opus`), never plan or
   execute on `haiku`. Codex/kiro have no plan mode: they are reviewers here.
 - Honour a CLI directive in the work order ("use codex for coding") by
@@ -536,7 +605,8 @@ Reply: each check -> pass/fail (+ run URL), whether you pushed any commit, final
 - BLOCKED is a real outcome: missing secret, unreachable dependency, missing
   DEPLOY.md / pipeline, iOS work with no gateway tools. Comment the blocker on
   the epic and `report_completion` with `outcome="deploy-blocked"` (ship) or a
-  summary starting with `BLOCKED:` (build). Never fake progress.
+  summary starting with `BLOCKED:` (build). Never fake progress. A terminal
+  deploy-blocked outcome carries a `human:engineer` ticket, not just a comment.
 - Findings and fixes are class-wide: the reviewer enumerates every occurrence of
   a pattern, the worker fixes them all (one shared helper where duplicated) — a
   fix that leaves a known sibling is not FIXED.
