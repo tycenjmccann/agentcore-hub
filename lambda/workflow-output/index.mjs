@@ -75,7 +75,12 @@ async function submitTicketPlan({ workflow_id, requirements, tickets }) {
 // legible error naming the shape it should have sent instead of an opaque
 // NoSuchKey. A future reader looking for the access-control boundary will not
 // find it here — there isn't one at this layer, by design.
-function assertPlainWorkflowKey(s3Key) {
+// TEAM-4587: the workflow_id-prefix check below is the same kind of guard, not a
+// tenancy or authorization control - it compares two strings the SAME caller
+// supplied in the SAME invocation, so an agent that wants another workflow's key
+// can just pass that workflow_id too. It catches only the realistic slip: a key
+// pasted out of a previous run's transcript.
+function assertPlainWorkflowKey(s3Key, workflowId) {
   const shape = `expected a plain object key under workflows/ (e.g. "workflows/<workflow_id>/<agent_id>/design.md") - no s3:// URL, no leading "/", no ".." segment`;
   const bad = (why) => new Error(`save_design_doc rejected s3Key "${s3Key}": ${why}. ${shape}.`);
   if (/^s3:\/\//i.test(s3Key)) throw bad("it is an s3:// URL, not an object key");
@@ -83,6 +88,12 @@ function assertPlainWorkflowKey(s3Key) {
   // Exact-segment test, not a substring test: "workflows/wf_1/a..b.md" is a fine key.
   if (s3Key.split("/").includes("..")) throw bad("it contains a \"..\" path segment");
   if (!s3Key.startsWith("workflows/")) throw bad("it is outside the workflows/ prefix");
+  // Only when the caller named a workflow - an unset workflow_id has no prefix to
+  // compare against, and this guard must not invent one.
+  const wf = typeof workflowId === "string" ? workflowId.trim() : "";
+  if (wf && !s3Key.startsWith(`workflows/${wf}/`)) {
+    throw bad(`it belongs to a different workflow - this save is for workflow_id "${wf}", so the key must start with "workflows/${wf}/"`);
+  }
 }
 
 /**
@@ -90,7 +101,7 @@ function assertPlainWorkflowKey(s3Key) {
  * by-reference path lives, so the persist path below stays untouched.
  * Returns { content, sourceKey }; sourceKey is null on the inline path.
  */
-async function resolveDesignDocContent({ content, s3Key }) {
+async function resolveDesignDocContent({ content, s3Key, workflow_id }) {
   const key = typeof s3Key === "string" ? s3Key.trim() : "";
   const inline = typeof content === "string" ? content : "";
 
@@ -103,7 +114,7 @@ async function resolveDesignDocContent({ content, s3Key }) {
 
   // Validate BEFORE reading anything: a rejected key must not fall back to
   // `content` either, or a typo'd key would silently save the wrong document.
-  assertPlainWorkflowKey(key);
+  assertPlainWorkflowKey(key, workflow_id);
   if (inline.trim()) {
     console.warn(`[save_design_doc] both content and s3Key were supplied; s3Key "${key}" takes precedence and the inline content is ignored`);
   }
@@ -129,7 +140,7 @@ async function saveDesignDoc({ workflow_id, agent_id, title, content, format = "
   // Resolve the body BEFORE anything below reads or writes: on the by-reference
   // path a bad key must leave the bucket exactly as it was. Everything after
   // this line is the pre-4569 persist path, unchanged and shared by both paths.
-  const source = await resolveDesignDocContent({ content, s3Key });
+  const source = await resolveDesignDocContent({ content, s3Key, workflow_id });
   content = source.content;
 
   // `format` decides ext + ContentType — never the source key's extension: a doc
@@ -172,15 +183,27 @@ async function saveDesignDoc({ workflow_id, agent_id, title, content, format = "
     Body: content,
     ContentType: format === "json" ? "application/json" : "text/markdown",
   }));
-  // Update manifest with design doc reference (skip when overwriting — the
-  // existing manifest entry already points at this key)
-  if (workflow_id && agent_id && !existed) {
+  // TEAM-4587: idempotency is keyed off the MANIFEST, not off `existed` (whether an
+  // object sits at the canonical shared/ key). An object can exist there with no
+  // manifest entry - a prior save whose manifest write failed, or a doc an agent
+  // wrote straight to that key with S3Storage___write_object - and `existed` alone
+  // would then suppress registration forever. Same path serves the inline and the
+  // by-reference save, so one check covers both.
+  if (workflow_id && agent_id) {
     try {
-      await updateManifest(workflow_id, agent_id, [{
-        type: "design-doc", format: format === "json" ? "json" : "markdown",
-        description: title || "Design document", s3Key: sharedKey, addedBy: agent_id, critical: true,
-      }]);
-    } catch { /* non-fatal */ }
+      const manifest = await loadManifest(workflow_id);
+      if (!hasDesignDocEntry(manifest, sharedKey)) {
+        await updateManifest(workflow_id, agent_id, [{
+          type: "design-doc", format: format === "json" ? "json" : "markdown",
+          description: title || "Design document", s3Key: sharedKey, addedBy: agent_id, critical: true,
+        }], { manifest }); // reuse the read above - no second GET
+      }
+    } catch (err) {
+      // Non-fatal by design: the doc IS saved, and failing the tool would strand a
+      // recoverable ticket over a missing reference. But never silent again - a
+      // swallowed manifest failure is exactly what made this bug invisible.
+      console.warn(`[save_design_doc] manifest update failed for workflow ${workflow_id} (${sharedKey}) - the doc was saved but no design-doc entry was registered: ${err.name}: ${err.message}`);
+    }
   }
 
   return {
@@ -335,32 +358,59 @@ const PHASE_MAP = {
   "agentcore_hub_release_manager": "ship",
 };
 
-async function updateManifest(workflowId, agentId, entries) {
-  if (!workflowId || !entries || entries.length === 0) return;
-  const manifestKey = `workflows/${workflowId}/shared/manifest.json`;
-  let manifest;
+const manifestKeyFor = (workflowId) => `workflows/${workflowId}/shared/manifest.json`;
+
+function freshManifest(workflowId) {
+  const now = new Date().toISOString();
+  return {
+    workflowId,
+    createdAt: now,
+    updatedAt: now,
+    phases: { intake: [], requirements: [], design: [], development: [], verification: [], ship: [] },
+  };
+}
+
+// TEAM-4587: a fresh skeleton is a safe answer only when the manifest genuinely
+// isn't there yet. Any OTHER read failure (throttle, 5xx, a corrupt JSON.parse)
+// means the manifest's contents are UNKNOWN, and writing a skeleton over it would
+// silently drop every other agent's entries - so those rethrow and the caller
+// warns and skips the write instead of ever clobbering a populated manifest.
+const MANIFEST_ABSENT = new Set(["NoSuchKey", "NotFound"]);
+
+async function loadManifest(workflowId) {
   try {
-    const result = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: manifestKey }));
-    manifest = JSON.parse(await result.Body.transformToString());
-  } catch {
-    manifest = {
-      workflowId,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-      phases: { intake: [], requirements: [], design: [], development: [], verification: [], ship: [] },
-    };
+    const result = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: manifestKeyFor(workflowId) }));
+    return JSON.parse(await result.Body.transformToString());
+  } catch (err) {
+    if (MANIFEST_ABSENT.has(err?.name) || err?.$metadata?.httpStatusCode === 404) return freshManifest(workflowId);
+    throw err;
   }
+}
+
+// TEAM-4587: is this design doc already registered? Keyed off the MANIFEST, never
+// off whether an object sits at the canonical shared/ key - see saveDesignDoc.
+// Scans EVERY phase, not just PHASE_MAP[agentId], so an entry a previous run filed
+// under a different phase still counts as registered.
+function hasDesignDocEntry(manifest, sharedKey) {
+  return Object.values(manifest?.phases || {}).some((entries) =>
+    Array.isArray(entries) && entries.some((e) => e?.type === "design-doc" && e?.s3Key === sharedKey));
+}
+
+async function updateManifest(workflowId, agentId, entries, { manifest } = {}) {
+  if (!workflowId || !entries || entries.length === 0) return;
+  const m = manifest ?? await loadManifest(workflowId);
+  if (!m.phases) m.phases = {};
 
   const phase = PHASE_MAP[agentId] || "development";
   const now = new Date().toISOString();
   const newEntries = entries.map((e, i) => ({ id: `${phase}-${Date.now().toString(36)}-${i}`, addedAt: now, ...e }));
-  manifest.phases[phase] = [...(manifest.phases[phase] || []), ...newEntries];
-  manifest.updatedAt = now;
+  m.phases[phase] = [...(m.phases[phase] || []), ...newEntries];
+  m.updatedAt = now;
 
   await s3.send(new PutObjectCommand({
     Bucket: BUCKET,
-    Key: manifestKey,
-    Body: JSON.stringify(manifest, null, 2),
+    Key: manifestKeyFor(workflowId),
+    Body: JSON.stringify(m, null, 2),
     ContentType: "application/json",
   }));
   console.log(`[manifest] Added ${newEntries.length} entries to ${phase} for ${workflowId}`);

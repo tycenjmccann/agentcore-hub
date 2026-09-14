@@ -21,7 +21,7 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
  * see its own bytes. `h.puts` still records PutObjectCommand inputs verbatim, so
  * every report_completion assertion above/below is untouched by the redesign.
  */
-const h = vi.hoisted(() => ({ puts: [], warns: [], gets: [], objects: new Map() }));
+const h = vi.hoisted(() => ({ puts: [], warns: [], gets: [], objects: new Map(), failGets: new Map() }));
 
 const asString = (body) => (typeof body === "string" ? body : Buffer.from(body).toString("utf8"));
 
@@ -37,6 +37,13 @@ vi.mock("@aws-sdk/client-s3", () => ({
       }
       if (name === "GetObjectCommand") {
         h.gets.push(input);
+        // TEAM-4587: lets one test inject a GET failure that is NOT NoSuchKey (a
+        // throttle, a 5xx) without disturbing every other test's happy-path GETs.
+        if (h.failGets.has(input.Key)) {
+          const err = new Error(`Simulated failure reading ${input.Key}`);
+          err.name = h.failGets.get(input.Key);
+          throw err;
+        }
         if (!h.objects.has(input.Key)) {
           // Real S3 surfaces a missing object this way, and the Lambda's error
           // message quotes err.name — so the stub has to carry the same name.
@@ -107,6 +114,7 @@ beforeEach(() => {
   h.warns.length = 0;
   h.gets.length = 0;
   h.objects.clear();
+  h.failGets.clear();
   vi.spyOn(console, "warn").mockImplementation((...args) => h.warns.push(args.join(" ")));
 });
 
@@ -464,6 +472,105 @@ describe("save_design_doc — s3Key reads the doc instead of taking it inline", 
     await saveDoc({ s3Key: jsonStaged });
     expect(written(SHARED_DEST)).toEqual(['{"ok":true}']);
     expect(h.puts.find((p) => p.Key === SHARED_DEST).ContentType).toBe("text/markdown");
+  });
+});
+
+// ─── TEAM-4587: manifest idempotency keys off the manifest, not the listing ──
+//
+// The dup-doc listing over shared/ answers "is there an object at the canonical
+// key?" — but an object can sit there with NO manifest entry (a prior save whose
+// manifest write failed inside a swallowed catch, or a doc an agent wrote
+// straight to that key with S3Storage___write_object). Keying registration off
+// that listing then suppresses the critical:true design-doc entry FOREVER, on
+// both the inline and the by-reference path. So the decision has to come from the
+// manifest itself, scanning every phase — not just PHASE_MAP[agent_id] — since a
+// misfiled entry must still count as registered.
+describe("save_design_doc — manifest idempotency keys off the manifest (TEAM-4587)", () => {
+  const MANIFEST_KEY = `workflows/${WF}/shared/manifest.json`;
+  const emptyManifest = () => ({
+    workflowId: WF, createdAt: "t0", updatedAt: "t0",
+    phases: { intake: [], requirements: [], design: [], development: [], verification: [], ship: [] },
+  });
+
+  it("(a) a canonical object with NO manifest entry still registers the critical design-doc entry (inline)", async () => {
+    h.objects.set(SHARED_DEST, BIG_DOC);
+    const r = saved(await saveDoc({ content: "# Backend design (rewritten)\n" }));
+    expect(r.status).toBe("updated");
+    const entries = manifestDesignEntries();
+    expect(entries).toHaveLength(1);
+    expect(entries[0].critical).toBe(true);
+    expect(entries[0].s3Key).toBe(SHARED_DEST);
+  });
+
+  it("(b) same for the by-reference path", async () => {
+    h.objects.set(SHARED_DEST, BIG_DOC);
+    h.objects.set(STAGED, `${BIG_DOC}\n## Revised\n`);
+    const r = saved(await saveDoc({ s3Key: STAGED }));
+    expect(r.status).toBe("updated");
+    const entries = manifestDesignEntries();
+    expect(entries).toHaveLength(1);
+    expect(entries[0].critical).toBe(true);
+    expect(entries[0].s3Key).toBe(SHARED_DEST);
+  });
+
+  it("(c) another agent's design-doc entry is preserved and ours is appended, never duplicated", async () => {
+    const OTHER_SHARED = `workflows/${WF}/shared/design-doc-agentcore_hub_frontend_designer.md`;
+    const manifest = emptyManifest();
+    manifest.phases.design = [{
+      id: "design-1", type: "design-doc", s3Key: OTHER_SHARED,
+      addedBy: "agentcore_hub_frontend_designer", critical: true, addedAt: "t0",
+    }];
+    h.objects.set(MANIFEST_KEY, JSON.stringify(manifest));
+    h.objects.set(SHARED_DEST, BIG_DOC);
+
+    await saveDoc({ content: "# Backend design\n" });
+    const entries = manifestDesignEntries();
+    expect(entries).toHaveLength(2);
+    expect(entries.map((e) => e.s3Key).sort()).toEqual([OTHER_SHARED, SHARED_DEST].sort());
+  });
+
+  it("(d) an entry filed under a different phase still counts as registered — no manifest write at all", async () => {
+    const manifest = emptyManifest();
+    // Put OUR entry under "development", not "design" — proves the check scans
+    // every phase array, not just PHASE_MAP[agent_id].
+    manifest.phases.development = [{
+      id: "dev-1", type: "design-doc", s3Key: SHARED_DEST, addedBy: DESIGNER, critical: true, addedAt: "t0",
+    }];
+    h.objects.set(MANIFEST_KEY, JSON.stringify(manifest));
+    h.objects.set(SHARED_DEST, BIG_DOC);
+    h.puts.length = 0;
+
+    await saveDoc({ content: "# Backend design revised\n" });
+    expect(h.puts.some((p) => p.Key === MANIFEST_KEY)).toBe(false);
+  });
+
+  it("(e) a manifest GET that fails for a reason other than NoSuchKey is non-fatal and loud", async () => {
+    h.objects.set(MANIFEST_KEY, JSON.stringify(emptyManifest()));
+    h.failGets.set(MANIFEST_KEY, "InternalError");
+
+    const res = await saveDoc({ content: "# Backend design\n" });
+    expect(res.isError).toBeFalsy();
+    expect(written(DEST)).toEqual(["# Backend design\n"]);
+    expect(written(SHARED_DEST)).toEqual(["# Backend design\n"]);
+    expect(h.warns.join("\n")).toMatch(/manifest update failed for workflow wf_1/);
+    // The populated manifest must not be clobbered with a skeleton — no write at all.
+    expect(h.puts.some((p) => p.Key === MANIFEST_KEY)).toBe(false);
+  });
+
+  it("(f) the guard rejects a key from a different workflow with zero reads and zero writes", async () => {
+    const key = `workflows/wf_OTHER/${DESIGNER}/design.md`;
+    const res = await saveDoc({ s3Key: key });
+    expect(res.isError).toBe(true);
+    expect(errorText(res)).toContain(key);
+    expect(errorText(res)).toMatch(/different workflow/);
+    expect(errorText(res)).toContain(`workflows/${WF}/`);
+    expect(h.gets).toHaveLength(0);
+    expect(h.puts).toHaveLength(0);
+
+    // The pre-existing "outside workflows/ entirely" message and regex must be
+    // unaffected — blueprints/backend-designer.md never reaches the new check.
+    const res2 = await saveDoc({ s3Key: "blueprints/backend-designer.md" });
+    expect(errorText(res2)).toMatch(/outside the workflows\/ prefix/);
   });
 });
 
