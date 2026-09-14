@@ -84,6 +84,17 @@ CASES = [
      'FAIL: stack.txt declares variablesNamespace "BuildVars" on action Build_and_gate but '
      'pipeline-contract.json says action Deploy_it - fix: correct '
      'namespaces["BuildVars"].action'),
+    # F3: the action matches namespaces[ns].action, but does not run the exporter
+    # buildspec (action -> project -> fromSourceFilename)
+    ("exporter-not-run-by-action", (), 1,
+     'FAIL: stack.txt action Build_and_gate (namespace "BuildVars") runs buildspec.yml but '
+     'pipeline-contract.json says exporter deploy.yml - fix: set '
+     'namespaces["BuildVars"].exporter to buildspec.yml or fix the stack\'s project binding'),
+    # F3: the action matches namespaces[ns].action, but runs no CodeBuild project at all
+    ("exporter-action-runs-no-project", (), 1,
+     'FAIL: stack.txt action Orphan_gate (namespace "OrphanVars") runs no CodeBuild project but '
+     'pipeline-contract.json says exporter buildspec.yml - fix: bind the action to the project '
+     'that runs buildspec.yml or correct namespaces["OrphanVars"].action'),
     # fail-closed: every infrastructure error is exit 2 with one FAIL line
     ("fail-closed-missing-contract", (), 2, "contract file missing"),
     ("fail-closed-unparseable-json", (), 2, "unparseable JSON"),

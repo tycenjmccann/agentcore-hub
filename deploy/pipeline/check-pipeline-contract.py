@@ -1076,6 +1076,17 @@ def check_parity(contract, contract_path, stack, scan_targets, explain, strict, 
             viol.add((S, 0, ns, "%s has no variablesNamespace \"%s\" but pipeline-contract.json declares namespace %s - fix: remove the namespace or add variablesNamespace to the exporter action (a HANDOFF)" % (S, ns, ns)))
         elif actual != e["action"]:
             viol.add((S, 0, ns, "%s declares variablesNamespace \"%s\" on action %s but pipeline-contract.json says action %s - fix: correct namespaces[\"%s\"].action" % (S, ns, actual, e["action"], ns)))
+        else:
+            # F3: the action matched namespaces[ns].action - now check it actually
+            # runs the exporter buildspec (action -> project -> fromSourceFilename),
+            # the same binding data P2a-d use. Gated on the action match above so an
+            # operator with both wrong sees one cause at a time.
+            proj = stack["project_of_action"].get(actual)
+            resolved = stack["buildspec_of_project"].get(proj) if proj else None
+            if resolved is None:
+                viol.add((S, 0, ns, "%s action %s (namespace \"%s\") runs no CodeBuild project but pipeline-contract.json says exporter %s - fix: bind the action to the project that runs %s or correct namespaces[\"%s\"].action" % (S, actual, ns, e["exporter"], e["exporter"], ns)))
+            elif resolved != e["exporter"]:
+                viol.add((S, 0, ns, "%s action %s (namespace \"%s\") runs %s but pipeline-contract.json says exporter %s - fix: set namespaces[\"%s\"].exporter to %s or fix the stack's project binding" % (S, actual, ns, resolved, e["exporter"], ns, resolved)))
 
     # P5: a buildspec the STACK runs must have a contract entry, whatever its name
     # (main()'s glob only closes buildspec-*.yml / *.yaml at two fixed locations).
