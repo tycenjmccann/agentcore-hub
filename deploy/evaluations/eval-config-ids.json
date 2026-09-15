@@ -42,6 +42,7 @@
     "eval_agentcore_hub_security_reviewer": "eval_agentcore_hub_security_reviewer-XXXX"
   },
   "notes": {
+    "coding_runtime_configs": "TEAM-4688: the coding-runtime configs (agentcore_hub_coding_runtime and its _ec2 twin) have no supported span scopes → 100 % ValidationException; DISABLED not deleted. The judge is turned off with PUT /api/evaluations/agents/agentcore_hub_coding_runtime {enabled:false} (flips executionStatus to DISABLED); the config and its results log group stay, so history and the reconcile in lambda/eval-packager keep working.",
     "trajectory_evaluators": "TrajectoryInOrderMatch/ExactOrderMatch/AnyOrderMatch require reference inputs — only usable in on-demand evaluations, not online",
     "custom_evaluator_note": "dependency_chain_compliance (on-demand version) uses {actual_tool_trajectory} placeholder — use for scheduled batch evaluations",
     "dependency_chain_agents": "TEAM-3368/TEAM-3376: only requirements_analyst has the custom evaluator — it is the only role that CREATES the ticket dependency graph; qa_verifier/ci_agent reassign rather than construct chains and scored rubric-mismatch zeros. Other agents get Builtin.Helpfulness in the fifth slot. lambda/eval-packager/index.mjs role-guards against config drift here.",

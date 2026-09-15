@@ -19,7 +19,7 @@ with the Evaluations surface removed), the remaining app still passes
 | **Core** | Always | Dashboard, Agents browser, Invoke console, region switching, AgentCore runtime discovery/traces. |
 | **Builder** | Optional | The `/build` page + builder-tools Lambda for scaffolding agents. |
 | **Workflow** | Optional | Multi-agent orchestration pipeline: intake → requirements → design → development → verification → review, with Jira + ticket tracking. |
-| **Evaluations** | Optional | Self-improvement loop: ingests AgentCore evaluation results from CloudWatch Logs, buffers them, and feeds an improver agent. |
+| **Evaluations** | Optional | Self-improvement loop: ingests AgentCore evaluation results from CloudWatch Logs, buffers them, and feeds an improver agent. Also the score-explanation surface: a persistent per-result store with per-persona and per-session drilldowns. |
 | **Registry** | Optional | Browse/manage the Amazon Bedrock AgentCore Registry — catalogs of registries and their records (MCP servers, A2A agents, custom resources, agent skills) with an approval lifecycle. |
 | **Cloud Code** | Optional | "Safe to close your laptop" coding agent — Claude Code / Codex run server-side on a dedicated AgentCore Runtime with an EFS workspace; chat (streaming) + a live terminal, resumable from any device. |
 | **Routines** | Optional | The `/routines` page — scheduled/recurring workflow runs built from a chat-based routine builder (`lambda/routines-runner`, `deploy/routine-builder/`). |
@@ -34,6 +34,17 @@ a one-place edit. One tolerated soft seam exists between two optional modules:
 Workflow's `WorkflowBoard.tsx` polls the Pipeline module's `/api/pipeline/status`
 for the deploy-gate banner, with a silent catch so the board works unchanged when
 the Pipeline module is absent.
+
+Workflow's link to the Evaluations drilldown is deliberately **not** a seam of
+that kind: the board renders a plain
+`<a href="/evaluations/agentcore_hub_agent?workflowId=…&days=all">` and shows it
+only when the Evaluations entry is present in `NAV_ITEMS`. It is a URL string
+gated by the module registry, with no import of any `src/lib/eval*` or
+`src/app/evaluations/*` code, so deleting the Evaluations module leaves the board
+compiling (the link simply stops rendering). Likewise, core's
+`src/app/agents/[id]/page.tsx` honours a `?session_id=` query param so a judge
+result can deep-link to its trace — core reads a query param, it does not import
+Evaluations.
 
 ---
 
@@ -107,37 +118,145 @@ Fleet runtime agents (`deploy/runtime-agent`, see `DEPLOY.md`) additionally read
 The continuous-improvement loop. Self-contained surface.
 
 **UI routes**
-- `src/app/evaluations/` — dashboard + `config/` page
+- `src/app/evaluations/` — dashboard + `config/` page. The dashboard carries a
+  window selector (`?days=7|30|90|all`) and expands each runtime row into its
+  per-persona rows.
+- `src/app/evaluations/[agentId]/` — per-agent drilldown: persona timeseries plus
+  the judge-result list, narrowable with `?workflowId=` and `?days=`.
+- `src/app/evaluations/components/` — the module's own dashboard/drilldown
+  components (window selector, persona table, timeseries, result list, session
+  detail).
 
-**API routes**
-- `src/app/api/evaluations/` — config, per-agent stats, flush, loop
+**API routes** (all `dynamic = "force-dynamic"`)
+- `src/app/api/evaluations/` — config, per-agent stats, flush, loop. `GET /api/evaluations?days=7|30|90|all`
+  returns the long-standing shape (`agents`, `scorecard`, `metrics`, `evaluators`,
+  `window`, `lastUpdated`) plus `personas`
+  (`{ [agentDisplayName]: [{ persona, displayName, sessions, calls, cost, costPerSession, scores }] }`,
+  sorted by sessions desc; agents with no persona rows are absent, so `{}` is the
+  normal empty answer) and `windowLabel`. `days` defaults to `7` when absent and an
+  unrecognised value is a `400`. Responses are cached 2 minutes, keyed by window.
+- `src/app/api/evaluations/timeseries/` — `?agentId=&persona=&days=` →
+  `{ agentId, persona, series: [{ day, sessions, evaluators: { [evaluator]: { avg, count } } }], window, windowLabel, lastUpdated }`,
+  ascending. A fixed window emits one point per day *including* zero days;
+  `days=all` emits only the days that exist. Missing `agentId` is a `400`.
+- `src/app/api/evaluations/results/` — `?agentId=&persona=&workflowId=&from=&to=&cursor=&limit=` →
+  `{ sessions: [{ sessionId, agentId, persona, workflowId, ticketId, evaluatedAt, evaluators, resultCount, partial }], cursor, index, lastUpdated }`.
+  Neither `agentId` nor `workflowId` is a `400`. **Pagination seam:** this route
+  pages by the DynamoDB `LastEvaluatedKey` and groups by `sessionId` *within the
+  page*, so a session may straddle a page boundary and its grouped row is then only
+  as complete as the page it was built from (hence the `partial` flag); the session
+  detail route is the authoritative per-session view.
+- `src/app/api/evaluations/sessions/[sessionId]/` —
+  `{ sessionId, agentId, persona, workflowId, ticketId, evaluatedAt, results: [...], tracesHref, workflowHref, lastUpdated }`.
+  A session with no stored rows is a `404`.
 
 **Frontend / lib code**
-- `src/lib/eval*` (evaluation helpers)
+- `src/lib/eval*` (evaluation helpers), notably:
+- `src/lib/eval-results.ts` — the DynamoDB query helpers for the four access
+  patterns (by agent, by persona, by workflow, by session); the opaque `cursor` is
+  base64 JSON of the DynamoDB `LastEvaluatedKey`
+- `src/lib/eval-metrics.ts` — folds day buckets into a window: `parseWindow`,
+  `windowDaysFor`, `splitDailyItems` (runtime rollup rows vs `<agentId>#<persona>`
+  rows). There is no window ceiling any more — the day buckets are permanent, so
+  `all` is a supported window
 
 **Lambdas** (`lambda/`)
-- `eval-packager` — triggered by CloudWatch Logs subscription filters; parses
-  evaluator results and buffers them
-- `token-aggregator` — token/cost aggregation into per-agent per-UTC-day items in `agentcore-hub-eval-daily` from Strands `chat` spans, harness EMF metrics and Claude Code `api_request` events; the Evaluations tab reads a rolling 7-day window (no weekly reset)
+- `eval-packager` — two entry points, one code path. **Push:** CloudWatch Logs
+  subscription filters deliver evaluator results; each result is written to
+  `agentcore-hub-eval-results` after extract → per-delivery dedup → role guard and
+  **before** the config / enabled / sample-rate gates, because those gates govern
+  the improver loop rather than the record of what the judge said (a paused loop, a
+  disabled agent or a 25%-sampled agent still leaves a complete audit trail). The
+  day buckets and the buffer/flush/PRD path stay behind the gates, unchanged.
+  **Reconcile:** invoked with `{ mode: "reconcile", days | from/to, group?, dryRun? }`
+  (handled before the `awslogs` decode); re-reads the results log groups with
+  `DescribeLogGroups` + `FilterLogEvents` and pushes the events through the same
+  extract → dedup → role-guard → row-mapper → put chain, then rewrites the day
+  buckets with `SET` from the stored rows (idempotent, where a second `ADD` would
+  double). A reconcile never touches the eval-config item (all-time scorecard,
+  `sessionBuffer`, `lastFlushedAt`), the seen-set, or the improver — it can neither
+  flush a batch nor synthesize a PRD. EMF record `AgentCoreHub/Evaluations` gains
+  `EvalResultsWritten` and `EvalResultsDuplicate`.
+- `token-aggregator` — token/cost aggregation into per-agent per-UTC-day items in `agentcore-hub-eval-daily` from Strands `chat` spans, harness EMF metrics and Claude Code `api_request` events; the buckets are permanent (no TTL, no `expiresAt`) so the Evaluations tab can fold 7 / 30 / 90 / all-time windows
 - `prd-submitter` — S3-triggered handoff into the improver agent
 
 **DynamoDB tables**
 - `agentcore-hub-eval-config` — per-agent eval controls + session buffer
-- `agentcore-hub-eval-daily` — per-agent per-UTC-day metric buckets (tokens/cache/cost from token-aggregator, sessions/scores from eval-packager; TTL `expiresAt`) read by `/api/evaluations` over a rolling window
+- `agentcore-hub-eval-seen` — the dedup seen-set (PK `dedupKey`, 24h TTL); see
+  `deploy/continuous-improvement/README.md`
+- `agentcore-hub-eval-daily` (`EVAL_DAILY_TABLE`) — per-agent per-UTC-day metric
+  buckets (tokens/cache/cost from token-aggregator, sessions/scores from
+  eval-packager), read by `/api/evaluations` over the selected window. PK `agentId`,
+  SK `day`. **TTL is disabled** and neither writer stamps `expiresAt` any more, so
+  the history is permanent and an all-time window is answerable; rows written before
+  that change keep an inert `expiresAt`. Two row shapes share the table: PK
+  `<agentId>` is the runtime rollup, and PK `<agentId>#<persona>` is one pipeline
+  persona (all 18 personas share the `agentcore_hub_agent` runtime, so the runtime
+  row is their sum). Persona rows carry only `sessions` / `e|<evaluator>|sum` /
+  `e|<evaluator>|count`; token and cost attributes (`m|<model>|<field>`) stay
+  runtime-only because they are not attributable per persona. `_runtime` gets no row
+  of its own — it *is* the rollup.
+- `agentcore-hub-eval-results` (`EVAL_RESULTS_TABLE`) — one row per judge result,
+  `PAY_PER_REQUEST`, PITR on, **no TTL, kept forever**. PK `agentId`, SK `sk` =
+  `<evaluatedAt ISO>#<dedupKey>`, using the same `dedupKey` as the seen-set, which
+  is what lets push, reconcile and backfill converge on one row via a conditional
+  `PutItem` (`attribute_not_exists(sk)`). Attributes: `persona`, `sessionId`,
+  `workflowId`, `ticketId`, `evaluator`, `day`, `evaluatedAt`, `score`, `scoreLabel`,
+  `explanation` (truncated to 8192 bytes, with `explanationTruncated: true` when it
+  was), `errorType`, `errorMessage`, `status`, `statusReason`, `traceId`, `spanId`,
+  `requestId`, `logGroup`, `source` (`push` | `reconcile`), `ingestedAt`. GSIs, all
+  `ProjectionType=ALL`:
+  - `bySession` — `gsi1pk` = `sessionId` HASH, `gsi1sk` = `<evaluator>#<evaluatedAt>` RANGE
+  - `byPersona` — `gsi2pk` = `<agentId>#<persona>` HASH, `sk` RANGE
+  - `byWorkflow` — `gsi3pk` = `workflowId` HASH, `sk` RANGE. **Sparse**: only
+    pipeline session ids parse into a `workflowId`, so canary, cloud-code, `si-`
+    and chat rows never appear in it.
+
+  The table is a queryable **mirror**, not the system of record: the
+  `/aws/bedrock-agentcore/evaluations/results/<configId>` log groups remain the
+  system of record, and the daily reconcile is what keeps the two equal.
 
 **CloudWatch wiring**
 - Subscription filters on `/aws/bedrock-agentcore/evaluations/results/eval_<harnessName>`
   log groups → `eval-packager`
+- EventBridge rule `agentcore-hub-eval-reconcile`, `rate(1 day)` → `eval-packager`
+  with `{"mode":"reconcile","days":2}` (created by
+  `deploy/continuous-improvement/deploy.sh`)
+
+**IAM**
+- Inline policy `EvalResultsAccess` on the shared `agentcore-hub-lambda-role`,
+  added by `deploy/continuous-improvement/deploy.sh`: DynamoDB `PutItem`/`Query`/
+  `BatchGetItem` on the results table and its `/index/*`, `logs:DescribeLogGroups`,
+  and `logs:FilterLogEvents` on the results log groups. It is additive, so it never
+  fights the `DynamoDBAccess` document written by `deploy/setup-lambda-role.sh`.
 
 **Deploy scripts**
 - `deploy/evaluations/setup-evaluations.sh`
+- `deploy/continuous-improvement/deploy-all.sh` — creates the tables, enables PITR
+  on the results table, and turns the `agentcore-hub-eval-daily` TTL **off**
 - `deploy/continuous-improvement/deploy.sh` (see `deploy/continuous-improvement/README.md`)
+  — packager code + env + the `EvalResultsAccess` policy + the reconcile schedule
+- `deploy/continuous-improvement/deploy-token-aggregator.sh`
+- `node deploy/continuous-improvement/backfill-results.mjs --from YYYY-MM-DD --to YYYY-MM-DD [--dry-run] [--group <name>] [--region r]`
+  — one reconcile invoke per UTC day, printing per-day rows/duplicates/sessions and
+  a total; idempotent by construction. `backfill-daily.mjs` is a deprecation stub
+  that exits 1 and points here.
 
 **`agents.json` fields it reads**
 - `evaluationsEnabled` — per-agent on/off
 - `evalConfigName` — substring used to match the agent's eval log groups
 
-**Env vars** — `EVAL_CONFIG_TABLE`, `ARTIFACT_BUCKET`, `LAMBDA_ROLE_ARN`.
+**Env vars** — `EVAL_CONFIG_TABLE`, `EVAL_SEEN_TABLE`, `EVAL_DAILY_TABLE`,
+`EVAL_RESULTS_TABLE`, `ARTIFACT_BUCKET`, `LAMBDA_ROLE_ARN`, and on the packager
+`LEGACY_RESULTS_GROUPS_B64` — base64 of the compact JSON of
+`deploy/evaluations/legacy-results-groups.json`, base64 because
+`aws lambda update-function-configuration --environment` takes a
+`Variables={K=V,...}` shell list that raw JSON cannot survive. Keys are results
+log-group leaf names (or a distinguishing substring), values are canonical
+`agentId`s, and keys starting with `_` are metadata and ignored. It is consulted
+**before** the name-based `resolveAgentId()`, which would otherwise mis-attribute a
+pre-consolidation log group to one persona's `agentId`. The map has to fit the
+Lambda's 4KB env budget.
 
 ---
 
@@ -506,7 +625,9 @@ the optional modules expect certain shape.
 3. **Shared IAM role.** `agentcore-hub-lambda-role` (`LAMBDA_ROLE_ARN` in
    `deploy/config.sh`) is reused across the Workflow and Evaluations Lambdas. If
    you deploy only one module you can scope the role down to just that module's
-   permissions.
+   permissions. Module-specific grants are attached as **additive inline policies**
+   rather than edits to the shared documents — Evaluations' `EvalResultsAccess` is
+   the example — so two modules' deploy scripts cannot clobber each other's access.
 
 ---
 
@@ -538,11 +659,29 @@ npx tsc --noEmit && npm run build
 Example — drop **Evaluations**:
 
 ```bash
+# 1. UI (dashboard + drilldown + components), API routes, libs
 rm -rf src/app/evaluations src/app/api/evaluations src/lib/eval*
-rm -rf lambda/eval-packager lambda/token-aggregator lambda/prd-submitter
-# delete the entry tagged module: "evaluations" in src/config/modules.ts
+
+# 2. Lambdas + deploy assets
+rm -rf lambda/eval-packager lambda/token-aggregator lambda/prd-submitter \
+       deploy/continuous-improvement deploy/evaluations
+
+# 3. Nav: delete the entry tagged module: "evaluations" in src/config/modules.ts
+#    That also removes the Workflow board's /evaluations link, which is gated on
+#    NAV_ITEMS and imports nothing from this module.
+
+# 4. Verify the rest still builds
 npx tsc --noEmit && npm run build
 ```
+
+If it was deployed, also tear down the AWS side: the `agentcore-hub-eval-config`,
+`agentcore-hub-eval-seen`, `agentcore-hub-eval-daily` and
+`agentcore-hub-eval-results` tables, the results log-group subscription filters, the
+`agentcore-hub-eval-reconcile` EventBridge rule (otherwise it keeps invoking a
+deleted function once a day), the online evaluation configs themselves, and the
+`EvalResultsAccess` inline policy on `agentcore-hub-lambda-role`. Core's
+`?session_id=` handling in `src/app/agents/[id]/page.tsx` is core behaviour and
+stays.
 
 Both removals were validated: the remaining app compiles and builds cleanly. The
 `agents.json` module fields left behind (e.g. `harnessName`, `evalConfigName`)
