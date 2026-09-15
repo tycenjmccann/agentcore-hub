@@ -123,7 +123,7 @@ vi.mock("./workflow-store.mjs", () => ({
   setTaskStatus: vi.fn(async () => {}),
   completeTaskEntry: vi.fn(async (wfId, tid, entry) => { if (h.state.workflow?.agentTasks) h.state.workflow.agentTasks[tid] = entry; }),
   mergeTaskMetadata: vi.fn(async () => {}),
-  advancePhase: vi.fn(async () => {}),
+  advancePhase: vi.fn(async () => true),
   adoptFeatureBranch: vi.fn(async () => {}),
   setResumeContext: vi.fn(async () => {}),
   removeResumeContext: vi.fn(async () => {}),

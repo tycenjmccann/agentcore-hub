@@ -2617,13 +2617,13 @@ async function handleTicketReadyUnified(ticketId, ticket) {
         TableName: TICKETS_TABLE,
         Key: { ticketId },
         UpdateExpression: "SET #s = :s, #u = :u",
-        ConditionExpression: "#s <> :inprog",
+        ConditionExpression: "#s <> :inprog AND #s <> :cancelled",
         ExpressionAttributeNames: { "#s": "status", "#u": "updatedAt" },
-        ExpressionAttributeValues: { ":s": "in_progress", ":inprog": "in_progress", ":u": new Date().toISOString() },
+        ExpressionAttributeValues: { ":s": "in_progress", ":inprog": "in_progress", ":cancelled": "cancelled", ":u": new Date().toISOString() },
       }));
     } catch (err) {
       if (err.name === "ConditionalCheckFailedException") {
-        console.log(`[orchestrator] ${ticketId} already in_progress — skipping duplicate invocation`);
+        console.log(`[orchestrator] ${ticketId} already in_progress or cancelled — skipping invocation`);
         return;
       }
       throw err;
@@ -2650,9 +2650,14 @@ async function handleTicketReadyUnified(ticketId, ticket) {
     workflow.featureBranch = await ensureFeatureBranch(workflow);
   }
   if (agentPhaseIdx > currentPhaseIdx) {
+    // CAS: a cancel that landed after our read makes this a no-op — stop here
+    // rather than dispatch into a cancelled run (TEAM-4577).
+    if (!(await store.advancePhase(workflow.id, ticketPhase, workflow.featureBranch))) {
+      console.log(`[orchestrator] GUARD: workflow ${workflow.id} went terminal before dispatch of ${ticketId} — not invoking ${assignee}`);
+      return;
+    }
     workflow.phase = ticketPhase;
     await publishEvent(ticketId, "workflow.phase_change", { phase: ticketPhase, workflowId: workflow.id });
-    await store.advancePhase(workflow.id, workflow.phase, workflow.featureBranch);
   }
 
   // Build context and invoke — SAME buildAgentContext for both paths
@@ -3066,13 +3071,13 @@ async function handleTicketReady(ticketId, image) {
       TableName: TICKETS_TABLE,
       Key: { ticketId },
       UpdateExpression: "SET #s = :s, #u = :u",
-      ConditionExpression: "#s <> :inprog",
+      ConditionExpression: "#s <> :inprog AND #s <> :cancelled",
       ExpressionAttributeNames: { "#s": "status", "#u": "updatedAt" },
-      ExpressionAttributeValues: { ":s": "in_progress", ":inprog": "in_progress", ":u": new Date().toISOString() },
+      ExpressionAttributeValues: { ":s": "in_progress", ":inprog": "in_progress", ":cancelled": "cancelled", ":u": new Date().toISOString() },
     }));
   } catch (err) {
     if (err.name === "ConditionalCheckFailedException") {
-      console.log(`[orchestrator] ${ticketId} already in_progress — skipping duplicate invocation`);
+      console.log(`[orchestrator] ${ticketId} already in_progress or cancelled — skipping invocation`);
       return;
     }
     throw err; // unexpected error — re-throw
@@ -3095,9 +3100,14 @@ async function handleTicketReady(ticketId, image) {
     workflow.featureBranch = await ensureFeatureBranch(workflow);
   }
   if (agentPhaseIdx > currentPhaseIdx) {
+    // CAS: a cancel that landed after our read makes this a no-op — stop here
+    // rather than dispatch into a cancelled run (TEAM-4577).
+    if (!(await store.advancePhase(workflow.id, ticketPhase, workflow.featureBranch))) {
+      console.log(`[orchestrator] GUARD: workflow ${workflow.id} went terminal before dispatch of ${ticketId} — not invoking ${assignee}`);
+      return;
+    }
     workflow.phase = ticketPhase;
     await publishEvent(ticketId, "workflow.phase_change", { phase: ticketPhase, workflowId: workflow.id });
-    await store.advancePhase(workflow.id, workflow.phase, workflow.featureBranch);
   }
 
   // Build context and invoke agent

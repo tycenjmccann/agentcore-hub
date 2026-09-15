@@ -210,6 +210,7 @@ vi.mock("./workflow-store.mjs", () => {
     advancePhase: vi.fn(async (_id, phase, featureBranch) => {
       wf().phase = phase;
       if (featureBranch) wf().featureBranch = featureBranch;
+      return true;
     }),
     adoptFeatureBranch: vi.fn(async () => {}),
     appendNotification: vi.fn(async (_id, n) => {
