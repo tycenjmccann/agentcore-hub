@@ -279,6 +279,39 @@ describe("business-hours reminder", () => {
     expect(db.items.get("gate#notif_TEAM-2_a").pagedAt.S).toBe("2026-09-09T07:11:00.000Z");
   });
 
+  /**
+   * TEAM-4671 F2 — the reminder is the SAME page, later. It used to be built
+   * from a strictly smaller input set: the reminder path fetched the run's
+   * tickets, kept only the gate's own row and threw the rest away, so the
+   * attempt count (which for a re-FILED gate comes from the sibling tickets)
+   * silently reset to 1. A reviewer got "Attempt 2 — previous issue: …" at
+   * 02:00 and a reminder with no attempt line at all at 09:00, for one gate.
+   */
+  it("(2c) a reminder carries the SAME attempt line as the page it repeats", async () => {
+    const handler = await loadHandler();
+    const n = notif("TEAM-2c", "notif_TEAM-2c_a", OUT_OF_HOURS);
+    const w = [wf([n])];
+    // A release manager re-filed the gate for the same deploy; the bridge
+    // recorded why the earlier ticket came back.
+    const tickets = [
+      { ticketId: "TEAM-2c", title: "Deploy gate: the queued deploy — PR #596", status: "in_review", blockedBy: [], createdAt: "2026-09-09T06:00:00.000Z" },
+      { ticketId: "TEAM-2c0", title: "Deploy gate: the queued deploy — PR #593", status: "done", blockedBy: [], createdAt: "2026-09-08T06:00:00.000Z" },
+    ];
+    db.items.set("gaterework#TEAM-2c0", {
+      id: { S: "gaterework#TEAM-2c0" }, reason: { S: "the smoke test regressed" }, at: { S: "2026-09-08T20:00:00.000Z" },
+    });
+    const ATTEMPT = /^Attempt 2 — previous issue: the smoke test regressed$/m;
+
+    const page = await scanAt(handler, "2026-09-09T07:11:00.000Z", w, { tickets });
+    expect(page.sent).toHaveLength(1);
+    expect(page.sent[0].text).toMatch(ATTEMPT);
+
+    const reminder = await scanAt(handler, "2026-09-09T16:00:30.000Z", w, { tickets });
+    expect(reminder.sent).toHaveLength(1);
+    expect(reminder.sent[0].text).toContain("business-hours reminder");
+    expect(reminder.sent[0].text, "the reminder must not contradict its own page").toMatch(ATTEMPT);
+  });
+
   // TEAM-4461 F4 — the request-time page itself landed inside the window, either
   // because the gate opened just before it (A) or because delivery was delayed
   // past the opening, e.g. a notifier outage (B). Neither earns a reminder: the

@@ -744,9 +744,13 @@ function buildApprovalMessage({
   const ship = (shipping || []).filter((s) => typeof s === "string" && s.trim()).map(oneLine);
   const n = Math.floor(Number(attempt) || 1);
   // ONE line, no history: the reviewer needs "this came back before, for this",
-  // not a changelog. Reason clamped to a single short line.
+  // not a changelog. Reason clamped to a single short line — and when no reason
+  // was RECORDED the line states the count and nothing else (TEAM-4671 F1). It
+  // used to assert "previous issue: changes requested on the previous attempt",
+  // which is a claim about a human's verdict that the bridge cannot make up.
+  const reason = clipText(oneLine(previousIssue), APPROVAL_REASON_MAX);
   const attemptLine = n >= 2
-    ? `Attempt ${n} — previous issue: ${clipText(oneLine(previousIssue) || "changes requested on the previous attempt", APPROVAL_REASON_MAX)}`
+    ? (reason ? `Attempt ${n} — previous issue: ${reason}` : `Attempt ${n}`)
     : "";
 
   let bl = (bullets || []).filter((b) => typeof b === "string" && b.trim());
@@ -978,16 +982,60 @@ const REPAGE_KEY_PREFIX = "repage#";
 // still looks pending here. Ask the ticket itself before nagging about it.
 const REPAGE_SKIP_STATUSES = new Set(["done", "blocked", "cancelled", "canceled"]);
 
-/** The gate's own ticket row, or null when the tickets view is unavailable. */
+/**
+ * The gate's own ticket row AND the run's whole ticket set, from ONE fetch.
+ *
+ * Both paging paths need both: the row for classification and the resolved
+ * check, the set for the attempt count (sibling gates) and the shipping list.
+ * The reminder path used to take the row and throw the set away, so it counted
+ * attempts from an empty list and a re-filed gate's reminder contradicted its
+ * own request-time page (TEAM-4671 F2). Never throws, and an unavailable
+ * tickets view degrades to `{ gateTicket: null, tickets: [] }` — the ping still
+ * goes out with the ticket id.
+ */
 async function gateTicketOf(wf, notif) {
   try {
     const res = await fetch(`${HUB_API_URL}/api/workflow/${wf.workflowId}/tickets`);
-    if (!res.ok) return null;
+    if (!res.ok) return { gateTicket: null, tickets: [] };
     const { tickets = [] } = await res.json();
-    return tickets.find((t) => t.ticketId === notif.ticketId) || null;
+    return { gateTicket: tickets.find((t) => t.ticketId === notif.ticketId) || null, tickets };
   } catch {
-    return null; // a reminder is cheap; a missed one is not
+    return { gateTicket: null, tickets: [] }; // a reminder is cheap; a missed one is not
   }
+}
+
+/**
+ * `blockedBy` is an ARRAY in dynamodb mode and a comma-joined STRING in jira
+ * mode (src/lib/workflow/jira-read.ts:145, despite JiraTicket.blockedBy being
+ * typed string[]). Calling .map() on the string form threw a TypeError that the
+ * caller's catch swallowed, so every Jira-mode gate lost its shipping list.
+ * The UI carries the same workaround inline (src/components/workflow/
+ * TicketDetailModal.tsx:320) — keep the three in step.
+ */
+function normalizeBlockedBy(x) {
+  if (Array.isArray(x)) return x.filter(Boolean);
+  if (typeof x === "string") return x.split(",").map((s) => s.trim()).filter(Boolean);
+  return [];
+}
+
+/**
+ * What this run has already landed, for a gate whose `blockedBy` says nothing.
+ * `wf.agentTasks[ticketId].prUrl` is the ONLY pre-completion PR signal on the
+ * wire: neither ticket provider puts a PR url on a ticket row, and `wf.delivery`
+ * is written by completeWorkflow AFTER the phase goes terminal — which
+ * scanReviewGates skips — so the old `wf.delivery?.prUrl` fallback here was
+ * unreachable. Titles come from the ticket rows; an agentTasks entry has none.
+ * Newest first, so the render cap keeps the work closest to this review.
+ */
+function shippedTitles(wf, tickets) {
+  const tasks = wf?.agentTasks && typeof wf.agentTasks === "object" ? wf.agentTasks : {};
+  return (tickets || [])
+    .filter((t) => t && String(t.status || "").toLowerCase() === "done" && tasks[t.ticketId]?.prUrl)
+    .map((t) => ({ title: oneLine(t.title), at: Date.parse(tasks[t.ticketId]?.completedAt || t.updatedAt || t.createdAt || "") }))
+    .filter((x) => x.title)
+    .sort((a, b) => (Number.isFinite(b.at) ? b.at : 0) - (Number.isFinite(a.at) ? a.at : 0))
+    .map((x) => x.title)
+    .slice(0, 5);
 }
 
 /**
@@ -1052,7 +1100,7 @@ async function repageIfWindowOpened(wf, notif, w) {
 
     // Resolved in the meantime → keep the claim: there is nothing to remind
     // about and re-checking on every later scan would be pure noise.
-    const gateTicket = await gateTicketOf(wf, notif);
+    const { gateTicket, tickets } = await gateTicketOf(wf, notif);
     const status = String(gateTicket?.status || "").toLowerCase();
     if (REPAGE_SKIP_STATUSES.has(status)) return;
 
@@ -1076,8 +1124,9 @@ async function repageIfWindowOpened(wf, notif, w) {
     ] };
 
     // Same content rules as the request-time page (TEAM-4660): the gate
-    // ticket's title/description never reach the reminder either.
-    const attempt = approvalAttempt({ wf, notif });
+    // ticket's title/description never reach the reminder either. Same INPUTS
+    // too (TEAM-4671 F2) — the reminder and the page must agree on the attempt.
+    const { attempt, previousIssue } = await approvalAttempt({ wf, notif, tickets });
     const { delivered } = await sendApprovalPing(chats, {
       label: "business-hours reminder",
       gateKind: ESCALATION_GATE_TITLE.test(title) ? "escalation" : gateKindOf(notif.gate, title),
@@ -1085,7 +1134,7 @@ async function repageIfWindowOpened(wf, notif, w) {
       subject: wf.input?.title || wf.workflowId,
       summary: "Sent for review outside working hours and still open — your window is open now.",
       attempt,
-      previousIssue: attempt >= 2 ? await readGateRework(notif.ticketId) : undefined,
+      previousIssue,
       meta: [
         `👤 ${esc(reviewer)}`,
         `🎫 [${notif.ticketId}](https://${JIRA_SITE_URL}/browse/${notif.ticketId})`,
@@ -1153,37 +1202,25 @@ async function scanReviewGates() {
       // ticket's title (for CLASSIFICATION only — never rendered, TEAM-4660), the
       // titles of the UPSTREAM work it blocks on (blockedBy) — i.e. exactly what
       // is being reviewed — and the sibling gates that came before it.
-      let title = notif.ticketId;
-      let gateTicket = null;
-      let upstreamTitles = [];
-      let allTickets = [];
-      try {
-        const tRes = await fetch(`${HUB_API_URL}/api/workflow/${wf.workflowId}/tickets`);
-        if (tRes.ok) {
-          const { tickets = [] } = await tRes.json();
-          allTickets = tickets;
-          gateTicket = tickets.find((x) => x.ticketId === notif.ticketId) || null;
-          if (gateTicket?.title) title = gateTicket.title;
-          const byId = new Map(tickets.map((x) => [x.ticketId, x]));
-          upstreamTitles = (gateTicket?.blockedBy || [])
-            .map((id) => byId.get(id)?.title)
-            .filter(Boolean)
-            .slice(0, 5);
-        }
-      } catch { /* ping still goes out with the id */ }
+      // One fetch, shared with the reminder path (gateTicketOf); it never throws,
+      // so an unavailable tickets view just leaves the id as the title.
+      const { gateTicket, tickets: allTickets } = await gateTicketOf(wf, notif);
+      const title = gateTicket?.title || notif.ticketId;
+      const byId = new Map(allTickets.map((x) => [x.ticketId, x]));
+      const upstreamTitles = normalizeBlockedBy(gateTicket?.blockedBy)
+        .map((id) => byId.get(id)?.title)
+        .filter(Boolean)
+        .slice(0, 5);
 
       const reviewer = notif.reviewer || "reviewer";
       const isEscalation = ESCALATION_GATE_TITLE.test(title);
       const ticketLink = `🎫 [${notif.ticketId}](https://${JIRA_SITE_URL}/browse/${notif.ticketId})`;
       // WHAT is being reviewed: the upstream work this gate blocks on, else the
-      // PR the run has already opened. Never the gate ticket's own prose.
-      const shipping = upstreamTitles.length
-        ? upstreamTitles
-        : (wf.delivery?.prUrl ? [`PR ${wf.delivery.prUrl}`] : []);
+      // work the run has already landed a PR for. Never the gate's own prose.
+      const shipping = upstreamTitles.length ? upstreamTitles : shippedTitles(wf, allTickets);
       // Only the closing agent's CURATED review package may speak here — a gate
       // ticket description is a runbook for the human, not ping copy.
-      const attempt = approvalAttempt({ wf, notif, tickets: allTickets });
-      const previousIssue = attempt >= 2 ? await readGateRework(notif.ticketId) : undefined;
+      const { attempt, previousIssue } = await approvalAttempt({ wf, notif, tickets: allTickets });
       // TEAM-3971: a ship-review escalation needs a DECISION, not a bare approve
       // (a bare approve used to park the release manager forever). Offer the
       // three decisions as buttons; each records a `DECISION:` line on the gate.
@@ -1295,12 +1332,15 @@ async function releaseGate(notif) {
   }));
 }
 
-// ─── Attempt / previous issue (TEAM-4660) ────────────────────────────────────
+// ─── Attempt / previous issue (TEAM-4660, tightened by TEAM-4671) ─────────────
 // Nothing upstream counts review cycles: gate-state.mjs has no attempt counter
-// and the notification carries no attempt/reason field, which is why a release
-// manager resorted to writing "(3×)" into the ticket TITLE. Both signals are
-// therefore derived here, from data already on the wire, and no orchestrator
-// field is invented.
+// (and its ledger is off by default), and the notification carries no
+// attempt/reason field, which is why a release manager resorted to writing
+// "(3×)" into the ticket TITLE. Both signals are therefore derived here, from
+// data already on the wire, and no orchestrator field is invented — but only
+// from evidence that a cycle actually concluded. An UNEVIDENCED guess is not
+// rendered at all: this text tells a human "you rejected this before", so a
+// false positive costs more than a missing line.
 const GATE_REWORK_PREFIX = "gaterework#";
 
 /** ms sort key for a review cycle: explicit timestamp, else the ISO minted into notif.id. */
@@ -1315,18 +1355,51 @@ function notifOrderKey(n) {
 const titlePrefix = (s) => oneLine(String(s || "").split(":")[0]).toLowerCase();
 
 /**
- * Which review cycle is this, 1-based? Two sources, both defensive — an
- * unparseable row must never cost the ping:
- *  1. earlier unacked-or-acked review_needed rows for the SAME gate ticket
- *     (the orchestrator mints a fresh notif per park), ordered by timestamp,
- *     else by the id's ISO, else by position in the append-only array.
- *  2. release-manager follow-ups, which are a NEW ticket per attempt rather
- *     than a re-park: same title prefix, earlier createdAt, in the same run.
- *     Prefix + createdAt is the provider-agnostic signal (Jira mode drops
- *     `labels` in src/lib/workflow/jira-read.ts); labels only narrow it when
- *     the field survives (dynamodb mode).
+ * Identity of the WORK a gate guards, from its title: everything before the
+ * first " — " / " - " / "—". A release manager files one ticket per attempt at
+ * the same target and appends the specifics ("Deploy gate: pipeline-a — PR
+ * #593"), so two attempts at pipeline-a share a key while pipeline-b — a
+ * DIFFERENT deploy running in parallel — does not. The old signal was the title
+ * PREFIX alone ("deploy gate"), which made every gate in a multi-target run a
+ * previous attempt at every other one.
  */
-function approvalAttempt({ wf, notif, tickets = [] }) {
+const GATE_KEY_SEP_RE = / — | - |—/;
+const gateKey = (s) => oneLine(s).split(GATE_KEY_SEP_RE)[0].trim().toLowerCase();
+
+/**
+ * Both ack shapes the hub writes: the orchestrator sets `acknowledged: true`
+ * (workflow-store.mjs ackNotifications, on approve AND on rejection), and the
+ * escalations route additionally stamps `acknowledgedAt`.
+ */
+const notifAcked = (n) => n?.acknowledged === true || Boolean(n?.acknowledgedAt);
+
+/** Bounded sibling lookups: one GetItem each, so cap the candidate set. */
+const GATE_SIBLING_MAX = 5;
+
+/**
+ * Which review cycle is this, and why did the last one come back? Both are
+ * derived from EVIDENCE only — a count we cannot evidence renders no attempt
+ * line at all, because "Attempt 2 — previous issue: changes requested" in front
+ * of a human who never rejected anything is worse than no line (TEAM-4671 F1).
+ *
+ * Two sources, both defensive — an unparseable row must never cost the ping:
+ *  1. earlier ACKNOWLEDGED review_needed rows for the SAME gate ticket. The
+ *     orchestrator mints a fresh notif per park and acks the old one when the
+ *     review concludes either way (index.mjs ackApprovedGateNotification /
+ *     handleReviewRejection), so an acked earlier row IS a concluded cycle.
+ *     Ordered by timestamp, else by the id's ISO, else by array position.
+ *  2. release-manager follow-ups, which are a NEW ticket per attempt rather
+ *     than a re-park. A candidate is an earlier ticket in the same run with the
+ *     same gate key; it only COUNTS if the bridge recorded a rejection against
+ *     it (gaterework#<id>, written by the ❌ tap and overwritten with the
+ *     delivered note). Ticket status is deliberately NOT evidence: a gate
+ *     created with blockers sits in `blocked`, which is the "sibling still open
+ *     in parallel" false positive, and a rejected-then-approved gate ends at
+ *     `done` like any other.
+ *
+ * @returns {Promise<{attempt:number, previousIssue?:string}>}
+ */
+async function approvalAttempt({ wf, notif, tickets = [] }) {
   try {
     const all = Array.isArray(wf?.humanNotifications) ? wf.humanNotifications : [];
     const selfIdx = all.indexOf(notif);
@@ -1336,6 +1409,7 @@ function approvalAttempt({ wf, notif, tickets = [] }) {
       if (!n || n === notif || i === selfIdx) return;
       if (n.id && notif.id && n.id === notif.id) return;
       if (n.type !== "review_needed" || n.ticketId !== notif.ticketId) return;
+      if (!notifAcked(n)) return; // an open twin is a duplicate, not a past cycle
       const k = notifOrderKey(n);
       const before = k !== null && selfKey !== null ? k < selfKey : selfIdx >= 0 && i < selfIdx;
       if (before) earlier++;
@@ -1345,23 +1419,31 @@ function approvalAttempt({ wf, notif, tickets = [] }) {
     // count only applies to the package-less (release-manager-authored) case.
     const self = tickets.find((t) => t?.ticketId === notif.ticketId);
     const prefix = titlePrefix(self?.title);
+    const key = gateKey(self?.title);
     const selfAt = Date.parse(self?.createdAt || "");
-    if (!notif.gate && prefix && GATE_TITLE_KINDS.has(prefix) && Number.isFinite(selfAt)) {
-      let siblings = 0;
-      for (const t of tickets) {
-        if (!t || t.ticketId === notif.ticketId) continue;
-        if (titlePrefix(t.title) !== prefix) continue;
-        const at = Date.parse(t.createdAt || "");
-        if (!Number.isFinite(at) || at >= selfAt) continue;
-        if (Array.isArray(t.labels) && Array.isArray(self.labels) && self.labels.length
-          && !t.labels.some((l) => self.labels.includes(l))) continue;
-        siblings++;
+    let siblingReason;
+    if (!notif.gate && key && prefix && GATE_TITLE_KINDS.has(prefix) && Number.isFinite(selfAt)) {
+      const candidates = tickets
+        .filter((t) => t && t.ticketId !== notif.ticketId && gateKey(t.title) === key)
+        .map((t) => ({ ticketId: t.ticketId, at: Date.parse(t.createdAt || "") }))
+        .filter((c) => Number.isFinite(c.at) && c.at < selfAt)
+        .sort((a, b) => b.at - a.at) // newest first: the reason we quote is the latest
+        .slice(0, GATE_SIBLING_MAX);
+      for (const c of candidates) {
+        const reason = await readGateRework(c.ticketId);
+        if (!reason) continue; // no recorded rejection → not an evidenced attempt
+        earlier++;
+        if (!siblingReason) siblingReason = reason;
       }
-      earlier += Math.min(siblings, 5);
     }
-    return 1 + earlier;
+
+    const attempt = 1 + earlier;
+    if (attempt < 2) return { attempt, previousIssue: undefined };
+    // The gate's own row wins (a re-park's reason is about THIS ticket); the
+    // latest evidenced sibling's is the fallback for the re-filed case.
+    return { attempt, previousIssue: (await readGateRework(notif.ticketId)) || siblingReason };
   } catch {
-    return 1;
+    return { attempt: 1, previousIssue: undefined };
   }
 }
 
