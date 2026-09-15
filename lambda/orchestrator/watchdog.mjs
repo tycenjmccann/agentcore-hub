@@ -41,11 +41,6 @@ export function setWatchdogSource(config) {
   _source = { perAgent, defaults: config?.defaults?.watchdog || {} };
 }
 
-/** Exposed for tests — the current resolution source. */
-export function _getWatchdogSource() {
-  return _source;
-}
-
 /** First finite, positive candidate wins; a zero/negative/NaN value is skipped. */
 function firstNum(candidates) {
   for (const c of candidates) {

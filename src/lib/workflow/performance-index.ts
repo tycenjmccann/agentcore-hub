@@ -42,8 +42,3 @@ export async function loadIndex(): Promise<PerformanceIndex> {
   indexCache = { at: Date.now(), value };
   return value;
 }
-
-/** Test-only: drop the memoized index so a spec can control what the next load sees. */
-export function resetIndexCache(): void {
-  indexCache = null;
-}
