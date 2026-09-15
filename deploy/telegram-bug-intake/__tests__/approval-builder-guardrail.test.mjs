@@ -196,6 +196,25 @@ describe("approval pings can only be composed by the builder", () => {
     expect(mod._buildApprovalMessageForTests({ gateKind: "escalation", subject: "A run" })).toContain("SHIP-REVIEW ESCALATION");
   });
 
+  /**
+   * TEAM-4671 F1 — the attempt line used to fall back to the literal
+   * "previous issue: changes requested on the previous attempt" whenever no
+   * reason was recorded, asserting a human verdict the bridge has no evidence
+   * for. It must now render the bare count, and only speak a reason it was
+   * actually given.
+   */
+  it("the attempt line is neutral with no recorded reason, and states one when given (TEAM-4671 F1)", async () => {
+    const mod = await import("../index.mjs");
+    const neutral = mod._buildApprovalMessageForTests({ gateKind: "deploy", subject: "A run", attempt: 2 });
+    expect(neutral).toMatch(/^Attempt 2$/m);
+    expect(neutral).not.toContain("previous issue");
+    expect(neutral).not.toContain("changes requested");
+    expect(neutral.match(/^Attempt .*$/gm) || []).toHaveLength(1);
+
+    const withReason = mod._buildApprovalMessageForTests({ gateKind: "deploy", subject: "A run", attempt: 2, previousIssue: "x" });
+    expect(withReason).toMatch(/^Attempt 2 — previous issue: x$/m);
+  });
+
   it("the cap sheds content, never the kicker, handle, attempt line or ask", async () => {
     const mod = await import("../index.mjs");
     const text = mod._buildApprovalMessageForTests({

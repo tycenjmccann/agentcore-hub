@@ -332,6 +332,27 @@ describe("approval pings are built from structured inputs, never from ticket pro
   });
 
   /**
+   * TEAM-4671 robustness. `oneLine(s) = String(s ?? "").replace(...).trim()`
+   * never throws and always returns a string, so `gateKey(self?.title)` is
+   * safe even when `self` is undefined — but prove the OUTCOME that matters:
+   * a tickets-view outage must not fall through to the try/catch's `attempt: 1`
+   * and silently wipe out the notif-derived count, which needs no ticket at
+   * all (it only walks `wf.humanNotifications`).
+   */
+  it("a tickets-view outage does not reset the notif-derived attempt count", async () => {
+    const mod = await loadModule();
+    const cycle1 = notif(`notif_${GATE}_2026-09-14T10:00:00.000Z`, "2026-09-14T10:00:00.000Z", { acknowledged: true });
+    const cycle2 = notif(`notif_${GATE}_2026-09-14T18:00:00.000Z`, "2026-09-14T18:00:00.000Z");
+    // No `tickets` override → the /tickets endpoint 404s (net.tickets is null),
+    // so gateTicketOf degrades to { gateTicket: null, tickets: [] }. The ping
+    // must still go out, keyed on the notif's own ticketId as the title.
+    const { sent } = await run(mod.handler, { batches: [[]], workflows: [wf([cycle1, cycle2])] });
+
+    expect(sent).toHaveLength(1);
+    expect(attemptLinesOf(sent[0].text)).toEqual(["Attempt 2"]);
+  });
+
+  /**
    * TEAM-4671 F1. A release manager files a NEW ticket per attempt, so the
    * sibling tickets ARE the cycle history — but only where a rejection was
    * actually recorded. The counter used to match on the title PREFIX alone
