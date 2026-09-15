@@ -2044,6 +2044,13 @@ def Pipeline___get_state(pipeline_name: str = "", execution_id: str = "") -> str
     terminal/succeeded when matchesExecution is true; matchesExecution:false
     means your run is not visible on any stage yet (keep polling).
 
+    While the human deploy gate is waiting, the response also carries
+    approvalPing: status "delivered" means the reviewer WAS paged on Telegram for
+    THIS execution (pagedAt, and repagedAt once the bridge sent its one reminder)
+    - keep polling. "not_delivered" means nobody was paged: do not keep polling
+    silently, escalate. "unknown" means the ping record could not be read, which
+    is NOT evidence that nobody was paged. You still cannot approve the gate.
+
     Args:
         pipeline_name: In Pipeline Mode this is REQUIRED — pass the
             pipeline_name from the `## Pipeline Mode` context block on EVERY

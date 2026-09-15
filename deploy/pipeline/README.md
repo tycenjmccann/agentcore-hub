@@ -86,7 +86,13 @@ skipped without one.
 To tell what happened on a given run: `Pipeline___get_state` reports
 `approvalSkipped`, and in the console (or `get-pipeline-execution`) the Approval
 stage shows **Skipped** instead of `InProgress`/`Succeeded`. A skipped run has no
-Telegram ping — that is expected, not a broken bridge. **To force the gate back on
+Telegram ping — that is expected, not a broken bridge. When the gate DID fire,
+`Pipeline___get_state` also reports `approvalPing` (TEAM-4670): `delivered` means
+the bridge recorded a page for that execution (`pagedAt`, `deliveredChats`, and
+`repagedAt` after its one reminder), `not_delivered` means nobody was paged and the
+wait should be escalated, and `unknown` means the tools Lambda could not look -
+the optional `DEPLOY_GATE_CLAIM_TABLE` (the bridge's claim table) is unset, or the
+read failed. `unknown` is never evidence that nobody was paged. **To force the gate back on
 for one run, simply do not pass `approved_head_sha`** to `Pipeline___start_deploy`
 (the tool returns `preapproval:{recorded:false, reason:"approved_head_sha_missing"}`,
 writes no record, and the human gate fires). There is no flag to unset: no record

@@ -298,6 +298,20 @@ Lambda and the pipeline definition — never in the orchestrator (DL-009) and be
 no new `*_MODE` flag. `Pipeline___get_state` reports `approvalSkipped: boolean`,
 and the ship/completion record carries `approved_head_sha`.
 
+The other half of that question (TEAM-4670, DL-029): when the gate DOES fire,
+`get_state` also reports `approvalPing` - present only while an approval is
+actually waiting - so "waiting on a human who was paged" is distinguishable from
+"waiting on a human nobody paged". `status` is `delivered` (the Telegram bridge
+recorded a page for THIS execution, with `pagedAt`, `deliveredChats` and, after
+its one reminder, `repagedAt`), `not_delivered` (no record for this execution:
+nobody was paged, escalate) or `unknown`. `unknown` is never evidence that nobody
+was paged - it means the tools Lambda could not look: the optional
+`DEPLOY_GATE_CLAIM_TABLE` env var (the bridge's own claim table) is unset, the
+execution id is unknown, or the read failed. With it unset no DynamoDB client is
+constructed and the role holds no `dynamodb` statement. Reading the record cannot
+resolve a gate: it holds no approval token, and the tools Lambda still has no
+approval action of any kind.
+
 ### CI two-lane policy (summary)
 
 On a red build, the CI agent classifies the failure
