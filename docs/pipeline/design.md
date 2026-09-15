@@ -183,7 +183,8 @@ The in-pipeline **ManualApproval** stage is a second gate beyond the merge
 gate: the merge gate authorizes the merge, the deploy gate authorizes shipping
 the built artifacts. It is bridged to Telegram by the `telegram-bug-intake`
 poller: it polls `GetPipelineState`, atomically claims the approval token in
-DynamoDB (exactly one ping per wait), and sends Approve / Reject inline
+DynamoDB (at least one *delivered* ping per wait, then a bounded reminder while
+it is still pending — TEAM-4663), and sends Approve / Reject inline
 buttons that map to `PutApprovalResult`. The tools Lambda **deliberately has
 no `PutApprovalResult`** — an agent can never approve its own deploy. The
 bridge is gated by `DEPLOY_PIPELINE_NAME` on that Lambda (unset = no-op).

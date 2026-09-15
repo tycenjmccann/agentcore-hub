@@ -2094,7 +2094,9 @@ async function scanDeployApprovalsForTarget(target) {
   // "a human was actually paged".
   const key = deployClaimKey(pending, target);
   const claimed = await claimDeployApproval(pending, target, key);
-  const mode = claimed ? { kind: "first" } : await decideDeployPingMode(key);
+  const mode = claimed
+    ? { kind: "first" }
+    : await decideDeployPingMode(`${DEPLOY_KEY_PREFIX}${key}`);
   if (!mode) return;
 
   try {

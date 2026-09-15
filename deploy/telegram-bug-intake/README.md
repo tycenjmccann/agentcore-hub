@@ -101,14 +101,19 @@ Optional: `BEDROCK_MODEL_ID`, `CONFIDENCE_THRESHOLD`,
 `TRANSCRIBE_LANGUAGE`, `CHAT_SETTLE_MS`, `CHAT_BUFFER_MAX_MS`,
 `WM_MIN_BUDGET_MS`, `WM_RELAY_TIMEOUT_MS`, `DEPLOY_PIPELINE_NAME`,
 `ARTIFACT_BUCKET`, `PIPELINE_REGIONS`, `EVENT_BUS`, `WM_BUSINESS_TZ`,
-`WM_BUSINESS_HOURS` (the last three: "Working-hours paging" below).
+`WM_BUSINESS_HOURS` (those three: "Working-hours paging" below), `PING_LEASE_MS`,
+`DEPLOY_REPING_INTERVAL_MS`, `DEPLOY_REPING_MAX` (the last three:
+"Deploy-approval delivery" below).
 
 `DEPLOY_PIPELINE_NAME` and `ARTIFACT_BUCKET` together enable the CI/CD
 deploy-approval bridge (TEAM-3740, multi-target since TEAM-4338): the poller
 watches, for EVERY CodePipeline it can see, for a `ManualApproval` action
 awaiting a decision, pings allowlisted chats with Approve / Reject buttons, and
 maps the tap to `codepipeline:PutApprovalResult` on that pipeline, in its own
-region. Both unset is the OSS default and makes the whole path a **true
+region. The claim on the approval token used to mean "exactly one ping per
+wait"; since TEAM-4663 it means "at least one **delivered** ping per wait, then a
+bounded reminder while the approval is still pending" — see "Deploy-approval
+delivery" below. Both unset is the OSS default and makes the whole path a **true
 no-op** — zero AWS calls, not even a client constructed — so both variables are
 purely additive:
 
@@ -136,13 +141,21 @@ This function is account-local — its execution role is managed out of band (se
 Provenance), not by a repo-tracked SAM/CDK stack — so the role's statements are
 documented here rather than declared in infra. Beyond the DynamoDB /
 Bedrock / Transcribe access the intake paths need, the deploy-approval bridge
-requires three statements: two CodePipeline actions, scoped to the function's
+requires three statements: three CodePipeline actions, scoped to the function's
 **effective** `DEPLOY_PIPELINE_NAME` ARN — `update-config.sh` reads that value
 back out of the env document it just applied, so a re-run without re-exporting
 still grants an operator's custom pipeline (TEAM-4377) — plus the `hub-*-deploy`
 convention per `PIPELINE_REGIONS`, and one S3 read:
 
 - `codepipeline:GetPipelineState` — poll for an approval action awaiting a decision.
+- `codepipeline:GetPipelineExecution` — resolve the commit of the execution
+  actually parked at that approval, for the cases `GetPipelineState` cannot
+  (TEAM-4663: state reports a revision per STAGE, so with two executions in
+  flight the Source stage's revision belongs to the newer one). Shares the
+  `PipelineStateRead` statement — same pipeline-level resources, no new
+  statement. **Best-effort**: while the grant is missing the call AccessDenies,
+  the failure is logged once per execution, and the human still gets the ping,
+  just the terse one with no commit brief.
 - `codepipeline:PutApprovalResult` — record the Approve / Reject tap. This
   function is the ONE place in the account that legitimately holds this
   action — the `Pipeline___*` tools Lambda never gets it (the deploy gate is
@@ -155,8 +168,8 @@ Plus one statement for the gate event ("Working-hours paging" below):
 - `events:PutEvents` on exactly the effective `EVENT_BUS` (read back the same
   way as the pipeline name). The only event published is `gate.requested`.
 
-`GetPipelineState` is authorized at the PIPELINE level, but `PutApprovalResult`
-is authorized at the ACTION level (`arn:...:<pipeline>/<stage>/<action>`), so
+`GetPipelineState` and `GetPipelineExecution` are authorized at the PIPELINE
+level, but `PutApprovalResult` is authorized at the ACTION level (`arn:...:<pipeline>/<stage>/<action>`), so
 its resource is `<pipeline-arn>/*` for each pipeline above, not the bare
 pipeline ARN — `update-config.sh` grants them accordingly.
 
@@ -216,6 +229,126 @@ or after `nextBusinessOpenAt` — the page landed inside the window on its own
 delivery past the opening) — so a "your window is open now" nudge is never sent
 for a page the human already received in hours. A claim with no `pagedAt`
 (written by an older deployment) falls through to the prior behaviour.
+
+`pagedAt` is **not** a delivery record and TEAM-4663 did not make it one: it is
+still the instant the claim was written, and the reminder still keys off exactly
+that. Delivery lives in the separate `deliveredAt` attribute added by that
+change, and a recovery re-send deliberately leaves `pagedAt` alone — a recovery
+lands within one lease (~5 min) plus one scan of the original claim, so the only
+way the two could disagree is a page requested within ~5 minutes of a window
+edge, and re-dating `pagedAt` would silently change this suppression rule. Do
+not conflate the two attributes.
+
+## Deploy-approval delivery (TEAM-4663)
+
+A pending `Approve_deploy` ManualApproval sat **8h45m** with no actionable ping
+while this same Lambda kept delivering review-gate pings to the same chat. The
+cause was structural, not a Telegram outage: the `dep#` claim row was written
+**before** `listChats` + three GitHub calls + the send, recorded nothing about
+delivery, and every later scan returned on "already claimed". So an invocation
+that died anywhere in that gap stranded the row, and — because the claim key is
+derived from the approval **token**, which is stable for the entire wait —
+nothing ever re-minted it. Silence for the row's 7-day TTL, in front of an
+irreversible production deploy.
+
+The invariant now: a pending approval on a registered pipeline is either pinged
+to an allowlisted chat with a working Approve / Reject callback, or re-pinged on
+a bounded schedule — never silently parked.
+
+**Two-phase claim.** The claim is phase 1 and records `claimedAt` only; phase 2
+(`deliveredAt`, `lastPingAt`, `pingCount`, `messageIds`) is written only after a
+confirmed send. `deliveredAt` absent therefore means "nobody was ever paged", a
+state the old row could not express. Nothing about the claim key, the
+`callback_data` format (`dok|<key>` / `dno|<key>`) or the callback semantics
+changed, and the 7-day `ttl` is never extended.
+
+**Recovery.** Losing the conditional Put no longer ends the scan: the row is
+consulted, and an undelivered claim older than `PING_LEASE_MS` (default 5 min,
+env-overridable) is re-taken with a conditional `UpdateItem` and re-sent, logging
+`"… ping never confirmed — re-sending"`. Inside the lease nothing happens — a
+send may be in flight in this or a sibling invocation. A recovery that itself
+fails to deliver **keeps** the row (its `claimedAt` was just refreshed), so the
+next scan past the lease tries again, indefinitely, while the approval is
+pending; only a `first`-mode failure releases the claim for the old fast retry.
+
+**Bounded reminders (deploy path only).** A *delivered* claim on a still-pending
+approval earns one reminder every `DEPLOY_REPING_INTERVAL_MS` (default 2h), at
+most `DEPLOY_REPING_MAX` (default 6) — `pingCount` 1 is the original ping. The
+reminder reuses the same key and therefore the same token, so the buttons on the
+reminder *and* on the original message all still work; it is titled "still
+waiting on your approval" and carries `⏳ Pending 8h 45m · reminder 2 of 6`. The
+slot is taken with an optimistic conditional update on
+`lastPingAt` + `pingCount`, and a reminder that fails to send burns its slot
+(logged; the next one is one interval away).
+
+**Attribution is execution-aware.** `GetPipelineState` reports the latest
+revision per **stage**, and an `ActionState` carries no execution id at all, so a
+stage's `currentRevision` describes the approval only when that stage's
+`latestExecution.pipelineExecutionId` matches the approval stage's. With two
+executions in flight it does not, and the incident's ping would have described a
+different PR entirely. The Source revision is now used only on a match;
+otherwise `GetPipelineExecution` supplies
+`pipelineExecution.artifactRevisions[0].revisionId`. Any failure — AccessDenied
+included — warns once per pipeline+execution and yields **no** commit, which
+means no brief and no GitHub calls rather than a wrong brief. Every ping, terse
+or rich, names the execution (`🆔 <first 8 chars>`) so a human can correlate it
+with the console and the CD ticket.
+
+**A bad brief can no longer block the ping.** `tgSend` uses legacy
+`parse_mode: "Markdown"`, which rejects the *whole* message on one unbalanced
+entity, and the old code's only response was release → re-claim → identical
+failure every 60s, forever. Each ping is now built twice, rich and terse, and a
+Telegram error that is not hopeless (rate-limited, blocked, chat gone) retries
+once with the plain-text terse body, same keyboard.
+
+**Scan budget.** The in-loop periodic scans could previously start with as little
+as 30s of clock — enough to strand a claim. They now require
+`POLL_RESERVE_MS + 90s` (120s) and, when blocked, leave `lastGateScan`
+un-stamped, so the next iteration or invocation scans as soon as there is budget.
+
+**Migration.** A `dep#` row from before this change has no `claimedAt`, so its
+claim time is derived from the TTL (which *is* claim time + 7 days). One
+consequence, and it is deliberate: on the first scan after this deploys, a
+legacy row older than the lease gets **one** recovery ping — including the row
+stranded by the incident. Same one-duplicate-ping tradeoff already documented
+for TEAM-4338, and strictly better than silence.
+
+### Gate + escalation pings
+
+The `gate#<notif.id>` and `esc#<notif.id>` claims (30-day TTL) had the same
+claim-before-send hole. A re-parked gate does mint a new `notif.id` — but only
+after a human reviews it, which requires that someone was paged, so a strand
+there is silent for the row's full 30 days with nothing to re-mint it. Both
+paths therefore adopt the **recovery half** through the same generic helpers:
+`claimedAt` at claim, `deliveredAt` after a confirmed send, and a lost
+conditional Put consults the row and re-sends only when nothing was ever
+delivered. As on the deploy path, only a `first`-mode failure releases the claim.
+`gate.requested` still fires exactly once per notification — a recovery happens
+only when nothing was ever delivered, so nothing was ever published either.
+
+Two deliberate differences from `dep#`:
+
+- **No reminders.** These paths get recovery only. A reminder here would have to
+  reason about `repage#`, `REPAGE_SKIP_STATUSES` and the business window, which
+  is a design decision, not a bug fix.
+- **No TTL fallback.** A `gate#`/`esc#` row with no `claimedAt` is pre-upgrade and
+  is **not** recovery-eligible. That is what makes deploying this change page
+  nobody twice: without the rule, every gate and escalation open at the time
+  would look stranded and be re-paged at once. (`dep#` takes the opposite rule on
+  purpose — one row, one incident, and a stale approval ping is cheap.)
+
+`pagedAt` semantics are untouched; see the note in "Working-hours paging" above.
+
+**Follow-up, deliberately not in this change:**
+
+- Bounded reminders for gates and escalations — the design question above.
+- Recovery for the `repage#` claim (`index.mjs:899`, released at `943`/`947`).
+  It is the mildest case: a lost *reminder* on top of an already-delivered page,
+  capped at one ever by design. It also keeps its claim on purpose when the gate
+  is already resolved or there are no chats, so "consult the row" needs a rule
+  that tells those two states apart from a strand. Those rows already carry
+  `claimedAt` (written by the shared claim helper, never read), so the follow-up
+  is a two-line change.
 
 ## Deploy
 
