@@ -677,6 +677,21 @@ describe("7. a cancel that lands after the dispatcher's read never dispatches or
     expect(h.state.workflow.phase).toBe("cancelled");
   });
 
+  it("a transient failure of the pre-invoke re-read fails OPEN — the claimed dispatch still invokes", async () => {
+    await replaySkeletonWrites();
+    wrapClaim(async (realClaim, args) => {
+      const ok = await realClaim(...args);
+      storeMock.getWorkflow.mockImplementationOnce(async () => { throw new Error("ddb blip"); });
+      return ok;
+    });
+
+    await replaySentinelUnblock();
+
+    expect(invokedFor(BUILD)).toHaveLength(1);
+    expect(dispatchesFor(BUILD)).toHaveLength(1);
+    expect(h.state.workflow.phase).toBe("development");
+  });
+
   it("control: without a cancel the same hop dispatches and advances", async () => {
     await replaySkeletonWrites();
     await replaySentinelUnblock();

@@ -408,6 +408,7 @@ async function redispatchTicket(workflow, ticket) {
   const claimed = await claimTicketInvocation(workflow, ticket.ticketId, ticket.assignee);
   if (!claimed) return false;
   const context = await buildAgentContext(ticket, workflow);
+  if (!(await workflowStillLive(workflow, ticket.ticketId, ticket.assignee))) return false;
   await invokeAgent(agentDef, context, workflow, ticket.ticketId);
   return true;
 }
@@ -1327,7 +1328,16 @@ async function harvestCompletionEvidence(workflow, ticketId) {
  * gap entirely; this shrinks it to the invoke call itself.
  */
 async function workflowStillLive(workflow, ticketId, assignee) {
-  const fresh = await store.getWorkflow(workflow.id);
+  let fresh;
+  try {
+    fresh = await store.getWorkflow(workflow.id);
+  } catch (err) {
+    // Fail OPEN: the claim is already ours, and a redelivery would only see
+    // "already claimed" — a transient read error must not strand the run
+    // until the stale-claim hatch. The agent itself notices a cancel.
+    console.warn(`[orchestrator] liveness re-read failed for ${workflow.id} (${err.message}) — proceeding with invoke of ${assignee} for ${ticketId}`);
+    return true;
+  }
   if (fresh && !fresh.cancelledAt && !TERMINAL_WORKFLOW_PHASES.includes(fresh.phase)) return true;
   console.log(`[orchestrator] GUARD: workflow ${workflow.id} is ${fresh ? fresh.phase : "gone"}${fresh?.cancelledAt ? " (cancelled)" : ""} — not invoking ${assignee} for ${ticketId}`);
   return false;
@@ -2675,8 +2685,6 @@ async function handleTicketReadyUnified(ticketId, ticket) {
     await publishEvent(ticketId, "workflow.phase_change", { phase: ticketPhase, workflowId: workflow.id });
   }
 
-  if (!(await workflowStillLive(workflow, ticketId, assignee))) return;
-
   // Build context and invoke — SAME buildAgentContext for both paths
   let context = await buildAgentContext(ticket, workflow);
 
@@ -2700,6 +2708,9 @@ async function handleTicketReadyUnified(ticketId, ticket) {
     resumed = true;
   }
 
+  // Last look, AFTER the context build (DDB/S3/Jira reads take seconds) and
+  // right before the invoke — the only place the re-read buys anything.
+  if (!(await workflowStillLive(workflow, ticketId, assignee))) return;
   console.log(`[orchestrator] Invoking agent ${assignee} for ticket ${ticketId}${resumed ? " (SESSION RESUME)" : ""}`);
   await publishEvent(ticketId, "agent.invoked", { ticketId, assignee, agentId: assignee, phase: ticketPhase, workflowId: workflow.id });
 
@@ -3127,8 +3138,6 @@ async function handleTicketReady(ticketId, image) {
     await publishEvent(ticketId, "workflow.phase_change", { phase: ticketPhase, workflowId: workflow.id });
   }
 
-  if (!(await workflowStillLive(workflow, ticketId, assignee))) return;
-
   // Build context and invoke agent
   const ticket = await getTicket(ticketId);
 
@@ -3153,6 +3162,9 @@ async function handleTicketReady(ticketId, image) {
     resumed = true;
   }
 
+  // Last look, AFTER the context build (DDB/S3/Jira reads take seconds) and
+  // right before the invoke — the only place the re-read buys anything.
+  if (!(await workflowStillLive(workflow, ticketId, assignee))) return;
   console.log(`[orchestrator] Invoking agent ${assignee} for ticket ${ticketId}${resumed ? " (SESSION RESUME)" : ""}`);
   await publishEvent(ticketId, "agent.invoked", { ticketId, assignee, agentId: assignee, phase: ticketPhase, workflowId: workflow.id });
 
