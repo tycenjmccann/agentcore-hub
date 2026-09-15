@@ -3555,8 +3555,11 @@ async def agent_invocation(payload, context):
     stay synchronous.
 
     WHY DETACH: the platform silently kills ANY invocation whose response stream
-    is idle ~15 min — and this entrypoint yields nothing until the agent loop
-    finishes. Workflow personas are invoked fire-and-forget (agent-invoker
+    is idle ~15 min. Since TEAM-4695 the synchronous path streams each text delta
+    as it arrives, so a *talking* agent keeps its own stream alive — but a
+    persona that spends 20 min inside one tool call still yields nothing for the
+    whole call, so the idle kill remains real for workflow runs.
+    Workflow personas are invoked fire-and-forget (agent-invoker
     destroys the connection without reading), so for them the open invocation
     buys nothing and costs everything: every persona run longer than ~16 min
     died mid-flight (2026-08-27 stuck fleet, all 19 re-kicked personas dead at
@@ -3900,6 +3903,9 @@ async def _run_agent_invocation(payload, context):
         # sort key collisions. Text is buffered briefly to reduce DDB writes.
         final_text = ""
         result = None
+        # TEAM-4695: deltas are yielded AS they arrive, so this records whether
+        # the loop emitted any — the post-loop fallback stays exactly-once.
+        streamed_any = False
         _text_buffer = ""
         _FLUSH_THRESHOLD = 200  # chars before flushing text to DDB
 
@@ -3922,6 +3928,14 @@ async def _run_agent_invocation(payload, context):
                     _text_buffer += event["data"]
                     if len(_text_buffer) >= _FLUSH_THRESHOLD:
                         _flush_text_buffer()
+                    # TEAM-4695: emit immediately. The caller's response stream is
+                    # the only live channel a chat run has — it sends no
+                    # workflow_id, so _publish_event's guard skips every DDB
+                    # write. Buffering the whole turn here is what made Agent Chat
+                    # look frozen until the persona finished. DDB writes stay
+                    # batched at _FLUSH_THRESHOLD; only the yield is per-chunk.
+                    streamed_any = True
+                    yield {"event": {"contentBlockDelta": {"delta": {"text": event["data"]}}}}
             elif "current_tool_use" in event:
                 _flush_text_buffer()  # flush pending text before tool event
                 current_tool_use = event["current_tool_use"]
@@ -3937,6 +3951,10 @@ async def _run_agent_invocation(payload, context):
                             "toolName": tool_name,
                             "workflowId": workflow_id,
                         })
+                        # TEAM-4695: interleaved with the text deltas, so the UI
+                        # flashes the tool icon when the call happens rather than
+                        # replaying every tool at the end of the turn.
+                        yield {"event": {"contentBlockStart": {"start": {"toolUse": {"name": tool_name}}}}}
             elif "reasoningText" in event and event["reasoningText"]:
                 _flush_text_buffer()  # flush pending text before reasoning event
                 tracker._publish_event("agent.streaming", {
@@ -3966,12 +3984,13 @@ async def _run_agent_invocation(payload, context):
         # Persist this turn to AgentCore Memory (no-op without MEMORY_ID env var)
         _save_memory_event(agent_id, getattr(context, "session_id", None), prompt, final_text)
 
-        # Emit tool_use events FIRST so the agent-invoker can publish them for real-time UI flashing.
-        for tool_name in tool_events:
-            yield {"event": {"contentBlockStart": {"start": {"toolUse": {"name": tool_name}}}}}
-
-        # Then emit the final text as a single contentBlockDelta event
-        yield {"event": {"contentBlockDelta": {"delta": {"text": final_text}}}}
+        # Tool frames and text deltas were already emitted inline, as they
+        # happened (TEAM-4695). Only the non-streaming cases still need a frame
+        # here: the result-message fallback above, and a turn that produced no
+        # stream text at all — which must still yield one (possibly empty) delta,
+        # exactly as this did before deltas were streamed.
+        if not streamed_any:
+            yield {"event": {"contentBlockDelta": {"delta": {"text": final_text}}}}
     finally:
         # Deliver queued spans before the microVM becomes freeze-eligible.
         # BatchSpanProcessor exports on a daemon thread on a 5s batch delay;
