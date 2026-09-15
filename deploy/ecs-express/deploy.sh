@@ -319,6 +319,12 @@ aws iam put-role-policy \
           \"codepipeline:GetPipelineState\"
         ],
         \"Resource\": \"*\"
+      },
+      {
+        \"Sid\": \"AssumeCrossAccountTrigger\",
+        \"Effect\": \"Allow\",
+        \"Action\": \"sts:AssumeRole\",
+        \"Resource\": \"arn:aws:iam::*:role/hub-cd-trigger-*\"
       }
     ]
   }"

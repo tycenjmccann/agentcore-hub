@@ -21,6 +21,7 @@ import {
   CodePipelineClient,
   GetPipelineStateCommand,
 } from "@aws-sdk/client-codepipeline";
+import { STSClient, AssumeRoleCommand } from "@aws-sdk/client-sts";
 import { DEFAULT_REGION } from "@/lib/agentcore-sdk";
 import {
   loadCdRegistry,
@@ -29,9 +30,66 @@ import {
   type CdRegistry,
 } from "@/lib/cd-registry";
 
+/** Temp creds from an assumed role — the shape SDK v3 clients accept. */
+interface TempCredentials {
+  accessKeyId: string;
+  secretAccessKey: string;
+  sessionToken: string;
+  expiration?: Date;
+}
+
 const CI_PROJECT = process.env.PIPELINE_CI_PROJECT || "agentcore-hub-ci";
 const DEPLOY_PIPELINE =
   process.env.PIPELINE_DEPLOY_NAME || "agentcore-hub-deploy";
+
+// One STS client (hub account, default region) — the SDK resolves the caller's
+// ambient creds; we only ever assume from here, never carry a role in.
+let _sts: STSClient | null = null;
+function sts(): STSClient {
+  if (!_sts) _sts = new STSClient({ region: DEFAULT_REGION });
+  return _sts;
+}
+
+/**
+ * An SDK-v3 credentials provider that assumes a cross-account hub-cd-trigger
+ * role and caches the temp creds until ~1 min before they expire. Mirrors the
+ * canonical provider in lambda/agentcore-hub-pipeline-tools/index.mjs and the
+ * Telegram gate bridge — same read-only cross-account contract. Reads only:
+ * PutApprovalResult is never issued from the hub UI (DL-028, human-only gate).
+ */
+function assumeRoleProvider(
+  roleArn: string,
+  externalId: string | null
+): () => Promise<TempCredentials> {
+  let cached: { creds: TempCredentials; expiresAt: number } | null = null;
+  return async () => {
+    if (cached && cached.expiresAt - 60_000 > Date.now()) return cached.creds;
+    const out = await sts().send(
+      new AssumeRoleCommand({
+        RoleArn: roleArn,
+        RoleSessionName: "hub-pipeline-status",
+        ...(externalId ? { ExternalId: externalId } : {}),
+        DurationSeconds: 900,
+      })
+    );
+    const c = out.Credentials;
+    if (!c?.AccessKeyId || !c.SecretAccessKey || !c.SessionToken) {
+      throw new Error(`AssumeRole ${roleArn} returned no credentials`);
+    }
+    cached = {
+      creds: {
+        accessKeyId: c.AccessKeyId,
+        secretAccessKey: c.SecretAccessKey,
+        sessionToken: c.SessionToken,
+        expiration: c.Expiration,
+      },
+      expiresAt: c.Expiration
+        ? new Date(c.Expiration).getTime()
+        : Date.now() + 900_000,
+    };
+    return cached.creds;
+  };
+}
 
 export interface CiBuildSummary {
   id: string;
@@ -101,6 +159,9 @@ interface PipelineTarget {
   pipeline: string;
   region: string;
   ciProject: string;
+  /** Cross-account trigger role + its ExternalId, or null (same-account). */
+  roleArn: string | null;
+  externalId: string | null;
 }
 
 function envTarget(registry: CdRegistry): PipelineTarget {
@@ -114,6 +175,9 @@ function envTarget(registry: CdRegistry): PipelineTarget {
     pipeline: DEPLOY_PIPELINE,
     region: DEFAULT_REGION,
     ciProject: CI_PROJECT,
+    // The env default pipeline is always same-account (this hub's own account).
+    roleArn: null,
+    externalId: null,
   };
 }
 
@@ -156,6 +220,11 @@ export async function getPipelineStatus(
       pipeline: projects.pipeline,
       region: projects.region,
       ciProject: projects.ciProject,
+      // Cross-account entries carry the hub-cd-trigger-<slug> role the hub
+      // assumes to read the pipeline in the repo's own account; null = same
+      // account (ambient hub creds). pipelineProjectsFor already resolved these.
+      roleArn: projects.roleArn,
+      externalId: projects.externalId,
     });
   }
   // Dedupe by pipeline name: a registry entry naming the env default pipeline
@@ -171,18 +240,33 @@ export async function getPipelineStatus(
     selected = mine.length > 0 ? mine : [fallback];
   }
 
+  // Cross-account targets are read through the entry's hub-cd-trigger-<slug>
+  // role — same contract the Pipeline___* tools Lambda and the Telegram gate
+  // bridge use. Clients are keyed by region AND assumed role (externalId part of
+  // the key so a rotated id forces a fresh client); same-account targets pass
+  // no roleArn and keep ambient hub creds.
   const clients = new Map<
     string,
     { cb: CodeBuildClient; cp: CodePipelineClient }
   >();
-  const clientsFor = (region: string) => {
-    let pair = clients.get(region);
+  const clientsFor = (
+    region: string,
+    roleArn: string | null,
+    externalId: string | null
+  ) => {
+    const key = `${region}|${roleArn || ""}|${externalId || ""}`;
+    let pair = clients.get(key);
     if (!pair) {
+      const cfg: {
+        region: string;
+        credentials?: () => Promise<TempCredentials>;
+      } = { region };
+      if (roleArn) cfg.credentials = assumeRoleProvider(roleArn, externalId);
       pair = {
-        cb: new CodeBuildClient({ region }),
-        cp: new CodePipelineClient({ region }),
+        cb: new CodeBuildClient(cfg),
+        cp: new CodePipelineClient(cfg),
       };
-      clients.set(region, pair);
+      clients.set(key, pair);
     }
     return pair;
   };
@@ -196,7 +280,7 @@ export async function getPipelineStatus(
         stages: [],
       };
       try {
-        const { cb, cp } = clientsFor(t.region);
+        const { cb, cp } = clientsFor(t.region, t.roleArn, t.externalId);
         const [builds, state] = await Promise.all([
           recentBuilds(cb, t.region, t.ciProject),
           pipelineStages(cp, t.pipeline),
