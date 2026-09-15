@@ -7,6 +7,7 @@ import {
   Activity, CheckCircle2, Database, Code2, Play, AlertTriangle, ExternalLink, RefreshCw,
 } from "lucide-react";
 import Link from "next/link";
+import { useSearchParams } from "next/navigation";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { streamAgentInvocation, AgentInfo, TraceEvent } from "@/lib/agentcore-stream";
@@ -409,6 +410,27 @@ function InvokeUI({ agent }: { agent: AgentDetail }) {
       setLoadingHistory(false);
     }
   }, [agent.id]);
+
+  // TEAM-4688 — `?session_id=<sid>` deep-links one trace session.
+  //
+  // Callers elsewhere in the app (e.g. a judge-score row) hand out
+  // `/agents/<agentId>?session_id=<sid>`; honouring it here means the link lands
+  // on the spans for that session instead of an empty new session. It reuses the
+  // exact path the Traces session list already uses (resumeTraceSession), so
+  // nothing about how a session loads changes. Purely additive: with no
+  // `session_id` in the URL the effect returns immediately — no extra fetch, and
+  // the default session source stays whatever `agent.memoryId` implies. Fires
+  // once per distinct id so a later manual session pick is never overridden.
+  const searchParams = useSearchParams();
+  const deepLinkSessionId = searchParams.get("session_id");
+  const deepLinkedSessionRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (!deepLinkSessionId || deepLinkedSessionRef.current === deepLinkSessionId) return;
+    deepLinkedSessionRef.current = deepLinkSessionId;
+    setSessionSource("traces");
+    resumeTraceSession({ sessionId: deepLinkSessionId, actorId: "", createdAt: "" });
+  }, [deepLinkSessionId, resumeTraceSession]);
 
   const storeInMemory = useCallback(
     (userMsg: string, assistantMsg: string) => {
