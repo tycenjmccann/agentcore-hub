@@ -15,6 +15,7 @@ npm run dev          # next dev (localhost:3000)
 npm run build        # next build — also the module-removal smoke test (must pass)
 npm run lint         # next lint
 npm test             # fast Playwright: tab UI + API smoke (~30s, no live harness)
+                     # tests that START a real run (cancel/archive flows) are skipped unless E2E_LIVE_WRITES=1 — never set it against a prod-wired server
 npm run test:full    # adds builder e2e + full workflow e2e (5-10min, needs BUILDER_AGENT_ID + harness role)
 
 # Run a single Playwright spec / test

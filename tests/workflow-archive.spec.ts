@@ -8,6 +8,9 @@ import { test, expect } from "@playwright/test";
  */
 
 test.describe("Workflow Archive", () => {
+  // Creates a REAL run on the target hub — opt-in, same gate as the cancel test.
+  test.skip(!process.env.E2E_LIVE_WRITES, "creates a real workflow — set E2E_LIVE_WRITES=1 to run");
+
   let workflowId: string;
 
   test.beforeAll(async ({ request }) => {
