@@ -146,7 +146,10 @@ vi.mock("./workflow-store.mjs", () => {
     claimInvocation: vi.fn(async (_id, tid, entry, staleBefore) => {
       const t = tasks();
       const cur = t[tid];
-      const ok = !cur || cur.status !== "running" || (cur.startedAt || "") < staleBefore;
+      const w = h.state.workflow;
+      // Mirror the store's CAS (TEAM-4577): a cancelled/terminal run never claims.
+      const live = !w.cancelledAt && w.phase !== "cancelled";
+      const ok = live && (!cur || cur.status !== "running" || (cur.startedAt || "") < staleBefore);
       h.state.claims.push({ ticketId: tid, ok });
       if (ok) t[tid] = { ...entry };
       return ok;
@@ -160,8 +163,11 @@ vi.mock("./workflow-store.mjs", () => {
       return first;
     }),
     advancePhase: vi.fn(async (_id, phase, featureBranch) => {
+      // Mirror the store's CAS: a cancelled/terminal run refuses the advance.
+      if (h.state.workflow.cancelledAt || h.state.workflow.phase === "cancelled") return false;
       h.state.workflow.phase = phase;
       if (featureBranch) h.state.workflow.featureBranch = featureBranch;
+      return true;
     }),
     setTaskStatus: vi.fn(async () => {}),
     putTaskEntry: vi.fn(async () => {}),
@@ -589,5 +595,68 @@ describe("6. Jira twin — the phase:<p> label drives the dispatch", () => {
 
     expect(invokedFor(BUILD)[0].detail.phase).toBe("development");
     expect(h.state.workflow.phase).toBe("development");
+  });
+});
+
+// ─── 7. Cancel racing the dispatch (TEAM-4577) ───────────────────────────────
+
+/**
+ * Prod replay (wf_1789359767820_zg1br8, 2026-09-14 04:22:52Z): the cancel route
+ * stamped cancelledAt + phase=cancelled; 245 ms later the dispatcher — working
+ * from a workflow row read BEFORE the cancel — claimed the analyst ticket,
+ * emitted workflow.phase_change → requirements, overwrote the phase and invoked
+ * the agent. The run ended with cancelledAt set but a non-terminal phase, so the
+ * watchdog re-fired on it forever. The in-memory phase guard cannot see a cancel
+ * that lands after the read; only the store's CAS can.
+ */
+describe("7. a cancel that lands after the dispatcher's read never dispatches or un-cancels the run", () => {
+  beforeEach(async () => { await load(); });
+
+  const cancelNow = () => {
+    h.state.workflow.phase = "cancelled";
+    h.state.workflow.cancelledAt = "2026-09-14T04:22:52.213Z";
+  };
+
+  it("cancel between the workflow read and the claim → claim refused, no invoke, no phase_change", async () => {
+    await replaySkeletonWrites();
+    // The dispatcher gets a pre-cancel snapshot; the cancel lands right after.
+    storeMock.getWorkflow.mockImplementationOnce(async () => {
+      const snapshot = { ...h.state.workflow, agentTasks: { ...h.state.workflow.agentTasks } };
+      cancelNow();
+      return snapshot;
+    });
+
+    await replaySentinelUnblock();
+
+    expect(h.state.claims.filter((c) => c.ticketId === BUILD && c.ok)).toHaveLength(0);
+    expect(invokedFor(BUILD)).toHaveLength(0);
+    expect(dispatchesFor(BUILD)).toHaveLength(0);
+    expect(eventsOf("workflow.phase_change")).toHaveLength(0);
+    expect(h.state.workflow.phase).toBe("cancelled");
+  });
+
+  it("cancel between the claim and the phase advance → advance refused, no invoke, phase stays cancelled", async () => {
+    await replaySkeletonWrites();
+    const realClaim = storeMock.claimInvocation.getMockImplementation();
+    storeMock.claimInvocation.mockImplementationOnce(async (...args) => {
+      const ok = await realClaim(...args);
+      cancelNow();
+      return ok;
+    });
+
+    await replaySentinelUnblock();
+
+    expect(h.state.claims.filter((c) => c.ticketId === BUILD && c.ok)).toHaveLength(1);
+    expect(invokedFor(BUILD)).toHaveLength(0);
+    expect(dispatchesFor(BUILD)).toHaveLength(0);
+    expect(eventsOf("workflow.phase_change")).toHaveLength(0);
+    expect(h.state.workflow.phase).toBe("cancelled");
+  });
+
+  it("control: without a cancel the same hop dispatches and advances", async () => {
+    await replaySkeletonWrites();
+    await replaySentinelUnblock();
+    expect(invokedFor(BUILD)).toHaveLength(1);
+    expect(eventsOf("workflow.phase_change").map((e) => e.detail.phase)).toEqual(["development"]);
   });
 });

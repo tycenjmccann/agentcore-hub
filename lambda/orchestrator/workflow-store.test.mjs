@@ -148,6 +148,18 @@ describe("claimInvocation", () => {
     expect(claim.input.ConditionExpression).toContain("agentTasks.#tid.startedAt < :staleBefore");
   });
 
+  it("refuses to claim on a cancelled or terminal run (TEAM-4577 — cancel vs dispatch race)", async () => {
+    // The dispatcher's phase read is stale by the time it claims; only the CAS
+    // can see a cancel that landed in between.
+    await claimInvocation("wf_1", "TEAM-2", entry, "2026-08-29T23:00:00Z");
+    const claim = writes().find((c) => c.input.ConditionExpression?.includes(":running"));
+    expect(claim.input.ConditionExpression).toMatch(/^attribute_not_exists\(cancelledAt\) AND /);
+    expect(claim.input.ConditionExpression).toContain("phase <> :tp0");
+    expect(Object.values(claim.input.ExpressionAttributeValues)).toContain("cancelled");
+    // The lease clause is parenthesised so the guards apply to every branch of it.
+    expect(claim.input.ConditionExpression).toMatch(/AND \(attribute_not_exists\(agentTasks\.#tid\) OR .* < :staleBefore\)$/);
+  });
+
   it("strips a stale deadSessionDetectedAt so a FRESH generation never inherits it (TEAM-3698 F1)", async () => {
     // A caller that spreads the prior task (index.mjs claimTicketInvocation)
     // could carry the previous generation's stamp onto the new startedAt — the
@@ -333,13 +345,25 @@ describe("incrementDeadSessionRetry", () => {
 
 describe("advancePhase", () => {
   it("pins the feature branch with if_not_exists", async () => {
-    await advancePhase("wf_1", "development", "feature/x");
+    expect(await advancePhase("wf_1", "development", "feature/x")).toBe(true);
     expect(writes()[0].input.UpdateExpression).toContain("featureBranch = if_not_exists(featureBranch, :fb)");
   });
 
   it("writes only the phase when no branch", async () => {
     await advancePhase("wf_1", "design");
     expect(writes()[0].input.UpdateExpression).toBe("SET phase = :p");
+  });
+
+  it("never overwrites a cancelled or terminal phase (TEAM-4577)", async () => {
+    await advancePhase("wf_1", "requirements");
+    const w = writes()[0];
+    expect(w.input.ConditionExpression).toMatch(/^attribute_not_exists\(cancelledAt\) AND phase <> :tp0/);
+    expect(Object.values(w.input.ExpressionAttributeValues)).toEqual(expect.arrayContaining(["cancelled", "complete"]));
+  });
+
+  it("returns false (no throw) when the run went terminal first", async () => {
+    failNextCondition = true;
+    expect(await advancePhase("wf_1", "requirements")).toBe(false);
   });
 });
 

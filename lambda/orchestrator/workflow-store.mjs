@@ -85,6 +85,10 @@ async function ensureAgentTasksMap(workflowId) {
  */
 export async function claimInvocation(workflowId, ticketId, entry, staleBefore) {
   await ensureAgentTasksMap(workflowId);
+  // TEAM-4577: a cancelled (or otherwise terminal) run can never win a dispatch
+  // claim. The dispatcher's in-memory phase check is stale by the time it runs
+  // (cancel landed 245 ms after the read in prod), so the CAS is the guard.
+  const live = notTerminalPhaseGuard("phase");
   // TEAM-3698: a FRESH claim generation must never inherit the previous
   // generation's deadSessionDetectedAt stamp. Callers build the entry by
   // spreading the prior task (index.mjs claimTicketInvocation), so the stamp
@@ -101,12 +105,14 @@ export async function claimInvocation(workflowId, ticketId, entry, staleBefore) 
       Key: { workflowId },
       UpdateExpression: "SET agentTasks.#tid = :task",
       ConditionExpression:
-        "attribute_not_exists(agentTasks.#tid) OR agentTasks.#tid.#st <> :running OR agentTasks.#tid.startedAt < :staleBefore",
+        `attribute_not_exists(cancelledAt) AND ${live.condition} AND ` +
+        "(attribute_not_exists(agentTasks.#tid) OR agentTasks.#tid.#st <> :running OR agentTasks.#tid.startedAt < :staleBefore)",
       ExpressionAttributeNames: { "#tid": ticketId, "#st": "status" },
       ExpressionAttributeValues: {
         ":task": task,
         ":running": "running",
         ":staleBefore": staleBefore,
+        ...live.values,
       },
     }));
     return true;
@@ -408,17 +414,34 @@ export async function incrementDeadSessionRetry(workflowId, ticketId) {
  * consistent read serialized by the command queue (R1).
  */
 export async function advancePhase(workflowId, phase, featureBranch) {
-  await _ddb.send(new UpdateCommand({
-    TableName: _table,
-    Key: { workflowId },
-    UpdateExpression: featureBranch
-      ? "SET phase = :p, featureBranch = if_not_exists(featureBranch, :fb)"
-      : "SET phase = :p",
-    ExpressionAttributeValues: {
-      ":p": phase,
-      ...(featureBranch ? { ":fb": featureBranch } : {}),
-    },
-  }));
+  // TEAM-4577: never overwrite a terminal phase. A cancel that lands between
+  // the dispatcher's claim and this write used to be clobbered back to the
+  // ticket's phase (indexOf("cancelled") === -1, so every advance "won"),
+  // leaving cancelledAt set on a run that never reads as terminal. Returns
+  // false when the run is already terminal; the caller must not invoke.
+  const live = notTerminalPhaseGuard("phase");
+  try {
+    await _ddb.send(new UpdateCommand({
+      TableName: _table,
+      Key: { workflowId },
+      UpdateExpression: featureBranch
+        ? "SET phase = :p, featureBranch = if_not_exists(featureBranch, :fb)"
+        : "SET phase = :p",
+      ConditionExpression: `attribute_not_exists(cancelledAt) AND ${live.condition}`,
+      ExpressionAttributeValues: {
+        ":p": phase,
+        ...(featureBranch ? { ":fb": featureBranch } : {}),
+        ...live.values,
+      },
+    }));
+    return true;
+  } catch (err) {
+    if (err.name === "ConditionalCheckFailedException") {
+      console.log(`[workflow-store] advancePhase(${workflowId} -> ${phase}): run is terminal/cancelled, no-op.`);
+      return false;
+    }
+    throw err;
+  }
 }
 
 /** Pin the shared feature branch (first writer wins). */

@@ -296,7 +296,7 @@ vi.mock("./workflow-store.mjs", () => {
     setTaskStatus: inert(),
     mergeTaskMetadata: inert(),
     trackTicket: inert(),
-    advancePhase: inert(),
+    advancePhase: vi.fn(async () => true),
     appendNotification: inert(),
     adoptFeatureBranch: inert(),
     setDelivery: inert(),
