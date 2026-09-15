@@ -133,6 +133,12 @@ function makeNet(ctx, overrides = {}) {
       if (net.transitionStatus !== 200) {
         return jsonRes(net.transitionBody || { error: "Ticket transition rejected" }, false, net.transitionStatus);
       }
+      // The hub REMEMBERS: a /tickets read after this must see the status the
+      // transition just applied, or a test cannot tell "read the gate before
+      // the ✅" from "read it after" (TEAM-4677). No-op unless this net was
+      // given a matching ticket row.
+      const row = (net.tickets || []).find((t) => t?.ticketId === body?.ticketId);
+      if (row && body?.targetStatus) row.status = body.targetStatus;
       return jsonRes({ success: true });
     }
     if (/\/api\/workflow\/[^/]+\/tickets$/.test(u)) {
@@ -501,32 +507,35 @@ describe("approval pings are built from structured inputs, never from ticket pro
  * an evidenced rejection for the next same-target gate, so a human who
  * APPROVED gate A got told, on gate B, that they had rejected it.
  */
-describe("a ❌ that never became a rejection is not a previous attempt (TEAM-4675)", () => {
-  const GATE_B = "TEAM-4659";
-  const REWORK_KEY = `gaterework#${GATE}`;
-  const tapGno = (updateId = 1) => ({
-    update_id: updateId,
-    callback_query: { id: `cb-${updateId}`, data: `gno|${GATE}|${WF}`, message: { message_id: 7, chat: { id: CHAT }, text: "ping" } },
-  });
-  const tapGok = (updateId = 2) => ({
-    update_id: updateId,
-    callback_query: { id: `cb-${updateId}`, data: `gok|${GATE}|${WF}`, message: { message_id: 7, chat: { id: CHAT }, text: "ping" } },
-  });
-  const tapDrop = (updateId = 3) => ({
-    update_id: updateId,
-    callback_query: { id: `cb-${updateId}`, data: `rjx|${GATE}`, message: { message_id: 8, chat: { id: CHAT }, text: "⚠️ Couldn't send…" } },
-  });
-  // Gate B: same target as GATE, filed later in the run — the RM-authored,
-  // new-ticket-per-attempt shape the sibling scan exists for.
-  const pageGateB = async (mod) => (await run(mod.handler, {
-    batches: [[]],
-    workflows: [wf([notif(`notif_${GATE_B}_2026-09-14T18:30:00.000Z`, "2026-09-14T18:30:00.000Z", { ticketId: GATE_B })])],
-    tickets: [
-      dgate(GATE_B, "the queued deploy", "2026-09-14T18:00:00.000Z", { status: "in_review" }),
-      dgate(GATE, "the queued deploy", "2026-09-14T09:00:00.000Z"),
-    ],
-  })).sent[0].text;
+// Shared by the TEAM-4675 and TEAM-4677 blocks below: the same gate A, the same
+// taps, the same later same-target gate B.
+const GATE_B = "TEAM-4659";
+const REWORK_KEY = `gaterework#${GATE}`;
+const REJ_KEY = `rej#${CHAT}`;
+const tapGno = (updateId = 1) => ({
+  update_id: updateId,
+  callback_query: { id: `cb-${updateId}`, data: `gno|${GATE}|${WF}`, message: { message_id: 7, chat: { id: CHAT }, text: "ping" } },
+});
+const tapGok = (updateId = 2) => ({
+  update_id: updateId,
+  callback_query: { id: `cb-${updateId}`, data: `gok|${GATE}|${WF}`, message: { message_id: 7, chat: { id: CHAT }, text: "ping" } },
+});
+const tapDrop = (updateId = 3) => ({
+  update_id: updateId,
+  callback_query: { id: `cb-${updateId}`, data: `rjx|${GATE}`, message: { message_id: 8, chat: { id: CHAT }, text: "⚠️ Couldn't send…" } },
+});
+// Gate B: same target as GATE, filed later in the run — the RM-authored,
+// new-ticket-per-attempt shape the sibling scan exists for.
+const pageGateB = async (mod) => (await run(mod.handler, {
+  batches: [[]],
+  workflows: [wf([notif(`notif_${GATE_B}_2026-09-14T18:30:00.000Z`, "2026-09-14T18:30:00.000Z", { ticketId: GATE_B })])],
+  tickets: [
+    dgate(GATE_B, "the queued deploy", "2026-09-14T18:00:00.000Z", { status: "in_review" }),
+    dgate(GATE, "the queued deploy", "2026-09-14T09:00:00.000Z"),
+  ],
+})).sent[0].text;
 
+describe("a ❌ that never became a rejection is not a previous attempt (TEAM-4675)", () => {
   it("❌ then ✅ on gate A leaves no evidence for a later same-target gate B", async () => {
     const mod = await loadModule();
 
@@ -605,6 +614,77 @@ describe("a ❌ that never became a rejection is not a previous attempt (TEAM-46
       tickets,
     });
     expect(attemptLinesOf(second.sent[0].text)).toEqual(["Attempt 2 — previous issue: the deploy gate must name one execution, not three"]);
+  });
+});
+
+/**
+ * TEAM-4677. TEAM-4675 gave the ❌ placeholder an exit, but only for the ❌→✅
+ * order: gok retracts the row it finds. The OTHER order was still open — a human
+ * who taps ✅ and then ❌ before the ✅ edit drops the keyboard has both callbacks
+ * delivered in one getUpdates batch and processed in order (handleCallback awaits
+ * each update), so gok transitioned the gate to done and retracted the row, and
+ * gno — which consulted no state at all — put it straight back. The placeholder
+ * then stood for its full 30 days and paged the next same-target gate with
+ * "Attempt 2 — previous issue: changes requested" for a cycle the human APPROVED.
+ *
+ * The invariant is order-independent, so it is asserted from both ends: an
+ * approved gate never yields rejection evidence, while a gate the hub still
+ * reports as open — or a hub that cannot be reached at all — records the
+ * rejection exactly as before (TEAM-4671 must not be weakened into silence).
+ */
+describe("an approved gate never produces rejection evidence, regardless of callback order (TEAM-4677)", () => {
+  it("✅ then ❌ in the SAME batch on gate A leaves no evidence for a later same-target gate B", async () => {
+    const mod = await loadModule();
+    // Gate A is open when the batch arrives; the ✅'s transition is what makes it
+    // done, so the ❌ that follows is provably reading the post-✅ state.
+    const gateA = dgate(GATE, "the queued deploy", "2026-09-14T09:00:00.000Z", { status: "in_review" });
+    const net = await run(mod.handler, { batches: [[tapGok(1), tapGno(2)]], tickets: [gateA] });
+
+    // The ✅ landed, and the ❌ sent nothing back.
+    expect(net.transitions).toEqual([expect.objectContaining({ ticketId: GATE, targetStatus: "done" })]);
+    expect(net.transitions.some((t) => t.targetStatus === "blocked")).toBe(false);
+    expect(gateA.status, "the fake applied the ✅ before the ❌ read it").toBe("done");
+
+    // Mechanism: the ❌ wrote nothing — no placeholder, no rework marker.
+    expect(db.items.has(REWORK_KEY), "❌ on a done gate must not write the placeholder").toBe(false);
+    expect(db.items.has(REJ_KEY), "❌ on a done gate must not park a rework marker").toBe(false);
+    expect(net.answered.at(-1).text).toMatch(/already approved/i);
+    // …and it did not overwrite the ✅'s edit with rework vocabulary.
+    expect(net.edited).toHaveLength(1);
+    expect(net.edited[0].text).toMatch(/✅ Approved/);
+    expect(net.edited.every((e) => !/Changes requested/.test(e.text))).toBe(true);
+
+    // Symptom: gate B must not read A's ❌ as an attempt.
+    const text = await pageGateB(mod);
+    expect(attemptLinesOf(text)).toEqual([]);
+    expect(text).not.toContain("previous issue");
+    expect(text).not.toContain("changes requested");
+    expect(text).toMatch(mod.APPROVAL_KICKER_RE);
+  });
+
+  it("fails open: an unreachable tickets view records the rejection exactly as before", async () => {
+    const mod = await loadModule();
+    // No `tickets` override → /tickets 404s → gateTicketOf degrades to
+    // { gateTicket: null }. A hub blip must never swallow a real rejection.
+    const net = await run(mod.handler, { batches: [[tapGno()]] });
+
+    expect(db.items.get(REWORK_KEY)?.reason?.S).toBe("changes requested");
+    expect(db.items.get(REJ_KEY)?.ticketId?.S).toBe(GATE);
+    expect(net.answered.at(-1).text).toBe("Reply with what needs to change.");
+    expect(net.edited[0].text).toMatch(/reply to this message later/i);
+  });
+
+  it("does not weaken TEAM-4671: ❌ on a gate the hub still reports open is recorded", async () => {
+    const mod = await loadModule();
+    const net = await run(mod.handler, {
+      batches: [[tapGno()]],
+      tickets: [dgate(GATE, "the queued deploy", "2026-09-14T09:00:00.000Z", { status: "in_review" })],
+    });
+
+    expect(db.items.get(REWORK_KEY)?.reason?.S).toBe("changes requested");
+    expect(db.items.get(REJ_KEY)?.ticketId?.S).toBe(GATE);
+    expect(net.answered.at(-1).text).toBe("Reply with what needs to change.");
+    expect(net.edited[0].text).toMatch(/Changes requested/);
   });
 });
 

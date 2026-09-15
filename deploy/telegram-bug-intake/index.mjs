@@ -1539,6 +1539,21 @@ async function handleGateCallback(cb, chatId, action, ticketId, workflowId) {
     await tgEdit(chatId, cb.message.message_id, `${cb.message.text}\n\n${note}`);
     return;
   }
+  // ✅ then ❌ in the same batch (both callbacks land before the ✅ edit drops the
+  // keyboard): gok already moved the gate to done, so writing the placeholder
+  // again would hand approvalAttempt rejection evidence for a cycle the human
+  // APPROVED (TEAM-4677). Ask the hub rather than a local marker — a gate
+  // approved from the board counts too — and fail open: gateTicketOf never
+  // throws, so an unavailable tickets view falls through to the normal path and
+  // a transient error can never eat a real rejection. TEAM-4675's
+  // deleteGateRework in the gok branch above covers the reverse order.
+  const { gateTicket } = await gateTicketOf({ workflowId }, { ticketId });
+  if (String(gateTicket?.status || "").toLowerCase() === "done") {
+    // No tgEdit: the ✅ edit already states the truth, and this branch's edit
+    // text carries "Changes requested" — gateFromReply's routing vocabulary.
+    await tgAnswer(cb.id, "Already approved — nothing to reject.");
+    return;
+  }
   // Request changes: the ticket needs a rework note. Park the intent; the
   // chat's next plain message — or a reply to this ping, any time — becomes
   // the note (resolveReworkTarget → deliverReworkNote).
