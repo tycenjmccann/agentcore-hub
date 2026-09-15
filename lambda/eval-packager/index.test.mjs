@@ -85,6 +85,8 @@ vi.mock('https', () => {
 // ─── Fixtures ───────────────────────────────────────────────────────────────
 
 const AGENT_ID = 'agentcore_hub_backend_dev';
+// TEAM-4688 per-result store (default name; the tests never override the env).
+const RESULTS_TABLE = 'agentcore-hub-eval-results';
 const EVAL_CONFIG_NAME = 'eval_backend_dev';
 const LOG_GROUP = `/aws/bedrock-agentcore/evaluations/results/${EVAL_CONFIG_NAME}-FO0D1sFZfY`;
 const AGENTS = [
@@ -205,6 +207,13 @@ beforeEach(() => {
     seenPuts: [],
     seenGets: [],
     seenSetPersistent: false,
+    // TEAM-4688 results store. `resultRows` is the fake table (agentId#sk →
+    // row) and `resultPuts` records every attempted put. Conditional semantics
+    // are honoured only when `resultsPersistent` is set, mirroring the seen-set
+    // knob above, so replay suites still see each delivery's puts.
+    resultRows: new Map(),
+    resultPuts: [],
+    resultsPersistent: false,
     // TEAM-3385 finding 2: make the next N buffer appends throw the way a real
     // DDB throttle / 400KB-item rejection does, so a test can prove that a
     // failed invocation claimed nothing and its re-delivery is processed.
@@ -292,6 +301,22 @@ beforeEach(() => {
       return { Responses: { [table]: items }, UnprocessedKeys: {} };
     }
     if (name === 'PutCommand') {
+      // TEAM-4688: two tables take conditional puts now. The results store
+      // (one row per judge result, PK agentId / SK sk) is keyed and conditioned
+      // differently from the seen-set, so route on TableName instead of
+      // funnelling every put into `seenItems`.
+      if (cmd.input.TableName === RESULTS_TABLE) {
+        const rowKey = `${cmd.input.Item?.agentId}#${cmd.input.Item?.sk}`;
+        ddbState.resultPuts.push(cmd.input);
+        // `attribute_not_exists(sk)` — the idempotency guard the reconcile and
+        // backfill paths lean on. Honoured only when the fake table persists,
+        // so suites that replay one delivery still see each put.
+        if (ddbState.resultsPersistent) {
+          if (ddbState.resultRows.has(rowKey)) throw conditionalCheckFailed();
+          ddbState.resultRows.set(rowKey, { ...cmd.input.Item });
+        }
+        return {};
+      }
       const key = cmd.input.Item?.dedupKey;
       ddbState.seenPuts.push(cmd.input);
       if (ddbState.seenSetPersistent) {
@@ -1058,6 +1083,9 @@ describe('classifySessions / emitEvalMetrics / extractSessionData (TEAM-3103)', 
     expect(emf[0].Metrics.map((m) => m.Name).sort()).toEqual([
       'EvalDepChainExcludedCount',
       'EvalDuplicateResultCount',
+      // TEAM-4688 ingest health for the per-result mirror.
+      'EvalResultsDuplicate',
+      'EvalResultsWritten',
       'EvalSessionsError',
       'EvalSessionsSpanMissing',
       'EvalSessionsTotal',
@@ -1065,6 +1093,10 @@ describe('classifySessions / emitEvalMetrics / extractSessionData (TEAM-3103)', 
       'EvalThrottleRate',
       'EvalValidationExceptionRate',
     ]);
+    // Healthy batches must publish explicit zeros: a metric that goes silent is
+    // indistinguishable from a broken emitter.
+    expect(record.EvalResultsWritten).toBe(0);
+    expect(record.EvalResultsDuplicate).toBe(0);
     expect(typeof record._aws.Timestamp).toBe('number');
     expect(record.AgentName).toBe('agentcore_hub_backend_dev');
     expect(record.EvalSessionsTotal).toBe(4);
@@ -3064,14 +3096,18 @@ describe('TEAM-3385: span-missing classification + concurrency claims', () => {
     expect(w.TableName).toBe('agentcore-hub-eval-daily');
     expect(w.Key).toEqual({ agentId: AGENT_ID, day: '2023-11-14' });
     // One atomic ADD, flat names — no path set-up, no CAS.
-    expect(w.UpdateExpression).toMatch(/^SET #updatedAt = :now, #expiresAt = if_not_exists\(#expiresAt, :ttl\) ADD #sessions :sessions, #e0s :e0s, #e0c :e0c, #e1s :e1s, #e1c :e1c$/);
+    expect(w.UpdateExpression).toMatch(/^SET #updatedAt = :now ADD #sessions :sessions, #e0s :e0s, #e0c :e0c, #e1s :e1s, #e1c :e1c$/);
     expect(w.ExpressionAttributeNames).toMatchObject({
       '#sessions': 'sessions',
       '#e0s': 'e|builtin.correctness|sum', '#e0c': 'e|builtin.correctness|count',
       '#e1s': 'e|builtin.helpfulness|sum', '#e1c': 'e|builtin.helpfulness|count',
     });
     expect(w.ExpressionAttributeValues).toMatchObject({ ':sessions': 2, ':e0s': 8, ':e0c': 1, ':e1s': 6, ':e1c': 1 });
-    expect(w.ExpressionAttributeValues[':ttl']).toBe(Date.UTC(2023, 10, 29) / 1000); // 14 + 1 days after 2023-11-14
+    // TEAM-4688: no TTL any more — the buckets are the 30/90/all-time history,
+    // so nothing may stamp an expiry on them.
+    expect(w.ExpressionAttributeValues[':ttl']).toBeUndefined();
+    expect(w.ExpressionAttributeNames['#expiresAt']).toBeUndefined();
+    expect(w.UpdateExpression).not.toContain('expiresAt');
     expect(w.ConditionExpression).toBeUndefined();
 
     // All-time aggregates untouched in shape and still CAS-guarded.
