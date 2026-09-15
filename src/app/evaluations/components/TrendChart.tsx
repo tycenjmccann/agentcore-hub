@@ -70,7 +70,7 @@ export default function TrendChart({
               </div>
               <div className="h-[104px] mt-2">
                 <ResponsiveContainer width="100%" height="100%">
-                  <LineChart data={points} margin={{ top: 6, right: 8, bottom: 0, left: -18 }}>
+                  <LineChart data={points} margin={{ top: 6, right: 8, bottom: 0, left: 2 }}>
                     <CartesianGrid stroke={GRID} strokeWidth={1} vertical={false} />
                     <XAxis
                       dataKey="day"

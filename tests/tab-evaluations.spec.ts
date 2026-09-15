@@ -294,6 +294,23 @@ test.describe("Evaluations tab (TEAM-4688)", () => {
     await expect(page.locator("[data-testid=eval-trend-Helpfulness]")).toBeVisible();
     await expect(page.locator("[data-testid=eval-trend-Correctness] svg path.recharts-line-curve")).toHaveCount(1);
 
+    // Y-axis tick labels must not start left of their own chart's SVG edge — the
+    // TrendChart margin/width regression that silently clipped "50%"/"100%" down
+    // to "0%" (visually indistinguishable in a screenshot; only the DOM catches it).
+    const clippedTicks = await page.locator("[data-testid=eval-trend-chart]").evaluate((container) => {
+      const bad: string[] = [];
+      container.querySelectorAll(".recharts-yAxis").forEach((axis) => {
+        const svgX = axis.closest("svg")?.getBoundingClientRect().x;
+        if (svgX === undefined) return;
+        axis.querySelectorAll(".recharts-cartesian-axis-tick text").forEach((el) => {
+          const x = el.getBoundingClientRect().x;
+          if (x < svgX) bad.push(`${el.textContent} at x=${x} < svg x=${svgX}`);
+        });
+      });
+      return bad;
+    });
+    expect(clippedTicks).toEqual([]);
+
     // The workflow pre-filter is passed through to /results.
     expect(calls.results.some((u) => u.includes("workflowId=wf-4688"))).toBe(true);
 
