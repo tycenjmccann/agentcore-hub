@@ -12,9 +12,14 @@
  *
  * The DynamoDB and CloudWatch Logs clients are fakes keyed on the real command
  * classes, so the SDK's own shapes are exercised without a network.
+ *
+ * index.mjs throws at module scope without ARTIFACTS_BUCKET, so — same fix as
+ * index.test.mjs — the env is stubbed BEFORE a dynamic `await import`, not a
+ * static import: a static import runs at collection time, ahead of any
+ * beforeAll, and CI's unit-test job sets no ARTIFACT_BUCKET.
  */
 
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, beforeAll } from 'vitest';
 import {
   MAX_EVENTS_PER_PASS,
   RESULTS_GROUP_PREFIX,
@@ -26,9 +31,15 @@ import {
   reconcile,
   windowDays,
 } from './reconcile.mjs';
-// The REAL extract → dedup → role-guard chain, imported from the handler module:
-// a fixture copy could drift, and "one code path" is the property under test.
-import { extractSessionData } from '../index.mjs';
+
+// The REAL extract → dedup → role-guard chain, from the handler module: a
+// fixture copy could drift, and "one code path" is the property under test.
+let extractSessionData;
+beforeAll(async () => {
+  process.env.ARTIFACTS_BUCKET ??= 'agentcore-hub-artifacts-123456789012-us-east-1';
+  process.env.AWS_REGION ??= 'us-east-1';
+  ({ extractSessionData } = await import('../index.mjs'));
+});
 
 const RESULTS_TABLE = 'agentcore-hub-eval-results';
 const DAILY_TABLE = process.env.EVAL_DAILY_TABLE || 'agentcore-hub-eval-daily';
