@@ -6,11 +6,13 @@
 #                                             DynamoDB grants on eval-config and
 #                                             the eval-seen dedup table
 #   2. deploy/continuous-improvement/deploy-all.sh
-#                                           — creates BOTH DynamoDB tables
-#                                             (agentcore-hub-eval-config and
-#                                             agentcore-hub-eval-seen, the latter
-#                                             with TTL on expiresAt) and seeds
-#                                             one config row per fleet agent
+#                                           — creates the DynamoDB tables
+#                                             (agentcore-hub-eval-config,
+#                                             agentcore-hub-eval-seen with TTL on
+#                                             expiresAt, agentcore-hub-eval-daily
+#                                             and agentcore-hub-eval-results with
+#                                             its three GSIs) and seeds one config
+#                                             row per fleet agent
 #   3. deploy/evaluations/setup-evaluations.sh
 #   4. THIS SCRIPT                          — the Lambdas, CW Logs subscriptions,
 #                                             alarms and S3/EventBridge wiring
@@ -30,8 +32,41 @@ FLEET_REPO="$FLEET_REPO_URL"
 # Cross-delivery dedup seen-set (config.sh defaults it to agentcore-hub-eval-seen,
 # matching index.mjs and the table deploy-all.sh creates).
 SEEN_TABLE="$EVAL_SEEN_TABLE"
-# Per-day metric buckets (PK agentId / SK day) — see deploy-all.sh + backfill-daily.mjs.
+# Per-day metric buckets (PK agentId / SK day) — see deploy-all.sh.
 DAILY_TABLE="${EVAL_DAILY_TABLE:-agentcore-hub-eval-daily}"
+# Per-result rows (PK agentId / SK sk, GSIs bySession/byPersona/byWorkflow).
+# Created by deploy-all.sh, which defaults to the same name.
+RESULTS_TABLE="${EVAL_RESULTS_TABLE:-agentcore-hub-eval-results}"
+
+# ─── Legacy results-group → agentId map ─────────────────────────────────────
+# deploy/evaluations/legacy-results-groups.json lists the pre-consolidation eval
+# results groups whose NAME no longer matches the agent that produced the
+# sessions in them; the packager consults it before resolveAgentId().
+#
+# It ships as BASE64 of the compact JSON, in LEGACY_RESULTS_GROUPS_B64. It cannot
+# ship as raw JSON: `update-function-configuration --environment` takes a shell
+# `Variables={K=V,...}` list, and a JSON value full of `,` and `=` would be
+# shredded into bogus keys. `base64 -w0` is GNU-only, so fall back to plain
+# base64 with the newlines stripped (macOS).
+LEGACY_GROUPS_FILE="${REPO_ROOT}/deploy/evaluations/legacy-results-groups.json"
+if [ -f "$LEGACY_GROUPS_FILE" ]; then
+  LEGACY_GROUPS_JSON=$(python3 -c "
+import json
+with open('$LEGACY_GROUPS_FILE') as f:
+    print(json.dumps(json.load(f), separators=(',', ':')))
+")
+  LEGACY_GROUPS_B64=$(printf '%s' "$LEGACY_GROUPS_JSON" | { base64 -w0 2>/dev/null || base64 | tr -d '\n'; })
+  echo "✓ Legacy results-group map: $(basename "$LEGACY_GROUPS_FILE") (${#LEGACY_GROUPS_B64} b64 chars)"
+  # Lambda's TOTAL environment is capped at 4KB; this var shares it with the rest.
+  # Warn loudly well before create/update-function-configuration starts failing.
+  if [ "${#LEGACY_GROUPS_B64}" -gt 2048 ]; then
+    echo "⚠ LEGACY_RESULTS_GROUPS_B64 is ${#LEGACY_GROUPS_B64} chars — Lambda caps ALL env vars at 4KB combined."
+    echo "  Trim the map's _note, or move it to S3 alongside config/agents.json."
+  fi
+else
+  LEGACY_GROUPS_B64=""
+  echo "⚠ No ${LEGACY_GROUPS_FILE} — packager will fall back to resolveAgentId() for every results group."
+fi
 
 # Resolve the Fleet Improver runtime ARN dynamically (no hardcoded suffix —
 # the runtime id is account-specific). eval-packager invokes this on flush to
@@ -74,6 +109,59 @@ aws s3 mb "s3://${BUCKET}" 2>/dev/null || true
 aws s3api put-bucket-notification-configuration \
   --bucket "$BUCKET" --notification-configuration '{"EventBridgeConfiguration":{}}' 2>/dev/null
 echo "✓ S3: ${BUCKET}"
+
+# ─── IAM: results table + evaluator-results log reads ───────────────────────
+# A SEPARATE inline policy on the SAME shared Lambda role, deliberately not
+# folded into setup-lambda-role.sh's `DynamoDBAccess` document: put-role-policy
+# replaces a policy wholesale, so two scripts editing one document would each
+# clobber the other's grants. `EvalResultsAccess` is owned here, additive, and
+# put-role-policy is idempotent by nature (it overwrites), so re-runs are no-ops.
+#
+# The packager's reconcile mode reads the evaluator results log groups directly
+# (FilterLogEvents) instead of waiting for a subscription delivery, and writes one
+# conditional row per result into ${RESULTS_TABLE} (+ its GSIs on Query).
+# DescribeLogGroups has to be unscoped: it is a list call, and the resource it
+# would be scoped to is what the call is discovering.
+ROLE_NAME_FOR_EVAL="${ROLE_ARN##*/}"
+aws iam put-role-policy \
+  --role-name "$ROLE_NAME_FOR_EVAL" \
+  --policy-name "EvalResultsAccess" \
+  --policy-document "{
+    \"Version\": \"2012-10-17\",
+    \"Statement\": [
+      {
+        \"Sid\": \"EvalResultsTable\",
+        \"Effect\": \"Allow\",
+        \"Action\": [
+          \"dynamodb:PutItem\",
+          \"dynamodb:GetItem\",
+          \"dynamodb:Query\",
+          \"dynamodb:BatchWriteItem\",
+          \"dynamodb:DescribeTable\"
+        ],
+        \"Resource\": [
+          \"arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/${RESULTS_TABLE}\",
+          \"arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/${RESULTS_TABLE}/index/*\"
+        ]
+      },
+      {
+        \"Sid\": \"EvalResultsListLogGroups\",
+        \"Effect\": \"Allow\",
+        \"Action\": [\"logs:DescribeLogGroups\"],
+        \"Resource\": \"*\"
+      },
+      {
+        \"Sid\": \"EvalResultsReadLogGroups\",
+        \"Effect\": \"Allow\",
+        \"Action\": [\"logs:FilterLogEvents\"],
+        \"Resource\": [
+          \"arn:aws:logs:${AWS_REGION}:${ACCOUNT_ID}:log-group:/aws/bedrock-agentcore/evaluations/results/*\",
+          \"arn:aws:logs:${AWS_REGION}:${ACCOUNT_ID}:log-group:/aws/bedrock-agentcore/evaluations/results/*:*\"
+        ]
+      }
+    ]
+  }" --output text >/dev/null
+echo "✓ IAM: EvalResultsAccess on ${ROLE_NAME_FOR_EVAL} (DDB ${RESULTS_TABLE} + evaluator results log reads)"
 
 # ─── Lambdas ─────────────────────────────────────────────────────────────────
 deploy_lambda() {
@@ -123,8 +211,13 @@ deploy_lambda() {
 # creates it) and on deploy/setup-lambda-role.sh (which grants Put/Get on it) —
 # naming it here makes the wiring visible in the function config instead of
 # hiding a silently fail-open dedup layer behind a code default.
+#
+# EVAL_RESULTS_TABLE names the per-result table (PK agentId / SK sk) created by
+# ./deploy-all.sh; LEGACY_RESULTS_GROUPS_B64 carries the base64 of the compact
+# legacy results-group → agentId map (see above). --environment REPLACES the
+# whole variable set, so every var the packager needs must be listed here.
 deploy_lambda "eval-packager" "eval-packager" 600 512 \
-  "{ARTIFACT_BUCKET=${BUCKET},IMPROVEMENT_AGENT_ARN=${IMPROVER_ARN},AWS_ACCOUNT_ID=${ACCOUNT_ID},EVAL_SEEN_TABLE=${SEEN_TABLE},EVAL_DAILY_TABLE=${DAILY_TABLE}}"
+  "{ARTIFACT_BUCKET=${BUCKET},IMPROVEMENT_AGENT_ARN=${IMPROVER_ARN},AWS_ACCOUNT_ID=${ACCOUNT_ID},EVAL_SEEN_TABLE=${SEEN_TABLE},EVAL_DAILY_TABLE=${DAILY_TABLE},EVAL_RESULTS_TABLE=${RESULTS_TABLE},LEGACY_RESULTS_GROUPS_B64=${LEGACY_GROUPS_B64}}"
 
 deploy_lambda "prd-submitter" "prd-submitter" 30 256 \
   "{ARTIFACT_BUCKET=${BUCKET},WORKFLOW_API_URL=${WORKFLOW_API},FLEET_REPO_URL=${FLEET_REPO}}"
@@ -265,6 +358,38 @@ aws lambda add-permission \
   --output text 2>/dev/null || true
 
 echo "✓ S3 trigger: improvement-prds/ → prd-submitter → workflow API"
+
+# ─── Daily reconcile sweep (EventBridge → packager) ─────────────────────────
+# Subscription-filter delivery is best-effort: a throttled or failed delivery
+# loses those evaluator results for good. Once a day the packager re-reads the
+# last 2 days of results log groups directly and conditionally re-puts every row
+# it finds, so a missed delivery self-heals. Idempotent by construction (the
+# conditional puts dedupe) AND by deploy (put-rule/put-targets overwrite by name;
+# add-permission is tolerated when the statement is already there).
+RECONCILE_RULE="agentcore-hub-eval-reconcile"
+aws events put-rule \
+  --name "$RECONCILE_RULE" \
+  --schedule-expression "rate(1 day)" \
+  --state ENABLED \
+  --description "Daily eval reconcile: re-read the evaluator results log groups and backfill any results a subscription delivery dropped" \
+  --region "$AWS_REGION" --output text >/dev/null
+
+RECONCILE_RULE_ARN=$(aws events describe-rule --name "$RECONCILE_RULE" \
+  --region "$AWS_REGION" --query 'Arn' --output text)
+
+aws lambda add-permission \
+  --function-name agentcore-hub-eval-packager \
+  --statement-id "${RECONCILE_RULE}-invoke" \
+  --action lambda:InvokeFunction --principal events.amazonaws.com \
+  --source-arn "$RECONCILE_RULE_ARN" \
+  --region "$AWS_REGION" --output text >/dev/null 2>&1 \
+  || echo "  (reconcile invoke permission already present)"
+
+aws events put-targets --rule "$RECONCILE_RULE" --region "$AWS_REGION" \
+  --targets "[{\"Id\":\"eval-packager\",\"Arn\":\"${PACKAGER_ARN}\",\"Input\":\"{\\\"mode\\\":\\\"reconcile\\\",\\\"days\\\":2}\"}]" \
+  --output text >/dev/null
+
+echo "✓ Reconcile: ${RECONCILE_RULE} (rate(1 day)) → packager {\"mode\":\"reconcile\",\"days\":2}"
 
 # ─── Prompts ─────────────────────────────────────────────────────────────────
 for f in "${REPO_ROOT}/deploy/runtime-agent/prompts/agentcore_hub_"*.txt; do

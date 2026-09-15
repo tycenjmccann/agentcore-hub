@@ -111,7 +111,7 @@ describe('buildAddExpression', () => {
       'us.anthropic.claude-sonnet-4-5-20250929-v1:0': { ...mod.zeroModel(), input: 7, output: 3, costUsd: 0.5, calls: 1 },
     }, 'now');
     expect(expr.empty).toBe(false);
-    expect(expr.UpdateExpression).toMatch(/^SET #updatedAt = :now, #expiresAt = if_not_exists\(#expiresAt, :ttl\) ADD /);
+    expect(expr.UpdateExpression).toMatch(/^SET #updatedAt = :now ADD /);
     expect(expr.UpdateExpression).toContain('#m0_input :m0_input');
     expect(expr.UpdateExpression).toContain('#t_input :t_input');
     expect(expr.UpdateExpression).not.toContain(':t_cacheWrite1h'); // zero deltas omitted
@@ -124,11 +124,17 @@ describe('buildAddExpression', () => {
     });
     expect(expr.ExpressionAttributeValues[':t_input']).toBe(107);
     expect(expr.ExpressionAttributeValues[':t_calls']).toBe(2);
-    expect(expr.ExpressionAttributeValues[':ttl']).toBe(mod.expiresAtFor('2026-09-07'));
   });
 
-  it('TTL retires the bucket retainDays after its day', () => {
-    expect(mod.expiresAtFor('2026-09-07', 14)).toBe(Date.UTC(2026, 8, 22) / 1000);
+  it('stamps no TTL — day buckets are permanent', () => {
+    const expr = mod.buildAddExpression('2026-09-07', {
+      'us.anthropic.claude-fable-5-1': { ...mod.zeroModel(), input: 100, calls: 1 },
+    }, 'now');
+    expect(expr.UpdateExpression).not.toContain(':ttl');
+    expect(expr.UpdateExpression).not.toContain('#expiresAt');
+    expect(expr.ExpressionAttributeNames).not.toHaveProperty('#expiresAt');
+    expect(expr.ExpressionAttributeValues).not.toHaveProperty(':ttl');
+    expect(mod.expiresAtFor).toBeUndefined();
   });
 });
 

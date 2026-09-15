@@ -9,7 +9,9 @@
 #   managed harnesses -> EMF gen_ai.client.token.usage metric records
 #   coding runtime    -> Claude Code claude_code.api_request events
 # Also REMOVES the legacy weekly EventBridge reset — the dashboard reads a
-# rolling window from the day buckets, which prune themselves.
+# rolling window over the day buckets, which are now KEPT FOREVER (no TTL) so the
+# historical cost/quality trend survives. TTL is disabled on the table by
+# deploy/continuous-improvement/deploy-all.sh.
 #
 # Idempotent: re-runs update the Lambda code/config and skip resources that
 # already exist.
@@ -46,8 +48,8 @@ done
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 LAMBDA_NAME="agentcore-hub-token-aggregator"
 LAMBDA_ROLE="${LAMBDA_ROLE_ARN:-arn:aws:iam::${ACCOUNT_ID}:role/agentcore-hub-lambda-role}"
-# Per-day bucket table (PK agentId / SK day, TTL expiresAt). Created by
-# deploy-all.sh; ensured here too so this script is a complete entry point.
+# Per-day bucket table (PK agentId / SK day, no TTL — buckets are permanent).
+# Created by deploy-all.sh; ensured here too so this script is a complete entry point.
 DAILY_TABLE_NAME="${EVAL_DAILY_TABLE:-agentcore-hub-eval-daily}"
 # Artifact bucket convention (matches deploy/config.sh): agentcore-hub-artifacts-<ACCOUNT>-<REGION>.
 # The previous version dropped the region suffix and pointed the Lambda at a
@@ -76,11 +78,8 @@ else
     --billing-mode PAY_PER_REQUEST \
     --region "${REGION}" --output text --query 'TableDescription.TableStatus'
   aws dynamodb wait table-exists --table-name "${DAILY_TABLE_NAME}" --region "${REGION}"
-  aws dynamodb update-time-to-live \
-    --table-name "${DAILY_TABLE_NAME}" \
-    --time-to-live-specification "Enabled=true,AttributeName=expiresAt" \
-    --region "${REGION}" --output text --query 'TimeToLiveSpecification.Enabled'
-  echo "✓ ${DAILY_TABLE_NAME} created (TTL on expiresAt)"
+  # No TTL: day buckets are permanent, so the historical trend survives.
+  echo "✓ ${DAILY_TABLE_NAME} created (no TTL - buckets are permanent)"
 fi
 
 ###############################################################################
@@ -102,7 +101,7 @@ if aws lambda get-function --function-name "${LAMBDA_NAME}" --region "${REGION}"
   aws lambda update-function-configuration \
     --function-name "${LAMBDA_NAME}" \
     --timeout 60 --memory-size 256 \
-    --environment "Variables={EVAL_DAILY_TABLE=${DAILY_TABLE_NAME},ARTIFACTS_BUCKET=${BUCKET},DAILY_RETAIN_DAYS=14}" \
+    --environment "Variables={EVAL_DAILY_TABLE=${DAILY_TABLE_NAME},ARTIFACTS_BUCKET=${BUCKET}}" \
     --region "${REGION}" --output text --query 'FunctionArn'
 else
   echo "Creating new Lambda..."
@@ -113,7 +112,7 @@ else
     --role "${LAMBDA_ROLE}" \
     --zip-file fileb:///tmp/token-aggregator.zip \
     --timeout 60 --memory-size 256 \
-    --environment "Variables={EVAL_DAILY_TABLE=${DAILY_TABLE_NAME},ARTIFACTS_BUCKET=${BUCKET},DAILY_RETAIN_DAYS=14}" \
+    --environment "Variables={EVAL_DAILY_TABLE=${DAILY_TABLE_NAME},ARTIFACTS_BUCKET=${BUCKET}}" \
     --region "${REGION}" --output text --query 'FunctionArn'
   aws lambda wait function-active --function-name "${LAMBDA_NAME}" --region "${REGION}"
 fi
@@ -219,4 +218,5 @@ echo ""
 echo "=== Token Aggregator Deployment Complete ==="
 echo "Agent log groups → subscription filter → ${LAMBDA_NAME} → DDB ${DAILY_TABLE_NAME} (agentId, day)"
 echo ""
-echo "Next: node deploy/continuous-improvement/backfill-daily.mjs --days 7   # fill the window from CW Logs Insights"
+echo "Next: node deploy/continuous-improvement/backfill-results.mjs --from YYYY-MM-DD --to YYYY-MM-DD"
+echo "      (drives the eval-packager's reconcile mode; backfill-daily.mjs is retired)"
