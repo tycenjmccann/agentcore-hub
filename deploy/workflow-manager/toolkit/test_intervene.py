@@ -305,11 +305,12 @@ def test_file_bug_missing_title_or_description_refuses(rec, argv):
 #
 # The bug: mark-done recorded the operator's proof as prose only (a ticket
 # comment + a manager.intervention event) and transitioned the ticket. Nothing
-# ever wrote completions/{ticketId}.json, the record BOTH completion evidence
-# gates read, so a run whose agent died before report_completion emitted
-# workflow.completion_blocked reason=missing_evidence forever. The route now
-# writes that record — but only if mark-done actually SENDS the evidence, which
-# is what these pin.
+# ever wrote completions/{ticketId}.json — the record KPIs / cost-report and the
+# ship-verdict harvest read — so a mark-done left no deliverable data behind.
+# The route now writes that record, but only if mark-done actually SENDS the
+# evidence, which is what these pin. (The completion-evidence gate that once
+# also read this record was removed in #583; the record now feeds KPIs and the
+# ship-verdict harvest only.)
 
 
 @pytest.fixture
@@ -410,8 +411,10 @@ def test_mark_done_blank_evidence_refuses_before_any_post(rec, open_ticket, evid
 # create-only PUT and the read-back; a concurrent writer won the refill's
 # IfMatch, contents unknown) leave nothing the completion gate can use. The
 # response cannot distinguish them, so mark-done reads the record itself and
-# reports `completionRecordCheck`. A legitimate kept record must stay exit 0 —
-# exiting non-zero there would read as a failed intervention and escalate.
+# reports `completionRecordCheck`. Every case stays exit 0 — #583 removed the
+# completion-evidence gate, so a moved ticket finishes the run; a missing/blank
+# record is an advisory NOTE (KPIs / ship-verdict harvest see no record), not a
+# failed intervention.
 
 
 def test_mark_done_written_true_skips_the_s3_verification(rec, open_ticket, record_fetch, monkeypatch, capsys):
@@ -434,50 +437,50 @@ def test_mark_done_kept_existing_evidence_record_is_a_success(rec, open_ticket, 
     assert rec.events[0][1] == "mark_done"
 
 
-def test_mark_done_missing_record_warns_and_exits_nonzero(rec, open_ticket, record_fetch, monkeypatch, capsys):
+def test_mark_done_missing_record_notes_but_exits_zero(rec, open_ticket, record_fetch, monkeypatch, capsys):
     # (c) The "vanished between the PUT and the read-back" race: the ticket is
-    # done and NO record exists, so the completion gate will 409 forever and
-    # done → done blocks a retry. Exit non-zero with the create-only remedy —
-    # but the summary is still printed and the intervention still published,
-    # because the transition itself DID land.
+    # done and NO record exists. #583 removed the completion-evidence gate, so
+    # the moved ticket finishes the run — this is an advisory NOTE on stderr
+    # (exit 0), not a failure. The note flags that KPIs / the ship-verdict
+    # harvest have no record to read, and offers the create-only write for a
+    # ship ticket. The summary is printed and the intervention published.
     record_fetch.result = None
     monkeypatch.setattr(intervene, "api_post", transition_returns(rec, {"success": True, "completionRecordWritten": False}))
-    with pytest.raises(SystemExit) as exc:
-        run(["mark-done", "wf_1", "TEAM-X", "--evidence", "PR #87"])
-    message = str(exc.value)
-    assert "WARNING" in message
-    assert "IfNoneMatch" in message
-    assert "TEAM-X" in message
-    assert "completions/TEAM-X.json" in message
-    assert "missing_evidence" in message
-    assert '"completionRecordCheck": "missing"' in capsys.readouterr().out
+    run(["mark-done", "wf_1", "TEAM-X", "--evidence", "PR #87"])
+    captured = capsys.readouterr()
+    assert "NOTE" in captured.err
+    assert "IfNoneMatch" in captured.err
+    assert "TEAM-X" in captured.err
+    assert "completions/TEAM-X.json" in captured.err
+    assert '"completionRecordCheck": "missing"' in captured.out
     assert rec.events[0][1] == "mark_done"
 
 
-def test_mark_done_blank_record_warns_and_exits_nonzero(rec, open_ticket, record_fetch, monkeypatch, capsys):
+def test_mark_done_blank_record_notes_but_exits_zero(rec, open_ticket, record_fetch, monkeypatch, capsys):
     # (d) A record exists but is not evidence per completionRecordHasEvidence
     # (the concurrent-writer race can leave exactly this). Same answer as (c).
     record_fetch.result = {"ticket_id": "TEAM-X", "summary": ""}
     monkeypatch.setattr(intervene, "api_post", transition_returns(rec, {"success": True, "completionRecordWritten": False}))
-    with pytest.raises(SystemExit) as exc:
-        run(["mark-done", "wf_1", "TEAM-X", "--evidence", "PR #87"])
-    assert "WARNING" in str(exc.value)
-    assert "IfNoneMatch" in str(exc.value)
-    assert '"completionRecordCheck": "blank"' in capsys.readouterr().out
+    run(["mark-done", "wf_1", "TEAM-X", "--evidence", "PR #87"])
+    captured = capsys.readouterr()
+    assert "NOTE" in captured.err
+    assert "IfNoneMatch" in captured.err
+    assert '"completionRecordCheck": "blank"' in captured.out
 
 
 def test_mark_done_absent_written_key_still_verifies(rec, open_ticket, record_fetch, monkeypatch, capsys):
     # (e) Version skew: an older route that answers no completionRecordWritten
     # at all must NOT be read as "written". The toolkit ships to S3 before the
     # app rolls, and deploy/workflow-manager/deploy.sh can be hand-run alone, so
-    # this skew is not merely transient.
+    # this skew is not merely transient. Still reads the record; a missing one
+    # is now an advisory NOTE (exit 0), not a failure.
     record_fetch.result = None
     monkeypatch.setattr(intervene, "api_post", transition_returns(rec, {"success": True}))
-    with pytest.raises(SystemExit) as exc:
-        run(["mark-done", "wf_1", "TEAM-X", "--evidence", "PR #87"])
-    assert "WARNING" in str(exc.value)
+    run(["mark-done", "wf_1", "TEAM-X", "--evidence", "PR #87"])
+    captured = capsys.readouterr()
+    assert "NOTE" in captured.err
     assert record_fetch.calls == ["TEAM-X"]
-    assert '"completionRecordCheck": "missing"' in capsys.readouterr().out
+    assert '"completionRecordCheck": "missing"' in captured.out
 
 
 def test_mark_done_unset_artifact_bucket_is_unverified_not_a_failure(rec, open_ticket, record_fetch, monkeypatch, capsys):

@@ -133,8 +133,12 @@ def api_post(path, body=None):
 # response cannot tell them apart:
 #   - the record vanished between the create-only PUT and the read-back (race)
 #   - a concurrent writer won the refill's IfMatch, contents unknown
-# Either way the completion gate 409s missing_evidence forever, and done→done is
-# refused so mark-done cannot be retried. So we read the record ourselves.
+# The per-ticket completion-evidence gate that used to refuse such a run was
+# removed (PR #583) — the ticket moving to done IS the def of done now, so a
+# missing record no longer blocks the run. We still read the record ourselves
+# so the operator KNOWS it is thin: KPIs / cost-report and the ship-verdict
+# harvest read these records, so a ship ticket with no record has no merge
+# signal to show. That is an advisory, not a failure.
 
 _s3_client = None
 
@@ -210,16 +214,18 @@ def completion_record_has_evidence(record):
     return False
 
 
-def _missing_evidence_warning(ticket_id, state):
+def _missing_evidence_note(ticket_id, state):
     key = f"completions/{ticket_id}.json"
     return (
-        f"WARNING: mark-done closed {ticket_id} but s3://{ARTIFACT_BUCKET or '$ARTIFACT_BUCKET'}/{key} "
-        f"is {state} — the completion evidence gate will refuse the run with "
-        f"409 missing_evidence, and mark-done cannot be retried (done → done is rejected).\n"
-        f"Remedy: write the record out of band CREATE-ONLY — boto3 "
-        f"put_object(..., IfNoneMatch=\"*\") so an agent's authoritative record is never "
-        f"overwritten; see the watch-triage skill §2 for the exact snippet. Then `complete` the run.\n"
-        f"Re-check with: aws s3 cp s3://$ARTIFACT_BUCKET/{key} - "
+        f"NOTE: mark-done closed {ticket_id} but s3://{ARTIFACT_BUCKET or '$ARTIFACT_BUCKET'}/{key} "
+        f"is {state}. The ticket moved, so the run is NOT blocked (the completion-evidence "
+        f"gate was removed in #583). But KPIs / cost-report and the ship-verdict harvest read "
+        f"this record — with none, a SHIP ticket shows no merge/deploy signal.\n"
+        f"Optional, and only worth it for a ship ticket: write the record out of band CREATE-ONLY — "
+        f"boto3 put_object(..., IfNoneMatch=\"*\") so an agent's authoritative record is never "
+        f"overwritten. (Operator prose is not a merge commit, so this cannot flip a ship ticket to "
+        f"'shipped' — the run still closes static-ci-only.)\n"
+        f"Inspect with: aws s3 cp s3://$ARTIFACT_BUCKET/{key} - "
         f"(or the boto3 get_object equivalent)."
     )
 
@@ -229,7 +235,9 @@ def verify_completion_record(ticket_id, result):
 
     check  — the `completionRecordCheck` value reported in mark-done's summary
     note   — an advisory line for stderr (exit stays 0)
-    fatal  — a SystemExit message (the record is unusable; exit 1)
+    fatal  — a SystemExit message (exit 1). Since #583 removed the completion-
+             evidence gate, a mark-done that moved the ticket is never fatal;
+             this stays in the tuple only so callers keep a stable shape.
     """
     if result.get("completionRecordWritten") is True:
         # The route wrote it this call — nothing to verify, no S3 read.
@@ -255,7 +263,7 @@ def verify_completion_record(ticket_id, result):
             None,
         )
     if record is None:
-        return "missing", None, _missing_evidence_warning(ticket_id, "missing")
+        return "missing", _missing_evidence_note(ticket_id, "missing"), None
     if completion_record_has_evidence(record):
         # Route outcome "kept": a record already proved the deliverable (usually
         # the agent's own report_completion landing first). A real success.
@@ -264,7 +272,7 @@ def verify_completion_record(ticket_id, result):
             f"NOTE: completions/{ticket_id}.json already carried evidence — kept as is.",
             None,
         )
-    return "blank", None, _missing_evidence_warning(ticket_id, "evidence-less (blank)")
+    return "blank", _missing_evidence_note(ticket_id, "evidence-less (blank)"), None
 
 
 def get_ticket(ticket_id):
@@ -385,13 +393,15 @@ def cmd_mark_done(args):
       1. Posts `--evidence` as a ticket comment (the audit trail: WHY this was
          safe to close), then
       2. Transitions the ticket to done, which cascades the next phase, then
-      3. Verifies completions/<ticketId>.json really exists and carries
+      3. Checks completions/<ticketId>.json really exists and carries
          evidence. The route reports `completionRecordWritten`, but its "kept"
          outcome covers two races in which nothing usable was written and the
          response cannot say which. The outcome is reported as
-         `completionRecordCheck`; a missing/blank record exits 1 with the
-         out-of-band remedy, because the completion gate would otherwise refuse
-         the run forever and done → done cannot be retried.
+         `completionRecordCheck`; a missing/blank record is an advisory NOTE
+         (exit 0, not a failure) — #583 removed the completion-evidence gate, so
+         the moved ticket is enough to finish the run. The note only flags that
+         KPIs and the ship-verdict harvest have no record to read for this
+         ticket, which matters for a ship ticket's merge signal.
 
     The evidence is not optional — closing a ticket with no proof the work
     shipped is exactly the false-green this guards against. If you cannot cite
@@ -424,7 +434,7 @@ def cmd_mark_done(args):
     publish_intervention(args.workflow_id, "mark_done", {
         "ticketId": args.ticket_id, "evidence": args.evidence[:500],
     })
-    # 3. Verify the evidence record the completion gate will read.
+    # 3. Check the completions record KPIs / the ship-verdict harvest will read.
     check, note, fatal = verify_completion_record(args.ticket_id, result)
     print(json.dumps({
         "action": "mark_done", "ticketId": args.ticket_id,
