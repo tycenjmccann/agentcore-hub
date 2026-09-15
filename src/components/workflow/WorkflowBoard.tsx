@@ -10,6 +10,7 @@ import {
   isTerminalPhase,
 } from "@/lib/workflow/types";
 import awsIcons from "@/lib/aws-icons.json";
+import { NAV_ITEMS } from "@/config/modules";
 import { getPipelinePhases, resolveToolIcon, getPhaseToolCount, type PipelinePhaseConfig } from "@/lib/pipeline-config";
 import { DEFAULT_WORKFLOW_DEF_ID, getWorkflowDef } from "@/lib/workflow/workflow-defs";
 import { resolveSdlcFramework, sdlcBadgeFor } from "@/lib/workflow/sdlc-framework";
@@ -26,6 +27,21 @@ import WorkflowManagerPanel from "./WorkflowManagerPanel";
 import RunPerformanceCard from "./RunPerformanceCard";
 import HeroKpiStrip from "./HeroKpiStrip";
 import { useWorkflowStream, runKey } from "./useWorkflowStream";
+
+// ─── Cross-module deep link: judge scores (TEAM-4688) ───────────────────────
+//
+// Evaluations is an OPTIONAL module, and modules may not import each other, so
+// the board never touches eval code: the link below is a plain URL STRING whose
+// only gate is the module registry. Delete the module (its files AND its
+// `evaluations` nav entry) and the link disappears with the entry; a registry
+// entry that outlives the files leaves a dangling href, never a broken build.
+const EVALUATIONS_MODULE_PRESENT = NAV_ITEMS.some((i) => i.module === "evaluations");
+
+// The drilldown route is /evaluations/<agentId>, and every pipeline persona is
+// scored under the one fleet-host runtime id. Written as a literal rather than
+// imported from src/lib/workflow/fleet-runtime.ts on purpose: that module pulls
+// discoverAgents() (server-side AWS SDK) in with it, and this is a client file.
+const JUDGE_SCORES_AGENT_ID = "agentcore_hub_agent";
 
 interface WorkflowBoardProps {
   workflowId: string;
@@ -1883,6 +1899,21 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
                 </span>
               </>
             )}
+          </div>
+        )}
+
+        {/* Judge scores — per-session evaluation results for this run, in the
+            Evaluations drilldown. URL string only (see EVALUATIONS_MODULE_PRESENT). */}
+        {isTerminalPhase(state.phase) && EVALUATIONS_MODULE_PRESENT && (
+          <div className="flex flex-wrap items-center gap-2 text-xs">
+            <a
+              data-testid="judge-scores-link"
+              href={`/evaluations/${JUDGE_SCORES_AGENT_ID}?workflowId=${encodeURIComponent(workflowId)}&days=all`}
+              className="text-sky-400 hover:text-sky-300 underline"
+            >
+              Judge scores →
+            </a>
+            <span className="text-muted">Per-session evaluation scores for this run.</span>
           </div>
         )}
 

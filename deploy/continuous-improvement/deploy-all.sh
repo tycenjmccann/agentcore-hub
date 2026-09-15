@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
 # deploy/continuous-improvement/deploy-all.sh
-# Creates the eval-packager's two DynamoDB tables and seeds all fleet agents:
+# Creates the eval-packager's DynamoDB tables and seeds all fleet agents:
 #   agentcore-hub-eval-config — PK agentId. Per-agent eval controls (enabled,
 #                               sampleRate, batchSize) + the session buffer.
 #   agentcore-hub-eval-seen   — PK dedupKey, TTL on expiresAt. The
 #                               cross-delivery/concurrent-invocation dedup
 #                               seen-set (see the Step 1 comment below).
+#   agentcore-hub-eval-daily  — PK agentId / SK day. Per-UTC-day metric buckets.
+#                               NO TTL: buckets are permanent.
+#   agentcore-hub-eval-results — PK agentId / SK sk, GSIs bySession/byPersona/
+#                               byWorkflow. One row per evaluator result, PITR on.
 # Idempotent: skips agents that already have a config row.
 #
 # Run this BEFORE ./deploy.sh — that script points the eval-packager Lambda's
@@ -29,6 +33,11 @@ SEEN_TABLE_NAME="${EVAL_SEEN_TABLE:-agentcore-hub-eval-seen}"
 # /api/evaluations reads). Its own table because the eval-config row carries the
 # session buffer and sits at the 400KB item cap for busy agents.
 DAILY_TABLE_NAME="${EVAL_DAILY_TABLE:-agentcore-hub-eval-daily}"
+# Per-result rows (PK agentId / SK sk) with bySession/byPersona/byWorkflow GSIs.
+# The eval-packager writes them with conditional PutItem (its own dedupe) and the
+# Evaluations UI queries them. Name must match the packager's EVAL_RESULTS_TABLE
+# env var, which deploy.sh sets from the same default.
+RESULTS_TABLE_NAME="${EVAL_RESULTS_TABLE:-agentcore-hub-eval-results}"
 SEEN_TTL_ATTRIBUTE="expiresAt"
 REGION="${AWS_REGION:-us-east-1}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -47,6 +56,7 @@ echo "[deploy-all] Region: ${REGION}"
 echo "[deploy-all] Table:  ${TABLE_NAME}"
 echo "[deploy-all] Seen:   ${SEEN_TABLE_NAME}"
 echo "[deploy-all] Daily:  ${DAILY_TABLE_NAME}"
+echo "[deploy-all] Results:${RESULTS_TABLE_NAME}"
 echo "[deploy-all] Fleet:  ${FLEET_IDS_FILE}"
 
 ###############################################################################
@@ -141,8 +151,9 @@ fi
 
 
 ###############################################################################
-# Daily metric buckets table: PK agentId (S) / SK day (S, YYYY-MM-DD UTC), TTL
-# on expiresAt (the Lambdas stamp day + DAILY_RETAIN_DAYS). Idempotent.
+# Daily metric buckets table: PK agentId (S) / SK day (S, YYYY-MM-DD UTC).
+# NO TTL — day buckets are PERMANENT so the historical cost/quality trend
+# survives. Idempotent.
 ###############################################################################
 if aws dynamodb describe-table --table-name "${DAILY_TABLE_NAME}" --region "${REGION}" >/dev/null 2>&1; then
   echo "[deploy-all] Table '${DAILY_TABLE_NAME}' already exists. Skipping creation."
@@ -155,20 +166,77 @@ else
     --billing-mode PAY_PER_REQUEST \
     --region "${REGION}" --output text --query 'TableDescription.TableStatus'
   aws dynamodb wait table-exists --table-name "${DAILY_TABLE_NAME}" --region "${REGION}"
-  echo "[deploy-all] Table '${DAILY_TABLE_NAME}' is ACTIVE."
+  echo "[deploy-all] Table '${DAILY_TABLE_NAME}' is ACTIVE (no TTL - buckets are permanent)."
 fi
 
+# Day buckets used to expire via TTL on expiresAt (day + DAILY_RETAIN_DAYS). They
+# are now kept forever, so TTL must be DISABLED here. update-time-to-live errors
+# when the requested state already matches, which would abort the deploy under
+# `set -e` on every re-run — so only call it when TTL is actually on.
 DAILY_TTL_STATUS=$(aws dynamodb describe-time-to-live \
   --table-name "${DAILY_TABLE_NAME}" --region "${REGION}" \
   --query 'TimeToLiveDescription.TimeToLiveStatus' --output text 2>/dev/null || echo "DISABLED")
 if [[ "${DAILY_TTL_STATUS}" == "ENABLED" || "${DAILY_TTL_STATUS}" == "ENABLING" ]]; then
-  echo "[deploy-all] TTL already ${DAILY_TTL_STATUS} on ${DAILY_TABLE_NAME}.expiresAt. Skipping."
-else
-  echo "[deploy-all] Enabling TTL on ${DAILY_TABLE_NAME}.expiresAt..."
+  echo "[deploy-all] TTL is ${DAILY_TTL_STATUS} on ${DAILY_TABLE_NAME}.expiresAt - disabling (buckets are permanent)..."
   aws dynamodb update-time-to-live \
     --table-name "${DAILY_TABLE_NAME}" \
-    --time-to-live-specification "Enabled=true,AttributeName=expiresAt" \
+    --time-to-live-specification "Enabled=false,AttributeName=expiresAt" \
     --region "${REGION}" --output text --query 'TimeToLiveSpecification.Enabled'
+  echo "[deploy-all] TTL disabled on ${DAILY_TABLE_NAME}."
+else
+  echo "[deploy-all] TTL already ${DAILY_TTL_STATUS} on ${DAILY_TABLE_NAME}.expiresAt. Nothing to do."
+fi
+echo "[deploy-all] Note: rows written before this change keep a stale 'expiresAt' attribute, but it is no longer a TTL attribute - nothing expires."
+
+###############################################################################
+# Eval RESULTS table: one row per evaluator result, PK agentId (S) / SK sk (S).
+# Written by the eval-packager (conditional PutItem = dedupe), read by the
+# Evaluations UI. Three GSIs, all ProjectionType=ALL:
+#   bySession  gsi1pk (S) HASH / gsi1sk (S) RANGE
+#   byPersona  gsi2pk (S) HASH / sk     (S) RANGE
+#   byWorkflow gsi3pk (S) HASH / sk     (S) RANGE
+# No TTL: results are permanent. PITR is enabled below. Idempotent.
+###############################################################################
+if aws dynamodb describe-table --table-name "${RESULTS_TABLE_NAME}" --region "${REGION}" >/dev/null 2>&1; then
+  echo "[deploy-all] Table '${RESULTS_TABLE_NAME}' already exists. Skipping creation."
+else
+  echo "[deploy-all] Creating table '${RESULTS_TABLE_NAME}' with on-demand billing + 3 GSIs..."
+  aws dynamodb create-table \
+    --table-name "${RESULTS_TABLE_NAME}" \
+    --attribute-definitions \
+      AttributeName=agentId,AttributeType=S \
+      AttributeName=sk,AttributeType=S \
+      AttributeName=gsi1pk,AttributeType=S \
+      AttributeName=gsi1sk,AttributeType=S \
+      AttributeName=gsi2pk,AttributeType=S \
+      AttributeName=gsi3pk,AttributeType=S \
+    --key-schema AttributeName=agentId,KeyType=HASH AttributeName=sk,KeyType=RANGE \
+    --global-secondary-indexes \
+      'IndexName=bySession,KeySchema=[{AttributeName=gsi1pk,KeyType=HASH},{AttributeName=gsi1sk,KeyType=RANGE}],Projection={ProjectionType=ALL}' \
+      'IndexName=byPersona,KeySchema=[{AttributeName=gsi2pk,KeyType=HASH},{AttributeName=sk,KeyType=RANGE}],Projection={ProjectionType=ALL}' \
+      'IndexName=byWorkflow,KeySchema=[{AttributeName=gsi3pk,KeyType=HASH},{AttributeName=sk,KeyType=RANGE}],Projection={ProjectionType=ALL}' \
+    --billing-mode PAY_PER_REQUEST \
+    --region "${REGION}" --output text --query 'TableDescription.TableStatus'
+  echo "[deploy-all] Waiting for table to become ACTIVE..."
+  aws dynamodb wait table-exists --table-name "${RESULTS_TABLE_NAME}" --region "${REGION}"
+  echo "[deploy-all] Table '${RESULTS_TABLE_NAME}' is ACTIVE."
+fi
+
+# PITR. update-continuous-backups ERRORS when PITR is already enabled, which
+# would abort the deploy under `set -e` on every re-run — so check first.
+PITR_STATUS=$(aws dynamodb describe-continuous-backups \
+  --table-name "${RESULTS_TABLE_NAME}" --region "${REGION}" \
+  --query 'ContinuousBackupsDescription.PointInTimeRecoveryDescription.PointInTimeRecoveryStatus' \
+  --output text 2>/dev/null || echo "UNKNOWN")
+if [[ "${PITR_STATUS}" == "ENABLED" ]]; then
+  echo "[deploy-all] PITR already ENABLED on ${RESULTS_TABLE_NAME}. Skipping."
+else
+  echo "[deploy-all] Enabling PITR on ${RESULTS_TABLE_NAME} (was '${PITR_STATUS}')..."
+  aws dynamodb update-continuous-backups \
+    --table-name "${RESULTS_TABLE_NAME}" \
+    --point-in-time-recovery-specification PointInTimeRecoveryEnabled=true \
+    --region "${REGION}" --output text \
+    --query 'ContinuousBackupsDescription.PointInTimeRecoveryDescription.PointInTimeRecoveryStatus'
 fi
 
 ###############################################################################

@@ -5,10 +5,16 @@ This directory contains deployment scripts for the **eval-packager** continuous 
 ## Architecture Overview
 
 ```
-CloudWatch Logs → eval-packager Lambda → DynamoDB buffer
+CloudWatch Logs → eval-packager Lambda → agentcore-hub-eval-results (one row per
+                                          judge result, kept forever)
+                                       → agentcore-hub-eval-daily (day buckets)
+                                       → DynamoDB buffer
    → (on flush) archive raw batch to batches/
    → invoke Fleet Improver runtime → synthesized PRD to prd/
    → prd-submitter (S3→EventBridge) → workflow API → fix PR
+
+EventBridge (rate(1 day)) → eval-packager {mode:"reconcile"} → re-read the same
+   log groups → converge results rows + day buckets (no buffer, no PRD)
 ```
 
 ### Pipeline Stages
@@ -20,9 +26,13 @@ CloudWatch Logs → eval-packager Lambda → DynamoDB buffer
    where `<short_id>` is the agent's `agentId` with the `agentcore_hub_` prefix stripped.
 
 2. **Eval Packager Lambda** (`lambda/eval-packager/index.mjs`):
-   - Triggered by CW Logs subscription filters
-   - Resolves agent identity from the log group harness name
+   - Triggered by CW Logs subscription filters, or by the daily reconcile rule
+     (`{mode:"reconcile"}` — see [Two entry points, one code path](#two-entry-points-one-code-path))
+   - Resolves agent identity from `LEGACY_RESULTS_GROUPS_B64` first, then from the
+     log group harness name
    - Parses evaluator results (scores, evidence, evaluator name) from log event messages
+   - **Writes one row per judge result to `agentcore-hub-eval-results`** — before
+     the per-agent gates, so the audit trail is complete even when the loop is not
    - Applies per-agent controls (enabled flag, sample rate)
    - Atomically appends enriched session data to a DynamoDB buffer
    - **On flush, invokes the Fleet Improver runtime to synthesize a PRD** (see stage 5)
@@ -127,13 +137,14 @@ conditionally written instead of being globally serialized:
   ledger. `evalSessionCount` in particular stays **approximate** under
   at-least-once delivery regardless of locking — that's accepted, not chased.
 
-### Operational metrics: per-day buckets, one rolling window
+### Operational metrics: per-day buckets, selectable window
 
 The Evaluations tab's Operational Metrics (sessions, evaluator scores, tokens,
 cache hit, cost) are all read from the **`agentcore-hub-eval-daily`** table —
 one item per agent per UTC day (PK `agentId`, SK `day` = `YYYY-MM-DD`) — and
-folded over a single rolling window (`GET /api/evaluations?days=7`, clamped to
-1..14) by `src/lib/eval-metrics.ts`. There is no weekly reset and no all-time
+folded over the window the caller picks (`GET /api/evaluations?days=7|30|90|all`,
+`parseWindow` / `windowDaysFor` in `src/lib/eval-metrics.ts`; `days` defaults to
+7 and an unrecognised value is a 400). There is no weekly reset and no all-time
 counter in the UI path any more (the legacy `tokenTotalInput` / `tokenByModel`
 counters on the eval-config row and the `agentcore-hub-token-reset-weekly`
 cron were retired; the all-time `evalScores` / `evalSessionCount` fields are
@@ -152,8 +163,33 @@ Items are FLAT so each writer needs exactly one atomic `UpdateItem ... ADD`
 | `lambda/token-aggregator` | `tokensIn` (full prompt incl. cache), `tokensOut`, `cacheRead`, `cacheWrite`, `cacheWrite1h`, `calls`, `costUsd`, `m\|<model>\|<field>` | Strands `chat` spans (`strands.telemetry.tracer`) on Strands runtimes — the only record whose input count includes prompt-cache reads/writes; EMF `gen_ai.client.token.usage` metrics on managed harnesses; `claude_code.api_request` events on the coding runtime |
 | `lambda/eval-packager` (`aggregateScoresToDdb`) | `sessions`, `e\|<evaluator>\|sum`, `e\|<evaluator>\|count` | evaluator results, same deduped entries as the all-time aggregates |
 
-Both stamp `expiresAt = day + DAILY_RETAIN_DAYS (14)`; the table's TTL retires
-old days. Cost is computed read-side from `src/config/pricing.json`
+**The buckets are permanent.** TTL on this table is **disabled** (`deploy-all.sh`
+turns it off) and neither Lambda writes `expiresAt` any more, which is what makes
+the 30 / 90 / all-time windows answerable — a 14-day TTL had been deleting the
+history the wider windows need. `DAILY_RETAIN_DAYS` is gone from
+`deploy-token-aggregator.sh`. Rows written before the change still carry a stale
+`expiresAt` attribute; with TTL off it is inert, so there is nothing to clean up.
+
+**Persona rows.** All 18 pipeline personas share one runtime
+(`agentcore_hub_agent`), so that runtime's item is a rollup and a per-persona score
+is invisible in it. The packager therefore ALSO increments a second item keyed
+`PK <agentId>#<persona>` with the same score attributes (`sessions`,
+`e|<evaluator>|sum`, `e|<evaluator>|count`). Token and cost attributes
+(`m|<model>|<field>`) stay runtime-only — they are not attributable per persona.
+A persona is assigned only when the session id matches the FULL id the
+orchestrator mints for a run — `[<TICKET>_]<workflowId>-<agentId>-<13-digit ms>`
+(`SESSION_RE`, `lambda/eval-packager/lib/session-id.mjs`). Everything else is
+`_runtime` and gets no separate item, because it IS the rollup: the Invoke tab,
+the canary, the WM chat, and the `si-…`/`cc-…` sessions. Note that a non-pipeline
+id can still *end* in `-<agentId>-<13 digits>` — the improver mints
+`si-${agentId}-${Date.now()}` — so the persona split deliberately does NOT key
+off that suffix alone; `personaFor` is the single classifier both the results
+rows and these buckets go through. (The older, looser `ROLE_RE` suffix parse
+still exists and is still what the dependency-chain role guard uses; the two are
+intentionally different questions.) `splitDailyItems` in
+`src/lib/eval-metrics.ts` is what separates the two shapes read-side.
+
+Cost is computed read-side from `src/config/pricing.json`
 (`cachedInputDiscount`, `cacheWriteMultiplier` by TTL). Env var
 `EVAL_DAILY_TABLE` on both Lambdas and the app (default
 `agentcore-hub-eval-daily`).
@@ -161,9 +197,11 @@ old days. Cost is computed read-side from `src/config/pricing.json`
 Deploy / repair:
 
 ```bash
-bash deploy/continuous-improvement/deploy-all.sh                 # creates the table (+ TTL) with the other eval tables
+bash deploy/continuous-improvement/deploy-all.sh                # creates the tables, disables the eval-daily TTL
 bash deploy/continuous-improvement/deploy-token-aggregator.sh   # Lambda + per-shape subscription filters, deletes the weekly reset
-node deploy/continuous-improvement/backfill-daily.mjs --days 7  # rebuild the window from CW Logs Insights (idempotent, overwrites day items)
+# Rebuild day buckets by reconciling the results log groups (see below).
+# backfill-daily.mjs is a deprecation stub that exits 1.
+node deploy/continuous-improvement/backfill-results.mjs --from 2026-06-01 --to 2026-06-30
 ```
 
 Why the shapes matter: the previous aggregator only matched the EMF metric,
@@ -171,6 +209,142 @@ whose `input` type on Strands runtimes carries the *uncached* input (a few token
 per call once prompt caching is on) — the dashboard showed 3K in / 2M out for
 the shared runtime — and the coding runtime, which never emits that metric,
 always showed $0.
+
+### Per-result store: `agentcore-hub-eval-results`
+
+Aggregates alone could never explain a score. The hub kept an all-time sum/count
+per evaluator on the eval-config row plus 14 days of day buckets on a TTL, so a
+score could be *seen* but not *explained*, and no window wider than 14 days could
+be offered because the evidence had been deleted. `agentcore-hub-eval-results`
+(env `EVAL_RESULTS_TABLE`, created by `deploy-all.sh`) fixes that: **one row per
+judge result, `PAY_PER_REQUEST`, PITR on, no TTL, kept forever.**
+
+The evaluator results CloudWatch Logs groups
+(`/aws/bedrock-agentcore/evaluations/results/<configId>`) remain the **system of
+record**. This table is a queryable **mirror**, kept equal to them by a daily
+reconcile — if the two ever disagree, the log groups are right and a reconcile is
+the repair.
+
+**Keys.** PK `agentId` (S), SK `sk` (S) = `<evaluatedAt ISO>#<dedupKey>`, where
+`dedupKey` is the SAME key the cross-delivery seen-set uses. That shared key is
+what makes push, reconcile and backfill converge on one row: every write is a
+conditional `PutItem` with `attribute_not_exists(sk)`, so a second sighting of the
+same evaluation attempt is a counted duplicate, not a second row.
+
+**GSIs** (all `ProjectionType=ALL`):
+
+| Index | HASH | RANGE | Notes |
+|-------|------|-------|-------|
+| `bySession` | `gsi1pk` = `sessionId` | `gsi1sk` = `<evaluator>#<evaluatedAt>` | the session drilldown |
+| `byPersona` | `gsi2pk` = `<agentId>#<persona>` | `sk` | one persona's results over time |
+| `byWorkflow` | `gsi3pk` = `workflowId` | `sk` | **sparse** — only pipeline session ids parse into a `workflowId`, so canary / cloud-code / `si-` / chat rows never appear in it |
+
+**Row attributes**: `persona`, `sessionId`, `workflowId`, `ticketId`, `evaluator`,
+`day`, `evaluatedAt`, `score`, `scoreLabel`, `explanation` (truncated to 8192
+bytes, with `explanationTruncated: true` when it was), `errorType`,
+`errorMessage`, `status`, `statusReason`, `traceId`, `spanId`, `requestId`,
+`logGroup`, `source` (`push` | `reconcile`), `ingestedAt`.
+
+#### Two entry points, one code path
+
+`lambda/eval-packager/` is reached two ways and both run the same
+extract → dedup → role-guard → row-mapper → put chain:
+
+- **Push** — the CloudWatch Logs subscription filter calls the handler. Results
+  rows are written AFTER extract → in-delivery dedup → role guard and
+  **BEFORE** the config / enabled / sample-rate gates. That ordering is
+  deliberate: those gates govern the IMPROVER LOOP, not the record of what the
+  judge said, so a paused loop, a disabled agent or a 25%-sampled agent still
+  leaves a complete audit trail. The day buckets stay behind the gates
+  (behaviour unchanged) and the reconcile converges them.
+- **Reconcile** — `{ mode: "reconcile", days | from/to, group?, dryRun? }`,
+  handled *before* the `awslogs` decode. It re-reads the results log groups with
+  `DescribeLogGroups` + `FilterLogEvents` and pushes the events through that same
+  chain, then rewrites the day buckets with `SET` recomputed from the stored rows
+  — idempotent, where a second `ADD` would double-count. A reconcile **never**
+  touches the eval-config item (all-time scorecard, `sessionBuffer`,
+  `lastFlushedAt`), the seen-set, or the improver: it can neither flush a batch
+  nor synthesize a PRD. That is the whole reason a backfill over months of
+  history is safe to run.
+
+Two new fields land on the existing `AgentCoreHub/Evaluations` EMF record:
+`EvalResultsWritten` and `EvalResultsDuplicate`. A healthy steady state is mostly
+duplicates on the daily reconcile and mostly writes on the push path.
+
+#### `LEGACY_RESULTS_GROUPS_B64`
+
+Packager env var: **base64 of the compact JSON** of
+`deploy/evaluations/legacy-results-groups.json`. It is base64 because
+`aws lambda update-function-configuration --environment` takes a
+`Variables={K=V,...}` shell list that raw JSON cannot survive. Keys are results
+log-group leaf names (or a distinguishing substring), values are canonical
+`agentId`s; keys starting with `_` are metadata and are ignored. The map is
+consulted **before** the name-based `resolveAgentId()`, which would otherwise
+mis-attribute a pre-consolidation log group to one persona's `agentId`. Keep it
+small: it rides in the Lambda's 4KB env budget.
+
+#### Schedule and IAM
+
+- EventBridge rule **`agentcore-hub-eval-reconcile`**, `rate(1 day)` → the
+  packager with `{"mode":"reconcile","days":2}` (created by `deploy.sh`). Two days
+  of overlap covers a late-arriving judge result without re-reading history.
+- Inline policy **`EvalResultsAccess`** on the shared
+  `agentcore-hub-lambda-role`, added by `deploy.sh`: DynamoDB
+  `PutItem`/`Query`/`BatchGetItem` on the results table and its `/index/*`,
+  `logs:DescribeLogGroups`, and `logs:FilterLogEvents` on the results groups. It
+  is a separate, additive document, so it never fights the `DynamoDBAccess`
+  document that `deploy/setup-lambda-role.sh` writes.
+
+#### Backfill
+
+```bash
+node deploy/continuous-improvement/backfill-results.mjs \
+  --from YYYY-MM-DD --to YYYY-MM-DD [--dry-run] [--group <name>] [--region r]
+```
+
+One reconcile invoke per UTC day, printing per-day rows / duplicates / sessions
+plus a total. Idempotent by construction (the conditional `PutItem` plus the `SET`
+day-bucket rewrite), so re-running a range costs writes and changes nothing.
+`--dry-run` first is the habit. **`backfill-daily.mjs` is now a deprecation stub
+that exits 1** and points here.
+
+#### Reader surfaces
+
+The app reads this table through `src/lib/eval-results.ts` (query helpers for the
+four access patterns; the opaque `cursor` is base64 JSON of the DynamoDB
+`LastEvaluatedKey`) behind `GET /api/evaluations/timeseries`,
+`/api/evaluations/results` and `/api/evaluations/sessions/<sessionId>`. See
+[`docs/MODULES.md`](../../docs/MODULES.md) for the exact response shapes,
+including the results-route pagination seam (a session can straddle a page
+boundary; the session detail route is the authoritative per-session view).
+
+### Human handoff: prod rollout steps, in order
+
+The CI/CD pipeline ships Lambda **code only** — no `UpdateFunctionConfiguration`,
+no `iam:*`, no table creation. Tables, IAM, env and schedules are operator-run
+bash against the prod profile, in this order:
+
+1. `bash deploy/continuous-improvement/deploy-all.sh` — creates the results table
+   with PITR, and turns the `agentcore-hub-eval-daily` TTL off.
+2. `bash deploy/continuous-improvement/deploy.sh` — packager env
+   (`EVAL_RESULTS_TABLE`, `LEGACY_RESULTS_GROUPS_B64`), the `EvalResultsAccess`
+   policy, and the reconcile schedule.
+3. `bash deploy/continuous-improvement/deploy-token-aggregator.sh` — re-sets env
+   without `DAILY_RETAIN_DAYS`.
+4. `node deploy/continuous-improvement/backfill-results.mjs --from 2026-06-01 --to <today> --dry-run`,
+   then the same command live.
+5. Compare per-agent distinct sessions in the results table against the
+   `evalSessionCount` on the eval-config rows. `evalSessionCount` is approximate
+   under at-least-once delivery (see the concurrency model above), so expect
+   close-but-not-equal; an order-of-magnitude gap means a log group the map or the
+   backfill range missed.
+6. `PUT /api/evaluations/agents/agentcore_hub_coding_runtime {enabled:false}` —
+   the coding-runtime judge has no supported span scopes, so it fails 100% with
+   `ValidationException`. It is DISABLED, not deleted (the existing route flips
+   `executionStatus`), so the config and its results log group stay readable. See
+   the `coding_runtime_configs` note in `deploy/evaluations/eval-config-ids.json`.
+7. Confirm `agentcore-hub-eval-reconcile` fired once (rule metrics, or
+   `EvalResultsDuplicate` on the packager's EMF record).
 
 4. **S3 Batch Archive** (`fleet-imp-agent/batches/`):
    - The raw flushed batch (`{agentId, batchSize, flushedAt, sessions[]}`)
@@ -270,12 +444,19 @@ before this synthesis step existed.
 
 ### What it does
 
-1. **Creates both DynamoDB tables** with on-demand billing if they don't exist:
+1. **Creates the DynamoDB tables** with on-demand billing if they don't exist:
    - `agentcore-hub-eval-config` (PK `agentId`) — per-agent controls + session buffer
    - `agentcore-hub-eval-seen` (PK `dedupKey`) — the dedup seen-set, with TTL
-     enabled on `expiresAt`. Both the create and the TTL enable are idempotent:
-     a re-run skips an existing table and an already-`ENABLED` TTL rather than
-     aborting under `set -e`.
+     enabled on `expiresAt`.
+   - `agentcore-hub-eval-daily` (PK `agentId`, SK `day`) — the day buckets, and it
+     **disables** TTL on this table (permanent history).
+   - `agentcore-hub-eval-results` (PK `agentId`, SK `sk`) — one row per judge
+     result, with the `bySession` / `byPersona` / `byWorkflow` GSIs and PITR
+     enabled. No TTL, ever.
+
+   Every create, the TTL enable, the TTL disable and the PITR enable are
+   idempotent: a re-run skips an existing table, an already-`ENABLED` TTL and an
+   already-`DISABLED` one rather than aborting under `set -e`.
 2. **Seeds one eval-config row per agent** from `src/config/agents.json` with default eval configuration:
    - `enabled: true`
    - `sampleRate: 100` (100%)
@@ -285,8 +466,10 @@ before this synthesis step existed.
 The seed is idempotent — existing rows are not overwritten (`attribute_not_exists(agentId)` condition).
 
 Run `deploy-all.sh` **before** `deploy.sh`: the latter points the eval-packager
-Lambda's `EVAL_SEEN_TABLE` at the seen table created here (see the deploy-order
-comment at the top of `deploy.sh`).
+Lambda's `EVAL_SEEN_TABLE` and `EVAL_RESULTS_TABLE` at the tables created here and
+grants `EvalResultsAccess` against them (see the deploy-order comment at the top of
+`deploy.sh`). Deploying the packager first means every results write fails on a
+missing table.
 
 ### DDB Rows Created
 

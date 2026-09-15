@@ -1,21 +1,28 @@
 /**
- * GET /api/evaluations?days=7 — Fetch evaluation scorecard + per-agent metrics
+ * GET /api/evaluations?days=7|30|90|all — evaluation scorecard + per-agent metrics
  *
  * Sources: a Scan of agentcore-hub-eval-config (which agents exist) and a Scan
  * of agentcore-hub-eval-daily — one item per agent per UTC day, written by the
  * token-aggregator (tokens, cache, cost) and eval-packager (sessions, evaluator
- * scores) Lambdas. Every number is folded over the SAME rolling window — today
- * plus the previous (days - 1) UTC days; `days` clamps to 1..14 (bucket TTL).
- * No weekly reset, no all-time counters.
+ * scores) Lambdas. Every number is folded over the SAME window: today plus the
+ * previous (days - 1) UTC days, or every day on record for `days=all`.
+ *
+ * TEAM-4688: `days` was previously `Number(...)`-parsed and clamped to 14, so a
+ * 30- or 90-day request silently returned 14 days. It is now parsed against a
+ * closed set (7 | 30 | 90 | all) and an unknown value is a 400 — the operator
+ * never gets a period they didn't ask for. The same scan also carries per-agent
+ * PERSONA rows (PK `${agentId}#${persona}`), surfaced under `personas`.
  */
 
 import { NextRequest, NextResponse } from "next/server";
 import { getAllEvalConfigs, getAllEvalDaily } from "@/lib/eval-config";
 import {
-  DEFAULT_WINDOW_DAYS,
-  groupDailyItems,
+  ALLOWED_WINDOW_DAYS,
+  normalizeEvaluatorName,
+  parseWindow,
+  splitDailyItems,
   summarizeDaily,
-  windowDays,
+  windowDaysFor,
   type AgentWindowSummary,
   type Pricing,
 } from "@/lib/eval-metrics";
@@ -25,13 +32,6 @@ import pricingConfig from "@/config/pricing.json";
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
 export const fetchCache = "force-no-store";
-
-// Map raw CW Logs evaluator names to UI display names
-function normalizeEvaluatorName(raw: string): string {
-  if (raw.startsWith("Builtin.")) return raw.slice(8);
-  if (raw.includes("dependency_chain_compliance")) return "DependencyChainCompliance";
-  return raw;
-}
 
 // src/config/pricing.json is the single source of truth (shared with the
 // cost-report Lambda via the S3 config prefix); cache discount/surcharge included.
@@ -44,8 +44,13 @@ const AGENT_DISPLAY_NAMES = new Map(
     .map((a) => [a.agentId, a.displayName])
 );
 
-// In-memory cache, per window length
-const cache = new Map<number, { data: unknown; timestamp: number }>();
+// Personas are fleet agentIds that may share a runtime with the anchor agent, so
+// they are named off the FULL roster — not just the evaluations-enabled subset.
+const ALL_DISPLAY_NAMES = new Map(agentsConfig.agents.map((a) => [a.agentId, a.displayName]));
+
+// In-memory cache, keyed by the window STRING ("7" | "30" | "90" | "all"): keying
+// by day-count collided "all" with whatever number of days happened to be present.
+const cache = new Map<string, { data: unknown; timestamp: number }>();
 const CACHE_TTL_MS = 2 * 60 * 1000; // 2 minutes
 
 const EVALUATORS = [
@@ -62,10 +67,21 @@ const EVALUATORS = [
   "DependencyChainCompliance",
 ];
 
-type Scorecard = Record<string, Record<string, { avg: number; count: number; passing: number }>>;
+type EvaluatorScores = Record<string, { avg: number; count: number; passing: number }>;
+type Scorecard = Record<string, EvaluatorScores>;
 
-function scorecardFrom(summary: AgentWindowSummary): Record<string, { avg: number; count: number; passing: number }> | null {
-  const out: Record<string, { avg: number; count: number; passing: number }> = {};
+interface PersonaSummary {
+  persona: string;
+  displayName: string;
+  sessions: number;
+  calls: number;
+  cost: number;
+  costPerSession: number;
+  scores: EvaluatorScores | null;
+}
+
+function scorecardFrom(summary: AgentWindowSummary): EvaluatorScores | null {
+  const out: EvaluatorScores = {};
   for (const [rawEvaluator, data] of Object.entries(summary.evalScores)) {
     if (!data.count) continue;
     const avg = data.sum / data.count;
@@ -80,22 +96,29 @@ function scorecardFrom(summary: AgentWindowSummary): Record<string, { avg: numbe
 }
 
 export async function GET(req: NextRequest) {
-  const requested = Number(req.nextUrl.searchParams.get("days"));
-  const days = windowDays(Number.isFinite(requested) && requested > 0 ? requested : DEFAULT_WINDOW_DAYS);
-  const windowLen = days.length;
+  const spec = parseWindow(req.nextUrl.searchParams.get("days"));
+  if (!spec) {
+    return NextResponse.json(
+      { error: `Invalid days: expected one of ${ALLOWED_WINDOW_DAYS.join(", ")} or "all"` },
+      { status: 400 }
+    );
+  }
+  const cacheKey = String(spec.days);
 
-  const hit = cache.get(windowLen);
+  const hit = cache.get(cacheKey);
   if (hit && Date.now() - hit.timestamp < CACHE_TTL_MS) {
     return NextResponse.json(hit.data);
   }
 
   try {
     const [items, dailyItems] = await Promise.all([getAllEvalConfigs(), getAllEvalDaily()]);
-    const dailyByAgent = groupDailyItems(dailyItems);
+    const { byAgent, byPersona } = splitDailyItems(dailyItems);
+    const days = windowDaysFor(spec);
 
     const agents: string[] = [];
     const scorecard: Scorecard = {};
     const metrics: Record<string, Omit<AgentWindowSummary, "evalScores">> = {};
+    const personas: Record<string, PersonaSummary[]> = {};
 
     for (const item of items) {
       const agentId = item.agentId as string;
@@ -103,28 +126,65 @@ export async function GET(req: NextRequest) {
       if (!displayName) continue;
       agents.push(displayName);
 
-      const summary = summarizeDaily(dailyByAgent[agentId], days, PRICING);
+      const summary = summarizeDaily(byAgent[agentId], days, PRICING);
       const scores = scorecardFrom(summary);
       if (scores) scorecard[displayName] = scores;
 
       const { evalScores: _omit, ...rest } = summary;
       void _omit;
       metrics[displayName] = rest;
+
+      const perPersona = Object.entries(byPersona[agentId] || {})
+        .map(([persona, daily]): PersonaSummary => {
+          const s = summarizeDaily(daily, days, PRICING);
+          return {
+            persona,
+            displayName: ALL_DISPLAY_NAMES.get(persona) || persona,
+            sessions: s.sessions,
+            calls: s.calls,
+            cost: s.cost,
+            costPerSession: s.costPerSession,
+            scores: scorecardFrom(s),
+          };
+        })
+        .sort((a, b) => b.sessions - a.sessions || a.persona.localeCompare(b.persona));
+      if (perPersona.length) personas[displayName] = perPersona;
     }
+
+    // For a fixed window the bounds are the window itself; for "all" they are the
+    // oldest/newest day actually on record (retention is the real bound).
+    const bounds =
+      days === "all"
+        ? allTimeBounds(dailyItems)
+        : { start: days[0] ?? null, end: days[days.length - 1] ?? null };
 
     const responseData = {
       agents,
       scorecard,
       metrics,
+      personas,
       evaluators: EVALUATORS,
-      window: { days: windowLen, start: days[0], end: days[days.length - 1], timezone: "UTC" },
+      window: { days: spec.days, start: bounds.start, end: bounds.end, timezone: "UTC" },
+      windowLabel: spec.label,
       lastUpdated: new Date().toISOString(),
     };
 
-    cache.set(windowLen, { data: responseData, timestamp: Date.now() });
+    cache.set(cacheKey, { data: responseData, timestamp: Date.now() });
     return NextResponse.json(responseData);
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : "Unknown error";
     return NextResponse.json({ error: message }, { status: 500 });
   }
+}
+
+function allTimeBounds(dailyItems: Array<Record<string, unknown>>): { start: string | null; end: string | null } {
+  let start: string | null = null;
+  let end: string | null = null;
+  for (const item of dailyItems) {
+    const day = typeof item.day === "string" ? item.day : null;
+    if (!day) continue;
+    if (start === null || day < start) start = day;
+    if (end === null || day > end) end = day;
+  }
+  return { start, end };
 }

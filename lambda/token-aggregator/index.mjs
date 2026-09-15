@@ -30,15 +30,17 @@
  *   m|<model>|<field>          per-model counters (field = one of the above,
  *                              with input/output for tokensIn/tokensOut)
  *   sessions, e|<evaluator>|sum, e|<evaluator>|count   (written by eval-packager)
- *   expiresAt                  TTL = day + DAILY_RETAIN_DAYS
  * tokensIn is the FULL input (cache read + cache write + uncached) for every
  * shape. The dashboard (src/lib/eval-metrics.ts) applies ONE rolling window
- * to every row. No weekly reset; TTL retires old days.
+ * to every row. No weekly reset, and no TTL: day buckets are KEPT FOREVER so
+ * the historical cost/quality trend survives (TTL is disabled on the table by
+ * deploy/continuous-improvement/deploy-all.sh). Rows written before that change
+ * still carry a stale `expiresAt` attribute; it is no longer a TTL attribute, so
+ * nothing expires, and new writes stop stamping it.
  *
  * Environment Variables:
  *   EVAL_DAILY_TABLE  — per-day bucket table (default: agentcore-hub-eval-daily)
  *   ARTIFACTS_BUCKET  — S3 bucket for agents.json lookup
- *   DAILY_RETAIN_DAYS — days of buckets to keep, via TTL (default 14)
  */
 
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
@@ -60,7 +62,6 @@ if (!BUCKET) {
   );
 }
 const AGENTS_KEY = 'config/agents.json';
-export const RETAIN_DAYS = Math.max(7, Number(process.env.DAILY_RETAIN_DAYS) || 14);
 
 // ─── Agent resolution (cached per warm start) ──────────────────────────────
 let agentsCache = null;
@@ -235,15 +236,13 @@ export function modelAttr(model, field) {
   return `${MODEL_ATTR_PREFIX}${model}|${field}`;
 }
 
-export function expiresAtFor(day, retainDays = RETAIN_DAYS) {
-  const d = new Date(`${day}T00:00:00Z`);
-  d.setUTCDate(d.getUTCDate() + retainDays + 1);
-  return Math.floor(d.getTime() / 1000);
-}
-
+// No TTL stamp: day buckets are permanent (see the header), so `expiresAt` is
+// gone from the expression. `day` stays in the signature — it is the item's sort
+// key, every caller already has it, and dropping the parameter would churn all
+// call sites for nothing if a per-day clause ever comes back.
 export function buildAddExpression(day, models, now) {
-  const names = { '#expiresAt': 'expiresAt', '#updatedAt': 'updatedAt' };
-  const values = { ':now': now, ':ttl': expiresAtFor(day) };
+  const names = { '#updatedAt': 'updatedAt' };
+  const values = { ':now': now };
   const adds = [];
   const total = zeroModel();
   Object.entries(models).forEach(([model, delta], i) => {
@@ -262,7 +261,7 @@ export function buildAddExpression(day, models, now) {
     adds.push(`#t_${f} :t_${f}`);
   }
   return {
-    UpdateExpression: `SET #updatedAt = :now, #expiresAt = if_not_exists(#expiresAt, :ttl) ADD ${adds.join(', ')}`,
+    UpdateExpression: `SET #updatedAt = :now ADD ${adds.join(', ')}`,
     ExpressionAttributeNames: names,
     ExpressionAttributeValues: values,
     empty: adds.length === 0,
@@ -274,7 +273,7 @@ export const handler = async (event) => {
   // The weekly EventBridge reset is gone (rolling window replaces it). A stale
   // rule that still fires must not zero anything.
   if (event?.action === 'reset' || event?.['detail-type'] === 'token-reset') {
-    console.log('[token-agg] ignoring legacy reset event — day buckets expire via TTL');
+    console.log('[token-agg] ignoring legacy reset event — day buckets are permanent');
     return { statusCode: 200, body: 'reset-ignored' };
   }
 
