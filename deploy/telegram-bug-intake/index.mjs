@@ -643,33 +643,200 @@ function execPing({ kicker, subject, summary, bullets = [], meta = [], ask }) {
   return lines.join("\n");
 }
 
-// Flatten an agent-written ticket description into one phone-readable line:
-// drop code fences, turn [label](url) into label, strip bare workflows/…md
-// paths and Markdown syntax noise, collapse whitespace, clip. (The old code
-// dropped the description entirely because those raw paths rendered as broken
-// links — cleaning them lets us keep the actual prose.)
-function cleanDesc(s) {
-  if (typeof s !== "string") return "";
-  return s
-    .replace(/```[\s\S]*?```/g, " ")         // fenced code blocks
-    .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")  // [label](url) → label
-    .replace(/\bworkflows\/\S+/g, "")         // bare in-run artifact paths
-    .replace(/[#>*_`]/g, "")                  // residual Markdown syntax
-    .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, 400);
+// ─── The ONE approval-ping content builder (TEAM-4660) ───────────────────────
+// execPing above is the shared RENDERER; this is the shared CONTENT builder.
+// Before it, every approval site picked its own inputs, and two of them
+// (scanReviewGates, repageIfWindowOpened) accepted an agent-written gate ticket
+// as content: the title became the kicker (via gateLabel's slice(0,24) fallback)
+// and up to 400 chars of the description became the summary. A release-manager
+// deploy-gate ticket therefore paged as
+//   🚦 DEPLOY GATE: APPROVE APP REVIEW GATE — approval needed
+// followed by a console runbook full of execution ids and SHAs, while the
+// CodePipeline deploy ping — templated from buildDeployBrief — read cleanly.
+//
+// Rules encoded here, so no call site can re-litigate them:
+//   * the kicker comes from APPROVAL_KICKERS keyed by an ENUM. A freeform
+//     ticket title is never a kicker, in whole or in part.
+//   * the body is a subject (the RUN's title) + what is shipping + at most one
+//     curated summary line. A gate ticket's DESCRIPTION is not an input at all.
+//   * a re-paged gate says so once: "Attempt N — previous issue: …".
+//   * one hard length cap, enforced in one place.
+export const APPROVAL_TEXT_MAX = 900; // gate/approval pings — phone-readable
+const APPROVAL_SUBJECT_MAX = 120;
+const APPROVAL_SHIP_MAX = 3;        // shipping items rendered
+const APPROVAL_SHIP_ITEM_MAX = 60;
+const APPROVAL_REASON_MAX = 120;
+// Manager/dead-session pages carry orchestrator-authored evidence (details are
+// already clipped at ESC_DETAIL_MAX = 700) and are not the bug this fixes, so
+// they keep a wider budget rather than losing asserted body lines.
+const ESCALATION_TEXT_MAX = 1600;
+
+// gateKind → the EXACT kicker string. Two substrings are load-bearing for the
+// reply-to-ping rework router (gateFromReply): "REVIEW GATE" and
+// "SHIP-REVIEW ESCALATION". A reply to a ping carrying either, plus the 🎫
+// handle, is filed as a rework note — which is why `manager` and `dead-session`
+// deliberately contain NEITHER (a reply to those must not transition a gate).
+const APPROVAL_KICKERS = {
+  spec:              { kicker: "🚦 SPEC REVIEW GATE — approval needed",       max: APPROVAL_TEXT_MAX },
+  plan:              { kicker: "🚦 PLAN REVIEW GATE — approval needed",       max: APPROVAL_TEXT_MAX },
+  design:            { kicker: "🚦 DESIGN REVIEW GATE — approval needed",     max: APPROVAL_TEXT_MAX },
+  code:              { kicker: "🚦 CODE REVIEW GATE — approval needed",       max: APPROVAL_TEXT_MAX },
+  qa:                { kicker: "🚦 QA REVIEW GATE — approval needed",         max: APPROVAL_TEXT_MAX },
+  ship:              { kicker: "🚦 SHIP REVIEW GATE — approval needed",       max: APPROVAL_TEXT_MAX },
+  merge:             { kicker: "🚦 MERGE REVIEW GATE — approval needed",      max: APPROVAL_TEXT_MAX },
+  deploy:            { kicker: "🚦 DEPLOY REVIEW GATE — approval needed",     max: APPROVAL_TEXT_MAX },
+  review:            { kicker: "🚦 REVIEW GATE — approval needed",            max: APPROVAL_TEXT_MAX },
+  escalation:        { kicker: "🚨 SHIP-REVIEW ESCALATION — decision needed", max: APPROVAL_TEXT_MAX },
+  "deploy-pipeline": { kicker: "🚀 PRODUCTION DEPLOY — approval needed",      max: APPROVAL_TEXT_MAX },
+  manager:           { kicker: "🚨 WORKFLOW MANAGER ESCALATION",              max: ESCALATION_TEXT_MAX },
+  "dead-session":    { kicker: "🚨 DEAD SESSION",                             max: ESCALATION_TEXT_MAX },
+};
+
+/** The business-hours reminder variant of a kicker (a modifier, not a kind). */
+function repageKicker(kicker) {
+  return /—/.test(kicker)
+    ? kicker.replace(/\s*—\s*(?:approval|decision|input) needed$/, " · business-hours reminder")
+    : `${kicker} · business-hours reminder`;
 }
 
-// Short executive label for a review-gate kicker. Prefer the review-package
-// phase (spec/plan/design/dev/qa/ship); fall back to the gate ticket title.
-function gateLabel(gate, title) {
+const reLit = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+/**
+ * Shape stamp for builder-emitted approval text: line 1 is `*<a kicker from the
+ * table>*`. sendApprovalPing refuses anything else, so "this ping came from the
+ * builder" is true by construction and the guardrail test can assert it.
+ */
+export const APPROVAL_KICKER_RE = new RegExp(
+  `^\\*(?:${Object.values(APPROVAL_KICKERS).flatMap((k) => [k.kicker, repageKicker(k.kicker)]).map(reLit).join("|")})\\*`
+);
+
+const oneLine = (s) => String(s ?? "").replace(/\s+/g, " ").trim();
+
+/** "<run title> — shipping: A, B, C +N more" — the context line, never a runbook. */
+function shippingSubject(subject, shipping, n) {
+  const items = shipping.slice(0, Math.max(0, n)).map((s) => clipText(s, APPROVAL_SHIP_ITEM_MAX));
+  if (!items.length) return subject;
+  const more = shipping.length - items.length;
+  return `${subject} — shipping: ${items.join(", ")}${more > 0 ? ` +${more} more` : ""}`;
+}
+
+/**
+ * Compose an approval/gate ping. Structured inputs only.
+ * @param {object} o
+ * @param {string} o.gateKind      key of APPROVAL_KICKERS (an enum, not free text)
+ * @param {boolean} [o.repage]     business-hours reminder variant
+ * @param {string} o.subject       the RUN's title (never the gate ticket's title)
+ * @param {string[]} [o.shipping]  what is under review (upstream titles / brief lines)
+ * @param {string} [o.summary]     ONE curated line (review package / PR body) — never a description
+ * @param {string[]} [o.bullets]   curated bullets only
+ * @param {number} [o.attempt]     review cycle, 1-based
+ * @param {string} [o.previousIssue] why the last attempt came back
+ * @param {string[]} [o.meta]      pre-built, pre-escaped meta (the 🎫 handle lives here)
+ * @param {string} [o.ask]         the decision to make
+ * @returns {string} MarkdownV1 text, kicker-stamped and length-capped
+ */
+function buildApprovalMessage({
+  gateKind, repage = false, subject, shipping = [], summary,
+  bullets = [], attempt = 1, previousIssue, meta = [], ask,
+}) {
+  const entry = APPROVAL_KICKERS[gateKind] || APPROVAL_KICKERS.review;
+  const kicker = repage ? repageKicker(entry.kicker) : entry.kicker;
+  const subj = clipText(oneLine(subject), APPROVAL_SUBJECT_MAX);
+  const ship = (shipping || []).filter((s) => typeof s === "string" && s.trim()).map(oneLine);
+  const n = Math.floor(Number(attempt) || 1);
+  // ONE line, no history: the reviewer needs "this came back before, for this",
+  // not a changelog. Reason clamped to a single short line.
+  const attemptLine = n >= 2
+    ? `Attempt ${n} — previous issue: ${clipText(oneLine(previousIssue) || "changes requested on the previous attempt", APPROVAL_REASON_MAX)}`
+    : "";
+
+  let bl = (bullets || []).filter((b) => typeof b === "string" && b.trim());
+  let sum = oneLine(summary);
+  let shipN = Math.min(ship.length, APPROVAL_SHIP_MAX);
+
+  const render = () => execPing({
+    kicker,
+    subject: shippingSubject(subj, ship, shipN),
+    summary: [sum, attemptLine].filter(Boolean).join("\n"),
+    bullets: bl,
+    meta,
+    ask,
+  });
+
+  // Over budget: shed the least decision-critical content first. The kicker,
+  // the subject, the meta (🎫 handle → reply routing), the attempt line and the
+  // ask are never truncated.
+  const shrink = () => {
+    if (bl.length) { bl = bl.slice(0, -1); return true; }
+    if (sum) { sum = ""; return true; }
+    if (shipN > 0) { shipN -= 1; return true; }
+    return false;
+  };
+  let text = render();
+  while (text.length > entry.max && shrink()) text = render();
+  return text;
+}
+
+// Test seam (same convention as _resetBusinessWindowForTests): the guardrail
+// test renders each kicker directly to prove the escalation kinds stay out of
+// the reply-to-ping vocabulary and that the cap sheds the right content.
+export const _buildApprovalMessageForTests = buildApprovalMessage;
+
+/**
+ * Build + deliver a gate/approval ping. The ONLY sender the approval scans are
+ * allowed to use (asserted by __tests__/approval-builder-guardrail.test.mjs), so
+ * no site can hand Telegram text it composed itself.
+ * @returns {Promise<{delivered:number, text:string}>} delivered === 0 → the
+ * caller must release its claim, exactly as before.
+ */
+async function sendApprovalPing(chats, { keyboard, label = "approval", ...msgOpts }) {
+  const text = buildApprovalMessage(msgOpts);
+  if (!APPROVAL_KICKER_RE.test(text)) {
+    throw new Error(`approval ping text is not builder-stamped (gateKind=${msgOpts.gateKind})`);
+  }
+  let delivered = 0;
+  for (const chatId of chats) {
+    try { await tgSend(chatId, text, { reply_markup: keyboard }); delivered++; }
+    catch (err) { console.error(`[telegram-bug-intake] ${label} ping to ${chatId}`, err.message); }
+  }
+  return { delivered, text };
+}
+
+// review-package phase → gateKind.
+const GATE_PHASE_KINDS = [
+  ["requirement", "spec"], ["spec", "spec"], ["plan", "plan"],
+  ["design", "design"], ["dev", "code"], ["qa", "qa"], ["ship", "ship"],
+];
+// Gate-ticket title PREFIX (before the first ":") → gateKind. A CLOSED table:
+// the old fallback sliced 24 chars off whatever the agent wrote, so ids, SHAs
+// and "(3×)" landed in the kicker. Anything not listed here is just "review".
+const GATE_TITLE_KINDS = new Map([
+  ["deploy gate", "deploy"], ["deploy approval", "deploy"], ["deploy", "deploy"],
+  ["merge approval", "merge"], ["merge", "merge"],
+  ["handoff", "review"], ["review", "review"],
+  ["spec approval", "spec"], ["spec", "spec"],
+  ["plan approval", "plan"], ["plan", "plan"],
+  ["design approval", "design"], ["design", "design"],
+  ["code review", "code"], ["dev", "code"],
+  ["qa approval", "qa"], ["qa", "qa"], ["qa verification", "qa"],
+  ["ship approval", "ship"], ["ship", "ship"],
+]);
+// Never let an identifier-bearing prefix through, even if it matched the table.
+const UNSAFE_KICKER_RE = /\d{4}|\b[0-9a-f]{7,}\b|arn:/i;
+
+/**
+ * Which kicker does this gate get? The review-package phase wins; otherwise the
+ * ticket title's prefix is looked up in the closed table above; otherwise the
+ * generic review kicker. No path returns a substring of a freeform title.
+ */
+function gateKindOf(gate, title) {
   const g = String(gate || "").toLowerCase();
-  const map = [
-    ["requirement", "SPEC"], ["spec", "SPEC"], ["plan", "PLAN"],
-    ["design", "DESIGN"], ["dev", "CODE"], ["qa", "QA"], ["ship", "SHIP"],
-  ];
-  for (const [k, v] of map) if (g.includes(k)) return v;
-  return String(title || "REVIEW").toUpperCase().slice(0, 24);
+  for (const [k, v] of GATE_PHASE_KINDS) if (g.includes(k)) return v;
+  const prefix = oneLine(String(title || "").split(":")[0]).toLowerCase();
+  if (prefix && prefix.length <= 32 && !UNSAFE_KICKER_RE.test(prefix)) {
+    const hit = GATE_TITLE_KINDS.get(prefix);
+    if (hit) return hit;
+  }
+  return "review";
 }
 
 // ─── Working-hours gate paging (TEAM-4453 D3) ────────────────────────────────
@@ -897,17 +1064,6 @@ async function repageIfWindowOpened(wf, notif, w) {
 
     const title = gateTicket?.title || notif.ticketId;
     const reviewer = notif.reviewer || "reviewer";
-    const text = execPing({
-      kicker: `${gateLabel(notif.gate, title)} REVIEW · business-hours reminder`,
-      subject: wf.input?.title || wf.workflowId,
-      summary: `${title} was sent for review outside working hours and is still open. Your window is open now.`,
-      meta: [
-        `👤 ${esc(reviewer)}`,
-        `🎫 [${notif.ticketId}](https://${JIRA_SITE_URL}/browse/${notif.ticketId})`,
-        "⏸ pipeline paused on you",
-      ],
-      ask: "Approve to continue, or Request changes to send it back.",
-    });
     const keyboard = { inline_keyboard: [
       [
         { text: "✅ Approve", callback_data: `gok|${notif.ticketId}|${wf.workflowId}` },
@@ -919,11 +1075,25 @@ async function repageIfWindowOpened(wf, notif, w) {
       }],
     ] };
 
-    let delivered = 0;
-    for (const chatId of chats) {
-      await tgSend(chatId, text, { reply_markup: keyboard });
-      delivered++;
-    }
+    // Same content rules as the request-time page (TEAM-4660): the gate
+    // ticket's title/description never reach the reminder either.
+    const attempt = approvalAttempt({ wf, notif });
+    const { delivered } = await sendApprovalPing(chats, {
+      label: "business-hours reminder",
+      gateKind: ESCALATION_GATE_TITLE.test(title) ? "escalation" : gateKindOf(notif.gate, title),
+      repage: true,
+      subject: wf.input?.title || wf.workflowId,
+      summary: "Sent for review outside working hours and still open — your window is open now.",
+      attempt,
+      previousIssue: attempt >= 2 ? await readGateRework(notif.ticketId) : undefined,
+      meta: [
+        `👤 ${esc(reviewer)}`,
+        `🎫 [${notif.ticketId}](https://${JIRA_SITE_URL}/browse/${notif.ticketId})`,
+        "⏸ pipeline paused on you",
+      ],
+      ask: "Approve to continue, or Request changes to send it back.",
+      keyboard,
+    });
     if (!delivered) await releaseKey(holding);
   } catch (err) {
     console.error(`[telegram-bug-intake] business-hours reminder for ${notif.ticketId}`, err.message);
@@ -980,15 +1150,18 @@ async function scanReviewGates() {
 
       // Pull the whole ticket set so the ping is SELF-CONTAINED — the reviewer
       // decides from Telegram without opening the hub. From it we take: the gate
-      // ticket's title + cleaned description, and the titles of the UPSTREAM work
-      // it blocks on (blockedBy) — i.e. exactly what is being reviewed.
+      // ticket's title (for CLASSIFICATION only — never rendered, TEAM-4660), the
+      // titles of the UPSTREAM work it blocks on (blockedBy) — i.e. exactly what
+      // is being reviewed — and the sibling gates that came before it.
       let title = notif.ticketId;
       let gateTicket = null;
       let upstreamTitles = [];
+      let allTickets = [];
       try {
         const tRes = await fetch(`${HUB_API_URL}/api/workflow/${wf.workflowId}/tickets`);
         if (tRes.ok) {
           const { tickets = [] } = await tRes.json();
+          allTickets = tickets;
           gateTicket = tickets.find((x) => x.ticketId === notif.ticketId) || null;
           if (gateTicket?.title) title = gateTicket.title;
           const byId = new Map(tickets.map((x) => [x.ticketId, x]));
@@ -1001,43 +1174,19 @@ async function scanReviewGates() {
 
       const reviewer = notif.reviewer || "reviewer";
       const isEscalation = ESCALATION_GATE_TITLE.test(title);
-      const gateName = gateLabel(notif.gate, title);
       const ticketLink = `🎫 [${notif.ticketId}](https://${JIRA_SITE_URL}/browse/${notif.ticketId})`;
-      // Body content, best source first: the closing agent's curated review
-      // package (summary/bullets), else the gate ticket's own description, else
-      // the list of upstream items under review. The ping is never empty.
-      const pkgSummary = typeof notif.summary === "string" ? notif.summary.trim() : "";
-      const desc = cleanDesc(gateTicket?.description);
-      const summary =
-        pkgSummary ||
-        desc ||
-        (upstreamTitles.length
-          ? `Reviewing ${upstreamTitles.length} completed item${upstreamTitles.length === 1 ? "" : "s"} before this phase proceeds.`
-          : `${title} is ready for your review.`);
-      const bullets =
-        (Array.isArray(notif.bullets) && notif.bullets.length)
-          ? notif.bullets
-          : upstreamTitles; // the actual work under review = "What changed"
+      // WHAT is being reviewed: the upstream work this gate blocks on, else the
+      // PR the run has already opened. Never the gate ticket's own prose.
+      const shipping = upstreamTitles.length
+        ? upstreamTitles
+        : (wf.delivery?.prUrl ? [`PR ${wf.delivery.prUrl}`] : []);
+      // Only the closing agent's CURATED review package may speak here — a gate
+      // ticket description is a runbook for the human, not ping copy.
+      const attempt = approvalAttempt({ wf, notif, tickets: allTickets });
+      const previousIssue = attempt >= 2 ? await readGateRework(notif.ticketId) : undefined;
       // TEAM-3971: a ship-review escalation needs a DECISION, not a bare approve
       // (a bare approve used to park the release manager forever). Offer the
       // three decisions as buttons; each records a `DECISION:` line on the gate.
-      const text = isEscalation
-        ? execPing({
-            kicker: `🚨 SHIP-REVIEW ESCALATION — ${gateName}`,
-            subject: wf.input?.title || wf.workflowId,
-            summary: summary || "The ship-review loop hit its round cap and needs a human call.",
-            bullets,
-            meta: [`👤 ${esc(reviewer)}`, ticketLink],
-            ask: "Pick ONE decision below — it is recorded as a DECISION line and the release manager resumes on its own.",
-          })
-        : execPing({
-            kicker: `🚦 ${gateName} REVIEW GATE — approval needed`,
-            subject: wf.input?.title || wf.workflowId,
-            summary: summary || `${title} is ready for your review.`,
-            bullets,
-            meta: [`👤 ${esc(reviewer)}`, ticketLink, "⏸ pipeline paused on you"],
-            ask: "Approve to continue, or Request changes to send it back.",
-          });
       const keyboard = { inline_keyboard: isEscalation
         ? [
             [{ text: "✅ Merge with known findings", callback_data: `gdc|m|${notif.ticketId}|${wf.workflowId}` }],
@@ -1072,11 +1221,25 @@ async function scanReviewGates() {
         if (url) keyboard.inline_keyboard.push([{ text: `📄 ${l.label}`.slice(0, 60), url }]);
       }
 
-      let delivered = 0;
-      for (const chatId of chats) {
-        try { await tgSend(chatId, text, { reply_markup: keyboard }); delivered++; }
-        catch (err) { console.error(`[telegram-bug-intake] gate ping to ${chatId}`, err.message); }
-      }
+      const { delivered } = await sendApprovalPing(chats, {
+        label: "gate",
+        gateKind: isEscalation ? "escalation" : gateKindOf(notif.gate, title),
+        subject: wf.input?.title || wf.workflowId,
+        shipping,
+        summary: isEscalation
+          ? (oneLine(notif.summary) || "The ship-review loop hit its round cap and needs a human call.")
+          : oneLine(notif.summary),
+        bullets: Array.isArray(notif.bullets) ? notif.bullets : [],
+        attempt,
+        previousIssue,
+        meta: isEscalation
+          ? [`👤 ${esc(reviewer)}`, ticketLink]
+          : [`👤 ${esc(reviewer)}`, ticketLink, "⏸ pipeline paused on you"],
+        ask: isEscalation
+          ? "Pick ONE decision below — it is recorded as a DECISION line and the release manager resumes on its own."
+          : "Approve to continue, or Request changes to send it back.",
+        keyboard,
+      });
       // The claim was written before delivery was proven; if every send failed,
       // keeping it would silently skip this gate for 30 days.
       if (!delivered) await releaseGate(notif);
@@ -1132,6 +1295,112 @@ async function releaseGate(notif) {
   }));
 }
 
+// ─── Attempt / previous issue (TEAM-4660) ────────────────────────────────────
+// Nothing upstream counts review cycles: gate-state.mjs has no attempt counter
+// and the notification carries no attempt/reason field, which is why a release
+// manager resorted to writing "(3×)" into the ticket TITLE. Both signals are
+// therefore derived here, from data already on the wire, and no orchestrator
+// field is invented.
+const GATE_REWORK_PREFIX = "gaterework#";
+
+/** ms sort key for a review cycle: explicit timestamp, else the ISO minted into notif.id. */
+function notifOrderKey(n) {
+  const t = Date.parse(n?.timestamp || "");
+  if (Number.isFinite(t)) return t;
+  const m = String(n?.id || "").match(/\d{4}-\d{2}-\d{2}T[\d:.]+Z/);
+  const fromId = m ? Date.parse(m[0]) : NaN;
+  return Number.isFinite(fromId) ? fromId : null; // null → fall back to array position
+}
+
+const titlePrefix = (s) => oneLine(String(s || "").split(":")[0]).toLowerCase();
+
+/**
+ * Which review cycle is this, 1-based? Two sources, both defensive — an
+ * unparseable row must never cost the ping:
+ *  1. earlier unacked-or-acked review_needed rows for the SAME gate ticket
+ *     (the orchestrator mints a fresh notif per park), ordered by timestamp,
+ *     else by the id's ISO, else by position in the append-only array.
+ *  2. release-manager follow-ups, which are a NEW ticket per attempt rather
+ *     than a re-park: same title prefix, earlier createdAt, in the same run.
+ *     Prefix + createdAt is the provider-agnostic signal (Jira mode drops
+ *     `labels` in src/lib/workflow/jira-read.ts); labels only narrow it when
+ *     the field survives (dynamodb mode).
+ */
+function approvalAttempt({ wf, notif, tickets = [] }) {
+  try {
+    const all = Array.isArray(wf?.humanNotifications) ? wf.humanNotifications : [];
+    const selfIdx = all.indexOf(notif);
+    const selfKey = notifOrderKey(notif);
+    let earlier = 0;
+    all.forEach((n, i) => {
+      if (!n || n === notif || i === selfIdx) return;
+      if (n.id && notif.id && n.id === notif.id) return;
+      if (n.type !== "review_needed" || n.ticketId !== notif.ticketId) return;
+      const k = notifOrderKey(n);
+      const before = k !== null && selfKey !== null ? k < selfKey : selfIdx >= 0 && i < selfIdx;
+      if (before) earlier++;
+    });
+
+    // A gate with a review package is re-parked, never re-filed, so the sibling
+    // count only applies to the package-less (release-manager-authored) case.
+    const self = tickets.find((t) => t?.ticketId === notif.ticketId);
+    const prefix = titlePrefix(self?.title);
+    const selfAt = Date.parse(self?.createdAt || "");
+    if (!notif.gate && prefix && GATE_TITLE_KINDS.has(prefix) && Number.isFinite(selfAt)) {
+      let siblings = 0;
+      for (const t of tickets) {
+        if (!t || t.ticketId === notif.ticketId) continue;
+        if (titlePrefix(t.title) !== prefix) continue;
+        const at = Date.parse(t.createdAt || "");
+        if (!Number.isFinite(at) || at >= selfAt) continue;
+        if (Array.isArray(t.labels) && Array.isArray(self.labels) && self.labels.length
+          && !t.labels.some((l) => self.labels.includes(l))) continue;
+        siblings++;
+      }
+      earlier += Math.min(siblings, 5);
+    }
+    return 1 + earlier;
+  } catch {
+    return 1;
+  }
+}
+
+/**
+ * Remember WHY a gate came back, so the next page can say it in one line. The
+ * note lives in a ticket comment, and neither ticket provider puts comments on
+ * the /tickets wire, so the bridge records what it delivered itself. Overwrites:
+ * the latest rejection is the one the next attempt has to answer.
+ */
+async function recordGateRework(ticketId, reason) {
+  if (!ticketId) return;
+  try {
+    await ddb.send(new PutItemCommand({
+      TableName: PENDING_TABLE,
+      Item: {
+        id: { S: `${GATE_REWORK_PREFIX}${ticketId}` },
+        reason: { S: clipText(oneLine(reason) || "changes requested", APPROVAL_REASON_MAX) },
+        at: { S: new Date().toISOString() },
+        ttl: { N: String(Math.floor(Date.now() / 1000) + 30 * 86400) },
+      },
+    }));
+  } catch (err) {
+    console.warn(`[telegram-bug-intake] rework reason for ${ticketId} not recorded:`, err.message);
+  }
+}
+
+/** Best-effort: a missing row just means the Attempt line carries no reason. */
+async function readGateRework(ticketId) {
+  if (!ticketId) return undefined;
+  try {
+    const { Item } = await ddb.send(new GetItemCommand({
+      TableName: PENDING_TABLE, Key: { id: { S: `${GATE_REWORK_PREFIX}${ticketId}` } },
+    }));
+    return Item?.reason?.S || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 async function handleGateCallback(cb, chatId, action, ticketId, workflowId) {
   // Gate pings go to every registered chat, but only allowlisted chats may
   // transition tickets. Ack the tap (or Telegram re-sends the callback query)
@@ -1160,6 +1429,9 @@ async function handleGateCallback(cb, chatId, action, ticketId, workflowId) {
   // chat's next plain message — or a reply to this ping, any time — becomes
   // the note (resolveReworkTarget → deliverReworkNote).
   await putPendingRejection(chatId, ticketId, workflowId);
+  // Placeholder reason NOW, so the re-park page carries an Attempt line even if
+  // the note never arrives; deliverReworkNote overwrites it with the real note.
+  await recordGateRework(ticketId, "changes requested");
   await tgAnswer(cb.id, "Reply with what needs to change.");
   await tgEdit(chatId, cb.message.message_id,
     `${cb.message.text}\n\n❌ Changes requested — reply with a note describing what to change (your next message here, or a reply to this message later). It goes to the agents as rework context. ` +
@@ -1317,6 +1589,8 @@ async function deliverReworkNote(chatId, { ticketId, workflowId }, text) {
       ]] } });
     return false;
   }
+  // The note IS the previous issue for whatever this gate becomes next cycle.
+  await recordGateRework(ticketId, text);
   await deletePendingRejection(chatId);
   await tgSend(chatId, `❌ *${esc(ticketId)}* — changes requested. Your note is on the ticket; upstream work re-opens for rework.`);
   return true;
@@ -1462,7 +1736,7 @@ const DEAD_SESSION_SUMMARY = {
 };
 
 /**
- * Render a dead-session page through the ONE exec shape. Legacy rows (the
+ * The dead-session page's inputs for buildApprovalMessage. Legacy rows (the
  * pre-FR-3 evidence-free notification, and anything written while the flag is
  * off) carry no disposition/evidence — they fall back to their own details text
  * and still get the DEAD SESSION kicker, because the DECISION is the same.
@@ -1474,8 +1748,8 @@ function deadSessionPing(wf, notif, legacyDetails) {
   const children = Array.isArray(notif.children) ? notif.children : [];
   const artifacts = notif.artifacts || {};
   const tid = notif.ticketId || "";
-  return execPing({
-    kicker: "🚨 DEAD SESSION",
+  return {
+    gateKind: "dead-session",
     subject: `${tid || wf.workflowId} · ${clipText(notif.ticketTitle || notif.title || wf.input?.title || "", 80)}`,
     summary,
     bullets: [
@@ -1495,7 +1769,7 @@ function deadSessionPing(wf, notif, legacyDetails) {
     ask: disposition === "parked"
       ? "Approve the escalation gate to re-run the agent, then tap Resolved."
       : "Tap Resolved once handled — the watch scheduler skips this run while the escalation is open.",
-  });
+  };
 }
 
 async function scanManagerEscalations() {
@@ -1531,15 +1805,15 @@ async function scanManagerEscalations() {
 
       const details = String(notif.details || notif.message || "").trim();
       const clipped = details.length > ESC_DETAIL_MAX ? `${details.slice(0, ESC_DETAIL_MAX)}…` : details;
-      const text = DEAD_SESSION_REVIEWERS.has(String(notif.reviewer || ""))
+      const msg = DEAD_SESSION_REVIEWERS.has(String(notif.reviewer || ""))
         ? deadSessionPing(wf, notif, clipped)
-        : execPing({
-            kicker: "🚨 WORKFLOW MANAGER ESCALATION",
+        : {
+            gateKind: "manager",
             subject: wf.input?.title || wf.workflowId,
             summary: clipped,
             meta: ["⏸ run parked until you resolve"],
             ask: "Tap Resolved once handled — the watch scheduler skips this run while the escalation is open.",
-          });
+          };
       // The keyboard + claim keys are deliberately IDENTICAL for both shapes:
       // resolving is the same action whichever page you are looking at.
       const keyboard = { inline_keyboard: [
@@ -1547,11 +1821,7 @@ async function scanManagerEscalations() {
         [{ text: "📱 Open run in hub", url: `${HUB_API_URL}/workflow?id=${encodeURIComponent(wf.workflowId)}` }],
       ] };
 
-      let delivered = 0;
-      for (const chatId of chats) {
-        try { await tgSend(chatId, text, { reply_markup: keyboard }); delivered++; }
-        catch (err) { console.error(`[telegram-bug-intake] escalation ping to ${chatId}`, err.message); }
-      }
+      const { delivered } = await sendApprovalPing(chats, { ...msg, label: "escalation", keyboard });
       if (!delivered) await releaseKey(`${ESC_KEY_PREFIX}${notif.id}`);
     } catch (err) {
       await releaseKey(`${ESC_KEY_PREFIX}${notif.id}`).catch((relErr) =>
@@ -1838,9 +2108,11 @@ async function scanDeployApprovalsForTarget(target) {
     // bare pipeline name is not enough for a human to know what they are shipping.
     const meta = [`🏷 ${esc(target.pipeline)}`];
     if (target.repo) meta.push(`📦 ${esc(target.repo)}`);
-    const text = brief
-      ? execPing({
-          kicker: "🚀 PRODUCTION DEPLOY — approval needed",
+    // Both shapes go through the same builder as every other approval ping
+    // (TEAM-4660) — this path was already templated, so only the seam changes.
+    const msg = brief
+      ? {
+          gateKind: "deploy-pipeline",
           subject: brief.prTitle || brief.commitSubject || target.pipeline,
           summary: brief.summary || "",                       // one-line what/why from the PR body
           bullets: [
@@ -1850,14 +2122,14 @@ async function scanDeployApprovalsForTarget(target) {
           ].filter(Boolean),
           meta,
           ask: deployAsk,
-        })
-      : execPing({
-          kicker: "🚀 PRODUCTION DEPLOY — approval needed",
+        }
+      : {
+          gateKind: "deploy-pipeline",
           subject: target.pipeline,
           summary: "The build passed every gate and is waiting on you to ship it to prod.",
           meta,
           ask: deployAsk,
-        });
+        };
 
     const rows = [[
       { text: "🚀 Approve deploy", callback_data: `dok|${claimed.key}` },
@@ -1870,11 +2142,7 @@ async function scanDeployApprovalsForTarget(target) {
     if (linkRow.length) rows.push(linkRow);
     const keyboard = { inline_keyboard: rows };
 
-    let delivered = 0;
-    for (const chatId of chats) {
-      try { await tgSend(chatId, text, { reply_markup: keyboard }); delivered++; }
-      catch (err) { console.error(`[telegram-bug-intake] deploy approval ping to ${chatId}`, err.message); }
-    }
+    const { delivered } = await sendApprovalPing(chats, { ...msg, label: "deploy approval", keyboard });
     if (!delivered) await releaseDeployApproval(claimed.key);
   } catch (err) {
     await releaseDeployApproval(claimed.key).catch((relErr) =>
