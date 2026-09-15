@@ -220,7 +220,7 @@ test.describe("Workflow Page — cancel flow", () => {
   // Creates a REAL run on whatever hub the server points at. Against a
   // prod-wired server this filed TEAM-4565/TEAM-4567 (2026-09-14), so it is
   // opt-in: E2E_LIVE_WRITES=1 npx playwright test tests/tab-workflow.spec.ts
-  test.skip(!process.env.E2E_LIVE_WRITES, "creates a real workflow — set E2E_LIVE_WRITES=1 to run");
+  test.skip(process.env.E2E_LIVE_WRITES !== "1", "creates a real workflow — set E2E_LIVE_WRITES=1 (the literal) to run");
 
   test("cancel button + modal flow on a fresh workflow", async ({ page }) => {
     test.setTimeout(60_000);

@@ -1318,6 +1318,21 @@ async function harvestCompletionEvidence(workflow, ticketId) {
   }
 }
 
+/**
+ * Last look before an invoke: consistent re-read of the run. The claim CAS
+ * refuses a run cancelled BEFORE the claim and the advancePhase CAS one
+ * cancelled before an advance — but a same-phase dispatch (a second dev or
+ * design ticket) advances nothing, so a cancel landing after its claim was
+ * invisible to it (Codex review on #606). Nothing can close the read→invoke
+ * gap entirely; this shrinks it to the invoke call itself.
+ */
+async function workflowStillLive(workflow, ticketId, assignee) {
+  const fresh = await store.getWorkflow(workflow.id);
+  if (fresh && !fresh.cancelledAt && !TERMINAL_WORKFLOW_PHASES.includes(fresh.phase)) return true;
+  console.log(`[orchestrator] GUARD: workflow ${workflow.id} is ${fresh ? fresh.phase : "gone"}${fresh?.cancelledAt ? " (cancelled)" : ""} — not invoking ${assignee} for ${ticketId}`);
+  return false;
+}
+
 async function claimTicketInvocation(workflow, ticketId, assignee) {
   const now = new Date().toISOString();
   const taskId = workflow.agentTasks?.[ticketId]?.id || `task_${Date.now()}_${assignee}`;
@@ -2660,6 +2675,8 @@ async function handleTicketReadyUnified(ticketId, ticket) {
     await publishEvent(ticketId, "workflow.phase_change", { phase: ticketPhase, workflowId: workflow.id });
   }
 
+  if (!(await workflowStillLive(workflow, ticketId, assignee))) return;
+
   // Build context and invoke — SAME buildAgentContext for both paths
   let context = await buildAgentContext(ticket, workflow);
 
@@ -3109,6 +3126,8 @@ async function handleTicketReady(ticketId, image) {
     workflow.phase = ticketPhase;
     await publishEvent(ticketId, "workflow.phase_change", { phase: ticketPhase, workflowId: workflow.id });
   }
+
+  if (!(await workflowStillLive(workflow, ticketId, assignee))) return;
 
   // Build context and invoke agent
   const ticket = await getTicket(ticketId);

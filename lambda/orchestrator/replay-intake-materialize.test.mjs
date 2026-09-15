@@ -612,18 +612,23 @@ describe("6. Jira twin — the phase:<p> label drives the dispatch", () => {
 describe("7. a cancel that lands after the dispatcher's read never dispatches or un-cancels the run", () => {
   beforeEach(async () => { await load(); });
 
+  // The dispatcher holds the row it read (resolveWorkflow's raw GetItem); the
+  // cancel route writes the STORED row. Model that by giving the store a fresh
+  // object before stamping it, so the dispatcher's copy stays pre-cancel — as
+  // in prod, where its in-memory row is a snapshot, not a live view.
   const cancelNow = () => {
-    h.state.workflow.phase = "cancelled";
-    h.state.workflow.cancelledAt = "2026-09-14T04:22:52.213Z";
+    h.state.workflow = { ...h.state.workflow, phase: "cancelled", cancelledAt: "2026-09-14T04:22:52.213Z" };
+  };
+  const wrapClaim = (fn) => {
+    const realClaim = storeMock.claimInvocation.getMockImplementation();
+    storeMock.claimInvocation.mockImplementationOnce((...args) => fn(realClaim, args));
   };
 
   it("cancel between the workflow read and the claim → claim refused, no invoke, no phase_change", async () => {
     await replaySkeletonWrites();
-    // The dispatcher gets a pre-cancel snapshot; the cancel lands right after.
-    storeMock.getWorkflow.mockImplementationOnce(async () => {
-      const snapshot = { ...h.state.workflow, agentTasks: { ...h.state.workflow.agentTasks } };
-      cancelNow();
-      return snapshot;
+    wrapClaim(async (realClaim, args) => {
+      cancelNow(); // lands after the dispatcher's read, before its claim
+      return realClaim(...args);
     });
 
     await replaySentinelUnblock();
@@ -637,8 +642,7 @@ describe("7. a cancel that lands after the dispatcher's read never dispatches or
 
   it("cancel between the claim and the phase advance → advance refused, no invoke, phase stays cancelled", async () => {
     await replaySkeletonWrites();
-    const realClaim = storeMock.claimInvocation.getMockImplementation();
-    storeMock.claimInvocation.mockImplementationOnce(async (...args) => {
+    wrapClaim(async (realClaim, args) => {
       const ok = await realClaim(...args);
       cancelNow();
       return ok;
@@ -650,6 +654,26 @@ describe("7. a cancel that lands after the dispatcher's read never dispatches or
     expect(invokedFor(BUILD)).toHaveLength(0);
     expect(dispatchesFor(BUILD)).toHaveLength(0);
     expect(eventsOf("workflow.phase_change")).toHaveLength(0);
+    expect(h.state.workflow.phase).toBe("cancelled");
+  });
+
+  it("same-phase dispatch (no advance to CAS) + cancel after the claim → still no invoke (Codex #606)", async () => {
+    await replaySkeletonWrites();
+    // The run is already in the build ticket's phase, so the dispatcher has no
+    // advancePhase write to lose — only the pre-invoke re-read can see the cancel.
+    h.state.workflow.phase = "development";
+    wrapClaim(async (realClaim, args) => {
+      const ok = await realClaim(...args);
+      cancelNow();
+      return ok;
+    });
+
+    await replaySentinelUnblock();
+
+    expect(h.state.claims.filter((c) => c.ticketId === BUILD && c.ok)).toHaveLength(1);
+    expect(storeMock.advancePhase).not.toHaveBeenCalled();
+    expect(invokedFor(BUILD)).toHaveLength(0);
+    expect(dispatchesFor(BUILD)).toHaveLength(0);
     expect(h.state.workflow.phase).toBe("cancelled");
   });
 
