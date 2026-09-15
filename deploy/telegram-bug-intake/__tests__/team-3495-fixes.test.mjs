@@ -27,7 +27,7 @@ const HUB = "https://hub.example.invalid";
 
 // ─── AWS SDK mocks (hoisted, shared state) ───────────────────────────────────
 
-const db = vi.hoisted(() => ({ items: new Map(), puts: [], deletes: [] }));
+const db = vi.hoisted(() => ({ items: new Map(), puts: [], deletes: [], updates: [] }));
 // Publishing gate.requested (TEAM-4453 D3) is best-effort in index.mjs, so an
 // unmocked EventBridge does not fail a test — it silently reaches real AWS and
 // logs the AccessDenied. Stubbed here to keep this suite hermetic; the event
@@ -36,10 +36,15 @@ vi.mock("@aws-sdk/client-eventbridge", () => ({
   EventBridgeClient: class { async send() { return { FailedEntryCount: 0 }; } },
   PutEventsCommand: class { constructor(input) { this.input = input; } },
 }));
-vi.mock("@aws-sdk/client-dynamodb", () => {
+vi.mock("@aws-sdk/client-dynamodb", async () => {
+  // TEAM-4663: the handler now UPDATES claim rows (two-phase claim). One
+  // shared evaluator, because a fake that replaces instead of merging would
+  // hide a real regression — see helpers/ddb-fake.mjs.
+  const { applyUpdate } = await import("./helpers/ddb-fake.mjs");
   const cmd = (op) => class { constructor(input) { this.input = input; this.op = op; } };
   const GetItemCommand = cmd("get");
   const PutItemCommand = cmd("put");
+  const UpdateItemCommand = cmd("update");
   const DeleteItemCommand = cmd("del");
   const ScanCommand = cmd("scan");
   class DynamoDBClient {
@@ -65,10 +70,11 @@ vi.mock("@aws-sdk/client-dynamodb", () => {
         const p = c.input.ExpressionAttributeValues[":p"].S;
         return { Items: [...db.items.values()].filter((i) => i.id.S.startsWith(p)) };
       }
+      if (c.op === "update") return applyUpdate(db, c.input);
       throw new Error(`unexpected ddb op ${c.op}`);
     }
   }
-  return { DynamoDBClient, GetItemCommand, PutItemCommand, DeleteItemCommand, ScanCommand };
+  return { DynamoDBClient, GetItemCommand, PutItemCommand, UpdateItemCommand, DeleteItemCommand, ScanCommand };
 });
 
 const transcribeRec = vi.hoisted(() => ({ calls: 0 }));
@@ -178,7 +184,7 @@ const realFetch = global.fetch;
 beforeEach(() => {
   db.items.clear();
   db.puts.length = 0;
-  db.deletes.length = 0;
+  db.deletes.length = 0; db.updates.length = 0;
   transcribeRec.calls = 0;
 });
 

@@ -68,9 +68,9 @@
  */
 
 import { BedrockRuntimeClient, ConverseCommand } from "@aws-sdk/client-bedrock-runtime";
-import { DynamoDBClient, GetItemCommand, PutItemCommand, DeleteItemCommand, ScanCommand } from "@aws-sdk/client-dynamodb";
+import { DynamoDBClient, GetItemCommand, PutItemCommand, UpdateItemCommand, DeleteItemCommand, ScanCommand } from "@aws-sdk/client-dynamodb";
 import { TranscribeStreamingClient, StartStreamTranscriptionCommand } from "@aws-sdk/client-transcribe-streaming";
-import { CodePipelineClient, GetPipelineStateCommand, PutApprovalResultCommand } from "@aws-sdk/client-codepipeline";
+import { CodePipelineClient, GetPipelineStateCommand, GetPipelineExecutionCommand, PutApprovalResultCommand } from "@aws-sdk/client-codepipeline";
 import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
 import { EventBridgeClient, PutEventsCommand } from "@aws-sdk/client-eventbridge";
 import { parseCdRegistry, pipelineProjects } from "./cd-registry.mjs";
@@ -117,6 +117,17 @@ const FLUSH_MIN_MS = 60_000;
 
 // Stop long-polling when this much runtime remains for in-flight processing.
 const POLL_RESERVE_MS = 30_000;
+// Don't START the periodic gate/escalation/deploy scans with less runway than
+// this on top of POLL_RESERVE_MS (TEAM-4663). The three scans run serially and
+// each does network work (hub fetches, GetPipelineState, GitHub, Telegram), so
+// the old `> POLL_RESERVE_MS` loop guard could begin one with 30s left and die
+// between a claim and its ping — which is exactly how a claim gets stranded.
+const SCAN_BUDGET_MS = 90_000;
+// How long a claim row's holder is trusted to still be sending. Past this, an
+// UNDELIVERED claim (no deliveredAt) is re-takeable and the ping is re-sent —
+// the one rule that makes "claimed" stop meaning "silently parked" on all three
+// ping paths (deploy approvals, review gates, manager escalations).
+const PING_LEASE_MS = parseInt(process.env.PING_LEASE_MS || "300000", 10);
 // Paced transcription (TEAM-3464) costs ~the note's own duration in wall clock;
 // this margin covers Transcribe connect/latency overhead on top of that.
 const TRANSCRIBE_OVERHEAD_MS = 30_000;
@@ -202,7 +213,12 @@ export const handler = async (event, context) => {
   let lastGateScan = Date.now();
 
   while (context.getRemainingTimeInMillis() > POLL_RESERVE_MS) {
-    if (Date.now() - lastGateScan > 60_000) {
+    // TEAM-4663: only START a scan round with real runway. lastGateScan is left
+    // UN-stamped when the guard blocks, so the next loop iteration — or the next
+    // invocation, on a fresh clock — scans as soon as there is budget rather
+    // than waiting out another 60s window.
+    if (Date.now() - lastGateScan > 60_000 &&
+        context.getRemainingTimeInMillis() > POLL_RESERVE_MS + SCAN_BUDGET_MS) {
       lastGateScan = Date.now();
       try { await scanReviewGates(); } catch (err) { console.error("[telegram-bug-intake] gate scan", err); }
       try { await scanManagerEscalations(); } catch (err) { console.error("[telegram-bug-intake] escalation scan", err); }
@@ -953,19 +969,32 @@ async function scanReviewGates() {
   const window = businessWindow(); // resolved once per container, on the first scan
   let chats = null; // fetched lazily — most scans find nothing new
   let pinged = 0;
+  let recovered = 0;
   for (const { wf, notif } of pending) {
-    const claimed = await claimGate(notif);
-    if (!claimed) {
-      // Already paged. The only thing left to do for this gate is the
-      // once-per-notification reminder, if its page landed out of hours.
+    // TEAM-4663: "already claimed" is not the same as "already delivered". A
+    // claim with no deliveredAt, older than the lease, was stranded — nobody was
+    // ever paged, and because a re-parked gate only mints a new notif.id AFTER
+    // someone reviews it, nothing would ever re-mint this one. Re-send.
+    // No TTL fallback here on purpose: a row with no claimedAt predates this
+    // change, so deploying it re-pages nobody (claimedAtOf).
+    const mode = (await claimGate(notif))
+      ? "first"
+      : await consultClaimForRecovery(gateClaimKey(notif), { label: "review gate" });
+    if (!mode) {
+      // Already paged, and the page is accounted for. The only thing left to do
+      // for this gate is the once-per-notification reminder, if its page landed
+      // out of hours.
       await repageIfWindowOpened(wf, notif, window);
       continue;
     }
-    pinged++;
+    if (mode === "first") pinged++; else recovered++;
 
-    // The claim is written before delivery is proven, so ANY throw between
-    // here and a delivered ping (e.g. a transient listChats Scan failure)
-    // must release it — a stranded claim silences this gate for 30 days.
+    // The claim is written before delivery is proven, so ANY throw between here
+    // and a delivered ping (e.g. a transient listChats Scan failure) must
+    // release it — a stranded claim silences this gate for 30 days. In RECOVERY
+    // mode the row is kept instead: its lease was just refreshed, so the next
+    // scan past PING_LEASE_MS retries on its own, and deleting a row we did not
+    // create would lose the delivery history it carries.
     try {
       // The chat registry is historical — chat# rows outlive de-allowlisting.
       // Gate pings must respect the same allowlist as inbound messages, or the
@@ -974,7 +1003,7 @@ async function scanReviewGates() {
       chats = chats || (await listChats()).filter((c) => ALLOWED_CHAT_IDS.includes(String(c)));
       if (!chats.length) {
         console.warn("[telegram-bug-intake] gate ticket but no allowlisted chats to notify");
-        await releaseGate(notif); // nobody was pinged — let a later scan retry
+        if (mode === "first") await releaseGate(notif); // nobody was pinged — let a later scan retry
         continue;
       }
 
@@ -1073,23 +1102,44 @@ async function scanReviewGates() {
       }
 
       let delivered = 0;
+      const messageIds = [];
       for (const chatId of chats) {
-        try { await tgSend(chatId, text, { reply_markup: keyboard }); delivered++; }
+        try {
+          const res = await tgSend(chatId, text, { reply_markup: keyboard });
+          delivered++;
+          if (res?.message_id) messageIds.push(`${chatId}:${res.message_id}`);
+        }
         catch (err) { console.error(`[telegram-bug-intake] gate ping to ${chatId}`, err.message); }
       }
       // The claim was written before delivery was proven; if every send failed,
-      // keeping it would silently skip this gate for 30 days.
-      if (!delivered) await releaseGate(notif);
-      // Exactly one gate.requested per notification, and only for a page that
-      // actually landed — it is the metrics record of "the human was asked".
-      else await publishGateRequested(wf, notif, window);
+      // keeping it would silently skip this gate for 30 days. A recovery keeps
+      // the row and retries on the next lease expiry (see the try comment).
+      if (!delivered) { if (mode === "first") await releaseGate(notif); }
+      else {
+        // Phase 2 — record that a human actually has it, so a later scan can
+        // tell this row apart from a stranded claim. Never fatal: a failed write
+        // costs one duplicate page a lease later, while letting it throw would
+        // hit the catch below and release a claim whose ping DID land.
+        await markPingDelivered(gateClaimKey(notif), { pingCount: 1, messageIds }).catch((err) =>
+          console.error("[telegram-bug-intake] markPingDelivered (gate)", err.message));
+        // Exactly one gate.requested per notification, and only for a page that
+        // actually landed — it is the metrics record of "the human was asked".
+        // A recovery publishes too: nothing was ever delivered before it, so
+        // nothing was ever published, and the recovery IS when the human was asked.
+        await publishGateRequested(wf, notif, window);
+      }
     } catch (err) {
-      await releaseGate(notif).catch((relErr) =>
-        console.error("[telegram-bug-intake] releaseGate after gate failure", relErr.message));
+      if (mode === "first") {
+        await releaseGate(notif).catch((relErr) =>
+          console.error("[telegram-bug-intake] releaseGate after gate failure", relErr.message));
+      }
       throw err;
     }
   }
-  if (pinged) console.log(`[telegram-bug-intake] review gates: ${pending.length} open, ${pinged} newly pinged`);
+  if (pinged || recovered) {
+    console.log(`[telegram-bug-intake] review gates: ${pending.length} open, ${pinged} newly pinged` +
+      (recovered ? `, ${recovered} re-sent after an unconfirmed ping` : ""));
+  }
 }
 
 /**
@@ -1113,7 +1163,11 @@ async function claimGate(notif) {
         ttl: { N: String(Math.floor(Date.now() / 1000) + 30 * 86400) },
         // TEAM-4461: the claim is written milliseconds before delivery in the same
         // scan (and released when nobody received it), so this IS the page time.
+        // Untouched by TEAM-4663: the repage window check keys off it, and a
+        // lease recovery deliberately does NOT refresh it.
         pagedAt: { S: new Date().toISOString() },
+        // TEAM-4663 phase 1 — see the two-phase claim block near claimKey().
+        claimedAt: { N: String(Date.now()) },
       },
       ConditionExpression: "attribute_not_exists(id)",
     }));
@@ -1516,16 +1570,25 @@ async function scanManagerEscalations() {
 
   let chats = null;
   for (const { wf, notif } of pending) {
-    const claimed = await claimKey(`${ESC_KEY_PREFIX}${notif.id}`);
-    if (!claimed) continue;
+    const escKey = `${ESC_KEY_PREFIX}${notif.id}`;
+    // TEAM-4663, same rule as review gates: a claim with no deliveredAt older
+    // than the lease was stranded before its ping, and an open escalation PARKS
+    // the run — so a stranded claim here is the 9h TEAM-3938 stall with nobody
+    // paged. No TTL fallback: pre-upgrade rows are not recovery-eligible.
+    const mode = (await claimKey(escKey))
+      ? "first"
+      : await consultClaimForRecovery(escKey, { label: "manager escalation" });
+    if (!mode) continue;
 
     // Same claim-before-delivery contract as review gates: any throw before a
-    // delivered ping must release the claim or this escalation stays silent.
+    // delivered ping must release a FIRST claim or this escalation stays silent.
+    // A recovery keeps the row — its lease was just refreshed, so the next scan
+    // past PING_LEASE_MS retries.
     try {
       chats = chats || (await listChats()).filter((c) => ALLOWED_CHAT_IDS.includes(String(c)));
       if (!chats.length) {
         console.warn("[telegram-bug-intake] manager escalation but no allowlisted chats to notify");
-        await releaseKey(`${ESC_KEY_PREFIX}${notif.id}`);
+        if (mode === "first") await releaseKey(escKey);
         continue;
       }
 
@@ -1548,14 +1611,24 @@ async function scanManagerEscalations() {
       ] };
 
       let delivered = 0;
+      const messageIds = [];
       for (const chatId of chats) {
-        try { await tgSend(chatId, text, { reply_markup: keyboard }); delivered++; }
+        try {
+          const res = await tgSend(chatId, text, { reply_markup: keyboard });
+          delivered++;
+          if (res?.message_id) messageIds.push(`${chatId}:${res.message_id}`);
+        }
         catch (err) { console.error(`[telegram-bug-intake] escalation ping to ${chatId}`, err.message); }
       }
-      if (!delivered) await releaseKey(`${ESC_KEY_PREFIX}${notif.id}`);
+      if (!delivered) { if (mode === "first") await releaseKey(escKey); }
+      // Phase 2, best-effort for the same reason as the gate path.
+      else await markPingDelivered(escKey, { pingCount: 1, messageIds }).catch((err) =>
+        console.error("[telegram-bug-intake] markPingDelivered (escalation)", err.message));
     } catch (err) {
-      await releaseKey(`${ESC_KEY_PREFIX}${notif.id}`).catch((relErr) =>
-        console.error("[telegram-bug-intake] releaseKey after escalation failure", relErr.message));
+      if (mode === "first") {
+        await releaseKey(escKey).catch((relErr) =>
+          console.error("[telegram-bug-intake] releaseKey after escalation failure", relErr.message));
+      }
       throw err;
     }
   }
@@ -1587,7 +1660,15 @@ async function claimKey(id) {
   try {
     await ddb.send(new PutItemCommand({
       TableName: PENDING_TABLE,
-      Item: { id: { S: id }, ttl: { N: String(Math.floor(Date.now() / 1000) + 30 * 86400) } },
+      Item: {
+        id: { S: id },
+        ttl: { N: String(Math.floor(Date.now() / 1000) + 30 * 86400) },
+        // TEAM-4663 phase 1 of the two-phase claim: when this row was taken. The
+        // matching deliveredAt is written only once a send is CONFIRMED, so an
+        // invocation that dies in between leaves a row that can be told apart
+        // from a delivered one and re-taken past the lease.
+        claimedAt: { N: String(Date.now()) },
+      },
       ConditionExpression: "attribute_not_exists(id)",
     }));
     return true;
@@ -1599,6 +1680,144 @@ async function claimKey(id) {
 
 async function releaseKey(id) {
   await ddb.send(new DeleteItemCommand({ TableName: PENDING_TABLE, Key: { id: { S: id } } }));
+}
+
+// ─── Two-phase claim: claim, then PROVE delivery (TEAM-4663) ─────────────────
+// Every ping path claims a dedupe row BEFORE it sends — that row is what makes
+// "ping exactly once" true. But the claim on its own records nothing about
+// delivery, so an invocation killed between the PutItem and the send strands the
+// row, and every later scan bails on "already claimed": the page is silently
+// parked for the row's whole TTL (7 days for a production deploy gate, 30 for a
+// review gate). TEAM-4663 was 8h45m of an unpinged prod deploy behind exactly
+// that.
+//
+// Phase 2 closes it. `claimedAt` goes on the row at claim time; `deliveredAt`
+// (plus lastPingAt/pingCount/messageIds) only after a send is confirmed. A claim
+// with no deliveredAt older than PING_LEASE_MS is re-takeable, so the next scan
+// re-sends instead of returning. These primitives are id-keyed and deliberately
+// path-agnostic — dep#, gate# and esc# all use them.
+
+async function getClaimRow(id) {
+  const { Item } = await ddb.send(new GetItemCommand({
+    TableName: PENDING_TABLE, Key: { id: { S: id } },
+  }));
+  return Item || null;
+}
+
+/**
+ * When this claim/lease was taken, in ms — or null when that cannot be
+ * established. `ttlFallbackSec` is the row's TTL HORIZON (the row's ttl is claim
+ * time + horizon), and passing it is what makes a PRE-UPGRADE row — written
+ * before this change, so carrying no claimedAt — recovery-eligible.
+ *
+ * Whether a path passes it is a real policy decision, not a detail:
+ *   dep#         passes the 7-day horizon, so the row stranded by the incident
+ *                this fixes gets its one recovery ping when the fix deploys.
+ *   gate#, esc#  pass nothing, so a pre-upgrade row is ineligible and the deploy
+ *                of this fix cannot re-page every currently-open gate.
+ */
+function claimedAtOf(row, ttlFallbackSec = null) {
+  const claimedAt = Number(row?.claimedAt?.N);
+  if (Number.isFinite(claimedAt) && claimedAt > 0) return claimedAt;
+  if (ttlFallbackSec == null) return null;
+  const ttl = Number(row?.ttl?.N);
+  if (!Number.isFinite(ttl) || ttl <= 0) return null;
+  return (ttl - ttlFallbackSec) * 1000;
+}
+
+/**
+ * Take over an undelivered claim: refresh claimedAt so THIS invocation owns the
+ * lease. Conditional, so two pollers can never both re-send — and it refuses
+ * outright once deliveredAt exists, which is what stops a lease re-take from
+ * re-paging a human who already has the message. False = someone else won.
+ */
+async function retakeLease(id, seenClaimedAt, now) {
+  try {
+    await ddb.send(new UpdateItemCommand({
+      TableName: PENDING_TABLE,
+      Key: { id: { S: id } },
+      UpdateExpression: "SET claimedAt = :now",
+      ConditionExpression:
+        "attribute_exists(id) AND attribute_not_exists(deliveredAt) AND (claimedAt = :seen OR attribute_not_exists(claimedAt))",
+      ExpressionAttributeValues: {
+        ":now": { N: String(now) },
+        ":seen": { N: String(seenClaimedAt) },
+      },
+    }));
+    return true;
+  } catch (err) {
+    if (err.name === "ConditionalCheckFailedException") return false;
+    throw err;
+  }
+}
+
+/**
+ * Phase 2: at least one chat confirmed the send. deliveredAt is if_not_exists so
+ * it keeps meaning "when the human FIRST had it" across reminders; lastPingAt /
+ * pingCount move. Best-effort at every call site: losing this write costs at
+ * most one duplicate page a lease later, whereas treating it as fatal would
+ * release a claim whose ping already landed.
+ */
+async function markPingDelivered(id, { now = Date.now(), pingCount = 1, messageIds = [] } = {}) {
+  await ddb.send(new UpdateItemCommand({
+    TableName: PENDING_TABLE,
+    Key: { id: { S: id } },
+    UpdateExpression:
+      "SET deliveredAt = if_not_exists(deliveredAt, :now), lastPingAt = :now, pingCount = :n, messageIds = :m",
+    ExpressionAttributeValues: {
+      ":now": { N: String(now) },
+      ":n": { N: String(pingCount) },
+      ":m": { S: JSON.stringify(messageIds.slice(0, 20)) },
+    },
+  }));
+}
+
+/**
+ * Claim the right to send reminder #nextCount, conditional on nobody else having
+ * moved the counter. Reserved concurrency is 1 today, so this is belt and braces
+ * — but a reminder that double-fires is a page a human already read, and the
+ * condition costs nothing. False = another invocation took this slot.
+ */
+async function takeReminderSlot(id, { seenLastPingAt, seenCount, nextCount, now }) {
+  try {
+    await ddb.send(new UpdateItemCommand({
+      TableName: PENDING_TABLE,
+      Key: { id: { S: id } },
+      UpdateExpression: "SET lastPingAt = :now, pingCount = :next",
+      ConditionExpression: "lastPingAt = :seen AND pingCount = :seenCount",
+      ExpressionAttributeValues: {
+        ":now": { N: String(now) },
+        ":next": { N: String(nextCount) },
+        ":seen": { N: String(seenLastPingAt) },
+        ":seenCount": { N: String(seenCount) },
+      },
+    }));
+    return true;
+  } catch (err) {
+    if (err.name === "ConditionalCheckFailedException") return false;
+    throw err;
+  }
+}
+
+/**
+ * The ONE recovery rule, called whenever a claim's conditional Put loses: does
+ * this existing row prove a ping was delivered, or was it stranded? Returns
+ * "recovery" (the lease is now ours — re-send) or null (leave it alone).
+ *
+ * `row` may be passed in by a caller that already read it, so consulting costs
+ * one GetItem per scan and not two.
+ */
+async function consultClaimForRecovery(id, { ttlFallbackSec = null, label = "ping", row = undefined } = {}) {
+  const claim = row === undefined ? await getClaimRow(id) : row;
+  if (!claim) return null;                  // TTL'd or actioned between reads
+  if (claim.deliveredAt?.N) return null;    // a human has the page
+  const claimedAt = claimedAtOf(claim, ttlFallbackSec);
+  if (claimedAt == null) return null;       // pre-upgrade row (see claimedAtOf)
+  const now = Date.now();
+  if (now - claimedAt < PING_LEASE_MS) return null;   // a send may be in flight
+  if (!(await retakeLease(id, claimedAt, now))) return null;
+  console.warn(`[telegram-bug-intake] ${label} ping never confirmed — re-sending`, id);
+  return "recovery";
 }
 
 // Chat registry — every chat that ever messaged the bot gets gate pings.
@@ -1654,6 +1873,15 @@ async function scanAllPages(input) {
 // a total no-op — not one AWS call.
 
 const DEPLOY_KEY_PREFIX = "dep#";
+// The claim row's TTL horizon. Also the fallback used to date a PRE-TEAM-4663
+// row, whose ttl IS claim time + this (claimedAtOf).
+const DEPLOY_CLAIM_TTL_SEC = 7 * 86400;
+// A DELIVERED deploy ping still waiting on a human earns a bounded re-page: the
+// approval is an irreversible prod act and the pipeline is stopped on it, so
+// "the human scrolled past it" must not be a 7-day silence either. Bounded on
+// purpose — nagging a reviewer forever trains them to ignore the bot.
+const DEPLOY_REPING_INTERVAL_MS = parseInt(process.env.DEPLOY_REPING_INTERVAL_MS || "7200000", 10);
+const DEPLOY_REPING_MAX = parseInt(process.env.DEPLOY_REPING_MAX || "6", 10);
 
 // ─── CD registry deploy targets ──────────────────────────────────────────────
 // The same document the orchestrator and the Pipeline___* tools Lambda read
@@ -1771,6 +1999,59 @@ async function scanDeployApprovals() {
   }
 }
 
+// One warn per pipeline+execution whose commit could not be resolved — this runs
+// every 60s while a gate waits, and the ping still goes out without the brief.
+const _revisionWarned = new Set();
+
+/**
+ * The commit the WAITING EXECUTION would deploy (TEAM-4663 D3).
+ *
+ * The old code took the first `currentRevision` anywhere in the state — i.e. the
+ * Source stage's LATEST revision, which belongs to whatever execution ran
+ * through Source most recently. With two executions in flight (one building, one
+ * parked at the approval) that is a different commit: the incident's ping would
+ * have described the commit of the run BEHIND it, in front of a human about to
+ * irreversibly ship. ActionState carries no execution id, so the only safe read
+ * is stage-level: trust a stage's revision only when that stage's
+ * latestExecution.pipelineExecutionId IS the approval's execution.
+ *
+ * Fallback is the execution itself (artifactRevisions), best-effort: any failure
+ * — AccessDenied until update-config.sh grants GetPipelineExecution included —
+ * returns null, which means "no brief" and the terse ping, never a wrong commit.
+ */
+async function resolveApprovalRevision(target, state, executionId) {
+  if (!executionId) return null;
+  for (const stage of state.stageStates || []) {
+    if (stage.latestExecution?.pipelineExecutionId !== executionId) continue;
+    const rev = (stage.actionStates || [])
+      .map((a) => a.currentRevision?.revisionId)
+      .find(Boolean);
+    if (rev) return rev;
+  }
+  try {
+    const res = await codepipelineFor(target.region).send(new GetPipelineExecutionCommand({
+      pipelineName: target.pipeline, pipelineExecutionId: executionId,
+    }));
+    return res?.pipelineExecution?.artifactRevisions?.[0]?.revisionId || null;
+  } catch (err) {
+    const warnKey = `${target.pipeline} ${executionId}`;
+    if (!_revisionWarned.has(warnKey)) {
+      if (_revisionWarned.size > 500) _revisionWarned.clear();
+      _revisionWarned.add(warnKey);
+      console.warn(`[telegram-bug-intake] could not resolve the commit for ${target.pipeline} execution ${executionId}: ${err.name || err.message} — pinging without the brief`);
+    }
+    return null;
+  }
+}
+
+/** "8h 45m" / "12m" — how long a human has kept a prod deploy waiting. */
+function formatPending(ms) {
+  if (!Number.isFinite(ms) || ms < 0) return null;
+  const mins = Math.floor(ms / 60_000);
+  const h = Math.floor(mins / 60);
+  return h ? `${h}h ${mins % 60}m` : `${mins}m`;
+}
+
 async function scanDeployApprovalsForTarget(target) {
   let state;
   try {
@@ -1789,12 +2070,6 @@ async function scanDeployApprovalsForTarget(target) {
   // marks the *stage* InProgress and the action has a latestExecution.token
   // only while it waits; the token is required by PutApprovalResult.
   let pending = null;
-  // The commit being deployed — the Source stage's currentRevision. Used to
-  // enrich the ping with the actual commit / PR / scope (esbuild the SHA once).
-  const sourceRevisionId = (state.stageStates || [])
-    .flatMap((s) => s.actionStates || [])
-    .map((a) => a.currentRevision?.revisionId)
-    .find(Boolean);
   for (const stage of state.stageStates || []) {
     for (const action of stage.actionStates || []) {
       const token = action.latestExecution?.token;
@@ -1802,7 +2077,9 @@ async function scanDeployApprovalsForTarget(target) {
       if (token && status === "InProgress") {
         pending = { stageName: stage.stageName, actionName: action.actionName, token,
           revisionUrl: action.entityUrl || action.revisionUrl,
-          commitSha: sourceRevisionId || null };
+          // WHICH execution is parked here. The stage carries it; the action
+          // does not. Everything about the commit hangs off this (D3).
+          executionId: stage.latestExecution?.pipelineExecutionId || null };
         break;
       }
     }
@@ -1812,21 +2089,28 @@ async function scanDeployApprovalsForTarget(target) {
 
   // Claim on the pipeline + token: a new pipeline execution mints a fresh token,
   // so this naturally re-pings each run while never double-pinging the same wait.
-  const claimed = await claimDeployApproval(pending, target);
-  if (!claimed) return;
+  // A LOST claim is no longer the end of it (TEAM-4663) — the existing row is
+  // consulted, because "someone claimed this" used to be indistinguishable from
+  // "a human was actually paged".
+  const key = deployClaimKey(pending, target);
+  const claimed = await claimDeployApproval(pending, target, key);
+  const mode = claimed ? { kind: "first" } : await decideDeployPingMode(key);
+  if (!mode) return;
 
   try {
     const chats = (await listChats()).filter((c) => ALLOWED_CHAT_IDS.includes(String(c)));
     if (!chats.length) {
       console.warn("[telegram-bug-intake] deploy approval but no allowlisted chats to notify");
-      await releaseDeployApproval(claimed.key);
+      if (mode.kind === "first") await releaseDeployApproval(key);
       return;
     }
 
-    // Enrich the ping with what's actually shipping: the commit subject, the PR
-    // (title + workflow/epic + one-line summary from the body), and the file
-    // scope. Best-effort — a GitHub hiccup falls back to the terse message.
-    const brief = await buildDeployBrief(pending.commitSha, target.repo).catch((e) => {
+    // The commit THIS execution would ship (never the newest one in the
+    // pipeline), then what's in it: subject, PR title/epic/summary, file scope.
+    // Best-effort at both steps — an unresolved commit or a GitHub hiccup falls
+    // back to the terse message, which still carries working buttons.
+    const commitSha = await resolveApprovalRevision(target, state, pending.executionId);
+    const brief = await buildDeployBrief(commitSha, target.repo).catch((e) => {
       console.warn("[telegram-bug-intake] deploy brief enrich failed:", e.message);
       return null;
     });
@@ -1834,15 +2118,29 @@ async function scanDeployApprovalsForTarget(target) {
     const deployAsk =
       "This is the irreversible production deploy — the merge is already approved. " +
       "Approve to ship, or Reject to stop.";
+    const isReminder = mode.kind === "reminder";
     // Which pipeline, and which REPO's pipeline: with several registered repos a
-    // bare pipeline name is not enough for a human to know what they are shipping.
+    // bare pipeline name is not enough for a human to know what they are
+    // shipping. The execution id is what lets them find it in the console — and
+    // what proves WHICH of two in-flight runs this ping is about.
     const meta = [`🏷 ${esc(target.pipeline)}`];
     if (target.repo) meta.push(`📦 ${esc(target.repo)}`);
-    const text = brief
+    if (pending.executionId) meta.push(`🆔 ${esc(String(pending.executionId).slice(0, 8))}`);
+    if (isReminder) {
+      const pendingFor = formatPending(mode.pendingMs);
+      meta.push(`⏳ ${pendingFor ? `Pending ${pendingFor} · ` : ""}reminder ${mode.n} of ${DEPLOY_REPING_MAX}`);
+    }
+    const kicker = isReminder
+      ? "⏰ PRODUCTION DEPLOY — still waiting on your approval"
+      : "🚀 PRODUCTION DEPLOY — approval needed";
+    const fallbackSummary = isReminder
+      ? "This deploy is still parked on your approval — the pipeline cannot proceed without it."
+      : "The build passed every gate and is waiting on you to ship it to prod.";
+    const rich = brief
       ? execPing({
-          kicker: "🚀 PRODUCTION DEPLOY — approval needed",
+          kicker,
           subject: brief.prTitle || brief.commitSubject || target.pipeline,
-          summary: brief.summary || "",                       // one-line what/why from the PR body
+          summary: brief.summary || (isReminder ? fallbackSummary : ""), // one-line what/why from the PR body
           bullets: [
             brief.workflowLine,                               // "Workflow: TEAM-3721 (bug-fix)"
             brief.scopeLine,                                  // "Scope: 8 files (+147/-4)"
@@ -1852,16 +2150,31 @@ async function scanDeployApprovalsForTarget(target) {
           ask: deployAsk,
         })
       : execPing({
-          kicker: "🚀 PRODUCTION DEPLOY — approval needed",
+          kicker,
           subject: target.pipeline,
-          summary: "The build passed every gate and is waiting on you to ship it to prod.",
+          summary: fallbackSummary,
           meta,
           ask: deployAsk,
         });
+    // The SAME facts with no Markdown at all, for the fallback send. Telegram's
+    // legacy parse_mode rejects the whole message on an unbalanced entity, so
+    // without this a brief that happens to contain one silences a prod gate
+    // (release → re-claim → identical 400, every 60s, forever).
+    const terse = [
+      kicker.replace(/[*_`[\]]/g, ""),
+      target.pipeline + (target.repo ? ` (${target.repo})` : ""),
+      pending.executionId ? `execution ${String(pending.executionId).slice(0, 8)}` : "",
+      isReminder && formatPending(mode.pendingMs)
+        ? `pending ${formatPending(mode.pendingMs)} - reminder ${mode.n} of ${DEPLOY_REPING_MAX}`
+        : "",
+      commitSha ? `commit ${String(commitSha).slice(0, 7)}` : "",
+      fallbackSummary,
+      deployAsk,
+    ].filter(Boolean).join("\n").replace(/[*_`[\]]/g, "");
 
     const rows = [[
-      { text: "🚀 Approve deploy", callback_data: `dok|${claimed.key}` },
-      { text: "🛑 Reject", callback_data: `dno|${claimed.key}` },
+      { text: "🚀 Approve deploy", callback_data: `dok|${key}` },
+      { text: "🛑 Reject", callback_data: `dno|${key}` },
     ]];
     const linkRow = [];
     if (brief?.prUrl) linkRow.push({ text: "🔗 View PR", url: brief.prUrl });
@@ -1870,15 +2183,36 @@ async function scanDeployApprovalsForTarget(target) {
     if (linkRow.length) rows.push(linkRow);
     const keyboard = { inline_keyboard: rows };
 
-    let delivered = 0;
-    for (const chatId of chats) {
-      try { await tgSend(chatId, text, { reply_markup: keyboard }); delivered++; }
-      catch (err) { console.error(`[telegram-bug-intake] deploy approval ping to ${chatId}`, err.message); }
+    const { delivered, messageIds } = await sendPingWithFallback(chats, {
+      rich, terse, keyboard, label: "deploy approval ping",
+    });
+    if (delivered) {
+      // pingCount 1 == the original ping; a reminder advances it. Best-effort:
+      // see markPingDelivered. On a reminder the slot was already consumed by
+      // takeReminderSlot, so a failure here costs a repeat, not a lost bound.
+      await markPingDelivered(`${DEPLOY_KEY_PREFIX}${key}`, {
+        pingCount: isReminder ? mode.n + 1 : 1, messageIds,
+      }).catch((err) => console.error("[telegram-bug-intake] markPingDelivered (deploy)", err.message));
+    } else if (mode.kind === "first") {
+      // Nobody got it and we created the row — drop it so the next scan (60s)
+      // retries immediately rather than waiting out a lease.
+      await releaseDeployApproval(key);
+    } else if (mode.kind === "recovery") {
+      // Keep the row: the lease is ours and now fresh, so the next scan past
+      // PING_LEASE_MS tries again — indefinitely, while the approval is pending.
+      // This is the invariant-critical path; it must never go quiet.
+      console.error(`[telegram-bug-intake] deploy approval re-send still undelivered for ${target.pipeline} — retrying after the lease`);
+    } else {
+      // A reminder that failed: the slot is burned and the next one is an
+      // interval away. Deliberate — the original ping DID land, and rolling the
+      // counter back would need a second conditional write to buy very little.
+      console.error(`[telegram-bug-intake] deploy approval reminder ${mode.n} undelivered for ${target.pipeline}`);
     }
-    if (!delivered) await releaseDeployApproval(claimed.key);
   } catch (err) {
-    await releaseDeployApproval(claimed.key).catch((relErr) =>
-      console.error("[telegram-bug-intake] releaseDeployApproval after failure", relErr.message));
+    if (mode.kind === "first") {
+      await releaseDeployApproval(key).catch((relErr) =>
+        console.error("[telegram-bug-intake] releaseDeployApproval after failure", relErr.message));
+    }
     throw err;
   }
 }
@@ -2028,29 +2362,36 @@ async function buildDeployBrief(commitSha, targetRepo = null) {
 }
 
 /**
- * Atomically claim a deploy approval for notification, keyed by the target
- * pipeline + the approval TOKEN (unique per pipeline wait). Returns { key, ... }
- * on first claim, false if already pinged. The DDB row stores the
- * pipeline/region/repo/stage/action/token the button callback needs, since
- * callback_data can't carry the token itself.
+ * The claim key for one pipeline wait — a short, callback_data-safe hash of the
+ * target + the approval TOKEN (the token alone can exceed Telegram's 64-byte
+ * callback_data budget; it stays in the DDB item). Hashing the PIPELINE in means
+ * two targets can never collide on one claim row, whatever their tokens look
+ * like. Split out of claimDeployApproval by TEAM-4663: the caller needs the key
+ * even when the claim LOSES, to consult the existing row.
+ *
+ * MIGRATION (TEAM-4347): before TEAM-4338 the key was hash(token) alone, and that
+ * code watched exactly ONE pipeline — DEPLOY_PIPELINE_NAME. So legacy-shaped rows
+ * can only ever exist for that pipeline; keeping the legacy shape for it means an
+ * approval already paused on the gate when this zip lands still hashes to the row
+ * that claimed it, instead of claiming a second row and pinging twice. Matching on
+ * the pipeline NAME (not on "came from the env fallback") is deliberate: the hub is
+ * normally in the registry too, so its target is a REGISTRY target that happens to
+ * name DEPLOY_PIPELINE_NAME — the exact configuration the double-ping would hit.
  */
-async function claimDeployApproval(pending, target) {
-  // A short, callback_data-safe key derived from the target + the approval TOKEN
-  // (the token alone can exceed Telegram's 64-byte callback_data budget). The token
-  // stays in the DDB item. Hashing the PIPELINE in means two targets can never
-  // collide on one claim row, whatever their tokens look like.
-  //
-  // MIGRATION (TEAM-4347): before TEAM-4338 the key was hash(token) alone, and that
-  // code watched exactly ONE pipeline — DEPLOY_PIPELINE_NAME. So legacy-shaped rows
-  // can only ever exist for that pipeline; keeping the legacy shape for it means an
-  // approval already paused on the gate when this zip lands still hashes to the row
-  // that claimed it, instead of claiming a second row and pinging twice. Matching on
-  // the pipeline NAME (not on "came from the env fallback") is deliberate: the hub is
-  // normally in the registry too, so its target is a REGISTRY target that happens to
-  // name DEPLOY_PIPELINE_NAME — the exact configuration the double-ping would hit.
-  const key = DEPLOY_PIPELINE_NAME && target.pipeline === DEPLOY_PIPELINE_NAME
+function deployClaimKey(pending, target) {
+  return DEPLOY_PIPELINE_NAME && target.pipeline === DEPLOY_PIPELINE_NAME
     ? `dp${hashToken(pending.token)}`
     : `dp${hashToken(`${target.pipeline} ${pending.token}`)}`;
+}
+
+/**
+ * Atomically claim a deploy approval for notification, keyed by deployClaimKey().
+ * Returns { key, ... } on first claim, false if the row already exists. The DDB
+ * row stores the pipeline/region/repo/stage/action/token the button callback
+ * needs, since callback_data can't carry the token itself — plus, since
+ * TEAM-4663, claimedAt (phase 1) and the executionId the wait belongs to.
+ */
+async function claimDeployApproval(pending, target, key) {
   try {
     await ddb.send(new PutItemCommand({
       TableName: PENDING_TABLE,
@@ -2064,7 +2405,13 @@ async function claimDeployApproval(pending, target) {
         stageName: { S: pending.stageName },
         actionName: { S: pending.actionName },
         token: { S: pending.token },
-        ttl: { N: String(Math.floor(Date.now() / 1000) + 7 * 86400) },
+        ttl: { N: String(Math.floor(Date.now() / 1000) + DEPLOY_CLAIM_TTL_SEC) },
+        // TEAM-4663 phase 1 (see the two-phase claim block near claimKey), plus
+        // WHICH execution is waiting — the ping quotes it so a human can
+        // correlate with the console, and it is what makes the commit
+        // attribution execution-aware rather than "the newest Source revision".
+        claimedAt: { N: String(Date.now()) },
+        ...(pending.executionId ? { executionId: { S: pending.executionId } } : {}),
       },
       ConditionExpression: "attribute_not_exists(id)",
     }));
@@ -2073,6 +2420,38 @@ async function claimDeployApproval(pending, target) {
     if (err.name === "ConditionalCheckFailedException") return false;
     throw err;
   }
+}
+
+/**
+ * A claim row already exists for this wait — so what, if anything, do we send?
+ *   null                  nothing (a delivered ping inside its reminder window,
+ *                         a live lease, or an exhausted reminder budget)
+ *   {kind:"recovery"}     the row proves NOTHING was ever delivered and its lease
+ *                         expired — re-send the full ping (lease now ours)
+ *   {kind:"reminder", n}  a delivered ping the human hasn't actioned and the
+ *                         interval has passed — send reminder n of the budget
+ * Reminders are deploy-only by design: this is the one gate that stops an
+ * irreversible act, and unlike a review gate nothing else re-mints its id.
+ */
+async function decideDeployPingMode(id, now = Date.now()) {
+  const row = await getClaimRow(id);
+  if (!row) return null;   // TTL'd or actioned between the failed Put and here
+  if (await consultClaimForRecovery(id, {
+    ttlFallbackSec: DEPLOY_CLAIM_TTL_SEC, label: "deploy approval", row,
+  })) return { kind: "recovery" };
+  if (!row.deliveredAt?.N) return null;   // undelivered, but the lease is live
+
+  const pingCount = Number(row.pingCount?.N || "1");
+  const lastPingAt = Number(row.lastPingAt?.N || row.deliveredAt.N);
+  if (!Number.isFinite(lastPingAt) || !Number.isFinite(pingCount)) return null;
+  if (now - lastPingAt < DEPLOY_REPING_INTERVAL_MS) return null;
+  // pingCount 1 is the original ping, so reminders sent so far == pingCount - 1.
+  if (pingCount - 1 >= DEPLOY_REPING_MAX) return null;
+  if (!(await takeReminderSlot(id, {
+    seenLastPingAt: lastPingAt, seenCount: pingCount, nextCount: pingCount + 1, now,
+  }))) return null;
+  const claimedAt = claimedAtOf(row, DEPLOY_CLAIM_TTL_SEC);
+  return { kind: "reminder", n: pingCount, pendingMs: claimedAt == null ? null : now - claimedAt };
 }
 
 async function releaseDeployApproval(key) {
@@ -2466,14 +2845,65 @@ async function tgCall(method, body) {
     body: JSON.stringify(body),
   });
   const data = await res.json().catch(() => ({}));
-  if (!data.ok) throw new Error(`Telegram ${method}: ${data.description || res.status}`);
+  if (!data.ok) {
+    const err = new Error(`Telegram ${method}: ${data.description || res.status}`);
+    // TEAM-4663: callers that must decide "retry differently" vs "give up" need
+    // the reason, not just a message string. Additive — nothing else reads these.
+    err.status = res.status;
+    err.description = data.description || "";
+    throw err;
+  }
   return data.result;
 }
 
 const tgSend = (chatId, text, extra = {}) =>
   tgCall("sendMessage", { chat_id: chatId, text, parse_mode: "Markdown", disable_web_page_preview: true, ...extra });
-const tgSendPlain = (chatId, text) =>
-  tgCall("sendMessage", { chat_id: chatId, text, disable_web_page_preview: true });
+const tgSendPlain = (chatId, text, extra = {}) =>
+  tgCall("sendMessage", { chat_id: chatId, text, disable_web_page_preview: true, ...extra });
+// Telegram failures a retry cannot fix: the chat is gone/blocked, or we are
+// being rate-limited (a second immediate send makes that worse). Anything
+// else — above all a legacy-Markdown "can't parse entities" 400 — is worth one
+// plain-text retry, because the alternative is a human never seeing the page.
+const HOPELESS_TG_ERROR =
+  /Too Many Requests|retry after|bot was blocked|chat not found|user is deactivated|deactivated|bot was kicked|have no rights/i;
+function hopelessTelegramError(err) {
+  return HOPELESS_TG_ERROR.test(`${err?.description || ""} ${err?.message || ""}`);
+}
+
+/**
+ * Send one page to every chat, rich first and PLAIN as a fallback (TEAM-4663 F2).
+ * The rich text is Markdown and Telegram rejects the WHOLE message on a single
+ * unbalanced entity; the fallback keeps the same facts and the same keyboard, so
+ * a formatting problem can degrade the ping but never block the decision.
+ * Returns only CONFIRMED deliveries — the count the claim row is marked from.
+ */
+async function sendPingWithFallback(chats, { rich, terse, keyboard, label = "ping" }) {
+  let delivered = 0;
+  const messageIds = [];
+  const record = (chatId, res) => {
+    delivered++;
+    if (res?.message_id) messageIds.push(`${chatId}:${res.message_id}`);
+  };
+  for (const chatId of chats) {
+    try {
+      record(chatId, await tgSend(chatId, rich, { reply_markup: keyboard }));
+      continue;
+    } catch (err) {
+      if (hopelessTelegramError(err)) {
+        console.error(`[telegram-bug-intake] ${label} to ${chatId} (not retryable)`, err.message);
+        continue;
+      }
+      console.warn(`[telegram-bug-intake] ${label} to ${chatId} rejected the formatted message (${err.message}) — retrying as plain text`);
+    }
+    try {
+      record(chatId, await tgSendPlain(chatId, terse, { reply_markup: keyboard }));
+    } catch (err) {
+      console.error(`[telegram-bug-intake] ${label} to ${chatId} failed as plain text too`, err.message);
+    }
+  }
+  return { delivered, messageIds };
+}
+
 const tgEdit = (chatId, messageId, text, extra = {}) =>
   tgCall("editMessageText", { chat_id: chatId, message_id: messageId, text, ...extra });
 const tgAnswer = (cbId, text) => tgCall("answerCallbackQuery", { callback_query_id: cbId, text });

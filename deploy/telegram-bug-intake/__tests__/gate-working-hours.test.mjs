@@ -23,10 +23,14 @@ import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from "vites
 const TG_TOKEN = "111111:test-bot-token";
 const HUB = "https://hub.example.invalid";
 
-const db = vi.hoisted(() => ({ items: new Map(), puts: [], deletes: [] }));
+const db = vi.hoisted(() => ({ items: new Map(), puts: [], deletes: [], updates: [] }));
 const eb = vi.hoisted(() => ({ entries: [], fail: false }));
 
-vi.mock("@aws-sdk/client-dynamodb", () => {
+vi.mock("@aws-sdk/client-dynamodb", async () => {
+  // TEAM-4663: the handler now UPDATES claim rows (two-phase claim). One
+  // shared evaluator, because a fake that replaces instead of merging would
+  // hide a real regression — see helpers/ddb-fake.mjs.
+  const { applyUpdate } = await import("./helpers/ddb-fake.mjs");
   const cmd = (op) => class { constructor(input) { this.input = input; this.op = op; } };
   class DynamoDBClient {
     async send(c) {
@@ -47,10 +51,11 @@ vi.mock("@aws-sdk/client-dynamodb", () => {
         const p = c.input.ExpressionAttributeValues[":p"].S;
         return { Items: [...db.items.values()].filter((i) => i.id.S.startsWith(p)) };
       }
+      if (c.op === "update") return applyUpdate(db, c.input);
       throw new Error(`unexpected ddb op ${c.op}`);
     }
   }
-  return { DynamoDBClient, GetItemCommand: cmd("get"), PutItemCommand: cmd("put"), DeleteItemCommand: cmd("del"), ScanCommand: cmd("scan") };
+  return { DynamoDBClient, GetItemCommand: cmd("get"), PutItemCommand: cmd("put"), UpdateItemCommand: cmd("update"), DeleteItemCommand: cmd("del"), ScanCommand: cmd("scan") };
 });
 vi.mock("@aws-sdk/client-eventbridge", () => ({
   EventBridgeClient: class {
@@ -77,6 +82,7 @@ vi.mock("@aws-sdk/client-s3", () => ({
 vi.mock("@aws-sdk/client-codepipeline", () => ({
   CodePipelineClient: class { async send() { throw new Error("codepipeline must not be called"); } },
   GetPipelineStateCommand: class { constructor(input) { this.input = input; } },
+  GetPipelineExecutionCommand: class { constructor(input) { this.input = input; } },
   PutApprovalResultCommand: class { constructor(input) { this.input = input; } },
 }));
 
@@ -124,7 +130,7 @@ const loadHandler = async (over) => (await loadModule(over)).handler;
 
 const realFetch = global.fetch;
 beforeEach(() => {
-  db.items.clear(); db.puts.length = 0; db.deletes.length = 0;
+  db.items.clear(); db.puts.length = 0; db.deletes.length = 0; db.updates.length = 0;
   eb.entries.length = 0; eb.fail = false;
   db.items.set("chat#12345", { id: { S: "chat#12345" }, chatId: { N: "12345" } });
 });
