@@ -377,9 +377,15 @@ covers exactly the SHA in the brief.
    `ManualApproval` stage is the human's deploy gate; it fires only when the
    commit about to deploy is not the recorded merge of the approved head SHA (no
    record, a different SHA, or an unreadable record - it fails closed): surface
-   it and file the deploy-gate ticket per the existing policy, never approve it
-   yourself - you have no tool that can. `approvalSkipped: true` = this run
-   needed only the single Merge Approval; say so. `handoff: {files}` on a
+   it and file the deploy-gate ticket, never approve it yourself - you have no
+   tool that can. The Telegram bridge pages a phone off that ticket, so its
+   shape is fixed: title `Deploy gate: <pipeline> - <PR title>`, <=80 chars,
+   with **no execution ids, commit SHAs, stage/action names or attempt counts in
+   the title** - those belong in the description (execution id, SHA, PR link,
+   pipeline state, console steps), and a follow-up page for the same execution
+   says so in the description too, never in the title.
+   `approvalSkipped: true` = this run needed only the single Merge Approval;
+   say so. `handoff: {files}` on a
    SUCCEEDED run = infra scripts a human must run: list them in your summary, do
    not run them.
    **Build/Deploy FAILED:** `Pipeline___get_build_log(build_id=

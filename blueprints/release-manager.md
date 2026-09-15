@@ -690,9 +690,19 @@ or `pipeline_not_registered`.
      of the human-approved head SHA — no record, a different SHA, or a record the
      pipeline could not read, all of which fail closed on purpose. When it does
      fire, a HUMAN approves the deploy (bridged to Telegram): surface that it is
-     waiting and file the deploy-gate ticket per the existing policy; do NOT
-     approve it — you have no approval tool and must never approve your own
-     deploy. Conversely, `Pipeline___get_state` returning `approvalSkipped: true`
+     waiting and file the deploy-gate ticket; do NOT approve it — you have no
+     approval tool and must never approve your own deploy. The ticket's shape is
+     fixed, because the Telegram bridge pages a phone off it:
+     - Title: `Deploy gate: <pipeline> — <PR title>`, ≤80 chars. **No execution
+       ids, commit SHAs, stage or action names, and no attempt counts in the
+       title** — the bridge composes the page from the title's prefix, so
+       anything else you put there is dead weight the reviewer must read past.
+     - Description carries the operational detail: execution id, commit SHA, PR
+       link, the pipeline state and the console instructions.
+     - A follow-up ticket for the SAME execution says so **in the description**
+       ("third page for execution `<id>`; the first two were not actioned"),
+       never in the title.
+     Conversely, `Pipeline___get_state` returning `approvalSkipped: true`
      is the signal that this run needed only the single Merge Approval — say so in
      the summary rather than reporting the absent gate as a problem.
    - **Deploy FAILED** → verdict FAIL with the stage's log link + a fix ticket.

@@ -353,7 +353,11 @@ describe("review-gate ping is executive: package summary + curated artifacts", (
     expect(btns.some((b) => b.text === "📄 RFC" && b.url === "https://example.com/rfc")).toBe(true);
   });
 
-  it("falls back to the gate ticket description + upstream work when no review package", async () => {
+  // TEAM-4660: with no review package the ping falls back to the RUN's title +
+  // the upstream work under review. The gate ticket's DESCRIPTION is no longer a
+  // source — an agent-written runbook (console steps, execution ids, SHAs) used
+  // to land in the summary verbatim.
+  it("falls back to the workflow title + upstream work when no review package", async () => {
     const WF = [{
       workflowId: "wf-1",
       input: { title: "Checkout revamp" },
@@ -380,10 +384,11 @@ describe("review-gate ping is executive: package summary + curated artifacts", (
 
     const text = net.sent[0].text;
     expect(text).toMatch(/PLAN REVIEW GATE/);
-    expect(text).toContain("Approve the implementation plan for checkout");
+    // The run, then what is under review \u2014 one line, from structured fields.
+    expect(text).toContain("Checkout revamp");
+    expect(text).toMatch(/shipping: Design cart service, Migrate payment adapter/);
+    // The description is not an input to the ping any more.
+    expect(text).not.toContain("Approve the implementation plan");
     expect(text).not.toContain("workflows/wf-1");
-    expect(text).toContain("*What changed*");
-    expect(text).toContain("\u2022 Design cart service");
-    expect(text).toContain("\u2022 Migrate payment adapter");
   });
 });
