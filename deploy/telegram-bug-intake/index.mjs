@@ -1900,7 +1900,7 @@ async function scanDeployApprovalsForTarget(target) {
     // is answerable from the log as well as from the depping# row below.
     logDeployPing(delivered, pending, target, claimed.key);
     if (!delivered) await releaseDeployApproval(claimed.key);
-    else await recordDeployPing(pending, target, claimed.key, delivered, null);
+    else await recordDeployPing(pending, target, claimed.key, delivered, new Date().toISOString(), null);
   } catch (err) {
     await releaseDeployApproval(claimed.key).catch((relErr) =>
       console.error("[telegram-bug-intake] releaseDeployApproval after failure", relErr.message));
@@ -2027,14 +2027,20 @@ function logDeployPing(delivered, pending, target, key, kind = "deploy approval 
  * pipeline + execution so the Pipeline___* tools Lambda can find it with what
  * get_state already knows — no duplicated hashToken, and no token in the row.
  * Best-effort: evidence must never be the reason a page fails.
+ *
+ * `pagedAt` is the FIRST page time, always - the reminder call passes the
+ * claim row's original pagedAt back in, so a reminder's re-put of this row
+ * (which REPLACES it) cannot drift approvalPing.pagedAt forward to the
+ * reminder time. `repagedAt` is the only field that records when the
+ * reminder itself went out.
  */
-async function recordDeployPing(pending, target, claimKeyValue, deliveredChats, repagedAt) {
+async function recordDeployPing(pending, target, claimKeyValue, deliveredChats, pagedAt, repagedAt) {
   if (!pending.executionId) return;   // nothing stable to key on; the log line still records it
   await ddb.send(new PutItemCommand({
     TableName: PENDING_TABLE,
     Item: {
       id: { S: `${DEPLOY_PING_KEY_PREFIX}${target.pipeline}#${pending.executionId}` },
-      pagedAt: { S: new Date().toISOString() },
+      pagedAt: { S: pagedAt },
       deliveredChats: { N: String(deliveredChats) },
       ...(repagedAt ? { repagedAt: { S: repagedAt } } : {}),
       ...(pending.commitSha ? { commitSha: { S: pending.commitSha } } : {}),
@@ -2106,7 +2112,16 @@ async function repageDeployApproval(pending, target) {
       catch (err) { console.error(`[telegram-bug-intake] deploy approval reminder to ${chatId}`, err.message); }
     }
     logDeployPing(delivered, remind, target, key, "deploy approval reminder");
-    if (delivered) await recordDeployPing(remind, target, key, delivered, new Date().toISOString());
+    // The original page time, not now - recordDeployPing's Put REPLACES the
+    // depping# row, so passing "now" here would overwrite the first page's
+    // pagedAt with the reminder's own time on every reminder.
+    if (delivered) {
+      await recordDeployPing(
+        remind, target, key, delivered,
+        item.pagedAt?.S || new Date().toISOString(),
+        new Date().toISOString()
+      );
+    }
   } finally {
     // Nobody got it → drop the marker so the next scan tries again. The cap is
     // on DELIVERED reminders, not on attempts.

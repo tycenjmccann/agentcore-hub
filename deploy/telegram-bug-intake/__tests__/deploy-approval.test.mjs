@@ -1233,6 +1233,10 @@ describe("deploy-approval: delivery evidence (TEAM-4670 D4)", () => {
     global.fetch = first.fetch;
     await handler({}, first.ctx);
     expect(pingRow(PIPELINE, GATE_EXEC).repagedAt).toBeUndefined();
+    // The claim row's pagedAt is the ORIGINAL page instant, written once by the
+    // conditional claim Put and never rewritten - the value the reminder path
+    // must reuse verbatim.
+    const claimPagedAt = db.items.get(`dep#${legacyKey(TOKEN)}`).pagedAt.S;
 
     advanceClock(120_000);
     cp.state = overlappingState();
@@ -1244,6 +1248,11 @@ describe("deploy-approval: delivery evidence (TEAM-4670 D4)", () => {
     expect(Date.parse(row.repagedAt.S)).toBeGreaterThan(0);
     expect(row.deliveredChats.N).toBe("1");
     expect(pingRows().length, "still ONE row per gated execution").toBe(1);
+    // The reminder's Put REPLACES this row - pagedAt must stay the FIRST page
+    // time, not drift forward to the reminder's own time, or approvalPing.pagedAt
+    // would misreport how long the human has actually been waiting.
+    expect(row.pagedAt.S).toBe(claimPagedAt);
+    expect(row.repagedAt.S).not.toBe(row.pagedAt.S);
   });
 
   it("approving clears the claim, the reminder marker and the evidence row", async () => {
