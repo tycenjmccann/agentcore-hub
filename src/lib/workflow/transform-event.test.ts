@@ -53,3 +53,14 @@ describe("transformEvent — dead_session.shadow (TEAM-3698 F2)", () => {
     expect(out).toBeNull();
   });
 });
+
+describe("transformEvent — agent.invoke_skipped (TEAM-4577)", () => {
+  it("is dropped (null): the orchestrator's final liveness read found the run cancelled after agent.invoked", () => {
+    const out = transformEvent({
+      type: "agent.invoke_skipped",
+      timestamp: TS,
+      detail: { workflowId: "wf_1", ticketId: "TEAM-2", agentId: "dev", reason: "workflow cancelled or terminal" },
+    });
+    expect(out).toBeNull();
+  });
+});

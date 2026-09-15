@@ -408,7 +408,6 @@ async function redispatchTicket(workflow, ticket) {
   const claimed = await claimTicketInvocation(workflow, ticket.ticketId, ticket.assignee);
   if (!claimed) return false;
   const context = await buildAgentContext(ticket, workflow);
-  if (!(await workflowStillLive(workflow, ticket.ticketId, ticket.assignee))) return false;
   await invokeAgent(agentDef, context, workflow, ticket.ticketId);
   return true;
 }
@@ -1320,12 +1319,15 @@ async function harvestCompletionEvidence(workflow, ticketId) {
 }
 
 /**
- * Last look before an invoke: consistent re-read of the run. The claim CAS
+ * Last look before an invoke: consistent re-read of the run, called from
+ * invokeAgent as the final await before the dispatch is sent (so no other
+ * network operation sits between the read and the send). The claim CAS
  * refuses a run cancelled BEFORE the claim and the advancePhase CAS one
  * cancelled before an advance — but a same-phase dispatch (a second dev or
  * design ticket) advances nothing, so a cancel landing after its claim was
- * invisible to it (Codex review on #606). Nothing can close the read→invoke
- * gap entirely; this shrinks it to the invoke call itself.
+ * invisible to it (Codex review on #606). The send itself is the only
+ * remaining gap; an agent that starts anyway sees its cancelled ticket and
+ * no-ops (as the analyst did in the TEAM-4577 incident).
  */
 async function workflowStillLive(workflow, ticketId, assignee) {
   let fresh;
@@ -2708,9 +2710,6 @@ async function handleTicketReadyUnified(ticketId, ticket) {
     resumed = true;
   }
 
-  // Last look, AFTER the context build (DDB/S3/Jira reads take seconds) and
-  // right before the invoke — the only place the re-read buys anything.
-  if (!(await workflowStillLive(workflow, ticketId, assignee))) return;
   console.log(`[orchestrator] Invoking agent ${assignee} for ticket ${ticketId}${resumed ? " (SESSION RESUME)" : ""}`);
   await publishEvent(ticketId, "agent.invoked", { ticketId, assignee, agentId: assignee, phase: ticketPhase, workflowId: workflow.id });
 
@@ -3162,9 +3161,6 @@ async function handleTicketReady(ticketId, image) {
     resumed = true;
   }
 
-  // Last look, AFTER the context build (DDB/S3/Jira reads take seconds) and
-  // right before the invoke — the only place the re-read buys anything.
-  if (!(await workflowStillLive(workflow, ticketId, assignee))) return;
   console.log(`[orchestrator] Invoking agent ${assignee} for ticket ${ticketId}${resumed ? " (SESSION RESUME)" : ""}`);
   await publishEvent(ticketId, "agent.invoked", { ticketId, assignee, agentId: assignee, phase: ticketPhase, workflowId: workflow.id });
 
@@ -3744,6 +3740,16 @@ async function invokeAgent(agentDef, context, workflow, ticketId) {
       inputText: context,
       ...(modelConfig?.bedrockModelConfig ? { bedrockModelArn: modelConfig.bedrockModelConfig.modelId } : {}),
     });
+
+    // Final liveness read — the last await before the send (TEAM-4577).
+    // agent.invoked has already been published as the dispatch INTENT, so a
+    // skip is recorded explicitly rather than leaving a dangling boundary.
+    if (!(await workflowStillLive(workflow, ticketId, agentDef.agentId))) {
+      await publishEvent(ticketId || agentDef.agentId, "agent.invoke_skipped", {
+        ticketId: ticketId || "", agentId: agentDef.agentId, workflowId: workflow.id, reason: "workflow cancelled or terminal",
+      });
+      return;
+    }
 
     // Note: In production, we'd use the AgentCore Harness SDK's invokeHarnessAgent
     // For now, invoke as a separate async Lambda that handles the streaming
