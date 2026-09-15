@@ -672,10 +672,10 @@ describe("7. a cancel that lands after the dispatcher's read never dispatches or
 
     expect(h.state.claims.filter((c) => c.ticketId === BUILD && c.ok)).toHaveLength(1);
     expect(storeMock.advancePhase).not.toHaveBeenCalled();
-    // agent.invoked is the dispatch INTENT (published before the final read);
-    // the dispatch itself never left, and the skip is recorded explicitly.
+    // Boundary events are published only AFTER the send, so a stopped dispatch
+    // leaves nothing for the metrics or the agent-output segmenter to count.
     expect(dispatchesFor(BUILD)).toHaveLength(0);
-    expect(eventsOf("agent.invoke_skipped").map((e) => e.detail.ticketId)).toEqual([BUILD]);
+    expect(invokedFor(BUILD)).toHaveLength(0);
     expect(eventsOf("orchestrator.agent_invoked")).toHaveLength(0);
     expect(h.state.workflow.phase).toBe("cancelled");
   });

@@ -59,13 +59,6 @@ export function transformEvent(
       // through as an unknown event type and leak it into the stream.
       return null;
 
-    case "agent.invoke_skipped":
-      // The orchestrator's final liveness read found the run cancelled/terminal
-      // after agent.invoked was published; the dispatch never left. Not a UI
-      // event (the run is already cancelled on screen) — explicit so the default
-      // branch does not leak it as an unknown type.
-      return null;
-
     case "agent.started":
     case "agent.invoked":
       return base({
