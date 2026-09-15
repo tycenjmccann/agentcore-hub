@@ -72,11 +72,13 @@ case "$1" in
 esac
 `;
 
-// aws shim: STS identity succeeds; s3 cp exit is AWS_S3_EXIT (default 1).
+// aws shim: STS identity succeeds; s3 cp exit is AWS_S3_EXIT (default 1). The
+// `cat >/dev/null` drains stdin so the piped printf can't die of SIGPIPE under
+// the caller's pipefail (TEAM-4672).
 const AWS_SHIM = `#!/bin/bash
 case "$*" in
   *get-caller-identity*) echo "arn:aws:iam::123456789012:role/test"; exit 0 ;;
-  *"s3 cp"*) exit "\${AWS_S3_EXIT:-1}" ;;
+  *"s3 cp"*) cat >/dev/null; exit "\${AWS_S3_EXIT:-1}" ;;
   *) exit 1 ;;
 esac
 `;
@@ -415,5 +417,24 @@ describe("Finding 4: no-args gated scripts reject --force explicitly", () => {
     expect(r.out).toContain("--force");
     expect(r.out).toContain("EVAL_GATE_OVERRIDE=1 EVAL_GATE_OVERRIDE_REASON=");
     expect(existsSync(sentinel)).toBe(false);
+  });
+});
+
+describe("aws shim contract (TEAM-4665 / TEAM-4672)", () => {
+  it("drains stdin so `printf | aws s3 cp -` is pipefail-safe", () => {
+    // check-eval-gate.sh:316 computes s3_ok from `printf … | aws s3 cp - …` under
+    // the caller's `set -euo pipefail`. A shim that exits WITHOUT reading stdin can
+    // win the race, killing printf with SIGPIPE (141); pipefail then makes the whole
+    // pipeline non-zero and the audited break-glass becomes a spurious
+    // "S3 audit write FAILED" refusal. The sleep forces that race every run.
+    const r = runBash(
+      `set -euo pipefail
+       (sleep 0.3; printf '%s\\n' record) | aws s3 cp - s3://x/y >/dev/null 2>&1
+       echo "status=$?"`,
+      tmp,
+      { AWS_S3_EXIT: "0" },
+    );
+    expect(r.status).toBe(0);
+    expect(r.out).toContain("status=0");
   });
 });
