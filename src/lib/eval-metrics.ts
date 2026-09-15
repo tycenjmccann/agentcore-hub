@@ -11,6 +11,17 @@
  * `summarizeDaily` folds the buckets inside ONE window (default 7 days, today
  * inclusive) into the numbers the dashboard shows, so sessions, evaluator
  * scores, tokens and cost all describe the same period. Pure — no AWS.
+ *
+ * TEAM-4688: the window is no longer clamped to the daily-bucket TTL (the old
+ * MAX_WINDOW_DAYS = 14 silently turned a 30- or 90-day request into 14 days).
+ * `parseWindow` accepts exactly 7 | 30 | 90 | all, and `summarizeDaily` takes
+ * "all"/null for `days` meaning "every day present in the data" — retention,
+ * not a hardcoded ceiling, is what bounds an all-time fold.
+ *
+ * The same table also holds one row per agent PERSONA, keyed
+ * `${agentId}#${persona}` / day with the same flat attributes. `splitDailyItems`
+ * separates the two row families out of a single scan, so no caller needs a
+ * second pass over the table.
  */
 
 export interface DailyModelUsage {
@@ -117,15 +128,13 @@ export function groupDailyItems(items: Array<Record<string, unknown>>): Record<s
   }
   return out;
 }
-export const MAX_WINDOW_DAYS = 14; // matches the Lambdas' DAILY_RETAIN_DAYS default
-
 export function dayKey(d: Date): string {
   return d.toISOString().slice(0, 10);
 }
 
 /** Ascending list of UTC day keys: today and the (days - 1) days before it. */
 export function windowDays(days: number, now: Date = new Date()): string[] {
-  const n = Math.min(MAX_WINDOW_DAYS, Math.max(1, Math.floor(days) || DEFAULT_WINDOW_DAYS));
+  const n = Math.max(1, Math.floor(days) || DEFAULT_WINDOW_DAYS);
   const out: string[] = [];
   const cursor = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
   cursor.setUTCDate(cursor.getUTCDate() - (n - 1));
@@ -140,6 +149,77 @@ const n = (v: unknown): number => {
   const x = Number(v);
   return Number.isFinite(x) ? x : 0;
 };
+
+/** The only window lengths the API accepts, besides "all". */
+export const ALLOWED_WINDOW_DAYS = [7, 30, 90] as const;
+
+export interface WindowSpec {
+  /** A fixed number of trailing UTC days, or "all" for every day on record. */
+  days: number | "all";
+  /** Human label for the UI — "last 30 days" / "all time". */
+  label: string;
+}
+
+/**
+ * Parse the `?days=` search param. Returns null for anything not in
+ * {7, 30, 90, all} so the caller can answer 400 instead of silently serving a
+ * different period than the one the operator asked for. A missing/empty param
+ * is the default 7-day window, not an error.
+ */
+export function parseWindow(param: string | null | undefined): WindowSpec | null {
+  const raw = (param ?? "").trim();
+  if (!raw) return { days: DEFAULT_WINDOW_DAYS, label: `last ${DEFAULT_WINDOW_DAYS} days` };
+  if (raw.toLowerCase() === "all") return { days: "all", label: "all time" };
+  const num = Number(raw);
+  if (!Number.isInteger(num)) return null;
+  if (!(ALLOWED_WINDOW_DAYS as readonly number[]).includes(num)) return null;
+  return { days: num, label: `last ${num} days` };
+}
+
+/** Resolve a WindowSpec to the day keys summarizeDaily folds over. */
+export function windowDaysFor(spec: WindowSpec, now: Date = new Date()): string[] | "all" {
+  return spec.days === "all" ? "all" : windowDays(spec.days, now);
+}
+
+export interface SplitDailyItems {
+  /** Runtime-level rows (PK `agentId`): agentId → day → bucket. */
+  byAgent: Record<string, Record<string, Partial<DailyBucket>>>;
+  /** Persona rows (PK `${agentId}#${persona}`): agentId → persona → day → bucket. */
+  byPersona: Record<string, Record<string, Record<string, Partial<DailyBucket>>>>;
+}
+
+/**
+ * One scan, two row families. Persona rows carry `${agentId}#${persona}` in the
+ * partition key, so they are told apart from runtime rows by the separator
+ * alone — no extra query and no schema flag.
+ */
+export function splitDailyItems(items: Array<Record<string, unknown>>): SplitDailyItems {
+  const out: SplitDailyItems = { byAgent: {}, byPersona: {} };
+  for (const item of items) {
+    const pk = typeof item.agentId === "string" ? item.agentId : null;
+    const day = typeof item.day === "string" ? item.day : null;
+    if (!pk || !day) continue;
+    const sep = pk.indexOf("#");
+    if (sep < 0) {
+      (out.byAgent[pk] ||= {})[day] = bucketFromDailyItem(item);
+      continue;
+    }
+    const agentId = pk.slice(0, sep);
+    const persona = pk.slice(sep + 1);
+    // A half-formed key belongs to neither family — dropping it beats charging
+    // an empty agent (or every agent) with the row's sessions.
+    if (!agentId || !persona) continue;
+    ((out.byPersona[agentId] ||= {})[persona] ||= {})[day] = bucketFromDailyItem(item);
+  }
+  return out;
+}
+
+/** Map a raw CloudWatch Logs evaluator name to its UI display name. */
+export function normalizeEvaluatorName(raw: string): string {
+  if (raw.startsWith("Builtin.")) return raw.slice("Builtin.".length);
+  if (raw.includes("dependency_chain_compliance")) return "DependencyChainCompliance";
+  return raw;
+}
 
 function multiplier(pricing: Pricing, key: string, fallback: number): number {
   const v = pricing.cacheWriteMultiplier?.[key];
@@ -168,20 +248,24 @@ export function modelCost(model: string, u: Partial<DailyModelUsage>, pricing: P
 
 const round2 = (v: number) => Math.round(v * 100) / 100;
 
-/** Fold the buckets that fall inside `days` into one summary. */
+/**
+ * Fold the buckets that fall inside `days` into one summary. `days` is the
+ * explicit day-key list of a fixed window, or "all"/null meaning "every day
+ * present in `daily`" (the all-time view).
+ */
 export function summarizeDaily(
   daily: Record<string, Partial<DailyBucket>> | undefined | null,
-  days: string[],
+  days: string[] | "all" | null | undefined,
   pricing: Pricing
 ): AgentWindowSummary {
   const byModel: Record<string, DailyModelUsage> = {};
   const evalScores: Record<string, { sum: number; count: number }> = {};
   let sessions = 0;
   let calls = 0;
-  const inWindow = new Set(days);
+  const inWindow = Array.isArray(days) ? new Set(days) : null;
 
   for (const [day, bucket] of Object.entries(daily || {})) {
-    if (!inWindow.has(day) || !bucket) continue;
+    if ((inWindow && !inWindow.has(day)) || !bucket) continue;
     sessions += n(bucket.sessions);
     calls += n(bucket.calls);
     for (const [model, u] of Object.entries(bucket.byModel || {})) {
