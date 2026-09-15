@@ -245,14 +245,16 @@ test.describe("Evaluations tab (TEAM-4688)", () => {
 
     await page.locator("[data-testid=eval-window-30]").click();
     await expect(page.locator("[data-testid=eval-window-label]")).toHaveText("last 30 days");
-    expect(calls.overviewDays).toContain("30");
+    await expect.poll(() => calls.overviewDays).toContain("30");
     expect(new URL(page.url()).searchParams.get("days")).toBe("30");
-    // The timeseries request follows the window too.
-    expect(calls.timeseries.some((u) => u.includes("days=30"))).toBe(true);
+    // The timeseries request follows the window too. It is polled, not asserted
+    // outright: the sparkline fetch only fires once the overview response has
+    // repopulated the agent columns, so it trails the label by a tick.
+    await expect.poll(() => calls.timeseries.some((u) => u.includes("days=30"))).toBe(true);
 
     await page.locator("[data-testid=eval-window-all]").click();
     await expect(page.locator("[data-testid=eval-window-label]")).toHaveText("all time");
-    expect(calls.overviewDays).toContain("all");
+    await expect.poll(() => calls.overviewDays).toContain("all");
   });
 
   test("the shared-runtime column expands into its personas", async ({ page }) => {
