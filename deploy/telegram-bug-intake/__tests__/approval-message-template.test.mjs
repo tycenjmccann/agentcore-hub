@@ -178,13 +178,38 @@ const notif = (id, ts, extra = {}) => ({
   type: "review_needed", acknowledged: false, ticketId: GATE, reviewer: "engineer",
   id, timestamp: ts, ...extra,
 });
-const wf = (humanNotifications) => ({
-  workflowId: WF, phase: "ship", input: { title: RUN_TITLE }, humanNotifications,
+const wf = (humanNotifications, extra = {}) => ({
+  workflowId: WF, phase: "ship", input: { title: RUN_TITLE }, humanNotifications, ...extra,
 });
+// The only pre-completion PR signal on the wire: what the dev agent landed.
+// `wf.delivery` is written by completeWorkflow, i.e. after the phase this scan
+// skips, so it can never be the source here.
+const AGENT_TASKS = {
+  "TEAM-4600": { ticketId: "TEAM-4600", agentId: "developer", status: "complete", prUrl: "https://github.com/o/r/pull/593", completedAt: "2026-09-13T12:00:00.000Z" },
+};
+const shipped = (extra = {}) => ({ ticketId: "TEAM-4600", title: "Pipeline arg contract", status: "done", createdAt: "2026-09-12T09:00:00.000Z", ...extra });
 const rmGateTicket = (createdAt = "2026-09-14T09:00:00.000Z") => ({
   ticketId: GATE, title: RM_TITLE, description: RM_RUNBOOK, status: "in_review",
   assignee: "human:engineer", blockedBy: [], labels: ["deploy-gate"], createdAt,
 });
+/**
+ * A release-manager deploy gate for ONE target. The target is the gate key:
+ * the specifics (execution, PR, SHA) go after the em dash, so two attempts at
+ * the same target share a key and a parallel deploy of a different target does
+ * not. Defaults to a resolved earlier sibling.
+ */
+const dgate = (ticketId, target, createdAt, extra = {}) => ({
+  ticketId, title: `Deploy gate: ${target} — ${ticketId} (PR #593, main @ 9f6a9e0d)`,
+  description: RM_RUNBOOK, status: "done", assignee: "human:engineer",
+  blockedBy: [], labels: ["deploy-gate"], createdAt, ...extra,
+});
+/** What the bridge itself records when it delivers a ❌ + note (gaterework#<id>). */
+const REJECTION = "the deploy gate must name one execution, not three";
+const seedRework = (ticketId, reason = REJECTION) =>
+  db.items.set(`gaterework#${ticketId}`, {
+    id: { S: `gaterework#${ticketId}` }, reason: { S: reason }, at: { S: "2026-09-13T18:00:00.000Z" },
+  });
+const attemptLinesOf = (text) => text.match(/^Attempt .*$/gm) || [];
 const run = async (handler, overrides) => {
   const ctx = makeCtx();
   const net = makeNet(ctx, overrides);
@@ -198,8 +223,8 @@ describe("approval pings are built from structured inputs, never from ticket pro
     const mod = await loadModule();
     const net = await run(mod.handler, {
       batches: [[]],
-      workflows: [wf([notif(`notif_${GATE}_2026-09-14T10:00:00.000Z`, "2026-09-14T10:00:00.000Z")])],
-      tickets: [rmGateTicket(), { ticketId: "TEAM-4600", title: "Pipeline arg contract", createdAt: "2026-09-12T09:00:00.000Z" }],
+      workflows: [wf([notif(`notif_${GATE}_2026-09-14T10:00:00.000Z`, "2026-09-14T10:00:00.000Z")], { agentTasks: AGENT_TASKS })],
+      tickets: [rmGateTicket(), shipped()],
     });
 
     expect(net.sent).toHaveLength(1);
@@ -208,8 +233,10 @@ describe("approval pings are built from structured inputs, never from ticket pro
     // 1. the kicker is a table entry keyed off the title PREFIX, nothing more
     expect(text).toMatch(mod.APPROVAL_KICKER_RE);
     expect(text).toMatch(/^\*🚦 DEPLOY REVIEW GATE — approval needed\*/);
-    // 2. the body is the RUN, not the ticket
+    // 2. the body is the RUN, not the ticket — plus WHAT is shipping, which for
+    //    a gate with no blockedBy comes from the run's landed PRs (TEAM-4671 F3)
     expect(text).toContain(RUN_TITLE);
+    expect(text).toContain("shipping: Pipeline arg contract");
     // 3. nothing the release manager wrote leaks — ids, SHAs, console steps,
     //    pipeline state, the attempt count, or any description sentence
     for (const leak of ["347b9bcb", "19688946", "9f6a9e0d", "InProgress", "CODEPIPELINE CONSOLE", "(3×)", "Stage:"]) {
@@ -230,6 +257,33 @@ describe("approval pings are built from structured inputs, never from ticket pro
     expect(btns.some((b) => b.callback_data === `gok|${GATE}|${WF}`)).toBe(true);
     expect(btns.some((b) => b.callback_data === `gno|${GATE}|${WF}`)).toBe(true);
     expect(btns.some((b) => b.text === "📱 Open approval in hub")).toBe(true);
+  });
+
+  /**
+   * TEAM-4671 F3. `blockedBy` is an array in dynamodb mode and a comma-joined
+   * STRING in jira mode (jira-read.ts:145), so .map() threw a TypeError the
+   * caller's catch swallowed — every Jira-mode gate paged with no shipping list
+   * at all, silently. The upstream work is the whole point of the line: it is
+   * what the reviewer is being asked to approve.
+   */
+  it("the upstream work is listed whether blockedBy is an array or a comma-joined string", async () => {
+    const upstream = [
+      shipped(),
+      { ticketId: "TEAM-4601", title: "CI guard for buildspec args", status: "done", createdAt: "2026-09-12T10:00:00.000Z" },
+    ];
+    for (const blockedBy of [["TEAM-4600", "TEAM-4601"], "TEAM-4600,TEAM-4601", "TEAM-4600, TEAM-4601"]) {
+      db.items.clear();
+      db.items.set(`chat#${CHAT}`, { id: { S: `chat#${CHAT}` }, chatId: { N: String(CHAT) } });
+      const mod = await loadModule();
+      const text = (await run(mod.handler, {
+        batches: [[]],
+        workflows: [wf([notif(`notif_${GATE}_2026-09-14T10:00:00.000Z`, "2026-09-14T10:00:00.000Z")])],
+        tickets: [{ ...rmGateTicket(), blockedBy }, ...upstream],
+      })).sent[0].text;
+
+      expect(text, `blockedBy=${JSON.stringify(blockedBy)}`).toContain("shipping: Pipeline arg contract, CI guard for buildspec args");
+      expect(text.length).toBeLessThanOrEqual(mod.APPROVAL_TEXT_MAX);
+    }
   });
 
   it("a re-parked gate says Attempt 2 ONCE, with the note the bridge delivered", async () => {
@@ -277,25 +331,90 @@ describe("approval pings are built from structured inputs, never from ticket pro
     expect(text).not.toContain("347b9bcb");
   });
 
-  it("a release manager who files a NEW gate ticket per attempt gets the attempt counted", async () => {
+  /**
+   * TEAM-4671 robustness. `oneLine(s) = String(s ?? "").replace(...).trim()`
+   * never throws and always returns a string, so `gateKey(self?.title)` is
+   * safe even when `self` is undefined — but prove the OUTCOME that matters:
+   * a tickets-view outage must not fall through to the try/catch's `attempt: 1`
+   * and silently wipe out the notif-derived count, which needs no ticket at
+   * all (it only walks `wf.humanNotifications`).
+   */
+  it("a tickets-view outage does not reset the notif-derived attempt count", async () => {
     const mod = await loadModule();
-    const net = await run(mod.handler, {
-      batches: [[]],
-      workflows: [wf([notif(`notif_${GATE}_2026-09-14T10:00:00.000Z`, "2026-09-14T10:00:00.000Z")])],
-      tickets: [
-        rmGateTicket("2026-09-14T09:00:00.000Z"),
-        // The two earlier follow-ups for the same execution (TEAM-4656/4657).
-        { ticketId: "TEAM-4656", title: "Deploy gate: approve the queued deploy", status: "done", labels: ["deploy-gate"], createdAt: "2026-09-13T09:00:00.000Z" },
-        { ticketId: "TEAM-4657", title: "Deploy gate: approve it in the console", status: "done", labels: ["deploy-gate"], createdAt: "2026-09-13T17:00:00.000Z" },
-        // Same run, not a gate → must not inflate the count.
-        { ticketId: "TEAM-4601", title: "Dev: pipeline arg contract", status: "done", labels: ["dev"], createdAt: "2026-09-12T09:00:00.000Z" },
-      ],
-    });
+    const cycle1 = notif(`notif_${GATE}_2026-09-14T10:00:00.000Z`, "2026-09-14T10:00:00.000Z", { acknowledged: true });
+    const cycle2 = notif(`notif_${GATE}_2026-09-14T18:00:00.000Z`, "2026-09-14T18:00:00.000Z");
+    // No `tickets` override → the /tickets endpoint 404s (net.tickets is null),
+    // so gateTicketOf degrades to { gateTicket: null, tickets: [] }. The ping
+    // must still go out, keyed on the notif's own ticketId as the title.
+    const { sent } = await run(mod.handler, { batches: [[]], workflows: [wf([cycle1, cycle2])] });
 
-    const text = net.sent[0].text;
-    expect(text).toMatch(/^Attempt 3 — previous issue: changes requested on the previous attempt$/m);
-    expect((text.match(/^Attempt .*$/gm) || [])).toHaveLength(1);
+    expect(sent).toHaveLength(1);
+    expect(attemptLinesOf(sent[0].text)).toEqual(["Attempt 2"]);
+  });
+
+  /**
+   * TEAM-4671 F1. A release manager files a NEW ticket per attempt, so the
+   * sibling tickets ARE the cycle history — but only where a rejection was
+   * actually recorded. The counter used to match on the title PREFIX alone
+   * ("deploy gate") with no evidence at all, and then asserted a reason it had
+   * invented, so a first-ever page for one deploy claimed the human had
+   * rejected it because a DIFFERENT deploy existed in the same run.
+   */
+  const pagedNotif = () => notif(`notif_${GATE}_2026-09-14T10:00:00.000Z`, "2026-09-14T10:00:00.000Z");
+  const pageGate = async (mod, tickets) => (await run(mod.handler, {
+    batches: [[]], workflows: [wf([pagedNotif()])], tickets,
+  })).sent[0].text;
+
+  it("counts an earlier attempt at the SAME target only when a rejection was recorded, and quotes it", async () => {
+    const mod = await loadModule();
+    seedRework("TEAM-4657"); // the ❌ + note the bridge delivered on that ticket
+    const text = await pageGate(mod, [
+      dgate(GATE, "the queued deploy", "2026-09-14T09:00:00.000Z", { status: "in_review" }),
+      dgate("TEAM-4657", "the queued deploy", "2026-09-13T17:00:00.000Z"),
+      // A different deploy in the same run, and a non-gate ticket: neither is an
+      // attempt at THIS gate, evidence or not.
+      dgate("TEAM-4656", "the staging deploy", "2026-09-13T09:00:00.000Z"),
+      { ticketId: "TEAM-4601", title: "Dev: pipeline arg contract", status: "done", labels: ["dev"], createdAt: "2026-09-12T09:00:00.000Z" },
+    ]);
+
+    expect(attemptLinesOf(text)).toEqual([`Attempt 2 — previous issue: ${REJECTION}`]);
     expect(text.length).toBeLessThanOrEqual(mod.APPROVAL_TEXT_MAX);
+  });
+
+  it("an earlier same-target gate that was never rejected is NOT an attempt (TEAM-4656/57/58)", async () => {
+    const mod = await loadModule();
+    const text = await pageGate(mod, [
+      dgate(GATE, "the queued deploy", "2026-09-14T09:00:00.000Z", { status: "in_review" }),
+      // Resolved, earlier, same target — but no gaterework row: it was approved,
+      // or it was never presented at all. `status: "done"` is not a verdict.
+      dgate("TEAM-4657", "the queued deploy", "2026-09-13T17:00:00.000Z"),
+      dgate("TEAM-4656", "the queued deploy", "2026-09-13T09:00:00.000Z"),
+    ]);
+
+    expect(attemptLinesOf(text)).toEqual([]);
+    expect(text).not.toContain("previous issue");
+  });
+
+  it("a parallel deploy of a DIFFERENT target is never a previous attempt", async () => {
+    const mod = await loadModule();
+    const text = await pageGate(mod, [
+      dgate(GATE, "pipeline-b", "2026-09-14T09:00:00.000Z", { status: "in_review" }),
+      dgate("TEAM-4657", "pipeline-a", "2026-09-13T17:00:00.000Z"),
+    ]);
+
+    expect(attemptLinesOf(text)).toEqual([]);
+  });
+
+  it("a rejection recorded against a DIFFERENT target does not count, and its reason is never quoted", async () => {
+    const mod = await loadModule();
+    seedRework("TEAM-4657", "pipeline-a rolled back the migration");
+    const text = await pageGate(mod, [
+      dgate(GATE, "pipeline-b", "2026-09-14T09:00:00.000Z", { status: "in_review" }),
+      dgate("TEAM-4657", "pipeline-a", "2026-09-13T17:00:00.000Z"),
+    ]);
+
+    expect(attemptLinesOf(text)).toEqual([]);
+    expect(text).not.toContain("rolled back the migration");
   });
 
   it("the CodePipeline deploy ping keeps its brief, and the terse fallback is builder-stamped", async () => {

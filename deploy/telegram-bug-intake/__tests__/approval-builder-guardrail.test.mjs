@@ -80,6 +80,49 @@ const APPROVAL_SITES = [
 // …of which these actually deliver.
 const SENDERS = APPROVAL_SITES.filter((n) => n !== "deadSessionPing");
 
+/**
+ * Every Telegram send in index.mjs, attributed to its enclosing top-level
+ * function. All sends live inside a column-0 declaration (nested closures and
+ * loops don't matter — the nearest preceding one is the enclosing function), in
+ * one of these forms:
+ *   function f(  |  async function f(  |  export const f = async (  |  const f = (
+ */
+const DECL_RE = /^(?:export\s+)?(?:async\s+)?(?:function\s+(\w+)|const\s+(\w+)\s*=)/;
+const SEND_RE = /\btgSend\s*\(|\btgSendPlain\s*\(|\btgCall\s*\(\s*["']sendMessage["']/;
+// These two ARE the send primitives (thin tgCall wrappers), not call sites.
+const TG_PRIMITIVES = new Set(["tgSend", "tgSendPlain"]);
+
+function sitesByFunction(src, pattern, skip = new Set()) {
+  const counts = new Map();
+  const sites = [];
+  let current = "<module scope>";
+  src.split("\n").forEach((line, i) => {
+    const d = line.match(DECL_RE);
+    if (d) current = d[1] || d[2];
+    if (!pattern.test(line) || skip.has(current)) return;
+    counts.set(current, (counts.get(current) || 0) + 1);
+    sites.push({ fn: current, line: i + 1 });
+  });
+  return { counts, sites };
+}
+
+/**
+ * The complete inventory of non-approval Telegram sends, by enclosing function.
+ * An approval/gate page must go through sendApprovalPing — which is why it is in
+ * this list exactly once (its one tgSend) and no other approval site is.
+ * A new entry here means a new function talks to Telegram directly.
+ */
+const ALLOWED_TG_SENDS = {
+  handler: 1,                 // the "⚠️ Failed to process" fallback reply
+  routeMessage: 8,            // authz + voice-note errors, transcript echo, help
+  flushSettledBuffers: 1,     // per-buffer failure notice
+  processBug: 2,              // filed-ticket confirmations
+  sendApprovalPing: 1,        // ← the approval path; its text is builder-stamped
+  resolveReworkTarget: 1,     // stray-DECISION hint
+  deliverReworkNote: 2,       // rework Retry/Drop prompt + delivered confirmation
+  relayToWorkflowManager: 3,  // WM relay chunks, empty-reply and failure notices
+};
+
 describe("approval pings can only be composed by the builder", () => {
   it("no approval site formats or sends its own text", () => {
     for (const name of APPROVAL_SITES) {
@@ -93,6 +136,31 @@ describe("approval pings can only be composed by the builder", () => {
     for (const name of SENDERS) {
       expect(bodyOf(SRC, name), `${name}() must deliver via sendApprovalPing`).toMatch(/\bsendApprovalPing\s*\(/);
     }
+  });
+
+  /**
+   * TEAM-4671 F4 — the two tests above only look at the five names hardcoded in
+   * APPROVAL_SITES, so a SIXTH approval scan added tomorrow was checked by
+   * nothing at all. These two close the list from both ends: no unlisted
+   * function may send to Telegram, and no function may send an approval ping
+   * without being an approval site.
+   */
+  it("no function outside the allowlist sends to Telegram", () => {
+    const { counts, sites } = sitesByFunction(SRC, SEND_RE, TG_PRIMITIVES);
+    const unlisted = sites.filter((s) => !(s.fn in ALLOWED_TG_SENDS));
+    const where = unlisted.map((s) => `${s.fn}() at index.mjs:${s.line}`).join(", ");
+    expect(unlisted, where && `${where} sends to Telegram directly. If it pages a human for an approval or a gate, route it through sendApprovalPing() so the builder stamps and caps the text; if it is not an approval, allowlist it in ALLOWED_TG_SENDS here with a comment saying why.`).toEqual([]);
+    // Exact counts, so a send that MOVES between functions is noticed too.
+    expect(Object.fromEntries(counts), "ALLOWED_TG_SENDS is out of date — re-verify every send site against index.mjs").toEqual(ALLOWED_TG_SENDS);
+  });
+
+  it("every function that sends an approval ping is an APPROVAL_SITE", () => {
+    const { counts } = sitesByFunction(SRC, /\bsendApprovalPing\s*\(/, new Set(["sendApprovalPing"]));
+    const senders = [...counts.keys()].sort();
+    for (const fn of senders) {
+      expect(APPROVAL_SITES, `${fn}() sends an approval ping — add it to APPROVAL_SITES so its body is checked`).toContain(fn);
+    }
+    expect(senders, "an approval site stopped delivering — was a ping dropped?").toEqual([...SENDERS].sort());
   });
 
   it("only the builder renders a ping, and the sender rejects anything unstamped", () => {
@@ -126,6 +194,25 @@ describe("approval pings can only be composed by the builder", () => {
       expect(mod._buildApprovalMessageForTests({ gateKind: kind, subject: "A run" })).toContain("REVIEW GATE");
     }
     expect(mod._buildApprovalMessageForTests({ gateKind: "escalation", subject: "A run" })).toContain("SHIP-REVIEW ESCALATION");
+  });
+
+  /**
+   * TEAM-4671 F1 — the attempt line used to fall back to the literal
+   * "previous issue: changes requested on the previous attempt" whenever no
+   * reason was recorded, asserting a human verdict the bridge has no evidence
+   * for. It must now render the bare count, and only speak a reason it was
+   * actually given.
+   */
+  it("the attempt line is neutral with no recorded reason, and states one when given (TEAM-4671 F1)", async () => {
+    const mod = await import("../index.mjs");
+    const neutral = mod._buildApprovalMessageForTests({ gateKind: "deploy", subject: "A run", attempt: 2 });
+    expect(neutral).toMatch(/^Attempt 2$/m);
+    expect(neutral).not.toContain("previous issue");
+    expect(neutral).not.toContain("changes requested");
+    expect(neutral.match(/^Attempt .*$/gm) || []).toHaveLength(1);
+
+    const withReason = mod._buildApprovalMessageForTests({ gateKind: "deploy", subject: "A run", attempt: 2, previousIssue: "x" });
+    expect(withReason).toMatch(/^Attempt 2 — previous issue: x$/m);
   });
 
   it("the cap sheds content, never the kicker, handle, attempt line or ask", async () => {
