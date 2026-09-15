@@ -52,7 +52,9 @@ class TestBuildEnvVars(unittest.TestCase):
             return deploy_one_robust.build_env_vars(AGENT, f"prompts/{AGENT}.txt")
 
     def test_otel_service_name(self):
-        self.assertEqual(self.build()["OTEL_SERVICE_NAME"], AGENT)
+        # Must match the platform "<runtime>.<endpoint>" shape — online-eval
+        # configs and the hub metrics/sessions routes filter on "<name>.DEFAULT".
+        self.assertEqual(self.build()["OTEL_SERVICE_NAME"], f"{AGENT}.DEFAULT")
 
     def test_otel_resource_attributes_not_set(self):
         # TEAM-3313: covered by the PLATFORM_MANAGED guard too, but assert

@@ -1,6 +1,6 @@
 {
   "created": "2026-05-22",
-  "updated": "2026-08-27",
+  "updated": "2026-09-15",
   "sampling_rate": "tiered (TEAM-3366 §2.4 / TEAM-3376): 100% for gate roles (requirements_analyst, qa_verifier, ci_agent), 25% for all other agents",
   "judge_model": "us.anthropic.claude-opus-5",
   "evaluators": [
@@ -19,7 +19,7 @@
   ],
   "custom_evaluators": {
     "dependency_chain_compliance_online": "dependency_chain_compliance_online_v3-M1N0o94Jsa",
-    "dependency_chain_compliance_online_previous": "dependency_chain_compliance_online-mbLh2kEFhw (locked, superseded 2026-09-10; still attached nowhere — delete when convenient)",
+    "dependency_chain_compliance_online_previous": "dependency_chain_compliance_online-mbLh2kEFhw (locked, superseded 2026-09-10; was still attached to eval_agentcore_hub_agent until 2026-09-15 — swapped for _v3 then; now attached nowhere, delete when convenient)",
     "dependency_chain_compliance_ondemand": "dependency_chain_compliance-VyBv7H2bCi",
     "_note": "PR #496 (2026-09-10): rubric moved to dev -> [code_reviewer] -> CI -> QA. The live evaluator was LOCKED (attached to an online config), so in-place update was refused; created _v3 from the merged JSON and swapped it into eval_agentcore_hub_requirements_analyst-HbkURg7M1P via update-online-evaluation-config (only that config touched). Earlier: TEAM-3103: dependency_chain_evaluator.json rubric corrected to route QA through code_reviewer (design -> dev -> code_reviewer -> qa_verifier -> ci/security), matching the actual pipeline. Applied via in-place 'agentcore eval evaluator update' where the IDs above are unchanged. If the evaluator was instead recreated (new account-generated ID), refresh the IDs above and CUSTOM_EVALUATOR in setup-evaluations.sh — see that script's re-registration comment block."
   },
@@ -39,7 +39,8 @@
     "eval_agentcore_hub_localization": "eval_agentcore_hub_localization-XXXX",
     "eval_agentcore_hub_qa_verifier": "eval_agentcore_hub_qa_verifier-XXXX",
     "eval_agentcore_hub_requirements_analyst": "eval_agentcore_hub_requirements_analyst-XXXX",
-    "eval_agentcore_hub_security_reviewer": "eval_agentcore_hub_security_reviewer-XXXX"
+    "eval_agentcore_hub_security_reviewer": "eval_agentcore_hub_security_reviewer-XXXX",
+    "eval_agentcore_hub_agent": "eval_agentcore_hub_agent-wuNv8o5ZBa"
   },
   "notes": {
     "trajectory_evaluators": "TrajectoryInOrderMatch/ExactOrderMatch/AnyOrderMatch require reference inputs — only usable in on-demand evaluations, not online",
@@ -47,6 +48,7 @@
     "dependency_chain_agents": "TEAM-3368/TEAM-3376: only requirements_analyst has the custom evaluator — it is the only role that CREATES the ticket dependency graph; qa_verifier/ci_agent reassign rather than construct chains and scored rubric-mismatch zeros. Other agents get Builtin.Helpfulness in the fifth slot. lambda/eval-packager/index.mjs role-guards against config drift here.",
     "sampling": "Tiered sampling keeps the Opus judge under its RPM quota. If throttling persists anyway, see 'Eval judge throttling (quota)' in docs/orchestration-tracing-guide.md for the operator quota-increase runbook.",
     "monitoring_region": "eval-success-rate-alarm.json and eval-health-dashboard.json hard-code us-east-1 (pure JSON can't carry comments); substitute the region at apply time — see the monitoring comment blocks in setup-evaluations.sh.",
-    "max_evaluators": "API limit is 10 evaluators per config; TEAM-3366 §2.4 trimmed every config to 5 to cut Opus-judge load."
+    "max_evaluators": "API limit is 10 evaluators per config; TEAM-3366 §2.4 trimmed every config to 5 to cut Opus-judge load.",
+    "shared_runtime_service_name": "2026-09-15: eval_agentcore_hub_agent produced ZERO results 2026-08-30 → 2026-09-15 because deploy-one.sh set OTEL_SERVICE_NAME to the bare agent name while the config's dataSourceConfig.serviceNames (max 1 entry) is '<name>.DEFAULT'. Fixed by pinning OTEL_SERVICE_NAME='<name>.DEFAULT' in deploy-one.sh / deploy-one-robust.py and flipping the live runtime env (set-runtime-env.py). Config also reconciled to the 5-evaluator matrix with the _v3 custom evaluator the same day. When eval results stop, compare the config's serviceNames against live resource.attributes.service.name first."
   }
 }

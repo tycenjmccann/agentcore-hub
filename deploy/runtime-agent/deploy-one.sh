@@ -216,7 +216,12 @@ PROMPT_ENV="--env SYSTEM_PROMPT_S3_KEY=${PROMPT_S3_KEY}"
 # carries aws.log.group.names, and a deploy-time value REPLACES (never merges
 # with) the platform one, breaking CloudWatch log-group correlation.
 # OTEL_SERVICE_NAME takes precedence over service.name in resource attributes
-# per the OTel spec, so per-persona identity is preserved without it. NEVER
+# per the OTel spec, so per-persona identity is preserved without it. It MUST
+# keep the platform's "<runtime>.<endpoint>" shape (= "<name>.DEFAULT"): the
+# online-eval configs' dataSourceConfig.serviceNames filter, the hub's
+# /api/agentcore/metrics token attribution and the traces/sessions agent
+# filter all key on "<name>.DEFAULT". A bare name silently produces zero eval
+# results and zero dashboard tokens (2026-08-30 to 2026-09-15 outage). NEVER
 # set DISABLE_ADOT_OBSERVABILITY: without ADOT the invoke_agent span is never
 # exported and eval batches score 0/10.
 run_deploy() {
@@ -240,7 +245,7 @@ run_deploy() {
     --env "HOME=/tmp" \
     --env "TMPDIR=/tmp" \
     --env "UNIFIED_TRACES_DESTINATION_ENABLED=true" \
-    --env "OTEL_SERVICE_NAME=${AGENT_NAME}" \
+    --env "OTEL_SERVICE_NAME=${AGENT_NAME}.DEFAULT" \
     --env "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true" \
     ${FLEET_MEMORY_ID:+--env "MEMORY_ID=${FLEET_MEMORY_ID}"} \
     ${IOS_TEST_GATEWAY_URL:+--env "IOS_TEST_GATEWAY_URL=${IOS_TEST_GATEWAY_URL}"} \
