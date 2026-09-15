@@ -116,7 +116,8 @@ const jsonRes = (body, ok = true, status = 200) => ({ ok, status, json: async ()
 function makeNet(ctx, overrides = {}) {
   const net = {
     ctx, polls: 0, batches: [], afterPoll: [], workflows: [], tickets: null,
-    sent: [], answered: [], edited: [], transitions: [], github: null, ...overrides,
+    sent: [], answered: [], edited: [], transitions: [], github: null,
+    transitionStatus: 200, transitionBody: null, ...overrides,
   };
   net.fetch = async (url, opts) => {
     const u = String(url);
@@ -127,7 +128,13 @@ function makeNet(ctx, overrides = {}) {
       return jsonRes({});
     }
     if (u === `${HUB}/api/workflow/list`) return jsonRes({ workflows: net.workflows });
-    if (u.endsWith("/tickets/transition")) { net.transitions.push(body); return jsonRes({ success: true }); }
+    if (u.endsWith("/tickets/transition")) {
+      net.transitions.push(body);
+      if (net.transitionStatus !== 200) {
+        return jsonRes(net.transitionBody || { error: "Ticket transition rejected" }, false, net.transitionStatus);
+      }
+      return jsonRes({ success: true });
+    }
     if (/\/api\/workflow\/[^/]+\/tickets$/.test(u)) {
       return net.tickets ? jsonRes({ tickets: net.tickets }) : jsonRes({}, false, 404);
     }
@@ -480,6 +487,124 @@ describe("approval pings are built from structured inputs, never from ticket pro
     // otherwise be filed as a rework note against whatever key it mentions.
     expect(text).not.toContain("REVIEW GATE");
     expect(text).not.toContain("Changes requested");
+  });
+});
+
+/**
+ * TEAM-4675 (ship-review F1 on PR #603). recordGateRework's placeholder
+ * ("changes requested", written the instant ❌ is tapped, before any note
+ * exists — see the ❌-branch comment in index.mjs) used to have no exit: ✅
+ * Approve and 🗑 Drop each cleared only the rej#<chatId> marker, so a ❌
+ * tapped by mistake and then approved — or a note whose delivery failed and
+ * was dropped — left `gaterework#<ticketId>` standing forever (well, 30
+ * days). approvalAttempt's sibling scan (index.mjs ~1443) treats that row as
+ * an evidenced rejection for the next same-target gate, so a human who
+ * APPROVED gate A got told, on gate B, that they had rejected it.
+ */
+describe("a ❌ that never became a rejection is not a previous attempt (TEAM-4675)", () => {
+  const GATE_B = "TEAM-4659";
+  const REWORK_KEY = `gaterework#${GATE}`;
+  const tapGno = (updateId = 1) => ({
+    update_id: updateId,
+    callback_query: { id: `cb-${updateId}`, data: `gno|${GATE}|${WF}`, message: { message_id: 7, chat: { id: CHAT }, text: "ping" } },
+  });
+  const tapGok = (updateId = 2) => ({
+    update_id: updateId,
+    callback_query: { id: `cb-${updateId}`, data: `gok|${GATE}|${WF}`, message: { message_id: 7, chat: { id: CHAT }, text: "ping" } },
+  });
+  const tapDrop = (updateId = 3) => ({
+    update_id: updateId,
+    callback_query: { id: `cb-${updateId}`, data: `rjx|${GATE}`, message: { message_id: 8, chat: { id: CHAT }, text: "⚠️ Couldn't send…" } },
+  });
+  // Gate B: same target as GATE, filed later in the run — the RM-authored,
+  // new-ticket-per-attempt shape the sibling scan exists for.
+  const pageGateB = async (mod) => (await run(mod.handler, {
+    batches: [[]],
+    workflows: [wf([notif(`notif_${GATE_B}_2026-09-14T18:30:00.000Z`, "2026-09-14T18:30:00.000Z", { ticketId: GATE_B })])],
+    tickets: [
+      dgate(GATE_B, "the queued deploy", "2026-09-14T18:00:00.000Z", { status: "in_review" }),
+      dgate(GATE, "the queued deploy", "2026-09-14T09:00:00.000Z"),
+    ],
+  })).sent[0].text;
+
+  it("❌ then ✅ on gate A leaves no evidence for a later same-target gate B", async () => {
+    const mod = await loadModule();
+
+    await run(mod.handler, { batches: [[tapGno()]] });
+    expect(db.items.has(REWORK_KEY), "the ❌ tap writes the placeholder").toBe(true);
+
+    // …tapped by mistake — ✅ Approve the same ticket.
+    const approved = await run(mod.handler, { batches: [[tapGok()]] });
+    expect(approved.transitions[0]).toMatchObject({ ticketId: GATE, targetStatus: "done" });
+
+    // Behavioural symptom first: gate B must not read A's ❌ as an attempt.
+    const text = await pageGateB(mod);
+    expect(attemptLinesOf(text)).toEqual([]);
+    expect(text).not.toContain("previous issue");
+    expect(text).not.toContain("changes requested");
+    expect(text).toMatch(mod.APPROVAL_KICKER_RE);
+    expect(text.length).toBeLessThanOrEqual(mod.APPROVAL_TEXT_MAX);
+
+    // Mechanism second: ✅ actually retracted the placeholder.
+    expect(db.deletes).toContain(REWORK_KEY);
+    expect(db.items.has(REWORK_KEY), "✅ retracts the placeholder").toBe(false);
+  });
+
+  it("❌ → failed note delivery → 🗑 Drop leaves no evidence for a later same-target gate B", async () => {
+    const mod = await loadModule();
+
+    await run(mod.handler, { batches: [[tapGno()]] });
+    expect(db.items.has(REWORK_KEY)).toBe(true);
+
+    // The note is typed, but the hub refuses the transition — parked with
+    // Retry/Drop, same shape as gate-rework-note.test.mjs's 409 case.
+    const failed = await run(mod.handler, {
+      batches: [[{ update_id: 2, message: { message_id: 2, chat: { id: CHAT }, from: { id: CHAT }, text: "the fix broke the smoke test" } }]],
+      afterPoll: [100_000],
+      transitionStatus: 409,
+      transitionBody: { error: "Ticket transition rejected", details: 'No transition to "Blocked" found.' },
+    });
+    expect(failed.transitions).toHaveLength(1);
+    const warn = failed.sent.find((m) => /Couldn't send/.test(m.text));
+    expect(warn?.reply_markup?.inline_keyboard.flat().map((b) => b.callback_data)).toEqual([`rjr|${GATE}|${WF}`, `rjx|${GATE}`]);
+    expect(db.items.has(REWORK_KEY), "no rework was ever delivered — only the placeholder exists").toBe(true);
+
+    const dropped = await run(mod.handler, { batches: [[tapDrop()]] });
+    expect(dropped.edited[0].text).toMatch(/dropped/i);
+
+    // Behavioural symptom first: gate B must not read A's ❌ as an attempt.
+    const text = await pageGateB(mod);
+    expect(attemptLinesOf(text)).toEqual([]);
+    expect(text).not.toContain("previous issue");
+
+    // Mechanism second: Drop actually retracted the placeholder.
+    expect(db.deletes).toContain(REWORK_KEY);
+    expect(db.items.has(REWORK_KEY), "Drop retracts the placeholder").toBe(false);
+  });
+
+  it("the pre-existing Attempt-2 case is unaffected: a delivered note still counts", async () => {
+    const mod = await loadModule();
+    const cycle1 = notif(`notif_${GATE}_2026-09-14T10:00:00.000Z`, "2026-09-14T10:00:00.000Z");
+    const cycle2 = notif(`notif_${GATE}_2026-09-14T18:00:00.000Z`, "2026-09-14T18:00:00.000Z");
+    const tickets = [rmGateTicket()];
+
+    const first = await run(mod.handler, { batches: [[]], workflows: [wf([cycle1])], tickets });
+    expect(first.sent[0].text).not.toMatch(/Attempt/);
+
+    await run(mod.handler, { batches: [[tapGno()]] });
+    const noted = await run(mod.handler, {
+      batches: [[{ update_id: 2, message: { message_id: 2, chat: { id: CHAT }, from: { id: CHAT }, text: "the deploy gate must name one execution, not three" } }]],
+      afterPoll: [100_000],
+    });
+    expect(noted.transitions[0]).toMatchObject({ ticketId: GATE, targetStatus: "blocked" });
+    expect(db.items.get(REWORK_KEY)?.reason?.S).toBe("the deploy gate must name one execution, not three");
+
+    const second = await run(mod.handler, {
+      batches: [[]],
+      workflows: [wf([{ ...cycle1, acknowledged: true }, cycle2])],
+      tickets,
+    });
+    expect(attemptLinesOf(second.sent[0].text)).toEqual(["Attempt 2 — previous issue: the deploy gate must name one execution, not three"]);
   });
 });
 

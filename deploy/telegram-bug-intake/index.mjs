@@ -1493,6 +1493,25 @@ async function readGateRework(ticketId) {
   }
 }
 
+/**
+ * A ❌ that never became a rejection is not evidence. The placeholder written by
+ * the tap (recordGateRework below) must not outlive the cycle: an approved gate,
+ * or a dropped undelivered note, would otherwise read to approvalAttempt as an
+ * evidenced previous attempt and page the next same-target gate with a verdict
+ * the human never gave (TEAM-4671's invariant). Best-effort, like the rej#
+ * marker deletes: a failed retraction must not cost the tap its answer.
+ */
+async function deleteGateRework(ticketId) {
+  if (!ticketId) return;
+  try {
+    await ddb.send(new DeleteItemCommand({
+      TableName: PENDING_TABLE, Key: { id: { S: `${GATE_REWORK_PREFIX}${ticketId}` } },
+    }));
+  } catch (err) {
+    console.warn(`[telegram-bug-intake] rework reason for ${ticketId} not cleared:`, err.message);
+  }
+}
+
 async function handleGateCallback(cb, chatId, action, ticketId, workflowId) {
   // Gate pings go to every registered chat, but only allowlisted chats may
   // transition tickets. Ack the tap (or Telegram re-sends the callback query)
@@ -1508,6 +1527,9 @@ async function handleGateCallback(cb, chatId, action, ticketId, workflowId) {
     // chat's next message into a rework note for a gate that is now done.
     const stale = await getPendingRejection(chatId);
     if (stale?.ticketId === ticketId) await deletePendingRejection(chatId);
+    // …and the ❌'s rework row, so a later gate at the same target is not paged
+    // with a "previous issue" for a cycle the human APPROVED (TEAM-4675).
+    await deleteGateRework(ticketId);
     await tgAnswer(cb.id, `Approved ${ticketId}`);
     // TEAM-3971: the API records a bare approve on an escalation gate as
     // DECISION: merge-with-known-findings — say so, the human should know.
@@ -1522,7 +1544,8 @@ async function handleGateCallback(cb, chatId, action, ticketId, workflowId) {
   // the note (resolveReworkTarget → deliverReworkNote).
   await putPendingRejection(chatId, ticketId, workflowId);
   // Placeholder reason NOW, so the re-park page carries an Attempt line even if
-  // the note never arrives; deliverReworkNote overwrites it with the real note.
+  // the note never arrives; deliverReworkNote overwrites it with the real note,
+  // and ✅ / 🗑 Drop retract it — an unrejected cycle is not evidence (TEAM-4675).
   await recordGateRework(ticketId, "changes requested");
   await tgAnswer(cb.id, "Reply with what needs to change.");
   await tgEdit(chatId, cb.message.message_id,
@@ -1693,6 +1716,9 @@ async function deliverReworkNote(chatId, { ticketId, workflowId }, text) {
 async function handleReworkRetryCallback(cb, chatId, action, ticketId, workflowId) {
   if (action === "rjx") {
     await deletePendingRejection(chatId);
+    // The note was never delivered (deliverReworkNote threw before recording it),
+    // so the ❌'s placeholder is all that is left and it evidences nothing.
+    await deleteGateRework(ticketId);
     await tgAnswer(cb.id, "Dropped");
     await tgEdit(chatId, cb.message.message_id,
       `${cb.message.text}\n\n🗑 Note dropped. ${ticketId} is still waiting on you.`);
