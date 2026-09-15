@@ -685,6 +685,13 @@ export async function invokeAgentRuntime(params: {
   // Node ESM the assignment throws and the interval never clears.)
   let closed = false;
   let heartbeat: ReturnType<typeof setInterval> | undefined;
+  // Set ONLY by cancel(). `closed` cannot do this job: the normal completion
+  // path sets it too, so the outer catch could not tell a departed consumer from
+  // a genuine upstream failure.
+  let cancelled = false;
+  // Hoisted so cancel() can release the runtime body instead of leaving it open
+  // until the persona finishes its turn.
+  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
 
   return new ReadableStream({
     async start(controller) {
@@ -730,7 +737,7 @@ export async function invokeAgentRuntime(params: {
           };
 
           if (typeof src.transformToWebStream === "function") {
-            const reader = src.transformToWebStream().getReader();
+            reader = src.transformToWebStream().getReader();
             const decoder = new TextDecoder();
             let buf = "";
             // true = SSE (forward per line), false = one JSON/NDJSON document
@@ -740,6 +747,10 @@ export async function invokeAgentRuntime(params: {
             try {
               for (;;) {
                 const { done, value } = await reader.read();
+                // The loop's only suspension point. If the consumer cancelled
+                // while we were parked here, the controller is already closed and
+                // every enqueue below would throw.
+                if (cancelled) return;
                 if (done) break;
                 const chunk = decoder.decode(value, { stream: true });
                 if (!chunk) continue;
@@ -759,20 +770,27 @@ export async function invokeAgentRuntime(params: {
                 }
               }
               buf += decoder.decode(); // flush any multi-byte remainder
+              traceReceived(); // a zero-chunk body gets this trace too
               if (sse === true) {
                 if (buf.startsWith("data: ")) {
                   controller.enqueue(encoder.encode(buf + "\n\n"));
                 }
               } else {
-                traceReceived(); // an empty body got this trace before, too
                 emitBufferedBody(buf, controller, encoder);
               }
             } finally {
-              reader.releaseLock();
+              // After cancel() the lock may already be gone; releasing must not
+              // mask the real outcome.
+              try {
+                reader.releaseLock();
+              } catch {
+                /* already released */
+              }
             }
           } else if (typeof src.transformToString === "function") {
             // Non-streamable body (and older test doubles): the previous path.
             const body = await src.transformToString();
+            if (cancelled) return; // same hazard, at this path's one await
             traceReceived();
             if (body.includes("data: ")) {
               for (const line of body.split("\n")) {
@@ -799,6 +817,9 @@ export async function invokeAgentRuntime(params: {
         controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "done" })}\n\n`));
         controller.close();
       } catch (err) {
+        // A departed consumer has nothing to read error frames with; enqueuing
+        // them onto its closed controller is what used to throw.
+        if (cancelled) return;
         clearInterval(heartbeat);
         closed = true;
         const errMsg = err instanceof Error ? err.message : "Unknown error";
@@ -813,8 +834,13 @@ export async function invokeAgentRuntime(params: {
       }
     },
     cancel() {
+      cancelled = true;
       closed = true;
       clearInterval(heartbeat);
+      // Release the runtime response body. Without this the upstream connection
+      // is held until the persona finishes, and its next chunk drives an enqueue
+      // onto this now-closed controller.
+      reader?.cancel().catch(() => {});
     },
   });
 }
