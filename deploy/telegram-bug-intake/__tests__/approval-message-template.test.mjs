@@ -52,7 +52,7 @@ const RUN_TITLE = "Pipeline arg contract + CI guard";
 
 // ─── AWS SDK mocks (module seam) ──────────────────────────────────────────────
 
-const db = vi.hoisted(() => ({ items: new Map(), puts: [], deletes: [] }));
+const db = vi.hoisted(() => ({ items: new Map(), puts: [], deletes: [], failGetPrefix: null }));
 vi.mock("@aws-sdk/client-eventbridge", () => ({
   EventBridgeClient: class { async send() { return { FailedEntryCount: 0 }; } },
   PutEventsCommand: class { constructor(input) { this.input = input; } },
@@ -61,7 +61,14 @@ vi.mock("@aws-sdk/client-dynamodb", () => {
   const cmd = (op) => class { constructor(input) { this.input = input; this.op = op; } };
   class DynamoDBClient {
     async send(c) {
-      if (c.op === "get") return { Item: db.items.get(c.input.Key.id.S) };
+      if (c.op === "get") {
+        // TEAM-4682: lets a test make wasGateApprovedLocally's read fail
+        // without disturbing any other key.
+        if (db.failGetPrefix && c.input.Key.id.S.startsWith(db.failGetPrefix)) {
+          throw new Error("ProvisionedThroughputExceededException");
+        }
+        return { Item: db.items.get(c.input.Key.id.S) };
+      }
       if (c.op === "put") {
         const id = c.input.Item.id.S;
         if (c.input.ConditionExpression && db.items.has(id)) {
@@ -117,7 +124,11 @@ function makeNet(ctx, overrides = {}) {
   const net = {
     ctx, polls: 0, batches: [], afterPoll: [], workflows: [], tickets: null,
     sent: [], answered: [], edited: [], transitions: [], github: null,
-    transitionStatus: 200, transitionBody: null, ...overrides,
+    transitionStatus: 200, transitionBody: null,
+    // TEAM-4682: the hub's /tickets view lags the transition it just accepted
+    // (non-ConsistentRead Scan / JQL search). Default false = today's semantics.
+    staleReads: false,
+    ...overrides,
   };
   net.fetch = async (url, opts) => {
     const u = String(url);
@@ -136,9 +147,12 @@ function makeNet(ctx, overrides = {}) {
       // The hub REMEMBERS: a /tickets read after this must see the status the
       // transition just applied, or a test cannot tell "read the gate before
       // the ✅" from "read it after" (TEAM-4677). No-op unless this net was
-      // given a matching ticket row.
-      const row = (net.tickets || []).find((t) => t?.ticketId === body?.ticketId);
-      if (row && body?.targetStatus) row.status = body.targetStatus;
+      // given a matching ticket row. staleReads (TEAM-4682) skips this, so a
+      // test can drive the read-after-write gap the local marker exists for.
+      if (!net.staleReads) {
+        const row = (net.tickets || []).find((t) => t?.ticketId === body?.ticketId);
+        if (row && body?.targetStatus) row.status = body.targetStatus;
+      }
       return jsonRes({ success: true });
     }
     if (/\/api\/workflow\/[^/]+\/tickets$/.test(u)) {
@@ -176,7 +190,7 @@ async function loadModule({ pipeline } = {}) {
 
 const realFetch = global.fetch;
 beforeEach(() => {
-  db.items.clear(); db.puts.length = 0; db.deletes.length = 0;
+  db.items.clear(); db.puts.length = 0; db.deletes.length = 0; db.failGetPrefix = null;
   cp.state = null; cp.sends.length = 0;
   db.items.set(`chat#${CHAT}`, { id: { S: `chat#${CHAT}` }, chatId: { N: String(CHAT) } });
 });
@@ -685,6 +699,85 @@ describe("an approved gate never produces rejection evidence, regardless of call
     expect(db.items.get(REJ_KEY)?.ticketId?.S).toBe(GATE);
     expect(net.answered.at(-1).text).toBe("Reply with what needs to change.");
     expect(net.edited[0].text).toMatch(/Changes requested/);
+  });
+});
+
+/**
+ * TEAM-4682. TEAM-4677's guard has one signal — a fresh hub read via
+ * gateTicketOf — and that read is eventually consistent: dynamodb mode is a
+ * non-ConsistentRead Scan (src/lib/workflow/dynamo-read.ts) and jira mode is a
+ * JQL search, so the ✅'s own transition is routinely NOT visible to the ❌ that
+ * follows it in the same batch. The fix adds a local `approved#<id>` marker
+ * (read-your-write) that gok stamps and gno checks FIRST, plus widens the hub
+ * check from the literal "done" to GATE_RESOLVED_STATUSES (done/cancelled),
+ * deliberately excluding "blocked" — a blocked gate is rework in flight and a
+ * second ❌ on it is legitimate.
+ */
+describe("the ❌ done-gate guard survives a stale hub read and covers cancelled gates (TEAM-4682)", () => {
+  const APPROVED_KEY = `approved#${GATE}`;
+
+  it("✅ then ❌ in the SAME batch, with a STALE hub read, still leaves no evidence for gate B", async () => {
+    const mod = await loadModule();
+    const gateA = dgate(GATE, "the queued deploy", "2026-09-14T09:00:00.000Z", { status: "in_review" });
+    const net = await run(mod.handler, {
+      batches: [[tapGok(1), tapGno(2)]], tickets: [gateA], staleReads: true,
+    });
+
+    // The ✅ landed; the hub's own /tickets view never caught up.
+    expect(net.transitions).toEqual([expect.objectContaining({ ticketId: GATE, targetStatus: "done" })]);
+    expect(gateA.status, "staleReads: the hub view still shows the pre-✅ status").toBe("in_review");
+
+    // Symptom first: the ❌ must leave no evidence, regardless of mechanism.
+    expect(db.items.has(REWORK_KEY), "❌ after a stale-read ✅ must not write the placeholder").toBe(false);
+    expect(db.items.has(REJ_KEY), "❌ after a stale-read ✅ must not park a rework marker").toBe(false);
+    // Mechanism second: the LOCAL marker is what caught it, not the (stale) hub read.
+    expect(db.items.has(APPROVED_KEY), "gok must record the local approval marker").toBe(true);
+    expect(net.answered.at(-1).text).toMatch(/already approved/i);
+    expect(net.edited.every((e) => !/Changes requested/.test(e.text))).toBe(true);
+
+    // Symptom: gate B must not read A's ❌ as an attempt.
+    const text = await pageGateB(mod);
+    expect(attemptLinesOf(text)).toEqual([]);
+  });
+
+  it("❌ on a CANCELLED gate is a no-op, same as an already-done one", async () => {
+    const mod = await loadModule();
+    const net = await run(mod.handler, {
+      batches: [[tapGno()]],
+      tickets: [dgate(GATE, "the queued deploy", "2026-09-14T09:00:00.000Z", { status: "cancelled" })],
+    });
+
+    expect(net.transitions).toEqual([]);
+    expect(db.items.has(REWORK_KEY), "❌ on a cancelled gate must not write the placeholder").toBe(false);
+    expect(db.items.has(REJ_KEY), "❌ on a cancelled gate must not park a rework marker").toBe(false);
+    expect(net.answered.at(-1).text).toMatch(/nothing to reject/i);
+    expect(net.edited.every((e) => !/Changes requested/.test(e.text))).toBe(true);
+  });
+
+  it("an EXPIRED local marker does not silence a real rejection (TEAM-4671 must not weaken)", async () => {
+    const mod = await loadModule();
+    db.items.set(APPROVED_KEY, { id: { S: APPROVED_KEY }, at: { S: "2026-09-14T08:00:00.000Z" }, ttl: { N: String(Math.floor(Date.now() / 1000) - 60) } });
+    const net = await run(mod.handler, {
+      batches: [[tapGno()]],
+      tickets: [dgate(GATE, "the queued deploy", "2026-09-14T09:00:00.000Z", { status: "in_review" })],
+    });
+
+    expect(db.items.get(REWORK_KEY)?.reason?.S).toBe("changes requested");
+    expect(db.items.get(REJ_KEY)?.ticketId?.S).toBe(GATE);
+    expect(net.answered.at(-1).text).toBe("Reply with what needs to change.");
+  });
+
+  it("fails open on an unreadable local marker: the rejection is still recorded", async () => {
+    const mod = await loadModule();
+    db.failGetPrefix = "approved#";
+    const net = await run(mod.handler, {
+      batches: [[tapGno()]],
+      tickets: [dgate(GATE, "the queued deploy", "2026-09-14T09:00:00.000Z", { status: "in_review" })],
+    });
+
+    expect(db.items.get(REWORK_KEY)?.reason?.S).toBe("changes requested");
+    expect(db.items.get(REJ_KEY)?.ticketId?.S).toBe(GATE);
+    expect(net.answered.at(-1).text).toBe("Reply with what needs to change.");
   });
 });
 
