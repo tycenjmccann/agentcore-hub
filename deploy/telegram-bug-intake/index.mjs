@@ -1353,6 +1353,27 @@ async function releaseGate(notif) {
 // false positive costs more than a missing line.
 const GATE_REWORK_PREFIX = "gaterework#";
 
+/**
+ * A ✅ this bridge itself delivered, remembered locally for as long as a paired
+ * ❌ can still arrive. The gno guard's hub read (gateTicketOf) is eventually
+ * consistent — /api/workflow/<id>/tickets is a JQL search in jira mode and a
+ * non-ConsistentRead Scan in dynamodb mode (src/lib/workflow/dynamo-read.ts:73,
+ * whose consistentRead option that route does not pass) — so the transition gok
+ * just made is routinely NOT visible to the ❌ that lands in the same getUpdates
+ * batch, and TEAM-4677's guard missed it (TEAM-4682). This marker is the same
+ * Lambda writing and reading the same table: read-your-write. Short TTL on
+ * purpose — it answers "was this gate approved seconds ago", and a gate
+ * legitimately re-parked later must be rejectable again.
+ */
+const GATE_APPROVED_PREFIX = "approved#";
+const GATE_APPROVED_TTL_SEC = 10 * 60;
+/**
+ * Statuses in which a gate is no longer a decision anyone can reject — the same
+ * spellings REPAGE_SKIP_STATUSES uses, MINUS "blocked": a blocked gate is rework
+ * already in flight, and a second ❌ on it is a legitimate re-rejection.
+ */
+const GATE_RESOLVED_STATUSES = new Set(["done", "cancelled", "canceled"]);
+
 /** ms sort key for a review cycle: explicit timestamp, else the ISO minted into notif.id. */
 function notifOrderKey(n) {
   const t = Date.parse(n?.timestamp || "");
@@ -1512,6 +1533,49 @@ async function deleteGateRework(ticketId) {
   }
 }
 
+/**
+ * Remember that THIS bridge approved this gate (TEAM-4682). Best-effort, like
+ * every other marker here: a failed Put must not cost the ✅ its answer — the
+ * gno guard's hub read still stands behind it.
+ */
+async function recordGateApproved(ticketId) {
+  if (!ticketId) return;
+  try {
+    await ddb.send(new PutItemCommand({
+      TableName: PENDING_TABLE,
+      Item: {
+        id: { S: `${GATE_APPROVED_PREFIX}${ticketId}` },
+        at: { S: new Date().toISOString() },
+        ttl: { N: String(Math.floor(Date.now() / 1000) + GATE_APPROVED_TTL_SEC) },
+      },
+    }));
+  } catch (err) {
+    console.warn(`[telegram-bug-intake] approval marker for ${ticketId} not recorded:`, err.message);
+  }
+}
+
+/**
+ * Did this bridge just approve this gate? DDB TTL deletion is lazy, so the `ttl`
+ * stamp is honoured here rather than trusted to the table (same as
+ * getPendingRejection). FAILS OPEN: any error answers "not approved", so a
+ * transient DDB failure can never swallow a real rejection.
+ */
+async function wasGateApprovedLocally(ticketId) {
+  if (!ticketId) return false;
+  try {
+    const { Item } = await ddb.send(new GetItemCommand({
+      TableName: PENDING_TABLE, Key: { id: { S: `${GATE_APPROVED_PREFIX}${ticketId}` } },
+    }));
+    if (!Item) return false;
+    const ttl = Number(Item.ttl?.N);
+    if (Number.isFinite(ttl) && ttl > 0 && ttl <= Math.floor(Date.now() / 1000)) return false;
+    return true;
+  } catch (err) {
+    console.warn(`[telegram-bug-intake] approval marker for ${ticketId} not readable:`, err.message);
+    return false;
+  }
+}
+
 async function handleGateCallback(cb, chatId, action, ticketId, workflowId) {
   // Gate pings go to every registered chat, but only allowlisted chats may
   // transition tickets. Ack the tap (or Telegram re-sends the callback query)
@@ -1523,6 +1587,9 @@ async function handleGateCallback(cb, chatId, action, ticketId, workflowId) {
   }
   if (action === "gok") {
     const res = await transitionGate(workflowId, ticketId, "done", `Approved via Telegram by chat ${chatId}`);
+    // The ❌ that may follow in this same batch cannot see this transition through
+    // the hub (eventually consistent) — leave it a local record (TEAM-4682).
+    await recordGateApproved(ticketId);
     // A ❌ tapped by mistake before this ✅ left a marker that would turn the
     // chat's next message into a rework note for a gate that is now done.
     const stale = await getPendingRejection(chatId);
@@ -1542,16 +1609,29 @@ async function handleGateCallback(cb, chatId, action, ticketId, workflowId) {
   // ✅ then ❌ in the same batch (both callbacks land before the ✅ edit drops the
   // keyboard): gok already moved the gate to done, so writing the placeholder
   // again would hand approvalAttempt rejection evidence for a cycle the human
-  // APPROVED (TEAM-4677). Ask the hub rather than a local marker — a gate
-  // approved from the board counts too — and fail open: gateTicketOf never
-  // throws, so an unavailable tickets view falls through to the normal path and
-  // a transient error can never eat a real rejection. TEAM-4675's
+  // APPROVED (TEAM-4677). TWO signals, because neither alone is enough:
+  //  1. the LOCAL marker gok wrote — the hub read below is eventually consistent
+  //     and routinely cannot see a transition made milliseconds ago, which is
+  //     the whole of TEAM-4682; this one is read-your-write.
+  //  2. the hub read — a gate approved (or cancelled) from the board leaves no
+  //     local marker, and that is a resolved gate too.
+  // Both fail open: wasGateApprovedLocally returns false on error and
+  // gateTicketOf never throws, so a transient failure falls through to the
+  // normal path and can never eat a real rejection. TEAM-4675's
   // deleteGateRework in the gok branch above covers the reverse order.
-  const { gateTicket } = await gateTicketOf({ workflowId }, { ticketId });
-  if (String(gateTicket?.status || "").toLowerCase() === "done") {
-    // No tgEdit: the ✅ edit already states the truth, and this branch's edit
-    // text carries "Changes requested" — gateFromReply's routing vocabulary.
+  // No tgEdit on either exit: the ✅ edit already states the truth, and this
+  // branch's edit text carries "Changes requested" — gateFromReply's routing
+  // vocabulary.
+  if (await wasGateApprovedLocally(ticketId)) {
     await tgAnswer(cb.id, "Already approved — nothing to reject.");
+    return;
+  }
+  const { gateTicket } = await gateTicketOf({ workflowId }, { ticketId });
+  const gateStatus = String(gateTicket?.status || "").toLowerCase();
+  if (GATE_RESOLVED_STATUSES.has(gateStatus)) {
+    await tgAnswer(cb.id, gateStatus === "done"
+      ? "Already approved — nothing to reject."
+      : "Gate cancelled — nothing to reject.");
     return;
   }
   // Request changes: the ticket needs a rework note. Park the intent; the
