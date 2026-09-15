@@ -194,8 +194,12 @@ The continuous-improvement loop. Self-contained surface.
   persona (all 18 personas share the `agentcore_hub_agent` runtime, so the runtime
   row is their sum). Persona rows carry only `sessions` / `e|<evaluator>|sum` /
   `e|<evaluator>|count`; token and cost attributes (`m|<model>|<field>`) stay
-  runtime-only because they are not attributable per persona. `_runtime` gets no row
-  of its own — it *is* the rollup.
+  runtime-only because they are not attributable per persona. A persona is assigned
+  only when the session id matches the orchestrator's full
+  `[<TICKET>_]<workflowId>-<agentId>-<13-digit ms>` shape (`SESSION_RE` /
+  `personaFor`, the single classifier in `lambda/eval-packager/lib/session-id.mjs`);
+  Invoke-tab, canary, WM-chat and `si-…`/`cc-…` sessions are `_runtime`, which gets
+  no row of its own — it *is* the rollup.
 - `agentcore-hub-eval-results` (`EVAL_RESULTS_TABLE`) — one row per judge result,
   `PAY_PER_REQUEST`, PITR on, **no TTL, kept forever**. PK `agentId`, SK `sk` =
   `<evaluatedAt ISO>#<dedupKey>`, using the same `dedupKey` as the seen-set, which

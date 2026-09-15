@@ -124,6 +124,21 @@ describe('dailyDeltasByPersona', () => {
     expect(RUNTIME_PERSONA).toBe('_runtime');
   });
 
+  it('opens no persona bucket for a non-pipeline id that names a real persona', () => {
+    // `si-<persona>-<13 digits>` / `cc-<persona>-<13 digits>` match the loose
+    // ROLE_RE suffix but are NOT pipeline sessions (the improver's own
+    // `si-${agentId}-${Date.now()}`, index.mjs invokeImproverOnce, runs under
+    // workflow_id `self-improvement`). Incrementing a persona day bucket for
+    // them would show up in the UI as backend-dev sessions that no run ever had.
+    const byPersona = dailyDeltasByPersona(AGENT, [
+      row({ sessionId: 'si-agentcore_hub_backend_dev-1757900123456', score: 0.2 }),
+      row({ sessionId: 'cc-agentcore_hub_qa_verifier-1757900123456', score: 0.3 }),
+    ]);
+    expect(byPersona).toEqual({});
+    expect(byPersona.agentcore_hub_backend_dev).toBeUndefined();
+    expect(byPersona.agentcore_hub_qa_verifier).toBeUndefined();
+  });
+
   it('ignores rows with no session id', () => {
     expect(dailyDeltasByPersona(AGENT, [row({ sessionId: null }), { parseError: true }])).toEqual({});
   });

@@ -98,6 +98,14 @@ describe('toResultRow — keys and dimensions', () => {
     ['cc-3f7a1b9c4d2e4f8a9b0c1d2e3f4a5b6c', 'cloud code'],
     ['canary-eval-1757900123-agentcore_hub_agent', 'canary'],
     ['wmchat-conv-42000000000000000000000000', 'workflow-manager chat'],
+    // A non-pipeline id can carry a real persona's name AND a 13-digit ms tail:
+    // the improver mints `si-${agentId}-${Date.now()}` for a `self-improvement`
+    // invocation, with no run behind it. The loose `-<agentId>-<13 digits>`
+    // suffix (ROLE_RE) matches these, so persona attribution must be gated on
+    // the anchored full-pipeline parse instead, or self-improvement and
+    // cloud-code traffic silently inflates that persona's sessions and scores.
+    ['si-agentcore_hub_backend_dev-1757900123456', 'self-improvement naming a real persona'],
+    ['cc-agentcore_hub_qa_verifier-1757900123456', 'cloud code naming a real persona'],
   ])('files %s under the runtime with no workflow (%s)', (sessionId) => {
     const row = toResultRow(AGENT, entry({ sessionId }));
     expect(row.persona).toBe('_runtime');

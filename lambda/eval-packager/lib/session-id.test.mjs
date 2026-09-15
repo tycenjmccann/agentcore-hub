@@ -97,4 +97,20 @@ describe('personaFor', () => {
     expect(personaFor(`si-${RUNTIME}-1757900123456`, RUNTIME)).toBe(RUNTIME_PERSONA);
     expect(roleFromSessionId(`si-${RUNTIME}-1757900123456`)).toBe(RUNTIME);
   });
+
+  it.each([
+    ['si-agentcore_hub_backend_dev-1757900123456', 'self-improvement'],
+    ['cc-agentcore_hub_qa_verifier-1757900123456', 'cloud code'],
+  ])('files %s under the runtime even though it names a real persona (%s)', (sid) => {
+    // The regression this guards: personaFor used to answer from ROLE_RE, the
+    // loose `-<agentId>-<13 digits>` SUFFIX, which these ids satisfy — the
+    // improver mints `si-${agentId}-${Date.now()}` (index.mjs) for an invocation
+    // whose workflow_id is the literal `self-improvement`. Only the anchored
+    // full-pipeline shape means "a run gave this persona work to do".
+    expect(personaFor(sid, RUNTIME)).toBe(RUNTIME_PERSONA);
+    expect(parseSessionId(sid)).toBeNull(); // hence no workflowId to attribute
+    // The pre-existing role parse is deliberately UNCHANGED: applyRoleGuard and
+    // the improver still read the suffix, and that behaviour is out of scope.
+    expect(roleFromSessionId(sid)).not.toBeNull();
+  });
 });

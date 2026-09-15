@@ -82,13 +82,27 @@ export function parseSessionId(sid) {
 /**
  * Persona bucket for a session, relative to the runtime that hosts it.
  *
- * `_runtime` when the id names no persona OR names the hosting runtime itself
- * (`si-agentcore_hub_agent-<ms>` matches ROLE_RE with the runtime's own id — a
- * self-improvement session, not a pipeline persona, and filing it as a persona
- * would invent an `agentcore_hub_agent#agentcore_hub_agent` bucket).
+ * THE single persona classifier: results rows (results-store.mjs) and persona
+ * day buckets (daily.mjs) both go through here, so a session can never be a
+ * persona in one store and the runtime in the other.
+ *
+ * Gated on the FULL pipeline shape (parseSessionId / SESSION_RE), not on the
+ * loose `-<agentId>-<13 digits>` suffix that ROLE_RE matches. Only a session the
+ * orchestrator minted for a run has a persona; everything else is the runtime's
+ * own traffic. The suffix alone is not evidence of a persona, because the
+ * improver mints `si-${agentId}-${Date.now()}` (index.mjs, invokeImproverOnce) —
+ * a 13-digit id that ROLE_RE happily matches even though `workflow_id` on that
+ * invocation is the literal `self-improvement`, i.e. no run at all. Attributing
+ * it to a persona would inflate that persona's session count and score average
+ * with self-improvement traffic and file the row under a workflow that never
+ * existed.
+ *
+ * The runtime-equality check stays as a second guard: a pipeline id whose
+ * persona IS the hosting runtime must not invent an
+ * `agentcore_hub_agent#agentcore_hub_agent` bucket.
  */
 export function personaFor(sessionId, runtimeAgentId) {
-  const role = roleFromSessionId(sessionId);
-  if (!role || role === runtimeAgentId) return RUNTIME_PERSONA;
-  return role;
+  const parsed = parseSessionId(sessionId);
+  if (!parsed || parsed.agentId === runtimeAgentId) return RUNTIME_PERSONA;
+  return parsed.agentId;
 }

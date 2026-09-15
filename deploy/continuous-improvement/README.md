@@ -176,8 +176,17 @@ is invisible in it. The packager therefore ALSO increments a second item keyed
 `PK <agentId>#<persona>` with the same score attributes (`sessions`,
 `e|<evaluator>|sum`, `e|<evaluator>|count`). Token and cost attributes
 (`m|<model>|<field>`) stay runtime-only — they are not attributable per persona.
-`_runtime` (a session with no persona in its id, or whose persona IS the hosting
-runtime) gets no separate item: it IS the rollup. `splitDailyItems` in
+A persona is assigned only when the session id matches the FULL id the
+orchestrator mints for a run — `[<TICKET>_]<workflowId>-<agentId>-<13-digit ms>`
+(`SESSION_RE`, `lambda/eval-packager/lib/session-id.mjs`). Everything else is
+`_runtime` and gets no separate item, because it IS the rollup: the Invoke tab,
+the canary, the WM chat, and the `si-…`/`cc-…` sessions. Note that a non-pipeline
+id can still *end* in `-<agentId>-<13 digits>` — the improver mints
+`si-${agentId}-${Date.now()}` — so the persona split deliberately does NOT key
+off that suffix alone; `personaFor` is the single classifier both the results
+rows and these buckets go through. (The older, looser `ROLE_RE` suffix parse
+still exists and is still what the dependency-chain role guard uses; the two are
+intentionally different questions.) `splitDailyItems` in
 `src/lib/eval-metrics.ts` is what separates the two shapes read-side.
 
 Cost is computed read-side from `src/config/pricing.json`

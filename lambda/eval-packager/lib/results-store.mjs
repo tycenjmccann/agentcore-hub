@@ -26,7 +26,7 @@
 
 import { PutCommand } from '@aws-sdk/lib-dynamodb';
 import { dayKeyOf } from './daily.mjs';
-import { parseSessionId, personaFor, RUNTIME_PERSONA } from './session-id.mjs';
+import { parseSessionId, personaFor } from './session-id.mjs';
 
 /**
  * A judge explanation is free text and DynamoDB caps an item at 400 KB. 8 KB is
@@ -75,8 +75,11 @@ export function toResultRow(agentId, entry, { source = 'push', logGroup = '', in
       ? Number(entry.timestamp)
       : Date.now()
   ).toISOString();
-  const parsed = sessionId ? parseSessionId(sessionId) : null;
-  const persona = sessionId ? personaFor(sessionId, agentId) : RUNTIME_PERSONA;
+  // personaFor is the single persona classifier (session-id.mjs) and is gated on
+  // the same SESSION_RE parse, so `persona !== _runtime` iff `parsed` is non-null:
+  // a row can never carry a persona without the workflowId that persona ran for.
+  const parsed = parseSessionId(sessionId);
+  const persona = personaFor(sessionId, agentId);
   const evaluator = entry.evaluatorName || 'unknown';
   const { explanation, truncated } = truncateExplanation(entry.evidence);
 
