@@ -188,6 +188,23 @@ const AGENT_TASKS = {
   "TEAM-4600": { ticketId: "TEAM-4600", agentId: "developer", status: "complete", prUrl: "https://github.com/o/r/pull/593", completedAt: "2026-09-13T12:00:00.000Z" },
 };
 const shipped = (extra = {}) => ({ ticketId: "TEAM-4600", title: "Pipeline arg contract", status: "done", createdAt: "2026-09-12T09:00:00.000Z", ...extra });
+// N upstream tickets under one gate. Neutral titles on purpose: a title whose
+// prefix is in GATE_TITLE_KINDS would be read as a sibling gate attempt.
+const upstreamN = (n) => Array.from({ length: n }, (_, i) => ({
+  ticketId: `TEAM-46${String(i).padStart(2, "0")}`, title: `Upstream work ${i}`,
+  status: "done", createdAt: `2026-09-12T09:${String(i).padStart(2, "0")}:00.000Z`,
+}));
+const landedTasks = (tickets) => Object.fromEntries(tickets.map((t, i) => [t.ticketId, {
+  ticketId: t.ticketId, agentId: "developer", status: "complete",
+  prUrl: `https://github.com/o/r/pull/${500 + i}`,
+  completedAt: `2026-09-13T12:${String(i).padStart(2, "0")}:00.000Z`,
+}]));
+// The rendered items, with the "+N more" tail stripped off first (a lazy regex
+// group can't do this reliably — `$` pulls it to end-of-line).
+const shippingItemsOf = (text) => {
+  const m = text.match(/shipping: (.*)$/m);
+  return m ? m[1].replace(/ \+\d+ more$/, "").split(", ").filter(Boolean) : [];
+};
 const rmGateTicket = (createdAt = "2026-09-14T09:00:00.000Z") => ({
   ticketId: GATE, title: RM_TITLE, description: RM_RUNBOOK, status: "in_review",
   assignee: "human:engineer", blockedBy: [], labels: ["deploy-gate"], createdAt,
@@ -463,5 +480,91 @@ describe("approval pings are built from structured inputs, never from ticket pro
     // otherwise be filed as a rework note against whatever key it mentions.
     expect(text).not.toContain("REVIEW GATE");
     expect(text).not.toContain("Changes requested");
+  });
+});
+
+// TEAM-4673 — the two producers of the shipping list each pre-sliced to 5
+// before handing it to the builder, so shippingSubject's "+N more" (computed
+// from the array it was GIVEN) undercounted whatever ran past 5.
+describe("the shipping list counts what it does not render (TEAM-4673)", () => {
+  const gateNotif = () => notif(`notif_${GATE}_2026-09-14T10:00:00.000Z`, "2026-09-14T10:00:00.000Z");
+
+  it("a gate blocking on 8 upstream tickets renders 3 and counts the other 5", async () => {
+    const mod = await loadModule();
+    const upstream = upstreamN(8);
+    const text = (await run(mod.handler, {
+      batches: [[]],
+      workflows: [wf([gateNotif()])],
+      tickets: [{ ...rmGateTicket(), blockedBy: upstream.map((t) => t.ticketId) }, ...upstream],
+    })).sent[0].text;
+
+    expect(text).toContain("+5 more");
+    expect(shippingItemsOf(text)).toHaveLength(3);
+    // A neutral-titled upstream ticket must not be read as a sibling attempt.
+    expect(attemptLinesOf(text)).toEqual([]);
+  });
+
+  it("the landed-PR fallback counts every landed ticket, not the first five", async () => {
+    const mod = await loadModule();
+    const upstream = upstreamN(8);
+    const text = (await run(mod.handler, {
+      batches: [[]],
+      workflows: [wf([gateNotif()], { agentTasks: landedTasks(upstream) })],
+      tickets: [{ ...rmGateTicket(), blockedBy: [] }, ...upstream],
+    })).sent[0].text;
+
+    expect(text).toContain("+5 more");
+    const items = shippingItemsOf(text);
+    expect(items).toHaveLength(3);
+    // shippedTitles sorts newest-first by completedAt.
+    expect(items).toEqual(["Upstream work 7", "Upstream work 6", "Upstream work 5"]);
+  });
+
+  it("40 upstream tickets: 3 rendered, 37 counted, still under the cap", async () => {
+    const mod = await loadModule();
+    const upstream = upstreamN(40);
+    const text = (await run(mod.handler, {
+      batches: [[]],
+      workflows: [wf([gateNotif()])],
+      tickets: [{ ...rmGateTicket(), blockedBy: upstream.map((t) => t.ticketId) }, ...upstream],
+    })).sent[0].text;
+
+    expect(text).toContain("+37 more");
+    expect(shippingItemsOf(text)).toHaveLength(3);
+    expect(text.length).toBeLessThanOrEqual(mod.APPROVAL_TEXT_MAX);
+    expect(text).toMatch(mod.APPROVAL_KICKER_RE);
+  });
+});
+
+// TEAM-4673 — GATE_PHASE_KINDS had no key matching the real QA phase
+// ("verification"); the dead ["qa","qa"] key made a QA gate page as the
+// generic REVIEW GATE instead of APPROVAL_KICKERS.qa.
+describe("the QA gate pages with the QA kicker (TEAM-4673)", () => {
+  // A title whose prefix is NOT in GATE_TITLE_KINDS, so only notif.gate can
+  // produce a specific kicker — proving the phase table itself, not the title
+  // fallback.
+  const neutralGateTicket = () => ({ ...rmGateTicket(), title: "Some neutral title: blah" });
+  // Distinct notif id per gate: the claim key is gate#<notif.id>, and this test
+  // pages several gate values in a row without clearing PENDING_TABLE between
+  // them, so a shared id would dedupe every call after the first.
+  const pageWithGate = async (mod, gate) => (await run(mod.handler, {
+    batches: [[]],
+    workflows: [wf([notif(`notif_${GATE}_${gate}_2026-09-14T10:00:00.000Z`, "2026-09-14T10:00:00.000Z", { gate })])],
+    tickets: [neutralGateTicket()],
+  })).sent[0].text;
+
+  it('gate="verification" pages QA, and the other phases keep their kickers', async () => {
+    const mod = await loadModule();
+
+    const qaText = await pageWithGate(mod, "verification");
+    expect(qaText).toMatch(/^\*🚦 QA REVIEW GATE — approval needed\*/);
+    expect(qaText).toMatch(mod.APPROVAL_KICKER_RE);
+    expect(qaText).toContain("REVIEW GATE");
+    expect(qaText).toContain(`🎫 [${GATE}]`);
+
+    // Collision guard: the new "verification" key must not shadow the others.
+    expect(await pageWithGate(mod, "development")).toMatch(/^\*🚦 CODE REVIEW GATE — approval needed\*/);
+    expect(await pageWithGate(mod, "ship")).toMatch(/^\*🚦 SHIP REVIEW GATE — approval needed\*/);
+    expect(await pageWithGate(mod, "plan")).toMatch(/^\*🚦 PLAN REVIEW GATE — approval needed\*/);
   });
 });

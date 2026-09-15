@@ -805,10 +805,17 @@ async function sendApprovalPing(chats, { keyboard, label = "approval", ...msgOpt
   return { delivered, text };
 }
 
-// review-package phase → gateKind.
+// review-package phase → gateKind. Keys are matched as SUBSTRINGS of notif.gate,
+// which is the review package's `gate` — an agents.json `phase`
+// (lambda/orchestrator/index.mjs loadReviewPackage), else "plan"/"intake" from
+// fallbackReviewPackagePhase (lambda/orchestrator/artifact-chain.mjs). So these
+// must be the phase strings that actually ship: QA's phase is "verification",
+// never "qa" (the dead "qa" key is why a QA gate paged as a generic REVIEW GATE
+// — TEAM-4673), and "plan" is reachable only via fallbackReviewPackagePhase.
+// Unlisted phases fall through to the gate title's prefix, then to "review".
 const GATE_PHASE_KINDS = [
   ["requirement", "spec"], ["spec", "spec"], ["plan", "plan"],
-  ["design", "design"], ["dev", "code"], ["qa", "qa"], ["ship", "ship"],
+  ["design", "design"], ["dev", "code"], ["verification", "qa"], ["ship", "ship"],
 ];
 // Gate-ticket title PREFIX (before the first ":") → gateKind. A CLOSED table:
 // the old fallback sliced 24 chars off whatever the agent wrote, so ids, SHAs
@@ -1025,7 +1032,10 @@ function normalizeBlockedBy(x) {
  * is written by completeWorkflow AFTER the phase goes terminal — which
  * scanReviewGates skips — so the old `wf.delivery?.prUrl` fallback here was
  * unreachable. Titles come from the ticket rows; an agentTasks entry has none.
- * Newest first, so the render cap keeps the work closest to this review.
+ * Newest first, so the builder's render cap keeps the work closest to this
+ * review. The list is returned WHOLE and capped only at render time: the ping's
+ * "+N more" is `shipping.length - rendered` (shippingSubject), so a cap here
+ * silently undercounts what the reviewer is approving (TEAM-4673).
  */
 function shippedTitles(wf, tickets) {
   const tasks = wf?.agentTasks && typeof wf.agentTasks === "object" ? wf.agentTasks : {};
@@ -1034,8 +1044,7 @@ function shippedTitles(wf, tickets) {
     .map((t) => ({ title: oneLine(t.title), at: Date.parse(tasks[t.ticketId]?.completedAt || t.updatedAt || t.createdAt || "") }))
     .filter((x) => x.title)
     .sort((a, b) => (Number.isFinite(b.at) ? b.at : 0) - (Number.isFinite(a.at) ? a.at : 0))
-    .map((x) => x.title)
-    .slice(0, 5);
+    .map((x) => x.title);
 }
 
 /**
@@ -1207,10 +1216,11 @@ async function scanReviewGates() {
       const { gateTicket, tickets: allTickets } = await gateTicketOf(wf, notif);
       const title = gateTicket?.title || notif.ticketId;
       const byId = new Map(allTickets.map((x) => [x.ticketId, x]));
+      // Whole list, not a slice: the builder renders APPROVAL_SHIP_MAX of them
+      // and counts the rest as "+N more" (TEAM-4673).
       const upstreamTitles = normalizeBlockedBy(gateTicket?.blockedBy)
         .map((id) => byId.get(id)?.title)
-        .filter(Boolean)
-        .slice(0, 5);
+        .filter(Boolean);
 
       const reviewer = notif.reviewer || "reviewer";
       const isEscalation = ESCALATION_GATE_TITLE.test(title);
@@ -2177,7 +2187,11 @@ async function scanDeployApprovalsForTarget(target) {
 
     // Enrich the ping with what's actually shipping: the commit subject, the PR
     // (title + workflow/epic + one-line summary from the body), and the file
-    // scope. Best-effort — a GitHub hiccup falls back to the terse message.
+    // scope. Best-effort PER FIELD: buildDeployBrief catches each GitHub lookup
+    // on its own, so an API hiccup still returns a brief — just a partial one,
+    // whose only bullet is "Commit: <sha>". `brief` is null, and the terse
+    // message below is what goes out, ONLY when there is no commit SHA to
+    // describe (or the target's repo path is unsafe).
     const brief = await buildDeployBrief(pending.commitSha, target.repo).catch((e) => {
       console.warn("[telegram-bug-intake] deploy brief enrich failed:", e.message);
       return null;
@@ -2304,9 +2318,11 @@ const _unsafeRepoWarned = new Set();
  * Build a rich "what's shipping" brief for the deploy-approval ping from the
  * commit being deployed: the commit subject, its associated PR (title + body),
  * the workflow/epic key parsed from the PR body/title, a one-line summary, and
- * the file scope (count + additions/deletions). All best-effort against the
- * GitHub API with GITHUB_TOKEN; any failure returns partial/null and the caller
- * falls back to the terse message. Returns null if no commit SHA is known.
+ * the file scope (count + additions/deletions). Each GitHub lookup is
+ * best-effort and independently caught, so a failing API returns a PARTIAL
+ * brief: commitLine/commitUrl are seeded from the SHA alone and are all the
+ * caller gets. Returns null — the caller's terse message — only when no commit
+ * SHA is known, or the target's repo path is unsafe.
  *
  * `repo` is the TARGET's repo ("owner/name") — a registered repo's pipeline
  * deploys that repo, not the hub, so enriching from the hub would describe the
