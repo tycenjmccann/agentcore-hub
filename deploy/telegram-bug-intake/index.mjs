@@ -70,7 +70,7 @@
 import { BedrockRuntimeClient, ConverseCommand } from "@aws-sdk/client-bedrock-runtime";
 import { DynamoDBClient, GetItemCommand, PutItemCommand, DeleteItemCommand, ScanCommand } from "@aws-sdk/client-dynamodb";
 import { TranscribeStreamingClient, StartStreamTranscriptionCommand } from "@aws-sdk/client-transcribe-streaming";
-import { CodePipelineClient, GetPipelineStateCommand, PutApprovalResultCommand } from "@aws-sdk/client-codepipeline";
+import { CodePipelineClient, GetPipelineStateCommand, GetPipelineExecutionCommand, PutApprovalResultCommand } from "@aws-sdk/client-codepipeline";
 import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
 import { EventBridgeClient, PutEventsCommand } from "@aws-sdk/client-eventbridge";
 import { parseCdRegistry, pipelineProjects } from "./cd-registry.mjs";
@@ -99,6 +99,19 @@ const DEPLOY_PIPELINE_NAME = process.env.DEPLOY_PIPELINE_NAME || "";
 // EVERY registered repo's pipeline, in that repo's region. Unset → the single
 // DEPLOY_PIPELINE_NAME target only, exactly as before.
 const ARTIFACT_BUCKET = process.env.ARTIFACT_BUCKET || "";
+// Optional: how long an unanswered deploy gate waits before it earns ONE
+// reminder ping (TEAM-4670). A deploy-gate claim is one-shot with a 7-day TTL,
+// so before this a ping that was missed - or that reached nobody - never came
+// back: execution 347b9bcb sat on the gate for 9h. Explicit "0" disables
+// reminders; anything unparseable falls back to the default rather than off,
+// because a duplicate reminder costs one message and a silent gate costs a day.
+const DEPLOY_REPAGE_MS = (() => {
+  const raw = (process.env.DEPLOY_REPAGE_MS || "").trim();
+  if (!raw) return 30 * 60_000;
+  const n = parseInt(raw, 10);
+  if (!Number.isFinite(n)) return 30 * 60_000;
+  return n > 0 ? n : 0;
+})();
 // The region every legacy client used implicitly (AWS_REGION is always set in
 // Lambda). Registry entries carry their own region; this is the fallback for
 // the env target, the registry read and pre-multi-target claim rows.
@@ -1582,12 +1595,17 @@ async function handleEscalationCallback(cb, chatId, workflowId) {
     `${cb.message.text}\n\n✅ Resolved via Telegram (${resolved.length} escalation${resolved.length === 1 ? "" : "s"}) — watching resumes.`);
 }
 
-/** Atomically claim an arbitrary dedupe key (30-day TTL). False = already claimed. */
-async function claimKey(id) {
+/**
+ * Atomically claim an arbitrary dedupe key. False = already claimed.
+ * TTL defaults to 30 days; callers whose companion row expires sooner pass
+ * their own (the deploy-gate reminder marker matches the 7-day claim TTL, so a
+ * marker can never outlive the claim it guards and mute a later gate).
+ */
+async function claimKey(id, ttlSec = 30 * 86400) {
   try {
     await ddb.send(new PutItemCommand({
       TableName: PENDING_TABLE,
-      Item: { id: { S: id }, ttl: { N: String(Math.floor(Date.now() / 1000) + 30 * 86400) } },
+      Item: { id: { S: id }, ttl: { N: String(Math.floor(Date.now() / 1000) + ttlSec) } },
       ConditionExpression: "attribute_not_exists(id)",
     }));
     return true;
@@ -1653,7 +1671,27 @@ async function scanAllPages(input) {
 // ARTIFACT_BUCKET and DEPLOY_PIPELINE_NAME unset (OSS / no pipeline) makes this
 // a total no-op — not one AWS call.
 
+// OVERLAPPING EXECUTIONS (TEAM-4670): a pipeline's Approval stage belongs to ONE
+// execution, but Source keeps running ahead of it. GetPipelineState reports both,
+// so "the first currentRevision in the state" is the NEWEST commit, not the one
+// parked at the gate. Every brief is therefore scoped to the approval stage's own
+// pipelineExecutionId, and a mismatch is resolved with GetPipelineExecution.
 const DEPLOY_KEY_PREFIX = "dep#";
+// Delivery evidence for the gate, keyed on pipeline + execution so the
+// Pipeline___* tools Lambda can read it WITHOUT re-deriving the claim hash (it
+// must never see the approval token). Same 7-day TTL as the claim.
+const DEPLOY_PING_KEY_PREFIX = "depping#";
+// "This wait has already had its one reminder" - a conditional-Put marker
+// rather than an attribute on the claim row, so the check stays atomic without
+// an UpdateItem. Released when zero chats received the reminder.
+const DEPLOY_REPAGE_KEY_PREFIX = "deprepage#";
+const DEPLOY_TTL_SEC = 7 * 86400;
+const DEPLOY_GATE_KICKER = "🚀 CODEPIPELINE DEPLOY GATE - approval needed";
+// Said out loud because the operator answered three Jira deploy-gate tickets
+// while this gate sat InProgress: the Jira gate and the pipeline gate are
+// separate decisions, and only this ping resolves the pipeline one.
+const DEPLOY_NOT_JIRA_LINE =
+  "This is the PIPELINE's own gate - approving a Jira deploy-gate ticket does NOT approve it.";
 
 // ─── CD registry deploy targets ──────────────────────────────────────────────
 // The same document the orchestrator and the Pipeline___* tools Lambda read
@@ -1789,12 +1827,21 @@ async function scanDeployApprovalsForTarget(target) {
   // marks the *stage* InProgress and the action has a latestExecution.token
   // only while it waits; the token is required by PutApprovalResult.
   let pending = null;
-  // The commit being deployed — the Source stage's currentRevision. Used to
-  // enrich the ping with the actual commit / PR / scope (esbuild the SHA once).
-  const sourceRevisionId = (state.stageStates || [])
-    .flatMap((s) => s.actionStates || [])
-    .map((a) => a.currentRevision?.revisionId)
-    .find(Boolean);
+  // The commit carried by whichever stage reports a currentRevision, plus the
+  // execution that revision belongs to. Located by "first action carrying a
+  // currentRevision" rather than by a stage named Source: that is what the API
+  // actually populates, and it is stage-name agnostic across pipelines.
+  let revision = null;
+  for (const stage of state.stageStates || []) {
+    for (const action of stage.actionStates || []) {
+      const revisionId = action.currentRevision?.revisionId;
+      if (revisionId) {
+        revision = { revisionId, executionId: stage.latestExecution?.pipelineExecutionId || null };
+        break;
+      }
+    }
+    if (revision) break;
+  }
   for (const stage of state.stageStates || []) {
     for (const action of stage.actionStates || []) {
       const token = action.latestExecution?.token;
@@ -1802,18 +1849,28 @@ async function scanDeployApprovalsForTarget(target) {
       if (token && status === "InProgress") {
         pending = { stageName: stage.stageName, actionName: action.actionName, token,
           revisionUrl: action.entityUrl || action.revisionUrl,
-          commitSha: sourceRevisionId || null };
+          // The approval action's latestExecution carries no execution id; the
+          // STAGE is the only place CodePipeline reports it.
+          executionId: stage.latestExecution?.pipelineExecutionId || null,
+          commitSha: null };
         break;
       }
     }
     if (pending) break;
   }
   if (!pending) return;
+  await resolveDeployCommit(pending, revision, target);
 
   // Claim on the pipeline + token: a new pipeline execution mints a fresh token,
   // so this naturally re-pings each run while never double-pinging the same wait.
   const claimed = await claimDeployApproval(pending, target);
-  if (!claimed) return;
+  // Already pinged - but this is also the ONLY place we know the same token is
+  // still InProgress, so it is where an unanswered gate earns its one reminder.
+  if (!claimed) {
+    await repageDeployApproval(pending, target).catch((err) =>
+      console.error("[telegram-bug-intake] deploy approval repage", err.message));
+    return;
+  }
 
   try {
     const chats = (await listChats()).filter((c) => ALLOWED_CHAT_IDS.includes(String(c)));
@@ -1831,55 +1888,229 @@ async function scanDeployApprovalsForTarget(target) {
       return null;
     });
 
-    const deployAsk =
-      "This is the irreversible production deploy — the merge is already approved. " +
-      "Approve to ship, or Reject to stop.";
-    // Which pipeline, and which REPO's pipeline: with several registered repos a
-    // bare pipeline name is not enough for a human to know what they are shipping.
-    const meta = [`🏷 ${esc(target.pipeline)}`];
-    if (target.repo) meta.push(`📦 ${esc(target.repo)}`);
-    const text = brief
-      ? execPing({
-          kicker: "🚀 PRODUCTION DEPLOY — approval needed",
-          subject: brief.prTitle || brief.commitSubject || target.pipeline,
-          summary: brief.summary || "",                       // one-line what/why from the PR body
-          bullets: [
-            brief.workflowLine,                               // "Workflow: TEAM-3721 (bug-fix)"
-            brief.scopeLine,                                  // "Scope: 8 files (+147/-4)"
-            brief.commitLine && brief.commitLine.replace(/`/g, ""), // "Commit: a1b2c3d"
-          ].filter(Boolean),
-          meta,
-          ask: deployAsk,
-        })
-      : execPing({
-          kicker: "🚀 PRODUCTION DEPLOY — approval needed",
-          subject: target.pipeline,
-          summary: "The build passed every gate and is waiting on you to ship it to prod.",
-          meta,
-          ask: deployAsk,
-        });
-
-    const rows = [[
-      { text: "🚀 Approve deploy", callback_data: `dok|${claimed.key}` },
-      { text: "🛑 Reject", callback_data: `dno|${claimed.key}` },
-    ]];
-    const linkRow = [];
-    if (brief?.prUrl) linkRow.push({ text: "🔗 View PR", url: brief.prUrl });
-    if (pending.revisionUrl) linkRow.push({ text: "🔗 View commit", url: pending.revisionUrl });
-    else if (brief?.commitUrl) linkRow.push({ text: "🔗 View commit", url: brief.commitUrl });
-    if (linkRow.length) rows.push(linkRow);
-    const keyboard = { inline_keyboard: rows };
+    const text = deployGateText({ kicker: DEPLOY_GATE_KICKER, pending, target, brief });
+    const keyboard = { inline_keyboard: deployGateRows(claimed.key, pending, target, brief) };
 
     let delivered = 0;
     for (const chatId of chats) {
       try { await tgSend(chatId, text, { reply_markup: keyboard }); delivered++; }
       catch (err) { console.error(`[telegram-bug-intake] deploy approval ping to ${chatId}`, err.message); }
     }
+    // One grep-able line per wait, so "was a human actually paged for this gate?"
+    // is answerable from the log as well as from the depping# row below.
+    logDeployPing(delivered, pending, target, claimed.key);
     if (!delivered) await releaseDeployApproval(claimed.key);
+    else await recordDeployPing(pending, target, claimed.key, delivered, null);
   } catch (err) {
     await releaseDeployApproval(claimed.key).catch((relErr) =>
       console.error("[telegram-bug-intake] releaseDeployApproval after failure", relErr.message));
     throw err;
+  }
+}
+
+/**
+ * Set `pending.commitSha` to the commit THIS approval is gating (TEAM-4670).
+ *
+ * GetPipelineState reports every stage's latest action, so under overlapping
+ * executions the revision on Source belongs to a NEWER execution than the one
+ * parked at the gate: on 2026-09-14 the gate held 486b5ac9 while Source had
+ * already moved to 9f6a9e0d, and the ping described the wrong change. When the
+ * revision and the approval come from the same execution (or either id is
+ * unknown, which is every single-execution pipeline and every pre-TEAM-4670
+ * recorded state) the reported revision IS the right one. Otherwise ask the API
+ * for the parked execution's own artifact revision.
+ *
+ * Never throws: an AccessDenied here (the GetPipelineExecution grant is a
+ * separate human handoff) must degrade the brief, never drop the page.
+ */
+async function resolveDeployCommit(pending, revision, target) {
+  const revExec = revision?.executionId || null;
+  const gateExec = pending.executionId || null;
+  if (!revExec || !gateExec || revExec === gateExec) {
+    pending.commitSha = revision?.revisionId || null;
+    return;
+  }
+  try {
+    const res = await codepipelineFor(target.region).send(
+      new GetPipelineExecutionCommand({ pipelineName: target.pipeline, pipelineExecutionId: gateExec }),
+    );
+    const sha = res?.pipelineExecution?.artifactRevisions?.[0]?.revisionId || null;
+    if (!sha) throw new Error("execution reported no artifactRevisions");
+    pending.commitSha = sha;
+    // The approval action's entityUrl points at the revision CodePipeline last
+    // saw, which in exactly this case is the overtaking commit. Prefer the
+    // brief's own link for the commit we actually resolved.
+    pending.commitFromExecution = true;
+  } catch (err) {
+    console.warn(`[telegram-bug-intake] deploy commit for execution ${gateExec} on ${target.pipeline} unresolved: ${err.name || err.message}`);
+    pending.commitSha = null;
+    pending.commitUnknown = true;
+  }
+}
+
+const DEPLOY_COMMIT_UNKNOWN_LINE =
+  "Commit: unknown - a newer execution overtook the Source stage; open the execution link";
+
+/** The AWS console timeline for the exact execution parked at the gate. */
+function executionUrl(pipeline, region, executionId) {
+  const r = region || DEFAULT_REGION;
+  return `https://${r}.console.aws.amazon.com/codesuite/codepipeline/pipelines/${encodeURIComponent(pipeline)}/executions/${encodeURIComponent(executionId)}/timeline?region=${r}`;
+}
+
+/**
+ * The gate ping body. One shape for the first page and the reminder, differing
+ * only in the kicker — the whole point of TEAM-4670 D2 is that this message is
+ * never mistakable for the Jira review-gate ping that renders through the same
+ * execPing().
+ */
+function deployGateText({ kicker, pending, target, brief }) {
+  // Which pipeline, which REPO's pipeline, where, and WHICH EXECUTION: with
+  // several registered repos and overlapping executions, a bare pipeline name
+  // is not enough for a human to know what they are shipping.
+  const meta = [`🏷 ${esc(target.pipeline)}`];
+  if (target.repo) meta.push(`📦 ${esc(target.repo)}`);
+  meta.push(`🌐 ${esc(target.region || DEFAULT_REGION)}`);
+  if (pending.executionId) meta.push(`🆔 ${esc(String(pending.executionId).slice(0, 8))}`);
+  const commitBullet = pending.commitUnknown
+    ? DEPLOY_COMMIT_UNKNOWN_LINE
+    : brief?.commitLine && brief.commitLine.replace(/`/g, "");   // "Commit: a1b2c3d"
+  return execPing({
+    kicker,
+    subject: brief?.prTitle || brief?.commitSubject || target.pipeline,
+    summary: brief?.summary                                       // one-line what/why from the PR body
+      || "The build passed every gate and is waiting on you to ship it to prod.",
+    bullets: [
+      brief?.workflowLine,                                        // "Workflow: TEAM-3721 (bug-fix)"
+      brief?.scopeLine,                                           // "Scope: 8 files (+147/-4)"
+      commitBullet,
+    ].filter(Boolean),
+    meta,
+    ask: `${DEPLOY_NOT_JIRA_LINE} It is the irreversible production deploy; the merge is already approved. Approve to ship, or Reject to stop.`,
+  });
+}
+
+/**
+ * Approve / Reject plus the link row. The reminder reuses the SAME claim key, so
+ * either message's buttons resolve the one gate.
+ */
+function deployGateRows(key, pending, target, brief) {
+  const rows = [[
+    { text: "🚀 Approve deploy", callback_data: `dok|${key}` },
+    { text: "🛑 Reject", callback_data: `dno|${key}` },
+  ]];
+  const linkRow = [];
+  if (brief?.prUrl) linkRow.push({ text: "🔗 View PR", url: brief.prUrl });
+  // Straight to the parked execution's timeline: the one place that shows which
+  // commit is really at the gate, and the only useful link when it is unknown.
+  if (pending.executionId) {
+    linkRow.push({ text: "🔗 View execution", url: executionUrl(target.pipeline, target.region, pending.executionId) });
+  }
+  if (pending.commitFromExecution && brief?.commitUrl) linkRow.push({ text: "🔗 View commit", url: brief.commitUrl });
+  else if (pending.revisionUrl) linkRow.push({ text: "🔗 View commit", url: pending.revisionUrl });
+  else if (brief?.commitUrl) linkRow.push({ text: "🔗 View commit", url: brief.commitUrl });
+  if (linkRow.length) rows.push(linkRow);
+  return rows;
+}
+
+/** Grep-able delivery evidence in CloudWatch (TEAM-4670 D4). */
+function logDeployPing(delivered, pending, target, key, kind = "deploy approval ping") {
+  const line = `[telegram-bug-intake] ${kind} ${delivered ? "delivered" : "NOT delivered"}`
+    + ` pipeline=${target.pipeline} region=${target.region || DEFAULT_REGION}`
+    + ` execution=${pending.executionId || "unknown"} commit=${pending.commitSha || "unknown"}`
+    + ` chats=${delivered} key=${key}`;
+  if (delivered) console.log(line);
+  else console.error(line);
+}
+
+/**
+ * The machine-readable half of D4: one row per gated execution, keyed on
+ * pipeline + execution so the Pipeline___* tools Lambda can find it with what
+ * get_state already knows — no duplicated hashToken, and no token in the row.
+ * Best-effort: evidence must never be the reason a page fails.
+ */
+async function recordDeployPing(pending, target, claimKeyValue, deliveredChats, repagedAt) {
+  if (!pending.executionId) return;   // nothing stable to key on; the log line still records it
+  await ddb.send(new PutItemCommand({
+    TableName: PENDING_TABLE,
+    Item: {
+      id: { S: `${DEPLOY_PING_KEY_PREFIX}${target.pipeline}#${pending.executionId}` },
+      pagedAt: { S: new Date().toISOString() },
+      deliveredChats: { N: String(deliveredChats) },
+      ...(repagedAt ? { repagedAt: { S: repagedAt } } : {}),
+      ...(pending.commitSha ? { commitSha: { S: pending.commitSha } } : {}),
+      claimKey: { S: claimKeyValue },
+      ttl: { N: String(Math.floor(Date.now() / 1000) + DEPLOY_TTL_SEC) },
+    },
+  })).catch((err) =>
+    console.warn("[telegram-bug-intake] deploy ping record failed:", err.message));
+}
+
+/** "2h 14m" / "45m" — how long this gate has been waiting. */
+function formatWait(ms) {
+  const mins = Math.max(0, Math.round(ms / 60_000));
+  const h = Math.floor(mins / 60);
+  return h ? `${h}h ${mins % 60}m` : `${mins}m`;
+}
+
+/**
+ * ONE reminder for a gate that is still waiting (TEAM-4670 D3).
+ *
+ * Only ever called from scanDeployApprovalsForTarget after the claim Put came
+ * back ConditionalCheckFailed, which is the only proof that the SAME token is
+ * still InProgress. The once-only guarantee is a conditional Put on its own
+ * marker row (the same idiom as the review-gate repage), released again when the
+ * reminder reached nobody so a transient Telegram failure retries next scan.
+ */
+async function repageDeployApproval(pending, target) {
+  if (DEPLOY_REPAGE_MS <= 0) return;                  // explicitly disabled
+  const key = deployClaimKey(pending, target);
+  const row = await ddb.send(new GetItemCommand({
+    TableName: PENDING_TABLE, Key: { id: { S: `${DEPLOY_KEY_PREFIX}${key}` } },
+  }));
+  const item = row.Item;
+  if (!item) return;                                  // claim aged out; nothing to remind about
+  if (item.token?.S !== pending.token) return;        // different wait, same hash bucket
+  // pagedAt is written by the claim Put milliseconds before delivery, so it is
+  // the page time. A row from before TEAM-4670 has none: leave it alone rather
+  // than treat "unknown" as "overdue" and page about a stale claim.
+  const pagedAtMs = Date.parse(item.pagedAt?.S || "");
+  if (!Number.isFinite(pagedAtMs)) return;
+  const waited = Date.now() - pagedAtMs;
+  if (waited < DEPLOY_REPAGE_MS) return;
+
+  const marker = `${DEPLOY_REPAGE_KEY_PREFIX}${key}`;
+  if (!(await claimKey(marker, DEPLOY_TTL_SEC))) return;   // this wait already had its reminder
+  let delivered = 0;
+  try {
+    const chats = (await listChats()).filter((c) => ALLOWED_CHAT_IDS.includes(String(c)));
+    if (!chats.length) {
+      await releaseKey(marker);
+      return;
+    }
+    // Reuse the commit the claim row recorded: re-resolving it would spend
+    // another GetPipelineExecution on a commit that cannot have changed.
+    const remind = {
+      ...pending,
+      commitSha: pending.commitSha || item.commitSha?.S || null,
+      executionId: pending.executionId || item.executionId?.S || null,
+    };
+    const brief = await buildDeployBrief(remind.commitSha, target.repo).catch(() => null);
+    const text = deployGateText({
+      kicker: `🚀 CODEPIPELINE DEPLOY GATE - reminder, still waiting ${formatWait(waited)}`,
+      pending: remind, target, brief,
+    });
+    // Same claim key: whichever message the human taps resolves the same gate.
+    const keyboard = { inline_keyboard: deployGateRows(key, remind, target, brief) };
+    for (const chatId of chats) {
+      try { await tgSend(chatId, text, { reply_markup: keyboard }); delivered++; }
+      catch (err) { console.error(`[telegram-bug-intake] deploy approval reminder to ${chatId}`, err.message); }
+    }
+    logDeployPing(delivered, remind, target, key, "deploy approval reminder");
+    if (delivered) await recordDeployPing(remind, target, key, delivered, new Date().toISOString());
+  } finally {
+    // Nobody got it → drop the marker so the next scan tries again. The cap is
+    // on DELIVERED reminders, not on attempts.
+    if (!delivered) await releaseKey(marker).catch(() => {});
   }
 }
 
@@ -2034,23 +2265,32 @@ async function buildDeployBrief(commitSha, targetRepo = null) {
  * pipeline/region/repo/stage/action/token the button callback needs, since
  * callback_data can't carry the token itself.
  */
-async function claimDeployApproval(pending, target) {
-  // A short, callback_data-safe key derived from the target + the approval TOKEN
-  // (the token alone can exceed Telegram's 64-byte callback_data budget). The token
-  // stays in the DDB item. Hashing the PIPELINE in means two targets can never
-  // collide on one claim row, whatever their tokens look like.
-  //
-  // MIGRATION (TEAM-4347): before TEAM-4338 the key was hash(token) alone, and that
-  // code watched exactly ONE pipeline — DEPLOY_PIPELINE_NAME. So legacy-shaped rows
-  // can only ever exist for that pipeline; keeping the legacy shape for it means an
-  // approval already paused on the gate when this zip lands still hashes to the row
-  // that claimed it, instead of claiming a second row and pinging twice. Matching on
-  // the pipeline NAME (not on "came from the env fallback") is deliberate: the hub is
-  // normally in the registry too, so its target is a REGISTRY target that happens to
-  // name DEPLOY_PIPELINE_NAME — the exact configuration the double-ping would hit.
-  const key = DEPLOY_PIPELINE_NAME && target.pipeline === DEPLOY_PIPELINE_NAME
+/**
+ * A short, callback_data-safe key derived from the target + the approval TOKEN
+ * (the token alone can exceed Telegram's 64-byte callback_data budget). The token
+ * stays in the DDB item. Hashing the PIPELINE in means two targets can never
+ * collide on one claim row, whatever their tokens look like.
+ *
+ * MIGRATION (TEAM-4347): before TEAM-4338 the key was hash(token) alone, and that
+ * code watched exactly ONE pipeline — DEPLOY_PIPELINE_NAME. So legacy-shaped rows
+ * can only ever exist for that pipeline; keeping the legacy shape for it means an
+ * approval already paused on the gate when this zip lands still hashes to the row
+ * that claimed it, instead of claiming a second row and pinging twice. Matching on
+ * the pipeline NAME (not on "came from the env fallback") is deliberate: the hub is
+ * normally in the registry too, so its target is a REGISTRY target that happens to
+ * name DEPLOY_PIPELINE_NAME — the exact configuration the double-ping would hit.
+ *
+ * Pure, and the ONE place this is derived: the reminder path (TEAM-4670) must
+ * land on the very row the first ping claimed.
+ */
+function deployClaimKey(pending, target) {
+  return DEPLOY_PIPELINE_NAME && target.pipeline === DEPLOY_PIPELINE_NAME
     ? `dp${hashToken(pending.token)}`
     : `dp${hashToken(`${target.pipeline} ${pending.token}`)}`;
+}
+
+async function claimDeployApproval(pending, target) {
+  const key = deployClaimKey(pending, target);
   try {
     await ddb.send(new PutItemCommand({
       TableName: PENDING_TABLE,
@@ -2064,7 +2304,13 @@ async function claimDeployApproval(pending, target) {
         stageName: { S: pending.stageName },
         actionName: { S: pending.actionName },
         token: { S: pending.token },
-        ttl: { N: String(Math.floor(Date.now() / 1000) + 7 * 86400) },
+        // The claim is written milliseconds before delivery and deleted again
+        // when zero chats received it, so a surviving row's pagedAt IS the page
+        // time — which is what the reminder window is measured from (TEAM-4670).
+        pagedAt: { S: new Date().toISOString() },
+        ...(pending.executionId ? { executionId: { S: pending.executionId } } : {}),
+        ...(pending.commitSha ? { commitSha: { S: pending.commitSha } } : {}),
+        ttl: { N: String(Math.floor(Date.now() / 1000) + DEPLOY_TTL_SEC) },
       },
       ConditionExpression: "attribute_not_exists(id)",
     }));
@@ -2130,10 +2376,17 @@ async function handleDeployApprovalCallback(cb, chatId, action, key) {
       `${cb.message.text}\n\n⚠️ ${esc(err.name || "Error")}: ${esc(err.message || "")}`.slice(0, 4000));
     return;
   }
-  // One-shot: the token is now spent. Drop the claim so the row can't linger.
+  // One-shot: the token is now spent. Drop the claim so the row can't linger,
+  // and with it the reminder marker and the delivery-evidence row — the gate is
+  // decided, so get_state must stop reporting it as an open page (TEAM-4670).
   await ddb.send(new DeleteItemCommand({
     TableName: PENDING_TABLE, Key: { id: { S: `${DEPLOY_KEY_PREFIX}${key}` } },
   })).catch(() => {});
+  await releaseKey(`${DEPLOY_REPAGE_KEY_PREFIX}${key}`).catch(() => {});
+  const spentExecution = item.Item.executionId?.S;
+  if (spentExecution) {
+    await releaseKey(`${DEPLOY_PING_KEY_PREFIX}${item.Item.pipelineName.S}#${spentExecution}`).catch(() => {});
+  }
   await tgAnswer(cb.id, approve ? "Deploy approved" : "Deploy rejected");
   await tgEdit(chatId, cb.message.message_id,
     `${cb.message.text}\n\n${approve ? "🚀 Approved — deploying to prod." : "🛑 Rejected — deploy stopped."}`);
