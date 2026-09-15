@@ -52,6 +52,9 @@ vi.mock('@aws-sdk/lib-dynamodb', () => ({
   PutCommand: class PutCommand extends FakeCommand {},
   // TEAM-3385: the seen-set CHECK phase reads with BatchGetItem.
   BatchGetCommand: class BatchGetCommand extends FakeCommand {},
+  // TEAM-4688: lib/reconcile.mjs (imported by index.mjs for the second entry
+  // point) queries a day's stored result rows before rewriting its buckets.
+  QueryCommand: class QueryCommand extends FakeCommand {},
 }));
 
 vi.mock('@aws-sdk/client-s3', () => ({

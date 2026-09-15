@@ -83,6 +83,7 @@ import {
   personaDailyKey,
 } from './lib/daily.mjs';
 import { putResults, resultsTable, toResultRows } from './lib/results-store.mjs';
+import { reconcile } from './lib/reconcile.mjs';
 
 // ─── Clients ────────────────────────────────────────────────────────────────
 const ddbRaw = new DynamoDBClient({});
@@ -165,6 +166,16 @@ export function isBatterySession(sessionId) {
 
 // ─── Handler ────────────────────────────────────────────────────────────────
 export const handler = async (event) => {
+  // TEAM-4688 second entry point, checked BEFORE the awslogs decode: the daily
+  // EventBridge sweep ({mode:"reconcile",days:2}) and backfill-results.mjs
+  // ({mode:"reconcile",from,to}) re-read the results log groups directly and fill
+  // whatever the subscription filter dropped. Same extract → dedup → role-guard
+  // → row-mapper path as below; deliberately no config read, no seen-set claim,
+  // no buffer append and no improver invoke (see lib/reconcile.mjs).
+  if (event?.mode === 'reconcile') {
+    return reconcile(event, { ddb, loadAgents, resolveAgentId, extractSessionData });
+  }
+
   // Decode CloudWatch Logs payload
   const payload = Buffer.from(event.awslogs.data, 'base64');
   const parsed = JSON.parse(gunzipSync(payload).toString());
