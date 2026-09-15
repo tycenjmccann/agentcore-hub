@@ -1318,6 +1318,33 @@ async function harvestCompletionEvidence(workflow, ticketId) {
   }
 }
 
+/**
+ * Last look before an invoke: consistent re-read of the run, called from
+ * invokeAgent as the final await before the dispatch is sent (so no other
+ * network operation sits between the read and the send). The claim CAS
+ * refuses a run cancelled BEFORE the claim and the advancePhase CAS one
+ * cancelled before an advance — but a same-phase dispatch (a second dev or
+ * design ticket) advances nothing, so a cancel landing after its claim was
+ * invisible to it (Codex review on #606). The send itself is the only
+ * remaining gap; an agent that starts anyway sees its cancelled ticket and
+ * no-ops (as the analyst did in the TEAM-4577 incident).
+ */
+async function workflowStillLive(workflow, ticketId, assignee) {
+  let fresh;
+  try {
+    fresh = await store.getWorkflow(workflow.id);
+  } catch (err) {
+    // Fail OPEN: the claim is already ours, and a redelivery would only see
+    // "already claimed" — a transient read error must not strand the run
+    // until the stale-claim hatch. The agent itself notices a cancel.
+    console.warn(`[orchestrator] liveness re-read failed for ${workflow.id} (${err.message}) — proceeding with invoke of ${assignee} for ${ticketId}`);
+    return true;
+  }
+  if (fresh && !fresh.cancelledAt && !TERMINAL_WORKFLOW_PHASES.includes(fresh.phase)) return true;
+  console.log(`[orchestrator] GUARD: workflow ${workflow.id} is ${fresh ? fresh.phase : "gone"}${fresh?.cancelledAt ? " (cancelled)" : ""} — not invoking ${assignee} for ${ticketId}`);
+  return false;
+}
+
 async function claimTicketInvocation(workflow, ticketId, assignee) {
   const now = new Date().toISOString();
   const taskId = workflow.agentTasks?.[ticketId]?.id || `task_${Date.now()}_${assignee}`;
@@ -2684,9 +2711,8 @@ async function handleTicketReadyUnified(ticketId, ticket) {
   }
 
   console.log(`[orchestrator] Invoking agent ${assignee} for ticket ${ticketId}${resumed ? " (SESSION RESUME)" : ""}`);
-  await publishEvent(ticketId, "agent.invoked", { ticketId, assignee, agentId: assignee, phase: ticketPhase, workflowId: workflow.id });
 
-  await invokeAgent(agentDef, context, workflow, ticketId);
+  await invokeAgent(agentDef, context, workflow, ticketId, ticketPhase);
 }
 
 /**
@@ -3135,11 +3161,10 @@ async function handleTicketReady(ticketId, image) {
   }
 
   console.log(`[orchestrator] Invoking agent ${assignee} for ticket ${ticketId}${resumed ? " (SESSION RESUME)" : ""}`);
-  await publishEvent(ticketId, "agent.invoked", { ticketId, assignee, agentId: assignee, phase: ticketPhase, workflowId: workflow.id });
 
   // Fire-and-forget: invoke agent via AgentCore Harness
   // The agent will call report_completion when done → writes "done" to DynamoDB → triggers this Lambda again
-  await invokeAgent(agentDef, context, workflow, ticketId);
+  await invokeAgent(agentDef, context, workflow, ticketId, ticketPhase);
 }
 
 // ─── QA Gate ───────────────────────────────────────────────────────────────────
@@ -3658,7 +3683,16 @@ async function labelPullRequest(prUrl, label) {
  * Fire-and-forget: agent runs asynchronously. When done, it calls report_completion
  * which writes "done" to DynamoDB, triggering this Lambda again via the stream.
  */
-async function invokeAgent(agentDef, context, workflow, ticketId) {
+/**
+ * Dispatch one agent turn. Owns the dispatch-boundary events: `agent.invoked`
+ * (with the phase the caller resolved) and `orchestrator.agent_invoked` are
+ * published only AFTER the send, so a dispatch the final liveness read stops
+ * leaves no boundary behind — nothing for the metrics (compute_metrics.py
+ * invocation counts, cost-report re-dispatch instants) or the agent-output
+ * segmenter to mis-count. Callers that pass no `ticketPhase` (dead-session
+ * redispatch) get no agent.invoked, as before.
+ */
+async function invokeAgent(agentDef, context, workflow, ticketId, ticketPhase) {
   // Discover agent ARN — prefer runtimeArn from roster, then env var lookup
   const runtimeEnvKey = `RUNTIME_ARN_${agentDef.agentId.toUpperCase()}`;
   const harnessEnvKey = `HARNESS_ARN_${agentDef.agentId.toUpperCase()}`;
@@ -3714,6 +3748,11 @@ async function invokeAgent(agentDef, context, workflow, ticketId) {
       ...(modelConfig?.bedrockModelConfig ? { bedrockModelArn: modelConfig.bedrockModelConfig.modelId } : {}),
     });
 
+    // Final liveness read — the last await before the send (TEAM-4577). No
+    // boundary event has been published yet, so stopping here leaves no trace
+    // beyond the log line and the (now moot) claim on a terminal run.
+    if (!(await workflowStillLive(workflow, ticketId, agentDef.agentId))) return;
+
     // Note: In production, we'd use the AgentCore Harness SDK's invokeHarnessAgent
     // For now, invoke as a separate async Lambda that handles the streaming
     await lambda.send(new InvokeCommand({
@@ -3737,6 +3776,13 @@ async function invokeAgent(agentDef, context, workflow, ticketId) {
 
     console.log(`[orchestrator] Async invoke sent for ${agentDef.agentId} (session: ${sessionId})`);
 
+    // Dispatch boundary, after the send: the UI's running status + the phase
+    // stamp the metrics read. Redispatch (no phase) never emitted this.
+    if (ticketPhase) {
+      await publishEvent(ticketId, "agent.invoked", {
+        ticketId, assignee: agentDef.agentId, agentId: agentDef.agentId, phase: ticketPhase, workflowId: workflow.id,
+      });
+    }
     // Journey log: agent invocation dispatched
     await publishEvent(ticketId || agentDef.agentId, "orchestrator.agent_invoked", {
       ticketId: ticketId || "", agentId: agentDef.agentId, sessionId,
