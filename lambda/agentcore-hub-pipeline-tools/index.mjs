@@ -162,6 +162,15 @@
  *   PIPELINE_REPO       optional "owner/repo" label for the env default target, so
  *                       capabilities() can name the repo it deploys. Cosmetic —
  *                       nothing resolves on it
+ *   DEPLOY_GATE_CLAIM_TABLE  optional (TEAM-4670) — the telegram-bug-intake
+ *                       bridge's PENDING_TABLE, in THIS Lambda's account and
+ *                       region. Set → get_state reports approvalPing for an open
+ *                       deploy gate, read from the bridge's depping#<pipeline>#
+ *                       <executionId> evidence row (one GetItem, read-only, and
+ *                       the row holds no approval token). Unset → approvalPing is
+ *                       {status:"unknown"} and NO DynamoDB client is constructed.
+ *                       It grants no approval capability: this is evidence about a
+ *                       page, not a way to answer one
  *   REGION              default from AWS_REGION
  */
 
@@ -188,6 +197,11 @@ import {
 // runtime-provided). Used to assume a registry entry's cross-account
 // hub-cd-trigger-* role before reading/triggering a foreign-account pipeline.
 import { STSClient, AssumeRoleCommand } from "@aws-sdk/client-sts";
+// Also runtime-bundled. ONE read-only use (TEAM-4670): the Telegram bridge's
+// delivery-evidence row for an open deploy gate, so get_state can answer "has a
+// human actually been paged?" instead of leaving an agent to poll a gate nobody
+// was asked about for 9h. Read-only, one GetItem, one table.
+import { DynamoDBClient, GetItemCommand } from "@aws-sdk/client-dynamodb";
 // Byte copy of lambda/orchestrator/cd-registry.mjs (each Lambda zips from its own
 // directory). Pinned identical by scripts/check-cd-registry-parity.sh — edit the
 // canonical file in lambda/orchestrator/ and re-copy, never this one. Zero imports,
@@ -208,6 +222,10 @@ const PIPELINE_REPO = (process.env.PIPELINE_REPO || "").trim();
 // can be written and every deploy keeps its human gate, which is the pre-
 // TEAM-4525 behaviour. It grants no approval capability of any kind.
 const GITHUB_TOKEN = (process.env.GITHUB_TOKEN || "").trim();
+// The Telegram bridge's dedupe/claim table — see the Env block. Optional by
+// design: an install without the bridge (or before the IAM handoff) reports
+// approvalPing:{status:"unknown"} rather than failing get_state.
+const DEPLOY_GATE_CLAIM_TABLE = (process.env.DEPLOY_GATE_CLAIM_TABLE || "").trim();
 /** GitHub is on the critical path of a 60s Lambda; a slow API must fail closed
  * (unverified → gate fires), not burn the whole budget. */
 const GITHUB_TIMEOUT_MS = Number(process.env.GITHUB_TIMEOUT_MS || 5000);
@@ -315,6 +333,58 @@ let stsClient = null;
 function sts() {
   if (!stsClient) stsClient = new STSClient({ region: REGION });
   return stsClient;
+}
+
+// The bridge's claim table is in THIS Lambda's account and region (it is hub
+// state, like the artifact bucket — never fanned out to a target's region).
+// Lazy for the same reason as sts(): with DEPLOY_GATE_CLAIM_TABLE unset, no
+// client is constructed at all.
+let ddbClient = null;
+function ddb() {
+  if (!ddbClient) ddbClient = new DynamoDBClient({ region: REGION });
+  return ddbClient;
+}
+
+/**
+ * Was a human actually paged about this open deploy gate? (TEAM-4670)
+ *
+ * The telegram-bug-intake bridge writes one evidence row per gated execution,
+ * keyed on pipeline + execution id precisely so this Lambda can find it without
+ * re-deriving the bridge's claim hash — which would mean handling the approval
+ * token, and this Lambda must never see one. Only whitelisted fields are
+ * returned, so no token and no chat id can leak even if the row grows.
+ *
+ * Never throws and never blocks get_state: an unset env, a missing grant or a
+ * missing row all resolve to a status the caller can act on.
+ *   delivered     the bridge sent the ping to >=1 chat at pagedAt
+ *   not_delivered no row for this execution: nobody has been paged, escalate
+ *   unknown       we cannot tell — NOT evidence that nobody was paged
+ */
+async function readApprovalPing(pipelineName, executionId) {
+  if (!DEPLOY_GATE_CLAIM_TABLE) {
+    return { status: "unknown", reason: "DEPLOY_GATE_CLAIM_TABLE not configured" };
+  }
+  if (!executionId) {
+    return { status: "unknown", reason: "approval execution id unknown" };
+  }
+  try {
+    const res = await ddb().send(new GetItemCommand({
+      TableName: DEPLOY_GATE_CLAIM_TABLE,
+      Key: { id: { S: `depping#${pipelineName}#${executionId}` } },
+    }));
+    if (!res.Item) {
+      return { status: "not_delivered", reason: "no bridge ping record for this execution" };
+    }
+    const item = res.Item;
+    return {
+      status: "delivered",
+      ...(item.pagedAt?.S ? { pagedAt: item.pagedAt.S } : {}),
+      ...(item.deliveredChats?.N ? { deliveredChats: Number(item.deliveredChats.N) } : {}),
+      ...(item.repagedAt?.S ? { repagedAt: item.repagedAt.S } : {}),
+    };
+  } catch (err) {
+    return { status: "unknown", reason: err.name || "Error" };
+  }
 }
 
 // A credentials provider that assumes a cross-account hub-cd-trigger-* role with
@@ -935,6 +1005,20 @@ async function getState(args = {}, target) {
       approvalStage.actions.some((a) => /approv/i.test(a.action) && a.status === "Skipped"))
   );
 
+  // The other half of that question (TEAM-4670): when the gate IS firing, has
+  // the human been paged? Same scoping rule as approvalSkipped, and attached
+  // ONLY while an approval is actually waiting — a finished or skipped run has
+  // no page to report, so every existing caller sees a byte-identical response.
+  const approvalPending = !!(
+    approvalStage &&
+    (!executionId || approvalStage.executionId === executionId) &&
+    (approvalStage.status === "InProgress" ||
+      approvalStage.actions.some((a) => /approv/i.test(a.action) && a.status === "InProgress"))
+  );
+  const approvalPing = approvalPending
+    ? await readApprovalPing(name, approvalStage.executionId || pipelineExecutionId)
+    : null;
+
   return jsonResult({
     configured: true,
     pipelineName: name,
@@ -953,6 +1037,10 @@ async function getState(args = {}, target) {
     failed: anyFailed,
     // True iff the conditional deploy gate did not fire for this run.
     approvalSkipped,
+    // Present only while the deploy gate is actually waiting on a human:
+    // delivered / not_delivered / unknown. "unknown" is not evidence that
+    // nobody was paged — see readApprovalPing.
+    ...(approvalPing ? { approvalPing } : {}),
     stages,
     actionDetails,
   });

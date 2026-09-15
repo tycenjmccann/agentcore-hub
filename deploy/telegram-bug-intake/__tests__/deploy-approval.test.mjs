@@ -20,6 +20,16 @@
  *  4. DEPLOY_PIPELINE_NAME *and* ARTIFACT_BUCKET unset → no AWS calls at all
  *     (OSS / no pipeline): not one GetPipelineState, not one registry read.
  *  5. One target's failure never costs another target its ping.
+ *
+ * TEAM-4670 adds three more:
+ *  6. The brief describes the execution PARKED at the gate, not whichever
+ *     execution Source has moved on to; an unresolvable commit degrades the
+ *     brief ("Commit: unknown") and still pages.
+ *  7. The ping cannot be mistaken for the Jira review-gate ping: CODEPIPELINE
+ *     kicker, the "does NOT approve it" line, the execution id and a link to it.
+ *  8. An unanswered gate earns EXACTLY ONE delivered reminder after
+ *     DEPLOY_REPAGE_MS, on the same claim key, and leaves delivery evidence
+ *     (the depping# row + a grep-able log line) behind.
  */
 import { describe, it, expect, beforeEach, afterAll, vi } from "vitest";
 
@@ -79,11 +89,16 @@ vi.mock("@aws-sdk/client-dynamodb", () => {
  *                      how "the right region approved it" is asserted.
  *   cp.sends / cp.inits — every send / every client construction, for the
  *                      "nothing configured → no AWS calls" invariant.
+ *   cp.executions    — GetPipelineExecution answers, keyed by EXECUTION ID
+ *                      (TEAM-4670): `{ "<execId>": "<revisionId>" }`.
+ *   cp.executionError — name of an error GetPipelineExecution should throw
+ *                      instead (e.g. "AccessDeniedException").
  */
 const cp = vi.hoisted(() => {
   const s = {
     states: new Map(), stateErrors: new Map(), putErrors: new Map(),
     approvals: [], approvalCalls: [], sends: [], inits: [],
+    executions: {}, executionError: null,
   };
   for (const [prop, map] of [["state", "states"], ["stateError", "stateErrors"], ["putError", "putErrors"]]) {
     Object.defineProperty(s, prop, {
@@ -114,10 +129,24 @@ vi.mock("@aws-sdk/client-codepipeline", () => {
         cp.approvalCalls.push({ region: this.region, pipelineName: c.input?.pipelineName, input: c.input });
         return {};
       }
+      if (c.op === "exec") {
+        if (cp.executionError) {
+          const e = new Error(cp.executionError);
+          e.name = cp.executionError;
+          throw e;
+        }
+        const rev = cp.executions[c.input?.pipelineExecutionId];
+        return { pipelineExecution: rev ? { artifactRevisions: [{ revisionId: rev }] } : {} };
+      }
       throw new Error(`unexpected cp op ${c.op}`);
     }
   }
-  return { CodePipelineClient, GetPipelineStateCommand: cmd("state"), PutApprovalResultCommand: cmd("put") };
+  return {
+    CodePipelineClient,
+    GetPipelineStateCommand: cmd("state"),
+    GetPipelineExecutionCommand: cmd("exec"),
+    PutApprovalResultCommand: cmd("put"),
+  };
 });
 
 // Key-aware S3: the bridge reads exactly ONE key (the CD registry). `registry`
@@ -211,12 +240,14 @@ const ENV = {
   AWS_REGION: "us-east-1",
 };
 
-async function loadHandler({ allowed, pipeline, bucket, registry } = {}) {
+async function loadHandler({ allowed, pipeline, bucket, registry, repageMs } = {}) {
   vi.resetModules();
   Object.assign(process.env, ENV);
   if (allowed == null) delete process.env.ALLOWED_CHAT_IDS; else process.env.ALLOWED_CHAT_IDS = allowed;
   if (pipeline == null) delete process.env.DEPLOY_PIPELINE_NAME; else process.env.DEPLOY_PIPELINE_NAME = pipeline;
   if (bucket == null) delete process.env.ARTIFACT_BUCKET; else process.env.ARTIFACT_BUCKET = bucket;
+  // DEPLOY_REPAGE_MS is read at MODULE LOAD (a const), so it can only be set here.
+  if (repageMs == null) delete process.env.DEPLOY_REPAGE_MS; else process.env.DEPLOY_REPAGE_MS = String(repageMs);
   s3.registry = registry ?? null;
   return (await import("../index.mjs")).handler;
 }
@@ -228,12 +259,13 @@ beforeEach(() => {
   cp.approvals.length = 0; cp.approvalCalls.length = 0; cp.sends.length = 0; cp.inits.length = 0;
   s3.calls.length = 0; s3.inits.length = 0; s3.registry = null; s3.error = null;
   cp.state = { stageStates: [] }; cp.stateError = null; cp.putError = null;
+  cp.executions = {}; cp.executionError = null;
   clockSkewMs = 0;
 });
 afterAll(() => {
   vi.restoreAllMocks();
   global.fetch = realFetch;
-  for (const k of [...Object.keys(ENV), "ALLOWED_CHAT_IDS", "DEPLOY_PIPELINE_NAME", "ARTIFACT_BUCKET"]) delete process.env[k];
+  for (const k of [...Object.keys(ENV), "ALLOWED_CHAT_IDS", "DEPLOY_PIPELINE_NAME", "ARTIFACT_BUCKET", "DEPLOY_REPAGE_MS"]) delete process.env[k];
 });
 
 const registerChat = (id) => db.items.set(`chat#${id}`, { id: { S: `chat#${id}` }, chatId: { N: String(id) } });
@@ -242,18 +274,26 @@ const registerChat = (id) => db.items.set(`chat#${id}`, { id: { S: `chat#${id}` 
  * defaults to TOKEN (so existing no-arg callers are unchanged); a second target
  * needs its own token, since the claim key is derived from pipeline + token.
  */
-const pendingState = (token = TOKEN, { revision } = {}) => ({
+const pendingState = (token = TOKEN, { revision, revisionExecId, gateExecId } = {}) => ({
   stageStates: [
-    { stageName: "Build", actionStates: [{
-      actionName: "Build",
-      latestExecution: { status: "Succeeded" },
-      ...(revision ? { currentRevision: { revisionId: revision } } : {}),
-    }] },
-    { stageName: "Approval", actionStates: [{
-      actionName: "Approve_deploy",
-      entityUrl: "https://github.com/o/r/commits/main",
-      latestExecution: { status: "InProgress", token },
-    }] },
+    { stageName: "Build",
+      // Stage-level pipelineExecutionId is where CodePipeline reports which
+      // execution a stage's latest actions belong to (TEAM-4670). Omitted unless
+      // a test is exercising overlapping executions, exactly as the real API
+      // omits nothing but the tests need not care.
+      ...(revisionExecId ? { latestExecution: { pipelineExecutionId: revisionExecId } } : {}),
+      actionStates: [{
+        actionName: "Build",
+        latestExecution: { status: "Succeeded" },
+        ...(revision ? { currentRevision: { revisionId: revision } } : {}),
+      }] },
+    { stageName: "Approval",
+      ...(gateExecId ? { latestExecution: { pipelineExecutionId: gateExecId } } : {}),
+      actionStates: [{
+        actionName: "Approve_deploy",
+        entityUrl: "https://github.com/o/r/commits/main",
+        latestExecution: { status: "InProgress", token },
+      }] },
     { stageName: "Deploy", actionStates: [{ actionName: "Deploy_three_targets", latestExecution: {} }] },
   ],
 });
@@ -847,5 +887,421 @@ describe("deploy-approval bridge", () => {
       expect(d).toMatch(/^d(ok|no)\|dp[0-9a-z]+$/);
       expect(Buffer.byteLength(d, "utf8"), "Telegram's 64-byte callback_data cap").toBeLessThanOrEqual(64);
     }
+  });
+});
+
+// ─── TEAM-4670: the commit at the gate, the unmistakable message, one reminder ─
+//
+// The incident: execution 347b9bcb (commit 486b5ac9, PR #593) sat on
+// Approval/Approve_deploy for 9h. Execution 19688946 (commit 9f6a9e0d, PR #596)
+// started 12 minutes later and its Source+Build finished BEFORE the gate opened,
+// so GetPipelineState reported ITS revision on the Source stage — and the ping,
+// which took "the first currentRevision in the state", described the wrong
+// change. The operator answered three Jira deploy-gate tickets instead (none of
+// which touch CodePipeline) and nothing ever re-asked.
+
+const GATE_EXEC = "347b9bcb-1111-4444-8888-aaaaaaaaaaaa";   // parked at the gate
+const NEWER_EXEC = "19688946-2222-4444-8888-bbbbbbbbbbbb";  // overtook Source
+const GATE_SHA = "486b5ac9deadbeefcafe0000000000000000cafe";
+const NEWER_SHA = "9f6a9e0dfeedface1234000000000000000012ab";
+
+/** The pipelines GetPipelineExecution was asked about, in call order. */
+const execLookups = () => cp.sends.filter((s) => s.op === "exec").map((s) => s.input.pipelineExecutionId);
+/** The depping# evidence rows currently in the table. */
+const pingRows = () => [...db.items.entries()].filter(([id]) => id.startsWith("depping#"));
+const pingRow = (pipeline, execId) => db.items.get(`depping#${pipeline}#${execId}`);
+
+/**
+ * The overlapping-execution state from the incident: Source/Build report the
+ * NEWER execution's revision, the Approval stage is still the older one.
+ */
+const overlappingState = (token = TOKEN) =>
+  pendingState(token, {
+    revision: NEWER_SHA, revisionExecId: NEWER_EXEC, gateExecId: GATE_EXEC,
+  });
+
+describe("deploy-approval: the commit parked at the gate (TEAM-4670 D1)", () => {
+  it("overlapping executions → the brief describes the GATE's commit, not Source's newest", async () => {
+    const handler = await loadHandler({ allowed: "555", pipeline: PIPELINE });
+    registerChat(555);
+    cp.state = overlappingState();
+    cp.executions = { [GATE_EXEC]: GATE_SHA, [NEWER_EXEC]: NEWER_SHA };
+
+    const net = makeNet(makeCtx(100_000), {
+      batches: [[]],
+      github: {
+        commit: { commit: { message: "TEAM-4563: pipeline arg contract + CI guard" },
+          stats: { additions: 120, deletions: 8 }, files: new Array(5).fill({}) },
+        pulls: [{ number: 593, title: "TEAM-4563: pipeline arg contract + CI guard",
+          html_url: "https://github.com/o/r/pull/593", body: "## Summary\nBlock a PR whose buildspec reads a setting the pipeline does not provide." }],
+      },
+    });
+    global.fetch = net.fetch;
+    await handler({}, net.ctx);
+
+    // The mismatch was resolved by asking about the PARKED execution, once.
+    expect(execLookups()).toEqual([GATE_EXEC]);
+    expect(net.sent.length).toBe(1);
+    // GitHub was enriched from the gate's SHA - the whole defect was that this
+    // was the overtaking commit.
+    const shaFetches = net.fetched.filter((u) => u.includes("/commits/"));
+    expect(shaFetches.some((u) => u.includes(GATE_SHA))).toBe(true);
+    expect(shaFetches.some((u) => u.includes(NEWER_SHA))).toBe(false);
+    const text = net.sent[0].text;
+    expect(text).toMatch(/Commit: 486b5ac/);
+    expect(text).not.toMatch(/9f6a9e0/);
+    expect(text).not.toMatch(/Commit: unknown/);
+  });
+
+  it("GetPipelineExecution AccessDenied → commit unknown, and the gate still pages", async () => {
+    const handler = await loadHandler({ allowed: "555", pipeline: PIPELINE });
+    registerChat(555);
+    cp.state = overlappingState();
+    // The IAM grant is a separate human handoff, so this is the state of the
+    // world between the code deploy and update-config.sh.
+    cp.executionError = "AccessDeniedException";
+
+    const net = makeNet(makeCtx(100_000), { batches: [[]] });
+    global.fetch = net.fetch;
+    await handler({}, net.ctx);
+
+    expect(net.sent.length, "the page still goes out").toBe(1);
+    const text = net.sent[0].text;
+    expect(text).toMatch(/Commit: unknown/);
+    expect(text).toMatch(/newer execution overtook the Source stage/);
+    // Not silently the WRONG commit, and no GitHub enrichment off a bad SHA.
+    expect(text).not.toMatch(/9f6a9e0/);
+    expect(net.fetched.some((u) => u.includes("/commits/"))).toBe(false);
+    // Still actionable: the buttons are there.
+    expect(btnData(net.sent[0]).some((d) => d.startsWith("dok|"))).toBe(true);
+    expect(btnData(net.sent[0]).some((d) => d.startsWith("dno|"))).toBe(true);
+  });
+
+  it("one execution (ids equal, or absent) → the reported revision is used, no extra API call", async () => {
+    const handler = await loadHandler({ allowed: "555", pipeline: PIPELINE });
+    registerChat(555);
+    // Same execution on both stages: the state's own revision IS the gate's.
+    cp.state = pendingState(TOKEN, { revision: GATE_SHA, revisionExecId: GATE_EXEC, gateExecId: GATE_EXEC });
+
+    const net = makeNet(makeCtx(100_000), { batches: [[]] });
+    global.fetch = net.fetch;
+    await handler({}, net.ctx);
+
+    expect(execLookups(), "no mismatch, so nothing to resolve").toEqual([]);
+    expect(net.sent.length).toBe(1);
+    expect(net.sent[0].text).not.toMatch(/Commit: unknown/);
+    expect(net.fetched.some((u) => u.includes(GATE_SHA))).toBe(true);
+
+    // And with no execution ids at all (every pre-TEAM-4670 fixture, and any
+    // pipeline whose state omits them) the behaviour is byte-for-byte the old one.
+    // A fresh TOKEN2 wait, since the claim above still holds TOKEN's key.
+    const handler2 = await loadHandler({ allowed: "556", pipeline: PIPELINE });
+    registerChat(556);
+    cp.state = pendingState(TOKEN2, { revision: GATE_SHA });
+    const net2 = makeNet(makeCtx(100_000), { batches: [[]] });
+    global.fetch = net2.fetch;
+    await handler2({}, net2.ctx);
+    expect(execLookups()).toEqual([]);
+    expect(net2.sent.length).toBe(1);
+    expect(net2.sent[0].text).not.toMatch(/Commit: unknown/);
+  });
+});
+
+describe("deploy-approval: unmistakably the pipeline's own gate (TEAM-4670 D2)", () => {
+  it("kicker, the not-the-Jira-gate line, execution id, region and a View execution link", async () => {
+    const handler = await loadHandler({ allowed: "555", pipeline: PIPELINE });
+    registerChat(555);
+    cp.state = pendingState(TOKEN, { revision: GATE_SHA, revisionExecId: GATE_EXEC, gateExecId: GATE_EXEC });
+
+    const net = makeNet(makeCtx(100_000), { batches: [[]] });
+    global.fetch = net.fetch;
+    await handler({}, net.ctx);
+
+    const msg = net.sent[0];
+    const text = msg.text;
+    // This is a CODEPIPELINE gate, not the Jira review gate that renders through
+    // the same execPing().
+    expect(text).toMatch(/CODEPIPELINE DEPLOY GATE - approval needed/);
+    expect(text).toMatch(/approving a Jira deploy-gate ticket does NOT approve it/);
+    // Which pipeline, where, and WHICH execution.
+    expect(text).toContain(PIPELINE);
+    expect(text).toContain("us-east-1");
+    expect(text).toContain(GATE_EXEC.slice(0, 8));
+    // The one link that always shows what is really at the gate.
+    const exec = msg.reply_markup.inline_keyboard.flat().find((b) => b.text === "🔗 View execution");
+    expect(exec, "View execution button").toBeTruthy();
+    expect(exec.url).toContain(PIPELINE);
+    expect(exec.url).toContain(GATE_EXEC);          // FULL id in the link
+    expect(exec.url).toContain("region=us-east-1");
+    // Hyphens, never em dashes, in the text this ticket introduces.
+    expect(text).not.toMatch(/CODEPIPELINE[^\n]*—/);
+    expect(text).not.toMatch(/—[^\n]*approving a Jira/);
+  });
+
+  it("no execution id in the state → no View execution button, and the ping is unchanged otherwise", async () => {
+    const handler = await loadHandler({ allowed: "555", pipeline: PIPELINE });
+    registerChat(555);
+    cp.state = pendingState();   // no execution ids at all
+
+    const net = makeNet(makeCtx(100_000), { batches: [[]] });
+    global.fetch = net.fetch;
+    await handler({}, net.ctx);
+
+    const msg = net.sent[0];
+    expect(msg.text).toMatch(/CODEPIPELINE DEPLOY GATE - approval needed/);
+    expect(msg.reply_markup.inline_keyboard.flat().some((b) => b.text === "🔗 View execution")).toBe(false);
+    expect(msg.reply_markup.inline_keyboard.flat().some((b) => b.url === "https://github.com/o/r/commits/main")).toBe(true);
+  });
+});
+
+describe("deploy-approval: one bounded reminder (TEAM-4670 D3)", () => {
+  /** Ping, then re-scan `n` times after advancing the clock by `skew` each time. */
+  async function rescan(handler, skewMs) {
+    advanceClock(skewMs);
+    cp.state = overlappingState();
+    cp.executions = { [GATE_EXEC]: GATE_SHA };
+    const net = makeNet(makeCtx(100_000), { batches: [[]] });
+    global.fetch = net.fetch;
+    await handler({}, net.ctx);
+    return net;
+  }
+
+  it("reminds exactly once after DEPLOY_REPAGE_MS, on the SAME claim key, and never again", async () => {
+    const handler = await loadHandler({ allowed: "555", pipeline: PIPELINE, repageMs: 1_800_000 });
+    registerChat(555);
+    cp.state = overlappingState();
+    cp.executions = { [GATE_EXEC]: GATE_SHA };
+    const first = makeNet(makeCtx(100_000), { batches: [[]] });
+    global.fetch = first.fetch;
+    await handler({}, first.ctx);
+    expect(first.sent.length).toBe(1);
+    const originalKey = dokKey(first.sent[0]);
+
+    // 29 minutes in: still inside the window, so nothing.
+    const early = await rescan(handler, 29 * 60_000);
+    expect(early.sent.length, "no reminder before the window closes").toBe(0);
+
+    // 31 minutes: one reminder.
+    const due = await rescan(handler, 2 * 60_000);
+    expect(due.sent.length, "exactly one reminder").toBe(1);
+    expect(due.sent[0].text).toMatch(/CODEPIPELINE DEPLOY GATE - reminder, still waiting 31m/);
+    // Same gate, same claim: whichever message the human taps resolves it.
+    expect(dokKey(due.sent[0])).toBe(originalKey);
+    expect(btnData(due.sent[0]).some((d) => d === `dno|${originalKey}`)).toBe(true);
+
+    // Hours later: the cap is one delivered reminder per wait.
+    const later = await rescan(handler, 4 * 60 * 60_000);
+    expect(later.sent.length, "never a second reminder").toBe(0);
+  });
+
+  it("DEPLOY_REPAGE_MS=0 disables reminders entirely", async () => {
+    const handler = await loadHandler({ allowed: "555", pipeline: PIPELINE, repageMs: 0 });
+    registerChat(555);
+    cp.state = overlappingState();
+    cp.executions = { [GATE_EXEC]: GATE_SHA };
+    const first = makeNet(makeCtx(100_000), { batches: [[]] });
+    global.fetch = first.fetch;
+    await handler({}, first.ctx);
+    expect(first.sent.length).toBe(1);
+
+    const later = await rescan(handler, 9 * 60 * 60_000);   // the incident's own 9h
+    expect(later.sent.length).toBe(0);
+    // Not even a read: the disable check is the first thing repage does.
+    expect([...db.items.keys()].some((k) => k.startsWith("deprepage#"))).toBe(false);
+  });
+
+  it("a reminder that reached nobody releases its marker, so the next scan retries once", async () => {
+    const handler = await loadHandler({ allowed: "555", pipeline: PIPELINE, repageMs: 60_000 });
+    registerChat(555);
+    cp.state = overlappingState();
+    cp.executions = { [GATE_EXEC]: GATE_SHA };
+    const first = makeNet(makeCtx(100_000), { batches: [[]] });
+    global.fetch = first.fetch;
+    await handler({}, first.ctx);
+    const originalKey = dokKey(first.sent[0]);
+
+    // Window open, but every send fails.
+    advanceClock(120_000);
+    cp.state = overlappingState();
+    const failing = makeNet(makeCtx(100_000), { batches: [[]] });
+    failing.fetch = async (url, opts) => {
+      if (String(url).endsWith("/sendMessage")) throw new Error("telegram 503");
+      return makeNet(failing.ctx, {}).fetch(url, opts);
+    };
+    global.fetch = failing.fetch;
+    await handler({}, failing.ctx);
+    expect([...db.items.keys()].some((k) => k.startsWith("deprepage#")),
+      "marker released so a transient failure is not a lost reminder").toBe(false);
+    // Nothing was delivered, so no evidence row either.
+    expect(pingRow(PIPELINE, GATE_EXEC)?.repagedAt).toBeUndefined();
+
+    // Next scan: the one reminder lands.
+    const retry = await rescan(handler, 60_000);
+    expect(retry.sent.length).toBe(1);
+    expect(dokKey(retry.sent[0])).toBe(originalKey);
+    expect(db.items.has(`deprepage#${originalKey}`), "marker held once delivered").toBe(true);
+
+    // And now it is capped again.
+    const after = await rescan(handler, 60 * 60_000);
+    expect(after.sent.length).toBe(0);
+  });
+
+  it("a claim row from before this change (no pagedAt) is left alone", async () => {
+    const handler = await loadHandler({ allowed: "555", pipeline: PIPELINE, repageMs: 1_000 });
+    registerChat(555);
+    // Exactly what a pre-TEAM-4670 zip wrote: no pagedAt attribute.
+    db.items.set(`dep#${legacyKey(TOKEN)}`, {
+      id: { S: `dep#${legacyKey(TOKEN)}` }, pipelineName: { S: PIPELINE },
+      region: { S: "us-east-1" }, stageName: { S: "Approval" },
+      actionName: { S: "Approve_deploy" }, token: { S: TOKEN },
+    });
+    const net = await rescan(handler, 10_000);
+    expect(net.sent.length, "unknown page time is not treated as overdue").toBe(0);
+  });
+});
+
+describe("deploy-approval: delivery evidence (TEAM-4670 D4)", () => {
+  it("logs one grep-able delivered line and writes the depping# row", async () => {
+    const handler = await loadHandler({ allowed: "555", pipeline: PIPELINE, repageMs: 60_000 });
+    registerChat(555);
+    cp.state = overlappingState();
+    cp.executions = { [GATE_EXEC]: GATE_SHA };
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      const net = makeNet(makeCtx(100_000), { batches: [[]] });
+      global.fetch = net.fetch;
+      await handler({}, net.ctx);
+
+      const line = log.mock.calls.map((a) => String(a[0])).find((l) => l.includes("deploy approval ping"));
+      expect(line, "one grep-able delivery line").toBeTruthy();
+      expect(line).toContain("delivered");
+      expect(line).toContain(`pipeline=${PIPELINE}`);
+      expect(line).toContain("region=us-east-1");
+      expect(line).toContain(`execution=${GATE_EXEC}`);
+      expect(line).toContain(`commit=${GATE_SHA}`);
+      expect(line).toContain("chats=1");
+      // The row the tools Lambda reads: keyed on pipeline + execution, and it
+      // carries NO approval token.
+      const row = pingRow(PIPELINE, GATE_EXEC);
+      expect(row, "depping# evidence row").toBeTruthy();
+      expect(row.deliveredChats.N).toBe("1");
+      expect(row.commitSha.S).toBe(GATE_SHA);
+      expect(row.claimKey.S).toBe(legacyKey(TOKEN));
+      expect(Date.parse(row.pagedAt.S)).toBeGreaterThan(0);
+      expect(row.repagedAt).toBeUndefined();
+      // Same 7-day TTL as the claim it belongs to.
+      const claim = db.items.get(`dep#${legacyKey(TOKEN)}`);
+      expect(Number(row.ttl.N)).toBeCloseTo(Number(claim.ttl.N), -2);
+      expect(JSON.stringify(row)).not.toContain(TOKEN);
+    } finally { log.mockRestore(); }
+  });
+
+  it("a ping that reached nobody logs NOT delivered and leaves no evidence row", async () => {
+    const handler = await loadHandler({ allowed: "555", pipeline: PIPELINE });
+    registerChat(555);
+    cp.state = overlappingState();
+    cp.executions = { [GATE_EXEC]: GATE_SHA };
+    const err = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const net = makeNet(makeCtx(100_000), { batches: [[]] });
+      net.fetch = async (url, opts) => {
+        if (String(url).endsWith("/sendMessage")) throw new Error("telegram 503");
+        return makeNet(net.ctx, {}).fetch(url, opts);
+      };
+      global.fetch = net.fetch;
+      await handler({}, net.ctx);
+
+      // The per-chat failure is logged too; the SUMMARY line is the one carrying
+      // the structured fields.
+      const line = err.mock.calls.map((a) => String(a[0]))
+        .find((l) => l.includes("deploy approval ping") && l.includes("pipeline="));
+      expect(line, "one grep-able summary line").toBeTruthy();
+      expect(line).toContain("NOT delivered");
+      expect(line).toContain("chats=0");
+      expect(pingRows(), "no evidence for a page nobody got").toEqual([]);
+      // The claim is released too, so the next scan re-pings (invariant 1).
+      expect(db.items.has(`dep#${legacyKey(TOKEN)}`)).toBe(false);
+    } finally { err.mockRestore(); }
+  });
+
+  it("a delivered reminder stamps repagedAt on the same row", async () => {
+    const handler = await loadHandler({ allowed: "555", pipeline: PIPELINE, repageMs: 60_000 });
+    registerChat(555);
+    cp.state = overlappingState();
+    cp.executions = { [GATE_EXEC]: GATE_SHA };
+    const first = makeNet(makeCtx(100_000), { batches: [[]] });
+    global.fetch = first.fetch;
+    await handler({}, first.ctx);
+    expect(pingRow(PIPELINE, GATE_EXEC).repagedAt).toBeUndefined();
+    // The claim row's pagedAt is the ORIGINAL page instant, written once by the
+    // conditional claim Put and never rewritten - the value the reminder path
+    // must reuse verbatim.
+    const claimPagedAt = db.items.get(`dep#${legacyKey(TOKEN)}`).pagedAt.S;
+
+    advanceClock(120_000);
+    cp.state = overlappingState();
+    const due = makeNet(makeCtx(100_000), { batches: [[]] });
+    global.fetch = due.fetch;
+    await handler({}, due.ctx);
+    expect(due.sent.length).toBe(1);
+    const row = pingRow(PIPELINE, GATE_EXEC);
+    expect(Date.parse(row.repagedAt.S)).toBeGreaterThan(0);
+    expect(row.deliveredChats.N).toBe("1");
+    expect(pingRows().length, "still ONE row per gated execution").toBe(1);
+    // The reminder's Put REPLACES this row - pagedAt must stay the FIRST page
+    // time, not drift forward to the reminder's own time, or approvalPing.pagedAt
+    // would misreport how long the human has actually been waiting.
+    expect(row.pagedAt.S).toBe(claimPagedAt);
+    expect(row.repagedAt.S).not.toBe(row.pagedAt.S);
+  });
+
+  it("approving clears the claim, the reminder marker and the evidence row", async () => {
+    const handler = await loadHandler({ allowed: "555", pipeline: PIPELINE, repageMs: 60_000 });
+    registerChat(555);
+    cp.state = overlappingState();
+    cp.executions = { [GATE_EXEC]: GATE_SHA };
+    const first = makeNet(makeCtx(100_000), { batches: [[]] });
+    global.fetch = first.fetch;
+    await handler({}, first.ctx);
+    const key = dokKey(first.sent[0]);
+
+    // Earn the reminder marker too, so the tap has all three rows to clear.
+    advanceClock(120_000);
+    cp.state = overlappingState();
+    const due = makeNet(makeCtx(100_000), { batches: [[]] });
+    global.fetch = due.fetch;
+    await handler({}, due.ctx);
+    expect(db.items.has(`deprepage#${key}`)).toBe(true);
+    expect(pingRow(PIPELINE, GATE_EXEC)).toBeTruthy();
+
+    // The human approves.
+    cp.state = { stageStates: [] };
+    const tap = makeNet(makeCtx(100_000), { batches: [[cbUpdate(401, 555, `dok|${key}`)]] });
+    global.fetch = tap.fetch;
+    await handler({}, tap.ctx);
+
+    expect(cp.approvals.length).toBe(1);
+    expect(cp.approvals[0].result.status).toBe("Approved");
+    expect(db.items.has(`dep#${key}`), "claim cleared").toBe(false);
+    expect(db.items.has(`deprepage#${key}`), "reminder marker cleared").toBe(false);
+    expect(pingRows(), "evidence row cleared: the gate is decided").toEqual([]);
+  });
+
+  it("no execution id → the log still records the delivery, but there is nothing to key a row on", async () => {
+    const handler = await loadHandler({ allowed: "555", pipeline: PIPELINE });
+    registerChat(555);
+    cp.state = pendingState();   // no execution ids
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      const net = makeNet(makeCtx(100_000), { batches: [[]] });
+      global.fetch = net.fetch;
+      await handler({}, net.ctx);
+
+      expect(net.sent.length).toBe(1);
+      const line = log.mock.calls.map((a) => String(a[0])).find((l) => l.includes("deploy approval ping"));
+      expect(line).toContain("delivered");
+      expect(line).toContain("execution=unknown");
+      expect(pingRows()).toEqual([]);
+    } finally { log.mockRestore(); }
   });
 });

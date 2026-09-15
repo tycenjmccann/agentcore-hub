@@ -101,7 +101,8 @@ Optional: `BEDROCK_MODEL_ID`, `CONFIDENCE_THRESHOLD`,
 `TRANSCRIBE_LANGUAGE`, `CHAT_SETTLE_MS`, `CHAT_BUFFER_MAX_MS`,
 `WM_MIN_BUDGET_MS`, `WM_RELAY_TIMEOUT_MS`, `DEPLOY_PIPELINE_NAME`,
 `ARTIFACT_BUCKET`, `PIPELINE_REGIONS`, `EVENT_BUS`, `WM_BUSINESS_TZ`,
-`WM_BUSINESS_HOURS` (the last three: "Working-hours paging" below).
+`WM_BUSINESS_HOURS` (the last three: "Working-hours paging" below),
+`DEPLOY_REPAGE_MS` ("Deploy-gate paging" below).
 
 `DEPLOY_PIPELINE_NAME` and `ARTIFACT_BUCKET` together enable the CI/CD
 deploy-approval bridge (TEAM-3740, multi-target since TEAM-4338): the poller
@@ -136,13 +137,17 @@ This function is account-local — its execution role is managed out of band (se
 Provenance), not by a repo-tracked SAM/CDK stack — so the role's statements are
 documented here rather than declared in infra. Beyond the DynamoDB /
 Bedrock / Transcribe access the intake paths need, the deploy-approval bridge
-requires three statements: two CodePipeline actions, scoped to the function's
+requires three statements: three CodePipeline actions, scoped to the function's
 **effective** `DEPLOY_PIPELINE_NAME` ARN — `update-config.sh` reads that value
 back out of the env document it just applied, so a re-run without re-exporting
 still grants an operator's custom pipeline (TEAM-4377) — plus the `hub-*-deploy`
 convention per `PIPELINE_REGIONS`, and one S3 read:
 
 - `codepipeline:GetPipelineState` — poll for an approval action awaiting a decision.
+- `codepipeline:GetPipelineExecution` - resolve the commit of the execution
+  actually PARKED at the gate (TEAM-4670, "Deploy-gate paging" below). Until this
+  statement lands the call `AccessDenied`s, the brief says "Commit: unknown", and
+  the page still goes out.
 - `codepipeline:PutApprovalResult` — record the Approve / Reject tap. This
   function is the ONE place in the account that legitimately holds this
   action — the `Pipeline___*` tools Lambda never gets it (the deploy gate is
@@ -155,7 +160,7 @@ Plus one statement for the gate event ("Working-hours paging" below):
 - `events:PutEvents` on exactly the effective `EVENT_BUS` (read back the same
   way as the pipeline name). The only event published is `gate.requested`.
 
-`GetPipelineState` is authorized at the PIPELINE level, but `PutApprovalResult`
+Both reads are authorized at the PIPELINE level, but `PutApprovalResult`
 is authorized at the ACTION level (`arn:...:<pipeline>/<stage>/<action>`), so
 its resource is `<pipeline-arn>/*` for each pipeline above, not the bare
 pipeline ARN — `update-config.sh` grants them accordingly.
@@ -188,6 +193,72 @@ One consequence: on the deploy that ships this change, a wait that is already
 mid-flight resolves to a different key than before, so its FIRST scan after
 the new code lands can send one duplicate ping for that same wait — the stale
 claim row simply TTLs out (7 days) and nothing else is affected.
+
+## Deploy-gate paging (TEAM-4670)
+
+On 2026-09-14 execution `347b9bcb` of `agentcore-hub-deploy` (commit `486b5ac9`,
+PR #593) entered `Approval/Approve_deploy` at 17:33Z and sat there for over nine
+hours. The human was awake and answered three Jira deploy-gate tickets in that
+window - none of which touch CodePipeline. Four things had to be true at once,
+and all four are fixed here.
+
+**The ping names the execution parked at the gate, not the newest one.** The
+commit used to come from the first `currentRevision` in `GetPipelineState`, which
+is the Source stage's LATEST action - so with two executions in flight (here,
+`19688946` / `9f6a9e0d` / PR #596 had finished Source at 17:21Z and queued behind
+the same Approval stage) the brief described a change the human was not being
+asked to ship. The approval stage's own `latestExecution.pipelineExecutionId` is
+now the scope: when it matches the revision's stage the reported revision is used
+unchanged (no extra API call), and only on a mismatch does the poller spend one
+best-effort `GetPipelineExecution` to read that execution's own
+`artifactRevisions[0].revisionId`. Any error - including `AccessDenied` before the
+`update-config.sh` handoff has run - degrades to `Commit: unknown - a newer
+execution overtook the Source stage; open the execution link`, and the page still
+goes out. When the commit came from the execution lookup, the "View commit" button
+prefers the GitHub URL for THAT sha over the approval action's `entityUrl`, which
+in exactly this case points at the wrong execution.
+
+**The message cannot be mistaken for the Jira review gate.** Both pages render
+through the same `execPing`, which is how "I approved it" and "the pipeline is
+approved" came apart. The deploy gate now leads with
+`🚀 CODEPIPELINE DEPLOY GATE - approval needed`, states outright that *approving a
+Jira deploy-gate ticket does NOT approve it*, carries the pipeline, repo, region
+and the first 8 characters of the execution id, and adds a `🔗 View execution`
+button straight to that execution's console timeline.
+
+**An unanswered gate earns exactly one reminder.** `dep#<key>` is a one-shot
+conditional claim with a 7-day TTL, so a page nobody saw never came back. The
+claim row now also records `pagedAt`, `executionId` and `commitSha`; when a scan
+finds the SAME token still `InProgress` and the claim already held, and
+`pagedAt` is older than `DEPLOY_REPAGE_MS` (optional, default 30 min; `0`
+disables; an unparseable value keeps the default, because a redundant reminder is
+cheap and a silent gate is not), it sends ONE reminder with kicker
+`🚀 CODEPIPELINE DEPLOY GATE - reminder, still waiting <Nh Nm>` and the SAME
+`dok`/`dno` buttons. "Exactly one" is enforced by a conditional `deprepage#<key>`
+marker row, released again if zero chats actually received it, so a Telegram
+outage retries on the next scan instead of burning the only reminder. The
+reminder path never throws out of the scan.
+
+**Delivery is evidence, not assumption.** Every attempt logs one grep-able line:
+
+```
+[telegram-bug-intake] deploy approval ping delivered pipeline=<p> region=<r> execution=<id|unknown> commit=<sha|unknown> chats=<n> key=<key>
+[telegram-bug-intake] deploy approval ping NOT delivered pipeline=<p> ...   # every chat failed
+```
+
+and a delivery also writes a `depping#<pipeline>#<executionId>` row (same 7-day
+TTL) holding `pagedAt`, `deliveredChats`, `commitSha`, `claimKey` and, after a
+reminder, `repagedAt`. It is keyed on pipeline + execution - values any reader can
+compute - deliberately NOT on the claim hash, so the `Pipeline___*` tools Lambda
+can read it without going anywhere near the approval token. That is what
+`Pipeline___get_state` surfaces as `approvalPing`, letting a release manager
+escalate instead of polling a dead gate for nine hours. Both extra rows are
+deleted when the Approve / Reject tap spends the token.
+
+Operator note: the tools Lambda's `DEPLOY_GATE_CLAIM_TABLE` must be **this
+function's `PENDING_TABLE`**, in the tools Lambda's own account and region.
+Anything else yields `approvalPing.status:"unknown"` - never a false
+`not_delivered`.
 
 ## Working-hours paging (TEAM-4453 D3)
 

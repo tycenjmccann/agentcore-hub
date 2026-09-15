@@ -16,14 +16,20 @@
 # grant anywhere — do not add one there. This inline policy is the only place
 # in the account where an identity may resolve that gate; widen it with care.
 #
-#   PipelineStateRead    codepipeline:GetPipelineState on the pipeline the
-#                         function will ACTUALLY poll — its EFFECTIVE
-#                         DEPLOY_PIPELINE_NAME, read back after the env merge
-#                         (step 1b, TEAM-4377), NOT this shell's default — in its
-#                         own region, plus hub-*-deploy in every region in
+#   PipelineStateRead    codepipeline:GetPipelineState + GetPipelineExecution on
+#                         the pipeline the function will ACTUALLY poll — its
+#                         EFFECTIVE DEPLOY_PIPELINE_NAME, read back after the env
+#                         merge (step 1b, TEAM-4377), NOT this shell's default —
+#                         in its own region, plus hub-*-deploy in every region in
 #                         PIPELINE_REGIONS (the CD-registry convention — see
 #                         src/lib/cd-registry.ts / cd-registry.mjs).
-#                         GetPipelineState is authorized at the PIPELINE level.
+#                         Both are authorized at the PIPELINE level.
+#                         GetPipelineExecution (TEAM-4670) resolves the commit of
+#                         the execution PARKED at the gate: GetPipelineState alone
+#                         reports the Source stage's newest revision, so with two
+#                         executions in flight the ping named the wrong commit.
+#                         Until this statement lands the call AccessDenies, the
+#                         brief says "Commit: unknown" and the page still goes out.
 #   DeployApprovalWrite  codepipeline:PutApprovalResult on the SAME pipelines,
 #                         but PutApprovalResult is authorized at the ACTION
 #                         level (arn:...:<pipeline>/<stage>/<action>), so the
@@ -197,7 +203,7 @@ policy = {
         {
             "Sid": "PipelineStateRead",
             "Effect": "Allow",
-            "Action": ["codepipeline:GetPipelineState"],
+            "Action": ["codepipeline:GetPipelineState", "codepipeline:GetPipelineExecution"],
             "Resource": pipeline_resources,
         },
         {
@@ -238,7 +244,7 @@ aws iam put-role-policy \
   --policy-document "$POLICY_DOC"
 
 echo "IAM inline policy '$POLICY_NAME' applied to $ROLE_NAME:"
-echo "  PipelineStateRead (pipeline-level) on $DEPLOY_PIPELINE (effective, $AWS_REGION) + hub-*-deploy ($PIPELINE_REGIONS)"
+echo "  PipelineStateRead (pipeline-level: GetPipelineState + GetPipelineExecution) on $DEPLOY_PIPELINE (effective, $AWS_REGION) + hub-*-deploy ($PIPELINE_REGIONS)"
 echo "  DeployApprovalWrite (action-level, <pipeline>/*) on the same pipelines"
 echo "  CdRegistryRead on s3://$ARTIFACT_BUCKET/config/cd-registry.json"
 echo "  GateEventPublish (events:PutEvents) on event-bus/$EFFECTIVE_EVENT_BUS ($AWS_REGION) - gate.requested"

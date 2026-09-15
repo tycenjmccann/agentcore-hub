@@ -195,6 +195,12 @@ export function resolveEnv(env = process.env) {
     // record can be written, so every deploy keeps its human gate — the safe
     // default. It confers no approval capability.
     GITHUB_TOKEN: env.GITHUB_TOKEN || "",
+    // TEAM-4670: the telegram-bug-intake bridge's PENDING_TABLE, read ONLY to
+    // report whether a human was actually paged about an open deploy gate
+    // (get_state's approvalPing). Optional: unset means approvalPing is
+    // {status:"unknown"}, no DynamoDB client is constructed and no dynamodb
+    // statement is written. Read-only, one table, and no approval capability.
+    DEPLOY_GATE_CLAIM_TABLE: env.DEPLOY_GATE_CLAIM_TABLE || "",
   };
 }
 
@@ -366,6 +372,24 @@ export function buildInlinePolicy(env) {
             },
           ]
         : []),
+      // TEAM-4670: read the Telegram bridge's deploy-gate ping evidence so
+      // get_state can report approvalPing. GetItem ONLY, on the ONE table, and
+      // only when the operator named it — no table, no statement. The row this
+      // reads carries no approval token, and read access to it cannot resolve a
+      // gate: PutApprovalResult still stays absent from this role in every
+      // combination.
+      ...(env.DEPLOY_GATE_CLAIM_TABLE
+        ? [
+            {
+              Sid: "DeployGatePingRead",
+              Effect: "Allow",
+              Action: ["dynamodb:GetItem"],
+              Resource: [
+                `arn:aws:dynamodb:${REGION}:${ACCOUNT}:table/${env.DEPLOY_GATE_CLAIM_TABLE}`,
+              ],
+            },
+          ]
+        : []),
       {
         Sid: "BuildLogRead",
         Effect: "Allow",
@@ -409,6 +433,7 @@ async function main() {
     PIPELINE_REGIONS,
     ARTIFACT_BUCKET,
     GITHUB_TOKEN,
+    DEPLOY_GATE_CLAIM_TABLE,
   } = cfg;
 
   // Fail on a bad CI_PROJECT before touching AWS at all (buildInlinePolicy
@@ -511,6 +536,10 @@ async function main() {
   // empty string here would wipe a token an operator set out of band and silently
   // turn every conditional gate back into a human one.
   if (GITHUB_TOKEN) envVars.GITHUB_TOKEN = GITHUB_TOKEN;
+  // Same rule, same reason (TEAM-4670): an unconditional empty string would wipe
+  // a table an operator wired up out of band and silently turn approvalPing back
+  // into "unknown" on every gate.
+  if (DEPLOY_GATE_CLAIM_TABLE) envVars.DEPLOY_GATE_CLAIM_TABLE = DEPLOY_GATE_CLAIM_TABLE;
 
   // ─── 3. Create/update the function ───────────────────────────────────────────
   let exists = false;

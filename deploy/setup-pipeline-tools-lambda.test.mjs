@@ -254,6 +254,9 @@ describe("resolveEnv", () => {
       // TEAM-4525: optional. Empty means no ship-approval record can ever be
       // written, so every deploy keeps its human gate.
       GITHUB_TOKEN: "",
+      // TEAM-4670: optional. Empty means get_state reports approvalPing
+      // {status:"unknown"} and the role gets no dynamodb grant at all.
+      DEPLOY_GATE_CLAIM_TABLE: "",
     });
     expect(resolveEnv({ PIPELINE_CI_START_BUILD: "1" }).PIPELINE_CI_START_BUILD).toBe("1");
     expect(resolveEnv({ PIPELINE_CI_START_BUILD: "true" }).PIPELINE_CI_START_BUILD).toBe("0");
@@ -263,6 +266,95 @@ describe("resolveEnv", () => {
     // It is the ONLY way the merge binding can be machine-verified; without it
     // recordShipApproval refuses with merge_binding_unverified (TEAM-4525 review P1).
     expect(resolveEnv({ GITHUB_TOKEN: "ghp-abc" }).GITHUB_TOKEN).toBe("ghp-abc");
+  });
+
+  it("passes a DEPLOY_GATE_CLAIM_TABLE through when the operator set one", () => {
+    expect(
+      resolveEnv({ DEPLOY_GATE_CLAIM_TABLE: "telegram-bug-intake-pending" })
+        .DEPLOY_GATE_CLAIM_TABLE
+    ).toBe("telegram-bug-intake-pending");
+  });
+});
+
+// ─── The deploy-gate ping read (TEAM-4670) ───────────────────────────────────
+//
+// get_state can now answer "was a human actually paged for this gate?" by reading
+// ONE row the Telegram bridge writes. The grant that makes that possible is the
+// interesting part: a single table, GetItem only, and only when an operator names
+// the table — because the temptation this ticket had to refuse is letting the
+// tools Lambda RESOLVE the gate it can now see. The bridge remains the only
+// identity in the account holding PutApprovalResult.
+describe("buildInlinePolicy — the deploy-gate ping read", () => {
+  const TABLE = "telegram-bug-intake-pending";
+  const WITH_TABLE = { ...BASE, DEPLOY_GATE_CLAIM_TABLE: TABLE };
+
+  it("is ABSENT without DEPLOY_GATE_CLAIM_TABLE, and so is every dynamodb action", () => {
+    const policy = buildInlinePolicy(BASE);
+    expect(sid(policy, "DeployGatePingRead")).toBeUndefined();
+    expect(allActions(policy).filter((a) => a.startsWith("dynamodb:"))).toEqual([]);
+    expect(allResources(policy).filter((r) => r.includes(":dynamodb:"))).toEqual([]);
+  });
+
+  it("is exactly ONE statement: dynamodb:GetItem on the ONE named table", () => {
+    const policy = buildInlinePolicy(WITH_TABLE);
+    const statement = sid(policy, "DeployGatePingRead");
+    expect(statement).toEqual({
+      Sid: "DeployGatePingRead",
+      Effect: "Allow",
+      Action: ["dynamodb:GetItem"],
+      Resource: [`arn:aws:dynamodb:${REGION}:${ACCOUNT}:table/${TABLE}`],
+    });
+    // No Query, no Scan, no write, no stream, and no index sub-resource: the
+    // Lambda knows the exact key (depping#<pipeline>#<executionId>).
+    expect(allActions(policy).filter((a) => a.startsWith("dynamodb:"))).toEqual([
+      "dynamodb:GetItem",
+    ]);
+    // Deterministic position, like every other conditional statement: the Sid
+    // order is what a reviewer diffs when this policy changes.
+    const sids = policy.Statement.map((s) => s.Sid);
+    expect(sids.indexOf("DeployGatePingRead")).toBe(sids.indexOf("BuildLogRead") - 1);
+  });
+
+  it("has no wildcard, and cannot reach any other table", () => {
+    const resource = sid(buildInlinePolicy(WITH_TABLE), "DeployGatePingRead").Resource[0];
+    expect(resource).not.toContain("*");
+    // Not the workflows/events/tickets tables, and not the bare table prefix.
+    expect(resource).toMatch(/:table\/telegram-bug-intake-pending$/);
+    expect(resource).not.toMatch(/\/index\//);
+  });
+
+  it("derives the ARN from REGION/ACCOUNT — no hardcoded account id", () => {
+    const resource = sid(
+      buildInlinePolicy({ ...WITH_TABLE, REGION: "eu-west-2", ACCOUNT: "999988887777" }),
+      "DeployGatePingRead"
+    ).Resource[0];
+    expect(resource).toBe("arn:aws:dynamodb:eu-west-2:999988887777:table/telegram-bug-intake-pending");
+  });
+
+  it("widens nothing else: every other statement is byte-identical with it present", () => {
+    for (const flag of ["0", "1"]) {
+      const without = buildInlinePolicy({ ...BASE, PIPELINE_CI_START_BUILD: flag });
+      const with_ = buildInlinePolicy({ ...WITH_TABLE, PIPELINE_CI_START_BUILD: flag });
+      expect(
+        with_.Statement.filter((s) => s.Sid !== "DeployGatePingRead"),
+        flag
+      ).toEqual(without.Statement);
+    }
+  });
+
+  it("is not an approval grant — PutApprovalResult stays absent with it present", () => {
+    for (const flag of ["0", "1"]) {
+      for (const bucket of [undefined, "hub-artifacts"]) {
+        const policy = buildInlinePolicy({
+          ...WITH_TABLE,
+          PIPELINE_CI_START_BUILD: flag,
+          ARTIFACT_BUCKET: bucket,
+        });
+        const label = `${flag}/${bucket}`;
+        expect(allActions(policy), label).not.toContain("codepipeline:PutApprovalResult");
+        expect(JSON.stringify(policy), label).not.toContain("PutApprovalResult");
+      }
+    }
   });
 });
 

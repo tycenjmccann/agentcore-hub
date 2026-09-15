@@ -97,6 +97,8 @@ const h = vi.hoisted(() => ({
     cbCalls: [], // { region, name, type, input } for every CodeBuild command sent
     logsCalls: [], // { region, name, type, input } for every Logs command sent
     stsCalls: [], // { region, input } for every STS AssumeRole (cross-account only)
+    ddbCalls: [], // { region, input } for every DynamoDB GetItem (approvalPing only)
+    getItemImpl: async () => ({}),
     clientInits: [], // { kind, region, hasCreds } for every AWS client CONSTRUCTED
     // Cross-account: the temp creds AssumeRole hands back. The cp/cb/logs mocks
     // resolve their `credentials` provider in send() (a real client would, when
@@ -277,6 +279,23 @@ vi.mock("@aws-sdk/client-sts", () => ({
   AssumeRoleCommand: class { constructor(i) { this.input = i; } },
 }));
 
+// TEAM-4670: the deploy-gate ping evidence row. ONE read-only GetItem, and only
+// when DEPLOY_GATE_CLAIM_TABLE is set — the client construction is recorded in
+// clientInits so "no env → no client at all" is assertable, not just implied.
+vi.mock("@aws-sdk/client-dynamodb", () => ({
+  DynamoDBClient: class {
+    constructor(cfg) {
+      this.region = cfg?.region;
+      h.state.clientInits.push({ kind: "dynamodb", region: cfg?.region });
+    }
+    async send(cmd) {
+      h.state.ddbCalls.push({ region: this.region, input: cmd.input });
+      return h.state.getItemImpl(cmd.input);
+    }
+  },
+  GetItemCommand: class { constructor(i) { this.input = i; } },
+}));
+
 const { handler, validateCiProjectName, classifyPriorBuild } = await import("./index.mjs");
 
 /** The hoisted default BatchGetBuilds stub, so a suite that installs its own can
@@ -421,6 +440,8 @@ beforeEach(() => {
   h.state.cbCalls = [];
   h.state.logsCalls = [];
   h.state.stsCalls = [];
+  h.state.ddbCalls = [];
+  h.state.getItemImpl = async () => ({});
   h.state.clientInits = [];
   h.state.assumeRoleImpl = async () => ({
     Credentials: {
@@ -3896,5 +3917,208 @@ describe("cross-account CD (assume-role trigger)", () => {
     expect(cbInit.hasCreds).toBe(true);
     expect(h.state.stsCalls.length).toBeGreaterThanOrEqual(1);
     expect(h.state.stsCalls[0].input.RoleArn).toBe("arn:aws:iam::123456789012:role/hub-cd-trigger-juno");
+  });
+});
+
+// ─── 9. approvalPing: was a human actually paged for this gate? (TEAM-4670) ────
+//
+// The incident this closes: pipeline execution 347b9bcb sat on
+// Approval/Approve_deploy for 9h. get_state reported it InProgress, which is
+// indistinguishable from "a human was asked and has not answered yet" — so the
+// release manager had nothing to escalate on. The telegram-bug-intake bridge now
+// records one evidence row per gated execution, keyed on pipeline + execution id
+// so this Lambda can read it without ever touching the approval token.
+//
+// The absent capability is the point: reading this row cannot resolve a gate.
+describe("9. approvalPing (TEAM-4670)", () => {
+  /** A gate genuinely waiting on a human, on execution `execId`. */
+  function pendingApproval(execId = "NEW") {
+    return {
+      stageStates: [
+        {
+          stageName: "Build",
+          latestExecution: { status: "Succeeded", pipelineExecutionId: execId },
+          actionStates: [{ actionName: "Build_and_gate", latestExecution: { status: "Succeeded" } }],
+        },
+        {
+          stageName: "Approval",
+          latestExecution: { status: "InProgress", pipelineExecutionId: execId },
+          actionStates: [
+            {
+              actionName: "Approve_deploy",
+              latestExecution: { status: "InProgress", token: "super-secret-token" },
+            },
+          ],
+        },
+      ],
+    };
+  }
+
+  const TABLE = "telegram-bug-intake-pending";
+
+  it("no DEPLOY_GATE_CLAIM_TABLE → unknown, and NO DynamoDB client is constructed", async () => {
+    h.state.getPipelineStateImpl = async () => pendingApproval();
+
+    const out = await invoke("get_state", { execution_id: "NEW" });
+
+    expect(out.approvalPing).toEqual({
+      status: "unknown",
+      reason: "DEPLOY_GATE_CLAIM_TABLE not configured",
+    });
+    // The whole point of the lazy client: an install without the bridge pays
+    // nothing, and needs no dynamodb grant.
+    expect(h.state.clientInits.filter((c) => c.kind === "dynamodb")).toEqual([]);
+    expect(h.state.ddbCalls).toEqual([]);
+  });
+
+  it("a delivered ping → status delivered with pagedAt / deliveredChats / repagedAt", async () => {
+    h.state.getPipelineStateImpl = async () => pendingApproval("347b9bcb");
+    h.state.getItemImpl = async () => ({
+      Item: {
+        id: { S: "depping#agentcore-hub-deploy#347b9bcb" },
+        pagedAt: { S: "2026-09-14T17:33:10.000Z" },
+        deliveredChats: { N: "2" },
+        repagedAt: { S: "2026-09-14T18:03:11.000Z" },
+        commitSha: { S: "486b5ac9" },
+        claimKey: { S: "dp1v53bbo" },
+      },
+    });
+
+    const out = await withEnv({ DEPLOY_GATE_CLAIM_TABLE: TABLE }, (mod) =>
+      invokeOn(mod.handler, "get_state", { execution_id: "347b9bcb" }),
+    );
+
+    expect(out.approvalPing).toEqual({
+      status: "delivered",
+      pagedAt: "2026-09-14T17:33:10.000Z",
+      deliveredChats: 2,
+      repagedAt: "2026-09-14T18:03:11.000Z",
+    });
+    // Keyed on pipeline + execution — no claim-hash derivation, so no token.
+    expect(h.state.ddbCalls.length).toBe(1);
+    expect(h.state.ddbCalls[0].input).toEqual({
+      TableName: TABLE,
+      Key: { id: { S: "depping#agentcore-hub-deploy#347b9bcb" } },
+    });
+    // The bridge's table is hub state: this Lambda's own region, never a target's.
+    expect(h.state.ddbCalls[0].region).toBe(process.env.AWS_REGION || "us-east-1");
+    // Not the claimKey, not the token, not a chat id.
+    expect(JSON.stringify(out)).not.toContain("dp1v53bbo");
+    expect(JSON.stringify(out)).not.toContain("super-secret-token");
+  });
+
+  it("no row for this execution → not_delivered: nobody has been paged", async () => {
+    h.state.getPipelineStateImpl = async () => pendingApproval();
+    h.state.getItemImpl = async () => ({});   // GetItem miss
+
+    const out = await withEnv({ DEPLOY_GATE_CLAIM_TABLE: TABLE }, (mod) =>
+      invokeOn(mod.handler, "get_state", { execution_id: "NEW" }),
+    );
+
+    expect(out.approvalPing).toEqual({
+      status: "not_delivered",
+      reason: "no bridge ping record for this execution",
+    });
+  });
+
+  it("a DynamoDB failure → unknown with the error name, and get_state still answers", async () => {
+    h.state.getPipelineStateImpl = async () => pendingApproval();
+    h.state.getItemImpl = async () => {
+      const err = new Error("not authorized");
+      err.name = "AccessDeniedException";
+      throw err;
+    };
+
+    const out = await withEnv({ DEPLOY_GATE_CLAIM_TABLE: TABLE }, (mod) =>
+      invokeOn(mod.handler, "get_state", { execution_id: "NEW" }),
+    );
+
+    // "unknown" is never evidence that nobody was paged — the IAM statement is a
+    // separate human handoff, so this is the state between deploy and handoff.
+    expect(out.approvalPing).toEqual({ status: "unknown", reason: "AccessDeniedException" });
+    expect(out.configured).toBe(true);
+    expect(out.stages.length).toBeGreaterThan(0);
+  });
+
+  it("a partial row still reports delivered, with only the fields it has", async () => {
+    h.state.getPipelineStateImpl = async () => pendingApproval();
+    h.state.getItemImpl = async () => ({ Item: { id: { S: "depping#x#NEW" } } });
+
+    const out = await withEnv({ DEPLOY_GATE_CLAIM_TABLE: TABLE }, (mod) =>
+      invokeOn(mod.handler, "get_state", { execution_id: "NEW" }),
+    );
+
+    expect(out.approvalPing).toEqual({ status: "delivered" });
+  });
+
+  it("no gate waiting → NO approvalPing key at all, and no DynamoDB call", async () => {
+    // A finished run: additive by construction, so every pre-TEAM-4670 caller
+    // sees a byte-identical response and pays no GetItem.
+    h.state.getPipelineStateImpl = async () => ({
+      stageStates: [
+        {
+          stageName: "Approval",
+          latestExecution: { status: "Skipped", pipelineExecutionId: "NEW" },
+          actionStates: [{ actionName: "Approve_deploy", latestExecution: { status: "Skipped" } }],
+        },
+      ],
+    });
+
+    const out = await withEnv({ DEPLOY_GATE_CLAIM_TABLE: TABLE }, (mod) =>
+      invokeOn(mod.handler, "get_state", { execution_id: "NEW" }),
+    );
+
+    expect("approvalPing" in out).toBe(false);
+    expect(out.approvalSkipped).toBe(true);
+    expect(h.state.ddbCalls).toEqual([]);
+  });
+
+  it("an approval waiting on ANOTHER execution is not reported for this one", async () => {
+    h.state.getPipelineStateImpl = async () => ({
+      stageStates: [
+        {
+          stageName: "Approval",
+          latestExecution: { status: "InProgress", pipelineExecutionId: "OLD" },
+          actionStates: [
+            { actionName: "Approve_deploy", latestExecution: { status: "InProgress", token: "t" } },
+          ],
+        },
+        {
+          stageName: "Deploy",
+          latestExecution: { status: "InProgress", pipelineExecutionId: "NEW" },
+          actionStates: [],
+        },
+      ],
+    });
+
+    const out = await withEnv({ DEPLOY_GATE_CLAIM_TABLE: TABLE }, (mod) =>
+      invokeOn(mod.handler, "get_state", { execution_id: "NEW" }),
+    );
+
+    expect("approvalPing" in out).toBe(false);
+    expect(h.state.ddbCalls).toEqual([]);
+  });
+
+  it("unscoped get_state reports the ping for the gate the pipeline is holding", async () => {
+    // No execution_id: same scoping rule as approvalSkipped, so the approval
+    // stage's own execution id is what the row is looked up by.
+    h.state.getPipelineStateImpl = async () => pendingApproval("347b9bcb");
+    h.state.getItemImpl = async () => ({
+      Item: { id: { S: "x" }, pagedAt: { S: "2026-09-14T17:33:10.000Z" }, deliveredChats: { N: "1" } },
+    });
+
+    const out = await withEnv({ DEPLOY_GATE_CLAIM_TABLE: TABLE }, (mod) =>
+      invokeOn(mod.handler, "get_state", {}),
+    );
+
+    expect(out.approvalPing.status).toBe("delivered");
+    expect(h.state.ddbCalls[0].input.Key.id.S).toBe("depping#agentcore-hub-deploy#347b9bcb");
+  });
+
+  it("still no approval capability: reading the evidence adds none", async () => {
+    const caps = await withEnv({ DEPLOY_GATE_CLAIM_TABLE: TABLE }, (mod) =>
+      invokeOn(mod.handler, "capabilities", {}),
+    );
+    expect(caps.approveDeploy).toBe(false);
   });
 });
