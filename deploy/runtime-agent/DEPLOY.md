@@ -170,7 +170,7 @@ These are passed via `--env` in deploy-one.sh and available inside the runtime a
 | `ANTHROPIC_MODEL` | `us.anthropic.claude-fable-5-1` | Claude Code model (alt) |
 | `GITHUB_PAT` | *(token)* | GitHub MCP access |
 | `UNIFIED_TRACES_DESTINATION_ENABLED` | `true` | Deliver spans to the unified telemetry destination (`spans` log streams) |
-| `OTEL_SERVICE_NAME` | *(agent name)* | Service name on every emitted span |
+| `OTEL_SERVICE_NAME` | *(agent name)*`.DEFAULT` | Service name on every emitted span; must keep the platform `<runtime>.<endpoint>` shape or online evals + dashboard token attribution go dark |
 | `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` | `true` | Capture prompt/response content on GenAI span events (eval input) |
 | `PERSONA_PROMPT_CACHE` | `1` (default on) | Bedrock prompt caching for the persona system prompt + tools; set `0` to disable |
 | `PERSONA_CACHE_TTL` | `1h` (`5m`\|`1h`, default `1h`) | Prompt-cache TTL; invalid values fall back to `1h` |

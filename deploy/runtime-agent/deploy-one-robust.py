@@ -78,10 +78,14 @@ def build_env_vars(agent_name: str, prompt_key: str) -> dict[str, str]:
         # with) the platform one, breaking CloudWatch log-group correlation.
         # OTEL_SERVICE_NAME takes precedence over service.name in resource
         # attributes per the OTel spec, so per-persona identity is preserved
-        # without it. NEVER set DISABLE_ADOT_OBSERVABILITY: without ADOT the
-        # invoke_agent span is never exported and eval batches score 0/10.
+        # without it. It MUST keep the platform's "<runtime>.<endpoint>" shape
+        # ("<name>.DEFAULT"): online-eval configs' serviceNames filter and the
+        # hub's metrics/sessions routes key on it; a bare name yields zero eval
+        # results and zero dashboard tokens. NEVER set
+        # DISABLE_ADOT_OBSERVABILITY: without ADOT the invoke_agent span is
+        # never exported and eval batches score 0/10.
         "UNIFIED_TRACES_DESTINATION_ENABLED": "true",
-        "OTEL_SERVICE_NAME": agent_name,
+        "OTEL_SERVICE_NAME": f"{agent_name}.DEFAULT",
         "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT": "true",
     }
     if gw := os.environ.get("GATEWAY_ARN"):
