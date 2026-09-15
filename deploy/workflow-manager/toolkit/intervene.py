@@ -537,8 +537,10 @@ def cmd_file_bug(args):
 
     Common to both:
       - --title and --description are always REQUIRED.
-      - --repo defaults server-side to the hub repo (GITHUB_OWNER/GITHUB_REPO):
-        agent crashes are hub infrastructure, not the workload's repo."""
+      - --repo defaults server-side to the HUB repo (HUB_REPO_URL, else
+        GITHUB_OWNER/agentcore-hub) for both modes: crashes and manager-noticed
+        defects are hub infrastructure, not the workload's repo. Pass --repo
+        only when the bug is genuinely in a workload repo."""
     for field, val in (("--title", args.title), ("--description", args.description)):
         if not (val or "").strip():
             raise SystemExit(f"REFUSED: file-bug requires {field}")

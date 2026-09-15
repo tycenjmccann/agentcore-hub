@@ -314,11 +314,13 @@ async function watchScan() {
   do {
     const page = await ddb.send(new ScanCommand({
       TableName: WORKFLOWS_TABLE,
-      ProjectionExpression: "workflowId, phase, archived, managerWatch, wmLastWatchAt, startedAt, workflowDefId, humanNotifications",
+      ProjectionExpression: "workflowId, phase, archived, managerWatch, wmLastWatchAt, startedAt, workflowDefId, humanNotifications, cancelledAt",
       ExclusiveStartKey,
     }));
+    // cancelledAt is the cancel route's first stamp; a row carrying it is dead
+    // even if its phase lags (TEAM-4577 — the watchdog re-woke on such rows).
     active.push(...(page.Items || []).filter(
-      (w) => !TERMINAL_PHASES.has(w.phase) && !w.archived && w.managerWatch !== false && !parkedOnHuman(w)
+      (w) => !TERMINAL_PHASES.has(w.phase) && !w.cancelledAt && !w.archived && w.managerWatch !== false && !parkedOnHuman(w)
     ));
     ExclusiveStartKey = page.LastEvaluatedKey;
   } while (ExclusiveStartKey);
