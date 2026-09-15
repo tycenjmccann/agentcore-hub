@@ -410,6 +410,60 @@ describe("error hygiene", () => {
   });
 });
 
+describe("runtime frames are normalised to the app schema", () => {
+  /**
+   * The regression the first release shipped with: the fleet runtime is an
+   * AgentCore async-generator entrypoint, so the SDK forwards its Strands frames
+   * verbatim. The modal only renders `{type:"text"}`, so every reply rendered as
+   * an empty "Agent" line while the runtime log showed thousands of chars of
+   * output. These fixtures are the exact shapes `deploy/runtime-agent/main.py`
+   * yields at the end of `_run_agent_invocation`.
+   */
+  const delta = (text: string) => `data: ${JSON.stringify({ event: { contentBlockDelta: { delta: { text } } } })}`;
+  const toolStart = (name: string) =>
+    `data: ${JSON.stringify({ event: { contentBlockStart: { start: { toolUse: { name } } } } })}`;
+
+  it("turns a contentBlockDelta into a text frame the modal renders", async () => {
+    h.state.upstreamFrames = [delta("Two blockers,\none nit."), 'data: {"type":"done"}'];
+    const res = await post({ agentId: PERSONA, message: "what did you find?" });
+    const body = await readBody(res);
+    expect(body).toContain(`data: ${JSON.stringify({ type: "text", content: "Two blockers,\none nit." })}\n\n`);
+    expect(body).not.toContain("contentBlockDelta");
+    expect(body).toContain('{"type":"done"}');
+  });
+
+  it("turns a tool start into a trace frame, never into reply text", async () => {
+    h.state.upstreamFrames = [toolStart("Tickets___get_ticket"), delta("Done."), 'data: {"type":"done"}'];
+    const res = await post({ agentId: PERSONA, message: "hi" });
+    const body = await readBody(res);
+    const frames = body.split("\n\n").filter(f => f.startsWith("data: ")).map(f => JSON.parse(f.slice(6)));
+    const trace = frames.find(f => f.type === "trace" && f.event === "tool_start");
+    expect(trace?.name).toBe("Tickets___get_ticket");
+    expect(frames.filter(f => f.type === "text").map(f => f.content)).toEqual(["Done."]);
+    expect(body).not.toContain("contentBlockStart");
+  });
+
+  it("drops an empty delta instead of forwarding an empty text frame", async () => {
+    h.state.upstreamFrames = [delta(""), 'data: {"type":"done"}'];
+    const res = await post({ agentId: PERSONA, message: "hi" });
+    const body = await readBody(res);
+    expect(body).not.toContain('"type":"text"');
+    expect(body).toContain('{"type":"done"}');
+  });
+
+  it("still scrubs an error frame that arrives alongside runtime frames", async () => {
+    h.state.upstreamFrames = [
+      delta("partial"),
+      `data: ${JSON.stringify({ type: "error", content: `arn:aws:bedrock-agentcore:us-east-1:${ACCT}:runtime/x` })}`,
+    ];
+    const res = await post({ agentId: PERSONA, message: "hi" });
+    const body = await readBody(res);
+    expect(body).toContain('"content":"partial"');
+    expect(body).not.toContain(ACCT);
+    expect(body).toContain("could not be reached");
+  });
+});
+
 describe("GET (session + idle state for the modal)", () => {
   it("returns the recorded session id and whether the agent is active", async () => {
     h.state.workflow = workflowWith("running");
