@@ -33,6 +33,14 @@ const h = vi.hoisted(() => ({
     statusUpdates: /** @type {any[]} */ ([]),
     // TEAM-4537: edit_issue's title write (`SET #t = :t, …`).
     editUpdates: /** @type {any[]} */ ([]),
+    // TEAM-4706: every HeadObject the ship-phase Done gate makes (by Key), so a
+    // non-ship transition can be asserted to make NO S3 call at all…
+    s3Heads: /** @type {string[]} */ ([]),
+    // …and an INDETERMINATE S3 answer (AccessDenied, throttle, timeout) can be
+    // injected: null = "exists iff the key is in state.s3Objects".
+    headImpl: /** @type {((input: any) => any) | null} */ (null),
+    /** Keys that exist for HeadObject, e.g. completions/TEAM-4066.json. */
+    s3Objects: /** @type {Record<string, true>} */ ({}),
   },
 }));
 
@@ -41,12 +49,28 @@ vi.mock("@aws-sdk/client-s3", () => ({
   S3Client: class {
     async send(cmd) {
       const key = cmd.input.Key;
+      // TEAM-4706: HeadObject (the completion-record probe) and GetObject (the
+      // roster/workflow configs) share one client, so the command TYPE is what
+      // separates them — the __type tag is the shape the repo's other Lambda
+      // suites use (lambda/agentcore-hub-pipeline-tools/index.test.mjs).
+      if (cmd.__type === "HeadObject") {
+        h.state.s3Heads.push(key);
+        if (h.state.headImpl) return h.state.headImpl(cmd.input);
+        if (!(key in h.state.s3Objects)) {
+          const err = new Error("NotFound");
+          err.name = "NotFound";
+          err.$metadata = { httpStatusCode: 404 };
+          throw err;
+        }
+        return { ContentLength: 42 };
+      }
       if (!(key in h.state.s3)) throw new Error(`NoSuchKey: ${key}`);
       const body = h.state.s3[key];
       return { Body: { transformToString: async () => JSON.stringify(body) } };
     }
   },
-  GetObjectCommand: class { constructor(i) { this.input = i; } },
+  GetObjectCommand: class { constructor(i) { this.input = i; this.__type = "GetObject"; } },
+  HeadObjectCommand: class { constructor(i) { this.input = i; this.__type = "HeadObject"; } },
 }));
 vi.mock("@aws-sdk/lib-dynamodb", () => {
   class PutCommand { constructor(input) { this.input = input; } }
@@ -116,6 +140,9 @@ beforeEach(async () => {
   h.state.statusUpdates.length = 0;
   h.state.editUpdates.length = 0;
   h.state.items = {};
+  h.state.s3Heads.length = 0;
+  h.state.headImpl = null;
+  h.state.s3Objects = {};
   delete process.env.ARTIFACT_BUCKET;
   vi.resetModules();
   ({ handler } = await import("./index.mjs"));
@@ -685,6 +712,22 @@ describe("labels_add — the op name + envelope the orchestrator sends (TEAM-412
 describe("transition_ticket — reaching done from in_progress vs from blocked (TEAM-4130 F1)", () => {
   const transition = (args) => handler({ name: "Tickets___transition_ticket", arguments: args });
 
+  // TEAM-4706: these three cases CLOSE the run's ship ticket, which since DL-029
+  // requires its completion record to exist (the describe below owns that rule).
+  // The record is provisioned here so each test still asserts exactly what it was
+  // written to assert — which transition row `done` resolves through — rather than
+  // the new gate.
+  beforeEach(async () => {
+    process.env.ARTIFACT_BUCKET = "test-bucket";
+    h.state.s3Objects[`completions/${SHIP}.json`] = true;
+    vi.resetModules();
+    ({ handler } = await import("./index.mjs"));
+  });
+
+  afterEach(() => {
+    delete process.env.ARTIFACT_BUCKET;
+  });
+
   it("(i) done from in_progress resolves through the real `done` transition", async () => {
     h.state.items[SHIP] = { ticketId: SHIP, status: "in_progress", assignee: "agentcore_hub_release_manager" };
 
@@ -857,5 +900,168 @@ describe("create_ticket / edit_issue — surrogate-safe clamp (TEAM-4537)", () =
     await create({ summary: "A".repeat(256) });
     expect(h.state.puts[1].title).toBe("A".repeat(254) + "…");
     expect(h.state.puts[1].title.length).toBe(255);
+  });
+});
+
+/**
+ * TEAM-4706 (DL-029) — a SHIP-PHASE ticket cannot reach done without its
+ * completion record (s3://$ARTIFACT_BUCKET/completions/<ticket_id>.json).
+ *
+ * That record, written by lambda/workflow-output's report_completion BEFORE it
+ * asks this Lambda for the transition, is the only durable statement of what
+ * actually shipped — the run's completion gates, its KPIs and the deploy audit
+ * trail all read it. A ship ticket closed by hand leaves them with nothing.
+ *
+ * The rails that keep the gate from becoming a deadlock are as load-bearing as
+ * the gate itself, and each has a test below:
+ *   - HUMAN gates are exempt: the hub UI's approve action and the Telegram
+ *     bridge's ✅ transition through this same tool without writing a record;
+ *   - NON-ship tickets are untouched, and make no S3 call at all;
+ *   - an INDETERMINATE S3 answer refuses (fails closed) — "we could not find a
+ *     record" is not "there is no record" (DL-028's positive-evidence rule).
+ *
+ * The jira Lambda's suite asserts the identical twin, in its own idiom.
+ */
+describe("transition_ticket — ship-phase Done needs a completion record (TEAM-4706)", () => {
+  const transition = (args) => handler({ name: "Tickets___transition_ticket", arguments: args });
+  const RECORD_KEY = `completions/${SHIP}.json`;
+  const HINT =
+    "call WorkflowOutput___report_completion(ticket_id=…) — it writes the record and transitions the ticket for you";
+
+  /** The run's ship ticket: release manager, in progress, phase-stamped `ship`. */
+  const shipTicket = (extra = {}) => ({
+    ticketId: SHIP,
+    status: "in_progress",
+    assignee: "agentcore_hub_release_manager",
+    phase: "ship",
+    ...extra,
+  });
+
+  beforeEach(async () => {
+    // The gate only reads S3 when a bucket is configured; with none it fails
+    // closed, which the "indeterminate" test at the end pins separately.
+    process.env.ARTIFACT_BUCKET = "test-bucket";
+    h.state.s3 = {
+      "config/agents.json": {
+        agents: [
+          { agentId: "agentcore_hub_release_manager", phase: "ship" },
+          { agentId: "agentcore_hub_backend_dev", phase: "development" },
+        ],
+      },
+    };
+    vi.resetModules();
+    ({ handler } = await import("./index.mjs"));
+  });
+
+  afterEach(() => {
+    delete process.env.ARTIFACT_BUCKET;
+  });
+
+  it("(a) refuses done with no record — exact reason/hint, and NO status write", async () => {
+    h.state.items[SHIP] = shipTicket();
+
+    const res = await transition({ ticket_id: SHIP, to_status: "done" });
+
+    expect(res.ok).toBe(false);
+    expect(res.reason).toBe("completion_record_required");
+    expect(res.hint).toBe(HINT);
+    // The refusal is legible to the agent AND to the hub UI's rejectedDetails().
+    expect(res.content[0].text).toContain(HINT);
+    expect(res.content[0].text).toContain(`no ${RECORD_KEY}`);
+    // Nothing moved: the ticket is still in_progress in DynamoDB.
+    expect(h.state.statusUpdates).toHaveLength(0);
+    expect(h.state.s3Heads).toEqual([RECORD_KEY]);
+  });
+
+  it("(a, cont.) the `skip` row cannot walk around the gate either", async () => {
+    // From `blocked`, done resolves through the skip row's `to` alias (TEAM-4130
+    // F1), so keying the gate on the requested transition id would leave the main
+    // hole open. The RESOLVED target is what is tested.
+    h.state.items[SHIP] = shipTicket({ status: "blocked" });
+
+    const res = await transition({ ticket_id: SHIP, to_status: "done", reason: "PR merged" });
+
+    expect(res.reason).toBe("completion_record_required");
+    expect(h.state.statusUpdates).toHaveLength(0);
+  });
+
+  it("(b) allows done once the record exists", async () => {
+    h.state.items[SHIP] = shipTicket();
+    h.state.s3Objects[RECORD_KEY] = true;
+
+    const res = await transition({ ticket_id: SHIP, to_status: "done" });
+
+    expect(res).toMatchObject({ key: SHIP, status: "transitioned", from: "in_progress", to: "done" });
+    expect("reason" in res).toBe(false);
+    expect(h.state.statusUpdates).toHaveLength(1);
+    expect(h.state.statusUpdates[0].ExpressionAttributeValues[":s"]).toBe("done");
+    expect(h.state.s3Heads).toEqual([RECORD_KEY]);
+  });
+
+  it("(c) a NON-ship ticket closes with no record and makes no S3 call at all", async () => {
+    h.state.items["TEAM-4067"] = {
+      ticketId: "TEAM-4067",
+      status: "in_progress",
+      assignee: "agentcore_hub_backend_dev",
+      phase: "development",
+    };
+
+    const res = await transition({ ticket_id: "TEAM-4067", to_status: "done" });
+
+    expect(res).toMatchObject({ key: "TEAM-4067", status: "transitioned", to: "done" });
+    expect(h.state.statusUpdates).toHaveLength(1);
+    // The ship-phase predicate is cheap and runs FIRST — the hot path is untouched.
+    expect(h.state.s3Heads).toEqual([]);
+  });
+
+  it("(d) a human-assigned gate closes with no record — the UI/Telegram approve path", async () => {
+    // A Merge Approval gate IS a ship-phase ticket (`phase:ship`), and neither the
+    // console's approve nor the Telegram bridge's ✅ writes a completion record.
+    // Gating it would deadlock every human gate in the pipeline.
+    h.state.items["TEAM-4068"] = {
+      ticketId: "TEAM-4068",
+      status: "in_review",
+      assignee: "human:release-owner",
+      phase: "ship",
+      labels: ["human-review", "reviewer:release-owner", "phase:ship"],
+    };
+
+    const res = await transition({ ticket_id: "TEAM-4068", to_status: "done", reason: "approved" });
+
+    expect(res).toMatchObject({ key: "TEAM-4068", status: "transitioned", from: "in_review", to: "done" });
+    expect(h.state.statusUpdates).toHaveLength(1);
+    expect(h.state.s3Heads).toEqual([]);
+  });
+
+  it("(e) ship phase detected from the assignee's ROSTER phase, with no phase stamp", async () => {
+    // No `phase` field and no phase:ship label — the only signal is that the
+    // assignee is a ship-phase agent in config/agents.json.
+    h.state.items[SHIP] = { ticketId: SHIP, status: "in_progress", assignee: "agentcore_hub_release_manager" };
+
+    const res = await transition({ ticket_id: SHIP, to_status: "done" });
+
+    expect(res.reason).toBe("completion_record_required");
+    expect(res.hint).toBe(HINT);
+    expect(h.state.statusUpdates).toHaveLength(0);
+    expect(h.state.s3Heads).toEqual([RECORD_KEY]);
+  });
+
+  it("(f) an INDETERMINATE S3 answer refuses — fails closed, and leaks nothing", async () => {
+    h.state.items[SHIP] = shipTicket();
+    h.state.headImpl = () => {
+      const err = new Error("User: arn:aws:sts::…:assumed-role/… is not authorized");
+      err.name = "AccessDenied";
+      err.$metadata = { httpStatusCode: 403 };
+      throw err;
+    };
+
+    const res = await transition({ ticket_id: SHIP, to_status: "done" });
+
+    expect(res.reason).toBe("completion_record_required");
+    expect(h.state.statusUpdates).toHaveLength(0);
+    // The reason names the failure CLASS, never the AWS error body/identity.
+    expect(res.content[0].text).toContain("could not read");
+    expect(res.content[0].text).toContain("AccessDenied");
+    expect(res.content[0].text).not.toContain("assumed-role");
   });
 });

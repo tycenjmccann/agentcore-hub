@@ -1119,6 +1119,243 @@ for (const c of CLAMP_CASES) {
   });
 }
 
+// ─── TEAM-4706 (DL-029): a ship-phase ticket cannot go Done with no record ─────
+//
+// The record at s3://$ARTIFACT_BUCKET/completions/<ticket_id>.json, written by
+// lambda/workflow-output's report_completion BEFORE it asks this Lambda for the
+// transition, is the only durable statement of what actually shipped — the run's
+// completion gates, its KPIs and the deploy audit trail all read it. A ship ticket
+// closed by hand leaves them with nothing.
+//
+// The rails that keep the gate from becoming a deadlock are as load-bearing as the
+// gate itself, and each has a test here: human gates are exempt (the hub UI's
+// approve and the Telegram bridge's ✅ transition through this same tool without
+// writing a record), non-ship tickets are untouched, and an indeterminate S3 answer
+// refuses rather than assumes (DL-028's positive-evidence rule).
+//
+// The DynamoDB twin (lambda/agentcore-hub-tickets/index.test.mjs) asserts the
+// identical behaviour in that provider's idiom — a returned object rather than a
+// throw the handler maps to `{ error }`.
+
+const SHIP_TICKET = "TEAM-4066";
+const SHIP_RECORD_KEY = `completions/${SHIP_TICKET}.json`;
+const COMPLETION_HINT =
+  "call WorkflowOutput___report_completion(ticket_id=…) — it writes the record and transitions the ticket for you";
+
+/** The roster as config/agents.json serves it (agentId → phase). */
+const SHIP_ROSTER = {
+  agents: [
+    { agentId: "agentcore_hub_release_manager", phase: "ship" },
+    { agentId: "agentcore_hub_backend_dev", phase: "development" },
+  ],
+};
+
+/**
+ * A fresh module instance WITH an artifact bucket (ARTIFACT_BUCKET is read at
+ * module load), plus a stub on its exported S3 client: `node --test` has no module
+ * registry to mock, so the client itself is the seam. Returns the module and the
+ * recorded S3 traffic — `heads` is the completion-record probe.
+ */
+async function loadShipGate({ records = [], headError = null, bucket = "test-bucket" } = {}) {
+  process.env.ARTIFACT_BUCKET = bucket;
+  const mod = await import(`./index.mjs?ship-gate=${loadSeq++}`);
+  const s3Calls = { heads: [], gets: [] };
+  mod.s3.send = async (cmd) => {
+    if (cmd?.constructor?.name === "HeadObjectCommand") {
+      s3Calls.heads.push(cmd.input.Key);
+      if (headError) throw headError;
+      if (!records.includes(cmd.input.Key)) {
+        const err = new Error("NotFound");
+        err.name = "NotFound";
+        err.$metadata = { httpStatusCode: 404 };
+        throw err;
+      }
+      return { ContentLength: 42 };
+    }
+    s3Calls.gets.push(cmd.input.Key);
+    if (cmd.input.Key === "config/agents.json") {
+      return { Body: { transformToString: async () => JSON.stringify(SHIP_ROSTER) } };
+    }
+    const err = new Error(`NoSuchKey: ${cmd.input.Key}`);
+    err.name = "NoSuchKey";
+    throw err;
+  };
+  return { mod, s3Calls };
+}
+
+/**
+ * Jira stub for a Done transition: serves the `?fields=labels` read the gate makes,
+ * a transition list containing Done, and records every POST so a refusal can be
+ * proven to have written NOTHING.
+ */
+function installDoneStub({ labels = [], ticketId = SHIP_TICKET } = {}) {
+  const calls = { labelReads: [], transitions: [], comments: [], restore: null };
+  const originalFetch = globalThis.fetch;
+  calls.restore = () => { globalThis.fetch = originalFetch; };
+  globalThis.fetch = async (url, init = {}) => {
+    const u = String(url);
+    const method = (init.method || "GET").toUpperCase();
+    if (u.includes("fields=labels") && method === "GET") {
+      calls.labelReads.push(u);
+      return new Response(JSON.stringify({ key: ticketId, fields: { labels } }), { status: 200 });
+    }
+    if (u.includes("/transitions") && method === "GET") {
+      return new Response(JSON.stringify({ transitions: [
+        { id: "11", name: "Blocked", to: { name: "Blocked" } },
+        { id: "31", name: "Done", to: { name: "Done" } },
+      ] }), { status: 200 });
+    }
+    if (u.includes("/transitions") && method === "POST") {
+      calls.transitions.push(JSON.parse(init.body));
+      return new Response(null, { status: 204 });
+    }
+    if (u.includes("/comment") && method === "POST") {
+      calls.comments.push(JSON.parse(init.body));
+      return new Response(JSON.stringify({ id: "1" }), { status: 201 });
+    }
+    throw new Error(`unexpected ${method} ${u}`);
+  };
+  return calls;
+}
+
+const doneTransition = (h, ticketId = SHIP_TICKET, extra = {}) =>
+  h({ tool_name: "Tickets___transition_ticket", parameters: { ticket_id: ticketId, transition_id: "done", ...extra } });
+
+test("TEAM-4706 (a): a ship ticket with NO completion record is refused, and Jira is never POSTed", async () => {
+  const { mod, s3Calls } = await loadShipGate();
+  const cap = installDoneStub({ labels: ["agent:agentcore_hub_release_manager", "phase:ship", "wf:run1"] });
+  try {
+    const res = await doneTransition(mod.handler, SHIP_TICKET, { reason: "PR merged" });
+
+    // The structured refusal survives the throw → `{ error }` boundary verbatim.
+    assert.equal(res.ok, false);
+    assert.equal(res.reason, "completion_record_required");
+    assert.equal(res.hint, COMPLETION_HINT);
+    // `error` is what the hub UI's rejectedDetails() reads as "it did not move".
+    assert.match(res.error, /Cannot move TEAM-4066 to Done/);
+    assert.match(res.error, /report_completion/);
+
+    // Nothing was written: no transition POST, and not even the reason comment.
+    assert.deepEqual(cap.transitions, [], "a refused transition must not fire in Jira");
+    assert.deepEqual(cap.comments, [], "a refused transition must leave no comment behind");
+    assert.deepEqual(s3Calls.heads, [SHIP_RECORD_KEY]);
+  } finally {
+    cap.restore();
+    delete process.env.ARTIFACT_BUCKET;
+  }
+});
+
+test("TEAM-4706 (a, cont.): `skip` cannot walk around the gate — it resolves to Done", async () => {
+  const { mod } = await loadShipGate();
+  const cap = installDoneStub({ labels: ["agent:agentcore_hub_release_manager", "phase:ship"] });
+  try {
+    const res = await mod.handler({
+      tool_name: "Tickets___transition_ticket",
+      parameters: { ticket_id: SHIP_TICKET, transition_id: "skip", reason: "not needed" },
+    });
+    assert.equal(res.reason, "completion_record_required");
+    assert.deepEqual(cap.transitions, []);
+  } finally {
+    cap.restore();
+    delete process.env.ARTIFACT_BUCKET;
+  }
+});
+
+test("TEAM-4706 (b): the same ship ticket WITH the record transitions normally", async () => {
+  const { mod, s3Calls } = await loadShipGate({ records: [SHIP_RECORD_KEY] });
+  const cap = installDoneStub({ labels: ["agent:agentcore_hub_release_manager", "phase:ship"] });
+  try {
+    const res = await doneTransition(mod.handler);
+
+    assert.equal(res.status, "done");
+    assert.equal(res.ticketId, SHIP_TICKET);
+    assert.equal(res.reason, undefined);
+    assert.deepEqual(cap.transitions, [{ transition: { id: "31" } }]);
+    assert.deepEqual(s3Calls.heads, [SHIP_RECORD_KEY]);
+  } finally {
+    cap.restore();
+    delete process.env.ARTIFACT_BUCKET;
+  }
+});
+
+test("TEAM-4706 (c): a NON-ship ticket closes with no record and never probes S3", async () => {
+  const { mod, s3Calls } = await loadShipGate();
+  const cap = installDoneStub({ labels: ["agent:agentcore_hub_backend_dev", "phase:development"], ticketId: "TEAM-4067" });
+  try {
+    const res = await doneTransition(mod.handler, "TEAM-4067");
+
+    assert.equal(res.status, "done");
+    assert.deepEqual(cap.transitions, [{ transition: { id: "31" } }]);
+    // The cheap phase predicate runs FIRST: the completion-record probe never
+    // happens. (The only S3 traffic is the cold-start roster config read, which
+    // this Lambda already made before this ticket existed.)
+    assert.deepEqual(s3Calls.heads, []);
+  } finally {
+    cap.restore();
+    delete process.env.ARTIFACT_BUCKET;
+  }
+});
+
+test("TEAM-4706 (d): a human-review gate closes with no record — the UI/Telegram approve path", async () => {
+  const { mod, s3Calls } = await loadShipGate();
+  // A Merge Approval gate carries `phase:ship` itself, so the human exemption has
+  // to be checked BEFORE the phase label or every human gate deadlocks.
+  const cap = installDoneStub({
+    labels: ["human-review", "reviewer:release-owner", "phase:ship", "wf:run1"],
+    ticketId: "TEAM-4068",
+  });
+  try {
+    const res = await doneTransition(mod.handler, "TEAM-4068", { reason: "approved" });
+
+    assert.equal(res.status, "done");
+    assert.deepEqual(cap.transitions, [{ transition: { id: "31" } }]);
+    assert.deepEqual(s3Calls.heads, []);
+  } finally {
+    cap.restore();
+    delete process.env.ARTIFACT_BUCKET;
+  }
+});
+
+test("TEAM-4706 (e): ship phase read from the assignee's ROSTER phase, with no phase label", async () => {
+  const { mod, s3Calls } = await loadShipGate();
+  // No phase:ship label at all — the only signal is that agent:<id> is a
+  // ship-phase agent in config/agents.json.
+  const cap = installDoneStub({ labels: ["agent:agentcore_hub_release_manager", "wf:run1"] });
+  try {
+    const res = await doneTransition(mod.handler);
+
+    assert.equal(res.reason, "completion_record_required");
+    assert.equal(res.hint, COMPLETION_HINT);
+    assert.deepEqual(cap.transitions, []);
+    assert.deepEqual(s3Calls.heads, [SHIP_RECORD_KEY]);
+    // The phase came from the S3 roster, not from a hardcoded name here.
+    assert.ok(s3Calls.gets.includes("config/agents.json"));
+  } finally {
+    cap.restore();
+    delete process.env.ARTIFACT_BUCKET;
+  }
+});
+
+test("TEAM-4706 (f): an INDETERMINATE S3 answer refuses (fails closed) and leaks nothing", async () => {
+  const denied = new Error("User: arn:aws:sts::…:assumed-role/… is not authorized to perform s3:GetObject");
+  denied.name = "AccessDenied";
+  denied.$metadata = { httpStatusCode: 403 };
+  const { mod } = await loadShipGate({ headError: denied });
+  const cap = installDoneStub({ labels: ["agent:agentcore_hub_release_manager", "phase:ship"] });
+  try {
+    const res = await doneTransition(mod.handler);
+
+    assert.equal(res.reason, "completion_record_required");
+    assert.deepEqual(cap.transitions, [], "an unreadable bucket must not close a ship ticket");
+    // The message names the failure CLASS, never the AWS error body / identity.
+    assert.match(res.error, /could not read completions\/TEAM-4066\.json \(AccessDenied 403\)/);
+    assert.ok(!res.error.includes("assumed-role"), res.error);
+  } finally {
+    cap.restore();
+    delete process.env.ARTIFACT_BUCKET;
+  }
+});
+
 test("createTicket: an emoji title whose cut lands mid-surrogate-pair is clamped without corruption", async () => {
   const cap = captureCreate({ createdKey: "TEAM-910" });
   try {
