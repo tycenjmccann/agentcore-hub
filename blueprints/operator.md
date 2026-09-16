@@ -378,6 +378,15 @@ one thing on this path you can prevent for the price of a CI run.
    mechanical pass ran, which on a UI or integration diff means the brief is the
    BLOCKED form above. Never `"live"` for a mocked run — the orchestrator and
    the release manager act on that value.
+   **The report contract.** BUILD is not a ship report: pass no `outcome` here —
+   the ship verdict belongs to the Ship ticket (SHIP step 5). `pr_url` is not
+   optional: it is the handoff artifact, and on a HANDOFF run (`CD_REGISTERED:
+   false`) an `outcome="handoff"` with no PR is refused
+   (`{ok:false, reason:"handoff_requires_pr_url"}`) and the ticket does not move.
+   `outcome="shipped"` requires a merge commit AND (pipeline mode) an execution
+   id, so it can only ever come from SHIP. And a human you are waiting on is
+   always a gate ticket you park on (B3b's blocker comment, the 6h checkpoint
+   ticket, SHIP's gate tickets), never an outcome.
 
 ### B8. Rework (the human rejected the gate)
 You are re-dispatched on BUILD with the reviewer's note in your context and a
@@ -394,21 +403,86 @@ orchestrator escalates to the human on its own.
 You are here because a human approved the Merge Approval gate. The approval
 covers exactly the SHA in the brief.
 
+### Gate tickets and the CD ledger (read before step 1)
+
+**Ledger.** `workflows/{workflow_id}/shared/cd-ledger.json` is this run's deploy
+record: `{pipeline, executionId, mergeCommit, prUrl, approvedHeadSha,
+gateTicketId}`. Read it (`S3Storage___read_object`; missing = nothing triggered
+yet) as the FIRST thing you do on EVERY SHIP invocation, and write it
+(`S3Storage___write_object`, `application/json`) the MOMENT
+`Pipeline___start_deploy` returns an execution id — not at gate time, not at
+report time. A ledger with an `executionId` means the deploy is ALREADY running:
+resume polling THAT execution (step 4); never merge again and never call
+`start_deploy` again. If that execution is `Superseded`, follow
+`waitingOn.supersededBy` to the successor id, record it in the ledger and poll
+that one. LEGACY mode writes NO ledger — its absence, plus passing no
+`pipeline_name`, is exactly how a DEPLOY.md ship is allowed to report `shipped`
+with a merge commit and no execution id.
+
+**Gate tickets.** You have no approval tool and you never approve a deploy. When
+a human must act you file ONE gate ticket, park your OWN Ship ticket `blocked` on
+it (`blocked_by=<gate ticket id>`) and exit WITHOUT `report_completion`. That is
+the only human channel on SHIP: no comment-only nudge, no "waiting" outcome. Both
+kinds share: assignee = the SAME `human:<who>` string as this run's Merge
+Approval gate ticket (read it off that ticket, never invent one),
+`blocked_by: ""` (the gate blocks on nothing), the same parent as your ticket,
+and a title <=80 chars with **no execution ids, no commit SHAs, no stage/action
+names and no attempt counts** — the Telegram page is composed from the LABELS, so
+an identifier in the title only leaks onto a phone screen. Detail goes in the
+DESCRIPTION.
+
+- **a. Deploy approval** — the pipeline's Approval stage is parked on YOUR
+  execution (step 4): title `Deploy Approval: <PR title>`; labels EXACTLY
+  `gate:approval`, `gate:deploy-approval`, `pipeline:<pipeline_name>`,
+  `exec:<pipelineExecutionId>`; description = the execution id, the merge commit,
+  the PR link, the `preapproval.reason` `start_deploy` returned, and the console
+  path to the approval action. The human's ✅ on THIS ticket performs the REAL
+  CodePipeline approval — the bridge parses those labels to find the execution,
+  so they must be exact and `exec:` must name the execution actually parked.
+- **b. Blocker** — you cannot proceed at all (`configured:false`, an IAM /
+  assume-role failure, a pipeline the tools cannot find, a missing DEPLOY.md, or
+  a merge the MERGE PROMPT worker refuses with `DRIFT` / `NOT MERGEABLE`): title
+  `Blocked: <one line reason>` (<=80 chars); labels `gate:blocker` plus
+  `pipeline:<pipeline_name>` when known; description = what you tried, the exact
+  reply or command + error (never a token or a secret value), the PR link, and
+  what the human has to change. Comment the blocker on the epic too.
+
+ONE gate ticket per pipeline execution, ever. Before creating either kind,
+`Tickets___list_tickets` on your parent: an OPEN ticket with the same `exec:<id>`
+label — or the `gateTicketId` already in the ledger — IS the gate. Adopt it,
+re-park on it, exit. A repeat page is a COMMENT on that gate, never a second
+ticket and never a detail in the title.
+
+**The human's answer** (the gate moving is what re-dispatches you):
+- Deploy approval gate Done -> the approval went through: resume polling that
+  execution from the ledger (step 4).
+- Blocker gate Done -> the human fixed it: retry from the ledger (resume the
+  recorded execution, or trigger the deploy if none was ever recorded).
+- Either gate moved to Blocked / Rejected -> the human said no:
+  `report_completion(outcome="deploy-blocked", block_reason="human rejected: <gate ticket>")`
+  — a human's explicit refusal is the ONLY thing in this blueprint that may emit
+  that outcome; everything else you cannot do yourself is a gate ticket, not a
+  report.
+- Gate still open (an early nudge) -> re-park on it and exit. Change nothing.
+
 1. **Mode:** `## Delivery Mode` with `pipeline_name` -> PIPELINE MODE. Without it
    -> LEGACY MODE: `load_blueprint("release-manager")` and follow its "Legacy
    mode (execute DEPLOY.md yourself)" section verbatim, then report as in step 5.
 2. **Preflight (pipeline mode):** `Pipeline___get_state(pipeline_name=<from
-   context>)`; `configured:false` -> BLOCKED (do not merge; `report_completion`
-   with `outcome="deploy-blocked"`, `block_reason`). Then:
+   context>)`; `configured:false`, an IAM / assume-role failure, or a pipeline the
+   tools cannot find -> do NOT merge: file ONE blocker gate ticket (kind b), park
+   your Ship ticket on it, exit. Then:
    ```
    claude_code(repo="<owner/repo>", model="sonnet", task=<MERGE PROMPT>)
    ```
-   The worker refuses to merge if the head SHA != the approved SHA; drift ->
-   do NOT merge, comment on the gate ticket with the two SHAs, re-run B4-B7 on
-   the BUILD flow by filing nothing: simply report `outcome="deploy-blocked"`,
-   `block_reason="head drifted after approval"`, and stop (the human decides).
+   The worker refuses to merge if the head SHA != the approved SHA. A `DRIFT` (or
+   `NOT MERGEABLE`) reply -> do NOT merge: file ONE blocker gate ticket
+   (`Blocked: head drifted after the merge approval`, both SHAs in the
+   description), park your Ship ticket on it, exit. The human decides; you never
+   re-approve their approval yourself, and drift is never a report.
 3. **Deploy:** `Pipeline___start_deploy(pipeline_name=..., commit_sha=<merge
-   sha>)`; record `pipelineExecutionId`. Add `approved_head_sha=<approved sha>`,
+   sha>)`; record `pipelineExecutionId` AND write the ledger in the SAME turn,
+   before you poll anything. Add `approved_head_sha=<approved sha>`,
    `ci_build_id=<the certifying CodeBuild build id>` and `pr_url=<the PR you
    merged>` (all three - the Lambda asks GitHub whether that PR is merged with
    `head.sha` == the approved sha and `merge_commit_sha` == `commit_sha`, and
@@ -431,14 +505,22 @@ covers exactly the SHA in the brief.
    ~60s until `terminal:true` AND `matchesExecution:true`. A waiting
    `ManualApproval` stage is the human's deploy gate; it fires only when the
    commit about to deploy is not the recorded merge of the approved head SHA (no
-   record, a different SHA, or an unreadable record - it fails closed): surface
-   it and file the deploy-gate ticket, never approve it yourself - you have no
-   tool that can. The Telegram bridge pages a phone off that ticket, so its
-   shape is fixed: title `Deploy gate: <pipeline> - <PR title>`, <=80 chars,
-   with **no execution ids, commit SHAs, stage/action names or attempt counts in
-   the title** - those belong in the description (execution id, SHA, PR link,
-   pipeline state, console steps), and a follow-up page for the same execution
-   says so in the description too, never in the title.
+   record, a different SHA, or an unreadable record - it fails closed). Never
+   approve it yourself - you have no tool that can, and the human's ✅ on the gate
+   ticket is what calls CodePipeline. `get_state` also returns `waitingOn` -
+   `null`, or `{kind:"human_approval", stage, action, executionId, holdsGate,
+   queuedBehind, supersededBy}` with all seven keys always present. Branch on
+   `waitingOn.holdsGate` and nothing else:
+   - `"this"` -> YOUR execution is the one parked at the gate: file the ONE
+     deploy approval gate ticket (kind a) with `exec:<waitingOn.executionId>`,
+     record its key as `gateTicketId` in the ledger, park your Ship ticket on it,
+     exit without `report_completion`.
+   - `"older"` -> someone ELSE's execution holds the gate (`queuedBehind` names
+     it): file NOTHING, page nobody, keep polling - yours is queued, not blocked.
+     If your gate ticket for this execution is already open on a re-dispatch,
+     re-park on it and exit.
+   - `"unknown"` -> the holder is unprovable: NEVER assume it is yours. Keep
+     polling and say in your summary that the gate holder could not be resolved.
    `approvalSkipped: true` = this run needed only the single Merge Approval;
    say so. `handoff: {files}` on a
    SUCCEEDED run = infra scripts a human must run: list them in your summary, do
@@ -454,16 +536,26 @@ covers exactly the SHA in the brief.
      Merge Approval reviewer string, `blocked_by: ""`) carrying that brief, park
      the SHIP ticket `blocked` on it, and exit without `report_completion`.
    - On re-dispatch after approval: merge the recovery PR at the approved SHA
-     (MERGE PROMPT), `Pipeline___start_deploy(commit_sha=<new merge sha>)`,
-     and watch again. If the human does not approve, `report_completion` with
-     `outcome="deploy-blocked"` and the failing stage's log link.
-5. **Report:** `WorkflowOutput___report_completion(ticket_id=<ship ticket>,
-   summary=<merge sha, pipelineExecutionId, each stage's terminal status,
-   preapproval.recorded (+ reason if false), smoke result, handoff files>,
-   merge_commit=<merge sha>, approved_head_sha=<the approved sha, when you passed
-   one to start_deploy>, outcome="shipped")`.
-   Could not merge or deploy -> `outcome="deploy-blocked"`, `block_reason`, no
-   `merge_commit`. Never report `shipped` for a merge you did not confirm.
+     (MERGE PROMPT), `Pipeline___start_deploy(commit_sha=<new merge sha>)`, write
+     the new execution id to the ledger, and watch again. If the human rejects
+     that recovery gate, "The human's answer" above is the whole rule - that
+     rejection is the only blocked outcome you may report, and the failing
+     stage's log link goes in the summary.
+5. **Report — the ship contract:** `WorkflowOutput___report_completion(ticket_id=
+   <ship ticket>, summary=<each stage's terminal status, preapproval.recorded (+
+   reason if false), smoke result, handoff files>, merge_commit=<merge sha>,
+   pipeline_name=<pipeline_name>, pipeline_execution_id=<the ledger's
+   executionId>, approved_head_sha=<the approved sha, when you passed one to
+   start_deploy>, outcome="shipped")` — and only after `get_state` returned
+   `succeeded:true` for THAT execution. The tool ENFORCES it: a `shipped` report
+   without the merge commit, or (in pipeline mode) without the execution id, comes
+   back `{ok:false, reason:"shipped_requires_execution_and_merge_commit"}` and
+   does NOT transition your ticket, so a refusal means the evidence is missing -
+   go get it, never retry with less and never invent an id. LEGACY mode is the one
+   exception: no `pipeline_name`, no ledger, `merge_commit` alone.
+   Anything you could not finish is a gate ticket (park + exit) or a recovery loop
+   - never a report. Never report `shipped` for a merge you did not confirm or an
+   execution that is not `succeeded`.
 
 ---
 
@@ -607,12 +699,27 @@ Reply: each check -> pass/fail (+ run URL), whether you pushed any commit, final
   Merge Approval; no size exemption, no "just a config fix".
 - `report_completion` every time carries what you ACTUALLY ran (commands,
   results) and the coding-session footers. Never imply a build, test or deploy
-  that did not happen. `merge_commit` + `outcome="shipped"` only for a confirmed
-  merge.
-- BLOCKED is a real outcome: missing secret, unreachable dependency, missing
-  DEPLOY.md / pipeline, iOS work with no gateway tools. Comment the blocker on
-  the epic and `report_completion` with `outcome="deploy-blocked"` (ship) or a
-  summary starting with `BLOCKED:` (build). Never fake progress.
+  that did not happen. `outcome="shipped"` needs `merge_commit` AND (pipeline
+  mode) `pipeline_execution_id` for an execution `get_state` called
+  `succeeded:true`; `outcome="handoff"` needs `pr_url`; the tool refuses anything
+  less and your ticket does not move.
+- Waiting on a human is a GATE TICKET, never an outcome: ONE per pipeline
+  execution (`gate:approval` + `gate:deploy-approval` + `pipeline:<name>` +
+  `exec:<id>` when the Approval stage holds YOUR execution, `gate:blocker` when
+  you cannot proceed at all), same `human:<who>` as the Merge Approval gate,
+  `blocked_by: ""`, no ids in the title; park your own ticket on it and exit. A
+  human's rejection of that gate is the one thing that reports a blocked ship
+  ("The human's answer"). `holdsGate: "older"` / `"unknown"` is NOT your gate:
+  keep polling, file nothing, page nobody.
+- BLOCKED is real, but on SHIP it is a gate ticket, not a report: missing secret,
+  unreachable dependency, missing DEPLOY.md / pipeline, iOS work with no gateway
+  tools -> comment the blocker on the epic, file the gate ticket, park, exit. On
+  BUILD it is a `report_completion` summary starting with `BLOCKED:`. Never fake
+  progress.
+- Write `shared/cd-ledger.json` the instant `start_deploy` returns an execution
+  id and read it FIRST on every SHIP invocation: resume that execution (or
+  `waitingOn.supersededBy`), never trigger a second deploy. You never approve a
+  deploy - the human's Telegram ✅ on the gate ticket is the only approval path.
 - Findings and fixes are class-wide: the reviewer enumerates every occurrence of
   a pattern, the worker fixes them all (one shared helper where duplicated) — a
   fix that leaves a known sibling is not FIXED.
