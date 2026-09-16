@@ -343,6 +343,18 @@ stage is now always a real failure:**
 | `lambda/*/deploy.sh`, `deploy/*/deploy.sh`, `deploy/setup-*.{sh,mjs}` | the script itself — these change IAM / env vars / tables, which the pipeline role deliberately cannot |
 | `lambda/cost-report/index.mjs` with a `REPORT_VERSION` bump | code ships via the pipeline, but run `lambda/cost-report/deploy.sh --backfill` afterwards (`--rebuild-index` alone drops every older-version card from the fleet index) |
 
+**This PR (TEAM-4706) needs two of those handoff scripts re-run, in either order:**
+
+| Command | Why |
+|---|---|
+| `node deploy/setup-pipeline-tools-lambda.mjs` | the new deploy-time GitHub-token guard. It refuses to deploy a tools Lambda that cannot record a ship-approval (token from `GITHUB_TOKEN` or `GITHUB_PAT`; `--allow-no-github-token` to proceed anyway, accepting that every deploy pages a human). Re-running is also what puts a token on a Lambda that never had one — the `merge_binding_unverified` drift |
+| `node deploy/setup-tickets-lambda.mjs` | the ticket Lambdas now `HeadObject` `completions/*` in the artifact bucket. The existing bucket-wide `s3:GetObject` already covers it (no new IAM statement), but the Lambda CODE change ships only via its own setup script — `deploy/setup-*.mjs` is a handoff row above |
+
+`./scripts/verify-infra.sh` asserts the results of both: a variable NAMED
+`GITHUB_TOKEN` on the tools Lambda (never its value), `s3:PutObject` on
+`pipeline-artifacts/ship-approvals/*` for its role, and the ticket role's
+`s3:GetObject` cover over `completions/*`.
+
 Runtime-image CD landed in PR 2 — a baked source change (persona tool code) now
 deploys automatically. Only runtime env / lifecycle / IAM / EFS changes (which
 need `UpdateFunctionConfiguration`-class perms the narrow roles lack) remain a

@@ -229,6 +229,27 @@ commit; it is never approved by software. Four moving parts:
    `pipeline-stack.ts`), because their commands come from the branch under review
    and the Build role's `pipeline-artifacts/*` grant would otherwise let a change
    forge its own approval; `GetObject` stays allowed so Deploy can re-verify.
+
+   **The two drift modes, and how they are now caught (TEAM-4706).** Both of this
+   step's prerequisites are *deploy-time* facts, not logic, so both failed silently
+   in prod and each one degraded the conditional gate back into an unconditional
+   one for every run: with no `GITHUB_TOKEN` on the tools Lambda the merge binding
+   cannot be checked at all, so every call answers
+   `preapproval:{recorded:false, reason:"merge_binding_unverified"}`; with no
+   `s3:PutObject` on the ship-approvals prefix a fully proven binding still cannot
+   be stored, so it answers `reason:"record_write_failed"`. Neither is visible
+   until a release stalls at a gate nobody expected. Two guards close them.
+   `deploy/setup-pipeline-tools-lambda.mjs` now REFUSES to deploy a Lambda that
+   cannot record an approval - it takes the token from `GITHUB_TOKEN` or
+   `GITHUB_PAT` and, with neither set, exits 1 before any AWS call unless the
+   operator passes `--allow-no-github-token`, which proceeds with the consequence
+   stated (every deploy pages a human). And `scripts/verify-infra.sh` asserts both
+   prerequisites against a live account: that the function's environment carries a
+   variable NAMED `GITHUB_TOKEN` (the name only - neither script ever reads, prints
+   or logs the value) and that its role's inline policy grants `s3:PutObject` on
+   `pipeline-artifacts/ship-approvals/*`. A third check there covers the ticket
+   Lambdas' `s3:GetObject` over `completions/*`, which the existing bucket-wide
+   grant already satisfies and only a hand-narrowed policy would break.
 2. **Decide, in the Build stage.** `buildspec-ci.yml` declares
    `DEPLOY_PREAPPROVED` in `env.exported-variables`, sets it to `0` in
    `pre_build`, and in the `BUILD_APP_IMAGE` block (after the artifacts are
