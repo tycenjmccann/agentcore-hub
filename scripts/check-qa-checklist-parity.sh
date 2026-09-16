@@ -80,6 +80,8 @@ OPERATOR_MUST_HAVE=(
   'DECISION: BLOCKED'
   '`evidence_kind="live"` ONLY when B3b'
   '"Verified by construction" is a P1'
+  'B3b (live verify, the shared QA checklist)'
+  '**Ledger source check.**'
 )
 
 run_checks() { # $1 = repo root to check
@@ -161,6 +163,8 @@ self_test() {
     "operator lets evidence_kind=live float|sed -i.bak 's/`evidence_kind=\"live\"` ONLY when B3b/`evidence_kind=\"live\"` when B3b/' blueprints/operator.md"
     "operator reviewer drops verified-by-construction|sed -i.bak 's/\"Verified by construction\" is a P1/\"Verified by construction\" is a P3/' blueprints/operator.md"
     "operator plan template allows mocked-only|sed -i.bak 's/\"Mocked only\" is not an option here/\"Mocked only\" is fine/' blueprints/operator.md"
+    "operator ship-recovery loop drops B3b|sed -i.bak 's/B3b (live verify, the shared QA checklist)/B3 (verify again)/' blueprints/operator.md"
+    "operator B7 lets the ledger be written from memory|sed -i.bak 's/\*\*Ledger source check\.\*\*/Ledger note./' blueprints/operator.md"
   )
   for case in "${CASES[@]}"; do
     tmp="$(mktemp -d)"
