@@ -8,7 +8,7 @@
  *   JIRA_SITE_URL, JIRA_EMAIL, JIRA_API_TOKEN, JIRA_PROJECT_KEY
  */
 
-import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
+import { S3Client, GetObjectCommand, HeadObjectCommand } from "@aws-sdk/client-s3";
 // TEAM-4121 FR-8: the shared fix-ticket contract. Byte-identical copy of the one
 // in lambda/agentcore-hub-tickets/ and lambda/orchestrator/ (each Lambda ships as
 // a self-contained zip, so they cannot share a file); CI byte-compares them.
@@ -46,7 +46,11 @@ const AUTH = `Basic ${Buffer.from(`${EMAIL}:${TOKEN}`).toString("base64")}`;
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const ARTIFACT_BUCKET = process.env.ARTIFACT_BUCKET || "";
-const s3 = new S3Client({ region: REGION });
+// Exported ONLY as a test seam: this suite runs under `node --test`, which has no
+// module registry to mock (no vi.mock), so index.test.mjs stubs `s3.send` on a
+// freshly imported instance to drive the completion-record HeadObject below.
+// Production code never reassigns it.
+export const s3 = new S3Client({ region: REGION });
 
 // ─── Agent Roster (config-driven from S3, falls back to hardcoded) ────────────
 
@@ -164,6 +168,149 @@ async function loadValidPhases() {
     console.log(`[agentcore-hub-jira] Loaded ${phases.size} valid phases from S3 config`);
   }
   return VALID_PHASES;
+}
+
+// ─── Agent → phase map (TEAM-4706) ───────────────────────────────────────────
+//
+// VALID_PHASES above collapses the roster to a SET of phase names, which cannot
+// answer the question the ship-phase gate asks: "is THIS ticket's assignee a
+// ship-phase agent?" Same loader style, same S3 object (config/agents.json), so
+// a roster edit still needs no redeploy — Lambdas pick it up on the next cold
+// start. The fallback mirrors src/config/agents.json's pipeline roster, so an S3
+// read failure still recognizes the release manager as ship phase.
+const FALLBACK_AGENT_PHASES = new Map([
+  ["agentcore_hub_requirements_analyst", "requirements"],
+  ["agentcore_hub_frontend_designer", "design"],
+  ["agentcore_hub_ios_designer", "design"],
+  ["agentcore_hub_backend_designer", "design"],
+  ["agentcore_hub_android_designer", "design"],
+  ["agentcore_hub_security_reviewer", "design"],
+  ["agentcore_hub_legal_compliance", "design"],
+  ["agentcore_hub_localization", "design"],
+  ["agentcore_hub_analytics_designer", "design"],
+  ["agentcore_hub_backend_dev", "development"],
+  ["agentcore_hub_api_dev", "development"],
+  ["agentcore_hub_frontend_dev", "development"],
+  ["agentcore_hub_code_reviewer", "review"],
+  ["agentcore_hub_qa_verifier", "verification"],
+  ["agentcore_hub_ci_agent", "review"],
+  ["agentcore_hub_release_manager", "ship"],
+]);
+
+let AGENT_PHASES = null;
+
+async function loadAgentPhases() {
+  if (AGENT_PHASES) return AGENT_PHASES;
+  if (!ARTIFACT_BUCKET) {
+    console.warn("[agentcore-hub-jira] No ARTIFACT_BUCKET — using fallback agent-phase map");
+    AGENT_PHASES = FALLBACK_AGENT_PHASES;
+    return AGENT_PHASES;
+  }
+  try {
+    const res = await s3.send(new GetObjectCommand({
+      Bucket: ARTIFACT_BUCKET,
+      Key: "config/agents.json",
+    }));
+    const config = JSON.parse(await res.Body.transformToString());
+    const map = new Map();
+    for (const a of config.agents || []) {
+      if (typeof a.agentId === "string" && a.agentId && typeof a.phase === "string" && a.phase) {
+        map.set(a.agentId, a.phase);
+      }
+    }
+    if (map.size === 0) throw new Error("no agentId/phase pairs in config/agents.json");
+    AGENT_PHASES = map;
+    console.log(`[agentcore-hub-jira] Loaded ${map.size} agent phases from S3 config`);
+  } catch (err) {
+    console.warn(`[agentcore-hub-jira] Failed to load agent phases from S3: ${err.message} — using fallback agent-phase map`);
+    AGENT_PHASES = FALLBACK_AGENT_PHASES;
+  }
+  return AGENT_PHASES;
+}
+
+// ─── Ship-phase completion-record gate (TEAM-4706, DL-030) ───────────────────
+//
+// A ship-phase ticket may not reach Done unless the agent's own completion record
+// exists at s3://$ARTIFACT_BUCKET/completions/<ticket_id>.json — the record
+// lambda/workflow-output writes (reportCompletion) BEFORE it asks this Lambda for
+// the transition, and the only durable statement of what actually shipped. Closing
+// a ship ticket by hand leaves the run's completion gates, its KPIs and the deploy
+// audit trail with nothing to read.
+//
+// Twin of the block in lambda/agentcore-hub-tickets/index.mjs: both providers must
+// refuse identically (the twins doctrine, TEAM-4131 F2), so edit both or neither.
+// Not in fix-contract.mjs — that module is byte-compared across three copies by
+// CI, and each provider expresses the refusal in its own idiom.
+const SHIP_PHASE = "ship";
+
+// The refusal payload, verbatim in both providers. `reason` is what an agent (and
+// the orchestrator) match on; `hint` names the one call that does this correctly.
+const COMPLETION_RECORD_REQUIRED = {
+  ok: false,
+  reason: "completion_record_required",
+  hint: "call WorkflowOutput___report_completion(ticket_id=…) — it writes the record and transitions the ticket for you",
+};
+
+/**
+ * Is this ticket a ship-phase AGENT ticket? Cheap checks first: the caller only
+ * pays for the S3 HeadObject when this says yes.
+ *
+ * Human-review gates are EXEMPT, and that exemption comes first — the hub UI's
+ * approve action (src/app/api/workflow/[id]/tickets/transition/route.ts) and the
+ * Telegram bridge's ✅ both transition through this same tool without writing a
+ * record, and a Merge Approval gate carries `phase:ship` itself, so gating them
+ * would deadlock every human gate in the pipeline.
+ */
+async function isShipPhaseTicket(labels) {
+  const labelList = (labels || []).map((l) => String(l));
+  if (labelList.some((l) => l === "human-review" || l.startsWith("reviewer:"))) return false;
+  if (labelList.includes(`phase:${SHIP_PHASE}`)) return true;
+  const agentLabel = labelList.find((l) => l.startsWith("agent:"));
+  if (!agentLabel) return false;
+  const assignee = agentLabel.slice("agent:".length);
+  if (!assignee || assignee.startsWith("human:")) return false;
+  const phases = await loadAgentPhases();
+  return phases.get(assignee) === SHIP_PHASE;
+}
+
+/**
+ * POSITIVE proof that completions/<ticketId>.json exists. Fails CLOSED on an
+ * indeterminate answer (AccessDenied, throttle, timeout, ARTIFACT_BUCKET unset):
+ * "we could not find a record" is not "there is no record", the same
+ * positive-evidence rule as DL-028's deploy gate. `why` is log/message text only
+ * — never a credential, never the raw AWS error body.
+ */
+async function completionRecordProven(ticketId) {
+  const key = `completions/${ticketId}.json`;
+  if (!ARTIFACT_BUCKET) {
+    return { proven: false, why: `ARTIFACT_BUCKET is unset, so ${key} cannot be read` };
+  }
+  try {
+    await s3.send(new HeadObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: key }));
+    return { proven: true, why: `${key} exists` };
+  } catch (err) {
+    const status = err?.$metadata?.httpStatusCode;
+    if (err?.name === "NotFound" || err?.name === "NoSuchKey" || status === 404) {
+      return { proven: false, why: `no ${key} in the artifact bucket` };
+    }
+    return { proven: false, why: `could not read ${key} (${err?.name || "S3Error"}${status ? ` ${status}` : ""})` };
+  }
+}
+
+/**
+ * The refusal, in this Lambda's idiom: transitionTicket signals every other
+ * failure by throwing, and the handler turns a throw into `{ error }`. The
+ * structured payload rides on the Error so the handler can return `reason`/`hint`
+ * verbatim ALONGSIDE `error` — the `error` field is what the hub UI's
+ * rejectedDetails() recognizes as "the ticket did not move".
+ */
+function completionRecordRequiredError(ticketId, why) {
+  const err = new Error(
+    `Cannot move ${ticketId} to Done: a ship-phase ticket needs its completion record first — ` +
+    `${COMPLETION_RECORD_REQUIRED.hint} (${why})`
+  );
+  err.toolResult = { ...COMPLETION_RECORD_REQUIRED };
+  return err;
 }
 
 // ─── Status Mapping ──────────────────────────────────────────────────────────
@@ -740,6 +887,25 @@ async function transitionTicket(params) {
     }
   }
 
+  // TEAM-4706 (DL-030): a ship-phase ticket cannot reach Done without its
+  // completion record. Placed before the reason comment and the blocker links so a
+  // refused transition leaves NO trace in Jira. `effectiveStatus` (not the raw
+  // transition_id) is what is tested, so a "skip" — which resolves to Done, and is
+  // how a Blocked ticket reaches Done at all — cannot walk around the gate.
+  // Labels carry the phase AND the assignee in Jira mode, so one read answers both
+  // halves of the predicate, and only a ship-phase ticket costs an S3 call.
+  if (effectiveStatus.toLowerCase() === "done") {
+    const issue = await jiraFetch(`/rest/api/3/issue/${ticket_id}?fields=labels`);
+    const labels = issue?.fields?.labels || [];
+    if (await isShipPhaseTicket(labels)) {
+      const proof = await completionRecordProven(ticket_id);
+      if (!proof.proven) {
+        console.warn(`[jira-tools] ${ticket_id}: refusing Done on a ship-phase ticket — ${proof.why}`);
+        throw completionRecordRequiredError(ticket_id, proof.why);
+      }
+    }
+  }
+
   // Add the reason as a comment BEFORE the transition. The transition fires the
   // status webhook → orchestrator rejection handler reads the latest comment;
   // commenting first avoids a race where rework starts before the feedback lands.
@@ -1160,6 +1326,12 @@ export const handler = async (event) => {
     return result;
   } catch (err) {
     console.error(`[jira-tools] tool=${toolName} ERROR: ${err.message}`);
+    // TEAM-4706: a STRUCTURED refusal (the ship-phase completion-record gate)
+    // carries the shape the agent has to read — `reason` to match on, `hint` to
+    // act on — so it survives the throw→result boundary verbatim. `error` is kept
+    // alongside it because that is the field every existing caller (the hub UI's
+    // rejectedDetails, the orchestrator) recognizes as "the ticket did not move".
+    if (err?.toolResult) return { ...err.toolResult, error: err.message };
     return { error: err.message };
   }
 };

@@ -2044,6 +2044,23 @@ def Pipeline___get_state(pipeline_name: str = "", execution_id: str = "") -> str
     terminal/succeeded when matchesExecution is true; matchesExecution:false
     means your run is not visible on any stage yet (keep polling).
 
+    WHOSE gate is it? The response carries waitingOn: null when no human approval
+    is awaiting a decision, otherwise
+    {kind, stage, action, executionId, holdsGate, queuedBehind, supersededBy}.
+    A pipeline runs one execution at a time, so a gate you can see may belong to
+    the build in front of yours. Act on holdsGate, never on the stage list:
+      - "this"    — YOUR execution is the one parked at the human approval gate.
+                    This is the only case in which you file a human gate ticket,
+                    and you file exactly ONE.
+      - "older"   — someone else's build holds the gate (queuedBehind names it).
+                    File NOTHING and keep polling; your run has not reached it.
+      - "unknown" — the relationship could not be established. Treat it as
+                    "older": keep polling, file nothing.
+    If supersededBy is set, a newer execution inherited your commit and is the run
+    to follow — poll again with execution_id set to that id.
+    waitingOn is observational. You have NO way to answer the gate: the deploy
+    approval is a human decision, bridged to Telegram.
+
     Args:
         pipeline_name: In Pipeline Mode this is REQUIRED — pass the
             pipeline_name from the `## Pipeline Mode` context block on EVERY

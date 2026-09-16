@@ -75,6 +75,13 @@
  * resolvedSourceVersion: it derives the key from the phase, so the two pre-existing
  * PROVISIONING/DOWNLOAD_SOURCE cases now pass because of the FIX rather than because the
  * fixture asserted the code's own assumption.
+ *
+ * TEAM-4706 adds get_state's `waitingOn` (section 3d): WHOSE execution is parked at
+ * the human deploy gate. Its suite pins the two properties that make an
+ * observational field safe as well as the four holdsGate verdicts — the approval
+ * token's VALUE never reaches the response, and the one extra API call
+ * (ListPipelineExecutions, for a Superseded caller) happens exactly once and never
+ * on a poll, which every other test in the section asserts by its absence.
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
 // Section 8.10 asserts on the SOURCE of index.mjs, not on its behaviour: no
@@ -113,6 +120,10 @@ const h = vi.hoisted(() => ({
     listActionExecutionsImpl: async () => ({ actionExecutionDetails: [] }),
     startPipelineExecutionImpl: async () => ({ pipelineExecutionId: "exec-new" }),
     getPipelineExecutionImpl: async () => ({ pipelineExecution: { artifactRevisions: [] } }),
+    // TEAM-4706: the ONE extra call waitingOn can make, and only when the caller's
+    // own execution is Superseded. The default is empty, so every other test proves
+    // the call is not made at all (h.state.cpCalls carries no ListPipelineExecutions).
+    listPipelineExecutionsImpl: async () => ({ pipelineExecutionSummaries: [] }),
     s3Calls: [], // the input of every S3 command, reads and writes alike
     // TEAM-4525: PutObject only, with the CLIENT REGION it was sent on — the
     // ship-approval record must always be written by this Lambda's own ambient S3
@@ -179,6 +190,7 @@ vi.mock("@aws-sdk/client-codepipeline", () => ({
       if (type === "ListActionExecutions") return h.state.listActionExecutionsImpl(cmd.input);
       if (type === "StartPipelineExecution") return h.state.startPipelineExecutionImpl(cmd.input);
       if (type === "GetPipelineExecution") return h.state.getPipelineExecutionImpl(cmd.input);
+      if (type === "ListPipelineExecutions") return h.state.listPipelineExecutionsImpl(cmd.input);
       return {};
     }
   },
@@ -186,6 +198,7 @@ vi.mock("@aws-sdk/client-codepipeline", () => ({
   GetPipelineExecutionCommand: class { constructor(i) { this.input = i; this.__type = "GetPipelineExecution"; } },
   StartPipelineExecutionCommand: class { constructor(i) { this.input = i; this.__type = "StartPipelineExecution"; } },
   ListActionExecutionsCommand: class { constructor(i) { this.input = i; this.__type = "ListActionExecutions"; } },
+  ListPipelineExecutionsCommand: class { constructor(i) { this.input = i; this.__type = "ListPipelineExecutions"; } },
 }));
 
 vi.mock("@aws-sdk/client-codebuild", () => ({
@@ -442,6 +455,7 @@ beforeEach(() => {
   h.state.getPipelineExecutionImpl = async () => ({
     pipelineExecution: { artifactRevisions: [] },
   });
+  h.state.listPipelineExecutionsImpl = async () => ({ pipelineExecutionSummaries: [] });
   h.state.s3Calls = [];
   h.state.s3Puts = [];
   h.state.putObjectImpl = async () => ({});
@@ -1843,6 +1857,204 @@ describe("get_state with a SKIPPED Approval stage (TEAM-4525)", () => {
 
     expect(out.approvalSkipped).toBe(false);
     expect(out.succeeded).toBe(true);
+  });
+});
+
+// ─── 3d. get_state.waitingOn — WHOSE gate is it? (TEAM-4706) ─────────────────
+//
+// approvalSkipped says whether a human is being waited on. It cannot say whether
+// the run parked at that gate is the CALLER'S — and a pipeline serialises
+// executions, so the build in front of yours can hold the gate for hours while
+// your execution waits to enter the stage. Both look identical in the stage list,
+// which left a polling agent two bad options: file a SECOND human gate ticket for
+// a gate already pending, or wait forever on one it will never reach.
+//
+// Every test here also pins the two invariants that make the field safe: the
+// approval token's VALUE never leaves the Lambda, and ListPipelineExecutions is
+// made at most once, on the superseded path only — never on a poll.
+describe("get_state.waitingOn (TEAM-4706)", () => {
+  /** A token value that must never appear in any response. */
+  const GATE_TOKEN = "approval-token-must-never-appear";
+
+  /**
+   * A pipeline parked at the human deploy gate. `parkedId` is the execution
+   * occupying the Approval stage; `inboundId`, when given, is the execution
+   * CodePipeline reports as queued behind it (stageStates[].inboundExecution).
+   */
+  function pendingApproval({ parkedId = "NEW", inboundId = null, token = GATE_TOKEN } = {}) {
+    return {
+      stageStates: [
+        {
+          stageName: "Source",
+          latestExecution: { status: "Succeeded", pipelineExecutionId: parkedId },
+          actionStates: [{ actionName: "GitHub_main", latestExecution: { status: "Succeeded" } }],
+        },
+        {
+          stageName: "Approval",
+          latestExecution: { status: "InProgress", pipelineExecutionId: parkedId },
+          ...(inboundId
+            ? { inboundExecution: { pipelineExecutionId: inboundId, status: "InProgress" } }
+            : {}),
+          actionStates: [
+            {
+              actionName: "Approve_deploy",
+              latestExecution: {
+                status: "InProgress",
+                ...(token ? { token } : {}),
+              },
+            },
+          ],
+        },
+        {
+          stageName: "Deploy",
+          latestExecution: { status: "Succeeded", pipelineExecutionId: "PREVIOUS" },
+          actionStates: [],
+        },
+      ],
+    };
+  }
+
+  /** Every ListPipelineExecutions that reached CodePipeline this test. */
+  function listExecutionCalls() {
+    return h.state.cpCalls.filter((c) => c.type === "ListPipelineExecutions");
+  }
+
+  it("reports holdsGate:'this' when the caller's own execution is parked at the gate", async () => {
+    h.state.getPipelineStateImpl = async () => pendingApproval({ parkedId: "NEW" });
+
+    const out = await invoke("get_state", { execution_id: "NEW" });
+
+    expect(out.waitingOn).toEqual({
+      kind: "human_approval",
+      stage: "Approval",
+      action: "Approve_deploy",
+      executionId: "NEW",
+      holdsGate: "this",
+      queuedBehind: null,
+      supersededBy: null,
+    });
+    // A pending gate is not a skipped one, and the run is still going.
+    expect(out.approvalSkipped).toBe(false);
+    // The hot path costs no extra API call.
+    expect(listExecutionCalls()).toHaveLength(0);
+  });
+
+  it("reports holdsGate:'older' + queuedBehind when an EARLIER execution holds the gate", async () => {
+    // The case that made an agent file a duplicate human gate ticket: a gate is
+    // pending, but it belongs to the build in front of ours. Nothing to file —
+    // keep polling.
+    h.state.getPipelineStateImpl = async () =>
+      pendingApproval({ parkedId: "OLDER", inboundId: "MINE" });
+
+    const out = await invoke("get_state", { execution_id: "MINE" });
+
+    expect(out.waitingOn.holdsGate).toBe("older");
+    expect(out.waitingOn.queuedBehind).toBe("OLDER");
+    expect(out.waitingOn.executionId).toBe("OLDER");
+    expect(out.waitingOn.supersededBy).toBe(null);
+    expect(listExecutionCalls()).toHaveLength(0);
+  });
+
+  it("names the successor in supersededBy when the caller's execution was Superseded", async () => {
+    const REVISION = "0949f9d8814aa3e2b1c4d5f6a7b8c9d0e1f2a3b4";
+    h.state.getPipelineStateImpl = async () => pendingApproval({ parkedId: "NEWER" });
+    // The caller's own run lost the queue to a newer one.
+    h.state.getPipelineExecutionImpl = async () => ({
+      pipelineExecution: { status: "Superseded", artifactRevisions: [{ revisionId: REVISION }] },
+    });
+    // Newest-first, as CodePipeline returns them. The first entry deliberately
+    // carries ANOTHER commit, so a match on the revision — not merely "the newest
+    // execution" — is what identifies the successor.
+    h.state.listPipelineExecutionsImpl = async () => ({
+      pipelineExecutionSummaries: [
+        { pipelineExecutionId: "UNRELATED", sourceRevisions: [{ revisionId: "f".repeat(40) }] },
+        { pipelineExecutionId: "NEWER", sourceRevisions: [{ revisionId: REVISION }] },
+        { pipelineExecutionId: "MINE", sourceRevisions: [{ revisionId: REVISION }] },
+      ],
+    });
+
+    const out = await invoke("get_state", { execution_id: "MINE" });
+
+    expect(out.waitingOn.supersededBy).toBe("NEWER");
+    // Not ours: the gate belongs to the run that inherited our commit.
+    expect(out.waitingOn.holdsGate).toBe("older");
+    // Bounded: ONE call, its default page, never paginated.
+    const calls = listExecutionCalls();
+    expect(calls).toHaveLength(1);
+    expect(calls[0].input).toEqual({ pipelineName: "agentcore-hub-deploy" });
+  });
+
+  it("is null when no approval is awaiting a decision — and makes no extra call", async () => {
+    h.state.getPipelineStateImpl = async () => allGreenStages("NEW");
+
+    const out = await invoke("get_state", { execution_id: "NEW" });
+
+    expect(out.waitingOn).toBe(null);
+    expect(listExecutionCalls()).toHaveLength(0);
+  });
+
+  it("is null for an InProgress Approval action with NO token (nothing is parked yet)", async () => {
+    // PRESENCE of the token is the signal (the same rule the Telegram bridge
+    // uses), not the stage/action being named "approval".
+    h.state.getPipelineStateImpl = async () => pendingApproval({ parkedId: "NEW", token: null });
+
+    const out = await invoke("get_state", { execution_id: "NEW" });
+
+    expect(out.waitingOn).toBe(null);
+    expect(listExecutionCalls()).toHaveLength(0);
+  });
+
+  it("never lets the approval token's VALUE into the response", async () => {
+    h.state.getPipelineStateImpl = async () => pendingApproval({ parkedId: "NEW" });
+
+    const res = await handler({
+      name: "Pipeline___get_state",
+      arguments: { execution_id: "NEW" },
+    });
+
+    // The whole serialized payload, not just the parsed field we happen to check.
+    expect(res.content[0].text).not.toContain(GATE_TOKEN);
+    const out = JSON.parse(res.content[0].text);
+    // ...and the gate WAS detected, so the assertion above is not passing merely
+    // because nothing was found.
+    expect(out.waitingOn.holdsGate).toBe("this");
+    expect(out.stages[1].actions[0].token).toBe("<present>");
+  });
+
+  it("falls back to holdsGate:'unknown' rather than guessing 'this'", async () => {
+    // A gate is pending but the stage carries no execution id at all: the
+    // relationship cannot be established, and claiming "this" is the mistake that
+    // files a duplicate human gate ticket.
+    h.state.getPipelineStateImpl = async () => ({
+      stageStates: [
+        {
+          stageName: "Approval",
+          latestExecution: { status: "InProgress" },
+          actionStates: [
+            {
+              actionName: "Approve_deploy",
+              latestExecution: { status: "InProgress", token: GATE_TOKEN },
+            },
+          ],
+        },
+      ],
+    });
+
+    const out = await invoke("get_state", { execution_id: "MINE" });
+
+    expect(out.waitingOn.holdsGate).toBe("unknown");
+    expect(out.waitingOn.queuedBehind).toBe(null);
+  });
+
+  it("unscoped: the pipeline's LATEST execution parked at the gate is 'this'", async () => {
+    h.state.getPipelineStateImpl = async () => pendingApproval({ parkedId: "LATEST" });
+
+    const out = await invoke("get_state", {});
+
+    expect(out.pipelineExecutionId).toBe("LATEST");
+    expect(out.waitingOn.holdsGate).toBe("this");
+    expect(out.waitingOn.supersededBy).toBe(null);
+    expect(listExecutionCalls()).toHaveLength(0);
   });
 });
 

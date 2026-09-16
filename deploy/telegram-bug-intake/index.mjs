@@ -70,7 +70,7 @@
 import { BedrockRuntimeClient, ConverseCommand } from "@aws-sdk/client-bedrock-runtime";
 import { DynamoDBClient, GetItemCommand, PutItemCommand, DeleteItemCommand, ScanCommand } from "@aws-sdk/client-dynamodb";
 import { TranscribeStreamingClient, StartStreamTranscriptionCommand } from "@aws-sdk/client-transcribe-streaming";
-import { CodePipelineClient, GetPipelineStateCommand, PutApprovalResultCommand } from "@aws-sdk/client-codepipeline";
+import { CodePipelineClient, GetPipelineStateCommand, PutApprovalResultCommand, GetPipelineExecutionCommand } from "@aws-sdk/client-codepipeline";
 import { STSClient, AssumeRoleCommand } from "@aws-sdk/client-sts";
 import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
 import { EventBridgeClient, PutEventsCommand } from "@aws-sdk/client-eventbridge";
@@ -895,6 +895,248 @@ function gateKindOf(gate, title) {
   return "review";
 }
 
+// ─── gate:deploy-approval — ONE artefact per deploy decision (TEAM-4706) ─────
+// A production deploy used to produce TWO Telegram messages: the pipeline's own
+// 🚀 page (which really does call PutApprovalResult) and a release-manager
+// "Deploy gate" ticket whose ✅ only moved Jira while CodePipeline stayed
+// parked. On 2026-09-14 a human tapped the inert one and a release stalled 29h.
+//
+// So a gate ticket LABELLED `gate:deploy-approval` becomes the one artefact: it
+// pages with the 🚀 kicker and the same brief, and its ✅ releases the pipeline
+// BEFORE the ticket moves. The LABEL decides — never the agent-written title,
+// which is why GATE_TITLE_KINDS is left alone.
+//
+// Labels arrive in two shapes and must classify identically: agents write the
+// canonical colon form, and the ticket Lambdas' sanitizeUserLabels rewrites
+// [^a-z0-9._-] → "-", so the SAME gate can be stored as
+// `gate-deploy-approval` / `pipeline-<name>` / `exec-<uuid>`.
+const DEPLOY_APPROVAL_LABEL_RE = /^gate[:-]deploy-approval$/;
+const DEPLOY_PIPELINE_LABEL_RE = /^pipeline[:-](.+)$/;
+const DEPLOY_EXEC_LABEL_RE = /^exec[:-]([0-9a-f-]{36})$/;
+
+/**
+ * Classify a gate ticket's labels. Pure — the one place either label shape is
+ * read, so the colon and hyphen forms can never diverge.
+ * @param {string[]|string} labels ticket labels (an array on the wire; a
+ *   comma-joined string is tolerated the way normalizeBlockedBy tolerates one)
+ * @returns {{isDeployApproval: boolean, pipeline: string|null, executionId: string|null}}
+ */
+function parseDeployApprovalLabels(labels) {
+  const list = Array.isArray(labels)
+    ? labels
+    : typeof labels === "string" ? labels.split(",") : [];
+  const out = { isDeployApproval: false, pipeline: null, executionId: null };
+  for (const raw of list) {
+    const l = String(raw ?? "").trim().toLowerCase();
+    if (!l) continue;
+    if (DEPLOY_APPROVAL_LABEL_RE.test(l)) { out.isDeployApproval = true; continue; }
+    const p = DEPLOY_PIPELINE_LABEL_RE.exec(l);
+    if (p) { out.pipeline = out.pipeline || p[1]; continue; }
+    const e = DEPLOY_EXEC_LABEL_RE.exec(l);
+    if (e) out.executionId = out.executionId || e[1];
+  }
+  return out;
+}
+
+/**
+ * The kicker enum for a gate ping, in ONE place so the request-time page
+ * (scanReviewGates) and the business-hours reminder (repageIfWindowOpened) can
+ * never disagree about what a gate IS: the deploy-approval label wins, then the
+ * escalation title, then the phase/title table (gateKindOf, unchanged).
+ * @param {string|undefined} gate      notif.gate (the review-package phase)
+ * @param {string} title               the gate ticket's title
+ * @param {object|null|undefined} gateTicket  the gate ticket, for its labels
+ * @returns {string} a key of APPROVAL_KICKERS
+ */
+function gateKindFor(gate, title, gateTicket) {
+  if (parseDeployApprovalLabels(gateTicket?.labels).isDeployApproval) return "deploy-pipeline";
+  if (ESCALATION_GATE_TITLE.test(String(title || ""))) return "escalation";
+  return gateKindOf(gate, title);
+}
+
+/**
+ * The watched deploy target whose pipeline the `pipeline:` label names, from the
+ * SAME allow-list the pipeline poller uses (loadDeployTargets → the CD
+ * registry). A label naming an unregistered pipeline resolves to nothing: the
+ * registry is the allow-list, and a ticket label is not a way around it.
+ */
+async function deployTargetNamed(pipeline) {
+  if (!pipeline) return null;
+  const want = String(pipeline).toLowerCase();
+  const targets = await loadDeployTargets();
+  return targets.find((t) => String(t.pipeline).toLowerCase() === want) || null;
+}
+
+/**
+ * Is this gate ticket THE deploy decision, and against which target? null for
+ * every other gate — so an unlabelled gate reaches not one CodePipeline call.
+ * Never throws: a registry read problem must not cost the gate its ping/tap.
+ */
+async function deployApprovalGate(gateTicket) {
+  const labels = parseDeployApprovalLabels(gateTicket?.labels);
+  if (!labels.isDeployApproval) return null;
+  let target = null;
+  try {
+    target = await deployTargetNamed(labels.pipeline);
+    if (!target) {
+      console.warn(`[telegram-bug-intake] deploy-approval gate names pipeline "${labels.pipeline || "(none)"}" which no CD-registry entry watches`);
+    }
+  } catch (err) {
+    console.warn(`[telegram-bug-intake] deploy target lookup for "${labels.pipeline}": ${err.message}`);
+  }
+  return { ...labels, target };
+}
+
+/** Every ManualApproval action currently holding a wait on this pipeline. */
+function pendingApprovals(state) {
+  const out = [];
+  for (const stage of state?.stageStates || []) {
+    for (const action of stage.actionStates || []) {
+      const ex = action.latestExecution || {};
+      if (ex.token && ex.status === "InProgress") {
+        out.push({
+          stageName: stage.stageName,
+          actionName: action.actionName,
+          token: ex.token,
+          executionId: ex.pipelineExecutionId || null,
+        });
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * The commit this execution is deploying: the revision recorded against an
+ * action state of the SAME execution, else the execution's own artifact
+ * revision. Best-effort — the brief is enrichment, never a gate blocker, and a
+ * revision from a DIFFERENT execution would describe the wrong commit.
+ */
+async function executionRevision(cp, state, pipeline, executionId) {
+  const actions = (state?.stageStates || []).flatMap((s) => s.actionStates || []);
+  const sameExec = actions.find((a) =>
+    a.currentRevision?.revisionId &&
+    (!executionId || a.latestExecution?.pipelineExecutionId === executionId));
+  if (sameExec) return sameExec.currentRevision.revisionId;
+  if (!executionId) return actions.map((a) => a.currentRevision?.revisionId).find(Boolean) || null;
+  try {
+    const out = await cp.send(new GetPipelineExecutionCommand({
+      pipelineName: pipeline, pipelineExecutionId: executionId,
+    }));
+    return (out?.pipelineExecution?.artifactRevisions || [])
+      .map((r) => r.revisionId).find(Boolean) || null;
+  } catch (err) {
+    console.warn(`[telegram-bug-intake] execution ${executionId} revision lookup: ${err.message}`);
+    return null;
+  }
+}
+
+/**
+ * The same "what's shipping" brief the pipeline's own 🚀 page carries, for a
+ * deploy-approval gate ticket. Best-effort per field and never throws: a
+ * CodePipeline or GitHub hiccup must still page the human, just with today's
+ * plain gate content under the 🚀 kicker.
+ */
+async function deployApprovalBrief(deploy) {
+  if (!deploy?.target) return null;
+  try {
+    const cp = codepipelineFor(deploy.target.region, deploy.target.roleArn, deploy.target.externalId);
+    const state = await cp.send(new GetPipelineStateCommand({ name: deploy.target.pipeline }));
+    const sha = await executionRevision(cp, state, deploy.target.pipeline, deploy.executionId);
+    return await buildDeployBrief(sha, deploy.target.repo);
+  } catch (err) {
+    console.warn(`[telegram-bug-intake] deploy-approval gate brief failed: ${err.message}`);
+    return null;
+  }
+}
+
+// The ask on a deploy-approval gate: the buttons are the review-gate pair, but
+// the decision is the irreversible production act.
+const DEPLOY_GATE_ASK =
+  "This releases the pipeline's production deploy gate — the merge is already approved. " +
+  "Approve to ship, or Request changes to stop it.";
+const DEPLOY_GATE_TERSE =
+  "The build passed every gate and is waiting on you to ship it to prod.";
+
+// A superseded build has to be cleared off the gate before this execution can
+// reach it; CodePipeline needs a moment to move. 3 tries at ~10s ≈ 30s.
+const DEPLOY_GATE_RETRY_TRIES = 3;
+let _deployGateRetryMs = 10_000;
+/** Test seam (same convention as _resetBusinessWindowForTests): shorten the wait. */
+export function _setDeployGateRetryMsForTests(ms) {
+  _deployGateRetryMs = Number.isFinite(ms) && ms >= 0 ? ms : 10_000;
+}
+
+/**
+ * Record the human's decision on the PIPELINE for a gate:deploy-approval
+ * ticket. Returns true only when CodePipeline really took it — the caller
+ * transitions the ticket only then, so any failure leaves the gate exactly as
+ * it was and the tap can be retried.
+ *
+ * Approval TOKENS never leave this function: they are scrubbed out of anything
+ * user-visible, and only their presence is ever reported.
+ */
+async function decideDeployGate(cb, chatId, ticketId, deploy, approve) {
+  const secrets = new Set();
+  const scrub = (s) => {
+    let t = String(s ?? "");
+    for (const v of secrets) if (v) t = t.split(v).join("[REDACTED]");
+    return t;
+  };
+  try {
+    if (!deploy.target) {
+      throw new Error(`pipeline "${deploy.pipeline || "(unlabelled)"}" is not watched by any CD-registry entry`);
+    }
+    const name = deploy.target.pipeline;
+    const cp = codepipelineFor(deploy.target.region, deploy.target.roleArn, deploy.target.externalId);
+    const readGate = async () => {
+      const waits = pendingApprovals(await cp.send(new GetPipelineStateCommand({ name })));
+      for (const w of waits) secrets.add(w.token);
+      const mine = deploy.executionId
+        ? waits.find((w) => w.executionId === deploy.executionId) || null
+        : waits[0] || null;
+      return { mine, holder: mine ? null : waits[0] || null };
+    };
+
+    let { mine, holder } = await readGate();
+    // A DIFFERENT execution is parked at the gate — an older build the human is
+    // not looking at. Reject THAT one, then wait for this execution to arrive.
+    if (!mine && holder && deploy.executionId) {
+      await tgAnswer(cb.id,
+        `An older build (${holder.executionId || "unknown"}) holds the gate; rejecting it first.`).catch(() => {});
+      await cp.send(new PutApprovalResultCommand({
+        pipelineName: name, stageName: holder.stageName, actionName: holder.actionName,
+        token: holder.token,
+        result: { status: "Rejected", summary: `Superseded by ${deploy.executionId}` },
+      }));
+      for (let i = 0; i < DEPLOY_GATE_RETRY_TRIES && !mine; i++) {
+        await sleep(_deployGateRetryMs);
+        ({ mine } = await readGate());
+      }
+    }
+    if (!mine) {
+      throw new Error(`no approval action is waiting for execution ${deploy.executionId || "(unlabelled)"} on ${name}`);
+    }
+    await cp.send(new PutApprovalResultCommand({
+      pipelineName: name, stageName: mine.stageName, actionName: mine.actionName,
+      token: mine.token,
+      result: {
+        status: approve ? "Approved" : "Rejected",
+        summary: `${approve ? "Approved" : "Rejected"} via Telegram by chat ${chatId} (gate ${ticketId})`,
+      },
+    }));
+    return true;
+  } catch (err) {
+    console.error(`[telegram-bug-intake] deploy gate ${ticketId} (${deploy.pipeline || "?"})`, scrub(err.message));
+    await tgAnswer(cb.id, `Could not ${approve ? "approve" : "reject"} the deploy — nothing changed.`).catch(() => {});
+    const body =
+      `${cb.message.text}\n\n⚠️ ${esc(scrub(err.name || "Error"))}: ${esc(scrub(err.message || ""))}\n` +
+      `The pipeline was NOT ${approve ? "approved" : "rejected"} and ${esc(ticketId)} is untouched — tap again to retry.`;
+    await tgEdit(chatId, cb.message.message_id, body.slice(0, 4000)).catch(() => {});
+    return false;
+  }
+}
+
 // ─── Working-hours gate paging (TEAM-4453 D3) ────────────────────────────────
 // A gate page fires the moment the gate opens, including 02:00 on a Saturday.
 // Two things follow from that: (1) every page is tagged with business-hours
@@ -1183,7 +1425,9 @@ async function repageIfWindowOpened(wf, notif, w) {
     const { attempt, previousIssue } = await approvalAttempt({ wf, notif, tickets });
     const { delivered } = await sendApprovalPing(chats, {
       label: "business-hours reminder",
-      gateKind: ESCALATION_GATE_TITLE.test(title) ? "escalation" : gateKindOf(notif.gate, title),
+      // Shared classification (TEAM-4706): a deploy-approval gate reminds with
+      // the same 🚀 kicker it paged with, without a second rule living here.
+      gateKind: gateKindFor(notif.gate, title, gateTicket),
       repage: true,
       subject: wf.input?.title || wf.workflowId,
       summary: "Sent for review outside working hours and still open — your window is open now.",
@@ -1270,6 +1514,14 @@ async function scanReviewGates() {
       const reviewer = notif.reviewer || "reviewer";
       const isEscalation = ESCALATION_GATE_TITLE.test(title);
       const ticketLink = `🎫 [${notif.ticketId}](https://${JIRA_SITE_URL}/browse/${notif.ticketId})`;
+      // TEAM-4706: the LABEL decides. A gate:deploy-approval ticket IS the
+      // production-deploy decision, so it pages with the 🚀 kicker and the same
+      // brief the pipeline's own page carries — its ✅ really approves the
+      // pipeline (handleGateCallback). Both are best-effort: neither the target
+      // lookup nor the brief throws, so a registry/GitHub/CodePipeline hiccup
+      // still pages the human with today's plain gate content.
+      const deploy = await deployApprovalGate(gateTicket);
+      const brief = deploy ? await deployApprovalBrief(deploy) : null;
       // WHAT is being reviewed: the upstream work this gate blocks on, else the
       // work the run has already landed a PR for. Never the gate's own prose.
       const shipping = upstreamTitles.length ? upstreamTitles : shippedTitles(wf, allTickets);
@@ -1303,6 +1555,9 @@ async function scanReviewGates() {
         text: "📱 Open approval in hub",
         url: `${HUB_API_URL}/workflow?id=${encodeURIComponent(wf.workflowId)}&ticket=${encodeURIComponent(notif.ticketId)}`,
       }]);
+      // Same links the pipeline's own 🚀 page offers: what is actually shipping.
+      if (brief?.prUrl) keyboard.inline_keyboard.push([{ text: "🔗 View PR", url: brief.prUrl }]);
+      else if (brief?.commitUrl) keyboard.inline_keyboard.push([{ text: "🔗 View commit", url: brief.commitUrl }]);
       for (const l of (Array.isArray(notif.links) ? notif.links : []).slice(0, 4)) {
         if (!l || !l.label) continue;
         const url = l.url
@@ -1313,23 +1568,43 @@ async function scanReviewGates() {
         if (url) keyboard.inline_keyboard.push([{ text: `📄 ${l.label}`.slice(0, 60), url }]);
       }
 
+      const deployMeta = deploy
+        ? [
+            deploy.target?.pipeline ? `🏷 ${esc(deploy.target.pipeline)}` : "",
+            deploy.target?.repo ? `📦 ${esc(deploy.target.repo)}` : "",
+          ].filter(Boolean)
+        : [];
       const { delivered } = await sendApprovalPing(chats, {
-        label: "gate",
-        gateKind: isEscalation ? "escalation" : gateKindOf(notif.gate, title),
-        subject: wf.input?.title || wf.workflowId,
-        shipping,
-        summary: isEscalation
-          ? (oneLine(notif.summary) || "The ship-review loop hit its round cap and needs a human call.")
-          : oneLine(notif.summary),
-        bullets: Array.isArray(notif.bullets) ? notif.bullets : [],
+        label: deploy ? "deploy-approval gate" : "gate",
+        gateKind: gateKindFor(notif.gate, title, gateTicket),
+        subject: (brief && (brief.prTitle || brief.commitSubject)) || wf.input?.title || wf.workflowId,
+        // With a brief the subject already names the PR/commit; the upstream
+        // titles would only repeat it.
+        shipping: brief ? [] : shipping,
+        summary: deploy
+          ? (brief?.summary || oneLine(notif.summary) || DEPLOY_GATE_TERSE)
+          : isEscalation
+            ? (oneLine(notif.summary) || "The ship-review loop hit its round cap and needs a human call.")
+            : oneLine(notif.summary),
+        bullets: brief
+          ? [
+              brief.workflowLine,                               // "Workflow: TEAM-3721 (bug-fix)"
+              brief.scopeLine,                                  // "Scope: 8 files (+147/-4)"
+              brief.commitLine && brief.commitLine.replace(/`/g, ""), // "Commit: a1b2c3d"
+            ].filter(Boolean)
+          : Array.isArray(notif.bullets) ? notif.bullets : [],
         attempt,
         previousIssue,
-        meta: isEscalation
-          ? [`👤 ${esc(reviewer)}`, ticketLink]
-          : [`👤 ${esc(reviewer)}`, ticketLink, "⏸ pipeline paused on you"],
-        ask: isEscalation
-          ? "Pick ONE decision below — it is recorded as a DECISION line and the release manager resumes on its own."
-          : "Approve to continue, or Request changes to send it back.",
+        meta: deploy
+          ? [`👤 ${esc(reviewer)}`, ...deployMeta, ticketLink, "⏸ pipeline paused on you"]
+          : isEscalation
+            ? [`👤 ${esc(reviewer)}`, ticketLink]
+            : [`👤 ${esc(reviewer)}`, ticketLink, "⏸ pipeline paused on you"],
+        ask: deploy
+          ? DEPLOY_GATE_ASK
+          : isEscalation
+            ? "Pick ONE decision below — it is recorded as a DECISION line and the release manager resumes on its own."
+            : "Approve to continue, or Request changes to send it back.",
         keyboard,
       });
       // The claim was written before delivery was proven; if every send failed,
@@ -1567,6 +1842,15 @@ async function handleGateCallback(cb, chatId, action, ticketId, workflowId) {
     return;
   }
   if (action === "gok") {
+    // TEAM-4706: on a gate:deploy-approval ticket the PIPELINE moves first —
+    // this ✅ used to transition Jira only, leaving CodePipeline parked (a
+    // release stalled 29h on 2026-09-14). One fetch, and it never throws; an
+    // unlabelled gate reaches not one CodePipeline call and behaves as before.
+    const { gateTicket: approving } = await gateTicketOf({ workflowId }, { ticketId });
+    const deploy = await deployApprovalGate(approving);
+    // Failure already answered + edited the message; the ticket stays put so
+    // the human can tap again once the cause is fixed.
+    if (deploy && !(await decideDeployGate(cb, chatId, ticketId, deploy, true))) return;
     const res = await transitionGate(workflowId, ticketId, "done", `Approved via Telegram by chat ${chatId}`);
     // A ❌ tapped by mistake before this ✅ left a marker that would turn the
     // chat's next message into a rework note for a gate that is now done.
@@ -1599,6 +1883,11 @@ async function handleGateCallback(cb, chatId, action, ticketId, workflowId) {
     await tgAnswer(cb.id, "Already approved — nothing to reject.");
     return;
   }
+  // TEAM-4706: on a deploy-approval gate the pipeline is STOPPED first, from the
+  // fetch above (no second call), and only then does the ticket half run. A
+  // failed rejection leaves the ticket untouched, exactly like the ✅ path.
+  const rejecting = await deployApprovalGate(gateTicket);
+  if (rejecting && !(await decideDeployGate(cb, chatId, ticketId, rejecting, false))) return;
   // Request changes: the ticket needs a rework note. Park the intent; the
   // chat's next plain message — or a reply to this ping, any time — becomes
   // the note (resolveReworkTarget → deliverReworkNote).
