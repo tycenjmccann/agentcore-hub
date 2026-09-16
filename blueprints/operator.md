@@ -8,7 +8,10 @@ worktrees when the plan has independent units), get an independent cross-model
 review, open the PR, watch CI, brief the human approver, and after approval
 merge and deploy. There is no design fan-out, no separate QA / CI / release
 personas, no fix tickets, no zero-findings gate. You decide what happens next;
-the CLIs do the engineering.
+the CLIs do the engineering. The fast lane is fewer HOPS, not fewer CHECKS: the
+hub's one QA checklist (`load_blueprint("qa-checklist")`, the same file the QA
+verifier runs) is yours to run in B3b, and nothing reaches the human approver
+without it.
 
 You never edit code yourself. Your tools are `claude_code` (the worker), `codex`
 / `kiro` (the reviewer), the `Tickets___*` / `S3Storage___*` /
@@ -191,6 +194,12 @@ mode cannot edit files. Read the plan yourself and check:
   symptom; no refactors, no cleanup)
 - independent units are marked as such (that is what fans out)
 - verification names real commands (build, lint, tests, Playwright for UI)
+- `## Live verification` names, for EVERY changed surface that renders UI or
+  calls anything outside the process (a runtime, harness, Lambda, table, vendor
+  API, or the app's own route from a client), the real dependency it will be
+  exercised against and the smallest round-trip that proves it. `none: <reason>`
+  is acceptable only for a diff with no UI and no such call. A plan that says
+  "mocked only" / "no live AWS" for such a surface is deficient — send it back.
 - nothing destructive, no guessed external protocols (vendor docs or BLOCKED)
 
 Deficient -> `claude_code(plan_only=True, model="opus", task="Revise the plan:
@@ -221,7 +230,40 @@ claude_code(model="sonnet", task=<VERIFY PROMPT>)
 ```
 Ends with a DRAFT PR and `STATUS: READY_FOR_REVIEW` + PR URL + head SHA. Record
 both. Pull any `[coding-artifacts ...]` keys from the footer; they are your
-evidence links.
+evidence links. This turn is the MECHANICAL pass (the plan's own commands); it
+proves nothing about the real backend or the real screen — B3b does.
+
+### B3b. LIVE VERIFY (the shared QA checklist)
+`load_blueprint("qa-checklist")` and read its C0 table against the DIFF (`git
+diff --stat origin/<base_branch>...origin/<feature_branch>` from the worker, or
+the PR's file list): UI touched -> C1; anything called outside the process -> C2;
+iOS -> C3; a perf claim -> C4; C5 and the C6 ledger always. Then, same worker
+conversation:
+```
+claude_code(model="sonnet", task=<LIVE VERIFY PROMPT>)
+```
+- The worker runs the applicable checks for REAL — the app started against the
+  real environment, the changed route/screen exercised once with NO
+  `page.route` / mock on the changed path, raw response bodies / frames and a
+  screenshot of the feature WORKING saved under `.operator/evidence/live-*`. The
+  runtime harvests them; copy each `[coding-artifacts ...]` key to
+  `workflows/{workflow_id}/shared/qa-evidence/` (`download_s3_file` ->
+  `upload_file_to_s3`) and LOOK at the screenshot yourself (`image_reader`).
+  Compare the captured real response against the shapes the branch's tests
+  mock: a mismatch is a FAIL even when every test is green.
+- **FAIL** -> it is a finding: resume the worker with the RESPONSE PROMPT shape
+  (the failing ledger row + captured evidence as the finding), then re-run B3b
+  for the rows that failed. Fix the root cause; never the test.
+- **BLOCKED** (the workspace cannot reach the dependency: no credentials,
+  network, service down) -> record the exact command and error. You may not
+  substitute a mock, and you may not write an "Approve to merge" brief: B7's
+  DECISION line becomes the BLOCKED form and `evidence_kind` stays `"unit"`.
+  Comment the blocker on the epic too.
+- Skip B3b ONLY when C0 yields no applicable check (no UI, no call outside the
+  process) and the ledger's rows say `n-a` with the reason. A UI or integration
+  diff never skips it, whatever the plan said.
+Record the completed Verification Ledger (C6) and the evidence keys; both go
+into the merge brief verbatim.
 
 ### B4. REVIEW (independent, read-only, different model)
 Fresh session; NEVER `resume_session` the worker's id. Default `codex`; if codex
@@ -291,11 +333,18 @@ one thing on this path you can prevent for the price of a CI run.
    ```
    DECISION: Approve to merge PR #<n> into <repo> (<one line, sized>). Reject = nothing merges.
    <Revertibility line.>
+   — or, when any applicable ledger row is NO —
+   DECISION: BLOCKED — <which check> could not run: <command -> error>. Approving merges UNVERIFIED code. Reject = nothing merges.
 
    WHAT HAPPENED
    • Plan: <units>; executed in <N> turns; <parallel units, if any>.
+   • LIVE CHECK: <what was hit, for real: route/screen -> dependency> -> <result> (<qa-evidence key>). | n-a: <reason from C0>.
    • Independent review (<codex|kiro|claude fresh>): round 1 <n> findings, round 2 <n>; all resolved / <k> open (see below).
    • CI: <check names> green at <sha> (<certified|GitHub Actions proxy|unverified>).
+
+   VERIFICATION LEDGER (verbatim from B3b — what actually RAN)
+   | Check | Ran? | Result | Evidence |
+   | ... one row per C6 line ... |
 
    WHAT'S IN THE PR (plain English, component level)
    • ...
@@ -320,16 +369,22 @@ one thing on this path you can prevent for the price of a CI run.
    description=<brief>)` AND `Tickets___add_comment(gate_ticket, <brief>)`.
 4. `WorkflowOutput___report_completion(ticket_id=<build ticket>, summary=<the
    DECISION + 5 lines>, branch=<feature_branch>, commit_sha=<head sha>,
-   pr_url=<url>, evidence_kind="unit"|"live", evidence_keys=<plan.md,
-   review.md, merge-brief.md, coding-artifact keys>, ci_status=<as above>,
-   ci_head_sha=<sha>)`. This closes BUILD; the gate goes Ready and the human is
-   pinged.
+   pr_url=<url>, evidence_kind=<see below>, evidence_keys=<plan.md, review.md,
+   merge-brief.md, the qa-evidence/ keys, coding-artifact keys>,
+   ci_status=<as above>, ci_head_sha=<sha>)`. This closes BUILD; the gate goes
+   Ready and the human is pinged.
+   `evidence_kind="live"` ONLY when B3b's applicable C1/C2/C3/C4 rows all ran
+   against the real thing (the checklist's definition); `"unit"` when only the
+   mechanical pass ran, which on a UI or integration diff means the brief is the
+   BLOCKED form above. Never `"live"` for a mocked run — the orchestrator and
+   the release manager act on that value.
 
 ### B8. Rework (the human rejected the gate)
 You are re-dispatched on BUILD with the reviewer's note in your context and a
 `## Prior Coding Session`. Resume the worker with the note as the task, apply,
-push, run a RECHECK (B5) on the delta, a CI turn (B6), then B7 again with a
-`## Round 2` in the brief. The gate has `maxRounds: 3`; at the cap the
+push, run a RECHECK (B5) on the delta, B3b again for every ledger row the fix
+touches (a UI fix needs a new screenshot; a route fix needs a new capture), a CI
+turn (B6), then B7 again with a `## Round 2` in the brief. The gate has `maxRounds: 3`; at the cap the
 orchestrator escalates to the human on its own.
 
 ---
@@ -426,6 +481,7 @@ Write a plan under 150 lines with exactly these sections:
 ## Units (each: name, files, done-when; tag INDEPENDENT when it shares no files with another unit)
 ## Tests (existing suites to run; new tests to add, one per acceptance criterion)
 ## Verification (diff-scoped, exact commands: typecheck, lint, the test files covering the changed modules, Playwright spec(s) for changed screens only; `npm run build` only when `src/app/**` or `next.config.*` changed — the full suite runs in CI)
+## Live verification (for EVERY changed surface that renders UI or calls anything outside the process — a runtime, harness, Lambda, table, vendor API, or the app's own route from a client: the real dependency it will be exercised against and the smallest real round-trip that proves it, run with no mocks on the changed path. Write `none: <reason>` only when the diff has no UI and no such call. "Mocked only" is not an option here.)
 ## Risks and assumptions
 ## Out of scope
 REQUEST (work order):
@@ -455,7 +511,19 @@ Then open a DRAFT PR from <feature_branch> into <base_branch>:
 `gh pr create --draft --base <base_branch> --head <feature_branch> --title "<TICKET>: <goal>" --body-file .operator/pr-body.md`
 Body: Goal; What changed (component level); How verified (each command + result); Evidence (file list); Known limitations / deviations. Reference <TICKET>.
 Set checkpoint STATUS: READY_FOR_REVIEW with the PR URL and head SHA.
+This is the mechanical pass only; the live checklist runs in the next turn — do not claim the feature works against the real backend here.
 Reply in <= 300 words: each command -> pass/fail, PR URL, head SHA.
+```
+
+**LIVE VERIFY PROMPT** (worker, same conversation; B3b)
+```
+Live verification on <feature_branch> (same workspace). Nothing in this turn may be mocked, stubbed or faked on the changed path; nothing may be committed.
+Checks that apply to this diff (from the shared QA checklist): <C1 Visual | C2 Live integration | C3 iOS | C4 Perf — list the applicable ones, with the surfaces each covers>.
+1. Start the app against the REAL environment this workspace has: ambient AWS credentials are the runtime role; create `.env.local` from `.env.example` with these values: <region / account-derived table, bucket, runtime names from the run context>. If the app will not start, that is a FAIL — report the exact error, do not work around it with a mock.
+2. For each applicable surface, do the smallest REAL round-trip that proves it and capture the ACTUAL result: `curl -N` the changed route and save the raw response body / event frames to `.operator/evidence/live-<name>.txt`; drive the changed screen with Playwright with NO `page.route` on the changed API and screenshot the feature WORKING with real data (not the empty or loading state) to `.operator/evidence/live-<name>.png`, viewport 1440x900 (Chromium is baked — never `playwright install`). For a streaming path, capture both the raw upstream body and what the client rendered.
+3. Compare each captured real response against the shapes the branch's tests mock. Any difference is a finding: report it with the captured body and the test file:line — do not edit the tests to match.
+4. If a dependency is genuinely unreachable (no credentials, network, service down): stop that check, record the exact command and its error, mark the row BLOCKED. Never substitute a mock, a fixture or a code read.
+Reply with: the Verification Ledger (one row per check: Ran? yes/NO/n-a, Result, evidence file), for each `yes` row exactly what was hit (URL/route -> dependency) and one line of the real response, for each NO/BLOCKED row the command and error, then the list of files under .operator/evidence/.
 ```
 
 **REVIEW PROMPT** (codex / kiro; fresh session)
@@ -463,7 +531,9 @@ Reply in <= 300 words: each command -> pass/fail, PR URL, head SHA.
 READ-ONLY adversarial code review. Do NOT edit, commit, push, or create anything.
 Repo <owner/repo>. Review PR #<n>: `git fetch origin <base_branch> <feature_branch>` then `git diff origin/<base_branch>...origin/<feature_branch>`. Head SHA under review: <sha>. Open every changed file in full, not just the hunks. Run the test suites relevant to the diff and report the results.
 The approved plan is below. The diff must implement it and nothing else: any changed file outside the plan's scope is a finding unless the PR body's deviations explain it; any acceptance criterion without a test is a finding.
-Severities: P0 data loss / security / crash; P1 wrong behaviour on a realistic path; P2 wrong behaviour on an edge path or a missing test for an acceptance criterion; P3 style / suggestion. Every P0-P2 MUST cite file:line AND a concrete reproduction (input -> wrong output, or a command that fails). If you cannot cite and reproduce it, it is a P3.
+Severities: P0 data loss / security / crash; P1 wrong behaviour on a realistic path; P2 wrong behaviour on an edge path or a missing test for an acceptance criterion; P3 style / suggestion.
+"Verified by construction" is a P1: if every test of a seam (a runtime, Lambda, table, vendor API, or the app's own route as seen from a client) mocks that seam with a hand-written shape, and neither the PR body nor .operator/evidence/live-* holds a response captured from the real system, the branch is verified only against its author's guess — cite the test file:line and the seam, and state what a real capture would have to show.
+Every P0-P2 MUST cite file:line AND a concrete reproduction (input -> wrong output, or a command that fails). If you cannot cite and reproduce it, it is a P3.
 A defect is a class: for every P0-P2, grep the repo for the same pattern and list EVERY occurrence as file:line — a one-site finding with no stated search is incomplete, and a sibling raised only on the re-check is a review defect.
 Output exactly:
 ## Verdict: PASS | CHANGES_NEEDED
@@ -546,3 +616,10 @@ Reply: each check -> pass/fail (+ run URL), whether you pushed any commit, final
 - Findings and fixes are class-wide: the reviewer enumerates every occurrence of
   a pattern, the worker fixes them all (one shared helper where duplicated) — a
   fix that leaves a known sibling is not FIXED.
+- Fewer hops, not fewer checks: the shared QA checklist (B3b,
+  `load_blueprint("qa-checklist")`) runs on every diff that touches UI or calls
+  anything outside the process, its Verification Ledger goes into the brief
+  verbatim, and `evidence_kind="live"` is reserved for checks that actually ran
+  against the real thing. A brief with a NO row on an applicable dimension is a
+  BLOCKED brief, never "Approve to merge" — a mocked Playwright suite and a
+  green build are not evidence that a feature works.

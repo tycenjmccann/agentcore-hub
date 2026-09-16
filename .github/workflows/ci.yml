@@ -76,6 +76,15 @@ jobs:
       - name: Blueprint main-sync parity guard
         run: ./scripts/check-blueprint-main-sync.sh
 
+      # The hub has ONE verification standard, blueprints/qa-checklist.md, loaded
+      # via load_blueprint by the QA verifier AND the operator. wf_1789180719970_e7fdjx
+      # shipped Agent Chat with 96 mocked tests and never rendered a reply because
+      # the operator path had no checklist at all. This guard keeps the checklist's
+      # mandatory checks intact, keeps both loaders pointing at it, and refuses a
+      # persona blueprint that re-inlines (and so forks) the rules.
+      - name: QA-checklist parity guard
+        run: ./scripts/check-qa-checklist-parity.sh
+
       # TEAM-4337: cd-registry.mjs is byte-copied (never imported) into the
       # pipeline-tools Lambda and the Telegram bridge, since each ships as a
       # self-contained zip built from its own dir. A drifted copy is a silent
