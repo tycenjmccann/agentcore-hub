@@ -218,7 +218,11 @@ try {
 
 // Attach inline policy. DynamoDB statement is only needed for the dynamodb
 // provider; both providers need CloudWatch Logs and S3 read for the agent
-// roster artifact.
+// roster artifact — and, since TEAM-4706 (DL-029), for the HeadObject on
+// completions/<ticket_id>.json behind the ship-phase Done gate: a ship ticket
+// cannot be closed without its completion record. The same
+// `s3:GetObject` on the artifact bucket authorises both reads, so no extra
+// statement is needed here.
 const policyStatements = [
   {
     Effect: "Allow",
