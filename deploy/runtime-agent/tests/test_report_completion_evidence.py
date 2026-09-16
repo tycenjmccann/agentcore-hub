@@ -208,3 +208,87 @@ def test_block_reason_rides_with_a_blocked_outcome():
 def test_ship_verdict_fields_omitted_keep_the_pre_4121_payload():
     _, payload = _payload(merge_commit="", outcome="   ", block_reason="")
     assert payload == PRE_4121_PAYLOAD
+
+
+# ─── TEAM-4708: pipeline_execution_id / pipeline_name reach the Lambda ────────
+#
+# PR #618 taught the workflow-output Lambda to REFUSE outcome="shipped" without
+# `pipeline_execution_id` on the pipeline path, but never added the parameter to
+# this tool — so no agent could satisfy the rail and the live release manager got
+# `shipped_requires_execution_and_merge_commit, missing ["pipeline_execution_id"]`
+# with no way to comply. These tests pin the two names to the ones
+# lambda/workflow-output/index.mjs destructures; a rename on either side fails
+# here instead of at ship time.
+
+EXECUTION_ID = "b7f3c0de-1a2b-4c3d-8e9f-0a1b2c3d4e5f"
+
+
+def test_pipeline_execution_id_and_name_forwarded():
+    _, payload = _payload(
+        merge_commit="2c4781221b41a10974d564da9a27e50004c800dd",
+        outcome="shipped",
+        pipeline_execution_id=EXECUTION_ID,
+        pipeline_name="hub-agentcore-hub-deploy",
+    )
+    assert payload["pipeline_execution_id"] == EXECUTION_ID
+    assert payload["pipeline_name"] == "hub-agentcore-hub-deploy"
+    # the pair the shipped rail needs travels together with the merge commit
+    assert payload["merge_commit"] == "2c4781221b41a10974d564da9a27e50004c800dd"
+    assert payload["outcome"] == "shipped"
+
+
+def test_pipeline_fields_trimmed():
+    _, payload = _payload(
+        pipeline_execution_id=f"  {EXECUTION_ID}  ",
+        pipeline_name="  hub-agentcore-hub-deploy  ",
+    )
+    assert payload["pipeline_execution_id"] == EXECUTION_ID
+    assert payload["pipeline_name"] == "hub-agentcore-hub-deploy"
+
+
+def test_malformed_execution_id_still_forwarded_for_lambda_side_rejection():
+    """The harness does not own the execution-id shape check — the Lambda's
+    PIPELINE_EXECUTION_ID_RE does, and it must stay the one place that drops, so
+    the same rule applies from a runtime agent or a gateway. Silently swallowing
+    it here would turn a loud refusal into a report with no execution at all."""
+    _, payload = _payload(pipeline_execution_id="not-a-uuid")
+    assert payload["pipeline_execution_id"] == "not-a-uuid"
+
+
+def test_pipeline_name_alone_is_forwarded_without_an_execution_id():
+    """This is the combination that MUST reach the Lambda unaltered: naming the
+    pipeline is what proves the run took the pipeline path, so the rail can
+    demand the execution id instead of excusing it as a legacy DEPLOY.md ship."""
+    _, payload = _payload(outcome="shipped", pipeline_name="hub-agentcore-hub-deploy")
+    assert payload["pipeline_name"] == "hub-agentcore-hub-deploy"
+    assert "pipeline_execution_id" not in payload
+
+
+def test_pipeline_fields_omitted_keep_the_pre_4121_payload():
+    _, payload = _payload(pipeline_execution_id="", pipeline_name="   ")
+    assert payload == PRE_4121_PAYLOAD
+
+
+def test_tool_signature_exposes_the_two_ship_contract_params():
+    """The defect in #618 was a missing PARAMETER, not missing forwarding: the
+    body could never run because Strands would reject the keyword argument. Pin
+    the signature itself."""
+    import inspect
+
+    fn, _ = _report_completion()
+    params = inspect.signature(fn).parameters
+    for name in ("pipeline_execution_id", "pipeline_name"):
+        assert name in params, f"{TOOL_NAME} has no {name} parameter"
+        assert params[name].default == "", f"{name} must default to \"\" (absent stays absent)"
+
+
+def test_lambda_side_destructures_exactly_these_names():
+    """Parity with the consumer: lambda/workflow-output/index.mjs is the only
+    reader, and a name that does not match is a field the rail cannot see."""
+    lambda_src = (
+        MAIN_PY.resolve().parent.parent.parent / "lambda" / "workflow-output" / "index.mjs"
+    ).read_text()
+    for name in ("pipeline_execution_id", "pipeline_name"):
+        assert f"{name} }}" in lambda_src or f"{name}," in lambda_src, (
+            f"workflow-output Lambda no longer destructures {name}"
+        )
