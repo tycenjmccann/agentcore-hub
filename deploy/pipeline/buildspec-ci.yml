@@ -123,6 +123,10 @@ phases:
       # file at a time and cannot include each other. Mirrors ci.yml's "Blueprint
       # main-sync parity guard" step.
       - "./scripts/check-blueprint-main-sync.sh"
+      # One verification standard (blueprints/qa-checklist.md) loaded by the QA
+      # verifier and the operator; a persona blueprint may not re-inline it.
+      # Mirrors ci.yml's "QA-checklist parity guard" step.
+      - "./scripts/check-qa-checklist-parity.sh"
       # TEAM-4337: cd-registry.mjs is byte-copied into the pipeline-tools Lambda
       # and the Telegram bridge (each ships as a self-contained zip). Mirrors
       # ci.yml's "CD-registry parity guard" step.

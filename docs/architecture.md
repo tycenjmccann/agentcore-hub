@@ -856,6 +856,18 @@ One residual survives and is deliberately accepted: asymmetric wiring *plus* **d
 
 ---
 
+### DL-029: One Shared QA Checklist Blueprint (verification is not persona prose)
+
+**Date**: 2026-09-15
+**Decision**: The hub's verification standard lives in exactly one blueprint, `blueprints/qa-checklist.md`, which is not a persona. Any agent that has to decide "does this change actually work?" calls `load_blueprint("qa-checklist")` and runs the checks its C0 table says apply: C1 visual (UI), C2 live integration (anything called outside the process, including the app's own routes as seen from a client), C3 iOS gateway, C4 perf re-measure, C5 acceptance walk, C6 Verification Ledger + verdict semantics + `evidence_kind` meaning. The QA verifier runs it as its Steps 3-4; the operator runs it as B3b LIVE VERIFY before writing the merge brief. Persona blueprints may point at it and route its outcomes (fix tickets, worker findings) but may not restate its rules.
+**Status**: ACTIVE - shipped 2026-09-15; `scripts/check-qa-checklist-parity.sh` enforces it in CI.
+
+**Context**: `wf_1789180719970_e7fdjx` (operator def) shipped the run-modal Agent Chat (PR #558) with 96 mocked vitest cases and 5 mocked Playwright cases, and the feature never rendered a reply: the route forwarded raw Strands frames that the client did not parse. Every test mocked the runtime with a frame shape the runtime never emits, so the suite verified the code against its author's guess. Nine layers passed it - plan ("Playwright mocked, no live AWS"), unit, Playwright, the operator's verify turn (re-runs the plan's commands), two review rounds (read-only, same-family model after codex/kiro failed), hermetic CI, a 12-minute human gate, the deploy smoke, and the WM post-run analysis - and the completion record said `evidence_kind="unit"`. The rules that would have caught it in one `curl` existed, but only inside `blueprints/qa-verifier.md`, and the operator def dispatches no QA persona. The fast lane exists to remove hops between agents; it had also removed the checks, because the checks were written as one agent's process rather than as the hub's standard.
+
+**Mechanism**: the checklist is a plain blueprint served by `load_blueprint` like `review-package` and `release-manager` already are, so it needs no runtime change and takes effect on the deploy's `aws s3 sync blueprints/`. The operator's plan template gains a required `## Live verification` section ("mocked only" is not an option), a LIVE VERIFY PROMPT runs the applicable checks through the worker against the real environment with no `page.route`/mock on the changed path, the Verification Ledger is pasted into the merge brief verbatim, a NO row on an applicable dimension turns the brief's DECISION line into the BLOCKED form (the human is still paged - honestly - never asked to "Approve to merge" unverified code), and `evidence_kind="live"` is reserved for checks that ran against the real thing. The reviewer prompt treats "verified by construction" (a seam mocked with a hand-written shape and no real capture) as a P1.
+
+**Why a shared blueprint and not the orchestrator**: DL-009 - what counts as verified is agent judgement, not event routing; no new orchestrator code, no `*_MODE` flag. Why not duplicate the text into each persona (the Main-sync rule pattern, TEAM-4529): the Main-sync block is 14 lines and byte-compared; the checklist is ~200 lines of judgement that must evolve, and two copies of it is exactly how one persona ended up with none. The guard therefore checks the opposite property - that no persona re-inlines the checklist's headings - alongside "every loader still loads it".
+
 ### DL-012: System Prompts Baked at Deploy Time (Not Passed at Invocation)
 
 **Date**: 2026-05-19
