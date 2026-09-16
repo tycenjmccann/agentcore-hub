@@ -328,6 +328,11 @@ the approved SHA, which voids the approval and costs a second human gate — the
 one thing on this path you can prevent for the price of a CI run.
 
 ### B7. Merge brief + review package + report
+0. **Ledger source check.** If `load_blueprint("qa-checklist")` has not been
+   called in THIS invocation, call it now and go back to B3b: the ledger is
+   never written from memory. Its rows, their order and their labels are the
+   checklist's C6 rows (C5 is the acceptance walk, not the unit suite); a
+   ledger with invented rows or relabelled checks is a brief you may not send.
 1. `workflows/{workflow_id}/shared/merge-brief.md` (`S3Storage___write_object`,
    text/markdown), pyramid style, decision first:
    ```
@@ -530,8 +535,10 @@ ticket and never a detail in the title.
    approval covered exactly one SHA; a recovery commit is new production code
    and goes through the full loop again, never straight to merge:
    - Have the worker open a recovery PR against `base_branch` and run it through
-     B3 (verify) -> B4 (independent review) -> B5 -> B6 (CI) -> a recovery
-     merge brief at `shared/merge-brief-recovery-<n>.md`. No size exemption.
+     B3 (verify) -> B3b (live verify, the shared QA checklist) -> B4
+     (independent review) -> B5 -> B6 (CI) -> a recovery merge brief at
+     `shared/merge-brief-recovery-<n>.md`. No size exemption, no checklist
+     exemption: a recovery PR is production code like any other.
    - Create a human ticket `Merge Approval (recovery): {goal}` (assignee = the
      Merge Approval reviewer string, `blocked_by: ""`) carrying that brief, park
      the SHIP ticket `blocked` on it, and exit without `report_completion`.
