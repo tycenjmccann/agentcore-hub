@@ -10,6 +10,12 @@
  *   - get_state:      GetPipelineState + the latest execution's per-action
  *                     status/summary. The preflight "is a pipeline configured?"
  *                     check and the watch-to-terminal poll both use this.
+ *                     (TEAM-4706) It also answers WHOSE human approval the deploy
+ *                     gate is holding — `waitingOn.holdsGate` is "this" only when
+ *                     the parked execution is the caller's, so a blueprint files
+ *                     exactly one human gate ticket instead of duplicating another
+ *                     build's. Observational: presence of the approval token, never
+ *                     its value, and still no way to answer the gate.
  *   - start_deploy:   StartPipelineExecution. RM calls this after merging (the
  *                     GitHub push auto-trigger is not wired), and after a
  *                     build-failure fix lands, to re-run.
@@ -171,6 +177,9 @@ import {
   GetPipelineExecutionCommand,
   StartPipelineExecutionCommand,
   ListActionExecutionsCommand,
+  // TEAM-4706: used on ONE cold path only — resolving which newer execution took
+  // over from a Superseded one (findSupersedingExecution). Never on a poll.
+  ListPipelineExecutionsCommand,
 } from "@aws-sdk/client-codepipeline";
 import { S3Client, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
 import {
@@ -723,8 +732,13 @@ export const handler = async (event) => {
 // Lambda's own, because the marker lives in the one artifact bucket. The marker
 // read stays gated on ARTIFACT_BUCKET (no bucket → no S3 call at all); the status
 // does not, because it needs no bucket.
+//
+// It also returns `sourceRevision` — the commit this execution was started for,
+// already read here for the handoff key. TEAM-4706's superseded lookup needs it to
+// recognise the newer execution built from the SAME commit, and reading it from
+// this one call keeps that path at a single extra API call.
 async function executionSnapshot(pipelineName, pipelineExecutionId, cp) {
-  const none = { status: null, handoff: null };
+  const none = { status: null, handoff: null, sourceRevision: null };
   if (!pipelineExecutionId) return none;
   let sha = "";
   let status = null;
@@ -738,7 +752,7 @@ async function executionSnapshot(pipelineName, pipelineExecutionId, cp) {
     console.warn("get-pipeline-execution failed (non-fatal):", e.message);
     return none;
   }
-  if (!ARTIFACT_BUCKET || !sha) return { status, handoff: null };
+  if (!ARTIFACT_BUCKET || !sha) return { status, handoff: null, sourceRevision: sha || null };
   // The Build stage truncates the source revision to 12 chars for GIT_SHA, and
   // the Deploy stage keys the marker on that.
   const key = `pipeline-artifacts/handoff/${sha.slice(0, 12)}.txt`;
@@ -748,14 +762,60 @@ async function executionSnapshot(pipelineName, pipelineExecutionId, cp) {
     );
     const body = await obj.Body.transformToString();
     const files = body.split("\n").map((l) => l.trim()).filter(Boolean);
-    return { status, handoff: { sha: sha.slice(0, 12), files } };
+    return { status, handoff: { sha: sha.slice(0, 12), files }, sourceRevision: sha };
   } catch (e) {
     // NoSuchKey is the normal case: this deploy had nothing to hand off.
     if (e.name !== "NoSuchKey" && e.name !== "NotFound") {
       console.warn("handoff marker read failed (non-fatal):", e.name, e.message);
     }
-    return { status, handoff: null };
+    return { status, handoff: null, sourceRevision: sha };
   }
+}
+
+/**
+ * TEAM-4706 — which execution took over from a Superseded one?
+ *
+ * CodePipeline supersedes a queued execution when a newer one enters the same
+ * stage, and the newer one is then the run that reaches (and parks at) the human
+ * deploy gate. A blueprint watching its own execution_id therefore has to be able
+ * to FOLLOW its work: the successor is the newest OTHER execution built from the
+ * IDENTICAL source revision, because that is the only relationship that proves the
+ * new run carries the same commit rather than someone else's later push.
+ *
+ * ONE ListPipelineExecutions, its DEFAULT page, no pagination — the whole history
+ * is never walked. Called only from the superseded branch of getState's waitingOn,
+ * never from a poll that is merely waiting.
+ *
+ * `sourceRevision` is the fallback read from GetPipelineExecution
+ * (artifactRevisions); the summary's own sourceRevisions value is preferred when
+ * the caller's execution is still on this page, so both sides of the comparison
+ * come from the same field.
+ *
+ * @returns {Promise<string|null>} the successor's pipelineExecutionId, or null
+ */
+async function findSupersedingExecution(pipelineName, executionId, sourceRevision, cp) {
+  let summaries = [];
+  try {
+    const out = await cp.send(new ListPipelineExecutionsCommand({ pipelineName }));
+    summaries = out.pipelineExecutionSummaries || [];
+  } catch (e) {
+    // Non-fatal, like every other enrichment in get_state: no successor reported.
+    console.warn("list-pipeline-executions failed (non-fatal):", e?.name, e?.message);
+    return null;
+  }
+  const mine = summaries.find((s) => s?.pipelineExecutionId === executionId);
+  const revision = mine?.sourceRevisions?.[0]?.revisionId || sourceRevision || null;
+  // No revision to match on → no claim. Guessing "the newest execution" here would
+  // point a blueprint at an unrelated push.
+  if (!revision) return null;
+  // Summaries come back newest-first, so the first match is the newest successor.
+  const successor = summaries.find(
+    (s) =>
+      s?.pipelineExecutionId &&
+      s.pipelineExecutionId !== executionId &&
+      s.sourceRevisions?.[0]?.revisionId === revision
+  );
+  return successor?.pipelineExecutionId || null;
 }
 
 /** Execution dispositions from which nothing further can happen. A run in any of
@@ -791,6 +851,11 @@ const TERMINAL_EXECUTION_STATUSES = new Set([
 // test false forever. So `terminal` is ALSO taken from the execution's own status
 // (executionSnapshot), and `approvalSkipped` says out loud that no human is being
 // waited on.
+//
+// TEAM-4706 adds `waitingOn`: null, or WHICH execution is parked at the human
+// deploy gate and how it relates to the caller's — see the block that builds it.
+// Observational only; it grants no approval capability and reads the approval
+// token's PRESENCE, never its value.
 async function getState(args = {}, target) {
   // The pipeline is the RESOLVED target's — args.pipeline_name was already
   // validated against the allow-list (or refused) before we got here.
@@ -799,20 +864,28 @@ async function getState(args = {}, target) {
   const executionId = String(args.execution_id || "").trim();
   const state = await cp.send(new GetPipelineStateCommand({ name }));
 
-  const stages = (state.stageStates || []).map((s) => ({
-    stage: s.stageName,
-    status: s.latestExecution?.status || "Unknown",
-    executionId: s.latestExecution?.pipelineExecutionId,
-    actions: (s.actionStates || []).map((a) => ({
-      action: a.actionName,
-      status: a.latestExecution?.status || "Unknown",
-      summary: a.latestExecution?.summary,
-      token: a.latestExecution?.token ? "<present>" : undefined, // never leak the approval token
-      lastStatusChange: a.latestExecution?.lastStatusChange,
-      entityUrl: a.entityUrl,
-      revisionUrl: a.revisionUrl,
-    })),
-  }));
+  // TEAM-4706: stageStates[].inboundExecution is the run QUEUED BEHIND whatever
+  // currently occupies the stage — the shape of "my execution is waiting for the
+  // build in front of it". Collected during the ONE walk below rather than added to
+  // the mapped stage, because `stages` is a response contract callers already read.
+  const inboundByStage = new Map();
+  const stages = (state.stageStates || []).map((s) => {
+    inboundByStage.set(s.stageName, s.inboundExecution?.pipelineExecutionId || null);
+    return {
+      stage: s.stageName,
+      status: s.latestExecution?.status || "Unknown",
+      executionId: s.latestExecution?.pipelineExecutionId,
+      actions: (s.actionStates || []).map((a) => ({
+        action: a.actionName,
+        status: a.latestExecution?.status || "Unknown",
+        summary: a.latestExecution?.summary,
+        token: a.latestExecution?.token ? "<present>" : undefined, // never leak the approval token
+        lastStatusChange: a.latestExecution?.lastStatusChange,
+        entityUrl: a.entityUrl,
+        revisionUrl: a.revisionUrl,
+      })),
+    };
+  });
 
   // When an execution_id is given, only the stages whose latest execution IS
   // that execution count toward terminal/succeeded/failed. Omitted → all stages
@@ -900,11 +973,11 @@ async function getState(args = {}, target) {
   //  - handoff: present (non-null) when this execution's Deploy stage recorded
   //    infra files a human must still deploy. NOT a failure — the code shipped.
   //  - executionStatus: the run's own disposition.
-  const { status: executionStatus, handoff } = await executionSnapshot(
-    name,
-    pipelineExecutionId,
-    cp
-  );
+  const {
+    status: executionStatus,
+    handoff,
+    sourceRevision,
+  } = await executionSnapshot(name, pipelineExecutionId, cp);
 
   // TEAM-4525: the execution's own terminal disposition OVERRIDES the stage-level
   // arithmetic, in the one direction that is always safe — it can only ever turn
@@ -935,6 +1008,78 @@ async function getState(args = {}, target) {
       approvalStage.actions.some((a) => /approv/i.test(a.action) && a.status === "Skipped"))
   );
 
+  // ── waitingOn: WHOSE approval is the gate holding? (TEAM-4706) ──────────────
+  // approvalSkipped answers "is a human being waited on at all". It does not
+  // answer the question a polling agent actually has: is the run parked at that
+  // gate MINE? A pipeline serialises executions, so the build in front of yours can
+  // sit at the human gate for hours while your own execution waits to enter the
+  // stage — and get_state's stage list looks identical either way. Without this,
+  // an agent either files a SECOND human gate ticket for a gate that is already
+  // pending (someone else's), or waits forever on a gate it will never reach.
+  //
+  // Purely OBSERVATIONAL: it reports a relationship between execution ids and
+  // grants no new capability. There is still no PutApprovalResult here.
+  //
+  // The approval is detected exactly the way the Telegram bridge detects it
+  // (deploy/telegram-bug-intake scanDeployApprovalsForTarget): an action with a
+  // token AND status InProgress. Matched against the ALREADY-REDUCED `stages`
+  // above, whose token is the literal "<present>" — so the token's VALUE is
+  // structurally unreachable from here, and cannot be compared, logged or returned
+  // even by mistake.
+  let waitingOn = null;
+  let pendingStage = null;
+  let pendingAction = null;
+  for (const s of stages) {
+    const a = s.actions.find((x) => x.token === "<present>" && x.status === "InProgress");
+    if (a) {
+      pendingStage = s;
+      pendingAction = a;
+      break;
+    }
+  }
+  if (pendingStage) {
+    // The execution PARKED at the gate: the stage's own latest execution, since a
+    // waiting ManualApproval is what that stage is currently running.
+    const parkedId = pendingStage.executionId || null;
+    const inboundId = inboundByStage.get(pendingStage.stage) || null;
+    // Fail toward "unknown": claiming "this" wrongly is what makes a blueprint file
+    // a duplicate gate ticket, so it is only ever said on positive evidence.
+    let holdsGate = "unknown";
+    if (executionId) {
+      if (parkedId && parkedId === executionId) {
+        holdsGate = "this";
+      } else if (parkedId || inboundId === executionId) {
+        // Either the gate demonstrably belongs to another execution, or this stage
+        // names OUR execution as the one queued behind it. Both mean: not ours.
+        holdsGate = "older";
+      }
+    } else if (parkedId && pipelineExecutionId && parkedId === pipelineExecutionId) {
+      // No execution_id was supplied, so "mine" can only mean the pipeline's latest
+      // run — and it is the one parked.
+      holdsGate = "this";
+    }
+    // All seven keys are ALWAYS present (null rather than absent): JSON.stringify
+    // drops undefined, and a field an agent is told to branch on must not appear
+    // and disappear with an unnamed stage or action.
+    waitingOn = {
+      kind: "human_approval",
+      stage: pendingStage.stage || null,
+      action: pendingAction.action || null,
+      executionId: parkedId,
+      holdsGate,
+      // Only meaningful when someone else holds the gate: the execution our own is
+      // queued behind.
+      queuedBehind: holdsGate === "older" ? parkedId : null,
+      // The ONE extra AWS call this field can cost, and only on the cold path: the
+      // caller's own execution was superseded, so it needs the id of the run that
+      // inherited its commit (and, typically, this gate).
+      supersededBy:
+        executionId && executionStatus === "Superseded"
+          ? await findSupersedingExecution(name, executionId, sourceRevision, cp)
+          : null,
+    };
+  }
+
   return jsonResult({
     configured: true,
     pipelineName: name,
@@ -953,6 +1098,9 @@ async function getState(args = {}, target) {
     failed: anyFailed,
     // True iff the conditional deploy gate did not fire for this run.
     approvalSkipped,
+    // TEAM-4706: null, or WHOSE human approval the gate is currently holding —
+    // { kind, stage, action, executionId, holdsGate, queuedBehind, supersededBy }.
+    waitingOn,
     stages,
     actionDetails,
   });

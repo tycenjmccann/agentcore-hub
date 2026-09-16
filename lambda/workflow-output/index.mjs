@@ -5,7 +5,7 @@
  * Tools: submit_ticket_plan, save_design_doc, report_completion
  */
 
-import { S3Client, PutObjectCommand, GetObjectCommand, ListObjectsV2Command } from "@aws-sdk/client-s3";
+import { S3Client, PutObjectCommand, GetObjectCommand, HeadObjectCommand, ListObjectsV2Command } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { LambdaClient, InvokeCommand } from "@aws-sdk/client-lambda";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
@@ -223,7 +223,111 @@ const CI_FIELD_MAX_LEN = 128;
 const SHIP_OUTCOMES = ["shipped", "deploy-blocked", "static-ci-only", "handoff"];
 const BLOCK_REASON_MAX_LEN = 500;
 
-async function reportCompletion({ ticket_id, summary, artifacts = "", branch, commit_sha, pr_url, workflow_id, agent_id, evidence_kind, evidence_keys, ci_status, ci_build_id, ci_head_sha, merge_commit, approved_head_sha, outcome, block_reason }) {
+// ─── DL-030 ship-report contract (TEAM-4706) ──────────────────────────────────
+// A ship report is a claim that production changed, and this tool used to take
+// that claim entirely on trust: `outcome:"shipped"` with no merge commit and no
+// deploy execution recorded still wrote the record and closed the ticket, so a
+// run that never reached CD was indistinguishable from one that shipped. So a
+// `shipped` report must now NAME what it shipped (merge_commit) and, on the
+// pipeline path, the CodePipeline execution that shipped it; a `handoff` must
+// name the PR it handed off. A report that cannot is REFUSED as a value — see
+// shipContractRefusal below.
+const PIPELINE_EXECUTION_ID_RE = /^[0-9a-f-]{36}$/;
+
+// Still in SHIP_OUTCOMES, still accepted, still transition the ticket. DL-030
+// only deprecates them in the log so a blueprint that keeps emitting one is
+// visible; removing them would break existing records and the orchestrator's
+// evidence harvest (completion.mjs SHIP_BLOCKED_OUTCOMES), which reads them.
+const DEPRECATED_SHIP_OUTCOMES = ["deploy-blocked", "static-ci-only"];
+
+const CD_LEDGER_PRESENT = "present";
+const CD_LEDGER_ABSENT = "absent";
+const CD_LEDGER_INDETERMINATE = "indeterminate";
+
+/**
+ * Probe workflows/<workflow_id>/shared/cd-ledger.json — the record the release
+ * manager blueprint writes the moment Pipeline___start_deploy returns.
+ *
+ * THREE outcomes, never two, for the DL-028 reason (docs/architecture.md, "the
+ * licence to proceed must be positive evidence"): "no ledger" has to mean *we
+ * looked and S3 said 404*, never *we did not manage to find one*. AccessDenied,
+ * a throttle, a connect timeout, an unset ARTIFACT_BUCKET and a call carrying no
+ * workflow_id are all INDETERMINATE, and indeterminate keeps the execution id
+ * REQUIRED — refusing is cheap and recoverable (the agent files a human gate
+ * ticket), whereas accepting silently claims a deploy that may not exist.
+ *
+ * No IAM change: this Lambda's role already holds s3:GetObject on the whole
+ * artifact bucket (deploy/setup-lambda-role.sh, Sid "ObjectRW").
+ */
+async function probeCdLedger(workflowId) {
+  if (!BUCKET || !workflowId) {
+    console.warn(`[report_completion] cd-ledger probe not attempted (${BUCKET ? "no workflow_id on the call" : "no ARTIFACT_BUCKET configured"}) - indeterminate`);
+    return CD_LEDGER_INDETERMINATE;
+  }
+  const key = `workflows/${workflowId}/shared/cd-ledger.json`;
+  try {
+    await s3.send(new HeadObjectCommand({ Bucket: BUCKET, Key: key }));
+    return CD_LEDGER_PRESENT;
+  } catch (err) {
+    // A definite not-found is the ONLY positive evidence of "this run never
+    // started a pipeline deploy". Everything else is a failed look.
+    if (err?.name === "NoSuchKey" || err?.name === "NotFound" || err?.$metadata?.httpStatusCode === 404) {
+      return CD_LEDGER_ABSENT;
+    }
+    console.warn(`[report_completion] cd-ledger probe for ${key} was indeterminate (${err?.name || "Error"}: ${err?.message || "no message"}) - the pipeline execution id stays required`);
+    return CD_LEDGER_INDETERMINATE;
+  }
+}
+
+/**
+ * The gate. Returns a refusal VALUE (never throws) when the report may not be
+ * written, or null when it may.
+ *
+ * Deliberately not "is this repo CD-registered?": this Lambda has no repo on the
+ * wire, no CD-registry access and no workflows-table read, so it cannot know. It
+ * asks the question it CAN answer instead:
+ *   - merge_commit is required for EVERY `shipped`, no exceptions;
+ *   - pipeline_execution_id is additionally required UNLESS the run is *provably*
+ *     the legacy DEPLOY.md ship path, which means BOTH (a) no pipeline_name
+ *     argument was passed AND (b) a definite 404 on the cd-ledger.
+ */
+async function shipContractRefusal(report, { pipelineName, workflowId }) {
+  const outcome = report.outcome;
+  const prUrl = typeof report.pr_url === "string" ? report.pr_url.trim() : "";
+
+  if (outcome === "handoff" && !prUrl) {
+    return {
+      ok: false,
+      reason: "handoff_requires_pr_url",
+      missing: ["pr_url"],
+      message: `outcome "handoff" was refused: a handoff is only real once the PR the owning team will review exists. Open the PR, then call report_completion again with pr_url set. Nothing was recorded and the ticket was NOT transitioned.`,
+    };
+  }
+  if (outcome !== "shipped") return null;
+
+  const missing = [];
+  if (!report.merge_commit) missing.push("merge_commit");
+  if (!report.pipeline_execution_id) {
+    const named = typeof pipelineName === "string" && pipelineName.trim() !== "";
+    const ledger = named ? null : await probeCdLedger(workflowId);
+    if (!named && ledger === CD_LEDGER_ABSENT) {
+      console.log(`[report_completion] ${report.ticket_id}: "shipped" with no pipeline_execution_id ACCEPTED as the legacy DEPLOY.md path - no pipeline_name argument and cd-ledger.json is definitively absent for ${workflowId || "(no workflow_id)"}`);
+    } else {
+      missing.push("pipeline_execution_id");
+      console.warn(`[report_completion] ${report.ticket_id}: pipeline_execution_id is REQUIRED (${named ? "pipeline_name was supplied, so this run used the pipeline path" : `cd-ledger probe result: ${ledger}`})`);
+    }
+  }
+  if (missing.length === 0) return null;
+
+  return {
+    ok: false,
+    reason: "shipped_requires_execution_and_merge_commit",
+    missing,
+    message: `outcome "shipped" was refused: missing ${missing.join(" and ")}. A shipped report must name the merge commit, and the CodePipeline execution that deployed it whenever this run used the pipeline path. If the deploy genuinely did not happen, do NOT report "shipped" - file a human deploy-gate ticket and report the outcome that is true. Nothing was recorded and the ticket was NOT transitioned.`,
+  };
+}
+
+async function reportCompletion({ ticket_id, summary, artifacts = "", branch, commit_sha, pr_url, workflow_id, agent_id, evidence_kind, evidence_keys, ci_status, ci_build_id, ci_head_sha, merge_commit, approved_head_sha, outcome, block_reason, pipeline_execution_id, pipeline_name }) {
   const key = `completions/${ticket_id}.json`;
   const report = {
     ticket_id,
@@ -271,13 +375,47 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   } else if (approvedHeadSha) {
     console.warn(`[report_completion] dropping malformed approved_head_sha (${approvedHeadSha.length} chars; expected a 40-hex git SHA)`);
   }
+  // TEAM-4706: the deploy the ship report is claiming. Same additive
+  // drop-rather-than-store rule as merge_commit above, plus a shape check on the
+  // id — a mangled execution id is worse than none, because it reads as proof of
+  // a deploy nobody can look up. Lowercased before the test so an upper-case
+  // UUID normalises rather than being thrown away.
+  const pipelineExecutionId = typeof pipeline_execution_id === "string" ? pipeline_execution_id.trim().toLowerCase() : "";
+  if (pipelineExecutionId && pipelineExecutionId.length <= CI_FIELD_MAX_LEN && PIPELINE_EXECUTION_ID_RE.test(pipelineExecutionId)) {
+    report.pipeline_execution_id = pipelineExecutionId;
+  } else if (pipelineExecutionId) {
+    console.warn(`[report_completion] dropping malformed pipeline_execution_id (${pipelineExecutionId.length} chars; expected a 36-char CodePipeline execution id matching ${PIPELINE_EXECUTION_ID_RE})`);
+  }
+  const pipelineName = typeof pipeline_name === "string" ? pipeline_name.trim() : "";
+  if (pipelineName && pipelineName.length <= CI_FIELD_MAX_LEN) report.pipeline_name = pipelineName;
+  else if (pipelineName) console.warn(`[report_completion] dropping oversized pipeline_name (${pipelineName.length} chars)`);
+
   const shipOutcome = typeof outcome === "string" ? outcome.trim().toLowerCase() : "";
   if (shipOutcome) {
-    if (SHIP_OUTCOMES.includes(shipOutcome)) report.outcome = shipOutcome;
-    else console.warn(`[report_completion] dropping unknown outcome "${shipOutcome}" (expected ${SHIP_OUTCOMES.join("|")})`);
+    if (SHIP_OUTCOMES.includes(shipOutcome)) {
+      report.outcome = shipOutcome;
+      // Accepted, transitions as before — logged only so a blueprint still
+      // emitting a DL-030-deprecated verdict is visible in CloudWatch.
+      if (DEPRECATED_SHIP_OUTCOMES.includes(shipOutcome)) {
+        console.warn(`[report_completion] DEPRECATED outcome ${shipOutcome} (DL-030)`);
+      }
+    } else console.warn(`[report_completion] dropping unknown outcome "${shipOutcome}" (expected ${SHIP_OUTCOMES.join("|")})`);
   }
   const blockReason = typeof block_reason === "string" ? block_reason.trim() : "";
   if (blockReason) report.block_reason = blockReason.slice(0, BLOCK_REASON_MAX_LEN);
+
+  // DL-030 gate — BEFORE the S3 write, the journey event and the Done
+  // transition, so a refused report leaves no trace of a completion that did not
+  // happen. Refusals are returned, not thrown: the handler JSON-stringifies this
+  // object into the tool result, so the agent reads a legible reason instead of
+  // an "Error: ..." string it cannot act on. Note the gate reads `report.*`, so
+  // a field that was dropped above (a malformed pipeline_execution_id) counts as
+  // missing here — which is the point.
+  const refusal = await shipContractRefusal(report, { pipelineName, workflowId: workflow_id });
+  if (refusal) {
+    console.warn(`[report_completion] REFUSED ${ticket_id}: ${refusal.reason} (missing ${refusal.missing.join(", ")}) - no record written, ticket not transitioned`);
+    return refusal;
+  }
 
   await s3.send(new PutObjectCommand({
     Bucket: BUCKET,

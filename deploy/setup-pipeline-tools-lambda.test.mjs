@@ -42,6 +42,7 @@ import { readFileSync } from "node:fs";
 
 import {
   buildInlinePolicy,
+  githubTokenGuard,
   parsePipelineRegions,
   resolveEnv,
   validateCiProjectName as validateInDeployScript,
@@ -94,6 +95,16 @@ const SOURCE = readFileSync(
   new URL("./setup-pipeline-tools-lambda.mjs", import.meta.url),
   "utf8"
 );
+// This file too: a fixture that looked like a real credential would be a leak in
+// the repo regardless of which file it sits in (see the secret-hygiene test).
+const TEST_SOURCE = readFileSync(
+  new URL("./setup-pipeline-tools-lambda.test.mjs", import.meta.url),
+  "utf8"
+);
+// Obvious non-credentials. Every token fixture below is hyphenated on purpose so
+// it cannot be mistaken for (or pattern-matched as) a real GitHub token.
+const FAKE_TOKEN = "ghp-fixture-not-a-real-token";
+const FAKE_PAT = "ghp-fixture-pat-not-a-real-token";
 
 describe("buildInlinePolicy — the CiStartBuild grant", () => {
   it("is ABSENT with the flag off (today's policy, unchanged)", () => {
@@ -263,6 +274,128 @@ describe("resolveEnv", () => {
     // It is the ONLY way the merge binding can be machine-verified; without it
     // recordShipApproval refuses with merge_binding_unverified (TEAM-4525 review P1).
     expect(resolveEnv({ GITHUB_TOKEN: "ghp-abc" }).GITHUB_TOKEN).toBe("ghp-abc");
+  });
+
+  // TEAM-4706: GITHUB_PAT is an accepted alias because operators who have only
+  // that one exported deployed a token-less Lambda twice, and a token-less Lambda
+  // pages a human on every deploy forever.
+  it("takes the token from GITHUB_TOKEN, else GITHUB_PAT, else empty", () => {
+    expect(resolveEnv({ GITHUB_TOKEN: FAKE_TOKEN }).GITHUB_TOKEN).toBe(FAKE_TOKEN);
+    expect(resolveEnv({ GITHUB_PAT: FAKE_PAT }).GITHUB_TOKEN).toBe(FAKE_PAT);
+    // GITHUB_TOKEN wins when both are set — one name has to, and it is the name
+    // the Lambda itself reads.
+    expect(
+      resolveEnv({ GITHUB_TOKEN: FAKE_TOKEN, GITHUB_PAT: FAKE_PAT }).GITHUB_TOKEN
+    ).toBe(FAKE_TOKEN);
+    // An empty/blank alias is not a token.
+    expect(resolveEnv({ GITHUB_TOKEN: "", GITHUB_PAT: FAKE_PAT }).GITHUB_TOKEN).toBe(FAKE_PAT);
+    expect(resolveEnv({}).GITHUB_TOKEN).toBe("");
+    expect(resolveEnv({ GITHUB_TOKEN: "", GITHUB_PAT: "" }).GITHUB_TOKEN).toBe("");
+    // The alias is a resolveEnv concern only: the key it resolves INTO is always
+    // GITHUB_TOKEN, because that is what the Lambda reads.
+    expect(Object.keys(resolveEnv({ GITHUB_PAT: FAKE_PAT }))).not.toContain("GITHUB_PAT");
+  });
+});
+
+// ─── TEAM-4706: the deploy-time token guard ───────────────────────────────────
+//
+// DL-028's approve-once path drifted twice in prod, both times because a
+// deploy-time PREREQUISITE was missing rather than because the logic was wrong:
+// no GITHUB_TOKEN on the tools Lambda (reason merge_binding_unverified) and no
+// s3:PutObject on the ship-approvals prefix (reason record_write_failed). Either
+// way every deploy pages a human, silently. The guard is the DECISION only —
+// main() prints it and exits — so it is assertable without executing a deploy.
+
+describe("githubTokenGuard", () => {
+  it("passes silently when a token is present", () => {
+    expect(githubTokenGuard({ token: FAKE_TOKEN })).toEqual({ ok: true, message: null });
+    // The opt-out flag is irrelevant once there IS a token.
+    expect(
+      githubTokenGuard({ token: FAKE_TOKEN, allowNoGithubToken: true })
+    ).toEqual({ ok: true, message: null });
+  });
+
+  it("REFUSES the deploy with no token and no opt-out", () => {
+    for (const token of ["", undefined, null]) {
+      const gate = githubTokenGuard({ token, allowNoGithubToken: false });
+      expect(gate.ok, String(token)).toBe(false);
+      expect(gate.message, String(token)).toBeTruthy();
+    }
+    // Called with no argument at all (the shape main() would hit if resolveEnv
+    // ever stopped returning the key) still refuses rather than proceeding.
+    expect(githubTokenGuard().ok).toBe(false);
+    expect(githubTokenGuard({}).ok).toBe(false);
+  });
+
+  it("names BOTH accepted variables, the flag, and what breaks without them", () => {
+    const { message } = githubTokenGuard({ token: "" });
+    // The operator has to be able to act on one line: which vars, which escape
+    // hatch, and the consequence.
+    expect(message).toContain("GITHUB_TOKEN");
+    expect(message).toContain("GITHUB_PAT");
+    expect(message).toContain("--allow-no-github-token");
+    expect(message).toMatch(/pages a human/i);
+    // One line — a multi-line refusal gets truncated in CI output.
+    expect(message).not.toContain("\n");
+  });
+
+  it("proceeds under --allow-no-github-token, but WARNS with the consequence", () => {
+    const gate = githubTokenGuard({ token: "", allowNoGithubToken: true });
+    expect(gate.ok).toBe(true);
+    // ok:true with a message means "warn"; the consequence has to be spelled out,
+    // because the opt-out is exactly the state that broke prod.
+    expect(gate.message).toMatch(/WARNING/);
+    expect(gate.message).toContain("--allow-no-github-token");
+    expect(gate.message).toMatch(/ship-approval/i);
+    expect(gate.message).toMatch(/page[s]? a human/i);
+    expect(gate.message).not.toContain("\n");
+  });
+
+  it("never puts the token value in any message it returns", () => {
+    for (const allowNoGithubToken of [false, true]) {
+      for (const token of ["", FAKE_TOKEN, FAKE_PAT]) {
+        const { message } = githubTokenGuard({ token, allowNoGithubToken });
+        if (!message) continue;
+        const label = `${token || "(empty)"}/${allowNoGithubToken}`;
+        expect(message, label).not.toContain(FAKE_TOKEN);
+        expect(message, label).not.toContain(FAKE_PAT);
+        // Not even a fragment of one.
+        expect(message, label).not.toContain("fixture");
+      }
+    }
+  });
+});
+
+describe("secret hygiene — only the variable NAME is ever printed", () => {
+  it("interpolates the token into no string, logged or otherwise", () => {
+    // A leak here would be worse than the bug this unit closes: the deploy runs in
+    // CI, so anything console.log'd is archived. GITHUB_TOKEN may appear in a
+    // ternary CONDITION (presence) but never as a value in a template.
+    expect(SOURCE).not.toMatch(/\$\{\s*(?:cfg\.|env\.|process\.env\.)?GITHUB_(?:TOKEN|PAT)\s*\}/);
+    // Nor via a JSON dump of the env block that carries it.
+    expect(SOURCE).not.toMatch(/console\.\w+\([^)]*JSON\.stringify\(\s*envVars/);
+    // The value goes exactly one place: onto the function.
+    expect(SOURCE).toContain("if (GITHUB_TOKEN) envVars.GITHUB_TOKEN = GITHUB_TOKEN;");
+  });
+
+  it("keeps the merge-over-existing-env behaviour that protects an out-of-band token", () => {
+    // envVars is spread OVER existingEnv, and GITHUB_TOKEN is set only when
+    // non-empty, precisely so a re-run WITHOUT a token in the environment cannot
+    // wipe one an operator set by hand (which would silently restore the
+    // every-deploy-pages-a-human state).
+    expect(SOURCE).toContain("Variables: { ...existingEnv, ...envVars }");
+    const envBlock = SOURCE.slice(SOURCE.indexOf("const envVars = {"));
+    expect(envBlock.slice(0, envBlock.indexOf("};"))).not.toContain("GITHUB_TOKEN");
+  });
+
+  it("holds no credential-shaped literal in the script or in this test", () => {
+    for (const [label, text] of [
+      ["script", SOURCE],
+      ["test", TEST_SOURCE],
+    ]) {
+      expect(text, label).not.toMatch(/gh[pousr]_[A-Za-z0-9]{16,}/);
+      expect(text, label).not.toMatch(/github_pat_[A-Za-z0-9_]{20,}/);
+    }
   });
 });
 

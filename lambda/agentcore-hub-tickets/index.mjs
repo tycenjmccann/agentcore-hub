@@ -32,7 +32,7 @@ import {
   QueryCommand,
   ScanCommand,
 } from "@aws-sdk/lib-dynamodb";
-import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
+import { S3Client, GetObjectCommand, HeadObjectCommand } from "@aws-sdk/client-s3";
 // TEAM-4121 FR-8: the shared fix-ticket contract. Duplicated byte-for-byte into
 // the jira Lambda + orchestrator (each ships as a self-contained zip, so they
 // cannot share a file); CI byte-compares the copies. Edit one, `cp` the others.
@@ -165,6 +165,155 @@ async function loadValidPhases() {
     console.log(`[agentcore-hub-tickets] Loaded ${phases.size} valid phases from S3 config`);
   }
   return VALID_PHASES;
+}
+
+// ─── Agent → phase map (TEAM-4706) ───────────────────────────────────────────
+//
+// VALID_PHASES above collapses the roster to a SET of phase names, which cannot
+// answer the question the ship-phase gate asks: "is THIS ticket's assignee a
+// ship-phase agent?" Same loader style, same S3 object (config/agents.json), so a
+// roster edit still needs no redeploy — Lambdas pick it up on the next cold start.
+// The fallback mirrors src/config/agents.json's pipeline roster, so an S3 read
+// failure still recognizes the release manager as ship phase. Twin of the map in
+// lambda/agentcore-hub-jira/index.mjs.
+const FALLBACK_AGENT_PHASES = new Map([
+  ["agentcore_hub_requirements_analyst", "requirements"],
+  ["agentcore_hub_frontend_designer", "design"],
+  ["agentcore_hub_ios_designer", "design"],
+  ["agentcore_hub_backend_designer", "design"],
+  ["agentcore_hub_android_designer", "design"],
+  ["agentcore_hub_security_reviewer", "design"],
+  ["agentcore_hub_legal_compliance", "design"],
+  ["agentcore_hub_localization", "design"],
+  ["agentcore_hub_analytics_designer", "design"],
+  ["agentcore_hub_backend_dev", "development"],
+  ["agentcore_hub_api_dev", "development"],
+  ["agentcore_hub_frontend_dev", "development"],
+  ["agentcore_hub_code_reviewer", "review"],
+  ["agentcore_hub_qa_verifier", "verification"],
+  ["agentcore_hub_ci_agent", "review"],
+  ["agentcore_hub_release_manager", "ship"],
+]);
+
+let AGENT_PHASES = null;
+
+async function loadAgentPhases() {
+  if (AGENT_PHASES) return AGENT_PHASES;
+  if (!ARTIFACT_BUCKET) {
+    console.warn("[agentcore-hub-tickets] No ARTIFACT_BUCKET — using fallback agent-phase map");
+    AGENT_PHASES = FALLBACK_AGENT_PHASES;
+    return AGENT_PHASES;
+  }
+  try {
+    const res = await s3.send(new GetObjectCommand({
+      Bucket: ARTIFACT_BUCKET,
+      Key: "config/agents.json",
+    }));
+    const config = JSON.parse(await res.Body.transformToString());
+    const map = new Map();
+    for (const a of config.agents || []) {
+      if (typeof a.agentId === "string" && a.agentId && typeof a.phase === "string" && a.phase) {
+        map.set(a.agentId, a.phase);
+      }
+    }
+    if (map.size === 0) throw new Error("no agentId/phase pairs in config/agents.json");
+    AGENT_PHASES = map;
+    console.log(`[agentcore-hub-tickets] Loaded ${map.size} agent phases from S3 config`);
+  } catch (err) {
+    console.warn(`[agentcore-hub-tickets] Failed to load agent phases from S3: ${err.message} — using fallback agent-phase map`);
+    AGENT_PHASES = FALLBACK_AGENT_PHASES;
+  }
+  return AGENT_PHASES;
+}
+
+// ─── Ship-phase completion-record gate (TEAM-4706, DL-030) ───────────────────
+//
+// A ship-phase ticket may not reach done unless the agent's own completion record
+// exists at s3://$ARTIFACT_BUCKET/completions/<ticket_id>.json — the record
+// lambda/workflow-output writes (reportCompletion) BEFORE it asks this Lambda for
+// the transition, and the only durable statement of what actually shipped. Closing
+// a ship ticket by hand leaves the run's completion gates, its KPIs and the deploy
+// audit trail with nothing to read.
+//
+// Twin of the block in lambda/agentcore-hub-jira/index.mjs: both providers must
+// refuse identically (the twins doctrine, TEAM-4131 F2), so edit both or neither.
+// Not in fix-contract.mjs — that module is byte-compared across three copies by
+// CI, and each provider expresses the refusal in its own idiom.
+const SHIP_PHASE = "ship";
+
+// The refusal payload, verbatim in both providers. `reason` is what an agent (and
+// the orchestrator) match on; `hint` names the one call that does this correctly.
+const COMPLETION_RECORD_REQUIRED = {
+  ok: false,
+  reason: "completion_record_required",
+  hint: "call WorkflowOutput___report_completion(ticket_id=…) — it writes the record and transitions the ticket for you",
+};
+
+/**
+ * Is this ticket a ship-phase AGENT ticket? Takes the row transitionIssue already
+ * GOT, so the predicate costs no extra read, and the cheap checks come first: only
+ * a ship-phase ticket ever pays for the S3 HeadObject.
+ *
+ * Human-review gates are EXEMPT, and that exemption comes first — the hub UI's
+ * approve action (src/app/api/workflow/[id]/tickets/transition/route.ts) and the
+ * Telegram bridge's ✅ both transition through this same tool without writing a
+ * record, and a Merge Approval gate is itself a ship-phase ticket, so gating them
+ * would deadlock every human gate in the pipeline.
+ *
+ * `phase` is this provider's native carrier (createTicket persists the stamp as a
+ * top-level field); the `phase:ship` LABEL is checked too so the predicate reads
+ * the same in either provider.
+ */
+async function isShipPhaseTicket(item) {
+  const assignee = String(item?.assignee || "");
+  if (assignee.startsWith("human:")) return false;
+  const labels = (Array.isArray(item?.labels) ? item.labels : []).map((l) => String(l));
+  if (labels.some((l) => l === "human-review" || l.startsWith("reviewer:"))) return false;
+  if (item?.phase === SHIP_PHASE || labels.includes(`phase:${SHIP_PHASE}`)) return true;
+  if (!assignee) return false;
+  const phases = await loadAgentPhases();
+  return phases.get(assignee) === SHIP_PHASE;
+}
+
+/**
+ * POSITIVE proof that completions/<ticketId>.json exists. Fails CLOSED on an
+ * indeterminate answer (AccessDenied, throttle, timeout, ARTIFACT_BUCKET unset):
+ * "we could not find a record" is not "there is no record", the same
+ * positive-evidence rule as DL-028's deploy gate. `why` is log/message text only
+ * — never a credential, never the raw AWS error body.
+ */
+async function completionRecordProven(ticketId) {
+  const key = `completions/${ticketId}.json`;
+  if (!ARTIFACT_BUCKET) {
+    return { proven: false, why: `ARTIFACT_BUCKET is unset, so ${key} cannot be read` };
+  }
+  try {
+    await s3.send(new HeadObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: key }));
+    return { proven: true, why: `${key} exists` };
+  } catch (err) {
+    const status = err?.$metadata?.httpStatusCode;
+    if (err?.name === "NotFound" || err?.name === "NoSuchKey" || status === 404) {
+      return { proven: false, why: `no ${key} in the artifact bucket` };
+    }
+    return { proven: false, why: `could not read ${key} (${err?.name || "S3Error"}${status ? ` ${status}` : ""})` };
+  }
+}
+
+/**
+ * The refusal, in this Lambda's idiom: transitionIssue RETURNS its refusals, and
+ * the caller-facing text goes in `content` (textResult) — which is also what the
+ * hub UI's rejectedDetails() reads as "the ticket did not move". The structured
+ * `ok`/`reason`/`hint` keys ride alongside so an agent can match on the reason
+ * instead of parsing prose, identically to the jira Lambda.
+ */
+function completionRecordRequired(issueKey, why) {
+  return {
+    ...COMPLETION_RECORD_REQUIRED,
+    ...textResult(
+      `Cannot move ${issueKey} to done: a ship-phase ticket needs its completion record first — ` +
+      `${COMPLETION_RECORD_REQUIRED.hint} (${why})`
+    ),
+  };
 }
 
 // Valid status transitions
@@ -788,6 +937,20 @@ async function transitionIssue(args) {
     return textResult(
       `Cannot move ${issueKey} to in_review: only human-review tickets (assignee "human:*") can be sent to review.`
     );
+  }
+
+  // TEAM-4706 (DL-030): a ship-phase ticket cannot reach done without its
+  // completion record. Placed before the update is built so a refused transition
+  // writes nothing at all. The RESOLVED target is what is tested, not the requested
+  // transition id, so the `skip` row — which is how a blocked ticket reaches done
+  // (TEAM-4130 F1) — cannot walk around the gate. The row is already in hand, so a
+  // non-ship ticket costs no extra read and no S3 call.
+  if (transition.to === "done" && await isShipPhaseTicket(current.Item)) {
+    const proof = await completionRecordProven(issueKey);
+    if (!proof.proven) {
+      console.warn(`[agentcore-hub-tickets] ${issueKey}: refusing done on a ship-phase ticket — ${proof.why}`);
+      return completionRecordRequired(issueKey, proof.why);
+    }
   }
 
   // Build update expression — include skipReason if "skip" transition with a reason

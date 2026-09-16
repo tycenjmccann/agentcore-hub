@@ -143,6 +143,11 @@ function mapIssueToTicket(issue: Record<string, unknown>) {
     assignee,
     parentId: parent?.key as string | undefined,
     blockedBy: blockedBy.length > 0 ? blockedBy.join(",") : "",
+    // Raw Jira labels on the wire (DynamoDB mode already returns them on the row):
+    // consumers classify gate tickets by label — e.g. the Telegram bridge tells a
+    // `gate:deploy-approval` gate from a plain `gate:approval` one — and can do so
+    // from the tickets they already fetched instead of a second Jira call.
+    labels,
     workflowId,
     type: issueTypeName,
     createdAt: (fields?.created as string) || new Date().toISOString(),

@@ -21,7 +21,14 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
  * see its own bytes. `h.puts` still records PutObjectCommand inputs verbatim, so
  * every report_completion assertion above/below is untouched by the redesign.
  */
-const h = vi.hoisted(() => ({ puts: [], warns: [], gets: [], objects: new Map() }));
+/**
+ * `heads` / `headError` back the DL-030 cd-ledger probe (TEAM-4706). The probe's
+ * whole point is that a definite 404 and a failed look are DIFFERENT answers, so
+ * the stub has to be able to produce each on demand: by default HeadObject
+ * answers from the same object map (absent key → NotFound + 404), and a test can
+ * set `h.headError` to any other AWS error to simulate the indeterminate case.
+ */
+const h = vi.hoisted(() => ({ puts: [], warns: [], gets: [], heads: [], headError: null, invokes: [], objects: new Map() }));
 
 const asString = (body) => (typeof body === "string" ? body : Buffer.from(body).toString("utf8"));
 
@@ -53,6 +60,17 @@ vi.mock("@aws-sdk/client-s3", () => ({
           },
         };
       }
+      if (name === "HeadObjectCommand") {
+        h.heads.push(input);
+        if (h.headError) throw h.headError;
+        if (!h.objects.has(input.Key)) {
+          const err = new Error(`Not Found: ${input.Key}`);
+          err.name = "NotFound";
+          err.$metadata = { httpStatusCode: 404 };
+          throw err;
+        }
+        return { ContentLength: h.objects.get(input.Key).length };
+      }
       if (name === "ListObjectsV2Command") {
         const prefix = input.Prefix || "";
         return {
@@ -66,12 +84,20 @@ vi.mock("@aws-sdk/client-s3", () => ({
   },
   PutObjectCommand: class { constructor(input) { this.input = input; } },
   GetObjectCommand: class { constructor(input) { this.input = input; } },
+  HeadObjectCommand: class { constructor(input) { this.input = input; } },
   ListObjectsV2Command: class { constructor(input) { this.input = input; } },
 }));
 vi.mock("@aws-sdk/s3-request-presigner", () => ({ getSignedUrl: async () => "https://signed" }));
 vi.mock("@aws-sdk/client-lambda", () => ({
-  // The Done transition is not under test; a plain success keeps the log quiet.
-  LambdaClient: class { async send() { return { Payload: new TextEncoder().encode(JSON.stringify({ ok: true })) }; } },
+  // The Done transition itself is not under test — a plain success keeps the log
+  // quiet — but `h.invokes` records every call, because the DL-030 refusals below
+  // are only meaningful if the ticket was NOT transitioned.
+  LambdaClient: class {
+    async send(cmd) {
+      h.invokes.push(cmd?.input || {});
+      return { Payload: new TextEncoder().encode(JSON.stringify({ ok: true })) };
+    }
+  },
   InvokeCommand: class { constructor(input) { this.input = input; } },
 }));
 vi.mock("@aws-sdk/client-dynamodb", () => ({ DynamoDBClient: class {} }));
@@ -102,10 +128,25 @@ const report = (extra) =>
 // addition (or rename) fails here rather than in whatever reads the record.
 const BASE_KEYS = ["ticket_id", "summary", "artifacts", "branch", "commit_sha", "pr_url", "completed_at"];
 
+// TEAM-4706 fixtures, shared with the ship-report-contract block at the bottom.
+const EXEC_ID = "b3a1c0de-1234-4f56-89ab-cdef01234567"; // 36 chars, [0-9a-f-] only
+const PIPELINE = "hub-agentcore-hub-deploy";
+const MERGE_COMMIT = "0ef5892abc";
+const PR_URL = "https://github.com/owner/repo/pull/42";
+/** The tool's parsed result payload (success OR refusal — both are values). */
+const result = (res) => JSON.parse(res.content[0].text);
+/** Did the call write a completion record at all? */
+const wroteRecord = () => h.puts.some((p) => p.Key?.startsWith("completions/"));
+/** Did the call ask the ticket-tools Lambda to transition the ticket? */
+const transitioned = () => h.invokes.length > 0;
+
 beforeEach(() => {
   h.puts.length = 0;
   h.warns.length = 0;
   h.gets.length = 0;
+  h.heads.length = 0;
+  h.invokes.length = 0;
+  h.headError = null;
   h.objects.clear();
   vi.spyOn(console, "warn").mockImplementation((...args) => h.warns.push(args.join(" ")));
 });
@@ -217,9 +258,18 @@ describe("report_completion — merge_commit / outcome / block_reason", () => {
   });
 
   it("normalizes outcome case/whitespace and accepts every allowed value", async () => {
+    // TEAM-4706: two of the four outcomes now have to satisfy the ship-report
+    // contract (see the last describe), so each is given the fields IT requires.
+    // The assertion is unchanged: all four values are accepted and normalized.
+    const REQUIRED = {
+      shipped: { merge_commit: MERGE_COMMIT, pipeline_execution_id: EXEC_ID },
+      "deploy-blocked": {},
+      "static-ci-only": {},
+      handoff: { pr_url: PR_URL },
+    };
     for (const oc of ["shipped", "deploy-blocked", "static-ci-only", "handoff"]) {
       h.puts.length = 0;
-      await report({ outcome: ` ${oc.toUpperCase()} ` });
+      await report({ outcome: ` ${oc.toUpperCase()} `, ...REQUIRED[oc] });
       expect(record().outcome).toBe(oc);
     }
   });
@@ -287,6 +337,168 @@ describe("report_completion — approved_head_sha", () => {
     await report({ approved_head_sha: "   " });
     expect("approved_head_sha" in record()).toBe(false);
     expect(h.warns.join("\n")).not.toMatch(/approved_head_sha/);
+  });
+});
+
+// ─── TEAM-4706 / DL-030: the ship-report contract ─────────────────────────────
+//
+// `outcome:"shipped"` is the only durable claim that production changed, and the
+// tool used to take it on trust — a record with no merge commit and no deploy
+// execution still closed the ticket, so "we shipped" and "we never reached CD"
+// were the same bytes. Now a shipped report must NAME what it shipped, and a
+// handoff must name the PR it handed off; a report that cannot is refused as a
+// VALUE (the agent can read the reason and act), and refusal means NOTHING is
+// written and the ticket is NOT transitioned.
+//
+// The conditional half is where the care is. This Lambda cannot know whether the
+// repo is CD-registered (no repo on the wire, no registry, no workflows table),
+// and the legacy DEPLOY.md ship path legitimately ships with no pipeline
+// execution at all. So the execution id is required UNLESS the run is *provably*
+// legacy: no pipeline_name argument AND a definite 404 on the run's cd-ledger.
+// An indeterminate S3 answer (AccessDenied, throttle, timeout) is NOT proof and
+// therefore refuses — DL-028's rule, "the licence to proceed must be positive
+// evidence". Refusing costs a human gate ticket; accepting silently claims a
+// deploy that may never have happened.
+const CD_LEDGER_KEY = "workflows/wf_1/shared/cd-ledger.json";
+
+describe("report_completion — ship-report contract (pipeline_execution_id / pipeline_name)", () => {
+  it("(1) refuses shipped with no pipeline_execution_id, writing nothing and transitioning nothing", async () => {
+    // Two ways the pipeline path is known to have been used: the caller named the
+    // pipeline, or the run's cd-ledger exists. Both make the id mandatory.
+    const cases = [
+      { pipeline_name: PIPELINE },
+      { ledger: true },
+    ];
+    for (const c of cases) {
+      h.puts.length = 0;
+      h.invokes.length = 0;
+      h.objects.clear();
+      if (c.ledger) h.objects.set(CD_LEDGER_KEY, JSON.stringify({ execution_id: EXEC_ID }));
+      const r = result(await report({ outcome: "shipped", merge_commit: MERGE_COMMIT, ...(c.pipeline_name ? { pipeline_name: PIPELINE } : {}) }));
+      expect(r.ok).toBe(false);
+      expect(r.reason).toBe("shipped_requires_execution_and_merge_commit");
+      expect(r.missing).toEqual(["pipeline_execution_id"]);
+      expect(wroteRecord()).toBe(false);
+      expect(transitioned()).toBe(false);
+    }
+  });
+
+  it("(2) refuses shipped with no merge_commit, writing nothing and transitioning nothing", async () => {
+    const r = result(await report({ outcome: "shipped", pipeline_execution_id: EXEC_ID, pipeline_name: PIPELINE }));
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBe("shipped_requires_execution_and_merge_commit");
+    expect(r.missing).toEqual(["merge_commit"]);
+    expect(wroteRecord()).toBe(false);
+    expect(transitioned()).toBe(false);
+  });
+
+  it("(3) accepts shipped with both, storing them and transitioning the ticket", async () => {
+    const res = await report({ outcome: "shipped", merge_commit: MERGE_COMMIT, pipeline_execution_id: EXEC_ID, pipeline_name: PIPELINE });
+    expect(result(res).status).toBe("complete");
+    const r = record();
+    expect(r.pipeline_execution_id).toBe(EXEC_ID);
+    expect(r.pipeline_name).toBe(PIPELINE);
+    expect(r.merge_commit).toBe(MERGE_COMMIT);
+    expect(r.outcome).toBe("shipped");
+    expect(transitioned()).toBe(true);
+  });
+
+  it("(3b) trims and lowercases an execution id, and drops an oversized pipeline_name", async () => {
+    await report({ outcome: "shipped", merge_commit: MERGE_COMMIT, pipeline_execution_id: `  ${EXEC_ID.toUpperCase()}  `, pipeline_name: "p".repeat(129) });
+    const r = record();
+    expect(r.pipeline_execution_id).toBe(EXEC_ID);
+    expect("pipeline_name" in r).toBe(false);
+    expect(h.warns.join("\n")).toMatch(/oversized pipeline_name/);
+  });
+
+  it("(4) refuses handoff with no pr_url, transitioning nothing", async () => {
+    for (const extra of [{}, { pr_url: "   " }]) {
+      h.puts.length = 0;
+      h.invokes.length = 0;
+      const r = result(await report({ outcome: "handoff", ...extra }));
+      expect(r.ok).toBe(false);
+      expect(r.reason).toBe("handoff_requires_pr_url");
+      expect(wroteRecord()).toBe(false);
+      expect(transitioned()).toBe(false);
+    }
+    // …and accepts it the moment the PR exists.
+    const res = await report({ outcome: "handoff", pr_url: PR_URL });
+    expect(result(res).status).toBe("complete");
+    expect(record().outcome).toBe("handoff");
+  });
+
+  it("(5) accepts the legacy DEPLOY.md ship: no pipeline_name, cd-ledger definitively absent", async () => {
+    // THE regression that must not break: a registered repo with no CodePipeline
+    // ships via DEPLOY.md and has no execution id to report, ever.
+    const res = await report({ outcome: "shipped", merge_commit: MERGE_COMMIT });
+    expect(result(res).status).toBe("complete");
+    const r = record();
+    expect(r.outcome).toBe("shipped");
+    expect("pipeline_execution_id" in r).toBe(false);
+    expect(transitioned()).toBe(true);
+    // The licence came from a real probe, not from an assumption.
+    expect(h.heads.map((x) => x.Key)).toContain(CD_LEDGER_KEY);
+  });
+
+  it("(5b) a NoSuchKey-flavoured 404 is the same positive evidence as NotFound", async () => {
+    const err = new Error("The specified key does not exist.");
+    err.name = "NoSuchKey";
+    h.headError = err;
+    expect(result(await report({ outcome: "shipped", merge_commit: MERGE_COMMIT })).status).toBe("complete");
+  });
+
+  it("(6) refuses when the cd-ledger probe is indeterminate (AccessDenied), not just when it finds a ledger", async () => {
+    const err = new Error("Access Denied");
+    err.name = "AccessDenied";
+    err.$metadata = { httpStatusCode: 403 };
+    h.headError = err;
+    const r = result(await report({ outcome: "shipped", merge_commit: MERGE_COMMIT }));
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBe("shipped_requires_execution_and_merge_commit");
+    expect(r.missing).toEqual(["pipeline_execution_id"]);
+    expect(wroteRecord()).toBe(false);
+    expect(transitioned()).toBe(false);
+    expect(h.warns.join("\n")).toMatch(/indeterminate/);
+  });
+
+  it("(7) deploy-blocked and static-ci-only still succeed, and log DEPRECATED (DL-030)", async () => {
+    for (const oc of ["deploy-blocked", "static-ci-only"]) {
+      h.puts.length = 0;
+      h.warns.length = 0;
+      h.invokes.length = 0;
+      const res = await report({ outcome: oc, block_reason: "pipeline stage Deploy failed" });
+      expect(result(res).status).toBe("complete");
+      expect(record().outcome).toBe(oc);
+      expect(transitioned()).toBe(true);
+      expect(h.warns.join("\n")).toContain(`[report_completion] DEPRECATED outcome ${oc} (DL-030)`);
+    }
+  });
+
+  it("(8) a malformed execution id is dropped with a warning — and for shipped that counts as missing", async () => {
+    // Not stored on a non-ship report…
+    await report({ pipeline_execution_id: "not-a-pipeline-execution-id" });
+    expect("pipeline_execution_id" in record()).toBe(false);
+    expect(h.warns.join("\n")).toMatch(/malformed pipeline_execution_id/);
+    // …and a shipped report that supplied only that is refused, because a mangled
+    // id reads as proof of a deploy nobody can look up.
+    h.puts.length = 0;
+    h.invokes.length = 0;
+    const r = result(await report({ outcome: "shipped", merge_commit: MERGE_COMMIT, pipeline_name: PIPELINE, pipeline_execution_id: EXEC_ID.replace("b", "z") }));
+    expect(r.ok).toBe(false);
+    expect(r.missing).toEqual(["pipeline_execution_id"]);
+    expect(wroteRecord()).toBe(false);
+    expect(transitioned()).toBe(false);
+  });
+
+  it("(9) a record written without the new fields keeps exactly the pre-4706 key set", async () => {
+    await report({});
+    expect(Object.keys(record()).sort()).toEqual([...BASE_KEYS].sort());
+    // Blank values are the same as absent — no keys, no warnings.
+    h.puts.length = 0;
+    h.warns.length = 0;
+    await report({ pipeline_execution_id: "  ", pipeline_name: "" });
+    expect(Object.keys(record()).sort()).toEqual([...BASE_KEYS].sort());
+    expect(h.warns.join("\n")).not.toMatch(/pipeline_/);
   });
 });
 

@@ -50,13 +50,27 @@
  * A record is only written when the Lambda can PROVE the commit being deployed is
  * the merge of that approved head — it asks GitHub about the caller's pr_url
  * (merged / head.sha / merge_commit_sha), which is what GITHUB_TOKEN below is for.
- * The token is read-only and optional: with none, no record is ever written and
- * every deploy keeps its human gate.
+ * The token is read-only and confers no approval capability.
+ *
+ * ─── Why the token is now a deploy-time REQUIREMENT (TEAM-4706) ───────────────
+ * "Optional" is technically true and operationally a trap: a Lambda with no token
+ * can never verify the merge binding, so it answers
+ * preapproval:{recorded:false, reason:"merge_binding_unverified"} forever and
+ * EVERY deploy pages a human — the exact drift this deployment hit in prod, and
+ * invisible until a release stalls at a gate nobody expected. Its sibling failure
+ * was a role without s3:PutObject on the ship-approvals prefix
+ * (reason:"record_write_failed"). So this script now REFUSES to deploy a Lambda
+ * that cannot record an approval unless the operator opts out explicitly with
+ * --allow-no-github-token, and scripts/verify-infra.sh asserts both prerequisites
+ * against the live account (the env var NAME and the IAM Resource - never the
+ * secret's value).
  *
  * Idempotent / re-runnable. Account-guarded via deploy/config.sh conventions.
  *
  * Usage:
  *   AWS_PROFILE=tycenj-prod node deploy/setup-pipeline-tools-lambda.mjs
+ *   # deliberately without a token (every deploy will page a human):
+ *   AWS_PROFILE=tycenj-prod node deploy/setup-pipeline-tools-lambda.mjs --allow-no-github-token
  *
  * Env (all optional — sane prod defaults):
  *   PIPELINE_NAME   default agentcore-hub-deploy   (the CodePipeline)
@@ -68,13 +82,18 @@
  *                   function, so Pipeline___capabilities advertises the tool).
  *                   Anything else — including unset — omits the grant entirely.
  *   GITHUB_TOKEN    a READ-ONLY GitHub token (public_repo / repo:read is enough).
+ *                   GITHUB_PAT is accepted as an alias — many operators have only
+ *                   that one exported.
  *                   Used for one thing: proving pr_url's PR is merged with
  *                   head.sha == approved_head_sha and merge_commit_sha ==
  *                   commit_sha before a ship-approval record may be written.
- *                   Unset (or empty) = no record can ever be written, so every
- *                   deploy keeps its human gate — the pre-TEAM-4525 behaviour.
+ *                   REQUIRED unless --allow-no-github-token is passed: with
+ *                   neither var set no record can ever be written, so every deploy
+ *                   pages a human — the pre-TEAM-4525 behaviour, which is a
+ *                   regression rather than a default worth defaulting to.
  *                   Only sent when non-empty, so it never clobbers a token an
- *                   operator set out of band.
+ *                   operator set out of band. Never printed, logged or echoed by
+ *                   this script — only the variable NAME ever appears in output.
  *                   (GITHUB_TIMEOUT_MS, read by the Lambda itself, defaults to
  *                   5000: that call is on a 60s Lambda's critical path, so a slow
  *                   API must fail closed rather than burn the whole budget.)
@@ -191,10 +210,40 @@ export function resolveEnv(env = process.env) {
     ARTIFACT_BUCKET: env.ARTIFACT_BUCKET || "",
     // TEAM-4525: read-only GitHub credential used ONLY to prove that a
     // start_deploy's commit_sha really is the merge of the head SHA a human
-    // approved (verifyMergeBinding). Optional: with no token no ship-approval
-    // record can be written, so every deploy keeps its human gate — the safe
-    // default. It confers no approval capability.
-    GITHUB_TOKEN: env.GITHUB_TOKEN || "",
+    // approved (verifyMergeBinding). It confers no approval capability.
+    // GITHUB_PAT is an accepted alias (TEAM-4706): the two names are equivalent
+    // here, GITHUB_TOKEN wins, and with NEITHER set main() refuses to deploy —
+    // a token-less Lambda answers merge_binding_unverified forever and pages a
+    // human on every deploy. --allow-no-github-token is the explicit opt-out.
+    GITHUB_TOKEN: env.GITHUB_TOKEN || env.GITHUB_PAT || "",
+  };
+}
+
+/**
+ * The deploy-time GitHub-token guard, as a pure decision (TEAM-4706).
+ *
+ * Separated from main() so the DECISION is unit-assertable without executing a
+ * deploy: main() is only the caller (print + exit). `token` is never inspected
+ * beyond "is there one" and is NEVER placed in the returned message — only the
+ * variable NAMES may appear, because a message like this ends up in CI logs.
+ *
+ * ok:false     → refuse the deploy (no token, no opt-out).
+ * ok:true      → proceed; a non-null message is a WARNING that must be printed
+ *                (the operator opted out and every deploy will page a human).
+ */
+export function githubTokenGuard({ token, allowNoGithubToken } = {}) {
+  if (token) return { ok: true, message: null };
+  if (allowNoGithubToken) {
+    return {
+      ok: true,
+      message:
+        "WARNING: no GITHUB_TOKEN (or GITHUB_PAT) and --allow-no-github-token was passed - the tools Lambda can never verify a merge binding, so no ship-approval record is ever recorded, the approve-once skip can never fire, and EVERY deploy will page a human.",
+    };
+  }
+  return {
+    ok: false,
+    message:
+      "Refusing to deploy: set GITHUB_TOKEN (or GITHUB_PAT) to a read-only GitHub token, or pass --allow-no-github-token - without one the Lambda cannot verify a merge binding, records no ship-approval, and EVERY deploy pages a human.",
   };
 }
 
@@ -426,6 +475,21 @@ async function main() {
     }
   }
 
+  // Same place, same reason: a prerequisite the deploy cannot satisfy must fail
+  // in one second, before any AWS call. A Lambda deployed without a GitHub token
+  // cannot record a ship-approval, so DL-028's conditional gate silently becomes
+  // an unconditional one and every deploy pages a human (TEAM-4706). Only the
+  // variable NAMES are ever printed — never the token.
+  const gate = githubTokenGuard({
+    token: GITHUB_TOKEN,
+    allowNoGithubToken: process.argv.includes("--allow-no-github-token"),
+  });
+  if (!gate.ok) {
+    console.error(gate.message);
+    process.exit(1);
+  }
+  if (gate.message) console.warn(gate.message);
+
   const iam = new IAMClient({ region: REGION });
   const lambda = new LambdaClient({ region: REGION });
   const sts = new STSClient({ region: REGION });
@@ -445,6 +509,15 @@ async function main() {
       PIPELINE_CI_START_BUILD === "1"
         ? `StartBuild GRANTED on ${CI_PROJECT}`
         : "StartBuild not granted (PIPELINE_CI_START_BUILD unset)"
+    }`
+  );
+  // PRESENCE only. The value is a credential and never appears in this script's
+  // output, in any branch.
+  console.log(
+    `GitHub:   ${
+      GITHUB_TOKEN
+        ? "GITHUB_TOKEN set (merge binding verifiable - approve-once can record)"
+        : "no GITHUB_TOKEN/GITHUB_PAT - no ship-approval record, every deploy pages a human"
     }`
   );
 
@@ -507,9 +580,11 @@ async function main() {
     PIPELINE_REGIONS,
     ARTIFACT_BUCKET: ARTIFACT_BUCKET || `agentcore-hub-artifacts-${ACCOUNT}-${REGION}`,
   };
-  // Only when supplied: envVars is spread OVER existingEnv, so an unconditional
-  // empty string here would wipe a token an operator set out of band and silently
-  // turn every conditional gate back into a human one.
+  // Only when supplied: envVars is spread OVER existingEnv (see the merge below),
+  // so an unconditional empty string here would wipe a token an operator set out
+  // of band and silently turn every conditional gate back into a human one. Under
+  // --allow-no-github-token this is exactly what keeps an already-working Lambda
+  // working. The value is written to the function and nowhere else — never logged.
   if (GITHUB_TOKEN) envVars.GITHUB_TOKEN = GITHUB_TOKEN;
 
   // ─── 3. Create/update the function ───────────────────────────────────────────
