@@ -2273,7 +2273,7 @@ def Pipeline___capabilities(pipeline_name: str = "") -> str:
 # ─── Workflow Output Tools ────────────────────────────────────────────────────
 
 @tool
-def WorkflowOutput___report_completion(ticket_id: str, summary: str, artifacts: str = "", branch: str = "", commit_sha: str = "", pr_url: str = "", evidence_kind: str = "", evidence_keys: str = "", ci_status: str = "", ci_build_id: str = "", ci_head_sha: str = "", merge_commit: str = "", approved_head_sha: str = "", outcome: str = "", block_reason: str = "") -> str:
+def WorkflowOutput___report_completion(ticket_id: str, summary: str, artifacts: str = "", branch: str = "", commit_sha: str = "", pr_url: str = "", evidence_kind: str = "", evidence_keys: str = "", ci_status: str = "", ci_build_id: str = "", ci_head_sha: str = "", merge_commit: str = "", approved_head_sha: str = "", outcome: str = "", block_reason: str = "", pipeline_execution_id: str = "", pipeline_name: str = "") -> str:
     """Report that your work is complete. This saves your completion summary to S3 AND automatically transitions your Jira ticket to Done. Do NOT call Tickets___transition_ticket to mark your own ticket done — this tool handles that for you.
 
     Args:
@@ -2316,6 +2316,16 @@ def WorkflowOutput___report_completion(ticket_id: str, summary: str, artifacts: 
             "static-ci-only" | "handoff". Anything else is dropped by the Lambda.
         block_reason: one line on why the outcome is not "shipped" (required with
             "deploy-blocked").
+        pipeline_execution_id: ship phase only — the CodePipeline execution id
+            whose Pipeline___get_state returned succeeded:true for this
+            merge_commit. REQUIRED together with merge_commit for
+            outcome="shipped" on the pipeline path; the Lambda refuses the
+            report (shipped_requires_execution_and_merge_commit) unless the run
+            is provably the legacy DEPLOY.md path — no pipeline_name and no
+            cd-ledger.json. Never invent one: report the execution you actually
+            watched reach succeeded, not the one you started.
+        pipeline_name: ship phase only — the pipeline named in "## Pipeline
+            Mode", i.e. the one the execution above belongs to.
     """
     # Include workflow_id and agent_id from invocation context for journey logging (not exposed to agent)
     payload = {
@@ -2352,6 +2362,15 @@ def WorkflowOutput___report_completion(ticket_id: str, summary: str, artifacts: 
         payload["outcome"] = outcome.strip().lower()
     if block_reason.strip():
         payload["block_reason"] = block_reason.strip()
+    # TEAM-4708: the ship-contract pair the Lambda's shipped rail reads
+    # (shipped_requires_execution_and_merge_commit). Same additive rule as
+    # merge_commit / approved_head_sha above — the Lambda owns the shape check
+    # on the execution id, so the tool forwards what the agent said verbatim and
+    # absent stays absent.
+    if pipeline_execution_id.strip():
+        payload["pipeline_execution_id"] = pipeline_execution_id.strip()
+    if pipeline_name.strip():
+        payload["pipeline_name"] = pipeline_name.strip()
     return _invoke_lambda(WORKFLOW_OUTPUT_LAMBDA, "WorkflowOutput___report_completion", payload)
 
 
