@@ -137,6 +137,7 @@ aws iam put-role-policy \
           \"dynamodb:GetItem\",
           \"dynamodb:Query\",
           \"dynamodb:BatchWriteItem\",
+          \"dynamodb:BatchGetItem\",
           \"dynamodb:DescribeTable\"
         ],
         \"Resource\": [
