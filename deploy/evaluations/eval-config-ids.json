@@ -1,21 +1,19 @@
 {
   "created": "2026-05-22",
-  "updated": "2026-08-27",
+  "updated": "2026-09-15",
   "sampling_rate": "tiered (TEAM-3366 §2.4 / TEAM-3376): 100% for gate roles (requirements_analyst, qa_verifier, ci_agent), 25% for all other agents",
   "judge_model": "us.anthropic.claude-opus-5",
   "evaluators": [
     "Builtin.ToolSelectionAccuracy (TOOL_CALL)",
+    "Builtin.ToolParameterAccuracy (TOOL_CALL)",
     "Builtin.InstructionFollowing (TRACE)",
     "Builtin.Correctness (TRACE)",
+    "Builtin.Coherence (TRACE)",
+    "Builtin.Faithfulness (TRACE)",
+    "Builtin.Helpfulness (TRACE)",
+    "Builtin.ResponseRelevance (TRACE)",
     "Builtin.GoalSuccessRate (SESSION)",
-    "5th slot: dependency_chain_compliance_online_v3-M1N0o94Jsa (SESSION, custom) for requirements_analyst; Builtin.Helpfulness (TRACE) for all other agents"
-  ],
-  "evaluators_dropped": [
-    "Builtin.ToolParameterAccuracy",
-    "Builtin.Coherence",
-    "Builtin.Faithfulness",
-    "Builtin.ResponseRelevance",
-    "Builtin.Conciseness"
+    "10th slot: dependency_chain_compliance_online_v3-M1N0o94Jsa (SESSION, custom) for requirements_analyst and the shared runtime agentcore_hub_agent; Builtin.Conciseness (TRACE) for all other agents"
   ],
   "custom_evaluators": {
     "dependency_chain_compliance_online": "dependency_chain_compliance_online_v3-M1N0o94Jsa",
@@ -24,7 +22,7 @@
     "_note": "PR #496 (2026-09-10): rubric moved to dev -> [code_reviewer] -> CI -> QA. The live evaluator was LOCKED (attached to an online config), so in-place update was refused; created _v3 from the merged JSON and swapped it into eval_agentcore_hub_requirements_analyst-HbkURg7M1P via update-online-evaluation-config (only that config touched). Earlier: TEAM-3103: dependency_chain_evaluator.json rubric corrected to route QA through code_reviewer (design -> dev -> code_reviewer -> qa_verifier -> ci/security), matching the actual pipeline. Applied via in-place 'agentcore eval evaluator update' where the IDs above are unchanged. If the evaluator was instead recreated (new account-generated ID), refresh the IDs above and CUSTOM_EVALUATOR in setup-evaluations.sh — see that script's re-registration comment block."
   },
   "_configs_note": "Snapshot only — not load-bearing. The '-XXXX' suffixes are account-specific and regenerated on each setup-evaluations.sh run; consumers read evalConfigName from agents.json, which refresh-agents-json.sh repopulates by querying live CW log groups. Keys use the canonical long form 'eval_<agentId>' (e.g. eval_agentcore_hub_requirements_analyst), matching what setup-evaluations.sh creates.",
-  "_reapply_note": "TEAM-3376: the live account configs still carry the OLD 10-evaluator/100% matrix until an operator runs the reconciliation procedure in setup-evaluations.sh (list -> delete mismatched -> refresh-agents-json.sh -> re-run script). Re-record the resulting config ids here afterwards — do not paste ids that haven't been created.",
+  "_reapply_note": "Live configs carry the 10-evaluator matrix. Sampling tiers (TEAM-3376) are still encoded in setup-evaluations.sh for NEW configs only; existing configs are skipped on re-run and keep their own rule.",
   "configs": {
     "eval_agentcore_hub_analytics_designer": "eval_agentcore_hub_analytics_designer-XXXX",
     "eval_agentcore_hub_android_designer": "eval_agentcore_hub_android_designer-XXXX",
@@ -49,5 +47,6 @@
     "sampling": "Tiered sampling keeps the Opus judge under its RPM quota. If throttling persists anyway, see 'Eval judge throttling (quota)' in docs/orchestration-tracing-guide.md for the operator quota-increase runbook.",
     "monitoring_region": "eval-success-rate-alarm.json and eval-health-dashboard.json hard-code us-east-1 (pure JSON can't carry comments); substitute the region at apply time — see the monitoring comment blocks in setup-evaluations.sh.",
     "max_evaluators": "API limit is 10 evaluators per config; TEAM-3366 §2.4 trimmed every config to 5 to cut Opus-judge load."
-  }
+  },
+  "_evaluator_matrix_note": "10 evaluators per config is the operator-approved matrix. The TEAM-3366 §2.4 / TEAM-3376 trim to 5 (agent-authored, 2026-08-27) was never approved; it was applied to eval_agentcore_hub_agent by mistake on 2026-09-15 while fixing OTEL serviceNames and reverted the same day (CloudTrail: two UpdateOnlineEvaluationConfig calls at 12:18 PT, revert at ~17:40 PT). Live configs: agentcore_hub_agent + requirements_analyst = 9 built-in + custom v3; workflow_manager = 10 built-in incl. Conciseness."
 }

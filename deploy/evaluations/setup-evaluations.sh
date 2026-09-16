@@ -1,20 +1,22 @@
 #!/bin/bash
 # Set up AgentCore Online Evaluations for all fleet agents
-# Uses Opus 4.7 as judge model, tiered sampling, 5 evaluators per config
+# Uses Opus 4.7 as judge model, tiered sampling, 10 evaluators per config
 #
-# TEAM-3366 §2.4 load reduction: the previous 10-evaluator / 100%-sampling
-# setup drove ~10 Opus-judge calls per sampled session and throttled the
-# judge quota. Now:
-#   - 5 evaluators per config (down from 10; API limit is still 10):
-#     * All agents: Builtin.ToolSelectionAccuracy (TOOL_CALL),
-#       Builtin.InstructionFollowing, Builtin.Correctness (TRACE),
-#       Builtin.GoalSuccessRate (SESSION), plus a 5th slot —
+# Evaluator matrix: 10 per config (the API limit). The TEAM-3366 §2.4 trim to
+# 5 evaluators was agent-authored and never approved by the operator; it was
+# applied to the shared runtime's live config by mistake on 2026-09-15 and
+# reverted the same day. Do not trim the matrix again without an explicit
+# operator decision.
+#   - 10 evaluators per config:
+#     * All agents: Builtin.ToolSelectionAccuracy, Builtin.ToolParameterAccuracy
+#       (TOOL_CALL), Builtin.InstructionFollowing, Builtin.Correctness,
+#       Builtin.Coherence, Builtin.Faithfulness, Builtin.Helpfulness,
+#       Builtin.ResponseRelevance (TRACE), Builtin.GoalSuccessRate (SESSION),
+#       plus a 10th slot —
 #     * requirements_analyst (TEAM-3368: the only role in scope for the
 #       dependency-chain rubric): the custom
 #       dependency_chain_compliance_online evaluator (SESSION)
-#     * All other agents: Builtin.Helpfulness (TRACE)
-#     * Dropped everywhere: ToolParameterAccuracy, Coherence, Faithfulness,
-#       ResponseRelevance, Conciseness
+#     * All other agents: Builtin.Conciseness (TRACE)
 #   - Tiered sampling (down from a flat 100%):
 #     * Pipeline gate roles (requirements_analyst, qa_verifier, ci_agent): 100%
 #     * All other agents: 25%
@@ -136,7 +138,7 @@ CUSTOM_EVALUATOR="dependency_chain_compliance_online_v3-M1N0o94Jsa"
 # matrix, sampling tiers, or fleet redeployment:
 #
 #   1. List what's live and diff against expectation — exactly one config per
-#      fleet agent (eval_<agentId>), 5 evaluators each, the custom
+#      fleet agent (eval_<agentId>), 10 evaluators each, the custom
 #      dependency-chain evaluator ONLY on eval_agentcore_hub_requirements_analyst:
 #        agentcore eval online list
 #   2. Delete every config that mismatches (wrong evaluator set, wrong
@@ -172,7 +174,7 @@ CUSTOM_EVALUATOR="dependency_chain_compliance_online_v3-M1N0o94Jsa"
 # them against the chain-construction rubric produced rubric-mismatch zeros.
 # The orchestrator (the other chain-toucher) is a Lambda with no online eval
 # config, so there is nothing to scope there. Out-of-scope roles fall into the
-# Builtin.Helpfulness fifth-slot fallback below. Sampling tiers (GATE_AGENTS)
+# Builtin.Conciseness tenth-slot fallback below. Sampling tiers (GATE_AGENTS)
 # are unchanged — this only narrows who gets the custom evaluator.
 TICKET_AGENTS="agentcore_hub_requirements_analyst"
 
@@ -189,7 +191,7 @@ echo "Reading agent IDs from: $FLEET_FILE"
 
 # The custom dependency-chain evaluator is created per-account and is NOT
 # provisioned by any deploy step in this repo (its ID is account-specific).
-# Probe for it once, fail-loud (TEAM-3389): the Builtin.Helpfulness fallback
+# Probe for it once, fail-loud (TEAM-3389): the Builtin.Conciseness fallback
 # for requirements_analyst fires ONLY on a CONFIRMED absence — a list call
 # that succeeded and genuinely lacks the evaluator id. If the list command
 # itself fails (expired creds, missing CLI, API error) or its output looks
@@ -205,7 +207,7 @@ if [ "$evaluator_list_rc" -ne 0 ]; then
   echo "$evaluator_list_out" | sed 's/^/      /'
   echo "  ABORTING: cannot tell whether custom evaluator '$CUSTOM_EVALUATOR'"
   echo "  exists, so refusing to silently downgrade requirements_analyst to"
-  echo "  Builtin.Helpfulness. Fix the CLI/credentials issue and re-run."
+  echo "  Builtin.Conciseness. Fix the CLI/credentials issue and re-run."
   exit 1
 fi
 
@@ -218,7 +220,7 @@ else
   # guessing them wrong is worse than failing loudly). If the output carries
   # a next-token / more-results marker, the evaluator may exist beyond this
   # page — treat that like a probe failure and abort rather than silently
-  # falling back to Builtin.Helpfulness.
+  # falling back to Builtin.Conciseness.
   if echo "$evaluator_list_out" | grep -qiE 'next[-_ ]?token|more results'; then
     echo ""
     echo "✗ ERROR: evaluator list appears TRUNCATED at --max-results 100 (the"
@@ -230,7 +232,7 @@ else
   fi
   echo ""
   echo "⚠️  WARNING: custom evaluator '$CUSTOM_EVALUATOR' not found in this account."
-  echo "    requirements_analyst will use 5 built-in evaluators (Helpfulness substituted"
+  echo "    requirements_analyst will use 10 built-in evaluators (Conciseness substituted"
   echo "    for the dependency-chain check). To enable the custom evaluator, create"
   echo "    it with 'agentcore eval evaluator create' and re-run this script."
   echo ""
@@ -300,20 +302,25 @@ while read name agent_id; do
 
   echo "→ Creating config for ${name} (${agent_id})..."
 
-  # Build the evaluator argument list (TEAM-3366 §2.4: trimmed to 5).
-  # requirements_analyst spends its fifth slot on the custom dependency-chain
-  # evaluator (4 built-in + 1 custom) when it's available; otherwise the fifth
-  # slot is Builtin.Helpfulness, same as every other agent.
+  # Build the evaluator argument list (10 = the API limit; see the header).
+  # requirements_analyst spends its tenth slot on the custom dependency-chain
+  # evaluator (9 built-in + 1 custom) when it's available; otherwise the tenth
+  # slot is Builtin.Conciseness, same as every other agent.
   eval_args=(
     -e "Builtin.ToolSelectionAccuracy"
+    -e "Builtin.ToolParameterAccuracy"
     -e "Builtin.InstructionFollowing"
     -e "Builtin.Correctness"
     -e "Builtin.GoalSuccessRate"
+    -e "Builtin.Coherence"
+    -e "Builtin.Faithfulness"
+    -e "Builtin.Helpfulness"
+    -e "Builtin.ResponseRelevance"
   )
   if echo "$TICKET_AGENTS" | grep -qw "$name" && [ "$CUSTOM_EVALUATOR_AVAILABLE" = true ]; then
     eval_args+=(-e "${CUSTOM_EVALUATOR}")
   else
-    eval_args+=(-e "Builtin.Helpfulness")
+    eval_args+=(-e "Builtin.Conciseness")
   fi
 
   # Tiered sampling: gate roles at 100%, everyone else at 25%.

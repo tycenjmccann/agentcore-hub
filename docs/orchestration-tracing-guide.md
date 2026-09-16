@@ -258,10 +258,12 @@ Opus judge; sessions classify as `error` in eval batches; `EvalThrottleRate` /
 (`invoke_agent` spans) is healthy.
 
 **First response (no quota change needed)**: verify the load-reduction
-mitigations are actually applied — the trimmed 5-evaluator matrix and tiered
-sampling (100% gate roles / 25% others) in
+mitigation is actually applied — tiered sampling (100% gate roles / 25%
+others) in
 `deploy/evaluations/setup-evaluations.sh`, reconciled against the live configs
-per that script's reconciliation section. That alone cuts judge calls ~4-8×.
+per that script's reconciliation section. (The 5-evaluator trim from the same
+ticket was never operator-approved and was reverted on 2026-09-15; the matrix
+is 10 evaluators per config.)
 
 **Step 1 — identify the exact quota (grep, don't guess).** Quota names vary by
 model/version, so list them and filter rather than assuming a code:
@@ -277,8 +279,8 @@ The judge quota's expected name pattern is
 Record the `QuotaCode` and the current `Value` before requesting anything.
 
 **Step 2 — request an increase to 200 requests/minute.** Design derivation
-(TEAM-3366 §2.5): after the §2.4 load reduction (5 evaluators, tiered
-sampling) the judge runs at roughly ~16 RPM sustained, but two sessions
+(TEAM-3366 §2.5): after the §2.4 load reduction (tiered sampling; the
+5-evaluator trim has since been reverted) the judge runs at roughly ~16 RPM sustained, but two sessions
 completing simultaneously can burst to ~162 RPM — so 200 RPM gives headroom
 without over-asking:
 
