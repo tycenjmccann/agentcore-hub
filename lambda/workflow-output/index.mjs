@@ -223,7 +223,7 @@ const CI_FIELD_MAX_LEN = 128;
 const SHIP_OUTCOMES = ["shipped", "deploy-blocked", "static-ci-only", "handoff"];
 const BLOCK_REASON_MAX_LEN = 500;
 
-// ─── DL-029 ship-report contract (TEAM-4706) ──────────────────────────────────
+// ─── DL-030 ship-report contract (TEAM-4706) ──────────────────────────────────
 // A ship report is a claim that production changed, and this tool used to take
 // that claim entirely on trust: `outcome:"shipped"` with no merge commit and no
 // deploy execution recorded still wrote the record and closed the ticket, so a
@@ -234,7 +234,7 @@ const BLOCK_REASON_MAX_LEN = 500;
 // shipContractRefusal below.
 const PIPELINE_EXECUTION_ID_RE = /^[0-9a-f-]{36}$/;
 
-// Still in SHIP_OUTCOMES, still accepted, still transition the ticket. DL-029
+// Still in SHIP_OUTCOMES, still accepted, still transition the ticket. DL-030
 // only deprecates them in the log so a blueprint that keeps emitting one is
 // visible; removing them would break existing records and the orchestrator's
 // evidence harvest (completion.mjs SHIP_BLOCKED_OUTCOMES), which reads them.
@@ -395,16 +395,16 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
     if (SHIP_OUTCOMES.includes(shipOutcome)) {
       report.outcome = shipOutcome;
       // Accepted, transitions as before — logged only so a blueprint still
-      // emitting a DL-029-deprecated verdict is visible in CloudWatch.
+      // emitting a DL-030-deprecated verdict is visible in CloudWatch.
       if (DEPRECATED_SHIP_OUTCOMES.includes(shipOutcome)) {
-        console.warn(`[report_completion] DEPRECATED outcome ${shipOutcome} (DL-029)`);
+        console.warn(`[report_completion] DEPRECATED outcome ${shipOutcome} (DL-030)`);
       }
     } else console.warn(`[report_completion] dropping unknown outcome "${shipOutcome}" (expected ${SHIP_OUTCOMES.join("|")})`);
   }
   const blockReason = typeof block_reason === "string" ? block_reason.trim() : "";
   if (blockReason) report.block_reason = blockReason.slice(0, BLOCK_REASON_MAX_LEN);
 
-  // DL-029 gate — BEFORE the S3 write, the journey event and the Done
+  // DL-030 gate — BEFORE the S3 write, the journey event and the Done
   // transition, so a refused report leaves no trace of a completion that did not
   // happen. Refusals are returned, not thrown: the handler JSON-stringifies this
   // object into the tool result, so the agent reads a legible reason instead of

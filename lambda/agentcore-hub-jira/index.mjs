@@ -228,7 +228,7 @@ async function loadAgentPhases() {
   return AGENT_PHASES;
 }
 
-// ─── Ship-phase completion-record gate (TEAM-4706, DL-029) ───────────────────
+// ─── Ship-phase completion-record gate (TEAM-4706, DL-030) ───────────────────
 //
 // A ship-phase ticket may not reach Done unless the agent's own completion record
 // exists at s3://$ARTIFACT_BUCKET/completions/<ticket_id>.json — the record
@@ -887,7 +887,7 @@ async function transitionTicket(params) {
     }
   }
 
-  // TEAM-4706 (DL-029): a ship-phase ticket cannot reach Done without its
+  // TEAM-4706 (DL-030): a ship-phase ticket cannot reach Done without its
   // completion record. Placed before the reason comment and the blocker links so a
   // refused transition leaves NO trace in Jira. `effectiveStatus` (not the raw
   // transition_id) is what is tested, so a "skip" — which resolves to Done, and is

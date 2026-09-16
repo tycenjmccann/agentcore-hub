@@ -226,7 +226,7 @@ async function loadAgentPhases() {
   return AGENT_PHASES;
 }
 
-// ─── Ship-phase completion-record gate (TEAM-4706, DL-029) ───────────────────
+// ─── Ship-phase completion-record gate (TEAM-4706, DL-030) ───────────────────
 //
 // A ship-phase ticket may not reach done unless the agent's own completion record
 // exists at s3://$ARTIFACT_BUCKET/completions/<ticket_id>.json — the record
@@ -939,7 +939,7 @@ async function transitionIssue(args) {
     );
   }
 
-  // TEAM-4706 (DL-029): a ship-phase ticket cannot reach done without its
+  // TEAM-4706 (DL-030): a ship-phase ticket cannot reach done without its
   // completion record. Placed before the update is built so a refused transition
   // writes nothing at all. The RESOLVED target is what is tested, not the requested
   // transition id, so the `skip` row — which is how a blocked ticket reaches done

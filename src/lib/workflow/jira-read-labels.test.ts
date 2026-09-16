@@ -1,5 +1,5 @@
 /**
- * TEAM-4706 (DL-029): Jira labels must reach the wire.
+ * TEAM-4706 (DL-030): Jira labels must reach the wire.
  *
  * Consumers classify a human gate ticket by its labels — the Telegram bridge's
  * gateTicketOf() reads GET /api/workflow/{id}/tickets and has to tell a

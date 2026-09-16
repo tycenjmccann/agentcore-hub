@@ -22,7 +22,7 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
  * every report_completion assertion above/below is untouched by the redesign.
  */
 /**
- * `heads` / `headError` back the DL-029 cd-ledger probe (TEAM-4706). The probe's
+ * `heads` / `headError` back the DL-030 cd-ledger probe (TEAM-4706). The probe's
  * whole point is that a definite 404 and a failed look are DIFFERENT answers, so
  * the stub has to be able to produce each on demand: by default HeadObject
  * answers from the same object map (absent key → NotFound + 404), and a test can
@@ -90,7 +90,7 @@ vi.mock("@aws-sdk/client-s3", () => ({
 vi.mock("@aws-sdk/s3-request-presigner", () => ({ getSignedUrl: async () => "https://signed" }));
 vi.mock("@aws-sdk/client-lambda", () => ({
   // The Done transition itself is not under test — a plain success keeps the log
-  // quiet — but `h.invokes` records every call, because the DL-029 refusals below
+  // quiet — but `h.invokes` records every call, because the DL-030 refusals below
   // are only meaningful if the ticket was NOT transitioned.
   LambdaClient: class {
     async send(cmd) {
@@ -340,7 +340,7 @@ describe("report_completion — approved_head_sha", () => {
   });
 });
 
-// ─── TEAM-4706 / DL-029: the ship-report contract ─────────────────────────────
+// ─── TEAM-4706 / DL-030: the ship-report contract ─────────────────────────────
 //
 // `outcome:"shipped"` is the only durable claim that production changed, and the
 // tool used to take it on trust — a record with no merge commit and no deploy
@@ -461,7 +461,7 @@ describe("report_completion — ship-report contract (pipeline_execution_id / pi
     expect(h.warns.join("\n")).toMatch(/indeterminate/);
   });
 
-  it("(7) deploy-blocked and static-ci-only still succeed, and log DEPRECATED (DL-029)", async () => {
+  it("(7) deploy-blocked and static-ci-only still succeed, and log DEPRECATED (DL-030)", async () => {
     for (const oc of ["deploy-blocked", "static-ci-only"]) {
       h.puts.length = 0;
       h.warns.length = 0;
@@ -470,7 +470,7 @@ describe("report_completion — ship-report contract (pipeline_execution_id / pi
       expect(result(res).status).toBe("complete");
       expect(record().outcome).toBe(oc);
       expect(transitioned()).toBe(true);
-      expect(h.warns.join("\n")).toContain(`[report_completion] DEPRECATED outcome ${oc} (DL-029)`);
+      expect(h.warns.join("\n")).toContain(`[report_completion] DEPRECATED outcome ${oc} (DL-030)`);
     }
   });
 

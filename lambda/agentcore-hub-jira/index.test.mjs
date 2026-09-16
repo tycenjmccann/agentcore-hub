@@ -1119,7 +1119,7 @@ for (const c of CLAMP_CASES) {
   });
 }
 
-// ─── TEAM-4706 (DL-029): a ship-phase ticket cannot go Done with no record ─────
+// ─── TEAM-4706 (DL-030): a ship-phase ticket cannot go Done with no record ─────
 //
 // The record at s3://$ARTIFACT_BUCKET/completions/<ticket_id>.json, written by
 // lambda/workflow-output's report_completion BEFORE it asks this Lambda for the

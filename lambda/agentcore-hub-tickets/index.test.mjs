@@ -712,7 +712,7 @@ describe("labels_add — the op name + envelope the orchestrator sends (TEAM-412
 describe("transition_ticket — reaching done from in_progress vs from blocked (TEAM-4130 F1)", () => {
   const transition = (args) => handler({ name: "Tickets___transition_ticket", arguments: args });
 
-  // TEAM-4706: these three cases CLOSE the run's ship ticket, which since DL-029
+  // TEAM-4706: these three cases CLOSE the run's ship ticket, which since DL-030
   // requires its completion record to exist (the describe below owns that rule).
   // The record is provisioned here so each test still asserts exactly what it was
   // written to assert — which transition row `done` resolves through — rather than
@@ -904,7 +904,7 @@ describe("create_ticket / edit_issue — surrogate-safe clamp (TEAM-4537)", () =
 });
 
 /**
- * TEAM-4706 (DL-029) — a SHIP-PHASE ticket cannot reach done without its
+ * TEAM-4706 (DL-030) — a SHIP-PHASE ticket cannot reach done without its
  * completion record (s3://$ARTIFACT_BUCKET/completions/<ticket_id>.json).
  *
  * That record, written by lambda/workflow-output's report_completion BEFORE it
