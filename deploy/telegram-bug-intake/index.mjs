@@ -71,6 +71,7 @@ import { BedrockRuntimeClient, ConverseCommand } from "@aws-sdk/client-bedrock-r
 import { DynamoDBClient, GetItemCommand, PutItemCommand, DeleteItemCommand, ScanCommand } from "@aws-sdk/client-dynamodb";
 import { TranscribeStreamingClient, StartStreamTranscriptionCommand } from "@aws-sdk/client-transcribe-streaming";
 import { CodePipelineClient, GetPipelineStateCommand, PutApprovalResultCommand } from "@aws-sdk/client-codepipeline";
+import { STSClient, AssumeRoleCommand } from "@aws-sdk/client-sts";
 import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
 import { EventBridgeClient, PutEventsCommand } from "@aws-sdk/client-eventbridge";
 import { parseCdRegistry, pipelineProjects } from "./cd-registry.mjs";
@@ -145,13 +146,57 @@ const transcribe = new TranscribeStreamingClient({});
 // anywhere), memoized so a warm container builds each client once. There is
 // deliberately no module-level default instance: with nothing configured the
 // deploy-approval path must construct no client at all.
-const _cpByRegion = new Map();
-function codepipelineFor(region) {
-  const key = region || DEFAULT_REGION;
-  let client = _cpByRegion.get(key);
+// Cross-account deploy gates (TEAM-4338 Part A): a registered repo can own its
+// pipeline in its OWN account. The registry entry then carries a
+// hub-cd-trigger-<slug> roleArn + externalId; we assume that role (SDK v3 creds
+// provider, cached until ~1min before expiry) to read state and to
+// PutApprovalResult there. Same-account entries carry no roleArn, so the client
+// keeps ambient creds unchanged. Mirrors the assumeRoleProvider in
+// lambda/agentcore-hub-pipeline-tools (the ONE other place that assumes these).
+let _sts = null;
+function sts() {
+  if (!_sts) _sts = new STSClient({ region: DEFAULT_REGION });
+  return _sts;
+}
+function assumeRoleProvider(roleArn, externalId) {
+  let cached = null;
+  return async () => {
+    if (cached && cached.expiresAt - 60_000 > Date.now()) return cached.creds;
+    const out = await sts().send(new AssumeRoleCommand({
+      RoleArn: roleArn,
+      RoleSessionName: "telegram-deploy-gate",
+      ...(externalId ? { ExternalId: externalId } : {}),
+      DurationSeconds: 900,
+    }));
+    const c = out.Credentials;
+    cached = {
+      creds: {
+        accessKeyId: c.AccessKeyId,
+        secretAccessKey: c.SecretAccessKey,
+        sessionToken: c.SessionToken,
+        expiration: c.Expiration,
+      },
+      expiresAt: c.Expiration ? new Date(c.Expiration).getTime() : Date.now() + 900_000,
+    };
+    return cached.creds;
+  };
+}
+
+// CodePipeline is per-REGION and, for cross-account entries, per assumed-role,
+// memoized so a warm container builds each client once. There is deliberately no
+// module-level default instance: with nothing configured the deploy-approval
+// path must construct no client at all.
+const _cpByKey = new Map();
+function codepipelineFor(region, roleArn = null, externalId = null) {
+  const r = region || DEFAULT_REGION;
+  // externalId is part of the identity so a rotated id forces a fresh client.
+  const key = `${r}|${roleArn || ""}|${externalId || ""}`;
+  let client = _cpByKey.get(key);
   if (!client) {
-    client = new CodePipelineClient({ region: key });
-    _cpByRegion.set(key, client);
+    const cfg = { region: r };
+    if (roleArn) cfg.credentials = assumeRoleProvider(roleArn, externalId);
+    client = new CodePipelineClient(cfg);
+    _cpByKey.set(key, client);
   }
   return client;
 }
@@ -2142,6 +2187,10 @@ async function loadDeployTargets() {
     targets.push({
       pipeline: projects.pipeline,
       region: projects.region || DEFAULT_REGION,
+      // null on a same-account entry → ambient creds; set only for a validated
+      // cross-account triple, so the poller/callback assume the trigger role.
+      roleArn: projects.roleArn || null,
+      externalId: projects.externalId || null,
       repo: entry.repo || null,
     });
   }
@@ -2177,7 +2226,7 @@ async function scanDeployApprovals() {
 async function scanDeployApprovalsForTarget(target) {
   let state;
   try {
-    state = await codepipelineFor(target.region).send(
+    state = await codepipelineFor(target.region, target.roleArn, target.externalId).send(
       new GetPipelineStateCommand({ name: target.pipeline }),
     );
   } catch (err) {
@@ -2467,6 +2516,10 @@ async function claimDeployApproval(pending, target) {
         // The region to send PutApprovalResult to. Claim rows written before
         // TEAM-4338 have no region; the callback falls back to DEFAULT_REGION.
         region: { S: target.region },
+        // Cross-account trigger role for the callback's PutApprovalResult; absent
+        // on same-account rows (and on legacy rows), which approve with ambient creds.
+        ...(target.roleArn ? { roleArn: { S: target.roleArn } } : {}),
+        ...(target.externalId ? { externalId: { S: target.externalId } } : {}),
         ...(target.repo ? { repo: { S: target.repo } } : {}),
         stageName: { S: pending.stageName },
         actionName: { S: pending.actionName },
@@ -2514,7 +2567,11 @@ async function handleDeployApprovalCallback(cb, chatId, action, key) {
   // The pipeline's own region, from the claim row. A row written before
   // TEAM-4338 carries no region attribute — those approve via the default
   // region, which is where the only pipeline was.
-  const cp = codepipelineFor(item.Item.region?.S || DEFAULT_REGION);
+  const cp = codepipelineFor(
+    item.Item.region?.S || DEFAULT_REGION,
+    item.Item.roleArn?.S || null,
+    item.Item.externalId?.S || null,
+  );
   try {
     await cp.send(new PutApprovalResultCommand({
       pipelineName: item.Item.pipelineName.S,

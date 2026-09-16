@@ -207,6 +207,17 @@ policy = {
             "Resource": action_resources,
         },
         {
+            # Cross-account deploy gates (TEAM-4338 Part A): a registered repo
+            # whose pipeline lives in its OWN account carries a
+            # hub-cd-trigger-<slug> roleArn + externalId in the registry; the
+            # bridge assumes that role to GetPipelineState and PutApprovalResult
+            # there. Scoped to hub-cd-trigger-* so it cannot assume anything else.
+            "Sid": "AssumeCrossAccountTrigger",
+            "Effect": "Allow",
+            "Action": ["sts:AssumeRole"],
+            "Resource": ["arn:aws:iam::*:role/hub-cd-trigger-*"],
+        },
+        {
             "Sid": "CdRegistryRead",
             "Effect": "Allow",
             "Action": ["s3:GetObject"],
