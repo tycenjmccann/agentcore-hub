@@ -538,6 +538,112 @@ function buildRuntimePayload(prompt: string, sessionId: string, format?: Payload
   return JSON.stringify(builder(prompt, sessionId));
 }
 
+/**
+ * Emit a non-SSE runtime body as one `{type:"text"}` frame (+ a usage trace).
+ *
+ * This is the historical response-shape zoo: different agent frameworks answer
+ * with different envelopes, and a body that is a single JSON document (or NDJSON
+ * yields) can only be interpreted once it is complete — so unlike the SSE path
+ * it is buffered to the end by necessity, not by accident.
+ */
+function emitBufferedBody(
+  body: string,
+  controller: ReadableStreamDefaultController<Uint8Array>,
+  encoder: TextEncoder,
+): void {
+  let text = body;
+  let tokenInfo: { input?: number; output?: number } = {};
+  try {
+    const parsed = JSON.parse(body);
+    // Extract token usage if present
+    const usage = parsed.metadata?.usage || parsed.usage;
+    if (usage) {
+      tokenInfo = { input: usage.inputTokens, output: usage.outputTokens };
+    }
+    // Handle various response structures from different agent frameworks
+    if (parsed.result?.content && Array.isArray(parsed.result.content)) {
+      // Strands/MCP style: { result: { role, content: [{ text: "..." }], metadata } }
+      text = parsed.result.content.map((b: { text?: string }) => b.text || "").join("");
+      const meta = parsed.result.metadata?.usage;
+      if (meta) tokenInfo = { input: meta.inputTokens, output: meta.outputTokens };
+    } else if (parsed.event?.contentBlockDelta?.delta?.text) {
+      // AgentCore Runtime async generator yield: { event: { contentBlockDelta: { delta: { text: "..." } } } }
+      text = parsed.event.contentBlockDelta.delta.text;
+    } else if (parsed.result && typeof parsed.result === "string") {
+      text = parsed.result;
+    } else if (parsed.output?.text) {
+      // Simple output style: { output: { text: "..." } }
+      text = parsed.output.text;
+    } else if (parsed.output?.message?.content) {
+      // Converse output: { output: { message: { content: [{ text: "..." }] } } }
+      text = parsed.output.message.content.map((b: { text?: string }) => b.text || "").join("");
+    } else if (parsed.completion) {
+      // Completion style: { completion: "..." }
+      text = parsed.completion;
+    } else if (parsed.response) {
+      // Generic response field
+      text = typeof parsed.response === "string" ? parsed.response : JSON.stringify(parsed.response, null, 2);
+    } else if (parsed.answer) {
+      // Q&A style: { answer: "..." }
+      text = parsed.answer;
+    } else if (typeof parsed === "string") {
+      text = parsed;
+    }
+  } catch {
+    // Body might be newline-delimited JSON (multiple yields from async generator)
+    // Try to extract text from contentBlockDelta events
+    const lines = body.split("\n").filter((l: string) => l.trim());
+    if (lines.length > 1) {
+      const texts: string[] = [];
+      for (const line of lines) {
+        try {
+          const obj = JSON.parse(line);
+          if (obj.event?.contentBlockDelta?.delta?.text) {
+            texts.push(obj.event.contentBlockDelta.delta.text);
+          }
+        } catch { /* skip unparseable lines */ }
+      }
+      if (texts.length > 0) {
+        text = texts.join("");
+      }
+    }
+    // else use raw body as-is
+  }
+
+  const data = JSON.stringify({ type: "text", content: text });
+  controller.enqueue(encoder.encode(`data: ${data}\n\n`));
+
+  // Emit token usage trace if available
+  if (tokenInfo.input || tokenInfo.output) {
+    controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+      type: "trace",
+      event: "usage",
+      name: `Tokens: ${tokenInfo.input || 0} in → ${tokenInfo.output || 0} out`,
+      timestamp: new Date().toISOString(),
+    })}\n\n`));
+  }
+}
+
+/**
+ * Is this body SSE, judged from its opening bytes?
+ *
+ * `undefined` means "not enough bytes to tell yet" — the caller must wait for
+ * more rather than guess, because a first chunk of `"da"` is a viable prefix of
+ * an SSE `data:` line AND of nothing else. Deciding on the head (rather than on
+ * the whole body, as this used to) is what lets the SSE path forward frames as
+ * they land instead of after the turn ends.
+ */
+function sseHead(head: string): boolean | undefined {
+  const s = head.replace(/^\s+/, "");
+  if (!s) return undefined; // whitespace only so far
+  if (s.startsWith(":")) return true; // comment / heartbeat frame
+  for (const p of ["data:", "event:", "id:", "retry:"]) {
+    if (s.startsWith(p)) return true;
+    if (p.startsWith(s)) return undefined; // still a viable prefix — wait for more
+  }
+  return false;
+}
+
 export async function invokeAgentRuntime(params: {
   agentRuntimeArn: string;
   prompt: string;
@@ -579,16 +685,23 @@ export async function invokeAgentRuntime(params: {
   // Node ESM the assignment throws and the interval never clears.)
   let closed = false;
   let heartbeat: ReturnType<typeof setInterval> | undefined;
+  // Set ONLY by cancel(). `closed` cannot do this job: the normal completion
+  // path sets it too, so the outer catch could not tell a departed consumer from
+  // a genuine upstream failure.
+  let cancelled = false;
+  // Hoisted so cancel() can release the runtime body instead of leaving it open
+  // until the persona finishes its turn.
+  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
 
   return new ReadableStream({
     async start(controller) {
       // Emit start trace
       controller.enqueue(encoder.encode(`data: ${traceStart}\n\n`));
 
-      // This path buffers the whole runtime response (transformToString) before
-      // emitting anything, so a long agent turn sends zero bytes for minutes.
-      // Keep the connection alive with SSE comment heartbeats so App Runner /
-      // proxies don't drop it. sseData ignores non-`data:` lines.
+      // Frames are forwarded as they arrive (TEAM-4695), but a persona can still
+      // spend many minutes inside one tool call without emitting a byte. Keep the
+      // connection alive with SSE comment heartbeats so App Runner / proxies
+      // don't drop it. sseData ignores non-`data:` lines.
       heartbeat = setInterval(() => {
         if (closed) return;
         try {
@@ -600,93 +713,93 @@ export async function invokeAgentRuntime(params: {
 
       try {
         if (response.response) {
-          const body = await response.response.transformToString();
+          // TEAM-4695: consume the body INCREMENTALLY. This used to
+          // `await transformToString()`, which drains the whole runtime response
+          // before enqueuing a single frame — so an Agent Chat reply only
+          // appeared once the persona had finished its entire turn.
+          const src = response.response as unknown as {
+            transformToWebStream?: () => ReadableStream<Uint8Array>;
+            transformToString?: () => Promise<string>;
+          };
 
-          // Emit trace: response received
-          controller.enqueue(encoder.encode(`data: ${JSON.stringify({
-            type: "trace",
-            event: "model_call",
-            name: `Response received (${latencyMs}ms)`,
-            timestamp: new Date().toISOString(),
-          })}\n\n`));
+          // The "Response received" trace now fires on the FIRST bytes rather
+          // than the last — it is the UI's first sign of life.
+          let traced = false;
+          const traceReceived = () => {
+            if (traced) return;
+            traced = true;
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+              type: "trace",
+              event: "model_call",
+              name: `Response received (${latencyMs}ms)`,
+              timestamp: new Date().toISOString(),
+            })}\n\n`));
+          };
 
-          if (body.includes("data: ")) {
-            for (const line of body.split("\n")) {
-              if (line.startsWith("data: ")) {
-                controller.enqueue(encoder.encode(line + "\n\n"));
-              }
-            }
-          } else {
-            let text = body;
-            let tokenInfo: { input?: number; output?: number } = {};
+          if (typeof src.transformToWebStream === "function") {
+            reader = src.transformToWebStream().getReader();
+            const decoder = new TextDecoder();
+            let buf = "";
+            // true = SSE (forward per line), false = one JSON/NDJSON document
+            // (buffer to the end), undefined = not yet decidable.
+            let sse: boolean | undefined =
+              response.contentType === "text/event-stream" ? true : undefined;
             try {
-              const parsed = JSON.parse(body);
-              // Extract token usage if present
-              const usage = parsed.metadata?.usage || parsed.usage;
-              if (usage) {
-                tokenInfo = { input: usage.inputTokens, output: usage.outputTokens };
-              }
-              // Handle various response structures from different agent frameworks
-              if (parsed.result?.content && Array.isArray(parsed.result.content)) {
-                // Strands/MCP style: { result: { role, content: [{ text: "..." }], metadata } }
-                text = parsed.result.content.map((b: { text?: string }) => b.text || "").join("");
-                const meta = parsed.result.metadata?.usage;
-                if (meta) tokenInfo = { input: meta.inputTokens, output: meta.outputTokens };
-              } else if (parsed.event?.contentBlockDelta?.delta?.text) {
-                // AgentCore Runtime async generator yield: { event: { contentBlockDelta: { delta: { text: "..." } } } }
-                text = parsed.event.contentBlockDelta.delta.text;
-              } else if (parsed.result && typeof parsed.result === "string") {
-                text = parsed.result;
-              } else if (parsed.output?.text) {
-                // Simple output style: { output: { text: "..." } }
-                text = parsed.output.text;
-              } else if (parsed.output?.message?.content) {
-                // Converse output: { output: { message: { content: [{ text: "..." }] } } }
-                text = parsed.output.message.content.map((b: { text?: string }) => b.text || "").join("");
-              } else if (parsed.completion) {
-                // Completion style: { completion: "..." }
-                text = parsed.completion;
-              } else if (parsed.response) {
-                // Generic response field
-                text = typeof parsed.response === "string" ? parsed.response : JSON.stringify(parsed.response, null, 2);
-              } else if (parsed.answer) {
-                // Q&A style: { answer: "..." }
-                text = parsed.answer;
-              } else if (typeof parsed === "string") {
-                text = parsed;
-              }
-            } catch {
-              // Body might be newline-delimited JSON (multiple yields from async generator)
-              // Try to extract text from contentBlockDelta events
-              const lines = body.split("\n").filter((l: string) => l.trim());
-              if (lines.length > 1) {
-                const texts: string[] = [];
+              for (;;) {
+                const { done, value } = await reader.read();
+                // The loop's only suspension point. If the consumer cancelled
+                // while we were parked here, the controller is already closed and
+                // every enqueue below would throw.
+                if (cancelled) return;
+                if (done) break;
+                const chunk = decoder.decode(value, { stream: true });
+                if (!chunk) continue;
+                buf += chunk;
+                traceReceived();
+                if (sse === undefined) sse = sseHead(buf);
+                if (sse !== true) continue; // undecided, or buffering to the end
+                // Per-line handling is byte-identical to the pre-TEAM-4695 code:
+                // split on "\n", match the "data: " prefix, re-emit the line
+                // verbatim. Only the partial tail line is held back.
+                const lines = buf.split("\n");
+                buf = lines.pop() ?? "";
                 for (const line of lines) {
-                  try {
-                    const obj = JSON.parse(line);
-                    if (obj.event?.contentBlockDelta?.delta?.text) {
-                      texts.push(obj.event.contentBlockDelta.delta.text);
-                    }
-                  } catch { /* skip unparseable lines */ }
-                }
-                if (texts.length > 0) {
-                  text = texts.join("");
+                  if (line.startsWith("data: ")) {
+                    controller.enqueue(encoder.encode(line + "\n\n"));
+                  }
                 }
               }
-              // else use raw body as-is
+              buf += decoder.decode(); // flush any multi-byte remainder
+              traceReceived(); // a zero-chunk body gets this trace too
+              if (sse === true) {
+                if (buf.startsWith("data: ")) {
+                  controller.enqueue(encoder.encode(buf + "\n\n"));
+                }
+              } else {
+                emitBufferedBody(buf, controller, encoder);
+              }
+            } finally {
+              // After cancel() the lock may already be gone; releasing must not
+              // mask the real outcome.
+              try {
+                reader.releaseLock();
+              } catch {
+                /* already released */
+              }
             }
-
-            const data = JSON.stringify({ type: "text", content: text });
-            controller.enqueue(encoder.encode(`data: ${data}\n\n`));
-
-            // Emit token usage trace if available
-            if (tokenInfo.input || tokenInfo.output) {
-              controller.enqueue(encoder.encode(`data: ${JSON.stringify({
-                type: "trace",
-                event: "usage",
-                name: `Tokens: ${tokenInfo.input || 0} in → ${tokenInfo.output || 0} out`,
-                timestamp: new Date().toISOString(),
-              })}\n\n`));
+          } else if (typeof src.transformToString === "function") {
+            // Non-streamable body (and older test doubles): the previous path.
+            const body = await src.transformToString();
+            if (cancelled) return; // same hazard, at this path's one await
+            traceReceived();
+            if (body.includes("data: ")) {
+              for (const line of body.split("\n")) {
+                if (line.startsWith("data: ")) {
+                  controller.enqueue(encoder.encode(line + "\n\n"));
+                }
+              }
+            } else {
+              emitBufferedBody(body, controller, encoder);
             }
           }
         }
@@ -704,6 +817,9 @@ export async function invokeAgentRuntime(params: {
         controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "done" })}\n\n`));
         controller.close();
       } catch (err) {
+        // A departed consumer has nothing to read error frames with; enqueuing
+        // them onto its closed controller is what used to throw.
+        if (cancelled) return;
         clearInterval(heartbeat);
         closed = true;
         const errMsg = err instanceof Error ? err.message : "Unknown error";
@@ -718,8 +834,13 @@ export async function invokeAgentRuntime(params: {
       }
     },
     cancel() {
+      cancelled = true;
       closed = true;
       clearInterval(heartbeat);
+      // Release the runtime response body. Without this the upstream connection
+      // is held until the persona finishes, and its next chunk drives an enqueue
+      // onto this now-closed controller.
+      reader?.cancel().catch(() => {});
     },
   });
 }
