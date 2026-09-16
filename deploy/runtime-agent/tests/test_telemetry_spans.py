@@ -426,8 +426,13 @@ class _RecordingApp:
         self.calls.append(("complete", task_id))
 
 
-def _load_production_entrypoints() -> dict[str, Any]:
+def _load_production_entrypoints(overrides: dict[str, Any] | None = None) -> dict[str, Any]:
     """Extract ``_run_agent_invocation`` + ``agent_invocation`` from main.py.
+
+    ``overrides`` replaces entries in the exec namespace before the shipped
+    source runs — how tests/test_stream_deltas.py swaps in a scripted fake
+    ``Agent`` (``MockModel`` cannot emit ``current_tool_use``) without a second
+    copy of this namespace. Callers that pass nothing get today's behaviour.
 
     Same rationale as ``_load_init_telemetry``: importing main.py is impossible
     offline. The difference is that these functions lean on module-scope
@@ -562,6 +567,7 @@ def _load_production_entrypoints() -> dict[str, Any]:
         "_DETACHED_TASKS": set(),
         "app": _RecordingApp(),
     }
+    namespace.update(overrides or {})
     module = ast.Module(
         body=[watchdog_legacy, *watchdog_defs, gate_cls, *funcs], type_ignores=[]
     )
