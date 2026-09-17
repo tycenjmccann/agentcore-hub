@@ -38,31 +38,45 @@ interface RawAgent {
   displayName: string;
   evaluationsEnabled?: boolean;
   evalConfigName?: string;
-  /** Set on a persona whose judge results land on another agent's runtime. */
+  /** Explicit override: the agentId whose runtime scores this persona. */
   evalHost?: string;
   personas?: (string | { persona?: string; name?: string })[];
 }
 
 const ROSTER = (agentsConfig as unknown as { agents: RawAgent[] }).agents;
 
+const ROSTER_BY_ID = new Map(ROSTER.map((a) => [a.agentId, a]));
+
 /**
- * The agents that can hold evaluation data at all — the column/row universe.
- * A persona hosted on another agent's runtime (`evalHost`) is not a column of
- * its own: its results are keyed under the host, so it renders as one of the
- * host's expandable persona sub-columns instead of an always-empty top-level one.
+ * Fallback column universe, used only until the API answers: every roster
+ * agent that can hold evaluation data. The API's `columns` replaces it — the
+ * server derives, from the LIVE roster's runtimeArns, which personas share a
+ * host's runtime (and so are ↳ sub-columns, never a top-level column) and which
+ * own theirs. The bundled roster ships null ARNs, so it cannot tell.
  */
 const EVAL_AGENTS = ROSTER.filter((a) => !!a.evalConfigName && !!a.evaluationsEnabled && !a.evalHost);
 
+function columnAgents(data: EvalData | null): RawAgent[] {
+  if (!data?.columns?.length) return EVAL_AGENTS;
+  return data.columns.map(
+    (c) => ROSTER_BY_ID.get(c.agentId) ?? { agentId: c.agentId, displayName: c.displayName, evaluationsEnabled: true }
+  );
+}
+
 /**
- * Persona names declared in the roster, used only to order the expanded rows:
- * the agent's own `personas` list when it has one, else every roster entry that
- * names this agent as its `evalHost`, in roster order.
+ * Persona names for ordering the expanded rows: the agent's own `personas` list
+ * when it has one, else the API's persona → host map, else roster entries that
+ * name this agent as `evalHost`.
  */
-function configuredPersonas(agent: RawAgent): string[] {
+function configuredPersonas(agent: RawAgent, hosted: Record<string, string> | undefined): string[] {
   const declared = (agent.personas ?? [])
     .map((p) => (typeof p === "string" ? p : p.persona || p.name || ""))
     .filter(Boolean);
   if (declared.length) return declared;
+  const fromApi = Object.entries(hosted ?? {})
+    .filter(([, host]) => host === agent.agentId)
+    .map(([persona]) => persona);
+  if (fromApi.length) return fromApi;
   return ROSTER.filter((a) => a.evalHost === agent.agentId).map((a) => a.agentId);
 }
 
@@ -248,7 +262,7 @@ function EvaluationsOverview() {
       const fromTop = data?.personas?.[agent.displayName];
       const fromMetrics = (data?.metrics?.[agent.displayName] as AgentMetricsWithPersonas | undefined)?.personas;
       const rows = (fromTop ?? fromMetrics ?? []).filter((p) => !!p?.persona);
-      const order = configuredPersonas(agent);
+      const order = configuredPersonas(agent, data?.hosted);
       if (!order.length) return rows;
       return [...rows].sort((a, b) => {
         const ia = order.indexOf(a.persona);
@@ -262,7 +276,7 @@ function EvaluationsOverview() {
   const { cols, agentCols } = useMemo(() => {
     const all: Col[] = [];
     const agentsOnly: Col[] = [];
-    for (const agent of EVAL_AGENTS) {
+    for (const agent of columnAgents(data)) {
       const personas = personaRowsFor(agent);
       const scores = data?.scorecard?.[agent.displayName];
       const col: Col = {

@@ -9,7 +9,6 @@
       "model": "Claude Fable 5.1",
       "evaluationsEnabled": true,
       "evalConfigName": "eval_agentcore_hub_requirements_analyst",
-      "evalHost": "agentcore_hub_agent",
       "runtimeArn": null,
       "tools": [
         "S3Storage___list_objects",
@@ -76,7 +75,6 @@
       "type": "runtime",
       "model": "Claude Fable 5.1",
       "evaluationsEnabled": true,
-      "evalHost": "agentcore_hub_agent",
       "runtimeArn": null,
       "tools": [
         "S3Storage___list_objects",
@@ -132,7 +130,6 @@
       "type": "runtime",
       "model": "Claude Fable 5.1",
       "evaluationsEnabled": true,
-      "evalHost": "agentcore_hub_agent",
       "runtimeArn": null,
       "tools": [
         "S3Storage___list_objects",
@@ -189,7 +186,6 @@
       "type": "runtime",
       "model": "Claude Fable 5.1",
       "evaluationsEnabled": true,
-      "evalHost": "agentcore_hub_agent",
       "runtimeArn": null,
       "tools": [
         "S3Storage___list_objects",
@@ -245,7 +241,6 @@
       "type": "runtime",
       "model": "Claude Fable 5.1",
       "evaluationsEnabled": true,
-      "evalHost": "agentcore_hub_agent",
       "runtimeArn": null,
       "tools": [
         "S3Storage___list_objects",
@@ -301,7 +296,6 @@
       "type": "runtime",
       "model": "Claude Fable 5.1",
       "evaluationsEnabled": true,
-      "evalHost": "agentcore_hub_agent",
       "runtimeArn": null,
       "tools": [
         "S3Storage___list_objects",
@@ -357,7 +351,6 @@
       "type": "runtime",
       "model": "Claude Fable 5.1",
       "evaluationsEnabled": true,
-      "evalHost": "agentcore_hub_agent",
       "runtimeArn": null,
       "tools": [
         "S3Storage___list_objects",
@@ -413,7 +406,6 @@
       "type": "runtime",
       "model": "Claude Fable 5.1",
       "evaluationsEnabled": true,
-      "evalHost": "agentcore_hub_agent",
       "runtimeArn": null,
       "tools": [
         "S3Storage___list_objects",
@@ -469,7 +461,6 @@
       "type": "runtime",
       "model": "Claude Fable 5.1",
       "evaluationsEnabled": true,
-      "evalHost": "agentcore_hub_agent",
       "runtimeArn": null,
       "tools": [
         "S3Storage___list_objects",
@@ -525,7 +516,6 @@
       "type": "runtime",
       "model": "Claude Fable 5.1",
       "evaluationsEnabled": true,
-      "evalHost": "agentcore_hub_agent",
       "runtimeArn": null,
       "tools": [
         "S3Storage___list_objects",
@@ -586,7 +576,6 @@
       "type": "runtime",
       "model": "Claude Fable 5.1",
       "evaluationsEnabled": true,
-      "evalHost": "agentcore_hub_agent",
       "runtimeArn": null,
       "tools": [
         "S3Storage___list_objects",
@@ -646,7 +635,6 @@
       "type": "runtime",
       "model": "Claude Fable 5.1",
       "evaluationsEnabled": true,
-      "evalHost": "agentcore_hub_agent",
       "runtimeArn": null,
       "tools": [
         "S3Storage___list_objects",
@@ -707,7 +695,6 @@
       "type": "runtime",
       "model": "Claude Fable 5.1",
       "evaluationsEnabled": true,
-      "evalHost": "agentcore_hub_agent",
       "runtimeArn": null,
       "tools": [
         "S3Storage___list_objects",
@@ -769,7 +756,6 @@
       "type": "runtime",
       "model": "Claude Fable 5.1",
       "evaluationsEnabled": true,
-      "evalHost": "agentcore_hub_agent",
       "runtimeArn": null,
       "tools": [
         "S3Storage___list_objects",
@@ -831,7 +817,6 @@
       "type": "runtime",
       "model": "Claude Fable 5.1",
       "evaluationsEnabled": true,
-      "evalHost": "agentcore_hub_agent",
       "runtimeArn": null,
       "tools": [
         "S3Storage___list_objects",
@@ -898,7 +883,6 @@
       "type": "runtime",
       "model": "Claude Fable 5.1",
       "evaluationsEnabled": true,
-      "evalHost": "agentcore_hub_agent",
       "runtimeArn": null,
       "tools": [
         "S3Storage___list_objects",
@@ -963,7 +947,6 @@
       "type": "runtime",
       "model": "Claude Fable 5.1",
       "evaluationsEnabled": true,
-      "evalHost": "agentcore_hub_agent",
       "runtimeArn": null,
       "workflowDefId": "bug-fix",
       "tools": [
@@ -1086,7 +1069,6 @@
       "type": "runtime",
       "model": "Claude Fable 5.1",
       "evaluationsEnabled": true,
-      "evalHost": "agentcore_hub_agent",
       "runtimeArn": null,
       "tools": [
         "S3Storage___list_objects",

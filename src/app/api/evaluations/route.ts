@@ -26,7 +26,7 @@ import {
   type AgentWindowSummary,
   type Pricing,
 } from "@/lib/eval-metrics";
-import agentsConfig from "@/config/agents.json";
+import { deriveEvalColumns, loadEvalRoster } from "@/lib/eval-roster";
 import pricingConfig from "@/config/pricing.json";
 
 export const dynamic = "force-dynamic";
@@ -37,19 +37,11 @@ export const fetchCache = "force-no-store";
 // cost-report Lambda via the S3 config prefix); cache discount/surcharge included.
 const PRICING = pricingConfig as unknown as Pricing;
 
-// Agent ID → display name map. A persona hosted on another agent's runtime
-// (`evalHost`) has no runtime-level rows of its own — its results sit under the
-// host's `${agentId}#${persona}` rows — so it is not an agent of this response;
-// it appears under the host's `personas` instead.
-const AGENT_DISPLAY_NAMES = new Map(
-  agentsConfig.agents
-    .filter((a) => a.evaluationsEnabled && !(a as { evalHost?: string }).evalHost)
-    .map((a) => [a.agentId, a.displayName])
-);
-
-// Personas are fleet agentIds that may share a runtime with the anchor agent, so
-// they are named off the FULL roster — not just the evaluations-enabled subset.
-const ALL_DISPLAY_NAMES = new Map(agentsConfig.agents.map((a) => [a.agentId, a.displayName]));
+// Which roster agents are columns and which are personas hosted on another
+// agent's runtime is derived per request from the LIVE roster's runtimeArns
+// (src/lib/eval-roster.ts): a hosted persona has no runtime-level rows of its
+// own — its results sit under the host's `${agentId}#${persona}` rows — so it is
+// not an agent of this response and appears under the host's `personas` instead.
 
 // In-memory cache, keyed by the window STRING ("7" | "30" | "90" | "all"): keying
 // by day-count collided "all" with whatever number of days happened to be present.
@@ -114,7 +106,11 @@ export async function GET(req: NextRequest) {
   }
 
   try {
-    const [items, dailyItems] = await Promise.all([getAllEvalConfigs(), getAllEvalDaily()]);
+    const [items, dailyItems, roster] = await Promise.all([getAllEvalConfigs(), getAllEvalDaily(), loadEvalRoster()]);
+    const { columns, hosted } = deriveEvalColumns(roster);
+    const AGENT_DISPLAY_NAMES = new Map(columns.map((c) => [c.agentId, c.displayName]));
+    // Personas are named off the FULL roster — not just the column subset.
+    const ALL_DISPLAY_NAMES = new Map(roster.map((a) => [a.agentId, a.displayName || a.agentId]));
     const { byAgent, byPersona } = splitDailyItems(dailyItems);
     const days = windowDaysFor(spec);
 
@@ -163,6 +159,10 @@ export async function GET(req: NextRequest) {
 
     const responseData = {
       agents,
+      // The column universe, in roster order, and which personas are hosted where
+      // — so the UI never has to derive topology from the bundled roster.
+      columns,
+      hosted,
       scorecard,
       metrics,
       personas,

@@ -37,8 +37,22 @@ vi.mock("@/lib/eval-config", () => ({
   }),
 }));
 
+// The live roster the route derives its columns from: the hub owns the shared
+// runtime, two personas ride on it, the Workflow Manager has its own harness.
+const SHARED_ARN = "arn:aws:bedrock-agentcore:us-east-1:111111111111:runtime/agentcore_hub_agent-ITPP0eBToO";
+vi.mock("@/lib/eval-roster", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/eval-roster")>()),
+  loadEvalRoster: vi.fn(async () => [
+    { agentId: "agentcore_hub_requirements_analyst", displayName: "Requirements Analyst", evaluationsEnabled: true, runtimeArn: SHARED_ARN },
+    { agentId: "agentcore_hub_ios_designer", displayName: "iOS Designer", evaluationsEnabled: true, runtimeArn: SHARED_ARN },
+    { agentId: "agentcore_hub_workflow_manager", displayName: "Workflow Manager", evaluationsEnabled: true, runtimeArn: "arn:aws:bedrock-agentcore:us-east-1:111111111111:runtime/harness_agentcore_hub_workflow_manager-cJ6kEr51cY" },
+    { agentId: "agentcore_hub_agent", displayName: "Hub Agent (Shared Runtime)", evaluationsEnabled: true, runtimeArn: SHARED_ARN },
+    { agentId: "agentcore_hub_builder", displayName: "Builder", evaluationsEnabled: false, runtimeArn: null },
+  ]),
+}));
+
 // An evaluations-enabled roster agent that OWNS its runtime, and a persona that
-// shares it (roster: `evalHost: "agentcore_hub_agent"`).
+// shares it.
 const AGENT = "agentcore_hub_agent";
 const AGENT_NAME = "Hub Agent (Shared Runtime)";
 const PERSONA = "agentcore_hub_ios_designer";
@@ -233,7 +247,7 @@ describe("GET /api/evaluations — existing contract is unchanged", () => {
 });
 
 describe("GET /api/evaluations — hosted personas", () => {
-  it("does not list a persona hosted on another runtime as an agent, even with an eval-config row and daily rows of its own", async () => {
+  it("does not list a persona sharing the hub's runtime as an agent, even with an eval-config row and daily rows of its own", async () => {
     h.configs.push({ agentId: "agentcore_hub_requirements_analyst" });
     h.daily.push({ agentId: "agentcore_hub_requirements_analyst", day: "2026-09-15", sessions: 3 });
     const res = await get("?days=7");
@@ -241,5 +255,17 @@ describe("GET /api/evaluations — hosted personas", () => {
     expect(body.agents).toEqual([AGENT_NAME]);
     expect(body.metrics["Requirements Analyst"]).toBeUndefined();
     expect(body.scorecard["Requirements Analyst"]).toBeUndefined();
+  });
+
+  it("reports the derived column universe and the persona → host map", async () => {
+    const body = await (await get("?days=7")).json();
+    expect(body.columns).toEqual([
+      { agentId: "agentcore_hub_workflow_manager", displayName: "Workflow Manager" },
+      { agentId: AGENT, displayName: AGENT_NAME },
+    ]);
+    expect(body.hosted).toEqual({
+      agentcore_hub_requirements_analyst: AGENT,
+      agentcore_hub_ios_designer: AGENT,
+    });
   });
 });
