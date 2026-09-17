@@ -124,6 +124,10 @@ const h = vi.hoisted(() => ({
     // own execution is Superseded. The default is empty, so every other test proves
     // the call is not made at all (h.state.cpCalls carries no ListPipelineExecutions).
     listPipelineExecutionsImpl: async () => ({ pipelineExecutionSummaries: [] }),
+    // TEAM-4740 FR-4: the abandon path's Stop. Every other test proves it is NOT
+    // called (h.state.cpCalls carries no StopPipelineExecution) — a deploy tool
+    // that stops someone else's run without being asked is the whole risk here.
+    stopPipelineExecutionImpl: async () => ({}),
     s3Calls: [], // the input of every S3 command, reads and writes alike
     // TEAM-4525: PutObject only, with the CLIENT REGION it was sent on — the
     // ship-approval record must always be written by this Lambda's own ambient S3
@@ -146,6 +150,15 @@ const h = vi.hoisted(() => ({
     getObjectImpl: async () => {
       const err = new Error("NoSuchKey");
       err.name = "NoSuchKey";
+      throw err;
+    },
+    // TEAM-4740 SEC-1(3): the HeadObject probe for a `<merge_commit>.rejected.json`
+    // human veto. The default is NotFound = "no human rejected this commit", which
+    // is what every pre-TEAM-4740 ship-approval test assumes.
+    headObjectImpl: async () => {
+      const err = new Error("NotFound");
+      err.name = "NotFound";
+      err.$metadata = { httpStatusCode: 404 };
       throw err;
     },
     getLogEventsImpl: async () => ({ events: [] }),
@@ -191,6 +204,7 @@ vi.mock("@aws-sdk/client-codepipeline", () => ({
       if (type === "StartPipelineExecution") return h.state.startPipelineExecutionImpl(cmd.input);
       if (type === "GetPipelineExecution") return h.state.getPipelineExecutionImpl(cmd.input);
       if (type === "ListPipelineExecutions") return h.state.listPipelineExecutionsImpl(cmd.input);
+      if (type === "StopPipelineExecution") return h.state.stopPipelineExecutionImpl(cmd.input);
       return {};
     }
   },
@@ -199,6 +213,7 @@ vi.mock("@aws-sdk/client-codepipeline", () => ({
   StartPipelineExecutionCommand: class { constructor(i) { this.input = i; this.__type = "StartPipelineExecution"; } },
   ListActionExecutionsCommand: class { constructor(i) { this.input = i; this.__type = "ListActionExecutions"; } },
   ListPipelineExecutionsCommand: class { constructor(i) { this.input = i; this.__type = "ListPipelineExecutions"; } },
+  StopPipelineExecutionCommand: class { constructor(i) { this.input = i; this.__type = "StopPipelineExecution"; } },
 }));
 
 vi.mock("@aws-sdk/client-codebuild", () => ({
@@ -244,12 +259,14 @@ vi.mock("@aws-sdk/client-s3", () => ({
         h.state.s3Puts.push({ region: this.region, input: cmd.input });
         return h.state.putObjectImpl(cmd.input);
       }
+      if (cmd.__type === "HeadObject") return h.state.headObjectImpl(cmd.input);
       if (cmd.input?.Key === h.CD_REGISTRY_KEY) return h.state.registryImpl(cmd.input);
       return h.state.getObjectImpl(cmd.input);
     }
   },
   GetObjectCommand: class { constructor(i) { this.input = i; this.__type = "GetObject"; } },
   PutObjectCommand: class { constructor(i) { this.input = i; this.__type = "PutObject"; } },
+  HeadObjectCommand: class { constructor(i) { this.input = i; this.__type = "HeadObject"; } },
 }));
 
 vi.mock("@aws-sdk/client-cloudwatch-logs", () => ({
@@ -456,12 +473,19 @@ beforeEach(() => {
     pipelineExecution: { artifactRevisions: [] },
   });
   h.state.listPipelineExecutionsImpl = async () => ({ pipelineExecutionSummaries: [] });
+  h.state.stopPipelineExecutionImpl = async () => ({});
   h.state.s3Calls = [];
   h.state.s3Puts = [];
   h.state.putObjectImpl = async () => ({});
   h.state.getObjectImpl = async () => {
     const err = new Error("NoSuchKey");
     err.name = "NoSuchKey";
+    throw err;
+  };
+  h.state.headObjectImpl = async () => {
+    const err = new Error("NotFound");
+    err.name = "NotFound";
+    err.$metadata = { httpStatusCode: 404 };
     throw err;
   };
   h.state.listBuildsImpl = async () => ({ ids: [] });
@@ -2058,6 +2082,781 @@ describe("get_state.waitingOn (TEAM-4706)", () => {
   });
 });
 
+// ─── 3e. FR-4 blocker / remedy and the opt-in abandon (TEAM-4740) ────────────
+//
+// waitingOn (3d) says WHO holds the human deploy gate. It never said what to DO,
+// and start_deploy never looked at all: it started an execution that then queued
+// invisibly behind an older run's approval, sometimes for hours. FR-4 turns both
+// into values — a `blocker` + `remedy` on get_state, and an outright REFUSAL from
+// start_deploy — and adds exactly one new capability, gated five deep: abandoning
+// the run in front of us once GitHub has PROVEN its commit is contained in ours.
+//
+// The invariants every test here also holds:
+//   - the approval token's VALUE still never leaves the Lambda;
+//   - a refused start leaves NOTHING behind: no execution, no ship-approval record;
+//   - StopPipelineExecution is not called unless it was asked for AND proven;
+//   - there is still no PutApprovalResult, in this Lambda or in its reach.
+
+/** A token value that must never appear in any response (mirrors 3d's). */
+const FR4_TOKEN = "approval-token-must-never-appear";
+/** Full uuids: the projection reports ids verbatim, so short ids would hide a slice. */
+const OLDER_EXEC = "347b9bcb-6c02-4b0e-9b3e-1f2a4d5c6e70";
+const OUR_EXEC = "9f6a9e0d-1c3b-4f5a-8d7e-2b1c0a9f8e7d";
+const THEIR_SHA = "1111111111111111111111111111111111111111";
+const PENDING_AT = "2026-09-14T17:33:00Z";
+
+/**
+ * A pipeline whose Approval stage is parked, held by `parkedId`, since `since`.
+ * Shaped like 3d's `pendingApproval` (same stage names, same token-presence rule)
+ * but with the timestamp `blocker.pendingSince` is read from.
+ */
+function parkedGate({ parkedId = OLDER_EXEC, inboundId = null, since = PENDING_AT, token = FR4_TOKEN } = {}) {
+  return {
+    stageStates: [
+      {
+        stageName: "Source",
+        latestExecution: { status: "Succeeded", pipelineExecutionId: parkedId },
+        actionStates: [{ actionName: "GitHub_main", latestExecution: { status: "Succeeded" } }],
+      },
+      {
+        stageName: "Approval",
+        latestExecution: { status: "InProgress", pipelineExecutionId: parkedId },
+        ...(inboundId
+          ? { inboundExecution: { pipelineExecutionId: inboundId, status: "InProgress" } }
+          : {}),
+        actionStates: [
+          {
+            actionName: "Approve_deploy",
+            latestExecution: {
+              status: "InProgress",
+              lastStatusChange: since,
+              ...(token ? { token } : {}),
+            },
+          },
+        ],
+      },
+    ],
+  };
+}
+
+/** Every StopPipelineExecution that reached CodePipeline this test. */
+function stopCalls() {
+  return h.state.cpCalls.filter((c) => c.type === "StopPipelineExecution");
+}
+/** Every StartPipelineExecution that reached CodePipeline this test. */
+function startCalls() {
+  return h.state.cpCalls.filter((c) => c.type === "StartPipelineExecution");
+}
+
+/**
+ * GetPipelineExecution keyed on the execution asked about, so a test can give the
+ * BLOCKER a source revision without also claiming things about our own run. The
+ * `status` may change between calls (`statuses` is consumed in order) because the
+ * abandon path reads the same execution twice: once for its revision, once to
+ * confirm it is Stopped.
+ */
+function serveExecution(id, { revision = THEIR_SHA, statuses = ["InProgress"] } = {}) {
+  const queue = [...statuses];
+  h.state.getPipelineExecutionImpl = async (input) => {
+    if (input.pipelineExecutionId !== id) {
+      return { pipelineExecution: { artifactRevisions: [] } };
+    }
+    const status = queue.length > 1 ? queue.shift() : queue[0];
+    return {
+      pipelineExecution: { status, artifactRevisions: [{ revisionId: revision }] },
+    };
+  };
+}
+
+/** GitHub answers that PROVE ancestry: default branch `main`, compare "ahead". */
+function serveAncestry({ repo = "acme/widget", branch = "main", status = "ahead", aheadBy = 3 } = {}) {
+  h.state.githubImpl = async (url) => {
+    if (url === `https://api.github.com/repos/${repo}`) {
+      return { ok: true, status: 200, json: async () => ({ default_branch: branch }) };
+    }
+    if (url.startsWith(`https://api.github.com/repos/${repo}/compare/`)) {
+      return { ok: true, status: 200, json: async () => ({ status, ahead_by: aheadBy }) };
+    }
+    return { ok: false, status: 404, json: async () => ({}) };
+  };
+}
+
+/** A module wired to a repo GitHub can be asked about, with a token to ask with. */
+function withGithubTarget(fn, env = {}) {
+  return withEnv(
+    {
+      PIPELINE_REPO: "acme/widget",
+      GITHUB_TOKEN: "ghp-test-token",
+      ARTIFACT_BUCKET: "hub-artifacts-test",
+      ...env,
+    },
+    fn
+  );
+}
+
+describe("get_state.blocker / remedy (TEAM-4740 FR-4)", () => {
+  it("adds a 7-key blocker BESIDE an unchanged waitingOn when an older run holds the gate", async () => {
+    h.state.getPipelineStateImpl = async () => parkedGate({ inboundId: OUR_EXEC });
+    serveExecution(OLDER_EXEC);
+
+    const out = await invoke("get_state", { execution_id: OUR_EXEC });
+
+    // waitingOn is BYTE-UNCHANGED from TEAM-4706: same seven keys, same values. The
+    // new fields sit next to it, so a caller written against #618 sees no change.
+    expect(out.waitingOn).toEqual({
+      kind: "human_approval",
+      stage: "Approval",
+      action: "Approve_deploy",
+      executionId: OLDER_EXEC,
+      holdsGate: "older",
+      queuedBehind: OLDER_EXEC,
+      supersededBy: null,
+    });
+    expect(out.blocker).toEqual({
+      executionId: OLDER_EXEC,
+      // Resolved through executionSnapshot — the ONE reader of an execution's
+      // source revision in this file.
+      sourceSha: THEIR_SHA,
+      // Genuinely unknown: CodePipeline has no PR concept and the blocking run's PR
+      // lives only in ITS ship-approval record, which this role cannot read.
+      pr: null,
+      // Free — lastStatusChange was already on the action.
+      pendingSince: "2026-09-14T17:33:00.000Z",
+      stage: "Approval",
+      action: "Approve_deploy",
+      supersedable: false,
+    });
+    expect(out.remedy).toBe("wait");
+  });
+
+  it("is null/null when the gate is the CALLER'S own, and costs no extra call", async () => {
+    h.state.getPipelineStateImpl = async () => parkedGate({ parkedId: OUR_EXEC });
+
+    const out = await invoke("get_state", { execution_id: OUR_EXEC });
+
+    expect(out.waitingOn.holdsGate).toBe("this");
+    expect(out.blocker).toBe(null);
+    expect(out.remedy).toBe(null);
+    // Enrichment is on the "older" branch ONLY: the caller's own gate needs none,
+    // and get_state is polled in a loop.
+    expect(h.state.cpCalls.filter((c) => c.type === "GetPipelineExecution")).toHaveLength(1);
+  });
+
+  it("is null/null when no approval is pending at all", async () => {
+    h.state.getPipelineStateImpl = async () => allGreenStages(OUR_EXEC);
+
+    const out = await invoke("get_state", { execution_id: OUR_EXEC });
+
+    expect(out.waitingOn).toBe(null);
+    expect(out.blocker).toBe(null);
+    expect(out.remedy).toBe(null);
+  });
+
+  it('remedy is "follow_superseder" when our own run was superseded', async () => {
+    h.state.getPipelineStateImpl = async () => parkedGate({ parkedId: "NEWER" });
+    h.state.getPipelineExecutionImpl = async () => ({
+      pipelineExecution: { status: "Superseded", artifactRevisions: [{ revisionId: THEIR_SHA }] },
+    });
+    h.state.listPipelineExecutionsImpl = async () => ({
+      pipelineExecutionSummaries: [
+        { pipelineExecutionId: "NEWER", sourceRevisions: [{ revisionId: THEIR_SHA }] },
+        { pipelineExecutionId: OUR_EXEC, sourceRevisions: [{ revisionId: THEIR_SHA }] },
+      ],
+    });
+
+    const out = await invoke("get_state", { execution_id: OUR_EXEC });
+
+    expect(out.waitingOn.supersededBy).toBe("NEWER");
+    expect(out.blocker.supersedable).toBe(true);
+    expect(out.remedy).toBe("follow_superseder");
+  });
+
+  it("leaves sourceSha null when the blocker's revision cannot be read", async () => {
+    // executionSnapshot is non-fatal by construction: an unreadable execution is
+    // UNKNOWN, not a reason to withhold the blocker an agent needs.
+    h.state.getPipelineStateImpl = async () => parkedGate({ inboundId: OUR_EXEC });
+    h.state.getPipelineExecutionImpl = async () => {
+      throw new Error("throttled");
+    };
+
+    const out = await invoke("get_state", { execution_id: OUR_EXEC });
+
+    expect(out.blocker.executionId).toBe(OLDER_EXEC);
+    expect(out.blocker.sourceSha).toBe(null);
+    expect(out.remedy).toBe("wait");
+  });
+
+  it("still never lets the approval token's VALUE into the response", async () => {
+    h.state.getPipelineStateImpl = async () => parkedGate({ inboundId: OUR_EXEC });
+    serveExecution(OLDER_EXEC);
+
+    const res = await handler({
+      name: "Pipeline___get_state",
+      arguments: { execution_id: OUR_EXEC },
+    });
+
+    expect(res.content[0].text).not.toContain(FR4_TOKEN);
+    // ...and the gate WAS detected, so the assertion above is not vacuous.
+    expect(JSON.parse(res.content[0].text).blocker.executionId).toBe(OLDER_EXEC);
+  });
+});
+
+describe("start_deploy refuses an occupied approval gate (TEAM-4740 FR-4)", () => {
+  it("returns approval_stage_occupied and starts NOTHING, records NOTHING", async () => {
+    h.state.getPipelineStateImpl = async () => parkedGate();
+    serveExecution(OLDER_EXEC);
+
+    const out = await withGithubTarget((mod) =>
+      invokeOn(mod.handler, "start_deploy", {
+        commit_sha: "9f6a9e0d1c3b4f5a8d7e2b1c0a9f8e7d6c5b4a39",
+        approved_head_sha: "a".repeat(40),
+        pr_url: "https://github.com/acme/widget/pull/7",
+      })
+    );
+
+    expect(out.ok).toBe(false);
+    expect(out.reason).toBe("approval_stage_occupied");
+    expect(out.blocker.executionId).toBe(OLDER_EXEC);
+    expect(out.blocker.pendingSince).toBe("2026-09-14T17:33:00.000Z");
+    expect(out.remedy).toBe("wait");
+    expect(out.started).toBeUndefined();
+    // The two things a refusal must not leave behind. recordShipApproval runs
+    // AFTER this check for exactly this reason: a record for a merge commit that
+    // was never deployed would let the pipeline skip a human gate for a run that
+    // does not exist.
+    expect(startCalls()).toEqual([]);
+    expect(h.state.s3Puts).toEqual([]);
+    // And nothing was stopped: abandon is opt-in.
+    expect(stopCalls()).toEqual([]);
+  });
+
+  it("starts normally when the gate is clear, with no abandoned/gateProbe keys", async () => {
+    // The regression guard for the added GetPipelineState: the happy path must be
+    // byte-identical to pre-TEAM-4740.
+    h.state.getPipelineStateImpl = async () => ({ stageStates: [] });
+
+    const out = await withGithubTarget((mod) => invokeOn(mod.handler, "start_deploy", {}));
+
+    expect(out.started).toBe(true);
+    expect(out).not.toHaveProperty("abandoned");
+    expect(out).not.toHaveProperty("gateProbe");
+    expect(stopCalls()).toEqual([]);
+  });
+
+  it("FAILS OPEN when the gate itself cannot be read, and says so", async () => {
+    // Refusing here would turn a transient CodePipeline error into a blocked ship.
+    // Queue etiquette is not a safety property — the human gate still fires either
+    // way — so we start, and mark the answer as unverified rather than claim clear.
+    h.state.getPipelineStateImpl = async () => {
+      throw new Error("Throttling");
+    };
+
+    const out = await withGithubTarget((mod) => invokeOn(mod.handler, "start_deploy", {}));
+
+    expect(out.started).toBe(true);
+    expect(out.gateProbe).toBe("unavailable");
+  });
+
+  it("does not leak the approval token into the refusal", async () => {
+    h.state.getPipelineStateImpl = async () => parkedGate();
+    serveExecution(OLDER_EXEC);
+
+    const res = await handler({ name: "Pipeline___start_deploy", arguments: {} });
+
+    expect(res.content[0].text).not.toContain(FR4_TOKEN);
+    expect(JSON.parse(res.content[0].text).reason).toBe("approval_stage_occupied");
+  });
+});
+
+describe("start_deploy abandon — five gates, all must hold (TEAM-4740 FR-4)", () => {
+  const ABANDON = {
+    commit_sha: "9f6a9e0d1c3b4f5a8d7e2b1c0a9f8e7d6c5b4a39",
+    abandon: true,
+  };
+
+  it("abandons, confirms, and only THEN starts ours", async () => {
+    h.state.getPipelineStateImpl = async () => parkedGate();
+    // Read twice: once for the revision, once to confirm the Stop took effect.
+    serveExecution(OLDER_EXEC, { statuses: ["InProgress", "Stopped"] });
+    serveAncestry();
+
+    const out = await withGithubTarget((mod) =>
+      invokeOn(mod.handler, "start_deploy", ABANDON)
+    );
+
+    expect(out.started).toBe(true);
+    expect(out.abandoned).toMatchObject({
+      executionId: OLDER_EXEC,
+      sourceSha: THEIR_SHA,
+      // Asserted true only because ancestry was actually PROVEN — the pure
+      // projection alone would have said false here (no superseder).
+      supersedable: true,
+      remedy: "abandon",
+      ourRef: "main",
+      aheadBy: 3,
+    });
+    // Abandon, not stop-and-wait: a parked ManualApproval has nothing to unwind.
+    expect(stopCalls()).toHaveLength(1);
+    expect(stopCalls()[0].input).toMatchObject({
+      pipelineName: "agentcore-hub-deploy",
+      pipelineExecutionId: OLDER_EXEC,
+      abandon: true,
+    });
+    // ORDER is the invariant: the Stop precedes our Start.
+    const types = h.state.cpCalls.map((c) => c.type);
+    expect(types.indexOf("StopPipelineExecution")).toBeLessThan(
+      types.indexOf("StartPipelineExecution")
+    );
+    // The abandoned run's ship-approval record is never carried forward: the only
+    // S3 write this call could make is our OWN, and this call passed no
+    // approved_head_sha, so there is none.
+    expect(h.state.s3Puts).toEqual([]);
+  });
+
+  it("SEC-4: derives ourSha from the repo's default branch, never from args", async () => {
+    h.state.getPipelineStateImpl = async () => parkedGate();
+    serveExecution(OLDER_EXEC, { statuses: ["InProgress", "Stopped"] });
+    serveAncestry();
+
+    await withGithubTarget((mod) =>
+      invokeOn(mod.handler, "start_deploy", {
+        ...ABANDON,
+        // A caller-supplied SHA that would "prove" anything if it were trusted.
+        commit_sha: "f".repeat(40),
+      })
+    );
+
+    const urls = h.state.githubCalls.map((c) => c.url);
+    expect(urls).toEqual([
+      "https://api.github.com/repos/acme/widget",
+      `https://api.github.com/repos/acme/widget/compare/${THEIR_SHA}...main`,
+    ]);
+    // The caller's SHA appears in NO GitHub url: the comparison is theirSha (read
+    // from CodePipeline) against the branch GitHub itself named.
+    for (const url of urls) expect(url).not.toContain("f".repeat(40));
+  });
+
+  it("gate 2 — an UNNAMEABLE blocker can never be abandoned", async () => {
+    // holdsGate "older" with no parked execution id (the C8 row). Nothing about it
+    // can be proven, so nothing about it may be acted on.
+    h.state.getPipelineStateImpl = async () => ({
+      stageStates: [
+        {
+          stageName: "Approval",
+          latestExecution: { status: "InProgress" },
+          actionStates: [
+            {
+              actionName: "Approve_deploy",
+              latestExecution: { status: "InProgress", token: FR4_TOKEN, lastStatusChange: PENDING_AT },
+            },
+          ],
+        },
+      ],
+    });
+    serveAncestry();
+
+    const out = await withGithubTarget((mod) =>
+      invokeOn(mod.handler, "start_deploy", ABANDON)
+    );
+
+    expect(out.ok).toBe(false);
+    expect(out.reason).toBe("ancestry_unproven");
+    expect(out.blocker.executionId).toBe(null);
+    expect(stopCalls()).toEqual([]);
+    expect(startCalls()).toEqual([]);
+    // Not even asked: there is nothing to ask about.
+    expect(h.state.githubCalls).toEqual([]);
+  });
+
+  it("gate 3 — anything but a proven 'ahead' stops NOTHING", async () => {
+    // identical/behind/diverged are all "not proven", and so are a non-2xx, a
+    // throw, and a missing token. DL-028: "we could not look" is not "there is
+    // nothing there".
+    const cases = [
+      ["identical", () => serveAncestry({ status: "identical" })],
+      ["behind", () => serveAncestry({ status: "behind" })],
+      ["diverged", () => serveAncestry({ status: "diverged" })],
+      [
+        "compare 404",
+        () => {
+          h.state.githubImpl = async (url) =>
+            url.includes("/compare/")
+              ? { ok: false, status: 404, json: async () => ({}) }
+              : { ok: true, status: 200, json: async () => ({ default_branch: "main" }) };
+        },
+      ],
+      [
+        "repo read 500",
+        () => {
+          h.state.githubImpl = async () => ({ ok: false, status: 500, json: async () => ({}) });
+        },
+      ],
+      [
+        "timeout",
+        () => {
+          h.state.githubImpl = async () => {
+            const e = new Error("The operation was aborted due to timeout");
+            e.name = "TimeoutError";
+            throw e;
+          };
+        },
+      ],
+    ];
+
+    for (const [label, serve] of cases) {
+      h.state.cpCalls = [];
+      h.state.getPipelineStateImpl = async () => parkedGate();
+      serveExecution(OLDER_EXEC, { statuses: ["InProgress", "Stopped"] });
+      serve();
+
+      const out = await withGithubTarget((mod) =>
+        invokeOn(mod.handler, "start_deploy", ABANDON)
+      );
+
+      expect(out.reason, label).toBe("ancestry_unproven");
+      expect(stopCalls(), label).toEqual([]);
+      expect(startCalls(), label).toEqual([]);
+    }
+  });
+
+  it("gate 3 — no GITHUB_TOKEN means ancestry can never be proven", async () => {
+    h.state.getPipelineStateImpl = async () => parkedGate();
+    serveExecution(OLDER_EXEC);
+    serveAncestry();
+
+    const out = await withGithubTarget(
+      (mod) => invokeOn(mod.handler, "start_deploy", ABANDON),
+      { GITHUB_TOKEN: undefined }
+    );
+
+    expect(out.reason).toBe("ancestry_unproven");
+    expect(out.detail).toContain("GITHUB_TOKEN");
+    // Fail-closed BEFORE the network: an unauthenticated probe is not attempted.
+    expect(h.state.githubCalls).toEqual([]);
+    expect(stopCalls()).toEqual([]);
+  });
+
+  it("SEC-5 — a gate the human just decided is gate_no_longer_occupied", async () => {
+    // Between the projection and the Stop, the approval resolved. Stopping now
+    // would discard a run a human had ALREADY approved.
+    let reads = 0;
+    h.state.getPipelineStateImpl = async () => {
+      reads += 1;
+      return reads === 1 ? parkedGate() : { stageStates: [] };
+    };
+    serveExecution(OLDER_EXEC, { statuses: ["InProgress", "Stopped"] });
+    serveAncestry();
+
+    const out = await withGithubTarget((mod) =>
+      invokeOn(mod.handler, "start_deploy", ABANDON)
+    );
+
+    expect(out.ok).toBe(false);
+    expect(out.reason).toBe("gate_no_longer_occupied");
+    expect(stopCalls()).toEqual([]);
+    expect(startCalls()).toEqual([]);
+    // The re-read is immediately BEFORE the Stop, not cached from the projection.
+    expect(reads).toBe(2);
+  });
+
+  it("SEC-5 — a gate now held by a DIFFERENT execution is refused too", async () => {
+    let reads = 0;
+    h.state.getPipelineStateImpl = async () => {
+      reads += 1;
+      return reads === 1 ? parkedGate() : parkedGate({ parkedId: "SOMEONE-ELSE" });
+    };
+    serveExecution(OLDER_EXEC, { statuses: ["InProgress", "Stopped"] });
+    serveAncestry();
+
+    const out = await withGithubTarget((mod) =>
+      invokeOn(mod.handler, "start_deploy", ABANDON)
+    );
+
+    expect(out.reason).toBe("gate_no_longer_occupied");
+    expect(out.detail).toContain("SOMEONE-ELSE");
+    expect(stopCalls()).toEqual([]);
+  });
+
+  it("SEC-15 — AccessDenied on the Stop is abandon_not_permitted, and starts nothing", async () => {
+    h.state.getPipelineStateImpl = async () => parkedGate();
+    serveExecution(OLDER_EXEC, { statuses: ["InProgress", "Stopped"] });
+    serveAncestry();
+    h.state.stopPipelineExecutionImpl = async () => {
+      const e = new Error("User is not authorized to perform codepipeline:StopPipelineExecution");
+      e.name = "AccessDeniedException";
+      throw e;
+    };
+
+    const out = await withGithubTarget((mod) =>
+      invokeOn(mod.handler, "start_deploy", ABANDON)
+    );
+
+    expect(out.ok).toBe(false);
+    expect(out.reason).toBe("abandon_not_permitted");
+    expect(startCalls()).toEqual([]);
+  });
+
+  it("gate 5 — an unconfirmed Stop does NOT start ours", async () => {
+    // We will not start on top of a run that may still be live. An unreadable
+    // status is not a Stopped status.
+    h.state.getPipelineStateImpl = async () => parkedGate();
+    serveExecution(OLDER_EXEC, { statuses: ["InProgress", "InProgress"] });
+    serveAncestry();
+
+    const out = await withGithubTarget((mod) =>
+      invokeOn(mod.handler, "start_deploy", ABANDON)
+    );
+
+    expect(out.ok).toBe(false);
+    expect(out.reason).toBe("abandon_unconfirmed");
+    expect(out.detail).toContain("InProgress");
+    expect(stopCalls()).toHaveLength(1);
+    expect(startCalls()).toEqual([]);
+  });
+
+  it('accepts abandon:"true" (every runtime-tool arg arrives as a string)', async () => {
+    h.state.getPipelineStateImpl = async () => parkedGate();
+    serveExecution(OLDER_EXEC, { statuses: ["InProgress", "Stopped"] });
+    serveAncestry();
+
+    const out = await withGithubTarget((mod) =>
+      invokeOn(mod.handler, "start_deploy", { abandon: "true" })
+    );
+
+    expect(out.started).toBe(true);
+    expect(stopCalls()).toHaveLength(1);
+  });
+
+  it("ignores every truthy-looking value that is not the opt-in", async () => {
+    // "1", "yes", 1 and {} must NOT stop another team's deploy. The harness coerces
+    // to a real boolean; this Lambda accepts only `true` or the literal "true".
+    for (const abandon of ["1", "yes", "TRUE", 1, {}, "false"]) {
+      h.state.cpCalls = [];
+      h.state.getPipelineStateImpl = async () => parkedGate();
+      serveExecution(OLDER_EXEC, { statuses: ["InProgress", "Stopped"] });
+      serveAncestry();
+
+      const out = await withGithubTarget((mod) =>
+        invokeOn(mod.handler, "start_deploy", { abandon })
+      );
+
+      expect(out.reason, JSON.stringify(abandon)).toBe("approval_stage_occupied");
+      expect(stopCalls(), JSON.stringify(abandon)).toEqual([]);
+    }
+  });
+
+  it("refuses when the target names no parseable owner/repo", async () => {
+    h.state.getPipelineStateImpl = async () => parkedGate();
+    serveExecution(OLDER_EXEC);
+    serveAncestry();
+
+    const out = await withGithubTarget(
+      (mod) => invokeOn(mod.handler, "start_deploy", ABANDON),
+      { PIPELINE_REPO: "not-a-slug" }
+    );
+
+    expect(out.reason).toBe("ancestry_unproven");
+    expect(out.detail).toContain("owner/repo");
+    expect(h.state.githubCalls).toEqual([]);
+  });
+
+  it("refuses when the blocking execution has no readable source revision", async () => {
+    h.state.getPipelineStateImpl = async () => parkedGate();
+    h.state.getPipelineExecutionImpl = async () => ({
+      pipelineExecution: { status: "InProgress", artifactRevisions: [] },
+    });
+    serveAncestry();
+
+    const out = await withGithubTarget((mod) =>
+      invokeOn(mod.handler, "start_deploy", ABANDON)
+    );
+
+    expect(out.reason).toBe("ancestry_unproven");
+    expect(out.detail).toContain("not a full SHA");
+    expect(stopCalls()).toEqual([]);
+  });
+});
+
+describe("recordShipApproval honours a human rejection (TEAM-4740 SEC-1(3))", () => {
+  const MERGE_SHA = "9f6a9e0d1c3b4f5a8d7e2b1c0a9f8e7d6c5b4a39";
+  const HEAD_SHA = "a".repeat(40);
+  const ARGS = {
+    commit_sha: MERGE_SHA,
+    approved_head_sha: HEAD_SHA,
+    pr_url: "https://github.com/acme/widget/pull/7",
+  };
+
+  it("probes <merge_commit>.rejected.json FIRST and writes nothing when it exists", async () => {
+    h.state.headObjectImpl = async () => ({ ContentLength: 42 });
+
+    const out = await withGithubTarget((mod) => invokeOn(mod.handler, "start_deploy", ARGS));
+
+    expect(out.preapproval).toEqual({ recorded: false, reason: "human_rejected" });
+    expect(h.state.s3Puts).toEqual([]);
+    // FIRST: no CI read and no GitHub call happened, because an explicit human NO
+    // cannot be outranked by any proof that a human said YES to the code.
+    expect(h.state.cbCalls).toEqual([]);
+    expect(h.state.githubCalls).toEqual([]);
+    // ...and the deploy still STARTS. A rejected pre-approval means the gate fires,
+    // which is the status quo, not an error.
+    expect(out.started).toBe(true);
+  });
+
+  it("probes the exact key, on the hub bucket, with HeadObject not GetObject", async () => {
+    h.state.headObjectImpl = async () => ({});
+
+    await withGithubTarget((mod) => invokeOn(mod.handler, "start_deploy", ARGS));
+
+    expect(h.state.s3Calls).toContainEqual({
+      Bucket: "hub-artifacts-test",
+      Key: `pipeline-artifacts/ship-approvals/${MERGE_SHA}.rejected.json`,
+    });
+  });
+
+  it("an unprobeable marker is rejection_unverified — not an assumed absence", async () => {
+    // DL-028. We cannot prove there is NO veto, so no record, and the human is
+    // asked. Distinguishable from human_rejected so an operator can tell an S3
+    // permission problem from a real rejection.
+    h.state.headObjectImpl = async () => {
+      const e = new Error("Access Denied");
+      e.name = "AccessDenied";
+      e.$metadata = { httpStatusCode: 403 };
+      throw e;
+    };
+
+    const out = await withGithubTarget((mod) => invokeOn(mod.handler, "start_deploy", ARGS));
+
+    expect(out.preapproval).toEqual({ recorded: false, reason: "rejection_unverified" });
+    expect(h.state.s3Puts).toEqual([]);
+    expect(out.started).toBe(true);
+  });
+
+  it("a NotFound marker is the normal case and the flow continues", async () => {
+    // The default headObjectImpl. Proven by getting PAST the probe to the next
+    // reason in the chain rather than by asserting the absence of an effect.
+    const out = await withGithubTarget((mod) =>
+      invokeOn(mod.handler, "start_deploy", { commit_sha: MERGE_SHA, approved_head_sha: HEAD_SHA })
+    );
+
+    expect(out.preapproval).toEqual({ recorded: false, reason: "ci_not_certified" });
+  });
+
+  it("is skipped entirely when there is no artifact bucket to probe", async () => {
+    const out = await withEnv(
+      { ARTIFACT_BUCKET: undefined, PIPELINE_REPO: "acme/widget", GITHUB_TOKEN: "ghp-test-token" },
+      async (mod) => {
+        h.state.s3Calls = [];
+        return invokeOn(mod.handler, "start_deploy", ARGS);
+      }
+    );
+
+    // Never a HeadObject with an empty Bucket — S3 is not called at all.
+    expect(h.state.s3Calls).toEqual([]);
+    expect(out.started).toBe(true);
+  });
+});
+
+// ─── 3f. the READ SEAM the ticket twins will call (TEAM-4740) ────────────────
+//
+// TEAM-4739's ticket Lambdas reach these two tools by lambda:InvokeFunction, so
+// their request and response shapes stop being an internal detail and become a
+// cross-Lambda contract. This is the artifact handed to backend_dev: it pins the
+// exact envelope and the exact KEY SETS, as sorted lists, so any rename — ours or
+// theirs — fails here instead of silently returning undefined at 3am.
+describe("read-seam contract for the ticket twins (TEAM-4740)", () => {
+  it("get_state: the request envelope is {name, arguments:{pipeline_name, execution_id}}", async () => {
+    h.state.getPipelineStateImpl = async () => parkedGate({ inboundId: OUR_EXEC });
+    serveExecution(OLDER_EXEC);
+
+    // The literal payload a caller sends. Constructed here so a rename of the tool
+    // or of either argument fails this test.
+    const request = {
+      name: "Pipeline___get_state",
+      arguments: { pipeline_name: "agentcore-hub-deploy", execution_id: OUR_EXEC },
+    };
+    const out = JSON.parse((await handler(request)).content[0].text);
+
+    expect(out.pipelineName).toBe("agentcore-hub-deploy");
+    expect(Object.keys(out).sort()).toEqual([
+      "actionDetails",
+      "approvalSkipped",
+      "blocker",
+      "configured",
+      "failed",
+      "handoff",
+      "matchesExecution",
+      "pipelineExecutionId",
+      "pipelineName",
+      "region",
+      "remedy",
+      "repo",
+      "stages",
+      "succeeded",
+      "terminal",
+      "waitingOn",
+    ]);
+    expect(Object.keys(out.waitingOn).sort()).toEqual([
+      "action",
+      "executionId",
+      "holdsGate",
+      "kind",
+      "queuedBehind",
+      "stage",
+      "supersededBy",
+    ]);
+    expect(Object.keys(out.blocker).sort()).toEqual([
+      "action",
+      "executionId",
+      "pendingSince",
+      "pr",
+      "sourceSha",
+      "stage",
+      "supersedable",
+    ]);
+    // remedy is a SIBLING of blocker, from a closed vocabulary.
+    expect([null, "wait", "follow_superseder"]).toContain(out.remedy);
+  });
+
+  it("get_build_status: the request envelope is {name, arguments:{project, commit_sha}}", async () => {
+    h.state.listBuildsImpl = async () => ({ ids: ["b1"] });
+
+    const request = {
+      name: "Pipeline___get_build_status",
+      arguments: { project: "agentcore-hub-ci", commit_sha: "sha-b1" },
+    };
+    const out = JSON.parse((await handler(request)).content[0].text);
+
+    expect(Object.keys(out).sort()).toEqual([
+      "builds",
+      "match",
+      "project",
+      "region",
+      "requestedCommit",
+      "succeededForCommit",
+    ]);
+    // The two keys a caller actually branches on, by name and by type.
+    expect(out.match).not.toBe(null);
+    expect(out.succeededForCommit).toBe(true);
+    expect(Object.keys(out.match).sort()).toEqual([
+      "buildId",
+      "buildStatus",
+      "endTime",
+      "resolvedSourceVersion",
+      "sourceVersion",
+    ]);
+  });
+
+  it("get_state omits matchesExecution when no execution_id was asked for", async () => {
+    // The ONE conditional key in the envelope above, so a consumer knows when to
+    // expect it. Everything else is unconditional.
+    h.state.getPipelineStateImpl = async () => ({ stageStates: [] });
+    const out = await invoke("get_state", {});
+    expect(out).not.toHaveProperty("matchesExecution");
+    expect(out).toHaveProperty("blocker", null);
+    expect(out).toHaveProperty("remedy", null);
+  });
+});
+
 // ─── 4. start_ci_build (TEAM-4122 FR-4) ──────────────────────────────────────
 
 describe("start_ci_build request shape (the allow-list)", () => {
@@ -2812,10 +3611,13 @@ describe("start_ci_build retry ledger (TEAM-4448 D2)", () => {
 
   // ── (q) the contract is discoverable without tripping over a refusal ────────
 
-  it("capabilities advertises the retry contract at top level (version 4)", async () => {
+  it("capabilities advertises the retry contract at top level (version 5)", async () => {
     const out = await invoke("capabilities");
 
-    expect(out.version).toBe(4);
+    // TEAM-4740 bumped 4 → 5 for a get_state/start_deploy SHAPE change; every
+    // ciRetry field below is byte-identical to version 4, which is why it is
+    // asserted here rather than re-derived.
+    expect(out.version).toBe(5);
     expect(out.ciRetry.maxBuildsPerSha).toBe(2);
     expect(out.ciRetry.infraRetryPhases.sort()).toEqual([
       "DOWNLOAD_SOURCE",
@@ -3107,12 +3909,14 @@ describe("capabilities", () => {
     // The flat keys describe the ENV DEFAULT and are kept verbatim for callers
     // written against version 2. version 3 (TEAM-4337) adds `targets` — asserted
     // in the multi-target suite, not here. version 4 (TEAM-4448 D2) adds the
-    // top-level `ciRetry` contract — asserted in the retry suite.
+    // top-level `ciRetry` contract — asserted in the retry suite. version 5
+    // (TEAM-4740 FR-4) adds NOTHING here: it marks get_state's `blocker`/`remedy`
+    // and start_deploy's approval_stage_occupied refusal.
     expect(out).toMatchObject({
       ciProject: "agentcore-hub-ci",
       buildProject: "agentcore-hub-build",
       deployPipeline: "agentcore-hub-deploy",
-      version: 4,
+      version: 5,
     });
     // Read-only: capabilities never talks to AWS.
     expect(h.state.cpCalls).toEqual([]);
@@ -3860,16 +4664,17 @@ describe("multi-target registry resolution", () => {
     );
   });
 
-  // 8.9 capabilities v3 targets (v4 keeps them byte-identical) ──────────────
+  // 8.9 capabilities v3 targets (v4 and v5 keep them byte-identical) ────────
 
-  it("reports one entry per target and the flat keys intact (version 4)", async () => {
+  it("reports one entry per target and the flat keys intact (version 5)", async () => {
     const out = await withRegistry(MULTI_REGISTRY, (mod) => invokeOn(mod.handler, "capabilities"), {
       AWS_REGION: "us-east-1",
     });
 
-    // TEAM-4448 D2 bumped 3 → 4 by ADDING top-level `ciRetry`; `targets` and the
-    // flat keys below are unchanged, which is the point of asserting them here.
-    expect(out.version).toBe(4);
+    // TEAM-4448 D2 bumped 3 → 4 by ADDING top-level `ciRetry`; TEAM-4740 bumped
+    // 4 → 5 by adding NOTHING here at all. `targets` and the flat keys below are
+    // unchanged through both, which is the point of asserting them here.
+    expect(out.version).toBe(5);
     // Version-2 callers keep reading exactly what they read before.
     expect(out).toMatchObject({
       startCiBuild: false,
@@ -3910,12 +4715,16 @@ describe("multi-target registry resolution", () => {
       // The flat env-default keys are NOT filtered - they describe this Lambda.
       expect(one.deployPipeline).toBe(HUB);
 
+      // TEAM-4740 SEC-17: exactly three keys, and NO `known: [...]`. This tool IS
+      // the discovery surface — calling it with no pipeline_name returns the whole
+      // target list — so echoing the registry inside its own refusal was one more
+      // place it could be enumerated from and nothing else. The `toEqual` (not
+      // `toMatchObject`) is the assertion: a re-added key fails here.
       const bad = await invokeOn(mod.handler, "capabilities", { pipeline_name: "nope-deploy" });
       expect(bad).toEqual({
         ok: false,
         reason: "pipeline_not_registered",
         requested: "nope-deploy",
-        known: [HUB, WIDGET],
       });
     });
   });

@@ -117,10 +117,12 @@ describe("buildInlinePolicy — the CiStartBuild grant", () => {
     expect(policy.Statement.map((s) => s.Sid)).toEqual([
       "Logs",
       "PipelineReadAndTrigger",
+      "PipelineAbandonSuperseded",
       "BuildRead",
       "HandoffMarkerRead",
       "CdRegistryRead",
       "ShipApprovalRecordWrite",
+      "ShipRejectionMarkerRead",
       "BuildLogRead",
       "CrossAccountAssumeTrigger",
     ]);
@@ -132,11 +134,13 @@ describe("buildInlinePolicy — the CiStartBuild grant", () => {
     expect(policy.Statement.map((s) => s.Sid)).toEqual([
       "Logs",
       "PipelineReadAndTrigger",
+      "PipelineAbandonSuperseded",
       "BuildRead",
       "CiStartBuild",
       "HandoffMarkerRead",
       "CdRegistryRead",
       "ShipApprovalRecordWrite",
+      "ShipRejectionMarkerRead",
       "BuildLogRead",
       "CrossAccountAssumeTrigger",
     ]);
@@ -198,6 +202,9 @@ describe("buildInlinePolicy — the CiStartBuild grant", () => {
         "codepipeline:GetPipelineState",
         "codepipeline:ListActionExecutions",
         "codepipeline:StartPipelineExecution",
+        // TEAM-4740's Stop. Listed exhaustively on purpose: this is the assertion a
+        // future widening has to argue with.
+        "codepipeline:StopPipelineExecution",
       ]);
     }
   });
@@ -487,15 +494,18 @@ describe("buildInlinePolicy — the handoff-marker read", () => {
     }
   });
 
-  it("grants exactly two S3 reads and ONE S3 write, in that order", () => {
+  it("grants exactly three S3 reads and ONE S3 write, in that order", () => {
     const policy = buildInlinePolicy({ ...BASE, PIPELINE_CI_START_BUILD: "1" });
-    // Two reads since TEAM-4337 (handoff markers, CD registry) and, since
-    // TEAM-4525, exactly ONE write (the ship-approval record). Listed rather than
-    // deduped so a fourth S3 grant cannot appear unnoticed.
+    // Two reads since TEAM-4337 (handoff markers, CD registry), a third since
+    // TEAM-4740 (the ship-REJECTION marker), and still exactly ONE write (the
+    // ship-approval record). Listed rather than deduped so a fifth S3 grant cannot
+    // appear unnoticed — and note the shape of the widening: TEAM-4740 added a
+    // READ of a human veto, not a second write.
     expect(allActions(policy).filter((a) => a.startsWith("s3:"))).toEqual([
       "s3:GetObject",
       "s3:GetObject",
       "s3:PutObject",
+      "s3:GetObject",
     ]);
     // The write is on ONE prefix, and it is not the prefix either read covers.
     const writes = statementsWith(policy, "s3:PutObject");
@@ -615,6 +625,143 @@ describe("buildInlinePolicy — the ship-approval record write", () => {
 
 // ─── TEAM-4337: the hub-* convention grants ──────────────────────────────────
 
+describe("buildInlinePolicy — the abandon grant (TEAM-4740)", () => {
+  it("is exactly StopPipelineExecution, on the SAME resources as read+trigger", () => {
+    // The invariant, deep-equal rather than "contains": a pipeline this role can
+    // stop must be one it could already start and read. If the two lists ever
+    // diverge, this role can abandon a run on a pipeline it does not otherwise
+    // participate in — which is somebody else's deploy, stopped by us.
+    for (const regions of [undefined, "us-east-1", "us-east-1,eu-west-1,us-west-2"]) {
+      const policy = buildInlinePolicy({ ...BASE, PIPELINE_REGIONS: regions });
+      const abandon = sid(policy, "PipelineAbandonSuperseded");
+      const trigger = sid(policy, "PipelineReadAndTrigger");
+
+      expect(abandon.Action, String(regions)).toEqual(["codepipeline:StopPipelineExecution"]);
+      expect(abandon.Resource, String(regions)).toEqual(trigger.Resource);
+      expect(abandon.Effect).toBe("Allow");
+      // Not merely equal by value — the same array, computed once in the source.
+      expect(abandon.Resource, String(regions)).toBe(trigger.Resource);
+    }
+  });
+
+  it("carries no approval, retry, delete or disable action alongside the Stop", () => {
+    // The neighbours of StopPipelineExecution in the CodePipeline API are the
+    // dangerous ones: PutApprovalResult decides a human gate, DisableStageTransition
+    // reshapes the pipeline, RetryStageExecution re-runs a stage after the gate.
+    const statement = sid(buildInlinePolicy(BASE), "PipelineAbandonSuperseded");
+    expect(statement.Action).toHaveLength(1);
+    for (const forbidden of [
+      "codepipeline:PutApprovalResult",
+      "codepipeline:RetryStageExecution",
+      "codepipeline:DisableStageTransition",
+      "codepipeline:EnableStageTransition",
+      "codepipeline:DeletePipeline",
+      "codepipeline:UpdatePipeline",
+      "codepipeline:*",
+    ]) {
+      expect(statement.Action).not.toContain(forbidden);
+    }
+  });
+
+  it("names no codebuild, s3 or iam resource — pipelines only", () => {
+    const statement = sid(buildInlinePolicy(BASE), "PipelineAbandonSuperseded");
+    for (const resource of statement.Resource) {
+      expect(resource.startsWith("arn:aws:codepipeline:")).toBe(true);
+    }
+  });
+
+  it("is present unconditionally — it is not gated on a bucket or a flag", () => {
+    // Unlike the S3 grants, the abandon path needs no artifact bucket, and unlike
+    // CiStartBuild it is not behind a flag: the Lambda gates it at RUNTIME (opt-in
+    // arg + proven ancestry + a live gate + a confirmed Stop), not in IAM. IAM
+    // bounds the blast radius; the five runtime gates decide whether it fires.
+    for (const flag of ["0", "1"]) {
+      for (const bucket of ["", "explicit-bucket"]) {
+        const policy = buildInlinePolicy({
+          ...BASE,
+          PIPELINE_CI_START_BUILD: flag,
+          ARTIFACT_BUCKET: bucket,
+        });
+        expect(sid(policy, "PipelineAbandonSuperseded"), `${flag}/${bucket}`).toBeDefined();
+      }
+    }
+    expect(sid(buildInlinePolicy({ ...BASE, ACCOUNT: undefined }), "PipelineAbandonSuperseded"))
+      .toBeDefined();
+  });
+
+  it("the source derives the shared resource list ONCE", () => {
+    // The property the deep-equal above can only observe after the fact. Two
+    // literal `[pipelineArn, ...hubPipelineArns]` expressions would pass every
+    // assertion in this file today and drift on the next edit.
+    expect(SOURCE.match(/\[pipelineArn, \.\.\.hubPipelineArns\]/g)).toHaveLength(1);
+    expect(SOURCE.match(/Resource: pipelineArns,/g)).toHaveLength(2);
+  });
+});
+
+describe("buildInlinePolicy — the ship-rejection marker read (TEAM-4740)", () => {
+  const bucketArn = `arn:aws:s3:::agentcore-hub-artifacts-${ACCOUNT}-us-east-1`;
+
+  it("reads ONLY the .rejected.json suffix of the ship-approvals prefix", () => {
+    const statement = sid(buildInlinePolicy(BASE), "ShipRejectionMarkerRead");
+    expect(statement).toEqual({
+      Sid: "ShipRejectionMarkerRead",
+      Effect: "Allow",
+      Action: ["s3:GetObject"],
+      Resource: [`${bucketArn}/pipeline-artifacts/ship-approvals/*.rejected.json`],
+    });
+  });
+
+  it("cannot read the approval records this role WRITES", () => {
+    // Deliberately narrower than ShipApprovalRecordWrite's `ship-approvals/*`. The
+    // Lambda needs to know a veto EXISTS; it never needs to read an approval
+    // record's contents, and a role that could would be able to mine every merge
+    // commit and head SHA the hub has ever pre-approved.
+    const read = sid(buildInlinePolicy(BASE), "ShipRejectionMarkerRead").Resource[0];
+    const write = sid(buildInlinePolicy(BASE), "ShipApprovalRecordWrite").Resource[0];
+    expect(read).not.toBe(write);
+    expect(read.endsWith("*.rejected.json")).toBe(true);
+    // A plain `<merge_commit>.json` key does not match this Resource pattern.
+    expect(read).not.toContain("ship-approvals/*\"");
+    for (const forbidden of ["config/", "handoff/", "blueprints/", "last-deployed"]) {
+      expect(read).not.toContain(forbidden);
+    }
+  });
+
+  it("grants no write, delete or list along the way", () => {
+    const statement = sid(buildInlinePolicy(BASE), "ShipRejectionMarkerRead");
+    for (const forbidden of [
+      "s3:PutObject",
+      "s3:DeleteObject",
+      "s3:ListBucket",
+      "s3:GetObjectAcl",
+      "s3:*",
+    ]) {
+      expect(statement.Action).not.toContain(forbidden);
+    }
+  });
+
+  it("honours an explicit ARTIFACT_BUCKET and vanishes without one", () => {
+    expect(
+      sid(
+        buildInlinePolicy({ ...BASE, ARTIFACT_BUCKET: "explicit-bucket" }),
+        "ShipRejectionMarkerRead"
+      ).Resource
+    ).toEqual(["arn:aws:s3:::explicit-bucket/pipeline-artifacts/ship-approvals/*.rejected.json"]);
+    expect(
+      sid(buildInlinePolicy({ ...BASE, ACCOUNT: undefined }), "ShipRejectionMarkerRead")
+    ).toBeUndefined();
+  });
+
+  it("sits immediately after the write it guards", () => {
+    // Read order is the review argument: the write grant and the veto read that
+    // constrains it are adjacent so neither can be widened without the other in view.
+    const sids = buildInlinePolicy(BASE).Statement.map((s) => s.Sid);
+    expect(sids.indexOf("ShipRejectionMarkerRead")).toBe(
+      sids.indexOf("ShipApprovalRecordWrite") + 1
+    );
+  });
+});
+
 describe("buildInlinePolicy — the hub-* convention wildcards", () => {
   const ON = { ...BASE, PIPELINE_CI_START_BUILD: "1" };
   const cpArn = (name, region = REGION) =>
@@ -628,21 +775,25 @@ describe("buildInlinePolicy — the hub-* convention wildcards", () => {
     expect(buildInlinePolicy(BASE).Statement.map((s) => s.Sid)).toEqual([
       "Logs",
       "PipelineReadAndTrigger",
+      "PipelineAbandonSuperseded",
       "BuildRead",
       "HandoffMarkerRead",
       "CdRegistryRead",
       "ShipApprovalRecordWrite",
+      "ShipRejectionMarkerRead",
       "BuildLogRead",
       "CrossAccountAssumeTrigger",
     ]);
     expect(buildInlinePolicy(ON).Statement.map((s) => s.Sid)).toEqual([
       "Logs",
       "PipelineReadAndTrigger",
+      "PipelineAbandonSuperseded",
       "BuildRead",
       "CiStartBuild",
       "HandoffMarkerRead",
       "CdRegistryRead",
       "ShipApprovalRecordWrite",
+      "ShipRejectionMarkerRead",
       "BuildLogRead",
       "CrossAccountAssumeTrigger",
     ]);
@@ -816,6 +967,7 @@ describe("buildInlinePolicy — the hub-* convention wildcards", () => {
     expect(sid(noBucket, "CdRegistryRead")).toBeUndefined();
     expect(sid(noBucket, "HandoffMarkerRead")).toBeUndefined();
     expect(sid(noBucket, "ShipApprovalRecordWrite")).toBeUndefined();
+    expect(sid(noBucket, "ShipRejectionMarkerRead")).toBeUndefined();
     // Not one s3: action survives — there is no bucket to name in a Resource.
     expect(allActions(noBucket).filter((a) => a.startsWith("s3:"))).toEqual([]);
     // The handoff marker keeps its own prefix - the two grants are separate on
@@ -846,6 +998,11 @@ describe("buildInlinePolicy — the hub-* convention wildcards", () => {
             "codepipeline:GetPipelineState",
             "codepipeline:ListActionExecutions",
             "codepipeline:StartPipelineExecution",
+            // TEAM-4740. The complete list of CodePipeline actions this role has,
+            // and the reason this assertion is exhaustive rather than a negative
+            // match on /Approval/: a Stop is the LAST write that can be added here
+            // without someone reading this line and asking why.
+            "codepipeline:StopPipelineExecution",
           ]);
         }
       }

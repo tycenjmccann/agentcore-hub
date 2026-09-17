@@ -227,6 +227,14 @@ export default defineConfig({
       // persona's roster phase) advances intake → development → ship, a junk stamp
       // is ignored, and the human gate is published without an agentTasks entry.
       "lambda/orchestrator/replay-intake-materialize.test.mjs",
+      // replay-head-of-line (TEAM-4740 FR-4) — run p5ogpg, where start_deploy
+      // started a second execution behind an OLDER run parked on the human deploy
+      // gate and wrote a ship-approval record for a deploy that never ran.
+      // Replayed through the REAL pipeline-tools handler: the call is refused, the
+      // blocker is returned in full, and neither the Start nor the PutObject
+      // happens. Plus the TEAM-4663 create_ticket payload shape (base_branch:
+      // "main") as a pure fixture — the twins own their own validation tests.
+      "lambda/orchestrator/replay-head-of-line.test.mjs",
       // workflow-output report_completion (TEAM-4121 FR-9) — the completion record
       // is what live-reverify.mjs reads to decide whether a "live" fix actually
       // produced live evidence, so the two new fields must be additive (a record
