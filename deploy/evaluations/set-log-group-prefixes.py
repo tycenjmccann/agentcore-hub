@@ -10,9 +10,12 @@ error anywhere (that was the shape of the Aug 31 -> Sep 14 gap). With
 `logGroupNamePrefixes` ("/aws/bedrock-agentcore/runtimes/<name>-") the config
 follows the runtime through recreation; `serviceNames` still narrows the traces.
 
-Only `dataSourceConfig` is sent to UpdateOnlineEvaluationConfig. Evaluators,
-sampling rule, output config and role are re-read afterwards and asserted
-unchanged — see the "eval matrix trim" incident for why that guard exists.
+Only `dataSourceConfig` is sent to UpdateOnlineEvaluationConfig. The update is
+asynchronous, so the script polls until `status` leaves UPDATING and aborts on
+UPDATE_FAILED/ERROR (an immediate read echoes the REQUESTED data source and
+would report success for an update that later failed). Once settled, evaluators,
+sampling rule, output config and role are asserted unchanged — see the "eval
+matrix trim" incident for why that guard exists.
 
 Prefix derivation is deliberately strict: a log group that is not shaped like a
 runtime log group (`<name>-<10 alnum>-<endpoint>`) is refused, not guessed at,
@@ -35,6 +38,7 @@ import json
 import os
 import re
 import sys
+import time
 
 import boto3
 import botocore.session
@@ -48,6 +52,13 @@ RUNTIME_LG_RE = re.compile(
     r"^(?P<base>/aws/bedrock-agentcore/runtimes/(?P<name>[A-Za-z0-9_]+))-[A-Za-z0-9]{10}-[A-Za-z0-9_]+$"
 )
 MAX_PREFIXES = 5
+# UpdateOnlineEvaluationConfig is asynchronous: it returns while status is
+# UPDATING and can land on UPDATE_FAILED/ERROR afterwards. Reading the config
+# immediately shows the REQUESTED data source, so a failed update would print
+# "applied" while the judge stays on the old exact log group.
+TERMINAL_BAD = {"UPDATE_FAILED", "CREATE_FAILED", "ERROR", "DELETING"}
+SETTLE_TIMEOUT_S = 180
+SETTLE_POLL_S = 5
 
 
 def sdk_supports_prefixes() -> bool:
@@ -101,6 +112,21 @@ def collision(prefix: str, all_groups: list[str]) -> list[str]:
         if not m or m.group("name") != want:
             bad.append(lg)
     return bad
+
+
+def wait_settled(control, cid: str) -> dict:
+    """Poll until status leaves UPDATING. Raises on a terminal failure/timeout."""
+    deadline = time.monotonic() + SETTLE_TIMEOUT_S
+    while True:
+        cfg = control.get_online_evaluation_config(onlineEvaluationConfigId=cid)
+        status = cfg.get("status")
+        if status in TERMINAL_BAD:
+            raise RuntimeError(f"status={status} failureReason={cfg.get('failureReason') or '(none)'}")
+        if status == "ACTIVE":
+            return cfg
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"still {status} after {SETTLE_TIMEOUT_S}s — check the console before re-running")
+        time.sleep(SETTLE_POLL_S)
 
 
 def snapshot(cfg: dict) -> dict:
@@ -176,7 +202,12 @@ def main() -> int:
                 "cloudWatchLogs": {"logGroupNamePrefixes": prefixes, "serviceNames": cw["serviceNames"]}
             },
         )
-        after = control.get_online_evaluation_config(onlineEvaluationConfigId=cid)
+        try:
+            after = wait_settled(control, cid)
+        except RuntimeError as exc:
+            print(f"    ✗ update did not settle ACTIVE: {exc}")
+            print("      the judge may still be on the old exact log group — do NOT assume this config migrated")
+            return 3
         if snapshot(before) != snapshot(after):
             print("    ✗ OTHER FIELDS CHANGED — inspect immediately:")
             print("      before:", json.dumps(snapshot(before), default=str))
