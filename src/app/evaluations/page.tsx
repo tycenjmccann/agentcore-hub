@@ -58,9 +58,14 @@ const EVAL_AGENTS = ROSTER.filter((a) => !!a.evalConfigName && !!a.evaluationsEn
 
 function columnAgents(data: EvalData | null): RawAgent[] {
   if (!data?.columns?.length) return EVAL_AGENTS;
-  return data.columns.map(
-    (c) => ROSTER_BY_ID.get(c.agentId) ?? { agentId: c.agentId, displayName: c.displayName, evaluationsEnabled: true }
-  );
+  // The API keys metrics/scorecard/personas by the LIVE roster's displayName, so
+  // that name wins; the bundled entry only contributes colour and persona order.
+  return data.columns.map((c) => ({
+    ...(ROSTER_BY_ID.get(c.agentId) ?? {}),
+    agentId: c.agentId,
+    displayName: c.displayName,
+    evaluationsEnabled: true,
+  }));
 }
 
 /**

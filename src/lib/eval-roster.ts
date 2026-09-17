@@ -70,7 +70,12 @@ export function deriveEvalColumns(agents: EvalRosterAgent[]): EvalColumns {
 
   // 2. Shared runtimes — a group of ≥2 agents on one ARN collapses onto the
   //    agent whose agentId names that runtime. No anchor → no guess: every
-  //    member keeps its own column.
+  //    member keeps its own column. The anchor MUST be a roster agent because
+  //    the day rows are keyed by the agentId the eval-packager resolves from the
+  //    roster (resolveAgentId), never by a runtime name: the 1-runtime layout
+  //    works because `agentcore_hub_agent` is a roster entry, and a 4-runtime
+  //    layout needs one roster entry per phase runtime (`agentcore_hub_design`,
+  //    …) for evaluations to attribute at all — the same entry anchors it here.
   const byArn = new Map<string, EvalRosterAgent[]>();
   for (const a of enabled) {
     if (hosted[a.agentId] || !a.runtimeArn) continue;
