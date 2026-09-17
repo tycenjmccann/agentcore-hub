@@ -235,6 +235,15 @@ export default defineConfig({
       // happens. Plus the TEAM-4663 create_ticket payload shape (base_branch:
       // "main") as a pure fixture — the twins own their own validation tests.
       "lambda/orchestrator/replay-head-of-line.test.mjs",
+      // replay-followups (TEAM-4740 FR-13/FR-5) — four real runs whose delivery
+      // work went missing: a fix created while the Merge Approval gate was open
+      // (TEAM-4660), a post-deploy re-check that lived only in prose (15x8ql), and
+      // three console/IAM steps a human had to do (syq0p9). Replayed through the
+      // REAL workflow-output handler as the producer and the REAL completion.mjs
+      // gate as the reader, so it pins the property no unit test can: the ticket a
+      // report mints is one the completion gate recognizes and holds the run open
+      // for. REGRESSION hirhfw: a report with no follow-ups is byte-unchanged.
+      "lambda/orchestrator/replay-followups.test.mjs",
       // workflow-output report_completion (TEAM-4121 FR-9) — the completion record
       // is what live-reverify.mjs reads to decide whether a "live" fix actually
       // produced live evidence, so the two new fields must be additive (a record

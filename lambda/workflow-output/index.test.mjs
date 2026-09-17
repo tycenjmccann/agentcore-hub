@@ -28,7 +28,21 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
  * answers from the same object map (absent key → NotFound + 404), and a test can
  * set `h.headError` to any other AWS error to simulate the indeterminate case.
  */
-const h = vi.hoisted(() => ({ puts: [], warns: [], gets: [], heads: [], headError: null, invokes: [], objects: new Map() }));
+/**
+ * TEAM-4740 adds a SECOND consumer of the ticket-tools Lambda: report_completion
+ * now reads the ticket (for its epic and its base_branch line) and creates the
+ * follow-up tickets a report hands on. So the blanket `{ok:true}` stub becomes a
+ * tiny fake ticket system — `h.issue` is what get_issue answers, `h.siblings` is
+ * the epic's children, `h.ticketFail` makes a named tool fail — and `h.calls`
+ * records every (tool, params) pair, which is what most of the new assertions
+ * read. `h.created` rows are appended to `h.siblings` on create, because that is
+ * the state a RE-invocation of the same report actually sees; it is what makes
+ * the idempotency test a real round trip rather than a mock reading its own stub.
+ */
+const h = vi.hoisted(() => ({
+  puts: [], warns: [], gets: [], heads: [], headError: null, invokes: [], objects: new Map(),
+  calls: [], events: [], issue: undefined, siblings: [], created: [], ticketFail: new Set(),
+}));
 
 const asString = (body) => (typeof body === "string" ? body : Buffer.from(body).toString("utf8"));
 
@@ -88,26 +102,68 @@ vi.mock("@aws-sdk/client-s3", () => ({
   ListObjectsV2Command: class { constructor(input) { this.input = input; } },
 }));
 vi.mock("@aws-sdk/s3-request-presigner", () => ({ getSignedUrl: async () => "https://signed" }));
+/** A DynamoDB-twin-shaped ticket row (the shape normalizeIssue reads). */
+const ticketRow = ({ key, summary = "Work", assignee = "agentcore_hub_api_dev", status = "todo", parent = "TEAM-4100", created = "2026-09-17T09:00:00.000Z", description = "" }) => ({
+  key,
+  fields: {
+    summary, description, status: { name: status }, assignee: { displayName: assignee },
+    parent: parent ? { key: parent } : undefined, created,
+  },
+  blockedBy: [],
+});
+
 vi.mock("@aws-sdk/client-lambda", () => ({
   // The Done transition itself is not under test — a plain success keeps the log
   // quiet — but `h.invokes` records every call, because the DL-030 refusals below
   // are only meaningful if the ticket was NOT transitioned.
   LambdaClient: class {
     async send(cmd) {
-      h.invokes.push(cmd?.input || {});
-      return { Payload: new TextEncoder().encode(JSON.stringify({ ok: true })) };
+      const input = cmd?.input || {};
+      h.invokes.push(input);
+      let call = {};
+      try { call = JSON.parse(Buffer.from(input.Payload).toString("utf8")); } catch { /* not JSON: leave blank */ }
+      const tool = call.tool_name || null;
+      const params = call.parameters || {};
+      h.calls.push({ tool, params });
+      const reply = (obj) => ({ Payload: new TextEncoder().encode(JSON.stringify(obj)) });
+      // The DynamoDB twin reports failure as a textResult, not a throw — the shape
+      // ticketTool's toolFailure() has to recognize.
+      if (h.ticketFail.has(tool)) return reply({ content: [{ type: "text", text: `Error: ${tool} is unavailable` }] });
+      if (tool === "Tickets___get_issue") {
+        return reply(h.issue === undefined ? ticketRow({ key: params.ticket_id, summary: "The ticket under report" }) : h.issue);
+      }
+      if (tool === "Tickets___list_tickets") return reply({ total: h.siblings.length, issues: h.siblings });
+      if (tool === "Tickets___create_ticket") {
+        const key = `TEAM-49${String(h.created.length + 1).padStart(2, "0")}`;
+        h.created.push({ key, params });
+        // A created follow-up IS a sibling from that moment on. Appending it is what
+        // makes the idempotency assertion a real round trip: the second report reads
+        // back the [fu:<hash>] summary this create wrote.
+        h.siblings.push(ticketRow({ key, summary: params.summary, assignee: params.assignee, created: "2026-09-17T12:00:00.000Z" }));
+        return reply({ key, self: `https://tickets/${key}`, status: "created", ticket: { key, summary: params.summary } });
+      }
+      return reply({ ok: true });
     }
   },
   InvokeCommand: class { constructor(input) { this.input = input; } },
 }));
 vi.mock("@aws-sdk/client-dynamodb", () => ({ DynamoDBClient: class {} }));
 vi.mock("@aws-sdk/lib-dynamodb", () => ({
-  DynamoDBDocumentClient: { from: () => ({ send: async () => ({}) }) },
+  // Journey events are the only DynamoDB write this Lambda makes; FR-14's
+  // delivery.prState event is asserted off `h.events`.
+  DynamoDBDocumentClient: {
+    from: () => ({
+      send: async (cmd) => {
+        if (cmd?.input?.Item) h.events.push(cmd.input.Item);
+        return {};
+      },
+    }),
+  },
   PutCommand: class { constructor(input) { this.input = input; } },
 }));
 
 process.env.ARTIFACT_BUCKET = "test-bucket";
-const { handler, inferToolFromArgs } = await import("./index.mjs");
+const { handler, inferToolFromArgs, followUpHash, followUpBanner } = await import("./index.mjs");
 
 /** The completion record the call wrote, parsed. */
 const record = () => JSON.parse(h.puts.find((p) => p.Key?.startsWith("completions/")).Body);
@@ -126,7 +182,12 @@ const report = (extra) =>
 
 // Every key a pre-4121 record carries — asserted as a SET so an accidental
 // addition (or rename) fails here rather than in whatever reads the record.
-const BASE_KEYS = ["ticket_id", "summary", "artifacts", "branch", "commit_sha", "pr_url", "completed_at"];
+//
+// TEAM-4740 FR-14 adds exactly one: `delivery` is on EVERY record (it is derived
+// from the report, so it is always computable), which is why it belongs in the
+// base set rather than in the additive-field tests. That "plus only delivery" is
+// itself the assertion — the hirhfw regression is that nothing ELSE moved.
+const BASE_KEYS = ["ticket_id", "summary", "artifacts", "branch", "commit_sha", "pr_url", "completed_at", "delivery"];
 
 // TEAM-4706 fixtures, shared with the ship-report-contract block at the bottom.
 const EXEC_ID = "b3a1c0de-1234-4f56-89ab-cdef01234567"; // 36 chars, [0-9a-f-] only
@@ -137,8 +198,18 @@ const PR_URL = "https://github.com/owner/repo/pull/42";
 const result = (res) => JSON.parse(res.content[0].text);
 /** Did the call write a completion record at all? */
 const wroteRecord = () => h.puts.some((p) => p.Key?.startsWith("completions/"));
-/** Did the call ask the ticket-tools Lambda to transition the ticket? */
-const transitioned = () => h.invokes.length > 0;
+/**
+ * Did the call ask the ticket-tools Lambda to transition the ticket?
+ *
+ * Keyed on the TOOL, not on "any invoke happened" — since TEAM-4740 a report also
+ * reads the ticket and may create follow-ups, so `h.invokes.length > 0` would now
+ * read every refusal as a transition and quietly pass the DL-030 tests below.
+ */
+const transitioned = () => h.calls.some((c) => c.tool === "Tickets___transition_ticket");
+/** Params of every call to one tool, in order. */
+const calls = (tool) => h.calls.filter((c) => c.tool === tool).map((c) => c.params);
+/** Journey events of one type, most recent last. */
+const events = (type) => h.events.filter((e) => e.type === type);
 
 beforeEach(() => {
   h.puts.length = 0;
@@ -146,9 +217,16 @@ beforeEach(() => {
   h.gets.length = 0;
   h.heads.length = 0;
   h.invokes.length = 0;
+  h.calls.length = 0;
+  h.events.length = 0;
+  h.created.length = 0;
+  h.siblings.length = 0;
+  h.ticketFail.clear();
+  h.issue = undefined;
   h.headError = null;
   h.objects.clear();
   vi.spyOn(console, "warn").mockImplementation((...args) => h.warns.push(args.join(" ")));
+  vi.spyOn(console, "error").mockImplementation((...args) => h.warns.push(args.join(" ")));
 });
 
 describe("report_completion — evidence_kind / evidence_keys", () => {
@@ -372,6 +450,7 @@ describe("report_completion — ship-report contract (pipeline_execution_id / pi
     for (const c of cases) {
       h.puts.length = 0;
       h.invokes.length = 0;
+      h.calls.length = 0;
       h.objects.clear();
       if (c.ledger) h.objects.set(CD_LEDGER_KEY, JSON.stringify({ execution_id: EXEC_ID }));
       const r = result(await report({ outcome: "shipped", merge_commit: MERGE_COMMIT, ...(c.pipeline_name ? { pipeline_name: PIPELINE } : {}) }));
@@ -415,6 +494,7 @@ describe("report_completion — ship-report contract (pipeline_execution_id / pi
     for (const extra of [{}, { pr_url: "   " }]) {
       h.puts.length = 0;
       h.invokes.length = 0;
+      h.calls.length = 0;
       const r = result(await report({ outcome: "handoff", ...extra }));
       expect(r.ok).toBe(false);
       expect(r.reason).toBe("handoff_requires_pr_url");
@@ -466,6 +546,7 @@ describe("report_completion — ship-report contract (pipeline_execution_id / pi
       h.puts.length = 0;
       h.warns.length = 0;
       h.invokes.length = 0;
+      h.calls.length = 0;
       const res = await report({ outcome: oc, block_reason: "pipeline stage Deploy failed" });
       expect(result(res).status).toBe("complete");
       expect(record().outcome).toBe(oc);
@@ -483,6 +564,7 @@ describe("report_completion — ship-report contract (pipeline_execution_id / pi
     // id reads as proof of a deploy nobody can look up.
     h.puts.length = 0;
     h.invokes.length = 0;
+    h.calls.length = 0;
     const r = result(await report({ outcome: "shipped", merge_commit: MERGE_COMMIT, pipeline_name: PIPELINE, pipeline_execution_id: EXEC_ID.replace("b", "z") }));
     expect(r.ok).toBe(false);
     expect(r.missing).toEqual(["pipeline_execution_id"]);
@@ -499,6 +581,486 @@ describe("report_completion — ship-report contract (pipeline_execution_id / pi
     await report({ pipeline_execution_id: "  ", pipeline_name: "" });
     expect(Object.keys(record()).sort()).toEqual([...BASE_KEYS].sort());
     expect(h.warns.join("\n")).not.toMatch(/pipeline_/);
+  });
+});
+
+// ─── TEAM-4740 FR-14: delivery.prState ────────────────────────────────────────
+//
+// Every completion record now says what happened to the PR. It is DERIVED from the
+// report — this Lambda has no GitHub token and no client, deliberately, because
+// every agent can invoke it — so the contract is narrow on purpose: "merged" only
+// when the report names a merge commit or claims `shipped`, "open" when there is a
+// PR, and "unknown" otherwise. A derived state can lag reality by one merge; the
+// thing it must never do is LEAD it, which is why absence maps to unknown rather
+// than to "open".
+describe("report_completion — FR-14 delivery.prState", () => {
+  it("derives merged / open / unknown, and puts delivery on EVERY record", async () => {
+    const cases = [
+      [{ merge_commit: MERGE_COMMIT }, "merged", null],
+      [{ outcome: "shipped", merge_commit: MERGE_COMMIT }, "merged", null],
+      // A ship with a PR still reads merged: the merge commit is the stronger claim.
+      [{ merge_commit: MERGE_COMMIT, pr_url: PR_URL }, "merged", PR_URL],
+      [{ pr_url: PR_URL }, "open", PR_URL],
+      [{}, "unknown", null],
+      // A blank PR url is the same as absent, here as everywhere else.
+      [{ pr_url: "   " }, "unknown", null],
+    ];
+    for (const [extra, prState, prUrl] of cases) {
+      h.puts.length = 0;
+      await report(extra);
+      expect(record().delivery, JSON.stringify(extra)).toEqual({ prUrl, prState });
+    }
+  });
+
+  it("emits a delivery.prState event of its own, beside workflow.report_completion", async () => {
+    // A separate event, not a field on the completion event: the delivery view
+    // reads prState per TICKET and a run has many completions.
+    await report({ pr_url: PR_URL });
+    expect(events("workflow.report_completion")).toHaveLength(1);
+    const [ev] = events("delivery.prState");
+    expect(ev.workflowId).toBe("wf_1");
+    expect(ev.detail).toEqual({
+      workflowId: "wf_1",
+      ticketId: "TEAM-4200",
+      prUrl: PR_URL,
+      prState: "open",
+      observedAt: record().completed_at,
+    });
+  });
+
+  it("a refused report emits NO delivery event and writes no record", async () => {
+    // The FR-14 stamp is downstream of the DL-030 gate, so a refusal cannot leak a
+    // delivery claim for a completion that did not happen.
+    expect(result(await report({ outcome: "handoff" })).reason).toBe("handoff_requires_pr_url");
+    expect(events("delivery.prState")).toHaveLength(0);
+    expect(wroteRecord()).toBe(false);
+  });
+});
+
+// ─── TEAM-4740 FR-13: follow_ups ──────────────────────────────────────────────
+//
+// The failure this exists to remove: a run ends with real work still outstanding —
+// a post-deploy re-check, an IAM step only a human can do, a hub-infra commit that
+// still needs its own PR to main — recorded only in the summary prose. The epic
+// closes GREEN and the work evaporates.
+//
+// So a report may hand that work on as STRUCTURE, and each surviving entry becomes
+// one ticket under the epic, blocked on the CD ticket. Two rules shape every test
+// below. (1) The vocabulary is CLOSED and the caps are hard: an entry that does not
+// fit is dropped and REPORTED, never stored half-understood. (2) The fail direction
+// is always "complete anyway" — a completion must never be held hostage by its own
+// bookkeeping, so every materialization failure is a value on the response and the
+// ticket still transitions.
+const FU = (extra) => JSON.stringify([{ kind: "docs", owner: "agent", assignee: "agentcore_hub_api_dev", title: "Document the new flag", ...extra }]);
+/** The CD ticket of the run — the sibling whose assignee owns the ship phase. */
+const CD = ticketRow({ key: "TEAM-4199", summary: "Ship it", assignee: "agentcore_hub_release_manager", created: "2026-09-17T10:00:00.000Z" });
+
+describe("report_completion — FR-13 follow_ups: the record and the response", () => {
+  it("stores the surviving entries on the record and materializes one ticket each", async () => {
+    h.siblings.push(CD);
+    const res = result(await report({ follow_ups: FU() }));
+    const r = record();
+    expect(r.followUps).toHaveLength(1);
+    expect(r.followUps[0]).toEqual({
+      kind: "docs", owner: "agent", assignee: "agentcore_hub_api_dev",
+      title: "Document the new flag", detail: "",
+      hash: followUpHash("TEAM-4200", "docs", "Document the new flag"),
+    });
+    expect(h.created).toHaveLength(1);
+    const p = h.created[0].params;
+    expect(p.summary).toBe(`Document the new flag [fu:${r.followUps[0].hash}]`);
+    expect(p.parent_key).toBe("TEAM-4100");
+    expect(p.blocked_by).toEqual(["TEAM-4199"]);
+    expect(p.description.startsWith(followUpBanner("TEAM-4200"))).toBe(true);
+    // The completion is a completion: still ok, still transitioned.
+    expect(res.status).toBe("complete");
+    expect(res.followUpsMaterialized.created).toEqual([{
+      ticketId: "TEAM-4901", hash: r.followUps[0].hash, kind: "docs",
+      title: "Document the new flag", assignee: "agentcore_hub_api_dev", blockedBy: ["TEAM-4199"],
+    }]);
+    expect(transitioned()).toBe(true);
+  });
+
+  it("clamps title to 120 and detail to 1000, and flattens newlines out of the title", async () => {
+    h.siblings.push(CD);
+    await report({ follow_ups: JSON.stringify([{ kind: "docs", owner: "agent", assignee: "agentcore_hub_api_dev", title: `A\nvery ${"long ".repeat(40)}title`, detail: "d".repeat(2000) }]) });
+    const [fu] = record().followUps;
+    expect(fu.title).toHaveLength(120);
+    expect(fu.title).not.toMatch(/\n/);
+    expect(fu.detail).toHaveLength(1000);
+  });
+
+  it("keeps a valid baseBranch and omits — but does not drop the ENTRY for — an invalid one", async () => {
+    h.siblings.push(CD);
+    await report({ follow_ups: FU({ baseBranch: "release/2026.09" }) });
+    expect(record().followUps[0].baseBranch).toBe("release/2026.09");
+    expect(h.created[0].params.base_branch).toBe("release/2026.09");
+
+    // An unusable branch name loses the FIELD only: the work is still real, it just
+    // has no stated target — exactly a pre-FR-12 ticket.
+    h.puts.length = 0;
+    h.created.length = 0;
+    h.siblings.length = 0;
+    h.siblings.push(CD);
+    await report({ follow_ups: FU({ baseBranch: "-bad..name/" }) });
+    const [fu] = record().followUps;
+    expect("baseBranch" in fu).toBe(false);
+    expect("base_branch" in h.created[0].params).toBe(false);
+    expect(h.warns.join("\n")).toMatch(/dropping invalid baseBranch/);
+  });
+
+  it("an absent follow_ups arg leaves the record at exactly the base key set", async () => {
+    await report({});
+    expect(Object.keys(record()).sort()).toEqual([...BASE_KEYS].sort());
+    // …and the response carries neither of the two additive keys.
+    const res = result(await report({}));
+    expect("droppedFollowUps" in res).toBe(false);
+    expect("followUpsMaterialized" in res).toBe(false);
+  });
+});
+
+describe("report_completion — FR-13 the closed vocabulary and the SEC-11 caps", () => {
+  it("unparseable JSON drops the whole arg — additively, and never as a refusal", async () => {
+    // THE regression: a malformed hint is not a false claim, so it must not refuse.
+    // The record it produces has to be byte-identical to one written without the arg.
+    // Byte-for-byte, with only the wall-clock stamp normalized.
+    const body = () => h.puts.find((p) => p.Key?.startsWith("completions/")).Body.replace(/"completed_at": "[^"]+"/, '"completed_at": "T"');
+    await report({});
+    const clean = body();
+    for (const raw of ["{not json", '{"kind":"docs"}', "[[", "null", "42"]) {
+      h.puts.length = 0;
+      h.created.length = 0;
+      const res = result(await report({ follow_ups: raw }));
+      expect(res.status, raw).toBe("complete");
+      expect(body(), raw).toBe(clean);
+      expect(res.droppedFollowUps, raw).toEqual([{ reason: "unparseable" }]);
+      expect(h.created, raw).toHaveLength(0);
+      expect(transitioned(), raw).toBe(true);
+    }
+  });
+
+  it("an oversized arg is dropped whole, reporting the byte count it exceeded", async () => {
+    const huge = JSON.stringify([{ kind: "docs", owner: "agent", assignee: "agentcore_hub_api_dev", title: "T", detail: "x".repeat(9000) }]);
+    const res = result(await report({ follow_ups: huge }));
+    expect(res.status).toBe("complete");
+    expect(res.droppedFollowUps[0].reason).toBe("oversized");
+    expect(res.droppedFollowUps[0].bytes).toBeGreaterThan(8 * 1024);
+    expect("followUps" in record()).toBe(false);
+    expect(h.created).toHaveLength(0);
+  });
+
+  it("drops an unknown kind, an unknown owner and an owner/kind contradiction — each with its reason", async () => {
+    h.siblings.push(CD);
+    const res = result(await report({
+      follow_ups: JSON.stringify([
+        { kind: "vibes", owner: "agent", title: "Something" },
+        { kind: "docs", owner: "robot", title: "Something else" },
+        // A console handoff no human owns is a contradiction, not a typo: forcing
+        // either direction would file the work with the wrong actor and gate.
+        { kind: "console_handoff", owner: "agent", title: "Flip the flag" },
+        { kind: "fix", owner: "human", title: "Fix the thing" },
+        { kind: "docs", owner: "agent", assignee: "agentcore_hub_api_dev", title: "The one good entry" },
+      ]),
+    }));
+    expect(res.droppedFollowUps.map((d) => [d.index, d.reason])).toEqual([
+      [0, "unknown_kind"], [1, "unknown_owner"], [2, "owner_kind_mismatch"], [3, "owner_kind_mismatch"],
+    ]);
+    expect(record().followUps.map((f) => f.title)).toEqual(["The one good entry"]);
+    expect(h.created).toHaveLength(1);
+  });
+
+  it("drops a titleless entry, a non-object entry and a duplicate (kind,title)", async () => {
+    h.siblings.push(CD);
+    const res = result(await report({
+      follow_ups: JSON.stringify([
+        "just a string",
+        { kind: "docs", owner: "agent", assignee: "agentcore_hub_api_dev", title: "   " },
+        { kind: "docs", owner: "agent", assignee: "agentcore_hub_api_dev", title: "Write it up" },
+        { kind: "docs", owner: "agent", assignee: "agentcore_hub_backend_dev", title: " Write it up " },
+      ]),
+    }));
+    expect(res.droppedFollowUps.map((d) => d.reason)).toEqual(["not_an_object", "missing_title", "duplicate"]);
+    expect(h.created).toHaveLength(1);
+  });
+
+  it("caps at 5 entries, keeping the first five VALID ones", async () => {
+    h.siblings.push(CD);
+    const entries = [
+      { kind: "docs", owner: "nobody", title: "junk first" },
+      ...Array.from({ length: 7 }, (_, i) => ({ kind: "docs", owner: "agent", assignee: "agentcore_hub_api_dev", title: `Entry ${i}` })),
+    ];
+    const res = result(await report({ follow_ups: JSON.stringify(entries) }));
+    // The cap counts entries that PASSED validation, so junk never displaces a good
+    // entry — the first item above is dropped for its owner, not counted.
+    expect(record().followUps.map((f) => f.title)).toEqual(["Entry 0", "Entry 1", "Entry 2", "Entry 3", "Entry 4"]);
+    expect(res.droppedFollowUps.map((d) => d.reason)).toEqual(["unknown_owner", "over_entry_cap", "over_entry_cap"]);
+    expect(h.created).toHaveLength(5);
+  });
+
+  it("forces the assignee per kind, and refuses a fix aimed at a non-dev persona", async () => {
+    h.siblings.push(CD);
+    const res = result(await report({
+      follow_ups: JSON.stringify([
+        // Forced: the queue this work lands in is not the caller's call.
+        { kind: "post_deploy_verification", owner: "agent", assignee: "agentcore_hub_api_dev", title: "Re-check /health" },
+        { kind: "iam_handoff", owner: "human", assignee: "agentcore_hub_operator", title: "Grant AccessAnalyzer" },
+        // Restricted: a release manager can't land a code fix, so the ENTRY goes.
+        { kind: "fix", owner: "agent", assignee: "agentcore_hub_release_manager", title: "Repair the parser" },
+        { kind: "fix", owner: "agent", title: "No assignee at all" },
+      ]),
+    }));
+    expect(record().followUps.map((f) => [f.kind, f.assignee])).toEqual([
+      ["post_deploy_verification", "agentcore_hub_qa_verifier"],
+      ["iam_handoff", "human:engineer"],
+    ]);
+    expect(res.droppedFollowUps.map((d) => [d.reason, d.assignee])).toEqual([
+      ["invalid_assignee", "agentcore_hub_release_manager"],
+      ["invalid_assignee", null],
+    ]);
+  });
+});
+
+describe("report_completion — FR-13 materialization", () => {
+  it("stamps an agent-owned entry as a real fix ticket, and a human one as a plain task", async () => {
+    h.siblings.push(CD);
+    await report({
+      follow_ups: JSON.stringify([
+        { kind: "post_deploy_verification", owner: "agent", title: "Re-check /health after deploy" },
+        { kind: "fix", owner: "agent", assignee: "agentcore_hub_api_dev", title: "Repair the parser" },
+        { kind: "console_handoff", owner: "human", title: "Enable the feature flag" },
+      ]),
+    });
+    const [qa, fix, handoff] = h.created.map((c) => c.params);
+    // The marker + phase stamp are what make the ticket GATE the epic
+    // (completion.mjs rule (iii)); the origin is the CD ticket it waits on.
+    expect(qa.spawned_by).toEqual({ kind: "qa_fix", qaTicketId: "TEAM-4199" });
+    expect(qa.phase).toBe("verification");
+    expect(qa.assignee).toBe("agentcore_hub_qa_verifier");
+    expect(fix.spawned_by).toEqual({ kind: "ship_fix", shipTicketId: "TEAM-4199" });
+    expect(fix.phase).toBe("ship");
+    // The only anchor this Lambda can cite honestly is the record that asked.
+    expect(fix.fix_contract).toEqual({
+      invariant: "Repair the parser", evidence_source: "static",
+      cited_location: ["completions/TEAM-4200.json:1"], sibling_scope: "none",
+    });
+    // A human gate is already a first-class blocker; stamping it as a fix would
+    // enrol it in rework loop-cap counters it has nothing to do with.
+    expect("spawned_by" in handoff).toBe(false);
+    expect("fix_contract" in handoff).toBe(false);
+    expect("phase" in handoff).toBe(false);
+    expect(handoff.assignee).toBe("human:engineer");
+  });
+
+  it("picks the NEWEST ship-phase sibling as the CD ticket, ignoring humans and itself", async () => {
+    h.siblings.push(
+      ticketRow({ key: "TEAM-4150", summary: "Old ship", assignee: "agentcore_hub_release_manager", created: "2026-09-16T08:00:00.000Z" }),
+      ticketRow({ key: "TEAM-4198", summary: "Merge Approval", assignee: "human:engineer", created: "2026-09-17T09:30:00.000Z" }),
+      CD,
+      ticketRow({ key: "TEAM-4200", summary: "This very ticket", assignee: "agentcore_hub_release_manager", created: "2026-09-17T11:00:00.000Z" }),
+    );
+    await report({ follow_ups: FU() });
+    expect(h.created[0].params.blocked_by).toEqual(["TEAM-4199"]);
+  });
+
+  it("creates the follow-up UNBLOCKED when the run has no CD ticket, or its CD ticket is done", async () => {
+    // "Nothing to wait for" must not become "blocked on a guess": an unblocked
+    // follow-up is workable, a follow-up blocked on the wrong ticket is a wedge.
+    for (const siblings of [[], [ticketRow({ key: "TEAM-4199", summary: "Ship it", assignee: "agentcore_hub_release_manager", status: "Done" })]]) {
+      h.created.length = 0;
+      h.siblings.length = 0;
+      h.siblings.push(...siblings);
+      const res = result(await report({ follow_ups: FU() }));
+      expect("blocked_by" in h.created[0].params).toBe(false);
+      expect(res.followUpsMaterialized.created[0].blockedBy).toEqual([]);
+    }
+  });
+
+  it("is idempotent: a re-invocation of the same report creates nothing new", async () => {
+    h.siblings.push(CD);
+    await report({ follow_ups: FU() });
+    expect(h.created).toHaveLength(1);
+    // The [fu:<hash>] suffix in the summary is the marker, because list_tickets
+    // returns summaries and the DynamoDB twin's formatter drops labels.
+    const res = result(await report({ follow_ups: FU() }));
+    expect(h.created).toHaveLength(1);
+    expect(res.followUpsMaterialized.created).toEqual([]);
+    expect(res.followUpsMaterialized.skipped).toEqual([{
+      hash: followUpHash("TEAM-4200", "docs", "Document the new flag"),
+      kind: "docs", title: "Document the new flag", reason: "already_materialized",
+    }]);
+  });
+
+  it("a create failure is reported per entry and the completion still succeeds", async () => {
+    h.siblings.push(CD);
+    h.ticketFail.add("Tickets___create_ticket");
+    const res = result(await report({ follow_ups: FU() }));
+    expect(res.status).toBe("complete");
+    expect(transitioned()).toBe(true);
+    expect(res.followUpsMaterialized.created).toEqual([]);
+    expect(res.followUpsMaterialized.failed[0].reason).toMatch(/unavailable/);
+    // The record still names the work, so nothing is lost but the ticket.
+    expect(record().followUps).toHaveLength(1);
+  });
+
+  it("a failed sibling scan still creates the follow-up — unblocked, and loudly", async () => {
+    h.siblings.push(CD);
+    h.ticketFail.add("Tickets___list_tickets");
+    const res = result(await report({ follow_ups: FU() }));
+    expect(res.status).toBe("complete");
+    expect(h.created).toHaveLength(1);
+    expect("blocked_by" in h.created[0].params).toBe(false);
+    expect(h.warns.join("\n")).toMatch(/sibling scan under TEAM-4100 FAILED/);
+  });
+
+  it("an unresolvable epic fails every entry rather than filing a parentless ticket", async () => {
+    // A ticket with no parent is invisible to the run: it gates nothing and shows
+    // up in no phase, so telling the agent beats filing it.
+    h.issue = ticketRow({ key: "TEAM-4200", parent: null });
+    const res = result(await report({ follow_ups: FU() }));
+    expect(res.status).toBe("complete");
+    expect(h.created).toHaveLength(0);
+    expect(res.followUpsMaterialized.failed.map((f) => f.reason)).toEqual(["epic_unresolved"]);
+    expect(calls("Tickets___list_tickets")).toHaveLength(0);
+  });
+
+  it("reads the ticket once and reuses it for both the base_branch check and the epic", async () => {
+    h.siblings.push(CD);
+    await report({ follow_ups: FU() });
+    expect(calls("Tickets___get_issue")).toEqual([{ ticket_id: "TEAM-4200" }]);
+  });
+
+  it("skips the get_issue entirely when nothing needs it", async () => {
+    // A report that carries a PR and no follow-ups has no reason to read the
+    // ticket — the FR-5 check cannot fire and there is no epic to resolve.
+    await report({ pr_url: PR_URL });
+    expect(calls("Tickets___get_issue")).toHaveLength(0);
+    // …and a synthetic id has no ticket to read at all.
+    await handler({ tool_name: "WorkflowOutput___report_completion", arguments: { ticket_id: "HEALTHCHECK-1", summary: "ping", workflow_id: "wf_1" } });
+    expect(calls("Tickets___get_issue")).toHaveLength(0);
+  });
+});
+
+// ─── TEAM-4740 FR-5: the run whose hub-infra work never reached main ───────────
+//
+// Two halves of one failure. The MATERIALIZER half reads the run's cd-ledger: an
+// `unmerged` marker means commits that need their own PR to main, which is an
+// AGENT's job — filing it as a human handoff is precisely how it sat unnoticed —
+// and a `handoff[]` list means console/IAM steps only a person can do. The REFUSAL
+// half closes the other direction: a fix whose base branch IS main is not delivered
+// until the PR to main exists, so a completion without one is refused as a value.
+describe("report_completion — FR-5 cd-ledger derived follow-ups (amendment A3)", () => {
+  const ledger = (body) => h.objects.set(CD_LEDGER_KEY, JSON.stringify(body));
+
+  it("an unmerged marker becomes ONE agent-owned fix ticket with base_branch main", async () => {
+    h.siblings.push(CD);
+    ledger({ execution_id: EXEC_ID, unmerged: { commits: ["a1b2c3d"], files: ["deploy/config.sh"] } });
+    const res = result(await report({ outcome: "shipped", merge_commit: MERGE_COMMIT, pipeline_execution_id: EXEC_ID, pipeline_name: PIPELINE }));
+    expect(res.status).toBe("complete");
+    const [fu] = record().followUps;
+    expect(fu.kind).toBe("fix");
+    expect(fu.owner).toBe("agent");
+    expect(fu.assignee).toBe("agentcore_hub_bug_fixer");
+    expect(fu.baseBranch).toBe("main");
+    expect(fu.detail).toContain("a1b2c3d");
+    expect(fu.detail).toContain("deploy/config.sh");
+    const p = h.created[0].params;
+    expect(p.base_branch).toBe("main");
+    expect(p.spawned_by).toEqual({ kind: "ship_fix", shipTicketId: "TEAM-4199" });
+    // Never a human handoff — that is the whole point of A3.
+    expect(p.assignee).not.toMatch(/^human:/);
+  });
+
+  it("the older cd_unmerged spelling is read the same way", async () => {
+    h.siblings.push(CD);
+    ledger({ cd_unmerged: { commits: ["deadbee"] } });
+    await report({ merge_commit: MERGE_COMMIT });
+    expect(record().followUps[0].baseBranch).toBe("main");
+  });
+
+  it("a handoff[] of three steps collapses into ONE human:engineer ticket", async () => {
+    // Three tickets in one person's queue, for one sitting at one console, is three
+    // chances to close two and forget the third.
+    h.siblings.push(CD);
+    ledger({ handoff: ["Enable the flag in the console", { step: "Attach the IAM policy" }, "Re-run the smoke test"] });
+    await report({ merge_commit: MERGE_COMMIT });
+    const followUps = record().followUps;
+    expect(followUps).toHaveLength(1);
+    expect(followUps[0].kind).toBe("console_handoff");
+    expect(followUps[0].assignee).toBe("human:engineer");
+    expect(followUps[0].title).toBe("Post-merge console/IAM handoff (3 steps)");
+    expect(followUps[0].detail).toBe("1. Enable the flag in the console\n2. Attach the IAM policy\n3. Re-run the smoke test");
+    expect(h.created).toHaveLength(1);
+    expect(h.created[0].params.assignee).toBe("human:engineer");
+  });
+
+  it("the ledger's entries share the agent's caps and dedupe, not a second budget", async () => {
+    h.siblings.push(CD);
+    ledger({ handoff: ["Enable the flag"] });
+    await report({
+      merge_commit: MERGE_COMMIT,
+      // The agent already reported the same handoff by hand.
+      follow_ups: JSON.stringify([{ kind: "console_handoff", owner: "human", title: "Post-merge console/IAM handoff (1 steps)" }]),
+    });
+    expect(record().followUps).toHaveLength(1);
+    expect(h.created).toHaveLength(1);
+  });
+
+  it("is not read at all for an ordinary dev completion, and never fatal when it is", async () => {
+    // No outcome and no merge commit ⇒ no ship claim ⇒ no reason to pay the GET.
+    await report({ pr_url: PR_URL });
+    expect(h.gets.map((g) => g.Key)).not.toContain(CD_LEDGER_KEY);
+
+    // An unreadable ledger contributes nothing and refuses nothing.
+    h.puts.length = 0;
+    const res = result(await report({ merge_commit: MERGE_COMMIT, pr_url: PR_URL }));
+    expect(res.status).toBe("complete");
+    expect("followUps" in record()).toBe(false);
+  });
+});
+
+describe("report_completion — FR-5 main_fix_requires_pr", () => {
+  // The line both twins write into the description (FR-12) and this Lambda parses.
+  const withBase = (branch) => ticketRow({ key: "TEAM-4200", description: `Fix the expired-token path.\n\nbase_branch: ${branch}` });
+
+  it("refuses a base_branch=main completion with no PR, writing nothing and transitioning nothing", async () => {
+    h.issue = withBase("main");
+    const r = result(await report({}));
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBe("main_fix_requires_pr");
+    expect(r.missing).toEqual(["pr_url"]);
+    expect(r.message).toContain("Nothing was recorded and the ticket was NOT transitioned.");
+    expect(wroteRecord()).toBe(false);
+    expect(transitioned()).toBe(false);
+    expect(events("delivery.prState")).toHaveLength(0);
+  });
+
+  it("accepts it the moment the PR to main exists — without even reading the ticket", async () => {
+    h.issue = withBase("main");
+    const res = await report({ pr_url: PR_URL });
+    expect(result(res).status).toBe("complete");
+    expect(record().delivery.prState).toBe("open");
+    expect(calls("Tickets___get_issue")).toHaveLength(0);
+  });
+
+  it("does not fire for any other base branch", async () => {
+    h.issue = withBase("feature/TEAM-4734-integration");
+    expect(result(await report({})).status).toBe("complete");
+    expect(transitioned()).toBe(true);
+  });
+
+  it("FAILS OPEN when the ticket cannot be read, or carries no base_branch line", async () => {
+    // An unreadable ticket is not evidence that the branch is main; refusing on a
+    // failed look would wedge every completion whenever the ticket Lambda throttles.
+    h.ticketFail.add("Tickets___get_issue");
+    expect(result(await report({})).status).toBe("complete");
+    expect(h.warns.join("\n")).toMatch(/get_issue was unreadable/);
+    expect(transitioned()).toBe(true);
+
+    // Same for the Jira twin's shape, whose get_issue returns no description at
+    // all — a stated limitation of this check, not a silent one.
+    h.ticketFail.clear();
+    h.issue = { ticketId: "TEAM-4200", title: "Fix it", status: "in_progress", assignee: "agentcore_hub_api_dev", parentKey: "TEAM-4100" };
+    expect(result(await report({})).status).toBe("complete");
   });
 });
 
