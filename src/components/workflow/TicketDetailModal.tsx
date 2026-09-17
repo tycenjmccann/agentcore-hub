@@ -11,6 +11,8 @@ import {
   ExternalLink,
 } from "lucide-react";
 import type { HumanNotification, JiraTicket, TicketStatus, TicketType } from "@/lib/workflow/types";
+import type { TicketTiming } from "./TicketFlowDag";
+import TicketFlowDag from "./TicketFlowDag";
 
 // ─── Props ──────────────────────────────────────────────────────────────────
 
@@ -22,6 +24,10 @@ interface TicketDetailModalProps {
   /** review_needed notification for this ticket, when it's a human gate —
    *  renders the review package (summary/bullets/links) above the description. */
   reviewNotification?: HumanNotification | null;
+  /** Orders def-specific phases in the ticket flow after the SDLC ones. */
+  workflowDefId?: string | null;
+  /** Clicking a card in the ticket flow refocuses the modal on that ticket. */
+  onNavigate?: (ticketId: string) => void;
 }
 
 // ─── Constants ──────────────────────────────────────────────────────────────
@@ -77,187 +83,8 @@ function formatRelativeTime(isoString: string): string {
   return `${diffDays}d ago`;
 }
 
-// ─── DAG Component ──────────────────────────────────────────────────────────
-
-interface DagNode {
-  id: string;
-  status: string;
-  type: string;
-  blockedBy: string[];
-  parent: string;
-}
-
-function TicketDag({ tickets, currentTicketId }: { tickets: DagNode[]; currentTicketId: string }) {
-  if (tickets.length === 0) return null;
-
-  const ticketMap = new Map(tickets.map((t) => [t.id, t]));
-
-  // Separate epic from children
-  const epic = tickets.find((t) => t.type === "epic");
-  const children = tickets.filter((t) => t.type !== "epic");
-
-  // Check if children have internal edges (blockedBy refs pointing to other children)
-  const hasEdges = children.some((t) => t.blockedBy.some((b) => ticketMap.has(b)));
-
-  return (
-    <div className="space-y-2">
-      {/* Epic row */}
-      {epic && (
-        <div className="flex items-center gap-2">
-          <span
-            className={`inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1 text-[10px] font-mono ${
-              epic.id === currentTicketId
-                ? "border-blue-500/60 bg-blue-500/10 text-blue-700 dark:text-blue-300"
-                : "border-fuchsia-500/40 bg-fuchsia-500/10 text-fuchsia-700 dark:text-fuchsia-300"
-            }`}
-          >
-            <span
-              className="w-2 h-2 rounded-full"
-              style={{ backgroundColor: epic.id === currentTicketId ? getComputedDotColor(epic.status) : "#d946ef" }}
-            />
-            {epic.id}
-          </span>
-          <span className="text-[9px] text-muted">Epic</span>
-        </div>
-      )}
-
-      {/* Children flow */}
-      {!hasEdges ? (
-        // No dependencies — horizontal chip wrap
-        <div className="flex flex-wrap gap-1.5">
-          {children.map((t) => {
-            const isCurrent = t.id === currentTicketId;
-            return (
-              <span
-                key={t.id}
-                className={`inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-[10px] font-mono ${
-                  isCurrent
-                    ? "border-blue-500/60 bg-blue-500/10 text-blue-700 dark:text-blue-300"
-                    : "border-surface-4 bg-[color-mix(in_srgb,var(--color-surface-1)_60%,transparent)] text-secondary"
-                }`}
-              >
-                <span
-                  className="w-2 h-2 rounded-full"
-                  style={{ backgroundColor: getComputedDotColor(t.status) }}
-                />
-                {t.id}
-              </span>
-            );
-          })}
-        </div>
-      ) : (
-        // Has dependencies — SVG DAG with horizontal flow
-        <DagSvg tickets={children} currentTicketId={currentTicketId} ticketMap={ticketMap} />
-      )}
-    </div>
-  );
-}
-
-function DagSvg({ tickets, currentTicketId, ticketMap }: { tickets: DagNode[]; currentTicketId: string; ticketMap: Map<string, DagNode> }) {
-  // Topological layering
-  const placed = new Set<string>();
-  const layers: string[][] = [];
-  const remaining = new Set(tickets.map((t) => t.id));
-
-  while (remaining.size > 0) {
-    const layer: string[] = [];
-    for (const id of remaining) {
-      const t = ticketMap.get(id)!;
-      const allDepsPlaced = t.blockedBy.every((b) => placed.has(b) || !ticketMap.has(b));
-      if (allDepsPlaced) layer.push(id);
-    }
-    if (layer.length === 0) {
-      layers.push([...remaining]);
-      break;
-    }
-    layer.forEach((id) => { placed.add(id); remaining.delete(id); });
-    layers.push(layer);
-  }
-
-  const nodeW = 76;
-  const nodeH = 26;
-  const layerGap = 40;
-  const nodeGap = 6;
-
-  const positions: Record<string, { x: number; y: number }> = {};
-  let totalWidth = 0;
-  layers.forEach((layer, li) => {
-    const x = li * (nodeW + layerGap);
-    layer.forEach((id, ni) => {
-      positions[id] = { x, y: ni * (nodeH + nodeGap) };
-    });
-    totalWidth = x + nodeW;
-  });
-
-  const maxY = Math.max(...Object.values(positions).map((p) => p.y)) + nodeH;
-  const svgWidth = totalWidth + 8;
-  const svgHeight = maxY + 8;
-
-  return (
-    <div className="overflow-x-auto pb-1">
-      <svg width={svgWidth} height={svgHeight} className="min-w-fit" aria-label="Ticket dependency graph">
-        {/* Edges */}
-        {tickets.map((t) =>
-          t.blockedBy
-            .filter((bid) => positions[bid])
-            .map((bid) => {
-              const from = positions[bid];
-              const to = positions[t.id];
-              if (!from || !to) return null;
-              const x1 = from.x + nodeW + 2;
-              const y1 = from.y + nodeH / 2;
-              const x2 = to.x - 2;
-              const y2 = to.y + nodeH / 2;
-              const resolved = ticketMap.get(bid)?.status === "done";
-              const color = resolved ? "#22c55e" : "#ef4444";
-              const midX = (x1 + x2) / 2;
-              const d = `M${x1},${y1} C${midX},${y1} ${midX},${y2} ${x2},${y2}`;
-              return (
-                <g key={`${bid}->${t.id}`}>
-                  <path d={d} fill="none" stroke={color} strokeWidth={1.5} strokeDasharray={resolved ? undefined : "4 2"} opacity={0.5} />
-                  <polygon points={`${x2},${y2} ${x2 - 5},${y2 - 3} ${x2 - 5},${y2 + 3}`} fill={color} opacity={0.6} />
-                </g>
-              );
-            })
-        )}
-        {/* Nodes */}
-        {tickets.map((t) => {
-          const pos = positions[t.id];
-          if (!pos) return null;
-          const isCurrent = t.id === currentTicketId;
-          return (
-            <g key={t.id}>
-              <rect
-                x={pos.x} y={pos.y} width={nodeW} height={nodeH} rx={5}
-                fill={isCurrent ? "rgba(59,130,246,0.15)" : "rgba(30,41,59,0.8)"}
-                stroke={isCurrent ? "#3b82f6" : "rgba(51,65,85,0.5)"}
-                strokeWidth={isCurrent ? 1.5 : 1}
-              />
-              <circle cx={pos.x + 10} cy={pos.y + nodeH / 2} r={3} fill={getComputedDotColor(t.status)} />
-              <text x={pos.x + 18} y={pos.y + nodeH / 2 + 3.5} fontSize={9} fontFamily="monospace" fill={isCurrent ? "#93c5fd" : "#94a3b8"}>
-                {t.id}
-              </text>
-            </g>
-          );
-        })}
-      </svg>
-    </div>
-  );
-}
-
-function getComputedDotColor(status: string): string {
-  const colors: Record<string, string> = {
-    backlog: "#71717a",
-    todo: "#a1a1aa",
-    ready: "#facc15",
-    in_progress: "#60a5fa",
-    in_review: "#c084fc",
-    done: "#4ade80",
-    blocked: "#f87171",
-    cancelled: "#52525b",
-  };
-  return colors[status] || "#a1a1aa";
-}
+// ─── Ticket flow ────────────────────────────────────────────────────────────
+// The dependency graph lives in TicketFlowDag (layout: lib/workflow/ticket-flow-layout.ts).
 
 // ─── Component ──────────────────────────────────────────────────────────────
 
@@ -267,9 +94,12 @@ export default function TicketDetailModal({
   isOpen,
   onClose,
   reviewNotification,
+  workflowDefId,
+  onNavigate,
 }: TicketDetailModalProps) {
   const [ticket, setTicket] = useState<JiraTicket | null>(null);
   const [allTickets, setAllTickets] = useState<JiraTicket[]>([]);
+  const [timings, setTimings] = useState<Record<string, TicketTiming>>({});
   const [browseBaseUrl, setBrowseBaseUrl] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -308,9 +138,10 @@ export default function TicketDetailModal({
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         return r.json();
       })
-      .then((data: { tickets: Record<string, unknown>[]; browseBaseUrl?: string | null }) => {
+      .then((data: { tickets: Record<string, unknown>[]; browseBaseUrl?: string | null; timings?: Record<string, TicketTiming> }) => {
         const raw = data.tickets ?? [];
         if (data.browseBaseUrl) setBrowseBaseUrl(data.browseBaseUrl);
+        setTimings(data.timings ?? {});
         const normalized = raw.map((t) => ({
           ...t,
           id: (t.ticketId || t.id) as string,
@@ -428,15 +259,6 @@ export default function TicketDetailModal({
     }
   }, [ticket, newNote]);
 
-  // Build DAG data from all tickets in this workflow
-  const dagNodes: DagNode[] = allTickets.map((t) => ({
-    id: t.id,
-    status: t.status,
-    type: t.type,
-    blockedBy: t.blockedBy || [],
-    parent: t.parent || "",
-  }));
-
   // "in_review" is a human-review-gate state: only offer it for human:* tickets,
   // otherwise an agent ticket could be parked there and never invoked.
   const isHumanReview = !!ticket?.assignee?.startsWith("human:");
@@ -463,7 +285,7 @@ export default function TicketDetailModal({
         role="dialog"
         aria-modal="true"
         aria-labelledby="ticket-modal-title"
-        className={`relative z-[201] w-full max-w-2xl mx-4 max-h-[85vh] bg-surface-1 border border-theme rounded-xl shadow-2xl flex flex-col overflow-hidden ${isClosing ? "modal-card-exit" : "modal-card-enter"}`}
+        className={`relative z-[201] w-full max-w-5xl mx-4 max-h-[85vh] bg-surface-1 border border-theme rounded-xl shadow-2xl flex flex-col overflow-hidden ${isClosing ? "modal-card-exit" : "modal-card-enter"}`}
       >
         {/* ARIA live */}
         <div aria-live="polite" aria-atomic="true" className="sr-only">{announcement}</div>
@@ -500,10 +322,16 @@ export default function TicketDetailModal({
           {!isLoading && !error && ticket && (
             <div className="flex flex-col">
               {/* ─── DAG Section ─── */}
-              {dagNodes.length > 1 && (
+              {allTickets.length > 1 && (
                 <div className="px-5 pt-4 pb-3 border-b border-theme">
                   <p className="text-[9px] uppercase tracking-wider text-muted mb-2">Ticket Flow</p>
-                  <TicketDag tickets={dagNodes} currentTicketId={ticketId} />
+                  <TicketFlowDag
+                    tickets={allTickets}
+                    currentTicketId={ticketId}
+                    timings={timings}
+                    workflowDefId={workflowDefId}
+                    onSelect={onNavigate}
+                  />
                 </div>
               )}
 
