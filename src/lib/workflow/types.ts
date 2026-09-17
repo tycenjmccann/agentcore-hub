@@ -422,6 +422,19 @@ export interface WorkflowInput {
    * Absent → no dedup (human/API callers keep the mint-a-new-run behavior).
    */
   sourceTicket?: string;
+  /**
+   * TEAM-4740 FR-9: what the dead-code-sweep preflight observed before this run
+   * was minted (only set for defs with `preflight: "sweep"` that PROCEEDED — a
+   * skip never produces a workflow row). `alreadyRemoved` is also appended to
+   * `description`, which is what actually reaches the analyst's prompt; this
+   * field is the structured copy for the UI and for audit.
+   */
+  preflight?: {
+    decision: string;
+    stackedOn?: { number: number; url: string };
+    alreadyRemoved: string[];
+    mainSha: string | null;
+  };
 }
 
 export interface PortedSession {

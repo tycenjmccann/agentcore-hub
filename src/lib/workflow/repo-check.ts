@@ -51,7 +51,9 @@ export function parseGitHubUrl(url: string): { owner: string; repo: string } | n
   return m ? { owner: m[1], repo: m[2] } : null;
 }
 
-function ghHeaders(token?: string): Record<string, string> {
+/** Exported for sweep-preflight.ts (TEAM-4740 FR-9) — one GitHub client, one
+ *  header set, one timeout policy. Keyword only; no behaviour change. */
+export function ghHeaders(token?: string): Record<string, string> {
   return {
     Accept: "application/vnd.github+json",
     "X-GitHub-Api-Version": "2022-11-28",
@@ -60,7 +62,9 @@ function ghHeaders(token?: string): Record<string, string> {
   };
 }
 
-async function ghGet(
+/** Exported for sweep-preflight.ts (TEAM-4740 FR-9). Keyword only; no behaviour
+ *  change. `opts.fetchImpl` is what makes every caller unit-testable offline. */
+export async function ghGet(
   path: string,
   opts: RepoCheckOptions
 ): Promise<{ status: number; json: unknown }> {
