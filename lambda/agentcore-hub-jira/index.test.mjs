@@ -1378,3 +1378,244 @@ test("createTicket: an emoji title whose cut lands mid-surrogate-pair is clamped
     cap.restore();
   }
 });
+
+// ─── TEAM-4739: the typed gate guard, Jira-side ────────────────────────────────
+//
+// The cross-provider truth table is src/lib/workflow/gate-guard-parity.test.ts,
+// which drives BOTH Lambdas through the same rows and compares refusal payloads.
+// What is asserted here is what only this twin does:
+//   - the verification stamp and the `gate:awaiting-console` removal ride in the
+//     SAME `POST /transitions` request as the transition itself (Jira has no
+//     arbitrary field to write a structured record into, so the LABEL is the
+//     stamp, and a stamp written by an adjacent call could be lost after the
+//     close);
+//   - with no PIPELINE_TOOLS_LAMBDA — the configuration every existing install
+//     has — the guard ADMITS and stamps `indeterminate` rather than refusing;
+//   - the two createTicket seams refuse through this twin's throw/`toolResult`
+//     idiom, which is not the DynamoDB twin's `textResult` return.
+//
+// Note on env: both consts are read at module load and this runner has no module
+// mocking, so `unset` is the state under test throughout. That is deliberate — it
+// is the only state in which the guard's fail direction is observable without an
+// AWS call, and it is the state that must never wedge a real install.
+
+/**
+ * Run `fn` against a scripted Jira. `issues` maps key → {labels, description};
+ * `siblings` are the raw issues a `parent = X` search returns. Every non-GET
+ * request is recorded in `writes`.
+ */
+async function withJira({ issues = {}, siblings = [], searchFails = false }, fn) {
+  const originalFetch = globalThis.fetch;
+  const writes = [];
+  globalThis.fetch = async (url, options = {}) => {
+    const path = String(url).replace(/^https:\/\/[^/]+/, "");
+    const method = (options.method || "GET").toUpperCase();
+    const body = options.body ? JSON.parse(String(options.body)) : {};
+    if (method !== "GET") writes.push({ method, path, body });
+    const json = (payload) => new Response(JSON.stringify(payload ?? {}), { status: 200 });
+
+    if (/\/transitions$/.test(path)) {
+      if (method === "POST") return new Response(null, { status: 204 });
+      return json({ transitions: [{ id: "31", name: "Done", to: { name: "Done" } }] });
+    }
+    if (/\/search\/jql/.test(path)) {
+      if (searchFails) return new Response(JSON.stringify({ errorMessages: ["boom"] }), { status: 500 });
+      return json({ issues: siblings });
+    }
+    if (/\/comment$/.test(path)) return json({ id: "1" });
+    const keyMatch = /^\/rest\/api\/3\/issue\/([^/?]+)/.exec(path);
+    if (path === "/rest/api/3/issue" && method === "POST") return json({ key: "TEAM-901", id: "901" });
+    if (keyMatch && method === "PUT") {
+      const issue = issues[keyMatch[1]];
+      for (const op of body?.update?.labels || []) {
+        if (op.add && issue && !issue.labels.includes(op.add)) issue.labels.push(op.add);
+      }
+      return new Response(null, { status: 204 });
+    }
+    if (keyMatch && method === "GET") {
+      const issue = issues[keyMatch[1]];
+      if (!issue) return new Response(JSON.stringify({ errorMessages: ["not found"] }), { status: 404 });
+      return json({
+        key: keyMatch[1],
+        fields: {
+          labels: issue.labels,
+          description: issue.description ?? null,
+          status: { name: issue.status || "In Review" },
+          issuetype: { name: issue.issuetype || "Task" },
+        },
+      });
+    }
+    return json({});
+  };
+  try {
+    return await fn({ writes, issues });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+const transitionDone = (ticket_id) =>
+  handler({ tool_name: "Tickets___transition_ticket", parameters: { ticket_id, transition_id: "done" } });
+
+const DEPLOY_GATE = ["gate:deploy-approval", "pipeline:hub-x-deploy", "exec:0f8fad5b-d9cb-469f-a165-70867728950e"];
+
+test("gate guard: with no probe configured the close is ADMITTED and stamped indeterminate", async () => {
+  // The fail direction, as a deployment fact. A gate ticket nobody may close is an
+  // unliftable stall: there is no escalation rung above the human this gate pages.
+  await withJira({ issues: { "TEAM-900": { labels: [...DEPLOY_GATE] } } }, async ({ writes }) => {
+    const res = await transitionDone("TEAM-900");
+
+    assert.equal(res.status, "done");
+    assert.equal(res.gateVerification.result, "indeterminate");
+    assert.equal(res.gateVerification.reason, "probe_failed");
+    assert.equal(res.gateVerification.evidence, "probe_not_configured");
+    assert.equal(res.gateVerification.gateKind, "deploy-approval");
+
+    const posts = writes.filter((w) => /\/transitions$/.test(w.path));
+    assert.equal(posts.length, 1);
+    assert.deepEqual(posts[0].body, {
+      transition: { id: "31" },
+      update: { labels: [{ add: "gateverify:indeterminate" }] },
+    });
+  });
+});
+
+test("gate guard: the stamp and the parked-label removal ride in ONE transitions POST", async () => {
+  await withJira(
+    { issues: { "TEAM-901": { labels: ["gate:blocker", "gate:awaiting-console"] } } },
+    async ({ writes }) => {
+      const res = await transitionDone("TEAM-901");
+
+      assert.equal(res.gateVerification.result, "indeterminate");
+      // A blocker gate has no probe at all — no external condition to read.
+      assert.equal(res.gateVerification.reason, "no_probe_available");
+
+      const posts = writes.filter((w) => /\/transitions$/.test(w.path));
+      assert.equal(posts.length, 1);
+      assert.deepEqual(posts[0].body, {
+        transition: { id: "31" },
+        update: { labels: [{ remove: "gate:awaiting-console" }, { add: "gateverify:indeterminate" }] },
+      });
+      // No adjacent label PUT: a stamp written separately could be lost after the
+      // close, leaving a closed gate with no record of what admitted it.
+      assert.equal(writes.filter((w) => w.method === "PUT").length, 0);
+    }
+  );
+});
+
+test("gate guard: a `remove` is only emitted for a label that is actually present", async () => {
+  // Jira 400s a remove of an absent label, and that 400 would abort a transition
+  // the guard already decided to admit.
+  await withJira({ issues: { "TEAM-902": { labels: ["gate:blocker"] } } }, async ({ writes }) => {
+    await transitionDone("TEAM-902");
+    const posts = writes.filter((w) => /\/transitions$/.test(w.path));
+    assert.deepEqual(posts[0].body.update.labels, [{ add: "gateverify:indeterminate" }]);
+  });
+});
+
+test("gate guard: a non-gate ticket's transitions POST is byte-identical to before", async () => {
+  await withJira({ issues: { "TEAM-903": { labels: ["phase:development", "agent:agentcore_hub_backend_dev"] } } }, async ({ writes }) => {
+    const res = await transitionDone("TEAM-903");
+    assert.equal(res.gateVerification, undefined);
+    const posts = writes.filter((w) => /\/transitions$/.test(w.path));
+    assert.deepEqual(posts[0].body, { transition: { id: "31" } });
+  });
+});
+
+test("gate guard: `gate:approval` alone is untouched — a human escalation gate is not probed", async () => {
+  await withJira({ issues: { "TEAM-904": { labels: ["gate:approval"] } } }, async ({ writes }) => {
+    const res = await transitionDone("TEAM-904");
+    assert.equal(res.gateVerification, undefined);
+    const posts = writes.filter((w) => /\/transitions$/.test(w.path));
+    assert.deepEqual(posts[0].body, { transition: { id: "31" } });
+  });
+});
+
+test("gate guard: a blockquoted DECISION line IS parsed in Jira mode (a known, bounded twin difference)", async () => {
+  // adfToText FLATTENS blockquotes, so a `> DECISION: abort` inside a Jira
+  // blockquote reaches parseFixDecision as an unquoted line — where the DynamoDB
+  // twin, which reads raw markdown, rejects it. Bounded on purpose: a DECISION can
+  // only ever produce `indeterminate`, never `verified`, so the worst case is that
+  // Jira lifts a stall the other twin would not. Recorded here so the difference is
+  // a decision rather than a surprise.
+  const quoted = {
+    type: "doc",
+    version: 1,
+    content: [
+      {
+        type: "blockquote",
+        content: [{ type: "paragraph", content: [{ type: "text", text: "DECISION: accept-proxy" }] }],
+      },
+    ],
+  };
+  assert.ok(adfToText(quoted).split("\n").includes("DECISION: accept-proxy"));
+});
+
+test("createTicket: a deploy gate with no `exec:` label is refused through the toolResult idiom", async () => {
+  await withJira({}, async ({ writes }) => {
+    const res = await handler({
+      tool_name: "Tickets___create_ticket",
+      parameters: {
+        summary: "Approve the deploy",
+        description: "please approve",
+        labels: ["gate:deploy-approval", "pipeline:hub-x-deploy"],
+      },
+    });
+
+    assert.equal(res.ok, false);
+    assert.equal(res.reason, "gate_condition_unmet");
+    assert.match(res.hint, /exactly one `exec:<execution-id>` label \(found 0\)/);
+    // The thrown Error's message is what every existing caller reads as "the ticket
+    // did not move"; the structured fields ride alongside it.
+    assert.equal(res.error, res.hint);
+    assert.equal(writes.filter((w) => w.path === "/rest/api/3/issue").length, 0);
+  });
+});
+
+test("createTicket: the third identical gate ticket is refused, and the epic is marked", async () => {
+  const sibling = (key) => ({
+    key,
+    fields: {
+      summary: "CI is unavailable",
+      status: { name: "To Do" },
+      labels: ["gate-ci-unavailable", `head-${"b".repeat(40)}`],
+      issuelinks: [],
+    },
+  });
+  const issues = { "TEAM-1": { labels: ["wf:wf_1"], issuetype: "Epic" } };
+
+  await withJira({ issues, siblings: [sibling("TEAM-800"), sibling("TEAM-810")] }, async ({ writes }) => {
+    const res = await handler({
+      tool_name: "Tickets___create_ticket",
+      parameters: {
+        summary: "CI is unavailable",
+        labels: ["gate:ci-unavailable", `head:${"b".repeat(40)}`],
+        parent_key: "TEAM-1",
+      },
+    });
+
+    assert.equal(res.ok, false);
+    assert.equal(res.reason, "gate_loop_environmental");
+    assert.equal(res.existingTicketId, "TEAM-800");
+    assert.match(res.error, /Work the existing ticket TEAM-800/);
+    // No fourth ticket, and the epic carries the marker that dedupes the page.
+    assert.equal(writes.filter((w) => w.path === "/rest/api/3/issue").length, 0);
+    assert.ok(issues["TEAM-1"].labels.includes("gate:loop-broken"));
+  });
+});
+
+test("createTicket: FAILS OPEN — an unreadable epic files the gate ticket", async () => {
+  // A creation wall that trips whenever a read fails is a wedge, not a guard.
+  await withJira({ issues: { "TEAM-1": { labels: ["wf:wf_1"] } }, searchFails: true }, async () => {
+    const res = await handler({
+      tool_name: "Tickets___create_ticket",
+      parameters: {
+        summary: "CI is unavailable",
+        labels: ["gate:ci-unavailable", `head:${"b".repeat(40)}`],
+        parent_key: "TEAM-1",
+      },
+    });
+    assert.notEqual(res.ok, false);
+    assert.equal(res.ticketId, "TEAM-901");
+  });
+});
