@@ -169,8 +169,8 @@ Fallback if the CLI lacks `update`: `agentcore eval evaluator create
 `deploy/runtime-agent/refresh-agents-json.sh` → update the
 `custom_evaluators` map in `deploy/evaluations/eval-config-ids.json`.
 
-Step 7 — apply the reduced sampling/evaluator load profile
-(30% × 5 evaluators):
+Step 7 — apply the evaluator/sampling profile (10 evaluators per config;
+tiered sampling):
 
 ```bash
 ./deploy/evaluations/setup-evaluations.sh   # exits non-zero if any per-agent config fails
