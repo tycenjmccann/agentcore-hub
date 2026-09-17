@@ -249,6 +249,7 @@ The continuous-improvement loop. Self-contained surface.
 **`agents.json` fields it reads**
 - `evaluationsEnabled` — per-agent on/off
 - `evalConfigName` — substring used to match the agent's eval log groups
+- `evalHost` — agentId of the runtime whose judge config actually scores this persona (the shared fleet runtime). Set on every persona that has no runtime of its own; such an entry is NOT an Evaluations column or an `/api/evaluations` agent — it renders as a persona sub-column under the host, fed by the host's `${agentId}#${persona}` daily rows.
 
 **Env vars** — `EVAL_CONFIG_TABLE`, `EVAL_SEEN_TABLE`, `EVAL_DAILY_TABLE`,
 `EVAL_RESULTS_TABLE`, `ARTIFACT_BUCKET`, `LAMBDA_ROLE_ARN`, and on the packager

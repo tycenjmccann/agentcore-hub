@@ -282,6 +282,19 @@ test.describe("Evaluations tab (TEAM-4688)", () => {
     await expect(page.locator(`[data-testid=eval-persona-col-${PERSONA}]`)).toHaveCount(0);
   });
 
+  test("personas hosted on the shared runtime are never top-level columns", async ({ page }) => {
+    await installMocks(page);
+    await page.goto("/evaluations?days=7");
+    await expect(page.locator(`[data-testid=eval-col-${AGENT_ID}]`).first()).toBeVisible();
+    // Agents that own a runtime keep a column of their own...
+    await expect(page.locator("[data-testid=eval-col-agentcore_hub_workflow_manager]").first()).toBeVisible();
+    // ...while roster personas with `evalHost` set render only as ↳ sub-columns under
+    // the host, so no always-empty top-level column exists for them.
+    for (const hosted of ["agentcore_hub_requirements_analyst", "agentcore_hub_backend_dev", "agentcore_hub_qa_verifier", "agentcore_hub_code_reviewer"]) {
+      await expect(page.locator(`[data-testid=eval-col-${hosted}]`)).toHaveCount(0);
+    }
+  });
+
   test("drilldown renders the score-over-time chart and the sessions table", async ({ page }) => {
     const calls = await installMocks(page);
     await page.goto(`/evaluations/${AGENT_ID}?days=7&workflowId=wf-4688`);

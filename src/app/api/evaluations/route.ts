@@ -37,10 +37,13 @@ export const fetchCache = "force-no-store";
 // cost-report Lambda via the S3 config prefix); cache discount/surcharge included.
 const PRICING = pricingConfig as unknown as Pricing;
 
-// Agent ID → display name map
+// Agent ID → display name map. A persona hosted on another agent's runtime
+// (`evalHost`) has no runtime-level rows of its own — its results sit under the
+// host's `${agentId}#${persona}` rows — so it is not an agent of this response;
+// it appears under the host's `personas` instead.
 const AGENT_DISPLAY_NAMES = new Map(
   agentsConfig.agents
-    .filter((a) => a.evaluationsEnabled)
+    .filter((a) => a.evaluationsEnabled && !(a as { evalHost?: string }).evalHost)
     .map((a) => [a.agentId, a.displayName])
 );
 

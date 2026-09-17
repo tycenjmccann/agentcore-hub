@@ -37,9 +37,10 @@ vi.mock("@/lib/eval-config", () => ({
   }),
 }));
 
-// An evaluations-enabled roster agent, and a persona that shares its runtime.
-const AGENT = "agentcore_hub_requirements_analyst";
-const AGENT_NAME = "Requirements Analyst";
+// An evaluations-enabled roster agent that OWNS its runtime, and a persona that
+// shares it (roster: `evalHost: "agentcore_hub_agent"`).
+const AGENT = "agentcore_hub_agent";
+const AGENT_NAME = "Hub Agent (Shared Runtime)";
 const PERSONA = "agentcore_hub_ios_designer";
 const PERSONA_NAME = "iOS Designer";
 
@@ -228,5 +229,17 @@ describe("GET /api/evaluations — existing contract is unchanged", () => {
     const res = await get("?days=7");
     expect(res.status).toBe(500);
     expect((await res.json()).error).toBe("ddb blip");
+  });
+});
+
+describe("GET /api/evaluations — hosted personas", () => {
+  it("does not list a persona hosted on another runtime as an agent, even with an eval-config row and daily rows of its own", async () => {
+    h.configs.push({ agentId: "agentcore_hub_requirements_analyst" });
+    h.daily.push({ agentId: "agentcore_hub_requirements_analyst", day: "2026-09-15", sessions: 3 });
+    const res = await get("?days=7");
+    const body = await res.json();
+    expect(body.agents).toEqual([AGENT_NAME]);
+    expect(body.metrics["Requirements Analyst"]).toBeUndefined();
+    expect(body.scorecard["Requirements Analyst"]).toBeUndefined();
   });
 });

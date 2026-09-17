@@ -38,19 +38,32 @@ interface RawAgent {
   displayName: string;
   evaluationsEnabled?: boolean;
   evalConfigName?: string;
+  /** Set on a persona whose judge results land on another agent's runtime. */
+  evalHost?: string;
   personas?: (string | { persona?: string; name?: string })[];
 }
 
 const ROSTER = (agentsConfig as unknown as { agents: RawAgent[] }).agents;
 
-/** The agents that can hold evaluation data at all — the column/row universe. */
-const EVAL_AGENTS = ROSTER.filter((a) => !!a.evalConfigName && !!a.evaluationsEnabled);
+/**
+ * The agents that can hold evaluation data at all — the column/row universe.
+ * A persona hosted on another agent's runtime (`evalHost`) is not a column of
+ * its own: its results are keyed under the host, so it renders as one of the
+ * host's expandable persona sub-columns instead of an always-empty top-level one.
+ */
+const EVAL_AGENTS = ROSTER.filter((a) => !!a.evalConfigName && !!a.evaluationsEnabled && !a.evalHost);
 
-/** Persona names declared in the roster, used only to order the expanded rows. */
+/**
+ * Persona names declared in the roster, used only to order the expanded rows:
+ * the agent's own `personas` list when it has one, else every roster entry that
+ * names this agent as its `evalHost`, in roster order.
+ */
 function configuredPersonas(agent: RawAgent): string[] {
-  return (agent.personas ?? [])
+  const declared = (agent.personas ?? [])
     .map((p) => (typeof p === "string" ? p : p.persona || p.name || ""))
     .filter(Boolean);
+  if (declared.length) return declared;
+  return ROSTER.filter((a) => a.evalHost === agent.agentId).map((a) => a.agentId);
 }
 
 const AGENT_COLORS: Record<string, string> = {
