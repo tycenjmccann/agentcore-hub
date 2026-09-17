@@ -1,16 +1,15 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 
 /**
- * TEAM-3686 F3 + F4 — the orchestrator's completion gates.
+ * The orchestrator's completion gates.
  *
- * F3 / TEAM-3690: completeWorkflow runs the deliverable-evidence check (same
- * semantics as the HTTP complete route) BEFORE the completion claim. It now
- * ENFORCES by default (AC-D4.1): missing evidence → abort with
- * CompletionRejectedMissingEvidence, never touching store.completeWorkflow.
- * Unset/empty/unrecognized values all enforce (fail-closed). Only the explicit
- * opt-out COMPLETION_EVIDENCE_REQUIRED=off|false|0 shadow-logs and proceeds.
+ * (The per-ticket deliverable-evidence gate — TEAM-3686 F3 / TEAM-3690 — was
+ * removed: report_completion is the agent's definition of done, and git/PR is
+ * the ship ground truth, so the paperwork precondition was redundant. What
+ * remains are the two gates that check the SHIP truth, plus the fix-spawn
+ * re-check.)
  *
- * TEAM-3747 D2: completeWorkflow ALSO runs the ship/CD merge-verdict gate ("no
+ * TEAM-3747 D2: completeWorkflow runs the ship/CD merge-verdict gate ("no
  * green close over unshipped work"). When the def has a ship phase and a done ship
  * ticket carries no merge/deploy verdict, the run must NOT claim "complete" — it
  * diverts to closeWorkflowBlocked, which atomically claims the honest terminal
@@ -329,251 +328,13 @@ describe("isWorkflowComplete — fix-spawn re-check (TEAM-3686 F4)", () => {
   });
 });
 
-describe("completeWorkflow — evidence gate wiring (TEAM-3686 F3)", () => {
-  it("AC-D4.1 (TEAM-3690): flag UNSET (default ON) aborts before the completion claim on missing evidence", async () => {
-    // The regression F2 named: the DEFAULT/production config must REJECT an
-    // empty completion record, not shadow-log it. Env var deleted in beforeEach
-    // → the true default → enforce.
-    const error = vi.spyOn(console, "error").mockImplementation(() => {});
-    h.state.snapshots = [DONE];
-    h.state.freshWorkflow = { id: "wf_1", agentTasks: {} }; // no evidence anywhere
-    await load();
-    await completeWorkflow({ ...WF });
-    expect(h.state.storeCompletions.length).toBe(0); // never claimed completion
-    expect(h.state.finalized.length).toBe(0); // no side effects
-    const rejected = error.mock.calls.find((c) => String(c[0]).includes("CompletionRejectedMissingEvidence"));
-    expect(rejected).toBeTruthy();
-    expect(String(rejected[0])).toContain("T-1@development");
-    error.mockRestore();
-  });
-
-  it("fail-closed: an unrecognized value (\"banana\") also aborts on missing evidence", async () => {
-    process.env.COMPLETION_EVIDENCE_REQUIRED = "banana";
-    const error = vi.spyOn(console, "error").mockImplementation(() => {});
-    h.state.snapshots = [DONE];
-    h.state.freshWorkflow = { id: "wf_1", agentTasks: {} };
-    await load();
-    await completeWorkflow({ ...WF });
-    expect(h.state.storeCompletions.length).toBe(0);
-    expect(h.state.finalized.length).toBe(0);
-    expect(error.mock.calls.some((c) => String(c[0]).includes("CompletionRejectedMissingEvidence"))).toBe(true);
-    error.mockRestore();
-  });
-
-  it("explicit opt-out (=off): shadow-logs the would-block outcome and completes anyway", async () => {
-    // Shadow mode is no longer the default (TEAM-3690); it requires an explicit
-    // emergency opt-out (off|false|0). Here we assert off.
-    process.env.COMPLETION_EVIDENCE_REQUIRED = "off";
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    h.state.snapshots = [DONE];
-    h.state.freshWorkflow = { id: "wf_1", agentTasks: {} }; // no evidence anywhere
-    await load();
-    await completeWorkflow({ ...WF });
-    expect(h.state.storeCompletions.length).toBe(1);
-    expect(h.state.finalized).toEqual(["wf_1"]); // side effects ran to the end
-    const shadow = warn.mock.calls.find((c) => String(c[0]).includes("would be blocked for missing evidence"));
-    expect(shadow).toBeTruthy();
-    expect(String(shadow[0])).toContain("T-1@development");
-    warn.mockRestore();
-  });
-
-  it("flag ON: aborts BEFORE the completion claim and logs CompletionRejectedMissingEvidence", async () => {
-    process.env.COMPLETION_EVIDENCE_REQUIRED = "true";
-    const error = vi.spyOn(console, "error").mockImplementation(() => {});
-    h.state.snapshots = [DONE];
-    h.state.freshWorkflow = { id: "wf_1", agentTasks: {} };
-    await load();
-    await completeWorkflow({ ...WF });
-    expect(h.state.storeCompletions.length).toBe(0);
-    expect(h.state.finalized.length).toBe(0);
-    const rejected = error.mock.calls.find((c) => String(c[0]).includes("CompletionRejectedMissingEvidence"));
-    expect(rejected).toBeTruthy();
-    expect(String(rejected[0])).toContain("T-1@development");
-    error.mockRestore();
-  });
-
-  it("flag ON: completes when every done required-phase ticket has evidence", async () => {
-    process.env.COMPLETION_EVIDENCE_REQUIRED = "on";
-    h.state.snapshots = [DONE];
-    h.state.freshWorkflow = {
-      id: "wf_1",
-      agentTasks: {
-        "T-1": { ticketId: "T-1", output: "shipped the code" },
-        "T-2": { ticketId: "T-2", output: "", artifactKey: "workflows/wf_1/qa.md" },
-        "T-3": { ticketId: "T-3", output: "review notes" },
-      },
-    };
-    await load();
-    await completeWorkflow({ ...WF });
-    expect(h.state.storeCompletions.length).toBe(1);
-  });
-
-  it("a failure of the check itself never blocks completion (route parity)", async () => {
-    process.env.COMPLETION_EVIDENCE_REQUIRED = "true";
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    h.state.snapshots = [DONE];
-    h.state.getWorkflowThrows = true;
-    await load();
-    await completeWorkflow({ ...WF });
-    expect(h.state.storeCompletions.length).toBe(1);
-    expect(warn.mock.calls.some((c) => String(c[0]).includes("evidence check skipped"))).toBe(true);
-    warn.mockRestore();
-  });
-});
-
-/**
- * TEAM-3976 — completeWorkflow's completions-record fallback.
- *
- * The production failure: a dev ticket was mark_done'd (Workflow Manager) BEFORE
- * the agent's report_completion fired. The done cascade's one-shot harvest found
- * no completions/T.json and left agentTasks[T] = {status:"complete"} with no
- * output; the later report_completion wrote the record but its done→done
- * transition was a no-op, so no harvest re-ran and the gate refused forever.
- * Now the gate consults the record for the would-be offenders ONLY — the happy
- * path (every entry already carries evidence) must make ZERO completions/ reads.
- */
-describe("completeWorkflow — completions-record fallback (TEAM-3976)", () => {
-  const RECORD = {
-    ticket_id: "T-1",
-    summary: "Fixed it",
-    pr_url: "https://github.com/x/y/pull/1",
-    commit_sha: "abc",
-    branch: "feature/x",
-    artifacts: "shared/dev-evidence/T-1.md",
-  };
-  /** T-1 closed out-of-band: complete, but evidence-less. Siblings have output. */
-  const tasksMissingT1 = () => ({
-    id: "wf_1",
-    agentTasks: {
-      "T-1": { ticketId: "T-1", status: "complete", completedAt: "2026-09-01T00:00:00Z" },
-      "T-2": { ticketId: "T-2", output: "verified" },
-      "T-3": { ticketId: "T-3", output: "ci green" },
-    },
-  });
-  const completionReads = () => h.state.s3Gets.filter((k) => String(k).startsWith("completions/"));
-
-  it("record proves evidence → completes, backfills T-1 (deliverable fields only), no rejection", async () => {
-    const error = vi.spyOn(console, "error").mockImplementation(() => {});
-    h.state.snapshots = [DONE];
-    h.state.freshWorkflow = tasksMissingT1();
-    h.state.s3Objects["completions/T-1.json"] = JSON.stringify(RECORD);
-    await load();
-    await completeWorkflow({ ...WF });
-    expect(h.state.storeCompletions.length).toBe(1);
-    expect(error.mock.calls.some((c) => String(c[0]).includes("CompletionRejectedMissingEvidence"))).toBe(false);
-    // Exactly ONE record read: the TEAM-3985 re-harvest maps summary→output and
-    // the re-evaluation clears `missing`, so the TEAM-3976 second pass never runs
-    // (it would have been a second read of the same key).
-    expect(completionReads()).toEqual(["completions/T-1.json"]);
-    expect(h.state.notifications).toHaveLength(0);
-    expect(h.state.merges).toHaveLength(1);
-    expect(h.state.merges[0].wfId).toBe("wf_1");
-    expect(h.state.merges[0].tid).toBe("T-1");
-    expect(h.state.merges[0].fields).toEqual({
-      output: "Fixed it",
-      branch: "feature/x",
-      commitSha: "abc",
-      prUrl: "https://github.com/x/y/pull/1",
-    });
-    expect(h.state.merges[0].fields).not.toHaveProperty("mergeCommit");
-    expect(h.state.merges[0].fields).not.toHaveProperty("outcome");
-    error.mockRestore();
-  });
-
-  it("blank summary but PR proof (pr_url + commit_sha) → completes via the second pass; no escalation", async () => {
-    // The case the TEAM-3985 re-harvest alone cannot close: it maps summary→output,
-    // so a record whose deliverable proof is the PR leaves `output` empty and the
-    // agentTasks-only check still fails. The TEAM-3976 rule (summary OR pr_url OR
-    // commit_sha OR artifacts) resolves it — and the escalation must NOT fire.
-    const error = vi.spyOn(console, "error").mockImplementation(() => {});
-    h.state.snapshots = [DONE];
-    h.state.freshWorkflow = tasksMissingT1();
-    h.state.s3Objects["completions/T-1.json"] = JSON.stringify({
-      ticket_id: "T-1", summary: "", pr_url: "https://github.com/x/y/pull/1", commit_sha: "abc", branch: "feature/x",
-    });
-    await load();
-    await completeWorkflow({ ...WF });
-    expect(h.state.storeCompletions.length).toBe(1);
-    expect(error.mock.calls.some((c) => String(c[0]).includes("CompletionRejectedMissingEvidence"))).toBe(false);
-    expect(h.state.notifications).toHaveLength(0);
-    // Two reads of the same key: the re-harvest (first pass) and our resolver.
-    expect(completionReads()).toEqual(["completions/T-1.json", "completions/T-1.json"]);
-    expect(h.state.merges.length).toBeGreaterThanOrEqual(1);
-    const merged = Object.assign({}, ...h.state.merges.map((m) => m.fields));
-    expect(merged).toMatchObject({ prUrl: "https://github.com/x/y/pull/1", commitSha: "abc", branch: "feature/x" });
-    for (const m of h.state.merges) {
-      expect(m.tid).toBe("T-1");
-      expect(m.fields).not.toHaveProperty("output"); // a blank summary is never written as output
-      expect(m.fields).not.toHaveProperty("mergeCommit");
-      expect(m.fields).not.toHaveProperty("outcome");
-    }
-    error.mockRestore();
-  });
-
-  it("no record → still rejected (T-1@development), nothing backfilled", async () => {
-    const error = vi.spyOn(console, "error").mockImplementation(() => {});
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    h.state.snapshots = [DONE];
-    h.state.freshWorkflow = tasksMissingT1();
-    await load();
-    await completeWorkflow({ ...WF });
-    expect(h.state.storeCompletions.length).toBe(0);
-    expect(h.state.merges).toHaveLength(0);
-    const rejected = error.mock.calls.find((c) => String(c[0]).includes("CompletionRejectedMissingEvidence"));
-    expect(rejected).toBeTruthy();
-    expect(String(rejected[0])).toContain("T-1@development");
-    // A missing record is a fallback miss, NOT a check failure — the gate stays.
-    expect(warn.mock.calls.some((c) => String(c[0]).includes("evidence check skipped"))).toBe(false);
-    // TEAM-3985's escalation is preserved and fires exactly once, only after BOTH passes.
-    expect(h.state.notifications).toHaveLength(1);
-    expect(h.state.notifications[0].n.type).toBe("manager_escalation");
-    expect(h.state.notifications[0].n.details).toContain("T-1@development");
-    error.mockRestore();
-    warn.mockRestore();
-  });
-
-  it("blank record (whitespace summary) → still rejected — an empty record is not evidence (AC-D4.1)", async () => {
-    const error = vi.spyOn(console, "error").mockImplementation(() => {});
-    h.state.snapshots = [DONE];
-    h.state.freshWorkflow = tasksMissingT1();
-    h.state.s3Objects["completions/T-1.json"] = JSON.stringify({ ticket_id: "T-1", summary: "   " });
-    await load();
-    await completeWorkflow({ ...WF });
-    expect(h.state.storeCompletions.length).toBe(0);
-    expect(h.state.merges).toHaveLength(0);
-    expect(error.mock.calls.some((c) => String(c[0]).includes("T-1@development"))).toBe(true);
-    expect(h.state.notifications).toHaveLength(1);
-    expect(h.state.notifications[0].n.type).toBe("manager_escalation");
-    error.mockRestore();
-  });
-
-  it("happy path (every entry has evidence) → ZERO completions/ reads", async () => {
-    h.state.snapshots = [DONE];
-    h.state.freshWorkflow = {
-      id: "wf_1",
-      agentTasks: {
-        "T-1": { ticketId: "T-1", output: "shipped the code" },
-        "T-2": { ticketId: "T-2", output: "verified" },
-        "T-3": { ticketId: "T-3", output: "ci green" },
-      },
-    };
-    h.state.s3Objects["completions/T-1.json"] = JSON.stringify(RECORD);
-    await load();
-    await completeWorkflow({ ...WF });
-    expect(h.state.storeCompletions.length).toBe(1);
-    expect(completionReads()).toEqual([]);
-    expect(h.state.merges).toHaveLength(0);
-  });
-});
-
 /**
  * TEAM-3747 D2 — completeWorkflow's ship/CD merge-verdict gate.
  *
  * These use loadWithShipDef() so the resolved def requires the ship phase (the
  * fallback def used by the tests above does not, which is exactly the AC-D2.5
  * legacy case pinned at the bottom). The ship ticket T-4 is a done release-manager
- * ticket WITH deliverable evidence, so the F3 evidence gate always passes and the
- * only thing under test is the merge verdict.
+ * ticket WITH deliverable evidence; the only thing under test is the merge verdict.
  */
 const SHIP_DONE = [
   ...DONE,
@@ -900,80 +661,6 @@ describe("completeWorkflow — ship-phase merge gate (TEAM-3721)", () => {
     await completeWorkflow({ ...SHIP_WF });
     expect(h.state.storeCompletions.length).toBe(1);
     expect(global.fetch).not.toHaveBeenCalled();
-  });
-});
-
-/**
- * TEAM-3985 — evidence harvested late. Agents routinely Done their ticket before
- * report_completion writes completions/<ticket>.json, so the done-cascade
- * harvest finds nothing and the run stranded forever with a silent
- * CompletionRejectedMissingEvidence (prod: sffzti/TEAM-3790, Done 19:37Z,
- * record 19:50Z). completeWorkflow must re-harvest before rejecting, and when
- * still missing, escalate ONCE instead of staying silent.
- */
-describe("completeWorkflow — late evidence is re-harvested; a real gap escalates once (TEAM-3985)", () => {
-  const CHILDREN = [
-    { ticketId: "D-1", assignee: "agentcore_hub_backend_dev", type: "task", status: "done", phase: "development" },
-    { ticketId: "D-2", assignee: "agentcore_hub_qa_verifier", type: "task", status: "done", phase: "verification" },
-    { ticketId: "D-3", assignee: "agentcore_hub_ci_agent", type: "task", status: "done", phase: "review" },
-    { ticketId: "D-4", assignee: "agentcore_hub_release_manager", type: "task", status: "done", phase: "ship" },
-  ];
-  const TASKS_MISSING_D1 = () => ({
-    "D-1": { ticketId: "D-1", agentId: "agentcore_hub_backend_dev", status: "complete" }, // no output/artifact
-    "D-2": { ticketId: "D-2", output: "verified" },
-    "D-3": { ticketId: "D-3", output: "ci green" },
-    "D-4": { ticketId: "D-4", output: "shipped", mergeCommit: "9f1c2ab" },
-  });
-
-  beforeEach(async () => {
-    h.state.s3Completions = {};
-    h.state.notifications.length = 0;
-    h.state.storeCompletions.length = 0;
-    h.state.terminalClaims.length = 0;
-    delete process.env.GITHUB_PAT;
-    process.env.ARTIFACT_BUCKET = "test-bucket";
-    await loadWithShipDef();
-  });
-  afterEach(() => { delete process.env.ARTIFACT_BUCKET; });
-
-  it("record landed after the ticket went Done → re-harvested at completion time, run completes", async () => {
-    h.state.snapshots = [CHILDREN];
-    h.state.freshWorkflow = { id: "wf_1", agentTasks: TASKS_MISSING_D1() };
-    h.state.s3Completions["completions/D-1.json"] = {
-      ticket_id: "D-1", summary: "implemented the endpoint", branch: "feature/EPIC-1-x",
-      commit_sha: "c0ffee", pr_url: "https://github.com/o/r/pull/7",
-    };
-    const error = vi.spyOn(console, "error").mockImplementation(() => {});
-
-    await completeWorkflow({ ...WF });
-
-    expect(h.state.storeCompletions).toHaveLength(1);
-    expect(h.state.freshWorkflow.agentTasks["D-1"].output).toBe("implemented the endpoint");
-    expect(h.state.freshWorkflow.agentTasks["D-1"].prUrl).toBe("https://github.com/o/r/pull/7");
-    expect(error.mock.calls.some((c) => String(c[0]).includes("CompletionRejectedMissingEvidence"))).toBe(false);
-    expect(h.state.notifications).toHaveLength(0);
-    error.mockRestore();
-  });
-
-  it("no record anywhere → still rejected, but a manager_escalation is appended exactly once", async () => {
-    h.state.snapshots = [CHILDREN];
-    h.state.freshWorkflow = { id: "wf_1", agentTasks: TASKS_MISSING_D1(), humanNotifications: [] };
-    const error = vi.spyOn(console, "error").mockImplementation(() => {});
-
-    await completeWorkflow({ ...WF });
-    // A second pass (another re-Done kick) with the escalation still open: no duplicate.
-    h.state.freshWorkflow.humanNotifications = h.state.notifications.map((x) => x.n);
-    await completeWorkflow({ ...WF });
-
-    expect(h.state.storeCompletions).toHaveLength(0);
-    expect(error.mock.calls.filter((c) => String(c[0]).includes("CompletionRejectedMissingEvidence"))).toHaveLength(2);
-    expect(h.state.notifications).toHaveLength(1);
-    const n = h.state.notifications[0].n;
-    expect(n.type).toBe("manager_escalation");
-    expect(n.id).toBe("notif_completion_evidence_wf_1");
-    expect(n.details).toContain("D-1@development");
-    expect(n.acknowledged).toBe(false);
-    error.mockRestore();
   });
 });
 

@@ -31,36 +31,26 @@ import {
   PutCommand,
 } from "@aws-sdk/lib-dynamodb";
 import { EventBridgeClient, PutEventsCommand } from "@aws-sdk/client-eventbridge";
-import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
 import { getTicketsForWorkflowFromDynamo } from "@/lib/workflow/dynamo-read";
 import { getTicketsForWorkflowFromJira } from "@/lib/workflow/jira-read";
 import { JiraClient } from "@/lib/workflow/jira-client";
 import { resolveWorkflowDef } from "@/lib/workflow/defs-loader";
 import { SHIP_BLOCKED_OUTCOMES } from "@/lib/workflow/types";
-import { resolveMissingEvidenceFromRecords } from "@/lib/workflow/completion-evidence";
 import agentsConfig from "@/config/agents.json";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
-// TEAM-3976: the completions-record fallback reads completions/{ticketId}.json
-// (same client/bucket pattern as src/app/api/workflow/[id]/agent-output/route.ts).
-const ARTIFACT_BUCKET = process.env.ARTIFACT_BUCKET || "";
 const WORKFLOWS_TABLE = process.env.WORKFLOWS_TABLE || "agentcore-hub-workflows";
 const EVENTS_TABLE = process.env.EVENTS_TABLE || "agentcore-hub-events";
 const EVENT_BUS = process.env.EVENT_BUS || "default";
 const TICKET_PROVIDER = process.env.TICKET_PROVIDER || "dynamodb";
 
-// TEAM-3619 D4a / TEAM-3690: the deliverable-evidence gate. DEFAULT ON
-// (ENFORCE). The design (§X.5 step 6) mandated "evidence check behind
-// COMPLETION_EVIDENCE_REQUIRED flag (shadow-log first)"; that shadow-first
-// observation step is now COMPLETE. Per QA finding F2 (AC-D4.1: "a ticket with
-// an empty completion record cannot close") the rollout has advanced to
-// enforce-by-default — a run missing evidence gets a 409, not a shadow-log.
-// Shadow mode remains ONLY as an explicit emergency opt-OUT: set
-// COMPLETION_EVIDENCE_REQUIRED=off|false|0 (case-insensitive) to fall back to
-// shadow-log-and-complete. This is fail-closed: any other value — unset, empty,
-// or unrecognized garbage — ENFORCES, so an unparseable value can never
-// silently disable the invariant. As with the other lifecycle guards there is
-// deliberately still NO force/bypass request parameter regardless of the flag.
+// TEAM-3747 D2: fail-closed gate for the ship/CD merge-verdict check below
+// (2c). DEFAULT ON (ENFORCE): a run whose ship phase carries no merge/deploy
+// verdict closes on its honest terminal outcome rather than a fake "complete".
+// Explicit emergency opt-OUT only: COMPLETION_EVIDENCE_REQUIRED=off|false|0
+// (case-insensitive) shadow-logs and completes. Fail-closed — any other value
+// (unset, empty, garbage) ENFORCES, so an unparseable value can never silently
+// disable the invariant, and there is deliberately NO force/bypass parameter.
 const COMPLETION_EVIDENCE_REQUIRED = !/^(off|false|0)$/i.test(
   (process.env.COMPLETION_EVIDENCE_REQUIRED || "").trim()
 );
@@ -110,7 +100,6 @@ const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: REGION }), 
   marshallOptions: { removeUndefinedValues: true },
 });
 const eventBridge = new EventBridgeClient({ region: REGION });
-const s3 = new S3Client({ region: REGION });
 
 export const dynamic = "force-dynamic";
 
@@ -139,53 +128,6 @@ interface AgentTaskLike {
   ticketId?: string;
   output?: unknown;
   artifactKey?: unknown;
-}
-
-/**
- * TEAM-3619 D4a deliverable-evidence check. For every DONE (not cancelled) child
- * ticket whose phase is one the def requires for completion, assert its agentTask
- * entry carries proof of work: a non-empty `output` OR an `artifactKey`. A "done"
- * ticket with an empty task is a phantom deliverable — the very thing a mistaken
- * or injected `complete` call would rubber-stamp. Returns the offenders (empty =
- * clean). Tickets whose phase we can't resolve, or that aren't a required phase,
- * are left alone — this only tightens, never invents work.
- */
-function missingEvidenceTickets(
-  tickets: Ticket[],
-  agentTasks: Record<string, AgentTaskLike>,
-  requiredPhases: string[]
-): Array<{ ticketId: string; phase: string }> {
-  if (!requiredPhases.length) return [];
-  const required = new Set(requiredPhases);
-  const tasks = agentTasks && typeof agentTasks === "object" ? agentTasks : {};
-  const byTicketId = new Map<string, AgentTaskLike>();
-  for (const entry of Object.values(tasks)) {
-    if (entry && typeof entry.ticketId === "string") byTicketId.set(entry.ticketId, entry);
-  }
-  const missing: Array<{ ticketId: string; phase: string }> = [];
-  for (const t of tickets) {
-    if (t.type === "epic") continue;
-    if (String(t.status || "").toLowerCase() !== "done") continue; // cancelled excluded
-    // Human review gates owe no deliverable (PARITY with completion.mjs
-    // isHumanGateTicket): hub-materialized gates carry `phase:<afterPhase>`, so
-    // phaseOfTicket resolves them into a required phase with no agentTask evidence.
-    if (isHumanGateTicket(t)) continue;
-    const phase = phaseOfTicket(t);
-    if (!phase || !required.has(phase)) continue;
-    const ticketId = String(t.ticketId || "");
-    const entry = tasks[ticketId] || byTicketId.get(ticketId);
-    const hasOutput = typeof entry?.output === "string" && entry.output.trim().length > 0;
-    const hasArtifact = typeof entry?.artifactKey === "string" && entry.artifactKey.length > 0;
-    if (!hasOutput && !hasArtifact) missing.push({ ticketId, phase });
-  }
-  return missing;
-}
-
-/** Human review gate (assignee `human:<who>` or `human-review` label) — twin of completion.mjs. */
-function isHumanGateTicket(t: Ticket): boolean {
-  if (typeof t.assignee === "string" && t.assignee.startsWith("human:")) return true;
-  const labels = (t as { labels?: unknown }).labels;
-  return Array.isArray(labels) && labels.some((l) => String(l).trim().toLowerCase() === "human-review");
 }
 
 /**
@@ -244,7 +186,7 @@ interface ShipVerdict {
  * non-empty mergeCommit, or an explicit outcome==="shipped"), a
  * SHIP_BLOCKED_OUTCOMES value (an explicit terminal block), or null (a phantom
  * green close — CI may be green but nothing merged/deployed and no block
- * declared). Unlike missingEvidenceTickets, mere output/artifact is NOT proof
+ * declared). Mere output/artifact is NOT proof
  * the work shipped. Keep in agreement with completion.mjs.
  *
  * TEAM-3755 F1 (P0): `commitSha` is deliberately NOT a merge signal, in BOTH
@@ -534,91 +476,6 @@ export async function POST(
         },
         { status: 409 }
       );
-    }
-
-    // 2b. TEAM-3619 D4a: deliverable-evidence gate. Every done ticket in a
-    //     completion-required phase must have real work behind it (task output or
-    //     an artifact). Enforced by default (TEAM-3690): missing evidence → 409.
-    //     Only the explicit opt-out COMPLETION_EVIDENCE_REQUIRED=off|false|0 falls
-    //     back to shadow-log-and-continue. No bypass parameter: the same reason
-    //     the open-children gate has none.
-    try {
-      const def = await resolveWorkflowDef(String(workflow.workflowDefId || ""));
-      const requiredPhases = def?.completionRequiresAgentPhases || [];
-      const agentTasks = (workflow.agentTasks as Record<string, AgentTaskLike>) || {};
-      let missing = missingEvidenceTickets(tickets, agentTasks, requiredPhases);
-      // TEAM-3976: a ticket closed out-of-band (mark_done) BEFORE its
-      // report_completion landed has an evidence-less agentTasks entry — the
-      // orchestrator's one-shot harvest found no record, and the later done→done
-      // transition was a no-op so it never re-ran. Consult the authoritative
-      // completions/{ticketId}.json for the would-be offenders ONLY (no S3 reads
-      // on the happy path) and backfill the entry so the run self-heals. The
-      // resolver swallows read/backfill failures itself — a failed read keeps the
-      // offender (409), it must never fall through to the outer "skipped" catch.
-      if (missing.length > 0 && ARTIFACT_BUCKET) {
-        missing = await resolveMissingEvidenceFromRecords(missing, agentTasks, {
-          readCompletionRecord: async (ticketId) => {
-            try {
-              const obj = await s3.send(
-                new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: `completions/${ticketId}.json` })
-              );
-              const body = await obj.Body?.transformToString();
-              return body ? (JSON.parse(body) as Record<string, unknown>) : null;
-            } catch (err) {
-              const e = err as { name?: string; $metadata?: { httpStatusCode?: number } };
-              if (e?.name === "NoSuchKey" || e?.name === "NotFound" || e?.$metadata?.httpStatusCode === 404) {
-                return null;
-              }
-              throw err; // logged by the resolver; offender stays
-            }
-          },
-          // Hand-port of lambda/orchestrator/workflow-store.mjs mergeTaskMetadata:
-          // field-scoped SET on the existing entry only (attribute_exists guard),
-          // a missing entry is dropped rather than materialized.
-          backfill: async (ticketId, fields) => {
-            const names: Record<string, string> = { "#tid": ticketId };
-            const values: Record<string, unknown> = {};
-            const sets: string[] = [];
-            let i = 0;
-            for (const [k, v] of Object.entries(fields)) {
-              if (v === undefined || v === null) continue;
-              names[`#f${i}`] = k;
-              values[`:v${i}`] = v;
-              sets.push(`agentTasks.#tid.#f${i} = :v${i}`);
-              i++;
-            }
-            if (!sets.length) return;
-            try {
-              await ddb.send(
-                new UpdateCommand({
-                  TableName: WORKFLOWS_TABLE,
-                  Key: { workflowId },
-                  UpdateExpression: `SET ${sets.join(", ")}`,
-                  ConditionExpression: "attribute_exists(agentTasks.#tid)",
-                  ExpressionAttributeNames: names,
-                  ExpressionAttributeValues: values,
-                })
-              );
-            } catch (err) {
-              if ((err as Error).name !== "ConditionalCheckFailedException") throw err;
-            }
-          },
-          log: console.warn,
-        });
-      }
-      if (missing.length > 0) {
-        if (COMPLETION_EVIDENCE_REQUIRED) {
-          return NextResponse.json({ error: "missing_evidence", tickets: missing }, { status: 409 });
-        }
-        console.warn(
-          `[complete] ${workflowId} would be blocked for missing evidence (shadow opt-out): ` +
-            missing.map((m) => `${m.ticketId}@${m.phase}`).join(", ")
-        );
-      }
-    } catch (err) {
-      // Never let evidence resolution (def load) turn a legitimate completion into
-      // a 500 — the gate only tightens when it can prove a phantom deliverable.
-      console.warn(`[complete] evidence check skipped: ${(err as Error).message}`);
     }
 
     // 2b′. TEAM-3755 F4 — structural parity with completion.mjs
