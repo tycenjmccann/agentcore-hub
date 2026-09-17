@@ -27,15 +27,17 @@ Needs boto3 >= 1.43.96 (the first release whose CloudWatchLogsInputConfig has
 `logGroupNamePrefixes`); the script refuses to run on an older SDK.
 
 `--apply` writes to whatever account the ambient credentials resolve to, so it
-first prints the caller identity and region and makes you confirm. Pass
-`--expect-account <id>` to assert the account non-interactively instead (the id
-is never hardcoded here — it comes from the operator or deploy/config.sh).
+first prints the caller identity and region and makes you confirm. The expected
+account must come from a source INDEPENDENT of those credentials, or the check is
+tautological: `EXPECTED_ACCOUNT_ID` (deploy/.env.local, the same gitignored guard
+deploy/config.sh uses) or an explicit `--expect-account <id>`. Never derive it
+from `aws sts get-caller-identity` — that is the value being guarded.
 
 Usage (prod profile; dry-run by default):
   AWS_PROFILE=tycenj-prod AWS_REGION=us-east-1 python3 deploy/evaluations/set-log-group-prefixes.py
   AWS_PROFILE=tycenj-prod AWS_REGION=us-east-1 python3 deploy/evaluations/set-log-group-prefixes.py --apply
-  ... --expect-account "$(aws sts get-caller-identity --query Account --output text)"  # no prompt
-  ... --config-id eval_agentcore_hub_agent-XXXX     # limit to these configs
+  EXPECTED_ACCOUNT_ID=... ... --apply            # asserted, no prompt (CI/scripted)
+  ... --config-id eval_agentcore_hub_agent-XXXX  # limit to these configs
 """
 from __future__ import annotations
 
@@ -153,7 +155,9 @@ def main() -> int:
     ap.add_argument("--config-id", action="append", default=[], help="limit to these config ids")
     ap.add_argument(
         "--expect-account",
-        help="12-digit account id the credentials must resolve to; skips the --apply confirmation prompt",
+        default=os.environ.get("EXPECTED_ACCOUNT_ID") or None,
+        help="account id the credentials must resolve to (default: $EXPECTED_ACCOUNT_ID, the same "
+        "gitignored guard deploy/config.sh reads); skips the --apply confirmation prompt",
     )
     args = ap.parse_args()
 
@@ -170,7 +174,10 @@ def main() -> int:
         print(f"About to UPDATE online evaluation configs in account {account}, region {REGION}")
         print(f"  caller: {identity['Arn']}")
         if not sys.stdin.isatty():
-            print("ERROR: --apply needs a TTY to confirm, or pass --expect-account <id>. Refusing.")
+            print(
+                "ERROR: --apply needs a TTY to confirm, or an expected account from a source independent "
+                "of these credentials ($EXPECTED_ACCOUNT_ID or --expect-account). Refusing."
+            )
             return 2
         if input(f"Type the account id to continue: ").strip() != account:
             print("account id did not match — nothing was changed.")
