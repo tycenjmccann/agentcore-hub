@@ -26,10 +26,16 @@ different runtime name (e.g. "<name>_v2-..."). The trailing "-" is what keeps
 Needs boto3 >= 1.43.96 (the first release whose CloudWatchLogsInputConfig has
 `logGroupNamePrefixes`); the script refuses to run on an older SDK.
 
+`--apply` writes to whatever account the ambient credentials resolve to, so it
+first prints the caller identity and region and makes you confirm. Pass
+`--expect-account <id>` to assert the account non-interactively instead (the id
+is never hardcoded here — it comes from the operator or deploy/config.sh).
+
 Usage (prod profile; dry-run by default):
   AWS_PROFILE=tycenj-prod AWS_REGION=us-east-1 python3 deploy/evaluations/set-log-group-prefixes.py
   AWS_PROFILE=tycenj-prod AWS_REGION=us-east-1 python3 deploy/evaluations/set-log-group-prefixes.py --apply
-  ... --config-id eval_agentcore_hub_agent-XXXX     # limit to one config
+  ... --expect-account "$(aws sts get-caller-identity --query Account --output text)"  # no prompt
+  ... --config-id eval_agentcore_hub_agent-XXXX     # limit to these configs
 """
 from __future__ import annotations
 
@@ -145,11 +151,31 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--apply", action="store_true", help="write the change (default: dry-run)")
     ap.add_argument("--config-id", action="append", default=[], help="limit to these config ids")
+    ap.add_argument(
+        "--expect-account",
+        help="12-digit account id the credentials must resolve to; skips the --apply confirmation prompt",
+    )
     args = ap.parse_args()
 
     if not sdk_supports_prefixes():
         print("ERROR: this boto3/botocore predates logGroupNamePrefixes. pip install -U boto3 (>= 1.43.96) and re-run.")
         return 2
+
+    identity = boto3.client("sts", region_name=REGION).get_caller_identity()
+    account = identity["Account"]
+    if args.expect_account and args.expect_account != account:
+        print(f"ERROR: credentials resolve to account {account}, expected {args.expect_account} — refusing.")
+        return 2
+    if args.apply and not args.expect_account:
+        print(f"About to UPDATE online evaluation configs in account {account}, region {REGION}")
+        print(f"  caller: {identity['Arn']}")
+        if not sys.stdin.isatty():
+            print("ERROR: --apply needs a TTY to confirm, or pass --expect-account <id>. Refusing.")
+            return 2
+        if input(f"Type the account id to continue: ").strip() != account:
+            print("account id did not match — nothing was changed.")
+            return 2
+    print(f"account {account} / region {REGION}\n")
 
     control = boto3.client("bedrock-agentcore-control", region_name=REGION)
     logs = boto3.client("logs", region_name=REGION)
@@ -157,6 +183,13 @@ def main() -> int:
 
     configs = list_configs(control)
     if args.config_id:
+        live = {c["onlineEvaluationConfigId"] for c in configs}
+        # A misspelled or deleted id must not be silently dropped: it would look
+        # like that config was handled when it was never touched.
+        unknown = [cid for cid in args.config_id if cid not in live]
+        if unknown:
+            print(f"ERROR: no such online evaluation config in account {account}: {unknown}")
+            return 2
         configs = [c for c in configs if c["onlineEvaluationConfigId"] in set(args.config_id)]
     if not configs:
         print("no online evaluation configs found")
