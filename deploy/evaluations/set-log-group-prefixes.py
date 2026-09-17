@@ -172,6 +172,17 @@ def main() -> int:
             skipped += 1
             continue
         if cw.get("logGroupNamePrefixes") and not cw.get("logGroupNames"):
+            # GetOnlineEvaluationConfig echoes the REQUESTED data source even while
+            # an update is UPDATING or after it ended UPDATE_FAILED, so "it already
+            # has prefixes" is not on its own proof the migration took. Settle first.
+            if before.get("status") != "ACTIVE":
+                try:
+                    before = wait_settled(control, cid)
+                except RuntimeError as exc:
+                    print(f"✗ {cid}: reports prefixes but never settled ACTIVE: {exc}")
+                    print("   treat this config as UNMIGRATED — the judge may still be on the old exact log group")
+                    refused += 1
+                    continue
             print(f"✓ {cid}: already on prefixes {cw['logGroupNamePrefixes']}")
             skipped += 1
             continue
