@@ -408,3 +408,32 @@ if [ -n "$FAILED_CONFIGS" ]; then
   echo "  (See per-agent errors above.) This step did not fully succeed."
   exit 1
 fi
+
+# --- Post-create: prefix migration + matrix audit ---------------------------
+# `agentcore eval online create` pins each config to the runtime's EXACT log
+# group, which dies with the runtime id (see the input-log-groups block above).
+# Migrating is part of provisioning, not an optional follow-up: a config left on
+# an exact name is one runtime recreation away from a silently dark judge. Both
+# steps run here so /setup and DEPLOY.md get them without a separate manual step,
+# and a failure fails this script.
+echo ""
+echo "→ Migrating input log groups to prefixes..."
+if ! python3 "${REPO_ROOT}/deploy/evaluations/set-log-group-prefixes.py" --apply; then
+  echo ""
+  echo "✗ Prefix migration FAILED. The configs above may still pin an exact log"
+  echo "  group name and will stop being evaluated if their runtime is recreated."
+  echo "  Most likely cause: boto3 predates logGroupNamePrefixes (needs >= 1.43.96)"
+  echo "  — upgrade it and re-run set-log-group-prefixes.py --apply."
+  exit 1
+fi
+
+# Report-only: the configs were just created from the matrix above, so drift here
+# means this script and the live account disagree. Repair with --apply.
+echo ""
+echo "→ Auditing the evaluator matrix..."
+if ! python3 "${REPO_ROOT}/deploy/evaluations/audit-eval-matrix.py"; then
+  echo ""
+  echo "✗ Live configs do not match the evaluator matrix (see the diff above)."
+  echo "  Repair with: python3 deploy/evaluations/audit-eval-matrix.py --apply"
+  exit 1
+fi

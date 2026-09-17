@@ -31,6 +31,15 @@ import botocore.session
 REGION = os.environ.get("AWS_REGION", "us-east-1")
 ENV_LOCAL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".env.local")
 
+# Ownership. These scripts can write to any online evaluation config in the
+# account, and the hub's account is shared with unrelated agents (there is a
+# personal-assistant config next to the fleet's). Config names follow
+# `eval_<agentId>` and every hub agentId starts with `agentcore_hub_`, matching
+# the repo convention that hub-owned resources carry the `agentcore-hub`/
+# `agentcore_hub` prefix. Anything else belongs to another application and is
+# never written unless the operator opts in with --include-unowned.
+OWNED_CONFIG_PREFIX = "eval_agentcore_hub_"
+
 TERMINAL_BAD = {"UPDATE_FAILED", "CREATE_FAILED", "ERROR", "DELETING"}
 SETTLE_TIMEOUT_S = 180
 SETTLE_POLL_S = 5
@@ -65,8 +74,18 @@ def default_expected_account() -> str | None:
     return os.environ.get("EXPECTED_ACCOUNT_ID") or expected_account_from_env_local()
 
 
+def owned(config_name: str) -> bool:
+    return config_name.startswith(OWNED_CONFIG_PREFIX)
+
+
 def add_common_args(ap) -> None:
     ap.add_argument("--apply", action="store_true", help="write the change (default: dry-run)")
+    ap.add_argument(
+        "--include-unowned",
+        action="store_true",
+        help=f"also touch configs not named {OWNED_CONFIG_PREFIX}* (another application's configs; "
+        "off by default)",
+    )
     ap.add_argument(
         "--expect-account",
         default=default_expected_account(),
@@ -104,6 +123,27 @@ def guard_account(apply: bool, expect_account: str | None) -> tuple[str, int | N
     return account, None
 
 
+def list_evaluator_ids(control) -> set[str]:
+    """Every evaluator id in the account, fully paginated.
+
+    Pagination matters: a truncated list would read as "the custom evaluator is
+    absent", and a caller that then substitutes a built-in would silently narrow
+    what an agent is scored on. Callers must let the underlying error propagate
+    rather than treat a failed read as absence (the fail-loud rule in
+    setup-evaluations.sh).
+    """
+    ids, token = set(), None
+    while True:
+        kw = {"maxResults": 100}
+        if token:
+            kw["nextToken"] = token
+        page = control.list_evaluators(**kw)
+        ids.update(e["evaluatorId"] for e in page.get("evaluators", []))
+        token = page.get("nextToken")
+        if not token:
+            return ids
+
+
 def list_configs(control) -> list[dict]:
     out, token = [], None
     while True:
@@ -117,10 +157,19 @@ def list_configs(control) -> list[dict]:
             return out
 
 
-def select_configs(control, config_ids: list[str], account: str) -> tuple[list[dict], int | None]:
-    """All configs, or just `config_ids`. A misspelled/deleted id aborts rather
-    than being silently dropped — that would look like the config was handled."""
+def select_configs(
+    control, config_ids: list[str], account: str, include_unowned: bool = False
+) -> tuple[list[dict], int | None]:
+    """All hub-owned configs, or just `config_ids`. A misspelled/deleted id aborts
+    rather than being silently dropped — that would look like the config was
+    handled. Configs owned by another application are excluded unless
+    include_unowned is set, so an account-wide run cannot overwrite them."""
     configs = list_configs(control)
+    if not include_unowned:
+        skipped = [c["onlineEvaluationConfigName"] for c in configs if not owned(c["onlineEvaluationConfigName"])]
+        if skipped:
+            print(f"not this fleet, skipping (pass --include-unowned to override): {sorted(skipped)}\n")
+        configs = [c for c in configs if owned(c["onlineEvaluationConfigName"])]
     if config_ids:
         live = {c["onlineEvaluationConfigId"] for c in configs}
         unknown = [cid for cid in config_ids if cid not in live]

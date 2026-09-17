@@ -235,7 +235,15 @@ The continuous-improvement loop. Self-contained surface.
   fights the `DynamoDBAccess` document written by `deploy/setup-lambda-role.sh`.
 
 **Deploy scripts**
-- `deploy/evaluations/setup-evaluations.sh`
+- `deploy/evaluations/setup-evaluations.sh` — creates one online eval config per
+  agent, then runs the two scripts below (a failure in either fails the step)
+- `deploy/evaluations/set-log-group-prefixes.py` — points each config's input at
+  `logGroupNamePrefixes` (`/aws/bedrock-agentcore/runtimes/<name>-`) instead of an
+  exact log group name, which dies with the runtime id and silently stops the judge
+- `deploy/evaluations/audit-eval-matrix.py` — diffs live configs against the
+  10-evaluator matrix and repairs drift with `--apply`; refuses to shrink a matrix
+  (shared account guard / region / settle logic in `deploy/evaluations/eval_config_lib.py`;
+  both need boto3 >= 1.43.96 and only touch `eval_agentcore_hub_*`)
 - `deploy/continuous-improvement/deploy-all.sh` — creates the tables, enables PITR
   on the results table, and turns the `agentcore-hub-eval-daily` TTL **off**
 - `deploy/continuous-improvement/deploy.sh` (see `deploy/continuous-improvement/README.md`)

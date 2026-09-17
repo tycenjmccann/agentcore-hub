@@ -52,6 +52,7 @@ from eval_config_lib import (  # noqa: E402
     REGION,
     add_common_args,
     guard_account,
+    list_evaluator_ids,
     select_configs,
     wait_settled,
 )
@@ -84,8 +85,18 @@ def read_setup_sh() -> tuple[str, set[str]]:
     return m.group(1), {f"eval_{name}" for name in t.group(1).split()}
 
 
-def target_matrix(config_name: str, custom: str, ticket_configs: set[str]) -> list[str]:
-    return BUILTIN_NINE + [custom if config_name in ticket_configs else FALLBACK_TENTH]
+def target_matrix(config_name: str, custom: str, ticket_configs: set[str], custom_present: bool) -> list[str]:
+    """9 built-ins + the tenth slot.
+
+    setup-evaluations.sh deliberately creates ticket-agent configs with
+    Builtin.Conciseness when the custom dependency-chain evaluator is absent from
+    the account, so demanding the custom id unconditionally would report a valid
+    freshly provisioned deployment as drifted and then refuse to repair it. The
+    absence has to be CONFIRMED (a fully paginated list that genuinely lacks it),
+    never inferred from a failed read.
+    """
+    tenth = custom if (config_name in ticket_configs and custom_present) else FALLBACK_TENTH
+    return BUILTIN_NINE + [tenth]
 
 
 def snapshot(cfg: dict) -> dict:
@@ -110,26 +121,44 @@ def main() -> int:
     args = ap.parse_args()
 
     custom, ticket_configs = read_setup_sh()
-    print(f"matrix: 9 built-ins + {custom} for {sorted(ticket_configs)}, else {FALLBACK_TENTH}\n")
 
     account, rc = guard_account(args.apply, args.expect_account)
     if rc is not None:
         return rc
 
     control = boto3.client("bedrock-agentcore-control", region_name=REGION)
-    configs, rc = select_configs(control, args.config_id, account)
+
+    # Let a failed/incomplete read raise: treating it as "the evaluator is gone"
+    # would quietly swap the dependency-chain check for a built-in.
+    known_evaluators = list_evaluator_ids(control)
+    custom_present = custom in known_evaluators
+    tenth_for_ticket = custom if custom_present else f"{FALLBACK_TENTH} (custom evaluator absent from account)"
+    print(f"matrix: 9 built-ins + {tenth_for_ticket} for {sorted(ticket_configs)}, else {FALLBACK_TENTH}\n")
+
+    configs, rc = select_configs(control, args.config_id, account, args.include_unowned)
     if rc is not None:
         return rc
-
-    known_evaluators = {e["evaluatorId"] for e in control.list_evaluators(maxResults=100).get("evaluators", [])}
 
     ok = repaired = drifted = refused = 0
     for summary in configs:
         cid = summary["onlineEvaluationConfigId"]
         before = control.get_online_evaluation_config(onlineEvaluationConfigId=cid)
         name = before["onlineEvaluationConfigName"]
+        want = target_matrix(name, custom, ticket_configs, custom_present)
+
+        # GetOnlineEvaluationConfig echoes the REQUESTED evaluator list while an
+        # update is UPDATING and after one ended UPDATE_FAILED, so a matching list
+        # is not on its own proof the matrix landed. Settle before reporting.
+        if before.get("status") != "ACTIVE":
+            try:
+                before = wait_settled(control, cid)
+            except RuntimeError as exc:
+                print(f"✗ {name}: never settled ACTIVE: {exc}")
+                print("   its evaluator list is unverifiable — re-run the audit once the config settles")
+                refused += 1
+                continue
+
         have = {e["evaluatorId"] for e in before.get("evaluators", [])}
-        want = target_matrix(name, custom, ticket_configs)
         missing, extra = set(want) - have, have - set(want)
 
         if not missing and not extra:

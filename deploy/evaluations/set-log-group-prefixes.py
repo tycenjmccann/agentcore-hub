@@ -23,7 +23,9 @@ and a prefix is refused if any EXISTING log group it matches belongs to a
 different runtime name (e.g. "<name>_v2-..."). The trailing "-" is what keeps
 "agentcore_hub_coding_runtime-" from matching "agentcore_hub_coding_runtime_ec2-".
 
-Needs boto3 >= 1.43.96 (the first release whose CloudWatchLogsInputConfig has
+Only hub-owned configs (`eval_agentcore_hub_*`) are touched; another
+application's configs in the same account are listed and skipped unless
+--include-unowned is passed. Needs boto3 >= 1.43.96 (the first release whose CloudWatchLogsInputConfig has
 `logGroupNamePrefixes`); the script refuses to run on an older SDK. See
 eval_config_lib.py for the region, account-guard and settle rules.
 
@@ -126,7 +128,7 @@ def main() -> int:
     logs = boto3.client("logs", region_name=REGION)
     all_groups = list_runtime_log_groups(logs)
 
-    configs, rc = select_configs(control, args.config_id, account)
+    configs, rc = select_configs(control, args.config_id, account, args.include_unowned)
     if rc is not None:
         return rc
 
