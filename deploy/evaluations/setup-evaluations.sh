@@ -176,7 +176,10 @@ CUSTOM_EVALUATOR="dependency_chain_compliance_online_v3-M1N0o94Jsa"
 # config, so there is nothing to scope there. Out-of-scope roles fall into the
 # Builtin.Conciseness tenth-slot fallback below. Sampling tiers (GATE_AGENTS)
 # are unchanged — this only narrows who gets the custom evaluator.
-TICKET_AGENTS="agentcore_hub_requirements_analyst"
+# The shared fleet runtime (1-runtime topology) HOSTS requirements_analyst, so
+# its config carries the custom evaluator too; the eval-packager's role guard
+# drops dependency-chain rows for every other persona on that runtime.
+TICKET_AGENTS="agentcore_hub_requirements_analyst agentcore_hub_agent"
 
 # Read agent IDs dynamically from fleet-runtime-ids.json
 FLEET_FILE="${REPO_ROOT}/deploy/runtime-agent/fleet-runtime-ids.json"
@@ -249,7 +252,8 @@ for name, arn in data.items():
 
 # TEAM-3366 §2.4: pipeline gate roles keep 100% sampling (their scores gate
 # ticket flow); everyone else drops to 25% to cut judge load.
-GATE_AGENTS="agentcore_hub_requirements_analyst agentcore_hub_qa_verifier agentcore_hub_ci_agent"
+# The shared runtime hosts all three gate roles, so it samples at 100% as well.
+GATE_AGENTS="agentcore_hub_requirements_analyst agentcore_hub_qa_verifier agentcore_hub_ci_agent agentcore_hub_agent"
 
 AGENT_COUNT=$(echo "$AGENTS" | wc -l | tr -d ' ')
 echo "Creating online evaluation configs for ${AGENT_COUNT} agents..."
