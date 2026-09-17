@@ -235,6 +235,13 @@ export default defineConfig({
       // happens. Plus the TEAM-4663 create_ticket payload shape (base_branch:
       // "main") as a pure fixture — the twins own their own validation tests.
       "lambda/orchestrator/replay-head-of-line.test.mjs",
+      // replay-empty-sweep (TEAM-4740 FR-10/FR-11) — run fz514x, the dead-code sweep
+      // that found nothing: no diff, no PR, and four downstream tickets waiting for a
+      // diff that would never exist. Drives the REAL workflow-output handler for both
+      // halves (submit_ticket_plan's root-blocker autowire, report_completion's skip
+      // walk) against a ticket stub that enforces the DynamoDB twin's real skip-only-
+      // from-blocked constraint, plus the REAL completion.mjs verdict.
+      "lambda/orchestrator/replay-empty-sweep.test.mjs",
       // replay-followups (TEAM-4740 FR-13/FR-5) — four real runs whose delivery
       // work went missing: a fix created while the Merge Approval gate was open
       // (TEAM-4660), a post-deploy re-check that lived only in prose (15x8ql), and

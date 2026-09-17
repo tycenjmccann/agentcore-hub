@@ -42,6 +42,13 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 const h = vi.hoisted(() => ({
   puts: [], warns: [], gets: [], heads: [], headError: null, invokes: [], objects: new Map(),
   calls: [], events: [], issue: undefined, siblings: [], created: [], ticketFail: new Set(),
+  // FR-10: per-CALL transition control, which `ticketFail` (keyed on the tool) cannot
+  // express — the skip walk's whole shape is "skip, and if THAT one is refused, block
+  // then skip", so a test has to be able to refuse one ticket or one transition_id.
+  transitionGate: null,
+  // FR-11: the workflows-table row `submit_ticket_plan` reads `featureBranch` off,
+  // plus every Get it issued and an optional throw (the fail-open path).
+  workflow: null, workflowGets: [], workflowGetError: null,
 }));
 
 const asString = (body) => (typeof body === "string" ? body : Buffer.from(body).toString("utf8"));
@@ -103,13 +110,13 @@ vi.mock("@aws-sdk/client-s3", () => ({
 }));
 vi.mock("@aws-sdk/s3-request-presigner", () => ({ getSignedUrl: async () => "https://signed" }));
 /** A DynamoDB-twin-shaped ticket row (the shape normalizeIssue reads). */
-const ticketRow = ({ key, summary = "Work", assignee = "agentcore_hub_api_dev", status = "todo", parent = "TEAM-4100", created = "2026-09-17T09:00:00.000Z", description = "" }) => ({
+const ticketRow = ({ key, summary = "Work", assignee = "agentcore_hub_api_dev", status = "todo", parent = "TEAM-4100", created = "2026-09-17T09:00:00.000Z", description = "", blockedBy = [] }) => ({
   key,
   fields: {
     summary, description, status: { name: status }, assignee: { displayName: assignee },
     parent: parent ? { key: parent } : undefined, created,
   },
-  blockedBy: [],
+  blockedBy,
 });
 
 vi.mock("@aws-sdk/client-lambda", () => ({
@@ -129,8 +136,19 @@ vi.mock("@aws-sdk/client-lambda", () => ({
       // The DynamoDB twin reports failure as a textResult, not a throw — the shape
       // ticketTool's toolFailure() has to recognize.
       if (h.ticketFail.has(tool)) return reply({ content: [{ type: "text", text: `Error: ${tool} is unavailable` }] });
+      if (tool === "Tickets___transition_ticket" && h.transitionGate && !h.transitionGate(params)) {
+        return reply({ content: [{ type: "text", text: `Error: transition ${params.transition_id} is not available from the current status` }] });
+      }
       if (tool === "Tickets___get_issue") {
-        return reply(h.issue === undefined ? ticketRow({ key: params.ticket_id, summary: "The ticket under report" }) : h.issue);
+        // `h.issue` is the REPORTED ticket's answer. Since FR-10 the sweep also reads
+        // blockedBy off each SIBLING by id, so a single canned answer would make
+        // every sibling look like a leaf and quietly pass the ordering test — hence
+        // the per-id lookup, which only applies to ids that are not the reported one.
+        const id = params.ticket_id;
+        const reportedId = h.issue?.key || h.issue?.ticketId || null;
+        const sibling = id !== reportedId ? h.siblings.find((s) => s.key === id) : null;
+        if (sibling) return reply(sibling);
+        return reply(h.issue === undefined ? ticketRow({ key: id, summary: "The ticket under report" }) : h.issue);
       }
       if (tool === "Tickets___list_tickets") return reply({ total: h.siblings.length, issues: h.siblings });
       if (tool === "Tickets___create_ticket") {
@@ -149,21 +167,31 @@ vi.mock("@aws-sdk/client-lambda", () => ({
 }));
 vi.mock("@aws-sdk/client-dynamodb", () => ({ DynamoDBClient: class {} }));
 vi.mock("@aws-sdk/lib-dynamodb", () => ({
-  // Journey events are the only DynamoDB write this Lambda makes; FR-14's
-  // delivery.prState event is asserted off `h.events`.
+  // Journey events are the only DynamoDB WRITE this Lambda makes (FR-14's
+  // delivery.prState event is asserted off `h.events`); TEAM-4740 FR-11 adds one
+  // read — GetItem on the workflows table for `featureBranch`.
   DynamoDBDocumentClient: {
     from: () => ({
       send: async (cmd) => {
+        if (cmd?.constructor?.name === "GetCommand") {
+          h.workflowGets.push(cmd.input);
+          if (h.workflowGetError) throw h.workflowGetError;
+          return { Item: h.workflow || undefined };
+        }
         if (cmd?.input?.Item) h.events.push(cmd.input.Item);
         return {};
       },
     }),
   },
   PutCommand: class { constructor(input) { this.input = input; } },
+  GetCommand: class { constructor(input) { this.input = input; } },
 }));
 
 process.env.ARTIFACT_BUCKET = "test-bucket";
-const { handler, inferToolFromArgs, followUpHash, followUpBanner } = await import("./index.mjs");
+// FR-11 templating is skipped when this is unset, so every plan test below would
+// assert the no-op path if it were absent.
+process.env.WORKFLOWS_TABLE = "agentcore-hub-workflows";
+const { handler, inferToolFromArgs, followUpHash, followUpBanner, sweepSkipOrder } = await import("./index.mjs");
 
 /** The completion record the call wrote, parsed. */
 const record = () => JSON.parse(h.puts.find((p) => p.Key?.startsWith("completions/")).Body);
@@ -222,9 +250,13 @@ beforeEach(() => {
   h.created.length = 0;
   h.siblings.length = 0;
   h.ticketFail.clear();
+  h.transitionGate = null;
   h.issue = undefined;
   h.headError = null;
   h.objects.clear();
+  h.workflowGets.length = 0;
+  h.workflow = null;
+  h.workflowGetError = null;
   vi.spyOn(console, "warn").mockImplementation((...args) => h.warns.push(args.join(" ")));
   vi.spyOn(console, "error").mockImplementation((...args) => h.warns.push(args.join(" ")));
 });
@@ -1061,6 +1093,354 @@ describe("report_completion — FR-5 main_fix_requires_pr", () => {
     h.ticketFail.clear();
     h.issue = { ticketId: "TEAM-4200", title: "Fix it", status: "in_progress", assignee: "agentcore_hub_api_dev", parentKey: "TEAM-4100" };
     expect(result(await report({})).status).toBe("complete");
+  });
+});
+
+// ─── TEAM-4740 FR-10: the empty sweep ─────────────────────────────────────────
+//
+// A dead-code sweep that finds nothing has no diff, no PR and nothing to merge —
+// but it has a full downstream chain (dev, review, CI, QA, ship, CD) sitting on it.
+// Before FR-10 the run either faked a ship or left those tickets open forever. Now
+// the sweeper closes them itself, each with a record saying why, and the ORDER it
+// closes them in is the part that can go silently wrong: a done ticket cascades, so
+// closing a blocker before its dependent hands a live agent a ticket for a diff
+// that does not exist.
+
+/** The skip record written for `key`, parsed (undefined if none was written). */
+const skipRecord = (key) => {
+  const put = h.puts.find((p) => p.Key === `completions/${key}.json`);
+  return put ? JSON.parse(put.Body) : undefined;
+};
+/** Every ticket a skip record was written for, in write order. */
+const skipRecordOrder = () =>
+  h.puts.filter((p) => p.Key?.startsWith("completions/") && p.Key !== "completions/TEAM-4640.json")
+    .map((p) => p.Key.replace("completions/", "").replace(".json", ""));
+
+const sweep = (extra) =>
+  report({
+    ticket_id: "TEAM-4640", agent_id: "agentcore_hub_api_dev",
+    summary: "Swept 41 modules; every candidate is still referenced. No removals.",
+    outcome: "empty_sweep", ...extra,
+  });
+
+describe("report_completion — FR-10 empty_sweep", () => {
+  // The fz514x chain: the sweeper (4640) then dev (4643) → review (4644) → ship
+  // (4645). Reverse topological order is 4645, 4644, 4643.
+  beforeEach(() => {
+    h.issue = ticketRow({ key: "TEAM-4640", summary: "Sweep dead code", assignee: "agentcore_hub_api_dev", status: "in_progress" });
+    h.siblings.push(
+      ticketRow({ key: "TEAM-4640", summary: "Sweep dead code", assignee: "agentcore_hub_api_dev", status: "in_progress", created: "2026-09-17T09:00:00.000Z" }),
+      ticketRow({ key: "TEAM-4643", summary: "Remove the dead modules", assignee: "agentcore_hub_api_dev", created: "2026-09-17T09:01:00.000Z", blockedBy: ["TEAM-4640"] }),
+      ticketRow({ key: "TEAM-4644", summary: "Review the removals", assignee: "agentcore_hub_code_reviewer", created: "2026-09-17T09:02:00.000Z", blockedBy: ["TEAM-4643"] }),
+      ticketRow({ key: "TEAM-4645", summary: "Ship the sweep", assignee: "agentcore_hub_release_manager", created: "2026-09-17T09:03:00.000Z", blockedBy: ["TEAM-4644"] }),
+    );
+  });
+
+  it("skips every open sibling, DEPENDENTS FIRST, and reports them in that order", async () => {
+    const res = result(await sweep());
+    expect(res.status).toBe("complete");
+    // Deepest dependent first. Get this backwards and the run dispatches the dev
+    // ticket for a sweep that removed nothing.
+    expect(res.emptySweepSkipped).toEqual(["TEAM-4645", "TEAM-4644", "TEAM-4643"]);
+    expect(res).not.toHaveProperty("emptySweepFailed");
+    // The records were written in the same order as the transitions.
+    expect(skipRecordOrder()).toEqual(["TEAM-4645", "TEAM-4644", "TEAM-4643"]);
+  });
+
+  it("writes a real completion record for each — the harvest reads `summary`", async () => {
+    await sweep();
+    expect(skipRecord("TEAM-4644")).toEqual({
+      ticketId: "TEAM-4644",
+      workflowId: "wf_1",
+      summary: "Skipped: empty_sweep — no removals found by TEAM-4640",
+      evidence_kind: "skipped",
+      skipped: true,
+      reason: "empty_sweep",
+    });
+    // "skipped" has to be IN the closed vocabulary or the record's own
+    // evidence_kind would be dropped by the check that guards every other field.
+    expect(skipRecord("TEAM-4643").evidence_kind).toBe("skipped");
+  });
+
+  it("writes each record BEFORE that ticket's transition — the DL-030 ship guard", async () => {
+    // The tickets twin refuses `done` on a ship-phase ticket with no completion
+    // record. Record-second would make the sweep unable to close TEAM-4645 at all.
+    // The gate is used here purely as an observer: it reports, at the instant of
+    // each transition, whether that ticket's record already existed.
+    const at = [];
+    h.transitionGate = (params) => {
+      at.push({ id: params.ticket_id, hadRecord: h.objects.has(`completions/${params.ticket_id}.json`) });
+      return true;
+    };
+    await sweep();
+    expect(at.map((a) => a.id)).toEqual(["TEAM-4645", "TEAM-4644", "TEAM-4643", "TEAM-4640"]);
+    for (const a of at) expect(a.hadRecord, a.id).toBe(true);
+  });
+
+  it("skips them BEFORE the sweeper's own transition, so the cascade finds them done", async () => {
+    await sweep();
+    const transitions = calls("Tickets___transition_ticket").map((p) => p.ticket_id);
+    // The sweeper is LAST. Its Done is what cascades; by then every dependent is
+    // already closed.
+    expect(transitions[transitions.length - 1]).toBe("TEAM-4640");
+    expect(transitions.slice(0, -1)).toEqual(["TEAM-4645", "TEAM-4644", "TEAM-4643"]);
+  });
+
+  it("falls back to block→skip when the provider only offers skip from blocked", async () => {
+    // The DynamoDB twin's transition map has `skip` only on `blocked`. The Jira twin
+    // maps skip→Done from anywhere. Trying skip first needs no knowledge of either
+    // provider's status NAMES — the part that would rot.
+    let firstSkip = true;
+    h.siblings.length = 0;
+    h.siblings.push(ticketRow({ key: "TEAM-4643", summary: "Remove the dead modules", created: "2026-09-17T09:01:00.000Z" }));
+    h.transitionGate = (params) => {
+      if (params.transition_id === "skip" && firstSkip) { firstSkip = false; return false; }
+      return true;
+    };
+    const res = result(await sweep());
+    expect(res.emptySweepSkipped).toEqual(["TEAM-4643"]);
+    expect(calls("Tickets___transition_ticket").filter((p) => p.ticket_id === "TEAM-4643").map((p) => p.transition_id))
+      .toEqual(["skip", "block", "skip"]);
+    h.transitionGate = null;
+  });
+
+  it("carries the reason onto the transition, so a skipped ticket explains itself", async () => {
+    await sweep();
+    const skip = calls("Tickets___transition_ticket").find((p) => p.ticket_id === "TEAM-4645");
+    expect(skip).toEqual({ ticket_id: "TEAM-4645", transition_id: "skip", reason: "empty_sweep — no removals found by TEAM-4640" });
+  });
+
+  it("leaves human gates and already-done siblings alone", async () => {
+    h.siblings.push(
+      ticketRow({ key: "TEAM-4646", summary: "Merge Approval", assignee: "human:engineer", status: "in_review", created: "2026-09-17T09:04:00.000Z" }),
+      ticketRow({ key: "TEAM-4641", summary: "Requirements", assignee: "agentcore_hub_requirements_analyst", status: "done", created: "2026-09-17T08:59:00.000Z" }),
+    );
+    const res = result(await sweep());
+    // A human's queue is not ours to clear, and a done ticket needs nothing.
+    expect(res.emptySweepSkipped).not.toContain("TEAM-4646");
+    expect(res.emptySweepSkipped).not.toContain("TEAM-4641");
+    expect(skipRecord("TEAM-4646")).toBeUndefined();
+    expect(skipRecord("TEAM-4641")).toBeUndefined();
+    // …and never itself.
+    expect(res.emptySweepSkipped).not.toContain("TEAM-4640");
+  });
+
+  it("the sweeper's OWN record is an honest terminal outcome, not a ship", async () => {
+    await sweep();
+    const own = JSON.parse(h.puts.find((p) => p.Key === "completions/TEAM-4640.json").Body);
+    expect(own.outcome).toBe("empty_sweep");
+    expect(own.pr_url).toBeNull();
+    // Nothing was merged and nothing is open, so neither "merged" nor "open" would
+    // be true.
+    expect(own.delivery).toEqual({ prUrl: null, prState: "unknown" });
+  });
+
+  it("keeps going when one skip fails, and reports which", async () => {
+    h.transitionGate = (params) => params.ticket_id !== "TEAM-4644";
+    const res = result(await sweep());
+    // Partial closure with no record of which is the worst of the three states.
+    expect(res.emptySweepSkipped).toEqual(["TEAM-4645", "TEAM-4643"]);
+    expect(res.emptySweepFailed).toEqual([{ ticketId: "TEAM-4644", reason: expect.stringContaining("Error") }]);
+    expect(res.status).toBe("complete");
+    h.transitionGate = null;
+  });
+
+  it("orders a row whose blockedBy is unreadable as a leaf", () => {
+    // list_tickets omits blockedBy in BOTH twins, so the order comes from one
+    // get_issue per sibling — and a failed read leaves the row a leaf. Skipping a
+    // ticket too EARLY only risks a cascade touching something about to be skipped;
+    // skipping a blocker too early hands its dependent to a live agent. So a leaf
+    // must sort first, which is what this pins.
+    expect(sweepSkipOrder([
+      { ticketId: "A", blockedBy: [] },
+      { ticketId: "B", blockedBy: ["A"] },
+      { ticketId: "C", blockedBy: [] },
+      { ticketId: "D", blockedBy: ["B"] },
+    ]).map((r) => r.ticketId)).toEqual(["D", "B", "A", "C"]);
+    // A blocker outside the set is not a dependency we are ordering against, and a
+    // cycle (never valid, never trusted) must not recurse forever.
+    expect(sweepSkipOrder([{ ticketId: "A", blockedBy: ["TEAM-OUTSIDE"] }]).map((r) => r.ticketId)).toEqual(["A"]);
+    expect(sweepSkipOrder([
+      { ticketId: "A", blockedBy: ["B"] },
+      { ticketId: "B", blockedBy: ["A"] },
+    ])).toHaveLength(2);
+  });
+
+  it("says so out loud when the epic is unreadable, rather than passing as done", async () => {
+    h.ticketFail.add("Tickets___get_issue");
+    const res = result(await sweep());
+    // The completion still stands — bookkeeping never holds a completion hostage —
+    // but a sweep that closed nothing must not look like a sweep that had nothing
+    // to close.
+    expect(res.status).toBe("complete");
+    expect(res).not.toHaveProperty("emptySweepSkipped");
+    expect(h.warns.join("\n")).toContain("no siblings were readable");
+    expect(h.warns.join("\n")).toContain("no epic resolved");
+  });
+
+  it("an ordinary completion runs no sweep at all", async () => {
+    h.siblings.push(ticketRow({ key: "TEAM-4643", summary: "Remove the dead modules" }));
+    const res = result(await report({ pr_url: PR_URL }));
+    expect(res).not.toHaveProperty("emptySweepSkipped");
+    expect(calls("Tickets___transition_ticket")).toHaveLength(1);
+    expect(skipRecord("TEAM-4643")).toBeUndefined();
+  });
+});
+
+// ─── TEAM-4740 FR-11: submit_ticket_plan normalization ────────────────────────
+//
+// This tool creates nothing — the agent then calls Tickets___create_ticket per
+// ticket — so the only thing it can fix is the text the agent copies FROM. Two
+// things in that text have cost real runs: a branch name the analyst invented (the
+// devs end up on different branches), and a plan whose first tickets name no
+// blocker at all (the orchestrator dispatches them before the requirements they
+// were planned from are done).
+
+const PLAN = [
+  { title: "Requirements", description: "Analyse the request.", assignee: "agentcore_hub_requirements_analyst", blockedBy: [] },
+  { title: "API work", description: "Build it on feature/my-own-branch-name.", assignee: "agentcore_hub_api_dev", blockedBy: [] },
+  { title: "Spec Approval", description: "Approve the spec.", assignee: "human:product-owner", blockedBy: [] },
+];
+const BRANCH = "feature/TEAM-4100-add-retry";
+
+const plan = (extra) =>
+  handler({
+    tool_name: "WorkflowOutput___submit_ticket_plan",
+    arguments: { workflow_id: "wf_1", epic_id: "TEAM-4100", tickets: JSON.stringify(PLAN), ...extra },
+  });
+/** The persisted plan, parsed. */
+const savedPlan = () => JSON.parse(h.puts.find((p) => p.Key === "workflows/wf_1/shared/ticket-plan.json").Body);
+const planTicket = (tickets, title) => tickets.find((t) => t.title === title);
+
+describe("submit_ticket_plan — FR-11 normalization", () => {
+  beforeEach(() => {
+    h.workflow = { workflowId: "wf_1", featureBranch: BRANCH };
+    h.siblings.push(
+      ticketRow({ key: "TEAM-4101", summary: "Requirements", assignee: "agentcore_hub_requirements_analyst", created: "2026-09-17T09:00:00.000Z" }),
+      ticketRow({ key: "TEAM-4102", summary: "Spec Approval", assignee: "human:product-owner", created: "2026-09-17T08:00:00.000Z" }),
+    );
+  });
+
+  it("parses the JSON-array STRING main.py sends, and fixes ticket_count", async () => {
+    const res = result(await plan());
+    // Was `tickets.length` on a STRING before 4740 — a character count.
+    expect(res.ticket_count).toBe(3);
+    expect(res.tickets).toHaveLength(3);
+    expect(savedPlan().tickets).toHaveLength(3);
+  });
+
+  it("accepts a real array too", async () => {
+    const res = result(await plan({ tickets: PLAN }));
+    expect(res.ticket_count).toBe(3);
+  });
+
+  it("replaces a coined branch name with the run's recorded featureBranch", async () => {
+    const res = result(await plan());
+    const api = planTicket(res.tickets, "API work");
+    expect(api.description).toContain(BRANCH);
+    expect(api.description).not.toContain("feature/my-own-branch-name");
+    expect(res.integration_branch).toBe(BRANCH);
+    // Read from the workflows table, by key, for that one field only.
+    expect(h.workflowGets).toEqual([{
+      TableName: "agentcore-hub-workflows", Key: { workflowId: "wf_1" }, ProjectionExpression: "featureBranch",
+    }]);
+  });
+
+  it("appends the integration-branch note to every description, exactly once", async () => {
+    const res = result(await plan());
+    const note = `Integration branch: ${BRANCH} (orchestrator-provided; do not coin branch names)`;
+    for (const t of res.tickets) expect(t.description).toContain(note);
+    // Re-submitting the normalized plan must not accrete a second copy.
+    const again = result(await plan({ tickets: JSON.stringify(res.tickets) }));
+    for (const t of again.tickets) {
+      expect(t.description.split(note)).toHaveLength(2);
+    }
+  });
+
+  it("blocks every unblocked AGENT ticket on the run's root ticket", async () => {
+    const res = result(await plan());
+    // Root = earliest-created NON-human sibling: the analyst's own ticket. Not the
+    // Spec Approval gate, which was created earlier but is a human's.
+    expect(res.autowired).toEqual({ reason: "no_root_blocker", rootTicketId: "TEAM-4101", tickets: ["API work"] });
+    expect(planTicket(res.tickets, "API work").blockedBy).toEqual(["TEAM-4101"]);
+    // Never the root itself (matched by title), and never a human gate — a gate
+    // waiting on the work it gates is a deadlock.
+    expect(planTicket(res.tickets, "Requirements").blockedBy).toEqual([]);
+    expect(planTicket(res.tickets, "Spec Approval").blockedBy).toEqual([]);
+  });
+
+  it("emits plan.autowired ONCE for the whole plan", async () => {
+    await plan();
+    expect(events("plan.autowired")).toHaveLength(1);
+    expect(events("plan.autowired")[0].detail).toEqual({
+      workflowId: "wf_1", reason: "no_root_blocker", rootTicketId: "TEAM-4101", tickets: ["API work"],
+    });
+  });
+
+  it("leaves an explicit blockedBy alone — the analyst's chain is authoritative", async () => {
+    const res = result(await plan({
+      tickets: JSON.stringify([{ title: "QA", description: "Verify.", assignee: "agentcore_hub_qa_verifier", blockedBy: ["API work"] }]),
+    }));
+    expect(planTicket(res.tickets, "QA").blockedBy).toEqual(["API work"]);
+    expect(res).not.toHaveProperty("autowired");
+    expect(events("plan.autowired")).toHaveLength(0);
+  });
+
+  it("tells the agent the returned plan is the authoritative one", async () => {
+    const res = result(await plan());
+    expect(res.message).toContain("EXACTLY as returned");
+    expect(res.message).toContain("does not create tickets");
+  });
+
+  it("persists what normalization DID, so the plan record is auditable", async () => {
+    await plan();
+    // "No branch was recorded" and "the branch was already right" are different
+    // facts, so each additive key is present only when known.
+    expect(savedPlan()).toMatchObject({
+      epic_id: "TEAM-4100",
+      featureBranch: BRANCH,
+      autowired: { reason: "no_root_blocker", rootTicketId: "TEAM-4101", tickets: ["API work"] },
+    });
+    expect(savedPlan().tickets[1].blockedBy).toEqual(["TEAM-4101"]);
+  });
+
+  it("FAILS OPEN on an unparseable plan: persisted verbatim, nothing normalized", async () => {
+    const res = result(await plan({ tickets: "[{title: 'not json'}" }));
+    expect(res.status).toBe("saved");
+    expect(res.ticket_count).toBeNull();
+    expect(res.warning).toContain("not a JSON array");
+    expect(res).not.toHaveProperty("tickets");
+    // The bytes are what arrived — normalizing half a plan we cannot read would be
+    // worse than leaving it alone.
+    expect(savedPlan().tickets).toBe("[{title: 'not json'}");
+    expect(h.workflowGets).toHaveLength(0);
+  });
+
+  it("FAILS OPEN when the branch is unreadable: no templating, autowire still runs", async () => {
+    h.workflowGetError = Object.assign(new Error("throttled"), { name: "ProvisionedThroughputExceededException" });
+    const res = result(await plan());
+    const api = planTicket(res.tickets, "API work");
+    // The coined name survives — wrong, but recoverable, and the alternative is
+    // refusing a plan over a throttled read.
+    expect(api.description).toContain("feature/my-own-branch-name");
+    expect(res).not.toHaveProperty("integration_branch");
+    expect(api.blockedBy).toEqual(["TEAM-4101"]);
+    expect(h.warns.join("\n")).toContain("branch templating SKIPPED");
+  });
+
+  it("FAILS OPEN when no root sibling resolves: no invented blocker", async () => {
+    // Only a validated real ticket KEY may be inserted — the jira twin refuses a
+    // blocked_by that is not a ticket key outright.
+    h.siblings.length = 0;
+    const res = result(await plan());
+    expect(planTicket(res.tickets, "API work").blockedBy).toEqual([]);
+    expect(res).not.toHaveProperty("autowired");
+  });
+
+  it("skips the sibling scan entirely with no epic_id", async () => {
+    const res = result(await plan({ epic_id: "" }));
+    expect(calls("Tickets___list_tickets")).toHaveLength(0);
+    expect(res.ticket_count).toBe(3);
   });
 });
 

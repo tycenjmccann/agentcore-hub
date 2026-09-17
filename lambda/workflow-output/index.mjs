@@ -10,7 +10,7 @@ import { S3Client, PutObjectCommand, GetObjectCommand, HeadObjectCommand, ListOb
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { LambdaClient, InvokeCommand } from "@aws-sdk/client-lambda";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
-import { DynamoDBDocumentClient, PutCommand } from "@aws-sdk/lib-dynamodb";
+import { DynamoDBDocumentClient, PutCommand, GetCommand } from "@aws-sdk/lib-dynamodb";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const s3 = new S3Client({ region: REGION });
@@ -23,6 +23,12 @@ const TICKET_PROVIDER = process.env.TICKET_PROVIDER || "jira";
 const TICKET_TOOLS_LAMBDA = process.env.TICKET_TOOLS_LAMBDA ||
   (TICKET_PROVIDER === "jira" ? "agentcore-hub-jira" : "agentcore-hub-tickets");
 const EVENTS_TABLE = process.env.EVENTS_TABLE || "agentcore-hub-events";
+// TEAM-4740 FR-11: read-only, and GetItem only. The run's `featureBranch` is the
+// only recorded branch identity, and it is the value that has to reach every
+// ticket description so an analyst never coins a branch name of its own. Unset ⇒
+// templating is skipped, which is why there is no default: a WRONG table name
+// would be indistinguishable from a run with no branch yet.
+const WORKFLOWS_TABLE = process.env.WORKFLOWS_TABLE || "";
 
 async function publishJourneyEvent(workflowId, type, detail) {
   if (!EVENTS_TABLE || !workflowId) return;
@@ -43,20 +49,196 @@ async function publishJourneyEvent(workflowId, type, detail) {
 // TEAM-4589: no s3Key here — main.py's WorkflowOutput___submit_ticket_plan wrapper
 // forwards no `requirements` body at all, so there is no document body to pass by
 // reference; `tickets` is a short JSON array the agent has to author anyway.
-async function submitTicketPlan({ workflow_id, requirements, tickets }) {
+//
+// TEAM-4740 FR-11 — this tool NORMALIZES the plan it persists and returns.
+//
+// It still creates nothing: the agent then calls Tickets___create_ticket once per
+// ticket. So the only thing that can be fixed here is the text the agent copies
+// FROM — the returned plan — which is why the response says "EXACTLY as returned"
+// and why the enforcing half of each rule lives at create time (the twins'
+// autowireOpenGate) rather than here. Advisory, and honest about it.
+//
+// Two things are fixed, both of which cost real runs:
+//   1. Analyst-coined branch names. The orchestrator creates the integration
+//      branch; a plan that names `feature/some-slug-i-made-up` sends three devs
+//      to three different branches. The recorded `featureBranch` replaces every
+//      other feature/… token in every description.
+//   2. A plan whose first tickets have no blockers at all. Nothing depends on the
+//      analyst's own ticket, so the orchestrator dispatches them the moment the
+//      epic exists — before the requirements they were planned from are done.
+async function submitTicketPlan({ workflow_id, epic_id, requirements, tickets }) {
   const key = `workflows/${workflow_id}/shared/ticket-plan.json`;
+  const parsed = parseTicketsArg(tickets);
+
+  // FAIL OPEN, loudly: an unparseable plan is persisted exactly as it arrived and
+  // returned unchanged. Normalizing half of a plan we cannot read would be worse
+  // than leaving it alone, and this tool is not the place to refuse a plan.
+  if (!parsed.ok) {
+    console.warn(`[submit_ticket_plan] ${workflow_id}: tickets is not a JSON array (${parsed.reason}) - persisted verbatim, NOT normalized`);
+    await s3.send(new PutObjectCommand({
+      Bucket: BUCKET, Key: key, Body: JSON.stringify({ requirements, tickets }, null, 2), ContentType: "application/json",
+    }));
+    return {
+      status: "saved",
+      location: `s3://${BUCKET}/${key}`,
+      ticket_count: null,
+      warning: `tickets was not a JSON array (${parsed.reason}), so the plan was persisted verbatim and NOT normalized`,
+      message: `Ticket plan saved as a record. NEXT: you must call Tickets___create_ticket once per ticket to actually create them under the epic in the ticket system. submit_ticket_plan only persists the plan — it does not create tickets.`,
+    };
+  }
+
+  // Both reads fail open to null; each is skipped when its input is missing.
+  const featureBranch = await readFeatureBranch(workflow_id);
+  const rootTicket = epic_id ? findRootTicket(await loadSiblings(epic_id)) : null;
+  const norm = normalizePlan(parsed.items, { featureBranch, rootTicketId: rootTicket?.ticketId || null, rootTitle: rootTicket?.summary || null });
+
+  if (norm.autowired.length > 0) {
+    // ONE event for the whole plan, not one per ticket: the decision was made once,
+    // over the whole plan, and a reader wants the edge set rather than N rows.
+    await publishJourneyEvent(workflow_id, "plan.autowired", {
+      workflowId: workflow_id || null,
+      reason: "no_root_blocker",
+      rootTicketId: rootTicket?.ticketId || null,
+      tickets: norm.autowired,
+    });
+  }
+  if (norm.retargeted.length > 0) {
+    console.log(`[submit_ticket_plan] ${workflow_id}: retargeted ${norm.retargeted.length} coined branch name(s) to ${featureBranch}`);
+  }
+
   await s3.send(new PutObjectCommand({
     Bucket: BUCKET,
     Key: key,
-    Body: JSON.stringify({ requirements, tickets }, null, 2),
+    // Additive keys, and only when known — the persisted plan is the audit trail
+    // for what normalization DID, so a reader can tell "no branch was recorded"
+    // from "the branch was already right".
+    Body: JSON.stringify({
+      requirements,
+      tickets: norm.tickets,
+      ...(epic_id ? { epic_id } : {}),
+      ...(featureBranch ? { featureBranch } : {}),
+      ...(norm.autowired.length > 0 ? { autowired: { reason: "no_root_blocker", rootTicketId: rootTicket?.ticketId || null, tickets: norm.autowired } } : {}),
+    }, null, 2),
     ContentType: "application/json",
   }));
+
   return {
     status: "saved",
     location: `s3://${BUCKET}/${key}`,
-    ticket_count: tickets.length,
-    message: `Ticket plan saved with ${tickets.length} tickets as a record. NEXT: you must call Tickets___create_ticket once per ticket to actually create them under the epic in the ticket system. submit_ticket_plan only persists the plan — it does not create tickets.`,
+    // Was a CHARACTER count before 4740, because `tickets` arrives as a JSON
+    // string from main.py and nothing here parsed it.
+    ticket_count: norm.tickets.length,
+    tickets: norm.tickets,
+    ...(featureBranch ? { integration_branch: featureBranch } : {}),
+    ...(norm.autowired.length > 0 ? { autowired: { reason: "no_root_blocker", rootTicketId: rootTicket?.ticketId || null, tickets: norm.autowired } } : {}),
+    message: `Ticket plan saved with ${norm.tickets.length} tickets as a record. The plan above was NORMALIZED${featureBranch ? ` (integration branch ${featureBranch})` : ""}${norm.autowired.length > 0 ? ` and ${norm.autowired.length} ticket(s) were blocked on ${rootTicket?.ticketId}` : ""}. NEXT: you must call Tickets___create_ticket once per ticket, creating them EXACTLY as returned above — the returned titles, descriptions, assignees and blockedBy are authoritative, not the ones you sent. submit_ticket_plan only persists the plan — it does not create tickets.`,
   };
+}
+
+// ─── TEAM-4740 FR-11: plan normalization ──────────────────────────────────────
+
+/** The note appended to every templated description. */
+export const integrationBranchNote = (branch) =>
+  `Integration branch: ${branch} (orchestrator-provided; do not coin branch names)`;
+
+/**
+ * Any `feature/...` token in a description. Deliberately greedy over branch-legal
+ * characters only, so it stops at whitespace, a closing paren or a backtick and
+ * cannot swallow the rest of a sentence.
+ */
+export const FEATURE_BRANCH_TOKEN_RE = /feature\/[A-Za-z0-9._/-]+/g;
+
+/**
+ * `tickets` off the wire: main.py sends a JSON array STRING (main.py:2418-2432),
+ * a direct Lambda caller may send a real array. Both are accepted; anything else
+ * is reported so the caller path stays fail-open rather than throwing.
+ */
+export function parseTicketsArg(raw) {
+  if (Array.isArray(raw)) return { ok: true, items: raw, reason: null };
+  if (typeof raw !== "string" || !raw.trim()) return { ok: false, items: [], reason: raw === undefined ? "absent" : "not a string or array" };
+  let value;
+  try { value = JSON.parse(raw); } catch (err) { return { ok: false, items: [], reason: `unparseable JSON (${err.message})` }; }
+  if (!Array.isArray(value)) return { ok: false, items: [], reason: `parsed to ${value === null ? "null" : typeof value}, not an array` };
+  return { ok: true, items: value, reason: null };
+}
+
+/**
+ * The run's root ticket: the EARLIEST-created non-human sibling under the epic —
+ * in practice the analyst's own ticket, because the hub creates it first at start.
+ * Every planned ticket that names no blocker is made to wait for it.
+ *
+ * Deliberately the mirror image of findCdTicket (newest ship-phase sibling): same
+ * rows, same fail-to-null discipline, opposite end of the run.
+ */
+export function findRootTicket(siblings) {
+  const candidates = (siblings || []).filter((s) => !isHumanAssignee(s.assignee));
+  if (candidates.length === 0) return null;
+  const sorted = [...candidates].sort((a, b) => (a.createdAt && b.createdAt ? String(a.createdAt).localeCompare(String(b.createdAt)) : 0));
+  return sorted[0];
+}
+
+/**
+ * The normalization itself — pure, so the decision table is testable without S3,
+ * DynamoDB or a ticket Lambda.
+ *
+ * Returns new ticket objects; the caller's array is never mutated (the same array
+ * is also what gets persisted verbatim on the fail-open path).
+ */
+export function normalizePlan(items, { featureBranch, rootTicketId, rootTitle } = {}) {
+  const autowired = [];
+  const retargeted = [];
+  const tickets = (items || []).map((raw) => {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return raw;
+    const t = { ...raw };
+    const title = asText(t.title);
+
+    if (featureBranch && typeof t.description === "string") {
+      let description = t.description.replace(FEATURE_BRANCH_TOKEN_RE, (found) => {
+        if (found === featureBranch) return found;
+        retargeted.push({ title, found });
+        return featureBranch;
+      });
+      // Appended once — a re-submitted plan must not accrete a second copy.
+      if (!description.includes(integrationBranchNote(featureBranch))) {
+        description = `${description.replace(/\s+$/, "")}\n\n${integrationBranchNote(featureBranch)}`;
+      }
+      t.description = description;
+    }
+
+    // Only an AGENT ticket, only when it names no blocker at all, and never the
+    // root itself. A human gate's blockers come from the analyst's explicit chain
+    // — auto-wiring one would make a gate wait on work it is meant to gate.
+    const blockedBy = Array.isArray(t.blockedBy) ? t.blockedBy.filter((b) => asText(b).trim())
+      : asText(t.blockedBy).split(",").map((b) => b.trim()).filter(Boolean);
+    const isRoot = rootTitle && title && title === rootTitle;
+    if (rootTicketId && !isRoot && !isHumanAssignee(t.assignee) && blockedBy.length === 0) {
+      t.blockedBy = [rootTicketId];
+      autowired.push(title || null);
+    } else if (Array.isArray(t.blockedBy)) {
+      t.blockedBy = blockedBy;
+    }
+    return t;
+  });
+  return { tickets, autowired, retargeted };
+}
+
+/**
+ * The run's integration branch, GetItem only, failing open to null.
+ *
+ * The alternative — trusting a branch name on the wire — is the bug: the analyst
+ * is exactly the caller that does not know it.
+ */
+async function readFeatureBranch(workflowId) {
+  if (!WORKFLOWS_TABLE || !workflowId) return null;
+  try {
+    const r = await ddb.send(new GetCommand({
+      TableName: WORKFLOWS_TABLE, Key: { workflowId }, ProjectionExpression: "featureBranch",
+    }));
+    return asText(r?.Item?.featureBranch).trim() || null;
+  } catch (err) {
+    console.warn(`[submit_ticket_plan] ${workflowId}: could not read featureBranch from ${WORKFLOWS_TABLE} (${err.name}: ${err.message}) - branch templating SKIPPED`);
+    return null;
+  }
 }
 
 // ─── save_design_doc: pass-by-reference (TEAM-4589) ────────────────────────────
@@ -206,7 +388,12 @@ async function saveDesignDoc({ workflow_id, agent_id, title, content, format = "
 // closed without it is re-verified at the PR head. Anything else is dropped
 // rather than stored, so a downstream reader never has to guess what a novel
 // value meant.
-const EVIDENCE_KINDS = ["static", "unit", "live"];
+// TEAM-4740 FR-10: `skipped` — the evidence kind of a ticket that was never
+// worked because there was nothing to work on (an empty dead-code sweep skips its
+// own downstream tickets). It must be in this list or the closed-vocabulary check
+// below would drop `evidence_kind` from the very records that carry it. Safe for
+// the one reader that branches on a kind: live-reverify.mjs tests for "live".
+const EVIDENCE_KINDS = ["static", "unit", "live", "skipped"];
 
 // TEAM-4122 FR-4 §7.5 — how the CI agent's completion record proves a head SHA
 // was actually built. "certified" requires a real CodeBuild build id proven
@@ -447,7 +634,12 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   // and for the synthetic ids that have no ticket at all.
   const isSynthetic = !ticket_id || ticket_id.startsWith("HEALTHCHECK-") || ticket_id.startsWith("TEST-");
   const prUrlText = typeof pr_url === "string" ? pr_url.trim() : "";
-  const needsIssue = !isSynthetic && (!prUrlText || followUps.entries.length > 0);
+  // FR-10's skip pass needs the epic too. `!prUrlText` already covers an empty
+  // sweep in practice (it has no PR by definition), but stating it means a sweep
+  // that DID carry a pr_url still finds its siblings instead of silently skipping
+  // nothing.
+  const isEmptySweep = report.outcome === EMPTY_SWEEP_OUTCOME;
+  const needsIssue = !isSynthetic && (!prUrlText || followUps.entries.length > 0 || isEmptySweep);
   let issue = null;
   if (needsIssue) {
     const r = await ticketTool("Tickets___get_issue", { ticket_id });
@@ -497,10 +689,23 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
     observedAt: report.completed_at,
   });
 
-  // The sibling scan, once, shared by the follow-up materializer below (and by
-  // FR-10's empty_sweep skip pass). Skipped entirely when nothing needs it.
+  // The sibling scan, once, shared by the follow-up materializer below and by
+  // FR-10's empty_sweep skip pass. Skipped entirely when nothing needs it.
   const epicKey = issue?.parentKey || null;
-  const siblings = followUps.entries.length > 0 && epicKey ? await loadSiblings(epicKey) : [];
+  const siblings = (followUps.entries.length > 0 || isEmptySweep) && epicKey ? await loadSiblings(epicKey) : [];
+
+  // TEAM-4740 FR-10 — BEFORE the sweeper's own transition, and that is the point.
+  // The sweeper going Done cascades: the orchestrator unblocks and dispatches
+  // whatever was waiting on it. Closing the downstream tickets first means the
+  // cascade finds them already done instead of handing a live agent a ticket for a
+  // diff that does not exist. `emptySweepSkip` never throws (see FAIL DIRECTION
+  // there) so it cannot cost the sweeper its own completion.
+  let emptySweep = null;
+  if (isEmptySweep && siblings.length > 0) {
+    emptySweep = await emptySweepSkip({ siblings, ticketId: ticket_id, workflowId: workflow_id });
+  } else if (isEmptySweep) {
+    console.warn(`[report_completion] ${ticket_id}: outcome empty_sweep but no siblings were readable${epicKey ? ` under ${epicKey}` : " (no epic resolved)"} - nothing skipped`);
+  }
 
   // Transition ticket to Done in Jira — this triggers the webhook cascade
   // (orchestrator unblocks downstream tickets when it sees "done")
@@ -548,6 +753,9 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
     // run has no cd-ledger, so an existing caller's response is unchanged.
     ...(droppedFollowUps.length > 0 ? { droppedFollowUps } : {}),
     ...(followUps.entries.length > 0 ? { followUpsMaterialized: materialized } : {}),
+    // FR-10: in skip ORDER, because the order is the claim being made — a reader
+    // checking the sweep behaved correctly is checking dependents came first.
+    ...(emptySweep ? { emptySweepSkipped: emptySweep.skipped, ...(emptySweep.failed.length > 0 ? { emptySweepFailed: emptySweep.failed } : {}) } : {}),
   };
 }
 
@@ -1005,6 +1213,159 @@ async function loadSiblings(epicKey) {
     return [];
   }
   return normalizeSiblings(r.payload);
+}
+
+// ─── TEAM-4740 FR-10: the empty sweep ─────────────────────────────────────────
+//
+// A dead-code sweep that finds nothing to remove has provably nothing to merge.
+// Before this, such a run had no honest terminal outcome: it either faked a ship
+// or left its downstream tickets (dev, review, CI, QA, ship, CD) sitting there
+// forever waiting for a diff that will never exist. So the sweeper reports
+// `outcome: "empty_sweep"` and CLOSES those tickets itself, each with a completion
+// record that says why — which is the difference between a skipped ticket and a
+// lost one.
+export const EMPTY_SWEEP_OUTCOME = "empty_sweep";
+
+/**
+ * The skip order: dependents BEFORE the tickets they are blocked by.
+ *
+ * This ordering is the whole reason this is a walk and not a loop. Skipping a
+ * ticket transitions it to done, and a done ticket cascades — the orchestrator
+ * looks at its dependents and dispatches any that just became unblocked. Skip a
+ * blocker first and the sweep hands its own dependent to a live agent one tick
+ * before skipping it. Deepest-dependent-first means every ticket is already done
+ * by the time its blocker's cascade looks at it.
+ *
+ * Depth is measured only over IN-SCOPE edges (a blocker outside `rows` — the
+ * analyst's own done ticket, say — is not a dependency we are ordering against).
+ * Cycles cannot happen in a valid plan and are not trusted anyway: a revisited
+ * node contributes depth 0 rather than recursing.
+ */
+export function sweepSkipOrder(rows) {
+  const byId = new Map((rows || []).map((r) => [r.ticketId, r]));
+  const depth = new Map();
+  const measure = (id, seen) => {
+    if (depth.has(id)) return depth.get(id);
+    if (seen.has(id)) return 0;
+    seen.add(id);
+    const row = byId.get(id);
+    const inScope = (row?.blockedBy || []).map((b) => asText(b).trim()).filter((b) => byId.has(b));
+    const d = inScope.length === 0 ? 0 : 1 + Math.max(...inScope.map((b) => measure(b, seen)));
+    seen.delete(id);
+    depth.set(id, d);
+    return d;
+  };
+  for (const r of byId.keys()) measure(r, new Set());
+  // Stable within a depth: the provider's list order (created ASC) is preserved,
+  // so the order is reproducible across two invocations of the same sweep.
+  return [...(rows || [])].sort((a, b) => depth.get(b.ticketId) - depth.get(a.ticketId));
+}
+
+/**
+ * The completion record a skipped ticket gets. It is a real record, not a marker:
+ * the orchestrator's evidence harvest reads `summary` onto the ticket's agentTasks
+ * entry, so the run history shows WHY the ticket has no deliverable, and the ship
+ * -phase DL-030 guard (which requires completions/<id>.json to exist before a
+ * ship ticket may reach done) is satisfied honestly rather than bypassed.
+ */
+export function sweepSkipRecord({ ticketId, workflowId, sweeperTicketId }) {
+  return {
+    ticketId,
+    workflowId: workflowId || null,
+    summary: `Skipped: empty_sweep — no removals found by ${sweeperTicketId}`,
+    evidence_kind: "skipped",
+    skipped: true,
+    reason: EMPTY_SWEEP_OUTCOME,
+  };
+}
+
+/**
+ * Skip one ticket: record FIRST, then the transition.
+ *
+ * That order is load-bearing — the tickets twin refuses `done` on a ship-phase
+ * ticket that has no completion record, so writing the record second would make
+ * the sweep unable to close the very Ship/CD tickets it exists to close.
+ *
+ * The two-step transition is provider shape, not preference: the DynamoDB twin
+ * offers `skip` only from `blocked` (TRANSITIONS, index.mjs), while the Jira twin
+ * maps `skip` → Done from any status. Trying `skip` first therefore costs one
+ * wasted invoke in DynamoDB mode and none in Jira mode, and needs no knowledge of
+ * either provider's status NAMES — which is the part that would rot.
+ */
+async function skipSibling(row, { workflowId, sweeperTicketId }) {
+  const ticketId = row.ticketId;
+  await s3.send(new PutObjectCommand({
+    Bucket: BUCKET,
+    Key: `completions/${ticketId}.json`,
+    Body: JSON.stringify(sweepSkipRecord({ ticketId, workflowId, sweeperTicketId }), null, 2),
+    ContentType: "application/json",
+  }));
+  const reason = `empty_sweep — no removals found by ${sweeperTicketId}`;
+  let r = await ticketTool("Tickets___transition_ticket", { ticket_id: ticketId, transition_id: "skip", reason });
+  if (!r.ok) {
+    console.log(`[report_completion] ${ticketId}: skip needs the blocked state first (${r.error}) - blocking, then skipping`);
+    const blocked = await ticketTool("Tickets___transition_ticket", { ticket_id: ticketId, transition_id: "block", reason });
+    if (!blocked.ok) return { ok: false, error: `block failed: ${blocked.error}` };
+    r = await ticketTool("Tickets___transition_ticket", { ticket_id: ticketId, transition_id: "skip", reason });
+  }
+  return r.ok ? { ok: true, error: null } : { ok: false, error: r.error };
+}
+
+/**
+ * One get_issue per candidate, for `blockedBy` alone.
+ *
+ * Unavoidable: BOTH twins' list_tickets formatters omit blockedBy (the DynamoDB
+ * twin's formatSearchResults returns id/title/status/labels/assignee/phase/
+ * createdAt), and widening either formatter is outside this ticket's ownership
+ * slice. get_issue does return it in both twins. A sweep has ~10 siblings and this
+ * runs only on an empty sweep, so the cost is bounded and rare.
+ *
+ * A row whose read fails keeps `blockedBy: []` — it sorts as a leaf, so it is
+ * skipped early. That is the safe direction: too early only risks a cascade
+ * dispatching a ticket that is about to be skipped anyway, whereas skipping a
+ * blocker too early hands its dependent to a live agent.
+ */
+async function hydrateBlockers(rows) {
+  return Promise.all((rows || []).map(async (row) => {
+    if (row.blockedBy && row.blockedBy.length > 0) return row;
+    const r = await ticketTool("Tickets___get_issue", { ticket_id: row.ticketId });
+    if (!r.ok) {
+      console.warn(`[report_completion] ${row.ticketId}: blockedBy unreadable (${r.error}) - ordered as a leaf`);
+      return row;
+    }
+    const full = normalizeIssue(r.payload);
+    return full ? { ...row, blockedBy: full.blockedBy } : row;
+  }));
+}
+
+/**
+ * The sweep pass. Every not-done, non-human sibling except the sweeper itself.
+ *
+ * FAIL DIRECTION: a failed skip is reported and the walk CONTINUES. Stopping would
+ * leave the run in the worst state of the three — some tickets closed, the rest
+ * open, and no record of which. Human gates are left alone: a human's queue is not
+ * ours to clear.
+ */
+async function emptySweepSkip({ siblings, ticketId, workflowId }) {
+  const candidates = (siblings || []).filter((s) =>
+    s.ticketId && s.ticketId !== ticketId && !isHumanAssignee(s.assignee) && !isDoneStatus(s.status));
+  const ordered = sweepSkipOrder(await hydrateBlockers(candidates));
+  const skipped = [];
+  const failed = [];
+  for (const row of ordered) {
+    try {
+      const r = await skipSibling(row, { workflowId, sweeperTicketId: ticketId });
+      if (r.ok) skipped.push(row.ticketId);
+      else failed.push({ ticketId: row.ticketId, reason: r.error });
+    } catch (err) {
+      failed.push({ ticketId: row.ticketId, reason: `${err.name}: ${err.message}` });
+    }
+  }
+  if (failed.length > 0) {
+    console.error(`[report_completion] ${ticketId}: empty_sweep could not skip ${failed.length} sibling(s) - ${failed.map((f) => `${f.ticketId} (${f.reason})`).join("; ")}`);
+  }
+  console.log(`[report_completion] ${ticketId}: empty_sweep skipped ${skipped.length} sibling(s) in order [${skipped.join(", ")}]`);
+  return { skipped, failed };
 }
 
 /** fix-contract.mjs's KIND_TO_ORIGIN_KEY, for the two kinds used here. */
