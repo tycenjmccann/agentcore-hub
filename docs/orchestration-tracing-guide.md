@@ -278,15 +278,16 @@ The judge quota's expected name pattern is
 **"On-demand InvokeModel requests per minute for Anthropic Claude Opus 4.7"**.
 Record the `QuotaCode` and the current `Value` before requesting anything.
 
-**Step 2 — request an increase to 200 requests/minute.** Design derivation
-(TEAM-3366 §2.5): after the §2.4 load reduction (tiered sampling; the
-5-evaluator trim has since been reverted) the judge runs at roughly ~16 RPM sustained, but two sessions
-completing simultaneously can burst to ~162 RPM — so 200 RPM gives headroom
-without over-asking:
+**Step 2 — request an increase to 400 requests/minute.** Design derivation
+(TEAM-3366 §2.5) for the 5-evaluator trim was ~16 RPM sustained with a
+two-sessions-complete-together burst of ~162 RPM, hence the original 200 RPM
+ask. Judge calls scale linearly with the evaluator count, and the matrix is 10
+evaluators again (the trim was reverted 2026-09-15), so double both figures:
+~32 RPM sustained, ~325 RPM burst — 400 RPM gives the same headroom:
 
 ```bash
 aws service-quotas request-service-quota-increase \
-  --service-code bedrock --quota-code <QuotaCode from above> --desired-value 200
+  --service-code bedrock --quota-code <QuotaCode from above> --desired-value 400
 ```
 
 Track the resulting case with
