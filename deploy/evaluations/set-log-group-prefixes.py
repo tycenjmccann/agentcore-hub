@@ -24,16 +24,8 @@ different runtime name (e.g. "<name>_v2-..."). The trailing "-" is what keeps
 "agentcore_hub_coding_runtime-" from matching "agentcore_hub_coding_runtime_ec2-".
 
 Needs boto3 >= 1.43.96 (the first release whose CloudWatchLogsInputConfig has
-`logGroupNamePrefixes`); the script refuses to run on an older SDK.
-
-`--apply` writes to whatever account the ambient credentials resolve to, so it
-first prints the caller identity and region and makes you confirm. The expected
-account must come from a source INDEPENDENT of those credentials, or the check is
-tautological. In order: `--expect-account`, `$EXPECTED_ACCOUNT_ID`, then
-`EXPECTED_ACCOUNT_ID` in the gitignored repo-root `.env.local` that
-deploy/config.sh sources (read directly, since this script is run as python3 and
-never through config.sh). Never derive it from `aws sts get-caller-identity` —
-that is the value being guarded.
+`logGroupNamePrefixes`); the script refuses to run on an older SDK. See
+eval_config_lib.py for the region, account-guard and settle rules.
 
 Usage (prod profile; dry-run by default):
   AWS_PROFILE=tycenj-prod AWS_REGION=us-east-1 python3 deploy/evaluations/set-log-group-prefixes.py
@@ -47,77 +39,26 @@ import argparse
 import json
 import os
 import re
-import shlex
 import sys
-import time
 
 import boto3
-import botocore.session
 
-# AWS_REGION alone is NOT honored by boto3 when the profile carries its own
-# region (tycenj-prod resolves to us-west-2), so the region is passed explicitly.
-REGION = os.environ.get("AWS_REGION", "us-east-1")
-# deploy/config.sh sources the repo-root .env.local (gitignored) so every deploy
-# script sees the same EXPECTED_ACCOUNT_ID guard. This script is invoked directly
-# as python3, never through config.sh, so it reads that file itself — otherwise an
-# operator whose guard lives only in .env.local silently gets no guard at all.
-ENV_LOCAL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".env.local")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from eval_config_lib import (  # noqa: E402
+    REGION,
+    add_common_args,
+    guard_account,
+    sdk_supports,
+    select_configs,
+    wait_settled,
+)
+
 RUNTIME_LG_PREFIX = "/aws/bedrock-agentcore/runtimes/"
 # <prefix><runtime-name>-<10-char account id>-<endpoint>
 RUNTIME_LG_RE = re.compile(
     r"^(?P<base>/aws/bedrock-agentcore/runtimes/(?P<name>[A-Za-z0-9_]+))-[A-Za-z0-9]{10}-[A-Za-z0-9_]+$"
 )
 MAX_PREFIXES = 5
-# UpdateOnlineEvaluationConfig is asynchronous: it returns while status is
-# UPDATING and can land on UPDATE_FAILED/ERROR afterwards. Reading the config
-# immediately shows the REQUESTED data source, so a failed update would print
-# "applied" while the judge stays on the old exact log group.
-TERMINAL_BAD = {"UPDATE_FAILED", "CREATE_FAILED", "ERROR", "DELETING"}
-SETTLE_TIMEOUT_S = 180
-SETTLE_POLL_S = 5
-
-
-def expected_account_from_env_local(path: str = ENV_LOCAL) -> str | None:
-    """Read EXPECTED_ACCOUNT_ID out of .env.local without executing the file."""
-    try:
-        with open(path, encoding="utf-8") as fh:
-            lines = fh.readlines()
-    except OSError:
-        return None
-    value = None
-    for raw in lines:
-        line = raw.strip()
-        if line.startswith("export "):
-            line = line[len("export "):].strip()
-        if not line.startswith("EXPECTED_ACCOUNT_ID=") or line.startswith("#"):
-            continue
-        # Last assignment wins, matching how a shell would source the file. shlex
-        # handles quoting and trailing comments in one pass — stripping quotes and
-        # "#" separately gets `'123456789012'  # prod` wrong.
-        try:
-            parts = shlex.split(line.split("=", 1)[1], comments=True)
-        except ValueError:
-            continue
-        value = parts[0] if parts else None
-    return value or None
-
-
-def sdk_supports_prefixes() -> bool:
-    model = botocore.session.get_session().get_service_model("bedrock-agentcore-control")
-    return "logGroupNamePrefixes" in model.shape_for("CloudWatchLogsInputConfig").members
-
-
-def list_configs(control) -> list[dict]:
-    out, token = [], None
-    while True:
-        kw = {"maxResults": 50}
-        if token:
-            kw["nextToken"] = token
-        page = control.list_online_evaluation_configs(**kw)
-        out.extend(page.get("onlineEvaluationConfigs", []))
-        token = page.get("nextToken")
-        if not token:
-            return out
 
 
 def list_runtime_log_groups(logs) -> list[str]:
@@ -155,21 +96,6 @@ def collision(prefix: str, all_groups: list[str]) -> list[str]:
     return bad
 
 
-def wait_settled(control, cid: str) -> dict:
-    """Poll until status leaves UPDATING. Raises on a terminal failure/timeout."""
-    deadline = time.monotonic() + SETTLE_TIMEOUT_S
-    while True:
-        cfg = control.get_online_evaluation_config(onlineEvaluationConfigId=cid)
-        status = cfg.get("status")
-        if status in TERMINAL_BAD:
-            raise RuntimeError(f"status={status} failureReason={cfg.get('failureReason') or '(none)'}")
-        if status == "ACTIVE":
-            return cfg
-        if time.monotonic() >= deadline:
-            raise RuntimeError(f"still {status} after {SETTLE_TIMEOUT_S}s — check the console before re-running")
-        time.sleep(SETTLE_POLL_S)
-
-
 def snapshot(cfg: dict) -> dict:
     """The fields that must NOT change when only the data source is updated."""
     return {
@@ -184,57 +110,25 @@ def snapshot(cfg: dict) -> dict:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--apply", action="store_true", help="write the change (default: dry-run)")
+    add_common_args(ap)
     ap.add_argument("--config-id", action="append", default=[], help="limit to these config ids")
-    ap.add_argument(
-        "--expect-account",
-        default=os.environ.get("EXPECTED_ACCOUNT_ID") or expected_account_from_env_local(),
-        help="account id the credentials must resolve to (default: $EXPECTED_ACCOUNT_ID, else "
-        "EXPECTED_ACCOUNT_ID in the gitignored .env.local that deploy/config.sh sources); "
-        "skips the --apply confirmation prompt",
-    )
     args = ap.parse_args()
 
-    if not sdk_supports_prefixes():
+    if not sdk_supports("CloudWatchLogsInputConfig", "logGroupNamePrefixes"):
         print("ERROR: this boto3/botocore predates logGroupNamePrefixes. pip install -U boto3 (>= 1.43.96) and re-run.")
         return 2
 
-    identity = boto3.client("sts", region_name=REGION).get_caller_identity()
-    account = identity["Account"]
-    if args.expect_account and args.expect_account != account:
-        print(f"ERROR: credentials resolve to account {account}, expected {args.expect_account} — refusing.")
-        return 2
-    if args.apply and not args.expect_account:
-        print(f"About to UPDATE online evaluation configs in account {account}, region {REGION}")
-        print(f"  caller: {identity['Arn']}")
-        if not sys.stdin.isatty():
-            print(
-                "ERROR: --apply needs a TTY to confirm, or an expected account from a source independent "
-                "of these credentials ($EXPECTED_ACCOUNT_ID or --expect-account). Refusing."
-            )
-            return 2
-        if input(f"Type the account id to continue: ").strip() != account:
-            print("account id did not match — nothing was changed.")
-            return 2
-    print(f"account {account} / region {REGION}\n")
+    account, rc = guard_account(args.apply, args.expect_account)
+    if rc is not None:
+        return rc
 
     control = boto3.client("bedrock-agentcore-control", region_name=REGION)
     logs = boto3.client("logs", region_name=REGION)
     all_groups = list_runtime_log_groups(logs)
 
-    configs = list_configs(control)
-    if args.config_id:
-        live = {c["onlineEvaluationConfigId"] for c in configs}
-        # A misspelled or deleted id must not be silently dropped: it would look
-        # like that config was handled when it was never touched.
-        unknown = [cid for cid in args.config_id if cid not in live]
-        if unknown:
-            print(f"ERROR: no such online evaluation config in account {account}: {unknown}")
-            return 2
-        configs = [c for c in configs if c["onlineEvaluationConfigId"] in set(args.config_id)]
-    if not configs:
-        print("no online evaluation configs found")
-        return 1
+    configs, rc = select_configs(control, args.config_id, account)
+    if rc is not None:
+        return rc
 
     changed = skipped = refused = 0
     for summary in configs:

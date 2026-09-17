@@ -130,6 +130,21 @@ CUSTOM_EVALUATOR="dependency_chain_compliance_online_v3-M1N0o94Jsa"
 # is applied (covered by the healthy-batch precondition above).
 # -----------------------------------------------------------------------------
 
+# --- Auditing the live matrix (2026-09-17) ----------------------------------
+# Configs are created once and then drift silently: a re-run SKIPS every config
+# that already exists, so a config minted with a stale evaluator set keeps it
+# forever. deploy/evaluations/audit-eval-matrix.py diffs every live config
+# against the matrix defined above (it reads CUSTOM_EVALUATOR and TICKET_AGENTS
+# from THIS file, so the two cannot disagree) and repairs the difference:
+#
+#   AWS_REGION=... python3 deploy/evaluations/audit-eval-matrix.py           # report
+#   AWS_REGION=... python3 deploy/evaluations/audit-eval-matrix.py --apply   # repair
+#
+# It sends only `evaluators`, asserts nothing else changed, and REFUSES to reduce
+# a config's evaluator count — shrinking the matrix is an operator decision.
+# First run found 3 of 8 drifted (see eval-config-ids.json notes.matrix_drift_audit).
+# -----------------------------------------------------------------------------
+
 # --- Reconciling live configs after a matrix/sampling change (TEAM-3376) ---
 # `agentcore eval online create` does not update in place: re-running this
 # script against an account that already has configs SKIPS every existing
