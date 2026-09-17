@@ -187,12 +187,106 @@ Your context always carries a `## Delivery Mode` block, derived from the hub's
   ("Delivery: handoff — PR for the owning team") so downstream agents plan their
   evidence for a human reviewer on the PR.
 
+### Step 2d: CI proof path + Deploy-approval path (REQUIRED sections in every requirements doc)
+
+Two questions have stalled runs for tens of hours because nobody answered them
+at intake: how a head SHA gets PROVEN green, and who is allowed to approve the
+deploy. Both are answerable now, with tools you already hold. Every requirements
+doc carries both sections, filled in with real values — "TBD" in either is an
+invalid doc.
+
+**1. `## CI proof path` (REQUIRED).** State concretely:
+- the CodeBuild project that certifies the head: `ci_project` from the
+  `## Pipeline Mode` block in your context (e.g. `agentcore-hub-ci`). No
+  `## Pipeline Mode` block → say so, and say the run has no CodeBuild
+  certification path.
+- how a build is proven against a head SHA:
+  `Pipeline___start_ci_build(commit_sha=<head>, project=<ci_project>)`, then
+  `Pipeline___get_build_status(commit_sha=<head>, project=<ci_project>)`, and the
+  proof is `succeededForCommit` with the match's `resolvedSourceVersion` equal to
+  that head. "The latest build is green" is not proof of anything.
+- that GitHub check-runs alone are `github-actions-proxy` and NEVER
+  certification — the `ci_status` enum is
+  `certified | github-actions-proxy | unverified`
+  (`lambda/workflow-output/index.mjs:216`); only a CodeBuild build id matched to
+  the head is `certified`.
+- what the doc records for CI UNAVAILABLE: when CI is unavailable the CI agent
+  files ONE `gate:ci-unavailable` gate ticket labelled `head:<sha>` with a remedy
+  list — never a `github-actions-proxy` certification, and never a second gate
+  for the same head (the ticket Lambda refuses it: `gate_loop_environmental`).
+  Labels are stored normalized (`gate-ci-unavailable`, `head-<40hex>`). CI is
+  unavailable when `Pipeline___capabilities` reports
+  `targets[].startCiBuild: false`, or `start_ci_build` refuses with
+  `start_build_not_granted`. The filing mechanics live in
+  `blueprints/ci-agent.md` — point at them, do not restate them.
+- the repo's CI TRIGGER contract, established by YOU at intake: does the
+  PR-check webhook fire when a PR is opened? is it gated on an approval the bot
+  cannot give? is
+  `Pipeline___capabilities(pipeline_name).targets[].startCiBuild` true for THIS
+  repo's entry (read your own `pipeline_name`'s entry — the flat top-level keys
+  describe the Lambda's env-default target, not this repo's)? Record each answer
+  with the tool output it came from. (juno run `37ule1` cost 31 h because all
+  three were discoverable at intake and nobody looked.)
+
+**2. `## Deploy-approval path` (REQUIRED).** Read
+`Pipeline___capabilities(pipeline_name)` and the `## Delivery Mode` block, then
+state:
+- `approveDeploy` — always `false`, by design: the `Pipeline___*` tools Lambda
+  holds no `PutApprovalResult` and is not going to
+  (`lambda/agentcore-hub-pipeline-tools/index.mjs:2248`). It is a TOP-LEVEL key,
+  not a per-target one.
+- pipeline + region from `Pipeline___capabilities(pipeline_name).targets[]` —
+  each entry carries `repo`, `pipeline`, `region`, `ciProject`, `buildProject`,
+  `deployProject`, `startCiBuild`. Read YOUR OWN `pipeline_name`'s entry; the flat
+  top-level keys describe the Lambda's env-default target, not this repo's.
+  `pipeline_name` / `pipeline_region` / `ci_project` in `## Pipeline Mode` carry
+  the same values.
+- CD-registered vs handoff, from `## Delivery Mode` (`CD_REGISTERED`, Step 2c).
+  The registry is `src/config/cd-registry.json` (checked-in seed; served from S3
+  key `config/cd-registry.json`), parsed by `cd-registry.mjs` — a runtime
+  allow-list, not intake config.
+- who approves and through which channel: the release manager files ONE
+  `gate:deploy-approval` ticket per pipeline execution, and the human's ✅ in
+  Telegram is what calls `PutApprovalResult` through the bridge (DL-030,
+  `docs/architecture.md:859`; PR #618). Console fallback:
+  `https://console.aws.amazon.com/codesuite/codepipeline/pipelines/<pipeline>/view?region=<region>`
+  (the region-hosted `https://<region>.console.aws.amazon.com/...` form is
+  equivalent).
+- explicitly: `PutApprovalResult` is BRIDGE-ONLY and nothing is auto-approved —
+  the deploy gate is conditional, never approved by software (DL-028,
+  `docs/architecture.md:824`). A doc that plans "merge auto-deploys" is wrong.
+
+**3. RISK FLAGS — raise each one that applies, in the doc AND in the ticket it
+lands on:**
+- **Runtime-image change** ⇒ the deployed target cannot be verified before CD.
+  Pre-CD evidence is `unit` at best; the deployed-target check is a FOLLOW-UP
+  ticket whose `blocked_by` is the CD ticket (run `15x8ql`).
+- **New persisted state** — a row or item, a claim/lease marker, an S3 marker
+  object, a NEW FIELD on an existing row, a label family used as state ⇒ the fix
+  owes a lifecycle table: WRITERS / READERS / DELETE-OR-EXPIRE / ORDERING, one
+  test per row. Say so in the ticket (TEAM-4660).
+- **Lambda contract change** ⇒ the CALLER changes in the SAME PR: the
+  `deploy/runtime-agent/main.py` tool signature and/or the blueprint that
+  documents the call, with a name-parity test in the shape of
+  `src/lib/workflow/completion-evidence-parity.test.ts` /
+  `src/lib/workflow/fix-contract-parity.test.ts` (run `syq0p9`, PR #618).
+
+**4. Never coin an integration-branch name.** The orchestrator creates
+`feature/<epicId>-<slug>` and templates it into every ticket's `## Branch`
+block. Call it "the orchestrator-created integration branch" — a literal name of
+your own making sends agents to a branch that does not exist (runs `xgf0dt`,
+`37ule1`).
+
+Anything in either section that is about VERIFYING behaviour points at
+`load_blueprint("qa-checklist")`. The hub has ONE verification standard and this
+doc does not restate it (DL-029).
+
 ### Step 3: Delegate to Claude Code
 Call `claude_code` to produce the requirements document and agent selection:
 
 ```
 claude_code(
-    task="Produce a requirements document for [feature].\n\nContext:\n[what you found in repo/Jira]\n\nFeature Request:\n[paste ticket description]\n\nScope: [MODIFY EXISTING / NET NEW]\nExisting Code: [file paths]\n\nProduce:\n1. Functional requirements with testable acceptance criteria\n2. Agent selection (which agents need tickets) with justification for each\n3. Ticket plan with dependency chain\n\nRules:\n- Default DENY on agent selection — justify every agent included\n- iOS/Android designers ONLY for native mobile apps\n- Security reviewer ONLY if auth/credentials/user data involved\n- Legal ONLY if new data collection or consent changes\n- Assignees: use the exact agent IDs below as the `assignee` (these match the IDs in the `Tickets___create_ticket` tool description; any other value is rejected).\n- Dependency chain (THREE tiers, not two):\n  TIER 1 — Primary designers (blocked_by=none, run immediately after requirements):\n    agentcore_hub_frontend_designer, agentcore_hub_backend_designer, agentcore_hub_ios_designer, agentcore_hub_android_designer\n  TIER 2 — Reviewers (blocked_by=ALL Tier 1 ticket IDs that were created):\n    agentcore_hub_security_reviewer, agentcore_hub_legal_compliance, agentcore_hub_analytics_designer, agentcore_hub_localization\n    These agents REVIEW design outputs — they MUST wait for designs to complete.\n  TIER 3 — Dev agents (blocked_by=ALL Tier 1 + Tier 2 ticket IDs):\n    agentcore_hub_backend_dev, agentcore_hub_api_dev, agentcore_hub_frontend_dev\n    ONE ticket per dev agent, scoped to that agent's whole surface (frontend / backend / api). NEVER split one agent's work into multiple parallel tickets — parallel sessions of the same agent race each other on the same code and produce conflicting PRs. If a surface is genuinely too big for one ticket, chain the extra tickets serially (blocked_by=the previous ticket for that agent).\n  TIER 4 — Code review (blocked_by=ALL Tier 3 dev ticket IDs):\n    agentcore_hub_code_reviewer — reviews the dev branch adversarially (races, eventual consistency, null/empty, error paths, security) and files fix tickets. ALWAYS include exactly one, gated on the dev tickets.\n  TIER 5 — CI (blocked_by=the agentcore_hub_code_reviewer ticket ID):\n    agentcore_hub_ci_agent — syncs the default branch into the integration branch and certifies the head on the CodeBuild PR-check (ci_status in its completion record). CI runs BEFORE QA so QA reads one certified build instead of re-running the mechanical build/test suite.\n  TIER 6 — Verification (blocked_by=the agentcore_hub_ci_agent ticket ID):\n    agentcore_hub_qa_verifier — judgment work only (visual, live integration, perf, acceptance); the compile/test proof comes from the Tier 5 completion record.\n  TIERS 7-8 apply ONLY when `## Delivery Mode` in your context says CD_REGISTERED: true (the repo is in the hub's CD registry and agentcore_hub_release_manager appears in ## Available Agents). When it says CD_REGISTERED: false, the chain ENDS at Tier 6 — create NO Ship, NO Merge Approval and NO CD ticket: the hub does not merge or deploy that repo; the orchestrator opens the unified PR at completion and leaves it open for the owning team.\n  TIER 7 — Ship (blocked_by=the agentcore_hub_qa_verifier ticket ID) [CD_REGISTERED: true only]:\n    agentcore_hub_release_manager — ONE ticket, title 'Ship: {feature}'. Opens the unified PR and reviews the final assembled diff.\n  MERGE GATE [CD_REGISTERED: true only] — the 'Merge Approval' human-review ticket from ## Human Review Gates MUST be blocked_by the Tier 7 ticket.\n  TIER 8 — CD (blocked_by=the Merge Approval gate ticket ID) [CD_REGISTERED: true only]:\n    agentcore_hub_release_manager — ONE ticket, title 'CD: {feature}'. Merges the approved PR and deploys per the target repo's DEPLOY.md (or through the named pipeline when ## Pipeline Mode is present). NEVER parallel with the Tier 7 ticket — always chained through the gate.\n- ADVISORY tickets (Step 2) are NOT part of this chain and belong to no tier: each has labels='advisory', blocked_by='' and no spawned_by_kind, and NO ticket in the chain may list an advisory ticket in its blocked_by. They are backlog for the owning agent, delivered on their own branch against the repo default branch — never a link the run waits on.\n- CRITICAL: Never set blocked_by='' for reviewers. They produce garbage without design context.\n- EXTERNAL-API WORK: paste the authoritative reference facts from Step 2b (source URLs + exact endpoint, auth scheme, secret name, model ids, message/event/tool schema) into every design and dev ticket that touches the integration, and require the dev to build ONLY against those verified facts — never a guessed protocol."
+    task="Produce a requirements document for [feature].\n\nContext:\n[what you found in repo/Jira]\n\nFeature Request:\n[paste ticket description]\n\nScope: [MODIFY EXISTING / NET NEW]\nExisting Code: [file paths]\n\nProduce:\n1. Functional requirements with testable acceptance criteria\n2. Agent selection (which agents need tickets) with justification for each\n3. Ticket plan with dependency chain\n4. A '## CI proof path' section per Step 2d: the ci_project that certifies the head; the Pipeline___start_ci_build → Pipeline___get_build_status proof (succeededForCommit with resolvedSourceVersion == the head SHA), never 'the latest build is green'; that GitHub check-runs alone are github-actions-proxy and never certification (lambda/workflow-output/index.mjs:216); that when CI is unavailable the CI agent files ONE gate:ci-unavailable gate ticket labelled head:<sha> with a remedy list — never a github-actions-proxy certification, and never a second gate for the same head (the ticket Lambda refuses it: gate_loop_environmental), with the filing mechanics left to blueprints/ci-agent.md; and the repo's CI trigger contract (does the PR check fire on PR open? is it gated on an approval a bot cannot give? is targets[].startCiBuild true for THIS repo's pipeline entry?)\n5. A '## Deploy-approval path' section per Step 2d: approveDeploy (always false by design, a top-level key), pipeline + region from Pipeline___capabilities(pipeline_name).targets[] (repo, pipeline, region, ciProject, buildProject, deployProject, startCiBuild) for THIS repo's entry, CD-registered vs handoff from ## Delivery Mode citing src/config/cd-registry.json (checked-in seed; served from S3 key config/cd-registry.json) parsed by cd-registry.mjs, the gate:deploy-approval ticket whose Telegram ✅ calls PutApprovalResult through the bridge (bridge-only, nothing auto-approved), and the console fallback URL https://console.aws.amazon.com/codesuite/codepipeline/pipelines/<pipeline>/view?region=<region>\n6. The Step 2d RISK FLAGS that apply: runtime-image change ⇒ deployed-target verification only post-CD, as a follow-up ticket blocked_by the CD ticket; new persisted state ⇒ a lifecycle table (WRITERS / READERS / DELETE-OR-EXPIRE / ORDERING, one test per row); Lambda contract change ⇒ the caller (deploy/runtime-agent/main.py signature and/or the blueprint documenting the call) changes in the SAME PR with a name-parity test\n\nRules:\n- Default DENY on agent selection — justify every agent included\n- iOS/Android designers ONLY for native mobile apps\n- Security reviewer ONLY if auth/credentials/user data involved\n- Legal ONLY if new data collection or consent changes\n- Assignees: use the exact agent IDs below as the `assignee` (these match the IDs in the `Tickets___create_ticket` tool description; any other value is rejected).\n- Dependency chain (THREE tiers, not two):\n  TIER 1 — Primary designers (blocked_by=none, run immediately after requirements):\n    agentcore_hub_frontend_designer, agentcore_hub_backend_designer, agentcore_hub_ios_designer, agentcore_hub_android_designer\n  TIER 2 — Reviewers (blocked_by=ALL Tier 1 ticket IDs that were created):\n    agentcore_hub_security_reviewer, agentcore_hub_legal_compliance, agentcore_hub_analytics_designer, agentcore_hub_localization\n    These agents REVIEW design outputs — they MUST wait for designs to complete.\n  TIER 3 — Dev agents (blocked_by=ALL Tier 1 + Tier 2 ticket IDs):\n    agentcore_hub_backend_dev, agentcore_hub_api_dev, agentcore_hub_frontend_dev\n    ONE ticket per dev agent, scoped to that agent's whole surface (frontend / backend / api). NEVER split one agent's work into multiple parallel tickets — parallel sessions of the same agent race each other on the same code and produce conflicting PRs. If a surface is genuinely too big for one ticket, chain the extra tickets serially (blocked_by=the previous ticket for that agent).\n  TIER 4 — Code review (blocked_by=ALL Tier 3 dev ticket IDs):\n    agentcore_hub_code_reviewer — reviews the dev branch adversarially (races, eventual consistency, null/empty, error paths, security) and files fix tickets. ALWAYS include exactly one, gated on the dev tickets.\n  TIER 5 — CI (blocked_by=the agentcore_hub_code_reviewer ticket ID):\n    agentcore_hub_ci_agent — syncs the default branch into the integration branch and certifies the head on the CodeBuild PR-check (ci_status in its completion record). CI runs BEFORE QA so QA reads one certified build instead of re-running the mechanical build/test suite.\n  TIER 6 — Verification (blocked_by=the agentcore_hub_ci_agent ticket ID):\n    agentcore_hub_qa_verifier — judgment work only (visual, live integration, perf, acceptance); the compile/test proof comes from the Tier 5 completion record.\n  TIERS 7-8 apply ONLY when `## Delivery Mode` in your context says CD_REGISTERED: true (the repo is in the hub's CD registry and agentcore_hub_release_manager appears in ## Available Agents). When it says CD_REGISTERED: false, the chain ENDS at Tier 6 — create NO Ship, NO Merge Approval and NO CD ticket: the hub does not merge or deploy that repo; the orchestrator opens the unified PR at completion and leaves it open for the owning team.\n  TIER 7 — Ship (blocked_by=the agentcore_hub_qa_verifier ticket ID) [CD_REGISTERED: true only]:\n    agentcore_hub_release_manager — ONE ticket, title 'Ship: {feature}'. Opens the unified PR and reviews the final assembled diff.\n  MERGE GATE [CD_REGISTERED: true only] — the 'Merge Approval' human-review ticket from ## Human Review Gates MUST be blocked_by the Tier 7 ticket.\n  TIER 8 — CD (blocked_by=the Merge Approval gate ticket ID) [CD_REGISTERED: true only]:\n    agentcore_hub_release_manager — ONE ticket, title 'CD: {feature}'. Merges the approved PR and deploys per the target repo's DEPLOY.md (or through the named pipeline when ## Pipeline Mode is present). NEVER parallel with the Tier 7 ticket — always chained through the gate.\n- ADVISORY tickets (Step 2) are NOT part of this chain and belong to no tier: each has labels='advisory', blocked_by='' and no spawned_by_kind, and NO ticket in the chain may list an advisory ticket in its blocked_by. They are backlog for the owning agent, delivered on their own branch against the repo default branch — never a link the run waits on.\n- CRITICAL: Never set blocked_by='' for reviewers. They produce garbage without design context.\n- EXTERNAL-API WORK: paste the authoritative reference facts from Step 2b (source URLs + exact endpoint, auth scheme, secret name, model ids, message/event/tool schema) into every design and dev ticket that touches the integration, and require the dev to build ONLY against those verified facts — never a guessed protocol.\n- NEVER coin an integration-branch name: the orchestrator creates feature/<epicId>-<slug> and templates it into every ticket. Refer to 'the orchestrator-created integration branch', never a literal feature/... name of your own making.\n- Anything about VERIFYING behaviour points at load_blueprint(\"qa-checklist\") — do not restate verification rules in the requirements doc."
 )
 ```
 
@@ -241,3 +335,13 @@ a full duplicate set of tickets that wedges the whole run:
   A stall, loop or missed hand-off is a blueprint fix — the agent parks itself
   with `Tickets___transition_ticket(blocked_by=…)` or files a ticket — or a
   `Tickets___*` / `WorkflowOutput___*` tool change. Write the ticket that way.
+- Every requirements doc carries a `## CI proof path` and a `## Deploy-approval
+  path` section with real values from `Pipeline___capabilities` + `## Pipeline
+  Mode` + `## Delivery Mode` (Step 2d). "TBD" in either is an invalid doc.
+- Raise the Step 2d RISK FLAGS that apply: runtime-image change ⇒ post-CD
+  follow-up ticket `blocked_by` the CD ticket; new persisted state ⇒ a lifecycle
+  table (WRITERS / READERS / DELETE-OR-EXPIRE / ORDERING, a test per row); Lambda
+  contract change ⇒ the caller + a name-parity test in the SAME PR.
+- Never coin an integration-branch name — the orchestrator creates
+  `feature/<epicId>-<slug>` and templates it into every ticket. Say "the
+  orchestrator-created integration branch".
