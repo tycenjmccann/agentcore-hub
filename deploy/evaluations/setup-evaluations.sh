@@ -130,6 +130,21 @@ CUSTOM_EVALUATOR="dependency_chain_compliance_online_v3-M1N0o94Jsa"
 # is applied (covered by the healthy-batch precondition above).
 # -----------------------------------------------------------------------------
 
+# --- Auditing the live matrix (2026-09-17) ----------------------------------
+# Configs are created once and then drift silently: a re-run SKIPS every config
+# that already exists, so a config minted with a stale evaluator set keeps it
+# forever. deploy/evaluations/audit-eval-matrix.py diffs every live config
+# against the matrix defined above (it reads CUSTOM_EVALUATOR and TICKET_AGENTS
+# from THIS file, so the two cannot disagree) and repairs the difference:
+#
+#   AWS_REGION=... python3 deploy/evaluations/audit-eval-matrix.py           # report
+#   AWS_REGION=... python3 deploy/evaluations/audit-eval-matrix.py --apply   # repair
+#
+# It sends only `evaluators`, asserts nothing else changed, and REFUSES to reduce
+# a config's evaluator count — shrinking the matrix is an operator decision.
+# First run found 3 of 8 drifted (see eval-config-ids.json notes.matrix_drift_audit).
+# -----------------------------------------------------------------------------
+
 # --- Reconciling live configs after a matrix/sampling change (TEAM-3376) ---
 # `agentcore eval online create` does not update in place: re-running this
 # script against an account that already has configs SKIPS every existing
@@ -158,6 +173,23 @@ CUSTOM_EVALUATOR="dependency_chain_compliance_online_v3-M1N0o94Jsa"
 # The whole procedure is idempotent: a config that already matches the
 # expected shape is left alone, and re-running create for a deleted name just
 # mints a fresh account-suffixed id.
+# -----------------------------------------------------------------------------
+
+# --- Input log groups: prefixes, not exact names (2026-09-17) ---------------
+# `agentcore eval online create --agent-id` pins the runtime's exact log group
+# ("/aws/bedrock-agentcore/runtimes/<name>-<id>-DEFAULT"). Recreate the runtime
+# and that config keeps watching the dead group — the judge goes dark with no
+# error anywhere. Every live config was therefore switched to
+# dataSourceConfig.cloudWatchLogs.logGroupNamePrefixes
+# ("/aws/bedrock-agentcore/runtimes/<name>-"), which follows the runtime across
+# recreation; serviceNames still narrows the traces. This script does not do
+# that itself (the toolkit CLI has no prefix flag) — after it creates configs run:
+#
+#   AWS_REGION=... python3 deploy/evaluations/set-log-group-prefixes.py          # dry-run
+#   AWS_REGION=... python3 deploy/evaluations/set-log-group-prefixes.py --apply
+#
+# It changes ONLY the data source and asserts evaluators/sampling/output/role
+# came back unchanged. Needs boto3 >= 1.43.96.
 # -----------------------------------------------------------------------------
 
 # --- Eval judge throttling (quota) — OPERATOR action, NOT CI ---------------
@@ -374,5 +406,34 @@ if [ -n "$FAILED_CONFIGS" ]; then
   echo ""
   echo "✗ Online eval config creation FAILED for:${FAILED_CONFIGS}"
   echo "  (See per-agent errors above.) This step did not fully succeed."
+  exit 1
+fi
+
+# --- Post-create: prefix migration + matrix audit ---------------------------
+# `agentcore eval online create` pins each config to the runtime's EXACT log
+# group, which dies with the runtime id (see the input-log-groups block above).
+# Migrating is part of provisioning, not an optional follow-up: a config left on
+# an exact name is one runtime recreation away from a silently dark judge. Both
+# steps run here so /setup and DEPLOY.md get them without a separate manual step,
+# and a failure fails this script.
+echo ""
+echo "→ Migrating input log groups to prefixes..."
+if ! python3 "${REPO_ROOT}/deploy/evaluations/set-log-group-prefixes.py" --apply; then
+  echo ""
+  echo "✗ Prefix migration FAILED. The configs above may still pin an exact log"
+  echo "  group name and will stop being evaluated if their runtime is recreated."
+  echo "  Most likely cause: boto3 predates logGroupNamePrefixes (needs >= 1.43.96)"
+  echo "  — upgrade it and re-run set-log-group-prefixes.py --apply."
+  exit 1
+fi
+
+# Report-only: the configs were just created from the matrix above, so drift here
+# means this script and the live account disagree. Repair with --apply.
+echo ""
+echo "→ Auditing the evaluator matrix..."
+if ! python3 "${REPO_ROOT}/deploy/evaluations/audit-eval-matrix.py"; then
+  echo ""
+  echo "✗ Live configs do not match the evaluator matrix (see the diff above)."
+  echo "  Repair with: python3 deploy/evaluations/audit-eval-matrix.py --apply"
   exit 1
 fi

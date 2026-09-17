@@ -1,6 +1,6 @@
 {
   "created": "2026-05-22",
-  "updated": "2026-09-15",
+  "updated": "2026-09-17",
   "sampling_rate": "100% on the shared fleet runtime (it hosts requirements_analyst, qa_verifier and ci_agent, the gate roles) and on those three when they own a runtime; 25% for other dedicated-runtime agents. Tiers apply to NEW configs created by setup-evaluations.sh only.",
   "judge_model": "us.anthropic.claude-opus-5",
   "evaluators": [
@@ -17,12 +17,13 @@
   ],
   "custom_evaluators": {
     "dependency_chain_compliance_online": "dependency_chain_compliance_online_v3-M1N0o94Jsa",
-    "dependency_chain_compliance_online_previous": "dependency_chain_compliance_online-mbLh2kEFhw (locked, superseded 2026-09-10; still attached nowhere — delete when convenient)",
+    "dependency_chain_compliance_online_previous": "dependency_chain_compliance_online-mbLh2kEFhw (locked, superseded 2026-09-10; was still ATTACHED to eval_agentcore_hub_builder and eval_agentcore_hub_routine_builder until 2026-09-17, which scored both against a rubric they are out of scope for and kept the evaluator locked against deletion. deploy/evaluations/audit-eval-matrix.py detached it; now attached nowhere — safe to delete.)",
     "dependency_chain_compliance_ondemand": "dependency_chain_compliance-VyBv7H2bCi",
     "_note": "PR #496 (2026-09-10): rubric moved to dev -> [code_reviewer] -> CI -> QA. The live evaluator was LOCKED (attached to an online config), so in-place update was refused; created _v3 from the merged JSON and swapped it into eval_agentcore_hub_requirements_analyst-HbkURg7M1P via update-online-evaluation-config (only that config touched). Earlier: TEAM-3103: dependency_chain_evaluator.json rubric corrected to route QA through code_reviewer (design -> dev -> code_reviewer -> qa_verifier -> ci/security), matching the actual pipeline. Applied via in-place 'agentcore eval evaluator update' where the IDs above are unchanged. If the evaluator was instead recreated (new account-generated ID), refresh the IDs above and CUSTOM_EVALUATOR in setup-evaluations.sh — see that script's re-registration comment block."
   },
   "_configs_note": "Snapshot only — not load-bearing. The '-XXXX' suffixes are account-specific and regenerated on each setup-evaluations.sh run; consumers read evalConfigName from agents.json, which refresh-agents-json.sh repopulates by querying live CW log groups. Keys use the canonical long form 'eval_<agentId>' (e.g. eval_agentcore_hub_requirements_analyst), matching what setup-evaluations.sh creates.",
   "_reapply_note": "Live configs carry the 10-evaluator matrix. Sampling tiers (TEAM-3376) are still encoded in setup-evaluations.sh for NEW configs only; existing configs are skipped on re-run and keep their own rule.",
+  "_data_source_note": "2026-09-17: every live config selects its input by logGroupNamePrefixes ('/aws/bedrock-agentcore/runtimes/<runtime-name>-'), not an exact logGroupNames entry, so a recreated runtime (new account id in the log group name) is picked up automatically instead of the judge going dark. serviceNames is unchanged and still narrows the traces. `agentcore eval online create` still mints configs with exact names; run deploy/evaluations/set-log-group-prefixes.py --apply after creating new ones (needs boto3 >= 1.43.96).",
   "configs": {
     "eval_agentcore_hub_analytics_designer": "eval_agentcore_hub_analytics_designer-XXXX",
     "eval_agentcore_hub_android_designer": "eval_agentcore_hub_android_designer-XXXX",
@@ -46,7 +47,8 @@
     "dependency_chain_agents": "TEAM-3368: only requirements_analyst has the custom evaluator — it is the only role that CREATES the ticket dependency graph; qa_verifier/ci_agent reassign rather than construct chains and scored rubric-mismatch zeros. In the 1-runtime topology the shared runtime carries it too (it hosts requirements_analyst; the eval-packager's role guard drops dependency-chain rows for every other persona). Every other config gets Builtin.Conciseness in the tenth slot. (Historical: the reverted TEAM-3376 5-evaluator shape put Builtin.Helpfulness in a fifth slot.)",
     "sampling": "Tiered sampling keeps the Opus judge under its RPM quota. If throttling persists anyway, see 'Eval judge throttling (quota)' in docs/orchestration-tracing-guide.md for the operator quota-increase runbook.",
     "monitoring_region": "eval-success-rate-alarm.json and eval-health-dashboard.json hard-code us-east-1 (pure JSON can't carry comments); substitute the region at apply time — see the monitoring comment blocks in setup-evaluations.sh.",
-    "max_evaluators": "API limit is 10 evaluators per config and the matrix uses all 10. Historical: TEAM-3366 §2.4 trimmed to 5 to cut Opus-judge load; that trim was never operator-approved and was reverted 2026-09-15."
+    "max_evaluators": "API limit is 10 evaluators per config and the matrix uses all 10. Historical: TEAM-3366 §2.4 trimmed to 5 to cut Opus-judge load; that trim was never operator-approved and was reverted 2026-09-15.",
+    "matrix_drift_audit": "2026-09-17: deploy/evaluations/audit-eval-matrix.py reports and repairs configs that have drifted from the 10-evaluator matrix, reading CUSTOM_EVALUATOR and TICKET_AGENTS out of setup-evaluations.sh so it cannot disagree with the script that creates the configs. It refuses to reduce a config's evaluator count. First run found 3 drifted of 8: eval_agentcore_hub_fleet_improver was created 2026-08-29 with the never-approved 5-evaluator trim shape, and builder + routine_builder carried the superseded dependency-chain evaluator instead of Builtin.Conciseness. All three repaired; re-audit is 8/8 clean."
   },
   "_evaluator_matrix_note": "10 evaluators per config is the operator-approved matrix. The TEAM-3366 §2.4 / TEAM-3376 trim to 5 (agent-authored, 2026-08-27) was never approved; it was applied to eval_agentcore_hub_agent by mistake on 2026-09-15 while fixing OTEL serviceNames and reverted the same day (CloudTrail: two UpdateOnlineEvaluationConfig calls at 12:18 PT, revert at ~17:40 PT). Live configs: agentcore_hub_agent + requirements_analyst = 9 built-in + custom v3; workflow_manager = 10 built-in incl. Conciseness."
 }

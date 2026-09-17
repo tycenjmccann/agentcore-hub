@@ -176,6 +176,18 @@ tiered sampling):
 ./deploy/evaluations/setup-evaluations.sh   # exits non-zero if any per-agent config fails
 ```
 
+That script now also migrates every config's input log groups to
+`logGroupNamePrefixes` and audits the evaluator matrix, and fails if either step
+fails — a config left pinned to an exact runtime log group stops being evaluated
+the moment its runtime is recreated. Both are re-runnable on their own:
+
+```bash
+python3 deploy/evaluations/set-log-group-prefixes.py --apply   # dry-run without --apply
+python3 deploy/evaluations/audit-eval-matrix.py                # --apply to repair drift
+```
+
+They need boto3 >= 1.43.96 and only touch `eval_agentcore_hub_*` configs.
+
 Step 8 — eval health alarms, GATED. Run the observation command first; create
 the alarms ONLY if BOTH metrics show a non-zero Sum on the dimensionless
 `AgentCoreHub/Evaluations` fleet series over a healthy batch (that series only
