@@ -278,12 +278,17 @@ The judge quota's expected name pattern is
 **"On-demand InvokeModel requests per minute for Anthropic Claude Opus 4.7"**.
 Record the `QuotaCode` and the current `Value` before requesting anything.
 
-**Step 2 — request an increase to 400 requests/minute.** Design derivation
-(TEAM-3366 §2.5) for the 5-evaluator trim was ~16 RPM sustained with a
-two-sessions-complete-together burst of ~162 RPM, hence the original 200 RPM
-ask. Judge calls scale linearly with the evaluator count, and the matrix is 10
-evaluators again (the trim was reverted 2026-09-15), so double both figures:
-~32 RPM sustained, ~325 RPM burst — 400 RPM gives the same headroom:
+**Step 2 — request an increase to 400 requests/minute.** Derive the target
+from the LIVE configuration, not from the TEAM-3366 §2.5 figures (~16 RPM
+sustained / ~162 RPM burst), which assumed the 5-evaluator trim and 25%
+sampling on most agents — neither is in effect: the matrix is 10 evaluators
+again (the trim was reverted 2026-09-15) and the shared fleet runtime, which
+hosts every pipeline persona, samples at 100%. Per sampled session the judge
+makes roughly one call per TRACE/SESSION evaluator (8) plus one per tool call
+for the two TOOL_CALL evaluators, i.e. ~10 + 2 × tool calls. At the observed
+~2 sessions completing per minute that is ~30-40 RPM sustained, and two
+tool-heavy sessions finishing together burst to ~300+ RPM — hence 400 RPM.
+Re-derive if sampling, the matrix or the fleet's throughput changes:
 
 ```bash
 aws service-quotas request-service-quota-increase \

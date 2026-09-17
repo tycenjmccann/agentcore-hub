@@ -139,7 +139,9 @@ CUSTOM_EVALUATOR="dependency_chain_compliance_online_v3-M1N0o94Jsa"
 #
 #   1. List what's live and diff against expectation — exactly one config per
 #      fleet agent (eval_<agentId>), 10 evaluators each, the custom
-#      dependency-chain evaluator ONLY on eval_agentcore_hub_requirements_analyst:
+#      dependency-chain evaluator on eval_agentcore_hub_requirements_analyst
+#      and — in the 1-runtime topology, where the shared runtime hosts it — on
+#      eval_agentcore_hub_agent; Builtin.Conciseness in that slot everywhere else:
 #        agentcore eval online list
 #   2. Delete every config that mismatches (wrong evaluator set, wrong
 #      sampling rate, stale agent id from a previous fleet deployment):

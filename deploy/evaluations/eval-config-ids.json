@@ -1,7 +1,7 @@
 {
   "created": "2026-05-22",
   "updated": "2026-09-15",
-  "sampling_rate": "tiered (TEAM-3366 §2.4 / TEAM-3376): 100% for gate roles (requirements_analyst, qa_verifier, ci_agent), 25% for all other agents",
+  "sampling_rate": "100% on the shared fleet runtime (it hosts requirements_analyst, qa_verifier and ci_agent, the gate roles) and on those three when they own a runtime; 25% for other dedicated-runtime agents. Tiers apply to NEW configs created by setup-evaluations.sh only.",
   "judge_model": "us.anthropic.claude-opus-5",
   "evaluators": [
     "Builtin.ToolSelectionAccuracy (TOOL_CALL)",
@@ -43,10 +43,10 @@
     "coding_runtime_configs": "TEAM-4688: the coding-runtime configs (agentcore_hub_coding_runtime and its _ec2 twin) have no supported span scopes → 100 % ValidationException; DISABLED not deleted. The judge is turned off with PUT /api/evaluations/agents/agentcore_hub_coding_runtime {enabled:false} (flips executionStatus to DISABLED); the config and its results log group stay, so history and the reconcile in lambda/eval-packager keep working.",
     "trajectory_evaluators": "TrajectoryInOrderMatch/ExactOrderMatch/AnyOrderMatch require reference inputs — only usable in on-demand evaluations, not online",
     "custom_evaluator_note": "dependency_chain_compliance (on-demand version) uses {actual_tool_trajectory} placeholder — use for scheduled batch evaluations",
-    "dependency_chain_agents": "TEAM-3368/TEAM-3376: only requirements_analyst has the custom evaluator — it is the only role that CREATES the ticket dependency graph; qa_verifier/ci_agent reassign rather than construct chains and scored rubric-mismatch zeros. Other agents get Builtin.Helpfulness in the fifth slot. lambda/eval-packager/index.mjs role-guards against config drift here.",
+    "dependency_chain_agents": "TEAM-3368: only requirements_analyst has the custom evaluator — it is the only role that CREATES the ticket dependency graph; qa_verifier/ci_agent reassign rather than construct chains and scored rubric-mismatch zeros. In the 1-runtime topology the shared runtime carries it too (it hosts requirements_analyst; the eval-packager's role guard drops dependency-chain rows for every other persona). Every other config gets Builtin.Conciseness in the tenth slot. (Historical: the reverted TEAM-3376 5-evaluator shape put Builtin.Helpfulness in a fifth slot.)",
     "sampling": "Tiered sampling keeps the Opus judge under its RPM quota. If throttling persists anyway, see 'Eval judge throttling (quota)' in docs/orchestration-tracing-guide.md for the operator quota-increase runbook.",
     "monitoring_region": "eval-success-rate-alarm.json and eval-health-dashboard.json hard-code us-east-1 (pure JSON can't carry comments); substitute the region at apply time — see the monitoring comment blocks in setup-evaluations.sh.",
-    "max_evaluators": "API limit is 10 evaluators per config; TEAM-3366 §2.4 trimmed every config to 5 to cut Opus-judge load."
+    "max_evaluators": "API limit is 10 evaluators per config and the matrix uses all 10. Historical: TEAM-3366 §2.4 trimmed to 5 to cut Opus-judge load; that trim was never operator-approved and was reverted 2026-09-15."
   },
   "_evaluator_matrix_note": "10 evaluators per config is the operator-approved matrix. The TEAM-3366 §2.4 / TEAM-3376 trim to 5 (agent-authored, 2026-08-27) was never approved; it was applied to eval_agentcore_hub_agent by mistake on 2026-09-15 while fixing OTEL serviceNames and reverted the same day (CloudTrail: two UpdateOnlineEvaluationConfig calls at 12:18 PT, revert at ~17:40 PT). Live configs: agentcore_hub_agent + requirements_analyst = 9 built-in + custom v3; workflow_manager = 10 built-in incl. Conciseness."
 }
