@@ -271,11 +271,15 @@ console.log(
 console.log("\n3/5 Deploying Lambda function...");
 
 // Zip the Lambda code (per-provider source dir). fix-contract.mjs (TEAM-4121
-// FR-8) is a local import of index.mjs in BOTH providers — omitting it kills the
-// function at cold start with ERR_MODULE_NOT_FOUND.
+// FR-8) and gate-contract.mjs (TEAM-4739) are local imports of index.mjs in BOTH
+// providers — omitting either kills the function at cold start with
+// ERR_MODULE_NOT_FOUND. scripts/check-lambda-zip-manifest.sh validates this line
+// against index.mjs's actual import closure; run it before changing the line.
 const lambdaDir = join(__dirname, "..", "lambda", LAMBDA_SOURCE_DIR);
 const zipPath = `/tmp/${LAMBDA_NAME}.zip`;
-execSync(`cd "${lambdaDir}" && zip -j "${zipPath}" index.mjs fix-contract.mjs`, { stdio: "pipe" });
+execSync(`cd "${lambdaDir}" && zip -j "${zipPath}" index.mjs fix-contract.mjs gate-contract.mjs`, {
+  stdio: "pipe",
+});
 const zipBuffer = readFileSync(zipPath);
 
 // FIX_TICKET_CONTRACT is forwarded ONLY when set in the deploying shell, so an

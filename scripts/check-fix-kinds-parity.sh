@@ -24,7 +24,10 @@
 #
 # This guard normalizes every kind list to a sorted set and fails on ANY
 # difference. It also (a) byte-compares the three fix-contract.mjs copies (cmp),
-# the only thing keeping the duplicated module from drifting, and (b) compares the
+# the only thing keeping the duplicated module from drifting — and, since
+# TEAM-4739, the TWO gate-contract.mjs copies, which are duplicated the same way
+# but only across the two ticket Lambdas (the tickets copy is canonical there,
+# since the orchestrator has no copy) — and (b) compares the
 # kind -> originKey MAPPING (not just its key set) across the three places that
 # carry one — fix-contract.mjs, compute_metrics.py and main.py — because a kind
 # pointed at the wrong origin key is as silent as a missing kind.
@@ -47,6 +50,31 @@ for copy in lambda/agentcore-hub-tickets/fix-contract.mjs lambda/agentcore-hub-j
     fail=1
   fi
 done
+
+# ─── 1b. the two gate-contract.mjs copies must be byte-identical ──────────────
+# TEAM-4739. Same duplication problem, DIFFERENT copy count: gate-contract.mjs is
+# read only by the two ticket Lambdas (it decides whether a gate ticket may CLOSE),
+# so it does not exist in lambda/orchestrator/ and the tickets copy — not $CANON —
+# is the source of truth. A drift here means the two providers disagree about
+# whether a deploy gate was proven, which is the whole failure this module closes.
+GATE_CANON="lambda/agentcore-hub-tickets/gate-contract.mjs"
+if [ ! -f "$GATE_CANON" ]; then
+  echo "FAIL: missing $GATE_CANON" >&2
+  fail=1
+else
+  for copy in lambda/agentcore-hub-jira/gate-contract.mjs; do
+    if [ ! -f "$copy" ]; then
+      echo "FAIL: missing gate-contract.mjs copy: $copy" >&2
+      fail=1
+    elif ! cmp -s "$GATE_CANON" "$copy"; then
+      echo "FAIL: $copy is not byte-identical to $GATE_CANON" >&2
+      echo "      gate-contract.mjs is duplicated per ticket-Lambda zip." >&2
+      echo "      Edit the TICKETS copy, then: cp $GATE_CANON $copy" >&2
+      diff <(cat "$GATE_CANON") <(cat "$copy") | head -20 >&2 || true
+      fail=1
+    fi
+  done
+fi
 
 # ─── 2. the kind lists must agree ─────────────────────────────────────────────
 # Each extractor prints the kinds it found, one per line. Empty output = the
@@ -248,4 +276,5 @@ echo "fix-kinds parity guard: OK"
 echo "  FIX_KINDS        = ${KINDS[0]}  (${#KINDS[@]} locations in agreement)"
 echo "  REWORK_FIX_KINDS = $rw_contract"
 echo "  origin-key map   = $map_contract  (${#MAPS[@]} locations in agreement)"
-echo "  fix-contract.mjs = 3 byte-identical copies"
+echo "  fix-contract.mjs  = 3 byte-identical copies"
+echo "  gate-contract.mjs = 2 byte-identical copies (tickets canonical)"
