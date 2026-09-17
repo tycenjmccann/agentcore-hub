@@ -60,6 +60,10 @@ export interface PersonaRow {
 
 export interface EvalData {
   agents: string[];
+  /** Column universe (agents that own their runtime), roster order. */
+  columns?: { agentId: string; displayName: string }[];
+  /** persona agentId → host agentId for personas sharing a host's runtime. */
+  hosted?: Record<string, string>;
   scorecard: Record<string, Record<string, ScorecardEntry>>;
   metrics: Record<string, AgentMetrics>;
   evaluators: string[];

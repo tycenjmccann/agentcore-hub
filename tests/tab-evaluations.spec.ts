@@ -30,7 +30,19 @@ function json(route: Route, body: Json, status = 200) {
 function overview(days: string): Json {
   const label = days === "all" ? "all time" : `last ${days} days`;
   return {
-    agents: [AGENT_NAME],
+    agents: [AGENT_NAME, "Workflow Manager"],
+    // The server derives the column universe from the live roster's runtimeArns;
+    // hosted personas never appear here, only under `personas`.
+    columns: [
+      { agentId: AGENT_ID, displayName: AGENT_NAME },
+      { agentId: "agentcore_hub_workflow_manager", displayName: "Workflow Manager" },
+    ],
+    hosted: {
+      agentcore_hub_requirements_analyst: AGENT_ID,
+      agentcore_hub_backend_dev: AGENT_ID,
+      agentcore_hub_qa_verifier: AGENT_ID,
+      agentcore_hub_code_reviewer: AGENT_ID,
+    },
     scorecard: {
       [AGENT_NAME]: {
         "Builtin.Correctness": { avg: 0.94, count: 40, passing: 100 },
@@ -280,6 +292,19 @@ test.describe("Evaluations tab (TEAM-4688)", () => {
 
     await page.locator(`[data-testid=eval-expand-${AGENT_ID}]`).first().click();
     await expect(page.locator(`[data-testid=eval-persona-col-${PERSONA}]`)).toHaveCount(0);
+  });
+
+  test("personas hosted on the shared runtime are never top-level columns", async ({ page }) => {
+    await installMocks(page);
+    await page.goto("/evaluations?days=7");
+    await expect(page.locator(`[data-testid=eval-col-${AGENT_ID}]`).first()).toBeVisible();
+    // Agents that own a runtime keep a column of their own...
+    await expect(page.locator("[data-testid=eval-col-agentcore_hub_workflow_manager]").first()).toBeVisible();
+    // ...while personas the API reports as hosted on the shared runtime render only
+    // as ↳ sub-columns under the host, so no always-empty top-level column exists.
+    for (const hosted of ["agentcore_hub_requirements_analyst", "agentcore_hub_backend_dev", "agentcore_hub_qa_verifier", "agentcore_hub_code_reviewer"]) {
+      await expect(page.locator(`[data-testid=eval-col-${hosted}]`)).toHaveCount(0);
+    }
   });
 
   test("drilldown renders the score-over-time chart and the sessions table", async ({ page }) => {
