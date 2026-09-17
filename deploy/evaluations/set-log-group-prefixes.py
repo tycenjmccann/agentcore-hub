@@ -29,9 +29,11 @@ Needs boto3 >= 1.43.96 (the first release whose CloudWatchLogsInputConfig has
 `--apply` writes to whatever account the ambient credentials resolve to, so it
 first prints the caller identity and region and makes you confirm. The expected
 account must come from a source INDEPENDENT of those credentials, or the check is
-tautological: `EXPECTED_ACCOUNT_ID` (deploy/.env.local, the same gitignored guard
-deploy/config.sh uses) or an explicit `--expect-account <id>`. Never derive it
-from `aws sts get-caller-identity` — that is the value being guarded.
+tautological. In order: `--expect-account`, `$EXPECTED_ACCOUNT_ID`, then
+`EXPECTED_ACCOUNT_ID` in the gitignored repo-root `.env.local` that
+deploy/config.sh sources (read directly, since this script is run as python3 and
+never through config.sh). Never derive it from `aws sts get-caller-identity` —
+that is the value being guarded.
 
 Usage (prod profile; dry-run by default):
   AWS_PROFILE=tycenj-prod AWS_REGION=us-east-1 python3 deploy/evaluations/set-log-group-prefixes.py
@@ -45,6 +47,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import sys
 import time
 
@@ -54,6 +57,11 @@ import botocore.session
 # AWS_REGION alone is NOT honored by boto3 when the profile carries its own
 # region (tycenj-prod resolves to us-west-2), so the region is passed explicitly.
 REGION = os.environ.get("AWS_REGION", "us-east-1")
+# deploy/config.sh sources the repo-root .env.local (gitignored) so every deploy
+# script sees the same EXPECTED_ACCOUNT_ID guard. This script is invoked directly
+# as python3, never through config.sh, so it reads that file itself — otherwise an
+# operator whose guard lives only in .env.local silently gets no guard at all.
+ENV_LOCAL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".env.local")
 RUNTIME_LG_PREFIX = "/aws/bedrock-agentcore/runtimes/"
 # <prefix><runtime-name>-<10-char account id>-<endpoint>
 RUNTIME_LG_RE = re.compile(
@@ -67,6 +75,31 @@ MAX_PREFIXES = 5
 TERMINAL_BAD = {"UPDATE_FAILED", "CREATE_FAILED", "ERROR", "DELETING"}
 SETTLE_TIMEOUT_S = 180
 SETTLE_POLL_S = 5
+
+
+def expected_account_from_env_local(path: str = ENV_LOCAL) -> str | None:
+    """Read EXPECTED_ACCOUNT_ID out of .env.local without executing the file."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.readlines()
+    except OSError:
+        return None
+    value = None
+    for raw in lines:
+        line = raw.strip()
+        if line.startswith("export "):
+            line = line[len("export "):].strip()
+        if not line.startswith("EXPECTED_ACCOUNT_ID=") or line.startswith("#"):
+            continue
+        # Last assignment wins, matching how a shell would source the file. shlex
+        # handles quoting and trailing comments in one pass — stripping quotes and
+        # "#" separately gets `'123456789012'  # prod` wrong.
+        try:
+            parts = shlex.split(line.split("=", 1)[1], comments=True)
+        except ValueError:
+            continue
+        value = parts[0] if parts else None
+    return value or None
 
 
 def sdk_supports_prefixes() -> bool:
@@ -155,9 +188,10 @@ def main() -> int:
     ap.add_argument("--config-id", action="append", default=[], help="limit to these config ids")
     ap.add_argument(
         "--expect-account",
-        default=os.environ.get("EXPECTED_ACCOUNT_ID") or None,
-        help="account id the credentials must resolve to (default: $EXPECTED_ACCOUNT_ID, the same "
-        "gitignored guard deploy/config.sh reads); skips the --apply confirmation prompt",
+        default=os.environ.get("EXPECTED_ACCOUNT_ID") or expected_account_from_env_local(),
+        help="account id the credentials must resolve to (default: $EXPECTED_ACCOUNT_ID, else "
+        "EXPECTED_ACCOUNT_ID in the gitignored .env.local that deploy/config.sh sources); "
+        "skips the --apply confirmation prompt",
     )
     args = ap.parse_args()
 
