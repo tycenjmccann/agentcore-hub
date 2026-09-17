@@ -641,7 +641,7 @@ The Fleet Improver runtime must be deployed for synthesis to run
 (`cd deploy/runtime-agent && ./deploy-one.sh agentcore_hub_fleet_improver`).
 Without it, eval-packager archives batches but skips the workflow trigger.
 
-Every agent invocation is evaluated by 5 criteria — four shared built-ins (tool selection, instruction following, correctness, goal success) plus a fifth slot that is the custom dependency-chain evaluator for ticket agents or Helpfulness otherwise — using a judge model. When scores drop, the fleet improver agent determines whether the fix is a prompt change, a missing tool, a permissions issue, or an infrastructure problem — then creates a PRD that triggers the same 16-agent pipeline to produce a fix PR.
+Every agent invocation is evaluated by 10 criteria — nine shared built-ins (tool selection, tool parameters, instruction following, correctness, goal success, coherence, faithfulness, helpfulness, response relevance) plus a tenth slot that is the custom dependency-chain evaluator for ticket agents or Conciseness otherwise — using a judge model. When scores drop, the fleet improver agent determines whether the fix is a prompt change, a missing tool, a permissions issue, or an infrastructure problem — then creates a PRD that triggers the same 16-agent pipeline to produce a fix PR.
 
 ### One-Command Setup
 

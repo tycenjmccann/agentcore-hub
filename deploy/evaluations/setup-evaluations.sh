@@ -254,9 +254,9 @@ GATE_AGENTS="agentcore_hub_requirements_analyst agentcore_hub_qa_verifier agentc
 AGENT_COUNT=$(echo "$AGENTS" | wc -l | tr -d ' ')
 echo "Creating online evaluation configs for ${AGENT_COUNT} agents..."
 if [ "$CUSTOM_EVALUATOR_AVAILABLE" = true ]; then
-  echo "Evaluators: 5 per agent (requirements_analyst gets custom dependency_chain evaluator)"
+  echo "Evaluators: 10 per agent (requirements_analyst gets custom dependency_chain evaluator in the tenth slot)"
 else
-  echo "Evaluators: 5 built-in per agent (custom evaluator unavailable — see warning above)"
+  echo "Evaluators: 10 built-in per agent (custom evaluator unavailable — see warning above)"
 fi
 echo "Sampling: 100% for gate roles (requirements_analyst, qa_verifier, ci_agent), 25% otherwise"
 echo "Judge model: Opus 4.7"

@@ -298,10 +298,10 @@ full batch window before considering raising sampling rates back up.
 **Note — shared on-demand pool.** Check whether online evaluations draw from
 the same on-demand InvokeModel pool as the fleet's own model calls: fleet
 model overrides include Opus 4.6/4.7, and if the judge and the fleet share one
-quota, the 200 RPM target must be re-derived with the fleet's RPM added on
+quota, the 400 RPM target must be re-derived with the fleet's RPM added on
 top. Compare the judge's throttling timestamps against fleet invocation spikes
 (or ask AWS support which quota the evaluations service consumes) before
-treating 200 as sufficient.
+treating 400 as sufficient.
 
 ---
 
