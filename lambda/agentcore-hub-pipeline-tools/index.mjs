@@ -1263,6 +1263,36 @@ function parsePrUrl(value) {
 }
 
 /**
+ * The ONE way this Lambda talks to GitHub — a single read-only GET.
+ *
+ * Extracted (TEAM-4740) so a second GitHub read cannot drift from the first on the
+ * three properties that make it safe: the read-only token, the pinned API version
+ * header, and a timeout SHORTER than the Lambda's own budget so a slow GitHub
+ * fails closed instead of consuming it. `path` is always built from values this
+ * Lambda derived itself (a parsePrUrl result, a server-read source revision), never
+ * pasted from args.
+ *
+ * The caller decides what a non-2xx MEANS — for a merge binding it is "unverified",
+ * for an ancestry probe it is "unproven" — so the status is returned rather than
+ * translated here. A transport failure (timeout, DNS) still THROWS: "we could not
+ * look" must never be reachable as a successful answer.
+ *
+ * @returns {Promise<{ok: boolean, status: number, json: any}>} `json` is the parsed
+ *   body on 2xx and null otherwise (a non-2xx body is an error document, never data).
+ */
+async function githubJson(path) {
+  const res = await fetch(`https://api.github.com${path}`, {
+    headers: {
+      Authorization: `token ${GITHUB_TOKEN}`,
+      Accept: "application/vnd.github+json",
+      "User-Agent": "agentcore-hub-pipeline-tools",
+    },
+    signal: AbortSignal.timeout(GITHUB_TIMEOUT_MS),
+  });
+  return { ok: res.ok, status: res.status, json: res.ok ? await res.json() : null };
+}
+
+/**
  * Ask GitHub whether `mergeCommit` really is the merge of `approvedHead` for the
  * PR at `prUrl`, in `expectedRepo`.
  *
@@ -1309,25 +1339,17 @@ async function verifyMergeBinding({ prUrl, mergeCommit, approvedHead, expectedRe
 
   let pr;
   try {
-    const res = await fetch(
-      `https://api.github.com/repos/${parsed.owner}/${parsed.repo}/pulls/${parsed.number}`,
-      {
-        headers: {
-          Authorization: `token ${GITHUB_TOKEN}`,
-          Accept: "application/vnd.github+json",
-          "User-Agent": "agentcore-hub-pipeline-tools",
-        },
-        signal: AbortSignal.timeout(GITHUB_TIMEOUT_MS),
-      }
+    const gh = await githubJson(
+      `/repos/${parsed.owner}/${parsed.repo}/pulls/${parsed.number}`
     );
-    if (!res.ok) {
+    if (!gh.ok) {
       return {
         ok: false,
         reason: PREAPPROVAL_REASONS.BINDING_UNVERIFIED,
-        detail: `GitHub returned ${res.status}`,
+        detail: `GitHub returned ${gh.status}`,
       };
     }
-    pr = await res.json();
+    pr = gh.json;
   } catch (e) {
     return {
       ok: false,
