@@ -136,23 +136,27 @@ def main() -> int:
     for summary in configs:
         cid = summary["onlineEvaluationConfigId"]
         before = control.get_online_evaluation_config(onlineEvaluationConfigId=cid)
+
+        # Settle BEFORE reading or writing the data source, for two reasons:
+        # a CREATING/UPDATING config rejects a concurrent update (setup-evaluations.sh
+        # calls this script straight after its create loop), and a read taken
+        # mid-update echoes the REQUESTED shape, so "it already has prefixes" would
+        # not be proof the migration took.
+        if before.get("status") != "ACTIVE":
+            try:
+                before = wait_settled(control, cid)
+            except RuntimeError as exc:
+                print(f"✗ {cid}: never settled ACTIVE: {exc}")
+                print("   treat this config as UNMIGRATED — the judge may still be on an exact log group name")
+                refused += 1
+                continue
+
         cw = before.get("dataSourceConfig", {}).get("cloudWatchLogs")
         if not cw:
             print(f"↷ {cid}: data source is not CloudWatch Logs — skipping")
             skipped += 1
             continue
         if cw.get("logGroupNamePrefixes") and not cw.get("logGroupNames"):
-            # GetOnlineEvaluationConfig echoes the REQUESTED data source even while
-            # an update is UPDATING or after it ended UPDATE_FAILED, so "it already
-            # has prefixes" is not on its own proof the migration took. Settle first.
-            if before.get("status") != "ACTIVE":
-                try:
-                    before = wait_settled(control, cid)
-                except RuntimeError as exc:
-                    print(f"✗ {cid}: reports prefixes but never settled ACTIVE: {exc}")
-                    print("   treat this config as UNMIGRATED — the judge may still be on the old exact log group")
-                    refused += 1
-                    continue
             print(f"✓ {cid}: already on prefixes {cw['logGroupNamePrefixes']}")
             skipped += 1
             continue
