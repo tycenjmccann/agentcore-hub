@@ -220,7 +220,12 @@ const CI_FIELD_MAX_LEN = 128;
 // ended. The orchestrator's completion evidence harvest already reads these
 // three keys from the record (completion.mjs SHIP_BLOCKED_OUTCOMES); this is the
 // writer side. Same drop-rather-than-store rule as CI_STATUSES.
-const SHIP_OUTCOMES = ["shipped", "deploy-blocked", "static-ci-only", "handoff"];
+// TEAM-4740 FR-10: `empty_sweep` — a dead-code sweep that found nothing to remove.
+// It has provably nothing to merge, so it is neither a ship nor a block; without it
+// such a run has no honest terminal outcome and either fakes a ship or wedges.
+// Exported so src/lib/workflow/ship-outcome-parity.test.ts can hold this list and
+// completion.mjs's verdict map to each other instead of to review.
+export const SHIP_OUTCOMES = ["shipped", "deploy-blocked", "static-ci-only", "handoff", "empty_sweep"];
 const BLOCK_REASON_MAX_LEN = 500;
 
 // ─── DL-030 ship-report contract (TEAM-4706) ──────────────────────────────────

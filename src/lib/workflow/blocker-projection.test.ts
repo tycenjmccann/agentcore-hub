@@ -7,6 +7,27 @@ import { describe, it, expect } from "vitest";
 import { blockerFromWaitingOn } from "../../../lambda/agentcore-hub-pipeline-tools/index.mjs";
 
 /**
+ * The projection's contract, restated for the type checker: the .mjs carries no
+ * declarations, so TS widens `blocker` to `object` and every field read below
+ * becomes an error. Spelling the seven keys out here is not a second source of
+ * truth — BLOCKER_KEYS and the assertions are still what enforce it at runtime —
+ * it just lets `npx tsc --noEmit` read the same shape the tests do.
+ */
+type Blocker = {
+  executionId: string | null;
+  sourceSha: string | null;
+  pr: string | null;
+  pendingSince: string | null;
+  stage: string | null;
+  action: string | null;
+  supersedable: boolean;
+};
+const project = blockerFromWaitingOn as (
+  waitingOn?: unknown,
+  opts?: { ours?: string; sourceSha?: string; pr?: string; pendingSince?: string }
+) => { blocker: Blocker | null; remedy: string | null };
+
+/**
  * TEAM-4740 FR-4 — the deploy-gate blocker projection, as a truth table.
  *
  * `waitingOn` (TEAM-4706) says WHO holds the human deploy gate. That is
@@ -58,17 +79,17 @@ const BLOCKER_KEYS = [
 
 describe("blockerFromWaitingOn — nothing is in front of us", () => {
   it("returns a null blocker and a null remedy when waitingOn is null", () => {
-    expect(blockerFromWaitingOn(null)).toEqual({ blocker: null, remedy: null });
+    expect(project(null)).toEqual({ blocker: null, remedy: null });
   });
 
   it("returns a null blocker when waitingOn is absent entirely", () => {
-    expect(blockerFromWaitingOn(undefined)).toEqual({ blocker: null, remedy: null });
+    expect(project(undefined)).toEqual({ blocker: null, remedy: null });
   });
 
   it('holdsGate "this" is the NORMAL case — our own gate, not a blocker', () => {
     // The single most important false positive to avoid: refusing a deploy whose
     // own approval is pending would break every ship run.
-    expect(blockerFromWaitingOn(waitingOn({ holdsGate: "this" }))).toEqual({
+    expect(project(waitingOn({ holdsGate: "this" }))).toEqual({
       blocker: null,
       remedy: null,
     });
@@ -76,7 +97,7 @@ describe("blockerFromWaitingOn — nothing is in front of us", () => {
 
   it('holdsGate "unknown" is NOT evidence of a blocker', () => {
     // "We could not establish a relationship" is not "someone is in front of you".
-    expect(blockerFromWaitingOn(waitingOn({ holdsGate: "unknown" }))).toEqual({
+    expect(project(waitingOn({ holdsGate: "unknown" }))).toEqual({
       blocker: null,
       remedy: null,
     });
@@ -87,7 +108,7 @@ describe("blockerFromWaitingOn — nothing is in front of us", () => {
     // is nothing to follow if nothing is in front of us.
     for (const holdsGate of ["this", "unknown"]) {
       expect(
-        blockerFromWaitingOn(waitingOn({ holdsGate, supersededBy: SUCCESSOR }))
+        project(waitingOn({ holdsGate, supersededBy: SUCCESSOR }))
       ).toEqual({ blocker: null, remedy: null });
     }
   });
@@ -95,7 +116,7 @@ describe("blockerFromWaitingOn — nothing is in front of us", () => {
 
 describe("blockerFromWaitingOn — someone else holds the gate", () => {
   it('"older" with an id and no superseder → a full blocker, remedy "wait"', () => {
-    const { blocker, remedy } = blockerFromWaitingOn(waitingOn(), {
+    const { blocker, remedy } = project(waitingOn(), {
       ours: OURS,
       sourceSha: "1111111111111111111111111111111111111111",
       pr: "https://github.com/acme/widget/pull/7",
@@ -117,7 +138,7 @@ describe("blockerFromWaitingOn — someone else holds the gate", () => {
   it('"older" with a superseder → supersedable, remedy "follow_superseder"', () => {
     // Our OWN run was superseded, so the successor inherited our commit and will
     // inherit the gate. Following it is strictly better than starting a third run.
-    const { blocker, remedy } = blockerFromWaitingOn(
+    const { blocker, remedy } = project(
       waitingOn({ supersededBy: SUCCESSOR }),
       { ours: OURS }
     );
@@ -129,7 +150,7 @@ describe("blockerFromWaitingOn — someone else holds the gate", () => {
     // Telling a caller to follow itself is a spin loop. findSupersedingExecution
     // already excludes the caller's id; this projection is the contract and does
     // not depend on that, and the safe direction for a capability flag is off.
-    const { blocker, remedy } = blockerFromWaitingOn(
+    const { blocker, remedy } = project(
       waitingOn({ supersededBy: OURS }),
       { ours: OURS }
     );
@@ -141,7 +162,7 @@ describe("blockerFromWaitingOn — someone else holds the gate", () => {
     // The stage named OUR execution as inbound but exposed no parked execution id.
     // Something is genuinely in front of us; we simply cannot name it — which is
     // exactly why it can never be abandoned.
-    const { blocker, remedy } = blockerFromWaitingOn(
+    const { blocker, remedy } = project(
       waitingOn({ executionId: null, queuedBehind: null }),
       { ours: OURS }
     );
@@ -155,7 +176,7 @@ describe("blockerFromWaitingOn — someone else holds the gate", () => {
     // A blueprint that files a gate ticket names the stage/action it is waiting on.
     // Renaming either of these on the way through would misfile that ticket.
     const wo = waitingOn({ stage: "ShipGate", action: "HumanApproval" });
-    const { blocker } = blockerFromWaitingOn(wo, { ours: OURS });
+    const { blocker } = project(wo, { ours: OURS });
     expect(blocker?.stage).toBe(wo.stage);
     expect(blocker?.action).toBe(wo.action);
   });
@@ -165,7 +186,7 @@ describe("blockerFromWaitingOn — the shape is the contract", () => {
   it("has EXACTLY seven keys, with explicit nulls, when nothing was enriched", () => {
     // Called with no opts at all: every enrichment is null and PRESENT. A consumer
     // must never have to tell "absent" from "unknown".
-    const { blocker, remedy } = blockerFromWaitingOn(waitingOn());
+    const { blocker, remedy } = project(waitingOn());
     expect(Object.keys(blocker as object).sort()).toEqual(BLOCKER_KEYS);
     expect(blocker).toEqual({
       executionId: OLDER,
@@ -189,7 +210,7 @@ describe("blockerFromWaitingOn — the shape is the contract", () => {
       { executionId: null },
       { stage: null, action: null },
     ]) {
-      const { blocker } = blockerFromWaitingOn(waitingOn(over), { ours: OURS });
+      const { blocker } = project(waitingOn(over), { ours: OURS });
       expect(Object.keys(blocker as object).sort(), JSON.stringify(over)).toEqual(
         BLOCKER_KEYS
       );
@@ -198,7 +219,7 @@ describe("blockerFromWaitingOn — the shape is the contract", () => {
 
   it("never puts remedy inside blocker, and never invents an unknown value", () => {
     for (const over of [{}, { supersededBy: SUCCESSOR }, { holdsGate: "this" }]) {
-      const out = blockerFromWaitingOn(waitingOn(over), { ours: OURS });
+      const out = project(waitingOn(over), { ours: OURS });
       expect(Object.keys(out).sort()).toEqual(["blocker", "remedy"]);
       if (out.blocker) expect(out.blocker).not.toHaveProperty("remedy");
       // "abandon" is start_deploy's word, and only AFTER it proved ancestry and
@@ -212,13 +233,13 @@ describe("blockerFromWaitingOn — the shape is the contract", () => {
     // reading it must leave TEAM-4706's shape byte-identical.
     const wo = waitingOn({ supersededBy: SUCCESSOR });
     const before = JSON.stringify(wo);
-    blockerFromWaitingOn(wo, { ours: OURS, sourceSha: "abc", pendingSince: "now" });
+    project(wo, { ours: OURS, sourceSha: "abc", pendingSince: "now" });
     expect(JSON.stringify(wo)).toBe(before);
   });
 
   it("is pure: identical inputs give a deep-equal, non-shared result", () => {
-    const a = blockerFromWaitingOn(waitingOn(), { ours: OURS });
-    const b = blockerFromWaitingOn(waitingOn(), { ours: OURS });
+    const a = project(waitingOn(), { ours: OURS });
+    const b = project(waitingOn(), { ours: OURS });
     expect(a).toEqual(b);
     expect(a.blocker).not.toBe(b.blocker);
   });
