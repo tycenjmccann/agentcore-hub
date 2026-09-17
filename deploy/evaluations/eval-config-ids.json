@@ -1,6 +1,6 @@
 {
   "created": "2026-05-22",
-  "updated": "2026-09-15",
+  "updated": "2026-09-17",
   "sampling_rate": "100% on the shared fleet runtime (it hosts requirements_analyst, qa_verifier and ci_agent, the gate roles) and on those three when they own a runtime; 25% for other dedicated-runtime agents. Tiers apply to NEW configs created by setup-evaluations.sh only.",
   "judge_model": "us.anthropic.claude-opus-5",
   "evaluators": [
@@ -23,6 +23,7 @@
   },
   "_configs_note": "Snapshot only — not load-bearing. The '-XXXX' suffixes are account-specific and regenerated on each setup-evaluations.sh run; consumers read evalConfigName from agents.json, which refresh-agents-json.sh repopulates by querying live CW log groups. Keys use the canonical long form 'eval_<agentId>' (e.g. eval_agentcore_hub_requirements_analyst), matching what setup-evaluations.sh creates.",
   "_reapply_note": "Live configs carry the 10-evaluator matrix. Sampling tiers (TEAM-3376) are still encoded in setup-evaluations.sh for NEW configs only; existing configs are skipped on re-run and keep their own rule.",
+  "_data_source_note": "2026-09-17: every live config selects its input by logGroupNamePrefixes ('/aws/bedrock-agentcore/runtimes/<runtime-name>-'), not an exact logGroupNames entry, so a recreated runtime (new account id in the log group name) is picked up automatically instead of the judge going dark. serviceNames is unchanged and still narrows the traces. `agentcore eval online create` still mints configs with exact names; run deploy/evaluations/set-log-group-prefixes.py --apply after creating new ones (needs boto3 >= 1.43.96).",
   "configs": {
     "eval_agentcore_hub_analytics_designer": "eval_agentcore_hub_analytics_designer-XXXX",
     "eval_agentcore_hub_android_designer": "eval_agentcore_hub_android_designer-XXXX",

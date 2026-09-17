@@ -160,6 +160,23 @@ CUSTOM_EVALUATOR="dependency_chain_compliance_online_v3-M1N0o94Jsa"
 # mints a fresh account-suffixed id.
 # -----------------------------------------------------------------------------
 
+# --- Input log groups: prefixes, not exact names (2026-09-17) ---------------
+# `agentcore eval online create --agent-id` pins the runtime's exact log group
+# ("/aws/bedrock-agentcore/runtimes/<name>-<id>-DEFAULT"). Recreate the runtime
+# and that config keeps watching the dead group — the judge goes dark with no
+# error anywhere. Every live config was therefore switched to
+# dataSourceConfig.cloudWatchLogs.logGroupNamePrefixes
+# ("/aws/bedrock-agentcore/runtimes/<name>-"), which follows the runtime across
+# recreation; serviceNames still narrows the traces. This script does not do
+# that itself (the toolkit CLI has no prefix flag) — after it creates configs run:
+#
+#   AWS_REGION=... python3 deploy/evaluations/set-log-group-prefixes.py          # dry-run
+#   AWS_REGION=... python3 deploy/evaluations/set-log-group-prefixes.py --apply
+#
+# It changes ONLY the data source and asserts evaluators/sampling/output/role
+# came back unchanged. Needs boto3 >= 1.43.96.
+# -----------------------------------------------------------------------------
+
 # --- Eval judge throttling (quota) — OPERATOR action, NOT CI ---------------
 # If eval results show ThrottlingException storms (EvalThrottleRate /
 # EvalThrottleCount climbing on the eval-health dashboard), the Opus judge
