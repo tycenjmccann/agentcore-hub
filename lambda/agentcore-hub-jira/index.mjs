@@ -45,6 +45,7 @@ import {
   GATE_CONDITION_UNMET,
   GATE_LOOP_BROKEN_LABEL,
   GATE_LOOP_BROKEN_RE,
+  MERGE_GATE_LABEL_RE,
   consoleApprovalUrl,
   descriptionCarriesConsoleLink,
   gateExecOf,
@@ -933,14 +934,16 @@ export function validateBaseBranch(base_branch) {
 }
 
 // ─── TEAM-4740 FR-5: freeze new work behind an open Merge Approval gate ──────
-//
-// INTERIM: TEAM-4739 lands gate-contract.mjs; swap to import.
-const MERGE_GATE_LABEL_RE = /^gate[:-]merge-approval$/;
 
 let eventsDdb = null;
 
 /**
- * INTERIM: TEAM-4739 lands gate-contract.mjs; swap to import.
+ * Stays LOCAL rather than becoming a thin wrapper over
+ * gate-contract.mjs's publishJourneyEvent: EVENTS_TABLE here is read from
+ * process.env at CALL time (below), not at module load — same shape as the
+ * tickets twin, whose index.test.mjs FR-5 tests set/delete that env var
+ * mid-test with no module reload to exercise both the on and off paths. A
+ * module-load-time table name would go stale the moment the first such test ran.
  *
  * The autowired blocker edge, as a journey event. Same Item shape as
  * lambda/workflow-output/index.mjs publishJourneyEvent (copied deliberately, so
