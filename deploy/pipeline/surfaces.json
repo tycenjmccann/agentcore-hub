@@ -43,10 +43,12 @@
       "dir": "lambda/workflow-analyzer",
       "files": [
         "index.mjs",
+        "si-ledger.mjs",
         "package.json",
         "node_modules/"
       ],
-      "npm": true
+      "npm": true,
+      "note": "si-ledger.mjs is a byte-copy pair: this dir holds the canonical copy and lambda/prd-submitter/si-ledger.mjs must stay identical (nothing lives in lambda/shared/)."
     },
     {
       "function": "agentcore-hub-pipeline-tools",
@@ -93,9 +95,11 @@
       "function": "agentcore-hub-prd-submitter",
       "dir": "lambda/prd-submitter",
       "files": [
-        "index.mjs"
+        "index.mjs",
+        "si-ledger.mjs"
       ],
-      "npm": false
+      "npm": false,
+      "note": "si-ledger.mjs is the byte-copy twin of lambda/workflow-analyzer/si-ledger.mjs (canonical) — edit the canonical copy and mirror it."
     },
     {
       "function": "agentcore-hub-token-aggregator",

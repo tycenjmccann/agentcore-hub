@@ -30,6 +30,7 @@ require_eval_gate "deploy/workflow-manager/**"
 BUCKET="$ARTIFACT_BUCKET"
 ROLE_ARN="$LAMBDA_ROLE_ARN"
 ANALYSES_TABLE="${ANALYSES_TABLE:-agentcore-hub-workflow-analyses}"
+SI_LEDGER_TABLE="${SI_LEDGER_TABLE:-agentcore-hub-si-ledger}"
 
 # Resolve the Workflow Manager harness ARN — explicit override, else discover.
 WM_ARN="${WORKFLOW_MANAGER_ARN:-}"
@@ -71,7 +72,24 @@ else
   echo "✓ Table: ${ANALYSES_TABLE} (exists)"
 fi
 
-# ─── Lambda role: analyses table access + InvokeHarness ──────────────────────
+# ─── DynamoDB: SI ledger table (PK patternKey, no GSI) ────────────────────────
+# scripts/create-dynamodb-tables.sh creates this too; mirrored here so this
+# script stays self-sufficient for a WM-only install.
+# NO TTL on purpose — the ledger is the permanent record of whether an SI fix
+# actually landed, deployed and held. Do not add update-time-to-live.
+if ! aws dynamodb describe-table --table-name "$SI_LEDGER_TABLE" >/dev/null 2>&1; then
+  aws dynamodb create-table \
+    --table-name "$SI_LEDGER_TABLE" \
+    --attribute-definitions AttributeName=patternKey,AttributeType=S \
+    --key-schema AttributeName=patternKey,KeyType=HASH \
+    --billing-mode PAY_PER_REQUEST --output text >/dev/null
+  aws dynamodb wait table-exists --table-name "$SI_LEDGER_TABLE"
+  echo "✓ Table: ${SI_LEDGER_TABLE} (created)"
+else
+  echo "✓ Table: ${SI_LEDGER_TABLE} (exists)"
+fi
+
+# ─── Lambda role: analyses + SI ledger table access + InvokeHarness ──────────
 aws iam put-role-policy --role-name agentcore-hub-lambda-role \
   --policy-name WorkflowManagerAccess \
   --policy-document "{
@@ -85,6 +103,12 @@ aws iam put-role-policy --role-name agentcore-hub-lambda-role \
           \"arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/${ANALYSES_TABLE}\",
           \"arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/${ANALYSES_TABLE}/index/*\"
         ]
+      },
+      {
+        \"Sid\": \"SiLedgerTable\",
+        \"Effect\": \"Allow\",
+        \"Action\": [\"dynamodb:GetItem\",\"dynamodb:Query\",\"dynamodb:PutItem\",\"dynamodb:Scan\",\"dynamodb:UpdateItem\"],
+        \"Resource\": \"arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/${SI_LEDGER_TABLE}\"
       },
       {
         \"Sid\": \"InvokeHarness\",
@@ -116,7 +140,7 @@ echo "✓ Skills: s3://${BUCKET}/workflow-manager/skills/"
 
 # ─── Trigger Lambda ───────────────────────────────────────────────────────────
 LAMBDA_NAME="agentcore-hub-workflow-analyzer"
-ENV_VARS="{WORKFLOW_MANAGER_ARN=${WM_ARN},ANALYSES_TABLE=${ANALYSES_TABLE},WORKFLOWS_TABLE=${WORKFLOWS_TABLE},EVENTS_TABLE=${EVENTS_TABLE},WM_STALE_MINUTES=${WM_STALE_MINUTES:-10},WM_WATCH_COOLDOWN_MINUTES=${WM_WATCH_COOLDOWN_MINUTES:-15},HUB_REPO_URL=${HUB_REPO_URL:-},SI_BATCH_SIZE=${SI_BATCH_SIZE:-5},SI_COOLDOWN_HOURS=${SI_COOLDOWN_HOURS:-12}}"
+ENV_VARS="{WORKFLOW_MANAGER_ARN=${WM_ARN},ANALYSES_TABLE=${ANALYSES_TABLE},SI_LEDGER_TABLE=${SI_LEDGER_TABLE},WORKFLOWS_TABLE=${WORKFLOWS_TABLE},EVENTS_TABLE=${EVENTS_TABLE},WM_STALE_MINUTES=${WM_STALE_MINUTES:-10},WM_WATCH_COOLDOWN_MINUTES=${WM_WATCH_COOLDOWN_MINUTES:-15},HUB_REPO_URL=${HUB_REPO_URL:-},SI_BATCH_SIZE=${SI_BATCH_SIZE:-5},SI_COOLDOWN_HOURS=${SI_COOLDOWN_HOURS:-12}}"
 
 cd "${REPO_ROOT}/lambda/workflow-analyzer" && rm -f function.zip
 npm install --omit=dev --no-audit --no-fund --silent
