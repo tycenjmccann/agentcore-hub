@@ -281,7 +281,9 @@
     "lambda/orchestrator/template.yaml",
     "deploy/coding-agent-runtime/deploy-instances.py",
     "deploy/runtime-agent/set-runtime-env.py",
-    "deploy/ecs-express/set-env.sh"
+    "deploy/ecs-express/set-env.sh",
+    "deploy/workflow-manager/set-harness-env.mjs",
+    "scripts/si-ledger-handoff.sh"
   ],
   "runtimes": [
     {

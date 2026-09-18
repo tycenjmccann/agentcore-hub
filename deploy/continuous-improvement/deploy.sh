@@ -193,6 +193,15 @@ aws iam put-role-policy \
   }" --output text >/dev/null
 echo "✓ IAM: EvalResultsAccess on ${ROLE_NAME_FOR_EVAL} (DDB ${RESULTS_TABLE} + ${SI_LEDGER_TABLE} + evaluator results log reads)"
 
+# TEAM-4770: IAM_ONLY=1 applies the IAM above and stops here, so
+# scripts/si-ledger-handoff.sh can re-apply the prd-submitter ledger grant
+# without redeploying Lambda code or replacing Lambda env (CD owns those).
+# Same env var as deploy/workflow-manager/deploy.sh — one vocabulary.
+if [ "${IAM_ONLY:-}" = "1" ]; then
+  echo "IAM_ONLY=1 — stopping before Lambda code + env deploy (IAM applied)"
+  exit 0
+fi
+
 # ─── Lambdas ─────────────────────────────────────────────────────────────────
 deploy_lambda() {
   local NAME=$1 DIR=$2 TIMEOUT=$3 MEM=$4 ENV_VARS=$5
