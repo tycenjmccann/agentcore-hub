@@ -103,39 +103,52 @@ function toolParams(src: string): string[] {
     .filter((p) => p.length > 0 && p !== "self");
 }
 
-/** The payload KEYS a wrapper actually sends: the top-level `payload = {…}` /
- *  `args = {…}` literal (depth-1 keys only, so the nested `fix_contract` and
- *  origin-key maps are not mistaken for payload fields) plus every later
- *  `payload["…"] = ` / `args["…"] = ` assignment. This is the set that has to
- *  match the Lambda, and building it from the body rather than the signature is
- *  the whole reason the rename cases above do not produce false failures. */
+/** The depth-1 keys of ONE brace-delimited dict literal starting at `open`.
+ *  Depth-1 only, so the nested `fix_contract` and origin-key maps inside
+ *  `create_ticket`'s payload are not mistaken for payload fields. */
+function dictLiteralKeys(src: string, open: number, into: Set<string>): void {
+  let depth = 0;
+  let close = src.length;
+  for (let i = open; i < src.length; i++) {
+    if (src[i] === "{") depth++;
+    else if (src[i] === "}") {
+      depth--;
+      if (depth === 0) {
+        close = i + 1;
+        break;
+      }
+    }
+  }
+  let d = 0;
+  for (const m of src.slice(open, close).matchAll(/[{}]|["']([a-z_0-9]+)["']\s*:/g)) {
+    if (m[0] === "{") d++;
+    else if (m[0] === "}") d--;
+    else if (d === 1) into.add(m[1]);
+  }
+}
+
+/** The payload KEYS a wrapper actually sends. Three shapes are in use across
+ *  these wrappers, and all three count — building this from the body rather than
+ *  the signature is the whole reason the rename cases above do not produce false
+ *  failures:
+ *
+ *    1. a named `payload = {…}` / `args = {…}` literal (create_ticket, start_deploy);
+ *    2. later `payload["…"] = ` / `args["…"] = ` assignments (the additive fields);
+ *    3. a dict literal passed INLINE to `_invoke_lambda(LAMBDA, "Tool", {…})`
+ *       (add_comment, get_issue, list_tickets — the short wrappers).
+ *
+ *  Shape 3 was missing at first and made this extractor return an EMPTY set for
+ *  add_comment, i.e. it would have passed vacuously on the very tool the sibling
+ *  sweep was checking. Hence the non-empty assertion in the self-checks. */
 function forwardedKeys(src: string): Set<string> {
   const keys = new Set<string>();
   for (const m of src.matchAll(/(?:payload|args)\[\s*["']([a-z_0-9]+)["']\s*\]\s*=/g)) {
     keys.add(m[1]);
   }
-  const literal = /\n\s*(?:payload|args)\s*=\s*\{/.exec(src);
-  if (literal) {
-    const open = src.indexOf("{", literal.index);
-    let depth = 0;
-    let close = src.length;
-    for (let i = open; i < src.length; i++) {
-      if (src[i] === "{") depth++;
-      else if (src[i] === "}") {
-        depth--;
-        if (depth === 0) {
-          close = i + 1;
-          break;
-        }
-      }
-    }
-    const body = src.slice(open, close);
-    let d = 0;
-    for (const m of body.matchAll(/[{}]|["']([a-z_0-9]+)["']\s*:/g)) {
-      if (m[0] === "{") d++;
-      else if (m[0] === "}") d--;
-      else if (d === 1) keys.add(m[1]);
-    }
+  const named = /\n\s*(?:payload|args)\s*=\s*\{/.exec(src);
+  if (named) dictLiteralKeys(src, src.indexOf("{", named.index), keys);
+  for (const m of src.matchAll(/_invoke_lambda\s*\([^,]+,\s*"[A-Za-z_0-9]+___[a-z_0-9]+"\s*,\s*\{/g)) {
+    dictLiteralKeys(src, src.indexOf("{", m.index + m[0].length - 1), keys);
   }
   return keys;
 }
@@ -169,6 +182,50 @@ function destructuredKeys(source: string, anchor: RegExp, label: string): Set<st
 function argsPropertyReads(source: string): Set<string> {
   const keys = new Set<string>();
   for (const m of source.matchAll(/\bargs\??\.([a-z][a-z_0-9]*)\b/g)) keys.add(m[1]);
+  return keys;
+}
+
+/** One `async function <name>(…)` slice out of a Lambda, to the next top-level
+ *  `async function`. Needed for the per-tool handlers below: unlike
+ *  `createTicket`/`reportCompletion`, the comment and transition handlers read a
+ *  handful of keys by property access, so a file-wide union would say "yes, some
+ *  tool in this zip reads that" — which is exactly the question that misses a
+ *  per-tool mismatch. */
+function lambdaFunctionSource(source: string, name: string, label: string): string {
+  const start = source.indexOf(`async function ${name}(`);
+  expect(start, `${label}: async function ${name} not found — the extractor is stale`).toBeGreaterThan(
+    -1,
+  );
+  const rest = source.slice(start);
+  const end = rest.indexOf("\nasync function ", 1);
+  return end === -1 ? rest : rest.slice(0, end);
+}
+
+/** Every `Tickets___*` tool name main.py actually invokes on the ticket-tools
+ *  Lambda. The tool NAME is the dispatch key, so this is the set that has to be
+ *  routable — a name neither twin knows is a tool that always errors. */
+function invokedTicketToolNames(): Set<string> {
+  const names = new Set<string>();
+  for (const m of mainPy.matchAll(/TICKET_TOOLS_LAMBDA,\s*"(Tickets___[a-z_0-9]+)"/g)) {
+    names.add(m[1]);
+  }
+  return names;
+}
+
+/** The DDB twin dispatches on `toolName.split("___").pop()` and a `switch`, so
+ *  its routable names are the STRIPPED case labels. */
+function ddbSwitchCases(): Set<string> {
+  const cases = new Set<string>();
+  for (const m of ticketsLambda.matchAll(/\n\s*case "([a-z_0-9]+)":/g)) cases.add(m[1]);
+  return cases;
+}
+
+/** The Jira twin dispatches on `TOOLS[event.tool_name]` — a lookup on the FULL,
+ *  unstripped name. Two different dispatch schemes over one tool interface is
+ *  precisely why a name can be routable on one twin and not the other. */
+function jiraToolsMapKeys(): Set<string> {
+  const keys = new Set<string>();
+  for (const m of jiraLambda.matchAll(/\n\s*(Tickets___[a-z_0-9]+):\s*[A-Za-z]/g)) keys.add(m[1]);
   return keys;
 }
 
@@ -370,6 +427,172 @@ describe("tool-signature parity — the three at-risk arguments", () => {
     expect(reportCompletionFwd).toContain("follow_ups");
     expect(workflowOutputRead).toContain("follow_ups");
     expect(reportCompletionSrc).not.toMatch(/\bfollowUps\b/);
+  });
+});
+
+describe("tool-signature parity — the other Tickets___* tools reach both twins", () => {
+  /**
+   * TEAM-4749 sibling sweep. The two ticket Lambdas are meant to expose ONE
+   * identical `Tickets___*` interface (CLAUDE.md), and the checks above only
+   * covered `create_ticket`. Two independent things have to line up per tool, and
+   * the twins do each of them differently, so each gets its own assertion:
+   *
+   *   1. the tool NAME has to be routable — the DDB twin strips `___` and
+   *      switches on the tail, the Jira twin looks up the full name in a map;
+   *   2. the payload KEYS have to be the ones that twin's handler reads.
+   *
+   * Both mismatches return an error string to the persona and write nothing, and
+   * neither unit suite could see them.
+   */
+  const invoked = invokedTicketToolNames();
+  const ddbCases = ddbSwitchCases();
+  const jiraKeys = jiraToolsMapKeys();
+
+  it("found the invoked names and both twins' dispatch tables", () => {
+    // Vacuity guard — any of these passing empty would make every assertion
+    // below meaningless. The forwardedKeys checks are here because the extractor
+    // DID return empty for these wrappers at first: they pass their payload
+    // inline to _invoke_lambda instead of building a named `args` dict, so the
+    // "add_comment sends both names" test passed vacuously until shape 3 was
+    // added. A parity test that cannot fail is worse than no parity test.
+    expect(invoked.size).toBeGreaterThan(5);
+    expect(ddbCases.size).toBeGreaterThan(5);
+    expect(jiraKeys.size).toBeGreaterThan(5);
+    for (const tool of [
+      "Tickets___add_comment",
+      "Tickets___transition_ticket",
+      "Tickets___update_ticket",
+      "Tickets___get_issue",
+    ]) {
+      expect(
+        forwardedKeys(toolSource(tool)).size,
+        `forwardedKeys extracted nothing from ${tool} — the extractor is stale`,
+      ).toBeGreaterThan(1);
+    }
+  });
+
+  /**
+   * Names the DDB twin cannot route. `update_ticket` is a REAL, live gap, not a
+   * naming choice: main.py invokes `Tickets___update_ticket`, the DDB twin strips
+   * that to `update_ticket` and its switch has only `edit_issue`, so the call
+   * lands on the default `Unknown tool` branch. It is not fixable from the
+   * wrapper — the Jira twin's map has `Tickets___update_ticket` and NO
+   * `edit_issue` entry at all, so renaming the invoke to `Tickets___edit_issue`
+   * would simply move the breakage to the shipped provider. The fix is a
+   * one-line `case "update_ticket":` alias in the DDB twin, which TEAM-4749 does
+   * not own. Tracked here so the gap is a named exception instead of a silence,
+   * and so any NEW unroutable tool fails this test.
+   */
+  const DDB_ROUTING_GAPS: Record<string, string> = {
+    Tickets___update_ticket:
+      "DDB twin has case 'edit_issue' but no 'update_ticket'; Jira twin has no " +
+      "'edit_issue', so no single name routes on both. Needs a DDB-side alias.",
+  };
+
+  it("every invoked tool name is routable by the DynamoDB twin", () => {
+    const unroutable = [...invoked]
+      .filter((n) => !ddbCases.has(n.split("___").pop()!) && !(n in DDB_ROUTING_GAPS))
+      .sort();
+    expect(
+      unroutable,
+      `main.py invokes ${unroutable.join(", ")} but the DynamoDB twin's switch has no ` +
+        `matching case, so the call returns "Unknown tool" and writes nothing. Add the ` +
+        `case, or record it in DDB_ROUTING_GAPS with a reason`,
+    ).toEqual([]);
+  });
+
+  it("every invoked tool name is routable by the Jira twin", () => {
+    // No exceptions list here on purpose: the Jira twin is the shipped provider
+    // (Dockerfile / .env.example set TICKET_PROVIDER=jira), so an unroutable name
+    // here is a production outage, never a tracked gap.
+    const unroutable = [...invoked].filter((n) => !jiraKeys.has(n)).sort();
+    expect(
+      unroutable,
+      `main.py invokes ${unroutable.join(", ")} but the Jira twin's TOOLS map has no such ` +
+        `key — that is the shipped provider, so this is live`,
+    ).toEqual([]);
+  });
+
+  it("the recorded DynamoDB routing gaps are still real", () => {
+    // A tracked exception that gets fixed must stop being an exception, or this
+    // list quietly becomes a place where real drift can hide.
+    for (const [name, why] of Object.entries(DDB_ROUTING_GAPS)) {
+      expect(invoked, `${name} is in DDB_ROUTING_GAPS but main.py no longer invokes it`).toContain(
+        name,
+      );
+      expect(
+        ddbCases.has(name.split("___").pop()!),
+        `${name} now routes on the DynamoDB twin — delete it from DDB_ROUTING_GAPS (${why})`,
+      ).toBe(false);
+    }
+  });
+
+  it("add_comment sends the text under both wire names", () => {
+    /**
+     * The twins disagree on the key for a comment's text, so the wrapper sends
+     * both — the same fix `Tickets___get_issue` already uses for `ticket_id` vs
+     * `issue_key`. Before it, every comment in TICKET_PROVIDER=dynamodb mode came
+     * back "Error: 'body' is required" and wrote nothing; dynamodb is the code
+     * default when the var is unset (deploy/setup-tickets-lambda.mjs).
+     */
+    const addCommentFwd = forwardedKeys(toolSource("Tickets___add_comment"));
+    const ddbAddComment = lambdaFunctionSource(ticketsLambda, "addComment", "tickets twin");
+    const jiraAddComment = lambdaFunctionSource(jiraLambda, "addComment", "jira twin");
+
+    // Each twin's own read, asserted rather than assumed.
+    expect(argsPropertyReads(ddbAddComment)).toContain("body");
+    expect(jiraAddComment).toMatch(/const \{[^}]*\bcomment\b[^}]*\} = params;/);
+
+    // ...and the payload satisfies both at once.
+    expect(addCommentFwd).toContain("comment");
+    expect(addCommentFwd).toContain("body");
+    expect(addCommentFwd).toContain("ticket_id");
+  });
+
+  it("transition_ticket's arguments are read by both twins", () => {
+    const fwd = forwardedKeys(toolSource("Tickets___transition_ticket"));
+    const ddbTransition = lambdaFunctionSource(ticketsLambda, "transitionIssue", "tickets twin");
+    const jiraTransition = lambdaFunctionSource(jiraLambda, "transitionTicket", "jira twin");
+
+    // `blocked_by` is the typed-gate parking argument and `reason` is the audit
+    // line — a persona is told to pass both, so both must survive the crossing.
+    for (const key of ["reason", "blocked_by"]) {
+      expect(fwd, `transition_ticket no longer forwards ${key}`).toContain(key);
+      expect(
+        argsPropertyReads(ddbTransition).has(key) || new RegExp(`\\b${key}\\b`).test(ddbTransition),
+        `the DynamoDB twin's transitionIssue no longer reads ${key}`,
+      ).toBe(true);
+      expect(jiraTransition, `the Jira twin's transitionTicket no longer reads ${key}`).toMatch(
+        new RegExp(`\\b${key}\\b`),
+      );
+    }
+    // The ticket key needs one spelling only: Jira destructures `ticket_id` and
+    // the DDB twin reads `issue_key || ticket_id`.
+    expect(fwd).toContain("ticket_id");
+    expect(ddbTransition).toMatch(/args\.issue_key \|\| args\.ticket_id/);
+  });
+
+  it("update_ticket's payload matches the twin that can actually route it", () => {
+    /**
+     * Keys only — the DDB routing gap above means its handler is unreachable, so
+     * pinning `title` against `editIssue`'s `args.summary` would assert a contract
+     * nothing exercises. What IS live is the Jira twin, and it destructures the
+     * three keys the wrapper sends.
+     */
+    const fwd = forwardedKeys(toolSource("Tickets___update_ticket"));
+    const jiraUpdate = lambdaFunctionSource(jiraLambda, "updateTicket", "jira twin");
+    for (const key of ["ticket_id", "description", "title"]) {
+      expect(fwd, `update_ticket no longer forwards ${key}`).toContain(key);
+      expect(jiraUpdate, `the Jira twin's updateTicket no longer reads ${key}`).toMatch(
+        new RegExp(`\\b${key}\\b`),
+      );
+    }
+    // The DDB twin's editIssue reads `summary`, not `title` — recorded so that
+    // whoever lands the routing alias knows the payload needs a second spelling
+    // too, exactly like add_comment above.
+    expect(
+      lambdaFunctionSource(ticketsLambda, "editIssue", "tickets twin"),
+    ).toMatch(/args\.summary/);
   });
 });
 

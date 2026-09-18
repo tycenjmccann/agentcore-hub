@@ -1999,8 +1999,16 @@ def Tickets___add_comment(ticket_id: str, comment: str) -> str:
         ticket_id: The ticket ID to comment on
         comment: Comment text to add
     """
+    # TEAM-4749 sibling sweep: send the text under BOTH key names, exactly as
+    # Tickets___get_issue above sends `ticket_id` + `issue_key` and for the same
+    # reason — the twins disagree on the wire name. The Jira twin destructures
+    # `comment` (jira index.mjs addComment), the DDB twin reads `body || content`
+    # (tickets index.mjs addComment) and answered "Error: 'body' is required" to
+    # every comment in TICKET_PROVIDER=dynamodb mode, which is the code default
+    # when the var is unset. `body` is read in exactly one place across both twins
+    # and neither rejects unknown keys, so the extra key is inert on Jira.
     return _invoke_lambda(TICKET_TOOLS_LAMBDA, "Tickets___add_comment", {
-        "ticket_id": ticket_id, "comment": comment
+        "ticket_id": ticket_id, "comment": comment, "body": comment
     })
 
 
