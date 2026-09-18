@@ -37,6 +37,11 @@ DAILY_TABLE="${EVAL_DAILY_TABLE:-agentcore-hub-eval-daily}"
 # Per-result rows (PK agentId / SK sk, GSIs bySession/byPersona/byWorkflow).
 # Created by deploy-all.sh, which defaults to the same name.
 RESULTS_TABLE="${EVAL_RESULTS_TABLE:-agentcore-hub-eval-results}"
+# TEAM-4760: the SI ledger (PK patternKey), created by scripts/create-dynamodb-tables.sh
+# and by deploy/workflow-manager/deploy.sh. prd-submitter reads it to refuse a
+# pattern already in flight and writes the in-run attempt for the run it starts;
+# same default name as lambda/prd-submitter/si-ledger.mjs.
+SI_LEDGER_TABLE="${SI_LEDGER_TABLE:-agentcore-hub-si-ledger}"
 
 # ─── Legacy results-group → agentId map ─────────────────────────────────────
 # deploy/evaluations/legacy-results-groups.json lists the pre-consolidation eval
@@ -110,7 +115,7 @@ aws s3api put-bucket-notification-configuration \
   --bucket "$BUCKET" --notification-configuration '{"EventBridgeConfiguration":{}}' 2>/dev/null
 echo "✓ S3: ${BUCKET}"
 
-# ─── IAM: results table + evaluator-results log reads ───────────────────────
+# ─── IAM: results table + si ledger + evaluator-results log reads ───────────
 # A SEPARATE inline policy on the SAME shared Lambda role, deliberately not
 # folded into setup-lambda-role.sh's `DynamoDBAccess` document: put-role-policy
 # replaces a policy wholesale, so two scripts editing one document would each
@@ -122,6 +127,19 @@ echo "✓ S3: ${BUCKET}"
 # conditional row per result into ${RESULTS_TABLE} (+ its GSIs on Query).
 # DescribeLogGroups has to be unscoped: it is a list call, and the resource it
 # would be scoped to is what the call is discovering.
+#
+# TEAM-4760: prd-submitter reads the SI ledger (GetItem/Scan) to refuse a pattern
+# already in flight, and puts the in-run attempt + expectations for the run it
+# starts. Scan is there because SiLedger.list() is a full scan by design (one row
+# per pattern — tens, not millions); no Update/Delete, because every write is a
+# whole-row put of a reduced row and nothing here ever removes a pattern.
+#
+# This DUPLICATES the `SiLedgerTable` statement that
+# deploy/workflow-manager/deploy.sh puts on the same role (in its own
+# `WorkflowManagerAccess` document, so neither clobbers the other) — deliberately:
+# prd-submitter ships with the Evaluations module and must not silently lose its
+# dedupe gate on an install where the Workflow Manager was never deployed. The
+# grant here is the narrower of the two (no Query/UpdateItem).
 ROLE_NAME_FOR_EVAL="${ROLE_ARN##*/}"
 aws iam put-role-policy \
   --role-name "$ROLE_NAME_FOR_EVAL" \
@@ -146,6 +164,17 @@ aws iam put-role-policy \
         ]
       },
       {
+        \"Sid\": \"SiLedgerTable\",
+        \"Effect\": \"Allow\",
+        \"Action\": [
+          \"dynamodb:GetItem\",
+          \"dynamodb:PutItem\",
+          \"dynamodb:Scan\",
+          \"dynamodb:DescribeTable\"
+        ],
+        \"Resource\": \"arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/${SI_LEDGER_TABLE}\"
+      },
+      {
         \"Sid\": \"EvalResultsListLogGroups\",
         \"Effect\": \"Allow\",
         \"Action\": [\"logs:DescribeLogGroups\"],
@@ -162,7 +191,7 @@ aws iam put-role-policy \
       }
     ]
   }" --output text >/dev/null
-echo "✓ IAM: EvalResultsAccess on ${ROLE_NAME_FOR_EVAL} (DDB ${RESULTS_TABLE} + evaluator results log reads)"
+echo "✓ IAM: EvalResultsAccess on ${ROLE_NAME_FOR_EVAL} (DDB ${RESULTS_TABLE} + ${SI_LEDGER_TABLE} + evaluator results log reads)"
 
 # ─── Lambdas ─────────────────────────────────────────────────────────────────
 deploy_lambda() {
@@ -173,6 +202,13 @@ deploy_lambda() {
   # every invocation fail with ERR_MODULE_NOT_FOUND at init.
   local EXTRA_PATHS=()
   [ -d lib ] && EXTRA_PATHS+=(lib/)
+  # TEAM-4760: si-ledger.mjs is a sibling module, byte-copied per Lambda zip
+  # because the zip is built with `cd "$DIR"` and cannot reach lambda/shared/
+  # (see scripts/check-si-ledger-parity.sh). prd-submitter imports it at module
+  # load, so leaving it out of the zip fails EVERY invocation at init with
+  # ERR_MODULE_NOT_FOUND — the same trap the lib/ line above exists for. Mirrors
+  # the explicit files list in deploy/pipeline/surfaces.json.
+  [ -f si-ledger.mjs ] && EXTRA_PATHS+=(si-ledger.mjs)
   # Bundle node_modules when the function declares runtime deps (e.g. the
   # eval-packager's SigV4 stack used to invoke the improver runtime). The
   # nodejs20.x runtime only ships the v3 SDK clients, not @smithy/* signing.
@@ -220,8 +256,13 @@ deploy_lambda() {
 deploy_lambda "eval-packager" "eval-packager" 600 512 \
   "{ARTIFACT_BUCKET=${BUCKET},IMPROVEMENT_AGENT_ARN=${IMPROVER_ARN},AWS_ACCOUNT_ID=${ACCOUNT_ID},EVAL_SEEN_TABLE=${SEEN_TABLE},EVAL_DAILY_TABLE=${DAILY_TABLE},EVAL_RESULTS_TABLE=${RESULTS_TABLE},LEGACY_RESULTS_GROUPS_B64=${LEGACY_GROUPS_B64}}"
 
+# SI_LEDGER_TABLE is what makes the submission gate real: without it the submitter
+# would fall back to the code default and, if that table were absent, every system
+# PRD would throw on the dedupe read instead of silently double-filing a pattern
+# (reads happen BEFORE the run is started, so a retry is safe). --environment
+# REPLACES the whole variable set, so all four must be listed here.
 deploy_lambda "prd-submitter" "prd-submitter" 30 256 \
-  "{ARTIFACT_BUCKET=${BUCKET},WORKFLOW_API_URL=${WORKFLOW_API},FLEET_REPO_URL=${FLEET_REPO}}"
+  "{ARTIFACT_BUCKET=${BUCKET},WORKFLOW_API_URL=${WORKFLOW_API},FLEET_REPO_URL=${FLEET_REPO},SI_LEDGER_TABLE=${SI_LEDGER_TABLE}}"
 
 # ─── CW Logs → Packager (subscription filters) ──────────────────────────────
 PACKAGER_ARN="arn:aws:lambda:${AWS_REGION}:${ACCOUNT_ID}:function:agentcore-hub-eval-packager"

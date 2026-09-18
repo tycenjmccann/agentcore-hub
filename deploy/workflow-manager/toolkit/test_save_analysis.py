@@ -176,5 +176,197 @@ class KpiVersion(unittest.TestCase):
             save_analysis.validate(bad)
 
 
+class PatternKeys(unittest.TestCase):
+    """TEAM-4760 — a P0/P1 recommendation must name the defect class it is about.
+
+    The defect this pins: recommendations used to be prose inside one analysis row,
+    so "the WM has asked for this 8 times and 6 fixes did nothing" was
+    unanswerable, and the loop re-synthesized the same ask for weeks. The key is
+    what makes an ask countable. save_analysis is the only write path for analyses,
+    so it is the only place the rule can be enforced — a missing key fails the save
+    rather than being fixed up, because a silently keyless P0 is invisible again.
+    """
+
+    def _with_recs(self, *recs):
+        analysis = _valid_analysis()
+        analysis["recommendations"] = list(recs)
+        return analysis
+
+    def _rec(self, priority="P0", **extra):
+        rec = {
+            "priority": priority,
+            "type": "prompt",
+            "title": "Make the harness report completion before exiting",
+            "description": "The agent exits without calling report_completion.",
+            "expectedImpact": "Silent deaths go to zero.",
+        }
+        rec.update(extra)
+        return rec
+
+    def test_p0_without_patternkey_rejected(self):
+        with self.assertRaises(SystemExit) as ctx:
+            save_analysis.validate(self._with_recs(self._rec("P0")))
+        self.assertIn("patternKey is required on P0", str(ctx.exception))
+
+    def test_p1_without_patternkey_rejected(self):
+        with self.assertRaises(SystemExit) as ctx:
+            save_analysis.validate(self._with_recs(self._rec("P1")))
+        self.assertIn("patternKey is required on P1", str(ctx.exception))
+
+    def test_p2_may_omit_it(self):
+        # Requiring a key on every nicety would only produce throwaway keys.
+        save_analysis.validate(self._with_recs(self._rec("P2")))
+
+    def test_malformed_keys_are_rejected_at_every_priority(self):
+        bad = [
+            "Harness.Silent-Death",          # uppercase
+            "harness",                       # no area/slug split
+            "harness.",                      # empty segment
+            "harness..silent",               # empty middle segment
+            "harness silent.death",          # space
+            "harness_silent.death",          # underscore
+            "#metrics",                      # reserved bookkeeping namespace
+            "",
+            42,
+        ]
+        for value in bad:
+            with self.subTest(value=value):
+                with self.assertRaises(SystemExit):
+                    save_analysis.validate(self._with_recs(self._rec("P0", patternKey=value)))
+            with self.subTest(value=value, priority="P2"):
+                # A key that IS present must be valid even where it is optional: a
+                # typo starts a second lineage for an already-tracked defect.
+                with self.assertRaises(SystemExit):
+                    save_analysis.validate(self._with_recs(self._rec("P2", patternKey=value)))
+
+    def test_a_valid_key_passes(self):
+        save_analysis.validate(
+            self._with_recs(self._rec("P0", patternKey="harness.silent-death.exit-without-report"))
+        )
+
+    def test_a_finding_key_must_be_valid_but_is_not_required(self):
+        analysis = _valid_analysis()
+        save_analysis.validate(analysis)  # no key on the finding: fine
+        analysis["findings"][0]["patternKey"] = "NOPE"
+        with self.assertRaises(SystemExit):
+            save_analysis.validate(analysis)
+        analysis["findings"][0]["patternKey"] = "ci.flake.timeout"
+        save_analysis.validate(analysis)
+
+
+class Sightings(unittest.TestCase):
+    """The occurrence rows this analysis contributes to the ledger — pure mapping,
+    no table."""
+
+    KEY = "harness.silent-death.exit-without-report"
+
+    def _item(self):
+        return {
+            "workflowId": "wf_1",
+            "analysisId": "1750000000000-abcd",
+            "workflowDefId": "software-delivery",
+            "analyzedAt": "2026-09-18T12:00:00Z",
+        }
+
+    def test_one_occurrence_per_key_even_when_named_twice(self):
+        # The same defect named by a finding AND its recommendation is ONE sighting
+        # in ONE run. Counting it twice would inflate the number the SI impact
+        # panel exists to report.
+        analysis = _valid_analysis()
+        analysis["findings"] = [
+            {"title": "Agent exited silently", "kind": "failure", "severity": "critical",
+             "evidence": "TEAM-1 ended with no completion event.", "patternKey": self.KEY},
+            {"title": "Tests passed", "kind": "success", "severity": "low", "evidence": "CI green."},
+        ]
+        analysis["recommendations"] = [{
+            "priority": "P0", "type": "prompt", "patternKey": self.KEY,
+            "title": "Require report_completion before exit",
+            "description": "…", "expectedImpact": "…",
+        }]
+        out = save_analysis.sightings(analysis, self._item())
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["patternKey"], self.KEY)
+        # Recommendation wins the title (it names the ask), finding wins the
+        # severity (it is the only one that has a real severity).
+        self.assertEqual(out[0]["title"], "Require report_completion before exit")
+        self.assertEqual(out[0]["occurrence"]["severity"], "critical")
+
+    def test_severity_falls_back_to_the_priority(self):
+        analysis = _valid_analysis()
+        analysis["recommendations"] = [
+            {"priority": "P0", "type": "prompt", "patternKey": "a.b", "title": "t",
+             "description": "d", "expectedImpact": "e"},
+            {"priority": "P2", "type": "process", "patternKey": "c.d", "title": "t",
+             "description": "d", "expectedImpact": "e"},
+        ]
+        got = {s["patternKey"]: s["occurrence"]["severity"] for s in save_analysis.sightings(analysis, self._item())}
+        self.assertEqual(got, {"a.b": "critical", "c.d": "medium"})
+
+    def test_occurrence_carries_the_run_and_the_analysis_id(self):
+        analysis = _valid_analysis()
+        analysis["recommendations"] = [{
+            "priority": "P1", "type": "tooling", "patternKey": self.KEY, "title": "t",
+            "description": "d", "expectedImpact": "e",
+        }]
+        occ = save_analysis.sightings(analysis, self._item())[0]["occurrence"]
+        self.assertEqual(occ["workflowId"], "wf_1")
+        # analysisId is what makes the upsert idempotent — a re-run of ANALYZE for
+        # the same run must not add a second sighting.
+        self.assertEqual(occ["analysisId"], "1750000000000-abcd")
+        self.assertEqual(occ["workflowDefId"], "software-delivery")
+        self.assertEqual(occ["at"], "2026-09-18T12:00:00Z")
+
+    def test_no_keys_means_no_ledger_client_is_even_built(self):
+        # An analysis with no keys must not construct SiLedger at all: doing so
+        # would import boto3 and resolve credentials for a write that has nothing
+        # to write, and would fail an ANALYZE on a role without ledger access.
+        with mock.patch.object(save_analysis.si_ledger, "SiLedger") as ctor:
+            out = save_analysis.record_sightings(_valid_analysis(), self._item())
+        ctor.assert_not_called()
+        self.assertEqual(out, {"keys": [], "errors": []})
+
+
+class LedgerWriteIsNotFatal(unittest.TestCase):
+    """The analysis is the expensive artifact; the ledger is a mirror the next
+    analysis re-converges. A ledger failure must therefore be REPORTED, not
+    allowed to discard a completed analysis."""
+
+    def _analysis_with_two_keys(self):
+        analysis = _valid_analysis()
+        analysis["recommendations"] = [
+            {"priority": "P0", "type": "prompt", "patternKey": "a.one", "title": "t",
+             "description": "d", "expectedImpact": "e"},
+            {"priority": "P1", "type": "process", "patternKey": "b.two", "title": "t",
+             "description": "d", "expectedImpact": "e"},
+        ]
+        return analysis
+
+    def test_both_keys_are_upserted_and_reported(self):
+        fake = mock.MagicMock()
+        with mock.patch.object(save_analysis.si_ledger, "SiLedger", return_value=fake):
+            item = _persisted_item(self, {"phase": "complete"}, analysis=self._analysis_with_two_keys())
+        self.assertEqual(item["recommendations"][0]["patternKey"], "a.one")
+        self.assertEqual(
+            sorted(c.args[0] for c in fake.upsert_occurrence.call_args_list),
+            ["a.one", "b.two"],
+        )
+
+    def test_a_failing_upsert_does_not_lose_the_analysis(self):
+        fake = mock.MagicMock()
+        fake.upsert_occurrence.side_effect = [RuntimeError("ProvisionedThroughputExceeded"), None]
+        with mock.patch.object(save_analysis.si_ledger, "SiLedger", return_value=fake):
+            out = save_analysis.record_sightings(
+                self._analysis_with_two_keys(),
+                {"workflowId": "wf_1", "analysisId": "a1", "workflowDefId": "software-delivery",
+                 "analyzedAt": "2026-09-18T12:00:00Z"},
+            )
+        # One key through, one reported — and no exception, so main() still printed
+        # the saved analysis.
+        self.assertEqual(out["keys"], ["b.two"])
+        self.assertEqual(len(out["errors"]), 1)
+        self.assertEqual(out["errors"][0]["patternKey"], "a.one")
+        self.assertIn("ProvisionedThroughputExceeded", out["errors"][0]["error"])
+
+
 if __name__ == "__main__":
     unittest.main()

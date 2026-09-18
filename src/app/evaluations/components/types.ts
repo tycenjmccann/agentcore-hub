@@ -196,3 +196,51 @@ export function personaMetrics(row: PersonaRow): Partial<AgentMetrics> {
     models: row.metrics?.models ?? row.models,
   };
 }
+
+// ─── GET /api/evaluations/si-ledger ──────────────────────────────────────────
+
+/**
+ * The SI ledger, as the "SI impact" panel consumes it. Structural types only —
+ * the authoritative row shape lives in `src/lib/si-ledger.ts` (server side) and
+ * is re-exported here so the client bundle never imports the AWS SDK. Keep the
+ * two in step; every field stays optional for the reason in this file's header.
+ */
+export type {
+  SiAttempt,
+  SiCoverageDay,
+  SiExpected,
+  SiLedgerRow,
+  SiOccurrence,
+  SiStatus,
+  SiVerdict,
+  SiVerdictValue,
+} from "@/lib/si-ledger";
+
+import type { SiAttempt, SiExpected, SiStatus, SiVerdict } from "@/lib/si-ledger";
+
+/** Hero tiles. `analysisCoverage` is null when the daily verify has not measured yet. */
+export interface SiSummary {
+  patterns: number;
+  openPatterns: number;
+  verifiedFixes: number;
+  noEffectFixes: number;
+  inRun: number;
+  occurrences: number;
+  analysisCoverage: number | null;
+  analysisCoverageDay: string | null;
+}
+
+/** One table row: counts, not histories — the drill-down fetches the full row. */
+export interface SiPatternSummary {
+  patternKey: string;
+  title: string | null;
+  status: SiStatus | null;
+  firstSeen: string | null;
+  lastSeen: string | null;
+  occurrences: number;
+  attempts: number;
+  source: string | null;
+  latestAttempt: SiAttempt | null;
+  latestVerdict: SiVerdict | null;
+  expected: SiExpected[];
+}
