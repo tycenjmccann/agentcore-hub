@@ -29,7 +29,8 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
  *   syq0p9 — the cd-ledger carried three console/IAM steps only a human could do.
  *     Three separate asks in one person's queue for one sitting at one console.
  *   hirhfw — the REGRESSION: an ordinary completion that carries no follow-ups at
- *     all must produce the pre-change record plus exactly one key (`delivery`).
+ *     all must produce the pre-change record plus exactly three keys (`delivery`,
+ *     `followUpsPending`, `status`).
  */
 
 const h = vi.hoisted(() => ({
@@ -416,7 +417,7 @@ describe("syq0p9 — three console/IAM steps become ONE human ticket", () => {
 });
 
 describe("REGRESSION hirhfw — a completion with no follow-ups is unchanged but for delivery", () => {
-  it("writes the pre-change record plus exactly one key, and calls no ticket tool but the transition", async () => {
+  it("writes the pre-change record plus exactly three keys, and calls no ticket tool but the transition", async () => {
     // hirhfw is an ordinary dev completion: a PR, no ship claim, no follow-ups. It
     // is the shape almost every report in the corpus has, so "additive" has to mean
     // additive here or TEAM-4740 changed every run in the fleet.
