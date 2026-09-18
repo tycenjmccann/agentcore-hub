@@ -113,6 +113,10 @@ phases:
       - "node --test lambda/cost-report"
       - "node --test lambda/agentcore-hub-jira"
       - "node --test lambda/anomaly-watcher"
+      # TEAM-4760: the SI-ledger reducers and the backfill classifier are
+      # standalone node:test suites too (nothing under scripts/ was gated before).
+      # Mirrors ci.yml's "SI-ledger + backfill unit tests" step.
+      - "node --test lambda/workflow-analyzer/si-ledger.test.mjs scripts/__tests__"
       # The fix-kind set is duplicated across seven places that cannot import each
       # other (two ticket Lambdas, the orchestrator, types.ts, main.py,
       # compute_metrics.py); a kind forgotten in one fails SILENTLY. Mirrors
@@ -131,6 +135,11 @@ phases:
       # and the Telegram bridge (each ships as a self-contained zip). Mirrors
       # ci.yml's "CD-registry parity guard" step.
       - "./scripts/check-cd-registry-parity.sh"
+      # TEAM-4760: si-ledger.mjs is byte-copied into prd-submitter, and
+      # toolkit/si_ledger.py is its Python twin — both pinned by
+      # fixtures/si-ledger-contract.json. Mirrors ci.yml's "SI-ledger parity
+      # guard" step.
+      - "./scripts/check-si-ledger-parity.sh"
       # DL-009 thin-orchestrator guard: module + env allow-lists, zip-line names,
       # line budget. Mirrors ci.yml's "Orchestrator surface guard" step.
       - "./scripts/check-orchestrator-surface.sh"
