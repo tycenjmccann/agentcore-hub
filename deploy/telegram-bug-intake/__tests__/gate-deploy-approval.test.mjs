@@ -160,12 +160,16 @@ vi.mock("@aws-sdk/client-sts", () => ({
   AssumeRoleCommand: class { constructor(input) { this.input = input; } },
 }));
 
-// The bridge reads exactly one S3 key: the CD registry.
-const s3 = vi.hoisted(() => ({ calls: [], registry: null }));
+// The bridge reads one S3 key (the CD registry) and writes one (the SEC-1
+// rejection marker, TEAM-4781 — load-bearing on ❌, so PutObjectCommand must be
+// mocked here too: without it `new PutObjectCommand(...)` is `new undefined()`,
+// and that TypeError used to be swallowed by the best-effort write).
+const s3 = vi.hoisted(() => ({ calls: [], puts: [], registry: null }));
 vi.mock("@aws-sdk/client-s3", () => ({
   S3Client: class {
     async send(c) {
       s3.calls.push(c.input);
+      if (c.op === "put") { s3.puts.push(c.input); return {}; }
       if (c.input?.Key === CD_REGISTRY_KEY && s3.registry) {
         const doc = s3.registry;
         return { Body: { transformToString: async () => (typeof doc === "string" ? doc : JSON.stringify(doc)) } };
@@ -176,6 +180,7 @@ vi.mock("@aws-sdk/client-s3", () => ({
     }
   },
   GetObjectCommand: class { constructor(i) { this.input = i; } },
+  PutObjectCommand: class { constructor(i) { this.input = i; this.op = "put"; } },
 }));
 
 vi.mock("@aws-sdk/client-eventbridge", () => ({
@@ -261,7 +266,7 @@ function resetAll() {
   db.items.clear(); db.puts.length = 0; db.deletes.length = 0;
   cp.states.clear(); cp.stateErrors.clear(); cp.putErrors.clear();
   cp.approvals.length = 0; cp.sends.length = 0; cp.inits.length = 0; cp.onPut = null;
-  s3.calls.length = 0; s3.registry = null;
+  s3.calls.length = 0; s3.puts.length = 0; s3.registry = null;
   sts.assumes.length = 0;
   log.entries.length = 0;
   db.items.set(`chat#${CHAT}`, { id: { S: `chat#${CHAT}` }, chatId: { N: String(CHAT) } });
