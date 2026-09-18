@@ -56,6 +56,16 @@ const h = vi.hoisted(() => ({
   // FR-11: the workflows-table row `submit_ticket_plan` reads `featureBranch` off,
   // plus every Get it issued and an optional throw (the fail-open path).
   workflow: null, workflowGets: [], workflowGetError: null,
+  // TEAM-4756 R3-2: `h.calls.length` at the moment of each PutObject, one entry per
+  // `h.puts` entry. The R3-2 invariant is an ORDERING one — the record lands after the
+  // follow-up creates and before the Done transition — and S3 and the ticket Lambda are
+  // separate mocks, so there is otherwise nothing that relates their two arrays.
+  putAtCall: [],
+  // TEAM-4756 R3-2: `(input) => Error|null`, consulted on every PutObject after it has
+  // been recorded on `h.puts` (so a gate can count what it has already seen). The status
+  // rewrite on a failed transition is BEST-EFFORT, and "best-effort" is only a claim if
+  // a test can make it fail and watch the response stay the same.
+  putGate: null,
 }));
 
 const asString = (body) => (typeof body === "string" ? body : Buffer.from(body).toString("utf8"));
@@ -67,6 +77,14 @@ vi.mock("@aws-sdk/client-s3", () => ({
       const input = cmd?.input || {};
       if (name === "PutObjectCommand") {
         h.puts.push(input);
+        h.putAtCall.push(h.calls.length);
+        // TEAM-4756 R3-2: per-CALL, like `transitionGate`, because the case under test is
+        // "the FIRST write of this key lands and the SECOND fails" — a key-scoped throw
+        // would fail both and there would be no record to leave standing.
+        if (h.putGate) {
+          const err = h.putGate(input);
+          if (err) throw err;
+        }
         h.objects.set(input.Key, asString(input.Body));
         return {};
       }
@@ -247,7 +265,11 @@ const report = (extra) =>
 // from the report, so it is always computable), which is why it belongs in the
 // base set rather than in the additive-field tests. That "plus only delivery" is
 // itself the assertion — the hirhfw regression is that nothing ELSE moved.
-const BASE_KEYS = ["ticket_id", "summary", "artifacts", "branch", "commit_sha", "pr_url", "completed_at", "delivery"];
+//
+// TEAM-4756 R3-2 adds exactly two more, on the same "every record carries them"
+// footing: `followUpsPending` and `status` are computable on every completion and
+// are what the twins' existence-only DL-030 guard has to read.
+const BASE_KEYS = ["ticket_id", "summary", "artifacts", "branch", "commit_sha", "pr_url", "completed_at", "delivery", "followUpsPending", "status"];
 
 // TEAM-4706 fixtures, shared with the ship-report-contract block at the bottom.
 const EXEC_ID = "b3a1c0de-1234-4f56-89ab-cdef01234567"; // 36 chars, [0-9a-f-] only
@@ -273,6 +295,8 @@ const events = (type) => h.events.filter((e) => e.type === type);
 
 beforeEach(() => {
   h.puts.length = 0;
+  h.putAtCall.length = 0;
+  h.putGate = null;
   h.warns.length = 0;
   h.gets.length = 0;
   h.heads.length = 0;
@@ -1102,8 +1126,15 @@ describe("report_completion — N2: a retryable follow-up failure withholds Done
     // states a fact the durable record already carries, so it is unaffected.
     expect(events("workflow.report_completion")).toHaveLength(0);
     expect(events("delivery.prState")).toHaveLength(1);
+    // TEAM-4756 R3-2: and the record SAYS so, which is the whole contract — the
+    // twins' DL-030 guard is existence-only, so a record that does not state this is
+    // indistinguishable from a finished one and licenses a direct done.
+    expect(record().followUpsPending).toBe(true);
+    expect(record().status).toBe("complete_pending_follow_ups");
 
     // The retry, with the SAME arguments the message told the agent to send.
+    h.puts.length = 0;
+    h.putAtCall.length = 0; // kept in lockstep with h.puts - they are index-aligned
     h.createGate = null;
     const res = result(await report({ follow_ups: TWO }));
     expect(h.created).toHaveLength(2); // exactly ONE more
@@ -1116,6 +1147,10 @@ describe("report_completion — N2: a retryable follow-up failure withholds Done
     // that publishes the event.
     expect(events("workflow.report_completion")).toHaveLength(1);
     expect(events("delivery.prState")).toHaveLength(2);
+    // …and the record is no longer provisional. `h.puts` was cleared above, so this
+    // reads the RETRY's record, not the first attempt's.
+    expect(record().followUpsPending).toBe(false);
+    expect(record().status).toBe("complete");
   });
 
   it("the outer catch also withholds it — a THROW is not a licence to cascade", async () => {
@@ -1157,6 +1192,11 @@ describe("report_completion — N2: a retryable follow-up failure withholds Done
     expect(res.status).toBe("complete");
     expect(res.message).toBe("Completion saved for TEAM-4200. Ticket transitioned to Done.");
     expect(transitioned()).toBe(true);
+    // TEAM-4756: the RESPONSE stays byte-identical — the two new states are the only
+    // thing 4756 adds to it, and neither applies here. The RECORD gains exactly two
+    // keys, both stating the uneventful answer.
+    expect(record().followUpsPending).toBe(false);
+    expect(record().status).toBe("complete");
   });
 
   it("follow-ups that ALL land are also unchanged: complete, no next_action, Done", async () => {
@@ -1364,6 +1404,122 @@ describe("toolFailure — every failure shape both twins actually produce", () =
     expect(isAlreadyDoneRefusal('No transition to "Done" found. Available: Start Progress (-> In Progress)')).toBe(false);
     expect(isAlreadyDoneRefusal('Invalid transition "done" from status "in_progress"')).toBe(false);
     expect(isAlreadyDoneRefusal(null)).toBe(false);
+  });
+});
+
+// ─── TEAM-4756 R3-2: the record states followUpsPending and status ─────────────
+//
+// N2 made the TOOL's answer honest about a pending follow-up, but the record it wrote
+// said nothing. Both twins' DL-030 guard (`completionRecordProven`) is existence-only —
+// a HeadObject — so a `complete_pending_follow_ups` record satisfied it exactly as well
+// as a finished one, and a direct `Tickets___transition_ticket(done)` on that ticket
+// closed the run over follow-ups that were never filed. The record is the only artefact
+// that guard can see, so the record has to carry the answer.
+//
+// THE INVARIANT, at every instant: a record that exists with `followUpsPending !== true`
+// means every RETRYABLE follow-up is materialized. The tests below are that invariant
+// read from both ends — the value, and the ordering that makes the value true.
+describe("report_completion — R3-2: the completion record states its own state", () => {
+  const KEY = "completions/TEAM-4200.json";
+  /** `h.calls.length` when the reported ticket's own record was written, per write. */
+  const recordWrites = () => h.puts.map((p, i) => [p, h.putAtCall[i]]).filter(([p]) => p.Key === KEY);
+  const lastIndexOfCall = (tool, pred = () => true) =>
+    h.calls.reduce((at, c, i) => (c.tool === tool && pred(c.params) ? i : at), -1);
+
+  it("the write lands AFTER the follow-up creates and BEFORE the Done transition", async () => {
+    // Both halves of the invariant's placement, in one assertion chain: after the
+    // creates is what makes `followUpsPending` knowable, before the transition is what
+    // DL-030 requires of a ship-phase ticket.
+    h.siblings.push(CD);
+    expect(result(await report({ follow_ups: FU() })).status).toBe("complete");
+    const writes = recordWrites();
+    expect(writes).toHaveLength(1);
+    const [, at] = writes[0];
+    const lastCreate = lastIndexOfCall("Tickets___create_ticket");
+    const done = lastIndexOfCall("Tickets___transition_ticket", (p) => p.transition_id === "done");
+    expect(lastCreate).toBeGreaterThanOrEqual(0);
+    expect(done).toBeGreaterThan(lastCreate);
+    expect(at).toBeGreaterThan(lastCreate);
+    expect(at).toBeLessThanOrEqual(done);
+  });
+
+  it("a pending record exists and says so — the guard's whole problem", async () => {
+    // The scenario the existence-only guard could not tell apart: the record IS there
+    // (HeadObject succeeds, so a direct done still passes today) but the run is not
+    // finished. Now the bytes say which of the two it is.
+    h.siblings.push(CD);
+    h.createGate = () => false;
+    const res = result(await report({ follow_ups: FU() }));
+    expect(res.status).toBe("complete_pending_follow_ups");
+    expect(h.objects.has(KEY)).toBe(true);
+    expect(record().followUpsPending).toBe(true);
+    expect(record().status).toBe("complete_pending_follow_ups");
+    expect(transitioned()).toBe(false);
+  });
+
+  it("a NON-retryable failure is not pending: epic_unresolved still goes Done", async () => {
+    // `followUpsPending` tracks exactly what withholds Done, not "did anything go
+    // wrong": a ticket that provably has no parent is a definite negative no retry can
+    // change, so it stays disclosed on the response and the record is final.
+    h.issue = ticketRow({ key: "TEAM-4200", summary: "The ticket under report", parent: null });
+    const res = result(await report({ follow_ups: FU() }));
+    expect(res.followUpsMaterialized.failed.map((f) => [f.reason, f.retryable])).toEqual([["epic_unresolved", false]]);
+    expect(res.status).toBe("complete");
+    expect(record().followUpsPending).toBe(false);
+    expect(record().status).toBe("complete");
+  });
+
+  it("a failed transition rewrites ONLY status — the content is produced once", async () => {
+    // Two writes are unavoidable on this path (DL-030 wants the record before the
+    // transition; this status is only knowable after it), so what is pinned is the
+    // intended meaning of "written once": the record's content is computed once and
+    // the rewrite differs in `status` alone.
+    h.transitionGate = () => { throw new Error("TooManyRequestsException: Rate exceeded"); };
+    const res = result(await report({}));
+    expect(res.status).toBe("complete_transition_failed");
+    const writes = recordWrites();
+    expect(writes).toHaveLength(2);
+    const [first, second] = writes.map(([p]) => JSON.parse(p.Body));
+    expect(first.status).toBe("complete");
+    expect(second.status).toBe("complete_transition_failed");
+    // followUpsPending stays FALSE: the follow-ups ARE filed and only the Done write
+    // failed, so a human closing this ticket by hand is a legitimate recovery the
+    // reader must not refuse.
+    expect(second.followUpsPending).toBe(false);
+    expect({ ...first, status: null }).toEqual({ ...second, status: null });
+    // …and the durable object is the rewritten one.
+    expect(JSON.parse(h.objects.get(KEY)).status).toBe("complete_transition_failed");
+  });
+
+  it("the rewrite is BEST-EFFORT: if it fails the record stands and the answer does not change", async () => {
+    // The response already tells the agent to retry, and the retry restamps the record,
+    // so a failed relabel must cost a label rather than turn a durable completion into
+    // a thrown tool error.
+    h.transitionGate = () => { throw new Error("TooManyRequestsException: Rate exceeded"); };
+    // The FIRST write of the key lands; the second — the relabel — does not.
+    let seen = 0;
+    h.putGate = (input) => (input.Key === KEY && ++seen > 1 ? Object.assign(new Error("connection reset"), { name: "NetworkingError" }) : null);
+    const res = result(await report({}));
+    expect(res.status).toBe("complete_transition_failed");
+    expect(res.next_action).toBe("retry_report_completion");
+    expect(JSON.parse(h.objects.get(KEY)).status).toBe("complete");
+    expect(h.warns.join("\n")).toMatch(/could not rewrite the record's status/);
+  });
+
+  it("an idempotent already-Done transition leaves the record final, with one write", async () => {
+    h.transitionGate = () => 'Invalid transition "done" from status "done". Available: reopen (→ todo)';
+    expect(result(await report({})).status).toBe("complete");
+    expect(recordWrites()).toHaveLength(1);
+    expect(record().status).toBe("complete");
+    expect(record().followUpsPending).toBe(false);
+  });
+
+  it("a synthetic id gets a final record too — there is no transition to fail", async () => {
+    const res = result(await report({ ticket_id: "HEALTHCHECK-1" }));
+    expect(res.status).toBe("complete");
+    const write = h.puts.find((p) => p.Key === "completions/HEALTHCHECK-1.json");
+    expect(JSON.parse(write.Body).status).toBe("complete");
+    expect(JSON.parse(write.Body).followUpsPending).toBe(false);
   });
 });
 

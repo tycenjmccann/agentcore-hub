@@ -762,17 +762,28 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
     prState: derivePrState({ mergeCommit: report.merge_commit, outcome: report.outcome, prUrl: pr_url }),
   };
 
-  await s3.send(new PutObjectCommand({
+  // ─── TEAM-4756 R3-2: the record write, which used to happen HERE ──────────────
+  //
+  // The write itself now happens below, once `mayTransition` is known, so the record
+  // can STATE whether it is provisional. What stays here is only the closure, next to
+  // the last field it serializes, so a reader of this block still sees where `report`
+  // stops being mutated in the normal case.
+  const putRecord = () => s3.send(new PutObjectCommand({
     Bucket: BUCKET,
     Key: key,
     Body: JSON.stringify(report, null, 2),
     ContentType: "application/json",
   }));
-  console.log(`[report_completion] Saved s3://${BUCKET}/${key}`);
 
   // TEAM-4740 FR-14: a separate event, not a field on the one above, because the
   // UI's delivery view and the run-history queries read prState per TICKET and a
   // run has many completions.
+  //
+  // Left exactly where it was by TEAM-4756 R3-2, which means it now fires just BEFORE
+  // the record rather than just after. It carries its own payload and no consumer
+  // follows it to S3 (grep: the UI's delivery view, the run-history query — both read
+  // the event), so nothing can observe a prState whose record is missing. Keeping it
+  // put is also what leaves its ordering against emptySweepSkip byte-unchanged.
   await publishJourneyEvent(workflow_id || ticket_id, "delivery.prState", {
     workflowId: workflow_id || null,
     ticketId: ticket_id,
@@ -843,6 +854,26 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   const pendingFollowUps = materialized.failed.filter((f) => f.retryable);
   const mayTransition = pendingFollowUps.length === 0;
 
+  // ─── TEAM-4756 R3-2: the record SAYS whether it is provisional ────────────────
+  //
+  // Both twins' DL-030 guard (`completionRecordProven`) is existence-only — a
+  // HeadObject — so a record written in the `complete_pending_follow_ups` state
+  // satisfied it just as well as a finished one, and a direct transition_ticket(done)
+  // on that ticket closed the run over follow-ups that were never filed. The record is
+  // the only artefact that guard can see, so the record has to carry the answer.
+  //
+  // INVARIANT, at every instant: a record that exists with `followUpsPending !== true`
+  // means every RETRYABLE follow-up is materialized. That is what pins this single
+  // write to exactly here — AFTER materializeFollowUps, so `pendingFollowUps` is known,
+  // and still BEFORE the Done transition, because DL-030 requires a ship-phase
+  // ticket's record to exist before it may close. `!== true` rather than `=== false` is
+  // deliberate: a pre-4756 record has neither field, and the invariant holds for it
+  // too (it was written before follow-ups existed at all).
+  report.followUpsPending = pendingFollowUps.length > 0;
+  report.status = mayTransition ? "complete" : STATUS_PENDING_FOLLOW_UPS;
+  await putRecord();
+  console.log(`[report_completion] Saved s3://${BUCKET}/${key} (status ${report.status})`);
+
   // Transition ticket to Done in Jira — this triggers the webhook cascade
   // (orchestrator unblocks downstream tickets when it sees "done")
   //
@@ -883,6 +914,21 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
       });
     } else {
       console.error(`[report_completion] ${ticket_id}: Done transition FAILED (${transition.error}) - the record is SAVED but the ticket is NOT closed, the agent must retry report_completion`);
+      // TEAM-4756 R3-2: the SECOND write, and the only one. DL-030 forces the record to
+      // exist before the transition and this status is only knowable after it, so the
+      // failure path necessarily writes the key twice — the content is produced once and
+      // only `status` differs. `followUpsPending` deliberately stays `false`: the
+      // follow-ups ARE filed and only the Done write failed, so a human or a direct
+      // transition closing this ticket is a legitimate recovery the reader must not
+      // refuse. Best-effort: the response below already tells the agent to retry, so a
+      // rewrite that itself fails costs a label, not the work, and must not turn a
+      // durable record into a thrown tool error.
+      report.status = STATUS_TRANSITION_FAILED;
+      try {
+        await putRecord();
+      } catch (err) {
+        console.error(`[report_completion] ${ticket_id}: could not rewrite the record's status to ${STATUS_TRANSITION_FAILED} (${err.name}: ${err.message}) - the record stands at "complete" and the retry will restamp it`);
+      }
     }
   }
   const transitionFailed = transition !== null && !transition.ok;
@@ -1665,6 +1711,10 @@ export function sweepSkipRecord({ ticketId, workflowId, sweeperTicketId }) {
  */
 async function skipSibling(row, { workflowId, sweeperTicketId }) {
   const ticketId = row.ticketId;
+  // TEAM-4756 R3-2 deliberately does NOT stamp followUpsPending/status here: a skip
+  // record is a marker that a ticket was closed WITHOUT work, not a completion report,
+  // and it can carry no follow-ups to be pending on. The reader side's `!== true` test
+  // is what keeps that safe — the same reading that keeps every pre-4756 record valid.
   await s3.send(new PutObjectCommand({
     Bucket: BUCKET,
     Key: `completions/${ticketId}.json`,

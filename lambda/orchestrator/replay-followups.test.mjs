@@ -338,9 +338,15 @@ describe("REGRESSION hirhfw — a completion with no follow-ups is unchanged but
     expect(res.status).toBe("complete");
     expect(Object.keys(res).sort()).toEqual(["message", "status"]);
     const r = record("TEAM-4610");
+    // TEAM-4756 R3-2 appends exactly two, in this order and at the END: the record now
+    // states whether it is provisional, because the twins' DL-030 guard is
+    // existence-only and could not otherwise tell a pending record from a finished one.
     expect(Object.keys(r)).toEqual([
       "ticket_id", "summary", "artifacts", "branch", "commit_sha", "pr_url", "completed_at", "delivery",
+      "followUpsPending", "status",
     ]);
+    expect(r.followUpsPending).toBe(false);
+    expect(r.status).toBe("complete");
     expect(r.delivery).toEqual({ prUrl: "https://github.com/tycenjmccann/agentcore-hub/pull/611", prState: "open" });
     // No sibling scan, no create: the report that needs none of it pays for none of
     // it. The ticket itself IS read now (TEAM-4752 D3 — its base branch lives
