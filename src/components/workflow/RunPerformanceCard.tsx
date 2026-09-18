@@ -162,7 +162,7 @@ export default function RunPerformanceCard({ workflowId }: { workflowId: string 
                   <ul className="mt-1 space-y-1">
                     {card.quality.interventionsDetail!.map((i, idx) => (
                       <li key={idx} className="text-[var(--color-text-muted)]">
-                        <span className="text-[var(--color-text)]">{i.action}</span>
+                        <span className="text-[var(--color-text-primary)]">{i.action}</span>
                         {i.ticketId ? ` · ${i.ticketId}` : ""} · {new Date(i.at).toLocaleString()}
                         {i.note ? <div className="pl-2 italic break-words">{i.note}</div> : null}
                       </li>
