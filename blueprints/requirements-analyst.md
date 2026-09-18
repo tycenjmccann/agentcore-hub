@@ -310,8 +310,21 @@ a full duplicate set of tickets that wedges the whole run:
     genuinely-missing tickets (an assignee in your plan with no ticket yet), then go
     to 4c. If the full chain is already present, skip creation entirely.
   - If none exist, this is a fresh run — proceed to 4b.
-- **4b — Create the missing tickets** via `Tickets___create_ticket` with correct
-  `blocked_by` chains (the tiers from Step 3).
+- **4b0 — Submit the plan FIRST.** Before creating anything, call
+  `WorkflowOutput___submit_ticket_plan(workflow_id, epic_id, tickets)` with your
+  full planned chain as `tickets` (a JSON array). It persists the plan to S3 and
+  returns `{status:"saved", location, ticket_count, tickets, integration_branch?,
+  warning?, autowired?}` — `tickets` in the RESPONSE, not what you sent, is
+  authoritative: it normalizes each ticket's `blockedBy`, templates in the
+  orchestrator-created integration branch, and — when the epic has no root
+  blocker yet — autowires one, returned as
+  `autowired: {reason:"no_root_blocker", rootTicketId, tickets}`. If `warning` is
+  present (the sibling scan that finds the root blocker failed), say so in your
+  `report_completion` and double-check each ticket's `blockedBy` yourself before
+  4b, since the autowire was skipped.
+- **4b — Create the missing tickets** via `Tickets___create_ticket`, minting
+  EXACTLY the `tickets` array `submit_ticket_plan` returned — titles,
+  descriptions, assignees and especially `blockedBy` — not your original plan.
 - **4c — Verify after creating.** Call `Tickets___list_tickets(epic_id)` again and confirm:
   - Exactly ONE ticket per planned assignee. Expected exceptions: `agentcore_hub_release_manager`
     has TWO (Ship + CD) — on a CD-registered repo only; a HANDOFF run (`CD_REGISTERED: false`) has NONE —
