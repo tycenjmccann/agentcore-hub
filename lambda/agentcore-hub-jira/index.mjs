@@ -459,14 +459,21 @@ function gateWorkflowIdOf(labels) {
  * It NEVER dispatches, and it never creates a ticket: a gate that cannot be closed
  * is answered by verifying the condition, not by filing a second gate.
  *
- * EVENT DEDUPE, and the one place this differs from the DynamoDB twin: Jira's `add`
- * verb is idempotent server-side and reports nothing back, so addLabels cannot tell
- * "newly added" from "already there" the way a conditional list_append can. The
- * dedupe is therefore the labels we ALREADY hold from the transition's read — the
- * first refusal pages, every later refusal on the same stall repeats the payload in
- * silence. (A racing labeller could cost one duplicate event; a duplicate page is
- * cheaper than a missed one.) Every side effect is best-effort: a correct refusal
- * must not turn into a tool error because Jira rate-limited a comment.
+ * SIDE-EFFECT DEDUPE (event AND comment), and the one place this differs from the
+ * DynamoDB twin: Jira's `add` verb is idempotent server-side and reports nothing
+ * back, so addLabels cannot tell "newly added" from "already there" the way a
+ * conditional list_append can. The dedupe is therefore the labels we ALREADY hold
+ * from the transition's read — the first refusal pages and comments, every later
+ * refusal on the same stall repeats the payload in silence. (A racing labeller could
+ * cost one duplicate event; a duplicate page is cheaper than a missed one.)
+ *
+ * The comment is under that dedupe for a reason this twin feels harder than the
+ * other (TEAM-4750 B1): getIssue reads only the newest 50 comments, so a
+ * `transition_ticket(done)` retry loop appending the same console link evicts the
+ * human's advisory `DECISION:` line out of the window the guard itself reads.
+ *
+ * Every side effect is best-effort: a correct refusal must not turn into a tool
+ * error because Jira rate-limited a comment.
  */
 async function repageGate(ticketId, labels, gateKind, verdict, refusal) {
   const parked = labels.some((l) => GATE_AWAITING_CONSOLE_RE.test(String(l ?? "").trim().toLowerCase()));
@@ -487,12 +494,12 @@ async function repageGate(ticketId, labels, gateKind, verdict, refusal) {
       consoleUrl: verdict.consoleUrl,
       attempt: 1,
     });
-  }
 
-  try {
-    await addComment({ ticket_id: ticketId, comment: refusal.comment });
-  } catch (err) {
-    console.warn(`[agentcore-hub-jira] ${ticketId}: could not comment the refusal — ${err?.name}`);
+    try {
+      await addComment({ ticket_id: ticketId, comment: refusal.comment });
+    } catch (err) {
+      console.warn(`[agentcore-hub-jira] ${ticketId}: could not comment the refusal — ${err?.name}`);
+    }
   }
 }
 

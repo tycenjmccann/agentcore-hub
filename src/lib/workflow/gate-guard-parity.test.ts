@@ -54,6 +54,8 @@ const h = vi.hoisted(() => ({
     items: {} as Record<string, Record<string, unknown>>,
     statusUpdates: [] as Array<Record<string, unknown>>,
     labelUpdates: [] as Array<Record<string, unknown>>,
+    /** addComment's `list_append` writes — the refusal-comment dedupe (B1). */
+    comments: [] as Array<Record<string, unknown>>,
   },
   /** Jira twin state. */
   jira: {
@@ -164,6 +166,12 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
               row.labels = [...have, label as string];
               return {};
             }
+            if (cmd.input.ExpressionAttributeValues?.[":comment"] !== undefined) {
+              // addComment's list_append. Recorded so "one comment per stall" is
+              // assertable on this twin the way the /comment POST count is on Jira.
+              h.ddb.comments.push(cmd.input);
+              return {};
+            }
             if (cmd.input.ExpressionAttributeValues?.[":s"] !== undefined) {
               h.ddb.statusUpdates.push(cmd.input);
               return {};
@@ -262,6 +270,7 @@ function seed(scn: Scenario) {
   h.events.length = 0;
   h.ddb.statusUpdates.length = 0;
   h.ddb.labelUpdates.length = 0;
+  h.ddb.comments.length = 0;
   h.jira.writes.length = 0;
   h.probeBy = {};
   for (const p of scn.probes || []) {
@@ -680,6 +689,7 @@ describe("a refusal's side effects", () => {
     const t = await runTickets(OPEN);
     expect(h.ddb.statusUpdates, "no status write on a refusal").toHaveLength(0);
     expect(t.labels).toContain("gate:awaiting-console");
+    expect(h.ddb.comments, "exactly one comment").toHaveLength(1);
 
     const j = await runJira(OPEN);
     expect(h.jira.writes.filter((w) => /\/transitions$/.test(w.path)), "no transition POST").toHaveLength(0);
@@ -687,7 +697,11 @@ describe("a refusal's side effects", () => {
     expect(h.jira.writes.filter((w) => /\/comment$/.test(w.path)), "exactly one comment").toHaveLength(1);
   });
 
-  it("emits ONE gate.repaged, and a repeat refusal emits nothing (both twins)", async () => {
+  it("emits ONE gate.repaged AND one comment; a repeat refusal emits neither (both twins)", async () => {
+    // TEAM-4750 B1: the comment is under the SAME dedupe as the event. It was not,
+    // so a transition_ticket(done) retry loop appended the same console link on every
+    // attempt — and on Jira pushed the human's advisory DECISION: line out of the
+    // 50-comment window getIssue reads, which is the guard's own input.
     const t1 = await runTickets(OPEN);
     expect(t1.events.map((e) => e.type)).toEqual(["gate.repaged"]);
     expect(t1.events[0]).toMatchObject({
@@ -698,10 +712,12 @@ describe("a refusal's side effects", () => {
     // The event carries a ttl (SEC-13): these are the first rows in the events
     // table with an expiry, and an unbounded gate-event stream is a cost leak.
     expect(typeof t1.events[0].ttl).toBe("number");
+    expect(h.ddb.comments, "the first refusal comments once").toHaveLength(1);
 
     // Retry on the same stall: the label is already there, so nothing pages again.
     h.probes.length = 0;
     h.events.length = 0;
+    h.ddb.comments.length = 0;
     h.probeBy = { Pipeline___get_state: { result: { waitingOn: { stage: "Deploy", action: "ApproveDeploy", holdsGate: "this" } } } };
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const again: any = await ticketsHandler({
@@ -711,12 +727,15 @@ describe("a refusal's side effects", () => {
     });
     expect(again.reason).toBe("gate_condition_unmet");
     expect(h.events, "no second gate.repaged").toHaveLength(0);
+    expect(h.ddb.comments, "no second refusal comment").toHaveLength(0);
 
     // Same for Jira, whose dedupe is a before/after label read rather than a
     // conditional write (its `add` verb reports nothing back).
     const j1 = await runJira(OPEN);
     expect(j1.events.map((e) => e.type)).toEqual(["gate.repaged"]);
+    expect(h.jira.writes.filter((w) => /\/comment$/.test(w.path)), "the first refusal comments once").toHaveLength(1);
     h.events.length = 0;
+    h.jira.writes.length = 0;
     h.probeBy = { Pipeline___get_state: { result: { waitingOn: { stage: "Deploy", action: "ApproveDeploy", holdsGate: "this" } } } };
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const jAgain: any = await jiraHandler({
@@ -726,6 +745,7 @@ describe("a refusal's side effects", () => {
     });
     expect(jAgain.reason).toBe("gate_condition_unmet");
     expect(h.events, "no second gate.repaged (jira)").toHaveLength(0);
+    expect(h.jira.writes.filter((w) => /\/comment$/.test(w.path)), "no second refusal comment (jira)").toHaveLength(0);
   });
 
   it("a rejected approval says `block`, not close — a human decision is never overwritten", async () => {

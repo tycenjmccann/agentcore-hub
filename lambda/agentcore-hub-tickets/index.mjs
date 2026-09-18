@@ -431,10 +431,14 @@ async function verifyTypedGate(issueKey, item) {
  * It NEVER dispatches, and it never creates a ticket: a gate that cannot be closed
  * is answered by verifying the condition, not by filing a second gate.
  *
- * The conditional `list_append` inside addLabels is the EVENT DEDUPE: the label
- * lands once, so the first refusal pages and every later refusal on the same stall
- * repeats the payload in silence. Every side effect is best-effort — a correct
- * refusal must not turn into a tool error because the events table throttled.
+ * The conditional `list_append` inside addLabels is the SIDE-EFFECT DEDUPE, and it
+ * covers the event AND the comment: the label lands once, so the first refusal pages
+ * and comments, and every later refusal on the same stall repeats the payload in
+ * silence. A `transition_ticket(done)` retry loop would otherwise append the same
+ * console link forever (TEAM-4750 B1) — noise here, and on the Jira twin an actual
+ * loss, because its `getIssue` reads only the newest 50 comments. Every side effect
+ * is best-effort — a correct refusal must not turn into a tool error because the
+ * events table throttled.
  */
 async function repageGate(issueKey, item, gateKind, verdict, refusal) {
   let newlyLabelled = false;
@@ -453,12 +457,12 @@ async function repageGate(issueKey, item, gateKind, verdict, refusal) {
       consoleUrl: verdict.consoleUrl,
       attempt: 1,
     });
-  }
 
-  try {
-    await addComment({ ticket_id: issueKey, body: refusal.comment, author: "gate-guard" });
-  } catch (err) {
-    console.warn(`[agentcore-hub-tickets] ${issueKey}: could not comment the refusal — ${err?.name}`);
+    try {
+      await addComment({ ticket_id: issueKey, body: refusal.comment, author: "gate-guard" });
+    } catch (err) {
+      console.warn(`[agentcore-hub-tickets] ${issueKey}: could not comment the refusal — ${err?.name}`);
+    }
   }
 }
 
