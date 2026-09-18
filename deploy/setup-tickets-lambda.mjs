@@ -226,11 +226,14 @@ try {
 
 // Attach inline policy. DynamoDB statement is only needed for the dynamodb
 // provider; both providers need CloudWatch Logs and S3 read for the agent
-// roster artifact — and, since TEAM-4706 (DL-030), for the HeadObject on
+// roster artifact — and, since TEAM-4706 (DL-030), for reading
 // completions/<ticket_id>.json behind the ship-phase Done gate: a ship ticket
-// cannot be closed without its completion record. The same
-// `s3:GetObject` on the artifact bucket authorises both reads, so no extra
-// statement is needed here.
+// cannot be closed without its completion record. TEAM-4757 made that guard GET
+// the record's body (it has to read `followUpsPending`, not just prove the key
+// exists), which needs nothing new: the same `s3:GetObject` on the artifact bucket
+// below authorises the roster read, a HeadObject and a GetObject alike, so no extra
+// statement is needed here. scripts/verify-infra.sh asserts this grant is still
+// bucket-wide or explicitly covers completions/*.
 const policyStatements = [
   {
     Effect: "Allow",

@@ -33,14 +33,21 @@ const h = vi.hoisted(() => ({
     statusUpdates: /** @type {any[]} */ ([]),
     // TEAM-4537: edit_issue's title write (`SET #t = :t, …`).
     editUpdates: /** @type {any[]} */ ([]),
-    // TEAM-4706: every HeadObject the ship-phase Done gate makes (by Key), so a
-    // non-ship transition can be asserted to make NO S3 call at all…
-    s3Heads: /** @type {string[]} */ ([]),
+    // TEAM-4706: every completion-record read the ship-phase Done gate makes (by
+    // Key), so a non-ship transition can be asserted to make NO S3 call at all…
+    s3RecordReads: /** @type {string[]} */ ([]),
     // …and an INDETERMINATE S3 answer (AccessDenied, throttle, timeout) can be
     // injected: null = "exists iff the key is in state.s3Objects".
-    headImpl: /** @type {((input: any) => any) | null} */ (null),
-    /** Keys that exist for HeadObject, e.g. completions/TEAM-4066.json. */
-    s3Objects: /** @type {Record<string, true>} */ ({}),
+    recordImpl: /** @type {((input: any) => any) | null} */ (null),
+    /**
+     * The completion records that exist, e.g. completions/TEAM-4066.json. TEAM-4757:
+     * the gate GETs the body, so the VALUE is the body it serves —
+     *   `true`   → a pre-TEAM-4756 record (neither followUpsPending nor status), the
+     *              shape every test written before that field existed assumed;
+     *   object   → served as JSON.stringify(value);
+     *   string   → served verbatim, so a non-JSON or empty body is expressible.
+     */
+    s3Objects: /** @type {Record<string, true | object | string>} */ ({}),
     // TEAM-4739: the typed gate guard's probe into the pipeline-tools Lambda —
     // every call recorded (so "made no probe at all" is assertable), and the reply
     // injected by tool name. An absent entry makes the invoke THROW, which is the
@@ -89,20 +96,29 @@ vi.mock("@aws-sdk/client-s3", () => ({
   S3Client: class {
     async send(cmd) {
       const key = cmd.input.Key;
-      // TEAM-4706: HeadObject (the completion-record probe) and GetObject (the
-      // roster/workflow configs) share one client, so the command TYPE is what
-      // separates them — the __type tag is the shape the repo's other Lambda
-      // suites use (lambda/agentcore-hub-pipeline-tools/index.test.mjs).
-      if (cmd.__type === "HeadObject") {
-        h.state.s3Heads.push(key);
-        if (h.state.headImpl) return h.state.headImpl(cmd.input);
+      // TEAM-4706 + TEAM-4757: the completion-record read and the roster/workflow
+      // config reads are now both GetObject on one client, so the KEY PREFIX is what
+      // separates them (it used to be the command type, when the gate HeadObject-ed).
+      // The __type tag is still the shape the repo's other Lambda suites use
+      // (lambda/agentcore-hub-pipeline-tools/index.test.mjs).
+      if (String(key).startsWith("completions/")) {
+        h.state.s3RecordReads.push(key);
+        if (h.state.recordImpl) return h.state.recordImpl(cmd.input);
         if (!(key in h.state.s3Objects)) {
-          const err = new Error("NotFound");
-          err.name = "NotFound";
+          const err = new Error("NoSuchKey");
+          err.name = "NoSuchKey";
           err.$metadata = { httpStatusCode: 404 };
           throw err;
         }
-        return { ContentLength: 42 };
+        const record = h.state.s3Objects[key];
+        // `true` = a pre-4756 record: it exists and carries neither new field.
+        const text =
+          record === true
+            ? JSON.stringify({ ticketId: key.slice("completions/".length).replace(/\.json$/, ""), summary: "shipped" })
+            : typeof record === "string"
+              ? record
+              : JSON.stringify(record);
+        return { Body: { transformToString: async () => text } };
       }
       if (!(key in h.state.s3)) throw new Error(`NoSuchKey: ${key}`);
       const body = h.state.s3[key];
@@ -110,7 +126,6 @@ vi.mock("@aws-sdk/client-s3", () => ({
     }
   },
   GetObjectCommand: class { constructor(i) { this.input = i; this.__type = "GetObject"; } },
-  HeadObjectCommand: class { constructor(i) { this.input = i; this.__type = "HeadObject"; } },
 }));
 vi.mock("@aws-sdk/lib-dynamodb", () => {
   class PutCommand { constructor(input) { this.input = input; } }
@@ -207,8 +222,8 @@ beforeEach(async () => {
   h.state.statusUpdates.length = 0;
   h.state.editUpdates.length = 0;
   h.state.items = {};
-  h.state.s3Heads.length = 0;
-  h.state.headImpl = null;
+  h.state.s3RecordReads.length = 0;
+  h.state.recordImpl = null;
   h.state.s3Objects = {};
   h.state.probes.length = 0;
   h.state.probeBy = {};
@@ -1008,6 +1023,13 @@ describe("create_ticket / edit_issue — surrogate-safe clamp (TEAM-4537)", () =
  *   - an INDETERMINATE S3 answer refuses (fails closed) — "we could not find a
  *     record" is not "there is no record" (DL-028's positive-evidence rule).
  *
+ * TEAM-4757 R3-2 added the (g)…(l) cases: the gate READS THE BODY, because
+ * TEAM-4756 made reportCompletion stamp `followUpsPending`/`status` into the record
+ * and a record in the pending state used to prove completion exactly as well as a
+ * finished one. The admission test is `followUpsPending !== true`, never
+ * `=== false` — a pre-4756 record, a sweep skip-record and the transition-failed
+ * restamp all legitimately lack the field, and (i)/(j) are what pin that.
+ *
  * The jira Lambda's suite asserts the identical twin, in its own idiom.
  */
 describe("transition_ticket — ship-phase Done needs a completion record (TEAM-4706)", () => {
@@ -1058,7 +1080,7 @@ describe("transition_ticket — ship-phase Done needs a completion record (TEAM-
     expect(res.content[0].text).toContain(`no ${RECORD_KEY}`);
     // Nothing moved: the ticket is still in_progress in DynamoDB.
     expect(h.state.statusUpdates).toHaveLength(0);
-    expect(h.state.s3Heads).toEqual([RECORD_KEY]);
+    expect(h.state.s3RecordReads).toEqual([RECORD_KEY]);
   });
 
   it("(a, cont.) the `skip` row cannot walk around the gate either", async () => {
@@ -1083,7 +1105,7 @@ describe("transition_ticket — ship-phase Done needs a completion record (TEAM-
     expect("reason" in res).toBe(false);
     expect(h.state.statusUpdates).toHaveLength(1);
     expect(h.state.statusUpdates[0].ExpressionAttributeValues[":s"]).toBe("done");
-    expect(h.state.s3Heads).toEqual([RECORD_KEY]);
+    expect(h.state.s3RecordReads).toEqual([RECORD_KEY]);
   });
 
   it("(c) a NON-ship ticket closes with no record and makes no S3 call at all", async () => {
@@ -1099,7 +1121,7 @@ describe("transition_ticket — ship-phase Done needs a completion record (TEAM-
     expect(res).toMatchObject({ key: "TEAM-4067", status: "transitioned", to: "done" });
     expect(h.state.statusUpdates).toHaveLength(1);
     // The ship-phase predicate is cheap and runs FIRST — the hot path is untouched.
-    expect(h.state.s3Heads).toEqual([]);
+    expect(h.state.s3RecordReads).toEqual([]);
   });
 
   it("(d) a human-assigned gate closes with no record — the UI/Telegram approve path", async () => {
@@ -1118,7 +1140,7 @@ describe("transition_ticket — ship-phase Done needs a completion record (TEAM-
 
     expect(res).toMatchObject({ key: "TEAM-4068", status: "transitioned", from: "in_review", to: "done" });
     expect(h.state.statusUpdates).toHaveLength(1);
-    expect(h.state.s3Heads).toEqual([]);
+    expect(h.state.s3RecordReads).toEqual([]);
   });
 
   it("(e) ship phase detected from the assignee's ROSTER phase, with no phase stamp", async () => {
@@ -1131,12 +1153,12 @@ describe("transition_ticket — ship-phase Done needs a completion record (TEAM-
     expect(res.reason).toBe("completion_record_required");
     expect(res.hint).toBe(HINT);
     expect(h.state.statusUpdates).toHaveLength(0);
-    expect(h.state.s3Heads).toEqual([RECORD_KEY]);
+    expect(h.state.s3RecordReads).toEqual([RECORD_KEY]);
   });
 
   it("(f) an INDETERMINATE S3 answer refuses — fails closed, and leaks nothing", async () => {
     h.state.items[SHIP] = shipTicket();
-    h.state.headImpl = () => {
+    h.state.recordImpl = () => {
       const err = new Error("User: arn:aws:sts::…:assumed-role/… is not authorized");
       err.name = "AccessDenied";
       err.$metadata = { httpStatusCode: 403 };
@@ -1151,6 +1173,125 @@ describe("transition_ticket — ship-phase Done needs a completion record (TEAM-
     expect(res.content[0].text).toContain("could not read");
     expect(res.content[0].text).toContain("AccessDenied");
     expect(res.content[0].text).not.toContain("assumed-role");
+  });
+
+  // ── TEAM-4757 R3-2: the record's BODY is the proof, not its existence ──────
+
+  it("(g) a record with followUpsPending:true is REFUSED — the R3-2 hole", async () => {
+    // reportCompletion's own state when a follow-up create failed: the record is
+    // durable, the ticket is deliberately still open, and the follow-up (a
+    // post-deploy verification, say) was never filed. Closing here cascades and
+    // completes the epic over work that does not exist.
+    h.state.items[SHIP] = shipTicket();
+    h.state.s3Objects[RECORD_KEY] = {
+      ticketId: SHIP,
+      summary: "deployed",
+      followUpsPending: true,
+      status: "complete_pending_follow_ups",
+    };
+
+    const res = await transition({ ticket_id: SHIP, to_status: "done" });
+
+    expect(res.ok).toBe(false);
+    expect(res.reason).toBe("completion_record_required");
+    expect(res.hint).toBe(HINT);
+    // The message names the state AND the one call that fixes it.
+    expect(res.content[0].text).toContain(
+      `${RECORD_KEY} has followUpsPending:true (status complete_pending_follow_ups)`
+    );
+    expect(res.content[0].text).toContain(
+      "re-run WorkflowOutput___report_completion with the same arguments to materialize the follow-ups"
+    );
+    // Nothing moved, and the record was read exactly once.
+    expect(h.state.statusUpdates).toHaveLength(0);
+    expect(h.state.s3RecordReads).toEqual([RECORD_KEY]);
+  });
+
+  it("(h) followUpsPending:false + status complete closes", async () => {
+    h.state.items[SHIP] = shipTicket();
+    h.state.s3Objects[RECORD_KEY] = { ticketId: SHIP, followUpsPending: false, status: "complete" };
+
+    const res = await transition({ ticket_id: SHIP, to_status: "done" });
+
+    expect(res).toMatchObject({ key: SHIP, status: "transitioned", to: "done" });
+    expect(h.state.statusUpdates).toHaveLength(1);
+  });
+
+  it("(i) a PRE-4756 record — neither field — still closes", async () => {
+    // Every record written before TEAM-4756 looks like this, and the invariant held
+    // for it too (it predates follow-ups entirely). `=== false` instead of `!== true`
+    // would strand every in-flight run at the moment this deploys.
+    h.state.items[SHIP] = shipTicket();
+    h.state.s3Objects[RECORD_KEY] = { ticketId: SHIP, summary: "shipped", pr_url: "https://example.test/pr/1" };
+
+    const res = await transition({ ticket_id: SHIP, to_status: "done" });
+
+    expect(res).toMatchObject({ key: SHIP, status: "transitioned", to: "done" });
+    expect(h.state.statusUpdates).toHaveLength(1);
+  });
+
+  it("(i, cont.) a sweep SKIP-record closes, and so does the transition-failed restamp", async () => {
+    // workflow-output's sweepSkipRecord deliberately stamps neither field (a skip is
+    // not a completion report), and the `complete_transition_failed` restamp
+    // deliberately leaves followUpsPending false — the follow-ups ARE filed there and
+    // only the Done write failed, so closing it directly is a legitimate recovery.
+    h.state.items[SHIP] = shipTicket();
+    h.state.s3Objects[RECORD_KEY] = {
+      ticketId: SHIP,
+      evidence_kind: "skipped",
+      skipped: true,
+      reason: "empty_sweep_no_siblings",
+    };
+    expect((await transition({ ticket_id: SHIP, to_status: "done" })).status).toBe("transitioned");
+
+    h.state.items[SHIP] = shipTicket();
+    h.state.s3Objects[RECORD_KEY] = {
+      ticketId: SHIP,
+      followUpsPending: false,
+      status: "complete_transition_failed",
+    };
+    expect((await transition({ ticket_id: SHIP, to_status: "done" })).status).toBe("transitioned");
+  });
+
+  it("(j) followUpsPending:\"true\" (a STRING) closes — the test is `=== true`, not truthiness", async () => {
+    h.state.items[SHIP] = shipTicket();
+    h.state.s3Objects[RECORD_KEY] = { ticketId: SHIP, followUpsPending: "true" };
+
+    const res = await transition({ ticket_id: SHIP, to_status: "done" });
+
+    expect(res).toMatchObject({ key: SHIP, status: "transitioned", to: "done" });
+  });
+
+  it("(k) followUpsPending:true with no status names the status `unstated`", async () => {
+    h.state.items[SHIP] = shipTicket();
+    h.state.s3Objects[RECORD_KEY] = { ticketId: SHIP, followUpsPending: true };
+
+    const res = await transition({ ticket_id: SHIP, to_status: "done" });
+
+    expect(res.reason).toBe("completion_record_required");
+    expect(res.content[0].text).toContain("has followUpsPending:true (status unstated)");
+    expect(h.state.statusUpdates).toHaveLength(0);
+  });
+
+  it.each([
+    ["non-JSON", "not json at all", "unparseable JSON"],
+    ["empty", "", "an empty body"],
+    ["a JSON array", "[]", "parsed to an array, not an object"],
+    ["JSON null", "null", "parsed to null, not an object"],
+  ])("(l) an UNREADABLE body (%s) refuses — fails closed", async (_label, body, detail) => {
+    // A record we cannot parse cannot tell us whether its follow-ups are pending, and
+    // "could not tell" is not "they are filed" — the same three-outcome discipline as
+    // workflow-output's readCdLedger.
+    h.state.items[SHIP] = shipTicket();
+    h.state.s3Objects[RECORD_KEY] = body;
+
+    const res = await transition({ ticket_id: SHIP, to_status: "done" });
+
+    expect(res.ok).toBe(false);
+    expect(res.reason).toBe("completion_record_required");
+    expect(res.content[0].text).toContain(`${RECORD_KEY} could not be read as a completion record (${detail}`);
+    expect(res.content[0].text).toContain("Re-run WorkflowOutput___report_completion");
+    expect(h.state.statusUpdates).toHaveLength(0);
   });
 });
 

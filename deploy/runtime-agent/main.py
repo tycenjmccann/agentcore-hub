@@ -3524,10 +3524,12 @@ class _CompletionGate:
     TEAM-4754: "successful" is two questions, because engaging does more than
     drop text — it deletes the resume object and marks the turn accounted for.
     `_succeeded` asks whether the CALL worked; `_reports_done` asks whether the
-    answer left the ticket DONE. A refusal (`ok: false`) and N2's
-    `complete_pending_follow_ups` both arrive as a well-formed JSON body, so
-    `_succeeded` alone read them as successes — which is exactly the "walk away"
-    N2 exists to close."""
+    answer left the ticket DONE. The tool answers with exactly one of three
+    statuses — `complete` (done), N2's `complete_pending_follow_ups` and
+    TEAM-4756's `complete_transition_failed` — of which only the first is done,
+    and a refusal (`ok: false`) is a fourth shape. All of them arrive as a
+    well-formed JSON body, so `_succeeded` alone read them as successes — which
+    is exactly the "walk away" N2 exists to close."""
 
     TOOL = "WorkflowOutput___report_completion"
 
@@ -3560,13 +3562,20 @@ class _CompletionGate:
         marks the turn accounted for (FR-7, so no `agent.died`) — so a report
         that left the ticket OPEN must not engage.
 
-        Two payloads leave it open, and neither is visible to `_succeeded`
-        because both arrive as a well-formed JSON body rather than an "Error:"
-        string: a refusal (`ok: false` — DL-030, main_fix_requires_pr,
-        sibling_scan_failed, cd_ledger_unreadable) and N2's
-        `status: "complete_pending_follow_ups"`. Both need the model's own
-        report to surface and both need a retry, which the ungated
-        `current_tool_use` branch still allows in the same turn.
+        Two kinds of payload leave it open, and neither is visible to
+        `_succeeded` because both arrive as a well-formed JSON body rather than
+        an "Error:" string: a refusal (`ok: false` — DL-030,
+        main_fix_requires_pr, sibling_scan_failed, cd_ledger_unreadable), and
+        any `status` other than `complete`. The tool emits three —
+        `complete` (the ticket reached Done), N2's
+        `complete_pending_follow_ups` (the follow-ups it promised are not filed
+        yet) and TEAM-4756's `complete_transition_failed` (the completion record
+        is durable but the Done write failed) — so the test below is
+        `!= "complete"` rather than a list of the two open ones: a fourth status
+        added on the Lambda side has to read as OPEN here, never as done. All of
+        them need the model's own report to surface and all of them need a
+        retry, which the ungated `current_tool_use` branch still allows in the
+        same turn.
 
         Only a DEFINITE negative disengages. A payload we cannot parse keeps the
         pre-4754 behaviour, because mis-reading a real completion as open would
