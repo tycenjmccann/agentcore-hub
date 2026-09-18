@@ -206,7 +206,11 @@ beforeEach(async () => {
   globalThis.fetch = (async (url: string, init?: RequestInit) => {
     h.fetches.push({ url: String(url), init });
     const path = String(url).replace("https://api.github.com", "");
-    const key = Object.keys(h.routes).find((k) => path.startsWith(k));
+    // LONGEST match, not first: the preflight now reads both `/pulls/33` (for
+    // `mergeable`) and `/pulls/33/files`, and a first-match stub would confuse them.
+    const key = Object.keys(h.routes)
+      .filter((k) => path.startsWith(k))
+      .sort((a, b) => b.length - a.length)[0];
     if (!key) return { status: 404, json: async () => ({ message: "Not Found" }) };
     const r = h.routes[key];
     return { status: r.status ?? 200, json: async () => r.json ?? null };
@@ -232,12 +236,20 @@ function post(body: Record<string, unknown>) {
   );
 }
 
-const openSweepPrAtMain = () => {
+/** #33: open, based on main HEAD, from a branch in this repo, and mergeable. */
+const PR_33 = {
+  number: 33,
+  html_url: "u33",
+  head: { ref: "chore/dead-code-sweep-33", repo: { full_name: "tycenjmccann/agentcore-hub" } },
+  base: { sha: MAIN, ref: "main" },
+};
+
+const openSweepPrAtMain = (detailOver: Record<string, unknown> = {}) => {
   h.routes = {
     "/repos/tycenjmccann/agentcore-hub/commits/main": { json: { sha: MAIN } },
-    "/repos/tycenjmccann/agentcore-hub/pulls?state=open": {
-      json: [{ number: 33, html_url: "u33", head: { ref: "chore/dead-code-sweep-33" }, base: { sha: MAIN } }],
-    },
+    "/repos/tycenjmccann/agentcore-hub/pulls?state=open": { json: [PR_33] },
+    // TEAM-4752 D4: the single-PR endpoint is the only one carrying `mergeable`.
+    "/repos/tycenjmccann/agentcore-hub/pulls/33": { json: { ...PR_33, draft: false, mergeable: true, ...detailOver } },
     "/repos/tycenjmccann/agentcore-hub/pulls/33/files": { json: [{ status: "removed", filename: "src/gone.ts" }] },
     "/repos/tycenjmccann/agentcore-hub/issues/33/comments": { status: 201, json: {} },
   };
@@ -260,7 +272,7 @@ describe("POST /api/workflow/start — sweep preflight skip", () => {
     expect(await res.json()).toEqual({
       skipped: true,
       reason: "open_sweep_pr",
-      prs: [{ number: 33, url: "u33", baseSha: MAIN }],
+      prs: [{ number: 33, url: "u33", baseSha: MAIN, mergeable: true }],
       mainSha: MAIN,
     });
     // The saving, stated as absence: not one ticket-Lambda call, not one row.
@@ -274,14 +286,45 @@ describe("POST /api/workflow/start — sweep preflight skip", () => {
     expect(h.events).toHaveLength(1);
     expect(h.events[0]).toMatchObject({
       type: "workflow.skipped",
-      detail: { reason: "open_sweep_pr", mainSha: MAIN, prs: [{ number: 33, url: "u33", baseSha: MAIN }] },
+      detail: {
+        reason: "open_sweep_pr",
+        mainSha: MAIN,
+        prs: [{ number: 33, url: "u33", baseSha: MAIN, mergeable: true }],
+      },
     });
     expect(h.events[0].workflowId).toEqual(h.events[0].detail && (h.events[0].detail as any).workflowId);
     const comments = h.fetches.filter((f) => f.url.endsWith("/issues/33/comments"));
     expect(comments).toHaveLength(1);
     expect(JSON.parse(String(comments[0].init?.body))).toEqual({
-      body: expect.stringContaining(`re-verified against main @${MAIN} on `),
+      // The observed mergeability reaches the comment through the route, which is
+      // the whole point of carrying it on the echo (TEAM-4752 D4). The date is the
+      // run's own timestamp, so it is matched by shape rather than recomputed here.
+      body: expect.stringMatching(
+        new RegExp(`^re-verified against main @${MAIN} on \\d{4}-\\d{2}-\\d{2}; still mergeable$`)
+      ),
     });
+  });
+
+  it("says 'not yet computed' when GitHub has not answered mergeability yet", async () => {
+    // Still a skip — null is not a negative — but the comment must not tell the
+    // human the PR is fine on the strength of a base SHA.
+    openSweepPrAtMain({ mergeable: null });
+    const res = await submit();
+    expect((await res.json()).skipped).toBe(true);
+    const comments = h.fetches.filter((f) => f.url.endsWith("/issues/33/comments"));
+    expect(JSON.parse(String(comments[0].init?.body)).body).toContain("mergeability not yet computed by GitHub");
+  });
+
+  it("does NOT skip when the open sweep PR is conflicting — it starts the run", async () => {
+    openSweepPrAtMain({ mergeable: false });
+    const res = await submit();
+    const body = await res.json();
+    expect(body.skipped).toBeUndefined();
+    // A real run: a workflow row exists, and nothing was commented on a PR that
+    // cannot deliver the sweep.
+    expect(h.puts.find((p) => (p.workflowId as string)?.startsWith("wf_"))).toBeDefined();
+    expect(h.fetches.filter((f) => f.url.endsWith("/comments"))).toEqual([]);
+    expect(h.events.filter((e) => e.type === "workflow.skipped")).toEqual([]);
   });
 
   it("releases the dedup marker it claimed, fenced on its own id", async () => {
@@ -317,19 +360,17 @@ describe("POST /api/workflow/start — sweep preflight skip", () => {
 describe("POST /api/workflow/start — sweep preflight proceed", () => {
   it("appends alreadyRemoved to the description and stamps input.preflight", async () => {
     const moved = "bbb2220000000000000000000000000000000000";
+    const pr23 = {
+      number: 23,
+      html_url: "u23",
+      head: { ref: "chore/dead-code-sweep-23", repo: { full_name: "tycenjmccann/agentcore-hub" } },
+      base: { sha: MAIN, ref: "main" },
+      body: "## Removal Ledger\n- `budget_map`",
+    };
     h.routes = {
       "/repos/tycenjmccann/agentcore-hub/commits/main": { json: { sha: moved } },
-      "/repos/tycenjmccann/agentcore-hub/pulls?state=open": {
-        json: [
-          {
-            number: 23,
-            html_url: "u23",
-            head: { ref: "chore/dead-code-sweep-23" },
-            base: { sha: MAIN },
-            body: "## Removal Ledger\n- `budget_map`",
-          },
-        ],
-      },
+      "/repos/tycenjmccann/agentcore-hub/pulls?state=open": { json: [pr23] },
+      "/repos/tycenjmccann/agentcore-hub/pulls/23": { json: { ...pr23, draft: false, mergeable: true } },
       "/repos/tycenjmccann/agentcore-hub/pulls/23/files": { json: [] },
     };
     const res = await submit();

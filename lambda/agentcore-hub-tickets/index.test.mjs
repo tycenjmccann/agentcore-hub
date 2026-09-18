@@ -1615,21 +1615,46 @@ describe("create_ticket — open-gate autowire (FR-5)", () => {
     expect(res.autowired).toBeUndefined();
   });
 
-  it("FAILS OPEN: a scan error creates the ticket UNFROZEN and warns", async () => {
+  // TEAM-4752 D1 — this used to FAIL OPEN and create the ticket UNFROZEN, on the
+  // argument that an unfrozen ticket is recoverable. It is not: an unfrozen ticket
+  // is dispatched immediately, onto a branch the open merge is about to supersede,
+  // and that work is thrown away. Nor is "create it blocked" the answer — a blocked
+  // ticket with no blocker edge is a permanent wedge. So: refuse, and let the agent
+  // retry.
+  it("REFUSES the create when the scan errors — nothing minted, not even a ticket number", async () => {
     h.state.queryThrows = true;
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
 
     const res = await create({ ...AGENT, description: "Fix the abandon guard." });
 
-    // Created, unfrozen, unbannered — a ticket frozen behind a blocker we only
-    // guessed at would never run at all.
+    expect(res.content[0].text).toMatch(/^Error: create_ticket refused:/);
+    expect(res.content[0].text).toContain(`the sibling scan under ${EPIC} failed`);
+    expect(res.content[0].text).toContain("Nothing was created. Retry the call.");
+    // Refused before nextTicketId, so the counter is untouched too.
+    expect(h.state.puts).toHaveLength(0);
+    expect(h.state.counter).toBe(0);
+    expect(warn.mock.calls.flat().join(" ")).toContain("REFUSING the create");
+    warn.mockRestore();
+  });
+
+  it("refuses with the EXACT shared body — the twins may not drift", async () => {
+    h.state.queryThrows = true;
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { siblingScanRefusal } = await import("./index.mjs");
+    const res = await create({ ...AGENT });
+    expect(res.content[0].text).toBe(
+      `Error: ${siblingScanRefusal(EPIC, "Requested resource not found: parentId-index")}`
+    );
+  });
+
+  it("a scan error does NOT refuse a human gate — that path never scans", async () => {
+    // The refusal is confined to exactly the path the autowire governs. A human
+    // gate returns `untouched` before the try block, so it is unaffected.
+    h.state.queryThrows = true;
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const res = await create({ summary: "Merge Approval", assignee: "human:tycen", parent_key: EPIC });
     expect(res.status).toBe("created");
     expect(h.state.puts[0].blockedBy).toEqual([]);
-    expect(h.state.puts[0].status).toBe("todo");
-    expect(h.state.puts[0].description).toBe("Fix the abandon guard.");
-    expect(res.autowired).toBeUndefined();
-    expect(warn.mock.calls.flat().join(" ")).toContain("UNFROZEN");
-    warn.mockRestore();
   });
 
   it("never scans at all without a parent — there are no siblings to scan", async () => {
@@ -1637,6 +1662,14 @@ describe("create_ticket — open-gate autowire (FR-5)", () => {
     const res = await create({ ...BASE });
     expect(h.state.queries).toHaveLength(0);
     expect(res.autowired).toBeUndefined();
+  });
+
+  it("a scan error does NOT refuse a parentless create either", async () => {
+    h.state.queryThrows = true;
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const res = await create({ ...BASE });
+    expect(res.status).toBe("created");
+    expect(h.state.puts).toHaveLength(1);
   });
 
   it("detects the gate by LABEL as well as by title", async () => {

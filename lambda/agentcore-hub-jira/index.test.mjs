@@ -1604,9 +1604,19 @@ test("createTicket: the third identical gate ticket is refused, and the epic is 
   });
 });
 
-test("createTicket: FAILS OPEN — an unreadable epic files the gate ticket", async () => {
-  // A creation wall that trips whenever a read fails is a wedge, not a guard.
-  await withJira({ issues: { "TEAM-1": { labels: ["wf:wf_1"] } }, searchFails: true }, async () => {
+test("createTicket: the gate-loop guard FAILS OPEN on an unreadable epic — it is never the thing that refuses", async () => {
+  // A creation wall that trips whenever a read fails is a wedge, not a guard: the
+  // loop guard must not be what stops this create.
+  //
+  // TEAM-4752 D1: the create is nonetheless refused now — by the open-gate
+  // autowire, which reads the SAME `parent = TEAM-1` search and no longer reads
+  // "the search failed" as "no merge gate is open". That refusal is uniform (this
+  // ticket has a parent and no `human:` assignee, so the autowire governs it) and
+  // it is retryable, which is the whole difference from a wedge. What this test
+  // still pins is that the loop guard itself stayed open: no
+  // `gate_loop_environmental`, and no `gate:loop-broken` label on the epic.
+  const issues = { "TEAM-1": { labels: ["wf:wf_1"] } };
+  await withJira({ issues, searchFails: true }, async ({ writes }) => {
     const res = await handler({
       tool_name: "Tickets___create_ticket",
       parameters: {
@@ -1615,8 +1625,11 @@ test("createTicket: FAILS OPEN — an unreadable epic files the gate ticket", as
         parent_key: "TEAM-1",
       },
     });
-    assert.notEqual(res.ok, false);
-    assert.equal(res.ticketId, "TEAM-901");
+    assert.notEqual(res.reason, "gate_loop_environmental");
+    assert.equal(issues["TEAM-1"].labels.includes("gate:loop-broken"), false);
+    assert.match(res.error, /^create_ticket refused: the sibling scan under TEAM-1 failed/);
+    assert.equal(res.ticketId, undefined);
+    assert.equal(writes.filter((w) => w.path === "/rest/api/3/issue").length, 0);
   });
 });
 
@@ -1989,7 +2002,11 @@ test("FR-5: the NEWEST CD ticket wins when a re-run filed a second one", async (
   }
 });
 
-test("FR-5 FAILS OPEN: a failed sibling scan creates the ticket UNFROZEN", async () => {
+// TEAM-4752 D1 — this used to FAIL OPEN and file the ticket UNFROZEN. A failed
+// scan is not evidence that no gate is open, and an unfrozen ticket is dispatched
+// straight onto a branch the open merge is about to supersede. Refuse instead; the
+// refusal is retryable, whereas a blocked ticket with no blocker edge is a wedge.
+test("FR-5 REFUSES the create when the sibling scan fails", async () => {
   const m = await loadWithMode("off");
   const cap = captureGateCreate({ siblings: [gateIssue(), cdIssue()], scanFails: true });
   try {
@@ -1997,13 +2014,21 @@ test("FR-5 FAILS OPEN: a failed sibling scan creates the ticket UNFROZEN", async
       tool_name: "Tickets___create_ticket",
       parameters: { ...AGENT_TICKET, description: "Fix the abandon guard." },
     });
-    // Created, unfrozen, unbannered: a ticket frozen behind a blocker we only
-    // guessed at would never run at all.
-    assert.equal(result.ticketId, "TEAM-4711", JSON.stringify(result));
-    assert.equal(result.status, "todo");
-    assert.equal(result.autowired, undefined);
+    // The twin's idiom: createTicket throws, the handler maps it to `error`.
+    assert.match(result.error, /^create_ticket refused: the sibling scan under TEAM-4734 failed/);
+    assert.match(result.error, /Nothing was created\. Retry the call\./);
+    assert.equal(result.ticketId, undefined, JSON.stringify(result));
+    // Nothing reached Jira: no issue, no link, no transition — and the refusal
+    // precedes the idempotency probe, so not even that search ran.
+    assert.equal(cap.posts.length, 0);
     assert.deepEqual(cap.links, []);
-    assert.deepEqual(blocksOf(cap), ["Fix the abandon guard."]);
+    assert.deepEqual(cap.transitionIds, []);
+    assert.equal(cap.dupScans.length, 0);
+    // …and it is the SHARED body, byte for byte — the twins may not drift.
+    assert.equal(
+      result.error,
+      m.siblingScanRefusal(EPIC, "Jira API 400: The parent field is not searchable")
+    );
   } finally {
     cap.restore();
   }

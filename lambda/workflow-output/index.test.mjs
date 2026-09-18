@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 
 /**
  * report_completion's completion RECORD (TEAM-4121 FR-9).
@@ -257,6 +257,10 @@ beforeEach(() => {
   h.workflowGets.length = 0;
   h.workflow = null;
   h.workflowGetError = null;
+  // TEAM-4752 D3: unset by default, so no test can reach the real GitHub API just
+  // because the developer running it happens to have a token exported. The D3 block
+  // below sets it explicitly and stubs `fetch` alongside.
+  delete process.env.GITHUB_TOKEN;
   vi.spyOn(console, "warn").mockImplementation((...args) => h.warns.push(args.join(" ")));
   vi.spyOn(console, "error").mockImplementation((...args) => h.warns.push(args.join(" ")));
 });
@@ -934,14 +938,45 @@ describe("report_completion — FR-13 materialization", () => {
     expect(record().followUps).toHaveLength(1);
   });
 
-  it("a failed sibling scan still creates the follow-up — unblocked, and loudly", async () => {
+  // TEAM-4752 D1 — this test asserted the DEFECT: it created the follow-up on a
+  // roster it had failed to read. The dedupe set is built from that roster, so the
+  // create was blind, and a redelivered report (the orchestrator retries) filed a
+  // second copy of every entry — the exact duplicate FR-13's (ticketId, kind,
+  // title) key exists to prevent.
+  it("a failed sibling scan creates NOTHING — the completion stands, the entries come back failed", async () => {
     h.siblings.push(CD);
     h.ticketFail.add("Tickets___list_tickets");
     const res = result(await report({ follow_ups: FU() }));
+    // The completion itself is durable and the ticket still goes Done: the work
+    // WAS done, and refusing the report over a follow-up would throw that away.
     expect(res.status).toBe("complete");
-    expect(h.created).toHaveLength(1);
-    expect("blocked_by" in h.created[0].params).toBe(false);
+    expect(wroteRecord()).toBe(true);
+    expect(transitioned()).toBe(true);
+    // The record still NAMES the work, so nothing is lost but the ticket.
+    expect(record().followUps).toHaveLength(1);
+    // Nothing was created, and every entry says exactly why.
+    expect(h.created).toHaveLength(0);
+    expect(res.followUpsMaterialized.created).toEqual([]);
+    expect(res.followUpsMaterialized.failed).toEqual([{
+      hash: followUpHash("TEAM-4200", "docs", "Document the new flag"),
+      kind: "docs", title: "Document the new flag", reason: "sibling_scan_failed",
+    }]);
     expect(h.warns.join("\n")).toMatch(/sibling scan under TEAM-4100 FAILED/);
+    expect(h.warns.join("\n")).toMatch(/a duplicate cannot be ruled out/);
+  });
+
+  it("retrying after a failed scan then materializes exactly once", async () => {
+    // What makes fail-closed safe: the persona is TOLD to retry, and the retry is
+    // idempotent because the [fu:<hash>] dedupe now runs against a roster that is
+    // either right or absent — never wrongly empty.
+    h.siblings.push(CD);
+    h.ticketFail.add("Tickets___list_tickets");
+    await report({ follow_ups: FU() });
+    expect(h.created).toHaveLength(0);
+    h.ticketFail.delete("Tickets___list_tickets");
+    const res = result(await report({ follow_ups: FU() }));
+    expect(h.created).toHaveLength(1);
+    expect(res.followUpsMaterialized.created[0].blockedBy).toEqual(["TEAM-4199"]);
   });
 
   it("an unresolvable epic fails every entry rather than filing a parentless ticket", async () => {
@@ -961,14 +996,18 @@ describe("report_completion — FR-13 materialization", () => {
     expect(calls("Tickets___get_issue")).toEqual([{ ticket_id: "TEAM-4200" }]);
   });
 
-  it("skips the get_issue entirely when nothing needs it", async () => {
-    // A report that carries a PR and no follow-ups has no reason to read the
-    // ticket — the FR-5 check cannot fire and there is no epic to resolve.
+  it("skips the get_issue for a SYNTHETIC id — the only report with no ticket to read", async () => {
+    // TEAM-4752 D3 removed the other short-circuit. A report that carries a PR used
+    // to skip the read, which is exactly the report FR-5 has to inspect: the base
+    // branch lives only on the ticket, so "it carries a PR" cannot be the reason not
+    // to look at which branch that PR targets.
     await report({ pr_url: PR_URL });
-    expect(calls("Tickets___get_issue")).toHaveLength(0);
-    // …and a synthetic id has no ticket to read at all.
+    expect(calls("Tickets___get_issue")).toHaveLength(1);
+    // A synthetic id has no ticket at all, so it still costs nothing.
     await handler({ tool_name: "WorkflowOutput___report_completion", arguments: { ticket_id: "HEALTHCHECK-1", summary: "ping", workflow_id: "wf_1" } });
-    expect(calls("Tickets___get_issue")).toHaveLength(0);
+    expect(calls("Tickets___get_issue")).toHaveLength(1);
+    await handler({ tool_name: "WorkflowOutput___report_completion", arguments: { ticket_id: "TEST-1", summary: "ping", workflow_id: "wf_1" } });
+    expect(calls("Tickets___get_issue")).toHaveLength(1);
   });
 });
 
@@ -1059,19 +1098,54 @@ describe("report_completion — FR-5 main_fix_requires_pr", () => {
     const r = result(await report({}));
     expect(r.ok).toBe(false);
     expect(r.reason).toBe("main_fix_requires_pr");
+    expect(r.detail).toBe("no_pr_url");
     expect(r.missing).toEqual(["pr_url"]);
     expect(r.message).toContain("Nothing was recorded and the ticket was NOT transitioned.");
     expect(wroteRecord()).toBe(false);
     expect(transitioned()).toBe(false);
     expect(events("delivery.prState")).toHaveLength(0);
+    // The log names WHICH negative fired, so the four are distinguishable in
+    // CloudWatch — it used to print a hardcoded "(base_branch: main, no pr_url)"
+    // that would have been a lie for three of them.
+    expect(h.warns.join("\n")).toContain("main_fix_requires_pr (no_pr_url)");
   });
 
-  it("accepts it the moment the PR to main exists — without even reading the ticket", async () => {
+  it("accepts it the moment the PR to main exists — but says the acceptance is UNVERIFIED", async () => {
+    // TEAM-4752 D3: the ticket IS read now (base_branch lives nowhere else), and
+    // with no GITHUB_TOKEN configured the acceptance rests on the report's word —
+    // which the response now says out loud instead of implying GitHub agreed.
     h.issue = withBase("main");
     const res = await report({ pr_url: PR_URL });
     expect(result(res).status).toBe("complete");
+    expect(result(res).prBaseVerification).toBe("unverified");
     expect(record().delivery.prState).toBe("open");
-    expect(calls("Tickets___get_issue")).toHaveLength(0);
+    expect(calls("Tickets___get_issue")).toHaveLength(1);
+  });
+
+  it("refuses a pr_url that is not a GitHub pull-request URL at all — with no fetch", async () => {
+    // The defect: `asText(pr_url).trim()` accepted anything non-blank, so "TBD" or a
+    // branch name satisfied "a completion must carry the PR to main".
+    const fetchSpy = vi.fn();
+    vi.stubGlobal("fetch", fetchSpy);
+    try {
+      for (const bad of ["TBD", "feature/TEAM-4200-fix", "https://github.com/owner/repo/pulls/42", "https://gitlab.com/o/r/pull/1", "https://github.com/owner/repo/pull/42?x=1", "https://github.com/./r/pull/1"]) {
+        h.puts.length = 0;
+        h.calls.length = 0;
+        h.issue = withBase("main");
+        const r = result(await report({ pr_url: bad }));
+        expect(r.ok, `accepted ${JSON.stringify(bad)}`).toBe(false);
+        expect(r.reason).toBe("main_fix_requires_pr");
+        expect(r.detail).toBe("pr_url_not_a_github_pr");
+        expect(r.message).toContain(JSON.stringify(bad));
+        expect(r.message).toContain("Nothing was recorded and the ticket was NOT transitioned.");
+        expect(wroteRecord()).toBe(false);
+        expect(transitioned()).toBe(false);
+      }
+      // A definite negative needs no network: it is provable from the report.
+      expect(fetchSpy).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it("does not fire for any other base branch", async () => {
@@ -1093,6 +1167,157 @@ describe("report_completion — FR-5 main_fix_requires_pr", () => {
     h.ticketFail.clear();
     h.issue = { ticketId: "TEAM-4200", title: "Fix it", status: "in_progress", assignee: "agentcore_hub_api_dev", parentKey: "TEAM-4100" };
     expect(result(await report({})).status).toBe("complete");
+  });
+});
+
+// ─── TEAM-4752 D3: the base branch of the PR, asked of GitHub ──────────────────
+//
+// `main_fix_requires_pr` used to be satisfied by any non-blank `pr_url`, so a fix
+// to main "delivered" by a PR to the integration branch passed the very check that
+// exists to catch it — that PR is superseded the moment the integration branch
+// merges, which is the TEAM-4663 failure the FR-5 refusal was written for.
+//
+// The rule: refuse only on an answer GITHUB GAVE. Everything else — no token, a
+// 500, a timeout — is accepted and LABELLED, because a check that wedges every
+// completion whenever GitHub is slow would be removed within a week.
+describe("report_completion — FR-5 verifies the PR's base branch (D3)", () => {
+  const withBase = (branch) => ticketRow({ key: "TEAM-4200", description: `Fix the expired-token path.\n\nbase_branch: ${branch}` });
+
+  /** Stub GitHub's one GET. `reply` gets the URL and returns a Response-ish. */
+  const stubGitHub = (reply) => {
+    const spy = vi.fn(async (url, init) => reply(String(url), init));
+    vi.stubGlobal("fetch", spy);
+    return spy;
+  };
+  const ok = (body) => ({ ok: true, status: 200, json: async () => body });
+  const fail = (status) => ({ ok: false, status, json: async () => ({ message: "nope" }) });
+
+  beforeEach(() => { process.env.GITHUB_TOKEN = "ghp_test_token_value"; });
+  afterEach(() => { delete process.env.GITHUB_TOKEN; vi.unstubAllGlobals(); });
+
+  it("200 + base.ref main ⇒ accepted and stamped `verified`, from the right URL", async () => {
+    h.issue = withBase("main");
+    const spy = stubGitHub(() => ok({ base: { ref: "main" } }));
+    const r = result(await report({ pr_url: PR_URL }));
+    expect(r.status).toBe("complete");
+    expect(r.prBaseVerification).toBe("verified");
+    expect(transitioned()).toBe(true);
+    // Derived from the parsed URL, never pasted: owner/repo/number only.
+    expect(spy.mock.calls[0][0]).toBe("https://api.github.com/repos/owner/repo/pulls/42");
+    const init = spy.mock.calls[0][1];
+    expect(init.headers.Accept).toBe("application/vnd.github+json");
+    expect(init.headers["X-GitHub-Api-Version"]).toBe("2022-11-28");
+    // Bounded, and by less than the Lambda's own budget.
+    expect(init.signal).toBeInstanceOf(AbortSignal);
+  });
+
+  it("200 + base.ref anything else ⇒ REFUSED, and the message names the base observed", async () => {
+    h.issue = withBase("main");
+    stubGitHub(() => ok({ base: { ref: "feature/TEAM-4734--si-x" } }));
+    const r = result(await report({ pr_url: PR_URL }));
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBe("main_fix_requires_pr");
+    expect(r.detail).toBe("pr_base_not_main");
+    expect(r.message).toContain(JSON.stringify("feature/TEAM-4734--si-x"));
+    expect(r.message).toContain("Nothing was recorded and the ticket was NOT transitioned.");
+    // A refusal leaves NO trace: no record, no events, no transition.
+    expect(wroteRecord()).toBe(false);
+    expect(transitioned()).toBe(false);
+    expect(events("delivery.prState")).toHaveLength(0);
+    expect(events("workflow.report_completion")).toHaveLength(0);
+    expect(r).not.toHaveProperty("prBaseVerification");
+  });
+
+  it("404 ⇒ REFUSED: a PR the hub cannot see is not evidence", async () => {
+    h.issue = withBase("main");
+    stubGitHub(() => fail(404));
+    const r = result(await report({ pr_url: PR_URL }));
+    expect(r.ok).toBe(false);
+    expect(r.detail).toBe("pr_not_found");
+    expect(r.message).toContain("owner/repo#42");
+    expect(wroteRecord()).toBe(false);
+    expect(transitioned()).toBe(false);
+  });
+
+  it("no GITHUB_TOKEN ⇒ accepted, stamped `unverified`, and NO call attempted", async () => {
+    delete process.env.GITHUB_TOKEN;
+    h.issue = withBase("main");
+    const spy = stubGitHub(() => ok({ base: { ref: "main" } }));
+    const r = result(await report({ pr_url: PR_URL }));
+    expect(r.status).toBe("complete");
+    expect(r.prBaseVerification).toBe("unverified");
+    expect(spy).not.toHaveBeenCalled();
+    expect(h.warns.join("\n")).toContain("pr base UNVERIFIED (no GITHUB_TOKEN)");
+  });
+
+  it.each([500, 502, 403, 401, 429])("GitHub %i ⇒ accepted, stamped `indeterminate` (fail-open)", async (status) => {
+    h.issue = withBase("main");
+    stubGitHub(() => fail(status));
+    const r = result(await report({ pr_url: PR_URL }));
+    expect(r.status).toBe("complete");
+    expect(r.prBaseVerification).toBe("indeterminate");
+    expect(transitioned()).toBe(true);
+    expect(h.warns.join("\n")).toContain(`pr base INDETERMINATE for owner/repo#42 (GitHub ${status})`);
+  });
+
+  it("a timeout ⇒ accepted, stamped `indeterminate` — a slow GitHub cannot wedge a run", async () => {
+    h.issue = withBase("main");
+    stubGitHub(() => { const e = new Error("The operation was aborted due to timeout"); e.name = "TimeoutError"; throw e; });
+    const r = result(await report({ pr_url: PR_URL }));
+    expect(r.status).toBe("complete");
+    expect(r.prBaseVerification).toBe("indeterminate");
+    expect(transitioned()).toBe(true);
+    expect(h.warns.join("\n")).toContain("pr base INDETERMINATE for owner/repo#42 (TimeoutError");
+  });
+
+  it("200 with no base.ref at all ⇒ indeterminate, not 'verified'", async () => {
+    // A body we cannot read is not a body that said "main".
+    h.issue = withBase("main");
+    stubGitHub(() => ok({ number: 42 }));
+    const r = result(await report({ pr_url: PR_URL }));
+    expect(r.status).toBe("complete");
+    expect(r.prBaseVerification).toBe("indeterminate");
+  });
+
+  it("makes NO call, and stamps nothing, when the ticket's base branch is not main", async () => {
+    h.issue = withBase("feature/TEAM-4734-integration");
+    const spy = stubGitHub(() => ok({ base: { ref: "main" } }));
+    const r = result(await report({ pr_url: PR_URL }));
+    expect(r.status).toBe("complete");
+    expect(r).not.toHaveProperty("prBaseVerification");
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  it("makes NO call when the ticket states no base branch at all — the ordinary report", async () => {
+    // The shape almost every completion in the fleet has. It must not acquire a
+    // GitHub dependency.
+    const spy = stubGitHub(() => ok({ base: { ref: "main" } }));
+    const r = result(await report({ pr_url: PR_URL }));
+    expect(r.status).toBe("complete");
+    expect(Object.keys(r).sort()).toEqual(["message", "status"]);
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  it("never puts the token anywhere but the Authorization header", async () => {
+    h.issue = withBase("main");
+    const spy = stubGitHub(() => ok({ base: { ref: "main" } }));
+    const res = await report({ pr_url: PR_URL });
+    const TOKEN = "ghp_test_token_value";
+    expect(spy.mock.calls[0][1].headers.Authorization).toBe(`token ${TOKEN}`);
+    // Not in the URL, not in a log line, not on the response, not in the record.
+    expect(spy.mock.calls[0][0]).not.toContain(TOKEN);
+    expect(h.warns.join("\n")).not.toContain(TOKEN);
+    expect(res.content[0].text).not.toContain(TOKEN);
+    expect(JSON.stringify(record())).not.toContain(TOKEN);
+  });
+
+  it("accepts the api.github.com form of the URL too", async () => {
+    // Blueprints paste whichever form the merge worker returned.
+    h.issue = withBase("main");
+    const spy = stubGitHub(() => ok({ base: { ref: "main" } }));
+    const r = result(await report({ pr_url: "https://api.github.com/repos/owner/repo/pulls/42" }));
+    expect(r.prBaseVerification).toBe("verified");
+    expect(spy.mock.calls[0][0]).toBe("https://api.github.com/repos/owner/repo/pulls/42");
   });
 });
 
@@ -1266,16 +1491,60 @@ describe("report_completion — FR-10 empty_sweep", () => {
     ])).toHaveLength(2);
   });
 
-  it("says so out loud when the epic is unreadable, rather than passing as done", async () => {
+  // ── TEAM-4752 D1: an unknown roster REFUSES the report ────────────────────────
+  //
+  // These two replace "says so out loud when the epic is unreadable, rather than
+  // passing as done", which accepted the report, warned, and transitioned the
+  // sweeper anyway. Warning is not enough here: the sweeper's Done is what
+  // CASCADES, so accepting it hands every downstream ticket to a live agent for a
+  // diff that does not exist — the FR-10 failure this feature exists to prevent.
+  it("REFUSES the report when the sweeper's own ticket is unreadable — its epic is unknown", async () => {
     h.ticketFail.add("Tickets___get_issue");
     const res = result(await sweep());
-    // The completion still stands — bookkeeping never holds a completion hostage —
-    // but a sweep that closed nothing must not look like a sweep that had nothing
-    // to close.
+    expect(res.ok).toBe(false);
+    expect(res.reason).toBe("sibling_scan_failed");
+    // Nothing durable, nothing announced, nothing transitioned — the persona retries.
+    expect(wroteRecord()).toBe(false);
+    expect(transitioned()).toBe(false);
+    expect(events("workflow.report_completion")).toHaveLength(0);
+    expect(events("delivery.prState")).toHaveLength(0);
+    expect(res.message).toContain("the ticket was NOT transitioned");
+    expect(res.message).toContain("Retry the call");
+    expect(h.warns.join("\n")).toMatch(/REFUSED TEAM-4640: sibling_scan_failed \(get_issue:/);
+  });
+
+  it("REFUSES the report when the sibling scan under a known epic fails", async () => {
+    h.ticketFail.add("Tickets___list_tickets");
+    const res = result(await sweep());
+    expect(res.ok).toBe(false);
+    expect(res.reason).toBe("sibling_scan_failed");
+    expect(res.message).toContain("the sibling scan under TEAM-4100 failed");
+    expect(res.message).toContain("cascade the run onto a diff that does not exist");
+    expect(wroteRecord()).toBe(false);
+    expect(transitioned()).toBe(false);
+    // No sibling was touched either — a refusal leaves no partial sweep behind.
+    expect(h.puts.filter((p) => p.Key?.startsWith("completions/"))).toHaveLength(0);
+  });
+
+  it("still ACCEPTS a sweeper that provably has no parent — that is a definite negative", async () => {
+    // "We looked and there is no epic" is knowledge; "we could not look" is not.
+    // Only the second refuses. This keeps the pre-4752 warn-and-proceed path for a
+    // parentless sweeper, which has no siblings to close by construction.
+    h.issue = ticketRow({ key: "TEAM-4640", summary: "Sweep dead code", parent: null });
+    const res = result(await sweep());
     expect(res.status).toBe("complete");
     expect(res).not.toHaveProperty("emptySweepSkipped");
-    expect(h.warns.join("\n")).toContain("no siblings were readable");
-    expect(h.warns.join("\n")).toContain("no epic resolved");
+    expect(transitioned()).toBe(true);
+    expect(calls("Tickets___list_tickets")).toHaveLength(0);
+    expect(h.warns.join("\n")).toContain("the ticket has no parent");
+  });
+
+  it("ACCEPTS a readable but EMPTY roster, and says which it was", async () => {
+    h.siblings.length = 0;
+    const res = result(await sweep());
+    expect(res.status).toBe("complete");
+    expect(res).not.toHaveProperty("emptySweepSkipped");
+    expect(h.warns.join("\n")).toContain("the sibling roster is readable but EMPTY under TEAM-4100");
   });
 
   it("an ordinary completion runs no sweep at all", async () => {
@@ -1441,6 +1710,34 @@ describe("submit_ticket_plan — FR-11 normalization", () => {
     const res = result(await plan({ epic_id: "" }));
     expect(calls("Tickets___list_tickets")).toHaveLength(0);
     expect(res.ticket_count).toBe(3);
+  });
+
+  // TEAM-4752 D1 — the ONE sibling-scan consumer that stays fail-open. This tool
+  // creates nothing; the ENFORCING half of the freeze rule is the twins'
+  // create-time autowire, which 4752 makes fail-closed. So refusing the plan would
+  // strand the analyst's whole output over one throttled Query, for an edge that is
+  // re-derived at create time anyway. What changes is that it is no longer SILENT.
+  it("FAILS OPEN on a failed sibling scan — but says so on the response", async () => {
+    h.ticketFail.add("Tickets___list_tickets");
+    const res = result(await plan());
+    expect(res.status).toBe("saved");
+    expect(res.ticket_count).toBe(3);
+    // No invented blocker: only a validated real ticket key may ever be inserted.
+    expect(planTicket(res.tickets, "API work").blockedBy).toEqual([]);
+    expect(res).not.toHaveProperty("autowired");
+    // The visible part — the agent that has to copy this plan can see the edge is
+    // missing instead of trusting a plan that was silently degraded.
+    expect(res.warning).toContain("root-blocker autowire SKIPPED");
+    expect(res.warning).toContain("TEAM-4100");
+    expect(h.warns.join("\n")).toMatch(/sibling scan under TEAM-4100 FAILED .* root-blocker autowire SKIPPED/);
+    // Still persisted, and the branch templating still ran.
+    expect(savedPlan().tickets).toHaveLength(3);
+    expect(res.integration_branch).toBe(BRANCH);
+  });
+
+  it("adds no warning key at all on the ordinary path", async () => {
+    // Additive: an existing caller's response is byte-identical to pre-4752.
+    expect(result(await plan())).not.toHaveProperty("warning");
   });
 });
 

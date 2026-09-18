@@ -294,6 +294,9 @@ async function recordSweepSkip(
       token: ctx.token,
       mainSha: pf.mainSha,
       date: at.slice(0, 10),
+      // TEAM-4752 D4: word the comment from the observed mergeability instead of
+      // asserting "still mergeable" off the base SHA.
+      mergeable: newest.mergeable,
     });
   }
   console.log(`[start] dead-code sweep skipped (${pf.reason}) at main @${pf.mainSha ?? "?"}`);

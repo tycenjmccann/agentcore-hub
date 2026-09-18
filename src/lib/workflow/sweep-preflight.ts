@@ -15,8 +15,10 @@
  * dead code" but "is there dead code THIS run could remove that an open PR does
  * not already remove". Three outcomes:
  *
- *   skip open_sweep_pr   an open sweep PR is based on the CURRENT main — its diff
- *                        is exactly what we would produce. Re-verify it and stop.
+ *   skip open_sweep_pr   an open sweep PR that could actually LAND is based on the
+ *                        CURRENT main — its diff is exactly what we would produce.
+ *                        Re-verify it and stop. (TEAM-4752 D4: "could land" is a
+ *                        check, not an assumption — see `isViableSweepPr`.)
  *   skip unchanged_main  no open sweep PR and main has not moved since the last
  *                        sweep's base — the last sweep already answered this SHA.
  *   proceed              main moved. `alreadyRemoved` names what an open PR is
@@ -51,7 +53,7 @@ export function isSweepHead(headRef: string): boolean {
   return SWEEP_HEAD_PATTERNS.some((re) => re.test(ref));
 }
 
-/** An open sweep PR, reduced to the four things the decision needs. */
+/** An open sweep PR, reduced to what the decision needs. */
 export interface OpenSweepPr {
   number: number;
   url: string;
@@ -60,6 +62,16 @@ export interface OpenSweepPr {
   baseSha: string;
   /** Paths (and ledger-named symbols) this PR already deletes. */
   deletedPaths: string[];
+  // ─── TEAM-4752 D4: whether this PR could actually land ─────────────────────
+  /** `base.ref` — the branch the PR targets, not the branch it came from. */
+  baseRef: string;
+  /** GitHub's `draft` flag: a draft PR is not offered for merge. */
+  draft: boolean;
+  /** `head.repo.full_name` — "owner/repo", so a fork's PR is recognizable. */
+  headRepoFullName: string;
+  /** GitHub's three-state mergeability: `false` = CONFLICTING, `null` = not yet
+   *  computed. Null is NOT a negative; GitHub computes it asynchronously. */
+  mergeable: boolean | null;
 }
 
 /** The `prs` echo on a skip — enough for a human to go look at what blocked it. */
@@ -67,6 +79,9 @@ export interface SkippedPrRef {
   number: number;
   url: string;
   baseSha: string;
+  /** TEAM-4752 D4: so the caller can WORD its comment from the observed state
+   *  instead of asserting "still mergeable" on the strength of the base SHA. */
+  mergeable: boolean | null;
 }
 
 export type SweepSkipReason = "open_sweep_pr" | "unchanged_main";
@@ -99,6 +114,12 @@ export interface SweepPreflightInput {
   openSweepPrs: OpenSweepPr[];
   /** Base SHA the previous sweep ran against, when it is knowable. */
   lastSweepBaseSha?: string | null;
+  // ─── TEAM-4752 D4 — pure function, so what it compares against is an INPUT ──
+  /** The branch a viable sweep PR must target (the repo's default branch). */
+  defaultBranch: string;
+  /** "owner/repo" a viable sweep PR's head must live in — a fork cannot be the
+   *  thing that lands this diff. */
+  repoFullName: string;
 }
 
 /** Newest = highest PR number. GitHub numbers are monotonic per repo. */
@@ -110,25 +131,65 @@ function newest(prs: OpenSweepPr[]): OpenSweepPr | undefined {
 }
 
 /**
- * The decision, as a pure function of the three observations. Order matters: an
- * open PR at the current main is the strongest signal we have, and it is checked
- * before the (weaker, often unknowable) last-base comparison.
+ * TEAM-4752 D4 — could this PR actually deliver the diff we are about to skip?
+ *
+ * The skip arm's whole claim is "an open PR already contains this run's diff", and
+ * it was resting on `base.sha` alone. A PR at the right base SHA that is CONFLICTING,
+ * a draft, targeting a release branch, or opened from a fork does not deliver
+ * anything — so skipping on it retires the sweep in favour of a PR that will never
+ * merge, and the dead code stays. That is strictly worse than the duplicate-PR
+ * problem FR-9 was written to solve, because at least a duplicate PR was mergeable.
+ *
+ * Each clause is a DEFINITE negative, and `mergeable: null` is deliberately not one:
+ * GitHub computes mergeability asynchronously and answers null until it has, so
+ * treating null as unmergeable would make the decision depend on how quickly we
+ * asked. The comment on a skip is worded from the same value instead
+ * (`commentOnSweepPr`), so an unknown is disclosed rather than asserted away.
+ */
+export function isViableSweepPr(
+  pr: OpenSweepPr,
+  { defaultBranch, repoFullName }: { defaultBranch: string; repoFullName: string }
+): boolean {
+  if (!pr) return false;
+  if (!defaultBranch || pr.baseRef !== defaultBranch) return false;
+  if (pr.draft) return false;
+  if (pr.mergeable === false) return false;
+  if (!repoFullName || pr.headRepoFullName !== repoFullName) return false;
+  return true;
+}
+
+/**
+ * The decision, as a pure function of the observations. Order matters: an open PR at
+ * the current main is the strongest signal we have, and it is checked before the
+ * (weaker, often unknowable) last-base comparison.
+ *
+ * TEAM-4752 D4: every arm that CONSUMES an open PR now consumes only the viable
+ * ones. That includes the advisory arms — `alreadyRemoved` tells the analyst "do NOT
+ * re-report these", so listing paths a conflicting or forked PR can no longer
+ * deliver suppresses the only useful part of proceeding. `open.length === 0` for the
+ * `unchanged_main` arm stays on the RAW list: an unmergeable sweep PR is still an
+ * open sweep PR, and the run that would have to fix it is not the run we should
+ * cancel for having nothing to do.
  */
 export function decideSweepPreflight({
   mainSha,
   openSweepPrs,
   lastSweepBaseSha,
+  defaultBranch,
+  repoFullName,
 }: SweepPreflightInput): SweepPreflight {
   const open = (openSweepPrs || []).filter((pr) => pr && isSweepHead(pr.headRef));
+  const viable = open.filter((pr) => isViableSweepPr(pr, { defaultBranch, repoFullName }));
 
-  // An open sweep PR based on the CURRENT main already contains this run's diff.
-  if (mainSha && open.some((pr) => pr.baseSha === mainSha)) {
+  // An open, LANDABLE sweep PR based on the CURRENT main already contains this
+  // run's diff.
+  if (mainSha && viable.some((pr) => pr.baseSha === mainSha)) {
     return {
       decision: "skip",
       reason: "open_sweep_pr",
-      // All matching PRs, not just the one at main: lpkxmt had two, and a human
+      // All viable matches, not just the one at main: lpkxmt had two, and a human
       // reading the skip needs to see both to know which one to merge.
-      prs: open.map((pr) => ({ number: pr.number, url: pr.url, baseSha: pr.baseSha })),
+      prs: viable.map((pr) => ({ number: pr.number, url: pr.url, baseSha: pr.baseSha, mergeable: pr.mergeable })),
     };
   }
 
@@ -138,9 +199,9 @@ export function decideSweepPreflight({
     return { decision: "skip", reason: "unchanged_main", prs: [] };
   }
 
-  if (open.length > 0) {
-    const alreadyRemoved = [...new Set(open.flatMap((pr) => pr.deletedPaths || []))].sort();
-    const top = newest(open);
+  if (viable.length > 0) {
+    const alreadyRemoved = [...new Set(viable.flatMap((pr) => pr.deletedPaths || []))].sort();
+    const top = newest(viable);
     return {
       decision: "proceed",
       alreadyRemoved,
@@ -193,8 +254,11 @@ interface GhPr {
   number?: number;
   html_url?: string;
   body?: string | null;
-  head?: { ref?: string };
-  base?: { sha?: string };
+  draft?: boolean;
+  head?: { ref?: string; repo?: { full_name?: string } | null };
+  base?: { sha?: string; ref?: string };
+  /** Only the single-PR endpoint returns this; the list endpoint omits it. */
+  mergeable?: boolean | null;
 }
 
 /**
@@ -228,6 +292,15 @@ export async function runSweepPreflight(
     for (const pr of candidates) {
       const number = pr.number;
       if (typeof number !== "number") continue;
+
+      // TEAM-4752 D4: the LIST endpoint does not carry `mergeable` — GitHub computes
+      // it per PR, on demand, and only the single-PR endpoint reports it. So a
+      // viability check that needs it needs this second call; there is no way to get
+      // it in bulk. One extra request per sweep PR, and there are never many.
+      const detail = await ghGet(`/repos/${o}/${r}/pulls/${number}`, opts);
+      if (detail.status !== 200 || !detail.json || typeof detail.json !== "object") return failOpen;
+      const full = detail.json as GhPr;
+
       const files = await ghGet(`/repos/${o}/${r}/pulls/${number}/files?per_page=100`, opts);
       if (files.status !== 200 || !Array.isArray(files.json)) return failOpen;
       const removed = (files.json as { status?: string; filename?: string }[])
@@ -235,20 +308,56 @@ export async function runSweepPreflight(
         .map((f) => f.filename as string);
       openSweepPrs.push({
         number,
-        url: pr.html_url || `https://github.com/${owner}/${repo}/pull/${number}`,
-        headRef: pr.head?.ref || "",
-        baseSha: pr.base?.sha || "",
-        deletedPaths: [...removed, ...parseRemovalLedger(pr.body)],
+        url: full.html_url || pr.html_url || `https://github.com/${owner}/${repo}/pull/${number}`,
+        headRef: full.head?.ref || pr.head?.ref || "",
+        baseSha: full.base?.sha || pr.base?.sha || "",
+        deletedPaths: [...removed, ...parseRemovalLedger(full.body ?? pr.body)],
+        baseRef: full.base?.ref || pr.base?.ref || "",
+        draft: full.draft === true,
+        headRepoFullName: full.head?.repo?.full_name || pr.head?.repo?.full_name || "",
+        // Anything that is not a literal boolean is "GitHub has not answered yet",
+        // which `isViableSweepPr` deliberately does not read as a negative.
+        mergeable: typeof full.mergeable === "boolean" ? full.mergeable : null,
       });
     }
 
     return {
-      ...decideSweepPreflight({ mainSha, openSweepPrs, lastSweepBaseSha: opts.lastSweepBaseSha }),
+      ...decideSweepPreflight({
+        mainSha,
+        openSweepPrs,
+        lastSweepBaseSha: opts.lastSweepBaseSha,
+        defaultBranch,
+        repoFullName: `${owner}/${repo}`,
+      }),
       mainSha,
     };
   } catch {
     return failOpen;
   }
+}
+
+/**
+ * TEAM-4752 D4 — the comment body, as a pure function of what we actually observed.
+ *
+ * "still mergeable" was asserted on the strength of `base.sha` alone, which says only
+ * that the PR is based on the current main — nothing about conflicts. The comment is
+ * the ONE artefact a skip leaves for a human, and it was the sentence telling them
+ * not to look. Each state now says what is true, and the `true` state keeps today's
+ * wording byte-for-byte so a merged-by-hand history stays greppable.
+ */
+export function sweepSkipCommentBody({
+  mainSha,
+  date,
+  mergeable,
+}: {
+  mainSha: string;
+  date: string;
+  mergeable: boolean | null | undefined;
+}): string {
+  const head = `re-verified against main @${mainSha} on ${date};`;
+  if (mergeable === true) return `${head} still mergeable`;
+  if (mergeable === false) return `${head} GitHub reports it as CONFLICTING`;
+  return `${head} mergeability not yet computed by GitHub`;
 }
 
 /**
@@ -266,8 +375,10 @@ export async function commentOnSweepPr(opts: {
   timeoutMs?: number;
   mainSha: string;
   date: string;
+  /** GitHub's three-state mergeability for this PR, as observed by the preflight. */
+  mergeable?: boolean | null;
 }): Promise<boolean> {
-  const { owner, repo, number, mainSha, date } = opts;
+  const { owner, repo, number, mainSha, date, mergeable } = opts;
   if (!owner || !repo || !number) return false;
   try {
     const f = opts.fetchImpl ?? fetch;
@@ -276,7 +387,7 @@ export async function commentOnSweepPr(opts: {
       {
         method: "POST",
         headers: { ...ghHeaders(opts.token), "Content-Type": "application/json" },
-        body: JSON.stringify({ body: `re-verified against main @${mainSha} on ${date}; still mergeable` }),
+        body: JSON.stringify({ body: sweepSkipCommentBody({ mainSha, date, mergeable }) }),
         signal: AbortSignal.timeout(opts.timeoutMs ?? 8000),
       }
     );

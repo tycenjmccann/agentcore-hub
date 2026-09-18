@@ -120,6 +120,10 @@ beforeEach(() => {
   h.siblings.length = 0;
   h.issue = null;
   h.objects.clear();
+  // TEAM-4752 D3: no fixture here states `base_branch: main`, so nothing should
+  // reach GitHub — unset the token so that stays true even for a developer who has
+  // one exported, rather than depending on it.
+  delete process.env.GITHUB_TOKEN;
   vi.spyOn(console, "warn").mockImplementation((...a) => h.logs.push(a.join(" ")));
   vi.spyOn(console, "error").mockImplementation((...a) => h.logs.push(a.join(" ")));
   vi.spyOn(console, "log").mockImplementation((...a) => h.logs.push(a.join(" ")));
@@ -155,6 +159,27 @@ describe("TEAM-4660 — a fix created while the Merge Approval gate is open wait
     // A ship_fix in the ship phase: that pairing is what makes rule (iii) bite.
     expect(p.spawned_by).toEqual({ kind: "ship_fix", shipTicketId: "TEAM-4669" });
     expect(p.phase).toBe("ship");
+  });
+
+  it("files the fix BEFORE it transitions itself Done — the cascade must not outrun it (TEAM-4752 D2)", async () => {
+    await report({
+      ticket_id: "TEAM-4670", summary: "Repro confirmed at HEAD.", workflow_id: "wf_4660", agent_id: "agentcore_hub_qa_verifier",
+      follow_ups: JSON.stringify([{ kind: "fix", owner: "agent", assignee: "agentcore_hub_bug_fixer", title: "Expired token returns 500 instead of 401" }]),
+    });
+    // The ORDER of the invokes, not just their presence. The Done transition is what
+    // cascades: the orchestrator unblocks the dependents and re-evaluates whether the
+    // epic is complete, and completion.mjs rule (iii) can only be gated by a fix
+    // ticket that already EXISTS. Materializing after the transition left a window in
+    // which the run could roll to `complete` past the very follow-up it was handed.
+    const tools = h.calls.map((c) => c.tool);
+    const transitionAt = tools.findIndex(
+      (t, i) => t === "Tickets___transition_ticket" && h.calls[i].params.ticket_id === "TEAM-4670"
+    );
+    const lastCreateAt = tools.lastIndexOf("Tickets___create_ticket");
+    expect(lastCreateAt).toBeGreaterThanOrEqual(0);
+    expect(transitionAt).toBeGreaterThan(lastCreateAt);
+    // …and the transition really is the sweeper's own, to `done`.
+    expect(h.calls[transitionAt].params.transition_id).toBe("done");
   });
 
   it("and the run is NOT complete while that fix is open — no new gate logic", async () => {
@@ -291,9 +316,12 @@ describe("REGRESSION hirhfw — a completion with no follow-ups is unchanged but
       "ticket_id", "summary", "artifacts", "branch", "commit_sha", "pr_url", "completed_at", "delivery",
     ]);
     expect(r.delivery).toEqual({ prUrl: "https://github.com/tycenjmccann/agentcore-hub/pull/611", prState: "open" });
-    // No epic read, no sibling scan, no create: the report that needs none of it
-    // pays for none of it.
-    expect(h.calls.map((c) => c.tool)).toEqual(["Tickets___transition_ticket"]);
+    // No sibling scan, no create: the report that needs none of it pays for none of
+    // it. The ticket itself IS read now (TEAM-4752 D3 — its base branch lives
+    // nowhere else, so "it carries a PR" cannot be the reason not to look), which is
+    // one extra invoke and no change to what gets written; the record-key assertion
+    // above is what "byte-unchanged" actually means here.
+    expect(h.calls.map((c) => c.tool)).toEqual(["Tickets___get_issue", "Tickets___transition_ticket"]);
     expect(h.created).toHaveLength(0);
   });
 });
