@@ -168,6 +168,9 @@ function Drilldown({ patternKey, onClose }: { patternKey: string; onClose: () =>
         const json = await res.json();
         if (!live) return;
         if (!res.ok) setError(json.error || `HTTP ${res.status}`);
+        // 200 + no row = the table itself is not there (see the route). Say so
+        // rather than spinning on a row that will never arrive.
+        else if (!json.row) setError(json.unavailable?.reason || "This pattern has no ledger row.");
         else setRow(json.row);
       })
       .catch((e: unknown) => live && setError(e instanceof Error ? e.message : "Failed to load"));
@@ -278,6 +281,8 @@ export default function SiImpactPanel() {
   const [coverage, setCoverage] = useState<SiCoverageDay[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [unavailable, setUnavailable] = useState<string | null>(null);
+  const [truncated, setTruncated] = useState(false);
   const [openKey, setOpenKey] = useState<string | null>(null);
 
   const fetchLedger = useCallback(async () => {
@@ -289,6 +294,10 @@ export default function SiImpactPanel() {
       setSummary(json.summary ?? null);
       setPatterns(json.patterns ?? []);
       setCoverage(json.coverage ?? []);
+      // The table is an operator handoff step, not a CD one: "not created yet" is
+      // a normal state and gets the setup instruction, not the error styling.
+      setUnavailable(json.unavailable?.reason ?? null);
+      setTruncated(Boolean(json.truncated));
       setError(null);
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : "Failed to load the SI ledger");
@@ -322,6 +331,25 @@ export default function SiImpactPanel() {
       {error && (
         <div data-testid="si-impact-error" className="bg-danger-subtle border border-danger-fg/30 rounded-lg px-3 py-2 text-danger-fg text-xs">
           {error}
+        </div>
+      )}
+
+      {unavailable && (
+        <div
+          data-testid="si-impact-unavailable"
+          className="bg-warning-subtle border border-warning-fg/30 rounded-lg px-3 py-2 text-warning-fg text-xs"
+        >
+          {unavailable}
+        </div>
+      )}
+
+      {truncated && (
+        <div
+          data-testid="si-impact-truncated"
+          className="bg-warning-subtle border border-warning-fg/30 rounded-lg px-3 py-2 text-warning-fg text-xs"
+        >
+          The ledger has more rows than this panel reads in one request — the tiles below count only
+          the rows shown.
         </div>
       )}
 
@@ -411,7 +439,7 @@ export default function SiImpactPanel() {
                   {openKey === p.patternKey && <Drilldown patternKey={p.patternKey} onClose={() => setOpenKey(null)} />}
                 </Fragment>
               ))}
-              {!loading && patterns.length === 0 && !error && (
+              {!loading && patterns.length === 0 && !error && !unavailable && (
                 <tr>
                   <td colSpan={7} data-testid="si-impact-empty" className="px-3 py-6 text-center text-[var(--color-text-muted)]">
                     No patterns tracked yet. The ledger fills as runs are analysed — run{" "}

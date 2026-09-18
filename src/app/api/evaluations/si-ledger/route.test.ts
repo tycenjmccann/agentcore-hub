@@ -17,9 +17,17 @@ import { NextRequest } from "next/server";
  * 3. **An empty table is a 200, not an error.** Before the backfill runs, and on
  *    a fresh account, the panel's normal state is zero rows. Rendering an error
  *    there would read as "the loop is broken" when the truth is "nothing yet".
+ *    A table that does not EXIST yet is the same statement, and gets the same
+ *    200 — carrying `unavailable.reason` with the handoff steps, on both the list
+ *    and the drill-down. The line is drawn at "missing table" and nowhere else:
+ *    AccessDenied, the IAM half of that same handoff, still 500s, because it can
+ *    equally mean a real regression and must not be rendered as "nothing yet".
  * 4. **`no-effect` is a verdict, not a status.** A row whose fix did nothing is
  *    put back to `open` with the attempt kept, so it is counted by BOTH tiles.
  *    That double count is the honest answer and is asserted here.
+ * 5. **A short read says so.** The list read is page-capped (LIST_MAX_PAGES), so
+ *    if the cap ever bites the tiles are counted over a partial table; the route
+ *    must pass `truncated` through rather than under-report in silence.
  *
  * Seam-mocked at @/lib/si-ledger (our own helper, not a raw SDK call), like
  * api/evaluations/route.test.ts. The summarize/latest* helpers are NOT mocked —
@@ -29,6 +37,7 @@ import { NextRequest } from "next/server";
 const h = vi.hoisted(() => ({
   rows: [] as Array<Record<string, unknown>>,
   coverage: [] as Array<Record<string, unknown>>,
+  truncated: false,
   listError: null as Error | null,
   getError: null as Error | null,
   getCalls: [] as string[],
@@ -38,7 +47,7 @@ vi.mock("@/lib/si-ledger", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/lib/si-ledger")>()),
   listLedgerRows: vi.fn(async () => {
     if (h.listError) throw h.listError;
-    return { rows: h.rows, coverage: h.coverage };
+    return { rows: h.rows, coverage: h.coverage, truncated: h.truncated };
   }),
   getLedgerRow: vi.fn(async (patternKey: string) => {
     h.getCalls.push(patternKey);
@@ -104,6 +113,7 @@ async function get(url: string) {
 beforeEach(() => {
   h.rows = [];
   h.coverage = [];
+  h.truncated = false;
   h.listError = null;
   h.getError = null;
   h.getCalls = [];
@@ -163,11 +173,50 @@ describe("GET /api/evaluations/si-ledger (list)", () => {
     expect(body.coverage).toHaveLength(3);
   });
 
-  it("returns 500 with the message when the table read fails", async () => {
-    h.listError = new Error("ResourceNotFoundException: table not found");
+  it("explains a table that does not exist yet — 200, not 500", async () => {
+    // The table is created by the operator handoff (docs/MODULES.md), not by CD,
+    // so a fresh install legitimately has none. A 500 there reads as "the
+    // self-improvement loop is broken"; the truth is "nobody has run the handoff".
+    const err = new Error("Requested resource not found");
+    err.name = "ResourceNotFoundException";
+    h.listError = err;
+    const { status, body } = await get("/api/evaluations/si-ledger");
+    expect(status).toBe(200);
+    expect(body.error).toBeUndefined();
+    expect(body.unavailable.reason).toMatch(/does not exist yet/);
+    expect(body.unavailable.reason).toMatch(/create-dynamodb-tables\.sh/);
+    expect(body.unavailable.reason).toMatch(/SI_LEDGER_TABLE/);
+    // ...and the payload still renders: zeroed tiles, no rows, no coverage.
+    expect(body.patterns).toEqual([]);
+    expect(body.coverage).toEqual([]);
+    expect(body.summary.patterns).toBe(0);
+    expect(body.summary.analysisCoverage).toBeNull();
+  });
+
+  it("still 500s any OTHER read failure — AccessDenied is not 'nothing yet'", async () => {
+    // The IAM half of the same handoff, and every real regression, must stay loud:
+    // rendering AccessDenied as an empty ledger would hide a broken deploy.
+    const err = new Error("User is not authorized to perform: dynamodb:Scan");
+    err.name = "AccessDeniedException";
+    h.listError = err;
     const { status, body } = await get("/api/evaluations/si-ledger");
     expect(status).toBe(500);
-    expect(body.error).toMatch(/ResourceNotFoundException/);
+    expect(body.error).toMatch(/not authorized/);
+    expect(body.unavailable).toBeUndefined();
+  });
+
+  it("flags a truncated read so the tiles are not silently counted short", async () => {
+    h.truncated = true;
+    h.rows = [verifiedRow()];
+    const { status, body } = await get("/api/evaluations/si-ledger");
+    expect(status).toBe(200);
+    expect(body.truncated).toBe(true);
+  });
+
+  it("omits `truncated` entirely on a complete read", async () => {
+    h.rows = [verifiedRow()];
+    const { body } = await get("/api/evaluations/si-ledger");
+    expect(body.truncated).toBeUndefined();
   });
 });
 
@@ -203,6 +252,27 @@ describe("GET /api/evaluations/si-ledger?patternKey=", () => {
     const { status } = await get("/api/evaluations/si-ledger?patternKey=%23metrics");
     expect(status).toBe(400);
     expect(h.getCalls).toEqual([]);
+  });
+
+  it("explains a missing table here too — not a 500, and not a 404", async () => {
+    // A 404 would be a lie of a different kind: it says "this pattern is not
+    // tracked" when what happened is that there is nowhere to track it yet.
+    const err = new Error("Requested resource not found");
+    err.name = "ResourceNotFoundException";
+    h.getError = err;
+    const { status, body } = await get(`/api/evaluations/si-ledger?patternKey=${PAGING}`);
+    expect(status).toBe(200);
+    expect(body.row).toBeNull();
+    expect(body.unavailable.reason).toMatch(/does not exist yet/);
+  });
+
+  it("still 500s any OTHER drill-down failure", async () => {
+    const err = new Error("User is not authorized to perform: dynamodb:GetItem");
+    err.name = "AccessDeniedException";
+    h.getError = err;
+    const { status, body } = await get(`/api/evaluations/si-ledger?patternKey=${PAGING}`);
+    expect(status).toBe(500);
+    expect(body.error).toMatch(/not authorized/);
   });
 });
 

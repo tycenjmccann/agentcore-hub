@@ -14,9 +14,9 @@
    "wf_sd01..wf_sd31": "31 runs whose analyses each name the SAME pattern (harness silent death) in a DIFFERENT way - 'went silent', 'died mid-turn', 'no spans', 'dropped silently', 'stopped emitting spans'. This is the pattern the feature exists for: one ask made 31 times. 24 of them carry a second, unrelated item so a run contributes to more than one key.",
    "wf_ok01..wf_ok07": "7 runs with no silent death at all - they carry the remaining patterns (timeout, dispatch stall, lease leak, cascade gap, orchestrator scope creep, self-park, rework loop, missing evidence, QA gap, human wait, CI flake, deploy gate, build failure, intake scope, coding session loss, coding deps, trace gap, token burn, duplicate tickets).",
    "wf_ok08": "the NEGATIVES-only run - 'shipped ahead of schedule' and 'keep the summary at the top' name no systemic pattern, so classify() must return null and buildPlan must list them under `skipped` rather than invent a key.",
-   "6 silent-death PRDs": "the six real attempts at the pattern, with mixed outcomes on purpose: 3 deployed, 2 landed (merged, never deployed), and TEAM-4734 STILL RUNNING - no mergedAt and no completedAt, so it must land on `in-run`, not `landed`.",
+   "6 silent-death PRDs": "the six real attempts at the pattern, with mixed outcomes on purpose: 3 deployed, 2 landed (merged, never deployed), and TEAM-4734 STILL RUNNING - no mergedAt and no completedAt, so it must land on `in-run`, not `landed`. Replayed oldest-first, the ROW therefore ends `in-run`: applyAttempt assigns statusAfterOutcome(outcome) on every stamp, so a key's status is what its newest attempt says, not the furthest any attempt got. That is what keeps dedupeBlocked from filing a seventh PRD while the sixth is still running.",
    "system-20260820T093000.json": "the PRECEDENCE case: its description says 'human gate', but it names the DEPLOY gate, so it must classify as pipeline.deploy-gate and not the generic gate.human-wait. Swap those two entries in PATTERNS and this record fails.",
-   "system-20260828T171000.json": "a PRD with no run block at all - written, never started. Its attempt is `batched`, and because its pattern (gate.human-wait) is an existing `verified` row, the ledger's no-downgrade rule must keep it `verified`.",
+   "system-20260828T171000.json": "a PRD with no run block at all - written, never started. There is NO attempt to record: attempts[] is keyed on the run that carried one and `batched` is not an ATTEMPT_OUTCOMES member, so applyAttempt would throw - and replaying it as a `batched` status write would downgrade its pattern (gate.human-wait), an existing `verified` row, because applyStatus does not rank. It must appear under `skipped` with reason `prd-never-run` and write nothing.",
    "system-20260912T083000.json": "a cosmetic PRD that matches no pattern - the PRD-side negative case.",
    "existingRows[gate.human-wait]": "already `verified` with its own title and 2 occurrences. The backfill must APPEND its 3 new occurrences, keep the status `verified`, and keep the original title - a merge, never a clobber.",
    "existingRows[pipeline.build-failure]": "already `landed`; nothing in the backfill promotes it, so it stays `landed` (the mid-rank no-downgrade case)."
@@ -26,8 +26,8 @@
    "prds": 12,
    "distinctKeys": 20,
    "occurrences": 65,
-   "attempts": 11,
-   "skipped": 3,
+   "attempts": 10,
+   "skipped": 4,
    "silentDeath": {
     "occurrences": 31,
     "attempts": 6,
@@ -39,7 +39,7 @@
      "landed",
      "in-run"
     ],
-    "status": "deployed"
+    "status": "in-run"
    },
    "merged": {
     "gate.human-wait": "verified",
@@ -48,7 +48,7 @@
    "perKeyAttempts": {
     "harness.silent-death": 6,
     "pipeline.deploy-gate": 1,
-    "gate.human-wait": 1,
+    "gate.human-wait": 0,
     "blueprint.self-park": 1,
     "blueprint.rework-loop": 1,
     "qa.verification-gap": 1

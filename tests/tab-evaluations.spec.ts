@@ -572,4 +572,65 @@ test.describe("SI impact panel (TEAM-4760)", () => {
     // Unmeasured coverage is "—", never 0%.
     await expect(page.locator("[data-testid=si-tile-coverage]")).toContainText("—");
   });
+
+  test("a ledger table that does not exist yet explains the handoff, not an error", async ({ page }) => {
+    await installMocks(page);
+    // The route answers 200 + `unavailable` for a missing table (the table is
+    // created by the human handoff, not CD — docs/MODULES.md). The panel has to
+    // render THAT, and not the "nothing tracked yet" row, which would tell the
+    // operator the loop is running and finding nothing.
+    await page.route(
+      (url) => url.pathname === "/api/evaluations/si-ledger",
+      (r) =>
+        json(r, {
+          summary: { patterns: 0, openPatterns: 0, verifiedFixes: 0, noEffectFixes: 0, inRun: 0, occurrences: 0, analysisCoverage: null, analysisCoverageDay: null },
+          patterns: [],
+          coverage: [],
+          unavailable: { reason: "The SI ledger table (agentcore-hub-si-ledger) does not exist yet. Create it with scripts/create-dynamodb-tables.sh, set SI_LEDGER_TABLE on this service." },
+        })
+    );
+
+    await page.goto("/evaluations");
+    await expect(page.locator("[data-testid=si-impact-panel]")).toBeVisible();
+    const notice = page.locator("[data-testid=si-impact-unavailable]");
+    await expect(notice).toContainText("does not exist yet");
+    await expect(notice).toContainText("create-dynamodb-tables.sh");
+    // Not an error, and not the "nothing yet" row — those say different things.
+    await expect(page.locator("[data-testid=si-impact-error]")).toHaveCount(0);
+    await expect(page.locator("[data-testid=si-impact-empty]")).toHaveCount(0);
+  });
+
+  test("a page-capped read warns that the tiles are counted over a partial table", async ({ page }) => {
+    await installMocks(page);
+    await page.route(
+      (url) => url.pathname === "/api/evaluations/si-ledger",
+      (r) =>
+        json(r, {
+          summary: { patterns: 1, openPatterns: 1, verifiedFixes: 0, noEffectFixes: 0, inRun: 0, occurrences: 2, analysisCoverage: null, analysisCoverageDay: null },
+          truncated: true,
+          patterns: [
+            {
+              patternKey: "ops.paging.out-of-hours",
+              title: "Operator paged outside working hours",
+              status: "open",
+              firstSeen: "2026-08-01T00:00:00.000Z",
+              lastSeen: "2026-09-10T00:00:00.000Z",
+              occurrences: 2,
+              attempts: 0,
+              source: null,
+              latestAttempt: null,
+              latestVerdict: null,
+              expected: [],
+            },
+          ],
+          coverage: [],
+        })
+    );
+
+    await page.goto("/evaluations");
+    await expect(page.locator("[data-testid=si-impact-truncated]")).toContainText("more rows than this panel reads");
+    // The rows it DID read still render — a partial answer beats no answer.
+    await expect(page.locator("[data-testid=si-impact-panel]")).toContainText("ops.paging.out-of-hours");
+    await expect(page.locator("[data-testid=si-impact-error]")).toHaveCount(0);
+  });
 });

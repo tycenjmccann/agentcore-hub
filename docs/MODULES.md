@@ -154,7 +154,20 @@ The continuous-improvement loop. Self-contained surface.
   writes the ledger; rows are authored by the loop's own writers below). Bare
   `GET` lists the ledger rows for the "SI impact" panel; `?patternKey=<key>` is
   the single-pattern drill-down (full `occurrences` / `attempts` / `expected` /
-  `verdicts` history).
+  `verdicts` history). Two contracts worth knowing before reading a response:
+  - **A missing table is a `200`, not a `500`.** The table is created by the human
+    handoff below, not by CD, so "it does not exist yet" is the normal state of a
+    fresh install. Both paths answer `200` with `unavailable: { reason }` naming
+    the handoff steps (and an empty/`null` payload alongside), and the panel
+    renders that explanation instead of an error. The line is drawn at
+    `ResourceNotFoundException` and nowhere else — `AccessDenied`, the IAM half of
+    the same handoff, still `500`s, because it can equally mean a real regression.
+  - **The list read is page-capped** (`LIST_MAX_PAGES` in `src/lib/si-ledger.ts`,
+    10 pages x 100 rows — ~20x any plausible size of a one-row-per-defect-class
+    table) so a synchronous handler can never be made to walk an unbounded Scan.
+    If the cap ever bites, the response carries `truncated: true` and the panel
+    says the tiles are counted over a partial table. The writers' scans are
+    deliberately uncapped: their contract is completeness.
 - `src/app/api/evaluations/sessions/[sessionId]/` —
   `{ sessionId, agentId, persona, workflowId, ticketId, evaluatedAt, results: [...], tracesHref, workflowHref, lastUpdated }`.
   A session with no stored rows is a `404`.
@@ -275,6 +288,21 @@ The continuous-improvement loop. Self-contained surface.
     `si_verify.py --apply` (the `verified`/`no-effect`/`regressed` verdicts, on the
     daily SI-VERIFY sweep), and `scripts/si-ledger-backfill.mjs` for the one-time
     seed from existing analyses.
+  - **What the backfill will NOT write**, because the ledger's own rules forbid it
+    rather than because the history is thin — `--dry-run` prints each one under
+    `skipped (nothing written)` with its reason, so the operator sees it before
+    `--apply`: `no-pattern-match` (nothing in the text maps to a known key — the
+    keyword map is a judgement, not a classifier, so an unmapped item is left for a
+    human); `prd-never-run` (a PRD was written but never became a run, so there is
+    no attempt to record — `batched` is not an `ATTEMPT_OUTCOMES` member and
+    writing it as a *status* would downgrade a row that has since been `verified`);
+    and `attempt-without-occurrence` (the key has neither an existing row nor a
+    replayed sighting, and `stampAttempt` → `requireRow` throws rather than mint
+    one, because an attempt with no sighting behind it means the caller invented a
+    key). Predicted statuses in the report follow the ledger's own
+    last-attempt-wins rule — `applyAttempt` assigns `statusAfterOutcome(outcome)`
+    on every stamp — so the dry run never promises a status `--apply` cannot
+    produce.
   - **Readers:** `GET /api/evaluations/si-ledger` (the "SI impact" panel), the hub
     ECS service **read-only**, and `si_verify.py` in the WM toolkit, which reads
     `expected[]` back to decide the verdict.

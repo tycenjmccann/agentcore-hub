@@ -26,7 +26,12 @@
  *
  * Everything that makes a decision is therefore a pure exported function:
  * `classify` (text -> patternKey), `buildPlan` (data -> the exact ledger call
- * arguments) and `renderPlan` (plan -> operator report). `main()` only does I/O.
+ * arguments) and `renderPlan` (plan -> operator report). The one function that
+ * TOUCHES the ledger, `applyPlan`, takes it as an argument, so `main()` only
+ * does I/O — and the unit suite can drive the real SiLedger through the real
+ * call sites over a fake DynamoDB client. That coverage is not optional: with
+ * the ledger behind a lazy import, nothing else in the repo checks that this
+ * script and si-ledger.mjs still agree on method names and argument order.
  *
  * ── Dry run is the DEFAULT ──────────────────────────────────────────────────
  * A backfill that writes 88 runs of history because someone forgot a flag is
@@ -59,33 +64,30 @@ export function isValidPatternKey(key) {
 }
 
 /**
- * Status progress order, mirroring the ledger's "NEVER downgrade" rule. Used
- * only to compute the status a key ENDS at in the report; the ledger itself is
- * the enforcer, this is so the dry run predicts it honestly.
+ * Mirrors `statusAfterOutcome()` in lambda/workflow-analyzer/si-ledger.mjs: the
+ * status an attempt drives its row to. Kept here ONLY so the dry run can predict
+ * honestly what `--apply` will leave on the table; the ledger is the enforcer.
  *
- * The three verdicts (no-effect / regressed / wont-fix) sit ABOVE deployed on
- * purpose: they are a human/judge conclusion about a pattern, and a backfilled
- * attempt must not quietly erase one.
+ * This replaced a `STATUS_RANK`/`maxStatus` "never downgrade" mirror that the
+ * ledger does not actually implement. `applyAttempt` assigns
+ * `statusAfterOutcome(outcome)` on EVERY stamp, so a key's status is what its
+ * NEWEST attempt says — not the furthest any attempt ever got. The two disagree
+ * exactly where it matters: `harness.silent-death` has three deployed fixes and
+ * then a run still in flight, and the row is `in-run` (which is what stops
+ * dedupeBlocked from letting a fourth PRD be filed against it), while the ranking
+ * mirror printed `deployed`. The dry run must not promise a status the apply
+ * cannot produce, so there is one rule now and it is the ledger's.
+ * `si-ledger-backfill.test.mjs` section 7 pins this map against the real
+ * `statusAfterOutcome` for every ATTEMPT_OUTCOMES member.
  */
-export const STATUS_RANK = {
-  open: 0,
-  batched: 1,
-  "in-run": 2,
-  landed: 3,
-  deployed: 4,
-  "no-effect": 5,
-  regressed: 5,
-  "wont-fix": 5,
-  verified: 6,
-};
-
-const rank = (s) => (s in STATUS_RANK ? STATUS_RANK[s] : 0);
-/** The higher-ranked of two statuses — never a downgrade. */
-export function maxStatus(a, b) {
-  if (!a) return b;
-  if (!b) return a;
-  return rank(b) > rank(a) ? b : a;
-}
+export const STATUS_AFTER_OUTCOME = Object.freeze({
+  "in-run": "in-run",
+  landed: "landed",
+  deployed: "deployed",
+  cancelled: "open",
+  error: "open",
+  handoff: "landed",
+});
 
 // ── The keyword map: the ONE judgement call in this unit ─────────────────────
 //
@@ -278,14 +280,25 @@ const PRIORITY_TO_SEVERITY = { P0: "critical", P1: "high", P2: "medium" };
 /**
  * What an `[SI]` PRD's run actually achieved, from whatever the object records.
  * A PRD is an ATTEMPT at a pattern; how far that attempt got is the status.
- * Deployed beats merged beats still-running beats "written but never run".
+ * Deployed beats merged beats still-running.
+ *
+ * `null` for a PRD that was written but NEVER RUN. That is not an attempt: the
+ * ledger's `attempts[]` entry is keyed on the run that carried it and its
+ * `outcome` is validated against si-ledger.mjs ATTEMPT_OUTCOMES
+ * (`in-run|landed|deployed|cancelled|error|handoff`), which has no member for
+ * "nobody ever started it" — `applyAttempt` would throw. Nor may it be replayed
+ * as a `batched` STATUS write: `applyStatus` sets the status unconditionally, so
+ * a never-run PRD naming an already-`verified` pattern would silently downgrade
+ * it. So it is REPORTED under `skipped` and nothing is written. The mirror of
+ * this rule is `statusAfterOutcome` in lambda/workflow-analyzer/si-ledger.mjs.
  */
 export function deriveAttemptOutcome(prd) {
   const run = prd.run || {};
-  if (run.deployedAt) return { outcome: "deployed", status: "deployed" };
-  if (run.mergedAt) return { outcome: "landed", status: "landed" };
-  if (run.workflowId && !run.completedAt) return { outcome: "in-run", status: "in-run" };
-  return { outcome: "batched", status: "batched" };
+  const at = (outcome) => ({ outcome, status: STATUS_AFTER_OUTCOME[outcome] });
+  if (run.deployedAt) return at("deployed");
+  if (run.mergedAt) return at("landed");
+  if (run.workflowId && !run.completedAt) return at("in-run");
+  return null;
 }
 
 const textOf = (...parts) => parts.filter(Boolean).join("\n");
@@ -411,15 +424,30 @@ export function buildPlan({ analyses = [], prds = [], existingRows = [] } = {}) 
       continue;
     }
     const entry = touch(classified.patternKey, classified);
-    const { outcome, status } = deriveAttemptOutcome(prd);
+    const derived = deriveAttemptOutcome(prd);
+    if (!derived) {
+      // Written, never run — no attempt exists to record. See deriveAttemptOutcome.
+      skipped.push({
+        kind: "prd",
+        prdKey: prd.key,
+        patternKey: classified.patternKey,
+        title: prd.title || "(untitled)",
+        reason: "prd-never-run",
+      });
+      continue;
+    }
+    const { outcome, status } = derived;
     const run = prd.run || {};
-    // The status still counts even when the attempt is already on the row: the
-    // key's reported status is the furthest any attempt got it.
-    entry.status = maxStatus(entry.status, status);
     const attemptKey = `${classified.patternKey}|${prd.key}`;
     if (seenAttempts.has(attemptKey)) continue;
     seenAttempts.add(attemptKey);
     entry.attempts += 1;
+    // Newest REPLAYED attempt wins, because that is what applyAttempt does — it
+    // assigns statusAfterOutcome(outcome) on every stamp. PRDs are replayed
+    // oldest-first, so the last assignment here is the last write there. A key
+    // whose attempts are all already on the row keeps the row's own status: an
+    // occurrence never touches it. See STATUS_AFTER_OUTCOME.
+    entry.status = status;
     attempts.push({
       patternKey: classified.patternKey,
       source: "backfill",
@@ -437,9 +465,40 @@ export function buildPlan({ analyses = [], prds = [], existingRows = [] } = {}) 
     });
   }
 
+  // `stampAttempt` is a single-key writer: si-ledger.mjs requireRow() THROWS
+  // rather than mint a row, because an attempt with no occurrence behind it
+  // means the caller invented a key. So an attempt whose key will have neither a
+  // pre-existing row nor an occurrence replayed before it is not writable — drop
+  // it from the plan and say so, instead of letting --apply die mid-replay.
+  const writableKeys = new Set([
+    ...existing.keys(),
+    ...occurrences.map((o) => o.patternKey),
+  ]);
+  const writableAttempts = [];
+  for (const a of attempts) {
+    if (writableKeys.has(a.patternKey)) {
+      writableAttempts.push(a);
+      continue;
+    }
+    const entry = keys.get(a.patternKey);
+    if (entry) {
+      entry.attempts -= 1;
+      // Every attempt for such a key is unbackable (the key has no occurrence at
+      // all), so the status this one predicted is withdrawn with it.
+      entry.status = existing.get(a.patternKey)?.status || "open";
+    }
+    skipped.push({
+      kind: "prd",
+      prdKey: a.attempt.prdKey,
+      patternKey: a.patternKey,
+      title: entry?.title || a.patternKey,
+      reason: "attempt-without-occurrence",
+    });
+  }
+
   return {
     occurrences,
-    attempts,
+    attempts: writableAttempts,
     skipped,
     keys: [...keys.values()].sort((a, b) => a.patternKey.localeCompare(b.patternKey)),
   };
@@ -461,9 +520,12 @@ export function renderPlan(plan) {
     );
   }
   if (plan.skipped.length) {
-    lines.push("", `  skipped (no pattern matched):`);
+    // The reason is printed because they are no longer all the same: a PRD can
+    // also be skipped for naming no pattern, for never having run, or for
+    // naming a key with no occurrence to hang the attempt on.
+    lines.push("", `  skipped (nothing written):`);
     for (const s of plan.skipped) {
-      lines.push(`    ${s.kind} ${s.prdKey || `${s.workflowId}/${s.analysisId}`}: ${s.title}`);
+      lines.push(`    [${s.reason}] ${s.kind} ${s.prdKey || `${s.workflowId}/${s.analysisId}`}: ${s.title}`);
     }
   }
   const merged = plan.keys.filter((k) => k.existing).length;
@@ -473,6 +535,45 @@ export function renderPlan(plan) {
       `  attempts=${plan.attempts.length}  skipped=${plan.skipped.length}  merged=${merged}`,
   );
   return lines.join("\n");
+}
+
+// ── Replay ─────────────────────────────────────────────────────────────────
+
+/**
+ * Replay a plan through a REAL `SiLedger` (lambda/workflow-analyzer/si-ledger.mjs).
+ *
+ * The ledger is injected rather than constructed so this function — the ONLY
+ * place the backfill calls the ledger's API — stays importable with no AWS SDK
+ * and no ledger module resolvable, and so the unit suite drives these exact call
+ * sites against the real class over a fake DocumentClient. That matters: this
+ * script cannot import si-ledger.mjs at module scope (see the header), so a
+ * rename or a signature change on the other side is invisible to `node --check`
+ * and to every pure test. Covering `applyPlan` is what makes that drift fail a
+ * test instead of failing an operator's `--apply` half way through a write.
+ *
+ * Occurrences first, then attempts: `upsertOccurrence` is the only method that
+ * mints a row and `stampAttempt` throws on a missing one (buildPlan already
+ * drops attempts that no occurrence can back).
+ *
+ * @param ledger  an `SiLedger` instance (or anything with the same two methods)
+ * @param plan    the output of `buildPlan`
+ * @returns { occurrences, attempts } counts actually written
+ */
+export async function applyPlan(ledger, plan) {
+  let occurrences = 0;
+  let attempts = 0;
+  for (const o of plan.occurrences) {
+    // `source` rides inside the occurrence because that is where newRow() reads
+    // it from (si-ledger.mjs upsertOccurrence → newRow({ source: occ.source })),
+    // so only a row this backfill MINTED gets stamped source:"backfill".
+    await ledger.upsertOccurrence(o.patternKey, o.title, { ...o.occurrence, source: o.source });
+    occurrences += 1;
+  }
+  for (const a of plan.attempts) {
+    await ledger.stampAttempt(a.patternKey, a.attempt);
+    attempts += 1;
+  }
+  return { occurrences, attempts };
 }
 
 // ── I/O (main only) ────────────────────────────────────────────────────────
@@ -568,9 +669,9 @@ async function main() {
     import("@aws-sdk/client-dynamodb"),
     import("@aws-sdk/lib-dynamodb"),
     import("@aws-sdk/client-s3"),
-    // Even the dry run needs the ledger: `listRows()` is the only reader of the
-    // table, and a plan built without the existing rows would report a `verified`
-    // pattern as brand new.
+    // Even the dry run needs the ledger: `SiLedger.list()` is the only reader of
+    // the table, and a plan built without the existing rows would report a
+    // `verified` pattern as brand new.
     import(LEDGER_MODULE).catch((err) => {
       throw new Error(
         `cannot load ${LEDGER_MODULE} — it is the ledger's only writer/reader ` +
@@ -583,12 +684,12 @@ async function main() {
     marshallOptions: { removeUndefinedValues: true },
   });
   const s3 = new s3mod.S3Client({ region });
-  const ledger = ledgerMod.makeLedger({ ddb, table: ledgerTable });
+  const ledger = new ledgerMod.SiLedger({ ddb, table: ledgerTable });
 
   const [analyses, prds, existingRows] = await Promise.all([
     readAnalyses(ddb, ScanCommand, analysesTable),
     readPrds(s3, s3mod, bucket, prefix),
-    ledger.listRows(),
+    ledger.list(),
   ]);
   console.log(
     `read ${analyses.length} analyses (${analysesTable}), ${prds.length} PRDs ` +
@@ -604,16 +705,11 @@ async function main() {
     return;
   }
 
-  let wrote = 0;
-  for (const args of plan.occurrences) {
-    await ledger.upsertOccurrence(args);
-    wrote += 1;
-  }
-  for (const args of plan.attempts) {
-    await ledger.stampAttempt(args);
-    wrote += 1;
-  }
-  console.log(`\nApplied ${wrote} ledger writes to ${ledgerTable}.`);
+  const wrote = await applyPlan(ledger, plan);
+  console.log(
+    `\nApplied ${wrote.occurrences + wrote.attempts} ledger writes to ${ledgerTable} ` +
+      `(${wrote.occurrences} occurrences, ${wrote.attempts} attempts).`,
+  );
 }
 
 // Run only as a script — importing this file (the tests do) must do no I/O.

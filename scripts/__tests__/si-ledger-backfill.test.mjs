@@ -1,12 +1,18 @@
 // TEAM-4760 U9 — the SI ledger backfill, pinned against a committed fixture.
 //
-// This test runs OFFLINE and with NO dependencies: it imports
+// Sections 1-6 run OFFLINE and with NO dependencies: they import
 // scripts/si-ledger-backfill.mjs, which keeps `@aws-sdk/*` AND
 // `lambda/workflow-analyzer/si-ledger.mjs` behind lazy imports inside main()
 // for exactly this reason. If someone hoists either import to the top of that
 // file, every test below fails with ERR_MODULE_NOT_FOUND — which is the guard,
-// not an accident. Nothing here may import the ledger module, directly or
-// transitively.
+// not an accident, so nothing at module scope here may pull in either.
+//
+// Section 7 is the counterweight, and it is not optional: the pure sections can
+// only check the SHAPE the plan emits, never that the ledger ACCEPTS it. So
+// section 7 imports the real si-ledger.mjs (dynamically, inside each test) and
+// replays the plan through the real SiLedger over a fake DynamoDB client, via
+// the same `applyPlan` that `main()` calls. Those tests need
+// @aws-sdk/lib-dynamodb resolvable; the rest do not.
 //
 // The fixture (fixtures/si-backfill-history.json) stands in for the real
 // history: rows of `agentcore-hub-workflow-analyses` plus the `[SI]` PRD objects
@@ -23,10 +29,12 @@ import { fileURLToPath } from "node:url";
 import {
   KEY_GRAMMAR,
   PATTERN_KEYS,
+  STATUS_AFTER_OUTCOME,
+  applyPlan,
   buildPlan,
   classify,
+  deriveAttemptOutcome,
   isValidPatternKey,
-  maxStatus,
   renderPlan,
 } from "../si-ledger-backfill.mjs";
 
@@ -99,9 +107,13 @@ test("the silent-death attempts carry real, mixed outcomes — not all one value
     assert.ok(a.attempt.prdKey.endsWith(".json"), `attempt has no PRD key: ${a.attempt.prdKey}`);
     assert.ok(a.attempt.note.includes(a.attempt.prdKey));
   }
-  // The pattern ends where its furthest attempt got it, never downgraded by a
-  // later, less-complete one (attempt 5 landed but never deployed).
+  // The pattern ends where its NEWEST attempt left it — three of these fixes
+  // deployed, but TEAM-4734 is still running, so the row is `in-run`. That is
+  // what applyAttempt does (statusAfterOutcome on every stamp) and it is load
+  // bearing: `in-run` is what stops dedupeBlocked filing a seventh PRD while the
+  // sixth is still going. Section 7 replays this through the real reducers.
   assert.equal(keyOf("harness.silent-death").status, EXPECT.silentDeath.status);
+  assert.equal(EXPECT.silentDeath.status, "in-run");
 });
 
 // ── 3. a run that was still going when the ledger arrived ───────────────────
@@ -117,12 +129,62 @@ test("the TEAM-4734 attempt ends in-run, not landed", () => {
   assert.ok(a.attempt.workflowId, "in-run is only claimable with a workflowId");
 });
 
-test("a PRD that was written but never run is an attempt at status batched", () => {
-  const a = plan.attempts.find((x) => x.attempt.prdKey.endsWith("system-20260828T171000.json"));
-  assert.ok(a);
-  assert.equal(a.status, "batched");
-  assert.equal(a.attempt.outcome, "batched");
-  assert.equal(a.attempt.workflowId, undefined);
+test("a PRD that was written but never run writes NOTHING, and says so", () => {
+  const prdKey = "workflow-manager/synthesized-prds/system-20260828T171000.json";
+  // There is no attempt to record: attempts[] is keyed on the run that carried
+  // one, `batched` is not an ATTEMPT_OUTCOMES member (applyAttempt would throw),
+  // and replaying it as a `batched` STATUS write would downgrade gate.human-wait
+  // from `verified` — applyStatus does not rank. So: reported, never written.
+  assert.equal(deriveAttemptOutcome({ key: prdKey }), null);
+  assert.equal(deriveAttemptOutcome({ key: prdKey, run: {} }), null);
+  assert.equal(plan.attempts.filter((a) => a.attempt.prdKey === prdKey).length, 0);
+  const s = plan.skipped.find((x) => x.prdKey === prdKey);
+  assert.ok(s, "the never-run PRD is not reported at all");
+  assert.equal(s.reason, "prd-never-run");
+  assert.equal(s.patternKey, "gate.human-wait");
+  assert.match(renderPlan(plan), /\[prd-never-run\] prd .*system-20260828T171000\.json/);
+});
+
+test("an attempt whose key has no occurrence to hang it on is dropped, not replayed", () => {
+  // stampAttempt() → requireRow() THROWS on a missing row rather than mint one,
+  // so a plan that emitted this would kill `--apply` half way through a write.
+  const orphan = buildPlan({
+    analyses: [],
+    prds: [
+      {
+        key: "workflow-manager/synthesized-prds/orphan.json",
+        title: "[SI] the requirements agent went silent mid-turn",
+        run: { workflowId: "wf_orphan", mergedAt: "2026-09-01T00:00:00.000Z" },
+      },
+    ],
+    existingRows: [],
+  });
+  assert.equal(orphan.occurrences.length, 0);
+  assert.equal(orphan.attempts.length, 0, "an unbackable attempt stayed in the plan");
+  const s = orphan.skipped.find((x) => x.reason === "attempt-without-occurrence");
+  assert.ok(s, "the dropped attempt is not reported");
+  assert.match(s.patternKey, SILENT_DEATH);
+  // ...and the key's own summary must not claim an attempt it will not write.
+  assert.equal(orphan.keys.find((k) => k.patternKey === s.patternKey).attempts, 0);
+  // The same PRD IS written once an occurrence backs the key.
+  const backed = buildPlan({
+    analyses: [
+      {
+        workflowId: "wf_sd_x",
+        analysisId: "an_x",
+        createdAt: "2026-08-01T00:00:00.000Z",
+        findings: [{ title: "dev_agent_2 went silent mid-turn", severity: "high" }],
+      },
+    ],
+    prds: [
+      {
+        key: "workflow-manager/synthesized-prds/orphan.json",
+        title: "[SI] the requirements agent went silent mid-turn",
+        run: { workflowId: "wf_orphan", mergedAt: "2026-09-01T00:00:00.000Z" },
+      },
+    ],
+  });
+  assert.equal(backed.attempts.length, 1);
 });
 
 // ── 4. existing rows are merged, never clobbered ────────────────────────────
@@ -145,10 +207,11 @@ test("an existing verified row is merged, not reset to open or renamed", () => {
       "the plan re-emits an occurrence the row already has",
     );
   }
-  // Status survives: a backfilled `batched` attempt must not downgrade it.
+  // Status survives: the never-run PRD that names this key writes nothing at all,
+  // so there is no `batched` write that could downgrade it (see prd-never-run).
   assert.equal(after.status, "verified");
   assert.equal(after.status, EXPECT.merged["gate.human-wait"]);
-  assert.ok(plan.attempts.some((a) => a.patternKey === "gate.human-wait" && a.status === "batched"));
+  assert.equal(plan.attempts.filter((a) => a.patternKey === "gate.human-wait").length, 0);
   // Title survives, on the key summary AND on every write replayed for it.
   assert.equal(after.title, before.title);
   for (const o of plan.occurrences.filter((x) => x.patternKey === "gate.human-wait")) {
@@ -166,12 +229,25 @@ test("an existing mid-rank row keeps its status when nothing promotes it", () =>
   assert.equal(after.attempts, 0);
 });
 
-test("maxStatus never downgrades", () => {
-  assert.equal(maxStatus("verified", "batched"), "verified");
-  assert.equal(maxStatus("deployed", "landed"), "deployed");
-  assert.equal(maxStatus("open", "in-run"), "in-run");
-  assert.equal(maxStatus("landed", "deployed"), "deployed");
-  assert.equal(maxStatus("no-effect", "deployed"), "no-effect");
+test("a key with no replayed attempt keeps the status the row already holds", () => {
+  // Occurrences never touch status (applyOccurrence leaves it alone — an
+  // occurrence on a `verified` row is evidence of a regression, which only
+  // si_verify may rule on), so the only thing that can move a status here is an
+  // attempt. pipeline.build-failure gets occurrences and no attempt.
+  assert.equal(keyOf("pipeline.build-failure").status, "landed");
+  assert.equal(keyOf("gate.human-wait").status, "verified");
+  // ...and a brand-new key seen only in analyses starts, and stays, open.
+  const fresh = buildPlan({
+    analyses: [
+      {
+        workflowId: "wf_a",
+        analysisId: "an_a",
+        createdAt: "2026-08-01T00:00:00.000Z",
+        findings: [{ title: "the turn went silent and emitted no spans", severity: "high" }],
+      },
+    ],
+  });
+  assert.equal(fresh.keys[0].status, "open");
 });
 
 // ── 5. nothing matched means nothing matched ────────────────────────────────
@@ -186,7 +262,16 @@ test("classify returns null for text that names no pattern", () => {
 
 test("unmatched items are reported under skipped, never as an invented key", () => {
   assert.equal(plan.skipped.length, EXPECT.skipped);
-  for (const s of plan.skipped) assert.equal(s.reason, "no-pattern-match");
+  // Every skip names WHY, from the closed set — an unexplained skip is a write
+  // that silently vanished.
+  for (const s of plan.skipped) {
+    assert.ok(
+      ["no-pattern-match", "prd-never-run", "attempt-without-occurrence"].includes(s.reason),
+      `unknown skip reason ${s.reason}`,
+    );
+  }
+  const unmatched = plan.skipped.filter((s) => s.reason === "no-pattern-match");
+  assert.equal(unmatched.length, 3);
 
   const titles = plan.skipped.map((s) => s.title);
   assert.ok(titles.some((t) => t.includes("shipped ahead of schedule")));
@@ -196,7 +281,7 @@ test("unmatched items are reported under skipped, never as an invented key", () 
   // The negatives-only run contributed no writes at all.
   assert.equal(plan.occurrences.filter((o) => o.occurrence.workflowId === "wf_ok08").length, 0);
   // The cosmetic PRD is an attempt against nothing.
-  const cosmetic = plan.skipped.find((s) => s.kind === "prd");
+  const cosmetic = unmatched.find((s) => s.kind === "prd");
   assert.ok(cosmetic.prdKey.endsWith("system-20260912T083000.json"));
   assert.equal(plan.attempts.filter((a) => a.attempt.prdKey === cosmetic.prdKey).length, 0);
 });
@@ -267,7 +352,9 @@ test("renderPlan names every key and ends on a totals line", () => {
         `\\s+attempts=${plan.attempts.length}\\s+skipped=${plan.skipped.length}\\s+merged=2`,
     ),
   );
-  assert.ok(out.includes("skipped (no pattern matched)"));
+  assert.ok(out.includes("skipped (nothing written)"));
+  // Each skip line carries its reason — they are no longer all the same.
+  for (const s of plan.skipped) assert.ok(out.includes(`[${s.reason}]`), `report omits ${s.reason}`);
   assert.ok(out.includes("existing (merged)"), "report does not flag merged rows");
   assert.equal(plan.occurrences.length, EXPECT.occurrences);
   assert.equal(plan.attempts.length, EXPECT.attempts);
@@ -276,4 +363,121 @@ test("renderPlan names every key and ends on a totals line", () => {
 test("renderPlan survives an empty plan", () => {
   const out = renderPlan(buildPlan({}));
   assert.match(out, /TOTALS\s+keys=0\s+occurrences=0\s+attempts=0\s+skipped=0\s+merged=0/);
+});
+
+// ── 7. the plan replayed through the REAL ledger ────────────────────────────
+//
+// Everything above is pure: it checks the SHAPE the plan emits. It cannot catch
+// the failure that actually matters — the plan being handed to a ledger API that
+// does not accept it. `main()` cannot import si-ledger.mjs at module scope (the
+// script must stay stdlib-pure at import time), so nothing outside these tests
+// ever type-checks that boundary, and a renamed method or a reordered argument
+// would sail through every test in sections 1-6 and die on an operator's
+// `--apply` half way through writing the ledger.
+//
+// So these tests import the REAL lambda/workflow-analyzer/si-ledger.mjs — the
+// real SiLedger class over the real reducers — with ONLY the DynamoDB document
+// client faked, and replay the plan through `applyPlan`, the single function
+// `main()` also uses. Every status asserted below is produced by production
+// code. The import is dynamic per-test so sections 1-6 keep running with no
+// node_modules; si-ledger.mjs imports @aws-sdk/lib-dynamodb for its command
+// shapes, so these tests (and only these) need it resolvable.
+
+/** An in-memory DynamoDBDocumentClient: one table, keyed on patternKey. */
+function fakeDdb(seed = []) {
+  const items = new Map(seed.map((r) => [r.patternKey, structuredClone(r)]));
+  return {
+    items,
+    calls: [],
+    async send(cmd) {
+      const name = cmd.constructor.name;
+      this.calls.push(name);
+      if (name === "GetCommand") {
+        const hit = items.get(cmd.input.Key.patternKey);
+        return { Item: hit ? structuredClone(hit) : undefined };
+      }
+      if (name === "PutCommand") {
+        items.set(cmd.input.Item.patternKey, structuredClone(cmd.input.Item));
+        return {};
+      }
+      if (name === "ScanCommand") return { Items: [...items.values()].map((r) => structuredClone(r)) };
+      throw new Error(`fakeDdb: unexpected ${name}`);
+    },
+  };
+}
+
+async function realLedger(seed) {
+  const { SiLedger } = await import("../../lambda/workflow-analyzer/si-ledger.mjs");
+  const ddb = fakeDdb(seed);
+  return { ledger: new SiLedger({ ddb, table: "si-ledger-test" }), ddb };
+}
+
+test("STATUS_AFTER_OUTCOME is the real statusAfterOutcome, member for member", async () => {
+  // The mirror that caused the bug this section exists to catch: the backfill
+  // used to rank statuses and predict the furthest one, which the ledger never
+  // does. Pin the replacement against the real function so it cannot drift again.
+  const { ATTEMPT_OUTCOMES, statusAfterOutcome } = await import("../../lambda/workflow-analyzer/si-ledger.mjs");
+  assert.deepEqual(Object.keys(STATUS_AFTER_OUTCOME).sort(), [...ATTEMPT_OUTCOMES].sort());
+  for (const outcome of ATTEMPT_OUTCOMES) {
+    assert.equal(STATUS_AFTER_OUTCOME[outcome], statusAfterOutcome(outcome), outcome);
+  }
+  // And every outcome the backfill can emit is one the ledger accepts.
+  for (const a of plan.attempts) assert.ok(ATTEMPT_OUTCOMES.includes(a.attempt.outcome), a.attempt.outcome);
+});
+
+test("the plan replays through the real SiLedger without a single API mismatch", async () => {
+  const { ledger, ddb } = await realLedger(history.existingRows);
+  const wrote = await applyPlan(ledger, plan);
+  assert.equal(wrote.occurrences, plan.occurrences.length);
+  assert.equal(wrote.attempts, plan.attempts.length);
+  // Every key the report named now exists on the table.
+  assert.equal(ddb.items.size, plan.keys.length);
+  for (const k of plan.keys) assert.ok(ddb.items.has(k.patternKey), `${k.patternKey} was never written`);
+});
+
+test("the report's predicted status is the status the real reducers produce", async () => {
+  const { ledger, ddb } = await realLedger(history.existingRows);
+  await applyPlan(ledger, plan);
+  // This is the dry run's whole promise: what it printed is what --apply does.
+  for (const k of plan.keys) {
+    assert.equal(ddb.items.get(k.patternKey).status, k.status, `${k.patternKey} status drifted`);
+  }
+});
+
+test("replayed for real, silent-death carries 31 sightings and 6 attempts", async () => {
+  const { ledger, ddb } = await realLedger(history.existingRows);
+  await applyPlan(ledger, plan);
+  const row = [...ddb.items.values()].find((r) => SILENT_DEATH.test(r.patternKey));
+  assert.equal(row.occurrences.length, EXPECT.silentDeath.occurrences);
+  assert.equal(row.attempts.length, EXPECT.silentDeath.attempts);
+  assert.deepEqual(row.attempts.map((a) => a.outcome), EXPECT.silentDeath.outcomes);
+  // Three of the six fixes deployed, but the newest attempt is still running.
+  assert.equal(row.status, "in-run");
+  assert.equal(row.status, EXPECT.silentDeath.status);
+  assert.equal(row.source, "backfill", "a row this backfill minted is not stamped");
+  // firstSeen/lastSeen bracket the replay, oldest-first.
+  assert.ok(row.firstSeen < row.lastSeen);
+});
+
+test("replayed for real, the existing verified row is merged — not reset, not renamed", async () => {
+  const before = history.existingRows.find((r) => r.patternKey === "gate.human-wait");
+  const { ledger, ddb } = await realLedger(history.existingRows);
+  await applyPlan(ledger, plan);
+  const after = ddb.items.get("gate.human-wait");
+  assert.equal(after.status, "verified", "the backfill downgraded a verified row");
+  assert.equal(after.title, before.title);
+  assert.equal(after.occurrences.length, before.occurrences.length + 3);
+  assert.equal(after.source, undefined, "an existing row was restamped as a backfill");
+});
+
+test("replayed twice, the real ledger is byte-identical — no double-append", async () => {
+  const { ledger, ddb } = await realLedger(history.existingRows);
+  await applyPlan(ledger, plan);
+  const once = JSON.stringify([...ddb.items.entries()].sort());
+  // Pass 2 the way an operator re-runs it: re-read the table, re-plan, re-apply.
+  const again = buildPlan({ ...history, existingRows: await ledger.list() });
+  assert.equal(again.occurrences.length, 0);
+  assert.equal(again.attempts.length, 0);
+  await applyPlan(ledger, again);
+  assert.equal(JSON.stringify([...ddb.items.entries()].sort()), once);
 });

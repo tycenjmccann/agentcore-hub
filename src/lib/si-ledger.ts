@@ -229,20 +229,45 @@ function activityAt(row: SiLedgerRow): string {
 export interface SiLedgerListing {
   rows: SiLedgerRow[];
   coverage: SiCoverageDay[];
+  /** True when the page cap stopped the read before the table ended. */
+  truncated: boolean;
 }
 
 /**
- * Whole-table read, newest activity first. A Scan is the right call here and will
- * stay right: the table holds one row per defect class, so it is tens of rows,
- * and there is no access pattern that a GSI would serve better.
+ * Hard bound on the list read. The table is one row per defect class — tens of
+ * rows, low hundreds at the outside — so this cap is 20x any plausible size and
+ * exists purely so a synchronous HTTP handler can never be made to walk an
+ * unbounded number of pages: a mis-set SI_LEDGER_TABLE pointing at a large table,
+ * or a writer bug that mints keys, would otherwise hang the Evaluations tab and
+ * burn RCUs per request with no ceiling. The precedent is INVOCATION_MAX_PAGES in
+ * src/lib/workflow/dynamo-read.ts, which bounds the events read the same way.
+ *
+ * Reaching the cap is reported (`truncated`), never swallowed — a silently short
+ * list would make the hero tiles wrong, and wrong tiles are worse than a warning.
+ *
+ * The Scan in the WRITERS (lambda/workflow-analyzer's siReapScan, si_verify's
+ * sweep, this backfill) is deliberately NOT capped: those are asynchronous batch
+ * readers whose contract is completeness, and a cap there would silently skip
+ * rows — the opposite of the bug this cap prevents.
+ */
+const LIST_PAGE_SIZE = 100;
+const LIST_MAX_PAGES = 10;
+
+/**
+ * Whole-table read, newest activity first, bounded to LIST_MAX_PAGES pages.
+ * A Scan is the right call here and will stay right: the table holds one row per
+ * defect class and there is no access pattern a GSI would serve better.
  */
 export async function listLedgerRows(): Promise<SiLedgerListing> {
   const rows: SiLedgerRow[] = [];
   let coverage: SiCoverageDay[] = [];
   let ExclusiveStartKey: Record<string, unknown> | undefined;
-  do {
-    const page = await ddb.send(new ScanCommand({ TableName: TABLE, ExclusiveStartKey }));
-    for (const item of (page.Items || []) as SiLedgerRow[]) {
+  let truncated = false;
+  for (let page = 0; page < LIST_MAX_PAGES; page++) {
+    const res = await ddb.send(
+      new ScanCommand({ TableName: TABLE, Limit: LIST_PAGE_SIZE, ExclusiveStartKey }),
+    );
+    for (const item of (res.Items || []) as SiLedgerRow[]) {
       if (!item?.patternKey) continue;
       if (item.patternKey === SI_METRICS_KEY) {
         coverage = ((item as unknown as { coverage?: SiCoverageDay[] }).coverage || []).filter((d) => !!d?.day);
@@ -251,11 +276,14 @@ export async function listLedgerRows(): Promise<SiLedgerListing> {
       if (isReservedKey(item.patternKey)) continue;
       rows.push(item);
     }
-    ExclusiveStartKey = page.LastEvaluatedKey as Record<string, unknown> | undefined;
-  } while (ExclusiveStartKey);
+    ExclusiveStartKey = res.LastEvaluatedKey as Record<string, unknown> | undefined;
+    if (!ExclusiveStartKey) break;
+    // Cap hit with a key still pending → the table is bigger than the panel reads.
+    if (page === LIST_MAX_PAGES - 1) truncated = true;
+  }
 
   rows.sort((a, b) => activityAt(b).localeCompare(activityAt(a)));
-  return { rows, coverage };
+  return { rows, coverage, truncated };
 }
 
 /** One pattern, for the drill-down. `null` when the key has no row. */
@@ -263,4 +291,33 @@ export async function getLedgerRow(patternKey: string): Promise<SiLedgerRow | nu
   const res = await ddb.send(new GetCommand({ TableName: TABLE, Key: { patternKey } }));
   const item = res.Item as SiLedgerRow | undefined;
   return item?.patternKey ? item : null;
+}
+
+/**
+ * The ledger table is created by a human, not by CD (`docs/MODULES.md` handoff:
+ * `scripts/create-dynamodb-tables.sh`, then `SI_LEDGER_TABLE` on the analyzer,
+ * prd-submitter, the WM harness and this service). So "the table does not exist"
+ * is a NORMAL state on a fresh install, not a fault — and answering the panel
+ * with a 500 there reads as "the self-improvement loop is broken" when the truth
+ * is "nobody has run the handoff yet". Callers turn this into a 200 carrying an
+ * `unavailable` reason so the panel can say exactly that, with the fix.
+ *
+ * Deliberately narrow: ONLY a missing table. An AccessDenied (the IAM half of the
+ * same handoff) or any other failure still surfaces as an error, because those can
+ * equally mean a real regression and must not be rendered as "nothing yet".
+ */
+export function ledgerTableMissing(error: unknown): boolean {
+  const name = (error as { name?: string } | null)?.name || "";
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  return name === "ResourceNotFoundException" || /ResourceNotFoundException/.test(message);
+}
+
+/** The reason string the panel renders when the table is not there yet. */
+export function ledgerUnavailableReason(): string {
+  return (
+    `The SI ledger table (${TABLE}) does not exist yet. Create it with ` +
+    `scripts/create-dynamodb-tables.sh, set SI_LEDGER_TABLE on this service and ` +
+    `on the analyzer / prd-submitter Lambdas, then seed it with ` +
+    `scripts/si-ledger-backfill.mjs.`
+  );
 }
