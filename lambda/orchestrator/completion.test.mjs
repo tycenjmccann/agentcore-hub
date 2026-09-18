@@ -16,6 +16,9 @@ import {
   isAdvisoryTicket,
   advisoryNeverApplies,
   isHumanGateTicket,
+  deliveryRollUp,
+  FOLLOWUP_LABEL_RE,
+  FOLLOWUP_TITLE_RE,
 } from "./completion.mjs";
 
 /**
@@ -937,5 +940,213 @@ describe("workflow-manager completion record clears the gate (TEAM-4266)", () =>
     // Deliberate: operator prose is not proof anything merged (TEAM-3755 F1). The
     // record unblocks missing_evidence without ever synthesizing a ship signal.
     expect(shipVerdictOf(evidenceBackfillFields(MANAGER_RECORD, {}))).toBeNull();
+  });
+});
+
+/**
+ * TEAM-4740 FR-10 — `empty_sweep`.
+ *
+ * A dead-code sweep that finds nothing to remove has no honest terminal outcome
+ * today, so such a run either fakes a ship or wedges open (run fz514x). It is not a
+ * BLOCK — nothing was attempted and refused — and it is not a phantom green either:
+ * there was provably nothing to merge. So it maps to the positive verdict, while
+ * staying out of SHIP_BLOCKED_OUTCOMES (and therefore out of TERMINAL_WORKFLOW_PHASES,
+ * which is derived from it — a run must still close on `complete`, not on a phase
+ * called "empty_sweep").
+ */
+describe("shipVerdictOf — empty_sweep (TEAM-4740 FR-10)", () => {
+  it('classifies an empty sweep as "shipped"', () => {
+    expect(shipVerdictOf({ ticketId: "T-4", outcome: "empty_sweep" })).toBe("shipped");
+    // The agent writes it lowercase; the reader trims/lowers anyway, as for every
+    // other outcome.
+    expect(shipVerdictOf({ outcome: "  EMPTY_SWEEP " })).toBe("shipped");
+  });
+
+  it("is NOT a blocked outcome and NOT a terminal phase", () => {
+    expect(SHIP_BLOCKED_OUTCOMES).not.toContain("empty_sweep");
+    expect(TERMINAL_WORKFLOW_PHASES).not.toContain("empty_sweep");
+  });
+
+  it("lets a sweep run with nothing to remove close green at the run level", () => {
+    // The whole point: evaluateShipVerdict stops treating it as a phantom.
+    const verdict = evaluateShipVerdict(
+      doneRun(),
+      tasksWithShip({ outcome: "empty_sweep" }),
+      SHIP,
+      opts
+    );
+    expect(verdict).toEqual({
+      required: true,
+      shipped: true,
+      outcome: null,
+      blockReason: null,
+      offenders: [],
+    });
+  });
+
+  it("still refuses a ship report that claims nothing at all", () => {
+    // Guard against over-reach: the new branch must not soften the null case.
+    const verdict = evaluateShipVerdict(doneRun(), tasksWithShip({ output: "merged it" }), SHIP, opts);
+    expect(verdict.shipped).toBe(false);
+    expect(verdict.outcome).toBe("static-ci-only");
+  });
+});
+
+/**
+ * TEAM-4740 FR-13/FR-14 — `deliveryRollUp`, the pure roll-up the orchestrator
+ * splices into its ONE setDelivery write at completion.
+ *
+ * Two things it must never do: claim a delivery state it cannot derive (an absent
+ * field is honest, a wrong one is not), and return `undefined` (the caller spreads
+ * the result straight into the write).
+ */
+describe("deliveryRollUp (TEAM-4740 FR-13/FR-14)", () => {
+  /** A materialized follow-up, carrying both markers the materializer mints. */
+  const followUp = (over = {}) => ({
+    ticketId: "FU-1",
+    title: "Re-verify the deploy in prod [fu:1a2b3c4d]",
+    labels: ["followup-1a2b3c4d"],
+    assignee: "agentcore_hub_qa_verifier",
+    status: "todo",
+    ...over,
+  });
+
+  it("returns {} — never undefined — for a run with nothing to roll up", () => {
+    expect(deliveryRollUp([], {})).toEqual({});
+    expect(deliveryRollUp(doneRun(), {})).toEqual({});
+    // …and for junk, so the spread at the call site can never throw.
+    expect(deliveryRollUp(undefined, undefined)).toEqual({});
+    expect(deliveryRollUp(null, "nope")).toEqual({});
+  });
+
+  it("says NOTHING while an agent-owned follow-up is still open", () => {
+    // Deliberate: that follow-up is a fix ticket, so isWorkflowComplete rule (iii)
+    // is holding the run open and there is no completion to describe yet. Claiming
+    // "complete-with-handoff" here would label a run that has not finished.
+    expect(deliveryRollUp([followUp()], {})).toEqual({});
+  });
+
+  it("reports complete-with-handoff when every open follow-up is HUMAN-owned", () => {
+    const tickets = [
+      ...doneRun(),
+      followUp({ ticketId: "FU-1", assignee: "human:engineer", status: "todo" }),
+      followUp({ ticketId: "FU-2", assignee: "agentcore_hub_qa_verifier", status: "done" }),
+    ];
+    expect(deliveryRollUp(tickets, {})).toEqual({ outcome: "complete-with-handoff" });
+  });
+
+  it("says nothing once every follow-up is settled", () => {
+    const tickets = [
+      followUp({ ticketId: "FU-1", assignee: "human:engineer", status: "done" }),
+      followUp({ ticketId: "FU-2", assignee: "human:engineer", status: "cancelled" }),
+    ];
+    expect(deliveryRollUp(tickets, {})).toEqual({});
+  });
+
+  it("one open human follow-up beside a still-open agent one says nothing", () => {
+    const tickets = [
+      followUp({ ticketId: "FU-1", assignee: "human:engineer", status: "todo" }),
+      followUp({ ticketId: "FU-2", assignee: "agentcore_hub_backend_dev", status: "in_progress" }),
+    ];
+    expect(deliveryRollUp(tickets, {})).toEqual({});
+  });
+
+  it("recognizes a follow-up by EITHER marker, and ordinary tickets by neither", () => {
+    // The label is the filter; the title suffix is the only marker a re-entrant
+    // scan can read back, since list_tickets returns `summary` and not `labels`.
+    const labelOnly = { ticketId: "FU-1", title: "Hand off the IAM change", labels: ["followup-00ff11aa"], assignee: "human:engineer", status: "todo" };
+    const titleOnly = { ticketId: "FU-2", title: "Hand off the IAM change [fu:00ff11aa]", assignee: "human:engineer", status: "todo" };
+    expect(deliveryRollUp([labelOnly], {})).toEqual({ outcome: "complete-with-handoff" });
+    expect(deliveryRollUp([titleOnly], {})).toEqual({ outcome: "complete-with-handoff" });
+    // An ordinary open human gate is NOT a follow-up — it is the run's own review
+    // gate, and mislabelling it would report a handoff on every gated run.
+    expect(deliveryRollUp([{ ticketId: "G-1", title: "Merge Approval", assignee: "human:tycen", status: "in_review" }], {})).toEqual({});
+    // Nor is a near-miss marker (wrong length, wrong separator, not lowercase hex).
+    for (const near of ["followup-1a2b3c4", "followup:1a2b3c4d", "followup-1A2B3C4D", "followup-zzzzzzzz"]) {
+      expect(FOLLOWUP_LABEL_RE.test(near)).toBe(false);
+      expect(deliveryRollUp([{ ...followUp(), title: "no suffix", labels: [near] }], {})).toEqual({});
+    }
+    expect(FOLLOWUP_TITLE_RE.test("Re-verify [fu:1a2b3c4d] then stop")).toBe(false); // must be the SUFFIX
+    expect("Re-verify [fu:1a2b3c4d]  ".match(FOLLOWUP_TITLE_RE)[1]).toBe("1a2b3c4d");
+  });
+
+  it("derives prState=merged from a merge commit or an explicit shipped", () => {
+    expect(deliveryRollUp([], tasksWithShip({ mergeCommit: "9f1c2ab" }))).toEqual({ prState: "merged" });
+    expect(deliveryRollUp([], tasksWithShip({ outcome: "shipped" }))).toEqual({ prState: "merged" });
+    // FR-10: an empty sweep landed nothing, but it has nothing outstanding either —
+    // it rides the same positive verdict, so prState agrees with shipVerdictOf.
+    expect(deliveryRollUp([], tasksWithShip({ outcome: "empty_sweep" }))).toEqual({ prState: "merged" });
+  });
+
+  it("derives prState=open from a pr url alone — a PR exists, it did not land", () => {
+    const tasks = tasksWithShip({ prUrl: "https://github.com/o/r/pull/7" });
+    expect(deliveryRollUp([], tasks)).toEqual({ prState: "open" });
+    // TEAM-3755 F1 again, one layer up: the unmerged branch HEAD is not a merge.
+    expect(deliveryRollUp([], tasksWithShip({ commitSha: "abc1234" }))).toEqual({});
+    // A merge commit alongside the PR url wins — merged is the stronger signal.
+    expect(deliveryRollUp([], tasksWithShip({ prUrl: "https://github.com/o/r/pull/7", mergeCommit: "9f1c2ab" })))
+      .toEqual({ prState: "merged" });
+  });
+
+  it("omits prState entirely when nothing was harvested", () => {
+    // Not "unknown": an absent key lets the UI keep whatever the last write knew,
+    // and setDelivery is a whole-object SET.
+    expect(deliveryRollUp([], tasksWithShip({ output: "did stuff" }))).toEqual({});
+    expect(deliveryRollUp([], { "T-4": null })).toEqual({});
+    expect(deliveryRollUp([], tasksWithShip({ prUrl: "   " }))).toEqual({});
+  });
+
+  it("carries the handoff outcome and the prState together", () => {
+    const tickets = [followUp({ assignee: "human:engineer" })];
+    expect(deliveryRollUp(tickets, tasksWithShip({ mergeCommit: "9f1c2ab" }))).toEqual({
+      outcome: "complete-with-handoff",
+      prState: "merged",
+    });
+  });
+});
+
+/**
+ * TEAM-4740 FR-13 — the reason the materializer files agent-owned follow-ups as
+ * FIX tickets: rule (iii) then gates the epic with zero new completion logic. This
+ * pins that dependency, so a future refactor of the roll-up cannot quietly become
+ * the thing that holds a run open.
+ */
+describe("isWorkflowComplete — agent follow-ups gate via rule (iii) (TEAM-4740)", () => {
+  const postDeploy = (status) => ({
+    ticketId: "FU-1",
+    title: "Re-verify the deploy against prod [fu:1a2b3c4d]",
+    labels: ["followup-1a2b3c4d"],
+    assignee: "qa",
+    phase: "verification",
+    status,
+    spawnedBy: { kind: "qa_fix", qaTicketId: "T-4" },
+  });
+  const mainPr = (status) => ({
+    ticketId: "FU-2",
+    title: "Open a PR to main for the hub-infra fix [fu:9988aabb]",
+    labels: ["followup-9988aabb"],
+    assignee: "dev",
+    phase: "ship",
+    status,
+    spawnedBy: { kind: "ship_fix", shipTicketId: "T-4" },
+  });
+
+  it("an open post_deploy_verification follow-up (qa_fix) holds the run open", () => {
+    expect(isWorkflowComplete(doneRun([postDeploy("todo")]), DEF, opts)).toBe(false);
+    expect(isWorkflowComplete(doneRun([postDeploy("done")]), DEF, opts)).toBe(true);
+  });
+
+  it("an open main-PR follow-up (ship_fix) holds the run open", () => {
+    expect(isWorkflowComplete(doneRun([mainPr("in_progress")]), DEF, opts)).toBe(false);
+    expect(isWorkflowComplete(doneRun([mainPr("done")]), DEF, opts)).toBe(true);
+  });
+
+  it("a HUMAN follow-up does not gate — which is why it becomes complete-with-handoff", () => {
+    // The complement of the two cases above, and the whole reason the roll-up
+    // exists: nothing in the completion gate can see a human's inbox, so the
+    // handoff has to be recorded on the run instead of blocking it.
+    const human = { ticketId: "FU-3", title: "Grant the console role [fu:77665544]", labels: ["followup-77665544"], assignee: "human:engineer", status: "todo" };
+    expect(isWorkflowComplete(doneRun([human]), DEF, opts)).toBe(true);
+    expect(deliveryRollUp(doneRun([human]), {})).toEqual({ outcome: "complete-with-handoff" });
   });
 });

@@ -9,6 +9,15 @@
  */
 
 import { S3Client, GetObjectCommand, HeadObjectCommand } from "@aws-sdk/client-s3";
+// TEAM-4740 FR-5 (interim): the ONLY DynamoDB this Lambda touches is the events
+// table, and only to audit an autowired blocker edge — the same write the DynamoDB
+// twin makes, so the twins emit one event vocabulary instead of two. Dark unless
+// EVENTS_TABLE is set (this Lambda's deploy env does not set it), and the client is
+// built lazily inside emitJourneyEvent so an unconfigured deploy pays nothing.
+// Both packages are provided by the nodejs20.x runtime, so the self-contained zip
+// stays self-contained.
+import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
+import { DynamoDBDocumentClient, PutCommand } from "@aws-sdk/lib-dynamodb";
 // TEAM-4121 FR-8: the shared fix-ticket contract. Byte-identical copy of the one
 // in lambda/agentcore-hub-tickets/ and lambda/orchestrator/ (each Lambda ships as
 // a self-contained zip, so they cannot share a file); CI byte-compares them.
@@ -475,8 +484,237 @@ export function clampSummary(s) {
   return trimmed.trimEnd() + "…";
 }
 
+// ─── TEAM-4740 FR-12: base_branch (SEC-12) ───────────────────────────────────
+//
+// The branch this ticket's PR must target. A ticket filed mid-run with no branch
+// identity inherits whatever branch its assignee happens to be on — and while a
+// Merge Approval gate is open that is the integration branch the merge is about
+// to supersede, so the work evaporates with it (run p5ogpg / TEAM-4663).
+//
+// Twins doctrine (TEAM-4131 F2): the REGEX and the refusal TEXT are byte-identical
+// here and in lambda/agentcore-hub-tickets/index.mjs; only the DELIVERY differs
+// (this twin throws, as every other createTicket refusal here does; the DynamoDB
+// twin returns a textResult). src/lib/workflow/base-branch-parity.test.ts imports
+// BOTH modules and fails if either drifts.
+//
+// The pattern is git check-ref-format reduced to what a branch NAME may be: no
+// leading "-" (that is an argument, not a ref) or "/", no ".." / "//" / "@{"
+// anywhere, no ".lock" suffix, no trailing "/" or ".", 1-120 chars drawn from
+// [A-Za-z0-9._/-]. Lookbehind is fine — both twins run nodejs20.x.
+export const BASE_BRANCH_RE =
+  /^(?![-/])(?!.*\.\.)(?!.*\/\/)(?!.*@\{)(?!.*\.lock$)[A-Za-z0-9._/-]{1,120}(?<![/.])$/;
+
+/** The refusal body. Byte-identical in both twins — pinned by the parity test. */
+export function baseBranchRefusal(value) {
+  return (
+    `'base_branch' ${JSON.stringify(String(value ?? ""))} is not a valid branch name. ` +
+    `Expected 1-120 characters from [A-Za-z0-9._/-], with no leading "-" or "/", no "..", ` +
+    `"//" or "@{" anywhere, no ".lock" suffix and no trailing "/" or "." — e.g. "main" ` +
+    `or "feature/TEAM-1234-thing".`
+  );
+}
+
+/**
+ * The ONE machine-parseable line both twins append to a ticket's description.
+ *
+ * workflow-output's FR-5 refusal reads a ticket back through Tickets___get_issue,
+ * which returns the description and neither a `baseBranch` field nor labels — so
+ * the description line is the only carrier that survives BOTH providers. It is
+ * emitted byte-identically here and in the DynamoDB twin, and BASE_BRANCH_LINE_RE
+ * is the exact parser, exported so the parity test proves the line round-trips.
+ * In this twin the line is its own ADF block, so adfToText puts it on its own
+ * line — which is what the anchored regex needs.
+ */
+export function baseBranchLine(value) {
+  return `base_branch: ${value}`;
+}
+export const BASE_BRANCH_LINE_RE = /^base_branch:\s*(\S+)\s*$/m;
+
+/**
+ * Validate at CREATE time. Absent/empty is NOT an error — it means "no branch
+ * stated", and such a ticket is byte-identical to one filed before this feature.
+ * A stated-but-invalid branch IS refused: silently dropping it would produce
+ * exactly the ticket whose absence of a branch lost TEAM-4663.
+ */
+export function validateBaseBranch(base_branch) {
+  const raw = typeof base_branch === "string" ? base_branch.trim() : "";
+  if (!raw) return { ok: true, value: null };
+  if (!BASE_BRANCH_RE.test(raw)) return { ok: false, value: null };
+  return { ok: true, value: raw };
+}
+
+// ─── TEAM-4740 FR-5: freeze new work behind an open Merge Approval gate ──────
+//
+// INTERIM: TEAM-4739 lands gate-contract.mjs; swap to import.
+const MERGE_GATE_LABEL_RE = /^gate[:-]merge-approval$/;
+
+let eventsDdb = null;
+
+/**
+ * INTERIM: TEAM-4739 lands gate-contract.mjs; swap to import.
+ *
+ * The autowired blocker edge, as a journey event. Same Item shape as
+ * lambda/workflow-output/index.mjs publishJourneyEvent (copied deliberately, so
+ * the two cannot drift into two event vocabularies) plus a `ttl` — the events
+ * table has TTL enabled on that attribute (scripts/create-dynamodb-tables.sh),
+ * and SEC-13 says a per-create write must not accumulate forever.
+ *
+ * Dark by default: neither twin's deploy env sets EVENTS_TABLE
+ * (deploy/setup-tickets-lambda.mjs), so this is a no-op until an operator sets it
+ * — the `autowired` field on the create response is the signal callers read.
+ * Non-fatal in every direction: an event is never worth failing a create over.
+ */
+async function emitJourneyEvent(workflowId, type, detail) {
+  const table = process.env.EVENTS_TABLE;
+  if (!table || !workflowId) return;
+  try {
+    if (!eventsDdb) {
+      eventsDdb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: REGION }), {
+        marshallOptions: { removeUndefinedValues: true },
+      });
+    }
+    await eventsDdb.send(new PutCommand({
+      TableName: table,
+      Item: {
+        workflowId,
+        eventId: `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        type,
+        detail,
+        timestamp: new Date().toISOString(),
+        ttl: Math.floor(Date.now() / 1000) + 90 * 24 * 60 * 60,
+      },
+    }));
+  } catch { /* non-fatal */ }
+}
+
+/** The banner. Byte-identical in both twins. */
+function gateFreezeBanner(cdTicketId) {
+  return (
+    `DELIVERY CONSTRAINT: a Merge Approval gate is open on this run's integration ` +
+    `branch, so this ticket is frozen behind the CD ticket ${cdTicketId}. Do NOT push ` +
+    `to the integration branch — the merge is about to supersede it and your work would ` +
+    `go with it. After the merge lands, deliver this work via your OWN pull request to main.`
+  );
+}
+
+/**
+ * An OPEN human Merge Approval gate, from a normalized sibling row: a human-owned
+ * ticket (human-review / reviewer:*) that is a merge-approval gate (the label, or
+ * the title the hub gives it) and is currently presented to a person (in_review).
+ * Byte-identical predicate in both twins.
+ */
+function isOpenMergeGate(row) {
+  const labels = row.labels || [];
+  if (!labels.some((l) => l === "human-review" || l.startsWith("reviewer:"))) return false;
+  const isMergeGate =
+    labels.some((l) => MERGE_GATE_LABEL_RE.test(l)) || row.title.startsWith("Merge Approval");
+  if (!isMergeGate) return false;
+  return row.status === "in_review";
+}
+
+/** Terminal for freezing purposes: a finished CD ticket blocks nothing. */
+function isSettled(status) {
+  return status === "done" || status === "closed";
+}
+
+/**
+ * Siblings under `parent_key`, normalized to the shape both twins' predicates
+ * read. `parent` is interpolated into JQL, so it is shape-checked first (F6's
+ * rule: never interpolate anything that has not been proved to be a ticket key) —
+ * a bad key throws, and autowireOpenGate's fail-open catch turns that into an
+ * unfrozen create. Labels are requested explicitly because the gate predicate is
+ * defined in terms of them.
+ */
+async function scanSiblingTickets(parentKey) {
+  const key = String(parentKey || "");
+  if (!TICKET_KEY_RE.test(key)) throw new Error(`not a ticket key: ${JSON.stringify(key)}`);
+  const search = await jiraSearch(
+    `parent = ${key} ORDER BY created ASC`,
+    ["summary", "status", "labels", "assignee", "issuetype", "created"],
+    50
+  );
+  return (search?.issues || []).map((iss) => {
+    const labels = (iss.fields?.labels || []).map((l) => String(l));
+    const agentLabel = labels.find((l) => l.startsWith("agent:"));
+    const reviewerLabel = labels.find((l) => l.startsWith("reviewer:"));
+    return {
+      ticketId: String(iss.key || ""),
+      title: String(iss.fields?.summary || ""),
+      status: mapStatusToInternal(iss.fields?.status?.name || ""),
+      labels,
+      // This twin carries the assignee as a label; reconstruct the internal form
+      // (`human:<who>` / `<agentId>`) so the shared predicates read identically.
+      assignee: agentLabel
+        ? agentLabel.slice("agent:".length)
+        : reviewerLabel
+          ? `human:${reviewerLabel.slice("reviewer:".length)}`
+          : "",
+      createdAt: String(iss.fields?.created || ""),
+    };
+  });
+}
+
+/**
+ * FR-5 create half: while a Merge Approval gate is open on this run, a NEW agent
+ * ticket is frozen behind the run's CD ticket instead of being handed a branch the
+ * merge is about to supersede. Returns the blockers to use, the banner to prepend,
+ * and the `autowired` marker for the response — `{ blockedBy, banner, autowired }`
+ * on every path, so the caller never has to distinguish absent from unknown.
+ *
+ * FAIL DIRECTION — OPEN. Any scan failure creates the ticket UNFROZEN: an
+ * unfrozen ticket is worked on the wrong branch (recoverable, and the banner is
+ * advice, not a lock), whereas a ticket frozen behind a blocker that does not
+ * exist never runs at all. Same fail-open discipline as the idempotency guard
+ * below.
+ *
+ * `ticketIdIfKnown` exists so a caller that already has an id (a future
+ * re-materialization path) cannot freeze a ticket behind itself; both twins mint
+ * the id AFTER this seam, so today it is always null.
+ */
+async function autowireOpenGate({ parent_key, assignee, blocked_by, ticketIdIfKnown }) {
+  const blockers = Array.isArray(blocked_by) ? blocked_by : blocked_by ? [blocked_by] : [];
+  const untouched = { blockedBy: blockers, banner: "", autowired: null };
+  if (!parent_key) return untouched;
+  // A human gate is never frozen behind delivery work — it IS the decision the
+  // delivery work is waiting on, so freezing it would deadlock the run.
+  if (typeof assignee === "string" && assignee.startsWith("human:")) return untouched;
+
+  try {
+    const siblings = await scanSiblingTickets(parent_key);
+    const gate = siblings.find(isOpenMergeGate);
+    if (!gate) return untouched;
+
+    // The CD ticket: the non-human sibling the ship-phase predicate claims, newest
+    // first (a re-run files a second one and the latest is the live one).
+    const candidates = [];
+    for (const row of siblings) {
+      if (row.ticketId === gate.ticketId) continue;
+      if (ticketIdIfKnown && row.ticketId === ticketIdIfKnown) continue;
+      if (row.assignee.startsWith("human:")) continue;
+      if (await isShipPhaseTicket(row.labels)) candidates.push(row);
+    }
+    candidates.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+    const cd = candidates[0];
+    if (!cd) return untouched;          // nothing to freeze behind
+    if (isSettled(cd.status)) return untouched;
+    if (blockers.includes(cd.ticketId)) return untouched;  // caller already ordered it
+
+    return {
+      blockedBy: [...blockers, cd.ticketId],
+      banner: gateFreezeBanner(cd.ticketId),
+      autowired: { reason: "open_gate", blockedBy: [cd.ticketId], gateTicketId: gate.ticketId },
+    };
+  } catch (err) {
+    console.warn(
+      `[jira-tools] open-gate autowire failed for parent ${parent_key} ` +
+      `(creating UNFROZEN): ${err.message}`
+    );
+    return untouched;
+  }
+}
+
 async function createTicket(params) {
-  const { summary: rawSummary, description, parent_key, assignee, issue_type, blocked_by, workflow_id, spawned_by, fix_contract, phase, labels } = params;
+  const { summary: rawSummary, description, parent_key, assignee, issue_type, blocked_by, workflow_id, spawned_by, fix_contract, phase, labels, base_branch } = params;
   const summary = clampSummary(rawSummary);
 
   // TEAM-4121 FR-8: provenance + contract, validated BEFORE anything is created
@@ -522,6 +760,14 @@ async function createTicket(params) {
     contract = fc.contract;
   }
 
+  // TEAM-4740 FR-12 (seam 5a): the stated base branch, validated BEFORE anything
+  // is created in Jira — same discipline as the fix contract above, so a refused
+  // ticket leaves no partially-wired issue behind. Absent/empty is not an error;
+  // it just means no branch was stated.
+  const baseBranchCheck = validateBaseBranch(base_branch);
+  if (!baseBranchCheck.ok) throw new Error(baseBranchRefusal(base_branch));
+  const baseBranch = baseBranchCheck.value;
+
   // Validate assignee against known roster — reject hallucinated agent names.
   // "human:<who>" assignees are human-review gates, not agents, and are always
   // allowed (the orchestrator parks them for a person instead of invoking).
@@ -533,6 +779,17 @@ async function createTicket(params) {
       `Note: There is NO "agentcore_hub_ios_dev" agent. ALL iOS/SwiftUI/Android/Web development goes to "agentcore_hub_frontend_dev".`
     );
   }
+
+  // TEAM-4740 FR-5 (seam 7b): while a Merge Approval gate is open on this run, new
+  // agent work is frozen behind the CD ticket rather than pushed onto a branch the
+  // merge is about to supersede. Fails OPEN — an unreadable roster of siblings
+  // creates the ticket unfrozen, never behind a blocker we only guessed at.
+  const autowire = await autowireOpenGate({
+    parent_key,
+    assignee,
+    blocked_by,
+    ticketIdIfKnown: null,
+  });
 
   // ─── Idempotency guard ───────────────────────────────────────────────────
   // create_ticket has no natural idempotency, so any repeat (a model retry, an
@@ -588,8 +845,11 @@ async function createTicket(params) {
         // returned the bare dup now, the orchestrator would see a ticket missing
         // the dependencies/state it relies on and could run or wedge it early.
         // Reconcile (idempotently) before returning.
-        const dupBlockers = Array.isArray(blocked_by) ? blocked_by : blocked_by ? [blocked_by] : [];
-        await reconcileBlockersAndStatus(dup.key, dupBlockers, assignee);
+        // TEAM-4740 FR-5: reconcile against the AUTOWIRED blockers, not the raw
+        // arg. reconcileBlockersAndStatus derives the status from the list it is
+        // handed, so passing the un-autowired list here would transition an
+        // already-frozen duplicate to Ready and undo the freeze on every retry.
+        await reconcileBlockersAndStatus(dup.key, autowire.blockedBy, assignee);
         console.log(`[jira-tools] IDEMPOTENT: "${summary}" (${assignee || "unassigned"}) already exists as ${dup.key} in ${workflow_id} — reconciled blockers/status, returning existing instead of duplicating.`);
         return { ...mapIssue(dup), deduplicated: true };
       }
@@ -721,20 +981,35 @@ async function createTicket(params) {
   const contractBlock = contract
     ? renderFixContractBlock(contract, { kind: fixKind, originId, phase: phaseStamp })
     : null;
+  // TEAM-4740 FR-5/FR-12: the delivery banner leads the prose (it changes what the
+  // assignee must DO) and the machine-parseable base_branch line trails it, each as
+  // its OWN ADF block — adfToText separates block nodes with "\n", which is what
+  // BASE_BRANCH_LINE_RE anchors on. Both are omitted entirely when absent, so an
+  // ordinary ticket's description is byte-identical to before. The contract block
+  // still comes first: parseFixContractBlock expects contract-then-prose.
+  const para = (text) => ({ type: "paragraph", content: [{ type: "text", text }] });
+  const bannerBlocks = autowire.banner ? [para(autowire.banner)] : [];
+  const baseBranchBlocks = baseBranch ? [para(baseBranchLine(baseBranch))] : [];
   if (contractBlock) {
     fields.description = {
       type: "doc",
       version: 1,
       content: [
         { type: "codeBlock", attrs: { language: "yaml" }, content: [{ type: "text", text: contractBlock }] },
-        { type: "paragraph", content: [{ type: "text", text: description || "" }] },
+        ...bannerBlocks,
+        para(description || ""),
+        ...baseBranchBlocks,
       ],
     };
-  } else if (description) {
+  } else if (description || bannerBlocks.length > 0 || baseBranchBlocks.length > 0) {
     fields.description = {
       type: "doc",
       version: 1,
-      content: [{ type: "paragraph", content: [{ type: "text", text: description }] }],
+      content: [
+        ...bannerBlocks,
+        ...(description ? [para(description)] : []),
+        ...baseBranchBlocks,
+      ],
     };
   }
 
@@ -776,11 +1051,31 @@ async function createTicket(params) {
 
   // 2 + 3. Link blockers and set the initial status. Shared with the dedup path
   // so an interrupted-then-retried create still ends up fully wired.
-  const blockers = Array.isArray(blocked_by) ? blocked_by : blocked_by ? [blocked_by] : [];
+  // TEAM-4740 FR-5: the caller's blockers PLUS the autowired CD edge. The
+  // Array/scalar normalization happens once, inside autowireOpenGate, so the frozen
+  // and unfrozen paths cannot disagree about the shape.
+  const blockers = autowire.blockedBy;
   const status = await reconcileBlockersAndStatus(ticketId, blockers, assignee);
 
+  // TEAM-4740 FR-5: audit the autowired edge — after the create, so the event never
+  // describes a ticket that does not exist. Dark unless EVENTS_TABLE is set.
+  if (autowire.autowired) {
+    await emitJourneyEvent(workflow_id, "plan.autowired", {
+      ticketId,
+      ...autowire.autowired,
+    });
+  }
+
   console.log(`[jira-tools] Created ${ticketId} in Jira. Status: ${status}`);
-  return { ticketId, status, message: `Created ${ticketId}: ${summary}` };
+  return {
+    ticketId,
+    status,
+    message: `Created ${ticketId}: ${summary}`,
+    // TEAM-4740 FR-12/FR-5: what was recorded and what it was frozen behind. Both
+    // absent entirely when unset, so an ordinary create's response is unchanged.
+    ...(baseBranch ? { base_branch: baseBranch } : {}),
+    ...(autowire.autowired ? { autowired: autowire.autowired } : {}),
+  };
 }
 
 // Bring a ticket to its intended blocker-links + initial status. Idempotent:

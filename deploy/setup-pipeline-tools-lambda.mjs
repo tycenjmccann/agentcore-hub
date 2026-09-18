@@ -286,6 +286,11 @@ export function buildInlinePolicy(env) {
   //   StartBuild      project/hub-*-ci  ONLY - see the CiStartBuild statement
   const REGIONS = parsePipelineRegions(env.PIPELINE_REGIONS, REGION);
   const hubPipelineArns = REGIONS.map((r) => `arn:aws:codepipeline:${r}:${ACCOUNT}:hub-*-deploy`);
+  // TEAM-4740 — computed ONCE and referenced by both pipeline statements below.
+  // PipelineAbandonSuperseded must be able to stop exactly the executions
+  // PipelineReadAndTrigger can already start and read, and not one more; deriving
+  // that list a second time is how the two drift apart.
+  const pipelineArns = [pipelineArn, ...hubPipelineArns];
   const hubProjectArns = REGIONS.map((r) => `arn:aws:codebuild:${r}:${ACCOUNT}:project/hub-*`);
   const hubCiArns = REGIONS.map((r) => `arn:aws:codebuild:${r}:${ACCOUNT}:project/hub-*-ci`);
   // Both forms, matching the exact-name log statement below: the group itself and
@@ -339,7 +344,26 @@ export function buildInlinePolicy(env) {
           "codepipeline:GetPipelineExecution",
           "codepipeline:StartPipelineExecution",
         ],
-        Resource: [pipelineArn, ...hubPipelineArns],
+        Resource: pipelineArns,
+      },
+      {
+        // TEAM-4740 FR-4 — the head-of-line grant, and the only CodePipeline write
+        // this role has ever gained beyond StartPipelineExecution. It is a STOP,
+        // not an approval: start_deploy may abandon an OLDER execution parked on
+        // the human gate, and only after GitHub has PROVEN that execution's commit
+        // is contained in the one we are deploying, the live gate has been re-read,
+        // and the Stop has been confirmed. Same Resource list as
+        // PipelineReadAndTrigger, by construction (`pipelineArns`, computed once
+        // above) — a pipeline this role cannot start is a pipeline it must not stop.
+        //
+        // codepipeline:PutApprovalResult is STILL absent from this role in every
+        // combination, and that is the whole point: "abandon the run in front of
+        // me" and "approve the run in front of me" must never be the same
+        // capability. Do not add an approval action here to save a round trip.
+        Sid: "PipelineAbandonSuperseded",
+        Effect: "Allow",
+        Action: ["codepipeline:StopPipelineExecution"],
+        Resource: pipelineArns,
       },
       {
         // Read-only build visibility, incl. the Deploy stage's own CodeBuild
@@ -411,6 +435,26 @@ export function buildInlinePolicy(env) {
               Action: ["s3:PutObject"],
               Resource: [
                 `arn:aws:s3:::${artifactBucket}/pipeline-artifacts/ship-approvals/*`,
+              ],
+            },
+          ]
+        : []),
+      // TEAM-4740 SEC-1(3) — the veto side of the same prefix. Before recording a
+      // ship-approval, start_deploy probes for `<merge_commit>.rejected.json`: a
+      // human who explicitly REJECTED this merge commit at the gate must not have
+      // that decision silently overridden by a later pre-approval record. The grant
+      // is deliberately narrower than ShipApprovalRecordWrite's write scope — only
+      // the `*.rejected.json` suffix, so this role can read a veto and nothing else
+      // in the prefix, including the approval records it writes. HeadObject needs
+      // s3:GetObject; existence is the entire signal and the body is never read.
+      ...(artifactBucket
+        ? [
+            {
+              Sid: "ShipRejectionMarkerRead",
+              Effect: "Allow",
+              Action: ["s3:GetObject"],
+              Resource: [
+                `arn:aws:s3:::${artifactBucket}/pipeline-artifacts/ship-approvals/*.rejected.json`,
               ],
             },
           ]
