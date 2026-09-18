@@ -1,0 +1,1264 @@
+{
+ "_fixture": {
+  "ticket": "TEAM-4760 U9",
+  "what": "Hand-built stand-in for the history the SI ledger backfill reads: rows of agentcore-hub-workflow-analyses and the [SI] PRD objects under s3://$ARTIFACT_BUCKET/workflow-manager/synthesized-prds/. NOT a capture - it is sized and shaped so every branch of classify()/buildPlan() is pinned by one record.",
+  "readBy": [
+   "scripts/__tests__/si-ledger-backfill.test.mjs"
+  ],
+  "shape": {
+   "analyses": "one row per analysed run: workflowId, analysisId, createdAt, workflowDefId, findings[], recommendations[]",
+   "prds": "one [SI] PRD object per attempt: key (its S3 key), title, description, sources[], and an optional run{} block",
+   "existingRows": "rows already in agentcore-hub-si-ledger before the backfill runs"
+  },
+  "cases": {
+   "wf_sd01..wf_sd31": "31 runs whose analyses each name the SAME pattern (harness silent death) in a DIFFERENT way - 'went silent', 'died mid-turn', 'no spans', 'dropped silently', 'stopped emitting spans'. This is the pattern the feature exists for: one ask made 31 times. 24 of them carry a second, unrelated item so a run contributes to more than one key.",
+   "wf_ok01..wf_ok07": "7 runs with no silent death at all - they carry the remaining patterns (timeout, dispatch stall, lease leak, cascade gap, orchestrator scope creep, self-park, rework loop, missing evidence, QA gap, human wait, CI flake, deploy gate, build failure, intake scope, coding session loss, coding deps, trace gap, token burn, duplicate tickets).",
+   "wf_ok08": "the NEGATIVES-only run - 'shipped ahead of schedule' and 'keep the summary at the top' name no systemic pattern, so classify() must return null and buildPlan must list them under `skipped` rather than invent a key.",
+   "6 silent-death PRDs": "the six real attempts at the pattern, with mixed outcomes on purpose: 3 deployed, 2 landed (merged, never deployed), and TEAM-4734 STILL RUNNING - no mergedAt and no completedAt, so it must land on `in-run`, not `landed`.",
+   "system-20260820T093000.json": "the PRECEDENCE case: its description says 'human gate', but it names the DEPLOY gate, so it must classify as pipeline.deploy-gate and not the generic gate.human-wait. Swap those two entries in PATTERNS and this record fails.",
+   "system-20260828T171000.json": "a PRD with no run block at all - written, never started. Its attempt is `batched`, and because its pattern (gate.human-wait) is an existing `verified` row, the ledger's no-downgrade rule must keep it `verified`.",
+   "system-20260912T083000.json": "a cosmetic PRD that matches no pattern - the PRD-side negative case.",
+   "existingRows[gate.human-wait]": "already `verified` with its own title and 2 occurrences. The backfill must APPEND its 3 new occurrences, keep the status `verified`, and keep the original title - a merge, never a clobber.",
+   "existingRows[pipeline.build-failure]": "already `landed`; nothing in the backfill promotes it, so it stays `landed` (the mid-rank no-downgrade case)."
+  },
+  "expected": {
+   "analyses": 39,
+   "prds": 12,
+   "distinctKeys": 20,
+   "occurrences": 65,
+   "attempts": 11,
+   "skipped": 3,
+   "silentDeath": {
+    "occurrences": 31,
+    "attempts": 6,
+    "outcomes": [
+     "deployed",
+     "deployed",
+     "landed",
+     "deployed",
+     "landed",
+     "in-run"
+    ],
+    "status": "deployed"
+   },
+   "merged": {
+    "gate.human-wait": "verified",
+    "pipeline.build-failure": "landed"
+   },
+   "perKeyAttempts": {
+    "harness.silent-death": 6,
+    "pipeline.deploy-gate": 1,
+    "gate.human-wait": 1,
+    "blueprint.self-park": 1,
+    "blueprint.rework-loop": 1,
+    "qa.verification-gap": 1
+   },
+   "idempotent": "folding the plan back into existingRows and re-running emits 0 writes"
+  }
+ },
+ "analyses": [
+  {
+   "workflowId": "wf_sd01",
+   "analysisId": "an_sd01",
+   "createdAt": "2026-06-01T09:00:00.000Z",
+   "workflowDefId": "bug-fix",
+   "findings": [
+    {
+     "title": "Requirements agent went silent for 15 minutes and the platform killed the invocation",
+     "kind": "failure",
+     "severity": "critical",
+     "phase": "requirements",
+     "agentId": null,
+     "evidence": "see the run's spans and ticket transitions"
+    },
+    {
+     "title": "Dev turn timed out at the 900s cap",
+     "kind": "bottleneck",
+     "severity": "low",
+     "phase": "review",
+     "agentId": null,
+     "evidence": "see the run's spans and ticket transitions"
+    }
+   ],
+   "recommendations": []
+  },
+  {
+   "workflowId": "wf_sd02",
+   "analysisId": "an_sd02",
+   "createdAt": "2026-06-04T09:00:00.000Z",
+   "workflowDefId": "software-delivery",
+   "findings": [
+    {
+     "title": "Solution architect invocation died mid-turn - no spans after the first tool call",
+     "kind": "bottleneck",
+     "severity": "high",
+     "phase": "design",
+     "agentId": null,
+     "evidence": "see the run's spans and ticket transitions"
+    },
+    {
+     "title": "Design turn timed out twice on the same ticket",
+     "kind": "bottleneck",
+     "severity": "critical",
+     "phase": "ship",
+     "agentId": null,
+     "evidence": "see the run's spans and ticket transitions"
+    }
+   ],
+   "recommendations": []
+  },
+  {
+   "workflowId": "wf_sd03",
+   "analysisId": "an_sd03",
+   "createdAt": "2026-06-07T09:00:00.000Z",
+   "workflowDefId": "software-delivery",
+   "findings": [
+    {
+     "title": "Silent death of dev_agent_1 before any ticket transition",
+     "kind": "bottleneck",
+     "severity": "medium",
+     "phase": "development",
+     "agentId": null,
+     "evidence": "see the run's spans and ticket transitions"
+    }
+   ],
+   "recommendations": [
+    {
+     "title": "Shorten the coding probe so a turn cannot hit the timeout unseen",
+     "priority": "P2",
+     "type": "process",
+     "target": "blueprint",
+     "description": "raised against the phase named in target",
+     "expectedImpact": "fewer repeat occurrences"
+    }
+   ]
+  },
+  {
+   "workflowId": "wf_sd04",
+   "analysisId": "an_sd04",
+   "createdAt": "2026-06-10T09:00:00.000Z",
+   "workflowDefId": "software-delivery",
+   "findings": [
+    {
+     "title": "Code reviewer stopped emitting spans halfway through the diff read",
+     "kind": "bottleneck",
+     "severity": "low",
+     "phase": "review",
+     "agentId": null,
+     "evidence": "see the run's spans and ticket transitions"
+    },
+    {
+     "title": "Ticket sat in Ready for 40 minutes with no dispatch",
+     "kind": "bottleneck",
+     "severity": "medium",
+     "phase": "design",
+     "agentId": null,
+     "evidence": "see the run's spans and ticket transitions"
+    }
+   ],
+   "recommendations": []
+  },
+  {
+   "workflowId": "wf_sd05",
+   "analysisId": "an_sd05",
+   "createdAt": "2026-06-13T09:00:00.000Z",
+   "workflowDefId": "software-delivery",
+   "findings": [
+    {
+     "title": "QA verifier vanished mid-invocation; the reaper found it 20 minutes later",
+     "kind": "bottleneck",
+     "severity": "critical",
+     "phase": "ship",
+     "agentId": null,
+     "evidence": "see the run's spans and ticket transitions"
+    },
+    {
+     "title": "QA ticket was never dispatched after its blocker cleared",
+     "kind": "failure",
+     "severity": "low",
+     "phase": "development",
+     "agentId": null,
+     "evidence": "see the run's spans and ticket transitions"
+    }
+   ],
+   "recommendations": []
+  },
+  {
+   "workflowId": "wf_sd06",
+   "analysisId": "an_sd06",
+   "createdAt": "2026-06-16T09:00:00.000Z",
+   "workflowDefId": "software-delivery",
+   "findings": [
+    {
+     "title": "Release manager terminated silently before the ship report",
+     "kind": "bottleneck",
+     "severity": "high",
+     "phase": "requirements",
+     "agentId": null,
+     "evidence": "see the run's spans and ticket transitions"
+    },
+    {
+     "title": "Stale claim on a dead session blocked the retry",
+     "kind": "bottleneck",
+     "severity": "critical",
+     "phase": "review",
+     "agentId": null,
+     "evidence": "see the run's spans and ticket transitions"
+    }
+   ],
+   "recommendations": []
+  },
+  {
+   "workflowId": "wf_sd07",
+   "analysisId": "an_sd07",
+   "createdAt": "2026-06-19T09:00:00.000Z",
+   "workflowDefId": "software-delivery",
+   "findings": [
+    {
+     "title": "CI agent died silently during the build probe",
+     "kind": "bottleneck",
+     "severity": "medium",
+     "phase": "design",
+     "agentId": null,
+     "evidence": "see the run's spans and ticket transitions"
+    },
+    {
+     "title": "The invocation lease outlived the process that held it",
+     "kind": "bottleneck",
+     "severity": "high",
+     "phase": "ship",
+     "agentId": null,
+     "evidence": "see the run's spans and ticket transitions"
+    }
+   ],
+   "recommendations": []
+  },
+  {
+   "workflowId": "wf_sd08",
+   "analysisId": "an_sd08",
+   "createdAt": "2026-06-22T09:00:00.000Z",
+   "workflowDefId": "software-delivery",
+   "findings": [
+    {
+     "title": "Two parallel design agents went silent in the same run",
+     "kind": "failure",
+     "severity": "low",
+     "phase": "development",
+     "agentId": null,
+     "evidence": "see the run's spans and ticket transitions"
+    },
+    {
+     "title": "Cascade never readied the QA ticket after Dev finished",
+     "kind": "bottleneck",
+     "severity": "medium",
+     "phase": "requirements",
+     "agentId": null,
+     "evidence": "see the run's spans and ticket transitions"
+    }
+   ],
+   "recommendations": []
+  },
+  {
+   "workflowId": "wf_sd09",
+   "analysisId": "an_sd09",
+   "createdAt": "2026-06-25T09:00:00.000Z",
+   "workflowDefId": "software-delivery",
+   "findings": [
+    {
+     "title": "Silent death immediately after the coding CLI probe returned",
+     "kind": "bottleneck",
+     "severity": "critical",
+     "phase": "review",
+     "agentId": null,
+     "evidence": "see the run's spans and ticket transitions"
+    },
+    {
+     "title": "Ship dependents were never readied because the blocker edge was missing",
+     "kind": "bottleneck",
+     "severity": "low",
+     "phase": "design",
+     "agentId": null,
+     "evidence": "see the run's spans and ticket transitions"
+    }
+   ],
+   "recommendations": []
+  },
+  {
+   "workflowId": "wf_sd10",
+   "analysisId": "an_sd10",
+   "createdAt": "2026-06-28T09:00:00.000Z",
+   "workflowDefId": "bug-fix",
+   "findings": [
+    {
+     "title": "dev_agent_2 dropped silently with a zero-length response",
+     "kind": "bottleneck",
+     "severity": "high",
+     "phase": "ship",
+     "agentId": null,
+     "evidence": "see the run's spans and ticket transitions"
+    },
+    {
+     "title": "The fix shipped as a new orchestrator module, against DL-009",
+     "kind": "bottleneck",
+     "severity": "critical",
+     "phase": "development",
+     "agentId": null,
+     "evidence": "see the run's spans and ticket transitions"
+    }
+   ],
+   "recommendations": []
+  },
+  {
+   "workflowId": "wf_sd11",
+   "analysisId": "an_sd11",
+   "createdAt": "2026-07-01T09:00:00.000Z",
+   "workflowDefId": "software-delivery",
+   "findings": [
+    {
+     "title": "Security architect turn produced no spans at all",
+     "kind": "bottleneck",
+     "severity": "medium",
+     "phase": "requirements",
+     "agentId": null,
+     "evidence": "see the run's spans and ticket transitions"
+    },
+    {
+     "title": "Release manager did not park behind its own fix ticket",
+     "kind": "bottleneck",
+     "severity": "high",
+     "phase": "review",
+     "agentId": null,
+     "evidence": "see the run's spans and ticket transitions"
+    }
+   ],
+   "recommendations": []
+  },
+  {
+   "workflowId": "wf_sd12",
+   "analysisId": "an_sd12",
+   "createdAt": "2026-07-04T09:00:00.000Z",
+   "workflowDefId": "software-delivery",
+   "findings": [
+    {
+     "title": "The run shows a 15-minute silence, then a reap and a re-dispatch",
+     "kind": "bottleneck",
+     "severity": "low",
+     "phase": "design",
+     "agentId": null,
+     "evidence": "see the run's spans and ticket transitions"
+    },
+    {
+     "title": "QA verifier filed a fix but left its own ticket In Progress instead of self-parking",
+     "kind": "failure",
+     "severity": "medium",
+     "phase": "ship",
+     "agentId": null,
+     "evidence": "see the run's spans and ticket transitions"
+    }
+   ],
+   "recommendations": []
+  },
+  {
+   "workflowId": "wf_sd13",
+   "analysisId": "an_sd13",
+   "createdAt": "2026-07-07T09:00:00.000Z",
+   "workflowDefId": "software-delivery",
+   "findings": [
+    {
+     "title": "Data architect invocation vanished mid-turn with the claim still held",
+     "kind": "bottleneck",
+     "severity": "critical",
+     "phase": "development",
+     "agentId": null,
+     "evidence": "see the run's spans and ticket transitions"
+    }
+   ],
+   "recommendations": [
+    {
+     "title": "Teach the reviewer to transition with blocked_by instead of waiting",
+     "priority": "P0",
+     "type": "process",
+     "target": "intake",
+     "description": "raised against the phase named in target",
+     "expectedImpact": "fewer repeat occurrences"
+    }
+   ]
+  },
+  {
+   "workflowId": "wf_sd14",
+   "analysisId": "an_sd14",
+   "createdAt": "2026-07-10T09:00:00.000Z",
+   "workflowDefId": "software-delivery",
+   "findings": [
+    {
+     "title": "Silent death on the second dispatch of the same ticket",
+     "kind": "bottleneck",
+     "severity": "high",
+     "phase": "review",
+     "agentId": null,
+     "evidence": "see the run's spans and ticket transitions"
+    },
+    {
+     "title": "Six review rounds on one PR before convergence",
+     "kind": "bottleneck",
+     "severity": "critical",
+     "phase": "design",
+     "agentId": null,
+     "evidence": "see the run's spans and ticket transitions"
+    }
+   ],
+   "recommendations": []
+  },
+  {
+   "workflowId": "wf_sd15",
+   "analysisId": "an_sd15",
+   "createdAt": "2026-07-13T09:00:00.000Z",
+   "workflowDefId": "software-delivery",
+   "findings": [
+    {
+     "title": "UX designer agent went silent and never filed its report",
+     "kind": "failure",
+     "severity": "medium",
+     "phase": "ship",
+     "agentId": null,
+     "evidence": "see the run's spans and ticket transitions"
+    },
+    {
+     "title": "Reviewer and dev ping-pong over the same three files",
+     "kind": "bottleneck",
+     "severity": "high",
+     "phase": "development",
+     "agentId": null,
+     "evidence": "see the run's spans and ticket transitions"
+    }
+   ],
+   "recommendations": []
+  },
+  {
+   "workflowId": "wf_sd16",
+   "analysisId": "an_sd16",
+   "createdAt": "2026-07-16T09:00:00.000Z",
+   "workflowDefId": "software-delivery",
+   "findings": [
+    {
+     "title": "Integration architect stopped emitting spans after load_blueprint",
+     "kind": "bottleneck",
+     "severity": "low",
+     "phase": "requirements",
+     "agentId": null,
+     "evidence": "see the run's spans and ticket transitions"
+    }
+   ],
+   "recommendations": [
+    {
+     "title": "Add a sibling-sweep rule so a defect class closes in one round of review",
+     "priority": "P0",
+     "type": "process",
+     "target": "gate",
+     "description": "raised against the phase named in target",
+     "expectedImpact": "fewer repeat occurrences"
+    }
+   ]
+  },
+  {
+   "workflowId": "wf_sd17",
+   "analysisId": "an_sd17",
+   "createdAt": "2026-07-19T09:00:00.000Z",
+   "workflowDefId": "software-delivery",
+   "findings": [
+    {
+     "title": "Silent death of the QA verifier on a three-hour run",
+     "kind": "bottleneck",
+     "severity": "critical",
+     "phase": "design",
+     "agentId": null,
+     "evidence": "see the run's spans and ticket transitions"
+    },
+    {
+     "title": "Ship reported completion without evidence in S3",
+     "kind": "bottleneck",
+     "severity": "low",
+     "phase": "ship",
+     "agentId": null,
+     "evidence": "see the run's spans and ticket transitions"
+    }
+   ],
+   "recommendations": []
+  },
+  {
+   "workflowId": "wf_sd18",
+   "analysisId": "an_sd18",
+   "createdAt": "2026-07-22T09:00:00.000Z",
+   "workflowDefId": "software-delivery",
+   "findings": [
+    {
+     "title": "Technical writer invocation exited silently with no error",
+     "kind": "bottleneck",
+     "severity": "high",
+     "phase": "development",
+     "agentId": null,
+     "evidence": "see the run's spans and ticket transitions"
+    },
+    {
+     "title": "report_completion arrived before the artifact was persisted",
+     "kind": "bottleneck",
+     "severity": "critical",
+     "phase": "requirements",
+     "agentId": null,
+     "evidence": "see the run's spans and ticket transitions"
+    }
+   ],
+   "recommendations": []
+  },
+  {
+   "workflowId": "wf_sd19",
+   "analysisId": "an_sd19",
+   "createdAt": "2026-07-25T09:00:00.000Z",
+   "workflowDefId": "bug-fix",
+   "findings": [
+    {
+     "title": "Requirements re-run also went silent - twice in one workflow",
+     "kind": "bottleneck",
+     "severity": "medium",
+     "phase": "review",
+     "agentId": null,
+     "evidence": "see the run's spans and ticket transitions"
+    },
+    {
+     "title": "QA passed a build that did not compile",
+     "kind": "failure",
+     "severity": "high",
+     "phase": "design",
+     "agentId": null,
+     "evidence": "see the run's spans and ticket transitions"
+    }
+   ],
+   "recommendations": []
+  },
+  {
+   "workflowId": "wf_sd20",
+   "analysisId": "an_sd20",
+   "createdAt": "2026-07-28T09:00:00.000Z",
+   "workflowDefId": "software-delivery",
+   "findings": [
+    {
+     "title": "Silent death during the parallel design fan-out",
+     "kind": "bottleneck",
+     "severity": "low",
+     "phase": "ship",
+     "agentId": null,
+     "evidence": "see the run's spans and ticket transitions"
+    }
+   ],
+   "recommendations": [
+    {
+     "title": "Point the operator at the one QA checklist instead of restating it",
+     "priority": "P1",
+     "type": "process",
+     "target": "gate",
+     "description": "raised against the phase named in target",
+     "expectedImpact": "fewer repeat occurrences"
+    }
+   ]
+  },
+  {
+   "workflowId": "wf_sd21",
+   "analysisId": "an_sd21",
+   "createdAt": "2026-07-31T09:00:00.000Z",
+   "workflowDefId": "software-delivery",
+   "findings": [
+    {
+     "title": "dev_agent_3 produced no spans and no completion record",
+     "kind": "bottleneck",
+     "severity": "critical",
+     "phase": "requirements",
+     "agentId": null,
+     "evidence": "see the run's spans and ticket transitions"
+    },
+    {
+     "title": "Human approval gate held the run for 14 hours overnight",
+     "kind": "bottleneck",
+     "severity": "low",
+     "phase": "review",
+     "agentId": null,
+     "evidence": "see the run's spans and ticket transitions"
+    }
+   ],
+   "recommendations": []
+  },
+  {
+   "workflowId": "wf_sd22",
+   "analysisId": "an_sd22",
+   "createdAt": "2026-08-03T09:00:00.000Z",
+   "workflowDefId": "software-delivery",
+   "findings": [
+    {
+     "title": "Operator turn died mid-run while probing the pipeline",
+     "kind": "failure",
+     "severity": "high",
+     "phase": "design",
+     "agentId": null,
+     "evidence": "see the run's spans and ticket transitions"
+    },
+    {
+     "title": "Merge approval arrived 9 hours after the PR was ready",
+     "kind": "bottleneck",
+     "severity": "critical",
+     "phase": "ship",
+     "agentId": null,
+     "evidence": "see the run's spans and ticket transitions"
+    }
+   ],
+   "recommendations": []
+  },
+  {
+   "workflowId": "wf_sd23",
+   "analysisId": "an_sd23",
+   "createdAt": "2026-08-06T09:00:00.000Z",
+   "workflowDefId": "software-delivery",
+   "findings": [
+    {
+     "title": "Silent death after the 15-minute platform silence window",
+     "kind": "bottleneck",
+     "severity": "medium",
+     "phase": "development",
+     "agentId": null,
+     "evidence": "see the run's spans and ticket transitions"
+    }
+   ],
+   "recommendations": [
+    {
+     "title": "Page the approver during working hours so the human wait stops dominating",
+     "priority": "P1",
+     "type": "process",
+     "target": "blueprint",
+     "description": "raised against the phase named in target",
+     "expectedImpact": "fewer repeat occurrences"
+    }
+   ]
+  },
+  {
+   "workflowId": "wf_sd24",
+   "analysisId": "an_sd24",
+   "createdAt": "2026-08-09T09:00:00.000Z",
+   "workflowDefId": "software-delivery",
+   "findings": [
+    {
+     "title": "Code reviewer went silent while the ticket stayed In Progress",
+     "kind": "bottleneck",
+     "severity": "low",
+     "phase": "review",
+     "agentId": null,
+     "evidence": "see the run's spans and ticket transitions"
+    },
+    {
+     "title": "Flaky INSTALL step failed the build twice in a row",
+     "kind": "bottleneck",
+     "severity": "medium",
+     "phase": "design",
+     "agentId": null,
+     "evidence": "see the run's spans and ticket transitions"
+    }
+   ],
+   "recommendations": []
+  },
+  {
+   "workflowId": "wf_sd25",
+   "analysisId": "an_sd25",
+   "createdAt": "2026-08-12T09:00:00.000Z",
+   "workflowDefId": "software-delivery",
+   "findings": [
+    {
+     "title": "API designer invocation dropped silently between tool calls",
+     "kind": "bottleneck",
+     "severity": "critical",
+     "phase": "ship",
+     "agentId": null,
+     "evidence": "see the run's spans and ticket transitions"
+    }
+   ],
+   "recommendations": []
+  },
+  {
+   "workflowId": "wf_sd26",
+   "analysisId": "an_sd26",
+   "createdAt": "2026-08-15T09:00:00.000Z",
+   "workflowDefId": "software-delivery",
+   "findings": [
+    {
+     "title": "Silent death observed on the ship phase for the third run this week",
+     "kind": "bottleneck",
+     "severity": "high",
+     "phase": "requirements",
+     "agentId": null,
+     "evidence": "see the run's spans and ticket transitions"
+    }
+   ],
+   "recommendations": []
+  },
+  {
+   "workflowId": "wf_sd27",
+   "analysisId": "an_sd27",
+   "createdAt": "2026-08-18T09:00:00.000Z",
+   "workflowDefId": "software-delivery",
+   "findings": [
+    {
+     "title": "Performance architect turn vanished mid-invocation",
+     "kind": "bottleneck",
+     "severity": "medium",
+     "phase": "design",
+     "agentId": null,
+     "evidence": "see the run's spans and ticket transitions"
+    }
+   ],
+   "recommendations": []
+  },
+  {
+   "workflowId": "wf_sd28",
+   "analysisId": "an_sd28",
+   "createdAt": "2026-08-21T09:00:00.000Z",
+   "workflowDefId": "bug-fix",
+   "findings": [
+    {
+     "title": "Silent death: no OTEL spans, no logs, no completion",
+     "kind": "bottleneck",
+     "severity": "low",
+     "phase": "development",
+     "agentId": null,
+     "evidence": "see the run's spans and ticket transitions"
+    }
+   ],
+   "recommendations": []
+  },
+  {
+   "workflowId": "wf_sd29",
+   "analysisId": "an_sd29",
+   "createdAt": "2026-08-24T09:00:00.000Z",
+   "workflowDefId": "software-delivery",
+   "findings": [
+    {
+     "title": "Release manager went silent right after its first pipeline read",
+     "kind": "failure",
+     "severity": "critical",
+     "phase": "review",
+     "agentId": null,
+     "evidence": "see the run's spans and ticket transitions"
+    }
+   ],
+   "recommendations": []
+  },
+  {
+   "workflowId": "wf_sd30",
+   "analysisId": "an_sd30",
+   "createdAt": "2026-08-27T09:00:00.000Z",
+   "workflowDefId": "software-delivery",
+   "findings": [
+    {
+     "title": "Silent death took out the whole design phase",
+     "kind": "bottleneck",
+     "severity": "high",
+     "phase": "ship",
+     "agentId": null,
+     "evidence": "see the run's spans and ticket transitions"
+    }
+   ],
+   "recommendations": []
+  },
+  {
+   "workflowId": "wf_sd31",
+   "analysisId": "an_sd31",
+   "createdAt": "2026-08-30T09:00:00.000Z",
+   "workflowDefId": "software-delivery",
+   "findings": [
+    {
+     "title": "dev_agent_1 stopped emitting spans and the claim expired",
+     "kind": "bottleneck",
+     "severity": "medium",
+     "phase": "requirements",
+     "agentId": null,
+     "evidence": "see the run's spans and ticket transitions"
+    }
+   ],
+   "recommendations": []
+  },
+  {
+   "workflowId": "wf_ok01",
+   "analysisId": "an_ok01",
+   "createdAt": "2026-09-02T09:00:00.000Z",
+   "workflowDefId": "software-delivery",
+   "findings": [
+    {
+     "title": "Deploy gate was skipped on an unproven head",
+     "kind": "bottleneck",
+     "severity": "high",
+     "phase": "design",
+     "agentId": null,
+     "evidence": "see the run's spans and ticket transitions"
+    }
+   ],
+   "recommendations": [
+    {
+     "title": "Retry the flake once before ticketing it to dev",
+     "priority": "P0",
+     "type": "process",
+     "target": "orchestrator",
+     "description": "raised against the phase named in target",
+     "expectedImpact": "fewer repeat occurrences"
+    }
+   ]
+  },
+  {
+   "workflowId": "wf_ok02",
+   "analysisId": "an_ok02",
+   "createdAt": "2026-09-05T09:00:00.000Z",
+   "workflowDefId": "software-delivery",
+   "findings": [
+    {
+     "title": "Build failed on prettier formatting only",
+     "kind": "bottleneck",
+     "severity": "high",
+     "phase": "design",
+     "agentId": null,
+     "evidence": "see the run's spans and ticket transitions"
+    },
+    {
+     "title": "Lockfile drift broke the build for every run that day",
+     "kind": "bottleneck",
+     "severity": "medium",
+     "phase": "development",
+     "agentId": null,
+     "evidence": "see the run's spans and ticket transitions"
+    }
+   ],
+   "recommendations": []
+  },
+  {
+   "workflowId": "wf_ok03",
+   "analysisId": "an_ok03",
+   "createdAt": "2026-09-08T09:00:00.000Z",
+   "workflowDefId": "software-delivery",
+   "findings": [
+    {
+     "title": "Intake planned too many tickets for a one-line change",
+     "kind": "bottleneck",
+     "severity": "medium",
+     "phase": "development",
+     "agentId": null,
+     "evidence": "see the run's spans and ticket transitions"
+    },
+    {
+     "title": "Intake planning missed the QA ticket entirely",
+     "kind": "bottleneck",
+     "severity": "low",
+     "phase": "review",
+     "agentId": null,
+     "evidence": "see the run's spans and ticket transitions"
+    }
+   ],
+   "recommendations": []
+  },
+  {
+   "workflowId": "wf_ok04",
+   "analysisId": "an_ok04",
+   "createdAt": "2026-09-11T09:00:00.000Z",
+   "workflowDefId": "software-delivery",
+   "findings": [
+    {
+     "title": "Rework resumed on the wrong runtime and lost the coding session",
+     "kind": "bottleneck",
+     "severity": "low",
+     "phase": "review",
+     "agentId": null,
+     "evidence": "see the run's spans and ticket transitions"
+    },
+    {
+     "title": "The coding session's /mnt/workspace was wiped between turns",
+     "kind": "bottleneck",
+     "severity": "critical",
+     "phase": "ship",
+     "agentId": null,
+     "evidence": "see the run's spans and ticket transitions"
+    }
+   ],
+   "recommendations": []
+  },
+  {
+   "workflowId": "wf_ok05",
+   "analysisId": "an_ok05",
+   "createdAt": "2026-09-14T09:00:00.000Z",
+   "workflowDefId": "software-delivery",
+   "findings": [
+    {
+     "title": "npm ci replaced the provisioned node_modules symlink",
+     "kind": "bottleneck",
+     "severity": "critical",
+     "phase": "ship",
+     "agentId": null,
+     "evidence": "see the run's spans and ticket transitions"
+    }
+   ],
+   "recommendations": [
+    {
+     "title": "Stop reinstalling dependencies as a fix for a red build",
+     "priority": "P2",
+     "type": "process",
+     "target": "blueprint",
+     "description": "raised against the phase named in target",
+     "expectedImpact": "fewer repeat occurrences"
+    }
+   ]
+  },
+  {
+   "workflowId": "wf_ok06",
+   "analysisId": "an_ok06",
+   "createdAt": "2026-09-17T09:00:00.000Z",
+   "workflowDefId": "software-delivery",
+   "findings": [
+    {
+     "title": "Ship phase cannot be explained from its traces - trace gap of 22 minutes",
+     "kind": "bottleneck",
+     "severity": "high",
+     "phase": "requirements",
+     "agentId": null,
+     "evidence": "see the run's spans and ticket transitions"
+    },
+    {
+     "title": "Token burn of 40M for a docs-only change",
+     "kind": "bottleneck",
+     "severity": "medium",
+     "phase": "design",
+     "agentId": null,
+     "evidence": "see the run's spans and ticket transitions"
+    }
+   ],
+   "recommendations": []
+  },
+  {
+   "workflowId": "wf_ok07",
+   "analysisId": "an_ok07",
+   "createdAt": "2026-09-20T09:00:00.000Z",
+   "workflowDefId": "software-delivery",
+   "findings": [
+    {
+     "title": "The same ask was filed twice as duplicate tickets",
+     "kind": "bottleneck",
+     "severity": "medium",
+     "phase": "design",
+     "agentId": null,
+     "evidence": "see the run's spans and ticket transitions"
+    }
+   ],
+   "recommendations": []
+  },
+  {
+   "workflowId": "wf_ok08",
+   "analysisId": "an_ok08",
+   "createdAt": "2026-09-23T09:00:00.000Z",
+   "workflowDefId": "software-delivery",
+   "findings": [
+    {
+     "title": "The team shipped ahead of schedule and the PR was small",
+     "kind": "failure",
+     "severity": "low",
+     "phase": "development",
+     "agentId": null,
+     "evidence": "see the run's spans and ticket transitions"
+    }
+   ],
+   "recommendations": [
+    {
+     "title": "Keep the summary section at the top of the report",
+     "priority": "P2",
+     "type": "process",
+     "target": "orchestrator",
+     "description": "raised against the phase named in target",
+     "expectedImpact": "fewer repeat occurrences"
+    }
+   ]
+  }
+ ],
+ "prds": [
+  {
+   "key": "workflow-manager/synthesized-prds/system-20260610T091500.json",
+   "title": "system: harness silent deaths swallow whole phases",
+   "description": "Three runs in this batch lost a phase to a silent death. Reap on span silence and re-dispatch once.",
+   "sources": [
+    {
+     "type": "s3",
+     "value": "s3://bucket/analyses/an_sd01.json",
+     "label": "analysis an_sd01"
+    }
+   ],
+   "run": {
+    "workflowId": "wf_si_4301",
+    "epicId": "TEAM-4301",
+    "prNumbers": [
+     512
+    ],
+    "startedAt": "2026-06-10T09:20:00.000Z",
+    "completedAt": "2026-06-11T18:00:00.000Z",
+    "mergedAt": "2026-06-11T17:10:00.000Z",
+    "deployedAt": "2026-06-11T18:40:00.000Z"
+   }
+  },
+  {
+   "key": "workflow-manager/synthesized-prds/system-20260625T140200.json",
+   "title": "system: reap and re-dispatch runs that went silent",
+   "description": "The 15-minute silence window is the only signal we get; act on it in the reaper.",
+   "sources": [
+    {
+     "type": "s3",
+     "value": "s3://bucket/analyses/an_sd06.json",
+     "label": "analysis an_sd06"
+    }
+   ],
+   "run": {
+    "workflowId": "wf_si_4366",
+    "epicId": "TEAM-4366",
+    "prNumbers": [
+     548
+    ],
+    "startedAt": "2026-06-25T14:10:00.000Z",
+    "completedAt": "2026-06-26T20:00:00.000Z",
+    "mergedAt": "2026-06-26T19:05:00.000Z",
+    "deployedAt": "2026-06-26T21:15:00.000Z"
+   }
+  },
+  {
+   "key": "workflow-manager/synthesized-prds/system-20260709T083000.json",
+   "title": "system: detect a silent death with an in-container commands probe",
+   "description": "Ask the container what the CLI process is doing instead of trusting the invocation.",
+   "sources": [
+    {
+     "type": "s3",
+     "value": "s3://bucket/analyses/an_sd11.json",
+     "label": "analysis an_sd11"
+    }
+   ],
+   "run": {
+    "workflowId": "wf_si_4412",
+    "epicId": "TEAM-4412",
+    "prNumbers": [
+     561
+    ],
+    "startedAt": "2026-07-09T08:40:00.000Z",
+    "completedAt": "2026-07-10T12:00:00.000Z",
+    "mergedAt": "2026-07-10T11:30:00.000Z"
+   }
+  },
+  {
+   "key": "workflow-manager/synthesized-prds/system-20260722T110000.json",
+   "title": "system: a silently terminated turn must still leave a completion record",
+   "description": "Completion evidence is what the orchestrator reads; a dead turn leaves none.",
+   "sources": [
+    {
+     "type": "s3",
+     "value": "s3://bucket/analyses/an_sd17.json",
+     "label": "analysis an_sd17"
+    }
+   ],
+   "run": {
+    "workflowId": "wf_si_4488",
+    "epicId": "TEAM-4488",
+    "prNumbers": [
+     575,
+     576
+    ],
+    "startedAt": "2026-07-22T11:10:00.000Z",
+    "completedAt": "2026-07-23T15:00:00.000Z",
+    "mergedAt": "2026-07-23T14:20:00.000Z",
+    "deployedAt": "2026-07-23T16:05:00.000Z"
+   }
+  },
+  {
+   "key": "workflow-manager/synthesized-prds/system-20260814T162000.json",
+   "title": "system: no spans means dead - shorten the reaper window",
+   "description": "Runs sat dead for 20+ minutes before the reaper noticed. Tighten it.",
+   "sources": [
+    {
+     "type": "s3",
+     "value": "s3://bucket/analyses/an_sd24.json",
+     "label": "analysis an_sd24"
+    }
+   ],
+   "run": {
+    "workflowId": "wf_si_4602",
+    "epicId": "TEAM-4602",
+    "prNumbers": [
+     598
+    ],
+    "startedAt": "2026-08-14T16:30:00.000Z",
+    "completedAt": "2026-08-15T19:00:00.000Z",
+    "mergedAt": "2026-08-15T18:15:00.000Z"
+   }
+  },
+  {
+   "key": "workflow-manager/synthesized-prds/system-20260910T074500.json",
+   "title": "system: silent death on the ship phase (TEAM-4734)",
+   "description": "Sixth attempt at this pattern. Still open when the ledger was introduced.",
+   "sources": [
+    {
+     "type": "s3",
+     "value": "s3://bucket/analyses/an_sd30.json",
+     "label": "analysis an_sd30"
+    }
+   ],
+   "run": {
+    "workflowId": "wf_si_4734",
+    "epicId": "TEAM-4734",
+    "prNumbers": [],
+    "startedAt": "2026-09-10T07:55:00.000Z"
+   }
+  },
+  {
+   "key": "workflow-manager/synthesized-prds/system-20260630T102000.json",
+   "title": "system: converge the review/fix rework loop in one round",
+   "description": "Sibling defects must close as a class, not one round each.",
+   "sources": [
+    {
+     "type": "s3",
+     "value": "s3://bucket/analyses/an_ok01.json",
+     "label": "analysis an_ok01"
+    }
+   ],
+   "run": {
+    "workflowId": "wf_si_4533",
+    "epicId": "TEAM-4533",
+    "prNumbers": [
+     577
+    ],
+    "startedAt": "2026-06-30T10:30:00.000Z",
+    "completedAt": "2026-07-01T09:00:00.000Z",
+    "mergedAt": "2026-07-01T08:30:00.000Z"
+   }
+  },
+  {
+   "key": "workflow-manager/synthesized-prds/system-20260802T131500.json",
+   "title": "system: agents self-park behind their own fix tickets",
+   "description": "DL-011: whoever finds the defect files it and parks itself; routing stays routing.",
+   "sources": [
+    {
+     "type": "s3",
+     "value": "s3://bucket/analyses/an_ok03.json",
+     "label": "analysis an_ok03"
+    }
+   ],
+   "run": {
+    "workflowId": "wf_si_4571",
+    "epicId": "TEAM-4571",
+    "prNumbers": [
+     584
+    ],
+    "startedAt": "2026-08-02T13:25:00.000Z",
+    "completedAt": "2026-08-03T17:00:00.000Z",
+    "mergedAt": "2026-08-03T16:10:00.000Z",
+    "deployedAt": "2026-08-03T18:00:00.000Z"
+   }
+  },
+  {
+   "key": "workflow-manager/synthesized-prds/system-20260820T093000.json",
+   "title": "system: the deploy gate must never be skipped on an unproven head",
+   "description": "Only a literal pre-approval for the exact merge commit may skip the human gate.",
+   "sources": [
+    {
+     "type": "s3",
+     "value": "s3://bucket/analyses/an_ok05.json",
+     "label": "analysis an_ok05"
+    }
+   ],
+   "run": {
+    "workflowId": "wf_si_4625",
+    "epicId": "TEAM-4625",
+    "prNumbers": [
+     604
+    ],
+    "startedAt": "2026-08-20T09:40:00.000Z",
+    "completedAt": "2026-08-21T14:00:00.000Z",
+    "mergedAt": "2026-08-21T13:20:00.000Z",
+    "deployedAt": "2026-08-21T15:10:00.000Z"
+   }
+  },
+  {
+   "key": "workflow-manager/synthesized-prds/system-20260828T171000.json",
+   "title": "system: human approval gates sit idle overnight",
+   "description": "Page the approver during working hours instead of letting the gate burn a night.",
+   "sources": [
+    {
+     "type": "s3",
+     "value": "s3://bucket/analyses/an_ok07.json",
+     "label": "analysis an_ok07"
+    }
+   ]
+  },
+  {
+   "key": "workflow-manager/synthesized-prds/system-20260905T120000.json",
+   "title": "system: one QA checklist so QA cannot pass broken work",
+   "description": "Load the shared checklist; never restate its rules in another blueprint.",
+   "sources": [
+    {
+     "type": "s3",
+     "value": "s3://bucket/analyses/an_ok04.json",
+     "label": "analysis an_ok04"
+    }
+   ],
+   "run": {
+    "workflowId": "wf_si_4690",
+    "epicId": "TEAM-4690",
+    "prNumbers": [
+     616
+    ],
+    "startedAt": "2026-09-05T12:10:00.000Z",
+    "completedAt": "2026-09-06T10:00:00.000Z",
+    "mergedAt": "2026-09-06T09:30:00.000Z"
+   }
+  },
+  {
+   "key": "workflow-manager/synthesized-prds/system-20260912T083000.json",
+   "title": "system: rename the Past runs list header",
+   "description": "A cosmetic copy edit in the sidebar. No behaviour attached.",
+   "sources": []
+  }
+ ],
+ "existingRows": [
+  {
+   "patternKey": "gate.human-wait",
+   "title": "Human gates stall runs overnight (confirmed 2026-08-19)",
+   "status": "verified",
+   "firstSeen": "2026-06-14T10:00:00.000Z",
+   "lastSeen": "2026-08-19T11:00:00.000Z",
+   "occurrences": [
+    {
+     "workflowId": "wf_pre01",
+     "analysisId": "an_pre01",
+     "at": "2026-06-14T10:00:00.000Z"
+    },
+    {
+     "workflowId": "wf_pre02",
+     "analysisId": "an_pre02",
+     "at": "2026-08-19T11:00:00.000Z"
+    }
+   ],
+   "attempts": [
+    {
+     "prdKey": "workflow-manager/synthesized-prds/system-20260701T000000.json",
+     "outcome": "deployed"
+    }
+   ]
+  },
+  {
+   "patternKey": "pipeline.build-failure",
+   "title": "Mechanical lint failures fail the build",
+   "status": "landed",
+   "firstSeen": "2026-07-02T10:00:00.000Z",
+   "lastSeen": "2026-07-02T10:00:00.000Z",
+   "occurrences": [
+    {
+     "workflowId": "wf_pre03",
+     "analysisId": "an_pre03",
+     "at": "2026-07-02T10:00:00.000Z"
+    }
+   ],
+   "attempts": []
+  }
+ ]
+}
