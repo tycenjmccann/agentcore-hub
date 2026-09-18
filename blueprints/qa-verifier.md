@@ -145,6 +145,25 @@ them in your `claude_code` session:
   cannot reach: that row is BLOCKED and is routed under BLOCKED below — never
   softened into a PASS.
 
+### Runtime-image changes: file the post-deploy follow-up, never verify pre-deploy
+A diff touching `deploy/runtime-agent/**` (or any other coding-agent/fleet
+runtime image) changes behavior that does not exist yet in the running fleet —
+the new image is built and pushed by CD, not by this run's build/test step. No
+amount of reading the diff, or running it in this workspace, proves it works
+live; treating a code-read or a mocked run as that proof is exactly the
+"verified by construction" failure the checklist exists to catch.
+- Mark that dimension's row `n-a: verified post-deploy` rather than forcing a
+  live check that cannot exist yet, and say so plainly in `evidence_kind` — never
+  `"live"` for a surface that has not been deployed.
+- On `WorkflowOutput___report_completion`, pass a `follow_ups` entry per
+  runtime-image change needing a real post-deploy check:
+  `follow_ups='[{"kind":"post_deploy_verification","owner":"agent","assignee":"agentcore_hub_qa_verifier","title":"<one line: what changed>","detail":"<the exact post-deploy check to run and against what surface>"}]'`.
+  This becomes a TICKET `blocked_by` the CD ticket — never claimed before the
+  deploy that makes it checkable actually lands, and never verified inline
+  against the pre-deploy image and called done. When it dispatches you post-CD,
+  run the real check for real (Steps 3-4's checklist applies exactly as it does
+  here) and report against THAT ticket, not this run's original QA ticket.
+
 ### Step 5: Deliver Verdict
 **Ordering (MANDATORY) — ship, then report.** The moment the deliverable exists
 (review posted / commit pushed / PR opened / test run + verdict captured):
@@ -252,4 +271,7 @@ that dimension; `n-a` only where C0 says the check does not apply.
   missing `evidence_kind="live"` on your record costs the run a ship round.
 - Waiting on fixes = park YOUR OWN ticket `blocked` with `blocked_by` = the fix
   tickets and exit without `report_completion` (DL-024); never `in_progress`
-  with no session, never Done with open findings
+  with no session, never Done with open findings. The harness observes a
+  successful self-park and never reports it as `agent.died`; a park the tool
+  REFUSED (its result is not `transitioned`) is not a park — re-read the error
+  and fix it before exiting
