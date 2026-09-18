@@ -183,6 +183,91 @@ const SESSION_DETAIL: Json = {
   workflowHref: "/workflow?id=wf-4688",
 };
 
+// ─── SI ledger fixture (TEAM-4760) ──────────────────────────────────────────
+
+const SILENT_DEATH = "harness.silent-death.exit-without-report";
+const PAGING = "ops.paging.out-of-hours";
+
+/**
+ * Two rows that between them cover the states the panel has to get right: a fix
+ * that worked, and a fix that shipped and did nothing (verdict `no-effect`, row
+ * back to `open` with the attempt kept). The second is the whole reason the panel
+ * exists, so it is what the test asserts hardest on.
+ */
+const SI_PAGING_ROW = {
+  patternKey: PAGING,
+  title: "Operator paged outside working hours",
+  status: "open",
+  firstSeen: "2026-08-01T00:00:00.000Z",
+  lastSeen: "2026-09-10T00:00:00.000Z",
+  occurrences: [
+    { workflowId: "wf-si-a", workflowDefId: "software-delivery", severity: "high", at: "2026-08-01T00:00:00.000Z" },
+    { workflowId: "wf-si-b", workflowDefId: "software-delivery", severity: "high", at: "2026-09-01T00:00:00.000Z" },
+    { workflowId: "wf-si-c", workflowDefId: "software-delivery", severity: "medium", at: "2026-09-10T00:00:00.000Z" },
+  ],
+  attempts: [
+    {
+      prdKey: "si-0001",
+      workflowId: "wf-si-fix",
+      prNumbers: [551],
+      mergedAt: "2026-08-20T00:00:00.000Z",
+      deployedAt: "2026-08-20T06:00:00.000Z",
+      outcome: "deployed",
+    },
+  ],
+  expected: [{ metric: "out_of_hours_pages", baseline: { value: 4, runs: 10 }, target: 0, observeRuns: 10 }],
+  verdicts: [
+    {
+      at: "2026-09-05T00:00:00.000Z",
+      verdict: "no-effect",
+      before: { out_of_hours_pages: 4 },
+      after: { out_of_hours_pages: 4 },
+    },
+  ],
+};
+
+const SI_LEDGER_LIST = {
+  summary: {
+    patterns: 2,
+    openPatterns: 1,
+    verifiedFixes: 1,
+    noEffectFixes: 1,
+    inRun: 0,
+    occurrences: 4,
+    analysisCoverage: 0.875,
+    analysisCoverageDay: "2026-09-12",
+  },
+  patterns: [
+    {
+      patternKey: PAGING,
+      title: SI_PAGING_ROW.title,
+      status: "open",
+      firstSeen: SI_PAGING_ROW.firstSeen,
+      lastSeen: SI_PAGING_ROW.lastSeen,
+      occurrences: 3,
+      attempts: 1,
+      source: null,
+      latestAttempt: SI_PAGING_ROW.attempts[0],
+      latestVerdict: SI_PAGING_ROW.verdicts[0],
+      expected: SI_PAGING_ROW.expected,
+    },
+    {
+      patternKey: SILENT_DEATH,
+      title: "Harness exits without reporting completion",
+      status: "verified",
+      firstSeen: "2026-07-01T00:00:00.000Z",
+      lastSeen: "2026-09-12T00:00:00.000Z",
+      occurrences: 1,
+      attempts: 2,
+      source: "backfill",
+      latestAttempt: { prdKey: "si-0002", workflowId: "wf-si-d", prNumbers: [620], mergedAt: "2026-09-08T00:00:00.000Z", outcome: "deployed" },
+      latestVerdict: { at: "2026-09-12T00:00:00.000Z", verdict: "verified", before: { silent_deaths: 6 }, after: { silent_deaths: 0 } },
+      expected: [],
+    },
+  ],
+  coverage: [{ day: "2026-09-12", analyses: 7, completedRuns: 8, ratio: 0.875 }],
+};
+
 // ─── Harness ────────────────────────────────────────────────────────────────
 
 interface Mocks {
@@ -192,10 +277,12 @@ interface Mocks {
   timeseries: string[];
   /** Full URL of every /api/evaluations/results request. */
   results: string[];
+  /** Full URL of every /api/evaluations/si-ledger request (list and drill-down). */
+  siLedger: string[];
 }
 
 async function installMocks(page: Page): Promise<Mocks> {
-  const calls: Mocks = { overviewDays: [], timeseries: [], results: [] };
+  const calls: Mocks = { overviewDays: [], timeseries: [], results: [], siLedger: [] };
 
   // Catch-all first: later, more specific handlers take precedence.
   await page.route((url) => url.pathname.startsWith("/api/"), (r) => json(r, {}));
@@ -229,6 +316,19 @@ async function installMocks(page: Page): Promise<Mocks> {
       return id === SESSION_A
         ? json(r, SESSION_DETAIL)
         : json(r, { error: "not found" }, 404);
+    }
+  );
+
+  await page.route(
+    (url) => url.pathname === "/api/evaluations/si-ledger",
+    (r) => {
+      const url = new URL(r.request().url());
+      calls.siLedger.push(r.request().url());
+      const key = url.searchParams.get("patternKey");
+      if (!key) return json(r, SI_LEDGER_LIST);
+      return key === PAGING
+        ? json(r, { row: SI_PAGING_ROW, latestVerdict: SI_PAGING_ROW.verdicts[0], latestAttempt: SI_PAGING_ROW.attempts[0] })
+        : json(r, { error: `No ledger row for ${key}` }, 404);
     }
   );
 
@@ -391,5 +491,146 @@ test.describe("Evaluations tab (TEAM-4688)", () => {
 
     await page.locator("[data-testid=eval-session-panel-close]").click();
     await expect(panel).toHaveCount(0);
+  });
+});
+
+test.describe("SI impact panel (TEAM-4760)", () => {
+  test("tiles and pattern rows render the ledger, no-effect included", async ({ page }) => {
+    const calls = await installMocks(page);
+
+    await page.goto("/evaluations");
+
+    const panel = page.locator("[data-testid=si-impact-panel]");
+    await expect(panel).toBeVisible();
+    // The panel loads its own data with no patternKey. Not an exact count:
+    // StrictMode double-invokes the effect in dev, which is not a defect.
+    expect(calls.siLedger.length).toBeGreaterThan(0);
+    expect(calls.siLedger.every((u) => !u.includes("patternKey="))).toBe(true);
+
+    await expect(page.locator("[data-testid=si-tile-open]")).toContainText("1");
+    await expect(page.locator("[data-testid=si-tile-verified]")).toContainText("1");
+    // The tile that makes the feature worth having: a fix shipped and measured
+    // as having changed nothing. It must not be hidden or rounded away.
+    await expect(page.locator("[data-testid=si-tile-no-effect]")).toContainText("1");
+    await expect(page.locator("[data-testid=si-tile-coverage]")).toContainText("88%");
+
+    const rows = page.locator("[data-testid=si-pattern-row]");
+    await expect(rows).toHaveCount(2);
+
+    const paging = rows.filter({ hasText: PAGING });
+    await expect(paging).toContainText("no-effect");
+    // Both numbers, not just the verdict word — the before/after IS the evidence.
+    await expect(paging).toContainText("out_of_hours_pages: 4 → 4");
+    await expect(paging.locator(`a[href="https://github.com/tycenjmccann/agentcore-hub/pull/551"]`)).toBeVisible();
+
+    const death = rows.filter({ hasText: SILENT_DEATH });
+    await expect(death).toContainText("verified");
+    await expect(death).toContainText("silent_deaths: 6 → 0");
+    await expect(death).toContainText("backfilled");
+  });
+
+  test("clicking a pattern drills down to its sightings and links each run", async ({ page }) => {
+    const calls = await installMocks(page);
+
+    await page.goto("/evaluations");
+    await expect(page.locator("[data-testid=si-impact-panel]")).toBeVisible();
+
+    await page.locator("[data-testid=si-pattern-row]").filter({ hasText: PAGING }).click();
+
+    const drilldown = page.locator("[data-testid=si-drilldown]");
+    await expect(drilldown).toBeVisible();
+    expect(calls.siLedger.some((u) => u.includes(`patternKey=${encodeURIComponent(PAGING)}`))).toBe(true);
+
+    // All three sightings, each a link into the run that produced it.
+    await expect(drilldown.locator('a[href="/workflow?id=wf-si-a"]')).toBeVisible();
+    await expect(drilldown.locator('a[href="/workflow?id=wf-si-c"]')).toBeVisible();
+    await expect(drilldown.locator('a[href="/workflow?id=wf-si-fix"]')).toBeVisible();
+    await expect(drilldown).toContainText("out_of_hours_pages");
+    await expect(drilldown).toContainText("target 0");
+
+    await drilldown.locator("text=close").click();
+    await expect(drilldown).toHaveCount(0);
+  });
+
+  test("an empty ledger is an explanation, not an error", async ({ page }) => {
+    await installMocks(page);
+    // More specific than the harness's handler, so it wins.
+    await page.route(
+      (url) => url.pathname === "/api/evaluations/si-ledger",
+      (r) =>
+        json(r, {
+          summary: { patterns: 0, openPatterns: 0, verifiedFixes: 0, noEffectFixes: 0, inRun: 0, occurrences: 0, analysisCoverage: null, analysisCoverageDay: null },
+          patterns: [],
+          coverage: [],
+        })
+    );
+
+    await page.goto("/evaluations");
+    await expect(page.locator("[data-testid=si-impact-panel]")).toBeVisible();
+    await expect(page.locator("[data-testid=si-impact-empty]")).toContainText("No patterns tracked yet");
+    await expect(page.locator("[data-testid=si-impact-error]")).toHaveCount(0);
+    // Unmeasured coverage is "—", never 0%.
+    await expect(page.locator("[data-testid=si-tile-coverage]")).toContainText("—");
+  });
+
+  test("a ledger table that does not exist yet explains the handoff, not an error", async ({ page }) => {
+    await installMocks(page);
+    // The route answers 200 + `unavailable` for a missing table (the table is
+    // created by the human handoff, not CD — docs/MODULES.md). The panel has to
+    // render THAT, and not the "nothing tracked yet" row, which would tell the
+    // operator the loop is running and finding nothing.
+    await page.route(
+      (url) => url.pathname === "/api/evaluations/si-ledger",
+      (r) =>
+        json(r, {
+          summary: { patterns: 0, openPatterns: 0, verifiedFixes: 0, noEffectFixes: 0, inRun: 0, occurrences: 0, analysisCoverage: null, analysisCoverageDay: null },
+          patterns: [],
+          coverage: [],
+          unavailable: { reason: "The SI ledger table (agentcore-hub-si-ledger) does not exist yet. Create it with scripts/create-dynamodb-tables.sh, set SI_LEDGER_TABLE on this service." },
+        })
+    );
+
+    await page.goto("/evaluations");
+    await expect(page.locator("[data-testid=si-impact-panel]")).toBeVisible();
+    const notice = page.locator("[data-testid=si-impact-unavailable]");
+    await expect(notice).toContainText("does not exist yet");
+    await expect(notice).toContainText("create-dynamodb-tables.sh");
+    // Not an error, and not the "nothing yet" row — those say different things.
+    await expect(page.locator("[data-testid=si-impact-error]")).toHaveCount(0);
+    await expect(page.locator("[data-testid=si-impact-empty]")).toHaveCount(0);
+  });
+
+  test("a page-capped read warns that the tiles are counted over a partial table", async ({ page }) => {
+    await installMocks(page);
+    await page.route(
+      (url) => url.pathname === "/api/evaluations/si-ledger",
+      (r) =>
+        json(r, {
+          summary: { patterns: 1, openPatterns: 1, verifiedFixes: 0, noEffectFixes: 0, inRun: 0, occurrences: 2, analysisCoverage: null, analysisCoverageDay: null },
+          truncated: true,
+          patterns: [
+            {
+              patternKey: "ops.paging.out-of-hours",
+              title: "Operator paged outside working hours",
+              status: "open",
+              firstSeen: "2026-08-01T00:00:00.000Z",
+              lastSeen: "2026-09-10T00:00:00.000Z",
+              occurrences: 2,
+              attempts: 0,
+              source: null,
+              latestAttempt: null,
+              latestVerdict: null,
+              expected: [],
+            },
+          ],
+          coverage: [],
+        })
+    );
+
+    await page.goto("/evaluations");
+    await expect(page.locator("[data-testid=si-impact-truncated]")).toContainText("more rows than this panel reads");
+    // The rows it DID read still render — a partial answer beats no answer.
+    await expect(page.locator("[data-testid=si-impact-panel]")).toContainText("ops.paging.out-of-hours");
+    await expect(page.locator("[data-testid=si-impact-error]")).toHaveCount(0);
   });
 });

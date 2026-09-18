@@ -126,6 +126,10 @@ The continuous-improvement loop. Self-contained surface.
 - `src/app/evaluations/components/` — the module's own dashboard/drilldown
   components (window selector, persona table, timeseries, result list, session
   detail).
+- The dashboard also carries a read-only **"SI impact"** panel beside the existing
+  Self-Improvement Loop surface: it renders the `agentcore-hub-si-ledger` rows
+  (pattern, status, occurrences, the run that attempted it, the verdict) so the
+  loop's follow-through is visible next to its controls, and it never writes.
 
 **API routes** (all `dynamic = "force-dynamic"`)
 - `src/app/api/evaluations/` — config, per-agent stats, flush, loop. `GET /api/evaluations?days=7|30|90|all`
@@ -146,6 +150,24 @@ The continuous-improvement loop. Self-contained surface.
   page*, so a session may straddle a page boundary and its grouped row is then only
   as complete as the page it was built from (hence the `partial` flag); the session
   detail route is the authoritative per-session view.
+- `src/app/api/evaluations/si-ledger/` — `GET` only, **read-only** (the UI never
+  writes the ledger; rows are authored by the loop's own writers below). Bare
+  `GET` lists the ledger rows for the "SI impact" panel; `?patternKey=<key>` is
+  the single-pattern drill-down (full `occurrences` / `attempts` / `expected` /
+  `verdicts` history). Two contracts worth knowing before reading a response:
+  - **A missing table is a `200`, not a `500`.** The table is created by the human
+    handoff below, not by CD, so "it does not exist yet" is the normal state of a
+    fresh install. Both paths answer `200` with `unavailable: { reason }` naming
+    the handoff steps (and an empty/`null` payload alongside), and the panel
+    renders that explanation instead of an error. The line is drawn at
+    `ResourceNotFoundException` and nowhere else — `AccessDenied`, the IAM half of
+    the same handoff, still `500`s, because it can equally mean a real regression.
+  - **The list read is page-capped** (`LIST_MAX_PAGES` in `src/lib/si-ledger.ts`,
+    10 pages x 100 rows — ~20x any plausible size of a one-row-per-defect-class
+    table) so a synchronous handler can never be made to walk an unbounded Scan.
+    If the cap ever bites, the response carries `truncated: true` and the panel
+    says the tiles are counted over a partial table. The writers' scans are
+    deliberately uncapped: their contract is completeness.
 - `src/app/api/evaluations/sessions/[sessionId]/` —
   `{ sessionId, agentId, persona, workflowId, ticketId, evaluatedAt, results: [...], tracesHref, workflowHref, lastUpdated }`.
   A session with no stored rows is a `404`.
@@ -178,7 +200,30 @@ The continuous-improvement loop. Self-contained surface.
   flush a batch nor synthesize a PRD. EMF record `AgentCoreHub/Evaluations` gains
   `EvalResultsWritten` and `EvalResultsDuplicate`.
 - `token-aggregator` — token/cost aggregation into per-agent per-UTC-day items in `agentcore-hub-eval-daily` from Strands `chat` spans, harness EMF metrics and Claude Code `api_request` events; the buckets are permanent (no TTL, no `expiresAt`) so the Evaluations tab can fold 7 / 30 / 90 / all-time windows
-- `prd-submitter` — S3-triggered handoff into the improver agent
+- `prd-submitter` — S3-triggered handoff into the improver agent; on submit it
+  stamps the ledger row for every `patternKey` the PRD claims to fix (status
+  `open`/`batched` → `in-run`, the `workflowId` appended to `attempts[]`, the
+  PRD's promised effect to `expected[]`), so a pattern is never silently
+  re-synthesized while its fix is mid-flight
+- `workflow-analyzer` — the Workflow Manager's trigger Lambda (terminal-run
+  ANALYZE, the 5-minute WATCH scan, the `#si-synthesis` batch claim and the daily
+  `{"action":"si-verify"}` sweep); it owns the canonical copy of `si-ledger.mjs`
+  and closes out the attempt each finished run was carrying — when the run's
+  `input.si` names patterns, it stamps one `attempts[]` entry with the outcome read
+  off the run (`deployed`/`landed` from `workflows/<id>/shared/cd-ledger.json`,
+  `handoff` from `delivery.mode`, and `cancelled`/`error` back to `open` **with a
+  note**, so a dead SI run's patterns stay filable instead of wedging at `in-run`).
+  A **cancelled** run never reaches ANALYZE — the cancel route emits no terminal
+  EventBridge outcome — so the 5-minute scan sweeps that case first: for every
+  ledger row still `in-run`, it reads the run its newest attempt names and stamps it
+  if that run has ended (`cancelledAt`, or a terminal phase). The cleared `in-run`
+  status is itself the marker, so a second sweep is a no-op and no run is
+  re-analysed. It also fails an ANALYZE that persisted no analysis row, releasing
+  the auto-claim so the retry can re-run it
+- `si-ledger.mjs` is a **byte-copy pair** — `lambda/workflow-analyzer/si-ledger.mjs`
+  is canonical and `lambda/prd-submitter/si-ledger.mjs` must stay identical
+  (nothing lives in `lambda/shared/`); both copies are listed in
+  `deploy/pipeline/surfaces.json` so the Deploy stage packages them
 
 **DynamoDB tables**
 - `agentcore-hub-eval-config` — per-agent eval controls + session buffer
@@ -219,6 +264,48 @@ The continuous-improvement loop. Self-contained surface.
   The table is a queryable **mirror**, not the system of record: the
   `/aws/bedrock-agentcore/evaluations/results/<configId>` log groups remain the
   system of record, and the daily reconcile is what keeps the two equal.
+- `agentcore-hub-si-ledger` (`SI_LEDGER_TABLE`) — one row per recurring failure
+  **pattern**, the loop's follow-through record. PK `patternKey` (S), no sort key,
+  no GSI, `PAY_PER_REQUEST`. **No TTL, and that is deliberate:** unlike the
+  seen-set (24h) the ledger's whole value is permanence — a pattern that
+  resurfaces two quarters after its "fix" has to find its own history, and an
+  expired row would let the loop re-discover, re-PRD and re-ship the same fix
+  forever with nothing able to say the last attempt had no effect. Row shape:
+  `{patternKey, title, status, firstSeen, lastSeen, occurrences[], attempts[],
+  expected[], verdicts[]}` — the four lists are append-only history (where it was
+  seen, which runs tried to fix it, what each fix promised, what the next runs
+  actually showed). `status` vocabulary, in lifecycle order:
+  `open` → `batched` → `in-run` → `landed` → `deployed` → `verified`, plus the two
+  negative terminals `no-effect` and `regressed` and the human terminal
+  `wont-fix`.
+  - **Writers:** `save_analysis.py` via the WM toolkit twin (records a new
+    sighting on every terminal-run ANALYZE), the `si-synthesis` skill (`batched`
+    when a pattern enters a synthesis batch), `prd-submitter` (`in-run` + the
+    `attempts[]`/`expected[]` entries when the PRD is submitted),
+    `workflow-analyzer` (the attempt's terminal outcome —
+    `deployed`/`landed`/`handoff`, or back to `open` on a cancelled/errored run,
+    the latter from its 5-minute sweep of rows still marked `in-run`),
+    `si_verify.py --apply` (the `verified`/`no-effect`/`regressed` verdicts, on the
+    daily SI-VERIFY sweep), and `scripts/si-ledger-backfill.mjs` for the one-time
+    seed from existing analyses.
+  - **What the backfill will NOT write**, because the ledger's own rules forbid it
+    rather than because the history is thin — `--dry-run` prints each one under
+    `skipped (nothing written)` with its reason, so the operator sees it before
+    `--apply`: `no-pattern-match` (nothing in the text maps to a known key — the
+    keyword map is a judgement, not a classifier, so an unmapped item is left for a
+    human); `prd-never-run` (a PRD was written but never became a run, so there is
+    no attempt to record — `batched` is not an `ATTEMPT_OUTCOMES` member and
+    writing it as a *status* would downgrade a row that has since been `verified`);
+    and `attempt-without-occurrence` (the key has neither an existing row nor a
+    replayed sighting, and `stampAttempt` → `requireRow` throws rather than mint
+    one, because an attempt with no sighting behind it means the caller invented a
+    key). Predicted statuses in the report follow the ledger's own
+    last-attempt-wins rule — `applyAttempt` assigns `statusAfterOutcome(outcome)`
+    on every stamp — so the dry run never promises a status `--apply` cannot
+    produce.
+  - **Readers:** `GET /api/evaluations/si-ledger` (the "SI impact" panel), the hub
+    ECS service **read-only**, and `si_verify.py` in the WM toolkit, which reads
+    `expected[]` back to decide the verdict.
 
 **CloudWatch wiring**
 - Subscription filters on `/aws/bedrock-agentcore/evaluations/results/eval_<harnessName>`
@@ -226,6 +313,11 @@ The continuous-improvement loop. Self-contained surface.
 - EventBridge rule `agentcore-hub-eval-reconcile`, `rate(1 day)` → `eval-packager`
   with `{"mode":"reconcile","days":2}` (created by
   `deploy/continuous-improvement/deploy.sh`)
+- EventBridge rule `agentcore-hub-si-verify-daily`, `cron(30 7 * * ? *)` →
+  `workflow-analyzer` with `{"action":"si-verify"}` (created by
+  `deploy/workflow-manager/deploy.sh`). The harness runs
+  `toolkit/si_verify.py --apply`, which is the only thing that ever records a
+  verdict; disable the rule to pause verification without touching code
 
 **IAM**
 - Inline policy `EvalResultsAccess` on the shared `agentcore-hub-lambda-role`,
@@ -260,7 +352,9 @@ The continuous-improvement loop. Self-contained surface.
 - `evalHost` — OPTIONAL override: agentId of the agent whose runtime scores this persona. Normally unset — `src/lib/eval-roster.ts` derives "hosted" from the LIVE S3 roster's `runtimeArn`s (evaluations-enabled agents sharing one ARN collapse onto the agent named by that runtime), so the same roster works for the 1-, 4- and 14-runtime topologies. A hosted persona is not an Evaluations column or an `/api/evaluations` agent; it renders as a persona sub-column under the host, fed by the host's `${agentId}#${persona}` daily rows. The route returns `columns` + `hosted` so the page never derives topology from the bundled (null-ARN) roster.
 
 **Env vars** — `EVAL_CONFIG_TABLE`, `EVAL_SEEN_TABLE`, `EVAL_DAILY_TABLE`,
-`EVAL_RESULTS_TABLE`, `ARTIFACT_BUCKET`, `LAMBDA_ROLE_ARN`, and on the packager
+`EVAL_RESULTS_TABLE`, `SI_LEDGER_TABLE` (default `agentcore-hub-si-ledger`; needed
+on `workflow-analyzer`, `prd-submitter`, the `agentcore_hub_workflow_manager`
+harness and the hub ECS service), `ARTIFACT_BUCKET`, `LAMBDA_ROLE_ARN`, and on the packager
 `LEGACY_RESULTS_GROUPS_B64` — base64 of the compact JSON of
 `deploy/evaluations/legacy-results-groups.json`, base64 because
 `aws lambda update-function-configuration --environment` takes a
@@ -270,6 +364,39 @@ log-group leaf names (or a distinguishing substring), values are canonical
 **before** the name-based `resolveAgentId()`, which would otherwise mis-attribute a
 pre-consolidation log group to one persona's `agentId`. The map has to fit the
 Lambda's 4KB env budget.
+
+> **Human handoff — the SI ledger is not self-installing.** The CD Deploy stage is
+> **code-only**: it ships Lambda zips, harness prompt/model/skills and S3 toolkits,
+> and never touches DynamoDB tables, env vars or IAM. So creating
+> `agentcore-hub-si-ledger`, putting `SI_LEDGER_TABLE` on all four surfaces
+> (`workflow-analyzer` + `prd-submitter` Lambdas, the WM harness, the hub ECS
+> service) and applying the two IAM statements (`SiLedgerTable` on
+> `agentcore-hub-lambda-role`, `SiLedgerReadWrite` on `agentcore-hub-harness-role`)
+> are steps a human runs once, via
+> `./scripts/create-dynamodb-tables.sh`, `./deploy/workflow-manager/deploy.sh`,
+> `./deploy/continuous-improvement/deploy.sh`,
+> `node deploy/workflow-manager/setup-workflow-manager.mjs` and
+> `deploy/ecs-express/set-env.sh`. Until they are done, the shipped code sees an
+> unset `SI_LEDGER_TABLE` / `AccessDenied`. Remember that harness
+> `environmentVariables` and the ECS/Lambda env APIs are **replace-all**: use
+> `set-env.sh` / `set-runtime-env.py`, never a raw update call.
+>
+> Which script owns which surface: `deploy/workflow-manager/deploy.sh` sets the env
+> and the `SiLedgerTable` grant for `workflow-analyzer`;
+> `deploy/continuous-improvement/deploy.sh` does the same for `prd-submitter` (its
+> own `EvalResultsAccess` document carries a narrower duplicate of the statement, so
+> the Evaluations module works on an install that never deployed the Workflow
+> Manager) and packages the byte-copied `si-ledger.mjs` into its zip. Only the WM
+> harness and the ECS service are hand-set. `./deploy/continuous-improvement/verify.sh`
+> asserts the submitter's env var and that the table is ACTIVE.
+>
+> `deploy/workflow-manager/deploy.sh` additionally sets `ARTIFACT_BUCKET` on the
+> analyzer (without it no attempt can be dated from the cd-ledger, so every fix
+> reads as "nothing shipped") and creates the `agentcore-hub-si-verify-daily` rule.
+> The harness's SI-VERIFY mode is *not* a handoff step — `system-prompt.md` is a CD
+> harness surface, so the Deploy stage re-runs `setup-workflow-manager.mjs` itself
+> whenever that file changes; the hand-set part is only the harness `SI_LEDGER_TABLE`
+> env var, which CD never touches.
 
 ---
 

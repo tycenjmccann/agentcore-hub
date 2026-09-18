@@ -164,6 +164,13 @@ export interface AnalysisFinding {
   phase?: string | null;
   agentId?: string | null;
   evidence: string;
+  /**
+   * The defect class this is an instance of — a row in the SI ledger
+   * (`src/lib/si-ledger.ts`). Optional on findings and on P2 recommendations,
+   * REQUIRED on P0/P1 recommendations by `save_analysis.py`. Absent on every
+   * analysis written before TEAM-4760, so it stays optional here.
+   */
+  patternKey?: string | null;
 }
 
 export interface AnalysisRecommendation {
@@ -173,6 +180,8 @@ export interface AnalysisRecommendation {
   target?: string | null;
   description: string;
   expectedImpact: string;
+  /** See AnalysisFinding.patternKey — required on P0/P1 at the write path. */
+  patternKey?: string | null;
 }
 
 export interface AnalysisTrend {

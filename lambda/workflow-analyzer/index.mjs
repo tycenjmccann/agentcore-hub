@@ -12,11 +12,17 @@
  *      (auto, idempotent). Only source + detail.workflowId are read, so the
  *      detail-type set is a deploy-time concern, not a code branch.
  *   2. Direct invoke {workflowId, trigger: "manual"} → ANALYZE (re-runs allowed)
- *   3. EventBridge schedule {action: "watch"} → scan live runs, WATCH stale ones
+ *   3. EventBridge schedule {action: "watch"} → close out SI attempts whose run
+ *      already ended (cancelled/error never reach shape 1 — TEAM-4760 AC4), then
+ *      scan live runs and WATCH stale ones
+ *   4. EventBridge schedule {action: "si-verify"} → daily SI verdict sweep
+ *      (TEAM-4760; the harness runs toolkit/si_verify.py, this Lambda does no
+ *      metric arithmetic of its own)
  *
  * Env: WORKFLOW_MANAGER_ARN (harness ARN), ANALYSES_TABLE, WORKFLOWS_TABLE,
- *      EVENTS_TABLE, WM_STALE_MINUTES (default 10), WM_WATCH_COOLDOWN_MINUTES
- *      (default 15), WM_ANALYZE_DELAY_MS (default 30000).
+ *      EVENTS_TABLE, SI_LEDGER_TABLE, ARTIFACT_BUCKET, WM_STALE_MINUTES
+ *      (default 10), WM_WATCH_COOLDOWN_MINUTES (default 15),
+ *      WM_ANALYZE_DELAY_MS (default 30000).
  */
 
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
@@ -27,6 +33,8 @@ import {
   ScanCommand,
   UpdateCommand,
 } from "@aws-sdk/lib-dynamodb";
+
+import { SiLedger, SI_LEDGER_TABLE_DEFAULT, normalizeKey } from "./si-ledger.mjs";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const WORKFLOW_MANAGER_ARN = process.env.WORKFLOW_MANAGER_ARN;
@@ -60,9 +68,27 @@ const SI_CLAIM_SK = "claim";
 /** Cap the pairs listed in one SYNTHESIZE prompt; the rest ride the next batch. */
 const SI_MAX_BATCH = 20;
 
+// ─── SI ledger (TEAM-4760) ────────────────────────────────────────────────────
+const SI_LEDGER_TABLE = process.env.SI_LEDGER_TABLE || SI_LEDGER_TABLE_DEFAULT;
+/** Artifact bucket — read-only here, for workflows/<id>/shared/cd-ledger.json. */
+const ARTIFACT_BUCKET = process.env.ARTIFACT_BUCKET || "";
+/**
+ * Terminal phases where the run is CLOSED but the change was NOT delivered: a
+ * human rejected the deploy gate, or CI certified nothing past static checks.
+ * They must never read as "deployed" even when the cd-ledger carries an
+ * execution id — the id is written the moment start_deploy returns, i.e. before
+ * the gate the human then refused.
+ */
+const SHIP_BLOCKED_PHASES = new Set(["deploy-blocked", "static-ci-only"]);
+
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: REGION }), {
   marshallOptions: { removeUndefinedValues: true },
 });
+
+let ledgerClient;
+function siLedger() {
+  return (ledgerClient ||= new SiLedger({ ddb, table: SI_LEDGER_TABLE }));
+}
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -79,6 +105,13 @@ export const handler = async (event) => {
   // Shape 3: scheduled watch scan
   if (event?.action === "watch") {
     return watchScan();
+  }
+
+  // Shape 4: scheduled SI verdict sweep. A plain action branch, NOT a mode flag:
+  // it selects which prompt the harness gets, it does not change how anything
+  // else behaves (DL-009's no-new-*_MODE-flag rule).
+  if (event?.action === "si-verify") {
+    return siVerify();
   }
 
   // Shapes 1 + 2: analyze one workflow
@@ -152,8 +185,34 @@ async function analyze(workflowId, trigger) {
   try {
     // Let the final completions/*.json S3 writes land before the dossier pull.
     if (trigger === "auto") await sleep(ANALYZE_DELAY_MS);
+    // The analysis ids as they stand BEFORE this session, so "did this ANALYZE
+    // persist anything?" is a set difference rather than a count (a concurrent
+    // manual re-analysis must not be able to satisfy it). null = read failed.
+    const before = await analysisIdsFor(workflowId);
     const result = await invokeHarness(prompt, sessionId("wm", workflowId));
     console.log(`[analyzer] ANALYZE ${workflowId} stopReason=${result.stopReason} chars=${result.text.length}`);
+
+    // Close out the SI attempt this run was carrying (TEAM-4760). Deliberately
+    // BEFORE the D5 check below: the stamp is what hands a cancelled or errored
+    // run's patterns back to `open`, and a run whose analysis keeps failing to
+    // persist must not ALSO leave those patterns wedged at `in-run` —
+    // dedupeBlocked suppresses an `in-run` key from every future PRD and has no
+    // staleness escape, so that state is permanent until someone re-stamps it.
+    const si = await stampSiAttempt(workflow, phase);
+
+    // D5: a harness session can end "successfully" (stopReason=end_turn) having
+    // written NOTHING — the failure mode that made auto-analysis look healthy
+    // while the analyses table stayed empty for the run. The claim is an
+    // in-progress marker, so throw and let the catch release it: re-running the
+    // analysis is the only way that row ever appears.
+    const added = analysisDelta(before, await analysisIdsFor(workflowId));
+    if (added && added.length === 0) {
+      throw new Error(
+        `ANALYZE ${workflowId} persisted no analysis (stopReason=${result.stopReason}, ` +
+        `${result.text.length} chars replied) — save_analysis.py never wrote a row`,
+      );
+    }
+
     // System-SI check rides the ANALYZE that just persisted a new analysis.
     // Failures are logged, never thrown: a synthesis hiccup must not release
     // the auto-claim and re-run a completed analysis.
@@ -163,7 +222,15 @@ async function analyze(workflowId, trigger) {
     } catch (err) {
       console.error(`[analyzer] SI synthesis check failed:`, err.message);
     }
-    return { workflowId, trigger, stopReason: result.stopReason, synthesis, summary: result.text.slice(0, 500) };
+    return {
+      workflowId,
+      trigger,
+      stopReason: result.stopReason,
+      analysisIds: added,
+      si,
+      synthesis,
+      summary: result.text.slice(0, 500),
+    };
   } catch (err) {
     if (trigger === "auto") await releaseAutoClaim(workflowId);
     throw err; // let EventBridge retry a released run
@@ -291,6 +358,371 @@ async function releaseAutoClaim(workflowId) {
   }
 }
 
+// ─── SI ledger: closing out the attempt a run was carrying (TEAM-4760) ────────
+
+/**
+ * WHY THIS LIVES HERE. prd-submitter flips a pattern's row to `in-run` when it
+ * starts the run that carries the fix. Something has to close that attempt when
+ * the run ends, and this Lambda is the only component told about EVERY terminal
+ * outcome (the EventBridge rule covers complete / deploy_blocked /
+ * static_ci_only, a manual invoke covers the rest).
+ *
+ * So the UNHAPPY paths matter most here. A cancelled or errored SI run that was
+ * never stamped leaves its keys at `in-run`, and `dedupeBlocked` then suppresses
+ * that recommendation from every future PRD — "asked 8 times, never tracked"
+ * inverted into "asked once, never askable again". Every outcome below therefore
+ * carries a NOTE naming what the run actually did, and the ones that delivered
+ * nothing hand the key back to `open`.
+ *
+ * Nothing in this section is allowed to fail an ANALYZE: the analysis is the
+ * expensive artifact (a full harness session) and the ledger is a mirror that
+ * the next analysis or the daily si_verify sweep re-converges.
+ */
+
+/** The `si` block prd-submitter put on the run, normalised — or null. */
+export function siBlock(workflow) {
+  const si = workflow?.input?.si;
+  if (!si || typeof si !== "object") return null;
+  const patternKeys = [];
+  for (const raw of Array.isArray(si.patternKeys) ? si.patternKeys : []) {
+    // normalizeKey is the single arbiter of "is this a key" (si-ledger.mjs) —
+    // every ledger read normalises, so a key this rejects names no row at all.
+    try {
+      const key = normalizeKey(raw);
+      if (!patternKeys.includes(key)) patternKeys.push(key);
+    } catch {
+      console.warn(`[analyzer] si: ignoring unusable patternKey ${JSON.stringify(raw)}`);
+    }
+  }
+  if (!patternKeys.length) return null;
+  return { prdKey: String(si.prdKey || ""), patternKeys };
+}
+
+/**
+ * Every PR this run produced, as numbers. Read from the per-ticket
+ * `agentTasks[*].prUrl` (each ship/dev ticket records its own) AND from
+ * `delivery.prUrl` (the unified PR the completer opens, which on a handoff run
+ * is the ONLY place a PR appears). Unioned because a run that opened a second PR
+ * must not erase the first — applyAttempt unions again on top.
+ */
+export function prNumbersFrom(workflow) {
+  const out = [];
+  for (const url of [
+    ...Object.values(workflow?.agentTasks || {}).map((t) => t?.prUrl),
+    workflow?.delivery?.prUrl,
+  ]) {
+    const m = /\/pull\/(\d+)/.exec(String(url || ""));
+    const n = m ? Number(m[1]) : NaN;
+    if (Number.isFinite(n) && !out.includes(n)) out.push(n);
+  }
+  return out.sort((a, b) => a - b);
+}
+
+/** A Date or date-ish string → ISO-8601, or null. Never throws. */
+function iso(value) {
+  if (!value) return null;
+  const t = value instanceof Date ? value.getTime() : Date.parse(String(value));
+  return Number.isNaN(t) ? null : new Date(t).toISOString();
+}
+
+/**
+ * When did this attempt merge, and when did it deploy?
+ *
+ * The cd-ledger carries NO timestamps — it is exactly
+ * `{pipeline, executionId, mergeCommit, prUrl, approvedHeadSha, gateTicketId}`
+ * (blueprints/release-manager.md, "The CD ledger"). So the time is taken from an
+ * explicit field if one is ever added, else from the S3 object's LastModified —
+ * the release manager writes that object the instant `Pipeline___start_deploy`
+ * returns, which is the closest real record of the deploy trigger — else from
+ * the caller's fallback (the run's completion time). Each stamp is only set when
+ * the ledger holds the EVIDENCE for it: no mergeCommit, no mergedAt. A guessed
+ * mergedAt would start dedupeBlocked's 14-day freshness window on a merge that
+ * never happened.
+ */
+export function cdStamps(cd, { lastModified, fallbackAt } = {}) {
+  if (!cd || typeof cd !== "object") return { mergedAt: null, deployedAt: null };
+  const at = iso(lastModified) || iso(fallbackAt);
+  return {
+    mergedAt: cd.mergeCommit ? iso(cd.mergedAt) || at : null,
+    deployedAt: cd.executionId ? iso(cd.deployedAt) || at : null,
+  };
+}
+
+/**
+ * What did this run DO for the pattern? → `{ outcome, note }`, where outcome is
+ * one of si-ledger's ATTEMPT_OUTCOMES and note is the evidence sentence a human
+ * (or the next synthesis) reads off the row.
+ *
+ * Evidence-ordered, and the default is pessimistic: a run that reached a
+ * terminal phase with no merge and no handoff PR delivered nothing, so it is
+ * recorded as `error` — which returns the key to `open`, keeping the ask owed.
+ * Claiming `landed` on a completed-but-unmerged run is how the ledger would
+ * start lying in the direction that silences the backlog.
+ */
+export function siOutcome({ phase, workflow, cd } = {}) {
+  const mode = workflow?.delivery?.mode || "";
+  const prs = prNumbersFrom(workflow);
+  const evidence =
+    `phase=${phase}, delivery=${mode || "none"}, ` +
+    `PRs=${prs.length ? prs.map((n) => `#${n}`).join(" ") : "none"}, ` +
+    `cd-ledger=${cd ? `execution ${cd.executionId || "none"} / merge ${String(cd.mergeCommit || "none").slice(0, 12)}` : "absent"}`;
+
+  if (phase === "cancelled") return { outcome: "cancelled", note: `run cancelled before the fix shipped (${evidence})` };
+  if (phase === "error") return { outcome: "error", note: `run ended in error (${evidence})` };
+  if (SHIP_BLOCKED_PHASES.has(phase)) {
+    return cd?.mergeCommit
+      ? { outcome: "landed", note: `merged but never deployed — run closed ${phase} (${evidence})` }
+      : { outcome: "error", note: `run closed ${phase} with nothing merged (${evidence})` };
+  }
+  if (cd?.executionId) return { outcome: "deployed", note: `deployed via ${cd.pipeline || "pipeline"} (${evidence})` };
+  if (cd?.mergeCommit) return { outcome: "landed", note: `merged, no deploy execution recorded (${evidence})` };
+  if (mode === "handoff" && prs.length) {
+    return { outcome: "handoff", note: `PR left open for the owning team — repo is outside the CD registry (${evidence})` };
+  }
+  return {
+    outcome: "error",
+    note: `run reached ${phase} with no merge evidence — nothing shipped, the ask is still owed (${evidence})`,
+  };
+}
+
+/**
+ * Read `workflows/<id>/shared/cd-ledger.json` → `{ cd, lastModified }`, or
+ * `{ cd: null }` when there is none (or it could not be read — an unreadable
+ * ledger must degrade to "no merge evidence", never to a fabricated deploy).
+ *
+ * The S3 client is imported lazily and NOT declared in package.json: the
+ * nodejs20.x managed runtime provides the v3 clients, which is how
+ * lambda/prd-submitter runs with no package.json at all. Keeping it out of the
+ * zip avoids ~10MB of bundle for one GetObject. No IAM change either — this
+ * Lambda's role already holds s3:GetObject on the whole artifact bucket
+ * (deploy/setup-lambda-role.sh, Sid "ObjectRW").
+ */
+export async function readCdLedger(workflowId, { s3, bucket = ARTIFACT_BUCKET } = {}) {
+  if (!bucket || !workflowId) {
+    console.warn(`[analyzer] si: cd-ledger not read (${bucket ? "no workflowId" : "ARTIFACT_BUCKET unset"})`);
+    return { cd: null, lastModified: null };
+  }
+  const Key = `workflows/${workflowId}/shared/cd-ledger.json`;
+  try {
+    const { S3Client, GetObjectCommand } = await import("@aws-sdk/client-s3");
+    const client = s3 || new S3Client({ region: REGION });
+    const out = await client.send(new GetObjectCommand({ Bucket: bucket, Key }));
+    const cd = JSON.parse(await out.Body.transformToString());
+    return { cd: cd && typeof cd === "object" ? cd : null, lastModified: out.LastModified || null };
+  } catch (err) {
+    const missing = err?.name === "NoSuchKey" || err?.name === "NotFound" || err?.$metadata?.httpStatusCode === 404;
+    if (!missing) console.warn(`[analyzer] si: cd-ledger read failed for ${Key} (${err?.name}): ${err?.message}`);
+    return { cd: null, lastModified: null };
+  }
+}
+
+/**
+ * Stamp this run's attempt onto every pattern it was carrying. Never throws.
+ *
+ * One attempt object for all the run's keys — it IS one attempt, and
+ * applyAttempt dedupes on (prdKey, workflowId), so a manual re-analysis
+ * re-stamps the same entry instead of adding a second one. A per-key write that
+ * fails (the row was deleted between submission and completion) is logged and
+ * skipped so the other keys still close out; re-running ANALYZE manually for the
+ * run re-stamps whatever was missed.
+ */
+export async function stampSiAttempt(workflow, phase, { ledger = siLedger(), s3, bucket, at } = {}) {
+  const si = siBlock(workflow);
+  if (!si) return { skipped: "run carried no input.si" };
+  const workflowId = workflow.workflowId;
+  try {
+    const { cd, lastModified } = await readCdLedger(workflowId, { s3, bucket });
+    const { outcome, note } = siOutcome({ phase, workflow, cd });
+    const { mergedAt, deployedAt } = cdStamps(cd, {
+      lastModified,
+      fallbackAt: workflow.completedAt || workflow.cancelledAt || at || new Date().toISOString(),
+    });
+    const attempt = {
+      prdKey: si.prdKey,
+      workflowId,
+      epicId: workflow.epicId,
+      prNumbers: prNumbersFrom(workflow),
+      mergedAt,
+      deployedAt,
+      outcome,
+      note,
+    };
+
+    const stamped = [];
+    const failed = [];
+    for (const patternKey of si.patternKeys) {
+      try {
+        const row = await ledger.stampAttempt(patternKey, attempt);
+        stamped.push(patternKey);
+        console.log(`[analyzer] si-ledger: ${patternKey} → ${row.status} (${outcome}, PRD ${si.prdKey}, run ${workflowId})`);
+      } catch (err) {
+        failed.push(patternKey);
+        console.error(`[analyzer] si-ledger: ${patternKey} NOT stamped (${outcome}) — ${err?.message || err}`);
+      }
+    }
+    return { prdKey: si.prdKey, outcome, stamped, failed };
+  } catch (err) {
+    console.error(`[analyzer] si-ledger: attempt stamp failed for ${workflowId}: ${err?.message || err}`);
+    return { prdKey: si.prdKey, error: String(err?.message || err), stamped: [], failed: si.patternKeys };
+  }
+}
+
+/**
+ * Which terminal phase this row is in, or null while it is still live.
+ *
+ * `cancelledAt` is the cancel route's FIRST stamp and the phase can lag behind it
+ * (TEAM-4577, the same reason watchScan filters on it), so a row carrying it is
+ * read as cancelled whatever its phase says — that is the truth the attempt has
+ * to record.
+ */
+export function terminalPhaseOf(workflow) {
+  if (!workflow) return null;
+  if (workflow.cancelledAt || workflow.phase === "cancelled") return "cancelled";
+  return TERMINAL_PHASES.has(workflow.phase) ? workflow.phase : null;
+}
+
+/**
+ * Close out attempts whose run is already over (TEAM-4760 AC4).
+ *
+ * ANALYZE stamps the attempt for a run that ends through one of the orchestrator's
+ * terminal EventBridge outcomes — but a CANCELLED run emits none of them: the
+ * cancel route writes a single events-table row and nothing else, and the watch
+ * loop skips terminal rows by design. So nothing would ever stamp that attempt,
+ * and since dedupeBlocked blocks an `in-run` key UNCONDITIONALLY (no staleness
+ * escape) while si_verify.py skips `in-run` rows entirely, the run's patterns
+ * would be wedged out of the backlog forever — the exact inverse of what this
+ * ledger exists to do. Same for a run that died in `error`.
+ *
+ * The sweep therefore starts from the LEDGER rather than the workflows table: for
+ * every row the ledger still believes is `in-run`, ask whether the run it named
+ * has ended. That is one Scan of a tens-of-rows table plus one GetItem per open
+ * attempt instead of a full workflows Scan, it needs no marker attribute because
+ * the stamp itself clears the `in-run` status, and it also repairs a per-key stamp
+ * that failed earlier. Idempotent by construction: a stamped row is no longer
+ * `in-run`, so the next sweep does not look at it.
+ *
+ * Only rows whose STATUS is `in-run` are touched, and only their newest attempt —
+ * exactly the (row, attempt) pair dedupeBlocked cites. Closing an OLDER in-run
+ * attempt on a row that has since landed would drag that row's status backwards.
+ */
+export async function siReapScan({ ledger = siLedger(), client = ddb, table = WORKFLOWS_TABLE, s3, bucket } = {}) {
+  const reaped = [];
+  let rows;
+  try {
+    rows = await ledger.list();
+  } catch (err) {
+    console.error(`[analyzer] si-reap: ledger scan failed: ${err?.message || err}`);
+    return { candidates: 0, live: 0, reaped };
+  }
+
+  const candidates = rows.filter((row) => row?.status === "in-run");
+  const closed = new Set();
+  let live = 0;
+  for (const row of candidates) {
+    const attempts = Array.isArray(row.attempts) ? row.attempts : [];
+    const workflowId = attempts.length ? attempts[attempts.length - 1]?.workflowId : null;
+    if (!workflowId) {
+      console.warn(`[analyzer] si-reap: ${row.patternKey} is in-run with no attempt workflowId — skipped`);
+      continue;
+    }
+    // stampSiAttempt closes EVERY key its run carried, so the run's other rows in
+    // this same snapshot are already done — re-stamping them would be harmless
+    // (applyAttempt dedupes) but would re-read the cd-ledger once per key.
+    if (closed.has(workflowId)) continue;
+    try {
+      const wf = (await client.send(new GetCommand({ TableName: table, Key: { workflowId } }))).Item;
+      if (!wf) {
+        // Do NOT invent an outcome for a run we cannot see. Rows are not deleted
+        // by any code path (archiving sets a flag), so this is an operator action
+        // and an operator's call to resolve.
+        console.warn(`[analyzer] si-reap: ${row.patternKey} names run ${workflowId}, which no longer exists — left in-run`);
+        continue;
+      }
+      const phase = terminalPhaseOf(wf);
+      if (!phase) {
+        live++;
+        continue;
+      }
+      const result = await stampSiAttempt(wf, phase, { ledger, s3, bucket });
+      closed.add(workflowId);
+      reaped.push({ patternKey: row.patternKey, workflowId, phase, outcome: result.outcome, stamped: result.stamped || [] });
+    } catch (err) {
+      console.error(`[analyzer] si-reap: ${row.patternKey} (run ${workflowId}) failed: ${err?.message || err}`);
+    }
+  }
+  if (candidates.length) {
+    console.log(`[analyzer] si-reap: ${candidates.length} in-run, ${live} still running, ${reaped.length} closed out`);
+  }
+  return { candidates: candidates.length, live, reaped };
+}
+
+/**
+ * The analysis ids on record for a run, or null when the read failed — null and
+ * "none" are different answers, and only the D5 check below is allowed to decide
+ * what to do about the difference.
+ */
+export async function analysisIdsFor(workflowId, { client = ddb, table = ANALYSES_TABLE } = {}) {
+  try {
+    const ids = new Set();
+    let ExclusiveStartKey;
+    do {
+      const page = await client.send(new QueryCommand({
+        TableName: table,
+        KeyConditionExpression: "workflowId = :w",
+        ExpressionAttributeValues: { ":w": workflowId },
+        ProjectionExpression: "analysisId",
+        ...(ExclusiveStartKey ? { ExclusiveStartKey } : {}),
+      }));
+      for (const item of page.Items || []) if (item?.analysisId) ids.add(String(item.analysisId));
+      ExclusiveStartKey = page.LastEvaluatedKey;
+    } while (ExclusiveStartKey);
+    return ids;
+  } catch (err) {
+    console.warn(`[analyzer] analyses read failed for ${workflowId}: ${err?.message || err}`);
+    return null;
+  }
+}
+
+/**
+ * Which analysis ids this session added → `[]` when it added none, or null when
+ * we genuinely do not know (either read failed). `analysisId` is minted per save
+ * as `<epoch-ms>-<4 random chars>` (toolkit/save_analysis.py), so a re-analysis
+ * always produces a NEW id and the growth check cannot be satisfied by an
+ * existing row.
+ *
+ * null must never be treated as failure: a throttled Query would then release
+ * the claim and re-run a perfectly good, already-persisted analysis — burning a
+ * harness session to fix a problem that does not exist.
+ */
+export function analysisDelta(before, after) {
+  if (!before || !after) return null;
+  return [...after].filter((id) => !before.has(id));
+}
+
+// ─── SI-VERIFY (daily) ─────────────────────────────────────────────────────────
+
+/**
+ * The daily "did the fixes work?" sweep. This Lambda computes NOTHING: the
+ * verdict rule is arithmetic that lives in one place, toolkit/si_verify.py, and
+ * the harness's only job is to run it and report what it printed. A verdict an
+ * LLM can reword is a verdict the loop can talk itself past, which is how the
+ * old loop re-filed asks it had already tried.
+ */
+export const SI_VERIFY_PROMPT =
+  "SI-VERIFY (daily sweep)\n" +
+  "Run the session bootstrap, then `python3 /mnt/workspace/toolkit/si_verify.py --apply` " +
+  "and report its output VERBATIM (the full Prior-attempts / verdict table, unedited).\n" +
+  "The script is the only judge: do not rule on any expectation yourself, do not re-word " +
+  "or summarise its verdicts, do not write to the si-ledger by any other route, and do not " +
+  "file, batch or synthesise anything in this session. If it exits non-zero, report the " +
+  "error output and stop.";
+
+export async function siVerify({ invoke = invokeHarness, now = Date.now() } = {}) {
+  const result = await invoke(SI_VERIFY_PROMPT, sessionId("wmverify", String(now)));
+  console.log(`[analyzer] SI-VERIFY stopReason=${result.stopReason} chars=${result.text.length}`);
+  return { action: "si-verify", stopReason: result.stopReason, summary: result.text.slice(0, 2000) };
+}
+
 // ─── WATCH ─────────────────────────────────────────────────────────────────────
 
 /**
@@ -307,12 +739,22 @@ function parkedOnHuman(wf) {
   );
 }
 
-async function watchScan() {
-  const now = Date.now();
+/**
+ * The 5-minute scan. Two jobs, in this order: close out SI attempts whose run has
+ * already ended (cheap, bounded, no model call), then WATCH the stale live runs.
+ * The sweep goes FIRST because the watch loop can spend the whole 900s budget on
+ * harness invocations, and a wedged `in-run` key must not wait on that.
+ *
+ * Collaborators are parameters with real defaults so the suite can drive this
+ * whole path over an in-memory table — nodejs20 has no `mock.module`.
+ */
+export async function watchScan({ client = ddb, ledger, s3, bucket, invoke = invokeHarness, now = Date.now() } = {}) {
+  const si = await siReapScan({ ledger, client, s3, bucket });
+
   const active = [];
   let ExclusiveStartKey;
   do {
-    const page = await ddb.send(new ScanCommand({
+    const page = await client.send(new ScanCommand({
       TableName: WORKFLOWS_TABLE,
       ProjectionExpression: "workflowId, phase, archived, managerWatch, wmLastWatchAt, startedAt, workflowDefId, humanNotifications, cancelledAt",
       ExclusiveStartKey,
@@ -330,7 +772,7 @@ async function watchScan() {
     const lastWatch = wf.wmLastWatchAt ? Date.parse(wf.wmLastWatchAt) : 0;
     if (now - lastWatch < COOLDOWN_MS) continue;
 
-    const lastEventAge = await lastSignificantEventAge(wf.workflowId, now);
+    const lastEventAge = await lastSignificantEventAge(wf.workflowId, now, client);
     // Age used to decide staleness AND to report in the prompt: event age when we
     // have events, else time since the run started (0 if we know neither).
     const staleAge = lastEventAge ?? (wf.startedAt ? now - Date.parse(wf.startedAt) : 0);
@@ -338,7 +780,7 @@ async function watchScan() {
 
     // Claim the watch slot BEFORE invoking — prevents intervention loops even
     // if the harness invocation itself is slow or this Lambda retries.
-    await ddb.send(new UpdateCommand({
+    await client.send(new UpdateCommand({
       TableName: WORKFLOWS_TABLE,
       Key: { workflowId: wf.workflowId },
       UpdateExpression: "SET wmLastWatchAt = :t",
@@ -350,7 +792,7 @@ async function watchScan() {
       `No significant events for ${Math.round(staleAge / 60000)} minutes. ` +
       `Diagnose and unstick if warranted.`;
     try {
-      const result = await invokeHarness(prompt, sessionId("wmwatch", wf.workflowId));
+      const result = await invoke(prompt, sessionId("wmwatch", wf.workflowId));
       console.log(`[analyzer] WATCH ${wf.workflowId} stopReason=${result.stopReason}`);
       watched.push(wf.workflowId);
     } catch (err) {
@@ -358,7 +800,7 @@ async function watchScan() {
     }
   }
   console.log(`[analyzer] watch scan: ${active.length} active, ${watched.length} watched`);
-  return { active: active.length, watched };
+  return { active: active.length, watched, si };
 }
 
 /** Age in ms of the newest non-streaming event, or null if none. */
@@ -368,8 +810,8 @@ async function watchScan() {
 // looking fresh no matter what the agent is doing (TEAM-3969).
 const NON_SIGNIFICANT_EVENT_TYPES = new Set(["agent.streaming", "orchestrator.nudge"]);
 
-async function lastSignificantEventAge(workflowId, now) {
-  const page = await ddb.send(new QueryCommand({
+async function lastSignificantEventAge(workflowId, now, client = ddb) {
+  const page = await client.send(new QueryCommand({
     TableName: EVENTS_TABLE,
     KeyConditionExpression: "workflowId = :w",
     ExpressionAttributeValues: { ":w": workflowId },

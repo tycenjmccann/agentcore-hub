@@ -14,6 +14,7 @@ rework, outcomes.
 ```bash
 python3 /mnt/workspace/toolkit/pull_dossier.py <wfId>
 python3 /mnt/workspace/toolkit/compute_metrics.py <wfId>
+python3 /mnt/workspace/toolkit/si_ledger.py keys           # every patternKey already tracked
 ```
 
 Read your knowledge file for this workflow definition:
@@ -131,11 +132,12 @@ EOF
   "verdict": "one-sentence assessment",
   "findings": [{"title": "", "kind": "bottleneck|failure|success|risk",
                 "severity": "critical|high|medium|low", "phase": "",
-                "agentId": null, "evidence": "cite ticket IDs + metric values"}],
+                "agentId": null, "evidence": "cite ticket IDs + metric values",
+                "patternKey": null}],
   "recommendations": [{"title": "", "priority": "P0|P1|P2",
                        "type": "workflow-def|prompt|gate-config|process|tooling",
                        "target": "phase/agent/gate", "description": "",
-                       "expectedImpact": ""}],
+                       "expectedImpact": "", "patternKey": "<area>.<slug>"}],
   "trend": {"priorRunsCompared": N,
             "deltas": {"totalDurationMs": null, "humanWaitTotalMs": null,
                        "changeRequests": null, "overallScore": null},
@@ -151,6 +153,41 @@ actionable against something concrete: a workflow def's phases/gates
 (`workflow-def`/`gate-config`), an agent prompt (`prompt`), the org's process
 (`process`), or tooling. `trend.deltas` are this run minus the most recent
 prior run (null when no prior).
+
+### `patternKey` — which defect class this is (required on P0/P1)
+
+Every **P0 and P1** recommendation must carry a `patternKey`; `save_analysis.py`
+rejects the analysis otherwise. It is optional on P2 and on findings, but a key
+you do write must be well-formed. The key is what makes an ask countable: it is
+how "the same fix has been recommended 8 times and 6 attempts changed nothing"
+becomes a number instead of a hunch, and how the SI loop refuses to re-synthesize
+an ask that is already in flight.
+
+**Reuse before you mint.** Read the `si_ledger.py keys` output from step 1 and
+reuse the existing key whenever the defect class is the same, even when the
+wording, the phase or the agent differs — one defect, one key, forever. Mint a new
+one only when no listed key is the same defect class.
+
+Form: `<area>.<slug>[.<slug>]` — lowercase, segments separated by `.`, words
+inside a segment by `-`, at least two segments. Name the **defect**, not the fix
+and not the run:
+
+```
+harness.silent-death.exit-without-report     good — the failure mode
+ci.flake.timeout                             good
+ops.paging.out-of-hours                      good
+fix-the-harness                              bad  — names the fix, single segment
+TEAM-4711.retry                              bad  — names a ticket, uppercase
+prompt_tuning                                bad  — underscore, no area/slug split
+```
+
+A key is not a severity: `severity` comes from the finding that names the same
+key, or from the priority when no finding does. Saving the analysis records one
+sighting per key in the ledger — so re-running ANALYZE on the same run does not
+double-count, but describing one defect under two keys does. `save_analysis.py`
+prints `patternKeys` (recorded) and `ledgerErrors` (attempted and failed); if
+`ledgerErrors` is non-empty, say so in your step-6 report — the analysis saved but
+the ask is not being tracked yet.
 
 `kpiVersion` is the only optional field: copy `metrics.kpiVersion` (`null` when
 there was no card). It records which version of the scoring config produced the

@@ -6,6 +6,7 @@ import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import agentsConfig from "@/config/agents.json";
 import ScoreChip from "./components/ScoreChip";
+import SiImpactPanel from "./components/SiImpactPanel";
 import Sparkline from "./components/Sparkline";
 import WindowSelector from "./components/WindowSelector";
 import { parseWindow, windowLabel as fallbackWindowLabel } from "./components/window";
@@ -713,6 +714,14 @@ function EvaluationsOverview() {
           </div>
         </div>
       )}
+
+      {/*
+        The table above answers "is the loop running"; this answers "did the
+        fixes work". Mounted OUTSIDE the `cols.length > 0` guard and loading its
+        own data: the ledger is not per-agent and not windowed, so an empty
+        evaluations roster must not hide it.
+      */}
+      <SiImpactPanel />
     </div>
   );
 }
