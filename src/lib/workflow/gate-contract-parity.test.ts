@@ -305,6 +305,50 @@ describe("gateVerificationSlots — which stamps a close replaces (TEAM-4750 B2)
   });
 });
 
+describe("the pipeline label cap agrees (TEAM-4750 B3)", () => {
+  const name = (len: number) => "h" + "u".repeat(len - 1);
+
+  it("both copies cap the regex and the name at the same value", () => {
+    expect(agree("MAX_PIPELINE_NAME", (m) => m.MAX_PIPELINE_NAME)).toBe(55);
+    expect(agree("PIPELINE_LABEL_PREFIX", (m) => m.PIPELINE_LABEL_PREFIX)).toBe("pipeline:");
+    expect(agree("PIPELINE_LABEL_RE source", (m) => m.PIPELINE_LABEL_RE.source)).toBe(
+      "^pipeline[:-]([a-z0-9][a-z0-9._-]{0,54})$"
+    );
+  });
+
+  it("finds the same offending RAW label, before any truncation", () => {
+    const over = `pipeline:${name(56)}`;
+    expect(agree("overflow: found", (m) => m.pipelineLabelOverflow(["gate:deploy-approval", over]))).toBe(
+      over
+    );
+    expect(agree("overflow: hyphen spelling", (m) => m.pipelineLabelOverflow([`pipeline-${name(56)}`]))).toBe(
+      `pipeline-${name(56)}`
+    );
+    // Exactly at the cap is fine — that is the whole point of naming the number.
+    expect(agree("overflow: at the cap", (m) => m.pipelineLabelOverflow([`pipeline:${name(55)}`]))).toBeNull();
+    expect(agree("overflow: none", (m) => m.pipelineLabelOverflow(["gate:blocker"]))).toBeNull();
+    expect(agree("overflow: junk", (m) => m.pipelineLabelOverflow(null))).toBeNull();
+    // A long label in another namespace is somebody else's problem (sanitizeUserLabels
+    // truncates it and no reader forwards it to a probe).
+    expect(agree("overflow: other namespace", (m) => m.pipelineLabelOverflow([`wf:${name(90)}`]))).toBeNull();
+  });
+
+  it("refuses in the same words, naming both limits", () => {
+    const over = `pipeline:${name(56)}`;
+    const refusal = agree("refusal", (m) => m.pipelineLabelRefusal(over)) as {
+      ok: boolean;
+      reason: string;
+      hint: string;
+    };
+    expect(refusal.ok).toBe(false);
+    expect(refusal.reason).toBe(agree("GATE_CONDITION_UNMET", (m) => m.GATE_CONDITION_UNMET));
+    // Both numbers, so an agent can act on it instead of guessing at "too long".
+    expect(refusal.hint).toContain("64");
+    expect(refusal.hint).toContain("55");
+    expect(refusal.hint).toContain("TRUNCATED");
+  });
+});
+
 describe("the probe's shape agrees", () => {
   it("PROBE_TOOLS is the same read-only allow-list in both copies", () => {
     expect(agree("PROBE_TOOLS", (m) => m.PROBE_TOOLS)).toEqual([

@@ -182,7 +182,7 @@ const CONTROL_CHARS_RE = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g;
 const MAX_INVARIANT = 2000;
 const MAX_REPRO = 1000;
 const MAX_SIBLING_SCOPE = 500;
-const MAX_LABEL = 64;
+export const MAX_LABEL = 64; // exported: gate-contract.mjs derives its own caps from it
 
 const OPEN_MARKER = "# fix-contract v1";
 const CLOSE_MARKER = "# /fix-contract";

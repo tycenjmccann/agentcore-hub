@@ -62,6 +62,8 @@ import {
   gateVerificationSlots,
   invokeProbe,
   parseFixDecision,
+  pipelineLabelOverflow,
+  pipelineLabelRefusal,
   probedGateKindOf,
   publishJourneyEvent,
   verifyGateCondition,
@@ -1126,6 +1128,17 @@ async function createTicket(args) {
   const baseBranchCheck = validateBaseBranch(base_branch);
   if (!baseBranchCheck.ok) return textResult(`Error: ${baseBranchRefusal(base_branch)}`);
   const baseBranch = baseBranchCheck.value;
+
+  // TEAM-4750 B3: an over-long `pipeline:` label is refused, not stored. It has to
+  // be checked HERE — on the RAW label, before sanitizeUserLabels truncates it to
+  // MAX_LABEL — because after truncation the label still matches PIPELINE_LABEL_RE
+  // and names a DIFFERENT pipeline, which the gate would then be verified against.
+  // Before nextTicketId too, so a refusal consumes no ticket number.
+  const longPipelineLabel = pipelineLabelOverflow(labels);
+  if (longPipelineLabel) {
+    const refusal = pipelineLabelRefusal(longPipelineLabel);
+    return { ...refusal, ...textResult(refusal.hint) };
+  }
 
   // Caller-supplied labels are sanitized independently of the contract flag —
   // dropping a label that squats a system namespace (fix:/wf:/agent:/…) is a

@@ -2,7 +2,12 @@ import { describe, it, expect, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
-import { GATE_KINDS, GATE_LABEL_RE, gateKindsOf } from "../../../lambda/orchestrator/fix-contract.mjs";
+import {
+  GATE_KINDS,
+  GATE_LABEL_RE,
+  MAX_LABEL,
+  gateKindsOf,
+} from "../../../lambda/orchestrator/fix-contract.mjs";
 import { parseDecision } from "../../../lambda/orchestrator/review-cap.mjs";
 import { gateSlug } from "./intake-materialize";
 import workflowDefs from "../../config/workflows.json";
@@ -59,8 +64,12 @@ import {
   HEAD_LABEL_RE,
   EXEC_LABEL_RE,
   MERGE_GATE_LABEL_RE,
+  MAX_PIPELINE_NAME,
+  PIPELINE_LABEL_PREFIX,
+  PIPELINE_LABEL_RE,
   gateHeadOf,
   gateExecOf,
+  gatePipelineOf,
   parseFixDecision,
   invokeProbe,
   PROBE_TOOLS,
@@ -107,6 +116,12 @@ describe("every gate-label reader accepts BOTH spellings", () => {
     ],
     ["gate-contract gateHeadOf", (l) => gateHeadOf([l]) === SHA, `head:${SHA}`, `head-${SHA}`],
     ["gate-contract gateExecOf", (l) => gateExecOf([l]) === UUID, `exec:${UUID}`, `exec-${UUID}`],
+    [
+      "gate-contract PIPELINE_LABEL_RE",
+      (l) => PIPELINE_LABEL_RE.test(l),
+      "pipeline:hub-x-deploy",
+      "pipeline-hub-x-deploy",
+    ],
     [
       "bridge DEPLOY_APPROVAL_LABEL_RE",
       (l) => bridgeRegex("DEPLOY_APPROVAL_LABEL_RE").test(l),
@@ -156,6 +171,40 @@ describe("every gate-label reader accepts BOTH spellings", () => {
     // gateKindsOf trims, so the trailing-space form IS a gate for it — the readers
     // differ here on purpose: the regex is exact, the reader normalizes first.
     expect(gateKindsOf(["gate:blocker "])).toEqual(["blocker"]);
+  });
+});
+
+describe("PIPELINE_LABEL_RE cannot match a name a label could not carry (TEAM-4750 B3)", () => {
+  // The regex used to admit 128 chars while a label caps at MAX_LABEL, so an
+  // over-long `pipeline:<name>` was TRUNCATED into a shorter name that still
+  // matched — and the gate was then verified against a pipeline nobody named. The
+  // regex literal cannot interpolate the constant, so this is where the two are
+  // pinned against each other.
+  const name = (len: number) => "h" + "u".repeat(len - 1);
+
+  it("MAX_PIPELINE_NAME is exactly what is left of a label after the prefix", () => {
+    expect(PIPELINE_LABEL_PREFIX).toBe("pipeline:");
+    expect(MAX_PIPELINE_NAME).toBe(MAX_LABEL - PIPELINE_LABEL_PREFIX.length);
+    expect(MAX_PIPELINE_NAME).toBe(55);
+    // …and the longest label the regex accepts is exactly one label's worth.
+    expect(`${PIPELINE_LABEL_PREFIX}${name(MAX_PIPELINE_NAME)}`).toHaveLength(MAX_LABEL);
+  });
+
+  it("matches a name of MAX_PIPELINE_NAME chars and stops one char later", () => {
+    for (const sep of [":", "-"]) {
+      const fits = `pipeline${sep}${name(MAX_PIPELINE_NAME)}`;
+      const over = `pipeline${sep}${name(MAX_PIPELINE_NAME + 1)}`;
+      expect(PIPELINE_LABEL_RE.test(fits), fits).toBe(true);
+      expect(PIPELINE_LABEL_RE.test(over), over).toBe(false);
+      // The reader agrees with the regex, and never returns a partial name.
+      expect(gatePipelineOf([fits])).toBe(name(MAX_PIPELINE_NAME));
+      expect(gatePipelineOf([over])).toBeNull();
+    }
+  });
+
+  it("still reads the real registry names, which are nowhere near the cap", () => {
+    expect(gatePipelineOf(["pipeline:agentcore-hub-deploy"])).toBe("agentcore-hub-deploy");
+    expect(gatePipelineOf(["pipeline:hub-agentcore-hub-deploy"])).toBe("hub-agentcore-hub-deploy");
   });
 });
 

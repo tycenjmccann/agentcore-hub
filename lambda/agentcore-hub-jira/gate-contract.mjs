@@ -62,7 +62,7 @@
 
 import { LambdaClient, InvokeCommand } from "@aws-sdk/client-lambda";
 import { PutCommand } from "@aws-sdk/lib-dynamodb";
-import { GATE_KINDS, gateKindsOf } from "./fix-contract.mjs";
+import { GATE_KINDS, gateKindsOf, MAX_LABEL } from "./fix-contract.mjs";
 
 // ── Label grammar ───────────────────────────────────────────────────────────
 // Labels arrive in two spellings and must read identically: agents write the
@@ -109,11 +109,65 @@ export function gateExecOf(labels) {
 // so the charset is narrowed to what an AWS resource name can be. Nothing here
 // derives the CI/build project names from it: pipelineProjects() (and its TS
 // mirror) is the one place allowed to do that.
-export const PIPELINE_LABEL_RE = /^pipeline[:-]([a-z0-9][a-z0-9._-]{0,127})$/i;
+//
+// The LENGTH is capped at what a label can actually carry (TEAM-4750 B3). A label
+// is MAX_LABEL = 64 chars (fix-contract.mjs's sanitizeUserLabels truncates there,
+// and normalizeSystemLabel rejects past it), the `pipeline:` prefix costs 9, and
+// the first character is matched separately — so the tail is
+// MAX_PIPELINE_NAME - 1 = 54. The regex literal cannot interpolate the constant;
+// gate-label-readers.test.ts pins the two against each other instead.
+export const PIPELINE_LABEL_PREFIX = "pipeline:";
+export const MAX_PIPELINE_NAME = MAX_LABEL - PIPELINE_LABEL_PREFIX.length; // 55
+export const PIPELINE_LABEL_RE = /^pipeline[:-]([a-z0-9][a-z0-9._-]{0,54})$/i;
 
 /** The pipeline a gate ticket is bound to, from `pipeline:<name>`. */
 export function gatePipelineOf(labels) {
   return firstCapture(labels, PIPELINE_LABEL_RE);
+}
+
+/**
+ * The RAW caller label that cannot survive being stored, or null (TEAM-4750 B3).
+ *
+ * Capping PIPELINE_LABEL_RE is not enough on its own, and this is the subtle half of
+ * the bug: `sanitizeUserLabels` truncates a label to MAX_LABEL, which leaves a
+ * pipeline name of exactly MAX_PIPELINE_NAME chars — still a match, but a DIFFERENT
+ * name than the caller asked for. validateGateTicketShape would then probe, and the
+ * human would later be paged about, a pipeline nobody named. Truncation cannot be
+ * detected after the fact, so it has to be refused before it happens.
+ *
+ * Deliberately runs on the caller's labels BEFORE sanitizeUserLabels, and matches
+ * loosely (`/^pipeline[:-]/i`) rather than through PIPELINE_LABEL_RE: the label we
+ * must catch is precisely the one that does not match once it is too long.
+ *
+ * @returns {string|null} the offending label as the caller wrote it
+ */
+export function pipelineLabelOverflow(labels) {
+  const list = Array.isArray(labels) ? labels : typeof labels === "string" ? labels.split(",") : [];
+  for (const raw of list) {
+    const label = String(raw ?? "").trim();
+    if (/^pipeline[:-]/i.test(label) && label.length > MAX_LABEL) return label;
+  }
+  return null;
+}
+
+/**
+ * The refusal for the above, built HERE so both twins refuse in the same words —
+ * each one only has to deliver it in its own idiom (textResult vs a thrown
+ * err.toolResult). Names both limits, because "too long" without the number is not
+ * something an agent can act on.
+ */
+export function pipelineLabelRefusal(label) {
+  const name = String(label ?? "").replace(/^pipeline[:-]/i, "");
+  return {
+    ok: false,
+    reason: GATE_CONDITION_UNMET,
+    hint:
+      `the \`pipeline:\` label is ${String(label ?? "").length} characters, over the ${MAX_LABEL}-character limit for a ` +
+      `label — it would be silently TRUNCATED to a different pipeline name than you asked for, and this gate would ` +
+      `then be verified against that wrong name. The pipeline name itself may be at most ${MAX_PIPELINE_NAME} ` +
+      `characters (got ${name.length}): use the CD registry's \`pipeline\` value for this repo, which is the name the ` +
+      `hub can actually reach.`,
+  };
 }
 
 // ── The labels the guard itself writes ──────────────────────────────────────

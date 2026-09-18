@@ -56,6 +56,8 @@ import {
   gateVerificationSlots,
   invokeProbe,
   parseFixDecision,
+  pipelineLabelOverflow,
+  pipelineLabelRefusal,
   probedGateKindOf,
   publishJourneyEvent,
   verifyGateCondition,
@@ -1159,6 +1161,19 @@ async function createTicket(params) {
       `Invalid assignee "${assignee}". Valid agents: ${valid}. ` +
       `Note: There is NO "agentcore_hub_ios_dev" agent. ALL iOS/SwiftUI/Android/Web development goes to "agentcore_hub_frontend_dev".`
     );
+  }
+
+  // TEAM-4750 B3: an over-long `pipeline:` label is refused, not stored. It has to
+  // be checked HERE — on the RAW label, before sanitizeUserLabels truncates it to
+  // MAX_LABEL — because after truncation the label still matches PIPELINE_LABEL_RE
+  // and names a DIFFERENT pipeline, which the gate would then be verified against.
+  // Before the issue is created, so a refusal leaves nothing behind.
+  const longPipelineLabel = pipelineLabelOverflow(labels);
+  if (longPipelineLabel) {
+    const refusal = pipelineLabelRefusal(longPipelineLabel);
+    const err = new Error(refusal.hint);
+    err.toolResult = refusal;
+    throw err;
   }
 
   // TEAM-4739: hoisted from where the label list is assembled (it used to run just
