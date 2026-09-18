@@ -120,6 +120,15 @@ aws iam put-role-policy --role-name agentcore-hub-lambda-role \
   }" >/dev/null
 echo "✓ IAM: WorkflowManagerAccess policy on agentcore-hub-lambda-role"
 
+# TEAM-4770: IAM_ONLY=1 applies the tables + IAM above and stops here, so
+# scripts/si-ledger-handoff.sh can re-apply the lambda-role ledger grant without
+# redeploying code or replacing Lambda env (the CD pipeline owns those).
+# Env var, not a flag — this script rejects all CLI arguments (see the top).
+if [ "${IAM_ONLY:-}" = "1" ]; then
+  echo "IAM_ONLY=1 — stopping before code + env deploy (tables + IAM applied)"
+  exit 0
+fi
+
 # ─── Toolkit sync (updates take effect on the next harness session) ──────────
 # fixtures/ is test-only (real reduced dossiers the unit tests assert against) —
 # it is hundreds of KB the harness never reads. Keep this exclude list identical
