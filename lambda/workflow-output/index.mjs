@@ -780,37 +780,56 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
     console.warn(`[report_completion] ${ticket_id}: outcome empty_sweep and the sibling roster is readable but EMPTY${epicKey ? ` under ${epicKey}` : " (the ticket has no parent)"} - nothing to skip`);
   }
 
-  // TEAM-4740 FR-13, moved BEFORE the own transition by TEAM-4752 D2.
+  // TEAM-4740 FR-13, moved BEFORE the own transition by TEAM-4752 D2 and made a
+  // PRECONDITION of it by TEAM-4754 N2.
   //
   // The transition below CASCADES: the orchestrator sees "done", unblocks the
   // dependents and re-evaluates whether the epic is complete. A follow-up filed
   // after that point is filed into a run that may already have closed — and for the
   // run's LAST ticket (the CD ticket, with nothing else open) that is not
   // theoretical: completion.mjs rule iii can only refuse to close on a fix ticket
-  // that EXISTS. Same ordering argument as FR-10's skip pass above.
+  // that EXISTS. Same ordering argument as FR-10's skip pass above. N2 adds the
+  // other half: filing FIRST only helps if failing to file also stops the cascade.
   //
-  // Still wrapped, and still internally fail-open: the completion record is already
-  // durable in S3, so a materialization throw must not cost the ticket its Done
-  // transition (the catch falls through to it) and must not surface as an "Error:"
-  // the agent would retry, re-running the whole report. What that costs is a slow
-  // create pushing the transition later in the same invoke — bounded by the SEC-11
-  // cap of 5 entries against a 60 s Lambda budget.
+  // Still wrapped, and still a value rather than an "Error:" the agent cannot act
+  // on: the completion record is already durable in S3. What the catch does NOT do
+  // any more is fall through to the transition — TEAM-4754 N2 marks every entry
+  // retryable, and the gate below withholds Done on exactly that. What this costs
+  // is a slow create pushing the transition later in the same invoke — bounded by
+  // the SEC-11 cap of 5 entries against a 60 s Lambda budget.
   let materialized = { created: [], skipped: [], failed: [] };
   if (followUps.entries.length > 0) {
     try {
       materialized = await materializeFollowUps({
         entries: followUps.entries, siblings: scan.siblings, scanOk: scan.ok,
-        ticketId: ticket_id, workflowId: workflow_id, epicKey,
+        ticketId: ticket_id, workflowId: workflow_id, epicKey, issueError,
       });
     } catch (err) {
-      console.error(`[report_completion] ${ticket_id}: follow-up materialization threw (${err.name}: ${err.message}) - the completion STANDS and the ticket is still transitioned`);
-      materialized = { created: [], skipped: [], failed: followUps.entries.map((e) => ({ hash: e.hash, kind: e.kind, title: e.title, reason: `${err.name}: ${err.message}` })) };
+      console.error(`[report_completion] ${ticket_id}: follow-up materialization threw (${err.name}: ${err.message}) - the record STANDS but the ticket is NOT transitioned (retryable)`);
+      materialized = { created: [], skipped: [], failed: followUps.entries.map((e) => failedEntry(e, `${err.name}: ${err.message}`)) };
     }
   }
 
+  // ─── TEAM-4754 N2: the transition is CONDITIONAL on the dependent write ───────
+  //
+  // The rule: a dependent write that failed in a way a retry could fix means we do
+  // NOT proceed as if it succeeded. Transitioning here cascades — the orchestrator
+  // unblocks the dependents and re-evaluates whether the epic is complete — so for
+  // the run's LAST ticket a Done on top of a failed create closes the run over a
+  // follow-up that does not exist, and the only trace is a nested field nothing
+  // reads. Withholding Done keeps the ticket the one place the work is still owned.
+  //
+  // Only RETRYABLE rows hold it. `epic_unresolved` (the ticket provably has no
+  // parent) is a definite negative no retry can change, so it stays disclosed on
+  // the response and the ticket goes Done as before.
+  const pendingFollowUps = materialized.failed.filter((f) => f.retryable);
+  const mayTransition = pendingFollowUps.length === 0;
+
   // Transition ticket to Done in Jira — this triggers the webhook cascade
   // (orchestrator unblocks downstream tickets when it sees "done")
-  if (ticket_id && !ticket_id.startsWith("HEALTHCHECK-") && !ticket_id.startsWith("TEST-")) {
+  if (!mayTransition) {
+    console.error(`[report_completion] ${ticket_id}: Done WITHHELD - ${pendingFollowUps.length} retryable follow-up failure(s) (${pendingFollowUps.map((f) => `${f.kind}: ${f.reason}`).join("; ")}) - the record is saved, the agent must retry report_completion`);
+  } else if (ticket_id && !ticket_id.startsWith("HEALTHCHECK-") && !ticket_id.startsWith("TEST-")) {
     try {
       const resp = await lambda.send(new InvokeCommand({
         FunctionName: TICKET_TOOLS_LAMBDA,
@@ -832,8 +851,13 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   }
 
   return {
-    status: "complete",
-    message: `Completion saved for ${ticket_id}. Ticket transitioned to Done.`,
+    // A report with no follow-ups, or whose follow-ups all landed, is
+    // byte-identical to pre-4754: `status: "complete"` and no `next_action`.
+    status: mayTransition ? "complete" : "complete_pending_follow_ups",
+    ...(mayTransition ? {} : { next_action: "retry_report_completion" }),
+    message: mayTransition
+      ? `Completion saved for ${ticket_id}. Ticket transitioned to Done.`
+      : `Completion for ${ticket_id} is SAVED (the record is durable and idempotent) but ${pendingFollowUps.length} follow-up ticket(s) could NOT be created, so ${ticket_id} was NOT transitioned to Done. Call WorkflowOutput___report_completion again with the SAME arguments: the retry re-scans the epic, follow-ups that already exist are skipped as already_materialized, and only the missing ones are created. The ticket goes Done as soon as every entry lands. If it keeps failing, comment the failed entries on the ticket and report BLOCKED - do not walk away.`,
     // Additive: absent entirely on a report that carried no follow_ups and whose
     // run has no cd-ledger, so an existing caller's response is unchanged.
     ...(droppedFollowUps.length > 0 ? { droppedFollowUps } : {}),
@@ -924,6 +948,40 @@ async function updateManifest(workflowId, agentId, entries) {
  */
 export const FOLLOW_UP_KINDS = ["post_deploy_verification", "console_handoff", "iam_handoff", "fix", "docs"];
 export const FOLLOW_UP_OWNERS = ["agent", "human"];
+
+/**
+ * TEAM-4754 N2 — the reason a follow-up failed decides whether the reporting
+ * ticket may go Done.
+ *
+ * `epic_unresolved` is the ONE definite negative in the set: get_issue succeeded
+ * and the ticket provably has no parent. A parentless ticket is invisible to the
+ * run — it gates nothing and appears in no phase — so no number of retries will
+ * produce an epic to file under, and withholding Done would strand finished work
+ * forever. Everything else (a create that failed, an unreadable sibling roster, an
+ * unreadable ticket, a throw) is a TRANSIENT failure a retry can fix, so it
+ * withholds the transition.
+ *
+ * `ticket_unreadable` is the sibling D1 already drew for empty_sweep: "the ticket
+ * says it has no parent" and "we could not read the ticket" are different answers,
+ * and only the first one licenses closing anything.
+ */
+export const FOLLOW_UP_TICKET_UNREADABLE = "ticket_unreadable";
+export const FOLLOW_UP_EPIC_UNRESOLVED = "epic_unresolved";
+export const FOLLOW_UP_SCAN_FAILED = "sibling_scan_failed";
+export const FOLLOW_UP_NONRETRYABLE_REASONS = [FOLLOW_UP_EPIC_UNRESOLVED];
+/**
+ * Default RETRYABLE, deliberately. The retryable set is open-ended — a create
+ * failure's reason is whatever string the ticket Lambda produced — so an unknown
+ * reason must fail SAFE (withhold Done, tell the agent to retry) rather than
+ * silently closing a ticket whose follow-up does not exist.
+ */
+export function followUpRetryable(reason) {
+  return !FOLLOW_UP_NONRETRYABLE_REASONS.includes(reason);
+}
+/** One shape for every `failed[]` row, so `retryable` cannot be forgotten at one of the four sites. */
+function failedEntry(entry, reason) {
+  return { hash: entry.hash, kind: entry.kind, title: entry.title, reason, retryable: followUpRetryable(reason) };
+}
 
 /**
  * SEC-11 caps. Five entries and 8 KB are both "enough for any real run, far too
@@ -1558,7 +1616,7 @@ export function followUpCreateParams({ entry, ticketId, workflowId, epicKey, cdT
 /**
  * Materialize the surviving entries. Runs AFTER the record write and BEFORE the
  * ticket's own Done transition, and every failure is a logged value on the
- * response — the completion stays `ok`.
+ * response — the completion record stays durable either way.
  *
  * TEAM-4752 D2 moved it before that transition. It used to run last, which left a
  * real race rather than a theoretical one: the Done transition cascades, the
@@ -1567,12 +1625,20 @@ export function followUpCreateParams({ entry, ticketId, workflowId, epicKey, cdT
  * ticket, with nothing else open — the epic could therefore roll to `complete`
  * before the agent-owned follow-up this report is handing on had been filed.
  *
- * The trade that replaces it: the record is already durable in S3 before this
- * runs, so the only risk left is a slow ticket Lambda pushing the transition
- * later in the same invoke. That is bounded — at most 5 entries (SEC-11) against
- * a 60 s budget — and the caller wraps this in a try/catch, so even a throw
- * leaves the transition to happen. What was closed is unbounded: a follow-up that
- * never gated the epic it was created to gate.
+ * TEAM-4754 N2 finishes that pair. D2 fixed the ORDER; ordering alone still let a
+ * report whose every follow-up FAILED transition the ticket to Done and answer
+ * `status: "complete"`, which reopened the same hole one step down: the CD ticket
+ * closes, the epic rolls complete, and the follow-up never exists. So a `failed[]`
+ * row whose reason is RETRYABLE (see followUpRetryable) now WITHHOLDS the caller's
+ * Done transition and the caller answers `complete_pending_follow_ups`. The record
+ * is already durable and idempotent, so retrying the whole report is cheap; the
+ * dedupe below is what makes it duplicate-safe.
+ *
+ * The trade that D2 made stands: the only cost left is a slow ticket Lambda
+ * pushing the transition later in the same invoke, bounded at 5 entries (SEC-11)
+ * against a 60 s budget. The caller still wraps this in a try/catch — but that
+ * catch now marks every entry retryable and therefore ALSO withholds the
+ * transition, rather than falling through to it.
  *
  * TEAM-4752 D1: `scanOk: false` (the sibling roster is unknown) creates NOTHING.
  * The dedupe below is the whole defence against duplicate follow-ups on a
@@ -1580,26 +1646,33 @@ export function followUpCreateParams({ entry, ticketId, workflowId, epicKey, cdT
  * is exactly how FR-13's `(ticketId, kind, title)` key gets violated. Every entry
  * comes back as `failed[*].reason = "sibling_scan_failed"` and the persona can
  * retry safely, because the `[fu:<8hex>]` title dedupe now runs against a roster
- * that is either right or absent.
+ * that is either right or absent. Under N2 that roster failure holds the
+ * transition too — the retry it already invited is now actually required.
  */
-async function materializeFollowUps({ entries, siblings, scanOk = true, ticketId, workflowId, epicKey }) {
+async function materializeFollowUps({ entries, siblings, scanOk = true, ticketId, workflowId, epicKey, issueError = null }) {
   const created = [];
   const skipped = [];
   const failed = [];
   if (!entries.length) return { created, skipped, failed };
   if (!epicKey) {
-    // No epic ⇒ no parent. A parentless ticket is invisible to the run: it gates
-    // nothing and shows up in no phase, so telling the agent is more useful than
-    // filing it.
-    console.error(`[report_completion] ${ticketId}: cannot materialize ${entries.length} follow-up(s) - the epic (parent) could not be resolved`);
-    return { created, skipped, failed: entries.map((e) => ({ hash: e.hash, kind: e.kind, title: e.title, reason: "epic_unresolved" })) };
+    // TEAM-4754 N2 — the same distinction D1 drew for empty_sweep, and it decides
+    // whether the caller may go Done. `issueError` set ⇒ we could not READ the
+    // ticket, so its epic is UNKNOWN and a retry may well resolve it
+    // (`ticket_unreadable`, retryable). No error ⇒ get_issue answered and the
+    // ticket provably has NO parent: it is invisible to the run, gates nothing and
+    // appears in no phase, so telling the agent is more useful than filing it and
+    // more useful than blocking its completion forever (`epic_unresolved`, not
+    // retryable).
+    const reason = issueError ? FOLLOW_UP_TICKET_UNREADABLE : FOLLOW_UP_EPIC_UNRESOLVED;
+    console.error(`[report_completion] ${ticketId}: cannot materialize ${entries.length} follow-up(s) - ${issueError ? `the ticket could not be read (${issueError}), so its epic (parent) is UNKNOWN` : "the ticket provably has no epic (parent)"} [${reason}]`);
+    return { created, skipped, failed: entries.map((e) => failedEntry(e, reason)) };
   }
   if (!scanOk) {
     // TEAM-4752 D1: fail CLOSED. Creating here would be creating blind — the
     // dedupe set below would be empty for the same reason the roster is, so a
     // redelivered report files a second copy of every follow-up.
     console.error(`[report_completion] ${ticketId}: cannot materialize ${entries.length} follow-up(s) - the sibling scan under ${epicKey} failed, so a duplicate cannot be ruled out`);
-    return { created, skipped, failed: entries.map((e) => ({ hash: e.hash, kind: e.kind, title: e.title, reason: "sibling_scan_failed" })) };
+    return { created, skipped, failed: entries.map((e) => failedEntry(e, FOLLOW_UP_SCAN_FAILED)) };
   }
   const cd = findCdTicket(siblings, { exclude: ticketId });
   const cdTicketId = cd && !isDoneStatus(cd.status) ? cd.ticketId : null;
@@ -1617,7 +1690,7 @@ async function materializeFollowUps({ entries, siblings, scanOk = true, ticketId
     const r = await ticketTool("Tickets___create_ticket", params);
     if (!r.ok) {
       console.error(`[report_completion] ${ticketId}: follow-up "${entry.title}" (${entry.kind}) FAILED to materialize - ${r.error}`);
-      failed.push({ hash: entry.hash, kind: entry.kind, title: entry.title, reason: r.error });
+      failed.push(failedEntry(entry, r.error));
       continue;
     }
     const newId = r.payload?.key || r.payload?.ticketId || r.payload?.ticket?.key || null;

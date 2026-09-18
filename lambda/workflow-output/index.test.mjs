@@ -46,6 +46,10 @@ const h = vi.hoisted(() => ({
   // express — the skip walk's whole shape is "skip, and if THAT one is refused, block
   // then skip", so a test has to be able to refuse one ticket or one transition_id.
   transitionGate: null,
+  // TEAM-4754 N2: per-CALL create control, for the same reason `transitionGate`
+  // exists — "the second of two follow-ups fails" is the case the transition gate
+  // is actually about, and `ticketFail` (keyed on the tool) fails both or neither.
+  createGate: null,
   // FR-11: the workflows-table row `submit_ticket_plan` reads `featureBranch` off,
   // plus every Get it issued and an optional throw (the fail-open path).
   workflow: null, workflowGets: [], workflowGetError: null,
@@ -152,6 +156,16 @@ vi.mock("@aws-sdk/client-lambda", () => ({
       }
       if (tool === "Tickets___list_tickets") return reply({ total: h.siblings.length, issues: h.siblings });
       if (tool === "Tickets___create_ticket") {
+        // TEAM-4754 N2: a per-call refusal. `null` from the gate throws a
+        // NON-Error, which is the only way to reach reportCompletion's OUTER catch:
+        // ticketTool's own catch reads `err.name`, so a nullish throw raises a
+        // TypeError inside it and escapes. A thrown Error would just come back as a
+        // per-entry `failed[]` row, which the `false` verdict already covers.
+        if (h.createGate) {
+          const verdict = h.createGate(params);
+          if (verdict === null) throw null; // eslint-disable-line no-throw-literal
+          if (verdict === false) return reply({ content: [{ type: "text", text: `Error: create_ticket refused ${params.summary}` }] });
+        }
         const key = `TEAM-49${String(h.created.length + 1).padStart(2, "0")}`;
         h.created.push({ key, params });
         // A created follow-up IS a sibling from that moment on. Appending it is what
@@ -251,6 +265,7 @@ beforeEach(() => {
   h.siblings.length = 0;
   h.ticketFail.clear();
   h.transitionGate = null;
+  h.createGate = null;
   h.issue = undefined;
   h.headError = null;
   h.objects.clear();
@@ -926,15 +941,21 @@ describe("report_completion — FR-13 materialization", () => {
     }]);
   });
 
-  it("a create failure is reported per entry and the completion still succeeds", async () => {
+  // TEAM-4754 N2 — this test asserted the DEFECT in its own title: the completion
+  // "still succeeded" and the ticket went Done on top of a follow-up that does not
+  // exist. The record is still durable; what is withheld is the cascade.
+  it("a create failure is reported per entry and WITHHOLDS the Done transition", async () => {
     h.siblings.push(CD);
     h.ticketFail.add("Tickets___create_ticket");
     const res = result(await report({ follow_ups: FU() }));
-    expect(res.status).toBe("complete");
-    expect(transitioned()).toBe(true);
+    expect(res.status).toBe("complete_pending_follow_ups");
+    expect(res.next_action).toBe("retry_report_completion");
+    expect(transitioned()).toBe(false);
     expect(res.followUpsMaterialized.created).toEqual([]);
     expect(res.followUpsMaterialized.failed[0].reason).toMatch(/unavailable/);
-    // The record still names the work, so nothing is lost but the ticket.
+    expect(res.followUpsMaterialized.failed[0].retryable).toBe(true);
+    // The record still names the work, so nothing is lost but the transition.
+    expect(wroteRecord()).toBe(true);
     expect(record().followUps).toHaveLength(1);
   });
 
@@ -943,50 +964,62 @@ describe("report_completion — FR-13 materialization", () => {
   // create was blind, and a redelivered report (the orchestrator retries) filed a
   // second copy of every entry — the exact duplicate FR-13's (ticketId, kind,
   // title) key exists to prevent.
-  it("a failed sibling scan creates NOTHING — the completion stands, the entries come back failed", async () => {
+  it("a failed sibling scan creates NOTHING — the record stands, the transition does not", async () => {
     h.siblings.push(CD);
     h.ticketFail.add("Tickets___list_tickets");
     const res = result(await report({ follow_ups: FU() }));
-    // The completion itself is durable and the ticket still goes Done: the work
-    // WAS done, and refusing the report over a follow-up would throw that away.
-    expect(res.status).toBe("complete");
+    // The completion record is durable — the work WAS done, and refusing the whole
+    // report would throw that away. TEAM-4754 N2: the Done transition is what waits,
+    // because it CASCADES and the follow-up it would cascade past does not exist.
+    expect(res.status).toBe("complete_pending_follow_ups");
     expect(wroteRecord()).toBe(true);
-    expect(transitioned()).toBe(true);
-    // The record still NAMES the work, so nothing is lost but the ticket.
+    expect(transitioned()).toBe(false);
+    // The record still NAMES the work, so nothing is lost but the transition.
     expect(record().followUps).toHaveLength(1);
     // Nothing was created, and every entry says exactly why.
     expect(h.created).toHaveLength(0);
     expect(res.followUpsMaterialized.created).toEqual([]);
     expect(res.followUpsMaterialized.failed).toEqual([{
       hash: followUpHash("TEAM-4200", "docs", "Document the new flag"),
-      kind: "docs", title: "Document the new flag", reason: "sibling_scan_failed",
+      kind: "docs", title: "Document the new flag", reason: "sibling_scan_failed", retryable: true,
     }]);
     expect(h.warns.join("\n")).toMatch(/sibling scan under TEAM-4100 FAILED/);
     expect(h.warns.join("\n")).toMatch(/a duplicate cannot be ruled out/);
+    expect(h.warns.join("\n")).toMatch(/Done WITHHELD/);
   });
 
-  it("retrying after a failed scan then materializes exactly once", async () => {
+  it("retrying after a failed scan then materializes exactly once, and THEN goes Done", async () => {
     // What makes fail-closed safe: the persona is TOLD to retry, and the retry is
     // idempotent because the [fu:<hash>] dedupe now runs against a roster that is
     // either right or absent — never wrongly empty.
     h.siblings.push(CD);
     h.ticketFail.add("Tickets___list_tickets");
-    await report({ follow_ups: FU() });
+    const first = result(await report({ follow_ups: FU() }));
+    expect(first.status).toBe("complete_pending_follow_ups");
     expect(h.created).toHaveLength(0);
+    expect(transitioned()).toBe(false);
     h.ticketFail.delete("Tickets___list_tickets");
     const res = result(await report({ follow_ups: FU() }));
     expect(h.created).toHaveLength(1);
     expect(res.followUpsMaterialized.created[0].blockedBy).toEqual(["TEAM-4199"]);
+    expect(res.status).toBe("complete");
+    expect(transitioned()).toBe(true);
   });
 
-  it("an unresolvable epic fails every entry rather than filing a parentless ticket", async () => {
+  it("an unresolvable epic fails every entry rather than filing a parentless ticket, and still goes Done", async () => {
     // A ticket with no parent is invisible to the run: it gates nothing and shows
-    // up in no phase, so telling the agent beats filing it.
+    // up in no phase, so telling the agent beats filing it. TEAM-4754 N2: this is
+    // the ONE non-retryable reason — get_issue ANSWERED and the answer was "no
+    // parent", so no retry can produce an epic and withholding Done would strand
+    // finished work forever.
     h.issue = ticketRow({ key: "TEAM-4200", parent: null });
     const res = result(await report({ follow_ups: FU() }));
     expect(res.status).toBe("complete");
+    expect("next_action" in res).toBe(false);
+    expect(transitioned()).toBe(true);
     expect(h.created).toHaveLength(0);
     expect(res.followUpsMaterialized.failed.map((f) => f.reason)).toEqual(["epic_unresolved"]);
+    expect(res.followUpsMaterialized.failed.map((f) => f.retryable)).toEqual([false]);
     expect(calls("Tickets___list_tickets")).toHaveLength(0);
   });
 
@@ -1008,6 +1041,103 @@ describe("report_completion — FR-13 materialization", () => {
     expect(calls("Tickets___get_issue")).toHaveLength(1);
     await handler({ tool_name: "WorkflowOutput___report_completion", arguments: { ticket_id: "TEST-1", summary: "ping", workflow_id: "wf_1" } });
     expect(calls("Tickets___get_issue")).toHaveLength(1);
+  });
+});
+
+// ─── TEAM-4754 N2: a failed follow-up write withholds the Done transition ───────
+//
+// TEAM-4752 D2 moved materialization BEFORE the transition. That fixed the order
+// and left the hole one step down: the transition happened anyway. For the run's
+// LAST ticket (the CD ticket) that means the create throws, the ticket goes Done,
+// the orchestrator's isWorkflowComplete rolls the epic to complete, and the
+// follow-up never exists — with the only trace in a nested `failed[]` nothing
+// reads. So the transition is now a CONSEQUENCE of the dependent write, not a
+// sibling of it.
+describe("report_completion — N2: a retryable follow-up failure withholds Done", () => {
+  const TWO = JSON.stringify([
+    { kind: "docs", owner: "agent", assignee: "agentcore_hub_api_dev", title: "Document the new flag" },
+    { kind: "post_deploy_verification", owner: "agent", title: "Re-check /health after deploy" },
+  ]);
+
+  it("1 of 2 created, the second fails: pending, no transition — and the retry files exactly the missing one", async () => {
+    // The whole point of withholding rather than refusing: the first create is
+    // durable, so the retry must NOT duplicate it. That is the `[fu:<8hex>]` dedupe
+    // running against a roster the create itself appended to.
+    h.siblings.push(CD);
+    h.createGate = (p) => !/health/.test(p.summary);
+    const first = result(await report({ follow_ups: TWO }));
+    expect(first.status).toBe("complete_pending_follow_ups");
+    expect(first.next_action).toBe("retry_report_completion");
+    expect(first.message).toMatch(/was NOT transitioned to Done/);
+    expect(first.message).toMatch(/SAME arguments/);
+    expect(wroteRecord()).toBe(true);
+    expect(transitioned()).toBe(false);
+    expect(first.followUpsMaterialized.created).toHaveLength(1);
+    expect(first.followUpsMaterialized.failed).toHaveLength(1);
+    expect(first.followUpsMaterialized.failed[0].kind).toBe("post_deploy_verification");
+    expect(first.followUpsMaterialized.failed[0].retryable).toBe(true);
+    expect(h.created).toHaveLength(1);
+
+    // The retry, with the SAME arguments the message told the agent to send.
+    h.createGate = null;
+    const res = result(await report({ follow_ups: TWO }));
+    expect(h.created).toHaveLength(2); // exactly ONE more
+    expect(res.followUpsMaterialized.created.map((c) => c.kind)).toEqual(["post_deploy_verification"]);
+    expect(res.followUpsMaterialized.skipped.map((s) => [s.kind, s.reason])).toEqual([["docs", "already_materialized"]]);
+    expect(res.followUpsMaterialized.failed).toEqual([]);
+    expect(res.status).toBe("complete");
+    expect(transitioned()).toBe(true);
+  });
+
+  it("the outer catch also withholds it — a THROW is not a licence to cascade", async () => {
+    // Reaches reportCompletion's own try/catch (not ticketTool's) by throwing a
+    // non-Error; see the createGate note in the Lambda mock.
+    h.siblings.push(CD);
+    h.createGate = () => null;
+    const res = result(await report({ follow_ups: FU() }));
+    expect(res.status).toBe("complete_pending_follow_ups");
+    expect(transitioned()).toBe(false);
+    expect(wroteRecord()).toBe(true);
+    expect(res.followUpsMaterialized.failed).toHaveLength(1);
+    expect(res.followUpsMaterialized.failed[0].retryable).toBe(true);
+    expect(h.warns.join("\n")).toMatch(/materialization threw/);
+    expect(h.warns.join("\n")).toMatch(/the record STANDS but the ticket is NOT transitioned/);
+  });
+
+  it("an UNREADABLE ticket is ticket_unreadable, not epic_unresolved — and holds the transition", async () => {
+    // The distinction D1 already drew for empty_sweep. "The ticket says it has no
+    // parent" is a definite negative; "we could not read the ticket" is a transient
+    // failure that must not be spelled the same way.
+    h.ticketFail.add("Tickets___get_issue");
+    const res = result(await report({ follow_ups: FU() }));
+    expect(res.status).toBe("complete_pending_follow_ups");
+    expect(res.next_action).toBe("retry_report_completion");
+    expect(transitioned()).toBe(false);
+    expect(h.created).toHaveLength(0);
+    expect(res.followUpsMaterialized.failed.map((f) => f.reason)).toEqual(["ticket_unreadable"]);
+    expect(res.followUpsMaterialized.failed.map((f) => f.retryable)).toEqual([true]);
+    // No epic ⇒ nothing to scan; and mainFixRefusal returns null on a null issue,
+    // so nothing refused the report before this point.
+    expect(calls("Tickets___list_tickets")).toHaveLength(0);
+    expect(h.warns.join("\n")).toMatch(/its epic \(parent\) is UNKNOWN/);
+  });
+
+  it("a report with no follow_ups is byte-identical to pre-4754", async () => {
+    const res = result(await report({}));
+    expect(Object.keys(res).sort()).toEqual(["message", "status"]);
+    expect(res.status).toBe("complete");
+    expect(res.message).toBe("Completion saved for TEAM-4200. Ticket transitioned to Done.");
+    expect(transitioned()).toBe(true);
+  });
+
+  it("follow-ups that ALL land are also unchanged: complete, no next_action, Done", async () => {
+    h.siblings.push(CD);
+    const res = result(await report({ follow_ups: FU() }));
+    expect(res.status).toBe("complete");
+    expect("next_action" in res).toBe(false);
+    expect(res.message).toBe("Completion saved for TEAM-4200. Ticket transitioned to Done.");
+    expect(res.followUpsMaterialized.failed).toEqual([]);
+    expect(transitioned()).toBe(true);
   });
 });
 
