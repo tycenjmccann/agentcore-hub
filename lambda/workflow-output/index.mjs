@@ -753,6 +753,34 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
     console.warn(`[report_completion] ${ticket_id}: outcome empty_sweep and the sibling roster is readable but EMPTY${epicKey ? ` under ${epicKey}` : " (the ticket has no parent)"} - nothing to skip`);
   }
 
+  // TEAM-4740 FR-13, moved BEFORE the own transition by TEAM-4752 D2.
+  //
+  // The transition below CASCADES: the orchestrator sees "done", unblocks the
+  // dependents and re-evaluates whether the epic is complete. A follow-up filed
+  // after that point is filed into a run that may already have closed — and for the
+  // run's LAST ticket (the CD ticket, with nothing else open) that is not
+  // theoretical: completion.mjs rule iii can only refuse to close on a fix ticket
+  // that EXISTS. Same ordering argument as FR-10's skip pass above.
+  //
+  // Still wrapped, and still internally fail-open: the completion record is already
+  // durable in S3, so a materialization throw must not cost the ticket its Done
+  // transition (the catch falls through to it) and must not surface as an "Error:"
+  // the agent would retry, re-running the whole report. What that costs is a slow
+  // create pushing the transition later in the same invoke — bounded by the SEC-11
+  // cap of 5 entries against a 60 s Lambda budget.
+  let materialized = { created: [], skipped: [], failed: [] };
+  if (followUps.entries.length > 0) {
+    try {
+      materialized = await materializeFollowUps({
+        entries: followUps.entries, siblings: scan.siblings, scanOk: scan.ok,
+        ticketId: ticket_id, workflowId: workflow_id, epicKey,
+      });
+    } catch (err) {
+      console.error(`[report_completion] ${ticket_id}: follow-up materialization threw (${err.name}: ${err.message}) - the completion STANDS and the ticket is still transitioned`);
+      materialized = { created: [], skipped: [], failed: followUps.entries.map((e) => ({ hash: e.hash, kind: e.kind, title: e.title, reason: `${err.name}: ${err.message}` })) };
+    }
+  }
+
   // Transition ticket to Done in Jira — this triggers the webhook cascade
   // (orchestrator unblocks downstream tickets when it sees "done")
   if (ticket_id && !ticket_id.startsWith("HEALTHCHECK-") && !ticket_id.startsWith("TEST-")) {
@@ -773,23 +801,6 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
       }
     } catch (err) {
       console.error(`[report_completion] Error transitioning ${ticket_id}:`, err.message);
-    }
-  }
-
-  // TEAM-4740 FR-13: LAST, and never fatal. Wrapped as well as internally
-  // fail-open because the completion is already durable at this point — throwing
-  // here would turn a recorded, transitioned completion into an "Error:" string
-  // the agent would retry, re-running the whole report.
-  let materialized = { created: [], skipped: [], failed: [] };
-  if (followUps.entries.length > 0) {
-    try {
-      materialized = await materializeFollowUps({
-        entries: followUps.entries, siblings: scan.siblings, scanOk: scan.ok,
-        ticketId: ticket_id, workflowId: workflow_id, epicKey,
-      });
-    } catch (err) {
-      console.error(`[report_completion] ${ticket_id}: follow-up materialization threw (${err.name}: ${err.message}) - the completion STANDS`);
-      materialized = { created: [], skipped: [], failed: followUps.entries.map((e) => ({ hash: e.hash, kind: e.kind, title: e.title, reason: `${err.name}: ${err.message}` })) };
     }
   }
 

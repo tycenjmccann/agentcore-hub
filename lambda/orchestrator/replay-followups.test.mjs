@@ -157,6 +157,27 @@ describe("TEAM-4660 — a fix created while the Merge Approval gate is open wait
     expect(p.phase).toBe("ship");
   });
 
+  it("files the fix BEFORE it transitions itself Done — the cascade must not outrun it (TEAM-4752 D2)", async () => {
+    await report({
+      ticket_id: "TEAM-4670", summary: "Repro confirmed at HEAD.", workflow_id: "wf_4660", agent_id: "agentcore_hub_qa_verifier",
+      follow_ups: JSON.stringify([{ kind: "fix", owner: "agent", assignee: "agentcore_hub_bug_fixer", title: "Expired token returns 500 instead of 401" }]),
+    });
+    // The ORDER of the invokes, not just their presence. The Done transition is what
+    // cascades: the orchestrator unblocks the dependents and re-evaluates whether the
+    // epic is complete, and completion.mjs rule (iii) can only be gated by a fix
+    // ticket that already EXISTS. Materializing after the transition left a window in
+    // which the run could roll to `complete` past the very follow-up it was handed.
+    const tools = h.calls.map((c) => c.tool);
+    const transitionAt = tools.findIndex(
+      (t, i) => t === "Tickets___transition_ticket" && h.calls[i].params.ticket_id === "TEAM-4670"
+    );
+    const lastCreateAt = tools.lastIndexOf("Tickets___create_ticket");
+    expect(lastCreateAt).toBeGreaterThanOrEqual(0);
+    expect(transitionAt).toBeGreaterThan(lastCreateAt);
+    // …and the transition really is the sweeper's own, to `done`.
+    expect(h.calls[transitionAt].params.transition_id).toBe("done");
+  });
+
   it("and the run is NOT complete while that fix is open — no new gate logic", async () => {
     await report({
       ticket_id: "TEAM-4670", summary: "Repro confirmed at HEAD.", workflow_id: "wf_4660", agent_id: "agentcore_hub_qa_verifier",
