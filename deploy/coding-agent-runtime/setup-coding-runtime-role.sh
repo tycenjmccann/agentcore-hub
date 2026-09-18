@@ -47,8 +47,35 @@ ARTIFACT_BUCKET="${ARTIFACT_BUCKET:-agentcore-hub-artifacts-${ACCOUNT_ID}-${REGI
 # prohibition is unchanged). Verifying a change must never be able to alter the
 # evidence it is verifying.
 #
-# The table/agentcore-hub-* wildcard follows the existing precedent in
-# deploy/setup-runtime-role.sh and deploy/ecs-express/deploy.sh.
+# SCOPE — a FIXED ALLOW-LIST, deliberately (TEAM-4785 / F1).
+#
+# The table/agentcore-hub-* and whole-bucket wildcards in
+# deploy/setup-runtime-role.sh, deploy/ecs-express/deploy.sh and
+# deploy/apprunner/deploy.sh are held by TRUSTED identities — the hub itself, its
+# Lambdas, its harness, the fleet runtime. This role is not one of those: it is
+# assumed by the UNTRUSTED coding runtime, whose credentials are inherited by the
+# claude/codex/kiro subprocesses it runs. An earlier revision of this comment
+# cited those wildcards as precedent; the precedent does not transfer.
+#
+# The trade the allow-list makes: a NEW hub table, or a new artifact prefix, fails
+# CLOSED under live verify with AccessDenied until it is added below and
+# scripts/si-ledger-handoff.sh is re-run. That is preferred over letting a
+# verification step read every tenant's data. Specifically NOT readable:
+# agentcore-hub-cloud-code-sessions (session rows — userId, repo, branch,
+# resumeTranscriptKey), agentcore-hub-routines, agentcore-hub-anomaly-watcher-state,
+# agentcore-hub-eval-seen. On S3, config/cd-registry.json is excluded because it
+# carries the cross-account CD externalId + roleArn (src/lib/cd-registry.ts:41-43)
+# — and note that loadCdRegistry DEGRADES on AccessDenied to an empty registry
+# rather than erroring (src/lib/cd-registry.ts:348-357), so a live-verify run
+# touching /api/workflow/start will silently see delivery mode "handoff": treat
+# that row as UNVERIFIED, not PASS.
+#
+# Scoping matters for a second reason. An unconditioned s3:ListBucket and a
+# bucket-root s3:GetObject here SUPERSEDED the narrow CloudCodeList /
+# CloudCodeObjects statements in ConfigBundleRead below — IAM unions Allow
+# statements, so the broader grant silently voided their per-tenant
+# cloud-code/t/* prefix condition. Keeping this document prefix-scoped is what
+# makes those load-bearing again.
 HUB_LIVE_VERIFY_READ_POLICY=$(cat <<EOF
 {
   "Version": "2012-10-17",
@@ -58,21 +85,42 @@ HUB_LIVE_VERIFY_READ_POLICY=$(cat <<EOF
       "Effect": "Allow",
       "Action": ["dynamodb:DescribeTable", "dynamodb:Scan", "dynamodb:Query", "dynamodb:GetItem"],
       "Resource": [
-        "arn:aws:dynamodb:${REGION}:${ACCOUNT_ID}:table/agentcore-hub-*",
-        "arn:aws:dynamodb:${REGION}:${ACCOUNT_ID}:table/agentcore-hub-*/index/*"
+        "arn:aws:dynamodb:${REGION}:${ACCOUNT_ID}:table/agentcore-hub-si-ledger",
+        "arn:aws:dynamodb:${REGION}:${ACCOUNT_ID}:table/agentcore-hub-si-ledger/index/*",
+        "arn:aws:dynamodb:${REGION}:${ACCOUNT_ID}:table/agentcore-hub-workflows",
+        "arn:aws:dynamodb:${REGION}:${ACCOUNT_ID}:table/agentcore-hub-workflows/index/*",
+        "arn:aws:dynamodb:${REGION}:${ACCOUNT_ID}:table/agentcore-hub-tickets",
+        "arn:aws:dynamodb:${REGION}:${ACCOUNT_ID}:table/agentcore-hub-tickets/index/*",
+        "arn:aws:dynamodb:${REGION}:${ACCOUNT_ID}:table/agentcore-hub-events",
+        "arn:aws:dynamodb:${REGION}:${ACCOUNT_ID}:table/agentcore-hub-events/index/*",
+        "arn:aws:dynamodb:${REGION}:${ACCOUNT_ID}:table/agentcore-hub-workflow-analyses",
+        "arn:aws:dynamodb:${REGION}:${ACCOUNT_ID}:table/agentcore-hub-workflow-analyses/index/*",
+        "arn:aws:dynamodb:${REGION}:${ACCOUNT_ID}:table/agentcore-hub-eval-results",
+        "arn:aws:dynamodb:${REGION}:${ACCOUNT_ID}:table/agentcore-hub-eval-results/index/*",
+        "arn:aws:dynamodb:${REGION}:${ACCOUNT_ID}:table/agentcore-hub-eval-daily",
+        "arn:aws:dynamodb:${REGION}:${ACCOUNT_ID}:table/agentcore-hub-eval-daily/index/*",
+        "arn:aws:dynamodb:${REGION}:${ACCOUNT_ID}:table/agentcore-hub-eval-config",
+        "arn:aws:dynamodb:${REGION}:${ACCOUNT_ID}:table/agentcore-hub-eval-config/index/*"
       ]
     },
     {
       "Sid": "ArtifactBucketReadOnly",
       "Effect": "Allow",
       "Action": ["s3:GetObject"],
-      "Resource": ["arn:aws:s3:::${ARTIFACT_BUCKET}/*"]
+      "Resource": [
+        "arn:aws:s3:::${ARTIFACT_BUCKET}/workflows/*",
+        "arn:aws:s3:::${ARTIFACT_BUCKET}/completions/*",
+        "arn:aws:s3:::${ARTIFACT_BUCKET}/config/agents.json",
+        "arn:aws:s3:::${ARTIFACT_BUCKET}/config/workflows.json",
+        "arn:aws:s3:::${ARTIFACT_BUCKET}/config/connectors.json"
+      ]
     },
     {
       "Sid": "ArtifactBucketList",
       "Effect": "Allow",
       "Action": ["s3:ListBucket"],
-      "Resource": ["arn:aws:s3:::${ARTIFACT_BUCKET}"]
+      "Resource": ["arn:aws:s3:::${ARTIFACT_BUCKET}"],
+      "Condition": { "StringLike": { "s3:prefix": ["config/*", "workflows/*", "completions/*"] } }
     }
   ]
 }
@@ -286,7 +334,7 @@ aws iam put-role-policy \
   --role-name "$ROLE_NAME" \
   --policy-name "HubLiveVerifyRead" \
   --policy-document "$HUB_LIVE_VERIFY_READ_POLICY"
-echo "   ✓ HubLiveVerifyRead — read-only hub tables + artifact bucket (live verify)"
+echo "   ✓ HubLiveVerifyRead — 8 allow-listed hub tables + config/workflows/completions prefixes (live verify, read-only)"
 
 # ─── EFS mount (persistent code workspace at /mnt/efs) ───────────────────────
 aws iam put-role-policy \

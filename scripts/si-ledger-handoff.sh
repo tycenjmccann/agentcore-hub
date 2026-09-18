@@ -68,6 +68,10 @@ source "${REPO_ROOT}/deploy/config.sh"
 # NOT the ledger table — every sibling script defaults it locally the same way.
 SI_LEDGER_TABLE="${SI_LEDGER_TABLE:-agentcore-hub-si-ledger}"
 LEDGER_ARN="arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/${SI_LEDGER_TABLE}"
+# TEAM-4785: the table the untrusted coding runtime must NEVER reach. Session rows
+# carry userId, repo, branch and resumeTranscriptKey, so a cross-tenant Scan here
+# is the failure HubLiveVerifyRead's allow-list exists to prevent.
+SESSIONS_ARN="arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/agentcore-hub-cloud-code-sessions"
 HARNESS_ROLE="agentcore-hub-harness-role"
 CODING_ROLE="agentcore-hub-coding-runtime-role"
 ANALYZER_FN="agentcore-hub-workflow-analyzer"
@@ -281,9 +285,10 @@ simulate "$HARNESS_ROLE" allowed "$LEDGER_ARN" \
   dynamodb:PutItem dynamodb:UpdateItem
 simulate "$CODING_ROLE" allowed "$LEDGER_ARN" \
   dynamodb:DescribeTable dynamodb:Scan dynamodb:Query dynamodb:GetItem
-# The negative matters as much as the positives: live verify must never be able
-# to write the evidence it is verifying.
+# The negatives matter as much as the positives: live verify must never be able
+# to write the evidence it is verifying, nor read another tenant's sessions.
 simulate "$CODING_ROLE" implicitDeny "$LEDGER_ARN" dynamodb:PutItem
+simulate "$CODING_ROLE" implicitDeny "$SESSIONS_ARN" dynamodb:Scan
 
 for FN in "$ANALYZER_FN" "$SUBMITTER_FN"; do
   VAL="$(aws lambda get-function-configuration --function-name "$FN" --region "$AWS_REGION" \
