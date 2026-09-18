@@ -986,28 +986,59 @@ function gateKindOf(gate, title) {
 const DEPLOY_APPROVAL_LABEL_RE = /^gate[:-]deploy-approval$/;
 const DEPLOY_PIPELINE_LABEL_RE = /^pipeline[:-](.+)$/;
 const DEPLOY_EXEC_LABEL_RE = /^exec[:-]([0-9a-f-]{36})$/;
+// TEAM-4751 C2: the two labels the awaiting-console consumer's dedupe key needs.
+// `head:` is written by the twins' gateHeadOf as a 40-hex sha
+// (lambda/agentcore-hub-{tickets,jira}/gate-contract.mjs HEAD_LABEL_RE); read it
+// tolerantly, because the key only needs the value to be STABLE and a short sha
+// costs nothing to accept. `gate:<kind>` is the closed vocabulary in
+// fix-contract.mjs GATE_KINDS.
+// WP2's refusal stamp. A probed gate whose `→ done` was refused because its
+// condition is not verified stays in `in_review`, gains `gate:awaiting-console`,
+// and gets ONE comment carrying the check's finding (and, for a deploy approval,
+// the console deep link). The bridge reads the label so its page says what the
+// human must actually do.
+const AWAITING_CONSOLE_LABEL_RE = /^gate[:-]awaiting-console$/;
+const GATE_HEAD_LABEL_RE = /^head[:-]([0-9a-f]{7,40})$/;
+const GATE_KIND_LABEL_RE = /^gate[:-]([a-z0-9-]+)$/;
+// The guard's own bookkeeping labels — never a ticket's KIND.
+const GATE_BOOKKEEPING_KINDS = new Set(["awaiting-console", "loop-broken"]);
+// The kinds whose close asserts something a read can contradict, in the twins'
+// own precedence order (gate-contract.mjs PROBED_GATE_KINDS): the kind that
+// earned the refusal is the one that belongs in the dedupe key.
+const PROBED_GATE_KIND_ORDER = ["deploy-approval", "ci-unavailable", "blocker"];
 
 /**
  * Classify a gate ticket's labels. Pure — the one place either label shape is
  * read, so the colon and hyphen forms can never diverge.
  * @param {string[]|string} labels ticket labels (an array on the wire; a
  *   comma-joined string is tolerated the way normalizeBlockedBy tolerates one)
- * @returns {{isDeployApproval: boolean, pipeline: string|null, executionId: string|null}}
+ * @returns {{isDeployApproval: boolean, pipeline: string|null, executionId: string|null,
+ *   awaitingConsole: boolean, headSha: string|null, gateKind: string}}
  */
 function parseDeployApprovalLabels(labels) {
   const list = Array.isArray(labels)
     ? labels
     : typeof labels === "string" ? labels.split(",") : [];
-  const out = { isDeployApproval: false, pipeline: null, executionId: null };
+  const out = {
+    isDeployApproval: false, pipeline: null, executionId: null,
+    awaitingConsole: false, headSha: null, gateKind: "gate",
+  };
+  const kinds = [];
   for (const raw of list) {
     const l = String(raw ?? "").trim().toLowerCase();
     if (!l) continue;
-    if (DEPLOY_APPROVAL_LABEL_RE.test(l)) { out.isDeployApproval = true; continue; }
+    if (DEPLOY_APPROVAL_LABEL_RE.test(l)) { out.isDeployApproval = true; }
+    if (AWAITING_CONSOLE_LABEL_RE.test(l)) { out.awaitingConsole = true; continue; }
+    const g = GATE_KIND_LABEL_RE.exec(l);
+    if (g) { if (!GATE_BOOKKEEPING_KINDS.has(g[1])) kinds.push(g[1]); continue; }
     const p = DEPLOY_PIPELINE_LABEL_RE.exec(l);
     if (p) { out.pipeline = out.pipeline || p[1]; continue; }
     const e = DEPLOY_EXEC_LABEL_RE.exec(l);
-    if (e) out.executionId = out.executionId || e[1];
+    if (e) { out.executionId = out.executionId || e[1]; continue; }
+    const h = GATE_HEAD_LABEL_RE.exec(l);
+    if (h) out.headSha = out.headSha || h[1];
   }
+  out.gateKind = PROBED_GATE_KIND_ORDER.find((k) => kinds.includes(k)) || kinds[0] || "gate";
   return out;
 }
 
@@ -1027,21 +1058,12 @@ function gateKindFor(gate, title, gateTicket) {
   return gateKindOf(gate, title);
 }
 
-// WP2's refusal stamp. A gate:deploy-approval ticket whose `→ done` was refused
-// because the pipeline's human gate is still open stays in `in_review`, gains
-// `gate:awaiting-console`, and gets ONE comment carrying the console deep link.
-// The bridge reads the label so its re-page says what the human must actually do
-// — the decision is in the console, and no Telegram tap has been recorded for it.
-// Both spellings, for the same reason as every other gate label.
-const AWAITING_CONSOLE_LABEL_RE = /^gate[:-]awaiting-console$/;
-
-/** Is this gate stamped as waiting on the console approval? Pure. */
+/**
+ * Is this gate stamped as refused by the typed-gate guard? Pure — a delegate, so
+ * label reading stays in exactly ONE place (parseDeployApprovalLabels).
+ */
 function gateAwaitingConsole(gateTicket) {
-  const labels = gateTicket?.labels;
-  const list = Array.isArray(labels)
-    ? labels
-    : typeof labels === "string" ? labels.split(",") : [];
-  return list.some((l) => AWAITING_CONSOLE_LABEL_RE.test(String(l ?? "").trim().toLowerCase()));
+  return parseDeployApprovalLabels(gateTicket?.labels).awaitingConsole;
 }
 
 /**
@@ -1666,18 +1688,85 @@ async function publishGateRequested(wf, notif, w) {
   }
 }
 
+/** The ✅/❌ + hub keyboard every gate page and re-page carries. */
+function gateDecisionKeyboard(wf, notif) {
+  return { inline_keyboard: [
+    [
+      { text: "✅ Approve", callback_data: `gok|${notif.ticketId}|${wf.workflowId}` },
+      { text: "❌ Request changes", callback_data: `gno|${notif.ticketId}|${wf.workflowId}` },
+    ],
+    [{
+      text: "📱 Open approval in hub",
+      url: `${HUB_API_URL}/workflow?id=${encodeURIComponent(wf.workflowId)}&ticket=${encodeURIComponent(notif.ticketId)}`,
+    }],
+  ] };
+}
+
+/**
+ * The COPY for a gate the typed-gate guard refused (`gate:awaiting-console`) —
+ * ONE construction with two callers (TEAM-4751 C2): the out-of-hours reminder
+ * (repageIfWindowOpened) and the in-hours consumer (repageAwaitingConsole). A
+ * second copy of this wording is exactly how the two would drift into telling a
+ * human two different things about one stall.
+ *
+ * It is NOT an ordinary "still waiting on you" page: an agent already tried to
+ * close the gate and was told no. So the copy names the place the condition is
+ * actually cleared, and drops the "your window is open" line, which would
+ * describe the wrong reason for the wait.
+ *
+ * Kind-aware, because the twins stamp this label on ANY probed gate
+ * (gate-contract.mjs PROBED_GATE_KINDS — deploy-approval, ci-unavailable,
+ * blocker). Only a deploy approval has a console the human answers; for the rest
+ * the remedy is in the ticket's own gate-guard comment, so no console URL is
+ * claimed and no console button is offered (the meta line is omitted with it).
+ *
+ * `keyboard` is mutated in place — the console button is pushed onto it — which
+ * is what keeps the send in the caller (the approval-builder guardrail requires
+ * that the sender be an APPROVAL_SITE). Best-effort, like every other lookup on
+ * these paths: deployApprovalGate never throws.
+ *
+ * @returns {Promise<{consoleUrl:string, label:string, summary:string, meta:string[], ask:string}>}
+ */
+async function awaitingConsolePage(gateTicket, keyboard) {
+  const { gateKind } = parseDeployApprovalLabels(gateTicket?.labels);
+  const g = await deployApprovalGate(gateTicket);
+  const consoleUrl = g
+    ? pipelineConsoleUrl({ pipeline: g.target?.pipeline || g.pipeline, region: g.target?.region })
+    : "";
+  if (consoleUrl) {
+    keyboard.inline_keyboard.push([{ text: "🔗 Open the deploy gate in the console", url: consoleUrl }]);
+  }
+  const deployKind = Boolean(g);
+  return {
+    consoleUrl,
+    label: "awaiting-console reminder",
+    summary: deployKind
+      ? "Still parked on the pipeline's own deploy approval — an agent tried to close this gate and was refused, because the approval has not been given yet."
+      : `An agent tried to close this gate and was refused, because its gate:${gateKind} condition has not been verified. The ticket's own gate-guard comment says what the check found and how to clear it.`,
+    meta: deployKind && consoleUrl ? [`🖥 [deploy gate in the console](${consoleUrl})`] : [],
+    ask: !deployKind
+      ? "Clear the condition the gate names — the ticket comment has the remedy — or Request changes here to stop it."
+      : consoleUrl
+        ? "Approve the deploy in the console (the button above), or Request changes here to stop it."
+        : "Approve the deploy in the pipeline's own console, or Request changes here to stop it.",
+  };
+}
+
 /**
  * The gate# claim already exists (this notification was paged on an earlier
  * scan). If that page landed outside the window and the window has since
  * opened, send exactly ONE reminder, deduped on repage#<notif>. Never throws:
  * a failure here must not cost the remaining pending gates their pages.
+ *
+ * @returns {Promise<boolean>} true only when a reminder was DELIVERED. The
+ *   caller uses that to keep one stall to one page per scan (TEAM-4751 C2).
  */
 async function repageIfWindowOpened(wf, notif, w) {
   let holding = null;
   try {
-    if (isOutsideHours(notif.timestamp, w) !== true) return;
+    if (isOutsideHours(notif.timestamp, w) !== true) return false;
     const openAt = nextBusinessOpenAt(notif.timestamp, w);
-    if (!openAt || Date.now() < openAt.getTime()) return;
+    if (!openAt || Date.now() < openAt.getTime()) return false;
 
     // TEAM-4461: the request-time page itself may have landed INSIDE the window —
     // a gate requested 08:59 and paged by the 09:00 scan, or a page delayed past
@@ -1688,10 +1777,10 @@ async function repageIfWindowOpened(wf, notif, w) {
       TableName: PENDING_TABLE, Key: { id: { S: gateClaimKey(notif) } },
     }));
     const pagedAt = Date.parse(claim?.pagedAt?.S || "");
-    if (Number.isFinite(pagedAt) && pagedAt >= openAt.getTime()) return;
+    if (Number.isFinite(pagedAt) && pagedAt >= openAt.getTime()) return false;
 
     const key = `${REPAGE_KEY_PREFIX}${notif.id || notif.ticketId}`;
-    if (!(await claimKey(key))) return; // already reminded
+    if (!(await claimKey(key))) return false; // already reminded
     holding = key;
 
     // gateTicketOf fails CLOSED, but "closed" is about the WRITE paths: a caller
@@ -1708,80 +1797,189 @@ async function repageIfWindowOpened(wf, notif, w) {
     // Resolved in the meantime → keep the claim: there is nothing to remind
     // about and re-checking on every later scan would be pure noise.
     const status = String(gateTicket?.status || "").toLowerCase();
-    if (REPAGE_SKIP_STATUSES.has(status)) return;
+    if (REPAGE_SKIP_STATUSES.has(status)) return false;
 
     const chats = (await listChats()).filter((c) => ALLOWED_CHAT_IDS.includes(String(c)));
     if (!chats.length) {
       console.warn("[telegram-bug-intake] business-hours reminder but no allowlisted chats to notify");
-      return; // the request-time page already went out; do not retry forever
+      return false; // the request-time page already went out; do not retry forever
     }
 
     const title = gateTicket?.title || notif.ticketId;
     const reviewer = notif.reviewer || "reviewer";
-    const keyboard = { inline_keyboard: [
-      [
-        { text: "✅ Approve", callback_data: `gok|${notif.ticketId}|${wf.workflowId}` },
-        { text: "❌ Request changes", callback_data: `gno|${notif.ticketId}|${wf.workflowId}` },
-      ],
-      [{
-        text: "📱 Open approval in hub",
-        url: `${HUB_API_URL}/workflow?id=${encodeURIComponent(wf.workflowId)}&ticket=${encodeURIComponent(notif.ticketId)}`,
-      }],
-    ] };
+    const keyboard = gateDecisionKeyboard(wf, notif);
 
-    // A gate the ticket Lambdas refused to close because the pipeline's own
-    // human gate is still open (WP2's gate:awaiting-console stamp). It is NOT an
-    // ordinary "still waiting on you" reminder: an agent already tried to close
-    // it and was told no, so the reminder must name the console — the one place
-    // the decision can be made — and drop the "your window is open" line, which
-    // would describe the wrong reason for the wait. The target lookup is
-    // best-effort, like every other one on this path.
-    const awaitingConsole = gateAwaitingConsole(gateTicket);
-    let consoleUrl = "";
-    if (awaitingConsole) {
-      const g = await deployApprovalGate(gateTicket);
-      consoleUrl = pipelineConsoleUrl({
-        pipeline: g?.target?.pipeline || g?.pipeline, region: g?.target?.region,
-      });
-      if (consoleUrl) {
-        keyboard.inline_keyboard.push([{ text: "🔗 Open the deploy gate in the console", url: consoleUrl }]);
-      }
-    }
+    // A gate the ticket Lambdas refused to close because its typed-gate
+    // condition is not verified (WP2's gate:awaiting-console stamp). Its copy —
+    // and the console button, when there is a console to send anyone to — is
+    // built by awaitingConsolePage, shared with the in-hours consumer.
+    const page = gateAwaitingConsole(gateTicket) ? await awaitingConsolePage(gateTicket, keyboard) : null;
 
     // Same content rules as the request-time page (TEAM-4660): the gate
     // ticket's title/description never reach the reminder either. Same INPUTS
     // too (TEAM-4671 F2) — the reminder and the page must agree on the attempt.
     const { attempt, previousIssue } = await approvalAttempt({ wf, notif, tickets });
     const { delivered } = await sendApprovalPing(chats, {
-      label: awaitingConsole ? "awaiting-console reminder" : "business-hours reminder",
+      label: page ? page.label : "business-hours reminder",
       // Shared classification (TEAM-4706): a deploy-approval gate reminds with
       // the same 🚀 kicker it paged with, without a second rule living here.
       gateKind: gateKindFor(notif.gate, title, gateTicket),
       repage: true,
       subject: wf.input?.title || wf.workflowId,
-      summary: awaitingConsole
-        ? "Still parked on the pipeline's own deploy approval — an agent tried to close this gate and was refused, because the approval has not been given yet."
-        : "Sent for review outside working hours and still open — your window is open now.",
+      summary: page ? page.summary : "Sent for review outside working hours and still open — your window is open now.",
       attempt,
       previousIssue,
       meta: [
         `👤 ${esc(reviewer)}`,
         `🎫 [${notif.ticketId}](https://${JIRA_SITE_URL}/browse/${notif.ticketId})`,
         "⏸ pipeline paused on you",
-        ...(awaitingConsole && consoleUrl ? [`🖥 [deploy gate in the console](${consoleUrl})`] : []),
+        ...(page ? page.meta : []),
       ],
-      ask: awaitingConsole
-        ? "Approve the deploy in the console (the button above), or Request changes here to stop it."
-        : "Approve to continue, or Request changes to send it back.",
+      ask: page ? page.ask : "Approve to continue, or Request changes to send it back.",
       keyboard,
     });
     if (!delivered) await releaseKey(holding);
+    return delivered > 0;
   } catch (err) {
     console.error(`[telegram-bug-intake] business-hours reminder for ${notif.ticketId}`, err.message);
     if (holding) {
       await releaseKey(holding).catch((relErr) =>
         console.error("[telegram-bug-intake] releaseKey after reminder failure", relErr.message));
     }
+    return false;
+  }
+}
+
+// Rate limiter, NOT a ledger: the awaiting-console consumer's trigger is a LABEL,
+// so without this it would cost one /tickets GET per open gate per 60s scan. The
+// console# row is what makes the paging exactly-once; this only bounds the read.
+const AWAITING_CONSOLE_POLL_MS = parseInt(process.env.AWAITING_CONSOLE_POLL_MS || "120000", 10);
+const AWAITING_CONSOLE_SEEN_MAX = 500;
+const _awaitingConsoleSeen = new Map(); // gate claim key → lastCheckedAt (per container)
+
+const CONSOLE_KEY_PREFIX = "console#";
+
+/**
+ * NFR-5's idempotency tuple: console#<ticketId>|<gateKind>|<headSha|->|<hash(consoleUrl|->)>.
+ * hashToken keeps the URL itself out of the key while making a RE-TARGETED gate
+ * (new head sha, or a different pipeline) a different row — which is the point:
+ * the human owes a fresh answer, so it must not be deduped against the old one.
+ */
+function awaitingConsoleKey({ ticketId, gateKind, headSha, consoleUrl }) {
+  return `${CONSOLE_KEY_PREFIX}${ticketId}|${gateKind || "gate"}|${headSha || "-"}|${hashToken(consoleUrl || "-")}`;
+}
+
+/**
+ * TEAM-4751 C2 — page the human about a gate the twins' typed-gate guard parked
+ * (`gate:awaiting-console`), REGARDLESS of business hours.
+ *
+ * The label's only previous reader was repageIfWindowOpened, which needs the
+ * notification to have been requested out of hours AND its window to have since
+ * opened — so an in-hours refusal paged nobody at all and the human learned of
+ * the stall from a Jira comment. Here the LABEL is the trigger, not the clock.
+ *
+ * Bounded by the ledger the deploy re-ping already uses: one first page, then at
+ * most DEPLOY_REPING_MAX reminders at DEPLOY_REPING_INTERVAL_MS, keyed on the
+ * NFR-5 tuple. Never throws — a failure here must not cost the remaining pending
+ * gates their pages.
+ *
+ * Interplay with C1: the callback handler and this scan run serially inside one
+ * invocation (reserved concurrency 1), and the twins clear the label in the SAME
+ * write that moves the gate to `done`, so a label left by a lagging-read refusal
+ * that C1's retry then clears is never observed by a scan.
+ *
+ * @returns {Promise<boolean>} true only when a page was DELIVERED.
+ */
+async function repageAwaitingConsole(wf, notif, w) {
+  let holding = null;
+  try {
+    // Stamp the memo BEFORE the read, so a throwing read still rate-limits.
+    const memoKey = gateClaimKey(notif);
+    const now = Date.now();
+    const lastChecked = _awaitingConsoleSeen.get(memoKey);
+    if (Number.isFinite(lastChecked) && now - lastChecked < AWAITING_CONSOLE_POLL_MS) return false;
+    if (_awaitingConsoleSeen.size > AWAITING_CONSOLE_SEEN_MAX) _awaitingConsoleSeen.clear();
+    _awaitingConsoleSeen.set(memoKey, now);
+
+    // Fails CLOSED, unlike repageIfWindowOpened: there the reminder was already
+    // owed and the request-time facts were enough to send it, whereas here the
+    // label IS the trigger, so a read that proved nothing must page nothing and
+    // claim nothing. The next scan past the memo tries again.
+    const { gateTicket, tickets, indeterminate } = await gateTicketOf(wf, notif);
+    if (indeterminate) {
+      console.warn(`[telegram-bug-intake] awaiting-console check for ${notif.ticketId}: tickets unreadable — nothing paged`);
+      return false;
+    }
+    const labels = parseDeployApprovalLabels(gateTicket?.labels);
+    if (!labels.awaitingConsole) return false;
+    // Resolved in the meantime → nothing to page about.
+    if (REPAGE_SKIP_STATUSES.has(String(gateTicket?.status || "").toLowerCase())) return false;
+
+    const keyboard = gateDecisionKeyboard(wf, notif);
+    const page = await awaitingConsolePage(gateTicket, keyboard);
+    const key = awaitingConsoleKey({
+      ticketId: notif.ticketId, gateKind: labels.gateKind,
+      headSha: labels.headSha, consoleUrl: page.consoleUrl,
+    });
+
+    // claimKey writes claimedAt + a 30-day TTL, which is exactly the row shape
+    // decideDeployPingMode reads — so the first page and every bounded reminder
+    // share one row, with no second ledger and no change to any existing caller.
+    const first = await claimKey(key);
+    const mode = first ? { kind: "first" } : await decideDeployPingMode(key);
+    if (!mode) return false; // too soon, or the reminder budget is spent
+    if (first) holding = key;
+
+    const chats = (await listChats()).filter((c) => ALLOWED_CHAT_IDS.includes(String(c)));
+    if (!chats.length) {
+      console.warn("[telegram-bug-intake] awaiting-console page but no allowlisted chats to notify");
+      if (holding) await releaseKey(holding);
+      return false;
+    }
+
+    const title = gateTicket?.title || notif.ticketId;
+    // A deploy approval nags with its OWN kind (APPROVAL_KICKERS
+    // "deploy-pipeline-reminder", TEAM-4663 F3); any other probed kind keeps the
+    // kicker it was paged with. Never `repage: true` on either: this page fires
+    // whenever the label appears, in hours as often as not, and "·
+    // business-hours reminder" would state the wrong reason for the wait — the
+    // reason is in the summary, and it is a refused close, not the clock.
+    const isDeploy = labels.isDeployApproval;
+    const { attempt, previousIssue } = await approvalAttempt({ wf, notif, tickets });
+    const { delivered, messageIds } = await sendApprovalPing(chats, {
+      label: page.label,
+      gateKind: isDeploy ? "deploy-pipeline-reminder" : gateKindFor(notif.gate, title, gateTicket),
+      repage: false,
+      subject: wf.input?.title || wf.workflowId,
+      summary: page.summary,
+      attempt,
+      previousIssue,
+      meta: [
+        `👤 ${esc(notif.reviewer || "reviewer")}`,
+        `🎫 [${notif.ticketId}](https://${JIRA_SITE_URL}/browse/${notif.ticketId})`,
+        "⏸ pipeline paused on you",
+        ...page.meta,
+      ],
+      ask: page.ask,
+      keyboard,
+    });
+    if (!delivered) {
+      if (holding) await releaseKey(holding);
+      return false;
+    }
+    await markPingDelivered(key, {
+      now: Date.now(),
+      pingCount: mode.kind === "reminder" ? mode.n + 1 : 1,
+      messageIds,
+    }).catch((err) => console.error(`[telegram-bug-intake] markPingDelivered ${key}`, err.message));
+    return true;
+  } catch (err) {
+    console.error(`[telegram-bug-intake] awaiting-console page for ${notif.ticketId}`, err.message);
+    if (holding) {
+      await releaseKey(holding).catch((relErr) =>
+        console.error("[telegram-bug-intake] releaseKey after awaiting-console failure", relErr.message));
+    }
+    return false;
   }
 }
 
@@ -1816,10 +2014,18 @@ async function scanReviewGates() {
       ? "first"
       : await consultClaimForRecovery(gateClaimKey(notif), { label: "review gate" });
     if (!mode) {
-      // Already paged, and the page is accounted for. The only thing left to do
-      // for this gate is the once-per-notification reminder, if its page landed
-      // out of hours.
-      await repageIfWindowOpened(wf, notif, window);
+      // Already paged, and the page is accounted for. Two things can still be
+      // owed: the once-per-notification business-hours reminder, and — TEAM-4751
+      // C2 — a page for a gate the twins' guard parked on its unmet condition.
+      // At most ONE page per scan: the two are keyed differently (repage# vs
+      // console#) and would both fire for a labelled gate whose window just
+      // opened, which is two messages about one stall. The out-of-hours reminder
+      // wins (it is once-per-notification and already carries the
+      // awaiting-console copy); the consumer's console# row is untouched, so it
+      // pages on a later scan if the gate is still parked.
+      if (!(await repageIfWindowOpened(wf, notif, window))) {
+        await repageAwaitingConsole(wf, notif, window);
+      }
       continue;
     }
     if (mode === "first") pinged++; else recovered++;

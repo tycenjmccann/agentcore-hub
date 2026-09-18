@@ -73,6 +73,7 @@ function bodyOf(src, name) {
 const APPROVAL_SITES = [
   "scanReviewGates",
   "repageIfWindowOpened",
+  "repageAwaitingConsole",
   "scanManagerEscalations",
   "scanDeployApprovalsForTarget",
   "deadSessionPing",
