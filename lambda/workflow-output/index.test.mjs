@@ -934,14 +934,45 @@ describe("report_completion — FR-13 materialization", () => {
     expect(record().followUps).toHaveLength(1);
   });
 
-  it("a failed sibling scan still creates the follow-up — unblocked, and loudly", async () => {
+  // TEAM-4752 D1 — this test asserted the DEFECT: it created the follow-up on a
+  // roster it had failed to read. The dedupe set is built from that roster, so the
+  // create was blind, and a redelivered report (the orchestrator retries) filed a
+  // second copy of every entry — the exact duplicate FR-13's (ticketId, kind,
+  // title) key exists to prevent.
+  it("a failed sibling scan creates NOTHING — the completion stands, the entries come back failed", async () => {
     h.siblings.push(CD);
     h.ticketFail.add("Tickets___list_tickets");
     const res = result(await report({ follow_ups: FU() }));
+    // The completion itself is durable and the ticket still goes Done: the work
+    // WAS done, and refusing the report over a follow-up would throw that away.
     expect(res.status).toBe("complete");
-    expect(h.created).toHaveLength(1);
-    expect("blocked_by" in h.created[0].params).toBe(false);
+    expect(wroteRecord()).toBe(true);
+    expect(transitioned()).toBe(true);
+    // The record still NAMES the work, so nothing is lost but the ticket.
+    expect(record().followUps).toHaveLength(1);
+    // Nothing was created, and every entry says exactly why.
+    expect(h.created).toHaveLength(0);
+    expect(res.followUpsMaterialized.created).toEqual([]);
+    expect(res.followUpsMaterialized.failed).toEqual([{
+      hash: followUpHash("TEAM-4200", "docs", "Document the new flag"),
+      kind: "docs", title: "Document the new flag", reason: "sibling_scan_failed",
+    }]);
     expect(h.warns.join("\n")).toMatch(/sibling scan under TEAM-4100 FAILED/);
+    expect(h.warns.join("\n")).toMatch(/a duplicate cannot be ruled out/);
+  });
+
+  it("retrying after a failed scan then materializes exactly once", async () => {
+    // What makes fail-closed safe: the persona is TOLD to retry, and the retry is
+    // idempotent because the [fu:<hash>] dedupe now runs against a roster that is
+    // either right or absent — never wrongly empty.
+    h.siblings.push(CD);
+    h.ticketFail.add("Tickets___list_tickets");
+    await report({ follow_ups: FU() });
+    expect(h.created).toHaveLength(0);
+    h.ticketFail.delete("Tickets___list_tickets");
+    const res = result(await report({ follow_ups: FU() }));
+    expect(h.created).toHaveLength(1);
+    expect(res.followUpsMaterialized.created[0].blockedBy).toEqual(["TEAM-4199"]);
   });
 
   it("an unresolvable epic fails every entry rather than filing a parentless ticket", async () => {
@@ -1266,16 +1297,60 @@ describe("report_completion — FR-10 empty_sweep", () => {
     ])).toHaveLength(2);
   });
 
-  it("says so out loud when the epic is unreadable, rather than passing as done", async () => {
+  // ── TEAM-4752 D1: an unknown roster REFUSES the report ────────────────────────
+  //
+  // These two replace "says so out loud when the epic is unreadable, rather than
+  // passing as done", which accepted the report, warned, and transitioned the
+  // sweeper anyway. Warning is not enough here: the sweeper's Done is what
+  // CASCADES, so accepting it hands every downstream ticket to a live agent for a
+  // diff that does not exist — the FR-10 failure this feature exists to prevent.
+  it("REFUSES the report when the sweeper's own ticket is unreadable — its epic is unknown", async () => {
     h.ticketFail.add("Tickets___get_issue");
     const res = result(await sweep());
-    // The completion still stands — bookkeeping never holds a completion hostage —
-    // but a sweep that closed nothing must not look like a sweep that had nothing
-    // to close.
+    expect(res.ok).toBe(false);
+    expect(res.reason).toBe("sibling_scan_failed");
+    // Nothing durable, nothing announced, nothing transitioned — the persona retries.
+    expect(wroteRecord()).toBe(false);
+    expect(transitioned()).toBe(false);
+    expect(events("workflow.report_completion")).toHaveLength(0);
+    expect(events("delivery.prState")).toHaveLength(0);
+    expect(res.message).toContain("the ticket was NOT transitioned");
+    expect(res.message).toContain("Retry the call");
+    expect(h.warns.join("\n")).toMatch(/REFUSED TEAM-4640: sibling_scan_failed \(get_issue:/);
+  });
+
+  it("REFUSES the report when the sibling scan under a known epic fails", async () => {
+    h.ticketFail.add("Tickets___list_tickets");
+    const res = result(await sweep());
+    expect(res.ok).toBe(false);
+    expect(res.reason).toBe("sibling_scan_failed");
+    expect(res.message).toContain("the sibling scan under TEAM-4100 failed");
+    expect(res.message).toContain("cascade the run onto a diff that does not exist");
+    expect(wroteRecord()).toBe(false);
+    expect(transitioned()).toBe(false);
+    // No sibling was touched either — a refusal leaves no partial sweep behind.
+    expect(h.puts.filter((p) => p.Key?.startsWith("completions/"))).toHaveLength(0);
+  });
+
+  it("still ACCEPTS a sweeper that provably has no parent — that is a definite negative", async () => {
+    // "We looked and there is no epic" is knowledge; "we could not look" is not.
+    // Only the second refuses. This keeps the pre-4752 warn-and-proceed path for a
+    // parentless sweeper, which has no siblings to close by construction.
+    h.issue = ticketRow({ key: "TEAM-4640", summary: "Sweep dead code", parent: null });
+    const res = result(await sweep());
     expect(res.status).toBe("complete");
     expect(res).not.toHaveProperty("emptySweepSkipped");
-    expect(h.warns.join("\n")).toContain("no siblings were readable");
-    expect(h.warns.join("\n")).toContain("no epic resolved");
+    expect(transitioned()).toBe(true);
+    expect(calls("Tickets___list_tickets")).toHaveLength(0);
+    expect(h.warns.join("\n")).toContain("the ticket has no parent");
+  });
+
+  it("ACCEPTS a readable but EMPTY roster, and says which it was", async () => {
+    h.siblings.length = 0;
+    const res = result(await sweep());
+    expect(res.status).toBe("complete");
+    expect(res).not.toHaveProperty("emptySweepSkipped");
+    expect(h.warns.join("\n")).toContain("the sibling roster is readable but EMPTY under TEAM-4100");
   });
 
   it("an ordinary completion runs no sweep at all", async () => {
@@ -1441,6 +1516,34 @@ describe("submit_ticket_plan — FR-11 normalization", () => {
     const res = result(await plan({ epic_id: "" }));
     expect(calls("Tickets___list_tickets")).toHaveLength(0);
     expect(res.ticket_count).toBe(3);
+  });
+
+  // TEAM-4752 D1 — the ONE sibling-scan consumer that stays fail-open. This tool
+  // creates nothing; the ENFORCING half of the freeze rule is the twins'
+  // create-time autowire, which 4752 makes fail-closed. So refusing the plan would
+  // strand the analyst's whole output over one throttled Query, for an edge that is
+  // re-derived at create time anyway. What changes is that it is no longer SILENT.
+  it("FAILS OPEN on a failed sibling scan — but says so on the response", async () => {
+    h.ticketFail.add("Tickets___list_tickets");
+    const res = result(await plan());
+    expect(res.status).toBe("saved");
+    expect(res.ticket_count).toBe(3);
+    // No invented blocker: only a validated real ticket key may ever be inserted.
+    expect(planTicket(res.tickets, "API work").blockedBy).toEqual([]);
+    expect(res).not.toHaveProperty("autowired");
+    // The visible part — the agent that has to copy this plan can see the edge is
+    // missing instead of trusting a plan that was silently degraded.
+    expect(res.warning).toContain("root-blocker autowire SKIPPED");
+    expect(res.warning).toContain("TEAM-4100");
+    expect(h.warns.join("\n")).toMatch(/sibling scan under TEAM-4100 FAILED .* root-blocker autowire SKIPPED/);
+    // Still persisted, and the branch templating still ran.
+    expect(savedPlan().tickets).toHaveLength(3);
+    expect(res.integration_branch).toBe(BRANCH);
+  });
+
+  it("adds no warning key at all on the ordinary path", async () => {
+    // Additive: an existing caller's response is byte-identical to pre-4752.
+    expect(result(await plan())).not.toHaveProperty("warning");
   });
 });
 

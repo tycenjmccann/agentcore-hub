@@ -850,6 +850,25 @@ export function baseBranchRefusal(value) {
 }
 
 /**
+ * TEAM-4752 D1 — the create-time refusal when the open-gate sibling scan FAILS.
+ *
+ * Byte-identical in both twins, pinned by src/lib/workflow/sibling-scan-parity
+ * .test.ts (output AND `.toString()` source), for the same reason
+ * baseBranchRefusal is: an agent reads this string and has to be able to act on
+ * it, and two providers disagreeing about the wording is how a persona learns to
+ * pattern-match one of them.
+ *
+ * REFUSE rather than create: see the FAIL DIRECTION note on autowireOpenGate.
+ */
+export function siblingScanRefusal(parentKey, error) {
+  return (
+    `create_ticket refused: the sibling scan under ${parentKey} failed (${error}), so the ` +
+    `open-gate freeze state is unknown and the ticket cannot be created safely. Nothing was ` +
+    `created. Retry the call.`
+  );
+}
+
+/**
  * The ONE machine-parseable line both twins append to a ticket's description.
  *
  * workflow-output's FR-5 refusal reads a ticket back through Tickets___get_issue,
@@ -996,11 +1015,21 @@ async function scanSiblingTickets(parentKey) {
  * and the `autowired` marker for the response — `{ blockedBy, banner, autowired }`
  * on every path, so the caller never has to distinguish absent from unknown.
  *
- * FAIL DIRECTION — OPEN. Any scan failure creates the ticket UNFROZEN: an
- * unfrozen ticket is worked on the wrong branch (recoverable, and the banner is
- * advice, not a lock), whereas a ticket frozen behind a blocker that does not
- * exist never runs at all. Same fail-open discipline as the idempotency guard
- * below.
+ * FAIL DIRECTION — REFUSE THE CREATE (TEAM-4752 D1). It used to fail OPEN, on the
+ * argument that an unfrozen ticket is recoverable while a ticket frozen behind a
+ * blocker that does not exist never runs at all. The second half of that is still
+ * true, which is why the fix is NOT "create it blocked" — a `blocked` ticket with
+ * no blocker edge is a permanent wedge. But the first half was wrong: an unfrozen
+ * ticket is dispatched immediately, onto a branch the open merge is about to
+ * supersede, and that work is thrown away rather than recovered. So a scan failure
+ * now returns `scanFailed` and createTicket refuses (see siblingScanRefusal) —
+ * nothing is created, and the agent can simply retry.
+ *
+ * The refusal is confined to the path this autowire actually governs: a
+ * `human:*` assignee and a parentless create return `untouched` above without ever
+ * scanning, so both stay byte-for-byte as they were. Note the shape-check in
+ * scanSiblingTickets throws for a non-key `parent`, and that now refuses too —
+ * correctly: a parent we cannot even name is not a parent we can clear.
  *
  * `ticketIdIfKnown` exists so a caller that already has an id (a future
  * re-materialization path) cannot freeze a ticket behind itself; both twins mint
@@ -1040,11 +1069,13 @@ async function autowireOpenGate({ parent_key, assignee, blocked_by, ticketIdIfKn
       autowired: { reason: "open_gate", blockedBy: [cd.ticketId], gateTicketId: gate.ticketId },
     };
   } catch (err) {
+    // TEAM-4752 D1: NOT `untouched` — that spelled "we looked and there is no
+    // gate", which is the one thing we do not know here.
     console.warn(
-      `[jira-tools] open-gate autowire failed for parent ${parent_key} ` +
-      `(creating UNFROZEN): ${err.message}`
+      `[jira-tools] open-gate autowire scan failed for parent ${parent_key} ` +
+      `(REFUSING the create): ${err.message}`
     );
-    return untouched;
+    return { ...untouched, scanFailed: true, error: err.message };
   }
 }
 
@@ -1137,15 +1168,20 @@ async function createTicket(params) {
 
   // TEAM-4740 FR-5 (seam 7b): while a Merge Approval gate is open on this run, new
   // agent work is frozen behind the CD ticket rather than pushed onto a branch the
-  // merge is about to supersede. Fails OPEN — an unreadable roster of siblings
-  // creates the ticket unfrozen, never behind a blocker we only guessed at. Runs
-  // AFTER the two gate seams above (TEAM-4739 owns this insertion point first).
+  // merge is about to supersede. Runs AFTER the two gate seams above (TEAM-4739
+  // owns this insertion point first).
+  //
+  // TEAM-4752 D1: an unreadable roster of siblings REFUSES the create — it no
+  // longer files the ticket unfrozen, because "we could not look" is not evidence
+  // that no gate is open. Refused BEFORE the idempotency guard and the create POST,
+  // so nothing reaches Jira.
   const autowire = await autowireOpenGate({
     parent_key,
     assignee,
     blocked_by,
     ticketIdIfKnown: null,
   });
+  if (autowire.scanFailed) throw new Error(siblingScanRefusal(parent_key, autowire.error));
 
   // ─── Idempotency guard ───────────────────────────────────────────────────
   // create_ticket has no natural idempotency, so any repeat (a model retry, an

@@ -89,7 +89,20 @@ async function submitTicketPlan({ workflow_id, epic_id, requirements, tickets })
 
   // Both reads fail open to null; each is skipped when its input is missing.
   const featureBranch = await readFeatureBranch(workflow_id);
-  const rootTicket = epic_id ? findRootTicket(await loadSiblings(epic_id)) : null;
+  // TEAM-4752 D1: the ONE sibling-scan consumer that stays fail-open, and the
+  // reason is that this tool creates nothing. It persists and returns a plan the
+  // agent then copies into N Tickets___create_ticket calls, and the ENFORCING half
+  // of the same freeze rule is the twins' create-time autowire — which 4752 makes
+  // fail-closed. So a failed scan here costs at most an advisory root-blocker edge
+  // on a plan whose real edges are re-derived at create time, whereas refusing
+  // would strand the analyst's whole plan over one throttled Query. What was wrong
+  // was swallowing it: the warning below is now on the RESPONSE, so the agent that
+  // has to copy the plan can see the edge is missing rather than trusting it.
+  const scan = epic_id ? await loadSiblings(epic_id) : { ok: true, siblings: [], error: null };
+  if (!scan.ok) {
+    console.warn(`[submit_ticket_plan] ${workflow_id}: sibling scan under ${epic_id} FAILED (${scan.error}) - root-blocker autowire SKIPPED`);
+  }
+  const rootTicket = findRootTicket(scan.siblings);
   const norm = normalizePlan(parsed.items, { featureBranch, rootTicketId: rootTicket?.ticketId || null, rootTitle: rootTicket?.summary || null });
 
   if (norm.autowired.length > 0) {
@@ -130,6 +143,9 @@ async function submitTicketPlan({ workflow_id, epic_id, requirements, tickets })
     ticket_count: norm.tickets.length,
     tickets: norm.tickets,
     ...(featureBranch ? { integration_branch: featureBranch } : {}),
+    // TEAM-4752 D1: additive, and present only on the failed-scan path — an
+    // ordinary plan's response is byte-identical to before.
+    ...(scan.ok ? {} : { warning: `sibling scan under ${epic_id} failed (${scan.error}) — root-blocker autowire SKIPPED; check each ticket's blockedBy before creating it` }),
     ...(norm.autowired.length > 0 ? { autowired: { reason: "no_root_blocker", rootTicketId: rootTicket?.ticketId || null, tickets: norm.autowired } } : {}),
     message: `Ticket plan saved with ${norm.tickets.length} tickets as a record. The plan above was NORMALIZED${featureBranch ? ` (integration branch ${featureBranch})` : ""}${norm.autowired.length > 0 ? ` and ${norm.autowired.length} ticket(s) were blocked on ${rootTicket?.ticketId}` : ""}. NEXT: you must call Tickets___create_ticket once per ticket, creating them EXACTLY as returned above — the returned titles, descriptions, assignees and blockedBy are authoritative, not the ones you sent. submit_ticket_plan only persists the plan — it does not create tickets.`,
   };
@@ -641,16 +657,47 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   const isEmptySweep = report.outcome === EMPTY_SWEEP_OUTCOME;
   const needsIssue = !isSynthetic && (!prUrlText || followUps.entries.length > 0 || isEmptySweep);
   let issue = null;
+  // TEAM-4752 D1: WHY `issue` is null matters now. "The ticket says it has no
+  // parent" and "we could not read the ticket" are different answers, and the
+  // empty_sweep gate below refuses on the second one.
+  let issueError = null;
   if (needsIssue) {
     const r = await ticketTool("Tickets___get_issue", { ticket_id });
-    if (r.ok) issue = normalizeIssue(r.payload);
-    else console.warn(`[report_completion] ${ticket_id}: get_issue was unreadable (${r.error}) - the base_branch check and the epic lookup FAIL OPEN`);
+    if (!r.ok) {
+      issueError = r.error;
+      console.warn(`[report_completion] ${ticket_id}: get_issue was unreadable (${r.error}) - the base_branch check FAILS OPEN`);
+    } else {
+      issue = normalizeIssue(r.payload);
+      if (!issue) {
+        issueError = "the ticket payload carried no ticket key";
+        console.warn(`[report_completion] ${ticket_id}: get_issue returned a payload with no ticket key - treated as unreadable`);
+      }
+    }
   }
 
   const mainRefusal = mainFixRefusal({ issue, prUrl: pr_url });
   if (mainRefusal) {
     console.warn(`[report_completion] REFUSED ${ticket_id}: ${mainRefusal.reason} (base_branch: main, no pr_url) - no record written, ticket not transitioned`);
     return mainRefusal;
+  }
+
+  // ─── TEAM-4752 D1: the sibling scan, BEFORE anything durable ─────────────────
+  //
+  // It used to run after the record write and after the events, which made the
+  // empty_sweep refusal below impossible to state: by the time we knew the roster
+  // was unreadable, the completion had already been recorded and announced. Now
+  // the scan is the last thing that can refuse the report, and a refusal leaves
+  // no trace — the same discipline as the DL-030 gate above.
+  const epicKey = issue?.parentKey || null;
+  const needsSiblings = followUps.entries.length > 0 || isEmptySweep;
+  const scan = needsSiblings ? await loadSiblings(epicKey) : { ok: true, siblings: [], error: null };
+
+  if (isEmptySweep) {
+    const scanRefusal = emptySweepScanRefusal({ epicKey, issueError, scan });
+    if (scanRefusal) {
+      console.warn(`[report_completion] REFUSED ${ticket_id}: ${scanRefusal.reason} (${issueError ? `get_issue: ${issueError}` : `list_tickets under ${epicKey}: ${scan.error}`}) - no record written, ticket not transitioned`);
+      return scanRefusal;
+    }
   }
 
   // TEAM-4740 FR-14: what happened to the PR, on EVERY record. Derived from the
@@ -689,22 +736,21 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
     observedAt: report.completed_at,
   });
 
-  // The sibling scan, once, shared by the follow-up materializer below and by
-  // FR-10's empty_sweep skip pass. Skipped entirely when nothing needs it.
-  const epicKey = issue?.parentKey || null;
-  const siblings = (followUps.entries.length > 0 || isEmptySweep) && epicKey ? await loadSiblings(epicKey) : [];
-
   // TEAM-4740 FR-10 — BEFORE the sweeper's own transition, and that is the point.
   // The sweeper going Done cascades: the orchestrator unblocks and dispatches
   // whatever was waiting on it. Closing the downstream tickets first means the
   // cascade finds them already done instead of handing a live agent a ticket for a
   // diff that does not exist. `emptySweepSkip` never throws (see FAIL DIRECTION
   // there) so it cannot cost the sweeper its own completion.
+  //
+  // TEAM-4752 D1: the roster is now known to be READABLE at this point — an
+  // unreadable one refused the whole report above — so the `else` below means
+  // exactly one thing: this sweeper has no siblings to close.
   let emptySweep = null;
-  if (isEmptySweep && siblings.length > 0) {
-    emptySweep = await emptySweepSkip({ siblings, ticketId: ticket_id, workflowId: workflow_id });
+  if (isEmptySweep && scan.siblings.length > 0) {
+    emptySweep = await emptySweepSkip({ siblings: scan.siblings, ticketId: ticket_id, workflowId: workflow_id });
   } else if (isEmptySweep) {
-    console.warn(`[report_completion] ${ticket_id}: outcome empty_sweep but no siblings were readable${epicKey ? ` under ${epicKey}` : " (no epic resolved)"} - nothing skipped`);
+    console.warn(`[report_completion] ${ticket_id}: outcome empty_sweep and the sibling roster is readable but EMPTY${epicKey ? ` under ${epicKey}` : " (the ticket has no parent)"} - nothing to skip`);
   }
 
   // Transition ticket to Done in Jira — this triggers the webhook cascade
@@ -738,7 +784,8 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   if (followUps.entries.length > 0) {
     try {
       materialized = await materializeFollowUps({
-        entries: followUps.entries, siblings, ticketId: ticket_id, workflowId: workflow_id, epicKey,
+        entries: followUps.entries, siblings: scan.siblings, scanOk: scan.ok,
+        ticketId: ticket_id, workflowId: workflow_id, epicKey,
       });
     } catch (err) {
       console.error(`[report_completion] ${ticket_id}: follow-up materialization threw (${err.name}: ${err.message}) - the completion STANDS`);
@@ -1204,15 +1251,31 @@ export function findCdTicket(siblings, { exclude } = {}) {
   return sorted[sorted.length - 1];
 }
 
-/** The sibling scan. Fails to an EMPTY list, loudly — never to a partial answer. */
+/**
+ * The sibling scan. Returns `{ ok, siblings, error }` — never a bare list.
+ *
+ * TEAM-4752 D1: it used to fail to an EMPTY list, which made "we looked and this
+ * epic has no siblings" and "we could not look" the same answer to every caller.
+ * Three separate writes then proceeded on that false negative: the follow-up
+ * dedupe (duplicate tickets on a redelivery), the empty_sweep skip pass (a Done
+ * transition that cascades the run onto a diff that does not exist) and — in the
+ * twins — the open-gate freeze. This is the SAME three-outcome discipline
+ * probeCdLedger already applies to the cd-ledger: only a definite negative
+ * licenses a dependent write, and no caller can mistake failure for empty
+ * because failure is not spelled `[]` any more.
+ *
+ * `siblings` is still `[]` on failure so a caller that only reads rows cannot
+ * crash, but every caller here checks `ok` first.
+ */
 async function loadSiblings(epicKey) {
-  if (!epicKey) return [];
+  // A definite negative: no epic ⇒ no siblings, and nothing was attempted.
+  if (!epicKey) return { ok: true, siblings: [], error: null };
   const r = await ticketTool("Tickets___list_tickets", { parent_id: epicKey });
   if (!r.ok) {
     console.error(`[report_completion] sibling scan under ${epicKey} FAILED (${r.error}) - follow-ups cannot be deduped or frozen`);
-    return [];
+    return { ok: false, siblings: [], error: r.error };
   }
-  return normalizeSiblings(r.payload);
+  return { ok: true, siblings: normalizeSiblings(r.payload), error: null };
 }
 
 // ─── TEAM-4740 FR-10: the empty sweep ─────────────────────────────────────────
@@ -1225,6 +1288,40 @@ async function loadSiblings(epicKey) {
 // record that says why — which is the difference between a skipped ticket and a
 // lost one.
 export const EMPTY_SWEEP_OUTCOME = "empty_sweep";
+
+/**
+ * TEAM-4752 D1 — the empty_sweep half of the fail-closed rule, as a VALUE.
+ *
+ * `outcome: "empty_sweep"` is a claim about OTHER tickets: it says "these siblings
+ * have provably nothing left to do, close them". The sweeper's own Done transition
+ * then cascades. So when the sibling roster is UNKNOWN, the honest answer is not
+ * "skip nothing and go Done anyway" — which is what shipped, and which hands
+ * downstream agents a ticket for a diff that does not exist — it is to refuse the
+ * whole report and let the persona retry. Refusing is cheap and recoverable; the
+ * cascade is neither.
+ *
+ * Two reads can leave the roster unknown, and BOTH count:
+ *   - the sweeper's own get_issue failed, so we do not even know its epic;
+ *   - the list_tickets scan under a known epic failed.
+ * A ticket that PROVABLY has no parent is NOT refused — that is a definite
+ * negative, and it keeps the pre-4752 warn-and-proceed path.
+ *
+ * Returns null when the report may proceed.
+ */
+export function emptySweepScanRefusal({ epicKey, issueError, scan }) {
+  const what = issueError
+    ? `the sweeper's own ticket could not be read (${issueError}), so its epic - and with it the set of tickets this sweep would close - is unknown`
+    : scan && !scan.ok
+      ? `the sibling scan under ${epicKey} failed (${scan.error}), so the tickets this sweep must close are unknown`
+      : null;
+  if (!what) return null;
+  return {
+    ok: false,
+    reason: "sibling_scan_failed",
+    missing: [],
+    message: `outcome "${EMPTY_SWEEP_OUTCOME}" was refused: ${what}. Transitioning this ticket to Done now would cascade the run onto a diff that does not exist. Nothing was recorded and the ticket was NOT transitioned. Retry the call.`,
+  };
+}
 
 /**
  * The skip order: dependents BEFORE the tickets they are blocked by.
@@ -1417,17 +1514,33 @@ export function followUpCreateParams({ entry, ticketId, workflowId, epicKey, cdT
 }
 
 /**
- * Materialize the surviving entries. Runs AFTER the record write and AFTER the
+ * Materialize the surviving entries. Runs AFTER the record write and BEFORE the
  * ticket's own Done transition, and every failure is a logged value on the
  * response — the completion stays `ok`.
  *
- * That ordering is deliberate and is a trade: materializing first would close the
- * theoretical race where the orchestrator evaluates completion before a gating
- * follow-up exists, but it would also mean a slow or throttled ticket Lambda can
- * time this invoke out and leave the ticket NEVER transitioned — a wedged run,
- * which is strictly worse than a follow-up the next sweep picks up.
+ * TEAM-4752 D2 moved it before that transition. It used to run last, which left a
+ * real race rather than a theoretical one: the Done transition cascades, the
+ * orchestrator evaluates completion, and completion.mjs rule (iii) can only be
+ * gated by a follow-up ticket that EXISTS. For the run's last ticket — the CD
+ * ticket, with nothing else open — the epic could therefore roll to `complete`
+ * before the agent-owned follow-up this report is handing on had been filed.
+ *
+ * The trade that replaces it: the record is already durable in S3 before this
+ * runs, so the only risk left is a slow ticket Lambda pushing the transition
+ * later in the same invoke. That is bounded — at most 5 entries (SEC-11) against
+ * a 60 s budget — and the caller wraps this in a try/catch, so even a throw
+ * leaves the transition to happen. What was closed is unbounded: a follow-up that
+ * never gated the epic it was created to gate.
+ *
+ * TEAM-4752 D1: `scanOk: false` (the sibling roster is unknown) creates NOTHING.
+ * The dedupe below is the whole defence against duplicate follow-ups on a
+ * redelivery, and it reads the sibling list — so creating on an unreadable roster
+ * is exactly how FR-13's `(ticketId, kind, title)` key gets violated. Every entry
+ * comes back as `failed[*].reason = "sibling_scan_failed"` and the persona can
+ * retry safely, because the `[fu:<8hex>]` title dedupe now runs against a roster
+ * that is either right or absent.
  */
-async function materializeFollowUps({ entries, siblings, ticketId, workflowId, epicKey }) {
+async function materializeFollowUps({ entries, siblings, scanOk = true, ticketId, workflowId, epicKey }) {
   const created = [];
   const skipped = [];
   const failed = [];
@@ -1438,6 +1551,13 @@ async function materializeFollowUps({ entries, siblings, ticketId, workflowId, e
     // filing it.
     console.error(`[report_completion] ${ticketId}: cannot materialize ${entries.length} follow-up(s) - the epic (parent) could not be resolved`);
     return { created, skipped, failed: entries.map((e) => ({ hash: e.hash, kind: e.kind, title: e.title, reason: "epic_unresolved" })) };
+  }
+  if (!scanOk) {
+    // TEAM-4752 D1: fail CLOSED. Creating here would be creating blind — the
+    // dedupe set below would be empty for the same reason the roster is, so a
+    // redelivered report files a second copy of every follow-up.
+    console.error(`[report_completion] ${ticketId}: cannot materialize ${entries.length} follow-up(s) - the sibling scan under ${epicKey} failed, so a duplicate cannot be ruled out`);
+    return { created, skipped, failed: entries.map((e) => ({ hash: e.hash, kind: e.kind, title: e.title, reason: "sibling_scan_failed" })) };
   }
   const cd = findCdTicket(siblings, { exclude: ticketId });
   const cdTicketId = cd && !isDoneStatus(cd.status) ? cd.ticketId : null;
