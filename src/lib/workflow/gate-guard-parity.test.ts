@@ -784,7 +784,7 @@ describe("a refusal's side effects", () => {
     expect(h.jira.writes.filter((w) => /\/comment$/.test(w.path)), "no second refusal comment (jira)").toHaveLength(0);
   });
 
-  it("a rejected approval says `block`, not close — a human decision is never overwritten", async () => {
+  it("a Failed approval says `block`, not close — and does not presume a rejection", async () => {
     const scn: Scenario = {
       labels: DEPLOY_LABELS,
       probes: [
@@ -796,7 +796,12 @@ describe("a refusal's side effects", () => {
     };
     const t = await runTickets(scn);
     const j = await runJira(scn);
-    expect(t.payload?.hint).toContain("REJECTED by a human");
+    // TEAM-4750 B4: CodePipeline marks a ManualApproval Failed on its 7-day timeout
+    // too, and the row does not say which happened — so the hint names BOTH causes
+    // rather than accusing a reviewer of a decision they may not have made. The
+    // refusal itself is unchanged: either way this run's approval did not pass.
+    expect(t.payload?.hint).toContain("REJECTED");
+    expect(t.payload?.hint).toContain("TIMED OUT");
     expect(t.payload?.hint).toContain("`block`");
     expect(j.payload).toEqual(t.payload);
   });

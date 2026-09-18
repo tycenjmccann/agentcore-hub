@@ -567,15 +567,20 @@ export async function verifyGateCondition(fnName, opts = {}) {
       return admit("indeterminate", "probe_unanswerable", state.reason || "unanswerable");
     }
 
-    // (1) The most definite negative there is: a human REJECTED at the approval
-    // action. actionDetails is execution-scoped (ListActionExecutions filtered by
-    // pipelineExecutionId), so a Failed approval row here is this run's rejection.
+    // (1) The most definite negative there is: the approval action is recorded as
+    // Failed. Two things produce that row and CodePipeline does not distinguish
+    // them — a human rejected the approval, or the ManualApproval timed out after
+    // its 7 days (TEAM-4750 B4) — so the hint must not accuse a reviewer of a
+    // decision they may never have made. Either way THIS run's approval did not
+    // pass, which is what makes it a refusal at all. actionDetails is
+    // execution-scoped (ListActionExecutions filtered by pipelineExecutionId), so a
+    // Failed approval row here belongs to this run and not to a neighbouring one.
     const rejected = (Array.isArray(state.actionDetails) ? state.actionDetails : []).find(
       (a) => a && /approv/i.test(String(a.action || "")) && String(a.status) === "Failed"
     );
     if (rejected) {
       return refuse(
-        `the deploy approval was REJECTED by a human at ${stageAction(rejected)} — closing this ticket as done would overwrite that decision. Transition it \`block\` instead and file the work the reviewer asked for.`,
+        `the deploy approval at ${stageAction(rejected)} is recorded as Failed — it was REJECTED by a human, or CodePipeline TIMED OUT the approval after 7 days. Either way this run's approval did not pass, and closing this ticket as done would record one that never happened. Transition it \`block\` instead: file the work the reviewer asked for if there was a rejection, or re-run the deploy to page for the approval again if it timed out.`,
         rejected
       );
     }
