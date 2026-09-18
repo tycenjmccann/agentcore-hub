@@ -279,7 +279,9 @@ const SHIP_SATISFIED_VERDICTS: readonly string[] = ["shipped", "handoff"];
  * the orchestrator twin — "cannot prove a phantom with nothing to inspect → stay
  * green"; human review-gate tickets owe no verdict; "deploy-blocked" outranks
  * "static-ci-only". Runs with no ship phase return required=false (untouched).
- * Keep this in agreement with completion.mjs.
+ * Keep this in agreement with completion.mjs. TEAM-4768's `handoff` key is the one
+ * deliberate omission: it exists only to exempt a pure-handoff run from the
+ * orchestrator's GitHub merge-verify probe, and this route has no such probe.
  */
 function evaluateShipVerdict(
   tickets: Ticket[],

@@ -301,7 +301,10 @@ describe("TEAM-4660 — a CD handoff closes the run complete, not static-ci-only
     // These two assertions are the ones that FAILED before this fix (the run closed
     // on the static-ci-only terminal phase instead of completing).
     expect(verdict.outcome).not.toBe("static-ci-only");
-    expect(verdict).toEqual({ required: true, shipped: true, outcome: null, blockReason: null, offenders: [] });
+    // TEAM-4768: `handoff` is what tells completeWorkflow's merge-verify probe there
+    // is no merge claim to cross-check, so the open PR below is not read as a CD
+    // failure and the run is not left open forever.
+    expect(verdict).toEqual({ required: true, shipped: true, handoff: true, outcome: null, blockReason: null, offenders: [] });
   });
 
   it("the run closes GREEN and the delivery row says how it was handed off", async () => {

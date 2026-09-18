@@ -479,7 +479,7 @@ describe("shipVerdictOf — one harvested ship entry (TEAM-3747 D2)", () => {
 describe("evaluateShipVerdict — run-level verdict (TEAM-3747 D2)", () => {
   it("a done ship ticket WITH a merge commit ships the run", () => {
     const v = evaluateShipVerdict(doneRun(), tasksWithShip({ mergeCommit: "9f1c2ab", prUrl: "https://github.com/o/r/pull/7" }), SHIP, opts);
-    expect(v).toEqual({ required: true, shipped: true, outcome: null, blockReason: null, offenders: [] });
+    expect(v).toEqual({ required: true, shipped: true, handoff: false, outcome: null, blockReason: null, offenders: [] });
   });
 
   it("AC-D2.4: a done ship ticket with only output/artifact has NO verdict → static-ci-only", () => {
@@ -492,6 +492,7 @@ describe("evaluateShipVerdict — run-level verdict (TEAM-3747 D2)", () => {
     expect(v).toEqual({
       required: true,
       shipped: false,
+      handoff: false,
       outcome: "static-ci-only",
       blockReason: null,
       offenders: [{ ticketId: "T-4", phase: "ship", verdict: "none" }],
@@ -538,7 +539,7 @@ describe("evaluateShipVerdict — run-level verdict (TEAM-3747 D2)", () => {
 
   it('TEAM-4739: an empty_sweep ship entry ships the run with no offenders', () => {
     const v = evaluateShipVerdict(doneRun(), tasksWithShip({ outcome: "empty_sweep" }), SHIP, opts);
-    expect(v).toEqual({ required: true, shipped: true, outcome: null, blockReason: null, offenders: [] });
+    expect(v).toEqual({ required: true, shipped: true, handoff: false, outcome: null, blockReason: null, offenders: [] });
   });
 
   it("resolves the ship entry keyed by task id with a ticketId field", () => {
@@ -551,7 +552,7 @@ describe("evaluateShipVerdict — run-level verdict (TEAM-3747 D2)", () => {
     // to inspect, so the gate cannot prove a phantom (required, still shipped).
     const children = doneRun().filter((t) => t.ticketId !== "T-4");
     expect(evaluateShipVerdict(children, {}, SHIP, opts)).toEqual({
-      required: true, shipped: true, outcome: null, blockReason: null, offenders: [],
+      required: true, shipped: true, handoff: false, outcome: null, blockReason: null, offenders: [],
     });
   });
 
@@ -586,7 +587,7 @@ describe("evaluateShipVerdict — run-level verdict (TEAM-3747 D2)", () => {
 
   it("guards: a non-array children list is inert", () => {
     expect(evaluateShipVerdict(undefined, {}, SHIP, opts)).toEqual({
-      required: false, shipped: true, outcome: null, blockReason: null, offenders: [],
+      required: false, shipped: true, handoff: false, outcome: null, blockReason: null, offenders: [],
     });
   });
 
@@ -636,7 +637,7 @@ describe("AC-D2.5 — legacy records evaluate exactly as before D2", () => {
     const shipPhases = LEGACY_DEF.completionRequiresAgentPhases.filter((p) => SHIP_PHASES.has(p));
     expect(shipPhases).toEqual([]);
     expect(evaluateShipVerdict(LEGACY_CHILDREN, LEGACY_TASKS, shipPhases, opts)).toEqual({
-      required: false, shipped: true, outcome: null, blockReason: null, offenders: [],
+      required: false, shipped: true, handoff: false, outcome: null, blockReason: null, offenders: [],
     });
   });
 
@@ -994,6 +995,9 @@ describe("shipVerdictOf — empty_sweep (TEAM-4740 FR-10)", () => {
     expect(verdict).toEqual({
       required: true,
       shipped: true,
+      // An empty sweep IS shipped, so it is not a handoff — it stays subject to the
+      // merge-verify probe (which fails open on a branch with nothing to compare).
+      handoff: false,
       outcome: null,
       blockReason: null,
       offenders: [],
@@ -1048,10 +1052,27 @@ describe("shipVerdictOf / evaluateShipVerdict — handoff (TEAM-4763 P1-A)", () 
     expect(verdict).toEqual({
       required: true,
       shipped: true,
+      // TEAM-4768: the run is shipped PURELY by handoff, so completeWorkflow skips
+      // the merge-verify probe — this PR is open by definition and there is no merge
+      // claim to cross-check. Without this key the probe refused the run forever.
+      handoff: true,
       outcome: null,
       blockReason: null,
       offenders: [],
     });
+  });
+
+  it("a mixed run (one handoff, one shipped) is NOT probe-exempt (TEAM-4768)", () => {
+    // A "shipped" ticket beside the handoff IS a merge claim, so the run keeps
+    // paying the GitHub cross-check. handoff must be false, not "any handoff".
+    const children = doneRun([{ ticketId: "T-5", assignee: "rm", status: "done" }]);
+    const tasks = {
+      ...tasksWithShip({ outcome: "handoff", prUrl: "https://github.com/o/r/pull/7" }),
+      "T-5": { ticketId: "T-5", mergeCommit: "9f1c2ab" },
+    };
+    const verdict = evaluateShipVerdict(children, tasks, SHIP, opts);
+    expect(verdict.shipped).toBe(true);
+    expect(verdict.handoff).toBe(false);
   });
 
   it("a real block beside a handoff still blocks — the gate is not softened", () => {

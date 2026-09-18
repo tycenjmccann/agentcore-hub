@@ -39,6 +39,7 @@ const h = vi.hoisted(() => ({
     claims: /** @type {any[]} */ ([]),
     notifications: /** @type {any[]} */ ([]),
     completions: /** @type {any[]} */ ([]),
+    terminalClaims: /** @type {any[]} */ ([]),
     deliveries: /** @type {any[]} */ ([]),
     githubCalls: /** @type {any[]} */ ([]),
   },
@@ -132,7 +133,7 @@ vi.mock("./workflow-store.mjs", () => ({
   appendNotification: vi.fn(async () => {}),
   ackNotifications: vi.fn(async () => {}),
   completeWorkflow: vi.fn(async (id, ts) => { h.state.completions.push({ id, ts }); return true; }),
-  claimTerminalOutcome: vi.fn(async () => true),
+  claimTerminalOutcome: vi.fn(async (id, outcome) => { h.state.terminalClaims.push({ id, outcome }); return true; }),
   claimFinalization: vi.fn(async () => false),
   markFinalized: vi.fn(async () => {}),
   setDelivery: vi.fn(async (id, d) => { h.state.deliveries.push({ id, d }); }),
@@ -232,6 +233,7 @@ beforeEach(() => {
   h.state.claims.length = 0;
   h.state.notifications.length = 0;
   h.state.completions.length = 0;
+  h.state.terminalClaims.length = 0;
   h.state.deliveries.length = 0;
   h.state.githubCalls.length = 0;
   h.state.s3Gets.length = 0;
@@ -475,5 +477,110 @@ describe("4. completion — HANDOFF run ends at the PR", () => {
     expect(await isWorkflowComplete(EPIC, h.state.workflow, DEV)).toBe(false);
     expect(h.state.completions).toHaveLength(0);
     expect(h.state.githubCalls.filter((c) => c.method === "POST" && /\/pulls$/.test(c.url))).toHaveLength(0);
+  });
+});
+
+/**
+ * TEAM-4768 (QA r2 R2-1) — a REGISTERED repo whose release manager honestly
+ * reported `outcome:"handoff"`. The PR is open for the owning team and nothing
+ * merged, which is exactly what the TEAM-3721 merge-verify probe calls "provably
+ * unmerged": pre-fix the probe ran first, emitted workflow.cd_unmerged and
+ * returned, so the run never reached store.completeWorkflow or setDelivery and
+ * stayed OPEN forever. The honest "not merged" of a handoff is not a CD merge
+ * failure, so a PURE-handoff ship verdict now skips the probe — there is no merge
+ * claim to cross-check. The two controls beside it are the proof that nothing
+ * else was softened.
+ */
+describe("5. completion — CD run handed off (TEAM-4768)", () => {
+  const PR = "https://github.com/acme/juno/pull/634";
+
+  /** Every phase done, ship included: T-4 is the RM's CD ticket, T-5 the human gate. */
+  const shipDone = (shipEntry) => {
+    h.state.children = [
+      { ticketId: "T-1", parentId: EPIC, assignee: DEV, type: "task", status: "done", phase: "development" },
+      { ticketId: "T-2", parentId: EPIC, assignee: "agentcore_hub_qa_verifier", type: "task", status: "done", phase: "verification" },
+      { ticketId: "T-3", parentId: EPIC, assignee: "agentcore_hub_ci_agent", type: "task", status: "done", phase: "review" },
+      { ticketId: "T-4", parentId: EPIC, assignee: RM, type: "task", status: "done", phase: "ship" },
+      { ticketId: "T-5", parentId: EPIC, assignee: "human:engineer", type: "task", status: "done", phase: "ship", labels: ["human-review"], blockedBy: ["T-4"] },
+    ];
+    h.state.workflow.agentTasks = {
+      "T-1": { ticketId: "T-1", status: "complete", output: "implemented" },
+      "T-2": { ticketId: "T-2", status: "complete", output: "verified" },
+      "T-3": { ticketId: "T-3", status: "complete", output: "ci green" },
+      "T-4": { ticketId: "T-4", status: "complete", output: "handed off", prUrl: PR, ...shipEntry },
+    };
+  };
+
+  /** GitHub says the branch is UNMERGED: no merged PR, compare ahead by 3. */
+  const unmergedGitHub = () => {
+    global.fetch = vi.fn(async (url, init) => {
+      h.state.githubCalls.push({ url: String(url), method: init?.method || "GET", body: init?.body ? JSON.parse(init.body) : null });
+      const u = String(url);
+      const body = u.includes("/pulls?") ? [{ merged_at: null, html_url: PR }]
+        : u.includes("/compare/") ? { status: "ahead", ahead_by: 3 }
+        : {};
+      const text = JSON.stringify(body);
+      return { ok: true, status: 200, json: async () => body, text: async () => text };
+    });
+  };
+
+  it('outcome:"handoff" → the probe is SKIPPED, the run completes, delivery says complete-with-handoff', async () => {
+    await load(REGISTERED);
+    shipDone({ outcome: "handoff" }); // no mergeCommit — a handoff never claims a merge
+    unmergedGitHub();
+
+    expect(await isWorkflowComplete(EPIC, h.state.workflow, RM)).toBe(true);
+    await completeWorkflow(h.state.workflow);
+
+    expect(h.state.completions).toEqual([{ id: "wf_1", ts: expect.any(String) }]);
+    expect(h.state.deliveries).toEqual([{
+      id: "wf_1",
+      d: { mode: "cd", pipeline: "juno-deploy", outcome: "complete-with-handoff", prState: "open", at: expect.any(String) },
+    }]);
+    expect(eventsOf("workflow.complete")).toHaveLength(1);
+    expect(eventsOf("workflow.cd_unmerged")).toHaveLength(0);
+    // The exemption is a SKIP, not a tolerated refusal: no probe call at all, and
+    // the ship phase still owns the PR so nothing is created here either.
+    expect(h.state.githubCalls).toEqual([]);
+  });
+
+  it('CONTROL outcome:"shipped" on the same unmerged branch → still cd_unmerged, run stays open', async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    await load(REGISTERED);
+    shipDone({ outcome: "shipped" }); // a merge CLAIM, and GitHub disproves it
+    unmergedGitHub();
+
+    await completeWorkflow(h.state.workflow);
+
+    const refused = eventsOf("workflow.cd_unmerged");
+    expect(refused).toHaveLength(1);
+    expect(refused[0].detail).toMatchObject({
+      workflowId: "wf_1",
+      featureBranch: "feature/EPIC-1-highlight-reel",
+      reason: expect.stringContaining("ahead"),
+    });
+    expect(h.state.completions).toEqual([]);
+    expect(h.state.deliveries).toEqual([]);
+    expect(eventsOf("workflow.complete")).toHaveLength(0);
+    expect(error.mock.calls.some((c) => String(c[0]).includes("CompletionRejectedUnmergedBranch"))).toBe(true);
+    error.mockRestore();
+  });
+
+  it('CONTROL outcome:"static-ci-only" with GitHub down → closeWorkflowBlocked, no delivery', async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    await load(REGISTERED);
+    shipDone({ outcome: "static-ci-only" });
+    global.fetch = vi.fn(async (url, init) => {
+      h.state.githubCalls.push({ url: String(url), method: init?.method || "GET", body: null });
+      return { ok: false, status: 503, text: async () => "boom" };
+    });
+
+    await completeWorkflow(h.state.workflow);
+
+    // Probe fails open (merged:null, no proof), so D2 closes on the honest outcome.
+    expect(h.state.terminalClaims).toEqual([{ id: "wf_1", outcome: "static-ci-only" }]);
+    expect(h.state.completions).toEqual([]);
+    expect(h.state.deliveries).toEqual([]);
+    error.mockRestore();
   });
 });
