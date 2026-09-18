@@ -1809,7 +1809,7 @@ def S3Storage___list_objects(prefix: str = "", bucket: str = "") -> str:
 # ─── Ticket Tools ────────────────────────────────────────────────────────────
 
 @tool
-def Tickets___create_ticket(title: str, description: str, parent_id: str = "", assignee: str = "", ticket_type: str = "task", blocked_by: str = "", workflow_id: str = "", phase: str = "", spawned_by_kind: str = "", spawned_by_origin_id: str = "", invariant: str = "", evidence_source: str = "", evidence_repro: str = "", cited_location: str = "", sibling_scope: str = "", labels: str = "") -> str:
+def Tickets___create_ticket(title: str, description: str, parent_id: str = "", assignee: str = "", ticket_type: str = "task", blocked_by: str = "", workflow_id: str = "", phase: str = "", spawned_by_kind: str = "", spawned_by_origin_id: str = "", invariant: str = "", evidence_source: str = "", evidence_repro: str = "", cited_location: str = "", sibling_scope: str = "", labels: str = "", base_branch: str = "") -> str:
     """Create a new ticket in the project tracker.
 
     MANDATORY TICKETS (create these for EVERY workflow, no exceptions):
@@ -1864,6 +1864,12 @@ def Tickets___create_ticket(title: str, description: str, parent_id: str = "", a
         sibling_scope: other tickets/components this fix must NOT touch (or "none").
         labels: comma-separated free labels (e.g. "advisory"). System prefixes (fix:, origin:,
             phase:, …) are dropped.
+        base_branch: ONLY for a hub-infra fix ticket you file as the release manager after
+            a failed ship — a defect in the HUB's own infra (a Pipeline___* tool, a Lambda
+            env var, an IAM policy, the pipeline stack) rather than the target repo's code.
+            Pass "main" so the fix opens its PR against the hub's default branch instead of
+            riding this run's PR. Leave "" on every other ticket: absent means "no branch
+            was stated", and the run's own integration branch is the default.
     """
     blockers = [b.strip() for b in blocked_by.split(",") if b.strip()] if blocked_by else []
     # Auto-inject workflow_id from invocation context if agent didn't pass one —
@@ -1917,6 +1923,13 @@ def Tickets___create_ticket(title: str, description: str, parent_id: str = "", a
     free_labels = [l.strip() for l in labels.split(",") if l.strip()]
     if free_labels:
         payload["labels"] = free_labels
+    # TEAM-4749 A1a: additive on the labels/fix_contract rule — forwarded only when
+    # non-blank, so every pre-4749 payload stays byte-identical. Both ticket twins
+    # already read and validate this key (tickets index.mjs createTicket, jira
+    # index.mjs createIssue); the blueprint told the release manager to pass it long
+    # before the signature could accept it.
+    if base_branch.strip():
+        payload["base_branch"] = base_branch.strip()
     return _invoke_lambda(TICKET_TOOLS_LAMBDA, "Tickets___create_ticket", payload)
 
 
@@ -1986,8 +1999,16 @@ def Tickets___add_comment(ticket_id: str, comment: str) -> str:
         ticket_id: The ticket ID to comment on
         comment: Comment text to add
     """
+    # TEAM-4749 sibling sweep: send the text under BOTH key names, exactly as
+    # Tickets___get_issue above sends `ticket_id` + `issue_key` and for the same
+    # reason — the twins disagree on the wire name. The Jira twin destructures
+    # `comment` (jira index.mjs addComment), the DDB twin reads `body || content`
+    # (tickets index.mjs addComment) and answered "Error: 'body' is required" to
+    # every comment in TICKET_PROVIDER=dynamodb mode, which is the code default
+    # when the var is unset. `body` is read in exactly one place across both twins
+    # and neither rejects unknown keys, so the extra key is inert on Jira.
     return _invoke_lambda(TICKET_TOOLS_LAMBDA, "Tickets___add_comment", {
-        "ticket_id": ticket_id, "comment": comment
+        "ticket_id": ticket_id, "comment": comment, "body": comment
     })
 
 
@@ -2080,7 +2101,7 @@ def Pipeline___get_state(pipeline_name: str = "", execution_id: str = "") -> str
 
 
 @tool
-def Pipeline___start_deploy(pipeline_name: str = "", commit_sha: str = "", approved_head_sha: str = "", ci_build_id: str = "", pr_url: str = "", workflow_id: str = "", ticket_id: str = "") -> str:
+def Pipeline___start_deploy(pipeline_name: str = "", commit_sha: str = "", approved_head_sha: str = "", ci_build_id: str = "", pr_url: str = "", workflow_id: str = "", ticket_id: str = "", abandon: str = "") -> str:
     """Trigger a deploy pipeline execution. Call this AFTER merging the PR (the
     GitHub push auto-trigger is not wired) and again after a build-failure fix has
     landed on the default branch, to re-run. Returns the pipelineExecutionId.
@@ -2132,6 +2153,18 @@ def Pipeline___start_deploy(pipeline_name: str = "", commit_sha: str = "", appro
             refused (reason pr_url_missing) and the human gate fires.
         workflow_id: The workflow this deploy belongs to — audit context.
         ticket_id: Your CD/ship ticket ID — audit context.
+        abandon: "true" to discard the execution parked in front of you. EXPLICIT
+            OPT-IN ONLY, and only after start_deploy already refused with
+            reason: "approval_stage_occupied" and remedy: "abandon" — never on a
+            first call, never on a guess. Default ("") stops nothing. Asking is
+            not getting: the Lambda honours it only when GitHub PROVES the
+            blocking execution's commit is already contained in what you are
+            deploying, the gate is still that same execution's on a fresh read,
+            and the stop is confirmed Stopped. Otherwise it refuses with
+            ancestry_unproven, gate_no_longer_occupied, abandon_not_permitted or
+            abandon_unconfirmed, and NOTHING is started and NO ship-approval
+            record is written. This is not an approval capability: no tool here
+            can approve a deploy gate for you or for anyone else.
     """
     args = {}
     if pipeline_name:
@@ -2151,6 +2184,13 @@ def Pipeline___start_deploy(pipeline_name: str = "", commit_sha: str = "", appro
         args["workflow_id"] = workflow_id.strip()
     if ticket_id.strip():
         args["ticket_id"] = ticket_id.strip()
+    # TEAM-4749 A1b: explicit opt-in. The Lambda accepts only `true` / "true"
+    # (pipeline-tools index.mjs startDeploy) — it does NOT test JS truthiness — so
+    # the tokens an agent plausibly types are normalized here and anything else is
+    # OMITTED. An absent key is "stop nothing", which is the safe default and
+    # byte-identical to every pre-4749 call.
+    if abandon.strip().lower() in ("true", "1", "yes"):
+        args["abandon"] = True
     return _invoke_lambda(PIPELINE_TOOLS_LAMBDA, "Pipeline___start_deploy", args)
 
 
@@ -3932,9 +3972,14 @@ def _publish_agent_died(workflow_id: str, agent_id: str, ticket_id: str = "",
 # 40-minute persona turn therefore killed the whole turn, and the persona's ticket
 # stayed parked until the sweep noticed.
 #
-# The retry re-enters `agent.stream_async(prompt)` on the SAME Agent object, so
-# the conversation, the tool results already returned and the prompt cache all
-# survive; nothing is rebuilt and the prompt is never re-derived.
+# The retry re-enters `agent.stream_async` on the SAME Agent object, so the
+# conversation, the tool results already returned and the prompt cache all
+# survive; nothing is rebuilt and the prompt is never re-derived. It is also never
+# re-SENT: a retry passes `[]` so the vendored conversation manager appends no
+# second copy of the prompt (TEAM-4749 A2, see `_stream_with_retry`). The wall
+# budget below bounds retry time and is armed at the first failure, not at the top
+# of the turn — a 40-minute turn must not arrive at its first break with the
+# budget already spent.
 _STREAM_RETRY_MAX_ATTEMPTS = 3
 _STREAM_RETRY_BUDGET_S = 60.0
 _STREAM_RETRY_BASE_S = 1.0
@@ -4352,22 +4397,46 @@ async def _run_agent_invocation(payload, context):
             (`final_text`, `_text_buffer`, `streamed_any`, the DDB deltas already
             published) survives untouched — a retry appends, it never replays.
 
-            Re-entry is on the SAME Agent object with the SAME prompt object: the
-            conversation, the tool results already returned and the prompt cache
-            are all state on that agent, and rebuilding either would throw the
-            turn away to save the stream. On exhaustion the error is surfaced as
-            `agent.error` and re-raised, which is what keeps agent.error and
+            Re-entry is on the SAME Agent object, so the conversation, the tool
+            results already returned and the prompt cache are all preserved —
+            rebuilding either would throw the turn away to save the stream. But a
+            RETRY re-enters with `[]`, never with the prompt again: see the
+            comment on `stream_input` below. On exhaustion the error is surfaced
+            as `agent.error` and re-raised, which is what keeps agent.error and
             agent.died disjoint."""
             attempt = 0
-            deadline = time.monotonic() + _STREAM_RETRY_BUDGET_S
+            deadline = None  # A3: armed at the FIRST failure, not here
+            baseline = len(getattr(agent, "messages", None) or [])
             while True:
                 attempt += 1
+                # TEAM-4749 A2: attempt 1 delivers the prompt; a retry must NOT.
+                # strands 1.53/1.54 `_convert_prompt_to_messages` appends a fresh
+                # user message for any str, so re-sending the prompt put TWO
+                # adjacent user messages in history, Bedrock answered
+                # ValidationException, and `_classify_stream_error` correctly
+                # called that `fail` — the retry was guaranteed to destroy the
+                # turn it exists to save. `[]` appends nothing AND still runs the
+                # vendored dangling-toolUse repair (an assistant(toolUse) tail
+                # gets its synthetic user(toolResult)), which `None` would skip.
+                # Truncating agent.messages instead would discard the tool results
+                # this docstring promises to keep. The len() test is the honest
+                # fallback: if attempt 1 died before history grew, the prompt
+                # never reached the model and must be re-sent.
+                delivered = len(getattr(agent, "messages", None) or []) > baseline
+                stream_input = [] if delivered else prompt
                 try:
-                    async for _ev in agent.stream_async(prompt):
+                    async for _ev in agent.stream_async(stream_input):
                         yield _ev
                     return
                 except Exception as exc:  # noqa: BLE001 — classified below
                     verdict = _classify_stream_error(exc)
+                    if deadline is None:
+                        # A3: the budget bounds RETRY time, not stream duration.
+                        # Armed before `while True` it was already spent by the
+                        # time a long turn broke, so every break past minute 1
+                        # gave up on attempt 1 and FR-6 never fired on the only
+                        # turns long enough to need it.
+                        deadline = time.monotonic() + _STREAM_RETRY_BUDGET_S
                     remaining = deadline - time.monotonic()
                     exhausted = (verdict != "retry"
                                  or attempt >= _STREAM_RETRY_MAX_ATTEMPTS

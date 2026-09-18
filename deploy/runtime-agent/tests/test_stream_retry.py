@@ -15,10 +15,22 @@ What is pinned here:
      deterministic fails, and anything unrecognised fails (a transient we fail to
      retry costs one turn the sweep recovers; a deterministic error we retry burns
      a full turn's tokens three times and ends where it started).
-  2. A retry re-enters `stream_async` on the SAME Agent object with the SAME
-     prompt, and everything the turn had already produced survives: text is
-     APPENDED, never replayed, so the caller sees no duplicate delta and Memory
-     records one continuous reply.
+  2. A retry re-enters `stream_async` on the SAME Agent object and everything the
+     turn had already produced survives: text is APPENDED, never replayed, so the
+     caller sees no duplicate delta and Memory records one continuous reply. The
+     prompt is never re-derived and — TEAM-4749 A2 — never re-SENT: strands
+     `_convert_prompt_to_messages` appends a fresh user message for any str, so
+     re-sending it left two adjacent user messages in history and Bedrock answered
+     ValidationException, which the classifier correctly calls `fail`. A retry
+     therefore passes `[]`, which appends nothing and still runs the vendored
+     dangling-toolUse repair (`None` skips that repair; truncating history would
+     discard the tool results already produced). Asserted as history SHAPE below,
+     because "one copy of the prompt, roles alternating, a user message last" is
+     what Bedrock actually requires.
+  2b. TEAM-4749 A3 — the wall budget bounds RETRY time, armed at the FIRST
+     failure. Armed at the top of the turn it was already spent by the time a long
+     turn broke, so every break past minute 1 gave up on attempt 1 and FR-6 never
+     fired on the only turns long enough to need it.
   3. `agent.error` is published exactly once, only after the retries are
      exhausted (or immediately for a deterministic error), and never on a turn
      that recovered. `agent.died` is never published on this path — the two are
@@ -106,14 +118,32 @@ def _flaky_agent_class(scripts: list[list[Any]]) -> type:
 
         def __init__(self, **kwargs: Any) -> None:
             self.attempts = 0
-            self.prompts: list[str] = []
+            self.prompts: list[Any] = []
+            # TEAM-4749 A2: a miniature of the real conversation manager. The retry
+            # decision is about MESSAGE HISTORY, so an Agent double without history
+            # cannot express the bug — the old double accepted a re-sent prompt
+            # silently, which is exactly how this shipped.
+            self.messages: list[dict[str, Any]] = []
             self.hooks = list(kwargs.get("hooks") or [])
             type(self).instances.append(self)
 
-        async def stream_async(self, prompt: str):
+        async def stream_async(self, prompt: Any):
             index = self.attempts
             self.attempts += 1
             self.prompts.append(prompt)
+            # strands 1.53/1.54 `_convert_prompt_to_messages`, in the order it
+            # runs: for any prompt that is not None, a dangling assistant(toolUse)
+            # tail first gets a synthetic user(toolResult) appended; THEN a str
+            # becomes a fresh user message, while an empty list becomes nothing.
+            # `None` skips the repair as well as the append, which is why the
+            # production code passes `[]` and not `None`.
+            if prompt is not None:
+                if self.messages and any("toolUse" in c for c in self.messages[-1]["content"]):
+                    self.messages.append(
+                        {"role": "user", "content": [{"toolResult": {"status": "error"}}]}
+                    )
+                if isinstance(prompt, str):
+                    self.messages.append({"role": "user", "content": [{"text": prompt}]})
             for step in scripts[index] if index < len(scripts) else scripts[-1]:
                 if isinstance(step, BaseException):
                     raise step
@@ -123,6 +153,47 @@ def _flaky_agent_class(scripts: list[list[Any]]) -> type:
                     yield step
 
     return _FlakyAgent
+
+
+def _tool_cycle(agent: Any) -> None:
+    """Append an assistant(toolUse) with NO result yet — a stream that died between
+    asking for a tool and recording its answer, which is the tail Bedrock rejects
+    and the one shape a naive `None` re-entry would leave broken."""
+    agent.messages.append(
+        {"role": "assistant", "content": [{"toolUse": {"toolUseId": "tu-1", "name": "read"}}]}
+    )
+
+
+def _tool_cycle_closed(agent: Any) -> None:
+    """A COMPLETED tool cycle: assistant(toolUse) then user(toolResult). History is
+    already valid, so the retry must add nothing at all."""
+    _tool_cycle(agent)
+    agent.messages.append(
+        {"role": "user", "content": [{"toolResult": {"toolUseId": "tu-1", "status": "success"}}]}
+    )
+
+
+def _roles(agent: Any) -> list[str]:
+    return [m["role"] for m in agent.messages]
+
+
+def _prompt_copies(agent: Any, text: str) -> int:
+    return sum(
+        1
+        for m in agent.messages
+        if any(c.get("text") == text for c in m["content"] if isinstance(c, dict))
+    )
+
+
+def _assert_valid_history(agent: Any) -> None:
+    """What Bedrock's ConverseStream actually requires of the history it is handed:
+    strictly alternating roles, and the last message is the user's — anything else
+    is the ValidationException this fix exists to stop causing."""
+    roles = _roles(agent)
+    assert roles, "no history at all — the double never recorded a message"
+    for i in range(1, len(roles)):
+        assert roles[i] != roles[i - 1], f"two adjacent {roles[i]} messages: {roles}"
+    assert roles[-1] == "user", f"history must end on the user's turn; got {roles}"
 
 
 def _engage_completion(agent: Any) -> None:
@@ -308,7 +379,13 @@ async def test_two_transient_breaks_then_success() -> None:
 
     assert agent.attempts == 3, f"expected 3 stream_async attempts, got {agent.attempts}"
     assert len(agent_cls.instances) == 1, "the retry rebuilt the Agent — the conversation is gone"
-    assert len(set(agent.prompts)) == 1, "the retry re-derived the prompt instead of re-sending it"
+    # TEAM-4749 A2: stronger than the old `len(set(prompts)) == 1`, which could only
+    # say "the prompt was never re-derived" and would now TypeError on an unhashable
+    # []. This says that AND that the retries sent no prompt at all.
+    assert agent.prompts[0] == PAYLOAD["prompt"], "attempt 1 must deliver the derived prompt"
+    assert agent.prompts[1:] == [[], []], (
+        f"each retry must re-enter with [], not the prompt; got {agent.prompts[1:]!r}"
+    )
     # The partial the first attempt produced is kept and the retry appends to it.
     # A replay would show up here as ["part-", "part-", "rest"].
     assert _deltas(frames) == ["part-", "rest"], f"got {_deltas(frames)}"
@@ -365,7 +442,13 @@ async def test_the_attempt_cap_stops_an_endlessly_broken_stream() -> None:
 @pytest.mark.asyncio
 async def test_an_exhausted_wall_budget_stops_before_the_attempt_cap() -> None:
     """The budget is the real bound: 3 attempts against a 30-second stall would
-    hold the claim for 90 seconds, so a blown budget gives up on attempt 1."""
+    hold the claim for 90 seconds, so a spent budget gives up on attempt 1.
+
+    Still true after TEAM-4749 A3 moved the arming point into the failure handler,
+    but for a different reason: a 0.0 budget now means "no retry time is allowed at
+    all" rather than "the turn already consumed it", and `remaining <= 0` fires on
+    the first failure either way. The 60s-of-real-retrying case that A3 actually
+    changed is `test_the_budget_still_exhausts_after_60s_of_retrying` below."""
     ns, agent_cls, errors, deaths = _load([[EventStreamError("stream closed")]])
     ns["_STREAM_RETRY_BUDGET_S"] = 0.0
 
@@ -406,3 +489,216 @@ async def test_a_break_after_the_completion_gate_engaged_still_retries() -> None
     )
     assert agent_cls.instances[0].attempts == 2
     assert errors == [] and deaths == []
+
+
+# ─── 4. TEAM-4749 A2: the retry leaves a history Bedrock will accept ──────────
+
+
+@pytest.mark.asyncio
+async def test_retry_sends_the_prompt_exactly_once() -> None:
+    """The A2 defect, stated as the thing that broke: a re-sent str prompt put a
+    SECOND user message next to the first, Bedrock answered ValidationException,
+    and `_classify_stream_error` correctly called that `fail` — so the retry that
+    exists to save the turn was guaranteed to destroy it."""
+    ns, agent_cls, errors, deaths = _load([
+        [{"data": "part-"}, EventStreamError("stream closed")],
+        [{"data": "rest"}, _engage_completion],
+    ])
+
+    frames = [f async for f in ns["_run_agent_invocation"](PAYLOAD, CTX)]
+    (agent,) = agent_cls.instances
+
+    assert agent.attempts == 2
+    assert agent.prompts == [PAYLOAD["prompt"], []], f"got {agent.prompts!r}"
+    assert _prompt_copies(agent, PAYLOAD["prompt"]) == 1, (
+        f"the prompt is in history {_prompt_copies(agent, PAYLOAD['prompt'])} times: "
+        f"{_roles(agent)}"
+    )
+    _assert_valid_history(agent)
+    assert _deltas(frames) == ["part-", "rest"]
+    assert errors == [] and deaths == []
+
+
+@pytest.mark.asyncio
+async def test_retry_after_a_tool_cycle_leaves_a_valid_alternating_tail() -> None:
+    """The second failure shape, and the reason the retry passes `[]` rather than
+    `None`: a stream that died after asking for a tool but before the result landed
+    leaves an assistant(toolUse) tail, which Bedrock rejects. Strands' own repair
+    appends the synthetic user(toolResult) for any prompt that is not None — `[]`
+    gets the repair, `None` skips it."""
+    ns, agent_cls, errors, deaths = _load([
+        [{"data": "calling "}, _tool_cycle, EventStreamError("stream closed mid-cycle")],
+        [{"data": "done"}, _engage_completion],
+    ])
+
+    frames = [f async for f in ns["_run_agent_invocation"](PAYLOAD, CTX)]
+    (agent,) = agent_cls.instances
+
+    assert agent.prompts == [PAYLOAD["prompt"], []]
+    assert _roles(agent) == ["user", "assistant", "user"], (
+        f"the dangling toolUse was not repaired: {_roles(agent)}"
+    )
+    assert any("toolResult" in c for c in agent.messages[-1]["content"]), (
+        "the repair must be a toolResult, not another copy of the prompt"
+    )
+    _assert_valid_history(agent)
+    assert _prompt_copies(agent, PAYLOAD["prompt"]) == 1
+    assert _deltas(frames) == ["calling ", "done"]
+    assert errors == [] and deaths == []
+
+
+@pytest.mark.asyncio
+async def test_retry_after_a_completed_tool_cycle_adds_nothing() -> None:
+    """A turn whose tool cycle CLOSED before the break already has valid history,
+    and the tool results it produced are exactly what FR-6 promises to keep. The
+    retry must not append, and must not truncate."""
+    ns, agent_cls, errors, deaths = _load([
+        [_tool_cycle_closed, EventStreamError("stream closed after the cycle")],
+        [{"data": "carrying on"}, _engage_completion],
+    ])
+
+    frames = [f async for f in ns["_run_agent_invocation"](PAYLOAD, CTX)]
+    (agent,) = agent_cls.instances
+
+    assert _roles(agent) == ["user", "assistant", "user"]
+    assert any("toolResult" in c for c in agent.messages[-1]["content"]), (
+        "the tool result the turn already produced was discarded"
+    )
+    _assert_valid_history(agent)
+    assert _deltas(frames) == ["carrying on"]
+    assert errors == [] and deaths == []
+
+
+@pytest.mark.asyncio
+async def test_retry_resends_the_prompt_if_it_never_reached_history() -> None:
+    """The honest fallback. If attempt 1 broke before the prompt was delivered
+    there is nothing in history to continue from, and re-entering with `[]` would
+    ask the model to answer a conversation that does not exist. `[]` is only
+    correct once the prompt is provably in history."""
+
+    class _PreDeliveryFailure:
+        """A double whose attempt 1 dies BEFORE recording anything, so `messages` is
+        still at the baseline when the retry decides what to send. `_FlakyAgent`
+        cannot express this: it records the prompt before running its script."""
+
+        instances: list[Any] = []
+
+        def __init__(self, **kwargs: Any) -> None:
+            self.attempts = 0
+            self.prompts: list[Any] = []
+            self.messages: list[dict[str, Any]] = []
+            self.hooks = list(kwargs.get("hooks") or [])
+            type(self).instances.append(self)
+
+        async def stream_async(self, prompt: Any):
+            self.attempts += 1
+            self.prompts.append(prompt)
+            if self.attempts == 1:
+                # Nothing appended: the socket died before the request was accepted.
+                raise EventStreamError("closed before the request was accepted")
+            if isinstance(prompt, str):
+                self.messages.append({"role": "user", "content": [{"text": prompt}]})
+            yield {"data": "second try"}
+            _engage_completion(self)
+
+    _PreDeliveryFailure.instances = []
+    # The scripts are unused — _PreDeliveryFailure ignores them and drives itself.
+    ns, _unused, errors, deaths = _load([[]], Agent=_PreDeliveryFailure)
+
+    frames = [f async for f in ns["_run_agent_invocation"](PAYLOAD, CTX)]
+    (agent,) = _PreDeliveryFailure.instances
+
+    assert agent.attempts == 2
+    assert agent.prompts[1] == PAYLOAD["prompt"], (
+        "an undelivered prompt must be RE-SENT, not swapped for []; "
+        f"got {agent.prompts[1]!r}"
+    )
+    assert _prompt_copies(agent, PAYLOAD["prompt"]) == 1
+    assert _deltas(frames) == ["second try"]
+    assert errors == [] and deaths == []
+
+
+# ─── 5. TEAM-4749 A3: the budget clocks from the first failure ────────────────
+#
+# A scripted `monotonic` rather than real sleeping: the behaviour under test is
+# arithmetic on a clock, and waiting 400 real seconds to assert it would be a
+# test nobody runs. `time.time`/`strftime`/`gmtime` stay REAL — the event-id
+# stamper in the shipped source uses them and does not care about our fiction.
+
+
+def _scripted_clock(readings: list[float]):
+    """A `time` stand-in whose `monotonic` walks a script and then holds its last
+    value, so an extra reading cannot make the test fail as an IndexError."""
+    import time as _real_time
+
+    state = {"i": 0}
+
+    def monotonic() -> float:
+        i = state["i"]
+        state["i"] = min(i + 1, len(readings) - 1)
+        return readings[i]
+
+    return SimpleNamespace(
+        monotonic=monotonic,
+        time=_real_time.time,
+        strftime=_real_time.strftime,
+        gmtime=_real_time.gmtime,
+        sleep=lambda *_a: None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_failure_after_five_minutes_is_still_retried() -> None:
+    """The A3 defect. The budget was armed before the retry loop, so it measured
+    STREAM duration: a persona turn that ran 400s and then hit one transient break
+    arrived with `remaining` already negative and gave up on attempt 1. Since every
+    persona turn is long, FR-6 effectively never retried in production."""
+    # Readings: the deadline arm and the `remaining` read on each failure, all at
+    # t=400s and later — a clock that has already run far past the old 60s budget.
+    clock = _scripted_clock([400.0, 400.0, 400.1, 400.2, 400.3, 400.4, 400.5])
+    ns, agent_cls, errors, deaths = _load(
+        [
+            [{"data": "a"}, EventStreamError("stream closed")],
+            [ThrottlingException("Too many requests")],
+            [{"data": "b"}, _engage_completion],
+        ],
+        time=clock,
+    )
+
+    frames = [f async for f in ns["_run_agent_invocation"](PAYLOAD, CTX)]
+    (agent,) = agent_cls.instances
+
+    assert agent.attempts == 3, (
+        "a break 400s into a turn must still get its retries — the budget bounds "
+        f"RETRY time, not stream time; got {agent.attempts} attempt(s)"
+    )
+    assert agent.prompts == [PAYLOAD["prompt"], [], []]
+    _assert_valid_history(agent)
+    assert _deltas(frames) == ["a", "b"]
+    assert errors == [], "a turn that recovered on the third attempt is not an error"
+    assert deaths == []
+
+
+@pytest.mark.asyncio
+async def test_the_budget_still_exhausts_after_60s_of_retrying() -> None:
+    """The other half of A3: arming later must not make the budget unbounded. 61
+    seconds of ACTUAL retrying still stops before the attempt cap — which no
+    existing test covered, because the old clock could never get there."""
+    # Arm at t=1000, then the next failure reads a clock 61s later: past budget.
+    clock = _scripted_clock([1000.0, 1000.0, 1061.0, 1061.0, 1062.0])
+    ns, agent_cls, errors, deaths = _load(
+        [[EventStreamError("stream closed")]], time=clock
+    )
+
+    with pytest.raises(EventStreamError):
+        async for _ in ns["_run_agent_invocation"](PAYLOAD, CTX):
+            pass
+
+    (agent,) = agent_cls.instances
+    assert agent.attempts == 2, (
+        "60s of retrying is the bound; the cap of 3 must not be reached here — "
+        f"got {agent.attempts}"
+    )
+    assert agent.attempts < ns["_STREAM_RETRY_MAX_ATTEMPTS"]
+    assert len(errors) == 1, f"exactly one agent.error from the budget branch; got {errors}"
+    assert deaths == []
