@@ -146,8 +146,20 @@ vi.mock("@aws-sdk/client-lambda", () => ({
       // The DynamoDB twin reports failure as a textResult, not a throw — the shape
       // ticketTool's toolFailure() has to recognize.
       if (h.ticketFail.has(tool)) return reply({ content: [{ type: "text", text: `Error: ${tool} is unavailable` }] });
-      if (tool === "Tickets___transition_ticket" && h.transitionGate && !h.transitionGate(params)) {
-        return reply({ content: [{ type: "text", text: `Error: transition ${params.transition_id} is not available from the current status` }] });
+      // TEAM-4756 R3-1 widens the gate's verdict vocabulary, because "a refused
+      // transition" has FOUR real shapes and the fix is about telling them apart:
+      // `false` keeps the pre-4756 canned "Error: ..." text (every existing caller
+      // returns only true/false and is untouched), a STRING is that exact text as the
+      // DynamoDB twin's bare textResult, an OBJECT is the payload verbatim (a
+      // structured `ok:false` refusal, or a `{errorMessage}` FunctionError), and a
+      // gate that THROWS is an invoke-level throw — the throttle/timeout case.
+      if (tool === "Tickets___transition_ticket" && h.transitionGate) {
+        const verdict = h.transitionGate(params);
+        if (verdict === false) {
+          return reply({ content: [{ type: "text", text: `Error: transition ${params.transition_id} is not available from the current status` }] });
+        }
+        if (typeof verdict === "string") return reply({ content: [{ type: "text", text: verdict }] });
+        if (verdict && typeof verdict === "object") return reply(verdict);
       }
       if (tool === "Tickets___get_issue") {
         // `h.issue` is the REPORTED ticket's answer. Since FR-10 the sweep also reads
@@ -211,7 +223,7 @@ process.env.ARTIFACT_BUCKET = "test-bucket";
 // FR-11 templating is skipped when this is unset, so every plan test below would
 // assert the no-op path if it were absent.
 process.env.WORKFLOWS_TABLE = "agentcore-hub-workflows";
-const { handler, inferToolFromArgs, followUpHash, followUpBanner, sweepSkipOrder } = await import("./index.mjs");
+const { handler, inferToolFromArgs, followUpHash, followUpBanner, sweepSkipOrder, toolFailure, isAlreadyDoneRefusal } = await import("./index.mjs");
 
 /** The completion record the call wrote, parsed. */
 const record = () => JSON.parse(h.puts.find((p) => p.Key?.startsWith("completions/")).Body);
@@ -1155,6 +1167,203 @@ describe("report_completion — N2: a retryable follow-up failure withholds Done
     expect(res.message).toBe("Completion saved for TEAM-4200. Ticket transitioned to Done.");
     expect(res.followUpsMaterialized.failed).toEqual([]);
     expect(transitioned()).toBe(true);
+  });
+});
+
+// ─── TEAM-4756 R3-1: a failed Done transition is not "complete" ────────────────
+//
+// The same rule N2 applied to the follow-up write, applied to the LAST dependent
+// write: a transition that did not happen must not be reported as one that did. The
+// raw invoke this replaces read only `payload.error` — the one failure shape the
+// DynamoDB twin never uses — and both of its failure branches fell through to
+// `status: "complete"`. That answer is load-bearing: the harness's completion gate
+// (deploy/runtime-agent/main.py `_reports_done`) treats exactly "complete" as done and
+// deletes the resume object, so a swallowed refusal left the ticket in_progress with
+// no live session and nothing owning the work.
+//
+// Every test below therefore asserts on the STATUS, not on a log line: a CloudWatch
+// console.error is precisely what the old code already did, and it changed nothing.
+describe("report_completion — R3-1: a refused or failed Done transition", () => {
+  /** Every transition the call attempted, in order. */
+  const dones = () => calls("Tickets___transition_ticket").filter((p) => p.transition_id === "done");
+
+  it("an invoke THROW is complete_transition_failed — and the retry closes the ticket", async () => {
+    // The throttle/timeout case: `lambda.send` rejects, which the old catch logged and
+    // then reported as a success.
+    h.transitionGate = () => { throw new Error("TooManyRequestsException: Rate exceeded"); };
+    const first = result(await report({}));
+    expect(first.status).not.toBe("complete");
+    expect(first.status).toBe("complete_transition_failed");
+    expect(first.next_action).toBe("retry_report_completion");
+    expect(first.transition).toEqual({ ok: false, error: expect.stringContaining("Rate exceeded") });
+    expect(first.message).toMatch(/SAME arguments/);
+    expect(first.message).toMatch(/report BLOCKED/);
+    // The record IS durable — that is what makes the retry cheap and what the message
+    // promises the agent.
+    expect(wroteRecord()).toBe(true);
+    expect(dones()).toHaveLength(1);
+
+    // The retry, with the SAME arguments the message told the agent to send.
+    h.transitionGate = null;
+    const res = result(await report({}));
+    expect(res.status).toBe("complete");
+    expect(Object.keys(res).sort()).toEqual(["message", "status"]);
+    // Exactly one Done attempt per invocation — the retry does not double-transition.
+    expect(dones()).toHaveLength(2);
+  });
+
+  it("a FunctionError is a failure, not a success", async () => {
+    h.transitionGate = () => ({ errorMessage: "Task timed out after 60.00 seconds" });
+    const res = result(await report({}));
+    expect(res.status).toBe("complete_transition_failed");
+    expect(res.transition.error).toMatch(/timed out/);
+  });
+
+  it("the twin's already-done refusal is idempotent SUCCESS, not a failure", async () => {
+    // The retry path's own footgun: the first attempt DID close the ticket and only its
+    // reply was lost, so the twin now refuses the second `done`. Reporting that as a
+    // failure would loop the persona forever on a ticket that is already closed.
+    h.transitionGate = () => 'Invalid transition "done" from status "done". Available: reopen (→ todo)';
+    const res = result(await report({}));
+    expect(res.status).toBe("complete");
+    expect("transition" in res).toBe(false);
+    expect(Object.keys(res).sort()).toEqual(["message", "status"]);
+    expect(h.warns.join("\n")).not.toMatch(/transition FAILED/);
+    // Recognized from the refusal text alone — no second read needed.
+    expect(calls("Tickets___get_issue")).toHaveLength(1);
+  });
+
+  it("a DL-030 refusal is a failure even though it never says \"Error:\"", async () => {
+    // The shape the old toolFailure returned null for: the DynamoDB twin RETURNS this,
+    // with the machine-readable `ok:false` beside the prose. Reported as "complete", it
+    // meant a ship ticket whose record the twin could not see closed the run anyway.
+    h.transitionGate = () => ({
+      ok: false,
+      reason: "completion_record_required",
+      content: [{ type: "text", text: "Cannot move TEAM-4200 to done: a ship-phase ticket needs its completion record first — call WorkflowOutput___report_completion(ticket_id=…) (no completions/TEAM-4200.json in the artifact bucket)" }],
+    });
+    const res = result(await report({}));
+    expect(res.status).toBe("complete_transition_failed");
+    expect(res.transition.error).toMatch(/needs its completion record first/);
+  });
+
+  it("the typed-gate refusal is a failure too — prose the classifier cannot know", async () => {
+    // Same structured shape, arbitrary hint text: `ok:false` is what catches it, which
+    // is why the classifier keys on that rather than on a growing list of prefixes.
+    h.transitionGate = () => ({
+      ok: false,
+      reason: "gate_condition_unmet",
+      content: [{ type: "text", text: "The deploy approval for exec 1234 is still parked; this gate cannot close against it." }],
+    });
+    expect(result(await report({})).status).toBe("complete_transition_failed");
+  });
+
+  it("a Jira-style AMBIGUOUS refusal re-reads the ticket: Done ⇒ complete", async () => {
+    // 'No transition to "Done" found' is the same text a stuck ticket and an
+    // already-closed ticket both produce, so there is nothing to match on — ask the
+    // ticket instead of parsing the prose.
+    h.issue = ticketRow({ key: "TEAM-4200", summary: "The ticket under report", status: "done" });
+    h.transitionGate = () => ({ error: 'No transition to "Done" found. Available: Start Progress (-> In Progress)' });
+    const res = result(await report({}));
+    expect(res.status).toBe("complete");
+    // The up-front read plus the re-read.
+    expect(calls("Tickets___get_issue")).toHaveLength(2);
+  });
+
+  it("…and the same refusal with the ticket still in_progress stays FAILED", async () => {
+    h.issue = ticketRow({ key: "TEAM-4200", summary: "The ticket under report", status: "in_progress" });
+    h.transitionGate = () => ({ error: 'No transition to "Done" found. Available: Start Progress (-> In Progress)' });
+    const res = result(await report({}));
+    expect(res.status).toBe("complete_transition_failed");
+    expect(calls("Tickets___get_issue")).toHaveLength(2);
+  });
+
+  it("an UNREADABLE re-read stays FAILED — \"we could not look\" is not \"it is done\"", async () => {
+    // The same positive-evidence rule completionRecordProven applies: only an answer
+    // the twin actually gave may license the success.
+    h.ticketFail.add("Tickets___get_issue");
+    h.transitionGate = () => ({ error: 'No transition to "Done" found. Available: Start Progress (-> In Progress)' });
+    const res = result(await report({}));
+    expect(res.status).toBe("complete_transition_failed");
+    expect(h.warns.join("\n")).toMatch(/could not re-read the ticket/);
+  });
+
+  it("the TERMINAL journey event fires only once the ticket is actually Done", async () => {
+    // The UI's done card, cost-report's duration and compute_metrics' TERMINAL_TASK_EVENTS
+    // all read workflow.report_completion as "this ticket's work ended". Publishing it
+    // before a transition that then fails is the same falsehood N2 removed.
+    h.transitionGate = () => { throw new Error("TooManyRequestsException: Rate exceeded"); };
+    await report({});
+    expect(events("workflow.report_completion")).toHaveLength(0);
+    // delivery.prState is NOT terminal — it states a fact the durable record already
+    // carries — so it is unaffected, exactly as in the pending case.
+    expect(events("delivery.prState")).toHaveLength(1);
+
+    h.transitionGate = null;
+    await report({});
+    expect(events("workflow.report_completion")).toHaveLength(1);
+    expect(events("delivery.prState")).toHaveLength(2);
+  });
+
+  it("a SYNTHETIC id has no transition to wait for, so it still announces itself", async () => {
+    // The healthcheck path: no ticket, so no transition — the report itself is terminal.
+    const res = result(await report({ ticket_id: "HEALTHCHECK-1" }));
+    expect(res.status).toBe("complete");
+    expect(transitioned()).toBe(false);
+    expect(events("workflow.report_completion")).toHaveLength(1);
+  });
+});
+
+// ─── TEAM-4756 R3-1: the ONE failure classifier ───────────────────────────────
+//
+// Both twins are exercised through the handler above; this pins the classifier
+// directly because the shapes are the whole bug and a table says which is which.
+describe("toolFailure — every failure shape both twins actually produce", () => {
+  const text = (t) => ({ content: [{ type: "text", text: t }] });
+
+  it("detects all of them", () => {
+    // jira twin: the handler turns every throw into `{error}` (plus the structured
+    // refusal keys when there are any).
+    expect(toolFailure({ error: "Jira API 400: bad request" })).toMatch(/Jira API 400/);
+    expect(toolFailure({ ok: false, reason: "completion_record_required", error: "Cannot move X to done: …" })).toBeTruthy();
+    expect(toolFailure({ errorMessage: "Task timed out after 60.00 seconds" })).toMatch(/timed out/);
+    // DynamoDB twin, STRUCTURED: `ok:false` with the prose in content.
+    expect(toolFailure({ ok: false, reason: "gate_condition_unmet", ...text("anything at all") })).toBe("anything at all");
+    // …and with no content at all, the reason is still an answer.
+    expect(toolFailure({ ok: false, reason: "gate_condition_unmet" })).toBe("gate_condition_unmet");
+    expect(toolFailure({ ok: false })).toBe("refused");
+    // DynamoDB twin, BARE textResults.
+    expect(toolFailure(text("Error: 'issue_key' is required"))).toMatch(/issue_key/);
+    expect(toolFailure(text("Issue TEAM-1 not found."))).toMatch(/not found/);
+    // The two TEAM-4756 additions — neither starts "Error:" nor ends "not found.".
+    expect(toolFailure(text('Invalid transition "done" from status "done". Available: reopen (→ todo)'))).toMatch(/^Invalid transition/);
+    expect(toolFailure(text('Invalid transition "skip" from status "in_progress". Available: done (→ done)'))).toMatch(/^Invalid transition/);
+    expect(toolFailure(text("Cannot move TEAM-1 to in_review: only human-review tickets (assignee \"human:*\") can be sent to review."))).toMatch(/^Cannot move/);
+    expect(toolFailure(text("Cannot move TEAM-1 to done: a ship-phase ticket needs its completion record first — …"))).toMatch(/^Cannot move/);
+    // Absent / unparseable is a failure, not a silent success.
+    expect(toolFailure(null)).toBe("empty response");
+    expect(toolFailure("nope")).toBe("empty response");
+  });
+
+  it("and calls a real success a success", () => {
+    expect(toolFailure({ ok: true })).toBeNull();
+    expect(toolFailure({ key: "TEAM-1", status: "created" })).toBeNull();
+    expect(toolFailure(text("Transitioned TEAM-1 to done"))).toBeNull();
+    expect(toolFailure({ total: 0, issues: [] })).toBeNull();
+    // A ROW that merely mentions a not-found-ish summary is not a failure: the match is
+    // anchored at the end of the text, as it always was.
+    expect(toolFailure(text("Moved TEAM-1: the not found. banner was removed from the page"))).toBeNull();
+  });
+
+  it("isAlreadyDoneRefusal matches both spellings and NOT Jira's ambiguous one", () => {
+    expect(isAlreadyDoneRefusal('Invalid transition "done" from status "done". Available: reopen (→ todo)')).toBe(true);
+    expect(isAlreadyDoneRefusal('Invalid transition from "done" to "done"')).toBe(true);
+    // Jira's refusal is the SAME text a genuinely stuck ticket produces, so it proves
+    // nothing about the current status and must stay a failure here — the ticket re-read
+    // is what covers that provider.
+    expect(isAlreadyDoneRefusal('No transition to "Done" found. Available: Start Progress (-> In Progress)')).toBe(false);
+    expect(isAlreadyDoneRefusal('Invalid transition "done" from status "in_progress"')).toBe(false);
+    expect(isAlreadyDoneRefusal(null)).toBe(false);
   });
 });
 
