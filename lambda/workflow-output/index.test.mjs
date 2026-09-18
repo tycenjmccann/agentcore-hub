@@ -1084,6 +1084,12 @@ describe("report_completion — N2: a retryable follow-up failure withholds Done
     expect(first.followUpsMaterialized.failed[0].kind).toBe("post_deploy_verification");
     expect(first.followUpsMaterialized.failed[0].retryable).toBe(true);
     expect(h.created).toHaveLength(1);
+    // TEAM-4754: the UI marks the agent's card done off this event, and
+    // cost-report/anomaly-watcher treat it as terminal — none of that is true
+    // yet, so it must not fire while the ticket is still open. delivery.prState
+    // states a fact the durable record already carries, so it is unaffected.
+    expect(events("workflow.report_completion")).toHaveLength(0);
+    expect(events("delivery.prState")).toHaveLength(1);
 
     // The retry, with the SAME arguments the message told the agent to send.
     h.createGate = null;
@@ -1094,6 +1100,10 @@ describe("report_completion — N2: a retryable follow-up failure withholds Done
     expect(res.followUpsMaterialized.failed).toEqual([]);
     expect(res.status).toBe("complete");
     expect(transitioned()).toBe(true);
+    // The retry is what finally gets the ticket to Done, so this is the ONE call
+    // that publishes the event.
+    expect(events("workflow.report_completion")).toHaveLength(1);
+    expect(events("delivery.prState")).toHaveLength(2);
   });
 
   it("the outer catch also withholds it — a THROW is not a licence to cascade", async () => {

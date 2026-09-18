@@ -758,11 +758,6 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   }));
   console.log(`[report_completion] Saved s3://${BUCKET}/${key}`);
 
-  // Journey log: report_completion received — includes agentId so UI can immediately mark agent done
-  await publishJourneyEvent(workflow_id || ticket_id, "workflow.report_completion", {
-    ticketId: ticket_id, agentId: agent_id || null, summary: summary.slice(0, 200), branch: branch || null, pr_url: pr_url || null,
-  });
-
   // TEAM-4740 FR-14: a separate event, not a field on the one above, because the
   // UI's delivery view and the run-history queries read prState per TICKET and a
   // run has many completions.
@@ -840,24 +835,45 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   // (orchestrator unblocks downstream tickets when it sees "done")
   if (!mayTransition) {
     console.error(`[report_completion] ${ticket_id}: Done WITHHELD - ${pendingFollowUps.length} retryable follow-up failure(s) (${pendingFollowUps.map((f) => `${f.kind}: ${f.reason}`).join("; ")}) - the record is saved, the agent must retry report_completion`);
-  } else if (ticket_id && !ticket_id.startsWith("HEALTHCHECK-") && !ticket_id.startsWith("TEST-")) {
-    try {
-      const resp = await lambda.send(new InvokeCommand({
-        FunctionName: TICKET_TOOLS_LAMBDA,
-        InvocationType: "RequestResponse",
-        Payload: Buffer.from(JSON.stringify({
-          tool_name: "Tickets___transition_ticket",
-          parameters: { ticket_id, transition_id: "done" },
-        })),
-      }));
-      const payload = JSON.parse(new TextDecoder().decode(resp.Payload));
-      if (payload.error) {
-        console.error(`[report_completion] Failed to transition ${ticket_id} to Done:`, payload.error);
-      } else {
-        console.log(`[report_completion] Transitioned ${ticket_id} → Done`);
+  } else {
+    // TEAM-4754: moved here, off the S3 write, and now gated on `mayTransition`.
+    // The UI marks the agent's card done off this event
+    // (src/app/api/workflow/[id]/agent-output/route.ts ~:295, transform-event.ts
+    // ~:72), and cost-report / anomaly-watcher (bands-schema.mjs) treat it as a
+    // TERMINAL task event for duration and anomaly-band purposes. All three read
+    // it as "this ticket's work ended" — which was false in the pending state:
+    // the record is durable but the ticket is still open and the persona has not
+    // finished. It must not fire until the retry that lands every follow-up
+    // actually gets here. Placed immediately before the transition invoke so its
+    // ordering relative to the Done cascade is unchanged on the happy path.
+    //
+    // Still published for a synthetic id (HEALTHCHECK-/TEST-) even though the
+    // transition below is skipped for one — that skip is about not calling
+    // Tickets___transition_ticket on an id with no ticket, not about whether the
+    // report is "done"; a synthetic report has no retryable follow-up path at
+    // all, so `mayTransition` is the only condition that changed here.
+    await publishJourneyEvent(workflow_id || ticket_id, "workflow.report_completion", {
+      ticketId: ticket_id, agentId: agent_id || null, summary: summary.slice(0, 200), branch: branch || null, pr_url: pr_url || null,
+    });
+    if (ticket_id && !ticket_id.startsWith("HEALTHCHECK-") && !ticket_id.startsWith("TEST-")) {
+      try {
+        const resp = await lambda.send(new InvokeCommand({
+          FunctionName: TICKET_TOOLS_LAMBDA,
+          InvocationType: "RequestResponse",
+          Payload: Buffer.from(JSON.stringify({
+            tool_name: "Tickets___transition_ticket",
+            parameters: { ticket_id, transition_id: "done" },
+          })),
+        }));
+        const payload = JSON.parse(new TextDecoder().decode(resp.Payload));
+        if (payload.error) {
+          console.error(`[report_completion] Failed to transition ${ticket_id} to Done:`, payload.error);
+        } else {
+          console.log(`[report_completion] Transitioned ${ticket_id} → Done`);
+        }
+      } catch (err) {
+        console.error(`[report_completion] Error transitioning ${ticket_id}:`, err.message);
       }
-    } catch (err) {
-      console.error(`[report_completion] Error transitioning ${ticket_id}:`, err.message);
     }
   }
 
