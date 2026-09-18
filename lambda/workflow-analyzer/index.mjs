@@ -12,7 +12,9 @@
  *      (auto, idempotent). Only source + detail.workflowId are read, so the
  *      detail-type set is a deploy-time concern, not a code branch.
  *   2. Direct invoke {workflowId, trigger: "manual"} → ANALYZE (re-runs allowed)
- *   3. EventBridge schedule {action: "watch"} → scan live runs, WATCH stale ones
+ *   3. EventBridge schedule {action: "watch"} → close out SI attempts whose run
+ *      already ended (cancelled/error never reach shape 1 — TEAM-4760 AC4), then
+ *      scan live runs and WATCH stale ones
  *   4. EventBridge schedule {action: "si-verify"} → daily SI verdict sweep
  *      (TEAM-4760; the harness runs toolkit/si_verify.py, this Lambda does no
  *      metric arithmetic of its own)
@@ -566,6 +568,95 @@ export async function stampSiAttempt(workflow, phase, { ledger = siLedger(), s3,
 }
 
 /**
+ * Which terminal phase this row is in, or null while it is still live.
+ *
+ * `cancelledAt` is the cancel route's FIRST stamp and the phase can lag behind it
+ * (TEAM-4577, the same reason watchScan filters on it), so a row carrying it is
+ * read as cancelled whatever its phase says — that is the truth the attempt has
+ * to record.
+ */
+export function terminalPhaseOf(workflow) {
+  if (!workflow) return null;
+  if (workflow.cancelledAt || workflow.phase === "cancelled") return "cancelled";
+  return TERMINAL_PHASES.has(workflow.phase) ? workflow.phase : null;
+}
+
+/**
+ * Close out attempts whose run is already over (TEAM-4760 AC4).
+ *
+ * ANALYZE stamps the attempt for a run that ends through one of the orchestrator's
+ * terminal EventBridge outcomes — but a CANCELLED run emits none of them: the
+ * cancel route writes a single events-table row and nothing else, and the watch
+ * loop skips terminal rows by design. So nothing would ever stamp that attempt,
+ * and since dedupeBlocked blocks an `in-run` key UNCONDITIONALLY (no staleness
+ * escape) while si_verify.py skips `in-run` rows entirely, the run's patterns
+ * would be wedged out of the backlog forever — the exact inverse of what this
+ * ledger exists to do. Same for a run that died in `error`.
+ *
+ * The sweep therefore starts from the LEDGER rather than the workflows table: for
+ * every row the ledger still believes is `in-run`, ask whether the run it named
+ * has ended. That is one Scan of a tens-of-rows table plus one GetItem per open
+ * attempt instead of a full workflows Scan, it needs no marker attribute because
+ * the stamp itself clears the `in-run` status, and it also repairs a per-key stamp
+ * that failed earlier. Idempotent by construction: a stamped row is no longer
+ * `in-run`, so the next sweep does not look at it.
+ *
+ * Only rows whose STATUS is `in-run` are touched, and only their newest attempt —
+ * exactly the (row, attempt) pair dedupeBlocked cites. Closing an OLDER in-run
+ * attempt on a row that has since landed would drag that row's status backwards.
+ */
+export async function siReapScan({ ledger = siLedger(), client = ddb, table = WORKFLOWS_TABLE, s3, bucket } = {}) {
+  const reaped = [];
+  let rows;
+  try {
+    rows = await ledger.list();
+  } catch (err) {
+    console.error(`[analyzer] si-reap: ledger scan failed: ${err?.message || err}`);
+    return { candidates: 0, live: 0, reaped };
+  }
+
+  const candidates = rows.filter((row) => row?.status === "in-run");
+  const closed = new Set();
+  let live = 0;
+  for (const row of candidates) {
+    const attempts = Array.isArray(row.attempts) ? row.attempts : [];
+    const workflowId = attempts.length ? attempts[attempts.length - 1]?.workflowId : null;
+    if (!workflowId) {
+      console.warn(`[analyzer] si-reap: ${row.patternKey} is in-run with no attempt workflowId — skipped`);
+      continue;
+    }
+    // stampSiAttempt closes EVERY key its run carried, so the run's other rows in
+    // this same snapshot are already done — re-stamping them would be harmless
+    // (applyAttempt dedupes) but would re-read the cd-ledger once per key.
+    if (closed.has(workflowId)) continue;
+    try {
+      const wf = (await client.send(new GetCommand({ TableName: table, Key: { workflowId } }))).Item;
+      if (!wf) {
+        // Do NOT invent an outcome for a run we cannot see. Rows are not deleted
+        // by any code path (archiving sets a flag), so this is an operator action
+        // and an operator's call to resolve.
+        console.warn(`[analyzer] si-reap: ${row.patternKey} names run ${workflowId}, which no longer exists — left in-run`);
+        continue;
+      }
+      const phase = terminalPhaseOf(wf);
+      if (!phase) {
+        live++;
+        continue;
+      }
+      const result = await stampSiAttempt(wf, phase, { ledger, s3, bucket });
+      closed.add(workflowId);
+      reaped.push({ patternKey: row.patternKey, workflowId, phase, outcome: result.outcome, stamped: result.stamped || [] });
+    } catch (err) {
+      console.error(`[analyzer] si-reap: ${row.patternKey} (run ${workflowId}) failed: ${err?.message || err}`);
+    }
+  }
+  if (candidates.length) {
+    console.log(`[analyzer] si-reap: ${candidates.length} in-run, ${live} still running, ${reaped.length} closed out`);
+  }
+  return { candidates: candidates.length, live, reaped };
+}
+
+/**
  * The analysis ids on record for a run, or null when the read failed — null and
  * "none" are different answers, and only the D5 check below is allowed to decide
  * what to do about the difference.
@@ -648,12 +739,22 @@ function parkedOnHuman(wf) {
   );
 }
 
-async function watchScan() {
-  const now = Date.now();
+/**
+ * The 5-minute scan. Two jobs, in this order: close out SI attempts whose run has
+ * already ended (cheap, bounded, no model call), then WATCH the stale live runs.
+ * The sweep goes FIRST because the watch loop can spend the whole 900s budget on
+ * harness invocations, and a wedged `in-run` key must not wait on that.
+ *
+ * Collaborators are parameters with real defaults so the suite can drive this
+ * whole path over an in-memory table — nodejs20 has no `mock.module`.
+ */
+export async function watchScan({ client = ddb, ledger, s3, bucket, invoke = invokeHarness, now = Date.now() } = {}) {
+  const si = await siReapScan({ ledger, client, s3, bucket });
+
   const active = [];
   let ExclusiveStartKey;
   do {
-    const page = await ddb.send(new ScanCommand({
+    const page = await client.send(new ScanCommand({
       TableName: WORKFLOWS_TABLE,
       ProjectionExpression: "workflowId, phase, archived, managerWatch, wmLastWatchAt, startedAt, workflowDefId, humanNotifications, cancelledAt",
       ExclusiveStartKey,
@@ -671,7 +772,7 @@ async function watchScan() {
     const lastWatch = wf.wmLastWatchAt ? Date.parse(wf.wmLastWatchAt) : 0;
     if (now - lastWatch < COOLDOWN_MS) continue;
 
-    const lastEventAge = await lastSignificantEventAge(wf.workflowId, now);
+    const lastEventAge = await lastSignificantEventAge(wf.workflowId, now, client);
     // Age used to decide staleness AND to report in the prompt: event age when we
     // have events, else time since the run started (0 if we know neither).
     const staleAge = lastEventAge ?? (wf.startedAt ? now - Date.parse(wf.startedAt) : 0);
@@ -679,7 +780,7 @@ async function watchScan() {
 
     // Claim the watch slot BEFORE invoking — prevents intervention loops even
     // if the harness invocation itself is slow or this Lambda retries.
-    await ddb.send(new UpdateCommand({
+    await client.send(new UpdateCommand({
       TableName: WORKFLOWS_TABLE,
       Key: { workflowId: wf.workflowId },
       UpdateExpression: "SET wmLastWatchAt = :t",
@@ -691,7 +792,7 @@ async function watchScan() {
       `No significant events for ${Math.round(staleAge / 60000)} minutes. ` +
       `Diagnose and unstick if warranted.`;
     try {
-      const result = await invokeHarness(prompt, sessionId("wmwatch", wf.workflowId));
+      const result = await invoke(prompt, sessionId("wmwatch", wf.workflowId));
       console.log(`[analyzer] WATCH ${wf.workflowId} stopReason=${result.stopReason}`);
       watched.push(wf.workflowId);
     } catch (err) {
@@ -699,7 +800,7 @@ async function watchScan() {
     }
   }
   console.log(`[analyzer] watch scan: ${active.length} active, ${watched.length} watched`);
-  return { active: active.length, watched };
+  return { active: active.length, watched, si };
 }
 
 /** Age in ms of the newest non-streaming event, or null if none. */
@@ -709,8 +810,8 @@ async function watchScan() {
 // looking fresh no matter what the agent is doing (TEAM-3969).
 const NON_SIGNIFICANT_EVENT_TYPES = new Set(["agent.streaming", "orchestrator.nudge"]);
 
-async function lastSignificantEventAge(workflowId, now) {
-  const page = await ddb.send(new QueryCommand({
+async function lastSignificantEventAge(workflowId, now, client = ddb) {
+  const page = await client.send(new QueryCommand({
     TableName: EVENTS_TABLE,
     KeyConditionExpression: "workflowId = :w",
     ExpressionAttributeValues: { ":w": workflowId },

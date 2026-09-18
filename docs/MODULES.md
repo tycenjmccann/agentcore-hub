@@ -200,8 +200,13 @@ The continuous-improvement loop. Self-contained surface.
   off the run (`deployed`/`landed` from `workflows/<id>/shared/cd-ledger.json`,
   `handoff` from `delivery.mode`, and `cancelled`/`error` back to `open` **with a
   note**, so a dead SI run's patterns stay filable instead of wedging at `in-run`).
-  It also fails an ANALYZE that persisted no analysis row, releasing the auto-claim
-  so the retry can re-run it
+  A **cancelled** run never reaches ANALYZE — the cancel route emits no terminal
+  EventBridge outcome — so the 5-minute scan sweeps that case first: for every
+  ledger row still `in-run`, it reads the run its newest attempt names and stamps it
+  if that run has ended (`cancelledAt`, or a terminal phase). The cleared `in-run`
+  status is itself the marker, so a second sweep is a no-op and no run is
+  re-analysed. It also fails an ANALYZE that persisted no analysis row, releasing
+  the auto-claim so the retry can re-run it
 - `si-ledger.mjs` is a **byte-copy pair** — `lambda/workflow-analyzer/si-ledger.mjs`
   is canonical and `lambda/prd-submitter/si-ledger.mjs` must stay identical
   (nothing lives in `lambda/shared/`); both copies are listed in
@@ -265,7 +270,8 @@ The continuous-improvement loop. Self-contained surface.
     when a pattern enters a synthesis batch), `prd-submitter` (`in-run` + the
     `attempts[]`/`expected[]` entries when the PRD is submitted),
     `workflow-analyzer` (the attempt's terminal outcome —
-    `deployed`/`landed`/`handoff`, or back to `open` on a cancelled/errored run),
+    `deployed`/`landed`/`handoff`, or back to `open` on a cancelled/errored run,
+    the latter from its 5-minute sweep of rows still marked `in-run`),
     `si_verify.py --apply` (the `verified`/`no-effect`/`regressed` verdicts, on the
     daily SI-VERIFY sweep), and `scripts/si-ledger-backfill.mjs` for the one-time
     seed from existing analyses.

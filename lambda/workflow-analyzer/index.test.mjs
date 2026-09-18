@@ -42,6 +42,9 @@ const {
   siOutcome,
   readCdLedger,
   stampSiAttempt,
+  terminalPhaseOf,
+  siReapScan,
+  watchScan,
   analysisIdsFor,
   analysisDelta,
   siVerify,
@@ -93,6 +96,26 @@ function fakeS3(cd, { lastModified = LAST_MODIFIED, error } = {}) {
         LastModified: lastModified,
         Body: { transformToString: async () => JSON.stringify(cd) },
       };
+    },
+  };
+}
+
+/** An in-memory workflows table: Get by workflowId, Scan, plus watchScan's reads. */
+function fakeWorkflows(rows = []) {
+  const items = new Map(rows.map((r) => [r.workflowId, r]));
+  return {
+    items,
+    gets: [],
+    async send(cmd) {
+      const name = cmd.constructor.name;
+      if (name === "GetCommand") {
+        this.gets.push(cmd.input.Key.workflowId);
+        return { Item: items.get(cmd.input.Key.workflowId) };
+      }
+      if (name === "ScanCommand") return { Items: [...items.values()] };
+      if (name === "QueryCommand") return { Items: [] }; // no events → watchScan falls back to startedAt
+      if (name === "UpdateCommand") return {};
+      throw new Error(`fakeWorkflows: unexpected ${name}`);
     },
   };
 }
@@ -418,6 +441,144 @@ describe("stampSiAttempt", () => {
     assert.deepEqual(value.failed, [KEY_A]);
     assert.deepEqual(value.stamped, []);
     assert.ok(lines.some((l) => /NOT stamped/.test(l)));
+  });
+});
+
+// ── the cancelled/errored-run sweep (AC4) ────────────────────────────────────
+
+describe("terminalPhaseOf", () => {
+  it("reads a row as cancelled on cancelledAt alone, since the phase can lag it", () => {
+    assert.equal(terminalPhaseOf({ phase: "development", cancelledAt: "2026-09-17T12:30:00.000Z" }), "cancelled");
+    assert.equal(terminalPhaseOf({ phase: "cancelled" }), "cancelled");
+  });
+
+  it("passes the other terminal phases through, and is null while the run is live", () => {
+    assert.equal(terminalPhaseOf({ phase: "complete" }), "complete");
+    assert.equal(terminalPhaseOf({ phase: "deploy-blocked" }), "deploy-blocked");
+    assert.equal(terminalPhaseOf({ phase: "development" }), null);
+    assert.equal(terminalPhaseOf(null), null);
+  });
+});
+
+describe("siReapScan", () => {
+  const over = (ledgerRows, workflowRows) => {
+    const ddb = fakeDdb(ledgerRows);
+    return { ddb, ledger: new SiLedger({ ddb, table: "test-si-ledger" }), client: fakeWorkflows(workflowRows) };
+  };
+  const cancelledRun = (overrides = {}) => siRun({
+    phase: "cancelled",
+    cancelledAt: "2026-09-17T12:30:00.000Z",
+    completedAt: undefined,
+    delivery: undefined,
+    input: { si: { prdKey: PRD, patternKeys: [KEY_A, KEY_B] } },
+    ...overrides,
+  });
+
+  it("cancelling a fixture SI run flips its keys back to open with the attempt recorded", async () => {
+    // AC4 end-to-end: nobody re-analyses a cancelled run (the cancel route emits
+    // no EventBridge outcome and the watch loop skips terminal rows), so the sweep
+    // is the ONLY thing that closes this attempt out.
+    const { ddb, ledger, client } = over([inRunRow(KEY_A), inRunRow(KEY_B)], [cancelledRun()]);
+
+    const { value } = await quiet(() => siReapScan({ ledger, client, s3: fakeS3(null), bucket: "test-bucket" }));
+
+    assert.equal(value.candidates, 2);
+    assert.equal(value.live, 0);
+    // One stamp, not two: closing the first key closes every key its run carried.
+    assert.equal(value.reaped.length, 1);
+    assert.deepEqual(value.reaped[0].stamped, [KEY_A, KEY_B]);
+    assert.equal(value.reaped[0].outcome, "cancelled");
+
+    for (const key of [KEY_A, KEY_B]) {
+      const row = ddb.items.get(key);
+      assert.equal(row.status, "open", `${key} must be filable again`);
+      const attempt = row.attempts.find((a) => a.workflowId === WF);
+      assert.ok(attempt, `${key} must keep the attempt that was tried`);
+      assert.equal(attempt.outcome, "cancelled");
+      assert.match(attempt.note, /cancelled/);
+    }
+  });
+
+  it("a second sweep is a no-op — the cleared in-run status is the marker", async () => {
+    const { ddb, ledger, client } = over([inRunRow(KEY_A), inRunRow(KEY_B)], [cancelledRun()]);
+    await quiet(() => siReapScan({ ledger, client, s3: fakeS3(null), bucket: "test-bucket" }));
+    const after = JSON.stringify([...ddb.items.values()]);
+
+    const s3 = fakeS3(null);
+    const gets = client.gets.length;
+    const { value } = await quiet(() => siReapScan({ ledger, client, s3, bucket: "test-bucket" }));
+
+    assert.equal(value.candidates, 0, "no row is in-run any more");
+    assert.deepEqual(value.reaped, []);
+    assert.equal(client.gets.length, gets, "the workflows table is not read again");
+    assert.equal(s3.gets.length, 0, "the cd-ledger is not read again");
+    assert.equal(JSON.stringify([...ddb.items.values()]), after, "no row is rewritten");
+  });
+
+  it("closes an errored run the same way, back to open", async () => {
+    const { ddb, ledger, client } = over(
+      [inRunRow(KEY_A)],
+      [siRun({ phase: "error", input: { si: { prdKey: PRD, patternKeys: [KEY_A] } } })],
+    );
+    const { value } = await quiet(() => siReapScan({ ledger, client, s3: fakeS3(null), bucket: "test-bucket" }));
+    assert.equal(value.reaped[0].outcome, "error");
+    const row = ddb.items.get(KEY_A);
+    assert.equal(row.status, "open");
+    assert.equal(row.attempts.at(-1).outcome, "error");
+  });
+
+  it("leaves a run that is still in flight alone", async () => {
+    const { ddb, ledger, client } = over([inRunRow(KEY_A)], [siRun({ phase: "development", completedAt: undefined })]);
+    const { value } = await quiet(() => siReapScan({ ledger, client, s3: fakeS3(null), bucket: "test-bucket" }));
+    assert.equal(value.live, 1);
+    assert.deepEqual(value.reaped, []);
+    assert.equal(ddb.items.get(KEY_A).status, "in-run");
+  });
+
+  it("never reads the workflows table for a row that is not in-run", async () => {
+    const landed = applyAttempt(inRunRow(KEY_A), { prdKey: PRD, workflowId: WF, outcome: "landed", mergedAt: "2026-09-10T00:00:00.000Z" });
+    const { ledger, client } = over([landed], [siRun()]);
+    const { value } = await quiet(() => siReapScan({ ledger, client, s3: fakeS3(null), bucket: "test-bucket" }));
+    assert.equal(value.candidates, 0);
+    assert.deepEqual(client.gets, []);
+  });
+
+  it("leaves a row in-run — never inventing an outcome — when its run has vanished", async () => {
+    const { ddb, ledger, client } = over([inRunRow(KEY_A)], []);
+    const { value, lines } = await quiet(() => siReapScan({ ledger, client, s3: fakeS3(null), bucket: "test-bucket" }));
+    assert.deepEqual(value.reaped, []);
+    assert.equal(ddb.items.get(KEY_A).status, "in-run");
+    assert.ok(lines.some((l) => l.includes("no longer exists")));
+  });
+
+  it("survives a ledger scan failure without failing the watch scan around it", async () => {
+    const ledger = { async list() { throw new Error("ProvisionedThroughputExceededException"); } };
+    const { value, lines } = await quiet(() => siReapScan({ ledger, client: fakeWorkflows([]) }));
+    assert.deepEqual(value, { candidates: 0, live: 0, reaped: [] });
+    assert.ok(lines.some((l) => l.includes("ledger scan failed")));
+  });
+});
+
+describe("watchScan", () => {
+  it("closes out the cancelled SI run before it watches anything, and invokes no harness", async () => {
+    const ddb = fakeDdb([inRunRow(KEY_A)]);
+    const ledger = new SiLedger({ ddb, table: "test-si-ledger" });
+    const cancelled = siRun({
+      phase: "cancelled",
+      cancelledAt: "2026-09-17T12:30:00.000Z",
+      completedAt: undefined,
+      delivery: undefined,
+      input: { si: { prdKey: PRD, patternKeys: [KEY_A] } },
+    });
+    const client = fakeWorkflows([cancelled]);
+    const invoke = () => { throw new Error("the sweep must not invoke the harness"); };
+
+    const { value } = await quiet(() => watchScan({ client, ledger, s3: fakeS3(null), bucket: "test-bucket", invoke }));
+
+    assert.equal(value.active, 0, "a cancelled row is not a live run");
+    assert.deepEqual(value.watched, []);
+    assert.equal(value.si.reaped.length, 1);
+    assert.equal(ddb.items.get(KEY_A).status, "open");
   });
 });
 
