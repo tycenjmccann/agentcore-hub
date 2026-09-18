@@ -443,3 +443,91 @@ describe("publishJourneyEvent — best effort, ttl'd, never throws", () => {
     }
   });
 });
+
+/**
+ * TEAM-4757 R3-2 — judgeCompletionRecord, the DL-030 body verdict.
+ *
+ * This is the one helper in the module that FAILS CLOSED (DL-030/DL-028 positive
+ * evidence), the opposite band from every gate-close verdict around it, so its
+ * matrix is worth stating explicitly. What a drift here costs: one provider would
+ * close a ship ticket over follow-ups the other refuses to close over, and the run
+ * that closed would cascade and complete its epic over work that was never filed.
+ *
+ * Both twins call this through their own `completionRecordProven`, which is NOT
+ * exported (it owns a per-twin S3 client) — the pure judgement is exported precisely
+ * so the refusal STRINGS can be pinned from one place, here.
+ */
+describe("judgeCompletionRecord — the DL-030 completion-record verdict", () => {
+  const KEY = "completions/TEAM-4066.json";
+  const judge = (body: unknown) => agree(`judgeCompletionRecord(${JSON.stringify(body)})`,
+    (m) => m.judgeCompletionRecord(KEY, body)) as { proven: boolean; why: string };
+
+  it("refuses a record whose follow-ups are still pending, and names the re-run", () => {
+    const v = judge(JSON.stringify({ followUpsPending: true, status: "complete_pending_follow_ups" }));
+    expect(v.proven).toBe(false);
+    expect(v.why).toBe(
+      `${KEY} has followUpsPending:true (status complete_pending_follow_ups) — re-run ` +
+        `WorkflowOutput___report_completion with the same arguments to materialize the follow-ups`
+    );
+  });
+
+  it("names the status `unstated` when the record carries followUpsPending but no status", () => {
+    const v = judge(JSON.stringify({ followUpsPending: true }));
+    expect(v.proven).toBe(false);
+    expect(v.why).toContain("(status unstated)");
+  });
+
+  it("admits `followUpsPending !== true` — false, absent, a skip-record, a string", () => {
+    // `!== true` and never `=== false`: a pre-TEAM-4756 record carries neither field,
+    // sweepSkipRecord deliberately omits both, and the complete_transition_failed
+    // restamp deliberately leaves followUpsPending false (the follow-ups ARE filed
+    // there; only the Done write failed). Each of these must still close.
+    for (const body of [
+      { followUpsPending: false, status: "complete" },
+      { ticketId: "TEAM-4066", summary: "shipped", pr_url: "https://example.test/pr/1" },
+      { evidence_kind: "skipped", skipped: true, reason: "empty_sweep_no_siblings" },
+      { followUpsPending: false, status: "complete_transition_failed" },
+      { followUpsPending: "true" },
+      { followUpsPending: 1 },
+      { followUpsPending: null },
+    ]) {
+      const v = judge(JSON.stringify(body));
+      expect(v.proven, `${JSON.stringify(body)} must be admitted`).toBe(true);
+      expect(v.why).toBe(`${KEY} exists`);
+    }
+  });
+
+  it("fails CLOSED on a body it cannot read as a JSON object", () => {
+    for (const [body, detail] of [
+      ["not json at all", "unparseable JSON"],
+      ["", "an empty body"],
+      ["   ", "an empty body"],
+      ["[]", "parsed to an array, not an object"],
+      ["null", "parsed to null, not an object"],
+      ['"a string"', "parsed to string, not an object"],
+      ["42", "parsed to number, not an object"],
+    ] as const) {
+      const v = judge(body);
+      expect(v.proven, `${JSON.stringify(body)} must fail closed`).toBe(false);
+      expect(v.why).toContain(`${KEY} could not be read as a completion record (${detail}`);
+      expect(v.why).toContain("Re-run WorkflowOutput___report_completion");
+    }
+    // A non-string body (no body at all on the S3 response) is the same class.
+    for (const body of [undefined, null]) {
+      const v = judge(body);
+      expect(v.proven).toBe(false);
+      expect(v.why).toContain("(no body)");
+    }
+  });
+
+  it("the pending refusal is BYTE-identical across the two copies", () => {
+    // `agree` compares with toEqual; a refusal an agent reads differently on Jira
+    // than on DynamoDB makes it take a different next action, so pin the bytes.
+    const body = JSON.stringify({ followUpsPending: true, status: "complete_pending_follow_ups" });
+    const [ticketsWhy, jiraWhy] = MODULES.map(([, m]) =>
+      Buffer.from(m.judgeCompletionRecord(KEY, body).why, "utf8")
+    );
+    expect(ticketsWhy.length).toBeGreaterThan(0);
+    expect(jiraWhy.equals(ticketsWhy), "the two copies phrase the DL-030 refusal differently").toBe(true);
+  });
+});

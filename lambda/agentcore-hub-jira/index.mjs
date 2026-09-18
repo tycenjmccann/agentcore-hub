@@ -8,7 +8,7 @@
  *   JIRA_SITE_URL, JIRA_EMAIL, JIRA_API_TOKEN, JIRA_PROJECT_KEY
  */
 
-import { S3Client, GetObjectCommand, HeadObjectCommand } from "@aws-sdk/client-s3";
+import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
 // TEAM-4740 FR-5 (interim): the ONLY DynamoDB this Lambda touches is the events
 // table, and only to audit an autowired blocker edge — the same write the DynamoDB
 // twin makes, so the twins emit one event vocabulary instead of two. Dark unless
@@ -55,6 +55,7 @@ import {
   gateRefusal,
   gateVerificationSlots,
   invokeProbe,
+  judgeCompletionRecord,
   parseFixDecision,
   pipelineLabelOverflow,
   pipelineLabelRefusal,
@@ -296,6 +297,19 @@ async function loadAgentPhases() {
 // a ship ticket by hand leaves the run's completion gates, its KPIs and the deploy
 // audit trail with nothing to read.
 //
+// TEAM-4757 R3-2: the guard READS THE RECORD'S BODY, it no longer just proves the
+// key exists. reportCompletion stamps `followUpsPending` (and a `status` of
+// "complete" / "complete_pending_follow_ups" / "complete_transition_failed") into
+// the record after materializing follow-up tickets and before the Done transition,
+// so a record written while follow-ups were still unfiled used to satisfy an
+// existence-only check exactly as well as a finished one — and a direct
+// transition_ticket(done) on that ticket closed the run, cascaded, and completed the
+// epic over work that was never filed. `followUpsPending === true` is now refused
+// with the re-run hint; `!== true` (never `=== false`) admits every pre-4756 record,
+// every sweep skip-record and the transition-failed recovery. The judgement itself —
+// every refusal string — is judgeCompletionRecord in gate-contract.mjs, so the two
+// providers cannot drift on what they say; only the GetObject is per-twin.
+//
 // Twin of the block in lambda/agentcore-hub-tickets/index.mjs: both providers must
 // refuse identically (the twins doctrine, TEAM-4131 F2), so edit both or neither.
 // Not in fix-contract.mjs — that module is byte-compared across three copies by
@@ -312,7 +326,7 @@ const COMPLETION_RECORD_REQUIRED = {
 
 /**
  * Is this ticket a ship-phase AGENT ticket? Cheap checks first: the caller only
- * pays for the S3 HeadObject when this says yes.
+ * pays for the S3 read of the completion record when this says yes.
  *
  * Human-review gates are EXEMPT, and that exemption comes first — the hub UI's
  * approve action (src/app/api/workflow/[id]/tickets/transition/route.ts) and the
@@ -333,20 +347,31 @@ async function isShipPhaseTicket(labels) {
 }
 
 /**
- * POSITIVE proof that completions/<ticketId>.json exists. Fails CLOSED on an
- * indeterminate answer (AccessDenied, throttle, timeout, ARTIFACT_BUCKET unset):
- * "we could not find a record" is not "there is no record", the same
- * positive-evidence rule as DL-028's deploy gate. `why` is log/message text only
- * — never a credential, never the raw AWS error body.
+ * POSITIVE proof that completions/<ticketId>.json exists AND reports finished work.
+ * Fails CLOSED on an indeterminate answer (AccessDenied, throttle, timeout,
+ * ARTIFACT_BUCKET unset, a body that is not a JSON object): "we could not find a
+ * record" is not "there is no record", the same positive-evidence rule as DL-028's
+ * deploy gate. `why` is log/message text only — never a credential, never the raw
+ * AWS error body.
+ *
+ * TEAM-4757 R3-2: this GETs the body rather than HeadObject-ing the key, because
+ * existence alone stopped being the answer when TEAM-4756 started stamping
+ * `followUpsPending`/`status` into the record (see judgeCompletionRecord's section
+ * in gate-contract.mjs for the invariant and for why the test is `!== true`). The
+ * missing-record and indeterminate texts are byte-unchanged; only a record that
+ * exists and says its follow-ups are still pending is newly refused.
  */
 async function completionRecordProven(ticketId) {
   const key = `completions/${ticketId}.json`;
   if (!ARTIFACT_BUCKET) {
     return { proven: false, why: `ARTIFACT_BUCKET is unset, so ${key} cannot be read` };
   }
+  let bodyText;
   try {
-    await s3.send(new HeadObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: key }));
-    return { proven: true, why: `${key} exists` };
+    const res = await s3.send(new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: key }));
+    // Inside the try on purpose: a stream that fails mid-read, or a response with no
+    // Body at all, is the same "could not tell" as the GetObject itself throwing.
+    bodyText = await res.Body.transformToString();
   } catch (err) {
     const status = err?.$metadata?.httpStatusCode;
     if (err?.name === "NotFound" || err?.name === "NoSuchKey" || status === 404) {
@@ -354,6 +379,7 @@ async function completionRecordProven(ticketId) {
     }
     return { proven: false, why: `could not read ${key} (${err?.name || "S3Error"}${status ? ` ${status}` : ""})` };
   }
+  return judgeCompletionRecord(key, bodyText);
 }
 
 /**

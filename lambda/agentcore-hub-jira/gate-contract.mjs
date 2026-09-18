@@ -749,3 +749,97 @@ export function descriptionCarriesConsoleLink(description, { pipeline, region } 
   const path = `pipelines/${encodeURIComponent(String(pipeline).trim())}/view`;
   return text.includes(url) || text.includes(path);
 }
+
+// ── The DL-030 completion record (TEAM-4757 R3-2) ────────────────────────────
+//
+// THIS SECTION IS IN THE OPPOSITE FAIL BAND FROM THE REST OF THE FILE. Everything
+// above answers "may this GATE ticket close?" and admits on indeterminate, because
+// an unliftable stall is its dangerous failure. This answers DL-030's question —
+// "has the agent's completion record proven this ship-phase ticket's work is
+// actually finished?" — whose dangerous failure is the opposite: a ship ticket
+// closing over work that was never filed, cascading into an epic that completes
+// over nothing. So it FAILS CLOSED, the same positive-evidence rule as DL-028's
+// deploy gate. Do not "harmonise" it with the admit-on-indeterminate argument in
+// the header; the two bands are deliberate and the header says so.
+//
+// WHY THE BODY AND NOT JUST EXISTENCE. lambda/workflow-output/index.mjs
+// (reportCompletion, TEAM-4756) writes completions/<ticket_id>.json AFTER
+// materializing follow-up tickets and BEFORE the Done transition, and stamps the
+// outcome into the body: `followUpsPending` plus a `status` of "complete",
+// "complete_pending_follow_ups" or "complete_transition_failed". A record in the
+// pending state exists exactly like a finished one, so an existence-only guard
+// admitted it — the R3-2 defect. The writer's invariant, stated at index.mjs:865,
+// is: a record that exists with `followUpsPending !== true` means every retryable
+// follow-up is materialized.
+//
+// `!== true` AND NEVER `=== false` — both the writer and this reader depend on it:
+//   · a pre-TEAM-4756 record carries NEITHER field (the invariant held for it too:
+//     it was written before follow-ups existed at all);
+//   · sweepSkipRecord (index.mjs:1714) deliberately omits both — a skip marker is
+//     not a completion report and can carry no pending follow-ups;
+//   · the `complete_transition_failed` restamp (index.mjs:920) deliberately leaves
+//     `followUpsPending` false, because the follow-ups ARE filed and only the Done
+//     write failed; closing that ticket directly is a legitimate recovery this
+//     reader must not refuse.
+
+/**
+ * Anything that is not a readable JSON object. Fails CLOSED: an unreadable record
+ * cannot tell us whether its follow-ups are pending, and "we could not tell" is not
+ * "they are filed" (the same three-outcome discipline as workflow-output's
+ * readCdLedger — read / provably absent / could-not-tell).
+ */
+function completionRecordUnreadable(key, detail) {
+  return {
+    proven: false,
+    why:
+      `${key} could not be read as a completion record (${detail}) — so whether its ` +
+      `follow-ups are still pending is UNKNOWN. Re-run WorkflowOutput___report_completion ` +
+      `with the same arguments to rewrite it`,
+  };
+}
+
+/**
+ * Judge a completion record's BODY — the pure half of both twins'
+ * `completionRecordProven`. Every refusal STRING lives here so the two providers
+ * cannot phrase this differently; each twin keeps its own GetObject and its own
+ * missing/indeterminate error mapping, because the S3 client is per-twin.
+ *
+ * @param {string} key      completions/<ticketId>.json — quoted verbatim in `why`
+ * @param {string} bodyText the object body, already streamed to a string
+ * @returns {{proven: boolean, why: string}} `why` is log/message text only — never a
+ *   credential, never a raw AWS error body, and never the record's own contents.
+ */
+export function judgeCompletionRecord(key, bodyText) {
+  const k = String(key || "");
+  const text = typeof bodyText === "string" ? bodyText : "";
+  if (!text.trim()) {
+    return completionRecordUnreadable(
+      k,
+      bodyText === undefined || bodyText === null ? "no body" : "an empty body"
+    );
+  }
+
+  let record;
+  try {
+    record = JSON.parse(text);
+  } catch (err) {
+    return completionRecordUnreadable(k, `unparseable JSON (${err?.message || "no message"})`);
+  }
+  if (!record || typeof record !== "object" || Array.isArray(record)) {
+    const shape = record === null ? "null" : Array.isArray(record) ? "an array" : typeof record;
+    return completionRecordUnreadable(k, `parsed to ${shape}, not an object`);
+  }
+
+  if (record.followUpsPending === true) {
+    const status =
+      typeof record.status === "string" && record.status.trim() ? record.status.trim() : "unstated";
+    return {
+      proven: false,
+      why:
+        `${k} has followUpsPending:true (status ${status}) — re-run ` +
+        `WorkflowOutput___report_completion with the same arguments to materialize the follow-ups`,
+    };
+  }
+
+  return { proven: true, why: `${k} exists` };
+}

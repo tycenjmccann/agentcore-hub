@@ -1154,29 +1154,41 @@ const SHIP_ROSTER = {
  * A fresh module instance WITH an artifact bucket (ARTIFACT_BUCKET is read at
  * module load), plus a stub on its exported S3 client: `node --test` has no module
  * registry to mock, so the client itself is the seam. Returns the module and the
- * recorded S3 traffic — `heads` is the completion-record probe.
+ * recorded S3 traffic — `records` is the completion-record read.
+ *
+ * TEAM-4757: the gate GETs the record's body, so the record read and the roster read
+ * are both GetObject and the KEY PREFIX separates them (it used to be the command
+ * type). `records` lists the keys that exist and serves each a pre-TEAM-4756 body —
+ * neither followUpsPending nor status — which is what every test written before that
+ * field existed assumed. `recordBodies[key]` overrides with a RAW STRING, so a
+ * pending record, a non-JSON body and an empty body are all expressible.
  */
-async function loadShipGate({ records = [], headError = null, bucket = "test-bucket" } = {}) {
+async function loadShipGate({ records = [], recordBodies = {}, recordError = null, bucket = "test-bucket" } = {}) {
   process.env.ARTIFACT_BUCKET = bucket;
   const mod = await import(`./index.mjs?ship-gate=${loadSeq++}`);
-  const s3Calls = { heads: [], gets: [] };
+  const s3Calls = { records: [], gets: [] };
   mod.s3.send = async (cmd) => {
-    if (cmd?.constructor?.name === "HeadObjectCommand") {
-      s3Calls.heads.push(cmd.input.Key);
-      if (headError) throw headError;
-      if (!records.includes(cmd.input.Key)) {
-        const err = new Error("NotFound");
-        err.name = "NotFound";
+    const key = cmd?.input?.Key;
+    if (String(key).startsWith("completions/")) {
+      s3Calls.records.push(key);
+      if (recordError) throw recordError;
+      if (!(key in recordBodies) && !records.includes(key)) {
+        const err = new Error("NoSuchKey");
+        err.name = "NoSuchKey";
         err.$metadata = { httpStatusCode: 404 };
         throw err;
       }
-      return { ContentLength: 42 };
+      const body =
+        key in recordBodies
+          ? recordBodies[key]
+          : JSON.stringify({ ticketId: key.slice("completions/".length).replace(/\.json$/, ""), summary: "shipped" });
+      return { Body: { transformToString: async () => body } };
     }
-    s3Calls.gets.push(cmd.input.Key);
-    if (cmd.input.Key === "config/agents.json") {
+    s3Calls.gets.push(key);
+    if (key === "config/agents.json") {
       return { Body: { transformToString: async () => JSON.stringify(SHIP_ROSTER) } };
     }
-    const err = new Error(`NoSuchKey: ${cmd.input.Key}`);
+    const err = new Error(`NoSuchKey: ${key}`);
     err.name = "NoSuchKey";
     throw err;
   };
@@ -1238,7 +1250,7 @@ test("TEAM-4706 (a): a ship ticket with NO completion record is refused, and Jir
     // Nothing was written: no transition POST, and not even the reason comment.
     assert.deepEqual(cap.transitions, [], "a refused transition must not fire in Jira");
     assert.deepEqual(cap.comments, [], "a refused transition must leave no comment behind");
-    assert.deepEqual(s3Calls.heads, [SHIP_RECORD_KEY]);
+    assert.deepEqual(s3Calls.records, [SHIP_RECORD_KEY]);
   } finally {
     cap.restore();
     delete process.env.ARTIFACT_BUCKET;
@@ -1271,7 +1283,7 @@ test("TEAM-4706 (b): the same ship ticket WITH the record transitions normally",
     assert.equal(res.ticketId, SHIP_TICKET);
     assert.equal(res.reason, undefined);
     assert.deepEqual(cap.transitions, [{ transition: { id: "31" } }]);
-    assert.deepEqual(s3Calls.heads, [SHIP_RECORD_KEY]);
+    assert.deepEqual(s3Calls.records, [SHIP_RECORD_KEY]);
   } finally {
     cap.restore();
     delete process.env.ARTIFACT_BUCKET;
@@ -1289,7 +1301,7 @@ test("TEAM-4706 (c): a NON-ship ticket closes with no record and never probes S3
     // The cheap phase predicate runs FIRST: the completion-record probe never
     // happens. (The only S3 traffic is the cold-start roster config read, which
     // this Lambda already made before this ticket existed.)
-    assert.deepEqual(s3Calls.heads, []);
+    assert.deepEqual(s3Calls.records, []);
   } finally {
     cap.restore();
     delete process.env.ARTIFACT_BUCKET;
@@ -1309,7 +1321,7 @@ test("TEAM-4706 (d): a human-review gate closes with no record — the UI/Telegr
 
     assert.equal(res.status, "done");
     assert.deepEqual(cap.transitions, [{ transition: { id: "31" } }]);
-    assert.deepEqual(s3Calls.heads, []);
+    assert.deepEqual(s3Calls.records, []);
   } finally {
     cap.restore();
     delete process.env.ARTIFACT_BUCKET;
@@ -1327,7 +1339,7 @@ test("TEAM-4706 (e): ship phase read from the assignee's ROSTER phase, with no p
     assert.equal(res.reason, "completion_record_required");
     assert.equal(res.hint, COMPLETION_HINT);
     assert.deepEqual(cap.transitions, []);
-    assert.deepEqual(s3Calls.heads, [SHIP_RECORD_KEY]);
+    assert.deepEqual(s3Calls.records, [SHIP_RECORD_KEY]);
     // The phase came from the S3 roster, not from a hardcoded name here.
     assert.ok(s3Calls.gets.includes("config/agents.json"));
   } finally {
@@ -1340,7 +1352,7 @@ test("TEAM-4706 (f): an INDETERMINATE S3 answer refuses (fails closed) and leaks
   const denied = new Error("User: arn:aws:sts::…:assumed-role/… is not authorized to perform s3:GetObject");
   denied.name = "AccessDenied";
   denied.$metadata = { httpStatusCode: 403 };
-  const { mod } = await loadShipGate({ headError: denied });
+  const { mod } = await loadShipGate({ recordError: denied });
   const cap = installDoneStub({ labels: ["agent:agentcore_hub_release_manager", "phase:ship"] });
   try {
     const res = await doneTransition(mod.handler);
@@ -1353,6 +1365,136 @@ test("TEAM-4706 (f): an INDETERMINATE S3 answer refuses (fails closed) and leaks
   } finally {
     cap.restore();
     delete process.env.ARTIFACT_BUCKET;
+  }
+});
+
+// ─── TEAM-4757 R3-2: the record's BODY is the proof, not its existence ────────
+//
+// TEAM-4756 made reportCompletion stamp `followUpsPending`/`status` into the record,
+// written after materializing follow-up tickets and before the Done transition. A
+// record in the pending state existed exactly like a finished one, so the
+// existence-only guard admitted it and a direct transition_ticket(done) closed the
+// run — cascading, and completing the epic over follow-ups that were never filed.
+// The admission test is `followUpsPending !== true`, never `=== false`: a pre-4756
+// record, a sweep skip-record and the `complete_transition_failed` restamp all
+// legitimately lack the field. Byte-identical twin of the (g)…(l) cases in
+// lambda/agentcore-hub-tickets/index.test.mjs; the refusal STRINGS come from
+// gate-contract.mjs's judgeCompletionRecord, which is why both twins can assert them.
+
+/** A ship ticket whose record says what `body` says. */
+async function shipDoneWithRecord(body, { labels = ["agent:agentcore_hub_release_manager", "phase:ship"] } = {}) {
+  const { mod, s3Calls } = await loadShipGate({ recordBodies: { [SHIP_RECORD_KEY]: body } });
+  const cap = installDoneStub({ labels });
+  try {
+    return { res: await doneTransition(mod.handler), cap, s3Calls };
+  } finally {
+    cap.restore();
+    delete process.env.ARTIFACT_BUCKET;
+  }
+}
+
+test("TEAM-4757 (g): a record with followUpsPending:true is REFUSED — the R3-2 hole", async () => {
+  const { res, cap, s3Calls } = await shipDoneWithRecord(
+    JSON.stringify({
+      ticketId: SHIP_TICKET,
+      summary: "deployed",
+      followUpsPending: true,
+      status: "complete_pending_follow_ups",
+    })
+  );
+
+  assert.equal(res.ok, false);
+  assert.equal(res.reason, "completion_record_required");
+  assert.equal(res.hint, COMPLETION_HINT);
+  // The message names the state AND the one call that fixes it.
+  assert.match(
+    res.error,
+    /completions\/TEAM-4066\.json has followUpsPending:true \(status complete_pending_follow_ups\)/
+  );
+  assert.match(
+    res.error,
+    /re-run WorkflowOutput___report_completion with the same arguments to materialize the follow-ups/
+  );
+  // Nothing was written, and the record was read exactly once.
+  assert.deepEqual(cap.transitions, [], "a pending record must not close a ship ticket");
+  assert.deepEqual(cap.comments, []);
+  assert.deepEqual(s3Calls.records, [SHIP_RECORD_KEY]);
+});
+
+test("TEAM-4757 (h): followUpsPending:false + status complete transitions", async () => {
+  const { res, cap } = await shipDoneWithRecord(
+    JSON.stringify({ ticketId: SHIP_TICKET, followUpsPending: false, status: "complete" })
+  );
+
+  assert.equal(res.status, "done");
+  assert.equal(res.reason, undefined);
+  assert.deepEqual(cap.transitions, [{ transition: { id: "31" } }]);
+});
+
+test("TEAM-4757 (i): a PRE-4756 record — neither field — still transitions", async () => {
+  // Every record written before TEAM-4756 looks like this. `=== false` instead of
+  // `!== true` would strand every in-flight run the moment this deploys.
+  const { res, cap } = await shipDoneWithRecord(
+    JSON.stringify({ ticketId: SHIP_TICKET, summary: "shipped", pr_url: "https://example.test/pr/1" })
+  );
+
+  assert.equal(res.status, "done");
+  assert.deepEqual(cap.transitions, [{ transition: { id: "31" } }]);
+});
+
+test("TEAM-4757 (i, cont.): a sweep SKIP-record transitions, and so does the transition-failed restamp", async () => {
+  // sweepSkipRecord deliberately stamps neither field (a skip is not a completion
+  // report); the `complete_transition_failed` restamp deliberately leaves
+  // followUpsPending false, because the follow-ups ARE filed there and only the Done
+  // write failed — closing that ticket directly is a legitimate recovery.
+  const skip = await shipDoneWithRecord(
+    JSON.stringify({ ticketId: SHIP_TICKET, evidence_kind: "skipped", skipped: true, reason: "empty_sweep_no_siblings" })
+  );
+  assert.equal(skip.res.status, "done");
+
+  const failed = await shipDoneWithRecord(
+    JSON.stringify({ ticketId: SHIP_TICKET, followUpsPending: false, status: "complete_transition_failed" })
+  );
+  assert.equal(failed.res.status, "done");
+});
+
+test('TEAM-4757 (j): followUpsPending:"true" (a STRING) transitions — the test is `=== true`, not truthiness', async () => {
+  const { res, cap } = await shipDoneWithRecord(
+    JSON.stringify({ ticketId: SHIP_TICKET, followUpsPending: "true" })
+  );
+
+  assert.equal(res.status, "done");
+  assert.deepEqual(cap.transitions, [{ transition: { id: "31" } }]);
+});
+
+test("TEAM-4757 (k): followUpsPending:true with no status names the status `unstated`", async () => {
+  const { res, cap } = await shipDoneWithRecord(JSON.stringify({ ticketId: SHIP_TICKET, followUpsPending: true }));
+
+  assert.equal(res.reason, "completion_record_required");
+  assert.match(res.error, /has followUpsPending:true \(status unstated\)/);
+  assert.deepEqual(cap.transitions, []);
+});
+
+test("TEAM-4757 (l): an UNREADABLE body refuses — fails closed", async () => {
+  // A record we cannot parse cannot tell us whether its follow-ups are pending, and
+  // "could not tell" is not "they are filed" — the same three-outcome discipline as
+  // workflow-output's readCdLedger.
+  for (const [body, detail] of [
+    ["not json at all", "unparseable JSON"],
+    ["", "an empty body"],
+    ["[]", "parsed to an array, not an object"],
+    ["null", "parsed to null, not an object"],
+  ]) {
+    const { res, cap } = await shipDoneWithRecord(body);
+
+    assert.equal(res.ok, false, `body ${JSON.stringify(body)} must refuse`);
+    assert.equal(res.reason, "completion_record_required");
+    assert.ok(
+      res.error.includes(`completions/TEAM-4066.json could not be read as a completion record (${detail}`),
+      `body ${JSON.stringify(body)}: expected the "${detail}" refusal, got: ${res.error}`
+    );
+    assert.match(res.error, /Re-run WorkflowOutput___report_completion/);
+    assert.deepEqual(cap.transitions, []);
   }
 });
 
