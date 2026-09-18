@@ -552,7 +552,13 @@ WHAT WAS KEPT / NOT DONE (and why)
 
 ⚠ NEEDS YOUR ATTENTION (omit section if empty)
 • <ONLY things a human must do beyond approve/reject: billing failures,
-  auth-walled bot flags, required checks that cannot run, judgment calls>
+  auth-walled bot flags, required checks that cannot run, judgment calls,
+  infra handoff commands from Step 5's infra-handoff rule below>
+• <if this PR touched lambda/agentcore-hub-tickets/ or lambda/agentcore-hub-jira/,
+  or the reconcile sweep: the two commands verbatim, e.g.
+  "PIPELINE_TOOLS_LAMBDA=agentcore-hub-pipeline-tools EVENTS_TABLE=agentcore-hub-events
+  node deploy/setup-tickets-lambda.mjs" and/or
+  "RECONCILE_SWEEP_MODE=enforce ./lambda/orchestrator/deploy.sh">
 
 RISK IF WE'RE WRONG: <Low/Medium/High + one sentence why + worst case +
 recovery path>.
@@ -572,6 +578,10 @@ Rules for the brief:
   link, don't inline.
 - On a PASS-with-known-findings, the brief's ⚠ NEEDS YOUR ATTENTION section
   MUST list the accepted open findings and link the escalation digest.
+- If this run's diff touched the ticket twins or the reconcile sweep, ⚠ NEEDS
+  YOUR ATTENTION MUST carry the matching command(s) from Step 5's infra-handoff
+  rule verbatim (never paraphrased) — a human copy-pasting from memory is how a
+  handoff silently never happens.
 
 ### Step 6: Review package — the Merge Approval ping
 `load_blueprint("review-package")` and write
@@ -914,6 +924,22 @@ triggered yet) is the FIRST thing you do on EVERY invocation of the CD ticket.
    for a human (DEPLOY.md "What the pipeline deploys, and what it hands off"
    maps each path to its command). Do NOT file a fix ticket for a handoff and
    do NOT run the handoff scripts yourself.
+   - Two handoff commands recur for changes to the gate/sweep surface — quote
+     them verbatim in your report so the human can copy-paste, never paraphrase:
+     ```
+     PIPELINE_TOOLS_LAMBDA=agentcore-hub-pipeline-tools EVENTS_TABLE=agentcore-hub-events \
+       node deploy/setup-tickets-lambda.mjs        # ticket twins: gate probe + journey events
+     RECONCILE_SWEEP_MODE=enforce ./lambda/orchestrator/deploy.sh   # promote after shadow is clean
+     ```
+     The first is mandatory whenever `lambda/agentcore-hub-tickets/` or
+     `lambda/agentcore-hub-jira/` changed: `setup-tickets-lambda.mjs` only attaches
+     the `Pipeline___capabilities` invoke grant and the events-table `PutItem` grant,
+     and only forwards those two env vars, when they are set in the DEPLOYING
+     shell — a bare re-run leaves the FR-1 gate guard deployed but blind, with no
+     probe target, so it admits every typed gate as `indeterminate`. The second
+     promotes `RECONCILE_SWEEP_MODE` from its dark `off` default to `enforce` once
+     `shadow`'s `reconcile.would_*` / `would_watch_*` log lines look right — the
+     W2/W3 human-gate watches never page before `enforce` is set.
 6. **Report — the ship contract:** `WorkflowOutput___report_completion` with
    `merge_commit=<the merge commit SHA now on the default branch>`,
    `pipeline_name=<pipeline_name>`, `pipeline_execution_id=<the ledger's

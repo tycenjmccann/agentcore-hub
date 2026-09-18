@@ -29,7 +29,7 @@
  *        generation-CAS steal, so a second sweep over an already-recovered
  *        ticket loses that CAS harmlessly (a no-op).
  *
- * Modes (RECONCILE_SWEEP_MODE): off = skip; shadow (default) = full scan +
+ * Modes (RECONCILE_SWEEP_MODE): off (the default) = skip; shadow = full scan +
  * logs/metrics of what WOULD be re-driven, but ZERO writes; enforce = re-drive
  * for real. Fails SAFE: the value is trimmed + lowercased and anything that is
  * not exactly off|shadow|enforce is coerced to shadow with a loud warning.
