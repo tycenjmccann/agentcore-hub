@@ -10,10 +10,16 @@
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
 
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+
 import {
   REINVOCATION_KINDS, REWORK_KINDS, classifyReinvocation, computeAgentTasks,
-  reinvocationTotals, interventionDetail,
+  reinvocationTotals, interventionDetail, invocationInstants,
 } from "./index.mjs";
+
+const HERE = dirname(fileURLToPath(import.meta.url));
 
 const T0 = Date.parse("2026-09-17T02:00:00.000Z");
 const at = (min) => new Date(T0 + min * 60_000).toISOString();
@@ -210,5 +216,37 @@ describe("interventionDetail — every WM action, with what it said", () => {
     const rows = interventionDetail([ev(1, "manager.intervention", { action: "comment", comment: `a\n\n${"b".repeat(400)}` })]);
     assert.equal(rows[0].note.length, 240);
     assert.ok(rows[0].note.startsWith("a b"));
+  });
+});
+
+describe("a real dossier — wf_1788416098262_sffzti (Codex review on #635)", () => {
+  const dossier = JSON.parse(readFileSync(join(HERE, "../../deploy/workflow-manager/toolkit/fixtures/sffzti-dossier.json"), "utf8"));
+  const tasks = computeAgentTasks(dossier.workflow, dossier.events);
+  const byId = Object.fromEntries(tasks.map((t) => [t.ticketId, t]));
+
+  test("the release manager: woken by its CI re-cert, then WM-restarted twice — never rework", () => {
+    const rm = byId["TEAM-3799"];
+    // 4 dispatches: the 21:14 one exists ONLY as the orchestrator's journal event
+    // (the runtime died before publishing agent.invoked) and must still count.
+    assert.equal(rm.invocations, 4);
+    assert.deepEqual(rm.reinvocations.map((r) => r.kind), ["ci_recert", "retry", "retry"]);
+    // The 20:21 re-wake follows six agent.error events from the PRIOR session 38 h
+    // earlier; the orchestrator.unblocked seconds before it is the cause.
+    assert.equal(rm.reinvocations[0].cause, "TEAM-3796");
+    assert.equal(rm.reworkRounds, 0);
+    assert.equal(rm.retries, 2);
+  });
+
+  test("one dispatch stamped at two precisions is one invocation, not a rework round", () => {
+    // Every first dispatch in this run appears as both "…33Z" and "…33.861Z".
+    assert.equal(byId["TEAM-3783"].invocations, 1);
+    assert.deepEqual(byId["TEAM-3783"].reinvocations, []);
+    assert.equal(reinvocationTotals(tasks).byKind.unknown, 0);
+  });
+
+  test("invocationInstants collapses runtime + journal + precision twins, keeps the earliest", () => {
+    const t0 = Date.parse("2026-09-03T06:19:33Z");
+    const got = invocationInstants([t0 + 861, t0, t0 + 988, t0 + 90_000, t0 + 90_100, NaN]);
+    assert.deepEqual(got, [t0, t0 + 90_000]);
   });
 });

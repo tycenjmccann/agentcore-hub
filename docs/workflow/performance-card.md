@@ -285,9 +285,18 @@ is re-invoked when that closes, so "invoked twice" no longer means "sent back".
 (`classifyReinvocation`, `REINVOCATION_KINDS`); only `REWORK_KINDS` feed
 `quality.reworkRounds` and first-pass yield.
 
+An invocation is a distinct dispatch instant (`invocationInstants`): the
+runtime's `agent.invoked` and the orchestrator's journal
+`orchestrator.agent_invoked` for one dispatch, and the same instant stamped at
+two precisions by two writers, collapse into one (5 s slack); a journal event
+with no runtime twin (the session died before the runtime published) still
+counts. The cause of a re-invocation is the signal *nearest* to it — a stale
+`agent.error` from the previous session never outranks the
+`orchestrator.unblocked` that actually re-dispatched the ticket.
+
 | Kind | Cause seen in the ticket's own events since its previous invocation | Counts as |
 |---|---|---|
-| `retry` | `agent.retry` / `agent.error` / `agent.died` | error (`quality.errors`, `quality.retries`) |
+| `retry` | `agent.retry` / `agent.error` / `agent.died`, or a Workflow Manager `manager.intervention` whose action is `retry` / `dispatch` / `restart` | error (`quality.errors`, `quality.retries`) |
 | `human_gate` | `orchestrator.unblocked` by a `human:*` ticket | re-wake (`quality.rewakes`) |
 | `ci_recert` | the ticket is a CI ticket, or it was unblocked by one | re-wake |
 | `dependency` | unblocked by any other non-fix agent ticket | re-wake |

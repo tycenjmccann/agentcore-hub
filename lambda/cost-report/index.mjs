@@ -1433,25 +1433,43 @@ export const REINVOCATION_KINDS = Object.freeze([
 ]);
 export const REWORK_KINDS = new Set(["fix_rework", "review_rework", "unknown"]);
 const RETRY_EVENT_TYPES = new Set(["agent.retry", "agent.error", "agent.died"]);
+/** A Workflow Manager action that re-dispatches a stalled ticket is a retry as well. */
+const WM_RETRY_ACTIONS = new Set(["retry", "dispatch", "redispatch", "restart"]);
+const isRetrySignal = (e) => RETRY_EVENT_TYPES.has(e.type)
+  || (e.type === "manager.intervention" && WM_RETRY_ACTIONS.has(String(e.detail?.action || "").toLowerCase()));
+const INVOKE_EVENT_TYPES = new Set(["agent.invoked", "orchestrator.agent_invoked"]);
 const CI_AGENT_RE = /_ci_agent$/;
-/** An unblock/retry lands ≤1s before the re-invoke; allow clock skew between writers. */
+/**
+ * An unblock/retry lands ≤1s before the re-invoke, and the runtime's agent.invoked
+ * and the orchestrator's journal event for ONE dispatch land <1s apart; allow
+ * clock skew between writers.
+ */
 const REINVOKE_SLACK_MS = 5_000;
 
 /**
  * Why was `ticketId` invoked again at `at`, given its previous invocation at
  * `prevAt`? Looks only at the ticket's own events in (prevAt, at] plus any
  * review rejection in that window. Pure; returns { kind, cause }.
+ *
+ * The cause is the signal NEAREST the new invocation: a session's stale
+ * agent.error hours earlier must not outrank the orchestrator.unblocked that
+ * actually re-dispatched the ticket (sffzti TEAM-3799: unblocked by its CI
+ * re-cert 38 h after the prior session's errors).
  */
 export function classifyReinvocation(ticketId, prevAt, at, ctx) {
   const hi = at + REINVOKE_SLACK_MS;
-  const inWindow = (e) => { const t = Date.parse(e.timestamp); return Number.isFinite(t) && t > prevAt && t <= hi; };
-  const own = (ctx.byTicket.get(ticketId) || []).filter(inWindow);
-  const retry = own.find((e) => RETRY_EVENT_TYPES.has(e.type));
-  if (retry) return { kind: "retry", cause: retry.type };
+  const ms = (e) => Date.parse(e.timestamp);
+  const own = (ctx.byTicket.get(ticketId) || [])
+    .filter((e) => { const t = ms(e); return Number.isFinite(t) && t > prevAt && t <= hi; })
+    .sort((a, b) => ms(a) - ms(b));
   const self = ctx.tickets.get(ticketId);
-  const unblocked = own.filter((e) => e.type === "orchestrator.unblocked").pop();
-  if (unblocked) {
-    const by = unblocked.detail?.unblockedBy || null;
+  const nearest = own.reverse().find((e) => isRetrySignal(e) || e.type === "orchestrator.unblocked");
+  if (nearest && isRetrySignal(nearest)) {
+    const cause = nearest.type === "manager.intervention" ? `manager.intervention:${nearest.detail?.action}` : nearest.type;
+    return { kind: "retry", cause };
+  }
+  if (nearest) {
+    const by = nearest.detail?.unblockedBy || null;
     const info = by ? ctx.tickets.get(by) : null;
     if (CI_AGENT_RE.test(self?.agentId || "")) return { kind: "ci_recert", cause: by };
     if (isHuman(info?.agentId)) return { kind: "human_gate", cause: by };
@@ -1465,21 +1483,34 @@ export function classifyReinvocation(ticketId, prevAt, at, ctx) {
 }
 
 /**
- * One row per ticket in workflow.agentTasks. `invocations` = distinct
- * agent.invoked instants for the ticket; each one beyond the first is classified
- * (see REINVOCATION_KINDS) and `reworkRounds` counts only the REWORK_KINDS.
+ * Distinct invocation instants for one ticket. The runtime's agent.invoked and
+ * the orchestrator's journal orchestrator.agent_invoked describe the SAME
+ * dispatch (<1 s apart), and two writers may stamp one instant at different
+ * precisions ("…33Z" vs "…33.861Z"), so instants within the slack collapse into
+ * one invocation and keep the earliest. A journal event with no runtime twin —
+ * the session died before the runtime published — still counts as an invocation.
+ */
+export function invocationInstants(msList) {
+  const out = [];
+  for (const t of [...msList].filter(Number.isFinite).sort((a, b) => a - b)) {
+    if (!out.length || t - out[out.length - 1] > REINVOKE_SLACK_MS) out.push(t);
+  }
+  return out;
+}
+
+/**
+ * One row per ticket in workflow.agentTasks. `invocations` = distinct dispatch
+ * instants for the ticket (see invocationInstants); each one beyond the first is
+ * classified (see REINVOCATION_KINDS) and `reworkRounds` counts only the REWORK_KINDS.
  */
 export function computeAgentTasks(workflow, events) {
   const invokesByTicket = new Map();
-  const fallbackInvokes = new Map();
   const byTicket = new Map();
   const reviewRejectedAt = [];
   const tickets = new Map();
   for (const e of events) {
     const tid = e.detail?.ticketId;
-    if (e.type === "agent.invoked" && tid) (invokesByTicket.get(tid) || invokesByTicket.set(tid, new Set()).get(tid)).add(e.timestamp);
-    // Older runs only carry the orchestrator's journal event; use it when the runtime's is absent.
-    if (e.type === "orchestrator.agent_invoked" && tid) (fallbackInvokes.get(tid) || fallbackInvokes.set(tid, new Set()).get(tid)).add(e.timestamp);
+    if (INVOKE_EVENT_TYPES.has(e.type) && tid) (invokesByTicket.get(tid) || invokesByTicket.set(tid, []).get(tid)).push(Date.parse(e.timestamp));
     if (tid) (byTicket.get(tid) || byTicket.set(tid, []).get(tid)).push(e);
     if (e.type === "review.rejected") { const t = Date.parse(e.timestamp); if (Number.isFinite(t)) reviewRejectedAt.push(t); }
     if (e.type === "ticket.created" && e.detail?.ticket?.id) {
@@ -1495,8 +1526,7 @@ export function computeAgentTasks(workflow, events) {
 
   const tasks = [];
   for (const [ticketId, t] of Object.entries(workflow.agentTasks || {})) {
-    const instants = [...(invokesByTicket.get(ticketId) || fallbackInvokes.get(ticketId) || [])]
-      .map((ts) => Date.parse(ts)).filter(Number.isFinite).sort((a, b) => a - b);
+    const instants = invocationInstants(invokesByTicket.get(ticketId) || []);
     const invocations = instants.length || (t.startedAt ? 1 : 0);
     const reinvocations = [];
     for (let i = 1; i < instants.length; i++) {
