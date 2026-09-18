@@ -261,6 +261,50 @@ describe("gateLoopVerdict — the third gate of a kind against one target", () =
   });
 });
 
+describe("gateVerificationSlots — which stamps a close replaces (TEAM-4750 B2)", () => {
+  // Each twin removes the contradictory stamp in its own idiom (one conditional
+  // UpdateCommand vs one transitions POST), so the DECISION has to be shared or the
+  // two drift into disagreeing about what a closed gate carries.
+  const BASE = ["gate:blocker", "pipeline:hub-x-deploy"];
+
+  it("splits same from opposite, in either spelling", () => {
+    expect(agree("slots: colon opposite", (m) => m.gateVerificationSlots([...BASE, "gateverify:indeterminate"], "verified"))).toEqual({
+      stamp: "gateverify:verified",
+      same: [],
+      opposite: [2],
+    });
+    expect(agree("slots: hyphen opposite", (m) => m.gateVerificationSlots([...BASE, "gateverify-indeterminate"], "verified"))).toEqual({
+      stamp: "gateverify:verified",
+      same: [],
+      opposite: [2],
+    });
+    expect(agree("slots: both present", (m) =>
+      m.gateVerificationSlots(["gateverify:verified", ...BASE, "gateverify:indeterminate"], "verified")
+    )).toEqual({ stamp: "gateverify:verified", same: [0], opposite: [3] });
+  });
+
+  it("classifies NOTHING when the caller has no verdict of its own", () => {
+    // The fail-safe direction for a label mutation: no stamp to write ⇒ no stamp is
+    // deleted. A caller with a junk result must not go pruning the audit trail.
+    expect(agree("slots: junk result", (m) =>
+      m.gateVerificationSlots([...BASE, "gateverify:verified", "gateverify:indeterminate"], "bogus")
+    )).toEqual({ stamp: "", same: [], opposite: [] });
+  });
+
+  it("tolerates junk input the way every other reader here does", () => {
+    expect(agree("slots: junk labels", (m) => m.gateVerificationSlots(null, "verified"))).toEqual({
+      stamp: "gateverify:verified",
+      same: [],
+      opposite: [],
+    });
+    expect(agree("slots: sparse labels", (m) => m.gateVerificationSlots([null, undefined, " GATEVERIFY:VERIFIED "], "verified"))).toEqual({
+      stamp: "gateverify:verified",
+      same: [2],
+      opposite: [],
+    });
+  });
+});
+
 describe("the probe's shape agrees", () => {
   it("PROBE_TOOLS is the same read-only allow-list in both copies", () => {
     expect(agree("PROBE_TOOLS", (m) => m.PROBE_TOOLS)).toEqual([

@@ -210,15 +210,24 @@ function installJiraFetch() {
     if (/\/transitions$/.test(path) && method === "GET") {
       return ok({ transitions: [{ id: "31", name: "Done", to: { name: "Done" } }] });
     }
-    if (/\/transitions$/.test(path) && method === "POST") return { status: 204, ok: true, text: async () => "" };
-    if (/\/comment$/.test(path)) return ok({ id: "1" });
-    if (keyMatch && method === "PUT") {
-      // addLabels: Jira's `add` verb is idempotent server-side, so apply it that way.
-      const ops = body?.update?.labels || [];
-      for (const op of ops) {
+    // Jira's `add` verb is idempotent server-side, so apply ops that way. Both the
+    // transition POST and a bare PUT carry them: the guard's label plan rides in the
+    // transition request, so applying them there is what makes the resulting label
+    // list assertable rather than assumed.
+    const applyLabelOps = (ops: Array<{ add?: string; remove?: string }>) => {
+      for (const op of ops || []) {
         if (op.add && issue && !issue.labels.includes(op.add)) issue.labels.push(op.add);
         if (op.remove && issue) issue.labels = issue.labels.filter((l) => l !== op.remove);
       }
+    };
+
+    if (/\/transitions$/.test(path) && method === "POST") {
+      applyLabelOps(body?.update?.labels);
+      return { status: 204, ok: true, text: async () => "" };
+    }
+    if (/\/comment$/.test(path)) return ok({ id: "1" });
+    if (keyMatch && method === "PUT") {
+      applyLabelOps(body?.update?.labels);
       return { status: 204, ok: true, text: async () => "" };
     }
     if (keyMatch && method === "GET") {
@@ -343,6 +352,33 @@ function classify(res: any): Outcome {
 function six(res: any) {
   const { ok, reason, hint, consoleUrl, stage, action } = res;
   return { ok, reason, hint, consoleUrl, stage, action };
+}
+
+/**
+ * Replay a status write's label clauses over the labels the row was seeded with, so
+ * "what does the ticket end up carrying?" is assertable on this twin the way reading
+ * `h.jira.issues[TICKET].labels` is on the other. The lib-dynamodb mock records
+ * UpdateCommands rather than interpreting UpdateExpressions, and teaching it the
+ * whole expression language to check one label list would be the wrong trade.
+ *
+ * Applies DynamoDB's documented semantics: index paths resolve against the ORIGINAL
+ * list, and the compaction from several REMOVEs happens once, at the end.
+ */
+function replayLabelWrite(seeded: string[], write: { UpdateExpression: string; ExpressionAttributeValues: Record<string, unknown> }) {
+  const out = [...seeded];
+  const values = write.ExpressionAttributeValues;
+  const slotSet = /#l\[(\d+)] = :stampl/.exec(write.UpdateExpression);
+  if (slotSet) out[Number(slotSet[1])] = values[":stampl"] as string;
+  else if (write.UpdateExpression.includes("list_append(if_not_exists(#l, :emptyl), :stampl)")) {
+    out.push(...(values[":stampl"] as string[]));
+  }
+  const removed = new Set(
+    [...write.UpdateExpression.matchAll(/REMOVE (.+)$/g)]
+      .flatMap((m) => m[1].split(",").map((s) => /#l\[(\d+)]/.exec(s.trim())?.[1]))
+      .filter((i): i is string => Boolean(i))
+      .map(Number)
+  );
+  return out.filter((_, i) => !removed.has(i));
 }
 
 const DEPLOY_LABELS = [`gate:deploy-approval`, `pipeline:${PIPELINE}`, `exec:${EXEC}`, "wf:wf_1"];
@@ -814,6 +850,111 @@ describe("the admit path writes the stamp WITH the status", () => {
     // No adjacent second call: a stamp written separately could be lost after the
     // close, leaving a closed gate with no record of what admitted it.
     expect(h.jira.writes.filter((w) => w.method === "PUT"), "no separate label PUT").toHaveLength(0);
+  });
+
+  // TEAM-4750 B2. A gate ticket may be closed, reopened and closed again with a
+  // DIFFERENT verdict; the stamp is the only label record of why it closed, so two
+  // contradictory stamps make that record unreadable. Both twins must therefore take
+  // the opposite stamp OFF in the same write that adds the new one.
+  describe("a contradictory gateverify stamp is replaced, never accumulated", () => {
+    const SWAP: Scenario = {
+      labels: [...DEPLOY_LABELS, "gate:awaiting-console", "gateverify:indeterminate"],
+      probes: [{ tool: "Pipeline___get_state", result: { waitingOn: null } }],
+    };
+
+    it("dynamodb: the park slot becomes the new stamp and the opposite slot is REMOVEd, in one write", async () => {
+      await runTickets(SWAP);
+      expect(h.ddb.statusUpdates).toHaveLength(1);
+      const write = h.ddb.statusUpdates[0] as {
+        UpdateExpression: string;
+        ExpressionAttributeValues: Record<string, unknown>;
+        ConditionExpression?: string;
+      };
+      // The stamp reuses the awaiting slot (index 4); the stale one (index 5) is
+      // dropped. Distinct indices are fine in one expression — only `labels` next
+      // to `labels[i]` is not — and several REMOVEs resolve against the ORIGINAL
+      // indices, so no shift-by-one hazard.
+      expect(write.UpdateExpression).toMatch(/#l\[4] = :stampl/);
+      expect(write.UpdateExpression).toMatch(/REMOVE #l\[5]/);
+      expect(write.UpdateExpression).not.toContain("list_append");
+      expect(write.ExpressionAttributeValues[":stampl"]).toBe("gateverify:verified");
+      // Every touched slot is conditioned, so a racing labeller trips the retry
+      // path rather than corrupting a neighbouring label.
+      expect(write.ConditionExpression).toBe("#l[4] = :awaiting AND #l[5] = :opp0");
+      expect(write.ExpressionAttributeValues[":awaiting"]).toBe("gate:awaiting-console");
+      expect(write.ExpressionAttributeValues[":opp0"]).toBe("gateverify:indeterminate");
+      // What the row ends up carrying: exactly one verification label, no park label.
+      const after = replayLabelWrite(SWAP.labels, write);
+      expect(after.filter((l) => /^gateverify[:-]/.test(l))).toEqual(["gateverify:verified"]);
+      expect(after).not.toContain("gate:awaiting-console");
+      expect(after, "no other label is disturbed").toEqual([...DEPLOY_LABELS, "gateverify:verified"]);
+    });
+
+    it("jira: the opposite stamp is removed in the SAME transitions POST as the add", async () => {
+      const j = await runJira(SWAP);
+      const posts = h.jira.writes.filter((w) => /\/transitions$/.test(w.path));
+      expect(posts).toHaveLength(1);
+      expect(posts[0].body).toEqual({
+        transition: { id: "31" },
+        update: {
+          labels: [
+            { remove: "gate:awaiting-console" },
+            { remove: "gateverify:indeterminate" },
+            { add: "gateverify:verified" },
+          ],
+        },
+      });
+      expect(j.labels.filter((l) => /^gateverify[:-]/.test(l))).toEqual(["gateverify:verified"]);
+    });
+
+    it("both stamps already present ⇒ the contradiction is cleaned up, nothing re-added", async () => {
+      // The row a pre-B2 deployment leaves behind. The verdict is already stamped,
+      // so the write only has to delete the one that contradicts it.
+      const DIRTY: Scenario = {
+        labels: [...DEPLOY_LABELS, "gateverify:verified", "gateverify:indeterminate"],
+        probes: [{ tool: "Pipeline___get_state", result: { waitingOn: null } }],
+      };
+      await runTickets(DIRTY);
+      const write = h.ddb.statusUpdates[0] as {
+        UpdateExpression: string;
+        ExpressionAttributeValues: Record<string, unknown>;
+        ConditionExpression?: string;
+      };
+      expect(write.UpdateExpression).toMatch(/REMOVE #l\[5]/);
+      expect(write.ExpressionAttributeValues[":stampl"], "nothing to add").toBeUndefined();
+      expect(write.ConditionExpression).toBe("#l[5] = :opp0");
+      expect(replayLabelWrite(DIRTY.labels, write).filter((l) => /^gateverify[:-]/.test(l))).toEqual([
+        "gateverify:verified",
+      ]);
+
+      const j = await runJira(DIRTY);
+      const posts = h.jira.writes.filter((w) => /\/transitions$/.test(w.path));
+      expect(posts[0].body).toEqual({
+        transition: { id: "31" },
+        update: { labels: [{ remove: "gateverify:indeterminate" }] },
+      });
+      expect(j.labels.filter((l) => /^gateverify[:-]/.test(l))).toEqual(["gateverify:verified"]);
+    });
+
+    it("the hyphen spelling of a stale stamp is caught too", async () => {
+      // Agents write `gateverify:x`; sanitizeUserLabels rewrites the colon to a
+      // hyphen. A reader that only knew the colon form left the hyphen twin behind.
+      const HYPHEN: Scenario = {
+        labels: [...DEPLOY_LABELS, "gateverify-indeterminate"],
+        probes: [{ tool: "Pipeline___get_state", result: { waitingOn: null } }],
+      };
+      await runTickets(HYPHEN);
+      const write = h.ddb.statusUpdates[0] as {
+        UpdateExpression: string;
+        ExpressionAttributeValues: Record<string, unknown>;
+      };
+      // Nothing to park, so the stale slot itself becomes the new stamp.
+      expect(write.UpdateExpression).toMatch(/#l\[4] = :stampl/);
+      expect(replayLabelWrite(HYPHEN.labels, write)).toEqual([...DEPLOY_LABELS, "gateverify:verified"]);
+
+      const j = await runJira(HYPHEN);
+      expect(j.labels.filter((l) => /^gateverify[:-]/.test(l))).toEqual(["gateverify:verified"]);
+    });
   });
 
   it("a non-gate ticket's write is byte-identical to the pre-TEAM-4739 one", async () => {

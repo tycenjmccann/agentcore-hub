@@ -1513,6 +1513,45 @@ test("gate guard: a `remove` is only emitted for a label that is actually presen
   });
 });
 
+test("gate guard: a CONTRADICTORY stamp is removed in the same POST that adds the new one", async () => {
+  // TEAM-4750 B2. done -> reopen -> done with a different verdict used to leave both
+  // gateverify:verified and gateverify:indeterminate on the issue. Order matters only
+  // in that the awaiting removal stays first, keeping the common case unchanged.
+  await withJira(
+    { issues: { "TEAM-903": { labels: ["gate:blocker", "gate:awaiting-console", "gateverify:verified"] } } },
+    async ({ writes }) => {
+      const res = await transitionDone("TEAM-903");
+
+      assert.equal(res.gateVerification.result, "indeterminate");
+      const posts = writes.filter((w) => /\/transitions$/.test(w.path));
+      assert.equal(posts.length, 1);
+      assert.deepEqual(posts[0].body.update.labels, [
+        { remove: "gate:awaiting-console" },
+        { remove: "gateverify:verified" },
+        { add: "gateverify:indeterminate" },
+      ]);
+      // That the issue then carries exactly one stamp is pinned in
+      // src/lib/workflow/gate-guard-parity.test.ts, whose Jira fake applies the ops.
+    }
+  );
+});
+
+test("gate guard: a stale stamp is removed using the spelling the issue carries", async () => {
+  // sanitizeUserLabels rewrites the colon to a hyphen, so both spellings exist in
+  // the wild - and a remove must name the label as stored or Jira 400s the request.
+  await withJira(
+    { issues: { "TEAM-904": { labels: ["gate:blocker", "gateverify-verified"] } } },
+    async ({ writes }) => {
+      await transitionDone("TEAM-904");
+      const posts = writes.filter((w) => /\/transitions$/.test(w.path));
+      assert.deepEqual(posts[0].body.update.labels, [
+        { remove: "gateverify-verified" },
+        { add: "gateverify:indeterminate" },
+      ]);
+    }
+  );
+});
+
 test("gate guard: a non-gate ticket's transitions POST is byte-identical to before", async () => {
   await withJira({ issues: { "TEAM-903": { labels: ["phase:development", "agent:agentcore_hub_backend_dev"] } } }, async ({ writes }) => {
     const res = await transitionDone("TEAM-903");

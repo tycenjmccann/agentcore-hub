@@ -144,6 +144,41 @@ export function gateVerificationLabel(result) {
   return GATE_VERIFICATIONS.includes(result) ? `gateverify:${result}` : "";
 }
 
+/**
+ * Where a verification stamp already sits in a ticket's label list, split into the
+ * one we are about to write and the CONTRADICTORY one(s) (TEAM-4750 B2).
+ *
+ * Both twins used to ask only "is my stamp already there?" and never looked for the
+ * opposite, so done → reopen → done with a different verdict left BOTH
+ * `gateverify:verified` and `gateverify:indeterminate` on the ticket and the label
+ * record of why the gate closed became unreadable. Each twin removes/overwrites the
+ * opposite slot in its own idiom (one conditional UpdateCommand, one transitions
+ * POST), but which slots those are is decided HERE so the two cannot disagree.
+ *
+ * Matches both spellings via GATE_VERIFICATION_LABEL_RE: an agent may have written
+ * `gateverify-verified` by hand, and sanitizeUserLabels rewrites the colon anyway.
+ *
+ * When `result` is not one of GATE_VERIFICATIONS the stamp is "" and both index
+ * lists come back EMPTY — a caller with no verdict of its own must not go deleting
+ * stamps it cannot classify, which also keeps the pre-B2 behaviour byte-identical.
+ *
+ * @returns {{stamp: string, same: number[], opposite: number[]}} indices into `labels`
+ */
+export function gateVerificationSlots(labels, result) {
+  const stamp = gateVerificationLabel(result);
+  const same = [];
+  const opposite = [];
+  if (!stamp) return { stamp, same, opposite };
+  const want = stamp.slice("gateverify:".length);
+  const list = Array.isArray(labels) ? labels : [];
+  list.forEach((l, i) => {
+    const m = GATE_VERIFICATION_LABEL_RE.exec(String(l ?? "").trim().toLowerCase());
+    if (!m) return;
+    (m[1] === want ? same : opposite).push(i);
+  });
+  return { stamp, same, opposite };
+}
+
 // ── Which gate kinds are actually PROBED ────────────────────────────────────
 // GATE_KINDS (fix-contract.mjs) is the label vocabulary; this is the subset whose
 // close asserts something a read can contradict. `approval` is deliberately out:

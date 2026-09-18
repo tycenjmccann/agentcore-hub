@@ -53,7 +53,7 @@ import {
   gateLoopVerdict,
   gatePipelineOf,
   gateRefusal,
-  gateVerificationLabel,
+  gateVerificationSlots,
   invokeProbe,
   parseFixDecision,
   probedGateKindOf,
@@ -511,17 +511,25 @@ async function repageGate(ticketId, labels, gateKind, verdict, refusal) {
  * Jira has no arbitrary-field store, so the LABEL is the stamp here (the DynamoDB
  * twin writes the same label plus the structured `gateVerification` map). Only ever
  * removes a label the issue provably carries — a `remove` of an absent label risks a
- * 400 that would fail the whole transition.
+ * 400 that would fail the whole transition, which is also why every remove uses the
+ * issue's OWN spelling of the label rather than the canonical colon form.
+ *
+ * TEAM-4750 B2: the CONTRADICTORY stamp is removed too. Adding `gateverify:<result>`
+ * without taking the opposite one off left a ticket carrying both after
+ * done → reopen → done with a different verdict. Which labels those are comes from
+ * gateVerificationSlots (gate-contract.mjs), the same helper the DynamoDB twin uses,
+ * so neither twin can drift from the other. Order — awaiting, then contradictory,
+ * then the add — keeps the common single-remove case byte-identical to before.
  */
 function planGateLabelOps(labels, verification) {
-  const stamp = gateVerificationLabel(verification?.result);
   const list = Array.isArray(labels) ? labels : [];
-  const lower = list.map((l) => String(l ?? "").trim().toLowerCase());
+  const { stamp, same, opposite } = gateVerificationSlots(list, verification?.result);
   const ops = [];
   for (const l of list) {
     if (GATE_AWAITING_CONSOLE_RE.test(String(l ?? "").trim().toLowerCase())) ops.push({ remove: l });
   }
-  if (stamp && !lower.includes(stamp)) ops.push({ add: stamp });
+  for (const o of opposite) ops.push({ remove: list[o] });
+  if (stamp && same.length === 0) ops.push({ add: stamp });
   return ops;
 }
 
