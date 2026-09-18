@@ -3964,9 +3964,11 @@ def _publish_agent_died(workflow_id: str, agent_id: str, ticket_id: str = "",
 # 40-minute persona turn therefore killed the whole turn, and the persona's ticket
 # stayed parked until the sweep noticed.
 #
-# The retry re-enters `agent.stream_async(prompt)` on the SAME Agent object, so
-# the conversation, the tool results already returned and the prompt cache all
-# survive; nothing is rebuilt and the prompt is never re-derived.
+# The retry re-enters `agent.stream_async` on the SAME Agent object, so the
+# conversation, the tool results already returned and the prompt cache all
+# survive; nothing is rebuilt and the prompt is never re-derived. It is also never
+# re-SENT: a retry passes `[]` so the vendored conversation manager appends no
+# second copy of the prompt (TEAM-4749 A2, see `_stream_with_retry`).
 _STREAM_RETRY_MAX_ATTEMPTS = 3
 _STREAM_RETRY_BUDGET_S = 60.0
 _STREAM_RETRY_BASE_S = 1.0
@@ -4384,18 +4386,35 @@ async def _run_agent_invocation(payload, context):
             (`final_text`, `_text_buffer`, `streamed_any`, the DDB deltas already
             published) survives untouched — a retry appends, it never replays.
 
-            Re-entry is on the SAME Agent object with the SAME prompt object: the
-            conversation, the tool results already returned and the prompt cache
-            are all state on that agent, and rebuilding either would throw the
-            turn away to save the stream. On exhaustion the error is surfaced as
-            `agent.error` and re-raised, which is what keeps agent.error and
+            Re-entry is on the SAME Agent object, so the conversation, the tool
+            results already returned and the prompt cache are all preserved —
+            rebuilding either would throw the turn away to save the stream. But a
+            RETRY re-enters with `[]`, never with the prompt again: see the
+            comment on `stream_input` below. On exhaustion the error is surfaced
+            as `agent.error` and re-raised, which is what keeps agent.error and
             agent.died disjoint."""
             attempt = 0
             deadline = time.monotonic() + _STREAM_RETRY_BUDGET_S
+            baseline = len(getattr(agent, "messages", None) or [])
             while True:
                 attempt += 1
+                # TEAM-4749 A2: attempt 1 delivers the prompt; a retry must NOT.
+                # strands 1.53/1.54 `_convert_prompt_to_messages` appends a fresh
+                # user message for any str, so re-sending the prompt put TWO
+                # adjacent user messages in history, Bedrock answered
+                # ValidationException, and `_classify_stream_error` correctly
+                # called that `fail` — the retry was guaranteed to destroy the
+                # turn it exists to save. `[]` appends nothing AND still runs the
+                # vendored dangling-toolUse repair (an assistant(toolUse) tail
+                # gets its synthetic user(toolResult)), which `None` would skip.
+                # Truncating agent.messages instead would discard the tool results
+                # this docstring promises to keep. The len() test is the honest
+                # fallback: if attempt 1 died before history grew, the prompt
+                # never reached the model and must be re-sent.
+                delivered = len(getattr(agent, "messages", None) or []) > baseline
+                stream_input = [] if delivered else prompt
                 try:
-                    async for _ev in agent.stream_async(prompt):
+                    async for _ev in agent.stream_async(stream_input):
                         yield _ev
                     return
                 except Exception as exc:  # noqa: BLE001 — classified below
