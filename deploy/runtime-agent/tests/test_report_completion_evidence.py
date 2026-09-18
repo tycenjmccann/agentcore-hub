@@ -292,3 +292,83 @@ def test_lambda_side_destructures_exactly_these_names():
         assert f"{name} }}" in lambda_src or f"{name}," in lambda_src, (
             f"workflow-output Lambda no longer destructures {name}"
         )
+
+
+# ─── TEAM-4739: follow_ups ────────────────────────────────────────────────────
+#
+# The thread a ticket surfaced but does not own (a post-deploy verification, a
+# console or IAM handoff, a docs gap) had nowhere to go: a persona either closed
+# its own ticket over the loose end or filed the follow-up itself, reaching across
+# ticket boundaries. `follow_ups` is the declaration; the workflow-output Lambda
+# (TEAM-4740) owns the schema, the allow-lists and the dropping of unknown
+# entries, exactly as it owns EVIDENCE_KINDS. Same additive rule as every
+# parameter above: blank is byte-identical to absent, so a pre-4739 record stays
+# distinguishable from "the agent said there was nothing to follow up on".
+
+FOLLOW_UPS = (
+    '[{"kind":"post_deploy_verification","owner":"agent",'
+    '"title":"Re-check the gate ping after deploy",'
+    '"detail":"Tap-to-approve path was never exercised on prod.",'
+    '"base_branch":"main"}]'
+)
+
+
+def test_follow_ups_forwarded_when_supplied():
+    _, payload = _payload(follow_ups=FOLLOW_UPS)
+    assert payload["follow_ups"] == FOLLOW_UPS
+
+
+def test_follow_ups_trimmed_but_not_parsed():
+    """The harness must not parse, validate or re-serialise the array — the
+    Lambda owns the schema, and a harness that dropped a malformed entry would
+    silently swallow the one signal telling an author their JSON was wrong."""
+    _, payload = _payload(follow_ups=f"  {FOLLOW_UPS}  ")
+    assert payload["follow_ups"] == FOLLOW_UPS
+    _, payload = _payload(follow_ups="not json at all")
+    assert payload["follow_ups"] == "not json at all"
+
+
+def test_follow_ups_omitted_keeps_the_pre_4739_payload_exactly():
+    _, payload = _payload()
+    assert payload == PRE_4121_PAYLOAD
+    assert "follow_ups" not in payload
+
+
+@pytest.mark.parametrize("blank", ["", "   ", "\n\t "])
+def test_follow_ups_blank_is_the_same_as_omitted(blank):
+    _, payload = _payload(follow_ups=blank)
+    assert payload == PRE_4121_PAYLOAD
+
+
+def test_follow_ups_rides_along_with_a_ship_verdict():
+    """The combination that motivated it: the release manager ships AND declares
+    the post-deploy verification it is deliberately not doing itself."""
+    _, payload = _payload(
+        outcome="shipped",
+        merge_commit="2c4781221b41a10974d564da9a27e50004c800dd",
+        follow_ups=FOLLOW_UPS,
+    )
+    assert payload["outcome"] == "shipped"
+    assert payload["follow_ups"] == FOLLOW_UPS
+
+
+def test_follow_ups_is_a_signature_parameter_defaulting_to_blank():
+    """Same failure mode as #618's missing parameter: without it in the signature
+    Strands rejects the keyword argument and the body can never run."""
+    import inspect
+
+    fn, _ = _report_completion()
+    params = inspect.signature(fn).parameters
+    assert "follow_ups" in params, f"{TOOL_NAME} has no follow_ups parameter"
+    assert params["follow_ups"].default == "", 'follow_ups must default to ""'
+
+
+def test_follow_ups_docstring_names_the_kinds_and_owners():
+    """The docstring IS the tool spec Strands ships to the model — a parameter the
+    model is never told the shape of is a parameter it never fills."""
+    fn, _ = _report_completion()
+    doc = fn.__doc__ or ""
+    assert "follow_ups" in doc
+    for kind in ("post_deploy_verification", "console_handoff", "iam_handoff", "fix", "docs"):
+        assert kind in doc, f"docstring does not name the {kind} follow-up kind"
+    assert "agent" in doc and "human" in doc
