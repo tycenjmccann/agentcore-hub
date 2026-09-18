@@ -2373,6 +2373,13 @@ def WorkflowOutput___report_completion(ticket_id: str, summary: str, artifacts: 
             agent|human; unknown entries are dropped by the Lambda. Use it
             instead of closing your own ticket over an unfinished thread or
             filing the follow-up yourself.
+            A response whose `status` is not "complete" — or that carries a
+            non-empty followUpsMaterialized.failed[] with retryable: true —
+            means your ticket is NOT Done: call this tool again with the SAME
+            arguments (it is idempotent; follow-ups already created come back
+            skipped as already_materialized), and if it still fails, comment the
+            failed entries on your ticket and report BLOCKED / park rather than
+            walking away.
     """
     # Include workflow_id and agent_id from invocation context for journey logging (not exposed to agent)
     payload = {
@@ -3512,7 +3519,15 @@ class _CompletionGate:
     text deltas (final_text + DDB type=text) — they duplicate the summary the
     tool already delivered. A FAILED report_completion must NOT engage (and
     disengages a prior engage): persona TOOL STATUS REPORTING requires the
-    model's failure report to surface. Best-effort: never raises."""
+    model's failure report to surface. Best-effort: never raises.
+
+    TEAM-4754: "successful" is two questions, because engaging does more than
+    drop text — it deletes the resume object and marks the turn accounted for.
+    `_succeeded` asks whether the CALL worked; `_reports_done` asks whether the
+    answer left the ticket DONE. A refusal (`ok: false`) and N2's
+    `complete_pending_follow_ups` both arrive as a well-formed JSON body, so
+    `_succeeded` alone read them as successes — which is exactly the "walk away"
+    N2 exists to close."""
 
     TOOL = "WorkflowOutput___report_completion"
 
@@ -3538,11 +3553,49 @@ class _CompletionGate:
                 return False  # _invoke_lambda maps Lambda errorMessage -> "Error: ..."
         return True
 
+    @staticmethod
+    def _reports_done(result) -> bool:
+        """TEAM-4754: `_succeeded` says the CALL worked. Engaging additionally
+        CLAIMS THE TICKET IS DONE — it deletes the persona's resume object and
+        marks the turn accounted for (FR-7, so no `agent.died`) — so a report
+        that left the ticket OPEN must not engage.
+
+        Two payloads leave it open, and neither is visible to `_succeeded`
+        because both arrive as a well-formed JSON body rather than an "Error:"
+        string: a refusal (`ok: false` — DL-030, main_fix_requires_pr,
+        sibling_scan_failed, cd_ledger_unreadable) and N2's
+        `status: "complete_pending_follow_ups"`. Both need the model's own
+        report to surface and both need a retry, which the ungated
+        `current_tool_use` branch still allows in the same turn.
+
+        Only a DEFINITE negative disengages. A payload we cannot parse keeps the
+        pre-4754 behaviour, because mis-reading a real completion as open would
+        publish a spurious `agent.died` and re-dispatch finished work."""
+        if not isinstance(result, dict):
+            return True
+        for block in result.get("content") or []:
+            text = (block.get("text") or "") if isinstance(block, dict) else ""
+            if not text.strip():
+                continue
+            try:
+                payload = json.loads(text)
+            except Exception:  # noqa: BLE001 — not JSON: nothing to read, stay engaged
+                continue
+            if not isinstance(payload, dict):
+                continue
+            if payload.get("ok") is False:
+                return False
+            status = payload.get("status")
+            if isinstance(status, str) and status != "complete":
+                return False
+        return True
+
     def _on_tool_result(self, event):
         try:
             if (getattr(event, "tool_use", None) or {}).get("name") != self.TOOL:
                 return
-            self.engaged = self._succeeded(getattr(event, "result", None))
+            result = getattr(event, "result", None)
+            self.engaged = self._succeeded(result) and self._reports_done(result)
             if self.engaged and self._on_success:
                 try:
                     self._on_success()

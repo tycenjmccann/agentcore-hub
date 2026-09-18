@@ -32,6 +32,9 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 
 const h = vi.hoisted(() => ({
   puts: [], objects: new Map(), created: [], calls: [], siblings: [], issue: null, logs: [],
+  // TEAM-4754 N2: refuse the create, to pin the OTHER half of D2's ordering — filing
+  // first only helps if failing to file also stops the cascade.
+  createFail: false,
 }));
 
 const asString = (b) => (typeof b === "string" ? b : Buffer.from(b).toString("utf8"));
@@ -74,6 +77,7 @@ vi.mock("@aws-sdk/client-lambda", () => ({
       if (tool === "Tickets___get_issue") return reply(h.issue);
       if (tool === "Tickets___list_tickets") return reply({ total: h.siblings.length, issues: h.siblings });
       if (tool === "Tickets___create_ticket") {
+        if (h.createFail) return reply({ content: [{ type: "text", text: "Error: create_ticket is unavailable" }] });
         const key = params.__key || `TEAM-99${String(h.created.length + 1).padStart(2, "0")}`;
         h.created.push({ key, params });
         return reply({ key, status: "created", ticket: { key, summary: params.summary } });
@@ -119,6 +123,7 @@ beforeEach(() => {
   h.calls.length = 0;
   h.siblings.length = 0;
   h.issue = null;
+  h.createFail = false;
   h.objects.clear();
   // TEAM-4752 D3: no fixture here states `base_branch: main`, so nothing should
   // reach GitHub — unset the token so that stays true even for a developer who has
@@ -180,6 +185,27 @@ describe("TEAM-4660 — a fix created while the Merge Approval gate is open wait
     expect(transitionAt).toBeGreaterThan(lastCreateAt);
     // …and the transition really is the sweeper's own, to `done`.
     expect(h.calls[transitionAt].params.transition_id).toBe("done");
+  });
+
+  it("and if the fix CANNOT be filed, it does not transition itself Done at all (TEAM-4754 N2)", async () => {
+    // The other half of the ordering above, and the reason ordering alone was not
+    // enough: TEAM-4670 going Done is what cascades. On a failed create the run's
+    // remaining tickets would be unblocked and the epic re-evaluated with the fix
+    // that gates it (rule iii) never having existed — so the run rolls complete over
+    // work nobody owns. Withholding the transition keeps TEAM-4670 the one place the
+    // work is still visible, and the persona is told to retry.
+    h.createFail = true;
+    const res = result(await report({
+      ticket_id: "TEAM-4670", summary: "Repro confirmed at HEAD.", workflow_id: "wf_4660", agent_id: "agentcore_hub_qa_verifier",
+      follow_ups: JSON.stringify([{ kind: "fix", owner: "agent", assignee: "agentcore_hub_bug_fixer", title: "Expired token returns 500 instead of 401" }]),
+    }));
+    expect(res.status).toBe("complete_pending_follow_ups");
+    expect(res.next_action).toBe("retry_report_completion");
+    expect(h.created).toHaveLength(0);
+    // Not "the transition came last" — there is NO transition of TEAM-4670.
+    expect(h.calls.filter((c) => c.tool === "Tickets___transition_ticket" && c.params.ticket_id === "TEAM-4670")).toEqual([]);
+    // The record is still durable, so the retry is cheap and loses nothing.
+    expect(record("TEAM-4670").followUps).toHaveLength(1);
   });
 
   it("and the run is NOT complete while that fix is open — no new gate logic", async () => {
