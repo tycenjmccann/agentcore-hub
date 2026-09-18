@@ -536,6 +536,18 @@ async function shipContractRefusal(report, { pipelineName, workflowId }) {
   };
 }
 
+// ─── The three terminal statuses report_completion can answer ─────────────────
+//
+// The SUCCESS literal is the bare string "complete" and must stay exactly that: the
+// runtime harness's completion gate (deploy/runtime-agent/main.py, `_reports_done`)
+// treats ONLY that exact value as done and stays engaged on anything else, which is
+// what makes both states below safe to invent — a new failure status automatically
+// keeps the persona alive and retrying rather than needing main.py to learn about it.
+// Named constants for the two FAILURE literals only, so no caller can typo one into
+// something that accidentally reads as "complete".
+const STATUS_PENDING_FOLLOW_UPS = "complete_pending_follow_ups";
+const STATUS_TRANSITION_FAILED = "complete_transition_failed";
+
 async function reportCompletion({ ticket_id, summary, artifacts = "", branch, commit_sha, pr_url, workflow_id, agent_id, evidence_kind, evidence_keys, ci_status, ci_build_id, ci_head_sha, merge_commit, approved_head_sha, outcome, block_reason, pipeline_execution_id, pipeline_name, follow_ups }) {
   const key = `completions/${ticket_id}.json`;
   const report = {
@@ -750,17 +762,28 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
     prState: derivePrState({ mergeCommit: report.merge_commit, outcome: report.outcome, prUrl: pr_url }),
   };
 
-  await s3.send(new PutObjectCommand({
+  // ─── TEAM-4756 R3-2: the record write, which used to happen HERE ──────────────
+  //
+  // The write itself now happens below, once `mayTransition` is known, so the record
+  // can STATE whether it is provisional. What stays here is only the closure, next to
+  // the last field it serializes, so a reader of this block still sees where `report`
+  // stops being mutated in the normal case.
+  const putRecord = () => s3.send(new PutObjectCommand({
     Bucket: BUCKET,
     Key: key,
     Body: JSON.stringify(report, null, 2),
     ContentType: "application/json",
   }));
-  console.log(`[report_completion] Saved s3://${BUCKET}/${key}`);
 
   // TEAM-4740 FR-14: a separate event, not a field on the one above, because the
   // UI's delivery view and the run-history queries read prState per TICKET and a
   // run has many completions.
+  //
+  // Left exactly where it was by TEAM-4756 R3-2, which means it now fires just BEFORE
+  // the record rather than just after. It carries its own payload and no consumer
+  // follows it to S3 (grep: the UI's delivery view, the run-history query — both read
+  // the event), so nothing can observe a prState whose record is missing. Keeping it
+  // put is also what leaves its ordering against emptySweepSkip byte-unchanged.
   await publishJourneyEvent(workflow_id || ticket_id, "delivery.prState", {
     workflowId: workflow_id || null,
     ticketId: ticket_id,
@@ -831,60 +854,100 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   const pendingFollowUps = materialized.failed.filter((f) => f.retryable);
   const mayTransition = pendingFollowUps.length === 0;
 
+  // ─── TEAM-4756 R3-2: the record SAYS whether it is provisional ────────────────
+  //
+  // Both twins' DL-030 guard (`completionRecordProven`) is existence-only — a
+  // HeadObject — so a record written in the `complete_pending_follow_ups` state
+  // satisfied it just as well as a finished one, and a direct transition_ticket(done)
+  // on that ticket closed the run over follow-ups that were never filed. The record is
+  // the only artefact that guard can see, so the record has to carry the answer.
+  //
+  // INVARIANT, at every instant: a record that exists with `followUpsPending !== true`
+  // means every RETRYABLE follow-up is materialized. That is what pins this single
+  // write to exactly here — AFTER materializeFollowUps, so `pendingFollowUps` is known,
+  // and still BEFORE the Done transition, because DL-030 requires a ship-phase
+  // ticket's record to exist before it may close. `!== true` rather than `=== false` is
+  // deliberate: a pre-4756 record has neither field, and the invariant holds for it
+  // too (it was written before follow-ups existed at all).
+  report.followUpsPending = pendingFollowUps.length > 0;
+  report.status = mayTransition ? "complete" : STATUS_PENDING_FOLLOW_UPS;
+  await putRecord();
+  console.log(`[report_completion] Saved s3://${BUCKET}/${key} (status ${report.status})`);
+
   // Transition ticket to Done in Jira — this triggers the webhook cascade
   // (orchestrator unblocks downstream tickets when it sees "done")
+  //
+  // TEAM-4756 R3-1: `transition` stays null when there was nothing to attempt (Done
+  // withheld, or a synthetic id with no ticket), so "not attempted" and "attempted
+  // and failed" cannot collapse into one answer the way they did when both ended at
+  // `status: "complete"`.
+  let transition = null;
   if (!mayTransition) {
     console.error(`[report_completion] ${ticket_id}: Done WITHHELD - ${pendingFollowUps.length} retryable follow-up failure(s) (${pendingFollowUps.map((f) => `${f.kind}: ${f.reason}`).join("; ")}) - the record is saved, the agent must retry report_completion`);
-  } else {
-    // TEAM-4754: moved here, off the S3 write, and now gated on `mayTransition`.
-    // The UI marks the agent's card done off this event
-    // (src/app/api/workflow/[id]/agent-output/route.ts ~:295, transform-event.ts
-    // ~:72), and cost-report / anomaly-watcher (bands-schema.mjs) treat it as a
-    // TERMINAL task event for duration and anomaly-band purposes. All three read
-    // it as "this ticket's work ended" — which was false in the pending state:
-    // the record is durable but the ticket is still open and the persona has not
-    // finished. It must not fire until the retry that lands every follow-up
-    // actually gets here. Placed immediately before the transition invoke so its
-    // ordering relative to the Done cascade is unchanged on the happy path.
-    //
-    // Still published for a synthetic id (HEALTHCHECK-/TEST-) even though the
-    // transition below is skipped for one — that skip is about not calling
-    // Tickets___transition_ticket on an id with no ticket, not about whether the
-    // report is "done"; a synthetic report has no retryable follow-up path at
-    // all, so `mayTransition` is the only condition that changed here.
+  } else if (!ticket_id || ticket_id.startsWith("HEALTHCHECK-") || ticket_id.startsWith("TEST-")) {
+    // A synthetic id has no ticket to transition, so there is no transition whose
+    // success the event could wait for — the report itself IS terminal here. That
+    // skip is about not calling Tickets___transition_ticket on an id with no ticket,
+    // never about whether the report is "done".
     await publishJourneyEvent(workflow_id || ticket_id, "workflow.report_completion", {
       ticketId: ticket_id, agentId: agent_id || null, summary: summary.slice(0, 200), branch: branch || null, pr_url: pr_url || null,
     });
-    if (ticket_id && !ticket_id.startsWith("HEALTHCHECK-") && !ticket_id.startsWith("TEST-")) {
+  } else {
+    transition = await transitionToDone(ticket_id);
+    if (transition.ok) {
+      console.log(`[report_completion] Transitioned ${ticket_id} → Done${transition.alreadyDone ? " (already Done - idempotent)" : ""}`);
+      // TEAM-4754 moved this off the S3 write and gated it on `mayTransition`;
+      // TEAM-4756 R3-1 moves it AFTER the transition it is claiming. The UI marks the
+      // agent's card done off this event
+      // (src/app/api/workflow/[id]/agent-output/route.ts ~:295, transform-event.ts
+      // ~:72), cost-report / anomaly-watcher (bands-schema.mjs) treat it as a TERMINAL
+      // task event for duration and anomaly-band purposes, and the manager toolkit
+      // lists it in TERMINAL_TASK_EVENTS (compute_metrics.py). All of them read it as
+      // "this ticket's work ended", which is exactly as false on a FAILED transition
+      // as it was in the pending state N2 fixed: the record is durable but the ticket
+      // is still open and the persona has not finished. So it fires only once the
+      // ticket is really closed — including the idempotent already-Done case, where it
+      // is closed by definition. Nothing in the orchestrator's control flow consumes
+      // this event, so publishing it after the Done cascade costs ordering nothing.
+      await publishJourneyEvent(workflow_id || ticket_id, "workflow.report_completion", {
+        ticketId: ticket_id, agentId: agent_id || null, summary: summary.slice(0, 200), branch: branch || null, pr_url: pr_url || null,
+      });
+    } else {
+      console.error(`[report_completion] ${ticket_id}: Done transition FAILED (${transition.error}) - the record is SAVED but the ticket is NOT closed, the agent must retry report_completion`);
+      // TEAM-4756 R3-2: the SECOND write, and the only one. DL-030 forces the record to
+      // exist before the transition and this status is only knowable after it, so the
+      // failure path necessarily writes the key twice — the content is produced once and
+      // only `status` differs. `followUpsPending` deliberately stays `false`: the
+      // follow-ups ARE filed and only the Done write failed, so a human or a direct
+      // transition closing this ticket is a legitimate recovery the reader must not
+      // refuse. Best-effort: the response below already tells the agent to retry, so a
+      // rewrite that itself fails costs a label, not the work, and must not turn a
+      // durable record into a thrown tool error.
+      report.status = STATUS_TRANSITION_FAILED;
       try {
-        const resp = await lambda.send(new InvokeCommand({
-          FunctionName: TICKET_TOOLS_LAMBDA,
-          InvocationType: "RequestResponse",
-          Payload: Buffer.from(JSON.stringify({
-            tool_name: "Tickets___transition_ticket",
-            parameters: { ticket_id, transition_id: "done" },
-          })),
-        }));
-        const payload = JSON.parse(new TextDecoder().decode(resp.Payload));
-        if (payload.error) {
-          console.error(`[report_completion] Failed to transition ${ticket_id} to Done:`, payload.error);
-        } else {
-          console.log(`[report_completion] Transitioned ${ticket_id} → Done`);
-        }
+        await putRecord();
       } catch (err) {
-        console.error(`[report_completion] Error transitioning ${ticket_id}:`, err.message);
+        console.error(`[report_completion] ${ticket_id}: could not rewrite the record's status to ${STATUS_TRANSITION_FAILED} (${err.name}: ${err.message}) - the record stands at "complete" and the retry will restamp it`);
       }
     }
   }
+  const transitionFailed = transition !== null && !transition.ok;
 
   return {
-    // A report with no follow-ups, or whose follow-ups all landed, is
-    // byte-identical to pre-4754: `status: "complete"` and no `next_action`.
-    status: mayTransition ? "complete" : "complete_pending_follow_ups",
-    ...(mayTransition ? {} : { next_action: "retry_report_completion" }),
-    message: mayTransition
-      ? `Completion saved for ${ticket_id}. Ticket transitioned to Done.`
-      : `Completion for ${ticket_id} is SAVED (the record is durable and idempotent) but ${pendingFollowUps.length} follow-up ticket(s) could NOT be created, so ${ticket_id} was NOT transitioned to Done. Call WorkflowOutput___report_completion again with the SAME arguments: the retry re-scans the epic, follow-ups that already exist are skipped as already_materialized, and only the missing ones are created. The ticket goes Done as soon as every entry lands. If it keeps failing, comment the failed entries on the ticket and report BLOCKED - do not walk away.`,
+    // A report with no follow-ups, or whose follow-ups all landed and whose ticket
+    // really moved, is byte-identical to pre-4754: `status: "complete"` and no
+    // `next_action`. The two failure states are DIFFERENT strings from "complete", so
+    // the harness's completion gate keeps the persona engaged to retry either one.
+    status: transitionFailed ? STATUS_TRANSITION_FAILED : mayTransition ? "complete" : STATUS_PENDING_FOLLOW_UPS,
+    ...(mayTransition && !transitionFailed ? {} : { next_action: "retry_report_completion" }),
+    message: transitionFailed
+      ? `Completion for ${ticket_id} is SAVED (the record is durable and idempotent) but the ticket could NOT be transitioned to Done: ${transition.error}. Nothing downstream has been unblocked, so the run is waiting on this. Call WorkflowOutput___report_completion again with the SAME arguments - the record write is idempotent and follow-ups that already exist are skipped as already_materialized, so the retry effectively just re-attempts the transition. If it keeps failing, comment this error on the ticket and report BLOCKED - do not walk away.`
+      : mayTransition
+        ? `Completion saved for ${ticket_id}. Ticket transitioned to Done.`
+        : `Completion for ${ticket_id} is SAVED (the record is durable and idempotent) but ${pendingFollowUps.length} follow-up ticket(s) could NOT be created, so ${ticket_id} was NOT transitioned to Done. Call WorkflowOutput___report_completion again with the SAME arguments: the retry re-scans the epic, follow-ups that already exist are skipped as already_materialized, and only the missing ones are created. The ticket goes Done as soon as every entry lands. If it keeps failing, comment the failed entries on the ticket and report BLOCKED - do not walk away.`,
+    // Additive, and only on the failure: a success response keeps exactly the key set
+    // it had before TEAM-4756.
+    ...(transitionFailed ? { transition: { ok: false, error: transition.error } } : {}),
     // Additive: absent entirely on a report that carried no follow_ups and whose
     // run has no cd-ledger, so an existing caller's response is unchanged.
     ...(droppedFollowUps.length > 0 ? { droppedFollowUps } : {}),
@@ -1341,6 +1404,9 @@ export function ledgerFollowUps(ledger) {
  * Both twins answer on the same tool names but in different shapes, and both
  * report failure in a THIRD way (jira: `{error}`; dynamodb: a textResult whose
  * body starts "Error:"), so failure detection lives here, once.
+ *
+ * TEAM-4756 R3-1: "once" is the whole point, which is why the Done transition is
+ * routed through here too rather than keeping its own raw invoke.
  */
 async function ticketTool(tool, parameters) {
   try {
@@ -1359,12 +1425,32 @@ async function ticketTool(tool, parameters) {
   }
 }
 
-function toolFailure(payload) {
+/**
+ * Is this payload a FAILURE, in either twin's idiom? The error string, or null.
+ *
+ * The jira twin turns every refusal into a throw and its handler answers
+ * `{...toolResult, error: err.message}`, so `payload.error` catches all of them.
+ * The DynamoDB twin RETURNS its refusals instead, in two shapes, and TEAM-4756 R3-1
+ * is that neither was detected:
+ *
+ *   STRUCTURED — `{ok:false, reason, ...textResult(prose)}`: the DL-030 ship-phase
+ *   gate (COMPLETION_RECORD_REQUIRED, lambda/agentcore-hub-tickets/index.mjs) and
+ *   the TEAM-4739 typed-gate refusal. `ok:false` is the twins' shared machine-
+ *   readable marker, so it is checked first and needs no knowledge of the prose.
+ *
+ *   BARE — a plain textResult: `Invalid transition "done" from status "done".
+ *   Available: ...` and `Cannot move <key> to <status>: ...`. Neither starts
+ *   "Error:" nor ends "not found.", so both read as SUCCESS before this change —
+ *   which is how a refused transition became `status: "complete"`.
+ */
+export function toolFailure(payload) {
   if (!payload || typeof payload !== "object") return "empty response";
   if (payload.error) return String(payload.error);
   if (payload.errorMessage) return String(payload.errorMessage);
-  const text = payload.content?.[0]?.text;
-  if (typeof text === "string" && (/^Error:/.test(text.trim()) || /not found\.?$/i.test(text.trim()))) return text.trim();
+  const text = asText(payload.content?.[0]?.text).trim();
+  if (payload.ok === false) return text || asText(payload.reason) || "refused";
+  if (/^Error:/.test(text) || /not found\.?$/i.test(text)
+    || /^Invalid transition\b/.test(text) || /^Cannot move\b/.test(text)) return text;
   return null;
 }
 
@@ -1407,6 +1493,66 @@ export function normalizeSiblings(payload) {
 
 const isHumanAssignee = (a) => typeof a === "string" && a.startsWith("human:");
 const isDoneStatus = (s) => /^done$/i.test(asText(s).trim());
+
+// ─── TEAM-4756 R3-1: the ticket's own Done transition ─────────────────────────
+//
+// A documented BYTE-COPY of ALREADY_DONE_RES in deploy/telegram-bug-intake/index.mjs
+// (isAlreadyDoneRefusal there). Copied rather than imported on purpose: the two live
+// in different Lambda zips with no shared layer, and reaching across that boundary
+// would couple the deploy-gate bridge's packaging to this one. Keep the two in sync.
+//
+// The trailing "Available: ..." list is deliberately not part of either match. Jira's
+// own refusal (`No transition to "Done" found. Available: ...`) is deliberately NOT
+// here and stays a FAILURE: it is the SAME text a genuinely stuck, not-done ticket
+// produces, so it proves nothing about the current status. The re-read in
+// transitionToDone is what covers that provider.
+export const ALREADY_DONE_RES = [
+  /Invalid transition\s+"?done"?\s+from status\s+"?done"?/i,
+  /Invalid transition from\s+"?done"?\s+to\s+"?done"?/i,
+];
+
+/**
+ * Is this failure "the close you asked for is already the ticket's state"? Only ever
+ * consulted for a `done` transition, so a rework note's done→blocked refusal could
+ * never be read as a success.
+ */
+export const isAlreadyDoneRefusal = (error) => ALREADY_DONE_RES.some((re) => re.test(asText(error)));
+
+/**
+ * The reported ticket's own Done transition, as a VALUE — `{ ok, error, alreadyDone }`.
+ *
+ * TEAM-4756 R3-1. This replaces a raw `lambda.send(new InvokeCommand(...))` that read
+ * only `payload.error` — the one failure shape the DynamoDB twin never uses — and then
+ * fell through to `status: "complete"` regardless. Routing through `ticketTool` means
+ * both twins' failure shapes are detected by the one classifier above, and a throw, a
+ * FunctionError and a returned refusal all arrive here as `ok: false`.
+ *
+ * `{ok:true, alreadyDone:true}` is SUCCESS, not a fudge: a ticket that is already Done
+ * IS the state this call exists to reach, and report_completion is retried by design
+ * (the record write is idempotent and the follow-up scan dedupes), so a retry whose
+ * transition already landed must not report failure forever.
+ */
+async function transitionToDone(ticketId) {
+  const r = await ticketTool("Tickets___transition_ticket", { ticket_id: ticketId, transition_id: "done" });
+  if (r.ok) return { ok: true, error: null, alreadyDone: false };
+  if (isAlreadyDoneRefusal(r.error)) return { ok: true, error: null, alreadyDone: true };
+  // The fallback for an AMBIGUOUS refusal. The jira twin answers `No transition to
+  // "Done" found. Available: ...` both for a ticket that is already closed and for one
+  // that is genuinely stuck, so there is nothing to match on — stop reading prose and
+  // ask the ticket what its status actually is. Best-effort in the safe direction: a
+  // re-read that itself fails leaves the transition FAILED, because "we could not look"
+  // is not "it is done" (the same positive-evidence rule as completionRecordProven).
+  const reread = await ticketTool("Tickets___get_issue", { ticket_id: ticketId });
+  const issue = reread.ok ? normalizeIssue(reread.payload) : null;
+  if (issue && isDoneStatus(issue.status)) {
+    console.log(`[report_completion] ${ticketId}: transition refused (${r.error}) but the ticket reads Done - idempotent success`);
+    return { ok: true, error: null, alreadyDone: true };
+  }
+  if (!reread.ok) {
+    console.warn(`[report_completion] ${ticketId}: could not re-read the ticket to resolve an ambiguous transition refusal (${reread.error}) - staying FAILED`);
+  }
+  return { ok: false, error: r.error, alreadyDone: false };
+}
 
 /**
  * The run's CD ticket: the non-human sibling whose assignee owns the ship phase,
@@ -1565,6 +1711,10 @@ export function sweepSkipRecord({ ticketId, workflowId, sweeperTicketId }) {
  */
 async function skipSibling(row, { workflowId, sweeperTicketId }) {
   const ticketId = row.ticketId;
+  // TEAM-4756 R3-2 deliberately does NOT stamp followUpsPending/status here: a skip
+  // record is a marker that a ticket was closed WITHOUT work, not a completion report,
+  // and it can carry no follow-ups to be pending on. The reader side's `!== true` test
+  // is what keeps that safe — the same reading that keeps every pre-4756 record valid.
   await s3.send(new PutObjectCommand({
     Bucket: BUCKET,
     Key: `completions/${ticketId}.json`,
