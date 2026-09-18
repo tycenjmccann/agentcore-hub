@@ -53,9 +53,11 @@ import {
   gateLoopVerdict,
   gatePipelineOf,
   gateRefusal,
-  gateVerificationLabel,
+  gateVerificationSlots,
   invokeProbe,
   parseFixDecision,
+  pipelineLabelOverflow,
+  pipelineLabelRefusal,
   probedGateKindOf,
   publishJourneyEvent,
   verifyGateCondition,
@@ -459,14 +461,21 @@ function gateWorkflowIdOf(labels) {
  * It NEVER dispatches, and it never creates a ticket: a gate that cannot be closed
  * is answered by verifying the condition, not by filing a second gate.
  *
- * EVENT DEDUPE, and the one place this differs from the DynamoDB twin: Jira's `add`
- * verb is idempotent server-side and reports nothing back, so addLabels cannot tell
- * "newly added" from "already there" the way a conditional list_append can. The
- * dedupe is therefore the labels we ALREADY hold from the transition's read — the
- * first refusal pages, every later refusal on the same stall repeats the payload in
- * silence. (A racing labeller could cost one duplicate event; a duplicate page is
- * cheaper than a missed one.) Every side effect is best-effort: a correct refusal
- * must not turn into a tool error because Jira rate-limited a comment.
+ * SIDE-EFFECT DEDUPE (event AND comment), and the one place this differs from the
+ * DynamoDB twin: Jira's `add` verb is idempotent server-side and reports nothing
+ * back, so addLabels cannot tell "newly added" from "already there" the way a
+ * conditional list_append can. The dedupe is therefore the labels we ALREADY hold
+ * from the transition's read — the first refusal pages and comments, every later
+ * refusal on the same stall repeats the payload in silence. (A racing labeller could
+ * cost one duplicate event; a duplicate page is cheaper than a missed one.)
+ *
+ * The comment is under that dedupe for a reason this twin feels harder than the
+ * other (TEAM-4750 B1): getIssue reads only the newest 50 comments, so a
+ * `transition_ticket(done)` retry loop appending the same console link evicts the
+ * human's advisory `DECISION:` line out of the window the guard itself reads.
+ *
+ * Every side effect is best-effort: a correct refusal must not turn into a tool
+ * error because Jira rate-limited a comment.
  */
 async function repageGate(ticketId, labels, gateKind, verdict, refusal) {
   const parked = labels.some((l) => GATE_AWAITING_CONSOLE_RE.test(String(l ?? "").trim().toLowerCase()));
@@ -487,12 +496,12 @@ async function repageGate(ticketId, labels, gateKind, verdict, refusal) {
       consoleUrl: verdict.consoleUrl,
       attempt: 1,
     });
-  }
 
-  try {
-    await addComment({ ticket_id: ticketId, comment: refusal.comment });
-  } catch (err) {
-    console.warn(`[agentcore-hub-jira] ${ticketId}: could not comment the refusal — ${err?.name}`);
+    try {
+      await addComment({ ticket_id: ticketId, comment: refusal.comment });
+    } catch (err) {
+      console.warn(`[agentcore-hub-jira] ${ticketId}: could not comment the refusal — ${err?.name}`);
+    }
   }
 }
 
@@ -504,17 +513,25 @@ async function repageGate(ticketId, labels, gateKind, verdict, refusal) {
  * Jira has no arbitrary-field store, so the LABEL is the stamp here (the DynamoDB
  * twin writes the same label plus the structured `gateVerification` map). Only ever
  * removes a label the issue provably carries — a `remove` of an absent label risks a
- * 400 that would fail the whole transition.
+ * 400 that would fail the whole transition, which is also why every remove uses the
+ * issue's OWN spelling of the label rather than the canonical colon form.
+ *
+ * TEAM-4750 B2: the CONTRADICTORY stamp is removed too. Adding `gateverify:<result>`
+ * without taking the opposite one off left a ticket carrying both after
+ * done → reopen → done with a different verdict. Which labels those are comes from
+ * gateVerificationSlots (gate-contract.mjs), the same helper the DynamoDB twin uses,
+ * so neither twin can drift from the other. Order — awaiting, then contradictory,
+ * then the add — keeps the common single-remove case byte-identical to before.
  */
 function planGateLabelOps(labels, verification) {
-  const stamp = gateVerificationLabel(verification?.result);
   const list = Array.isArray(labels) ? labels : [];
-  const lower = list.map((l) => String(l ?? "").trim().toLowerCase());
+  const { stamp, same, opposite } = gateVerificationSlots(list, verification?.result);
   const ops = [];
   for (const l of list) {
     if (GATE_AWAITING_CONSOLE_RE.test(String(l ?? "").trim().toLowerCase())) ops.push({ remove: l });
   }
-  if (stamp && !lower.includes(stamp)) ops.push({ add: stamp });
+  for (const o of opposite) ops.push({ remove: list[o] });
+  if (stamp && same.length === 0) ops.push({ add: stamp });
   return ops;
 }
 
@@ -1144,6 +1161,19 @@ async function createTicket(params) {
       `Invalid assignee "${assignee}". Valid agents: ${valid}. ` +
       `Note: There is NO "agentcore_hub_ios_dev" agent. ALL iOS/SwiftUI/Android/Web development goes to "agentcore_hub_frontend_dev".`
     );
+  }
+
+  // TEAM-4750 B3: an over-long `pipeline:` label is refused, not stored. It has to
+  // be checked HERE — on the RAW label, before sanitizeUserLabels truncates it to
+  // MAX_LABEL — because after truncation the label still matches PIPELINE_LABEL_RE
+  // and names a DIFFERENT pipeline, which the gate would then be verified against.
+  // Before the issue is created, so a refusal leaves nothing behind.
+  const longPipelineLabel = pipelineLabelOverflow(labels);
+  if (longPipelineLabel) {
+    const refusal = pipelineLabelRefusal(longPipelineLabel);
+    const err = new Error(refusal.hint);
+    err.toolResult = refusal;
+    throw err;
   }
 
   // TEAM-4739: hoisted from where the label list is assembled (it used to run just

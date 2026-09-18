@@ -1162,7 +1162,7 @@ describe("transition_ticket — ship-phase Done needs a completion record (TEAM-
  * byte for byte). What is asserted here is what has no Jira counterpart:
  *   - the UNSET env default: with no PIPELINE_TOOLS_LAMBDA the guard admits and
  *     never constructs a client — the configuration every existing install has;
- *   - `planGateLabelWrite`'s three shapes, which exist because DynamoDB forbids one
+ *   - `planGateLabelWrite`'s shapes, which exist because DynamoDB forbids one
  *     UpdateExpression from touching both `labels` and `labels[i]`;
  *   - the conditional status write losing a race with a concurrent labeller.
  */
@@ -1267,7 +1267,7 @@ describe("transition_ticket — typed gate guard, DynamoDB-side mechanics (TEAM-
       expect(h.state.labelUpdates).toHaveLength(1); // the label still lands
     });
 
-    describe("planGateLabelWrite — one UpdateExpression, three shapes", () => {
+    describe("planGateLabelWrite — one UpdateExpression, one shape per label state", () => {
       beforeEach(() => {
         h.state.probeBy.Pipeline___get_state = { result: { waitingOn: null } };
       });
@@ -1301,6 +1301,52 @@ describe("transition_ticket — typed gate guard, DynamoDB-side mechanics (TEAM-
         const w = h.state.statusUpdates[0];
         expect(w.UpdateExpression).toMatch(/REMOVE #l\[3]/);
         expect(w.ExpressionAttributeValues[":stampl"]).toBeUndefined();
+      });
+
+      it("a CONTRADICTORY stamp ⇒ the park slot takes the new one, the stale slot is REMOVEd", async () => {
+        // TEAM-4750 B2. Both clauses in ONE expression, at distinct indices: only
+        // `labels` beside `labels[i]` is forbidden, and multiple REMOVEs resolve
+        // against the original indices. Two stamps on one ticket would make the
+        // label record of why the gate closed unreadable.
+        h.state.items[GATE] = gateTicket([...DEPLOY_LABELS, "gate:awaiting-console", "gateverify:indeterminate"]);
+        await transition({ ticket_id: GATE, to_status: "done" });
+        const w = h.state.statusUpdates[0];
+        expect(w.UpdateExpression).toMatch(/#l\[3] = :stampl/);
+        expect(w.UpdateExpression).toMatch(/REMOVE #l\[4]/);
+        expect(w.UpdateExpression).not.toContain("list_append");
+        expect(w.ExpressionAttributeValues[":stampl"]).toBe("gateverify:verified");
+        expect(w.ExpressionAttributeValues[":opp0"]).toBe("gateverify:indeterminate");
+        // Both touched slots are conditioned, so the race fallback below covers them.
+        expect(w.ConditionExpression).toBe("#l[3] = :awaiting AND #l[4] = :opp0");
+      });
+
+      it("a stale stamp with NO park label ⇒ the stale slot itself becomes the new stamp", async () => {
+        // Nothing else is being cleared, so reusing the contradictory slot is what
+        // keeps this a single slot write rather than an append plus a remove.
+        h.state.items[GATE] = gateTicket([...DEPLOY_LABELS, "gateverify:indeterminate"]);
+        await transition({ ticket_id: GATE, to_status: "done" });
+        const w = h.state.statusUpdates[0];
+        expect(w.UpdateExpression).toMatch(/#l\[3] = :stampl/);
+        expect(w.UpdateExpression).not.toContain("REMOVE");
+        expect(w.UpdateExpression).not.toContain("list_append");
+        expect(w.ExpressionAttributeValues[":stampl"]).toBe("gateverify:verified");
+        expect(w.ConditionExpression).toBe("#l[3] = :opp0");
+      });
+
+      it("losing the race on the OPPOSITE slot still transitions — without the label clause", async () => {
+        // The same fallback the park-label race gets: every slot the plan touches is
+        // conditioned, so a concurrent labeller costs the cosmetic label edit and
+        // never a verified close.
+        h.state.items[GATE] = gateTicket([...DEPLOY_LABELS, "gateverify:indeterminate"]);
+        h.state.statusRaceOnce = true;
+
+        const res = await transition({ ticket_id: GATE, to_status: "done" });
+
+        expect(res).toMatchObject({ status: "transitioned", to: "done" });
+        expect(h.state.statusUpdates).toHaveLength(2);
+        expect(h.state.statusUpdates[1].ConditionExpression).toBeUndefined();
+        expect(h.state.statusUpdates[1].UpdateExpression).not.toContain("#l");
+        expect(h.state.statusUpdates[1].ExpressionAttributeValues[":gv"].result).toBe("verified");
       });
 
       it("the stamp rides in the SAME write as the status", async () => {

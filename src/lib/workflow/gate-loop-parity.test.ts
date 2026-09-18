@@ -665,3 +665,59 @@ describe("validateGateTicketShape — a deploy gate a human can act on", () => {
     expect((await runJira(scn)).payload).toEqual(t.payload);
   });
 });
+
+describe("an over-long pipeline: label is refused, not silently renamed (TEAM-4750 B3)", () => {
+  // sanitizeUserLabels truncates a label to 64 chars, which used to leave a 55-char
+  // pipeline name that STILL matched PIPELINE_LABEL_RE — so the shape check and the
+  // probe ran against a pipeline nobody had named, and the human was eventually
+  // paged about it. Refused on the RAW label instead, before truncation.
+  const name = (len: number) => "h" + "u".repeat(len - 1);
+  const CAPS = { ok: true, approveDeploy: true, version: 4 };
+
+  it("both twins refuse identically, naming the limit, before any probe", async () => {
+    const scn: Scenario = {
+      labels: ["gate:deploy-approval", `pipeline:${name(56)}`, `exec:${EXEC}`],
+      description: `Console: ${CONSOLE}`,
+      caps: CAPS,
+    };
+    const t = await runTickets(scn);
+    const j = await runJira(scn);
+
+    expect(t.refused, "dynamodb refuses").toBe(true);
+    expect(j.refused, "jira refuses").toBe(true);
+    expect(t.payload?.reason).toBe("gate_condition_unmet");
+    // Both caps by number: the label cap it broke, and the name cap to aim at.
+    expect(String(t.payload?.hint)).toContain("64-character limit");
+    expect(String(t.payload?.hint)).toContain("at most 55");
+    expect(t.message).toBe(t.payload?.hint);
+    expect(j.payload, "payload parity").toEqual(t.payload);
+    expect(j.message, "message parity").toBe(t.message);
+
+    // It is the FIRST seam: nothing was read, nothing was written, and on the
+    // DynamoDB side not even a ticket number was minted.
+    expect(t.probes, "refuses before the capabilities probe").toHaveLength(0);
+    expect(j.probes, "refuses before the capabilities probe").toHaveLength(0);
+    expect(h.ddb.created, "no ticket row").toHaveLength(0);
+  });
+
+  it("a name at the cap — a 64-char label — is created", async () => {
+    const scn: Scenario = {
+      labels: ["gate:deploy-approval", `pipeline:${name(55)}`, `exec:${EXEC}`],
+      description: `Console: ${CONSOLE}`,
+      caps: CAPS,
+    };
+    expect(`pipeline:${name(55)}`).toHaveLength(64);
+    expect((await runTickets(scn)).refused, "dynamodb creates").toBe(false);
+    expect((await runJira(scn)).refused, "jira creates").toBe(false);
+  });
+
+  it("the hyphen spelling is refused too, and a long non-pipeline label is not", async () => {
+    const hyphen: Scenario = { labels: ["gate:blocker", `pipeline-${name(56)}`] };
+    expect((await runTickets(hyphen)).payload?.reason).toBe("gate_condition_unmet");
+    expect((await runJira(hyphen)).payload?.reason).toBe("gate_condition_unmet");
+    // Only the `pipeline:` namespace is forwarded to a probe, so only it is capped.
+    const other: Scenario = { labels: ["gate:blocker", `needs-${name(90)}`] };
+    expect((await runTickets(other)).refused).toBe(false);
+    expect((await runJira(other)).refused).toBe(false);
+  });
+});

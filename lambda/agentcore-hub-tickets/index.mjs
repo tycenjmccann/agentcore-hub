@@ -59,9 +59,11 @@ import {
   gateLoopVerdict,
   gatePipelineOf,
   gateRefusal,
-  gateVerificationLabel,
+  gateVerificationSlots,
   invokeProbe,
   parseFixDecision,
+  pipelineLabelOverflow,
+  pipelineLabelRefusal,
   probedGateKindOf,
   publishJourneyEvent,
   verifyGateCondition,
@@ -431,10 +433,14 @@ async function verifyTypedGate(issueKey, item) {
  * It NEVER dispatches, and it never creates a ticket: a gate that cannot be closed
  * is answered by verifying the condition, not by filing a second gate.
  *
- * The conditional `list_append` inside addLabels is the EVENT DEDUPE: the label
- * lands once, so the first refusal pages and every later refusal on the same stall
- * repeats the payload in silence. Every side effect is best-effort — a correct
- * refusal must not turn into a tool error because the events table throttled.
+ * The conditional `list_append` inside addLabels is the SIDE-EFFECT DEDUPE, and it
+ * covers the event AND the comment: the label lands once, so the first refusal pages
+ * and comments, and every later refusal on the same stall repeats the payload in
+ * silence. A `transition_ticket(done)` retry loop would otherwise append the same
+ * console link forever (TEAM-4750 B1) — noise here, and on the Jira twin an actual
+ * loss, because its `getIssue` reads only the newest 50 comments. Every side effect
+ * is best-effort — a correct refusal must not turn into a tool error because the
+ * events table throttled.
  */
 async function repageGate(issueKey, item, gateKind, verdict, refusal) {
   let newlyLabelled = false;
@@ -453,12 +459,12 @@ async function repageGate(issueKey, item, gateKind, verdict, refusal) {
       consoleUrl: verdict.consoleUrl,
       attempt: 1,
     });
-  }
 
-  try {
-    await addComment({ ticket_id: issueKey, body: refusal.comment, author: "gate-guard" });
-  } catch (err) {
-    console.warn(`[agentcore-hub-tickets] ${issueKey}: could not comment the refusal — ${err?.name}`);
+    try {
+      await addComment({ ticket_id: issueKey, body: refusal.comment, author: "gate-guard" });
+    } catch (err) {
+      console.warn(`[agentcore-hub-tickets] ${issueKey}: could not comment the refusal — ${err?.name}`);
+    }
   }
 }
 
@@ -472,32 +478,71 @@ async function repageGate(issueKey, item, gateKind, verdict, refusal) {
  * concurrent writer's labels — see addLabels), and the `labels[i] = :awaiting`
  * condition makes the write safe against a racing label edit.
  *
- * @returns {null|{set?:string, remove?:string, condition?:string, names:object, values:object}}
+ * TEAM-4750 B2: the CONTRADICTORY stamp comes off in that same call too. This used
+ * to overwrite only the structured `gateVerification` map, so done → reopen → done
+ * with a different verdict left both `gateverify:verified` and
+ * `gateverify:indeterminate` in `labels`. Which slots are same/opposite is decided by
+ * gateVerificationSlots (gate-contract.mjs) so the Jira twin agrees by construction.
+ *
+ * Three rules make the cases below the only expressible ones:
+ *   - never a whole-list SET, and never `list_append` beside a `labels[i]` write
+ *     (overlapping document paths) — so an added stamp REUSES a slot we are already
+ *     clearing: the awaiting slot if there is one, else the first opposite slot;
+ *   - several REMOVEs in ONE expression are resolved against the ORIGINAL indices
+ *     and the list compacts once, so `REMOVE #l[1], #l[3]` drops exactly those two;
+ *   - every touched slot is conditioned on the value we read, so a racing labeller
+ *     trips ConditionalCheckFailedException and transitionIssue retries WITHOUT the
+ *     label plan — a cosmetic label edit is never worth failing a verified close.
+ *
+ * @returns {null|{set?:string, removes?:string[], condition?:string, names:object, values:object}}
  */
 function planGateLabelWrite(item, verification) {
-  const stamp = gateVerificationLabel(verification?.result);
   const labels = Array.isArray(item?.labels) ? item.labels : [];
   const lower = labels.map((l) => String(l ?? "").trim().toLowerCase());
   const idx = lower.findIndex((l) => GATE_AWAITING_CONSOLE_RE.test(l));
-  const hasStamp = Boolean(stamp) && lower.includes(stamp);
+  const { stamp, same, opposite } = gateVerificationSlots(labels, verification?.result);
+  const needsStamp = Boolean(stamp) && same.length === 0;
 
-  if (idx < 0) {
-    if (!stamp || hasStamp) return null;
+  if (idx < 0 && opposite.length === 0) {
+    if (!needsStamp) return null;
+    // Nothing to clear: the one case that may append.
     return {
       set: "#l = list_append(if_not_exists(#l, :emptyl), :stampl)",
       names: { "#l": "labels" },
       values: { ":emptyl": [], ":stampl": [stamp] },
     };
   }
+
   const names = { "#l": "labels" };
-  const condition = `#l[${idx}] = :awaiting`;
-  const values = { ":awaiting": labels[idx] };
-  if (!stamp || hasStamp) return { remove: `#l[${idx}]`, condition, names, values };
+  const values = {};
+  const conditions = [];
+  const removes = [];
+  let set;
+  // The slot an added stamp lands in: the awaiting slot when parked, otherwise the
+  // first contradictory stamp. Whichever it is, it is cleared either way.
+  let reuse = -1;
+  if (needsStamp) reuse = idx >= 0 ? idx : opposite[0];
+
+  if (idx >= 0) {
+    values[":awaiting"] = labels[idx];
+    conditions.push(`#l[${idx}] = :awaiting`);
+    if (reuse === idx) set = `#l[${idx}] = :stampl`;
+    else removes.push(`#l[${idx}]`);
+  }
+  opposite.forEach((o, n) => {
+    values[`:opp${n}`] = labels[o];
+    conditions.push(`#l[${o}] = :opp${n}`);
+    if (reuse === o) set = `#l[${o}] = :stampl`;
+    else removes.push(`#l[${o}]`);
+  });
+  if (set) values[":stampl"] = stamp;
+
   return {
-    set: `#l[${idx}] = :stampl`,
-    condition,
+    ...(set ? { set } : {}),
+    ...(removes.length ? { removes } : {}),
+    condition: conditions.join(" AND "),
     names,
-    values: { ...values, ":stampl": stamp },
+    values,
   };
 }
 
@@ -1084,6 +1129,17 @@ async function createTicket(args) {
   if (!baseBranchCheck.ok) return textResult(`Error: ${baseBranchRefusal(base_branch)}`);
   const baseBranch = baseBranchCheck.value;
 
+  // TEAM-4750 B3: an over-long `pipeline:` label is refused, not stored. It has to
+  // be checked HERE — on the RAW label, before sanitizeUserLabels truncates it to
+  // MAX_LABEL — because after truncation the label still matches PIPELINE_LABEL_RE
+  // and names a DIFFERENT pipeline, which the gate would then be verified against.
+  // Before nextTicketId too, so a refusal consumes no ticket number.
+  const longPipelineLabel = pipelineLabelOverflow(labels);
+  if (longPipelineLabel) {
+    const refusal = pipelineLabelRefusal(longPipelineLabel);
+    return { ...refusal, ...textResult(refusal.hint) };
+  }
+
   // Caller-supplied labels are sanitized independently of the contract flag —
   // dropping a label that squats a system namespace (fix:/wf:/agent:/…) is a
   // provenance-forgery guard, not a contract rule.
@@ -1655,7 +1711,7 @@ async function transitionIssue(args) {
       Object.assign(names, labelPlan.names);
       Object.assign(values, labelPlan.values);
       if (labelPlan.set) expr += `, ${labelPlan.set}`;
-      if (labelPlan.remove) removes.push(labelPlan.remove);
+      if (labelPlan.removes) removes.push(...labelPlan.removes);
       condition = labelPlan.condition || null;
     }
     await ddb.send(

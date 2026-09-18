@@ -62,7 +62,7 @@
 
 import { LambdaClient, InvokeCommand } from "@aws-sdk/client-lambda";
 import { PutCommand } from "@aws-sdk/lib-dynamodb";
-import { GATE_KINDS, gateKindsOf } from "./fix-contract.mjs";
+import { GATE_KINDS, gateKindsOf, MAX_LABEL } from "./fix-contract.mjs";
 
 // ── Label grammar ───────────────────────────────────────────────────────────
 // Labels arrive in two spellings and must read identically: agents write the
@@ -109,11 +109,65 @@ export function gateExecOf(labels) {
 // so the charset is narrowed to what an AWS resource name can be. Nothing here
 // derives the CI/build project names from it: pipelineProjects() (and its TS
 // mirror) is the one place allowed to do that.
-export const PIPELINE_LABEL_RE = /^pipeline[:-]([a-z0-9][a-z0-9._-]{0,127})$/i;
+//
+// The LENGTH is capped at what a label can actually carry (TEAM-4750 B3). A label
+// is MAX_LABEL = 64 chars (fix-contract.mjs's sanitizeUserLabels truncates there,
+// and normalizeSystemLabel rejects past it), the `pipeline:` prefix costs 9, and
+// the first character is matched separately — so the tail is
+// MAX_PIPELINE_NAME - 1 = 54. The regex literal cannot interpolate the constant;
+// gate-label-readers.test.ts pins the two against each other instead.
+export const PIPELINE_LABEL_PREFIX = "pipeline:";
+export const MAX_PIPELINE_NAME = MAX_LABEL - PIPELINE_LABEL_PREFIX.length; // 55
+export const PIPELINE_LABEL_RE = /^pipeline[:-]([a-z0-9][a-z0-9._-]{0,54})$/i;
 
 /** The pipeline a gate ticket is bound to, from `pipeline:<name>`. */
 export function gatePipelineOf(labels) {
   return firstCapture(labels, PIPELINE_LABEL_RE);
+}
+
+/**
+ * The RAW caller label that cannot survive being stored, or null (TEAM-4750 B3).
+ *
+ * Capping PIPELINE_LABEL_RE is not enough on its own, and this is the subtle half of
+ * the bug: `sanitizeUserLabels` truncates a label to MAX_LABEL, which leaves a
+ * pipeline name of exactly MAX_PIPELINE_NAME chars — still a match, but a DIFFERENT
+ * name than the caller asked for. validateGateTicketShape would then probe, and the
+ * human would later be paged about, a pipeline nobody named. Truncation cannot be
+ * detected after the fact, so it has to be refused before it happens.
+ *
+ * Deliberately runs on the caller's labels BEFORE sanitizeUserLabels, and matches
+ * loosely (`/^pipeline[:-]/i`) rather than through PIPELINE_LABEL_RE: the label we
+ * must catch is precisely the one that does not match once it is too long.
+ *
+ * @returns {string|null} the offending label as the caller wrote it
+ */
+export function pipelineLabelOverflow(labels) {
+  const list = Array.isArray(labels) ? labels : typeof labels === "string" ? labels.split(",") : [];
+  for (const raw of list) {
+    const label = String(raw ?? "").trim();
+    if (/^pipeline[:-]/i.test(label) && label.length > MAX_LABEL) return label;
+  }
+  return null;
+}
+
+/**
+ * The refusal for the above, built HERE so both twins refuse in the same words —
+ * each one only has to deliver it in its own idiom (textResult vs a thrown
+ * err.toolResult). Names both limits, because "too long" without the number is not
+ * something an agent can act on.
+ */
+export function pipelineLabelRefusal(label) {
+  const name = String(label ?? "").replace(/^pipeline[:-]/i, "");
+  return {
+    ok: false,
+    reason: GATE_CONDITION_UNMET,
+    hint:
+      `the \`pipeline:\` label is ${String(label ?? "").length} characters, over the ${MAX_LABEL}-character limit for a ` +
+      `label — it would be silently TRUNCATED to a different pipeline name than you asked for, and this gate would ` +
+      `then be verified against that wrong name. The pipeline name itself may be at most ${MAX_PIPELINE_NAME} ` +
+      `characters (got ${name.length}): use the CD registry's \`pipeline\` value for this repo, which is the name the ` +
+      `hub can actually reach.`,
+  };
 }
 
 // ── The labels the guard itself writes ──────────────────────────────────────
@@ -142,6 +196,41 @@ export const GATE_VERIFICATION_LABEL_RE = /^gateverify[:-](verified|indeterminat
 
 export function gateVerificationLabel(result) {
   return GATE_VERIFICATIONS.includes(result) ? `gateverify:${result}` : "";
+}
+
+/**
+ * Where a verification stamp already sits in a ticket's label list, split into the
+ * one we are about to write and the CONTRADICTORY one(s) (TEAM-4750 B2).
+ *
+ * Both twins used to ask only "is my stamp already there?" and never looked for the
+ * opposite, so done → reopen → done with a different verdict left BOTH
+ * `gateverify:verified` and `gateverify:indeterminate` on the ticket and the label
+ * record of why the gate closed became unreadable. Each twin removes/overwrites the
+ * opposite slot in its own idiom (one conditional UpdateCommand, one transitions
+ * POST), but which slots those are is decided HERE so the two cannot disagree.
+ *
+ * Matches both spellings via GATE_VERIFICATION_LABEL_RE: an agent may have written
+ * `gateverify-verified` by hand, and sanitizeUserLabels rewrites the colon anyway.
+ *
+ * When `result` is not one of GATE_VERIFICATIONS the stamp is "" and both index
+ * lists come back EMPTY — a caller with no verdict of its own must not go deleting
+ * stamps it cannot classify, which also keeps the pre-B2 behaviour byte-identical.
+ *
+ * @returns {{stamp: string, same: number[], opposite: number[]}} indices into `labels`
+ */
+export function gateVerificationSlots(labels, result) {
+  const stamp = gateVerificationLabel(result);
+  const same = [];
+  const opposite = [];
+  if (!stamp) return { stamp, same, opposite };
+  const want = stamp.slice("gateverify:".length);
+  const list = Array.isArray(labels) ? labels : [];
+  list.forEach((l, i) => {
+    const m = GATE_VERIFICATION_LABEL_RE.exec(String(l ?? "").trim().toLowerCase());
+    if (!m) return;
+    (m[1] === want ? same : opposite).push(i);
+  });
+  return { stamp, same, opposite };
 }
 
 // ── Which gate kinds are actually PROBED ────────────────────────────────────
@@ -478,15 +567,20 @@ export async function verifyGateCondition(fnName, opts = {}) {
       return admit("indeterminate", "probe_unanswerable", state.reason || "unanswerable");
     }
 
-    // (1) The most definite negative there is: a human REJECTED at the approval
-    // action. actionDetails is execution-scoped (ListActionExecutions filtered by
-    // pipelineExecutionId), so a Failed approval row here is this run's rejection.
+    // (1) The most definite negative there is: the approval action is recorded as
+    // Failed. Two things produce that row and CodePipeline does not distinguish
+    // them — a human rejected the approval, or the ManualApproval timed out after
+    // its 7 days (TEAM-4750 B4) — so the hint must not accuse a reviewer of a
+    // decision they may never have made. Either way THIS run's approval did not
+    // pass, which is what makes it a refusal at all. actionDetails is
+    // execution-scoped (ListActionExecutions filtered by pipelineExecutionId), so a
+    // Failed approval row here belongs to this run and not to a neighbouring one.
     const rejected = (Array.isArray(state.actionDetails) ? state.actionDetails : []).find(
       (a) => a && /approv/i.test(String(a.action || "")) && String(a.status) === "Failed"
     );
     if (rejected) {
       return refuse(
-        `the deploy approval was REJECTED by a human at ${stageAction(rejected)} — closing this ticket as done would overwrite that decision. Transition it \`block\` instead and file the work the reviewer asked for.`,
+        `the deploy approval at ${stageAction(rejected)} is recorded as Failed — it was REJECTED by a human, or CodePipeline TIMED OUT the approval after 7 days. Either way this run's approval did not pass, and closing this ticket as done would record one that never happened. Transition it \`block\` instead: file the work the reviewer asked for if there was a rejection, or re-run the deploy to page for the approval again if it timed out.`,
         rejected
       );
     }
