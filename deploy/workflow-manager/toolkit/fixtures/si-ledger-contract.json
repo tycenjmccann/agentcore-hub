@@ -1,0 +1,733 @@
+{
+  "_fixture": {
+    "ticket": "TEAM-4760 U1",
+    "purpose": "The SI recommendation ledger exists twice — lambda/workflow-analyzer/si-ledger.mjs (canonical JS, byte-copied into lambda/prd-submitter/) and deploy/workflow-manager/toolkit/si_ledger.py (the Python twin on the WM harness). Neither can import the other: different language, different zip. So they share THIS fixture instead. Both unit suites iterate every section below and assert the same expectations, which is what makes a change on either side fail on the other — the same mechanism fix-lineage.json uses for the fix-ticket predicate.",
+    "readBy": [
+      "lambda/workflow-analyzer/si-ledger.test.mjs (node --test)",
+      "deploy/workflow-manager/toolkit/test_si_ledger.py (unittest/pytest)"
+    ],
+    "conventions": {
+      "op": "The CANONICAL (JS) reducer name. The Python suite maps it to the snake_case twin, so a renamed export breaks one suite loudly instead of both silently.",
+      "args": "Positional arguments AFTER the row, exactly as the reducer takes them. dedupeBlocked/newRow take their one object arg here.",
+      "row": "The input row literal, hand-built to sit exactly on the branch the case is about. Both suites deep-copy it first and assert the reducer did NOT mutate it — purity is part of the contract, because callers reduce twice before writing once.",
+      "expect": "A closed vocabulary: status, firstSeen, lastSeen, counts{occurrences,attempts,expected,verdicts}, row (full deep-equal), occurrences, attempts, expected, verdicts (array deep-equal), blocked, reason, throws (substring of the error/ValueError message). Both suites FAIL on an expect key they do not implement, so a new assertion cannot be added to one language only."
+    },
+    "cases": {
+      "keys.valid/invalid": "isValidKey is the arbiter: >=2 dot-separated segments, each starting alphanumeric, lower-case, hyphens inside, <=120 chars. `nodot` is the one that matters most — a key with no area is not reusable, so the two-segment floor is enforced, not encouraged.",
+      "keys.normalize": "What an agent actually types ('Harness.Silent-Death.Exit Without Report', '  ci .  recert loop  ') has to land on ONE row, or the ledger cannot dedupe anything. Note 'UPPER.only' appears in BOTH invalid and normalize: it is not a valid key as typed, and normalising it is how it becomes one.",
+      "keys.underscore": "'harness.silent_death' normalises to itself — `_` is inside the preserved charset — and is then REJECTED, so it throws. Deliberate: a pattern key is hyphen-separated, and silently folding `_` to `-` would make a_b and a-b the same key for one caller and different keys for a human reading the table.",
+      "keys.length": "The 123-char entry is the >120 cap, which exists because the key is a DynamoDB partition key printed in markdown tables and log lines.",
+      "statusAfterOutcome": "The whole map, asserted entry by entry, because the cancelled/error → open edge is the one that decides whether a dead SI run's keys can ever be filed again.",
+      "new-row-is-open": "The shape of a freshly minted row, pinned whole: status open, firstSeen == lastSeen == at, all four histories empty, and NO extra fields (the schema is closed).",
+      "new-row-carries-source": "A backfilled row is the one case that writes the optional top-level `source`; a normal row must not carry the field at all.",
+      "new-row-rejects-single-segment-key": "`<area>.<slug>` is enforced at construction. A one-segment key is not silently expanded — guessing an area would mint rows nobody can reuse.",
+      "first-occurrence-on-fresh-row": "The analyzer's first write: the occurrence entry shape, and status stays open.",
+      "duplicate-occurrence-bumps-lastseen-only": "Re-running ANALYZE over the same run re-files the same finding. It must not double-count (recommendation_recurrence is computed off this array) but it IS a fresh sighting, so lastSeen moves and firstSeen does not.",
+      "occurrence-on-verified-row-does-not-reopen": "An occurrence on a verified row is evidence of a regression for si_verify to rule on with numbers — not an automatic reopen that would erase the verdict.",
+      "occurrence-earlier-than-firstseen-backfills": "Backfilled history arrives out of order; firstSeen takes the min, not the last write.",
+      "status-batched": "The staging state the synthesiser sets. No attempt is written yet (a PRD that never gets submitted must leave no phantom attempt).",
+      "status-rejects-unknown": "The status enum is closed.",
+      "attempt-in-run-moves-status": "markInRun's reduction: the attempt is appended and the status follows the outcome.",
+      "attempt-deployed-merges-on-prdkey-and-workflow": "The same run stamped twice is ONE attempt: merge on prdKey+workflowId, keep the mergedAt an earlier stamp recorded, UNION prNumbers (a second PR must not erase the first) and sort/dedupe them numerically — including the string \"431\" a tool payload delivered.",
+      "attempt-cancelled-returns-to-open-and-keeps-attempt": "A cancelled SI run fixed nothing, so the ask is owed again — but the attempt stays, or the next synthesis would re-file an identical PRD believing nothing had been tried.",
+      "attempt-handoff-counts-as-landed": "The PR exists and is another team's to merge; the backlog is no longer owed the ask.",
+      "attempt-rejects-unknown-outcome": "The outcome enum is closed.",
+      "verdict-verified-sets-verified": "The number moved; stop re-filing it.",
+      "verdict-no-effect-reopens-and-keeps-attempt": "The dropped-ask bug this feature exists to prevent: status returns to open, the failed attempt is retained as evidence.",
+      "verdict-regressed-reopens": "Same transition as no-effect — a fix that made it worse still owes the backlog.",
+      "verdict-insufficient-leaves-status": "Not enough observed runs yet. Judging early is worse than judging late, so nothing moves.",
+      "verdict-rejects-unknown": "The verdict enum is closed.",
+      "expected-defaults-and-stamps": "observeRuns defaults to 5, setAt defaults to the call's `at`, and prdKey is stamped from the call — an expectation nobody can attribute to a PRD is unverifiable.",
+      "expected-replaces-same-metric-same-prd": "Re-synthesising the same PRD RESTATES its expectation (replace), while an expectation from a different prdKey is kept — that history is how 'we tried twice and neither moved it' stays visible.",
+      "expected-rejects-unknown-metric": "Free-prose impact claims are what made the old loop unfalsifiable. Only METRIC_NAMES.",
+      "dedupe-blocked-in-run": "A key already in flight must never be filed twice; the reason names the run so the skill can point at it.",
+      "dedupe-blocked-fresh-deployed": "Shipped 3 days ago with no verdict — let si_verify judge it first.",
+      "dedupe-not-blocked-fresh-deployed-with-no-effect-verdict": "The attempt shipped recently but a no-effect verdict landed AFTER it: we know it failed, so the ask is owed again immediately.",
+      "dedupe-not-blocked-deployed-older-than-fresh-days": "Past freshDays with no verdict, the silence is its own signal and re-filing is correct.",
+      "dedupe-not-blocked-open": "The ordinary case: an open row is always filable."
+    }
+  },
+
+  "metricNames": [
+    "dead_sessions_per_run",
+    "missed_rewake_gaps",
+    "rework_rounds_v2",
+    "rewakes_per_run",
+    "ci_recerts_per_run",
+    "human_wait_out_of_hours_ms",
+    "wm_interventions_per_run",
+    "cd_duplicate_executions",
+    "analysis_coverage",
+    "recommendation_recurrence"
+  ],
+
+  "statuses": ["open", "batched", "in-run", "landed", "deployed", "verified", "no-effect", "regressed", "wont-fix"],
+  "attemptOutcomes": ["in-run", "landed", "deployed", "cancelled", "error", "handoff"],
+  "verdictValues": ["verified", "no-effect", "regressed", "insufficient"],
+
+  "statusAfterOutcome": {
+    "in-run": "in-run",
+    "landed": "landed",
+    "deployed": "deployed",
+    "cancelled": "open",
+    "error": "open",
+    "handoff": "landed"
+  },
+
+  "keys": {
+    "valid": [
+      "harness.silent-death.exit-without-report",
+      "orchestrator.lease.stuck-claim",
+      "ci.recert-loop",
+      "a.b",
+      "wm.rework-rounds-v2"
+    ],
+    "invalid": [
+      "nodot",
+      "",
+      "a..b",
+      ".leading",
+      "trailing.",
+      "UPPER.only",
+      "has space.slug",
+      "harness.silent_death",
+      "-lead.slug",
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    ],
+    "normalize": [
+      ["Harness.Silent-Death.Exit Without Report", "harness.silent-death.exit-without-report"],
+      ["harness.silent-death.exit-without-report", "harness.silent-death.exit-without-report"],
+      ["UPPER.only", "upper.only"],
+      ["a..b", "a.b"],
+      [".leading.slug", "leading.slug"],
+      ["trailing.slug..", "trailing.slug"],
+      ["Orchestrator.Lease: stuck claim", "orchestrator.lease-stuck-claim"],
+      ["  ci .  recert loop  ", "ci.recert-loop"],
+      ["harness.-silent-death-", "harness.silent-death"],
+      ["ci.recert--loop", "ci.recert-loop"]
+    ],
+    "normalizeThrows": [
+      "nodot",
+      "",
+      "...",
+      "---",
+      "harness.silent_death",
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    ]
+  },
+
+  "transitions": [
+    {
+      "name": "new-row-is-open",
+      "row": null,
+      "op": "newRow",
+      "args": [{ "patternKey": "harness.silent-death.exit-without-report", "title": "Harness exits without report_completion", "at": "2026-09-01T10:00:00.000Z" }],
+      "expect": {
+        "row": {
+          "patternKey": "harness.silent-death.exit-without-report",
+          "title": "Harness exits without report_completion",
+          "status": "open",
+          "firstSeen": "2026-09-01T10:00:00.000Z",
+          "lastSeen": "2026-09-01T10:00:00.000Z",
+          "occurrences": [],
+          "attempts": [],
+          "expected": [],
+          "verdicts": []
+        }
+      }
+    },
+    {
+      "name": "new-row-carries-source",
+      "row": null,
+      "op": "newRow",
+      "args": [{ "patternKey": "Orchestrator.Lease: stuck claim", "title": "lease never released", "at": "2026-09-01T10:00:00.000Z", "source": "backfill" }],
+      "expect": {
+        "row": {
+          "patternKey": "orchestrator.lease-stuck-claim",
+          "title": "lease never released",
+          "status": "open",
+          "firstSeen": "2026-09-01T10:00:00.000Z",
+          "lastSeen": "2026-09-01T10:00:00.000Z",
+          "occurrences": [],
+          "attempts": [],
+          "expected": [],
+          "verdicts": [],
+          "source": "backfill"
+        }
+      }
+    },
+    {
+      "name": "new-row-rejects-single-segment-key",
+      "row": null,
+      "op": "newRow",
+      "args": [{ "patternKey": "silentdeath", "title": "no area", "at": "2026-09-01T10:00:00.000Z" }],
+      "expect": { "throws": "at least two dot-separated segments" }
+    },
+    {
+      "name": "first-occurrence-on-fresh-row",
+      "row": {
+        "patternKey": "harness.silent-death.exit-without-report",
+        "title": "Harness exits without report_completion",
+        "status": "open",
+        "firstSeen": "2026-09-01T10:00:00.000Z",
+        "lastSeen": "2026-09-01T10:00:00.000Z",
+        "occurrences": [],
+        "attempts": [],
+        "expected": [],
+        "verdicts": []
+      },
+      "op": "applyOccurrence",
+      "args": [{ "workflowId": "wf_1", "analysisId": "an_1", "workflowDefId": "software-delivery", "severity": "high", "at": "2026-09-01T10:00:00.000Z" }],
+      "expect": {
+        "status": "open",
+        "firstSeen": "2026-09-01T10:00:00.000Z",
+        "lastSeen": "2026-09-01T10:00:00.000Z",
+        "counts": { "occurrences": 1, "attempts": 0, "expected": 0, "verdicts": 0 },
+        "occurrences": [
+          { "workflowId": "wf_1", "analysisId": "an_1", "workflowDefId": "software-delivery", "severity": "high", "at": "2026-09-01T10:00:00.000Z" }
+        ]
+      }
+    },
+    {
+      "name": "duplicate-occurrence-bumps-lastseen-only",
+      "row": {
+        "patternKey": "harness.silent-death.exit-without-report",
+        "title": "Harness exits without report_completion",
+        "status": "open",
+        "firstSeen": "2026-09-01T10:00:00.000Z",
+        "lastSeen": "2026-09-01T10:00:00.000Z",
+        "occurrences": [
+          { "workflowId": "wf_1", "analysisId": "an_1", "workflowDefId": "software-delivery", "severity": "high", "at": "2026-09-01T10:00:00.000Z" }
+        ],
+        "attempts": [],
+        "expected": [],
+        "verdicts": []
+      },
+      "op": "applyOccurrence",
+      "args": [{ "workflowId": "wf_1", "analysisId": "an_1", "workflowDefId": "software-delivery", "severity": "critical", "at": "2026-09-04T09:00:00.000Z" }],
+      "expect": {
+        "status": "open",
+        "firstSeen": "2026-09-01T10:00:00.000Z",
+        "lastSeen": "2026-09-04T09:00:00.000Z",
+        "counts": { "occurrences": 1, "attempts": 0, "expected": 0, "verdicts": 0 },
+        "occurrences": [
+          { "workflowId": "wf_1", "analysisId": "an_1", "workflowDefId": "software-delivery", "severity": "high", "at": "2026-09-01T10:00:00.000Z" }
+        ]
+      }
+    },
+    {
+      "name": "occurrence-on-verified-row-does-not-reopen",
+      "row": {
+        "patternKey": "ci.recert-loop",
+        "title": "CI re-certifies the same head twice",
+        "status": "verified",
+        "firstSeen": "2026-08-01T10:00:00.000Z",
+        "lastSeen": "2026-08-20T10:00:00.000Z",
+        "occurrences": [
+          { "workflowId": "wf_old", "analysisId": "an_old", "workflowDefId": "software-delivery", "severity": "medium", "at": "2026-08-01T10:00:00.000Z" }
+        ],
+        "attempts": [
+          { "prdKey": "prd_1", "workflowId": "wf_si_1", "epicId": "TEAM-1", "prNumbers": [430], "mergedAt": "2026-08-10T10:00:00.000Z", "deployedAt": "2026-08-10T12:00:00.000Z", "outcome": "deployed", "note": "" }
+        ],
+        "expected": [],
+        "verdicts": [
+          { "at": "2026-08-20T10:00:00.000Z", "prdKey": "prd_1", "verdict": "verified", "before": {}, "after": {}, "note": "" }
+        ]
+      },
+      "op": "applyOccurrence",
+      "args": [{ "workflowId": "wf_new", "analysisId": "an_new", "workflowDefId": "software-delivery", "severity": "high", "at": "2026-09-05T10:00:00.000Z" }],
+      "expect": {
+        "status": "verified",
+        "firstSeen": "2026-08-01T10:00:00.000Z",
+        "lastSeen": "2026-09-05T10:00:00.000Z",
+        "counts": { "occurrences": 2, "attempts": 1, "expected": 0, "verdicts": 1 }
+      }
+    },
+    {
+      "name": "occurrence-earlier-than-firstseen-backfills",
+      "row": {
+        "patternKey": "harness.silent-death.exit-without-report",
+        "title": "Harness exits without report_completion",
+        "status": "open",
+        "firstSeen": "2026-09-01T10:00:00.000Z",
+        "lastSeen": "2026-09-01T10:00:00.000Z",
+        "occurrences": [
+          { "workflowId": "wf_1", "analysisId": "an_1", "workflowDefId": "software-delivery", "severity": "high", "at": "2026-09-01T10:00:00.000Z" }
+        ],
+        "attempts": [],
+        "expected": [],
+        "verdicts": []
+      },
+      "op": "applyOccurrence",
+      "args": [{ "workflowId": "wf_0", "analysisId": "an_0", "workflowDefId": "software-delivery", "severity": "low", "at": "2026-07-15T08:00:00.000Z" }],
+      "expect": {
+        "status": "open",
+        "firstSeen": "2026-07-15T08:00:00.000Z",
+        "lastSeen": "2026-09-01T10:00:00.000Z",
+        "counts": { "occurrences": 2, "attempts": 0, "expected": 0, "verdicts": 0 }
+      }
+    },
+    {
+      "name": "status-batched",
+      "row": {
+        "patternKey": "harness.silent-death.exit-without-report",
+        "title": "Harness exits without report_completion",
+        "status": "open",
+        "firstSeen": "2026-09-01T10:00:00.000Z",
+        "lastSeen": "2026-09-04T09:00:00.000Z",
+        "occurrences": [
+          { "workflowId": "wf_1", "analysisId": "an_1", "workflowDefId": "software-delivery", "severity": "high", "at": "2026-09-01T10:00:00.000Z" }
+        ],
+        "attempts": [],
+        "expected": [],
+        "verdicts": []
+      },
+      "op": "applyStatus",
+      "args": ["batched", { "note": "batched into prd_9", "at": "2026-09-05T10:00:00.000Z" }],
+      "expect": {
+        "status": "batched",
+        "firstSeen": "2026-09-01T10:00:00.000Z",
+        "lastSeen": "2026-09-04T09:00:00.000Z",
+        "counts": { "occurrences": 1, "attempts": 0, "expected": 0, "verdicts": 0 }
+      }
+    },
+    {
+      "name": "status-rejects-unknown",
+      "row": {
+        "patternKey": "harness.silent-death.exit-without-report",
+        "title": "Harness exits without report_completion",
+        "status": "open",
+        "firstSeen": "2026-09-01T10:00:00.000Z",
+        "lastSeen": "2026-09-01T10:00:00.000Z",
+        "occurrences": [],
+        "attempts": [],
+        "expected": [],
+        "verdicts": []
+      },
+      "op": "applyStatus",
+      "args": ["shipped", {}],
+      "expect": { "throws": "invalid status" }
+    },
+    {
+      "name": "attempt-in-run-moves-status",
+      "row": {
+        "patternKey": "harness.silent-death.exit-without-report",
+        "title": "Harness exits without report_completion",
+        "status": "batched",
+        "firstSeen": "2026-09-01T10:00:00.000Z",
+        "lastSeen": "2026-09-04T09:00:00.000Z",
+        "occurrences": [
+          { "workflowId": "wf_1", "analysisId": "an_1", "workflowDefId": "software-delivery", "severity": "high", "at": "2026-09-01T10:00:00.000Z" }
+        ],
+        "attempts": [],
+        "expected": [],
+        "verdicts": []
+      },
+      "op": "applyAttempt",
+      "args": [{ "prdKey": "prd_9", "workflowId": "wf_si_9", "epicId": "TEAM-9", "outcome": "in-run" }],
+      "expect": {
+        "status": "in-run",
+        "counts": { "occurrences": 1, "attempts": 1, "expected": 0, "verdicts": 0 },
+        "attempts": [
+          { "prdKey": "prd_9", "workflowId": "wf_si_9", "epicId": "TEAM-9", "prNumbers": [], "mergedAt": null, "deployedAt": null, "outcome": "in-run", "note": "" }
+        ]
+      }
+    },
+    {
+      "name": "attempt-deployed-merges-on-prdkey-and-workflow",
+      "row": {
+        "patternKey": "harness.silent-death.exit-without-report",
+        "title": "Harness exits without report_completion",
+        "status": "in-run",
+        "firstSeen": "2026-09-01T10:00:00.000Z",
+        "lastSeen": "2026-09-04T09:00:00.000Z",
+        "occurrences": [
+          { "workflowId": "wf_1", "analysisId": "an_1", "workflowDefId": "software-delivery", "severity": "high", "at": "2026-09-01T10:00:00.000Z" }
+        ],
+        "attempts": [
+          { "prdKey": "prd_9", "workflowId": "wf_si_9", "epicId": "TEAM-9", "prNumbers": [430], "mergedAt": "2026-09-06T10:00:00.000Z", "deployedAt": null, "outcome": "landed", "note": "merged by RM" }
+        ],
+        "expected": [],
+        "verdicts": []
+      },
+      "op": "applyAttempt",
+      "args": [{ "prdKey": "prd_9", "workflowId": "wf_si_9", "prNumbers": ["431", 430], "deployedAt": "2026-09-06T12:00:00.000Z", "outcome": "deployed" }],
+      "expect": {
+        "status": "deployed",
+        "counts": { "occurrences": 1, "attempts": 1, "expected": 0, "verdicts": 0 },
+        "attempts": [
+          { "prdKey": "prd_9", "workflowId": "wf_si_9", "epicId": "TEAM-9", "prNumbers": [430, 431], "mergedAt": "2026-09-06T10:00:00.000Z", "deployedAt": "2026-09-06T12:00:00.000Z", "outcome": "deployed", "note": "merged by RM" }
+        ]
+      }
+    },
+    {
+      "name": "attempt-cancelled-returns-to-open-and-keeps-attempt",
+      "row": {
+        "patternKey": "harness.silent-death.exit-without-report",
+        "title": "Harness exits without report_completion",
+        "status": "in-run",
+        "firstSeen": "2026-09-01T10:00:00.000Z",
+        "lastSeen": "2026-09-04T09:00:00.000Z",
+        "occurrences": [
+          { "workflowId": "wf_1", "analysisId": "an_1", "workflowDefId": "software-delivery", "severity": "high", "at": "2026-09-01T10:00:00.000Z" }
+        ],
+        "attempts": [
+          { "prdKey": "prd_9", "workflowId": "wf_si_9", "epicId": "TEAM-9", "prNumbers": [], "mergedAt": null, "deployedAt": null, "outcome": "in-run", "note": "" }
+        ],
+        "expected": [],
+        "verdicts": []
+      },
+      "op": "applyAttempt",
+      "args": [{ "prdKey": "prd_9", "workflowId": "wf_si_9", "outcome": "cancelled", "note": "operator cancelled the SI run" }],
+      "expect": {
+        "status": "open",
+        "counts": { "occurrences": 1, "attempts": 1, "expected": 0, "verdicts": 0 },
+        "attempts": [
+          { "prdKey": "prd_9", "workflowId": "wf_si_9", "epicId": "TEAM-9", "prNumbers": [], "mergedAt": null, "deployedAt": null, "outcome": "cancelled", "note": "operator cancelled the SI run" }
+        ]
+      }
+    },
+    {
+      "name": "attempt-handoff-counts-as-landed",
+      "row": {
+        "patternKey": "ci.recert-loop",
+        "title": "CI re-certifies the same head twice",
+        "status": "in-run",
+        "firstSeen": "2026-09-01T10:00:00.000Z",
+        "lastSeen": "2026-09-01T10:00:00.000Z",
+        "occurrences": [],
+        "attempts": [
+          { "prdKey": "prd_7", "workflowId": "wf_si_7", "epicId": "TEAM-7", "prNumbers": [], "mergedAt": null, "deployedAt": null, "outcome": "in-run", "note": "" }
+        ],
+        "expected": [],
+        "verdicts": []
+      },
+      "op": "applyAttempt",
+      "args": [{ "prdKey": "prd_7", "workflowId": "wf_si_7", "prNumbers": [12], "outcome": "handoff" }],
+      "expect": {
+        "status": "landed",
+        "counts": { "occurrences": 0, "attempts": 1, "expected": 0, "verdicts": 0 },
+        "attempts": [
+          { "prdKey": "prd_7", "workflowId": "wf_si_7", "epicId": "TEAM-7", "prNumbers": [12], "mergedAt": null, "deployedAt": null, "outcome": "handoff", "note": "" }
+        ]
+      }
+    },
+    {
+      "name": "attempt-rejects-unknown-outcome",
+      "row": {
+        "patternKey": "ci.recert-loop",
+        "title": "CI re-certifies the same head twice",
+        "status": "open",
+        "firstSeen": "2026-09-01T10:00:00.000Z",
+        "lastSeen": "2026-09-01T10:00:00.000Z",
+        "occurrences": [],
+        "attempts": [],
+        "expected": [],
+        "verdicts": []
+      },
+      "op": "applyAttempt",
+      "args": [{ "prdKey": "prd_7", "workflowId": "wf_si_7", "outcome": "merged" }],
+      "expect": { "throws": "invalid attempt outcome" }
+    },
+    {
+      "name": "verdict-verified-sets-verified",
+      "row": {
+        "patternKey": "harness.silent-death.exit-without-report",
+        "title": "Harness exits without report_completion",
+        "status": "deployed",
+        "firstSeen": "2026-09-01T10:00:00.000Z",
+        "lastSeen": "2026-09-04T09:00:00.000Z",
+        "occurrences": [],
+        "attempts": [
+          { "prdKey": "prd_9", "workflowId": "wf_si_9", "epicId": "TEAM-9", "prNumbers": [430], "mergedAt": "2026-09-06T10:00:00.000Z", "deployedAt": "2026-09-06T12:00:00.000Z", "outcome": "deployed", "note": "" }
+        ],
+        "expected": [],
+        "verdicts": []
+      },
+      "op": "applyVerdict",
+      "args": [{ "at": "2026-09-20T10:00:00.000Z", "prdKey": "prd_9", "verdict": "verified", "before": { "dead_sessions_per_run": 1.4 }, "after": { "dead_sessions_per_run": 0.1 }, "note": "6 runs since deploy" }],
+      "expect": {
+        "status": "verified",
+        "counts": { "occurrences": 0, "attempts": 1, "expected": 0, "verdicts": 1 },
+        "verdicts": [
+          { "at": "2026-09-20T10:00:00.000Z", "prdKey": "prd_9", "verdict": "verified", "before": { "dead_sessions_per_run": 1.4 }, "after": { "dead_sessions_per_run": 0.1 }, "note": "6 runs since deploy" }
+        ]
+      }
+    },
+    {
+      "name": "verdict-no-effect-reopens-and-keeps-attempt",
+      "row": {
+        "patternKey": "harness.silent-death.exit-without-report",
+        "title": "Harness exits without report_completion",
+        "status": "deployed",
+        "firstSeen": "2026-09-01T10:00:00.000Z",
+        "lastSeen": "2026-09-04T09:00:00.000Z",
+        "occurrences": [],
+        "attempts": [
+          { "prdKey": "prd_9", "workflowId": "wf_si_9", "epicId": "TEAM-9", "prNumbers": [430], "mergedAt": "2026-09-06T10:00:00.000Z", "deployedAt": "2026-09-06T12:00:00.000Z", "outcome": "deployed", "note": "" }
+        ],
+        "expected": [],
+        "verdicts": []
+      },
+      "op": "applyVerdict",
+      "args": [{ "at": "2026-09-20T10:00:00.000Z", "prdKey": "prd_9", "verdict": "no-effect", "before": { "dead_sessions_per_run": 1.4 }, "after": { "dead_sessions_per_run": 1.35 }, "note": "within tolerance over 6 runs" }],
+      "expect": {
+        "status": "open",
+        "counts": { "occurrences": 0, "attempts": 1, "expected": 0, "verdicts": 1 },
+        "attempts": [
+          { "prdKey": "prd_9", "workflowId": "wf_si_9", "epicId": "TEAM-9", "prNumbers": [430], "mergedAt": "2026-09-06T10:00:00.000Z", "deployedAt": "2026-09-06T12:00:00.000Z", "outcome": "deployed", "note": "" }
+        ]
+      }
+    },
+    {
+      "name": "verdict-regressed-reopens",
+      "row": {
+        "patternKey": "ci.recert-loop",
+        "title": "CI re-certifies the same head twice",
+        "status": "deployed",
+        "firstSeen": "2026-09-01T10:00:00.000Z",
+        "lastSeen": "2026-09-01T10:00:00.000Z",
+        "occurrences": [],
+        "attempts": [
+          { "prdKey": "prd_7", "workflowId": "wf_si_7", "epicId": "TEAM-7", "prNumbers": [12], "mergedAt": "2026-09-02T10:00:00.000Z", "deployedAt": "2026-09-02T11:00:00.000Z", "outcome": "deployed", "note": "" }
+        ],
+        "expected": [],
+        "verdicts": []
+      },
+      "op": "applyVerdict",
+      "args": [{ "at": "2026-09-19T10:00:00.000Z", "prdKey": "prd_7", "verdict": "regressed", "before": { "ci_recerts_per_run": 1.1 }, "after": { "ci_recerts_per_run": 2.4 }, "note": "worse after the change" }],
+      "expect": {
+        "status": "open",
+        "counts": { "occurrences": 0, "attempts": 1, "expected": 0, "verdicts": 1 }
+      }
+    },
+    {
+      "name": "verdict-insufficient-leaves-status",
+      "row": {
+        "patternKey": "ci.recert-loop",
+        "title": "CI re-certifies the same head twice",
+        "status": "deployed",
+        "firstSeen": "2026-09-01T10:00:00.000Z",
+        "lastSeen": "2026-09-01T10:00:00.000Z",
+        "occurrences": [],
+        "attempts": [
+          { "prdKey": "prd_7", "workflowId": "wf_si_7", "epicId": "TEAM-7", "prNumbers": [12], "mergedAt": "2026-09-02T10:00:00.000Z", "deployedAt": "2026-09-02T11:00:00.000Z", "outcome": "deployed", "note": "" }
+        ],
+        "expected": [],
+        "verdicts": []
+      },
+      "op": "applyVerdict",
+      "args": [{ "at": "2026-09-04T10:00:00.000Z", "prdKey": "prd_7", "verdict": "insufficient", "before": {}, "after": {}, "note": "only 2 of 5 observe runs" }],
+      "expect": {
+        "status": "deployed",
+        "counts": { "occurrences": 0, "attempts": 1, "expected": 0, "verdicts": 1 }
+      }
+    },
+    {
+      "name": "verdict-rejects-unknown",
+      "row": {
+        "patternKey": "ci.recert-loop",
+        "title": "CI re-certifies the same head twice",
+        "status": "deployed",
+        "firstSeen": "2026-09-01T10:00:00.000Z",
+        "lastSeen": "2026-09-01T10:00:00.000Z",
+        "occurrences": [],
+        "attempts": [],
+        "expected": [],
+        "verdicts": []
+      },
+      "op": "applyVerdict",
+      "args": [{ "at": "2026-09-04T10:00:00.000Z", "prdKey": "prd_7", "verdict": "better" }],
+      "expect": { "throws": "invalid verdict" }
+    },
+    {
+      "name": "expected-defaults-and-stamps",
+      "row": {
+        "patternKey": "harness.silent-death.exit-without-report",
+        "title": "Harness exits without report_completion",
+        "status": "batched",
+        "firstSeen": "2026-09-01T10:00:00.000Z",
+        "lastSeen": "2026-09-04T09:00:00.000Z",
+        "occurrences": [],
+        "attempts": [],
+        "expected": [],
+        "verdicts": []
+      },
+      "op": "applyExpected",
+      "args": [
+        [{ "metric": "dead_sessions_per_run", "baseline": { "value": 1.4, "runs": 6, "window": "30d" }, "target": 0.2 }],
+        { "prdKey": "prd_9", "at": "2026-09-05T10:00:00.000Z" }
+      ],
+      "expect": {
+        "status": "batched",
+        "counts": { "occurrences": 0, "attempts": 0, "expected": 1, "verdicts": 0 },
+        "expected": [
+          { "metric": "dead_sessions_per_run", "baseline": { "value": 1.4, "runs": 6, "window": "30d" }, "target": 0.2, "observeRuns": 5, "setAt": "2026-09-05T10:00:00.000Z", "prdKey": "prd_9" }
+        ]
+      }
+    },
+    {
+      "name": "expected-replaces-same-metric-same-prd",
+      "row": {
+        "patternKey": "harness.silent-death.exit-without-report",
+        "title": "Harness exits without report_completion",
+        "status": "batched",
+        "firstSeen": "2026-09-01T10:00:00.000Z",
+        "lastSeen": "2026-09-04T09:00:00.000Z",
+        "occurrences": [],
+        "attempts": [],
+        "expected": [
+          { "metric": "dead_sessions_per_run", "baseline": { "value": 1.4, "runs": 6, "window": "30d" }, "target": 0.2, "observeRuns": 5, "setAt": "2026-09-05T10:00:00.000Z", "prdKey": "prd_9" },
+          { "metric": "dead_sessions_per_run", "baseline": { "value": 2.0, "runs": 4, "window": "30d" }, "target": 0.5, "observeRuns": 5, "setAt": "2026-08-01T10:00:00.000Z", "prdKey": "prd_4" },
+          { "metric": "rewakes_per_run", "baseline": { "value": 3.0, "runs": 6, "window": "30d" }, "target": 1.0, "observeRuns": 5, "setAt": "2026-09-05T10:00:00.000Z", "prdKey": "prd_9" }
+        ],
+        "verdicts": []
+      },
+      "op": "applyExpected",
+      "args": [
+        [{ "metric": "dead_sessions_per_run", "baseline": { "value": 1.2, "runs": 8, "window": "30d" }, "target": 0.1, "observeRuns": 8 }],
+        { "prdKey": "prd_9", "at": "2026-09-07T10:00:00.000Z" }
+      ],
+      "expect": {
+        "counts": { "occurrences": 0, "attempts": 0, "expected": 3, "verdicts": 0 },
+        "expected": [
+          { "metric": "dead_sessions_per_run", "baseline": { "value": 2.0, "runs": 4, "window": "30d" }, "target": 0.5, "observeRuns": 5, "setAt": "2026-08-01T10:00:00.000Z", "prdKey": "prd_4" },
+          { "metric": "rewakes_per_run", "baseline": { "value": 3.0, "runs": 6, "window": "30d" }, "target": 1.0, "observeRuns": 5, "setAt": "2026-09-05T10:00:00.000Z", "prdKey": "prd_9" },
+          { "metric": "dead_sessions_per_run", "baseline": { "value": 1.2, "runs": 8, "window": "30d" }, "target": 0.1, "observeRuns": 8, "setAt": "2026-09-07T10:00:00.000Z", "prdKey": "prd_9" }
+        ]
+      }
+    },
+    {
+      "name": "expected-rejects-unknown-metric",
+      "row": {
+        "patternKey": "harness.silent-death.exit-without-report",
+        "title": "Harness exits without report_completion",
+        "status": "batched",
+        "firstSeen": "2026-09-01T10:00:00.000Z",
+        "lastSeen": "2026-09-04T09:00:00.000Z",
+        "occurrences": [],
+        "attempts": [],
+        "expected": [],
+        "verdicts": []
+      },
+      "op": "applyExpected",
+      "args": [
+        [{ "metric": "fewer_silent_deaths", "baseline": { "value": 1.4, "runs": 6, "window": "30d" }, "target": 0.2 }],
+        { "prdKey": "prd_9", "at": "2026-09-05T10:00:00.000Z" }
+      ],
+      "expect": { "throws": "unknown expected metric" }
+    },
+    {
+      "name": "dedupe-blocked-in-run",
+      "row": {
+        "patternKey": "harness.silent-death.exit-without-report",
+        "title": "Harness exits without report_completion",
+        "status": "in-run",
+        "firstSeen": "2026-09-01T10:00:00.000Z",
+        "lastSeen": "2026-09-04T09:00:00.000Z",
+        "occurrences": [],
+        "attempts": [
+          { "prdKey": "prd_9", "workflowId": "wf_si_9", "epicId": "TEAM-9", "prNumbers": [], "mergedAt": null, "deployedAt": null, "outcome": "in-run", "note": "" }
+        ],
+        "expected": [],
+        "verdicts": []
+      },
+      "op": "dedupeBlocked",
+      "args": [{ "now": "2026-09-08T10:00:00.000Z", "freshDays": 14 }],
+      "expect": {
+        "blocked": true,
+        "reason": "harness.silent-death.exit-without-report is already in flight: run wf_si_9 (PRD prd_9) is carrying it. File nothing new; let that run land."
+      }
+    },
+    {
+      "name": "dedupe-blocked-fresh-deployed",
+      "row": {
+        "patternKey": "harness.silent-death.exit-without-report",
+        "title": "Harness exits without report_completion",
+        "status": "deployed",
+        "firstSeen": "2026-09-01T10:00:00.000Z",
+        "lastSeen": "2026-09-04T09:00:00.000Z",
+        "occurrences": [],
+        "attempts": [
+          { "prdKey": "prd_9", "workflowId": "wf_si_9", "epicId": "TEAM-9", "prNumbers": [430], "mergedAt": "2026-09-05T10:00:00.000Z", "deployedAt": "2026-09-05T12:00:00.000Z", "outcome": "deployed", "note": "" }
+        ],
+        "expected": [],
+        "verdicts": []
+      },
+      "op": "dedupeBlocked",
+      "args": [{ "now": "2026-09-08T14:00:00.000Z", "freshDays": 14 }],
+      "expect": {
+        "blocked": true,
+        "reason": "harness.silent-death.exit-without-report already deployed 3d ago (2026-09-05T12:00:00.000Z, PRD prd_9) and has no no-effect/regressed verdict since. Let si_verify judge that attempt before filing it again."
+      }
+    },
+    {
+      "name": "dedupe-not-blocked-fresh-deployed-with-no-effect-verdict",
+      "row": {
+        "patternKey": "harness.silent-death.exit-without-report",
+        "title": "Harness exits without report_completion",
+        "status": "deployed",
+        "firstSeen": "2026-09-01T10:00:00.000Z",
+        "lastSeen": "2026-09-04T09:00:00.000Z",
+        "occurrences": [],
+        "attempts": [
+          { "prdKey": "prd_9", "workflowId": "wf_si_9", "epicId": "TEAM-9", "prNumbers": [430], "mergedAt": "2026-09-05T10:00:00.000Z", "deployedAt": "2026-09-05T12:00:00.000Z", "outcome": "deployed", "note": "" }
+        ],
+        "expected": [],
+        "verdicts": [
+          { "at": "2026-09-07T10:00:00.000Z", "prdKey": "prd_9", "verdict": "no-effect", "before": { "dead_sessions_per_run": 1.4 }, "after": { "dead_sessions_per_run": 1.4 }, "note": "" }
+        ]
+      },
+      "op": "dedupeBlocked",
+      "args": [{ "now": "2026-09-08T14:00:00.000Z", "freshDays": 14 }],
+      "expect": {
+        "blocked": false,
+        "reason": "harness.silent-death.exit-without-report is clear to file (status deployed)."
+      }
+    },
+    {
+      "name": "dedupe-not-blocked-deployed-older-than-fresh-days",
+      "row": {
+        "patternKey": "harness.silent-death.exit-without-report",
+        "title": "Harness exits without report_completion",
+        "status": "deployed",
+        "firstSeen": "2026-08-01T10:00:00.000Z",
+        "lastSeen": "2026-08-04T09:00:00.000Z",
+        "occurrences": [],
+        "attempts": [
+          { "prdKey": "prd_9", "workflowId": "wf_si_9", "epicId": "TEAM-9", "prNumbers": [430], "mergedAt": "2026-08-20T10:00:00.000Z", "deployedAt": "2026-08-20T12:00:00.000Z", "outcome": "deployed", "note": "" }
+        ],
+        "expected": [],
+        "verdicts": []
+      },
+      "op": "dedupeBlocked",
+      "args": [{ "now": "2026-09-08T14:00:00.000Z", "freshDays": 14 }],
+      "expect": {
+        "blocked": false,
+        "reason": "harness.silent-death.exit-without-report is clear to file (status deployed)."
+      }
+    },
+    {
+      "name": "dedupe-not-blocked-open",
+      "row": {
+        "patternKey": "ci.recert-loop",
+        "title": "CI re-certifies the same head twice",
+        "status": "open",
+        "firstSeen": "2026-09-01T10:00:00.000Z",
+        "lastSeen": "2026-09-04T09:00:00.000Z",
+        "occurrences": [
+          { "workflowId": "wf_1", "analysisId": "an_1", "workflowDefId": "software-delivery", "severity": "high", "at": "2026-09-01T10:00:00.000Z" }
+        ],
+        "attempts": [],
+        "expected": [],
+        "verdicts": []
+      },
+      "op": "dedupeBlocked",
+      "args": [{ "now": "2026-09-08T14:00:00.000Z", "freshDays": 14 }],
+      "expect": {
+        "blocked": false,
+        "reason": "ci.recert-loop is clear to file (status open)."
+      }
+    }
+  ]
+}
