@@ -10,7 +10,8 @@
 #                                     tickets complete)
 #
 # Required env vars (from deploy/config.sh):
-#   ACCOUNT_ID, AWS_REGION, LAMBDA_ROLE_ARN, ARTIFACT_BUCKET, EVENTS_TABLE
+#   ACCOUNT_ID, AWS_REGION, LAMBDA_ROLE_ARN, ARTIFACT_BUCKET, EVENTS_TABLE,
+#   WORKFLOWS_TABLE
 # Optional:
 #   TICKET_PROVIDER ("jira" | "dynamodb", default "jira")
 #   TICKET_TOOLS_LAMBDA (default derived from TICKET_PROVIDER)
@@ -65,7 +66,12 @@ zip -qr function.zip index.mjs node_modules
 SIZE=$(ls -lh function.zip | awk '{print $5}')
 echo "  Zip size: $SIZE"
 
-ENV_VARS="Variables={ARTIFACT_BUCKET=${ARTIFACT_BUCKET},EVENTS_TABLE=${EVENTS_TABLE},TICKET_PROVIDER=${TICKET_PROVIDER},TICKET_TOOLS_LAMBDA=${TICKET_TOOLS_LAMBDA}}"
+# TEAM-4740 FR-11: WORKFLOWS_TABLE is read (GetItem only) to resolve the run's
+# `featureBranch` so submit_ticket_plan can template the integration branch into
+# every ticket description instead of trusting an analyst-coined one. NO IAM change
+# — deploy/setup-lambda-role.sh already grants GetItem/Query on
+# agentcore-hub-workflows to this shared role. Unset ⇒ templating is skipped.
+ENV_VARS="Variables={ARTIFACT_BUCKET=${ARTIFACT_BUCKET},EVENTS_TABLE=${EVENTS_TABLE},WORKFLOWS_TABLE=${WORKFLOWS_TABLE},TICKET_PROVIDER=${TICKET_PROVIDER},TICKET_TOOLS_LAMBDA=${TICKET_TOOLS_LAMBDA}}"
 
 echo "=== Deploying $NAME ==="
 if aws lambda get-function --function-name "$NAME" --region "$AWS_REGION" >/dev/null 2>&1; then

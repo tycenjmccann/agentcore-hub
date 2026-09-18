@@ -1619,3 +1619,444 @@ test("createTicket: FAILS OPEN — an unreadable epic files the gate ticket", as
     assert.equal(res.ticketId, "TEAM-901");
   });
 });
+
+// ─── TEAM-4740 FR-12 / FR-5: base_branch + open-gate autowire (Jira twin) ──────
+//
+// The DynamoDB twin's copy of this matrix lives in
+// lambda/agentcore-hub-tickets/index.test.mjs; the two are held to ONE regex,
+// refusal string and description line by src/lib/workflow/base-branch-parity.test.ts.
+// This file owns the Jira-side BEHAVIOUR: the branch rides one ADF block (Jira has
+// no arbitrary columns), and the freeze is expressed as Blocks issue links plus a
+// real "Blocked" transition rather than a status column write.
+
+const EPIC = "TEAM-4734";
+const GATE_KEY = "TEAM-4668";
+const CD_KEY = "TEAM-4703";
+
+/** A sibling as Jira's search actually returns it. */
+function issue(key, fields) {
+  return {
+    key,
+    fields: {
+      summary: "",
+      status: { name: "To Do" },
+      labels: [],
+      created: "2026-09-14T12:00:00.000+0000",
+      ...fields,
+    },
+  };
+}
+
+/** The human Merge Approval gate: human-review + reviewer:<who>, In Review. */
+const gateIssue = (fields = {}) =>
+  issue(GATE_KEY, {
+    summary: "Merge Approval: [SI] system binding",
+    status: { name: "In Review" },
+    labels: ["human-review", "reviewer:tycen"],
+    created: "2026-09-14T17:33:00.000+0000",
+    ...fields,
+  });
+
+/** The run's CD ticket: an agent ticket stamped with the ship phase. */
+const cdIssue = (key = CD_KEY, fields = {}) =>
+  issue(key, {
+    summary: "CD: merge + deploy",
+    status: { name: "To Do" },
+    labels: ["agent:agentcore_hub_release_manager", "phase:ship"],
+    created: "2026-09-14T16:00:00.000+0000",
+    ...fields,
+  });
+
+/**
+ * Route Jira's REST surface for a create whose sibling scan matters. Splits the
+ * two JQL searches by their query (`parent = …` is the FR-5 scan; anything else is
+ * the pre-existing idempotency probe) and records the links + transitions the
+ * freeze is actually made of.
+ */
+function captureGateCreate({ createdKey = "TEAM-4711", siblings = [], scanFails = false } = {}) {
+  const cap = {
+    posts: [], fields: null, siblingScans: [], dupScans: [],
+    links: [], transitionIds: [], restore: null,
+  };
+  const originalFetch = globalThis.fetch;
+  cap.restore = () => { globalThis.fetch = originalFetch; };
+  globalThis.fetch = async (url, options = {}) => {
+    const method = options.method || "GET";
+    const u = String(url);
+    if (u.includes("/rest/api/3/search/jql")) {
+      const jql = jqlOf(u);
+      if (jql.startsWith("parent = ")) {
+        cap.siblingScans.push(jql);
+        if (scanFails) {
+          return new Response(JSON.stringify({ errorMessages: ["The parent field is not searchable"] }), { status: 400 });
+        }
+        return new Response(JSON.stringify({ issues: siblings }), { status: 200 });
+      }
+      cap.dupScans.push(jql);
+      return new Response(JSON.stringify({ issues: [] }), { status: 200 });
+    }
+    if (u.endsWith("/rest/api/3/issue") && method === "POST") {
+      cap.posts.push(u);
+      cap.fields = JSON.parse(options.body).fields;
+      return new Response(JSON.stringify({ key: createdKey }), { status: 201 });
+    }
+    if (u.endsWith("/rest/api/3/issueLink") && method === "POST") {
+      cap.links.push(JSON.parse(options.body));
+      return new Response(null, { status: 204 });
+    }
+    if (u.includes("/transitions")) {
+      if (method === "POST") {
+        cap.transitionIds.push(JSON.parse(options.body).transition.id);
+        return new Response(null, { status: 204 });
+      }
+      return new Response(JSON.stringify({ transitions: [
+        { id: "21", name: "Ready", to: { name: "Ready" } },
+        { id: "31", name: "Blocked", to: { name: "Blocked" } },
+      ] }), { status: 200 });
+    }
+    return new Response(JSON.stringify({}), { status: 200 });
+  };
+  return cap;
+}
+
+/** An ordinary agent ticket under the epic. */
+const AGENT_TICKET = {
+  summary: "Fix the abandon guard",
+  assignee: "agentcore_hub_backend_dev",
+  parent_key: EPIC,
+};
+
+/** The block texts of a captured ADF description, in order. */
+const blocksOf = (cap) => (cap.fields.description?.content || []).map((n) => n.content?.[0]?.text ?? "");
+
+test("FR-12: base_branch rides one ADF block and comes back on the response", async () => {
+  const m = await loadWithMode("off");
+  const cap = captureGateCreate();
+  try {
+    const result = await m.handler({
+      tool_name: "Tickets___create_ticket",
+      parameters: { ...AGENT_TICKET, description: "Fix the abandon guard.", base_branch: "main" },
+    });
+    assert.equal(result.ticketId, "TEAM-4711", JSON.stringify(result));
+    assert.equal(result.base_branch, "main");
+
+    // Its OWN block, after the prose — adfToText separates block nodes with "\n",
+    // which is the only reason the anchored parser can find the line at all.
+    assert.deepEqual(blocksOf(cap), ["Fix the abandon guard.", "base_branch: main"]);
+    const flattened = adfToText(cap.fields.description);
+    assert.equal(flattened.match(m.BASE_BRANCH_LINE_RE)[1], "main");
+  } finally {
+    cap.restore();
+  }
+});
+
+test("FR-12: the contract block still leads, with the branch line last", async () => {
+  const m = await loadWithMode("enforce");
+  const cap = captureGateCreate();
+  try {
+    await m.handler({
+      tool_name: "Tickets___create_ticket",
+      parameters: { ...SHIP_FIX, base_branch: "feature/TEAM-4734--si-x" },
+    });
+    // parseFixContractBlock needs contract-first-then-prose; the branch line must
+    // not get between them.
+    assert.deepEqual(cap.fields.description.content.map((n) => n.type), ["codeBlock", "paragraph", "paragraph"]);
+    const parsed = parseFixContractBlock(adfToText(cap.fields.description));
+    assert.ok(parsed, "the contract must still parse back out");
+    assert.equal(parsed.kind, "ship_fix");
+    assert.equal(
+      adfToText(cap.fields.description).match(m.BASE_BRANCH_LINE_RE)[1],
+      "feature/TEAM-4734--si-x"
+    );
+  } finally {
+    cap.restore();
+  }
+});
+
+test("FR-12: an invalid base_branch creates NOTHING", async () => {
+  const m = await loadWithMode("off");
+  const cap = captureGateCreate();
+  try {
+    for (const bad of ["--upload-pack=x", "-main", "/main", "feature/../main", "main@{1}", "main.lock", "feature/", "a b"]) {
+      const result = await m.handler({
+        tool_name: "Tickets___create_ticket",
+        parameters: { ...AGENT_TICKET, base_branch: bad },
+      });
+      // The twin's idiom: createTicket throws, the handler maps it to `error`.
+      assert.equal(result.error, m.baseBranchRefusal(bad), `for ${JSON.stringify(bad)}`);
+      assert.equal(result.ticketId, undefined);
+    }
+    assert.equal(cap.posts.length, 0, "no issue may be created for a refused branch");
+    // Refused BEFORE any Jira I/O at all — not even the sibling scan.
+    assert.equal(cap.siblingScans.length, 0);
+  } finally {
+    cap.restore();
+  }
+});
+
+test("FR-12: an absent base_branch leaves the description byte-identical", async () => {
+  const m = await loadWithMode("off");
+  const cap = captureGateCreate();
+  try {
+    const result = await m.handler({
+      tool_name: "Tickets___create_ticket",
+      parameters: { ...AGENT_TICKET, description: "Plain ticket." },
+    });
+    assert.deepEqual(blocksOf(cap), ["Plain ticket."]);
+    assert.equal("base_branch" in result, false);
+
+    // …and with no description either, there is still no description field.
+    const cap2 = captureGateCreate();
+    try {
+      await m.handler({ tool_name: "Tickets___create_ticket", parameters: { ...AGENT_TICKET } });
+      assert.equal(cap2.fields.description, undefined);
+    } finally {
+      cap2.restore();
+    }
+  } finally {
+    cap.restore();
+  }
+});
+
+test("FR-5: an open gate freezes a new agent ticket behind the CD ticket", async () => {
+  const m = await loadWithMode("off");
+  const cap = captureGateCreate({ siblings: [gateIssue(), cdIssue()] });
+  try {
+    const result = await m.handler({
+      tool_name: "Tickets___create_ticket",
+      parameters: { ...AGENT_TICKET, description: "Fix the abandon guard.", workflow_id: "run1" },
+    });
+
+    assert.equal(result.status, "blocked", JSON.stringify(result));
+    assert.deepEqual(result.autowired, {
+      reason: "open_gate",
+      blockedBy: [CD_KEY],
+      gateTicketId: GATE_KEY,
+    });
+    // The freeze in Jira IS the link + the transition; there is no status column.
+    assert.deepEqual(cap.links, [{
+      type: { name: "Blocks" },
+      inwardIssue: { key: CD_KEY },
+      outwardIssue: { key: "TEAM-4711" },
+    }]);
+    assert.deepEqual(cap.transitionIds, ["31"]);
+    // The banner LEADS the prose: it changes what the assignee must do.
+    const blocks = blocksOf(cap);
+    assert.ok(blocks[0].startsWith("DELIVERY CONSTRAINT:"), blocks[0]);
+    assert.ok(blocks[0].includes(CD_KEY));
+    assert.ok(blocks[0].includes("your OWN pull request to main"));
+    assert.equal(blocks[1], "Fix the abandon guard.");
+    // One scan, on the parent, ordered — and the pre-existing dedupe probe is
+    // untouched beside it.
+    assert.deepEqual(cap.siblingScans, [`parent = ${EPIC} ORDER BY created ASC`]);
+    assert.equal(cap.dupScans.length, 1);
+  } finally {
+    cap.restore();
+  }
+});
+
+test("FR-5: the caller's own blockers are kept and the CD edge appended", async () => {
+  const m = await loadWithMode("off");
+  const cap = captureGateCreate({ siblings: [gateIssue(), cdIssue()] });
+  try {
+    const result = await m.handler({
+      tool_name: "Tickets___create_ticket",
+      parameters: { ...AGENT_TICKET, blocked_by: ["TEAM-4700"] },
+    });
+    assert.equal(result.status, "blocked");
+    assert.deepEqual(cap.links.map((l) => l.inwardIssue.key), ["TEAM-4700", CD_KEY]);
+  } finally {
+    cap.restore();
+  }
+});
+
+test("FR-5: a human:* gate is never frozen — and costs no scan", async () => {
+  const m = await loadWithMode("off");
+  const cap = captureGateCreate({ siblings: [gateIssue(), cdIssue()] });
+  try {
+    const result = await m.handler({
+      tool_name: "Tickets___create_ticket",
+      parameters: { summary: "Merge Approval: round 2", assignee: "human:tycen", parent_key: EPIC },
+    });
+    assert.equal(result.status, "todo");
+    assert.equal(result.autowired, undefined);
+    assert.deepEqual(cap.links, []);
+    // Freezing a human gate would deadlock the run, so the answer never depends on
+    // a scan succeeding.
+    assert.equal(cap.siblingScans.length, 0);
+  } finally {
+    cap.restore();
+  }
+});
+
+test("FR-5: no duplicate edge when the caller already ordered it behind CD", async () => {
+  const m = await loadWithMode("off");
+  const cap = captureGateCreate({ siblings: [gateIssue(), cdIssue()] });
+  try {
+    const result = await m.handler({
+      tool_name: "Tickets___create_ticket",
+      parameters: { ...AGENT_TICKET, blocked_by: [CD_KEY] },
+    });
+    assert.equal(result.autowired, undefined);
+    assert.deepEqual(cap.links.map((l) => l.inwardIssue.key), [CD_KEY]);
+    // No banner either: the ordering it explains was already the caller's.
+    assert.equal(cap.fields.description, undefined);
+  } finally {
+    cap.restore();
+  }
+});
+
+test("FR-5: a settled CD ticket, a closed gate, or no CD ticket → unfrozen", async () => {
+  const m = await loadWithMode("off");
+  const cases = [
+    ["CD already done", [gateIssue(), cdIssue(CD_KEY, { status: { name: "Done" } })]],
+    ["gate approved", [gateIssue({ status: { name: "Done" } }), cdIssue()]],
+    ["gate never presented", [gateIssue({ status: { name: "To Do" } }), cdIssue()]],
+    ["no gate at all", [cdIssue()]],
+    ["gate but no CD ticket", [gateIssue()]],
+    ["a human ticket that is not a merge gate", [
+      gateIssue({ summary: "Bug intake triage" }), cdIssue(),
+    ]],
+  ];
+  for (const [why, siblings] of cases) {
+    const cap = captureGateCreate({ siblings });
+    try {
+      const result = await m.handler({ tool_name: "Tickets___create_ticket", parameters: { ...AGENT_TICKET } });
+      assert.equal(result.status, "todo", why);
+      assert.equal(result.autowired, undefined, why);
+      assert.deepEqual(cap.links, [], why);
+    } finally {
+      cap.restore();
+    }
+  }
+});
+
+test("FR-5: the gate is recognized by LABEL as well as by title", async () => {
+  const m = await loadWithMode("off");
+  // sanitizeUserLabels maps ':' to '-', so the stamp can arrive either way.
+  for (const label of ["gate:merge-approval", "gate-merge-approval"]) {
+    const cap = captureGateCreate({
+      siblings: [gateIssue({ summary: "Approve the merge", labels: ["human-review", label] }), cdIssue()],
+    });
+    try {
+      const result = await m.handler({ tool_name: "Tickets___create_ticket", parameters: { ...AGENT_TICKET } });
+      assert.equal(result.autowired?.gateTicketId, GATE_KEY, label);
+    } finally {
+      cap.restore();
+    }
+  }
+});
+
+test("FR-5: the CD ticket is found by phase:ship AND by the roster fallback", async () => {
+  const m = await loadWithMode("off");
+  // No phase stamp: the agent: label's phase in the roster is what says "ship".
+  const rosterOnly = captureGateCreate({
+    siblings: [gateIssue(), cdIssue(CD_KEY, { labels: ["agent:agentcore_hub_release_manager"] })],
+  });
+  try {
+    const result = await m.handler({ tool_name: "Tickets___create_ticket", parameters: { ...AGENT_TICKET } });
+    assert.deepEqual(result.autowired?.blockedBy, [CD_KEY]);
+  } finally {
+    rosterOnly.restore();
+  }
+
+  // A non-ship agent sibling is not a CD ticket, so nothing freezes behind it.
+  const notCd = captureGateCreate({
+    siblings: [gateIssue(), cdIssue("TEAM-4690", { labels: ["agent:agentcore_hub_backend_dev"] })],
+  });
+  try {
+    const result = await m.handler({ tool_name: "Tickets___create_ticket", parameters: { ...AGENT_TICKET } });
+    assert.equal(result.autowired, undefined);
+  } finally {
+    notCd.restore();
+  }
+});
+
+test("FR-5: the NEWEST CD ticket wins when a re-run filed a second one", async () => {
+  const m = await loadWithMode("off");
+  const cap = captureGateCreate({
+    siblings: [
+      gateIssue(),
+      cdIssue("TEAM-4600", { created: "2026-09-10T09:00:00.000+0000" }),
+      cdIssue("TEAM-4710", { created: "2026-09-15T09:00:00.000+0000" }),
+    ],
+  });
+  try {
+    const result = await m.handler({ tool_name: "Tickets___create_ticket", parameters: { ...AGENT_TICKET } });
+    assert.deepEqual(result.autowired?.blockedBy, ["TEAM-4710"]);
+  } finally {
+    cap.restore();
+  }
+});
+
+test("FR-5 FAILS OPEN: a failed sibling scan creates the ticket UNFROZEN", async () => {
+  const m = await loadWithMode("off");
+  const cap = captureGateCreate({ siblings: [gateIssue(), cdIssue()], scanFails: true });
+  try {
+    const result = await m.handler({
+      tool_name: "Tickets___create_ticket",
+      parameters: { ...AGENT_TICKET, description: "Fix the abandon guard." },
+    });
+    // Created, unfrozen, unbannered: a ticket frozen behind a blocker we only
+    // guessed at would never run at all.
+    assert.equal(result.ticketId, "TEAM-4711", JSON.stringify(result));
+    assert.equal(result.status, "todo");
+    assert.equal(result.autowired, undefined);
+    assert.deepEqual(cap.links, []);
+    assert.deepEqual(blocksOf(cap), ["Fix the abandon guard."]);
+  } finally {
+    cap.restore();
+  }
+});
+
+test("FR-5: a ticket with no parent is never scanned", async () => {
+  const m = await loadWithMode("off");
+  const cap = captureGateCreate({ siblings: [gateIssue(), cdIssue()] });
+  try {
+    const result = await m.handler({
+      tool_name: "Tickets___create_ticket",
+      parameters: { summary: "Fix null check", assignee: "agentcore_hub_backend_dev" },
+    });
+    assert.equal(result.autowired, undefined);
+    assert.equal(cap.siblingScans.length, 0);
+  } finally {
+    cap.restore();
+  }
+});
+
+test("FR-5: a deduped retry is reconciled against the AUTOWIRED blockers", async () => {
+  // The defect this guards: reconcileBlockersAndStatus derives status from the list
+  // it is handed, so reconciling a duplicate against the RAW arg would transition an
+  // already-frozen ticket to Ready and undo the freeze on every retry.
+  const m = await loadWithMode("off");
+  const cap = captureGateCreate({ siblings: [gateIssue(), cdIssue()] });
+  const originalFetch = globalThis.fetch;
+  const dup = issue("TEAM-4705", {
+    summary: AGENT_TICKET.summary,
+    labels: ["agent:agentcore_hub_backend_dev", "wf:run1"],
+  });
+  globalThis.fetch = async (url, options = {}) => {
+    const u = String(url);
+    if (u.includes("/rest/api/3/search/jql") && !jqlOf(u).startsWith("parent = ")) {
+      return new Response(JSON.stringify({ issues: [dup] }), { status: 200 });
+    }
+    return originalFetch(url, options);
+  };
+  try {
+    const result = await m.handler({
+      tool_name: "Tickets___create_ticket",
+      parameters: { ...AGENT_TICKET, workflow_id: "run1" },
+    });
+    assert.equal(result.deduplicated, true, JSON.stringify(result));
+    assert.equal(cap.posts.length, 0, "a dedupe must not create a second issue");
+    // The freeze is applied to the EXISTING ticket instead.
+    assert.deepEqual(cap.links, [{
+      type: { name: "Blocks" },
+      inwardIssue: { key: CD_KEY },
+      outwardIssue: { key: "TEAM-4705" },
+    }]);
+    assert.deepEqual(cap.transitionIds, ["31"]);
+  } finally {
+    cap.restore();
+  }
+});

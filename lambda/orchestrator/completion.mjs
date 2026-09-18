@@ -453,12 +453,14 @@ export function shipVerdictOf(entry) {
   // commitSha is NOT consulted (see the F1 note above) — it is the unmerged
   // branch HEAD and is present on every completion record.
   const merged = typeof entry.mergeCommit === "string" && entry.mergeCommit.trim().length > 0;
-  // TEAM-4739: `empty_sweep` is "there was nothing to merge", and that is a
-  // SHIPPED run, not a blocked one. It is deliberately NOT in
-  // SHIP_BLOCKED_OUTCOMES: an honest empty sweep has nothing left to do, so
-  // closing it "static-ci-only" would file it under unfinished work forever and
-  // page a human about a run that succeeded. The alternative the sweeper used
-  // before this existed was worse - close dishonestly, or wedge.
+  // TEAM-4739 / TEAM-4740 FR-10: `empty_sweep` is "there was nothing to merge",
+  // and that is a SHIPPED run, not a blocked one. A sweep that found nothing to
+  // remove has provably nothing to merge, so "shipped" is the HONEST verdict for
+  // it, not a missing one. It is deliberately NOT in SHIP_BLOCKED_OUTCOMES: an
+  // honest empty sweep has nothing left to do, so closing it "static-ci-only"
+  // would file it under unfinished work forever and page a human about a run
+  // that succeeded. The alternative the sweeper used before this existed was
+  // worse - close dishonestly, or wedge.
   if (merged || outcome === "shipped" || outcome === "empty_sweep") return "shipped";
   return null;
 }
@@ -533,4 +535,36 @@ export function evaluateShipVerdict(children, agentTasks, shipPhases, opts = {})
     return { required: true, shipped: true, outcome: null, blockReason: null, offenders: [] };
   }
   return { required: true, shipped: false, outcome: blocked || "static-ci-only", blockReason, offenders };
+}
+
+/**
+ * TEAM-4740 FR-13 — the markers the follow-up materializer mints. The label
+ * filters; the title suffix is the only one a re-entrant scan can read back
+ * (list_tickets returns `summary`, not `labels`). Both exported so workflow-output
+ * and the parity test share these source strings.
+ */
+export const FOLLOWUP_LABEL_RE = /^followup-[0-9a-f]{8}$/;
+export const FOLLOWUP_TITLE_RE = /\[fu:([0-9a-f]{8})\]\s*$/;
+
+/**
+ * TEAM-4740 FR-13/FR-14 — pure roll-up for the orchestrator's ONE setDelivery
+ * write. Returns `{}` (never undefined) so it is spread-safe, and adds no key it
+ * cannot derive: "complete-with-handoff" needs every STILL-OPEN follow-up to be
+ * human-owned (an open AGENT follow-up is a fix ticket, so rule (iii) holds the run
+ * open and there is nothing to describe yet), and `prState` is DERIVED, never
+ * polled — a merge commit or an explicit "shipped" proves the work landed, a pr url
+ * alone proves only that a PR exists. "complete:handoff:static-only" is NOT
+ * derivable here: `delivery.mode` never reaches this call, and a static-ci-only
+ * ship closes the run on that terminal PHASE instead of completing it.
+ */
+export function deliveryRollUp(tickets, agentTasks) {
+  const isFollowUp = (t) =>
+    (Array.isArray(t?.labels) && t.labels.some((l) => FOLLOWUP_LABEL_RE.test(String(l)))) ||
+    FOLLOWUP_TITLE_RE.test(String(t?.title || ""));
+  const open = (Array.isArray(tickets) ? tickets : []).filter((t) => isFollowUp(t) && isOpen(t));
+  const tasks = Object.values(agentTasks && typeof agentTasks === "object" ? agentTasks : {});
+  const prState = tasks.some((e) => shipVerdictOf(e) === "shipped") ? "merged"
+    : tasks.some((e) => typeof e?.prUrl === "string" && e.prUrl.trim().length > 0) ? "open" : null;
+  const handoff = open.length > 0 && open.every((t) => isHuman(t.assignee));
+  return { ...(handoff ? { outcome: "complete-with-handoff" } : {}), ...(prState ? { prState } : {}) };
 }

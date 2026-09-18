@@ -240,6 +240,30 @@ export default defineConfig({
       // persona's roster phase) advances intake → development → ship, a junk stamp
       // is ignored, and the human gate is published without an agentTasks entry.
       "lambda/orchestrator/replay-intake-materialize.test.mjs",
+      // replay-head-of-line (TEAM-4740 FR-4) — run p5ogpg, where start_deploy
+      // started a second execution behind an OLDER run parked on the human deploy
+      // gate and wrote a ship-approval record for a deploy that never ran.
+      // Replayed through the REAL pipeline-tools handler: the call is refused, the
+      // blocker is returned in full, and neither the Start nor the PutObject
+      // happens. Plus the TEAM-4663 create_ticket payload shape (base_branch:
+      // "main") as a pure fixture — the twins own their own validation tests.
+      "lambda/orchestrator/replay-head-of-line.test.mjs",
+      // replay-empty-sweep (TEAM-4740 FR-10/FR-11) — run fz514x, the dead-code sweep
+      // that found nothing: no diff, no PR, and four downstream tickets waiting for a
+      // diff that would never exist. Drives the REAL workflow-output handler for both
+      // halves (submit_ticket_plan's root-blocker autowire, report_completion's skip
+      // walk) against a ticket stub that enforces the DynamoDB twin's real skip-only-
+      // from-blocked constraint, plus the REAL completion.mjs verdict.
+      "lambda/orchestrator/replay-empty-sweep.test.mjs",
+      // replay-followups (TEAM-4740 FR-13/FR-5) — four real runs whose delivery
+      // work went missing: a fix created while the Merge Approval gate was open
+      // (TEAM-4660), a post-deploy re-check that lived only in prose (15x8ql), and
+      // three console/IAM steps a human had to do (syq0p9). Replayed through the
+      // REAL workflow-output handler as the producer and the REAL completion.mjs
+      // gate as the reader, so it pins the property no unit test can: the ticket a
+      // report mints is one the completion gate recognizes and holds the run open
+      // for. REGRESSION hirhfw: a report with no follow-ups is byte-unchanged.
+      "lambda/orchestrator/replay-followups.test.mjs",
       // workflow-output report_completion (TEAM-4121 FR-9) — the completion record
       // is what live-reverify.mjs reads to decide whether a "live" fix actually
       // produced live evidence, so the two new fields must be additive (a record
