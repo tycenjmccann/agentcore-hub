@@ -51,6 +51,23 @@ const GUARD_DETAIL =
 // A real 409 that is NOT the guard: an answer, not a race.
 const NO_TRANSITION_DETAIL = `No transition to "Done" found for ${GATE}`;
 
+// ─── TEAM-4753 N1: the two shapes a done→done comes back as ──────────────────
+// dynamodb mode — the hub route's OWN pre-check answers first, with a 400 whose
+// reason is in `error` (route.ts VALID_TRANSITIONS.done = ["todo"]).
+const ROUTE_DONE_DONE = { status: 400, error: "Invalid transition from done to done" };
+// the DDB twin's own refusal, forwarded by the route as a 409 `details`.
+const TWIN_DONE_DONE = {
+  status: 409,
+  details: `Invalid transition "done" from status "done". Available: todo (→ todo)`,
+};
+// …and the near misses that must stay failures: a real invalid transition FROM a
+// live status, and Jira's refusal, which says nothing about the current status.
+const OTHER_INVALID_409 = {
+  status: 409,
+  details: `Invalid transition "done" from status "in_progress". Available: done (→ done), blocked (→ blocked)`,
+};
+const OTHER_INVALID_400 = { status: 400, error: "Invalid transition from in_review to done" };
+
 // ─── AWS seams ───────────────────────────────────────────────────────────────
 
 const log = vi.hoisted(() => ({ entries: [] }));
@@ -158,6 +175,10 @@ function makeNet(ctx, overrides = {}) {
   const net = {
     ctx, polls: 0, batches: [], afterPoll: [], workflows: [], tickets: null,
     // A scripted queue of transition responses; anything past the end is a 200.
+    // A string entry is the hub's 409 refusal body with that `details` (the
+    // common case); `{status, details}` scripts any other failure shape — the
+    // route's OWN pre-check answers a dynamodb-mode done→done with a 400 whose
+    // reason is in `error`, not `details` (TEAM-4753).
     transitionResponses: [],
     sent: [], answered: [], edited: [], transitions: [], comments: [], ...overrides,
   };
@@ -170,7 +191,16 @@ function makeNet(ctx, overrides = {}) {
       net.transitions.push(body);
       log.entries.push({ kind: "transition", ticketId: body?.ticketId, targetStatus: body?.targetStatus });
       const scripted = net.transitionResponses.shift();
-      if (scripted) return refusal409(scripted);
+      if (typeof scripted === "string") return refusal409(scripted);
+      if (scripted) {
+        // `details` is the twin's reason forwarded by the route; `error` alone is
+        // the route's own pre-check verdict. JSON.stringify drops the undefined
+        // one, so each shape is byte-faithful to what the hub really sends.
+        return jsonRes(
+          { error: scripted.error ?? "Ticket transition rejected", details: scripted.details,
+            ticketId: GATE, targetStatus: body?.targetStatus },
+          false, scripted.status);
+      }
       const row = (net.tickets || []).find((t) => t?.ticketId === body?.ticketId);
       if (row && body?.targetStatus) row.status = body.targetStatus;
       return jsonRes({ success: true });
@@ -281,8 +311,17 @@ const tap = (updateId, action, extra = {}) => ({
     },
   },
 });
+/** Any other callback button on the same ping (the escalation-DECISION and rework-retry taps). */
+const cbTap = (updateId, data, text = "*🚀 PRODUCTION DEPLOY — approval needed*") => ({
+  update_id: updateId,
+  callback_query: {
+    id: `cb-${updateId}`, data,
+    message: { message_id: 11, chat: { id: CHAT }, text, reply_markup: KEYBOARD },
+  },
+});
 const kinds = () => log.entries.map((e) => e.kind);
 const failedToProcess = (net) => net.sent.filter((s) => /Failed to process/.test(String(s?.text || "")));
+const stuckEdits = (net) => net.edited.filter((e) => /could not be marked done yet/.test(String(e.text)));
 
 async function runTap(mod, action, { tickets = [gateRow()], transitionResponses = [], updateId = 1 } = {}) {
   const net = makeNet(makeCtx(), { tickets, transitionResponses, batches: [[tap(updateId, action)]] });
@@ -445,5 +484,185 @@ describe("a plain gate's ✅ is behaviourally unchanged (C1 scope)", () => {
     expect(net.edited).toHaveLength(1);
     expect(net.edited[0].text).toMatch(/✅ Approved — pipeline resuming/);
     expect(failedToProcess(net)).toEqual([]);
+  });
+});
+
+/**
+ * TEAM-4753 N1 — the re-tap C1's stuck-gate message asks for has to be able to
+ * SUCCEED. It could not: the ✅ path had no idea a gate was already `done`, so it
+ * re-ran both halves and read the resulting done→done refusal as a fresh failure.
+ * Every re-tap repeated "could not be marked done yet — tap ✅ again", forever.
+ *
+ * Two guards, and the second is what makes it one rule rather than one patch:
+ *
+ *  (a) the `gok` pre-read already carries `status` (gateTicketOf returns the whole
+ *      row), so an already-done gate short-circuits to the ✅ artefact — zero
+ *      PutApprovalResult, zero transition POST, zero ledger row.
+ *  (b) `transitionGate` — the ONE low-level helper every caller goes through —
+ *      treats a done→done refusal as a landed close, so handleDecisionCallback
+ *      gets it too, while deliverReworkNote's done→blocked keeps failing.
+ *
+ * The regex is the risk, so the negatives are half the block: the bridge talks to
+ * the HUB ROUTE, whose answer for this input differs by provider (a 400 from its
+ * own pre-check in dynamodb mode, a 409 carrying the twin's text otherwise), and
+ * Jira's refusal names no status at all and must stay a failure.
+ */
+describe("a `done` that already landed is a success, not a stuck gate (N1)", () => {
+  it("transition landed but response lost ⇒ the re-tap yields the ✅ edit, 0 extra PutApprovalResult, 0 stuck message", async () => {
+    const mod = await loadModule();
+    cp.states.set(PIPELINE, pendingState());
+    const tickets = [gateRow()];
+
+    // ── tap 1: the close COMMITS and the response never comes back ──
+    const net = makeNet(makeCtx(), { tickets, batches: [[tap(1, "gok")]] });
+    const inner = net.fetch;
+    net.fetch = async (url, opts) => {
+      if (String(url).endsWith("/tickets/transition")) {
+        const body = JSON.parse(opts.body);
+        net.transitions.push(body);
+        log.entries.push({ kind: "transition", ticketId: body.ticketId, targetStatus: body.targetStatus });
+        // The twin committed…
+        tickets.find((t) => t.ticketId === body.ticketId).status = body.targetStatus;
+        // …and then the socket died on the way back.
+        throw new Error("socket hang up");
+      }
+      return inner(url, opts);
+    };
+    global.fetch = net.fetch;
+    await mod.handler({}, net.ctx);
+
+    // Tap 1's surface is unchanged and honest: it cannot know the write landed.
+    expect(cp.approvals).toHaveLength(1);
+    expect(net.transitions).toHaveLength(1);
+    expect(stuckEdits(net)).toHaveLength(1);
+    expect(tickets[0].status, "the ticket IS done — only the answer was lost").toBe("done");
+
+    // ── tap 2: the human does what the message told them to ──
+    cp.states.set(PIPELINE, approvedState());
+    const again = await runTap(mod, "gok", { tickets, updateId: 2 });
+
+    expect(cp.approvals, "the pipeline must not be approved twice").toHaveLength(1);
+    expect(again.transitions, "nothing left to close — the pre-read said so").toEqual([]);
+    expect(again.edited).toHaveLength(1);
+    expect(again.edited[0].text).toMatch(/✅ Approved — pipeline resuming/);
+    expect(stuckEdits(again), "the lie is what N1 is about").toEqual([]);
+    expect(failedToProcess(again)).toEqual([]);
+  });
+
+  it("(i) a pre-read that says `done` costs 0 PutApprovalResult, 0 transition POST and 0 ledger rows", async () => {
+    const mod = await loadModule();
+    // A token IS waiting, so the short-circuit is driven by the TICKET, not by an
+    // empty pipeline: re-approving here would be a real second production write.
+    cp.states.set(PIPELINE, pendingState());
+
+    const net = await runTap(mod, "gok", { tickets: [gateRow({ status: "done" })] });
+
+    expect(cp.approvals).toEqual([]);
+    expect(net.transitions).toEqual([]);
+    expect(kinds(), "no pipeline call, no close, no decision ledger row").toEqual([]);
+    expect(net.edited).toHaveLength(1);
+    expect(net.edited[0].text).toMatch(/✅ Approved — pipeline resuming/);
+    expect(net.answered.filter((a) => new RegExp(`Approved ${GATE}`).test(String(a.text)))).toHaveLength(1);
+    expect(stuckEdits(net)).toEqual([]);
+    expect(failedToProcess(net)).toEqual([]);
+  });
+
+  it("(i) …and the same holds for a plain (non-deploy) gate that is already done", async () => {
+    const mod = await loadModule();
+
+    const net = await runTap(mod, "gok", { tickets: [plainGateRow({ status: "done" })] });
+
+    expect(cp.approvals).toEqual([]);
+    expect(net.transitions).toEqual([]);
+    expect(net.edited).toHaveLength(1);
+    expect(net.edited[0].text).toMatch(/✅ Approved — pipeline resuming/);
+    expect(failedToProcess(net)).toEqual([]);
+  });
+
+  // The residual race the pre-read cannot see: it read `in review`, and the close
+  // still came back done→done (a concurrent tap, or a retry of a lost response
+  // inside one invocation).
+  for (const [name, scripted] of [
+    ["the hub route's own 400 (dynamodb mode)", ROUTE_DONE_DONE],
+    ["the twin's 409 details", TWIN_DONE_DONE],
+  ]) {
+    it(`(ii) ${name} is a landed close: one POST, the ✅ edit, no stuck message`, async () => {
+      const mod = await loadModule();
+      cp.states.set(PIPELINE, pendingState());
+
+      const net = await runTap(mod, "gok", { transitionResponses: [scripted] });
+
+      expect(cp.approvals).toHaveLength(1);
+      expect(net.transitions, "an answer about the ticket's state is not a lagging read").toHaveLength(1);
+      expect(kinds()).toEqual(["ledger", "approval", "transition"]);
+      expect(net.edited).toHaveLength(1);
+      expect(net.edited[0].text).toMatch(/✅ Approved — pipeline resuming/);
+      expect(stuckEdits(net)).toEqual([]);
+      expect(failedToProcess(net)).toEqual([]);
+    });
+  }
+
+  // The regex must name done→done and nothing else. `(c)` above pins the short
+  // form of Jira's refusal; this pins the real one, alongside two invalid
+  // transitions FROM a live status — none of which prove the ticket is closed.
+  for (const [name, scripted] of [
+    ["a 409 from a non-done status", OTHER_INVALID_409],
+    ["a 400 from a non-done status", OTHER_INVALID_400],
+    ["Jira's `No transition to \"Done\" found`", {
+      status: 409,
+      details: `No transition to "Done" found. Available: Start work (-> In Progress), Block (-> Blocked)`,
+    }],
+  ]) {
+    it(`(iii) ${name} is still a failure`, async () => {
+      const mod = await loadModule();
+      cp.states.set(PIPELINE, pendingState());
+      const tickets = [gateRow()];
+
+      const net = await runTap(mod, "gok", { tickets, transitionResponses: [scripted] });
+
+      expect(cp.approvals).toHaveLength(1);
+      expect(net.transitions).toHaveLength(1);
+      expect(tickets[0].status, "the close did not land").toBe("in review");
+      expect(stuckEdits(net), "an unproven close must still page the human").toHaveLength(1);
+      expect(net.edited.at(-1).reply_markup, "the re-tap is the recovery").toEqual(KEYBOARD);
+      expect(net.edited.some((e) => /✅ Approved — pipeline resuming/.test(String(e.text)))).toBe(false);
+    });
+  }
+
+  it("(iv) a rework note's done→blocked refusal is untouched — it still parks the note", async () => {
+    const mod = await loadModule();
+    const REJ = `rej#${CHAT}`;
+    db.items.set(REJ, {
+      id: { S: REJ }, ticketId: { S: GATE }, workflowId: { S: WF },
+      note: { S: "the saved note" }, ttl: { N: String(Math.floor(Date.now() / 1000) + 3600) },
+    });
+    const net = makeNet(makeCtx(), {
+      batches: [[cbTap(3, `rjr|${GATE}|${WF}`, "⚠️ Couldn't send…")]],
+      // Same phrasing shape, different target — `blocked` is never idempotent here.
+      transitionResponses: [{ status: 400, error: "Invalid transition from done to blocked" }],
+    });
+    global.fetch = net.fetch;
+    await mod.handler({}, net.ctx);
+
+    expect(net.transitions).toEqual([expect.objectContaining({ targetStatus: "blocked" })]);
+    expect(db.items.get(REJ)?.note?.S, "swallowing this would lose the reviewer's note").toBe("the saved note");
+    expect(net.edited.at(-1).text).toMatch(/Retry failed/);
+  });
+
+  it("(v) an escalation DECISION on an already-done gate no longer says \"Failed to process\"", async () => {
+    const mod = await loadModule();
+    const net = makeNet(makeCtx(), {
+      batches: [[cbTap(4, `gdc|m|${GATE}|${WF}`)]],
+      transitionResponses: [ROUTE_DONE_DONE],
+    });
+    global.fetch = net.fetch;
+    await mod.handler({}, net.ctx);
+
+    // The rule lives in transitionGate, so this caller gets it with no code of
+    // its own — which is the whole reason it is there and not in the gok branch.
+    expect(net.transitions).toHaveLength(1);
+    expect(failedToProcess(net)).toEqual([]);
+    expect(net.edited.at(-1).text).toMatch(/DECISION: merge-with-known-findings recorded on TEAM-9101/);
+    expect(net.answered.at(-1).text).toMatch(/Recorded DECISION: merge-with-known-findings/);
   });
 });

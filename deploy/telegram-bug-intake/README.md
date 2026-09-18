@@ -244,6 +244,25 @@ scan: when the out-of-hours reminder fires for a labelled gate it wins (it alrea
 carries this copy) and the consumer pages on a later scan if the gate is still
 parked.
 
+### A ✅ on a gate that is already done (TEAM-4753)
+
+The re-tap the stuck-gate message above asks for has to be able to *succeed*, so
+`done` is idempotent on the ✅ path in two places. The `gok` pre-read
+(`gateTicketOf` already returns `status`) short-circuits an already-`done` gate
+straight to the ✅ edit — no `PutApprovalResult`, no transition POST, because WP2's
+typed-gate guard means a `done` gate ticket already proves the pipeline's approval
+was verified. And `transitionGate` itself treats a `done`→`done` refusal as a
+landed close, whichever layer answers it: the hub route's own **400** `Invalid
+transition from done to done` (dynamodb mode, `VALID_TRANSITIONS.done = ["todo"]`)
+or the twin's **409** `Invalid transition "done" from status "done"`. Because the
+rule lives in that one low-level helper, every `done` caller gets it — including
+the escalation-DECISION buttons, which used to answer this same input with
+`⚠️ Failed to process` — while `deliverReworkNote`'s `done`→`blocked` still throws
+into its own park-the-note / Retry / Drop surface. Jira's
+`No transition to "Done" found` is **not** treated as success: it is the same text
+a genuinely stuck, not-done ticket produces, so the pre-read is what covers that
+provider.
+
 ## Deploy
 
 The function has no dependencies to bundle — it imports only AWS SDK v3 clients,

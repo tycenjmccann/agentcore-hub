@@ -1621,6 +1621,15 @@ async function gateTicketOf(wf, notif) {
 }
 
 /**
+ * Is this ticket row already closed? Both gate branches ask it, and the two
+ * providers spell the status differently ("in review" vs "In Review", "Done"),
+ * so the lowercase compare is the only safe form.
+ */
+function isTicketDone(t) {
+  return String(t?.status || "").toLowerCase() === "done";
+}
+
+/**
  * `blockedBy` is an ARRAY in dynamodb mode and a comma-joined STRING in jira
  * mode (src/lib/workflow/jira-read.ts:145, despite JiraTicket.blockedBy being
  * typed string[]). Calling .map() on the string form threw a TypeError that the
@@ -2468,29 +2477,40 @@ async function handleGateCallback(cb, chatId, action, ticketId, workflowId) {
     // deploy gate while CodePipeline stayed parked — the exact 29h stall. Touch
     // nothing and let the human tap again.
     if (indeterminate) return await answerGateUnverifiable(cb, ticketId);
-    const deploy = await deployApprovalGate(approving);
-    // Only `failed` stops the ticket half: it already answered + edited the
-    // message, and the ticket stays put so the human can tap again once the
-    // cause is fixed. `alreadyResolved` means the pipeline is where the human
-    // wants it, so the ticket must still move (SEC-8).
-    const decided = deploy ? await decideDeployGate(cb, chatId, ticketId, deploy, true) : null;
-    if (decided === DEPLOY_GATE_FAILED) return;
-    let res;
-    if (decided) {
-      // TEAM-4751 C1: a pipeline decision LANDED (`decided` or `alreadyResolved`),
-      // so the ticket half is all that is left — and it must not be surfaced as a
-      // total failure. WP2's guard reads CodePipeline ONCE with no tolerance, so
-      // the close we fire immediately after our own PutApprovalResult can still
-      // see the Approval action InProgress and be refused. Retry that refusal;
-      // on a real one, say what is true rather than "⚠️ Failed to process".
-      const out = await transitionGateAfterDecision(
-        workflowId, ticketId, "done", `Approved via Telegram by chat ${chatId}`);
-      if (out.error) return await answerDeployGateTicketStuck(cb, chatId, ticketId, out.error);
-      res = out.res;
-    } else {
-      // A plain gate: no irreversible write preceded this tap, so a refusal is
-      // still allowed to throw to the update loop exactly as it always has.
-      res = await transitionGate(workflowId, ticketId, "done", `Approved via Telegram by chat ${chatId}`);
+    let res = null;
+    // TEAM-4753 N1: the pre-read above ALREADY says whether this gate is closed,
+    // and an already-`done` gate has no half left to run. WP2's typed-gate guard
+    // is what makes that conclusive: a `gate:deploy-approval` ticket cannot reach
+    // `done` unless the pipeline's own approval was verified. Firing either half
+    // anyway lies in both directions — decideDeployGate finds no waiting action
+    // and reports "Could not approve the deploy", and the close comes back
+    // done→done and reports "could not be marked done yet — tap ✅ again",
+    // forever, on every re-tap. Fall through to the same ✅ artefact the lost or
+    // earlier tap produced: no PutApprovalResult, no transition POST.
+    if (!isTicketDone(approving)) {
+      const deploy = await deployApprovalGate(approving);
+      // Only `failed` stops the ticket half: it already answered + edited the
+      // message, and the ticket stays put so the human can tap again once the
+      // cause is fixed. `alreadyResolved` means the pipeline is where the human
+      // wants it, so the ticket must still move (SEC-8).
+      const decided = deploy ? await decideDeployGate(cb, chatId, ticketId, deploy, true) : null;
+      if (decided === DEPLOY_GATE_FAILED) return;
+      if (decided) {
+        // TEAM-4751 C1: a pipeline decision LANDED (`decided` or `alreadyResolved`),
+        // so the ticket half is all that is left — and it must not be surfaced as a
+        // total failure. WP2's guard reads CodePipeline ONCE with no tolerance, so
+        // the close we fire immediately after our own PutApprovalResult can still
+        // see the Approval action InProgress and be refused. Retry that refusal;
+        // on a real one, say what is true rather than "⚠️ Failed to process".
+        const out = await transitionGateAfterDecision(
+          workflowId, ticketId, "done", `Approved via Telegram by chat ${chatId}`);
+        if (out.error) return await answerDeployGateTicketStuck(cb, chatId, ticketId, out.error);
+        res = out.res;
+      } else {
+        // A plain gate: no irreversible write preceded this tap, so a refusal is
+        // still allowed to throw to the update loop exactly as it always has.
+        res = await transitionGate(workflowId, ticketId, "done", `Approved via Telegram by chat ${chatId}`);
+      }
     }
     // A ❌ tapped by mistake before this ✅ left a marker that would turn the
     // chat's next message into a rework note for a gate that is now done.
@@ -2521,7 +2541,7 @@ async function handleGateCallback(cb, chatId, action, ticketId, workflowId) {
   // lost, it is retried by the same buttons.
   const { gateTicket, indeterminate: unreadable } = await gateTicketOf({ workflowId }, { ticketId });
   if (unreadable) return await answerGateUnverifiable(cb, ticketId);
-  if (String(gateTicket?.status || "").toLowerCase() === "done") {
+  if (isTicketDone(gateTicket)) {
     // No tgEdit: the ✅ edit already states the truth, and this branch's edit
     // text carries "Changes requested" — gateFromReply's routing vocabulary.
     await tgAnswer(cb.id, "Already approved — nothing to reject.");
@@ -2740,6 +2760,16 @@ async function transitionGate(workflowId, ticketId, targetStatus, comment) {
     // transition to \"Blocked\" found…") — that is what the human needs to see.
     let detail = raw;
     try { const j = JSON.parse(raw); detail = j.details || j.error || raw; } catch { /* not JSON */ }
+    // TEAM-4753 N1: the close we are asking for is already the ticket's state.
+    // That is not a failure of a ✅ — it IS the ✅ that already landed (a lost
+    // response, two taps racing, or the human tapping again). Every `done`
+    // caller gets this, which is the point: the same tap used to be reported as
+    // "could not be marked done yet" here and as "⚠️ Failed to process" from
+    // handleDecisionCallback.
+    if (targetStatus === "done" && isAlreadyDoneRefusal(res.status, detail)) {
+      console.log(`[telegram-bug-intake] ${ticketId} is already done — treating the close as landed: ${detail}`);
+      return { alreadyDone: true };
+    }
     const err = new Error(`transition ${res.status}: ${detail}`);
     err.status = res.status;
     err.detail = detail;
@@ -2764,6 +2794,39 @@ const GATE_GUARD_REFUSAL_RE = /condition is not met|gate_condition_unmet/i;
  */
 function isGateGuardRefusal(err) {
   return err?.status === 409 && GATE_GUARD_REFUSAL_RE.test(String(err?.detail ?? err?.message ?? ""));
+}
+
+// TEAM-4753 N1 — the two phrasings a done→done can come back as. The bridge
+// talks to the HUB ROUTE, not to the twins, so which layer answers first depends
+// on the provider:
+//
+//   dynamodb  the route's own pre-check answers, and it is a 400 with the reason
+//             in `error`: "Invalid transition from done to done"
+//             (src/app/api/workflow/[id]/tickets/transition/route.ts,
+//             VALID_TRANSITIONS.done = ["todo"]).
+//   the twin  409 with the reason in `details`: 'Invalid transition "done" from
+//             status "done". Available: …' (lambda/agentcore-hub-tickets
+//             transitionIssue) — reachable if the route ever stops pre-checking.
+//
+// The trailing "Available: …" list is deliberately not part of either match.
+// Jira's own refusal ('No transition to "Done" found. Available: …',
+// lambda/agentcore-hub-jira) is deliberately NOT here and stays a failure: it is
+// the SAME text a genuinely stuck, not-done ticket produces, so it proves
+// nothing about the current status. The gok branch's pre-read short-circuit is
+// what covers that provider — it fires before any POST.
+const ALREADY_DONE_RES = [
+  /Invalid transition\s+"?done"?\s+from status\s+"?done"?/i,
+  /Invalid transition from\s+"?done"?\s+to\s+"?done"?/i,
+];
+
+/**
+ * Is this refusal "the close you asked for is already the ticket's state"? The
+ * caller gates on `targetStatus === "done"` as well, so a rework note's
+ * done→blocked refusal (deliverReworkNote) can never be read as a success.
+ */
+function isAlreadyDoneRefusal(status, detail) {
+  return (status === 409 || status === 400) &&
+    ALREADY_DONE_RES.some((re) => re.test(String(detail ?? "")));
 }
 
 // 4 attempts ⇒ 3 sleeps at _deployGateRetryMs ≈ 30s, the same budget
