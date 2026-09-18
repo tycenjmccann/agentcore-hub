@@ -1714,14 +1714,20 @@ describe("create_ticket — open-gate autowire (FR-5)", () => {
     // Dark by default (the deploy env sets no EVENTS_TABLE): one write, the ticket.
     await create({ ...AGENT });
     expect(h.state.puts).toHaveLength(1);
+    expect(h.state.events).toHaveLength(0);
 
     process.env.EVENTS_TABLE = "agentcore-hub-events";
     h.state.puts.length = 0;
     await create({ ...AGENT, workflow_id: "wf_1757000000_si" });
     delete process.env.EVENTS_TABLE;
 
-    expect(h.state.puts).toHaveLength(2);
-    const event = h.state.puts[1];
+    // TEAM-4739's gate-loop event and TEAM-4740's autowire event both carry an
+    // `eventId`, so the mock routes any such Put into `h.state.events`, never
+    // `h.state.puts` — the ticket write and the audit write stay distinguishable
+    // by construction, not by array position.
+    expect(h.state.puts).toHaveLength(1);
+    expect(h.state.events).toHaveLength(1);
+    const event = h.state.events[0];
     expect(event.workflowId).toBe("wf_1757000000_si");
     expect(event.type).toBe("plan.autowired");
     expect(event.detail).toEqual({
