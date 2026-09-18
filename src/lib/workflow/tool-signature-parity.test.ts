@@ -65,6 +65,28 @@ function toolSource(name: string): string {
   return rest.slice(0, end === -1 ? undefined : end);
 }
 
+/** One method out of a Python CLASS. `toolSource` above slices to the next
+ *  TOP-LEVEL `def`, which over-runs an indented method — on `_reports_done` it
+ *  would swallow every later method of `_CompletionGate`, so a literal belonging
+ *  to some other method could satisfy an assertion about this one. This stops at
+ *  the next `def`/decorator/`class` at four spaces or less instead. */
+function pyMethodSource(name: string): string {
+  const start = mainPy.indexOf(`def ${name}(`);
+  expect(start, `${name} is not defined in main.py`).toBeGreaterThan(-1);
+  const rest = mainPy.slice(start + 1);
+  const end = rest.search(/\n {0,4}(?:@|def |class )/);
+  return rest.slice(0, end === -1 ? undefined : end);
+}
+
+/** One top-level Python `class`, to the next top-level `class`/`def`/decorator. */
+function pyClassSource(name: string): string {
+  const start = mainPy.indexOf(`\nclass ${name}:`);
+  expect(start, `class ${name} is not defined in main.py`).toBeGreaterThan(-1);
+  const rest = mainPy.slice(start + 1);
+  const end = rest.search(/\n(?:@|def |class )/);
+  return rest.slice(0, end === -1 ? undefined : end);
+}
+
 /** The docstring — which IS the tool spec the model reads. */
 function toolDocstring(src: string): string {
   const open = src.indexOf('"""');
@@ -622,5 +644,157 @@ describe("tool-signature parity — the release manager's blueprint spells them 
     // argument without separating the two would make the RM conflate them, which
     // is worse than the gap it closes.
     expect(releaseManager).toMatch(/`abandon` \(the argument\) is NOT "abandon the wait"/);
+  });
+});
+
+describe("response-contract parity — report_completion's answer means the same on both sides", () => {
+  /**
+   * TEAM-4757 R3-3. Everything above is the ARGUMENT layer — what the harness
+   * sends. This is the RESPONSE layer: what the Lambda answers and what the
+   * harness concludes from it. `_CompletionGate._reports_done`
+   * (`deploy/runtime-agent/main.py`) decides whether a `report_completion` left
+   * the ticket DONE by reading two things out of the tool's JSON body — the
+   * success literal (`status != "complete"`) and the refusal shape
+   * (`payload.get("ok") is False`) — and both are hard-coded there, while the
+   * Lambda emits them from `lambda/workflow-output/index.mjs`. Each side pins its
+   * own copy locally (`tests/test_completion_gate.py`, `index.test.mjs`); until
+   * this block, nothing read BOTH.
+   *
+   * The consequence of a one-sided rename is not a dropped value, it is the
+   * inverse of the gate: `_reports_done` would return False on every real
+   * completion, so the gate never engages, the resume object is never deleted and
+   * the turn is never marked accounted for — an `agent.died` plus a re-dispatch
+   * for every finished ticket. The Lambda's own suite would stay green.
+   */
+
+  const reportCompletionLambdaSrc = lambdaFunctionSource(
+    workflowOutputLambda,
+    "reportCompletion",
+    "workflow-output",
+  );
+  const reportsDoneSrc = pyMethodSource("_reports_done");
+  const completionGateSrc = pyClassSource("_CompletionGate");
+
+  /** The literal the Lambda puts in the RESPONSE's `status` when the ticket did
+   *  reach Done. The `status:` colon is what distinguishes it from the RECORD
+   *  write (`report.status = mayTransition ? …`) a few lines earlier — same
+   *  ternary, but only the response is the contract `_reports_done` reads. */
+  const lambdaSuccessStatus = reportCompletionLambdaSrc.match(
+    /status:\s*transitionFailed\s*\?\s*STATUS_TRANSITION_FAILED\s*:\s*mayTransition\s*\?\s*"([^"]*)"\s*:\s*STATUS_PENDING_FOLLOW_UPS/,
+  )?.[1];
+
+  /** The literal `_reports_done` treats as "done". Collected as a list so the
+   *  vacuity guard can insist there is exactly ONE — two would mean the method
+   *  grew a second status test that this block is silently not comparing. */
+  const pyDoneStatuses = [...reportsDoneSrc.matchAll(/status\s*!=\s*"([^"]*)"/g)].map((m) => m[1]);
+
+  /** Every `STATUS_*` constant in the Lambda, i.e. the non-done statuses it can
+   *  answer with. File-wide on purpose: they are module constants, and a new one
+   *  is exactly the kind of addition the harness has to already understand. */
+  const statusConstants = [
+    ...workflowOutputLambda.matchAll(/^const (STATUS_[A-Z_]+)\s*=\s*"([^"]*)";/gm),
+  ].map((m) => ({ name: m[1], value: m[2] }));
+
+  /** workflow-output's TOOL-FACING refusals: an `ok:`-false line whose object
+   *  also carries `reason:` and `message:` within a few lines. That window is
+   *  what separates the eight refusals a persona can actually receive from the
+   *  file's many INTERNAL three-outcome values (`readCdLedger`, `ticketTool`,
+   *  `transitionToDone`, `loadSiblings`, `parseTicketsArg`, `skipSibling`) and
+   *  from the nested `transition: { ok: false, error }` sub-object, none of which
+   *  are what `_reports_done` reads. Matched loosely — `"ok": false` and `ok: 0`
+   *  are collected too — so the spelling assertion below can fail on them
+   *  instead of the enumeration quietly skipping them. */
+  const refusalLines = workflowOutputLambda.split("\n").reduce<string[]>((acc, line, i, lines) => {
+    if (!/\bok["']?\s*:\s*(?:false|0|"false"|'false')/.test(line)) return acc;
+    const window = lines.slice(i, i + 9).join("\n");
+    if (/\breason:/.test(window) && /\bmessage:/.test(window)) acc.push(line.trim());
+    return acc;
+  }, []);
+
+  it("found both sides — no assertion below can pass vacuously", () => {
+    // Same rule as the extractor self-checks at the top of this file: a
+    // source-text test that stopped matching reports green over the drift it
+    // exists to catch, and this block's drift is silent in production.
+    expect(reportCompletionLambdaSrc.length, "reportCompletion slice is empty").toBeGreaterThan(
+      2000,
+    );
+    expect(
+      reportCompletionLambdaSrc.includes("async function reportCompletion("),
+      "the reportCompletion slice does not start at reportCompletion",
+    ).toBe(true);
+    expect(reportsDoneSrc, "_reports_done slice is empty").toContain("payload");
+    expect(
+      completionGateSrc.includes("_reports_done") && completionGateSrc.includes("_succeeded"),
+      "the _CompletionGate slice is missing its two predicates",
+    ).toBe(true);
+
+    expect(
+      typeof lambdaSuccessStatus === "string" && lambdaSuccessStatus.length > 0,
+      "workflow-output's response emitter no longer matches `status: transitionFailed ? " +
+        "STATUS_TRANSITION_FAILED : mayTransition ? \"…\" : STATUS_PENDING_FOLLOW_UPS` — the " +
+        "extractor is stale, fix it here rather than deleting the assertion",
+    ).toBe(true);
+    expect(
+      pyDoneStatuses,
+      '_reports_done no longer has exactly one `status != "…"` test — re-read it',
+    ).toHaveLength(1);
+    expect(statusConstants.length, "no STATUS_* constants found in workflow-output").toBeGreaterThan(
+      1,
+    );
+    for (const c of statusConstants) {
+      expect(c.value.length, `${c.name} has an empty value`).toBeGreaterThan(0);
+    }
+  });
+
+  it("the success literal the harness accepts is the one the Lambda emits", () => {
+    // Written once, derived twice: the string "complete" appears nowhere in this
+    // test, so a rename on EITHER side fails here instead of one side being
+    // updated together with its own suite.
+    expect(
+      pyDoneStatuses[0],
+      `main.py _reports_done treats "${pyDoneStatuses[0]}" as done, but workflow-output's ` +
+        `report_completion answers "${lambdaSuccessStatus}" on a ticket that reached Done — the ` +
+        "gate would refuse to engage on every real completion (agent.died + re-dispatch)",
+    ).toBe(lambdaSuccessStatus);
+  });
+
+  it("the refusal shape the harness tests for is the one the Lambda emits", () => {
+    expect(
+      refusalLines.length,
+      "no tool-facing `ok: false` refusals found in workflow-output — either they were all " +
+        "removed or the reason:/message: window no longer matches",
+    ).toBeGreaterThanOrEqual(6);
+
+    for (const line of refusalLines) {
+      // `_reports_done` reads `payload.get("ok") is False`: an identity test
+      // against the Python singleton. `ok: 0` or a stringified "false" would be
+      // JSON-truthy-false and still not disengage the gate.
+      expect(
+        line,
+        `workflow-output emits a refusal as \`${line}\` — main.py reads ` +
+          '`payload.get("ok") is False`, so the key must be a bare `ok` and the value the ' +
+          "boolean `false`",
+      ).toMatch(/\bok:\s*false\b/);
+    }
+
+    expect(
+      reportsDoneSrc,
+      '_reports_done no longer tests `payload.get("ok") is False`, so every refusal above would ' +
+        "read as a successful completion and engage the gate",
+    ).toMatch(/payload\.get\(\s*"ok"\s*\)\s+is\s+False/);
+  });
+
+  it("every non-done status the Lambda can answer with is accounted for in the gate", () => {
+    // `_reports_done`'s test is `status != "complete"`, so a new STATUS_* is
+    // handled correctly the moment it is added — the risk is not behavioural, it
+    // is that the gate's own documentation stops listing what it is rejecting and
+    // the next reader "narrows" the test to the statuses named there.
+    for (const c of statusConstants) {
+      expect(
+        completionGateSrc,
+        `workflow-output can answer ${c.name} ("${c.value}") but _CompletionGate never names it — ` +
+          "add it to the class/_reports_done docstring so the enumeration stays honest",
+      ).toContain(c.value);
+    }
   });
 });
