@@ -654,7 +654,10 @@ rather than the target repo's code, the fix ticket you file for it opens its PR
 against the hub's own default branch directly: pass `base_branch="main"` on
 `Tickets___create_ticket` — never this run's shared integration branch. An infra
 fix is unrelated to this run's feature and must not ride this run's PR into the
-target repo.
+target repo. On every OTHER ticket you file, leave `base_branch` out entirely: a
+blank value means "no branch was stated", and the run's own integration branch is
+the default. Passing it by habit is how an ordinary phase fix gets retargeted at
+`main` and stops riding the run's PR.
 
 Both kinds share: assignee = the SAME `human:<who>` string as this run's Merge
 Approval gate ticket (read it off that ticket — never invent or guess one),
@@ -820,6 +823,21 @@ triggered yet) is the FIRST thing you do on EVERY invocation of the CD ticket.
        execution can never resolve (`Superseded` with no further successor, or a
        terminal-failed/`Stopped` execution with nothing behind it) — never on
        your own timeout guess.
+     - **`abandon` (the argument) is NOT "abandon the wait".** Passing
+       `abandon="true"` on a *retry* of `start_deploy` asks the tool to **discard
+       the older execution parked on the gate**, which is a different act from
+       giving up waiting and filing a `gate:blocker` ticket. It is honoured only
+       when the tool can prove all three for itself: GitHub confirms the blocking
+       execution's commit is **already contained** in what you are deploying (the
+       compare says `ahead`), a fresh read still shows the gate held by **that
+       same** execution, and the stop is confirmed `Stopped`. A refusal
+       (`ancestry_unproven` / `gate_no_longer_occupied` / `abandon_not_permitted`
+       / `abandon_unconfirmed`) starts nothing and records nothing — treat it as
+       "keep waiting", never as a reason to start a second execution. Never pass
+       it on the first call, and never to skip a wait you merely find slow. On
+       success the reply carries `abandoned` with `remedy: "abandon"` and the
+       `aheadBy` count: state both in your run summary, because you ended
+       someone else's execution.
      - **Never start a second execution behind a held gate.** Calling
        `start_deploy` again while the blocker is still in force is exactly the
        double-deploy this check exists to prevent; a ledger you have not yet

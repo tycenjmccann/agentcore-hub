@@ -1809,7 +1809,7 @@ def S3Storage___list_objects(prefix: str = "", bucket: str = "") -> str:
 # ─── Ticket Tools ────────────────────────────────────────────────────────────
 
 @tool
-def Tickets___create_ticket(title: str, description: str, parent_id: str = "", assignee: str = "", ticket_type: str = "task", blocked_by: str = "", workflow_id: str = "", phase: str = "", spawned_by_kind: str = "", spawned_by_origin_id: str = "", invariant: str = "", evidence_source: str = "", evidence_repro: str = "", cited_location: str = "", sibling_scope: str = "", labels: str = "") -> str:
+def Tickets___create_ticket(title: str, description: str, parent_id: str = "", assignee: str = "", ticket_type: str = "task", blocked_by: str = "", workflow_id: str = "", phase: str = "", spawned_by_kind: str = "", spawned_by_origin_id: str = "", invariant: str = "", evidence_source: str = "", evidence_repro: str = "", cited_location: str = "", sibling_scope: str = "", labels: str = "", base_branch: str = "") -> str:
     """Create a new ticket in the project tracker.
 
     MANDATORY TICKETS (create these for EVERY workflow, no exceptions):
@@ -1864,6 +1864,12 @@ def Tickets___create_ticket(title: str, description: str, parent_id: str = "", a
         sibling_scope: other tickets/components this fix must NOT touch (or "none").
         labels: comma-separated free labels (e.g. "advisory"). System prefixes (fix:, origin:,
             phase:, …) are dropped.
+        base_branch: ONLY for a hub-infra fix ticket you file as the release manager after
+            a failed ship — a defect in the HUB's own infra (a Pipeline___* tool, a Lambda
+            env var, an IAM policy, the pipeline stack) rather than the target repo's code.
+            Pass "main" so the fix opens its PR against the hub's default branch instead of
+            riding this run's PR. Leave "" on every other ticket: absent means "no branch
+            was stated", and the run's own integration branch is the default.
     """
     blockers = [b.strip() for b in blocked_by.split(",") if b.strip()] if blocked_by else []
     # Auto-inject workflow_id from invocation context if agent didn't pass one —
@@ -1917,6 +1923,13 @@ def Tickets___create_ticket(title: str, description: str, parent_id: str = "", a
     free_labels = [l.strip() for l in labels.split(",") if l.strip()]
     if free_labels:
         payload["labels"] = free_labels
+    # TEAM-4749 A1a: additive on the labels/fix_contract rule — forwarded only when
+    # non-blank, so every pre-4749 payload stays byte-identical. Both ticket twins
+    # already read and validate this key (tickets index.mjs createTicket, jira
+    # index.mjs createIssue); the blueprint told the release manager to pass it long
+    # before the signature could accept it.
+    if base_branch.strip():
+        payload["base_branch"] = base_branch.strip()
     return _invoke_lambda(TICKET_TOOLS_LAMBDA, "Tickets___create_ticket", payload)
 
 
@@ -2080,7 +2093,7 @@ def Pipeline___get_state(pipeline_name: str = "", execution_id: str = "") -> str
 
 
 @tool
-def Pipeline___start_deploy(pipeline_name: str = "", commit_sha: str = "", approved_head_sha: str = "", ci_build_id: str = "", pr_url: str = "", workflow_id: str = "", ticket_id: str = "") -> str:
+def Pipeline___start_deploy(pipeline_name: str = "", commit_sha: str = "", approved_head_sha: str = "", ci_build_id: str = "", pr_url: str = "", workflow_id: str = "", ticket_id: str = "", abandon: str = "") -> str:
     """Trigger a deploy pipeline execution. Call this AFTER merging the PR (the
     GitHub push auto-trigger is not wired) and again after a build-failure fix has
     landed on the default branch, to re-run. Returns the pipelineExecutionId.
@@ -2132,6 +2145,18 @@ def Pipeline___start_deploy(pipeline_name: str = "", commit_sha: str = "", appro
             refused (reason pr_url_missing) and the human gate fires.
         workflow_id: The workflow this deploy belongs to — audit context.
         ticket_id: Your CD/ship ticket ID — audit context.
+        abandon: "true" to discard the execution parked in front of you. EXPLICIT
+            OPT-IN ONLY, and only after start_deploy already refused with
+            reason: "approval_stage_occupied" and remedy: "abandon" — never on a
+            first call, never on a guess. Default ("") stops nothing. Asking is
+            not getting: the Lambda honours it only when GitHub PROVES the
+            blocking execution's commit is already contained in what you are
+            deploying, the gate is still that same execution's on a fresh read,
+            and the stop is confirmed Stopped. Otherwise it refuses with
+            ancestry_unproven, gate_no_longer_occupied, abandon_not_permitted or
+            abandon_unconfirmed, and NOTHING is started and NO ship-approval
+            record is written. This is not an approval capability: no tool here
+            can approve a deploy gate for you or for anyone else.
     """
     args = {}
     if pipeline_name:
@@ -2151,6 +2176,13 @@ def Pipeline___start_deploy(pipeline_name: str = "", commit_sha: str = "", appro
         args["workflow_id"] = workflow_id.strip()
     if ticket_id.strip():
         args["ticket_id"] = ticket_id.strip()
+    # TEAM-4749 A1b: explicit opt-in. The Lambda accepts only `true` / "true"
+    # (pipeline-tools index.mjs startDeploy) — it does NOT test JS truthiness — so
+    # the tokens an agent plausibly types are normalized here and anything else is
+    # OMITTED. An absent key is "stop nothing", which is the safe default and
+    # byte-identical to every pre-4749 call.
+    if abandon.strip().lower() in ("true", "1", "yes"):
+        args["abandon"] = True
     return _invoke_lambda(PIPELINE_TOOLS_LAMBDA, "Pipeline___start_deploy", args)
 
 
