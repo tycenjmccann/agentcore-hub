@@ -5,17 +5,20 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
  *
  * `refuseGateLoop` closes the ENVIRONMENTAL LOOP: an agent that cannot make CI run
  * files "CI is unavailable" again, and again, and again, each time believing it is
- * reporting news. The third one under the same epic, against the same target, is not
- * new work — it is the same fact restated, and the run needs a human, not another
- * ticket. `validateGateTicketShape` closes the other half: a `gate:deploy-approval`
- * ticket nobody can act on (no execution bound, no pipeline, no console link) pages a
- * human who then has nothing to click.
+ * reporting news. The SECOND one under the same epic, against the same target, is not
+ * new work (FR-2) — it is the same fact restated, and the run needs a human, not
+ * another ticket. `validateGateTicketShape` closes the other half: a
+ * `gate:deploy-approval` ticket nobody can act on (no execution bound, no pipeline, no
+ * console link) pages a human who then has nothing to click.
  *
- * BOTH FAIL OPEN, and that is the property most worth pinning. A creation wall that
- * trips whenever a read fails is not a guard, it is a wedge — the agent cannot file
- * the ticket AND cannot proceed, with no rung above it. So: an unreadable epic files
- * the ticket, an unreachable capabilities probe files the ticket, and only a
- * SUCCESSFUL read that contradicts the request refuses.
+ * THE FAIL DIRECTION IS PER-EVIDENCE, not per-seam, and that is the property most
+ * worth pinning (TEAM-4780). A creation wall that trips whenever any read fails is
+ * not a guard, it is a wedge — so an unreachable capabilities probe files the ticket,
+ * and an unreadable EPIC (the page's addressee) files it too. The one exception is the
+ * SIBLING SCAN: it is the loop verdict's only evidence and the same scan
+ * autowireOpenGate refuses on (TEAM-4752 D1), so a failed scan REFUSES before
+ * anything is minted — a gate created over an unknown sibling set may be the very
+ * loop the breaker exists to stop, and refusing costs one retry.
  *
  * Twin parity again: the refusal payload and message an agent reads must not depend
  * on which provider is deployed, so every refusal row runs through both handlers and
@@ -332,7 +335,7 @@ beforeEach(() => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 
-describe("refuseGateLoop — the third identical gate is not new work", () => {
+describe("refuseGateLoop — the second identical gate is not new work", () => {
   it("the FIRST gate ticket is created (no priors)", async () => {
     for (const run of [await runTickets({ labels: CI_GATE }), await runJira({ labels: CI_GATE })]) {
       expect(run.refused).toBe(false);
@@ -341,16 +344,10 @@ describe("refuseGateLoop — the third identical gate is not new work", () => {
     }
   });
 
-  it("the SECOND is created too — one repeat is a retry, not a loop", async () => {
+  it("the SECOND is refused identically by both twins, and pages once", async () => {
+    // FR-2: ONE prior of the same kind against the same target is the loop. The
+    // repeat is not a retry — the prior is still open and still the ticket to work.
     const scn: Scenario = { labels: CI_GATE, siblings: [prior("TEAM-800")] };
-    for (const run of [await runTickets(scn), await runJira(scn)]) {
-      expect(run.refused).toBe(false);
-      expect(run.events).toHaveLength(0);
-    }
-  });
-
-  it("the THIRD is refused identically by both twins, and pages once", async () => {
-    const scn: Scenario = { labels: CI_GATE, siblings: [prior("TEAM-800"), prior("TEAM-810")] };
     const t = await runTickets(scn);
     const j = await runJira(scn);
 
@@ -363,11 +360,14 @@ describe("refuseGateLoop — the third identical gate is not new work", () => {
     expect(j.message, "message parity").toBe(t.message);
 
     // The remedy is the EXISTING ticket, named — an agent told only "refused"
-    // files a fourth one somewhere else.
-    expect(t.message).toContain("TEAM-800, TEAM-810");
+    // files another one somewhere else.
+    expect(t.message).toContain("TEAM-800");
     expect(t.message).toContain("Work the existing ticket TEAM-800");
     expect(t.message).toContain("environmental loop, not new work");
     expect(t.message).toContain(EPIC);
+    // Singular at the threshold: there is exactly ONE prior, so the count must not
+    // read "1 already exist".
+    expect(t.message).toContain("1 already exists for the same target");
 
     for (const [who, run] of [["dynamodb", t], ["jira", j]] as Array<[string, Run]>) {
       expect(run.epicLabels, `${who} marks the epic`).toContain("gate:loop-broken");
@@ -379,26 +379,30 @@ describe("refuseGateLoop — the third identical gate is not new work", () => {
           gateKind: "ci-unavailable",
           blockedByTicketId: "TEAM-800",
           head: SHA,
-          // `attempt` is how many already EXIST (2 at the threshold), not a
-          // counter of our own — nothing here is stateful enough to keep one.
+          // `attempt` is the number of THIS attempt — priors + this one, so 2 at the
+          // threshold. Not a counter of our own: nothing here is stateful enough to
+          // keep one.
           attempt: 2,
         },
       });
     }
   });
 
-  it("the FOURTH refuses with the same payload and emits NOTHING", async () => {
+  it("the THIRD and later refuse with the same payload and emit NOTHING", async () => {
     // The epic already carries the marker, which is the event dedupe in both twins
     // (a conditional add's outcome in DynamoDB, a before/after label read in Jira).
     const scn: Scenario = {
       labels: CI_GATE,
-      siblings: [prior("TEAM-800"), prior("TEAM-810"), prior("TEAM-820")],
+      siblings: [prior("TEAM-800"), prior("TEAM-810")],
       epicLabels: ["gate:loop-broken"],
     };
     const t = await runTickets(scn);
     const j = await runJira(scn);
     expect(t.refused).toBe(true);
+    expect(t.payload).toMatchObject({ reason: "gate_loop_environmental", existingTicketId: "TEAM-800" });
     expect(j.payload).toEqual(t.payload);
+    expect(j.message, "message parity").toBe(t.message);
+    expect(t.message, "both priors are named").toContain("TEAM-800, TEAM-810");
     expect(t.events, "no second page (dynamodb)").toHaveLength(0);
     expect(j.events, "no second page (jira)").toHaveLength(0);
     expect(h.ddb.labelUpdates, "no redundant label write").toHaveLength(0);
@@ -472,30 +476,47 @@ describe("refuseGateLoop — the third identical gate is not new work", () => {
     expect((await runJira(scn)).refused).toBe(false);
   });
 
-  it("FAILS OPEN: an unreadable epic files the ticket", async () => {
-    // A loop breaker that blocks creation whenever it cannot read is a wedge, not
-    // a guard — there is no rung above the agent to lift it.
+  it("FAILS CLOSED: a failed sibling scan refuses before anything is minted", async () => {
+    // TEAM-4780. The scan is the verdict's ONLY evidence, and it is the same scan
+    // autowireOpenGate refuses on a few lines later — so it cannot have the opposite
+    // fail direction inside one create. A gate minted over an unknown sibling set may
+    // be the very loop this breaker exists to stop; refusing costs one retry.
     const scn: Scenario = {
       labels: CI_GATE,
-      siblings: [prior("TEAM-800"), prior("TEAM-810")],
+      siblings: [prior("TEAM-800")],
       scanFails: true,
     };
-    expect((await runTickets(scn)).refused, "dynamodb").toBe(false);
-    expect((await runJira(scn)).refused, "jira").toBe(false);
+    const t = await runTickets(scn);
+    const j = await runJira(scn);
+
+    // The refusal body is siblingScanRefusal's — the SAME string the freeze uses,
+    // because when this scan fails the freeze state is equally unknown. Delivery
+    // differs per twin (a textResult vs a thrown Error), the body does not.
+    for (const [who, message] of [["dynamodb", t.message], ["jira", j.message]] as Array<[string, string]>) {
+      expect(message, `${who} refuses`).toContain(`create_ticket refused: the sibling scan under ${EPIC} failed`);
+      expect(message, `${who} says it is recoverable`).toContain("Nothing was created.");
+      expect(message, `${who} says what to do`).toContain("Retry the call.");
+    }
+
+    expect(h.ddb.created, "no ticket row minted").toHaveLength(0);
+    expect(h.jira.writes.filter((w) => w.path === "/rest/api/3/issue"), "no Jira issue created").toHaveLength(0);
+    // Nothing is claimed about a loop it could not see: no marker, no page.
+    expect(t.epicLabels).not.toContain("gate:loop-broken");
+    expect(j.epicLabels).not.toContain("gate:loop-broken");
+    expect(t.events, "no page (dynamodb)").toHaveLength(0);
+    expect(j.events, "no page (jira)").toHaveLength(0);
   });
 
-  it("an unlabelable epic still refuses — the marker is the dedupe, not the verdict", async () => {
-    // The epic row is missing, so the conditional label add fails. The refusal must
-    // survive: the ticket count is the loop evidence, and losing the marker only
-    // costs a duplicate page.
-    const scn: Scenario = { labels: CI_GATE, siblings: [prior("TEAM-800"), prior("TEAM-810")] };
+  it("an unreadable epic still refuses — the epic is the page, not the verdict", async () => {
+    // The epic row/issue is missing, so the workflowId read and the conditional label
+    // add both fail. The refusal must survive: the siblings ARE the loop evidence,
+    // and losing the epic only costs the page. This is the fail direction that stays
+    // OPEN, and it is the counterpart to the scan row above.
+    const scn: Scenario = { labels: CI_GATE, siblings: [prior("TEAM-800")] };
     seed(scn);
     h.ddb.created.length = 0;
     h.ddb.items = {}; // no epic row at all
-    h.ddb.siblings = [
-      { ticketId: "TEAM-800", labels: prior("TEAM-800").labels },
-      { ticketId: "TEAM-810", labels: prior("TEAM-810").labels },
-    ];
+    h.ddb.siblings = [{ ticketId: "TEAM-800", labels: prior("TEAM-800").labels }];
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const res: any = await ticketsHandler({
       _tool_name: "Tickets___create_ticket",
@@ -504,6 +525,26 @@ describe("refuseGateLoop — the third identical gate is not new work", () => {
     });
     expect(res.reason).toBe("gate_loop_environmental");
     expect(h.ddb.created, "no ticket minted").toHaveLength(0);
+
+    // Jira's epic GET 404s, so `epicLabels` is "could not tell" rather than "not yet
+    // marked" — it refuses, and skips both the label and the page rather than
+    // paging a run it cannot name.
+    seed(scn);
+    installJiraFetch();
+    h.jira.writes.length = 0;
+    h.jira.issues = {}; // the epic GET 404s
+    h.jira.siblings = [
+      { key: "TEAM-800", fields: { labels: prior("TEAM-800").labels, status: { name: "To Do" } } },
+    ];
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const jres: any = await jiraHandler({
+      _tool_name: "Tickets___create_ticket",
+      tool_name: "Tickets___create_ticket",
+      parameters: { summary: "CI is unavailable", labels: CI_GATE, parent_key: EPIC },
+    });
+    expect(jres.reason).toBe("gate_loop_environmental");
+    expect(h.jira.writes.filter((w) => w.path === "/rest/api/3/issue"), "no Jira issue created").toHaveLength(0);
+    expect(h.events, "no page it cannot attribute").toHaveLength(0);
   });
 
   it("a refusal costs no ticket number", async () => {

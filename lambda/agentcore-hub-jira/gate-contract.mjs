@@ -504,9 +504,13 @@ export async function invokeProbe(fnName, tool, args) {
 }
 
 // ── The gate-loop verdict ───────────────────────────────────────────────────
-// Priors needed before a re-file is a loop: two already exist, so the THIRD
-// attempt refuses.
-export const GATE_LOOP_THRESHOLD = 2;
+// Priors needed before a re-file is a loop: ONE. FR-2 defines the loop as the
+// SECOND same-triple gate (same gate kind, same blocked_by target, same head) —
+// one prior already proves the agent is re-filing the same environmental gate
+// rather than doing new work, and the prior is still the ticket to work. The
+// third and later attempts are refused SILENTLY: the `gate:loop-broken` epic
+// marker dedupes the event, so the run is paged exactly once.
+export const GATE_LOOP_THRESHOLD = 1;
 
 function idList(v) {
   const list = Array.isArray(v) ? v : typeof v === "string" ? v.split(",") : [];
@@ -514,7 +518,7 @@ function idList(v) {
 }
 
 /**
- * Is this new gate ticket the third of its kind against the same target?
+ * Is this new gate ticket the second of its kind against the same target?
  *
  * PURE, and the reason the verdict lives here rather than in either twin: the two
  * providers cannot gather siblings the same way (the DynamoDB twin queries
@@ -787,7 +791,10 @@ export function gateRefusal({ ticketId, gateKind, verdict } = {}) {
 /**
  * The refusal `refuseGateLoop` returns. `existingTicketId` is the FIRST prior of
  * the same kind against the same target — the ticket the caller should work on
- * instead of filing a third.
+ * instead of filing another.
+ *
+ * Phrased singular-safe: at the threshold there is exactly ONE prior (FR-2 — the
+ * second gate is the loop), so "1 already exists" has to read correctly.
  */
 export function gateLoopRefusal({ gateKind, verdict, epicId } = {}) {
   const v = verdict || {};
@@ -796,8 +803,9 @@ export function gateLoopRefusal({ gateKind, verdict, epicId } = {}) {
     .toLowerCase();
   const priors = Array.isArray(v.priors) ? v.priors.filter(Boolean) : [];
   const existingTicketId = priors[0] || "";
+  const exist = priors.length === 1 ? "already exists" : "already exist";
   const message =
-    `Refusing to create a third \`gate:${kind}\` ticket: ${priors.length} already exist for the same target ` +
+    `Refusing to create another \`gate:${kind}\` ticket: ${priors.length} ${exist} for the same target ` +
     `(${priors.join(", ")}). This is an environmental loop, not new work. Work the existing ticket ` +
     `${existingTicketId} — verify the condition, or record a DECISION line in its description — and ` +
     `escalate on it rather than filing another.` +

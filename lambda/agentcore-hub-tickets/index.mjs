@@ -575,17 +575,24 @@ function planGateLabelWrite(item, verification) {
 }
 
 /**
- * Refuse a THIRD gate ticket of the same kind against the same target under one
+ * Refuse a SECOND gate ticket of the same kind against the same target under one
  * epic — the environmental loop that has an agent re-filing "CI is unavailable"
- * forever instead of starting a build.
+ * forever instead of starting a build. FR-2: one prior of the same triple already
+ * proves the re-file is the same environmental gate restated, not new work.
  *
  * Narrowed to PROBED_GATE_KINDS: a `gate:approval` human escalation is deliberately
  * RE-FILED when a round cap trips, so counting those as a loop would break the one
  * escalation path the system has.
  *
- * FAILS OPEN in every direction — an unreadable epic, an unlabelable epic, an
- * unwritable event — because a loop breaker that blocks ticket creation whenever it
- * cannot read is a wedge, not a guard. It NEVER writes the workflows table.
+ * TWO fail directions, and the split is the point:
+ *   - the SIBLING SCAN fails CLOSED — a scan failure REFUSES before anything is
+ *     minted, exactly as autowireOpenGate does with the same scan (TEAM-4752 D1),
+ *     because a gate created over an unknown sibling set may be the very loop this
+ *     breaker exists to stop. Refusing costs one retry; creating costs another gate
+ *     ticket nobody will notice.
+ *   - the epic READ, the epic LABEL and the EVENT stay best-effort and fail open.
+ *     They are the PAGE, not the verdict: an unreadable epic must not turn a proven
+ *     loop into a created ticket. It NEVER writes the workflows table.
  *
  * @returns {Promise<object|null>} the refusal to return from createTicket, or null
  */
@@ -593,37 +600,37 @@ async function refuseGateLoop({ labels, blockedBy, parentId }) {
   const gateKind = probedGateKindOf(labels);
   if (!gateKind || !parentId) return null;
 
+  // ONE sibling scan per create, shared with autowireOpenGate below: one scan, one
+  // bound, one fail direction.
   let siblings = [];
-  let epic = null;
   try {
-    const [kids, parent] = await Promise.all([
-      ddb.send(
-        new QueryCommand({
-          TableName: TABLE_NAME,
-          IndexName: "parentId-index",
-          KeyConditionExpression: "parentId = :pid",
-          ExpressionAttributeValues: { ":pid": parentId },
-        })
-      ),
-      ddb.send(new GetCommand({ TableName: TABLE_NAME, Key: { ticketId: parentId } })),
-    ]);
-    siblings = (kids.Items || [])
-      .filter((i) => i.ticketId !== "__COUNTER__")
-      .map((i) => ({ id: i.ticketId, labels: i.labels, blockedBy: i.blockedBy }));
-    epic = parent.Item || null;
+    siblings = await scanSiblingTickets(parentId);
   } catch (err) {
     console.warn(
-      `[agentcore-hub-tickets] could not scan ${parentId} for a gate loop, creating normally — ${err?.name}`
+      `[agentcore-hub-tickets] gate-loop sibling scan failed for parent ${parentId} ` +
+        `(REFUSING the create): ${err.message}`
     );
-    return null;
+    return textResult(`Error: ${siblingScanRefusal(parentId, err.message)}`);
   }
 
   const head = gateHeadOf(labels);
   const verdict = gateLoopVerdict(siblings, { gateKind, blockedBy, head });
   if (!verdict.loop) return null;
 
+  // Only now is the epic worth reading — it carries the workflowId the event needs
+  // (SEC-16: off the EPIC ROW, never a caller argument), and nothing else.
+  let epic = null;
+  try {
+    const parent = await ddb.send(
+      new GetCommand({ TableName: TABLE_NAME, Key: { ticketId: parentId } })
+    );
+    epic = parent.Item || null;
+  } catch (err) {
+    console.warn(`[agentcore-hub-tickets] could not read epic ${parentId} — ${err?.name}`);
+  }
+
   // The epic carries the marker, and the conditional add's outcome is the EVENT
-  // dedupe — exactly as with gate:awaiting-console. The 3rd attempt pages; the 4th
+  // dedupe — exactly as with gate:awaiting-console. The 2nd attempt pages; the 3rd
   // and every later one refuses with the same payload and emits nothing.
   let newlyBroken = false;
   try {
@@ -635,14 +642,15 @@ async function refuseGateLoop({ labels, blockedBy, parentId }) {
 
   const refusal = gateLoopRefusal({ gateKind, verdict, epicId: parentId });
   if (newlyBroken) {
-    // SEC-16 again: workflowId off the EPIC row. `attempt` is how many of these
-    // already exist (2 at GATE_LOOP_THRESHOLD), not a counter of our own.
+    // `attempt` is the number of THIS attempt — priors + this one, so 2 at the
+    // threshold. Not a counter of our own: nothing here is stateful enough to keep
+    // one, and later attempts emit nothing at all.
     await publishJourneyEvent(ddb, EVENTS_TABLE, epic?.workflowId, "workflow.blocked", {
       reason: "environmental",
       gateKind,
       blockedByTicketId: refusal.payload.existingTicketId,
       head: head || "",
-      attempt: verdict.priorCount,
+      attempt: verdict.priorCount + 1,
     });
   }
   return { ...refusal.payload, ...textResult(refusal.message) };
@@ -991,6 +999,13 @@ function isSettled(status) {
  * read. Uses the RAW parentId-index Query (the same one listTickets issues) and
  * deliberately NOT formatSearchResults, which drops `labels` and `phase` — the
  * gate predicate is defined in terms of labels, so the formatter cannot answer it.
+ *
+ * TEAM-4780: `blockedBy` is carried too, because refuseGateLoop shares this scan
+ * and blocked_by overlap is one of the three ways gateLoopVerdict recognizes the
+ * same target. Additive — none of the freeze predicates read it.
+ *
+ * THROWS on a failed scan. Both callers refuse the create (siblingScanRefusal);
+ * the fail direction lives with them, not here.
  */
 async function scanSiblingTickets(parentKey) {
   const result = await ddb.send(
@@ -1008,6 +1023,7 @@ async function scanSiblingTickets(parentKey) {
       title: String(i.title || ""),
       status: String(i.status || ""),
       labels: (Array.isArray(i.labels) ? i.labels : []).map((l) => String(l)),
+      blockedBy: (Array.isArray(i.blockedBy) ? i.blockedBy : []).map((b) => String(b)),
       assignee: String(i.assignee || ""),
       phase: i.phase,
       createdAt: String(i.createdAt || ""),
@@ -1267,8 +1283,12 @@ async function createTicket(args) {
 
   // TEAM-4739: the two GATE seams. Both run on the sanitized label list, after the
   // roster check and BEFORE the id counter is touched, so a refusal costs no ticket
-  // number — the same rule the fix-contract enforce path follows above. Both fail
-  // OPEN: an unreadable epic or an unreachable probe files the ticket.
+  // number — the same rule the fix-contract enforce path follows above.
+  //
+  // Fail directions differ by what failed, not by seam (TEAM-4780): an unreachable
+  // PROBE files the ticket, and so does an unreadable epic, but a failed SIBLING
+  // SCAN refuses — it is the loop verdict's only evidence, and it is the same scan
+  // autowireOpenGate refuses on below.
   const loopRefusal = await refuseGateLoop({
     labels: userLabels.labels,
     blockedBy: blocked_by,

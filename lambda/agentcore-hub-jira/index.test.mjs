@@ -1753,7 +1753,7 @@ test("createTicket: a deploy gate with no `exec:` label is refused through the t
   });
 });
 
-test("createTicket: the third identical gate ticket is refused, and the epic is marked", async () => {
+test("createTicket: the second identical gate ticket is refused, and the epic is marked", async () => {
   const sibling = (key) => ({
     key,
     fields: {
@@ -1765,7 +1765,8 @@ test("createTicket: the third identical gate ticket is refused, and the epic is 
   });
   const issues = { "TEAM-1": { labels: ["wf:wf_1"], issuetype: "Epic" } };
 
-  await withJira({ issues, siblings: [sibling("TEAM-800"), sibling("TEAM-810")] }, async ({ writes }) => {
+  // ONE prior: FR-2 makes the SECOND same-triple gate the loop, not the third.
+  await withJira({ issues, siblings: [sibling("TEAM-800")] }, async ({ writes }) => {
     const res = await handler({
       tool_name: "Tickets___create_ticket",
       parameters: {
@@ -1779,32 +1780,31 @@ test("createTicket: the third identical gate ticket is refused, and the epic is 
     assert.equal(res.reason, "gate_loop_environmental");
     assert.equal(res.existingTicketId, "TEAM-800");
     assert.match(res.error, /Work the existing ticket TEAM-800/);
-    // No fourth ticket, and the epic carries the marker that dedupes the page.
+    assert.match(res.error, /1 already exists for the same target/);
+    // No second ticket, and the epic carries the marker that dedupes the page.
     assert.equal(writes.filter((w) => w.path === "/rest/api/3/issue").length, 0);
     assert.ok(issues["TEAM-1"].labels.includes("gate:loop-broken"));
   });
 });
 
-test("createTicket: the gate-loop guard FAILS OPEN on an unreadable epic — it is never the thing that refuses", async () => {
-  // A creation wall that trips whenever a read fails is a wedge, not a guard: the
-  // loop guard must not be what stops this create.
+test("createTicket: the gate-loop guard FAILS CLOSED on a failed sibling scan", async () => {
+  // TEAM-4780. The refusal now comes from the loop breaker itself, one seam earlier
+  // than the open-gate autowire — and with the SAME body, because the two share one
+  // scan of `parent = TEAM-1` and a failure leaves both questions unanswered: no
+  // loop verdict, and no open-gate freeze state. A gate created over an unknown
+  // sibling set may be the very loop the breaker exists to stop, and refusing costs
+  // one retry, which is the whole difference from a wedge.
   //
-  // TEAM-4752 D1: the create is nonetheless refused now — by the open-gate
-  // autowire, which reads the SAME `parent = TEAM-1` search and no longer reads
-  // "the search failed" as "no merge gate is open". That refusal is uniform (this
-  // ticket has a parent and no `human:` assignee, so the autowire governs it) and
-  // it is retryable, which is the whole difference from a wedge. What this test
-  // still pins is that the loop guard itself stayed open: no
-  // `gate_loop_environmental`, and no `gate:loop-broken` label on the epic.
+  // It still claims NOTHING about a loop it could not see: no
+  // `gate_loop_environmental` reason, and no `gate:loop-broken` label on the epic.
   const issues = { "TEAM-1": { labels: ["wf:wf_1"] } };
   await withJira({ issues, searchFails: true }, async ({ writes }) => {
     const res = await handler({
       tool_name: "Tickets___create_ticket",
       parameters: {
         summary: "CI is unavailable",
-        // Fully bound: the TEAM-4764 shape seam runs BEFORE the autowire's sibling
-        // scan, so an unbound gate would be refused for its labels and never reach
-        // the fail-open behaviour this test pins.
+        // Fully bound, so the TEAM-4764 shape seam is not what refuses. (It runs
+        // AFTER the loop seam anyway — an unbound gate in a loop reports the loop.)
         labels: ["gate:ci-unavailable", "pipeline:hub-x-deploy", `head:${"b".repeat(40)}`],
         parent_key: "TEAM-1",
       },
@@ -1812,6 +1812,7 @@ test("createTicket: the gate-loop guard FAILS OPEN on an unreadable epic — it 
     assert.notEqual(res.reason, "gate_loop_environmental");
     assert.equal(issues["TEAM-1"].labels.includes("gate:loop-broken"), false);
     assert.match(res.error, /^create_ticket refused: the sibling scan under TEAM-1 failed/);
+    assert.match(res.error, /Nothing was created\. Retry the call\./);
     assert.equal(res.ticketId, undefined);
     assert.equal(writes.filter((w) => w.path === "/rest/api/3/issue").length, 0);
   });
