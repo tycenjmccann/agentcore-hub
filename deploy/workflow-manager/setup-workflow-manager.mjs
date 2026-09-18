@@ -80,6 +80,10 @@ const TABLES = {
   EVENTS_TABLE: process.env.EVENTS_TABLE || "agentcore-hub-events",
   EVAL_CONFIG_TABLE: process.env.EVAL_CONFIG_TABLE || "agentcore-hub-eval-config",
   ANALYSES_TABLE: process.env.ANALYSES_TABLE || "agentcore-hub-workflow-analyses",
+  // SI ledger: one permanent row per recurring failure pattern (PK patternKey,
+  // no TTL). save_analysis.py in the toolkit writes to it, so the harness needs
+  // read+write — see the SiLedgerWrite statement below.
+  SI_LEDGER_TABLE: process.env.SI_LEDGER_TABLE || "agentcore-hub-si-ledger",
 };
 
 const sts = new STSClient({ region: REGION });
@@ -151,6 +155,25 @@ await iam.send(new PutRolePolicyCommand({
           `arn:aws:dynamodb:${REGION}:${accountId}:table/${TABLES.TICKETS_TABLE}`,
           `arn:aws:dynamodb:${REGION}:${accountId}:table/${TABLES.WORKFLOWS_TABLE}`,
         ],
+      },
+      {
+        // SI ledger: the toolkit twin (save_analysis.py) upserts pattern rows and
+        // appends occurrences/attempts/expectations/verdicts, and si_verify.py
+        // reads them back, so this one is full read+write on the single table.
+        // Kept as its own statement rather than folded into AnalysesWrite: only
+        // the ledger gets DeleteItem (retiring a wont-fix pattern), never the
+        // events / tickets / workflows tables.
+        Sid: "SiLedgerReadWrite",
+        Effect: "Allow",
+        Action: [
+          "dynamodb:GetItem",
+          "dynamodb:PutItem",
+          "dynamodb:UpdateItem",
+          "dynamodb:Query",
+          "dynamodb:Scan",
+          "dynamodb:DeleteItem",
+        ],
+        Resource: `arn:aws:dynamodb:${REGION}:${accountId}:table/${TABLES.SI_LEDGER_TABLE}`,
       },
       {
         Sid: "ArtifactBucket",
@@ -281,9 +304,15 @@ const harnessConfig = {
       filesystemConfigurations: [{ sessionStorage: { mountPath: "/mnt/workspace/" } }],
     },
   },
+  // environmentVariables is a REPLACE-ALL on both Create and Update: whatever is
+  // not in this object is not on the harness. So every table the toolkit reads —
+  // including SI_LEDGER_TABLE, spread in from TABLES — must be listed here, or a
+  // re-run silently drops it and save_analysis.py loses the ledger. (The update
+  // path below deliberately omits env for the same reason; an already-created
+  // harness therefore needs a one-time env push by hand to pick up a new table.)
   environmentVariables: {
     ARTIFACT_BUCKET,
-    ...TABLES,
+    ...TABLES, // WORKFLOWS / TICKETS / EVENTS / EVAL_CONFIG / ANALYSES / SI_LEDGER
     WORKFLOW_API_URL,
     TICKET_PROVIDER,
     MODEL_ID,
