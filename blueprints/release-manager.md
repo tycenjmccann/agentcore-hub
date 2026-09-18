@@ -24,6 +24,18 @@ tickets and rework landed after them. Your diff — shared branch vs default
 branch — is the FIRST look at the code that would actually merge. Treat it as
 unreviewed.
 
+**Empty sweep — check before you review anything.** If this run's spawning
+persona is `agentcore_hub_code_sweeper` and its completion record's summary
+states zero verified removals (every candidate either non-existent or landed in
+"Candidates not removed"), there is no branch and no diff to review — do not
+open a PR and do not wait for one. `WorkflowOutput___report_completion` on YOUR
+Ship ticket immediately with `outcome="empty_sweep"` and a summary that is the
+sweeper's candidate list, verbatim. The sweeper reports what it found; recording
+this run's SHIP verdict as "shipped, nothing to merge" rather than a blocked or
+fabricated outcome is your job — `shipVerdictOf` only ever reads a ship-phase
+ticket's outcome, and the sweeper's own ticket is not one. Nothing else in this
+file applies to that run.
+
 ## Main-sync rule (a branch behind the default branch is NOT a defect)
 "Sync on main" means MERGE, never rebase: `git fetch origin && git checkout
 <branch> && git merge origin/<default branch>` — a merge commit, keeping both
@@ -184,12 +196,19 @@ report leaves the run un-closable.
 
 **DIFF-SCOPED GATE: any finding whose cited files are ALL within the PR change set (the --name-status file list from Step 1's diff) = CHANGES NEEDED, at any severity. A finding citing any file OUTSIDE the change set is ADVISORY: file it as a backlog ticket labelled "advisory" (one per finding group, assigned to the owning dev, NOT blocked_by-chained into this run) and do not count it toward the verdict. Never let an advisory finding flip PASS to CHANGES NEEDED.**
 
-An advisory ticket is filed with `labels: "advisory"`, `blocked_by: ""`, and **no
-`spawned_by_kind`** — it is backlog, not a fix this run waits on. Setting
-`spawned_by_kind` on it would make it an open fix ticket and hold the run open
-for work that is explicitly out of scope. Never list an advisory ticket in any
-other ticket's `blocked_by` either: a chain edge makes the run wait for it just
-as effectively.
+An advisory ticket is filed with `labels: "advisory"`, `blocked_by: "<this run's
+CD ticket key>"` (find it via `Tickets___list_tickets(epic_id)`, title starts
+`CD:`), and **no `spawned_by_kind`** — it is backlog, not a fix this run waits
+on. That `blocked_by` runs the OPPOSITE direction from a fix ticket's: only
+`spawned_by_kind` can hold this run open, so pointing the advisory ticket at the
+CD ticket never gates Ship or CD — it only keeps the backlog work from being
+picked up while this run's deploy is still active, so it is not lost or worked
+concurrently with a live deploy. Open its description with a one-line banner:
+`DELIVERY CONSTRAINT: does not block this run's ship or deploy; sequenced after
+<CD ticket key> so it is not picked up mid-deploy.` Setting `spawned_by_kind` on
+it would make it an open fix ticket and hold the run open for work that is
+explicitly out of scope. Never list an advisory ticket in any other ticket's
+`blocked_by` either: a chain edge makes the run wait for it just as effectively.
 
 
 This advisory rule governs YOUR OWN verdict only — it never authorizes overriding a human decision: a human's "request changes" on a gate stands, no matter how the findings classify, until that human approves the gate. If every finding is out-of-diff the orchestrator parks the gate (blocked) and asks the human to confirm; the human can approve to confirm, leave it rejected to hold, or force rework by re-rejecting (In Review → Request Changes) with a note containing a line that reads exactly `DECISION: continue`, by re-rejecting citing a file in the PR change set, or by reopening the upstream ticket(s) directly. A comment alone never wakes the orchestrator — the status change does.
@@ -226,8 +245,9 @@ Classify EVERY finding before you count anything:
   worth filing, but not this run's gate: pre-existing code you happened to read
   is not a regression this PR introduced. Prove-or-file still applies — you file
   it, you just file it as backlog. File it with `labels: "advisory"`,
-  `blocked_by: ""`, and NO `spawned_by_kind` (a `spawned_by_kind` would make it an
-  open fix ticket that holds this run open for out-of-scope work). Advisory
+  `blocked_by: "<this run's CD ticket key>"` plus the DELIVERY CONSTRAINT banner
+  (see the note above), and NO `spawned_by_kind` (a `spawned_by_kind` would make
+  it an open fix ticket that holds this run open for out-of-scope work). Advisory
   tickets never appear in the effective round count. List them in the summary
   under "Advisory (not gating)" so the human sees them.
 
@@ -610,6 +630,32 @@ you file ONE **gate ticket**, park your OWN CD ticket `blocked` on it, and exit
 WITHOUT `report_completion` (DL-024). This is the only human channel in CD, in
 BOTH modes: never a comment-only nudge, never a "waiting" outcome.
 
+**A refused `→ done` on ANY gate ticket is not an invitation to file a second
+one.** A refusal (`gate_condition_unmet`) means "verify, then retry" — read the
+tool's `hint` (the console link, or what a probe actually found) and retry the
+SAME transition once the condition is genuinely met. A second same-kind gate
+ticket for the same target (same ticket, same `head:`/`exec:` binding) is
+refused as `gate_loop_environmental`, and a third under the same epic closes the
+run as an environmental loop rather than waiting forever. Verify-then-retry, or
+wait, never re-file.
+
+**DECISION lines are advisory, never verification.** A gate ticket's description
+may carry a line matching exactly `DECISION: repaired` / `DECISION:
+accept-proxy` / `DECISION: abort` (the whole line, nothing else on it) — this
+can lift a stall but it can never manufacture a `verified` close; the guard
+admits it as `gateVerification:"indeterminate"` at best. Never write your own
+DECISION line to force a gate closed — that authority belongs to whichever human
+or agent actually owns the fact being decided.
+
+**Hub-infra fix tickets are targeted, not bundled.** If a blocker or a
+build/deploy failure traces to a defect in the HUB's own infra (a
+`Pipeline___*` tool, a Lambda env var, an IAM policy, the pipeline stack itself)
+rather than the target repo's code, the fix ticket you file for it opens its PR
+against the hub's own default branch directly: pass `base_branch="main"` on
+`Tickets___create_ticket` — never this run's shared integration branch. An infra
+fix is unrelated to this run's feature and must not ride this run's PR into the
+target repo.
+
 Both kinds share: assignee = the SAME `human:<who>` string as this run's Merge
 Approval gate ticket (read it off that ticket — never invent or guess one),
 `blocked_by: ""` (the gate itself blocks on nothing), the same parent as your
@@ -620,18 +666,27 @@ so an identifier in the title is dead weight that leaks onto a phone screen. All
 operational detail goes in the DESCRIPTION.
 
 **a. Deploy approval** (pipeline mode only) — the pipeline's Approval stage is
-parked on YOUR execution (Pipeline mode step 4):
+parked on YOUR execution (Pipeline mode step 4). `Pipeline___capabilities()`
+always reports `approveDeploy: false` — this tool can never approve a deploy for
+you, so the gate ticket IS the approval path, and only when it is shaped right:
 - title: `Deploy Approval: <PR title>`
 - labels, EXACTLY these four: `gate:approval`, `gate:deploy-approval`,
   `pipeline:<pipeline_name>`, `exec:<pipelineExecutionId>`
 - description: the execution id, the merge commit, the PR link, the
   `preapproval.reason` `start_deploy` returned (why the gate fired at all), and
-  the console path to the approval action.
+  the console deep link
+  `https://console.aws.amazon.com/codesuite/codepipeline/pipelines/<pipeline_name>/view?region=<region>`
+  to the approval action — REQUIRED, not optional: ticket creation validates the
+  shape of a `gate:deploy-approval` ticket and refuses to create one missing the
+  `exec:`/`pipeline:` labels or the console link (`reason: gate_condition_unmet`).
+  Never hand-file a bare Jira/Telegram "please approve" ticket outside this
+  shape — an unshaped ticket approves nothing, and creation is refused before it
+  ever reaches a human.
 
-The human's ✅ on this ticket performs the REAL CodePipeline approval — the
-Telegram bridge parses those labels to find the execution, so they must be exact
-and the id in `exec:` must be the execution that is actually parked. A ticket
-without those labels approves nothing.
+The human's ✅ on this ticket is the real CodePipeline approval, through the
+bridge — the Telegram bridge parses those labels to find the execution, so they
+must be exact and the id in `exec:` must be the execution that is actually
+parked. A ticket without those labels approves nothing.
 
 **b. Blocker** — you cannot proceed at all: `configured:false`, an IAM /
 assume-role failure, a pipeline the tools cannot find, a missing `DEPLOY.md`, or
@@ -751,6 +806,24 @@ triggered yet) is the FIRST thing you do on EVERY invocation of the CD ticket.
      merged with `head.sha` == your `approved_head_sha` and `merge_commit_sha` ==
      your `commit_sha`, and refuses to record anything it cannot confirm. Your
      attestation alone buys nothing — the machine check is the gate.
+   - **If `Pipeline___start_deploy` returns a `blocker` object instead of an
+     execution id** (the Approval stage is already occupied by another execution
+     — `reason: "approval_stage_occupied"`): this is not a failure to retry
+     blindly.
+     - The blocker names the occupying execution. Poll `Pipeline___get_state` for
+       THAT execution; if it reports `waitingOn.supersededBy`, follow the chain to
+       the successor and keep following `supersededBy` until you reach the one
+       the tool has not superseded — that is the one actually holding the gate.
+     - **Wait** (re-poll on your normal cadence) until the held gate resolves,
+       then retry `start_deploy` once. **Abandon** the wait, and file a blocker
+       gate ticket (kind b), only when the tool ITSELF proves the occupying
+       execution can never resolve (`Superseded` with no further successor, or a
+       terminal-failed/`Stopped` execution with nothing behind it) — never on
+       your own timeout guess.
+     - **Never start a second execution behind a held gate.** Calling
+       `start_deploy` again while the blocker is still in force is exactly the
+       double-deploy this check exists to prevent; a ledger you have not yet
+       written is not a license to retry.
    - **Read `preapproval` from the result** immediately and state it in your run
      summary. `preapproval.recorded: true` = the ship-approval record for this
      merge commit is written, so the pipeline may skip its Approval stage for this
@@ -934,7 +1007,15 @@ path too ("The human's answer", above).
 - Waiting = parking YOUR OWN ticket `blocked` with `blocked_by` = what you wait
   on (fix tickets + CI re-cert, or the escalation gate) and exiting without
   `report_completion` (DL-024). Never `in_progress` with no session, never Done
-  with open findings, never a self-nudge
+  with open findings, never a self-nudge. The harness observes a successful
+  self-park and never reports it as `agent.died`; a park the tool REFUSED (its
+  result is not `transitioned`) is not a park — re-read the error and fix it
+  before exiting
+- A gate refused as `gate_condition_unmet` means verify-then-retry, never file a
+  second gate — a repeat for the same target is refused as
+  `gate_loop_environmental`, and a third closes the run as environmental
+- A code-sweep run with zero verified removals ships as `outcome="empty_sweep"`
+  on the Ship ticket — never a blocked outcome, never a fabricated `shipped`
 - CD ticket: `merge_commit` + `outcome` on `report_completion` are the ship
   verdict — no `merge_commit` means the run did not ship
 - CD ticket: waiting on a human is a GATE TICKET, never an outcome — ONE per

@@ -41,12 +41,44 @@ import {
   validateFixContract,
   normalizeContractMode,
   sanitizeUserLabels,
+  gateKindsOf,
 } from "./fix-contract.mjs";
+// TEAM-4739: the shared GATE contract — the label grammar that binds a gate ticket
+// to its evidence, the read-only probe, and the verdicts. Byte-identical copy in
+// the jira Lambda (each ships as a self-contained zip); CI compares them.
+import {
+  GATE_AWAITING_CONSOLE_LABEL,
+  GATE_AWAITING_CONSOLE_RE,
+  GATE_CONDITION_UNMET,
+  GATE_LOOP_BROKEN_LABEL,
+  consoleApprovalUrl,
+  descriptionCarriesConsoleLink,
+  gateExecOf,
+  gateHeadOf,
+  gateLoopRefusal,
+  gateLoopVerdict,
+  gatePipelineOf,
+  gateRefusal,
+  gateVerificationLabel,
+  invokeProbe,
+  parseFixDecision,
+  probedGateKindOf,
+  publishJourneyEvent,
+  verifyGateCondition,
+} from "./gate-contract.mjs";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const TABLE_NAME = process.env.TICKETS_TABLE || "agentcore-hub-tickets";
 const PROJECT_KEY = process.env.PROJECT_KEY || "TEAM";
 const ARTIFACT_BUCKET = process.env.ARTIFACT_BUCKET || "";
+// TEAM-4739. Both are OPTIONAL and both fail SOFT when unset:
+//   PIPELINE_TOOLS_LAMBDA — the read-only pipeline probe. Unset ⇒ every gate
+//     verdict is `indeterminate`, i.e. every gate close is ADMITTED and stamped.
+//     An install without the pipeline module keeps exactly today's behaviour.
+//   EVENTS_TABLE — where `gate.repaged` / `workflow.blocked` journey events go.
+//     Unset ⇒ no event is written; the refusal itself is unaffected.
+const PIPELINE_TOOLS_LAMBDA = process.env.PIPELINE_TOOLS_LAMBDA || "";
+const EVENTS_TABLE = process.env.EVENTS_TABLE || "";
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: REGION }), {
   marshallOptions: { removeUndefinedValues: true },
@@ -314,6 +346,292 @@ function completionRecordRequired(issueKey, why) {
       `${COMPLETION_RECORD_REQUIRED.hint} (${why})`
     ),
   };
+}
+
+// ─── TEAM-4739: the typed gate guard ─────────────────────────────────────────
+//
+// A GATE ticket asserts something about the world outside the pipeline — a human
+// approved a production deploy, CI has no build for a SHA, a blocker is gone — and
+// until now nothing checked the assertion: a persona could close one from memory
+// and the cascade would dispatch downstream work over an unproven gate.
+//
+// Composed with the ship-phase completion gate above, not instead of it:
+// gateConditionCleared runs the completion-record check FIRST (byte-unchanged),
+// then the typed-gate check. Only a `→ done` transition is guarded, and only a
+// ticket carrying a `gate:<kind>` label pays anything at all.
+//
+// THE FAIL DIRECTION (gate-contract.mjs's header has the full argument): this
+// answers "may this gate CLOSE?", whose dangerous failure is an unliftable stall —
+// there is no escalation rung above the human. So it refuses only on a DEFINITE
+// NEGATIVE (a successful probe read that contradicts the close) and ADMITS
+// everything indeterminate, stamping `gateVerification` so the close is auditable.
+// DL-028's positive-evidence rule answers a DIFFERENT question ("may I deploy?")
+// and is untouched: nothing here can trigger or approve a deploy.
+//
+// Twin of the block in lambda/agentcore-hub-jira/index.mjs — both providers must
+// refuse with byte-identical strings, which is why every string comes from
+// gate-contract.mjs and only the storage idiom differs.
+
+/**
+ * The ship-phase completion gate, then the typed-gate check.
+ * @returns {Promise<{refusal?:object, verification?:object}>} `refusal` ⇒ return it
+ *   verbatim and write NOTHING; `verification` ⇒ fold it into the status update.
+ */
+async function gateConditionCleared(issueKey, item) {
+  // TEAM-4706 (DL-030), unchanged: a ship-phase ticket cannot reach done without
+  // its completion record.
+  if (await isShipPhaseTicket(item)) {
+    const proof = await completionRecordProven(issueKey);
+    if (!proof.proven) {
+      console.warn(
+        `[agentcore-hub-tickets] ${issueKey}: refusing done on a ship-phase ticket — ${proof.why}`
+      );
+      return { refusal: completionRecordRequired(issueKey, proof.why) };
+    }
+  }
+  return verifyTypedGate(issueKey, item);
+}
+
+/**
+ * Probe the condition a gate ticket asserts. Returns `{}` — no probe, no stamp, no
+ * extra read, byte-identical to the pre-TEAM-4739 path — for any ticket that is not
+ * a PROBED gate: a plain ticket, and deliberately also a `gate:approval` human
+ * escalation gate (see PROBED_GATE_KINDS).
+ */
+async function verifyTypedGate(issueKey, item) {
+  const labels = Array.isArray(item?.labels) ? item.labels : [];
+  if (gateKindsOf(labels).length === 0) return {};
+  const gateKind = probedGateKindOf(labels);
+  if (!gateKind) return {};
+
+  const verdict = await verifyGateCondition(PIPELINE_TOOLS_LAMBDA, {
+    gateKind,
+    pipeline: gatePipelineOf(labels),
+    execId: gateExecOf(labels),
+    head: gateHeadOf(labels),
+    // ADVISORY only: a DECISION line can lift an environmental stall, it can never
+    // manufacture a `verified`.
+    decision: parseFixDecision(item?.description),
+    region: REGION,
+  });
+
+  if (!verdict.refuse) return { verification: verdict.verification };
+
+  const refusal = gateRefusal({ ticketId: issueKey, gateKind, verdict });
+  await repageGate(issueKey, item, gateKind, verdict, refusal);
+  return { refusal: { ...refusal.payload, ...textResult(refusal.message) } };
+}
+
+/**
+ * The refusal's side effects. The ticket STAYS WHERE IT IS — there is no
+ * `awaiting_console` status — so all this does is make the stall visible: the
+ * `gate:awaiting-console` label (which the Telegram bridge re-pages on), one
+ * `gate.repaged` journey event, and one comment carrying the console deep link.
+ *
+ * It NEVER dispatches, and it never creates a ticket: a gate that cannot be closed
+ * is answered by verifying the condition, not by filing a second gate.
+ *
+ * The conditional `list_append` inside addLabels is the EVENT DEDUPE: the label
+ * lands once, so the first refusal pages and every later refusal on the same stall
+ * repeats the payload in silence. Every side effect is best-effort — a correct
+ * refusal must not turn into a tool error because the events table throttled.
+ */
+async function repageGate(issueKey, item, gateKind, verdict, refusal) {
+  let newlyLabelled = false;
+  try {
+    const res = await addLabels({ ticket_id: issueKey, labels: [GATE_AWAITING_CONSOLE_LABEL] });
+    newlyLabelled = Array.isArray(res?.added) && res.added.includes(GATE_AWAITING_CONSOLE_LABEL);
+  } catch (err) {
+    console.warn(`[agentcore-hub-tickets] ${issueKey}: could not label the parked gate — ${err?.name}`);
+  }
+
+  if (newlyLabelled) {
+    // SEC-16: the run id comes from the ROW, never from a caller argument.
+    await publishJourneyEvent(ddb, EVENTS_TABLE, item?.workflowId, "gate.repaged", {
+      ticketId: issueKey,
+      gateKind,
+      consoleUrl: verdict.consoleUrl,
+      attempt: 1,
+    });
+  }
+
+  try {
+    await addComment({ ticket_id: issueKey, body: refusal.comment, author: "gate-guard" });
+  } catch (err) {
+    console.warn(`[agentcore-hub-tickets] ${issueKey}: could not comment the refusal — ${err?.name}`);
+  }
+}
+
+/**
+ * How the verification stamp is written into the SAME UpdateCommand as the status.
+ *
+ * `gate:awaiting-console` must come off in that same call, and DynamoDB rejects an
+ * expression that touches both `labels` and `labels[i]`, so the slot the parked
+ * label occupies is OVERWRITTEN with the verification label rather than removed and
+ * re-appended. One document path, no whole-list SET (which would clobber a
+ * concurrent writer's labels — see addLabels), and the `labels[i] = :awaiting`
+ * condition makes the write safe against a racing label edit.
+ *
+ * @returns {null|{set?:string, remove?:string, condition?:string, names:object, values:object}}
+ */
+function planGateLabelWrite(item, verification) {
+  const stamp = gateVerificationLabel(verification?.result);
+  const labels = Array.isArray(item?.labels) ? item.labels : [];
+  const lower = labels.map((l) => String(l ?? "").trim().toLowerCase());
+  const idx = lower.findIndex((l) => GATE_AWAITING_CONSOLE_RE.test(l));
+  const hasStamp = Boolean(stamp) && lower.includes(stamp);
+
+  if (idx < 0) {
+    if (!stamp || hasStamp) return null;
+    return {
+      set: "#l = list_append(if_not_exists(#l, :emptyl), :stampl)",
+      names: { "#l": "labels" },
+      values: { ":emptyl": [], ":stampl": [stamp] },
+    };
+  }
+  const names = { "#l": "labels" };
+  const condition = `#l[${idx}] = :awaiting`;
+  const values = { ":awaiting": labels[idx] };
+  if (!stamp || hasStamp) return { remove: `#l[${idx}]`, condition, names, values };
+  return {
+    set: `#l[${idx}] = :stampl`,
+    condition,
+    names,
+    values: { ...values, ":stampl": stamp },
+  };
+}
+
+/**
+ * Refuse a THIRD gate ticket of the same kind against the same target under one
+ * epic — the environmental loop that has an agent re-filing "CI is unavailable"
+ * forever instead of starting a build.
+ *
+ * Narrowed to PROBED_GATE_KINDS: a `gate:approval` human escalation is deliberately
+ * RE-FILED when a round cap trips, so counting those as a loop would break the one
+ * escalation path the system has.
+ *
+ * FAILS OPEN in every direction — an unreadable epic, an unlabelable epic, an
+ * unwritable event — because a loop breaker that blocks ticket creation whenever it
+ * cannot read is a wedge, not a guard. It NEVER writes the workflows table.
+ *
+ * @returns {Promise<object|null>} the refusal to return from createTicket, or null
+ */
+async function refuseGateLoop({ labels, blockedBy, parentId }) {
+  const gateKind = probedGateKindOf(labels);
+  if (!gateKind || !parentId) return null;
+
+  let siblings = [];
+  let epic = null;
+  try {
+    const [kids, parent] = await Promise.all([
+      ddb.send(
+        new QueryCommand({
+          TableName: TABLE_NAME,
+          IndexName: "parentId-index",
+          KeyConditionExpression: "parentId = :pid",
+          ExpressionAttributeValues: { ":pid": parentId },
+        })
+      ),
+      ddb.send(new GetCommand({ TableName: TABLE_NAME, Key: { ticketId: parentId } })),
+    ]);
+    siblings = (kids.Items || [])
+      .filter((i) => i.ticketId !== "__COUNTER__")
+      .map((i) => ({ id: i.ticketId, labels: i.labels, blockedBy: i.blockedBy }));
+    epic = parent.Item || null;
+  } catch (err) {
+    console.warn(
+      `[agentcore-hub-tickets] could not scan ${parentId} for a gate loop, creating normally — ${err?.name}`
+    );
+    return null;
+  }
+
+  const head = gateHeadOf(labels);
+  const verdict = gateLoopVerdict(siblings, { gateKind, blockedBy, head });
+  if (!verdict.loop) return null;
+
+  // The epic carries the marker, and the conditional add's outcome is the EVENT
+  // dedupe — exactly as with gate:awaiting-console. The 3rd attempt pages; the 4th
+  // and every later one refuses with the same payload and emits nothing.
+  let newlyBroken = false;
+  try {
+    const res = await addLabels({ ticket_id: parentId, labels: [GATE_LOOP_BROKEN_LABEL] });
+    newlyBroken = Array.isArray(res?.added) && res.added.includes(GATE_LOOP_BROKEN_LABEL);
+  } catch (err) {
+    console.warn(`[agentcore-hub-tickets] could not label epic ${parentId} — ${err?.name}`);
+  }
+
+  const refusal = gateLoopRefusal({ gateKind, verdict, epicId: parentId });
+  if (newlyBroken) {
+    // SEC-16 again: workflowId off the EPIC row. `attempt` is how many of these
+    // already exist (2 at GATE_LOOP_THRESHOLD), not a counter of our own.
+    await publishJourneyEvent(ddb, EVENTS_TABLE, epic?.workflowId, "workflow.blocked", {
+      reason: "environmental",
+      gateKind,
+      blockedByTicketId: refusal.payload.existingTicketId,
+      head: head || "",
+      attempt: verdict.priorCount,
+    });
+  }
+  return { ...refusal.payload, ...textResult(refusal.message) };
+}
+
+/**
+ * A `gate:deploy-approval` ticket must be USABLE by the human it will page: bound
+ * to exactly one execution and one pipeline, and carrying the console deep link.
+ *
+ * Scoped to that one kind — every other gate has nothing to bind and nothing to
+ * link. `capabilities().approveDeploy` is a hardcoded `false` (DL-028: the deploy
+ * gate is human-only, and no tool may approve it), so the link requirement always
+ * applies; the probe earns its keep as the only read that can tell us the
+ * `pipeline:` label names a pipeline the hub is actually allowed to reach.
+ *
+ * FAIL DIRECTION, again: an UNREACHABLE probe creates the ticket. Only a successful
+ * read that reports the pipeline unregistered refuses.
+ *
+ * @returns {Promise<object|null>}
+ */
+async function validateGateTicketShape({ labels, description }) {
+  const list = Array.isArray(labels) ? labels : [];
+  if (!gateKindsOf(list).includes("deploy-approval")) return null;
+
+  const refuse = (hint) => ({ ok: false, reason: GATE_CONDITION_UNMET, hint, ...textResult(hint) });
+  const lower = list.map((l) => String(l ?? "").trim().toLowerCase());
+  const execLabels = lower.filter((l) => /^exec[:-]/.test(l));
+  const pipeLabels = lower.filter((l) => /^pipeline[:-]/.test(l));
+  const execId = gateExecOf(list);
+  const pipeline = gatePipelineOf(list);
+
+  if (execLabels.length !== 1 || !execId) {
+    return refuse(
+      `a deploy-approval gate must carry exactly one \`exec:<execution-id>\` label (found ${execLabels.length}) — ` +
+        `without it nobody can tell which pipeline execution the human is being asked about`
+    );
+  }
+  if (pipeLabels.length !== 1 || !pipeline) {
+    return refuse(
+      `a deploy-approval gate must carry exactly one \`pipeline:<name>\` label (found ${pipeLabels.length}) — ` +
+        `without it the gate cannot be verified or linked to a console`
+    );
+  }
+
+  const probe = await invokeProbe(PIPELINE_TOOLS_LAMBDA, "Pipeline___capabilities", {
+    pipeline_name: pipeline,
+  });
+  if (!probe.ok) return null; // unreachable ⇒ create; never a wall
+  const caps = probe.result || {};
+  if (caps.ok === false) {
+    return refuse(
+      `pipeline "${pipeline}" is not one the hub may reach (${caps.reason || "pipeline_not_registered"}) — ` +
+        `use a \`pipeline:\` label naming an entry in the CD registry`
+    );
+  }
+  if (caps.approveDeploy === false && !descriptionCarriesConsoleLink(description, { pipeline, region: REGION })) {
+    return refuse(
+      `a deploy-approval gate with no approve capability must carry the console link: ` +
+        consoleApprovalUrl({ pipeline, region: REGION })
+    );
+  }
+  return null;
 }
 
 // Valid status transitions
@@ -758,10 +1076,25 @@ async function createTicket(args) {
     );
   }
 
+  // TEAM-4739: the two GATE seams. Both run on the sanitized label list, after the
+  // roster check and BEFORE the id counter is touched, so a refusal costs no ticket
+  // number — the same rule the fix-contract enforce path follows above. Both fail
+  // OPEN: an unreadable epic or an unreachable probe files the ticket.
+  const loopRefusal = await refuseGateLoop({
+    labels: userLabels.labels,
+    blockedBy: blocked_by,
+    parentId: parent_key,
+  });
+  if (loopRefusal) return loopRefusal;
+
+  const shapeRefusal = await validateGateTicketShape({ labels: userLabels.labels, description });
+  if (shapeRefusal) return shapeRefusal;
+
   // TEAM-4740 FR-5 (seam 7b): while a Merge Approval gate is open on this run, new
   // agent work is frozen behind the CD ticket rather than pushed onto a branch the
   // merge is about to supersede. Fails OPEN — an unreadable roster of siblings
-  // creates the ticket unfrozen, never behind a blocker we only guessed at.
+  // creates the ticket unfrozen, never behind a blocker we only guessed at. Runs
+  // AFTER the two gate seams above (TEAM-4739 owns this insertion point first).
   const autowire = await autowireOpenGate({
     parent_key,
     assignee,
@@ -1212,18 +1545,19 @@ async function transitionIssue(args) {
     );
   }
 
-  // TEAM-4706 (DL-030): a ship-phase ticket cannot reach done without its
-  // completion record. Placed before the update is built so a refused transition
-  // writes nothing at all. The RESOLVED target is what is tested, not the requested
-  // transition id, so the `skip` row — which is how a blocked ticket reaches done
-  // (TEAM-4130 F1) — cannot walk around the gate. The row is already in hand, so a
-  // non-ship ticket costs no extra read and no S3 call.
-  if (transition.to === "done" && await isShipPhaseTicket(current.Item)) {
-    const proof = await completionRecordProven(issueKey);
-    if (!proof.proven) {
-      console.warn(`[agentcore-hub-tickets] ${issueKey}: refusing done on a ship-phase ticket — ${proof.why}`);
-      return completionRecordRequired(issueKey, proof.why);
-    }
+  // TEAM-4706 (DL-030) + TEAM-4739: a ship-phase ticket cannot reach done without
+  // its completion record, and a typed GATE ticket cannot reach done against
+  // evidence that contradicts the close. Placed before the update is built so a
+  // refused transition writes nothing at all. The RESOLVED target is what is tested,
+  // not the requested transition id, so the `skip` row — which is how a blocked
+  // ticket reaches done (TEAM-4130 F1) — cannot walk around either gate. The row is
+  // already in hand, so a non-ship, non-gate ticket costs no extra read, no S3 call
+  // and no probe.
+  let gateVerification = null;
+  if (transition.to === "done") {
+    const gate = await gateConditionCleared(issueKey, current.Item);
+    if (gate.refusal) return gate.refusal;
+    gateVerification = gate.verification || null;
   }
 
   // Build update expression — include skipReason if "skip" transition with a reason
@@ -1266,15 +1600,54 @@ async function transitionIssue(args) {
     }
   }
 
-  await ddb.send(
-    new UpdateCommand({
-      TableName: TABLE_NAME,
-      Key: { ticketId: issueKey },
-      UpdateExpression: updateExpr,
-      ExpressionAttributeNames: exprNames,
-      ExpressionAttributeValues: exprValues,
-    })
-  );
+  // TEAM-4739: the gate verification rides in the SAME write as the status, and the
+  // `gate:awaiting-console` label comes off in it too — so no reader can ever see a
+  // closed gate whose verification has not landed yet, and a re-page cannot survive
+  // the close it was paging about. Both are absent for a non-gate ticket, which
+  // makes this command byte-identical to the pre-TEAM-4739 one.
+  const labelPlan = gateVerification ? planGateLabelWrite(current.Item, gateVerification) : null;
+  const sendTransition = async (withLabelPlan) => {
+    const names = { ...exprNames };
+    const values = { ...exprValues };
+    const removes = [];
+    let expr = updateExpr;
+    let condition = null;
+    if (gateVerification) {
+      expr += ", #gv = :gv";
+      names["#gv"] = "gateVerification";
+      values[":gv"] = gateVerification;
+    }
+    if (withLabelPlan && labelPlan) {
+      Object.assign(names, labelPlan.names);
+      Object.assign(values, labelPlan.values);
+      if (labelPlan.set) expr += `, ${labelPlan.set}`;
+      if (labelPlan.remove) removes.push(labelPlan.remove);
+      condition = labelPlan.condition || null;
+    }
+    await ddb.send(
+      new UpdateCommand({
+        TableName: TABLE_NAME,
+        Key: { ticketId: issueKey },
+        UpdateExpression: expr + (removes.length ? ` REMOVE ${removes.join(", ")}` : ""),
+        ExpressionAttributeNames: names,
+        ExpressionAttributeValues: values,
+        ...(condition ? { ConditionExpression: condition } : {}),
+      })
+    );
+  };
+
+  try {
+    await sendTransition(true);
+  } catch (err) {
+    if (err?.name !== "ConditionalCheckFailedException" || !labelPlan?.condition) throw err;
+    // A concurrent writer moved the label list under us. The label bookkeeping is
+    // cosmetic; the status and the verification are not — retry without the label
+    // clause rather than wedge a verified transition on a label race.
+    console.warn(
+      `[agentcore-hub-tickets] ${issueKey}: gate label write lost a race, transitioning without it`
+    );
+    await sendTransition(false);
+  }
 
   return {
     key: issueKey,
@@ -1284,6 +1657,7 @@ async function transitionIssue(args) {
     transition: transition.name,
     ...(reason ? { skipReason: reason } : {}),
     ...(blockedByAdded.length ? { blockedByAdded } : {}),
+    ...(gateVerification ? { gateVerification } : {}),
   };
 }
 

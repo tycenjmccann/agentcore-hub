@@ -353,7 +353,10 @@ never enters the findings list, and it never blocks the verdict.
   you still never edit product code
 - Waiting on fixes = park YOUR OWN ticket `blocked` with `blocked_by` = the fix
   tickets and exit without `report_completion` (DL-024); never `in_progress`
-  with no session, never Done with open findings
+  with no session, never Done with open findings. The harness observes a
+  successful self-park and never reports it as `agent.died`; a park the tool
+  REFUSED (its result is not `transitioned`) is not a park — re-read the error
+  and fix it before exiting
 - Do NOT rubber-stamp — on a clean non-trivial diff, state what you checked and
   why each failure mode does not apply
 - Use `codex` by default; fall back to `claude_code` only when `codex` is unavailable

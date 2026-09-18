@@ -73,6 +73,7 @@ import hashlib
 import importlib.metadata
 import json
 import logging
+import random
 import re
 import shlex
 import time
@@ -2273,7 +2274,7 @@ def Pipeline___capabilities(pipeline_name: str = "") -> str:
 # ─── Workflow Output Tools ────────────────────────────────────────────────────
 
 @tool
-def WorkflowOutput___report_completion(ticket_id: str, summary: str, artifacts: str = "", branch: str = "", commit_sha: str = "", pr_url: str = "", evidence_kind: str = "", evidence_keys: str = "", ci_status: str = "", ci_build_id: str = "", ci_head_sha: str = "", merge_commit: str = "", approved_head_sha: str = "", outcome: str = "", block_reason: str = "", pipeline_execution_id: str = "", pipeline_name: str = "") -> str:
+def WorkflowOutput___report_completion(ticket_id: str, summary: str, artifacts: str = "", branch: str = "", commit_sha: str = "", pr_url: str = "", evidence_kind: str = "", evidence_keys: str = "", ci_status: str = "", ci_build_id: str = "", ci_head_sha: str = "", merge_commit: str = "", approved_head_sha: str = "", outcome: str = "", block_reason: str = "", pipeline_execution_id: str = "", pipeline_name: str = "", follow_ups: str = "") -> str:
     """Report that your work is complete. This saves your completion summary to S3 AND automatically transitions your Jira ticket to Done. Do NOT call Tickets___transition_ticket to mark your own ticket done — this tool handles that for you.
 
     Args:
@@ -2326,6 +2327,12 @@ def WorkflowOutput___report_completion(ticket_id: str, summary: str, artifacts: 
             watched reach succeeded, not the one you started.
         pipeline_name: ship phase only — the pipeline named in "## Pipeline
             Mode", i.e. the one the execution above belongs to.
+        follow_ups: work this ticket surfaced that is NOT part of it — a JSON
+            array of {kind, owner, assignee, title, detail, base_branch}; kind ∈
+            post_deploy_verification|console_handoff|iam_handoff|fix|docs; owner ∈
+            agent|human; unknown entries are dropped by the Lambda. Use it
+            instead of closing your own ticket over an unfinished thread or
+            filing the follow-up yourself.
     """
     # Include workflow_id and agent_id from invocation context for journey logging (not exposed to agent)
     payload = {
@@ -2371,6 +2378,14 @@ def WorkflowOutput___report_completion(ticket_id: str, summary: str, artifacts: 
         payload["pipeline_execution_id"] = pipeline_execution_id.strip()
     if pipeline_name.strip():
         payload["pipeline_name"] = pipeline_name.strip()
+    # TEAM-4739: the follow-up thread a persona would otherwise either drop or
+    # file itself by reaching across ticket boundaries. Same additive rule —
+    # absent stays absent — and the STRING is forwarded verbatim rather than
+    # parsed here: the Lambda owns the shape (and the dropping of unknown kinds
+    # and owners), so a harness that guessed at the schema would be a second
+    # place for it to drift.
+    if follow_ups.strip():
+        payload["follow_ups"] = follow_ups.strip()
     return _invoke_lambda(WORKFLOW_OUTPUT_LAMBDA, "WorkflowOutput___report_completion", payload)
 
 
@@ -3461,8 +3476,13 @@ class _CompletionGate:
 
     TOOL = "WorkflowOutput___report_completion"
 
-    def __init__(self):
+    def __init__(self, on_success=None):
         self.engaged = False
+        # TEAM-4739: run once when the gate engages — the resume object's delete.
+        # A callback rather than the S3 call itself so this class keeps knowing
+        # nothing about buckets, and so every existing `_CompletionGate()` call
+        # site (and its tests) is byte-unchanged.
+        self._on_success = on_success
 
     def register_hooks(self, registry, **kwargs):
         from strands.hooks import AfterToolCallEvent
@@ -3483,8 +3503,104 @@ class _CompletionGate:
             if (getattr(event, "tool_use", None) or {}).get("name") != self.TOOL:
                 return
             self.engaged = self._succeeded(getattr(event, "result", None))
+            if self.engaged and self._on_success:
+                try:
+                    self._on_success()
+                except Exception as e:  # noqa: BLE001 — never fail the turn on cleanup
+                    logger.warning(f"completion gate on_success failed (non-fatal): {e}")
         except Exception as e:  # noqa: BLE001
             logger.warning(f"completion gate hook failed (non-fatal): {e}")
+
+
+class _ParkGate:
+    """FR-7: the persona DELIBERATELY ended its turn without reporting
+    completion — it transitioned its OWN ticket to blocked, done or skip.
+
+    That is not a death, and `agent.died` must not be published for it: a park
+    behind a fix, a ticket the persona legitimately closed and a skipped ticket
+    are all outcomes the cascade already understands, while a death is the
+    absence of any outcome at all. Without this gate every park would look
+    identical to a platform kill.
+
+    Only a SUCCESSFUL transition counts (same `_CompletionGate._succeeded` test,
+    reused rather than re-derived — a tool result that came back "Error: ..."
+    means the ticket did NOT move, so the turn really did end with nothing), and
+    only on THIS turn's ticket: a persona transitioning some other ticket has not
+    accounted for its own. `blocked_by` is deliberately irrelevant — a park with
+    no named blocker is still a park, and requiring one would reclassify honest
+    parks as deaths. Best-effort: never raises."""
+
+    TOOL = "Tickets___transition_ticket"
+    # Every spelling that RESOLVES to blocked or done. The ticket Lambdas match a
+    # requested transition by id, by target status OR by display name
+    # (`t.id === transitionId || t.to === transitionId || t.name.toLowerCase() === …`),
+    # so one park has several legal spellings: the table's id for a park is
+    # `block`, the tool's own docstring teaches personas `blocked`, and
+    # `Request Changes` / `Approve` are the names of the same two rows. Watching
+    # only one of them would read the most common park in the fleet as a death and
+    # escalate a run that is working exactly as designed.
+    PARK_TRANSITIONS = frozenset({
+        "block", "blocked", "request changes",   # → blocked
+        "done", "approve", "skip",               # → done
+    })
+
+    def __init__(self, ticket_id: str = "", on_park=None):
+        self.parked = False
+        self._ticket = str(ticket_id or "").strip()
+        self._on_park = on_park
+
+    # A park counts only when the ticket PROVABLY moved. `_succeeded` is necessary
+    # but not sufficient: the DynamoDB twin returns its REFUSALS as ordinary tool
+    # text — `Invalid transition "done" from status "todo". Available: …`,
+    # `Issue X not found.`, `Cannot move X to in_review: …`, a gate refusal — all of
+    # which carry a success status and do not start with "Error". Counting one of
+    # those as a park is precisely the silent stall this gate exists to prevent: the
+    # turn would publish neither a death nor a resume object while its ticket never
+    # left in_progress. Both twins say "transitioned" on success and only on success
+    # (tickets: `status: "transitioned"`; jira: `Transitioned to <status>`), pinned
+    # against both Lambdas by tests/test_park_gate.py.
+    MOVED_MARKER = "transitioned"
+    NOT_MOVED_MARKER = "not transitioned"
+
+    @classmethod
+    def _moved(cls, result) -> bool:
+        if not _CompletionGate._succeeded(result):
+            return False
+        blob = " ".join(
+            (block.get("text") or "")
+            for block in (result.get("content") or [])
+            if isinstance(block, dict)
+        ).lower()
+        return cls.MOVED_MARKER in blob and cls.NOT_MOVED_MARKER not in blob
+
+    def register_hooks(self, registry, **kwargs):
+        from strands.hooks import AfterToolCallEvent
+        registry.add_callback(AfterToolCallEvent, self._on_tool_result)
+
+    def _on_tool_result(self, event):
+        try:
+            tool_use = getattr(event, "tool_use", None) or {}
+            if tool_use.get("name") != self.TOOL:
+                return
+            if not self._ticket:
+                return  # an unbound turn has no "own ticket" to park
+            if not self._moved(getattr(event, "result", None)):
+                return
+            args = tool_use.get("input") or {}
+            if not isinstance(args, dict):
+                return
+            if str(args.get("ticket_id") or "").strip() != self._ticket:
+                return
+            if str(args.get("transition_id") or "").strip().lower() not in self.PARK_TRANSITIONS:
+                return
+            self.parked = True
+            if self._on_park:
+                try:
+                    self._on_park()
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f"park gate on_park failed (non-fatal): {e}")
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"park gate hook failed (non-fatal): {e}")
 
 
 def _save_memory_event(agent_id: str, session_id: str, user_text: str, assistant_text: str):
@@ -3633,7 +3749,12 @@ async def agent_invocation(payload, context):
             except Exception as exc:  # noqa: BLE001 — must never die silently
                 logger.error(f"[{agent_id}] detached run failed: {str(exc)[:500]}")
                 try:
-                    _publish_agent_error(workflow_id, agent_id, str(exc)[:500])
+                    # TEAM-4739: name the ticket. A detached crash with no
+                    # ticketId is an error the board cannot place on a card, and
+                    # the orphaned-ticket case (TEAM-3119) is exactly why this
+                    # call exists.
+                    _publish_agent_error(workflow_id, agent_id, str(exc)[:500],
+                                         ticket_id=payload.get("ticket_id", ""))
                 except Exception:  # noqa: BLE001
                     pass
             finally:
@@ -3725,6 +3846,249 @@ def _publish_agent_error(workflow_id: str, agent_id: str, error: str,
                        f"ticket_id={ticket_id or 'n/a'}): {e}")
 
 
+# The longest lastText the death event carries. The resume OBJECT holds the same
+# 2KB (it is the same clip), so this is a tail for a human reading the board, not
+# the resume payload — keeping the event small keeps the events table scannable.
+_AGENT_DIED_TEXT_LIMIT = 2048
+
+
+def _publish_agent_died(workflow_id: str, agent_id: str, ticket_id: str = "",
+                        session_id: str = "", last_stream_at: str = "",
+                        last_text: str = "") -> None:
+    """The turn ENDED without ending itself (TEAM-4739 FR-7): no
+    report_completion, no deliberate park, and no exception either — the process
+    simply stopped being given time (platform kill, microVM reap, a cancelled
+    detached task).
+
+    Why this is its own type and not another agent.error: `agent.error` already
+    means two different things (the model failed / the detector announced a dead
+    session), so nothing downstream could tell a retryable death from an
+    exhausted one, and the retry cap fired a round early. The two are DISJOINT by
+    construction — a turn that raises publishes agent.error and never this, a
+    turn that vanishes publishes this and never that.
+
+    Same contract as its sibling `_publish_agent_error`: retried a few times
+    because a lost death event is an invisible failure, and it swallows its own
+    errors because it is called from a `finally` that must not raise."""
+    import time as _t
+    try:
+        for attempt in range(1, _AGENT_ERROR_PUBLISH_ATTEMPTS + 1):
+            try:
+                # Same key discipline as agent.error: a random suffix so two
+                # personas killed in the same millisecond (the shared-outage
+                # case, which is most deaths) cannot overwrite each other, and a
+                # NUMERIC timestamp fraction because workflow-analyzer
+                # Date.parse()es it.
+                digits = f"{uuid.uuid4().int % 10**6:06d}"
+                _ddb_events_client.put_item(
+                    TableName=_EVENTS_TABLE,
+                    Item={
+                        "workflowId": {"S": workflow_id or "unknown"},
+                        "eventId": {"S": f"{int(_t.time() * 1000)}-died-{digits}"},
+                        "type": {"S": "agent.died"},
+                        "detail": {"M": {
+                            "agentId": {"S": agent_id},
+                            "workflowId": {"S": workflow_id or "unknown"},
+                            "ticketId": {"S": ticket_id or ""},
+                            "sessionId": {"S": session_id or ""},
+                            "lastStreamAt": {"S": last_stream_at or ""},
+                            "lastText": {"S": (last_text or "")[:_AGENT_DIED_TEXT_LIMIT]},
+                        }},
+                        "timestamp": {"S": _t.strftime("%Y-%m-%dT%H:%M:%S", _t.gmtime())
+                                      + f".{digits}Z"},
+                    },
+                )
+                logger.info(f"[{agent_id}] Published agent.died event")
+                return
+            except Exception as e:  # noqa: BLE001
+                if attempt == _AGENT_ERROR_PUBLISH_ATTEMPTS:
+                    logger.warning(
+                        f"[{agent_id}] Failed to publish agent.died after "
+                        f"{attempt} attempts (workflow_id={workflow_id or 'unknown'}, "
+                        f"ticket_id={ticket_id or 'n/a'}): {e}")
+                    return
+                logger.warning(
+                    f"[{agent_id}] agent.died publish attempt {attempt}/"
+                    f"{_AGENT_ERROR_PUBLISH_ATTEMPTS} failed — retrying: {e}")
+                _t.sleep(_AGENT_ERROR_PUBLISH_BACKOFF_S[
+                    min(attempt - 1, len(_AGENT_ERROR_PUBLISH_BACKOFF_S) - 1)])
+    except Exception as e:  # noqa: BLE001 — death surfacing must never fail the turn
+        logger.warning(f"[{agent_id}] Failed to publish agent.died "
+                       f"(workflow_id={workflow_id or 'unknown'}, "
+                       f"ticket_id={ticket_id or 'n/a'}): {e}")
+
+
+# ─── FR-6: in-turn ConverseStream retry ───────────────────────────────────────
+#
+# Why botocore cannot do this for us. `_build_bedrock_model` sets
+# retries={"max_attempts": 2}, and that governs the HTTP request that OPENS the
+# stream. Once ConverseStream has responded 200 and the event stream is open,
+# every later failure arrives as an event INSIDE that stream (botocore's own
+# bedrock-runtime model lists internalServerException, modelStreamErrorException,
+# throttlingException, serviceUnavailableException and validationException as
+# members of the ConverseStreamOutput union) or as a read timeout on the socket.
+# botocore has already returned success by then and will never retry any of them:
+# the request it would retry is over. A stream that dies at token 9,000 of a
+# 40-minute persona turn therefore killed the whole turn, and the persona's ticket
+# stayed parked until the sweep noticed.
+#
+# The retry re-enters `agent.stream_async(prompt)` on the SAME Agent object, so
+# the conversation, the tool results already returned and the prompt cache all
+# survive; nothing is rebuilt and the prompt is never re-derived.
+_STREAM_RETRY_MAX_ATTEMPTS = 3
+_STREAM_RETRY_BUDGET_S = 60.0
+_STREAM_RETRY_BASE_S = 1.0
+
+# Transient by nature: the stream broke, but asking again can work. Matched on
+# the lowercased exception TYPE NAME and message, not on imported classes,
+# because these reach us wrapped — Strands raises its own EventStreamError, and
+# the mid-stream union members surface as whatever the SDK maps them to.
+_STREAM_RETRY_MARKERS = (
+    "internalserverexception",
+    "throttlingexception",
+    "modelstreamerrorexception",
+    "serviceunavailableexception",
+    "eventstreamerror",
+    "readtimeouterror",
+    "timeouterror",  # botocore ReadTimeoutError's base, and asyncio.TimeoutError
+)
+# Deterministic: the same call will fail the same way, so a retry only burns the
+# budget and the tokens. Checked FIRST — a wrapper whose message quotes both is
+# reporting the deterministic cause.
+_STREAM_FAIL_MARKERS = (
+    "validationexception",
+    "maxtokensreachedexception",
+    "accessdenied",
+)
+
+
+def _classify_stream_error(exc) -> str:
+    """"retry" | "fail" for an exception out of `agent.stream_async`.
+
+    Pure by design (no module state, no imports, no logging) so the retry policy
+    can be exec'd and tabled in a test without main.py's import side effects.
+
+    Anything unrecognised is "fail". The asymmetry is deliberate: a transient we
+    fail to retry costs one turn, which the sweep already recovers, while a
+    deterministic error we DO retry burns a full turn's tokens three times over
+    and still ends where it started."""
+    blob = f"{type(exc).__name__} {exc}".lower()
+    if any(m in blob for m in _STREAM_FAIL_MARKERS):
+        return "fail"
+    if any(m in blob for m in _STREAM_RETRY_MARKERS):
+        return "retry"
+    return "fail"
+
+
+def _stream_retry_delay(attempt: int, remaining_s: float) -> float:
+    """Exponential backoff with full jitter, never past the wall budget.
+
+    Full jitter (uniform in [0, 2^n * base]) rather than a fixed ramp: the
+    failures worth retrying are overwhelmingly shared — one Bedrock hiccup hits
+    every persona in the fleet at once — and a deterministic ramp would send all
+    of them back in the same instant."""
+    ceiling = _STREAM_RETRY_BASE_S * (2 ** max(0, attempt - 1))
+    return max(0.0, min(random.uniform(0.0, ceiling), remaining_s))
+
+
+# ─── FR-7: the resume object ──────────────────────────────────────────────────
+#
+# A turn that died or parked leaves what it had reached in S3, so the NEXT turn
+# on the same ticket starts from it instead of from nothing. Written with the
+# module s3_client directly and never through S3Storage___write_object: that tool
+# is a model-facing surface, and this write happens on a path where there is no
+# model left to call it.
+_RESUME_ARTIFACT_KEY_CAP = 50
+_RESUME_TEXT_LIMIT = 2048
+
+
+def _resume_object_key(workflow_id: str, agent_id: str, ticket_id: str) -> str:
+    return f"workflows/{workflow_id}/agents/{agent_id}/resume/{ticket_id}.json"
+
+
+def _write_resume_object(workflow_id: str, agent_id: str, ticket_id: str,
+                         last_text: str = "", last_stream_at: str = "") -> None:
+    """Best-effort (R1.4): a failed resume write is logged and changes nothing
+    about the death or the park it accompanies."""
+    if not (ARTIFACT_BUCKET and workflow_id and agent_id and ticket_id):
+        return
+    try:
+        prefix = f"workflows/{workflow_id}/agents/{agent_id}/"
+        keys = []
+        try:
+            listed = s3_client.list_objects_v2(
+                Bucket=ARTIFACT_BUCKET, Prefix=prefix, MaxKeys=_RESUME_ARTIFACT_KEY_CAP)
+            keys = [o["Key"] for o in (listed.get("Contents") or [])
+                    ][:_RESUME_ARTIFACT_KEY_CAP]
+        except Exception as e:  # noqa: BLE001 — the text is the point; keys are a bonus
+            logger.warning(f"[{agent_id}] resume artifact listing failed (non-fatal): {e}")
+        s3_client.put_object(
+            Bucket=ARTIFACT_BUCKET,
+            Key=_resume_object_key(workflow_id, agent_id, ticket_id),
+            Body=json.dumps({
+                "lastText": (last_text or "")[:_RESUME_TEXT_LIMIT],
+                "lastStreamAt": last_stream_at or "",
+                "artifactKeys": keys,
+            }).encode("utf-8"),
+            ContentType="application/json",
+        )
+        logger.info(f"[{agent_id}] wrote resume object for {ticket_id} "
+                    f"({len(keys)} artifact key(s))")
+    except Exception as e:  # noqa: BLE001 — R1.4
+        logger.warning(f"[{agent_id}] resume object write failed (non-fatal): {e}")
+
+
+def _read_resume_object(workflow_id: str, agent_id: str, ticket_id: str):
+    """The previous attempt's remnant, or None. A MISSING object is the normal
+    case — first attempts are the overwhelming majority — so it is silent."""
+    if not (ARTIFACT_BUCKET and workflow_id and agent_id and ticket_id):
+        return None
+    try:
+        obj = s3_client.get_object(
+            Bucket=ARTIFACT_BUCKET,
+            Key=_resume_object_key(workflow_id, agent_id, ticket_id))
+        data = json.loads(obj["Body"].read().decode("utf-8"))
+        return data if isinstance(data, dict) else None
+    except Exception:  # noqa: BLE001 — absent is the normal case, unreadable is not fatal
+        return None
+
+
+def _delete_resume_object(workflow_id: str, agent_id: str, ticket_id: str) -> None:
+    """A turn that REPORTED completion has nothing to resume; leaving the object
+    would prepend a dead attempt to whatever runs on this ticket next."""
+    if not (ARTIFACT_BUCKET and workflow_id and agent_id and ticket_id):
+        return
+    try:
+        s3_client.delete_object(
+            Bucket=ARTIFACT_BUCKET,
+            Key=_resume_object_key(workflow_id, agent_id, ticket_id))
+    except Exception as e:  # noqa: BLE001 — R1.4
+        logger.warning(f"[{agent_id}] resume object delete failed (non-fatal): {e}")
+
+
+def _resume_prompt_block(resume) -> str:
+    """The `## Previous Attempt` preamble, or "" when there is nothing to say."""
+    if not isinstance(resume, dict):
+        return ""
+    last_text = str(resume.get("lastText") or "").strip()
+    last_at = str(resume.get("lastStreamAt") or "").strip()
+    keys = [str(k) for k in (resume.get("artifactKeys") or []) if k]
+    if not (last_text or keys):
+        return ""
+    lines = ["## Previous Attempt",
+             "",
+             "A previous turn on this ticket ended without reporting completion. "
+             "Continue from here rather than starting over; verify anything below "
+             "before you rely on it."]
+    if last_at:
+        lines += ["", f"Last output at: {last_at}"]
+    if last_text:
+        lines += ["", "Last output:", "", last_text[:_RESUME_TEXT_LIMIT]]
+    if keys:
+        lines += ["", "Artifacts already in S3:"] + [f"- {k}" for k in keys]
+    return "\n".join(lines) + "\n\n---\n\n"
+
+
 async def _run_agent_invocation(payload, context):
     """
     Handler for agent invocations — streaming responses.
@@ -3750,6 +4114,15 @@ async def _run_agent_invocation(payload, context):
     _CURRENT_WORKFLOW_ID = workflow_id
     _CURRENT_AGENT_ID = agent_id
     _CURRENT_TICKET_ID = payload.get("ticket_id", "")
+    # TEAM-4739 FR-7: a previous turn on this ticket that died or parked left what
+    # it had reached in S3. Prepend it so the retry continues instead of redoing
+    # the work — the whole cost of a mid-turn death was the second attempt
+    # starting from nothing. Missing is the normal case and stays silent.
+    _resume = _read_resume_object(workflow_id, agent_id, _CURRENT_TICKET_ID)
+    if _resume_block := _resume_prompt_block(_resume):
+        prompt = _resume_block + prompt
+        logger.info(f"[{agent_id}] resuming {_CURRENT_TICKET_ID} from a previous attempt "
+                    f"({len(_resume_block)} chars of context prepended)")
     # Fleet-wide watchdog knobs (D1.1) — payload-first → env → legacy constants.
     _WATCHDOG = _resolve_watchdog(payload)
 
@@ -3768,6 +4141,15 @@ async def _run_agent_invocation(payload, context):
     # loop-spanning invoke_agent span never gets exported.
     await _emit_session_anchor_span(agent_id, getattr(context, "session_id", None),
                                     workflow_id, _CURRENT_TICKET_ID)
+
+    # FR-7: bound BEFORE the try so the finally can read them however early the
+    # turn dies — a microVM reaped during agent construction unwinds through the
+    # same finally as one reaped at token 40,000.
+    _turn_crashed = False
+    completion_gate = None
+    park_gate = None
+    final_text = ""
+    last_stream_at = ""
 
     try:
         # Fresh coding session per agent-task: a warm microVM reuses this module, so
@@ -3923,13 +4305,16 @@ async def _run_agent_invocation(payload, context):
             "hub.prompt_cache": "on" if _cache_on else "off",
             "hub.cache_ttl": PERSONA_CACHE_TTL if _cache_on else "",
         }.items() if v}
-        completion_gate = _CompletionGate()
+        completion_gate = _CompletionGate(
+            on_success=lambda: _delete_resume_object(
+                workflow_id, agent_id, _CURRENT_TICKET_ID))
+        park_gate = _ParkGate(_CURRENT_TICKET_ID)
         agent = Agent(
             model=active_model,
             system_prompt=persona_prompt,
             tools=all_tools,
             callback_handler=None,
-            hooks=[_OperatorMailbox(workflow_id, agent_id), completion_gate],
+            hooks=[_OperatorMailbox(workflow_id, agent_id), completion_gate, park_gate],
             name=agent_id,
             trace_attributes=_trace_attrs,
         )
@@ -3944,6 +4329,9 @@ async def _run_agent_invocation(payload, context):
         streamed_any = False
         _text_buffer = ""
         _FLUSH_THRESHOLD = 200  # chars before flushing text to DDB
+        # FR-7: when the turn dies, this is the last moment it was demonstrably
+        # alive — the detector's silence clock and the resume object both read it.
+        last_stream_at = ""
 
         def _flush_text_buffer():
             nonlocal _text_buffer
@@ -3956,12 +4344,62 @@ async def _run_agent_invocation(payload, context):
                 })
                 _text_buffer = ""
 
-        async for event in agent.stream_async(prompt):
+        async def _stream_with_retry():
+            """FR-6: `agent.stream_async(prompt)`, re-opened on a transient break.
+
+            Yields exactly what stream_async yields, so the loop body below is
+            unchanged and every partial the turn already accumulated
+            (`final_text`, `_text_buffer`, `streamed_any`, the DDB deltas already
+            published) survives untouched — a retry appends, it never replays.
+
+            Re-entry is on the SAME Agent object with the SAME prompt object: the
+            conversation, the tool results already returned and the prompt cache
+            are all state on that agent, and rebuilding either would throw the
+            turn away to save the stream. On exhaustion the error is surfaced as
+            `agent.error` and re-raised, which is what keeps agent.error and
+            agent.died disjoint."""
+            attempt = 0
+            deadline = time.monotonic() + _STREAM_RETRY_BUDGET_S
+            while True:
+                attempt += 1
+                try:
+                    async for _ev in agent.stream_async(prompt):
+                        yield _ev
+                    return
+                except Exception as exc:  # noqa: BLE001 — classified below
+                    verdict = _classify_stream_error(exc)
+                    remaining = deadline - time.monotonic()
+                    exhausted = (verdict != "retry"
+                                 or attempt >= _STREAM_RETRY_MAX_ATTEMPTS
+                                 or remaining <= 0)
+                    if exhausted:
+                        logger.error(
+                            f"[{agent_id}] stream failed on attempt {attempt} "
+                            f"({verdict}, {remaining:.1f}s budget left) — giving up: "
+                            f"{type(exc).__name__}: {str(exc)[:300]}")
+                        _publish_agent_error(
+                            workflow_id, agent_id,
+                            f"stream failed after {attempt} attempt(s): "
+                            f"{type(exc).__name__}: {str(exc)[:400]}",
+                            ticket_id=_CURRENT_TICKET_ID)
+                        raise
+                    delay = _stream_retry_delay(attempt, remaining)
+                    logger.warning(
+                        f"[{agent_id}] stream broke on attempt {attempt}/"
+                        f"{_STREAM_RETRY_MAX_ATTEMPTS} "
+                        f"({type(exc).__name__}: {str(exc)[:200]}) — reopening in "
+                        f"{delay:.1f}s with {len(final_text)} chars kept")
+                    if delay:
+                        import asyncio as _retry_asyncio
+                        await _retry_asyncio.sleep(delay)
+
+        async for event in _stream_with_retry():
             if "data" in event and event["data"]:
                 # R3.2: post-completion text duplicates the report_completion summary
                 if not completion_gate.engaged:
                     final_text += event["data"]
                     _text_buffer += event["data"]
+                    last_stream_at = datetime.now(timezone.utc).isoformat()
                     if len(_text_buffer) >= _FLUSH_THRESHOLD:
                         _flush_text_buffer()
                     # TEAM-4695: emit immediately. The caller's response stream is
@@ -4027,7 +4465,57 @@ async def _run_agent_invocation(payload, context):
         # exactly as this did before deltas were streamed.
         if not streamed_any:
             yield {"event": {"contentBlockDelta": {"delta": {"text": final_text}}}}
+    except Exception:
+        # FR-7: this is the CRASH path, and it is what makes agent.error and
+        # agent.died disjoint. Anything that raises out of here is reported as
+        # agent.error — by _stream_with_retry on exhaustion, or by the detached
+        # runner's own except — so the finally below must not also call it a
+        # death. `except Exception`, deliberately not BaseException: a cancelled
+        # task or a closed generator IS a death (the platform took the turn away,
+        # and nothing publishes agent.error for it), so those keep unwinding into
+        # the finally with crashed still False.
+        _turn_crashed = True
+        raise
     finally:
+        # ─── FR-7: did this turn account for itself? ─────────────────────────
+        # Three ways a turn ends legitimately: it reported completion, it parked
+        # its own ticket, or it raised (already reported as agent.error). Anything
+        # else means the turn simply stopped being given time, and that is the
+        # signal nothing downstream had — `agent.error` covered both "the model
+        # failed" and "the process vanished", so the detector could not tell a
+        # retryable death from an exhausted one.
+        #
+        # An UNBOUND turn (chat, a healthcheck, an ad-hoc invoke) is excluded on
+        # purpose: with no workflow and no ticket there is no run to attribute the
+        # death to, and publishing anyway would inflate cost-report's per-run
+        # error count for a run that does not exist.
+        _completed = bool(completion_gate is not None and completion_gate.engaged)
+        _parked = bool(park_gate is not None and park_gate.parked)
+        _accounted = _completed or _parked or _turn_crashed
+        # "unknown" is the sentinel a workflow-less invoke carries (and this
+        # module's own default), so it must count as UNBOUND here exactly as it
+        # does in _publish_event's guard — otherwise a chat turn that happened to
+        # name a ticket would publish a death against a run id nothing can read.
+        _bound = bool(_CURRENT_WORKFLOW_ID
+                      and _CURRENT_WORKFLOW_ID != "unknown"
+                      and _CURRENT_TICKET_ID)
+        if not _accounted and _bound:
+            logger.warning(f"[{agent_id}] turn ended without completion, park or error "
+                           f"— publishing agent.died for {_CURRENT_TICKET_ID}")
+            _publish_agent_died(
+                _CURRENT_WORKFLOW_ID, agent_id, _CURRENT_TICKET_ID,
+                session_id=getattr(context, "session_id", "") or "",
+                last_stream_at=last_stream_at, last_text=final_text)
+        # The resume object is written on a death OR a park — both leave work the
+        # next turn on this ticket should continue from. Not on completion (the
+        # gate's on_success deletes it) and not on a crash (the crash is reported
+        # and re-raised; the retry the orchestrator schedules is a fresh attempt
+        # at a turn that failed for a reason, not a continuation of one that was
+        # cut off mid-thought).
+        if _bound and (_parked or not _accounted):
+            _write_resume_object(_CURRENT_WORKFLOW_ID, agent_id, _CURRENT_TICKET_ID,
+                                 last_text=final_text, last_stream_at=last_stream_at)
+
         # Deliver queued spans before the microVM becomes freeze-eligible.
         # BatchSpanProcessor exports on a daemon thread on a 5s batch delay;
         # after complete_async_task the microVM may freeze immediately, so

@@ -16,6 +16,7 @@ import {
   setRepoCheck,
   appendNotification,
   appendReviewNotificationOnce,
+  appendEscalationOnce,
   ackNotifications,
   completeWorkflow,
   claimTerminalOutcome,
@@ -955,5 +956,126 @@ describe("gate state machine (TEAM-4120 FR-1)", () => {
         "ProvisionedThroughputExceededException"
       );
     });
+  });
+});
+
+/**
+ * TEAM-4739 — appendEscalationOnce. The reconcile sweep's watches re-observe the
+ * same stall every 5 minutes, so "append once per id, bump a bounded count, then
+ * stand down" is what stops a notification storm. Same optimistic notifVersion
+ * CAS as appendReviewNotificationOnce (DynamoDB cannot predicate-match inside a
+ * list, so it is a read-modify-write under a version condition).
+ */
+describe("appendEscalationOnce (TEAM-4739 W1'/W2/W3)", () => {
+  const ID = "notif_watch_gate_TEAM-2";
+  const notif = (over = {}) => ({ type: "manager_escalation", ticketId: "TEAM-2", ...over });
+
+  /** Stub whose GetCommand returns `row`, recording every write. */
+  function rowReturning(row, { failFirstCondition = false } = {}) {
+    const origSend = stubDdb.send;
+    let updates = 0;
+    stubDdb.send = async (cmd) => {
+      sent.push({ type: cmd.constructor.name, input: cmd.input });
+      if (cmd.constructor.name === "GetCommand") return { Item: typeof row === "function" ? row() : row };
+      updates++;
+      if (failFirstCondition && updates === 1) {
+        const err = new Error("moved");
+        err.name = "ConditionalCheckFailedException";
+        throw err;
+      }
+      return {};
+    };
+    return () => { stubDdb.send = origSend; };
+  }
+
+  const lastWrite = () => sent.filter((c) => c.type === "UpdateCommand").at(-1);
+
+  it("appends at count:1 under the notifVersion CAS when nothing is open", async () => {
+    const restore = rowReturning({ workflowId: "wf_1", notifVersion: 2, humanNotifications: [] });
+    try {
+      expect(await appendEscalationOnce("wf_1", ID, notif())).toBe(true);
+    } finally { restore(); }
+    const w = lastWrite();
+    expect(w.input.UpdateExpression).toBe("SET humanNotifications = :n, notifVersion = :next");
+    expect(w.input.ConditionExpression).toContain("notifVersion = :cur");
+    expect(w.input.ExpressionAttributeValues[":cur"]).toBe(2);
+    expect(w.input.ExpressionAttributeValues[":next"]).toBe(3);
+    const list = w.input.ExpressionAttributeValues[":n"];
+    expect(list).toHaveLength(1);
+    expect(list[0]).toMatchObject({ id: ID, type: "manager_escalation", count: 1 });
+  });
+
+  it("bumps the count IN PLACE rather than appending a second row", async () => {
+    const restore = rowReturning({ workflowId: "wf_1", notifVersion: 5, humanNotifications: [
+      { id: ID, type: "manager_escalation", ticketId: "TEAM-2", count: 1, acknowledged: false },
+    ] });
+    try {
+      expect(await appendEscalationOnce("wf_1", ID, notif({ message: "still quiet" }))).toBe(true);
+    } finally { restore(); }
+    const list = lastWrite().input.ExpressionAttributeValues[":n"];
+    expect(list).toHaveLength(1);
+    expect(list[0]).toMatchObject({ id: ID, count: 2, message: "still quiet" });
+  });
+
+  it("stands down once the count would exceed maxCount (no write at all)", async () => {
+    const before = sent.filter((c) => c.type === "UpdateCommand").length;
+    const restore = rowReturning({ workflowId: "wf_1", notifVersion: 9, humanNotifications: [
+      { id: ID, type: "manager_escalation", count: 6, acknowledged: false },
+    ] });
+    try {
+      expect(await appendEscalationOnce("wf_1", ID, notif(), { maxCount: 6 })).toBe(false);
+    } finally { restore(); }
+    expect(sent.filter((c) => c.type === "UpdateCommand")).toHaveLength(before);
+  });
+
+  it("an ACKNOWLEDGED row is history — a fresh stall opens a new one at count:1", async () => {
+    const restore = rowReturning({ workflowId: "wf_1", notifVersion: 3, humanNotifications: [
+      { id: ID, type: "manager_escalation", count: 6, acknowledged: true },
+    ] });
+    try {
+      expect(await appendEscalationOnce("wf_1", ID, notif())).toBe(true);
+    } finally { restore(); }
+    const list = lastWrite().input.ExpressionAttributeValues[":n"];
+    expect(list).toHaveLength(2); // the acked row is retained, never rewritten away
+    expect(list[1]).toMatchObject({ id: ID, count: 1 });
+  });
+
+  it("a DIFFERENT id is a different watch — never deduped against an open one", async () => {
+    const restore = rowReturning({ workflowId: "wf_1", notifVersion: 1, humanNotifications: [
+      { id: "notif_watch_refile_TEAM-2", type: "manager_escalation", count: 2, acknowledged: false },
+    ] });
+    try {
+      expect(await appendEscalationOnce("wf_1", ID, notif())).toBe(true);
+    } finally { restore(); }
+    const list = lastWrite().input.ExpressionAttributeValues[":n"];
+    expect(list).toHaveLength(2);
+    expect(list[1]).toMatchObject({ id: ID, count: 1 });
+  });
+
+  it("re-reads and re-checks the guards after a lost CAS", async () => {
+    let gets = 0;
+    const restore = rowReturning(() => {
+      gets++;
+      // Second read shows a concurrent sweep already opened the row at 6, so the
+      // retry must STAND DOWN rather than blindly re-writing its own count:1.
+      return gets === 1
+        ? { workflowId: "wf_1", notifVersion: 4, humanNotifications: [] }
+        : { workflowId: "wf_1", notifVersion: 5, humanNotifications: [
+            { id: ID, type: "manager_escalation", count: 6, acknowledged: false },
+          ] };
+    }, { failFirstCondition: true });
+    let wrote;
+    try {
+      wrote = await appendEscalationOnce("wf_1", ID, notif(), { maxCount: 6 });
+    } finally { restore(); }
+    expect(wrote).toBe(false);
+    expect(gets).toBe(2);
+  });
+
+  it("a missing workflow row is a no-op, not a throw", async () => {
+    const restore = rowReturning(undefined);
+    try {
+      expect(await appendEscalationOnce("wf_missing", ID, notif())).toBe(false);
+    } finally { restore(); }
   });
 });

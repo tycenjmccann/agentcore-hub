@@ -137,6 +137,32 @@ export const SYSTEM_LABEL_PREFIXES = [
 // even if one is already stored from before this guard existed.
 export const RESERVED_ADVISORY_LABEL = "advisory";
 
+// TEAM-4739 — the gate KINDS a ticket can carry: what external condition its close
+// asserts. Here for the same reason as FIX_KINDS (the twins decide whether the close
+// is allowed, the orchestrator reads it back, none can import the others), and read
+// in BOTH spellings because sanitizeUserLabels rewrites `gate:x` → `gate-x`.
+export const GATE_KINDS = [
+  "approval",
+  "deploy-approval",
+  "blocker",
+  "ci-unavailable",
+  "awaiting-console",
+  "loop-broken",
+];
+export const GATE_LABEL_RE =
+  /^gate[:-](approval|deploy-approval|blocker|ci-unavailable|awaiting-console|loop-broken)$/;
+
+/** The gate kinds a label list carries, deduped, in GATE_KINDS order. */
+export function gateKindsOf(labels) {
+  const list = Array.isArray(labels) ? labels : typeof labels === "string" ? labels.split(",") : [];
+  const found = new Set();
+  for (const raw of list) {
+    const m = GATE_LABEL_RE.exec(String(raw ?? "").trim().toLowerCase());
+    if (m) found.add(m[1]);
+  }
+  return GATE_KINDS.filter((k) => found.has(k));
+}
+
 export const TICKET_KEY_RE = /^[A-Z][A-Z0-9]+-\d+$/;
 
 // DynamoDB-mode ids (and rearmOf/headSha) — bare, bounded, no separators that

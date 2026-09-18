@@ -236,3 +236,98 @@ describe("hasAgentErrorSince (TEAM-4120 FR-3)", () => {
     expect(inputs).toHaveLength(0);
   });
 });
+
+/**
+ * TEAM-4739 — the two additive READ SHAPES. Both must leave every existing call
+ * byte-equivalent: the `types` default is today's single agent.error filter, and
+ * lastStreamedText still returns a bare string unless a caller asks for the
+ * clock. `stealClaim` is still the only write in this module.
+ */
+describe("hasAgentErrorSince types (TEAM-4739)", () => {
+  const filterOf = (inputs) => inputs[0].FilterExpression;
+
+  it('the default is byte-equivalent to an explicit ["agent.error"]', async () => {
+    const a = eventsPages([{ Items: [] }]);
+    await hasAgentErrorSince(a.ddb, "events", "wf_1", "TEAM-2", iso(60_000));
+    const b = eventsPages([{ Items: [] }]);
+    await hasAgentErrorSince(b.ddb, "events", "wf_1", "TEAM-2", iso(60_000), { types: ["agent.error"] });
+    expect(filterOf(a.inputs)).toBe(filterOf(b.inputs));
+    expect(a.inputs[0].ExpressionAttributeValues).toEqual(b.inputs[0].ExpressionAttributeValues);
+    expect(a.inputs[0].ExpressionAttributeNames).toEqual(b.inputs[0].ExpressionAttributeNames);
+    // And it is still exactly today's shape — no OR wrapper, no :died value.
+    expect(filterOf(a.inputs)).toContain("detail.reason <> :dead");
+    expect(a.inputs[0].ExpressionAttributeValues[":died"]).toBeUndefined();
+  });
+
+  it('types:["agent.died"] does NOT apply the dead_session exclusion', async () => {
+    // dead_session is the DETECTOR's own agent.error reason; it can never be the
+    // reason on an agent.died row, so excluding it there would exclude nothing —
+    // and copying the clause would risk dropping deaths that carry a reason.
+    const { ddb, inputs } = eventsPages([{ Items: [] }]);
+    await hasAgentErrorSince(ddb, "events", "wf_1", "TEAM-2", iso(60_000), { types: ["agent.died"] });
+    expect(filterOf(inputs)).toContain("#t = :died");
+    expect(filterOf(inputs)).not.toContain(":dead");
+    expect(inputs[0].ExpressionAttributeValues[":died"]).toBe("agent.died");
+    expect(inputs[0].ExpressionAttributeValues[":err"]).toBeUndefined();
+  });
+
+  it("both types OR together, each keeping its own exclusion rule", async () => {
+    const { ddb, inputs } = eventsPages([{ Items: [] }]);
+    await hasAgentErrorSince(ddb, "events", "wf_1", "TEAM-2", iso(60_000),
+      { types: ["agent.error", "agent.died"] });
+    const f = filterOf(inputs);
+    expect(f).toContain("(#t = :err AND (attribute_not_exists(detail.reason) OR detail.reason <> :dead)) OR #t = :died");
+    expect(inputs[0].ExpressionAttributeValues[":err"]).toBe("agent.error");
+    expect(inputs[0].ExpressionAttributeValues[":died"]).toBe("agent.died");
+  });
+
+  it("an empty types list reads nothing rather than matching everything", async () => {
+    const { ddb, inputs } = eventsPages([{ Items: [{ type: "agent.died", detail: { ticketId: "TEAM-2" } }] }]);
+    expect(await hasAgentErrorSince(ddb, "events", "wf_1", "TEAM-2", iso(0), { types: [] })).toBe(false);
+    expect(inputs).toHaveLength(0);
+  });
+
+  it("finds an agent.died row when asked for it", async () => {
+    const { ddb } = eventsPages([{ Items: [{ type: "agent.died", detail: { ticketId: "TEAM-2" } }] }]);
+    expect(await hasAgentErrorSince(ddb, "events", "wf_1", "TEAM-2", iso(0), { types: ["agent.died"] }))
+      .toBe(true);
+  });
+});
+
+describe("lastStreamedText withTimestamp (TEAM-4739)", () => {
+  it("returns the bare string by default (every existing caller unchanged)", async () => {
+    const { ddb } = eventsPages([{ Items: [streamFrame("hello ")] }]);
+    expect(await lastStreamedText(ddb, "events", "wf_1", "dev_agent", "TEAM-2", 600)).toBe("hello ");
+  });
+
+  it("withTimestamp returns {text, at} — `at` is the NEWEST matching frame's clock", async () => {
+    // Newest-first, so the FIRST match is the latest: "at" must be the newest
+    // row's timestamp even though the text is re-joined chronologically.
+    const { ddb } = eventsPages([{
+      Items: [
+        { ...streamFrame("third "), timestamp: "2026-08-30T11:59:00Z" },
+        { ...streamFrame("second "), timestamp: "2026-08-30T11:58:00Z" },
+        { ...streamFrame("first "), timestamp: "2026-08-30T11:57:00Z" },
+      ],
+    }]);
+    const out = await lastStreamedText(ddb, "events", "wf_1", "dev_agent", "TEAM-2", 600, { withTimestamp: true });
+    expect(out).toEqual({ text: "first second third ", at: "2026-08-30T11:59:00Z" });
+  });
+
+  it("nothing streamed: {text:'', at:''} rather than a throw or a null", async () => {
+    const { ddb } = eventsPages([{ Items: [] }]);
+    expect(await lastStreamedText(ddb, "events", "wf_1", "dev_agent", "TEAM-2", 1, { withTimestamp: true }))
+      .toEqual({ text: "", at: "" });
+  });
+
+  it("a frame for ANOTHER ticket does not set the clock", async () => {
+    const { ddb } = eventsPages([{
+      Items: [
+        { ...streamFrame("theirs ", { ticketId: "TEAM-9" }), timestamp: "2026-08-30T11:59:00Z" },
+        { ...streamFrame("mine ", { ticketId: "TEAM-2" }), timestamp: "2026-08-30T11:50:00Z" },
+      ],
+    }]);
+    const out = await lastStreamedText(ddb, "events", "wf_1", "dev_agent", "TEAM-2", 600, { withTimestamp: true });
+    expect(out).toEqual({ text: "mine ", at: "2026-08-30T11:50:00Z" });
+  });
+});

@@ -697,9 +697,11 @@ Reply: each check -> pass/fail (+ run URL), whether you pushed any commit, final
   swapping roles: `codex` executes (ask for a text plan first and approve it),
   `claude_code` reviews as a fresh session.
 - Respect DL-009: you never touch orchestrator behaviour; waiting = park your own
-  ticket `blocked` with `blocked_by`, exit without `report_completion`; never
-  leave a ticket `in_progress` with no live session; never mark Done with an
-  unresolved P0/P1.
+  ticket `blocked` with `blocked_by`, exit without `report_completion` (DL-024);
+  never leave a ticket `in_progress` with no live session; never mark Done with
+  an unresolved P0/P1. The harness observes a successful self-park and never
+  reports it as `agent.died`; a park the tool REFUSED (its result is not
+  `transitioned`) is not a park — re-read the error and fix it before exiting.
 - `PR head == reviewed SHA == CI SHA` at brief time, and `== approved SHA` at
   merge time. Drift = re-check / do-not-merge, never "probably fine". Every
   merge to `base_branch`, including a deploy-recovery PR, has its own human

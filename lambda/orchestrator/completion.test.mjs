@@ -433,6 +433,14 @@ describe("shipVerdictOf — one harvested ship entry (TEAM-3747 D2)", () => {
     expect(shipVerdictOf({ outcome: "STATIC-CI-ONLY" })).toBe("static-ci-only");
   });
 
+  it('TEAM-4739: "empty_sweep" is a SHIPPED verdict, not a blocked one', () => {
+    // "there was nothing to merge" is a finished run. If it were blocked the run
+    // would sit in unfinished work forever and page a human about a success.
+    expect(shipVerdictOf({ outcome: "empty_sweep" })).toBe("shipped");
+    expect(shipVerdictOf({ outcome: "  Empty_Sweep " })).toBe("shipped");
+    expect(SHIP_BLOCKED_OUTCOMES).not.toContain("empty_sweep");
+  });
+
   it("output/artifactKey are NOT a merge verdict — the whole point of the gate", () => {
     expect(
       shipVerdictOf({
@@ -523,6 +531,11 @@ describe("evaluateShipVerdict — run-level verdict (TEAM-3747 D2)", () => {
     expect(v.shipped).toBe(false);
     expect(v.outcome).toBe("static-ci-only");
     expect(v.offenders).toEqual([{ ticketId: "T-4", phase: "ship", verdict: "static-ci-only" }]);
+  });
+
+  it('TEAM-4739: an empty_sweep ship entry ships the run with no offenders', () => {
+    const v = evaluateShipVerdict(doneRun(), tasksWithShip({ outcome: "empty_sweep" }), SHIP, opts);
+    expect(v).toEqual({ required: true, shipped: true, outcome: null, blockReason: null, offenders: [] });
   });
 
   it("resolves the ship entry keyed by task id with a ticketId field", () => {

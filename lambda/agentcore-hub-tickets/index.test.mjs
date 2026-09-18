@@ -41,14 +41,47 @@ const h = vi.hoisted(() => ({
     headImpl: /** @type {((input: any) => any) | null} */ (null),
     /** Keys that exist for HeadObject, e.g. completions/TEAM-4066.json. */
     s3Objects: /** @type {Record<string, true>} */ ({}),
-    // TEAM-4740 FR-5: the rows the parentId-index Query returns (create_ticket's
-    // open-gate autowire scan), every Query issued, and the switch that makes the
-    // scan FAIL — the fail-open direction is the whole point of the feature, so it
-    // has to be drivable.
+    // TEAM-4739: the typed gate guard's probe into the pipeline-tools Lambda —
+    // every call recorded (so "made no probe at all" is assertable), and the reply
+    // injected by tool name. An absent entry makes the invoke THROW, which is the
+    // suite's default and the case the admit-on-indeterminate rule turns on.
+    probes: /** @type {any[]} */ ([]),
+    probeBy: /** @type {Record<string, {result?: unknown}>} */ ({}),
+    // TEAM-4739 gate-loop gather / TEAM-4740 FR-5 open-gate autowire scan — both
+    // features read the SAME parentId-index Query, so they share this fixture.
     siblings: /** @type {any[]} */ ([]),
+    /** Journey events written through publishJourneyEvent. */
+    events: /** @type {any[]} */ ([]),
+    /** Make the NEXT conditional status write lose its race, once. */
+    statusRaceOnce: false,
+    // TEAM-4740 FR-5: every Query issued, and the switch that makes the scan
+    // FAIL — the fail-open direction is the whole point of the feature, so it
+    // has to be drivable.
     queries: /** @type {any[]} */ ([]),
     queryThrows: false,
   },
+}));
+
+vi.mock("@aws-sdk/client-lambda", () => ({
+  LambdaClient: class {
+    async send(cmd) {
+      const req = JSON.parse(Buffer.from(cmd.input.Payload).toString("utf8"));
+      h.state.probes.push({ tool: req.tool_name, args: req.parameters });
+      const plan = h.state.probeBy[req.tool_name];
+      if (!plan) {
+        const err = new Error("connect ETIMEDOUT");
+        err.name = "TimeoutError";
+        throw err;
+      }
+      // The real tools Lambda double-encodes (`jsonResult`), so feed that shape.
+      return {
+        Payload: Buffer.from(
+          JSON.stringify({ content: [{ type: "text", text: JSON.stringify(plan.result, null, 2) }] })
+        ),
+      };
+    }
+  },
+  InvokeCommand: class { constructor(input) { this.input = input; } },
 }));
 
 vi.mock("@aws-sdk/client-dynamodb", () => ({ DynamoDBClient: class {} }));
@@ -105,6 +138,15 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
             }
             if (cmd.input.ExpressionAttributeValues?.[":s"] !== undefined) {
               // A transitionIssue status write, not nextTicketId's counter bump.
+              // TEAM-4739: a conditional one carries the gate label plan, and can
+              // lose its race with a concurrent labeller.
+              if (h.state.statusRaceOnce && cmd.input.ConditionExpression) {
+                h.state.statusRaceOnce = false;
+                h.state.statusUpdates.push(cmd.input);
+                const err = new Error("The conditional request failed");
+                err.name = "ConditionalCheckFailedException";
+                throw err;
+              }
               h.state.statusUpdates.push(cmd.input);
               return {};
             }
@@ -120,10 +162,17 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
             return { Attributes: { nextNum: h.state.counter } };
           }
           if (name === "GetCommand") return { Item: h.state.items[cmd.input.Key.ticketId] };
-          if (name === "PutCommand") { h.state.puts.push(cmd.input.Item); return {}; }
+          if (name === "PutCommand") {
+            // TEAM-4739: a journey event and a new ticket both arrive as a Put;
+            // `eventId` is what tells them apart.
+            if (cmd.input.Item?.eventId) h.state.events.push(cmd.input.Item);
+            else h.state.puts.push(cmd.input.Item);
+            return {};
+          }
           if (name === "QueryCommand") {
             // TEAM-4740 FR-5: the sibling scan. Returned unfiltered (the Lambda
-            // drops __COUNTER__ itself) so the test can prove it does.
+            // drops __COUNTER__ itself) so the test can prove it does. Also feeds
+            // TEAM-4739's gate-loop gather — same parentId-index Query.
             h.state.queries.push(cmd.input);
             if (h.state.queryThrows) {
               const err = new Error("Requested resource not found: parentId-index");
@@ -161,10 +210,17 @@ beforeEach(async () => {
   h.state.s3Heads.length = 0;
   h.state.headImpl = null;
   h.state.s3Objects = {};
+  h.state.probes.length = 0;
+  h.state.probeBy = {};
   h.state.siblings.length = 0;
+  h.state.events.length = 0;
+  h.state.statusRaceOnce = false;
   h.state.queries.length = 0;
   h.state.queryThrows = false;
   delete process.env.ARTIFACT_BUCKET;
+  // TEAM-4739: both are read at MODULE LOAD, so the default here is "unset" — the
+  // configuration an install that has never heard of the gate guard still has.
+  delete process.env.PIPELINE_TOOLS_LAMBDA;
   // TEAM-4740 FR-5: the journey-event writer is dark unless EVENTS_TABLE is set,
   // and it writes through the same doc client — leaving it set would put an event
   // row into state.puts and make every ticket assertion below ambiguous.
@@ -172,6 +228,13 @@ beforeEach(async () => {
   vi.resetModules();
   ({ handler } = await import("./index.mjs"));
 });
+
+/** Reload the Lambda with gate-guard env set (both consts are load-time). */
+async function reloadWithEnv(env = {}) {
+  for (const [k, v] of Object.entries(env)) process.env[k] = v;
+  vi.resetModules();
+  ({ handler } = await import("./index.mjs"));
+}
 
 const BASE = { summary: "Fix null check", assignee: "agentcore_hub_backend_dev" };
 // TEAM-4130 F1: the run's ship ticket, the one a blocker edge must not strand.
@@ -1092,6 +1155,253 @@ describe("transition_ticket — ship-phase Done needs a completion record (TEAM-
 });
 
 /**
+ * TEAM-4739 — the typed gate guard, in the mechanics only THIS twin has.
+ *
+ * The cross-provider truth table lives in src/lib/workflow/gate-guard-parity.test.ts
+ * (it drives both Lambdas through the same rows and compares the refusal payloads
+ * byte for byte). What is asserted here is what has no Jira counterpart:
+ *   - the UNSET env default: with no PIPELINE_TOOLS_LAMBDA the guard admits and
+ *     never constructs a client — the configuration every existing install has;
+ *   - `planGateLabelWrite`'s three shapes, which exist because DynamoDB forbids one
+ *     UpdateExpression from touching both `labels` and `labels[i]`;
+ *   - the conditional status write losing a race with a concurrent labeller.
+ */
+describe("transition_ticket — typed gate guard, DynamoDB-side mechanics (TEAM-4739)", () => {
+  const transition = (args) => handler({ name: "Tickets___transition_ticket", arguments: args });
+  const GATE = "TEAM-4700";
+  const PIPELINE = "hub-x-deploy";
+  const EXEC = "0f8fad5b-d9cb-469f-a165-70867728950e";
+
+  const gateTicket = (labels, extra = {}) => ({
+    ticketId: GATE,
+    status: "in_review",
+    assignee: "human:reviewer",
+    labels,
+    workflowId: "wf_1",
+    ...extra,
+  });
+  const DEPLOY_LABELS = [`gate:deploy-approval`, `pipeline:${PIPELINE}`, `exec:${EXEC}`];
+
+  describe("with NO PIPELINE_TOOLS_LAMBDA configured (the default install)", () => {
+    it("admits the close, stamps indeterminate, and never builds a probe", async () => {
+      // This is the fail direction stated as a deployment fact: an install that has
+      // not been given the probe function must not have every gate ticket become
+      // uncloseable. `probe_not_configured` is an indeterminate, not a refusal.
+      h.state.items[GATE] = gateTicket(DEPLOY_LABELS);
+
+      const res = await transition({ ticket_id: GATE, to_status: "done" });
+
+      expect(res.gateVerification).toMatchObject({
+        result: "indeterminate",
+        reason: "probe_failed",
+        evidence: "probe_not_configured",
+        gateKind: "deploy-approval",
+      });
+      expect(h.state.probes, "no client, no invoke").toHaveLength(0);
+      expect(h.state.statusUpdates).toHaveLength(1);
+      expect(h.state.statusUpdates[0].ExpressionAttributeValues[":s"]).toBe("done");
+    });
+
+    it("a ci-unavailable gate admits too", async () => {
+      h.state.items[GATE] = gateTicket(["gate:ci-unavailable", `head:${"a".repeat(40)}`]);
+      const res = await transition({ ticket_id: GATE, to_status: "done" });
+      expect(res.gateVerification.result).toBe("indeterminate");
+      expect(h.state.statusUpdates).toHaveLength(1);
+    });
+  });
+
+  describe("with the probe configured", () => {
+    beforeEach(async () => {
+      await reloadWithEnv({ PIPELINE_TOOLS_LAMBDA: "hub-pipeline-tools", EVENTS_TABLE: "agentcore-hub-events" });
+    });
+
+    it("refuses an OPEN approval, leaves the ticket, and pages exactly once", async () => {
+      h.state.probeBy.Pipeline___get_state = {
+        result: { waitingOn: { stage: "Deploy", action: "ApproveDeploy", holdsGate: "this" } },
+      };
+      h.state.items[GATE] = gateTicket(DEPLOY_LABELS);
+
+      const res = await transition({ ticket_id: GATE, to_status: "done" });
+
+      expect(res).toMatchObject({ ok: false, reason: "gate_condition_unmet", stage: "Deploy", action: "ApproveDeploy" });
+      expect(h.state.statusUpdates, "the ticket does not move").toHaveLength(0);
+      expect(h.state.labelUpdates.map((u) => u.ExpressionAttributeValues[":label"])).toEqual(["gate:awaiting-console"]);
+      expect(h.state.events.map((e) => e.type)).toEqual(["gate.repaged"]);
+      expect(h.state.events[0].detail).toMatchObject({ ticketId: GATE, gateKind: "deploy-approval", attempt: 1 });
+    });
+
+    it("the conditional label add is the event dedupe — a repeat refusal is silent", async () => {
+      h.state.probeBy.Pipeline___get_state = { result: { waitingOn: { holdsGate: "this" } } };
+      h.state.items[GATE] = gateTicket([...DEPLOY_LABELS, "gate:awaiting-console"]);
+      // The label is already on the row, so its conditional append fails → no page.
+      h.state.condFail.push("gate:awaiting-console");
+
+      const res = await transition({ ticket_id: GATE, to_status: "done" });
+
+      expect(res.reason).toBe("gate_condition_unmet");
+      expect(h.state.events, "no second gate.repaged").toHaveLength(0);
+    });
+
+    it("a refusal survives an unwritable events table and an unlabelable ticket", async () => {
+      // Every side effect is best-effort: a correct refusal must not degrade into a
+      // tool error because the events table throttled.
+      h.state.probeBy.Pipeline___get_state = { result: { waitingOn: { holdsGate: "this" } } };
+      h.state.items[GATE] = gateTicket(DEPLOY_LABELS);
+      h.state.condFail.push("gate:awaiting-console");
+
+      const res = await transition({ ticket_id: GATE, to_status: "done" });
+      expect(res.reason).toBe("gate_condition_unmet");
+      expect(res.hint).toContain("still OPEN");
+    });
+
+    it("EVENTS_TABLE unset ⇒ no event, same refusal", async () => {
+      delete process.env.EVENTS_TABLE;
+      await reloadWithEnv({ PIPELINE_TOOLS_LAMBDA: "hub-pipeline-tools" });
+      h.state.probeBy.Pipeline___get_state = { result: { waitingOn: { holdsGate: "this" } } };
+      h.state.items[GATE] = gateTicket(DEPLOY_LABELS);
+
+      const res = await transition({ ticket_id: GATE, to_status: "done" });
+
+      expect(res.reason).toBe("gate_condition_unmet");
+      expect(h.state.events).toHaveLength(0);
+      expect(h.state.labelUpdates).toHaveLength(1); // the label still lands
+    });
+
+    describe("planGateLabelWrite — one UpdateExpression, three shapes", () => {
+      beforeEach(() => {
+        h.state.probeBy.Pipeline___get_state = { result: { waitingOn: null } };
+      });
+
+      it("no parked label ⇒ a plain list_append, no condition", async () => {
+        h.state.items[GATE] = gateTicket(DEPLOY_LABELS);
+        await transition({ ticket_id: GATE, to_status: "done" });
+        const w = h.state.statusUpdates[0];
+        expect(w.UpdateExpression).toContain("list_append(if_not_exists(#l, :emptyl), :stampl)");
+        expect(w.ExpressionAttributeValues[":stampl"]).toEqual(["gateverify:verified"]);
+        expect(w.ConditionExpression).toBeUndefined();
+      });
+
+      it("a parked label ⇒ its SLOT is overwritten with the stamp, under a condition", async () => {
+        // Not `SET labels = list_append(...)` + `REMOVE labels[i]`: DynamoDB rejects
+        // overlapping document paths. Not a whole-list SET either — that clobbers a
+        // concurrent labeller.
+        h.state.items[GATE] = gateTicket(["gate:awaiting-console", ...DEPLOY_LABELS]);
+        await transition({ ticket_id: GATE, to_status: "done" });
+        const w = h.state.statusUpdates[0];
+        expect(w.UpdateExpression).toContain("#l[0] = :stampl");
+        expect(w.UpdateExpression).not.toContain("list_append");
+        expect(w.ExpressionAttributeValues[":stampl"]).toBe("gateverify:verified");
+        expect(w.ConditionExpression).toBe("#l[0] = :awaiting");
+        expect(w.ExpressionAttributeValues[":awaiting"]).toBe("gate:awaiting-console");
+      });
+
+      it("stamp already present ⇒ the parked slot is REMOVEd and nothing re-added", async () => {
+        h.state.items[GATE] = gateTicket([...DEPLOY_LABELS, "gate:awaiting-console", "gateverify:verified"]);
+        await transition({ ticket_id: GATE, to_status: "done" });
+        const w = h.state.statusUpdates[0];
+        expect(w.UpdateExpression).toMatch(/REMOVE #l\[3]/);
+        expect(w.ExpressionAttributeValues[":stampl"]).toBeUndefined();
+      });
+
+      it("the stamp rides in the SAME write as the status", async () => {
+        h.state.items[GATE] = gateTicket(DEPLOY_LABELS);
+        await transition({ ticket_id: GATE, to_status: "done" });
+        expect(h.state.statusUpdates).toHaveLength(1);
+        const w = h.state.statusUpdates[0];
+        expect(w.UpdateExpression).toContain("#s = :s");
+        expect(w.UpdateExpression).toContain("#gv = :gv");
+        expect(w.ExpressionAttributeValues[":gv"]).toMatchObject({ result: "verified", gateKind: "deploy-approval" });
+      });
+
+      it("losing the label race still transitions — without the label clause", async () => {
+        // The gate was verified; the only thing lost is a cosmetic label edit. A
+        // verified gate that cannot close because a labeller raced it would be the
+        // same wedge the whole guard is built to avoid.
+        h.state.items[GATE] = gateTicket(["gate:awaiting-console", ...DEPLOY_LABELS]);
+        h.state.statusRaceOnce = true;
+
+        const res = await transition({ ticket_id: GATE, to_status: "done" });
+
+        expect(res).toMatchObject({ status: "transitioned", to: "done" });
+        expect(h.state.statusUpdates).toHaveLength(2);
+        expect(h.state.statusUpdates[1].ConditionExpression).toBeUndefined();
+        expect(h.state.statusUpdates[1].UpdateExpression).not.toContain("#l");
+        // The verdict is still recorded — the retry drops the LABEL, not the stamp.
+        expect(h.state.statusUpdates[1].ExpressionAttributeValues[":gv"].result).toBe("verified");
+      });
+    });
+
+    it("a non-gate ticket's write is byte-identical to the pre-TEAM-4739 one", async () => {
+      h.state.items[GATE] = gateTicket(["phase:development"]);
+      const res = await transition({ ticket_id: GATE, to_status: "done" });
+      expect(res.gateVerification).toBeUndefined();
+      expect(h.state.probes).toHaveLength(0);
+      expect(h.state.statusUpdates[0].UpdateExpression).toBe("SET #s = :s, #u = :u");
+    });
+
+    it("the ship-phase completion gate still wins — it refuses BEFORE any probe", async () => {
+      // Ordering matters: a ship ticket with no completion record must report the
+      // missing record (which the agent can produce), not a gate verdict.
+      // An AGENT assignee: a `human:` one is never a ship-phase ticket (that is
+      // what makes the gate tickets above exempt from the completion-record gate).
+      h.state.items[GATE] = gateTicket(["gate:deploy-approval", "phase:ship"], {
+        assignee: "agentcore_hub_release_manager",
+      });
+      const res = await transition({ ticket_id: GATE, to_status: "done" });
+      expect(res.reason).toBe("completion_record_required");
+      expect(h.state.probes, "no gate probe on a completion-record refusal").toHaveLength(0);
+    });
+  });
+});
+
+/**
+ * TEAM-4739 — create_ticket's gate-loop seam, DynamoDB-side.
+ *
+ * The cross-provider matrix is in src/lib/workflow/gate-loop-parity.test.ts. What is
+ * local here: the seam's PLACE in createTicket (before the id counter is touched),
+ * and that the parentId-index Query is the only gather it does.
+ */
+describe("create_ticket — gate-loop seam, DynamoDB-side (TEAM-4739)", () => {
+  const EPIC = "TEAM-1";
+  const SHA = "b".repeat(40);
+  const CI_GATE = ["gate:ci-unavailable", `head:${SHA}`];
+  const priorRow = (id) => ({ ticketId: id, labels: ["gate-ci-unavailable", `head-${SHA}`] });
+
+  beforeEach(async () => {
+    await reloadWithEnv({ PIPELINE_TOOLS_LAMBDA: "hub-pipeline-tools", EVENTS_TABLE: "agentcore-hub-events" });
+    h.state.items[EPIC] = { ticketId: EPIC, type: "epic", workflowId: "wf_1", labels: [] };
+  });
+
+  it("refuses the third, and mints NO ticket id", async () => {
+    h.state.siblings.push(priorRow("TEAM-800"), priorRow("TEAM-810"));
+
+    const res = await create({ summary: "CI is unavailable", labels: CI_GATE, parent_key: EPIC });
+
+    expect(res).toMatchObject({ ok: false, reason: "gate_loop_environmental", existingTicketId: "TEAM-800" });
+    expect(h.state.puts, "no ticket written").toHaveLength(0);
+    expect(h.state.counter, "the shared id counter is untouched").toBe(0);
+    expect(h.state.labelUpdates[0].ExpressionAttributeValues[":label"]).toBe("gate:loop-broken");
+    expect(h.state.events.map((e) => e.type)).toEqual(["workflow.blocked"]);
+  });
+
+  it("the __COUNTER__ row is never counted as a sibling", async () => {
+    // It lives in the same table and would otherwise be mapped into the verdict as
+    // a labelless row — harmless for a targeted gate, but it must not be there.
+    h.state.siblings.push({ ticketId: "__COUNTER__", nextNum: 42 }, priorRow("TEAM-800"));
+    const res = await create({ summary: "CI is unavailable", labels: CI_GATE, parent_key: EPIC });
+    expect(res.ok).not.toBe(false);
+    expect(h.state.puts).toHaveLength(1);
+  });
+
+  it("an ordinary ticket makes no sibling scan and no probe", async () => {
+    h.state.siblings.push(priorRow("TEAM-800"), priorRow("TEAM-810"));
+    await create({ ...BASE });
+    expect(h.state.puts).toHaveLength(1);
+    expect(h.state.probes).toHaveLength(0);
+  });
+});
+
+/**
  * TEAM-4740 FR-12 — base_branch at CREATE time.
  *
  * A ticket filed mid-run with no branch identity inherits whatever branch its
@@ -1404,14 +1714,20 @@ describe("create_ticket — open-gate autowire (FR-5)", () => {
     // Dark by default (the deploy env sets no EVENTS_TABLE): one write, the ticket.
     await create({ ...AGENT });
     expect(h.state.puts).toHaveLength(1);
+    expect(h.state.events).toHaveLength(0);
 
     process.env.EVENTS_TABLE = "agentcore-hub-events";
     h.state.puts.length = 0;
     await create({ ...AGENT, workflow_id: "wf_1757000000_si" });
     delete process.env.EVENTS_TABLE;
 
-    expect(h.state.puts).toHaveLength(2);
-    const event = h.state.puts[1];
+    // TEAM-4739's gate-loop event and TEAM-4740's autowire event both carry an
+    // `eventId`, so the mock routes any such Put into `h.state.events`, never
+    // `h.state.puts` — the ticket write and the audit write stay distinguishable
+    // by construction, not by array position.
+    expect(h.state.puts).toHaveLength(1);
+    expect(h.state.events).toHaveLength(1);
+    const event = h.state.events[0];
     expect(event.workflowId).toBe("wf_1757000000_si");
     expect(event.type).toBe("plan.autowired");
     expect(event.detail).toEqual({

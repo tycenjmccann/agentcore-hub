@@ -1,0 +1,657 @@
+/**
+ * gate-contract.mjs — the shared GATE contract for the two ticket Lambdas
+ * (TEAM-4739).
+ *
+ * A "gate ticket" is one whose close asserts something about the world OUTSIDE
+ * the pipeline: a human approved a production deploy, CI has no build for a SHA,
+ * a blocker is gone. Historically nothing checked the assertion — a persona could
+ * transition such a ticket `→ done` from memory, and the cascade would dispatch
+ * downstream work over a gate nobody had proven. This module is the read side of
+ * that check: the label grammar that binds a gate ticket to its evidence, the
+ * probe that fetches the evidence, and the pure verdicts computed from it.
+ *
+ * ── Scope: the TWINS only ───────────────────────────────────────────────────
+ * This is NOT an orchestrator module. It lives in lambda/agentcore-hub-tickets/
+ * and lambda/agentcore-hub-jira/ only, it is not on lambda/orchestrator/deploy.sh's
+ * zip line, and it is not counted against the DL-009 orchestrator budgets
+ * (scripts/check-orchestrator-surface.sh). The orchestrator's half of the gate
+ * vocabulary — GATE_KINDS / GATE_LABEL_RE / gateKindsOf — lives in fix-contract.mjs,
+ * which all three Lambdas already carry; this module imports it from there rather
+ * than re-deriving the grammar, because two spellings of the gate-kind list is
+ * exactly the silent drift the parity guards exist to prevent.
+ *
+ * ── TWO byte-identical copies ───────────────────────────────────────────────
+ * Each ticket Lambda ships as a self-contained single-directory zip, so the two
+ * cannot share a file; the module is duplicated byte-for-byte and CI compares the
+ * copies (scripts/check-fix-kinds-parity.sh §1b, plus the behavioural matrix in
+ * src/lib/workflow/gate-contract-parity.test.ts).
+ * EDIT THE TICKETS COPY, THEN: cp lambda/agentcore-hub-tickets/gate-contract.mjs \
+ *                                lambda/agentcore-hub-jira/gate-contract.mjs
+ * Unlike fix-contract.mjs this module is NOT import-free: it does I/O, so it
+ * imports @aws-sdk/* (resolved from the nodejs20.x runtime — neither zip carries
+ * node_modules) and the gate-kind grammar from ./fix-contract.mjs, which both
+ * zips already pack. Nothing else.
+ *
+ * ── The fail direction (do not "fix" this to be stricter) ───────────────────
+ * Everything here answers ONE question: "may this gate ticket close?" Its
+ * dangerous failure mode is an UNLIFTABLE STALL — there is no escalation rung
+ * above the human, so a gate the system refuses to let anyone close wedges the run
+ * forever. So a caller may refuse only on a DEFINITE NEGATIVE: a *successful*
+ * probe read whose content contradicts the close. Anything indeterminate — the
+ * invoke threw, the timeout fired, the payload did not parse, the tool was not on
+ * the allow-list — must ADMIT and be recorded as `gateVerification:"indeterminate"`.
+ * That is why invokeProbe NEVER throws and never returns a verdict of its own: it
+ * returns `{ok:true, result}` or `{ok:false, indeterminate:true, error}`, and the
+ * `ok:false` branch is always an admit.
+ *
+ * DL-028 is a DIFFERENT question — "may I deploy?" — where the dangerous failure
+ * is an unapproved production change and positive evidence is mandatory. That rule
+ * is untouched here, and nothing in this module can approve a deploy: PROBE_TOOLS
+ * is a read-only allow-list and the pipeline-tools Lambda has no approval call at
+ * all.
+ *
+ * ── Why journey events written here carry a ttl ─────────────────────────────
+ * lambda/workflow-output/index.mjs writes journey events with NO ttl, so the rows
+ * this module writes are the first expiring ones in agentcore-hub-events (the
+ * table's TTL attribute is `ttl`, enabled at create time by
+ * scripts/create-dynamodb-tables.sh). The window must outlive every consumer's
+ * reporting horizon: cost-report reads a run's events at report time, and the
+ * Workflow tab replays a finished run's journey. 90 days is comfortably past both
+ * and keeps a gate's paging history auditable for a full quarter.
+ */
+
+import { LambdaClient, InvokeCommand } from "@aws-sdk/client-lambda";
+import { PutCommand } from "@aws-sdk/lib-dynamodb";
+import { GATE_KINDS, gateKindsOf } from "./fix-contract.mjs";
+
+// ── Label grammar ───────────────────────────────────────────────────────────
+// Labels arrive in two spellings and must read identically: agents write the
+// canonical colon form, and the twins' sanitizeUserLabels rewrites
+// [^a-z0-9._-] → "-", so the SAME gate can be stored as `head-<sha>` /
+// `exec-<uuid>` / `gate-merge-approval`. Same `[:-]` rule as the Telegram
+// bridge's parseDeployApprovalLabels and fix-contract.mjs's GATE_LABEL_RE.
+export const HEAD_LABEL_RE = /^head[:-]([0-9a-f]{40})$/i;
+export const EXEC_LABEL_RE = /^exec[:-]([0-9a-f-]{36})$/i;
+export const MERGE_GATE_LABEL_RE = /^gate[:-]merge-approval$/;
+
+function labelList(labels) {
+  const list = Array.isArray(labels) ? labels : typeof labels === "string" ? labels.split(",") : [];
+  return list
+    .map((l) =>
+      String(l ?? "")
+        .trim()
+        .toLowerCase()
+    )
+    .filter(Boolean);
+}
+
+function firstCapture(labels, re) {
+  for (const l of labelList(labels)) {
+    const m = re.exec(l);
+    if (m) return m[1].toLowerCase();
+  }
+  return null;
+}
+
+/** The commit SHA a gate ticket is bound to, from `head:<40hex>`. */
+export function gateHeadOf(labels) {
+  return firstCapture(labels, HEAD_LABEL_RE);
+}
+
+/** The pipeline execution a gate ticket is bound to, from `exec:<uuid>`. */
+export function gateExecOf(labels) {
+  return firstCapture(labels, EXEC_LABEL_RE);
+}
+
+// The third binding: which pipeline the gate belongs to. The Telegram bridge's
+// DEPLOY_PIPELINE_LABEL_RE captures `(.+)` — right for a reader that only echoes
+// the value back to a human — but this capture is FORWARDED as a probe argument,
+// so the charset is narrowed to what an AWS resource name can be. Nothing here
+// derives the CI/build project names from it: pipelineProjects() (and its TS
+// mirror) is the one place allowed to do that.
+export const PIPELINE_LABEL_RE = /^pipeline[:-]([a-z0-9][a-z0-9._-]{0,127})$/i;
+
+/** The pipeline a gate ticket is bound to, from `pipeline:<name>`. */
+export function gatePipelineOf(labels) {
+  return firstCapture(labels, PIPELINE_LABEL_RE);
+}
+
+// ── The labels the guard itself writes ──────────────────────────────────────
+// Written through each provider's ADDITIVE label verb (the DynamoDB twin's
+// conditional list_append, Jira's `update:{labels:[{add}]}`), never a whole-list
+// SET. The canonical colon spelling is used because these are SYSTEM labels
+// (normalizeSystemLabel keeps the colon); the matching readers accept both
+// spellings anyway, since an agent may have hand-written the hyphen form.
+export const GATE_AWAITING_CONSOLE_LABEL = "gate:awaiting-console";
+export const GATE_LOOP_BROKEN_LABEL = "gate:loop-broken";
+export const GATE_AWAITING_CONSOLE_RE = /^gate[:-]awaiting-console$/;
+export const GATE_LOOP_BROKEN_RE = /^gate[:-]loop-broken$/;
+
+// The verification stamp. A LABEL and not only a field because Jira has nowhere
+// to put a structured map — the DynamoDB twin persists `gateVerification`
+// {result, reason, evidence, gateKind, probedAt} as well, but the label is the
+// part both providers write, in the SAME call as the status change, so a reader
+// can never see a closed gate whose verification has not landed yet.
+//
+// Structurally forgery-safe (contradiction 9 of the plan): the guard only ever
+// ADDS a verification and never READS one to admit a close, so an agent that
+// hand-labels `gateverify:verified` buys itself nothing — its ticket is probed
+// exactly the same way and the stamp is overwritten by the real verdict.
+export const GATE_VERIFICATIONS = ["verified", "indeterminate"];
+export const GATE_VERIFICATION_LABEL_RE = /^gateverify[:-](verified|indeterminate)$/;
+
+export function gateVerificationLabel(result) {
+  return GATE_VERIFICATIONS.includes(result) ? `gateverify:${result}` : "";
+}
+
+// ── Which gate kinds are actually PROBED ────────────────────────────────────
+// GATE_KINDS (fix-contract.mjs) is the label vocabulary; this is the subset whose
+// close asserts something a read can contradict. `approval` is deliberately out:
+// a plain human escalation gate is answered by a person, is deliberately RE-FILED
+// when a round cap trips, and has no external system to ask — probing it would
+// only add a way to stall it. `awaiting-console` and `loop-broken` are the
+// guard's own bookkeeping labels, never a ticket's kind.
+export const PROBED_GATE_KINDS = ["deploy-approval", "ci-unavailable", "blocker"];
+
+/** The one probed gate kind a ticket carries (PROBED_GATE_KINDS order), or null. */
+export function probedGateKindOf(labels) {
+  const kinds = gateKindsOf(labels);
+  for (const kind of PROBED_GATE_KINDS) if (kinds.includes(kind)) return kind;
+  return null;
+}
+
+// The two refusal reasons this contract can produce. Agents and the orchestrator
+// match on these strings, so they are exported rather than inlined twice.
+export const GATE_CONDITION_UNMET = "gate_condition_unmet";
+export const GATE_LOOP_ENVIRONMENTAL = "gate_loop_environmental";
+
+// ── DECISION lines ──────────────────────────────────────────────────────────
+// The options a human (or an agent acting on a human's instruction) can record on
+// a gate ticket to lift an environmental stall. A DECISION is ADVISORY: it can
+// admit a close that would otherwise stall, and it can NEVER manufacture
+// "verified" — the caller records `indeterminate` with sub-reason
+// `decision_advisory`.
+export const FIX_DECISIONS = ["repaired", "accept-proxy", "abort"];
+
+// Same grammar as lambda/orchestrator/review-cap.mjs parseDecision (the LAST line
+// that is nothing but `DECISION: <option>`, markdown noise tolerated), with two
+// deliberate divergences:
+//   - review-cap's leading class is `[\s>*-]*`, which tolerates a BLOCKQUOTED
+//     decision on purpose (a human replying inline in Jira). Here a quoted line is
+//     usually the OPTIONS being repeated back, or text quoted from somewhere else,
+//     so `>` is not in the class and a quoted DECISION does not count;
+//   - lines inside a fenced ``` / ~~~ block are skipped entirely, for the same
+//     reason: a fenced DECISION is documentation of the syntax, not a use of it.
+const DECISION_LINE_RE = /^[\s*-]*(?:\*\*)?\s*decision\s*:\s*([a-z][a-z-]*)\s*(?:\*\*)?\s*\.?\s*$/i;
+const FENCE_RE = /^\s*(?:```|~~~)/;
+
+/**
+ * The DECISION recorded in a gate ticket's description, or null.
+ * Fail-closed: only an explicit, well-formed, unquoted, unfenced line counts.
+ * @returns {"repaired"|"accept-proxy"|"abort"|null}
+ */
+export function parseFixDecision(text) {
+  let fenced = false;
+  let found = null;
+  for (const raw of String(text || "").split(/\r?\n/)) {
+    if (FENCE_RE.test(raw)) {
+      fenced = !fenced;
+      continue;
+    }
+    if (fenced) continue;
+    const m = DECISION_LINE_RE.exec(raw);
+    if (!m) continue;
+    const candidate = m[1].toLowerCase();
+    if (FIX_DECISIONS.includes(candidate)) found = candidate; // last one wins
+  }
+  return found;
+}
+
+// ── Journey events ──────────────────────────────────────────────────────────
+export const JOURNEY_EVENT_TTL_SEC = 90 * 24 * 60 * 60; // 90 days — see header
+
+/**
+ * Append one event to a run's journey. Port of lambda/workflow-output/index.mjs's
+ * publishJourneyEvent, plus the `ttl` the header explains.
+ *
+ * Best-effort exactly like its model: it NEVER throws into the caller, because a
+ * gate refusal that is correct must not become a tool error just because the
+ * events table was unavailable. Returns whether the row was written, so a caller
+ * can log the miss.
+ *
+ * @param {import("@aws-sdk/lib-dynamodb").DynamoDBDocumentClient} ddb
+ * @param {string} table  EVENTS_TABLE (absent env ⇒ no-op)
+ * @param {string} workflowId  MUST come from the ticket/epic row, never from a
+ *   caller-supplied argument (SEC-16): a persona must not choose which run's
+ *   journey its event lands in.
+ */
+export async function publishJourneyEvent(ddb, table, workflowId, type, detail) {
+  if (!ddb || !table || !workflowId || !type) return false;
+  try {
+    await ddb.send(
+      new PutCommand({
+        TableName: table,
+        Item: {
+          workflowId,
+          eventId: `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          type,
+          detail,
+          timestamp: new Date().toISOString(),
+          ttl: Math.floor(Date.now() / 1000) + JOURNEY_EVENT_TTL_SEC,
+        },
+      })
+    );
+    return true;
+  } catch {
+    return false; /* non-fatal */
+  }
+}
+
+// ── The console deep link ───────────────────────────────────────────────────
+/**
+ * The CodePipeline console URL a refusal points the human at.
+ *
+ * `stage`/`action` are accepted so a caller can pass the probe's `waitingOn`
+ * straight through, but they do not appear in the URL: the console has no
+ * per-action deep link. Name them in the comment body instead.
+ *
+ * @returns {string} the URL, or "" when the ticket is not bound to a pipeline.
+ */
+export function consoleApprovalUrl({ pipeline, region } = {}, _waitingOn = {}) {
+  const name = String(pipeline || "").trim();
+  if (!name) return "";
+  const r = String(region || process.env.AWS_REGION || "us-east-1").trim();
+  return (
+    "https://console.aws.amazon.com/codesuite/codepipeline/pipelines/" +
+    `${encodeURIComponent(name)}/view?region=${encodeURIComponent(r)}`
+  );
+}
+
+// ── The probe ───────────────────────────────────────────────────────────────
+// A READ-ONLY allow-list, enforced before an InvokeCommand is even constructed
+// (SEC-3). The twins forward a tool name that came from a gate ticket's labels;
+// without this, the same seam would be a general-purpose "invoke any tool on the
+// pipeline Lambda" primitive reachable from ticket data. Deliberately no
+// deploy/approve tool: nothing in the ticket path may trigger or approve CD.
+export const PROBE_TOOLS = [
+  "Pipeline___get_state",
+  "Pipeline___get_build_status",
+  "Pipeline___capabilities",
+];
+
+export const PROBE_TIMEOUT_MS = 4000;
+
+let probeLambda = null;
+
+/**
+ * Invoke one read-only pipeline tool and return its parsed result.
+ *
+ * NEVER THROWS and never retries: the whole body is inside one try/catch, so an
+ * SDK throw, the 4s abort, a Lambda FunctionError, a non-JSON payload and a
+ * disallowed tool all come back as `{ok:false, indeterminate:true, error}`. That
+ * totality is what makes the callers' admit-on-indeterminate rule total (header).
+ *
+ * The tools Lambda answers with the MCP envelope
+ * `{content:[{type:"text", text: JSON.stringify(obj)}]}`, so the payload needs a
+ * DOUBLE parse; a shape that does not double-parse is indeterminate, never a
+ * verdict.
+ *
+ * @param {string} fnName  PIPELINE_TOOLS_LAMBDA (absent env ⇒ indeterminate)
+ * @param {string} tool  one of PROBE_TOOLS
+ * @param {Record<string, unknown>} args  the tool's parameters
+ * @returns {Promise<{ok:true, result:any}|{ok:false, indeterminate:true, error:string}>}
+ */
+export async function invokeProbe(fnName, tool, args) {
+  if (!PROBE_TOOLS.includes(tool)) {
+    return { ok: false, indeterminate: true, error: "tool_not_allowed" };
+  }
+  if (!fnName) return { ok: false, indeterminate: true, error: "probe_not_configured" };
+  try {
+    if (!probeLambda) {
+      // maxAttempts: 1 == one attempt, zero retries. A gate close must not sit
+      // behind the SDK's default backoff; an unreachable probe is an admit.
+      probeLambda = new LambdaClient({
+        region: process.env.AWS_REGION || "us-east-1",
+        maxAttempts: 1,
+      });
+    }
+    const res = await probeLambda.send(
+      new InvokeCommand({
+        FunctionName: fnName,
+        InvocationType: "RequestResponse",
+        Payload: Buffer.from(JSON.stringify({ tool_name: tool, parameters: args || {} })),
+      }),
+      { abortSignal: AbortSignal.timeout(PROBE_TIMEOUT_MS) }
+    );
+    if (res.FunctionError) {
+      return { ok: false, indeterminate: true, error: `function_error:${res.FunctionError}` };
+    }
+    const raw = res.Payload ? Buffer.from(res.Payload).toString("utf8") : "";
+    const envelope = JSON.parse(raw);
+    const text = envelope?.content?.[0]?.text;
+    if (typeof text !== "string") {
+      return { ok: false, indeterminate: true, error: "probe_payload_shape" };
+    }
+    return { ok: true, result: JSON.parse(text) };
+  } catch (err) {
+    const name = err?.name || err?.code || "";
+    return { ok: false, indeterminate: true, error: String(name || err?.message || err) };
+  }
+}
+
+// ── The gate-loop verdict ───────────────────────────────────────────────────
+// Priors needed before a re-file is a loop: two already exist, so the THIRD
+// attempt refuses.
+export const GATE_LOOP_THRESHOLD = 2;
+
+function idList(v) {
+  const list = Array.isArray(v) ? v : typeof v === "string" ? v.split(",") : [];
+  return list.map((x) => String(x ?? "").trim()).filter(Boolean);
+}
+
+/**
+ * Is this new gate ticket the third of its kind against the same target?
+ *
+ * PURE, and the reason the verdict lives here rather than in either twin: the two
+ * providers cannot gather siblings the same way (the DynamoDB twin queries
+ * parentId-index; the jira twin must ask for `issuelinks` explicitly, since
+ * listTickets does not request that field and so returns no `blockedBy` at all),
+ * but they MUST refuse identically. Each twin gathers in its own idiom and hands
+ * the rows here.
+ *
+ * @param {Array<{id?:string, key?:string, labels?:string[]|string, blockedBy?:string[]|string}>} siblings
+ *   the epic's other children
+ * @param {{gateKind?:string, blockedBy?:string[]|string, head?:string}} opts  the
+ *   NEW ticket's gate kind and target
+ * @returns {{loop:boolean, priorCount:number, priors:string[], reason:string|null}}
+ */
+export function gateLoopVerdict(siblings, opts = {}) {
+  const gateKind = String(opts.gateKind || "")
+    .trim()
+    .toLowerCase();
+  const blockedBy = idList(opts.blockedBy);
+  const head = String(opts.head || "")
+    .trim()
+    .toLowerCase();
+  const out = { loop: false, priorCount: 0, priors: [], reason: null };
+  if (!GATE_KINDS.includes(gateKind)) return out;
+
+  for (const s of Array.isArray(siblings) ? siblings : []) {
+    if (!s) continue;
+    if (!gateKindsOf(s.labels).includes(gateKind)) continue;
+    // Same TARGET, read three ways because not every gate has every binding:
+    // the same head SHA, an overlapping blocked_by set, or — when neither side
+    // carries any binding at all — the kind alone under one epic.
+    const sib = idList(s.blockedBy);
+    const sameHead = Boolean(head) && gateHeadOf(s.labels) === head;
+    const sharesTarget = blockedBy.length > 0 && sib.some((b) => blockedBy.includes(b));
+    const untargeted = !head && blockedBy.length === 0 && sib.length === 0;
+    if (!sameHead && !sharesTarget && !untargeted) continue;
+    out.priors.push(String(s.id || s.key || s.ticketId || ""));
+  }
+
+  out.priorCount = out.priors.length;
+  out.loop = out.priorCount >= GATE_LOOP_THRESHOLD;
+  out.reason = out.loop ? GATE_LOOP_ENVIRONMENTAL : null;
+  return out;
+}
+
+// ── The gate-condition verdict ──────────────────────────────────────────────
+// One function, both twins, so "may this gate close?" cannot be answered two ways
+// by two installs. It does the probe and returns a verdict; it writes nothing, and
+// it does not know what a ticket is.
+
+/** "Deploy / ApproveDeploy" for a hint, from a probe row. Never empty. */
+function stageAction(row) {
+  const parts = [row?.stage, row?.action].map((p) => String(p || "").trim()).filter(Boolean);
+  return parts.join(" / ") || "the approval action";
+}
+
+/**
+ * Verify the condition a gate ticket asserts, by reading the system that owns it.
+ *
+ * @param {string} fnName  PIPELINE_TOOLS_LAMBDA. Unset ⇒ every probe is
+ *   indeterminate, i.e. every gate close is ADMITTED and stamped. That is the
+ *   deliberate default for an install that has not deployed the pipeline module:
+ *   the guard is inert rather than a wall.
+ * @param {{gateKind:string, pipeline?:string, execId?:string, head?:string,
+ *          decision?:string|null, region?:string}} opts  the gate's BINDINGS, read
+ *   from its labels by the caller (gatePipelineOf / gateExecOf / gateHeadOf) and
+ *   its DECISION, read from its description by parseFixDecision.
+ * @returns {Promise<{refuse:boolean,
+ *   verification:{result:string, reason:string, evidence:any, gateKind:string, probedAt:string}|null,
+ *   hint:string, stage:string, action:string, consoleUrl:string}>}
+ *   `refuse:true` ⇒ a definite negative; `verification` is then null (nothing is
+ *   stamped on a refusal, because nothing was proven). Otherwise the close is
+ *   ADMITTED and `verification` is what the caller writes in the same update.
+ */
+export async function verifyGateCondition(fnName, opts = {}) {
+  const gateKind = String(opts.gateKind || "")
+    .trim()
+    .toLowerCase();
+  const pipeline = String(opts.pipeline || "").trim();
+  const execId = String(opts.execId || "").trim();
+  const head = String(opts.head || "").trim();
+  const decision = opts.decision || null;
+  const region = opts.region || process.env.AWS_REGION || "us-east-1";
+  const consoleUrl = consoleApprovalUrl({ pipeline, region });
+  const probedAt = new Date().toISOString();
+
+  const admit = (result, reason, evidence = null) => ({
+    refuse: false,
+    verification: { result, reason, evidence, gateKind, probedAt },
+    hint: "",
+    stage: "",
+    action: "",
+    consoleUrl,
+  });
+  const refuse = (hint, row = {}) => ({
+    refuse: true,
+    verification: null,
+    hint,
+    stage: String(row.stage || ""),
+    action: String(row.action || ""),
+    consoleUrl,
+  });
+
+  // `blocker`: nothing to ask. Whether the tickets a blocker gate names are done
+  // is the CASCADE's business (it is what dispatches on blockedBy), not this
+  // guard's, and there is no external system that knows "the blocker is gone".
+  // Recorded as indeterminate so the close is still auditable.
+  if (gateKind === "blocker") return admit("indeterminate", "no_probe_available");
+
+  if (gateKind === "deploy-approval") {
+    // SEC-7: an unbound gate is not a provably-open gate. Refusing here would make
+    // a mislabelled ticket uncloseable by anyone.
+    if (!pipeline || !execId) return admit("indeterminate", "gate_unbound");
+
+    const probe = await invokeProbe(fnName, "Pipeline___get_state", {
+      pipeline_name: pipeline,
+      execution_id: execId,
+    });
+    if (!probe.ok) return admit("indeterminate", "probe_failed", probe.error);
+    const state = probe.result || {};
+    // A SUCCESSFUL invoke of a tool that then declined to answer (the pipeline is
+    // not in the CD registry, the module is not configured) is not a read of the
+    // world — it is a read of our own configuration.
+    if (state.ok === false || state.configured === false) {
+      return admit("indeterminate", "probe_unanswerable", state.reason || "unanswerable");
+    }
+
+    // (1) The most definite negative there is: a human REJECTED at the approval
+    // action. actionDetails is execution-scoped (ListActionExecutions filtered by
+    // pipelineExecutionId), so a Failed approval row here is this run's rejection.
+    const rejected = (Array.isArray(state.actionDetails) ? state.actionDetails : []).find(
+      (a) => a && /approv/i.test(String(a.action || "")) && String(a.status) === "Failed"
+    );
+    if (rejected) {
+      return refuse(
+        `the deploy approval was REJECTED by a human at ${stageAction(rejected)} — closing this ticket as done would overwrite that decision. Transition it \`block\` instead and file the work the reviewer asked for.`,
+        rejected
+      );
+    }
+
+    const waitingOn = state.waitingOn || null;
+
+    // (2) Our execution lost the pipeline to a newer one, so nobody will ever be
+    // asked to approve it: the gate is genuinely closed, just not by approval.
+    // Checked BEFORE holdsGate because supersededBy is only ever populated when it
+    // is OUR execution that was superseded, which makes it the more specific read.
+    if (waitingOn && waitingOn.supersededBy) {
+      return admit("verified", "execution_superseded", waitingOn.supersededBy);
+    }
+
+    // (3) No pending human approval anywhere on the pipeline.
+    if (!waitingOn) return admit("verified", "no_open_approval");
+
+    // (4) The gate is open on THIS execution: the human has not answered yet.
+    if (waitingOn.holdsGate === "this") {
+      return refuse(
+        `the deploy approval for execution ${execId} is still OPEN at ${stageAction(waitingOn)} and has not been answered — a human approves it through the bridge. Wait for the approval, then retry this transition; do not file another gate ticket.`,
+        waitingOn
+      );
+    }
+
+    // (5) An earlier execution is parked on the gate, so ours has not reached it.
+    if (waitingOn.holdsGate === "older") {
+      const blocker = String(waitingOn.queuedBehind || "").trim();
+      return refuse(
+        `execution ${execId} has not reached ${stageAction(waitingOn)} yet — the approval is currently held by ${blocker ? `execution ${blocker}` : "an earlier, unnamed execution"}. Wait for that one to be answered, then retry this transition.`,
+        waitingOn
+      );
+    }
+
+    // (6) Terminal, and the probe confirmed the stages are on OUR execution.
+    // matchesExecution:false means terminal describes some other run, which proves
+    // nothing about this gate — that falls through to indeterminate below.
+    if (state.terminal === true && state.matchesExecution !== false) {
+      return admit("verified", "execution_terminal");
+    }
+
+    // holdsGate:"unknown" — a pending approval exists but the probe could not
+    // attribute it to an execution. Not a negative; not a proof either.
+    return admit("indeterminate", "gate_holder_unknown", waitingOn.holdsGate || "unknown");
+  }
+
+  if (gateKind === "ci-unavailable") {
+    if (!pipeline || !head) return admit("indeterminate", "gate_unbound");
+
+    const probe = await invokeProbe(fnName, "Pipeline___get_build_status", {
+      pipeline_name: pipeline,
+      commit_sha: head,
+    });
+    if (!probe.ok) return admit("indeterminate", "probe_failed", probe.error);
+    const status = probe.result || {};
+    if (status.ok === false || status.configured === false) {
+      return admit("indeterminate", "probe_unanswerable", status.reason || "unanswerable");
+    }
+
+    // The claim is "CI is UNAVAILABLE for this SHA". A build that exists disproves
+    // it whatever its verdict says — IN_PROGRESS, FAILED and SUCCEEDED are all CI
+    // being available. Whether the build PASSED is the CI ticket's question, not
+    // this gate's.
+    if (status.match) {
+      return admit("verified", "build_exists", {
+        buildId: status.match.buildId,
+        buildStatus: status.match.buildStatus,
+      });
+    }
+
+    // A DECISION is ADVISORY (SEC-2a): a human may lift an environmental stall,
+    // but no human statement can turn "no build exists" into `verified`.
+    if (decision) return admit("indeterminate", "decision_advisory", decision);
+
+    return refuse(
+      `CI has a build history for ${status.project || pipeline} but NONE for commit ${head}, so "CI is unavailable" is not what happened — the build was never started. Remedies, in order: (1) \`Pipeline___start_ci_build(commit_sha="${head}")\` and wait for it; (2) if the SHA is stale, re-read the branch head and correct this ticket's \`head:\` label; (3) if CI genuinely cannot run, record a \`DECISION: accept-proxy\` (or \`abort\`) line in this ticket's description and retry. Filing another CI ticket is NOT a remedy and will be refused.`
+    );
+  }
+
+  // `approval`, `merge-approval`, an unknown kind: nothing is probed. `approval`
+  // deliberately never reaches here (PROBED_GATE_KINDS), so this is the
+  // belt-and-braces arm for a kind added to GATE_KINDS without a probe.
+  return admit("indeterminate", "no_probe_available");
+}
+
+// ── Refusal payloads (the byte-identical strings) ───────────────────────────
+/**
+ * The refusal a gate guard returns, its tool message, and the ONE comment it
+ * leaves on the ticket. Built here so the two twins cannot phrase a refusal
+ * differently — an agent that reads a different remedy on Jira than on DynamoDB
+ * takes a different next action, which is the split-brain the parity tests exist
+ * to catch.
+ *
+ * @returns {{payload:{ok:false, reason:string, hint:string, consoleUrl:string,
+ *   stage:string, action:string}, message:string, comment:string}}
+ */
+export function gateRefusal({ ticketId, gateKind, verdict } = {}) {
+  const v = verdict || {};
+  const id = String(ticketId || "").trim();
+  const kind = String(gateKind || "")
+    .trim()
+    .toLowerCase();
+  const hint = String(v.hint || "");
+  const consoleUrl = String(v.consoleUrl || "");
+  const stage = String(v.stage || "");
+  const action = String(v.action || "");
+
+  const where = [stage, action].filter(Boolean).join(" / ");
+  const message =
+    `Refusing to close ${id}: its \`gate:${kind}\` condition is not met. ${hint}` +
+    (consoleUrl ? ` Console: ${consoleUrl}` : "");
+  const comment =
+    `**Gate not verified — this ticket stays open.**\n\n` +
+    `A \`gate:${kind}\` ticket may only close once the condition it represents is verified, ` +
+    `and the check found evidence to the contrary.\n\n` +
+    `${hint}\n\n` +
+    (where ? `Waiting at: ${where}\n` : "") +
+    (consoleUrl ? `Console: ${consoleUrl}\n` : "") +
+    `\nThis ticket now carries \`${GATE_AWAITING_CONSOLE_LABEL}\`. Retry the transition once the ` +
+    `condition holds — do not file a replacement gate ticket.`;
+
+  return {
+    payload: { ok: false, reason: GATE_CONDITION_UNMET, hint, consoleUrl, stage, action },
+    message,
+    comment,
+  };
+}
+
+/**
+ * The refusal `refuseGateLoop` returns. `existingTicketId` is the FIRST prior of
+ * the same kind against the same target — the ticket the caller should work on
+ * instead of filing a third.
+ */
+export function gateLoopRefusal({ gateKind, verdict, epicId } = {}) {
+  const v = verdict || {};
+  const kind = String(gateKind || "")
+    .trim()
+    .toLowerCase();
+  const priors = Array.isArray(v.priors) ? v.priors.filter(Boolean) : [];
+  const existingTicketId = priors[0] || "";
+  const message =
+    `Refusing to create a third \`gate:${kind}\` ticket: ${priors.length} already exist for the same target ` +
+    `(${priors.join(", ")}). This is an environmental loop, not new work. Work the existing ticket ` +
+    `${existingTicketId} — verify the condition, or record a DECISION line in its description — and ` +
+    `escalate on it rather than filing another.` +
+    (epicId ? ` The epic ${epicId} is now labelled \`${GATE_LOOP_BROKEN_LABEL}\`.` : "");
+  return {
+    payload: { ok: false, reason: GATE_LOOP_ENVIRONMENTAL, existingTicketId },
+    message,
+  };
+}
+
+/**
+ * Does a gate ticket's description carry the console deep link a human needs?
+ *
+ * Matches on the PATH (`pipelines/<name>/view`) rather than the whole URL, so a
+ * link written with a different region query, extra params, or markdown wrapping
+ * still counts. The point is that a human reading the ticket can reach the gate —
+ * not that the string was produced by consoleApprovalUrl.
+ */
+export function descriptionCarriesConsoleLink(description, { pipeline, region } = {}) {
+  const url = consoleApprovalUrl({ pipeline, region });
+  if (!url) return false;
+  const text = String(description || "");
+  if (!text) return false;
+  const path = `pipelines/${encodeURIComponent(String(pipeline).trim())}/view`;
+  return text.includes(url) || text.includes(path);
+}

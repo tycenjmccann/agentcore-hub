@@ -158,6 +158,19 @@ export default defineConfig({
       // replay-d1/d2: asserts 3 in-diff CHANGES-NEEDED rounds STOP the loop —
       // cap-reached fires once, the upstream re-open is suppressed, no round 4.
       "lambda/orchestrator/replay-d3.test.mjs",
+      // replay-agent-died (TEAM-4739 WP5) — 15x8ql/TEAM-4700's agent.died row
+      // replayed through the REAL detector + REAL lease.mjs: the first sweep
+      // after the death reaps it via the positive-death path (GUARD 1 still
+      // first), and TEAM-4703 gets exactly two auto-resumes then a human.
+      "lambda/orchestrator/replay-agent-died.test.mjs",
+      // replay-watchdog-coverage (TEAM-4739 WP5) — the three runs the watchdog
+      // never paged on (fz514x, 37ule1) plus the one it must NOT page on
+      // (TEAM-4660), replayed through the REAL reconcile sweep's W2/W3 watches.
+      "lambda/orchestrator/replay-watchdog-coverage.test.mjs",
+      // replay-gate-binding (TEAM-4739 WP5) — lives in the tickets twin because
+      // the typed-gate guard does: p5ogpg/37ule1's gate closes replayed against
+      // the real refusal path (refused + repaged once, no ticket, no dispatch).
+      "lambda/agentcore-hub-tickets/replay-gate-binding.test.mjs",
       // agentcore-hub-tickets create_ticket (TEAM-3619 D4c) — the spawnedBy/phase
       // pass-through that lets agent-filed QA/review fixes gate completion.
       // Handler driven with a stub DDB doc client; no AWS.

@@ -467,7 +467,10 @@ async function buildCard(workflowId, workflow, pricing, getCompletion = defaultG
       loops: changeRequests + fixTickets,
       nudges: count("workflow.nudge") + count("nudge"),
       interventions: count("manager.intervention"),
-      errors: count("agent.error") + count("error"),
+      // agent.died (TEAM-4739) is a death, not a model failure, and is published
+      // INSTEAD of agent.error — so it must be counted here or a run whose
+      // personas were killed mid-turn reports zero errors.
+      errors: count("agent.error") + count("error") + count("agent.died"),
       retries: count("agent.retry"),
       unblocks: count("orchestrator.unblocked"),
       firstPassYield: aiTasks.length ? round4(firstPass / aiTasks.length) : null,

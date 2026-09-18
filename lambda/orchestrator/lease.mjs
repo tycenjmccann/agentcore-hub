@@ -129,9 +129,15 @@ export async function lastAgentActivity(ddb, eventsTable, workflowId, agentId, t
  *
  * Returns the RAW joined string: redaction + clipping belong to the caller,
  * which must join FIRST so a secret split across two chunks still matches.
+ *
+ * TEAM-4739: `{withTimestamp:true}` returns `{text, at}` instead, where `at` is
+ * the NEWEST matching frame's timestamp - the read-shape a liveness check needs
+ * (how long since this agent last said anything), which the joined string alone
+ * cannot answer. Every existing caller keeps the bare-string shape.
  */
-export async function lastStreamedText(ddb, eventsTable, workflowId, agentId, ticketId, maxChars = 600) {
+export async function lastStreamedText(ddb, eventsTable, workflowId, agentId, ticketId, maxChars = 600, { withTimestamp = false } = {}) {
   const chunks = [];
+  let at = "";
   let collected = 0;
   let lastKey;
   for (let page = 0; page < 20 && collected < maxChars; page++) {
@@ -159,13 +165,15 @@ export async function lastStreamedText(ddb, eventsTable, workflowId, agentId, ti
       const content = detail.content;
       if (typeof content !== "string" || !content) continue;
       chunks.push(content);
+      if (!at) at = e.timestamp || ""; // newest-first, so the first match is the latest
       collected += content.length;
       if (collected >= maxChars) break;
     }
     lastKey = res.LastEvaluatedKey;
     if (!lastKey) break;
   }
-  return chunks.reverse().join("");
+  const text = chunks.reverse().join("");
+  return withTimestamp ? { text, at } : text;
 }
 
 /**
@@ -174,25 +182,37 @@ export async function lastStreamedText(ddb, eventsTable, workflowId, agentId, ti
  * the detector's own death announcement: counting it would make every dead
  * session look like a self-reported agent error and suppress synthesis for all
  * of them.
+ *
+ * TEAM-4739: `{types}` widens WHICH event types count, defaulting to today's
+ * single `agent.error` so every existing call is unchanged. The `dead_session`
+ * exclusion stays scoped to `agent.error` alone - `agent.died` (FR-7) is the
+ * runtime's own positive proof that a turn stopped being given time, so applying
+ * the detector's-own-announcement filter to it would hide the exact row a
+ * positive-death caller asked for.
  */
-export async function hasAgentErrorSince(ddb, eventsTable, workflowId, ticketId, sinceIso) {
+export async function hasAgentErrorSince(ddb, eventsTable, workflowId, ticketId, sinceIso, { types = ["agent.error"] } = {}) {
   if (!sinceIso) return false;
+  const vals = { ":w": workflowId, ":tid": ticketId, ":since": sinceIso };
+  const ors = [];
+  if (types.includes("agent.error")) {
+    vals[":err"] = "agent.error";
+    vals[":dead"] = "dead_session";
+    ors.push("(#t = :err AND (attribute_not_exists(detail.reason) OR detail.reason <> :dead))");
+  }
+  if (types.includes("agent.died")) {
+    vals[":died"] = "agent.died";
+    ors.push("#t = :died");
+  }
+  if (!ors.length) return false;
   let lastKey;
   for (let page = 0; page < 20; page++) {
     const res = await ddb.send(
       new QueryCommand({
         TableName: eventsTable,
         KeyConditionExpression: "workflowId = :w",
-        FilterExpression:
-          "#t = :err AND detail.ticketId = :tid AND #ts >= :since AND (attribute_not_exists(detail.reason) OR detail.reason <> :dead)",
+        FilterExpression: `(${ors.join(" OR ")}) AND detail.ticketId = :tid AND #ts >= :since`,
         ExpressionAttributeNames: { "#t": "type", "#ts": "timestamp" },
-        ExpressionAttributeValues: {
-          ":w": workflowId,
-          ":err": "agent.error",
-          ":tid": ticketId,
-          ":since": sinceIso,
-          ":dead": "dead_session",
-        },
+        ExpressionAttributeValues: vals,
         ScanIndexForward: false,
         Limit: 500,
         ExclusiveStartKey: lastKey,

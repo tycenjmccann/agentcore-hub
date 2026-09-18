@@ -108,8 +108,8 @@ function sitesByFunction(src, pattern, skip = new Set()) {
 
 /**
  * The complete inventory of non-approval Telegram sends, by enclosing function.
- * An approval/gate page must go through sendApprovalPing — which is why it is in
- * this list exactly once (its one tgSend) and no other approval site is.
+ * An approval/gate page must go through sendApprovalPing — which is why it is
+ * the only approval site in this list.
  * A new entry here means a new function talks to Telegram directly.
  */
 const ALLOWED_TG_SENDS = {
@@ -117,7 +117,11 @@ const ALLOWED_TG_SENDS = {
   routeMessage: 8,            // authz + voice-note errors, transcript echo, help
   flushSettledBuffers: 1,     // per-buffer failure notice
   processBug: 2,              // filed-ticket confirmations
-  sendApprovalPing: 1,        // ← the approval path; its text is builder-stamped
+  // ← the approval path; its text is builder-stamped. TWO sends, one message
+  // (TEAM-4663 F2): the Markdown, then the SAME builder's plain rendering of the
+  // SAME inputs when Telegram rejects the formatting retryably. Both come from
+  // buildApprovalMessage, so neither is composed here.
+  sendApprovalPing: 2,
   resolveReworkTarget: 1,     // stray-DECISION hint
   deliverReworkNote: 2,       // rework Retry/Drop prompt + delivered confirmation
   relayToWorkflowManager: 3,  // WM relay chunks, empty-reply and failure notices
