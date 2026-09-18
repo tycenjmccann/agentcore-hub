@@ -523,6 +523,13 @@ export function shipVerdictOf(entry) {
  *                  block, else "static-ci-only" (green but nothing merged).
  *     blockReason: first recorded block reason (null if none).
  *     offenders:   [{ ticketId, phase, verdict }] — ship tickets missing a verdict.
+ *     handoff:     TEAM-4768 — the run is shipped PURELY by handoff: every inspected
+ *                  ship ticket said "handoff" and none said "shipped", so nothing
+ *                  here ever claimed a merge. The merge-verify probe reads this to
+ *                  know it has no claim to cross-check (a handoff's PR is open by
+ *                  definition, which the probe would otherwise call "provably
+ *                  unmerged" and refuse the run over). `shipped` alone cannot answer
+ *                  that question — it is true for a merge and a handoff alike.
  *   }
  *
  * Mirrors the "only tightens when it can prove" discipline of
@@ -533,7 +540,7 @@ export function shipVerdictOf(entry) {
  */
 export function evaluateShipVerdict(children, agentTasks, shipPhases, opts = {}) {
   const phases = shipPhases instanceof Set ? shipPhases : new Set(shipPhases || []);
-  const inert = { required: false, shipped: true, outcome: null, blockReason: null, offenders: [] };
+  const inert = { required: false, shipped: true, handoff: false, outcome: null, blockReason: null, offenders: [] };
   if (!Array.isArray(children) || phases.size === 0) return inert;
 
   const getAgentPhase = opts.getAgentPhase || (() => undefined);
@@ -558,6 +565,7 @@ export function evaluateShipVerdict(children, agentTasks, shipPhases, opts = {})
 
   let blocked = null;
   let blockReason = null;
+  let handoffs = 0;
   const offenders = [];
   for (const t of shipTickets) {
     const ticketId = String(t.ticketId || "");
@@ -565,7 +573,7 @@ export function evaluateShipVerdict(children, agentTasks, shipPhases, opts = {})
     const verdict = shipVerdictOf(entry);
     // TEAM-4763 P1-A: "handoff" satisfies the gate alongside "shipped" — see
     // SHIP_SATISFIED_VERDICTS. Anything else (including null) is an offender.
-    if (SHIP_SATISFIED_VERDICTS.includes(verdict)) continue;
+    if (SHIP_SATISFIED_VERDICTS.includes(verdict)) { if (verdict === "handoff") handoffs++; continue; }
     offenders.push({ ticketId, phase: phaseOf(t), verdict: verdict || "none" });
     // deploy-blocked outranks static-ci-only (an attempted+blocked deploy is the
     // more specific, more urgent verdict).
@@ -580,9 +588,12 @@ export function evaluateShipVerdict(children, agentTasks, shipPhases, opts = {})
   }
 
   if (offenders.length === 0) {
-    return { required: true, shipped: true, outcome: null, blockReason: null, offenders: [] };
+    // TEAM-4768: PURE handoff only. A run with one handoff beside one "shipped" DID
+    // claim a merge, so it is not exempt from the merge probe — every inspected
+    // ticket has to have handed off for there to be no claim to cross-check.
+    return { required: true, shipped: true, handoff: handoffs === shipTickets.length, outcome: null, blockReason: null, offenders: [] };
   }
-  return { required: true, shipped: false, outcome: blocked || "static-ci-only", blockReason, offenders };
+  return { required: true, shipped: false, handoff: false, outcome: blocked || "static-ci-only", blockReason, offenders };
 }
 
 /**
