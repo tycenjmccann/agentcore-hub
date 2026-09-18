@@ -56,6 +56,44 @@ export const REWORK_FIX_KINDS = new Set(["review_fix", "qa_fix", "codex_fix", "s
 export const SHIP_BLOCKED_OUTCOMES = ["deploy-blocked", "static-ci-only"];
 
 /**
+ * TEAM-4763 P1-A — the ship outcomes the orchestrator's evidence harvest may
+ * carry onto an agentTasks entry, decided HERE beside shipVerdictOf because
+ * admitting a value and knowing what it means are one decision. They had drifted
+ * apart: `handoff` was writable by report_completion (workflow-output
+ * SHIP_OUTCOMES) and admitted by nothing, so the harvest dropped it, shipVerdictOf
+ * saw no outcome at all, and a run that honestly handed its PR to another team
+ * closed on the static-ci-only terminal phase.
+ */
+export const HARVESTED_SHIP_OUTCOMES = Object.freeze([
+  ...SHIP_BLOCKED_OUTCOMES,
+  "shipped",
+  "empty_sweep",
+  "handoff",
+]);
+
+/**
+ * Normalize a completion record's raw `outcome` for the harvest: the trimmed,
+ * lowercased value when this reader can classify it, else null. A garbage or
+ * future-schema outcome is DROPPED rather than stored, so the ship gate can never
+ * trust a verdict nobody defined — a closed set, on purpose.
+ */
+export function harvestableShipOutcome(value) {
+  if (typeof value !== "string") return null;
+  const outcome = value.trim().toLowerCase();
+  return HARVESTED_SHIP_OUTCOMES.includes(outcome) ? outcome : null;
+}
+
+/**
+ * TEAM-4763 P1-A — the verdicts that SATISFY the D2 ship gate. "shipped" proves
+ * the work landed; "handoff" proves it was delivered to another team to land,
+ * which DL-030 already makes the agent prove with a PR URL (report_completion
+ * refuses outcome:"handoff" without one). Both are positive, agent-declared
+ * evidence in the DL-028 sense — this gate exists to catch SILENCE, not an honest
+ * handoff — so neither closes the run on a blocked terminal phase.
+ */
+export const SHIP_SATISFIED_VERDICTS = Object.freeze(["shipped", "handoff"]);
+
+/**
  * TEAM-3755 F2 — the ONE list of phases a run can already be closed on. Every
  * terminal-claim CAS must refuse ALL of them, or a later write can overwrite an
  * earlier honest verdict.
@@ -438,6 +476,9 @@ export function isWorkflowComplete(children, wfDef, opts = {}) {
  *                        proves the work landed.
  *   <a SHIP_BLOCKED_OUTCOMES value> → the agent recorded an EXPLICIT terminal
  *                        block ("deploy-blocked" / "static-ci-only").
+ *   "handoff"          → TEAM-4763 P1-A: the work was delivered to another team to
+ *                        land, so the PR is OPEN, not merged. Satisfies the gate
+ *                        (SHIP_SATISFIED_VERDICTS) without ever being a merge.
  *   null               → neither: a phantom green close (CI may be green, but
  *                        nothing merged/deployed and no block was declared).
  *
@@ -449,6 +490,11 @@ export function shipVerdictOf(entry) {
   if (!entry || typeof entry !== "object") return null;
   const outcome = typeof entry.outcome === "string" ? entry.outcome.trim().toLowerCase() : "";
   if (SHIP_BLOCKED_OUTCOMES.includes(outcome)) return outcome;
+  // TEAM-4763 P1-A: a handoff is its OWN verdict, deliberately NOT an alias for
+  // "shipped" — the work is delivered but nothing merged, and mapping it to
+  // "shipped" would make deliveryRollUp derive prState "merged" for a PR that is
+  // still open (workflow-output's derivePrState calls the same PR "open").
+  if (outcome === "handoff") return "handoff";
   // A merge commit is the ONLY harvested field that proves the work landed.
   // commitSha is NOT consulted (see the F1 note above) — it is the unmerged
   // branch HEAD and is present on every completion record.
@@ -517,7 +563,9 @@ export function evaluateShipVerdict(children, agentTasks, shipPhases, opts = {})
     const ticketId = String(t.ticketId || "");
     const entry = tasks[ticketId] || byTicketId.get(ticketId);
     const verdict = shipVerdictOf(entry);
-    if (verdict === "shipped") continue;
+    // TEAM-4763 P1-A: "handoff" satisfies the gate alongside "shipped" — see
+    // SHIP_SATISFIED_VERDICTS. Anything else (including null) is an offender.
+    if (SHIP_SATISFIED_VERDICTS.includes(verdict)) continue;
     offenders.push({ ticketId, phase: phaseOf(t), verdict: verdict || "none" });
     // deploy-blocked outranks static-ci-only (an attempted+blocked deploy is the
     // more specific, more urgent verdict).
@@ -549,22 +597,41 @@ export const FOLLOWUP_TITLE_RE = /\[fu:([0-9a-f]{8})\]\s*$/;
 /**
  * TEAM-4740 FR-13/FR-14 — pure roll-up for the orchestrator's ONE setDelivery
  * write. Returns `{}` (never undefined) so it is spread-safe, and adds no key it
- * cannot derive: "complete-with-handoff" needs every STILL-OPEN follow-up to be
- * human-owned (an open AGENT follow-up is a fix ticket, so rule (iii) holds the run
- * open and there is nothing to describe yet), and `prState` is DERIVED, never
- * polled — a merge commit or an explicit "shipped" proves the work landed, a pr url
- * alone proves only that a PR exists. "complete:handoff:static-only" is NOT
- * derivable here: `delivery.mode` never reaches this call, and a static-ci-only
- * ship closes the run on that terminal PHASE instead of completing it.
+ * cannot derive. `prState` is DERIVED, never polled: a merge commit or an explicit
+ * "shipped" proves the work landed, a pr url alone proves only that a PR exists,
+ * and a handoff is deliberately NOT a merge (its PR is open, by definition).
+ *
+ * TEAM-4763 P1-A — `outcome` is one of the two values types.ts allows for
+ * `delivery.outcome`, and this is the reading of FR-14 that decides between them
+ * (recorded here so the next reader does not re-derive it):
+ *   - "complete:handoff:static-only" — a HANDOFF-MODE run (the repo is absent from
+ *     the CD registry, so cd-registry.mjs stripped the ship phase) that nothing
+ *     proves merged: the hub opened a PR and static CI is the only verification it
+ *     ever had. The mode is the caller's to know, which is why it is passed in; it
+ *     is the more specific statement about such a run, so it outranks the plain
+ *     handoff label below (only one key is legal).
+ *   - "complete-with-handoff" — otherwise handed off: a ship record that declared
+ *     outcome:"handoff" (shipVerdictOf → "handoff"), or FR-13's rule that every
+ *     STILL-OPEN follow-up is human-owned. An open AGENT follow-up is a fix ticket,
+ *     so isWorkflowComplete rule (iii) is holding the run open and there is nothing
+ *     to describe yet — hence "every".
+ * A handed-off run therefore never records a bare `complete` with no qualifier.
  */
-export function deliveryRollUp(tickets, agentTasks) {
+export function deliveryRollUp(tickets, agentTasks, opts = {}) {
   const isFollowUp = (t) =>
     (Array.isArray(t?.labels) && t.labels.some((l) => FOLLOWUP_LABEL_RE.test(String(l)))) ||
     FOLLOWUP_TITLE_RE.test(String(t?.title || ""));
   const open = (Array.isArray(tickets) ? tickets : []).filter((t) => isFollowUp(t) && isOpen(t));
   const tasks = Object.values(agentTasks && typeof agentTasks === "object" ? agentTasks : {});
-  const prState = tasks.some((e) => shipVerdictOf(e) === "shipped") ? "merged"
+  const verdicts = tasks.map((e) => shipVerdictOf(e));
+  // Only "shipped" is a merge — "handoff" is excluded on purpose (see above).
+  const merged = verdicts.includes("shipped");
+  const prState = merged ? "merged"
     : tasks.some((e) => typeof e?.prUrl === "string" && e.prUrl.trim().length > 0) ? "open" : null;
-  const handoff = open.length > 0 && open.every((t) => isHuman(t.assignee));
-  return { ...(handoff ? { outcome: "complete-with-handoff" } : {}), ...(prState ? { prState } : {}) };
+  const handoff =
+    verdicts.includes("handoff") || (open.length > 0 && open.every((t) => isHuman(t.assignee)));
+  const mode = typeof opts?.mode === "string" ? opts.mode : "";
+  const outcome = mode === "handoff" && !merged ? "complete:handoff:static-only"
+    : handoff ? "complete-with-handoff" : null;
+  return { ...(outcome ? { outcome } : {}), ...(prState ? { prState } : {}) };
 }
