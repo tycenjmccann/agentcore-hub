@@ -55,11 +55,13 @@ jobs:
         run: node --test lambda/anomaly-watcher
 
       # TEAM-4760: the SI-ledger reducers (si-ledger.test.mjs, driven off the
-      # shared contract fixture) and the backfill's classifier
-      # (scripts/__tests__/) are both standalone node:test suites. scripts/__tests__
-      # had no CI step at all before this, so nothing under scripts/ was gated.
+      # shared contract fixture), the prd-submitter submission gate
+      # (lambda/prd-submitter, which drives the real reducers over an in-memory
+      # table) and the backfill's classifier (scripts/__tests__/) are standalone
+      # node:test suites. scripts/__tests__ had no CI step at all before this, so
+      # nothing under scripts/ was gated.
       - name: SI-ledger + backfill unit tests (node --test)
-        run: node --test lambda/workflow-analyzer/si-ledger.test.mjs scripts/__tests__
+        run: node --test lambda/workflow-analyzer/si-ledger.test.mjs lambda/prd-submitter scripts/__tests__
 
       # R2 (docs/race-condition-study.md): the workflows table may only be
       # written through lambda/orchestrator/workflow-store.mjs — ad-hoc writes

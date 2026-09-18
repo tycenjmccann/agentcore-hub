@@ -328,11 +328,21 @@ Lambda's 4KB env budget.
 > `agentcore-hub-lambda-role`, `SiLedgerReadWrite` on `agentcore-hub-harness-role`)
 > are steps a human runs once, via
 > `./scripts/create-dynamodb-tables.sh`, `./deploy/workflow-manager/deploy.sh`,
+> `./deploy/continuous-improvement/deploy.sh`,
 > `node deploy/workflow-manager/setup-workflow-manager.mjs` and
 > `deploy/ecs-express/set-env.sh`. Until they are done, the shipped code sees an
 > unset `SI_LEDGER_TABLE` / `AccessDenied`. Remember that harness
 > `environmentVariables` and the ECS/Lambda env APIs are **replace-all**: use
 > `set-env.sh` / `set-runtime-env.py`, never a raw update call.
+>
+> Which script owns which surface: `deploy/workflow-manager/deploy.sh` sets the env
+> and the `SiLedgerTable` grant for `workflow-analyzer`;
+> `deploy/continuous-improvement/deploy.sh` does the same for `prd-submitter` (its
+> own `EvalResultsAccess` document carries a narrower duplicate of the statement, so
+> the Evaluations module works on an install that never deployed the Workflow
+> Manager) and packages the byte-copied `si-ledger.mjs` into its zip. Only the WM
+> harness and the ECS service are hand-set. `./deploy/continuous-improvement/verify.sh`
+> asserts the submitter's env var and that the table is ACTIVE.
 
 ---
 
