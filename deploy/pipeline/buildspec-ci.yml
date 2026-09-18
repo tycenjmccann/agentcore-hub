@@ -113,11 +113,11 @@ phases:
       - "node --test lambda/cost-report"
       - "node --test lambda/agentcore-hub-jira"
       - "node --test lambda/anomaly-watcher"
-      # TEAM-4760: the SI-ledger reducers, the prd-submitter submission gate and
-      # the backfill classifier are standalone node:test suites too (nothing under
-      # scripts/ was gated before). Mirrors ci.yml's "SI-ledger + backfill unit
-      # tests" step.
-      - "node --test lambda/workflow-analyzer/si-ledger.test.mjs lambda/prd-submitter scripts/__tests__"
+      # TEAM-4760: the SI-ledger reducers, the analyzer's attempt-stamp / D5 /
+      # SI-VERIFY branches, the prd-submitter submission gate and the backfill
+      # classifier are standalone node:test suites too (nothing under scripts/ was
+      # gated before). Mirrors ci.yml's "SI-ledger + backfill unit tests" step.
+      - "node --test lambda/workflow-analyzer lambda/prd-submitter scripts/__tests__"
       # The fix-kind set is duplicated across seven places that cannot import each
       # other (two ticket Lambdas, the orchestrator, types.ts, main.py,
       # compute_metrics.py); a kind forgotten in one fails SILENTLY. Mirrors

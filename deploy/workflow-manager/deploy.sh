@@ -140,11 +140,18 @@ echo "✓ Skills: s3://${BUCKET}/workflow-manager/skills/"
 
 # ─── Trigger Lambda ───────────────────────────────────────────────────────────
 LAMBDA_NAME="agentcore-hub-workflow-analyzer"
-ENV_VARS="{WORKFLOW_MANAGER_ARN=${WM_ARN},ANALYSES_TABLE=${ANALYSES_TABLE},SI_LEDGER_TABLE=${SI_LEDGER_TABLE},WORKFLOWS_TABLE=${WORKFLOWS_TABLE},EVENTS_TABLE=${EVENTS_TABLE},WM_STALE_MINUTES=${WM_STALE_MINUTES:-10},WM_WATCH_COOLDOWN_MINUTES=${WM_WATCH_COOLDOWN_MINUTES:-15},HUB_REPO_URL=${HUB_REPO_URL:-},SI_BATCH_SIZE=${SI_BATCH_SIZE:-5},SI_COOLDOWN_HOURS=${SI_COOLDOWN_HOURS:-12}}"
+# ARTIFACT_BUCKET: TEAM-4760 — the analyzer reads workflows/<id>/shared/cd-ledger.json
+# to date an SI attempt's merge/deploy. Unset = every attempt is stamped with no
+# merge evidence, which reads as "nothing shipped".
+ENV_VARS="{WORKFLOW_MANAGER_ARN=${WM_ARN},ANALYSES_TABLE=${ANALYSES_TABLE},SI_LEDGER_TABLE=${SI_LEDGER_TABLE},WORKFLOWS_TABLE=${WORKFLOWS_TABLE},EVENTS_TABLE=${EVENTS_TABLE},ARTIFACT_BUCKET=${BUCKET},WM_STALE_MINUTES=${WM_STALE_MINUTES:-10},WM_WATCH_COOLDOWN_MINUTES=${WM_WATCH_COOLDOWN_MINUTES:-15},HUB_REPO_URL=${HUB_REPO_URL:-},SI_BATCH_SIZE=${SI_BATCH_SIZE:-5},SI_COOLDOWN_HOURS=${SI_COOLDOWN_HOURS:-12}}"
 
 cd "${REPO_ROOT}/lambda/workflow-analyzer" && rm -f function.zip
 npm install --omit=dev --no-audit --no-fund --silent
-zip -rq function.zip index.mjs package.json node_modules/
+# si-ledger.mjs is a sibling module index.mjs imports at top level — omitting it
+# fails EVERY invocation at init with ERR_MODULE_NOT_FOUND. Keep this file list in
+# lockstep with the analyzer's `files` in deploy/pipeline/surfaces.json (the CD
+# Deploy stage builds the same zip from that manifest).
+zip -rq function.zip index.mjs si-ledger.mjs package.json node_modules/
 if aws lambda get-function --function-name "$LAMBDA_NAME" >/dev/null 2>&1; then
   aws lambda update-function-code --function-name "$LAMBDA_NAME" \
     --zip-file fileb://function.zip --output text >/dev/null
@@ -203,11 +210,38 @@ aws lambda add-permission \
   --output text 2>/dev/null || true
 echo "✓ Rule: rate(5 minutes) → WATCH scan"
 
+# ─── EventBridge: daily → SI-VERIFY sweep (TEAM-4760) ─────────────────────────
+# Closes the self-improvement loop: the harness runs toolkit/si_verify.py --apply,
+# which recomputes every shipped expectation's metric before/after and records
+# verified | no-effect | regressed | insufficient on the si-ledger row. Without
+# this rule nothing ever asks whether a fix worked, and the same recommendation is
+# re-synthesised forever — the exact failure TEAM-4760 exists to end.
+#
+# A fixed cron, not rate(1 day): 07:30 UTC is after the overnight runs have closed
+# and analyzed, and a stable hour keeps each day's window comparable to the last.
+# Kill switch: aws events disable-rule --name agentcore-hub-si-verify-daily
+aws events put-rule \
+  --name "agentcore-hub-si-verify-daily" \
+  --schedule-expression "cron(30 7 * * ? *)" \
+  --state ENABLED --output text >/dev/null
+
+aws events put-targets --rule "agentcore-hub-si-verify-daily" \
+  --targets "Id=si-verify,Arn=${ANALYZER_ARN},Input='{\"action\":\"si-verify\"}'" \
+  --output text >/dev/null
+
+aws lambda add-permission \
+  --function-name "$LAMBDA_NAME" --statement-id wm-si-verify-daily \
+  --action lambda:InvokeFunction --principal events.amazonaws.com \
+  --source-arn "arn:aws:events:${AWS_REGION}:${ACCOUNT_ID}:rule/agentcore-hub-si-verify-daily" \
+  --output text 2>/dev/null || true
+echo "✓ Rule: cron(30 7 * * ? *) → SI-VERIFY sweep"
+
 echo ""
 echo "═══════════════════════════════════════════════════════════"
 echo "  ✓ Done"
 echo ""
 echo "  complete → analyzer Lambda → harness ANALYZE → analyses table + S3"
 echo "  every 5m → analyzer Lambda → stale runs → harness WATCH → intervene"
+echo "  daily    → analyzer Lambda → harness SI-VERIFY → si_verify.py → verdicts"
 echo "  UI chat  → /api/workflow-manager/chat → harness CHAT"
 echo "═══════════════════════════════════════════════════════════"

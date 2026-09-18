@@ -193,10 +193,15 @@ The continuous-improvement loop. Self-contained surface.
   PRD's promised effect to `expected[]`), so a pattern is never silently
   re-synthesized while its fix is mid-flight
 - `workflow-analyzer` — the Workflow Manager's trigger Lambda (terminal-run
-  ANALYZE, the 5-minute WATCH scan, and the `#si-synthesis` batch claim); it owns
-  the canonical copy of `si-ledger.mjs` and closes the loop on the ledger,
-  recording each new sighting in `occurrences[]` and moving a landed pattern to
-  `landed`/`deployed` (or `no-effect`/`regressed`) as the next runs judge it
+  ANALYZE, the 5-minute WATCH scan, the `#si-synthesis` batch claim and the daily
+  `{"action":"si-verify"}` sweep); it owns the canonical copy of `si-ledger.mjs`
+  and closes out the attempt each finished run was carrying — when the run's
+  `input.si` names patterns, it stamps one `attempts[]` entry with the outcome read
+  off the run (`deployed`/`landed` from `workflows/<id>/shared/cd-ledger.json`,
+  `handoff` from `delivery.mode`, and `cancelled`/`error` back to `open` **with a
+  note**, so a dead SI run's patterns stay filable instead of wedging at `in-run`).
+  It also fails an ANALYZE that persisted no analysis row, releasing the auto-claim
+  so the retry can re-run it
 - `si-ledger.mjs` is a **byte-copy pair** — `lambda/workflow-analyzer/si-ledger.mjs`
   is canonical and `lambda/prd-submitter/si-ledger.mjs` must stay identical
   (nothing lives in `lambda/shared/`); both copies are listed in
@@ -259,9 +264,11 @@ The continuous-improvement loop. Self-contained surface.
     sighting on every terminal-run ANALYZE), the `si-synthesis` skill (`batched`
     when a pattern enters a synthesis batch), `prd-submitter` (`in-run` + the
     `attempts[]`/`expected[]` entries when the PRD is submitted),
-    `workflow-analyzer` (the landed/deployed/verified/no-effect/regressed
-    verdicts), and `scripts/si-ledger-backfill.mjs` for the one-time seed from
-    existing analyses.
+    `workflow-analyzer` (the attempt's terminal outcome —
+    `deployed`/`landed`/`handoff`, or back to `open` on a cancelled/errored run),
+    `si_verify.py --apply` (the `verified`/`no-effect`/`regressed` verdicts, on the
+    daily SI-VERIFY sweep), and `scripts/si-ledger-backfill.mjs` for the one-time
+    seed from existing analyses.
   - **Readers:** `GET /api/evaluations/si-ledger` (the "SI impact" panel), the hub
     ECS service **read-only**, and `si_verify.py` in the WM toolkit, which reads
     `expected[]` back to decide the verdict.
@@ -272,6 +279,11 @@ The continuous-improvement loop. Self-contained surface.
 - EventBridge rule `agentcore-hub-eval-reconcile`, `rate(1 day)` → `eval-packager`
   with `{"mode":"reconcile","days":2}` (created by
   `deploy/continuous-improvement/deploy.sh`)
+- EventBridge rule `agentcore-hub-si-verify-daily`, `cron(30 7 * * ? *)` →
+  `workflow-analyzer` with `{"action":"si-verify"}` (created by
+  `deploy/workflow-manager/deploy.sh`). The harness runs
+  `toolkit/si_verify.py --apply`, which is the only thing that ever records a
+  verdict; disable the rule to pause verification without touching code
 
 **IAM**
 - Inline policy `EvalResultsAccess` on the shared `agentcore-hub-lambda-role`,
@@ -343,6 +355,13 @@ Lambda's 4KB env budget.
 > Manager) and packages the byte-copied `si-ledger.mjs` into its zip. Only the WM
 > harness and the ECS service are hand-set. `./deploy/continuous-improvement/verify.sh`
 > asserts the submitter's env var and that the table is ACTIVE.
+>
+> `deploy/workflow-manager/deploy.sh` additionally sets `ARTIFACT_BUCKET` on the
+> analyzer (without it no attempt can be dated from the cd-ledger, so every fix
+> reads as "nothing shipped") and creates the `agentcore-hub-si-verify-daily` rule.
+> Re-running `node deploy/workflow-manager/setup-workflow-manager.mjs` is also what
+> teaches the harness SI-VERIFY mode — the daily rule fires a prompt the old system
+> prompt does not recognise, so run it before enabling the rule.
 
 ---
 
