@@ -1786,13 +1786,18 @@ describe("create_ticket — open-gate autowire (FR-5)", () => {
     expect(res.autowired).toBeUndefined();
   });
 
-  it("does not freeze when there is no open gate", async () => {
+  it("does not freeze BEHIND THE GATE when there is no open gate", async () => {
     // Same siblings, gate already approved — the merge has happened, the
-    // integration branch is no longer about to move under anyone.
+    // integration branch is no longer about to move under anyone, so no banner.
     h.state.siblings.push(gateRow({ status: "done" }), cdRow());
     const res = await create({ ...AGENT });
-    expect(h.state.puts[0].blockedBy).toEqual([]);
-    expect(res.autowired).toBeUndefined();
+    expect(h.state.puts[0].description).toBe("");
+    // TEAM-4763 P2: the open-gate half produced nothing, so the root-blocker half
+    // runs and orders the ticket behind the run's earliest still-open agent ticket.
+    // Different reason, different blocker source, no gateTicketId — and this is the
+    // behaviour change the feature is: "unfrozen" no longer means "dispatched now".
+    expect(res.autowired).toEqual({ reason: "no_root_blocker", rootTicketId: CD, blockedBy: [CD] });
+    expect(h.state.puts[0].blockedBy).toEqual([CD]);
   });
 
   it("does not freeze when a gate is open but no CD ticket exists", async () => {
@@ -1876,12 +1881,16 @@ describe("create_ticket — open-gate autowire (FR-5)", () => {
       cdRow()
     );
     const res = await create({ ...AGENT });
-    expect(res.autowired).toBeUndefined();
+    // TEAM-4763 P2: what must never happen here is the GATE freeze — the root
+    // autowire that does run names no gate and writes no banner.
+    expect(res.autowired.reason).toBe("no_root_blocker");
+    expect(res.autowired.gateTicketId).toBeUndefined();
+    expect(h.state.puts[0].description).toBe("");
     // …nor by a merge gate that has not been presented to anyone yet.
     h.state.puts.length = 0;
     h.state.siblings.length = 0;
     h.state.siblings.push(gateRow({ status: "todo" }), cdRow());
-    expect((await create({ ...AGENT })).autowired).toBeUndefined();
+    expect((await create({ ...AGENT })).autowired.reason).toBe("no_root_blocker");
   });
 
   it("finds the CD ticket via the phase:ship label AND via the roster fallback", async () => {
@@ -1894,14 +1903,20 @@ describe("create_ticket — open-gate autowire (FR-5)", () => {
       gateTicketId: GATE,
     });
 
-    // A non-ship agent sibling is NOT a CD ticket, so nothing freezes behind it.
+    // A non-ship agent sibling is NOT a CD ticket, so the GATE freeze does not
+    // fire — TEAM-4763 P2's root autowire then orders it behind that sibling as
+    // the run's root, with no banner and no gate named.
     h.state.puts.length = 0;
     h.state.siblings.length = 0;
     h.state.siblings.push(
       gateRow(),
       cdRow({ ticketId: "TEAM-4690", labels: [], assignee: "agentcore_hub_backend_dev" })
     );
-    expect((await create({ ...AGENT })).autowired).toBeUndefined();
+    expect((await create({ ...AGENT })).autowired).toEqual({
+      reason: "no_root_blocker",
+      rootTicketId: "TEAM-4690",
+      blockedBy: ["TEAM-4690"],
+    });
   });
 
   it("picks the NEWEST CD ticket when a re-run filed a second one", async () => {
@@ -1958,5 +1973,155 @@ describe("create_ticket — open-gate autowire (FR-5)", () => {
     });
     // SEC-13: a per-create write must not accumulate forever.
     expect(event.ttl).toBeGreaterThan(Date.now() / 1000);
+  });
+});
+
+describe("create_ticket — root-blocker autowire (TEAM-4763 P2, FR-11 seam 7b)", () => {
+  const EPIC = "TEAM-4734";
+  const ROOT = "TEAM-4735";       // the analyst's ticket: earliest non-human sibling
+  const LATER = "TEAM-4750";      // a later agent ticket — never the root
+
+  /** A sibling as scanSiblingTickets returns it (internal assignee form). */
+  const row = (ticketId, overrides = {}) => ({
+    ticketId,
+    parentId: EPIC,
+    title: `Work: ${ticketId}`,
+    status: "in_progress",
+    labels: [],
+    assignee: "agentcore_hub_requirements_analyst",
+    createdAt: "2026-09-14T10:00:00.000Z",
+    ...overrides,
+  });
+
+  const AGENT = { ...BASE, parent_key: EPIC };
+
+  it("orders a mid-run ticket behind the run's root and says so", async () => {
+    h.state.siblings.push(row(LATER, { createdAt: "2026-09-14T18:00:00.000Z" }), row(ROOT));
+
+    const res = await create({ ...AGENT, description: "Fix the abandon guard." });
+
+    expect(h.state.puts[0].blockedBy).toEqual([ROOT]);
+    expect(h.state.puts[0].status).toBe("blocked");
+    // No banner: DELIVERY CONSTRAINT is about a merge superseding a branch, which
+    // is not what is happening here. The prose the caller wrote is untouched.
+    expect(h.state.puts[0].description).toBe("Fix the abandon guard.");
+    expect(res.autowired).toEqual({
+      reason: "no_root_blocker",
+      rootTicketId: ROOT,
+      blockedBy: [ROOT],
+    });
+    // The earliest-created sibling wins, not the first one the index returned.
+    expect(res.autowired.rootTicketId).not.toBe(LATER);
+  });
+
+  it("reuses the open-gate scan — one Query, not two", async () => {
+    h.state.siblings.push(row(ROOT));
+    await create({ ...AGENT });
+    expect(h.state.queries).toHaveLength(1);
+  });
+
+  it("audits it through the same plan.autowired event, exactly once", async () => {
+    h.state.siblings.push(row(ROOT));
+    process.env.EVENTS_TABLE = "agentcore-hub-events";
+    await create({ ...AGENT, workflow_id: "wf_1757000000_si" });
+    delete process.env.EVENTS_TABLE;
+
+    expect(h.state.events).toHaveLength(1);
+    expect(h.state.events[0].type).toBe("plan.autowired");
+    expect(h.state.events[0].detail).toEqual({
+      ticketId: h.state.events[0].detail.ticketId,
+      reason: "no_root_blocker",
+      rootTicketId: ROOT,
+      blockedBy: [ROOT],
+    });
+  });
+
+  it("leaves a human:* assignee alone — a gate is what work waits ON", async () => {
+    h.state.siblings.push(row(ROOT));
+    const res = await create({ ...AGENT, assignee: "human:tycen", summary: "Merge Approval: round 2" });
+    expect(h.state.puts[0].blockedBy).toEqual([]);
+    expect(h.state.puts[0].status).toBe("todo");
+    expect(res.autowired).toBeUndefined();
+  });
+
+  it("leaves a caller that named its own blockers alone", async () => {
+    h.state.siblings.push(row(ROOT));
+    const res = await create({ ...AGENT, blocked_by: ["TEAM-4700"] });
+    expect(h.state.puts[0].blockedBy).toEqual(["TEAM-4700"]);
+    expect(res.autowired).toBeUndefined();
+  });
+
+  it("leaves the run's FIRST ticket alone — there is no root yet to wait for", async () => {
+    const res = await create({ ...AGENT });
+    expect(h.state.puts[0].blockedBy).toEqual([]);
+    expect(h.state.puts[0].status).toBe("todo");
+    expect(res.autowired).toBeUndefined();
+  });
+
+  it("leaves it alone when every sibling is human — a roster of gates is no root", async () => {
+    h.state.siblings.push(row("TEAM-4736", { assignee: "human:tycen", status: "in_review" }));
+    const res = await create({ ...AGENT });
+    expect(h.state.puts[0].blockedBy).toEqual([]);
+    expect(res.autowired).toBeUndefined();
+  });
+
+  // The load-bearing skip: a `blocked` ticket behind a DONE blocker is a permanent
+  // wedge — nothing re-fires the unblock cascade for an edge that was already
+  // settled when it appeared, and RECONCILE_SWEEP_MODE is off by default. By the
+  // time most mid-run tickets are filed the analyst's ticket is exactly this.
+  it("leaves it alone when the root is already done — a settled blocker is a wedge", async () => {
+    h.state.siblings.push(row(ROOT, { status: "done" }));
+    const res = await create({ ...AGENT });
+    expect(h.state.puts[0].blockedBy).toEqual([]);
+    expect(h.state.puts[0].status).toBe("todo");
+    expect(res.autowired).toBeUndefined();
+  });
+
+  // `skipped` and `cancelled` are not in isSettled (the gate half treats them as
+  // open on purpose), but they are over for this purpose — and worse: cascade.mjs
+  // resolves a blocker on done/cancelled only, so a skipped root never unblocks
+  // anything, ever.
+  it("leaves it alone when the root was SKIPPED or CANCELLED, same reason", async () => {
+    h.state.siblings.push(row(ROOT, { status: "skipped" }));
+    expect((await create({ ...AGENT })).autowired).toBeUndefined();
+
+    h.state.puts.length = 0;
+    h.state.siblings.length = 0;
+    h.state.siblings.push(row(ROOT, { status: "cancelled" }));
+    expect((await create({ ...AGENT })).autowired).toBeUndefined();
+  });
+
+  it("does not consider the counter row a candidate root", async () => {
+    h.state.siblings.push({ ticketId: "__COUNTER__", parentId: EPIC, nextNum: 7 }, row(ROOT));
+    expect((await create({ ...AGENT })).autowired.rootTicketId).toBe(ROOT);
+  });
+
+  // Precedence: the two halves can never both fire, because the root half runs only
+  // when the open-gate half produced nothing. With an open merge gate present the
+  // gate freeze wins — it is the more specific statement, and it carries the banner.
+  it("never fires alongside open_gate — the gate freeze wins, one autowire only", async () => {
+    h.state.siblings.push(
+      { ticketId: "TEAM-4668", parentId: EPIC, title: "Merge Approval: [SI] system binding", status: "in_review", labels: ["human-review", "reviewer:tycen"], assignee: "human:tycen", createdAt: "2026-09-14T17:33:00.000Z" },
+      { ticketId: "TEAM-4703", parentId: EPIC, title: "CD: merge + deploy", status: "todo", labels: ["phase:ship"], assignee: "agentcore_hub_release_manager", createdAt: "2026-09-14T16:00:00.000Z" },
+      row(ROOT)
+    );
+
+    process.env.EVENTS_TABLE = "agentcore-hub-events";
+    const res = await create({ ...AGENT, workflow_id: "wf_1757000000_si" });
+    delete process.env.EVENTS_TABLE;
+
+    expect(res.autowired.reason).toBe("open_gate");
+    expect(res.autowired.blockedBy).toEqual(["TEAM-4703"]);
+    expect(res.autowired.rootTicketId).toBeUndefined();
+    expect(h.state.puts[0].blockedBy).toEqual(["TEAM-4703"]);
+    expect(h.state.events).toHaveLength(1);
+  });
+
+  it("never fires when the scan REFUSED — there is no create to wire", async () => {
+    h.state.queryThrows = true;
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const res = await create({ ...AGENT });
+    expect(res.content[0].text).toMatch(/^Error: create_ticket refused:/);
+    expect(h.state.puts).toHaveLength(0);
   });
 });
