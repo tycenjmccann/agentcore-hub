@@ -400,6 +400,69 @@ describe("the ❌ ticket half waits for the marker (TEAM-4781)", () => {
     expect(net.edited.at(-1).text).toContain(MARKER_KEY);
   });
 
+  // SR2 of this same review: "we already answered this gate" and "we already
+  // answered it the SAME way" are different facts, and only the second licenses
+  // re-running the ❌ half. The window is narrow but real - a ✅ that lands on the
+  // pipeline and then fails its ticket transition leaves the gate in_review with
+  // an "Approved" ledger row, so the caller's isTicketDone guard does not catch a
+  // later ❌ tap.
+  it("a ❌ after our own recorded ✅ writes no marker and runs no rework", async () => {
+    const mod = await loadModule();
+    cp.states.set(PIPELINE, settledState());   // nothing parked: the ✅ closed it
+    db.items.set(`approved#${GATE}`, {
+      id: { S: `approved#${GATE}` }, decision: { S: "Approved" },
+      decidedAt: { N: String(Date.now()) },
+    });
+    s3.failPuts = 99;   // would fail IF anything wrote — nothing should
+
+    const net = await runTap(mod, "gno");
+
+    expect(s3.attempts, "no marker for a commit we approved").toBe(0);
+    expect(cp.approvals, "and nothing new on the pipeline").toEqual([]);
+    expect(net.comments).toEqual([]);
+    expect(net.transitions).toEqual([]);
+    expect(db.items.has(`rej#${CHAT}`), "no parked rework note").toBe(false);
+    expect(db.items.has(`gaterework#${GATE}`)).toBe(false);
+    expect(net.answered.at(-1).text).toMatch(/already approved/i);
+    // No edit: that branch's text carries "Changes requested", which is
+    // gateFromReply's routing vocabulary and would mis-route the next message.
+    expect(net.edited.some((e) => /Changes requested/.test(e.text || ""))).toBe(false);
+  });
+
+  it("a ❌ after our own recorded ❌ still retries the marker", async () => {
+    const mod = await loadModule();
+    cp.states.set(PIPELINE, settledState());
+    db.items.set(`approved#${GATE}`, {
+      id: { S: `approved#${GATE}` }, decision: { S: "Rejected" },
+      decidedAt: { N: String(Date.now()) },
+    });
+
+    const net = await runTap(mod, "gno");
+
+    expect(s3.puts[0], "same decision: the marker is the half still missing").toMatchObject({ Key: MARKER_KEY });
+    expect(db.items.has(`rej#${CHAT}`)).toBe(true);
+    expect(net.answered.some((a) => /reply with what needs to change/i.test(a.text))).toBe(true);
+  });
+
+  it("a ledger row with no decision attribute stays conservative", async () => {
+    // A row written by an older build. Unknown is not "Approved": it must keep
+    // exactly today's behaviour rather than gain a meaning it was never written
+    // with, and the marker only ever ADDS a human gate.
+    const mod = await loadModule();
+    cp.states.set(PIPELINE, settledState());
+    db.items.set(`approved#${GATE}`, {
+      id: { S: `approved#${GATE}` }, decidedAt: { N: String(Date.now()) },
+    });
+
+    const net = await runTap(mod, "gno");
+
+    // No decision attribute reads as "no row at all", so there is nothing to
+    // prove the gate is ours and decideDeployGate reports a plain failure.
+    expect(s3.attempts).toBe(0);
+    expect(net.transitions).toEqual([]);
+    expect(db.items.has(`rej#${CHAT}`)).toBe(false);
+  });
+
   it("✅ is unaffected: no marker, no comment, the ticket closes", async () => {
     const mod = await loadModule();
     cp.states.set(PIPELINE, pendingState());
@@ -469,6 +532,51 @@ describe("the legacy tokenless page keeps its claim row for the retry", () => {
     expect(s3.puts[0]).toMatchObject({ Key: MARKER_KEY });
     expect(db.deletes).toContain(`dep#${CLAIM_KEY}`);
     expect(net.edited.at(-1).text).toMatch(/Rejected — deploy stopped/);
+  });
+
+  it("❌ after our own recorded ✅ writes no marker and claims no stop", async () => {
+    const mod = await loadModule();
+    cp.states.set(PIPELINE, pendingState());
+    seedDeployClaim();
+    db.items.set(`resolved#${PIPELINE}#${EXEC}`, {
+      id: { S: `resolved#${PIPELINE}#${EXEC}` }, decision: { S: "Approved" },
+      decidedAt: { N: String(Date.now()) },
+    });
+    // The token this page holds is spent, which is exactly how a ❌ landing after
+    // an ✅ presents.
+    cp.putErrors.set(PIPELINE, {
+      name: "ApprovalAlreadyCompletedException",
+      message: "The approval action has already been completed",
+    });
+    s3.failPuts = 99;
+
+    const net = await runLegacyTap(mod, "dno", 25);
+
+    expect(s3.attempts, "no marker for a commit we approved").toBe(0);
+    expect(net.edited.at(-1).text).toMatch(/Already approved on the pipeline/);
+    expect(net.edited.at(-1).text, "the old copy was a flat lie here").not.toMatch(/deploy stopped/);
+    // Token spent either way, so there is nothing left to retry on this page.
+    expect(db.deletes).toContain(`dep#${CLAIM_KEY}`);
+  });
+
+  it("❌ that cannot be attributed records the marker but claims no stop", async () => {
+    // No prior ledger row and the token already consumed: somebody else answered
+    // this gate and we cannot tell which way. The marker is still written (it only
+    // ever adds a human gate), but "deploy stopped" would be unprovable.
+    const mod = await loadModule();
+    cp.states.set(PIPELINE, pendingState());
+    seedDeployClaim();
+    cp.putErrors.set(PIPELINE, {
+      name: "ApprovalAlreadyCompletedException",
+      message: "The approval action has already been completed",
+    });
+
+    const net = await runLegacyTap(mod, "dno", 26);
+
+    expect(s3.puts[0]).toMatchObject({ Key: MARKER_KEY });
+    expect(net.edited.at(-1).text).toMatch(/Already actioned on the pipeline/);
+    expect(net.edited.at(-1).text).not.toMatch(/deploy stopped/);
+    expect(db.deletes).toContain(`dep#${CLAIM_KEY}`);
   });
 
   it("no ARTIFACT_BUCKET: nothing to record, nothing to retry, so it proceeds", async () => {

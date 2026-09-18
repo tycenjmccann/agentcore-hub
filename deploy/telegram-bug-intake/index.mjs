@@ -1272,23 +1272,43 @@ async function recordGateApproved(ref, { approve = true, chatId = "" } = {}) {
 }
 
 /**
+ * WHICH decision this bridge recorded for that gate, or null if it recorded
+ * none. The row has always carried `decision` (above); TEAM-4781 SR2 is what
+ * first needed to read it, because "we already answered this gate" and "we
+ * already answered it the SAME way" are different facts and only the second one
+ * licenses re-running the ❌ half.
+ *
+ * Best-effort: an unreadable ledger returns null, i.e. "we know nothing", which
+ * is what keeps every caller on its pre-ledger behaviour.
+ *
+ * @returns {Promise<"Approved"|"Rejected"|null>} the raw recorded decision. A
+ *   row written by an older build with no `decision` attribute reads as null -
+ *   unknown, not "Rejected" - so a pre-existing row never gains a meaning it
+ *   was not written with.
+ */
+async function gateDecisionRecorded(ref) {
+  const id = gateLedgerKey(ref);
+  if (!id) return null;
+  try {
+    const { Item } = await ddb.send(new GetItemCommand({
+      TableName: PENDING_TABLE, Key: { id: { S: id } },
+    }));
+    const decision = String(Item?.decision?.S || "");
+    return decision === "Approved" || decision === "Rejected" ? decision : null;
+  } catch (err) {
+    console.warn(`[telegram-bug-intake] gate ledger read ${id}: ${err.message}`);
+    return null;
+  }
+}
+
+/**
  * Did this bridge already answer that gate? Used to tell an ALREADY-RESOLVED
  * gate from a broken one, so a retried tap finishes the ticket half instead of
  * reporting a failure. Best-effort: an unreadable ledger returns false, i.e.
  * exactly today's behaviour.
  */
 async function wasGateApprovedLocally(ref) {
-  const id = gateLedgerKey(ref);
-  if (!id) return false;
-  try {
-    const { Item } = await ddb.send(new GetItemCommand({
-      TableName: PENDING_TABLE, Key: { id: { S: id } },
-    }));
-    return Boolean(Item?.decision?.S);
-  } catch (err) {
-    console.warn(`[telegram-bug-intake] gate ledger read ${id}: ${err.message}`);
-    return false;
-  }
+  return Boolean(await gateDecisionRecorded(ref));
 }
 
 // A superseded build has to be cleared off the gate before this execution can
@@ -1377,7 +1397,26 @@ async function decideDeployGate(cb, chatId, ticketId, deploy, approve, workflowI
       // Nothing is waiting. If the ledger says this bridge already answered THIS
       // gate, the wait is gone because we closed it — a retried tap, whose only
       // remaining work is the ticket half.
-      if (await wasGateApprovedLocally({ ticketId })) {
+      const recorded = await gateDecisionRecorded({ ticketId });
+      if (recorded) {
+        // TEAM-4781 SR2: a ❌ arriving after OUR OWN ✅ is not a retry of this tap,
+        // it is the opposite decision on a gate that is already approved. The
+        // window is real: a ✅ that lands on the pipeline and then fails its ticket
+        // transition (answerDeployGateTicketStuck) leaves the gate `in_review`
+        // with an "Approved" row, so the caller's isTicketDone guard does not
+        // catch it. Writing a rejection marker there would only add a human gate
+        // (fail-toward-gate, harmless), but parking a rework note and telling the
+        // human "changes requested" for a deploy they APPROVED is a lie in the
+        // one direction that costs a re-run. Record nothing and run no half.
+        if (!approve && recorded === "Approved") {
+          console.warn(`[telegram-bug-intake] deploy gate ${ticketId}: ❌ tap after our own recorded ✅ on ${name} - no rejection marker, no rework`);
+          // No tgEdit, matching the caller's own already-approved branch: that
+          // edit text carries "Changes requested", which is gateFromReply's
+          // routing vocabulary and would mis-route the human's next message.
+          await tgAnswer(cb.id, "Already approved on the pipeline — nothing to reject.").catch(() => {});
+          // The only outcome the caller treats as "run no ticket half".
+          return DEPLOY_GATE_FAILED;
+        }
         await tgAnswer(cb.id, "Already recorded on the pipeline — finishing the ticket.").catch(() => {});
         // TEAM-4781: the marker write is exactly what an earlier tap may have died
         // on, so a ❌ re-tap retries it (idempotent) before the ticket half runs.
@@ -1410,6 +1449,15 @@ async function decideDeployGate(cb, chatId, ticketId, deploy, approve, workflowI
       console.warn(`[telegram-bug-intake] deploy gate ${ticketId} was already resolved on ${name}: ${scrub(err.message)}`);
       // The rejection stands on the pipeline, so the marker is the only half that
       // may still be missing — attempt it here too (TEAM-4781).
+      //
+      // TEAM-4781 SR2 deliberately does NOT condition this arm on the ledger. An
+      // approval action WAS waiting for this execution a moment ago, so whoever
+      // answered it in the gap is unknowable from here - and the ledger cannot
+      // help, because the SEC-9 write above (BEFORE the pipeline call, which is
+      // the invariant that closes the 29h stall) has already stamped this tap's
+      // own "Rejected" over any earlier row. Unknown means conservative: the
+      // marker only ever ADDS a human gate, so writing it costs a re-approval at
+      // worst, while skipping it risks a rejected commit deploying unattended.
       if (!approve) {
         return await settleShipRejection({
           cb, chatId, ticketId, workflowId, outcome: DEPLOY_GATE_ALREADY,
@@ -4019,7 +4067,17 @@ async function handleDeployApprovalCallback(cb, chatId, action, key) {
   // the claim row's pipeline + execution. Written BEFORE the pipeline call, for
   // the same reason as the ticket-keyed half.
   const ledgerRef = { pipeline: pipelineName, executionId };
+  // TEAM-4781 SR2: read the PRIOR decision before the write below stamps this
+  // tap's own over it. That ordering is the only way this page can tell "my own
+  // ❌ re-tap" from "a ❌ landing on a gate I already ✅'d", and both the marker
+  // and the wording below turn on the difference. null = no prior row, or a row
+  // from a build that wrote none: unknown, never assumed.
+  const priorDecision = await gateDecisionRecorded(ledgerRef);
   await recordGateApproved(ledgerRef, { approve, chatId });
+  // Did CodePipeline refuse our call because the wait was already over? Hoisted
+  // because the closing edit's wording turns on it (TEAM-4781 SR2): only a call
+  // that actually LANDED lets this page claim it stopped the deploy.
+  let putAlreadyCompleted = false;
   try {
     await cp.send(new PutApprovalResultCommand({
       pipelineName,
@@ -4040,8 +4098,24 @@ async function handleDeployApprovalCallback(cb, chatId, action, key) {
     // the half that may still be missing. Fall through to the shared marker step
     // below rather than bailing: dropping the claim row is what makes this page
     // unactionable, and the row is the only thing left that can retry the marker.
+    //
+    // TEAM-4781 SR2: unless the prior row says we ✅'d it. Then this is the
+    // opposite decision on a gate this page already approved, not a re-tap of a
+    // rejection, and neither the marker nor a "deploy stopped" edit would be true.
     const alreadyRejected =
       !approve && APPROVAL_ALREADY_RE.test(`${err.name || ""} ${err.message || ""}`);
+    if (alreadyRejected && priorDecision === "Approved") {
+      console.warn(`[telegram-bug-intake] tokenless deploy gate on ${pipelineName}: ❌ tap after our own recorded ✅ - no rejection marker`);
+      // The token is spent either way, so there is nothing left for this page to
+      // retry: drop the claim exactly as the success path does.
+      await ddb.send(new DeleteItemCommand({
+        TableName: PENDING_TABLE, Key: { id: { S: `${DEPLOY_KEY_PREFIX}${key}` } },
+      })).catch(() => {});
+      await tgAnswer(cb.id, "Already approved — nothing to reject.");
+      await tgEdit(chatId, cb.message.message_id,
+        `${cb.message.text}\n\n🚀 Already approved on the pipeline — this ❌ changed nothing.`.slice(0, 4000));
+      return;
+    }
     if (!alreadyRejected) {
       // Anything else: nothing was recorded, so clear the claim as before.
       await ddb.send(new DeleteItemCommand({
@@ -4052,6 +4126,7 @@ async function handleDeployApprovalCallback(cb, chatId, action, key) {
         `${cb.message.text}\n\n⚠️ ${esc(err.name || "Error")}: ${esc(err.message || "")}`.slice(0, 4000));
       return;
     }
+    putAlreadyCompleted = true;
     console.warn(`[telegram-bug-intake] tokenless deploy gate on ${pipelineName} was already rejected: ${err.message} — retrying the marker only`);
   }
   // SEC-1: record the REJECTION where the pipeline's own preapproval check looks,
@@ -4073,8 +4148,19 @@ async function handleDeployApprovalCallback(cb, chatId, action, key) {
     TableName: PENDING_TABLE, Key: { id: { S: `${DEPLOY_KEY_PREFIX}${key}` } },
   })).catch(() => {});
   await tgAnswer(cb.id, approve ? "Deploy approved" : "Deploy rejected");
-  await tgEdit(chatId, cb.message.message_id,
-    `${cb.message.text}\n\n${approve ? "🚀 Approved — deploying to prod." : "🛑 Rejected — deploy stopped."}`);
+  // TEAM-4781 SR2: "deploy stopped" is a claim about what OUR call did, so only
+  // say it when our call landed, or when the prior ledger row proves the earlier
+  // tap that consumed the token was also ours and was also a ❌ (the re-tap that
+  // exists only to retry the marker). Otherwise the token was spent by a decision
+  // we cannot attribute - it may have been an approval - and the honest statement
+  // is that the gate is already actioned and the marker is recorded.
+  const weStoppedIt = !putAlreadyCompleted || priorDecision === "Rejected";
+  const verdict = approve
+    ? "🚀 Approved — deploying to prod."
+    : weStoppedIt
+      ? "🛑 Rejected — deploy stopped."
+      : "🛑 Already actioned on the pipeline — rejection marker recorded, so this commit cannot skip its deploy gate.";
+  await tgEdit(chatId, cb.message.message_id, `${cb.message.text}\n\n${verdict}`);
 }
 
 // ─── LLM structuring ─────────────────────────────────────────────────────────
