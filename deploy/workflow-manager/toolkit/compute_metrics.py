@@ -66,6 +66,10 @@ CARD_QUALITY_KEYS = (
     "tasks", "tasksCompleted", "reworkRounds", "firstPassYield", "loops",
     "changeRequests", "fixTickets", "nudges", "errors", "interventions",
     "gateRounds", "score", "ci",
+    # kpiVersion 2 (reportVersion 6+): re-invocations split by cause, re-wakes
+    # that are NOT rework, dead/restarted-session retries, and what every WM
+    # intervention did/said. Absent on v5 cards; .get keeps those readable.
+    "retries", "rewakes", "reinvocations", "interventionsDetail",
 )
 HUMAN_WAIT_NOTE = (
     "humanWaitTotalMs is the legacy per-review SUM; time.humanWaitMs is the card's "

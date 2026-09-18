@@ -15,7 +15,10 @@ See "Hero KPIs" below.
 
 **Version history** — `3`: baseline card schema. `4`: uncached-input pricing
 (cache tokens no longer double-billed). `5`: the `card.kpi` contract
-(deterministic quality score), `kpiVersion 1`.
+(deterministic quality score), `kpiVersion 1`. `6`: `kpiVersion 2` — re-invocations
+are classified by cause and only fix/review-caused ones are rework; dead or
+restarted sessions count as errors; every Workflow Manager intervention is listed
+with its text (`quality.interventionsDetail`). Weights and tolerances unchanged.
 
 ## What is measured
 
@@ -23,7 +26,7 @@ See "Hero KPIs" below.
 |---|---|---|
 | **Cost** | Total / persona LLM / coding CLIs, tokens in/out/cache-read/cache-write, persona cache hit rate, $ per task, by engine, by agent | Persona spans (`gen_ai.usage.*` on `aws/spans` + per-runtime span groups), Claude Code `api_request` events, Codex/Kiro `coding_usage` records; priced from `src/config/pricing.json` (Bedrock list, synced to S3 `config/pricing.json`) |
 | **Time** | End-to-end wall-clock, human-gate wait (interval union), active (wall − human), agent work (Σ task durations), orchestration idle (active − work), utilization, per phase | Workflow record + events table |
-| **Quality** | Agent tasks (+completed), rework rounds (re-invocations of a ticket), change requests (`review.rejected`), fix tickets, review-gate rounds, loops (= change requests + fix tickets), nudges, manager interventions, errors/retries, first-pass yield, CI verdict, PR, outcome, deterministic quality score (`kpi.quality`) | Events table (deduplicated — every event is written twice) + `reviewGateHistory` + `completions/{ticketId}.json` |
+| **Quality** | Agent tasks (+completed), rework rounds (re-invocations caused by a fix ticket or a review rejection — see "Re-invocation kinds"), re-wakes (re-invocations that are not rework), change requests (`review.rejected`), fix tickets, review-gate rounds, loops (= change requests + fix tickets), nudges, manager interventions, errors/retries, first-pass yield, CI verdict, PR, outcome, deterministic quality score (`kpi.quality`) | Events table (deduplicated — every event is written twice) + `reviewGateHistory` + `completions/{ticketId}.json` |
 | **Infra** | AgentCore runtime compute / memory, network, storage, CloudWatch, platform, optional (evaluations, CodeBuild fleet, legacy App Runner); per-runtime GB·h/vCPU·h split; per-run allocation | Cost Explorer (trailing 30d, region-scoped) + `AWS/Bedrock-AgentCore` metrics, refreshed at most every 6h |
 
 ## Anomaly bands
@@ -124,7 +127,7 @@ to 0:
 | `firstPass` | 30 | ratio | `quality.firstPassYield` | — |
 | `rework` | 20 | rate | `quality.reworkRounds` / `quality.tasks` | 0.6 |
 | `loops` | 20 | count | `quality.loops` | 8 |
-| `stability` | 15 | sum | `quality.errors` + `quality.nudges` + `quality.interventions` | 6 |
+| `stability` | 15 | sum | `quality.errors` (incl. `agent.retry` / `agent.died`) + `quality.nudges` + `quality.interventions` (every WM action) | 6 |
 | `gates` | 10 | excess | `max(0, quality.gateRounds − time.humanGates)` | 4 |
 | `ci` | 5 | verdict | `quality.ci.verdict` (`pass`→1, `fail`→0; `unknown`/`null` neutral) | — |
 
@@ -273,6 +276,29 @@ in `src/config/kpi.json` must bump `kpiVersion` **and** `REPORT_VERSION`
 `rebuildIndex` keeps every old card as current and the fleet silently mixes
 scores from two different rubrics; `--backfill` is what actually re-scores the
 historical runs under the new one.
+
+## Re-invocation kinds (kpiVersion 2)
+
+Since DL-024 an agent ends a turn by parking its ticket `blocked_by` something and
+is re-invoked when that closes, so "invoked twice" no longer means "sent back".
+`computeAgentTasks` classifies every re-invocation of a ticket by what woke it
+(`classifyReinvocation`, `REINVOCATION_KINDS`); only `REWORK_KINDS` feed
+`quality.reworkRounds` and first-pass yield.
+
+| Kind | Cause seen in the ticket's own events since its previous invocation | Counts as |
+|---|---|---|
+| `retry` | `agent.retry` / `agent.error` / `agent.died` | error (`quality.errors`, `quality.retries`) |
+| `human_gate` | `orchestrator.unblocked` by a `human:*` ticket | re-wake (`quality.rewakes`) |
+| `ci_recert` | the ticket is a CI ticket, or it was unblocked by one | re-wake |
+| `dependency` | unblocked by any other non-fix agent ticket | re-wake |
+| `fix_rework` | unblocked by a fix ticket (`isFixTicket`) | rework |
+| `review_rework` | a `review.rejected` in the window | rework |
+| `unknown` | no cause visible | rework (never hide real rework) |
+
+`quality.reinvocations = { total, byKind }` is the run-level split; each task row
+carries `reinvocations[] { at, kind, cause }`. Every Workflow Manager action is
+one `quality.interventions` (the WM only acts on a stalled run) and its text is in
+`quality.interventionsDetail[] { at, action, ticketId, note }`.
 
 ## Prompt caching
 
