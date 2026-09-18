@@ -655,7 +655,12 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   // that DID carry a pr_url still finds its siblings instead of silently skipping
   // nothing.
   const isEmptySweep = report.outcome === EMPTY_SWEEP_OUTCOME;
-  const needsIssue = !isSynthetic && (!prUrlText || followUps.entries.length > 0 || isEmptySweep);
+  // TEAM-4752 D3: read on EVERY non-synthetic completion. The old short-circuit
+  // (`!prUrlText || …`) skipped the read whenever a pr_url was present, which is
+  // precisely the case FR-5 has to check — base_branch is only readable off the
+  // ticket, so "it carries a PR" cannot be the reason not to look at which branch
+  // that PR is for. Costs one ticket-Lambda invoke (~50 ms) per report.
+  const needsIssue = !isSynthetic;
   let issue = null;
   // TEAM-4752 D1: WHY `issue` is null matters now. "The ticket says it has no
   // parent" and "we could not read the ticket" are different answers, and the
@@ -675,10 +680,32 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
     }
   }
 
+  // ─── TEAM-4740 FR-5 / TEAM-4752 D3: a fix to main must carry the PR to main ──
+  //
+  // Two halves, and the split is the point: `mainFixRefusal` is pure and states the
+  // DEFINITE negatives (no pr_url, or a pr_url that is not a GitHub PR URL);
+  // `verifyPrBase` asks GitHub what the PR actually targets, and only refuses on an
+  // answer GitHub gave. Both refuse before anything durable is written.
   const mainRefusal = mainFixRefusal({ issue, prUrl: pr_url });
   if (mainRefusal) {
-    console.warn(`[report_completion] REFUSED ${ticket_id}: ${mainRefusal.reason} (base_branch: main, no pr_url) - no record written, ticket not transitioned`);
+    console.warn(`[report_completion] REFUSED ${ticket_id}: ${mainRefusal.reason} (${mainRefusal.detail}) - no record written, ticket not transitioned`);
     return mainRefusal;
+  }
+
+  // Additive: null (and so absent from the response) on every report that does not
+  // state `base_branch: main`, which is almost all of them.
+  const prBase = await verifyPrBase({ issue, prUrl: pr_url });
+  if (prBase.refusal) {
+    console.warn(`[report_completion] REFUSED ${ticket_id}: ${prBase.refusal.reason} (${prBase.refusal.detail}) - no record written, ticket not transitioned`);
+    return prBase.refusal;
+  }
+  if (TICKET_PROVIDER === "jira" && issue && !asText(issue.description)) {
+    // The limitation, in CloudWatch rather than only in a comment: the Jira twin's
+    // get_issue does not request `description`, so there is no base_branch line to
+    // read and FR-5 cannot fire at all on that provider. Whoever is asking why a
+    // jira-mode fix to main sailed through needs to see that the check was INERT,
+    // not that the report passed it.
+    console.warn(`[report_completion] ${ticket_id}: FR-5 base_branch check INERT - TICKET_PROVIDER=jira returned no description, so the ticket's base branch is unknown here`);
   }
 
   // ─── TEAM-4752 D1: the sibling scan, BEFORE anything durable ─────────────────
@@ -814,6 +841,10 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
     // FR-10: in skip ORDER, because the order is the claim being made — a reader
     // checking the sweep behaved correctly is checking dependents came first.
     ...(emptySweep ? { emptySweepSkipped: emptySweep.skipped, ...(emptySweep.failed.length > 0 ? { emptySweepFailed: emptySweep.failed } : {}) } : {}),
+    // TEAM-4752 D3: only on the `base_branch: main` path, and it says which of
+    // verified / unverified / indeterminate the acceptance rests on — so a green
+    // report never silently implies GitHub agreed when nobody asked it.
+    ...(prBase.verification ? { prBaseVerification: prBase.verification } : {}),
   };
 }
 
@@ -1603,10 +1634,16 @@ async function materializeFollowUps({ entries, siblings, scanOk = true, ticketId
 // ─── TEAM-4740 FR-14: the delivery state of the PR, on every record ────────────
 
 /**
- * DERIVED, never observed. This Lambda has no GitHub token and no GitHub client
- * (by design — it is invoked by every agent), so it states what it can prove from
- * the report itself and labels everything else `unknown` rather than guessing.
- * A `merged` here can therefore LAG reality by one merge; it can never LEAD it.
+ * DERIVED, never observed. It states what it can prove from the report itself and
+ * labels everything else `unknown` rather than guessing, so a `merged` here can LAG
+ * reality by one merge; it can never LEAD it.
+ *
+ * TEAM-4752 D3: the Lambda now MAY hold a GitHub token, but it is optional and used
+ * for exactly one thing — FR-5's base-branch check (`verifyPrBase`), on a report
+ * that claims a fix to main. `derivePrState` deliberately does not reach for it: it
+ * runs on every completion, and turning the delivery field of every record in the
+ * fleet into a network read would trade a value that is cheap and honestly labelled
+ * for one that is expensive and sometimes wrong anyway.
  */
 export function derivePrState({ mergeCommit, outcome, prUrl }) {
   if (asText(mergeCommit).trim() || outcome === "shipped") return "merged";
@@ -1615,28 +1652,185 @@ export function derivePrState({ mergeCommit, outcome, prUrl }) {
 }
 
 /**
+ * The branch this ticket's description STATES as its base, or null when it states
+ * none (including a description we could not read at all). Split out by TEAM-4752
+ * D3 so the pure refusal below and the GitHub check beside it decide "does this
+ * check apply" from one place rather than parsing the line twice.
+ */
+export function statedBaseBranch(issue) {
+  const description = asText(issue?.description);
+  if (!description) return null;
+  return BASE_BRANCH_LINE_RE.exec(description)?.[1] ?? null;
+}
+
+/**
+ * A PR URL → `{ owner, repo, number }`, or null.
+ *
+ * A BYTE-COPY of lambda/agentcore-hub-pipeline-tools/index.mjs's `parsePrUrl`
+ * (same two anchored patterns, same `^\.+$` traversal guard), duplicated for the
+ * same reason BASE_BRANCH_RE is duplicated across the twins: a Lambda ships as its
+ * own zip and may not import from a sibling. The regex SOURCES are pinned against
+ * that file's text by src/lib/workflow/pr-url-parity.test.ts, so a fix to one is a
+ * CI failure in the other rather than a silent divergence.
+ *
+ * Deliberately strict: this string comes from an agent and decides which URL we
+ * fetch, so no query, no fragment, no traversal, and no host but github.com.
+ */
+export const PR_URL_RE = /^https:\/\/github\.com\/([A-Za-z0-9._-]+)\/([A-Za-z0-9._-]+)\/pull\/([0-9]{1,10})$/;
+export const PR_API_URL_RE = /^https:\/\/api\.github\.com\/repos\/([A-Za-z0-9._-]+)\/([A-Za-z0-9._-]+)\/pulls\/([0-9]{1,10})$/;
+
+export function parsePrUrl(value) {
+  const text = String(value ?? "").trim();
+  const m = PR_URL_RE.exec(text) || PR_API_URL_RE.exec(text);
+  if (!m) return null;
+  const [, owner, repo, number] = m;
+  // A path segment of "." or ".." passes the character class above.
+  if (/^\.+$/.test(owner) || /^\.+$/.test(repo)) return null;
+  return { owner, repo, number };
+}
+
+/**
  * TEAM-4740 FR-5 — a fix whose base branch is `main` has not been delivered until
  * the PR to main exists. Refused as a VALUE, in the same shape and with the same
  * "nothing was recorded" wording as handoff_requires_pr_url above.
+ *
+ * PURE and SYNCHRONOUS, and it stays that way: it states only the DEFINITE
+ * negatives — the ones provable from the report itself, with no I/O. What GitHub
+ * has to answer ("is that PR's base really main?") lives in `verifyPrBase` beside
+ * it, because a network answer can be indeterminate and a pure predicate must not
+ * have to represent that.
+ *
+ * TEAM-4752 D3 adds the second definite negative: a `pr_url` that is not a GitHub
+ * pull-request URL at all. `asText(prUrl).trim()` alone accepted "TBD", a branch
+ * name, or a link to some other repo's PR as proof of delivery, which is the whole
+ * defect — the refusal claimed "carries the PR to main" while checking only that
+ * the field was non-blank.
  *
  * FAILS OPEN by construction, and one provider cannot honour it at all: the Jira
  * twin's get_issue does not request `description` (and its `search_issues` mapper
  * drops it too), and neither read path is inside this ticket's ownership slice. So
  * on TICKET_PROVIDER=jira there is no base_branch line to read and this check is
- * inert — stated as a limitation rather than papered over.
+ * inert. Stated as a limitation rather than papered over — and, since TEAM-4752
+ * D3, LOGGED on the refusal path too, because a comment is invisible to whoever is
+ * reading CloudWatch wondering why a jira-mode run was never refused.
  */
 export function mainFixRefusal({ issue, prUrl }) {
-  if (asText(prUrl).trim()) return null;
-  const description = asText(issue?.description);
-  if (!description) return null;
-  const m = BASE_BRANCH_LINE_RE.exec(description);
-  if (!m || m[1] !== "main") return null;
-  return {
-    ok: false,
-    reason: "main_fix_requires_pr",
-    missing: ["pr_url"],
-    message: `This ticket's base branch is main; a completion must carry the PR to main. Nothing was recorded and the ticket was NOT transitioned.`,
-  };
+  if (statedBaseBranch(issue) !== "main") return null;   // the check does not apply
+  const text = asText(prUrl).trim();
+  if (!text) {
+    return {
+      ok: false,
+      reason: "main_fix_requires_pr",
+      detail: "no_pr_url",
+      missing: ["pr_url"],
+      message: `This ticket's base branch is main; a completion must carry the PR to main. Nothing was recorded and the ticket was NOT transitioned.`,
+    };
+  }
+  if (!parsePrUrl(text)) {
+    return {
+      ok: false,
+      reason: "main_fix_requires_pr",
+      detail: "pr_url_not_a_github_pr",
+      missing: ["pr_url"],
+      message: `This ticket's base branch is main; a completion must carry the PR to main, but pr_url ${JSON.stringify(text)} is not a GitHub pull-request URL (expected https://github.com/<owner>/<repo>/pull/<number>). Nothing was recorded and the ticket was NOT transitioned.`,
+    };
+  }
+  return null;   // well formed ⇒ ask GitHub (verifyPrBase)
+}
+
+// ─── TEAM-4752 D3: the one GitHub read this Lambda makes ───────────────────────
+//
+// Read LAZILY, not as a module-level const: a Lambda's env cannot change mid-life
+// so there is no behavioural difference, but it lets one test process drive both
+// the token-present and the token-absent rows of the table below. Never logged,
+// never returned — it appears in exactly one place, the Authorization header.
+const githubToken = () => (process.env.GITHUB_TOKEN || "").trim();
+// SHORTER than the Lambda's own 60 s budget, so a slow GitHub costs the report a
+// verification rather than the whole completion.
+const GITHUB_TIMEOUT_MS = Number(process.env.GITHUB_TIMEOUT_MS || 5000);
+
+/**
+ * Ask GitHub what the PR's base branch actually is.
+ *
+ * The refusal above can prove that a `pr_url` is well formed; only GitHub can say
+ * what it points AT. Without this, "a fix to main carries the PR to main" was
+ * satisfied by a PR to the integration branch — the exact delivery the FR-5 check
+ * exists to catch, since that PR evaporates when the integration branch merges.
+ *
+ * REFUSE only on a definite negative; an indeterminate answer never wedges the
+ * report (DL-028's direction, applied the same way `probeCdLedger` applies it):
+ *
+ *   200, base.ref === "main"   → accept, `verified`
+ *   200, base.ref !== "main"   → REFUSE, and name the base we observed
+ *   404                        → REFUSE (the PR is not visible to the hub token,
+ *                                so it is not evidence of anything)
+ *   no token                   → accept, `unverified` (+ WARN)
+ *   any other status / timeout → accept, `indeterminate` (+ WARN)
+ *
+ * @returns {Promise<{refusal: object|null, verification: string|null}>} `verification`
+ *   is null exactly when the check does not apply, so the response key stays absent.
+ */
+async function verifyPrBase({ issue, prUrl }) {
+  if (statedBaseBranch(issue) !== "main") return { refusal: null, verification: null };
+  const pr = parsePrUrl(prUrl);
+  if (!pr) return { refusal: null, verification: null };   // mainFixRefusal already refused
+
+  const token = githubToken();
+  if (!token) {
+    console.warn(`[report_completion] pr base UNVERIFIED (no GITHUB_TOKEN): ${pr.owner}/${pr.repo}#${pr.number} is accepted on the report's word alone`);
+    return { refusal: null, verification: "unverified" };
+  }
+
+  let status = 0;
+  let baseRef = null;
+  try {
+    const res = await fetch(`https://api.github.com/repos/${pr.owner}/${pr.repo}/pulls/${pr.number}`, {
+      headers: {
+        Authorization: `token ${token}`,
+        Accept: "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "agentcore-hub-workflow-output",
+      },
+      signal: AbortSignal.timeout(GITHUB_TIMEOUT_MS),
+    });
+    status = res.status;
+    if (res.ok) baseRef = asText((await res.json())?.base?.ref).trim() || null;
+  } catch (err) {
+    // A transport failure is "we could not look", which is not "the base is wrong".
+    console.warn(`[report_completion] pr base INDETERMINATE for ${pr.owner}/${pr.repo}#${pr.number} (${err.name}: ${err.message}) - accepted`);
+    return { refusal: null, verification: "indeterminate" };
+  }
+
+  if (status === 404) {
+    return {
+      refusal: {
+        ok: false,
+        reason: "main_fix_requires_pr",
+        detail: "pr_not_found",
+        missing: ["pr_url"],
+        message: `This ticket's base branch is main, but GitHub reports no pull request ${pr.owner}/${pr.repo}#${pr.number} (404) — a PR the hub cannot see is not evidence that the fix was delivered to main. Nothing was recorded and the ticket was NOT transitioned.`,
+      },
+      verification: null,
+    };
+  }
+  if (status !== 200 || !baseRef) {
+    console.warn(`[report_completion] pr base INDETERMINATE for ${pr.owner}/${pr.repo}#${pr.number} (GitHub ${status}) - accepted`);
+    return { refusal: null, verification: "indeterminate" };
+  }
+  if (baseRef !== "main") {
+    return {
+      refusal: {
+        ok: false,
+        reason: "main_fix_requires_pr",
+        detail: "pr_base_not_main",
+        missing: ["pr_url"],
+        message: `This ticket's base branch is main, but pull request ${pr.owner}/${pr.repo}#${pr.number} targets ${JSON.stringify(baseRef)} instead. A PR to an integration branch is superseded when that branch merges, which is the delivery this check exists to catch — open the PR against main. Nothing was recorded and the ticket was NOT transitioned.`,
+      },
+      verification: null,
+    };
+  }
+  console.log(`[report_completion] pr base VERIFIED: ${pr.owner}/${pr.repo}#${pr.number} → main`);
+  return { refusal: null, verification: "verified" };
 }
 
 // ─── S3 Storage tools ──────────────────────────────────────────────────────────

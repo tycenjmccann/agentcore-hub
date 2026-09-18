@@ -120,6 +120,10 @@ beforeEach(() => {
   h.siblings.length = 0;
   h.issue = null;
   h.objects.clear();
+  // TEAM-4752 D3: no fixture here states `base_branch: main`, so nothing should
+  // reach GitHub — unset the token so that stays true even for a developer who has
+  // one exported, rather than depending on it.
+  delete process.env.GITHUB_TOKEN;
   vi.spyOn(console, "warn").mockImplementation((...a) => h.logs.push(a.join(" ")));
   vi.spyOn(console, "error").mockImplementation((...a) => h.logs.push(a.join(" ")));
   vi.spyOn(console, "log").mockImplementation((...a) => h.logs.push(a.join(" ")));
@@ -312,9 +316,12 @@ describe("REGRESSION hirhfw — a completion with no follow-ups is unchanged but
       "ticket_id", "summary", "artifacts", "branch", "commit_sha", "pr_url", "completed_at", "delivery",
     ]);
     expect(r.delivery).toEqual({ prUrl: "https://github.com/tycenjmccann/agentcore-hub/pull/611", prState: "open" });
-    // No epic read, no sibling scan, no create: the report that needs none of it
-    // pays for none of it.
-    expect(h.calls.map((c) => c.tool)).toEqual(["Tickets___transition_ticket"]);
+    // No sibling scan, no create: the report that needs none of it pays for none of
+    // it. The ticket itself IS read now (TEAM-4752 D3 — its base branch lives
+    // nowhere else, so "it carries a PR" cannot be the reason not to look), which is
+    // one extra invoke and no change to what gets written; the record-key assertion
+    // above is what "byte-unchanged" actually means here.
+    expect(h.calls.map((c) => c.tool)).toEqual(["Tickets___get_issue", "Tickets___transition_ticket"]);
     expect(h.created).toHaveLength(0);
   });
 });
