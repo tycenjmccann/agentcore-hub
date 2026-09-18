@@ -236,7 +236,12 @@ never file a second one yourself either. Otherwise:
   detail goes in the description)
 - assignee: `human:engineer`
 - labels, EXACTLY: `gate:ci-unavailable`, `head:<head SHA, 40 hex chars>`,
-  `pipeline:<pipeline_name>`
+  `pipeline:<pipeline_name>` — **exactly one of each, and both are mandatory.**
+  `create_ticket` REFUSES with `gate_condition_unmet` (no ticket is minted, so
+  retry the same call with the labels fixed) if either is missing, duplicated, or
+  malformed — a 41-character head is malformed. Both bindings are what the close
+  guard probes; without them it can only admit the gate unproven, which is
+  exactly the hole this gate exists to close.
 - description: the exact tool reply/error proving CI is unreachable for this
   head, and a remedy list in this order:
   1. `Pipeline___start_ci_build(commit_sha=<head SHA>)` — the human re-grants or

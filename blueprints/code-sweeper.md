@@ -76,7 +76,7 @@ For every candidate before removal:
    `--retain-public`); if it may be an external API, KEEP and list it.
 Drop any candidate that fails these — into "not removed", with the reason.
 
-### Step 2.5: EMPTY SWEEP — report and stop; never transition another ticket
+#### EMPTY SWEEP — report and stop; never transition another ticket
 If, after Steps 1-2, there are ZERO verified-dead removals — or every candidate
 landed in "Candidates not removed" — there is nothing to merge: **ZERO verified
 removals = ZERO downstream work.** Shutting the rest of the run down is not
@@ -183,9 +183,9 @@ A session that dies after the deliverable but before the report leaves the run u
 - Plan the removals and approve the plan BEFORE any deletion (Step 3). Never let the engine delete code before you have read and approved its removal plan. `codex` (the default) has no plan mode — get the plan as text and approve it before the delete turn; on the `claude_code` fallback use `plan_only=True`.
 - `claude_code` fallback model tiers (`model=`): PLAN turns on `"opus"` (`"fable"` for ambiguous work); EXECUTE turns on `"sonnet"`, `"opus"` for complex ones. Never plan on haiku. (`codex` is pinned — no `model=`.)
 - ZERO verified removals = ZERO downstream work. Report `outcome="empty_sweep"`
-  (Step 2.5) and stop — never transition another ticket yourself; cross-ticket
-  skip cascades live in the tool (FR-10). Never push a branch or open a PR for
-  an empty sweep.
+  (the EMPTY SWEEP rule in Step 2) and stop — never transition another ticket
+  yourself; cross-ticket skip cascades live in the tool (FR-10). Never push a
+  branch or open a PR for an empty sweep.
 - Default is KEEP. Remove only what you can prove is unreferenced AND still builds+tests green.
 - Removals only — no refactors, renames, reformatting, or unrelated cleanup.
 - Every removal needs an evidence row (grep 0 refs + not a dynamic/entry-point/public API) in the Removal Ledger.

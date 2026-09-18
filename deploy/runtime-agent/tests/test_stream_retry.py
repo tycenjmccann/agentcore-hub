@@ -397,6 +397,41 @@ async def test_two_transient_breaks_then_success() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "exc",
+    [
+        InternalServerException("the model service failed mid-stream"),
+        EventStreamError("An error occurred (InternalServerException) reading the event stream"),
+    ],
+    ids=["bare", "wrapped"],
+)
+async def test_internal_server_exception_midstream_recovers_in_turn(exc: BaseException) -> None:
+    """The exact failure the fleet hit (TEAM-4764 P3): an ISE mid-stream, bare or
+    wrapped as an EventStreamError, recovers on the SAME Agent — 2 attempts, one
+    instance, no replayed prompt, no duplicate delta."""
+    ns, agent_cls, errors, deaths = _load([
+        [{"data": "the first half "}, exc],
+        [{"data": "and the second"}, _engage_completion],
+    ])
+
+    frames = [f async for f in ns["_run_agent_invocation"](PAYLOAD, CTX)]
+    (agent,) = agent_cls.instances
+
+    assert agent.attempts == 2, f"expected 2 stream_async attempts, got {agent.attempts}"
+    assert len(agent_cls.instances) == 1, "the retry rebuilt the Agent — the conversation is gone"
+    assert agent.prompts[0] == PAYLOAD["prompt"], "attempt 1 must deliver the derived prompt"
+    assert agent.prompts[1:] == [[]], (
+        f"the retry must re-enter with [], not the prompt; got {agent.prompts[1:]!r}"
+    )
+    assert _deltas(frames) == ["the first half ", "and the second"], f"got {_deltas(frames)}"
+    assert ns["_test_saved"][-1][-1] == "the first half and the second", (
+        f"Memory must hold one continuous reply; got {ns['_test_saved'][-1][-1]!r}"
+    )
+    assert errors == [], "a turn that RECOVERED must not publish agent.error"
+    assert deaths == [], "a recovered turn that reported completion is not a death"
+
+
+@pytest.mark.asyncio
 async def test_a_deterministic_error_is_not_retried() -> None:
     """One attempt, one agent.error carrying the ticket, and the raise propagates."""
     ns, agent_cls, errors, deaths = _load([

@@ -1551,7 +1551,9 @@ describe("transition_ticket — typed gate guard, DynamoDB-side mechanics (TEAM-
 describe("create_ticket — gate-loop seam, DynamoDB-side (TEAM-4739)", () => {
   const EPIC = "TEAM-1";
   const SHA = "b".repeat(40);
-  const CI_GATE = ["gate:ci-unavailable", `head:${SHA}`];
+  // Both bindings: since TEAM-4764 a ci-unavailable gate with no `pipeline:` label is
+  // refused by the shape seam, which runs before the loop seam under test here.
+  const CI_GATE = ["gate:ci-unavailable", "pipeline:hub-x-deploy", `head:${SHA}`];
   const priorRow = (id) => ({ ticketId: id, labels: ["gate-ci-unavailable", `head-${SHA}`] });
 
   beforeEach(async () => {
