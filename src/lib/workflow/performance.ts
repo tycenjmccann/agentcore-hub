@@ -42,6 +42,11 @@ export interface CardSummary {
     firstPassYield: number | null; humanGates: number;
     /** Deterministic 0-100 quality score (report v5+). Absent on older summaries. */
     score?: number | null;
+    /** kpiVersion 2 (report v6+): every WM action, dead/restarted sessions, and the re-invocation split. Absent on older summaries. */
+    interventions?: number | null;
+    retries?: number | null;
+    rewakes?: number | null;
+    reinvocations?: Record<string, number> | null;
   };
   agents: Record<string, { usd: number; workMs: number; tasks: number; reworkRounds: number }>;
   status: BandStatus;
@@ -104,10 +109,10 @@ export const FLEET_KPIS: KpiDef[] = [
   { key: "time.agentWork", label: "Agent work", unit: "ms", group: "time", floor: 900_000, help: "Sum of agent task durations (agents actually working)" },
   { key: "time.humanWait", label: "Human wait", unit: "ms", group: "time", floor: 900_000, help: "Union of open review-gate intervals" },
   { key: "quality.tasks", label: "Agent tasks", unit: "count", group: "quality", floor: 1, help: "Tickets worked by agents (fewer = tighter pipeline)" },
-  { key: "quality.reworkRounds", label: "Rework rounds", unit: "count", group: "quality", floor: 1, help: "Re-invocations of a ticket after its first run" },
+  { key: "quality.reworkRounds", label: "Rework rounds", unit: "count", group: "quality", floor: 1, help: "Re-invocations caused by a fix ticket or a review rejection (re-wakes after human gates, CI re-certs and retries are not rework)" },
   { key: "quality.loops", label: "Loops", unit: "count", group: "quality", floor: 1, help: "Change requests + fix tickets — times the pipeline went back" },
   { key: "quality.nudges", label: "Nudges", unit: "count", group: "quality", floor: 1, help: "Workflow Manager had to push a stalled run" },
-  { key: "quality.errors", label: "Errors", unit: "count", group: "quality", floor: 1, help: "agent.error events" },
+  { key: "quality.errors", label: "Errors", unit: "count", group: "quality", floor: 1, help: "agent.error events plus dead or restarted sessions (agent.retry / agent.died)" },
   { key: "quality.firstPassYield", label: "First-pass yield", unit: "ratio", group: "quality", floor: 0.1, direction: "lower", help: "Share of agent tasks that needed no rework (higher is better)" },
   { key: "cost.personaCacheHitRate", label: "Persona cache hit rate", unit: "ratio", group: "cost", floor: 0.1, direction: "lower", help: "Share of persona input tokens served from the Bedrock prompt cache (higher is better)" },
   // `floor: 5` is the BAND floor (mirrors the Lambda's BAND_KPIS row for this
@@ -427,7 +432,7 @@ export interface KpiConfig {
 export const KPI_CONFIG = kpiConfig as KpiConfig;
 
 /** Card schema this build reads/writes. Bumped with any card shape change. */
-export const CURRENT_REPORT_VERSION = 5;
+export const CURRENT_REPORT_VERSION = 6; // 6: kpiVersion 2 (re-invocation classes, dead sessions as errors, WM intervention detail)
 
 export interface KpiComponent {
   key: string;

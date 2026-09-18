@@ -71,7 +71,7 @@ describe("kpi.json is the only home for the numbers", () => {
   });
 
   test("the fixture, the config and REPORT_VERSION agree on their versions", () => {
-    assert.equal(REPORT_VERSION, 5);
+    assert.equal(REPORT_VERSION, 6);
     assert.equal(FIXTURE.reportVersion, REPORT_VERSION);
     assert.equal(FIXTURE.kpiVersion, KPI_CONFIG.kpiVersion);
   });

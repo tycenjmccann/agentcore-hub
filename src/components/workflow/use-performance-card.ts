@@ -82,6 +82,12 @@ export interface RunCard {
     outcome: string; tasks: number; tasksCompleted: number; reworkRounds: number; changeRequests: number;
     fixTickets: number; gateRounds: number; loops: number; nudges: number; interventions: number;
     errors: number; retries: number; firstPassYield: number | null; prUrl: string | null;
+    /** kpiVersion 2 (report v6+): re-invocations that are NOT rework (human gate / CI re-cert / dependency). */
+    rewakes?: number;
+    /** kpiVersion 2: every re-invocation by cause — see REINVOCATION_KINDS in lambda/cost-report/index.mjs. */
+    reinvocations?: { total: number; byKind: Record<string, number> };
+    /** kpiVersion 2: every Workflow Manager action on the run, with what it said. */
+    interventionsDetail?: { at: string; action: string; ticketId: string | null; note: string | null }[];
   };
   agents: Record<string, { usd: number; workMs: number; tasks: number; reworkRounds: number }>;
   bands: {

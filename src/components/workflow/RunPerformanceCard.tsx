@@ -142,10 +142,34 @@ export default function RunPerformanceCard({ workflowId }: { workflowId: string 
               <Row label="Outcome" value={card.quality.outcome} />
               <Row label="Agent tasks (done)" value={`${card.quality.tasks} (${card.quality.tasksCompleted})`} band={k("quality.tasks")} />
               <Row label="First-pass yield" value={formatKpi("ratio", card.quality.firstPassYield)} band={k("quality.firstPassYield")} hint="tasks that needed no rework" />
-              <Row label="Rework rounds" value={String(card.quality.reworkRounds)} band={k("quality.reworkRounds")} />
+              <Row label="Rework rounds" value={String(card.quality.reworkRounds)} band={k("quality.reworkRounds")} hint="re-invocations caused by a fix ticket or a review rejection" />
+              {card.quality.rewakes != null && (
+                <Row
+                  label="Re-wakes (not rework)"
+                  value={String(card.quality.rewakes)}
+                  hint={Object.entries(card.quality.reinvocations?.byKind ?? {})
+                    .filter(([kind, n]) => n > 0 && kind !== "fix_rework" && kind !== "review_rework" && kind !== "unknown" && kind !== "retry")
+                    .map(([kind, n]) => `${kind.replace("_", " ")} ${n}`)
+                    .join(", ") || "human gate / CI re-cert / dependency"}
+                />
+              )}
               <Row label="Change requests / fix tickets" value={`${card.quality.changeRequests} / ${card.quality.fixTickets}`} band={k("quality.loops")} />
-              <Row label="Nudges / interventions" value={`${card.quality.nudges} / ${card.quality.interventions}`} band={k("quality.nudges")} />
-              <Row label="Errors / retries" value={`${card.quality.errors} / ${card.quality.retries}`} band={k("quality.errors")} />
+              <Row label="Nudges / interventions" value={`${card.quality.nudges} / ${card.quality.interventions}`} band={k("quality.nudges")} hint="every Workflow Manager action counts — the run had stalled" />
+              <Row label="Errors / retries" value={`${card.quality.errors} / ${card.quality.retries}`} band={k("quality.errors")} hint="dead or restarted sessions count as errors" />
+              {(card.quality.interventionsDetail?.length ?? 0) > 0 && (
+                <details className="text-xs mt-1">
+                  <summary className="cursor-pointer text-[var(--color-text-muted)]">Workflow Manager interventions ({card.quality.interventionsDetail!.length})</summary>
+                  <ul className="mt-1 space-y-1">
+                    {card.quality.interventionsDetail!.map((i, idx) => (
+                      <li key={idx} className="text-[var(--color-text-muted)]">
+                        <span className="text-[var(--color-text-primary)]">{i.action}</span>
+                        {i.ticketId ? ` · ${i.ticketId}` : ""} · {new Date(i.at).toLocaleString()}
+                        {i.note ? <div className="pl-2 italic break-words">{i.note}</div> : null}
+                      </li>
+                    ))}
+                  </ul>
+                </details>
+              )}
               {card.quality.prUrl && (
                 <div className="text-xs"><a href={card.quality.prUrl} target="_blank" rel="noreferrer" className="text-sky-400 hover:text-sky-300 inline-flex items-center gap-1">PR <ExternalLink className="w-3 h-3" /></a></div>
               )}
