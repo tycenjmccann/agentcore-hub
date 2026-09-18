@@ -71,6 +71,17 @@ Both are wanted, so both are on the record:
 - `metrics.kpi.cost.band` / `.time.band` / `.quality.band` are this run against
   its own workflow def's recent history (`ok` / `warn` / `alert`, with `z`).
   A `warn`/`alert` band is the strongest "this run was unusual" evidence you have.
+- **kpiVersion 2 (card `reportVersion` ≥ 6) changed what the counters mean — read
+  them accordingly.** `quality.reworkRounds` counts only re-invocations caused by
+  a fix ticket or a review rejection; a re-wake after a human gate, a CI
+  re-certification or a sibling dependency is in `quality.rewakes` (split by
+  cause in `quality.reinvocations.byKind`) and is NOT rework. A dead or
+  restarted session is in `quality.errors` (via `agent.retry` / `agent.died`), so
+  `errors=0` now really means no session died. Every Workflow Manager action is
+  in `quality.interventions`, with what it did and said in
+  `quality.interventionsDetail` — do not argue a comment "should not count"; the
+  WM only acts on a stalled run, so say what stalled. Never compare a v2 score
+  against a v1 score as if they meant the same thing.
 - **Do not re-derive what the card provides.** Read counts and durations from
   `metrics.quality.*`, `metrics.time.*`, `metrics.cost.*` — not by counting
   events or tickets yourself. Two numbers for one run is a bug report.
