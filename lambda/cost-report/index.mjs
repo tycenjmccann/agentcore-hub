@@ -25,7 +25,7 @@
  *
  * Time: wall-clock, human-gate wait (interval union), active (wall − human),
  * agent work (Σ task durations), orchestration idle (active − work).
- * Quality: tasks, rework rounds (re-invocations), change requests, fix tickets,
+ * Quality: tasks, rework rounds (fix/review-caused re-invocations; kpiVersion 2), change requests, fix tickets,
  * review-gate rounds, nudges, interventions, errors, first-pass yield.
  *
  * Bands: for each KPI, median + MAD over the same workflowDefId's cards that
@@ -91,7 +91,7 @@ function loadKpiConfig() {
 }
 export const KPI_CONFIG = loadKpiConfig();
 
-export const REPORT_VERSION = 5; // 5: card.kpi contract (deterministic quality score); 4: uncached-input pricing (cache tokens no longer double-billed)
+export const REPORT_VERSION = 6; // 6: kpiVersion 2 — re-invocations classified (only fix/review-caused count as rework), dead sessions count as errors, WM interventions listed; 5: card.kpi contract (deterministic quality score); 4: uncached-input pricing (cache tokens no longer double-billed)
 export const BASELINE_DAYS = 28;
 export const BASELINE_MIN = 5;
 const INFRA_WINDOW_DAYS = 30;
@@ -383,6 +383,8 @@ async function buildCard(workflowId, workflow, pricing, getCompletion = defaultG
   const fixTickets = countFixTickets(events, agentTasks, workflow);
   const gates = computeGateRounds(workflow);
   const reworkRounds = aiTasks.reduce((s, t) => s + t.reworkRounds, 0);
+  const reinvocations = reinvocationTotals(aiTasks);
+  const interventionsDetail = interventionDetail(events);
   const tasksCompleted = aiTasks.filter((t) => t.status === "complete" || t.status === "done").length;
   const firstPass = aiTasks.filter((t) => t.reworkRounds === 0).length;
   const prUrl = findPrUrl(workflow, events, agentTasks);
@@ -466,12 +468,20 @@ async function buildCard(workflowId, workflow, pricing, getCompletion = defaultG
       gateReworks: gates.reworks,
       loops: changeRequests + fixTickets,
       nudges: count("workflow.nudge") + count("nudge"),
+      // kpiVersion 2: every WM action counts (the WM only acts on a stalled run);
+      // what each one did/said is in interventionsDetail for the reader.
       interventions: count("manager.intervention"),
-      // agent.died (TEAM-4739) is a death, not a model failure, and is published
-      // INSTEAD of agent.error — so it must be counted here or a run whose
-      // personas were killed mid-turn reports zero errors.
-      errors: count("agent.error") + count("error") + count("agent.died"),
+      interventionsDetail,
+      // kpiVersion 2: a dead or restarted session is an error even when nothing
+      // raised — agent.retry (WM/manual restart) and agent.died (runtime end-of-turn
+      // detection, TEAM-4739 — published INSTEAD of agent.error, so a run whose
+      // personas were killed mid-turn would otherwise report zero errors) join
+      // agent.error. Before v2 a silent death scored errors=0.
+      errors: count("agent.error") + count("error") + count("agent.died") + count("agent.retry"),
       retries: count("agent.retry"),
+      // kpiVersion 2: re-invocations by cause; only REWORK_KINDS feed reworkRounds.
+      reinvocations,
+      rewakes: aiTasks.reduce((s, t) => s + (t.rewakes || 0), 0),
       unblocks: count("orchestrator.unblocked"),
       firstPassYield: aiTasks.length ? round4(firstPass / aiTasks.length) : null,
       ci,
@@ -924,6 +934,11 @@ export function summarize(card) {
       fixTickets: card.quality.fixTickets, loops: card.quality.loops, nudges: card.quality.nudges,
       errors: card.quality.errors, gateRounds: card.quality.gateRounds, firstPassYield: card.quality.firstPassYield,
       humanGates: card.time.humanGates,
+      // kpiVersion 2 additions (absent on v1 summaries)
+      interventions: card.quality.interventions ?? null,
+      retries: card.quality.retries ?? null,
+      rewakes: card.quality.rewakes ?? null,
+      reinvocations: card.quality.reinvocations?.byKind ?? null,
       score: card.quality.score ?? null,
     },
     // Enough of the score for the fleet view and the bands to work from without
@@ -1401,40 +1416,172 @@ function computePhases(events, endedMs, gaps) {
 }
 
 /**
- * One row per ticket in workflow.agentTasks. reworkRounds = distinct
- * agent.invoked instants for the ticket beyond the first (a review "changes
- * requested" reopens the ticket and the orchestrator re-invokes the persona).
+ * Re-invocation kinds (kpiVersion 2). Since DL-024 an agent ends a turn by parking
+ * its ticket `blocked_by` something else and the orchestrator re-invokes it when
+ * that closes — so "invoked more than once" no longer means "was sent back". Each
+ * re-invocation is classified by what woke it; only REWORK_KINDS count against
+ * first-pass yield and the rework component. Everything else is either the
+ * designed flow (a human approval, a CI re-certification, a sibling dependency)
+ * or a failure that belongs under `errors` (a dead session that was retried).
  */
-function computeAgentTasks(workflow, events) {
+export const REINVOCATION_KINDS = Object.freeze([
+  "retry",         // agent.retry / agent.error / agent.died preceded it — a dead or restarted session
+  "human_gate",    // woken by a human:* ticket closing (approval / decision / escalation)
+  "ci_recert",     // a CI ticket re-run, or woken by a CI re-certification it waited on
+  "dependency",    // woken by another agent ticket that is not a fix
+  "fix_rework",    // woken by a fix ticket — review/QA/ship found a defect and it re-verifies
+  "review_rework", // a review gate rejected and the orchestrator reopened the ticket
+  "unknown",       // no cause visible in the window — counted as rework (legacy behaviour)
+]);
+export const REWORK_KINDS = new Set(["fix_rework", "review_rework", "unknown"]);
+const RETRY_EVENT_TYPES = new Set(["agent.retry", "agent.error", "agent.died"]);
+/** A Workflow Manager action that re-dispatches a stalled ticket is a retry as well. */
+const WM_RETRY_ACTIONS = new Set(["retry", "dispatch", "redispatch", "restart"]);
+const isRetrySignal = (e) => RETRY_EVENT_TYPES.has(e.type)
+  || (e.type === "manager.intervention" && WM_RETRY_ACTIONS.has(String(e.detail?.action || "").toLowerCase()));
+const INVOKE_EVENT_TYPES = new Set(["agent.invoked", "orchestrator.agent_invoked"]);
+const CI_AGENT_RE = /_ci_agent$/;
+/**
+ * An unblock/retry lands ≤1s before the re-invoke, and the runtime's agent.invoked
+ * and the orchestrator's journal event for ONE dispatch land <1s apart; allow
+ * clock skew between writers.
+ */
+const REINVOKE_SLACK_MS = 5_000;
+
+/**
+ * Why was `ticketId` invoked again at `at`, given its previous invocation at
+ * `prevAt`? Looks only at the ticket's own events in (prevAt, at] plus any
+ * review rejection in that window. Pure; returns { kind, cause }.
+ *
+ * The cause is the signal NEAREST the new invocation: a session's stale
+ * agent.error hours earlier must not outrank the orchestrator.unblocked that
+ * actually re-dispatched the ticket (sffzti TEAM-3799: unblocked by its CI
+ * re-cert 38 h after the prior session's errors).
+ */
+export function classifyReinvocation(ticketId, prevAt, at, ctx) {
+  const hi = at + REINVOKE_SLACK_MS;
+  const ms = (e) => Date.parse(e.timestamp);
+  const own = (ctx.byTicket.get(ticketId) || [])
+    .filter((e) => { const t = ms(e); return Number.isFinite(t) && t > prevAt && t <= hi; })
+    .sort((a, b) => ms(a) - ms(b));
+  const self = ctx.tickets.get(ticketId);
+  const nearest = own.reverse().find((e) => isRetrySignal(e) || e.type === "orchestrator.unblocked");
+  if (nearest && isRetrySignal(nearest)) {
+    const cause = nearest.type === "manager.intervention" ? `manager.intervention:${nearest.detail?.action}` : nearest.type;
+    return { kind: "retry", cause };
+  }
+  if (nearest) {
+    const by = nearest.detail?.unblockedBy || null;
+    const info = by ? ctx.tickets.get(by) : null;
+    if (CI_AGENT_RE.test(self?.agentId || "")) return { kind: "ci_recert", cause: by };
+    if (isHuman(info?.agentId)) return { kind: "human_gate", cause: by };
+    if (info && isFixTicket(info, ctx.intakeAt)) return { kind: "fix_rework", cause: by };
+    if (CI_AGENT_RE.test(info?.agentId || "")) return { kind: "ci_recert", cause: by };
+    return { kind: "dependency", cause: by };
+  }
+  if (CI_AGENT_RE.test(self?.agentId || "")) return { kind: "ci_recert", cause: null };
+  if (ctx.reviewRejectedAt.some((t) => t > prevAt && t <= hi)) return { kind: "review_rework", cause: "review.rejected" };
+  return { kind: "unknown", cause: null };
+}
+
+/**
+ * Distinct invocation instants for one ticket. The runtime's agent.invoked and
+ * the orchestrator's journal orchestrator.agent_invoked describe the SAME
+ * dispatch (<1 s apart), and two writers may stamp one instant at different
+ * precisions ("…33Z" vs "…33.861Z"), so instants within the slack collapse into
+ * one invocation and keep the earliest. A journal event with no runtime twin —
+ * the session died before the runtime published — still counts as an invocation.
+ */
+export function invocationInstants(msList) {
+  const out = [];
+  for (const t of [...msList].filter(Number.isFinite).sort((a, b) => a - b)) {
+    if (!out.length || t - out[out.length - 1] > REINVOKE_SLACK_MS) out.push(t);
+  }
+  return out;
+}
+
+/**
+ * One row per ticket in workflow.agentTasks. `invocations` = distinct dispatch
+ * instants for the ticket (see invocationInstants); each one beyond the first is
+ * classified (see REINVOCATION_KINDS) and `reworkRounds` counts only the REWORK_KINDS.
+ */
+export function computeAgentTasks(workflow, events) {
   const invokesByTicket = new Map();
+  const byTicket = new Map();
+  const reviewRejectedAt = [];
+  const tickets = new Map();
   for (const e of events) {
-    if (e.type !== "agent.invoked") continue;
     const tid = e.detail?.ticketId;
-    if (!tid) continue;
-    (invokesByTicket.get(tid) || invokesByTicket.set(tid, new Set()).get(tid)).add(e.timestamp);
+    if (INVOKE_EVENT_TYPES.has(e.type) && tid) (invokesByTicket.get(tid) || invokesByTicket.set(tid, []).get(tid)).push(Date.parse(e.timestamp));
+    if (tid) (byTicket.get(tid) || byTicket.set(tid, []).get(tid)).push(e);
+    if (e.type === "review.rejected") { const t = Date.parse(e.timestamp); if (Number.isFinite(t)) reviewRejectedAt.push(t); }
+    if (e.type === "ticket.created" && e.detail?.ticket?.id) {
+      const tk = e.detail.ticket;
+      tickets.set(tk.id, { ...(tickets.get(tk.id) || {}), title: tk.title || "", agentId: tk.assignee || tk.agentId || tickets.get(tk.id)?.agentId, createdAt: tk.createdAt || e.timestamp, spawnedBy: tk.spawnedBy });
+    }
   }
-  const titles = new Map();
-  for (const e of events) {
-    if (e.type === "ticket.created" && e.detail?.ticket?.id) titles.set(e.detail.ticket.id, e.detail.ticket.title || "");
+  for (const [ticketId, t] of Object.entries(workflow.agentTasks || {})) {
+    const prev = tickets.get(ticketId) || {};
+    tickets.set(ticketId, { ...prev, agentId: t.agentId || prev.agentId, title: t.title || prev.title || "", createdAt: t.createdAt || prev.createdAt, spawnedBy: t.spawnedBy || prev.spawnedBy });
   }
+  const ctx = { byTicket, tickets, reviewRejectedAt, intakeAt: intakeCompletedAt(events, workflow) };
+
   const tasks = [];
   for (const [ticketId, t] of Object.entries(workflow.agentTasks || {})) {
-    const invocations = invokesByTicket.get(ticketId)?.size || (t.startedAt ? 1 : 0);
+    const instants = invocationInstants(invokesByTicket.get(ticketId) || []);
+    const invocations = instants.length || (t.startedAt ? 1 : 0);
+    const reinvocations = [];
+    for (let i = 1; i < instants.length; i++) {
+      const { kind, cause } = classifyReinvocation(ticketId, instants[i - 1], instants[i], ctx);
+      reinvocations.push({ at: new Date(instants[i]).toISOString(), kind, cause });
+    }
     tasks.push({
       ticketId,
       agentId: t.agentId,
-      title: t.title || titles.get(ticketId) || null,
+      title: t.title || tickets.get(ticketId)?.title || null,
       status: t.status,
       startedAt: t.startedAt || null,
       completedAt: t.completedAt || null,
       durationMs: t.startedAt && t.completedAt
         ? Math.max(0, Date.parse(t.completedAt) - Date.parse(t.startedAt)) : null,
       invocations,
-      reworkRounds: Math.max(0, invocations - 1),
+      reinvocations,
+      reworkRounds: reinvocations.filter((r) => REWORK_KINDS.has(r.kind)).length,
+      retries: reinvocations.filter((r) => r.kind === "retry").length,
+      rewakes: reinvocations.filter((r) => !REWORK_KINDS.has(r.kind) && r.kind !== "retry").length,
       prUrl: t.prUrl || null,
     });
   }
   return tasks;
+}
+
+/** Sum of every task's re-invocations by kind — the card's one-line view of the classification. */
+export function reinvocationTotals(tasks) {
+  const byKind = Object.fromEntries(REINVOCATION_KINDS.map((k) => [k, 0]));
+  let total = 0;
+  for (const t of tasks) for (const r of t.reinvocations || []) { byKind[r.kind] = (byKind[r.kind] || 0) + 1; total++; }
+  return { total, byKind };
+}
+
+/**
+ * Every Workflow Manager action on the run, with what it said. The WM only acts
+ * when a run stalled, so each one counts (quality.interventions); the text is on
+ * the card so the reader can see whether it was a retry, a close or a note.
+ */
+export function interventionDetail(events) {
+  return events
+    .filter((e) => e.type === "manager.intervention")
+    .map((e) => {
+      const d = e.detail || {};
+      const note = d.comment || d.body || d.summary || d.reason || d.note || d.message || "";
+      return {
+        at: e.timestamp,
+        action: d.action || "unknown",
+        ticketId: d.ticketId || null,
+        note: String(note).replace(/\s+/g, " ").trim().slice(0, 240) || null,
+      };
+    })
+    .sort((a, b) => String(a.at).localeCompare(String(b.at)));
 }
 
 /**
@@ -1686,14 +1833,24 @@ function renderMarkdown(c) {
     `| Quality score | ${scoreLabel(c)}${c.kpi?.quality?.confidence ? ` · ${c.kpi.quality.confidence} evidence` : ""} |`,
     `| Agent tasks (completed) | ${c.quality.tasks} (${c.quality.tasksCompleted}) |`,
     `| First-pass yield (tasks with no rework) | ${pct(c.quality.firstPassYield)} |`,
-    `| Rework rounds (re-invocations) | ${c.quality.reworkRounds} |`,
+    `| Rework rounds (re-invocations caused by a fix ticket or a review rejection) | ${c.quality.reworkRounds} |`,
+    `| Re-wakes not counted as rework (human gate / CI re-cert / dependency) | ${c.quality.rewakes ?? 0}${c.quality.reinvocations ? ` (${Object.entries(c.quality.reinvocations.byKind).filter(([, n]) => n).map(([k, n]) => `${k} ${n}`).join(", ") || "none"})` : ""} |`,
     `| Change requests (review rejected) | ${c.quality.changeRequests} |`,
     `| Fix tickets | ${c.quality.fixTickets} |`,
     `| Review-gate rounds / reworks | ${c.quality.gateRounds} / ${c.quality.gateReworks} |`,
     `| Nudges / manager interventions | ${c.quality.nudges} / ${c.quality.interventions} |`,
-    `| Errors / retries | ${c.quality.errors} / ${c.quality.retries} |`,
+    `| Errors (incl. dead / restarted sessions) / retries | ${c.quality.errors} / ${c.quality.retries} |`,
     ...(c.quality.prUrl ? [`| PR | ${c.quality.prUrl} |`] : []),
     ``,
+    ...((c.quality.interventionsDetail || []).length ? [
+      `### Workflow Manager interventions (${c.quality.interventionsDetail.length})`,
+      ``,
+      `| When | Action | Ticket | Note |`,
+      `|---|---|---|---|`,
+      ...c.quality.interventionsDetail.map((i) =>
+        `| ${i.at} | ${i.action} | ${i.ticketId || "—"} | ${(i.note || "—").replace(/\|/g, "\\|")} |`),
+      ``,
+    ] : []),
     `## 🤖 By agent`,
     ``,
     `| Agent | Cost | Work | Tasks | Rework | Engines |`,
