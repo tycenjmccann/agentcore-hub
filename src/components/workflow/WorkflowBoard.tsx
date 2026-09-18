@@ -2034,6 +2034,8 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
           agentName="Workflow"
           workflowId={workflowId}
           initialArtifactKey={deepLinkArtifact}
+          workflowDefId={workflowDefId}
+          sdlcFramework={fw}
         />
 
         {/* Cancel Confirmation Modal */}

@@ -23,7 +23,7 @@ claude_code(
 - Determine if any are blocking vs advisory
 
 ### Step 4: Deliver
-- Save the security review: `S3Storage___write_object` to `workflows/{workflow_id}/shared/security-review.md` with all findings and remediation guidance. NEVER write the deliverable to `/tmp` or ask `claude_code` to save it to a file — take the findings from the `claude_code` result text and write them to S3 yourself.
+- Save the security review: `load_blueprint("writing-standard")` + `load_blueprint("template-assessment")`, then `S3Storage___write_object` to `workflows/{workflow_id}/shared/security-review.md` in the template's sections (`## Verdict` risk posture in one to three sentences, `## Findings` numbered by severity with remediation, `## Not covered`, `## Next actions`). NEVER write the deliverable to `/tmp` or ask `claude_code` to save it to a file — take the findings from the `claude_code` result text and write them to S3 yourself.
 - `WorkflowOutput___report_completion` with pass/fail verdict — Critical/High findings make the verdict FAIL
 
 ## Playbook runs (when `## SDLC Framework` is in your context)

@@ -76,12 +76,13 @@ The orchestration pipeline. Self-contained surface.
 - `orchestrator` — drives the pipeline state machine
 - `agentcore-hub-jira` — Jira Cloud ticket tools (deployed when `TICKET_PROVIDER=jira`)
 - `agentcore-hub-tickets` — DynamoDB-backed ticket tools (deployed when `TICKET_PROVIDER=dynamodb`)
-- `workflow-output` — collects agent artifacts
+- `workflow-output` — collects agent artifacts. Its `S3Storage___write_object` / `save_design_doc` tools also run the **writing-standard lint** (`deliverables-lint.mjs`, DL-031): a registered `shared/*.md` deliverable (see `docs/workflow/deliverables.md`) that is not in its family template's sections is refused as a value (`{status:"refused", reason:"writing_standard", template, problems[]}`) and nothing is written. Fails open when `config/workflows.json` is unreadable
 - `cost-report` — per-run performance card (cost / time / quality + anomaly bands) on `workflow.complete`; writes `workflows/{id}/shared/performance-card.{json,md}`, `performance/index.json`, `workflow.performance` events and `AgentCoreHub/Performance` CloudWatch metrics (`docs/workflow/performance-card.md`)
 - `anomaly-watcher` — scheduled workflow-observability Lambda (EventBridge Scheduler, ~10 min): folds live-run events into hourly metric buckets, detects anomalies against the bundled `bands.yaml`, and takes highest-tier action (log / diagnose + page / file one bug workflow under a fleet-wide cap); no function URL or API
 - `workflow-analyzer` — thin dispatcher that invokes the Workflow Manager harness (`agentcore_hub_workflow_manager`) on terminal workflow outcomes or a schedule to ANALYZE completed runs / WATCH stale ones; all analysis + intervention logic lives in the harness
 
 **Config**
+- `src/config/workflows.json` `deliverableFamilies` + per-def `deliverables[]` — the **deliverables registry** (DL-031): what each def owes per phase, its family (`brief` / `assessment` / `spec` / `record` / `external`), author, reader, gate and template. One list read by the board's artifacts modal (present / missing strip), the workflow-output lint and the generated [`docs/workflow/deliverables.md`](./workflow/deliverables.md) (`node scripts/gen-deliverables-doc.mjs`). `writingStandard: true` on a def turns the lint on; `scripts/check-deliverables-parity.sh` keeps registry, templates (`blueprints/template-*.md`), author blueprints and the doc in step
 - `src/config/kpi.json` — the deterministic quality rubric (`kpiVersion`, grade thresholds, outcome caps, `minEvidenceWeight`, weighted components summing to 100). Single source of truth for the 0-100 score; read identically by `lambda/cost-report/index.mjs` and `src/lib/workflow/performance.ts` (`computeKpi`), and both sides are pinned to the same expected values by `lambda/cost-report/fixtures/kpi-cases.json`. Change the rubric here only — never inline a weight, tolerance or threshold in either scorer
 
 **DynamoDB tables** (defaults in `deploy/config.sh`)

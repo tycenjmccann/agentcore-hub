@@ -114,6 +114,7 @@
       "dir": "lambda/workflow-output",
       "files": [
         "index.mjs",
+        "deliverables-lint.mjs",
         "node_modules/"
       ],
       "npm": true

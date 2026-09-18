@@ -212,10 +212,11 @@ compliance pass on top of the adversarial one:
   as code.
 
 Then write `findings.md` — your artifact in the chain. Have `claude_code` (same
-session) write `<artifact_dir>/findings.md` on `artifact_branch` with: the
-verdict, the review round, every finding (severity, file, scenario, status),
-the plan-compliance result (files in/out of plan, deviations recorded/unrecorded),
-and the spec-coverage result (criteria with/without tests). Commit it
+session) write `<artifact_dir>/findings.md` on `artifact_branch` in
+`template-assessment`'s sections (`## Verdict`, `## Findings`, `## Not covered`,
+`## Next actions`) with the plan-compliance result (files in/out of plan,
+deviations recorded/unrecorded) and the spec-coverage result (criteria
+with/without tests) as appendix `##` sections after them. Commit it
 (`review: findings round <n> (<workflow_id>)`) and push. Mirror the text to
 `workflows/{workflow_id}/shared/findings.md`. Verify the push landed before you
 report — nothing checks it for you, and a run whose findings.md is missing has
@@ -234,8 +235,14 @@ review is the baseline.
 ### Step 5: Deliver Verdict (mirror QA)
 **Ordering (MANDATORY) — ship, then report.** The moment the deliverable exists
 (review posted / commit pushed / PR opened / test run + verdict captured):
-1. persist evidence to `workflows/{workflow_id}/shared/findings.md`, then
-2. call `WorkflowOutput___report_completion` IMMEDIATELY — same turn, before any
+1. persist evidence to `workflows/{workflow_id}/shared/findings.md` in
+   `template-assessment`'s sections (`load_blueprint("writing-standard")` +
+   `load_blueprint("template-assessment")` once per invocation): `## Verdict`
+   (PASS or CHANGES NEEDED, head SHA, one to three sentences), `## Findings`
+   (numbered, highest severity first, file:line, repro, siblings), `## Not
+   covered`, `## Next actions` (the fix tickets you filed). Re-reviews append
+   one `## Round <n>` appendix section after those four; the write tool refuses
+   a findings.md whose first `##` is not `## Verdict`. Then — same turn, before any
    summary, recap, or reflective text.
 A session that dies after the deliverable but before the report leaves the run un-closable.
 

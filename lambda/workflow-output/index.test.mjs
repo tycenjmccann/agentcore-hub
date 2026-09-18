@@ -694,3 +694,71 @@ describe("inferToolFromArgs — (j) flat-args routing", () => {
     expect(inferToolFromArgs({ nothing: "useful" })).toBe(null);
   });
 });
+
+// ─── Writing-standard lint at the write tools (blueprints/writing-standard.md) ───
+// The pure rules live in deliverables-lint.test.mjs; this block pins the SEAM:
+// which tools consult the lint, that a refusal writes nothing, and that a
+// missing config fails open. The registry is the real src/config/workflows.json.
+import { readFileSync as _readFileSync } from "node:fs";
+const { resetDeliverableIndexForTests } = await import("./index.mjs");
+const REAL_CONFIG = _readFileSync(new URL("../../src/config/workflows.json", import.meta.url), "utf8");
+const BRIEF_EXAMPLE = (() => {
+  const md = _readFileSync(new URL("../../blueprints/template-brief.md", import.meta.url), "utf8");
+  return /## Example[^\n]*\n\n```\n([\s\S]*?)\n```/.exec(md)[1];
+})();
+const write = (key, content) => handler({ tool_name: "S3Storage___write_object", arguments: { key, content, content_type: "text/markdown" } });
+
+describe("writing-standard lint — S3Storage___write_object", () => {
+  beforeEach(() => { resetDeliverableIndexForTests(); h.objects.set("config/workflows.json", REAL_CONFIG); });
+
+  it("refuses a registered deliverable that breaks the standard and writes nothing", async () => {
+    const res = result(await write("workflows/wf_1/shared/merge-brief.md", "DECISION: approve\n\nWHAT HAPPENED\n• stuff"));
+    expect(res.status).toBe("refused");
+    expect(res.reason).toBe("writing_standard");
+    expect(res.template).toBe("template-brief");
+    expect(h.puts.some((p) => p.Key === "workflows/wf_1/shared/merge-brief.md")).toBe(false);
+    expect(h.warns.some((w) => w.includes("REFUSED write workflows/wf_1/shared/merge-brief.md"))).toBe(true);
+  });
+  it("writes a conforming deliverable", async () => {
+    const res = result(await write("workflows/wf_1/shared/merge-brief.md", BRIEF_EXAMPLE));
+    expect(res.status).toBe("saved");
+    expect(h.objects.get("workflows/wf_1/shared/merge-brief.md")).toBe(BRIEF_EXAMPLE);
+  });
+  it("leaves unregistered keys, agent folders and non-markdown alone", async () => {
+    expect(result(await write("workflows/wf_1/shared/plan.md", "free-form plan")).status).toBe("saved");
+    expect(result(await write("workflows/wf_1/agentcore_hub_operator/merge-brief.md", "staging copy")).status).toBe("saved");
+    expect(result(await write("workflows/wf_1/shared/cd-ledger.json", "{}")).status).toBe("saved");
+  });
+  it("fails open when config/workflows.json is unavailable", async () => {
+    h.objects.delete("config/workflows.json");
+    resetDeliverableIndexForTests();
+    expect(result(await write("workflows/wf_1/shared/merge-brief.md", "no structure at all")).status).toBe("saved");
+    expect(h.warns.some((w) => w.includes("lint disabled"))).toBe(true);
+  });
+});
+
+describe("writing-standard lint — save_design_doc", () => {
+  beforeEach(() => { resetDeliverableIndexForTests(); h.objects.set("config/workflows.json", REAL_CONFIG); });
+  const save = (content, extra = {}) => handler({
+    tool_name: "WorkflowOutput___save_design_doc",
+    arguments: { workflow_id: "wf_1", agent_id: "agentcore_hub_backend_designer", title: "Backend design", content, ...extra },
+  });
+  it("refuses a markdown design doc that is not a spec, before either copy is written", async () => {
+    const res = result(await save("Architecture\n\nWe will do things.\n"));
+    expect(res.status).toBe("refused");
+    expect(res.family).toBe("spec");
+    expect(h.puts.some((p) => p.Key.endsWith("backend-design.md"))).toBe(false);
+  });
+  it("saves a conforming spec to both keys", async () => {
+    const md = _readFileSync(new URL("../../blueprints/template-spec.md", import.meta.url), "utf8");
+    const spec = /## Example[^\n]*\n\n```\n([\s\S]*?)\n```/.exec(md)[1];
+    const res = result(await save(spec));
+    expect(res.status).not.toBe("refused");
+    expect(h.objects.has("workflows/wf_1/shared/backend-design.md")).toBe(true);
+    expect(h.objects.has("workflows/wf_1/agentcore_hub_backend_designer/backend-design.md")).toBe(true);
+  });
+  it("does not lint a JSON design doc", async () => {
+    const res = result(await save('{"a":1}', { format: "json" }));
+    expect(res.status).not.toBe("refused");
+  });
+});

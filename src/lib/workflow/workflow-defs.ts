@@ -193,6 +193,46 @@ export function resolveReviewGateCap(gate: ReviewGate): {
   };
 }
 
+/** A family of deliverables that share one reader intent and one template (blueprints/template-<family>.md). */
+export type DeliverableFamily = "brief" | "assessment" | "spec" | "record" | "external";
+
+export interface DeliverableFamilyDef {
+  title: string;
+  /** Who the family is written for, in one phrase. */
+  reader: string;
+  /** Blueprint name loaded by authors: `load_blueprint("template-brief")`. */
+  template: string;
+  /** The `##` sections, in order — the reader's questions. The write-time lint enforces them. */
+  sections: string[];
+}
+
+/**
+ * One deliverable a workflow def owes. `key` is relative to
+ * `workflows/{id}/shared/` and may contain `*` (design docs, dated evidence).
+ * `template` absent → the family template applies (and the write-time lint);
+ * `null` → the doc has its own contract (playbook/operator plan.md);
+ * `"review-package"` → the gate ping JSON. See docs/workflow/deliverables.md.
+ */
+export interface Deliverable {
+  key: string;
+  title: string;
+  /** agents.json `phase` that produces it (agentPhase or an extraAgentPhase of the def). */
+  phase: string;
+  family: DeliverableFamily;
+  /** agents.json agentId(s), or "hub" for app-written artifacts. */
+  author: string | string[];
+  reader: string;
+  required: boolean;
+  template?: string | null;
+  /** Human gate this deliverable is read at, when any. */
+  gate?: string;
+  /** "artifact" (default, S3), "pr" (a pull request), "binary" (image/html, not linted). */
+  kind?: "artifact" | "pr" | "binary";
+  /** Only produced under this framework overlay (e.g. "playbook"). */
+  framework?: string;
+  note?: string;
+}
+
 export interface WorkflowDef {
   id: string;
   /**
@@ -242,10 +282,19 @@ export interface WorkflowDef {
   /** Selectable framework overlays keyed by SdlcFramework id (e.g. { playbook: {...} }). */
   frameworks?: Partial<Record<SdlcFramework, FrameworkOverlay>>;
   phases: WorkflowDefPhase[];
+  /**
+   * true → this def's markdown deliverables are written to blueprints/writing-standard.md
+   * and the workflow-output Lambda refuses a registered `shared/*.md` that breaks
+   * its family template. false → deliverables are listed (docs, board) but not yet linted.
+   */
+  writingStandard?: boolean;
+  /** What this def owes, per phase. Registry for docs, the board and the lint. */
+  deliverables?: Deliverable[];
 }
 
 interface WorkflowsConfig {
   defaultWorkflowDefId: string;
+  deliverableFamilies?: Record<string, DeliverableFamilyDef>;
   workflows: WorkflowDef[];
 }
 
@@ -313,4 +362,28 @@ export function getPhaseOrder(def: WorkflowDef): string[] {
   const deduped = order.filter((p) => (seen.has(p) ? false : (seen.add(p), true)));
   deduped.push("complete");
   return deduped;
+}
+
+/** The deliverable families (one template each). Empty when the config predates them. */
+export function getDeliverableFamilies(): Record<string, DeliverableFamilyDef> {
+  return CONFIG.deliverableFamilies || {};
+}
+
+/** The deliverables a def owes, optionally only those of one framework overlay (`framework` undefined → framework-agnostic entries only). */
+export function getDeliverables(defId?: string | null, framework?: string | null): Deliverable[] {
+  const def = getWorkflowDef(defId);
+  const fw = framework && framework !== "standard" ? framework : null;
+  return (def.deliverables || []).filter((d) => !d.framework || d.framework === fw);
+}
+
+/**
+ * Does a shared/-relative deliverable key match a produced artifact key?
+ * `workflows/<id>/shared/<name>` against `key` (with `*` as a single-segment glob).
+ */
+export function deliverableMatches(deliverable: Deliverable, artifactKey: string): boolean {
+  const m = /^workflows\/[^/]+\/shared\/(.+)$/.exec(artifactKey);
+  if (!m) return false;
+  if (!deliverable.key.includes("*")) return m[1] === deliverable.key;
+  const esc = deliverable.key.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, "[^/]*");
+  return new RegExp(`^${esc}$`).test(m[1]);
 }

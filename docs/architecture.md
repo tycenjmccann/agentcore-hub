@@ -856,6 +856,22 @@ One residual survives and is deliberately accepted: asymmetric wiring *plus* **d
 
 ---
 
+### DL-031: One Writing Standard, Five Templates, One Deliverables Registry
+
+**Date**: 2026-09-18
+**Decision**: Every markdown deliverable an agent writes for a reader is one of five families, each with one template of reader questions (its `##` sections) and one real rewritten example: `brief` (someone approves), `assessment` (someone acts on findings), `spec` (someone builds), `record` (someone tracks), `external` (the end audience reads the thing itself). Each workflow def declares the deliverables it owes per phase in `src/config/workflows.json` (`deliverables[]`), and the workflow-output Lambda refuses a registered `shared/*.md` that does not open with the family's answer section and carry its sections in order. Approvals are one standard with a changing question: the gate ping (`review-package-<gate>.json`) is derived from the decision document, never written first.
+**Status**: SHIPPED for `software-delivery`, `bug-fix`, `operator`, `dead-code-sweep` (`writingStandard: true`); `marketing`, `sales`, `legal` are registered and listed but not yet linted (their blueprints still carry their own formats).
+
+**Context**: the merge brief for TEAM-4760 was 14.5 KB of ALL-CAPS labels and `•` bullets that the hub renderer flattened into one wall; the run's requirements were 48 KB, the code review 62 KB, one design doc 147 KB. The mandate for "a standard template" existed as two words in two blueprints, a seven-box form nobody could fit a decision into, and no enforcement. Deliverables themselves were undefined at the def level: `workflows.json` declared phases and gates but not outputs, so what a run owed was implicit in ~35 blueprints' S3 write paths and nothing could show a missing one.
+
+**Why five and not thirty**: templates multiply when they are keyed by artifact; they stay countable when keyed by what the reader does next. Thirty deliverables reduce to five reader intents, and every human gate reduces to one shape (a brief) whose only variable is the question (`template-brief` carries the gate table). Domain structure that other blueprints depend on (the playbook's `spec.md` / `plan.md` sections, the operator's plan, the escalation digest) keeps its own contract and is registered with `template: null`, listed but not linted.
+
+**Enforcement is structural, not a length cap**: `# Title` first; the family's sections present, in order, answer first; the lead is prose of at most 80 words; extra sections only as appendix; no ALL-CAPS heading or label, no `•`. The Lambda returns the refusal to the agent with the missing sections and the template to load (`lambda/workflow-output/deliverables-lint.mjs`); it fails open when the config is unreadable. `scripts/check-deliverables-parity.sh` (CI, with `--self-test`) keeps the registry, the five templates, every author blueprint's `load_blueprint(...)` calls and the generated `docs/workflow/deliverables.md` in step; `src/lib/workflow/deliverables.test.ts` pins the registry's integrity.
+
+**Not in this decision**: a completion-time check that a phase's required deliverables exist (the board strip shows present / missing; refusing a completion needs the ticket's phase, which `report_completion` does not carry today), and the marketing / sales / legal blueprint conversion (a follow-up, same templates).
+
+---
+
 ### DL-030: A Human Gate Ticket is the Only Human Channel (one approval artefact, "shipped" means deployed)
 
 **Date**: 2026-09-16

@@ -10,6 +10,7 @@ import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { LambdaClient, InvokeCommand } from "@aws-sdk/client-lambda";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, PutCommand } from "@aws-sdk/lib-dynamodb";
+import { buildDeliverableIndex, matchDeliverable, familyOf, lintDeliverable } from "./deliverables-lint.mjs";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const s3 = new S3Client({ region: REGION });
@@ -22,6 +23,26 @@ const TICKET_PROVIDER = process.env.TICKET_PROVIDER || "jira";
 const TICKET_TOOLS_LAMBDA = process.env.TICKET_TOOLS_LAMBDA ||
   (TICKET_PROVIDER === "jira" ? "agentcore-hub-jira" : "agentcore-hub-tickets");
 const EVENTS_TABLE = process.env.EVENTS_TABLE || "agentcore-hub-events";
+
+// Writing-standard lint (blueprints/writing-standard.md). The registry of
+// deliverables and their families lives in config/workflows.json next to the
+// defs that own them; it is read once per cold start. Fail OPEN: a missing or
+// unreadable config disables the lint rather than blocking every write.
+let _deliverableIndex;
+async function loadDeliverableIndex() {
+  if (_deliverableIndex !== undefined) return _deliverableIndex;
+  _deliverableIndex = null;
+  if (!BUCKET) return null;
+  try {
+    const r = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: "config/workflows.json" }));
+    _deliverableIndex = buildDeliverableIndex(JSON.parse(await r.Body.transformToString()));
+  } catch (err) {
+    console.warn(`[writing-standard] config/workflows.json unavailable (${err?.name || "Error"}: ${err?.message || ""}) - lint disabled for this container`);
+  }
+  return _deliverableIndex;
+}
+/** Test seam: forget the cached index so the next call re-reads config. */
+export function resetDeliverableIndexForTests() { _deliverableIndex = undefined; }
 
 async function publishJourneyEvent(workflowId, type, detail) {
   if (!EVENTS_TABLE || !workflowId) return;
@@ -145,6 +166,16 @@ async function saveDesignDoc({ workflow_id, agent_id, title, content, format = "
   const filename = `${slug}.${ext}`;
   const key = `workflows/${workflow_id}/${agent_id}/${filename}`;
   const sharedKey = `workflows/${workflow_id}/shared/${filename}`;
+
+  // Every markdown design doc is a `spec`-family deliverable (blueprints/template-spec.md).
+  // Refused BEFORE either write so a non-conforming doc leaves the bucket untouched.
+  if (ext === "md") {
+    const refusal = lintDeliverable({ key: sharedKey, content, match: familyOf(await loadDeliverableIndex(), "spec") });
+    if (refusal) {
+      console.warn(`[writing-standard] REFUSED save_design_doc ${sharedKey}: ${refusal.problems.join("; ")}`);
+      return refusal;
+    }
+  }
 
   // Detect pre-existing docs so the caller knows whether it is updating its own
   // doc or about to add a doc alongside another agent's — dup-ticket guard.
@@ -553,6 +584,15 @@ async function s3WriteObject({ bucket, key, content, content_type, encoding }) {
   // encoding:"base64"; decode back to raw bytes here so the stored object is a
   // real PNG/PDF, not corrupted text.
   const body = encoding === "base64" ? Buffer.from(content || "", "base64") : (content || "");
+  // Registered markdown deliverables under shared/ must follow their family
+  // template (blueprints/writing-standard.md). Refused as a value, nothing written.
+  if (encoding !== "base64" && targetBucket === BUCKET && /\.md$/.test(key)) {
+    const refusal = lintDeliverable({ key, content: body, match: matchDeliverable(await loadDeliverableIndex(), key) });
+    if (refusal) {
+      console.warn(`[writing-standard] REFUSED write ${key}: ${refusal.problems.join("; ")}`);
+      return refusal;
+    }
+  }
   await s3.send(new PutObjectCommand({
     Bucket: targetBucket,
     Key: key,
