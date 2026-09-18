@@ -453,7 +453,13 @@ export function shipVerdictOf(entry) {
   // commitSha is NOT consulted (see the F1 note above) — it is the unmerged
   // branch HEAD and is present on every completion record.
   const merged = typeof entry.mergeCommit === "string" && entry.mergeCommit.trim().length > 0;
-  if (merged || outcome === "shipped") return "shipped";
+  // TEAM-4739: `empty_sweep` is "there was nothing to merge", and that is a
+  // SHIPPED run, not a blocked one. It is deliberately NOT in
+  // SHIP_BLOCKED_OUTCOMES: an honest empty sweep has nothing left to do, so
+  // closing it "static-ci-only" would file it under unfinished work forever and
+  // page a human about a run that succeeded. The alternative the sweeper used
+  // before this existed was worse - close dishonestly, or wedge.
+  if (merged || outcome === "shipped" || outcome === "empty_sweep") return "shipped";
   return null;
 }
 

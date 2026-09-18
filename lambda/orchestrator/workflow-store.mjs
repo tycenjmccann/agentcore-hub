@@ -878,6 +878,58 @@ export async function appendReviewNotificationOnce(workflowId, ticketId, notific
 }
 
 /**
+ * TEAM-4739 — the id-scoped, count-bumping sibling of the above: ONE open
+ * notification per `id`, re-firing as a `count` bump up to `maxCount`, then
+ * standing down for good.
+ *
+ * Both new watches (a human gate open for hours, a gate ticket re-filed after
+ * closing) re-observe the same condition on every 5-minute sweep, so a plain
+ * appendNotification would page a human 12 times an hour, and a per-bucket id
+ * would fan out an unbounded number of rows nobody can ack. Bumping a count on
+ * ONE row keeps "this is still true, and now for the Nth time" legible while
+ * bounding the write; standing down at `maxCount` means a watch that nobody acts
+ * on stops being the loudest thing in the run.
+ *
+ * Same optimistic notifVersion CAS as appendReviewNotificationOnce, for the same
+ * reason (DynamoDB cannot predicate-match inside a list), and the same
+ * acknowledged-based lifecycle: an acked watch that recurs re-notifies.
+ * Returns true only when THIS caller wrote (appended or bumped).
+ */
+export async function appendEscalationOnce(workflowId, id, notification, { maxCount = 6 } = {}, maxAttempts = 3) {
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const wf = await getWorkflow(workflowId);
+    if (!wf) return false;
+    const list = Array.isArray(wf.humanNotifications) ? wf.humanNotifications : [];
+    const at = list.findIndex((n) => n.id === id && !n.acknowledged);
+    const open = at >= 0 ? list[at] : null;
+    const count = (open?.count || 1) + 1;
+    if (open && count > maxCount) return false; // said enough; stand down
+    const next = open
+      ? list.map((n, i) => (i === at ? { ...n, ...notification, id, count } : n))
+      : [...list, { ...notification, id, count: 1 }];
+    try {
+      await _ddb.send(new UpdateCommand({
+        TableName: _table,
+        Key: { workflowId },
+        UpdateExpression: "SET humanNotifications = :n, notifVersion = :next",
+        ConditionExpression: "attribute_not_exists(notifVersion) OR notifVersion = :cur",
+        ExpressionAttributeValues: {
+          ":n": next,
+          ":next": (wf.notifVersion || 0) + 1,
+          ":cur": wf.notifVersion || 0,
+        },
+      }));
+      return true;
+    } catch (err) {
+      if (err.name !== "ConditionalCheckFailedException") throw err;
+      // Concurrent append/ack — re-read, re-check the open/count guards.
+    }
+  }
+  console.warn(`[workflow-store] appendEscalationOnce(${workflowId}, ${id}): CAS retries exhausted`);
+  return false;
+}
+
+/**
  * Acknowledge matching notifications. DynamoDB can't update list items by
  * predicate, so this is the one unavoidable read-modify-write — guarded by an
  * optimistic version CAS with bounded retry.

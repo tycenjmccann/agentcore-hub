@@ -36,6 +36,7 @@ import {
   LEASE_TTL_MS,
   isLeaseLive,
   lastAgentActivity,
+  lastStreamedText,
   stealClaim,
 } from "./lease.mjs";
 import { resolveWatchdog, setWatchdogSource } from "./watchdog.mjs";
@@ -517,6 +518,12 @@ function getReconcileSweep() {
     cascade: getCascade(),
     getChildTickets,
     leaseTtlMs: LEASE_TTL_MS,
+    // TEAM-4739 W2/W3. Injected here (not imported by the sweep) so invariant R3
+    // holds: the sweep still calls neither lease.mjs nor a write command itself.
+    appendNotification: (wfId, id, notification, opts) =>
+      store.appendEscalationOnce(wfId, id, notification, opts),
+    lastStreamedTextAt: async (wfId, agentId, ticketId) =>
+      (await lastStreamedText(ddb, EVENTS_TABLE, wfId, agentId, ticketId, 1, { withTimestamp: true })).at,
   });
   return _reconcileSweep;
 }
@@ -1305,7 +1312,9 @@ async function harvestCompletionEvidence(workflow, ticketId) {
     if (record.merge_commit && !entry?.mergeCommit) fields.mergeCommit = record.merge_commit;
     if (typeof record.outcome === "string" && !entry?.outcome) {
       const oc = record.outcome.trim().toLowerCase();
-      if (SHIP_BLOCKED_OUTCOMES.includes(oc) || oc === "shipped") fields.outcome = oc;
+      // empty_sweep must pass this filter or shipVerdictOf never sees it
+      // (TEAM-4739; the workflow-output SHIP_OUTCOMES half is TEAM-4740's).
+      if (SHIP_BLOCKED_OUTCOMES.includes(oc) || oc === "shipped" || oc === "empty_sweep") fields.outcome = oc;
     }
     if (record.block_reason && !entry?.blockReason) {
       fields.blockReason = String(record.block_reason).slice(0, 500);
@@ -3566,10 +3575,16 @@ export async function completeWorkflow(workflow) {
   // vs "merged + deployed" without re-deriving it from the registry later
   // (the registry can change after the fact). Best-effort.
   try {
+    // TEAM-4739: carry the ship record's own verdict through when the harvest
+    // found one (api_dev writes outcome/prState on the record) — otherwise an
+    // "empty_sweep" completion is indistinguishable from a merge on this row.
+    const ship = Object.values(workflow.agentTasks || {}).find((t) => t?.outcome) || {};
     await store.setDelivery(workflow.id, {
       mode: delivery.mode,
       ...(delivery.pipeline ? { pipeline: delivery.pipeline } : {}),
       ...(prUrl ? { prUrl } : {}),
+      ...(ship.outcome ? { outcome: ship.outcome } : {}),
+      ...(ship.prState ? { prState: ship.prState } : {}),
       at: completedAt,
     });
   } catch (err) {
@@ -3659,6 +3674,30 @@ async function closeWorkflowBlocked(workflow, verdict) {
       featureBranch: workflow.featureBranch,
     }
   );
+
+  // W1′ (TEAM-4739) — a terminal block that pages nobody is a silent failure: the
+  // run is closed, honestly, and no human is told. notifyCompletionBlockedOnce
+  // already covers the OTHER terminal refusal (completion_blocked); this is the
+  // ship-outcome one. Same idiom: id-scoped, skip when one is already open, and
+  // wrapped so a notification failure never turns the close into a wedge.
+  const notifId = `notif_terminal_block_${workflow.id}`;
+  const notifs = Array.isArray(workflow.humanNotifications) ? workflow.humanNotifications : [];
+  if (!notifs.some((n) => n.id === notifId && !n.acknowledged)) {
+    try {
+      await store.appendNotification(workflow.id, {
+        id: notifId,
+        type: "manager_escalation",
+        title: `Run closed ${outcome} (not shipped)`,
+        details: `The run was closed on the honest terminal outcome "${outcome}"${verdict.blockReason ? ` (${verdict.blockReason})` : ""} because ship evidence never proved a merge/deploy: ${offenders}. Nothing else will re-drive it — a human decides whether to re-run the ship phase or accept the close.`,
+        reviewer: "ship-gate",
+        timestamp: completedAt,
+        acknowledged: false,
+      });
+      console.log(`[orchestrator] ${workflow.id}: ${outcome} close — manager_escalation appended`);
+    } catch (err) {
+      console.warn(`[orchestrator] ${workflow.id}: terminal-block notification failed (non-fatal): ${err?.message || err}`);
+    }
+  }
 
   await store.markFinalized(workflow.id);
 }
