@@ -32,7 +32,10 @@ function ghStub(routes: Record<string, Route>) {
   const fetchImpl = (async (url: string) => {
     const path = String(url).replace("https://api.github.com", "");
     seen.push(path);
-    const key = Object.keys(routes).find((k) => path.startsWith(k));
+    // LONGEST match, not first: `/pulls/30` and `/pulls/30/files` are both routes.
+    const key = Object.keys(routes)
+      .filter((k) => path.startsWith(k))
+      .sort((a, b) => b.length - a.length)[0];
     if (!key) return { status: 404, json: async () => ({ message: "Not Found" }) };
     const r = routes[key];
     return { status: r.status ?? 200, json: async () => r.json ?? null };
@@ -52,9 +55,22 @@ const files = (n: number, list: unknown[]) => ({
 const sweepPr = (number: number, baseSha: string, body = "") => ({
   number,
   html_url: `https://github.com/tycenjmccann/agentcore-hub/pull/${number}`,
-  head: { ref: `chore/dead-code-sweep-${number}` },
-  base: { sha: baseSha },
+  head: { ref: `chore/dead-code-sweep-${number}`, repo: { full_name: "tycenjmccann/agentcore-hub" } },
+  base: { sha: baseSha, ref: "main" },
   body,
+});
+
+/**
+ * TEAM-4752 D4 — the single-PR endpoint, which is where `mergeable` lives. Every
+ * historical PR below WAS an ordinary open PR on main from a branch in this repo,
+ * and GitHub reported all of them mergeable, so the replays must still reach the
+ * same verdicts they did before viability was checked. `over` is how the one new
+ * row (a CONFLICTING PR) diverges.
+ */
+const prDetail = (pr: { number: number }, over: Record<string, unknown> = {}) => ({
+  [`/repos/tycenjmccann/agentcore-hub/pulls/${pr.number}`]: {
+    json: { ...pr, draft: false, mergeable: true, ...over },
+  },
 });
 
 describe("lpkxmt — two open sweep PRs on the base we were about to sweep", () => {
@@ -62,6 +78,8 @@ describe("lpkxmt — two open sweep PRs on the base we were about to sweep", () 
   const fixture = {
     ...commits(MAIN),
     ...pulls([sweepPr(30, MAIN), sweepPr(33, MAIN)]),
+    ...prDetail(sweepPr(30, MAIN)),
+    ...prDetail(sweepPr(33, MAIN)),
     ...files(30, [{ status: "removed", filename: "src/lib/legacy/formatter.ts" }]),
     ...files(33, [{ status: "removed", filename: "src/lib/legacy/formatter.ts" }]),
   };
@@ -72,11 +90,29 @@ describe("lpkxmt — two open sweep PRs on the base we were about to sweep", () 
       decision: "skip",
       reason: "open_sweep_pr",
       prs: [
-        { number: 30, url: "https://github.com/tycenjmccann/agentcore-hub/pull/30", baseSha: MAIN },
-        { number: 33, url: "https://github.com/tycenjmccann/agentcore-hub/pull/33", baseSha: MAIN },
+        { number: 30, url: "https://github.com/tycenjmccann/agentcore-hub/pull/30", baseSha: MAIN, mergeable: true },
+        { number: 33, url: "https://github.com/tycenjmccann/agentcore-hub/pull/33", baseSha: MAIN, mergeable: true },
       ],
       mainSha: MAIN,
     });
+  });
+
+  it("would NOT have skipped had #30 and #33 both been conflicting (TEAM-4752 D4)", async () => {
+    // The counterfactual that makes the skip honest: two PRs at the right base SHA
+    // that GitHub says cannot merge deliver nothing, so the sweep is the only thing
+    // that can clear the dead code and it must run.
+    const pf = await run({
+      ...commits(MAIN),
+      ...pulls([sweepPr(30, MAIN), sweepPr(33, MAIN)]),
+      ...prDetail(sweepPr(30, MAIN), { mergeable: false }),
+      ...prDetail(sweepPr(33, MAIN), { mergeable: false }),
+      ...files(30, [{ status: "removed", filename: "src/lib/legacy/formatter.ts" }]),
+      ...files(33, [{ status: "removed", filename: "src/lib/legacy/formatter.ts" }]),
+    });
+    expect(pf).toEqual({ decision: "proceed", alreadyRemoved: [], mainSha: MAIN });
+    expect(shouldMintEpic(pf)).toBe(true);
+    // And the analyst is NOT told those paths are handled — they are not.
+    expect(sweepPreflightNote(pf)).toBe("");
   });
 
   it("mints no epic — which is the 0-agent-ticket outcome the run should have had", async () => {
@@ -96,6 +132,8 @@ describe("mgfcwf — the same failure a week earlier", () => {
     const pf = await run({
       ...commits(MAIN),
       ...pulls([sweepPr(6, MAIN), sweepPr(7, MAIN)]),
+      ...prDetail(sweepPr(6, MAIN)),
+      ...prDetail(sweepPr(7, MAIN)),
       ...files(6, [{ status: "removed", filename: "lambda/dead/handler.mjs" }]),
       ...files(7, [{ status: "removed", filename: "lambda/dead/handler.mjs" }]),
     });
@@ -112,24 +150,22 @@ describe("xgf0dt — main moved, #23 still open", () => {
   // #23's removals were three Python SYMBOLS inside files that survived, so the
   // files endpoint reports them as `modified`. The PR body's Removal Ledger is the
   // only place they exist — which is why the parser is not optional here.
+  const LEDGER_BODY = [
+    "Removes three unreferenced helpers found by vulture.",
+    "",
+    "## Removal Ledger",
+    "- `_extract_json_array`",
+    "- `_store_briefings` — last caller deleted in #19",
+    "- `budget_map`",
+    "",
+    "## Testing",
+    "- full pytest run",
+  ].join("\n");
   const fixture = {
     ...commits(MAIN),
+    ...prDetail(sweepPr(23, BASE_23, LEDGER_BODY)),
     ...pulls([
-      sweepPr(
-        23,
-        BASE_23,
-        [
-          "Removes three unreferenced helpers found by vulture.",
-          "",
-          "## Removal Ledger",
-          "- `_extract_json_array`",
-          "- `_store_briefings` — last caller deleted in #19",
-          "- `budget_map`",
-          "",
-          "## Testing",
-          "- full pytest run",
-        ].join("\n")
-      ),
+      sweepPr(23, BASE_23, LEDGER_BODY),
       // A live feature PR on the same base: not a sweep branch, never probed.
       { number: 24, html_url: "u24", head: { ref: "feature/TEAM-4700-thing" }, base: { sha: MAIN } },
     ]),
