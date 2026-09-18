@@ -349,6 +349,81 @@ describe("the pipeline label cap agrees (TEAM-4750 B3)", () => {
   });
 });
 
+describe("gateShapeRefusal — the create-time bindings both twins demand (TEAM-4764)", () => {
+  const SHA = "a".repeat(40);
+  const UUID = "0f8fad5b-d9cb-469f-a165-70867728950e";
+  const PIPE = "hub-x-deploy";
+  const hintOf = (label: string, labels: unknown) =>
+    (agree(label, (m) => m.gateShapeRefusal(labels)) as { hint: string } | null)?.hint ?? null;
+
+  // A ci-unavailable gate whose close nobody can probe is admitted unproven by
+  // verifyGateCondition (indeterminate/gate_unbound) — so the bindings are demanded
+  // at create time, in the same words from both copies.
+  it("demands exactly one pipeline: label on a ci-unavailable gate", () => {
+    expect(hintOf("ci: no pipeline", ["gate:ci-unavailable", `head:${SHA}`])).toBe(
+      "a ci-unavailable gate must carry exactly one `pipeline:<name>` label (found 0) — " +
+        "without it the close guard has nothing to probe and admits the gate unproven (indeterminate/gate_unbound)"
+    );
+    expect(hintOf("ci: two pipelines", ["gate:ci-unavailable", `pipeline:${PIPE}`, "pipeline:hub-y-deploy", `head:${SHA}`]))
+      .toContain("`pipeline:<name>` label (found 2)");
+  });
+
+  it("demands exactly one 40-hex head: label on a ci-unavailable gate", () => {
+    const expected =
+      "a ci-unavailable gate must carry exactly one `head:<sha>` label whose value is exactly 40 hex chars " +
+      "(found 1) — without it the close guard has nothing to probe and admits the gate " +
+      "unproven (indeterminate/gate_unbound)";
+    // 41 hex is the LIVE disarm: HEAD_LABEL_RE is anchored, so gateHeadOf is null
+    // while the label still looks like a binding to a human reading the ticket.
+    expect(hintOf("ci: 41 hex", ["gate:ci-unavailable", `pipeline:${PIPE}`, `head:${"a".repeat(41)}`])).toBe(expected);
+    expect(hintOf("ci: no head", ["gate:ci-unavailable", `pipeline:${PIPE}`])).toContain("(found 0)");
+    expect(hintOf("ci: two heads", ["gate:ci-unavailable", `pipeline:${PIPE}`, `head:${SHA}`, `head:${"c".repeat(40)}`]))
+      .toContain("(found 2)");
+  });
+
+  it("accepts a bound ci-unavailable gate in either spelling or case", () => {
+    expect(hintOf("ci: bound", ["gate:ci-unavailable", `pipeline:${PIPE}`, `head:${SHA}`])).toBeNull();
+    // Post-sanitizeUserLabels hyphen spelling, and upper-case hex, read the same.
+    expect(hintOf("ci: hyphen", ["gate-ci-unavailable", `pipeline-${PIPE}`, `head-${SHA}`])).toBeNull();
+    expect(hintOf("ci: upper hex", ["gate:ci-unavailable", `pipeline:${PIPE}`, `HEAD:${SHA.toUpperCase()}`])).toBeNull();
+  });
+
+  it("keeps the deploy-approval words and order unchanged", () => {
+    expect(hintOf("deploy: no exec", ["gate:deploy-approval", `pipeline:${PIPE}`])).toBe(
+      "a deploy-approval gate must carry exactly one `exec:<execution-id>` label (found 0) — " +
+        "without it nobody can tell which pipeline execution the human is being asked about"
+    );
+    expect(hintOf("deploy: no pipeline", ["gate:deploy-approval", `exec:${UUID}`])).toBe(
+      "a deploy-approval gate must carry exactly one `pipeline:<name>` label (found 0) — " +
+        "without it the gate cannot be verified or linked to a console"
+    );
+    // exec is reported first when BOTH are missing — the order agents have learned.
+    expect(hintOf("deploy: neither", ["gate:deploy-approval"])).toContain("`exec:<execution-id>`");
+    expect(hintOf("deploy: bound", ["gate:deploy-approval", `pipeline:${PIPE}`, `exec:${UUID}`])).toBeNull();
+  });
+
+  it("says nothing about a kind with no create-time binding, or a non-gate", () => {
+    for (const labels of [["gate:approval"], ["gate:blocker"], ["gate:merge-approval"], ["needs-docs"], [], null]) {
+      expect(hintOf(`inert: ${JSON.stringify(labels)}`, labels)).toBeNull();
+    }
+  });
+
+  it("evaluates BOTH kinds on a ticket that carries two, deploy-approval first", () => {
+    // probedGateKindOf picks exactly one kind; this check deliberately does not use
+    // it, so a second kind on the same ticket cannot slip past unbound.
+    expect(hintOf("both: deploy wins", ["gate:deploy-approval", "gate:ci-unavailable", `head:${SHA}`]))
+      .toContain("`exec:<execution-id>`");
+    expect(
+      hintOf("both: ci still checked", [
+        "gate:deploy-approval",
+        "gate:ci-unavailable",
+        `pipeline:${PIPE}`,
+        `exec:${UUID}`,
+      ])
+    ).toContain("`head:<sha>`");
+  });
+});
+
 describe("the probe's shape agrees", () => {
   it("PROBE_TOOLS is the same read-only allow-list in both copies", () => {
     expect(agree("PROBE_TOOLS", (m) => m.PROBE_TOOLS)).toEqual([

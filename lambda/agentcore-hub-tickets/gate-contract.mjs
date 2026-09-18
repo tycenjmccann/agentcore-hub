@@ -170,6 +170,81 @@ export function pipelineLabelRefusal(label) {
   };
 }
 
+/**
+ * The PURE half of the create-time gate shape check: everything decidable from the
+ * labels alone, for every gate kind whose close is later PROVEN by a probe.
+ *
+ * Worded here for the same reason as pipelineLabelRefusal above — both twins must
+ * refuse a malformed gate in identical words, and each one only delivers it in its
+ * own idiom (textResult vs a thrown err.toolResult). The probe half stays in the
+ * twins, because only `deploy-approval` has one.
+ *
+ * WHY create-time is the place (TEAM-4758). verifyGateCondition deliberately ADMITS
+ * anything it cannot contradict: a ci-unavailable gate with no `pipeline:` label, or
+ * a `head:` that is not 40 hex, resolves `indeterminate`/`gate_unbound` and closes
+ * unproven. At create time the binding is cheap to demand — the agent has the SHA and
+ * the pipeline name in hand — and refusing costs nothing but a retry. By close time
+ * the information is gone and the only safe direction is to let the ticket through.
+ * So a *definite* shape violation is refused HERE, before an id is minted.
+ *
+ * Each kind present is evaluated on its own — deliberately not probedGateKindOf,
+ * which picks exactly ONE kind and would silently skip a second one on the same
+ * ticket. deploy-approval is checked first, preserving its existing order and words.
+ *
+ * @returns {{hint: string}|null} null when the labels are acceptable
+ */
+export function gateShapeRefusal(labels) {
+  const list = Array.isArray(labels) ? labels : [];
+  const kinds = gateKindsOf(list);
+  const lower = list.map((l) =>
+    String(l ?? "")
+      .trim()
+      .toLowerCase()
+  );
+  const execLabels = lower.filter((l) => /^exec[:-]/.test(l));
+  const pipeLabels = lower.filter((l) => /^pipeline[:-]/.test(l));
+  const headLabels = lower.filter((l) => /^head[:-]/.test(l));
+
+  if (kinds.includes("deploy-approval")) {
+    if (execLabels.length !== 1 || !gateExecOf(list)) {
+      return {
+        hint:
+          `a deploy-approval gate must carry exactly one \`exec:<execution-id>\` label (found ${execLabels.length}) — ` +
+          `without it nobody can tell which pipeline execution the human is being asked about`,
+      };
+    }
+    if (pipeLabels.length !== 1 || !gatePipelineOf(list)) {
+      return {
+        hint:
+          `a deploy-approval gate must carry exactly one \`pipeline:<name>\` label (found ${pipeLabels.length}) — ` +
+          `without it the gate cannot be verified or linked to a console`,
+      };
+    }
+  }
+  // A ci-unavailable gate asserts something a read CAN contradict — that CI is
+  // genuinely unreachable for this commit — but only if it says which pipeline and
+  // which commit. Both bindings, exactly one each. No probe: the claim is about CI
+  // being down, so an unreachable probe is not evidence either way.
+  if (kinds.includes("ci-unavailable")) {
+    if (pipeLabels.length !== 1 || !gatePipelineOf(list)) {
+      return {
+        hint:
+          `a ci-unavailable gate must carry exactly one \`pipeline:<name>\` label (found ${pipeLabels.length}) — ` +
+          `without it the close guard has nothing to probe and admits the gate unproven (indeterminate/gate_unbound)`,
+      };
+    }
+    if (headLabels.length !== 1 || !gateHeadOf(list)) {
+      return {
+        hint:
+          `a ci-unavailable gate must carry exactly one \`head:<sha>\` label whose value is exactly 40 hex chars ` +
+          `(found ${headLabels.length}) — without it the close guard has nothing to probe and admits the gate ` +
+          `unproven (indeterminate/gate_unbound)`,
+      };
+    }
+  }
+  return null;
+}
+
 // ── The labels the guard itself writes ──────────────────────────────────────
 // Written through each provider's ADDITIVE label verb (the DynamoDB twin's
 // conditional list_append, Jira's `update:{labels:[{add}]}`), never a whole-list

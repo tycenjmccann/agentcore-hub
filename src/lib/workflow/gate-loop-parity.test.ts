@@ -584,9 +584,28 @@ describe("validateGateTicketShape — a deploy gate a human can act on", () => {
       { labels: ["gate:deploy-approval", `pipeline:${PIPELINE}`, `exec:${EXEC}`], description: "please approve" },
       null,
     ],
+    // TEAM-4758 / TEAM-4764: a ci-unavailable gate IS shape-checked, because the
+    // close guard's ci arm admits `indeterminate`/`gate_unbound` when either binding
+    // is missing — the gate then closes without a single read. Both bindings, exactly
+    // one each, demanded where they are still cheap to produce.
     [
-      "a ci-unavailable gate is not shape-checked (nothing to bind)",
+      "a ci-unavailable gate with no pipeline label ⇒ refuse",
       { labels: ["gate:ci-unavailable", `head:${SHA}`], caps: CAPS },
+      "a ci-unavailable gate must carry exactly one `pipeline:<name>` label (found 0)",
+    ],
+    [
+      "a ci-unavailable gate whose head is 41 hex ⇒ refuse",
+      { labels: ["gate:ci-unavailable", `pipeline:${PIPELINE}`, `head:${"a".repeat(41)}`], caps: CAPS },
+      "label whose value is exactly 40 hex chars (found 1)",
+    ],
+    [
+      "a ci-unavailable gate with two head labels ⇒ refuse",
+      { labels: ["gate:ci-unavailable", `pipeline:${PIPELINE}`, `head:${SHA}`, `head:${"c".repeat(40)}`], caps: CAPS },
+      "label whose value is exactly 40 hex chars (found 2)",
+    ],
+    [
+      "a ci-unavailable gate bound to one pipeline and one head ⇒ create",
+      { labels: CI_GATE, caps: CAPS },
       null,
     ],
     [
@@ -623,7 +642,10 @@ describe("validateGateTicketShape — a deploy gate a human can act on", () => {
   });
 
   it("a non-deploy gate makes NO probe", async () => {
-    await runTickets({ labels: ["gate:ci-unavailable", `head:${SHA}`], caps: CAPS });
+    // Bound (CI_GATE), so the shape check passes and we are really asserting that a
+    // ci-unavailable gate is never probed: it claims CI is down, so a capabilities
+    // read is no evidence either way.
+    await runTickets({ labels: CI_GATE, caps: CAPS });
     expect(h.probes).toHaveLength(0);
     await runJira({ labels: ["gate:blocker"], caps: CAPS });
     expect(h.probes).toHaveLength(0);

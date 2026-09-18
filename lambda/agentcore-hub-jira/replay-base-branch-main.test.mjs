@@ -218,3 +218,124 @@ test("no base_branch stated ⇒ no line, no response key (a pre-feature create i
     jira.restore();
   }
 });
+
+/**
+ * replay TEAM-4758 (TEAM-4764 P1), jira half — the unbound ci-unavailable gate.
+ *
+ * The tickets twin's half is lambda/agentcore-hub-tickets/replay-gate-binding.test.mjs.
+ * What only this provider can answer is that Jira refuses through its own idiom — a
+ * thrown `err.toolResult`, surfaced as `{ok:false, reason, hint, error}` — while
+ * producing the SAME words; the byte-equality of the hints across the two twins is
+ * asserted in src/lib/workflow/gate-loop-parity.test.ts, which drives both handlers.
+ *
+ * The refusal is pure, so it lands before the sibling scan and before the create
+ * POST: nothing is looked up and nothing is created.
+ */
+const CI_PIPELINE = "hub-agentcore-hub-deploy";
+const CI_HEAD = "a".repeat(40);
+
+/** A ci-unavailable gate as the CI agent files it, with whatever labels are given. */
+const fileCiGate = (labels) => handler({
+  tool_name: "Tickets___create_ticket",
+  parameters: {
+    summary: "CI is unavailable for the release commit",
+    description: "CodeBuild has no project for this commit.",
+    issue_type: "Task",
+    parent_key: EPIC,
+    assignee: "agentcore_hub_ci_agent",
+    workflow_id: WF,
+    labels,
+  },
+});
+
+test("(a) a head-only ci-unavailable gate is refused: no pipeline to probe, no issue created", async () => {
+  const jira = stubJira();
+  try {
+    const res = await fileCiGate(["gate:ci-unavailable", `head:${CI_HEAD}`]);
+
+    assert.equal(res.ok, false);
+    assert.equal(res.reason, "gate_condition_unmet");
+    assert.equal(
+      res.hint,
+      "a ci-unavailable gate must carry exactly one `pipeline:<name>` label (found 0) — " +
+        "without it the close guard has nothing to probe and admits the gate unproven (indeterminate/gate_unbound)"
+    );
+    assert.equal(res.error, res.hint);
+    assert.equal(res.ticketId, undefined);
+    // Nothing was created: the refusal lands before the create POST and before the
+    // idempotency dedupe. The ONE search is the loop seam's sibling scan, which by
+    // design runs ahead of the shape check so a looping gate reports the loop.
+    assert.equal(jira.calls.posts.length, 0);
+    assert.deepEqual(
+      jira.calls.searches.filter((q) => !q.startsWith(`parent = ${EPIC}`)),
+      []
+    );
+  } finally {
+    jira.restore();
+  }
+});
+
+test("(b) a 41-hex head is refused — the value that silently disarmed the close guard", async () => {
+  const jira = stubJira();
+  try {
+    const res = await fileCiGate(["gate:ci-unavailable", `pipeline:${CI_PIPELINE}`, `head:${"a".repeat(41)}`]);
+
+    assert.equal(res.reason, "gate_condition_unmet");
+    assert.equal(
+      res.hint,
+      "a ci-unavailable gate must carry exactly one `head:<sha>` label whose value is exactly 40 hex chars " +
+        "(found 1) — without it the close guard has nothing to probe and admits the gate " +
+        "unproven (indeterminate/gate_unbound)"
+    );
+    assert.equal(res.ticketId, undefined);
+    assert.equal(jira.calls.posts.length, 0);
+  } finally {
+    jira.restore();
+  }
+});
+
+test("(c) two head: labels are refused — which commit would the probe ask about?", async () => {
+  const jira = stubJira();
+  try {
+    const res = await fileCiGate([
+      "gate:ci-unavailable",
+      `pipeline:${CI_PIPELINE}`,
+      `head:${CI_HEAD}`,
+      `head:${"c".repeat(40)}`,
+    ]);
+
+    assert.equal(res.reason, "gate_condition_unmet");
+    assert.ok(res.hint.includes("(found 2)"), res.hint);
+    assert.equal(res.ticketId, undefined);
+    assert.equal(jira.calls.posts.length, 0);
+  } finally {
+    jira.restore();
+  }
+});
+
+test("(d) a gate bound to one pipeline and one 40-hex head is created", async () => {
+  const jira = stubJira({ siblings: [] });
+  try {
+    const res = await fileCiGate(["gate:ci-unavailable", `pipeline:${CI_PIPELINE}`, `head:${CI_HEAD}`]);
+
+    assert.equal(res.ticketId, MINTED);
+    assert.equal(jira.calls.posts.length, 1);
+  } finally {
+    jira.restore();
+  }
+});
+
+test("(e) a plain ticket and a gate:approval ticket are unaffected", async () => {
+  const jira = stubJira({ siblings: [] });
+  try {
+    const plain = await fileCiGate(["needs-docs"]);
+    assert.equal(plain.ticketId, MINTED);
+
+    const approval = await fileCiGate(["gate:approval"]);
+    assert.equal(approval.ticketId, MINTED);
+
+    assert.equal(jira.calls.posts.length, 2);
+  } finally {
+    jira.restore();
+  }
+});

@@ -378,3 +378,99 @@ describe("replay 37ule1 — the same gate re-filed against the same target", () 
     expect(h.state.events).toHaveLength(0);
   });
 });
+
+/**
+ * replay TEAM-4758 (TEAM-4764 P1) — the unbound ci-unavailable gate.
+ *
+ * QA filed a `gate:ci-unavailable` ticket carrying `head:<sha>` and NO `pipeline:`
+ * label. `gatePipelineOf` returned null, so `verifyGateCondition`'s ci arm took its
+ * `indeterminate`/`gate_unbound` exit and the close was admitted without a single
+ * read — the guard was inert. A 41-character `head:` value disarms it identically,
+ * since HEAD_LABEL_RE is anchored at 40 hex.
+ *
+ * The fix is create-time, and the reason is the fail direction: the close guard
+ * refuses only on a definite negative, so a gate that cannot be probed MUST be
+ * admitted there. At create time the agent has both bindings in hand, so demanding
+ * them is cheap; refusing before `nextTicketId` also means no id is burned.
+ */
+describe("create_ticket — an unbound ci-unavailable gate is refused at create time (TEAM-4758)", () => {
+  const EPIC = "TEAM-4750";
+  const PIPELINE = "hub-agentcore-hub-deploy";
+  const HEAD = "a".repeat(40);
+
+  const file = (labels) => create({
+    summary: "CI is unavailable for the release commit",
+    assignee: "agentcore_hub_ci_agent",
+    labels,
+    parent_key: EPIC,
+  });
+
+  beforeEach(() => {
+    h.state.items[EPIC] = { ticketId: EPIC, type: "epic", workflowId: "ab12cd", labels: [] };
+  });
+
+  it("(a) refuses a head-only gate — no pipeline to probe, no id minted", async () => {
+    const res = await file(["gate:ci-unavailable", `head:${HEAD}`]);
+
+    expect(res).toMatchObject({ ok: false, reason: "gate_condition_unmet" });
+    expect(res.hint).toBe(
+      "a ci-unavailable gate must carry exactly one `pipeline:<name>` label (found 0) — " +
+        "without it the close guard has nothing to probe and admits the gate unproven (indeterminate/gate_unbound)"
+    );
+    expect(h.state.puts, "no gate ticket row").toHaveLength(0);
+    expect(h.state.counter, "and no id burned").toBe(0);
+    expect(h.state.probes, "the label half needs no read at all").toHaveLength(0);
+  });
+
+  it("(b) refuses a 41-hex head — the value that silently disarmed the guard", async () => {
+    const res = await file(["gate:ci-unavailable", `pipeline:${PIPELINE}`, `head:${"a".repeat(41)}`]);
+
+    expect(res).toMatchObject({ ok: false, reason: "gate_condition_unmet" });
+    expect(res.hint).toBe(
+      "a ci-unavailable gate must carry exactly one `head:<sha>` label whose value is exactly 40 hex chars " +
+        "(found 1) — without it the close guard has nothing to probe and admits the gate " +
+        "unproven (indeterminate/gate_unbound)"
+    );
+    expect(h.state.puts).toHaveLength(0);
+    expect(h.state.counter).toBe(0);
+  });
+
+  it("(c) refuses two head: labels — which commit would the probe ask about?", async () => {
+    const res = await file([
+      "gate:ci-unavailable",
+      `pipeline:${PIPELINE}`,
+      `head:${HEAD}`,
+      `head:${"c".repeat(40)}`,
+    ]);
+
+    expect(res).toMatchObject({ ok: false, reason: "gate_condition_unmet" });
+    expect(res.hint).toContain("(found 2)");
+    expect(h.state.puts).toHaveLength(0);
+    expect(h.state.counter).toBe(0);
+  });
+
+  it("(d) creates a gate bound to one pipeline and one 40-hex head", async () => {
+    const res = await file(["gate:ci-unavailable", `pipeline:${PIPELINE}`, `head:${HEAD}`]);
+
+    expect(res.ok).not.toBe(false);
+    expect(h.state.puts).toHaveLength(1);
+    expect(h.state.counter, "one id minted").toBe(1);
+    expect(h.state.probes, "a ci gate claims CI is down — probing it proves nothing").toHaveLength(0);
+  });
+
+  it("(e) leaves a plain ticket and a gate:approval ticket alone", async () => {
+    const plain = await file(["needs-docs"]);
+    expect(plain.ok).not.toBe(false);
+
+    const approval = await create({
+      summary: "A human must decide whether to ship without the e2e suite",
+      assignee: "human:tycen",
+      labels: ["gate:approval"],
+      parent_key: EPIC,
+    });
+    expect(approval.ok).not.toBe(false);
+
+    expect(h.state.puts).toHaveLength(2);
+    expect(h.state.probes, "neither kind is shape-checked or probed").toHaveLength(0);
+  });
+});

@@ -1802,7 +1802,10 @@ test("createTicket: the gate-loop guard FAILS OPEN on an unreadable epic — it 
       tool_name: "Tickets___create_ticket",
       parameters: {
         summary: "CI is unavailable",
-        labels: ["gate:ci-unavailable", `head:${"b".repeat(40)}`],
+        // Fully bound: the TEAM-4764 shape seam runs BEFORE the autowire's sibling
+        // scan, so an unbound gate would be refused for its labels and never reach
+        // the fail-open behaviour this test pins.
+        labels: ["gate:ci-unavailable", "pipeline:hub-x-deploy", `head:${"b".repeat(40)}`],
         parent_key: "TEAM-1",
       },
     });

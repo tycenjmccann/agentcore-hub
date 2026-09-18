@@ -59,6 +59,7 @@ import {
   gateLoopVerdict,
   gatePipelineOf,
   gateRefusal,
+  gateShapeRefusal,
   gateVerificationSlots,
   invokeProbe,
   judgeCompletionRecord,
@@ -647,14 +648,19 @@ async function refuseGateLoop({ labels, blockedBy, parentId }) {
 }
 
 /**
- * A `gate:deploy-approval` ticket must be USABLE by the human it will page: bound
- * to exactly one execution and one pipeline, and carrying the console deep link.
+ * A typed gate ticket must be USABLE by whoever — or whatever — will later have to
+ * resolve it. A `gate:deploy-approval` must be bound to exactly one execution and one
+ * pipeline and carry the console deep link, so the human it pages can act; a
+ * `gate:ci-unavailable` must be bound to one pipeline and one 40-hex head, so the
+ * close guard has something to probe (TEAM-4758 — an unbound one closed unproven).
  *
- * Scoped to that one kind — every other gate has nothing to bind and nothing to
- * link. `capabilities().approveDeploy` is a hardcoded `false` (DL-028: the deploy
- * gate is human-only, and no tool may approve it), so the link requirement always
- * applies; the probe earns its keep as the only read that can tell us the
- * `pipeline:` label names a pipeline the hub is actually allowed to reach.
+ * The label half is gateShapeRefusal() in gate-contract.mjs, so both twins refuse in
+ * identical words. Only the PROBE half is here, and only deploy-approval has one:
+ * `capabilities().approveDeploy` is a hardcoded `false` (DL-028: the deploy gate is
+ * human-only, and no tool may approve it), so the link requirement always applies,
+ * and the probe earns its keep as the only read that can tell us the `pipeline:`
+ * label names a pipeline the hub is actually allowed to reach. A ci-unavailable gate
+ * claims CI is down, so an unreachable probe would be no evidence either way.
  *
  * FAIL DIRECTION, again: an UNREACHABLE probe creates the ticket. Only a successful
  * read that reports the pipeline unregistered refuses.
@@ -663,27 +669,13 @@ async function refuseGateLoop({ labels, blockedBy, parentId }) {
  */
 async function validateGateTicketShape({ labels, description }) {
   const list = Array.isArray(labels) ? labels : [];
-  if (!gateKindsOf(list).includes("deploy-approval")) return null;
-
   const refuse = (hint) => ({ ok: false, reason: GATE_CONDITION_UNMET, hint, ...textResult(hint) });
-  const lower = list.map((l) => String(l ?? "").trim().toLowerCase());
-  const execLabels = lower.filter((l) => /^exec[:-]/.test(l));
-  const pipeLabels = lower.filter((l) => /^pipeline[:-]/.test(l));
-  const execId = gateExecOf(list);
-  const pipeline = gatePipelineOf(list);
 
-  if (execLabels.length !== 1 || !execId) {
-    return refuse(
-      `a deploy-approval gate must carry exactly one \`exec:<execution-id>\` label (found ${execLabels.length}) — ` +
-        `without it nobody can tell which pipeline execution the human is being asked about`
-    );
-  }
-  if (pipeLabels.length !== 1 || !pipeline) {
-    return refuse(
-      `a deploy-approval gate must carry exactly one \`pipeline:<name>\` label (found ${pipeLabels.length}) — ` +
-        `without it the gate cannot be verified or linked to a console`
-    );
-  }
+  const shape = gateShapeRefusal(list);
+  if (shape) return refuse(shape.hint);
+
+  if (!gateKindsOf(list).includes("deploy-approval")) return null;
+  const pipeline = gatePipelineOf(list);
 
   const probe = await invokeProbe(PIPELINE_TOOLS_LAMBDA, "Pipeline___capabilities", {
     pipeline_name: pipeline,
