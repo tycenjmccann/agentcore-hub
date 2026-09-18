@@ -2212,6 +2212,36 @@ async function answerGateUnverifiable(cb, ticketId) {
   await tgAnswer(cb.id, "Could not verify gate type, retry.").catch(() => {});
 }
 
+// How much of the hub's refusal text the stuck-gate edit carries. Enough to name
+// the condition, short enough that the three sentences around it stay readable.
+const GATE_STUCK_DETAIL_MAX = 300;
+
+/**
+ * The one answer for "the PIPELINE is decided and the ticket is not" (TEAM-4751
+ * C1). The generic "⚠️ Failed to process" is a lie on this path: it reads as
+ * "nothing happened" about the single write that cannot be undone, and it sends
+ * the human — who just approved — off to the console the gate comment names.
+ *
+ * So say exactly what landed, what did not, and that a re-tap costs no second
+ * approval: `wasGateApprovedLocally` → DEPLOY_GATE_ALREADY is what guarantees
+ * that (SEC-8/SEC-9). The keyboard is preserved so the re-tap is possible, and
+ * the text deliberately avoids gateFromReply's routing vocabulary ("REVIEW
+ * GATE" / "SHIP-REVIEW ESCALATION" / "Changes requested") so a reply to it is
+ * not laundered into a rework note. Never throws, never rethrows.
+ */
+async function answerDeployGateTicketStuck(cb, chatId, ticketId, err) {
+  console.error(`[telegram-bug-intake] gate ${ticketId}: deploy decided but the ticket did not close`, err?.message);
+  const detail = clipText(redactText(String(err?.detail || err?.message || "")), GATE_STUCK_DETAIL_MAX);
+  await tgAnswer(cb.id, `Deploy approved — ${ticketId} still open.`).catch(() => {});
+  const body =
+    `${cb.message.text}\n\n` +
+    `✅ The deploy IS approved on the pipeline — it is resuming.\n` +
+    `⚠️ ${esc(ticketId)} could not be marked done yet: ${esc(detail)}\n` +
+    `Tap ✅ again to finish the ticket only — the pipeline will not be approved twice.`;
+  await tgEdit(chatId, cb.message.message_id, body.slice(0, 4000),
+    cb.message.reply_markup ? { reply_markup: cb.message.reply_markup } : {}).catch(() => {});
+}
+
 async function handleGateCallback(cb, chatId, action, ticketId, workflowId) {
   // Gate pings go to every registered chat, but only allowlisted chats may
   // transition tickets. Ack the tap (or Telegram re-sends the callback query)
@@ -2237,8 +2267,25 @@ async function handleGateCallback(cb, chatId, action, ticketId, workflowId) {
     // message, and the ticket stays put so the human can tap again once the
     // cause is fixed. `alreadyResolved` means the pipeline is where the human
     // wants it, so the ticket must still move (SEC-8).
-    if (deploy && (await decideDeployGate(cb, chatId, ticketId, deploy, true)) === DEPLOY_GATE_FAILED) return;
-    const res = await transitionGate(workflowId, ticketId, "done", `Approved via Telegram by chat ${chatId}`);
+    const decided = deploy ? await decideDeployGate(cb, chatId, ticketId, deploy, true) : null;
+    if (decided === DEPLOY_GATE_FAILED) return;
+    let res;
+    if (decided) {
+      // TEAM-4751 C1: a pipeline decision LANDED (`decided` or `alreadyResolved`),
+      // so the ticket half is all that is left — and it must not be surfaced as a
+      // total failure. WP2's guard reads CodePipeline ONCE with no tolerance, so
+      // the close we fire immediately after our own PutApprovalResult can still
+      // see the Approval action InProgress and be refused. Retry that refusal;
+      // on a real one, say what is true rather than "⚠️ Failed to process".
+      const out = await transitionGateAfterDecision(
+        workflowId, ticketId, "done", `Approved via Telegram by chat ${chatId}`);
+      if (out.error) return await answerDeployGateTicketStuck(cb, chatId, ticketId, out.error);
+      res = out.res;
+    } else {
+      // A plain gate: no irreversible write preceded this tap, so a refusal is
+      // still allowed to throw to the update loop exactly as it always has.
+      res = await transitionGate(workflowId, ticketId, "done", `Approved via Telegram by chat ${chatId}`);
+    }
     // A ❌ tapped by mistake before this ✅ left a marker that would turn the
     // chat's next message into a rework note for a gate that is now done.
     const stale = await getPendingRejection(chatId);
@@ -2494,6 +2541,56 @@ async function transitionGate(workflowId, ticketId, targetStatus, comment) {
   }
   // Body is informational (e.g. decisionDefaulted, TEAM-3971) — never required.
   try { return await res.json(); } catch { return {}; }
+}
+
+// WP2's typed-gate guard refused the close. The hub route surfaces the ticket
+// Lambda's refusal TEXT only (src/app/api/workflow/[id]/tickets/transition/
+// route.ts sends `details: gateRefusal().message`), never the machine reason —
+// so the match is on the message gateRefusal() builds ("…its `gate:<kind>`
+// condition is not met. <hint>"). `gate_condition_unmet` is the defensive arm
+// for the day the route starts forwarding `payload.reason` as well.
+const GATE_GUARD_REFUSAL_RE = /condition is not met|gate_condition_unmet/i;
+
+/**
+ * Is this a RETRYABLE typed-gate refusal, as opposed to a real 409? A refusal is
+ * a lagging read; "No transition to \"Done\" found" is an answer, and a 5xx is
+ * neither. Both of those must fail fast.
+ */
+function isGateGuardRefusal(err) {
+  return err?.status === 409 && GATE_GUARD_REFUSAL_RE.test(String(err?.detail ?? err?.message ?? ""));
+}
+
+// 4 attempts ⇒ 3 sleeps at _deployGateRetryMs ≈ 30s, the same budget
+// decideDeployGate already spends waiting for a superseded build to clear the
+// gate — so the invocation's tolerance for this callback is unchanged.
+export const DEPLOY_GATE_TRANSITION_TRIES = 4;
+
+/**
+ * Transition a gate whose PIPELINE decision has ALREADY landed (TEAM-4751 C1).
+ *
+ * Never throws: the caller must not let the top-level "⚠️ Failed to process"
+ * become the surface for a deploy that IS approved. Retries ONLY the guard's
+ * lagging-read refusal — the decision ledger row (`approved#<ticketId>`) is
+ * written before the pipeline call, so a retried close is idempotent — and
+ * treats every other failure as final.
+ *
+ * @returns {Promise<{res: object|null, error: Error|null, attempts: number, refusals: number}>}
+ */
+async function transitionGateAfterDecision(workflowId, ticketId, targetStatus, comment) {
+  let refusals = 0;
+  for (let attempt = 1; ; attempt++) {
+    try {
+      const res = await transitionGate(workflowId, ticketId, targetStatus, comment);
+      return { res, error: null, attempts: attempt, refusals };
+    } catch (err) {
+      if (!isGateGuardRefusal(err) || attempt >= DEPLOY_GATE_TRANSITION_TRIES) {
+        return { res: null, error: err, attempts: attempt, refusals };
+      }
+      refusals++;
+      console.warn(`[telegram-bug-intake] gate ${ticketId}: the gate guard refused the close (attempt ${attempt}/${DEPLOY_GATE_TRANSITION_TRIES}) — ${err.detail || err.message}`);
+      await sleep(_deployGateRetryMs);
+    }
+  }
 }
 
 // ─── Workflow Manager escalations ────────────────────────────────────────────
