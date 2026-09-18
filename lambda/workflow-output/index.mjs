@@ -635,7 +635,18 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   // that is the only kind of run that has a cd-ledger — so an ordinary dev
   // completion costs no extra S3 call.
   const ledger = report.outcome || report.merge_commit ? await readCdLedger(workflow_id) : null;
-  const ledgerEntries = ledgerFollowUps(ledger);
+  // TEAM-4754 — and the read is three-outcome now, so an unreadable ledger REFUSES
+  // rather than contributing `[]`. This belongs in the pre-write refusal band with
+  // the DL-030 gate above and mainFixRefusal / verifyPrBase / emptySweepScanRefusal
+  // below: it is the last moment at which "nothing was recorded" is still true, and
+  // that is what makes retrying free. Only a ship-shaped report pays for it — an
+  // ordinary dev completion never reads the ledger at all (see the gate above).
+  const ledgerRefusal = cdLedgerRefusal({ workflowId: workflow_id, ledger });
+  if (ledgerRefusal) {
+    console.warn(`[report_completion] REFUSED ${ticket_id}: ${ledgerRefusal.reason} (${ledger.error}) - no record written, ticket not transitioned`);
+    return ledgerRefusal;
+  }
+  const ledgerEntries = ledgerFollowUps(ledger?.ledger);
   if (ledgerEntries.length > 0) {
     console.log(`[report_completion] ${ticket_id}: cd-ledger contributed ${ledgerEntries.length} follow-up(s) (${ledgerEntries.map((e) => e.kind).join(", ")})`);
   }
@@ -1190,22 +1201,69 @@ export function validateFollowUps(items, { ticketId } = {}) {
 }
 
 /**
- * The cd-ledger BODY. A sibling of probeCdLedger above, deliberately separate:
- * that probe's three-outcome HeadObject contract is what the DL-030 gate is built
- * on and must not grow a fourth answer. This one runs only on the post-record
- * follow-up path, where "we could not read it" costs nothing but a log line.
+ * The cd-ledger BODY, in THREE outcomes. A sibling of probeCdLedger above, still
+ * deliberately separate: that probe's HeadObject contract is what the DL-030 gate
+ * is built on and must not grow a fourth answer.
+ *
+ * TEAM-4754 — this used to return `null` for both "there is no ledger" and "we
+ * could not read the ledger", which is the same defect TEAM-4752 D1 removed from
+ * the sibling scan, one read earlier. `ledgerFollowUps(null)` is `[]`, so an
+ * AccessDenied, a 503, a throttle or a truncated body that fails JSON.parse made
+ * FR-5's console/IAM handoffs and its unmerged-to-main fix silently EVAPORATE and
+ * the CD ticket closed green. Failure must not be spelled the same way as empty.
+ *
+ * Only a DEFINITE negative (a real 404) licenses proceeding:
+ *   { ok:true,  ledger: {...}, error:null }  the ledger was read
+ *   { ok:true,  ledger: null,  error:null }  it provably does not exist
+ *   { ok:false, ledger: null, error }        we could not tell
+ *
+ * `!BUCKET || !workflowId` is a definite negative here, and that is a deliberate
+ * difference from probeCdLedger (which calls the same condition INDETERMINATE):
+ * with no bucket the completion record's own PutObject cannot succeed either, and
+ * with no workflow_id there is no run and so no ledger to lose. The probe is
+ * stricter because it licenses a ship CLAIM; this read only DERIVES follow-ups.
  */
 async function readCdLedger(workflowId) {
-  if (!BUCKET || !workflowId) return null;
+  if (!BUCKET || !workflowId) return { ok: true, ledger: null, error: null };
   const key = `workflows/${workflowId}/shared/cd-ledger.json`;
   try {
     const r = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: key }));
-    return JSON.parse(await r.Body.transformToString());
+    return { ok: true, ledger: JSON.parse(await r.Body.transformToString()), error: null };
   } catch (err) {
-    if (err?.name === "NoSuchKey" || err?.name === "NotFound" || err?.$metadata?.httpStatusCode === 404) return null;
-    console.warn(`[report_completion] cd-ledger body for ${key} was unreadable (${err?.name || "Error"}: ${err?.message || "no message"}) - no ledger-derived follow-ups`);
-    return null;
+    if (err?.name === "NoSuchKey" || err?.name === "NotFound" || err?.$metadata?.httpStatusCode === 404) {
+      return { ok: true, ledger: null, error: null };
+    }
+    // Includes a JSON.parse failure: a body we cannot parse is a body we did not
+    // read, not a run with no handoffs.
+    const error = `${err?.name || "Error"}: ${err?.message || "no message"}`;
+    console.error(`[report_completion] cd-ledger body for ${key} was UNREADABLE (${error}) - the ledger-derived follow-ups are unknown`);
+    return { ok: false, ledger: null, error };
   }
+}
+
+/**
+ * TEAM-4754 — the cd-ledger half of the fail-closed rule, as a VALUE, and it takes
+ * D1's shape rather than N2's. The difference is ORDERING: this read happens
+ * BEFORE the S3 write, so nothing durable exists yet and the honest answer is to
+ * refuse the whole report and let the persona retry. N2's
+ * `complete_pending_follow_ups` exists only because by that point the record is
+ * already written and refusing would throw away a real completion.
+ *
+ * What is at stake is not a nicety: the ledger is where FR-5 learns about the
+ * console/IAM steps only a human can perform and about hub-infra commits that
+ * never reached main. Closing the CD ticket without them cascades the run to
+ * `complete` over work nobody owns.
+ *
+ * Returns null when the report may proceed.
+ */
+export function cdLedgerRefusal({ workflowId, ledger }) {
+  if (!ledger || ledger.ok !== false) return null;
+  return {
+    ok: false,
+    reason: "cd_ledger_unreadable",
+    missing: [],
+    message: `This ship report was refused: the run's cd-ledger (workflows/${workflowId || "<unknown>"}/shared/cd-ledger.json) could not be read (${ledger.error}), so the console/IAM handoffs and any unmerged-to-main work it records - each of which becomes a follow-up ticket - are UNKNOWN. Closing this ticket now would cascade the run to complete over work nobody owns. Nothing was recorded and the ticket was NOT transitioned. Retry the call.`,
+  };
 }
 
 const ledgerStepText = (s) => {

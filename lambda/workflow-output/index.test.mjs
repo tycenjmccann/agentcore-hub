@@ -41,6 +41,9 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
  */
 const h = vi.hoisted(() => ({
   puts: [], warns: [], gets: [], heads: [], headError: null, invokes: [], objects: new Map(),
+  // TEAM-4754: a GetObject that fails for a reason OTHER than "not there" — the
+  // whole point of the three-outcome cd-ledger read. Mirrors `headError`.
+  getError: null,
   calls: [], events: [], issue: undefined, siblings: [], created: [], ticketFail: new Set(),
   // FR-10: per-CALL transition control, which `ticketFail` (keyed on the tool) cannot
   // express — the skip walk's whole shape is "skip, and if THAT one is refused, block
@@ -69,6 +72,9 @@ vi.mock("@aws-sdk/client-s3", () => ({
       }
       if (name === "GetObjectCommand") {
         h.gets.push(input);
+        // Keyed so a test can break ONE object's read without breaking the design
+        // docs and manifests every other test reads back.
+        if (h.getError && (!h.getError.key || h.getError.key === input.Key)) throw h.getError.err;
         if (!h.objects.has(input.Key)) {
           // Real S3 surfaces a missing object this way, and the Lambda's error
           // message quotes err.name — so the stub has to carry the same name.
@@ -268,6 +274,7 @@ beforeEach(() => {
   h.createGate = null;
   h.issue = undefined;
   h.headError = null;
+  h.getError = null;
   h.objects.clear();
   h.workflowGets.length = 0;
   h.workflow = null;
@@ -1206,16 +1213,127 @@ describe("report_completion — FR-5 cd-ledger derived follow-ups (amendment A3)
     expect(h.created).toHaveLength(1);
   });
 
-  it("is not read at all for an ordinary dev completion, and never fatal when it is", async () => {
+  it("is not read at all for an ordinary dev completion, and an ABSENT one is not fatal", async () => {
     // No outcome and no merge commit ⇒ no ship claim ⇒ no reason to pay the GET.
     await report({ pr_url: PR_URL });
     expect(h.gets.map((g) => g.Key)).not.toContain(CD_LEDGER_KEY);
 
-    // An unreadable ledger contributes nothing and refuses nothing.
+    // A ledger that provably does not exist (NoSuchKey) is a DEFINITE negative: it
+    // contributes nothing and refuses nothing. TEAM-4754 splits this from the other
+    // half — an unreadable one now refuses; see the block below.
     h.puts.length = 0;
     const res = result(await report({ merge_commit: MERGE_COMMIT, pr_url: PR_URL }));
     expect(res.status).toBe("complete");
     expect("followUps" in record()).toBe(false);
+  });
+});
+
+// ─── TEAM-4754: an UNREADABLE cd-ledger refuses the ship report ────────────────
+//
+// The same defect N2 fixes, one read earlier. `readCdLedger` returned `null` for
+// both "there is no ledger" and "we could not read it", and `ledgerFollowUps(null)`
+// is `[]` — so an AccessDenied or a truncated body made FR-5's console/IAM handoffs
+// and its unmerged-to-main fix evaporate while the CD ticket closed green.
+//
+// It takes D1's shape, not N2's, and the reason is ordering: this read is BEFORE
+// the S3 write, so nothing durable exists yet and refuse-and-retry costs nothing.
+describe("report_completion — cd_ledger_unreadable (three-outcome ledger read)", () => {
+  const failGet = (name, extra = {}) => {
+    const err = new Error(`${name} on the ledger`);
+    err.name = name;
+    Object.assign(err, extra);
+    h.getError = { key: CD_LEDGER_KEY, err };
+  };
+  const shipReport = (extra) => report({
+    outcome: "shipped", merge_commit: MERGE_COMMIT, pipeline_execution_id: EXEC_ID, pipeline_name: PIPELINE, ...extra,
+  });
+
+  for (const [label, name, extra] of [
+    ["AccessDenied", "AccessDenied", {}],
+    ["a 503", "ServiceUnavailable", { $metadata: { httpStatusCode: 503 } }],
+  ]) {
+    it(`refuses on ${label}: nothing recorded, nothing transitioned, nothing announced`, async () => {
+      // DL-030 has to pass FIRST, or this would be asserting the wrong refusal.
+      h.objects.set(CD_LEDGER_KEY, JSON.stringify({ execution_id: EXEC_ID }));
+      failGet(name, extra);
+      const r = result(await shipReport({}));
+      expect(r.ok).toBe(false);
+      expect(r.reason).toBe("cd_ledger_unreadable");
+      expect(r.missing).toEqual([]);
+      expect(r.message).toMatch(/could not be read/);
+      expect(r.message).toMatch(/Nothing was recorded and the ticket was NOT transitioned\. Retry the call\./);
+      expect(wroteRecord()).toBe(false);
+      expect(transitioned()).toBe(false);
+      expect(events("delivery.prState")).toHaveLength(0);
+      // It refuses BEFORE the ticket read, so a refusal costs one GET and nothing else.
+      expect(calls("Tickets___get_issue")).toHaveLength(0);
+      expect(h.created).toHaveLength(0);
+      expect(h.warns.join("\n")).toMatch(/cd-ledger body .* was UNREADABLE/);
+      expect(h.warns.join("\n")).toMatch(/REFUSED TEAM-4200: cd_ledger_unreadable/);
+    });
+  }
+
+  it("refuses on a body that is present but not JSON — a body we cannot parse is a body we did not read", async () => {
+    h.objects.set(CD_LEDGER_KEY, "{ this is truncated");
+    const r = result(await shipReport({}));
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBe("cd_ledger_unreadable");
+    expect(wroteRecord()).toBe(false);
+    expect(transitioned()).toBe(false);
+  });
+
+  it("a DEFINITE NoSuchKey proceeds exactly as before", async () => {
+    // The whole point of three outcomes: only this one licenses proceeding.
+    h.siblings.push(CD);
+    const r = result(await shipReport({}));
+    expect(r.status).toBe("complete");
+    expect(wroteRecord()).toBe(true);
+    expect(transitioned()).toBe(true);
+    expect("followUps" in record()).toBe(false);
+  });
+
+  it("a readable ledger still contributes its follow-ups", async () => {
+    h.siblings.push(CD);
+    h.objects.set(CD_LEDGER_KEY, JSON.stringify({ handoff: ["Enable the flag in the console"] }));
+    const r = result(await shipReport({}));
+    expect(r.status).toBe("complete");
+    expect(record().followUps).toHaveLength(1);
+    expect(h.created).toHaveLength(1);
+  });
+
+  it("an ordinary dev completion is UNAFFECTED — only a ship-shaped report pays", async () => {
+    // The gate is `report.outcome || report.merge_commit`, so a dev completion never
+    // reads the ledger and therefore cannot be refused by a ledger it never touched.
+    failGet("AccessDenied");
+    const r = result(await report({ pr_url: PR_URL }));
+    expect(r.status).toBe("complete");
+    expect(wroteRecord()).toBe(true);
+    expect(transitioned()).toBe(true);
+    expect(h.gets.map((g) => g.Key)).not.toContain(CD_LEDGER_KEY);
+  });
+
+  it("sits with the other pre-write refusals: DL-030 still refuses FIRST", async () => {
+    // Ordering matters because both are pre-write: a ship claim missing its execution
+    // id must report THAT, not a ledger problem it never got far enough to have.
+    // `pipeline_name` with no execution id is the case DL-030 refuses outright (a
+    // named pipeline cannot be the legacy DEPLOY.md path).
+    failGet("AccessDenied");
+    const r = result(await report({ outcome: "shipped", merge_commit: MERGE_COMMIT, pipeline_name: PIPELINE }));
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBe("shipped_requires_execution_and_merge_commit");
+    // The ledger body is never even fetched, so the refusal costs nothing extra.
+    expect(h.gets.map((g) => g.Key)).not.toContain(CD_LEDGER_KEY);
+  });
+
+  it("refuses BEFORE mainFixRefusal, which is the next pre-write gate", async () => {
+    // Both refuse before anything durable; this one is first because it is the one
+    // that already spent its read. A base_branch=main ticket with no PR would be
+    // refused by FR-5 — but the ledger failure is what the agent must retry.
+    h.issue = ticketRow({ key: "TEAM-4200", description: "base_branch: main" });
+    failGet("AccessDenied");
+    const r = result(await shipReport({ pr_url: "" }));
+    expect(r.reason).toBe("cd_ledger_unreadable");
+    expect(wroteRecord()).toBe(false);
   });
 });
 
