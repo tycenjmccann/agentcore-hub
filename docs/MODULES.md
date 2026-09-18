@@ -359,9 +359,10 @@ Lambda's 4KB env budget.
 > `deploy/workflow-manager/deploy.sh` additionally sets `ARTIFACT_BUCKET` on the
 > analyzer (without it no attempt can be dated from the cd-ledger, so every fix
 > reads as "nothing shipped") and creates the `agentcore-hub-si-verify-daily` rule.
-> Re-running `node deploy/workflow-manager/setup-workflow-manager.mjs` is also what
-> teaches the harness SI-VERIFY mode — the daily rule fires a prompt the old system
-> prompt does not recognise, so run it before enabling the rule.
+> The harness's SI-VERIFY mode is *not* a handoff step — `system-prompt.md` is a CD
+> harness surface, so the Deploy stage re-runs `setup-workflow-manager.mjs` itself
+> whenever that file changes; the hand-set part is only the harness `SI_LEDGER_TABLE`
+> env var, which CD never touches.
 
 ---
 
