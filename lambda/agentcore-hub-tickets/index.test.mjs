@@ -1561,8 +1561,8 @@ describe("create_ticket — gate-loop seam, DynamoDB-side (TEAM-4739)", () => {
     h.state.items[EPIC] = { ticketId: EPIC, type: "epic", workflowId: "wf_1", labels: [] };
   });
 
-  it("refuses the third, and mints NO ticket id", async () => {
-    h.state.siblings.push(priorRow("TEAM-800"), priorRow("TEAM-810"));
+  it("refuses the SECOND, and mints NO ticket id", async () => {
+    h.state.siblings.push(priorRow("TEAM-800"));
 
     const res = await create({ summary: "CI is unavailable", labels: CI_GATE, parent_key: EPIC });
 
@@ -1571,15 +1571,40 @@ describe("create_ticket — gate-loop seam, DynamoDB-side (TEAM-4739)", () => {
     expect(h.state.counter, "the shared id counter is untouched").toBe(0);
     expect(h.state.labelUpdates[0].ExpressionAttributeValues[":label"]).toBe("gate:loop-broken");
     expect(h.state.events.map((e) => e.type)).toEqual(["workflow.blocked"]);
+    expect(h.state.events[0].detail.attempt, "the attempt being refused").toBe(2);
   });
 
   it("the __COUNTER__ row is never counted as a sibling", async () => {
     // It lives in the same table and would otherwise be mapped into the verdict as
     // a labelless row — harmless for a targeted gate, but it must not be there.
-    h.state.siblings.push({ ticketId: "__COUNTER__", nextNum: 42 }, priorRow("TEAM-800"));
+    // Seeded ALONE: since TEAM-4780 a single real prior legitimately refuses, so
+    // pairing it with one would stop testing what this row names.
+    h.state.siblings.push({ ticketId: "__COUNTER__", nextNum: 42 });
     const res = await create({ summary: "CI is unavailable", labels: CI_GATE, parent_key: EPIC });
     expect(res.ok).not.toBe(false);
     expect(h.state.puts).toHaveLength(1);
+  });
+
+  it("REFUSES when the sibling scan fails — the scan is the verdict's only evidence", async () => {
+    // TEAM-4780. The same scan autowireOpenGate refuses on (TEAM-4752 D1), so it
+    // cannot have the opposite fail direction one seam earlier: a gate created over
+    // an unknown sibling set may be the very loop the breaker exists to stop.
+    h.state.queryThrows = true;
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { siblingScanRefusal } = await import("./index.mjs");
+
+    const res = await create({ summary: "CI is unavailable", labels: CI_GATE, parent_key: EPIC });
+
+    // The EXACT shared body — when this scan fails, the open-gate freeze state the
+    // refusal names is equally unknown, so there is one wording, not two.
+    expect(res.content[0].text).toBe(
+      `Error: ${siblingScanRefusal(EPIC, "Requested resource not found: parentId-index")}`
+    );
+    expect(h.state.puts, "nothing minted").toHaveLength(0);
+    expect(h.state.counter, "not even a ticket number").toBe(0);
+    expect(h.state.events, "and nothing claimed about a loop it could not see").toHaveLength(0);
+    expect(warn.mock.calls.flat().join(" ")).toContain("REFUSING the create");
+    warn.mockRestore();
   });
 
   it("an ordinary ticket makes no sibling scan and no probe", async () => {

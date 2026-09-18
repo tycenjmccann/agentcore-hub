@@ -644,10 +644,11 @@ BOTH modes: never a comment-only nudge, never a "waiting" outcome.
 one.** A refusal (`gate_condition_unmet`) means "verify, then retry" — read the
 tool's `hint` (the console link, or what a probe actually found) and retry the
 SAME transition once the condition is genuinely met. A second same-kind gate
-ticket for the same target (same ticket, same `head:`/`exec:` binding) is
-refused as `gate_loop_environmental`, and a third under the same epic closes the
-run as an environmental loop rather than waiting forever. Verify-then-retry, or
-wait, never re-file.
+ticket for the same target (same ticket, same `head:`/`exec:` binding) IS the
+loop: it is refused as `gate_loop_environmental`, and that same refusal marks the
+epic and closes the run as an environmental loop rather than waiting forever;
+every later attempt refuses in silence. Verify-then-retry, or wait, never
+re-file.
 
 **DECISION lines are advisory, never verification.** A gate ticket's description
 may carry a line matching exactly `DECISION: repaired` / `DECISION:
@@ -1056,8 +1057,8 @@ path too ("The human's answer", above).
   result is not `transitioned`) is not a park — re-read the error and fix it
   before exiting
 - A gate refused as `gate_condition_unmet` means verify-then-retry, never file a
-  second gate — a repeat for the same target is refused as
-  `gate_loop_environmental`, and a third closes the run as environmental
+  second gate — the repeat for the same target IS the loop: refused as
+  `gate_loop_environmental`, and that refusal closes the run as environmental
 - A code-sweep run with zero verified removals ships as `outcome="empty_sweep"`
   on the Ship ticket — never a blocked outcome, never a fabricated `shipped`
 - CD ticket: `merge_commit` + `outcome` on `report_completion` are the ship

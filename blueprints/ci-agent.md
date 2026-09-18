@@ -228,10 +228,11 @@ release manager's Merge Brief reads all three off your completion record.
 **CI is unavailable — file ONE `gate:ci-unavailable` gate, never proceed
 unproven, never a second one for the same head.** Before creating it,
 `Tickets___list_tickets` on your parent for an OPEN ticket carrying the SAME
-`head:<40hex>` label — that ticket IS the gate; adopt it, park on it again. A
-repeat attempt for the same head is refused as `gate_loop_environmental`, and a
-third under the same epic closes the run as an environmental loop (DL-031) — so
-never file a second one yourself either. Otherwise:
+`head:<40hex>` label — that ticket IS the gate; adopt it, park on it again. The
+repeat attempt IS the loop: it is refused as `gate_loop_environmental`, and that
+same refusal marks the epic and pages the run once as an environmental loop
+(DL-031); every later attempt refuses in silence — so never file a second one
+yourself. Otherwise:
 - title: `CI unavailable: <one line reason>` (≤80 chars — no SHA in the title,
   detail goes in the description)
 - assignee: `human:engineer`

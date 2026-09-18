@@ -20,11 +20,12 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
  *                       and the ticket carried no DECISION line.
  *                       ⇒ refused, and NO CI re-certification ticket is filed:
  *                         the remedy is to start the build.
- *   37ule1              the same gate re-filed a third time against the same kind,
- *                       blocked_by and head — the environmental loop.
+ *   37ule1              the same gate re-filed a SECOND time against the same kind,
+ *                       blocked_by and head — the environmental loop (FR-2: one
+ *                       prior already proves the re-file is not new work).
  *                       ⇒ gate_loop_environmental + ONE
- *                         workflow.blocked{reason:"environmental"}; the next
- *                         attempt refuses identically and emits nothing.
+ *                         workflow.blocked{reason:"environmental", attempt:2}; every
+ *                         later attempt refuses identically and emits nothing.
  */
 
 const h = vi.hoisted(() => ({
@@ -323,21 +324,28 @@ describe("replay 37ule1 — the same gate re-filed against the same target", () 
   });
 
   it("the attempt that trips the loop refuses and pages the run exactly once", async () => {
-    // Two of these already exist against the same kind + head + blocked_by; the
-    // one being filed now is the third.
-    h.state.siblings.push(prior("TEAM-4650"), prior("TEAM-4652"));
+    // ONE of these already exists against the same kind + head + blocked_by, so the
+    // one being filed now is the second — the loop (FR-2). The prior is still open
+    // and still the ticket to work.
+    h.state.siblings.push(prior("TEAM-4650"));
 
     const res = await refile();
 
     expect(res).toMatchObject({ ok: false, reason: "gate_loop_environmental", existingTicketId: "TEAM-4650" });
-    expect(h.state.puts, "no third gate ticket").toHaveLength(0);
+    expect(h.state.puts, "no second gate ticket").toHaveLength(0);
     expect(h.state.counter, "and no id burned").toBe(0);
     // The marker goes on the EPIC, and the conditional add is the event dedupe.
     expect(h.state.labelUpdates.map((u) => u.Key.ticketId)).toEqual([EPIC]);
     expect(h.state.labelUpdates[0].ExpressionAttributeValues[":label"]).toBe("gate:loop-broken");
     expect(h.state.events).toHaveLength(1);
     expect(h.state.events[0].type).toBe("workflow.blocked");
-    expect(h.state.events[0].detail).toMatchObject({ reason: "environmental", gateKind: "ci-unavailable", head: HEAD });
+    expect(h.state.events[0].detail).toMatchObject({
+      reason: "environmental",
+      gateKind: "ci-unavailable",
+      head: HEAD,
+      // The attempt being refused: one prior + this one.
+      attempt: 2,
+    });
     expect(h.state.events[0].workflowId, "run id off the EPIC row").toBe("37ule1");
   });
 
@@ -353,23 +361,13 @@ describe("replay 37ule1 — the same gate re-filed against the same target", () 
     expect(h.state.events, "no second workflow.blocked").toHaveLength(0);
   });
 
-  it("the FIRST re-file is legitimate work and is created normally", async () => {
-    // One prior gate is a retry, not a loop: the breaker trips at the third.
-    h.state.siblings.push(prior("TEAM-4650"));
-
-    const res = await refile();
-
-    expect(res.ok).not.toBe(false);
-    expect(h.state.puts).toHaveLength(1);
-    expect(h.state.events).toHaveLength(0);
-  });
-
   it("a DIFFERENT target under the same epic is not the same loop", async () => {
     const otherHead = "c".repeat(40);
-    h.state.siblings.push(
-      { ticketId: "TEAM-4650", labels: ["gate-ci-unavailable", `head-${otherHead}`], blockedBy: ["TEAM-4699"] },
-      { ticketId: "TEAM-4652", labels: ["gate-ci-unavailable", `head-${otherHead}`], blockedBy: ["TEAM-4699"] }
-    );
+    h.state.siblings.push({
+      ticketId: "TEAM-4650",
+      labels: ["gate-ci-unavailable", `head-${otherHead}`],
+      blockedBy: ["TEAM-4699"],
+    });
 
     const res = await refile();
 

@@ -564,17 +564,24 @@ function planGateLabelOps(labels, verification) {
 }
 
 /**
- * Refuse a THIRD gate ticket of the same kind against the same target under one
+ * Refuse a SECOND gate ticket of the same kind against the same target under one
  * epic — the environmental loop that has an agent re-filing "CI is unavailable"
- * forever instead of starting a build.
+ * forever instead of starting a build. FR-2: one prior of the same triple already
+ * proves the re-file is the same environmental gate restated, not new work.
  *
  * Narrowed to PROBED_GATE_KINDS: a `gate:approval` human escalation is deliberately
  * RE-FILED when a round cap trips, so counting those as a loop would break the one
  * escalation path the system has.
  *
- * FAILS OPEN in every direction — an unreadable epic, an unlabelable epic, an
- * unwritable event — because a loop breaker that blocks ticket creation whenever it
- * cannot read is a wedge, not a guard.
+ * TWO fail directions, and the split is the point:
+ *   - the SIBLING SCAN fails CLOSED — a scan failure REFUSES before anything is
+ *     minted, exactly as autowireOpenGate does with the same scan (TEAM-4752 D1),
+ *     because a gate created over an unknown sibling set may be the very loop this
+ *     breaker exists to stop. Refusing costs one retry; creating costs another gate
+ *     ticket nobody will notice.
+ *   - the epic READ, the epic LABEL and the EVENT stay best-effort and fail open.
+ *     They are the PAGE, not the verdict: an unreadable epic must not turn a proven
+ *     loop into a created ticket.
  *
  * @returns {Promise<Error|null>} the Error to throw from createTicket, or null
  */
@@ -582,36 +589,43 @@ async function refuseGateLoop({ labels, blockedBy, parentId }) {
   const gateKind = probedGateKindOf(labels);
   if (!gateKind || !parentId || !TICKET_KEY_RE.test(String(parentId))) return null;
 
+  // ONE sibling scan per create, shared with autowireOpenGate below. Its maxResults
+  // is deliberately the same 50 that autowireOpenGate reads: one scan, one bound,
+  // one fail direction.
   let siblings = [];
-  let epicLabels = [];
   try {
-    // `issuelinks` is requested explicitly: listTickets' lean field set returns no
-    // blockedBy at all, and blocked_by overlap is one of the three ways
-    // gateLoopVerdict recognizes the same target.
-    const [kids, epic] = await Promise.all([
-      jiraSearch(`parent = ${parentId} ORDER BY created ASC`, ["summary", "status", "labels", "issuelinks"], 100),
-      jiraFetch(`/rest/api/3/issue/${parentId}?fields=labels`),
-    ]);
-    siblings = (kids?.issues || [])
-      .map(mapIssue)
-      .map((t) => ({ id: t.ticketId, labels: t.labels, blockedBy: t.blockedBy }));
-    epicLabels = epic?.fields?.labels || [];
+    siblings = await scanSiblingTickets(parentId);
   } catch (err) {
     console.warn(
-      `[agentcore-hub-jira] could not scan ${parentId} for a gate loop, creating normally — ${err?.name}`
+      `[agentcore-hub-jira] gate-loop sibling scan failed for parent ${parentId} ` +
+        `(REFUSING the create): ${err.message}`
     );
-    return null;
+    return new Error(siblingScanRefusal(parentId, err.message));
   }
 
   const head = gateHeadOf(labels);
   const verdict = gateLoopVerdict(siblings, { gateKind, blockedBy, head });
   if (!verdict.loop) return null;
 
+  // Only now is the epic worth reading — it carries the marker (the event dedupe)
+  // and, in its labels, the workflowId the event needs (SEC-16: off the EPIC, never
+  // a caller argument). `null` means COULD NOT TELL, which is not "not yet marked":
+  // an unreadable epic skips both the label and the page, and still refuses.
+  let epicLabels = null;
+  try {
+    const epic = await jiraFetch(`/rest/api/3/issue/${parentId}?fields=labels`);
+    epicLabels = epic?.fields?.labels || [];
+  } catch (err) {
+    console.warn(`[agentcore-hub-jira] could not read epic ${parentId} — ${err?.name}`);
+  }
+
   // The epic carries the marker, and its ABSENCE in the read above is the event
   // dedupe (same before/after rule as repageGate — Jira's `add` reports nothing).
-  // The 3rd attempt pages; the 4th and every later one refuses with the same
+  // The 2nd attempt pages; the 3rd and every later one refuses with the same
   // payload and emits nothing.
-  const alreadyBroken = epicLabels.some((l) => GATE_LOOP_BROKEN_RE.test(String(l ?? "").trim().toLowerCase()));
+  const alreadyBroken =
+    epicLabels === null ||
+    epicLabels.some((l) => GATE_LOOP_BROKEN_RE.test(String(l ?? "").trim().toLowerCase()));
   let newlyBroken = false;
   if (!alreadyBroken) {
     try {
@@ -624,14 +638,15 @@ async function refuseGateLoop({ labels, blockedBy, parentId }) {
 
   const refusal = gateLoopRefusal({ gateKind, verdict, epicId: parentId });
   if (newlyBroken) {
-    // SEC-16: workflowId off the EPIC's own labels. `attempt` is how many of these
-    // already exist (2 at GATE_LOOP_THRESHOLD), not a counter of our own.
+    // `attempt` is the number of THIS attempt — priors + this one, so 2 at the
+    // threshold. Not a counter of our own: nothing here is stateful enough to keep
+    // one, and later attempts emit nothing at all.
     await publishJourneyEvent(eventsClient(), EVENTS_TABLE, gateWorkflowIdOf(epicLabels), "workflow.blocked", {
       reason: "environmental",
       gateKind,
       blockedByTicketId: refusal.payload.existingTicketId,
       head: head || "",
-      attempt: verdict.priorCount,
+      attempt: verdict.priorCount + 1,
     });
   }
   const err = new Error(refusal.message);
@@ -1013,16 +1028,20 @@ function isSettled(status) {
  * Siblings under `parent_key`, normalized to the shape both twins' predicates
  * read. `parent` is interpolated into JQL, so it is shape-checked first (F6's
  * rule: never interpolate anything that has not been proved to be a ticket key) —
- * a bad key throws, and autowireOpenGate's fail-open catch turns that into an
- * unfrozen create. Labels are requested explicitly because the gate predicate is
- * defined in terms of them.
+ * a bad key throws, and BOTH callers turn that into a refused create. Labels are
+ * requested explicitly because the gate predicate is defined in terms of them.
+ *
+ * TEAM-4780: `issuelinks` is requested and `blockedBy` carried too, because
+ * refuseGateLoop shares this scan and blocked_by overlap is one of the three ways
+ * gateLoopVerdict recognizes the same target. Additive — none of the freeze
+ * predicates read it.
  */
 async function scanSiblingTickets(parentKey) {
   const key = String(parentKey || "");
   if (!TICKET_KEY_RE.test(key)) throw new Error(`not a ticket key: ${JSON.stringify(key)}`);
   const search = await jiraSearch(
     `parent = ${key} ORDER BY created ASC`,
-    ["summary", "status", "labels", "assignee", "issuetype", "created"],
+    ["summary", "status", "labels", "assignee", "issuetype", "created", "issuelinks"],
     50
   );
   return (search?.issues || []).map((iss) => {
@@ -1034,6 +1053,7 @@ async function scanSiblingTickets(parentKey) {
       title: String(iss.fields?.summary || ""),
       status: mapStatusToInternal(iss.fields?.status?.name || ""),
       labels,
+      blockedBy: blockedByOfFields(iss.fields) || [],
       // This twin carries the assignee as a label; reconstruct the internal form
       // (`human:<who>` / `<agentId>`) so the shared predicates read identically.
       assignee: agentLabel
@@ -1288,9 +1308,11 @@ async function createTicket(params) {
   // refused whether or not the dedupe read succeeded.
   const userLabels = sanitizeUserLabels(labels, { spawnedBy: spawn.value, assignee });
 
-  // Two gate seams, in order. Both FAIL OPEN (an unreadable epic or an unreachable
-  // probe creates the ticket) for the same reason the → done guard admits on
+  // Two gate seams, in order. An unreachable PROBE creates the ticket, and so does
+  // an unreadable epic, for the same reason the → done guard admits on
   // indeterminate: a creation wall that trips whenever a read fails is a wedge.
+  // A failed SIBLING SCAN is the exception (TEAM-4780): it is the loop verdict's
+  // only evidence, and it is the same scan autowireOpenGate refuses on below.
   const loopRefusal = await refuseGateLoop({
     labels: userLabels.labels,
     blockedBy: blocked_by,
@@ -2085,6 +2107,24 @@ const BLOCK_NODES = new Set([
   "codeBlock",
 ]);
 
+/**
+ * "is blocked by" = inward side of a Blocks link. Only present when the caller
+ * requested `issuelinks` (getIssue does; the lean list field set does not) —
+ * `undefined` then means "not asked for", which is NOT the same as "none", and the
+ * difference is what keeps mapIssue from inventing an empty blockedBy.
+ *
+ * One rule, two readers (mapIssue and scanSiblingTickets): the gate-loop verdict
+ * matches on blocked_by overlap, so a second copy of this filter would be a second
+ * definition of "same target".
+ */
+function blockedByOfFields(fields) {
+  return Array.isArray(fields?.issuelinks)
+    ? fields.issuelinks
+        .filter((l) => l?.type?.name === "Blocks" && l.inwardIssue?.key)
+        .map((l) => l.inwardIssue.key)
+    : undefined;
+}
+
 function mapIssue(issue) {
   const fields = issue.fields || {};
   const labels = fields.labels || [];
@@ -2100,14 +2140,7 @@ function mapIssue(issue) {
     ? `human:${reviewerLabel.replace("reviewer:", "")}`
     : fields.assignee?.displayName || null;
 
-  // "is blocked by" = inward side of a Blocks link. Only present when the caller
-  // requested `issuelinks` (getIssue does; list/search keep their lean field set
-  // and return no blockedBy rather than an empty one).
-  const blockedBy = Array.isArray(fields.issuelinks)
-    ? fields.issuelinks
-        .filter((l) => l?.type?.name === "Blocks" && l.inwardIssue?.key)
-        .map((l) => l.inwardIssue.key)
-    : undefined;
+  const blockedBy = blockedByOfFields(fields);
 
   return {
     ticketId: issue.key,

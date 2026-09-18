@@ -176,7 +176,7 @@ describe("consoleApprovalUrl", () => {
   });
 });
 
-describe("gateLoopVerdict — the third gate of a kind against one target", () => {
+describe("gateLoopVerdict — the second gate of a kind against one target", () => {
   const SHA = "c".repeat(40);
   const prior = (id: string, extra: Record<string, unknown> = {}) => ({
     id,
@@ -184,7 +184,7 @@ describe("gateLoopVerdict — the third gate of a kind against one target", () =
     ...extra,
   });
 
-  it("admits the first and second, refuses the third", () => {
+  it("admits the first, refuses the second (FR-2 — one prior IS the loop)", () => {
     const opts = { gateKind: "ci-unavailable", head: SHA };
     expect(agree("none", (m) => m.gateLoopVerdict([], opts))).toEqual({
       loop: false,
@@ -193,10 +193,10 @@ describe("gateLoopVerdict — the third gate of a kind against one target", () =
       reason: null,
     });
     expect(agree("one prior", (m) => m.gateLoopVerdict([prior("T-1")], opts))).toEqual({
-      loop: false,
+      loop: true,
       priorCount: 1,
       priors: ["T-1"],
-      reason: null,
+      reason: "gate_loop_environmental",
     });
     expect(agree("two priors", (m) => m.gateLoopVerdict([prior("T-1"), prior("T-2")], opts))).toEqual(
       { loop: true, priorCount: 2, priors: ["T-1", "T-2"], reason: "gate_loop_environmental" }
@@ -256,8 +256,8 @@ describe("gateLoopVerdict — the third gate of a kind against one target", () =
     });
   });
 
-  it("the threshold itself agrees (the 3rd attempt refuses)", () => {
-    expect(agree("GATE_LOOP_THRESHOLD", (m) => m.GATE_LOOP_THRESHOLD)).toBe(2);
+  it("the threshold itself agrees (the 2nd attempt refuses)", () => {
+    expect(agree("GATE_LOOP_THRESHOLD", (m) => m.GATE_LOOP_THRESHOLD)).toBe(1);
   });
 });
 
