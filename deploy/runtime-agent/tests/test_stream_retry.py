@@ -27,6 +27,10 @@ What is pinned here:
      discard the tool results already produced). Asserted as history SHAPE below,
      because "one copy of the prompt, roles alternating, a user message last" is
      what Bedrock actually requires.
+  2b. TEAM-4749 A3 — the wall budget bounds RETRY time, armed at the FIRST
+     failure. Armed at the top of the turn it was already spent by the time a long
+     turn broke, so every break past minute 1 gave up on attempt 1 and FR-6 never
+     fired on the only turns long enough to need it.
   3. `agent.error` is published exactly once, only after the retries are
      exhausted (or immediately for a deterministic error), and never on a turn
      that recovered. `agent.died` is never published on this path — the two are
@@ -438,7 +442,13 @@ async def test_the_attempt_cap_stops_an_endlessly_broken_stream() -> None:
 @pytest.mark.asyncio
 async def test_an_exhausted_wall_budget_stops_before_the_attempt_cap() -> None:
     """The budget is the real bound: 3 attempts against a 30-second stall would
-    hold the claim for 90 seconds, so a blown budget gives up on attempt 1."""
+    hold the claim for 90 seconds, so a spent budget gives up on attempt 1.
+
+    Still true after TEAM-4749 A3 moved the arming point into the failure handler,
+    but for a different reason: a 0.0 budget now means "no retry time is allowed at
+    all" rather than "the turn already consumed it", and `remaining <= 0` fires on
+    the first failure either way. The 60s-of-real-retrying case that A3 actually
+    changed is `test_the_budget_still_exhausts_after_60s_of_retrying` below."""
     ns, agent_cls, errors, deaths = _load([[EventStreamError("stream closed")]])
     ns["_STREAM_RETRY_BUDGET_S"] = 0.0
 
@@ -606,3 +616,89 @@ async def test_retry_resends_the_prompt_if_it_never_reached_history() -> None:
     assert _prompt_copies(agent, PAYLOAD["prompt"]) == 1
     assert _deltas(frames) == ["second try"]
     assert errors == [] and deaths == []
+
+
+# ─── 5. TEAM-4749 A3: the budget clocks from the first failure ────────────────
+#
+# A scripted `monotonic` rather than real sleeping: the behaviour under test is
+# arithmetic on a clock, and waiting 400 real seconds to assert it would be a
+# test nobody runs. `time.time`/`strftime`/`gmtime` stay REAL — the event-id
+# stamper in the shipped source uses them and does not care about our fiction.
+
+
+def _scripted_clock(readings: list[float]):
+    """A `time` stand-in whose `monotonic` walks a script and then holds its last
+    value, so an extra reading cannot make the test fail as an IndexError."""
+    import time as _real_time
+
+    state = {"i": 0}
+
+    def monotonic() -> float:
+        i = state["i"]
+        state["i"] = min(i + 1, len(readings) - 1)
+        return readings[i]
+
+    return SimpleNamespace(
+        monotonic=monotonic,
+        time=_real_time.time,
+        strftime=_real_time.strftime,
+        gmtime=_real_time.gmtime,
+        sleep=lambda *_a: None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_failure_after_five_minutes_is_still_retried() -> None:
+    """The A3 defect. The budget was armed before the retry loop, so it measured
+    STREAM duration: a persona turn that ran 400s and then hit one transient break
+    arrived with `remaining` already negative and gave up on attempt 1. Since every
+    persona turn is long, FR-6 effectively never retried in production."""
+    # Readings: the deadline arm and the `remaining` read on each failure, all at
+    # t=400s and later — a clock that has already run far past the old 60s budget.
+    clock = _scripted_clock([400.0, 400.0, 400.1, 400.2, 400.3, 400.4, 400.5])
+    ns, agent_cls, errors, deaths = _load(
+        [
+            [{"data": "a"}, EventStreamError("stream closed")],
+            [ThrottlingException("Too many requests")],
+            [{"data": "b"}, _engage_completion],
+        ],
+        time=clock,
+    )
+
+    frames = [f async for f in ns["_run_agent_invocation"](PAYLOAD, CTX)]
+    (agent,) = agent_cls.instances
+
+    assert agent.attempts == 3, (
+        "a break 400s into a turn must still get its retries — the budget bounds "
+        f"RETRY time, not stream time; got {agent.attempts} attempt(s)"
+    )
+    assert agent.prompts == [PAYLOAD["prompt"], [], []]
+    _assert_valid_history(agent)
+    assert _deltas(frames) == ["a", "b"]
+    assert errors == [], "a turn that recovered on the third attempt is not an error"
+    assert deaths == []
+
+
+@pytest.mark.asyncio
+async def test_the_budget_still_exhausts_after_60s_of_retrying() -> None:
+    """The other half of A3: arming later must not make the budget unbounded. 61
+    seconds of ACTUAL retrying still stops before the attempt cap — which no
+    existing test covered, because the old clock could never get there."""
+    # Arm at t=1000, then the next failure reads a clock 61s later: past budget.
+    clock = _scripted_clock([1000.0, 1000.0, 1061.0, 1061.0, 1062.0])
+    ns, agent_cls, errors, deaths = _load(
+        [[EventStreamError("stream closed")]], time=clock
+    )
+
+    with pytest.raises(EventStreamError):
+        async for _ in ns["_run_agent_invocation"](PAYLOAD, CTX):
+            pass
+
+    (agent,) = agent_cls.instances
+    assert agent.attempts == 2, (
+        "60s of retrying is the bound; the cap of 3 must not be reached here — "
+        f"got {agent.attempts}"
+    )
+    assert agent.attempts < ns["_STREAM_RETRY_MAX_ATTEMPTS"]
+    assert len(errors) == 1, f"exactly one agent.error from the budget branch; got {errors}"
+    assert deaths == []

@@ -3968,7 +3968,10 @@ def _publish_agent_died(workflow_id: str, agent_id: str, ticket_id: str = "",
 # conversation, the tool results already returned and the prompt cache all
 # survive; nothing is rebuilt and the prompt is never re-derived. It is also never
 # re-SENT: a retry passes `[]` so the vendored conversation manager appends no
-# second copy of the prompt (TEAM-4749 A2, see `_stream_with_retry`).
+# second copy of the prompt (TEAM-4749 A2, see `_stream_with_retry`). The wall
+# budget below bounds retry time and is armed at the first failure, not at the top
+# of the turn — a 40-minute turn must not arrive at its first break with the
+# budget already spent.
 _STREAM_RETRY_MAX_ATTEMPTS = 3
 _STREAM_RETRY_BUDGET_S = 60.0
 _STREAM_RETRY_BASE_S = 1.0
@@ -4394,7 +4397,7 @@ async def _run_agent_invocation(payload, context):
             as `agent.error` and re-raised, which is what keeps agent.error and
             agent.died disjoint."""
             attempt = 0
-            deadline = time.monotonic() + _STREAM_RETRY_BUDGET_S
+            deadline = None  # A3: armed at the FIRST failure, not here
             baseline = len(getattr(agent, "messages", None) or [])
             while True:
                 attempt += 1
@@ -4419,6 +4422,13 @@ async def _run_agent_invocation(payload, context):
                     return
                 except Exception as exc:  # noqa: BLE001 — classified below
                     verdict = _classify_stream_error(exc)
+                    if deadline is None:
+                        # A3: the budget bounds RETRY time, not stream duration.
+                        # Armed before `while True` it was already spent by the
+                        # time a long turn broke, so every break past minute 1
+                        # gave up on attempt 1 and FR-6 never fired on the only
+                        # turns long enough to need it.
+                        deadline = time.monotonic() + _STREAM_RETRY_BUDGET_S
                     remaining = deadline - time.monotonic()
                     exhausted = (verdict != "retry"
                                  or attempt >= _STREAM_RETRY_MAX_ATTEMPTS
