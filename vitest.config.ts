@@ -245,9 +245,20 @@ export default defineConfig({
       // gate and wrote a ship-approval record for a deploy that never ran.
       // Replayed through the REAL pipeline-tools handler: the call is refused, the
       // blocker is returned in full, and neither the Start nor the PutObject
-      // happens. Plus the TEAM-4663 create_ticket payload shape (base_branch:
-      // "main") as a pure fixture — the twins own their own validation tests.
+      // happens.
       "lambda/orchestrator/replay-head-of-line.test.mjs",
+      // replay-base-branch-main (TEAM-4663) — the other half of run p5ogpg: a fix
+      // that had to land on main, filed while the merge gate was open, delivered
+      // onto the integration branch instead. Lives in the tickets twin because the
+      // chain starts there: the REAL twin's create_ticket records base_branch and
+      // states it in the description, and the REAL workflow-output report_completion
+      // reads it back out of that description (its get_issue returns no baseBranch
+      // field) and refuses a main fix with no PR to main before anything durable.
+      // Both modules in one process; only ddb/s3/lambda-invoke/fetch are mocked.
+      // Replaces the tautological fixture deleted from replay-head-of-line.
+      // (The jira half is lambda/agentcore-hub-jira/replay-base-branch-main.test.mjs,
+      // run by `node --test`; the twins' banner parity is asserted here.)
+      "lambda/agentcore-hub-tickets/replay-base-branch-main.test.mjs",
       // replay-empty-sweep (TEAM-4740 FR-10/FR-11) — run fz514x, the dead-code sweep
       // that found nothing: no diff, no PR, and four downstream tickets waiting for a
       // diff that would never exist. Drives the REAL workflow-output handler for both

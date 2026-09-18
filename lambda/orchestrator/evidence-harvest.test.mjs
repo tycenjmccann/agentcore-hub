@@ -283,6 +283,20 @@ describe("ship-verdict harvest — merge_commit / outcome / block_reason (TEAM-3
     expect(h.state.merges[0].fields.outcome).toBe("static-ci-only");
   });
 
+  it("TEAM-4763 P1-A: a handoff outcome is harvested, not dropped", async () => {
+    // The router-level half of the fix: report_completion has accepted
+    // outcome:"handoff" (with a mandatory pr_url, DL-030) since TEAM-4740, but this
+    // harvest admitted no such value — so the entry reached the ship gate with NO
+    // outcome and the run closed on the static-ci-only terminal phase.
+    harvest({ summary: "PR handed to the owning team.", outcome: "handoff", pr_url: "https://github.com/o/r/pull/7" });
+    await handleTicketDoneUnified(DONE);
+    expect(h.state.merges[0].fields.outcome).toBe("handoff");
+    expect(h.state.merges[0].fields.prUrl).toBe("https://github.com/o/r/pull/7");
+    // Handed off, not merged — nothing here may invent a merge commit.
+    expect(h.state.merges[0].fields.mergeCommit).toBeUndefined();
+    expect(h.state.workflow.agentTasks[DONE].outcome).toBe("handoff");
+  });
+
   it("an unrecognized outcome is DROPPED, not stored — the rest still harvests", async () => {
     // A garbage or future-schema outcome must not become a verdict the gate then
     // trusts; the

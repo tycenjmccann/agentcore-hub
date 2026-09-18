@@ -25,15 +25,20 @@ describe("ship outcome vocabulary — writer/reader parity (TEAM-4740 FR-10)", (
   /**
    * The FULL map, spelled out by hand on purpose: a blanket "is not undefined"
    * assertion would pass for a new outcome that silently fell into the wrong
-   * bucket. `handoff` maps to `null` legitimately — a handoff is neither shipped
-   * nor blocked, and evaluateShipVerdict reads the null as "no verdict claimed",
-   * which is exactly right for a PR left open for another team.
+   * bucket.
+   *
+   * TEAM-4763 P1-A — `handoff` maps to ITSELF, not to `null`. The old `null` here
+   * recorded the defect as a contract: evaluateShipVerdict reads a null verdict as
+   * SILENCE, not as "no verdict claimed", so a run that honestly handed its PR to
+   * another team was closed on the static-ci-only terminal phase. It is also not an
+   * alias for "shipped" — nothing merged, so deliveryRollUp must not derive
+   * prState "merged" for a PR that workflow-output's derivePrState calls "open".
    */
   const VERDICTS: Record<string, string | null> = {
     shipped: "shipped",
     "deploy-blocked": "deploy-blocked",
     "static-ci-only": "static-ci-only",
-    handoff: null,
+    handoff: "handoff",
     empty_sweep: "shipped",
   };
 

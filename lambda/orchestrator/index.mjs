@@ -44,7 +44,7 @@ import { createDetector } from "./dead-session-detector.mjs";
 import { createCascade } from "./cascade.mjs";
 import { createReconcileSweep } from "./reconcile-sweep.mjs";
 import { createReviewCap, parseDecision } from "./review-cap.mjs";
-import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, SHIP_PHASES, SHIP_BLOCKED_OUTCOMES, TERMINAL_WORKFLOW_PHASES } from "./completion.mjs";
+import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, deliveryRollUp, harvestableShipOutcome, SHIP_PHASES, TERMINAL_WORKFLOW_PHASES } from "./completion.mjs";
 import { isPipelineEnabled } from "./pipeline-enabled.mjs";
 import { CD_REGISTRY_KEY, EMPTY_CD_REGISTRY, parseCdRegistry, isCdRegistered, effectiveWorkflowDef, resolveDelivery, deliveryModeContext } from "./cd-registry.mjs";
 import { pickTicketSession, renderPriorSessionBlock, renderRejectionSessionHint } from "./coding-session-hint.mjs";
@@ -1310,11 +1310,13 @@ async function harvestCompletionEvidence(workflow, ticketId) {
     if (record.commit_sha && !entry?.commitSha) fields.commitSha = record.commit_sha;
     if (record.pr_url && !entry?.prUrl) fields.prUrl = record.pr_url;
     if (record.merge_commit && !entry?.mergeCommit) fields.mergeCommit = record.merge_commit;
-    if (typeof record.outcome === "string" && !entry?.outcome) {
-      const oc = record.outcome.trim().toLowerCase();
-      // empty_sweep must pass this filter or shipVerdictOf never sees it
-      // (TEAM-4739; the workflow-output SHIP_OUTCOMES half is TEAM-4740's).
-      if (SHIP_BLOCKED_OUTCOMES.includes(oc) || oc === "shipped" || oc === "empty_sweep") fields.outcome = oc;
+    if (!entry?.outcome) {
+      // The admitted set lives beside shipVerdictOf (TEAM-4763 P1-A) because what
+      // may be harvested and what it MEANS are one decision: they had drifted, and
+      // `handoff` — writable by report_completion since TEAM-4740 — was dropped
+      // here, so an honest handoff closed the run on the static-ci-only phase.
+      const oc = harvestableShipOutcome(record.outcome);
+      if (oc) fields.outcome = oc;
     }
     if (record.block_reason && !entry?.blockReason) {
       fields.blockReason = String(record.block_reason).slice(0, 500);
@@ -3321,6 +3323,11 @@ export async function completeWorkflow(workflow) {
     return;
   }
 
+  // The epic's children, read once and shared by the three gates below that need
+  // them (evidence, ship verdict, delivery roll-up) — each gate is conditional, so
+  // this stays null until the first one actually reads (TEAM-4763 P1-A).
+  let children = null;
+
   // TEAM-3686 Finding 3: deliverable-evidence gate — same semantics as the HTTP
   // complete route (TEAM-3619 D4a). Every done ticket in a completion-required
   // phase must have real work behind it (non-empty agentTasks output or an
@@ -3335,7 +3342,7 @@ export async function completeWorkflow(workflow) {
     const wfDef = getEffectiveWorkflowDef(workflow);
     const requiredPhases = wfDef.completionRequiresAgentPhases || [];
     if (requiredPhases.length > 0) {
-      const children = await getChildTickets(workflow.epicId);
+      children = await getChildTickets(workflow.epicId);
       const evidenceOpts = { getAgentPhase: (assignee) => getAgentDef(assignee)?.phase };
       let freshWf = await store.getWorkflow(workflow.id);
       let missing = missingEvidenceTickets(
@@ -3473,7 +3480,7 @@ export async function completeWorkflow(workflow) {
     const requiredPhases = wfDef.completionRequiresAgentPhases || [];
     const shipPhases = requiredPhases.filter((p) => SHIP_PHASES.has(p));
     if (shipPhases.length > 0) {
-      const children = await getChildTickets(workflow.epicId);
+      children = await getChildTickets(workflow.epicId);
       let freshWf = await store.getWorkflow(workflow.id);
       const shipOpts = { getAgentPhase: (assignee) => getAgentDef(assignee)?.phase };
       let verdict = evaluateShipVerdict(
@@ -3575,16 +3582,24 @@ export async function completeWorkflow(workflow) {
   // vs "merged + deployed" without re-deriving it from the registry later
   // (the registry can change after the fact). Best-effort.
   try {
-    // TEAM-4739: carry the ship record's own verdict through when the harvest
-    // found one (api_dev writes outcome/prState on the record) — otherwise an
-    // "empty_sweep" completion is indistinguishable from a merge on this row.
-    const ship = Object.values(workflow.agentTasks || {}).find((t) => t?.outcome) || {};
+    // TEAM-4763 P1-A: the outcome/prState half comes from deliveryRollUp, the ONE
+    // place that knows what `delivery.outcome`'s two-value union (types.ts) means —
+    // this used to spread the ship entry's RAW outcome, which put "empty_sweep" or
+    // "handoff" on a field neither value belongs to. A null `children` here would
+    // silently drop the roll-up's human-follow-up rule, so fetch it if no gate
+    // above did; still best-effort, still inside this catch.
+    if (!children) {
+      try {
+        children = await getChildTickets(workflow.epicId);
+      } catch (err) {
+        console.warn(`[orchestrator] ${workflow.id}: delivery roll-up children read failed: ${err.message}`);
+      }
+    }
     await store.setDelivery(workflow.id, {
       mode: delivery.mode,
       ...(delivery.pipeline ? { pipeline: delivery.pipeline } : {}),
       ...(prUrl ? { prUrl } : {}),
-      ...(ship.outcome ? { outcome: ship.outcome } : {}),
-      ...(ship.prState ? { prState: ship.prState } : {}),
+      ...deliveryRollUp(children || [], workflow.agentTasks || {}, { mode: delivery.mode }),
       at: completedAt,
     });
   } catch (err) {

@@ -1023,8 +1023,9 @@ async function scanSiblingTickets(parentKey) {
  * FR-5 create half: while a Merge Approval gate is open on this run, a NEW agent
  * ticket is frozen behind the run's CD ticket instead of being handed a branch the
  * merge is about to supersede. Returns the blockers to use, the banner to prepend,
- * and the `autowired` marker for the response — `{ blockedBy, banner, autowired }`
- * on every path, so the caller never has to distinguish absent from unknown.
+ * the `autowired` marker for the response, and the siblings it scanned —
+ * `{ blockedBy, banner, autowired, siblings }` on every path, so the caller never
+ * has to distinguish absent from unknown.
  *
  * FAIL DIRECTION — REFUSE THE CREATE (TEAM-4752 D1). It used to fail OPEN, on the
  * argument that an unfrozen ticket is recoverable while a ticket frozen behind a
@@ -1046,7 +1047,13 @@ async function scanSiblingTickets(parentKey) {
  */
 async function autowireOpenGate({ parent_key, assignee, blocked_by, ticketIdIfKnown }) {
   const blockers = Array.isArray(blocked_by) ? blocked_by : blocked_by ? [blocked_by] : [];
-  const untouched = { blockedBy: blockers, banner: "", autowired: null };
+  // TEAM-4763 P2: `siblings` rides on every non-refusing return so the root-blocker
+  // autowire below reuses THIS scan instead of issuing a second Query. The two
+  // pre-scan returns carry `[]`, which is honest — nothing was looked at — and both
+  // are cases the root autowire has to skip anyway (a parentless create has no
+  // siblings to wait for; a human gate is never frozen behind delivery work), so no
+  // path is left silently inert by the empty list.
+  const untouched = { blockedBy: blockers, banner: "", autowired: null, siblings: [] };
   if (!parent_key) return untouched;
   // A human gate is never frozen behind delivery work — it IS the decision the
   // delivery work is waiting on, so freezing it would deadlock the run.
@@ -1054,8 +1061,11 @@ async function autowireOpenGate({ parent_key, assignee, blocked_by, ticketIdIfKn
 
   try {
     const siblings = await scanSiblingTickets(parent_key);
+    // Every path below this line has looked, so every path below this line reports
+    // what it saw — `untouched` would say "we never scanned".
+    const scanned = { ...untouched, siblings };
     const gate = siblings.find(isOpenMergeGate);
-    if (!gate) return untouched;
+    if (!gate) return scanned;
 
     // The CD ticket: the non-human sibling the ship-phase predicate claims, newest
     // first (a re-run files a second one and the latest is the live one).
@@ -1068,14 +1078,15 @@ async function autowireOpenGate({ parent_key, assignee, blocked_by, ticketIdIfKn
     }
     candidates.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
     const cd = candidates[0];
-    if (!cd) return untouched;          // nothing to freeze behind
-    if (isSettled(cd.status)) return untouched;
-    if (blockers.includes(cd.ticketId)) return untouched;  // caller already ordered it
+    if (!cd) return scanned;            // nothing to freeze behind
+    if (isSettled(cd.status)) return scanned;
+    if (blockers.includes(cd.ticketId)) return scanned;    // caller already ordered it
 
     return {
       blockedBy: [...blockers, cd.ticketId],
       banner: gateFreezeBanner(cd.ticketId),
       autowired: { reason: "open_gate", blockedBy: [cd.ticketId], gateTicketId: gate.ticketId },
+      siblings,
     };
   } catch (err) {
     // TEAM-4752 D1: NOT `untouched` — that spelled "we looked and there is no
@@ -1086,6 +1097,78 @@ async function autowireOpenGate({ parent_key, assignee, blocked_by, ticketIdIfKn
     );
     return { ...untouched, scanFailed: true, error: err.message };
   }
+}
+
+// ─── TEAM-4763 P2 (FR-11 seam 7b) — the root blocker, at MINT time ────────────
+//
+// Byte-identical in both twins, from here to the end of autowireRootBlocker. Edit
+// the tickets copy, then mirror it into lambda/agentcore-hub-jira/index.mjs;
+// src/lib/workflow/root-blocker-parity.test.ts fails if the two ever disagree — it
+// compares both twins' OUTPUT over a shared roster matrix and both twins' SOURCE
+// byte for byte, which is why these two pure helpers are exported at all.
+
+/**
+ * The run's ROOT ticket: the earliest-created non-human sibling under the epic — in
+ * practice the analyst's own ticket, because the hub creates it first at run start.
+ *
+ * The same rule lambda/workflow-output/index.mjs findRootTicket applies at PLAN time
+ * (same non-human filter, same localeCompare sort, same fail-to-null), and that is
+ * the point: the two halves have to name the SAME ticket or a run's unblocked work
+ * waits for different things depending on when it was filed. The plan-time half only
+ * ever sees the batch an intake agent submitted in one call; this one sees every
+ * ticket minted after it.
+ */
+export function findRootTicket(siblings) {
+  const candidates = (siblings || []).filter((s) => !s.assignee.startsWith("human:"));
+  if (candidates.length === 0) return null;
+  const sorted = [...candidates].sort((a, b) => (a.createdAt && b.createdAt ? String(a.createdAt).localeCompare(String(b.createdAt)) : 0));
+  return sorted[0];
+}
+
+/**
+ * FR-11 create half (seam 7b): a ticket minted mid-run that names NO blocker waits
+ * for the run's root ticket instead of being dispatched the moment it lands.
+ *
+ * PURE — it consumes the siblings autowireOpenGate already scanned, so it costs no
+ * extra Query and has no failure mode of its own. That also settles the fail
+ * direction the ticket asked about: a scan that failed never reaches here, because
+ * autowireOpenGate returns `scanFailed` and createTicket REFUSES the create above
+ * (TEAM-4752 D1) rather than filing it unwired.
+ *
+ * Returns the same `{ blockedBy, banner, autowired }` shape as autowireOpenGate, and
+ * no banner: the DELIVERY CONSTRAINT banner says "a merge is about to supersede your
+ * branch", which is true of an open merge gate and of nothing else.
+ *
+ * Skipped, deliberately, when:
+ *   - the caller named a blocker — it already stated the ordering it wants;
+ *   - the assignee is `human:*` — a review gate is what work waits ON, not with;
+ *   - nothing was scanned (a parentless create, or the run's very first ticket);
+ *   - there is no non-human sibling, or the only one is this ticket itself;
+ *   - THE ROOT IS ALREADY OVER. This one is not in the ticket and is load-bearing:
+ *     by the time most mid-run tickets are minted the analyst's ticket is already
+ *     done, and filing `blocked` behind a finished blocker is a PERMANENT wedge —
+ *     nothing re-fires the unblock cascade for a ticket that was already over when
+ *     the edge appeared, and RECONCILE_SWEEP_MODE is off by default. Same guard and
+ *     same reasoning as autowireOpenGate's `isSettled(cd.status)` above, widened by
+ *     the two statuses isSettled leaves out on purpose: cascade.mjs resolves a
+ *     blocker on `done`/`cancelled` only, so a `skipped` root would wedge hardest of
+ *     all. Without this guard the feature would wedge nearly every create it touched.
+ */
+export function autowireRootBlocker({ assignee, blockedBy, siblings, ticketIdIfKnown }) {
+  const untouched = { blockedBy, banner: "", autowired: null };
+  if (blockedBy.length > 0) return untouched;
+  if (typeof assignee === "string" && assignee.startsWith("human:")) return untouched;
+  if (!siblings || siblings.length === 0) return untouched;
+  const root = findRootTicket(siblings);
+  if (!root) return untouched;
+  if (ticketIdIfKnown && root.ticketId === ticketIdIfKnown) return untouched;
+  if (isSettled(root.status) || root.status === "skipped" || root.status === "cancelled") return untouched;
+
+  return {
+    blockedBy: [root.ticketId],
+    banner: "",
+    autowired: { reason: "no_root_blocker", rootTicketId: root.ticketId, blockedBy: [root.ticketId] },
+  };
 }
 
 async function createTicket(args) {
@@ -1210,13 +1293,29 @@ async function createTicket(args) {
   // longer files the ticket unfrozen, because "we could not look" is not evidence
   // that no gate is open. Refused before nextTicketId, so a refusal does not even
   // consume a ticket number (the same discipline as validateBaseBranch above).
-  const autowire = await autowireOpenGate({
+  let autowire = await autowireOpenGate({
     parent_key,
     assignee,
     blocked_by,
     ticketIdIfKnown: null,
   });
   if (autowire.scanFailed) return textResult(`Error: ${siblingScanRefusal(parent_key, autowire.error)}`);
+
+  // TEAM-4763 P2 (FR-11 seam 7b): no gate froze this ticket and the caller named no
+  // blocker, so it waits for the run's ROOT ticket rather than being dispatched into
+  // a run whose first phase may still be running. Only when the open-gate half
+  // produced nothing, so the two can never both fire; pure, and it reuses the
+  // siblings that scan already returned. Reassigned rather than named separately
+  // because every consumer below — `blockers`, the banner, the plan.autowired event
+  // and the response key — is already generic over which autowire produced it.
+  if (!autowire.autowired) {
+    autowire = autowireRootBlocker({
+      assignee,
+      blockedBy: autowire.blockedBy,
+      siblings: autowire.siblings,
+      ticketIdIfKnown: null,
+    });
+  }
 
   const ticketId = await nextTicketId(project_key);
   const now = new Date().toISOString();

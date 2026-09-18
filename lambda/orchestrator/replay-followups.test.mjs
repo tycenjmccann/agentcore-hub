@@ -21,13 +21,16 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
  *
  *   TEAM-4660 — a fix ticket was created while the Merge Approval gate was open, so
  *     it was worked and pushed onto a branch the imminent merge superseded. The
- *     work had to WAIT for the CD ticket, and nothing said so.
+ *     work had to WAIT for the CD ticket, and nothing said so. Replayed a second
+ *     time (TEAM-4763 P1-A) as the same run delivered by HANDOFF: the release
+ *     manager reported the truth and the run was closed static-ci-only for it.
  *   15x8ql — the run shipped and a post-deploy re-check was recorded in prose. The
  *     epic closed green; nobody re-checked.
  *   syq0p9 — the cd-ledger carried three console/IAM steps only a human could do.
  *     Three separate asks in one person's queue for one sitting at one console.
  *   hirhfw — the REGRESSION: an ordinary completion that carries no follow-ups at
- *     all must produce the pre-change record plus exactly one key (`delivery`).
+ *     all must produce the pre-change record plus exactly three keys (`delivery`,
+ *     `followUpsPending`, `status`).
  */
 
 const h = vi.hoisted(() => ({
@@ -95,7 +98,9 @@ vi.mock("@aws-sdk/lib-dynamodb", () => ({
 
 process.env.ARTIFACT_BUCKET = "replay-bucket";
 const { handler } = await import("../workflow-output/index.mjs");
-const { isWorkflowComplete, deliveryRollUp, FOLLOWUP_TITLE_RE } = await import("./completion.mjs");
+const {
+  isWorkflowComplete, deliveryRollUp, evaluateShipVerdict, harvestableShipOutcome, shipVerdictOf, FOLLOWUP_TITLE_RE,
+} = await import("./completion.mjs");
 
 /** A DynamoDB-twin ticket row, the shape report_completion's reads normalize. */
 const row = ({ key, summary = "Work", assignee, status = "todo", parent, created, description = "" }) => ({
@@ -228,6 +233,92 @@ describe("TEAM-4660 — a fix created while the Merge Approval gate is open wait
   });
 });
 
+/**
+ * TEAM-4763 P1-A replay — the same run, delivered by HANDOFF instead of by merge.
+ *
+ * The release manager reported the truth (`outcome:"handoff"` + the PR the owning
+ * team will review, which DL-030 makes mandatory) and the run was closed RED on the
+ * static-ci-only terminal phase, because the reader admitted the value nowhere: the
+ * harvest dropped it, so shipVerdictOf saw no outcome at all.
+ *
+ * Both real modules, in one chain: the workflow-output handler writes the record,
+ * then completion.mjs's own functions read the entry the harvest builds from it.
+ */
+describe("TEAM-4660 — a CD handoff closes the run complete, not static-ci-only", () => {
+  const PR = "https://github.com/tycenjmccann/agentcore-hub/pull/634";
+  const SHIP_OPTS = { getAgentPhase: (a) => PHASES[a] };
+
+  beforeEach(() => {
+    h.issue = row({ key: "TEAM-4669", summary: "Ship + deploy", assignee: "agentcore_hub_release_manager", parent: "TEAM-4660", created: "2026-09-14T10:05:00.000Z" });
+  });
+
+  /** Report the handoff for real, then return the record it persisted. */
+  const reportHandoff = async () => {
+    const res = result(await report({
+      ticket_id: "TEAM-4669", summary: "PR opened for the owning team; nothing merged here.",
+      workflow_id: "wf_4660", agent_id: "agentcore_hub_release_manager",
+      outcome: "handoff", pr_url: PR,
+    }));
+    expect(res.status).toBe("complete");
+    return record("TEAM-4669");
+  };
+
+  /** The agentTasks entry the orchestrator's harvest builds from that record. */
+  const harvested = (rec) => ({
+    "TEAM-4669": {
+      ticketId: "TEAM-4669",
+      output: rec.summary,
+      ...(rec.pr_url ? { prUrl: rec.pr_url } : {}),
+      ...(harvestableShipOutcome(rec.outcome) ? { outcome: harvestableShipOutcome(rec.outcome) } : {}),
+    },
+  });
+
+  /** Every ticket of the run done, ship included — the shape at completion time. */
+  const doneTickets = () => [
+    gateTicket({ key: "TEAM-4661", title: "Build it", assignee: "agentcore_hub_api_dev", status: "done", phase: "development" }),
+    gateTicket({ key: "TEAM-4670", title: "Verify it", assignee: "agentcore_hub_qa_verifier", status: "done", phase: "verification" }),
+    gateTicket({ key: "TEAM-4669", title: "Ship + deploy", assignee: "agentcore_hub_release_manager", status: "done", phase: "ship" }),
+  ];
+
+  it("records the handoff with the PR still OPEN — a handoff never claims a merge", async () => {
+    const rec = await reportHandoff();
+    expect(rec.outcome).toBe("handoff");
+    expect(rec.pr_url).toBe(PR);
+    expect(rec.merge_commit).toBeUndefined();
+    // workflow-output's own derivePrState calls this PR "open", which is why the
+    // reader must not treat `handoff` as an alias for "shipped".
+    expect(rec.delivery).toEqual({ prUrl: PR, prState: "open" });
+  });
+
+  it("the harvested entry carries the verdict, and the ship gate is SATISFIED", async () => {
+    const rec = await reportHandoff();
+    // The same predicate harvestCompletionEvidence calls. Pre-fix: null.
+    expect(harvestableShipOutcome(rec.outcome)).toBe("handoff");
+    const agentTasks = harvested(rec);
+    expect(shipVerdictOf(agentTasks["TEAM-4669"])).toBe("handoff");
+    // The caller passes the SHIP_PHASES subset of the def's required phases.
+    const verdict = evaluateShipVerdict(doneTickets(), agentTasks, ["ship"], SHIP_OPTS);
+    // These two assertions are the ones that FAILED before this fix (the run closed
+    // on the static-ci-only terminal phase instead of completing).
+    expect(verdict.outcome).not.toBe("static-ci-only");
+    expect(verdict).toEqual({ required: true, shipped: true, outcome: null, blockReason: null, offenders: [] });
+  });
+
+  it("the run closes GREEN and the delivery row says how it was handed off", async () => {
+    const rec = await reportHandoff();
+    const tickets = doneTickets();
+    const agentTasks = harvested(rec);
+    expect(complete(tickets)).toBe(true);
+    // A registered repo (CD mode) whose ship record declared a handoff.
+    expect(deliveryRollUp(tickets, agentTasks, { mode: "cd" }))
+      .toEqual({ outcome: "complete-with-handoff", prState: "open" });
+    // …and the CD-registry miss, where the ship phase was stripped and static CI was
+    // the only verification the run ever had.
+    expect(deliveryRollUp(tickets, agentTasks, { mode: "handoff" }))
+      .toEqual({ outcome: "complete:handoff:static-only", prState: "open" });
+  });
+});
+
 describe("15x8ql — a post-deploy re-check that used to live only in prose", () => {
   beforeEach(() => {
     h.issue = row({ key: "TEAM-4705", summary: "Ship + deploy", assignee: "agentcore_hub_release_manager", parent: "TEAM-4700", created: "2026-09-15T11:00:00.000Z" });
@@ -326,7 +417,7 @@ describe("syq0p9 — three console/IAM steps become ONE human ticket", () => {
 });
 
 describe("REGRESSION hirhfw — a completion with no follow-ups is unchanged but for delivery", () => {
-  it("writes the pre-change record plus exactly one key, and calls no ticket tool but the transition", async () => {
+  it("writes the pre-change record plus exactly three keys, and calls no ticket tool but the transition", async () => {
     // hirhfw is an ordinary dev completion: a PR, no ship claim, no follow-ups. It
     // is the shape almost every report in the corpus has, so "additive" has to mean
     // additive here or TEAM-4740 changed every run in the fleet.

@@ -1,11 +1,11 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
 /**
- * TEAM-4740 FR-4 — head-of-line replay fixtures.
+ * TEAM-4740 FR-4 — head-of-line replay fixture.
  *
- * Two real production runs whose delivery work was lost to the SAME shape of
- * failure: a decision that had to be made was recorded in prose instead of being
- * returned as a value, so nothing downstream could act on it.
+ * A real production run whose delivery work was lost because a decision that had to
+ * be made was recorded in prose instead of being returned as a value, so nothing
+ * downstream could act on it.
  *
  *   - p5ogpg : the release manager called Pipeline___start_deploy for the merge
  *              commit 9f6a9e0d while an OLDER execution (347b9bcb) had been parked
@@ -15,19 +15,21 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
  *              GREEN. A ship-approval record was written for a deploy that never
  *              ran. The fix is a REFUSAL: nothing started, nothing recorded, and
  *              the blocker named in a shape an agent can branch on.
- *   - TEAM-4663 : a hub-infra fix ticket was filed mid-run with no base branch, so
- *              its PR was opened against the integration branch that the merge was
- *              about to supersede, and the fix evaporated. The fix is that the
- *              release manager states the base branch at CREATE time.
+ *
+ * The same run's OTHER failure — TEAM-4663, the fix ticket filed mid-run with no
+ * base branch, whose PR went to the integration branch the merge then superseded —
+ * is replayed where the code that owns it lives: through the real twins and the real
+ * workflow-output in lambda/agentcore-hub-tickets/replay-base-branch-main.test.mjs
+ * and lambda/agentcore-hub-jira/replay-base-branch-main.test.mjs.
  *
  * Placement note: this file lives in lambda/orchestrator/ with its sibling
  * replays, and costs the DL-009 surface guard NOTHING — check-orchestrator-
  * surface.sh derives its module list from `ls *.mjs | grep -v '\.test\.mjs$'`, so
  * *.test.mjs files are outside the module allow-list, the env scan and both LOC
  * budgets. It adds no orchestrator behaviour: p5ogpg is replayed through the
- * pipeline-tools Lambda (where the decision belongs), and TEAM-4663 is a pure
- * payload-shape assertion. Nothing here imports the orchestrator, and nothing
- * here imports a ticket twin — the twins' own runners own that half.
+ * pipeline-tools Lambda, where the decision belongs. Nothing here imports the
+ * orchestrator, and nothing here imports a ticket twin — the twins' own runners own
+ * that half.
  *
  * MUST be listed in vitest.config.ts's include array. That list is explicit
  * per-file for lambda/**\/*.test.mjs, so a replay that is not added there silently
@@ -287,49 +289,6 @@ describe("p5ogpg — start_deploy behind an older parked approval", () => {
   });
 });
 
-describe("TEAM-4663 — the create_ticket payload a release manager must send", () => {
-  /**
-   * A PURE FIXTURE, deliberately not a twin import.
-   *
-   * This is the payload shape the release manager sends for a hub-infra fix filed
-   * mid-run: the run's own PR is about to be merged, so a fix that must land on
-   * `main` has to say so at CREATE time or it inherits the integration branch and
-   * disappears with it. Asserting the shape here — and only the shape — keeps this
-   * replay honest about its scope: the twins' validation lives in the twins' own
-   * tests, this run's evidence is that `base_branch` was ABSENT from the payload.
-   */
-  const RM_CREATE_TICKET_PAYLOAD = {
-    title: "fix(pipeline-tools): abandon guard leaves a parked execution running",
-    description: "Observed on run p5ogpg. Own PR to main; this is hub infra, not run work.",
-    parent_id: "TEAM-4734",
-    assignee: "agentcore_hub_api_dev",
-    ticket_type: "task",
-    blocked_by: "TEAM-4703",
-    workflow_id: "p5ogpg",
-    phase: "ship",
-    base_branch: "main",
-  };
-
-  it("states base_branch main explicitly — the field whose absence lost the fix", () => {
-    expect(RM_CREATE_TICKET_PAYLOAD.base_branch).toBe("main");
-    // Not the run's integration branch, which the merge supersedes.
-    expect(RM_CREATE_TICKET_PAYLOAD.base_branch).not.toContain("feature/");
-    expect(RM_CREATE_TICKET_PAYLOAD.base_branch).not.toContain("TEAM-4734");
-  });
-
-  it("is a flat map of scalars — every tool arg crosses the wire as a string", () => {
-    for (const [key, value] of Object.entries(RM_CREATE_TICKET_PAYLOAD)) {
-      expect(typeof value, key).toBe("string");
-      expect(value.length, key).toBeGreaterThan(0);
-    }
-  });
-
-  it("keeps the delivery ordering that made the fix land after the merge", () => {
-    // blocked_by is the CD ticket: the fix's PR to main cannot be opened until the
-    // run's own merge has happened, or it conflicts with it.
-    expect(RM_CREATE_TICKET_PAYLOAD.blocked_by).toBe("TEAM-4703");
-    expect(RM_CREATE_TICKET_PAYLOAD.parent_id).toBe("TEAM-4734");
-    // A hub-infra fix is agent work, never a human handoff.
-    expect(RM_CREATE_TICKET_PAYLOAD.assignee.startsWith("human:")).toBe(false);
-  });
-});
+// TEAM-4663's own replay is NOT here: it lives where the code it exercises does, in
+// lambda/agentcore-hub-tickets/replay-base-branch-main.test.mjs (the real tickets
+// twin + the real workflow-output) and lambda/agentcore-hub-jira/replay-base-branch-main.test.mjs.

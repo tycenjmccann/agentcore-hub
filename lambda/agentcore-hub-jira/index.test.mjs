@@ -2100,25 +2100,39 @@ test("FR-5: no duplicate edge when the caller already ordered it behind CD", asy
   }
 });
 
-test("FR-5: a settled CD ticket, a closed gate, or no CD ticket → unfrozen", async () => {
+test("FR-5: a settled CD ticket, a closed gate, or no CD ticket → no GATE freeze", async () => {
   const m = await loadWithMode("off");
+  // TEAM-4763 P2: "no gate freeze" no longer implies "dispatched now". Where the
+  // roster still holds an OPEN agent sibling, the root-blocker half orders the new
+  // ticket behind it — reason `no_root_blocker`, no gateTicketId, no banner. So each
+  // case now states which half, if either, is expected to fire; the third element is
+  // the root it must wait for, or null for "nothing at all".
   const cases = [
-    ["CD already done", [gateIssue(), cdIssue(CD_KEY, { status: { name: "Done" } })]],
-    ["gate approved", [gateIssue({ status: { name: "Done" } }), cdIssue()]],
-    ["gate never presented", [gateIssue({ status: { name: "To Do" } }), cdIssue()]],
-    ["no gate at all", [cdIssue()]],
-    ["gate but no CD ticket", [gateIssue()]],
+    ["CD already done", [gateIssue(), cdIssue(CD_KEY, { status: { name: "Done" } })], null],
+    ["gate approved", [gateIssue({ status: { name: "Done" } }), cdIssue()], CD_KEY],
+    ["gate never presented", [gateIssue({ status: { name: "To Do" } }), cdIssue()], CD_KEY],
+    ["no gate at all", [cdIssue()], CD_KEY],
+    ["gate but no CD ticket", [gateIssue()], null],
     ["a human ticket that is not a merge gate", [
       gateIssue({ summary: "Bug intake triage" }), cdIssue(),
-    ]],
+    ], CD_KEY],
   ];
-  for (const [why, siblings] of cases) {
+  for (const [why, siblings, root] of cases) {
     const cap = captureGateCreate({ siblings });
     try {
       const result = await m.handler({ tool_name: "Tickets___create_ticket", parameters: { ...AGENT_TICKET } });
-      assert.equal(result.status, "todo", why);
-      assert.equal(result.autowired, undefined, why);
-      assert.deepEqual(cap.links, [], why);
+      // In every case the one thing that must not happen is the GATE freeze.
+      assert.notEqual(result.autowired?.reason, "open_gate", why);
+      if (root) {
+        assert.equal(result.status, "blocked", why);
+        assert.deepEqual(result.autowired, { reason: "no_root_blocker", rootTicketId: root, blockedBy: [root] }, why);
+        assert.deepEqual(cap.links.map((l) => l.inwardIssue.key), [root], why);
+        assert.equal(cap.fields.description, undefined, `${why}: the root autowire writes no banner`);
+      } else {
+        assert.equal(result.status, "todo", why);
+        assert.equal(result.autowired, undefined, why);
+        assert.deepEqual(cap.links, [], why);
+      }
     } finally {
       cap.restore();
     }
@@ -2154,13 +2168,19 @@ test("FR-5: the CD ticket is found by phase:ship AND by the roster fallback", as
     rosterOnly.restore();
   }
 
-  // A non-ship agent sibling is not a CD ticket, so nothing freezes behind it.
+  // A non-ship agent sibling is not a CD ticket, so the GATE freeze does not fire —
+  // TEAM-4763 P2's root autowire then orders the ticket behind that sibling as the
+  // run's root, naming no gate and writing no banner.
   const notCd = captureGateCreate({
     siblings: [gateIssue(), cdIssue("TEAM-4690", { labels: ["agent:agentcore_hub_backend_dev"] })],
   });
   try {
     const result = await m.handler({ tool_name: "Tickets___create_ticket", parameters: { ...AGENT_TICKET } });
-    assert.equal(result.autowired, undefined);
+    assert.deepEqual(result.autowired, {
+      reason: "no_root_blocker",
+      rootTicketId: "TEAM-4690",
+      blockedBy: ["TEAM-4690"],
+    });
   } finally {
     notCd.restore();
   }
@@ -2262,6 +2282,119 @@ test("FR-5: a deduped retry is reconciled against the AUTOWIRED blockers", async
       outwardIssue: { key: "TEAM-4705" },
     }]);
     assert.deepEqual(cap.transitionIds, ["31"]);
+  } finally {
+    cap.restore();
+  }
+});
+
+// ─── TEAM-4763 P2 (FR-11 seam 7b) — the root blocker, at MINT time ────────────
+//
+// A ticket minted mid-run that names no blocker used to be dispatched the moment it
+// landed, into a run whose earlier phase may still be running. The tickets twin's
+// half of this is lambda/agentcore-hub-tickets/index.test.mjs (same cases, same
+// names), and src/lib/workflow/root-blocker-parity.test.ts holds the two to the
+// identical marker. The journey-event half is asserted only there: this runner has
+// no module mocking, so there is no DynamoDB double to observe it with.
+
+const ROOT_KEY = "TEAM-4735";   // the analyst's ticket: earliest non-human sibling
+const LATER_KEY = "TEAM-4750";  // a later agent ticket — never the root
+
+/** An ordinary open agent sibling, as Jira's search returns it. */
+const agentIssue = (key = ROOT_KEY, fields = {}) =>
+  issue(key, {
+    summary: `Work: ${key}`,
+    status: { name: "In Progress" },
+    labels: ["agent:agentcore_hub_requirements_analyst"],
+    created: "2026-09-14T10:00:00.000+0000",
+    ...fields,
+  });
+
+test("FR-11: a mid-run ticket is ordered behind the run's root, with no banner", async () => {
+  const m = await loadWithMode("off");
+  const cap = captureGateCreate({
+    siblings: [agentIssue(LATER_KEY, { created: "2026-09-14T18:00:00.000+0000" }), agentIssue()],
+  });
+  try {
+    const result = await m.handler({
+      tool_name: "Tickets___create_ticket",
+      parameters: { ...AGENT_TICKET, description: "Fix the abandon guard." },
+    });
+
+    assert.equal(result.status, "blocked", JSON.stringify(result));
+    assert.deepEqual(result.autowired, {
+      reason: "no_root_blocker",
+      rootTicketId: ROOT_KEY,
+      blockedBy: [ROOT_KEY],
+    });
+    // The freeze in Jira IS the link + the transition.
+    assert.deepEqual(cap.links, [{
+      type: { name: "Blocks" },
+      inwardIssue: { key: ROOT_KEY },
+      outwardIssue: { key: "TEAM-4711" },
+    }]);
+    assert.deepEqual(cap.transitionIds, ["31"]);
+    // No DELIVERY CONSTRAINT banner: that one is about a merge superseding a branch.
+    assert.deepEqual(blocksOf(cap), ["Fix the abandon guard."]);
+    // The earliest-created sibling wins, not the first one JQL returned.
+    assert.notEqual(result.autowired.rootTicketId, LATER_KEY);
+    // And it reuses the open-gate scan: one `parent = …` search, not two.
+    assert.deepEqual(cap.siblingScans, [`parent = ${EPIC} ORDER BY created ASC`]);
+  } finally {
+    cap.restore();
+  }
+});
+
+test("FR-11: human:*, a caller's own blockers, and the run's first ticket are left alone", async () => {
+  const m = await loadWithMode("off");
+  const cases = [
+    ["a human gate is what work waits ON", [agentIssue()], { summary: "Merge Approval: round 2", assignee: "human:tycen", parent_key: EPIC }],
+    ["the caller already stated its ordering", [agentIssue()], { ...AGENT_TICKET, blocked_by: ["TEAM-4700"] }],
+    ["the run's first ticket has no root yet", [], { ...AGENT_TICKET }],
+    ["a roster of gates is no root", [gateIssue()], { ...AGENT_TICKET }],
+    ["a done root would be a permanent wedge", [agentIssue(ROOT_KEY, { status: { name: "Done" } })], { ...AGENT_TICKET }],
+    // `Skipped`/`Cancelled` are outside the 6-status workflow, so they arrive
+    // unmapped and lowercased — and cascade.mjs resolves a blocker on done/cancelled
+    // only, so a skipped root never unblocks anything, ever.
+    ["a skipped root, same reason", [agentIssue(ROOT_KEY, { status: { name: "Skipped" } })], { ...AGENT_TICKET }],
+    ["a cancelled root, same reason", [agentIssue(ROOT_KEY, { status: { name: "Cancelled" } })], { ...AGENT_TICKET }],
+  ];
+  for (const [why, siblings, parameters] of cases) {
+    const cap = captureGateCreate({ siblings });
+    try {
+      const result = await m.handler({ tool_name: "Tickets___create_ticket", parameters });
+      assert.equal(result.autowired, undefined, why);
+      // The caller's own blocker is still honoured — "unwired" means the autowire
+      // added nothing, not that the edge the caller asked for was dropped.
+      const expectedLinks = (parameters.blocked_by || []).map((key) => key);
+      assert.deepEqual(cap.links.map((l) => l.inwardIssue.key), expectedLinks, why);
+    } finally {
+      cap.restore();
+    }
+  }
+});
+
+test("FR-11: the gate freeze wins when a merge gate is open — never two autowires", async () => {
+  const m = await loadWithMode("off");
+  const cap = captureGateCreate({ siblings: [gateIssue(), cdIssue(), agentIssue()] });
+  try {
+    const result = await m.handler({ tool_name: "Tickets___create_ticket", parameters: { ...AGENT_TICKET } });
+    assert.equal(result.autowired.reason, "open_gate");
+    assert.deepEqual(result.autowired.blockedBy, [CD_KEY]);
+    assert.equal(result.autowired.rootTicketId, undefined);
+    assert.deepEqual(cap.links.map((l) => l.inwardIssue.key), [CD_KEY]);
+  } finally {
+    cap.restore();
+  }
+});
+
+test("FR-11: a REFUSED scan never reaches the root autowire — there is no create to wire", async () => {
+  const m = await loadWithMode("off");
+  const cap = captureGateCreate({ siblings: [agentIssue()], scanFails: true });
+  try {
+    const result = await m.handler({ tool_name: "Tickets___create_ticket", parameters: { ...AGENT_TICKET } });
+    assert.match(result.error, /^create_ticket refused: the sibling scan under TEAM-4734 failed/);
+    assert.equal(cap.posts.length, 0);
+    assert.deepEqual(cap.links, []);
   } finally {
     cap.restore();
   }
