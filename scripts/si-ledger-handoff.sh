@@ -27,8 +27,16 @@
 #   ./scripts/si-ledger-handoff.sh --print-policies # the two IAM documents as JSON
 #
 #   Dry run prints every AWS mutation it WOULD make and executes none. Read-only
-#   calls (describe-table, get-function-configuration, simulate-principal-policy)
-#   run in both modes so the plan and the verification are real.
+#   calls run in both modes so the plan and the verification are real:
+#   describe-table, get-function-configuration, get-harness,
+#   describe-express-gateway-service and simulate-principal-policy.
+#
+#   The harness and ECS env pushes are REPLACE-ALL, so an echoed command proves
+#   nothing about what the merge would contain. In dry run those two children are
+#   therefore INVOKED with their own --dry-run (they read the live env and print
+#   the merged key names) rather than echoed. A probe that fails — because the
+#   surface is not deployed yet, or credentials cannot read it — is reported with
+#   a ⚠ saying --apply would abort there, and does not abort the dry run.
 #
 # ACCEPTANCE CHECKS (run these after --apply; they are the definition of done)
 #   1. From the Workflow Manager harness, `python3 toolkit/si_verify.py` exits 0
@@ -52,7 +60,9 @@ for arg in "$@"; do
     --dry-run)        MODE="dry-run" ;;
     --print-policies) MODE="print-policies" ;;
     -h|--help)
-      sed -n '2,45p' "$0"
+      # TEAM-4787: keep this range on the LAST header line — the F3 header grew by
+      # 8 lines and a stale range silently truncates the help text.
+      sed -n '2,53p' "$0"
       exit 0 ;;
     *)
       echo "ERROR: unknown argument '$arg' (expected --dry-run, --apply or --print-policies)" >&2
@@ -74,8 +84,21 @@ LEDGER_ARN="arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/${SI_LEDGER_TABLE
 SESSIONS_ARN="arn:aws:dynamodb:${AWS_REGION}:${ACCOUNT_ID}:table/agentcore-hub-cloud-code-sessions"
 HARNESS_ROLE="agentcore-hub-harness-role"
 CODING_ROLE="agentcore-hub-coding-runtime-role"
+# TEAM-4787: the shared Lambda role step 3 grants the ledger on (two inline
+# policy names, so the two deploy scripts union rather than clobber). Derived
+# from config.sh's LAMBDA_ROLE_ARN, never hardcoded — same idiom as
+# deploy/continuous-improvement/deploy.sh's ROLE_NAME_FOR_EVAL.
+LAMBDA_ROLE="${LAMBDA_ROLE_ARN##*/}"
 ANALYZER_FN="agentcore-hub-workflow-analyzer"
 SUBMITTER_FN="agentcore-hub-prd-submitter"
+# The WM harness step 4 pushes env onto, in lockstep with set-harness-env.mjs's
+# exported DEFAULT_HARNESS_NAME.
+WM_HARNESS="agentcore_hub_workflow_manager"
+# The hub ECS service step 4 pushes env onto. Same env-var names and defaults as
+# deploy/ecs-express/set-env.sh, so an operator who overrides them gets the same
+# service verified as the one that was written.
+EXPRESS_SERVICE="${EXPRESS_SERVICE_NAME:-agentcore-hub}"
+EXPRESS_CLUSTER="${EXPRESS_CLUSTER:-default}"
 WM_SETUP="${REPO_ROOT}/deploy/workflow-manager/setup-workflow-manager.mjs"
 CODING_ROLE_SETUP="${REPO_ROOT}/deploy/coding-agent-runtime/setup-coding-runtime-role.sh"
 
@@ -124,6 +147,23 @@ run() {
     "$@"
   else
     echo "   + $*"
+  fi
+}
+
+# TEAM-4787: like run(), for children that implement --dry-run themselves.
+# The harness and ECS env APIs are REPLACE-ALL, so an echoed command proves
+# nothing about what the merge would contain — only the child's own read+merge
+# does. So plan by INVOKING it with --dry-run instead of echoing it. A probe may
+# legitimately fail (surface not deployed yet, or credentials that cannot read
+# it); that is information a dry run should print, not a reason to abort under
+# `set -e` — but it is also exactly where --apply would stop, so say so.
+run_dry() {
+  if [ "$MODE" = "apply" ]; then
+    "$@"
+  else
+    echo "   + $* --dry-run"
+    "$@" --dry-run \
+      || echo "   ⚠ dry-run probe failed (rc $?) — --apply would abort here; surface may not exist yet"
   fi
 }
 
@@ -220,10 +260,10 @@ merge_lambda_env "$SUBMITTER_FN"
 
 # The WM harness: UpdateHarness's environmentVariables is replace-all, and no
 # tool pushed harness env before TEAM-4770 — set-harness-env.mjs is that tool.
-run node "${REPO_ROOT}/deploy/workflow-manager/set-harness-env.mjs" "SI_LEDGER_TABLE=${SI_LEDGER_TABLE}"
+run_dry node "${REPO_ROOT}/deploy/workflow-manager/set-harness-env.mjs" "SI_LEDGER_TABLE=${SI_LEDGER_TABLE}"
 
 # The hub ECS service: set-env.sh already reads the live container and merges.
-run bash "${REPO_ROOT}/deploy/ecs-express/set-env.sh" "SI_LEDGER_TABLE=${SI_LEDGER_TABLE}"
+run_dry bash "${REPO_ROOT}/deploy/ecs-express/set-env.sh" "SI_LEDGER_TABLE=${SI_LEDGER_TABLE}"
 
 # ─── 5/7  coding-runtime read access ─────────────────────────────────────────
 # ONLY_POLICY puts HubLiveVerifyRead alone: no role re-create, no trust refresh,
@@ -289,6 +329,11 @@ simulate "$CODING_ROLE" allowed "$LEDGER_ARN" \
 # to write the evidence it is verifying, nor read another tenant's sessions.
 simulate "$CODING_ROLE" implicitDeny "$LEDGER_ARN" dynamodb:PutItem
 simulate "$CODING_ROLE" implicitDeny "$SESSIONS_ARN" dynamodb:Scan
+# TEAM-4787: the grant step 3 applies and nothing verified. Without it, "the
+# handoff ran" and "prd-submitter can actually reach the ledger" stayed two
+# different facts — which is the shape of the TEAM-4770 failure itself.
+simulate "$LAMBDA_ROLE" allowed "$LEDGER_ARN" \
+  dynamodb:GetItem dynamodb:Scan dynamodb:PutItem
 
 for FN in "$ANALYZER_FN" "$SUBMITTER_FN"; do
   VAL="$(aws lambda get-function-configuration --function-name "$FN" --region "$AWS_REGION" \
@@ -300,6 +345,76 @@ for FN in "$ANALYZER_FN" "$SUBMITTER_FN"; do
     FAILURES=$((FAILURES + 1))
   fi
 done
+
+# TEAM-4787: the other two env surfaces step 4 writes. Same verdict semantics as
+# the Lambda loop above — a missing key is a ✗ and a FAILURE in BOTH modes; only
+# the summary differs (fatal after --apply, "not satisfied yet" in dry run).
+#
+# The harness: UpdateHarness's environmentVariables is replace-all and nothing in
+# this repo pushed harness env before TEAM-4770, so this is the surface most
+# likely to be silently unset. set-harness-env.mjs uses the SDK, but every check
+# here is a CLI call, so read it back the way DEPLOY.md documents:
+# list-harnesses → harnessId, then get-harness.
+WM_HARNESS_ID="$(aws bedrock-agentcore-control list-harnesses --region "$AWS_REGION" \
+  --query "harnesses[?harnessName=='${WM_HARNESS}'].harnessId | [0]" \
+  --output text 2>/dev/null || echo None)"
+if [ -z "$WM_HARNESS_ID" ] || [ "$WM_HARNESS_ID" = "None" ]; then
+  echo "   ✗ ${WM_HARNESS}: harness not found — SI_LEDGER_TABLE not verified"
+  FAILURES=$((FAILURES + 1))
+else
+  HARNESS_VAL="$(aws bedrock-agentcore-control get-harness --harness-id "$WM_HARNESS_ID" \
+    --region "$AWS_REGION" --query 'harness.environmentVariables.SI_LEDGER_TABLE' \
+    --output text 2>/dev/null || echo None)"
+  if [ "$HARNESS_VAL" = "$SI_LEDGER_TABLE" ]; then
+    echo "   ✓ ${WM_HARNESS}: SI_LEDGER_TABLE=${HARNESS_VAL}"
+  else
+    echo "   ✗ ${WM_HARNESS}: SI_LEDGER_TABLE=${HARNESS_VAL} (expected ${SI_LEDGER_TABLE})"
+    FAILURES=$((FAILURES + 1))
+  fi
+fi
+
+# The hub ECS service. It is an Express gateway service, so there is NO task
+# definition to describe: activeConfigurations[].primaryContainer is the live
+# spec. Same candidate order as deploy/ecs-express/set-env.sh (the script that
+# owns this surface) and deploy/pipeline/ecs-primary-container.py.
+ECS_SERVICES="$(aws ecs list-services --cluster "$EXPRESS_CLUSTER" --region "$AWS_REGION" \
+  --output json 2>/dev/null || true)"
+ECS_SERVICE_ARN="$(printf '%s' "$ECS_SERVICES" | python3 -c '
+import json, sys
+try:
+    arns = json.load(sys.stdin).get("serviceArns") or []
+except Exception:
+    arns = []
+for a in arns:
+    if a.rsplit("/", 1)[-1] == sys.argv[1]:
+        print(a)
+        break
+' "$EXPRESS_SERVICE")"
+if [ -z "$ECS_SERVICE_ARN" ]; then
+  echo "   ✗ ${EXPRESS_SERVICE} (${EXPRESS_CLUSTER}): service not found — SI_LEDGER_TABLE not verified"
+  FAILURES=$((FAILURES + 1))
+else
+  ECS_DESCRIBE="$(aws ecs describe-express-gateway-service --service-arn "$ECS_SERVICE_ARN" \
+    --region "$AWS_REGION" --output json 2>/dev/null || true)"
+  ECS_VAL="$(printf '%s' "$ECS_DESCRIBE" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin).get("service") or {}
+except Exception:
+    d = {}
+pcs = [c["primaryContainer"] for c in d.get("activeConfigurations") or [] if c.get("primaryContainer")]
+if d.get("primaryContainer"):
+    pcs.append(d["primaryContainer"])
+env = {e["name"]: e["value"] for e in (pcs[0].get("environment") or [])} if pcs else {}
+print(env.get(sys.argv[1]) or "None")
+' SI_LEDGER_TABLE)"
+  if [ "$ECS_VAL" = "$SI_LEDGER_TABLE" ]; then
+    echo "   ✓ ${EXPRESS_SERVICE} (${EXPRESS_CLUSTER}): SI_LEDGER_TABLE=${ECS_VAL}"
+  else
+    echo "   ✗ ${EXPRESS_SERVICE} (${EXPRESS_CLUSTER}): SI_LEDGER_TABLE=${ECS_VAL} (expected ${SI_LEDGER_TABLE})"
+    FAILURES=$((FAILURES + 1))
+  fi
+fi
 
 echo ""
 if [ "$FAILURES" -eq 0 ]; then

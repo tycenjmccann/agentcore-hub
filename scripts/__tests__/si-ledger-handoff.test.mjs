@@ -93,7 +93,11 @@ const envLocalSkip = HAS_ENV_LOCAL
 // One canned answer per read the handoff script performs. Every write, and every
 // call not listed, is an error: `exit 64`.
 const STUB = `#!/usr/bin/env bash
-printf '%s\\n' "$*" >> "$STUB_LOG"
+# ONE logged line per invocation: newlines inside an argument are collapsed to
+# spaces, because --policy-document is a multi-line JSON heredoc and the
+# IAM_ONLY allow-list below reasons per line ("each line is one AWS call").
+printf '%s\\n' "$*" | tr '\\n' ' ' >> "$STUB_LOG"
+printf '\\n' >> "$STUB_LOG"
 ARGS="$*"
 case "$ARGS" in
   "sts get-caller-identity"*)
