@@ -42,6 +42,41 @@ const BUCKET = `agentcore-hub-artifacts-${ACCOUNT}-${REGION}`;
 const TABLE = "agentcore-hub-si-ledger";
 const LEDGER_ARN = `arn:aws:dynamodb:${REGION}:${ACCOUNT}:table/${TABLE}`;
 
+// TEAM-4785 / F1 — HubLiveVerifyRead's allow-list, mirrored. The duplication is
+// deliberate: widening the grant has to be done twice, visibly, because the role
+// it widens is assumed by the UNTRUSTED coding runtime.
+const LIVE_VERIFY_TABLES = [
+  "agentcore-hub-si-ledger",
+  "agentcore-hub-workflows",
+  "agentcore-hub-tickets",
+  "agentcore-hub-events",
+  "agentcore-hub-workflow-analyses",
+  "agentcore-hub-eval-results",
+  "agentcore-hub-eval-daily",
+  "agentcore-hub-eval-config",
+];
+// Excluded BY DESIGN: cross-tenant session transcripts, and state owned by a
+// Lambda rather than by anything live verify reads.
+const NEVER_READABLE = [
+  "agentcore-hub-cloud-code-sessions",
+  "agentcore-hub-routines",
+  "agentcore-hub-anomaly-watcher-state",
+  "agentcore-hub-eval-seen",
+];
+// config/cd-registry.json is NOT here: it carries the cross-account CD externalId
+// and roleArn (src/lib/cd-registry.ts:41-43).
+const S3_GETTABLE = [
+  `arn:aws:s3:::${BUCKET}/workflows/*`,
+  `arn:aws:s3:::${BUCKET}/completions/*`,
+  `arn:aws:s3:::${BUCKET}/config/agents.json`,
+  `arn:aws:s3:::${BUCKET}/config/workflows.json`,
+  `arn:aws:s3:::${BUCKET}/config/connectors.json`,
+];
+const S3_PREFIXES = ["config/*", "workflows/*", "completions/*"];
+const SESSIONS_ARN = `arn:aws:dynamodb:${REGION}:${ACCOUNT}:table/agentcore-hub-cloud-code-sessions`;
+const actionsOf = (s) => [].concat(s.Action);
+const resourcesOf = (s) => [].concat(s.Resource);
+
 const HANDOFF = join(REPO, "scripts/si-ledger-handoff.sh");
 const WM_DEPLOY = join(REPO, "deploy/workflow-manager/deploy.sh");
 const CI_DEPLOY = join(REPO, "deploy/continuous-improvement/deploy.sh");
@@ -74,24 +109,40 @@ case "$ARGS" in
     echo '{"EXISTING_KEY":"keep"}' ;;
   "iam simulate-principal-policy"*)
     # Echo back one "<action>\\t<decision>" row per requested action, so the
-    # script's own parsing is exercised. Writes are denied for the coding role.
-    SRC=""; MODE=""
+    # script's own parsing is exercised. Writes are denied for the coding role,
+    # and so is any table outside HubLiveVerifyRead's allow-list.
+    #
+    # TWO PASSES, deliberately (TEAM-4785): simulate() sends --action-names BEFORE
+    # --resource-arns (si-ledger-handoff.sh:258-263), so a single-pass stub that
+    # emits a row as it reads each action has not yet seen the resource and can
+    # only ever answer "allowed" for it. Collect first, decide second.
+    SRC=""; RES=""; ACTIONS=""; MODE=""
     for a in "$@"; do
       case "$MODE" in
         src) SRC="$a"; MODE="" ; continue ;;
+        res) RES="$a"; MODE="" ; continue ;;
       esac
       case "$a" in
         --policy-source-arn) MODE=src ;;
+        --resource-arns) MODE=res ;;
         --action-names) MODE=actions ;;
         --*) [ "$MODE" = actions ] && MODE="" ;;
         *)
-          if [ "$MODE" = actions ]; then
-            case "$SRC:$a" in
-              *coding-runtime-role:dynamodb:PutItem) printf '%s\\timplicitDeny\\n' "$a" ;;
-              *) printf '%s\\tallowed\\n' "$a" ;;
-            esac
-          fi ;;
+          if [ "$MODE" = actions ]; then ACTIONS="$ACTIONS $a"; fi ;;
       esac
+    done
+    for a in $ACTIONS; do
+      DECISION=allowed
+      case "$SRC" in
+        *coding-runtime-role)
+          case "$a" in
+            dynamodb:PutItem|dynamodb:UpdateItem|dynamodb:DeleteItem|s3:PutObject) DECISION=implicitDeny ;;
+          esac
+          case "$RES" in
+            *table/agentcore-hub-cloud-code-sessions*|*table/agentcore-hub-routines*|*table/agentcore-hub-anomaly-watcher-state*|*table/agentcore-hub-eval-seen*) DECISION=implicitDeny ;;
+          esac ;;
+      esac
+      printf '%s\\t%s\\n' "$a" "$DECISION"
     done ;;
   *)
     echo "STUB: unsupported aws call: $ARGS" >&2
@@ -196,8 +247,7 @@ test("harnessRole HubTablesRead still covers the ledger table and its index", { 
 
 test("codingRuntimeRole HubLiveVerifyRead is read-only and scoped", { skip: envLocalSkip }, () => {
   const doc = JSON.parse(runHandoff(["--print-policies"]).stdout).codingRuntimeRole.document;
-  const actions = doc.Statement.flatMap((s) => [].concat(s.Action));
-  const resources = doc.Statement.flatMap((s) => [].concat(s.Resource));
+  const actions = doc.Statement.flatMap(actionsOf);
   assert.ok(actions.length > 0);
 
   const ALLOWED = /^(dynamodb:(DescribeTable|Scan|Query|GetItem)|s3:(GetObject|ListBucket))$/;
@@ -210,11 +260,88 @@ test("codingRuntimeRole HubLiveVerifyRead is read-only and scoped", { skip: envL
     assert.equal(s.Effect, "Allow");
   }
 
-  const TABLE_ARN = new RegExp(`^arn:aws:dynamodb:${REGION}:${ACCOUNT}:table/agentcore-hub-\\*(/index/\\*)?$`);
-  const S3_ARN = new RegExp(`^arn:aws:s3:::${BUCKET}(/\\*)?$`);
-  for (const r of resources) {
-    assert.ok(TABLE_ARN.test(r) || S3_ARN.test(r), `out-of-scope resource ${r}`);
+  // ── scope: a fixed allow-list. No table wildcard, no bucket-root object read.
+  // TEAM-4785 / F1: this role is UNTRUSTED, so "scoped" has to mean enumerated.
+  const ddb = doc.Statement.filter((s) => actionsOf(s).some((a) => a.startsWith("dynamodb:")))
+    .flatMap(resourcesOf);
+  const leaf = LIVE_VERIFY_TABLES.map((t) => t.replace("agentcore-hub-", "")).join("|");
+  const TABLE_ARN = new RegExp(
+    `^arn:aws:dynamodb:[^:]+:\\d+:table/agentcore-hub-(${leaf})(/index/\\*)?$`,
+  );
+  for (const r of ddb) assert.match(r, TABLE_ARN, `out-of-scope table resource ${r}`);
+  // …and EXACTLY the allow-list — the table ARN and its index ARN for each.
+  assert.deepEqual(
+    [...ddb].sort(),
+    LIVE_VERIFY_TABLES.flatMap((t) => [
+      `arn:aws:dynamodb:${REGION}:${ACCOUNT}:table/${t}`,
+      `arn:aws:dynamodb:${REGION}:${ACCOUNT}:table/${t}/index/*`,
+    ]).sort(),
+  );
+
+  const s3Get = doc.Statement.filter((s) => actionsOf(s).includes("s3:GetObject")).flatMap(resourcesOf);
+  assert.deepEqual([...s3Get].sort(), [...S3_GETTABLE].sort());
+  const S3_OK = new RegExp(
+    `^arn:aws:s3:::${BUCKET}/(workflows/\\*|completions/\\*|config/(agents|workflows|connectors)\\.json)$`,
+  );
+  for (const r of s3Get) assert.match(r, S3_OK, `out-of-scope s3 object resource ${r}`);
+});
+
+test("HubLiveVerifyRead cannot reach session transcripts, and never lists the whole bucket", { skip: envLocalSkip }, () => {
+  const doc = JSON.parse(runHandoff(["--print-policies"]).stdout).codingRuntimeRole.document;
+  const raw = JSON.stringify(doc);
+
+  // The untrusted runtime must not be able to read another tenant's session rows.
+  for (const t of NEVER_READABLE) {
+    assert.ok(!raw.includes(t), `${t} must stay unreadable from the coding runtime`);
   }
+  assert.doesNotMatch(raw, /table\/agentcore-hub-\*/, "the table wildcard is back (TEAM-4785 F1)");
+  assert.ok(!raw.includes("config/cd-registry.json"), "cd-registry carries the cross-account externalId");
+
+  assert.ok(
+    !doc.Statement.flatMap(resourcesOf).includes(`arn:aws:s3:::${BUCKET}/*`),
+    "bucket-root s3:GetObject is back",
+  );
+
+  // s3:prefix is the ONLY way to scope a ListBucket, and an unconditioned one here
+  // also superseded ConfigBundleRead's CloudCodeList (IAM unions Allows), voiding
+  // its per-tenant cloud-code/t/* condition. Mirrors that statement's shape.
+  const lists = doc.Statement.filter((s) => actionsOf(s).includes("s3:ListBucket"));
+  assert.equal(lists.length, 1, "expected exactly one ListBucket statement");
+  for (const s of lists) {
+    assert.deepEqual(resourcesOf(s), [`arn:aws:s3:::${BUCKET}`]);
+    const prefixes = s.Condition?.StringLike?.["s3:prefix"];
+    assert.ok(
+      Array.isArray(prefixes) && prefixes.length > 0,
+      "ListBucket has no StringLike s3:prefix condition",
+    );
+    for (const p of prefixes) {
+      assert.ok(typeof p === "string" && p.trim() !== "" && p !== "*", `unscoped s3:prefix ${JSON.stringify(p)}`);
+      assert.ok(S3_PREFIXES.includes(p), `unexpected s3:prefix ${p}`);
+    }
+  }
+});
+
+test("step 7 simulates the cross-tenant negative, not just the write negative", { skip: envLocalSkip }, () => {
+  const r = runHandoff(["--dry-run"]);
+  assert.equal(r.status, 0, `exit ${r.status}\n${r.stdout}\n${r.stderr}`);
+
+  // The call is made against the excluded table…
+  assert.match(
+    r.calls,
+    new RegExp(`simulate-principal-policy .*${SESSIONS_ARN.replace(/\*/g, "\\*")}`),
+    `step 7 never simulated against ${SESSIONS_ARN}:\n${r.calls}`,
+  );
+  // …and step 7 reports the denial it expects. A single-pass stub would answer
+  // "allowed" here, so this also pins the stub's resource-awareness.
+  assert.match(
+    r.stdout,
+    /coding-runtime-role: dynamodb:Scan → implicitDeny/,
+    `step 7 did not report the cloud-code-sessions denial:\n${r.stdout}`,
+  );
+  // The pre-existing write negative still holds.
+  assert.match(r.stdout, /coding-runtime-role: dynamodb:PutItem → implicitDeny/);
+  // And the ledger positives are unaffected by the resource-aware stub.
+  assert.match(r.stdout, /coding-runtime-role: dynamodb:Scan → allowed/);
 });
 
 test("the coding-runtime role's Secrets Manager prohibition is untouched", () => {
