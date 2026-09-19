@@ -32,6 +32,7 @@
  * so callers can re-run it freely.
  */
 import { setTimeout as sleep } from "node:timers/promises";
+import { pathToFileURL } from "node:url";
 
 // The WM harness name, kept in lockstep with setup-workflow-manager.mjs's
 // HARNESS_NAME constant (that file is a top-level-await script with no exports,
@@ -164,7 +165,12 @@ async function main() {
 }
 
 // Only run when invoked directly, so the test can import the pure helpers.
-if (import.meta.url === `file://${process.argv[1]}`) {
+// TEAM-4787: pathToFileURL, not `file://${process.argv[1]}` — import.meta.url is
+// percent-encoded, so from any path containing a space (or #, ?, …) the template
+// never matched, main() never ran, and the process exited 0 with NO output. The
+// handoff would then report a successful harness push having pushed nothing,
+// which is the same class of silent-inertness bug as TEAM-4770 itself.
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
   try {
     process.exit(await main());
   } catch (err) {
