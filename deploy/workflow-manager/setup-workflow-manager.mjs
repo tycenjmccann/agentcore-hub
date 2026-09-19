@@ -100,12 +100,17 @@ const TABLES = {
 };
 
 // STS is the single source of truth for the account on every path that touches
-// AWS. --print-policy is the one exception: it mutates nothing, so it accepts
-// AWS_ACCOUNT_ID (the same env deploy/config.sh:23 reads) and stays fully
-// offline, which is what lets the regression test parse the document with no
-// credentials. Every other mode still resolves the account from credentials.
-let accountId = getArg("account-id");
-if (!accountId && PRINT_POLICY) accountId = process.env.AWS_ACCOUNT_ID || null;
+// AWS, and there is deliberately NO argument or env override on those paths:
+// tableArns, ROLE_ARN and the trust-policy conditions are all built from
+// accountId, so a forged value aims PutRolePolicy at ANOTHER account's role name
+// against the REAL role and still prints ✓ (TEAM-4809 F1).
+// --print-policy is the one exception: it mutates nothing and exits before the
+// first IAM client, so it accepts AWS_ACCOUNT_ID (the same env
+// deploy/config.sh:23 reads) and stays fully offline, which is what lets the
+// regression test parse the document with no credentials. Every other mode —
+// --iam-only, PIPELINE_MODE and the full create/update run — resolves the
+// account from credentials.
+let accountId = PRINT_POLICY ? process.env.AWS_ACCOUNT_ID || null : null;
 if (!accountId) {
   const sts = new STSClient({ region: REGION });
   ({ Account: accountId } = await sts.send(new GetCallerIdentityCommand({})));

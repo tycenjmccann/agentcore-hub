@@ -79,6 +79,41 @@ export function parseAssignments(args) {
   return sets;
 }
 
+/**
+ * argv → {harnessName, unsets, assignments, dryRun}. Throws on an unknown flag,
+ * and on a flag whose operand is missing or is itself a flag.
+ *
+ * TEAM-4809 F2: `unsets.push(argv[++i])` pushed `undefined` for a trailing
+ * `--unset`, the "nothing to do" guard only counts unsets.length, and
+ * `undefined in env` is false — so the run reached ListHarnesses + GetHarness,
+ * removed nothing, printed "nothing changed" and exited 0. A mistyped unset came
+ * back green with the variable still set. (`--harness` did fail, but as a
+ * confusing "harness undefined not found in us-east-1" after two AWS calls.)
+ * Exported like the helpers above so the rejection is unit-testable with no
+ * AWS client, and thrown here so it lands before the @aws-sdk dynamic import.
+ */
+export function parseArgs(argv) {
+  const operand = (flag, v) => {
+    if (v === undefined || v.startsWith("--")) {
+      throw new Error(`${flag} expects a value, got ${v === undefined ? "nothing" : JSON.stringify(v)}`);
+    }
+    return v;
+  };
+  let harnessName = DEFAULT_HARNESS_NAME;
+  const unsets = [];
+  const assignments = [];
+  const dryRun = argv.includes("--dry-run");
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--dry-run") continue;
+    if (a === "--unset") { unsets.push(operand(a, argv[++i])); continue; }
+    if (a === "--harness") { harnessName = operand(a, argv[++i]); continue; }
+    if (a.startsWith("--")) throw new Error(`unknown flag ${a}`);
+    assignments.push(a);
+  }
+  return { harnessName, unsets, assignments, dryRun };
+}
+
 async function main() {
   const argv = process.argv.slice(2);
   if (argv.includes("--help") || argv.includes("-h")) {
@@ -94,18 +129,7 @@ async function main() {
   }
 
   const REGION = process.env.AWS_REGION || "us-east-1";
-  const DRY_RUN = argv.includes("--dry-run");
-  let harnessName = DEFAULT_HARNESS_NAME;
-  const unsets = [];
-  const assignments = [];
-  for (let i = 0; i < argv.length; i++) {
-    const a = argv[i];
-    if (a === "--dry-run") continue;
-    if (a === "--unset") { unsets.push(argv[++i]); continue; }
-    if (a === "--harness") { harnessName = argv[++i]; continue; }
-    if (a.startsWith("--")) throw new Error(`unknown flag ${a}`);
-    assignments.push(a);
-  }
+  const { harnessName, unsets, assignments, dryRun: DRY_RUN } = parseArgs(argv);
   const sets = parseAssignments(assignments);
   if (Object.keys(sets).length === 0 && unsets.length === 0) {
     throw new Error("nothing to do — pass at least one KEY=VALUE or --unset KEY");
