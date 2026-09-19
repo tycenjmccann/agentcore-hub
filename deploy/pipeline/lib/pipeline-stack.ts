@@ -1006,6 +1006,21 @@ function grantRuntimeImagePerms(
             `${ctx.artifactBucket.bucketArn}/pipeline-artifacts/ship-approvals/*`,
           ],
         }),
+        // TEAM-4734's human-rejection marker (<sha>.rejected.json) is checked with
+        // HeadObject. Without ListBucket on the prefix S3 answers a MISSING key
+        // with 403, not 404, so preapproved-check.sh read every clean SHA as an
+        // unprovable rejection and refused (executions e60cfd93 / 520dd56d,
+        // 2026-09-18: "no runtime image rolled"). The app Deploy role passes the
+        // same check because S3ConfigAndBlueprints grants ListBucket bucket-wide;
+        // this role gets the one prefix. Listing names keys, never contents.
+        new iam.PolicyStatement({
+          sid: "ListShipApprovalPrefix",
+          actions: ["s3:ListBucket"],
+          resources: [ctx.artifactBucket.bucketArn],
+          conditions: {
+            StringLike: { "s3:prefix": ["pipeline-artifacts/ship-approvals/*"] },
+          },
+        }),
         // Read to re-verify, never write. This role's AdvanceRuntimeBaseline grant
         // is one key so it could not forge a record today, but the Deny keeps that
         // true if the baseline grant is ever widened to a prefix.
