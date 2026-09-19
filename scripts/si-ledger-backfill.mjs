@@ -297,8 +297,64 @@ export function deriveAttemptOutcome(prd) {
   const at = (outcome) => ({ outcome, status: STATUS_AFTER_OUTCOME[outcome] });
   if (run.deployedAt) return at("deployed");
   if (run.mergedAt) return at("landed");
-  if (run.workflowId && !run.completedAt) return at("in-run");
+  if (!run.workflowId) return null;
+  // The run's own terminal phase, when the cd-ledger left no stamp (runs that
+  // predate cd-ledger.json, or never reached ship). `complete` on a hub run is a
+  // merge — the hub repo is CD-registered, so a run cannot complete unmerged —
+  // but it is recorded WITHOUT a mergedAt: the ledger's 14-day dedupe window
+  // must never start on a guessed date (see cdStamps in workflow-analyzer).
+  const phase = String(run.phase || "");
+  if (phase === "cancelled") return at("cancelled");
+  if (phase === "error") return at("error");
+  if (phase === "complete") return at(run.deliveryMode === "handoff" ? "handoff" : "landed");
+  if (RUN_BLOCKED_PHASES.has(phase)) return at("error"); // ended without shipping the fix
+  if (!run.completedAt) return at("in-run");
   return null;
+}
+
+/**
+ * Terminal phases on which a run ENDED without shipping: the attempt is over and
+ * the pattern is open again (mirrors SHIP_BLOCKED_OUTCOMES in the orchestrator's
+ * completion.mjs; kept as data here so the backfill stays stdlib-pure).
+ */
+export const RUN_BLOCKED_PHASES = new Set([
+  "static-ci-only", "deploy-blocked", "ship-blocked", "merge-blocked", "blocked", "failed",
+]);
+
+/**
+ * Link every PRD to the `[SI]` run that carried it. A PRD object in S3 knows
+ * nothing about its run — the link lives on the workflows row: `input.si.prdKey`
+ * (runs started after #637) or, for everything older, the run title, which
+ * prd-submitter has always built as `"[SI] " + prd.title`. Several runs for one
+ * title (a PRD re-submitted after a cancel) → the NEWEST run is the attempt that
+ * counts, which is also what `applyAttempt`'s last-write status rule expects.
+ *
+ * @param prds  `{ key, title, ... }[]`
+ * @param runs  `{ workflowId, phase, startedAt, completedAt, epicId, deliveryMode, title, prdKey, mergedAt, deployedAt }[]`
+ * @returns the same PRDs with `run` attached where one matched
+ */
+export function attachRuns(prds, runs = []) {
+  const norm = (t) => String(t || "").replace(/^\[SI\]\s*/, "").replace(/\s+/g, " ").trim().toLowerCase();
+  const byPrdKey = new Map();
+  const byTitle = new Map();
+  for (const r of runs) {
+    if (!r?.workflowId) continue;
+    if (r.prdKey) byPrdKey.set(r.prdKey, newer(byPrdKey.get(r.prdKey), r));
+    const t = norm(r.title);
+    if (t && t !== "undefined") byTitle.set(t, newer(byTitle.get(t), r));
+  }
+  return prds.map((prd) => {
+    if (prd.run) return prd;
+    const r = byPrdKey.get(prd.key) || byTitle.get(norm(prd.title));
+    if (!r) return prd;
+    const { title: _t, prdKey: _k, ...run } = r;
+    return { ...prd, run };
+  });
+}
+
+function newer(a, b) {
+  if (!a) return b;
+  return String(b.startedAt || "") > String(a.startedAt || "") ? b : a;
 }
 
 const textOf = (...parts) => parts.filter(Boolean).join("\n");
@@ -599,14 +655,20 @@ async function readAnalyses(ddb, ScanCommand, table) {
   return out;
 }
 
-/** Every `[SI]` PRD object under the prefix, flattened to `{ key, ...body }`. */
-async function readPrds(s3, { ListObjectsV2Command, GetObjectCommand }, bucket, prefix) {
+/**
+ * Every SYSTEM `[SI]` PRD object under the prefix, flattened to `{ key, ...body }`.
+ * The prefix also holds the agent-eval loop's PRDs (`prd-<agentId>-<ts>.json`,
+ * "Improve X based on evaluation findings"); those are a different loop and
+ * match no system pattern, so only basenames matching `filter` are read.
+ */
+async function readPrds(s3, { ListObjectsV2Command, GetObjectCommand }, bucket, prefix, filter = /^system-/) {
   const out = [];
   let ContinuationToken;
   do {
     const page = await s3.send(new ListObjectsV2Command({ Bucket: bucket, Prefix: prefix, ContinuationToken }));
     for (const obj of page.Contents || []) {
       if (!obj.Key.endsWith(".json")) continue;
+      if (filter && !filter.test(obj.Key.slice(prefix.length))) continue;
       const body = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: obj.Key }));
       try {
         out.push({ key: obj.Key, ...JSON.parse(await body.Body.transformToString()) });
@@ -616,6 +678,57 @@ async function readPrds(s3, { ListObjectsV2Command, GetObjectCommand }, bucket, 
     }
     ContinuationToken = page.IsTruncated ? page.NextContinuationToken : undefined;
   } while (ContinuationToken);
+  return out;
+}
+
+/**
+ * Every `[SI]` run on the workflows table, reduced to what attachRuns() and
+ * deriveAttemptOutcome() read. `mergedAt` / `deployedAt` come from the run's
+ * `shared/cd-ledger.json` when it exists (same fields the analyzer's cdStamps
+ * reads); absent ledger → both null and the terminal phase decides.
+ */
+async function readSiRuns(ddb, ScanCommand, table, s3, { GetObjectCommand }, bucket) {
+  const rows = [];
+  let ExclusiveStartKey;
+  do {
+    const page = await ddb.send(new ScanCommand({
+      TableName: table,
+      FilterExpression: "begins_with(#i.title, :p)",
+      ExpressionAttributeNames: { "#i": "input" },
+      ExpressionAttributeValues: { ":p": "[SI]" },
+      ProjectionExpression: "workflowId, phase, startedAt, createdAt, completedAt, finalizedAt, updatedAt, epicId, delivery, #i.title, #i.si",
+      ExclusiveStartKey,
+    }));
+    rows.push(...(page.Items || []));
+    ExclusiveStartKey = page.LastEvaluatedKey;
+  } while (ExclusiveStartKey);
+  const out = [];
+  for (const r of rows) {
+    const terminal = ["complete", "cancelled", "error"].includes(r.phase) || RUN_BLOCKED_PHASES.has(String(r.phase));
+    let mergedAt = null;
+    let deployedAt = null;
+    if (r.phase === "complete") {
+      try {
+        const obj = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: `workflows/${r.workflowId}/shared/cd-ledger.json` }));
+        const cd = JSON.parse(await obj.Body.transformToString());
+        const at = r.finalizedAt || r.completedAt || r.updatedAt || null;
+        if (cd?.mergeCommit) mergedAt = cd.mergedAt || at;
+        if (cd?.executionId) deployedAt = cd.deployedAt || at;
+      } catch { /* no ledger: the phase decides */ }
+    }
+    out.push({
+      workflowId: r.workflowId,
+      phase: r.phase,
+      startedAt: r.startedAt || r.createdAt || null,
+      completedAt: terminal ? (r.finalizedAt || r.completedAt || r.updatedAt || null) : null,
+      epicId: r.epicId || null,
+      deliveryMode: r.delivery?.mode || null,
+      title: r.input?.title || "",
+      prdKey: r.input?.si?.prdKey || null,
+      mergedAt,
+      deployedAt,
+    });
+  }
   return out;
 }
 
@@ -630,7 +743,8 @@ async function main() {
         "  --apply    replay the plan through lambda/workflow-analyzer/si-ledger.mjs",
         "  --json     also print the plan as JSON",
         "",
-        "Env: ANALYSES_TABLE, SI_LEDGER_TABLE, ARTIFACT_BUCKET, SI_PRD_PREFIX, AWS_REGION",
+        "Env: ANALYSES_TABLE, WORKFLOWS_TABLE, SI_LEDGER_TABLE, ARTIFACT_BUCKET, SI_PRD_PREFIX",
+        "     (default fleet-imp-agent/prd/), SI_PRD_FILTER (regex on the basename, default ^system-), AWS_REGION",
       ].join("\n"),
     );
     return;
@@ -654,9 +768,13 @@ async function main() {
   const AS_JSON = argv.includes("--json");
   const region = process.env.AWS_REGION || "us-east-1";
   const analysesTable = process.env.ANALYSES_TABLE || "agentcore-hub-workflow-analyses";
+  const workflowsTable = process.env.WORKFLOWS_TABLE || "agentcore-hub-workflows";
   const ledgerTable = process.env.SI_LEDGER_TABLE || "agentcore-hub-si-ledger";
   const bucket = process.env.ARTIFACT_BUCKET;
-  const prefix = process.env.SI_PRD_PREFIX || "workflow-manager/synthesized-prds/";
+  // Where prd-submitter's S3 trigger listens (deploy/continuous-improvement): the
+  // WM's si-synthesis skill writes system-<ts>.json there.
+  const prefix = process.env.SI_PRD_PREFIX || "fleet-imp-agent/prd/";
+  const prdFilter = new RegExp(process.env.SI_PRD_FILTER || "^system-");
   if (!bucket) {
     console.error("ARTIFACT_BUCKET is required (source deploy/config.sh)");
     process.exitCode = 1;
@@ -686,14 +804,18 @@ async function main() {
   const s3 = new s3mod.S3Client({ region });
   const ledger = new ledgerMod.SiLedger({ ddb, table: ledgerTable });
 
-  const [analyses, prds, existingRows] = await Promise.all([
+  const [analyses, rawPrds, runs, existingRows] = await Promise.all([
     readAnalyses(ddb, ScanCommand, analysesTable),
-    readPrds(s3, s3mod, bucket, prefix),
+    readPrds(s3, s3mod, bucket, prefix, prdFilter),
+    readSiRuns(ddb, ScanCommand, workflowsTable, s3, s3mod, bucket),
     ledger.list(),
   ]);
+  const prds = attachRuns(rawPrds, runs);
+  const linked = prds.filter((p) => p.run).length;
   console.log(
     `read ${analyses.length} analyses (${analysesTable}), ${prds.length} PRDs ` +
-      `(s3://${bucket}/${prefix}), ${existingRows.length} existing ledger rows (${ledgerTable})`,
+      `(s3://${bucket}/${prefix}, ${prdFilter}), ${runs.length} [SI] runs (${workflowsTable}), ` +
+      `${linked} PRDs linked to a run, ${existingRows.length} existing ledger rows (${ledgerTable})`,
   );
 
   const plan = buildPlan({ analyses, prds, existingRows });

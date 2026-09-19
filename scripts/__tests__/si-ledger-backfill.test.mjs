@@ -481,3 +481,61 @@ test("replayed twice, the real ledger is byte-identical — no double-append", a
   await applyPlan(ledger, again);
   assert.equal(JSON.stringify([...ddb.items.entries()].sort()), once);
 });
+
+// ── 8. PRD → run linking (the 2026-09-18 handoff wrote 209 occurrences and 0 attempts) ──
+//
+// A PRD object in S3 carries no `run`; the link is the workflows row. The first
+// live backfill read the wrong prefix (0 PRDs) and, once pointed at the right
+// one, reported every PRD as `prd-never-run` because nothing attached the run.
+// These pin the join and the phase-derived outcomes it feeds.
+import { attachRuns, RUN_BLOCKED_PHASES } from "../si-ledger-backfill.mjs";
+
+test("attachRuns links by input.si.prdKey first, then by the '[SI] ' + title convention, newest run wins", () => {
+  const prds = [
+    { key: "fleet-imp-agent/prd/system-1.json", title: "system: honest close" },
+    { key: "fleet-imp-agent/prd/system-2.json", title: "system: binding gates" },
+    { key: "fleet-imp-agent/prd/system-3.json", title: "system: never submitted" },
+  ];
+  const runs = [
+    { workflowId: "wf_old", phase: "cancelled", startedAt: "2026-09-01T00:00:00Z", title: "[SI] system: honest close", prdKey: null },
+    { workflowId: "wf_new", phase: "complete", startedAt: "2026-09-05T00:00:00Z", title: "[SI]  system:  Honest Close ", prdKey: null },
+    { workflowId: "wf_keyed", phase: "verification", startedAt: "2026-09-17T00:00:00Z", title: "[SI] a retitled run", prdKey: "fleet-imp-agent/prd/system-2.json" },
+    { workflowId: "wf_undef", phase: "complete", startedAt: "2026-08-01T00:00:00Z", title: "[SI] undefined", prdKey: null },
+  ];
+  const out = attachRuns(prds, runs);
+  assert.equal(out[0].run.workflowId, "wf_new", "newest run for the title wins");
+  assert.equal(out[0].run.title, undefined, "run carries no title/prdKey fields");
+  assert.equal(out[1].run.workflowId, "wf_keyed", "prdKey beats title");
+  assert.equal(out[2].run, undefined, "no match → no run, and '[SI] undefined' never matches anything");
+});
+
+test("deriveAttemptOutcome reads the run's terminal phase when the cd-ledger left no stamp", () => {
+  const k = "fleet-imp-agent/prd/system-x.json";
+  const at = (run) => deriveAttemptOutcome({ key: k, run });
+  assert.deepEqual(at({ workflowId: "w", phase: "cancelled", completedAt: "t" }), { outcome: "cancelled", status: "open" });
+  assert.deepEqual(at({ workflowId: "w", phase: "error", completedAt: "t" }), { outcome: "error", status: "open" });
+  assert.deepEqual(at({ workflowId: "w", phase: "complete", completedAt: "t" }), { outcome: "landed", status: "landed" });
+  assert.deepEqual(at({ workflowId: "w", phase: "complete", completedAt: "t", deliveryMode: "handoff" }), { outcome: "handoff", status: "landed" });
+  assert.deepEqual(at({ workflowId: "w", phase: "static-ci-only", completedAt: "t" }), { outcome: "error", status: "open" });
+  assert.ok(RUN_BLOCKED_PHASES.has("deploy-blocked"));
+  assert.deepEqual(at({ workflowId: "w", phase: "verification" }), { outcome: "in-run", status: "in-run" });
+  assert.deepEqual(at({ workflowId: "w", phase: "complete", deployedAt: "d", mergedAt: "m" }), { outcome: "deployed", status: "deployed" }, "cd-ledger stamps still win");
+  assert.equal(at({ phase: "complete" }), null, "no workflowId = never run, whatever the phase says");
+});
+
+test("a landed-by-phase attempt carries NO guessed mergedAt (the dedupe window must not start on a guess)", () => {
+  const plan = buildPlan({
+    analyses: [{ workflowId: "wf_a", analysisId: "a1", workflowDefId: "software-delivery", createdAt: "2026-09-01T00:00:00Z",
+      findings: [{ title: "Persona turn died silently mid-stream with no report_completion", severity: "P1" }] }],
+    prds: attachRuns(
+      [{ key: "fleet-imp-agent/prd/system-9.json", title: "system: silent-death recovery", description: "harness silent death auto-resume" }],
+      [{ workflowId: "wf_si", phase: "complete", startedAt: "2026-09-02T00:00:00Z", completedAt: "2026-09-03T00:00:00Z", title: "[SI] system: silent-death recovery", prdKey: null }],
+    ),
+  });
+  const a = plan.attempts.find((x) => x.attempt.prdKey === "fleet-imp-agent/prd/system-9.json");
+  assert.ok(a, "the PRD became an attempt");
+  assert.equal(a.attempt.outcome, "landed");
+  assert.equal(a.attempt.workflowId, "wf_si");
+  assert.equal(a.attempt.mergedAt ?? null, null);
+  assert.equal(a.attempt.deployedAt ?? null, null);
+});
