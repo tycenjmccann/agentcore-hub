@@ -262,6 +262,43 @@ interface GhPr {
 }
 
 /**
+ * SR2-1/SR2-2 pagination bound for the two GitHub LIST reads below. Ten pages is
+ * 500 open PRs at per_page=50 and 1000 changed files at per_page=100 — orders of
+ * magnitude past anything this repo or any sweep PR has produced.
+ */
+const GH_LIST_MAX_PAGES = 10;
+
+/**
+ * Read EVERY page of a GitHub list endpoint, or report that we could not.
+ *
+ * `ghGet` returns `{status, json}` only — no response headers — so Link-header
+ * pagination is not available without changing the hub's one GitHub client. Pages
+ * are walked by `page=N` and stopped by the first SHORT page, which needs no
+ * headers; a short page means page N+1 is never requested.
+ *
+ * `ok: false` is this module's single "the probe could not be completed" signal:
+ * a page that is not 200, a page whose body is not an array, or a still-FULL page
+ * at `maxPages`. Truncating instead would hide exactly the thing FR-9 looks for
+ * (the oldest open sweep PR), so an unread tail fails open (DL-028) rather than
+ * being silently reported as the whole list.
+ */
+async function ghGetAllPages(
+  path: string,
+  opts: RunSweepPreflightOptions,
+  { perPage, maxPages = GH_LIST_MAX_PAGES }: { perPage: number; maxPages?: number }
+): Promise<{ ok: true; items: unknown[] } | { ok: false }> {
+  const sep = path.includes("?") ? "&" : "?";
+  const items: unknown[] = [];
+  for (let page = 1; page <= maxPages; page++) {
+    const res = await ghGet(`${path}${sep}per_page=${perPage}&page=${page}`, opts);
+    if (res.status !== 200 || !Array.isArray(res.json)) return { ok: false };
+    items.push(...res.json);
+    if (res.json.length < perPage) return { ok: true, items };
+  }
+  return { ok: false };
+}
+
+/**
  * Probe GitHub and decide. Never throws: any failure — no token, 404, rate
  * limit, timeout, junk body — returns `proceed` with `probeFailed: true`.
  */
@@ -284,10 +321,10 @@ export async function runSweepPreflight(
     const mainSha = (head.json as { sha?: string } | null)?.sha;
     if (head.status !== 200 || typeof mainSha !== "string" || !mainSha) return failOpen;
 
-    const list = await ghGet(`/repos/${o}/${r}/pulls?state=open&per_page=50`, opts);
-    if (list.status !== 200 || !Array.isArray(list.json)) return failOpen;
+    const list = await ghGetAllPages(`/repos/${o}/${r}/pulls?state=open`, opts, { perPage: 50 });
+    if (!list.ok) return failOpen;
 
-    const candidates = (list.json as GhPr[]).filter((pr) => isSweepHead(pr?.head?.ref || ""));
+    const candidates = (list.items as GhPr[]).filter((pr) => isSweepHead(pr?.head?.ref || ""));
     const openSweepPrs: OpenSweepPr[] = [];
     for (const pr of candidates) {
       const number = pr.number;
@@ -301,9 +338,9 @@ export async function runSweepPreflight(
       if (detail.status !== 200 || !detail.json || typeof detail.json !== "object") return failOpen;
       const full = detail.json as GhPr;
 
-      const files = await ghGet(`/repos/${o}/${r}/pulls/${number}/files?per_page=100`, opts);
-      if (files.status !== 200 || !Array.isArray(files.json)) return failOpen;
-      const removed = (files.json as { status?: string; filename?: string }[])
+      const files = await ghGetAllPages(`/repos/${o}/${r}/pulls/${number}/files`, opts, { perPage: 100 });
+      if (!files.ok) return failOpen;
+      const removed = (files.items as { status?: string; filename?: string }[])
         .filter((f) => f?.status === "removed" && typeof f.filename === "string")
         .map((f) => f.filename as string);
       openSweepPrs.push({

@@ -304,6 +304,21 @@ const detail = (pr: Record<string, unknown>) => ({
   head: { ...(pr.head as object), ...LANDABLE.head },
 });
 
+// ─── SR2-1/SR2-2 pagination fixtures ───────────────────────────────────────────
+
+/** A FULL page (50) of non-sweep PRs, so a real sweep PR on the next page is the
+ *  only reason the preflight would keep reading. */
+const nonSweepPr = (n: number) => ({
+  number: n,
+  html_url: `u${n}`,
+  head: { ref: `feature/TEAM-${n}-thing` },
+  base: { sha: "aaa111" },
+});
+const fullListPage = (from: number) => Array.from({ length: 50 }, (_, i) => nonSweepPr(from + i));
+/** `count` "removed" files, named so page boundaries are visible in a failure diff. */
+const removedFiles = (from: number, count: number) =>
+  Array.from({ length: count }, (_, i) => ({ status: "removed", filename: `src/gone-${from + i}.ts` }));
+
 describe("runSweepPreflight", () => {
   it("probes main, the open PRs and each sweep PR's detail + files — and nothing else", async () => {
     const pr30 = { number: 30, html_url: "u30", head: { ref: "sweep/2026-09" }, base: { sha: "aaa111" }, body: "" };
@@ -329,10 +344,84 @@ describe("runSweepPreflight", () => {
     // files are ever fetched — the preflight must not walk every open PR.
     expect(seen).toEqual([
       "/repos/o/r/commits/main",
-      "/repos/o/r/pulls?state=open&per_page=50",
+      "/repos/o/r/pulls?state=open&per_page=50&page=1",
       "/repos/o/r/pulls/30",
-      "/repos/o/r/pulls/30/files?per_page=100",
+      "/repos/o/r/pulls/30/files?per_page=100&page=1",
     ]);
+  });
+
+  // ─── SR2-1: the open-PR list is paginated ─────────────────────────────────
+  it("paginates the open-PR list to find an OLD open sweep PR past page 1", async () => {
+    // GitHub sorts open PRs newest-first, so an old sweep PR sitting exactly at
+    // main HEAD is invisible to a single-page read once 50+ other PRs are open.
+    const pr30 = { number: 30, html_url: "u30", head: { ref: "sweep/2026-09" }, base: { sha: "aaa111" }, body: "" };
+    const { fetchImpl, seen } = ghStub({
+      "/repos/o/r/commits/main": { json: { sha: "aaa111" } },
+      "/repos/o/r/pulls?state=open&per_page=50&page=1": { json: fullListPage(1) },
+      "/repos/o/r/pulls?state=open&per_page=50&page=2": { json: [pr30] },
+      "/repos/o/r/pulls/30": { json: detail(pr30) },
+      "/repos/o/r/pulls/30/files": { json: [{ status: "removed", filename: "src/gone.ts" }] },
+    });
+    const pf = await runSweepPreflight({ ...BASE, fetchImpl });
+    expect(pf).toEqual({
+      decision: "skip",
+      reason: "open_sweep_pr",
+      prs: [{ number: 30, url: "u30", baseSha: "aaa111", mergeable: true }],
+      mainSha: "aaa111",
+    });
+    expect(seen).toContain("/repos/o/r/pulls?state=open&per_page=50&page=1");
+    expect(seen).toContain("/repos/o/r/pulls?state=open&per_page=50&page=2");
+    expect(seen.some((u) => u.includes("page=3"))).toBe(false);
+  });
+
+  // ─── SR2-2: a sweep PR's files list is paginated ──────────────────────────
+  it("paginates a sweep PR's changed-files list across pages", async () => {
+    const pr30 = { number: 30, html_url: "u30", head: { ref: "sweep/2026-09" }, base: { sha: "aaa111" }, body: "" };
+    const { fetchImpl, seen } = ghStub({
+      "/repos/o/r/commits/main": { json: { sha: "bbb222" } },
+      "/repos/o/r/pulls?state=open": { json: [pr30] },
+      "/repos/o/r/pulls/30": { json: detail(pr30) },
+      "/repos/o/r/pulls/30/files?per_page=100&page=1": { json: removedFiles(1, 100) },
+      "/repos/o/r/pulls/30/files?per_page=100&page=2": { json: removedFiles(101, 2) },
+    });
+    const pf = await runSweepPreflight({ ...BASE, fetchImpl });
+    expect(pf.decision).toBe("proceed");
+    const alreadyRemoved = pf.decision === "proceed" ? pf.alreadyRemoved : [];
+    expect(alreadyRemoved).toHaveLength(102);
+    expect(alreadyRemoved).toContain("src/gone-1.ts");
+    expect(alreadyRemoved).toContain("src/gone-101.ts");
+    expect(seen).toContain("/repos/o/r/pulls/30/files?per_page=100&page=1");
+    expect(seen).toContain("/repos/o/r/pulls/30/files?per_page=100&page=2");
+  });
+
+  it("open-PR list pagination cap ⇒ fails open without requesting an 11th page", async () => {
+    // Every page comes back FULL (50 items) forever, so the probe can never
+    // conclude it has seen the whole list. Ten pages in, it must give up rather
+    // than report a truncated list as though it were complete.
+    const { fetchImpl, seen } = ghStub({
+      "/repos/o/r/commits/main": { json: { sha: "aaa111" } },
+      "/repos/o/r/pulls?state=open": { json: fullListPage(1) },
+    });
+    const pf = await runSweepPreflight({ ...BASE, fetchImpl });
+    expect(pf).toEqual({ decision: "proceed", alreadyRemoved: [], probeFailed: true, mainSha: null });
+    const listPages = seen.filter((u) => u.startsWith("/repos/o/r/pulls?state=open"));
+    expect(listPages).toHaveLength(10);
+    expect(listPages.some((u) => u.includes("page=11"))).toBe(false);
+  });
+
+  it("PR files-list pagination cap ⇒ fails open without requesting an 11th page", async () => {
+    const pr30 = { number: 30, html_url: "u30", head: { ref: "sweep/2026-09" }, base: { sha: "aaa111" }, body: "" };
+    const { fetchImpl, seen } = ghStub({
+      "/repos/o/r/commits/main": { json: { sha: "aaa111" } },
+      "/repos/o/r/pulls?state=open": { json: [pr30] },
+      "/repos/o/r/pulls/30": { json: detail(pr30) },
+      "/repos/o/r/pulls/30/files": { json: removedFiles(1, 100) },
+    });
+    const pf = await runSweepPreflight({ ...BASE, fetchImpl });
+    expect(pf).toEqual({ decision: "proceed", alreadyRemoved: [], probeFailed: true, mainSha: null });
+    const filesPages = seen.filter((u) => u.startsWith("/repos/o/r/pulls/30/files"));
+    expect(filesPages).toHaveLength(10);
+    expect(filesPages.some((u) => u.includes("page=11"))).toBe(false);
   });
 
   it("collects removed paths AND ledger symbols into deletedPaths", async () => {
@@ -433,6 +522,16 @@ describe("runSweepPreflight", () => {
       {
         "/repos/o/r/commits/main": { json: { sha: "aaa111" } },
         "/repos/o/r/pulls?state=open": { json: { message: "nope" } },
+      },
+    ],
+    [
+      // SR2-1: the FIRST page reads fine — it is the SECOND page that fails, so a
+      // helper that only checked page 1's status would miss this.
+      "the PR list's second page is rate-limited",
+      {
+        "/repos/o/r/commits/main": { json: { sha: "aaa111" } },
+        "/repos/o/r/pulls?state=open&per_page=50&page=1": { json: fullListPage(1) },
+        "/repos/o/r/pulls?state=open&per_page=50&page=2": { status: 403, json: { message: "rate limit" } },
       },
     ],
     [
