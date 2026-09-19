@@ -370,16 +370,44 @@ Lambda's 4KB env budget.
 > and never touches DynamoDB tables, env vars or IAM. So creating
 > `agentcore-hub-si-ledger`, putting `SI_LEDGER_TABLE` on all four surfaces
 > (`workflow-analyzer` + `prd-submitter` Lambdas, the WM harness, the hub ECS
-> service) and applying the two IAM statements (`SiLedgerTable` on
-> `agentcore-hub-lambda-role`, `SiLedgerReadWrite` on `agentcore-hub-harness-role`)
-> are steps a human runs once, via
-> `./scripts/create-dynamodb-tables.sh`, `./deploy/workflow-manager/deploy.sh`,
-> `./deploy/continuous-improvement/deploy.sh`,
-> `node deploy/workflow-manager/setup-workflow-manager.mjs` and
-> `deploy/ecs-express/set-env.sh`. Until they are done, the shipped code sees an
-> unset `SI_LEDGER_TABLE` / `AccessDenied`. Remember that harness
-> `environmentVariables` and the ECS/Lambda env APIs are **replace-all**: use
-> `set-env.sh` / `set-runtime-env.py`, never a raw update call.
+> service) and applying the IAM statements (`SiLedgerTable` on
+> `agentcore-hub-lambda-role`, `SiLedgerReadWrite` on `agentcore-hub-harness-role`,
+> `HubLiveVerifyRead` on `agentcore-hub-coding-runtime-role` — the identity that
+> performs B3b LIVE VERIFY) are steps a human runs once. **One command
+> does all of them, idempotently:**
+>
+> ```bash
+> ./scripts/si-ledger-handoff.sh --dry-run   # the default: prints every mutation, executes none
+> ./scripts/si-ledger-handoff.sh --apply     # then actually apply
+> ```
+>
+> It calls the scripts that own each definition (`setup-workflow-manager.mjs --iam-only`,
+> `IAM_ONLY=1 deploy/workflow-manager/deploy.sh`,
+> `IAM_ONLY=1 deploy/continuous-improvement/deploy.sh`,
+> `ONLY_POLICY=HubLiveVerifyRead deploy/coding-agent-runtime/setup-coding-runtime-role.sh`),
+> **merges** the env onto all four surfaces, runs `scripts/si-ledger-backfill.mjs`, and
+> verifies the result with `iam simulate-principal-policy` — including the negatives, that
+> the coding-runtime role still cannot write and cannot Scan
+> `agentcore-hub-cloud-code-sessions`. `--print-policies` dumps the two IAM
+> documents without touching anything.
+>
+> `HubLiveVerifyRead` is **read-only and a fixed allow-list**, not a wildcard
+> (TEAM-4785): `DescribeTable`/`Scan`/`Query`/`GetItem` on exactly `agentcore-hub-`
+> `si-ledger`, `workflows`, `tickets`, `events`, `workflow-analyses`, `eval-results`,
+> `eval-daily`, `eval-config` (+ their `/index/*`), `s3:GetObject` on
+> `config/{agents,workflows,connectors}.json`, `workflows/*` and `completions/*`, and
+> `s3:ListBucket` constrained by an `s3:prefix` condition to those three prefixes.
+> Deliberately NOT readable: `cloud-code-sessions` (other tenants' session rows),
+> `routines`, `anomaly-watcher-state`, `eval-seen`, and `config/cd-registry.json`
+> (it holds the cross-account CD `externalId`). The role is assumed by the
+> **untrusted** coding runtime, so the wildcard grants the trusted roles hold are
+> not a precedent. A new hub table therefore **fails closed** under live verify with
+> `AccessDenied` until it is added to the allow-list in
+> `deploy/coding-agent-runtime/setup-coding-runtime-role.sh` and this handoff is re-run. Until it has been run, the shipped code sees an
+> unset `SI_LEDGER_TABLE` / `AccessDenied`: that is TEAM-4770, where #637 deployed and
+> sat inert (patternKey `tooling.coding-role.no-live-verify-access`). Remember that
+> harness `environmentVariables` and the ECS/Lambda env APIs are **replace-all**: use
+> `set-harness-env.mjs` / `set-env.sh` / `set-runtime-env.py`, never a raw update call.
 >
 > Which script owns which surface: `deploy/workflow-manager/deploy.sh` sets the env
 > and the `SiLedgerTable` grant for `workflow-analyzer`;
@@ -387,8 +415,12 @@ Lambda's 4KB env budget.
 > own `EvalResultsAccess` document carries a narrower duplicate of the statement, so
 > the Evaluations module works on an install that never deployed the Workflow
 > Manager) and packages the byte-copied `si-ledger.mjs` into its zip. Only the WM
-> harness and the ECS service are hand-set. `./deploy/continuous-improvement/verify.sh`
-> asserts the submitter's env var and that the table is ACTIVE.
+> harness and the ECS service are hand-set — the harness by
+> `deploy/workflow-manager/set-harness-env.mjs` (`UpdateHarness`'s
+> `environmentVariables` is replace-all, so it reads the live env back via
+> `GetHarness` and merges), the service by `deploy/ecs-express/set-env.sh`.
+> `./deploy/continuous-improvement/verify.sh` asserts the submitter's env var and
+> that the table is ACTIVE.
 >
 > `deploy/workflow-manager/deploy.sh` additionally sets `ARTIFACT_BUCKET` on the
 > analyzer (without it no attempt can be dated from the cd-ledger, so every fix
