@@ -187,14 +187,14 @@ export function createReconcileSweep(deps) {
       }
     }
 
-    // W3 — a closed gate re-filed as the same kind under the same epic.
+    // W3 — a closed gate re-filed (created AT OR AFTER the close) as the same kind.
     const kinds = gateKindsOf(sibling.labels);
     if (kinds.length && sibling.status === "done") {
       const closedMs = Date.parse(sibling.updatedAt || "");
       const refiled = siblings.some((s) => s && s.ticketId !== ticketId
         && !TERMINAL_TICKET_STATUSES.has(s.status)
         && gateKindsOf(s.labels).some((k) => kinds.includes(k))
-        && Math.abs(Date.parse(s.createdAt || "") - closedMs) <= WATCH.refileMs);
+        && Date.parse(s.createdAt || "") >= closedMs && Date.parse(s.createdAt || "") <= closedMs + WATCH.refileMs);
       if (refiled) {
         await page(`notif_watch_refile_${ticketId}`, "watch_refile",
           `gate ${kinds.join(",")} closed then re-filed within 30m`, "watchRefile");

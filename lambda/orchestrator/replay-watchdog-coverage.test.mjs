@@ -209,6 +209,63 @@ describe("replay TEAM-4660 — 06:20Z close, 07:30Z re-file is NOT a loop (TEAM-
     expect(s.notifications[0].id).toBe("notif_watch_refile_TEAM-4660");
     expect(s.notifications[0].notification.watch).toBe("watch_refile");
   });
+
+  // SR2-4: the window used to be Math.abs(createdAt - closedMs) <= refileMs, which
+  // is SYMMETRIC — a sibling already open 10m BEFORE the close (not a re-file at
+  // all) fell inside it and paged a false watch_refile. This is the mutation
+  // check: restoring Math.abs on the comparison line makes this one fail.
+  it("SR2-4: a same-kind sibling created 10m BEFORE the close is not a re-file — no page", async () => {
+    const before = {
+      ticketId: "TEAM-4663", type: "task", status: "in_review", assignee: "human:tycen",
+      labels: ["gate:deploy-approval"], updatedAt: "2026-09-14T06:10:00Z", createdAt: "2026-09-14T06:10:00Z",
+    };
+    const s = makeSweep({ workflow: wf("37ule1", "TEAM-4640"), siblings: [closedGate, before], nowMs: NOW });
+
+    const m = await s.runSweep();
+
+    expect(m.watchRefile).toBe(0);
+    expect(s.notifications.map((n) => n.id)).not.toContain("notif_watch_refile_TEAM-4660");
+  });
+
+  it("SR2-4: the same shape 10m AFTER the close still pages", async () => {
+    const after = {
+      ticketId: "TEAM-4664", type: "task", status: "in_review", assignee: "human:tycen",
+      labels: ["gate:deploy-approval"], updatedAt: "2026-09-14T06:30:00Z", createdAt: "2026-09-14T06:30:00Z",
+    };
+    const s = makeSweep({ workflow: wf("37ule1", "TEAM-4640"), siblings: [closedGate, after], nowMs: NOW });
+
+    const m = await s.runSweep();
+
+    expect(m.watchRefile).toBe(1);
+    expect(s.notifications[0].id).toBe("notif_watch_refile_TEAM-4660");
+  });
+
+  it("SR2-4: an unparseable close timestamp never pages, even with a valid re-file sibling", async () => {
+    const nanClosedGate = { ...closedGate, updatedAt: "not-a-date" };
+    const validSibling = {
+      ticketId: "TEAM-4665", type: "task", status: "in_review", assignee: "human:tycen",
+      labels: ["gate:deploy-approval"], updatedAt: "2026-09-14T06:30:00Z", createdAt: "2026-09-14T06:30:00Z",
+    };
+    const s = makeSweep({ workflow: wf("37ule1", "TEAM-4640"), siblings: [nanClosedGate, validSibling], nowMs: NOW });
+
+    const m = await s.runSweep();
+
+    expect(m.watchRefile).toBe(0);
+    expect(s.notifications.map((n) => n.id)).not.toContain("notif_watch_refile_TEAM-4660");
+  });
+
+  it("SR2-4: an unparseable sibling createdAt never pages, even against a valid close", async () => {
+    const garbageSibling = {
+      ticketId: "TEAM-4666", type: "task", status: "in_review", assignee: "human:tycen",
+      labels: ["gate:deploy-approval"], updatedAt: "2026-09-14T06:30:00Z", createdAt: undefined,
+    };
+    const s = makeSweep({ workflow: wf("37ule1", "TEAM-4640"), siblings: [closedGate, garbageSibling], nowMs: NOW });
+
+    const m = await s.runSweep();
+
+    expect(m.watchRefile).toBe(0);
+    expect(s.notifications.map((n) => n.id)).not.toContain("notif_watch_refile_TEAM-4660");
+  });
 });
 
 describe("watchdog.mjs is a config resolver, which is why W2/W3 exist", () => {
