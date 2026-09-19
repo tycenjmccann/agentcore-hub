@@ -264,6 +264,23 @@ const submit = (extra: Record<string, unknown> = {}) =>
     ...extra,
   });
 
+/** #30: also open, based on MAIN, from a branch in this repo, and mergeable — but
+ *  older than #33, whose base has since moved. SR2-3: the skip's ONE comment must
+ *  land on #30, the PR the "re-verified against main" sentence is true about. */
+const OTHER_BASE = "ccc3330000000000000000000000000000000000";
+const PR_30_AT_MAIN = {
+  number: 30,
+  html_url: "u30",
+  head: { ref: "chore/dead-code-sweep-30", repo: { full_name: "tycenjmccann/agentcore-hub" } },
+  base: { sha: MAIN, ref: "main" },
+};
+const PR_33_AT_OTHER_BASE = {
+  number: 33,
+  html_url: "u33",
+  head: { ref: "chore/dead-code-sweep-33", repo: { full_name: "tycenjmccann/agentcore-hub" } },
+  base: { sha: OTHER_BASE, ref: "main" },
+};
+
 describe("POST /api/workflow/start — sweep preflight skip", () => {
   it("answers 200 { skipped:true } and creates NO epic, ticket or workflow row", async () => {
     openSweepPrAtMain();
@@ -354,6 +371,36 @@ describe("POST /api/workflow/start — sweep preflight skip", () => {
     // Still a skip — the marker is a coalescing hint, never a reason to run.
     expect((await res.json()).skipped).toBe(true);
     expect(h.deletes).toEqual([]);
+  });
+
+  it("SR2-3: with two viable open sweep PRs, comments only on the one AT main", async () => {
+    // #30 is what triggers the skip (its baseSha IS mainSha); #33 is viable too
+    // and gets echoed in `prs`, but its base has moved on — the comment's claim
+    // "re-verified against main @<sha>" would be false if posted there.
+    h.routes = {
+      "/repos/tycenjmccann/agentcore-hub/commits/main": { json: { sha: MAIN } },
+      "/repos/tycenjmccann/agentcore-hub/pulls?state=open": { json: [PR_30_AT_MAIN, PR_33_AT_OTHER_BASE] },
+      "/repos/tycenjmccann/agentcore-hub/pulls/30": { json: { ...PR_30_AT_MAIN, draft: false, mergeable: true } },
+      "/repos/tycenjmccann/agentcore-hub/pulls/30/files": { json: [] },
+      "/repos/tycenjmccann/agentcore-hub/pulls/33": { json: { ...PR_33_AT_OTHER_BASE, draft: false, mergeable: true } },
+      "/repos/tycenjmccann/agentcore-hub/pulls/33/files": { json: [] },
+      "/repos/tycenjmccann/agentcore-hub/issues/30/comments": { status: 201, json: {} },
+      "/repos/tycenjmccann/agentcore-hub/issues/33/comments": { status: 201, json: {} },
+    };
+    const res = await submit();
+    const body = await res.json();
+    expect(body.skipped).toBe(true);
+    expect(body.prs).toEqual([
+      { number: 30, url: "u30", baseSha: MAIN, mergeable: true },
+      { number: 33, url: "u33", baseSha: OTHER_BASE, mergeable: true },
+    ]);
+    const comments30 = h.fetches.filter((f) => f.url.endsWith("/issues/30/comments"));
+    const comments33 = h.fetches.filter((f) => f.url.endsWith("/issues/33/comments"));
+    expect(comments30).toHaveLength(1);
+    expect(comments33).toEqual([]);
+    expect(JSON.parse(String(comments30[0].init?.body)).body).toMatch(
+      new RegExp(`^re-verified against main @${MAIN} on \\d{4}-\\d{2}-\\d{2}; still mergeable$`)
+    );
   });
 });
 

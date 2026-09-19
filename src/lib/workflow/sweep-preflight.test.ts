@@ -11,6 +11,7 @@ import {
   shouldMintEpic,
   sweepPreflightNote,
   preflightRowField,
+  skipCommentTarget,
 } from "./sweep-preflight";
 
 /**
@@ -686,6 +687,50 @@ describe("route helpers", () => {
     expect(shouldMintEpic({ decision: "skip", reason: "unchanged_main", prs: [] })).toBe(false);
     expect(shouldMintEpic({ decision: "proceed", alreadyRemoved: [] })).toBe(true);
     expect(shouldMintEpic({ decision: "proceed", alreadyRemoved: [], probeFailed: true })).toBe(true);
+  });
+
+  it("skipCommentTarget picks the newest PR that is actually AT mainSha (SR2-3)", () => {
+    // #30 is the only one at main; taking the highest PR NUMBER out of `prs` would
+    // have picked #33, whose baseSha the comment's claim would then be false about.
+    expect(
+      skipCommentTarget({
+        decision: "skip",
+        reason: "open_sweep_pr",
+        prs: [
+          { number: 30, url: "u30", baseSha: "aaa111", mergeable: true },
+          { number: 33, url: "u33", baseSha: "ccc333", mergeable: true },
+        ],
+        mainSha: "aaa111",
+      })
+    ).toEqual({ number: 30, url: "u30", baseSha: "aaa111", mergeable: true });
+
+    // Both at main ⇒ the newest of the matching ones, same as before.
+    expect(
+      skipCommentTarget({
+        decision: "skip",
+        reason: "open_sweep_pr",
+        prs: [
+          { number: 30, url: "u30", baseSha: "aaa111", mergeable: true },
+          { number: 33, url: "u33", baseSha: "aaa111", mergeable: true },
+        ],
+        mainSha: "aaa111",
+      })
+    ).toEqual({ number: 33, url: "u33", baseSha: "aaa111", mergeable: true });
+
+    // No known main SHA ⇒ no PR to truthfully claim re-verification against.
+    expect(
+      skipCommentTarget({
+        decision: "skip",
+        reason: "open_sweep_pr",
+        prs: [{ number: 30, url: "u30", baseSha: "aaa111", mergeable: true }],
+        mainSha: null,
+      })
+    ).toBeUndefined();
+
+    // unchanged_main's empty echo ⇒ nothing to comment on either.
+    expect(
+      skipCommentTarget({ decision: "skip", reason: "unchanged_main", prs: [], mainSha: "aaa111" })
+    ).toBeUndefined();
   });
 
   it("renders the delimited alreadyRemoved block the analyst reads", () => {

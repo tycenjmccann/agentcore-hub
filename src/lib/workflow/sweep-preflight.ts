@@ -445,6 +445,29 @@ export function shouldMintEpic(pf: SweepPreflight): boolean {
   return pf.decision !== "skip";
 }
 
+/**
+ * SR2-3 — which PR the ONE comment a skip leaves behind belongs on.
+ *
+ * `decideSweepPreflight` skips when ANY viable PR sits at the current main, but
+ * echoes EVERY viable PR in `prs` (a human reading the skip needs the whole set —
+ * lpkxmt had two). The comment, though, says "re-verified against main @<sha>", so
+ * it may only be posted where that is TRUE. Taking the highest number out of `prs`
+ * put it on a PR based on some other commit whenever the newest match was not the
+ * newest echo. Newest AMONG the PRs actually at `mainSha`; undefined when the SHA
+ * is unknown or nothing matches (`unchanged_main`, whose `prs` is empty, lands here
+ * too, and correctly comments on nothing).
+ */
+export function skipCommentTarget(
+  pf: SweepPreflightRun & { decision: "skip" }
+): SkippedPrRef | undefined {
+  if (!pf?.mainSha) return undefined;
+  return (pf.prs || []).reduce<SkippedPrRef | undefined>(
+    (best, pr) =>
+      pr && pr.baseSha === pf.mainSha && (best === undefined || pr.number > best.number) ? pr : best,
+    undefined
+  );
+}
+
 /** The delimited block appended to the run's description. "" when there is
  *  nothing an analyst would act on, so an ordinary sweep's prompt is unchanged. */
 export function sweepPreflightNote(pf: SweepPreflight): string {
