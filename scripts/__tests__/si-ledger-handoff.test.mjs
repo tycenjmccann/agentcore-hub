@@ -795,6 +795,109 @@ test("set-harness-env.mjs still runs from a path containing a space", () => {
   assert.match(ok.stdout, /Usage: node .*set-harness-env\.mjs/);
 });
 
+// ── 3c. TEAM-4809 F2 — a flag whose operand never arrived is an error ────────
+//
+// `unsets.push(argv[++i])` pushed `undefined` for a trailing `--unset`; the
+// "nothing to do" guard only counts unsets.length, and `undefined in env` is
+// false, so the run reached ListHarnesses + GetHarness, removed nothing, printed
+// "nothing changed" and exited 0. An operator who mistyped an unset got a green
+// run with the variable still set — the TEAM-4770 shape (inert, with a tick).
+// A flag-shaped operand is the same defect: `--unset --dry-run` would have
+// removed a key named "--dry-run" AND consumed the --dry-run, so a run the
+// operator planned as a dry run would have written.
+
+test("set-harness-env.mjs rejects a --unset/--harness with no operand", async () => {
+  const mod = await import("../../deploy/workflow-manager/set-harness-env.mjs");
+
+  // Missing operand: `argv[++i]` walked off the end.
+  assert.throws(() => mod.parseArgs(["--unset"]), /--unset expects a value, got nothing/);
+  assert.throws(() => mod.parseArgs(["A=1", "--unset"]), /--unset expects a value/);
+  assert.throws(() => mod.parseArgs(["--harness"]), /--harness expects a value, got nothing/);
+
+  // Flag-shaped operand: the next token is the NEXT flag, never a key name.
+  assert.throws(() => mod.parseArgs(["--unset", "--dry-run"]), /--unset expects a value, got "--dry-run"/);
+  assert.throws(() => mod.parseArgs(["--harness", "--unset", "OLD"]), /--harness expects a value, got "--unset"/);
+
+  // The pre-existing rejection is unchanged.
+  assert.throws(() => mod.parseArgs(["--bogus"]), /unknown flag --bogus/);
+
+  // …and every valid form still parses exactly as before.
+  assert.deepEqual(mod.parseArgs(["A=1", "--unset", "OLD", "--harness", "h", "--dry-run"]), {
+    harnessName: "h",
+    unsets: ["OLD"],
+    assignments: ["A=1"],
+    dryRun: true,
+  });
+  assert.deepEqual(mod.parseArgs(["A=1"]), {
+    harnessName: mod.DEFAULT_HARNESS_NAME,
+    unsets: [],
+    assignments: ["A=1"],
+    dryRun: false,
+  });
+});
+
+// The exit code alone proves nothing here: stubEnv points the SDK at the discard
+// port, so the BUGGY version also exits 1 — just from ECONNREFUSED on
+// ListHarnesses, after having decided that removing a key called "undefined" was
+// the job. The MESSAGE is the assertion, and it can only come from the parse,
+// which runs above the @aws-sdk dynamic import.
+test('a dangling --unset fails at parse, not with "nothing changed"', () => {
+  const stub = makeStub();
+  const r = spawnSync(
+    process.execPath,
+    [join(REPO, "deploy/workflow-manager/set-harness-env.mjs"), "--unset"],
+    { cwd: REPO, env: stubEnv(stub), encoding: "utf8", timeout: 60_000 },
+  );
+  assert.equal(r.status, 1, `expected exit 1, got ${r.status}\n${r.stdout}\n${r.stderr}`);
+  assert.match(
+    r.stderr,
+    /✗ --unset expects a value/,
+    `the dangling --unset was not rejected at parse:\n${r.stdout}\n${r.stderr}`,
+  );
+  assert.doesNotMatch(
+    r.stdout,
+    /nothing changed/,
+    `a mistyped unset was reported as a successful no-op:\n${r.stdout}`,
+  );
+  // It never reached an AWS call, so it cannot have reported a harness.
+  assert.doesNotMatch(r.stdout, /🔧/);
+});
+
+// TEAM-4809 sibling sweep — deploy/ecs-express/set-env.sh is the OTHER replace-all
+// env push the handoff drives (step 4), and it had F2's flag-shaped-operand half:
+// `--unset) UNSETS+=("$2"); shift 2` took "--dry-run" as the key name and consumed
+// the --dry-run with it. set -euo pipefail already aborted on a TRAILING --unset.
+//
+// NOTE on "before any aws call": the guard is in the arg loop, which sits below
+// `source ../config.sh` — and config.sh:23 resolves the account via
+// `aws sts get-caller-identity`. So one read precedes the rejection no matter what
+// the guard does; hoisting the loop above the source would reorder which error an
+// uncredentialled box reports first, which is more than this fix should change.
+// The assertion is therefore the one that matters: no ecs call, and no mutation.
+test("set-env.sh rejects a flag-shaped --unset operand before any ecs call", () => {
+  const stub = makeStub();
+  const r = spawnSync("bash", [join(REPO, "deploy/ecs-express/set-env.sh"), "--unset", "--dry-run"], {
+    cwd: REPO,
+    env: stubEnv(stub),
+    encoding: "utf8",
+    timeout: 60_000,
+  });
+  const calls = existsSync(stub.log) ? readFileSync(stub.log, "utf8") : "";
+  assert.equal(r.status, 1, `expected exit 1, got ${r.status}\n${r.stdout}\n${r.stderr}`);
+  assert.match(
+    r.stderr,
+    /--unset expects a value/,
+    `set-env.sh took a flag as the key to unset:\n${r.stdout}\n${r.stderr}`,
+  );
+  // It never got to the service, let alone the merge or the update.
+  assert.doesNotMatch(calls, /\becs\b/, `set-env.sh reached an ecs call before rejecting:\n${calls}`);
+  assert.doesNotMatch(r.stdout, /🔧/, `set-env.sh merged an env from a flag-shaped key:\n${r.stdout}`);
+  // Only config.sh's account probe may have run (see the note above).
+  for (const line of calls.split("\n").filter(Boolean)) {
+    assert.match(line, /^sts get-caller-identity/, `unexpected AWS call before the guard: ${line}`);
+  }
+});
+
 // ── 4. manifest registration + the additive IAM_ONLY guard ──────────────────
 
 test("surfaces.json lists both new handoff files", () => {
@@ -925,6 +1028,71 @@ test("--iam-only on setup-workflow-manager.mjs cannot reach the harness", () => 
   // PIPELINE_MODE must not be able to skip an explicitly requested IAM run —
   // that skip is exactly why #637's grant never landed.
   assert.match(src, /if \(PIPELINE_MODE && !IAM_ONLY\)/);
+});
+
+// ── 4b. TEAM-4809 F1 — the account comes from STS on every mutating path ─────
+//
+// `let accountId = getArg("account-id")` was honoured in EVERY mode, including
+// --iam-only, while the comment above it said "Every other mode still resolves the
+// account from credentials". accountId builds tableArns, ROLE_ARN and the
+// trust-policy conditions, so `--iam-only --account-id <other>` with real
+// credentials put WorkflowManagerData — scoped to ANOTHER account's table ARNs —
+// on the REAL agentcore-hub-harness-role, and printed ✓. The flag had no caller
+// anywhere in the repo and was absent from the usage header.
+//
+// 210987654321 is this repo's second placeholder account
+// (scripts/check-no-hardcoded-accounts.sh:12-13).
+const WRONG_ACCOUNT = "210987654321";
+
+test("setup-workflow-manager.mjs takes the account from STS, never from an argument", () => {
+  const src = readFileSync(join(REPO, "deploy/workflow-manager/setup-workflow-manager.mjs"), "utf8");
+
+  // No argument may name the account.
+  assert.doesNotMatch(
+    src,
+    /getArg\((["'])account-id\1\)/,
+    "the account is taken from an argument again — that aims PutRolePolicy at another account",
+  );
+
+  // Exactly ONE assignment of accountId that is not the STS answer (that line
+  // reads `accountId } =`, so it does not match), and it is gated on PRINT_POLICY,
+  // which exits before the first IAM client.
+  const assigns = src.split("\n").filter((l) => /\baccountId\s*=/.test(l) && !l.includes("sts.send"));
+  assert.equal(assigns.length, 1, `unexpected accountId assignment(s):\n${assigns.join("\n")}`);
+  assert.match(assigns[0], /PRINT_POLICY/, `the account is overridable outside --print-policy: ${assigns[0]}`);
+  assert.match(assigns[0], /process\.env\.AWS_ACCOUNT_ID/);
+});
+
+// The behavioural half. stubEnv gives fake credentials and points every SDK client
+// at the discard port, so BOTH versions exit non-zero — what differs is WHERE.
+// With the bug, --account-id short-circuits STS, WM_DATA_POLICY is built for the
+// forged account, and the run reaches the "1/4 Execution role" banner before dying
+// on GetRole (against a real account it would reach PutRolePolicy and print ✓).
+// Fixed, it dies inside GetCallerIdentity, above that banner.
+//
+// stubEnv also sets AWS_ACCOUNT_ID, so the same banner assertion simultaneously
+// pins that AWS_ACCOUNT_ID is ignored outside --print-policy — i.e. it pins the
+// comment's claim, not just the flag's removal.
+test("--iam-only ignores an account argument and stops at STS", () => {
+  const r = spawnSync(
+    process.execPath,
+    [
+      join(REPO, "deploy/workflow-manager/setup-workflow-manager.mjs"),
+      "--iam-only",
+      "--account-id",
+      WRONG_ACCOUNT,
+    ],
+    { cwd: REPO, env: stubEnv(makeStub()), encoding: "utf8", timeout: 60_000 },
+  );
+  const out = `${r.stdout}${r.stderr}`;
+  assert.notEqual(r.status, 0, `--iam-only succeeded with a forged account:\n${out}`);
+  assert.ok(!out.includes(WRONG_ACCOUNT), `${WRONG_ACCOUNT} reached the run:\n${out}`);
+  assert.doesNotMatch(
+    r.stdout,
+    /1\/4 Execution role/,
+    `--iam-only got past account resolution with a forged account:\n${r.stdout}`,
+  );
+  assert.doesNotMatch(r.stdout, /WorkflowManagerData inline policy applied/);
 });
 
 test("the handoff script never redefines a policy document of its own", () => {
