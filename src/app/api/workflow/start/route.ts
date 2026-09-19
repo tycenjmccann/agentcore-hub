@@ -24,6 +24,7 @@ import {
   shouldMintEpic,
   sweepPreflightNote,
   preflightRowField,
+  skipCommentTarget,
 } from "@/lib/workflow/sweep-preflight";
 import type { SweepPreflightRun } from "@/lib/workflow/sweep-preflight";
 import type { RepoCheck } from "@/lib/workflow/repo-check";
@@ -282,21 +283,20 @@ async function recordSweepSkip(
   } catch {
     /* event publish is non-fatal */
   }
-  const newest = pf.prs.reduce<(typeof pf.prs)[number] | undefined>(
-    (best, pr) => (best === undefined || pr.number > best.number ? pr : best),
-    undefined
-  );
-  if (newest && pf.mainSha) {
+  // SR2-3: the comment asserts "re-verified against main @<sha>", so it goes on a
+  // PR that is actually AT that sha — not merely the newest one echoed in `prs`.
+  const target = skipCommentTarget(pf);
+  if (target && pf.mainSha) {
     await commentOnSweepPr({
       owner: ctx.owner,
       repo: ctx.repo,
-      number: newest.number,
+      number: target.number,
       token: ctx.token,
       mainSha: pf.mainSha,
       date: at.slice(0, 10),
       // TEAM-4752 D4: word the comment from the observed mergeability instead of
       // asserting "still mergeable" off the base SHA.
-      mergeable: newest.mergeable,
+      mergeable: target.mergeable,
     });
   }
   console.log(`[start] dead-code sweep skipped (${pf.reason}) at main @${pf.mainSha ?? "?"}`);

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { runSweepPreflight, shouldMintEpic, sweepPreflightNote } from "./sweep-preflight";
+import { runSweepPreflight, shouldMintEpic, sweepPreflightNote, skipCommentTarget } from "./sweep-preflight";
 import workflowsConfig from "@/config/workflows.json";
 
 /**
@@ -122,6 +122,41 @@ describe("lpkxmt — two open sweep PRs on the base we were about to sweep", () 
     expect(shouldMintEpic(pf)).toBe(false);
     // And nothing is appended to the analyst's prompt, because there is no analyst.
     expect(sweepPreflightNote(pf)).toBe("");
+  });
+
+  it("SR2-3 variant — #33 was rebased elsewhere; the re-verification comment must land on #30", async () => {
+    // Same shape as the real run, except #33's base has moved off 0760fcc since it
+    // opened. Both PRs are still viable and both are echoed, but only #30 is AT
+    // main — so that is the only PR the skip comment may truthfully be posted on.
+    const REBASED_BASE = "1111111111111111111111111111111111111111";
+    const pf = await run({
+      ...commits(MAIN),
+      ...pulls([sweepPr(30, MAIN), sweepPr(33, REBASED_BASE)]),
+      ...prDetail(sweepPr(30, MAIN)),
+      ...prDetail(sweepPr(33, REBASED_BASE)),
+      ...files(30, [{ status: "removed", filename: "src/lib/legacy/formatter.ts" }]),
+      ...files(33, [{ status: "removed", filename: "src/lib/legacy/other.ts" }]),
+    });
+    expect(pf).toEqual({
+      decision: "skip",
+      reason: "open_sweep_pr",
+      prs: [
+        { number: 30, url: "https://github.com/tycenjmccann/agentcore-hub/pull/30", baseSha: MAIN, mergeable: true },
+        {
+          number: 33,
+          url: "https://github.com/tycenjmccann/agentcore-hub/pull/33",
+          baseSha: REBASED_BASE,
+          mergeable: true,
+        },
+      ],
+      mainSha: MAIN,
+    });
+    expect(pf.decision === "skip" && skipCommentTarget(pf)).toEqual({
+      number: 30,
+      url: "https://github.com/tycenjmccann/agentcore-hub/pull/30",
+      baseSha: MAIN,
+      mergeable: true,
+    });
   });
 });
 
