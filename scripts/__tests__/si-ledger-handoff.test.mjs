@@ -30,7 +30,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -144,6 +144,29 @@ case "$ARGS" in
       esac
       printf '%s\\t%s\\n' "$a" "$DECISION"
     done ;;
+  "iam put-role-policy"*)
+    # TEAM-4787 F2: the last call an IAM_ONLY=1 deploy is allowed to make. Answering
+    # it (instead of exit 64) is what lets the IAM_ONLY tests below run the two real
+    # deploy.sh files to completion; the calls log is the actual assertion.
+    : ;;
+  "bedrock-agentcore-control list-agent-runtimes"*)
+    # continuous-improvement/deploy.sh:86 discovers the improver runtime. "None" is
+    # the same answer a credential-less real CLI gives, and the script degrades to a
+    # warning (:91-95) rather than failing.
+    echo "None" ;;
+  "bedrock-agentcore-control list-harnesses"*)
+    echo "hid-test" ;;
+  "bedrock-agentcore-control get-harness"*)
+    # Honest: before --apply the harness env has no SI_LEDGER_TABLE yet (same shape
+    # as the lambda get-function-configuration answer above).
+    echo "None" ;;
+  "ecs list-services"*)
+    echo '{"serviceArns":["arn:aws:ecs:${REGION}:${ACCOUNT}:service/default/agentcore-hub"]}' ;;
+  "ecs describe-express-gateway-service"*)
+    # A LIVE-shaped container: a real image, an int containerPort and a non-empty
+    # environment, because ecs-express/set-env.sh fails closed on any of those being
+    # absent (set-env.sh:72-73). SI_LEDGER_TABLE is deliberately not in it yet.
+    echo '{"service":{"activeConfigurations":[{"primaryContainer":{"image":"stub:latest","containerPort":3000,"environment":[{"name":"EXISTING_KEY","value":"keep"}]}}]}}' ;;
   *)
     echo "STUB: unsupported aws call: $ARGS" >&2
     exit 64 ;;
@@ -155,6 +178,14 @@ function makeStub() {
   const bin = join(dir, "aws");
   writeFileSync(bin, STUB);
   chmodSync(bin, 0o755);
+  // TEAM-4787 F2: a `gh` that always fails, so the eval gate's verdict is the same
+  // here as in CI and on a dev box. `command -v gh` still succeeds (the file exists),
+  // so EVAL_GATE=enforce reaches `gh auth status` and refuses there
+  // (check-eval-gate.sh:553) instead of depending on whether the host's real gh
+  // happens to be authenticated. Nothing else in this suite shells out to gh.
+  const gh = join(dir, "gh");
+  writeFileSync(gh, "#!/usr/bin/env bash\nexit 1\n");
+  chmodSync(gh, 0o755);
   return { dir, log: join(dir, "_calls.log") };
 }
 
@@ -175,6 +206,16 @@ function stubEnv(stub, extra = {}) {
     AWS_PROFILE: "",
     AWS_EC2_METADATA_DISABLED: "true",
     AWS_SDK_LOAD_CONFIG: "0",
+    // TEAM-4787 F3: step 4 now INVOKES set-harness-env.mjs --dry-run, and that child
+    // talks to the control plane through the SDK, which the stubbed `aws` cannot
+    // intercept. Point it at the discard port (immediate ECONNREFUSED) and cap
+    // retries, so the probe fails FAST and deterministically — AWS_MAX_ATTEMPTS alone
+    // would still hang on connect in a sandbox with no network route. run_dry then
+    // prints its ⚠ line, which is what the dry-run test asserts. The stubbed `aws`
+    // ignores all of these, so the CLI-side answers are unaffected.
+    AWS_ENDPOINT_URL: "http://127.0.0.1:9",
+    AWS_MAX_ATTEMPTS: "1",
+    AWS_RETRY_MODE: "standard",
     EXPECTED_ACCOUNT_ID: "",
     ...extra,
   };
@@ -390,6 +431,74 @@ test("dry run is the DEFAULT and mutates nothing", { skip: envLocalSkip }, () =>
   }
 });
 
+// TEAM-4787 F3 — a dry run that only *echoes* the two replace-all env pushes
+// plans nothing: the whole risk in those two surfaces is what the MERGE would
+// contain, and only the child's own read+merge can tell you that. So step 4 must
+// invoke each child with its own --dry-run, and step 7 must verify all three
+// surfaces the script touched (harness env, ECS env, lambda-role grant) — not
+// just the table, the two Lambdas and the two IAM roles.
+test("dry run really probes the replace-all env surfaces, and step 7 verifies all three", { skip: envLocalSkip }, () => {
+  const r = runHandoff(["--dry-run"]);
+  assert.equal(r.status, 0, `exit ${r.status}\n${r.stdout}\n${r.stderr}`);
+
+  // step 4: the children are INVOKED with --dry-run, not echoed.
+  assert.match(
+    r.stdout,
+    /\+ node \S*set-harness-env\.mjs SI_LEDGER_TABLE=\S+ --dry-run/,
+    `step 4 did not plan the harness push with --dry-run:\n${r.stdout}`,
+  );
+  assert.match(
+    r.stdout,
+    /\+ bash \S*ecs-express\/set-env\.sh SI_LEDGER_TABLE=\S+ --dry-run/,
+    `step 4 did not plan the ECS push with --dry-run:\n${r.stdout}`,
+  );
+  // …and the ECS probe really read the live container (echoing cannot do this).
+  assert.match(
+    r.calls,
+    /ecs describe-express-gateway-service/,
+    `the ECS dry-run probe never read the live container:\n${r.calls}`,
+  );
+  assert.match(r.stdout, /🔧 agentcore-hub \(default, us-east-1\)/, "set-env.sh did not report its merge");
+
+  // The harness probe uses the SDK, which the stubbed `aws` cannot answer, so it
+  // fails here by design (stubEnv points it at the discard port). A failed probe
+  // is information, not a reason to abort a dry run — but it must say plainly
+  // that --apply would stop here.
+  assert.match(
+    r.stdout,
+    /⚠ dry-run probe failed \(rc \d+\) — --apply would abort here/,
+    `a failed dry-run probe was not reported as "--apply would abort here":\n${r.stdout}`,
+  );
+
+  // step 7: the three checks the script applied but never verified.
+  assert.match(
+    r.stdout,
+    /agentcore_hub_workflow_manager: SI_LEDGER_TABLE=/,
+    `step 7 never verified the harness env:\n${r.stdout}`,
+  );
+  assert.match(r.calls, /bedrock-agentcore-control get-harness/, "step 7 never called GetHarness");
+  assert.match(
+    r.stdout,
+    /agentcore-hub \([^)]*\): SI_LEDGER_TABLE=/,
+    `step 7 never verified the ECS container env:\n${r.stdout}`,
+  );
+  assert.match(
+    r.stdout,
+    /lambda-role: dynamodb:Scan → allowed/,
+    `step 7 never simulated the agentcore-hub-lambda-role grant step 3 applies:\n${r.stdout}`,
+  );
+  for (const action of ["dynamodb:GetItem", "dynamodb:PutItem"]) {
+    assert.match(r.stdout, new RegExp(`lambda-role: ${action} → allowed`), `lambda-role: no ${action} verdict`);
+  }
+
+  // Still a dry run: the probes are reads, and nothing was mutated.
+  assert.doesNotMatch(
+    r.calls,
+    /(update-harness|update-express-gateway-service|update-function-configuration|put-role-policy|create-table)/,
+    `the dry-run probes mutated something:\n${r.calls}`,
+  );
+});
+
 test("set-harness-env.mjs merges, and sends nothing but harnessId + environmentVariables", async () => {
   const mod = await import("../../deploy/workflow-manager/set-harness-env.mjs");
   const live = { WORKFLOW_MANAGER_ARN: "arn:pre-existing", HAND_SET_ONLY: "keep-me" };
@@ -405,6 +514,39 @@ test("set-harness-env.mjs merges, and sends nothing but harnessId + environmentV
   assert.deepEqual(Object.keys(input).sort(), ["environmentVariables", "harnessId"]);
   assert.equal(input.harnessId, "h-123");
   assert.equal(input.environmentVariables.HAND_SET_ONLY, "keep-me");
+});
+
+// TEAM-4787 F4 — the main guard. `file://${process.argv[1]}` does not
+// percent-encode, so from any path containing a space it never equals
+// import.meta.url: main() never runs, the process exits 0 with no output, and the
+// handoff reports a successful harness push having pushed nothing. --help is the
+// cheapest observable because it returns BEFORE the @aws-sdk dynamic import, and a
+// COPY is enough because the file's only static import is a node: builtin.
+//
+// Copy, not symlink: without --preserve-symlinks-main node resolves the main entry
+// to its realpath, so a symlink would put the space in argv[1] but not in
+// import.meta.url and this test would fail even with the fix.
+test("set-harness-env.mjs still runs from a path containing a space", () => {
+  const src = join(REPO, "deploy/workflow-manager/set-harness-env.mjs");
+  const dir = mkdtempSync(join(tmpdir(), "si handoff space-")); // the space is the point
+  const dest = join(dir, "set-harness-env.mjs");
+  copyFileSync(src, dest);
+
+  const r = spawnSync(process.execPath, [dest, "--help"], { encoding: "utf8", timeout: 60_000 });
+  assert.equal(r.status, 0, `exit ${r.status}\n${r.stderr}`);
+  assert.match(
+    r.stdout,
+    /Usage: node .*set-harness-env\.mjs/,
+    "the main guard compared import.meta.url to an unencoded `file://${argv[1]}`, so from a " +
+      "path with a space main() never runs: the process exits 0 with empty stdout and the " +
+      "handoff reports a harness push it never made",
+  );
+
+  // Control: the in-repo path (no space) behaves identically, so the assertion
+  // above is about encoding and not about --help itself.
+  const ok = spawnSync(process.execPath, [src, "--help"], { encoding: "utf8", timeout: 60_000 });
+  assert.equal(ok.status, 0, ok.stderr);
+  assert.match(ok.stdout, /Usage: node .*set-harness-env\.mjs/);
 });
 
 // ── 4. manifest registration + the additive IAM_ONLY guard ──────────────────
@@ -449,6 +591,79 @@ test("IAM_ONLY=1 exits after put-role-policy and before any code/env deploy", ()
     assert.match(block, /exit 0/, `${file}: IAM_ONLY guard does not exit`);
   }
 });
+
+// TEAM-4787 F2 — the static test above proves the guard is in the right PLACE.
+// It cannot prove the script makes no other write before reaching it, and both
+// files did: continuous-improvement/deploy.sh created the artifact bucket and
+// rewrote its notification configuration above the guard, and
+// workflow-manager/deploy.sh consulted the eval gate above the guard — which
+// needs gh + jq + a green check run and hard-exits without them, and whose
+// break-glass path performs its own S3 write. So RUN each script and assert on
+// the calls log. One test per script, so a regression in either names itself.
+//
+// EVAL_GATE=enforce on purpose: the gate must be SKIPPED under IAM_ONLY=1, not
+// satisfied. WORKFLOW_MANAGER_ARN is passed so the harness-discovery exit at
+// workflow-manager/deploy.sh:43-47 is not what this test measures.
+const IAM_ONLY_ENV = {
+  IAM_ONLY: "1",
+  EVAL_GATE: "enforce",
+  WORKFLOW_MANAGER_ARN: `arn:aws:bedrock-agentcore:${REGION}:${ACCOUNT}:harness/wm-test`,
+};
+// Reads, the conditional create-table, and put-role-policy. Nothing else.
+const IAM_ONLY_ALLOWED =
+  /^(sts get-caller-identity|iam put-role-policy|dynamodb (describe-table|create-table|wait table-exists)|bedrock-agentcore-control list-(harnesses|agent-runtimes)|logs describe-log-groups)\b/;
+
+for (const [label, script] of [
+  ["deploy/workflow-manager/deploy.sh", WM_DEPLOY],
+  ["deploy/continuous-improvement/deploy.sh", CI_DEPLOY],
+]) {
+  test(`IAM_ONLY=1 ${label} writes IAM + tables and nothing else`, { skip: envLocalSkip }, () => {
+    const stub = makeStub();
+    const r = spawnSync("bash", [script], {
+      cwd: REPO,
+      env: stubEnv(stub, IAM_ONLY_ENV),
+      encoding: "utf8",
+      timeout: 120_000,
+    });
+    const calls = existsSync(stub.log) ? readFileSync(stub.log, "utf8") : "";
+    assert.equal(r.status, 0, `${label} exited ${r.status}\n--- stdout\n${r.stdout}\n--- stderr\n${r.stderr}`);
+
+    // The point of IAM_ONLY: the grant lands…
+    assert.match(calls, /iam put-role-policy/, `${label}: IAM_ONLY=1 applied no IAM`);
+    // …and nothing else does.
+    assert.doesNotMatch(
+      calls,
+      /s3api put-bucket-notification-configuration/,
+      `${label}: IAM_ONLY=1 rewrote the artifact bucket's notification configuration:\n${calls}`,
+    );
+    assert.doesNotMatch(calls, /(^|\n)s3 mb\b/, `${label}: IAM_ONLY=1 created a bucket:\n${calls}`);
+    assert.doesNotMatch(calls, /(^|\n)s3 (cp|sync)\b/, `${label}: IAM_ONLY=1 wrote to S3:\n${calls}`);
+    assert.doesNotMatch(
+      calls,
+      /lambda (update-function-|create-function|add-permission)/,
+      `${label}: IAM_ONLY=1 deployed Lambda code or env:\n${calls}`,
+    );
+    assert.doesNotMatch(
+      calls,
+      /(events put-rule|events put-targets|cloudwatch put-metric-alarm|sns create-topic|logs put-subscription-filter)/,
+      `${label}: IAM_ONLY=1 wired infra:\n${calls}`,
+    );
+    for (const line of calls.split("\n").filter(Boolean)) {
+      assert.match(line, IAM_ONLY_ALLOWED, `${label}: IAM_ONLY=1 made a non-IAM call: ${line}`);
+    }
+
+    // The eval gate was not consulted at all — not even to print "skipped".
+    // An IAM_ONLY run ships no gated artifact (no prompt, skill or toolkit), so
+    // there is nothing for the gate to gate, and making the IAM re-apply depend
+    // on gh/jq/GitHub is the opposite of "IAM only".
+    assert.doesNotMatch(
+      `${r.stdout}${r.stderr}`,
+      /eval[- ]gate/i,
+      `${label}: IAM_ONLY=1 consulted the eval gate\n--- stdout\n${r.stdout}\n--- stderr\n${r.stderr}`,
+    );
+    assert.match(r.stdout, /IAM_ONLY=1 — stopping/, `${label}: did not report the IAM_ONLY stop`);
+  });
+}
 
 test("--iam-only on setup-workflow-manager.mjs cannot reach the harness", () => {
   const src = readFileSync(join(REPO, "deploy/workflow-manager/setup-workflow-manager.mjs"), "utf8");
