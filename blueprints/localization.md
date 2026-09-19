@@ -20,7 +20,7 @@ claude_code(
 ### Step 3: Review & Deliver
 - Verify all user-facing strings are cataloged
 - Check for hardcoded strings missed
-- Save the localization spec: `S3Storage___write_object` to `workflows/{workflow_id}/shared/localization-spec.md` (take the spec from the `claude_code` result text; never write it to `/tmp`)
+- Save the localization spec: `load_blueprint("writing-standard")` + `load_blueprint("template-spec")`, then `S3Storage___write_object` to `workflows/{workflow_id}/shared/localization-spec.md` in the template's sections (`## Outcome`, `## Scope`, `## Approach` with locales and string rules as `###` sub-headings, `## Acceptance`) (take the spec from the `claude_code` result text; never write it to `/tmp`)
 - `WorkflowOutput___report_completion`
 
 ## Playbook runs (when `## SDLC Framework` is in your context)

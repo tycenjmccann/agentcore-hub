@@ -73,8 +73,10 @@ this session" plus the checkpoint rules. The ported branch is your
   checkpoint file ARE the durable state.
 - Note your start time with `current_time`. If 6h have elapsed on BUILD and you
   are not yet at the merge brief: have the worker commit + push + update the
-  checkpoint, write `workflows/{workflow_id}/shared/operator-status.md` (what
-  is done, what is next), create a human ticket "Operator checkpoint: continue
+  checkpoint, write `workflows/{workflow_id}/shared/operator-status.md` in
+  `template-record`'s sections (`## Status` what decides the next step,
+  `## Timeline` table, `## Open items`; `load_blueprint("writing-standard")` +
+  `load_blueprint("template-record")` first), create a human ticket "Operator checkpoint: continue
   {EPIC}?" (assignee: the Merge Approval reviewer string from your context,
   `blocked_by: ""`), then park your BUILD ticket:
   `Tickets___transition_ticket(build_ticket, "blocked", blocked_by=<that ticket>)`
@@ -278,8 +280,11 @@ ATTENTION in the brief. Never call it independent.
 ```
 codex(repo="<owner/repo>", task=<REVIEW PROMPT>)
 ```
-Save the reply verbatim to `workflows/{workflow_id}/shared/review.md` (append
-`## Round N` headers on later rounds). Keep the reviewer's `[coding-session:
+Save the reply verbatim to `workflows/{workflow_id}/shared/review.md`. The
+REVIEW PROMPT asks for `template-assessment`'s sections
+(`load_blueprint("template-assessment")` to check them), so round 1 IS the file; later rounds are appended as one `## Round N re-check` appendix section
+each with the reviewer's headings demoted to `###` (the write tool refuses a
+review.md whose first `##` is not `## Verdict`). Keep the reviewer's `[coding-session:
 cc-…]` footer id: that is the REVIEWER's session and the only id you may resume
 for re-checks.
 
@@ -333,42 +338,38 @@ one thing on this path you can prevent for the price of a CI run.
    never written from memory. Its rows, their order and their labels are the
    checklist's C6 rows (C5 is the acceptance walk, not the unit suite); a
    ledger with invented rows or relabelled checks is a brief you may not send.
-1. `workflows/{workflow_id}/shared/merge-brief.md` (`S3Storage___write_object`,
-   text/markdown), pyramid style, decision first:
-   ```
-   DECISION: Approve to merge PR #<n> into <repo> (<one line, sized>). Reject = nothing merges.
-   <Revertibility line.>
-   — or, when any applicable ledger row is NO —
-   DECISION: BLOCKED — <which check> could not run: <command -> error>. Approving merges UNVERIFIED code. Reject = nothing merges.
-
-   WHAT HAPPENED
-   • Plan: <units>; executed in <N> turns; <parallel units, if any>.
-   • LIVE CHECK: <what was hit, for real: route/screen -> dependency> -> <result> (<qa-evidence key>). | n-a: <reason from C0>.
-   • Independent review (<codex|kiro|claude fresh>): round 1 <n> findings, round 2 <n>; all resolved / <k> open (see below).
-   • CI: <check names> green at <sha> (<certified|GitHub Actions proxy|unverified>).
-
-   VERIFICATION LEDGER (verbatim from B3b — what actually RAN)
-   | Check | Ran? | Result | Evidence |
-   | ... one row per C6 line ... |
-
-   WHAT'S IN THE PR (plain English, component level)
-   • ...
-
-   WHAT WAS KEPT / NOT DONE (and why)
-   • ...
-
-   ⚠ NEEDS YOUR ATTENTION (omit if empty)
-   • <open review disputes with both sides in one line each; unverified CI; pre-existing red checks>
-
-   RISK IF WE'RE WRONG: <Low|Medium|High> - <why>, worst case, recovery.
-
-   DETAILS: PR #<n> body; plan workflows/{id}/shared/plan.md; review workflows/{id}/shared/review.md.
-   ```
+1. `load_blueprint("writing-standard")` and `load_blueprint("template-brief")`
+   (once per invocation), then write
+   `workflows/{workflow_id}/shared/merge-brief.md` (`S3Storage___write_object`,
+   text/markdown) in the template's four sections, answer first. The write
+   tool refuses a brief that is not in those sections; fix it, never rename it.
+   - `## Decision`: "Approve to merge PR #<n> into <repo> (<one line, sized>).
+     Reject = nothing merges." plus the revertibility sentence. When any
+     applicable ledger row is NO the decision is Blocked, the old
+     `DECISION: BLOCKED` rule: "Blocked. <which check> could not run:
+     <command -> error>. Approving merges unverified code. Reject = nothing
+     merges."
+   - `## Why it is ready`: plan units and turns, the live check (what was hit
+     for real -> result, qa-evidence key), the independent review (rounds,
+     findings, open), CI (checks green at <sha>, certified or proxy). Then the
+     VERIFICATION LEDGER (verbatim from B3b — what actually RAN) as the table
+     `| Check | Ran? | Result | Evidence |`, one row per C6 line, captioned in
+     sentence case ("Verification ledger, verbatim from B3b:").
+   - `## What needs your eye`: open review disputes (both sides, one line
+     each), unverified CI, pre-existing red checks, blocked rows and the one
+     action that unblocks them. "Nothing." when empty. Never bury these
+     elsewhere.
+   - `## After approval`: merge and deploy path, manual steps CD will not do,
+     and where the detail lives (PR #<n> body, shared/plan.md, shared/review.md).
+   What changed (component level, plain English) and what was kept or not done
+   (with why) go as appendix `##` sections after those four, only when the PR
+   body does not already say it.
 2. `load_blueprint("review-package")` and write
    `workflows/{workflow_id}/shared/review-package-development.json` (that exact
    filename: the gate follows YOUR development ticket) using the `ship`
-   template's content: `"gate": "ship"`, summary = the DECISION line, 3-6
-   bullets, links = merge brief first, PR url second, `shared/review.md` only if
+   template's content: `"gate": "ship"`, summary = the first sentence of
+   `## Decision`, bullets = `## What needs your eye` plus the top evidence
+   lines, links = merge brief first, PR url second, `shared/review.md` only if
    the brief points at it.
 3. Put the brief on the gate ticket: `Tickets___update_ticket(gate_ticket,
    description=<brief>)` AND `Tickets___add_comment(gate_ticket, <brief>)`.
@@ -634,10 +635,16 @@ Severities: P0 data loss / security / crash; P1 wrong behaviour on a realistic p
 "Verified by construction" is a P1: if every test of a seam (a runtime, Lambda, table, vendor API, or the app's own route as seen from a client) mocks that seam with a hand-written shape, and neither the PR body nor .operator/evidence/live-* holds a response captured from the real system, the branch is verified only against its author's guess — cite the test file:line and the seam, and state what a real capture would have to show.
 Every P0-P2 MUST cite file:line AND a concrete reproduction (input -> wrong output, or a command that fails). If you cannot cite and reproduce it, it is a P3.
 A defect is a class: for every P0-P2, grep the repo for the same pattern and list EVERY occurrence as file:line — a one-site finding with no stated search is incomplete, and a sibling raised only on the re-check is a review defect.
-Output exactly:
-## Verdict: PASS | CHANGES_NEEDED
-## Findings (P0-P2)
-- [P?] <file:line> - <scenario> - <repro>
+Output exactly these sections, in this order, nothing before the title:
+# Independent review: PR #<n> (<TICKET>), round 1
+## Verdict
+One to three sentences: PASS or CHANGES_NEEDED, what blocks, head SHA reviewed, engine. No list.
+## Findings
+1. P? <file:line>. <what is wrong>. <repro>. Siblings: <file:line, ...>.  (P0-P2 only, highest first; "None." if empty)
+## Not covered
+What you could not run or examine and why. "Nothing." if complete.
+## Next actions
+Who does what next, one line each.
 ## Suggestions (P3)
 ## Plan compliance
 ## Tests run
@@ -663,7 +670,7 @@ FINDINGS:
 **RECHECK PROMPT** (reviewer, its own session)
 ```
 Re-check ONLY the delta. New head: <sha>; previous head: <old sha>. `git fetch origin <feature_branch>`; `git diff <old sha>..<sha>`.
-(a) For each finding marked FIXED, verify the fix is correct and tested. (b) For each REJECTED, evaluate the evidence; a rejection stands unless you can show the evidence is wrong. Same read-only rule. Same output format; a finding stays open only if the fix is wrong or the rejection does not hold.
+(a) For each finding marked FIXED, verify the fix is correct and tested. (b) For each REJECTED, evaluate the evidence; a rejection stands unless you can show the evidence is wrong. Same read-only rule. Same sections as round 1 (Verdict, Findings, Not covered, Next actions, Suggestions, Plan compliance, Tests run) but each as a `###` heading under one `## Round <k> re-check` heading, so the file appends cleanly; a finding stays open only if the fix is wrong or the rejection does not hold.
 DEV RESPONSE:
 <table>
 ```

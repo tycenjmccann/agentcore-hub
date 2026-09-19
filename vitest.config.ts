@@ -282,6 +282,10 @@ export default defineConfig({
       // unrecognized evidence_kind is dropped with a warning, never stored). REAL
       // handler, AWS SDK mocked at the module seam.
       "lambda/workflow-output/index.test.mjs",
+      // deliverables-lint.mjs — the writing-standard lint (pure: registry index
+      // from the real workflows.json + structural markdown rules). Every template
+      // blueprint's own example is the conforming corpus.
+      "lambda/workflow-output/deliverables-lint.test.mjs",
     ],
     // Keep unit tests away from the Playwright specs under tests/.
     exclude: ["tests/**", "node_modules/**", "demo/**"],

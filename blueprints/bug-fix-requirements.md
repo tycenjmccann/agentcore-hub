@@ -40,7 +40,13 @@ You do NOT have code-reading tools — your job is triage and dispatch, not root
 - From the report, identify the **likely subsystem** (UI, API route, lambda, infra, etc.) — this drives which dev agent gets the sub-task.
 - If a stack trace is present, the topmost in-app frame names the file the dev should start from. Quote it in the analysis.
 
-Write your triage to: `workflows/{workflow_id}/shared/bug-analysis.md` with sections:
+Write your triage to: `workflows/{workflow_id}/shared/bug-analysis.md` in
+`template-assessment`'s sections (`load_blueprint("writing-standard")` +
+`load_blueprint("template-assessment")` first; the write tool refuses any other
+shape): `## Verdict` = the hypothesis and suspected subsystem in one to three
+sentences; `## Findings` = the items below as `###` sub-headings, in this order;
+`## Not covered` = what could not be reproduced or read; `## Next actions` =
+the fix scope and the sub-task chain you create. The `###` items:
 - **Symptom** — what the user sees, copied from the report
 - **Repro Steps** — verbatim from the report (or "MISSING — requested in comments")
 - **Suspected Subsystem** — UI / API / lambda / infra, with one-line justification

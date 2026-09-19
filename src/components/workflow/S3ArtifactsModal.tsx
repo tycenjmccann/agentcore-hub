@@ -15,6 +15,7 @@ import {
   Loader2,
 } from "lucide-react";
 import ArtifactViewer, { artifactKind } from "./ArtifactViewer";
+import { getDeliverables, deliverableMatches, getWorkflowDef, type Deliverable } from "@/lib/workflow/workflow-defs";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -33,6 +34,17 @@ interface S3ArtifactsModalProps {
   workflowId: string;
   /** Deep link: open the viewer for this key as soon as the modal mounts. */
   initialArtifactKey?: string | null;
+  /**
+   * The run's def (+ framework overlay): drives the "Deliverables" strip, which
+   * shows what the def owes (src/config/workflows.json `deliverables`) against
+   * what is actually in shared/. Omitted → no strip (agent-scoped view).
+   */
+  workflowDefId?: string | null;
+  sdlcFramework?: string | null;
+  /** The run's agentPhase (`state.phase`): deliverables of later phases show as pending, not missing. */
+  currentPhase?: string | null;
+  /** `state.delivery.mode`: a handoff run never owed its ship-phase deliverables, so they are hidden. */
+  deliveryMode?: "cd" | "handoff" | null;
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -74,6 +86,87 @@ function getFileIcon(filename: string) {
 
 // ─── Component ───────────────────────────────────────────────────────────────
 
+/**
+ * What the def owes vs what exists. One row per registered deliverable (S3
+ * artifacts only — PRs live on the ticket). Present rows open the viewer;
+ * missing rows are muted, so a reader can see at a glance which phase has not
+ * delivered yet. Data: src/config/workflows.json `deliverables` + the artifact list.
+ */
+function DeliverablesStrip({
+  workflowDefId,
+  sdlcFramework,
+  currentPhase,
+  deliveryMode,
+  artifacts,
+  onView,
+}: {
+  workflowDefId: string;
+  sdlcFramework?: string | null;
+  currentPhase?: string | null;
+  deliveryMode?: "cd" | "handoff" | null;
+  artifacts: S3Artifact[];
+  onView: (a: S3Artifact) => void;
+}) {
+  // Pipeline-phase rank of an agentPhase (extraAgentPhases such as "review" rank
+  // with the pipeline phase that displays them). Unknown → -1.
+  const def = getWorkflowDef(workflowDefId, sdlcFramework);
+  const rankOf = (agentPhase: string | null | undefined): number => {
+    if (!agentPhase) return -1;
+    if (agentPhase === "complete") return Number.MAX_SAFE_INTEGER;
+    return def.phases.findIndex((p) => p.agentPhase === agentPhase || (p.extraAgentPhases || []).includes(agentPhase));
+  };
+  // A phase the run has not reached yet cannot be "missing" its deliverables.
+  // An unknown current phase (blocked/error terminal states) counts every phase
+  // as reached — the run is over, whatever is absent is absent.
+  const currentRank = rankOf(currentPhase);
+  const reached = (phase: string) => currentRank < 0 || rankOf(phase) <= currentRank;
+  const rows = getDeliverables(workflowDefId, sdlcFramework)
+    .filter((d) => d.kind !== "pr")
+    // The orchestrator strips the ship phase from a handoff run (cd-registry.mjs);
+    // the static def still lists it, so hide what this run never owed.
+    .filter((d) => !(deliveryMode === "handoff" && d.phase === "ship"))
+    .map((d) => ({ d, hit: artifacts.find((a) => deliverableMatches(d, a.key)) || null, pending: !reached(d.phase) }));
+  if (rows.length === 0) return null;
+  const present = rows.filter((r) => r.hit).length;
+  return (
+    <div className="mb-3" data-testid="deliverables-strip">
+      <div className="flex items-center gap-2 mb-1 px-1">
+        <span className="text-[11px] font-medium text-[var(--pipeline-text-secondary)] uppercase tracking-wider">
+          Deliverables
+        </span>
+        <span className="text-[10px] text-[var(--pipeline-text-muted)]">
+          {present}/{rows.length} present
+        </span>
+      </div>
+      <ul role="list" className="grid grid-cols-1 sm:grid-cols-2 gap-x-3 gap-y-0.5 px-1">
+        {rows.map(({ d, hit, pending }) => {
+          const previewable = !!hit && artifactKind(hit.filename) !== "binary";
+          return (
+            <li
+              key={d.key}
+              className={`flex items-center gap-2 text-[11px] rounded px-1 py-0.5 ${previewable ? "cursor-pointer hover:bg-[rgba(100,116,139,0.15)]" : ""}`}
+              onClick={previewable ? () => onView(hit!) : undefined}
+              role={previewable ? "button" : undefined}
+              tabIndex={previewable ? 0 : undefined}
+              onKeyDown={previewable ? (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onView(hit!); } } : undefined}
+              title={`${d.key} · ${d.phase} · ${d.family}${d.gate ? ` · read at ${d.gate}` : ""}${d.note ? `\n${d.note}` : ""}`}
+              data-present={hit ? "true" : "false"}
+              data-pending={pending ? "true" : "false"}
+            >
+              <span aria-hidden="true" className={hit ? "text-emerald-400" : "text-[var(--pipeline-text-muted)]"}>{hit ? "●" : "○"}</span>
+              <span className={`truncate ${hit ? "text-[var(--pipeline-text)]" : "text-[var(--pipeline-text-muted)]"}`}>{d.title}</span>
+              <span className="ml-auto shrink-0 text-[10px] text-[var(--pipeline-text-muted)]">{d.phase}</span>
+              {!hit && pending && <span className="shrink-0 text-[10px] text-[var(--pipeline-text-muted)]">pending</span>}
+              {!hit && !pending && d.required && <span className="shrink-0 text-[10px] text-amber-400/80">missing</span>}
+              {!hit && !pending && !d.required && <span className="shrink-0 text-[10px] text-[var(--pipeline-text-muted)]">optional</span>}
+            </li>
+          );
+        })}
+      </ul>
+    </div>
+  );
+}
+
 export default function S3ArtifactsModal({
   isOpen,
   onClose,
@@ -81,6 +174,10 @@ export default function S3ArtifactsModal({
   agentName,
   workflowId,
   initialArtifactKey,
+  workflowDefId,
+  sdlcFramework,
+  currentPhase,
+  deliveryMode,
 }: S3ArtifactsModalProps) {
   const [artifacts, setArtifacts] = useState<S3Artifact[]>([]);
   const [isLoading, setIsLoading] = useState(true);
@@ -320,6 +417,18 @@ export default function S3ArtifactsModal({
                 Artifacts will appear here as the agent produces output.
               </p>
             </div>
+          )}
+
+          {/* Deliverables: what the def owes vs what shared/ holds */}
+          {!isLoading && !error && workflowDefId && (
+            <DeliverablesStrip
+              workflowDefId={workflowDefId}
+              sdlcFramework={sdlcFramework}
+              currentPhase={currentPhase}
+              deliveryMode={deliveryMode}
+              artifacts={artifacts}
+              onView={setViewing}
+            />
           )}
 
           {/* File list — grouped by agent/folder */}
