@@ -10,10 +10,15 @@
 #                                     tickets complete)
 #
 # Required env vars (from deploy/config.sh):
-#   ACCOUNT_ID, AWS_REGION, LAMBDA_ROLE_ARN, ARTIFACT_BUCKET, EVENTS_TABLE
+#   ACCOUNT_ID, AWS_REGION, LAMBDA_ROLE_ARN, ARTIFACT_BUCKET, EVENTS_TABLE,
+#   WORKFLOWS_TABLE
 # Optional:
 #   TICKET_PROVIDER ("jira" | "dynamodb", default "jira")
 #   TICKET_TOOLS_LAMBDA (default derived from TICKET_PROVIDER)
+#   GITHUB_TOKEN (falls back to GITHUB_PAT) — read-only; verifies that a fix whose
+#     ticket says `base_branch: main` really opened its PR against main
+#     (TEAM-4752 D3). Absent ⇒ the key is omitted and the check accepts the report
+#     while stamping it `unverified`; it never blocks a completion.
 #
 # Usage:
 #   ./lambda/workflow-output/deploy.sh
@@ -65,7 +70,28 @@ zip -qr function.zip index.mjs deliverables-lint.mjs node_modules
 SIZE=$(ls -lh function.zip | awk '{print $5}')
 echo "  Zip size: $SIZE"
 
-ENV_VARS="Variables={ARTIFACT_BUCKET=${ARTIFACT_BUCKET},EVENTS_TABLE=${EVENTS_TABLE},TICKET_PROVIDER=${TICKET_PROVIDER},TICKET_TOOLS_LAMBDA=${TICKET_TOOLS_LAMBDA}}"
+# TEAM-4740 FR-11: WORKFLOWS_TABLE is read (GetItem only) to resolve the run's
+# `featureBranch` so submit_ticket_plan can template the integration branch into
+# every ticket description instead of trusting an analyst-coined one. NO IAM change
+# — deploy/setup-lambda-role.sh already grants GetItem/Query on
+# agentcore-hub-workflows to this shared role. Unset ⇒ templating is skipped.
+ENV_VARS="Variables={ARTIFACT_BUCKET=${ARTIFACT_BUCKET},EVENTS_TABLE=${EVENTS_TABLE},WORKFLOWS_TABLE=${WORKFLOWS_TABLE},TICKET_PROVIDER=${TICKET_PROVIDER},TICKET_TOOLS_LAMBDA=${TICKET_TOOLS_LAMBDA}"
+
+# TEAM-4752 D3: OPTIONAL, and appended only when actually set — an empty
+# GITHUB_TOKEN= would be indistinguishable from a configured one that stopped
+# working. Same fallback order as deploy/setup-pipeline-tools-lambda.mjs
+# (GITHUB_TOKEN || GITHUB_PAT); config.sh already sourced .env.local above, so an
+# operator's GITHUB_PAT is in scope here with no config.sh change. No IAM change —
+# the call is to GitHub, not to AWS. Never echoed: the value appears only inside
+# the --environment argument, and this script sets no `set -x`.
+GITHUB_TOKEN="${GITHUB_TOKEN:-${GITHUB_PAT:-}}"
+if [ -n "$GITHUB_TOKEN" ]; then
+  ENV_VARS="${ENV_VARS},GITHUB_TOKEN=${GITHUB_TOKEN}"
+  echo "  GITHUB_TOKEN: set (FR-5 base-branch verification enabled)"
+else
+  echo "  GITHUB_TOKEN: unset (FR-5 base-branch checks will report 'unverified')"
+fi
+ENV_VARS="${ENV_VARS}}"
 
 echo "=== Deploying $NAME ==="
 if aws lambda get-function --function-name "$NAME" --region "$AWS_REGION" >/dev/null 2>&1; then

@@ -158,3 +158,50 @@ def test_whitespace_only_origin_id_is_also_refused():
 def test_missing_origin_id_is_fine_on_a_non_fix_ticket():
     _, payload = _payload(spawned_by_origin_id="TEAM-1")
     assert "spawned_by" not in payload
+
+
+# ─── TEAM-4749 A1a: base_branch ───────────────────────────────────────────────
+#
+# The signature had no `base_branch` while blueprints/release-manager.md already
+# told the release manager to pass it, so Strands rejected the keyword and a
+# hub-infra fix ticket was unfileable. Both ticket twins already read and
+# validate the key; only the harness half was missing. Name parity across the
+# Lambda boundary is asserted in src/lib/workflow/tool-signature-parity.test.ts —
+# what is left for here is the payload behaviour.
+
+def test_base_branch_forwarded_when_supplied():
+    _, payload = _payload(base_branch="main")
+    assert payload["base_branch"] == "main"
+
+
+def test_base_branch_is_trimmed():
+    """The Lambda validates the value against a ref-name pattern before minting an
+    id, so a stray space would be refused as an invalid branch rather than
+    ignored."""
+    _, payload = _payload(base_branch="  main\n")
+    assert payload["base_branch"] == "main"
+
+
+@pytest.mark.parametrize("blank", ["", "   ", "\t", "\n  "])
+def test_blank_base_branch_omitted(blank):
+    """Absent means "no branch was stated" — the run's own integration branch is
+    the default. Sending "" would make every ordinary ticket look like it named a
+    branch and got an empty one."""
+    _, payload = _payload(base_branch=blank)
+    assert "base_branch" not in payload
+
+
+def test_all_blank_equals_the_pre_4749_payload():
+    """A call that passes nothing new must be byte-identical to what shipped
+    before, which is what makes this an additive change rather than a payload
+    change for every persona in the fleet."""
+    _, payload = _payload(base_branch="", labels="", phase="")
+    assert payload == {
+        "summary": "Fix login",
+        "description": "prose",
+        "parent_key": "",
+        "assignee": "agentcore_hub_backend_dev",
+        "issue_type": "task",
+        "blocked_by": [],
+        "workflow_id": "wf-ctx",
+    }

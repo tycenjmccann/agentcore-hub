@@ -339,7 +339,8 @@ The orchestrator refuses to finalize a ship-phase workflow when it can prove
 the feature branch is unmerged (emits `workflow.cd_unmerged` and leaves the
 run open) — a CD ticket marked done without a real merge can no longer
 false-complete a run. Best-effort: a GitHub/API failure never blocks a
-legitimate completion. Opt-out: `SHIP_MERGE_VERIFY=off`.
+legitimate completion. Opt-out: `SHIP_MERGE_VERIFY=off` (a pure-handoff ship
+verdict is exempt — its PR is open by definition).
 
 ### Deploy-gate banner in the UI
 
@@ -823,7 +824,8 @@ so the module stays truly optional.
 - **Ship merge-verify completion gate.** The orchestrator refuses to finalize a
   ship-phase workflow if it can prove the feature branch is unmerged (emits
   `workflow.cd_unmerged`, leaves the run open). Best-effort: a GitHub/API
-  failure never blocks a legitimate completion. Opt-out: `SHIP_MERGE_VERIFY=off`.
+  failure never blocks a legitimate completion. Opt-out: `SHIP_MERGE_VERIFY=off`
+  (a pure-handoff ship verdict is exempt — its PR is open by definition).
 - **CI two-lane auto-remediation** (`blueprints/ci-agent.md` P2a). Mechanical
   failures — an exhaustive whitelist: `prettier`, `eslint --fix`, import
   ordering, lockfile regen — are self-fixed by the CI agent: run the tool (never

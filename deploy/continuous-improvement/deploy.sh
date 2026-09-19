@@ -109,12 +109,6 @@ echo "  Continuous Improvement Loop"
 echo "  Account: ${ACCOUNT_ID}"
 echo "═══════════════════════════════════════════════════════════"
 
-# ─── S3 ──────────────────────────────────────────────────────────────────────
-aws s3 mb "s3://${BUCKET}" 2>/dev/null || true
-aws s3api put-bucket-notification-configuration \
-  --bucket "$BUCKET" --notification-configuration '{"EventBridgeConfiguration":{}}' 2>/dev/null
-echo "✓ S3: ${BUCKET}"
-
 # ─── IAM: results table + si ledger + evaluator-results log reads ───────────
 # A SEPARATE inline policy on the SAME shared Lambda role, deliberately not
 # folded into setup-lambda-role.sh's `DynamoDBAccess` document: put-role-policy
@@ -192,6 +186,27 @@ aws iam put-role-policy \
     ]
   }" --output text >/dev/null
 echo "✓ IAM: EvalResultsAccess on ${ROLE_NAME_FOR_EVAL} (DDB ${RESULTS_TABLE} + ${SI_LEDGER_TABLE} + evaluator results log reads)"
+
+# TEAM-4770: IAM_ONLY=1 applies the IAM above and stops here, so
+# scripts/si-ledger-handoff.sh can re-apply the prd-submitter ledger grant
+# without redeploying Lambda code or replacing Lambda env (CD owns those).
+# Same env var as deploy/workflow-manager/deploy.sh — one vocabulary.
+if [ "${IAM_ONLY:-}" = "1" ]; then
+  echo "IAM_ONLY=1 — stopping before Lambda code + env deploy (IAM applied)"
+  exit 0
+fi
+
+# ─── S3 ──────────────────────────────────────────────────────────────────────
+# TEAM-4787: BELOW the IAM_ONLY guard on purpose. These two calls used to sit
+# above it, so an "IAM only" re-apply created the artifact bucket and rewrote its
+# notification configuration — the one thing IAM_ONLY=1 promises it will not do.
+# Normal-mode behaviour is unchanged: nothing between the old position and here
+# reads S3 (it was one put-role-policy), and the only consumer of the
+# EventBridge notification config is the S3 → prd-submitter rule far below.
+aws s3 mb "s3://${BUCKET}" 2>/dev/null || true
+aws s3api put-bucket-notification-configuration \
+  --bucket "$BUCKET" --notification-configuration '{"EventBridgeConfiguration":{}}' 2>/dev/null
+echo "✓ S3: ${BUCKET}"
 
 # ─── Lambdas ─────────────────────────────────────────────────────────────────
 deploy_lambda() {

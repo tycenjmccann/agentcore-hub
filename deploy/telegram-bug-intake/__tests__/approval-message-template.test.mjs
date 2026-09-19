@@ -52,12 +52,16 @@ const RUN_TITLE = "Pipeline arg contract + CI guard";
 
 // ─── AWS SDK mocks (module seam) ──────────────────────────────────────────────
 
-const db = vi.hoisted(() => ({ items: new Map(), puts: [], deletes: [] }));
+const db = vi.hoisted(() => ({ items: new Map(), puts: [], deletes: [], updates: [] }));
 vi.mock("@aws-sdk/client-eventbridge", () => ({
   EventBridgeClient: class { async send() { return { FailedEntryCount: 0 }; } },
   PutEventsCommand: class { constructor(input) { this.input = input; } },
 }));
-vi.mock("@aws-sdk/client-dynamodb", () => {
+vi.mock("@aws-sdk/client-dynamodb", async () => {
+  // TEAM-4663: the handler now UPDATES claim rows (two-phase claim). One
+  // shared evaluator, because a fake that replaces instead of merging would
+  // hide a real regression — see helpers/ddb-fake.mjs.
+  const { applyUpdate } = await import("./helpers/ddb-fake.mjs");
   const cmd = (op) => class { constructor(input) { this.input = input; this.op = op; } };
   class DynamoDBClient {
     async send(c) {
@@ -73,6 +77,7 @@ vi.mock("@aws-sdk/client-dynamodb", () => {
         db.puts.push(c.input.Item);
         return {};
       }
+      if (c.op === "update") return applyUpdate(db, c.input);
       if (c.op === "del") { db.deletes.push(c.input.Key.id.S); db.items.delete(c.input.Key.id.S); return {}; }
       if (c.op === "scan") {
         const p = c.input.ExpressionAttributeValues[":p"].S;
@@ -81,7 +86,7 @@ vi.mock("@aws-sdk/client-dynamodb", () => {
       throw new Error(`unexpected ddb op ${c.op}`);
     }
   }
-  return { DynamoDBClient, GetItemCommand: cmd("get"), PutItemCommand: cmd("put"), DeleteItemCommand: cmd("del"), ScanCommand: cmd("scan") };
+  return { DynamoDBClient, GetItemCommand: cmd("get"), PutItemCommand: cmd("put"), DeleteItemCommand: cmd("del"), ScanCommand: cmd("scan"), UpdateItemCommand: cmd("update") };
 });
 vi.mock("@aws-sdk/client-transcribe-streaming", () => ({
   StartStreamTranscriptionCommand: class { constructor(input) { this.input = input; } },
@@ -334,6 +339,7 @@ describe("approval pings are built from structured inputs, never from ticket pro
         update_id: 1,
         callback_query: { id: "cb-1", data: `gno|${GATE}|${WF}`, message: { message_id: 7, chat: { id: CHAT }, text: ping } },
       }]],
+      tickets,   // gateTicketOf fails closed — a tap that must LAND needs a readable gate
     });
     const noted = await run(mod.handler, {
       batches: [[{ update_id: 2, message: { message_id: 2, chat: { id: CHAT }, from: { id: CHAT }, text: "the deploy gate must name one execution, not three" } }]],
@@ -524,6 +530,10 @@ const tapDrop = (updateId = 3) => ({
   update_id: updateId,
   callback_query: { id: `cb-${updateId}`, data: `rjx|${GATE}`, message: { message_id: 8, chat: { id: CHAT }, text: "⚠️ Couldn't send…" } },
 });
+// A ✅/❌ tap needs a READABLE gate A: since TEAM-4739 gateTicketOf fails closed,
+// so a tap over an unreachable tickets view touches nothing at all (asserted on
+// its own, in the fails-closed row). Every tap that is meant to LAND passes this.
+const openGateA = () => [dgate(GATE, "the queued deploy", "2026-09-14T09:00:00.000Z", { status: "in_review" })];
 // Gate B: same target as GATE, filed later in the run — the RM-authored,
 // new-ticket-per-attempt shape the sibling scan exists for.
 const pageGateB = async (mod) => (await run(mod.handler, {
@@ -539,11 +549,11 @@ describe("a ❌ that never became a rejection is not a previous attempt (TEAM-46
   it("❌ then ✅ on gate A leaves no evidence for a later same-target gate B", async () => {
     const mod = await loadModule();
 
-    await run(mod.handler, { batches: [[tapGno()]] });
+    await run(mod.handler, { batches: [[tapGno()]], tickets: openGateA() });
     expect(db.items.has(REWORK_KEY), "the ❌ tap writes the placeholder").toBe(true);
 
     // …tapped by mistake — ✅ Approve the same ticket.
-    const approved = await run(mod.handler, { batches: [[tapGok()]] });
+    const approved = await run(mod.handler, { batches: [[tapGok()]], tickets: openGateA() });
     expect(approved.transitions[0]).toMatchObject({ ticketId: GATE, targetStatus: "done" });
 
     // Behavioural symptom first: gate B must not read A's ❌ as an attempt.
@@ -562,7 +572,7 @@ describe("a ❌ that never became a rejection is not a previous attempt (TEAM-46
   it("❌ → failed note delivery → 🗑 Drop leaves no evidence for a later same-target gate B", async () => {
     const mod = await loadModule();
 
-    await run(mod.handler, { batches: [[tapGno()]] });
+    await run(mod.handler, { batches: [[tapGno()]], tickets: openGateA() });
     expect(db.items.has(REWORK_KEY)).toBe(true);
 
     // The note is typed, but the hub refuses the transition — parked with
@@ -600,7 +610,7 @@ describe("a ❌ that never became a rejection is not a previous attempt (TEAM-46
     const first = await run(mod.handler, { batches: [[]], workflows: [wf([cycle1])], tickets });
     expect(first.sent[0].text).not.toMatch(/Attempt/);
 
-    await run(mod.handler, { batches: [[tapGno()]] });
+    await run(mod.handler, { batches: [[tapGno()]], tickets: openGateA() });
     const noted = await run(mod.handler, {
       batches: [[{ update_id: 2, message: { message_id: 2, chat: { id: CHAT }, from: { id: CHAT }, text: "the deploy gate must name one execution, not three" } }]],
       afterPoll: [100_000],
@@ -629,8 +639,9 @@ describe("a ❌ that never became a rejection is not a previous attempt (TEAM-46
  *
  * The invariant is order-independent, so it is asserted from both ends: an
  * approved gate never yields rejection evidence, while a gate the hub still
- * reports as open — or a hub that cannot be reached at all — records the
- * rejection exactly as before (TEAM-4671 must not be weakened into silence).
+ * reports as open records the rejection exactly as before (TEAM-4671 must not be
+ * weakened into silence). A hub that cannot be reached at all is the third case,
+ * and since TEAM-4739 it is neither of those two — see the fails-closed row.
  */
 describe("an approved gate never produces rejection evidence, regardless of callback order (TEAM-4677)", () => {
   it("✅ then ❌ in the SAME batch on gate A leaves no evidence for a later same-target gate B", async () => {
@@ -662,16 +673,24 @@ describe("an approved gate never produces rejection evidence, regardless of call
     expect(text).toMatch(mod.APPROVAL_KICKER_RE);
   });
 
-  it("fails open: an unreachable tickets view records the rejection exactly as before", async () => {
+  /**
+   * TEAM-4739 reverses this row's fail direction, deliberately. It used to fail
+   * OPEN — an unreadable tickets view was treated as "not done" and the ❌ was
+   * recorded — but the labels are unreadable on exactly the same read, so a
+   * gate:deploy-approval ticket would be rejected as a plain gate and the
+   * pipeline's own approval would stay parked (the 29h stall of 2026-09-14). The
+   * rejection is not swallowed: nothing is written, nothing is transitioned, the
+   * keyboard stays, and the tap itself is the retry.
+   */
+  it("fails closed: an unreachable tickets view touches nothing and asks for a retry", async () => {
     const mod = await loadModule();
-    // No `tickets` override → /tickets 404s → gateTicketOf degrades to
-    // { gateTicket: null }. A hub blip must never swallow a real rejection.
     const net = await run(mod.handler, { batches: [[tapGno()]] });
 
-    expect(db.items.get(REWORK_KEY)?.reason?.S).toBe("changes requested");
-    expect(db.items.get(REJ_KEY)?.ticketId?.S).toBe(GATE);
-    expect(net.answered.at(-1).text).toBe("Reply with what needs to change.");
-    expect(net.edited[0].text).toMatch(/reply to this message later/i);
+    expect(db.items.has(REWORK_KEY), "no placeholder over an unverifiable gate").toBe(false);
+    expect(db.items.has(REJ_KEY), "no rework marker over an unverifiable gate").toBe(false);
+    expect(net.transitions, "the ticket is untouched").toEqual([]);
+    expect(net.answered.at(-1).text).toMatch(/could not verify gate type, retry/i);
+    expect(net.edited, "the keyboard is left in place — the tap is the retry").toEqual([]);
   });
 
   it("does not weaken TEAM-4671: ❌ on a gate the hub still reports open is recorded", async () => {

@@ -281,6 +281,18 @@ export interface WorkflowDef {
   artifactChain?: ArtifactChain;
   /** Selectable framework overlays keyed by SdlcFramework id (e.g. { playbook: {...} }). */
   frameworks?: Partial<Record<SdlcFramework, FrameworkOverlay>>;
+  /**
+   * TEAM-4740: whether this def's ship phase writes a cd-ledger commit entry.
+   * `false` on a def whose runs may legitimately have nothing to merge (a sweep
+   * that found no dead code), so a missing ledger is not read as a lost deploy.
+   */
+  ledgerCommit?: boolean;
+  /**
+   * TEAM-4740 FR-9: a start-time preflight this def opts into, gated on the VALUE
+   * and never on `def.id`. "sweep" — check for an already-open dead-code-sweep PR
+   * and an unchanged `main` before creating an epic (src/lib/workflow/sweep-preflight.ts).
+   */
+  preflight?: "sweep";
   phases: WorkflowDefPhase[];
   /**
    * true → this def's markdown deliverables are written to blueprints/writing-standard.md

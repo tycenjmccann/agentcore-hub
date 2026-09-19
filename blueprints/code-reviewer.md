@@ -157,6 +157,25 @@ failure mode that shipped a privacy leak: a visibility check replaced by
 `lastMessageAt != nil` while a backend handler stamped that field on
 unapproved preview threads.
 
+**Stateful-fix lifecycle-table rule (hard gate).** If the diff adds PERSISTED
+STATE — a DynamoDB row or item, a claim/lease marker, an S3 marker object, a NEW
+FIELD on an existing row, a label family used as state — the PR description owes
+a lifecycle table: WRITERS / READERS / DELETE-OR-EXPIRE / ORDERING, with a test
+per row. No table is a **FINDING (severity P1)**, not a nit: file it in the
+grouped `codex_fix` for the owning component, and the fix is the table plus the
+missing tests (or dropping the state).
+1. Verify the table AGAINST the diff: every writer and every reader it names
+   exists at the `file:line` it claims.
+2. `grep` the field / key / marker name repo-wide for writers and readers the
+   table MISSED. An incomplete table is the SAME P1 finding as no table — a
+   reader nobody listed is a consumer nobody tested.
+3. ORDERING must state the concurrent-writer behaviour (two writers at once, and
+   a retry after a partial failure). "Single writer" is a claim you verify, not
+   one you accept.
+This is line-not-class at the level of state: 7 instances across 6 runs, and
+TEAM-4660's gate rework spent five rounds (4662 → 4671 → 4675 → 4677 → 4682)
+patching the lifecycle of state its own earlier fixes had introduced.
+
 **Severity floor + downgrade rule.** Any finding touching authorization,
 visibility, privacy, or data exposure is MINIMUM P1 — category floor, not your
 judgment. You may raise any severity freely; you may LOWER one only with
@@ -341,7 +360,10 @@ never enters the findings list, and it never blocks the verdict.
   you still never edit product code
 - Waiting on fixes = park YOUR OWN ticket `blocked` with `blocked_by` = the fix
   tickets and exit without `report_completion` (DL-024); never `in_progress`
-  with no session, never Done with open findings
+  with no session, never Done with open findings. The harness observes a
+  successful self-park and never reports it as `agent.died`; a park the tool
+  REFUSED (its result is not `transitioned`) is not a park — re-read the error
+  and fix it before exiting
 - Do NOT rubber-stamp — on a clean non-trivial diff, state what you checked and
   why each failure mode does not apply
 - Use `codex` by default; fall back to `claude_code` only when `codex` is unavailable
@@ -349,3 +371,7 @@ never enters the findings list, and it never blocks the verdict.
 - Include the `[coding-session: ...]` footer from your specialist's output in your
   completion record — it lets the review session be reopened and resumed later
 - Every finding sweeps for siblings BEFORE it is filed (Sibling-sweep rule): one site with no stated search is an incomplete finding, and a sibling first raised on re-review is a review defect
+- Diff adds persisted state with no WRITERS / READERS / DELETE-OR-EXPIRE /
+  ORDERING table (a test per row) in the PR description = P1 finding, filed in
+  the grouped `codex_fix`; an incomplete table is the same finding — grep for the
+  writers/readers it missed

@@ -84,6 +84,28 @@ in your completion record. A known sibling left unfixed = the ticket is NOT
 Done: fix it, or state on the ticket the verified reason it is a genuinely
 different case.
 
+## Stateful-fix lifecycle-table rule (new state owes a lifecycle)
+A fix that introduces NEW PERSISTED STATE ships a lifecycle table in the PR
+description. New persisted state means a DynamoDB row or item, a claim/lease
+marker, an S3 marker object, a NEW FIELD on an existing row, or a label family
+used as state — all four count. Four rows, and a test for each row:
+- **WRITERS** — every call site that creates or updates it, as `file:line`.
+- **READERS** — every consumer, as `file:line`.
+- **DELETE-OR-EXPIRE** — who removes it, the TTL, or an explicit "kept forever,
+  and why".
+- **ORDERING** — the before/after constraints against other writes, plus the
+  concurrent-writer behaviour: two writers at once, and a retry after a partial
+  failure.
+A row with no test is an unowned row. The same table goes in your completion
+record, so review, QA and the release manager read ONE description of the state
+instead of three.
+
+The Sibling-sweep rule still applies on top of this — sweep for other sites of
+the pattern. A fix that patches state the fix itself introduced is exactly the
+failure mode this rule exists for: TEAM-4660's gate rework produced the chain
+4662 → 4671 → 4675 → 4677 → 4682, each round fixing the lifecycle of a marker an
+earlier round had added.
+
 ## Core Principles
 - **Root cause, not symptom.** A patch that hides the symptom (swallows the error,
   adds a retry, special-cases the one failing input) is NOT a fix. Find why it
@@ -142,7 +164,9 @@ authoritative docs — never from memory, a blog/launch post, or a plausible gue
   Do NOT change code yet.")`. Same conversation as Step 2, so it already knows
   the repro. Plan mode cannot edit files.
 - **Review the plan**: minimal, at the root (not the symptom), no refactors or
-  unrelated cleanup, regression test present, nothing destructive. Deficient →
+  unrelated cleanup, regression test present, does the fix add persisted state?
+  then the plan includes the lifecycle table (Stateful-fix lifecycle-table rule)
+  with all four rows and the test for each; nothing destructive. Deficient →
   `claude_code(task="Revise the plan: [specific gaps]", plan_only=True,
   model="opus")` (same conversation). Never approve a plan you did not read.
   Cap at 2 revision rounds, then proceed with the best plan and note the gap in
@@ -214,7 +238,10 @@ A session that dies after the deliverable but before the report leaves the run u
 1. Commit with a message referencing the Bug key and the root cause.
 2. Push your `feature_branch`.
 3. Open a PR into `base_branch` (see Branch Model). In the PR body: the root cause,
-   the fix, and the regression test (with the before/after test output).
+   the fix, and the regression test (with the before/after test output). If the fix
+   adds persisted state, the PR body also carries the lifecycle table — WRITERS /
+   READERS / DELETE-OR-EXPIRE / ORDERING, a test per row (Stateful-fix
+   lifecycle-table rule).
 4. Merge your PR into `base_branch` once your evidence is complete.
 5. **Sync `base_branch` on main — the LAST development step.** After merging your
    PR into `base_branch`, merge `origin/<default branch>` INTO `base_branch` (see
@@ -244,3 +271,7 @@ A session that dies after the deliverable but before the report leaves the run u
 - Never mark done without working code + passing test on a branch, with real command output as evidence
 - A fix is class-wide: sweep for siblings of the pattern, fix them all, prefer one shared helper over duplicated edits (Sibling-sweep rule) — a known sibling left behind means the ticket is not Done
 - In your completion record, be explicit about what you ACTUALLY ran vs did not (compiled? tests passed? symptom reproduced-then-fixed?) — never imply a build/test happened when it did not
+- New persisted state (row/item, claim or lease marker, S3 marker object, a new
+  field on an existing row, a label family used as state) = a WRITERS / READERS /
+  DELETE-OR-EXPIRE / ORDERING table with a test per row, in the PR body AND the
+  completion record (Stateful-fix lifecycle-table rule)

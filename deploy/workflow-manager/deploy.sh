@@ -25,7 +25,16 @@ source "${REPO_ROOT}/deploy/config.sh"
 # toolkit) is gated — TEAM-3295 widened the glob from system-prompt.md.
 # shellcheck disable=SC1091 # resolved relative to this script at runtime
 source "${REPO_ROOT}/deploy/lib/check-eval-gate.sh"
-require_eval_gate "deploy/workflow-manager/**"
+# TEAM-4787: an IAM_ONLY=1 run ships no gated artifact — no system prompt, no
+# skills, no toolkit, only the tables + IAM above the guard below — so there is
+# nothing here for the gate to gate. Consulting it made the SI-ledger handoff's
+# IAM re-apply depend on gh + jq + a green check run (hard `exit 1` without them,
+# check-eval-gate.sh:541-558) and its break-glass path performs its own S3 write
+# (check-eval-gate.sh:316) — the opposite of "IAM only". An `if` block, not
+# `[ … ] && require_eval_gate`: under `set -e` a false test would abort the run.
+if [ "${IAM_ONLY:-}" != "1" ]; then
+  require_eval_gate "deploy/workflow-manager/**"
+fi
 
 BUCKET="$ARTIFACT_BUCKET"
 ROLE_ARN="$LAMBDA_ROLE_ARN"
@@ -119,6 +128,15 @@ aws iam put-role-policy --role-name agentcore-hub-lambda-role \
     ]
   }" >/dev/null
 echo "✓ IAM: WorkflowManagerAccess policy on agentcore-hub-lambda-role"
+
+# TEAM-4770: IAM_ONLY=1 applies the tables + IAM above and stops here, so
+# scripts/si-ledger-handoff.sh can re-apply the lambda-role ledger grant without
+# redeploying code or replacing Lambda env (the CD pipeline owns those).
+# Env var, not a flag — this script rejects all CLI arguments (see the top).
+if [ "${IAM_ONLY:-}" = "1" ]; then
+  echo "IAM_ONLY=1 — stopping before code + env deploy (tables + IAM applied)"
+  exit 0
+fi
 
 # ─── Toolkit sync (updates take effect on the next harness session) ──────────
 # fixtures/ is test-only (real reduced dossiers the unit tests assert against) —

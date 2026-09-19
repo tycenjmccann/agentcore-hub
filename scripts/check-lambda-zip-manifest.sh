@@ -1,45 +1,76 @@
 #!/usr/bin/env bash
-# ─── Orchestrator zip manifest guard (TEAM-3696) ──────────────────────────────
+# ─── Lambda zip manifest guard (TEAM-3696, generalized TEAM-4739) ─────────────
 #
-# lambda/orchestrator/deploy.sh hand-lists the files packed into function.zip.
-# TEAM-3696: review-cap.mjs, ship-review.mjs, completion.mjs were added as
-# local imports but omitted from the `zip -rq function.zip ...` line, so the
-# deployed Lambda died at cold start with ERR_MODULE_NOT_FOUND.
+# A Lambda's deploy script hand-lists the files packed into its zip.
+# TEAM-3696: review-cap.mjs, ship-review.mjs, completion.mjs were added to the
+# orchestrator as local imports but omitted from the `zip -rq function.zip ...`
+# line, so the deployed Lambda died at cold start with ERR_MODULE_NOT_FOUND.
 #
 # This script walks the transitive local-import closure (relative `./x.mjs`
 # imports only, followed recursively) starting from the Lambda entrypoints
-# packed in the zip — index.mjs, agent-invoker.mjs, events-writer.mjs — and
-# fails if any module in that closure is missing from the zip manifest line
-# in deploy.sh.
+# packed in the zip and fails if any module in that closure is missing from the
+# zip manifest line in the deploy script.
+#
+# It defaults to the orchestrator (the surface TEAM-3696 broke) and takes flags
+# for any other single-directory Lambda — TEAM-4739 added gate-contract.mjs to
+# the two ticket Lambdas, which have the same hand-listed zip line and the same
+# cold-start failure mode:
+#
+#   --dir <path>            Lambda source dir      (default lambda/orchestrator)
+#   --entry <file.mjs>      entrypoint, repeatable (default: the orchestrator's 3)
+#   --manifest-file <path>  the deploy script carrying the zip line
+#                                                  (default lambda/orchestrator/deploy.sh)
+#   --zip <archive>         validate an ACTUAL built archive instead: every module
+#                           in the import closure must be physically present in
+#                           the zip. The pipeline's Build stage builds its own
+#                           orchestrator.zip from an independently maintained file
+#                           list, so this mode catches a module the buildspec's
+#                           list omits even when deploy.sh's line is correct
+#                           (Codex PR #263 P2).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-ORCH_DIR="lambda/orchestrator"
-ENTRYPOINTS=("index.mjs" "agent-invoker.mjs" "events-writer.mjs")
-
-# Two modes:
-#   (default)         validate deploy.sh's hand-listed zip manifest line.
-#   --zip <archive>   validate an ACTUAL built archive: every module in the
-#                     import closure must be physically present in the zip. The
-#                     pipeline's Build stage builds its own orchestrator.zip
-#                     from an independently maintained file list, so this mode
-#                     catches a module the buildspec's list omits even when
-#                     deploy.sh's line is correct (Codex PR #263 P2).
+LAMBDA_DIR=""
+MANIFEST_FILE=""
 ZIP_PATH=""
-CHECK_SOURCE="lambda/orchestrator/deploy.sh"
-if [ "${1:-}" = "--zip" ]; then
-  ZIP_PATH="${2:?--zip requires an archive path}"
+declare -a ENTRYPOINTS=()
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --dir) LAMBDA_DIR="${2:?--dir requires a path}"; shift 2 ;;
+    --entry) ENTRYPOINTS+=("${2:?--entry requires a file name}"); shift 2 ;;
+    --manifest-file) MANIFEST_FILE="${2:?--manifest-file requires a path}"; shift 2 ;;
+    --zip) ZIP_PATH="${2:?--zip requires an archive path}"; shift 2 ;;
+    *) echo "FAIL: unknown argument: $1" >&2
+       echo "usage: $0 [--dir DIR] [--entry FILE.mjs]... [--manifest-file PATH] [--zip ARCHIVE]" >&2
+       exit 2 ;;
+  esac
+done
+
+# Defaults: the orchestrator invocation, unchanged.
+[ -n "$LAMBDA_DIR" ] || LAMBDA_DIR="lambda/orchestrator"
+[ -n "$MANIFEST_FILE" ] || MANIFEST_FILE="lambda/orchestrator/deploy.sh"
+if [ "${#ENTRYPOINTS[@]}" -eq 0 ]; then
+  if [ "$LAMBDA_DIR" = "lambda/orchestrator" ]; then
+    ENTRYPOINTS=("index.mjs" "agent-invoker.mjs" "events-writer.mjs")
+  else
+    ENTRYPOINTS=("index.mjs")
+  fi
+fi
+
+CHECK_SOURCE="$MANIFEST_FILE"
+if [ -n "$ZIP_PATH" ]; then
   command -v unzip >/dev/null || { echo "FAIL: unzip not found (needed for --zip mode)"; exit 1; }
   # Materialize the zip's actual entry list; the node check reads it as the manifest.
   CHECK_SOURCE="$(mktemp)"
   unzip -Z1 "$ZIP_PATH" > "$CHECK_SOURCE"
 fi
 
-node - "$CHECK_SOURCE" "$ORCH_DIR" "$ZIP_PATH" "${ENTRYPOINTS[@]}" <<'EOF'
+node - "$CHECK_SOURCE" "$LAMBDA_DIR" "$ZIP_PATH" "${ENTRYPOINTS[@]}" <<'EOF'
 const fs = require("fs");
 const path = require("path");
 
-const [checkSourcePath, orchDir, zipPath, ...entrypoints] = process.argv.slice(2);
+const [checkSourcePath, lambdaDir, zipPath, ...entrypoints] = process.argv.slice(2);
 const zipMode = zipPath !== "";
 
 function localImports(file) {
@@ -58,7 +89,7 @@ while (queue.length) {
   const name = queue.shift();
   if (seen.has(name)) continue;
   seen.add(name);
-  const full = path.join(orchDir, name);
+  const full = path.join(lambdaDir, name);
   if (!fs.existsSync(full)) {
     console.error(`FAIL: ${full} does not exist (imported but missing)`);
     process.exit(1);
@@ -76,13 +107,27 @@ if (zipMode) {
   manifest = (name) => basenames.has(name);
   describe = `built archive ${zipPath}`;
 } else {
-  const deployShSrc = fs.readFileSync(checkSourcePath, "utf8");
-  const zipLineMatch = deployShSrc.match(/zip -rq function\.zip[^\n]*/);
-  if (!zipLineMatch) {
-    console.error(`FAIL: no "zip -rq function.zip ..." line found in ${checkSourcePath}`);
+  // The zip line, in whatever form the deploy script writes it: `zip -rq
+  // function.zip a.mjs ...` (orchestrator deploy.sh) or `zip -j "$zip" a.mjs ...`
+  // inside an execSync template (deploy/setup-tickets-lambda.mjs). Matched by
+  // "the word zip, a flag, and at least one .mjs on the same line" so a new
+  // packaging idiom does not silently stop being checked; more than one such line
+  // is ambiguous and fails rather than guessing which one is the manifest.
+  const manifestSrc = fs.readFileSync(checkSourcePath, "utf8");
+  const zipLines = manifestSrc.match(/(?:^|[^\w-])zip\s+-[^\n]*\.mjs[^\n]*/g) || [];
+  if (zipLines.length === 0) {
+    console.error(`FAIL: no "zip -<flags> ... *.mjs" line found in ${checkSourcePath}`);
     process.exit(1);
   }
-  const zipLine = zipLineMatch[0];
+  if (zipLines.length > 1) {
+    console.error(
+      `FAIL: ${zipLines.length} candidate zip manifest lines in ${checkSourcePath} — ` +
+        `cannot tell which one packs ${entrypoints.join(", ")}:\n` +
+        zipLines.map((l) => `  - ${l.trim()}`).join("\n"),
+    );
+    process.exit(1);
+  }
+  const zipLine = zipLines[0];
   manifest = (name) => zipLine.includes(name);
   describe = `zip manifest line in ${checkSourcePath}`;
 }
@@ -98,7 +143,8 @@ if (missing.length) {
 }
 
 console.log(
-  `lambda zip manifest guard: OK (${seen.size} modules in closure, all present in ${describe})`,
+  `lambda zip manifest guard: OK (${seen.size} modules in closure of ${lambdaDir}, ` +
+    `all present in ${describe})`,
 );
 EOF
 # Clean up the temp listing in --zip mode.

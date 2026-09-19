@@ -869,6 +869,8 @@
       "requiresRepo": true,
       "featureBranchPhase": "development",
       "createsPullRequest": true,
+      "ledgerCommit": false,
+      "preflight": "sweep",
       "completionRequiresAgentPhases": [
         "development",
         "verification",

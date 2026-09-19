@@ -221,6 +221,13 @@ phases:
         deactivate
       # HARD GATE: lambda-zip manifest integrity (the guard DEPLOY.md's inline zip bypassed)
       - "bash scripts/check-lambda-zip-manifest.sh"
+      # TEAM-4739: the two ticket Lambdas hand-list their zip contents the same way
+      # (deploy/setup-tickets-lambda.mjs picks the source dir by TICKET_PROVIDER), so
+      # a new local import of index.mjs — gate-contract.mjs — has the same cold-start
+      # ERR_MODULE_NOT_FOUND failure mode. Both dirs are checked because only one is
+      # packaged per install and the un-deployed one is where drift hides.
+      - "bash scripts/check-lambda-zip-manifest.sh --dir lambda/agentcore-hub-tickets --entry index.mjs --manifest-file deploy/setup-tickets-lambda.mjs"
+      - "bash scripts/check-lambda-zip-manifest.sh --dir lambda/agentcore-hub-jira --entry index.mjs --manifest-file deploy/setup-tickets-lambda.mjs"
 
   post_build:
     commands:

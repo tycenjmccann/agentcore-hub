@@ -36,6 +36,7 @@ import {
   LEASE_TTL_MS,
   isLeaseLive,
   lastAgentActivity,
+  lastStreamedText,
   stealClaim,
 } from "./lease.mjs";
 import { resolveWatchdog, setWatchdogSource } from "./watchdog.mjs";
@@ -43,7 +44,7 @@ import { createDetector } from "./dead-session-detector.mjs";
 import { createCascade } from "./cascade.mjs";
 import { createReconcileSweep } from "./reconcile-sweep.mjs";
 import { createReviewCap, parseDecision } from "./review-cap.mjs";
-import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, SHIP_PHASES, SHIP_BLOCKED_OUTCOMES, TERMINAL_WORKFLOW_PHASES } from "./completion.mjs";
+import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, deliveryRollUp, harvestableShipOutcome, SHIP_PHASES, TERMINAL_WORKFLOW_PHASES } from "./completion.mjs";
 import { isPipelineEnabled } from "./pipeline-enabled.mjs";
 import { CD_REGISTRY_KEY, EMPTY_CD_REGISTRY, parseCdRegistry, isCdRegistered, effectiveWorkflowDef, resolveDelivery, deliveryModeContext } from "./cd-registry.mjs";
 import { pickTicketSession, renderPriorSessionBlock, renderRejectionSessionHint } from "./coding-session-hint.mjs";
@@ -517,6 +518,12 @@ function getReconcileSweep() {
     cascade: getCascade(),
     getChildTickets,
     leaseTtlMs: LEASE_TTL_MS,
+    // TEAM-4739 W2/W3. Injected here (not imported by the sweep) so invariant R3
+    // holds: the sweep still calls neither lease.mjs nor a write command itself.
+    appendNotification: (wfId, id, notification, opts) =>
+      store.appendEscalationOnce(wfId, id, notification, opts),
+    lastStreamedTextAt: async (wfId, agentId, ticketId) =>
+      (await lastStreamedText(ddb, EVENTS_TABLE, wfId, agentId, ticketId, 1, { withTimestamp: true })).at,
   });
   return _reconcileSweep;
 }
@@ -1303,9 +1310,13 @@ async function harvestCompletionEvidence(workflow, ticketId) {
     if (record.commit_sha && !entry?.commitSha) fields.commitSha = record.commit_sha;
     if (record.pr_url && !entry?.prUrl) fields.prUrl = record.pr_url;
     if (record.merge_commit && !entry?.mergeCommit) fields.mergeCommit = record.merge_commit;
-    if (typeof record.outcome === "string" && !entry?.outcome) {
-      const oc = record.outcome.trim().toLowerCase();
-      if (SHIP_BLOCKED_OUTCOMES.includes(oc) || oc === "shipped") fields.outcome = oc;
+    if (!entry?.outcome) {
+      // The admitted set lives beside shipVerdictOf (TEAM-4763 P1-A) because what
+      // may be harvested and what it MEANS are one decision: they had drifted, and
+      // `handoff` — writable by report_completion since TEAM-4740 — was dropped
+      // here, so an honest handoff closed the run on the static-ci-only phase.
+      const oc = harvestableShipOutcome(record.outcome);
+      if (oc) fields.outcome = oc;
     }
     if (record.block_reason && !entry?.blockReason) {
       fields.blockReason = String(record.block_reason).slice(0, 500);
@@ -3312,6 +3323,11 @@ export async function completeWorkflow(workflow) {
     return;
   }
 
+  // The epic's children, read once and shared by the three gates below that need
+  // them (evidence, ship verdict, delivery roll-up) — each gate is conditional, so
+  // this stays null until the first one actually reads (TEAM-4763 P1-A).
+  let children = null;
+
   // TEAM-3686 Finding 3: deliverable-evidence gate — same semantics as the HTTP
   // complete route (TEAM-3619 D4a). Every done ticket in a completion-required
   // phase must have real work behind it (non-empty agentTasks output or an
@@ -3326,7 +3342,7 @@ export async function completeWorkflow(workflow) {
     const wfDef = getEffectiveWorkflowDef(workflow);
     const requiredPhases = wfDef.completionRequiresAgentPhases || [];
     if (requiredPhases.length > 0) {
-      const children = await getChildTickets(workflow.epicId);
+      children = await getChildTickets(workflow.epicId);
       const evidenceOpts = { getAgentPhase: (assignee) => getAgentDef(assignee)?.phase };
       let freshWf = await store.getWorkflow(workflow.id);
       let missing = missingEvidenceTickets(
@@ -3403,36 +3419,32 @@ export async function completeWorkflow(workflow) {
     console.warn(`[orchestrator] evidence check skipped for ${workflow.id}: ${err?.message || err}`);
   }
 
-  // ── TEAM-3760: TWO ship gates run here, in this order, both at full strength.
-  //   1. TEAM-3747 D2 ship-verdict gate (below): INTERNAL evidence, fail-CLOSED.
-  //      A done ship ticket with no merge/deploy verdict closes the run on an
-  //      honest TERMINAL outcome (deploy-blocked / static-ci-only).
-  //   2. TEAM-3721 SHIP_MERGE_VERIFY gate (after it): EXTERNAL GitHub ground
-  //      truth, fail-OPEN. A branch PROVABLY unmerged leaves the run OPEN
-  //      (workflow.cd_unmerged) for the RM/WM to repair.
-  // D2 must run first: it terminally closes the "nothing recorded shipped" runs,
-  // so merge-verify only ever sees runs whose recorded evidence CLAIMS a ship —
-  // and then cross-checks that claim against GitHub. Reversed, an unmerged run
-  // with no ship verdict would be left open by gate 2 and never reach gate 1 —
-  // exactly the silent CD dead-zone stall D2 exists to kill. (D2 first is also
-  // free: local reads, no GitHub call, for runs that will terminally close.)
-
-  // TEAM-3747 D2 — ship/CD merge-verdict gate: NO green close over unshipped work.
-  // If the def has a ship phase, a done ship ticket must carry a merge/deploy
-  // verdict (merge commit) OR an explicit deploy-blocked outcome. When neither is
-  // present the run did NOT actually ship, so we close it on the HONEST terminal
-  // outcome (deploy-blocked when a block was recorded, else static-ci-only) and
-  // emit a TERMINAL verdict event — never a silent stall, never a fake "complete".
-  // Reuses COMPLETION_EVIDENCE_REQUIRED (fail-closed: enforce by default; a
-  // fail-open here would defeat the whole deliverable). The explicit opt-out
-  // COMPLETION_EVIDENCE_REQUIRED=off|false|0 only shadow-logs and proceeds.
-  // TEAM-3986 — the release manager's report_completion tool has no
-  // outcome/merge_commit field, so the self-reported ship verdict can NEVER read
-  // "shipped" (commitSha is deliberately not proof: it is the branch HEAD). Every
-  // merged-and-deployed run therefore closed as static-ci-only. GitHub is the
-  // ground truth the TEAM-3721 gate already consults — consult it FIRST, and when
-  // it proves the merge, stamp the ship tasks with the merge commit so the
-  // verdict below (and the dashboard) tell the truth. Unknown → self-report decides.
+  // ── TEAM-3760: TWO ship gates run here, both at full strength, in the order the
+  // code below actually runs them (TEAM-4768 corrected this comment, which used to
+  // claim the reverse; completion-gates.test.mjs pins the real order):
+  //   1. TEAM-3721 SHIP_MERGE_VERIFY probe: EXTERNAL GitHub ground truth, fail-OPEN.
+  //      A branch PROVABLY unmerged leaves the run OPEN (workflow.cd_unmerged) for
+  //      the RM/WM to repair. Unknown/API error → no refusal and no proof.
+  //   2. TEAM-3747 D2 ship-verdict gate: INTERNAL evidence, fail-CLOSED. A done ship
+  //      ticket with no merge/deploy verdict closes the run on an honest TERMINAL
+  //      outcome (deploy-blocked / static-ci-only) — never a silent stall, never a
+  //      fake "complete". Reuses COMPLETION_EVIDENCE_REQUIRED (enforce by default; a
+  //      fail-open here would defeat the whole deliverable); the explicit opt-out
+  //      COMPLETION_EVIDENCE_REQUIRED=off|false|0 only shadow-logs and proceeds.
+  // TEAM-3986 is why the probe goes first: the release manager's report_completion
+  // tool has no outcome/merge_commit field, so the self-reported verdict can NEVER
+  // read "shipped" (commitSha is deliberately not proof — it is the branch HEAD),
+  // and every merged-and-deployed run closed static-ci-only. Consulting GitHub FIRST
+  // lets a proven merge stamp the ship tasks so the verdict (and the dashboard) tell
+  // the truth. Unknown → self-report decides.
+  // The VERDICT is therefore resolved before the probe (local reads, no GitHub call)
+  // for one reason only: TEAM-4768 — a run shipped PURELY by handoff has no merge
+  // claim to cross-check. Its PR is open BY DEFINITION, which the probe would read as
+  // "provably unmerged" and refuse the run over, wedging it open forever even though
+  // the RM reported honestly. Such a run skips the probe entirely; mergeProof stays
+  // null and D2 passes it on verdict.shipped. Accepted consequence: an RM that
+  // declares "handoff" but did merge gets prState "open" on its delivery row — we
+  // trust the agent's own claim rather than pay a probe to contradict it.
   const shipMergeVerify = !["off", "false", "0"].includes(
     String(process.env.SHIP_MERGE_VERIFY || "").trim().toLowerCase()
   );
@@ -3440,8 +3452,32 @@ export async function completeWorkflow(workflow) {
     shipMergeVerify && defHasShipPhase(workflow) && workflow.featureBranch &&
     workflow.repoConfig && process.env.GITHUB_PAT
   );
+  let shipPhases = [];
+  let shipOpts = null;
+  let freshWf = null;
+  let verdict = null;
+  try {
+    const wfDef = getEffectiveWorkflowDef(workflow);
+    shipPhases = (wfDef.completionRequiresAgentPhases || []).filter((p) => SHIP_PHASES.has(p));
+    if (shipPhases.length > 0) {
+      children = await getChildTickets(workflow.epicId);
+      freshWf = await store.getWorkflow(workflow.id);
+      shipOpts = { getAgentPhase: (assignee) => getAgentDef(assignee)?.phase };
+      verdict = evaluateShipVerdict(
+        children, freshWf?.agentTasks || workflow.agentTasks || {}, shipPhases, shipOpts
+      );
+    }
+  } catch (err) {
+    // Never let the ship-verdict resolution itself turn a legitimate completion
+    // into a stall — it only diverts when it can prove work never shipped. A null
+    // verdict fails OPEN into the probe below, exactly as before TEAM-4768.
+    console.warn(`[orchestrator] ship-verdict check skipped for ${workflow.id}: ${err?.message || err}`);
+  }
+
+  // Deliberately OUTSIDE any try/catch: a failure to publish cd_unmerged must still
+  // leave the run open, never fall through to completion.
   let mergeProof = null;
-  if (mergeVerifyConfigured) {
+  if (mergeVerifyConfigured && !verdict?.handoff) {
     const probe = await featureBranchMergeProbe(workflow);
     if (probe.merged === false) {
       console.error(
@@ -3460,62 +3496,39 @@ export async function completeWorkflow(workflow) {
   }
 
   try {
-    const wfDef = getEffectiveWorkflowDef(workflow);
-    const requiredPhases = wfDef.completionRequiresAgentPhases || [];
-    const shipPhases = requiredPhases.filter((p) => SHIP_PHASES.has(p));
-    if (shipPhases.length > 0) {
-      const children = await getChildTickets(workflow.epicId);
-      let freshWf = await store.getWorkflow(workflow.id);
-      const shipOpts = { getAgentPhase: (assignee) => getAgentDef(assignee)?.phase };
-      let verdict = evaluateShipVerdict(
+    if (verdict?.required && !verdict.shipped && mergeProof) {
+      // Stamp GitHub's proof onto ship tasks that self-reported nothing. A
+      // recorded BLOCK outcome is never overwritten — a block is a block.
+      for (const o of verdict.offenders) {
+        if (o.verdict && o.verdict !== "none") continue;
+        const fields = {
+          mergeCommit: mergeProof.mergeCommit || `merged:${workflow.featureBranch}`,
+          mergeVerifiedBy: "github",
+        };
+        if (mergeProof.prUrl && !freshWf?.agentTasks?.[o.ticketId]?.prUrl) fields.prUrl = mergeProof.prUrl;
+        try { await store.mergeTaskMetadata(workflow.id, o.ticketId, fields); }
+        catch (err) { console.warn(`[orchestrator] merge-proof stamp failed for ${o.ticketId}: ${err?.message || err}`); }
+      }
+      console.log(`[orchestrator] ${workflow.id}: GitHub proves ${workflow.featureBranch} merged (${mergeProof.mergeCommit || "compare"}) — ship verdict taken from ground truth`);
+      freshWf = await store.getWorkflow(workflow.id);
+      verdict = evaluateShipVerdict(
         children, freshWf?.agentTasks || workflow.agentTasks || {}, shipPhases, shipOpts
       );
-      if (verdict.required && !verdict.shipped && mergeProof) {
-        // Stamp GitHub's proof onto ship tasks that self-reported nothing. A
-        // recorded BLOCK outcome is never overwritten — a block is a block.
-        for (const o of verdict.offenders) {
-          if (o.verdict && o.verdict !== "none") continue;
-          const fields = {
-            mergeCommit: mergeProof.mergeCommit || `merged:${workflow.featureBranch}`,
-            mergeVerifiedBy: "github",
-          };
-          if (mergeProof.prUrl && !freshWf?.agentTasks?.[o.ticketId]?.prUrl) fields.prUrl = mergeProof.prUrl;
-          try { await store.mergeTaskMetadata(workflow.id, o.ticketId, fields); }
-          catch (err) { console.warn(`[orchestrator] merge-proof stamp failed for ${o.ticketId}: ${err?.message || err}`); }
-        }
-        console.log(`[orchestrator] ${workflow.id}: GitHub proves ${workflow.featureBranch} merged (${mergeProof.mergeCommit || "compare"}) — ship verdict taken from ground truth`);
-        freshWf = await store.getWorkflow(workflow.id);
-        verdict = evaluateShipVerdict(
-          children, freshWf?.agentTasks || workflow.agentTasks || {}, shipPhases, shipOpts
-        );
+    }
+    if (verdict?.required && !verdict.shipped) {
+      const offenders = verdict.offenders.map((o) => `${o.ticketId}@${o.phase}:${o.verdict}`).join(", ");
+      if (COMPLETION_EVIDENCE_REQUIRED) {
+        await closeWorkflowBlocked(workflow, verdict);
+        return;
       }
-      if (verdict.required && !verdict.shipped) {
-        const offenders = verdict.offenders.map((o) => `${o.ticketId}@${o.phase}:${o.verdict}`).join(", ");
-        if (COMPLETION_EVIDENCE_REQUIRED) {
-          await closeWorkflowBlocked(workflow, verdict);
-          return;
-        }
-        console.warn(
-          `[orchestrator] ${workflow.id} would close as ${verdict.outcome} (shadow opt-out) — ship verdict missing: ${offenders}`
-        );
-      }
+      console.warn(
+        `[orchestrator] ${workflow.id} would close as ${verdict.outcome} (shadow opt-out) — ship verdict missing: ${offenders}`
+      );
     }
   } catch (err) {
-    // Never let the ship-verdict resolution itself turn a legitimate completion
-    // into a stall — it only diverts when it can prove work never shipped.
     console.warn(`[orchestrator] ship-verdict check skipped for ${workflow.id}: ${err?.message || err}`);
   }
 
-  // Ship-phase merge gate (TEAM-3721 CD dead-zone): a def with a "ship" phase
-  // has the release manager own the merge, and the CD ticket can be marked done
-  // even though the PR was never actually merged (RM BLOCKs in preflight, or the
-  // merge step silently no-ops). Trusting ticket status alone let such a run
-  // finalize as "complete" with main untouched — the exact false-complete we hit.
-  // Before claiming completion, verify against GitHub that the feature branch is
-  // truly merged. Not merged → abort completion so the run stays open (the CD
-  // ticket / WM surfaces it) instead of lying. Best-effort: a GitHub/API failure
-  // (or no PAT) never blocks a legitimate completion — it only tightens when it
-  // can PROVE the branch is unmerged. Opt-out: SHIP_MERGE_VERIFY=off.
   const completedAt = new Date().toISOString();
   const won = await store.completeWorkflow(workflow.id, completedAt);
   if (!won) {
@@ -3566,10 +3579,24 @@ export async function completeWorkflow(workflow) {
   // vs "merged + deployed" without re-deriving it from the registry later
   // (the registry can change after the fact). Best-effort.
   try {
+    // TEAM-4763 P1-A: the outcome/prState half comes from deliveryRollUp, the ONE
+    // place that knows what `delivery.outcome`'s two-value union (types.ts) means —
+    // this used to spread the ship entry's RAW outcome, which put "empty_sweep" or
+    // "handoff" on a field neither value belongs to. A null `children` here would
+    // silently drop the roll-up's human-follow-up rule, so fetch it if no gate
+    // above did; still best-effort, still inside this catch.
+    if (!children) {
+      try {
+        children = await getChildTickets(workflow.epicId);
+      } catch (err) {
+        console.warn(`[orchestrator] ${workflow.id}: delivery roll-up children read failed: ${err.message}`);
+      }
+    }
     await store.setDelivery(workflow.id, {
       mode: delivery.mode,
       ...(delivery.pipeline ? { pipeline: delivery.pipeline } : {}),
       ...(prUrl ? { prUrl } : {}),
+      ...deliveryRollUp(children || [], workflow.agentTasks || {}, { mode: delivery.mode }),
       at: completedAt,
     });
   } catch (err) {
@@ -3659,6 +3686,30 @@ async function closeWorkflowBlocked(workflow, verdict) {
       featureBranch: workflow.featureBranch,
     }
   );
+
+  // W1′ (TEAM-4739) — a terminal block that pages nobody is a silent failure: the
+  // run is closed, honestly, and no human is told. notifyCompletionBlockedOnce
+  // already covers the OTHER terminal refusal (completion_blocked); this is the
+  // ship-outcome one. Same idiom: id-scoped, skip when one is already open, and
+  // wrapped so a notification failure never turns the close into a wedge.
+  const notifId = `notif_terminal_block_${workflow.id}`;
+  const notifs = Array.isArray(workflow.humanNotifications) ? workflow.humanNotifications : [];
+  if (!notifs.some((n) => n.id === notifId && !n.acknowledged)) {
+    try {
+      await store.appendNotification(workflow.id, {
+        id: notifId,
+        type: "manager_escalation",
+        title: `Run closed ${outcome} (not shipped)`,
+        details: `The run was closed on the honest terminal outcome "${outcome}"${verdict.blockReason ? ` (${verdict.blockReason})` : ""} because ship evidence never proved a merge/deploy: ${offenders}. Nothing else will re-drive it — a human decides whether to re-run the ship phase or accept the close.`,
+        reviewer: "ship-gate",
+        timestamp: completedAt,
+        acknowledged: false,
+      });
+      console.log(`[orchestrator] ${workflow.id}: ${outcome} close — manager_escalation appended`);
+    } catch (err) {
+      console.warn(`[orchestrator] ${workflow.id}: terminal-block notification failed (non-fatal): ${err?.message || err}`);
+    }
+  }
 
   await store.markFinalized(workflow.id);
 }
@@ -4754,17 +4805,6 @@ function defHasShipPhase(workflow) {
   ).some((p) => SHIP_PHASES.has(p));
 }
 
-// Ship-phase merge gate helper (TEAM-3721). Returns a short reason string when
-// the feature branch is PROVABLY not merged into the base branch, else "" (merged
-// or can't-tell). Squash merges leave the branch commits absent from base, so we
-// trust the PR's `merged` flag first (authoritative for both squash and merge
-// commits); only if no PR is found do we fall back to the compare API. Any API
-// error returns "" (fail-open — never block a legitimate completion on a transient).
-async function featureBranchUnmerged(workflow) {
-  const probe = await featureBranchMergeProbe(workflow);
-  return probe.merged === false ? probe.reason : "";
-}
-
 /**
  * TEAM-3986 — ONE GitHub probe, three honest answers:
  *   { merged: true,  mergeCommit, prUrl }  a PR for the head has merged_at (its
@@ -4774,7 +4814,10 @@ async function featureBranchUnmerged(workflow) {
  *   { merged: null }                       unknown status or API error — fail OPEN for
  *                                          the unmerged gate, and NO proof for the
  *                                          shipped verdict (self-report decides).
- * The fail-open `featureBranchUnmerged` wrapper keeps the TEAM-3721 semantics.
+ * Squash merges leave the branch commits absent from base, so the PR's `merged_at`
+ * is trusted first (authoritative for squash AND merge commits) and compare is only
+ * the fallback. The TEAM-3721 fail-open semantics live at the call site in
+ * completeWorkflow: only `merged === false` refuses.
  */
 async function featureBranchMergeProbe(workflow) {
   try {

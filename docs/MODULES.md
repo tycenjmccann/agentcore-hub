@@ -76,13 +76,13 @@ The orchestration pipeline. Self-contained surface.
 - `orchestrator` — drives the pipeline state machine
 - `agentcore-hub-jira` — Jira Cloud ticket tools (deployed when `TICKET_PROVIDER=jira`)
 - `agentcore-hub-tickets` — DynamoDB-backed ticket tools (deployed when `TICKET_PROVIDER=dynamodb`)
-- `workflow-output` — collects agent artifacts. Its `S3Storage___write_object` / `save_design_doc` tools also run the **writing-standard lint** (`deliverables-lint.mjs`, DL-031): a registered `shared/*.md` deliverable (see `docs/workflow/deliverables.md`) that is not in its family template's sections is refused as a value (`{status:"refused", reason:"writing_standard", template, problems[]}`) and nothing is written. Fails open when `config/workflows.json` is unreadable
+- `workflow-output` — collects agent artifacts. Its `S3Storage___write_object` / `save_design_doc` tools also run the **writing-standard lint** (`deliverables-lint.mjs`, DL-032): a registered `shared/*.md` deliverable (see `docs/workflow/deliverables.md`) that is not in its family template's sections is refused as a value (`{status:"refused", reason:"writing_standard", template, problems[]}`) and nothing is written. Fails open when `config/workflows.json` is unreadable
 - `cost-report` — per-run performance card (cost / time / quality + anomaly bands) on `workflow.complete`; writes `workflows/{id}/shared/performance-card.{json,md}`, `performance/index.json`, `workflow.performance` events and `AgentCoreHub/Performance` CloudWatch metrics (`docs/workflow/performance-card.md`)
 - `anomaly-watcher` — scheduled workflow-observability Lambda (EventBridge Scheduler, ~10 min): folds live-run events into hourly metric buckets, detects anomalies against the bundled `bands.yaml`, and takes highest-tier action (log / diagnose + page / file one bug workflow under a fleet-wide cap); no function URL or API
 - `workflow-analyzer` — thin dispatcher that invokes the Workflow Manager harness (`agentcore_hub_workflow_manager`) on terminal workflow outcomes or a schedule to ANALYZE completed runs / WATCH stale ones; all analysis + intervention logic lives in the harness
 
 **Config**
-- `src/config/workflows.json` `deliverableFamilies` + per-def `deliverables[]` — the **deliverables registry** (DL-031): what each def owes per phase, its family (`brief` / `assessment` / `spec` / `record` / `external`), author, reader, gate and template. One list read by the board's artifacts modal (present / missing strip), the workflow-output lint and the generated [`docs/workflow/deliverables.md`](./workflow/deliverables.md) (`node scripts/gen-deliverables-doc.mjs`). `writingStandard: true` on a def turns the lint on; `scripts/check-deliverables-parity.sh` keeps registry, templates (`blueprints/template-*.md`), author blueprints and the doc in step
+- `src/config/workflows.json` `deliverableFamilies` + per-def `deliverables[]` — the **deliverables registry** (DL-032): what each def owes per phase, its family (`brief` / `assessment` / `spec` / `record` / `external`), author, reader, gate and template. One list read by the board's artifacts modal (present / missing strip), the workflow-output lint and the generated [`docs/workflow/deliverables.md`](./workflow/deliverables.md) (`node scripts/gen-deliverables-doc.mjs`). `writingStandard: true` on a def turns the lint on; `scripts/check-deliverables-parity.sh` keeps registry, templates (`blueprints/template-*.md`), author blueprints and the doc in step
 - `src/config/kpi.json` — the deterministic quality rubric (`kpiVersion`, grade thresholds, outcome caps, `minEvidenceWeight`, weighted components summing to 100). Single source of truth for the 0-100 score; read identically by `lambda/cost-report/index.mjs` and `src/lib/workflow/performance.ts` (`computeKpi`), and both sides are pinned to the same expected values by `lambda/cost-report/fixtures/kpi-cases.json`. Change the rubric here only — never inline a weight, tolerance or threshold in either scorer
 
 **DynamoDB tables** (defaults in `deploy/config.sh`)
@@ -371,16 +371,44 @@ Lambda's 4KB env budget.
 > and never touches DynamoDB tables, env vars or IAM. So creating
 > `agentcore-hub-si-ledger`, putting `SI_LEDGER_TABLE` on all four surfaces
 > (`workflow-analyzer` + `prd-submitter` Lambdas, the WM harness, the hub ECS
-> service) and applying the two IAM statements (`SiLedgerTable` on
-> `agentcore-hub-lambda-role`, `SiLedgerReadWrite` on `agentcore-hub-harness-role`)
-> are steps a human runs once, via
-> `./scripts/create-dynamodb-tables.sh`, `./deploy/workflow-manager/deploy.sh`,
-> `./deploy/continuous-improvement/deploy.sh`,
-> `node deploy/workflow-manager/setup-workflow-manager.mjs` and
-> `deploy/ecs-express/set-env.sh`. Until they are done, the shipped code sees an
-> unset `SI_LEDGER_TABLE` / `AccessDenied`. Remember that harness
-> `environmentVariables` and the ECS/Lambda env APIs are **replace-all**: use
-> `set-env.sh` / `set-runtime-env.py`, never a raw update call.
+> service) and applying the IAM statements (`SiLedgerTable` on
+> `agentcore-hub-lambda-role`, `SiLedgerReadWrite` on `agentcore-hub-harness-role`,
+> `HubLiveVerifyRead` on `agentcore-hub-coding-runtime-role` — the identity that
+> performs B3b LIVE VERIFY) are steps a human runs once. **One command
+> does all of them, idempotently:**
+>
+> ```bash
+> ./scripts/si-ledger-handoff.sh --dry-run   # the default: prints every mutation, executes none
+> ./scripts/si-ledger-handoff.sh --apply     # then actually apply
+> ```
+>
+> It calls the scripts that own each definition (`setup-workflow-manager.mjs --iam-only`,
+> `IAM_ONLY=1 deploy/workflow-manager/deploy.sh`,
+> `IAM_ONLY=1 deploy/continuous-improvement/deploy.sh`,
+> `ONLY_POLICY=HubLiveVerifyRead deploy/coding-agent-runtime/setup-coding-runtime-role.sh`),
+> **merges** the env onto all four surfaces, runs `scripts/si-ledger-backfill.mjs`, and
+> verifies the result with `iam simulate-principal-policy` — including the negatives, that
+> the coding-runtime role still cannot write and cannot Scan
+> `agentcore-hub-cloud-code-sessions`. `--print-policies` dumps the two IAM
+> documents without touching anything.
+>
+> `HubLiveVerifyRead` is **read-only and a fixed allow-list**, not a wildcard
+> (TEAM-4785): `DescribeTable`/`Scan`/`Query`/`GetItem` on exactly `agentcore-hub-`
+> `si-ledger`, `workflows`, `tickets`, `events`, `workflow-analyses`, `eval-results`,
+> `eval-daily`, `eval-config` (+ their `/index/*`), `s3:GetObject` on
+> `config/{agents,workflows,connectors}.json`, `workflows/*` and `completions/*`, and
+> `s3:ListBucket` constrained by an `s3:prefix` condition to those three prefixes.
+> Deliberately NOT readable: `cloud-code-sessions` (other tenants' session rows),
+> `routines`, `anomaly-watcher-state`, `eval-seen`, and `config/cd-registry.json`
+> (it holds the cross-account CD `externalId`). The role is assumed by the
+> **untrusted** coding runtime, so the wildcard grants the trusted roles hold are
+> not a precedent. A new hub table therefore **fails closed** under live verify with
+> `AccessDenied` until it is added to the allow-list in
+> `deploy/coding-agent-runtime/setup-coding-runtime-role.sh` and this handoff is re-run. Until it has been run, the shipped code sees an
+> unset `SI_LEDGER_TABLE` / `AccessDenied`: that is TEAM-4770, where #637 deployed and
+> sat inert (patternKey `tooling.coding-role.no-live-verify-access`). Remember that
+> harness `environmentVariables` and the ECS/Lambda env APIs are **replace-all**: use
+> `set-harness-env.mjs` / `set-env.sh` / `set-runtime-env.py`, never a raw update call.
 >
 > Which script owns which surface: `deploy/workflow-manager/deploy.sh` sets the env
 > and the `SiLedgerTable` grant for `workflow-analyzer`;
@@ -388,8 +416,12 @@ Lambda's 4KB env budget.
 > own `EvalResultsAccess` document carries a narrower duplicate of the statement, so
 > the Evaluations module works on an install that never deployed the Workflow
 > Manager) and packages the byte-copied `si-ledger.mjs` into its zip. Only the WM
-> harness and the ECS service are hand-set. `./deploy/continuous-improvement/verify.sh`
-> asserts the submitter's env var and that the table is ACTIVE.
+> harness and the ECS service are hand-set — the harness by
+> `deploy/workflow-manager/set-harness-env.mjs` (`UpdateHarness`'s
+> `environmentVariables` is replace-all, so it reads the live env back via
+> `GetHarness` and merges), the service by `deploy/ecs-express/set-env.sh`.
+> `./deploy/continuous-improvement/verify.sh` asserts the submitter's env var and
+> that the table is ACTIVE.
 >
 > `deploy/workflow-manager/deploy.sh` additionally sets `ARTIFACT_BUCKET` on the
 > analyzer (without it no attempt can be dated from the cd-ledger, so every fix

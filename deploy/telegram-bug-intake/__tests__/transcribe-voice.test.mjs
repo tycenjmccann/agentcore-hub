@@ -118,6 +118,7 @@ vi.mock("@aws-sdk/client-dynamodb", () => {
     },
     GetItemCommand: cmd,
     PutItemCommand: cmd,
+    UpdateItemCommand: cmd,
     DeleteItemCommand: cmd,
     ScanCommand: cmd,
   };

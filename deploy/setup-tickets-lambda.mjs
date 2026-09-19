@@ -80,6 +80,14 @@ if (TICKET_PROVIDER === "jira") {
 const ACCOUNT_ID = process.env.AWS_ACCOUNT_ID || "";
 const ARTIFACT_BUCKET = process.env.ARTIFACT_BUCKET || (ACCOUNT_ID ? `agentcore-hub-artifacts-${ACCOUNT_ID}-${REGION}` : "");
 
+// TEAM-4739 — the typed gate guard's two OPTIONAL dependencies. NOT derived by
+// convention: both are only forwarded when the deploying shell sets them, so an
+// install that has never heard of them gets today's env and today's IAM policy back,
+// unchanged, on redeploy. Unset ⇒ the guard is inert (every probe indeterminate, i.e.
+// every gate close admitted and stamped) rather than a wall.
+const PIPELINE_TOOLS_LAMBDA = process.env.PIPELINE_TOOLS_LAMBDA || "";
+const EVENTS_TABLE = process.env.EVENTS_TABLE || "";
+
 // gateway-id is optional — if not provided, skip gateway target registration
 
 // --- Dynamic imports ---
@@ -218,11 +226,14 @@ try {
 
 // Attach inline policy. DynamoDB statement is only needed for the dynamodb
 // provider; both providers need CloudWatch Logs and S3 read for the agent
-// roster artifact — and, since TEAM-4706 (DL-030), for the HeadObject on
+// roster artifact — and, since TEAM-4706 (DL-030), for reading
 // completions/<ticket_id>.json behind the ship-phase Done gate: a ship ticket
-// cannot be closed without its completion record. The same
-// `s3:GetObject` on the artifact bucket authorises both reads, so no extra
-// statement is needed here.
+// cannot be closed without its completion record. TEAM-4757 made that guard GET
+// the record's body (it has to read `followUpsPending`, not just prove the key
+// exists), which needs nothing new: the same `s3:GetObject` on the artifact bucket
+// below authorises the roster read, a HeadObject and a GetObject alike, so no extra
+// statement is needed here. scripts/verify-infra.sh asserts this grant is still
+// bucket-wide or explicitly covers completions/*.
 const policyStatements = [
   {
     Effect: "Allow",
@@ -253,6 +264,28 @@ if (ARTIFACT_BUCKET) {
     Resource: `arn:aws:s3:::${ARTIFACT_BUCKET}/*`,
   });
 }
+// TEAM-4739 — both statements are CONDITIONAL on the matching env var, so an
+// install that has never set either gets a BYTE-IDENTICAL policy to before this
+// ticket. Each grants the narrowest thing the guard needs:
+//   PIPELINE_TOOLS_LAMBDA — invoke the read-only pipeline probe (get_state /
+//     get_build_status / capabilities; the twin's allow-list, not IAM's, is what
+//     keeps start_deploy out of reach — but there is no write here to grant).
+//   EVENTS_TABLE — PutItem only. The gate guard appends journey events; it never
+//     reads, updates or scans the events table.
+if (PIPELINE_TOOLS_LAMBDA) {
+  policyStatements.push({
+    Effect: "Allow",
+    Action: ["lambda:InvokeFunction"],
+    Resource: `arn:aws:lambda:${REGION}:${accountId}:function:${PIPELINE_TOOLS_LAMBDA}`,
+  });
+}
+if (EVENTS_TABLE) {
+  policyStatements.push({
+    Effect: "Allow",
+    Action: ["dynamodb:PutItem"],
+    Resource: `arn:aws:dynamodb:${REGION}:${accountId}:table/${EVENTS_TABLE}`,
+  });
+}
 
 await iam.send(
   new PutRolePolicyCommand({
@@ -262,7 +295,7 @@ await iam.send(
   })
 );
 console.log(
-  `   ✓ Policy attached (${TICKET_PROVIDER === "dynamodb" ? "DynamoDB + " : ""}CloudWatch Logs${ARTIFACT_BUCKET ? " + S3 read" : ""})`
+  `   ✓ Policy attached (${TICKET_PROVIDER === "dynamodb" ? "DynamoDB + " : ""}CloudWatch Logs${ARTIFACT_BUCKET ? " + S3 read" : ""}${PIPELINE_TOOLS_LAMBDA ? " + pipeline probe invoke" : ""}${EVENTS_TABLE ? " + events PutItem" : ""})`
 );
 
 // ============================================================
@@ -271,16 +304,22 @@ console.log(
 console.log("\n3/5 Deploying Lambda function...");
 
 // Zip the Lambda code (per-provider source dir). fix-contract.mjs (TEAM-4121
-// FR-8) is a local import of index.mjs in BOTH providers — omitting it kills the
-// function at cold start with ERR_MODULE_NOT_FOUND.
+// FR-8) and gate-contract.mjs (TEAM-4739) are local imports of index.mjs in BOTH
+// providers — omitting either kills the function at cold start with
+// ERR_MODULE_NOT_FOUND. scripts/check-lambda-zip-manifest.sh validates this line
+// against index.mjs's actual import closure; run it before changing the line.
 const lambdaDir = join(__dirname, "..", "lambda", LAMBDA_SOURCE_DIR);
 const zipPath = `/tmp/${LAMBDA_NAME}.zip`;
-execSync(`cd "${lambdaDir}" && zip -j "${zipPath}" index.mjs fix-contract.mjs`, { stdio: "pipe" });
+execSync(`cd "${lambdaDir}" && zip -j "${zipPath}" index.mjs fix-contract.mjs gate-contract.mjs`, {
+  stdio: "pipe",
+});
 const zipBuffer = readFileSync(zipPath);
 
 // FIX_TICKET_CONTRACT is forwarded ONLY when set in the deploying shell, so an
 // existing install that has never heard of it keeps the code default (off) and
-// its config is unchanged by a redeploy.
+// its config is unchanged by a redeploy. PIPELINE_TOOLS_LAMBDA / EVENTS_TABLE
+// (TEAM-4739) follow the same rule, in BOTH provider arms — the twins must reach the
+// same verdict, so they must be configurable the same way.
 const lambdaEnvVars =
   TICKET_PROVIDER === "jira"
     ? {
@@ -291,6 +330,8 @@ const lambdaEnvVars =
         AWS_REGION_OVERRIDE: REGION,
         ...(ARTIFACT_BUCKET && { ARTIFACT_BUCKET }),
         ...(process.env.FIX_TICKET_CONTRACT && { FIX_TICKET_CONTRACT: process.env.FIX_TICKET_CONTRACT }),
+        ...(PIPELINE_TOOLS_LAMBDA && { PIPELINE_TOOLS_LAMBDA }),
+        ...(EVENTS_TABLE && { EVENTS_TABLE }),
       }
     : {
         TICKETS_TABLE: TABLE_NAME,
@@ -298,6 +339,8 @@ const lambdaEnvVars =
         AWS_REGION_OVERRIDE: REGION,
         ...(ARTIFACT_BUCKET && { ARTIFACT_BUCKET }),
         ...(process.env.FIX_TICKET_CONTRACT && { FIX_TICKET_CONTRACT: process.env.FIX_TICKET_CONTRACT }),
+        ...(PIPELINE_TOOLS_LAMBDA && { PIPELINE_TOOLS_LAMBDA }),
+        ...(EVENTS_TABLE && { EVENTS_TABLE }),
       };
 
 const lambdaDescription =

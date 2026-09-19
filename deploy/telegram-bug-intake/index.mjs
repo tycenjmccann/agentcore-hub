@@ -68,11 +68,13 @@
  */
 
 import { BedrockRuntimeClient, ConverseCommand } from "@aws-sdk/client-bedrock-runtime";
-import { DynamoDBClient, GetItemCommand, PutItemCommand, DeleteItemCommand, ScanCommand } from "@aws-sdk/client-dynamodb";
+import { DynamoDBClient, GetItemCommand, PutItemCommand, UpdateItemCommand, DeleteItemCommand, ScanCommand } from "@aws-sdk/client-dynamodb";
 import { TranscribeStreamingClient, StartStreamTranscriptionCommand } from "@aws-sdk/client-transcribe-streaming";
 import { CodePipelineClient, GetPipelineStateCommand, PutApprovalResultCommand, GetPipelineExecutionCommand } from "@aws-sdk/client-codepipeline";
 import { STSClient, AssumeRoleCommand } from "@aws-sdk/client-sts";
-import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
+// PutObject is for ONE object shape only: the ship-approval REJECTION marker
+// (SEC-1). The bridge writes no other S3 key, and its IAM grant says so.
+import { S3Client, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
 import { EventBridgeClient, PutEventsCommand } from "@aws-sdk/client-eventbridge";
 import { parseCdRegistry, pipelineProjects } from "./cd-registry.mjs";
 
@@ -118,6 +120,17 @@ const FLUSH_MIN_MS = 60_000;
 
 // Stop long-polling when this much runtime remains for in-flight processing.
 const POLL_RESERVE_MS = 30_000;
+// Don't START the periodic gate/escalation/deploy scans with less runway than
+// this on top of POLL_RESERVE_MS (TEAM-4663). The three scans run serially and
+// each does network work (hub fetches, GetPipelineState, GitHub, Telegram), so
+// the old `> POLL_RESERVE_MS` loop guard could begin one with 30s left and die
+// between a claim and its ping — which is exactly how a claim gets stranded.
+const SCAN_BUDGET_MS = 90_000;
+// How long a claim row's holder is trusted to still be sending. Past this, an
+// UNDELIVERED claim (no deliveredAt) is re-takeable and the ping is re-sent —
+// the one rule that makes "claimed" stop meaning "silently parked" on all three
+// ping paths (deploy approvals, review gates, manager escalations).
+const PING_LEASE_MS = parseInt(process.env.PING_LEASE_MS || "300000", 10);
 // Paced transcription (TEAM-3464) costs ~the note's own duration in wall clock;
 // this margin covers Transcribe connect/latency overhead on top of that.
 const TRANSCRIBE_OVERHEAD_MS = 30_000;
@@ -201,8 +214,9 @@ function codepipelineFor(region, roleArn = null, externalId = null) {
   return client;
 }
 
-// S3 is only ever used to read the CD registry, which lives in the ONE artifact
-// bucket in this Lambda's own region — so one lazy client, not one per region.
+// S3 is used for exactly two objects, both in the ONE artifact bucket in this
+// Lambda's own region — so one lazy client, not one per region: the CD registry
+// (read) and the ship-approval REJECTION marker (write, see writeShipRejection).
 // Lazy on purpose: unconfigured installs (and the sibling test suites, which
 // mock only the four SDK packages the intake paths use) never construct it.
 let _s3 = null;
@@ -247,7 +261,12 @@ export const handler = async (event, context) => {
   let lastGateScan = Date.now();
 
   while (context.getRemainingTimeInMillis() > POLL_RESERVE_MS) {
-    if (Date.now() - lastGateScan > 60_000) {
+    // TEAM-4663: only START a scan round with real runway. lastGateScan is left
+    // UN-stamped when the guard blocks, so the next loop iteration — or the next
+    // invocation, on a fresh clock — scans as soon as there is budget rather
+    // than waiting out another 60s window.
+    if (Date.now() - lastGateScan > 60_000 &&
+        context.getRemainingTimeInMillis() > POLL_RESERVE_MS + SCAN_BUDGET_MS) {
       lastGateScan = Date.now();
       try { await scanReviewGates(); } catch (err) { console.error("[telegram-bug-intake] gate scan", err); }
       try { await scanManagerEscalations(); } catch (err) { console.error("[telegram-bug-intake] escalation scan", err); }
@@ -673,7 +692,14 @@ const REWORK_HINTED = Symbol("rework-hinted");
 //   _ask_               the decision to make
 // Free text (subject/summary/bullets) is esc()'d for legacy Markdown. `meta`
 // entries are pre-built, link-safe strings and are NOT re-escaped.
-function execPing({ kicker, subject, summary, bullets = [], meta = [], ask }) {
+//
+// `plain` renders the SAME lines with no Markdown at all, for sendApprovalPing's
+// fallback send (TEAM-4663 F2): Telegram's legacy parse_mode rejects the WHOLE
+// message on one unbalanced entity, so without it a brief that happens to
+// contain one silences a prod gate (release → re-claim → identical 400, every
+// 60s, forever). It is a post-pass over the composed text rather than a second
+// template, so the two renderings cannot drift apart.
+function execPing({ kicker, subject, summary, bullets = [], meta = [], ask, plain = false }) {
   const lines = [`*${kicker}*`];
   if (subject) lines.push(esc(String(subject)));
   if (summary && String(summary).trim()) lines.push("", esc(String(summary).trim()));
@@ -685,7 +711,20 @@ function execPing({ kicker, subject, summary, bullets = [], meta = [], ask }) {
   const ml = (meta || []).filter(Boolean);
   if (ml.length) lines.push("", ml.join("  ·  "));
   if (ask) lines.push("", `_${esc(String(ask))}_`);
-  return lines.join("\n");
+  const text = lines.join("\n");
+  return plain ? stripMd(text) : text;
+}
+
+/**
+ * Legacy-Markdown text → the same facts as plain text: flatten `[label](url)` to
+ * "label url" (the 🎫 handle and the console link must survive as reachable
+ * URLs), undo esc()'s backslashes, then drop the emphasis characters.
+ */
+function stripMd(s) {
+  return String(s)
+    .replace(/\[([^\]]*)\]\((\S+?)\)/g, "$1 $2")
+    .replace(/\\([_*`[\]])/g, "$1")
+    .replace(/[*_`]/g, "");
 }
 
 // ─── The ONE approval-ping content builder (TEAM-4660) ───────────────────────
@@ -733,6 +772,11 @@ const APPROVAL_KICKERS = {
   review:            { kicker: "🚦 REVIEW GATE — approval needed",            max: APPROVAL_TEXT_MAX },
   escalation:        { kicker: "🚨 SHIP-REVIEW ESCALATION — decision needed", max: APPROVAL_TEXT_MAX },
   "deploy-pipeline": { kicker: "🚀 PRODUCTION DEPLOY — approval needed",      max: APPROVAL_TEXT_MAX },
+  // The bounded re-ping (TEAM-4663 F3) is its own KIND, not the `repage`
+  // modifier: `repage` renders "business-hours reminder", which a 2-hourly nag
+  // on an already-open prod gate is not.
+  "deploy-pipeline-reminder":
+                     { kicker: "⏰ PRODUCTION DEPLOY — still waiting on your approval", max: APPROVAL_TEXT_MAX },
   manager:           { kicker: "🚨 WORKFLOW MANAGER ESCALATION",              max: ESCALATION_TEXT_MAX },
   "dead-session":    { kicker: "🚨 DEAD SESSION",                             max: ESCALATION_TEXT_MAX },
 };
@@ -781,7 +825,7 @@ function shippingSubject(subject, shipping, n) {
  */
 function buildApprovalMessage({
   gateKind, repage = false, subject, shipping = [], summary,
-  bullets = [], attempt = 1, previousIssue, meta = [], ask,
+  bullets = [], attempt = 1, previousIssue, meta = [], ask, plain = false,
 }) {
   const entry = APPROVAL_KICKERS[gateKind] || APPROVAL_KICKERS.review;
   const kicker = repage ? repageKicker(entry.kicker) : entry.kicker;
@@ -809,6 +853,7 @@ function buildApprovalMessage({
     bullets: bl,
     meta,
     ask,
+    plain,
   });
 
   // Over budget: shed the least decision-critical content first. The kicker,
@@ -834,20 +879,48 @@ export const _buildApprovalMessageForTests = buildApprovalMessage;
  * Build + deliver a gate/approval ping. The ONLY sender the approval scans are
  * allowed to use (asserted by __tests__/approval-builder-guardrail.test.mjs), so
  * no site can hand Telegram text it composed itself.
- * @returns {Promise<{delivered:number, text:string}>} delivered === 0 → the
- * caller must release its claim, exactly as before.
+ *
+ * Two sends per chat, one message (TEAM-4663 F2): the builder's Markdown, and on
+ * a retryable rejection the SAME builder's plain rendering of the SAME inputs.
+ * Deliberately not a second sender — a formatting problem must be able to
+ * degrade a page, never to compose one.
+ *
+ * @returns {Promise<{delivered:number, text:string, messageIds:string[]}>}
+ *   `delivered === 0` → the caller must release its claim, exactly as before.
+ *   `messageIds` are `<chatId>:<messageId>` for the CONFIRMED sends only: the
+ *   proof a human really has this page, and the handles a later edit needs.
  */
 async function sendApprovalPing(chats, { keyboard, label = "approval", ...msgOpts }) {
   const text = buildApprovalMessage(msgOpts);
   if (!APPROVAL_KICKER_RE.test(text)) {
     throw new Error(`approval ping text is not builder-stamped (gateKind=${msgOpts.gateKind})`);
   }
+  let plainText = null;   // built once, and only if Telegram ever rejects the Markdown
   let delivered = 0;
+  const messageIds = [];
+  const record = (chatId, res) => {
+    delivered++;
+    if (res?.message_id) messageIds.push(`${chatId}:${res.message_id}`);
+  };
   for (const chatId of chats) {
-    try { await tgSend(chatId, text, { reply_markup: keyboard }); delivered++; }
-    catch (err) { console.error(`[telegram-bug-intake] ${label} ping to ${chatId}`, err.message); }
+    try {
+      record(chatId, await tgSend(chatId, text, { reply_markup: keyboard }));
+      continue;
+    } catch (err) {
+      if (hopelessTelegramError(err)) {
+        console.error(`[telegram-bug-intake] ${label} ping to ${chatId} (not retryable)`, err.message);
+        continue;
+      }
+      console.warn(`[telegram-bug-intake] ${label} ping to ${chatId} rejected the formatted message (${err.message}) — retrying as plain text`);
+    }
+    if (plainText === null) plainText = buildApprovalMessage({ ...msgOpts, plain: true });
+    try {
+      record(chatId, await tgSendPlain(chatId, plainText, { reply_markup: keyboard }));
+    } catch (err) {
+      console.error(`[telegram-bug-intake] ${label} ping to ${chatId} failed as plain text too`, err.message);
+    }
   }
-  return { delivered, text };
+  return { delivered, text, messageIds };
 }
 
 // review-package phase → gateKind. Keys are matched as SUBSTRINGS of notif.gate,
@@ -913,28 +986,59 @@ function gateKindOf(gate, title) {
 const DEPLOY_APPROVAL_LABEL_RE = /^gate[:-]deploy-approval$/;
 const DEPLOY_PIPELINE_LABEL_RE = /^pipeline[:-](.+)$/;
 const DEPLOY_EXEC_LABEL_RE = /^exec[:-]([0-9a-f-]{36})$/;
+// TEAM-4751 C2: the two labels the awaiting-console consumer's dedupe key needs.
+// `head:` is written by the twins' gateHeadOf as a 40-hex sha
+// (lambda/agentcore-hub-{tickets,jira}/gate-contract.mjs HEAD_LABEL_RE); read it
+// tolerantly, because the key only needs the value to be STABLE and a short sha
+// costs nothing to accept. `gate:<kind>` is the closed vocabulary in
+// fix-contract.mjs GATE_KINDS.
+// WP2's refusal stamp. A probed gate whose `→ done` was refused because its
+// condition is not verified stays in `in_review`, gains `gate:awaiting-console`,
+// and gets ONE comment carrying the check's finding (and, for a deploy approval,
+// the console deep link). The bridge reads the label so its page says what the
+// human must actually do.
+const AWAITING_CONSOLE_LABEL_RE = /^gate[:-]awaiting-console$/;
+const GATE_HEAD_LABEL_RE = /^head[:-]([0-9a-f]{7,40})$/;
+const GATE_KIND_LABEL_RE = /^gate[:-]([a-z0-9-]+)$/;
+// The guard's own bookkeeping labels — never a ticket's KIND.
+const GATE_BOOKKEEPING_KINDS = new Set(["awaiting-console", "loop-broken"]);
+// The kinds whose close asserts something a read can contradict, in the twins'
+// own precedence order (gate-contract.mjs PROBED_GATE_KINDS): the kind that
+// earned the refusal is the one that belongs in the dedupe key.
+const PROBED_GATE_KIND_ORDER = ["deploy-approval", "ci-unavailable", "blocker"];
 
 /**
  * Classify a gate ticket's labels. Pure — the one place either label shape is
  * read, so the colon and hyphen forms can never diverge.
  * @param {string[]|string} labels ticket labels (an array on the wire; a
  *   comma-joined string is tolerated the way normalizeBlockedBy tolerates one)
- * @returns {{isDeployApproval: boolean, pipeline: string|null, executionId: string|null}}
+ * @returns {{isDeployApproval: boolean, pipeline: string|null, executionId: string|null,
+ *   awaitingConsole: boolean, headSha: string|null, gateKind: string}}
  */
 function parseDeployApprovalLabels(labels) {
   const list = Array.isArray(labels)
     ? labels
     : typeof labels === "string" ? labels.split(",") : [];
-  const out = { isDeployApproval: false, pipeline: null, executionId: null };
+  const out = {
+    isDeployApproval: false, pipeline: null, executionId: null,
+    awaitingConsole: false, headSha: null, gateKind: "gate",
+  };
+  const kinds = [];
   for (const raw of list) {
     const l = String(raw ?? "").trim().toLowerCase();
     if (!l) continue;
-    if (DEPLOY_APPROVAL_LABEL_RE.test(l)) { out.isDeployApproval = true; continue; }
+    if (DEPLOY_APPROVAL_LABEL_RE.test(l)) { out.isDeployApproval = true; }
+    if (AWAITING_CONSOLE_LABEL_RE.test(l)) { out.awaitingConsole = true; continue; }
+    const g = GATE_KIND_LABEL_RE.exec(l);
+    if (g) { if (!GATE_BOOKKEEPING_KINDS.has(g[1])) kinds.push(g[1]); continue; }
     const p = DEPLOY_PIPELINE_LABEL_RE.exec(l);
     if (p) { out.pipeline = out.pipeline || p[1]; continue; }
     const e = DEPLOY_EXEC_LABEL_RE.exec(l);
-    if (e) out.executionId = out.executionId || e[1];
+    if (e) { out.executionId = out.executionId || e[1]; continue; }
+    const h = GATE_HEAD_LABEL_RE.exec(l);
+    if (h) out.headSha = out.headSha || h[1];
   }
+  out.gateKind = PROBED_GATE_KIND_ORDER.find((k) => kinds.includes(k)) || kinds[0] || "gate";
   return out;
 }
 
@@ -952,6 +1056,34 @@ function gateKindFor(gate, title, gateTicket) {
   if (parseDeployApprovalLabels(gateTicket?.labels).isDeployApproval) return "deploy-pipeline";
   if (ESCALATION_GATE_TITLE.test(String(title || ""))) return "escalation";
   return gateKindOf(gate, title);
+}
+
+/**
+ * Is this gate stamped as refused by the typed-gate guard? Pure — a delegate, so
+ * label reading stays in exactly ONE place (parseDeployApprovalLabels).
+ */
+function gateAwaitingConsole(gateTicket) {
+  return parseDeployApprovalLabels(gateTicket?.labels).awaitingConsole;
+}
+
+/**
+ * The pipeline's console view — where the human deploy gate is answered.
+ *
+ * A deliberate, byte-identical MIRROR of consoleApprovalUrl() in
+ * lambda/agentcore-hub-{tickets,jira}/gate-contract.mjs, asserted by
+ * __tests__/console-url-parity.test.mjs. It is copied rather than imported
+ * because check-fix-kinds-parity.sh §1b pins gate-contract.mjs at exactly TWO
+ * copies (tickets canonical, jira mirror) — a third would fail CI — and the
+ * bridge is not a ticket Lambda.
+ */
+function pipelineConsoleUrl({ pipeline, region } = {}, _waitingOn = {}) {
+  const name = String(pipeline || "").trim();
+  if (!name) return "";
+  const r = String(region || process.env.AWS_REGION || "us-east-1").trim();
+  return (
+    "https://console.aws.amazon.com/codesuite/codepipeline/pipelines/" +
+    `${encodeURIComponent(name)}/view?region=${encodeURIComponent(r)}`
+  );
 }
 
 /**
@@ -1007,18 +1139,36 @@ function pendingApprovals(state) {
 }
 
 /**
- * The commit this execution is deploying: the revision recorded against an
- * action state of the SAME execution, else the execution's own artifact
+ * The commit this execution is deploying (TEAM-4663 D3): the revision recorded
+ * against a stage of the SAME execution, else the execution's own artifact
  * revision. Best-effort — the brief is enrichment, never a gate blocker, and a
- * revision from a DIFFERENT execution would describe the wrong commit.
+ * revision from a DIFFERENT execution would describe the wrong commit to a
+ * human about to irreversibly ship.
+ *
+ * The match is scoped by STAGE first: `StageState.latestExecution` is the one
+ * place the API states which execution a stage's revision belongs to
+ * (`ActionState.latestExecution` is an ActionExecution, which has no execution
+ * id at all). The action-level comparison is kept behind it because the rest of
+ * this module reads an action-level `pipelineExecutionId` too (pendingApprovals),
+ * so where one is present it is the same evidence. Without an executionId there
+ * is nothing to scope to, and the first revision in the state is the best (and
+ * historical) answer.
  */
+// One warn per pipeline+execution whose commit could not be resolved — this runs
+// every 60s while a gate waits, and the ping still goes out without the brief.
+const _revisionWarned = new Set();
+
 async function executionRevision(cp, state, pipeline, executionId) {
   const actions = (state?.stageStates || []).flatMap((s) => s.actionStates || []);
-  const sameExec = actions.find((a) =>
-    a.currentRevision?.revisionId &&
-    (!executionId || a.latestExecution?.pipelineExecutionId === executionId));
-  if (sameExec) return sameExec.currentRevision.revisionId;
   if (!executionId) return actions.map((a) => a.currentRevision?.revisionId).find(Boolean) || null;
+  for (const stage of state?.stageStates || []) {
+    if (stage.latestExecution?.pipelineExecutionId !== executionId) continue;
+    const rev = (stage.actionStates || []).map((a) => a.currentRevision?.revisionId).find(Boolean);
+    if (rev) return rev;
+  }
+  const sameExec = actions.find((a) =>
+    a.currentRevision?.revisionId && a.latestExecution?.pipelineExecutionId === executionId);
+  if (sameExec) return sameExec.currentRevision.revisionId;
   try {
     const out = await cp.send(new GetPipelineExecutionCommand({
       pipelineName: pipeline, pipelineExecutionId: executionId,
@@ -1026,7 +1176,11 @@ async function executionRevision(cp, state, pipeline, executionId) {
     return (out?.pipelineExecution?.artifactRevisions || [])
       .map((r) => r.revisionId).find(Boolean) || null;
   } catch (err) {
-    console.warn(`[telegram-bug-intake] execution ${executionId} revision lookup: ${err.message}`);
+    const seen = `${pipeline}#${executionId}`;
+    if (!_revisionWarned.has(seen)) {
+      _revisionWarned.add(seen);
+      console.warn(`[telegram-bug-intake] could not resolve the commit for ${pipeline} execution ${executionId}: ${err.message} — pinging without the brief`);
+    }
     return null;
   }
 }
@@ -1058,6 +1212,105 @@ const DEPLOY_GATE_ASK =
 const DEPLOY_GATE_TERSE =
   "The build passed every gate and is waiting on you to ship it to prod.";
 
+// ─── The local decision ledger (SEC-9) ───────────────────────────────────────
+// ONE writer (recordGateApproved) and ONE reader (wasGateApprovedLocally) over
+// two key shapes, both rows in PENDING_TABLE:
+//
+//   approved#<ticketId>                the decision on a gate TICKET — the
+//                                      gok/gno taps, which always have one
+//   resolved#<pipeline>#<executionId>  the tokenless dok/dno page, which has no
+//                                      ticket at all: only the claim row's
+//                                      pipeline and the execution it waits on
+//
+// The row is written BEFORE the approval call, never after. The failure it
+// closes is the one where CodePipeline TOOK the decision and this Lambda then
+// died — the tap is retried, the pipeline has already moved on, and the second
+// attempt cannot tell "already answered by me" from "answered by someone else"
+// or from a real error. A row with no matching pipeline change is harmless (the
+// gate is simply still open and the next tap decides it); a pipeline change with
+// no row is the 29h stall.
+//
+// TTL is DEPLOY_CLAIM_TTL_SEC — the same window as the claim row it shadows, so
+// the memo can never outlive the thing it remembers.
+const GATE_APPROVED_PREFIX = "approved#";
+const GATE_RESOLVED_PREFIX = "resolved#";
+
+/**
+ * The ledger id for a decision. Accepts #607's bare ticket id, or a
+ * `{pipeline, executionId}` ref for the tokenless path.
+ * @returns {string|null} null when neither shape is identifiable — the caller
+ *   then simply keeps no memo, which is the pre-ledger behaviour.
+ */
+function gateLedgerKey(ref) {
+  if (typeof ref === "string") return ref.trim() ? `${GATE_APPROVED_PREFIX}${ref.trim()}` : null;
+  if (ref?.ticketId) return `${GATE_APPROVED_PREFIX}${String(ref.ticketId).trim()}`;
+  const pipeline = String(ref?.pipeline || "").trim();
+  const executionId = String(ref?.executionId || "").trim();
+  return pipeline && executionId ? `${GATE_RESOLVED_PREFIX}${pipeline}#${executionId}` : null;
+}
+
+/** Record that THIS bridge is about to answer a gate. Best-effort, never throws. */
+async function recordGateApproved(ref, { approve = true, chatId = "" } = {}) {
+  const id = gateLedgerKey(ref);
+  if (!id) return false;
+  try {
+    await ddb.send(new PutItemCommand({
+      TableName: PENDING_TABLE,
+      Item: {
+        id: { S: id },
+        decision: { S: approve ? "Approved" : "Rejected" },
+        decidedAt: { N: String(Date.now()) },
+        ...(chatId ? { chatId: { S: String(chatId) } } : {}),
+        ttl: { N: String(Math.floor(Date.now() / 1000) + DEPLOY_CLAIM_TTL_SEC) },
+      },
+    }));
+    return true;
+  } catch (err) {
+    console.warn(`[telegram-bug-intake] gate ledger write ${id}: ${err.message}`);
+    return false;
+  }
+}
+
+/**
+ * WHICH decision this bridge recorded for that gate, or null if it recorded
+ * none. The row has always carried `decision` (above); TEAM-4781 SR2 is what
+ * first needed to read it, because "we already answered this gate" and "we
+ * already answered it the SAME way" are different facts and only the second one
+ * licenses re-running the ❌ half.
+ *
+ * Best-effort: an unreadable ledger returns null, i.e. "we know nothing", which
+ * is what keeps every caller on its pre-ledger behaviour.
+ *
+ * @returns {Promise<"Approved"|"Rejected"|null>} the raw recorded decision. A
+ *   row written by an older build with no `decision` attribute reads as null -
+ *   unknown, not "Rejected" - so a pre-existing row never gains a meaning it
+ *   was not written with.
+ */
+async function gateDecisionRecorded(ref) {
+  const id = gateLedgerKey(ref);
+  if (!id) return null;
+  try {
+    const { Item } = await ddb.send(new GetItemCommand({
+      TableName: PENDING_TABLE, Key: { id: { S: id } },
+    }));
+    const decision = String(Item?.decision?.S || "");
+    return decision === "Approved" || decision === "Rejected" ? decision : null;
+  } catch (err) {
+    console.warn(`[telegram-bug-intake] gate ledger read ${id}: ${err.message}`);
+    return null;
+  }
+}
+
+/**
+ * Did this bridge already answer that gate? Used to tell an ALREADY-RESOLVED
+ * gate from a broken one, so a retried tap finishes the ticket half instead of
+ * reporting a failure. Best-effort: an unreadable ledger returns false, i.e.
+ * exactly today's behaviour.
+ */
+async function wasGateApprovedLocally(ref) {
+  return Boolean(await gateDecisionRecorded(ref));
+}
+
 // A superseded build has to be cleared off the gate before this execution can
 // reach it; CodePipeline needs a moment to move. 3 tries at ~10s ≈ 30s.
 const DEPLOY_GATE_RETRY_TRIES = 3;
@@ -1067,16 +1320,38 @@ export function _setDeployGateRetryMsForTests(ms) {
   _deployGateRetryMs = Number.isFinite(ms) && ms >= 0 ? ms : 10_000;
 }
 
+// The outcome of the approval WRITE — not of the human's decision (that is
+// `approve`). The caller transitions the ticket on `decided` and on
+// `alreadyResolved`, and on `failed` leaves the ticket completely untouched.
+const DEPLOY_GATE_DECIDED = "decided";
+const DEPLOY_GATE_ALREADY = "alreadyResolved";
+const DEPLOY_GATE_FAILED = "failed";
+// The pipeline says the wait is over: someone else answered it, the wait timed
+// out, or this is a retry of the very tap that answered it.
+const APPROVAL_ALREADY_RE = /ApprovalAlreadyCompleted|already been (?:completed|approved)|not currently in a pending/i;
+
 /**
  * Record the human's decision on the PIPELINE for a gate:deploy-approval
- * ticket. Returns true only when CodePipeline really took it — the caller
- * transitions the ticket only then, so any failure leaves the gate exactly as
- * it was and the tap can be retried.
+ * ticket. Tri-state (SEC-8), about the WRITE:
+ *
+ *   "decided"          CodePipeline took the decision on this call
+ *   "alreadyResolved"  the gate was already answered — by someone else, or by a
+ *                      retry of this same tap (the ledger proves the latter).
+ *                      The pipeline is where the human wants it, so the TICKET
+ *                      half must still run; refusing here is what leaves a
+ *                      resolved gate parked in `in_review` forever.
+ *   "failed"           anything else. Nothing was recorded; the ticket is left
+ *                      exactly as it was and the tap stays retryable.
  *
  * Approval TOKENS never leave this function: they are scrubbed out of anything
  * user-visible, and only their presence is ever reported.
+ *
+ * TEAM-4781: on a ❌ the SEC-1 rejection marker is part of the WRITE. A rejection
+ * recorded on the pipeline but not in S3 still lets a later run of the same commit
+ * skip this gate, so a marker that will not land downgrades the outcome to
+ * "failed" — the ticket stays open and a re-tap retries the marker.
  */
-async function decideDeployGate(cb, chatId, ticketId, deploy, approve) {
+async function decideDeployGate(cb, chatId, ticketId, deploy, approve, workflowId) {
   const secrets = new Set();
   const scrub = (s) => {
     let t = String(s ?? "");
@@ -1089,16 +1364,20 @@ async function decideDeployGate(cb, chatId, ticketId, deploy, approve) {
     }
     const name = deploy.target.pipeline;
     const cp = codepipelineFor(deploy.target.region, deploy.target.roleArn, deploy.target.externalId);
+    // `state` is kept, not discarded: the rejection marker (SEC-1) needs the
+    // commit THIS execution would have shipped, and that read is a pure function
+    // of the state we already fetched.
     const readGate = async () => {
-      const waits = pendingApprovals(await cp.send(new GetPipelineStateCommand({ name })));
+      const state = await cp.send(new GetPipelineStateCommand({ name }));
+      const waits = pendingApprovals(state);
       for (const w of waits) secrets.add(w.token);
       const mine = deploy.executionId
         ? waits.find((w) => w.executionId === deploy.executionId) || null
         : waits[0] || null;
-      return { mine, holder: mine ? null : waits[0] || null };
+      return { mine, holder: mine ? null : waits[0] || null, state };
     };
 
-    let { mine, holder } = await readGate();
+    let { mine, holder, state } = await readGate();
     // A DIFFERENT execution is parked at the gate — an older build the human is
     // not looking at. Reject THAT one, then wait for this execution to arrive.
     if (!mine && holder && deploy.executionId) {
@@ -1111,21 +1390,94 @@ async function decideDeployGate(cb, chatId, ticketId, deploy, approve) {
       }));
       for (let i = 0; i < DEPLOY_GATE_RETRY_TRIES && !mine; i++) {
         await sleep(_deployGateRetryMs);
-        ({ mine } = await readGate());
+        ({ mine, state } = await readGate());
       }
     }
     if (!mine) {
+      // Nothing is waiting. If the ledger says this bridge already answered THIS
+      // gate, the wait is gone because we closed it — a retried tap, whose only
+      // remaining work is the ticket half.
+      const recorded = await gateDecisionRecorded({ ticketId });
+      if (recorded) {
+        // TEAM-4781 SR2: a ❌ arriving after OUR OWN ✅ is not a retry of this tap,
+        // it is the opposite decision on a gate that is already approved. The
+        // window is real: a ✅ that lands on the pipeline and then fails its ticket
+        // transition (answerDeployGateTicketStuck) leaves the gate `in_review`
+        // with an "Approved" row, so the caller's isTicketDone guard does not
+        // catch it. Writing a rejection marker there would only add a human gate
+        // (fail-toward-gate, harmless), but parking a rework note and telling the
+        // human "changes requested" for a deploy they APPROVED is a lie in the
+        // one direction that costs a re-run. Record nothing and run no half.
+        if (!approve && recorded === "Approved") {
+          console.warn(`[telegram-bug-intake] deploy gate ${ticketId}: ❌ tap after our own recorded ✅ on ${name} - no rejection marker, no rework`);
+          // No tgEdit, matching the caller's own already-approved branch: that
+          // edit text carries "Changes requested", which is gateFromReply's
+          // routing vocabulary and would mis-route the human's next message.
+          await tgAnswer(cb.id, "Already approved on the pipeline — nothing to reject.").catch(() => {});
+          // The only outcome the caller treats as "run no ticket half".
+          return DEPLOY_GATE_FAILED;
+        }
+        await tgAnswer(cb.id, "Already recorded on the pipeline — finishing the ticket.").catch(() => {});
+        // TEAM-4781: the marker write is exactly what an earlier tap may have died
+        // on, so a ❌ re-tap retries it (idempotent) before the ticket half runs.
+        if (!approve) {
+          return await settleShipRejection({
+            cb, chatId, ticketId, workflowId, outcome: DEPLOY_GATE_ALREADY,
+            state, cp, pipeline: name, executionId: deploy.executionId,
+          });
+        }
+        return DEPLOY_GATE_ALREADY;
+      }
       throw new Error(`no approval action is waiting for execution ${deploy.executionId || "(unlabelled)"} on ${name}`);
     }
-    await cp.send(new PutApprovalResultCommand({
-      pipelineName: name, stageName: mine.stageName, actionName: mine.actionName,
-      token: mine.token,
-      result: {
-        status: approve ? "Approved" : "Rejected",
-        summary: `${approve ? "Approved" : "Rejected"} via Telegram by chat ${chatId} (gate ${ticketId})`,
-      },
-    }));
-    return true;
+    // Ledger BEFORE the pipeline call (SEC-9): if this invocation dies between
+    // the two, the memo is what tells the retry that the gate is already ours.
+    await recordGateApproved({ ticketId }, { approve, chatId });
+    try {
+      await cp.send(new PutApprovalResultCommand({
+        pipelineName: name, stageName: mine.stageName, actionName: mine.actionName,
+        token: mine.token,
+        result: {
+          status: approve ? "Approved" : "Rejected",
+          summary: `${approve ? "Approved" : "Rejected"} via Telegram by chat ${chatId} (gate ${ticketId})`,
+        },
+      }));
+    } catch (err) {
+      // Answered in the gap between the state read and this call. The pipeline
+      // is where the human wants it, so this is not a failure of the decision.
+      if (!APPROVAL_ALREADY_RE.test(`${err.name || ""} ${err.message || ""}`)) throw err;
+      console.warn(`[telegram-bug-intake] deploy gate ${ticketId} was already resolved on ${name}: ${scrub(err.message)}`);
+      // The rejection stands on the pipeline, so the marker is the only half that
+      // may still be missing — attempt it here too (TEAM-4781).
+      //
+      // TEAM-4781 SR2 deliberately does NOT condition this arm on the ledger. An
+      // approval action WAS waiting for this execution a moment ago, so whoever
+      // answered it in the gap is unknowable from here - and the ledger cannot
+      // help, because the SEC-9 write above (BEFORE the pipeline call, which is
+      // the invariant that closes the 29h stall) has already stamped this tap's
+      // own "Rejected" over any earlier row. Unknown means conservative: the
+      // marker only ever ADDS a human gate, so writing it costs a re-approval at
+      // worst, while skipping it risks a rejected commit deploying unattended.
+      if (!approve) {
+        return await settleShipRejection({
+          cb, chatId, ticketId, workflowId, outcome: DEPLOY_GATE_ALREADY,
+          state, cp, pipeline: name,
+          executionId: mine.executionId || deploy.executionId,
+        });
+      }
+      return DEPLOY_GATE_ALREADY;
+    }
+    // SEC-1: a REJECTED ship is recorded where the pipeline's own preapproval
+    // check looks, so a later run cannot read a stale approval for this commit.
+    // TEAM-4781: and if it cannot be recorded, this is not a completed decision.
+    if (!approve) {
+      return await settleShipRejection({
+        cb, chatId, ticketId, workflowId, outcome: DEPLOY_GATE_DECIDED,
+        state, cp, pipeline: name,
+        executionId: mine.executionId || deploy.executionId,
+      });
+    }
+    return DEPLOY_GATE_DECIDED;
   } catch (err) {
     console.error(`[telegram-bug-intake] deploy gate ${ticketId} (${deploy.pipeline || "?"})`, scrub(err.message));
     await tgAnswer(cb.id, `Could not ${approve ? "approve" : "reject"} the deploy — nothing changed.`).catch(() => {});
@@ -1133,7 +1485,141 @@ async function decideDeployGate(cb, chatId, ticketId, deploy, approve) {
       `${cb.message.text}\n\n⚠️ ${esc(scrub(err.name || "Error"))}: ${esc(scrub(err.message || ""))}\n` +
       `The pipeline was NOT ${approve ? "approved" : "rejected"} and ${esc(ticketId)} is untouched — tap again to retry.`;
     await tgEdit(chatId, cb.message.message_id, body.slice(0, 4000)).catch(() => {});
-    return false;
+    return DEPLOY_GATE_FAILED;
+  }
+}
+
+/**
+ * The ship-approval REJECTION marker (SEC-1) — the bridge's ONE S3 write.
+ *
+ * The pipeline's Build stage decides whether the human deploy gate may be
+ * skipped by reading `pipeline-artifacts/ship-approvals/<merge_commit>.json`
+ * (deploy/pipeline/preapproved-check.sh). An approval recorded for a commit is
+ * therefore durable, and a rejection that leaves no trace next to it lets a
+ * re-run of the SAME commit read the stale approval and skip the gate the human
+ * just closed. This writes the counterpart.
+ *
+ * TEAM-4781 (SR1-2): it used to be best-effort — a swallowed PutObject error, and
+ * the caller returned "decided" regardless, which is why DL-031's "durable fact"
+ * was not one. It still never THROWS, but it now retries once and REPORTS, so the
+ * caller can keep the gate open for a re-tap:
+ *
+ *   { ok: true,  key }                    the marker is in S3
+ *   { ok: true,  key: null, skipped }     nothing could be written and no retry
+ *                                         can change that (see below)
+ *   { ok: false, key, reason }            both PutObject attempts failed
+ *
+ * The two `skipped` cases are deliberately NOT failures:
+ *   "artifact_bucket_unset"  — an install with no ARTIFACT_BUCKET has no
+ *     ship-approval RECORD either, so nothing can skip the gate on it:
+ *     preapproved-check.sh prints 0 with no bucket and refuses on the empty path.
+ *     There is nothing to record and nothing to retry.
+ *   "commit_unresolved"      — the state carries no source revision, so there is
+ *     no key to write, name or retry (it is a pure function of the state already
+ *     fetched). Pre-existing behaviour, logged loudly, out of SR1-2's scope.
+ */
+async function writeShipRejection({ state, cp, pipeline, executionId, chatId }) {
+  if (!ARTIFACT_BUCKET) {
+    console.warn(`[telegram-bug-intake] ship rejection for ${pipeline}: ARTIFACT_BUCKET is unset — no marker to write`);
+    return { ok: true, key: null, skipped: "artifact_bucket_unset" };
+  }
+  let mergeCommit = null;
+  try {
+    mergeCommit = await executionRevision(cp, state, pipeline, executionId);
+  } catch (err) {
+    console.error(`[telegram-bug-intake] ship rejection for ${pipeline}: commit lookup failed: ${err.message}`);
+  }
+  if (!mergeCommit) {
+    console.warn(`[telegram-bug-intake] ship rejection for ${pipeline} execution ${executionId || "(unknown)"}: no commit resolved — no marker written`);
+    return { ok: true, key: null, skipped: "commit_unresolved" };
+  }
+  const key = `pipeline-artifacts/ship-approvals/${mergeCommit}.rejected.json`;
+  const body = JSON.stringify({
+    executionId: executionId || null,
+    pipeline,
+    rejectedAt: new Date().toISOString(),
+    chatId: String(chatId ?? ""),
+  });
+  let last = "";
+  // Two attempts: the overwhelmingly common failure here is transient (throttle,
+  // a credential refresh, a blip), and one retry is the difference between a
+  // recoverable stall and paging the human.
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      await s3Client().send(new PutObjectCommand({
+        Bucket: ARTIFACT_BUCKET, Key: key, Body: body, ContentType: "application/json",
+      }));
+      return { ok: true, key };
+    } catch (err) {
+      last = err?.message || String(err);
+      console.error(`[telegram-bug-intake] ship rejection marker ${key} attempt ${attempt}/2: ${last}`);
+      if (attempt < 2) await sleep(_deployGateRetryMs);
+    }
+  }
+  return { ok: false, key, reason: last };
+}
+
+/**
+ * A ❌ whose rejection is now recorded on the PIPELINE, settled against the
+ * marker (TEAM-4781). Returns the outcome the caller should return: `outcome`
+ * when the marker is in place, DEPLOY_GATE_FAILED when it is not — and "failed"
+ * already means, everywhere in this module, "the ticket is not touched at all and
+ * the tap is the retry" (SEC-8).
+ */
+async function settleShipRejection({
+  cb, chatId, ticketId, workflowId, outcome, state, cp, pipeline, executionId,
+}) {
+  const marker = await writeShipRejection({ state, cp, pipeline, executionId, chatId });
+  if (marker.ok) return outcome;
+  await reportMissingRejectionMarker({ cb, chatId, ticketId, workflowId, marker });
+  return DEPLOY_GATE_FAILED;
+}
+
+/**
+ * Say what actually happened when the pipeline took the ❌ but the marker did not
+ * land: the rejection is IRREVERSIBLE and the gate is still guardable, which is
+ * the opposite of the generic "the pipeline was NOT rejected" text.
+ *
+ * Patterned on answerDeployGateTicketStuck: never throws, and preserves the
+ * keyboard so the ❌ re-tap that retries the marker is possible. The comment names
+ * the KEY and nothing else — no bucket, no ARNs, no credentials, no S3 error text
+ * (that stays in CloudWatch).
+ */
+async function reportMissingRejectionMarker({ cb, chatId, ticketId, workflowId, marker }) {
+  const key = marker?.key || "(unresolved)";
+  console.error(`[telegram-bug-intake] gate ${ticketId || "(tokenless)"}: rejection recorded on the pipeline but marker ${key} is MISSING: ${redactText(String(marker?.reason || ""))}`);
+  await tgAnswer(cb.id, "Rejected on the pipeline — the marker did not save.").catch(() => {});
+  if (workflowId && ticketId) {
+    await postGateComment(workflowId, ticketId,
+      `🛑 The deploy was REJECTED on the pipeline, but the ship-rejection marker could not be written after a retry.\n\n` +
+      `Missing object key: ${key}\n\n` +
+      `Until that key exists, a later run of the same commit could read an earlier ship-approval record and skip this gate. ` +
+      `This gate is deliberately left open: tap ❌ again on the Telegram page to retry the marker — the pipeline will not be rejected twice.`,
+    ).catch(() => {});
+  }
+  const body =
+    `${cb.message.text}\n\n` +
+    `🛑 The deploy IS rejected on the pipeline — that part is done.\n` +
+    `⚠️ The rejection marker could not be saved: ${esc(key)}\n` +
+    `${esc(ticketId || "The gate")} is untouched — tap ❌ again to retry the marker only; the pipeline will not be rejected twice.`;
+  await tgEdit(chatId, cb.message.message_id, body.slice(0, 4000),
+    cb.message.reply_markup ? { reply_markup: cb.message.reply_markup } : {}).catch(() => {});
+}
+
+/**
+ * Comment on a gate ticket WITHOUT transitioning it. The transition route's
+ * VALID_TRANSITIONS has no in_review → in_review edge, so the comment-only
+ * endpoint is the one that can say something on a ticket that must stay put.
+ */
+async function postGateComment(workflowId, ticketId, content) {
+  const res = await fetch(`${HUB_API_URL}/api/workflow/${encodeURIComponent(workflowId)}/tickets/comment`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ticketId, author: "telegram-deploy-gate", content }),
+  });
+  if (!res.ok) {
+    const raw = await res.text().catch(() => "");
+    throw new Error(`comment ${res.status}: ${raw.slice(0, 300)}`);
   }
 }
 
@@ -1283,19 +1769,33 @@ const REPAGE_SKIP_STATUSES = new Set(["done", "blocked", "cancelled", "canceled"
  * check, the set for the attempt count (sibling gates) and the shipping list.
  * The reminder path used to take the row and throw the set away, so it counted
  * attempts from an empty list and a re-filed gate's reminder contradicted its
- * own request-time page (TEAM-4671 F2). Never throws, and an unavailable
- * tickets view degrades to `{ gateTicket: null, tickets: [] }` — the ping still
- * goes out with the ticket id.
+ * own request-time page (TEAM-4671 F2). Never throws.
+ *
+ * FAILS CLOSED: an unavailable tickets view returns `{indeterminate:true}`, not
+ * an empty set. `{gateTicket:null, tickets:[]}` is indistinguishable from "this
+ * is an ordinary review gate", and *that* read is what let a
+ * `gate:deploy-approval` ticket be transitioned as a plain gate while the
+ * pipeline's approval was never touched. On `indeterminate` a caller must
+ * transition NOTHING, write no ledger row, and say so — the tap stays retryable.
  */
 async function gateTicketOf(wf, notif) {
   try {
     const res = await fetch(`${HUB_API_URL}/api/workflow/${wf.workflowId}/tickets`);
-    if (!res.ok) return { gateTicket: null, tickets: [] };
+    if (!res.ok) return { gateTicket: null, tickets: [], indeterminate: true };
     const { tickets = [] } = await res.json();
     return { gateTicket: tickets.find((t) => t.ticketId === notif.ticketId) || null, tickets };
   } catch {
-    return { gateTicket: null, tickets: [] }; // a reminder is cheap; a missed one is not
+    return { gateTicket: null, tickets: [], indeterminate: true };
   }
+}
+
+/**
+ * Is this ticket row already closed? Both gate branches ask it, and the two
+ * providers spell the status differently ("in review" vs "In Review", "Done"),
+ * so the lowercase compare is the only safe form.
+ */
+function isTicketDone(t) {
+  return String(t?.status || "").toLowerCase() === "done";
 }
 
 /**
@@ -1366,18 +1866,85 @@ async function publishGateRequested(wf, notif, w) {
   }
 }
 
+/** The ✅/❌ + hub keyboard every gate page and re-page carries. */
+function gateDecisionKeyboard(wf, notif) {
+  return { inline_keyboard: [
+    [
+      { text: "✅ Approve", callback_data: `gok|${notif.ticketId}|${wf.workflowId}` },
+      { text: "❌ Request changes", callback_data: `gno|${notif.ticketId}|${wf.workflowId}` },
+    ],
+    [{
+      text: "📱 Open approval in hub",
+      url: `${HUB_API_URL}/workflow?id=${encodeURIComponent(wf.workflowId)}&ticket=${encodeURIComponent(notif.ticketId)}`,
+    }],
+  ] };
+}
+
+/**
+ * The COPY for a gate the typed-gate guard refused (`gate:awaiting-console`) —
+ * ONE construction with two callers (TEAM-4751 C2): the out-of-hours reminder
+ * (repageIfWindowOpened) and the in-hours consumer (repageAwaitingConsole). A
+ * second copy of this wording is exactly how the two would drift into telling a
+ * human two different things about one stall.
+ *
+ * It is NOT an ordinary "still waiting on you" page: an agent already tried to
+ * close the gate and was told no. So the copy names the place the condition is
+ * actually cleared, and drops the "your window is open" line, which would
+ * describe the wrong reason for the wait.
+ *
+ * Kind-aware, because the twins stamp this label on ANY probed gate
+ * (gate-contract.mjs PROBED_GATE_KINDS — deploy-approval, ci-unavailable,
+ * blocker). Only a deploy approval has a console the human answers; for the rest
+ * the remedy is in the ticket's own gate-guard comment, so no console URL is
+ * claimed and no console button is offered (the meta line is omitted with it).
+ *
+ * `keyboard` is mutated in place — the console button is pushed onto it — which
+ * is what keeps the send in the caller (the approval-builder guardrail requires
+ * that the sender be an APPROVAL_SITE). Best-effort, like every other lookup on
+ * these paths: deployApprovalGate never throws.
+ *
+ * @returns {Promise<{consoleUrl:string, label:string, summary:string, meta:string[], ask:string}>}
+ */
+async function awaitingConsolePage(gateTicket, keyboard) {
+  const { gateKind } = parseDeployApprovalLabels(gateTicket?.labels);
+  const g = await deployApprovalGate(gateTicket);
+  const consoleUrl = g
+    ? pipelineConsoleUrl({ pipeline: g.target?.pipeline || g.pipeline, region: g.target?.region })
+    : "";
+  if (consoleUrl) {
+    keyboard.inline_keyboard.push([{ text: "🔗 Open the deploy gate in the console", url: consoleUrl }]);
+  }
+  const deployKind = Boolean(g);
+  return {
+    consoleUrl,
+    label: "awaiting-console reminder",
+    summary: deployKind
+      ? "Still parked on the pipeline's own deploy approval — an agent tried to close this gate and was refused, because the approval has not been given yet."
+      : `An agent tried to close this gate and was refused, because its gate:${gateKind} condition has not been verified. The ticket's own gate-guard comment says what the check found and how to clear it.`,
+    meta: deployKind && consoleUrl ? [`🖥 [deploy gate in the console](${consoleUrl})`] : [],
+    ask: !deployKind
+      ? "Clear the condition the gate names — the ticket comment has the remedy — or Request changes here to stop it."
+      : consoleUrl
+        ? "Approve the deploy in the console (the button above), or Request changes here to stop it."
+        : "Approve the deploy in the pipeline's own console, or Request changes here to stop it.",
+  };
+}
+
 /**
  * The gate# claim already exists (this notification was paged on an earlier
  * scan). If that page landed outside the window and the window has since
  * opened, send exactly ONE reminder, deduped on repage#<notif>. Never throws:
  * a failure here must not cost the remaining pending gates their pages.
+ *
+ * @returns {Promise<boolean>} true only when a reminder was DELIVERED. The
+ *   caller uses that to keep one stall to one page per scan (TEAM-4751 C2).
  */
 async function repageIfWindowOpened(wf, notif, w) {
   let holding = null;
   try {
-    if (isOutsideHours(notif.timestamp, w) !== true) return;
+    if (isOutsideHours(notif.timestamp, w) !== true) return false;
     const openAt = nextBusinessOpenAt(notif.timestamp, w);
-    if (!openAt || Date.now() < openAt.getTime()) return;
+    if (!openAt || Date.now() < openAt.getTime()) return false;
 
     // TEAM-4461: the request-time page itself may have landed INSIDE the window —
     // a gate requested 08:59 and paged by the 09:00 scan, or a page delayed past
@@ -1388,66 +1955,209 @@ async function repageIfWindowOpened(wf, notif, w) {
       TableName: PENDING_TABLE, Key: { id: { S: gateClaimKey(notif) } },
     }));
     const pagedAt = Date.parse(claim?.pagedAt?.S || "");
-    if (Number.isFinite(pagedAt) && pagedAt >= openAt.getTime()) return;
+    if (Number.isFinite(pagedAt) && pagedAt >= openAt.getTime()) return false;
 
     const key = `${REPAGE_KEY_PREFIX}${notif.id || notif.ticketId}`;
-    if (!(await claimKey(key))) return; // already reminded
+    if (!(await claimKey(key))) return false; // already reminded
     holding = key;
 
+    // gateTicketOf fails CLOSED, but "closed" is about the WRITE paths: a caller
+    // that would transition a ticket or answer a tap must touch nothing. This
+    // path writes nothing — it only reminds — and going quiet because the hub's
+    // tickets view blipped is the silent park this whole change exists to end.
+    // So the reminder still goes out on an unverifiable read, on exactly the
+    // information the request-time page had (scanReviewGates does the same at the
+    // gateTicketOf call above): the id as the title, no awaiting-console branch.
+    const { gateTicket, tickets, indeterminate } = await gateTicketOf(wf, notif);
+    if (indeterminate) {
+      console.warn(`[telegram-bug-intake] business-hours reminder for ${notif.ticketId}: gate type unverifiable — reminding on the request-time facts`);
+    }
     // Resolved in the meantime → keep the claim: there is nothing to remind
     // about and re-checking on every later scan would be pure noise.
-    const { gateTicket, tickets } = await gateTicketOf(wf, notif);
     const status = String(gateTicket?.status || "").toLowerCase();
-    if (REPAGE_SKIP_STATUSES.has(status)) return;
+    if (REPAGE_SKIP_STATUSES.has(status)) return false;
 
     const chats = (await listChats()).filter((c) => ALLOWED_CHAT_IDS.includes(String(c)));
     if (!chats.length) {
       console.warn("[telegram-bug-intake] business-hours reminder but no allowlisted chats to notify");
-      return; // the request-time page already went out; do not retry forever
+      return false; // the request-time page already went out; do not retry forever
     }
 
     const title = gateTicket?.title || notif.ticketId;
     const reviewer = notif.reviewer || "reviewer";
-    const keyboard = { inline_keyboard: [
-      [
-        { text: "✅ Approve", callback_data: `gok|${notif.ticketId}|${wf.workflowId}` },
-        { text: "❌ Request changes", callback_data: `gno|${notif.ticketId}|${wf.workflowId}` },
-      ],
-      [{
-        text: "📱 Open approval in hub",
-        url: `${HUB_API_URL}/workflow?id=${encodeURIComponent(wf.workflowId)}&ticket=${encodeURIComponent(notif.ticketId)}`,
-      }],
-    ] };
+    const keyboard = gateDecisionKeyboard(wf, notif);
+
+    // A gate the ticket Lambdas refused to close because its typed-gate
+    // condition is not verified (WP2's gate:awaiting-console stamp). Its copy —
+    // and the console button, when there is a console to send anyone to — is
+    // built by awaitingConsolePage, shared with the in-hours consumer.
+    const page = gateAwaitingConsole(gateTicket) ? await awaitingConsolePage(gateTicket, keyboard) : null;
 
     // Same content rules as the request-time page (TEAM-4660): the gate
     // ticket's title/description never reach the reminder either. Same INPUTS
     // too (TEAM-4671 F2) — the reminder and the page must agree on the attempt.
     const { attempt, previousIssue } = await approvalAttempt({ wf, notif, tickets });
     const { delivered } = await sendApprovalPing(chats, {
-      label: "business-hours reminder",
+      label: page ? page.label : "business-hours reminder",
       // Shared classification (TEAM-4706): a deploy-approval gate reminds with
       // the same 🚀 kicker it paged with, without a second rule living here.
       gateKind: gateKindFor(notif.gate, title, gateTicket),
       repage: true,
       subject: wf.input?.title || wf.workflowId,
-      summary: "Sent for review outside working hours and still open — your window is open now.",
+      summary: page ? page.summary : "Sent for review outside working hours and still open — your window is open now.",
       attempt,
       previousIssue,
       meta: [
         `👤 ${esc(reviewer)}`,
         `🎫 [${notif.ticketId}](https://${JIRA_SITE_URL}/browse/${notif.ticketId})`,
         "⏸ pipeline paused on you",
+        ...(page ? page.meta : []),
       ],
-      ask: "Approve to continue, or Request changes to send it back.",
+      ask: page ? page.ask : "Approve to continue, or Request changes to send it back.",
       keyboard,
     });
     if (!delivered) await releaseKey(holding);
+    return delivered > 0;
   } catch (err) {
     console.error(`[telegram-bug-intake] business-hours reminder for ${notif.ticketId}`, err.message);
     if (holding) {
       await releaseKey(holding).catch((relErr) =>
         console.error("[telegram-bug-intake] releaseKey after reminder failure", relErr.message));
     }
+    return false;
+  }
+}
+
+// Rate limiter, NOT a ledger: the awaiting-console consumer's trigger is a LABEL,
+// so without this it would cost one /tickets GET per open gate per 60s scan. The
+// console# row is what makes the paging exactly-once; this only bounds the read.
+const AWAITING_CONSOLE_POLL_MS = parseInt(process.env.AWAITING_CONSOLE_POLL_MS || "120000", 10);
+const AWAITING_CONSOLE_SEEN_MAX = 500;
+const _awaitingConsoleSeen = new Map(); // gate claim key → lastCheckedAt (per container)
+
+const CONSOLE_KEY_PREFIX = "console#";
+
+/**
+ * NFR-5's idempotency tuple: console#<ticketId>|<gateKind>|<headSha|->|<hash(consoleUrl|->)>.
+ * hashToken keeps the URL itself out of the key while making a RE-TARGETED gate
+ * (new head sha, or a different pipeline) a different row — which is the point:
+ * the human owes a fresh answer, so it must not be deduped against the old one.
+ */
+function awaitingConsoleKey({ ticketId, gateKind, headSha, consoleUrl }) {
+  return `${CONSOLE_KEY_PREFIX}${ticketId}|${gateKind || "gate"}|${headSha || "-"}|${hashToken(consoleUrl || "-")}`;
+}
+
+/**
+ * TEAM-4751 C2 — page the human about a gate the twins' typed-gate guard parked
+ * (`gate:awaiting-console`), REGARDLESS of business hours.
+ *
+ * The label's only previous reader was repageIfWindowOpened, which needs the
+ * notification to have been requested out of hours AND its window to have since
+ * opened — so an in-hours refusal paged nobody at all and the human learned of
+ * the stall from a Jira comment. Here the LABEL is the trigger, not the clock.
+ *
+ * Bounded by the ledger the deploy re-ping already uses: one first page, then at
+ * most DEPLOY_REPING_MAX reminders at DEPLOY_REPING_INTERVAL_MS, keyed on the
+ * NFR-5 tuple. Never throws — a failure here must not cost the remaining pending
+ * gates their pages.
+ *
+ * Interplay with C1: the callback handler and this scan run serially inside one
+ * invocation (reserved concurrency 1), and the twins clear the label in the SAME
+ * write that moves the gate to `done`, so a label left by a lagging-read refusal
+ * that C1's retry then clears is never observed by a scan.
+ *
+ * @returns {Promise<boolean>} true only when a page was DELIVERED.
+ */
+async function repageAwaitingConsole(wf, notif, w) {
+  let holding = null;
+  try {
+    // Stamp the memo BEFORE the read, so a throwing read still rate-limits.
+    const memoKey = gateClaimKey(notif);
+    const now = Date.now();
+    const lastChecked = _awaitingConsoleSeen.get(memoKey);
+    if (Number.isFinite(lastChecked) && now - lastChecked < AWAITING_CONSOLE_POLL_MS) return false;
+    if (_awaitingConsoleSeen.size > AWAITING_CONSOLE_SEEN_MAX) _awaitingConsoleSeen.clear();
+    _awaitingConsoleSeen.set(memoKey, now);
+
+    // Fails CLOSED, unlike repageIfWindowOpened: there the reminder was already
+    // owed and the request-time facts were enough to send it, whereas here the
+    // label IS the trigger, so a read that proved nothing must page nothing and
+    // claim nothing. The next scan past the memo tries again.
+    const { gateTicket, tickets, indeterminate } = await gateTicketOf(wf, notif);
+    if (indeterminate) {
+      console.warn(`[telegram-bug-intake] awaiting-console check for ${notif.ticketId}: tickets unreadable — nothing paged`);
+      return false;
+    }
+    const labels = parseDeployApprovalLabels(gateTicket?.labels);
+    if (!labels.awaitingConsole) return false;
+    // Resolved in the meantime → nothing to page about.
+    if (REPAGE_SKIP_STATUSES.has(String(gateTicket?.status || "").toLowerCase())) return false;
+
+    const keyboard = gateDecisionKeyboard(wf, notif);
+    const page = await awaitingConsolePage(gateTicket, keyboard);
+    const key = awaitingConsoleKey({
+      ticketId: notif.ticketId, gateKind: labels.gateKind,
+      headSha: labels.headSha, consoleUrl: page.consoleUrl,
+    });
+
+    // claimKey writes claimedAt + a 30-day TTL, which is exactly the row shape
+    // decideDeployPingMode reads — so the first page and every bounded reminder
+    // share one row, with no second ledger and no change to any existing caller.
+    const first = await claimKey(key);
+    const mode = first ? { kind: "first" } : await decideDeployPingMode(key);
+    if (!mode) return false; // too soon, or the reminder budget is spent
+    if (first) holding = key;
+
+    const chats = (await listChats()).filter((c) => ALLOWED_CHAT_IDS.includes(String(c)));
+    if (!chats.length) {
+      console.warn("[telegram-bug-intake] awaiting-console page but no allowlisted chats to notify");
+      if (holding) await releaseKey(holding);
+      return false;
+    }
+
+    const title = gateTicket?.title || notif.ticketId;
+    // A deploy approval nags with its OWN kind (APPROVAL_KICKERS
+    // "deploy-pipeline-reminder", TEAM-4663 F3); any other probed kind keeps the
+    // kicker it was paged with. Never `repage: true` on either: this page fires
+    // whenever the label appears, in hours as often as not, and "·
+    // business-hours reminder" would state the wrong reason for the wait — the
+    // reason is in the summary, and it is a refused close, not the clock.
+    const isDeploy = labels.isDeployApproval;
+    const { attempt, previousIssue } = await approvalAttempt({ wf, notif, tickets });
+    const { delivered, messageIds } = await sendApprovalPing(chats, {
+      label: page.label,
+      gateKind: isDeploy ? "deploy-pipeline-reminder" : gateKindFor(notif.gate, title, gateTicket),
+      repage: false,
+      subject: wf.input?.title || wf.workflowId,
+      summary: page.summary,
+      attempt,
+      previousIssue,
+      meta: [
+        `👤 ${esc(notif.reviewer || "reviewer")}`,
+        `🎫 [${notif.ticketId}](https://${JIRA_SITE_URL}/browse/${notif.ticketId})`,
+        "⏸ pipeline paused on you",
+        ...page.meta,
+      ],
+      ask: page.ask,
+      keyboard,
+    });
+    if (!delivered) {
+      if (holding) await releaseKey(holding);
+      return false;
+    }
+    await markPingDelivered(key, {
+      now: Date.now(),
+      pingCount: mode.kind === "reminder" ? mode.n + 1 : 1,
+      messageIds,
+    }).catch((err) => console.error(`[telegram-bug-intake] markPingDelivered ${key}`, err.message));
+    return true;
+  } catch (err) {
+    console.error(`[telegram-bug-intake] awaiting-console page for ${notif.ticketId}`, err.message);
+    if (holding) {
+      await releaseKey(holding).catch((relErr) =>
+        console.error("[telegram-bug-intake] releaseKey after awaiting-console failure", relErr.message));
+    }
+    return false;
   }
 }
 
@@ -1470,19 +2180,40 @@ async function scanReviewGates() {
   const window = businessWindow(); // resolved once per container, on the first scan
   let chats = null; // fetched lazily — most scans find nothing new
   let pinged = 0;
+  let recovered = 0;
   for (const { wf, notif } of pending) {
-    const claimed = await claimGate(notif);
-    if (!claimed) {
-      // Already paged. The only thing left to do for this gate is the
-      // once-per-notification reminder, if its page landed out of hours.
-      await repageIfWindowOpened(wf, notif, window);
+    // TEAM-4663: "already claimed" is not the same as "already delivered". A
+    // claim with no deliveredAt, older than the lease, was stranded — nobody was
+    // ever paged, and because a re-parked gate only mints a new notif.id AFTER
+    // someone reviews it, nothing would ever re-mint this one. Re-send.
+    // No TTL fallback here on purpose: a row with no claimedAt predates this
+    // change, so deploying it re-pages nobody (claimedAtOf).
+    const mode = (await claimGate(notif))
+      ? "first"
+      : await consultClaimForRecovery(gateClaimKey(notif), { label: "review gate" });
+    if (!mode) {
+      // Already paged, and the page is accounted for. Two things can still be
+      // owed: the once-per-notification business-hours reminder, and — TEAM-4751
+      // C2 — a page for a gate the twins' guard parked on its unmet condition.
+      // At most ONE page per scan: the two are keyed differently (repage# vs
+      // console#) and would both fire for a labelled gate whose window just
+      // opened, which is two messages about one stall. The out-of-hours reminder
+      // wins (it is once-per-notification and already carries the
+      // awaiting-console copy); the consumer's console# row is untouched, so it
+      // pages on a later scan if the gate is still parked.
+      if (!(await repageIfWindowOpened(wf, notif, window))) {
+        await repageAwaitingConsole(wf, notif, window);
+      }
       continue;
     }
-    pinged++;
+    if (mode === "first") pinged++; else recovered++;
 
-    // The claim is written before delivery is proven, so ANY throw between
-    // here and a delivered ping (e.g. a transient listChats Scan failure)
-    // must release it — a stranded claim silences this gate for 30 days.
+    // The claim is written before delivery is proven, so ANY throw between here
+    // and a delivered ping (e.g. a transient listChats Scan failure) must
+    // release it — a stranded claim silences this gate for 30 days. In RECOVERY
+    // mode the row is kept instead: its lease was just refreshed, so the next
+    // scan past PING_LEASE_MS retries on its own, and deleting a row we did not
+    // create would lose the delivery history it carries.
     try {
       // The chat registry is historical — chat# rows outlive de-allowlisting.
       // Gate pings must respect the same allowlist as inbound messages, or the
@@ -1491,7 +2222,7 @@ async function scanReviewGates() {
       chats = chats || (await listChats()).filter((c) => ALLOWED_CHAT_IDS.includes(String(c)));
       if (!chats.length) {
         console.warn("[telegram-bug-intake] gate ticket but no allowlisted chats to notify");
-        await releaseGate(notif); // nobody was pinged — let a later scan retry
+        if (mode === "first") await releaseGate(notif); // nobody was pinged — let a later scan retry
         continue;
       }
 
@@ -1574,7 +2305,9 @@ async function scanReviewGates() {
             deploy.target?.repo ? `📦 ${esc(deploy.target.repo)}` : "",
           ].filter(Boolean)
         : [];
-      const { delivered } = await sendApprovalPing(chats, {
+      // messageIds is what phase 2 records on the claim row (TEAM-4663): the
+      // proof a human really has this page, and the handles a later edit needs.
+      const { delivered, messageIds } = await sendApprovalPing(chats, {
         label: deploy ? "deploy-approval gate" : "gate",
         gateKind: gateKindFor(notif.gate, title, gateTicket),
         subject: (brief && (brief.prTitle || brief.commitSubject)) || wf.input?.title || wf.workflowId,
@@ -1608,18 +2341,34 @@ async function scanReviewGates() {
         keyboard,
       });
       // The claim was written before delivery was proven; if every send failed,
-      // keeping it would silently skip this gate for 30 days.
-      if (!delivered) await releaseGate(notif);
-      // Exactly one gate.requested per notification, and only for a page that
-      // actually landed — it is the metrics record of "the human was asked".
-      else await publishGateRequested(wf, notif, window);
+      // keeping it would silently skip this gate for 30 days. A recovery keeps
+      // the row and retries on the next lease expiry (see the try comment).
+      if (!delivered) { if (mode === "first") await releaseGate(notif); }
+      else {
+        // Phase 2 — record that a human actually has it, so a later scan can
+        // tell this row apart from a stranded claim. Never fatal: a failed write
+        // costs one duplicate page a lease later, while letting it throw would
+        // hit the catch below and release a claim whose ping DID land.
+        await markPingDelivered(gateClaimKey(notif), { pingCount: 1, messageIds }).catch((err) =>
+          console.error("[telegram-bug-intake] markPingDelivered (gate)", err.message));
+        // Exactly one gate.requested per notification, and only for a page that
+        // actually landed — it is the metrics record of "the human was asked".
+        // A recovery publishes too: nothing was ever delivered before it, so
+        // nothing was ever published, and the recovery IS when the human was asked.
+        await publishGateRequested(wf, notif, window);
+      }
     } catch (err) {
-      await releaseGate(notif).catch((relErr) =>
-        console.error("[telegram-bug-intake] releaseGate after gate failure", relErr.message));
+      if (mode === "first") {
+        await releaseGate(notif).catch((relErr) =>
+          console.error("[telegram-bug-intake] releaseGate after gate failure", relErr.message));
+      }
       throw err;
     }
   }
-  if (pinged) console.log(`[telegram-bug-intake] review gates: ${pending.length} open, ${pinged} newly pinged`);
+  if (pinged || recovered) {
+    console.log(`[telegram-bug-intake] review gates: ${pending.length} open, ${pinged} newly pinged` +
+      (recovered ? `, ${recovered} re-sent after an unconfirmed ping` : ""));
+  }
 }
 
 /**
@@ -1643,7 +2392,11 @@ async function claimGate(notif) {
         ttl: { N: String(Math.floor(Date.now() / 1000) + 30 * 86400) },
         // TEAM-4461: the claim is written milliseconds before delivery in the same
         // scan (and released when nobody received it), so this IS the page time.
+        // Untouched by TEAM-4663: the repage window check keys off it, and a
+        // lease recovery deliberately does NOT refresh it.
         pagedAt: { S: new Date().toISOString() },
+        // TEAM-4663 phase 1 — see the two-phase claim block near claimKey().
+        claimedAt: { N: String(Date.now()) },
       },
       ConditionExpression: "attribute_not_exists(id)",
     }));
@@ -1832,6 +2585,47 @@ async function deleteGateRework(ticketId) {
   }
 }
 
+/**
+ * The one answer for "the gate's type could not be verified". No transition, no
+ * ledger row, no pipeline call, and the keyboard is left in place — the tap is
+ * the retry. Deliberately says nothing about approve/reject: the bridge does not
+ * know which kind of gate it is looking at, which is the whole point.
+ */
+async function answerGateUnverifiable(cb, ticketId) {
+  console.warn(`[telegram-bug-intake] gate ${ticketId}: could not verify gate type — nothing was touched`);
+  await tgAnswer(cb.id, "Could not verify gate type, retry.").catch(() => {});
+}
+
+// How much of the hub's refusal text the stuck-gate edit carries. Enough to name
+// the condition, short enough that the three sentences around it stay readable.
+const GATE_STUCK_DETAIL_MAX = 300;
+
+/**
+ * The one answer for "the PIPELINE is decided and the ticket is not" (TEAM-4751
+ * C1). The generic "⚠️ Failed to process" is a lie on this path: it reads as
+ * "nothing happened" about the single write that cannot be undone, and it sends
+ * the human — who just approved — off to the console the gate comment names.
+ *
+ * So say exactly what landed, what did not, and that a re-tap costs no second
+ * approval: `wasGateApprovedLocally` → DEPLOY_GATE_ALREADY is what guarantees
+ * that (SEC-8/SEC-9). The keyboard is preserved so the re-tap is possible, and
+ * the text deliberately avoids gateFromReply's routing vocabulary ("REVIEW
+ * GATE" / "SHIP-REVIEW ESCALATION" / "Changes requested") so a reply to it is
+ * not laundered into a rework note. Never throws, never rethrows.
+ */
+async function answerDeployGateTicketStuck(cb, chatId, ticketId, err) {
+  console.error(`[telegram-bug-intake] gate ${ticketId}: deploy decided but the ticket did not close`, err?.message);
+  const detail = clipText(redactText(String(err?.detail || err?.message || "")), GATE_STUCK_DETAIL_MAX);
+  await tgAnswer(cb.id, `Deploy approved — ${ticketId} still open.`).catch(() => {});
+  const body =
+    `${cb.message.text}\n\n` +
+    `✅ The deploy IS approved on the pipeline — it is resuming.\n` +
+    `⚠️ ${esc(ticketId)} could not be marked done yet: ${esc(detail)}\n` +
+    `Tap ✅ again to finish the ticket only — the pipeline will not be approved twice.`;
+  await tgEdit(chatId, cb.message.message_id, body.slice(0, 4000),
+    cb.message.reply_markup ? { reply_markup: cb.message.reply_markup } : {}).catch(() => {});
+}
+
 async function handleGateCallback(cb, chatId, action, ticketId, workflowId) {
   // Gate pings go to every registered chat, but only allowlisted chats may
   // transition tickets. Ack the tap (or Telegram re-sends the callback query)
@@ -1846,12 +2640,47 @@ async function handleGateCallback(cb, chatId, action, ticketId, workflowId) {
     // this ✅ used to transition Jira only, leaving CodePipeline parked (a
     // release stalled 29h on 2026-09-14). One fetch, and it never throws; an
     // unlabelled gate reaches not one CodePipeline call and behaves as before.
-    const { gateTicket: approving } = await gateTicketOf({ workflowId }, { ticketId });
-    const deploy = await deployApprovalGate(approving);
-    // Failure already answered + edited the message; the ticket stays put so
-    // the human can tap again once the cause is fixed.
-    if (deploy && !(await decideDeployGate(cb, chatId, ticketId, deploy, true))) return;
-    const res = await transitionGate(workflowId, ticketId, "done", `Approved via Telegram by chat ${chatId}`);
+    const { gateTicket: approving, indeterminate } = await gateTicketOf({ workflowId }, { ticketId });
+    // Could not read the ticket → could not read its LABELS, so we cannot tell a
+    // deploy-approval gate from a plain one. Falling through would transition a
+    // deploy gate while CodePipeline stayed parked — the exact 29h stall. Touch
+    // nothing and let the human tap again.
+    if (indeterminate) return await answerGateUnverifiable(cb, ticketId);
+    let res = null;
+    // TEAM-4753 N1: the pre-read above ALREADY says whether this gate is closed,
+    // and an already-`done` gate has no half left to run. WP2's typed-gate guard
+    // is what makes that conclusive: a `gate:deploy-approval` ticket cannot reach
+    // `done` unless the pipeline's own approval was verified. Firing either half
+    // anyway lies in both directions — decideDeployGate finds no waiting action
+    // and reports "Could not approve the deploy", and the close comes back
+    // done→done and reports "could not be marked done yet — tap ✅ again",
+    // forever, on every re-tap. Fall through to the same ✅ artefact the lost or
+    // earlier tap produced: no PutApprovalResult, no transition POST.
+    if (!isTicketDone(approving)) {
+      const deploy = await deployApprovalGate(approving);
+      // Only `failed` stops the ticket half: it already answered + edited the
+      // message, and the ticket stays put so the human can tap again once the
+      // cause is fixed. `alreadyResolved` means the pipeline is where the human
+      // wants it, so the ticket must still move (SEC-8).
+      const decided = deploy ? await decideDeployGate(cb, chatId, ticketId, deploy, true, workflowId) : null;
+      if (decided === DEPLOY_GATE_FAILED) return;
+      if (decided) {
+        // TEAM-4751 C1: a pipeline decision LANDED (`decided` or `alreadyResolved`),
+        // so the ticket half is all that is left — and it must not be surfaced as a
+        // total failure. WP2's guard reads CodePipeline ONCE with no tolerance, so
+        // the close we fire immediately after our own PutApprovalResult can still
+        // see the Approval action InProgress and be refused. Retry that refusal;
+        // on a real one, say what is true rather than "⚠️ Failed to process".
+        const out = await transitionGateAfterDecision(
+          workflowId, ticketId, "done", `Approved via Telegram by chat ${chatId}`);
+        if (out.error) return await answerDeployGateTicketStuck(cb, chatId, ticketId, out.error);
+        res = out.res;
+      } else {
+        // A plain gate: no irreversible write preceded this tap, so a refusal is
+        // still allowed to throw to the update loop exactly as it always has.
+        res = await transitionGate(workflowId, ticketId, "done", `Approved via Telegram by chat ${chatId}`);
+      }
+    }
     // A ❌ tapped by mistake before this ✅ left a marker that would turn the
     // chat's next message into a rework note for a gate that is now done.
     const stale = await getPendingRejection(chatId);
@@ -1872,12 +2701,16 @@ async function handleGateCallback(cb, chatId, action, ticketId, workflowId) {
   // keyboard): gok already moved the gate to done, so writing the placeholder
   // again would hand approvalAttempt rejection evidence for a cycle the human
   // APPROVED (TEAM-4677). Ask the hub rather than a local marker — a gate
-  // approved from the board counts too — and fail open: gateTicketOf never
-  // throws, so an unavailable tickets view falls through to the normal path and
-  // a transient error can never eat a real rejection. TEAM-4675's
-  // deleteGateRework in the gok branch above covers the reverse order.
-  const { gateTicket } = await gateTicketOf({ workflowId }, { ticketId });
-  if (String(gateTicket?.status || "").toLowerCase() === "done") {
+  // approved from the board counts too. TEAM-4675's deleteGateRework in the gok
+  // branch above covers the reverse order.
+  //
+  // An UNREADABLE tickets view is not "not done": the labels are unreadable too,
+  // so a deploy gate here would be rejected as a plain gate and CodePipeline
+  // would stay parked. Touch nothing (SEC-8/gateTicketOf) — a rejection is not
+  // lost, it is retried by the same buttons.
+  const { gateTicket, indeterminate: unreadable } = await gateTicketOf({ workflowId }, { ticketId });
+  if (unreadable) return await answerGateUnverifiable(cb, ticketId);
+  if (isTicketDone(gateTicket)) {
     // No tgEdit: the ✅ edit already states the truth, and this branch's edit
     // text carries "Changes requested" — gateFromReply's routing vocabulary.
     await tgAnswer(cb.id, "Already approved — nothing to reject.");
@@ -1887,7 +2720,10 @@ async function handleGateCallback(cb, chatId, action, ticketId, workflowId) {
   // fetch above (no second call), and only then does the ticket half run. A
   // failed rejection leaves the ticket untouched, exactly like the ✅ path.
   const rejecting = await deployApprovalGate(gateTicket);
-  if (rejecting && !(await decideDeployGate(cb, chatId, ticketId, rejecting, false))) return;
+  // TEAM-4781: `failed` now also covers "the pipeline took the ❌ but the SEC-1
+  // marker did not land" — the rework plumbing below must not run then either, or
+  // the gate leaves `in_review` with nothing left to retry the marker.
+  if (rejecting && (await decideDeployGate(cb, chatId, ticketId, rejecting, false, workflowId)) === DEPLOY_GATE_FAILED) return;
   // Request changes: the ticket needs a rework note. Park the intent; the
   // chat's next plain message — or a reply to this ping, any time — becomes
   // the note (resolveReworkTarget → deliverReworkNote).
@@ -2096,6 +2932,16 @@ async function transitionGate(workflowId, ticketId, targetStatus, comment) {
     // transition to \"Blocked\" found…") — that is what the human needs to see.
     let detail = raw;
     try { const j = JSON.parse(raw); detail = j.details || j.error || raw; } catch { /* not JSON */ }
+    // TEAM-4753 N1: the close we are asking for is already the ticket's state.
+    // That is not a failure of a ✅ — it IS the ✅ that already landed (a lost
+    // response, two taps racing, or the human tapping again). Every `done`
+    // caller gets this, which is the point: the same tap used to be reported as
+    // "could not be marked done yet" here and as "⚠️ Failed to process" from
+    // handleDecisionCallback.
+    if (targetStatus === "done" && isAlreadyDoneRefusal(res.status, detail)) {
+      console.log(`[telegram-bug-intake] ${ticketId} is already done — treating the close as landed: ${detail}`);
+      return { alreadyDone: true };
+    }
     const err = new Error(`transition ${res.status}: ${detail}`);
     err.status = res.status;
     err.detail = detail;
@@ -2103,6 +2949,89 @@ async function transitionGate(workflowId, ticketId, targetStatus, comment) {
   }
   // Body is informational (e.g. decisionDefaulted, TEAM-3971) — never required.
   try { return await res.json(); } catch { return {}; }
+}
+
+// WP2's typed-gate guard refused the close. The hub route surfaces the ticket
+// Lambda's refusal TEXT only (src/app/api/workflow/[id]/tickets/transition/
+// route.ts sends `details: gateRefusal().message`), never the machine reason —
+// so the match is on the message gateRefusal() builds ("…its `gate:<kind>`
+// condition is not met. <hint>"). `gate_condition_unmet` is the defensive arm
+// for the day the route starts forwarding `payload.reason` as well.
+const GATE_GUARD_REFUSAL_RE = /condition is not met|gate_condition_unmet/i;
+
+/**
+ * Is this a RETRYABLE typed-gate refusal, as opposed to a real 409? A refusal is
+ * a lagging read; "No transition to \"Done\" found" is an answer, and a 5xx is
+ * neither. Both of those must fail fast.
+ */
+function isGateGuardRefusal(err) {
+  return err?.status === 409 && GATE_GUARD_REFUSAL_RE.test(String(err?.detail ?? err?.message ?? ""));
+}
+
+// TEAM-4753 N1 — the two phrasings a done→done can come back as. The bridge
+// talks to the HUB ROUTE, not to the twins, so which layer answers first depends
+// on the provider:
+//
+//   dynamodb  the route's own pre-check answers, and it is a 400 with the reason
+//             in `error`: "Invalid transition from done to done"
+//             (src/app/api/workflow/[id]/tickets/transition/route.ts,
+//             VALID_TRANSITIONS.done = ["todo"]).
+//   the twin  409 with the reason in `details`: 'Invalid transition "done" from
+//             status "done". Available: …' (lambda/agentcore-hub-tickets
+//             transitionIssue) — reachable if the route ever stops pre-checking.
+//
+// The trailing "Available: …" list is deliberately not part of either match.
+// Jira's own refusal ('No transition to "Done" found. Available: …',
+// lambda/agentcore-hub-jira) is deliberately NOT here and stays a failure: it is
+// the SAME text a genuinely stuck, not-done ticket produces, so it proves
+// nothing about the current status. The gok branch's pre-read short-circuit is
+// what covers that provider — it fires before any POST.
+const ALREADY_DONE_RES = [
+  /Invalid transition\s+"?done"?\s+from status\s+"?done"?/i,
+  /Invalid transition from\s+"?done"?\s+to\s+"?done"?/i,
+];
+
+/**
+ * Is this refusal "the close you asked for is already the ticket's state"? The
+ * caller gates on `targetStatus === "done"` as well, so a rework note's
+ * done→blocked refusal (deliverReworkNote) can never be read as a success.
+ */
+function isAlreadyDoneRefusal(status, detail) {
+  return (status === 409 || status === 400) &&
+    ALREADY_DONE_RES.some((re) => re.test(String(detail ?? "")));
+}
+
+// 4 attempts ⇒ 3 sleeps at _deployGateRetryMs ≈ 30s, the same budget
+// decideDeployGate already spends waiting for a superseded build to clear the
+// gate — so the invocation's tolerance for this callback is unchanged.
+export const DEPLOY_GATE_TRANSITION_TRIES = 4;
+
+/**
+ * Transition a gate whose PIPELINE decision has ALREADY landed (TEAM-4751 C1).
+ *
+ * Never throws: the caller must not let the top-level "⚠️ Failed to process"
+ * become the surface for a deploy that IS approved. Retries ONLY the guard's
+ * lagging-read refusal — the decision ledger row (`approved#<ticketId>`) is
+ * written before the pipeline call, so a retried close is idempotent — and
+ * treats every other failure as final.
+ *
+ * @returns {Promise<{res: object|null, error: Error|null, attempts: number, refusals: number}>}
+ */
+async function transitionGateAfterDecision(workflowId, ticketId, targetStatus, comment) {
+  let refusals = 0;
+  for (let attempt = 1; ; attempt++) {
+    try {
+      const res = await transitionGate(workflowId, ticketId, targetStatus, comment);
+      return { res, error: null, attempts: attempt, refusals };
+    } catch (err) {
+      if (!isGateGuardRefusal(err) || attempt >= DEPLOY_GATE_TRANSITION_TRIES) {
+        return { res: null, error: err, attempts: attempt, refusals };
+      }
+      refusals++;
+      console.warn(`[telegram-bug-intake] gate ${ticketId}: the gate guard refused the close (attempt ${attempt}/${DEPLOY_GATE_TRANSITION_TRIES}) — ${err.detail || err.message}`);
+      await sleep(_deployGateRetryMs);
+    }
+  }
 }
 
 // ─── Workflow Manager escalations ────────────────────────────────────────────
@@ -2257,16 +3186,25 @@ async function scanManagerEscalations() {
 
   let chats = null;
   for (const { wf, notif } of pending) {
-    const claimed = await claimKey(`${ESC_KEY_PREFIX}${notif.id}`);
-    if (!claimed) continue;
+    const escKey = `${ESC_KEY_PREFIX}${notif.id}`;
+    // TEAM-4663, same rule as review gates: a claim with no deliveredAt older
+    // than the lease was stranded before its ping, and an open escalation PARKS
+    // the run — so a stranded claim here is the 9h TEAM-3938 stall with nobody
+    // paged. No TTL fallback: pre-upgrade rows are not recovery-eligible.
+    const mode = (await claimKey(escKey))
+      ? "first"
+      : await consultClaimForRecovery(escKey, { label: "manager escalation" });
+    if (!mode) continue;
 
     // Same claim-before-delivery contract as review gates: any throw before a
-    // delivered ping must release the claim or this escalation stays silent.
+    // delivered ping must release a FIRST claim or this escalation stays silent.
+    // A recovery keeps the row — its lease was just refreshed, so the next scan
+    // past PING_LEASE_MS retries.
     try {
       chats = chats || (await listChats()).filter((c) => ALLOWED_CHAT_IDS.includes(String(c)));
       if (!chats.length) {
         console.warn("[telegram-bug-intake] manager escalation but no allowlisted chats to notify");
-        await releaseKey(`${ESC_KEY_PREFIX}${notif.id}`);
+        if (mode === "first") await releaseKey(escKey);
         continue;
       }
 
@@ -2288,11 +3226,18 @@ async function scanManagerEscalations() {
         [{ text: "📱 Open run in hub", url: `${HUB_API_URL}/workflow?id=${encodeURIComponent(wf.workflowId)}` }],
       ] };
 
-      const { delivered } = await sendApprovalPing(chats, { ...msg, label: "escalation", keyboard });
-      if (!delivered) await releaseKey(`${ESC_KEY_PREFIX}${notif.id}`);
+      const { delivered, messageIds } = await sendApprovalPing(chats, { ...msg, label: "escalation", keyboard });
+      // A FIRST claim with nothing delivered is dropped so the next scan retries;
+      // a RECOVERY keeps its (now fresh) lease and retries past PING_LEASE_MS.
+      if (!delivered) { if (mode === "first") await releaseKey(escKey); }
+      // Phase 2, best-effort for the same reason as the gate path.
+      else await markPingDelivered(escKey, { pingCount: 1, messageIds }).catch((err) =>
+        console.error("[telegram-bug-intake] markPingDelivered (escalation)", err.message));
     } catch (err) {
-      await releaseKey(`${ESC_KEY_PREFIX}${notif.id}`).catch((relErr) =>
-        console.error("[telegram-bug-intake] releaseKey after escalation failure", relErr.message));
+      if (mode === "first") {
+        await releaseKey(escKey).catch((relErr) =>
+          console.error("[telegram-bug-intake] releaseKey after escalation failure", relErr.message));
+      }
       throw err;
     }
   }
@@ -2324,7 +3269,15 @@ async function claimKey(id) {
   try {
     await ddb.send(new PutItemCommand({
       TableName: PENDING_TABLE,
-      Item: { id: { S: id }, ttl: { N: String(Math.floor(Date.now() / 1000) + 30 * 86400) } },
+      Item: {
+        id: { S: id },
+        ttl: { N: String(Math.floor(Date.now() / 1000) + 30 * 86400) },
+        // TEAM-4663 phase 1 of the two-phase claim: when this row was taken. The
+        // matching deliveredAt is written only once a send is CONFIRMED, so an
+        // invocation that dies in between leaves a row that can be told apart
+        // from a delivered one and re-taken past the lease.
+        claimedAt: { N: String(Date.now()) },
+      },
       ConditionExpression: "attribute_not_exists(id)",
     }));
     return true;
@@ -2336,6 +3289,144 @@ async function claimKey(id) {
 
 async function releaseKey(id) {
   await ddb.send(new DeleteItemCommand({ TableName: PENDING_TABLE, Key: { id: { S: id } } }));
+}
+
+// ─── Two-phase claim: claim, then PROVE delivery (TEAM-4663) ─────────────────
+// Every ping path claims a dedupe row BEFORE it sends — that row is what makes
+// "ping exactly once" true. But the claim on its own records nothing about
+// delivery, so an invocation killed between the PutItem and the send strands the
+// row, and every later scan bails on "already claimed": the page is silently
+// parked for the row's whole TTL (7 days for a production deploy gate, 30 for a
+// review gate). TEAM-4663 was 8h45m of an unpinged prod deploy behind exactly
+// that.
+//
+// Phase 2 closes it. `claimedAt` goes on the row at claim time; `deliveredAt`
+// (plus lastPingAt/pingCount/messageIds) only after a send is confirmed. A claim
+// with no deliveredAt older than PING_LEASE_MS is re-takeable, so the next scan
+// re-sends instead of returning. These primitives are id-keyed and deliberately
+// path-agnostic — dep#, gate# and esc# all use them.
+
+async function getClaimRow(id) {
+  const { Item } = await ddb.send(new GetItemCommand({
+    TableName: PENDING_TABLE, Key: { id: { S: id } },
+  }));
+  return Item || null;
+}
+
+/**
+ * When this claim/lease was taken, in ms — or null when that cannot be
+ * established. `ttlFallbackSec` is the row's TTL HORIZON (the row's ttl is claim
+ * time + horizon), and passing it is what makes a PRE-UPGRADE row — written
+ * before this change, so carrying no claimedAt — recovery-eligible.
+ *
+ * Whether a path passes it is a real policy decision, not a detail:
+ *   dep#         passes the 7-day horizon, so the row stranded by the incident
+ *                this fixes gets its one recovery ping when the fix deploys.
+ *   gate#, esc#  pass nothing, so a pre-upgrade row is ineligible and the deploy
+ *                of this fix cannot re-page every currently-open gate.
+ */
+function claimedAtOf(row, ttlFallbackSec = null) {
+  const claimedAt = Number(row?.claimedAt?.N);
+  if (Number.isFinite(claimedAt) && claimedAt > 0) return claimedAt;
+  if (ttlFallbackSec == null) return null;
+  const ttl = Number(row?.ttl?.N);
+  if (!Number.isFinite(ttl) || ttl <= 0) return null;
+  return (ttl - ttlFallbackSec) * 1000;
+}
+
+/**
+ * Take over an undelivered claim: refresh claimedAt so THIS invocation owns the
+ * lease. Conditional, so two pollers can never both re-send — and it refuses
+ * outright once deliveredAt exists, which is what stops a lease re-take from
+ * re-paging a human who already has the message. False = someone else won.
+ */
+async function retakeLease(id, seenClaimedAt, now) {
+  try {
+    await ddb.send(new UpdateItemCommand({
+      TableName: PENDING_TABLE,
+      Key: { id: { S: id } },
+      UpdateExpression: "SET claimedAt = :now",
+      ConditionExpression:
+        "attribute_exists(id) AND attribute_not_exists(deliveredAt) AND (claimedAt = :seen OR attribute_not_exists(claimedAt))",
+      ExpressionAttributeValues: {
+        ":now": { N: String(now) },
+        ":seen": { N: String(seenClaimedAt) },
+      },
+    }));
+    return true;
+  } catch (err) {
+    if (err.name === "ConditionalCheckFailedException") return false;
+    throw err;
+  }
+}
+
+/**
+ * Phase 2: at least one chat confirmed the send. deliveredAt is if_not_exists so
+ * it keeps meaning "when the human FIRST had it" across reminders; lastPingAt /
+ * pingCount move. Best-effort at every call site: losing this write costs at
+ * most one duplicate page a lease later, whereas treating it as fatal would
+ * release a claim whose ping already landed.
+ */
+async function markPingDelivered(id, { now = Date.now(), pingCount = 1, messageIds = [] } = {}) {
+  await ddb.send(new UpdateItemCommand({
+    TableName: PENDING_TABLE,
+    Key: { id: { S: id } },
+    UpdateExpression:
+      "SET deliveredAt = if_not_exists(deliveredAt, :now), lastPingAt = :now, pingCount = :n, messageIds = :m",
+    ExpressionAttributeValues: {
+      ":now": { N: String(now) },
+      ":n": { N: String(pingCount) },
+      ":m": { S: JSON.stringify(messageIds.slice(0, 20)) },
+    },
+  }));
+}
+
+/**
+ * Claim the right to send reminder #nextCount, conditional on nobody else having
+ * moved the counter. Reserved concurrency is 1 today, so this is belt and braces
+ * — but a reminder that double-fires is a page a human already read, and the
+ * condition costs nothing. False = another invocation took this slot.
+ */
+async function takeReminderSlot(id, { seenLastPingAt, seenCount, nextCount, now }) {
+  try {
+    await ddb.send(new UpdateItemCommand({
+      TableName: PENDING_TABLE,
+      Key: { id: { S: id } },
+      UpdateExpression: "SET lastPingAt = :now, pingCount = :next",
+      ConditionExpression: "lastPingAt = :seen AND pingCount = :seenCount",
+      ExpressionAttributeValues: {
+        ":now": { N: String(now) },
+        ":next": { N: String(nextCount) },
+        ":seen": { N: String(seenLastPingAt) },
+        ":seenCount": { N: String(seenCount) },
+      },
+    }));
+    return true;
+  } catch (err) {
+    if (err.name === "ConditionalCheckFailedException") return false;
+    throw err;
+  }
+}
+
+/**
+ * The ONE recovery rule, called whenever a claim's conditional Put loses: does
+ * this existing row prove a ping was delivered, or was it stranded? Returns
+ * "recovery" (the lease is now ours — re-send) or null (leave it alone).
+ *
+ * `row` may be passed in by a caller that already read it, so consulting costs
+ * one GetItem per scan and not two.
+ */
+async function consultClaimForRecovery(id, { ttlFallbackSec = null, label = "ping", row = undefined } = {}) {
+  const claim = row === undefined ? await getClaimRow(id) : row;
+  if (!claim) return null;                  // TTL'd or actioned between reads
+  if (claim.deliveredAt?.N) return null;    // a human has the page
+  const claimedAt = claimedAtOf(claim, ttlFallbackSec);
+  if (claimedAt == null) return null;       // pre-upgrade row (see claimedAtOf)
+  const now = Date.now();
+  if (now - claimedAt < PING_LEASE_MS) return null;   // a send may be in flight
+  if (!(await retakeLease(id, claimedAt, now))) return null;
+  console.warn(`[telegram-bug-intake] ${label} ping never confirmed — re-sending`, id);
+  return "recovery";
 }
 
 // Chat registry — every chat that ever messaged the bot gets gate pings.
@@ -2391,6 +3482,15 @@ async function scanAllPages(input) {
 // a total no-op — not one AWS call.
 
 const DEPLOY_KEY_PREFIX = "dep#";
+// The claim row's TTL horizon. Also the fallback used to date a PRE-TEAM-4663
+// row, whose ttl IS claim time + this (claimedAtOf).
+const DEPLOY_CLAIM_TTL_SEC = 7 * 86400;
+// A DELIVERED deploy ping still waiting on a human earns a bounded re-page: the
+// approval is an irreversible prod act and the pipeline is stopped on it, so
+// "the human scrolled past it" must not be a 7-day silence either. Bounded on
+// purpose — nagging a reviewer forever trains them to ignore the bot.
+const DEPLOY_REPING_INTERVAL_MS = parseInt(process.env.DEPLOY_REPING_INTERVAL_MS || "7200000", 10);
+const DEPLOY_REPING_MAX = parseInt(process.env.DEPLOY_REPING_MAX || "6", 10);
 
 // ─── CD registry deploy targets ──────────────────────────────────────────────
 // The same document the orchestrator and the Pipeline___* tools Lambda read
@@ -2512,12 +3612,24 @@ async function scanDeployApprovals() {
   }
 }
 
+/** "8h 45m" / "12m" — how long a human has kept a prod deploy waiting. */
+function formatPending(ms) {
+  if (!Number.isFinite(ms) || ms < 0) return null;
+  const mins = Math.floor(ms / 60_000);
+  const h = Math.floor(mins / 60);
+  return h ? `${h}h ${mins % 60}m` : `${mins}m`;
+}
+
 async function scanDeployApprovalsForTarget(target) {
+  // One client for the whole scan: the state read AND the commit lookup must go
+  // to the same account, which for a cross-account target means the same assumed
+  // hub-cd-trigger role (#611). Building a second, bare client for the commit
+  // lookup is how that read silently AccessDenies on every registered repo whose
+  // pipeline lives elsewhere.
+  const cp = codepipelineFor(target.region, target.roleArn, target.externalId);
   let state;
   try {
-    state = await codepipelineFor(target.region, target.roleArn, target.externalId).send(
-      new GetPipelineStateCommand({ name: target.pipeline }),
-    );
+    state = await cp.send(new GetPipelineStateCommand({ name: target.pipeline }));
   } catch (err) {
     // A missing pipeline (wrong account, torn down, registry typo) must not spam
     // the log every 60s — bail quietly. Any other error propagates to the
@@ -2530,12 +3642,6 @@ async function scanDeployApprovalsForTarget(target) {
   // marks the *stage* InProgress and the action has a latestExecution.token
   // only while it waits; the token is required by PutApprovalResult.
   let pending = null;
-  // The commit being deployed — the Source stage's currentRevision. Used to
-  // enrich the ping with the actual commit / PR / scope (esbuild the SHA once).
-  const sourceRevisionId = (state.stageStates || [])
-    .flatMap((s) => s.actionStates || [])
-    .map((a) => a.currentRevision?.revisionId)
-    .find(Boolean);
   for (const stage of state.stageStates || []) {
     for (const action of stage.actionStates || []) {
       const token = action.latestExecution?.token;
@@ -2543,7 +3649,9 @@ async function scanDeployApprovalsForTarget(target) {
       if (token && status === "InProgress") {
         pending = { stageName: stage.stageName, actionName: action.actionName, token,
           revisionUrl: action.entityUrl || action.revisionUrl,
-          commitSha: sourceRevisionId || null };
+          // WHICH execution is parked here. The stage carries it; the action
+          // does not. Everything about the commit hangs off this (D3).
+          executionId: stage.latestExecution?.pipelineExecutionId || null };
         break;
       }
     }
@@ -2553,25 +3661,33 @@ async function scanDeployApprovalsForTarget(target) {
 
   // Claim on the pipeline + token: a new pipeline execution mints a fresh token,
   // so this naturally re-pings each run while never double-pinging the same wait.
-  const claimed = await claimDeployApproval(pending, target);
-  if (!claimed) return;
+  // A LOST claim is no longer the end of it (TEAM-4663) — the existing row is
+  // consulted, because "someone claimed this" used to be indistinguishable from
+  // "a human was actually paged".
+  const key = deployClaimKey(pending, target);
+  const claimed = await claimDeployApproval(pending, target, key);
+  const mode = claimed
+    ? { kind: "first" }
+    : await decideDeployPingMode(`${DEPLOY_KEY_PREFIX}${key}`);
+  if (!mode) return;
 
   try {
     const chats = (await listChats()).filter((c) => ALLOWED_CHAT_IDS.includes(String(c)));
     if (!chats.length) {
       console.warn("[telegram-bug-intake] deploy approval but no allowlisted chats to notify");
-      await releaseDeployApproval(claimed.key);
+      if (mode.kind === "first") await releaseDeployApproval(key);
       return;
     }
 
-    // Enrich the ping with what's actually shipping: the commit subject, the PR
-    // (title + workflow/epic + one-line summary from the body), and the file
-    // scope. Best-effort PER FIELD: buildDeployBrief catches each GitHub lookup
-    // on its own, so an API hiccup still returns a brief — just a partial one,
-    // whose only bullet is "Commit: <sha>". `brief` is null, and the terse
-    // message below is what goes out, ONLY when there is no commit SHA to
-    // describe (or the target's repo path is unsafe).
-    const brief = await buildDeployBrief(pending.commitSha, target.repo).catch((e) => {
+    // The commit THIS execution would ship (never the newest one in the
+    // pipeline — GetPipelineState reports a revision per STAGE, so with two
+    // executions in flight the Source stage's revision belongs to the newer one,
+    // and quoting it would describe the run BEHIND this gate to a human about to
+    // irreversibly ship). Then what's in it: subject, PR title/epic/summary, file
+    // scope. Best-effort at both steps — an unresolved commit or a GitHub hiccup
+    // degrades the ping to the terse body, which still carries working buttons.
+    const commitSha = await executionRevision(cp, state, target.pipeline, pending.executionId);
+    const brief = await buildDeployBrief(commitSha, target.repo).catch((e) => {
       console.warn("[telegram-bug-intake] deploy brief enrich failed:", e.message);
       return null;
     });
@@ -2579,17 +3695,31 @@ async function scanDeployApprovalsForTarget(target) {
     const deployAsk =
       "This is the irreversible production deploy — the merge is already approved. " +
       "Approve to ship, or Reject to stop.";
+    const isReminder = mode.kind === "reminder";
     // Which pipeline, and which REPO's pipeline: with several registered repos a
-    // bare pipeline name is not enough for a human to know what they are shipping.
+    // bare pipeline name is not enough for a human to know what they are
+    // shipping. The execution id is what lets them find it in the console — and
+    // what proves WHICH of two in-flight runs this ping is about.
     const meta = [`🏷 ${esc(target.pipeline)}`];
     if (target.repo) meta.push(`📦 ${esc(target.repo)}`);
+    if (pending.executionId) meta.push(`🆔 ${esc(String(pending.executionId).slice(0, 8))}`);
+    if (isReminder) {
+      const pendingFor = formatPending(mode.pendingMs);
+      meta.push(`⏳ ${pendingFor ? `Pending ${pendingFor} · ` : ""}reminder ${mode.n} of ${DEPLOY_REPING_MAX}`);
+    }
+    const fallbackSummary = isReminder
+      ? "This deploy is still parked on your approval — the pipeline cannot proceed without it."
+      : "The build passed every gate and is waiting on you to ship it to prod.";
     // Both shapes go through the same builder as every other approval ping
     // (TEAM-4660) — this path was already templated, so only the seam changes.
+    // The reminder is its own kind rather than the `repage` modifier: `repage`
+    // renders "business-hours reminder", which a 2-hourly nag is not.
+    const gateKind = isReminder ? "deploy-pipeline-reminder" : "deploy-pipeline";
     const msg = brief
       ? {
-          gateKind: "deploy-pipeline",
+          gateKind,
           subject: brief.prTitle || brief.commitSubject || target.pipeline,
-          summary: brief.summary || "",                       // one-line what/why from the PR body
+          summary: brief.summary || (isReminder ? fallbackSummary : ""), // one-line what/why from the PR body
           bullets: [
             brief.workflowLine,                               // "Workflow: TEAM-3721 (bug-fix)"
             brief.scopeLine,                                  // "Scope: 8 files (+147/-4)"
@@ -2599,16 +3729,16 @@ async function scanDeployApprovalsForTarget(target) {
           ask: deployAsk,
         }
       : {
-          gateKind: "deploy-pipeline",
+          gateKind,
           subject: target.pipeline,
-          summary: "The build passed every gate and is waiting on you to ship it to prod.",
+          summary: fallbackSummary,
           meta,
           ask: deployAsk,
         };
 
     const rows = [[
-      { text: "🚀 Approve deploy", callback_data: `dok|${claimed.key}` },
-      { text: "🛑 Reject", callback_data: `dno|${claimed.key}` },
+      { text: "🚀 Approve deploy", callback_data: `dok|${key}` },
+      { text: "🛑 Reject", callback_data: `dno|${key}` },
     ]];
     const linkRow = [];
     if (brief?.prUrl) linkRow.push({ text: "🔗 View PR", url: brief.prUrl });
@@ -2617,11 +3747,36 @@ async function scanDeployApprovalsForTarget(target) {
     if (linkRow.length) rows.push(linkRow);
     const keyboard = { inline_keyboard: rows };
 
-    const { delivered } = await sendApprovalPing(chats, { ...msg, label: "deploy approval", keyboard });
-    if (!delivered) await releaseDeployApproval(claimed.key);
+    const { delivered, messageIds } = await sendApprovalPing(chats, {
+      ...msg, label: "deploy approval", keyboard,
+    });
+    if (delivered) {
+      // pingCount 1 == the original ping; a reminder advances it. Best-effort:
+      // see markPingDelivered. On a reminder the slot was already consumed by
+      // takeReminderSlot, so a failure here costs a repeat, not a lost bound.
+      await markPingDelivered(`${DEPLOY_KEY_PREFIX}${key}`, {
+        pingCount: isReminder ? mode.n + 1 : 1, messageIds,
+      }).catch((err) => console.error("[telegram-bug-intake] markPingDelivered (deploy)", err.message));
+    } else if (mode.kind === "first") {
+      // Nobody got it and we created the row — drop it so the next scan (60s)
+      // retries immediately rather than waiting out a lease.
+      await releaseDeployApproval(key);
+    } else if (mode.kind === "recovery") {
+      // Keep the row: the lease is ours and now fresh, so the next scan past
+      // PING_LEASE_MS tries again — indefinitely, while the approval is pending.
+      // This is the invariant-critical path; it must never go quiet.
+      console.error(`[telegram-bug-intake] deploy approval re-send still undelivered for ${target.pipeline} — retrying after the lease`);
+    } else {
+      // A reminder that failed: the slot is burned and the next one is an
+      // interval away. Deliberate — the original ping DID land, and rolling the
+      // counter back would need a second conditional write to buy very little.
+      console.error(`[telegram-bug-intake] deploy approval reminder ${mode.n} undelivered for ${target.pipeline}`);
+    }
   } catch (err) {
-    await releaseDeployApproval(claimed.key).catch((relErr) =>
-      console.error("[telegram-bug-intake] releaseDeployApproval after failure", relErr.message));
+    if (mode.kind === "first") {
+      await releaseDeployApproval(key).catch((relErr) =>
+        console.error("[telegram-bug-intake] releaseDeployApproval after failure", relErr.message));
+    }
     throw err;
   }
 }
@@ -2773,29 +3928,36 @@ async function buildDeployBrief(commitSha, targetRepo = null) {
 }
 
 /**
- * Atomically claim a deploy approval for notification, keyed by the target
- * pipeline + the approval TOKEN (unique per pipeline wait). Returns { key, ... }
- * on first claim, false if already pinged. The DDB row stores the
- * pipeline/region/repo/stage/action/token the button callback needs, since
- * callback_data can't carry the token itself.
+ * The claim key for one pipeline wait — a short, callback_data-safe hash of the
+ * target + the approval TOKEN (the token alone can exceed Telegram's 64-byte
+ * callback_data budget; it stays in the DDB item). Hashing the PIPELINE in means
+ * two targets can never collide on one claim row, whatever their tokens look
+ * like. Split out of claimDeployApproval by TEAM-4663: the caller needs the key
+ * even when the claim LOSES, to consult the existing row.
+ *
+ * MIGRATION (TEAM-4347): before TEAM-4338 the key was hash(token) alone, and that
+ * code watched exactly ONE pipeline — DEPLOY_PIPELINE_NAME. So legacy-shaped rows
+ * can only ever exist for that pipeline; keeping the legacy shape for it means an
+ * approval already paused on the gate when this zip lands still hashes to the row
+ * that claimed it, instead of claiming a second row and pinging twice. Matching on
+ * the pipeline NAME (not on "came from the env fallback") is deliberate: the hub is
+ * normally in the registry too, so its target is a REGISTRY target that happens to
+ * name DEPLOY_PIPELINE_NAME — the exact configuration the double-ping would hit.
  */
-async function claimDeployApproval(pending, target) {
-  // A short, callback_data-safe key derived from the target + the approval TOKEN
-  // (the token alone can exceed Telegram's 64-byte callback_data budget). The token
-  // stays in the DDB item. Hashing the PIPELINE in means two targets can never
-  // collide on one claim row, whatever their tokens look like.
-  //
-  // MIGRATION (TEAM-4347): before TEAM-4338 the key was hash(token) alone, and that
-  // code watched exactly ONE pipeline — DEPLOY_PIPELINE_NAME. So legacy-shaped rows
-  // can only ever exist for that pipeline; keeping the legacy shape for it means an
-  // approval already paused on the gate when this zip lands still hashes to the row
-  // that claimed it, instead of claiming a second row and pinging twice. Matching on
-  // the pipeline NAME (not on "came from the env fallback") is deliberate: the hub is
-  // normally in the registry too, so its target is a REGISTRY target that happens to
-  // name DEPLOY_PIPELINE_NAME — the exact configuration the double-ping would hit.
-  const key = DEPLOY_PIPELINE_NAME && target.pipeline === DEPLOY_PIPELINE_NAME
+function deployClaimKey(pending, target) {
+  return DEPLOY_PIPELINE_NAME && target.pipeline === DEPLOY_PIPELINE_NAME
     ? `dp${hashToken(pending.token)}`
     : `dp${hashToken(`${target.pipeline} ${pending.token}`)}`;
+}
+
+/**
+ * Atomically claim a deploy approval for notification, keyed by deployClaimKey().
+ * Returns { key, ... } on first claim, false if the row already exists. The DDB
+ * row stores the pipeline/region/repo/stage/action/token the button callback
+ * needs, since callback_data can't carry the token itself — plus, since
+ * TEAM-4663, claimedAt (phase 1) and the executionId the wait belongs to.
+ */
+async function claimDeployApproval(pending, target, key) {
   try {
     await ddb.send(new PutItemCommand({
       TableName: PENDING_TABLE,
@@ -2813,7 +3975,13 @@ async function claimDeployApproval(pending, target) {
         stageName: { S: pending.stageName },
         actionName: { S: pending.actionName },
         token: { S: pending.token },
-        ttl: { N: String(Math.floor(Date.now() / 1000) + 7 * 86400) },
+        ttl: { N: String(Math.floor(Date.now() / 1000) + DEPLOY_CLAIM_TTL_SEC) },
+        // TEAM-4663 phase 1 (see the two-phase claim block near claimKey), plus
+        // WHICH execution is waiting — the ping quotes it so a human can
+        // correlate with the console, and it is what makes the commit
+        // attribution execution-aware rather than "the newest Source revision".
+        claimedAt: { N: String(Date.now()) },
+        ...(pending.executionId ? { executionId: { S: pending.executionId } } : {}),
       },
       ConditionExpression: "attribute_not_exists(id)",
     }));
@@ -2822,6 +3990,38 @@ async function claimDeployApproval(pending, target) {
     if (err.name === "ConditionalCheckFailedException") return false;
     throw err;
   }
+}
+
+/**
+ * A claim row already exists for this wait — so what, if anything, do we send?
+ *   null                  nothing (a delivered ping inside its reminder window,
+ *                         a live lease, or an exhausted reminder budget)
+ *   {kind:"recovery"}     the row proves NOTHING was ever delivered and its lease
+ *                         expired — re-send the full ping (lease now ours)
+ *   {kind:"reminder", n}  a delivered ping the human hasn't actioned and the
+ *                         interval has passed — send reminder n of the budget
+ * Reminders are deploy-only by design: this is the one gate that stops an
+ * irreversible act, and unlike a review gate nothing else re-mints its id.
+ */
+async function decideDeployPingMode(id, now = Date.now()) {
+  const row = await getClaimRow(id);
+  if (!row) return null;   // TTL'd or actioned between the failed Put and here
+  if (await consultClaimForRecovery(id, {
+    ttlFallbackSec: DEPLOY_CLAIM_TTL_SEC, label: "deploy approval", row,
+  })) return { kind: "recovery" };
+  if (!row.deliveredAt?.N) return null;   // undelivered, but the lease is live
+
+  const pingCount = Number(row.pingCount?.N || "1");
+  const lastPingAt = Number(row.lastPingAt?.N || row.deliveredAt.N);
+  if (!Number.isFinite(lastPingAt) || !Number.isFinite(pingCount)) return null;
+  if (now - lastPingAt < DEPLOY_REPING_INTERVAL_MS) return null;
+  // pingCount 1 is the original ping, so reminders sent so far == pingCount - 1.
+  if (pingCount - 1 >= DEPLOY_REPING_MAX) return null;
+  if (!(await takeReminderSlot(id, {
+    seenLastPingAt: lastPingAt, seenCount: pingCount, nextCount: pingCount + 1, now,
+  }))) return null;
+  const claimedAt = claimedAtOf(row, DEPLOY_CLAIM_TTL_SEC);
+  return { kind: "reminder", n: pingCount, pendingMs: claimedAt == null ? null : now - claimedAt };
 }
 
 async function releaseDeployApproval(key) {
@@ -2861,9 +4061,26 @@ async function handleDeployApprovalCallback(cb, chatId, action, key) {
     item.Item.roleArn?.S || null,
     item.Item.externalId?.S || null,
   );
+  const pipelineName = item.Item.pipelineName.S;
+  const executionId = item.Item.executionId?.S || "";
+  // The ledger's tokenless key shape (SEC-9): this page has no gate ticket, only
+  // the claim row's pipeline + execution. Written BEFORE the pipeline call, for
+  // the same reason as the ticket-keyed half.
+  const ledgerRef = { pipeline: pipelineName, executionId };
+  // TEAM-4781 SR2: read the PRIOR decision before the write below stamps this
+  // tap's own over it. That ordering is the only way this page can tell "my own
+  // ❌ re-tap" from "a ❌ landing on a gate I already ✅'d", and both the marker
+  // and the wording below turn on the difference. null = no prior row, or a row
+  // from a build that wrote none: unknown, never assumed.
+  const priorDecision = await gateDecisionRecorded(ledgerRef);
+  await recordGateApproved(ledgerRef, { approve, chatId });
+  // Did CodePipeline refuse our call because the wait was already over? Hoisted
+  // because the closing edit's wording turns on it (TEAM-4781 SR2): only a call
+  // that actually LANDED lets this page claim it stopped the deploy.
+  let putAlreadyCompleted = false;
   try {
     await cp.send(new PutApprovalResultCommand({
-      pipelineName: item.Item.pipelineName.S,
+      pipelineName,
       stageName: item.Item.stageName.S,
       actionName: item.Item.actionName.S,
       token: item.Item.token.S,
@@ -2874,22 +4091,76 @@ async function handleDeployApprovalCallback(cb, chatId, action, key) {
     }));
   } catch (err) {
     // Token already consumed (approved elsewhere, or the wait timed out) →
-    // ApprovalAlreadyCompletedException. Report it and clear the claim.
-    await ddb.send(new DeleteItemCommand({
-      TableName: PENDING_TABLE, Key: { id: { S: `${DEPLOY_KEY_PREFIX}${key}` } },
-    })).catch(() => {});
-    await tgAnswer(cb.id, "Could not record — it may already be actioned.");
-    await tgEdit(chatId, cb.message.message_id,
-      `${cb.message.text}\n\n⚠️ ${esc(err.name || "Error")}: ${esc(err.message || "")}`.slice(0, 4000));
-    return;
+    // ApprovalAlreadyCompletedException.
+    //
+    // TEAM-4781: on a ❌ this is the shape of a RE-TAP of the very tap that
+    // rejected this execution, so the rejection already stands and the MARKER is
+    // the half that may still be missing. Fall through to the shared marker step
+    // below rather than bailing: dropping the claim row is what makes this page
+    // unactionable, and the row is the only thing left that can retry the marker.
+    //
+    // TEAM-4781 SR2: unless the prior row says we ✅'d it. Then this is the
+    // opposite decision on a gate this page already approved, not a re-tap of a
+    // rejection, and neither the marker nor a "deploy stopped" edit would be true.
+    const alreadyRejected =
+      !approve && APPROVAL_ALREADY_RE.test(`${err.name || ""} ${err.message || ""}`);
+    if (alreadyRejected && priorDecision === "Approved") {
+      console.warn(`[telegram-bug-intake] tokenless deploy gate on ${pipelineName}: ❌ tap after our own recorded ✅ - no rejection marker`);
+      // The token is spent either way, so there is nothing left for this page to
+      // retry: drop the claim exactly as the success path does.
+      await ddb.send(new DeleteItemCommand({
+        TableName: PENDING_TABLE, Key: { id: { S: `${DEPLOY_KEY_PREFIX}${key}` } },
+      })).catch(() => {});
+      await tgAnswer(cb.id, "Already approved — nothing to reject.");
+      await tgEdit(chatId, cb.message.message_id,
+        `${cb.message.text}\n\n🚀 Already approved on the pipeline — this ❌ changed nothing.`.slice(0, 4000));
+      return;
+    }
+    if (!alreadyRejected) {
+      // Anything else: nothing was recorded, so clear the claim as before.
+      await ddb.send(new DeleteItemCommand({
+        TableName: PENDING_TABLE, Key: { id: { S: `${DEPLOY_KEY_PREFIX}${key}` } },
+      })).catch(() => {});
+      await tgAnswer(cb.id, "Could not record — it may already be actioned.");
+      await tgEdit(chatId, cb.message.message_id,
+        `${cb.message.text}\n\n⚠️ ${esc(err.name || "Error")}: ${esc(err.message || "")}`.slice(0, 4000));
+      return;
+    }
+    putAlreadyCompleted = true;
+    console.warn(`[telegram-bug-intake] tokenless deploy gate on ${pipelineName} was already rejected: ${err.message} — retrying the marker only`);
+  }
+  // SEC-1: record the REJECTION where the pipeline's own preapproval check looks,
+  // so a re-run of this commit cannot read a stale approval and skip the gate the
+  // human just closed. TEAM-4781: no longer best-effort — if the marker will not
+  // land, KEEP the claim row so this page's ❌ can retry it, and say so.
+  if (!approve) {
+    const marker = await writeShipRejection({
+      state: await cp.send(new GetPipelineStateCommand({ name: pipelineName })).catch(() => null),
+      cp, pipeline: pipelineName, executionId, chatId,
+    });
+    if (!marker.ok) {
+      await reportMissingRejectionMarker({ cb, chatId, ticketId: null, workflowId: null, marker });
+      return;
+    }
   }
   // One-shot: the token is now spent. Drop the claim so the row can't linger.
   await ddb.send(new DeleteItemCommand({
     TableName: PENDING_TABLE, Key: { id: { S: `${DEPLOY_KEY_PREFIX}${key}` } },
   })).catch(() => {});
   await tgAnswer(cb.id, approve ? "Deploy approved" : "Deploy rejected");
-  await tgEdit(chatId, cb.message.message_id,
-    `${cb.message.text}\n\n${approve ? "🚀 Approved — deploying to prod." : "🛑 Rejected — deploy stopped."}`);
+  // TEAM-4781 SR2: "deploy stopped" is a claim about what OUR call did, so only
+  // say it when our call landed, or when the prior ledger row proves the earlier
+  // tap that consumed the token was also ours and was also a ❌ (the re-tap that
+  // exists only to retry the marker). Otherwise the token was spent by a decision
+  // we cannot attribute - it may have been an approval - and the honest statement
+  // is that the gate is already actioned and the marker is recorded.
+  const weStoppedIt = !putAlreadyCompleted || priorDecision === "Rejected";
+  const verdict = approve
+    ? "🚀 Approved — deploying to prod."
+    : weStoppedIt
+      ? "🛑 Rejected — deploy stopped."
+      : "🛑 Already actioned on the pipeline — rejection marker recorded, so this commit cannot skip its deploy gate.";
+  await tgEdit(chatId, cb.message.message_id, `${cb.message.text}\n\n${verdict}`);
 }
 
 // ─── LLM structuring ─────────────────────────────────────────────────────────
@@ -3219,14 +4490,31 @@ async function tgCall(method, body) {
     body: JSON.stringify(body),
   });
   const data = await res.json().catch(() => ({}));
-  if (!data.ok) throw new Error(`Telegram ${method}: ${data.description || res.status}`);
+  if (!data.ok) {
+    const err = new Error(`Telegram ${method}: ${data.description || res.status}`);
+    // TEAM-4663: callers that must decide "retry differently" vs "give up" need
+    // the reason, not just a message string. Additive — nothing else reads these.
+    err.status = res.status;
+    err.description = data.description || "";
+    throw err;
+  }
   return data.result;
 }
 
 const tgSend = (chatId, text, extra = {}) =>
   tgCall("sendMessage", { chat_id: chatId, text, parse_mode: "Markdown", disable_web_page_preview: true, ...extra });
-const tgSendPlain = (chatId, text) =>
-  tgCall("sendMessage", { chat_id: chatId, text, disable_web_page_preview: true });
+const tgSendPlain = (chatId, text, extra = {}) =>
+  tgCall("sendMessage", { chat_id: chatId, text, disable_web_page_preview: true, ...extra });
+// Telegram failures a retry cannot fix: the chat is gone/blocked, or we are
+// being rate-limited (a second immediate send makes that worse). Anything
+// else — above all a legacy-Markdown "can't parse entities" 400 — is worth one
+// plain-text retry, because the alternative is a human never seeing the page.
+const HOPELESS_TG_ERROR =
+  /Too Many Requests|retry after|bot was blocked|chat not found|user is deactivated|deactivated|bot was kicked|have no rights/i;
+function hopelessTelegramError(err) {
+  return HOPELESS_TG_ERROR.test(`${err?.description || ""} ${err?.message || ""}`);
+}
+
 const tgEdit = (chatId, messageId, text, extra = {}) =>
   tgCall("editMessageText", { chat_id: chatId, message_id: messageId, text, ...extra });
 const tgAnswer = (cbId, text) => tgCall("answerCallbackQuery", { callback_query_id: cbId, text });

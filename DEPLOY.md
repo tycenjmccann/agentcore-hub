@@ -367,6 +367,13 @@ stage is now always a real failure:**
 `pipeline-artifacts/ship-approvals/*` for its role, and the ticket role's
 `s3:GetObject` cover over `completions/*`.
 
+**This PR (TEAM-4764) needs one of those handoff scripts re-run, plus a sweep-mode promotion:**
+
+| Command | Why |
+|---|---|
+| `PIPELINE_TOOLS_LAMBDA=agentcore-hub-pipeline-tools EVENTS_TABLE=agentcore-hub-events node deploy/setup-tickets-lambda.mjs` | the ticket twins now refuse an unbound `gate:ci-unavailable` at create time, but `setup-tickets-lambda.mjs` only attaches the `Pipeline___capabilities` invoke grant and the events-table `PutItem` grant — and only forwards those two env vars onto the Lambda — when they are set in the DEPLOYING shell. A bare re-run ships the new guard blind: it can create-time refuse on labels alone, but has no probe target and no journey-event sink |
+| `RECONCILE_SWEEP_MODE=enforce ./lambda/orchestrator/deploy.sh` | promotes the reconciliation sweep out of its dark `off` default once `shadow`'s `reconcile.would_*` / `would_watch_*` log lines look right — the W2/W3 human-gate watches never page before `enforce` is set |
+
 Runtime-image CD landed in PR 2 — a baked source change (persona tool code) now
 deploys automatically. Only runtime env / lifecycle / IAM / EFS changes (which
 need `UpdateFunctionConfiguration`-class perms the narrow roles lack) remain a

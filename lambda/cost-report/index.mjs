@@ -474,7 +474,9 @@ async function buildCard(workflowId, workflow, pricing, getCompletion = defaultG
       interventionsDetail,
       // kpiVersion 2: a dead or restarted session is an error even when nothing
       // raised — agent.retry (WM/manual restart) and agent.died (runtime end-of-turn
-      // detection) join agent.error. Before v2 a silent death scored errors=0.
+      // detection, TEAM-4739 — published INSTEAD of agent.error, so a run whose
+      // personas were killed mid-turn would otherwise report zero errors) join
+      // agent.error. Before v2 a silent death scored errors=0.
       errors: count("agent.error") + count("error") + count("agent.died") + count("agent.retry"),
       retries: count("agent.retry"),
       // kpiVersion 2: re-invocations by cause; only REWORK_KINDS feed reworkRounds.
