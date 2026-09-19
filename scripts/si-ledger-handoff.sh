@@ -31,6 +31,13 @@
 #   describe-table, get-function-configuration, get-harness,
 #   describe-express-gateway-service and simulate-principal-policy.
 #
+#   TEAM-4807: step 7 never counts a check it could not EVALUATE as passed. If
+#   simulate-principal-policy is unavailable, errors, or answers fewer actions than
+#   were asked, that is a ✗ and exit 1 under --apply — the grant was just applied,
+#   so a grant that cannot be verified is a failed handoff — and a counted ⚠ in dry
+#   run, whose summary then says "skipped … NOT verified" instead of claiming that
+#   all checks passed.
+#
 #   The harness and ECS env pushes are REPLACE-ALL, so an echoed command proves
 #   nothing about what the merge would contain. In dry run those two children are
 #   therefore INVOKED with their own --dry-run (they read the live env and print
@@ -61,8 +68,9 @@ for arg in "$@"; do
     --print-policies) MODE="print-policies" ;;
     -h|--help)
       # TEAM-4787: keep this range on the LAST header line — the F3 header grew by
-      # 8 lines and a stale range silently truncates the help text.
-      sed -n '2,53p' "$0"
+      # 8 lines and a stale range silently truncates the help text. TEAM-4807 grew it
+      # by 7 more (53 → 60) and pins the range with a --help test.
+      sed -n '2,60p' "$0"
       exit 0 ;;
     *)
       echo "ERROR: unknown argument '$arg' (expected --dry-run, --apply or --print-policies)" >&2
@@ -139,6 +147,11 @@ fi
 
 # ─── plumbing ────────────────────────────────────────────────────────────────
 FAILURES=0
+# TEAM-4807: a check that could not be EVALUATED is not a check that passed. In dry
+# run the grants are not expected to exist yet, so "could not tell" is a warning and
+# not a failure — but the summary has to COUNT it, or "✓ all checks passed" means
+# nothing. FAILURES was the only counter, which is what made F5 silent.
+WARNINGS=0
 step() { printf '\n── %s\n' "$*"; }
 
 # Execute in --apply, print in --dry-run. Every mutation goes through this.
@@ -296,21 +309,50 @@ else
   FAILURES=$((FAILURES + 1))
 fi
 
+# TEAM-4807: the one place that decides what "could not verify" means. --apply has
+# just applied the grant, so a grant it cannot verify is a failed handoff — fatal,
+# exactly like a wrong decision. Dry run has not applied it yet, so the same condition
+# is a counted warning. Keeping that split here means the callers below cannot drift.
+unverified() {
+  local ROLE="$1" WHY="$2" RC="${3:-0}" DETAIL="${4:-}" SUFFIX=""
+  [ "$RC" != "0" ] && SUFFIX=" [rc ${RC}]"
+  [ -n "$DETAIL" ] && SUFFIX="${SUFFIX} ${DETAIL}"
+  if [ "$MODE" = "apply" ]; then
+    echo "   ✗ ${ROLE}: ${WHY} — not verified after --apply${SUFFIX}"
+    FAILURES=$((FAILURES + 1))
+  else
+    echo "   ⚠ ${ROLE}: ${WHY}${SUFFIX}"
+    WARNINGS=$((WARNINGS + 1))
+  fi
+  return 0
+}
+
 simulate() {
   local ROLE="$1" EXPECT="$2" RESOURCE="$3"; shift 3
-  local OUT
+  # Declare, then assign on its own line: `local OUT="$(aws …)"` puts the status of
+  # `local` in $?, not the CLI's, and would re-open the hole TEAM-4807 closes.
+  local OUT ERRF DETAIL SEEN MISSING RC=0
+  ERRF="$(mktemp)"
+  # shellcheck disable=SC2064
+  trap "rm -f '$ERRF'" RETURN
   OUT="$(aws iam simulate-principal-policy \
     --policy-source-arn "arn:aws:iam::${ACCOUNT_ID}:role/${ROLE}" \
     --action-names "$@" \
     --resource-arns "$RESOURCE" \
     --region "$AWS_REGION" \
-    --query 'EvaluationResults[].[EvalActionName,EvalDecision]' --output text 2>/dev/null || true)"
+    --query 'EvaluationResults[].[EvalActionName,EvalDecision]' --output text 2>"$ERRF")" || RC=$?
+  # The last stderr line, so AccessDenied (grant iam:SimulatePrincipalPolicy) and
+  # ThrottlingException (just retry) stay distinguishable now that this can exit 1.
+  DETAIL="$(tail -n 1 "$ERRF" 2>/dev/null || true)"
   if [ -z "$OUT" ]; then
-    echo "   ⚠ ${ROLE}: simulate-principal-policy unavailable (needs iam:SimulatePrincipalPolicy)"
+    unverified "$ROLE" \
+      "simulate-principal-policy unavailable (needs iam:SimulatePrincipalPolicy)" "$RC" "$DETAIL"
     return 0
   fi
+  SEEN=""
   while read -r ACTION DECISION; do
     [ -z "${ACTION:-}" ] && continue
+    SEEN="${SEEN} ${ACTION}"
     if [ "$DECISION" = "$EXPECT" ]; then
       echo "   ✓ ${ROLE}: ${ACTION} → ${DECISION}"
     else
@@ -318,6 +360,19 @@ simulate() {
       FAILURES=$((FAILURES + 1))
     fi
   done <<< "$OUT"
+  # Every requested action must come back with a decision. A truncated answer was the
+  # quietest failure in step 7: OUT is non-empty, so there was no ⚠ and no ✗ at all
+  # and the summary still said "all checks passed".
+  MISSING=""
+  for ACTION in "$@"; do
+    case " ${SEEN} " in
+      *" ${ACTION} "*) ;;
+      *) MISSING="${MISSING}${MISSING:+,}${ACTION}" ;;
+    esac
+  done
+  [ -n "$MISSING" ] && unverified "$ROLE" \
+    "simulate-principal-policy returned no verdict for ${MISSING}" "$RC" "$DETAIL"
+  return 0
 }
 
 simulate "$HARNESS_ROLE" allowed "$LEDGER_ARN" \
@@ -417,13 +472,21 @@ print(env.get(sys.argv[1]) or "None")
 fi
 
 echo ""
-if [ "$FAILURES" -eq 0 ]; then
+if [ "$FAILURES" -eq 0 ] && [ "$WARNINGS" -eq 0 ]; then
   echo "✓ all checks passed"
 elif [ "$MODE" = "apply" ]; then
+  # WARNINGS is 0 here by construction — unverified() counts a warning only outside
+  # --apply — so this line and its exit code are unchanged from before TEAM-4807.
   echo "✗ ${FAILURES} check(s) failed after --apply — see above" >&2
   exit 1
+elif [ "$FAILURES" -eq 0 ]; then
+  # TEAM-4807 / F5: this used to print "✓ all checks passed" over an account where not
+  # one IAM grant had actually been evaluated.
+  echo "⚠ ${WARNINGS} check(s) skipped (simulate-principal-policy unavailable or incomplete) — NOT verified"
 else
-  echo "ℹ ${FAILURES} check(s) not satisfied yet — expected before --apply"
+  SKIPPED=""
+  [ "$WARNINGS" -gt 0 ] && SKIPPED=" (+ ${WARNINGS} skipped, NOT verified)"
+  echo "ℹ ${FAILURES} check(s) not satisfied yet — expected before --apply${SKIPPED}"
 fi
 
 if [ "$MODE" != "apply" ]; then

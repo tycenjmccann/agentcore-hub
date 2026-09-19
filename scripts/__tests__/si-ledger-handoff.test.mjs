@@ -30,9 +30,17 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { chmodSync, copyFileSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const REPO = fileURLToPath(new URL("../..", import.meta.url));
@@ -108,10 +116,32 @@ case "$ARGS" in
     echo '{"Table":{"TableName":"${TABLE}","TableStatus":"ACTIVE"}}' ;;
   "lambda get-function-configuration"*"Environment.Variables.SI_LEDGER_TABLE"*)
     # Honest: before --apply the env var is NOT there yet.
-    echo "None" ;;
+    #
+    # TEAM-4807: POST_APPLY=1 answers instead as the account looks AFTER a successful
+    # --apply, on all four env surfaces. That is what lets a test isolate step 7's IAM
+    # verdicts from its env checks — without it an --apply run exits 1 from the env
+    # checks regardless, and an assertion on the exit code would prove nothing.
+    if [ "\${POST_APPLY:-}" = 1 ]; then echo "${TABLE}"; else echo "None"; fi ;;
   "lambda get-function-configuration"*"Environment.Variables"*)
-    echo '{"EXISTING_KEY":"keep"}' ;;
+    if [ "\${POST_APPLY:-}" = 1 ]; then
+      echo '{"EXISTING_KEY":"keep","SI_LEDGER_TABLE":"${TABLE}"}'
+    else
+      echo '{"EXISTING_KEY":"keep"}'
+    fi ;;
   "iam simulate-principal-policy"*)
+    # TEAM-4807: SIM_MODE drives the answers simulate() has to cope with. Unset —
+    # i.e. every test written before TEAM-4807 — is the full, resource-aware answer
+    # below, so those tests see exactly the behaviour they always saw.
+    case "\${SIM_MODE:-full}" in
+      empty)
+        # rc 0 and not one row. THE F5 trigger: an empty OUT used to mean "pass".
+        exit 0 ;;
+      denied)
+        # What a real denial looks like: a message on stderr and a non-zero exit.
+        # The old redirect-plus-|| true ate both.
+        echo "An error occurred (AccessDenied) when calling the SimulatePrincipalPolicy operation" >&2
+        exit 255 ;;
+    esac
     # Echo back one "<action>\\t<decision>" row per requested action, so the
     # script's own parsing is exercised. Writes are denied for the coding role,
     # and so is any table outside HubLiveVerifyRead's allow-list.
@@ -146,7 +176,17 @@ case "$ARGS" in
             *table/agentcore-hub-cloud-code-sessions*|*table/agentcore-hub-routines*|*table/agentcore-hub-anomaly-watcher-state*|*table/agentcore-hub-eval-seen*) DECISION=implicitDeny ;;
           esac ;;
       esac
+      # TEAM-4807: one role answers wrongly, so the ✗-on-mismatch path can be pinned
+      # on its own without disturbing the other roles' verdicts.
+      case "\${SIM_MODE:-full}" in
+        mismatch-harness) case "$SRC" in *harness-role) DECISION=implicitDeny ;; esac ;;
+      esac
       printf '%s\\t%s\\n' "$a" "$DECISION"
+      # A truncated answer: fewer verdicts than actions requested. Written as an if,
+      # NOT as a test-and-break one-liner — as the loop body's last statement that
+      # leaves the stub's exit status at 1 whenever the condition is false, which
+      # simulate() would then report as a failed CLI call. An untaken if returns 0.
+      if [ "\${SIM_MODE:-full}" = partial ]; then break; fi
     done ;;
   "iam put-role-policy"*)
     # TEAM-4787 F2: the last call an IAM_ONLY=1 deploy is allowed to make. Answering
@@ -163,14 +203,18 @@ case "$ARGS" in
   "bedrock-agentcore-control get-harness"*)
     # Honest: before --apply the harness env has no SI_LEDGER_TABLE yet (same shape
     # as the lambda get-function-configuration answer above).
-    echo "None" ;;
+    if [ "\${POST_APPLY:-}" = 1 ]; then echo "${TABLE}"; else echo "None"; fi ;;
   "ecs list-services"*)
     echo '{"serviceArns":["arn:aws:ecs:${REGION}:${ACCOUNT}:service/default/agentcore-hub"]}' ;;
   "ecs describe-express-gateway-service"*)
     # A LIVE-shaped container: a real image, an int containerPort and a non-empty
     # environment, because ecs-express/set-env.sh fails closed on any of those being
     # absent (set-env.sh:72-73). SI_LEDGER_TABLE is deliberately not in it yet.
-    echo '{"service":{"activeConfigurations":[{"primaryContainer":{"image":"stub:latest","containerPort":3000,"environment":[{"name":"EXISTING_KEY","value":"keep"}]}}]}}' ;;
+    if [ "\${POST_APPLY:-}" = 1 ]; then
+      echo '{"service":{"activeConfigurations":[{"primaryContainer":{"image":"stub:latest","containerPort":3000,"environment":[{"name":"EXISTING_KEY","value":"keep"},{"name":"SI_LEDGER_TABLE","value":"${TABLE}"}]}}]}}'
+    else
+      echo '{"service":{"activeConfigurations":[{"primaryContainer":{"image":"stub:latest","containerPort":3000,"environment":[{"name":"EXISTING_KEY","value":"keep"}]}}]}}'
+    fi ;;
   *)
     echo "STUB: unsupported aws call: $ARGS" >&2
     exit 64 ;;
@@ -228,6 +272,72 @@ function stubEnv(stub, extra = {}) {
 function runHandoff(args, extra = {}) {
   const stub = makeStub();
   const r = spawnSync("bash", [HANDOFF, ...args], {
+    cwd: REPO,
+    env: stubEnv(stub, extra),
+    encoding: "utf8",
+    timeout: 120_000,
+  });
+  const calls = existsSync(stub.log) ? readFileSync(stub.log, "utf8") : "";
+  return { ...r, calls };
+}
+
+// ── driving --apply as far as step 7 ────────────────────────────────────────
+// TEAM-4807. --apply cannot be run against the real tree: step 2 runs the real
+// setup-workflow-manager.mjs and step 4 runs set-harness-env.mjs WITHOUT --dry-run,
+// and both reach AWS through the SDK — which the stubbed `aws` cannot intercept — so
+// the script set -e-aborts long before step 7. But it derives every child from
+// REPO_ROOT = dirname($0)/.. (si-ledger-handoff.sh:73), so a temp tree holding a COPY
+// of the script plus one trivial stub per child runs the REAL step 7 verbatim. That
+// keeps the production script free of any knob that exists only for tests.
+//
+// deploy/config.sh is the real one, so ACCOUNT_ID / LAMBDA_ROLE_ARN / ARTIFACT_BUCKET
+// derive exactly as in production — and because it resolves .env.local relative to its
+// own copy (config.sh:13), the copy in a temp tree can never find a developer's, so
+// unlike the tests above these need no envLocalSkip.
+const FAKE_CHILDREN = [
+  "deploy/workflow-manager/setup-workflow-manager.mjs",
+  "deploy/workflow-manager/set-harness-env.mjs",
+  "deploy/workflow-manager/deploy.sh",
+  "deploy/continuous-improvement/deploy.sh",
+  "deploy/coding-agent-runtime/setup-coding-runtime-role.sh",
+  "deploy/ecs-express/set-env.sh",
+  "scripts/si-ledger-backfill.mjs",
+];
+
+function makeFakeRepo() {
+  const dir = mkdtempSync(join(tmpdir(), "si-handoff-apply-"));
+  mkdirSync(join(dir, "scripts"), { recursive: true });
+  mkdirSync(join(dir, "deploy"), { recursive: true });
+  copyFileSync(HANDOFF, join(dir, "scripts/si-ledger-handoff.sh"));
+  copyFileSync(join(REPO, "deploy/config.sh"), join(dir, "deploy/config.sh"));
+  for (const rel of FAKE_CHILDREN) {
+    const dest = join(dir, rel);
+    mkdirSync(dirname(dest), { recursive: true });
+    // .mjs children are invoked as `node <path>`, .sh as `bash <path>`. A bash-shebang
+    // stub handed to node is a SyntaxError, which would abort step 2 under set -e.
+    writeFileSync(
+      dest,
+      rel.endsWith(".mjs")
+        ? `console.log("   [stub ${rel} " + process.argv.slice(2).join(" ") + "]");\n`
+        : `#!/usr/bin/env bash\necho "   [stub ${rel} $*]"\nexit 0\n`,
+    );
+    chmodSync(dest, 0o755);
+  }
+  // Self-maintaining: every ${REPO_ROOT}/… path the script dereferences has to exist
+  // here, so a child added to the script fails with THIS message rather than as a
+  // confusing set -e abort halfway through an --apply.
+  const referenced = new Set(
+    [...readFileSync(HANDOFF, "utf8").matchAll(/\$\{REPO_ROOT\}\/([\w./-]+)/g)].map((m) => m[1]),
+  );
+  for (const rel of referenced) {
+    assert.ok(existsSync(join(dir, rel)), `fake repo is missing ${rel} — add it to FAKE_CHILDREN`);
+  }
+  return join(dir, "scripts/si-ledger-handoff.sh");
+}
+
+function runApply(extra = {}) {
+  const stub = makeStub();
+  const r = spawnSync("bash", [makeFakeRepo(), "--apply"], {
     cwd: REPO,
     env: stubEnv(stub, extra),
     encoding: "utf8",
@@ -501,6 +611,138 @@ test("dry run really probes the replace-all env surfaces, and step 7 verifies al
     /(update-harness|update-express-gateway-service|update-function-configuration|put-role-policy|create-table)/,
     `the dry-run probes mutated something:\n${r.calls}`,
   );
+});
+
+// ── 3b. TEAM-4807 / F5 — a check that returned no verdict is not a check that passed
+//
+// simulate() swallowed stderr AND exit status (`2>/dev/null || true`) and then treated
+// an empty answer as a pass: a ⚠ and `return 0`, never touching FAILURES. FAILURES was
+// the only counter the summary consulted, so a run in which all 16 IAM action verdicts
+// across 5 call sites went unevaluated printed "✓ all checks passed" and exited 0 — in
+// --apply as much as in dry run. That is a green handoff over an unverified account,
+// i.e. the TEAM-4770 failure (deployed but inert) with a tick next to it.
+//
+// The negative space matters as much as the assertions: these tests must NOT be
+// satisfiable by a script that merely prints a scarier warning. They pin the verdict
+// (✗ + exit 1 under --apply), the counting (a dry run can no longer claim success) and
+// the completeness (each requested action needs its own verdict).
+
+test("a simulate with NO verdict does not let a dry run claim success", { skip: envLocalSkip }, () => {
+  const r = runHandoff(["--dry-run"], { SIM_MODE: "empty", POST_APPLY: "1" });
+  assert.equal(r.status, 0, `exit ${r.status}\n${r.stdout}\n${r.stderr}`);
+
+  // The hint an operator actually acts on has to survive the fix.
+  assert.match(
+    r.stdout,
+    /⚠ agentcore-hub-harness-role: simulate-principal-policy unavailable \(needs iam:SimulatePrincipalPolicy\)/,
+    `the iam:SimulatePrincipalPolicy hint was lost:\n${r.stdout}`,
+  );
+  // Every env surface is satisfied here, so FAILURES=0 — and that is exactly when the
+  // old summary claimed success over an account with zero verified grants.
+  assert.doesNotMatch(
+    r.stdout,
+    /all checks passed/,
+    `a run that evaluated 0 of 16 IAM verdicts still claimed success:\n${r.stdout}`,
+  );
+  assert.match(r.stdout, /check\(s\) skipped/, `the skipped checks were not counted:\n${r.stdout}`);
+  assert.match(r.stdout, /NOT verified/, `the summary does not say the checks are unverified:\n${r.stdout}`);
+  // Still a dry run.
+  assert.doesNotMatch(r.calls, /(put-role-policy|create-table|update-function-configuration)/);
+});
+
+test("--apply FAILS when a grant cannot be verified", () => {
+  const r = runApply({ SIM_MODE: "empty", POST_APPLY: "1" });
+  assert.equal(r.status, 1, `expected exit 1, got ${r.status}\n${r.stdout}\n${r.stderr}`);
+
+  // --apply has just applied the grant, so "cannot tell" is a failed handoff, not a
+  // warning — and the hint is still there to say what to do about it.
+  assert.match(
+    r.stdout,
+    /✗ agentcore-hub-harness-role: simulate-principal-policy unavailable \(needs iam:SimulatePrincipalPolicy\) — not verified after --apply/,
+    `--apply did not fail the unverifiable harness-role grant:\n${r.stdout}`,
+  );
+  // One per simulate() call site: harness, coding-runtime ×3, lambda-role.
+  assert.match(`${r.stdout}${r.stderr}`, /✗ 5 check\(s\) failed after --apply/);
+  assert.doesNotMatch(r.stdout, /all checks passed/);
+
+  // The fake children absorb the mutations, so --apply reaches step 7 without the stub
+  // seeing a single write — its `exit 64` catch-all stays armed for the whole run.
+  assert.doesNotMatch(
+    r.calls,
+    /(put-role-policy|create-table|update-function-configuration|update-harness|update-express-gateway-service)/,
+    `--apply mutated something through the stub:\n${r.calls}`,
+  );
+});
+
+test("--apply says WHY it could not verify, so AccessDenied and throttling differ", () => {
+  const r = runApply({ SIM_MODE: "denied", POST_APPLY: "1" });
+  assert.equal(r.status, 1, `expected exit 1, got ${r.status}\n${r.stdout}\n${r.stderr}`);
+  assert.match(r.stdout, /✗ agentcore-hub-harness-role: simulate-principal-policy unavailable/);
+  // `|| true` swallowed the status and `2>/dev/null` the message. Now that this exits
+  // 1, "grant the permission" and "just retry" have to be tellable apart.
+  assert.match(r.stdout, /\[rc 255\]/, `the CLI's exit status was swallowed:\n${r.stdout}`);
+  assert.match(r.stdout, /AccessDenied/, `the CLI's stderr was swallowed:\n${r.stdout}`);
+});
+
+test("a PARTIAL simulate answer is not a pass, and names the actions with no verdict", { skip: envLocalSkip }, () => {
+  // Quieter than F5 itself: OUT is non-empty, so there was no ⚠ AND no ✗ — 11 of 16
+  // verdicts simply vanished under a clean "✓ all checks passed".
+  const dry = runHandoff(["--dry-run"], { SIM_MODE: "partial", POST_APPLY: "1" });
+  assert.equal(dry.status, 0, `exit ${dry.status}\n${dry.stdout}\n${dry.stderr}`);
+  assert.doesNotMatch(
+    dry.stdout,
+    /all checks passed/,
+    `a truncated simulate answer still claimed success:\n${dry.stdout}`,
+  );
+  assert.match(
+    dry.stdout,
+    /⚠ agentcore-hub-harness-role: simulate-principal-policy returned no verdict for dynamodb:GetItem,dynamodb:Query,dynamodb:Scan,dynamodb:PutItem,dynamodb:UpdateItem/,
+    `the unanswered actions were not named:\n${dry.stdout}`,
+  );
+  // The one action that WAS answered still gets its own verdict — a partial answer
+  // must not throw away the part that arrived.
+  assert.match(dry.stdout, /✓ agentcore-hub-harness-role: dynamodb:DescribeTable → allowed/);
+  // Three multi-action call sites were short-changed; the two single-action negatives
+  // were answered in full.
+  assert.match(dry.stdout, /⚠ 3 check\(s\) skipped/);
+
+  const r = runApply({ SIM_MODE: "partial", POST_APPLY: "1" });
+  assert.equal(r.status, 1, `expected exit 1, got ${r.status}\n${r.stdout}\n${r.stderr}`);
+  assert.match(`${r.stdout}${r.stderr}`, /✗ 3 check\(s\) failed after --apply/);
+});
+
+// The mismatch path was already correct at b399ae3 — no test covered it under --apply,
+// which is how a fix to the empty path could have broken it unnoticed.
+test("--apply FAILS on a mismatching decision", () => {
+  const r = runApply({ SIM_MODE: "mismatch-harness", POST_APPLY: "1" });
+  assert.match(
+    r.stdout,
+    /✗ agentcore-hub-harness-role: dynamodb:Scan → implicitDeny \(expected allowed\)/,
+    `a wrong decision was not reported:\n${r.stdout}`,
+  );
+  assert.equal(r.status, 1, `expected exit 1, got ${r.status}\n${r.stdout}\n${r.stderr}`);
+  // Exactly the harness role's six actions — the other roles still verify normally, so
+  // "unverifiable" and "wrong" stay separate verdicts rather than one blanket failure.
+  assert.match(`${r.stdout}${r.stderr}`, /✗ 6 check\(s\) failed after --apply/);
+  assert.match(r.stdout, /✓ agentcore-hub-lambda-role: dynamodb:Scan → allowed/);
+  assert.doesNotMatch(r.stdout, /check\(s\) skipped/, "a wrong decision was miscounted as skipped");
+});
+
+// TEAM-4787 left the range comment at si-ledger-handoff.sh:63-65 because a stale
+// `sed -n '2,Np'` truncates --help silently. TEAM-4807 grew the header again, so pin it.
+test("--help still prints the whole header", () => {
+  const r = runHandoff(["--help"]);
+  assert.equal(r.status, 0, `exit ${r.status}\n${r.stderr}`);
+  // First and last lines of the header block.
+  assert.match(r.stdout, /SI ledger handoff — apply the non-code surfaces of PR #637/);
+  assert.match(
+    r.stdout,
+    /tooling\.coding-role\.no-live-verify-access/,
+    "--help is truncated: the sed range no longer reaches the last header line",
+  );
+  // …and it documents when --apply now fails.
+  assert.match(r.stdout, /never counts a check it could not EVALUATE as passed/);
+  assert.doesNotMatch(r.stdout, /set -euo pipefail/, "--help spilled past the end of the header");
 });
 
 test("set-harness-env.mjs merges, and sends nothing but harnessId + environmentVariables", async () => {
