@@ -194,7 +194,8 @@
           "family": "assessment",
           "author": "agentcore_hub_security_reviewer",
           "reader": "dev agents",
-          "required": true
+          "required": false,
+          "note": "only when the requirements analyst selected the security reviewer (auth, credentials or user data involved)"
         },
         {
           "key": "compliance-review.md",

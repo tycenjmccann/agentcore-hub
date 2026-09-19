@@ -45,7 +45,7 @@ Writing standard: **enforced** (the Lambda lints every templated markdown delive
 | requirements | Spec (playbook) | `spec.md` | spec | requirements_analyst | designers, dev agents, Product Owner | no | own contract |  | playbook only; exact sections defined in requirements-analyst.md P1; mirrored from the repo artifact chain |
 | design | Design doc (one per designer) | `design-doc-*.md` | spec | frontend_designer, backend_designer, ios_designer, android_designer, legal_compliance | dev agents, Engineer (Plan Approval) | yes | `template-spec` | Plan Approval | any markdown saved with save_design_doc; filename is the doc title slug |
 | design | Plan Approval package (one per designer) | `review-package-design.*.json` | brief | frontend_designer, backend_designer, ios_designer, android_designer, legal_compliance | Plan Approval reviewer (Telegram ping) | no | `review-package` | Plan Approval | only when the Plan Approval gate is flagged |
-| design | Security review | `security-review.md` | assessment | security_reviewer | dev agents | yes | `template-assessment` |  |  |
+| design | Security review | `security-review.md` | assessment | security_reviewer | dev agents | no | `template-assessment` |  | only when the requirements analyst selected the security reviewer (auth, credentials or user data involved) |
 | design | Compliance review | `compliance-review.md` | assessment | legal_compliance | dev agents | no | `template-assessment` |  |  |
 | design | Analytics spec | `analytics-spec.md` | spec | analytics_designer | dev agents | no | `template-spec` |  |  |
 | design | Localization spec | `localization-spec.md` | spec | localization | dev agents | no | `template-spec` |  |  |
