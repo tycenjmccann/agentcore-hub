@@ -303,6 +303,55 @@ describe("contractLabels / sanitizeUserLabels / escapeJql agree across copies", 
     expect(unknownKind.error).toContain("spawned_by.kind");
   });
 
+  it("the GATE kinds agree, and gateKindsOf reads both label spellings (TEAM-4739)", () => {
+    expect(agree("GATE_KINDS", (m) => m.GATE_KINDS)).toEqual([
+      "approval",
+      "deploy-approval",
+      "blocker",
+      "ci-unavailable",
+      "awaiting-console",
+      "loop-broken",
+    ]);
+
+    // Agents write `gate:x`; sanitizeUserLabels rewrites it to `gate-x`. Both are
+    // the SAME gate, and every reader in the system is /^gate[:-]…$/ for that
+    // reason — a reader that saw only one spelling would let a gate close unchecked.
+    expect(agree("colon", (m) => m.gateKindsOf(["gate:deploy-approval"]))).toEqual([
+      "deploy-approval",
+    ]);
+    expect(agree("hyphen", (m) => m.gateKindsOf(["gate-deploy-approval"]))).toEqual([
+      "deploy-approval",
+    ]);
+    // Deduped, and always in GATE_KINDS order regardless of label order.
+    expect(
+      agree("both spellings + order", (m) =>
+        m.gateKindsOf(["gate-blocker", "GATE:APPROVAL", "gate:blocker"])
+      )
+    ).toEqual(["approval", "blocker"]);
+    expect(agree("string form", (m) => m.gateKindsOf("gate:blocker, needs-docs"))).toEqual([
+      "blocker",
+    ]);
+
+    // Not gate kinds: the human review gates intake materializes (`gate:<slug>`
+    // from a reviewGates entry) must NOT be swept into the typed-gate guard.
+    expect(agree("review gate slug", (m) => m.gateKindsOf(["gate:merge-approval"]))).toEqual([]);
+    expect(agree("prefixed", (m) => m.gateKindsOf(["gate:approval-2", "xgate:approval"]))).toEqual([]);
+    expect(agree("empty", (m) => m.gateKindsOf(undefined))).toEqual([]);
+    expect(agree("junk", (m) => m.gateKindsOf([null, 7, "  "]))).toEqual([]);
+  });
+
+  it("does NOT export the twin-only gate contract (gate-contract.mjs is not here)", () => {
+    // fix-contract.mjs is import-free and lives in THREE zips; the probe/journey/
+    // console-link half of the gate contract does I/O and lives only in the two
+    // ticket Lambdas. Keeping the split explicit stops the orchestrator from
+    // growing a probe seam by accident (DL-009).
+    for (const [name, mod] of MODULES) {
+      for (const forbidden of ["invokeProbe", "publishJourneyEvent", "consoleApprovalUrl", "gateLoopVerdict"]) {
+        expect(mod[forbidden], `${name} should not export ${forbidden}`).toBeUndefined();
+      }
+    }
+  });
+
   it("the kind lists themselves agree (the parity guard's subject)", () => {
     expect(agree("FIX_KINDS", (m) => m.FIX_KINDS)).toEqual([
       "review_fix",

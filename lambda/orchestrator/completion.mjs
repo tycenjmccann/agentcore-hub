@@ -56,6 +56,44 @@ export const REWORK_FIX_KINDS = new Set(["review_fix", "qa_fix", "codex_fix", "s
 export const SHIP_BLOCKED_OUTCOMES = ["deploy-blocked", "static-ci-only"];
 
 /**
+ * TEAM-4763 P1-A — the ship outcomes the orchestrator's evidence harvest may
+ * carry onto an agentTasks entry, decided HERE beside shipVerdictOf because
+ * admitting a value and knowing what it means are one decision. They had drifted
+ * apart: `handoff` was writable by report_completion (workflow-output
+ * SHIP_OUTCOMES) and admitted by nothing, so the harvest dropped it, shipVerdictOf
+ * saw no outcome at all, and a run that honestly handed its PR to another team
+ * closed on the static-ci-only terminal phase.
+ */
+export const HARVESTED_SHIP_OUTCOMES = Object.freeze([
+  ...SHIP_BLOCKED_OUTCOMES,
+  "shipped",
+  "empty_sweep",
+  "handoff",
+]);
+
+/**
+ * Normalize a completion record's raw `outcome` for the harvest: the trimmed,
+ * lowercased value when this reader can classify it, else null. A garbage or
+ * future-schema outcome is DROPPED rather than stored, so the ship gate can never
+ * trust a verdict nobody defined — a closed set, on purpose.
+ */
+export function harvestableShipOutcome(value) {
+  if (typeof value !== "string") return null;
+  const outcome = value.trim().toLowerCase();
+  return HARVESTED_SHIP_OUTCOMES.includes(outcome) ? outcome : null;
+}
+
+/**
+ * TEAM-4763 P1-A — the verdicts that SATISFY the D2 ship gate. "shipped" proves
+ * the work landed; "handoff" proves it was delivered to another team to land,
+ * which DL-030 already makes the agent prove with a PR URL (report_completion
+ * refuses outcome:"handoff" without one). Both are positive, agent-declared
+ * evidence in the DL-028 sense — this gate exists to catch SILENCE, not an honest
+ * handoff — so neither closes the run on a blocked terminal phase.
+ */
+export const SHIP_SATISFIED_VERDICTS = Object.freeze(["shipped", "handoff"]);
+
+/**
  * TEAM-3755 F2 — the ONE list of phases a run can already be closed on. Every
  * terminal-claim CAS must refuse ALL of them, or a later write can overwrite an
  * earlier honest verdict.
@@ -438,6 +476,9 @@ export function isWorkflowComplete(children, wfDef, opts = {}) {
  *                        proves the work landed.
  *   <a SHIP_BLOCKED_OUTCOMES value> → the agent recorded an EXPLICIT terminal
  *                        block ("deploy-blocked" / "static-ci-only").
+ *   "handoff"          → TEAM-4763 P1-A: the work was delivered to another team to
+ *                        land, so the PR is OPEN, not merged. Satisfies the gate
+ *                        (SHIP_SATISFIED_VERDICTS) without ever being a merge.
  *   null               → neither: a phantom green close (CI may be green, but
  *                        nothing merged/deployed and no block was declared).
  *
@@ -449,11 +490,24 @@ export function shipVerdictOf(entry) {
   if (!entry || typeof entry !== "object") return null;
   const outcome = typeof entry.outcome === "string" ? entry.outcome.trim().toLowerCase() : "";
   if (SHIP_BLOCKED_OUTCOMES.includes(outcome)) return outcome;
+  // TEAM-4763 P1-A: a handoff is its OWN verdict, deliberately NOT an alias for
+  // "shipped" — the work is delivered but nothing merged, and mapping it to
+  // "shipped" would make deliveryRollUp derive prState "merged" for a PR that is
+  // still open (workflow-output's derivePrState calls the same PR "open").
+  if (outcome === "handoff") return "handoff";
   // A merge commit is the ONLY harvested field that proves the work landed.
   // commitSha is NOT consulted (see the F1 note above) — it is the unmerged
   // branch HEAD and is present on every completion record.
   const merged = typeof entry.mergeCommit === "string" && entry.mergeCommit.trim().length > 0;
-  if (merged || outcome === "shipped") return "shipped";
+  // TEAM-4739 / TEAM-4740 FR-10: `empty_sweep` is "there was nothing to merge",
+  // and that is a SHIPPED run, not a blocked one. A sweep that found nothing to
+  // remove has provably nothing to merge, so "shipped" is the HONEST verdict for
+  // it, not a missing one. It is deliberately NOT in SHIP_BLOCKED_OUTCOMES: an
+  // honest empty sweep has nothing left to do, so closing it "static-ci-only"
+  // would file it under unfinished work forever and page a human about a run
+  // that succeeded. The alternative the sweeper used before this existed was
+  // worse - close dishonestly, or wedge.
+  if (merged || outcome === "shipped" || outcome === "empty_sweep") return "shipped";
   return null;
 }
 
@@ -469,6 +523,13 @@ export function shipVerdictOf(entry) {
  *                  block, else "static-ci-only" (green but nothing merged).
  *     blockReason: first recorded block reason (null if none).
  *     offenders:   [{ ticketId, phase, verdict }] — ship tickets missing a verdict.
+ *     handoff:     TEAM-4768 — the run is shipped PURELY by handoff: every inspected
+ *                  ship ticket said "handoff" and none said "shipped", so nothing
+ *                  here ever claimed a merge. The merge-verify probe reads this to
+ *                  know it has no claim to cross-check (a handoff's PR is open by
+ *                  definition, which the probe would otherwise call "provably
+ *                  unmerged" and refuse the run over). `shipped` alone cannot answer
+ *                  that question — it is true for a merge and a handoff alike.
  *   }
  *
  * Mirrors the "only tightens when it can prove" discipline of
@@ -479,7 +540,7 @@ export function shipVerdictOf(entry) {
  */
 export function evaluateShipVerdict(children, agentTasks, shipPhases, opts = {}) {
   const phases = shipPhases instanceof Set ? shipPhases : new Set(shipPhases || []);
-  const inert = { required: false, shipped: true, outcome: null, blockReason: null, offenders: [] };
+  const inert = { required: false, shipped: true, handoff: false, outcome: null, blockReason: null, offenders: [] };
   if (!Array.isArray(children) || phases.size === 0) return inert;
 
   const getAgentPhase = opts.getAgentPhase || (() => undefined);
@@ -504,12 +565,15 @@ export function evaluateShipVerdict(children, agentTasks, shipPhases, opts = {})
 
   let blocked = null;
   let blockReason = null;
+  let handoffs = 0;
   const offenders = [];
   for (const t of shipTickets) {
     const ticketId = String(t.ticketId || "");
     const entry = tasks[ticketId] || byTicketId.get(ticketId);
     const verdict = shipVerdictOf(entry);
-    if (verdict === "shipped") continue;
+    // TEAM-4763 P1-A: "handoff" satisfies the gate alongside "shipped" — see
+    // SHIP_SATISFIED_VERDICTS. Anything else (including null) is an offender.
+    if (SHIP_SATISFIED_VERDICTS.includes(verdict)) { if (verdict === "handoff") handoffs++; continue; }
     offenders.push({ ticketId, phase: phaseOf(t), verdict: verdict || "none" });
     // deploy-blocked outranks static-ci-only (an attempted+blocked deploy is the
     // more specific, more urgent verdict).
@@ -524,7 +588,61 @@ export function evaluateShipVerdict(children, agentTasks, shipPhases, opts = {})
   }
 
   if (offenders.length === 0) {
-    return { required: true, shipped: true, outcome: null, blockReason: null, offenders: [] };
+    // TEAM-4768: PURE handoff only. A run with one handoff beside one "shipped" DID
+    // claim a merge, so it is not exempt from the merge probe — every inspected
+    // ticket has to have handed off for there to be no claim to cross-check.
+    return { required: true, shipped: true, handoff: handoffs === shipTickets.length, outcome: null, blockReason: null, offenders: [] };
   }
-  return { required: true, shipped: false, outcome: blocked || "static-ci-only", blockReason, offenders };
+  return { required: true, shipped: false, handoff: false, outcome: blocked || "static-ci-only", blockReason, offenders };
+}
+
+/**
+ * TEAM-4740 FR-13 — the markers the follow-up materializer mints. The label
+ * filters; the title suffix is the only one a re-entrant scan can read back
+ * (list_tickets returns `summary`, not `labels`). Both exported so workflow-output
+ * and the parity test share these source strings.
+ */
+export const FOLLOWUP_LABEL_RE = /^followup-[0-9a-f]{8}$/;
+export const FOLLOWUP_TITLE_RE = /\[fu:([0-9a-f]{8})\]\s*$/;
+
+/**
+ * TEAM-4740 FR-13/FR-14 — pure roll-up for the orchestrator's ONE setDelivery
+ * write. Returns `{}` (never undefined) so it is spread-safe, and adds no key it
+ * cannot derive. `prState` is DERIVED, never polled: a merge commit or an explicit
+ * "shipped" proves the work landed, a pr url alone proves only that a PR exists,
+ * and a handoff is deliberately NOT a merge (its PR is open, by definition).
+ *
+ * TEAM-4763 P1-A — `outcome` is one of the two values types.ts allows for
+ * `delivery.outcome`, and this is the reading of FR-14 that decides between them
+ * (recorded here so the next reader does not re-derive it):
+ *   - "complete:handoff:static-only" — a HANDOFF-MODE run (the repo is absent from
+ *     the CD registry, so cd-registry.mjs stripped the ship phase) that nothing
+ *     proves merged: the hub opened a PR and static CI is the only verification it
+ *     ever had. The mode is the caller's to know, which is why it is passed in; it
+ *     is the more specific statement about such a run, so it outranks the plain
+ *     handoff label below (only one key is legal).
+ *   - "complete-with-handoff" — otherwise handed off: a ship record that declared
+ *     outcome:"handoff" (shipVerdictOf → "handoff"), or FR-13's rule that every
+ *     STILL-OPEN follow-up is human-owned. An open AGENT follow-up is a fix ticket,
+ *     so isWorkflowComplete rule (iii) is holding the run open and there is nothing
+ *     to describe yet — hence "every".
+ * A handed-off run therefore never records a bare `complete` with no qualifier.
+ */
+export function deliveryRollUp(tickets, agentTasks, opts = {}) {
+  const isFollowUp = (t) =>
+    (Array.isArray(t?.labels) && t.labels.some((l) => FOLLOWUP_LABEL_RE.test(String(l)))) ||
+    FOLLOWUP_TITLE_RE.test(String(t?.title || ""));
+  const open = (Array.isArray(tickets) ? tickets : []).filter((t) => isFollowUp(t) && isOpen(t));
+  const tasks = Object.values(agentTasks && typeof agentTasks === "object" ? agentTasks : {});
+  const verdicts = tasks.map((e) => shipVerdictOf(e));
+  // Only "shipped" is a merge — "handoff" is excluded on purpose (see above).
+  const merged = verdicts.includes("shipped");
+  const prState = merged ? "merged"
+    : tasks.some((e) => typeof e?.prUrl === "string" && e.prUrl.trim().length > 0) ? "open" : null;
+  const handoff =
+    verdicts.includes("handoff") || (open.length > 0 && open.every((t) => isHuman(t.assignee)));
+  const mode = typeof opts?.mode === "string" ? opts.mode : "";
+  const outcome = mode === "handoff" && !merged ? "complete:handoff:static-only"
+    : handoff ? "complete-with-handoff" : null;
+  return { ...(outcome ? { outcome } : {}), ...(prState ? { prState } : {}) };
 }

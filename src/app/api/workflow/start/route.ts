@@ -12,12 +12,21 @@
 import { timingSafeEqual, createHash } from "node:crypto";
 import { NextRequest, NextResponse } from "next/server";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
-import { DynamoDBDocumentClient, PutCommand, GetCommand, UpdateCommand, TransactWriteCommand } from "@aws-sdk/lib-dynamodb";
+import { DynamoDBDocumentClient, PutCommand, GetCommand, UpdateCommand, DeleteCommand, TransactWriteCommand } from "@aws-sdk/lib-dynamodb";
 import { LambdaClient, InvokeCommand } from "@aws-sdk/client-lambda";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { validateIntakeSources, getSourceValidationMode, shouldRejectSubmission } from "@/lib/workflow/intake";
 import { validateSourcesShape } from "@/lib/workflow/source-shape";
-import { checkRepoConfig, definitiveFailures, describeRepoCheckFailure } from "@/lib/workflow/repo-check";
+import { checkRepoConfig, definitiveFailures, describeRepoCheckFailure, parseGitHubUrl } from "@/lib/workflow/repo-check";
+import {
+  runSweepPreflight,
+  commentOnSweepPr,
+  shouldMintEpic,
+  sweepPreflightNote,
+  preflightRowField,
+  skipCommentTarget,
+} from "@/lib/workflow/sweep-preflight";
+import type { SweepPreflightRun } from "@/lib/workflow/sweep-preflight";
 import type { RepoCheck } from "@/lib/workflow/repo-check";
 import type { WorkflowInput } from "@/lib/workflow/types";
 import type { WorkflowDef } from "@/lib/workflow/workflow-defs";
@@ -36,6 +45,7 @@ const PROJECT_KEY = process.env.JIRA_PROJECT_KEY || process.env.PROJECT_KEY || "
 const TICKET_PROVIDER = process.env.TICKET_PROVIDER || "dynamodb";
 const TICKET_TOOLS_LAMBDA = process.env.TICKET_TOOLS_LAMBDA || "agentcore-hub-tickets";
 const ARTIFACT_BUCKET = process.env.ARTIFACT_BUCKET || "";
+const EVENTS_TABLE = process.env.EVENTS_TABLE || "agentcore-hub-events";
 
 // TEAM-3335 F1: intakeChannel values reserved for internal callers. The
 // anomaly-watcher Lambda counts its fleet-wide open-filing cap via a GSI on
@@ -217,6 +227,80 @@ async function resolveDedup(
     const winner = reread.Item?.canonicalWorkflowId as string | undefined;
     return winner ? { coalesce: winner } : { proceed: candidateWorkflowId, markerId };
   }
+}
+
+/**
+ * TEAM-4740 FR-9: everything a skipped dead-code sweep leaves behind. No epic, no
+ * tickets, no workflow row — those are the cost the skip avoids — but three things
+ * MUST happen or the skip is worse than the redundant run it replaced:
+ *
+ *  1. Release the dedup marker. resolveDedup claims it before this point, and a
+ *     marker pointing at a canonical run that will never exist makes every
+ *     redelivery inside DEDUP_INFLIGHT_GRACE_MS coalesce onto a phantom. Fenced
+ *     on the exact id we claimed (the same guard resolveDedup re-points with) so
+ *     a racer that legitimately re-pointed the marker keeps it.
+ *  2. Record `workflow.skipped`. This is the audit trail AND the UI's only
+ *     evidence that the schedule fired at all — silence looks like a dead cron.
+ *  3. Comment once on the newest open sweep PR. The PR's subscribers are the repo
+ *     owner, so this is the notification; the hub has no other notifier to reuse.
+ *
+ * Every step is non-fatal: a skip that could not comment is still a correct skip.
+ */
+async function recordSweepSkip(
+  pf: SweepPreflightRun & { decision: "skip" },
+  ctx: { workflowId: string; markerId?: string; owner: string; repo: string; token?: string }
+): Promise<{ skipped: true; reason: string; prs: unknown[]; mainSha: string | null }> {
+  if (ctx.markerId) {
+    try {
+      await ddb.send(
+        new DeleteCommand({
+          TableName: WORKFLOWS_TABLE,
+          Key: { workflowId: ctx.markerId },
+          ConditionExpression: "canonicalWorkflowId = :mine",
+          ExpressionAttributeValues: { ":mine": ctx.workflowId },
+        })
+      );
+    } catch (err) {
+      if ((err as { name?: string }).name !== "ConditionalCheckFailedException") {
+        console.error(`[start] sweep skip: dedup marker ${ctx.markerId} not released:`, err);
+      }
+    }
+  }
+  const at = new Date().toISOString();
+  try {
+    await ddb.send(
+      new PutCommand({
+        TableName: EVENTS_TABLE,
+        Item: {
+          workflowId: ctx.workflowId,
+          eventId: `${Date.now()}-skipped-${Math.random().toString(36).slice(2, 6)}`,
+          timestamp: at,
+          type: "workflow.skipped",
+          detail: { workflowId: ctx.workflowId, reason: pf.reason, prs: pf.prs, mainSha: pf.mainSha },
+        },
+      })
+    );
+  } catch {
+    /* event publish is non-fatal */
+  }
+  // SR2-3: the comment asserts "re-verified against main @<sha>", so it goes on a
+  // PR that is actually AT that sha — not merely the newest one echoed in `prs`.
+  const target = skipCommentTarget(pf);
+  if (target && pf.mainSha) {
+    await commentOnSweepPr({
+      owner: ctx.owner,
+      repo: ctx.repo,
+      number: target.number,
+      token: ctx.token,
+      mainSha: pf.mainSha,
+      date: at.slice(0, 10),
+      // TEAM-4752 D4: word the comment from the observed mergeability instead of
+      // asserting "still mergeable" off the base SHA.
+      mergeable: target.mergeable,
+    });
+  }
+  console.log(`[start] dead-code sweep skipped (${pf.reason}) at main @${pf.mainSha ?? "?"}`);
+  return { skipped: true, reason: pf.reason, prs: pf.prs, mainSha: pf.mainSha };
 }
 
 /**
@@ -511,6 +595,40 @@ export async function POST(req: NextRequest) {
       // start functions fence their workflow-row write on it (proving we still
       // own the marker) so a re-pointed loser can't double-create.
       markerId = dedup.markerId;
+    }
+
+    // TEAM-4740 FR-9: dead-code-sweep preflight. Gated on def.preflight, NEVER on
+    // def.id — any def that opts in gets it and the sweep def is not special-cased.
+    // Placed after the dedup claim (so a skip releases a marker it owns) and before
+    // BOTH providers' epic creation, so one insertion covers both. Fails open.
+    if (def.preflight === "sweep") {
+      const target = (body.repoConfig.repos ?? []).find((r) => r?.url);
+      const gh = parseGitHubUrl(target?.url || "");
+      const pf: SweepPreflightRun = gh
+        ? await runSweepPreflight({
+            owner: gh.owner,
+            repo: gh.repo,
+            defaultBranch: target?.defaultBranch || "main",
+            token: process.env.GITHUB_PAT,
+            // Not derivable with a BOUNDED query: the workflows table is keyed on
+            // workflowId with only an epicId GSI, so "the last complete run of
+            // this def on this repo" is a full Scan. Left undefined — the
+            // `unchanged_main` arm simply never fires from here. See PR body.
+            lastSweepBaseSha: undefined,
+          })
+        : { decision: "proceed", alreadyRemoved: [], probeFailed: true, mainSha: null };
+      if (!shouldMintEpic(pf)) {
+        const skipped = await recordSweepSkip(pf as SweepPreflightRun & { decision: "skip" }, {
+          workflowId: workflowId ?? mintWorkflowId(),
+          markerId,
+          owner: gh?.owner || "",
+          repo: gh?.repo || "",
+          token: process.env.GITHUB_PAT,
+        });
+        return NextResponse.json({ ...skipped, ...responseMeta }, { status: 200 });
+      }
+      body.description = `${body.description || ""}${sweepPreflightNote(pf)}`;
+      body.preflight = preflightRowField(pf);
     }
 
     if (TICKET_PROVIDER === "jira") {

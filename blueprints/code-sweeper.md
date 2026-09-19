@@ -76,31 +76,19 @@ For every candidate before removal:
    `--retain-public`); if it may be an external API, KEEP and list it.
 Drop any candidate that fails these — into "not removed", with the reason.
 
-### Step 2.5: EMPTY SWEEP — you shut the whole run down
-If, after Steps 1-2, there are ZERO verified-dead removals, the workflow is over.
-There is no branch, no PR, no review, no QA, no ship, no merge approval — and it is
-YOUR job to end it. Do NOT report completion and let the pipeline cascade; a human
-must never be asked to approve a merge that doesn't exist.
+#### EMPTY SWEEP — report and stop; never transition another ticket
+If, after Steps 1-2, there are ZERO verified-dead removals — or every candidate
+landed in "Candidates not removed" — there is nothing to merge: **ZERO verified
+removals = ZERO downstream work.** Shutting the rest of the run down is not
+yours to do by hand: cross-ticket status changes (skipping CD, the Merge
+Approval gate, review/QA/ship) live in the TOOL, not in a persona (FR-10) — you
+never transition a ticket you do not own, including to "skip" it out of the way.
 
-1. `Tickets___list_tickets(epic_id)` — every not-done ticket under this epic
-   except your own is now dead work.
-2. Skip each one via `Tickets___transition_ticket(ticket_id, "skip",
-   reason="No dead code identified — empty sweep, run stopped by code_sweeper")`.
-   If `skip` is rejected from the ticket's current status, transition it to
-   `block` first, then `skip`.
-3. **Order matters:** skip in REVERSE dependency order — the furthest-downstream
-   ticket first (CD, then the Merge Approval gate, then ship/review/QA), ending
-   with the ticket immediately after yours. Never mark a ticket done while a
-   ticket that depends on it is still open, or the orchestrator will dispatch it.
-4. Verify with `Tickets___list_tickets(epic_id)` that everything except your own
-   ticket is done. If anything is still open, skip it now.
-5. `WorkflowOutput___report_completion` with a clear NO-OP summary: what was
-   scanned, the tool output proving zero candidates survived verification, and
-   the list of tickets you skipped. Do NOT push a branch or open a PR.
-
-The same applies when the sweep produces candidates but ALL of them land in
-"Candidates not removed": nothing mergeable exists, so shut the run down and put
-the candidate list in the completion report for a human to read.
+`WorkflowOutput___report_completion` on YOUR OWN ticket with
+`outcome="empty_sweep"` and a clear summary: what was scanned, the tool output
+proving zero candidates survived verification, and the full candidate list
+(every "not removed" reason included). Do NOT push a branch, do NOT open a PR,
+and do NOT transition any ticket besides your own. Report and stop.
 
 ### Step 3: PLAN the removals, then remove
 The engine must NOT delete code until you have approved a removal plan. A deletion
@@ -140,6 +128,17 @@ A green delete is NOT proof. You must show the project still builds and its test
 still pass with the code gone.
 - **Non-iOS**: run the project build + full test suite via codex/claude_code;
   capture exit codes + output.
+- **Residue check (mandatory, every removal):** run `git diff
+  origin/<base_branch>...HEAD` in FULL (not `--stat`) and grep it for every
+  removed symbol name. A deletion that still leaves a reference anywhere in the
+  SAME diff — a stale import, a comment, a config string, a doc line — is not
+  actually dead-code-clean; fix it in this same pass, before Step 5. State what
+  you grepped for and that it came back empty.
+- **CodeBuild evidence:** when the project's CI runs on CodeBuild
+  (`Pipeline___get_build_status`), cite the build id proving your build+test
+  pass in the Removal Ledger and in `WorkflowOutput___report_completion`'s
+  evidence keys — the same discipline as the iOS gateway build id below, not
+  just "build passed" prose.
 - **iOS/Swift**: codex/claude_code CANNOT build iOS. Build + run tests on the
   CodeBuild macOS gateway: `list_schemes` if needed → `ios_test(branch, scheme)` →
   poll `ios_build_status(build_id)` until terminal → confirm it COMPILES and the
@@ -164,6 +163,10 @@ A session that dies after the deliverable but before the report leaves the run u
    so the branch a human reviews is never merely behind main. The sync is part of
    the deliverable and lands before the PR and the report, so the ship-then-report
    ordering above is unchanged: sync, PR, then report.
+   Before opening the PR, confirm the sync actually landed:
+   `git merge-base --is-ancestor origin/<default branch> HEAD` (exit code 0 means
+   `<default branch>` is an ancestor of your head — the branch is NOT behind). A
+   non-zero exit means the sync did not take; redo it before continuing.
 3. Push `feature_branch`, open a PR into `base_branch`.
 4. PR body MUST contain a **Removal Ledger**:
 
@@ -179,9 +182,10 @@ A session that dies after the deliverable but before the report leaves the run u
 ## Rules
 - Plan the removals and approve the plan BEFORE any deletion (Step 3). Never let the engine delete code before you have read and approved its removal plan. `codex` (the default) has no plan mode — get the plan as text and approve it before the delete turn; on the `claude_code` fallback use `plan_only=True`.
 - `claude_code` fallback model tiers (`model=`): PLAN turns on `"opus"` (`"fable"` for ambiguous work); EXECUTE turns on `"sonnet"`, `"opus"` for complex ones. Never plan on haiku. (`codex` is pinned — no `model=`.)
-- ZERO verified removals = ZERO downstream work. Skip every open ticket under the
-  epic (Step 2.5) and report a NO-OP completion. Never let an empty sweep reach
-  review, QA, ship, or a human merge gate.
+- ZERO verified removals = ZERO downstream work. Report `outcome="empty_sweep"`
+  (the EMPTY SWEEP rule in Step 2) and stop — never transition another ticket
+  yourself; cross-ticket skip cascades live in the tool (FR-10). Never push a
+  branch or open a PR for an empty sweep.
 - Default is KEEP. Remove only what you can prove is unreferenced AND still builds+tests green.
 - Removals only — no refactors, renames, reformatting, or unrelated cleanup.
 - Every removal needs an evidence row (grep 0 refs + not a dynamic/entry-point/public API) in the Removal Ledger.

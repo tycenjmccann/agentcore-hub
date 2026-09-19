@@ -158,6 +158,19 @@ export default defineConfig({
       // replay-d1/d2: asserts 3 in-diff CHANGES-NEEDED rounds STOP the loop —
       // cap-reached fires once, the upstream re-open is suppressed, no round 4.
       "lambda/orchestrator/replay-d3.test.mjs",
+      // replay-agent-died (TEAM-4739 WP5) — 15x8ql/TEAM-4700's agent.died row
+      // replayed through the REAL detector + REAL lease.mjs: the first sweep
+      // after the death reaps it via the positive-death path (GUARD 1 still
+      // first), and TEAM-4703 gets exactly two auto-resumes then a human.
+      "lambda/orchestrator/replay-agent-died.test.mjs",
+      // replay-watchdog-coverage (TEAM-4739 WP5) — the three runs the watchdog
+      // never paged on (fz514x, 37ule1) plus the one it must NOT page on
+      // (TEAM-4660), replayed through the REAL reconcile sweep's W2/W3 watches.
+      "lambda/orchestrator/replay-watchdog-coverage.test.mjs",
+      // replay-gate-binding (TEAM-4739 WP5) — lives in the tickets twin because
+      // the typed-gate guard does: p5ogpg/37ule1's gate closes replayed against
+      // the real refusal path (refused + repaged once, no ticket, no dispatch).
+      "lambda/agentcore-hub-tickets/replay-gate-binding.test.mjs",
       // agentcore-hub-tickets create_ticket (TEAM-3619 D4c) — the spawnedBy/phase
       // pass-through that lets agent-filed QA/review fixes gate completion.
       // Handler driven with a stub DDB doc client; no AWS.
@@ -227,6 +240,41 @@ export default defineConfig({
       // persona's roster phase) advances intake → development → ship, a junk stamp
       // is ignored, and the human gate is published without an agentTasks entry.
       "lambda/orchestrator/replay-intake-materialize.test.mjs",
+      // replay-head-of-line (TEAM-4740 FR-4) — run p5ogpg, where start_deploy
+      // started a second execution behind an OLDER run parked on the human deploy
+      // gate and wrote a ship-approval record for a deploy that never ran.
+      // Replayed through the REAL pipeline-tools handler: the call is refused, the
+      // blocker is returned in full, and neither the Start nor the PutObject
+      // happens.
+      "lambda/orchestrator/replay-head-of-line.test.mjs",
+      // replay-base-branch-main (TEAM-4663) — the other half of run p5ogpg: a fix
+      // that had to land on main, filed while the merge gate was open, delivered
+      // onto the integration branch instead. Lives in the tickets twin because the
+      // chain starts there: the REAL twin's create_ticket records base_branch and
+      // states it in the description, and the REAL workflow-output report_completion
+      // reads it back out of that description (its get_issue returns no baseBranch
+      // field) and refuses a main fix with no PR to main before anything durable.
+      // Both modules in one process; only ddb/s3/lambda-invoke/fetch are mocked.
+      // Replaces the tautological fixture deleted from replay-head-of-line.
+      // (The jira half is lambda/agentcore-hub-jira/replay-base-branch-main.test.mjs,
+      // run by `node --test`; the twins' banner parity is asserted here.)
+      "lambda/agentcore-hub-tickets/replay-base-branch-main.test.mjs",
+      // replay-empty-sweep (TEAM-4740 FR-10/FR-11) — run fz514x, the dead-code sweep
+      // that found nothing: no diff, no PR, and four downstream tickets waiting for a
+      // diff that would never exist. Drives the REAL workflow-output handler for both
+      // halves (submit_ticket_plan's root-blocker autowire, report_completion's skip
+      // walk) against a ticket stub that enforces the DynamoDB twin's real skip-only-
+      // from-blocked constraint, plus the REAL completion.mjs verdict.
+      "lambda/orchestrator/replay-empty-sweep.test.mjs",
+      // replay-followups (TEAM-4740 FR-13/FR-5) — four real runs whose delivery
+      // work went missing: a fix created while the Merge Approval gate was open
+      // (TEAM-4660), a post-deploy re-check that lived only in prose (15x8ql), and
+      // three console/IAM steps a human had to do (syq0p9). Replayed through the
+      // REAL workflow-output handler as the producer and the REAL completion.mjs
+      // gate as the reader, so it pins the property no unit test can: the ticket a
+      // report mints is one the completion gate recognizes and holds the run open
+      // for. REGRESSION hirhfw: a report with no follow-ups is byte-unchanged.
+      "lambda/orchestrator/replay-followups.test.mjs",
       // workflow-output report_completion (TEAM-4121 FR-9) — the completion record
       // is what live-reverify.mjs reads to decide whether a "live" fix actually
       // produced live evidence, so the two new fields must be additive (a record

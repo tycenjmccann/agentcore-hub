@@ -217,6 +217,52 @@ delivery past the opening) — so a "your window is open now" nudge is never sen
 for a page the human already received in hours. A claim with no `pagedAt`
 (written by an older deployment) falls through to the prior behaviour.
 
+### Gates the ticket Lambdas refused to close (TEAM-4751 C2)
+
+The ticket twins' typed-gate guard only lets a `gate:<kind>` ticket reach `done`
+once its condition is verified (a deploy approval actually given, CI actually
+reachable). On a refusal they leave the ticket in review and stamp
+**`gate:awaiting-console`** — a stall a human has to clear, and one the clock has
+nothing to do with. So `repageAwaitingConsole` pages on that label **regardless of
+business hours**, unlike the reminder above: the label is the trigger. The copy is
+kind-aware and built in one place (`awaitingConsolePage`, shared with the
+out-of-hours reminder): a `deploy-approval` gate gets the console deep link as a
+button and is asked to approve there; any other probed kind gets no console URL
+and is pointed at the ticket's own gate-guard comment for the remedy. It fails
+closed — a `/tickets` read that proves nothing pages nothing.
+
+Paging is exactly-once per stall via a ledger row keyed on FR/NFR-5's tuple,
+`console#<ticketId>|<gateKind>|<headSha|->|<hash(consoleUrl)>` — so a re-targeted
+gate (new head sha, different pipeline) is a new row and gets a fresh page, while
+the same stall is not re-paged. It reuses the deploy re-ping's bounded reminder
+ledger: the first page, then at most `DEPLOY_REPING_MAX` (6) reminders no more
+often than `DEPLOY_REPING_INTERVAL_MS` (2h), on a 30-day row. Reading the label
+costs a `/tickets` GET, so `AWAITING_CONSOLE_POLL_MS` (default `120000`) rate
+limits that read per gate per container — it bounds the read only; the `console#`
+row is what bounds the paging. One stall is worth at most **one** message per
+scan: when the out-of-hours reminder fires for a labelled gate it wins (it already
+carries this copy) and the consumer pages on a later scan if the gate is still
+parked.
+
+### A ✅ on a gate that is already done (TEAM-4753)
+
+The re-tap the stuck-gate message above asks for has to be able to *succeed*, so
+`done` is idempotent on the ✅ path in two places. The `gok` pre-read
+(`gateTicketOf` already returns `status`) short-circuits an already-`done` gate
+straight to the ✅ edit — no `PutApprovalResult`, no transition POST, because WP2's
+typed-gate guard means a `done` gate ticket already proves the pipeline's approval
+was verified. And `transitionGate` itself treats a `done`→`done` refusal as a
+landed close, whichever layer answers it: the hub route's own **400** `Invalid
+transition from done to done` (dynamodb mode, `VALID_TRANSITIONS.done = ["todo"]`)
+or the twin's **409** `Invalid transition "done" from status "done"`. Because the
+rule lives in that one low-level helper, every `done` caller gets it — including
+the escalation-DECISION buttons, which used to answer this same input with
+`⚠️ Failed to process` — while `deliverReworkNote`'s `done`→`blocked` still throws
+into its own park-the-note / Retry / Drop surface. Jira's
+`No transition to "Done" found` is **not** treated as success: it is the same text
+a genuinely stuck, not-done ticket produces, so the pre-read is what covers that
+provider.
+
 ## Deploy
 
 The function has no dependencies to bundle — it imports only AWS SDK v3 clients,

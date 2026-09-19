@@ -117,6 +117,22 @@ jobs:
       - name: Orchestrator surface guard
         run: ./scripts/check-orchestrator-surface.sh
 
+      # TEAM-3696/TEAM-4739: a Lambda's deploy script hand-lists what goes in its
+      # zip, and a local import missing from that list kills the function at cold
+      # start with ERR_MODULE_NOT_FOUND — invisible until deploy. This guard walks
+      # index.mjs's actual import closure and compares. It ran only in
+      # deploy/pipeline/buildspec-ci.yml, i.e. after merge; a contributor who only
+      # ever sees the GitHub PR checks never saw the failure. Both ticket-Lambda
+      # dirs are checked because only one is packaged per install (TICKET_PROVIDER)
+      # and the un-deployed one is where drift hides.
+      - name: Lambda zip manifest guard
+        run: |
+          ./scripts/check-lambda-zip-manifest.sh
+          ./scripts/check-lambda-zip-manifest.sh --dir lambda/agentcore-hub-tickets \
+            --entry index.mjs --manifest-file deploy/setup-tickets-lambda.mjs
+          ./scripts/check-lambda-zip-manifest.sh --dir lambda/agentcore-hub-jira \
+            --entry index.mjs --manifest-file deploy/setup-tickets-lambda.mjs
+
       # Every lambda/* and deploy/* surface must be in the pipeline's deploy
       # manifest (deploy/pipeline/surfaces.json) — or explicitly handoff/excluded —
       # otherwise merged code never reaches prod and drifts behind main.

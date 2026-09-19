@@ -261,7 +261,27 @@ export interface WorkflowState {
    * "handoff" — the repo is NOT registered: the hub opened `prUrl` and left it
    * open for the owning team to merge and deploy (see src/lib/cd-registry.ts).
    */
-  delivery?: { mode: "cd" | "handoff"; prUrl?: string; pipeline?: string; at?: string };
+  delivery?: {
+    mode: "cd" | "handoff";
+    prUrl?: string;
+    pipeline?: string;
+    at?: string;
+    /**
+     * TEAM-4740 FR-14: what happened to `prUrl`, DERIVED at completion from the
+     * ship report (lambda/workflow-output/index.mjs derivePrState) and rolled up
+     * by lambda/orchestrator/completion.mjs deliveryRollUp. Nothing polls GitHub,
+     * so "merged" can LAG reality by one merge and never leads it; "unknown" is a
+     * first-class answer, not a missing value.
+     */
+    prState?: "open" | "merged" | "closed" | "unknown";
+    /**
+     * TEAM-4740 FR-13: the run closed, but with follow-up work still owned by a
+     * person. Deliberately NOT a phase — adding one to TERMINAL_PHASES would
+     * change what resolveDedup, the reconcile sweep and the dead-session detector
+     * each consider a closed run.
+     */
+    outcome?: "complete-with-handoff" | "complete:handoff:static-only";
+  };
 }
 
 // ─── Repo Configuration ──────────────────────────────────────────────────────
@@ -402,6 +422,19 @@ export interface WorkflowInput {
    * Absent → no dedup (human/API callers keep the mint-a-new-run behavior).
    */
   sourceTicket?: string;
+  /**
+   * TEAM-4740 FR-9: what the dead-code-sweep preflight observed before this run
+   * was minted (only set for defs with `preflight: "sweep"` that PROCEEDED — a
+   * skip never produces a workflow row). `alreadyRemoved` is also appended to
+   * `description`, which is what actually reaches the analyst's prompt; this
+   * field is the structured copy for the UI and for audit.
+   */
+  preflight?: {
+    decision: string;
+    stackedOn?: { number: number; url: string };
+    alreadyRemoved: string[];
+    mainSha: string | null;
+  };
 }
 
 export interface PortedSession {

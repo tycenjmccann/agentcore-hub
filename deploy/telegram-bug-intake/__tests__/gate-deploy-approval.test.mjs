@@ -58,8 +58,12 @@ const XEXTID = "hub-cd-widget-external-id";
 // invariant — "the pipeline moved FIRST" is.
 const log = vi.hoisted(() => ({ entries: [] }));
 
-const db = vi.hoisted(() => ({ items: new Map(), puts: [], deletes: [] }));
-vi.mock("@aws-sdk/client-dynamodb", () => {
+const db = vi.hoisted(() => ({ items: new Map(), puts: [], deletes: [], updates: [] }));
+vi.mock("@aws-sdk/client-dynamodb", async () => {
+  // TEAM-4663: the handler now UPDATES claim rows (two-phase claim). One
+  // shared evaluator, because a fake that replaces instead of merging would
+  // hide a real regression — see helpers/ddb-fake.mjs.
+  const { applyUpdate } = await import("./helpers/ddb-fake.mjs");
   const cmd = (op) => class { constructor(input) { this.input = input; this.op = op; } };
   class DynamoDBClient {
     async send(c) {
@@ -75,6 +79,7 @@ vi.mock("@aws-sdk/client-dynamodb", () => {
         db.puts.push(c.input.Item);
         return {};
       }
+      if (c.op === "update") return applyUpdate(db, c.input);
       if (c.op === "del") { db.deletes.push(c.input.Key.id.S); db.items.delete(c.input.Key.id.S); return {}; }
       if (c.op === "scan") {
         const p = c.input.ExpressionAttributeValues[":p"].S;
@@ -86,7 +91,7 @@ vi.mock("@aws-sdk/client-dynamodb", () => {
   return {
     DynamoDBClient,
     GetItemCommand: cmd("get"), PutItemCommand: cmd("put"),
-    DeleteItemCommand: cmd("del"), ScanCommand: cmd("scan"),
+    DeleteItemCommand: cmd("del"), ScanCommand: cmd("scan"), UpdateItemCommand: cmd("update"),
   };
 });
 
@@ -155,12 +160,16 @@ vi.mock("@aws-sdk/client-sts", () => ({
   AssumeRoleCommand: class { constructor(input) { this.input = input; } },
 }));
 
-// The bridge reads exactly one S3 key: the CD registry.
-const s3 = vi.hoisted(() => ({ calls: [], registry: null }));
+// The bridge reads one S3 key (the CD registry) and writes one (the SEC-1
+// rejection marker, TEAM-4781 — load-bearing on ❌, so PutObjectCommand must be
+// mocked here too: without it `new PutObjectCommand(...)` is `new undefined()`,
+// and that TypeError used to be swallowed by the best-effort write).
+const s3 = vi.hoisted(() => ({ calls: [], puts: [], registry: null }));
 vi.mock("@aws-sdk/client-s3", () => ({
   S3Client: class {
     async send(c) {
       s3.calls.push(c.input);
+      if (c.op === "put") { s3.puts.push(c.input); return {}; }
       if (c.input?.Key === CD_REGISTRY_KEY && s3.registry) {
         const doc = s3.registry;
         return { Body: { transformToString: async () => (typeof doc === "string" ? doc : JSON.stringify(doc)) } };
@@ -171,6 +180,7 @@ vi.mock("@aws-sdk/client-s3", () => ({
     }
   },
   GetObjectCommand: class { constructor(i) { this.input = i; } },
+  PutObjectCommand: class { constructor(i) { this.input = i; this.op = "put"; } },
 }));
 
 vi.mock("@aws-sdk/client-eventbridge", () => ({
@@ -256,7 +266,7 @@ function resetAll() {
   db.items.clear(); db.puts.length = 0; db.deletes.length = 0;
   cp.states.clear(); cp.stateErrors.clear(); cp.putErrors.clear();
   cp.approvals.length = 0; cp.sends.length = 0; cp.inits.length = 0; cp.onPut = null;
-  s3.calls.length = 0; s3.registry = null;
+  s3.calls.length = 0; s3.puts.length = 0; s3.registry = null;
   sts.assumes.length = 0;
   log.entries.length = 0;
   db.items.set(`chat#${CHAT}`, { id: { S: `chat#${CHAT}` }, chatId: { N: String(CHAT) } });
@@ -616,5 +626,80 @@ describe("gate:deploy-approval — the ticket IS the deploy decision", () => {
     expect(db.items.has(`gaterework#${GATE}`)).toBe(false);
     expect(net.transitions).toEqual([]);
     expect(net.edited.at(-1).text).toMatch(/NOT rejected/);
+  });
+
+  // ─── the gate KIND has to be readable before either half runs (TEAM-4739) ────
+
+  /**
+   * `gateTicketOf` used to return `{gateTicket:null, tickets:[]}` when the hub's
+   * tickets view could not be read, which is indistinguishable from "this is an
+   * ordinary release-manager gate". On a `gate:deploy-approval` ticket that read
+   * decides which of two irreconcilable things a tap means, so a blip made ✅
+   * transition the ticket while the pipeline's own approval stayed parked — the
+   * 29h stall. It now fails CLOSED with `{indeterminate:true}` and the tap is
+   * the retry.
+   */
+  it("(g) an unreadable tickets view answers 'retry' and touches nothing at all", async () => {
+    const mod = await loadModule({ bucket: BUCKET, registry: registry() });
+    cp.states.set(PIPELINE, pendingState(TOKEN, EXEC));
+    seedDeployClaim(PIPELINE, TOKEN);
+    const net = makeNet(makeCtx(), {
+      tickets: null, // the /tickets view 404s
+      batches: [[cbUpdate(12, `gok|${GATE}|${WF}`)]],
+    });
+    global.fetch = net.fetch;
+    await mod.handler({}, net.ctx);
+
+    // Not the deploy half…
+    expect(cp.approvals, "no approval over an unverifiable gate kind").toEqual([]);
+    expect(db.puts.some((i) => i.id.S.startsWith("approved#")), "and no ledger row").toBe(false);
+    // …and not the plain-gate half either, which is the bug this row prevents.
+    expect(net.transitions, "the ticket is untouched").toEqual([]);
+    expect(net.answered.at(-1).text).toMatch(/could not verify gate type, retry/i);
+    expect(net.edited, "the keyboard stays — the tap itself is the retry").toEqual([]);
+  });
+
+  it("(g2) the same on ❌ — no rejection, no rework plumbing", async () => {
+    const mod = await loadModule({ bucket: BUCKET, registry: registry() });
+    cp.states.set(PIPELINE, pendingState(TOKEN, EXEC));
+    seedDeployClaim(PIPELINE, TOKEN);
+    const net = makeNet(makeCtx(), {
+      tickets: null,
+      batches: [[cbUpdate(13, `gno|${GATE}|${WF}`)]],
+    });
+    global.fetch = net.fetch;
+    await mod.handler({}, net.ctx);
+
+    expect(cp.approvals).toEqual([]);
+    expect(db.items.has(`rej#${CHAT}`)).toBe(false);
+    expect(db.items.has(`gaterework#${GATE}`)).toBe(false);
+    expect(net.transitions).toEqual([]);
+    expect(net.answered.at(-1).text).toMatch(/could not verify gate type, retry/i);
+  });
+
+  /**
+   * The tri-state (SEC-8) is about the WRITE, not about which way the human
+   * decided: `alreadyResolved` means the pipeline is already where they want it,
+   * so the TICKET half must still run. Its own file pins the full matrix
+   * (`deploy-gate-ordering.test.mjs`); this row keeps it wired to the real
+   * already-completed exception shape alongside (b), the `failed` row.
+   */
+  it("(h) a gate answered in the gap still finishes the ticket half", async () => {
+    const mod = await loadModule({ bucket: BUCKET, registry: registry() });
+    cp.states.set(PIPELINE, pendingState(TOKEN, EXEC));
+    cp.putErrors.set(PIPELINE, "The approval action Approve_deploy has already been completed");
+    seedDeployClaim(PIPELINE, TOKEN);
+    const net = makeNet(makeCtx(), {
+      tickets: [gateRow(LABELS_COLON)],
+      batches: [[cbUpdate(14, `gok|${GATE}|${WF}`)]],
+    });
+    global.fetch = net.fetch;
+    await mod.handler({}, net.ctx);
+
+    expect(cp.approvals, "our write did not land").toEqual([]);
+    expect(net.transitions, "…but the gate is resolved, so the ticket closes").toEqual([
+      { ticketId: GATE, targetStatus: "done", comment: expect.stringContaining("Approved via Telegram") },
+    ]);
+    expect(net.edited.at(-1).text).toContain("✅ Approved");
   });
 });

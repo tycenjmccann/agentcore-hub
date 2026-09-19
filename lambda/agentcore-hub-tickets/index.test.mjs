@@ -33,15 +33,62 @@ const h = vi.hoisted(() => ({
     statusUpdates: /** @type {any[]} */ ([]),
     // TEAM-4537: edit_issue's title write (`SET #t = :t, …`).
     editUpdates: /** @type {any[]} */ ([]),
-    // TEAM-4706: every HeadObject the ship-phase Done gate makes (by Key), so a
-    // non-ship transition can be asserted to make NO S3 call at all…
-    s3Heads: /** @type {string[]} */ ([]),
+    // TEAM-4706: every completion-record read the ship-phase Done gate makes (by
+    // Key), so a non-ship transition can be asserted to make NO S3 call at all…
+    s3RecordReads: /** @type {string[]} */ ([]),
     // …and an INDETERMINATE S3 answer (AccessDenied, throttle, timeout) can be
     // injected: null = "exists iff the key is in state.s3Objects".
-    headImpl: /** @type {((input: any) => any) | null} */ (null),
-    /** Keys that exist for HeadObject, e.g. completions/TEAM-4066.json. */
-    s3Objects: /** @type {Record<string, true>} */ ({}),
+    recordImpl: /** @type {((input: any) => any) | null} */ (null),
+    /**
+     * The completion records that exist, e.g. completions/TEAM-4066.json. TEAM-4757:
+     * the gate GETs the body, so the VALUE is the body it serves —
+     *   `true`   → a pre-TEAM-4756 record (neither followUpsPending nor status), the
+     *              shape every test written before that field existed assumed;
+     *   object   → served as JSON.stringify(value);
+     *   string   → served verbatim, so a non-JSON or empty body is expressible.
+     */
+    s3Objects: /** @type {Record<string, true | object | string>} */ ({}),
+    // TEAM-4739: the typed gate guard's probe into the pipeline-tools Lambda —
+    // every call recorded (so "made no probe at all" is assertable), and the reply
+    // injected by tool name. An absent entry makes the invoke THROW, which is the
+    // suite's default and the case the admit-on-indeterminate rule turns on.
+    probes: /** @type {any[]} */ ([]),
+    probeBy: /** @type {Record<string, {result?: unknown}>} */ ({}),
+    // TEAM-4739 gate-loop gather / TEAM-4740 FR-5 open-gate autowire scan — both
+    // features read the SAME parentId-index Query, so they share this fixture.
+    siblings: /** @type {any[]} */ ([]),
+    /** Journey events written through publishJourneyEvent. */
+    events: /** @type {any[]} */ ([]),
+    /** Make the NEXT conditional status write lose its race, once. */
+    statusRaceOnce: false,
+    // TEAM-4740 FR-5: every Query issued, and the switch that makes the scan
+    // FAIL — the fail-open direction is the whole point of the feature, so it
+    // has to be drivable.
+    queries: /** @type {any[]} */ ([]),
+    queryThrows: false,
   },
+}));
+
+vi.mock("@aws-sdk/client-lambda", () => ({
+  LambdaClient: class {
+    async send(cmd) {
+      const req = JSON.parse(Buffer.from(cmd.input.Payload).toString("utf8"));
+      h.state.probes.push({ tool: req.tool_name, args: req.parameters });
+      const plan = h.state.probeBy[req.tool_name];
+      if (!plan) {
+        const err = new Error("connect ETIMEDOUT");
+        err.name = "TimeoutError";
+        throw err;
+      }
+      // The real tools Lambda double-encodes (`jsonResult`), so feed that shape.
+      return {
+        Payload: Buffer.from(
+          JSON.stringify({ content: [{ type: "text", text: JSON.stringify(plan.result, null, 2) }] })
+        ),
+      };
+    }
+  },
+  InvokeCommand: class { constructor(input) { this.input = input; } },
 }));
 
 vi.mock("@aws-sdk/client-dynamodb", () => ({ DynamoDBClient: class {} }));
@@ -49,20 +96,29 @@ vi.mock("@aws-sdk/client-s3", () => ({
   S3Client: class {
     async send(cmd) {
       const key = cmd.input.Key;
-      // TEAM-4706: HeadObject (the completion-record probe) and GetObject (the
-      // roster/workflow configs) share one client, so the command TYPE is what
-      // separates them — the __type tag is the shape the repo's other Lambda
-      // suites use (lambda/agentcore-hub-pipeline-tools/index.test.mjs).
-      if (cmd.__type === "HeadObject") {
-        h.state.s3Heads.push(key);
-        if (h.state.headImpl) return h.state.headImpl(cmd.input);
+      // TEAM-4706 + TEAM-4757: the completion-record read and the roster/workflow
+      // config reads are now both GetObject on one client, so the KEY PREFIX is what
+      // separates them (it used to be the command type, when the gate HeadObject-ed).
+      // The __type tag is still the shape the repo's other Lambda suites use
+      // (lambda/agentcore-hub-pipeline-tools/index.test.mjs).
+      if (String(key).startsWith("completions/")) {
+        h.state.s3RecordReads.push(key);
+        if (h.state.recordImpl) return h.state.recordImpl(cmd.input);
         if (!(key in h.state.s3Objects)) {
-          const err = new Error("NotFound");
-          err.name = "NotFound";
+          const err = new Error("NoSuchKey");
+          err.name = "NoSuchKey";
           err.$metadata = { httpStatusCode: 404 };
           throw err;
         }
-        return { ContentLength: 42 };
+        const record = h.state.s3Objects[key];
+        // `true` = a pre-4756 record: it exists and carries neither new field.
+        const text =
+          record === true
+            ? JSON.stringify({ ticketId: key.slice("completions/".length).replace(/\.json$/, ""), summary: "shipped" })
+            : typeof record === "string"
+              ? record
+              : JSON.stringify(record);
+        return { Body: { transformToString: async () => text } };
       }
       if (!(key in h.state.s3)) throw new Error(`NoSuchKey: ${key}`);
       const body = h.state.s3[key];
@@ -70,7 +126,6 @@ vi.mock("@aws-sdk/client-s3", () => ({
     }
   },
   GetObjectCommand: class { constructor(i) { this.input = i; this.__type = "GetObject"; } },
-  HeadObjectCommand: class { constructor(i) { this.input = i; this.__type = "HeadObject"; } },
 }));
 vi.mock("@aws-sdk/lib-dynamodb", () => {
   class PutCommand { constructor(input) { this.input = input; } }
@@ -98,6 +153,15 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
             }
             if (cmd.input.ExpressionAttributeValues?.[":s"] !== undefined) {
               // A transitionIssue status write, not nextTicketId's counter bump.
+              // TEAM-4739: a conditional one carries the gate label plan, and can
+              // lose its race with a concurrent labeller.
+              if (h.state.statusRaceOnce && cmd.input.ConditionExpression) {
+                h.state.statusRaceOnce = false;
+                h.state.statusUpdates.push(cmd.input);
+                const err = new Error("The conditional request failed");
+                err.name = "ConditionalCheckFailedException";
+                throw err;
+              }
               h.state.statusUpdates.push(cmd.input);
               return {};
             }
@@ -113,7 +177,25 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
             return { Attributes: { nextNum: h.state.counter } };
           }
           if (name === "GetCommand") return { Item: h.state.items[cmd.input.Key.ticketId] };
-          if (name === "PutCommand") { h.state.puts.push(cmd.input.Item); return {}; }
+          if (name === "PutCommand") {
+            // TEAM-4739: a journey event and a new ticket both arrive as a Put;
+            // `eventId` is what tells them apart.
+            if (cmd.input.Item?.eventId) h.state.events.push(cmd.input.Item);
+            else h.state.puts.push(cmd.input.Item);
+            return {};
+          }
+          if (name === "QueryCommand") {
+            // TEAM-4740 FR-5: the sibling scan. Returned unfiltered (the Lambda
+            // drops __COUNTER__ itself) so the test can prove it does. Also feeds
+            // TEAM-4739's gate-loop gather — same parentId-index Query.
+            h.state.queries.push(cmd.input);
+            if (h.state.queryThrows) {
+              const err = new Error("Requested resource not found: parentId-index");
+              err.name = "ResourceNotFoundException";
+              throw err;
+            }
+            return { Items: h.state.siblings };
+          }
           return {};
         },
       }),
@@ -140,13 +222,34 @@ beforeEach(async () => {
   h.state.statusUpdates.length = 0;
   h.state.editUpdates.length = 0;
   h.state.items = {};
-  h.state.s3Heads.length = 0;
-  h.state.headImpl = null;
+  h.state.s3RecordReads.length = 0;
+  h.state.recordImpl = null;
   h.state.s3Objects = {};
+  h.state.probes.length = 0;
+  h.state.probeBy = {};
+  h.state.siblings.length = 0;
+  h.state.events.length = 0;
+  h.state.statusRaceOnce = false;
+  h.state.queries.length = 0;
+  h.state.queryThrows = false;
   delete process.env.ARTIFACT_BUCKET;
+  // TEAM-4739: both are read at MODULE LOAD, so the default here is "unset" — the
+  // configuration an install that has never heard of the gate guard still has.
+  delete process.env.PIPELINE_TOOLS_LAMBDA;
+  // TEAM-4740 FR-5: the journey-event writer is dark unless EVENTS_TABLE is set,
+  // and it writes through the same doc client — leaving it set would put an event
+  // row into state.puts and make every ticket assertion below ambiguous.
+  delete process.env.EVENTS_TABLE;
   vi.resetModules();
   ({ handler } = await import("./index.mjs"));
 });
+
+/** Reload the Lambda with gate-guard env set (both consts are load-time). */
+async function reloadWithEnv(env = {}) {
+  for (const [k, v] of Object.entries(env)) process.env[k] = v;
+  vi.resetModules();
+  ({ handler } = await import("./index.mjs"));
+}
 
 const BASE = { summary: "Fix null check", assignee: "agentcore_hub_backend_dev" };
 // TEAM-4130 F1: the run's ship ticket, the one a blocker edge must not strand.
@@ -920,6 +1023,13 @@ describe("create_ticket / edit_issue — surrogate-safe clamp (TEAM-4537)", () =
  *   - an INDETERMINATE S3 answer refuses (fails closed) — "we could not find a
  *     record" is not "there is no record" (DL-028's positive-evidence rule).
  *
+ * TEAM-4757 R3-2 added the (g)…(l) cases: the gate READS THE BODY, because
+ * TEAM-4756 made reportCompletion stamp `followUpsPending`/`status` into the record
+ * and a record in the pending state used to prove completion exactly as well as a
+ * finished one. The admission test is `followUpsPending !== true`, never
+ * `=== false` — a pre-4756 record, a sweep skip-record and the transition-failed
+ * restamp all legitimately lack the field, and (i)/(j) are what pin that.
+ *
  * The jira Lambda's suite asserts the identical twin, in its own idiom.
  */
 describe("transition_ticket — ship-phase Done needs a completion record (TEAM-4706)", () => {
@@ -970,7 +1080,7 @@ describe("transition_ticket — ship-phase Done needs a completion record (TEAM-
     expect(res.content[0].text).toContain(`no ${RECORD_KEY}`);
     // Nothing moved: the ticket is still in_progress in DynamoDB.
     expect(h.state.statusUpdates).toHaveLength(0);
-    expect(h.state.s3Heads).toEqual([RECORD_KEY]);
+    expect(h.state.s3RecordReads).toEqual([RECORD_KEY]);
   });
 
   it("(a, cont.) the `skip` row cannot walk around the gate either", async () => {
@@ -995,7 +1105,7 @@ describe("transition_ticket — ship-phase Done needs a completion record (TEAM-
     expect("reason" in res).toBe(false);
     expect(h.state.statusUpdates).toHaveLength(1);
     expect(h.state.statusUpdates[0].ExpressionAttributeValues[":s"]).toBe("done");
-    expect(h.state.s3Heads).toEqual([RECORD_KEY]);
+    expect(h.state.s3RecordReads).toEqual([RECORD_KEY]);
   });
 
   it("(c) a NON-ship ticket closes with no record and makes no S3 call at all", async () => {
@@ -1011,7 +1121,7 @@ describe("transition_ticket — ship-phase Done needs a completion record (TEAM-
     expect(res).toMatchObject({ key: "TEAM-4067", status: "transitioned", to: "done" });
     expect(h.state.statusUpdates).toHaveLength(1);
     // The ship-phase predicate is cheap and runs FIRST — the hot path is untouched.
-    expect(h.state.s3Heads).toEqual([]);
+    expect(h.state.s3RecordReads).toEqual([]);
   });
 
   it("(d) a human-assigned gate closes with no record — the UI/Telegram approve path", async () => {
@@ -1030,7 +1140,7 @@ describe("transition_ticket — ship-phase Done needs a completion record (TEAM-
 
     expect(res).toMatchObject({ key: "TEAM-4068", status: "transitioned", from: "in_review", to: "done" });
     expect(h.state.statusUpdates).toHaveLength(1);
-    expect(h.state.s3Heads).toEqual([]);
+    expect(h.state.s3RecordReads).toEqual([]);
   });
 
   it("(e) ship phase detected from the assignee's ROSTER phase, with no phase stamp", async () => {
@@ -1043,12 +1153,12 @@ describe("transition_ticket — ship-phase Done needs a completion record (TEAM-
     expect(res.reason).toBe("completion_record_required");
     expect(res.hint).toBe(HINT);
     expect(h.state.statusUpdates).toHaveLength(0);
-    expect(h.state.s3Heads).toEqual([RECORD_KEY]);
+    expect(h.state.s3RecordReads).toEqual([RECORD_KEY]);
   });
 
   it("(f) an INDETERMINATE S3 answer refuses — fails closed, and leaks nothing", async () => {
     h.state.items[SHIP] = shipTicket();
-    h.state.headImpl = () => {
+    h.state.recordImpl = () => {
       const err = new Error("User: arn:aws:sts::…:assumed-role/… is not authorized");
       err.name = "AccessDenied";
       err.$metadata = { httpStatusCode: 403 };
@@ -1063,5 +1173,982 @@ describe("transition_ticket — ship-phase Done needs a completion record (TEAM-
     expect(res.content[0].text).toContain("could not read");
     expect(res.content[0].text).toContain("AccessDenied");
     expect(res.content[0].text).not.toContain("assumed-role");
+  });
+
+  // ── TEAM-4757 R3-2: the record's BODY is the proof, not its existence ──────
+
+  it("(g) a record with followUpsPending:true is REFUSED — the R3-2 hole", async () => {
+    // reportCompletion's own state when a follow-up create failed: the record is
+    // durable, the ticket is deliberately still open, and the follow-up (a
+    // post-deploy verification, say) was never filed. Closing here cascades and
+    // completes the epic over work that does not exist.
+    h.state.items[SHIP] = shipTicket();
+    h.state.s3Objects[RECORD_KEY] = {
+      ticketId: SHIP,
+      summary: "deployed",
+      followUpsPending: true,
+      status: "complete_pending_follow_ups",
+    };
+
+    const res = await transition({ ticket_id: SHIP, to_status: "done" });
+
+    expect(res.ok).toBe(false);
+    expect(res.reason).toBe("completion_record_required");
+    expect(res.hint).toBe(HINT);
+    // The message names the state AND the one call that fixes it.
+    expect(res.content[0].text).toContain(
+      `${RECORD_KEY} has followUpsPending:true (status complete_pending_follow_ups)`
+    );
+    expect(res.content[0].text).toContain(
+      "re-run WorkflowOutput___report_completion with the same arguments to materialize the follow-ups"
+    );
+    // Nothing moved, and the record was read exactly once.
+    expect(h.state.statusUpdates).toHaveLength(0);
+    expect(h.state.s3RecordReads).toEqual([RECORD_KEY]);
+  });
+
+  it("(h) followUpsPending:false + status complete closes", async () => {
+    h.state.items[SHIP] = shipTicket();
+    h.state.s3Objects[RECORD_KEY] = { ticketId: SHIP, followUpsPending: false, status: "complete" };
+
+    const res = await transition({ ticket_id: SHIP, to_status: "done" });
+
+    expect(res).toMatchObject({ key: SHIP, status: "transitioned", to: "done" });
+    expect(h.state.statusUpdates).toHaveLength(1);
+  });
+
+  it("(i) a PRE-4756 record — neither field — still closes", async () => {
+    // Every record written before TEAM-4756 looks like this, and the invariant held
+    // for it too (it predates follow-ups entirely). `=== false` instead of `!== true`
+    // would strand every in-flight run at the moment this deploys.
+    h.state.items[SHIP] = shipTicket();
+    h.state.s3Objects[RECORD_KEY] = { ticketId: SHIP, summary: "shipped", pr_url: "https://example.test/pr/1" };
+
+    const res = await transition({ ticket_id: SHIP, to_status: "done" });
+
+    expect(res).toMatchObject({ key: SHIP, status: "transitioned", to: "done" });
+    expect(h.state.statusUpdates).toHaveLength(1);
+  });
+
+  it("(i, cont.) a sweep SKIP-record closes, and so does the transition-failed restamp", async () => {
+    // workflow-output's sweepSkipRecord deliberately stamps neither field (a skip is
+    // not a completion report), and the `complete_transition_failed` restamp
+    // deliberately leaves followUpsPending false — the follow-ups ARE filed there and
+    // only the Done write failed, so closing it directly is a legitimate recovery.
+    h.state.items[SHIP] = shipTicket();
+    h.state.s3Objects[RECORD_KEY] = {
+      ticketId: SHIP,
+      evidence_kind: "skipped",
+      skipped: true,
+      reason: "empty_sweep_no_siblings",
+    };
+    expect((await transition({ ticket_id: SHIP, to_status: "done" })).status).toBe("transitioned");
+
+    h.state.items[SHIP] = shipTicket();
+    h.state.s3Objects[RECORD_KEY] = {
+      ticketId: SHIP,
+      followUpsPending: false,
+      status: "complete_transition_failed",
+    };
+    expect((await transition({ ticket_id: SHIP, to_status: "done" })).status).toBe("transitioned");
+  });
+
+  it("(j) followUpsPending:\"true\" (a STRING) closes — the test is `=== true`, not truthiness", async () => {
+    h.state.items[SHIP] = shipTicket();
+    h.state.s3Objects[RECORD_KEY] = { ticketId: SHIP, followUpsPending: "true" };
+
+    const res = await transition({ ticket_id: SHIP, to_status: "done" });
+
+    expect(res).toMatchObject({ key: SHIP, status: "transitioned", to: "done" });
+  });
+
+  it("(k) followUpsPending:true with no status names the status `unstated`", async () => {
+    h.state.items[SHIP] = shipTicket();
+    h.state.s3Objects[RECORD_KEY] = { ticketId: SHIP, followUpsPending: true };
+
+    const res = await transition({ ticket_id: SHIP, to_status: "done" });
+
+    expect(res.reason).toBe("completion_record_required");
+    expect(res.content[0].text).toContain("has followUpsPending:true (status unstated)");
+    expect(h.state.statusUpdates).toHaveLength(0);
+  });
+
+  it.each([
+    ["non-JSON", "not json at all", "unparseable JSON"],
+    ["empty", "", "an empty body"],
+    ["a JSON array", "[]", "parsed to an array, not an object"],
+    ["JSON null", "null", "parsed to null, not an object"],
+  ])("(l) an UNREADABLE body (%s) refuses — fails closed", async (_label, body, detail) => {
+    // A record we cannot parse cannot tell us whether its follow-ups are pending, and
+    // "could not tell" is not "they are filed" — the same three-outcome discipline as
+    // workflow-output's readCdLedger.
+    h.state.items[SHIP] = shipTicket();
+    h.state.s3Objects[RECORD_KEY] = body;
+
+    const res = await transition({ ticket_id: SHIP, to_status: "done" });
+
+    expect(res.ok).toBe(false);
+    expect(res.reason).toBe("completion_record_required");
+    expect(res.content[0].text).toContain(`${RECORD_KEY} could not be read as a completion record (${detail}`);
+    expect(res.content[0].text).toContain("Re-run WorkflowOutput___report_completion");
+    expect(h.state.statusUpdates).toHaveLength(0);
+  });
+});
+
+/**
+ * TEAM-4739 — the typed gate guard, in the mechanics only THIS twin has.
+ *
+ * The cross-provider truth table lives in src/lib/workflow/gate-guard-parity.test.ts
+ * (it drives both Lambdas through the same rows and compares the refusal payloads
+ * byte for byte). What is asserted here is what has no Jira counterpart:
+ *   - the UNSET env default: with no PIPELINE_TOOLS_LAMBDA the guard admits and
+ *     never constructs a client — the configuration every existing install has;
+ *   - `planGateLabelWrite`'s shapes, which exist because DynamoDB forbids one
+ *     UpdateExpression from touching both `labels` and `labels[i]`;
+ *   - the conditional status write losing a race with a concurrent labeller.
+ */
+describe("transition_ticket — typed gate guard, DynamoDB-side mechanics (TEAM-4739)", () => {
+  const transition = (args) => handler({ name: "Tickets___transition_ticket", arguments: args });
+  const GATE = "TEAM-4700";
+  const PIPELINE = "hub-x-deploy";
+  const EXEC = "0f8fad5b-d9cb-469f-a165-70867728950e";
+
+  const gateTicket = (labels, extra = {}) => ({
+    ticketId: GATE,
+    status: "in_review",
+    assignee: "human:reviewer",
+    labels,
+    workflowId: "wf_1",
+    ...extra,
+  });
+  const DEPLOY_LABELS = [`gate:deploy-approval`, `pipeline:${PIPELINE}`, `exec:${EXEC}`];
+
+  describe("with NO PIPELINE_TOOLS_LAMBDA configured (the default install)", () => {
+    it("admits the close, stamps indeterminate, and never builds a probe", async () => {
+      // This is the fail direction stated as a deployment fact: an install that has
+      // not been given the probe function must not have every gate ticket become
+      // uncloseable. `probe_not_configured` is an indeterminate, not a refusal.
+      h.state.items[GATE] = gateTicket(DEPLOY_LABELS);
+
+      const res = await transition({ ticket_id: GATE, to_status: "done" });
+
+      expect(res.gateVerification).toMatchObject({
+        result: "indeterminate",
+        reason: "probe_failed",
+        evidence: "probe_not_configured",
+        gateKind: "deploy-approval",
+      });
+      expect(h.state.probes, "no client, no invoke").toHaveLength(0);
+      expect(h.state.statusUpdates).toHaveLength(1);
+      expect(h.state.statusUpdates[0].ExpressionAttributeValues[":s"]).toBe("done");
+    });
+
+    it("a ci-unavailable gate admits too", async () => {
+      h.state.items[GATE] = gateTicket(["gate:ci-unavailable", `head:${"a".repeat(40)}`]);
+      const res = await transition({ ticket_id: GATE, to_status: "done" });
+      expect(res.gateVerification.result).toBe("indeterminate");
+      expect(h.state.statusUpdates).toHaveLength(1);
+    });
+  });
+
+  describe("with the probe configured", () => {
+    beforeEach(async () => {
+      await reloadWithEnv({ PIPELINE_TOOLS_LAMBDA: "hub-pipeline-tools", EVENTS_TABLE: "agentcore-hub-events" });
+    });
+
+    it("refuses an OPEN approval, leaves the ticket, and pages exactly once", async () => {
+      h.state.probeBy.Pipeline___get_state = {
+        result: { waitingOn: { stage: "Deploy", action: "ApproveDeploy", holdsGate: "this" } },
+      };
+      h.state.items[GATE] = gateTicket(DEPLOY_LABELS);
+
+      const res = await transition({ ticket_id: GATE, to_status: "done" });
+
+      expect(res).toMatchObject({ ok: false, reason: "gate_condition_unmet", stage: "Deploy", action: "ApproveDeploy" });
+      expect(h.state.statusUpdates, "the ticket does not move").toHaveLength(0);
+      expect(h.state.labelUpdates.map((u) => u.ExpressionAttributeValues[":label"])).toEqual(["gate:awaiting-console"]);
+      expect(h.state.events.map((e) => e.type)).toEqual(["gate.repaged"]);
+      expect(h.state.events[0].detail).toMatchObject({ ticketId: GATE, gateKind: "deploy-approval", attempt: 1 });
+    });
+
+    it("the conditional label add is the event dedupe — a repeat refusal is silent", async () => {
+      h.state.probeBy.Pipeline___get_state = { result: { waitingOn: { holdsGate: "this" } } };
+      h.state.items[GATE] = gateTicket([...DEPLOY_LABELS, "gate:awaiting-console"]);
+      // The label is already on the row, so its conditional append fails → no page.
+      h.state.condFail.push("gate:awaiting-console");
+
+      const res = await transition({ ticket_id: GATE, to_status: "done" });
+
+      expect(res.reason).toBe("gate_condition_unmet");
+      expect(h.state.events, "no second gate.repaged").toHaveLength(0);
+    });
+
+    it("a refusal survives an unwritable events table and an unlabelable ticket", async () => {
+      // Every side effect is best-effort: a correct refusal must not degrade into a
+      // tool error because the events table throttled.
+      h.state.probeBy.Pipeline___get_state = { result: { waitingOn: { holdsGate: "this" } } };
+      h.state.items[GATE] = gateTicket(DEPLOY_LABELS);
+      h.state.condFail.push("gate:awaiting-console");
+
+      const res = await transition({ ticket_id: GATE, to_status: "done" });
+      expect(res.reason).toBe("gate_condition_unmet");
+      expect(res.hint).toContain("still OPEN");
+    });
+
+    it("EVENTS_TABLE unset ⇒ no event, same refusal", async () => {
+      delete process.env.EVENTS_TABLE;
+      await reloadWithEnv({ PIPELINE_TOOLS_LAMBDA: "hub-pipeline-tools" });
+      h.state.probeBy.Pipeline___get_state = { result: { waitingOn: { holdsGate: "this" } } };
+      h.state.items[GATE] = gateTicket(DEPLOY_LABELS);
+
+      const res = await transition({ ticket_id: GATE, to_status: "done" });
+
+      expect(res.reason).toBe("gate_condition_unmet");
+      expect(h.state.events).toHaveLength(0);
+      expect(h.state.labelUpdates).toHaveLength(1); // the label still lands
+    });
+
+    describe("planGateLabelWrite — one UpdateExpression, one shape per label state", () => {
+      beforeEach(() => {
+        h.state.probeBy.Pipeline___get_state = { result: { waitingOn: null } };
+      });
+
+      it("no parked label ⇒ a plain list_append, no condition", async () => {
+        h.state.items[GATE] = gateTicket(DEPLOY_LABELS);
+        await transition({ ticket_id: GATE, to_status: "done" });
+        const w = h.state.statusUpdates[0];
+        expect(w.UpdateExpression).toContain("list_append(if_not_exists(#l, :emptyl), :stampl)");
+        expect(w.ExpressionAttributeValues[":stampl"]).toEqual(["gateverify:verified"]);
+        expect(w.ConditionExpression).toBeUndefined();
+      });
+
+      it("a parked label ⇒ its SLOT is overwritten with the stamp, under a condition", async () => {
+        // Not `SET labels = list_append(...)` + `REMOVE labels[i]`: DynamoDB rejects
+        // overlapping document paths. Not a whole-list SET either — that clobbers a
+        // concurrent labeller.
+        h.state.items[GATE] = gateTicket(["gate:awaiting-console", ...DEPLOY_LABELS]);
+        await transition({ ticket_id: GATE, to_status: "done" });
+        const w = h.state.statusUpdates[0];
+        expect(w.UpdateExpression).toContain("#l[0] = :stampl");
+        expect(w.UpdateExpression).not.toContain("list_append");
+        expect(w.ExpressionAttributeValues[":stampl"]).toBe("gateverify:verified");
+        expect(w.ConditionExpression).toBe("#l[0] = :awaiting");
+        expect(w.ExpressionAttributeValues[":awaiting"]).toBe("gate:awaiting-console");
+      });
+
+      it("stamp already present ⇒ the parked slot is REMOVEd and nothing re-added", async () => {
+        h.state.items[GATE] = gateTicket([...DEPLOY_LABELS, "gate:awaiting-console", "gateverify:verified"]);
+        await transition({ ticket_id: GATE, to_status: "done" });
+        const w = h.state.statusUpdates[0];
+        expect(w.UpdateExpression).toMatch(/REMOVE #l\[3]/);
+        expect(w.ExpressionAttributeValues[":stampl"]).toBeUndefined();
+      });
+
+      it("a CONTRADICTORY stamp ⇒ the park slot takes the new one, the stale slot is REMOVEd", async () => {
+        // TEAM-4750 B2. Both clauses in ONE expression, at distinct indices: only
+        // `labels` beside `labels[i]` is forbidden, and multiple REMOVEs resolve
+        // against the original indices. Two stamps on one ticket would make the
+        // label record of why the gate closed unreadable.
+        h.state.items[GATE] = gateTicket([...DEPLOY_LABELS, "gate:awaiting-console", "gateverify:indeterminate"]);
+        await transition({ ticket_id: GATE, to_status: "done" });
+        const w = h.state.statusUpdates[0];
+        expect(w.UpdateExpression).toMatch(/#l\[3] = :stampl/);
+        expect(w.UpdateExpression).toMatch(/REMOVE #l\[4]/);
+        expect(w.UpdateExpression).not.toContain("list_append");
+        expect(w.ExpressionAttributeValues[":stampl"]).toBe("gateverify:verified");
+        expect(w.ExpressionAttributeValues[":opp0"]).toBe("gateverify:indeterminate");
+        // Both touched slots are conditioned, so the race fallback below covers them.
+        expect(w.ConditionExpression).toBe("#l[3] = :awaiting AND #l[4] = :opp0");
+      });
+
+      it("a stale stamp with NO park label ⇒ the stale slot itself becomes the new stamp", async () => {
+        // Nothing else is being cleared, so reusing the contradictory slot is what
+        // keeps this a single slot write rather than an append plus a remove.
+        h.state.items[GATE] = gateTicket([...DEPLOY_LABELS, "gateverify:indeterminate"]);
+        await transition({ ticket_id: GATE, to_status: "done" });
+        const w = h.state.statusUpdates[0];
+        expect(w.UpdateExpression).toMatch(/#l\[3] = :stampl/);
+        expect(w.UpdateExpression).not.toContain("REMOVE");
+        expect(w.UpdateExpression).not.toContain("list_append");
+        expect(w.ExpressionAttributeValues[":stampl"]).toBe("gateverify:verified");
+        expect(w.ConditionExpression).toBe("#l[3] = :opp0");
+      });
+
+      it("losing the race on the OPPOSITE slot still transitions — without the label clause", async () => {
+        // The same fallback the park-label race gets: every slot the plan touches is
+        // conditioned, so a concurrent labeller costs the cosmetic label edit and
+        // never a verified close.
+        h.state.items[GATE] = gateTicket([...DEPLOY_LABELS, "gateverify:indeterminate"]);
+        h.state.statusRaceOnce = true;
+
+        const res = await transition({ ticket_id: GATE, to_status: "done" });
+
+        expect(res).toMatchObject({ status: "transitioned", to: "done" });
+        expect(h.state.statusUpdates).toHaveLength(2);
+        expect(h.state.statusUpdates[1].ConditionExpression).toBeUndefined();
+        expect(h.state.statusUpdates[1].UpdateExpression).not.toContain("#l");
+        expect(h.state.statusUpdates[1].ExpressionAttributeValues[":gv"].result).toBe("verified");
+      });
+
+      it("the stamp rides in the SAME write as the status", async () => {
+        h.state.items[GATE] = gateTicket(DEPLOY_LABELS);
+        await transition({ ticket_id: GATE, to_status: "done" });
+        expect(h.state.statusUpdates).toHaveLength(1);
+        const w = h.state.statusUpdates[0];
+        expect(w.UpdateExpression).toContain("#s = :s");
+        expect(w.UpdateExpression).toContain("#gv = :gv");
+        expect(w.ExpressionAttributeValues[":gv"]).toMatchObject({ result: "verified", gateKind: "deploy-approval" });
+      });
+
+      it("losing the label race still transitions — without the label clause", async () => {
+        // The gate was verified; the only thing lost is a cosmetic label edit. A
+        // verified gate that cannot close because a labeller raced it would be the
+        // same wedge the whole guard is built to avoid.
+        h.state.items[GATE] = gateTicket(["gate:awaiting-console", ...DEPLOY_LABELS]);
+        h.state.statusRaceOnce = true;
+
+        const res = await transition({ ticket_id: GATE, to_status: "done" });
+
+        expect(res).toMatchObject({ status: "transitioned", to: "done" });
+        expect(h.state.statusUpdates).toHaveLength(2);
+        expect(h.state.statusUpdates[1].ConditionExpression).toBeUndefined();
+        expect(h.state.statusUpdates[1].UpdateExpression).not.toContain("#l");
+        // The verdict is still recorded — the retry drops the LABEL, not the stamp.
+        expect(h.state.statusUpdates[1].ExpressionAttributeValues[":gv"].result).toBe("verified");
+      });
+    });
+
+    it("a non-gate ticket's write is byte-identical to the pre-TEAM-4739 one", async () => {
+      h.state.items[GATE] = gateTicket(["phase:development"]);
+      const res = await transition({ ticket_id: GATE, to_status: "done" });
+      expect(res.gateVerification).toBeUndefined();
+      expect(h.state.probes).toHaveLength(0);
+      expect(h.state.statusUpdates[0].UpdateExpression).toBe("SET #s = :s, #u = :u");
+    });
+
+    it("the ship-phase completion gate still wins — it refuses BEFORE any probe", async () => {
+      // Ordering matters: a ship ticket with no completion record must report the
+      // missing record (which the agent can produce), not a gate verdict.
+      // An AGENT assignee: a `human:` one is never a ship-phase ticket (that is
+      // what makes the gate tickets above exempt from the completion-record gate).
+      h.state.items[GATE] = gateTicket(["gate:deploy-approval", "phase:ship"], {
+        assignee: "agentcore_hub_release_manager",
+      });
+      const res = await transition({ ticket_id: GATE, to_status: "done" });
+      expect(res.reason).toBe("completion_record_required");
+      expect(h.state.probes, "no gate probe on a completion-record refusal").toHaveLength(0);
+    });
+  });
+});
+
+/**
+ * TEAM-4739 — create_ticket's gate-loop seam, DynamoDB-side.
+ *
+ * The cross-provider matrix is in src/lib/workflow/gate-loop-parity.test.ts. What is
+ * local here: the seam's PLACE in createTicket (before the id counter is touched),
+ * and that the parentId-index Query is the only gather it does.
+ */
+describe("create_ticket — gate-loop seam, DynamoDB-side (TEAM-4739)", () => {
+  const EPIC = "TEAM-1";
+  const SHA = "b".repeat(40);
+  // Both bindings: since TEAM-4764 a ci-unavailable gate with no `pipeline:` label is
+  // refused by the shape seam, which runs before the loop seam under test here.
+  const CI_GATE = ["gate:ci-unavailable", "pipeline:hub-x-deploy", `head:${SHA}`];
+  const priorRow = (id) => ({ ticketId: id, labels: ["gate-ci-unavailable", `head-${SHA}`] });
+
+  beforeEach(async () => {
+    await reloadWithEnv({ PIPELINE_TOOLS_LAMBDA: "hub-pipeline-tools", EVENTS_TABLE: "agentcore-hub-events" });
+    h.state.items[EPIC] = { ticketId: EPIC, type: "epic", workflowId: "wf_1", labels: [] };
+  });
+
+  it("refuses the SECOND, and mints NO ticket id", async () => {
+    h.state.siblings.push(priorRow("TEAM-800"));
+
+    const res = await create({ summary: "CI is unavailable", labels: CI_GATE, parent_key: EPIC });
+
+    expect(res).toMatchObject({ ok: false, reason: "gate_loop_environmental", existingTicketId: "TEAM-800" });
+    expect(h.state.puts, "no ticket written").toHaveLength(0);
+    expect(h.state.counter, "the shared id counter is untouched").toBe(0);
+    expect(h.state.labelUpdates[0].ExpressionAttributeValues[":label"]).toBe("gate:loop-broken");
+    expect(h.state.events.map((e) => e.type)).toEqual(["workflow.blocked"]);
+    expect(h.state.events[0].detail.attempt, "the attempt being refused").toBe(2);
+  });
+
+  it("the __COUNTER__ row is never counted as a sibling", async () => {
+    // It lives in the same table and would otherwise be mapped into the verdict as
+    // a labelless row — harmless for a targeted gate, but it must not be there.
+    // Seeded ALONE: since TEAM-4780 a single real prior legitimately refuses, so
+    // pairing it with one would stop testing what this row names.
+    h.state.siblings.push({ ticketId: "__COUNTER__", nextNum: 42 });
+    const res = await create({ summary: "CI is unavailable", labels: CI_GATE, parent_key: EPIC });
+    expect(res.ok).not.toBe(false);
+    expect(h.state.puts).toHaveLength(1);
+  });
+
+  it("REFUSES when the sibling scan fails — the scan is the verdict's only evidence", async () => {
+    // TEAM-4780. The same scan autowireOpenGate refuses on (TEAM-4752 D1), so it
+    // cannot have the opposite fail direction one seam earlier: a gate created over
+    // an unknown sibling set may be the very loop the breaker exists to stop.
+    h.state.queryThrows = true;
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { siblingScanRefusal } = await import("./index.mjs");
+
+    const res = await create({ summary: "CI is unavailable", labels: CI_GATE, parent_key: EPIC });
+
+    // The EXACT shared body — when this scan fails, the open-gate freeze state the
+    // refusal names is equally unknown, so there is one wording, not two.
+    expect(res.content[0].text).toBe(
+      `Error: ${siblingScanRefusal(EPIC, "Requested resource not found: parentId-index")}`
+    );
+    expect(h.state.puts, "nothing minted").toHaveLength(0);
+    expect(h.state.counter, "not even a ticket number").toBe(0);
+    expect(h.state.events, "and nothing claimed about a loop it could not see").toHaveLength(0);
+    expect(warn.mock.calls.flat().join(" ")).toContain("REFUSING the create");
+    warn.mockRestore();
+  });
+
+  it("an ordinary ticket makes no sibling scan and no probe", async () => {
+    h.state.siblings.push(priorRow("TEAM-800"), priorRow("TEAM-810"));
+    await create({ ...BASE });
+    expect(h.state.puts).toHaveLength(1);
+    expect(h.state.probes).toHaveLength(0);
+  });
+});
+
+/**
+ * TEAM-4740 FR-12 — base_branch at CREATE time.
+ *
+ * A ticket filed mid-run with no branch identity inherits whatever branch its
+ * assignee happens to be on; while a Merge Approval gate is open that is the
+ * integration branch the merge is about to supersede, so the work evaporates with
+ * it (run p5ogpg / TEAM-4663). The contract: a stated branch is VALIDATED (a bad
+ * one mints nothing), PERSISTED as a field, and written as one machine-parseable
+ * description line — the only carrier that survives get_issue in both providers.
+ * An absent branch changes nothing at all.
+ *
+ * The regex + refusal text + line format are held identical to the jira twin by
+ * src/lib/workflow/base-branch-parity.test.ts; this file owns the BEHAVIOUR.
+ */
+describe("create_ticket — base_branch (FR-12)", () => {
+  it("persists the branch as a field, a description line, and on the response", async () => {
+    const res = await create({ ...BASE, description: "Fix the abandon guard.", base_branch: "main" });
+
+    expect(h.state.puts).toHaveLength(1);
+    const item = h.state.puts[0];
+    expect(item.baseBranch).toBe("main");
+    // The line is on its own line, AFTER the prose, and matches the parser
+    // workflow-output's FR-5 refusal will use.
+    expect(item.description).toBe("Fix the abandon guard.\n\nbase_branch: main");
+    expect(item.description.match(/^base_branch:\s*(\S+)\s*$/m)[1]).toBe("main");
+    // And the caller sees it back under the wire name it sent.
+    expect(res.ticket.base_branch).toBe("main");
+    expect(res.ticket.description).toBe(item.description);
+  });
+
+  it("accepts a real integration branch name", async () => {
+    await create({ ...BASE, base_branch: "feature/TEAM-4734--si-system-binding-gate-resolution-deplo" });
+    expect(h.state.puts[0].baseBranch).toBe("feature/TEAM-4734--si-system-binding-gate-resolution-deplo");
+  });
+
+  it("trims, so a padded value is stored canonically", async () => {
+    await create({ ...BASE, base_branch: "  main  " });
+    expect(h.state.puts[0].baseBranch).toBe("main");
+    expect(h.state.puts[0].description).toBe("base_branch: main");
+  });
+
+  it("REFUSES an invalid branch and mints NOTHING — not even a counter bump", async () => {
+    const res = await create({ ...BASE, base_branch: "--upload-pack=x" });
+
+    expect(res.content[0].text).toMatch(/^Error: /);
+    expect(res.content[0].text).toContain("'base_branch'");
+    expect(res.content[0].text).toContain('"--upload-pack=x"');
+    expect(h.state.puts).toHaveLength(0);
+    expect(h.state.counter).toBe(0);
+  });
+
+  it.each(["-main", "/main", "feature/../main", "main@{1}", "main.lock", "feature/", "a b"])(
+    "REFUSES %j",
+    async (bad) => {
+      const res = await create({ ...BASE, base_branch: bad });
+      expect(res.content[0].text).toMatch(/^Error: /);
+      expect(h.state.puts).toHaveLength(0);
+    }
+  );
+
+  it("an ABSENT branch leaves the ticket byte-identical to before the feature", async () => {
+    await create({ ...BASE, description: "Plain ticket." });
+    const item = h.state.puts[0];
+    expect("baseBranch" in item).toBe(false);
+    expect(item.description).toBe("Plain ticket.");
+    const res = await create({ ...BASE });
+    expect("base_branch" in res.ticket).toBe(false);
+    expect(h.state.puts[1].description).toBe("");
+  });
+
+  it("an EMPTY branch is 'unstated', not invalid", async () => {
+    for (const v of ["", "   "]) {
+      h.state.puts.length = 0;
+      const res = await create({ ...BASE, base_branch: v });
+      expect(res.status).toBe("created");
+      expect("baseBranch" in h.state.puts[0]).toBe(false);
+    }
+  });
+});
+
+/**
+ * TEAM-4740 FR-5 (create half) — freeze new work behind an OPEN Merge Approval
+ * gate.
+ *
+ * Observed on run TEAM-4660: TEAM-4677 was filed while the Merge Approval gate
+ * TEAM-4668 was open, so it was dispatched immediately and its work went onto the
+ * integration branch the merge then superseded. The fix is an ordering edge added
+ * at CREATE time — the new ticket is blocked_by the CD ticket and carries a banner
+ * telling its assignee to deliver via its own PR to main.
+ *
+ * Every case here is also a statement about the FAIL DIRECTION: the freeze is
+ * added only on positive evidence (a gate that is provably open AND a CD ticket
+ * that is provably unfinished), and anything else — a scan failure, a human
+ * assignee, a settled CD ticket, no gate at all — creates the ticket UNFROZEN.
+ */
+describe("create_ticket — open-gate autowire (FR-5)", () => {
+  const EPIC = "TEAM-4734";
+  const GATE = "TEAM-4668";
+  const CD = "TEAM-4703";
+
+  /** The human Merge Approval gate, as the hub creates it: labels + title. */
+  const gateRow = (overrides = {}) => ({
+    ticketId: GATE,
+    parentId: EPIC,
+    title: "Merge Approval: [SI] system binding",
+    status: "in_review",
+    labels: ["human-review", "reviewer:tycen"],
+    assignee: "human:tycen",
+    createdAt: "2026-09-14T17:33:00.000Z",
+    ...overrides,
+  });
+
+  /** The run's CD ticket, stamped with the ship phase. */
+  const cdRow = (overrides = {}) => ({
+    ticketId: CD,
+    parentId: EPIC,
+    title: "CD: merge + deploy",
+    status: "todo",
+    labels: ["phase:ship"],
+    assignee: "agentcore_hub_release_manager",
+    createdAt: "2026-09-14T16:00:00.000Z",
+    ...overrides,
+  });
+
+  const AGENT = { ...BASE, parent_key: EPIC };
+
+  it("freezes a new AGENT ticket behind the CD ticket and says why", async () => {
+    h.state.siblings.push(gateRow(), cdRow());
+
+    const res = await create({ ...AGENT, description: "Fix the abandon guard." });
+
+    const item = h.state.puts[0];
+    expect(item.blockedBy).toEqual([CD]);
+    expect(item.status).toBe("blocked");
+    // The banner LEADS the description (it changes what the assignee must do) and
+    // names the ticket that has to land first.
+    expect(item.description.startsWith("DELIVERY CONSTRAINT:")).toBe(true);
+    expect(item.description).toContain(CD);
+    expect(item.description).toContain("your OWN pull request to main");
+    expect(item.description).toContain("Fix the abandon guard.");
+    // And the caller is told, in a shape it can branch on.
+    expect(res.autowired).toEqual({
+      reason: "open_gate",
+      blockedBy: [CD],
+      gateTicketId: GATE,
+    });
+  });
+
+  it("scans the parentId-index directly — labels are what the gate predicate reads", async () => {
+    h.state.siblings.push(gateRow(), cdRow());
+    await create({ ...AGENT });
+    expect(h.state.queries).toHaveLength(1);
+    expect(h.state.queries[0].IndexName).toBe("parentId-index");
+    expect(h.state.queries[0].ExpressionAttributeValues).toEqual({ ":pid": EPIC });
+  });
+
+  it("keeps the caller's own blockers and APPENDS the CD edge", async () => {
+    h.state.siblings.push(gateRow(), cdRow());
+    await create({ ...AGENT, blocked_by: "TEAM-4700" });
+    expect(h.state.puts[0].blockedBy).toEqual(["TEAM-4700", CD]);
+  });
+
+  it("does NOT freeze a human:* assignee — the gate is what everything waits on", async () => {
+    h.state.siblings.push(gateRow(), cdRow());
+
+    const res = await create({
+      ...AGENT,
+      assignee: "human:tycen",
+      summary: "Merge Approval: round 2",
+    });
+
+    expect(h.state.puts[0].blockedBy).toEqual([]);
+    expect(h.state.puts[0].status).toBe("todo");
+    expect(res.autowired).toBeUndefined();
+    // Decided before any I/O: freezing a human gate would deadlock the run, so the
+    // answer never depends on a scan succeeding.
+    expect(h.state.queries).toHaveLength(0);
+  });
+
+  it("adds no DUPLICATE edge when the caller already ordered it behind CD", async () => {
+    h.state.siblings.push(gateRow(), cdRow());
+
+    const res = await create({ ...AGENT, blocked_by: [CD] });
+
+    expect(h.state.puts[0].blockedBy).toEqual([CD]);
+    expect(res.autowired).toBeUndefined();
+    // No banner either: the ordering the banner explains was already the caller's.
+    expect(h.state.puts[0].description).toBe("");
+  });
+
+  it("does not freeze when the CD ticket is already done", async () => {
+    h.state.siblings.push(gateRow(), cdRow({ status: "done" }));
+    const res = await create({ ...AGENT });
+    expect(h.state.puts[0].blockedBy).toEqual([]);
+    expect(h.state.puts[0].status).toBe("todo");
+    expect(res.autowired).toBeUndefined();
+  });
+
+  it("does not freeze BEHIND THE GATE when there is no open gate", async () => {
+    // Same siblings, gate already approved — the merge has happened, the
+    // integration branch is no longer about to move under anyone, so no banner.
+    h.state.siblings.push(gateRow({ status: "done" }), cdRow());
+    const res = await create({ ...AGENT });
+    expect(h.state.puts[0].description).toBe("");
+    // TEAM-4763 P2: the open-gate half produced nothing, so the root-blocker half
+    // runs and orders the ticket behind the run's earliest still-open agent ticket.
+    // Different reason, different blocker source, no gateTicketId — and this is the
+    // behaviour change the feature is: "unfrozen" no longer means "dispatched now".
+    expect(res.autowired).toEqual({ reason: "no_root_blocker", rootTicketId: CD, blockedBy: [CD] });
+    expect(h.state.puts[0].blockedBy).toEqual([CD]);
+  });
+
+  it("does not freeze when a gate is open but no CD ticket exists", async () => {
+    h.state.siblings.push(gateRow());
+    const res = await create({ ...AGENT });
+    expect(h.state.puts[0].blockedBy).toEqual([]);
+    expect(res.autowired).toBeUndefined();
+  });
+
+  // TEAM-4752 D1 — this used to FAIL OPEN and create the ticket UNFROZEN, on the
+  // argument that an unfrozen ticket is recoverable. It is not: an unfrozen ticket
+  // is dispatched immediately, onto a branch the open merge is about to supersede,
+  // and that work is thrown away. Nor is "create it blocked" the answer — a blocked
+  // ticket with no blocker edge is a permanent wedge. So: refuse, and let the agent
+  // retry.
+  it("REFUSES the create when the scan errors — nothing minted, not even a ticket number", async () => {
+    h.state.queryThrows = true;
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const res = await create({ ...AGENT, description: "Fix the abandon guard." });
+
+    expect(res.content[0].text).toMatch(/^Error: create_ticket refused:/);
+    expect(res.content[0].text).toContain(`the sibling scan under ${EPIC} failed`);
+    expect(res.content[0].text).toContain("Nothing was created. Retry the call.");
+    // Refused before nextTicketId, so the counter is untouched too.
+    expect(h.state.puts).toHaveLength(0);
+    expect(h.state.counter).toBe(0);
+    expect(warn.mock.calls.flat().join(" ")).toContain("REFUSING the create");
+    warn.mockRestore();
+  });
+
+  it("refuses with the EXACT shared body — the twins may not drift", async () => {
+    h.state.queryThrows = true;
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { siblingScanRefusal } = await import("./index.mjs");
+    const res = await create({ ...AGENT });
+    expect(res.content[0].text).toBe(
+      `Error: ${siblingScanRefusal(EPIC, "Requested resource not found: parentId-index")}`
+    );
+  });
+
+  it("a scan error does NOT refuse a human gate — that path never scans", async () => {
+    // The refusal is confined to exactly the path the autowire governs. A human
+    // gate returns `untouched` before the try block, so it is unaffected.
+    h.state.queryThrows = true;
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const res = await create({ summary: "Merge Approval", assignee: "human:tycen", parent_key: EPIC });
+    expect(res.status).toBe("created");
+    expect(h.state.puts[0].blockedBy).toEqual([]);
+  });
+
+  it("never scans at all without a parent — there are no siblings to scan", async () => {
+    h.state.siblings.push(gateRow(), cdRow());
+    const res = await create({ ...BASE });
+    expect(h.state.queries).toHaveLength(0);
+    expect(res.autowired).toBeUndefined();
+  });
+
+  it("a scan error does NOT refuse a parentless create either", async () => {
+    h.state.queryThrows = true;
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const res = await create({ ...BASE });
+    expect(res.status).toBe("created");
+    expect(h.state.puts).toHaveLength(1);
+  });
+
+  it("detects the gate by LABEL as well as by title", async () => {
+    // sanitizeUserLabels maps ':' to '-', so a label-stamped gate can arrive in
+    // either form; MERGE_GATE_LABEL_RE accepts both.
+    h.state.siblings.push(
+      gateRow({ title: "Approve the merge", labels: ["human-review", "gate-merge-approval"] }),
+      cdRow()
+    );
+    const res = await create({ ...AGENT });
+    expect(res.autowired.gateTicketId).toBe(GATE);
+  });
+
+  it("is not fooled by a human ticket that is neither a merge gate nor in review", async () => {
+    h.state.siblings.push(
+      gateRow({ title: "Bug intake triage", labels: ["human-review", "reviewer:tycen"] }),
+      cdRow()
+    );
+    const res = await create({ ...AGENT });
+    // TEAM-4763 P2: what must never happen here is the GATE freeze — the root
+    // autowire that does run names no gate and writes no banner.
+    expect(res.autowired.reason).toBe("no_root_blocker");
+    expect(res.autowired.gateTicketId).toBeUndefined();
+    expect(h.state.puts[0].description).toBe("");
+    // …nor by a merge gate that has not been presented to anyone yet.
+    h.state.puts.length = 0;
+    h.state.siblings.length = 0;
+    h.state.siblings.push(gateRow({ status: "todo" }), cdRow());
+    expect((await create({ ...AGENT })).autowired.reason).toBe("no_root_blocker");
+  });
+
+  it("finds the CD ticket via the phase:ship label AND via the roster fallback", async () => {
+    // Label stamp (above) and the roster path: no labels at all, the assignee's
+    // phase in config/agents.json (here the fallback map) is what says 'ship'.
+    h.state.siblings.push(gateRow(), cdRow({ labels: [] }));
+    expect((await create({ ...AGENT })).autowired).toEqual({
+      reason: "open_gate",
+      blockedBy: [CD],
+      gateTicketId: GATE,
+    });
+
+    // A non-ship agent sibling is NOT a CD ticket, so the GATE freeze does not
+    // fire — TEAM-4763 P2's root autowire then orders it behind that sibling as
+    // the run's root, with no banner and no gate named.
+    h.state.puts.length = 0;
+    h.state.siblings.length = 0;
+    h.state.siblings.push(
+      gateRow(),
+      cdRow({ ticketId: "TEAM-4690", labels: [], assignee: "agentcore_hub_backend_dev" })
+    );
+    expect((await create({ ...AGENT })).autowired).toEqual({
+      reason: "no_root_blocker",
+      rootTicketId: "TEAM-4690",
+      blockedBy: ["TEAM-4690"],
+    });
+  });
+
+  it("picks the NEWEST CD ticket when a re-run filed a second one", async () => {
+    h.state.siblings.push(
+      gateRow(),
+      cdRow({ ticketId: "TEAM-4600", createdAt: "2026-09-10T09:00:00.000Z" }),
+      cdRow({ ticketId: "TEAM-4710", createdAt: "2026-09-15T09:00:00.000Z" })
+    );
+    const res = await create({ ...AGENT });
+    expect(res.autowired.blockedBy).toEqual(["TEAM-4710"]);
+  });
+
+  it("ignores the ticket-id counter row the index also returns", async () => {
+    h.state.siblings.push({ ticketId: "__COUNTER__", parentId: EPIC, nextNum: 7 }, gateRow(), cdRow());
+    expect((await create({ ...AGENT })).autowired.blockedBy).toEqual([CD]);
+  });
+
+  it("composes banner + prose + base_branch line, in that order", async () => {
+    h.state.siblings.push(gateRow(), cdRow());
+    await create({ ...AGENT, description: "Own PR to main; this is hub infra.", base_branch: "main" });
+    const lines = h.state.puts[0].description.split("\n\n");
+    expect(lines).toHaveLength(3);
+    expect(lines[0].startsWith("DELIVERY CONSTRAINT:")).toBe(true);
+    expect(lines[1]).toBe("Own PR to main; this is hub infra.");
+    expect(lines[2]).toBe("base_branch: main");
+  });
+
+  it("audits the edge as a journey event — but only when EVENTS_TABLE is set", async () => {
+    h.state.siblings.push(gateRow(), cdRow());
+    // Dark by default (the deploy env sets no EVENTS_TABLE): one write, the ticket.
+    await create({ ...AGENT });
+    expect(h.state.puts).toHaveLength(1);
+    expect(h.state.events).toHaveLength(0);
+
+    process.env.EVENTS_TABLE = "agentcore-hub-events";
+    h.state.puts.length = 0;
+    await create({ ...AGENT, workflow_id: "wf_1757000000_si" });
+    delete process.env.EVENTS_TABLE;
+
+    // TEAM-4739's gate-loop event and TEAM-4740's autowire event both carry an
+    // `eventId`, so the mock routes any such Put into `h.state.events`, never
+    // `h.state.puts` — the ticket write and the audit write stay distinguishable
+    // by construction, not by array position.
+    expect(h.state.puts).toHaveLength(1);
+    expect(h.state.events).toHaveLength(1);
+    const event = h.state.events[0];
+    expect(event.workflowId).toBe("wf_1757000000_si");
+    expect(event.type).toBe("plan.autowired");
+    expect(event.detail).toEqual({
+      ticketId: event.detail.ticketId,
+      reason: "open_gate",
+      blockedBy: [CD],
+      gateTicketId: GATE,
+    });
+    // SEC-13: a per-create write must not accumulate forever.
+    expect(event.ttl).toBeGreaterThan(Date.now() / 1000);
+  });
+});
+
+describe("create_ticket — root-blocker autowire (TEAM-4763 P2, FR-11 seam 7b)", () => {
+  const EPIC = "TEAM-4734";
+  const ROOT = "TEAM-4735";       // the analyst's ticket: earliest non-human sibling
+  const LATER = "TEAM-4750";      // a later agent ticket — never the root
+
+  /** A sibling as scanSiblingTickets returns it (internal assignee form). */
+  const row = (ticketId, overrides = {}) => ({
+    ticketId,
+    parentId: EPIC,
+    title: `Work: ${ticketId}`,
+    status: "in_progress",
+    labels: [],
+    assignee: "agentcore_hub_requirements_analyst",
+    createdAt: "2026-09-14T10:00:00.000Z",
+    ...overrides,
+  });
+
+  const AGENT = { ...BASE, parent_key: EPIC };
+
+  it("orders a mid-run ticket behind the run's root and says so", async () => {
+    h.state.siblings.push(row(LATER, { createdAt: "2026-09-14T18:00:00.000Z" }), row(ROOT));
+
+    const res = await create({ ...AGENT, description: "Fix the abandon guard." });
+
+    expect(h.state.puts[0].blockedBy).toEqual([ROOT]);
+    expect(h.state.puts[0].status).toBe("blocked");
+    // No banner: DELIVERY CONSTRAINT is about a merge superseding a branch, which
+    // is not what is happening here. The prose the caller wrote is untouched.
+    expect(h.state.puts[0].description).toBe("Fix the abandon guard.");
+    expect(res.autowired).toEqual({
+      reason: "no_root_blocker",
+      rootTicketId: ROOT,
+      blockedBy: [ROOT],
+    });
+    // The earliest-created sibling wins, not the first one the index returned.
+    expect(res.autowired.rootTicketId).not.toBe(LATER);
+  });
+
+  it("reuses the open-gate scan — one Query, not two", async () => {
+    h.state.siblings.push(row(ROOT));
+    await create({ ...AGENT });
+    expect(h.state.queries).toHaveLength(1);
+  });
+
+  it("audits it through the same plan.autowired event, exactly once", async () => {
+    h.state.siblings.push(row(ROOT));
+    process.env.EVENTS_TABLE = "agentcore-hub-events";
+    await create({ ...AGENT, workflow_id: "wf_1757000000_si" });
+    delete process.env.EVENTS_TABLE;
+
+    expect(h.state.events).toHaveLength(1);
+    expect(h.state.events[0].type).toBe("plan.autowired");
+    expect(h.state.events[0].detail).toEqual({
+      ticketId: h.state.events[0].detail.ticketId,
+      reason: "no_root_blocker",
+      rootTicketId: ROOT,
+      blockedBy: [ROOT],
+    });
+  });
+
+  it("leaves a human:* assignee alone — a gate is what work waits ON", async () => {
+    h.state.siblings.push(row(ROOT));
+    const res = await create({ ...AGENT, assignee: "human:tycen", summary: "Merge Approval: round 2" });
+    expect(h.state.puts[0].blockedBy).toEqual([]);
+    expect(h.state.puts[0].status).toBe("todo");
+    expect(res.autowired).toBeUndefined();
+  });
+
+  it("leaves a caller that named its own blockers alone", async () => {
+    h.state.siblings.push(row(ROOT));
+    const res = await create({ ...AGENT, blocked_by: ["TEAM-4700"] });
+    expect(h.state.puts[0].blockedBy).toEqual(["TEAM-4700"]);
+    expect(res.autowired).toBeUndefined();
+  });
+
+  it("leaves the run's FIRST ticket alone — there is no root yet to wait for", async () => {
+    const res = await create({ ...AGENT });
+    expect(h.state.puts[0].blockedBy).toEqual([]);
+    expect(h.state.puts[0].status).toBe("todo");
+    expect(res.autowired).toBeUndefined();
+  });
+
+  it("leaves it alone when every sibling is human — a roster of gates is no root", async () => {
+    h.state.siblings.push(row("TEAM-4736", { assignee: "human:tycen", status: "in_review" }));
+    const res = await create({ ...AGENT });
+    expect(h.state.puts[0].blockedBy).toEqual([]);
+    expect(res.autowired).toBeUndefined();
+  });
+
+  // The load-bearing skip: a `blocked` ticket behind a DONE blocker is a permanent
+  // wedge — nothing re-fires the unblock cascade for an edge that was already
+  // settled when it appeared, and RECONCILE_SWEEP_MODE is off by default. By the
+  // time most mid-run tickets are filed the analyst's ticket is exactly this.
+  it("leaves it alone when the root is already done — a settled blocker is a wedge", async () => {
+    h.state.siblings.push(row(ROOT, { status: "done" }));
+    const res = await create({ ...AGENT });
+    expect(h.state.puts[0].blockedBy).toEqual([]);
+    expect(h.state.puts[0].status).toBe("todo");
+    expect(res.autowired).toBeUndefined();
+  });
+
+  // `skipped` and `cancelled` are not in isSettled (the gate half treats them as
+  // open on purpose), but they are over for this purpose — and worse: cascade.mjs
+  // resolves a blocker on done/cancelled only, so a skipped root never unblocks
+  // anything, ever.
+  it("leaves it alone when the root was SKIPPED or CANCELLED, same reason", async () => {
+    h.state.siblings.push(row(ROOT, { status: "skipped" }));
+    expect((await create({ ...AGENT })).autowired).toBeUndefined();
+
+    h.state.puts.length = 0;
+    h.state.siblings.length = 0;
+    h.state.siblings.push(row(ROOT, { status: "cancelled" }));
+    expect((await create({ ...AGENT })).autowired).toBeUndefined();
+  });
+
+  it("does not consider the counter row a candidate root", async () => {
+    h.state.siblings.push({ ticketId: "__COUNTER__", parentId: EPIC, nextNum: 7 }, row(ROOT));
+    expect((await create({ ...AGENT })).autowired.rootTicketId).toBe(ROOT);
+  });
+
+  // Precedence: the two halves can never both fire, because the root half runs only
+  // when the open-gate half produced nothing. With an open merge gate present the
+  // gate freeze wins — it is the more specific statement, and it carries the banner.
+  it("never fires alongside open_gate — the gate freeze wins, one autowire only", async () => {
+    h.state.siblings.push(
+      { ticketId: "TEAM-4668", parentId: EPIC, title: "Merge Approval: [SI] system binding", status: "in_review", labels: ["human-review", "reviewer:tycen"], assignee: "human:tycen", createdAt: "2026-09-14T17:33:00.000Z" },
+      { ticketId: "TEAM-4703", parentId: EPIC, title: "CD: merge + deploy", status: "todo", labels: ["phase:ship"], assignee: "agentcore_hub_release_manager", createdAt: "2026-09-14T16:00:00.000Z" },
+      row(ROOT)
+    );
+
+    process.env.EVENTS_TABLE = "agentcore-hub-events";
+    const res = await create({ ...AGENT, workflow_id: "wf_1757000000_si" });
+    delete process.env.EVENTS_TABLE;
+
+    expect(res.autowired.reason).toBe("open_gate");
+    expect(res.autowired.blockedBy).toEqual(["TEAM-4703"]);
+    expect(res.autowired.rootTicketId).toBeUndefined();
+    expect(h.state.puts[0].blockedBy).toEqual(["TEAM-4703"]);
+    expect(h.state.events).toHaveLength(1);
+  });
+
+  it("never fires when the scan REFUSED — there is no create to wire", async () => {
+    h.state.queryThrows = true;
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const res = await create({ ...AGENT });
+    expect(res.content[0].text).toMatch(/^Error: create_ticket refused:/);
+    expect(h.state.puts).toHaveLength(0);
   });
 });
