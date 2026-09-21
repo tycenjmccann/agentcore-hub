@@ -1,20 +1,51 @@
 # .hub/buildspec-ios-ci.yml — PR check for hub-<slug>-ios-ci (macOS, MAC_ARM).
 # Deploys NOTHING and needs NO signing: builds for the simulator and runs your
-# XCTest suite. Green = safe to merge. Mirror your existing iOS CI so the hub's
-# CI gate certifies what your GitHub checks do.
+# unit-test target. Green = safe to merge. Mirror your existing iOS CI so the
+# hub's CI gate certifies what your GitHub checks do.
 version: 0.2
+env:
+  variables:
+    WORKSPACE: MyApp.xcworkspace          # or swap -workspace for -project MyApp.xcodeproj below
+    SCHEME: MyApp
+    TEST_TARGET: MyAppTests               # unit tests only; UI tests need creds/devices you do not have here
+    # Warm-cache slot on the shared Mac host. MUST be unique per app (use the repo
+    # slug). Two apps sharing a slot corrupt each other's incremental builds.
+    HUB_APP: my-app
+    DISK_HIGH_PCT: "85"
+    DISK_LOW_PCT: "70"
 phases:
   install:
     commands:
-      - echo "== select Xcode (image ships one; pin if you need a specific ver) =="
       - xcodebuild -version
+      - xcrun simctl list runtimes | grep -q iOS || xcodebuild -downloadPlatform iOS
+  pre_build:
+    commands:
+      - |
+        # The Mac host is shared and its disk persists across builds. Xcode's default
+        # DerivedData is keyed on the checkout path, which CodeBuild changes every build,
+        # so each run would leave a fresh multi-GB copy that is never reused or pruned
+        # (this filled the shared host on 2026-09-21). Pin ONE cache per app: reused
+        # across builds, one copy. It is regenerable, so when the disk runs tight evict
+        # the least-recently-used apps (and any default DerivedData) until there is room.
+        # Keep this block verbatim in every hub iOS buildspec; do not remove it.
+        set -euo pipefail
+        disk_used() { df -P "$HOME" | awk 'NR==2 { sub("%", "", $5); print $5 }'; }
+        if [ "$(disk_used)" -ge "$DISK_HIGH_PCT" ]; then
+          echo "disk $(disk_used)% >= ${DISK_HIGH_PCT}%: evicting warm caches"
+          rm -rf "$HOME/Library/Developer/Xcode/DerivedData"
+          for app in $(ls -1tr "$HOME/hub-ci" 2>/dev/null); do
+            [ "$(disk_used)" -lt "$DISK_LOW_PCT" ] && break
+            echo "evicting $app"; rm -rf "$HOME/hub-ci/$app"
+          done
+        fi
+        mkdir -p "$HOME/hub-ci/$HUB_APP" && touch "$HOME/hub-ci/$HUB_APP"
+        echo "disk $(disk_used)% used; DerivedData -> $HOME/hub-ci/$HUB_APP/DerivedData"
   build:
     commands:
       - set -euo pipefail
-      - echo "== resolve packages + build for simulator + run tests (no signing) =="
-      # Fill in your scheme + destination. Example:
-      # - xcodebuild test \
-      #     -project MyApp.xcodeproj -scheme MyApp \
-      #     -destination 'platform=iOS Simulator,name=iPhone 15,OS=latest' \
-      #     CODE_SIGNING_ALLOWED=NO -resultBundlePath TestResults.xcresult | xcpretty
+      # Newest available iPhone simulator on the image; no hardcoded device name to go stale.
+      - SIM_ID=$(xcrun simctl list devices available -j | python3 -c "import json,sys; d=json.load(sys.stdin)['devices']; print(next(x['udid'] for rt in sorted(d, reverse=True) if 'iOS' in rt for x in d[rt] if x['isAvailable'] and x['name'].startswith('iPhone')))")
+      - echo "simulator $SIM_ID"; mkdir -p build
+      - xcodebuild test -workspace "$WORKSPACE" -scheme "$SCHEME" -destination "id=$SIM_ID" -derivedDataPath "$HOME/hub-ci/$HUB_APP/DerivedData" -only-testing:"$TEST_TARGET" CODE_SIGNING_ALLOWED=NO -resultBundlePath build/UnitTests.xcresult > build/test.log 2>&1 || { grep -E "error:|failed|Test run|Executed" build/test.log | tail -40; exit 1; }
+      - grep -E "Test run|Executed|TEST SUCCEEDED" build/test.log | tail -5 || true
       - echo "iOS CI passed"

@@ -31,6 +31,11 @@ env:
     WORKSPACE: MyApp.xcworkspace          # or use -project MyApp.xcodeproj below
     SCHEME: MyApp
     APP_NAME: MyApp                        # the .app/.ipa base name (the archived product)
+    # Warm-cache slot on the shared Mac host. MUST be unique per app (repo slug) and
+    # match the CI buildspec so CI and release builds share one DerivedData.
+    HUB_APP: my-app
+    DISK_HIGH_PCT: "85"
+    DISK_LOW_PCT: "70"
     # Pin a release; macos-universal runs on the MAC_ARM fleet.
     RCODESIGN_URL: https://github.com/indygreg/apple-platform-rs/releases/download/apple-codesign/0.29.0/apple-codesign-0.29.0-macos-universal.tar.gz
 phases:
@@ -51,6 +56,25 @@ phases:
   pre_build:
     commands:
       - set -euo pipefail
+      - |
+        # The Mac host is shared and its disk persists across builds. Xcode's default
+        # DerivedData is keyed on the checkout path, which CodeBuild changes every build,
+        # so each run would leave a fresh multi-GB copy that is never reused or pruned
+        # (this filled the shared host on 2026-09-21). Pin ONE cache per app: reused
+        # across builds, one copy. It is regenerable, so when the disk runs tight evict
+        # the least-recently-used apps (and any default DerivedData) until there is room.
+        # Keep this block verbatim in every hub iOS buildspec; do not remove it.
+        disk_used() { df -P "$HOME" | awk 'NR==2 { sub("%", "", $5); print $5 }'; }
+        if [ "$(disk_used)" -ge "$DISK_HIGH_PCT" ]; then
+          echo "disk $(disk_used)% >= ${DISK_HIGH_PCT}%: evicting warm caches"
+          rm -rf "$HOME/Library/Developer/Xcode/DerivedData"
+          for app in $(ls -1tr "$HOME/hub-ci" 2>/dev/null); do
+            [ "$(disk_used)" -lt "$DISK_LOW_PCT" ] && break
+            echo "evicting $app"; rm -rf "$HOME/hub-ci/$app"
+          done
+        fi
+        mkdir -p "$HOME/hub-ci/$HUB_APP" && touch "$HOME/hub-ci/$HUB_APP"
+        echo "disk $(disk_used)% used; DerivedData -> $HOME/hub-ci/$HUB_APP/DerivedData"
       # The shared fleet exports stale RCODESIGN_* env vars (a remote-sign config
       # from another job) that rcodesign merges in and `-C /dev/null` cannot
       # override. Clear them so only our CLI flags drive signing. Env persists
@@ -83,6 +107,7 @@ phases:
       - |
         xcodebuild -workspace "$WORKSPACE" -scheme "$SCHEME" -configuration Release \
           -destination 'generic/platform=iOS' -archivePath "build/$APP_NAME.xcarchive" archive \
+          -derivedDataPath "$HOME/hub-ci/$HUB_APP/DerivedData" \
           CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
           CURRENT_PROJECT_VERSION="$BUILD_NO" > build/archive.log 2>&1 \
           || { grep -E "error:|error " build/archive.log | tail -40; exit 1; }

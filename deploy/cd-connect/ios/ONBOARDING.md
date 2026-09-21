@@ -103,6 +103,13 @@ Copy into your repo at `.hub/`:
 Fill in your workspace/scheme, bundle id, and the secret path prefix. You do **not**
 need an `ExportOptions.plist` with the keychain-free path.
 
+Set `HUB_APP` to your repo slug in **both** the CI and build buildspecs and keep the
+`pre_build` disk-guard block verbatim. The Mac host is shared and its disk persists:
+Xcode's default DerivedData is keyed on the checkout path, which changes every build,
+so without the pinned `-derivedDataPath` every run leaves a new multi-GB copy behind
+and the host fills up for everyone (Gotcha #8). One slot per app, reused, evicted
+least-recently-used when the disk is tight.
+
 The build recipe, in words:
 
 1. Download `rcodesign` (pinned release, `macos-universal`), install on PATH.
@@ -217,6 +224,15 @@ keychain needed.
 New reserved Mac fleets can be backlogged for a long time across regions/sizes. →
 Reuse an existing fleet ARN (`ExistingMacFleetArn`) instead of creating one. This
 is why Brush Up runs in the hub account on the shared fleet.
+
+**#8 — Every build on the fleet dies in DOWNLOAD_SOURCE: "No space left on device".**
+The shared host's disk is full, so the failure happens before any buildspec runs and
+no in-build cleanup can save it. Cause: a buildspec that let Xcode use its default
+DerivedData (one new copy per build, never pruned). → Every hub iOS buildspec must
+pass `-derivedDataPath "$HOME/hub-ci/$HUB_APP/DerivedData"` and carry the `pre_build`
+disk guard from the examples. Unstick a full host by rotating the fleet instance
+(`update-fleet --base-capacity 2`, then back to 1) or running the job on the other
+fleet size; a full host cannot even place a NO_SOURCE cleanup build.
 
 **#8 — Signing settings vs. runtime entitlements.**
 The app's real entitlements come from the **provisioning profile** (app id, team
