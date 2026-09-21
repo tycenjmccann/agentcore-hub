@@ -54,10 +54,14 @@ export function isLeaseLive(
   task: AgentTaskEntry | undefined,
   lastActivityIso: string | null,
   nowMs: number,
-  ttlMs: number = LEASE_TTL_MS
+  ttlMs: number = LEASE_TTL_MS,
+  { positiveDeath = false }: { positiveDeath?: boolean } = {}
 ): boolean {
   if (!task) return false;
   if (!task.status || !liveClaimStatuses.includes(task.status)) return false;
+  // TEAM-4889: callers only set this for agent.died rows scoped to the current
+  // claim generation (since=startedAt); a positive death is not a live lease.
+  if (positiveDeath) return false;
   const started = task.startedAt ? Date.parse(task.startedAt) : 0;
   const lastActivity = lastActivityIso ? Date.parse(lastActivityIso) : 0;
   const freshest = Math.max(started, lastActivity);

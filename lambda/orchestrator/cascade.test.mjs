@@ -1208,3 +1208,136 @@ describe("TEAM-3755 F9 — blockers are confirmed by consistent point-read befor
     expect(redispatch).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("TEAM-4889 — reconcile sweep budgets dead ready/todo/blocked redispatch", () => {
+  const TICKET = "TEAM-4889";
+  const STARTED = "2026-09-01T10:00:00.000Z";
+  const sibling = (status = "blocked") => ({ ticketId: TICKET, status, assignee: "dev", type: "task", blockedBy: [DONE] });
+  const task = (status, extra = {}) => ({ id: "task_4889", ticketId: TICKET, agentId: "dev", status, startedAt: STARTED, ...extra });
+  const wf = (agentTask, extra = {}) => ({ id: "wf_4889", workflowId: "wf_4889", agentTasks: agentTask ? { [TICKET]: agentTask } : {}, deadSessionRetries: {}, ...extra });
+
+  function depsFor({ agentTask, retries = 0, leaseOverrides = {}, redispatchResult = true, stealResult = true, storeOverrides = {} } = {}) {
+    const workflow = wf(agentTask, { deadSessionRetries: retries ? { [TICKET]: retries } : {} });
+    const store = {
+      incrementDeadSessionRetry: vi.fn(async () => retries + 1),
+      setTaskStatus: vi.fn(async () => {}),
+      appendNotification: vi.fn(async () => {}),
+      ...storeOverrides,
+    };
+    const lease = {
+      lastAgentActivity: vi.fn(async () => null),
+      isLeaseLive: vi.fn(() => false),
+      stealClaim: vi.fn(async () => stealResult),
+      DEAD_SESSION_MAX_AUTO_RESUMES: 2,
+      ...leaseOverrides,
+    };
+    const base = makeDeps({
+      publishEvent: vi.fn(async () => {}),
+      now: () => NOW,
+    });
+    const deps = {
+      ...base.deps,
+      ddb: base.ddb,
+      eventsTable: "events",
+      workflowsTable: "workflows",
+      lease,
+      store,
+      redispatch: vi.fn(async () => redispatchResult),
+      blockTicket: vi.fn(async () => {}),
+    };
+    return { deps, workflow, store, lease };
+  }
+
+  it.each([
+    ["no task", undefined, false, false],
+    ["pending without startedAt", { status: "pending" }, false, false],
+    ["complete", task("complete"), false, false],
+    ["running", task("running"), true, true],
+    ["stolen ready", task("ready"), false, true],
+    ["error retries 0", task("error"), false, true],
+  ])("classifies %s", async (_name, agentTask, shouldSteal, shouldIncrement) => {
+    const { deps, workflow, store, lease } = depsFor({ agentTask });
+    const { reconcileDependent } = createCascade(deps);
+
+    const outcome = await reconcileDependent(sibling("blocked"), "reconcile-sweep", workflow, newMetrics(), "enforce");
+
+    expect(outcome).toBe("redispatched");
+    expect(deps.redispatch).toHaveBeenCalledTimes(1);
+    expect(lease.stealClaim).toHaveBeenCalledTimes(shouldSteal ? 1 : 0);
+    expect(store.incrementDeadSessionRetry).toHaveBeenCalledTimes(shouldIncrement ? 1 : 0);
+  });
+
+  it("uses one escalation implementation for in_progress and blocked dead dispatches", async () => {
+    for (const [status, agentTask] of [["in_progress", task("running")], ["blocked", task("ready")]]) {
+      const { deps, workflow, store } = depsFor({ agentTask, retries: 2 });
+      const { reconcileDependent } = createCascade(deps);
+
+      const outcome = await reconcileDependent(sibling(status), "reconcile-sweep", workflow, newMetrics(), "enforce");
+
+      expect(outcome).toBe("escalated");
+      expect(eventsOfType(deps.publishEvent, "agent.escalated")[0][2]).toMatchObject({
+        workflowId: "wf_4889",
+        ticketId: TICKET,
+        agentId: "dev",
+        reason: "dead_session_retry_exhausted",
+        source: "reconcile-sweep",
+        claimStartedAt: STARTED,
+      });
+      expect(store.appendNotification.mock.calls[0][1].details).toContain("2 automatic re-dispatches already spent");
+    }
+  });
+
+  it("spends on redispatch-refused only after a won steal, not on claim-only refusal", async () => {
+    let setup = depsFor({ agentTask: task("running"), redispatchResult: false });
+    let outcome = await createCascade(setup.deps).reconcileDependent(sibling("in_progress"), "reconcile-sweep", setup.workflow, newMetrics(), "enforce");
+    expect(outcome).toBe("redispatch-refused");
+    expect(setup.store.incrementDeadSessionRetry).toHaveBeenCalledTimes(1);
+
+    setup = depsFor({ agentTask: task("ready"), redispatchResult: false });
+    outcome = await createCascade(setup.deps).reconcileDependent(sibling("blocked"), "reconcile-sweep", setup.workflow, newMetrics(), "enforce");
+    expect(outcome).toBe("redispatch-refused");
+    expect(setup.store.incrementDeadSessionRetry).not.toHaveBeenCalled();
+  });
+
+  it("consults agent.died when wired and fails probe errors toward live/no-steal", async () => {
+    let setup = depsFor({ agentTask: task("running"), leaseOverrides: { hasAgentErrorSince: vi.fn(async () => true), isLeaseLive: vi.fn((_t, _a, _n, _ttl, opts) => !opts?.positiveDeath) } });
+    let outcome = await createCascade(setup.deps).reconcileDependent(sibling("blocked"), "reconcile-sweep", setup.workflow, newMetrics(), "enforce");
+    expect(outcome).toBe("redispatched");
+    expect(setup.lease.hasAgentErrorSince).toHaveBeenCalledWith(setup.deps.ddb, "events", "wf_4889", TICKET, STARTED, { types: ["agent.died"] });
+    expect(setup.lease.stealClaim).toHaveBeenCalledTimes(1);
+
+    setup = depsFor({ agentTask: task("running"), leaseOverrides: { hasAgentErrorSince: vi.fn(async () => { throw new Error("boom"); }), isLeaseLive: vi.fn(() => true) } });
+    outcome = await createCascade(setup.deps).reconcileDependent(sibling("blocked"), "reconcile-sweep", setup.workflow, newMetrics(), "enforce");
+    expect(outcome).toBe("live");
+    expect(setup.lease.stealClaim).not.toHaveBeenCalled();
+  });
+
+  it("TOCTOU re-check honors positiveDeath when a heartbeat appears", async () => {
+    const setup = depsFor({
+      agentTask: task("running"),
+      leaseOverrides: {
+        hasAgentErrorSince: vi.fn(async () => true),
+        lastAgentActivity: vi.fn(async () => "2026-09-01T11:59:00.000Z"),
+        isLeaseLive: vi.fn((_t, _a, _n, _ttl, opts) => !opts?.positiveDeath),
+      },
+    });
+    const outcome = await createCascade(setup.deps).reconcileDependent(sibling("blocked"), "reconcile-sweep", setup.workflow, newMetrics(), "enforce");
+    expect(outcome).toBe("redispatched");
+    expect(setup.lease.stealClaim).toHaveBeenCalledTimes(1);
+  });
+
+  it("fresh terminal workflow re-read returns terminal-workflow with zero writes", async () => {
+    for (const terminal of [{ cancelledAt: "2026-09-01T11:00:00.000Z" }, { phase: "cancelled" }, null]) {
+      const store = { getWorkflow: vi.fn(async () => terminal && { ...wf(task("running")), ...terminal }), incrementDeadSessionRetry: vi.fn() };
+      const setup = depsFor({ agentTask: task("running"), storeOverrides: store });
+      setup.deps.store = store;
+      const m = newMetrics();
+      const outcome = await createCascade(setup.deps).reconcileDependent(sibling("blocked"), "reconcile-sweep", setup.workflow, m, "enforce");
+      expect(outcome).toBe("terminal-workflow");
+      expect(m.terminalWorkflow).toBe(1);
+      expect(setup.deps.redispatch).not.toHaveBeenCalled();
+      expect(setup.lease.stealClaim).not.toHaveBeenCalled();
+      expect(store.incrementDeadSessionRetry).not.toHaveBeenCalled();
+    }
+  });
+});

@@ -163,6 +163,7 @@ export default defineConfig({
       // after the death reaps it via the positive-death path (GUARD 1 still
       // first), and TEAM-4703 gets exactly two auto-resumes then a human.
       "lambda/orchestrator/replay-agent-died.test.mjs",
+      "lambda/orchestrator/replay-team-4801.test.mjs",
       // replay-watchdog-coverage (TEAM-4739 WP5) — the three runs the watchdog
       // never paged on (fz514x, 37ule1) plus the one it must NOT page on
       // (TEAM-4660), replayed through the REAL reconcile sweep's W2/W3 watches.

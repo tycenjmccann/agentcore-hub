@@ -599,11 +599,11 @@ describe("TEAM-3969 — stale in_progress recovery shares the dead-session retry
     expect(eventsOfType(s.publishEvent, "orchestrator.nudge")).toHaveLength(0);
   });
 
-  it("second death (deadSessionRetries=1): ZERO steal/re-dispatch → manager_escalation, task error, ticket parked", async () => {
+  it("third death (deadSessionRetries=2): ZERO steal/re-dispatch → manager_escalation, task error, ticket parked", async () => {
     const store = makeStore();
     const blockTicket = vi.fn(async () => {});
     const s = makeSweep({
-      workflows: [workflow({ deadSessionRetries: { "TEAM-2": 1 } })],
+      workflows: [workflow({ deadSessionRetries: { "TEAM-2": 2 } })],
       siblings: inProgressStale, store, blockTicket,
     });
     const cap = captureMetrics();
@@ -633,7 +633,7 @@ describe("TEAM-3969 — stale in_progress recovery shares the dead-session retry
     const blockTicket = vi.fn(async () => {});
     const escalate = vi.fn(async () => ({ disposition: "synthesized_children" }));
     const s = makeSweep({
-      workflows: [workflow({ deadSessionRetries: { "TEAM-2": 1 } })],
+      workflows: [workflow({ deadSessionRetries: { "TEAM-2": 2 } })],
       siblings: inProgressStale, store, blockTicket, escalate,
     });
 
@@ -657,11 +657,11 @@ describe("TEAM-3969 — stale in_progress recovery shares the dead-session retry
     expect(s.redispatch).not.toHaveBeenCalled();
   });
 
-  it("second death in shadow mode: observe only, zero writes", async () => {
+  it("third death in shadow mode: observe only, zero writes", async () => {
     const store = makeStore();
     const blockTicket = vi.fn(async () => {});
     const s = makeSweep({
-      workflows: [workflow({ deadSessionRetries: { "TEAM-2": 1 } })],
+      workflows: [workflow({ deadSessionRetries: { "TEAM-2": 2 } })],
       siblings: inProgressStale, store, blockTicket,
     });
 
@@ -745,7 +745,7 @@ describe("TEAM-3973 — an escalated ticket is HELD for the human in every statu
 
   it("a spent budget alone (task still running) does NOT hold — only the error status does", async () => {
     const s = makeSweep({
-      workflows: [workflow({ deadSessionRetries: { "TEAM-2": 1 } })],
+      workflows: [workflow({ deadSessionRetries: { "TEAM-2": 2 } })],
       siblings: inProgressStale,
       store: { incrementDeadSessionRetry: vi.fn(), setTaskStatus: vi.fn(async () => {}), appendNotification: vi.fn(async () => {}) },
     });
@@ -753,7 +753,7 @@ describe("TEAM-3973 — an escalated ticket is HELD for the human in every statu
     const m = await s.runSweep("enforce");
 
     expect(m.escalationHeld).toBe(0);
-    expect(m.escalated).toBe(1); // second death → escalate, unchanged (TEAM-3969)
+    expect(m.escalated).toBe(1); // retries already at cap → escalate
   });
 });
 
@@ -1121,5 +1121,102 @@ describe("the watches inherit RECONCILE_SWEEP_MODE and fail toward silence (TEAM
     expect(appendNotification).toHaveBeenCalledTimes(1);
     expect(m.watchGate).toBe(0);
     expect(log.mock.calls.some(([msg]) => msg.includes("reconcile.watch_gate_held"))).toBe(true);
+  });
+});
+
+describe("TEAM-4889 — reconcile sweep budgets ready/todo/blocked dead dispatches", () => {
+  const started = STALE_STARTED;
+  const statuses = ["blocked", "todo", "ready"];
+
+  for (const boardStatus of statuses) {
+    it(`${boardStatus} + running task gets exactly two consecutive redispatches, then one escalation and holds`, async () => {
+      let clock = NOW;
+      const row = workflow({
+        deadSessionRetries: {},
+        agentTasks: { "TEAM-2": { id: "t2", agentId: "dev", ticketId: "TEAM-2", status: "running", startedAt: started } },
+      });
+      const siblingRows = [
+        { ticketId: DONE, status: "done", type: "task" },
+        { ticketId: "TEAM-2", status: boardStatus, assignee: "dev", type: "task", blockedBy: [DONE], updatedAt: started },
+      ];
+      const store = {
+        getWorkflow: vi.fn(async () => row),
+        incrementDeadSessionRetry: vi.fn(async (_wf, tid) => {
+          row.deadSessionRetries[tid] = (row.deadSessionRetries[tid] || 0) + 1;
+          return row.deadSessionRetries[tid];
+        }),
+        setTaskStatus: vi.fn(async (_wf, tid, status) => { row.agentTasks[tid].status = status; }),
+        appendNotification: vi.fn(async () => {}),
+      };
+      const lease = {
+        hasAgentErrorSince: vi.fn(async () => true),
+        isLeaseLive: vi.fn(() => false),
+        stealClaim: vi.fn(async (_ddb, _table, _wf, tid) => { row.agentTasks[tid].status = "ready"; return true; }),
+      };
+      const redispatch = vi.fn(async (_wf, ticket) => {
+        row.agentTasks[ticket.ticketId].status = "running";
+        row.agentTasks[ticket.ticketId].startedAt = new Date(clock).toISOString();
+        return true;
+      });
+      const s = makeSweep({ workflows: [row], siblings: siblingRows, store, lease, redispatch, now: () => clock });
+
+      const summaries = [];
+      for (let i = 0; i < 5; i++) {
+        summaries.push(await s.runSweep("enforce"));
+        clock += 5 * 60_000;
+      }
+
+      expect(redispatch).toHaveBeenCalledTimes(2);
+      expect(lease.stealClaim).toHaveBeenCalledTimes(2);
+      expect(store.incrementDeadSessionRetry).toHaveBeenCalledTimes(2);
+      expect(row.deadSessionRetries["TEAM-2"]).toBe(2);
+      expect(eventsOfType(s.publishEvent, "agent.escalated")).toHaveLength(1);
+      expect(summaries.map((m) => m.redispatched)).toEqual([1, 1, 0, 0, 0]);
+      expect(summaries.map((m) => m.escalated || 0)).toEqual([0, 0, 1, 0, 0]);
+      expect(summaries.map((m) => m.escalationHeld || 0)).toEqual([0, 0, 0, 1, 1]);
+    });
+  }
+
+  it("ready candidate with no agentTask remains an unbudgeted never-dispatched redispatch", async () => {
+    const row = workflow({ agentTasks: {}, deadSessionRetries: {} });
+    const store = { getWorkflow: vi.fn(async () => row), incrementDeadSessionRetry: vi.fn() };
+    const s = makeSweep({ workflows: [row], siblings: readyCandidate, store });
+
+    const m = await s.runSweep("enforce");
+
+    expect(m.redispatched).toBe(1);
+    expect(s.redispatch).toHaveBeenCalledTimes(1);
+    expect(s.lease.stealClaim).not.toHaveBeenCalled();
+    expect(store.incrementDeadSessionRetry).not.toHaveBeenCalled();
+  });
+
+  it("stolen-ready task skips stealClaim, redispatches, and spends budget", async () => {
+    const row = workflow({ agentTasks: { "TEAM-2": { id: "t2", agentId: "dev", ticketId: "TEAM-2", status: "ready", startedAt: started } }, deadSessionRetries: {} });
+    const store = { getWorkflow: vi.fn(async () => row), incrementDeadSessionRetry: vi.fn(async () => 1) };
+    const s = makeSweep({ workflows: [row], siblings: [{ ticketId: DONE, status: "done", type: "task" }, { ticketId: "TEAM-2", status: "blocked", assignee: "dev", type: "task", blockedBy: [DONE], updatedAt: started }], store });
+
+    const m = await s.runSweep("enforce");
+
+    expect(m.redispatched).toBe(1);
+    expect(s.lease.stealClaim).not.toHaveBeenCalled();
+    expect(store.incrementDeadSessionRetry).toHaveBeenCalledWith("wf_1", "TEAM-2");
+  });
+
+  it("cancelled workflow from the fresh re-read tallies terminalWorkflow with zero writes", async () => {
+    const row = workflow({ cancelledAt: "2026-09-01T11:59:00.000Z" });
+    const store = { getWorkflow: vi.fn(async () => row), incrementDeadSessionRetry: vi.fn(), setTaskStatus: vi.fn(), appendNotification: vi.fn() };
+    const s = makeSweep({ workflows: [workflow()], siblings: inProgressStale, store });
+    const cap = captureMetrics();
+
+    const m = await s.runSweep("enforce");
+    const records = cap.records();
+    cap.restore();
+
+    expect(m.terminalWorkflow).toBe(1);
+    expect(records[0].ReconcileTerminalWorkflow).toBe(1);
+    expect(s.redispatch).not.toHaveBeenCalled();
+    expect(s.lease.stealClaim).not.toHaveBeenCalled();
+    expect(store.incrementDeadSessionRetry).not.toHaveBeenCalled();
+    expect(eventsOfType(s.publishEvent, "agent.escalated")).toHaveLength(0);
   });
 });

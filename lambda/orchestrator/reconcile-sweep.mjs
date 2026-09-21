@@ -224,6 +224,7 @@ export function createReconcileSweep(deps) {
       skippedLiveLease: 0,
       escalated: 0,
       escalationHeld: 0,
+      terminalWorkflow: 0,
       redispatched: 0,
       reviewReawakened: 0,
       watchGate: 0,
@@ -286,6 +287,10 @@ export function createReconcileSweep(deps) {
           if (!sibling.assignee) continue;
           if (!CANDIDATE_STATUSES.has(sibling.status)) continue;
           if (!allBlockersResolved(sibling, siblings)) continue;
+          // TEAM-4889: do not bypass parkedLongEnough here. The detector gives
+          // in_progress positive deaths the first-sweep-at/after-died bound; the
+          // sweep accepts bounded extra latency for blocked died claims instead
+          // of adding an events read for every fresh candidate every 5 minutes.
           if (!parkedLongEnough(sibling, startedAtMs)) continue;
 
           m.candidates++;
@@ -312,7 +317,7 @@ export function createReconcileSweep(deps) {
 
     m.durationMs = now() - startedAtMs;
     emitReconcileMetrics(m);
-    log(`reconcile sweep done — mode=${mode} candidates=${m.candidates} skippedLiveLease=${m.skippedLiveLease} redispatched=${m.redispatched} escalated=${m.escalated || 0} escalationHeld=${m.escalationHeld || 0} reviewReawakened=${m.reviewReawakened} watchGate=${m.watchGate} watchRefile=${m.watchRefile} wouldWatchGate=${m.wouldwatchGate} wouldWatchRefile=${m.wouldwatchRefile} watchErrors=${m.watchErrors} wouldRedispatch=${m.wouldRedispatch} noop=${m.noop} candidateErrors=${m.candidateErrors} truncated=${m.truncated} durationMs=${m.durationMs} (sweep ${sweepId})`);
+    log(`reconcile sweep done — mode=${mode} candidates=${m.candidates} skippedLiveLease=${m.skippedLiveLease} redispatched=${m.redispatched} escalated=${m.escalated || 0} escalationHeld=${m.escalationHeld || 0} terminalWorkflow=${m.terminalWorkflow || 0} reviewReawakened=${m.reviewReawakened} watchGate=${m.watchGate} watchRefile=${m.watchRefile} wouldWatchGate=${m.wouldwatchGate} wouldWatchRefile=${m.wouldwatchRefile} watchErrors=${m.watchErrors} wouldRedispatch=${m.wouldRedispatch} noop=${m.noop} candidateErrors=${m.candidateErrors} truncated=${m.truncated} durationMs=${m.durationMs} (sweep ${sweepId})`);
     return m;
   }
 
@@ -337,6 +342,9 @@ function tally(m, outcome) {
       break;
     case "escalation-held":
       m.escalationHeld++;
+      break;
+    case "terminal-workflow":
+      m.terminalWorkflow++;
       break;
     case "redispatched":
       m.redispatched++;
@@ -377,6 +385,7 @@ export function emitReconcileMetrics(m) {
           { Name: "ReconcileRedispatch", Unit: "Count" },
           { Name: "ReconcileEscalations", Unit: "Count" },
           { Name: "ReconcileEscalationHeld", Unit: "Count" },
+          { Name: "ReconcileTerminalWorkflow", Unit: "Count" },
           { Name: "ReconcileReviewReawaken", Unit: "Count" },
           { Name: "ReconcileWouldRedispatch", Unit: "Count" },
           { Name: "ReconcileNoop", Unit: "Count" },
@@ -392,6 +401,7 @@ export function emitReconcileMetrics(m) {
     ReconcileRedispatch: m.redispatched,
     ReconcileEscalations: m.escalated || 0,
     ReconcileEscalationHeld: m.escalationHeld || 0,
+    ReconcileTerminalWorkflow: m.terminalWorkflow || 0,
     ReconcileReviewReawaken: m.reviewReawakened,
     ReconcileWouldRedispatch: m.wouldRedispatch,
     ReconcileNoop: m.noop,
