@@ -21,7 +21,7 @@ claude_code(
 ### Step 3: Review & Deliver
 - Validate findings against applicable regulations
 - Determine blocking vs advisory
-- Save the compliance review: `S3Storage___write_object` to `workflows/{workflow_id}/shared/compliance-review.md` with all findings and required changes (take them from the `claude_code` result text; never write the deliverable to `/tmp`)
+- Save the compliance review: `load_blueprint("writing-standard")` + `load_blueprint("template-assessment")`, then `S3Storage___write_object` to `workflows/{workflow_id}/shared/compliance-review.md` in the template's sections (`## Verdict`, `## Findings` blocking first then advisory, `## Not covered`, `## Next actions` the required changes) (take them from the `claude_code` result text; never write the deliverable to `/tmp`)
 - `WorkflowOutput___report_completion` — blocking findings make the verdict FAIL
 
 ## Playbook runs (when `## SDLC Framework` is in your context)

@@ -64,7 +64,8 @@
       "dir": "lambda/agentcore-hub-jira",
       "files": [
         "index.mjs",
-        "fix-contract.mjs"
+        "fix-contract.mjs",
+        "gate-contract.mjs"
       ],
       "npm": false,
       "note": "Only @aws-sdk/client-s3 is declared, which the nodejs20.x runtime provides — deploy/setup-tickets-lambda.mjs ships index.mjs alone too."
@@ -74,7 +75,8 @@
       "dir": "lambda/agentcore-hub-tickets",
       "files": [
         "index.mjs",
-        "fix-contract.mjs"
+        "fix-contract.mjs",
+        "gate-contract.mjs"
       ],
       "npm": false,
       "optional": true,
@@ -114,6 +116,7 @@
       "dir": "lambda/workflow-output",
       "files": [
         "index.mjs",
+        "deliverables-lint.mjs",
         "node_modules/"
       ],
       "npm": true
@@ -281,7 +284,9 @@
     "lambda/orchestrator/template.yaml",
     "deploy/coding-agent-runtime/deploy-instances.py",
     "deploy/runtime-agent/set-runtime-env.py",
-    "deploy/ecs-express/set-env.sh"
+    "deploy/ecs-express/set-env.sh",
+    "deploy/workflow-manager/set-harness-env.mjs",
+    "scripts/si-ledger-handoff.sh"
   ],
   "runtimes": [
     {

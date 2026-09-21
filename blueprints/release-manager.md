@@ -286,11 +286,14 @@ missing = empty state, round 1):
    of `effectiveRoundCount` in `src/lib/workflow/ship-review.ts` — that function
    and this paragraph are a matched pair.
 3. **Update the running review summary** — EVERY round, regardless of verdict,
-   append/update this round's section in
-   `workflows/{workflow_id}/shared/ship-review-summary.md`
-   (`S3Storage___write_object`): round number, head SHA, verdict, effective
-   count so far, and every finding with its severity, file/seam and IN-DIFF or
-   ADVISORY marking. A regression finding carries its EXACT label
+   rewrite `workflows/{workflow_id}/shared/ship-review-summary.md`
+   (`S3Storage___write_object`) in `template-assessment`'s sections
+   (`load_blueprint("writing-standard")` + `load_blueprint("template-assessment")`
+   once per invocation): `## Verdict` = this
+   round's verdict, head SHA and effective count so far; `## Findings` = this
+   round's findings with severity, file/seam and IN-DIFF or ADVISORY marking;
+   `## Not covered`; `## Next actions` = the fix tickets or the gate. Earlier
+   rounds move to appendix `## Round <n>` sections after those four. A regression finding carries its EXACT label
    (`REGRESSION-OF-FIX r<N>`) plus the prior round's finding id and the
    seam/file whose fix it reverts — the summary and the ledger must agree on
    every label. The merge-gate ping links this summary for the human.
@@ -527,49 +530,41 @@ content_type text/markdown) — that S3 copy is the approval DOC the review
 package (Step 6) links to, so the reviewer's phone ping opens the brief
 directly instead of the engineer-facing review history.
 
-Format — pyramid principle, decision first, plain English, no jargon:
-
-```
-DECISION: Approve to merge PR #<n> into <repo> (<one-line what it does,
-sized: "removes 92 lines of dead code">). Reject = nothing merges.
-<Revertibility: "Fully revertible with one click if anything breaks." or the
-honest alternative.>
-
-WHAT HAPPENED
-• Scanned/built <scope>; found <N> candidates / implemented <N> tickets.
-• <N> proven safe and included in this PR; <M> questionable and left alone.
-• Build + full test suite pass. <N> independent agents re-verified the work.
-  <If you synced the branch during the review: name the chore(sync) merge commit
-  and the re-certified head SHA.>
-
-WHAT'S IN THE PR (plain English — what each item IS, not its symbol name)
-• <e.g. "4 helper functions for reading chat transcripts — replaced months
-  ago, originals never deleted.">
-• ...
-
-WHAT WAS KEPT / NOT DONE (and why)
-• <flagged-but-kept items, deferred scope — with the reason>
-
-⚠ NEEDS YOUR ATTENTION (omit section if empty)
-• <ONLY things a human must do beyond approve/reject: billing failures,
-  auth-walled bot flags, required checks that cannot run, judgment calls,
-  infra handoff commands from Step 5's infra-handoff rule below>
-• <if this PR touched lambda/agentcore-hub-tickets/ or lambda/agentcore-hub-jira/,
-  or the reconcile sweep: the two commands verbatim, e.g.
+Format: `load_blueprint("writing-standard")` and `load_blueprint("template-brief")`
+once per invocation and write the template's four sections, answer first. The
+write tool refuses a brief that is not in those sections.
+- `## Decision`: "Approve to merge PR #<n> into <repo> (<one line, sized:
+  "removes 92 lines of dead code">). Reject = nothing merges." plus the
+  revertibility sentence ("Fully revertible with one click if anything
+  breaks." or the honest alternative). For PASS-with-known-findings say so
+  here in one clause.
+- `## Why it is ready`: what was scanned or built and found, how many items
+  proven safe and included vs left alone, build and test suite result, which
+  independent agents re-verified, review rounds and open findings, CI at which
+  head. If you synced the branch during the review, name the chore(sync) merge
+  commit and the re-certified head SHA. Counts, not adjectives.
+- `## What needs your eye`: ONLY things a human must do beyond approve or
+  reject: billing failures, auth-walled bot flags, required checks that cannot
+  run, judgment calls, the known findings you are asking them to accept, and
+  the infra handoff commands from Step 5's infra-handoff rule below (if this PR
+  touched lambda/agentcore-hub-tickets/ or lambda/agentcore-hub-jira/, or the
+  reconcile sweep: the two commands verbatim, e.g.
   "PIPELINE_TOOLS_LAMBDA=agentcore-hub-pipeline-tools EVENTS_TABLE=agentcore-hub-events
   node deploy/setup-tickets-lambda.mjs" and/or
-  "RECONCILE_SWEEP_MODE=enforce ./lambda/orchestrator/deploy.sh">
-
-RISK IF WE'RE WRONG: <Low/Medium/High + one sentence why + worst case +
-recovery path>.
-
-DETAILS: PR #<n> body has the full evidence ledger; deep analysis in
-<s3 shared/ artifact path>.
-```
+  "RECONCILE_SWEEP_MODE=enforce ./lambda/orchestrator/deploy.sh").
+  "Nothing." when empty.
+- `## After approval`: the deploy path (pipeline or DEPLOY.md), manual steps
+  CD will not do, where the evidence ledger lives (PR body, shared/
+  ship-review-summary.md).
+What is in the PR (plain English, what each item IS, not its symbol name) and
+what was kept or not done (with the reason) are appendix `##` sections after
+those four when the PR body does not already carry them.
 
 Rules for the brief:
 - Lead with the decision and its blast radius. Never lead with SHAs, tables,
-  or verification methodology.
+  or verification methodology. Sentence-case headings, `-` bullets; the old
+  ALL-CAPS labels (WHAT HAPPENED, RISK IF WE'RE WRONG) are refused by the
+  write tool.
 - Translate every removed/changed item into what it IS in product terms.
   Symbol names in parentheses are fine; symbol names alone are not.
 - ⚠ NEEDS YOUR ATTENTION exists so nothing human-actionable is ever buried
@@ -1026,9 +1021,13 @@ rollback-on-failure rule. Otherwise production is out of scope — say so in
 your report and stop after staging.
 
 ### Step 6: Evidence + report
-Write the full command transcript (deploy + smoke + any rollback) to
+Write the deploy record to
 `workflows/{workflow_id}/shared/cd-evidence/deploy-{merge-sha}.md` via
-`S3Storage___write_object`. Then `WorkflowOutput___report_completion` with
+`S3Storage___write_object` in `template-record`'s sections
+(`load_blueprint("writing-standard")` + `load_blueprint("template-record")`): `## Status` = deployed / rolled back and
+what proves it, `## Timeline` = one row per command (deploy, smoke, rollback)
+with its result, `## Open items`. The full transcript goes after them as an
+appendix `## Transcript` section. Then `WorkflowOutput___report_completion` with
 `merge_commit=<merge SHA>` and `outcome="shipped"` — the ship verdict. **This is
 the one ship path that carries NO pipeline execution id**, and that is correct:
 a legacy DEPLOY.md run has no pipeline, passes no `pipeline_name` and writes no

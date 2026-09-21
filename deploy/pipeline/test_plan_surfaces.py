@@ -177,6 +177,27 @@ def test_check_would_catch_an_unmanifested_src_config_json():
     assert "src/config/workflows.json" in ps.check(root, m)
 
 
+def test_check_catches_a_local_import_missing_from_files():
+    # TEAM-4825: #640 added `import ... from "./gate-contract.mjs"` to both ticket
+    # Lambdas and to setup-tickets-lambda.mjs's zip line but not to files[] here,
+    # so the pipeline shipped agentcore-hub-jira without it and every Tickets___*
+    # call died with ERR_MODULE_NOT_FOUND. Drop the file from files[] → the guard
+    # must name it.
+    root = HERE.parent.parent
+    m = copy.deepcopy(MANIFEST)
+    jira = next(l for l in m["lambdas"] if l["function"] == "agentcore-hub-jira")
+    jira["files"] = [f for f in jira["files"] if f != "gate-contract.mjs"]
+    gaps = ps.check(root, m)
+    assert any(g.startswith("lambda/agentcore-hub-jira/gate-contract.mjs") for g in gaps), gaps
+
+
+def test_import_closure_accepts_listed_dir_prefix():
+    # eval-packager imports ./lib/*.mjs and lists "lib/" — a directory ships whole.
+    root = HERE.parent.parent
+    pk = next(l for l in MANIFEST["lambdas"] if l["function"] == "agentcore-hub-eval-packager")
+    assert ps.import_closure_gaps(root, pk) == []
+
+
 def test_check_covers_json_under_src_config_but_not_ts():
     # .ts in src/config is app source (compiled into the image by Target 3), not a
     # deploy surface — widening the guard must not demand a manifest entry for it.

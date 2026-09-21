@@ -181,6 +181,48 @@ def coverage_prefixes(manifest: dict) -> list[str]:
     return prefixes
 
 
+_LOCAL_IMPORT = re.compile(r"""(?:from\s+|import\s*\(\s*)["']\./([\w./-]+\.mjs)["']""")
+
+
+def _local_imports(path: Path) -> list[str]:
+    try:
+        return _LOCAL_IMPORT.findall(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError):
+        return []
+
+
+def import_closure_gaps(root: Path, entry: dict) -> list[str]:
+    """Local .mjs modules a lambda's files[] would leave out of its zip.
+
+    The Deploy stage zips exactly files[] (plan → `zip ... <files>`), so a
+    relative import that is not listed ships as a hole and the function dies at
+    cold start with ERR_MODULE_NOT_FOUND. TEAM-4825: gate-contract.mjs was added
+    to both ticket Lambdas (#640) and to deploy/setup-tickets-lambda.mjs's zip
+    line, but not here — the pipeline shipped agentcore-hub-jira without it and
+    every Tickets___* call failed for a day. Walk the transitive closure from each
+    .mjs entrypoint in files[] and require every module to be listed, either by
+    name or under a listed directory prefix (e.g. "lib/").
+    """
+    files = list(entry.get("files", []))
+    dirs = [f for f in files if f.endswith("/")]
+    listed = set(files)
+    base = root / entry["dir"]
+    seen: set[str] = set()
+    queue = [f for f in files if f.endswith(".mjs")]
+    gaps = []
+    while queue:
+        name = queue.pop(0)
+        if name in seen:
+            continue
+        seen.add(name)
+        if name not in listed and not any(name.startswith(d) for d in dirs):
+            gaps.append(f"{entry['dir']}/{name} (imported, not in files[] of {entry['function']})")
+        if any(name.startswith(d) for d in dirs) and name not in listed:
+            continue  # inside a listed dir: the whole dir ships, no need to walk it
+        queue.extend(_local_imports(base / name))
+    return gaps
+
+
 def check(root: Path, manifest: dict) -> list[str]:
     ignore = [re.compile(p) for p in manifest.get("ignore", [])]
     prefixes = coverage_prefixes(manifest)
@@ -193,6 +235,8 @@ def check(root: Path, manifest: dict) -> list[str]:
         if any(f.startswith(p) for p in prefixes):
             continue
         uncovered.append(f)
+    for lam in manifest.get("lambdas", []):
+        uncovered.extend(import_closure_gaps(root, lam))
     return uncovered
 
 
@@ -207,7 +251,8 @@ def main(argv: list[str]) -> int:
             for f in missing:
                 print(f"  - {f}", file=sys.stderr)
             print("Add the surface (lambdas / s3 / harnesses), list it under handoff (infra script), "
-                  "or add it to excluded with a reason.", file=sys.stderr)
+                  "or add it to excluded with a reason. A '(imported, not in files[])' line means a "
+                  "local .mjs import is missing from that lambda's files[] — add it there.", file=sys.stderr)
             return 1
         print(f"deploy-surface manifest covers lambda/, deploy/ and src/config/*.json "
               f"({len(manifest.get('lambdas', []))} lambdas, {len(manifest.get('harnesses', []))} harnesses, "

@@ -699,13 +699,25 @@ const REWORK_HINTED = Symbol("rework-hinted");
 // contain one silences a prod gate (release → re-claim → identical 400, every
 // 60s, forever). It is a post-pass over the composed text rather than a second
 // template, so the two renderings cannot drift apart.
-function execPing({ kicker, subject, summary, bullets = [], meta = [], ask, plain = false }) {
+function execPing({
+  kicker, subject, summary, shipping = [], shippingMore = 0,
+  bullets = [], bulletsLabel = "What changed", meta = [], ask, plain = false,
+}) {
   const lines = [`*${kicker}*`];
   if (subject) lines.push(esc(String(subject)));
   if (summary && String(summary).trim()) lines.push("", esc(String(summary).trim()));
+  // WHAT is under review, one item per line (TEAM-4885). It used to be glued
+  // onto the subject as "<run> — shipping: A, B, C +19 more", one unreadable
+  // paragraph on a phone. The count of un-rendered items is its own line.
+  const sh = (shipping || []).filter((x) => typeof x === "string" && x.trim());
+  if (sh.length) {
+    lines.push("", "*Shipping*");
+    for (const x of sh) lines.push(`• ${esc(x.trim())}`);
+    if (shippingMore > 0) lines.push(`• +${shippingMore} more`);
+  }
   const bl = (bullets || []).filter((b) => typeof b === "string" && b.trim()).slice(0, 6);
   if (bl.length) {
-    lines.push("", "*What changed*");
+    lines.push("", `*${esc(bulletsLabel)}*`);
     for (const b of bl) lines.push(`• ${esc(b.trim().slice(0, 200))}`);
   }
   const ml = (meta || []).filter(Boolean);
@@ -770,6 +782,10 @@ const APPROVAL_KICKERS = {
   merge:             { kicker: "🚦 MERGE REVIEW GATE — approval needed",      max: APPROVAL_TEXT_MAX },
   deploy:            { kicker: "🚦 DEPLOY REVIEW GATE — approval needed",     max: APPROVAL_TEXT_MAX },
   review:            { kicker: "🚦 REVIEW GATE — approval needed",            max: APPROVAL_TEXT_MAX },
+  // A ticket an agent hands to a human to DO (Handoff / Escalation titles): not
+  // an approval, so the ping carries the ticket's own ask and no shipping list
+  // (TEAM-4885). Deliberately contains neither reply-router phrase.
+  handoff:           { kicker: "🙋 HANDOFF — a human has to do this",         max: APPROVAL_TEXT_MAX },
   escalation:        { kicker: "🚨 SHIP-REVIEW ESCALATION — decision needed", max: APPROVAL_TEXT_MAX },
   "deploy-pipeline": { kicker: "🚀 PRODUCTION DEPLOY — approval needed",      max: APPROVAL_TEXT_MAX },
   // The bounded re-ping (TEAM-4663 F3) is its own KIND, not the `repage`
@@ -784,7 +800,7 @@ const APPROVAL_KICKERS = {
 /** The business-hours reminder variant of a kicker (a modifier, not a kind). */
 function repageKicker(kicker) {
   return /—/.test(kicker)
-    ? kicker.replace(/\s*—\s*(?:approval|decision|input) needed$/, " · business-hours reminder")
+    ? kicker.replace(/\s*—\s*(?:(?:approval|decision|input) needed|a human has to do this)$/, " · business-hours reminder")
     : `${kicker} · business-hours reminder`;
 }
 
@@ -800,12 +816,10 @@ export const APPROVAL_KICKER_RE = new RegExp(
 
 const oneLine = (s) => String(s ?? "").replace(/\s+/g, " ").trim();
 
-/** "<run title> — shipping: A, B, C +N more" — the context line, never a runbook. */
-function shippingSubject(subject, shipping, n) {
+/** The rendered shipping items (clipped) and how many were left out. */
+function shippingBlock(shipping, n) {
   const items = shipping.slice(0, Math.max(0, n)).map((s) => clipText(s, APPROVAL_SHIP_ITEM_MAX));
-  if (!items.length) return subject;
-  const more = shipping.length - items.length;
-  return `${subject} — shipping: ${items.join(", ")}${more > 0 ? ` +${more} more` : ""}`;
+  return { items, more: shipping.length - items.length };
 }
 
 /**
@@ -817,6 +831,7 @@ function shippingSubject(subject, shipping, n) {
  * @param {string[]} [o.shipping]  what is under review (upstream titles / brief lines)
  * @param {string} [o.summary]     ONE curated line (review package / PR body) — never a description
  * @param {string[]} [o.bullets]   curated bullets only
+ * @param {string} [o.bulletsLabel] heading over the bullets (default "What changed")
  * @param {number} [o.attempt]     review cycle, 1-based
  * @param {string} [o.previousIssue] why the last attempt came back
  * @param {string[]} [o.meta]      pre-built, pre-escaped meta (the 🎫 handle lives here)
@@ -825,7 +840,7 @@ function shippingSubject(subject, shipping, n) {
  */
 function buildApprovalMessage({
   gateKind, repage = false, subject, shipping = [], summary,
-  bullets = [], attempt = 1, previousIssue, meta = [], ask, plain = false,
+  bullets = [], bulletsLabel, attempt = 1, previousIssue, meta = [], ask, plain = false,
 }) {
   const entry = APPROVAL_KICKERS[gateKind] || APPROVAL_KICKERS.review;
   const kicker = repage ? repageKicker(entry.kicker) : entry.kicker;
@@ -846,15 +861,21 @@ function buildApprovalMessage({
   let sum = oneLine(summary);
   let shipN = Math.min(ship.length, APPROVAL_SHIP_MAX);
 
-  const render = () => execPing({
-    kicker,
-    subject: shippingSubject(subj, ship, shipN),
-    summary: [sum, attemptLine].filter(Boolean).join("\n"),
-    bullets: bl,
-    meta,
-    ask,
-    plain,
-  });
+  const render = () => {
+    const { items, more } = shippingBlock(ship, shipN);
+    return execPing({
+      kicker,
+      subject: subj,
+      summary: [sum, attemptLine].filter(Boolean).join("\n"),
+      shipping: items,
+      shippingMore: more,
+      bullets: bl,
+      bulletsLabel,
+      meta,
+      ask,
+      plain,
+    });
+  };
 
   // Over budget: shed the least decision-critical content first. The kicker,
   // the subject, the meta (🎫 handle → reply routing), the attempt line and the
@@ -941,7 +962,7 @@ const GATE_PHASE_KINDS = [
 const GATE_TITLE_KINDS = new Map([
   ["deploy gate", "deploy"], ["deploy approval", "deploy"], ["deploy", "deploy"],
   ["merge approval", "merge"], ["merge", "merge"],
-  ["handoff", "review"], ["review", "review"],
+  ["handoff", "handoff"], ["escalation", "handoff"], ["review", "review"],
   ["spec approval", "spec"], ["spec", "spec"],
   ["plan approval", "plan"], ["plan", "plan"],
   ["design approval", "design"], ["design", "design"],
@@ -960,7 +981,9 @@ const UNSAFE_KICKER_RE = /\d{4}|\b[0-9a-f]{7,}\b|arn:/i;
 function gateKindOf(gate, title) {
   const g = String(gate || "").toLowerCase();
   for (const [k, v] of GATE_PHASE_KINDS) if (g.includes(k)) return v;
-  const prefix = oneLine(String(title || "").split(":")[0]).toLowerCase();
+  // "Handoff (QA probe TEAM-4876): …" — the parenthetical is the agent's
+  // context, not the kind; strip it before the table lookup (TEAM-4885).
+  const prefix = oneLine(String(title || "").split(":")[0]).replace(/\s*\(.*$/, "").trim().toLowerCase();
   if (prefix && prefix.length <= 32 && !UNSAFE_KICKER_RE.test(prefix)) {
     const hit = GATE_TITLE_KINDS.get(prefix);
     if (hit) return hit;
@@ -1056,6 +1079,32 @@ function gateKindFor(gate, title, gateTicket) {
   if (parseDeployApprovalLabels(gateTicket?.labels).isDeployApproval) return "deploy-pipeline";
   if (ESCALATION_GATE_TITLE.test(String(title || ""))) return "escalation";
   return gateKindOf(gate, title);
+}
+
+const HANDOFF_SUBJECT_MAX = 200;
+const HANDOFF_SUMMARY_MAX = 240;
+/**
+ * Copy for a `handoff` ping (TEAM-4885). A Handoff/Escalation ticket is a task
+ * an agent hands to a human, so — unlike an approval gate, whose copy is the
+ * closing agent's curated review package — the ticket's own title IS the ask
+ * and its first sentence IS the context. Nothing else is rendered: no shipping
+ * list (the run's ticket titles are not what the human is being asked to do),
+ * no runbook body. The run title moves to a Context bullet.
+ */
+function handoffCopy(gateTicket, wf) {
+  const rawTitle = oneLine(gateTicket?.title || "");
+  // Drop the "Handoff (…):" / "Escalation:" classifier prefix — the kicker says it.
+  const ask = rawTitle.replace(/^[^:]{0,80}:\s*/, "") || rawTitle;
+  const firstSentence = oneLine(
+    String(gateTicket?.description || "").split(/\n+/).map((l) => l.trim()).find(Boolean) || ""
+  ).split(/(?<=[.!?])\s+/)[0] || "";
+  const runTitle = oneLine(wf?.input?.title || wf?.workflowId || "");
+  return {
+    subject: clipText(ask, HANDOFF_SUBJECT_MAX),
+    summary: clipText(firstSentence, HANDOFF_SUMMARY_MAX),
+    bullets: runTitle ? [`Run: ${clipText(runTitle, 120)}`] : [],
+    bulletsLabel: "Context",
+  };
 }
 
 /**
@@ -1997,20 +2046,25 @@ async function repageIfWindowOpened(wf, notif, w) {
     // ticket's title/description never reach the reminder either. Same INPUTS
     // too (TEAM-4671 F2) — the reminder and the page must agree on the attempt.
     const { attempt, previousIssue } = await approvalAttempt({ wf, notif, tickets });
+    // Shared classification (TEAM-4706): a deploy-approval gate reminds with
+    // the same 🚀 kicker it paged with, without a second rule living here. A
+    // handoff reminds with its own ask, like its page (TEAM-4885).
+    const reminderKind = gateKindFor(notif.gate, title, gateTicket);
+    const handoff = reminderKind === "handoff" ? handoffCopy(gateTicket, wf) : null;
     const { delivered } = await sendApprovalPing(chats, {
       label: page ? page.label : "business-hours reminder",
-      // Shared classification (TEAM-4706): a deploy-approval gate reminds with
-      // the same 🚀 kicker it paged with, without a second rule living here.
-      gateKind: gateKindFor(notif.gate, title, gateTicket),
+      gateKind: reminderKind,
       repage: true,
-      subject: wf.input?.title || wf.workflowId,
+      subject: handoff ? handoff.subject : (wf.input?.title || wf.workflowId),
       summary: page ? page.summary : "Sent for review outside working hours and still open — your window is open now.",
+      bullets: handoff ? handoff.bullets : [],
+      bulletsLabel: handoff ? handoff.bulletsLabel : undefined,
       attempt,
       previousIssue,
       meta: [
         `👤 ${esc(reviewer)}`,
         `🎫 [${notif.ticketId}](https://${JIRA_SITE_URL}/browse/${notif.ticketId})`,
-        "⏸ pipeline paused on you",
+        handoff ? "⏸ the agent is parked until you close this" : "⏸ pipeline paused on you",
         ...(page ? page.meta : []),
       ],
       ask: page ? page.ask : "Approve to continue, or Request changes to send it back.",
@@ -2307,37 +2361,50 @@ async function scanReviewGates() {
         : [];
       // messageIds is what phase 2 records on the claim row (TEAM-4663): the
       // proof a human really has this page, and the handles a later edit needs.
+      const gateKind = gateKindFor(notif.gate, title, gateTicket);
+      const handoff = gateKind === "handoff" ? handoffCopy(gateTicket, wf) : null;
       const { delivered, messageIds } = await sendApprovalPing(chats, {
-        label: deploy ? "deploy-approval gate" : "gate",
-        gateKind: gateKindFor(notif.gate, title, gateTicket),
-        subject: (brief && (brief.prTitle || brief.commitSubject)) || wf.input?.title || wf.workflowId,
+        label: deploy ? "deploy-approval gate" : handoff ? "handoff" : "gate",
+        gateKind,
+        subject: handoff
+          ? handoff.subject
+          : (brief && (brief.prTitle || brief.commitSubject)) || wf.input?.title || wf.workflowId,
         // With a brief the subject already names the PR/commit; the upstream
-        // titles would only repeat it.
-        shipping: brief ? [] : shipping,
+        // titles would only repeat it. A handoff is not shipping anything.
+        shipping: brief || handoff ? [] : shipping,
         summary: deploy
           ? (brief?.summary || oneLine(notif.summary) || DEPLOY_GATE_TERSE)
           : isEscalation
             ? (oneLine(notif.summary) || "The ship-review loop hit its round cap and needs a human call.")
-            : oneLine(notif.summary),
+            : handoff
+              ? (oneLine(notif.summary) || handoff.summary)
+              : oneLine(notif.summary),
         bullets: brief
           ? [
               brief.workflowLine,                               // "Workflow: TEAM-3721 (bug-fix)"
               brief.scopeLine,                                  // "Scope: 8 files (+147/-4)"
               brief.commitLine && brief.commitLine.replace(/`/g, ""), // "Commit: a1b2c3d"
             ].filter(Boolean)
-          : Array.isArray(notif.bullets) ? notif.bullets : [],
+          : handoff
+            ? handoff.bullets
+            : Array.isArray(notif.bullets) ? notif.bullets : [],
+        bulletsLabel: handoff ? handoff.bulletsLabel : undefined,
         attempt,
         previousIssue,
         meta: deploy
           ? [`👤 ${esc(reviewer)}`, ...deployMeta, ticketLink, "⏸ pipeline paused on you"]
           : isEscalation
             ? [`👤 ${esc(reviewer)}`, ticketLink]
-            : [`👤 ${esc(reviewer)}`, ticketLink, "⏸ pipeline paused on you"],
+            : handoff
+              ? [`👤 ${esc(reviewer)}`, ticketLink, "⏸ the agent is parked until you close this"]
+              : [`👤 ${esc(reviewer)}`, ticketLink, "⏸ pipeline paused on you"],
         ask: deploy
           ? DEPLOY_GATE_ASK
           : isEscalation
             ? "Pick ONE decision below — it is recorded as a DECISION line and the release manager resumes on its own."
-            : "Approve to continue, or Request changes to send it back.",
+            : handoff
+              ? "Do it, then tap ✅ to release the agent — or ❌ with a note to send it back."
+              : "Approve to continue, or Request changes to send it back.",
         keyboard,
       });
       // The claim was written before delivery was proven; if every send failed,

@@ -1,5 +1,60 @@
 {
   "defaultWorkflowDefId": "software-delivery",
+  "deliverableFamilies": {
+    "brief": {
+      "title": "Decision brief",
+      "reader": "a human or agent who must approve or reject",
+      "template": "template-brief",
+      "sections": [
+        "Decision",
+        "Why it is ready",
+        "What needs your eye",
+        "After approval"
+      ]
+    },
+    "assessment": {
+      "title": "Assessment",
+      "reader": "whoever acts on the findings",
+      "template": "template-assessment",
+      "sections": [
+        "Verdict",
+        "Findings",
+        "Not covered",
+        "Next actions"
+      ]
+    },
+    "spec": {
+      "title": "Spec / plan / design",
+      "reader": "whoever builds from it",
+      "template": "template-spec",
+      "sections": [
+        "Outcome",
+        "Scope",
+        "Approach",
+        "Acceptance"
+      ]
+    },
+    "record": {
+      "title": "Record",
+      "reader": "whoever tracks progress or audits later",
+      "template": "template-record",
+      "sections": [
+        "Status",
+        "Timeline",
+        "Open items"
+      ]
+    },
+    "external": {
+      "title": "External content",
+      "reader": "the end audience (customer, counterparty, public)",
+      "template": "template-external",
+      "sections": [
+        "Brief",
+        "Content",
+        "Notes for review"
+      ]
+    }
+  },
   "workflows": [
     {
       "id": "software-delivery",
@@ -48,6 +103,298 @@
           "maxRounds": 3,
           "regressionCountsDouble": true,
           "onCapReached": "escalate"
+        }
+      ],
+      "writingStandard": true,
+      "deliverables": [
+        {
+          "key": "intent.md",
+          "title": "Intent (verbatim request)",
+          "phase": "intake",
+          "family": "external",
+          "author": "hub",
+          "reader": "requirements analyst, Product Owner",
+          "required": true,
+          "template": null,
+          "note": "the request as submitted; never rewritten"
+        },
+        {
+          "key": "requirements.md",
+          "title": "Requirements",
+          "phase": "requirements",
+          "family": "spec",
+          "author": "agentcore_hub_requirements_analyst",
+          "reader": "designers, dev agents, Product Owner (Spec Approval)",
+          "required": true,
+          "gate": "Spec Approval"
+        },
+        {
+          "key": "review-package-requirements.json",
+          "title": "Spec Approval package",
+          "phase": "requirements",
+          "family": "brief",
+          "author": "agentcore_hub_requirements_analyst",
+          "reader": "Spec Approval reviewer (Telegram ping)",
+          "required": false,
+          "template": "review-package",
+          "gate": "Spec Approval",
+          "note": "only when the Spec Approval gate is flagged"
+        },
+        {
+          "key": "spec.md",
+          "title": "Spec (playbook)",
+          "phase": "requirements",
+          "family": "spec",
+          "author": "agentcore_hub_requirements_analyst",
+          "reader": "designers, dev agents, Product Owner",
+          "required": false,
+          "template": null,
+          "framework": "playbook",
+          "note": "exact sections defined in requirements-analyst.md P1; mirrored from the repo artifact chain"
+        },
+        {
+          "key": "design-doc-*.md",
+          "title": "Design doc (one per designer)",
+          "phase": "design",
+          "family": "spec",
+          "author": [
+            "agentcore_hub_frontend_designer",
+            "agentcore_hub_backend_designer",
+            "agentcore_hub_ios_designer",
+            "agentcore_hub_android_designer",
+            "agentcore_hub_legal_compliance"
+          ],
+          "reader": "dev agents, Engineer (Plan Approval)",
+          "required": true,
+          "gate": "Plan Approval",
+          "note": "any markdown saved with save_design_doc; filename is the doc title slug"
+        },
+        {
+          "key": "review-package-design.*.json",
+          "title": "Plan Approval package (one per designer)",
+          "phase": "design",
+          "family": "brief",
+          "author": [
+            "agentcore_hub_frontend_designer",
+            "agentcore_hub_backend_designer",
+            "agentcore_hub_ios_designer",
+            "agentcore_hub_android_designer",
+            "agentcore_hub_legal_compliance"
+          ],
+          "reader": "Plan Approval reviewer (Telegram ping)",
+          "required": false,
+          "template": "review-package",
+          "gate": "Plan Approval",
+          "note": "only when the Plan Approval gate is flagged"
+        },
+        {
+          "key": "security-review.md",
+          "title": "Security review",
+          "phase": "design",
+          "family": "assessment",
+          "author": "agentcore_hub_security_reviewer",
+          "reader": "dev agents",
+          "required": false,
+          "note": "only when the requirements analyst selected the security reviewer (auth, credentials or user data involved)"
+        },
+        {
+          "key": "compliance-review.md",
+          "title": "Compliance review",
+          "phase": "design",
+          "family": "assessment",
+          "author": "agentcore_hub_legal_compliance",
+          "reader": "dev agents",
+          "required": false
+        },
+        {
+          "key": "analytics-spec.md",
+          "title": "Analytics spec",
+          "phase": "design",
+          "family": "spec",
+          "author": "agentcore_hub_analytics_designer",
+          "reader": "dev agents",
+          "required": false
+        },
+        {
+          "key": "localization-spec.md",
+          "title": "Localization spec",
+          "phase": "design",
+          "family": "spec",
+          "author": "agentcore_hub_localization",
+          "reader": "dev agents",
+          "required": false
+        },
+        {
+          "key": "mockup.html",
+          "title": "Frontend mockup",
+          "phase": "design",
+          "family": "record",
+          "author": "agentcore_hub_frontend_designer",
+          "reader": "Plan Approval reviewer, frontend dev",
+          "required": false,
+          "template": null,
+          "kind": "binary"
+        },
+        {
+          "key": "design-mockup.png",
+          "title": "Frontend mockup screenshot",
+          "phase": "design",
+          "family": "record",
+          "author": "agentcore_hub_frontend_designer",
+          "reader": "Plan Approval reviewer",
+          "required": false,
+          "template": null,
+          "kind": "binary"
+        },
+        {
+          "key": "ios-design-mockup.png",
+          "title": "iOS mockup screenshot",
+          "phase": "design",
+          "family": "record",
+          "author": "agentcore_hub_ios_designer",
+          "reader": "Plan Approval reviewer",
+          "required": false,
+          "template": null,
+          "kind": "binary"
+        },
+        {
+          "key": "architecture-diagram.png",
+          "title": "Architecture diagram",
+          "phase": "design",
+          "family": "record",
+          "author": "agentcore_hub_backend_designer",
+          "reader": "Plan Approval reviewer, backend dev",
+          "required": false,
+          "template": null,
+          "kind": "binary"
+        },
+        {
+          "key": "plan.md",
+          "title": "Plan (playbook)",
+          "phase": "development",
+          "family": "spec",
+          "author": "agentcore_hub_backend_dev",
+          "reader": "Engineer (Plan Approval), dev agents",
+          "required": false,
+          "template": null,
+          "framework": "playbook",
+          "note": "exact sections defined in playbook-build.md; read by the code reviewer"
+        },
+        {
+          "key": "pull-request",
+          "title": "Pull request (one per dev surface)",
+          "phase": "development",
+          "family": "record",
+          "author": [
+            "agentcore_hub_backend_dev",
+            "agentcore_hub_api_dev",
+            "agentcore_hub_frontend_dev"
+          ],
+          "reader": "code reviewer, CI, release manager",
+          "required": true,
+          "kind": "pr",
+          "template": null
+        },
+        {
+          "key": "findings.md",
+          "title": "Code review findings",
+          "phase": "review",
+          "family": "assessment",
+          "author": "agentcore_hub_code_reviewer",
+          "reader": "dev agents (fix tickets), QA verifier",
+          "required": true
+        },
+        {
+          "key": "ci-evidence/*",
+          "title": "CI evidence",
+          "phase": "review",
+          "family": "record",
+          "author": "agentcore_hub_ci_agent",
+          "reader": "QA verifier, release manager",
+          "required": false,
+          "template": null,
+          "note": "raw build/test output; the CI verdict is the completion record (ci_status)"
+        },
+        {
+          "key": "qa-evidence/*.png",
+          "title": "QA evidence",
+          "phase": "verification",
+          "family": "record",
+          "author": "agentcore_hub_qa_verifier",
+          "reader": "release manager, Merge Approval reviewer",
+          "required": false,
+          "template": null,
+          "note": "screenshots captured by the QA checklist; the QA verdict is the completion record"
+        },
+        {
+          "key": "ship-review-summary.md",
+          "title": "Ship review summary",
+          "phase": "ship",
+          "family": "assessment",
+          "author": "agentcore_hub_release_manager",
+          "reader": "engineers",
+          "required": true
+        },
+        {
+          "key": "merge-brief.md",
+          "title": "Merge brief",
+          "phase": "ship",
+          "family": "brief",
+          "author": "agentcore_hub_release_manager",
+          "reader": "Code Owner (Merge Approval)",
+          "required": true,
+          "gate": "Merge Approval"
+        },
+        {
+          "key": "review-package-ship.json",
+          "title": "Merge Approval package",
+          "phase": "ship",
+          "family": "brief",
+          "author": "agentcore_hub_release_manager",
+          "reader": "Merge Approval reviewer (Telegram ping)",
+          "required": true,
+          "template": "review-package",
+          "gate": "Merge Approval"
+        },
+        {
+          "key": "cd-ledger.json",
+          "title": "CD ledger",
+          "phase": "ship",
+          "family": "record",
+          "author": "agentcore_hub_release_manager",
+          "reader": "orchestrator, release manager, humans auditing a deploy",
+          "required": false,
+          "template": null
+        },
+        {
+          "key": "cd-evidence/deploy-*.md",
+          "title": "Deploy evidence",
+          "phase": "ship",
+          "family": "record",
+          "author": "agentcore_hub_release_manager",
+          "reader": "deploy-gate approver, auditors",
+          "required": false
+        },
+        {
+          "key": "ship-review-state.json",
+          "title": "Ship review state",
+          "phase": "ship",
+          "family": "record",
+          "author": "agentcore_hub_release_manager",
+          "reader": "release manager (re-entry)",
+          "required": false,
+          "template": null
+        },
+        {
+          "key": "ship-review-escalation.md",
+          "title": "Ship review escalation",
+          "phase": "ship",
+          "family": "brief",
+          "author": "agentcore_hub_release_manager",
+          "reader": "Code Owner",
+          "required": false,
+          "note": "only when the review-round cap is reached; digest format defined in release-manager.md",
+          "template": null
         }
       ],
       "phases": [
@@ -219,6 +566,131 @@
           "onCapReached": "escalate"
         }
       ],
+      "writingStandard": true,
+      "deliverables": [
+        {
+          "key": "bug-analysis.md",
+          "title": "Bug analysis",
+          "phase": "requirements",
+          "family": "assessment",
+          "author": "agentcore_hub_requirements_analyst",
+          "reader": "bug fixer",
+          "required": true,
+          "note": "written under the bug-fix-requirements blueprint"
+        },
+        {
+          "key": "pull-request",
+          "title": "Fix pull request",
+          "phase": "development",
+          "family": "record",
+          "author": "agentcore_hub_bug_fixer",
+          "reader": "code reviewer, CI, release manager",
+          "required": true,
+          "kind": "pr",
+          "template": null
+        },
+        {
+          "key": "findings.md",
+          "title": "Code review findings",
+          "phase": "review",
+          "family": "assessment",
+          "author": "agentcore_hub_code_reviewer",
+          "reader": "dev agents (fix tickets), QA verifier",
+          "required": true
+        },
+        {
+          "key": "ci-evidence/*",
+          "title": "CI evidence",
+          "phase": "review",
+          "family": "record",
+          "author": "agentcore_hub_ci_agent",
+          "reader": "QA verifier, release manager",
+          "required": false,
+          "template": null,
+          "note": "raw build/test output; the CI verdict is the completion record (ci_status)"
+        },
+        {
+          "key": "qa-evidence/*.png",
+          "title": "QA evidence",
+          "phase": "verification",
+          "family": "record",
+          "author": "agentcore_hub_qa_verifier",
+          "reader": "release manager, Merge Approval reviewer",
+          "required": false,
+          "template": null,
+          "note": "screenshots captured by the QA checklist; the QA verdict is the completion record"
+        },
+        {
+          "key": "ship-review-summary.md",
+          "title": "Ship review summary",
+          "phase": "ship",
+          "family": "assessment",
+          "author": "agentcore_hub_release_manager",
+          "reader": "engineers",
+          "required": true
+        },
+        {
+          "key": "merge-brief.md",
+          "title": "Merge brief",
+          "phase": "ship",
+          "family": "brief",
+          "author": "agentcore_hub_release_manager",
+          "reader": "Code Owner (Merge Approval)",
+          "required": true,
+          "gate": "Merge Approval"
+        },
+        {
+          "key": "review-package-ship.json",
+          "title": "Merge Approval package",
+          "phase": "ship",
+          "family": "brief",
+          "author": "agentcore_hub_release_manager",
+          "reader": "Merge Approval reviewer (Telegram ping)",
+          "required": true,
+          "template": "review-package",
+          "gate": "Merge Approval"
+        },
+        {
+          "key": "cd-ledger.json",
+          "title": "CD ledger",
+          "phase": "ship",
+          "family": "record",
+          "author": "agentcore_hub_release_manager",
+          "reader": "orchestrator, release manager, humans auditing a deploy",
+          "required": false,
+          "template": null
+        },
+        {
+          "key": "cd-evidence/deploy-*.md",
+          "title": "Deploy evidence",
+          "phase": "ship",
+          "family": "record",
+          "author": "agentcore_hub_release_manager",
+          "reader": "deploy-gate approver, auditors",
+          "required": false
+        },
+        {
+          "key": "ship-review-state.json",
+          "title": "Ship review state",
+          "phase": "ship",
+          "family": "record",
+          "author": "agentcore_hub_release_manager",
+          "reader": "release manager (re-entry)",
+          "required": false,
+          "template": null
+        },
+        {
+          "key": "ship-review-escalation.md",
+          "title": "Ship review escalation",
+          "phase": "ship",
+          "family": "brief",
+          "author": "agentcore_hub_release_manager",
+          "reader": "Code Owner",
+          "required": false,
+          "note": "only when the review-round cap is reached; digest format defined in release-manager.md",
+          "template": null
+        }
+      ],
       "phases": [
         {
           "id": "intake",
@@ -276,6 +748,91 @@
           "onReject": "rework",
           "reviewerRole": "Code Owner",
           "assignee": "human:engineer"
+        }
+      ],
+      "writingStandard": true,
+      "deliverables": [
+        {
+          "key": "plan.md",
+          "title": "Operator plan",
+          "phase": "development",
+          "family": "spec",
+          "author": "agentcore_hub_operator",
+          "reader": "the operator (worker turns), reviewer",
+          "required": true,
+          "template": null,
+          "note": "exact sections defined in operator.md B2, including ## Live verification"
+        },
+        {
+          "key": "review.md",
+          "title": "Independent review",
+          "phase": "development",
+          "family": "assessment",
+          "author": "agentcore_hub_operator",
+          "reader": "the operator, Merge Approval reviewer",
+          "required": true,
+          "note": "the reviewer's reply saved verbatim; the review prompt asks for these sections"
+        },
+        {
+          "key": "merge-brief.md",
+          "title": "Merge brief",
+          "phase": "development",
+          "family": "brief",
+          "author": "agentcore_hub_operator",
+          "reader": "Code Owner (Merge Approval)",
+          "required": true,
+          "gate": "Merge Approval"
+        },
+        {
+          "key": "review-package-development.json",
+          "title": "Merge Approval package",
+          "phase": "development",
+          "family": "brief",
+          "author": "agentcore_hub_operator",
+          "reader": "Merge Approval reviewer (Telegram ping)",
+          "required": true,
+          "template": "review-package",
+          "gate": "Merge Approval"
+        },
+        {
+          "key": "operator-status.md",
+          "title": "Operator checkpoint",
+          "phase": "development",
+          "family": "record",
+          "author": "agentcore_hub_operator",
+          "reader": "human deciding whether to continue the run",
+          "required": false,
+          "gate": "Operator checkpoint"
+        },
+        {
+          "key": "pull-request",
+          "title": "Pull request",
+          "phase": "development",
+          "family": "record",
+          "author": "agentcore_hub_operator",
+          "reader": "reviewer, Merge Approval reviewer",
+          "required": true,
+          "kind": "pr",
+          "template": null
+        },
+        {
+          "key": "cd-ledger.json",
+          "title": "CD ledger",
+          "phase": "ship",
+          "family": "record",
+          "author": "agentcore_hub_operator",
+          "reader": "orchestrator, humans auditing a deploy",
+          "required": false,
+          "template": null
+        },
+        {
+          "key": "cd-evidence/deploy-*.md",
+          "title": "Deploy evidence",
+          "phase": "ship",
+          "family": "record",
+          "author": "agentcore_hub_operator",
+          "reader": "deploy-gate approver, auditors",
+          "required": false
         }
       ],
       "phases": [
@@ -358,6 +915,131 @@
           "onCapReached": "escalate"
         }
       ],
+      "writingStandard": true,
+      "deliverables": [
+        {
+          "key": "requirements.md",
+          "title": "Sweep requirements",
+          "phase": "intake",
+          "family": "spec",
+          "author": "agentcore_hub_requirements_analyst",
+          "reader": "code sweeper",
+          "required": true,
+          "note": "the requirements analyst is the intake agent on this def"
+        },
+        {
+          "key": "pull-request",
+          "title": "Sweep pull request",
+          "phase": "development",
+          "family": "record",
+          "author": "agentcore_hub_code_sweeper",
+          "reader": "code reviewer, CI, release manager",
+          "required": true,
+          "kind": "pr",
+          "template": null
+        },
+        {
+          "key": "findings.md",
+          "title": "Code review findings",
+          "phase": "review",
+          "family": "assessment",
+          "author": "agentcore_hub_code_reviewer",
+          "reader": "dev agents (fix tickets), QA verifier",
+          "required": true
+        },
+        {
+          "key": "ci-evidence/*",
+          "title": "CI evidence",
+          "phase": "review",
+          "family": "record",
+          "author": "agentcore_hub_ci_agent",
+          "reader": "QA verifier, release manager",
+          "required": false,
+          "template": null,
+          "note": "raw build/test output; the CI verdict is the completion record (ci_status)"
+        },
+        {
+          "key": "qa-evidence/*.png",
+          "title": "QA evidence",
+          "phase": "verification",
+          "family": "record",
+          "author": "agentcore_hub_qa_verifier",
+          "reader": "release manager, Merge Approval reviewer",
+          "required": false,
+          "template": null,
+          "note": "screenshots captured by the QA checklist; the QA verdict is the completion record"
+        },
+        {
+          "key": "ship-review-summary.md",
+          "title": "Ship review summary",
+          "phase": "ship",
+          "family": "assessment",
+          "author": "agentcore_hub_release_manager",
+          "reader": "engineers",
+          "required": true
+        },
+        {
+          "key": "merge-brief.md",
+          "title": "Merge brief",
+          "phase": "ship",
+          "family": "brief",
+          "author": "agentcore_hub_release_manager",
+          "reader": "Code Owner (Merge Approval)",
+          "required": true,
+          "gate": "Merge Approval"
+        },
+        {
+          "key": "review-package-ship.json",
+          "title": "Merge Approval package",
+          "phase": "ship",
+          "family": "brief",
+          "author": "agentcore_hub_release_manager",
+          "reader": "Merge Approval reviewer (Telegram ping)",
+          "required": true,
+          "template": "review-package",
+          "gate": "Merge Approval"
+        },
+        {
+          "key": "cd-ledger.json",
+          "title": "CD ledger",
+          "phase": "ship",
+          "family": "record",
+          "author": "agentcore_hub_release_manager",
+          "reader": "orchestrator, release manager, humans auditing a deploy",
+          "required": false,
+          "template": null
+        },
+        {
+          "key": "cd-evidence/deploy-*.md",
+          "title": "Deploy evidence",
+          "phase": "ship",
+          "family": "record",
+          "author": "agentcore_hub_release_manager",
+          "reader": "deploy-gate approver, auditors",
+          "required": false
+        },
+        {
+          "key": "ship-review-state.json",
+          "title": "Ship review state",
+          "phase": "ship",
+          "family": "record",
+          "author": "agentcore_hub_release_manager",
+          "reader": "release manager (re-entry)",
+          "required": false,
+          "template": null
+        },
+        {
+          "key": "ship-review-escalation.md",
+          "title": "Ship review escalation",
+          "phase": "ship",
+          "family": "brief",
+          "author": "agentcore_hub_release_manager",
+          "reader": "Code Owner",
+          "required": false,
+          "note": "only when the review-round cap is reached; digest format defined in release-manager.md",
+          "template": null
+        }
+      ],
       "sdlcFramework": "standard"
     },
     {
@@ -412,6 +1094,72 @@
           "type": "agent",
           "agentPhase": "scheduling"
         }
+      ],
+      "writingStandard": false,
+      "deliverables": [
+        {
+          "key": "campaign-brief.md",
+          "title": "Campaign brief",
+          "phase": "strategy",
+          "family": "spec",
+          "author": "agentcore_hub_marketing_strategist",
+          "reader": "copywriters, content designer, scheduler",
+          "required": true
+        },
+        {
+          "key": "ad-copy.md",
+          "title": "Ad copy",
+          "phase": "creative",
+          "family": "external",
+          "author": "agentcore_hub_ad_copywriter",
+          "reader": "brand QA, then the audience",
+          "required": true
+        },
+        {
+          "key": "blog.md",
+          "title": "Blog post",
+          "phase": "creative",
+          "family": "external",
+          "author": "agentcore_hub_blog_writer",
+          "reader": "brand QA, then the audience",
+          "required": true
+        },
+        {
+          "key": "social-copy.md",
+          "title": "Social copy",
+          "phase": "creative",
+          "family": "external",
+          "author": "agentcore_hub_social_copywriter",
+          "reader": "brand QA, then the audience",
+          "required": true
+        },
+        {
+          "key": "assets-manifest.md",
+          "title": "Assets manifest",
+          "phase": "generation",
+          "family": "record",
+          "author": "agentcore_hub_content_designer",
+          "reader": "brand QA, scheduler",
+          "required": true
+        },
+        {
+          "key": "qa-review.md",
+          "title": "Brand QA review",
+          "phase": "verification",
+          "family": "assessment",
+          "author": "agentcore_hub_brand_qa",
+          "reader": "copywriters (rework), scheduler",
+          "required": true
+        },
+        {
+          "key": "publishing-plan.md",
+          "title": "Publishing plan",
+          "phase": "scheduling",
+          "family": "spec",
+          "author": "agentcore_hub_campaign_scheduler",
+          "reader": "whoever publishes",
+          "required": true
+        }
       ]
     },
     {
@@ -461,6 +1209,63 @@
           "type": "agent",
           "agentPhase": "approval"
         }
+      ],
+      "writingStandard": false,
+      "deliverables": [
+        {
+          "key": "deal-brief.md",
+          "title": "Deal brief",
+          "phase": "qualification",
+          "family": "assessment",
+          "author": "agentcore_hub_deal_qualifier",
+          "reader": "proposal writer, solution engineer, pricing",
+          "required": true
+        },
+        {
+          "key": "proposal.md",
+          "title": "Proposal",
+          "phase": "drafting",
+          "family": "external",
+          "author": "agentcore_hub_proposal_writer",
+          "reader": "deal desk, then the customer",
+          "required": true
+        },
+        {
+          "key": "solution-sow.md",
+          "title": "Solution SOW",
+          "phase": "drafting",
+          "family": "spec",
+          "author": "agentcore_hub_solution_engineer",
+          "reader": "deal desk, then the customer",
+          "required": true
+        },
+        {
+          "key": "pricing.md",
+          "title": "Pricing",
+          "phase": "review",
+          "family": "spec",
+          "author": "agentcore_hub_pricing_analyst",
+          "reader": "deal desk, approver",
+          "required": true
+        },
+        {
+          "key": "deal-desk-review.md",
+          "title": "Deal desk review",
+          "phase": "review",
+          "family": "assessment",
+          "author": "agentcore_hub_deal_desk_reviewer",
+          "reader": "approver, drafters (rework)",
+          "required": true
+        },
+        {
+          "key": "approval.md",
+          "title": "Approval",
+          "phase": "approval",
+          "family": "brief",
+          "author": "agentcore_hub_sales_approver",
+          "reader": "sales leadership",
+          "required": true
+        }
       ]
     },
     {
@@ -488,6 +1293,84 @@
           "onReject": "rework",
           "reviewerRole": "Legal",
           "assignee": "human:counsel"
+        }
+      ],
+      "writingStandard": false,
+      "deliverables": [
+        {
+          "key": "triage.md",
+          "title": "Triage",
+          "phase": "triage",
+          "family": "assessment",
+          "author": "agentcore_hub_legal_intake",
+          "reader": "reviewers",
+          "required": true
+        },
+        {
+          "key": "contract-review.md",
+          "title": "Contract review",
+          "phase": "review",
+          "family": "assessment",
+          "author": "agentcore_hub_contract_reviewer",
+          "reader": "redline drafter, counsel",
+          "required": true
+        },
+        {
+          "key": "compliance-review.md",
+          "title": "Compliance review",
+          "phase": "review",
+          "family": "assessment",
+          "author": "agentcore_hub_legal_compliance",
+          "reader": "redline drafter, counsel",
+          "required": true
+        },
+        {
+          "key": "privacy-review.md",
+          "title": "Privacy review",
+          "phase": "review",
+          "family": "assessment",
+          "author": "agentcore_hub_privacy_reviewer",
+          "reader": "redline drafter, counsel",
+          "required": true
+        },
+        {
+          "key": "risk-review.md",
+          "title": "Risk review",
+          "phase": "review",
+          "family": "assessment",
+          "author": "agentcore_hub_risk_analyst",
+          "reader": "redline drafter, counsel",
+          "required": true
+        },
+        {
+          "key": "redlines.md",
+          "title": "Redlines",
+          "phase": "redline",
+          "family": "external",
+          "author": "agentcore_hub_redline_drafter",
+          "reader": "counsel (Counsel Sign-off), then the counterparty",
+          "required": true,
+          "gate": "Counsel Sign-off"
+        },
+        {
+          "key": "review-package-redline.json",
+          "title": "Counsel Sign-off package",
+          "phase": "redline",
+          "family": "brief",
+          "author": "agentcore_hub_redline_drafter",
+          "reader": "Counsel Sign-off reviewer (Telegram ping)",
+          "required": true,
+          "template": "review-package",
+          "gate": "Counsel Sign-off"
+        },
+        {
+          "key": "signoff.md",
+          "title": "Sign-off",
+          "phase": "signoff",
+          "family": "brief",
+          "author": "agentcore_hub_legal_approver",
+          "reader": "counsel, the requester",
+          "required": true
         }
       ],
       "phases": [
