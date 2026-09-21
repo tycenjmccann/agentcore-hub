@@ -689,6 +689,9 @@ export function createCascade(deps) {
     });
     await store.setTaskStatus(workflow.id, ticketId, "error");
     if (blockTicket) await blockTicket(ticketId, "dead_session_retry_exhausted");
+    // TEAM-4120 FR-3 — same hook as the detector's twin: with the escalation tree
+    // wired, IT writes the notification (with evidence + a resume path);
+    // unwired (the default) this is byte-identical to pre-4120.
     if (escalate) {
       await escalate({
         workflow, ticketId, agentId,

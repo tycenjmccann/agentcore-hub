@@ -17,7 +17,17 @@ function makeDdb(row, events) {
       if (cmd.constructor.name === "ScanCommand") return { Items: [row], Count: 1, ScannedCount: 1 };
       if (cmd.constructor.name === "QueryCommand") {
         const values = input.ExpressionAttributeValues || {};
-        const visible = events.filter((event) => event.workflowId === values[":w"]);
+        const typeSet = new Set([values[":err"], values[":died"], values[":hb1"], values[":hb2"]].filter(Boolean));
+        const visible = events.filter((event) => {
+          if (event.workflowId !== values[":w"]) return false;
+          if (typeSet.size && !typeSet.has(event.type)) return false;
+          if (values[":tid"] && event.detail?.ticketId !== values[":tid"]) return false;
+          if (values[":since"] && String(event.timestamp || "") < values[":since"]) return false;
+          if (values[":cutoff"] && String(event.timestamp || "") < values[":cutoff"]) return false;
+          if (values[":aid"] && event.detail?.agentId !== values[":aid"]) return false;
+          if (values[":dead"] && event.detail?.reason === values[":dead"]) return false;
+          return true;
+        });
         return { Items: visible };
       }
       return {};
@@ -64,6 +74,13 @@ function makeFixture({ injectDeathProbe }) {
   const redispatch = vi.fn(async (_workflow, ticket) => {
     row.agentTasks[ticket.ticketId].status = "running";
     row.agentTasks[ticket.ticketId].startedAt = iso(clock);
+    events.push({
+      workflowId: WF,
+      eventId: `died_after_${redispatch.mock.calls.length}`,
+      type: "agent.died",
+      timestamp: iso(clock + 60_000),
+      detail: { ticketId: ticket.ticketId, agentId: AGENT },
+    });
     return true;
   });
   const cascade = createCascade({
@@ -119,12 +136,18 @@ describe("TEAM-4889 replay — TEAM-4801 blocked died claim is capped", () => {
     // Pre-fix counter-assertion from prod: 59 dispatches, 57 agent.died rows,
     // zero escalations, and no deadSessionRetries on wf_bug_TEAM-4798.
     const fx = makeFixture({ injectDeathProbe: false });
-    for (let i = 0; i < 20; i++) {
-      await fx.sweep.runSweep("enforce");
+    const dispatchAt = [];
+    const escalatedAt = [];
+    for (let i = 0; i < 40; i++) {
+      const m = await fx.sweep.runSweep("enforce");
+      if (m.redispatched) dispatchAt.push(i);
+      if (m.escalated) escalatedAt.push(i);
       fx.advance();
     }
 
     expect(fx.redispatch.mock.calls.length).toBeLessThanOrEqual(2);
+    expect(dispatchAt).toEqual([0, 6]);
+    expect(escalatedAt).toEqual([12]);
     expect(fx.store.incrementDeadSessionRetry).toHaveBeenCalledTimes(2);
     expect(fx.row.deadSessionRetries[TICKET]).toBe(2);
     expect(eventsOfType(fx.publishEvent, "agent.escalated")).toHaveLength(1);
