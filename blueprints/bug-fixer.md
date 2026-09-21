@@ -257,6 +257,7 @@ A session that dies after the deliverable but before the report leaves the run u
 
 ## Rules
 - Model tiers per `claude_code` call (`model=`): PLAN turns on `"opus"` (`"fable"` for ambiguous / architecture-heavy work); EXECUTE turns on `"sonnet"` for well-specified plans, `"opus"` for complex ones; `"haiku"` only for trivial mechanical edits. Never plan on haiku.
+- Review-fix round 2+ = `"fable"` for PLAN **and** EXECUTE. Your ticket is a review fix when its title starts `Fix (review):`; it is round 2+ when `Tickets___list_tickets(epic_id)` shows an earlier `Fix (review):` ticket under the same epic, or when any finding you were handed is a regression a prior fix round introduced. Round-1 review fixes keep the tiers above. Why: the second time code comes back from review, the remaining findings are the subtle invariants a cheaper execute turn already got wrong once (wf_bug_TEAM-4798: round 4 on opus/sonnet cleared its 4 findings and introduced a new P1 in the same ref-minting code).
 - Never let `claude_code` change code before you have read and approved its fix plan (Step 3). (`codex` has no plan mode — when on the codex fallback, ask it for the plan as text first and approve it before the fix turn.)
 - Default to `claude_code`; fall back to `codex` only when `claude_code` is unavailable; BLOCKED if neither
 - Root cause, not symptom — a patch that hides the symptom is a fix ticket back to you
