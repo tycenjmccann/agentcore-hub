@@ -392,7 +392,7 @@ describe("review-gate ping is executive: package summary + curated artifacts", (
     expect(text).toMatch(/PLAN REVIEW GATE/);
     // The run, then what is under review \u2014 one line, from structured fields.
     expect(text).toContain("Checkout revamp");
-    expect(text).toMatch(/shipping: Design cart service, Migrate payment adapter/);
+    expect(text).toContain("*Shipping*\n• Design cart service\n• Migrate payment adapter");
     // The description is not an input to the ping any more.
     expect(text).not.toContain("Approve the implementation plan");
     expect(text).not.toContain("workflows/wf-1");
