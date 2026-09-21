@@ -534,14 +534,21 @@ async function repageGate(ticketId, labels, gateKind, verdict, refusal) {
 }
 
 /**
- * The label half of the admit path, as Jira `update.labels` ops that ride in the
- * SAME request as the transition: stamp the verification, take `gate:awaiting-console`
- * off. One request, so a close can never be recorded without its verification.
+ * The label half of the admit path, as Jira `update.labels` ops: stamp the
+ * verification, take `gate:awaiting-console` off. Written through the ADDITIVE
+ * `PUT /rest/api/3/issue/{key}` verb — the same one addLabels uses, which accepts
+ * both `{add}` and `{remove}` — immediately BEFORE the bare transition, and NOT
+ * inside the transitions body, which Jira honours only for fields on that
+ * transition's screen (TEAM-4882; see writeGateLabelOps and transitionTicket).
+ *
+ * The label lands FIRST because a stamped-but-still-open gate is recoverable — the
+ * next transition_ticket(done) re-probes and closes it — while a closed-but-unstamped
+ * gate is the unauditable case this guard exists to prevent.
  *
  * Jira has no arbitrary-field store, so the LABEL is the stamp here (the DynamoDB
  * twin writes the same label plus the structured `gateVerification` map). Only ever
  * removes a label the issue provably carries — a `remove` of an absent label risks a
- * 400 that would fail the whole transition, which is also why every remove uses the
+ * 400 that would fail the whole write, which is also why every remove uses the
  * issue's OWN spelling of the label rather than the canonical colon form.
  *
  * TEAM-4750 B2: the CONTRADICTORY stamp is removed too. Adding `gateverify:<result>`
@@ -561,6 +568,31 @@ function planGateLabelOps(labels, verification) {
   for (const o of opposite) ops.push({ remove: list[o] });
   if (stamp && same.length === 0) ops.push({ add: stamp });
   return ops;
+}
+
+/**
+ * Write planGateLabelOps' ops through the additive issue-edit verb (TEAM-4882).
+ *
+ * Deliberately NOT addLabels: that one runs normalizeSystemLabel over its input and
+ * only ever emits `{add}`, while a `remove` here has to name the label in the
+ * issue's OWN spelling, verbatim.
+ *
+ * A failure THROWS, which aborts the transition — see the ordering rationale at the
+ * transitions POST in transitionTicket. The message names the state the ticket is
+ * left in, because that state (open, unstamped) is what makes the retry safe.
+ */
+async function writeGateLabelOps(ticketId, ops) {
+  try {
+    await jiraFetch(`/rest/api/3/issue/${ticketId}`, {
+      method: "PUT",
+      body: JSON.stringify({ update: { labels: ops } }),
+    });
+  } catch (err) {
+    throw new Error(
+      `Cannot move ${ticketId} to Done: the gate verification stamp could not be written ` +
+      `(${err.message}) — the ticket was NOT transitioned and is still open. Retry the transition.`
+    );
+  }
 }
 
 /**
@@ -1810,18 +1842,56 @@ async function transitionTicket(params) {
     throw new Error(`No transition to "${effectiveStatus}" found. Available: ${available}`);
   }
 
-  // TEAM-4739: the verification stamp rides in the SAME request as the transition —
-  // `POST /transitions` accepts `update.labels` alongside `transition` — so a gate
-  // close can never be recorded without the verdict that admitted it, and
-  // `gate:awaiting-console` comes off in the same call rather than in an adjacent one
-  // that could be lost.
+  // TEAM-4882: the verification stamp is written by an ADJACENT, ADDITIVE label PUT
+  // and the transition body is BARE.
+  //
+  // Jira honours `fields`/`update` in a `POST /transitions` body ONLY for fields on
+  // that transition's SCREEN. The TEAM project's Done transition has no screen
+  // carrying `labels`, so the one-request form TEAM-4739 shipped 400s
+  // ("Field 'labels' cannot be set. It is not on the appropriate screen, or
+  // unknown.") on EVERY admitted close of a probed gate — `verified` and
+  // `indeterminate` alike, `skip` included, since skip resolves to Done. The refusal
+  // path never hit it because repageGate labels through `PUT /issue/{key}`, which the
+  // same project accepts.
+  //
+  // So the ONE-REQUEST ATOMICITY THE PREVIOUS COMMENT CLAIMED IS NOT AVAILABLE HERE.
+  // This is the honest ordering instead: LABEL FIRST, then the transition. A
+  // stamped-but-still-open gate is recoverable; a closed-but-unstamped one is the
+  // unauditable case the guard exists to prevent. A failed PUT therefore throws
+  // (writeGateLabelOps) and the transition is never sent — the ticket stays open and
+  // unstamped, which is retryable.
+  //
+  // Cost: one extra request per GATE close. A non-gate ticket has no ops, so its
+  // traffic is byte-identical to before.
+  //
+  // KNOWN WINDOW: if the PUT lands and the POST fails, `gate:awaiting-console` is
+  // already off a still-open gate, so the Telegram bridge's awaiting-console reminder
+  // goes quiet until a retry. What a retry does from there: transition_ticket(done)
+  // re-probes; if the gate is admitted again the ops are EMPTY (the stamp is already
+  // present, nothing left to remove) and only the bare POST is sent; if it is refused,
+  // repageGate re-adds `gate:awaiting-console` and may re-page once — a duplicate page
+  // is cheaper than a missed one, the same trade repageGate already documents.
+  // Splitting the ops across two calls to close that window would add a third request
+  // and a second failure mode for a gate the guard has already admitted.
   const labelOps = gateVerification ? planGateLabelOps(gateLabels, gateVerification) : [];
+
+  // F2b: the verification that ADMITTED this close, logged before either write — so a
+  // write that fails still leaves a record of WHY the probe admitted.
+  if (gateVerification) {
+    const ev = gateVerification.evidence;
+    console.log(
+      `[agentcore-hub-jira] ${ticket_id}: gate:${gateVerification.gateKind} ADMITTED ` +
+      `${gateVerification.result}/${gateVerification.reason}` +
+      (ev == null ? "" : ` evidence=${(typeof ev === "string" ? ev : JSON.stringify(ev)).slice(0, 200)}`) +
+      ` — labelOps=${labelOps.length}, transition=${match.id}`
+    );
+  }
+
+  if (labelOps.length) await writeGateLabelOps(ticket_id, labelOps);
+
   await jiraFetch(`/rest/api/3/issue/${ticket_id}/transitions`, {
     method: "POST",
-    body: JSON.stringify({
-      transition: { id: match.id },
-      ...(labelOps.length ? { update: { labels: labelOps } } : {}),
-    }),
+    body: JSON.stringify({ transition: { id: match.id } }),
   });
 
   const finalStatus = isSkip ? "done" : mapStatusToInternal(match.to.name);

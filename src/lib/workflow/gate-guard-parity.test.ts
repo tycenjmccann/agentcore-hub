@@ -63,6 +63,8 @@ const h = vi.hoisted(() => ({
     issues: {} as Record<string, { labels: string[]; description?: unknown; status?: string }>,
     /** Every non-GET request, as `{method, path, body}`. */
     writes: [] as Array<{ method: string; path: string; body: Record<string, unknown> }>,
+    /** Make `PUT /issue/{key}` 400 — the stamp cannot be written (TEAM-4882). */
+    putFails: false,
   },
 }));
 
@@ -210,10 +212,10 @@ function installJiraFetch() {
     if (/\/transitions$/.test(path) && method === "GET") {
       return ok({ transitions: [{ id: "31", name: "Done", to: { name: "Done" } }] });
     }
-    // Jira's `add` verb is idempotent server-side, so apply ops that way. Both the
-    // transition POST and a bare PUT carry them: the guard's label plan rides in the
-    // transition request, so applying them there is what makes the resulting label
-    // list assertable rather than assumed.
+    // Jira's `add` verb is idempotent server-side, so apply ops that way. ONLY the
+    // issue-edit PUT carries them: that is where the guard's label plan goes, so
+    // applying them there is what makes the resulting label list assertable rather
+    // than assumed.
     const applyLabelOps = (ops: Array<{ add?: string; remove?: string }>) => {
       for (const op of ops || []) {
         if (op.add && issue && !issue.labels.includes(op.add)) issue.labels.push(op.add);
@@ -222,11 +224,31 @@ function installJiraFetch() {
     };
 
     if (/\/transitions$/.test(path) && method === "POST") {
-      applyLabelOps(body?.update?.labels);
+      // TEAM-4882: the real TEAM project rejects `update`/`fields` here, because
+      // `labels` is not on the Done transition's SCREEN. The old fake accepted them
+      // and applied the ops, which is exactly why a suite this thorough still shipped
+      // a 400 on every admitted gate close.
+      if (body?.update || body?.fields) {
+        return {
+          status: 400,
+          ok: false,
+          text: async () =>
+            JSON.stringify({
+              errors: { labels: "Field 'labels' cannot be set. It is not on the appropriate screen, or unknown." },
+            }),
+        };
+      }
       return { status: 204, ok: true, text: async () => "" };
     }
     if (/\/comment$/.test(path)) return ok({ id: "1" });
     if (keyMatch && method === "PUT") {
+      if (h.jira.putFails) {
+        return {
+          status: 400,
+          ok: false,
+          text: async () => JSON.stringify({ errors: { labels: "Field 'labels' cannot be set." } }),
+        };
+      }
       applyLabelOps(body?.update?.labels);
       return { status: 204, ok: true, text: async () => "" };
     }
@@ -261,6 +283,8 @@ interface Scenario {
   labels: string[];
   description?: string;
   probes?: Probe[];
+  /** Jira only: make the stamp's issue-edit PUT 400 (TEAM-4882). */
+  jiraPutFails?: boolean;
 }
 
 interface Run {
@@ -281,6 +305,7 @@ function seed(scn: Scenario) {
   h.ddb.labelUpdates.length = 0;
   h.ddb.comments.length = 0;
   h.jira.writes.length = 0;
+  h.jira.putFails = Boolean(scn.jiraPutFails);
   h.probeBy = {};
   for (const p of scn.probes || []) {
     h.probeBy[p.tool] = { result: p.result, throws: p.throws, functionError: p.functionError, raw: p.raw };
@@ -824,6 +849,11 @@ describe("the admit path writes the stamp WITH the status", () => {
     probes: [{ tool: "Pipeline___get_state", result: { waitingOn: null } }],
   };
 
+  /** The transition POSTs — TEAM-4882: they may never carry `update`/`fields`. */
+  const transitionPosts = () => h.jira.writes.filter((w) => w.method === "POST" && /\/transitions$/.test(w.path));
+  /** The issue-edit PUTs — where this twin's label ops actually go. */
+  const labelPuts = () => h.jira.writes.filter((w) => w.method === "PUT");
+
   it("dynamodb: one UpdateCommand carries status + gateVerification, and clears the park label", async () => {
     await runTickets(CLEAR);
     expect(h.ddb.statusUpdates).toHaveLength(1);
@@ -844,23 +874,41 @@ describe("the admit path writes the stamp WITH the status", () => {
     expect(write.ConditionExpression).toMatch(/#l\[\d+] = :awaiting/);
   });
 
-  it("jira: the stamp and the label removal ride in the SAME transitions POST", async () => {
+  it("jira: the stamp PUT lands BEFORE a bare transitions POST", async () => {
+    // TEAM-4882. Jira cannot do what the twin above does: `update.labels` in a
+    // transitions body is honoured only when `labels` is on that transition's screen,
+    // and on the TEAM project's Done transition it is not — the whole close 400s. So
+    // the ops go through the additive issue-edit PUT, and the ORDER carries the
+    // guarantee that one request used to: stamped-but-open is retryable, whereas
+    // closed-but-unstamped is the unauditable state the guard exists to prevent.
     await runJira(CLEAR);
-    const posts = h.jira.writes.filter((w) => /\/transitions$/.test(w.path));
+    const posts = transitionPosts();
     expect(posts).toHaveLength(1);
-    expect(posts[0].body).toEqual({
-      transition: { id: "31" },
+    expect(posts[0].body).toEqual({ transition: { id: "31" } });
+
+    const puts = labelPuts();
+    expect(puts, "exactly one label PUT").toHaveLength(1);
+    expect(puts[0].body).toEqual({
       update: { labels: [{ remove: "gate:awaiting-console" }, { add: "gateverify:verified" }] },
     });
-    // No adjacent second call: a stamp written separately could be lost after the
-    // close, leaving a closed gate with no record of what admitted it.
-    expect(h.jira.writes.filter((w) => w.method === "PUT"), "no separate label PUT").toHaveLength(0);
+    expect(h.jira.writes.indexOf(puts[0])).toBeLessThan(h.jira.writes.indexOf(posts[0]));
+  });
+
+  it("jira: a rejected label PUT aborts the close — the gate stays open and unstamped", async () => {
+    const j = await runJira({ ...CLEAR, jiraPutFails: true });
+    expect(j.message).toMatch(/gate verification stamp could not be written/);
+    expect(j.message).toMatch(/NOT transitioned and is still open/);
+    expect(transitionPosts(), "no close without a stamp").toHaveLength(0);
+    expect(j.labels.filter((l) => /^gateverify[:-]/.test(l))).toEqual([]);
+    // Still parked, so the Telegram bridge keeps reminding until a retry closes it.
+    expect(j.labels).toContain("gate:awaiting-console");
   });
 
   // TEAM-4750 B2. A gate ticket may be closed, reopened and closed again with a
   // DIFFERENT verdict; the stamp is the only label record of why it closed, so two
   // contradictory stamps make that record unreadable. Both twins must therefore take
-  // the opposite stamp OFF in the same write that adds the new one.
+  // the opposite stamp OFF in the same write that adds the new one (Jira: in the one
+  // PUT that precedes the close — TEAM-4882).
   describe("a contradictory gateverify stamp is replaced, never accumulated", () => {
     const SWAP: Scenario = {
       labels: [...DEPLOY_LABELS, "gate:awaiting-console", "gateverify:indeterminate"],
@@ -895,12 +943,12 @@ describe("the admit path writes the stamp WITH the status", () => {
       expect(after, "no other label is disturbed").toEqual([...DEPLOY_LABELS, "gateverify:verified"]);
     });
 
-    it("jira: the opposite stamp is removed in the SAME transitions POST as the add", async () => {
+    it("jira: the opposite stamp is removed in the SAME label PUT as the add", async () => {
       const j = await runJira(SWAP);
-      const posts = h.jira.writes.filter((w) => /\/transitions$/.test(w.path));
-      expect(posts).toHaveLength(1);
-      expect(posts[0].body).toEqual({
-        transition: { id: "31" },
+      expect(transitionPosts()).toHaveLength(1);
+      const puts = labelPuts();
+      expect(puts).toHaveLength(1);
+      expect(puts[0].body).toEqual({
         update: {
           labels: [
             { remove: "gate:awaiting-console" },
@@ -933,11 +981,8 @@ describe("the admit path writes the stamp WITH the status", () => {
       ]);
 
       const j = await runJira(DIRTY);
-      const posts = h.jira.writes.filter((w) => /\/transitions$/.test(w.path));
-      expect(posts[0].body).toEqual({
-        transition: { id: "31" },
-        update: { labels: [{ remove: "gateverify:indeterminate" }] },
-      });
+      expect(transitionPosts()[0].body).toEqual({ transition: { id: "31" } });
+      expect(labelPuts()[0].body).toEqual({ update: { labels: [{ remove: "gateverify:indeterminate" }] } });
       expect(j.labels.filter((l) => /^gateverify[:-]/.test(l))).toEqual(["gateverify:verified"]);
     });
 
@@ -970,8 +1015,10 @@ describe("the admit path writes the stamp WITH the status", () => {
     expect(h.probes, "no probe for a non-gate ticket").toHaveLength(0);
 
     await runJira({ labels: ["phase:development"], probes: [] });
-    const posts = h.jira.writes.filter((w) => /\/transitions$/.test(w.path));
-    expect(posts[0].body).toEqual({ transition: { id: "31" } });
+    expect(transitionPosts()[0].body).toEqual({ transition: { id: "31" } });
+    // No ops ⇒ no extra request: a non-gate close costs exactly what it did before
+    // TEAM-4882 too, not just before TEAM-4739.
+    expect(labelPuts()).toHaveLength(0);
   });
 
   it("an indeterminate close is stamped too — the audit trail is the whole point", async () => {
@@ -985,8 +1032,32 @@ describe("the admit path writes the stamp WITH the status", () => {
     });
 
     await runJira(scn);
-    const posts = h.jira.writes.filter((w) => /\/transitions$/.test(w.path));
-    expect(posts[0].body.update).toEqual({ labels: [{ add: "gateverify:indeterminate" }] });
+    expect(transitionPosts()[0].body).toEqual({ transition: { id: "31" } });
+    expect(labelPuts()[0].body.update).toEqual({ labels: [{ add: "gateverify:indeterminate" }] });
+  });
+
+  it("the stamp lands with the close on BOTH twins", async () => {
+    // What the two twins have to AGREE on, stated independently of how many requests
+    // each one spends getting there (TEAM-4882): after an admitted close, the ticket
+    // carries exactly one verification label and no park label, and the close itself
+    // is recorded. One twin does it in one conditional UpdateCommand, the other in a
+    // PUT followed by a bare transition.
+    const t = await runTickets(CLEAR);
+    const write = h.ddb.statusUpdates[0] as {
+      UpdateExpression: string;
+      ExpressionAttributeValues: Record<string, unknown>;
+    };
+    expect(write.ExpressionAttributeValues[":s"]).toBe("done");
+    const afterDdb = replayLabelWrite(CLEAR.labels, write);
+    expect(afterDdb.filter((l) => /^gateverify[:-]/.test(l))).toEqual(["gateverify:verified"]);
+    expect(afterDdb).not.toContain("gate:awaiting-console");
+    expect(t.outcome).toBe("ADMIT_VERIFIED");
+
+    const j = await runJira(CLEAR);
+    expect(transitionPosts()).toHaveLength(1);
+    expect(j.labels.filter((l) => /^gateverify[:-]/.test(l))).toEqual(["gateverify:verified"]);
+    expect(j.labels).not.toContain("gate:awaiting-console");
+    expect(j.outcome).toBe("ADMIT_VERIFIED");
   });
 });
 
