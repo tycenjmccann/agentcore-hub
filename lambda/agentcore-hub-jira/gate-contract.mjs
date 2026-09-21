@@ -259,8 +259,17 @@ export const GATE_LOOP_BROKEN_RE = /^gate[:-]loop-broken$/;
 // The verification stamp. A LABEL and not only a field because Jira has nowhere
 // to put a structured map — the DynamoDB twin persists `gateVerification`
 // {result, reason, evidence, gateKind, probedAt} as well, but the label is the
-// part both providers write, in the SAME call as the status change, so a reader
-// can never see a closed gate whose verification has not landed yet.
+// part both providers write.
+//
+// WHERE THE TWO TWINS DIFFER (TEAM-4882). The DynamoDB twin writes the label in the
+// SAME conditional UpdateCommand as the status, so there a closed gate's
+// verification has provably landed. The Jira twin CANNOT: Jira honours
+// `update.labels` in a `POST /transitions` body only when `labels` is on that
+// transition's screen, and on a project where it is not, the whole close 400s. It
+// therefore writes the labels through an additive `PUT /issue/{key}` FIRST and then
+// posts the bare transition. Its failure window is a STAMPED GATE THAT IS STILL
+// OPEN — retryable, and the direction that keeps a closed gate from ever being
+// unauditable.
 //
 // Structurally forgery-safe (contradiction 9 of the plan): the guard only ever
 // ADDS a verification and never READS one to admit a close, so an agent that
@@ -466,10 +475,21 @@ let probeLambda = null;
  * @returns {Promise<{ok:true, result:any}|{ok:false, indeterminate:true, error:string}>}
  */
 export async function invokeProbe(fnName, tool, args) {
+  // F2b (TEAM-4882): one line per INDETERMINATE outcome. The callers ADMIT on
+  // indeterminate, so without this a probe that silently could not answer is
+  // indistinguishable in the logs from one that answered. The error NAME only —
+  // never the SDK message, which can carry the assumed-role identity.
+  // Contract unchanged: the same object, and still never throws.
+  const swallowed = (error) => {
+    console.warn(
+      `[gate-contract] probe ${tool} via ${fnName || "(unconfigured)"} is INDETERMINATE: ${error}`
+    );
+    return { ok: false, indeterminate: true, error };
+  };
   if (!PROBE_TOOLS.includes(tool)) {
-    return { ok: false, indeterminate: true, error: "tool_not_allowed" };
+    return swallowed("tool_not_allowed");
   }
-  if (!fnName) return { ok: false, indeterminate: true, error: "probe_not_configured" };
+  if (!fnName) return swallowed("probe_not_configured");
   try {
     if (!probeLambda) {
       // maxAttempts: 1 == one attempt, zero retries. A gate close must not sit
@@ -488,18 +508,18 @@ export async function invokeProbe(fnName, tool, args) {
       { abortSignal: AbortSignal.timeout(PROBE_TIMEOUT_MS) }
     );
     if (res.FunctionError) {
-      return { ok: false, indeterminate: true, error: `function_error:${res.FunctionError}` };
+      return swallowed(`function_error:${res.FunctionError}`);
     }
     const raw = res.Payload ? Buffer.from(res.Payload).toString("utf8") : "";
     const envelope = JSON.parse(raw);
     const text = envelope?.content?.[0]?.text;
     if (typeof text !== "string") {
-      return { ok: false, indeterminate: true, error: "probe_payload_shape" };
+      return swallowed("probe_payload_shape");
     }
     return { ok: true, result: JSON.parse(text) };
   } catch (err) {
     const name = err?.name || err?.code || "";
-    return { ok: false, indeterminate: true, error: String(name || err?.message || err) };
+    return swallowed(String(name || err?.message || err));
   }
 }
 
