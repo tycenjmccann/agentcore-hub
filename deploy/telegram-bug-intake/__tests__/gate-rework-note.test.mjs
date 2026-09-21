@@ -539,3 +539,53 @@ describe("stale markers and stray DECISION lines", () => {
     expect(db.items.has(REJ_KEY), "a later plain message must not become a rework note").toBe(false);
   });
 });
+
+describe("❌ note on a gate with nobody upstream (TEAM-4916)", () => {
+  const escalation = (extra = {}) => ({
+    ticketId: GATE, title: "Escalation: code review not converging (TEAM-4798, round 5)",
+    status: "in review", assignee: "human:engineer", blockedBy: "", ...extra,
+  });
+
+  it("a handoff-kind gate (Escalation) closes WITH the note — `blocked` reached nobody", async () => {
+    const handler = await loadHandler();
+    seedMarker(nowSec() + 3600);
+    const ctx = makeCtx(100_000);
+    const net = makeNet(ctx, {
+      tickets: [escalation()],
+      batches: [[msgUpdate(2, "Use Fable for this round and fix the ref minting properly.")]],
+      afterPoll: [100_000],
+    });
+    global.fetch = net.fetch;
+
+    await handler({}, ctx);
+
+    expect(net.transitions).toHaveLength(1);
+    // The parked reviewer IS the recipient: the gate closes and the comment is the instruction.
+    expect(net.transitions[0]).toMatchObject({ ticketId: GATE, targetStatus: "done" });
+    expect(net.transitions[0].comment).toBe("Changes requested via Telegram: Use Fable for this round and fix the ref minting properly.");
+    expect(db.items.has(REJ_KEY)).toBe(false);
+    expect(net.sent.some((m) => /note delivered/i.test(m.text) && m.text.includes(GATE))).toBe(true);
+    nothingFiled(net);
+  });
+
+  it("a review gate WITH upstream work still goes back as `blocked` for the orchestrator's rework", async () => {
+    const handler = await loadHandler();
+    seedMarker(nowSec() + 3600);
+    const ctx = makeCtx(100_000);
+    const net = makeNet(ctx, {
+      tickets: [
+        { ticketId: GATE, title: "Merge Approval: widget sprocket cache", status: "in review", blockedBy: "TEST-70" },
+        { ticketId: "TEST-70", title: "Ship: final PR review — widget sprocket cache", status: "done" },
+      ],
+      batches: [[msgUpdate(2, "The cache key ignores the tenant.")]],
+      afterPoll: [100_000],
+    });
+    global.fetch = net.fetch;
+
+    await handler({}, ctx);
+
+    expect(net.transitions).toHaveLength(1);
+    expect(net.transitions[0]).toMatchObject({ ticketId: GATE, targetStatus: "blocked" });
+    expect(net.sent.some((m) => /changes requested\./i.test(m.text))).toBe(true);
+  });
+});

@@ -228,8 +228,22 @@ const pendingState = () => ({
       actionStates: [{ actionName: "Source", currentRevision: { revisionId: "cafe1234beef5678" } }] },
     { stageName: "Approval",
       latestExecution: { status: "InProgress", pipelineExecutionId: EXEC },
+      // No pipelineExecutionId on the ACTION: CodePipeline's ActionExecution has
+      // none — only the stage's record names the execution (prod, 2026-09-21).
       actionStates: [{ actionName: "Approve_deploy",
-        latestExecution: { status: "InProgress", token: TOKEN, pipelineExecutionId: EXEC } }] },
+        latestExecution: { status: "InProgress", token: TOKEN } }] },
+  ],
+});
+/** The same gate after someone ELSE approved it: no token, a Succeeded approval. */
+const settledState = (summary = "Approved via Telegram by chat 999") => ({
+  stageStates: [
+    { stageName: "Source",
+      latestExecution: { status: "Succeeded", pipelineExecutionId: EXEC },
+      actionStates: [{ actionName: "Source", currentRevision: { revisionId: "cafe1234beef5678" } }] },
+    { stageName: "Approval",
+      latestExecution: { status: "Succeeded", pipelineExecutionId: EXEC },
+      actionStates: [{ actionName: "Approve_deploy",
+        latestExecution: { status: "Succeeded", summary, lastUpdatedBy: "arn:aws:sts::1:assumed-role/bridge" } }] },
   ],
 });
 const tap = (updateId, action) => ({
@@ -357,7 +371,37 @@ describe("the tri-state decides whether the ticket half runs at all (SEC-8)", ()
     expect(net.answered.some((a) => /already recorded/i.test(a.text))).toBe(true);
   });
 
-  it("failed: nothing is waiting and no ledger row ⇒ the ticket is untouched", async () => {
+  it("alreadyResolved: the pipeline's OWN page answered this execution first ⇒ the ticket still moves", async () => {
+    const mod = await loadModule();
+    // The human tapped the pipeline's tokenless page a moment ago: that page
+    // wrote the pipeline+execution ledger row and consumed the wait. No
+    // ticket-keyed row exists. This used to be "no approval action is waiting"
+    // and a gate parked in in_review behind a deploy that had shipped.
+    cp.states.set(PIPELINE, settledState());
+    db.items.set(`resolved#${PIPELINE}#${EXEC}`, {
+      id: { S: `resolved#${PIPELINE}#${EXEC}` },
+      decision: { S: "Approved" }, decidedAt: { N: String(Date.now()) }, chatId: { S: "999" },
+    });
+
+    const net = await runTap(mod, "gok");
+
+    expect(cp.approvals, "nothing left to approve").toEqual([]);
+    expect(net.transitions).toEqual([expect.objectContaining({ ticketId: GATE, targetStatus: "done" })]);
+    expect(db.items.has(`approved#${GATE}`), "ticket-keyed row stamped so a re-tap is a no-op").toBe(true);
+    expect(net.edited.at(-1).text).toMatch(/✅ Approved/);
+  });
+
+  it("alreadyResolved: no ledger at all, but the pipeline shows this execution Approved (console) ⇒ the ticket still moves", async () => {
+    const mod = await loadModule();
+    cp.states.set(PIPELINE, settledState("Approved by a human in the console"));
+
+    const net = await runTap(mod, "gok");
+
+    expect(cp.approvals).toEqual([]);
+    expect(net.transitions).toEqual([expect.objectContaining({ ticketId: GATE, targetStatus: "done" })]);
+  });
+
+  it("failed: nothing is waiting, no ledger, and the pipeline has no verdict for this execution ⇒ the ticket is untouched", async () => {
     const mod = await loadModule();
     cp.states.set(PIPELINE, { stageStates: [] });
 
