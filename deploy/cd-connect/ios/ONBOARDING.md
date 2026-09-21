@@ -234,6 +234,15 @@ disk guard from the examples. Unstick a full host by rotating the fleet instance
 (`update-fleet --base-capacity 2`, then back to 1) or running the job on the other
 fleet size; a full host cannot even place a NO_SOURCE cleanup build.
 
+**#9 — The archive build dies in pre_build: "security: ... A default keychain could not be found".**
+The fleet instance was recycled. A fresh macOS host boots with no login/default
+keychain, and `security cms -D` (used to read the entitlements out of the
+provisioning profile) refuses to run there even though it never writes to one.
+→ Decode the profile with LibreSSL instead, as the example does:
+`/usr/bin/openssl smime -inform der -verify -noverify -in pp.mobileprovision -out profile.plist`.
+Same plist byte-for-byte, no keychain. Nothing else in the keychain-free build
+touches `security`, so this is the only line a recycle can break.
+
 **#8 — Signing settings vs. runtime entitlements.**
 The app's real entitlements come from the **provisioning profile** (app id, team
 id, `get-task-allow=false`, TestFlight `beta-reports-active`, keychain groups). Pass

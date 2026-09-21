@@ -87,7 +87,12 @@ phases:
       - aws secretsmanager get-secret-value --secret-id "$SIGNING_SECRETS_PATH/provisioning-profile" --query SecretString --output text | base64 -d > "$KDIR/pp.mobileprovision"
       # Distribution entitlements come FROM the profile (application-identifier,
       # team-identifier, get-task-allow=false, beta-reports-active, keychain groups).
-      - security cms -D -i "$KDIR/pp.mobileprovision" -o "$KDIR/profile.plist"
+      # Decoded with openssl, not `security cms -D`: that command refuses to run on a
+      # host with no default keychain, which is exactly how a freshly provisioned
+      # fleet instance boots (2026-09-21: every archive died here after a recycle).
+      # LibreSSL's smime verify yields the identical plist; -noverify because we
+      # only read entitlements from the file, we do not trust it on that basis.
+      - /usr/bin/openssl smime -inform der -verify -noverify -in "$KDIR/pp.mobileprovision" -out "$KDIR/profile.plist" 2>/dev/null || security cms -D -i "$KDIR/pp.mobileprovision" -o "$KDIR/profile.plist"
       - plutil -extract Entitlements xml1 -o "$KDIR/entitlements.plist" "$KDIR/profile.plist"
       - |
         echo "signing cert:"; rcodesign -C /dev/null analyze-certificate --pem-source "$KDIR/dist.pem" 2>&1 | grep "Subject CN" | head -1 || true
