@@ -125,6 +125,7 @@ const ALLOWED_TG_SENDS = {
   sendApprovalPing: 2,
   resolveReworkTarget: 1,     // stray-DECISION hint
   deliverReworkNote: 2,       // rework Retry/Drop prompt + delivered confirmation
+  closeSettledDeployGate: 1,  // not an approval: notice that a decided deploy gate closed itself
   relayToWorkflowManager: 3,  // WM relay chunks, empty-reply and failure notices
 };
 

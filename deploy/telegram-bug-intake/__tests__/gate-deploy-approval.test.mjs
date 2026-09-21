@@ -703,3 +703,48 @@ describe("gate:deploy-approval — the ticket IS the deploy decision", () => {
     expect(net.edited.at(-1).text).toContain("✅ Approved");
   });
 });
+
+describe("a deploy gate whose wait was answered elsewhere (TEAM-4907 / TEAM-4920)", () => {
+  /** EXEC after the pipeline's own page (or the console) approved it: no token, a Succeeded approval naming who answered. */
+  const settledState = () => ({
+    stageStates: [
+      { stageName: "Source", latestExecution: { status: "Succeeded", pipelineExecutionId: EXEC },
+        actionStates: [{ actionName: "Source", latestExecution: { status: "Succeeded" } }] },
+      { stageName: "Approval", latestExecution: { status: "Succeeded", pipelineExecutionId: EXEC },
+        actionStates: [{ actionName: "Approve_deploy",
+          latestExecution: { status: "Succeeded", summary: "Approved via Telegram by chat 555", lastUpdatedBy: "arn:aws:sts::1:assumed-role/bridge" } }] },
+      { stageName: "Deploy", latestExecution: { status: "InProgress", pipelineExecutionId: EXEC },
+        actionStates: [{ actionName: "Deploy_prod", latestExecution: { status: "InProgress", externalExecutionId: "build/1" } }] },
+    ],
+  });
+
+  it("the scan closes the ticket with the pipeline's verdict instead of paging a decided question", async () => {
+    const mod = await loadModule({ bucket: BUCKET, registry: registry() });
+    cp.states.set(PIPELINE, settledState());
+    const net = makeNet(makeCtx(), { batches: [[]], workflows: [workflow()], tickets: [gateRow(LABELS_COLON)] });
+    global.fetch = net.fetch;
+
+    await mod.handler({}, net.ctx);
+
+    expect(net.transitions).toEqual([expect.objectContaining({ ticketId: GATE, targetStatus: "done" })]);
+    expect(cp.approvals, "nothing left to approve").toEqual([]);
+    const buttons = net.sent.flatMap((m) => m.reply_markup?.inline_keyboard?.flat() || []);
+    expect(buttons.some((b) => b.callback_data?.startsWith("gok|")), "no approval page for a decided gate").toBe(false);
+    expect(net.sent.some((m) => /already approved on the pipeline/i.test(m.text))).toBe(true);
+  });
+
+  it("a ✅ on the ticket after the pipeline's own page won the race still finishes the ticket half", async () => {
+    const mod = await loadModule({ bucket: BUCKET, registry: registry() });
+    cp.states.set(PIPELINE, settledState());
+    const net = makeNet(makeCtx(), {
+      batches: [[cbUpdate(1, `gok|${GATE}|${WF}`)]], workflows: [workflow()], tickets: [gateRow(LABELS_COLON)],
+    });
+    global.fetch = net.fetch;
+
+    await mod.handler({}, net.ctx);
+
+    expect(cp.approvals).toEqual([]);
+    expect(net.transitions.some((t) => t.ticketId === GATE && t.targetStatus === "done")).toBe(true);
+    expect(bodies(net).some((b) => /no approval action is waiting/.test(b)), "the old dead end").toBe(false);
+  });
+});

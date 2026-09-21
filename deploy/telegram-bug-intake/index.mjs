@@ -1179,12 +1179,39 @@ function pendingApprovals(state) {
           stageName: stage.stageName,
           actionName: action.actionName,
           token: ex.token,
-          executionId: ex.pipelineExecutionId || null,
+          // WHICH execution is parked here. Only the STAGE's execution record
+          // carries it (ActionExecution has no pipelineExecutionId), so reading
+          // it off the action left every wait unlabelled — and decideDeployGate
+          // then took the real wait for "a different execution" and REJECTED it
+          // as superseded whenever the gate ticket named its execution.
+          executionId: stage.latestExecution?.pipelineExecutionId || ex.pipelineExecutionId || null,
         });
       }
     }
   }
   return out;
+}
+
+/**
+ * How the ManualApproval for THIS execution ended, once it has: "Approved",
+ * "Rejected", or null while it still waits (or the stage has moved on to a
+ * different execution). An approval action's execution record carries the
+ * principal who answered it (`lastUpdatedBy`) and no externalExecutionId; that
+ * is what tells it apart from a Source/Build action that also reads Succeeded.
+ */
+function settledApproval(state, executionId) {
+  if (!executionId) return null;
+  for (const stage of state?.stageStates || []) {
+    if (stage.latestExecution?.pipelineExecutionId !== executionId) continue;
+    for (const action of stage.actionStates || []) {
+      const ex = action.latestExecution || {};
+      if (ex.token || ex.externalExecutionId) continue;
+      if (!ex.lastUpdatedBy && !/via Telegram/i.test(ex.summary || "")) continue;
+      if (ex.status === "Succeeded") return "Approved";
+      if (ex.status === "Failed" || ex.status === "Abandoned") return "Rejected";
+    }
+  }
+  return null;
 }
 
 /**
@@ -1476,6 +1503,36 @@ async function decideDeployGate(cb, chatId, ticketId, deploy, approve, workflowI
           });
         }
         return DEPLOY_GATE_ALREADY;
+      }
+      // Nothing is waiting and the ticket-keyed ledger is empty: someone else
+      // answered this execution. In practice that is the pipeline's OWN page
+      // (scanDeployApprovals pages the same human for the same wait a minute
+      // before the ticket does), so whichever tap landed second ended here as
+      // "no approval action is waiting" — with the gate parked in `in_review`
+      // and the run stalled behind a deploy that had already shipped (TEAM-4907,
+      // TEAM-4920, 2026-09-21). The tokenless ledger and the pipeline's own
+      // record both know the verdict; only a wait nobody answered is a failure.
+      const elsewhere = (deploy.executionId
+        && await gateDecisionRecorded({ pipeline: name, executionId: deploy.executionId }))
+        || settledApproval(state, deploy.executionId);
+      if (elsewhere === "Approved" && approve) {
+        // Stamp the ticket-keyed row too, so a re-tap takes the ledger path above.
+        await recordGateApproved({ ticketId }, { approve, chatId });
+        await tgAnswer(cb.id, "Already approved on the pipeline — finishing the ticket.").catch(() => {});
+        return DEPLOY_GATE_ALREADY;
+      }
+      if (elsewhere === "Rejected" && !approve) {
+        await recordGateApproved({ ticketId }, { approve, chatId });
+        return await settleShipRejection({
+          cb, chatId, ticketId, workflowId, outcome: DEPLOY_GATE_ALREADY,
+          state, cp, pipeline: name, executionId: deploy.executionId,
+        });
+      }
+      if (elsewhere) {
+        // The pipeline went the OTHER way from this tap. Say so; touch nothing.
+        console.warn(`[telegram-bug-intake] deploy gate ${ticketId}: ${approve ? "✅" : "❌"} tap on ${name} but the execution is already ${elsewhere} - nothing to do`);
+        await tgAnswer(cb.id, `Already ${elsewhere.toLowerCase()} on the pipeline — this tap changed nothing.`).catch(() => {});
+        return DEPLOY_GATE_FAILED;
       }
       throw new Error(`no approval action is waiting for execution ${deploy.executionId || "(unlabelled)"} on ${name}`);
     }
@@ -2143,6 +2200,9 @@ async function repageAwaitingConsole(wf, notif, w) {
       console.warn(`[telegram-bug-intake] awaiting-console check for ${notif.ticketId}: tickets unreadable — nothing paged`);
       return false;
     }
+    // Same rate-limited read serves the already-paged gate whose wait was
+    // answered on the pipeline's own page after this ticket's page went out.
+    if (await closeSettledDeployGate(wf, notif, gateTicket)) return true;
     const labels = parseDeployApprovalLabels(gateTicket?.labels);
     if (!labels.awaitingConsole) return false;
     // Resolved in the meantime → nothing to page about.
@@ -2212,6 +2272,45 @@ async function repageAwaitingConsole(wf, notif, w) {
       await releaseKey(holding).catch((relErr) =>
         console.error("[telegram-bug-intake] releaseKey after awaiting-console failure", relErr.message));
     }
+    return false;
+  }
+}
+
+/**
+ * If this open gate is a `gate:deploy-approval` whose execution's approval has
+ * ALREADY settled Approved — on the pipeline's own page or in the console —
+ * close it with that verdict and tell the chat: a decided question is not paged
+ * (TEAM-4907 / TEAM-4920, 2026-09-21: both deploys shipped while their gates
+ * sat in `in_review` for hours). Takes the ticket its caller already read, so it
+ * costs no extra /tickets fetch; one GetPipelineState, the same read the
+ * pipeline's own page pays. Never throws; false = "page as usual".
+ */
+async function closeSettledDeployGate(wf, notif, gateTicket) {
+  try {
+    if (!gateTicket || isTicketDone(gateTicket)) return false;
+    const labels = parseDeployApprovalLabels(gateTicket.labels);
+    if (!labels.isDeployApproval || !labels.executionId) return false;
+    const deploy = await deployApprovalGate(gateTicket);
+    const target = deploy?.target;
+    if (!target) return false;
+    const cp = codepipelineFor(target.region, target.roleArn, target.externalId);
+    const state = await cp.send(new GetPipelineStateCommand({ name: target.pipeline }));
+    if (settledApproval(state, labels.executionId) !== "Approved") return false;
+    const out = await transitionGateAfterDecision(wf.workflowId, notif.ticketId, "done",
+      `Approved on the pipeline ${target.pipeline} (execution ${labels.executionId}) outside this gate - closing the gate`);
+    if (out.error) {
+      console.warn(`[telegram-bug-intake] deploy gate ${notif.ticketId}: pipeline already approved but the close was refused: ${out.error.detail || out.error.message}`);
+      return false;
+    }
+    console.log(`[telegram-bug-intake] deploy gate ${notif.ticketId}: approved on ${target.pipeline} outside the gate - closed without paging`);
+    const chats = (await listChats()).filter((c) => ALLOWED_CHAT_IDS.includes(String(c)));
+    for (const chatId of chats) {
+      await tgSend(chatId,
+        `✅ *${esc(notif.ticketId)}* — the deploy was already approved on the pipeline, so this gate is closed; release manager resuming.`).catch(() => {});
+    }
+    return true;
+  } catch (err) {
+    console.warn(`[telegram-bug-intake] settled-deploy-gate check for ${notif?.ticketId}: ${err.message}`);
     return false;
   }
 }
@@ -2289,6 +2388,12 @@ async function scanReviewGates() {
       // One fetch, shared with the reminder path (gateTicketOf); it never throws,
       // so an unavailable tickets view just leaves the id as the title.
       const { gateTicket, tickets: allTickets } = await gateTicketOf(wf, notif);
+      // The pipeline already holds this gate's verdict: close it with that and
+      // keep the claim as delivered, so nothing pages a decided question.
+      if (await closeSettledDeployGate(wf, notif, gateTicket)) {
+        await markPingDelivered(gateClaimKey(notif)).catch(() => {});
+        continue;
+      }
       const title = gateTicket?.title || notif.ticketId;
       const byId = new Map(allTickets.map((x) => [x.ticketId, x]));
       // Whole list, not a slice: the builder renders APPROVAL_SHIP_MAX of them
@@ -2950,8 +3055,9 @@ async function deletePendingRejection(chatId) {
  * deleted the reviewer's re-typed note went through bug intake as a new report.)
  */
 async function deliverReworkNote(chatId, { ticketId, workflowId }, text) {
+  const target = await reworkTargetFor(workflowId, ticketId);
   try {
-    await transitionGate(workflowId, ticketId, "blocked", `Changes requested via Telegram: ${text}`);
+    await transitionGate(workflowId, ticketId, target, `Changes requested via Telegram: ${text}`);
   } catch (err) {
     console.error(`[telegram-bug-intake] rework note for ${ticketId} not delivered:`, err.message);
     await putPendingRejection(chatId, ticketId, workflowId, text);
@@ -2967,8 +3073,28 @@ async function deliverReworkNote(chatId, { ticketId, workflowId }, text) {
   // The note IS the previous issue for whatever this gate becomes next cycle.
   await recordGateRework(ticketId, text);
   await deletePendingRejection(chatId);
-  await tgSend(chatId, `❌ *${esc(ticketId)}* — changes requested. Your note is on the ticket; upstream work re-opens for rework.`);
+  await tgSend(chatId, target === "done"
+    ? `❌ *${esc(ticketId)}* — note delivered. The agent parked behind this gate resumes with your instruction.`
+    : `❌ *${esc(ticketId)}* — changes requested. Your note is on the ticket; upstream work re-opens for rework.`);
   return true;
+}
+
+/**
+ * Where a ❌ note sends the gate. `blocked` hands it to the orchestrator, which
+ * re-opens the gate's UPSTREAM tickets for rework — the right thing for a
+ * review, merge or deploy gate. A handoff-kind gate (Handoff / Escalation / CI
+ * unavailable) has no upstream: the agent parked behind it IS the recipient of
+ * the note, and `blocked` reached nobody — the orchestrator re-opened nothing
+ * and the reviewer stayed parked for two hours on a note it never saw
+ * (TEAM-4916, 2026-09-21). For those the note closes the gate, exactly as ✅
+ * does, and the comment is the instruction. Same for any gate with nothing
+ * upstream to re-open. An unreadable tickets view keeps today's `blocked`.
+ */
+async function reworkTargetFor(workflowId, ticketId) {
+  const { gateTicket } = await gateTicketOf({ workflowId }, { ticketId });
+  if (!gateTicket) return "blocked";
+  if (gateKindOf("", gateTicket.title) === "handoff") return "done";
+  return normalizeBlockedBy(gateTicket.blockedBy).length ? "blocked" : "done";
 }
 
 // Parked-note buttons: rjr|<ticketId>|<workflowId> re-sends the saved note;
