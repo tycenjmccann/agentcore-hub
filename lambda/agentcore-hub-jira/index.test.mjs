@@ -1546,7 +1546,7 @@ test("createTicket: an emoji title whose cut lands mid-surrogate-pair is clamped
  * `siblings` are the raw issues a `parent = X` search returns. Every non-GET
  * request is recorded in `writes`.
  */
-async function withJira({ issues = {}, siblings = [], searchFails = false }, fn) {
+async function withJira({ issues = {}, siblings = [], searchFails = false, transitionRefusesLabels = false }, fn) {
   const originalFetch = globalThis.fetch;
   const writes = [];
   globalThis.fetch = async (url, options = {}) => {
@@ -1557,7 +1557,13 @@ async function withJira({ issues = {}, siblings = [], searchFails = false }, fn)
     const json = (payload) => new Response(JSON.stringify(payload ?? {}), { status: 200 });
 
     if (/\/transitions$/.test(path)) {
-      if (method === "POST") return new Response(null, { status: 204 });
+      if (method === "POST") {
+        // TEAM-4908: a workflow with no transition screen refuses update.labels here.
+        if (transitionRefusesLabels && body?.update?.labels) {
+          return new Response(JSON.stringify({ errorMessages: [], errors: { labels: "Field 'labels' cannot be set. It is not on the appropriate screen, or unknown." } }), { status: 400 });
+        }
+        return new Response(null, { status: 204 });
+      }
       return json({ transitions: [{ id: "31", name: "Done", to: { name: "Done" } }] });
     }
     if (/\/search\/jql/.test(path)) {
@@ -1620,6 +1626,50 @@ test("gate guard: with no probe configured the close is ADMITTED and stamped ind
       update: { labels: [{ add: "gateverify:indeterminate" }] },
     });
   });
+});
+
+test("gate guard: a workflow with no transition screen still closes — stamp via PUT, then transition (TEAM-4908)", async () => {
+  // agentis-demo's team-managed workflow has no transition screens, so Jira 400s
+  // `update.labels` on POST /transitions although editmeta lists labels as
+  // editable. Before this fallback every human ✅ on a verified gate 409'd.
+  await withJira({ issues: { "TEAM-4908": { labels: [...DEPLOY_GATE] } }, transitionRefusesLabels: true }, async ({ writes, issues }) => {
+    const res = await transitionDone("TEAM-4908");
+
+    assert.equal(res.status, "done");
+    assert.equal(res.gateVerification.result, "indeterminate");
+    // 1st POST carried the stamp and was refused; then PUT /issue stamped; then a
+    // bare POST closed it — stamp strictly before close.
+    assert.deepEqual(writes.map((w) => `${w.method} ${w.path}`), [
+      "POST /rest/api/3/issue/TEAM-4908/transitions",
+      "PUT /rest/api/3/issue/TEAM-4908",
+      "POST /rest/api/3/issue/TEAM-4908/transitions",
+    ]);
+    assert.deepEqual(writes[1].body, { update: { labels: [{ add: "gateverify:indeterminate" }] } });
+    assert.deepEqual(writes[2].body, { transition: { id: "31" } });
+    assert.ok(issues["TEAM-4908"].labels.includes("gateverify:indeterminate"));
+  });
+});
+
+test("gate guard: any OTHER transition 400 still propagates (no blind retry)", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, options = {}) => {
+    const path = String(url).replace(/^https:\/\/[^/]+/, "");
+    const method = (options.method || "GET").toUpperCase();
+    if (/\/transitions$/.test(path) && method === "POST") {
+      return new Response(JSON.stringify({ errorMessages: ["Transition is not valid"] }), { status: 400 });
+    }
+    if (/\/transitions$/.test(path)) return new Response(JSON.stringify({ transitions: [{ id: "31", name: "Done", to: { name: "Done" } }] }), { status: 200 });
+    if (/\/rest\/api\/3\/issue\/TEAM-4909/.test(path) && method === "GET") {
+      return new Response(JSON.stringify({ key: "TEAM-4909", fields: { labels: [...DEPLOY_GATE], description: null, status: { name: "In Review" }, issuetype: { name: "Task" } } }), { status: 200 });
+    }
+    return new Response(JSON.stringify({}), { status: 200 });
+  };
+  try {
+    const res = await transitionDone("TEAM-4909");
+    assert.match(String(res.error), /Jira API 400/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("gate guard: the stamp and the parked-label removal ride in ONE transitions POST", async () => {

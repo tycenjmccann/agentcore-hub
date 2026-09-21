@@ -1816,13 +1816,26 @@ async function transitionTicket(params) {
   // `gate:awaiting-console` comes off in the same call rather than in an adjacent one
   // that could be lost.
   const labelOps = gateVerification ? planGateLabelOps(gateLabels, gateVerification) : [];
-  await jiraFetch(`/rest/api/3/issue/${ticket_id}/transitions`, {
-    method: "POST",
-    body: JSON.stringify({
-      transition: { id: match.id },
-      ...(labelOps.length ? { update: { labels: labelOps } } : {}),
-    }),
+  const transitionBody = (withLabels) => JSON.stringify({
+    transition: { id: match.id },
+    ...(withLabels && labelOps.length ? { update: { labels: labelOps } } : {}),
   });
+  try {
+    await jiraFetch(`/rest/api/3/issue/${ticket_id}/transitions`, { method: "POST", body: transitionBody(true) });
+  } catch (err) {
+    // TEAM-4908: a team-managed workflow whose transitions have no SCREEN rejects
+    // `update.labels` on POST /transitions with 400 "Field 'labels' cannot be set.
+    // It is not on the appropriate screen, or unknown." — while the same field IS
+    // on the edit screen (editmeta lists it). Every human ✅ on a verified gate
+    // 409'd for a day (2026-09-21). Fallback keeps the TEAM-4739 invariant "no
+    // close without its stamp" the other way round: stamp through the edit
+    // endpoint FIRST, then transition without labels. A stamp with no close is
+    // recoverable (re-approve); a close with no stamp is not.
+    if (!(labelOps.length && isLabelsScreenRefusal(err))) throw err;
+    console.warn(`[jira-tools] ${ticket_id}: transition screen has no labels field — stamping via PUT /issue, then transitioning without labels`);
+    await jiraFetch(`/rest/api/3/issue/${ticket_id}`, { method: "PUT", body: JSON.stringify({ update: { labels: labelOps } }) });
+    await jiraFetch(`/rest/api/3/issue/${ticket_id}/transitions`, { method: "POST", body: transitionBody(false) });
+  }
 
   const finalStatus = isSkip ? "done" : mapStatusToInternal(match.to.name);
   console.log(`[jira-tools] Transitioned ${ticket_id} to ${finalStatus} in Jira${blockers.length ? ` (blocked_by +${blockers.join(",")})` : ""}`);
@@ -1880,6 +1893,12 @@ function normalizeSystemLabel(label) {
  * `fix:`…). `add` is idempotent server-side: adding a label the issue already
  * carries is a no-op, so a redelivered call is harmless.
  */
+/** Jira's "labels is not on this transition's screen" refusal (TEAM-4908). */
+function isLabelsScreenRefusal(err) {
+  const m = String(err?.message || "");
+  return /Jira API 400/.test(m) && /labels/i.test(m) && /appropriate screen/i.test(m);
+}
+
 async function addLabels(params) {
   const ticketId = params.ticket_id || params.issue_key;
   if (!ticketId) throw new Error("'ticket_id' is required");
