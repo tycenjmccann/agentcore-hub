@@ -109,24 +109,48 @@ An entry carries `pipeline` (the CodePipeline that deploys the repo), `region`
 confused-deputy guard on that AssumeRole). The triple is honored only as a
 complete, valid set — `roleArn`'s embedded account cross-checked against
 `account`, `roleArn` naming the reserved `hub-cd-trigger-*` role — else it is
-dropped and the entry falls back to same-account. Everything else is derived
+dropped and the entry falls back to same-account.
+
+That trigger role is hand-applied per repo (there is no template in this repo),
+and what it must allow grew with TEAM-4866: besides `GetPipelineState` /
+`GetPipelineExecution` / `ListActionExecutions` / `StartPipelineExecution` on the
+pipeline, it needs `codepipeline:ListPipelineExecutions` (without it
+`start_deploy`'s duplicate-adoption check fails open and two executions can still
+deploy the same revision — and `get_state` never reports `supersededBy`) and
+`codebuild:BatchGetBuilds` + `logs:GetLogEvents` on
+`<pipeline-base>-runtime-image-deploy` (without them the release manager cannot
+read a failed runtime-image deploy's log). Never `codepipeline:PutApprovalResult`
+— the deploy gate is human-only in every account.
+
+Everything else is derived
 from the pipeline name, by one rule shared by every surface —
 `pipelineProjects()` in `lambda/orchestrator/cd-registry.mjs` and its TS mirror
 `pipelineProjectsFor()` in `src/lib/cd-registry.ts`:
 
 ```
 pipeline: hub-<slug>-deploy
-  → ciProject     hub-<slug>-ci      (unless the entry names one explicitly)
-  → buildProject  hub-<slug>-build
-  → deployProject hub-<slug>-deploy
+  → ciProject           hub-<slug>-ci      (unless the entry names one explicitly)
+  → buildProject        hub-<slug>-build
+  → deployProject       hub-<slug>-deploy
+  → runtimeImageProject hub-<slug>-runtime-image-deploy   (READ-only, TEAM-4866)
 ```
+
+`runtimeImageProject` is the Deploy stage's **second** CodeBuild action
+(`Deploy_runtime_images`). It exists in the derivation for exactly one reason:
+`Pipeline___get_build_log` must be able to explain a failed runtime-image deploy
+(before TEAM-4866 that build id came back `project_not_registered`). It is a
+read-only name — it is a reserved CI project, it is deliberately absent from the
+project set every other tool resolves against, and nothing anywhere may hand it
+to `codebuild:StartBuild`.
 
 `slug` = the repo name, lowercased, every run of `[^a-z0-9]+` collapsed to `-`,
 trimmed of leading/trailing `-`, truncated to 40 chars. A pipeline name that does
 not end in `-deploy` is used as the base as-is (`juno` → `juno-ci` / `juno-build`).
 `hub-` is a **reserved prefix** for hub-managed pipelines; the hub's own resources
 keep their historical `agentcore-hub-*` names, so `agentcore-hub-deploy` derives
-`agentcore-hub-ci` / `agentcore-hub-build`.
+`agentcore-hub-ci` / `agentcore-hub-build` /
+`agentcore-hub-runtime-image-deploy` (the last one overridable on the tools
+Lambda via `RUNTIME_IMAGE_PROJECT`).
 
 `POST /api/workflow/cd-registry` shape-validates every field (`repo`, `region`,
 `pipeline`, `ciProject`, `deployDoc`, `notes`, plus the cross-account
@@ -163,11 +187,21 @@ follow-up (PR B).
    (`gh pr merge --squash`) and records the merge SHA.
 2. **Trigger.** Merge does **not** auto-trigger the pipeline (the GitHub push
    webhook is not wired) — RM calls `Pipeline___start_deploy` and records the
-   `pipelineExecutionId`.
+   `pipelineExecutionId`. If an execution is already **in flight on that same
+   Source revision**, the tool ADOPTS it rather than starting a second one:
+   `{started:false, adopted:true, reason:"same_revision_in_progress"}` with
+   `pipelineExecutionId` = that execution's id, so the RM watches it exactly as
+   if it had started it (TEAM-4866 — two executions deployed identical bytes 5
+   min apart in the PR #640 run, because `gateAhead` only ever saw executions
+   *parked on the approval stage*, never a RUNNING duplicate). The check is one
+   `ListPipelineExecutions` and it **fails open**: if that call is denied or
+   errors, the response carries `adoptionCheck:{ok:false, reason}` and the deploy
+   starts as before — duplicate-avoidance is an optimisation, never a gate.
 3. **Watch to terminal.** RM polls `Pipeline___get_state` until the execution
    is terminal, reporting stage statuses as CD evidence.
 4. **On Build FAILED:** RM calls `Pipeline___get_build_log` (phase contexts +
-   log tail), then files a **precise fix ticket** (file:line + failing command)
+   log tail) — readable for the CI, build and deploy projects **and** for the
+   Deploy stage's runtime-image action — then files a **precise fix ticket** (file:line + failing command)
    routed to the owning dev — it never hand-fixes the deploy. When the fix
    merges, RM calls `Pipeline___start_deploy` again. This loop is RM's to own
    until the pipeline is green or the fix is genuinely blocked.

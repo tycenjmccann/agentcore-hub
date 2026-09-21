@@ -472,7 +472,10 @@ For **cross-account CD**, a registry entry may also carry `account`, `roleArn`
 the hub assumes that role to trigger a pipeline in a different AWS account. Set
 this triple with `scripts/cd-registry.sh` or the API only — the Workflow-tab CD
 registry form exposes `pipeline`/`region`/`ciProject`, not the cross-account
-fields. Note the current limitation: only the `Pipeline___*` tools Lambda
+fields. That role is hand-applied per repo, and it must also allow
+`codepipeline:ListPipelineExecutions` plus `codebuild:BatchGetBuilds` /
+`logs:GetLogEvents` on `<pipeline-base>-runtime-image-deploy` — never
+`codepipeline:PutApprovalResult`. Note the current limitation: only the `Pipeline___*` tools Lambda
 assumes the trigger role, so a cross-account pipeline can be *triggered*, but the
 `/pipeline` board and the Telegram deploy-gate bridge use ambient credentials —
 they cannot read that pipeline's status or surface its approval gate.

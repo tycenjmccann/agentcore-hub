@@ -382,3 +382,59 @@ def test_abandon_is_not_an_approval_surface():
         "abandon_unconfirmed",
     ):
         assert reason in doc, f"the tool spec does not name the {reason} refusal"
+
+
+# ─── TEAM-4866: adoption, and the second Deploy action's log ───────────────────
+#
+# Two advisory findings from the PR #640 CD run. Both are answered in the Lambda;
+# what is asserted HERE is the only "manifest" a persona ever reads — the @tool
+# docstring. A behaviour the spec does not describe is a behaviour the agent
+# misreads: started:false looks like a failure unless the spec says it is not, and
+# a readable project nobody is told about stays unread.
+
+
+def test_start_deploy_doc_names_the_adopted_response():
+    """An execution already in flight for this exact commit is ADOPTED, not
+    duplicated. The spec must name every key the persona branches on, and say
+    plainly that started:false is a success — a retry here is the double deploy
+    this feature exists to prevent."""
+    fn, _ = _load_tool("Pipeline___start_deploy")
+    doc = fn.__doc__ or ""
+    for token in (
+        "adopted",
+        "started:false",
+        "same_revision_in_progress",
+        "pipelineExecutionId",
+    ):
+        assert token in doc, f"the tool spec does not name {token}"
+    assert "SUCCESS" in doc
+    assert "never retry it" in doc
+    # No new parameter: adoption is not opt-in, so the signature is unchanged and
+    # the payload tests above still describe it completely.
+    import inspect
+
+    assert "adopt" not in " ".join(inspect.signature(fn).parameters)
+    # And the widening did not bring an approval path with it (DL-028).
+    assert "putApprovalResult" not in doc
+    assert "not an approval capability" in doc
+    for reason in (
+        "ancestry_unproven",
+        "gate_no_longer_occupied",
+        "abandon_not_permitted",
+        "abandon_unconfirmed",
+    ):
+        assert reason in doc, f"the tool spec does not name the {reason} refusal"
+
+
+def test_get_build_log_doc_names_the_runtime_image_project():
+    """The Deploy stage runs TWO CodeBuild actions. Until TEAM-4866 only one was
+    readable, and the release manager spent a turn on a project_not_registered
+    refusal; now the spec must say both are readable — and that reading is ALL it
+    can do there."""
+    fn, _ = _load_tool("Pipeline___get_build_log")
+    doc = fn.__doc__ or ""
+    assert "runtime-image" in doc
+    assert "-runtime-image-deploy" in doc
+    assert "TWO CodeBuild actions" in doc
+    assert "read-only" in doc
+    assert "putApprovalResult" not in doc

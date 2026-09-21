@@ -99,6 +99,11 @@
  *                   API must fail closed rather than burn the whole budget.)
  *   DEPLOY_PROJECT  default agentcore-hub-deploy   (the Deploy stage's CodeBuild
  *                   project — same NAME as the pipeline, different resource kind)
+ *   RUNTIME_IMAGE_PROJECT  default agentcore-hub-runtime-image-deploy (the Deploy
+ *                   stage's SECOND CodeBuild action, Deploy_runtime_images).
+ *                   READ-ONLY (TEAM-4866): exact ARNs in BuildRead + BuildLogRead
+ *                   so Pipeline___get_build_log can explain a failed runtime-image
+ *                   deploy. Never in CiStartBuild, and reserved against CI_PROJECT.
  *   PIPELINE_REGIONS  comma list of regions holding hub-*-deploy pipelines.
  *                   Default: AWS_REGION alone. The list is taken LITERALLY — set
  *                   it to every region you register repos in, the Lambda's own
@@ -137,7 +142,15 @@ const ROLE_NAME = "agentcore-hub-pipeline-tools-role";
 // index.mjs here would construct three AWS SDK clients inside a deploy script.
 // The two copies are pinned against each other on a shared matrix by
 // deploy/setup-pipeline-tools-lambda.test.mjs — change one, change both.
-const RESERVED_CI_PROJECTS = ["agentcore-hub-runtime-image-deploy"];
+// TEAM-4866 made the name configurable (RUNTIME_IMAGE_PROJECT) so get_build_log
+// can READ it; the union with the literal default is what keeps a configured name
+// from un-reserving the default one. Same expression as the Lambda's copy.
+const RESERVED_CI_PROJECTS = [
+  ...new Set([
+    process.env.RUNTIME_IMAGE_PROJECT || "agentcore-hub-runtime-image-deploy",
+    "agentcore-hub-runtime-image-deploy",
+  ]),
+];
 
 export function validateCiProjectName(name, opts = {}) {
   const { buildProject, deployProject, pipelineName } = opts;
@@ -198,6 +211,13 @@ export function resolveEnv(env = process.env) {
     // (the CodePipeline) but is a DIFFERENT AWS resource kind — keep the two
     // constants distinct; do not collapse them.
     DEPLOY_PROJECT: env.DEPLOY_PROJECT || "agentcore-hub-deploy",
+    // TEAM-4866 — the Deploy stage's SECOND CodeBuild action
+    // (Deploy_runtime_images). A READ target only: it gets exact ARNs in BuildRead
+    // and BuildLogRead so Pipeline___get_build_log can explain a failed
+    // runtime-image deploy, and it must NEVER appear in CiStartBuild. It is also a
+    // RESERVED_CI_PROJECTS name, so pointing CI_PROJECT at it disables
+    // start_ci_build rather than granting StartBuild on a deploy.
+    RUNTIME_IMAGE_PROJECT: env.RUNTIME_IMAGE_PROJECT || "agentcore-hub-runtime-image-deploy",
     PIPELINE_CI_START_BUILD: env.PIPELINE_CI_START_BUILD === "1" ? "1" : "0",
     // Every region holding a hub-*-deploy pipeline this role may read + trigger.
     // Normalized to a comma string so the same value can go straight onto the
@@ -266,6 +286,7 @@ export function buildInlinePolicy(env) {
     BUILD_PROJECT,
     CI_PROJECT,
     DEPLOY_PROJECT,
+    RUNTIME_IMAGE_PROJECT,
     PIPELINE_CI_START_BUILD,
   } = env;
   const artifactBucket =
@@ -276,6 +297,9 @@ export function buildInlinePolicy(env) {
   const buildArn = `arn:aws:codebuild:${REGION}:${ACCOUNT}:project/${BUILD_PROJECT}`;
   const ciArn = `arn:aws:codebuild:${REGION}:${ACCOUNT}:project/${CI_PROJECT}`;
   const deployArn = `arn:aws:codebuild:${REGION}:${ACCOUNT}:project/${DEPLOY_PROJECT}`;
+  // TEAM-4866 — the Deploy stage's OTHER CodeBuild action. Read-only: this ARN
+  // appears in BuildRead + BuildLogRead and MUST NOT appear in CiStartBuild.
+  const runtimeImageArn = `arn:aws:codebuild:${REGION}:${ACCOUNT}:project/${RUNTIME_IMAGE_PROJECT}`;
 
   // ─── the hub-* convention wildcards, one set per PIPELINE_REGIONS region ─────
   // Registering a repo in the CD registry must not require an IAM edit, so the
@@ -339,6 +363,12 @@ export function buildInlinePolicy(env) {
         Action: [
           "codepipeline:GetPipelineState",
           "codepipeline:ListActionExecutions",
+          // TEAM-4866 — the execution LIST, read for two things, both read-only:
+          // start_deploy's adoption probe (is an execution for this exact commit
+          // already in flight? if so return its id instead of deploying the same
+          // bytes twice) and get_state's findSupersedingExecution, which has always
+          // called it and was silently AccessDenied without this grant.
+          "codepipeline:ListPipelineExecutions",
           // Resolves an execution's source revision so get_state can look up
           // that commit's infra-handoff marker.
           "codepipeline:GetPipelineExecution",
@@ -372,10 +402,17 @@ export function buildInlinePolicy(env) {
         // build AND deploy projects — reading a deploy build's log is how the CI
         // agent sees why a deploy failed. Still NO approval/write action of any
         // kind.
+        //
+        // TEAM-4866 adds the runtime-image deploy project: the Deploy stage has TWO
+        // CodeBuild actions, and when Deploy_runtime_images failed the release
+        // manager got project_not_registered instead of the log. Only the hub's own
+        // name needs an exact ARN — a registered repo's
+        // hub-<slug>-runtime-image-deploy already matches project/hub-* here, and
+        // matches project/hub-*-ci nowhere, so StartBuild cannot reach it.
         Sid: "BuildRead",
         Effect: "Allow",
         Action: ["codebuild:BatchGetBuilds", "codebuild:ListBuildsForProject"],
-        Resource: [buildArn, ciArn, deployArn, ...hubProjectArns],
+        Resource: [buildArn, ciArn, deployArn, runtimeImageArn, ...hubProjectArns],
       },
       // The ONLY write this role ever gets, and only when asked for: StartBuild on
       // the validated PR-check project ARN plus project/hub-*-ci — never the
@@ -467,6 +504,9 @@ export function buildInlinePolicy(env) {
           `arn:aws:logs:${REGION}:${ACCOUNT}:log-group:/aws/codebuild/${BUILD_PROJECT}:*`,
           `arn:aws:logs:${REGION}:${ACCOUNT}:log-group:/aws/codebuild/${CI_PROJECT}:*`,
           `arn:aws:logs:${REGION}:${ACCOUNT}:log-group:/aws/codebuild/${DEPLOY_PROJECT}:*`,
+          // TEAM-4866 — the runtime-image deploy build's log. Its hub-* equivalent
+          // is already covered by hubLogArns below.
+          `arn:aws:logs:${REGION}:${ACCOUNT}:log-group:/aws/codebuild/${RUNTIME_IMAGE_PROJECT}:*`,
           ...hubLogArns,
         ],
       },
@@ -498,6 +538,7 @@ async function main() {
     BUILD_PROJECT,
     CI_PROJECT,
     DEPLOY_PROJECT,
+    RUNTIME_IMAGE_PROJECT,
     PIPELINE_CI_START_BUILD,
     PIPELINE_REGIONS,
     ARTIFACT_BUCKET,
@@ -620,6 +661,7 @@ async function main() {
     BUILD_PROJECT,
     CI_PROJECT,
     DEPLOY_PROJECT,
+    RUNTIME_IMAGE_PROJECT,
     PIPELINE_CI_START_BUILD,
     PIPELINE_REGIONS,
     ARTIFACT_BUCKET: ARTIFACT_BUCKET || `agentcore-hub-artifacts-${ACCOUNT}-${REGION}`,

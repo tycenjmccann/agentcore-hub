@@ -28,9 +28,18 @@
  *                     same human a SECOND time for byte-identical code is
  *                     necessary. Recording is not approving: see the
  *                     DELIBERATELY ABSENT block below.
+ *                     (TEAM-4866) It ADOPTS instead of duplicating: if an
+ *                     execution for this exact commit is already InProgress, the
+ *                     answer is `started:false, adopted:true` carrying THAT
+ *                     execution's id, so two tickets deploying the same merge
+ *                     commit no longer run the pipeline twice. Best-effort — an
+ *                     unreadable execution list starts as before.
  *   - get_build_log:  For a Failed Build stage — the CodeBuild build's phase
  *                     contexts + a tail of its CloudWatch log, so RM can file a
- *                     precise fix ticket (it does NOT hand-fix).
+ *                     precise fix ticket (it does NOT hand-fix). (TEAM-4866) That
+ *                     includes the Deploy stage's SECOND CodeBuild action, the
+ *                     runtime-image deploy — read-only, like every other project
+ *                     this tool reaches.
  *   - start_ci_build: (TEAM-4122 FR-4) Start the PR-CHECK build for one commit,
  *                     so the CI agent can re-run CI on a head it just pushed
  *                     instead of waiting for a webhook that may never fire. The
@@ -156,6 +165,13 @@
  *                       stage's CodeBuild project (same name as the pipeline,
  *                       different resource kind), callers pass
  *                       project="agentcore-hub-deploy" explicitly to get_build_log
+ *   RUNTIME_IMAGE_PROJECT  default "agentcore-hub-runtime-image-deploy" — the Deploy
+ *                       stage's SECOND CodeBuild action (Deploy_runtime_images).
+ *                       READ-ONLY (TEAM-4866): get_build_log may resolve a build id
+ *                       in it so a failed runtime-image deploy can be explained, and
+ *                       it stays in RESERVED_CI_PROJECTS so nothing can ever hand it
+ *                       to codebuild:StartBuild. The IAM grant is read-only too
+ *                       (BuildRead + BuildLogRead, never CiStartBuild)
  *   ARTIFACT_BUCKET     the artifact bucket, in this Lambda's region. Source of
  *                       the CD registry (config/cd-registry.json) and the Deploy
  *                       stage's handoff markers, and the destination of the
@@ -225,6 +241,11 @@ const PIPELINE_NAME = process.env.PIPELINE_NAME || "agentcore-hub-deploy";
 const BUILD_PROJECT = process.env.BUILD_PROJECT || "agentcore-hub-build";
 const CI_PROJECT = process.env.CI_PROJECT || "agentcore-hub-ci";
 const DEPLOY_PROJECT = process.env.DEPLOY_PROJECT || "agentcore-hub-deploy";
+// TEAM-4866 — the Deploy stage's other CodeBuild action, for the env default
+// target. A READ target only; registry targets derive their own name through
+// pipelineProjects().runtimeImageProject.
+const RUNTIME_IMAGE_PROJECT =
+  process.env.RUNTIME_IMAGE_PROJECT || "agentcore-hub-runtime-image-deploy";
 const ARTIFACT_BUCKET = process.env.ARTIFACT_BUCKET || "";
 // Cosmetic label for the env default target only — see the Env block above.
 const PIPELINE_REPO = (process.env.PIPELINE_REPO || "").trim();
@@ -240,7 +261,14 @@ const GITHUB_TIMEOUT_MS = Number(process.env.GITHUB_TIMEOUT_MS || 5000);
 
 // A CodeBuild project that deploys, but is not the pipeline's Deploy stage, so
 // the DEPLOY_PROJECT/PIPELINE_NAME comparisons below would not catch it.
-const RESERVED_CI_PROJECTS = ["agentcore-hub-runtime-image-deploy"];
+//
+// TEAM-4866 made the name configurable (RUNTIME_IMAGE_PROJECT) so get_build_log
+// can READ it. The union — never the env value alone — is what keeps that from
+// weakening this list: overriding the env moves what is readable, and can never
+// un-reserve the default name for an agent-triggerable StartBuild.
+const RESERVED_CI_PROJECTS = [
+  ...new Set([RUNTIME_IMAGE_PROJECT, "agentcore-hub-runtime-image-deploy"]),
+];
 
 /**
  * TEAM-4122 FR-4 (security review F2/F3) — is `name` safe to hand to
@@ -511,6 +539,8 @@ async function listTargets() {
       ciProject: projects.ciProject,
       buildProject: projects.buildProject,
       deployProject: projects.deployProject,
+      // READ-only (TEAM-4866) — see readableProjectsOf below.
+      runtimeImageProject: projects.runtimeImageProject,
       // The registry may name the deployment's OWN pipeline, and normally does.
       // That entry IS the env default — it just carries the registry's
       // region/ciProject instead of env's. Stamping false here (TEAM-4358) left
@@ -530,21 +560,48 @@ async function listTargets() {
       ciProject: CI_PROJECT,
       buildProject: BUILD_PROJECT,
       deployProject: DEPLOY_PROJECT,
+      // From env, not derived: the hub's own runtime-image project name is
+      // settable independently of PIPELINE_NAME (TEAM-4866).
+      runtimeImageProject: RUNTIME_IMAGE_PROJECT,
       isEnvDefault: true,
     });
   }
   return targets;
 }
 
-/** Every CodeBuild project name a target owns. */
+/**
+ * Every CodeBuild project name a target owns for ALL purposes — the set that
+ * makes a project "registered" for start_ci_build's validation and for the
+ * default project_not_registered refusal.
+ *
+ * TEAM-4866: runtimeImageProject is deliberately NOT here. Adding it would make
+ * the runtime-image deploy project a registered project everywhere, softening the
+ * RESERVED_CI_PROJECTS refusal in start_ci_build from "refused, with zero AWS
+ * traffic" into a silent ignore. Read access is a strictly smaller grant and gets
+ * its own set below.
+ */
 function projectsOf(target) {
   return [target.ciProject, target.buildProject, target.deployProject].filter(Boolean);
 }
 
-/** The target that owns CodeBuild project `name`, or null. */
-function targetForProject(targets, name) {
+/**
+ * Every CodeBuild project a target's build LOG may be read for (TEAM-4866) —
+ * projectsOf plus the Deploy stage's runtime-image action. Used ONLY by
+ * get_build_log (a read of phases + a log tail); never by start_ci_build, and
+ * never by the IAM-relevant "can this be started" question.
+ */
+function readableProjectsOf(target) {
+  return [...projectsOf(target), target.runtimeImageProject].filter(Boolean);
+}
+
+/**
+ * The target that owns CodeBuild project `name`, or null. `readable:true` widens
+ * the membership test to the read-only set (runtime-image project included).
+ */
+function targetForProject(targets, name, { readable = false } = {}) {
   if (!name) return null;
-  return targets.find((t) => projectsOf(t).includes(name)) || null;
+  const owns = readable ? readableProjectsOf : projectsOf;
+  return targets.find((t) => owns(t).includes(name)) || null;
 }
 
 /**
@@ -553,7 +610,9 @@ function targetForProject(targets, name) {
  *   args.pipeline_name  → the target whose `pipeline` matches EXACTLY, else a
  *                         pipeline_not_registered refusal.
  *   args.project        → READ TOOLS ONLY (requirePipelineName false): the
- *                         target owning that ci/build/deploy project, else a
+ *                         target owning that ci/build/deploy project — plus the
+ *                         runtime-image deploy project when the caller passes
+ *                         readableProjects (get_build_log, TEAM-4866) — else a
  *                         project_not_registered refusal. Skipped entirely when
  *                         requirePipelineName is true (TEAM-4348) — start_deploy
  *                         does not take a project, and honouring one here would
@@ -571,7 +630,10 @@ function targetForProject(targets, name) {
  *
  * @returns {Promise<{target: Target|null, refusal: object|null, targets: Target[]}>}
  */
-async function resolveTarget(args = {}, { requirePipelineName = false } = {}) {
+async function resolveTarget(
+  args = {},
+  { requirePipelineName = false, readableProjects = false } = {}
+) {
   const targets = await listTargets();
   const pipelines = targets.map((t) => t.pipeline);
 
@@ -600,7 +662,10 @@ async function resolveTarget(args = {}, { requirePipelineName = false } = {}) {
   if (!requirePipelineName) {
     const requestedProject = String(args.project ?? "").trim();
     if (requestedProject) {
-      const target = targetForProject(targets, requestedProject);
+      // readableProjects (TEAM-4866) is passed by get_build_log ONLY, and widens
+      // this membership test to the read-only set — see readableProjectsOf.
+      const owns = readableProjects ? readableProjectsOf : projectsOf;
+      const target = targetForProject(targets, requestedProject, { readable: readableProjects });
       if (!target) {
         return {
           target: null,
@@ -609,7 +674,7 @@ async function resolveTarget(args = {}, { requirePipelineName = false } = {}) {
             ok: false,
             reason: "project_not_registered",
             requested: requestedProject,
-            known: targets.flatMap(projectsOf),
+            known: targets.flatMap(owns),
           },
         };
       }
@@ -698,8 +763,12 @@ export const handler = async (event) => {
       // rather than guessing which repo to deploy.
       case "start_deploy":
         return await onTarget(args, { requirePipelineName: true }, (t) => startDeploy(args, t));
+      // The ONE tool that may name the Deploy stage's runtime-image project
+      // (TEAM-4866): reading a build log is a read. No other case passes this.
       case "get_build_log":
-        return await onTarget(args, {}, (t, all) => getBuildLog(args, t, all));
+        return await onTarget(args, { readableProjects: true }, (t, all) =>
+          getBuildLog(args, t, all)
+        );
       case "get_build_status":
         return await onTarget(args, {}, (t, all) => getBuildStatus(args, t, all));
       case "start_ci_build":
@@ -833,6 +902,80 @@ async function findSupersedingExecution(pipelineName, executionId, sourceRevisio
       s.sourceRevisions?.[0]?.revisionId === revision
   );
   return successor?.pipelineExecutionId || null;
+}
+
+/** How many summaries the adoption probe reads. One page, newest-first — a
+ * duplicate of a commit we are deploying RIGHT NOW is necessarily recent. */
+const ADOPTION_SCAN = 20;
+
+/**
+ * TEAM-4866 — is an execution for THIS exact commit already in flight?
+ *
+ * Two executions deployed byte-identical code five minutes apart (2026-09-19
+ * e60cfd93 / 520dd56d) because nothing looked: gateAhead only sees an execution
+ * PARKED on the ManualApproval gate, so a RUNNING duplicate is invisible to it,
+ * and CodePipeline's own clientRequestToken idempotency does not dedupe two
+ * DIFFERENT calls that merely happen to carry the same source revision (the
+ * duplicate's Source stage pulled the branch HEAD, it passed no commit_sha at all).
+ *
+ * ORDERING INVARIANT — this runs BEFORE StartPipelineExecution, and must stay
+ * there. That is the whole reason no "is this one mine?" filter is needed: at the
+ * moment of the call our own execution does not exist yet, so every InProgress
+ * summary on this revision belongs to somebody else. Move this call after the
+ * start and it would adopt the execution it just created, report started:false
+ * for a deploy it DID start, and make the tool lie about what it did.
+ *
+ * Matching is conservative — a wrong adoption means a deploy that never happens:
+ *   - 40-hex commit_sha  → exact compare against every sourceRevisions[] entry
+ *                          (Source may report more than one artifact).
+ *   - 7-39 hex           → prefix match, adopted ONLY when exactly one InProgress
+ *                          execution matches. Two matches is ambiguous, so we start.
+ *   - anything else      → no candidate (the caller skips the probe entirely).
+ * Only status "InProgress" counts: a Succeeded/Failed/Stopped/Superseded execution
+ * on this revision is history, and re-deploying after a failure is the point.
+ *
+ * FAIL-OPEN by construction: this is duplicate avoidance, not a safety gate. A
+ * throw (AccessDenied on a role that predates the ListPipelineExecutions grant, a
+ * throttle) comes back as {error} and the caller starts exactly as before.
+ *
+ * @returns {Promise<{summary: object|null, error: string|null}>}
+ */
+async function findInFlightForRevision(pipelineName, sha, cp) {
+  let summaries = [];
+  try {
+    const out = await cp.send(
+      new ListPipelineExecutionsCommand({ pipelineName, maxResults: ADOPTION_SCAN })
+    );
+    summaries = out.pipelineExecutionSummaries || [];
+  } catch (e) {
+    console.warn(
+      "adoption probe: list-pipeline-executions failed (non-fatal, starting anyway):",
+      e?.name,
+      e?.message
+    );
+    return { summary: null, error: e?.name || "list_failed" };
+  }
+  const exact = FULL_SHA.test(sha);
+  const matches = summaries.filter(
+    (s) =>
+      s?.pipelineExecutionId &&
+      s.status === "InProgress" &&
+      (s.sourceRevisions || []).some((r) => {
+        const rev = normalizeSha(r?.revisionId);
+        return exact ? rev === sha : rev.startsWith(sha);
+      })
+  );
+  // Ambiguity is only possible on a short SHA; an exact 40-hex match on two live
+  // executions means two runs of the same commit, and adopting the newest (first)
+  // is exactly what a second caller wants.
+  if (matches.length === 0) return { summary: null, error: null };
+  if (!exact && matches.length > 1) {
+    console.warn(
+      `adoption probe: short sha ${sha} matched ${matches.length} in-flight executions — starting instead of guessing`
+    );
+    return { summary: null, error: null };
+  }
+  return { summary: matches[0], error: null };
 }
 
 /** An AWS SDK timestamp (a Date live, a string in a replayed fixture) as an ISO
@@ -1550,6 +1693,14 @@ async function gateAhead(name, target, cp) {
 // AWS call, `preapproval:{recorded:false, reason:"approved_head_sha_missing"}`, and
 // the human deploy gate fires. Nothing here can FAIL a deploy: recording is
 // best-effort by construction.
+//
+// TEAM-4866 — THREE terminal shapes now, and only the middle one is a refusal:
+//   started:true                      a new execution (the ordinary answer)
+//   started:false + adopted:true      an execution for THIS commit was already in
+//                                     flight, so we return ITS id instead of
+//                                     deploying the same bytes twice. ok:true.
+//   ok:false + reason                 refused (FR-4 gate occupied / abandon
+//                                     refusals) — nothing started, nothing recorded.
 async function startDeploy(args = {}, target) {
   const name = target.pipeline;
   const { cp, cb } = clientsFor(target.region, target.roleArn, target.externalId);
@@ -1561,6 +1712,66 @@ async function startDeploy(args = {}, target) {
   const sanitized = rawSha.replace(/[^a-zA-Z0-9-]/g, "");
   if (sanitized) {
     input.clientRequestToken = `deploy-${sanitized}`.slice(0, 128);
+  }
+
+  // ── TEAM-4866 adoption probe. FIRST — before gateAhead, before the abandon
+  // branch, before the start (see findInFlightForRevision's ordering invariant).
+  // Before gateAhead specifically because the duplicate may BE the execution
+  // parked on the gate: that one is ours to follow, never to abandon, and a
+  // gateAhead refusal would have sent the caller off to prove ancestry against a
+  // run built from its own commit.
+  const adoptionSha = normalizeSha(args.commit_sha);
+  let adoptionCheck = null;
+  if (/^[0-9a-f]{7,40}$/.test(adoptionSha)) {
+    const { summary, error } = await findInFlightForRevision(name, adoptionSha, cp);
+    if (error) {
+      // Fail-open: record that we could not look, and carry on to start.
+      adoptionCheck = { ok: false, reason: error };
+    } else if (summary) {
+      // The record write is unchanged and unconditional on this path: it is keyed
+      // by merge commit and idempotent, so writing it for an execution someone
+      // else started is the same statement about the same commit. It can only ever
+      // make the human gate MORE likely to fire — the adopted run may already be
+      // past the Build stage's preapproved-check, in which case the human is asked
+      // exactly as before (fail-closed, DL-028).
+      const preapproval = await recordShipApproval(args, target, cb);
+      console.log(
+        "adopted in-flight execution",
+        summary.pipelineExecutionId,
+        "for revision",
+        adoptionSha
+      );
+      return jsonResult({
+        ok: true,
+        started: false,
+        adopted: true,
+        reason: "same_revision_in_progress",
+        pipelineName: name,
+        region: target.region,
+        repo: target.repo,
+        // THEIRS, and deliberately top-level: every caller downstream (the watch
+        // poll's execution_id, shared/cd-ledger.json, report_completion) reads
+        // this key, and the execution to watch is that one.
+        pipelineExecutionId: summary.pipelineExecutionId,
+        adoptedExecution: {
+          executionId: summary.pipelineExecutionId,
+          status: summary.status || null,
+          startTime: isoOrNull(summary.startTime),
+          trigger: summary.trigger || null,
+          sourceRevision: summary.sourceRevisions?.[0]?.revisionId || null,
+        },
+        preapproval,
+        note:
+          "NOTHING new was started: an execution for THIS commit was already in flight, so this call ADOPTED it. " +
+          "started:false with adopted:true is a SUCCESS, not a refusal — do not retry, and do not treat it as a fault. " +
+          "pipelineExecutionId is that execution's: poll get_state with execution_id=<it> until terminal:true AND " +
+          "matchesExecution:true, and record it as this run's CD execution exactly as if you had started it. " +
+          "holdsGate/waitingOn may report it as another run's gate, which is expected — it deploys your commit. " +
+          "The ship-approval record was still written for this merge commit (see preapproval); if the adopted run was " +
+          "already past the point where the pipeline reads it, the human deploy gate fires as usual, which is the safe " +
+          "outcome. You have NO approval capability here.",
+      });
+    }
   }
 
   // ── FR-4 (TEAM-4740). BEFORE recordShipApproval, which is itself before the
@@ -1628,6 +1839,10 @@ async function startDeploy(args = {}, target) {
     // Present ONLY when the gate could not be read at all, so a caller can tell
     // "the gate was clear" from "we started without being able to check".
     ...(gate.probe === "unavailable" ? { gateProbe: "unavailable" } : {}),
+    // TEAM-4866: present ONLY when the adoption probe was ATTEMPTED and FAILED —
+    // absent both on the clean path and when there was no sha to probe with. Same
+    // idea as gateProbe: "we started without being able to check for a duplicate".
+    ...(adoptionCheck ? { adoptionCheck } : {}),
     // { recorded, reason?, key? } — see recordShipApproval.
     preapproval,
     note:
@@ -2131,13 +2346,19 @@ async function getBuildLog(args = {}, target, targets = []) {
   // Region follows whoever owns that project — never the `|| target` fallback:
   // an unregistered project must be refused, not silently read in whichever
   // region the (possibly unrelated) resolved target happens to sit in.
-  const owner = targetForProject(targets, project);
+  //
+  // readable:true (TEAM-4866) — the Deploy stage has TWO CodeBuild actions, and a
+  // failed Deploy_runtime_images build was unreadable here until its project
+  // joined the read set. Reading is all it adds: nothing in this function starts
+  // a build, and projectsOf() (what start_ci_build validates against) is
+  // untouched.
+  const owner = targetForProject(targets, project, { readable: true });
   if (!owner) {
     return jsonResult({
       ok: false,
       reason: "project_not_registered",
       requested: project,
-      known: targets.flatMap(projectsOf),
+      known: targets.flatMap(readableProjectsOf),
     });
   }
   const { cb, logs } = clientsFor(owner.region, owner.roleArn, owner.externalId);
@@ -2762,6 +2983,14 @@ async function findBuildsForCommit(cb, project, sha, scan = BUILD_SCAN_WINDOW) {
 // `approveDeploy` is still a hard false — abandoning a run in front of you is not
 // approving it, and there is still no PutApprovalResult in this Lambda's reach.
 //
+// version 6 (TEAM-4866) adds `targets[].runtimeImageProject` — the Deploy stage's
+// SECOND CodeBuild action (Deploy_runtime_images), which get_build_log can now
+// read a build log from. It is a READ name only: it is a reserved CI project, so
+// `startCiBuild` never applies to it, and nothing here can start it. The same
+// version covers start_deploy's new ADOPTION answer (`started:false,
+// adopted:true` when an execution for that exact commit is already in flight) —
+// still no PutApprovalResult anywhere in this Lambda's reach.
+//
 // version 4 (TEAM-4448 D2) adds `ciRetry` — the retry contract start_ci_build
 // enforces. It sits at TOP LEVEL, not per target: the cap, the retryable phases and
 // the refusal reasons are properties of this Lambda's CODE, identical for every
@@ -2793,7 +3022,7 @@ async function capabilities(args = {}) {
     buildProject: BUILD_PROJECT,
     deployPipeline: PIPELINE_NAME,
     approveDeploy: false,
-    version: 5,
+    version: 6,
     ciRetry: {
       maxBuildsPerSha: MAX_BUILDS_PER_SHA,
       infraRetryPhases: [...INFRA_RETRY_PHASES],
@@ -2814,6 +3043,10 @@ async function capabilities(args = {}) {
       ciProject: t.ciProject,
       buildProject: t.buildProject,
       deployProject: t.deployProject,
+      // TEAM-4866 — the Deploy stage's second CodeBuild action. READABLE by
+      // get_build_log, never startable: it is a reserved CI project, so
+      // startCiBuild below says nothing about it.
+      runtimeImageProject: t.runtimeImageProject,
       // Per target: the flag is deployment-wide, but a target whose ciProject
       // fails validation cannot be started even so.
       startCiBuild: flagOn && validateCiProjectAcrossTargets(t.ciProject, targets).ok,

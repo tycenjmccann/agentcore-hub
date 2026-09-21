@@ -28,6 +28,8 @@ CHECK_TICKETS=false
 # deploy/setup-tickets-lambda.mjs ROLE_NAME per TICKET_PROVIDER).
 PIPELINE_TOOLS_FUNCTION="${PIPELINE_TOOLS_FUNCTION:-agentcore-hub-pipeline-tools}"
 PIPELINE_TOOLS_ROLE="${PIPELINE_TOOLS_ROLE:-${PIPELINE_TOOLS_FUNCTION}-role}"
+# Same default as resolveEnv() in deploy/setup-pipeline-tools-lambda.mjs.
+RUNTIME_IMAGE_PROJECT="${RUNTIME_IMAGE_PROJECT:-agentcore-hub-runtime-image-deploy}"
 if [ "${TICKET_PROVIDER:-dynamodb}" = "jira" ]; then
   TICKETS_ROLE="${TICKETS_ROLE:-AgentCoreHubJiraLambdaRole}"
 else
@@ -185,6 +187,18 @@ if aws lambda get-function-configuration --function-name "$PIPELINE_TOOLS_FUNCTI
   else
     echo "  - IAM: ship-approval record write (ARTIFACT_BUCKET not set, skipped)"
   fi
+
+  # ─── The two TEAM-4866 read grants ──────────────────────────────────────────
+  # Both failed SILENTLY before they existed, which is why they are asserted here:
+  # a missing runtime-image read answers the release manager
+  # project_not_registered when a Deploy_runtime_images build fails, and a missing
+  # ListPipelineExecutions makes start_deploy's duplicate check (and get_state's
+  # supersededBy) fail open forever with nothing but a CloudWatch warning. Both
+  # read IAM Resource strings only — no secret, no token.
+  check "IAM: $PIPELINE_TOOLS_ROLE grants codebuild:BatchGetBuilds on the runtime-image deploy project" \
+    "role_policy_grants $PIPELINE_TOOLS_ROLE codebuild:BatchGetBuilds 'project/(\*|${RUNTIME_IMAGE_PROJECT}|hub-\*)$'"
+  check "IAM: $PIPELINE_TOOLS_ROLE grants codepipeline:ListPipelineExecutions" \
+    "role_policy_grants $PIPELINE_TOOLS_ROLE codepipeline:ListPipelineExecutions '^arn:aws:codepipeline:'"
 else
   echo "  - Pipeline tools: $PIPELINE_TOOLS_FUNCTION not deployed (pipeline module optional, skipped)"
 fi

@@ -567,7 +567,7 @@ export class PipelineStack extends Stack {
     new CfnOutput(this, "RuntimeImageProjectName", {
       value: runtimeImageProject.projectName,
       description:
-        "arm64 runtime-image Deploy project; wire into the pipeline-tools Lambda so the RM can read its build log.",
+        "arm64 runtime-image Deploy project. Wired READ-ONLY into agentcore-hub-pipeline-tools as RUNTIME_IMAGE_PROJECT (TEAM-4866), so the RM can read this action's build log; it is never a StartBuild target.",
     });
     new CfnOutput(this, "DeployPipelineName", { value: pipeline.pipelineName });
     new CfnOutput(this, "ApprovalTopicArn", { value: approvalTopic.topicArn });
