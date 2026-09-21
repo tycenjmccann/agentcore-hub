@@ -962,7 +962,7 @@ const GATE_PHASE_KINDS = [
 const GATE_TITLE_KINDS = new Map([
   ["deploy gate", "deploy"], ["deploy approval", "deploy"], ["deploy", "deploy"],
   ["merge approval", "merge"], ["merge", "merge"],
-  ["handoff", "handoff"], ["escalation", "handoff"], ["review", "review"],
+  ["handoff", "handoff"], ["escalation", "handoff"], ["ci unavailable", "handoff"], ["review", "review"],
   ["spec approval", "spec"], ["spec", "spec"],
   ["plan approval", "plan"], ["plan", "plan"],
   ["design approval", "design"], ["design", "design"],
@@ -2049,7 +2049,8 @@ async function repageIfWindowOpened(wf, notif, w) {
     // Shared classification (TEAM-4706): a deploy-approval gate reminds with
     // the same 🚀 kicker it paged with, without a second rule living here. A
     // handoff reminds with its own ask, like its page (TEAM-4885).
-    const reminderKind = gateKindFor(notif.gate, title, gateTicket);
+    let reminderKind = gateKindFor(notif.gate, title, gateTicket);
+    if (reminderKind === "review" && !page && gateTicket?.title && !oneLine(notif.summary)) reminderKind = "handoff";
     const handoff = reminderKind === "handoff" ? handoffCopy(gateTicket, wf) : null;
     const { delivered } = await sendApprovalPing(chats, {
       label: page ? page.label : "business-hours reminder",
@@ -2361,7 +2362,14 @@ async function scanReviewGates() {
         : [];
       // messageIds is what phase 2 records on the claim row (TEAM-4663): the
       // proof a human really has this page, and the handles a later edit needs.
-      const gateKind = gateKindFor(notif.gate, title, gateTicket);
+      // A gate the table cannot name AND that no closing agent wrote a review
+      // package for is, by elimination, a task for a human (TEAM-4908: "CI
+      // unavailable: …"). Rendering it as an approval would show the run title and
+      // a ticket dump with no ask — so it pages as a handoff, with its own ask.
+      let gateKind = gateKindFor(notif.gate, title, gateTicket);
+      // (Only when the ticket itself is known — an unreadable tickets view leaves a
+      // bare review gate, as before.)
+      if (gateKind === "review" && !deploy && gateTicket?.title && !oneLine(notif.summary)) gateKind = "handoff";
       const handoff = gateKind === "handoff" ? handoffCopy(gateTicket, wf) : null;
       const { delivered, messageIds } = await sendApprovalPing(chats, {
         label: deploy ? "deploy-approval gate" : handoff ? "handoff" : "gate",
