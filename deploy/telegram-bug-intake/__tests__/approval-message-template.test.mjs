@@ -339,6 +339,43 @@ describe("approval pings are built from structured inputs, never from ticket pro
     expect(text.length).toBeLessThanOrEqual(mod.APPROVAL_TEXT_MAX);
   });
 
+  it("an unclassifiable gate with no review package pages as a handoff, not a bare review gate", async () => {
+    // TEAM-4908: "CI unavailable: hub-brushup-ios-ci host disk-full…" — no table
+    // prefix, no curated summary → the old path rendered the run title + a
+    // ticket dump. By elimination it is a task for a human.
+    const mod = await loadModule();
+    const gate = {
+      ticketId: GATE,
+      title: "CI unavailable: hub-brushup-ios-ci host disk-full, retry refused for PR #63 head",
+      description: "CI cannot certify PR #63 head c36ac19. The only build for this SHA FAILED with No space left on device.\n\n### Proof\n1. …",
+      status: "in_review", assignee: "human:engineer", createdAt: "2026-09-21T19:55:00.000Z", blockedBy: [],
+    };
+    const text = (await run(mod.handler, {
+      batches: [[]],
+      workflows: [wf([notif(`notif_${GATE}_2026-09-21T19:55:53.000Z`, "2026-09-21T19:55:53.000Z")], { agentTasks: AGENT_TASKS })],
+      tickets: [gate, shipped()],
+    })).sent[0].text;
+
+    expect(text).toMatch(/^\*🙋 HANDOFF — a human has to do this\*/);
+    expect(text.split("\n")[1]).toMatch(/^hub-brushup-ios-ci host disk-full, retry refused for PR #63 head/);
+    expect(text).toContain("CI cannot certify PR #63 head c36ac19.");
+    expect(text).not.toContain("Shipping");
+    expect(text).not.toContain("REVIEW GATE");
+  });
+
+  it("a gate WITH a review package keeps the review kicker even without a table prefix", async () => {
+    const mod = await loadModule();
+    const gate = { ticketId: GATE, title: "Something odd: approve the widget", description: "runbook", status: "in_review", assignee: "human:engineer", createdAt: "2026-09-21T19:55:00.000Z", blockedBy: [] };
+    const text = (await run(mod.handler, {
+      batches: [[]],
+      workflows: [wf([notif(`notif_${GATE}_2026-09-21T19:55:53.000Z`, "2026-09-21T19:55:53.000Z", { summary: "Widget PR #9 — review PASS, CI certified." })], { agentTasks: AGENT_TASKS })],
+      tickets: [gate, shipped()],
+    })).sent[0].text;
+    expect(text).toMatch(/^\*🚦 REVIEW GATE — approval needed\*/);
+    expect(text).toContain("Widget PR #9 — review PASS, CI certified.");
+    expect(text).not.toContain("HANDOFF");
+  });
+
   /**
    * TEAM-4671 F3. `blockedBy` is an array in dynamodb mode and a comma-joined
    * STRING in jira mode (jira-read.ts:145), so .map() threw a TypeError the
