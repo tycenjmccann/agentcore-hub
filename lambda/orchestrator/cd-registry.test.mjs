@@ -126,6 +126,7 @@ describe("pipelineProjects", () => {
       ciProject: "agentcore-hub-ci",
       buildProject: "agentcore-hub-build",
       deployProject: "agentcore-hub-deploy",
+      runtimeImageProject: "agentcore-hub-runtime-image-deploy",
     });
   });
   it("derives from a hub-<slug>-deploy pipeline name and carries the region", () => {
@@ -137,6 +138,7 @@ describe("pipelineProjects", () => {
       ciProject: "hub-foo-ci",
       buildProject: "hub-foo-build",
       deployProject: "hub-foo-deploy",
+      runtimeImageProject: "hub-foo-runtime-image-deploy",
     });
   });
   it("an explicit entry.ciProject overrides the derived name; build/deploy stay derived", () => {
@@ -154,6 +156,7 @@ describe("pipelineProjects", () => {
       ciProject: "hub-foo-pipeline-ci",
       buildProject: "hub-foo-pipeline-build",
       deployProject: "hub-foo-pipeline",
+      runtimeImageProject: "hub-foo-pipeline-runtime-image-deploy",
     });
   });
   it("no pipeline → null", () => {
@@ -169,6 +172,29 @@ describe("pipelineProjects", () => {
     expect(p.roleArn).toBe("arn:aws:iam::123456789012:role/hub-cd-trigger-juno");
     expect(p.externalId).toBe("hub-cd-juno-xyz");
     expect(p.region).toBe("us-west-2");
+  });
+
+  /**
+   * TEAM-4866: the Deploy stage has TWO CodeBuild actions and only one of them
+   * had a derived name, so a failed Deploy_runtime_images build was unreadable
+   * (`Pipeline___get_build_log` → project_not_registered). The name is derived
+   * from the SAME base as ci/build/deploy so it can never drift from them, and it
+   * is a READ name only — no surface may hand it to codebuild:StartBuild.
+   */
+  it("derives the runtime-image deploy project from the pipeline name", () => {
+    expect(pipelineProjects({ pipeline: "agentcore-hub-deploy" }).runtimeImageProject)
+      .toBe("agentcore-hub-runtime-image-deploy");
+  });
+  it("derives the runtime-image project for a hub-<slug>-deploy pipeline", () => {
+    expect(pipelineProjects({ pipeline: "hub-juno-deploy" }).runtimeImageProject)
+      .toBe("hub-juno-runtime-image-deploy");
+    // Same base as the other three: one -deploy strip, never two.
+    expect(pipelineProjects({ pipeline: "hub-juno-deploy" }).buildProject).toBe("hub-juno-build");
+  });
+  it("an explicit ciProject does not affect runtimeImageProject", () => {
+    const p = pipelineProjects({ pipeline: "hub-foo-deploy", ciProject: "custom-checks" });
+    expect(p.ciProject).toBe("custom-checks");
+    expect(p.runtimeImageProject).toBe("hub-foo-runtime-image-deploy");
   });
 });
 

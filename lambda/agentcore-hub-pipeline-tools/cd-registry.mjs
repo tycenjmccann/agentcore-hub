@@ -163,7 +163,8 @@ export function effectiveWorkflowDef(def, registry, repoConfig, shipPhases) {
  * keep a differently named PR-check project). Returns null for an entry with
  * no pipeline — a DEPLOY.md-mode CD repo has no CodeBuild projects to name.
  *
- * Hub: agentcore-hub-deploy -> ci/build/deploy = agentcore-hub-{ci,build,deploy}.
+ * Hub: agentcore-hub-deploy -> ci/build/deploy = agentcore-hub-{ci,build,deploy},
+ * and runtimeImageProject = agentcore-hub-runtime-image-deploy (TEAM-4866).
  */
 export function pipelineProjects(entry) {
   const pipeline = typeof entry?.pipeline === "string" ? entry.pipeline.trim() : "";
@@ -180,6 +181,12 @@ export function pipelineProjects(entry) {
     ciProject: entry.ciProject || `${base}-ci`,
     buildProject: `${base}-build`,
     deployProject: pipeline,
+    // TEAM-4866 — the Deploy stage's SECOND CodeBuild action
+    // (deploy/pipeline/lib/pipeline-stack.ts, Deploy_runtime_images). READ-only
+    // everywhere it is consumed: Pipeline___get_build_log resolves a build id in
+    // it so a failed runtime-image deploy can be explained, and no surface may
+    // ever hand it to codebuild:StartBuild (it is in RESERVED_CI_PROJECTS).
+    runtimeImageProject: `${base}-runtime-image-deploy`,
   };
 }
 

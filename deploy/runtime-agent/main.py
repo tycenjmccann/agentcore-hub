@@ -2233,6 +2233,13 @@ def Pipeline___get_build_log(build_id: str = "", project: str = "", tail_lines: 
     as build_id, or project="agentcore-hub-deploy" (e.g. to read the intentional
     exit-2 "HANDOFF" signal vs a genuine deploy failure).
 
+    The Deploy stage runs TWO CodeBuild actions and BOTH are readable here: the
+    runtime-image action (project "<pipeline-base>-runtime-image-deploy", e.g.
+    "agentcore-hub-runtime-image-deploy") as well as the three-target app deploy.
+    So when Deploy_runtime_images is the failing action, pass its
+    externalExecutionId as build_id (or that project name) and read the log —
+    read-only: no tool can start a build in it.
+
     Args:
         build_id: CodeBuild build id (from get_state actionDetails.externalExecutionId).
             The project is inferred from build_id itself (`<project>:<uuid>`),
@@ -2291,10 +2298,10 @@ def Pipeline___start_ci_build(commit_sha: str, source_version: str = "", project
 def Pipeline___capabilities(pipeline_name: str = "") -> str:
     """Report what this deployment's pipeline tools Lambda will actually do —
     whether Pipeline___start_ci_build can start a build (startCiBuild), the CI/
-    build/deploy project + pipeline names, and confirmation that deploy approval
-    is never agent-controlled (approveDeploy is always false). Call this before
-    Pipeline___start_ci_build so a denied deployment is a clean BLOCKED verdict
-    instead of a failed StartBuild call.
+    build/deploy/runtime-image project + pipeline names, and confirmation that
+    deploy approval is never agent-controlled (approveDeploy is always false).
+    Call this before Pipeline___start_ci_build so a denied deployment is a clean
+    BLOCKED verdict instead of a failed StartBuild call.
 
     Args:
         pipeline_name: In Pipeline Mode, pass the pipeline_name from the

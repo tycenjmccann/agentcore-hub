@@ -3916,7 +3916,7 @@ describe("capabilities", () => {
       ciProject: "agentcore-hub-ci",
       buildProject: "agentcore-hub-build",
       deployPipeline: "agentcore-hub-deploy",
-      version: 5,
+      version: 6,
     });
     // Read-only: capabilities never talks to AWS.
     expect(h.state.cpCalls).toEqual([]);
@@ -4664,17 +4664,18 @@ describe("multi-target registry resolution", () => {
     );
   });
 
-  // 8.9 capabilities v3 targets (v4 and v5 keep them byte-identical) ────────
+  // 8.9 capabilities v3 targets (v4/v5 byte-identical, v6 adds ONE key) ─────
 
-  it("reports one entry per target and the flat keys intact (version 5)", async () => {
+  it("reports one entry per target and the flat keys intact (version 6)", async () => {
     const out = await withRegistry(MULTI_REGISTRY, (mod) => invokeOn(mod.handler, "capabilities"), {
       AWS_REGION: "us-east-1",
     });
 
     // TEAM-4448 D2 bumped 3 → 4 by ADDING top-level `ciRetry`; TEAM-4740 bumped
-    // 4 → 5 by adding NOTHING here at all. `targets` and the flat keys below are
-    // unchanged through both, which is the point of asserting them here.
-    expect(out.version).toBe(5);
+    // 4 → 5 by adding NOTHING here at all. TEAM-4866 bumps 5 → 6 by adding
+    // exactly one per-target key, `runtimeImageProject`. The flat keys below are
+    // unchanged through all three, which is the point of asserting them here.
+    expect(out.version).toBe(6);
     // Version-2 callers keep reading exactly what they read before.
     expect(out).toMatchObject({
       startCiBuild: false,
@@ -4694,6 +4695,9 @@ describe("multi-target registry resolution", () => {
         "pipeline",
         "region",
         "repo",
+        // TEAM-4866: a READ name, reported so an agent knows the second Deploy
+        // action's log is fetchable without having to guess the project.
+        "runtimeImageProject",
         "startCiBuild",
       ]);
     }
@@ -4704,6 +4708,7 @@ describe("multi-target registry resolution", () => {
       ciProject: "hub-widget-ci",
       buildProject: "hub-widget-build",
       deployProject: WIDGET,
+      runtimeImageProject: "hub-widget-runtime-image-deploy",
       startCiBuild: false,
     });
   });

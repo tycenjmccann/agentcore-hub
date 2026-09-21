@@ -70,7 +70,7 @@ The orchestration pipeline. Self-contained surface.
 - `src/lib/workflow/` (~30 modules: types, ticket providers (`ticket-provider*.ts`), board state, leases, ship-review, event transforms, jira-client, model-config, watchdog, performance (fleet performance card + `computeKpi`, the TS mirror of the Lambda scorer — see `docs/workflow/performance-card.md`), …)
 - `src/lib/workflow/performance-index.ts` — the one `performance/index.json` read + 60 s cache, shared by the performance and list routes so they cost one S3 GET per TTL between them (read-only)
 - `src/lib/pipeline-config.ts`
-- `src/lib/cd-registry.ts` (core lib, no module imports) + `src/config/cd-registry.json` (first-deploy seed; ships empty) — mirror of `lambda/orchestrator/cd-registry.mjs`. Unregistered repo = **handoff**: no Ship / Merge Approval / CD tickets, the orchestrator opens the unified PR at completion and leaves it open for the owning team (`workflow.delivery = { mode: "handoff", prUrl }`). Registered = full ship phase; an entry with a `pipeline` also turns on Pipeline Mode for that repo's agents. `pipelineProjectsFor(entry)` is the TS mirror of the canonical `pipelineProjects(entry)` — it derives `<base>-ci` / `<base>-build` / `<base>-deploy` from the entry's `pipeline` (`hub-<slug>-deploy` convention; an explicit `ciProject` wins), so the UI names exactly the resources the tools Lambda drives. Because the registry is read at runtime by more than the orchestrator, `cd-registry.mjs` is **byte-copied** to `lambda/agentcore-hub-pipeline-tools/cd-registry.mjs` (which pipeline a `Pipeline___*` call may touch) and `deploy/telegram-bug-intake/cd-registry.mjs` (which pipelines the deploy-gate bridge polls); `scripts/check-cd-registry-parity.sh` fails CI when the copies drift, and `deploy/telegram-bug-intake/update-config.sh` is the handoff script that points the bridge at the registered pipelines. Registry write access = deploy-trigger authority (see [`pipeline/design.md`](./pipeline/design.md)).
+- `src/lib/cd-registry.ts` (core lib, no module imports) + `src/config/cd-registry.json` (first-deploy seed; ships empty) — mirror of `lambda/orchestrator/cd-registry.mjs`. Unregistered repo = **handoff**: no Ship / Merge Approval / CD tickets, the orchestrator opens the unified PR at completion and leaves it open for the owning team (`workflow.delivery = { mode: "handoff", prUrl }`). Registered = full ship phase; an entry with a `pipeline` also turns on Pipeline Mode for that repo's agents. `pipelineProjectsFor(entry)` is the TS mirror of the canonical `pipelineProjects(entry)` — it derives `<base>-ci` / `<base>-build` / `<base>-deploy` / `<base>-runtime-image-deploy` (the last read-only) from the entry's `pipeline` (`hub-<slug>-deploy` convention; an explicit `ciProject` wins), so the UI names exactly the resources the tools Lambda drives. Because the registry is read at runtime by more than the orchestrator, `cd-registry.mjs` is **byte-copied** to `lambda/agentcore-hub-pipeline-tools/cd-registry.mjs` (which pipeline a `Pipeline___*` call may touch) and `deploy/telegram-bug-intake/cd-registry.mjs` (which pipelines the deploy-gate bridge polls); `scripts/check-cd-registry-parity.sh` fails CI when the copies drift, and `deploy/telegram-bug-intake/update-config.sh` is the handoff script that points the bridge at the registered pipelines. Registry write access = deploy-trigger authority (see [`pipeline/design.md`](./pipeline/design.md)).
 
 **Lambdas** (`lambda/`)
 - `orchestrator` — drives the pipeline state machine
@@ -714,6 +714,13 @@ CloudWatch Logs. Deploy role is deliberately narrow (Lambda code-only, no
   `agentcore-hub-pipeline-tools`).
 - `PIPELINE_NAME` / `BUILD_PROJECT` / `CI_PROJECT` — on the tools Lambda
   (defaults `agentcore-hub-deploy` / `agentcore-hub-build` / `agentcore-hub-ci`).
+- `RUNTIME_IMAGE_PROJECT` — on the tools Lambda (default
+  `agentcore-hub-runtime-image-deploy`): the Deploy stage's SECOND CodeBuild
+  action (`Deploy_runtime_images`). READ-only (TEAM-4866) — it is granted
+  `BatchGetBuilds` + log reads so `Pipeline___get_build_log` can explain a failed
+  runtime-image deploy, it stays a reserved CI project, and nothing may ever
+  `StartBuild` it. For a registered repo the name is derived from its `pipeline`
+  (`<base>-runtime-image-deploy`), not from this env.
 - `PIPELINE_CI_WEBHOOK` — CDK-time flag turning on the CodeBuild PR-check
   webhook (default OFF; required PR checks today come from GitHub Actions).
 - `DEPLOY_PIPELINE_NAME` — on the **telegram-bug-intake** Lambda: enables the

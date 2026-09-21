@@ -80,6 +80,10 @@ const BASE = {
   BUILD_PROJECT: "agentcore-hub-build",
   CI_PROJECT: "agentcore-hub-ci",
   DEPLOY_PROJECT: "agentcore-hub-deploy",
+  // TEAM-4866. buildInlinePolicy is always fed resolveEnv()'s output, which
+  // always sets this, so the fixture mirrors that rather than relying on a
+  // default inside the policy builder.
+  RUNTIME_IMAGE_PROJECT: "agentcore-hub-runtime-image-deploy",
   PIPELINE_CI_START_BUILD: "0",
 };
 
@@ -264,6 +268,9 @@ describe("resolveEnv", () => {
       BUILD_PROJECT: "agentcore-hub-build",
       CI_PROJECT: "agentcore-hub-ci",
       DEPLOY_PROJECT: "agentcore-hub-deploy",
+      // TEAM-4866: the Deploy stage's SECOND CodeBuild action. A READ target
+      // only — granted BatchGetBuilds + its log group, never StartBuild.
+      RUNTIME_IMAGE_PROJECT: "agentcore-hub-runtime-image-deploy",
       PIPELINE_CI_START_BUILD: "0",
       // Just the Lambda's own region until an operator registers a repo elsewhere.
       PIPELINE_REGIONS: "us-east-1",
@@ -822,12 +829,13 @@ describe("buildInlinePolicy — the hub-* convention wildcards", () => {
     ]);
   });
 
-  it("adds project/hub-* to BuildRead, keeping the three exact project ARNs", () => {
+  it("adds project/hub-* to BuildRead, keeping the four exact project ARNs", () => {
     const statement = sid(buildInlinePolicy(BASE), "BuildRead");
     expect(statement.Resource).toEqual([
       arn("agentcore-hub-build"),
       arn("agentcore-hub-ci"),
       arn("agentcore-hub-deploy"),
+      arn("agentcore-hub-runtime-image-deploy"),
       arn("hub-*"),
     ]);
     // Read-only: a broad project wildcard is only safe because these two actions
@@ -845,6 +853,7 @@ describe("buildInlinePolicy — the hub-* convention wildcards", () => {
       logArn("agentcore-hub-build:*"),
       logArn("agentcore-hub-ci:*"),
       logArn("agentcore-hub-deploy:*"),
+      logArn("agentcore-hub-runtime-image-deploy:*"),
       logArn("hub-*"),
       logArn("hub-*:*"),
     ]);
@@ -1035,6 +1044,10 @@ describe("the deploy package and the function env", () => {
       "BUILD_PROJECT",
       "CI_PROJECT",
       "DEPLOY_PROJECT",
+      // TEAM-4866: the Lambda reads it (RUNTIME_IMAGE_PROJECT), so the deploy
+      // must set it — an ungranted/unset name is the project_not_registered
+      // refusal this ticket removed.
+      "RUNTIME_IMAGE_PROJECT",
       "PIPELINE_CI_START_BUILD",
       "PIPELINE_REGIONS",
       "ARTIFACT_BUCKET",

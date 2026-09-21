@@ -160,13 +160,20 @@ export interface PipelineProjects {
   ciProject: string;
   buildProject: string;
   deployProject: string;
+  /**
+   * The Deploy stage's SECOND CodeBuild action (Deploy_runtime_images) —
+   * READ-only everywhere (TEAM-4866): `Pipeline___get_build_log` may read its
+   * build log, nothing may ever StartBuild it.
+   */
+  runtimeImageProject: string;
 }
 
 /**
  * The AWS project names implied by an entry's `pipeline`, by convention:
  * `hub-<slug>-deploy` → `hub-<slug>-ci` / `hub-<slug>-build` / `hub-<slug>-deploy`
- * (the hub's own resources keep the `agentcore-hub-*` names: `agentcore-hub-deploy`
- * → `agentcore-hub-ci` / `agentcore-hub-build`).
+ * / `hub-<slug>-runtime-image-deploy` (the hub's own resources keep the
+ * `agentcore-hub-*` names: `agentcore-hub-deploy` → `agentcore-hub-ci` /
+ * `agentcore-hub-build` / `agentcore-hub-runtime-image-deploy`).
  *
  * TS mirror of pipelineProjects() in lambda/orchestrator/cd-registry.mjs — same
  * derivation, so the UI names the same resources the tools Lambda drives. An
@@ -189,6 +196,7 @@ export function pipelineProjectsFor(entry: CdRegistryEntry): PipelineProjects | 
     ciProject: entry.ciProject || `${base}-ci`,
     buildProject: `${base}-build`,
     deployProject: pipeline,
+    runtimeImageProject: `${base}-runtime-image-deploy`,
   };
 }
 

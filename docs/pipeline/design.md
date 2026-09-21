@@ -116,17 +116,28 @@ from the pipeline name, by one rule shared by every surface —
 
 ```
 pipeline: hub-<slug>-deploy
-  → ciProject     hub-<slug>-ci      (unless the entry names one explicitly)
-  → buildProject  hub-<slug>-build
-  → deployProject hub-<slug>-deploy
+  → ciProject           hub-<slug>-ci      (unless the entry names one explicitly)
+  → buildProject        hub-<slug>-build
+  → deployProject       hub-<slug>-deploy
+  → runtimeImageProject hub-<slug>-runtime-image-deploy   (READ-only, TEAM-4866)
 ```
+
+`runtimeImageProject` is the Deploy stage's **second** CodeBuild action
+(`Deploy_runtime_images`). It exists in the derivation for exactly one reason:
+`Pipeline___get_build_log` must be able to explain a failed runtime-image deploy
+(before TEAM-4866 that build id came back `project_not_registered`). It is a
+read-only name — it is a reserved CI project, it is deliberately absent from the
+project set every other tool resolves against, and nothing anywhere may hand it
+to `codebuild:StartBuild`.
 
 `slug` = the repo name, lowercased, every run of `[^a-z0-9]+` collapsed to `-`,
 trimmed of leading/trailing `-`, truncated to 40 chars. A pipeline name that does
 not end in `-deploy` is used as the base as-is (`juno` → `juno-ci` / `juno-build`).
 `hub-` is a **reserved prefix** for hub-managed pipelines; the hub's own resources
 keep their historical `agentcore-hub-*` names, so `agentcore-hub-deploy` derives
-`agentcore-hub-ci` / `agentcore-hub-build`.
+`agentcore-hub-ci` / `agentcore-hub-build` /
+`agentcore-hub-runtime-image-deploy` (the last one overridable on the tools
+Lambda via `RUNTIME_IMAGE_PROJECT`).
 
 `POST /api/workflow/cd-registry` shape-validates every field (`repo`, `region`,
 `pipeline`, `ciProject`, `deployDoc`, `notes`, plus the cross-account
@@ -167,7 +178,8 @@ follow-up (PR B).
 3. **Watch to terminal.** RM polls `Pipeline___get_state` until the execution
    is terminal, reporting stage statuses as CD evidence.
 4. **On Build FAILED:** RM calls `Pipeline___get_build_log` (phase contexts +
-   log tail), then files a **precise fix ticket** (file:line + failing command)
+   log tail) — readable for the CI, build and deploy projects **and** for the
+   Deploy stage's runtime-image action — then files a **precise fix ticket** (file:line + failing command)
    routed to the owning dev — it never hand-fixes the deploy. When the fix
    merges, RM calls `Pipeline___start_deploy` again. This loop is RM's to own
    until the pipeline is green or the fix is genuinely blocked.

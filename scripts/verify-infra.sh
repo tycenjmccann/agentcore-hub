@@ -28,6 +28,8 @@ CHECK_TICKETS=false
 # deploy/setup-tickets-lambda.mjs ROLE_NAME per TICKET_PROVIDER).
 PIPELINE_TOOLS_FUNCTION="${PIPELINE_TOOLS_FUNCTION:-agentcore-hub-pipeline-tools}"
 PIPELINE_TOOLS_ROLE="${PIPELINE_TOOLS_ROLE:-${PIPELINE_TOOLS_FUNCTION}-role}"
+# Same default as resolveEnv() in deploy/setup-pipeline-tools-lambda.mjs.
+RUNTIME_IMAGE_PROJECT="${RUNTIME_IMAGE_PROJECT:-agentcore-hub-runtime-image-deploy}"
 if [ "${TICKET_PROVIDER:-dynamodb}" = "jira" ]; then
   TICKETS_ROLE="${TICKETS_ROLE:-AgentCoreHubJiraLambdaRole}"
 else

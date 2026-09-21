@@ -156,6 +156,13 @@
  *                       stage's CodeBuild project (same name as the pipeline,
  *                       different resource kind), callers pass
  *                       project="agentcore-hub-deploy" explicitly to get_build_log
+ *   RUNTIME_IMAGE_PROJECT  default "agentcore-hub-runtime-image-deploy" — the Deploy
+ *                       stage's SECOND CodeBuild action (Deploy_runtime_images).
+ *                       READ-ONLY (TEAM-4866): get_build_log may resolve a build id
+ *                       in it so a failed runtime-image deploy can be explained, and
+ *                       it stays in RESERVED_CI_PROJECTS so nothing can ever hand it
+ *                       to codebuild:StartBuild. The IAM grant is read-only too
+ *                       (BuildRead + BuildLogRead, never CiStartBuild)
  *   ARTIFACT_BUCKET     the artifact bucket, in this Lambda's region. Source of
  *                       the CD registry (config/cd-registry.json) and the Deploy
  *                       stage's handoff markers, and the destination of the
@@ -225,6 +232,11 @@ const PIPELINE_NAME = process.env.PIPELINE_NAME || "agentcore-hub-deploy";
 const BUILD_PROJECT = process.env.BUILD_PROJECT || "agentcore-hub-build";
 const CI_PROJECT = process.env.CI_PROJECT || "agentcore-hub-ci";
 const DEPLOY_PROJECT = process.env.DEPLOY_PROJECT || "agentcore-hub-deploy";
+// TEAM-4866 — the Deploy stage's other CodeBuild action, for the env default
+// target. A READ target only; registry targets derive their own name through
+// pipelineProjects().runtimeImageProject.
+const RUNTIME_IMAGE_PROJECT =
+  process.env.RUNTIME_IMAGE_PROJECT || "agentcore-hub-runtime-image-deploy";
 const ARTIFACT_BUCKET = process.env.ARTIFACT_BUCKET || "";
 // Cosmetic label for the env default target only — see the Env block above.
 const PIPELINE_REPO = (process.env.PIPELINE_REPO || "").trim();
@@ -240,7 +252,14 @@ const GITHUB_TIMEOUT_MS = Number(process.env.GITHUB_TIMEOUT_MS || 5000);
 
 // A CodeBuild project that deploys, but is not the pipeline's Deploy stage, so
 // the DEPLOY_PROJECT/PIPELINE_NAME comparisons below would not catch it.
-const RESERVED_CI_PROJECTS = ["agentcore-hub-runtime-image-deploy"];
+//
+// TEAM-4866 made the name configurable (RUNTIME_IMAGE_PROJECT) so get_build_log
+// can READ it. The union — never the env value alone — is what keeps that from
+// weakening this list: overriding the env moves what is readable, and can never
+// un-reserve the default name for an agent-triggerable StartBuild.
+const RESERVED_CI_PROJECTS = [
+  ...new Set([RUNTIME_IMAGE_PROJECT, "agentcore-hub-runtime-image-deploy"]),
+];
 
 /**
  * TEAM-4122 FR-4 (security review F2/F3) — is `name` safe to hand to
@@ -511,6 +530,8 @@ async function listTargets() {
       ciProject: projects.ciProject,
       buildProject: projects.buildProject,
       deployProject: projects.deployProject,
+      // READ-only (TEAM-4866) — see readableProjectsOf below.
+      runtimeImageProject: projects.runtimeImageProject,
       // The registry may name the deployment's OWN pipeline, and normally does.
       // That entry IS the env default — it just carries the registry's
       // region/ciProject instead of env's. Stamping false here (TEAM-4358) left
@@ -530,21 +551,48 @@ async function listTargets() {
       ciProject: CI_PROJECT,
       buildProject: BUILD_PROJECT,
       deployProject: DEPLOY_PROJECT,
+      // From env, not derived: the hub's own runtime-image project name is
+      // settable independently of PIPELINE_NAME (TEAM-4866).
+      runtimeImageProject: RUNTIME_IMAGE_PROJECT,
       isEnvDefault: true,
     });
   }
   return targets;
 }
 
-/** Every CodeBuild project name a target owns. */
+/**
+ * Every CodeBuild project name a target owns for ALL purposes — the set that
+ * makes a project "registered" for start_ci_build's validation and for the
+ * default project_not_registered refusal.
+ *
+ * TEAM-4866: runtimeImageProject is deliberately NOT here. Adding it would make
+ * the runtime-image deploy project a registered project everywhere, softening the
+ * RESERVED_CI_PROJECTS refusal in start_ci_build from "refused, with zero AWS
+ * traffic" into a silent ignore. Read access is a strictly smaller grant and gets
+ * its own set below.
+ */
 function projectsOf(target) {
   return [target.ciProject, target.buildProject, target.deployProject].filter(Boolean);
 }
 
-/** The target that owns CodeBuild project `name`, or null. */
-function targetForProject(targets, name) {
+/**
+ * Every CodeBuild project a target's build LOG may be read for (TEAM-4866) —
+ * projectsOf plus the Deploy stage's runtime-image action. Used ONLY by
+ * get_build_log (a read of phases + a log tail); never by start_ci_build, and
+ * never by the IAM-relevant "can this be started" question.
+ */
+function readableProjectsOf(target) {
+  return [...projectsOf(target), target.runtimeImageProject].filter(Boolean);
+}
+
+/**
+ * The target that owns CodeBuild project `name`, or null. `readable:true` widens
+ * the membership test to the read-only set (runtime-image project included).
+ */
+function targetForProject(targets, name, { readable = false } = {}) {
   if (!name) return null;
-  return targets.find((t) => projectsOf(t).includes(name)) || null;
+  const owns = readable ? readableProjectsOf : projectsOf;
+  return targets.find((t) => owns(t).includes(name)) || null;
 }
 
 /**
@@ -553,7 +601,9 @@ function targetForProject(targets, name) {
  *   args.pipeline_name  → the target whose `pipeline` matches EXACTLY, else a
  *                         pipeline_not_registered refusal.
  *   args.project        → READ TOOLS ONLY (requirePipelineName false): the
- *                         target owning that ci/build/deploy project, else a
+ *                         target owning that ci/build/deploy project — plus the
+ *                         runtime-image deploy project when the caller passes
+ *                         readableProjects (get_build_log, TEAM-4866) — else a
  *                         project_not_registered refusal. Skipped entirely when
  *                         requirePipelineName is true (TEAM-4348) — start_deploy
  *                         does not take a project, and honouring one here would
@@ -571,7 +621,10 @@ function targetForProject(targets, name) {
  *
  * @returns {Promise<{target: Target|null, refusal: object|null, targets: Target[]}>}
  */
-async function resolveTarget(args = {}, { requirePipelineName = false } = {}) {
+async function resolveTarget(
+  args = {},
+  { requirePipelineName = false, readableProjects = false } = {}
+) {
   const targets = await listTargets();
   const pipelines = targets.map((t) => t.pipeline);
 
@@ -600,7 +653,10 @@ async function resolveTarget(args = {}, { requirePipelineName = false } = {}) {
   if (!requirePipelineName) {
     const requestedProject = String(args.project ?? "").trim();
     if (requestedProject) {
-      const target = targetForProject(targets, requestedProject);
+      // readableProjects (TEAM-4866) is passed by get_build_log ONLY, and widens
+      // this membership test to the read-only set — see readableProjectsOf.
+      const owns = readableProjects ? readableProjectsOf : projectsOf;
+      const target = targetForProject(targets, requestedProject, { readable: readableProjects });
       if (!target) {
         return {
           target: null,
@@ -609,7 +665,7 @@ async function resolveTarget(args = {}, { requirePipelineName = false } = {}) {
             ok: false,
             reason: "project_not_registered",
             requested: requestedProject,
-            known: targets.flatMap(projectsOf),
+            known: targets.flatMap(owns),
           },
         };
       }
@@ -698,8 +754,12 @@ export const handler = async (event) => {
       // rather than guessing which repo to deploy.
       case "start_deploy":
         return await onTarget(args, { requirePipelineName: true }, (t) => startDeploy(args, t));
+      // The ONE tool that may name the Deploy stage's runtime-image project
+      // (TEAM-4866): reading a build log is a read. No other case passes this.
       case "get_build_log":
-        return await onTarget(args, {}, (t, all) => getBuildLog(args, t, all));
+        return await onTarget(args, { readableProjects: true }, (t, all) =>
+          getBuildLog(args, t, all)
+        );
       case "get_build_status":
         return await onTarget(args, {}, (t, all) => getBuildStatus(args, t, all));
       case "start_ci_build":
@@ -2131,7 +2191,13 @@ async function getBuildLog(args = {}, target, targets = []) {
   // Region follows whoever owns that project — never the `|| target` fallback:
   // an unregistered project must be refused, not silently read in whichever
   // region the (possibly unrelated) resolved target happens to sit in.
-  const owner = targetForProject(targets, project);
+  //
+  // readable:true (TEAM-4866) — the Deploy stage has TWO CodeBuild actions, and a
+  // failed Deploy_runtime_images build was unreadable here until its project
+  // joined the read set. Reading is all it adds: nothing in this function starts
+  // a build, and projectsOf() (what start_ci_build validates against) is
+  // untouched.
+  const owner = targetForProject(targets, project, { readable: true });
   if (!owner) {
     return jsonResult({
       ok: false,
@@ -2230,7 +2296,7 @@ async function getBuildStatus(args = {}, target, targets = []) {
       ok: false,
       reason: "project_not_registered",
       requested: project,
-      known: targets.flatMap(projectsOf),
+      known: targets.flatMap(readableProjectsOf),
     });
   }
   const { cb } = clientsFor(owner.region, owner.roleArn, owner.externalId);
@@ -2793,7 +2859,7 @@ async function capabilities(args = {}) {
     buildProject: BUILD_PROJECT,
     deployPipeline: PIPELINE_NAME,
     approveDeploy: false,
-    version: 5,
+    version: 6,
     ciRetry: {
       maxBuildsPerSha: MAX_BUILDS_PER_SHA,
       infraRetryPhases: [...INFRA_RETRY_PHASES],
@@ -2814,6 +2880,10 @@ async function capabilities(args = {}) {
       ciProject: t.ciProject,
       buildProject: t.buildProject,
       deployProject: t.deployProject,
+      // TEAM-4866 — the Deploy stage's second CodeBuild action. READABLE by
+      // get_build_log, never startable: it is a reserved CI project, so
+      // startCiBuild below says nothing about it.
+      runtimeImageProject: t.runtimeImageProject,
       // Per target: the flag is deployment-wide, but a target whose ciProject
       // fails validation cannot be started even so.
       startCiBuild: flagOn && validateCiProjectAcrossTargets(t.ciProject, targets).ok,

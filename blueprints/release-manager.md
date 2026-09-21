@@ -883,6 +883,13 @@ triggered yet) is the FIRST thing you do on EVERY invocation of the CD ticket.
      `Pipeline___start_deploy` again to re-run. This trigger→watch→fix→re-run
      loop is YOURS to own until the pipeline is green or a fix is genuinely
      blocked.
+   - **Deploy FAILED** → the Deploy stage runs TWO CodeBuild actions and BOTH
+     logs are readable the same way: the app deploy (`<base>-deploy`) and the
+     runtime-image build (`<base>-runtime-image-deploy`,
+     `targets[].runtimeImageProject` in `Pipeline___capabilities`). Pass the
+     failing action's `externalExecutionId` as `build_id` and read it — never
+     report a failed Deploy stage as unexplained because you only looked at one
+     of the two actions.
    - **Waiting on approval** — the Approval stage's approval action is
      `InProgress` and `Pipeline___get_state` returns a non-null `waitingOn`
      (`{kind:"human_approval", stage, action, executionId, holdsGate,

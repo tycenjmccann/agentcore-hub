@@ -70,6 +70,7 @@ describe("pipelineProjectsFor (app mirror of pipelineProjects)", () => {
       ciProject: "agentcore-hub-ci",
       buildProject: "agentcore-hub-build",
       deployProject: "agentcore-hub-deploy",
+      runtimeImageProject: "agentcore-hub-runtime-image-deploy",
     });
   });
 
@@ -79,6 +80,23 @@ describe("pipelineProjectsFor (app mirror of pipelineProjects)", () => {
     expect(p.buildProject).toBe("hub-juno-build");
     expect(p.deployProject).toBe("hub-juno-deploy");
     expect(p.region).toBe("eu-west-1");
+  });
+
+  /**
+   * TEAM-4866 — the Deploy stage's SECOND CodeBuild action. The UI derives it
+   * here for the same reason it derives the other three: so it names exactly the
+   * resource the tools Lambda will read a build log from. Read-only everywhere.
+   */
+  it("mirrors runtimeImageProject exactly as the canonical helper derives it", () => {
+    expect(pipelineProjectsFor({ repo: "acme/juno", pipeline: "hub-juno-deploy" })!.runtimeImageProject)
+      .toBe("hub-juno-runtime-image-deploy");
+    expect(pipelineProjectsFor({ repo: "a/b", pipeline: "juno" })!.runtimeImageProject)
+      .toBe("juno-runtime-image-deploy");
+    // An explicit ciProject overrides ONLY the CI name.
+    expect(
+      pipelineProjectsFor({ repo: "acme/juno", pipeline: "hub-juno-deploy", ciProject: "juno-pr-checks" })!
+        .runtimeImageProject,
+    ).toBe("hub-juno-runtime-image-deploy");
   });
 
   it("a pipeline NOT ending in -deploy is its own base (no suffix invented away)", () => {
