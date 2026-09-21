@@ -2,6 +2,8 @@
 import copy
 import importlib.util
 import json
+import posixpath
+import re
 from pathlib import Path
 
 import pytest
@@ -191,3 +193,53 @@ def test_every_lambda_dir_is_a_surface_or_excluded():
     for d in sorted(p for p in (root / "lambda").iterdir() if p.is_dir()):
         rel = f"lambda/{d.name}"
         assert rel in listed, f"{rel} is neither a lambda surface nor excluded"
+
+
+# ─── The zip must carry each entrypoint's whole local-import closure ──────────
+
+_LOCAL_IMPORT = re.compile(r"""(?:from|import)\s+["'](\./[\w./-]+\.mjs)["']""")
+
+
+def _import_closure(lambda_dir: Path, entries: list[str]) -> set[str]:
+    """Every ./x.mjs reachable from `entries`, as paths relative to lambda_dir."""
+    seen: set[str] = set()
+    queue = list(entries)
+    while queue:
+        name = queue.pop()
+        if name in seen:
+            continue
+        seen.add(name)
+        src = lambda_dir / name
+        if not src.exists():
+            continue
+        for imp in _LOCAL_IMPORT.findall(src.read_text(encoding="utf-8")):
+            queue.append(posixpath.normpath(posixpath.join(posixpath.dirname(name), imp)))
+    return seen
+
+
+def _unpacked(entry: dict, root: Path) -> list[str]:
+    """Modules the entry imports that its `files` list would not put in the zip."""
+    files = entry["files"]
+    closure = _import_closure(root / entry["dir"].rstrip("/"), [f for f in files if f.endswith(".mjs")])
+    return sorted(m for m in closure
+                  if m not in files and not any(f.endswith("/") and m.startswith(f) for f in files))
+
+
+def test_every_lambda_ships_its_whole_local_import_closure():
+    # PR #640 added gate-contract.mjs to both ticket twins as a local import of
+    # index.mjs and to deploy/setup-tickets-lambda.mjs's zip line — but not to
+    # `files` here. Deploy runs `zip -rq /tmp/surface.zip $FILES`, so CD shipped
+    # index.mjs without it and every Tickets___* call died at cold start with
+    # ERR_MODULE_NOT_FOUND. check-lambda-zip-manifest.sh walks the same closure
+    # against the hand-run deploy script's zip line; nothing checked this manifest.
+    root = HERE.parent.parent
+    for lam in MANIFEST["lambdas"]:
+        assert _unpacked(lam, root) == [], f"{lam['function']}: imported but absent from files[]"
+
+
+def test_closure_guard_would_catch_a_dropped_module():
+    # The #640 drift itself: drop the entry → the guard must name it.
+    root = HERE.parent.parent
+    lam = copy.deepcopy(next(l for l in MANIFEST["lambdas"] if l["function"] == "agentcore-hub-tickets"))
+    lam["files"] = [f for f in lam["files"] if f != "gate-contract.mjs"]
+    assert _unpacked(lam, root) == ["gate-contract.mjs"]

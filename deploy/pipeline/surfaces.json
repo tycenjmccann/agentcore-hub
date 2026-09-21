@@ -64,17 +64,19 @@
       "dir": "lambda/agentcore-hub-jira",
       "files": [
         "index.mjs",
-        "fix-contract.mjs"
+        "fix-contract.mjs",
+        "gate-contract.mjs"
       ],
       "npm": false,
-      "note": "Only @aws-sdk/client-s3 is declared, which the nodejs20.x runtime provides — deploy/setup-tickets-lambda.mjs ships index.mjs alone too."
+      "note": "Only @aws-sdk/client-s3 is declared, which the nodejs20.x runtime provides — deploy/setup-tickets-lambda.mjs packs the same three files. index.mjs's local imports (fix-contract.mjs, gate-contract.mjs) must all be listed here or the function dies at cold start with ERR_MODULE_NOT_FOUND."
     },
     {
       "function": "agentcore-hub-tickets",
       "dir": "lambda/agentcore-hub-tickets",
       "files": [
         "index.mjs",
-        "fix-contract.mjs"
+        "fix-contract.mjs",
+        "gate-contract.mjs"
       ],
       "npm": false,
       "optional": true,
