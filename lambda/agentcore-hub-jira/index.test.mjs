@@ -1526,11 +1526,14 @@ test("createTicket: an emoji title whose cut lands mid-surrogate-pair is clamped
 // The cross-provider truth table is src/lib/workflow/gate-guard-parity.test.ts,
 // which drives BOTH Lambdas through the same rows and compares refusal payloads.
 // What is asserted here is what only this twin does:
-//   - the verification stamp and the `gate:awaiting-console` removal ride in the
-//     SAME `POST /transitions` request as the transition itself (Jira has no
-//     arbitrary field to write a structured record into, so the LABEL is the
-//     stamp, and a stamp written by an adjacent call could be lost after the
-//     close);
+//   - the verification stamp and the `gate:awaiting-console` removal go out as their
+//     own `PUT /issue/{key}` BEFORE a BARE transition POST (Jira has no arbitrary
+//     field to write a structured record into, so the LABEL is the stamp). They used
+//     to ride in the transition request itself; TEAM-4888 split them, because that
+//     needs Labels on the transition screen and a project without it 400s the whole
+//     request atomically — the ticket never moved and the gate was uncloseable;
+//   - a stamp Jira refuses is recorded as a comment and reported as `stampFailed`,
+//     and the close still happens;
 //   - with no PIPELINE_TOOLS_LAMBDA — the configuration every existing install
 //     has — the guard ADMITS and stamps `indeterminate` rather than refusing;
 //   - the two createTicket seams refuse through this twin's throw/`toolResult`
@@ -1542,11 +1545,32 @@ test("createTicket: an emoji title whose cut lands mid-surrogate-pair is clamped
 // AWS call, and it is the state that must never wedge a real install.
 
 /**
- * Run `fn` against a scripted Jira. `issues` maps key → {labels, description};
- * `siblings` are the raw issues a `parent = X` search returns. Every non-GET
- * request is recorded in `writes`.
+ * The 400 the live project answers a label write with (TEAM-4888 / probe TEAM-4876),
+ * byte-for-byte. A rejected Jira request is ATOMIC — nothing in it is applied — which
+ * is what made a label op riding the transition POST able to stop the transition.
  */
-async function withJira({ issues = {}, siblings = [], searchFails = false }, fn) {
+const LABEL_SCREEN_400 = {
+  errors: {
+    labels: "Field 'labels' cannot be set. It is not on the appropriate screen, or unknown.",
+  },
+};
+
+/** A project with Labels on neither the edit screen nor any transition screen. */
+const REJECT_LABEL_WRITES = (method, path, body) =>
+  (method === "PUT" && /^\/rest\/api\/3\/issue\/[^/?]+$/.test(path)) ||
+  (method === "POST" && /\/transitions$/.test(path) && !!body?.update);
+
+/**
+ * Run `fn` against a scripted Jira. `issues` maps key → {labels, description};
+ * `siblings` are the raw issues a `parent = X` search returns; `comments` maps key →
+ * the ADF comment rows a `GET .../comment` returns. `reject(method, path, body)` ⇒
+ * that write answers LABEL_SCREEN_400 (the write is still recorded, so a test can
+ * assert what was ATTEMPTED). Every non-GET request is recorded in `writes`.
+ */
+async function withJira(
+  { issues = {}, siblings = [], searchFails = false, reject = null, comments = {}, commentsFail = false },
+  fn
+) {
   const originalFetch = globalThis.fetch;
   const writes = [];
   globalThis.fetch = async (url, options = {}) => {
@@ -1556,6 +1580,10 @@ async function withJira({ issues = {}, siblings = [], searchFails = false }, fn)
     if (method !== "GET") writes.push({ method, path, body });
     const json = (payload) => new Response(JSON.stringify(payload ?? {}), { status: 200 });
 
+    if (reject && method !== "GET" && reject(method, path, body)) {
+      return new Response(JSON.stringify(LABEL_SCREEN_400), { status: 400 });
+    }
+
     if (/\/transitions$/.test(path)) {
       if (method === "POST") return new Response(null, { status: 204 });
       return json({ transitions: [{ id: "31", name: "Done", to: { name: "Done" } }] });
@@ -1564,7 +1592,12 @@ async function withJira({ issues = {}, siblings = [], searchFails = false }, fn)
       if (searchFails) return new Response(JSON.stringify({ errorMessages: ["boom"] }), { status: 500 });
       return json({ issues: siblings });
     }
-    if (/\/comment$/.test(path)) return json({ id: "1" });
+    const commentMatch = /^\/rest\/api\/3\/issue\/([^/?]+)\/comment(?:\?|$)/.exec(path);
+    if (commentMatch && method === "GET") {
+      if (commentsFail) return new Response(JSON.stringify({ errorMessages: ["boom"] }), { status: 500 });
+      return json({ comments: comments[commentMatch[1]] || [] });
+    }
+    if (/\/comment(?:\?|$)/.test(path)) return json({ id: "1" });
     const keyMatch = /^\/rest\/api\/3\/issue\/([^/?]+)/.exec(path);
     if (path === "/rest/api/3/issue" && method === "POST") return json({ key: "TEAM-901", id: "901" });
     if (keyMatch && method === "PUT") {
@@ -1601,28 +1634,35 @@ const transitionDone = (ticket_id) =>
 
 const DEPLOY_GATE = ["gate:deploy-approval", "pipeline:hub-x-deploy", "exec:0f8fad5b-d9cb-469f-a165-70867728950e"];
 
+/** The label ops the one stamp PUT carried, or null when no PUT was issued. */
+const stampOps = (writes) => {
+  const put = writes.find((w) => w.method === "PUT" && /^\/rest\/api\/3\/issue\/[^/?]+$/.test(w.path));
+  return put ? put.body.update.labels : null;
+};
+const transitionPosts = (writes) => writes.filter((w) => w.method === "POST" && /\/transitions$/.test(w.path));
+
 test("gate guard: with no probe configured the close is ADMITTED and stamped indeterminate", async () => {
   // The fail direction, as a deployment fact. A gate ticket nobody may close is an
   // unliftable stall: there is no escalation rung above the human this gate pages.
   await withJira({ issues: { "TEAM-900": { labels: [...DEPLOY_GATE] } } }, async ({ writes }) => {
     const res = await transitionDone("TEAM-900");
 
+    assert.equal(res.ok, true);
     assert.equal(res.status, "done");
+    assert.equal(res.stampFailed, undefined);
     assert.equal(res.gateVerification.result, "indeterminate");
     assert.equal(res.gateVerification.reason, "probe_failed");
     assert.equal(res.gateVerification.evidence, "probe_not_configured");
     assert.equal(res.gateVerification.gateKind, "deploy-approval");
 
-    const posts = writes.filter((w) => /\/transitions$/.test(w.path));
+    assert.deepEqual(stampOps(writes), [{ add: "gateverify:indeterminate" }]);
+    const posts = transitionPosts(writes);
     assert.equal(posts.length, 1);
-    assert.deepEqual(posts[0].body, {
-      transition: { id: "31" },
-      update: { labels: [{ add: "gateverify:indeterminate" }] },
-    });
+    assert.deepEqual(posts[0].body, { transition: { id: "31" } });
   });
 });
 
-test("gate guard: the stamp and the parked-label removal ride in ONE transitions POST", async () => {
+test("gate guard: the stamp and the parked-label removal go out in ONE label PUT, before a BARE transition", async () => {
   await withJira(
     { issues: { "TEAM-901": { labels: ["gate:blocker", "gate:awaiting-console"] } } },
     async ({ writes }) => {
@@ -1632,30 +1672,34 @@ test("gate guard: the stamp and the parked-label removal ride in ONE transitions
       // A blocker gate has no probe at all — no external condition to read.
       assert.equal(res.gateVerification.reason, "no_probe_available");
 
-      const posts = writes.filter((w) => /\/transitions$/.test(w.path));
+      assert.deepEqual(stampOps(writes), [
+        { remove: "gate:awaiting-console" },
+        { add: "gateverify:indeterminate" },
+      ]);
+      // TEAM-4888: the stamp lands FIRST, so a reader can never see a closed gate
+      // whose verification has not landed yet.
+      const order = writes.filter((w) => w.method !== "GET").map((w) => `${w.method} ${w.path}`);
+      assert.ok(
+        order.indexOf("PUT /rest/api/3/issue/TEAM-901") <
+          order.indexOf("POST /rest/api/3/issue/TEAM-901/transitions"),
+        `stamp must precede the transition, got ${JSON.stringify(order)}`
+      );
+      const posts = transitionPosts(writes);
       assert.equal(posts.length, 1);
-      assert.deepEqual(posts[0].body, {
-        transition: { id: "31" },
-        update: { labels: [{ remove: "gate:awaiting-console" }, { add: "gateverify:indeterminate" }] },
-      });
-      // No adjacent label PUT: a stamp written separately could be lost after the
-      // close, leaving a closed gate with no record of what admitted it.
-      assert.equal(writes.filter((w) => w.method === "PUT").length, 0);
+      assert.deepEqual(posts[0].body, { transition: { id: "31" } });
     }
   );
 });
 
 test("gate guard: a `remove` is only emitted for a label that is actually present", async () => {
-  // Jira 400s a remove of an absent label, and that 400 would abort a transition
-  // the guard already decided to admit.
+  // Jira 400s a remove of an absent label, and that 400 would lose the whole stamp.
   await withJira({ issues: { "TEAM-902": { labels: ["gate:blocker"] } } }, async ({ writes }) => {
     await transitionDone("TEAM-902");
-    const posts = writes.filter((w) => /\/transitions$/.test(w.path));
-    assert.deepEqual(posts[0].body.update.labels, [{ add: "gateverify:indeterminate" }]);
+    assert.deepEqual(stampOps(writes), [{ add: "gateverify:indeterminate" }]);
   });
 });
 
-test("gate guard: a CONTRADICTORY stamp is removed in the same POST that adds the new one", async () => {
+test("gate guard: a CONTRADICTORY stamp is removed in the same PUT that adds the new one", async () => {
   // TEAM-4750 B2. done -> reopen -> done with a different verdict used to leave both
   // gateverify:verified and gateverify:indeterminate on the issue. Order matters only
   // in that the awaiting removal stays first, keeping the common case unchanged.
@@ -1665,9 +1709,7 @@ test("gate guard: a CONTRADICTORY stamp is removed in the same POST that adds th
       const res = await transitionDone("TEAM-903");
 
       assert.equal(res.gateVerification.result, "indeterminate");
-      const posts = writes.filter((w) => /\/transitions$/.test(w.path));
-      assert.equal(posts.length, 1);
-      assert.deepEqual(posts[0].body.update.labels, [
+      assert.deepEqual(stampOps(writes), [
         { remove: "gate:awaiting-console" },
         { remove: "gateverify:verified" },
         { add: "gateverify:indeterminate" },
@@ -1685,11 +1727,101 @@ test("gate guard: a stale stamp is removed using the spelling the issue carries"
     { issues: { "TEAM-904": { labels: ["gate:blocker", "gateverify-verified"] } } },
     async ({ writes }) => {
       await transitionDone("TEAM-904");
-      const posts = writes.filter((w) => /\/transitions$/.test(w.path));
-      assert.deepEqual(posts[0].body.update.labels, [
+      assert.deepEqual(stampOps(writes), [
         { remove: "gateverify-verified" },
         { add: "gateverify:indeterminate" },
       ]);
+    }
+  );
+});
+
+// ─── TEAM-4888: a refused label write may never wedge the close ────────────────
+
+test("gate guard: no transitions POST ever carries `update.labels` (the regression pin)", async () => {
+  // The defect itself. `update.labels` on a transition POST needs Labels on that
+  // TRANSITION screen; the live project has it on none, Jira rejects such a request
+  // atomically, and the ticket then cannot be closed at all.
+  const shapes = [
+    ["TEAM-910", ["gate:blocker"]],
+    ["TEAM-911", ["gate:blocker", "gate:awaiting-console", "gateverify:verified"]],
+    ["TEAM-912", [...DEPLOY_GATE]],
+  ];
+  for (const [key, labels] of shapes) {
+    await withJira({ issues: { [key]: { labels } } }, async ({ writes }) => {
+      await transitionDone(key);
+      for (const post of transitionPosts(writes)) {
+        assert.deepEqual(
+          Object.keys(post.body).sort(),
+          ["transition"],
+          `${key}: transition POST must carry nothing but \`transition\`, got ${JSON.stringify(post.body)}`
+        );
+      }
+    });
+  }
+});
+
+test("gate guard: a REFUSED stamp still closes the ticket and reports stampFailed, never an error", async () => {
+  // TEAM-4876 reproduced: gate:blocker, every label write 400ing.
+  await withJira(
+    { issues: { "TEAM-913": { labels: ["gate:blocker"] } }, reject: REJECT_LABEL_WRITES },
+    async ({ writes }) => {
+      const res = await transitionDone("TEAM-913");
+
+      assert.equal(res.ok, true);
+      assert.equal(res.status, "done");
+      assert.equal(res.message, "Transitioned to done");
+      assert.equal(res.gateVerification.result, "indeterminate");
+      assert.equal("error" in res, false);
+      assert.match(res.stampFailed, /Field 'labels' cannot be set/);
+      // `_ParkGate._moved` in deploy/runtime-agent/main.py reads the whole blob.
+      assert.equal(/not transitioned/.test(JSON.stringify(res)), false);
+
+      // The stamp was attempted, then the verdict was recorded where no screen can
+      // refuse it, and the bare transition still went out.
+      assert.deepEqual(stampOps(writes), [{ add: "gateverify:indeterminate" }]);
+      const verdictComment = writes.find(
+        (w) => w.method === "POST" && /\/comment$/.test(w.path)
+      );
+      const text = verdictComment.body.body.content[0].content[0].text;
+      assert.match(text, /^Gate verified - closing\. gate=blocker result=indeterminate reason=no_probe_available\./);
+      assert.match(text, /this comment is the record\./);
+      assert.equal(transitionPosts(writes).length, 1);
+    }
+  );
+});
+
+test("gate guard: `skip` on a gate whose stamp is refused also closes the ticket", async () => {
+  // `skip` resolves to Done, so it runs the same guard — and used to hit the same
+  // 400. It is how a Blocked gate ticket reaches Done at all.
+  await withJira(
+    { issues: { "TEAM-914": { labels: ["gate:blocker"] } }, reject: REJECT_LABEL_WRITES },
+    async ({ writes }) => {
+      const res = await handler({
+        tool_name: "Tickets___transition_ticket",
+        parameters: { ticket_id: "TEAM-914", transition_id: "skip" },
+      });
+
+      assert.equal(res.ok, true);
+      assert.equal(res.status, "done");
+      assert.equal("error" in res, false);
+      assert.match(res.stampFailed, /Field 'labels' cannot be set/);
+      assert.deepEqual(transitionPosts(writes)[0].body, { transition: { id: "31" } });
+    }
+  );
+});
+
+test("gate guard: retrying after a refused stamp attempts NO label write at all", async () => {
+  // The benign window stamp-then-transition opens (stamped, still open) self-heals:
+  // planGateLabelOps sees its own stamp and plans zero ops.
+  await withJira(
+    { issues: { "TEAM-915": { labels: ["gate:blocker", "gateverify:indeterminate"] } }, reject: REJECT_LABEL_WRITES },
+    async ({ writes }) => {
+      const res = await transitionDone("TEAM-915");
+
+      assert.equal(res.stampFailed, undefined);
+      assert.equal(stampOps(writes), null);
+      assert.equal(writes.filter((w) => /\/comment$/.test(w.path)).length, 0);
+      assert.deepEqual(transitionPosts(writes)[0].body, { transition: { id: "31" } });
     }
   );
 });
