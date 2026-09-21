@@ -3611,13 +3611,14 @@ describe("start_ci_build retry ledger (TEAM-4448 D2)", () => {
 
   // ── (q) the contract is discoverable without tripping over a refusal ────────
 
-  it("capabilities advertises the retry contract at top level (version 5)", async () => {
+  it("capabilities advertises the retry contract at top level (version 6)", async () => {
     const out = await invoke("capabilities");
 
-    // TEAM-4740 bumped 4 → 5 for a get_state/start_deploy SHAPE change; every
-    // ciRetry field below is byte-identical to version 4, which is why it is
-    // asserted here rather than re-derived.
-    expect(out.version).toBe(5);
+    // TEAM-4740 bumped 4 → 5 for a get_state/start_deploy SHAPE change; TEAM-4866
+    // bumped 5 → 6 for start_deploy's adoption answer and targets[].runtimeImageProject.
+    // Every ciRetry field below is byte-identical since version 4, which is why it
+    // is asserted here rather than re-derived.
+    expect(out.version).toBe(6);
     expect(out.ciRetry.maxBuildsPerSha).toBe(2);
     expect(out.ciRetry.infraRetryPhases.sort()).toEqual([
       "DOWNLOAD_SOURCE",
