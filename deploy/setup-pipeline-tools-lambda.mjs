@@ -363,6 +363,12 @@ export function buildInlinePolicy(env) {
         Action: [
           "codepipeline:GetPipelineState",
           "codepipeline:ListActionExecutions",
+          // TEAM-4866 — the execution LIST, read for two things, both read-only:
+          // start_deploy's adoption probe (is an execution for this exact commit
+          // already in flight? if so return its id instead of deploying the same
+          // bytes twice) and get_state's findSupersedingExecution, which has always
+          // called it and was silently AccessDenied without this grant.
+          "codepipeline:ListPipelineExecutions",
           // Resolves an execution's source revision so get_state can look up
           // that commit's infra-handoff marker.
           "codepipeline:GetPipelineExecution",

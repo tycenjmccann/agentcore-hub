@@ -820,6 +820,14 @@ triggered yet) is the FIRST thing you do on EVERY invocation of the CD ticket.
      merged with `head.sha` == your `approved_head_sha` and `merge_commit_sha` ==
      your `commit_sha`, and refuses to record anything it cannot confirm. Your
      attestation alone buys nothing — the machine check is the gate.
+   - **If the reply says `started: false` with `adopted: true`** (`reason:
+     "same_revision_in_progress"`): an execution for this EXACT commit was
+     already in flight, so the tool handed you that one instead of deploying the
+     same bytes twice. This is a SUCCESS, not a refusal —
+     `pipelineExecutionId` is that execution's id, `adoptedExecution` carries its
+     status/startTime/trigger. Write it into `shared/cd-ledger.json` and watch it
+     exactly as if you had started it. Do NOT call `start_deploy` again, and do
+     NOT pass `abandon` to "clear" it: it is deploying your commit.
    - **If `Pipeline___start_deploy` returns a `blocker` object instead of an
      execution id** (the Approval stage is already occupied by another execution
      — `reason: "approval_stage_occupied"`): this is not a failure to retry

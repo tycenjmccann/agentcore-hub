@@ -109,7 +109,20 @@ An entry carries `pipeline` (the CodePipeline that deploys the repo), `region`
 confused-deputy guard on that AssumeRole). The triple is honored only as a
 complete, valid set — `roleArn`'s embedded account cross-checked against
 `account`, `roleArn` naming the reserved `hub-cd-trigger-*` role — else it is
-dropped and the entry falls back to same-account. Everything else is derived
+dropped and the entry falls back to same-account.
+
+That trigger role is hand-applied per repo (there is no template in this repo),
+and what it must allow grew with TEAM-4866: besides `GetPipelineState` /
+`GetPipelineExecution` / `ListActionExecutions` / `StartPipelineExecution` on the
+pipeline, it needs `codepipeline:ListPipelineExecutions` (without it
+`start_deploy`'s duplicate-adoption check fails open and two executions can still
+deploy the same revision — and `get_state` never reports `supersededBy`) and
+`codebuild:BatchGetBuilds` + `logs:GetLogEvents` on
+`<pipeline-base>-runtime-image-deploy` (without them the release manager cannot
+read a failed runtime-image deploy's log). Never `codepipeline:PutApprovalResult`
+— the deploy gate is human-only in every account.
+
+Everything else is derived
 from the pipeline name, by one rule shared by every surface —
 `pipelineProjects()` in `lambda/orchestrator/cd-registry.mjs` and its TS mirror
 `pipelineProjectsFor()` in `src/lib/cd-registry.ts`:
@@ -174,7 +187,16 @@ follow-up (PR B).
    (`gh pr merge --squash`) and records the merge SHA.
 2. **Trigger.** Merge does **not** auto-trigger the pipeline (the GitHub push
    webhook is not wired) — RM calls `Pipeline___start_deploy` and records the
-   `pipelineExecutionId`.
+   `pipelineExecutionId`. If an execution is already **in flight on that same
+   Source revision**, the tool ADOPTS it rather than starting a second one:
+   `{started:false, adopted:true, reason:"same_revision_in_progress"}` with
+   `pipelineExecutionId` = that execution's id, so the RM watches it exactly as
+   if it had started it (TEAM-4866 — two executions deployed identical bytes 5
+   min apart in the PR #640 run, because `gateAhead` only ever saw executions
+   *parked on the approval stage*, never a RUNNING duplicate). The check is one
+   `ListPipelineExecutions` and it **fails open**: if that call is denied or
+   errors, the response carries `adoptionCheck:{ok:false, reason}` and the deploy
+   starts as before — duplicate-avoidance is an optimisation, never a gate.
 3. **Watch to terminal.** RM polls `Pipeline___get_state` until the execution
    is terminal, reporting stage statuses as CD evidence.
 4. **On Build FAILED:** RM calls `Pipeline___get_build_log` (phase contexts +

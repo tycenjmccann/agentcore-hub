@@ -28,9 +28,18 @@
  *                     same human a SECOND time for byte-identical code is
  *                     necessary. Recording is not approving: see the
  *                     DELIBERATELY ABSENT block below.
+ *                     (TEAM-4866) It ADOPTS instead of duplicating: if an
+ *                     execution for this exact commit is already InProgress, the
+ *                     answer is `started:false, adopted:true` carrying THAT
+ *                     execution's id, so two tickets deploying the same merge
+ *                     commit no longer run the pipeline twice. Best-effort — an
+ *                     unreadable execution list starts as before.
  *   - get_build_log:  For a Failed Build stage — the CodeBuild build's phase
  *                     contexts + a tail of its CloudWatch log, so RM can file a
- *                     precise fix ticket (it does NOT hand-fix).
+ *                     precise fix ticket (it does NOT hand-fix). (TEAM-4866) That
+ *                     includes the Deploy stage's SECOND CodeBuild action, the
+ *                     runtime-image deploy — read-only, like every other project
+ *                     this tool reaches.
  *   - start_ci_build: (TEAM-4122 FR-4) Start the PR-CHECK build for one commit,
  *                     so the CI agent can re-run CI on a head it just pushed
  *                     instead of waiting for a webhook that may never fire. The
@@ -895,6 +904,80 @@ async function findSupersedingExecution(pipelineName, executionId, sourceRevisio
   return successor?.pipelineExecutionId || null;
 }
 
+/** How many summaries the adoption probe reads. One page, newest-first — a
+ * duplicate of a commit we are deploying RIGHT NOW is necessarily recent. */
+const ADOPTION_SCAN = 20;
+
+/**
+ * TEAM-4866 — is an execution for THIS exact commit already in flight?
+ *
+ * Two executions deployed byte-identical code five minutes apart (2026-09-19
+ * e60cfd93 / 520dd56d) because nothing looked: gateAhead only sees an execution
+ * PARKED on the ManualApproval gate, so a RUNNING duplicate is invisible to it,
+ * and CodePipeline's own clientRequestToken idempotency does not dedupe two
+ * DIFFERENT calls that merely happen to carry the same source revision (the
+ * duplicate's Source stage pulled the branch HEAD, it passed no commit_sha at all).
+ *
+ * ORDERING INVARIANT — this runs BEFORE StartPipelineExecution, and must stay
+ * there. That is the whole reason no "is this one mine?" filter is needed: at the
+ * moment of the call our own execution does not exist yet, so every InProgress
+ * summary on this revision belongs to somebody else. Move this call after the
+ * start and it would adopt the execution it just created, report started:false
+ * for a deploy it DID start, and make the tool lie about what it did.
+ *
+ * Matching is conservative — a wrong adoption means a deploy that never happens:
+ *   - 40-hex commit_sha  → exact compare against every sourceRevisions[] entry
+ *                          (Source may report more than one artifact).
+ *   - 7-39 hex           → prefix match, adopted ONLY when exactly one InProgress
+ *                          execution matches. Two matches is ambiguous, so we start.
+ *   - anything else      → no candidate (the caller skips the probe entirely).
+ * Only status "InProgress" counts: a Succeeded/Failed/Stopped/Superseded execution
+ * on this revision is history, and re-deploying after a failure is the point.
+ *
+ * FAIL-OPEN by construction: this is duplicate avoidance, not a safety gate. A
+ * throw (AccessDenied on a role that predates the ListPipelineExecutions grant, a
+ * throttle) comes back as {error} and the caller starts exactly as before.
+ *
+ * @returns {Promise<{summary: object|null, error: string|null}>}
+ */
+async function findInFlightForRevision(pipelineName, sha, cp) {
+  let summaries = [];
+  try {
+    const out = await cp.send(
+      new ListPipelineExecutionsCommand({ pipelineName, maxResults: ADOPTION_SCAN })
+    );
+    summaries = out.pipelineExecutionSummaries || [];
+  } catch (e) {
+    console.warn(
+      "adoption probe: list-pipeline-executions failed (non-fatal, starting anyway):",
+      e?.name,
+      e?.message
+    );
+    return { summary: null, error: e?.name || "list_failed" };
+  }
+  const exact = FULL_SHA.test(sha);
+  const matches = summaries.filter(
+    (s) =>
+      s?.pipelineExecutionId &&
+      s.status === "InProgress" &&
+      (s.sourceRevisions || []).some((r) => {
+        const rev = normalizeSha(r?.revisionId);
+        return exact ? rev === sha : rev.startsWith(sha);
+      })
+  );
+  // Ambiguity is only possible on a short SHA; an exact 40-hex match on two live
+  // executions means two runs of the same commit, and adopting the newest (first)
+  // is exactly what a second caller wants.
+  if (matches.length === 0) return { summary: null, error: null };
+  if (!exact && matches.length > 1) {
+    console.warn(
+      `adoption probe: short sha ${sha} matched ${matches.length} in-flight executions — starting instead of guessing`
+    );
+    return { summary: null, error: null };
+  }
+  return { summary: matches[0], error: null };
+}
+
 /** An AWS SDK timestamp (a Date live, a string in a replayed fixture) as an ISO
  * string, or null. A value that does not parse is UNKNOWN — never a fabricated
  * date, because `pendingSince` is what a blueprint uses to decide how long a
@@ -1610,6 +1693,14 @@ async function gateAhead(name, target, cp) {
 // AWS call, `preapproval:{recorded:false, reason:"approved_head_sha_missing"}`, and
 // the human deploy gate fires. Nothing here can FAIL a deploy: recording is
 // best-effort by construction.
+//
+// TEAM-4866 — THREE terminal shapes now, and only the middle one is a refusal:
+//   started:true                      a new execution (the ordinary answer)
+//   started:false + adopted:true      an execution for THIS commit was already in
+//                                     flight, so we return ITS id instead of
+//                                     deploying the same bytes twice. ok:true.
+//   ok:false + reason                 refused (FR-4 gate occupied / abandon
+//                                     refusals) — nothing started, nothing recorded.
 async function startDeploy(args = {}, target) {
   const name = target.pipeline;
   const { cp, cb } = clientsFor(target.region, target.roleArn, target.externalId);
@@ -1621,6 +1712,66 @@ async function startDeploy(args = {}, target) {
   const sanitized = rawSha.replace(/[^a-zA-Z0-9-]/g, "");
   if (sanitized) {
     input.clientRequestToken = `deploy-${sanitized}`.slice(0, 128);
+  }
+
+  // ── TEAM-4866 adoption probe. FIRST — before gateAhead, before the abandon
+  // branch, before the start (see findInFlightForRevision's ordering invariant).
+  // Before gateAhead specifically because the duplicate may BE the execution
+  // parked on the gate: that one is ours to follow, never to abandon, and a
+  // gateAhead refusal would have sent the caller off to prove ancestry against a
+  // run built from its own commit.
+  const adoptionSha = normalizeSha(args.commit_sha);
+  let adoptionCheck = null;
+  if (/^[0-9a-f]{7,40}$/.test(adoptionSha)) {
+    const { summary, error } = await findInFlightForRevision(name, adoptionSha, cp);
+    if (error) {
+      // Fail-open: record that we could not look, and carry on to start.
+      adoptionCheck = { ok: false, reason: error };
+    } else if (summary) {
+      // The record write is unchanged and unconditional on this path: it is keyed
+      // by merge commit and idempotent, so writing it for an execution someone
+      // else started is the same statement about the same commit. It can only ever
+      // make the human gate MORE likely to fire — the adopted run may already be
+      // past the Build stage's preapproved-check, in which case the human is asked
+      // exactly as before (fail-closed, DL-028).
+      const preapproval = await recordShipApproval(args, target, cb);
+      console.log(
+        "adopted in-flight execution",
+        summary.pipelineExecutionId,
+        "for revision",
+        adoptionSha
+      );
+      return jsonResult({
+        ok: true,
+        started: false,
+        adopted: true,
+        reason: "same_revision_in_progress",
+        pipelineName: name,
+        region: target.region,
+        repo: target.repo,
+        // THEIRS, and deliberately top-level: every caller downstream (the watch
+        // poll's execution_id, shared/cd-ledger.json, report_completion) reads
+        // this key, and the execution to watch is that one.
+        pipelineExecutionId: summary.pipelineExecutionId,
+        adoptedExecution: {
+          executionId: summary.pipelineExecutionId,
+          status: summary.status || null,
+          startTime: isoOrNull(summary.startTime),
+          trigger: summary.trigger || null,
+          sourceRevision: summary.sourceRevisions?.[0]?.revisionId || null,
+        },
+        preapproval,
+        note:
+          "NOTHING new was started: an execution for THIS commit was already in flight, so this call ADOPTED it. " +
+          "started:false with adopted:true is a SUCCESS, not a refusal — do not retry, and do not treat it as a fault. " +
+          "pipelineExecutionId is that execution's: poll get_state with execution_id=<it> until terminal:true AND " +
+          "matchesExecution:true, and record it as this run's CD execution exactly as if you had started it. " +
+          "holdsGate/waitingOn may report it as another run's gate, which is expected — it deploys your commit. " +
+          "The ship-approval record was still written for this merge commit (see preapproval); if the adopted run was " +
+          "already past the point where the pipeline reads it, the human deploy gate fires as usual, which is the safe " +
+          "outcome. You have NO approval capability here.",
+      });
+    }
   }
 
   // ── FR-4 (TEAM-4740). BEFORE recordShipApproval, which is itself before the
@@ -1688,6 +1839,10 @@ async function startDeploy(args = {}, target) {
     // Present ONLY when the gate could not be read at all, so a caller can tell
     // "the gate was clear" from "we started without being able to check".
     ...(gate.probe === "unavailable" ? { gateProbe: "unavailable" } : {}),
+    // TEAM-4866: present ONLY when the adoption probe was ATTEMPTED and FAILED —
+    // absent both on the clean path and when there was no sha to probe with. Same
+    // idea as gateProbe: "we started without being able to check for a duplicate".
+    ...(adoptionCheck ? { adoptionCheck } : {}),
     // { recorded, reason?, key? } — see recordShipApproval.
     preapproval,
     note:
@@ -2203,7 +2358,7 @@ async function getBuildLog(args = {}, target, targets = []) {
       ok: false,
       reason: "project_not_registered",
       requested: project,
-      known: targets.flatMap(projectsOf),
+      known: targets.flatMap(readableProjectsOf),
     });
   }
   const { cb, logs } = clientsFor(owner.region, owner.roleArn, owner.externalId);
@@ -2296,7 +2451,7 @@ async function getBuildStatus(args = {}, target, targets = []) {
       ok: false,
       reason: "project_not_registered",
       requested: project,
-      known: targets.flatMap(readableProjectsOf),
+      known: targets.flatMap(projectsOf),
     });
   }
   const { cb } = clientsFor(owner.region, owner.roleArn, owner.externalId);
@@ -2827,6 +2982,14 @@ async function findBuildsForCommit(cb, project, sha, scan = BUILD_SCAN_WINDOW) {
 // an older run. Everything else in this payload is byte-identical to version 4, and
 // `approveDeploy` is still a hard false — abandoning a run in front of you is not
 // approving it, and there is still no PutApprovalResult in this Lambda's reach.
+//
+// version 6 (TEAM-4866) adds `targets[].runtimeImageProject` — the Deploy stage's
+// SECOND CodeBuild action (Deploy_runtime_images), which get_build_log can now
+// read a build log from. It is a READ name only: it is a reserved CI project, so
+// `startCiBuild` never applies to it, and nothing here can start it. The same
+// version covers start_deploy's new ADOPTION answer (`started:false,
+// adopted:true` when an execution for that exact commit is already in flight) —
+// still no PutApprovalResult anywhere in this Lambda's reach.
 //
 // version 4 (TEAM-4448 D2) adds `ciRetry` — the retry contract start_ci_build
 // enforces. It sits at TOP LEVEL, not per target: the cap, the retryable phases and

@@ -192,7 +192,11 @@ what the stack already uses. Explicitly set values always win.
 > `roleArn` account matches `account`) to reach the pipeline. Set the fields via
 > `scripts/cd-registry.sh ... --account ID --role-arn ARN --external-id ID` or
 > the API — the Workflow-tab CD-registry form only saves
-> `pipeline`/`region`/`ciProject`, not the cross-account triple. Only the tools
+> `pipeline`/`region`/`ciProject`, not the cross-account triple. The
+> hand-applied `hub-cd-trigger-*` role must also allow
+> `codepipeline:ListPipelineExecutions` (else `start_deploy`'s duplicate-adoption
+> check fails open) and `codebuild:BatchGetBuilds` + `logs:GetLogEvents` on
+> `<pipeline-base>-runtime-image-deploy` — never `PutApprovalResult`. Only the tools
 > Lambda assumes the role, so `/pipeline` and the Telegram deploy-gate bridge
 > (ambient credentials) cannot yet read or approve a cross-account pipeline.
 

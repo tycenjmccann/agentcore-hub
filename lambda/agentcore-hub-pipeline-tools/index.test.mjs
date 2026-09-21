@@ -3911,7 +3911,9 @@ describe("capabilities", () => {
     // in the multi-target suite, not here. version 4 (TEAM-4448 D2) adds the
     // top-level `ciRetry` contract — asserted in the retry suite. version 5
     // (TEAM-4740 FR-4) adds NOTHING here: it marks get_state's `blocker`/`remedy`
-    // and start_deploy's approval_stage_occupied refusal.
+    // and start_deploy's approval_stage_occupied refusal. version 6 (TEAM-4866)
+    // adds NOTHING here either: it marks `targets[].runtimeImageProject` and
+    // start_deploy's adoption answer.
     expect(out).toMatchObject({
       ciProject: "agentcore-hub-ci",
       buildProject: "agentcore-hub-build",
@@ -4843,6 +4845,525 @@ describe("multi-target registry resolution", () => {
     }
 
     expect(offenders).toEqual([]);
+  });
+});
+
+// ─── 8b. get_build_log reads the runtime-image deploy project (TEAM-4866) ─────
+//
+// The Deploy stage runs TWO CodeBuild actions — Deploy_three_targets
+// (<base>-deploy) and Deploy_runtime_images (<base>-runtime-image-deploy) — and
+// only the first was ever a "registered" project. So when the runtime-image action
+// FAILED on the PR #640 CD run, the release manager's
+// get_build_log(build_id="agentcore-hub-runtime-image-deploy:2493ee8d-…") answered
+// project_not_registered: the agent could see THAT a Deploy action failed and not
+// WHY.
+//
+// The fix adds READ membership only, and this suite's job is to pin BOTH halves of
+// that: the log is now readable (first four tests), and nothing became startable
+// (the next four). `projectsOf()` — the set start_ci_build validates against — is
+// untouched on purpose; `readableProjectsOf()` is the wider set and only
+// get_build_log opts into it.
+describe("get_build_log reads the runtime-image deploy project (TEAM-4866)", () => {
+  const HUB_RI = "agentcore-hub-runtime-image-deploy";
+  const WIDGET_RI = "hub-widget-runtime-image-deploy";
+  /** The literal build id from the PR #640 run that returned project_not_registered. */
+  const HUB_BUILD = `${HUB_RI}:2493ee8d-1111-2222-3333-444444444444`;
+  const WIDGET_BUILD = `${WIDGET_RI}:11111111-2222-3333-4444-555555555555`;
+
+  /** A FAILED build with a log stream, so the answer carries phases AND a tail. */
+  function serveFailedBuild(logGroup) {
+    h.state.batchGetBuildsImpl = async (input) => ({
+      builds: [
+        {
+          id: input.ids[0],
+          buildStatus: "FAILED",
+          phases: [
+            {
+              phaseType: "BUILD",
+              phaseStatus: "FAILED",
+              durationInSeconds: 42,
+              contexts: [{ statusCode: "COMMAND_EXECUTION_ERROR", message: "docker buildx failed" }],
+            },
+          ],
+          logs: { groupName: logGroup, streamName: "stream-1" },
+        },
+      ],
+    });
+    h.state.getLogEventsImpl = async () => ({ events: [{ message: "denied: not authorized\n" }] });
+  }
+
+  it("resolves a build_id in the env-default pipeline's runtime-image project", async () => {
+    serveFailedBuild(`/aws/codebuild/${HUB_RI}`);
+
+    const out = await withRegistry(null, (mod) =>
+      invokeOn(mod.handler, "get_build_log", { build_id: HUB_BUILD }), { AWS_REGION: "us-east-1" });
+
+    // The exact call that used to be refused now answers with the two things the
+    // release manager needs: which phase failed, and the tail that says why.
+    expect(out.ok).toBeUndefined();
+    expect(out.project).toBe(HUB_RI);
+    expect(out.region).toBe("us-east-1");
+    expect(out.buildId).toBe(HUB_BUILD);
+    expect(out.phases[0]).toMatchObject({ phase: "BUILD", status: "FAILED" });
+    expect(out.logTail).toContain("not authorized");
+    // A known build id needs no history scan — same as every other project.
+    expect(h.state.cbCalls.some((c) => c.type === "ListBuildsForProject")).toBe(false);
+  });
+
+  it("resolves a registered repo's hub-<slug>-runtime-image-deploy in that repo's region", async () => {
+    serveFailedBuild(`/aws/codebuild/${WIDGET_RI}`);
+
+    const out = await withRegistry(MULTI_REGISTRY, (mod) =>
+      invokeOn(mod.handler, "get_build_log", { build_id: WIDGET_BUILD })
+    );
+
+    // Derived from the entry's own `pipeline`, and the region follows the OWNER —
+    // the same rule as ci/build/deploy, which is why it cannot drift from them.
+    expect(out.project).toBe(WIDGET_RI);
+    expect(out.region).toBe("us-west-2");
+    expect(h.state.cbCalls.find((c) => c.type === "BatchGetBuilds").region).toBe("us-west-2");
+    expect(h.state.logsCalls.map((c) => c.region)).toEqual(["us-west-2"]);
+  });
+
+  it("accepts project= with no build_id and scans that project's newest build", async () => {
+    h.state.listBuildsImpl = async () => ({ ids: [HUB_BUILD] });
+    serveFailedBuild(`/aws/codebuild/${HUB_RI}`);
+
+    const out = await withRegistry(null, (mod) =>
+      invokeOn(mod.handler, "get_build_log", { project: HUB_RI }), { AWS_REGION: "us-east-1" });
+
+    expect(out.project).toBe(HUB_RI);
+    expect(out.buildId).toBe(HUB_BUILD);
+    expect(h.state.cbCalls.find((c) => c.type === "ListBuildsForProject").input).toMatchObject({
+      projectName: HUB_RI,
+      sortOrder: "DESCENDING",
+    });
+  });
+
+  it("honours RUNTIME_IMAGE_PROJECT, and the default name stops being readable when it is overridden", async () => {
+    serveFailedBuild("/aws/codebuild/agentcore-hub-images-deploy");
+
+    await withRegistry(
+      null,
+      async (mod) => {
+        const ok = await invokeOn(mod.handler, "get_build_log", {
+          build_id: "agentcore-hub-images-deploy:33333333-4444-5555-6666-777777777777",
+        });
+        expect(ok.project).toBe("agentcore-hub-images-deploy");
+
+        // The env names ONE project, and the hard-coded default is not a second
+        // readable name — the grant in setup-pipeline-tools-lambda.mjs follows the
+        // same env, so a readable name the IAM policy does not cover would answer
+        // AccessDenied instead of a refusal.
+        h.state.cbCalls = [];
+        const refused = await invokeOn(mod.handler, "get_build_log", { build_id: HUB_BUILD });
+        expect(refused.ok).toBe(false);
+        expect(refused.reason).toBe("project_not_registered");
+        expect(h.state.cbCalls).toEqual([]);
+      },
+      { AWS_REGION: "us-east-1", RUNTIME_IMAGE_PROJECT: "agentcore-hub-images-deploy" }
+    );
+  });
+
+  it("still refuses an unrelated runtime-image project, with zero AWS traffic", async () => {
+    // acme/legacy is a DEPLOY.md-mode entry: no pipeline, so no derived names at
+    // all. Nothing about the new read set makes an unregistered repo's build
+    // readable — the refusal still happens before any client is constructed.
+    const out = await withRegistry(MULTI_REGISTRY, (mod) =>
+      invokeOn(mod.handler, "get_build_log", {
+        build_id: "hub-legacy-runtime-image-deploy:99999999-8888-7777-6666-555555555555",
+      })
+    );
+
+    expect(out.ok).toBe(false);
+    expect(out.reason).toBe("project_not_registered");
+    expect(out.requested).toBe("hub-legacy-runtime-image-deploy");
+    expect(h.state.cbCalls).toEqual([]);
+    expect(h.state.logsCalls).toEqual([]);
+    expect(initRegions("codebuild")).toEqual([]);
+    expect(initRegions("logs")).toEqual([]);
+  });
+
+  it("lists both runtime-image projects in the refusal's known[], so the agent can correct itself", async () => {
+    const out = await withRegistry(MULTI_REGISTRY, (mod) =>
+      invokeOn(mod.handler, "get_build_log", { build_id: "nope-build:1111" })
+    );
+
+    expect(out.known).toEqual(expect.arrayContaining([HUB_RI, WIDGET_RI]));
+    // ...beside everything that was already there.
+    expect(out.known).toEqual(
+      expect.arrayContaining(["agentcore-hub-ci", "agentcore-hub-build", "hub-widget-ci"])
+    );
+  });
+
+  it("start_ci_build STILL refuses it — read membership is not build membership", async () => {
+    // The whole reason readableProjectsOf() is separate from projectsOf(). Both
+    // names are tried: the hub's own (also in RESERVED_CI_PROJECTS) and a
+    // registered repo's derived one (reserved nowhere, refused purely because it
+    // is not a startable project).
+    for (const project of [HUB_RI, WIDGET_RI]) {
+      h.state.cbCalls = [];
+      const out = await withRegistry(MULTI_REGISTRY, (mod) =>
+        invokeOn(mod.handler, "start_ci_build", { project, commit_sha: "a".repeat(40) }),
+        { PIPELINE_CI_START_BUILD: "1" }
+      );
+
+      expect(out.ok, project).toBe(false);
+      expect(out.reason, project).toBe("project_not_registered");
+      expect(h.state.cbCalls, project).toEqual([]);
+    }
+  });
+
+  it("get_build_status does not gain the runtime-image project either", async () => {
+    // get_build_status answers "is this commit green"; a deploy action's build is
+    // not a CI result, and widening it would have let one be read as one.
+    const out = await withRegistry(MULTI_REGISTRY, (mod) =>
+      invokeOn(mod.handler, "get_build_status", { project: WIDGET_RI })
+    );
+
+    expect(out.ok).toBe(false);
+    expect(out.reason).toBe("project_not_registered");
+    expect(h.state.cbCalls).toEqual([]);
+  });
+
+  it("capabilities reports runtimeImageProject per target, from env for the env default", async () => {
+    const out = await withRegistry(null, (mod) => invokeOn(mod.handler, "capabilities"), {
+      AWS_REGION: "us-east-1",
+      RUNTIME_IMAGE_PROJECT: "agentcore-hub-images-deploy",
+    });
+
+    expect(out.version).toBe(6);
+    expect(out.targets[0].runtimeImageProject).toBe("agentcore-hub-images-deploy");
+    // It is a READ name: the per-target startCiBuild verdict says nothing about it.
+    expect(out.targets[0].startCiBuild).toBe(false);
+  });
+});
+
+// ─── 8c. start_deploy adopts an in-flight execution (TEAM-4866) ───────────────
+//
+// On 2026-09-19 executions e60cfd93 (03:37Z) and 520dd56d (03:42Z) deployed
+// byte-identical code five minutes apart. Nothing looked: gateAhead only sees an
+// execution PARKED on the ManualApproval, so a RUNNING duplicate is invisible to
+// it, and clientRequestToken cannot dedupe two DIFFERENT calls that merely happen
+// to carry the same source revision.
+//
+// start_deploy now probes ListPipelineExecutions for an InProgress execution on
+// the same Source revision and ADOPTS it — returning THAT execution's id with
+// started:false, adopted:true. The three properties this suite pins, because each
+// failure mode is silent:
+//
+//  1. ADOPTION IS NOT A GATE. It fails OPEN on a throwing list call (a role that
+//     predates the ListPipelineExecutions grant answers AccessDenied), skips
+//     entirely without a usable sha, and never converts "unknown" into "refused".
+//  2. IT RUNS FIRST. Before gateAhead, so the duplicate that is parked ON the gate
+//     is adopted rather than refused — or, with abandon:true, STOPPED. Adopting a
+//     run that is deploying our own commit and then discarding it is the worst
+//     outcome available here.
+//  3. MATCHING IS CONSERVATIVE. A wrong adoption is a deploy that never happens,
+//     so only InProgress counts, and a short sha matching two executions starts
+//     instead of guessing.
+describe("start_deploy adopts an in-flight execution on the same revision (TEAM-4866)", () => {
+  /** The commit both calls carry, and one that is merely similar. */
+  const SHA = "5".repeat(40);
+  const OTHER = "6".repeat(40);
+  /** Shares SHA's first ten characters — what makes a short sha ambiguous. */
+  const COUSIN = `${"5".repeat(10)}${"7".repeat(30)}`;
+  const THEIRS = "e60cfd93-1111-2222-3333-444444444444";
+  const MINE = "520dd56d-5555-6666-7777-888888888888";
+  const START_AT = "2026-09-19T03:37:00Z";
+  const TRIGGER = { triggerType: "PutActionRevision", triggerDetail: "main" };
+  /** Distinct 40-hex SHAs for the ship-approval record (never conflated). */
+  const MERGE = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678";
+  const HEAD = "0f1e2d3c4b5a69788796a5b4c3d2e1f001234567";
+
+  /** One ListPipelineExecutions summary, newest-first order as AWS returns them. */
+  function summary(id, revisionId, { status = "InProgress", revisions } = {}) {
+    return {
+      pipelineExecutionId: id,
+      status,
+      startTime: START_AT,
+      trigger: TRIGGER,
+      sourceRevisions: revisions || [{ revisionId }],
+    };
+  }
+  function serveExecutions(summaries) {
+    h.state.listPipelineExecutionsImpl = async () => ({ pipelineExecutionSummaries: summaries });
+  }
+  const listCalls = () => h.state.cpCalls.filter((c) => c.type === "ListPipelineExecutions");
+  const stateCalls = () => h.state.cpCalls.filter((c) => c.type === "GetPipelineState");
+
+  it("adopts an InProgress execution on the same commit and starts NOTHING", async () => {
+    serveExecutions([summary(THEIRS, SHA)]);
+
+    const out = await withGithubTarget((mod) =>
+      invokeOn(mod.handler, "start_deploy", { commit_sha: SHA })
+    );
+
+    expect(out.ok).toBe(true);
+    expect(out.started).toBe(false);
+    expect(out.adopted).toBe(true);
+    expect(out.reason).toBe("same_revision_in_progress");
+    expect(out.adoptedExecution).toEqual({
+      executionId: THEIRS,
+      status: "InProgress",
+      startTime: "2026-09-19T03:37:00.000Z",
+      trigger: TRIGGER,
+      sourceRevision: SHA,
+    });
+    // The whole point: no second execution of the same bytes.
+    expect(startCalls()).toEqual([]);
+    // One page, newest-first — a duplicate of a commit being deployed RIGHT NOW is
+    // necessarily recent, and pagination would be a cost with no answer in it.
+    expect(listCalls()).toHaveLength(1);
+    expect(listCalls()[0].input).toEqual({
+      pipelineName: "agentcore-hub-deploy",
+      maxResults: 20,
+    });
+  });
+
+  it("keeps pipelineExecutionId top-level so the watch poll and cd-ledger work unchanged", async () => {
+    serveExecutions([summary(THEIRS, SHA)]);
+
+    const out = await withGithubTarget(
+      (mod) => invokeOn(mod.handler, "start_deploy", { commit_sha: SHA }),
+      { AWS_REGION: "us-east-1" }
+    );
+
+    // The release manager records `pipelineExecutionId` into shared/cd-ledger.json
+    // and passes it as execution_id on every get_state poll. Adoption changes WHICH
+    // execution that is, never where the caller reads it from.
+    expect(out.pipelineExecutionId).toBe(THEIRS);
+    expect(out.pipelineExecutionId).toBe(out.adoptedExecution.executionId);
+    expect(out.pipelineName).toBe("agentcore-hub-deploy");
+    expect(out.region).toBe("us-east-1");
+    // And the answer says, in words, that this is a success and not a retry cue.
+    expect(out.note).toContain("started:false with adopted:true is a SUCCESS");
+    expect(out.note).toContain("NO approval capability");
+  });
+
+  it("still records the ship-approval on the adopted path and returns preapproval", async () => {
+    // Keyed by merge commit and idempotent, so writing it for an execution someone
+    // else started is the same statement about the same commit. It can only make
+    // the human gate MORE likely to fire (the adopted run may already be past the
+    // Build stage's read), never less.
+    h.state.listBuildsImpl = async () => ({ ids: ["agentcore-hub-ci:ci-build-uuid"] });
+    h.state.batchGetBuildsImpl = async (input) => ({
+      builds: (input.ids || []).map((id) => ({
+        id,
+        buildStatus: "SUCCEEDED",
+        resolvedSourceVersion: HEAD,
+        sourceVersion: HEAD,
+        endTime: "2026-09-19T03:30:00Z",
+      })),
+    });
+    h.state.githubImpl = async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        merged: true,
+        head: { sha: HEAD },
+        merge_commit_sha: MERGE,
+        base: { repo: { full_name: "acme/widget" } },
+      }),
+    });
+    serveExecutions([summary(THEIRS, MERGE)]);
+
+    const out = await withGithubTarget((mod) =>
+      invokeOn(mod.handler, "start_deploy", {
+        commit_sha: MERGE,
+        approved_head_sha: HEAD,
+        pr_url: "https://github.com/acme/widget/pull/9",
+      })
+    );
+
+    expect(out.adopted).toBe(true);
+    expect(out.preapproval).toEqual({
+      recorded: true,
+      key: `pipeline-artifacts/ship-approvals/${MERGE}.json`,
+    });
+    expect(h.state.s3Puts).toHaveLength(1);
+    expect(JSON.parse(h.state.s3Puts[0].input.Body)).toMatchObject({
+      merge_commit: MERGE,
+      approved_head_sha: HEAD,
+      recorded_by: "Pipeline___start_deploy",
+    });
+    expect(startCalls()).toEqual([]);
+  });
+
+  it("runs BEFORE gateAhead — the duplicate parked ON the gate is adopted, not refused", async () => {
+    // Pre-fix this answered approval_stage_occupied and sent the caller off to
+    // prove ancestry against a run built from its own commit.
+    h.state.getPipelineStateImpl = async () => parkedGate();
+    serveExecution(OLDER_EXEC);
+    serveExecutions([summary(OLDER_EXEC, SHA)]);
+
+    const out = await withGithubTarget((mod) =>
+      invokeOn(mod.handler, "start_deploy", { commit_sha: SHA })
+    );
+
+    expect(out.ok).toBe(true);
+    expect(out.adopted).toBe(true);
+    expect(out.pipelineExecutionId).toBe(OLDER_EXEC);
+    // The gate was never even read: adoption short-circuits ahead of it.
+    expect(stateCalls()).toEqual([]);
+    expect(startCalls()).toEqual([]);
+  });
+
+  it("adopts rather than abandons, even when the caller passed abandon:true", async () => {
+    h.state.getPipelineStateImpl = async () => parkedGate();
+    serveExecution(OLDER_EXEC, { statuses: ["InProgress", "Stopped"] });
+    serveAncestry();
+    serveExecutions([summary(OLDER_EXEC, SHA)]);
+
+    const out = await withGithubTarget((mod) =>
+      invokeOn(mod.handler, "start_deploy", { commit_sha: SHA, abandon: "true" })
+    );
+
+    expect(out.adopted).toBe(true);
+    // Stopping a run that is deploying OUR OWN commit is the worst outcome this
+    // tool has: it discards work that would have shipped and needs a human at the
+    // gate again for the replacement.
+    expect(stopCalls()).toEqual([]);
+    expect(startCalls()).toEqual([]);
+  });
+
+  it("starts normally when the in-flight execution is a DIFFERENT revision", async () => {
+    serveExecutions([summary(THEIRS, OTHER)]);
+
+    const out = await withGithubTarget((mod) =>
+      invokeOn(mod.handler, "start_deploy", { commit_sha: SHA })
+    );
+
+    expect(out.started).toBe(true);
+    expect(out.pipelineExecutionId).toBe("exec-new");
+    expect(out).not.toHaveProperty("adopted");
+    expect(out).not.toHaveProperty("adoptedExecution");
+    expect(out).not.toHaveProperty("adoptionCheck");
+    expect(startCalls()).toHaveLength(1);
+  });
+
+  it.each(["Succeeded", "Failed", "Stopped", "Superseded"])(
+    "starts normally when the same revision's execution is %s — history is not a duplicate",
+    async (status) => {
+      // Re-deploying after a failure is the point; re-deploying after a success is
+      // an operator's call. Only a LIVE run is a duplicate.
+      serveExecutions([summary(THEIRS, SHA, { status })]);
+
+      const out = await withGithubTarget((mod) =>
+        invokeOn(mod.handler, "start_deploy", { commit_sha: SHA })
+      );
+
+      expect(out.started, status).toBe(true);
+      expect(out, status).not.toHaveProperty("adopted");
+      expect(startCalls(), status).toHaveLength(1);
+    }
+  );
+
+  it("FAILS OPEN with adoptionCheck.ok:false when ListPipelineExecutions throws", async () => {
+    // The live shape of this: the grant is new, so a role deployed before it
+    // answers AccessDenied. Duplicate avoidance is an optimisation — refusing here
+    // would turn a missing read permission into a blocked ship.
+    h.state.listPipelineExecutionsImpl = async () => {
+      const err = new Error("not authorized to perform ListPipelineExecutions");
+      err.name = "AccessDeniedException";
+      throw err;
+    };
+
+    const out = await withGithubTarget((mod) =>
+      invokeOn(mod.handler, "start_deploy", { commit_sha: SHA })
+    );
+
+    expect(out.started).toBe(true);
+    expect(out.adoptionCheck).toEqual({ ok: false, reason: "AccessDeniedException" });
+    expect(startCalls()).toHaveLength(1);
+  });
+
+  it("adopts on an unambiguous short-sha prefix, and does NOT when two runs match it", async () => {
+    // One match on a 10-char prefix → adopt.
+    serveExecutions([summary(THEIRS, SHA)]);
+    const one = await withGithubTarget((mod) =>
+      invokeOn(mod.handler, "start_deploy", { commit_sha: SHA.slice(0, 10) })
+    );
+    expect(one.adopted).toBe(true);
+    expect(one.pipelineExecutionId).toBe(THEIRS);
+
+    // Two matches → ambiguous, so START rather than guess which one to watch.
+    h.state.cpCalls = [];
+    serveExecutions([summary(THEIRS, SHA), summary(MINE, COUSIN)]);
+    const two = await withGithubTarget((mod) =>
+      invokeOn(mod.handler, "start_deploy", { commit_sha: SHA.slice(0, 10) })
+    );
+    expect(two.started).toBe(true);
+    expect(two).not.toHaveProperty("adopted");
+    expect(startCalls()).toHaveLength(1);
+  });
+
+  it("makes NO ListPipelineExecutions call when there is no usable commit_sha", async () => {
+    // Nothing to match on, so nothing is asked — every pre-TEAM-4866 caller that
+    // passes no sha keeps making exactly the calls it made before.
+    serveExecutions([summary(THEIRS, SHA)]);
+
+    for (const args of [{}, { commit_sha: "" }, { commit_sha: "not-a-sha" }, { commit_sha: "abc12" }]) {
+      h.state.cpCalls = [];
+      const out = await withGithubTarget((mod) => invokeOn(mod.handler, "start_deploy", args));
+
+      expect(out.started, JSON.stringify(args)).toBe(true);
+      expect(out, JSON.stringify(args)).not.toHaveProperty("adoptionCheck");
+      expect(listCalls(), JSON.stringify(args)).toEqual([]);
+    }
+  });
+
+  it("matches ANY sourceRevisions entry, case-insensitively", async () => {
+    // Source can emit more than one artifact revision, and CodePipeline reports
+    // revision ids verbatim — an upper-case sha on either side must still match.
+    serveExecutions([
+      summary(THEIRS, null, { revisions: [{ revisionId: OTHER }, { revisionId: SHA.toUpperCase() }] }),
+    ]);
+
+    const out = await withGithubTarget((mod) =>
+      invokeOn(mod.handler, "start_deploy", { commit_sha: SHA.toUpperCase() })
+    );
+
+    expect(out.adopted).toBe(true);
+    // `sourceRevision` reports the summary's FIRST revision, which is what the
+    // console shows for the execution — not necessarily the one that matched.
+    expect(out.adoptedExecution.sourceRevision).toBe(OTHER);
+  });
+
+  it("lists executions through the assumed-role client for a cross-account pipeline", async () => {
+    serveExecutions([summary(THEIRS, SHA)]);
+
+    const out = await withRegistry(
+      {
+        version: 1,
+        repos: [
+          {
+            repo: "tycenjmccann/juno",
+            pipeline: "hub-juno-deploy",
+            region: "us-west-2",
+            account: "123456789012",
+            roleArn: "arn:aws:iam::123456789012:role/hub-cd-trigger-juno",
+            externalId: "hub-cd-juno-secret",
+          },
+        ],
+      },
+      (mod) =>
+        invokeOn(mod.handler, "start_deploy", {
+          pipeline_name: "hub-juno-deploy",
+          commit_sha: SHA,
+        })
+    );
+
+    expect(out.adopted).toBe(true);
+    expect(out.region).toBe("us-west-2");
+    // The probe uses the SAME client the start would have used — it must not read
+    // the hub's own account and conclude "no duplicate" for a foreign pipeline.
+    expect(listCalls()[0].region).toBe("us-west-2");
+    expect(h.state.clientInits.find((c) => c.kind === "codepipeline").hasCreds).toBe(true);
+    expect(h.state.stsCalls[0].input).toMatchObject({
+      RoleArn: "arn:aws:iam::123456789012:role/hub-cd-trigger-juno",
+      ExternalId: "hub-cd-juno-secret",
+    });
   });
 });
 

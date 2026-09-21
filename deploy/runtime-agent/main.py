@@ -2111,6 +2111,14 @@ def Pipeline___start_deploy(pipeline_name: str = "", commit_sha: str = "", appro
     pipeline. Record the returned pipelineExecutionId and pass it as
     execution_id on every Pipeline___get_state watch poll.
 
+    If an execution is ALREADY in flight for that exact commit (someone else's
+    ship ticket, or the push that preceded yours), this call ADOPTS it instead of
+    deploying the same bytes twice: started:false, adopted:true,
+    reason:"same_revision_in_progress", and pipelineExecutionId is THAT
+    execution's id. Watch it exactly as if you had started it, and record it as
+    your CD evidence. started:false with adopted:true is a SUCCESS — never treat
+    it as a failure and never retry it.
+
     The Deploy stage has an in-pipeline ManualApproval (the deploy gate) that a
     HUMAN approves via Telegram — you do NOT approve it, and there is NO tool
     (here or anywhere in the fleet) that can approve it. Passing

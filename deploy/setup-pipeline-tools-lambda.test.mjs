@@ -205,6 +205,9 @@ describe("buildInlinePolicy — the CiStartBuild grant", () => {
         "codepipeline:GetPipelineExecution",
         "codepipeline:GetPipelineState",
         "codepipeline:ListActionExecutions",
+        // TEAM-4866's read: start_deploy's duplicate-adoption check (and the
+        // supersededBy chain get_state reports) list executions. READ-only.
+        "codepipeline:ListPipelineExecutions",
         "codepipeline:StartPipelineExecution",
         // TEAM-4740's Stop. Listed exhaustively on purpose: this is the assertion a
         // future widening has to argue with.
@@ -859,6 +862,124 @@ describe("buildInlinePolicy — the hub-* convention wildcards", () => {
     ]);
   });
 
+  /**
+   * TEAM-4866 — the Deploy stage's SECOND CodeBuild action. The PR #640 CD run
+   * lost a release-manager turn because `Pipeline___get_build_log` answered
+   * project_not_registered for a FAILED `agentcore-hub-runtime-image-deploy`
+   * build: the project was in no target's project set and in no IAM statement.
+   * These tests pin the grant at both ends — present for READS, absent from every
+   * StartBuild statement, in every flag/region combination.
+   */
+  describe("the runtime-image deploy project is readable, never buildable", () => {
+    const RI = "agentcore-hub-runtime-image-deploy";
+
+    it("BuildRead grants read on the runtime-image deploy project by exact ARN", () => {
+      const statement = sid(buildInlinePolicy(BASE), "BuildRead");
+      expect(statement.Resource).toContain(arn(RI));
+      // Exactly the two read verbs — the wildcard sibling is only safe for those.
+      expect(statement.Action).toEqual([
+        "codebuild:BatchGetBuilds",
+        "codebuild:ListBuildsForProject",
+      ]);
+    });
+
+    it("BuildLogRead grants the runtime-image project's log group", () => {
+      expect(sid(buildInlinePolicy(BASE), "BuildLogRead").Resource).toContain(
+        logArn(`${RI}:*`)
+      );
+    });
+
+    it("honours RUNTIME_IMAGE_PROJECT in both read statements", () => {
+      const policy = buildInlinePolicy({ ...BASE, RUNTIME_IMAGE_PROJECT: "custom-images" });
+      expect(sid(policy, "BuildRead").Resource).toContain(arn("custom-images"));
+      expect(sid(policy, "BuildLogRead").Resource).toContain(logArn("custom-images:*"));
+      // The default name is no longer granted — the env is the name, not an addition.
+      expect(sid(policy, "BuildRead").Resource).not.toContain(arn(RI));
+    });
+
+    it("CiStartBuild never names the runtime-image project — flag on or off", () => {
+      for (const env of [BASE, ON, { ...ON, RUNTIME_IMAGE_PROJECT: "custom-images" }]) {
+        const statement = sid(buildInlinePolicy(env), "CiStartBuild");
+        if (!statement) continue; // flag off: the statement does not exist at all
+        for (const resource of [].concat(statement.Resource)) {
+          expect(resource).not.toMatch(/runtime-image/);
+          expect(resource).not.toMatch(/custom-images/);
+        }
+      }
+    });
+
+    it("no statement grants codebuild:StartBuild on the runtime-image project in any combination", () => {
+      for (const env of [
+        BASE,
+        ON,
+        { ...ON, PIPELINE_REGIONS: "us-east-1,eu-west-1" },
+        { ...ON, RUNTIME_IMAGE_PROJECT: "custom-images" },
+        { ...ON, ARTIFACT_BUCKET: "" },
+      ]) {
+        const resources = statementsWith(buildInlinePolicy(env), "codebuild:StartBuild")
+          .flatMap((s) => [].concat(s.Resource));
+        for (const resource of resources) {
+          expect(resource).not.toMatch(/runtime-image/);
+          expect(resource).not.toMatch(/custom-images/);
+          // ...and no wildcard broad enough to subsume it.
+          expect(resource).not.toBe("*");
+          expect(resource).not.toMatch(/project\/hub-\*$/);
+          expect(resource).not.toMatch(/project\/agentcore-hub-\*$/);
+        }
+      }
+    });
+
+    it("project/hub-* and /aws/codebuild/hub-* already cover a registered repo's runtime-image project, and project/hub-*-ci does not", () => {
+      // Why only the hub's OWN name needs exact ARNs: hub-<slug>-runtime-image-deploy
+      // is matched by the read wildcards and by NONE of the StartBuild ones.
+      const name = "hub-juno-runtime-image-deploy";
+      const matches = (pattern, value) =>
+        new RegExp(`^${pattern.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*")}$`).test(value);
+      expect(matches("hub-*", name)).toBe(true);
+      expect(matches("hub-*-ci", name)).toBe(false);
+      expect(matches("hub-*-deploy", name)).toBe(true); // a PIPELINE pattern, not a project one
+      // And that is what the policy actually contains.
+      const policy = buildInlinePolicy(ON);
+      expect(sid(policy, "BuildRead").Resource).toContain(arn("hub-*"));
+      expect(sid(policy, "BuildLogRead").Resource).toContain(logArn("hub-*"));
+      expect(sid(policy, "CiStartBuild").Resource).toEqual([
+        arn("agentcore-hub-ci"),
+        arn("hub-*-ci"),
+      ]);
+    });
+
+    it("keeps agentcore-hub-runtime-image-deploy reserved for CI_PROJECT after the env is introduced", () => {
+      // The reserved list is a UNION with the literal default, so pointing
+      // RUNTIME_IMAGE_PROJECT elsewhere can never un-reserve the default name.
+      for (const env of [ON, { ...ON, RUNTIME_IMAGE_PROJECT: "custom-images" }]) {
+        expect(() => buildInlinePolicy({ ...env, CI_PROJECT: RI })).toThrow(
+          /PIPELINE_CI_START_BUILD=1 refused/
+        );
+      }
+    });
+
+    it("PipelineReadAndTrigger adds ListPipelineExecutions on the same pipelineArns as StartPipelineExecution", () => {
+      const statement = sid(buildInlinePolicy(BASE), "PipelineReadAndTrigger");
+      expect(statement.Action).toContain("codepipeline:ListPipelineExecutions");
+      // One statement, one Resource list: the read cannot reach a pipeline the
+      // trigger cannot, and vice versa.
+      expect(statement.Action).toContain("codepipeline:StartPipelineExecution");
+      expect(statement.Resource).toEqual([
+        cpArn("agentcore-hub-deploy"),
+        cpArn("hub-*-deploy"),
+      ]);
+    });
+
+    it("still contains no codepipeline:PutApprovalResult with the new read action present", () => {
+      for (const env of [BASE, ON]) {
+        const actions = allActions(buildInlinePolicy(env));
+        expect(actions).toContain("codepipeline:ListPipelineExecutions");
+        expect(actions).not.toContain("codepipeline:PutApprovalResult");
+        expect(actions.filter((a) => /Approval/i.test(a))).toEqual([]);
+      }
+    });
+  });
+
   // ─── the StartBuild blast radius, the one that matters ────────────────────
 
   it("hub-*-ci is the ONLY wildcard in any statement granting StartBuild", () => {
@@ -1006,6 +1127,8 @@ describe("buildInlinePolicy — the hub-* convention wildcards", () => {
             "codepipeline:GetPipelineExecution",
             "codepipeline:GetPipelineState",
             "codepipeline:ListActionExecutions",
+            // TEAM-4866's read (start_deploy's adoption probe + supersededBy).
+            "codepipeline:ListPipelineExecutions",
             "codepipeline:StartPipelineExecution",
             // TEAM-4740. The complete list of CodePipeline actions this role has,
             // and the reason this assertion is exhaustive rather than a negative
