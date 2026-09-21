@@ -220,8 +220,10 @@ const landedTasks = (tickets) => Object.fromEntries(tickets.map((t, i) => [t.tic
 // The rendered items, with the "+N more" tail stripped off first (a lazy regex
 // group can't do this reliably — `$` pulls it to end-of-line).
 const shippingItemsOf = (text) => {
-  const m = text.match(/shipping: (.*)$/m);
-  return m ? m[1].replace(/ \+\d+ more$/, "").split(", ").filter(Boolean) : [];
+  // The Shipping block: "*Shipping*" then one "• item" per line up to the next
+  // blank line; the "• +N more" tail is a count, not an item (TEAM-4885).
+  const m = text.match(/^\*Shipping\*\n((?:• .*\n?)+)/m);
+  return m ? m[1].split("\n").filter(Boolean).map((l) => l.replace(/^• /, "")).filter((l) => !/^\+\d+ more$/.test(l)) : [];
 };
 const rmGateTicket = (createdAt = "2026-09-14T09:00:00.000Z") => ({
   ticketId: GATE, title: RM_TITLE, description: RM_RUNBOOK, status: "in_review",
@@ -271,7 +273,7 @@ describe("approval pings are built from structured inputs, never from ticket pro
     // 2. the body is the RUN, not the ticket — plus WHAT is shipping, which for
     //    a gate with no blockedBy comes from the run's landed PRs (TEAM-4671 F3)
     expect(text).toContain(RUN_TITLE);
-    expect(text).toContain("shipping: Pipeline arg contract");
+    expect(text).toContain("*Shipping*\n• Pipeline arg contract");
     // 3. nothing the release manager wrote leaks — ids, SHAs, console steps,
     //    pipeline state, the attempt count, or any description sentence
     for (const leak of ["347b9bcb", "19688946", "9f6a9e0d", "InProgress", "CODEPIPELINE CONSOLE", "(3×)", "Stage:"]) {
@@ -292,6 +294,49 @@ describe("approval pings are built from structured inputs, never from ticket pro
     expect(btns.some((b) => b.callback_data === `gok|${GATE}|${WF}`)).toBe(true);
     expect(btns.some((b) => b.callback_data === `gno|${GATE}|${WF}`)).toBe(true);
     expect(btns.some((b) => b.text === "📱 Open approval in hub")).toBe(true);
+  });
+
+  /**
+   * TEAM-4885. A "Handoff (…)" / "Escalation:" ticket is a task an agent hands
+   * to a human, not an approval. It paged as "🚦 REVIEW GATE" with the RUN title
+   * plus "shipping: <every ticket title> +19 more" and no ask at all — the one
+   * thing the human needed (what to do) was the ticket title, which the
+   * approval rules never render. A handoff renders its own ask and context and
+   * no shipping list.
+   */
+  it("a Handoff ticket pages with its own ask and context, no shipping dump", async () => {
+    const mod = await loadModule();
+    const handoff = {
+      ticketId: GATE,
+      title: "Handoff (QA probe TEAM-4876): attribute + repair the deployed ticket Lambdas' pipeline-tools probe — env PIPELINE_TOOLS_LAMBDA, lambda:InvokeFunction grant, or 4 s probe timeout",
+      description: "The FR-1 post-deploy probe shows the DEPLOYED guard ADMITTED a bound close whose head has NO CodeBuild build. A successful pipeline-tools probe would have refused it.\n\n1. Open the console…",
+      status: "in_review", assignee: "human:engineer", createdAt: "2026-09-21T18:40:00.000Z",
+      blockedBy: "TEAM-4600,TEAM-4601",
+    };
+    const upstream = [shipped(), { ticketId: "TEAM-4601", title: "CI guard for buildspec args", status: "done", createdAt: "2026-09-12T10:00:00.000Z" }];
+    const text = (await run(mod.handler, {
+      batches: [[]],
+      workflows: [wf([notif(`notif_${GATE}_2026-09-21T18:41:00.000Z`, "2026-09-21T18:41:00.000Z")])],
+      tickets: [handoff, ...upstream],
+    })).sent[0].text;
+
+    expect(text).toMatch(/^\*🙋 HANDOFF — a human has to do this\*/);
+    expect(text).toMatch(mod.APPROVAL_KICKER_RE);
+    // line 2 is the ask — the title minus its "Handoff (…):" classifier prefix
+    expect(text.split("\n")[1]).toMatch(/^attribute \+ repair the deployed ticket Lambdas' pipeline-tools probe/);
+    expect(text).not.toContain("Handoff (QA probe");
+    // the first sentence of the description is the context; the runbook is not
+    expect(text).toContain("The FR-1 post-deploy probe shows the DEPLOYED guard ADMITTED a bound close whose head has NO CodeBuild build.");
+    expect(text).not.toContain("Open the console");
+    // no shipping list, the run is a Context bullet, and the ask says what ✅ does
+    expect(text).not.toContain("Shipping");
+    expect(shippingItemsOf(text)).toEqual([]);
+    expect(text).toContain(`*Context*\n• Run: ${RUN_TITLE}`);
+    expect(text).toContain("the agent is parked until you close this");
+    expect(text).toContain("Do it, then tap ✅ to release the agent");
+    // a reply to a handoff page must not route as a rework note
+    expect(text).not.toContain("REVIEW GATE");
+    expect(text.length).toBeLessThanOrEqual(mod.APPROVAL_TEXT_MAX);
   });
 
   /**
@@ -316,7 +361,7 @@ describe("approval pings are built from structured inputs, never from ticket pro
         tickets: [{ ...rmGateTicket(), blockedBy }, ...upstream],
       })).sent[0].text;
 
-      expect(text, `blockedBy=${JSON.stringify(blockedBy)}`).toContain("shipping: Pipeline arg contract, CI guard for buildspec args");
+      expect(text, `blockedBy=${JSON.stringify(blockedBy)}`).toContain("*Shipping*\n• Pipeline arg contract\n• CI guard for buildspec args");
       expect(text.length).toBeLessThanOrEqual(mod.APPROVAL_TEXT_MAX);
     }
   });
