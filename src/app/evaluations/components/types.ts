@@ -86,11 +86,6 @@ export interface TimeseriesPoint {
   evaluators?: Record<string, { avg: number; count: number }>;
 }
 
-export interface TimeseriesResponse {
-  series?: TimeseriesPoint[];
-  window?: unknown;
-}
-
 /** evaluator (normalized, no `Builtin.` prefix) → ascending points. */
 export type EvaluatorSeries = Record<string, { day: string; avg: number; count: number }[]>;
 
