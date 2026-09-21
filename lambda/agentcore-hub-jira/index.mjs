@@ -502,46 +502,99 @@ function gateWorkflowIdOf(labels) {
  * `transition_ticket(done)` retry loop appending the same console link evicts the
  * human's advisory `DECISION:` line out of the window the guard itself reads.
  *
+ * TEAM-4888: the page no longer depends on the LABEL WRITE succeeding. Both side
+ * effects used to sit behind `newlyLabelled`, so on a project whose EDIT screen has
+ * no Labels field the refusal was completely silent — no event, no comment, nothing
+ * for a human to act on, which is the same screen dependency that made the admit
+ * path uncloseable. The label is still tried first and is still the dedupe when it
+ * lands; when it cannot land, refusalAlreadyCommented takes over so the dedupe
+ * intent above survives without it.
+ *
  * Every side effect is best-effort: a correct refusal must not turn into a tool
  * error because Jira rate-limited a comment.
  */
 async function repageGate(ticketId, labels, gateKind, verdict, refusal) {
   const parked = labels.some((l) => GATE_AWAITING_CONSOLE_RE.test(String(l ?? "").trim().toLowerCase()));
-  let newlyLabelled = false;
-  if (!parked) {
-    try {
-      await addLabels({ ticket_id: ticketId, labels: [GATE_AWAITING_CONSOLE_LABEL] });
-      newlyLabelled = true;
-    } catch (err) {
-      console.warn(`[agentcore-hub-jira] ${ticketId}: could not label the parked gate — ${err?.name}`);
-    }
+  if (parked) return;
+
+  let labelled = false;
+  try {
+    await addLabels({ ticket_id: ticketId, labels: [GATE_AWAITING_CONSOLE_LABEL] });
+    labelled = true;
+  } catch (err) {
+    console.warn(`[agentcore-hub-jira] ${ticketId}: could not label the parked gate — ${err?.name}`);
   }
 
-  if (newlyLabelled) {
-    await publishJourneyEvent(eventsClient(), EVENTS_TABLE, gateWorkflowIdOf(labels), "gate.repaged", {
-      ticketId,
-      gateKind,
-      consoleUrl: verdict.consoleUrl,
-      attempt: 1,
-    });
+  // The label could not be written, so it cannot be this stall's dedupe key. Ask the
+  // comment thread instead rather than pay the B1 cost of an unbounded repeat.
+  if (!labelled && (await refusalAlreadyCommented(ticketId, refusal.comment))) return;
 
-    try {
-      await addComment({ ticket_id: ticketId, comment: refusal.comment });
-    } catch (err) {
-      console.warn(`[agentcore-hub-jira] ${ticketId}: could not comment the refusal — ${err?.name}`);
-    }
+  await publishJourneyEvent(eventsClient(), EVENTS_TABLE, gateWorkflowIdOf(labels), "gate.repaged", {
+    ticketId,
+    gateKind,
+    consoleUrl: verdict.consoleUrl,
+    attempt: 1,
+  });
+
+  try {
+    await addComment({ ticket_id: ticketId, comment: refusal.comment });
+  } catch (err) {
+    console.warn(`[agentcore-hub-jira] ${ticketId}: could not comment the refusal — ${err?.name}`);
   }
 }
 
 /**
- * The label half of the admit path, as Jira `update.labels` ops that ride in the
- * SAME request as the transition: stamp the verification, take `gate:awaiting-console`
- * off. One request, so a close can never be recorded without its verification.
+ * Has this exact refusal already been commented on the ticket? The dedupe of last
+ * resort, called ONLY when the `gate:awaiting-console` label could not be written,
+ * so a healthy install never pays for it.
+ *
+ * Keyed on the FIRST LINE of the refusal comment, which gateRefusal (gate-contract.mjs)
+ * builds as a constant banner — `**Gate not verified — this ticket stays open.**`, with
+ * no ticket id, timestamp, attempt counter or probe evidence in it, so it is byte-stable
+ * across repeated refusals of the same gate. Derived from `refusal.comment` rather than
+ * re-spelled here, so the contract stays the only place that string exists. The banner
+ * is unique to gateRefusal: gateLoopRefusal has no comment at all.
+ *
+ * Suppressing a LATER refusal of the same ticket is the intended reading and matches
+ * what the label does — a parked label is only ever removed by a successful close
+ * stamp, so a re-refusal after the label is present is silent too.
+ *
+ * Fails OPEN: an unreadable thread pages. A duplicate page is cheaper than a stall
+ * nobody hears about, which is the whole fail direction of this guard.
+ */
+async function refusalAlreadyCommented(ticketId, comment) {
+  const banner = String(comment ?? "").split("\n")[0].trim();
+  if (!banner) return false;
+  try {
+    const page = await jiraFetch(
+      `/rest/api/3/issue/${ticketId}/comment?orderBy=-created&maxResults=5`
+    );
+    const recent = Array.isArray(page?.comments) ? page.comments : [];
+    return recent.some((c) => adfToText(c?.body).includes(banner));
+  } catch (err) {
+    console.warn(
+      `[agentcore-hub-jira] ${ticketId}: could not read comments for the refusal dedupe — ${err?.name}`
+    );
+    return false;
+  }
+}
+
+/**
+ * The label half of the admit path, as Jira `update.labels` ops: stamp the
+ * verification, take `gate:awaiting-console` off.
+ *
+ * TEAM-4888: these ops used to ride in the SAME `POST /transitions` request as the
+ * transition. They no longer do — `update.labels` on a transition POST needs the
+ * Labels field on that TRANSITION screen, and a project without it 400s the whole
+ * request atomically, so the ticket never moved and the gate was uncloseable. They
+ * now go out as their own `PUT /issue/{key}` (stampGateLabels) issued BEFORE the
+ * bare transition, and a refused stamp falls back to a comment instead of blocking
+ * the close. What this function plans is unchanged; only who sends it moved.
  *
  * Jira has no arbitrary-field store, so the LABEL is the stamp here (the DynamoDB
  * twin writes the same label plus the structured `gateVerification` map). Only ever
  * removes a label the issue provably carries — a `remove` of an absent label risks a
- * 400 that would fail the whole transition, which is also why every remove uses the
+ * 400 that would lose the whole stamp, which is also why every remove uses the
  * issue's OWN spelling of the label rather than the canonical colon form.
  *
  * TEAM-4750 B2: the CONTRADICTORY stamp is removed too. Adding `gateverify:<result>`
@@ -1712,6 +1765,46 @@ async function reconcileBlockersAndStatus(ticketId, blockers, assignee) {
   return status;
 }
 
+/**
+ * Write the gate verdict's labels in their OWN request (TEAM-4888).
+ *
+ * `update.labels` alongside `transition` on a `POST /transitions` needs the Labels
+ * field on that TRANSITION screen. Real projects do not have it there, and Jira
+ * rejects a request like that ATOMICALLY — so the 400 took the transition down with
+ * it and the gate ticket could not be closed by `done` or by `skip` (TEAM-4876). The
+ * stamp is therefore its own `PUT /issue/{key}`, against the EDIT screen, and can
+ * never block the close.
+ *
+ * ORDER: stamp, then transition. The invariant gate-contract.mjs states — a reader can
+ * never see a closed gate whose verification has not landed — only holds in that order.
+ * The inverse window it opens (stamped, still open) is safe and self-healing: on a
+ * retry planGateLabelOps sees its own stamp in `same` and plans ZERO ops, so the retry
+ * is a bare transition with no stamp attempted at all.
+ *
+ * FAIL DIRECTION: never block the close. A refused stamp is returned, not thrown — the
+ * caller records the verdict as a comment instead and reports it as `stampFailed`.
+ * That matches the guard's own posture everywhere else (admit on anything
+ * indeterminate): an unliftable stall is the dangerous failure here, a close whose
+ * record is a comment rather than a label is not.
+ *
+ * @returns {Promise<string|null>} null on success, else the Jira error message.
+ */
+async function stampGateLabels(ticketId, labelOps) {
+  if (!labelOps.length) return null;
+  try {
+    await jiraFetch(`/rest/api/3/issue/${ticketId}`, {
+      method: "PUT",
+      body: JSON.stringify({ update: { labels: labelOps } }),
+    });
+    return null;
+  } catch (err) {
+    console.warn(
+      `[agentcore-hub-jira] ${ticketId}: gate verdict labels were refused — ${err?.message}`
+    );
+    return String(err?.message || "label update failed");
+  }
+}
+
 async function transitionTicket(params) {
   const { ticket_id, transition_id, reason, blocked_by } = params;
   // DL-024: an agent parks ITS OWN ticket behind the tickets it just filed.
@@ -1810,28 +1903,49 @@ async function transitionTicket(params) {
     throw new Error(`No transition to "${effectiveStatus}" found. Available: ${available}`);
   }
 
-  // TEAM-4739: the verification stamp rides in the SAME request as the transition —
-  // `POST /transitions` accepts `update.labels` alongside `transition` — so a gate
-  // close can never be recorded without the verdict that admitted it, and
-  // `gate:awaiting-console` comes off in the same call rather than in an adjacent one
-  // that could be lost.
+  // TEAM-4739, amended by TEAM-4888: the verification stamp goes out FIRST, in its own
+  // PUT, so a gate close is still never recorded without the verdict that admitted it —
+  // but a stamp Jira refuses (no Labels field on the transition or edit screen) can no
+  // longer take the transition down with it. Placed after the `match` lookup so a
+  // ticket with no Done transition is never stamped for a close that cannot happen.
   const labelOps = gateVerification ? planGateLabelOps(gateLabels, gateVerification) : [];
+  const stampFailed = await stampGateLabels(ticket_id, labelOps);
+  if (stampFailed) {
+    // The verdict still has to be recorded somewhere no screen can refuse. Plain text
+    // on purpose: addComment wraps the string in a single ADF text node, so markdown
+    // would be shown literally. Only fields verifyGateCondition actually returns.
+    try {
+      await addComment({
+        ticket_id,
+        comment:
+          `Gate verified - closing. gate=${gateVerification.gateKind} ` +
+          `result=${gateVerification.result} reason=${gateVerification.reason}. ` +
+          `Labels could not be stamped (${stampFailed}); this comment is the record.`,
+      });
+    } catch (err) {
+      console.warn(
+        `[agentcore-hub-jira] ${ticket_id}: could not comment the gate verdict — ${err?.name}`
+      );
+    }
+  }
+
   await jiraFetch(`/rest/api/3/issue/${ticket_id}/transitions`, {
     method: "POST",
-    body: JSON.stringify({
-      transition: { id: match.id },
-      ...(labelOps.length ? { update: { labels: labelOps } } : {}),
-    }),
+    body: JSON.stringify({ transition: { id: match.id } }),
   });
 
   const finalStatus = isSkip ? "done" : mapStatusToInternal(match.to.name);
   console.log(`[jira-tools] Transitioned ${ticket_id} to ${finalStatus} in Jira${blockers.length ? ` (blocked_by +${blockers.join(",")})` : ""}`);
   return {
+    ok: true,
     ticketId: ticket_id,
     status: finalStatus,
     message: `Transitioned to ${finalStatus}`,
     ...(blockers.length ? { blockedByAdded: blockers } : {}),
     ...(gateVerification ? { gateVerification } : {}),
+    // Never `error`: the hub UI's rejectedDetails and workflow-output's toolFailure
+    // both read that key as "the tool refused", which this is not.
+    ...(stampFailed ? { stampFailed } : {}),
   };
 }
 

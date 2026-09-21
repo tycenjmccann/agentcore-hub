@@ -535,6 +535,18 @@ curl -s -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
 
 > **Note:** This is the only supported workflow configuration. Other Jira workflow setups will not work.
 
+**Screen setup (recommended):**
+
+Put the **Labels** field on the project's **Edit** screen (Project Settings → Issue types → *Task* → the field list). Labels are how the hub records machine-readable state on a ticket: `wf:`, `phase:`, `agent:` and, for the typed-gate guard, `gateverify:<verified|indeterminate>` and `gate:awaiting-console` — all written with `PUT /rest/api/3/issue/{key}`, which uses the Edit screen. Without it the guard degrades but does not stall: a gate close records its verdict as a ticket comment instead and the tool reports `stampFailed`, and a refused gate still gets its console-link comment and `gate.repaged` event.
+
+Labels are **not** required on any transition screen (TEAM-4888: every status change is issued as a bare transition). Verify the Edit screen on any ticket:
+
+```bash
+curl -s -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
+  "https://$JIRA_SITE_URL/rest/api/3/issue/<KEY>/editmeta" | jq -r '.fields | keys[]' | grep labels
+# prints "labels" when the field is on the Edit screen
+```
+
 **Webhook setup** (required for cascade orchestration):
 1. In Jira → Settings → Webhooks → Create webhook
 2. URL: `https://your-deployed-app.com/api/jira/webhook`
