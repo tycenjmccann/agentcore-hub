@@ -505,12 +505,56 @@ export async function invokeProbe(fnName, tool, args) {
 
 // ── The gate-loop verdict ───────────────────────────────────────────────────
 // Priors needed before a re-file is a loop: ONE. FR-2 defines the loop as the
-// SECOND same-triple gate (same gate kind, same blocked_by target, same head) —
-// one prior already proves the agent is re-filing the same environmental gate
-// rather than doing new work, and the prior is still the ticket to work. The
-// third and later attempts are refused SILENTLY: the `gate:loop-broken` epic
-// marker dedupes the event, so the run is paged exactly once.
+// SECOND gate of a kind against the same BINDING — one prior already proves the
+// agent is re-filing the same environmental gate rather than doing new work, and
+// the prior is still the ticket to work. The third and later attempts are refused
+// SILENTLY: the `gate:loop-broken` epic marker dedupes the event, so the run is
+// paged exactly once.
+//
+// WHICH BINDING, per kind (TEAM-4986 — this used to be one rule for all of them,
+// ending in "…or, when neither side carries a binding, the kind alone under one
+// epic", and that last clause is what made the guard wrong):
+//
+//   deploy-approval  the `exec:<id>` label, and NOTHING else. A deploy gate carries
+//                    no `head:` and usually no `blocked_by`, so the kind-alone
+//                    fallback matched every deploy gate under an epic to every
+//                    other one. On run wf_bug_TEAM-4798 that refused the gate for
+//                    execution 7bb31573… against a DONE gate for c33ac06f… — an
+//                    earlier follow-up PR under the same Bug parent — and labelled
+//                    the epic `gate:loop-broken`. Serial CD follow-ups under one
+//                    parent are DIFFERENT deploy decisions; the execution is the
+//                    only thing that says two of them are the same decision.
+//   blocker /        the `head:` SHA when BOTH sides carry one, otherwise an
+//   ci-unavailable   overlapping `blocked_by` set. Never merely the same parent
+//                    and kind.
+//
+// And for every kind: a SETTLED sibling is never a prior. The refusal's whole
+// remedy is "work the existing ticket", which does not exist on a closed one, so
+// counting an answered gate can only wedge the run.
 export const GATE_LOOP_THRESHOLD = 1;
+
+/**
+ * The statuses that mean a gate has been ANSWERED (TEAM-4986). In the INTERNAL
+ * spelling both twins' `scanSiblingTickets` already hand over: the DynamoDB twin
+ * copies the row's `status` verbatim, and the jira twin maps Jira's display name
+ * through `mapStatusToInternal` ("Done" → `done`; "Closed" / "Cancelled" reach
+ * `closed` / `cancelled` through its lowercase fallback).
+ *
+ * Deliberately a SUPERSET of each twin's private `isSettled` (done|closed), which
+ * answers a different question — "does this CD ticket still freeze new work?" —
+ * and stays where it is. This one lives in the shared contract because both twins
+ * must reach the same verdict about the same sibling.
+ */
+export const GATE_SETTLED_STATUSES = ["done", "closed", "skipped", "cancelled"];
+
+/** Has this gate been answered? Unreadable/absent status ⇒ treated as still open. */
+export function isSettledGateStatus(status) {
+  return GATE_SETTLED_STATUSES.includes(
+    String(status ?? "")
+      .trim()
+      .toLowerCase()
+  );
+}
 
 function idList(v) {
   const list = Array.isArray(v) ? v : typeof v === "string" ? v.split(",") : [];
@@ -518,7 +562,7 @@ function idList(v) {
 }
 
 /**
- * Is this new gate ticket the second of its kind against the same target?
+ * Is this new gate ticket the second of its kind against the same binding?
  *
  * PURE, and the reason the verdict lives here rather than in either twin: the two
  * providers cannot gather siblings the same way (the DynamoDB twin queries
@@ -527,10 +571,19 @@ function idList(v) {
  * but they MUST refuse identically. Each twin gathers in its own idiom and hands
  * the rows here.
  *
- * @param {Array<{id?:string, key?:string, labels?:string[]|string, blockedBy?:string[]|string}>} siblings
- *   the epic's other children
- * @param {{gateKind?:string, blockedBy?:string[]|string, head?:string}} opts  the
- *   NEW ticket's gate kind and target
+ * See the GATE_LOOP_THRESHOLD comment above for which binding each kind is keyed
+ * on, and why the old parent + kind fallback had to go (TEAM-4986).
+ *
+ * @param {Array<{id?:string, key?:string, ticketId?:string, status?:string,
+ *                labels?:string[]|string, blockedBy?:string[]|string}>} siblings
+ *   the epic's other children. `status` is the INTERNAL form (see
+ *   GATE_SETTLED_STATUSES); a settled sibling is skipped for every kind.
+ * @param {{gateKind?:string, blockedBy?:string[]|string, head?:string,
+ *          execId?:string}} opts  the NEW ticket's gate kind and BINDINGS, read
+ *   from its own labels by the caller (gateHeadOf / gateExecOf). An absent binding
+ *   matches NOTHING rather than everything — for a deploy-approval gate the loop
+ *   seam runs before gateShapeRefusal, which is what refuses an unbound one a
+ *   moment later.
  * @returns {{loop:boolean, priorCount:number, priors:string[], reason:string|null}}
  */
 export function gateLoopVerdict(siblings, opts = {}) {
@@ -541,20 +594,31 @@ export function gateLoopVerdict(siblings, opts = {}) {
   const head = String(opts.head || "")
     .trim()
     .toLowerCase();
+  const execId = String(opts.execId || "")
+    .trim()
+    .toLowerCase();
   const out = { loop: false, priorCount: 0, priors: [], reason: null };
   if (!GATE_KINDS.includes(gateKind)) return out;
 
   for (const s of Array.isArray(siblings) ? siblings : []) {
     if (!s) continue;
     if (!gateKindsOf(s.labels).includes(gateKind)) continue;
-    // Same TARGET, read three ways because not every gate has every binding:
-    // the same head SHA, an overlapping blocked_by set, or — when neither side
-    // carries any binding at all — the kind alone under one epic.
-    const sib = idList(s.blockedBy);
-    const sameHead = Boolean(head) && gateHeadOf(s.labels) === head;
-    const sharesTarget = blockedBy.length > 0 && sib.some((b) => blockedBy.includes(b));
-    const untargeted = !head && blockedBy.length === 0 && sib.length === 0;
-    if (!sameHead && !sharesTarget && !untargeted) continue;
+    // An ANSWERED gate is not a gate still being asked, whatever it is bound to.
+    if (isSettledGateStatus(s.status)) continue;
+
+    if (gateKind === "deploy-approval") {
+      // The pipeline execution, and only it: not the head, not the blocked_by
+      // target, and never the kind alone.
+      if (!execId || gateExecOf(s.labels) !== execId) continue;
+    } else {
+      const sibHead = gateHeadOf(s.labels);
+      if (head && sibHead) {
+        // Both sides name a commit, so the commit decides.
+        if (sibHead !== head) continue;
+      } else if (!blockedBy.length || !idList(s.blockedBy).some((b) => blockedBy.includes(b))) {
+        continue;
+      }
+    }
     out.priors.push(String(s.id || s.key || s.ticketId || ""));
   }
 

@@ -577,8 +577,13 @@ function planGateLabelWrite(item, verification) {
 /**
  * Refuse a SECOND gate ticket of the same kind against the same target under one
  * epic — the environmental loop that has an agent re-filing "CI is unavailable"
- * forever instead of starting a build. FR-2: one prior of the same triple already
- * proves the re-file is the same environmental gate restated, not new work.
+ * forever instead of starting a build. FR-2: one OPEN prior sharing this gate's own
+ * binding already proves the re-file is the same environmental gate restated.
+ *
+ * What "the same target" means is per kind, and gateLoopVerdict owns the rule
+ * (TEAM-4986): a deploy-approval gate is keyed on its `exec:<id>` and nothing else,
+ * the rest on `head:` or an overlapping blocked_by. Never the parent and kind alone,
+ * and never a sibling that has already been answered.
  *
  * Narrowed to PROBED_GATE_KINDS: a `gate:approval` human escalation is deliberately
  * RE-FILED when a round cap trips, so counting those as a loop would break the one
@@ -613,8 +618,12 @@ async function refuseGateLoop({ labels, blockedBy, parentId }) {
     return textResult(`Error: ${siblingScanRefusal(parentId, err.message)}`);
   }
 
+  // The NEW ticket's own bindings. `execId` is what keys a deploy-approval gate
+  // (TEAM-4986) — without it the verdict fell back to the kind alone and refused a
+  // legitimate gate for a second pipeline execution under the same parent.
   const head = gateHeadOf(labels);
-  const verdict = gateLoopVerdict(siblings, { gateKind, blockedBy, head });
+  const execId = gateExecOf(labels);
+  const verdict = gateLoopVerdict(siblings, { gateKind, blockedBy, head, execId });
   if (!verdict.loop) return null;
 
   // Only now is the epic worth reading — it carries the workflowId the event needs
@@ -650,6 +659,9 @@ async function refuseGateLoop({ labels, blockedBy, parentId }) {
       gateKind,
       blockedByTicketId: refusal.payload.existingTicketId,
       head: head || "",
+      // The binding that WAS the verdict, alongside `head` (TEAM-4986): a deploy
+      // gate has no head, so without this the page cannot say what looped.
+      exec: execId || "",
       attempt: verdict.priorCount + 1,
     });
   }
@@ -1001,8 +1013,12 @@ function isSettled(status) {
  * gate predicate is defined in terms of labels, so the formatter cannot answer it.
  *
  * TEAM-4780: `blockedBy` is carried too, because refuseGateLoop shares this scan
- * and blocked_by overlap is one of the three ways gateLoopVerdict recognizes the
- * same target. Additive — none of the freeze predicates read it.
+ * and blocked_by overlap is one of the ways gateLoopVerdict recognizes the same
+ * target. Additive — none of the freeze predicates read it.
+ *
+ * TEAM-4986: `status` matters to that verdict too — an ANSWERED gate is never a
+ * prior — and this twin's rows already hold the internal form, which is what the
+ * shared contract's isSettledGateStatus() is written against.
  *
  * THROWS on a failed scan. Both callers refuse the create (siblingScanRefusal);
  * the fail direction lives with them, not here.

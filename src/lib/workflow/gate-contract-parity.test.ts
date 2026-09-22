@@ -230,10 +230,14 @@ describe("gateLoopVerdict — the second gate of a kind against one target", () 
     ).toEqual({ loop: false, priorCount: 0, priors: [], reason: null });
   });
 
-  it("counts untargeted siblings only when neither side carries a binding", () => {
+  it("parent + kind alone is NEVER a loop (TEAM-4986)", () => {
+    // This used to count as the loop: neither side carried a binding, so the kind
+    // alone under one epic was the whole match. That is what refused a legitimate
+    // deploy-approval gate for a SECOND pipeline execution under one Bug parent —
+    // serial CD follow-ups are different targets, not a re-file of the same one.
     const untargeted = [{ id: "T-1", labels: ["gate:blocker"] }, { id: "T-2", labels: ["gate-blocker"] }];
     expect(agree("both unbound", (m) => m.gateLoopVerdict(untargeted, { gateKind: "blocker" })))
-      .toMatchObject({ loop: true, priorCount: 2 });
+      .toMatchObject({ loop: false, priorCount: 0 });
     // The NEW ticket names a target, the priors do not: not the same gate.
     expect(
       agree("new one targeted", (m) =>
@@ -258,6 +262,158 @@ describe("gateLoopVerdict — the second gate of a kind against one target", () 
 
   it("the threshold itself agrees (the 2nd attempt refuses)", () => {
     expect(agree("GATE_LOOP_THRESHOLD", (m) => m.GATE_LOOP_THRESHOLD)).toBe(1);
+  });
+});
+
+/**
+ * TEAM-4986 — the binding that makes two deploy gates the SAME gate.
+ *
+ * A `gate:deploy-approval` ticket carries no `head:` and usually no `blocked_by`, so
+ * under the old three-way match ("same head, or overlapping blocked_by, or — when
+ * neither side carries either — the kind alone") every deploy gate under one epic
+ * matched every other one. On run wf_bug_TEAM-4798 that refused the gate for
+ * execution 7bb31573… against a DONE gate for execution c33ac06f…, and labelled the
+ * epic `gate:loop-broken`. Serial CD follow-ups under one parent each legitimately
+ * need their own deploy-approval gate.
+ *
+ * The rule: one OPEN sibling carrying the SAME `exec:<id>`, and nothing else.
+ */
+describe("gateLoopVerdict — a deploy gate is keyed on exec:<id> (TEAM-4986)", () => {
+  const EXEC_A = "c33ac06f-b684-4d0a-b486-d8f812020022";
+  const EXEC_B = "7bb31573-3917-49aa-898e-c132c9bc5ad6";
+  const SHA = "e".repeat(40);
+  /** A deploy gate as the row actually holds it (sanitizeUserLabels' hyphen form). */
+  const gate = (id: string, exec: string, status: string, extra: string[] = []) => ({
+    id,
+    status,
+    labels: ["gate-deploy-approval", "pipeline-hub-juno-deploy", `exec-${exec}`, ...extra],
+  });
+  const ask = (exec: string | undefined, extra: Record<string, unknown> = {}) => ({
+    gateKind: "deploy-approval",
+    ...(exec ? { execId: exec } : {}),
+    ...extra,
+  });
+
+  it("a DONE gate for exec A is not the prior of a request for exec B", () => {
+    expect(
+      agree("done A vs new B", (m) => m.gateLoopVerdict([gate("TEAM-4979", EXEC_A, "done")], ask(EXEC_B)))
+    ).toEqual({ loop: false, priorCount: 0, priors: [], reason: null });
+  });
+
+  it("an OPEN gate for exec A is not the prior of a request for exec B", () => {
+    expect(
+      agree("open A vs new B", (m) =>
+        m.gateLoopVerdict([gate("TEAM-4979", EXEC_A, "in_review")], ask(EXEC_B))
+      )
+    ).toEqual({ loop: false, priorCount: 0, priors: [], reason: null });
+  });
+
+  it("an OPEN gate for exec A IS the prior of a request for exec A", () => {
+    expect(
+      agree("open A vs new A", (m) =>
+        m.gateLoopVerdict([gate("TEAM-4979", EXEC_A, "in_review")], ask(EXEC_A))
+      )
+    ).toEqual({
+      loop: true,
+      priorCount: 1,
+      priors: ["TEAM-4979"],
+      reason: "gate_loop_environmental",
+    });
+  });
+
+  it("a DONE gate for exec A is not a loop even for a request for exec A", () => {
+    // A gate that has been ANSWERED is not a gate that is still being asked. The
+    // remedy the refusal names ("work the existing ticket") does not exist for a
+    // closed ticket, so refusing here can only wedge the run.
+    expect(
+      agree("done A vs new A", (m) =>
+        m.gateLoopVerdict([gate("TEAM-4979", EXEC_A, "done")], ask(EXEC_A))
+      )
+    ).toEqual({ loop: false, priorCount: 0, priors: [], reason: null });
+  });
+
+  it("never head, never blocked_by, never kind alone", () => {
+    const siblings = [
+      // Same head AND an overlapping blocked_by, but a different execution.
+      gate("TEAM-1", EXEC_A, "in_review", [`head-${SHA}`]),
+      // No exec binding at all: unmatchable, not a wildcard.
+      { id: "TEAM-2", status: "in_review", labels: ["gate-deploy-approval"], blockedBy: ["TEAM-500"] },
+    ];
+    expect(
+      agree("other bindings are not the exec", (m) =>
+        m.gateLoopVerdict(siblings, ask(EXEC_B, { head: SHA, blockedBy: ["TEAM-500"] }))
+      )
+    ).toEqual({ loop: false, priorCount: 0, priors: [], reason: null });
+  });
+
+  it("a request with NO exec binding counts nothing", () => {
+    // The loop seam runs before gateShapeRefusal, which is what refuses an unbound
+    // deploy gate a moment later. Until then there is no target to compare, so there
+    // is no prior — an absent binding must not match everything.
+    expect(
+      agree("unbound request", (m) =>
+        m.gateLoopVerdict([gate("TEAM-4979", EXEC_A, "in_review")], ask(undefined))
+      )
+    ).toEqual({ loop: false, priorCount: 0, priors: [], reason: null });
+  });
+
+  it("the exec binding is read in both label spellings and case-insensitively", () => {
+    for (const label of [`exec:${EXEC_A}`, `exec-${EXEC_A}`, `EXEC:${EXEC_A.toUpperCase()}`]) {
+      expect(
+        agree(`spelling ${label}`, (m) =>
+          m.gateLoopVerdict(
+            [{ id: "TEAM-4979", status: "in_review", labels: ["gate:deploy-approval", label] }],
+            ask(EXEC_A)
+          )
+        ),
+        label
+      ).toMatchObject({ loop: true, priors: ["TEAM-4979"] });
+    }
+  });
+});
+
+describe("isSettledGateStatus — an answered gate is never a prior (TEAM-4986)", () => {
+  it("the settled set agrees, and is the four terminal spellings", () => {
+    expect(agree("GATE_SETTLED_STATUSES", (m) => m.GATE_SETTLED_STATUSES)).toEqual([
+      "done",
+      "closed",
+      "skipped",
+      "cancelled",
+    ]);
+  });
+
+  it.each(["done", "closed", "skipped", "cancelled", "Done", " done ", "CANCELLED"])(
+    "%j is settled",
+    (status) => {
+      expect(agree(`settled ${status}`, (m) => m.isSettledGateStatus(status))).toBe(true);
+    }
+  );
+
+  it.each(["", "todo", "ready", "in_progress", "in_review", "blocked", "doneish"])(
+    "%j is NOT settled",
+    (status) => {
+      expect(agree(`open ${status}`, (m) => m.isSettledGateStatus(status))).toBe(false);
+    }
+  );
+
+  it("junk is not settled (a status we cannot read is not an answered gate)", () => {
+    for (const junk of [undefined, null, 0, {}, []]) {
+      expect(agree(`junk ${JSON.stringify(junk)}`, (m) => m.isSettledGateStatus(junk))).toBe(false);
+    }
+  });
+
+  it("excludes a settled sibling for EVERY kind, not just deploy-approval", () => {
+    const head = "f".repeat(40);
+    const done = [{ id: "T-1", status: "done", labels: ["gate-ci-unavailable", `head-${head}`] }];
+    expect(
+      agree("done ci sibling", (m) => m.gateLoopVerdict(done, { gateKind: "ci-unavailable", head }))
+    ).toMatchObject({ loop: false, priorCount: 0 });
+    const doneBlocker = [{ id: "T-1", status: "closed", labels: ["gate-blocker"], blockedBy: ["T-9"] }];
+    expect(
+      agree("closed blocker sibling", (m) =>
+        m.gateLoopVerdict(doneBlocker, { gateKind: "blocker", blockedBy: ["T-9"] })
+      )
+    ).toMatchObject({ loop: false, priorCount: 0 });
   });
 });
 

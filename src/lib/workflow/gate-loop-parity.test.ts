@@ -214,12 +214,35 @@ interface Scenario {
   description?: string;
   blocked_by?: string | string[];
   parent_key?: string;
-  /** DynamoDB sibling rows / Jira sibling issues, described once. */
-  siblings?: Array<{ id: string; labels: string[]; blockedBy?: string[] }>;
+  /**
+   * DynamoDB sibling rows / Jira sibling issues, described once. `status` is the
+   * INTERNAL form (TEAM-4986) — the DynamoDB row carries it verbatim, and the Jira
+   * seeder maps it back to the display name Jira would return, so the round trip
+   * through mapStatusToInternal is exercised rather than assumed. Absent ⇒ open.
+   */
+  siblings?: Array<{ id: string; labels: string[]; blockedBy?: string[]; status?: string }>;
   epicLabels?: string[];
   caps?: unknown;
   scanFails?: boolean;
 }
+
+/**
+ * A Scenario's INTERNAL sibling status, as the display name Jira would actually
+ * return — the jira twin's scanSiblingTickets maps it back with mapStatusToInternal,
+ * so seeding "Done" here is what proves that map lands on `done` (TEAM-4986).
+ */
+const JIRA_STATUS_NAME: Record<string, string> = {
+  todo: "To Do",
+  ready: "Ready",
+  in_progress: "In Progress",
+  in_review: "In Review",
+  blocked: "Blocked",
+  done: "Done",
+  closed: "Closed",
+  skipped: "Skipped",
+  cancelled: "Cancelled",
+};
+const jiraStatusName = (internal?: string) => JIRA_STATUS_NAME[String(internal || "todo")] ?? "To Do";
 
 interface Run {
   refused: boolean;
@@ -248,6 +271,7 @@ async function runTickets(scn: Scenario): Promise<Run> {
     ticketId: s.id,
     labels: s.labels,
     ...(s.blockedBy ? { blockedBy: s.blockedBy } : {}),
+    ...(s.status ? { status: s.status } : {}),
   }));
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const res: any = await ticketsHandler({
@@ -285,7 +309,7 @@ async function runJira(scn: Scenario): Promise<Run> {
     key: s.id,
     fields: {
       summary: "prior gate",
-      status: { name: "To Do" },
+      status: { name: jiraStatusName(s.status) },
       labels: s.labels,
       issuelinks: (s.blockedBy || []).map((b) => ({ type: { name: "Blocks" }, inwardIssue: { key: b } })),
     },
@@ -464,6 +488,20 @@ describe("refuseGateLoop — the second identical gate is not new work", () => {
     expect((await runJira(scn)).refused, "jira").toBe(false);
   });
 
+  it("parent + kind alone is not a loop — the binding is the target (TEAM-4986)", async () => {
+    // The removed `untargeted` fallback: two unbound blocker gates under one epic
+    // used to be the loop on the strength of the kind alone.
+    const scn: Scenario = {
+      labels: ["gate:blocker"],
+      siblings: [
+        { id: "TEAM-800", labels: ["gate-blocker"] },
+        { id: "TEAM-810", labels: ["gate-blocker"] },
+      ],
+    };
+    expect((await runTickets(scn)).refused, "dynamodb").toBe(false);
+    expect((await runJira(scn)).refused, "jira").toBe(false);
+  });
+
   it("a non-gate ticket is not scanned at all", async () => {
     const scn: Scenario = { labels: ["needs-docs"], siblings: [prior("TEAM-800"), prior("TEAM-810")] };
     expect((await runTickets(scn)).refused).toBe(false);
@@ -578,6 +616,139 @@ describe("refuseGateLoop — the second identical gate is not new work", () => {
     });
     expect(res.reason).toBe("gate_loop_environmental");
     expect(h.jira.writes.filter((w) => w.path === "/rest/api/3/issue")).toHaveLength(0);
+  });
+});
+
+/**
+ * TEAM-4986 — deploy gates, through both real handlers.
+ *
+ * Run wf_bug_TEAM-4798: `Tickets___create_ticket` refused a `gate:deploy-approval`
+ * for pipeline execution 7bb31573… because a DONE gate for execution c33ac06f… (an
+ * earlier follow-up PR under the same Bug parent) existed as a sibling, and stamped
+ * `gate:loop-broken` on the epic. A deploy gate carries no `head:` and no
+ * `blocked_by`, so the old "kind alone under one epic" fallback matched every deploy
+ * gate to every other one.
+ *
+ * Serial CD follow-ups under one parent are DIFFERENT deploy decisions. The only
+ * thing that makes two of them the same gate is the `exec:<id>` binding, and only
+ * while the prior is still OPEN — the refusal's whole remedy is "work the existing
+ * ticket", which is not available on a closed one.
+ *
+ * Every row runs through both twins: what refuses a run must not depend on which
+ * ticket provider is deployed.
+ */
+describe("deploy-approval gates are keyed on exec:<id> (TEAM-4986)", () => {
+  const CAPS = { ok: true, approveDeploy: false, version: 4 };
+  const EXEC_A = "c33ac06f-b684-4d0a-b486-d8f812020022";
+  const EXEC_B = "7bb31573-3917-49aa-898e-c132c9bc5ad6";
+
+  /** The request, fully shaped, so the loop seam is the only thing that can refuse. */
+  const ask = (exec: string, siblings: Scenario["siblings"]): Scenario => ({
+    labels: ["gate:approval", "gate:deploy-approval", `pipeline:${PIPELINE}`, `exec:${exec}`],
+    description: `Approve the production deploy.\n\nConsole: ${CONSOLE}`,
+    caps: CAPS,
+    siblings,
+  });
+  const gate = (id: string, exec: string, status: string) => ({
+    id,
+    status,
+    labels: ["gate-approval", "gate-deploy-approval", `pipeline-${PIPELINE}`, `exec-${exec}`],
+  });
+
+  /** Created, and — the part that actually wedged the run — no marker and no page. */
+  async function expectCreated(scn: Scenario) {
+    const t = await runTickets(scn);
+    const j = await runJira(scn);
+    for (const [who, run] of [["dynamodb", t], ["jira", j]] as Array<[string, Run]>) {
+      expect(run.refused, `${who} creates`).toBe(false);
+      expect(run.epicLabels, `${who} leaves the epic unmarked`).not.toContain("gate:loop-broken");
+      expect(run.events, `${who} pages nobody`).toHaveLength(0);
+    }
+    expect(h.ddb.created, "one ticket row").toHaveLength(1);
+    return { t, j };
+  }
+
+  it("a DONE gate for exec A, a new request for exec B ⇒ created", async () => {
+    // The exact incident. Two independent reasons it is not a loop, and the row
+    // exercises both: a different execution, and a prior that is already answered.
+    await expectCreated(ask(EXEC_B, [gate("TEAM-4979", EXEC_A, "done")]));
+  });
+
+  it("an OPEN gate for exec A, a new request for exec B ⇒ created", async () => {
+    // The narrower half: the prior is genuinely open, but it is open on a DIFFERENT
+    // deploy decision, so it is not the ticket to work for this one.
+    await expectCreated(ask(EXEC_B, [gate("TEAM-4979", EXEC_A, "in_review")]));
+  });
+
+  it("an OPEN gate for exec A, a new request for exec A ⇒ refused + loop-broken", async () => {
+    // The loop the breaker exists for: the same human decision asked twice.
+    const scn = ask(EXEC_A, [gate("TEAM-4979", EXEC_A, "in_review")]);
+    const t = await runTickets(scn);
+    const j = await runJira(scn);
+
+    expect(t.payload).toEqual({
+      ok: false,
+      reason: "gate_loop_environmental",
+      existingTicketId: "TEAM-4979",
+    });
+    expect(j.payload, "payload parity").toEqual(t.payload);
+    expect(j.message, "message parity").toBe(t.message);
+    expect(t.message).toContain("Work the existing ticket TEAM-4979");
+    expect(h.ddb.created, "no second gate ticket").toHaveLength(0);
+
+    for (const [who, run] of [["dynamodb", t], ["jira", j]] as Array<[string, Run]>) {
+      expect(run.epicLabels, `${who} marks the epic`).toContain("gate:loop-broken");
+      expect(run.events.map((e) => e.type), `${who} pages once`).toEqual(["workflow.blocked"]);
+      expect(run.events[0]).toMatchObject({
+        workflowId: "wf_1",
+        detail: {
+          reason: "environmental",
+          gateKind: "deploy-approval",
+          blockedByTicketId: "TEAM-4979",
+          // The binding that WAS the verdict, on the page — `head` is empty for a
+          // deploy gate, so without this the event cannot say what looped.
+          exec: EXEC_A,
+          head: "",
+          attempt: 2,
+        },
+      });
+    }
+  });
+
+  it("a DONE gate for exec A, a new request for exec A ⇒ created", async () => {
+    // A Done gate is ANSWERED, not looping. The human already decided; a genuine
+    // re-ask for the same execution (a re-run, a re-deploy) needs its own ticket,
+    // and "work the existing ticket TEAM-4979" would point at a closed one.
+    await expectCreated(ask(EXEC_A, [gate("TEAM-4979", EXEC_A, "done")]));
+  });
+
+  it.each(["closed", "skipped", "cancelled"])(
+    "a %s gate for exec A is not a prior either",
+    async (status) => {
+      await expectCreated(ask(EXEC_A, [gate("TEAM-4979", EXEC_A, status)]));
+    }
+  );
+
+  it("an OPEN deploy gate with NO exec label is never a prior", async () => {
+    // An absent binding must not match everything — that is the bug in one line.
+    await expectCreated(
+      ask(EXEC_B, [{ id: "TEAM-4979", status: "in_review", labels: ["gate-deploy-approval"] }])
+    );
+  });
+
+  it("neither a shared blocked_by nor a shared head makes two deploy gates one", async () => {
+    const scn: Scenario = {
+      ...ask(EXEC_B, [
+        {
+          id: "TEAM-4979",
+          status: "in_review",
+          labels: ["gate-deploy-approval", `exec-${EXEC_A}`, `head-${SHA}`],
+          blockedBy: ["TEAM-500"],
+        },
+      ]),
+      blocked_by: ["TEAM-500"],
+    };
+    await expectCreated(scn);
   });
 });
 
@@ -717,9 +888,13 @@ describe("validateGateTicketShape — a deploy gate a human can act on", () => {
       description: "no link here",
       caps: CAPS,
       blocked_by: ["TEAM-500"],
+      // TEAM-4986: the priors must carry the SAME `exec:` as the request, which is
+      // now the only thing that makes two deploy gates the same gate. The shared
+      // blocked_by target is no longer what decides (and on its own would make this
+      // a create, quietly turning this row into a test of the shape seam instead).
       siblings: [
-        { id: "TEAM-800", labels: ["gate-deploy-approval"], blockedBy: ["TEAM-500"] },
-        { id: "TEAM-810", labels: ["gate-deploy-approval"], blockedBy: ["TEAM-500"] },
+        { id: "TEAM-800", labels: ["gate-deploy-approval", `exec-${EXEC}`], blockedBy: ["TEAM-500"] },
+        { id: "TEAM-810", labels: ["gate-deploy-approval", `exec-${EXEC}`], blockedBy: ["TEAM-500"] },
       ],
     };
     const t = await runTickets(scn);
