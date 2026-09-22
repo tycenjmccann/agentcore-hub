@@ -1288,6 +1288,73 @@ const DEPLOY_GATE_ASK =
 const DEPLOY_GATE_TERSE =
   "The build passed every gate and is waiting on you to ship it to prod.";
 
+// ─── One page per deploy execution ───────────────────────────────────────────
+// Two paths can page the SAME production-deploy decision: the pipeline poller
+// (scanDeployApprovalsForTarget, dok/dno) and a `gate:deploy-approval` ticket
+// (scanReviewGates, gok/gno). TEAM-4706 made the ticket's ✅ really approve the
+// pipeline, but both cards still went out for every deploy (2026-09-22: TEAM-4977
+// two minutes after the poller's page, TEAM-4979 three minutes after). Whichever
+// path pages first records it here, keyed by the EXECUTION; the other sees the
+// row and stays quiet. Either card's tap closes both: the poller's ✅ settles the
+// wait, and closeSettledDeployGate then closes the ticket with that verdict; the
+// ticket's ✅ approves the pipeline itself. A ❌ on the poller's card is NOT
+// covered on purpose — the ticket then pages as usual, so the human still
+// decides the rework half. TTL matches the claim rows it arbitrates between.
+const EXEC_PAGED_PREFIX = "paged#";
+
+function execPagedKey(pipeline, executionId) {
+  const p = String(pipeline || "").trim();
+  const e = String(executionId || "").trim();
+  return p && e ? `${EXEC_PAGED_PREFIX}${p}#${e}` : null;
+}
+
+/** Record which path paged this execution. Best-effort, never throws. */
+async function recordExecPaged(pipeline, executionId, by, ref = "") {
+  const id = execPagedKey(pipeline, executionId);
+  if (!id) return false;
+  try {
+    await ddb.send(new PutItemCommand({
+      TableName: PENDING_TABLE,
+      Item: {
+        id: { S: id },
+        by: { S: by },
+        ...(ref ? { ref: { S: String(ref) } } : {}),
+        pagedAt: { N: String(Date.now()) },
+        ttl: { N: String(Math.floor(Date.now() / 1000) + DEPLOY_CLAIM_TTL_SEC) },
+      },
+    }));
+    return true;
+  } catch (err) {
+    console.warn(`[telegram-bug-intake] exec-paged write ${id}: ${err.message}`);
+    return false;
+  }
+}
+
+/** "pipeline" | "ticket" | null — who already paged this execution. Never throws. */
+async function execPagedBy(pipeline, executionId) {
+  const id = execPagedKey(pipeline, executionId);
+  if (!id) return null;
+  try {
+    const { Item } = await ddb.send(new GetItemCommand({ TableName: PENDING_TABLE, Key: { id: { S: id } } }));
+    const by = Item?.by?.S;
+    return by === "pipeline" || by === "ticket" ? by : null;
+  } catch (err) {
+    console.warn(`[telegram-bug-intake] exec-paged read ${id}: ${err.message}`);
+    return null;
+  }
+}
+
+// The run title is every gate page's subject (TEAM-4660: a gate ticket's prose
+// is never rendered). Sibling gates on one run then read identically — three
+// merge gates under Bug TEAM-4798 on 2026-09-22 (PR #618, #620, #621) looked like
+// the same page sent three times. A PR NUMBER is not prose: lift it from the
+// ticket title so the human can tell which PR this card is about.
+function gateSubjectFor(wf, gateTicket) {
+  const base = oneLine(wf?.input?.title || wf?.workflowId || "");
+  const m = /\bPR\s*#(\d+)\b/i.exec(String(gateTicket?.title || ""));
+  return m ? `${base} · PR #${m[1]}` : base;
+}
+
 // ─── The local decision ledger (SEC-9) ───────────────────────────────────────
 // ONE writer (recordGateApproved) and ONE reader (wasGateApprovedLocally) over
 // two key shapes, both rows in PENDING_TABLE:
@@ -2113,7 +2180,7 @@ async function repageIfWindowOpened(wf, notif, w) {
       label: page ? page.label : "business-hours reminder",
       gateKind: reminderKind,
       repage: true,
-      subject: handoff ? handoff.subject : (wf.input?.title || wf.workflowId),
+      subject: handoff ? handoff.subject : gateSubjectFor(wf, gateTicket),
       summary: page ? page.summary : "Sent for review outside working hours and still open — your window is open now.",
       bullets: handoff ? handoff.bullets : [],
       bulletsLabel: handoff ? handoff.bulletsLabel : undefined,
@@ -2243,7 +2310,7 @@ async function repageAwaitingConsole(wf, notif, w) {
       label: page.label,
       gateKind: isDeploy ? "deploy-pipeline-reminder" : gateKindFor(notif.gate, title, gateTicket),
       repage: false,
-      subject: wf.input?.title || wf.workflowId,
+      subject: gateSubjectFor(wf, gateTicket),
       summary: page.summary,
       attempt,
       previousIssue,
@@ -2283,21 +2350,34 @@ async function repageAwaitingConsole(wf, notif, w) {
  * (TEAM-4907 / TEAM-4920, 2026-09-21: both deploys shipped while their gates
  * sat in `in_review` for hours). Takes the ticket its caller already read, so it
  * costs no extra /tickets fetch; one GetPipelineState, the same read the
- * pipeline's own page pays. Never throws; false = "page as usual".
+ * pipeline's own page pays — read once by settledDeployGateVerdict and shared
+ * with the one-page-per-execution check below. Never throws; false = "page as
+ * usual".
  */
-async function closeSettledDeployGate(wf, notif, gateTicket) {
+async function settledDeployGateVerdict(gateTicket) {
   try {
-    if (!gateTicket || isTicketDone(gateTicket)) return false;
+    if (!gateTicket || isTicketDone(gateTicket)) return null;
     const labels = parseDeployApprovalLabels(gateTicket.labels);
-    if (!labels.isDeployApproval || !labels.executionId) return false;
+    if (!labels.isDeployApproval || !labels.executionId) return null;
     const deploy = await deployApprovalGate(gateTicket);
     const target = deploy?.target;
-    if (!target) return false;
+    if (!target) return null;
     const cp = codepipelineFor(target.region, target.roleArn, target.externalId);
     const state = await cp.send(new GetPipelineStateCommand({ name: target.pipeline }));
-    if (settledApproval(state, labels.executionId) !== "Approved") return false;
+    return { deploy, executionId: labels.executionId, verdict: settledApproval(state, labels.executionId) };
+  } catch (err) {
+    console.warn(`[telegram-bug-intake] settled-deploy-gate check for ${gateTicket?.ticketId}: ${err.message}`);
+    return null;
+  }
+}
+
+async function closeSettledDeployGate(wf, notif, gateTicket, settled = undefined) {
+  try {
+    const s = settled === undefined ? await settledDeployGateVerdict(gateTicket) : settled;
+    if (!s || s.verdict !== "Approved") return false;
+    const target = s.deploy.target;
     const out = await transitionGateAfterDecision(wf.workflowId, notif.ticketId, "done",
-      `Approved on the pipeline ${target.pipeline} (execution ${labels.executionId}) outside this gate - closing the gate`);
+      `Approved on the pipeline ${target.pipeline} (execution ${s.executionId}) outside this gate - closing the gate`);
     if (out.error) {
       console.warn(`[telegram-bug-intake] deploy gate ${notif.ticketId}: pipeline already approved but the close was refused: ${out.error.detail || out.error.message}`);
       return false;
@@ -2390,7 +2470,8 @@ async function scanReviewGates() {
       const { gateTicket, tickets: allTickets } = await gateTicketOf(wf, notif);
       // The pipeline already holds this gate's verdict: close it with that and
       // keep the claim as delivered, so nothing pages a decided question.
-      if (await closeSettledDeployGate(wf, notif, gateTicket)) {
+      const settled = await settledDeployGateVerdict(gateTicket);
+      if (await closeSettledDeployGate(wf, notif, gateTicket, settled)) {
         await markPingDelivered(gateClaimKey(notif)).catch(() => {});
         continue;
       }
@@ -2411,7 +2492,18 @@ async function scanReviewGates() {
       // pipeline (handleGateCallback). Both are best-effort: neither the target
       // lookup nor the brief throws, so a registry/GitHub/CodePipeline hiccup
       // still pages the human with today's plain gate content.
-      const deploy = await deployApprovalGate(gateTicket);
+      const deploy = settled?.deploy ?? await deployApprovalGate(gateTicket);
+      // One page per execution: the pipeline's own 🚀 card already asked this
+      // question. Keep the claim as delivered and stay quiet — the poller's ✅
+      // settles the wait and the next scan closes this gate with that verdict
+      // (closeSettledDeployGate). A ❌ there is a verdict too, but a rework one:
+      // the ticket then pages as usual so the human still closes it.
+      if (deploy?.executionId && settled?.verdict !== "Rejected"
+        && (await execPagedBy(deploy.target?.pipeline, deploy.executionId)) === "pipeline") {
+        await markPingDelivered(gateClaimKey(notif)).catch(() => {});
+        console.log(`[telegram-bug-intake] deploy gate ${notif.ticketId}: the pipeline's own page already asked about ${deploy.target?.pipeline} execution ${deploy.executionId} - not paging a second card`);
+        continue;
+      }
       const brief = deploy ? await deployApprovalBrief(deploy) : null;
       // WHAT is being reviewed: the upstream work this gate blocks on, else the
       // work the run has already landed a PR for. Never the gate's own prose.
@@ -2481,7 +2573,7 @@ async function scanReviewGates() {
         gateKind,
         subject: handoff
           ? handoff.subject
-          : (brief && (brief.prTitle || brief.commitSubject)) || wf.input?.title || wf.workflowId,
+          : (brief && (brief.prTitle || brief.commitSubject)) || gateSubjectFor(wf, gateTicket),
         // With a brief the subject already names the PR/commit; the upstream
         // titles would only repeat it. A handoff is not shipping anything.
         shipping: brief || handoff ? [] : shipping,
@@ -2531,6 +2623,9 @@ async function scanReviewGates() {
         // hit the catch below and release a claim whose ping DID land.
         await markPingDelivered(gateClaimKey(notif), { pingCount: 1, messageIds }).catch((err) =>
           console.error("[telegram-bug-intake] markPingDelivered (gate)", err.message));
+        // This card is THE deploy question for its execution: the pipeline
+        // poller reads this row and does not send its own.
+        if (deploy?.executionId) await recordExecPaged(deploy.target?.pipeline, deploy.executionId, "ticket", notif.ticketId);
         // Exactly one gate.requested per notification, and only for a page that
         // actually landed — it is the metrics record of "the human was asked".
         // A recovery publishes too: nothing was ever delivered before it, so
@@ -3850,9 +3945,12 @@ async function scanDeployApprovalsForTarget(target) {
       if (token && status === "InProgress") {
         pending = { stageName: stage.stageName, actionName: action.actionName, token,
           revisionUrl: action.entityUrl || action.revisionUrl,
-          // WHICH execution is parked here. The stage carries it; the action
-          // does not. Everything about the commit hangs off this (D3).
-          executionId: stage.latestExecution?.pipelineExecutionId || null };
+          // WHICH execution is parked here. The stage carries it (the action's
+          // own ActionExecution normally does not, but pendingApprovals reads it
+          // there too, so accept either). Everything about the commit hangs off
+          // this (D3), and now the one-page-per-execution row does as well.
+          executionId: stage.latestExecution?.pipelineExecutionId
+            || action.latestExecution?.pipelineExecutionId || null };
         break;
       }
     }
@@ -3871,6 +3969,17 @@ async function scanDeployApprovalsForTarget(target) {
     ? { kind: "first" }
     : await decideDeployPingMode(`${DEPLOY_KEY_PREFIX}${key}`);
   if (!mode) return;
+  // One page per execution: a `gate:deploy-approval` ticket already paged this
+  // execution (scanReviewGates runs first in every cycle), and its ✅ approves
+  // the pipeline itself. Keep the claim, mark it delivered with the reminder
+  // budget spent, and send nothing — the ticket's own reminders cover the wait.
+  if (mode.kind === "first" && pending.executionId
+    && (await execPagedBy(target.pipeline, pending.executionId)) === "ticket") {
+    await markPingDelivered(`${DEPLOY_KEY_PREFIX}${key}`, { pingCount: DEPLOY_REPING_MAX + 1, messageIds: [] })
+      .catch((err) => console.error("[telegram-bug-intake] markPingDelivered (deploy, ticket-paged)", err.message));
+    console.log(`[telegram-bug-intake] deploy approval ${target.pipeline} execution ${pending.executionId}: the gate ticket already paged it - not sending the pipeline's own card`);
+    return;
+  }
 
   try {
     const chats = (await listChats()).filter((c) => ALLOWED_CHAT_IDS.includes(String(c)));
@@ -3958,6 +4067,9 @@ async function scanDeployApprovalsForTarget(target) {
       await markPingDelivered(`${DEPLOY_KEY_PREFIX}${key}`, {
         pingCount: isReminder ? mode.n + 1 : 1, messageIds,
       }).catch((err) => console.error("[telegram-bug-intake] markPingDelivered (deploy)", err.message));
+      // This card is THE deploy question for its execution: a later
+      // gate:deploy-approval ticket for the same execution does not page again.
+      if (mode.kind === "first" && pending.executionId) await recordExecPaged(target.pipeline, pending.executionId, "pipeline", key);
     } else if (mode.kind === "first") {
       // Nobody got it and we created the row — drop it so the next scan (60s)
       // retries immediately rather than waiting out a lease.
