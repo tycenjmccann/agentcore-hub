@@ -1613,6 +1613,68 @@ describe("create_ticket — gate-loop seam, DynamoDB-side (TEAM-4739)", () => {
     expect(h.state.puts).toHaveLength(1);
     expect(h.state.probes).toHaveLength(0);
   });
+
+  /**
+   * TEAM-4986 — a deploy-approval gate is keyed on its `exec:<id>`, DynamoDB-side.
+   *
+   * The truth table is in the parity file; what is local here is the pair of
+   * side effects that actually wedged run wf_bug_TEAM-4798: the `gate:loop-broken`
+   * label write on the epic and the `workflow.blocked` page. A serial CD follow-up
+   * under the same Bug parent must produce NEITHER.
+   */
+  describe("a deploy gate for a SECOND execution (TEAM-4986)", () => {
+    const PIPELINE = "hub-juno-deploy";
+    const EXEC_A = "c33ac06f-b684-4d0a-b486-d8f812020022";
+    const EXEC_B = "7bb31573-3917-49aa-898e-c132c9bc5ad6";
+    const CONSOLE = `https://console.aws.amazon.com/codesuite/codepipeline/pipelines/${PIPELINE}/view`;
+
+    /** A prior deploy gate, in the normalized label spelling the row holds. */
+    const deployPrior = (id, exec, status) => ({
+      ticketId: id,
+      status,
+      labels: ["gate-approval", "gate-deploy-approval", `pipeline-${PIPELINE}`, `exec-${exec}`],
+    });
+    const fileDeployGate = (exec) =>
+      create({
+        summary: "Deploy Approval: production deploy for the follow-up PR",
+        assignee: "human:engineer",
+        labels: ["gate:approval", "gate:deploy-approval", `pipeline:${PIPELINE}`, `exec:${exec}`],
+        description: `Approve the production deploy.\n\nConsole: ${CONSOLE}`,
+        parent_key: EPIC,
+      });
+
+    beforeEach(() => {
+      // So the SHAPE seam (which runs after the loop seam) is not what decides.
+      h.state.probeBy.Pipeline___capabilities = { result: { ok: true, approveDeploy: false } };
+    });
+
+    it("is CREATED over a DONE gate for another execution — no marker, no page", async () => {
+      h.state.siblings.push(deployPrior("TEAM-4979", EXEC_A, "done"));
+
+      const res = await fileDeployGate(EXEC_B);
+
+      expect(res.ok).not.toBe(false);
+      expect(h.state.puts, "the gate the human is waiting for exists").toHaveLength(1);
+      expect(h.state.counter, "one id minted").toBe(1);
+      expect(h.state.labelUpdates, "the epic is NOT labelled gate:loop-broken").toHaveLength(0);
+      expect(h.state.events, "and nobody is paged about a loop").toHaveLength(0);
+    });
+
+    it("refuses a SECOND gate for the SAME execution, and the page names it", async () => {
+      h.state.siblings.push(deployPrior("TEAM-4979", EXEC_A, "in_review"));
+
+      const res = await fileDeployGate(EXEC_A);
+
+      expect(res).toMatchObject({ ok: false, reason: "gate_loop_environmental", existingTicketId: "TEAM-4979" });
+      expect(h.state.puts).toHaveLength(0);
+      expect(h.state.counter, "not even a ticket number").toBe(0);
+      expect(h.state.labelUpdates[0].ExpressionAttributeValues[":label"]).toBe("gate:loop-broken");
+      expect(h.state.events.map((e) => e.type)).toEqual(["workflow.blocked"]);
+      // A deploy gate carries no `head:`, so `exec` is the only thing that can say
+      // WHAT looped — the reason it is on the detail at all.
+      expect(h.state.events[0].detail).toMatchObject({ gateKind: "deploy-approval", exec: EXEC_A, head: "", attempt: 2 });
+    });
+  });
 });
 
 /**
