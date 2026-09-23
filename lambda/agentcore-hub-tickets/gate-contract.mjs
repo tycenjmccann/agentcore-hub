@@ -71,6 +71,7 @@ import {
   EXEC_LABEL_RE,
   gateHeadOf,
   gateExecOf,
+  sameGateBinding,
 } from "./fix-contract.mjs";
 
 // ── Label grammar ───────────────────────────────────────────────────────────
@@ -507,7 +508,10 @@ export async function invokeProbe(fnName, tool, args) {
 //
 // WHICH BINDING, per kind (TEAM-4986 — this used to be one rule for all of them,
 // ending in "…or, when neither side carries a binding, the kind alone under one
-// epic", and that last clause is what made the guard wrong):
+// epic", and that last clause is what made the guard wrong): sameGateBinding
+// (fix-contract.mjs) is the ONE spelling of that rule, shared with the
+// orchestrator's W3 re-file watch (TEAM-4989) so a create-time refusal and a
+// re-file page can never disagree about what "the same gate" means. In short —
 //
 //   deploy-approval  the `exec:<id>` label, and NOTHING else. A deploy gate carries
 //                    no `head:` and usually no `blocked_by`, so the kind-alone
@@ -550,9 +554,28 @@ export function isSettledGateStatus(status) {
   );
 }
 
-function idList(v) {
-  const list = Array.isArray(v) ? v : typeof v === "string" ? v.split(",") : [];
-  return list.map((x) => String(x ?? "").trim()).filter(Boolean);
+/**
+ * The NEW ticket as a ROW `sameGateBinding` can read, so the create-time refusal and
+ * the orchestrator's W3 re-file watch run the SAME predicate over the SAME shape.
+ *
+ * Back-compat is why this is not simply `{labels, blockedBy}`: the direct callers in
+ * the parity tests (and every pre-TEAM-4989 caller) hand over `head` / `execId` as
+ * BARE strings, already extracted with gateHeadOf / gateExecOf. Those are re-spelled
+ * as the labels they came from and appended AFTER the ticket's own, so a real
+ * `labels` still wins on the first-match rule those readers use.
+ *
+ * A value that is not a readable binding (not 40-hex, not a 36-char execution id)
+ * synthesizes a label the readers do not match, and so reads as UNBOUND. That is the
+ * honest answer — an unreadable binding names no target — and it is unreachable from
+ * production: both twins pass exactly what gateHeadOf / gateExecOf just returned.
+ */
+function selfGateRow(opts) {
+  const labels = labelList(opts.labels);
+  const head = String(opts.head ?? "").trim();
+  const execId = String(opts.execId ?? "").trim();
+  if (head) labels.push(`head:${head}`);
+  if (execId) labels.push(`exec:${execId}`);
+  return { labels, blockedBy: opts.blockedBy };
 }
 
 /**
@@ -565,54 +588,42 @@ function idList(v) {
  * but they MUST refuse identically. Each twin gathers in its own idiom and hands
  * the rows here.
  *
- * See the GATE_LOOP_THRESHOLD comment above for which binding each kind is keyed
- * on, and why the old parent + kind fallback had to go (TEAM-4986).
+ * The binding decision itself is NOT spelled here — sameGateBinding (fix-contract.mjs)
+ * is the one spelling of that rule (TEAM-4989), shared with the orchestrator's W3
+ * re-file watch. See the GATE_LOOP_THRESHOLD comment above for which binding each
+ * kind is keyed on, and why the old parent + kind fallback had to go (TEAM-4986).
  *
  * @param {Array<{id?:string, key?:string, ticketId?:string, status?:string,
  *                labels?:string[]|string, blockedBy?:string[]|string}>} siblings
  *   the epic's other children. `status` is the INTERNAL form (see
  *   GATE_SETTLED_STATUSES); a settled sibling is skipped for every kind.
- * @param {{gateKind?:string, blockedBy?:string[]|string, head?:string,
- *          execId?:string}} opts  the NEW ticket's gate kind and BINDINGS, read
- *   from its own labels by the caller (gateHeadOf / gateExecOf). An absent binding
- *   matches NOTHING rather than everything — for a deploy-approval gate the loop
- *   seam runs before gateShapeRefusal, which is what refuses an unbound one a
- *   moment later.
+ * @param {{gateKind?:string, blockedBy?:string[]|string, labels?:string[]|string,
+ *          head?:string, execId?:string}} opts  the NEW ticket's gate kind and
+ *   BINDINGS. `labels` is the ticket's own labels; `head` / `execId` are a
+ *   back-compat spelling for a caller that already ran gateHeadOf / gateExecOf
+ *   itself. An absent binding matches NOTHING rather than everything — for a
+ *   deploy-approval gate the loop seam runs before gateShapeRefusal, which is what
+ *   refuses an unbound one a moment later.
  * @returns {{loop:boolean, priorCount:number, priors:string[], reason:string|null}}
  */
 export function gateLoopVerdict(siblings, opts = {}) {
   const gateKind = String(opts.gateKind || "")
     .trim()
     .toLowerCase();
-  const blockedBy = idList(opts.blockedBy);
-  const head = String(opts.head || "")
-    .trim()
-    .toLowerCase();
-  const execId = String(opts.execId || "")
-    .trim()
-    .toLowerCase();
   const out = { loop: false, priorCount: 0, priors: [], reason: null };
   if (!GATE_KINDS.includes(gateKind)) return out;
+
+  const self = selfGateRow(opts);
 
   for (const s of Array.isArray(siblings) ? siblings : []) {
     if (!s) continue;
     if (!gateKindsOf(s.labels).includes(gateKind)) continue;
     // An ANSWERED gate is not a gate still being asked, whatever it is bound to.
     if (isSettledGateStatus(s.status)) continue;
-
-    if (gateKind === "deploy-approval") {
-      // The pipeline execution, and only it: not the head, not the blocked_by
-      // target, and never the kind alone.
-      if (!execId || gateExecOf(s.labels) !== execId) continue;
-    } else {
-      const sibHead = gateHeadOf(s.labels);
-      if (head && sibHead) {
-        // Both sides name a commit, so the commit decides.
-        if (sibHead !== head) continue;
-      } else if (!blockedBy.length || !idList(s.blockedBy).some((b) => blockedBy.includes(b))) {
-        continue;
-      }
-    }
+    // The ONLY binding decision, and it is not spelled here: one predicate, shared
+    // with the orchestrator's W3 re-file watch (TEAM-4989), so a create-time refusal
+    // and a re-file page can never disagree about what "the same gate" means.
+    if (!sameGateBinding(gateKind, self, s)) continue;
     out.priors.push(String(s.id || s.key || s.ticketId || ""));
   }
 
