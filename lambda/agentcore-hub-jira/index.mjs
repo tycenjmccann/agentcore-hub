@@ -615,6 +615,11 @@ async function refuseGateLoop({ labels, blockedBy, parentId }) {
   const verdict = gateLoopVerdict(siblings, { gateKind, labels, blockedBy });
   if (!verdict.loop) return null;
 
+  // Needed only for the page below now that the verdict reads the binding itself
+  // (TEAM-4989) — the event still has to name what looped.
+  const head = gateHeadOf(labels);
+  const execId = gateExecOf(labels);
+
   // Only now is the epic worth reading — it carries the marker (the event dedupe)
   // and, in its labels, the workflowId the event needs (SEC-16: off the EPIC, never
   // a caller argument). `null` means COULD NOT TELL, which is not "not yet marked":

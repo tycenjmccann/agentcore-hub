@@ -625,6 +625,11 @@ async function refuseGateLoop({ labels, blockedBy, parentId }) {
   const verdict = gateLoopVerdict(siblings, { gateKind, labels, blockedBy });
   if (!verdict.loop) return null;
 
+  // Needed only for the page below now that the verdict reads the binding itself
+  // (TEAM-4989) — the event still has to name what looped.
+  const head = gateHeadOf(labels);
+  const execId = gateExecOf(labels);
+
   // Only now is the epic worth reading — it carries the workflowId the event needs
   // (SEC-16: off the EPIC ROW, never a caller argument), and nothing else.
   let epic = null;
