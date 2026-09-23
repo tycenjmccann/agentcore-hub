@@ -378,6 +378,101 @@ describe("replay 37ule1 — the same gate re-filed against the same target", () 
 });
 
 /**
+ * replay TEAM-4986 — a serial CD follow-up is not the earlier gate's loop.
+ *
+ * Observed 2026-09-22 on wf_bug_TEAM-4798. The release manager filed the deploy
+ * approval for its follow-up PR's pipeline execution and was refused
+ * `gate_loop_environmental` against TEAM-4979 — a DONE deploy gate for a DIFFERENT
+ * execution under the same Bug parent, from the previous follow-up. The epic was
+ * labelled `gate:loop-broken`, a human was paged, and the run could not ship.
+ *
+ * `gateLoopVerdict` matched it on the gate KIND alone: a deploy gate carries no
+ * `head:` and no `blocked_by`, so the `untargeted` arm made every earlier
+ * deploy-approval sibling a prior regardless of execution or status. The fixture is
+ * the real one — the two execution ids, the real labels, the real parent.
+ */
+describe("replay TEAM-4986 — a serial CD follow-up is not the earlier gate's loop", () => {
+  const EPIC = "TEAM-4798";
+  const PIPELINE = "hub-juno-deploy";
+  // The DONE gate from the earlier follow-up, and the execution being approved now.
+  const EXEC_DONE = "c33ac06f-b684-4d0a-b486-d8f812020022";
+  const EXEC_NEW = "7bb31573-3917-49aa-898e-c132c9bc5ad6";
+  const CONSOLE = `https://console.aws.amazon.com/codesuite/codepipeline/pipelines/${PIPELINE}/view?region=us-east-1`;
+
+  /** TEAM-4979 as the row actually held it (normalized label spelling). */
+  const prior = (status) => ({
+    ticketId: "TEAM-4979",
+    status,
+    labels: ["gate-approval", "gate-deploy-approval", `pipeline-${PIPELINE}`, `exec-${EXEC_DONE}`],
+  });
+  /** The refused create, exactly as the release manager issued it. */
+  const fileGate = (exec) => create({
+    summary: "Deploy Approval: production deploy for the review-fix follow-up",
+    assignee: "human:engineer",
+    labels: ["gate:approval", "gate:deploy-approval", `pipeline:${PIPELINE}`, `exec:${exec}`],
+    description: `Approve the production deploy for the ${EPIC} follow-up PR.\n\nConsole: ${CONSOLE}`,
+    parent_key: EPIC,
+  });
+
+  beforeEach(() => {
+    h.state.items[EPIC] = { ticketId: EPIC, type: "bug", workflowId: "wf_bug_TEAM-4798", labels: [] };
+    // The pipeline is registered and cannot self-approve — the shape seam's happy
+    // path, so the loop seam is provably what decides each row below.
+    h.state.probeBy.Pipeline___capabilities = { result: { ok: true, approveDeploy: false } };
+  });
+
+  it("the refused gate is CREATED — no marker on the epic, and nobody paged", async () => {
+    h.state.siblings.push(prior("done"));
+
+    const res = await fileGate(EXEC_NEW);
+
+    expect(res.ok).not.toBe(false);
+    expect(h.state.puts, "the gate the human was waiting for").toHaveLength(1);
+    expect(h.state.puts[0].labels).toContain(`exec-${EXEC_NEW}`);
+    expect(h.state.counter, "one id minted").toBe(1);
+    expect(
+      h.state.labelUpdates.map((u) => u.ExpressionAttributeValues[":label"]),
+      "the epic is never labelled gate:loop-broken"
+    ).toEqual([]);
+    expect(h.state.events, "and no workflow.blocked page").toHaveLength(0);
+  });
+
+  it("an OPEN gate for the SAME execution is still the loop", async () => {
+    // The guard keeps working: a genuine re-file of the same deploy decision.
+    h.state.siblings.push(prior("in_review"));
+
+    const res = await fileGate(EXEC_DONE);
+
+    expect(res).toMatchObject({ ok: false, reason: "gate_loop_environmental", existingTicketId: "TEAM-4979" });
+    expect(h.state.puts).toHaveLength(0);
+    expect(h.state.counter).toBe(0);
+    expect(h.state.labelUpdates[0].ExpressionAttributeValues[":label"]).toBe("gate:loop-broken");
+    expect(h.state.events).toHaveLength(1);
+    expect(h.state.events[0].type).toBe("workflow.blocked");
+    expect(h.state.events[0].detail).toMatchObject({
+      reason: "environmental",
+      gateKind: "deploy-approval",
+      blockedByTicketId: "TEAM-4979",
+      exec: EXEC_DONE,
+      attempt: 2,
+    });
+    expect(h.state.events[0].workflowId, "run id off the EPIC row").toBe("wf_bug_TEAM-4798");
+  });
+
+  it("a DONE gate for the same execution is answered, not looping", async () => {
+    // The pipeline re-ran the same execution after the first approval expired: the
+    // answered gate cannot be the ticket to work, so a new one must be filable.
+    h.state.siblings.push(prior("done"));
+
+    const res = await fileGate(EXEC_DONE);
+
+    expect(res.ok).not.toBe(false);
+    expect(h.state.puts).toHaveLength(1);
+    expect(h.state.events).toHaveLength(0);
+  });
+});
+
+/**
  * replay TEAM-4758 (TEAM-4764 P1) — the unbound ci-unavailable gate.
  *
  * QA filed a `gate:ci-unavailable` ticket carrying `head:<sha>` and NO `pipeline:`

@@ -1837,6 +1837,90 @@ test("createTicket: the second identical gate ticket is refused, and the epic is
   });
 });
 
+// ─── TEAM-4986: a deploy gate is keyed on its `exec:<id>`, Jira-side ───────────
+//
+// The DynamoDB replay is lambda/agentcore-hub-tickets/replay-gate-binding.test.mjs
+// and the truth table is src/lib/workflow/gate-loop-parity.test.ts. What only this
+// twin can prove is the STATUS round trip: the prior gate is Done in Jira's own
+// vocabulary, and it is `mapStatusToInternal` turning "Done" into `done` that makes
+// the shared contract's settled-gate rule fire at all.
+const TEAM_4986 = {
+  pipeline: "hub-juno-deploy",
+  execDone: "c33ac06f-b684-4d0a-b486-d8f812020022",
+  execNew: "7bb31573-3917-49aa-898e-c132c9bc5ad6",
+};
+
+/** TEAM-4979, the earlier follow-up's deploy gate, as Jira's search returns it. */
+const deployGateIssue = (statusName) => ({
+  key: "TEAM-4979",
+  fields: {
+    summary: "Deploy Approval: earlier follow-up",
+    status: { name: statusName },
+    labels: [
+      "gate-approval",
+      "gate-deploy-approval",
+      `pipeline-${TEAM_4986.pipeline}`,
+      `exec-${TEAM_4986.execDone}`,
+    ],
+    issuelinks: [],
+  },
+});
+
+const fileDeployGate = (exec) =>
+  handler({
+    tool_name: "Tickets___create_ticket",
+    parameters: {
+      summary: "Deploy Approval: production deploy for the review-fix follow-up",
+      description: "Approve the production deploy.",
+      labels: [
+        "gate:approval",
+        "gate:deploy-approval",
+        `pipeline:${TEAM_4986.pipeline}`,
+        `exec:${exec}`,
+      ],
+      parent_key: "TEAM-4798",
+    },
+  });
+
+test("createTicket: a deploy gate for a SECOND execution is created over a Done one (TEAM-4986)", async () => {
+  // The incident on wf_bug_TEAM-4798: refused against a DONE gate for another
+  // execution, and the Bug epic wrongly labelled `gate:loop-broken`.
+  const issues = { "TEAM-4798": { labels: ["wf:wf_bug_TEAM-4798"], issuetype: "Bug" } };
+  await withJira({ issues, siblings: [deployGateIssue("Done")] }, async ({ writes }) => {
+    const res = await fileDeployGate(TEAM_4986.execNew);
+
+    assert.notEqual(res.ok, false);
+    assert.equal(writes.filter((w) => w.path === "/rest/api/3/issue").length, 1);
+    assert.equal(issues["TEAM-4798"].labels.includes("gate:loop-broken"), false);
+  });
+});
+
+test("createTicket: an OPEN deploy gate for the SAME execution is still the loop (TEAM-4986)", async () => {
+  const issues = { "TEAM-4798": { labels: ["wf:wf_bug_TEAM-4798"], issuetype: "Bug" } };
+  await withJira({ issues, siblings: [deployGateIssue("In Review")] }, async ({ writes }) => {
+    const res = await fileDeployGate(TEAM_4986.execDone);
+
+    assert.equal(res.ok, false);
+    assert.equal(res.reason, "gate_loop_environmental");
+    assert.equal(res.existingTicketId, "TEAM-4979");
+    assert.equal(writes.filter((w) => w.path === "/rest/api/3/issue").length, 0);
+    assert.ok(issues["TEAM-4798"].labels.includes("gate:loop-broken"));
+  });
+});
+
+test("createTicket: a DONE gate for the SAME execution is answered, not looping (TEAM-4986)", async () => {
+  // The other half of the status rule, and the twin-parity assertion for Jira's
+  // "Done" → `done` map: an answered gate cannot be the ticket to work.
+  const issues = { "TEAM-4798": { labels: ["wf:wf_bug_TEAM-4798"], issuetype: "Bug" } };
+  await withJira({ issues, siblings: [deployGateIssue("Done")] }, async ({ writes }) => {
+    const res = await fileDeployGate(TEAM_4986.execDone);
+
+    assert.notEqual(res.ok, false);
+    assert.equal(writes.filter((w) => w.path === "/rest/api/3/issue").length, 1);
+    assert.equal(issues["TEAM-4798"].labels.includes("gate:loop-broken"), false);
+  });
+});
+
 test("createTicket: the gate-loop guard FAILS CLOSED on a failed sibling scan", async () => {
   // TEAM-4780. The refusal now comes from the loop breaker itself, one seam earlier
   // than the open-gate autowire — and with the SAME body, because the two share one
