@@ -608,12 +608,11 @@ async function refuseGateLoop({ labels, blockedBy, parentId }) {
     return new Error(siblingScanRefusal(parentId, err.message));
   }
 
-  // The NEW ticket's own bindings. `execId` is what keys a deploy-approval gate
-  // (TEAM-4986) — without it the verdict fell back to the kind alone and refused a
-  // legitimate gate for a second pipeline execution under the same parent.
-  const head = gateHeadOf(labels);
-  const execId = gateExecOf(labels);
-  const verdict = gateLoopVerdict(siblings, { gateKind, blockedBy, head, execId });
+  // The NEW ticket's own labels carry its bindings — gateLoopVerdict reads the
+  // `exec:`/`head:` binding itself (TEAM-4989), via the same sameGateBinding the
+  // orchestrator's W3 re-file watch uses, so a create-time refusal and a re-file
+  // page can never disagree about what "the same gate" means.
+  const verdict = gateLoopVerdict(siblings, { gateKind, labels, blockedBy });
   if (!verdict.loop) return null;
 
   // Only now is the epic worth reading — it carries the marker (the event dedupe)

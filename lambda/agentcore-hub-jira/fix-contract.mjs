@@ -231,8 +231,8 @@ export function gateExecOf(labels) {
  * about a healthy run).
  *
  * gateLoopVerdict (gate-contract.mjs) answers the same question at CREATE time and
- * is being rewritten to this rule in PR #669; once that lands it should delegate
- * here rather than keep a second spelling of the rule.
+ * delegates here (TEAM-4989) rather than keeping a second spelling of the rule —
+ * a create-time refusal and this watch can now never disagree about a binding.
  */
 export function sameGateBinding(kind, a, b) {
   const k = String(kind ?? "")

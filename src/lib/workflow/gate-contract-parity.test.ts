@@ -7,6 +7,7 @@ import { resolve } from "node:path";
 // self-contained zip, so they CANNOT share a file. The tickets copy is canonical.
 import * as ticketsCopy from "../../../lambda/agentcore-hub-tickets/gate-contract.mjs";
 import * as jiraCopy from "../../../lambda/agentcore-hub-jira/gate-contract.mjs";
+import { sameGateBinding } from "../../../lambda/agentcore-hub-tickets/fix-contract.mjs";
 
 /**
  * TEAM-4739 parity contract — same two-layer shape as fix-contract-parity.test.ts.
@@ -369,6 +370,60 @@ describe("gateLoopVerdict — a deploy gate is keyed on exec:<id> (TEAM-4986)", 
         label
       ).toMatchObject({ loop: true, priors: ["TEAM-4979"] });
     }
+  });
+});
+
+describe("gateLoopVerdict delegates the binding to sameGateBinding (TEAM-4989)", () => {
+  const SHA_A = "1".repeat(40);
+  const SHA_B = "2".repeat(40);
+  const EXEC_A = "c33ac06f-b684-4d0a-b486-d8f812020022";
+  const EXEC_B = "7bb31573-3917-49aa-898e-c132c9bc5ad6";
+
+  // (kind, the NEW ticket's row, the OPEN sibling's bindings)
+  const ROWS: Array<[string, Record<string, unknown>, Record<string, unknown>]> = [
+    ["deploy-approval", { labels: [`exec:${EXEC_A}`] }, { labels: [`exec-${EXEC_A}`] }],
+    ["deploy-approval", { labels: [`exec:${EXEC_A}`] }, { labels: [`exec-${EXEC_B}`] }],
+    ["deploy-approval", { labels: [] }, { labels: [`exec-${EXEC_A}`] }],
+    // deploy-approval is keyed on the exec ALONE: a shared head + blocked_by is not it.
+    [
+      "deploy-approval",
+      { labels: [`exec:${EXEC_A}`], blockedBy: ["T-9"] },
+      { labels: [`exec-${EXEC_B}`, `head-${SHA_A}`], blockedBy: ["T-9"] },
+    ],
+    ["ci-unavailable", { labels: [`head:${SHA_A}`] }, { labels: [`head-${SHA_A}`] }],
+    ["ci-unavailable", { labels: [`head:${SHA_A}`] }, { labels: [`head-${SHA_B}`] }],
+    ["blocker", { blockedBy: ["T-9", "T-8"] }, { blockedBy: "T-8" }],
+    ["blocker", { blockedBy: ["T-9"] }, { blockedBy: ["T-7"] }],
+    ["blocker", {}, {}],
+  ];
+
+  it.each(ROWS)("%s — counts a prior exactly when sameGateBinding says bound", (kind, self, sib) => {
+    const sibling = {
+      id: "T-1",
+      status: "in_review",
+      labels: [`gate:${kind}`, ...((sib.labels as string[]) ?? [])],
+      ...(sib.blockedBy ? { blockedBy: sib.blockedBy } : {}),
+    };
+    const bound = sameGateBinding(kind, self, sibling);
+    // The point of the row: NOT a hand-copied expectation, but agreement with the
+    // other half of the rule. A second spelling of the binding cannot pass this.
+    const verdict = agree(`${kind} ${JSON.stringify(sib)}`, (m) =>
+      m.gateLoopVerdict([sibling], { gateKind: kind, labels: self.labels, blockedBy: self.blockedBy })
+    ) as { loop: boolean; priors: string[] };
+    expect(verdict.loop, `delegation drifted for ${kind}`).toBe(bound);
+    expect(verdict.priors).toEqual(bound ? ["T-1"] : []);
+  });
+
+  it("still reads bare head/execId opts as the bindings they were read from", () => {
+    // Both twins passed these as strings before TEAM-4989 and the TEAM-4986 rows above
+    // still do, so the back-compat spelling must hit the identical rule.
+    const sib = { id: "T-1", status: "in_review", labels: ["gate-ci-unavailable", `head-${SHA_A}`] };
+    expect(
+      agree("bare head hit", (m) => m.gateLoopVerdict([sib], { gateKind: "ci-unavailable", head: SHA_A }))
+    ).toMatchObject({ loop: true, priors: ["T-1"] });
+    expect(
+      agree("bare head miss", (m) => m.gateLoopVerdict([sib], { gateKind: "ci-unavailable", head: SHA_B }))
+    ).toMatchObject({ loop: false, priorCount: 0 });
   });
 });
 
