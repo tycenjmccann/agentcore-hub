@@ -186,29 +186,28 @@ describe("replay 15x8ql / TEAM-4700 — agent.died is positive proof (TEAM-4739)
     expect(eventsOfType(deps.publishEvent, "agent.escalated")).toHaveLength(0);
   });
 
-  it("GUARD 1 still comes first: a live lease survives its own agent.died row", async () => {
-    // The same death row, but the persona streamed 2 min before the sweep (a
-    // duplicate/late death publish, or a runtime that recovered). isLeaseLive
-    // wins: no steal, no dispatch, and the died read is never even reached.
+  it("agent.died newer than the claim reaps without waiting for the 30-minute TTL", async () => {
+    // The same death row plus a fresh heartbeat: TEAM-4889 reads died before
+    // GUARD 1 and passes positiveDeath into isLeaseLive, so a runtime-finally
+    // death for this generation cannot be resurrected by prior activity.
     const events = [
       ...runEvents(),
-      { workflowId: WF, eventId: "4", type: "agent.streaming", timestamp: "2026-09-15T00:43:00.000Z", detail: { agentId: AGENT, ticketId: TICKET, type: "text", content: "still here" } },
+      { workflowId: WF, eventId: "4", type: "agent.streaming", timestamp: "2026-09-15T00:43:00.000Z", detail: { agentId: AGENT, ticketId: TICKET, type: "text", content: "last output before finally" } },
     ];
     const shapes = [];
     const workflow = makeWorkflow();
-    const { deps, ddb } = makeDeps({ workflow, events, onQuery: (i) => shapes.push(i.ExpressionAttributeValues) });
+    const { deps } = makeDeps({ workflow, events, onQuery: (i) => shapes.push(i.ExpressionAttributeValues) });
     const m = await createDetector(deps).runSweep("enforce");
 
-    expect(m.skippedLiveLease).toBe(1);
-    expect(m.fired).toBe(0);
-    expect(deps.redispatch).not.toHaveBeenCalled();
-    expect(ddb.updates).toEqual([]); // stealClaim is the only write, and it never ran
-    expect(shapes.some((v) => v[":died"])).toBe(false);
+    expect(m.fired).toBe(1);
+    expect(deps.redispatch).toHaveBeenCalledTimes(1);
+    expect(shapes.some((v) => v[":died"])).toBe(true);
   });
 
-  it("the reap is bounded by the 5-min sweep, not by the event", async () => {
+  it("the reap is bounded by the first rate(5 minutes) sweep at/after agent.died", async () => {
     // A sweep one tick EARLIER (00:40, before the 00:41:08 death) sees nothing
-    // to reap; the next tick does. That gap is the honest detection bound.
+    // to reap; the next tick does. There is still no sub-minute push path — the
+    // bound is the scheduled sweep, not the event publish.
     const early = makeWorkflow();
     const before = makeDeps({ workflow: early, events: runEvents(), nowMs: Date.parse("2026-09-15T00:40:00.000Z") });
     expect((await createDetector(before.deps).runSweep("enforce")).fired).toBe(0);

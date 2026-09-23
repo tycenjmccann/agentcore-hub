@@ -36,6 +36,13 @@ describe("isLeaseLive (mjs)", () => {
     expect(isLeaseLive(undefined, null, NOW, TTL)).toBe(false);
     expect(isLeaseLive({ status: "running" }, null, NOW, TTL)).toBe(false);
   });
+
+  it("positiveDeath makes a fresh running claim non-live", () => {
+    const task = { status: "running", startedAt: iso(60_000) };
+    expect(isLeaseLive(task, iso(30_000), NOW, TTL, { positiveDeath: true })).toBe(false);
+    expect(isLeaseLive(task, iso(30_000), NOW, TTL, { positiveDeath: false })).toBe(true);
+    expect(isLeaseLive(task, iso(30_000), NOW, TTL)).toBe(true);
+  });
 });
 
 describe("lastAgentActivity (mjs)", () => {

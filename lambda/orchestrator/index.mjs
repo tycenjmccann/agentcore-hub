@@ -34,9 +34,11 @@ import {
   DEFAULT_TTL_MINUTES,
   STALE_CLAIM_MULTIPLIER,
   LEASE_TTL_MS,
+  DEAD_SESSION_MAX_AUTO_RESUMES,
   isLeaseLive,
   lastAgentActivity,
   lastStreamedText,
+  hasAgentErrorSince,
   stealClaim,
 } from "./lease.mjs";
 import { resolveWatchdog, setWatchdogSource } from "./watchdog.mjs";
@@ -454,7 +456,7 @@ function getDetector() {
     workflowsTable: WORKFLOWS_TABLE,
     eventsTable: EVENTS_TABLE,
     store,
-    lease: { isLeaseLive, lastAgentActivity, stealClaim, LEASE_TTL_MS },
+    lease: { isLeaseLive, lastAgentActivity, hasAgentErrorSince, stealClaim, LEASE_TTL_MS, DEAD_SESSION_MAX_AUTO_RESUMES },
     getTicket,
     getAgentDef,
     publishEvent,
@@ -486,7 +488,7 @@ function getCascade() {
     // instead of waiting for the Ready webhook.
     levelTriggerDispatch: LEVEL_TRIGGER_DISPATCH,
     dispatchReady: dispatchReadyDependent,
-    lease: { isLeaseLive, lastAgentActivity, stealClaim, LEASE_TTL_MS },
+    lease: { isLeaseLive, lastAgentActivity, hasAgentErrorSince, stealClaim, LEASE_TTL_MS, DEAD_SESSION_MAX_AUTO_RESUMES },
     eventsTable: EVENTS_TABLE,
     workflowsTable: WORKFLOWS_TABLE,
     redispatch: redispatchTicket,

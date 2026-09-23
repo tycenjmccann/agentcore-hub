@@ -41,6 +41,10 @@ const [HEARTBEAT_TYPE_1, HEARTBEAT_TYPE_2] = heartbeatEventTypes;
 // the lease-aware endpoints instead of re-hardcoding them.
 export const DEFAULT_TTL_MINUTES = defaultTtlMinutes;
 export const STALE_CLAIM_MULTIPLIER = staleClaimMultiplier;
+// DL-031 / TEAM-4889: two automatic dead-session re-dispatches, then page.
+// Keep this in code (not lease-constants.json): no app reader consumes the cap,
+// and a missing JSON key in the Lambda zip would silently break enforcement.
+export const DEAD_SESSION_MAX_AUTO_RESUMES = 2;
 
 /** A nonnumeric/zero/negative env value must not silently disable leases. */
 function resolveTtlMs() {
@@ -54,9 +58,15 @@ export const LEASE_TTL_MS = resolveTtlMs();
  * Pure liveness check. A claim is live when it is running AND the newer of
  * (claim start, last observed agent activity) is within the TTL.
  */
-export function isLeaseLive(task, lastActivityIso, nowMs, ttlMs = LEASE_TTL_MS) {
+export function isLeaseLive(task, lastActivityIso, nowMs, ttlMs = LEASE_TTL_MS, { positiveDeath = false } = {}) {
   if (!task) return false;
   if (!task.status || !liveClaimStatuses.includes(task.status)) return false;
+  // TEAM-4889: agent.died is emitted by the runtime finally path instead of
+  // agent.error when there was no completion and no self-park — the process is
+  // gone. Callers scope positiveDeath to this generation via since=startedAt;
+  // old died rows cannot kill a re-issued claim, and stealClaim still CASes on
+  // startedAt before writes.
+  if (positiveDeath) return false;
   const started = task.startedAt ? Date.parse(task.startedAt) : 0;
   const lastActivity = lastActivityIso ? Date.parse(lastActivityIso) : 0;
   const freshest = Math.max(started, lastActivity);

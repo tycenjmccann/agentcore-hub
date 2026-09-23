@@ -43,22 +43,31 @@ describe("isLeaseLive parity: lease.ts ≡ lease.mjs", () => {
                   ...(startOff === null ? {} : { startedAt: iso(startOff) }),
                 };
           const lastActivity = actOff === null ? null : iso(actOff);
-          const ts = isLeaseLiveTs(task, lastActivity, NOW, TTL);
-          const mjs = isLeaseLiveMjs(task, lastActivity, NOW, TTL);
-          expect(
-            mjs,
-            `mismatch for status=${String(status)} startOff=${String(startOff)} actOff=${String(actOff)}`
-          ).toBe(ts);
-          compared++;
+          for (const positiveDeath of [false, true]) {
+            const ts = isLeaseLiveTs(task, lastActivity, NOW, TTL, { positiveDeath });
+            const mjs = isLeaseLiveMjs(task, lastActivity, NOW, TTL, { positiveDeath });
+            expect(
+              mjs,
+              `mismatch for status=${String(status)} startOff=${String(startOff)} actOff=${String(actOff)} positiveDeath=${positiveDeath}`
+            ).toBe(ts);
+            compared++;
+          }
         }
       }
     }
     // Guard against the loop silently short-circuiting to zero comparisons.
-    expect(compared).toBe(STATUSES.length * OFFSETS.length * OFFSETS.length);
+    expect(compared).toBe(STATUSES.length * OFFSETS.length * OFFSETS.length * 2);
   });
 
   it("agrees with the default (env-derived) TTL argument omitted", () => {
     const task = { status: "running", startedAt: iso(5 * 60_000) };
     expect(isLeaseLiveMjs(task, null, NOW)).toBe(isLeaseLiveTs(task, null, NOW));
+  });
+
+  it("agrees that positiveDeath overrides a fresh running lease", () => {
+    const task = { status: "running", startedAt: iso(5 * 60_000) };
+    expect(isLeaseLiveMjs(task, iso(60_000), NOW, TTL, { positiveDeath: true }))
+      .toBe(isLeaseLiveTs(task, iso(60_000), NOW, TTL, { positiveDeath: true }));
+    expect(isLeaseLiveMjs(task, iso(60_000), NOW, TTL, { positiveDeath: true })).toBe(false);
   });
 });

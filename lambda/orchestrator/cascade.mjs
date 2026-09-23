@@ -56,6 +56,7 @@
  */
 
 import { UpdateCommand } from "@aws-sdk/lib-dynamodb";
+import { TERMINAL_WORKFLOW_PHASES } from "./completion.mjs";
 
 // Extended-state rollout modes (TEAM-3747 D1) — same vocabulary + fail-safe
 // default (shadow) as DEAD_SESSION_DETECTOR_MODE.
@@ -328,12 +329,12 @@ export function createCascade(deps) {
   // the sole liveness authority — we only call isLeaseLive / stealClaim).
 
   /** Is this sibling's current claim generation a live lease? (R3, lease.mjs.) */
-  async function leaseIsLive(sibling, workflow) {
+  async function leaseIsLive(sibling, workflow, positiveDeath = false) {
     const task = workflow?.agentTasks?.[sibling.ticketId];
     const lastActivity = await lease.lastAgentActivity(
       ddb, eventsTable, workflow?.id, sibling.assignee, sibling.ticketId
     );
-    return lease.isLeaseLive(task, lastActivity, now());
+    return lease.isLeaseLive(task, lastActivity, now(), undefined, { positiveDeath });
   }
 
   /**
@@ -382,7 +383,7 @@ export function createCascade(deps) {
    * and, if the lease came back to life, abort and treat it as what the
    * non-racing ordering would have done: a nudge, zero steal (AC-D3.3).
    */
-  async function stealAndRedispatch(sibling, unblockedBy, workflow, m, mode) {
+  async function stealAndRedispatch(sibling, unblockedBy, workflow, m, mode, positiveDeath = false) {
     const agentId = sibling.assignee;
     const task = workflow?.agentTasks?.[sibling.ticketId];
     if (mode !== "enforce") {
@@ -391,7 +392,7 @@ export function createCascade(deps) {
       log(`[orchestrator] cascade would-steal+redispatch (shadow, stale lease) — ${sibling.ticketId} agent=${agentId}`);
       return "would-steal";
     }
-    if (await leaseIsLive(sibling, workflow)) {
+    if (await leaseIsLive(sibling, workflow, positiveDeath)) {
       log(`[orchestrator] cascade steal aborted (lease live again on re-check) — ${sibling.ticketId} agent=${agentId}`);
       return emitNudge(sibling, unblockedBy, workflow, m, mode);
     }
@@ -536,29 +537,99 @@ export function createCascade(deps) {
    * observes, enforce writes. Returns an outcome string the sweep tallies.
    */
   async function reconcileDependent(sibling, unblockedBy, workflow, m, mode) {
-    // TEAM-3973 — an ESCALATED ticket is held for the human, in every status.
-    // Escalation used to bind only the in_progress steal path, so the very next
-    // sweep re-drove the ticket through the ready/todo/blocked branch and the
-    // escalation meant nothing (prod TEAM-3897: escalated 20:54Z, re-dispatched
-    // 20:59Z). The park transition cannot carry this on its own — a board with
-    // no Blocked transition falls back to To Do, which IS dispatch-eligible.
+    workflow = await freshLiveWorkflow(workflow, m);
+    if (!workflow) return "terminal-workflow";
+
+    // TEAM-3973 / TEAM-4889 — an ESCALATED ticket is held for the human, in
+    // every status. Keep the hold at retries >= 1: status=error is written only
+    // by escalation or failed invoke, both of which already put a human/config
+    // fix in play. Keying this to the new cap would un-park tickets escalated
+    // under the old cap of one on deploy.
     if (escalationHeld(sibling, workflow)) {
       m.escalationHeld = (m.escalationHeld || 0) + 1;
       log(`[orchestrator] reconcile hold (escalated, awaiting human) — ${sibling.ticketId} status=${sibling.status}`);
       return "escalation-held";
     }
-    if (await leaseIsLive(sibling, workflow)) {
+
+    const positiveDeath = await diedSinceClaim(sibling, workflow);
+    if (await leaseIsLive(sibling, workflow, positiveDeath)) {
       return emitNudge(sibling, unblockedBy, workflow, m, mode);
     }
     if (sibling.status === "in_review") {
       return handleInReviewDependent(sibling, unblockedBy, workflow, m, mode);
     }
     if (sibling.status === "in_progress") {
-      return stealWithRetryBudget(sibling, unblockedBy, workflow, m, mode);
+      return withDeathBudget(sibling, unblockedBy, workflow, m, mode, {
+        attempt: () => stealAndRedispatch(sibling, unblockedBy, workflow, m, mode, positiveDeath),
+        spent: (outcome) => outcome === "redispatched" || outcome === "redispatch-refused",
+      });
     }
-    // ready / todo / blocked — unblocked (or unblockable) but never dispatched.
-    // No live claim to steal (the lease gate above already returned for a live
-    // one); go straight through the claim CAS, which is the final arbiter.
+
+    // ready / todo / blocked: truly never-dispatched tickets stay unbudgeted; a
+    // parked failed claim generation is a dead dispatch and must spend the same
+    // retry budget as in_progress. TEAM-4889 fixes the direct redispatch loop
+    // that produced a 60-minute cadence forever when claimInvocation refused a
+    // running task until 2×TTL.
+    if (!deadDispatch(sibling, workflow, positiveDeath)) {
+      return redispatchOnly(sibling, workflow, m, mode);
+    }
+    const task = workflow?.agentTasks?.[sibling.ticketId];
+    if (task?.status === "running" || task?.status === "in_progress") {
+      return withDeathBudget(sibling, unblockedBy, workflow, m, mode, {
+        attempt: () => stealAndRedispatch(sibling, unblockedBy, workflow, m, mode, positiveDeath),
+        spent: (outcome) => outcome === "redispatched" || outcome === "redispatch-refused",
+      });
+    }
+    return withDeathBudget(sibling, unblockedBy, workflow, m, mode, {
+      attempt: () => redispatchOnly(sibling, workflow, m, mode),
+      spent: (outcome) => outcome === "redispatched",
+    });
+  }
+
+  /**
+   * TEAM-4889 §4 — re-read the workflow row consistently for each candidate
+   * before writing. The scan snapshot is eventually consistent; a workflow
+   * cancelled after the scan must not be stolen, counted, blocked, or paged.
+   * When store/getWorkflow is unwired, preserve the old snapshot behavior.
+   */
+  async function freshLiveWorkflow(workflow, m) {
+    if (!store?.getWorkflow || !workflow?.id) return workflow;
+    const fresh = await store.getWorkflow(workflow.id);
+    if (!fresh?.id || fresh.cancelledAt || TERMINAL_WORKFLOW_PHASES.includes(fresh.phase)) {
+      m.terminalWorkflow = (m.terminalWorkflow || 0) + 1;
+      log(`[orchestrator] reconcile skip (terminal workflow) — workflow=${workflow?.id} phase=${fresh?.phase || "missing"}`);
+      return null;
+    }
+    return fresh;
+  }
+
+  /**
+   * TEAM-4889 positive death probe. A failed/unwired read fails toward LIVE: the
+   * sweep may nudge or wait for silence, but it never steals on ignorance. The
+   * since=startedAt scope pins the died row to this claim generation; an old
+   * runtime death cannot kill a re-issued claim, and stealClaim still CASes on
+   * startedAt before any write.
+   */
+  async function diedSinceClaim(sibling, workflow) {
+    const task = workflow?.agentTasks?.[sibling.ticketId];
+    if (typeof lease?.hasAgentErrorSince !== "function" || !task?.startedAt) return false;
+    try {
+      return await lease.hasAgentErrorSince(
+        ddb, eventsTable, workflow.id, sibling.ticketId, task.startedAt, { types: ["agent.died"] });
+    } catch (err) {
+      log(`reconcile.died_read_failed — ${sibling.ticketId} ${err?.message || err}`);
+      return false;
+    }
+  }
+
+  function deadDispatch(sibling, workflow, positiveDeath = false) {
+    const task = workflow?.agentTasks?.[sibling.ticketId];
+    if (!task?.startedAt) return false;
+    if (positiveDeath) return true;
+    return !["pending", "complete"].includes(task.status);
+  }
+
+  async function redispatchOnly(sibling, workflow, m, mode) {
     if (mode !== "enforce") {
       m.wouldRedispatch++;
       log(`[orchestrator] reconcile would-redispatch (shadow) — ${sibling.ticketId} status=${sibling.status}`);
@@ -588,24 +659,19 @@ export function createCascade(deps) {
   }
 
   /**
-   * TEAM-3969 — the sweep's stale-lease recovery shares the dead-session
-   * detector's retry budget (workflow.deadSessionRetries[ticketId]): ONE
-   * automatic re-dispatch per ticket, then escalate to a human. Without the cap
-   * the sweep re-steals a permanently-dying session every lease TTL forever (an
-   * agent parked fail-closed on a human gate is indistinguishable from a dead
-   * one), and the detector's once-then-escalate policy never engages because the
-   * sweep always steals first. Mirrors dead-session-detector.mjs retryOrEscalate.
-   * The counter is bumped only after the steal CAS wins, so a steal aborted by a
-   * live re-check never burns the budget. Unwired store = uncapped (pre-3968).
+   * TEAM-4889 — one shared retry budget for all dead-dispatch recovery shapes.
+   * ready/todo/blocked used to bypass the counter and loop forever; now a spend
+   * is recorded only after the winning CAS (steal or claim) proves this sweep
+   * actually recovered the generation. Unwired store stays uncapped.
    */
-  async function stealWithRetryBudget(sibling, unblockedBy, workflow, m, mode) {
+  async function withDeathBudget(sibling, unblockedBy, workflow, m, mode, { attempt, spent }) {
     const ticketId = sibling.ticketId;
     const agentId = sibling.assignee;
+    const cap = lease?.DEAD_SESSION_MAX_AUTO_RESUMES ?? 2;
     const priorRetries = workflow?.deadSessionRetries?.[ticketId] || 0;
-    if (!store || priorRetries === 0) {
-      const outcome = await stealAndRedispatch(sibling, unblockedBy, workflow, m, mode);
-      // Steal CAS won (whether or not the re-dispatch claim did) → budget spent.
-      if (store && (outcome === "redispatched" || outcome === "redispatch-refused")) {
+    if (!store || priorRetries < cap) {
+      const outcome = await attempt();
+      if (store && spent(outcome)) {
         await store.incrementDeadSessionRetry(workflow.id, ticketId);
       }
       return outcome;
@@ -640,7 +706,7 @@ export function createCascade(deps) {
         id: `notif_dead_session_${ticketId}_${at}`,
         type: "manager_escalation",
         title: `Dead session (retry exhausted): ${ticketId}`,
-        details: `Agent ${agentId} went silent past the lease TTL twice on ${ticketId} (one automatic re-dispatch already spent). Auto-retry is exhausted — needs a human.`,
+        details: `Agent ${agentId} died ${cap + 1} times on ${ticketId} (${cap} automatic re-dispatches already spent, source ${unblockedBy}). Auto-retry is exhausted — needs a human.`,
         reviewer: "reconcile-sweep",
         ticketId,
         timestamp: at,

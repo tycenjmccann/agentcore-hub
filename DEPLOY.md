@@ -374,6 +374,13 @@ stage is now always a real failure:**
 | `PIPELINE_TOOLS_LAMBDA=agentcore-hub-pipeline-tools EVENTS_TABLE=agentcore-hub-events node deploy/setup-tickets-lambda.mjs` | the ticket twins now refuse an unbound `gate:ci-unavailable` at create time, but `setup-tickets-lambda.mjs` only attaches the `Pipeline___capabilities` invoke grant and the events-table `PutItem` grant — and only forwards those two env vars onto the Lambda — when they are set in the DEPLOYING shell. A bare re-run ships the new guard blind: it can create-time refuse on labels alone, but has no probe target and no journey-event sink |
 | `RECONCILE_SWEEP_MODE=enforce ./lambda/orchestrator/deploy.sh` | promotes the reconciliation sweep out of its dark `off` default once `shadow`'s `reconcile.would_*` / `would_watch_*` log lines look right — the W2/W3 human-gate watches never page before `enforce` is set |
 
+
+**This PR (TEAM-4889) needs one sweep-mode promotion:**
+
+| Command | Why |
+|---|---|
+| `DEAD_SESSION_DETECTOR_MODE=enforce RECONCILE_SWEEP_MODE=enforce ./lambda/orchestrator/deploy.sh` | promotes the dead-session detector out of its dark `shadow` default, now that `lease.hasAgentErrorSince` is actually injected into it (it was not, so DL-031's positive-death path never ran in prod) and a positive death overrides the lease TTL as well as the silence threshold. Pass `RECONCILE_SWEEP_MODE=enforce` in the SAME command - `deploy.sh` only forwards a mode variable that is set in the deploying shell, so omitting one reverts it to its code default. Same `JIRA_*` caveat as every orchestrator deploy (see "Required secrets" at the top of this file). After it lands expect `detector.retry` / `detector.escalate` log lines, `agent.escalated` events that carry `detectorMeta`, `reconcile.recover` outcomes reading `escalated` / `escalation-held` / `terminal-workflow` instead of an endless `redispatched`, and a `deadSessionRetries` entry on the workflow row that stops at 2. |
+
 Runtime-image CD landed in PR 2 — a baked source change (persona tool code) now
 deploys automatically. Only runtime env / lifecycle / IAM / EFS changes (which
 need `UpdateFunctionConfiguration`-class perms the narrow roles lack) remain a

@@ -237,7 +237,8 @@ export function createDetector(deps) {
     // old cap escalated a round early - it paged a human for the class of
     // failure that self-heals. The escalation path below is unchanged; only how
     // many times the same persona is re-dispatched into it changed.
-    if (priorRetries <= 1) {
+    const cap = lease?.DEAD_SESSION_MAX_AUTO_RESUMES ?? 2;
+    if (priorRetries < cap) {
       await store.incrementDeadSessionRetry(workflow.id, ticketId);
       // Re-dispatch through the NORMAL path: claim CAS → invoke. The CAS is
       // the final arbiter (the steal flipped status→ready, so it wins).
@@ -403,11 +404,27 @@ export function createDetector(deps) {
             continue;
           }
 
-          // ── GUARD 1 (MANDATORY, FIRST): the lease must be DEAD. ──────────────
+          // ── POSITIVE DEATH (TEAM-4889): the runtime already said so. ─────
+          // agent.died is emitted from the runtime's finally path instead of
+          // agent.error when there was no completion and no self-park. Read it
+          // before GUARD 1 so a fresh heartbeat cannot resurrect a generation
+          // whose process is known gone. Read failure fails safe: skip this
+          // candidate rather than steal on ignorance; no probe injected keeps the
+          // legacy threshold path.
+          let positiveDeath = false;
+          if (lease.hasAgentErrorSince) try {
+            positiveDeath = await lease.hasAgentErrorSince(
+              ddb, eventsTable, workflow.id, ticketId, task.startedAt, { types: ["agent.died"] });
+          } catch (e) {
+            log(`detector.died_read_failed — ${ticketId} ${e?.message || e} (sweep ${sweepId})`);
+            continue;
+          }
+
+          // ── GUARD 1: the lease must be DEAD or positively dead. ─────────────
           const lastActivity = await lease.lastAgentActivity(
             ddb, eventsTable, workflow.id, agentId, ticketId
           );
-          if (lease.isLeaseLive(task, lastActivity, startedAtMs)) {
+          if (lease.isLeaseLive(task, lastActivity, startedAtMs, undefined, { positiveDeath })) {
             m.skippedLiveLease++;
             // A stamp on a LIVE lease is residue of a clear that failed or
             // raced (TEAM-3702) — retry the generation-CAS'd clear so the
@@ -433,26 +450,8 @@ export function createDetector(deps) {
           // write) — nothing dead to recover.
           if (await hasCompletionSince(workflow.id, ticketId, task.startedAt)) continue;
 
-          // ── POSITIVE DEATH (TEAM-4739 FR-7): the runtime already said so. ────
-          // agent.died is the persona's own report that its turn stopped being
-          // given time - no completion, no self-park, no raise. That is proof,
-          // not inference, so it overrides GUARD 2's statistical threshold:
-          // making a claim nothing will ever finish wait out a median-derived
-          // silence window is pure added latency. GUARD 1 above still ran first
-          // and still had to find the lease dead. A failed read leaves the claim
-          // alone (fail toward silence) - the threshold path recovers it anyway.
-          // An injection with no probe at all is NOT a failure: it degrades to the
-          // threshold path rather than disabling the reaper.
-          let positiveDeath = false;
-          if (lease.hasAgentErrorSince) try {
-            positiveDeath = await lease.hasAgentErrorSince(
-              ddb, eventsTable, workflow.id, ticketId, task.startedAt, { types: ["agent.died"] });
-          } catch (e) {
-            log(`detector.died_read_failed — ${ticketId} ${e?.message || e} (sweep ${sweepId})`);
-            continue;
-          }
-
-          // ── GUARD 2: silence must exceed the per-agent threshold. ────────────
+          // ── GUARD 2: silence must exceed the per-agent threshold unless an
+          // agent.died row scoped to this generation already proves death. ─────
           const { medianMs, sampleCount } = await rollingMedian(agentId);
           const threshold = computeThreshold(medianMs, sampleCount);
           const startedMs = task.startedAt ? Date.parse(task.startedAt) : 0;
@@ -528,7 +527,7 @@ export function createDetector(deps) {
           const recheckActivity = await lease.lastAgentActivity(
             ddb, eventsTable, workflow.id, agentId, ticketId
           );
-          if (lease.isLeaseLive(task, recheckActivity, now())) {
+          if (lease.isLeaseLive(task, recheckActivity, now(), undefined, { positiveDeath })) {
             m.skippedLiveLease++;
             const cleared = await store.clearDeadSessionDetected(workflow.id, ticketId, task.startedAt);
             if (cleared) {

@@ -172,7 +172,7 @@ describe("first dead session (retry count 0)", () => {
   });
 });
 
-// TEAM-4739: the cap is TWO auto-resumes (priorRetries <= 1 re-drives), because a
+// TEAM-4739: the cap is TWO auto-resumes (priorRetries < 2 re-drives), because a
 // persona killed by a platform timeout usually survives the second attempt and the
 // old one-retry cap escalated recoverable turns. The THIRD death escalates.
 describe("second dead session, same ticket (one auto-resume still left)", () => {
@@ -1215,11 +1215,9 @@ describe("TEAM-3756 F5 — the detector's workflow scan excludes EVERY terminal 
 // ── TEAM-4739 FR-7: positive death ───────────────────────────────────────────
 //
 // `agent.died` is the runtime's own report that a turn stopped being given time.
-// It is PROOF, not inference, so it must override GUARD 2's statistical silence
-// threshold - making a claim nothing will ever finish wait out a median-derived
-// window is pure added latency. What it must NOT override is GUARD 1: a lease
-// that reads live is still untouchable, because a live lease means a NEW
-// generation is running and the death belongs to the previous one.
+// It is PROOF, not inference, so it must override both the statistical silence
+// threshold and the TTL-only live-lease math for THIS claim generation. The
+// since=startedAt probe scope keeps older death rows from killing newer claims.
 describe("positive death via agent.died (TEAM-4739)", () => {
   // A claim 60s old: silence (60s) is far BELOW the 60min fallback threshold, so
   // the threshold path alone would never fire on it.
@@ -1254,20 +1252,18 @@ describe("positive death via agent.died (TEAM-4739)", () => {
       deps.ddb, "events", "wf_1", "TEAM-2", FRESH_STARTED, { types: ["agent.died"] });
   });
 
-  it("does NOT override the live-lease guard — a live lease stays untouched", async () => {
+  it("overrides a fresh TTL lease when agent.died is scoped to this generation", async () => {
     const { deps, store, lease } = makeDeps({ ddb: makeDdb({ workflows: [freshWorkflow()] }) });
-    lease.isLeaseLive.mockReturnValue(true);
+    lease.isLeaseLive.mockImplementation((_task, _activity, _now, _ttl, opts) => !opts?.positiveDeath);
     lease.hasAgentErrorSince = vi.fn(async () => true);
     const { runSweep } = createDetector(deps);
 
     const m = await runSweep("enforce");
 
-    expect(m.skippedLiveLease).toBe(1);
-    expect(m.fired).toBe(0);
-    // GUARD 1 short-circuits BEFORE the death read is even attempted.
-    expect(lease.hasAgentErrorSince).not.toHaveBeenCalled();
-    expect(store.markDeadSessionDetected).not.toHaveBeenCalled();
-    expect(lease.stealClaim).not.toHaveBeenCalled();
+    expect(m.fired).toBe(1);
+    expect(lease.hasAgentErrorSince).toHaveBeenCalledTimes(1);
+    expect(store.markDeadSessionDetected).toHaveBeenCalledWith("wf_1", "TEAM-2", FRESH_STARTED);
+    expect(lease.stealClaim).toHaveBeenCalledTimes(1);
   });
 
   it("no agent.died + below threshold: still a no-op (the read cannot invent a death)", async () => {
