@@ -1126,7 +1126,7 @@ describe("W3 — a closed gate re-filed against the same BINDING (TEAM-4739, TEA
       siblings: [
         { ticketId: DONE, status: "done", type: "task" },
         { ticketId: "GATE-1", status: "done", type: "task", updatedAt: CLOSED_AT,
-          labels: [`gate-deploy-approval,exec-${EXEC_A.toUpperCase()}`] },
+          labels: `gate-deploy-approval,exec-${EXEC_A.toUpperCase()}` },
         { ticketId: "GATE-2", status: "todo", type: "task", labels: ["gate:deploy-approval", `exec:${EXEC_A}`],
           createdAt: new Date(Date.parse(CLOSED_AT) + 60_000).toISOString() },
       ],

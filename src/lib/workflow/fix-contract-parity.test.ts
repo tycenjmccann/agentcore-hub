@@ -448,7 +448,7 @@ describe("contractLabels / sanitizeUserLabels / escapeJql agree across copies", 
     });
 
     it("sameGateBinding is symmetric, and an unknown kind never binds", () => {
-      const same = (m: { sameGateBinding: (k: string, a: unknown, b: unknown) => boolean }) =>
+      const same = (m: { sameGateBinding: (k: unknown, a: unknown, b: unknown) => boolean }) =>
         m.sameGateBinding;
       const a = deploy([`exec:${EXEC_A}`]);
       const b = deploy([`exec:${EXEC_A}`]);
