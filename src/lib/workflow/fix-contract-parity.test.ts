@@ -340,6 +340,159 @@ describe("contractLabels / sanitizeUserLabels / escapeJql agree across copies", 
     expect(agree("junk", (m) => m.gateKindsOf([null, 7, "  "]))).toEqual([]);
   });
 
+  it("labelList normalizes a label list one way for every reader (TEAM-4987)", () => {
+    // The ONE spelling of "what a label list is": array or comma-joined string in,
+    // trimmed + lowercased, blanks dropped. gateKindsOf, the binding readers and
+    // gate-contract's own gatePipelineOf all go through it, so a label that one
+    // reader sees is a label they ALL see.
+    expect(agree("array", (m) => m.labelList([" Gate:Approval ", "x"]))).toEqual([
+      "gate:approval",
+      "x",
+    ]);
+    expect(agree("string", (m) => m.labelList("a, B ,, c"))).toEqual(["a", "b", "c"]);
+    expect(agree("junk", (m) => m.labelList([null, undefined, "  ", 7]))).toEqual(["7"]);
+    expect(agree("absent", (m) => m.labelList(undefined))).toEqual([]);
+  });
+
+  describe("gate BINDINGS — what a gate is about, not just what kind it is (TEAM-4987)", () => {
+    const EXEC_A = "11111111-2222-3333-4444-555555555555";
+    const EXEC_B = "66666666-7777-8888-9999-aaaaaaaaaaaa";
+    const HEAD_A = "a".repeat(40);
+    const HEAD_B = "b".repeat(40);
+    const deploy = (labels: string[], blockedBy?: string[]) => ({
+      labels: ["gate:deploy-approval", ...labels],
+      ...(blockedBy ? { blockedBy } : {}),
+    });
+    const blocker = (labels: string[] = [], blockedBy?: string[]) => ({
+      labels: ["gate:blocker", ...labels],
+      ...(blockedBy ? { blockedBy } : {}),
+    });
+
+    it("gateHeadOf / gateExecOf read both spellings, lowercase, first match wins", () => {
+      expect(agree("exec colon", (m) => m.gateExecOf([`exec:${EXEC_A}`]))).toBe(EXEC_A);
+      expect(agree("exec hyphen + case", (m) => m.gateExecOf([`exec-${EXEC_A.toUpperCase()}`]))).toBe(
+        EXEC_A
+      );
+      expect(agree("exec string form", (m) => m.gateExecOf(`gate:deploy-approval, exec:${EXEC_A}`))).toBe(
+        EXEC_A
+      );
+      expect(agree("exec first of two", (m) => m.gateExecOf([`exec:${EXEC_A}`, `exec:${EXEC_B}`]))).toBe(
+        EXEC_A
+      );
+      expect(agree("no exec", (m) => m.gateExecOf(["gate:deploy-approval"]))).toBeNull();
+      expect(agree("head colon", (m) => m.gateHeadOf([`head:${HEAD_A.toUpperCase()}`]))).toBe(HEAD_A);
+      expect(agree("head hyphen", (m) => m.gateHeadOf([`head-${HEAD_A}`]))).toBe(HEAD_A);
+      // 40 hex exactly — a short SHA is not a binding.
+      expect(agree("short sha", (m) => m.gateHeadOf(["head:abc1234"]))).toBeNull();
+      expect(agree("no head", (m) => m.gateHeadOf(undefined))).toBeNull();
+    });
+
+    it("a deploy gate is bound to its exec: and to NOTHING else", () => {
+      const same = (m: { sameGateBinding: (k: string, a: unknown, b: unknown) => boolean }) =>
+        m.sameGateBinding;
+      expect(
+        agree("same exec", (m) =>
+          same(m)("deploy-approval", deploy([`exec:${EXEC_A}`]), deploy([`exec-${EXEC_A}`]))
+        )
+      ).toBe(true);
+      // The wf_bug_TEAM-4798 shape: two executions, two decisions, not a re-file.
+      expect(
+        agree("different exec", (m) =>
+          same(m)("deploy-approval", deploy([`exec:${EXEC_A}`]), deploy([`exec:${EXEC_B}`]))
+        )
+      ).toBe(false);
+      expect(
+        agree("one side unbound", (m) => same(m)("deploy-approval", deploy([`exec:${EXEC_A}`]), deploy([])))
+      ).toBe(false);
+      expect(agree("both unbound", (m) => same(m)("deploy-approval", deploy([]), deploy([])))).toBe(false);
+      // A shared head or blocker is NOT a deploy binding — four CD follow-ups off
+      // one merge commit share a head while approving four different executions.
+      expect(
+        agree("shared head does not bind a deploy gate", (m) =>
+          same(m)(
+            "deploy-approval",
+            deploy([`head:${HEAD_A}`, `exec:${EXEC_A}`], ["TEAM-9"]),
+            deploy([`head:${HEAD_A}`, `exec:${EXEC_B}`], ["TEAM-9"])
+          )
+        )
+      ).toBe(false);
+    });
+
+    it("every other kind is bound by head: when both carry one, else by blocked_by", () => {
+      const same = (m: { sameGateBinding: (k: string, a: unknown, b: unknown) => boolean }) =>
+        m.sameGateBinding;
+      expect(
+        agree("same head", (m) => same(m)("blocker", blocker([`head:${HEAD_A}`]), blocker([`head-${HEAD_A}`])))
+      ).toBe(true);
+      expect(
+        agree("different head", (m) =>
+          same(m)("blocker", blocker([`head:${HEAD_A}`]), blocker([`head:${HEAD_B}`]))
+        )
+      ).toBe(false);
+      // Head on one side only → it cannot decide; fall through to blocked_by.
+      expect(
+        agree("head one side, blockers overlap", (m) =>
+          same(m)("blocker", blocker([`head:${HEAD_A}`], ["TEAM-9"]), blocker([], ["TEAM-9", "TEAM-8"]))
+        )
+      ).toBe(true);
+      expect(
+        agree("blockers overlap", (m) =>
+          same(m)("ci-unavailable", { labels: ["gate:ci-unavailable"], blockedBy: "TEAM-9, TEAM-8" },
+            { labels: ["gate:ci-unavailable"], blockedBy: ["team-8"] })
+        )
+      ).toBe(true);
+      expect(
+        agree("blockers disjoint", (m) => same(m)("blocker", blocker([], ["TEAM-9"]), blocker([], ["TEAM-7"])))
+      ).toBe(false);
+      expect(agree("no binding at all", (m) => same(m)("blocker", blocker(), blocker()))).toBe(false);
+    });
+
+    it("sameGateBinding is symmetric, and an unknown kind never binds", () => {
+      const same = (m: { sameGateBinding: (k: unknown, a: unknown, b: unknown) => boolean }) =>
+        m.sameGateBinding;
+      const a = deploy([`exec:${EXEC_A}`]);
+      const b = deploy([`exec:${EXEC_A}`]);
+      expect(agree("a,b", (m) => same(m)("deploy-approval", a, b))).toBe(
+        agree("b,a", (m) => same(m)("deploy-approval", b, a))
+      );
+      expect(agree("unknown kind", (m) => same(m)("nope", a, b))).toBe(false);
+      expect(agree("blank kind", (m) => same(m)("  ", a, b))).toBe(false);
+      expect(agree("undefined kind", (m) => same(m)(undefined, a, b))).toBe(false);
+    });
+
+    it("gateRefileBindingMatches is the whole rule — deploy-approval governs alone", () => {
+      // A real deploy gate carries BOTH `gate:approval` and `gate:deploy-approval`.
+      // Letting the generic kind vote too would re-admit the bug through a shared
+      // head or blocked_by while the executions differ, so the most-specific kind
+      // wins — the same precedence probedGateKindOf applies in the twins.
+      const withBoth = (exec: string) => ({
+        labels: ["gate:approval", "gate:deploy-approval", `head:${HEAD_A}`, `exec:${exec}`],
+        blockedBy: ["TEAM-9"],
+      });
+      expect(agree("precedence", (m) => m.gateRefileBindingMatches(withBoth(EXEC_A), withBoth(EXEC_B)))).toBe(
+        false
+      );
+      expect(agree("precedence same exec", (m) =>
+        m.gateRefileBindingMatches(withBoth(EXEC_A), withBoth(EXEC_A))
+      )).toBe(true);
+      // No shared kind is no re-file, however well the bindings line up.
+      expect(
+        agree("no shared kind", (m) =>
+          m.gateRefileBindingMatches(blocker([`head:${HEAD_A}`]), {
+            labels: ["gate:ci-unavailable", `head:${HEAD_A}`],
+          })
+        )
+      ).toBe(false);
+      // And kind alone, with nothing bound, is never a re-file — TEAM-4987 itself.
+      expect(
+        agree("kind alone", (m) =>
+          m.gateRefileBindingMatches({ labels: ["gate:deploy-approval"] }, { labels: ["gate:deploy-approval"] })
+        )
+      ).toBe(false);
+      expect(agree("non-gate rows", (m) => m.gateRefileBindingMatches({}, {}))).toBe(false);
+    });
+  });
+
   it("does NOT export the twin-only gate contract (gate-contract.mjs is not here)", () => {
     // fix-contract.mjs is import-free and lives in THREE zips; the probe/journey/
     // console-link half of the gate contract does I/O and lives only in the two

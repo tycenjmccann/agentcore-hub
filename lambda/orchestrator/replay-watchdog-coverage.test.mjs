@@ -169,19 +169,23 @@ describe("replay fz514x / 37ule1 — an unanswered human gate now pages (TEAM-47
   });
 });
 
-describe("replay TEAM-4660 — 06:20Z close, 07:30Z re-file is NOT a loop (TEAM-4739 W3)", () => {
+describe("replay TEAM-4660 — 06:20Z close, 07:30Z re-file is NOT a loop (TEAM-4739 W3, TEAM-4987)", () => {
   const CLOSED = "2026-09-14T06:20:00Z";
   const REFILED = "2026-09-14T07:30:00Z";
   const NOW = at("2026-09-14T08:00:00Z");
+  // The execution TEAM-4660's deploy gate was bound to. Every fixture below carries
+  // it, so the window / NaN cases keep testing the rule they were written for rather
+  // than going silent on a missing binding (TEAM-4987).
+  const EXEC = "4c1f9d2e-7b3a-4e51-9c8d-0a6b2f7e1d43";
   const closedGate = {
     ticketId: "TEAM-4660", type: "task", status: "done", assignee: "human:tycen",
-    labels: ["gate:deploy-approval"], updatedAt: CLOSED, createdAt: "2026-09-14T05:00:00Z",
+    labels: ["gate:deploy-approval", `exec:${EXEC}`], updatedAt: CLOSED, createdAt: "2026-09-14T05:00:00Z",
   };
 
   it("70 minutes apart is sequential work — no false fire", async () => {
     const later = {
       ticketId: "TEAM-4661", type: "task", status: "in_review", assignee: "human:tycen",
-      labels: ["gate:deploy-approval"], updatedAt: REFILED, createdAt: REFILED,
+      labels: ["gate:deploy-approval", `exec:${EXEC}`], updatedAt: REFILED, createdAt: REFILED,
     };
     const s = makeSweep({ workflow: wf("37ule1", "TEAM-4640"), siblings: [closedGate, later], nowMs: NOW });
 
@@ -194,12 +198,12 @@ describe("replay TEAM-4660 — 06:20Z close, 07:30Z re-file is NOT a loop (TEAM-
   });
 
   it("the SAME pair 25 minutes apart is the loop, and it does fire", async () => {
-    // The discriminator is the gap, not the shape: a gate re-filed inside 30m of
-    // its own close is the close/re-file cycle each turn of which looks like
-    // local progress.
+    // The discriminator is the gap AND the binding, not the shape: the SAME
+    // decision re-filed inside 30m of its own close is the close/re-file cycle
+    // each turn of which looks like local progress.
     const quick = {
       ticketId: "TEAM-4662", type: "task", status: "in_review", assignee: "human:tycen",
-      labels: ["gate:deploy-approval"], updatedAt: "2026-09-14T06:45:00Z", createdAt: "2026-09-14T06:45:00Z",
+      labels: ["gate:deploy-approval", `exec:${EXEC}`], updatedAt: "2026-09-14T06:45:00Z", createdAt: "2026-09-14T06:45:00Z",
     };
     const s = makeSweep({ workflow: wf("37ule1", "TEAM-4640"), siblings: [closedGate, quick], nowMs: NOW });
 
@@ -210,6 +214,25 @@ describe("replay TEAM-4660 — 06:20Z close, 07:30Z re-file is NOT a loop (TEAM-
     expect(s.notifications[0].notification.watch).toBe("watch_refile");
   });
 
+  // TEAM-4987: the same 25-minute gap, the same kind, a DIFFERENT execution. This is
+  // the wf_bug_TEAM-4798 hand-off — the human answered the deploy gate for one CD
+  // execution and the next follow-up filed the gate for the next one. Nothing is
+  // looping, so nothing may page. This is the mutation check for the binding rule:
+  // dropping it back to kind-overlap makes this one fail.
+  it("TEAM-4987: the same gap against a DIFFERENT execution is a hand-off — no page", async () => {
+    const nextExecution = {
+      ticketId: "TEAM-4667", type: "task", status: "in_review", assignee: "human:tycen",
+      labels: ["gate:deploy-approval", "exec:9f0e8d7c-6b5a-4938-8271-1a2b3c4d5e6f"],
+      updatedAt: "2026-09-14T06:45:00Z", createdAt: "2026-09-14T06:45:00Z",
+    };
+    const s = makeSweep({ workflow: wf("37ule1", "TEAM-4640"), siblings: [closedGate, nextExecution], nowMs: NOW });
+
+    const m = await s.runSweep();
+
+    expect(m.watchRefile).toBe(0);
+    expect(s.notifications.map((n) => n.id)).not.toContain("notif_watch_refile_TEAM-4660");
+  });
+
   // SR2-4: the window used to be Math.abs(createdAt - closedMs) <= refileMs, which
   // is SYMMETRIC — a sibling already open 10m BEFORE the close (not a re-file at
   // all) fell inside it and paged a false watch_refile. This is the mutation
@@ -217,7 +240,7 @@ describe("replay TEAM-4660 — 06:20Z close, 07:30Z re-file is NOT a loop (TEAM-
   it("SR2-4: a same-kind sibling created 10m BEFORE the close is not a re-file — no page", async () => {
     const before = {
       ticketId: "TEAM-4663", type: "task", status: "in_review", assignee: "human:tycen",
-      labels: ["gate:deploy-approval"], updatedAt: "2026-09-14T06:10:00Z", createdAt: "2026-09-14T06:10:00Z",
+      labels: ["gate:deploy-approval", `exec:${EXEC}`], updatedAt: "2026-09-14T06:10:00Z", createdAt: "2026-09-14T06:10:00Z",
     };
     const s = makeSweep({ workflow: wf("37ule1", "TEAM-4640"), siblings: [closedGate, before], nowMs: NOW });
 
@@ -230,7 +253,7 @@ describe("replay TEAM-4660 — 06:20Z close, 07:30Z re-file is NOT a loop (TEAM-
   it("SR2-4: the same shape 10m AFTER the close still pages", async () => {
     const after = {
       ticketId: "TEAM-4664", type: "task", status: "in_review", assignee: "human:tycen",
-      labels: ["gate:deploy-approval"], updatedAt: "2026-09-14T06:30:00Z", createdAt: "2026-09-14T06:30:00Z",
+      labels: ["gate:deploy-approval", `exec:${EXEC}`], updatedAt: "2026-09-14T06:30:00Z", createdAt: "2026-09-14T06:30:00Z",
     };
     const s = makeSweep({ workflow: wf("37ule1", "TEAM-4640"), siblings: [closedGate, after], nowMs: NOW });
 
@@ -244,7 +267,7 @@ describe("replay TEAM-4660 — 06:20Z close, 07:30Z re-file is NOT a loop (TEAM-
     const nanClosedGate = { ...closedGate, updatedAt: "not-a-date" };
     const validSibling = {
       ticketId: "TEAM-4665", type: "task", status: "in_review", assignee: "human:tycen",
-      labels: ["gate:deploy-approval"], updatedAt: "2026-09-14T06:30:00Z", createdAt: "2026-09-14T06:30:00Z",
+      labels: ["gate:deploy-approval", `exec:${EXEC}`], updatedAt: "2026-09-14T06:30:00Z", createdAt: "2026-09-14T06:30:00Z",
     };
     const s = makeSweep({ workflow: wf("37ule1", "TEAM-4640"), siblings: [nanClosedGate, validSibling], nowMs: NOW });
 
@@ -257,7 +280,7 @@ describe("replay TEAM-4660 — 06:20Z close, 07:30Z re-file is NOT a loop (TEAM-
   it("SR2-4: an unparseable sibling createdAt never pages, even against a valid close", async () => {
     const garbageSibling = {
       ticketId: "TEAM-4666", type: "task", status: "in_review", assignee: "human:tycen",
-      labels: ["gate:deploy-approval"], updatedAt: "2026-09-14T06:30:00Z", createdAt: undefined,
+      labels: ["gate:deploy-approval", `exec:${EXEC}`], updatedAt: "2026-09-14T06:30:00Z", createdAt: undefined,
     };
     const s = makeSweep({ workflow: wf("37ule1", "TEAM-4640"), siblings: [closedGate, garbageSibling], nowMs: NOW });
 

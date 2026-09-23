@@ -41,8 +41,9 @@
 
 import { newMetrics as newCascadeMetrics } from "./cascade.mjs";
 // The ONE gate-label vocabulary (TEAM-4739 WP1) — W3 must recognise "the same
-// kind of gate" exactly as the twins that refuse and stamp them do.
-import { gateKindsOf } from "./fix-contract.mjs";
+// gate, re-filed" exactly as the twins that refuse and stamp them do: the same kind
+// AND the same binding (TEAM-4987), which is what gateRefileBindingMatches decides.
+import { gateKindsOf, gateExecOf, gateHeadOf, gateRefileBindingMatches } from "./fix-contract.mjs";
 // The ONE open-workflow scan, shared with dead-session-detector.mjs
 // (TEAM-3839). Carries the TEAM-3764 F5 rotating window and the TEAM-3755
 // F8-derived terminal-phase filter. SWEEP_ROTATION_QUANTUM_MS is re-exported
@@ -187,17 +188,29 @@ export function createReconcileSweep(deps) {
       }
     }
 
-    // W3 — a closed gate re-filed (created AT OR AFTER the close) as the same kind.
+    // W3 — a closed gate re-filed (created AT OR AFTER the close) as the same kind
+    // AND against the same BINDING. Kind alone is not a re-file: four serial CD
+    // follow-ups under one Bug parent each close a deploy gate and file the next one
+    // minutes later, for four DIFFERENT pipeline executions, and paging a human
+    // about that healthy run is TEAM-4987. gateRefileBindingMatches owns the whole
+    // rule (`exec:` for a deploy gate, `head:`/blocked_by otherwise, deploy-approval
+    // governing when a ticket carries both kinds) so this watch keeps no gate
+    // vocabulary of its own.
     const kinds = gateKindsOf(sibling.labels);
     if (kinds.length && sibling.status === "done") {
       const closedMs = Date.parse(sibling.updatedAt || "");
       const refiled = siblings.some((s) => s && s.ticketId !== ticketId
         && !TERMINAL_TICKET_STATUSES.has(s.status)
-        && gateKindsOf(s.labels).some((k) => kinds.includes(k))
+        && gateRefileBindingMatches(sibling, s)
         && Date.parse(s.createdAt || "") >= closedMs && Date.parse(s.createdAt || "") <= closedMs + WATCH.refileMs);
       if (refiled) {
+        // Name the binding in the page: "the deploy gate for exec X" is actionable,
+        // "a deploy gate" makes the human re-derive which decision is looping.
+        const exec = gateExecOf(sibling.labels);
+        const head = gateHeadOf(sibling.labels);
+        const bound = exec ? ` (exec:${exec})` : head ? ` (head:${head})` : "";
         await page(`notif_watch_refile_${ticketId}`, "watch_refile",
-          `gate ${kinds.join(",")} closed then re-filed within 30m`, "watchRefile");
+          `gate ${kinds.join(",")}${bound} closed then re-filed within 30m against the same binding`, "watchRefile");
       }
     }
   }
