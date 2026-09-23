@@ -152,15 +152,128 @@ export const GATE_KINDS = [
 export const GATE_LABEL_RE =
   /^gate[:-](approval|deploy-approval|blocker|ci-unavailable|awaiting-console|loop-broken)$/;
 
+/**
+ * A ticket's labels as a normalized list: an array or a comma-joined string in;
+ * trimmed, lowercased, blanks dropped out. Exported because gate-contract.mjs's own
+ * readers (gatePipelineOf) need the SAME normalization — one spelling of "what a
+ * label list is", not two.
+ */
+export function labelList(labels) {
+  const list = Array.isArray(labels) ? labels : typeof labels === "string" ? labels.split(",") : [];
+  return list.map((l) => String(l ?? "").trim().toLowerCase()).filter(Boolean);
+}
+
 /** The gate kinds a label list carries, deduped, in GATE_KINDS order. */
 export function gateKindsOf(labels) {
-  const list = Array.isArray(labels) ? labels : typeof labels === "string" ? labels.split(",") : [];
   const found = new Set();
-  for (const raw of list) {
-    const m = GATE_LABEL_RE.exec(String(raw ?? "").trim().toLowerCase());
+  for (const l of labelList(labels)) {
+    const m = GATE_LABEL_RE.exec(l);
     if (m) found.add(m[1]);
   }
   return GATE_KINDS.filter((k) => found.has(k));
+}
+
+// ── Gate BINDINGS ───────────────────────────────────────────────────────────
+// A gate's KIND says what its close asserts; its BINDING says what ABOUT. The two
+// are read together or not at all: a deploy-approval gate for execution A and one
+// for execution B are two different decisions about two different deploys, and the
+// only thing that tells them apart is the `exec:` label.
+//
+// These moved here from gate-contract.mjs (TEAM-4987) because the ORCHESTRATOR has
+// to read a binding too and cannot import that module — it does I/O, it is not on
+// lambda/orchestrator/deploy.sh's zip line, and it is excluded from the DL-009
+// budgets. gate-contract.mjs imports them from here and RE-EXPORTS them, so every
+// existing importer (both twins' index.mjs, the parity tests) is unchanged.
+//
+// Both spellings, like every other gate-label reader: agents write the canonical
+// colon form and the twins' sanitizeUserLabels rewrites [^a-z0-9._-] → "-", so the
+// SAME gate can be stored as `head-<sha>` / `exec-<uuid>`. The cross-surface table
+// that pins these against the Telegram bridge's own literals is
+// src/lib/workflow/gate-label-readers.test.ts.
+export const HEAD_LABEL_RE = /^head[:-]([0-9a-f]{40})$/i;
+export const EXEC_LABEL_RE = /^exec[:-]([0-9a-f-]{36})$/i;
+
+function firstCapture(labels, re) {
+  for (const l of labelList(labels)) {
+    const m = re.exec(l);
+    if (m) return m[1].toLowerCase();
+  }
+  return null;
+}
+
+/** The commit SHA a gate ticket is bound to, from `head:<40hex>`. */
+export function gateHeadOf(labels) {
+  return firstCapture(labels, HEAD_LABEL_RE);
+}
+
+/** The pipeline execution a gate ticket is bound to, from `exec:<uuid>`. */
+export function gateExecOf(labels) {
+  return firstCapture(labels, EXEC_LABEL_RE);
+}
+
+/**
+ * Do two gate tickets of ONE kind share the binding that makes the second a
+ * RE-FILE of the first rather than a new decision? PURE and symmetric; `a` and `b`
+ * are ticket rows ({labels, blockedBy}, each an array or a comma-joined string).
+ *
+ * Per-kind, because the kinds are bound by different things:
+ *   deploy-approval  the same `exec:<id>`, and NOTHING else — not the head, not
+ *                    blocked_by. Four serial CD follow-ups under one Bug parent
+ *                    legitimately file four deploy gates for four executions
+ *                    (wf_bug_TEAM-4798).
+ *   every other kind the same `head:` when BOTH sides carry one, otherwise an
+ *                    overlapping non-empty blocked_by set. A blocker gate is bound
+ *                    to the tickets it names, or to the commit it was gathered on.
+ *
+ * NEVER the kind alone. Two unbound gates of one kind under one epic are evidence
+ * of nothing, and that fallback is the whole of TEAM-4986 (a legitimate deploy gate
+ * refused at create time) and TEAM-4987 (the orchestrator's W3 watch paging a human
+ * about a healthy run).
+ *
+ * gateLoopVerdict (gate-contract.mjs) answers the same question at CREATE time and
+ * is being rewritten to this rule in PR #669; once that lands it should delegate
+ * here rather than keep a second spelling of the rule.
+ */
+export function sameGateBinding(kind, a, b) {
+  const k = String(kind ?? "")
+    .trim()
+    .toLowerCase();
+  if (!GATE_KINDS.includes(k)) return false;
+  if (k === "deploy-approval") {
+    const exec = gateExecOf(a?.labels);
+    return Boolean(exec) && exec === gateExecOf(b?.labels);
+  }
+  const head = gateHeadOf(a?.labels);
+  const otherHead = gateHeadOf(b?.labels);
+  if (head && otherHead) return head === otherHead;
+  // blocked_by goes through labelList for the same normalization (array or comma
+  // string, trimmed, blanks dropped). Ids therefore compare case-insensitively,
+  // which no ticket-id scheme in play here distinguishes.
+  const blockers = labelList(a?.blockedBy);
+  return blockers.length > 0 && labelList(b?.blockedBy).some((id) => blockers.includes(id));
+}
+
+/**
+ * Is gate ticket `b` a re-file of gate ticket `a`? The whole rule, so a caller needs
+ * no kind vocabulary of its own: the kinds the two SHARE, with `deploy-approval` as
+ * the SOLE governing kind whenever it is one of them.
+ *
+ * That precedence mirrors probedGateKindOf (gate-contract.mjs), which picks one
+ * governing kind in PROBED_GATE_KINDS order for exactly the same reason: a real
+ * deploy gate carries `gate:approval` AND `gate:deploy-approval`, so letting the
+ * generic `approval` kind vote too would re-admit the bug through a shared head or
+ * blocked_by while the two executions differ.
+ *
+ * Consumer: the orchestrator's W3 "closed gate re-filed" watch
+ * (reconcile-sweep.mjs). Observational only — it pages a human and never refuses a
+ * create; the create-time refusal is gateLoopVerdict's half of the same rule.
+ */
+export function gateRefileBindingMatches(a, b) {
+  const otherKinds = gateKindsOf(b?.labels);
+  const shared = gateKindsOf(a?.labels).filter((k) => otherKinds.includes(k));
+  if (shared.length === 0) return false;
+  const governing = shared.includes("deploy-approval") ? ["deploy-approval"] : shared;
+  return governing.some((k) => sameGateBinding(k, a, b));
 }
 
 export const TICKET_KEY_RE = /^[A-Z][A-Z0-9]+-\d+$/;

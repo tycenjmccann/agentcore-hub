@@ -62,7 +62,16 @@
 
 import { LambdaClient, InvokeCommand } from "@aws-sdk/client-lambda";
 import { PutCommand } from "@aws-sdk/lib-dynamodb";
-import { GATE_KINDS, gateKindsOf, MAX_LABEL } from "./fix-contract.mjs";
+import {
+  GATE_KINDS,
+  gateKindsOf,
+  MAX_LABEL,
+  labelList,
+  HEAD_LABEL_RE,
+  EXEC_LABEL_RE,
+  gateHeadOf,
+  gateExecOf,
+} from "./fix-contract.mjs";
 
 // ── Label grammar ───────────────────────────────────────────────────────────
 // Labels arrive in two spellings and must read identically: agents write the
@@ -70,20 +79,15 @@ import { GATE_KINDS, gateKindsOf, MAX_LABEL } from "./fix-contract.mjs";
 // [^a-z0-9._-] → "-", so the SAME gate can be stored as `head-<sha>` /
 // `exec-<uuid>` / `gate-merge-approval`. Same `[:-]` rule as the Telegram
 // bridge's parseDeployApprovalLabels and fix-contract.mjs's GATE_LABEL_RE.
-export const HEAD_LABEL_RE = /^head[:-]([0-9a-f]{40})$/i;
-export const EXEC_LABEL_RE = /^exec[:-]([0-9a-f-]{36})$/i;
+//
+// The BINDING half of that grammar — HEAD_LABEL_RE / EXEC_LABEL_RE / gateHeadOf /
+// gateExecOf, and the labelList normalization they share — now lives in
+// fix-contract.mjs (TEAM-4987), the module all THREE Lambdas carry, because the
+// orchestrator's W3 re-file watch has to read a binding too and cannot import this
+// module. It is RE-EXPORTED here unchanged, so every importer of this module keeps
+// working and the two halves still read as one vocabulary.
+export { HEAD_LABEL_RE, EXEC_LABEL_RE, gateHeadOf, gateExecOf };
 export const MERGE_GATE_LABEL_RE = /^gate[:-]merge-approval$/;
-
-function labelList(labels) {
-  const list = Array.isArray(labels) ? labels : typeof labels === "string" ? labels.split(",") : [];
-  return list
-    .map((l) =>
-      String(l ?? "")
-        .trim()
-        .toLowerCase()
-    )
-    .filter(Boolean);
-}
 
 function firstCapture(labels, re) {
   for (const l of labelList(labels)) {
@@ -91,16 +95,6 @@ function firstCapture(labels, re) {
     if (m) return m[1].toLowerCase();
   }
   return null;
-}
-
-/** The commit SHA a gate ticket is bound to, from `head:<40hex>`. */
-export function gateHeadOf(labels) {
-  return firstCapture(labels, HEAD_LABEL_RE);
-}
-
-/** The pipeline execution a gate ticket is bound to, from `exec:<uuid>`. */
-export function gateExecOf(labels) {
-  return firstCapture(labels, EXEC_LABEL_RE);
 }
 
 // The third binding: which pipeline the gate belongs to. The Telegram bridge's
