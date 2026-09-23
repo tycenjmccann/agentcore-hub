@@ -106,16 +106,19 @@ describe("every gate-label reader accepts BOTH spellings", () => {
       "gate:ci-unavailable",
       "gate-ci-unavailable",
     ],
-    ["gate-contract HEAD_LABEL_RE", (l) => HEAD_LABEL_RE.test(l), `head:${SHA}`, `head-${SHA}`],
-    ["gate-contract EXEC_LABEL_RE", (l) => EXEC_LABEL_RE.test(l), `exec:${UUID}`, `exec-${UUID}`],
+    // The BINDING readers live in fix-contract.mjs (the module all three Lambdas
+    // carry) since TEAM-4987, and gate-contract re-exports them — which is the
+    // import these rows still use, so the re-export is covered too.
+    ["fix-contract HEAD_LABEL_RE (via gate-contract)", (l) => HEAD_LABEL_RE.test(l), `head:${SHA}`, `head-${SHA}`],
+    ["fix-contract EXEC_LABEL_RE (via gate-contract)", (l) => EXEC_LABEL_RE.test(l), `exec:${UUID}`, `exec-${UUID}`],
     [
       "gate-contract MERGE_GATE_LABEL_RE",
       (l) => MERGE_GATE_LABEL_RE.test(l),
       "gate:merge-approval",
       "gate-merge-approval",
     ],
-    ["gate-contract gateHeadOf", (l) => gateHeadOf([l]) === SHA, `head:${SHA}`, `head-${SHA}`],
-    ["gate-contract gateExecOf", (l) => gateExecOf([l]) === UUID, `exec:${UUID}`, `exec-${UUID}`],
+    ["fix-contract gateHeadOf (via gate-contract)", (l) => gateHeadOf([l]) === SHA, `head:${SHA}`, `head-${SHA}`],
+    ["fix-contract gateExecOf (via gate-contract)", (l) => gateExecOf([l]) === UUID, `exec:${UUID}`, `exec-${UUID}`],
     [
       "gate-contract PIPELINE_LABEL_RE",
       (l) => PIPELINE_LABEL_RE.test(l),
