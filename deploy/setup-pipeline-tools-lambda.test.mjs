@@ -55,6 +55,10 @@ vi.mock("@aws-sdk/client-codepipeline", () => ({
   GetPipelineStateCommand: class {},
   StartPipelineExecutionCommand: class {},
   ListActionExecutionsCommand: class {},
+  // TEAM-5033 — the definition read. Only here so this mock names every command
+  // the Lambda imports; nothing in THIS file sends one (the suite drives the pure
+  // buildInlinePolicy/validateCiProjectName exports).
+  GetPipelineCommand: class {},
 }));
 vi.mock("@aws-sdk/client-codebuild", () => ({
   CodeBuildClient: class { async send() { return {}; } },
@@ -198,6 +202,10 @@ describe("buildInlinePolicy — the CiStartBuild grant", () => {
       // Nor any other approval/write verb sneaking in via a prefix.
       expect(actions.filter((a) => /Approval/i.test(a)), flag).toEqual([]);
       expect(actions.filter((a) => a.startsWith("codepipeline:")).sort(), flag).toEqual([
+        // TEAM-5033 — a READ of the pipeline's definition (which CodeBuild projects
+        // it owns), so get_build_log can reach the Deploy stage's parallel
+        // runtime-image project. Names projects; runs, approves and stops nothing.
+        "codepipeline:GetPipeline",
         "codepipeline:GetPipelineExecution",
         "codepipeline:GetPipelineState",
         "codepipeline:ListActionExecutions",
@@ -264,6 +272,10 @@ describe("resolveEnv", () => {
       BUILD_PROJECT: "agentcore-hub-build",
       CI_PROJECT: "agentcore-hub-ci",
       DEPLOY_PROJECT: "agentcore-hub-deploy",
+      // TEAM-5033: IAM scoping only — the Deploy stage's parallel CodeBuild
+      // project. Deliberately not sent to the function (the Lambda discovers it
+      // from the pipeline definition); see the envVars comment in the script.
+      RUNTIME_IMAGE_PROJECT: "agentcore-hub-runtime-image-deploy",
       PIPELINE_CI_START_BUILD: "0",
       // Just the Lambda's own region until an operator registers a repo elsewhere.
       PIPELINE_REGIONS: "us-east-1",
@@ -822,12 +834,16 @@ describe("buildInlinePolicy — the hub-* convention wildcards", () => {
     ]);
   });
 
-  it("adds project/hub-* to BuildRead, keeping the three exact project ARNs", () => {
+  it("adds project/hub-* to BuildRead, keeping the four exact project ARNs", () => {
     const statement = sid(buildInlinePolicy(BASE), "BuildRead");
     expect(statement.Resource).toEqual([
       arn("agentcore-hub-build"),
       arn("agentcore-hub-ci"),
       arn("agentcore-hub-deploy"),
+      // TEAM-5033 — the Deploy stage's parallel runtime-image project. It has to be
+      // exact: project/hub-* below requires a literal `hub-` prefix, which an
+      // `agentcore-hub-*` name never has, so the wildcard never covered it.
+      arn("agentcore-hub-runtime-image-deploy"),
       arn("hub-*"),
     ]);
     // Read-only: a broad project wildcard is only safe because these two actions
@@ -845,6 +861,9 @@ describe("buildInlinePolicy — the hub-* convention wildcards", () => {
       logArn("agentcore-hub-build:*"),
       logArn("agentcore-hub-ci:*"),
       logArn("agentcore-hub-deploy:*"),
+      // TEAM-5033 — without this, get_build_log on the runtime-image project could
+      // return its phases and never its log, which is the half that diagnoses.
+      logArn("agentcore-hub-runtime-image-deploy:*"),
       logArn("hub-*"),
       logArn("hub-*:*"),
     ]);
@@ -994,6 +1013,10 @@ describe("buildInlinePolicy — the hub-* convention wildcards", () => {
           expect(actions, label).not.toContain("codepipeline:PutApprovalResult");
           expect(actions.filter((a) => /Approval/i.test(a)), label).toEqual([]);
           expect(actions.filter((a) => a.startsWith("codepipeline:")).sort(), label).toEqual([
+            // TEAM-5033 — reads the DEFINITION (which CodeBuild projects the
+            // pipeline owns), never state and never a write. It is what makes the
+            // read-only allow-list derivable instead of hardcoded.
+            "codepipeline:GetPipeline",
             "codepipeline:GetPipelineExecution",
             "codepipeline:GetPipelineState",
             "codepipeline:ListActionExecutions",
@@ -1006,6 +1029,141 @@ describe("buildInlinePolicy — the hub-* convention wildcards", () => {
           ]);
         }
       }
+    }
+  });
+});
+
+// ─── TEAM-5033 — the runtime-image deploy project read ────────────────────────
+// The Deploy stage runs TWO CodeBuild actions in parallel (Deploy +
+// Deploy_runtime_images). The second project's phases and log were unreachable:
+// project/hub-* cannot match `agentcore-hub-runtime-image-deploy`, so neither
+// BuildRead nor BuildLogRead covered it. These grants are the IAM half of the fix
+// (the code half derives the ALLOW-LIST from the pipeline definition), and the
+// property that matters is that both are strictly READS.
+describe("buildInlinePolicy — the runtime-image deploy project read (TEAM-5033)", () => {
+  const RUNTIME_IMAGE = "agentcore-hub-runtime-image-deploy";
+  const cpArn = (name, region = REGION) =>
+    `arn:aws:codepipeline:${region}:${ACCOUNT}:${name}`;
+  const logArn = (group, region = REGION) =>
+    `arn:aws:logs:${region}:${ACCOUNT}:log-group:/aws/codebuild/${group}`;
+
+  it("grants BatchGetBuilds/ListBuildsForProject on the runtime-image project", () => {
+    const statement = sid(buildInlinePolicy(BASE), "BuildRead");
+    expect(statement.Resource).toContain(arn(RUNTIME_IMAGE));
+    expect(statement.Action).toEqual([
+      "codebuild:BatchGetBuilds",
+      "codebuild:ListBuildsForProject",
+    ]);
+  });
+
+  it("grants GetLogEvents on the runtime-image project's log group", () => {
+    const statement = sid(buildInlinePolicy(BASE), "BuildLogRead");
+    expect(statement.Resource).toContain(logArn(`${RUNTIME_IMAGE}:*`));
+    expect(statement.Action).toEqual(["logs:GetLogEvents"]);
+  });
+
+  it("derives both ARNs from REGION/ACCOUNT, never a hardcoded pair", () => {
+    const policy = buildInlinePolicy({
+      ...BASE,
+      REGION: "eu-west-2",
+      ACCOUNT: "999988887777",
+    });
+    expect(sid(policy, "BuildRead").Resource).toContain(
+      `arn:aws:codebuild:eu-west-2:999988887777:project/${RUNTIME_IMAGE}`
+    );
+    expect(sid(policy, "BuildLogRead").Resource).toContain(
+      `arn:aws:logs:eu-west-2:999988887777:log-group:/aws/codebuild/${RUNTIME_IMAGE}:*`
+    );
+    // And the old account id is nowhere in the document.
+    for (const resource of allResources(policy)) {
+      expect(resource).not.toContain(ACCOUNT);
+    }
+  });
+
+  it("honours a non-default RUNTIME_IMAGE_PROJECT in both grants", () => {
+    // A deployment whose stack names that project differently must still be able
+    // to read it — the name is operator config, not a constant.
+    const policy = buildInlinePolicy({
+      ...BASE,
+      RUNTIME_IMAGE_PROJECT: "other-runtime-image-deploy",
+    });
+    expect(sid(policy, "BuildRead").Resource).toContain(arn("other-runtime-image-deploy"));
+    expect(sid(policy, "BuildLogRead").Resource).toContain(
+      logArn("other-runtime-image-deploy:*")
+    );
+    // The default is then NOT granted: a rename moves the grant, it does not add one.
+    expect(sid(policy, "BuildRead").Resource).not.toContain(arn(RUNTIME_IMAGE));
+  });
+
+  it("defaults the name when the env object omits it entirely", () => {
+    // BASE has no RUNTIME_IMAGE_PROJECT key, which is also what a hand-made env
+    // object in any other test looks like — an `undefined` in an ARN would be a
+    // silently useless grant rather than a failure.
+    expect(BASE.RUNTIME_IMAGE_PROJECT).toBeUndefined();
+    for (const resource of allResources(buildInlinePolicy(BASE))) {
+      expect(resource).not.toContain("undefined");
+    }
+  });
+
+  // ─── it is a READ, in every combination ───────────────────────────────────
+
+  it("never appears in a statement granting codebuild:StartBuild", () => {
+    // The reserved-project rule (validateCiProjectName) already refuses to POINT
+    // start_ci_build at it; this asserts the IAM side independently, so neither
+    // check alone is load-bearing.
+    for (const flag of ["0", "1"]) {
+      for (const regions of [undefined, "us-east-1,eu-west-1"]) {
+        const policy = buildInlinePolicy({
+          ...BASE,
+          PIPELINE_CI_START_BUILD: flag,
+          PIPELINE_REGIONS: regions,
+        });
+        const label = `${flag}/${regions}`;
+        for (const statement of statementsWith(policy, "codebuild:StartBuild")) {
+          expect([].concat(statement.Resource), label).not.toContain(arn(RUNTIME_IMAGE));
+          for (const resource of [].concat(statement.Resource)) {
+            expect(resource, label).not.toContain(RUNTIME_IMAGE);
+          }
+        }
+      }
+    }
+  });
+
+  it("adds no codebuild action beyond the two reads", () => {
+    const actions = allActions(buildInlinePolicy(BASE)).filter((a) =>
+      a.startsWith("codebuild:")
+    );
+    expect([...new Set(actions)].sort()).toEqual([
+      "codebuild:BatchGetBuilds",
+      "codebuild:ListBuildsForProject",
+    ]);
+  });
+
+  it("codepipeline:GetPipeline lives only in PipelineReadAndTrigger, on pipelineArns", () => {
+    const policy = buildInlinePolicy(BASE);
+    const statements = statementsWith(policy, "codepipeline:GetPipeline");
+    expect(statements.map((s) => s.Sid)).toEqual(["PipelineReadAndTrigger"]);
+    // Same Resource list the reads and the trigger already use — a pipeline whose
+    // state this role can read is a pipeline whose definition it can read, and not
+    // one more.
+    expect(statements[0].Resource).toEqual([
+      cpArn("agentcore-hub-deploy"),
+      cpArn("hub-*-deploy"),
+    ]);
+    // Identity, not just equality: PipelineAbandonSuperseded shares the array, so a
+    // widening of one is a widening of both and has to be argued for once.
+    expect(sid(policy, "PipelineAbandonSuperseded").Resource).toBe(statements[0].Resource);
+  });
+
+  it("GetPipeline adds no write and no approval path", () => {
+    for (const flag of ["0", "1"]) {
+      const actions = allActions(buildInlinePolicy({ ...BASE, PIPELINE_CI_START_BUILD: flag }));
+      expect(actions, flag).toContain("codepipeline:GetPipeline");
+      expect(actions.filter((a) => /Approval/i.test(a)), flag).toEqual([]);
+      // Reading a definition must not have dragged in the sibling that MUTATES one.
+      expect(actions, flag).not.toContain("codepipeline:UpdatePipeline");
+      expect(actions, flag).not.toContain("codepipeline:CreatePipeline");
+      expect(actions, flag).not.toContain("codepipeline:DeletePipeline");
     }
   });
 });

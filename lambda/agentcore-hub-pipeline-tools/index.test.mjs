@@ -128,6 +128,12 @@ const h = vi.hoisted(() => ({
     // called (h.state.cpCalls carries no StopPipelineExecution) — a deploy tool
     // that stops someone else's run without being asked is the whole risk here.
     stopPipelineExecutionImpl: async () => ({}),
+    // TEAM-5033: the pipeline DEFINITION read, used to discover the CodeBuild
+    // projects a pipeline owns beyond its ci/build/deploy trio. The default is a
+    // pipeline with NO stages, so every pre-TEAM-5033 test still sees exactly the
+    // trio — and the LAZY property (a trio hit makes no GetPipeline at all) is
+    // asserted by the absence of GetPipeline from h.state.cpCalls elsewhere.
+    getPipelineImpl: async () => ({ pipeline: { stages: [] } }),
     s3Calls: [], // the input of every S3 command, reads and writes alike
     // TEAM-4525: PutObject only, with the CLIENT REGION it was sent on — the
     // ship-approval record must always be written by this Lambda's own ambient S3
@@ -205,9 +211,11 @@ vi.mock("@aws-sdk/client-codepipeline", () => ({
       if (type === "GetPipelineExecution") return h.state.getPipelineExecutionImpl(cmd.input);
       if (type === "ListPipelineExecutions") return h.state.listPipelineExecutionsImpl(cmd.input);
       if (type === "StopPipelineExecution") return h.state.stopPipelineExecutionImpl(cmd.input);
+      if (type === "GetPipeline") return h.state.getPipelineImpl(cmd.input);
       return {};
     }
   },
+  GetPipelineCommand: class { constructor(i) { this.input = i; this.__type = "GetPipeline"; } },
   GetPipelineStateCommand: class { constructor(i) { this.input = i; this.__type = "GetPipelineState"; } },
   GetPipelineExecutionCommand: class { constructor(i) { this.input = i; this.__type = "GetPipelineExecution"; } },
   StartPipelineExecutionCommand: class { constructor(i) { this.input = i; this.__type = "StartPipelineExecution"; } },
@@ -474,6 +482,9 @@ beforeEach(() => {
   });
   h.state.listPipelineExecutionsImpl = async () => ({ pipelineExecutionSummaries: [] });
   h.state.stopPipelineExecutionImpl = async () => ({});
+  // TEAM-5033: back to "this pipeline owns no CodeBuild action", so a project
+  // outside the trio is genuinely unknown unless a test says otherwise.
+  h.state.getPipelineImpl = async () => ({ pipeline: { stages: [] } });
   h.state.s3Calls = [];
   h.state.s3Puts = [];
   h.state.putObjectImpl = async () => ({});
@@ -4233,7 +4244,19 @@ describe("multi-target registry resolution", () => {
       expect.arrayContaining(["agentcore-hub-ci", "hub-widget-ci", "hub-widget-build", WIDGET])
     );
     expect(h.state.cbCalls).toEqual([]);
-    expect(initRegions("codebuild")).toEqual([]);
+    // TEAM-5033 moved this assertion rather than dropping it. The read side now
+    // consults each REGISTERED pipeline's definition before concluding a project is
+    // unknown, and clientsFor builds cp+cb+logs as one set, so a CodeBuild client
+    // now gets CONSTRUCTED on this path. The property that actually matters is
+    // unchanged and stated more strongly here: nothing is ever READ against the
+    // caller's name (cbCalls is empty above), and the only CodePipeline traffic is
+    // GetPipeline on pipelines this deployment already owns — never on
+    // "someone-elses-ci", so this still cannot probe whether a foreign resource
+    // exists.
+    for (const call of h.state.cpCalls) {
+      expect(call.type).toBe("GetPipeline");
+      expect([HUB, WIDGET]).toContain(call.name);
+    }
   });
 
   it("refuses start_deploy without pipeline_name when more than one target exists", async () => {
@@ -4384,9 +4407,15 @@ describe("multi-target registry resolution", () => {
     });
     expect(h.state.cbCalls).toEqual([]);
     expect(h.state.logsCalls).toEqual([]);
-    // Not even a client: the refusal happens before clientsFor is ever called.
-    expect(initRegions("codebuild")).toEqual([]);
-    expect(initRegions("logs")).toEqual([]);
+    // TEAM-5033: see the sibling assertion in "refuses an unregistered project with
+    // zero CodeBuild traffic". Discovery now runs before this refusal, and clientsFor
+    // constructs cp+cb+logs together, so "not even a client" no longer holds — but
+    // the guarantee does: no build and no log is ever read (both arrays empty above),
+    // and every CodePipeline call is a definition read of a pipeline we own.
+    for (const call of h.state.cpCalls) {
+      expect(call.type).toBe("GetPipeline");
+      expect([HUB, WIDGET]).toContain(call.name);
+    }
   });
 
   it("refuses a project that disagrees with the build_id's project instead of picking one", async () => {
@@ -4917,5 +4946,490 @@ describe("cross-account CD (assume-role trigger)", () => {
     expect(cbInit.hasCreds).toBe(true);
     expect(h.state.stsCalls.length).toBeGreaterThanOrEqual(1);
     expect(h.state.stsCalls[0].input.RoleArn).toBe("arn:aws:iam::123456789012:role/hub-cd-trigger-juno");
+  });
+});
+
+// ─── 10. Definition-derived project discovery (TEAM-5033) ─────────────────────
+//
+// agentcore-hub-deploy's Deploy stage runs TWO CodeBuild actions in PARALLEL:
+// Deploy (agentcore-hub-deploy) and Deploy_runtime_images
+// (agentcore-hub-runtime-image-deploy). Only the ci/build/deploy trio was
+// allow-listed, so get_build_log on the second one answered
+// project_not_registered — and that tool is the release manager's ONLY channel to
+// that log, because the coding-runtime role is denied codebuild/logs directly. A
+// failed runtime-image roll was therefore undiagnosable.
+//
+// The read side now derives the allow-list from the pipeline's own DEFINITION. The
+// four properties this section exists to pin:
+//   1. It WORKS   — the runtime-image build's phases and log come back.
+//   2. It is LAZY — a trio hit sends no GetPipeline at all, so no poll pays for it.
+//   3. It is READ-ONLY — start_ci_build never discovers, so the reserved
+//      runtime-image project is STILL refused at resolution.
+//   4. It DEGRADES — a missing codepipeline:GetPipeline names the grant and the
+//      remedy (project_discovery_failed) instead of lying with
+//      project_not_registered or throwing a 500.
+describe("definition-derived project discovery (TEAM-5033)", () => {
+  const WIDGET = "hub-widget-deploy";
+  const HUB = "agentcore-hub-deploy";
+  const RUNTIME_IMAGE = "agentcore-hub-runtime-image-deploy";
+  const RUNTIME_BUILD_ID = `${RUNTIME_IMAGE}:3f9cdab1-8716-4284-9541-47e49f35b7e5`;
+
+  /**
+   * A pipeline definition whose Deploy stage runs `projectNames` as CodeBuild
+   * actions, plus a Source action and a ManualApproval action that are NOT
+   * CodeBuild — so the provider filter is exercised rather than assumed. The
+   * approval action is the one that matters: a stage-name or action-name heuristic
+   * would sweep it up, and it has no ProjectName to sweep.
+   */
+  function pipelineDefWith(projectNames) {
+    return {
+      pipeline: {
+        name: HUB,
+        stages: [
+          {
+            stageName: "Source",
+            actions: [
+              { actionName: "Source", actionTypeId: { provider: "GitHub" }, configuration: {} },
+            ],
+          },
+          {
+            stageName: "Deploy",
+            actions: [
+              ...projectNames.map((name, i) => ({
+                actionName: `Build_${i}`,
+                actionTypeId: { category: "Build", provider: "CodeBuild" },
+                configuration: { ProjectName: name },
+              })),
+              {
+                actionName: "DeployApproval",
+                actionTypeId: { category: "Approval", provider: "Manual" },
+                configuration: {},
+              },
+            ],
+          },
+        ],
+      },
+    };
+  }
+
+  /** GetPipeline answers per pipeline NAME; anything unlisted gets no stages. */
+  function servePipelineDefs(byName) {
+    h.state.getPipelineImpl = async (input) => {
+      const answer = byName[input?.name];
+      if (typeof answer === "function") return answer();
+      return answer || { pipeline: { stages: [] } };
+    };
+  }
+
+  function accessDenied(message = "User is not authorized to perform this action") {
+    const err = new Error(message);
+    err.name = "AccessDeniedException";
+    return err;
+  }
+
+  /** Every GetPipeline this invocation sent, as pipeline names. */
+  const getPipelineNames = () =>
+    h.state.cpCalls.filter((c) => c.type === "GetPipeline").map((c) => c.name);
+
+  /** A finished runtime-image build, with a log group/stream to tail. */
+  function runtimeImageBuild(overrides = {}) {
+    return {
+      builds: [
+        {
+          id: RUNTIME_BUILD_ID,
+          buildStatus: "FAILED",
+          currentPhase: "COMPLETED",
+          resolvedSourceVersion: "c".repeat(40),
+          sourceVersion: "main",
+          phases: [
+            { phaseType: "BUILD", phaseStatus: "FAILED", durationInSeconds: 42, contexts: [{ statusCode: "COMMAND_EXECUTION_ERROR", message: "docker build exited 1" }] },
+          ],
+          logs: {
+            groupName: `/aws/codebuild/${RUNTIME_IMAGE}`,
+            streamName: "3f9cdab1-8716-4284-9541-47e49f35b7e5",
+          },
+          ...overrides,
+        },
+      ],
+    };
+  }
+
+  // ─── 1. it works ───────────────────────────────────────────────────────────
+
+  it("get_build_log reads the Deploy stage's parallel runtime-image build", async () => {
+    servePipelineDefs({ [HUB]: pipelineDefWith(["agentcore-hub-deploy", RUNTIME_IMAGE]) });
+    h.state.batchGetBuildsImpl = async () => runtimeImageBuild();
+    h.state.getLogEventsImpl = async () => ({
+      events: [{ message: "ERROR: failed to push image\n" }],
+    });
+
+    const out = await withRegistry(MULTI_REGISTRY, (mod) =>
+      invokeOn(mod.handler, "get_build_log", { build_id: RUNTIME_BUILD_ID })
+    );
+
+    // Not a refusal any more — this is the whole ticket.
+    expect(out.reason).toBeUndefined();
+    expect(out.project).toBe(RUNTIME_IMAGE);
+    expect(out.buildId).toBe(RUNTIME_BUILD_ID);
+    // The hub owns that project, so the read happens in the hub's region.
+    expect(out.region).toBe("us-east-1");
+    expect(out.buildStatus).toBe("FAILED");
+    // The phase context AND the log tail — the two things a fix ticket needs.
+    expect(out.phases[0].contexts[0].message).toBe("docker build exited 1");
+    expect(out.logTail).toContain("failed to push image");
+    // The definition was consulted, and only for REGISTERED pipelines.
+    expect(getPipelineNames()).toEqual(expect.arrayContaining([HUB]));
+    for (const name of getPipelineNames()) expect([HUB, WIDGET]).toContain(name);
+    // Never the caller-supplied project name: GetPipeline takes pipelines only.
+    expect(getPipelineNames()).not.toContain(RUNTIME_IMAGE);
+    expect(h.state.cbCalls.every((c) => c.region === "us-east-1")).toBe(true);
+    expect(h.state.logsCalls[0].region).toBe("us-east-1");
+  });
+
+  it("get_build_status resolves a discovered project and scans in the owner's region", async () => {
+    servePipelineDefs({ [HUB]: pipelineDefWith([RUNTIME_IMAGE]) });
+
+    const out = await withRegistry(MULTI_REGISTRY, (mod) =>
+      invokeOn(mod.handler, "get_build_status", { project: RUNTIME_IMAGE })
+    );
+
+    expect(out.reason).toBeUndefined();
+    expect(out.project).toBe(RUNTIME_IMAGE);
+    expect(out.region).toBe("us-east-1");
+    expect(h.state.cbCalls[0].type).toBe("ListBuildsForProject");
+    expect(h.state.cbCalls[0].name).toBe(RUNTIME_IMAGE);
+    expect(h.state.cbCalls[0].region).toBe("us-east-1");
+  });
+
+  it("only CodeBuild actions become projects — an approval action is not one", async () => {
+    // pipelineDefWith always includes a ManualApproval action with no ProjectName.
+    // If the filter keyed on anything but the provider, `known` would carry junk
+    // (or undefined) and a caller could be told an approval action is readable.
+    servePipelineDefs({ [HUB]: pipelineDefWith([RUNTIME_IMAGE]) });
+
+    const out = await withRegistry(MULTI_REGISTRY, (mod) =>
+      invokeOn(mod.handler, "get_build_status", { project: "not-a-project-at-all" })
+    );
+
+    expect(out.reason).toBe("project_not_registered");
+    expect(out.known).toContain(RUNTIME_IMAGE);
+    expect(out.known.every((p) => typeof p === "string" && p.length > 0)).toBe(true);
+    expect(out.known).not.toContain("DeployApproval");
+    // Deduped: the hub's own deploy project is in BOTH the trio and the definition.
+    expect(new Set(out.known).size).toBe(out.known.length);
+  });
+
+  it("a project in neither the trio nor any definition is still project_not_registered", async () => {
+    servePipelineDefs({ [HUB]: pipelineDefWith([RUNTIME_IMAGE]) });
+
+    const out = await withRegistry(MULTI_REGISTRY, (mod) =>
+      invokeOn(mod.handler, "get_build_log", {
+        build_id: "someone-elses-build:11111111-2222-3333-4444-555555555555",
+      })
+    );
+
+    // The reason code is UNCHANGED — the remedy is still "name a project we own".
+    expect(out.ok).toBe(false);
+    expect(out.reason).toBe("project_not_registered");
+    expect(out.requested).toBe("someone-elses-build");
+    // …but `known` is now honest about what we own, discovery included, so a
+    // caller that was refused can actually correct itself.
+    expect(out.known).toContain(RUNTIME_IMAGE);
+    expect(out.known).toContain("agentcore-hub-build");
+    expect(out.known).toContain("hub-widget-build");
+    // Every definition WAS readable, so there is nothing to report as a failure.
+    expect(out.discoveryErrors).toBeUndefined();
+    expect(h.state.cbCalls).toEqual([]);
+    expect(h.state.logsCalls).toEqual([]);
+  });
+
+  // ─── 2. it is lazy and cached ──────────────────────────────────────────────
+
+  it("the trio fast path sends NO GetPipeline — a poll pays nothing for discovery", async () => {
+    servePipelineDefs({ [HUB]: pipelineDefWith([RUNTIME_IMAGE]) });
+
+    const [log, status] = await withRegistry(MULTI_REGISTRY, async (mod) => {
+      const a = await invokeOn(mod.handler, "get_build_log", {
+        build_id: "agentcore-hub-build:99999999-2222-3333-4444-555555555555",
+      });
+      const b = await invokeOn(mod.handler, "get_build_status", {
+        project: "agentcore-hub-ci",
+      });
+      return [a, b];
+    });
+
+    expect(log.project).toBe("agentcore-hub-build");
+    expect(status.project).toBe("agentcore-hub-ci");
+    // The point: both resolved from the trio, so the definition was never read.
+    expect(getPipelineNames()).toEqual([]);
+  });
+
+  it("get_state never discovers — it is the hot poll path", async () => {
+    servePipelineDefs({ [HUB]: pipelineDefWith([RUNTIME_IMAGE]) });
+
+    await withRegistry(MULTI_REGISTRY, (mod) =>
+      invokeOn(mod.handler, "get_state", { pipeline_name: HUB })
+    );
+
+    expect(getPipelineNames()).toEqual([]);
+    expect(h.state.cpCalls.some((c) => c.type === "GetPipelineState")).toBe(true);
+  });
+
+  it("caches the definition per target: two calls, one GetPipeline each", async () => {
+    servePipelineDefs({ [HUB]: pipelineDefWith([RUNTIME_IMAGE]) });
+    h.state.batchGetBuildsImpl = async () => runtimeImageBuild();
+
+    await withRegistry(MULTI_REGISTRY, async (mod) => {
+      await invokeOn(mod.handler, "get_build_log", { build_id: RUNTIME_BUILD_ID });
+      await invokeOn(mod.handler, "get_build_log", { build_id: RUNTIME_BUILD_ID });
+    });
+
+    // Two invocations, two targets, and exactly one definition read per target —
+    // not one per invocation, and not one per resolveProjectOwner call (the second
+    // invocation is served entirely from the TTL cache).
+    expect(getPipelineNames().filter((n) => n === HUB)).toHaveLength(1);
+    expect(getPipelineNames().filter((n) => n === WIDGET)).toHaveLength(1);
+  });
+
+  it("a persistent denial is not re-asked every invocation either", async () => {
+    // The cache window opens on FAILURE too (the property loadRegistry has). Without
+    // it, a missing grant meant a GetPipeline per target per invocation forever.
+    servePipelineDefs({
+      [HUB]: () => {
+        throw accessDenied();
+      },
+      [WIDGET]: () => {
+        throw accessDenied();
+      },
+    });
+
+    const outs = await withRegistry(MULTI_REGISTRY, async (mod) => [
+      await invokeOn(mod.handler, "get_build_status", { project: RUNTIME_IMAGE }),
+      await invokeOn(mod.handler, "get_build_status", { project: RUNTIME_IMAGE }),
+    ]);
+
+    expect(outs[0].reason).toBe("project_discovery_failed");
+    expect(outs[1].reason).toBe("project_discovery_failed");
+    expect(getPipelineNames()).toHaveLength(2); // one per target, not one per call
+  });
+
+  // ─── 3. it is read-only ────────────────────────────────────────────────────
+
+  it("start_ci_build still refuses the reserved runtime-image project, and never discovers", async () => {
+    // The invariant this whole gate exists for. If discovery were wired into
+    // resolveTarget unconditionally, this call would stop being refused and would
+    // instead fall through to the target's CI project — starting a DIFFERENT build
+    // than the one named, silently.
+    servePipelineDefs({ [HUB]: pipelineDefWith([RUNTIME_IMAGE]) });
+
+    const out = await withRegistry(MULTI_REGISTRY, (mod) =>
+      invokeOn(mod.handler, "start_ci_build", {
+        project: RUNTIME_IMAGE,
+        commit_sha: "f".repeat(40),
+      })
+    );
+
+    expect(out.ok).toBe(false);
+    expect(out.reason).toBe("project_not_registered");
+    // The write path does not even LOOK at the definition, so a discovered project
+    // can never become a StartBuild target.
+    expect(getPipelineNames()).toEqual([]);
+    expect(h.state.cbCalls).toEqual([]);
+  });
+
+  it("start_deploy is unchanged: pipeline_name_required, zero GetPipeline", async () => {
+    servePipelineDefs({ [HUB]: pipelineDefWith([RUNTIME_IMAGE]) });
+
+    const out = await withRegistry(MULTI_REGISTRY, (mod) =>
+      invokeOn(mod.handler, "start_deploy", { commit_sha: "a".repeat(40) })
+    );
+
+    expect(out.reason).toBe("pipeline_name_required");
+    expect(getPipelineNames()).toEqual([]);
+  });
+
+  // ─── 4. it degrades, naming the grant ──────────────────────────────────────
+
+  it("GetPipeline AccessDenied → project_discovery_failed naming the grant and remedy", async () => {
+    servePipelineDefs({
+      [HUB]: () => {
+        throw accessDenied("not authorized to perform: codepipeline:GetPipeline");
+      },
+      [WIDGET]: () => {
+        throw accessDenied("not authorized to perform: codepipeline:GetPipeline");
+      },
+    });
+
+    const out = await withRegistry(MULTI_REGISTRY, (mod) =>
+      invokeOn(mod.handler, "get_build_log", { build_id: RUNTIME_BUILD_ID })
+    );
+
+    // NOT project_not_registered: we genuinely do not know, and saying "not
+    // registered" would send the agent to fix the wrong thing.
+    expect(out.ok).toBe(false);
+    expect(out.reason).toBe("project_discovery_failed");
+    expect(out.requested).toBe(RUNTIME_IMAGE);
+    expect(out.detail).toContain("codepipeline:GetPipeline");
+    expect(out.detail).toContain("deploy/setup-pipeline-tools-lambda.mjs");
+    expect(out.detail).toContain("Not retryable");
+    // Both failures are reported, each naming its own pipeline and region, so an
+    // operator knows exactly which grant is missing where.
+    expect(out.discoveryErrors).toHaveLength(2);
+    expect(out.discoveryErrors.map((e) => e.pipeline).sort()).toEqual([HUB, WIDGET]);
+    expect(out.discoveryErrors[0].error).toContain("AccessDeniedException");
+    expect(out.discoveryErrors.find((e) => e.pipeline === WIDGET).region).toBe("us-west-2");
+    // The trio is still listed — the fallback allow-list survived the failure.
+    expect(out.known).toContain("agentcore-hub-build");
+    // And nothing was read: no build, no log.
+    expect(h.state.cbCalls).toEqual([]);
+    expect(h.state.logsCalls).toEqual([]);
+  });
+
+  it("one target's discovery failing does not break the other's", async () => {
+    servePipelineDefs({
+      [HUB]: () => {
+        throw accessDenied();
+      },
+      [WIDGET]: pipelineDefWith(["hub-widget-extra-deploy"]),
+    });
+    h.state.batchGetBuildsImpl = async () => runtimeImageBuild();
+
+    const [found, missing] = await withRegistry(MULTI_REGISTRY, async (mod) => [
+      await invokeOn(mod.handler, "get_build_status", { project: "hub-widget-extra-deploy" }),
+      await invokeOn(mod.handler, "get_build_status", { project: "nobody-owns-this" }),
+    ]);
+
+    // The readable target's project resolves anyway — a warning, not an outage.
+    expect(found.reason).toBeUndefined();
+    expect(found.project).toBe("hub-widget-extra-deploy");
+    // Region follows the OWNER, not the env default: the widget pipeline is us-west-2.
+    expect(found.region).toBe("us-west-2");
+    // Only the genuinely unresolvable name gets the discovery-failure reason.
+    expect(missing.reason).toBe("project_discovery_failed");
+    expect(missing.discoveryErrors.map((e) => e.pipeline)).toEqual([HUB]);
+    expect(missing.detail).toContain("1 of 2");
+  });
+
+  it("the trio keeps working while discovery is denied", async () => {
+    // The non-negotiable degradation property: a missing codepipeline:GetPipeline
+    // must not take the read-only tools down for the projects they always handled.
+    servePipelineDefs({
+      [HUB]: () => {
+        throw accessDenied();
+      },
+    });
+
+    const out = await withRegistry(MULTI_REGISTRY, (mod) =>
+      invokeOn(mod.handler, "get_build_status", { project: "agentcore-hub-ci" })
+    );
+
+    expect(out.reason).toBeUndefined();
+    expect(out.project).toBe("agentcore-hub-ci");
+    expect(out.region).toBe("us-east-1");
+    expect(getPipelineNames()).toEqual([]); // fast path, so it was never even asked
+  });
+
+  it("BatchGetBuilds AccessDenied → build_read_not_granted, not a 500", async () => {
+    // The state between this change landing and an operator re-running the setup
+    // script: the project is allow-listed by the definition, but the IAM Resource
+    // for it does not exist yet. That must read as a deploy-side fact.
+    servePipelineDefs({ [HUB]: pipelineDefWith([RUNTIME_IMAGE]) });
+    h.state.batchGetBuildsImpl = async () => {
+      throw accessDenied("not authorized to perform: codebuild:BatchGetBuilds");
+    };
+
+    const out = await withRegistry(MULTI_REGISTRY, (mod) =>
+      invokeOn(mod.handler, "get_build_log", { build_id: RUNTIME_BUILD_ID })
+    );
+
+    expect(out.ok).toBe(false);
+    expect(out.reason).toBe("build_read_not_granted");
+    expect(out.project).toBe(RUNTIME_IMAGE);
+    expect(out.region).toBe("us-east-1");
+    expect(out.buildId).toBe(RUNTIME_BUILD_ID);
+    expect(out.detail).toContain("codebuild:BatchGetBuilds");
+    expect(out.detail).toContain(`arn:aws:codebuild:us-east-1:*:project/${RUNTIME_IMAGE}`);
+    expect(out.detail).toContain("deploy/setup-pipeline-tools-lambda.mjs");
+    // A refusal, not the generic `Error: ...` text a throw would have produced.
+    expect(out.error).toBeUndefined();
+  });
+
+  it("a non-denial CodeBuild error still surfaces as an error, not a refusal", async () => {
+    // build_read_not_granted must mean exactly one thing. Swallowing every
+    // BatchGetBuilds failure into it would tell an operator to fix IAM for a
+    // throttle or an outage.
+    servePipelineDefs({ [HUB]: pipelineDefWith([RUNTIME_IMAGE]) });
+    h.state.batchGetBuildsImpl = async () => {
+      const err = new Error("Rate exceeded");
+      err.name = "ThrottlingException";
+      throw err;
+    };
+
+    const res = await withRegistry(MULTI_REGISTRY, (mod) =>
+      mod.handler({ name: "Pipeline___get_build_log", arguments: { build_id: RUNTIME_BUILD_ID } })
+    );
+
+    expect(res.content[0].text).toContain("ThrottlingException");
+    expect(res.content[0].text).not.toContain("build_read_not_granted");
+  });
+
+  it("GetLogEvents AccessDenied → phases still returned, logTail names the grant", async () => {
+    servePipelineDefs({ [HUB]: pipelineDefWith([RUNTIME_IMAGE]) });
+    h.state.batchGetBuildsImpl = async () => runtimeImageBuild();
+    h.state.getLogEventsImpl = async () => {
+      throw accessDenied("not authorized to perform: logs:GetLogEvents");
+    };
+
+    const out = await withRegistry(MULTI_REGISTRY, (mod) =>
+      invokeOn(mod.handler, "get_build_log", { build_id: RUNTIME_BUILD_ID })
+    );
+
+    // Deliberately NOT a refusal: the phase contexts alone often name the failure,
+    // so returning them beats refusing the whole call.
+    expect(out.reason).toBeUndefined();
+    expect(out.phases[0].contexts[0].message).toBe("docker build exited 1");
+    // The existing prefix is preserved (callers match on it), and the message now
+    // says which grant, on which log group, and how to apply it.
+    expect(out.logTail).toContain("(log fetch failed:");
+    expect(out.logTail).toContain("logs:GetLogEvents");
+    expect(out.logTail).toContain(`log-group:/aws/codebuild/${RUNTIME_IMAGE}:*`);
+    expect(out.logTail).toContain("deploy/setup-pipeline-tools-lambda.mjs");
+  });
+
+  it("a non-denial log failure keeps its bare message", async () => {
+    servePipelineDefs({ [HUB]: pipelineDefWith([RUNTIME_IMAGE]) });
+    h.state.batchGetBuildsImpl = async () => runtimeImageBuild();
+    h.state.getLogEventsImpl = async () => {
+      const err = new Error("log stream was deleted");
+      err.name = "ResourceNotFoundException";
+      throw err;
+    };
+
+    const out = await withRegistry(MULTI_REGISTRY, (mod) =>
+      invokeOn(mod.handler, "get_build_log", { build_id: RUNTIME_BUILD_ID })
+    );
+
+    expect(out.logTail).toBe("(log fetch failed: log stream was deleted)");
+    expect(out.logTail).not.toContain("logs:GetLogEvents");
+  });
+
+  // ─── project_mismatch is checked BEFORE any of this ────────────────────────
+
+  it("project_mismatch still wins over discovery, with zero GetPipeline", async () => {
+    servePipelineDefs({ [HUB]: pipelineDefWith([RUNTIME_IMAGE]) });
+
+    const out = await withRegistry(MULTI_REGISTRY, (mod) =>
+      invokeOn(mod.handler, "get_build_log", {
+        project: "agentcore-hub-build",
+        build_id: RUNTIME_BUILD_ID,
+      })
+    );
+
+    expect(out.reason).toBe("project_mismatch");
+    expect(out.requested).toBe("agentcore-hub-build");
+    expect(out.buildIdProject).toBe(RUNTIME_IMAGE);
+    // Two names that disagree is a caller bug, answerable without asking AWS anything.
+    expect(getPipelineNames()).toEqual([]);
+    expect(h.state.cbCalls).toEqual([]);
   });
 });

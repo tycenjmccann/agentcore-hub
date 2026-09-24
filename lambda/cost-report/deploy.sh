@@ -154,8 +154,17 @@ aws lambda wait function-updated --function-name "$FN" --region "$AWS_REGION"
 aws lambda put-function-concurrency --function-name "$FN" --region "$AWS_REGION" \
   --reserved-concurrent-executions "${COST_REPORT_RESERVED_CONCURRENCY:-5}"
 
-echo "==> Sync pricing.json → s3://$ARTIFACT_BUCKET/config/pricing.json"
-aws s3 cp "$REPO_ROOT/src/config/pricing.json" "s3://$ARTIFACT_BUCKET/config/pricing.json" --region "$AWS_REGION" --only-show-errors
+# config/pricing.json is the LIVE projection of the model registry (rates
+# refreshed by the nightly reconcile's Pricing API pass), so it is seeded only
+# when absent - the same rule as the pipeline's Target 2 (buildspec-deploy.yml,
+# surfaces.json). It used to be an unconditional cp, which overwrote every
+# refreshed rate on each hand deploy (2026-09-24).
+if aws s3api head-object --bucket "$ARTIFACT_BUCKET" --key config/pricing.json --region "$AWS_REGION" >/dev/null 2>&1; then
+  echo "==> config/pricing.json present - live projection kept (not overwritten)"
+else
+  echo "==> Seed pricing.json → s3://$ARTIFACT_BUCKET/config/pricing.json (absent)"
+  aws s3 cp "$REPO_ROOT/src/config/pricing.json" "s3://$ARTIFACT_BUCKET/config/pricing.json" --region "$AWS_REGION" --only-show-errors
+fi
 
 # The Lambda never reads this — it loads the bundled kpi.json (see loadKpiConfig
 # in index.mjs). This copy is for humans and the Workflow Manager toolkit, which

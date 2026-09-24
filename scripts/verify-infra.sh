@@ -28,6 +28,11 @@ CHECK_TICKETS=false
 # deploy/setup-tickets-lambda.mjs ROLE_NAME per TICKET_PROVIDER).
 PIPELINE_TOOLS_FUNCTION="${PIPELINE_TOOLS_FUNCTION:-agentcore-hub-pipeline-tools}"
 PIPELINE_TOOLS_ROLE="${PIPELINE_TOOLS_ROLE:-${PIPELINE_TOOLS_FUNCTION}-role}"
+# TEAM-5033: the hub's own deploy pipeline and the SECOND CodeBuild project its
+# Deploy stage runs in parallel (deploy/pipeline/lib/pipeline-stack.ts). Same
+# defaults the setup script uses; override for a differently-named deployment.
+PIPELINE_NAME="${PIPELINE_NAME:-agentcore-hub-deploy}"
+RUNTIME_IMAGE_PROJECT="${RUNTIME_IMAGE_PROJECT:-agentcore-hub-runtime-image-deploy}"
 # Model-registry principals (TEAM-4995): the app's ECS task role (same override
 # idiom as deploy/connectors/deploy.sh:17) and the token aggregator's own role
 # (deploy/setup-token-aggregator-role.sh).
@@ -237,6 +242,19 @@ if aws lambda get-function-configuration --function-name "$PIPELINE_TOOLS_FUNCTI
   else
     echo "  - IAM: ship-approval record write (ARTIFACT_BUCKET not set, skipped)"
   fi
+
+  # TEAM-5033 — the two grants that make the Deploy stage's PARALLEL runtime-image
+  # build readable. Both are hand-applied (the setup script is a pipeline handoff),
+  # so they drift exactly like the two above. Without the first, get_build_log on
+  # any project outside a target's ci/build/deploy trio answers
+  # project_discovery_failed; without the second, build_read_not_granted. Either
+  # way the release manager loses its ONLY channel to that log (the coding-runtime
+  # role is denied codebuild/logs directly) and a failed image roll is
+  # undiagnosable. Both read IAM Resource strings only.
+  check "IAM: $PIPELINE_TOOLS_ROLE grants codepipeline:GetPipeline on $PIPELINE_NAME" \
+    "role_policy_grants $PIPELINE_TOOLS_ROLE codepipeline:GetPipeline '^arn:aws:codepipeline:[^:]*:[^:]*:($PIPELINE_NAME|\*)$'"
+  check "IAM: $PIPELINE_TOOLS_ROLE grants codebuild:BatchGetBuilds on $RUNTIME_IMAGE_PROJECT" \
+    "role_policy_grants $PIPELINE_TOOLS_ROLE codebuild:BatchGetBuilds '^arn:aws:codebuild:[^:]*:[^:]*:project/($RUNTIME_IMAGE_PROJECT|\*)$'"
 else
   echo "  - Pipeline tools: $PIPELINE_TOOLS_FUNCTION not deployed (pipeline module optional, skipped)"
 fi

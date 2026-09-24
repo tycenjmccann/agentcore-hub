@@ -140,8 +140,13 @@ zip -rq /tmp/token-aggregator.zip index.mjs models-registry.mjs models-reconcile
 # 900s: a reconcile walks every region's inference profiles, Mantle's model list
 # and the Pricing API, and a `cli` probe drives a full coding turn. The log
 # subscription path still returns in milliseconds.
-LAMBDA_ENV="Variables={EVAL_DAILY_TABLE=${DAILY_TABLE_NAME},ARTIFACTS_BUCKET=${BUCKET}"
-LAMBDA_ENV="${LAMBDA_ENV},CODING_AGENT_RUNTIME_ARN=${CODING_RUNTIME_ARN},BEDROCK_MANTLE_REGIONS=${MANTLE_REGIONS}}"
+# JSON, not the CLI shorthand: BEDROCK_MANTLE_REGIONS is a comma list, and a
+# comma inside a shorthand value ends the pair (2026-09-24 hand step failed here).
+LAMBDA_ENV=$(python3 -c 'import json,sys; print(json.dumps({"Variables": dict(a.split("=", 1) for a in sys.argv[1:])}))' \
+  "EVAL_DAILY_TABLE=${DAILY_TABLE_NAME}" \
+  "ARTIFACTS_BUCKET=${BUCKET}" \
+  "CODING_AGENT_RUNTIME_ARN=${CODING_RUNTIME_ARN}" \
+  "BEDROCK_MANTLE_REGIONS=${MANTLE_REGIONS}")
 
 if aws lambda get-function --function-name "${LAMBDA_NAME}" --region "${REGION}" >/dev/null 2>&1; then
   echo "Updating existing Lambda..."

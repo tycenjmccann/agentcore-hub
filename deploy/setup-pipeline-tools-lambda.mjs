@@ -99,6 +99,17 @@
  *                   API must fail closed rather than burn the whole budget.)
  *   DEPLOY_PROJECT  default agentcore-hub-deploy   (the Deploy stage's CodeBuild
  *                   project — same NAME as the pipeline, different resource kind)
+ *   RUNTIME_IMAGE_PROJECT  default agentcore-hub-runtime-image-deploy (TEAM-5033).
+ *                   The Deploy stage's SECOND, parallel CodeBuild action
+ *                   (Deploy_runtime_images). IAM SCOPING ONLY — it is deliberately
+ *                   NOT set on the function: the Lambda learns this name by reading
+ *                   the pipeline's own definition (codepipeline:GetPipeline), so a
+ *                   fifth project added to the stack needs no code change. This var
+ *                   exists because an IAM Resource cannot be discovered at runtime —
+ *                   project/hub-* cannot match an agentcore-hub-* name, so the
+ *                   BatchGetBuilds/ListBuildsForProject and GetLogEvents grants need
+ *                   the exact ARN. It is READ-ONLY in every statement: this name must
+ *                   never appear in CiStartBuild.
  *   PIPELINE_REGIONS  comma list of regions holding hub-*-deploy pipelines.
  *                   Default: AWS_REGION alone. The list is taken LITERALLY — set
  *                   it to every region you register repos in, the Lambda's own
@@ -198,6 +209,12 @@ export function resolveEnv(env = process.env) {
     // (the CodePipeline) but is a DIFFERENT AWS resource kind — keep the two
     // constants distinct; do not collapse them.
     DEPLOY_PROJECT: env.DEPLOY_PROJECT || "agentcore-hub-deploy",
+    // TEAM-5033: the Deploy stage's SECOND, parallel CodeBuild project
+    // (Deploy_runtime_images). Present here for IAM SCOPING ONLY and NOT sent to
+    // the function — the Lambda discovers it from the pipeline definition. See the
+    // Env block above for why an IAM Resource still has to name it literally.
+    RUNTIME_IMAGE_PROJECT:
+      env.RUNTIME_IMAGE_PROJECT || "agentcore-hub-runtime-image-deploy",
     PIPELINE_CI_START_BUILD: env.PIPELINE_CI_START_BUILD === "1" ? "1" : "0",
     // Every region holding a hub-*-deploy pipeline this role may read + trigger.
     // Normalized to a comma string so the same value can go straight onto the
@@ -268,6 +285,11 @@ export function buildInlinePolicy(env) {
     DEPLOY_PROJECT,
     PIPELINE_CI_START_BUILD,
   } = env;
+  // TEAM-5033 — defaulted here too, so a caller that builds a policy from a
+  // hand-made env object (every test in this script's suite does) still gets the
+  // runtime-image grants rather than an "undefined" in an ARN.
+  const RUNTIME_IMAGE_PROJECT =
+    env.RUNTIME_IMAGE_PROJECT || "agentcore-hub-runtime-image-deploy";
   const artifactBucket =
     env.ARTIFACT_BUCKET ||
     (ACCOUNT ? `agentcore-hub-artifacts-${ACCOUNT}-${REGION}` : "");
@@ -276,6 +298,10 @@ export function buildInlinePolicy(env) {
   const buildArn = `arn:aws:codebuild:${REGION}:${ACCOUNT}:project/${BUILD_PROJECT}`;
   const ciArn = `arn:aws:codebuild:${REGION}:${ACCOUNT}:project/${CI_PROJECT}`;
   const deployArn = `arn:aws:codebuild:${REGION}:${ACCOUNT}:project/${DEPLOY_PROJECT}`;
+  // TEAM-5033 — the Deploy stage's parallel runtime-image project. An exact ARN
+  // because project/hub-* (below) requires a literal `hub-` prefix and this name
+  // starts with `agentcore-hub-`, so the wildcard never covered it. READ ONLY.
+  const runtimeImageArn = `arn:aws:codebuild:${REGION}:${ACCOUNT}:project/${RUNTIME_IMAGE_PROJECT}`;
 
   // ─── the hub-* convention wildcards, one set per PIPELINE_REGIONS region ─────
   // Registering a repo in the CD registry must not require an IAM edit, so the
@@ -337,6 +363,14 @@ export function buildInlinePolicy(env) {
         Sid: "PipelineReadAndTrigger",
         Effect: "Allow",
         Action: [
+          // TEAM-5033 — the pipeline's DEFINITION, not its state. This is what
+          // lets the Lambda answer "which CodeBuild projects does this pipeline
+          // own?" without a hardcoded list: the Deploy stage runs a second,
+          // parallel CodeBuild action (Deploy_runtime_images) whose log was
+          // unreadable, and a future fifth project becomes readable with no IAM
+          // or code change. A read of configuration, adding no write and no
+          // approval path — it names projects, it cannot run them.
+          "codepipeline:GetPipeline",
           "codepipeline:GetPipelineState",
           "codepipeline:ListActionExecutions",
           // Resolves an execution's source revision so get_state can look up
@@ -372,10 +406,15 @@ export function buildInlinePolicy(env) {
         // build AND deploy projects — reading a deploy build's log is how the CI
         // agent sees why a deploy failed. Still NO approval/write action of any
         // kind.
+        //
+        // TEAM-5033 adds runtimeImageArn: the Deploy stage's parallel
+        // Deploy_runtime_images action. Named exactly because project/hub-* cannot
+        // match `agentcore-hub-runtime-image-deploy`, and placed BEFORE the
+        // wildcards so the exact ARNs stay a contiguous prefix of this list.
         Sid: "BuildRead",
         Effect: "Allow",
         Action: ["codebuild:BatchGetBuilds", "codebuild:ListBuildsForProject"],
-        Resource: [buildArn, ciArn, deployArn, ...hubProjectArns],
+        Resource: [buildArn, ciArn, deployArn, runtimeImageArn, ...hubProjectArns],
       },
       // The ONLY write this role ever gets, and only when asked for: StartBuild on
       // the validated PR-check project ARN plus project/hub-*-ci — never the
@@ -467,6 +506,10 @@ export function buildInlinePolicy(env) {
           `arn:aws:logs:${REGION}:${ACCOUNT}:log-group:/aws/codebuild/${BUILD_PROJECT}:*`,
           `arn:aws:logs:${REGION}:${ACCOUNT}:log-group:/aws/codebuild/${CI_PROJECT}:*`,
           `arn:aws:logs:${REGION}:${ACCOUNT}:log-group:/aws/codebuild/${DEPLOY_PROJECT}:*`,
+          // TEAM-5033 — the runtime-image project's log group. BuildRead's exact
+          // ARN makes its PHASES readable; this makes its LOG readable, which is
+          // the half the release manager actually needs to file a fix ticket.
+          `arn:aws:logs:${REGION}:${ACCOUNT}:log-group:/aws/codebuild/${RUNTIME_IMAGE_PROJECT}:*`,
           ...hubLogArns,
         ],
       },
@@ -615,6 +658,10 @@ async function main() {
   });
   const zipBuffer = readFileSync(zipPath);
 
+  // RUNTIME_IMAGE_PROJECT is deliberately NOT here (TEAM-5033): it scopes two IAM
+  // Resources and nothing else. The Lambda reads the pipeline's definition to learn
+  // which CodeBuild projects it owns, so handing it the name as config would create
+  // a second source of truth that drifts the moment the stack adds a project.
   const envVars = {
     PIPELINE_NAME,
     BUILD_PROJECT,
