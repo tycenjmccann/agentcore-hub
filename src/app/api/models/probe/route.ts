@@ -27,6 +27,7 @@ import {
   MODEL_ID_RE,
   VersionConflictError,
   loadModelsRegistryMeta,
+  resolveModel,
   saveModelsRegistry,
 } from "@/lib/models-registry";
 import type { CatalogRow, ModelsRegistry, ProbeOutcome } from "@/lib/models-registry";
@@ -111,6 +112,25 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
   const row = registry.catalog.find((r) => r.modelId === modelId);
   if (!row) {
     return NextResponse.json({ error: "unknown_model", modelId }, { status: 404, ...NO_STORE });
+  }
+
+  // A row the resolver will not resolve to ITSELF must not be probed. The coding
+  // runtime's `resolve_coding_model` gets null for a retired or quarantined id and
+  // silently falls through to `defaults.coding*`, and the turn result carries no
+  // model echo to catch it with — so a green result would be a green result for
+  // some other model, and finding 2's adoption gate would then trust it. The
+  // refusal IS the guard until the runtime echoes the model it ran
+  // (deploy/coding-agent-runtime/models_registry.py, and see src/lib/models/probe.ts).
+  const resolved = resolveModel(registry, modelId, { cli: row.vendor === "openai" ? "codex" : "claude" });
+  if (!resolved || resolved.modelId !== row.modelId || resolved.source !== "catalog") {
+    return NextResponse.json(
+      {
+        error: "not_probeable",
+        modelId,
+        status: registry.quarantine.includes(modelId) ? "quarantined" : row.status,
+      },
+      { status: 409, ...NO_STORE }
+    );
   }
 
   const key = `${modelId}#${mode}`;

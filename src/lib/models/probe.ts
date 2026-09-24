@@ -239,6 +239,13 @@ async function stopProbeSession(
 /**
  * One coding turn plus an independent in-container verification of its work.
  * Never throws; the session is always torn down, including when the turn fails.
+ *
+ * A green result here means "the CLI worked", not yet "the CLI worked on
+ * `row.modelId`": the runtime's turn result carries no model echo, and its
+ * `resolve_coding_model` substitutes `defaults.coding*` for an id it cannot
+ * resolve. Until the runtime echoes the model it ran, the guard is the probe
+ * route's `not_probeable` refusal, which never sends it a substitutable row
+ * (TEAM-5008 finding 5).
  */
 export async function runCliProbe(
   row: CatalogRow,

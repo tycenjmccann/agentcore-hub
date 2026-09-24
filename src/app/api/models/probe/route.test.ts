@@ -251,6 +251,63 @@ describe("POST /api/models/probe", () => {
     expect((await POST(req({ modelId: "us.anthropic.claude-opus-5", mode: "api" }))).status).toBe(202);
   });
 
+  /**
+   * TEAM-5008 finding 5. The coding runtime's `resolve_coding_model` answers null
+   * for a retired or quarantined id and silently falls through to
+   * `defaults.coding*`, and the turn result carries no model echo — so a green
+   * `probe.cli` on such a row would be a green result for a DIFFERENT model, and
+   * finding 2's adoption gate would then trust it.
+   */
+  it("409s a probe of a retired row — the runtime would substitute a default", async () => {
+    seatLive(5);
+    for (const mode of ["api", "cli"]) {
+      const res = await POST(req({ modelId: "us.anthropic.claude-opus-4-8", mode }));
+      expect(res.status).toBe(409);
+      expect(await res.json()).toEqual({
+        error: "not_probeable",
+        modelId: "us.anthropic.claude-opus-4-8",
+        status: "retired",
+      });
+    }
+    expect(h.state.apiCalls).toEqual([]);
+    expect(h.state.cliCalls).toEqual([]);
+  });
+
+  it("409s a quarantined row, listed by status or by the quarantine array", async () => {
+    const byStatus = seatLive(5);
+    byStatus.catalog.find((r) => r.modelId === "us.anthropic.claude-opus-5-5")!.status = "quarantined";
+    h.state.objects[MODELS_KEY] = JSON.stringify(byStatus);
+    const first = await POST(req({ modelId: "us.anthropic.claude-opus-5-5", mode: "cli" }));
+    expect(first.status).toBe(409);
+    expect(await first.json()).toMatchObject({ error: "not_probeable", status: "quarantined" });
+
+    // The other spelling: the row stays `active` and the id is quarantined
+    // document-wide. `resolveModel` refuses it either way, so the route must too.
+    await load();
+    const byList = seatLive(5);
+    byList.quarantine = ["us.anthropic.claude-opus-5-5"];
+    h.state.objects[MODELS_KEY] = JSON.stringify(byList);
+    const second = await POST(req({ modelId: "us.anthropic.claude-opus-5-5", mode: "cli" }));
+    expect(second.status).toBe(409);
+    expect(await second.json()).toMatchObject({ error: "not_probeable", status: "quarantined" });
+
+    expect(h.state.cliCalls).toEqual([]);
+  });
+
+  it("still probes an active row, and a candidate awaiting its two green probes", async () => {
+    const live = seatLive(5);
+    // A candidate is exactly the row a probe exists for: it resolves to itself,
+    // it just has no result yet.
+    live.catalog.find((r) => r.modelId === "us.anthropic.claude-opus-5-5")!.status = "candidate";
+    h.state.objects[MODELS_KEY] = JSON.stringify(live);
+
+    expect((await POST(req({ modelId: "us.anthropic.claude-opus-5-5", mode: "cli" }))).status).toBe(202);
+    expect((await POST(req({ modelId: "us.anthropic.claude-opus-5", mode: "api" }))).status).toBe(202);
+    await vi.waitFor(() => expect(h.state.puts.length).toBeGreaterThanOrEqual(2));
+    expect(h.state.cliCalls).toEqual(["us.anthropic.claude-opus-5-5"]);
+    expect(h.state.apiCalls).toEqual(["us.anthropic.claude-opus-5"]);
+  });
+
   it("refuses a non-admin and a cross-site POST", async () => {
     seatLive(5);
     process.env.AUTH_MODE = "oidc";
