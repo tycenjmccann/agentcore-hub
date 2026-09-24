@@ -12,7 +12,8 @@
 #   * the registry's own seed / catalog / pricing files
 #   * each byte-copied loader's LITERAL_* fallback constant (the last resort when
 #     S3 is unreadable — a hub with no registry must still boot)
-#   * the env-fallback layer in the deploy scripts (DD4: `--env X=${X:-<literal>}`)
+#   * the env-fallback layer in the deploy scripts (DD4: `--env X=${X:-<literal>}`
+#     in bash, `os.environ.get("X", <literal>)` in Python)
 #   * prose — a comment, docstring, help text or prompt example
 # Everything else is a resolution path and must go through the registry.
 #
@@ -90,13 +91,19 @@ ALLOW=(
   # The coding runtime's CLAUDE_MODEL / CODEX_MODEL env tails.
   'deploy/coding-agent-runtime/main.py:/os\.environ\.get\(/'
   'deploy/coding-agent-runtime/main.py:/^\s*"CLAUDE_MODEL", /'
-  # `--env NAME=${NAME:-<literal>}` on the create/update calls: the runtime reads
-  # the registry, but a runtime created before the registry existed still needs a
-  # model. These are deploy scripts, not a resolution path.
-  'deploy/runtime-agent/deploy-one.sh'
-  'deploy/runtime-agent/deploy-one-robust.py'
-  'deploy/runtime-agent/deploy-fleet.sh'
-  'deploy/coding-agent-runtime/deploy.py'
+  # The env-fallback tails on the create/update calls: the runtime reads the
+  # registry at the point of use, but a runtime created before the registry
+  # existed still needs a model, so a deploy script passes one as the LAST resort
+  # under an env override. Shape-pinned rather than whole-file (TEAM-5023): the
+  # entry now enforces the shape the reason claims — `--env NAME=${NAME:-<literal>}`
+  # in bash, `os.environ.get("NAME", "<literal>")` in Python — instead of blessing
+  # any literal these four files ever grow. deploy-fleet.sh holds MODEL_ID only to
+  # print it in the banner, and exports it for the child deploy-one.sh /
+  # deploy-one-robust.py, so banner and baked value cannot drift.
+  'deploy/runtime-agent/deploy-one.sh:/--env "[A-Z_]+=\$\{[A-Z_]+:-/'
+  'deploy/runtime-agent/deploy-one-robust.py:/os\.environ\.get\("[A-Z_]+", "/'
+  'deploy/runtime-agent/deploy-fleet.sh:/^MODEL_ID="\$\{MODEL_ID:-/'
+  'deploy/coding-agent-runtime/deploy.py:/os\.environ\.get\("[A-Z_]+", "/'
   # Both remaining hits are comments explaining which endpoint serves which id
   # shape; the model id itself now arrives via `models_registry.py --export`.
   'deploy/coding-agent-runtime/run-codex.sh:/^#/'
