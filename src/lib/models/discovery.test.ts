@@ -313,6 +313,17 @@ describe("mergeDiscovered", () => {
     expect(retired).toContain("global.anthropic.claude-opus-5");
   });
 
+  it("never retires a row routed at only by one of its aliases", () => {
+    // us.anthropic.claude-opus-5-5 retires when nothing routes at it (above); an
+    // alias in a tier protects it exactly as its id would, because validation
+    // resolves a routing target by id or alias.
+    const reg = seed();
+    reg.tiers.claude.sonnet = "claude-opus-5-5";
+    const { next, retired } = mergeDiscovered(reg, [], { scanned: BOTH_PLANES });
+    expect(retired).not.toContain("us.anthropic.claude-opus-5-5");
+    expect(next.catalog.find((r) => r.modelId === "us.anthropic.claude-opus-5-5")?.status).toBe("active");
+  });
+
   it("leaves already-retired rows alone", () => {
     const reg = seed();
     const before = reg.catalog.filter((r) => r.status === "retired").map((r) => r.retiredAt);
