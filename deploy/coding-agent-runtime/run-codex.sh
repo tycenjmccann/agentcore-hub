@@ -125,6 +125,8 @@ echo "[codex] endpoint=${CODEX_ENDPOINT} base_url=${CODEX_BASE_URL} model=${CODE
 # (`codex exec resume <id> <prompt>`); otherwise start a fresh one. --skip-git-repo-check
 # lets it run outside a git repo (and resume doesn't accept --yolo, so pass the
 # sandbox/approval bypass explicitly for parity with the fresh-run --yolo).
+# main.py passes no RESUME_ID when the thread was created on a different model:
+# its encrypted reasoning is model-bound and Bedrock rejects the replay (TEAM-5066).
 if [ -n "$RESUME_ID" ]; then
   set -- exec resume "$RESUME_ID" --json --model "$CODEX_RESOLVED_MODEL" \
     --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check "$PROMPT"

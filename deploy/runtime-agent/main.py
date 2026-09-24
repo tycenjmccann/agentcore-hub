@@ -1496,7 +1496,8 @@ def _remote_coding_turn(task: str, cli: str, repo: str = "", model: str = "",
     _record_coding_session(cli)
 
     footer = (f"\n\n[coding-session: {_CODING_SESSION['session_id']} cli={cli}"
-              f" conversation={_CODING_SESSION['conversation_ids'].get(cli) or 'n/a'}]")
+              f" conversation={_CODING_SESSION['conversation_ids'].get(cli) or 'n/a'}"
+              + (f" model={result['model']}" if result.get("model") else "") + "]")
     if _CODING_SESSION.get("fallback_note"):
         footer += f"\n[{_CODING_SESSION.pop('fallback_note')}]"
     # Deliverables the turn produced (mockups, screenshots, diagrams) are
