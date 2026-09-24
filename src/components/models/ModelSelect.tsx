@@ -20,11 +20,31 @@
  */
 
 import { isSelectable } from "./diff";
-import { optionText } from "./format";
+import { optionText, type InvalidFieldAction } from "./format";
 import type { CatalogRow, SelectField } from "./types";
 
 const SELECT_CLASSES =
   "w-full px-3 py-2 text-sm rounded-lg bg-surface-2 border text-primary focus:outline-none focus:border-brand-600/50";
+
+// Literal class names so Tailwind's content scan emits them: they are applied via
+// classList, which the scanner cannot see through.
+const HIGHLIGHT = ["ring-2", "ring-brand-500"];
+
+/**
+ * Scroll to the row that can fix a rejected field and put focus on its control.
+ * `block: "start"` pairs with the row's `scroll-mt-24`; `preventScroll` stops
+ * focus() from fighting the smooth scroll. The fallback focus on the row itself is
+ * a no-op for a div with no tabindex, but the scroll has still happened.
+ */
+function revealTarget(action: InvalidFieldAction) {
+  const target = document.getElementById(action.targetId);
+  if (!target) return;
+  target.scrollIntoView({ block: "start", behavior: "smooth" });
+  const focusable = document.querySelector<HTMLElement>(`[data-testid="${action.focusTestId}"]`) ?? target;
+  focusable.focus({ preventScroll: true });
+  target.classList.add(...HIGHLIGHT);
+  window.setTimeout(() => target.classList.remove(...HIGHLIGHT), 2000);
+}
 
 /** The catalog row a value points at, if the catalog still has one. */
 export function rowFor(catalog: CatalogRow[], modelId: string): CatalogRow | undefined {
@@ -39,6 +59,7 @@ export function ModelSelect({
   catalog,
   quarantine,
   invalidMessage,
+  invalidAction,
   inheritLabel,
   disabled,
   testId,
@@ -52,6 +73,8 @@ export function ModelSelect({
   quarantine: string[];
   /** Set when the server rejected this exact field in a 422. */
   invalidMessage?: string;
+  /** A one-click route to where the rejection can be fixed, shown under the message. */
+  invalidAction?: InvalidFieldAction | null;
   /** When set, an empty value is offered under this label (the per-agent rows). */
   inheritLabel?: string;
   disabled?: boolean;
@@ -92,9 +115,24 @@ export function ModelSelect({
         ))}
       </select>
       {invalidMessage && (
-        <p id={errorId} role="alert" className="text-[11px] text-danger-fg mt-1 leading-relaxed">
-          {invalidMessage}
-        </p>
+        <div className="mt-1">
+          {/* role=alert and aria-describedby stay on the sentence alone, so the
+              select's description does not swallow the button's label. */}
+          <p id={errorId} role="alert" className="text-[11px] text-danger-fg leading-relaxed">
+            {invalidMessage}
+          </p>
+          {invalidAction && (
+            <button
+              type="button"
+              onClick={() => revealTarget(invalidAction)}
+              data-testid={`${id}-error-action`}
+              data-target={invalidAction.targetId}
+              className="mt-1 text-[11px] underline text-secondary hover:text-primary transition-colors"
+            >
+              {invalidAction.label}
+            </button>
+          )}
+        </div>
       )}
     </div>
   );

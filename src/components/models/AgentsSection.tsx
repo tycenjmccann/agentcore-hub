@@ -16,6 +16,7 @@
 
 import { ChevronDown, ChevronRight, Search } from "lucide-react";
 import { AgentRow, agentRowStatus } from "./AgentRow";
+import { invalidFieldAction } from "./format";
 import type { Deployable, GroupName, InvalidReason, RegistryDoc, ResolvedModel } from "./types";
 import { DEPLOYABLES, GROUP_ORDER, groupFor } from "./types";
 
@@ -161,6 +162,7 @@ export function AgentsSection({
                         catalog={draft.catalog}
                         quarantine={draft.quarantine ?? []}
                         invalidMessage={invalidFields[`agents.${d.agentId}`]?.message}
+                        invalidAction={invalidFieldAction(invalidFields[`agents.${d.agentId}`]?.reason, overrides[d.agentId] ?? "")}
                         rowStatus={agentRowStatus(
                           d,
                           resolved[d.agentId],

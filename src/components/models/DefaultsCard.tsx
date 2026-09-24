@@ -8,7 +8,7 @@
  */
 
 import { PriceSourceBadge } from "./badges";
-import { factsLine } from "./format";
+import { factsLine, invalidFieldAction } from "./format";
 import { ModelSelect, rowFor } from "./ModelSelect";
 import type { CatalogRow, DefaultsField, InvalidReason, RegistryDoc, SelectField } from "./types";
 import { DEFAULTS_FIELDS } from "./types";
@@ -60,7 +60,7 @@ export function DefaultsCard({
         Defaults
       </h3>
       <p className="text-xs text-muted mt-1 leading-relaxed">
-        Only active, priced models can be a default. A candidate becomes selectable once both probes pass and you adopt
+        Only active, priced models can be a default. A candidate becomes selectable once both its smoke tests pass and you adopt
         it. Quarantined, unpriced and read-only judge models never appear here.
       </p>
 
@@ -77,6 +77,7 @@ export function DefaultsCard({
                 catalog={draft.catalog}
                 quarantine={draft.quarantine ?? []}
                 invalidMessage={invalidFields[`defaults.${field}`]?.message}
+                invalidAction={invalidFieldAction(invalidFields[`defaults.${field}`]?.reason, value)}
                 testId={`defaults-select-${field}`}
                 onChange={(modelId) => onChange(field, modelId)}
               />

@@ -13,7 +13,7 @@
  */
 
 import { InterimAgeChip, PriceSourceBadge } from "./badges";
-import { rateQuad } from "./format";
+import { invalidFieldAction, rateQuad } from "./format";
 import { ModelSelect, rowFor } from "./ModelSelect";
 import type { InvalidReason, RegistryDoc } from "./types";
 import { CLAUDE_TIERS, CODEX_TIERS } from "./types";
@@ -53,6 +53,7 @@ function TierRows({
               catalog={draft.catalog}
               quarantine={draft.quarantine ?? []}
               invalidMessage={invalidFields[`tiers.${family}.${tier}`]?.message}
+              invalidAction={invalidFieldAction(invalidFields[`tiers.${family}.${tier}`]?.reason, value)}
               testId={`tier-select-${family}-${tier}`}
               onChange={(modelId) => onChange(family, tier, modelId)}
             />
