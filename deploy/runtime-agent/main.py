@@ -90,11 +90,13 @@ import boto3
 # the try/except keeps main.py parseable/exec-able from the tests directory,
 # where sys.path does not include deploy/runtime-agent.
 try:
-    from models_registry import load_registry, resolve_agent_model, resolve_coding_model
+    from models_registry import (base_url_for, codex_config_text, load_registry,
+                                 resolve_agent_model, resolve_coding_model)
 except ImportError:  # pragma: no cover — container always has the twin alongside
     import sys as _sys
     _sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from models_registry import load_registry, resolve_agent_model, resolve_coding_model
+    from models_registry import (base_url_for, codex_config_text, load_registry,
+                                 resolve_agent_model, resolve_coding_model)
 
 from strands import Agent, tool
 from strands.models import BedrockModel
@@ -3028,10 +3030,10 @@ def claude_code(task: str, working_directory: str = "/tmp", repo: str = "", mode
 
 
 # ─── Codex CLI Tool ──────────────────────────────────────────────────────────
-# OpenAI Codex as an alternative coding agent, running GPT-5.5 via Amazon Bedrock
-# "Mantle" (OpenAI-compatible endpoint) — no OpenAI key. Auth is a short-term
-# Bedrock bearer token minted from the runtime IAM role. Mirrors claude_code's
-# subprocess + watchdog pattern so it's a drop-in peer.
+# OpenAI Codex as an alternative coding agent, reached over an OpenAI-compatible
+# Amazon Bedrock endpoint — no OpenAI key. Auth is a short-term Bedrock bearer
+# token minted from the runtime IAM role. Mirrors claude_code's subprocess +
+# watchdog pattern so it's a drop-in peer.
 
 # Codex has TWO homes and the registry row says which (TEAM-4995): Bedrock
 # Runtime serves the inference-profile ids (us.openai.gpt-…) on /openai/v1 and
@@ -3053,42 +3055,19 @@ def _ensure_codex_config(model: str = "") -> tuple[str, str | None]:
     deployed configuration — `codex` returns via _remote_coding_turn above and
     never reaches here; the coding runtime writes its own config.toml through
     merge-codex-config.py. This path exists for a runtime with no coding runtime
-    attached, so it is kept correct (both endpoints) but deliberately minimal:
-    the canonical, fully-merged config generator is the coding runtime's.
+    attached, and there is nothing endpoint-specific left in it: both writers
+    take the config.toml keys that are ours from the ONE generator in the
+    models_registry twin (codex_config_fragment), which is what stopped this copy
+    drifting — it used to name the provider "Amazon Bedrock Runtime
+    (OpenAI-compatible)", inline the base URL and carry its own output cap.
     """
     model_id, endpoint, region, _api, context_window = resolve_coding_model(
         load_registry(), model, "codex")
     codex_home = os.path.join(os.environ.get("HOME", "/tmp"), ".codex")
     os.makedirs(codex_home, exist_ok=True)
-    mantle = endpoint == "bedrock-mantle"
-    base_url = (f"https://bedrock-mantle.{region}.api.aws/openai/v1" if mantle
-                else f"https://bedrock-runtime.{region}.amazonaws.com/openai/v1")
-    provider_name = "Mantle" if mantle else "Runtime"
-    # Top-level keys FIRST, then the provider table — anything written after a
-    # [table] header becomes a key OF that table. web_search is top-level and
-    # must be explicit on Bedrock Runtime: --yolo otherwise defaults it to
-    # "live", which that endpoint does not serve, and the turn fails.
-    # Same key order and values the canonical generator emits
-    # (deploy/coding-agent-runtime/merge-codex-config.py), so the two paths write
-    # the same provider — codex has no built-in metadata for these ids and warns
-    # its way into conservative defaults when the limits are missing.
-    lines = [f'model = {json.dumps(model_id)}',
-             f'model_provider = {json.dumps(endpoint)}',
-             f'model_context_window = {context_window}',
-             'model_max_output_tokens = 128000']
-    if not mantle:
-        lines.append('web_search = "disabled"')
-    lines += ['',
-              f"[model_providers.{endpoint}]",
-              f'name = {json.dumps(f"Amazon Bedrock {provider_name} (OpenAI-compatible)")}',
-              f'base_url = {json.dumps(base_url)}',
-              'env_key = "OPENAI_API_KEY"',
-              'wire_api = "responses"']
-    if mantle:
-        lines += ['', f"[model_providers.{endpoint}.http_headers]",
-                  f'OpenAI-Project = {json.dumps(_MANTLE_PROJECT)}']
     with open(os.path.join(codex_home, "config.toml"), "w") as f:
-        f.write("\n".join(lines) + "\n")
+        f.write(codex_config_text(model_id, base_url_for(endpoint, region), endpoint,
+                                  _MANTLE_PROJECT, context_window))
     if not os.environ.get("OPENAI_API_KEY"):
         try:
             from aws_bedrock_token_generator import provide_token
@@ -3101,11 +3080,14 @@ def _ensure_codex_config(model: str = "") -> tuple[str, str | None]:
 @tool
 def codex(task: str, working_directory: str = "/tmp", repo: str = "", model: str = "",
           resume_session: str = "") -> str:
-    """Delegate a coding task to OpenAI Codex (GPT-5.5 via Amazon Bedrock).
+    """Delegate a coding task to OpenAI Codex, running on Amazon Bedrock.
 
     A peer to claude_code — same contract, different engine. Useful for a second
-    opinion, code review, or when you want GPT-5.5 to implement/verify. No OpenAI
-    key required; inference routes through Amazon Bedrock using the runtime role.
+    opinion, code review, or when you want a non-Claude model to implement or
+    verify. No OpenAI key required; inference routes through Amazon Bedrock using
+    the runtime role. Which model each tier reaches, and which you get when you
+    pass none, is the registry's answer (`tiers.codex` / `defaults.codingCodex`
+    in config/models.json) — never a model named in this docstring.
 
     All your codex calls in this task share ONE workspace and ONE conversation —
     a later call remembers the earlier calls and their files. Do NOT reference

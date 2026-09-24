@@ -286,3 +286,78 @@ def test_mantle_region_env_only_moves_the_mantle_branch(monkeypatch):
     monkeypatch.setenv("AWS_REGION", "eu-central-1")
     assert mr.resolve_coding_model(None, "", "codex")[2] == "us-west-2"
     assert mr.resolve_coding_model(None, "", "claude")[2] == "eu-central-1"
+
+
+# ─── ONE Codex config generator (byte-identical block in both twins' tests) ──
+# There were two generators and they drifted: the fleet runtime named the
+# provider "Amazon Bedrock Runtime (OpenAI-compatible)", inlined the base URL and
+# carried its own output cap, while the coding runtime's merger was correct. Now
+# codex_config_fragment in THIS module is the only one, and these tests are what
+# keeps it that way — the merger's output must be byte-identical to the fragment,
+# and main.py must have no provider strings left of its own.
+
+FLEET_MAIN = REPO_ROOT / "deploy" / "runtime-agent" / "main.py"
+MERGER = REPO_ROOT / "deploy" / "coding-agent-runtime" / "merge-codex-config.py"
+
+# One id per endpoint: the two branches ARE the contract (web_search here,
+# OpenAI-Project there), so neither may be tested alone.
+CODEX_ENDPOINT_INPUTS = [
+    ("us.openai.gpt-6-astra", "bedrock-runtime", "us-east-1"),
+    ("openai.gpt-5.5", "bedrock-mantle", "us-east-2"),
+]
+
+
+def _load_merger():
+    """merge-codex-config.py, loaded the way the container runs it: its own
+    directory on sys.path, so its `from models_registry import …` finds the twin
+    sitting next to it. If the merger ever grows a private copy of the fragment,
+    the byte-equality test below is what notices."""
+    import sys as _sys
+    spec = importlib.util.spec_from_file_location("merge_codex_config_under_test", MERGER)
+    mod = importlib.util.module_from_spec(spec)
+    _sys.path.insert(0, str(MERGER.parent))
+    try:
+        spec.loader.exec_module(mod)
+    finally:
+        _sys.path.remove(str(MERGER.parent))
+    return mod
+
+
+@pytest.mark.parametrize("model_id,endpoint,region", CODEX_ENDPOINT_INPUTS)
+def test_the_merger_emits_exactly_the_shared_fragment(model_id, endpoint, region):
+    merger = _load_merger()
+    base_url = mr.base_url_for(endpoint, region)
+    args = (model_id, base_url, endpoint, "default", 400000)
+    assert merger.our_fragment(*args) == mr.codex_config_fragment(*args)
+    # Merged into an EMPTY user config the whole file is ours, which is exactly
+    # what the fleet runtime's local fallback writes.
+    assert merger.merge("", *args) == mr.codex_config_text(*args)
+
+
+@pytest.mark.parametrize("model_id,endpoint,region", CODEX_ENDPOINT_INPUTS)
+def test_the_fragment_carries_the_per_endpoint_rules(model_id, endpoint, region):
+    text = mr.codex_config_text(model_id, mr.base_url_for(endpoint, region), endpoint, "proj-x")
+    mantle = endpoint == "bedrock-mantle"
+    assert f"[model_providers.{endpoint}]" in text
+    assert f'model_provider = "{endpoint}"' in text
+    assert f"model_max_output_tokens = {mr.CODEX_MAX_OUTPUT_TOKENS}" in text
+    # web_search on bedrock-runtime ONLY (a --yolo turn dies without it there);
+    # the project header on mantle ONLY ("Engine not found" without it).
+    assert ('web_search = "disabled"' in text) == (not mantle)
+    assert ('OpenAI-Project = "proj-x"' in text) == mantle
+    expected_name = ("Amazon Bedrock Mantle (OpenAI-compatible)" if mantle
+                     else "Amazon Bedrock (OpenAI-compatible)")
+    assert f'name = {json.dumps(expected_name)}' in text
+    # Top-level keys before the first [table] header, or they become keys OF it.
+    assert text.index("model = ") < text.index("[model_providers.")
+
+
+def test_the_fleet_runtime_writes_no_provider_config_of_its_own():
+    """main.py cannot be imported (module-level Strands construction), so its half
+    of the parity is asserted as text: every TOML key of the provider block has to
+    come from the fragment, or the two writers can drift again."""
+    text = FLEET_MAIN.read_text()
+    for owned in ("[model_providers", "model_provider =", "model_context_window",
+                  "model_max_output_tokens", "wire_api", "env_key"):
+        assert owned not in text, f"{owned!r} is written in main.py, not by the fragment"
+    assert "codex_config_text(" in text, "main.py must call the shared generator"

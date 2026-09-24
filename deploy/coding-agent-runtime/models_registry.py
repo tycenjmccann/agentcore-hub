@@ -76,6 +76,15 @@ _DEFAULT_CODEX_ENDPOINT = "bedrock-mantle"
 _DEFAULT_CODEX_API = "responses"
 _DEFAULT_CONTEXT_WINDOW = 400000
 
+# Codex config numbers, public because both containers' config writers read them
+# (see codex_config_fragment). GPT-5 class: 400k context, 128k max output — codex
+# ships no metadata for these ids over Bedrock, so it warns and falls back to
+# conservative defaults unless the limits are declared.
+CODEX_MAX_OUTPUT_TOKENS = 128000
+CODEX_DEFAULT_CONTEXT_WINDOW = _DEFAULT_CONTEXT_WINDOW
+# An account setting, not a model property, so the caller passes it in.
+CODEX_DEFAULT_PROJECT = "default"
+
 # Agents that legitimately appear in `agents` but not in src/config/agents.json:
 # the Telegram bug-intake bridge is a Lambda, not a fleet runtime, so it has no
 # roster row — but it does pick a model, so it needs a pin.
@@ -696,6 +705,67 @@ def base_url_for(endpoint, region):
     if endpoint == "bedrock-mantle":
         return f"https://bedrock-mantle.{region}.api.aws/openai/v1"
     return f"https://bedrock-runtime.{region}.amazonaws.com/openai/v1"
+
+
+# ─── Codex provider config ───────────────────────────────────────────────────
+# ONE generator for the config.toml keys that are OURS. There were two, and they
+# drifted: deploy/runtime-agent/main.py named the provider "Amazon Bedrock Runtime
+# (OpenAI-compatible)" (codex's own name for the endpoint is not ours to invent),
+# inlined the base URL instead of calling base_url_for, and carried its own copy
+# of the output cap. This module is where it belongs: it is the only file both
+# container images already have on the import path (/app/models_registry.py), it
+# is stdlib-only by contract, and it already owns base_url_for and the context
+# window. Callers are deploy/coding-agent-runtime/merge-codex-config.py (which
+# merges the fragment into a user-supplied file) and the fleet runtime's
+# _ensure_codex_config (which writes a whole fresh file).
+
+def codex_config_fragment(model, base_url, endpoint, project=CODEX_DEFAULT_PROJECT,
+                          context_window=CODEX_DEFAULT_CONTEXT_WINDOW):
+    """-> (top-level keys, provider tables): the two TOML blocks that are OURS.
+
+    Two blocks, not one string, because the top-level keys must be emitted BEFORE
+    any [table] header — anything after one becomes a key OF that table — and a
+    merging caller has to slot the user's surviving keys in between.
+    """
+    top = [
+        f"model = {json.dumps(model)}",
+        f"model_provider = {json.dumps(endpoint)}",
+        f"model_context_window = {context_window}",
+        f"model_max_output_tokens = {CODEX_MAX_OUTPUT_TOKENS}",
+    ]
+    if endpoint != "bedrock-mantle":
+        # MANDATORY on bedrock-runtime. `codex exec --yolo` defaults web_search to
+        # "live", and Bedrock answers a request carrying the web_search tool with
+        # turn.failed "web search is not supported for this request" — i.e. every
+        # turn dies. Mantle does not need it, which is why it is emitted here
+        # only (design DD3b).
+        top.append('web_search = "disabled"')
+
+    name = ("Amazon Bedrock Mantle (OpenAI-compatible)" if endpoint == "bedrock-mantle"
+            else "Amazon Bedrock (OpenAI-compatible)")
+    tables = [
+        f"[model_providers.{endpoint}]",
+        f"name = {json.dumps(name)}",
+        f"base_url = {json.dumps(base_url)}",
+        'env_key = "OPENAI_API_KEY"',
+        # GPT-5 class only supports /responses.
+        'wire_api = "responses"',
+    ]
+    if endpoint == "bedrock-mantle":
+        # Mantle REQUIRES the project header — "Engine not found" without it.
+        tables += [
+            "",
+            f"[model_providers.{endpoint}.http_headers]",
+            f"OpenAI-Project = {json.dumps(project)}",
+        ]
+    return "\n".join(top), "\n".join(tables)
+
+
+def codex_config_text(model, base_url, endpoint, project=CODEX_DEFAULT_PROJECT,
+                      context_window=CODEX_DEFAULT_CONTEXT_WINDOW):
+    """A whole fresh config.toml — byte-identical to merging into an empty file."""
+    top, tables = codex_config_fragment(model, base_url, endpoint, project, context_window)
+    return "\n\n".join(block for block in (top, tables) if block) + "\n"
 
 
 # ─── `--export` CLI ──────────────────────────────────────────────────────────
