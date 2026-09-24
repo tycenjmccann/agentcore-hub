@@ -100,7 +100,7 @@ ALLOW=(
   # any literal these four files ever grow. deploy-fleet.sh holds MODEL_ID only to
   # print it in the banner, and exports it for the child deploy-one.sh /
   # deploy-one-robust.py, so banner and baked value cannot drift.
-  'deploy/runtime-agent/deploy-one.sh:/"[A-Z_]+=\$\{[A-Z_]+:-/'
+  'deploy/runtime-agent/deploy-one.sh:/--env "[A-Z_]+=\$\{[A-Z_]+:-/'
   'deploy/runtime-agent/deploy-one-robust.py:/os\.environ\.get\("[A-Z_]+", "/'
   'deploy/runtime-agent/deploy-fleet.sh:/^MODEL_ID="\$\{MODEL_ID:-/'
   'deploy/coding-agent-runtime/deploy.py:/os\.environ\.get\("[A-Z_]+", "/'
@@ -203,7 +203,10 @@ entry_covers() { # $1 = entry, $2 = path, $3 = line no, $4 = line text
     # directory prefix.
     *:/*/)
       spec="${entry%%:/*}"; where="${entry#*:/}"; where="${where%/}"
-      [ "$spec" = "$p" ] && printf '%s' "$text" | grep -qE "$where" && return 0 ;;
+      # `--`: a shape pin may legitimately begin with `-` (e.g. `--env `), and
+      # without an option terminator grep reads that as an option string, not
+      # a pattern, and misreports every real hit under it as unallowed.
+      [ "$spec" = "$p" ] && printf '%s' "$text" | grep -qE -- "$where" && return 0 ;;
     */) [ "${p#"$entry"}" != "$p" ] && return 0 ;;
     *:[0-9]*-[0-9]*)
       spec="${entry%%:*}"; where="${entry##*:}"
@@ -330,6 +333,26 @@ self_test() {
     echo "  ok — docs and *.test.ts are exempt"; pass=$((pass + 1))
   else
     echo "  SELF-TEST FAIL: an exempt path was reported" >&2; fail=$((fail + 1))
+  fi
+
+  # 5. a pin whose regex begins with `-` (e.g. `--env `) is read as a pattern,
+  # not misparsed as a grep option (TEAM-5023) — and the same pin still
+  # rejects a hardcoded line with no env fallback.
+  printf '  --env "X_MODEL=${X_MODEL:-us.anthropic.claude-opus-5}"\n' \
+    > "$tmp/lambda/somewhere/index.mjs"
+  ALLOW+=('lambda/somewhere/index.mjs:/--env "[A-Z_]+=\$\{[A-Z_]+:-/')
+  if run_check "$tmp" >/dev/null 2>&1; then
+    echo "  ok — a pin beginning with --env is read as a pattern, not a grep option"; pass=$((pass + 1))
+  else
+    echo "  SELF-TEST FAIL: a leading-dash pin misfired as a grep option" >&2; fail=$((fail + 1))
+  fi
+
+  printf '  --env "X_MODEL=us.anthropic.claude-opus-5"\n' \
+    > "$tmp/lambda/somewhere/index.mjs"
+  if run_check "$tmp" >/dev/null 2>&1; then
+    echo "  SELF-TEST FAIL: the leading-dash pin allowed a hardcoded literal with no fallback" >&2; fail=$((fail + 1))
+  else
+    echo "  ok — the same pin still rejects a hardcoded (non-fallback) line"; pass=$((pass + 1))
   fi
 
   rm -rf "$tmp"
