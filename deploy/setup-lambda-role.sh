@@ -164,6 +164,15 @@ echo "   ✓ Attached DynamoDB Streams read (tickets)"
 # ─── S3 RW on the artifact bucket ────────────────────────────────────────────
 # Bucket name follows the convention in deploy/config.sh:
 #   agentcore-hub-artifacts-${ACCOUNT_ID}-${REGION}
+#
+# This role is shared by 7 functions, and workflow-output's S3Storage___write_object
+# writes an AGENT-SUPPLIED key — so the bucket-wide ObjectRW below also hands every
+# persona a write onto config/models.json, the document that decides which model
+# each of them runs on. These functions only READ the registry, so DenyRegistryWrite
+# takes the three registry keys back; a Deny outranks every Allow, in this policy or
+# any other attached one. The writers are the token aggregator's own role
+# (setup-token-aggregator-role.sh, RegistryReadWrite, already key-scoped) and the
+# hub's ECS task role (the console save) — neither is touched.
 ARTIFACT_BUCKET_NAME="agentcore-hub-artifacts-${ACCOUNT_ID}-${REGION}"
 aws iam put-role-policy \
   --role-name "$ROLE_NAME" \
@@ -187,6 +196,16 @@ aws iam put-role-policy \
           \"s3:GetObjectVersion\"
         ],
         \"Resource\": \"arn:aws:s3:::${ARTIFACT_BUCKET_NAME}/*\"
+      },
+      {
+        \"Sid\": \"DenyRegistryWrite\",
+        \"Effect\": \"Deny\",
+        \"Action\": [\"s3:PutObject\", \"s3:DeleteObject\"],
+        \"Resource\": [
+          \"arn:aws:s3:::${ARTIFACT_BUCKET_NAME}/config/models.json\",
+          \"arn:aws:s3:::${ARTIFACT_BUCKET_NAME}/config/models.prev.json\",
+          \"arn:aws:s3:::${ARTIFACT_BUCKET_NAME}/config/pricing.json\"
+        ]
       }
     ]
   }"

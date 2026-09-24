@@ -33,6 +33,10 @@ PIPELINE_TOOLS_ROLE="${PIPELINE_TOOLS_ROLE:-${PIPELINE_TOOLS_FUNCTION}-role}"
 # (deploy/setup-token-aggregator-role.sh).
 ECS_TASK_ROLE="${ECS_TASK_ROLE_NAME:-agentcore-hub-ecs-task}"
 TOKEN_AGGREGATOR_ROLE="${TOKEN_AGGREGATOR_ROLE_NAME:-agentcore-hub-token-aggregator-role}"
+# The two LLM-driven principals that must NOT be able to write the registry
+# (deploy/setup-runtime-role.sh:22, deploy/setup-lambda-role.sh:33 — same override idiom).
+RUNTIME_ROLE="${AGENTCORE_ROLE_NAME:-agentcore-hub-agentcore-role}"
+LAMBDA_ROLE="${LAMBDA_ROLE_NAME:-agentcore-hub-lambda-role}"
 # simulate-principal-policy needs the account in --policy-source-arn. Derived,
 # never hardcoded — AWS_ACCOUNT_ID short-circuits STS (deploy/config.sh:23 idiom).
 ACCOUNT_ID="${AWS_ACCOUNT_ID:-$(aws sts get-caller-identity --query Account --output text 2>/dev/null || echo '')}"
@@ -156,6 +160,26 @@ action_allowed() {
     --output text 2>/dev/null | grep -qx "allowed"
 }
 
+# The peer of action_allowed: assert IAM's evaluator does NOT allow <action> on
+# <resource>. Either denial counts — explicitDeny (a Deny statement, which is what
+# DenyRegistryWrite is) or implicitDeny (no Allow reaches it) — because the property
+# being verified is "this principal cannot write that key", not which statement says
+# so. Read-only; simulate never performs the action.
+#
+# Usage: action_denied <role> <action> <resource-arn>
+action_denied() {
+  local role=$1
+  local action=$2
+  local resource=$3
+  [ -n "$ACCOUNT_ID" ] || return 1
+  aws iam simulate-principal-policy \
+    --policy-source-arn "arn:aws:iam::${ACCOUNT_ID}:role/${role}" \
+    --action-names "$action" \
+    --resource-arns "$resource" \
+    --query 'EvaluationResults[0].EvalDecision' \
+    --output text 2>/dev/null | grep -qxE "explicitDeny|implicitDeny"
+}
+
 echo ""
 echo "  Verifying AgentCore Hub Infrastructure"
 echo "  ═══════════════════════════════════"
@@ -251,6 +275,35 @@ if aws iam get-role --role-name "$TOKEN_AGGREGATOR_ROLE" >/dev/null 2>&1; then
     "action_allowed $TOKEN_AGGREGATOR_ROLE bedrock:ListInferenceProfiles"
 else
   echo "  - IAM: $TOKEN_AGGREGATOR_ROLE not found (skipped — hand-apply with ./deploy/setup-token-aggregator-role.sh)"
+fi
+
+# ─── Who may WRITE config/models.json (TEAM-5009) ─────────────────────────────
+# One document decides which model every agent, judge and coding CLI runs on, and
+# the two prompt-driven principals hold a bucket-wide s3:PutObject on the artifact
+# bucket — workflow-output's S3Storage___write_object even takes the key from the
+# agent. So each of their setup scripts carries an explicit DenyRegistryWrite, and
+# these checks are what notice if a hand-applied policy loses it: the registry key
+# must be DENIED for the fleet runtime and the shared Lambda role, and still
+# ALLOWED for the aggregator, which is the machine that legitimately rewrites it.
+# A deny that also broke the writer would pass a one-sided check, which is why the
+# positive case is asserted next to the two negative ones. Skipped, not failed,
+# when the role or ARTIFACT_BUCKET is absent; nothing here calls S3.
+if [ -n "$ARTIFACT_BUCKET" ]; then
+  REGISTRY_KEY_ARN="arn:aws:s3:::${ARTIFACT_BUCKET}/config/models.json"
+  for r in "$RUNTIME_ROLE" "$LAMBDA_ROLE"; do
+    if aws iam get-role --role-name "$r" >/dev/null 2>&1; then
+      check "IAM: $r DENIED s3:PutObject on config/models.json (DenyRegistryWrite)" \
+        "action_denied $r s3:PutObject $REGISTRY_KEY_ARN"
+    else
+      echo "  - IAM: $r not found (skipped — hand-apply with ./deploy/setup-runtime-role.sh / ./deploy/setup-lambda-role.sh)"
+    fi
+  done
+  if aws iam get-role --role-name "$TOKEN_AGGREGATOR_ROLE" >/dev/null 2>&1; then
+    check "IAM: $TOKEN_AGGREGATOR_ROLE allowed s3:PutObject on config/models.json (the one machine writer)" \
+      "action_allowed $TOKEN_AGGREGATOR_ROLE s3:PutObject $REGISTRY_KEY_ARN"
+  fi
+else
+  echo "  - IAM: registry-write denials (ARTIFACT_BUCKET not set, skipped)"
 fi
 
 echo ""

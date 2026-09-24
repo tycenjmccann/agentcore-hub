@@ -192,6 +192,25 @@ const WM_DATA_POLICY = {
       ],
     },
     {
+      // This harness is prompt-driven and the Allow above is bucket-wide, so it also
+      // covers the model registry — the document that decides which model it and every
+      // fleet persona runs on. Its toolkit writes run artifacts and reads only
+      // config/workflows.json (pull_dossier.py); the registry read below happens at
+      // DEPLOY time, under the operator's credentials, not this role's. So the three
+      // registry keys are denied back and a Deny outranks every Allow. The writers are
+      // the token aggregator's own role (deploy/setup-token-aggregator-role.sh,
+      // RegistryReadWrite, already key-scoped) and the hub's ECS task role (the console
+      // save) — neither is touched.
+      Sid: "DenyRegistryWrite",
+      Effect: "Deny",
+      Action: ["s3:PutObject", "s3:DeleteObject"],
+      Resource: [
+        `arn:aws:s3:::${ARTIFACT_BUCKET}/config/models.json`,
+        `arn:aws:s3:::${ARTIFACT_BUCKET}/config/models.prev.json`,
+        `arn:aws:s3:::${ARTIFACT_BUCKET}/config/pricing.json`,
+      ],
+    },
+    {
       // crash-rca skill: pull_session_logs.py reads runtime log groups +
       // span destinations to diagnose dead agent sessions. Read-only.
       Sid: "SessionLogsRead",
