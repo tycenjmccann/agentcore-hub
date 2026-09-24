@@ -91,7 +91,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       if (!(err instanceof RegistryFallbackError)) throw err;
       console.warn(`[models] discovery.write_refused reason=registry_fallback source=${err.source}`);
       return NextResponse.json(
-        { error: "registry_unavailable", source: err.source },
+        { error: "registry_unavailable", source: err.source, fallback: err.fallback ?? null },
         { status: 503, ...NO_STORE }
       );
     }

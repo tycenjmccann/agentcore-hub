@@ -241,7 +241,10 @@ export class VersionConflictError extends Error {
  */
 export class RegistryFallbackError extends Error {
   readonly code = "registry_unavailable";
-  constructor(readonly source: RegistryMeta["source"]) {
+  constructor(
+    readonly source: RegistryMeta["source"],
+    readonly fallback?: RegistryFallback
+  ) {
     super(`registry read fell back to ${source}; refusing to write over it`);
     this.name = "RegistryFallbackError";
   }
@@ -1067,10 +1070,24 @@ interface RegistryCache {
 let _regCache: RegistryCache | null = null;
 let _priceCache: { pricing: PricingDoc; at: number } | null = null;
 
+/**
+ * Why a read did not come from S3 (TEAM-5052). In memory only, per read: the
+ * /models page shows it, so a refused live document is visible instead of the
+ * page quietly showing the seed's "version 1".
+ */
+export interface RegistryFallback {
+  reason: "invalid" | "missing" | "error" | "no_bucket";
+  detail: string;
+  /** The version of the live document the read gate refused, when it parsed. */
+  refusedVersion?: number;
+}
+
 export interface RegistryMeta {
   registry: ModelsRegistry;
   etag?: string;
   source: "s3" | "cache" | "seed";
+  /** Set on every non-S3 answer except a warm TTL hit. */
+  fallback?: RegistryFallback;
 }
 
 /**
@@ -1083,7 +1100,7 @@ export interface RegistryMeta {
  */
 export function requireLiveRegistry(meta: RegistryMeta): RegistryMeta & { source: "s3"; etag: string } {
   if (meta.source === "s3" && meta.etag) return meta as RegistryMeta & { source: "s3"; etag: string };
-  throw new RegistryFallbackError(meta.source);
+  throw new RegistryFallbackError(meta.source, meta.fallback);
 }
 
 /**
@@ -1095,16 +1112,16 @@ export function requireLiveRegistry(meta: RegistryMeta): RegistryMeta & { source
  * too, and reading it would add a blocking S3 GET to the request path at exactly
  * the moment S3 is the thing going wrong.
  */
-function lastGoodRegistry(): RegistryMeta {
+function lastGoodRegistry(fallback: RegistryFallback): RegistryMeta {
   if (_regCache) {
     _regCache.at = Date.now();
     // A cache that only ever held the bundled seed IS the seed: saying "cache"
     // would tell the page (and a writer's log) a live copy was once read.
-    if (_regCache.registry === BUNDLED_REGISTRY) return { registry: BUNDLED_REGISTRY, source: "seed" };
-    return { registry: _regCache.registry, etag: _regCache.etag, source: "cache" };
+    if (_regCache.registry === BUNDLED_REGISTRY) return { registry: BUNDLED_REGISTRY, source: "seed", fallback };
+    return { registry: _regCache.registry, etag: _regCache.etag, source: "cache", fallback };
   }
   _regCache = { registry: BUNDLED_REGISTRY, at: Date.now() };
-  return { registry: BUNDLED_REGISTRY, source: "seed" };
+  return { registry: BUNDLED_REGISTRY, source: "seed", fallback };
 }
 
 /**
@@ -1156,7 +1173,13 @@ export async function loadModelsRegistryMeta(opts: { force?: boolean } = {}): Pr
   if (!opts.force && _regCache && Date.now() - _regCache.at < TTL_MS) {
     return { registry: _regCache.registry, etag: _regCache.etag, source: "cache" };
   }
-  if (!ARTIFACT_BUCKET) return { registry: BUNDLED_REGISTRY, source: "seed" };
+  if (!ARTIFACT_BUCKET) {
+    return {
+      registry: BUNDLED_REGISTRY,
+      source: "seed",
+      fallback: { reason: "no_bucket", detail: "ARTIFACT_BUCKET is not set" },
+    };
+  }
   try {
     const s3 = new S3Client({ region: REGION });
     const obj = await s3.send(new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: MODELS_REGISTRY_KEY }));
@@ -1166,7 +1189,11 @@ export async function loadModelsRegistryMeta(opts: { force?: boolean } = {}): Pr
       // A corrupt read is a FAILED read: never cached as last-good, and never
       // reported as `source:"s3"`.
       console.warn(`[models] registry.fallback reason=invalid detail=${failure}`);
-      return lastGoodRegistry();
+      return lastGoodRegistry({
+        reason: "invalid",
+        detail: failure,
+        ...(Number.isFinite(registry.version) && registry.catalog.length ? { refusedVersion: registry.version } : {}),
+      });
     }
     _regCache = { registry, etag: obj.ETag, at: Date.now() };
     console.log(
@@ -1176,11 +1203,12 @@ export async function loadModelsRegistryMeta(opts: { force?: boolean } = {}): Pr
   } catch (err) {
     if (isNotFound(err)) {
       console.log("[models] registry.fallback reason=missing");
-      return lastGoodRegistry(); // seed only when nothing is cached
+      // seed only when nothing is cached
+      return lastGoodRegistry({ reason: "missing", detail: `s3 key ${MODELS_REGISTRY_KEY} not found` });
     }
     const reason = (err as Error)?.name || "error";
     console.warn(`[models] registry.fallback reason=${reason}`);
-    return lastGoodRegistry();
+    return lastGoodRegistry({ reason: "error", detail: reason });
   }
 }
 
