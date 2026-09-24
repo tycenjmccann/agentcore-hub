@@ -131,25 +131,120 @@ def _row_ok(row):
     return True
 
 
-def validate_registry(doc, agents_path=None):
-    """Tolerant parse of a registry document.
+def parse_registry(doc):
+    """Tolerant NORMALIZE of a registry document, with no verdict attached.
 
-    Returns `(doc_or_None, warnings, errors)`. A malformed ROW is dropped with a
-    warning — one bad candidate must not take the fleet down. But a document
-    whose `defaults`, `tiers` or `agents` point AT a dropped row is internally
-    inconsistent: resolving through it would silently hand back something other
-    than what the operator wrote, so the whole document is an error and the
-    caller falls back to env/literal instead. That asymmetry is the point.
+    Returns `(doc_or_None, warnings)`. Mirror of parseModelsRegistry() in
+    src/lib/models-registry.ts, and the reason that function and validateRegistry()
+    are two functions there rather than one: normalizing (drop malformed rows,
+    de-duplicate aliases, fold dated snapshots) answers "what does this document
+    say", while validating answers "may the hub serve it". A caller that wants to
+    resolve THROUGH a document the read gate would refuse — a registry that
+    quarantines a model some tier still points at, say — needs the first without
+    the second. Only `load_registry` wants the verdict, and it calls
+    validate_registry.
     """
-    warnings, errors = [], []
+    normalized, warnings, _errors = _parse_registry(doc)
+    return normalized, warnings
+
+
+def validate_registry(doc, agents_path=None):
+    """Tolerant parse of a registry document, PLUS the hub's read-time verdict.
+
+    Returns `(doc_or_None, warnings, errors)`, where `errors` is a
+    `{field path: reason}` map in the SAME vocabulary as validateRegistry() in
+    src/lib/models-registry.ts — `bad_model_id`, `quarantined`, `unknown_model`,
+    `read_only`, `inactive`, `unpriced`, `unprobed`, `duplicate_alias`. The hub
+    calls that function on its READ path (`registryReadFailure`) and falls back
+    to last-good/seed on any of those reasons, so a twin that keeps serving a
+    document the hub refuses IS the divergence DL-033 exists to prevent. Same
+    reasons, same paths, same verdict.
+
+    A malformed ROW is dropped with a warning — one bad candidate must not take
+    the fleet down. But a document whose `defaults`, `tiers`, `agents` or
+    `legacyAliases` point AT a row that cannot be routed to — dropped, retired,
+    quarantined, read-only, unpriced, or a candidate that has not passed both
+    probe planes — is internally inconsistent: resolving through it would
+    silently hand back something other than what the operator wrote, so the
+    whole document is an error and the caller falls back to env/literal instead.
+    That asymmetry is the point.
+    """
+    normalized, warnings, errors = _parse_registry(doc)
+    if normalized is None:
+        return None, warnings, errors
+
+    rows = normalized["models"]
+    alias_owner = normalized["_aliasOwner"]
+    legacy = doc.get("legacyAliases") if isinstance(doc.get("legacyAliases"), dict) else {}
+
+    # Anything the document POINTS AT must be ROUTABLE, not merely present.
+    # `defaults` and `tiers` are how every caller lands somewhere when it was
+    # given nothing, so a target that cannot be routed to is not a warning.
+    # _target_reason is the mirror of targetReason() in the canonical.
+    index = _index_rows(rows, alias_owner)
+    quarantine = _quarantine_set(doc)
+
+    defaults = doc.get("defaults") if isinstance(doc.get("defaults"), dict) else {}
+    for key, value in defaults.items():
+        reason = _target_reason(index, quarantine, value)
+        if reason:
+            errors[f"defaults.{key}"] = reason
+
+    tiers = doc.get("tiers") if isinstance(doc.get("tiers"), dict) else {}
+    for cli, mapping in tiers.items():
+        if not isinstance(mapping, dict):
+            errors[f"tiers.{cli}"] = "not_an_object"
+            continue
+        for tier, value in mapping.items():
+            reason = _target_reason(index, quarantine, value)
+            if reason:
+                errors[f"tiers.{cli}.{tier}"] = reason
+
+    agents = doc.get("agents") if isinstance(doc.get("agents"), dict) else {}
+    for agent_id, value in agents.items():
+        reason = _target_reason(index, quarantine, value)
+        if reason:
+            errors[f"agents.{agent_id}"] = reason
+
+    for alias, value in legacy.items():
+        if not isinstance(alias, str) or not MODEL_ID_RE.match(alias):
+            errors[f"legacyAliases.{alias}"] = "bad_model_id"
+            continue
+        reason = _target_reason(index, quarantine, value)
+        if reason:
+            errors[f"legacyAliases.{alias}"] = reason
+
+    # Every pinned agent must be a real agent. Skipped entirely when the roster
+    # is not readable from here — agents.json is NOT shipped into either Python
+    # container, so absence is the normal case at runtime and only CI (which
+    # passes a path) enforces this.
+    roster = _read_roster(agents_path)
+    if roster is not None:
+        for agent_id in agents:
+            if agent_id not in roster and agent_id not in EXEMPT_AGENTS:
+                errors[f"agents.{agent_id}"] = "unknown_agent"
+
+    if errors:
+        return None, warnings, errors
+    return normalized, warnings, errors
+
+
+def _parse_registry(doc):
+    """The normalize half, shared by both entry points above.
+
+    `(doc_or_None, warnings, errors)`, where `errors` carries only the STRUCTURAL
+    and catalog-integrity reasons — the document still normalizes with them, which
+    is why parse_registry can hand it back and validate_registry cannot.
+    """
+    warnings, errors = [], {}
     if not isinstance(doc, dict):
-        return None, warnings, ["not an object"]
+        return None, warnings, {"document": "not_an_object"}
 
     raw_models = doc.get("models")
     if raw_models is None:
         raw_models = doc.get("catalog")
     if not isinstance(raw_models, list):
-        return None, warnings, ["models[] missing or not an array"]
+        return None, warnings, {"models": "missing_or_not_an_array"}
 
     rows, seen_ids, alias_owner = [], set(), {}
     for idx, row in enumerate(raw_models):
@@ -161,29 +256,52 @@ def validate_registry(doc, agents_path=None):
             warnings.append(f"row {idx} dropped (duplicate modelId {model_id})")
             continue
         seen_ids.add(model_id)
-        rows.append(row)
+        # A COPY, matching `rows.push({...row})` in the mjs twin: the alias and
+        # dated-fold passes below rewrite `aliases`, and doing that to the
+        # caller's dict made parsing the same document twice give two answers.
+        rows.append(dict(row))
 
-    # Aliases must be unambiguous ACROSS namespaces: an alias that is also a
-    # modelId, or that two rows both claim, makes resolution order observable.
-    # Such an alias is dropped (not the row) — the row still resolves by id.
+    # Aliases must be unambiguous ACROSS namespaces: an alias that another row
+    # already claims as its id or its alias makes resolution order decide which
+    # model — and therefore which price — you get. The canonical errors on that
+    # (`catalog.<id>.aliases.<alias>`), so this does too.
+    #
+    # An alias that collides with a legacyAliases KEY is the one case that stays
+    # a dropped-with-a-warning: the canonical ignores legacy collisions, and
+    # dropping the alias leaves the row reachable by id, so refusing the whole
+    # document over a compatibility shim would be stricter than the hub.
     legacy = doc.get("legacyAliases") if isinstance(doc.get("legacyAliases"), dict) else {}
+    claimed = {row["modelId"]: row["modelId"] for row in rows}
     for row in rows:
         kept = []
         for alias in (row.get("aliases") or []):
             if not isinstance(alias, str) or not MODEL_ID_RE.match(alias):
+                errors[f"catalog.{row['modelId']}.aliases.{alias}"] = "bad_model_id"
                 warnings.append(f"alias {alias!r} dropped (malformed)")
                 continue
-            if alias in seen_ids or alias in alias_owner or alias in legacy:
+            owner = claimed.get(alias)
+            if owner is not None and owner != row["modelId"]:
+                errors[f"catalog.{row['modelId']}.aliases.{alias}"] = "duplicate_alias"
                 warnings.append(f"alias {alias!r} dropped (ambiguous)")
                 continue
+            if alias in legacy:
+                warnings.append(f"alias {alias!r} dropped (ambiguous)")
+                continue
+            claimed[alias] = row["modelId"]
             alias_owner[alias] = row["modelId"]
             kept.append(alias)
         row["aliases"] = kept
 
     # A dated snapshot of a model already in the catalog is the same model. Keep
-    # the base id canonical and let the dated form resolve to it as an alias.
+    # the base id canonical and let the dated form resolve to it as an alias —
+    # UNLESS something routes at the dated id, in which case routing outranks
+    # tidiness and the row stays a row. Folding a routing target would make
+    # `tiers.claude.sonnet` resolve to a different model than the operator wrote.
+    targets = _routing_targets(doc)
     for row in list(rows):
         m = DATED_DUPLICATE_RE.match(row["modelId"])
+        if row["modelId"] in targets:
+            continue
         if m and m.group(1) in seen_ids and m.group(1) != row["modelId"]:
             base = next(r for r in rows if r["modelId"] == m.group(1))
             if row["modelId"] not in alias_owner:
@@ -193,51 +311,116 @@ def validate_registry(doc, agents_path=None):
             rows.remove(row)
             seen_ids.discard(row["modelId"])
 
-    known = set(seen_ids) | set(alias_owner)
-
-    # Anything the document POINTS AT must exist. `defaults` and `tiers` are how
-    # every caller lands somewhere when it was given nothing, so a dangling
-    # pointer there is not a warning.
-    defaults = doc.get("defaults") if isinstance(doc.get("defaults"), dict) else {}
-    for key, value in defaults.items():
-        if isinstance(value, str) and value and value not in known:
-            errors.append(f"defaults.{key} -> unknown model {value!r}")
-
-    tiers = doc.get("tiers") if isinstance(doc.get("tiers"), dict) else {}
-    for cli, mapping in tiers.items():
-        if not isinstance(mapping, dict):
-            errors.append(f"tiers.{cli} is not an object")
-            continue
-        for tier, value in mapping.items():
-            if not isinstance(value, str) or value not in known:
-                errors.append(f"tiers.{cli}.{tier} -> unknown model {value!r}")
-
-    agents = doc.get("agents") if isinstance(doc.get("agents"), dict) else {}
-    for agent_id, value in agents.items():
-        if not isinstance(value, str) or value not in known:
-            errors.append(f"agents.{agent_id} -> unknown model {value!r}")
-
-    for alias, value in legacy.items():
-        if not isinstance(value, str) or value not in known:
-            warnings.append(f"legacyAliases.{alias} -> unknown model {value!r} (ignored)")
-
-    # Every pinned agent must be a real agent. Skipped entirely when the roster
-    # is not readable from here — agents.json is NOT shipped into either Python
-    # container, so absence is the normal case at runtime and only CI (which
-    # passes a path) enforces this.
-    roster = _read_roster(agents_path)
-    if roster is not None:
-        for agent_id in agents:
-            if agent_id not in roster and agent_id not in EXEMPT_AGENTS:
-                errors.append(f"agents.{agent_id} is not in agents.json")
-
-    if errors:
-        return None, warnings, errors
-
     normalized = dict(doc)
     normalized["models"] = rows
     normalized["_aliasOwner"] = alias_owner
     return normalized, warnings, errors
+
+
+def _routing_targets(doc):
+    """Every model id the document ROUTES at: defaults, tiers, agents, legacyAliases.
+
+    Mirror of routingTargets() in src/lib/models-registry.ts. A dated duplicate
+    that something routes at is kept; one nothing routes at is noise.
+    """
+    targets = set()
+    if not isinstance(doc, dict):
+        return targets
+    for key in ("defaults", "agents", "legacyAliases"):
+        mapping = doc.get(key)
+        if isinstance(mapping, dict):
+            targets.update(v for v in mapping.values() if isinstance(v, str) and v)
+    tiers = doc.get("tiers")
+    if isinstance(tiers, dict):
+        for mapping in tiers.values():
+            if isinstance(mapping, dict):
+                targets.update(v for v in mapping.values() if isinstance(v, str) and v)
+    return targets
+
+
+def _index_rows(rows, alias_owner):
+    """`(by_id, by_alias)` over the KEPT rows — the twin's RegistryIndex."""
+    by_id = {row["modelId"]: row for row in rows}
+    by_alias = {}
+    for alias, owner in alias_owner.items():
+        row = by_id.get(owner)
+        if row is not None:
+            by_alias[alias] = row
+    return by_id, by_alias
+
+
+def _quarantine_set(doc):
+    quarantine = doc.get("quarantine") if isinstance(doc, dict) else None
+    if not isinstance(quarantine, (list, tuple)):
+        return set()
+    return {v for v in quarantine if isinstance(v, str)}
+
+
+def price_block_of(row):
+    """A row's price block under either spelling: `price` canonical, `pricing` tolerated.
+
+    Mirror of priceBlockOf() in the mjs twin. The registry writes `price`; older
+    hand-edited documents and the pre-DL-033 pricing file used `pricing`, and a
+    read path that only knew one spelling would call a priced model unpriced and
+    refuse the whole document.
+    """
+    if not isinstance(row, dict):
+        return None
+    for key in ("price", "pricing"):
+        block = row.get(key)
+        if isinstance(block, dict):
+            return block
+    return None
+
+
+def _priced_ok(price):
+    """Mirror of pricedOk(): both rates present, finite and non-negative."""
+    if not isinstance(price, dict):
+        return False
+    for key in ("input", "output"):
+        value = price.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return False
+        if value != value or value in (float("inf"), float("-inf")) or value < 0:
+            return False
+    return True
+
+
+def _target_reason(index, quarantine, value):
+    """Why `value` cannot be routed to, or None when it can.
+
+    Byte-for-byte the same reason vocabulary and the same ORDER as
+    targetReason() in src/lib/models-registry.ts, because the hub rejects a live
+    document for any of them on its read path. Order matters: a quarantined id
+    reports `quarantined` even if it is also unpriced, so an operator reading the
+    hub's error and the fleet's log sees one story.
+    """
+    by_id, by_alias = index
+    if not isinstance(value, str) or not MODEL_ID_RE.match(value):
+        return "bad_model_id"
+    if value in quarantine:
+        return "quarantined"
+    row = by_id.get(value) or by_alias.get(value)
+    if row is None:
+        return "unknown_model"
+    if row.get("readOnly"):
+        return "read_only"
+    status = row.get("status", "active")
+    if status == "quarantined":
+        return "quarantined"
+    if status == "retired":
+        return "inactive"
+    if not _priced_ok(price_block_of(row)):
+        return "unpriced"
+    # BOTH planes, not either: a model that answers the API but not the coding
+    # CLI is half-proven, and `or` here would let a single green probe adopt it.
+    if status == "candidate":
+        probe = row.get("probe") if isinstance(row.get("probe"), dict) else {}
+        api = probe.get("api") if isinstance(probe.get("api"), dict) else {}
+        cli = probe.get("cli") if isinstance(probe.get("cli"), dict) else {}
+        if not (api.get("ok") and cli.get("ok")):
+            return "unprobed"
+    return None
 
 
 def _read_roster(agents_path):
@@ -289,8 +472,8 @@ def load_registry(ttl_seconds=0, agents_path=None):
             for w in warnings:
                 logger.info(f"[models] registry.warn {w}")
             if errors:
-                for e in errors:
-                    logger.warning(f"[models] registry.error {e}")
+                for path, reason in sorted(errors.items()):
+                    logger.warning(f"[models] registry.error {path} reason={reason}")
                 logger.warning("[models] registry.fallback reason=invalid")
                 doc = None
             else:
@@ -340,7 +523,9 @@ def resolve_model(registry, name, cli=None):
 
     Order (the design's algorithm, and the reason each step is where it is):
       1. `quarantine` — an operator kill switch has to beat every other source,
-         including an explicit pin, or it is not a kill switch.
+         including an explicit pin, or it is not a kill switch. Checked on the
+         raw input AND again on the resolved id (step 4), because a tier word or
+         a legacy alias must not be a way around it.
       2. `tiers[cli]` — tiers are CLI-scoped: "sol" means a Codex model to codex
          and nothing to claude, so an unscoped map would cross the wires.
       3. `legacyAliases` — yesterday's names ("claude-sonnet-45") keep working.
@@ -357,24 +542,37 @@ def resolve_model(registry, name, cli=None):
     if not name:
         return None
 
-    quarantine = registry.get("quarantine") if isinstance(registry, dict) else None
-    if isinstance(quarantine, (list, tuple)) and name in quarantine:
+    if _quarantined(registry, name):
         logger.warning(f"[models] registry.quarantined {name}")
         return None
 
     tiers = registry.get("tiers") if isinstance(registry, dict) else None
     if isinstance(tiers, dict):
         scoped = tiers.get("codex" if cli == "codex" else "claude")
-        if isinstance(scoped, dict) and name.lower() in scoped:
-            name = scoped[name.lower()]
+        # EXACT case: tier words are document keys, not user prose. Case-folding
+        # here made "OPUS" resolve on the fleet and not in the hub, which is the
+        # kind of split the canonical exists to prevent.
+        if isinstance(scoped, dict) and name in scoped:
+            name = scoped[name]
 
     legacy = registry.get("legacyAliases") if isinstance(registry, dict) else None
     if isinstance(legacy, dict) and name in legacy:
         name = legacy[name]
 
+    # The kill switch is re-checked on the RESOLVED id: quarantining a model must
+    # not be bypassable by asking for its tier or one of its old names.
+    if _quarantined(registry, name):
+        logger.warning(f"[models] registry.quarantined {name}")
+        return None
+
     row = _find_row(registry, name)
     if row is not None:
         status = row.get("status", "active")
+        # An alias hit resolves to the row id, so the row id is what the kill
+        # switch has to be checked against as well.
+        if status == "quarantined" or _quarantined(registry, row["modelId"]):
+            logger.warning(f"[models] registry.quarantined {row['modelId']}")
+            return None
         if status in _RESOLVABLE_STATUSES:
             return row["modelId"]
         logger.warning(f"[models] registry.retired {row['modelId']} (status={status})")

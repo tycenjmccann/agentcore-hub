@@ -241,6 +241,9 @@ describe('reconcileModels', () => {
 
   it('promotes an interim price to the published rate', async () => {
     const doc = baseDoc();
+    // The INPUT document carries the older `pricing` spelling on purpose: the
+    // reconcile reads either through priceBlockOf() and rewrites as `price`, so
+    // no row is left holding two rate blocks.
     row(doc, 'us.anthropic.claude-opus-5').pricing = {
       input: 9, output: 45, state: 'interim', source: 'predecessor:us.anthropic.claude-opus-4-8',
     };
@@ -254,10 +257,13 @@ describe('reconcileModels', () => {
     });
     const s = await reconcileModels({}, h.deps);
     expect(s).toMatchObject({ outcome: 'ok', promoted: 1 });
-    expect(row(h.written(MODELS_KEY), 'us.anthropic.claude-opus-5').pricing).toEqual({
+    const written = row(h.written(MODELS_KEY), 'us.anthropic.claude-opus-5');
+    expect(written.price).toEqual({
       input: 11, output: 55, cacheReadInput: 1.1,
       state: 'published', source: 'pricing-api', asOf: '2026-09-24T03:00:00.000Z',
     });
+    // One rate block per row: the stale spelling is removed, not left alongside.
+    expect(written.pricing).toBeUndefined();
     // The projection follows it into pricing.json, carrying the other blocks.
     const pricing = h.written(PRICING_KEY);
     expect(pricing.models['us.anthropic.claude-opus-5']).toEqual({ input: 11, output: 55, cacheReadInput: 1.1 });
@@ -286,10 +292,12 @@ describe('reconcileModels', () => {
     const s = await reconcileModels({}, h.deps);
     expect(s).toMatchObject({ outcome: 'ok', repriced: 1 });
     const after = h.written(MODELS_KEY);
-    expect(row(after, 'us.anthropic.claude-opus-6').pricing).toEqual({
+    expect(row(after, 'us.anthropic.claude-opus-6').price).toEqual({
       input: 5.5, output: 27.5, state: 'interim',
       source: 'predecessor:us.anthropic.claude-opus-5', asOf: '2026-09-24T03:00:00.000Z',
     });
+    // The predecessor rate was read off the older `pricing` spelling in baseDoc().
+    expect(row(after, 'us.anthropic.claude-nova-1').price).toBeUndefined();
     expect(row(after, 'us.anthropic.claude-nova-1').pricing).toBeUndefined();
     expect(h.logs.join('\n')).toContain('pricing.unpriced modelId=us.anthropic.claude-nova-1');
   });
@@ -305,7 +313,7 @@ describe('reconcileModels', () => {
     const s = await reconcileModels({}, h.deps);
     expect(s).toMatchObject({ outcome: 'ok', promoted: 0, repriced: 0 });
     expect(s.drifts).toContain('us.anthropic.claude-opus-5');
-    const pricing = row(h.written(MODELS_KEY), 'us.anthropic.claude-opus-5').pricing;
+    const pricing = row(h.written(MODELS_KEY), 'us.anthropic.claude-opus-5').price;
     expect(pricing).toMatchObject({ input: 5.5, output: 27.5, state: 'published' });
     expect(pricing.priceDrift).toEqual({ input: 7.5, output: 30, seenAt: '2026-09-24T03:00:00.000Z' });
     expect(h.logs.join('\n')).toContain('pricing.drift modelId=us.anthropic.claude-opus-5');

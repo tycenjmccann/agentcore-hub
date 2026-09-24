@@ -3835,7 +3835,11 @@ async function loadModelsRegistry() {
     // failure rather than being turned into an empty catalog.
     const doc = JSON.parse(await res.Body.transformToString());
     const { registry, errors } = validateRegistry(doc);
-    if (!registry) throw new Error(`invalid registry: ${errors.join("; ")}`);
+    if (!registry) {
+      // `errors` is a {field path: reason} map, matching the TS canonical.
+      const why = Object.entries(errors).map(([path, reason]) => `${path}=${reason}`).join("; ");
+      throw new Error(`invalid registry: ${why}`);
+    }
     const first = !_modelsRegistryLoadedAt;
     _modelsRegistry = registry;
     if (first) {
@@ -3867,10 +3871,15 @@ let _loggedIntakeModel = "";
  */
 async function intakeModelId() {
   const reg = await loadModelsRegistry();
-  const { modelId, source } = resolveAgentModel(reg, "telegram_intake", "", { MODEL_ID: MODEL_ID_FALLBACK });
+  const { modelId, source, envVar } = resolveAgentModel(reg, "telegram_intake", "", {
+    MODEL_ID: MODEL_ID_FALLBACK,
+  });
   if (modelId !== _loggedIntakeModel) {
     _loggedIntakeModel = modelId;
-    console.log(`[models] harness.model agentId=telegram_intake modelId=${modelId} source=${source}`);
+    // `source` is one of the registry's five chain steps; when it is `env` the
+    // variable that answered is the detail, and it goes in its own field.
+    const via = envVar ? ` envVar=${envVar}` : "";
+    console.log(`[models] harness.model agentId=telegram_intake modelId=${modelId} source=${source}${via}`);
   }
   return modelId;
 }

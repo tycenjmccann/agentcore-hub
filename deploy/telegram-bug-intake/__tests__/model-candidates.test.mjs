@@ -169,10 +169,14 @@ const ENV = {
   ALLOWED_CHAT_IDS: `${CHAT},${CHAT2}`, AWS_REGION: "us-east-1", CHAT_SETTLE_MS: "0",
 };
 
+// Priced by default: validateRegistry refuses a document whose agents/defaults
+// point at an UNPRICED row, the same read-time verdict the hub reaches, so a row
+// something routes at has to carry a rate or the bridge falls back to env.
 const row = (over = {}) => ({
   modelId: "us.anthropic.claude-opus-6", label: "Opus 6", vendor: "anthropic",
   family: "claude-opus", endpoint: "bedrock-runtime", region: "us-east-1",
-  api: "converse", status: "candidate", notify: { requestedAt: "2026-09-24T03:00:00Z" },
+  api: "converse", status: "candidate", price: { input: 3, output: 15 },
+  notify: { requestedAt: "2026-09-24T03:00:00Z" },
   ...over,
 });
 

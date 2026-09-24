@@ -45,6 +45,7 @@ import {
   predecessorRow,
   tierForFamily,
   usagetypeFor,
+  priceBlockOf,
   pricingProjection,
   validateRegistry,
 } from './models-registry.mjs';
@@ -303,6 +304,14 @@ async function publishedRates(deps, row) {
 
 const usablePrice = (p) => isPlainObject(p) && isPositive(p.input) && isPositive(p.output);
 
+/** Write the rate block under the one field everything reads, and drop the older
+ *  `pricing` spelling if this document still carries it — two rate blocks on one
+ *  row is the split-brain that made the projection publish no prices at all. */
+function setPrice(row, price) {
+  row.price = price;
+  delete row.pricing;
+}
+
 /**
  * Bring every live row's price up to date.
  *
@@ -317,25 +326,30 @@ const usablePrice = (p) => isPlainObject(p) && isPositive(p.input) && isPositive
  *   - a row nothing prices borrows its predecessor's rate as `interim`, or stays
  *     unpriced. Unpriced is visible: REPORT_VERSION 7 makes it a gap on the card
  *     instead of a plausible guess.
+ *
+ * The rate lands on `row.price` — the one field the seed, the TS canonical's
+ * `parsePrice(raw.price)` and the projection's priceOf() all read. A document
+ * still carrying the older `pricing` spelling is read through priceBlockOf() and
+ * then rewritten as `price`, so no row ends up holding two rate blocks.
  */
 async function refreshPricing(doc, deps, counts, nowIso, drifts) {
   for (const row of doc.models || []) {
     if (!RESOLVABLE_STATUSES.includes(statusOf(row))) continue;
-    const current = isPlainObject(row.pricing) ? row.pricing : null;
+    const current = priceBlockOf(row);
     const rates = await publishedRates(deps, row);
 
     if (rates) {
       const state = current?.state;
       if (!usablePrice(current) || state !== 'published') {
-        row.pricing = { ...(current || {}), ...rates, state: 'published', source: 'pricing-api', asOf: nowIso };
-        delete row.pricing.priceDrift;
+        setPrice(row, { ...(current || {}), ...rates, state: 'published', source: 'pricing-api', asOf: nowIso });
+        delete row.price.priceDrift;
         if (state === 'interim') counts.promoted += 1; else counts.repriced += 1;
         deps.log.log(`[models] pricing.published modelId=${row.modelId} input=${rates.input} output=${rates.output}`);
         continue;
       }
       const differs = PRICE_KINDS.some(([, f]) => isPositive(rates[f]) && rates[f] !== current[f]);
       if (differs) {
-        row.pricing = { ...current, priceDrift: { ...rates, seenAt: nowIso } };
+        setPrice(row, { ...current, priceDrift: { ...rates, seenAt: nowIso } });
         drifts.push(row.modelId);
         deps.log.warn?.(`[models] pricing.drift modelId=${row.modelId} `
           + `carried=${current.input}/${current.output} listed=${rates.input}/${rates.output} applied=no`);
@@ -345,16 +359,16 @@ async function refreshPricing(doc, deps, counts, nowIso, drifts) {
 
     if (usablePrice(current)) continue;
     const pred = predecessorRow(doc, row);
-    const predPrice = isPlainObject(pred?.pricing) ? pred.pricing : null;
+    const predPrice = priceBlockOf(pred);
     if (usablePrice(predPrice)) {
-      row.pricing = {
+      setPrice(row, {
         input: predPrice.input,
         output: predPrice.output,
         ...(isPositive(predPrice.cacheReadInput) ? { cacheReadInput: predPrice.cacheReadInput } : {}),
         state: 'interim',
         source: `predecessor:${pred.modelId}`,
         asOf: nowIso,
-      };
+      });
       counts.repriced += 1;
       deps.log.log(`[models] pricing.interim modelId=${row.modelId} from=${pred.modelId}`);
       continue;
@@ -387,7 +401,7 @@ async function autoAdopt(doc, deps, counts, nowIso) {
 
     const eligible = (doc.models || []).filter((row) => statusOf(row) === 'candidate'
       && tierForFamily(row.vendor, row.family) === `${cli}.${tier}`
-      && usablePrice(row.pricing)
+      && usablePrice(priceBlockOf(row))
       && row.probe?.api?.ok === true);
     if (!eligible.length) continue;
 

@@ -21,7 +21,9 @@ import {
   MODEL_ID_RE,
   LITERAL_PERSONA_DEFAULT,
   LITERAL_CODING_CODEX,
+  CHAIN_STEPS,
   validateRegistry,
+  parseRegistry,
   resolveModel,
   resolveAgentModel,
   resolveCodingModel,
@@ -39,6 +41,11 @@ const FIXTURE = fileURLToPath(new URL('../../src/config/__fixtures__/models-regi
 
 // ─── a registry small enough to read, big enough to be interesting ──────────
 
+// Every row something ROUTES at carries a price, and the one candidate row
+// carries both green probe planes: validateRegistry now refuses a document whose
+// defaults/tiers/agents/legacyAliases point at an unpriced or half-probed row,
+// exactly as the TS canonical does on its read path. A test registry without
+// prices would be a document the hub itself would reject.
 const registryDoc = () => ({
   version: 3,
   updatedAt: '2026-09-24T00:00:00Z',
@@ -55,8 +62,17 @@ const registryDoc = () => ({
       contextWindow: 500000,
       pricing: { input: 11, output: 55, cacheReadInput: 0.275, state: 'published' },
     },
-    { modelId: 'us.anthropic.claude-opus-5', vendor: 'anthropic', family: 'claude-opus', status: 'active' },
-    { modelId: 'us.anthropic.claude-sonnet-5', vendor: 'anthropic', family: 'claude-sonnet', status: 'candidate' },
+    { modelId: 'us.anthropic.claude-opus-5', vendor: 'anthropic', family: 'claude-opus', status: 'active', price: { input: 3, output: 15 } },
+    {
+      modelId: 'us.anthropic.claude-sonnet-5',
+      vendor: 'anthropic',
+      family: 'claude-sonnet',
+      status: 'candidate',
+      price: { input: 3, output: 15 },
+      // A candidate needs BOTH probe planes green to be a legal routing target
+      // (tiers.claude.sonnet points here) — see targetReasonFor.
+      probe: { api: { ok: true }, cli: { ok: true } },
+    },
     { modelId: 'us.anthropic.claude-opus-4-1', vendor: 'anthropic', family: 'claude-opus', status: 'retired' },
     {
       modelId: 'us.openai.gpt-6-sol',
@@ -66,6 +82,7 @@ const registryDoc = () => ({
       region: 'us-east-1',
       api: 'responses',
       contextWindow: 300000,
+      price: { input: 2, output: 8 },
     },
     {
       modelId: 'openai.gpt-5.5',
@@ -74,6 +91,7 @@ const registryDoc = () => ({
       endpoint: 'bedrock-mantle',
       region: 'us-east-2',
       api: 'responses',
+      price: { input: 2, output: 8 },
     },
   ],
   tiers: {
@@ -95,7 +113,7 @@ const registryDoc = () => ({
 
 function validated(doc = registryDoc()) {
   const { registry, errors } = validateRegistry(doc);
-  expect(errors).toEqual([]);
+  expect(errors).toEqual({});
   return registry;
 }
 
@@ -135,11 +153,43 @@ describe('resolveModel', () => {
   });
 
   it('lets quarantine beat a tier AND an explicit id', () => {
-    const doc = registryDoc();
-    doc.quarantine = ['us.anthropic.claude-opus-5', 'opus'];
-    const reg = validated(doc);
+    // Only the MODEL ID is quarantined here, deliberately: the kill switch is a
+    // list of models, and an operator must not have to also guess every tier word
+    // and alias that reaches one. This used to pass only because 'opus' was in the
+    // list too -- the re-check after resolution is what makes it real.
+    //
+    // The list is set AFTER validation on purpose. A document that ROUTES at a
+    // quarantined model is now refused outright (see the validateRegistry tests
+    // below), matching the hub, so the only way to observe the resolver's
+    // re-check on the tier path is a registry quarantined after it was read —
+    // which is exactly what a cached registry plus a fresh kill switch looks like.
+    const reg = validated();
+    reg.quarantine = ['us.anthropic.claude-opus-5'];
     expect(resolveModel(reg, 'opus', { cli: 'claude', log: quiet() })).toBeNull();
     expect(resolveModel(reg, 'us.anthropic.claude-opus-5', { log: quiet() })).toBeNull();
+  });
+
+  it('re-checks quarantine after tier and alias resolution', () => {
+    const reg = validated();
+    reg.quarantine = ['us.anthropic.claude-fable-5-1', 'us.anthropic.claude-sonnet-5'];
+    expect(resolveModel(reg, 'fable', { cli: 'claude', log: quiet() })).toBeNull();        // via tiers
+    expect(resolveModel(reg, 'fable-5', { log: quiet() })).toBeNull();                     // via a row alias
+    expect(resolveModel(reg, 'claude-sonnet-45', { log: quiet() })).toBeNull();            // via legacyAliases
+    expect(resolveModel(reg, 'us.anthropic.claude-fable-5-1', { log: quiet() })).toBeNull();
+    // A quarantined ROW status is refused the same way, with or without the list.
+    const byStatus = validated();
+    byStatus.models.find((r) => r.modelId === 'us.anthropic.claude-opus-5').status = 'quarantined';
+    expect(resolveModel(byStatus, 'opus', { cli: 'claude', log: quiet() })).toBeNull();
+  });
+
+  it('matches a tier word EXACTLY, never case-folded', () => {
+    // Tier words are document KEYS, not user prose. Case-folding them made 'OPUS'
+    // resolve here and not in the hub, whose resolver is exact-case.
+    const reg = validated();
+    expect(resolveModel(reg, 'opus', { cli: 'claude' })).toBe('us.anthropic.claude-opus-5');
+    expect(resolveModel(reg, 'OPUS', { cli: 'claude' })).toBeNull();
+    expect(resolveModel(reg, 'Opus', { cli: 'claude' })).toBeNull();
+    expect(resolveModel(reg, 'SOL', { cli: 'codex' })).toBeNull();
   });
 
   it('resolves legacy aliases and row aliases, and candidates are usable', () => {
@@ -180,18 +230,41 @@ describe('resolveModel', () => {
 // ─── 3. resolveAgentModel / resolveCodingModel ──────────────────────────────
 
 describe('resolveAgentModel', () => {
-  it('walks override -> pin -> defaults.persona -> env -> literal', () => {
+  it('walks override -> agents -> defaults -> env -> literal', () => {
+    // Every `source` here is a CHAIN_STEPS word — the vocabulary the fixture, the
+    // canonical and the /models UI share. Which env var it was is detail, and
+    // rides along in `envVar`.
     const reg = validated();
     expect(resolveAgentModel(reg, 'agentcore_hub_backend_dev', 'sonnet'))
       .toEqual({ modelId: 'us.anthropic.claude-sonnet-5', source: 'override' });
     expect(resolveAgentModel(reg, 'agentcore_hub_backend_dev'))
-      .toEqual({ modelId: 'us.anthropic.claude-opus-5', source: 'pin' });
+      .toEqual({ modelId: 'us.anthropic.claude-opus-5', source: 'agents' });
     expect(resolveAgentModel(reg, 'agentcore_hub_qa_verifier'))
-      .toEqual({ modelId: 'us.anthropic.claude-fable-5-1', source: 'defaults.persona' });
+      .toEqual({ modelId: 'us.anthropic.claude-fable-5-1', source: 'defaults' });
     expect(resolveAgentModel(null, 'whoever', '', { MODEL_ID: 'us.anthropic.claude-haiku-4-5' }))
-      .toEqual({ modelId: 'us.anthropic.claude-haiku-4-5', source: 'env:MODEL_ID' });
+      .toEqual({ modelId: 'us.anthropic.claude-haiku-4-5', source: 'env', envVar: 'MODEL_ID' });
     expect(resolveAgentModel(null, 'whoever'))
       .toEqual({ modelId: LITERAL_PERSONA_DEFAULT, source: 'literal' });
+  });
+
+  it('reports a source inside the closed enum for every chain step', () => {
+    // A stray 'pin' / 'defaults.persona' / 'env:MODEL_ID' would describe the same
+    // decision in a vocabulary the fixture and the Python twin do not have.
+    const reg = validated();
+    for (const got of [
+      resolveAgentModel(reg, 'agentcore_hub_backend_dev', 'sonnet'),
+      resolveAgentModel(reg, 'agentcore_hub_backend_dev'),
+      resolveAgentModel(reg, 'agentcore_hub_qa_verifier'),
+      resolveAgentModel(null, 'whoever', '', { MODEL_ID: 'us.anthropic.claude-haiku-4-5' }),
+      resolveAgentModel(null, 'whoever'),
+      resolveCodingModel(reg, 'opus', 'claude'),
+      resolveCodingModel(reg, '', 'claude'),
+      resolveCodingModel(null, '', 'codex', { CODEX_MODEL: 'openai.gpt-5.5' }),
+      resolveCodingModel(null, '', 'codex'),
+    ]) {
+      expect(CHAIN_STEPS, JSON.stringify(got)).toContain(got.source);
+    }
+    expect(CHAIN_STEPS).toEqual(['override', 'agents', 'defaults', 'env', 'literal']);
   });
 
   it('falls through an unresolvable override instead of honouring it', () => {
@@ -202,8 +275,13 @@ describe('resolveAgentModel', () => {
 
   it('lets quarantine beat even the env var', () => {
     const doc = registryDoc();
-    doc.quarantine = ['us.anthropic.claude-opus-5'];
     doc.defaults = {};
+    doc.agents = {};
+    doc.tiers = {};
+    doc.legacyAliases = {};
+    doc.quarantine = ['us.anthropic.claude-opus-5'];
+    // Nothing routes at the quarantined model, so the document is still valid —
+    // the kill switch alone is what refuses the operator's env var.
     const reg = validated(doc);
     const got = resolveAgentModel(reg, 'nobody', '', { MODEL_ID: 'us.anthropic.claude-opus-5' }, { log: quiet() });
     expect(got).toEqual({ modelId: LITERAL_PERSONA_DEFAULT, source: 'literal' });
@@ -255,7 +333,7 @@ describe('validateRegistry', () => {
     const doc = registryDoc();
     doc.models.push({ nope: 1 });
     const { registry, warnings, errors } = validateRegistry(doc);
-    expect(errors).toEqual([]);
+    expect(errors).toEqual({});
     expect(registry).not.toBeNull();
     expect(warnings.join()).toContain('dropped');
   });
@@ -267,7 +345,8 @@ describe('validateRegistry', () => {
     const { registry, warnings, errors } = validateRegistry(doc);
     expect(registry).toBeNull();
     expect(warnings.join()).toContain('dropped');
-    expect(errors.join()).toContain('tiers.claude.opus');
+    // The row was dropped, so the tier points at nothing that EXISTS.
+    expect(errors['tiers.claude.opus']).toBe('unknown_model');
   });
 
   it('invalidates the document for a dangling default or agent pin', () => {
@@ -285,44 +364,222 @@ describe('validateRegistry', () => {
     expect(validated(ok).models.some((m) => m.modelId === 'us.openai.gpt-6-luna')).toBe(false);
     const bad = registryDoc();
     bad.models[0].region = 'us-east-1; rm -rf /';
-    expect(validateRegistry(bad).errors.join()).toContain('defaults.persona');
+    expect(validateRegistry(bad).errors['defaults.persona']).toBe('unknown_model');
   });
 
-  it('drops an ambiguous alias but keeps the row', () => {
+  it('reports the canonical reason for every routing-target problem', () => {
+    // One case per reason in targetReason(), same order, same vocabulary: the
+    // reason is the contract, because `unpriced` and `inactive` send an operator
+    // to two different fixes.
+    const cases = {
+      bad_model_id: (d) => { d.defaults.persona = 'us.anthropic.claude-opus-5; rm -rf /'; },
+      unknown_model: (d) => { d.defaults.persona = 'us.anthropic.claude-nope'; },
+      inactive: (d) => { d.defaults.persona = 'us.anthropic.claude-opus-4-1'; },
+      unpriced: (d) => { delete d.models[0].pricing; },
+      read_only: (d) => { d.models[0].readOnly = true; },
+      quarantined: (d) => { d.quarantine = ['us.anthropic.claude-fable-5-1']; },
+      unprobed: (d) => { d.models[0].status = 'candidate'; },
+    };
+    for (const [reason, mutate] of Object.entries(cases)) {
+      const doc = registryDoc();
+      mutate(doc);
+      const { registry, errors } = validateRegistry(doc);
+      expect(registry, reason).toBeNull();
+      expect(errors['defaults.persona'], reason).toBe(reason);
+    }
+  });
+
+  it('calls a half-probed candidate unprobed on EITHER plane', () => {
+    // BOTH planes: a model that answers the API but not the coding CLI is
+    // half-proven, and `||` here would let a single green probe adopt it.
+    for (const probe of [
+      { api: { ok: true }, cli: { ok: false } },
+      { api: { ok: false }, cli: { ok: true } },
+      { api: { ok: true } },
+      {},
+    ]) {
+      const doc = registryDoc();
+      doc.models[0].status = 'candidate';
+      doc.models[0].probe = probe;
+      expect(validateRegistry(doc).errors['defaults.persona'], JSON.stringify(probe)).toBe('unprobed');
+    }
+    const ok = registryDoc();
+    ok.models[0].status = 'candidate';
+    ok.models[0].probe = { api: { ok: true }, cli: { ok: true } };
+    expect(validated(ok)).not.toBeNull();
+  });
+
+  it('refuses a quarantined routing target in every field family', () => {
+    // The hub's read path refuses the document for ANY of these, so this twin
+    // does too — a tier still pointing at a killed model is an operator error to
+    // fix, not something to resolve through.
+    const fields = {
+      'defaults.persona': (d) => { d.defaults.persona = 'us.anthropic.claude-opus-5'; },
+      'tiers.claude.opus': () => {},
+      'agents.agentcore_hub_backend_dev': () => {},
+      'legacyAliases.claude-sonnet-45': (d) => { d.legacyAliases['claude-sonnet-45'] = 'us.anthropic.claude-opus-5'; },
+    };
+    for (const [field, mutate] of Object.entries(fields)) {
+      const doc = registryDoc();
+      doc.quarantine = ['us.anthropic.claude-opus-5'];
+      mutate(doc);
+      const { registry, errors } = validateRegistry(doc);
+      expect(registry, field).toBeNull();
+      expect(errors[field], field).toBe('quarantined');
+    }
+  });
+
+  it('judges a routing target through an ALIAS hop', () => {
+    // The target is spelled as an alias of the offending row: resolving the alias
+    // before judging it is what makes the twin agree with the canonical, which
+    // indexes byId and byAlias alike.
+    const ok = registryDoc();
+    ok.defaults.persona = 'fable-5';
+    expect(validated(ok)).not.toBeNull();
+    const bad = registryDoc();
+    bad.defaults.persona = 'fable-5';
+    delete bad.models[0].pricing;
+    expect(validateRegistry(bad).errors['defaults.persona']).toBe('unpriced');
+  });
+
+  it('errors on a malformed legacyAliases KEY', () => {
     const doc = registryDoc();
-    doc.models[1].aliases = ['fable-5'];
-    const { registry, warnings } = validateRegistry(doc);
+    doc.legacyAliases['nope; rm -rf /'] = 'us.anthropic.claude-opus-5';
+    expect(validateRegistry(doc).errors['legacyAliases.nope; rm -rf /']).toBe('bad_model_id');
+  });
+
+  it('errors on an alias two rows claim', () => {
+    // Resolution ORDER would otherwise decide which model — and therefore which
+    // price — 'fable-5' means. The canonical errors on it, keyed by the row that
+    // tried to claim it second, so this does too.
+    const doc = registryDoc();
+    doc.models[1].aliases = ['fable-5'];              // already owned by the fable row
+    const { registry, warnings, errors } = validateRegistry(doc);
+    expect(registry).toBeNull();
+    expect(errors['catalog.us.anthropic.claude-opus-5.aliases.fable-5']).toBe('duplicate_alias');
     expect(warnings.join()).toContain('ambiguous');
-    expect(resolveModel(registry, 'fable-5')).toBe('us.anthropic.claude-fable-5-1');
+  });
+
+  it('drops an alias colliding with a legacyAliases key, without refusing the document', () => {
+    // The one tolerated collision, and the reason is stated rather than hidden:
+    // the canonical ignores legacyAliases when checking catalog aliases, and
+    // dropping the alias leaves the row reachable by id — so refusing the whole
+    // document over a compatibility shim would make this twin STRICTER than the
+    // hub, which is the same divergence in the other direction.
+    const doc = registryDoc();
+    doc.models[1].aliases = ['claude-sonnet-45'];     // a legacyAliases key
+    const { registry, warnings, errors } = validateRegistry(doc);
+    expect(errors).toEqual({});
+    expect(warnings.join()).toContain('ambiguous');
+    expect(resolveModel(registry, 'claude-sonnet-45')).toBe('us.anthropic.claude-sonnet-5');
     expect(resolveModel(registry, 'us.anthropic.claude-opus-5')).toBe('us.anthropic.claude-opus-5');
+  });
+
+  it('errors on a malformed alias', () => {
+    const doc = registryDoc();
+    doc.models[1].aliases = ['opus; rm -rf /'];
+    const { registry, errors } = validateRegistry(doc);
+    expect(registry).toBeNull();
+    expect(errors['catalog.us.anthropic.claude-opus-5.aliases.opus; rm -rf /']).toBe('bad_model_id');
   });
 
   it('folds a dated duplicate into its base id', () => {
     const doc = registryDoc();
     doc.models.push({ modelId: 'us.anthropic.claude-opus-5-20251001-v1:0' });
-    const { registry, warnings } = validateRegistry(doc);
+    const { registry, warnings } = parseRegistry(doc);
     expect(warnings.join()).toContain('dated duplicate');
     expect(resolveModel(registry, 'us.anthropic.claude-opus-5-20251001-v1:0')).toBe('us.anthropic.claude-opus-5');
+  });
+
+  it('keeps a dated duplicate that something ROUTES at', () => {
+    // Routing outranks tidiness: folding a tier's target would make the tier
+    // resolve to a DIFFERENT model than the operator wrote. Mirror of
+    // routingTargets() in src/lib/models-registry.ts.
+    const dated = 'us.anthropic.claude-opus-5-20251001-v1:0';
+    const doc = registryDoc();
+    doc.models.push({ modelId: dated, price: { input: 3, output: 15 } });
+    doc.tiers.claude.opus = dated;
+    const { registry, warnings, errors } = validateRegistry(doc);
+    expect(errors).toEqual({});
+    expect(warnings.join()).not.toContain('dated duplicate');
+    expect(registry.models.map((r) => r.modelId)).toContain(dated);
+    expect(resolveModel(registry, 'opus', { cli: 'claude' })).toBe(dated);
+    expect(resolveModel(registry, dated)).toBe(dated);
   });
 
   it('checks agents keys against a supplied roster, exempting the bridge', () => {
     const doc = registryDoc();
     doc.agents = { not_a_real_agent: 'us.anthropic.claude-opus-5' };
-    expect(validateRegistry(doc, { agentIds: ['agentcore_hub_backend_dev'] }).errors.join())
-      .toContain('not_a_real_agent');
+    expect(validateRegistry(doc, { agentIds: ['agentcore_hub_backend_dev'] }).errors['agents.not_a_real_agent'])
+      .toBe('unknown_agent');
     const bridge = registryDoc();
     bridge.agents = { telegram_intake: 'us.anthropic.claude-opus-5' };
-    expect(validateRegistry(bridge, { agentIds: ['agentcore_hub_backend_dev'] }).errors).toEqual([]);
+    expect(validateRegistry(bridge, { agentIds: ['agentcore_hub_backend_dev'] }).errors).toEqual({});
     // No roster supplied -> the check is skipped entirely (the runtime case).
     const runtime = registryDoc();
     runtime.agents = { whatever_agent: 'us.anthropic.claude-opus-5' };
-    expect(validateRegistry(runtime).errors).toEqual([]);
+    expect(validateRegistry(runtime).errors).toEqual({});
   });
 
   it('rejects a document that is not a registry at all', () => {
     expect(validateRegistry([1, 2, 3]).registry).toBeNull();
+    expect(validateRegistry([1, 2, 3]).errors).toEqual({ document: 'not_an_object' });
     expect(validateRegistry({ models: 'nope' }).registry).toBeNull();
+    expect(validateRegistry({ models: 'nope' }).errors).toEqual({ models: 'missing_or_not_an_array' });
     expect(validateRegistry(null).registry).toBeNull();
+  });
+});
+
+// ─── 4b. parseRegistry: normalize without the verdict ───────────────────────
+
+describe('parseRegistry', () => {
+  it('normalizes a document the validator refuses', () => {
+    // The two halves answer different questions. parseRegistry says what the
+    // document SAYS (rows, aliases, folds); validateRegistry says whether the hub
+    // may serve it. A registry that kills a model some tier still points at is
+    // refused by the second and still readable by the first — which is how the
+    // shared fixture can ask what the RESOLVER does with it.
+    const doc = registryDoc();
+    doc.quarantine = ['us.anthropic.claude-opus-5'];
+    const verdict = validateRegistry(doc);
+    expect(verdict.registry).toBeNull();
+    expect(verdict.errors['tiers.claude.opus']).toBe('quarantined');
+    const { registry, warnings } = parseRegistry(doc);
+    expect(registry).not.toBeNull();
+    // The kill switch still holds on the resolver, which is the point.
+    expect(resolveModel(registry, 'opus', { cli: 'claude', log: quiet() })).toBeNull();
+    expect(warnings).toEqual(verdict.warnings);
+  });
+
+  it('gives the same answer twice for the same document', () => {
+    // The alias and dated-fold passes rewrite `aliases`, so the parser works on a
+    // COPY of each row; without that, validating a document and then parsing it
+    // gave two different catalogs.
+    const doc = registryDoc();
+    doc.models.push({ modelId: 'us.anthropic.claude-opus-5-20251001-v1:0' });
+    const first = parseRegistry(doc).registry;
+    const second = parseRegistry(doc).registry;
+    expect(first.models.map((r) => r.modelId)).toEqual(second.models.map((r) => r.modelId));
+    expect(first._aliasOwner).toEqual(second._aliasOwner);
+    expect(doc.models[0].aliases).toEqual(['fable-5']);   // the caller's document is untouched
+  });
+
+  it('still refuses a structurally broken document', () => {
+    expect(parseRegistry([1, 2, 3]).registry).toBeNull();
+    expect(parseRegistry({ models: 'nope' }).registry).toBeNull();
+    expect(parseRegistry(null).registry).toBeNull();
+  });
+
+  it('keeps a catalog-integrity problem readable', () => {
+    // A duplicate alias is fatal to the VERDICT and not to the normalize: the
+    // alias is dropped either way, so the rows are still usable.
+    const doc = registryDoc();
+    doc.models[1].aliases = ['fable-5'];
+    expect(validateRegistry(doc).registry).toBeNull();
+    const { registry, warnings } = parseRegistry(doc);
+    expect(registry).not.toBeNull();
+    expect(resolveModel(registry, 'fable-5')).toBe('us.anthropic.claude-fable-5-1');
+    expect(warnings.join()).toContain('ambiguous');
   });
 });
 
@@ -444,13 +701,16 @@ describe('pricingProjection', () => {
   it('emits a row per priced model AND per alias, never a legacyAliases key', () => {
     const doc = registryDoc();
     doc.models[1].pricing = { input: 5.5, output: 27.5 };
+    // An unpriced row NOTHING routes at: every routing target has to carry a
+    // price now, so the projection's price gap is demonstrated on a spare row.
+    doc.models.push({ modelId: 'us.openai.gpt-6-luna', vendor: 'openai', family: 'gpt-luna' });
     const { pricing } = pricingProjection(validated(doc), livePricing());
     expect(pricing.models['us.anthropic.claude-fable-5-1']).toEqual({ input: 11, output: 55, cacheReadInput: 0.275 });
     expect(pricing.models['fable-5']).toEqual({ input: 11, output: 55, cacheReadInput: 0.275 });
     expect(pricing.models['claude-sonnet-45']).toBeUndefined();
     // A row without a usable price is left OUT, which is what makes the card
     // Lambda report it as a gap instead of pricing it at the default rate.
-    expect(pricing.models['us.openai.gpt-6-sol']).toBeUndefined();
+    expect(pricing.models['us.openai.gpt-6-luna']).toBeUndefined();
     // The hand-written row is gone: the catalog owns per-model rates outright.
     expect(pricing.models['openai.gpt-legacy']).toBeUndefined();
   });

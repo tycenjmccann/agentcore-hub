@@ -25,8 +25,11 @@
  *
  * @typedef {{modelId:string,label?:string,vendor?:string,family?:string,
  *   endpoint?:string,region?:string,api?:string,contextWindow?:number,
- *   aliases?:string[],status?:string,pricing?:ModelPrice,probe?:object,
- *   notify?:{requestedAt?:string}}} ModelRow
+ *   aliases?:string[],status?:string,price?:ModelPrice,pricing?:ModelPrice,
+ *   probe?:object,notify?:{requestedAt?:string}}} ModelRow
+ * `price` is the rate block — the spelling the seed, the TS canonical and the
+ * reconcile all use. `pricing` is the same shape under an older name, read as a
+ * fallback and never written; see priceBlockOf().
  * @typedef {{input?:number,output?:number,cacheReadInput?:number,
  *   longContext?:object,state?:string,asOf?:string,source?:string,
  *   priceDrift?:object}} ModelPrice
@@ -57,6 +60,13 @@ export const LITERAL_CODING_CODEX = 'openai.gpt-5.5';
 export const EXEMPT_AGENT_IDS = ['telegram_intake'];
 
 export const RESOLVABLE_STATUSES = ['active', 'candidate'];
+
+/** The CLOSED vocabulary a chain result may report as its `source`, mirroring
+ *  CHAIN_STEPS in src/lib/models-registry.ts and the fixture's _comment. It is a
+ *  contract, not a log string: the /models UI, the fixture and the Python twin
+ *  all have to describe the same decision with the same word. Which env var, or
+ *  which `defaults` key, is detail — it rides along in `envVar` and in the log. */
+export const CHAIN_STEPS = ['override', 'agents', 'defaults', 'env', 'literal'];
 const ROW_STATUSES = ['active', 'candidate', 'retired', 'quarantined'];
 
 const DEFAULT_CLAUDE_ENDPOINT = 'bedrock-runtime';
@@ -95,11 +105,42 @@ export function isDatedDuplicate(id, idSet) {
 }
 
 /**
- * Tolerant parse of a registry document → `{registry|null, warnings, errors}`.
+ * Every model id the document ROUTES at: defaults, tiers, agents, legacyAliases.
+ * Mirror of routingTargets() in src/lib/models-registry.ts. A dated duplicate
+ * something routes at is kept; one nothing routes at is noise.
+ */
+function routingTargetsOf(doc) {
+  const targets = new Set();
+  if (!isPlainObject(doc)) return targets;
+  for (const key of ['defaults', 'agents', 'legacyAliases']) {
+    if (!isPlainObject(doc[key])) continue;
+    for (const value of Object.values(doc[key])) if (typeof value === 'string' && value) targets.add(value);
+  }
+  if (isPlainObject(doc.tiers)) {
+    for (const mapping of Object.values(doc.tiers)) {
+      if (!isPlainObject(mapping)) continue;
+      for (const value of Object.values(mapping)) if (typeof value === 'string' && value) targets.add(value);
+    }
+  }
+  return targets;
+}
+
+/**
+ * Tolerant parse of a registry document → `{registry|null, warnings, errors}`,
+ * where `errors` is a `{field path: reason}` map in the SAME vocabulary as
+ * validateRegistry() in src/lib/models-registry.ts — `bad_model_id`,
+ * `quarantined`, `unknown_model`, `read_only`, `inactive`, `unpriced`,
+ * `unprobed`, `duplicate_alias`, `unknown_agent`. The hub calls that function on
+ * its READ path (`registryReadFailure`) and falls back to last-good/seed on any
+ * of those reasons, so a twin that keeps serving a document the hub refuses IS
+ * the divergence DL-033 exists to prevent. Same reasons, same paths, same
+ * verdict.
  *
  * A malformed ROW is dropped with a warning — one bad candidate must not take
- * the fleet down. But a document whose `defaults`, `tiers` or `agents` point AT
- * a dropped row is internally inconsistent: resolving through it would hand
+ * the fleet down. But a document whose `defaults`, `tiers`, `agents` or
+ * `legacyAliases` point AT a row that cannot be routed to — dropped, retired,
+ * quarantined, read-only, unpriced, or a candidate that has not passed both
+ * probe planes — is internally inconsistent: resolving through it would hand
  * back something other than what the operator wrote, so the WHOLE document is
  * an error and the caller falls back to env/literal instead. That asymmetry is
  * the point (finding 13).
@@ -110,13 +151,97 @@ export function isDatedDuplicate(id, idSet) {
  *   which is the normal case at runtime (agents.json is not shipped everywhere).
  */
 export function validateRegistry(doc, opts = {}) {
+  const { registry: normalized, warnings, errors } = parseRegistryInternal(doc);
+  if (!normalized) return { registry: null, warnings, errors };
+
+  const rows = normalized.models;
+  const aliasOwner = normalized._aliasOwner;
+  const legacy = isPlainObject(doc.legacyAliases) ? doc.legacyAliases : {};
+
+  // Anything the document POINTS AT must be ROUTABLE, not merely present.
+  // `defaults` and `tiers` are how every caller lands somewhere when it was
+  // given nothing, so a target that cannot be routed to is not a warning.
+  // targetReasonFor is the mirror of targetReason() in the canonical.
+  const index = indexRows(rows, aliasOwner);
+  const quarantine = quarantineSetOf(doc);
+
+  const defaults = isPlainObject(doc.defaults) ? doc.defaults : {};
+  for (const [key, value] of Object.entries(defaults)) {
+    const reason = targetReasonFor(index, quarantine, value);
+    if (reason) errors[`defaults.${key}`] = reason;
+  }
+
+  const tiers = isPlainObject(doc.tiers) ? doc.tiers : {};
+  for (const [cli, mapping] of Object.entries(tiers)) {
+    if (!isPlainObject(mapping)) {
+      errors[`tiers.${cli}`] = 'not_an_object';
+      continue;
+    }
+    for (const [tier, value] of Object.entries(mapping)) {
+      const reason = targetReasonFor(index, quarantine, value);
+      if (reason) errors[`tiers.${cli}.${tier}`] = reason;
+    }
+  }
+
+  const agents = isPlainObject(doc.agents) ? doc.agents : {};
+  for (const [agentId, value] of Object.entries(agents)) {
+    const reason = targetReasonFor(index, quarantine, value);
+    if (reason) errors[`agents.${agentId}`] = reason;
+  }
+
+  for (const [alias, value] of Object.entries(legacy)) {
+    if (!MODEL_ID_RE.test(alias)) {
+      errors[`legacyAliases.${alias}`] = 'bad_model_id';
+      continue;
+    }
+    const reason = targetReasonFor(index, quarantine, value);
+    if (reason) errors[`legacyAliases.${alias}`] = reason;
+  }
+
+  // Every pinned agent must be a real agent — only when a roster was supplied.
+  const roster = opts.agentIds instanceof Set ? opts.agentIds
+    : Array.isArray(opts.agentIds) ? new Set(opts.agentIds) : null;
+  if (roster) {
+    for (const agentId of Object.keys(agents)) {
+      if (!roster.has(agentId) && !EXEMPT_AGENT_IDS.includes(agentId)) {
+        errors[`agents.${agentId}`] = 'unknown_agent';
+      }
+    }
+  }
+
+  if (Object.keys(errors).length) return { registry: null, warnings, errors };
+  return { registry: normalized, warnings, errors };
+}
+
+/**
+ * Tolerant NORMALIZE of a registry document, with no verdict attached →
+ * `{registry|null, warnings}`.
+ *
+ * Mirror of parseModelsRegistry() in src/lib/models-registry.ts, and the reason
+ * that function and validateRegistry() are two functions there rather than one:
+ * normalizing (drop malformed rows, de-duplicate aliases, fold dated snapshots)
+ * answers "what does this document say", while validating answers "may the hub
+ * serve it". A caller that wants to resolve THROUGH a document the read gate
+ * would refuse — a registry that quarantines a model some tier still points at,
+ * say — needs the first without the second.
+ */
+export function parseRegistry(doc) {
+  const { registry, warnings } = parseRegistryInternal(doc);
+  return { registry, warnings };
+}
+
+/** The normalize half, shared by both entry points above. `errors` carries only
+ *  the STRUCTURAL and catalog-integrity reasons — the document still normalizes
+ *  with them, which is why parseRegistry can hand it back and the validator
+ *  cannot. */
+function parseRegistryInternal(doc) {
   const warnings = [];
-  const errors = [];
-  if (!isPlainObject(doc)) return { registry: null, warnings, errors: ['not an object'] };
+  const errors = {};
+  if (!isPlainObject(doc)) return { registry: null, warnings, errors: { document: 'not_an_object' } };
 
   const rawModels = doc.models ?? doc.catalog;
   if (!Array.isArray(rawModels)) {
-    return { registry: null, warnings, errors: ['models[] missing or not an array'] };
+    return { registry: null, warnings, errors: { models: 'missing_or_not_an_array' } };
   }
 
   const rows = [];
@@ -131,21 +256,36 @@ export function validateRegistry(doc, opts = {}) {
     rows.push({ ...row });
   });
 
-  // Aliases must be unambiguous ACROSS namespaces: an alias that is also a
-  // modelId, or that two rows both claim, makes resolution order observable.
-  // Such an alias is dropped (not the row) — the row still resolves by id.
+  // Aliases must be unambiguous ACROSS namespaces: an alias that another row
+  // already claims as its id or its alias makes resolution order decide which
+  // model — and therefore which price — you get. The canonical errors on that
+  // (`catalog.<id>.aliases.<alias>`), so this does too.
+  //
+  // An alias that collides with a legacyAliases KEY is the one case that stays
+  // a dropped-with-a-warning: the canonical ignores legacy collisions, and
+  // dropping the alias leaves the row reachable by id, so refusing the whole
+  // document over a compatibility shim would be stricter than the hub.
   const legacy = isPlainObject(doc.legacyAliases) ? doc.legacyAliases : {};
+  const claimed = new Map(rows.map((r) => [r.modelId, r.modelId]));
   for (const row of rows) {
     const kept = [];
     for (const alias of row.aliases || []) {
       if (typeof alias !== 'string' || !MODEL_ID_RE.test(alias)) {
+        errors[`catalog.${row.modelId}.aliases.${alias}`] = 'bad_model_id';
         warnings.push(`alias ${JSON.stringify(alias)} dropped (malformed)`);
         continue;
       }
-      if (seenIds.has(alias) || alias in aliasOwner || alias in legacy) {
+      const owner = claimed.get(alias);
+      if (owner !== undefined && owner !== row.modelId) {
+        errors[`catalog.${row.modelId}.aliases.${alias}`] = 'duplicate_alias';
         warnings.push(`alias ${JSON.stringify(alias)} dropped (ambiguous)`);
         continue;
       }
+      if (alias in legacy) {
+        warnings.push(`alias ${JSON.stringify(alias)} dropped (ambiguous)`);
+        continue;
+      }
+      claimed.set(alias, row.modelId);
       aliasOwner[alias] = row.modelId;
       kept.push(alias);
     }
@@ -153,9 +293,14 @@ export function validateRegistry(doc, opts = {}) {
   }
 
   // A dated snapshot of a model already in the catalog is the same model: keep
-  // the base id canonical and let the dated form resolve to it as an alias.
+  // the base id canonical and let the dated form resolve to it as an alias —
+  // UNLESS something routes at the dated id, in which case routing outranks
+  // tidiness and the row stays a row. Folding a routing target would make
+  // `tiers.claude.sonnet` resolve to a different model than the operator wrote.
+  const routingTargets = routingTargetsOf(doc);
   for (const row of [...rows]) {
     const base = datedDuplicateBase(row.modelId);
+    if (routingTargets.has(row.modelId)) continue;
     if (!base || base === row.modelId || !seenIds.has(base)) continue;
     const target = rows.find((r) => r.modelId === base);
     if (!(row.modelId in aliasOwner)) {
@@ -167,57 +312,54 @@ export function validateRegistry(doc, opts = {}) {
     seenIds.delete(row.modelId);
   }
 
-  const known = new Set([...seenIds, ...Object.keys(aliasOwner)]);
-
-  // Anything the document POINTS AT must exist. `defaults` and `tiers` are how
-  // every caller lands somewhere when it was given nothing, so a dangling
-  // pointer there is not a warning.
-  const defaults = isPlainObject(doc.defaults) ? doc.defaults : {};
-  for (const [key, value] of Object.entries(defaults)) {
-    if (typeof value === 'string' && value && !known.has(value)) {
-      errors.push(`defaults.${key} -> unknown model ${JSON.stringify(value)}`);
-    }
-  }
-
-  const tiers = isPlainObject(doc.tiers) ? doc.tiers : {};
-  for (const [cli, mapping] of Object.entries(tiers)) {
-    if (!isPlainObject(mapping)) {
-      errors.push(`tiers.${cli} is not an object`);
-      continue;
-    }
-    for (const [tier, value] of Object.entries(mapping)) {
-      if (typeof value !== 'string' || !known.has(value)) {
-        errors.push(`tiers.${cli}.${tier} -> unknown model ${JSON.stringify(value)}`);
-      }
-    }
-  }
-
-  const agents = isPlainObject(doc.agents) ? doc.agents : {};
-  for (const [agentId, value] of Object.entries(agents)) {
-    if (typeof value !== 'string' || !known.has(value)) {
-      errors.push(`agents.${agentId} -> unknown model ${JSON.stringify(value)}`);
-    }
-  }
-
-  for (const [alias, value] of Object.entries(legacy)) {
-    if (typeof value !== 'string' || !known.has(value)) {
-      warnings.push(`legacyAliases.${alias} -> unknown model ${JSON.stringify(value)} (ignored)`);
-    }
-  }
-
-  // Every pinned agent must be a real agent — only when a roster was supplied.
-  const roster = opts.agentIds instanceof Set ? opts.agentIds
-    : Array.isArray(opts.agentIds) ? new Set(opts.agentIds) : null;
-  if (roster) {
-    for (const agentId of Object.keys(agents)) {
-      if (!roster.has(agentId) && !EXEMPT_AGENT_IDS.includes(agentId)) {
-        errors.push(`agents.${agentId} is not in agents.json`);
-      }
-    }
-  }
-
-  if (errors.length) return { registry: null, warnings, errors };
   return { registry: { ...doc, models: rows, _aliasOwner: aliasOwner }, warnings, errors };
+}
+
+/** `{byId, byAlias}` over the KEPT rows — the twin's RegistryIndex. */
+function indexRows(rows, aliasOwner) {
+  const byId = new Map(rows.map((r) => [r.modelId, r]));
+  const byAlias = new Map();
+  for (const [alias, owner] of Object.entries(aliasOwner)) {
+    const row = byId.get(owner);
+    if (row) byAlias.set(alias, row);
+  }
+  return { byId, byAlias };
+}
+
+function quarantineSetOf(doc) {
+  const list = isPlainObject(doc) ? doc.quarantine : null;
+  return new Set(Array.isArray(list) ? list.filter((v) => typeof v === 'string') : []);
+}
+
+/** Mirror of pricedOk(): both rates present, finite and non-negative. */
+function pricedOk(price) {
+  if (!isPlainObject(price)) return false;
+  return ['input', 'output'].every((k) => Number.isFinite(price[k]) && price[k] >= 0);
+}
+
+/**
+ * Why `value` cannot be routed to, or null when it can.
+ *
+ * The same reason vocabulary and the same ORDER as targetReason() in
+ * src/lib/models-registry.ts, because the hub rejects a live document for any of
+ * them on its read path (`registryReadFailure`). Order matters: a quarantined id
+ * reports `quarantined` even if it is also unpriced, so an operator reading the
+ * hub's error and this twin's log sees one story.
+ */
+function targetReasonFor({ byId, byAlias }, quarantine, value) {
+  if (typeof value !== 'string' || !MODEL_ID_RE.test(value)) return 'bad_model_id';
+  if (quarantine.has(value)) return 'quarantined';
+  const row = byId.get(value) || byAlias.get(value);
+  if (!row) return 'unknown_model';
+  if (row.readOnly) return 'read_only';
+  const status = row.status ?? 'active';
+  if (status === 'quarantined') return 'quarantined';
+  if (status === 'retired') return 'inactive';
+  if (!pricedOk(priceBlockOf(row))) return 'unpriced';
+  // BOTH planes, not either: a model that answers the API but not the coding CLI
+  // is half-proven, and `||` here would let a single green probe adopt it.
+  if (status === 'candidate' && !(row.probe?.api?.ok && row.probe?.cli?.ok)) return 'unprobed';
+  return null;
 }
 
 // ─── Resolution ──────────────────────────────────────────────────────────────
@@ -243,7 +385,9 @@ const quarantinedIn = (registry, name) => {
  *
  * Order, and the reason each step is where it is:
  *   1. `quarantine` — an operator kill switch has to beat every other source,
- *      including an explicit pin, or it is not a kill switch.
+ *      including an explicit pin, or it is not a kill switch. Checked on the raw
+ *      input AND again on the resolved id (step 4), because a tier word or a
+ *      legacy alias must not be a way around it.
  *   2. `tiers[cli]` — tiers are CLI-scoped: "sol" means a Codex model to codex
  *      and nothing to claude, so an unscoped map would cross the wires.
  *   3. `legacyAliases` — yesterday's names ("claude-sonnet-45") keep working.
@@ -271,14 +415,30 @@ export function resolveModel(registry, value, ctx = {}) {
   const tiers = isPlainObject(registry) ? registry.tiers : null;
   if (isPlainObject(tiers)) {
     const scoped = tiers[ctx.cli === 'codex' ? 'codex' : 'claude'];
-    if (isPlainObject(scoped) && name.toLowerCase() in scoped) name = scoped[name.toLowerCase()];
+    // EXACT case: tier words are document keys, not user prose. Case-folding here
+    // made "OPUS" resolve on the fleet and not in the hub, which is the kind of
+    // split the canonical exists to prevent.
+    if (isPlainObject(scoped) && name in scoped) name = scoped[name];
   }
 
   const legacy = isPlainObject(registry) ? registry.legacyAliases : null;
   if (isPlainObject(legacy) && name in legacy) name = legacy[name];
 
+  // The kill switch is re-checked on the RESOLVED id: quarantining a model must
+  // not be bypassable by asking for its tier or one of its old names.
+  if (quarantinedIn(registry, name)) {
+    log.warn?.(`[models] registry.quarantined ${name}`);
+    return null;
+  }
+
   const row = rowFor(registry, name);
   if (row) {
+    // An alias hit resolves to the row id, so the row id is what the kill switch
+    // has to be checked against as well.
+    if (row.status === 'quarantined' || quarantinedIn(registry, row.modelId)) {
+      log.warn?.(`[models] registry.quarantined ${row.modelId}`);
+      return null;
+    }
     if (RESOLVABLE_STATUSES.includes(row.status ?? 'active')) return row.modelId;
     log.warn?.(`[models] registry.retired ${row.modelId} (status=${row.status})`);
     return null;
@@ -313,14 +473,16 @@ const defaultFor = (registry, key) => {
  * override -> agents[agentId] -> defaults.persona -> $MODEL_ID -> literal.
  * Each step goes through `resolveModel`, so a tier name, a legacy alias or a
  * retired id at any level falls through to the next rather than pinning
- * something that no longer exists. `source` is what the caller logs — a model
- * chosen by the literal fallback must be distinguishable from a pinned one.
+ * something that no longer exists. `source` is one of CHAIN_STEPS — the closed
+ * vocabulary the canonical and the fixture use — so a model chosen by the
+ * literal fallback is distinguishable from a pinned one in every loader's words,
+ * not just this one's. `envVar` names the variable when `source` is 'env'.
  */
 export function resolveAgentModel(registry, agentId, override = '', env = {}, ctx = {}) {
   const steps = [
     ['override', override],
-    ['pin', pinFor(registry, agentId)],
-    ['defaults.persona', defaultFor(registry, 'persona')],
+    ['agents', pinFor(registry, agentId)],
+    ['defaults', defaultFor(registry, 'persona')],
   ];
   for (const [source, candidate] of steps) {
     const modelId = resolveModel(registry, candidate, ctx);
@@ -329,14 +491,14 @@ export function resolveAgentModel(registry, agentId, override = '', env = {}, ct
   const fromEnv = trimmed(env.MODEL_ID);
   if (fromEnv) {
     const modelId = resolveModel(registry, fromEnv, ctx) || rawEnv(registry, fromEnv);
-    if (modelId) return { modelId, source: 'env:MODEL_ID' };
+    if (modelId) return { modelId, source: 'env', envVar: 'MODEL_ID' };
   }
   return { modelId: LITERAL_PERSONA_DEFAULT, source: 'literal' };
 }
 
 /**
  * Resolve a coding-CLI model →
- * `{modelId, endpoint, region, api, contextWindow, baseUrl, source}`.
+ * `{modelId, endpoint, region, api, contextWindow, baseUrl, source, envVar?}`.
  *
  * argument -> defaults.codingClaude|codingCodex -> $ANTHROPIC_MODEL/$CLAUDE_MODEL
  * (claude) or $CODEX_MODEL (codex) -> literal.
@@ -352,8 +514,10 @@ export function resolveCodingModel(registry, tierOrId, cli, env = {}, ctx = {}) 
   const codex = cli === 'codex';
   const rctx = { ...ctx, cli };
   const steps = [
-    ['argument', tierOrId],
-    [`defaults.${codex ? 'codingCodex' : 'codingClaude'}`, defaultFor(registry, codex ? 'codingCodex' : 'codingClaude')],
+    // An explicit argument is the caller's override, the same chain slot the
+    // persona chain calls `override` — the canonical names it that too.
+    ['override', tierOrId],
+    ['defaults', defaultFor(registry, codex ? 'codingCodex' : 'codingClaude')],
   ];
   for (const [source, candidate] of steps) {
     const modelId = resolveModel(registry, candidate, rctx);
@@ -363,13 +527,13 @@ export function resolveCodingModel(registry, tierOrId, cli, env = {}, ctx = {}) 
     const value = trimmed(env[name]);
     if (!value) continue;
     const modelId = resolveModel(registry, value, rctx) || rawEnv(registry, value);
-    if (modelId) return withEndpoint(registry, modelId, codex, env, `env:${name}`, rctx);
+    if (modelId) return withEndpoint(registry, modelId, codex, env, 'env', rctx, name);
   }
   const literal = codex ? LITERAL_CODING_CODEX : LITERAL_CODING_CLAUDE;
   return withEndpoint(registry, literal, codex, env, 'literal', rctx);
 }
 
-function withEndpoint(registry, modelId, codex, env, source, ctx) {
+function withEndpoint(registry, modelId, codex, env, source, ctx, envVar = null) {
   const log = ctx.log || console;
   const row = rowFor(registry, modelId);
   const endpoint = (row && row.endpoint) || (codex ? DEFAULT_CODEX_ENDPOINT : DEFAULT_CLAUDE_ENDPOINT);
@@ -382,7 +546,9 @@ function withEndpoint(registry, modelId, codex, env, source, ctx) {
   const ctxWindow = row && Number.isInteger(row.contextWindow) && row.contextWindow > 0
     ? row.contextWindow : DEFAULT_CONTEXT_WINDOW;
   const id = row ? row.modelId : modelId;
-  return { modelId: id, endpoint, region, api, contextWindow: ctxWindow, baseUrl: baseUrlFor(endpoint, region), source };
+  const out = { modelId: id, endpoint, region, api, contextWindow: ctxWindow, baseUrl: baseUrlFor(endpoint, region), source };
+  if (envVar) out.envVar = envVar;
+  return out;
 }
 
 /** Region when the row does not say. Mantle has its own env var — and it is
@@ -528,8 +694,19 @@ export const PRICE_FIELDS = ['input', 'output', 'cacheReadInput'];
  *  rate. They are CARRIED FORWARD from the live document, never regenerated. */
 export const CARRIED_PRICING_KEYS = ['default', 'cachedInputDiscount', 'cacheWriteMultiplier', 'kiro', 'agentcore'];
 
+/** The row's rate block. `price` is the field the seed, the TS canonical
+ *  (`parsePrice(raw.price)`) and the reconcile all write; `pricing` is tolerated
+ *  on READ only, because an earlier reconcile spelled it that way and a document
+ *  that already carries it must still price rather than bill at the default
+ *  rate. Nothing writes `pricing`. */
+export function priceBlockOf(row) {
+  if (isPlainObject(row?.price)) return row.price;
+  if (isPlainObject(row?.pricing)) return row.pricing;
+  return null;
+}
+
 function priceOf(row) {
-  const p = row?.pricing;
+  const p = priceBlockOf(row);
   if (!isPlainObject(p) || !isPositive(p.input) || !isPositive(p.output)) return null;
   const out = { input: p.input, output: p.output };
   if (isPositive(p.cacheReadInput)) out.cacheReadInput = p.cacheReadInput;
