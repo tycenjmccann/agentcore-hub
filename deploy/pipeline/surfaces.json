@@ -232,7 +232,10 @@
       "paths": [
         "deploy/workflow-manager/system-prompt.md",
         "deploy/workflow-manager/setup-workflow-manager.mjs",
-        "deploy/workflow-manager/skills/"
+        "deploy/workflow-manager/skills/",
+        "deploy/pipeline/harness-model.mjs",
+        "deploy/pipeline/harness-snapshot.mjs",
+        "src/lib/models/models-registry.mjs"
       ]
     },
     {
@@ -241,7 +244,10 @@
       "paths": [
         "deploy/setup-builder-agent.mjs",
         "src/config/models.json",
-        "src/lib/models/harness-models.mjs"
+        "src/lib/models/harness-models.mjs",
+        "deploy/pipeline/harness-model.mjs",
+        "deploy/pipeline/harness-snapshot.mjs",
+        "src/lib/models/models-registry.mjs"
       ]
     },
     {
@@ -249,7 +255,10 @@
       "script": "deploy/routine-builder/setup-routine-builder.mjs",
       "paths": [
         "deploy/routine-builder/system-prompt.md",
-        "deploy/routine-builder/setup-routine-builder.mjs"
+        "deploy/routine-builder/setup-routine-builder.mjs",
+        "deploy/pipeline/harness-model.mjs",
+        "deploy/pipeline/harness-snapshot.mjs",
+        "src/lib/models/models-registry.mjs"
       ]
     }
   ],
@@ -347,7 +356,7 @@
   "excluded": {
     "lambda/orchestrator": "Target 1 of buildspec-deploy.yml (one zip to orchestrator + agent-invoker + events-writer).",
     "lambda/builder-tools": "No deployed function — the builder harness uses code_interpreter; source kept for reference.",
-    "deploy/pipeline": "The pipeline itself; buildspec/stack edits take effect on the next run or via deploy/pipeline/deploy.sh.",
+    "deploy/pipeline": "The pipeline itself; buildspec/stack edits take effect on the next run or via deploy/pipeline/deploy.sh. TEAM-5020: harness-model.mjs and harness-snapshot.mjs are the exception — every harness setup script imports them for model resolution, so both are ALSO listed under each harnesses[].paths as harness triggers, even though the rest of this dir is excluded.",
     "deploy/ecs-express": "The app image is Target 3 (roll-by-digest); deploy.sh is the pre-pipeline manual path.",
     "deploy/local": "Gitignored scratch.",
     "deploy/config.sh": "Sourced by scripts; not a deploy surface.",
