@@ -13,6 +13,11 @@
  * this file declares the small slice of the response it needs rather than importing
  * the page's types.
  *
+ * The response carries the resolution CHAIN (`{modelId, source, via?}`) and the
+ * catalog, not display strings, so the label a card prints is derived here from both
+ * — see `deriveResolved` in ./model-label, which is where that derivation lives so it
+ * can be unit tested without a DOM.
+ *
  * `resolve()` NEVER throws and never returns undefined. A console pointed at a
  * region whose fleet differs, a runtime deployed five minutes ago, a cached
  * document from before a rename: all of those are agents the registry has not heard
@@ -23,20 +28,20 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { cachedFetch } from "./client-cache";
+import { deriveResolved } from "./model-label";
+import type { CatalogLabelRow, DerivedModelLabels, ResolvedModelEntry } from "./model-label";
 
-/** One resolved deployable, as `/api/models/registry` reports it. */
-export interface ResolvedModelEntry {
-  modelId: string;
-  label: string;
-  shortLabel: string;
-  /** False when a per-agent override is set; true when it comes from defaults. */
-  inherited: boolean;
-  /** What the live harness reports, when the deployable is a harness. */
-  harnessModel?: string | null;
-}
+export type { ResolvedModelEntry } from "./model-label";
 
-/** The answer a render site gets, including for an agent nobody knows about. */
-export interface ResolvedModel extends ResolvedModelEntry {
+/**
+ * The answer a render site gets: the wire entry, the labels derived from it, and
+ * whether the registry had heard of the key at all.
+ *
+ * `source`/`via` ride along deliberately — a site that wants to be honest about
+ * provenance ("Inherited from defaults.persona" vs "Resolved via env") needs the
+ * chain step, not just the `inherited` boolean it collapses to.
+ */
+export interface ResolvedModel extends ResolvedModelEntry, DerivedModelLabels {
   /** True when the registry has no entry for this key — render a dash. */
   unknown: boolean;
 }
@@ -44,6 +49,8 @@ export interface ResolvedModel extends ResolvedModelEntry {
 interface RegistrySlice {
   version: number;
   defaults?: Record<string, string>;
+  /** The label for a resolved model id lives here, one row per id. */
+  catalog?: CatalogLabelRow[];
 }
 
 interface RegistryReadResponse {
@@ -53,6 +60,7 @@ interface RegistryReadResponse {
 
 const UNKNOWN: ResolvedModel = {
   modelId: "",
+  source: "literal",
   label: "",
   shortLabel: "",
   inherited: true,
@@ -144,7 +152,7 @@ export function useModelsRegistry(): UseModelsRegistry {
       if (!key) return UNKNOWN;
       for (const candidate of candidateKeys(key)) {
         const hit = table[candidate];
-        if (hit) return { ...hit, unknown: false };
+        if (hit) return { ...hit, ...deriveResolved(hit, data?.registry?.catalog), unknown: false };
       }
       return UNKNOWN;
     },

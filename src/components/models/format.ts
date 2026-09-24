@@ -75,14 +75,11 @@ export function absoluteUtc(iso: string | null | undefined): string {
 }
 
 /**
- * The last segment of a model id, for the compact label sites (agent cards, the
- * board's phase roll-up) where the full `us.anthropic.claude-fable-5-1` does not
- * fit. Falls back to the whole id.
+ * The last segment of a model id. Re-exported, not implemented: the compact label
+ * sites outside this page (agent cards, the board's phase roll-up) need the same
+ * shortening, so it lives in core — see @/lib/model-label.
  */
-export function shortModelId(modelId: string): string {
-  if (!modelId) return "";
-  return modelId.split("/").pop()?.split(":")[0] || modelId;
-}
+export { shortModelId } from "@/lib/model-label";
 
 /**
  * The copy for one rejected field in a 422.

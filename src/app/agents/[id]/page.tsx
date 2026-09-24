@@ -12,6 +12,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { streamAgentInvocation, AgentInfo, TraceEvent } from "@/lib/agentcore-stream";
 import { cachedFetch, getCached, getClientRegion } from "@/lib/client-cache";
+import { provenanceCaption } from "@/lib/model-label";
 import { useModelsRegistry } from "@/lib/models-registry-client";
 
 interface AgentDetail {
@@ -174,9 +175,11 @@ function AgentInfoHeader({ agent }: { agent: AgentDetail }) {
               <>
                 <p className="text-secondary mt-0.5">{model.shortLabel}</p>
                 <p className="text-muted font-mono text-[10px] truncate" title={model.modelId}>{model.modelId}</p>
-                <p className="text-muted text-[10px] mt-0.5">
-                  {model.inherited ? "Inherited from defaults.persona" : "Override"}
-                </p>
+                {/* Derived from the chain step, not from `inherited`: a model that
+                    came from MODEL_ID or the built-in literal is not the persona
+                    default, and saying it is sends someone hunting for a
+                    defaults.persona they never set. */}
+                <p className="text-muted text-[10px] mt-0.5">{provenanceCaption(model.source)}</p>
               </>
             )}
             <Link href={`/models#agent-${agent.name}`} className="text-[10px] text-accent-fg hover:underline">

@@ -12,9 +12,8 @@
  *    branch. (The initial read still goes through `cachedFetch`, in
  *    src/lib/models-registry-client.ts, because there a failure really is just
  *    an error.)
- *  - The security review may turn catalog refresh from a GET into a POST. With
- *    every verb and path in this file that is a one-line change instead of a
- *    hunt through the components.
+ *  - Every verb and path the page uses is in one place, so a route that moves is a
+ *    one-line change here instead of a hunt through the components.
  *
  * Every call carries `x-aws-region`, because the registry is per-region like the
  * rest of the console, and every successful write drops the client cache for
@@ -107,21 +106,34 @@ export async function reapplyAgent<T>(version: number, agentId: string): Promise
   return result;
 }
 
-/** Re-run the pricing projection after a 207 left cost math on the old prices. */
+/**
+ * Re-run the pricing projection after a 207 left cost math on the old prices.
+ *
+ * `version` alone: the projection is a single idempotent write that always runs, so
+ * there is nothing to narrow it to. Only `agentId` narrows a reapply, and that is
+ * the other caller above.
+ */
 export async function reapplyPricing<T>(version: number): Promise<ApiResult<T>> {
   const result = await call<T>(`${BASE}/registry/reapply`, {
     method: "POST",
-    body: JSON.stringify({ version, pricing: true }),
+    body: JSON.stringify({ version }),
   });
   if (result.status === 200 || result.status === 207) invalidate();
   return result;
 }
 
-/** Write a previous version's content forward as a new version. */
-export async function rollbackRegistry<T>(toVersion: number, baseVersion: number): Promise<ApiResult<T>> {
+/**
+ * Write the previous version's content forward as a new version.
+ *
+ * There is no target to choose: the server rolls back to `config/models.prev.json`,
+ * which is always the one document before the live one. `baseVersion` is the
+ * optimistic-concurrency check, exactly as on a save. The version being rolled back
+ * TO is the page's business (it names it in the confirm dialog), not the request's.
+ */
+export async function rollbackRegistry<T>(baseVersion: number): Promise<ApiResult<T>> {
   const result = await call<T>(`${BASE}/registry/rollback`, {
     method: "POST",
-    body: JSON.stringify({ toVersion, baseVersion }),
+    body: JSON.stringify({ baseVersion }),
   });
   if (result.status === 200 || result.status === 207) invalidate();
   return result;
@@ -133,20 +145,20 @@ export async function rollbackRegistry<T>(toVersion: number, baseVersion: number
  * Re-discover models and republish prices. This rewrites the catalog on the
  * server, which is why the page makes the operator save or discard first.
  *
- * NOTE: a GET today, and a GET that mutates — the API ticket's security review
- * may move it to POST. When it does, this is the line that changes.
+ * A POST, and `{refresh:true}` rather than an empty body: `GET /catalog` is the
+ * read-only view and `GET ?refresh=1` answers 405, because a GET that sweeps
+ * inference profiles and writes a document is one a browser prefetch, a link
+ * preview or a retry can fire on the operator's behalf.
+ *
+ * Answers 200, or 207 when the catalog saved but the pricing projection did not.
+ * Both replaced the document, so both invalidate.
  */
-export function refreshCatalog(): Promise<ApiResult<CatalogRefreshResponse>> {
-  return call<CatalogRefreshResponse>(`${BASE}/catalog`);
-}
-
-/** Add a model seen in spans but absent from the catalog, as an unpriced candidate. */
-export async function addCatalogRow<T>(modelId: string): Promise<ApiResult<T>> {
-  const result = await call<T>(`${BASE}/catalog`, {
+export async function refreshCatalog(): Promise<ApiResult<CatalogRefreshResponse>> {
+  const result = await call<CatalogRefreshResponse>(`${BASE}/catalog`, {
     method: "POST",
-    body: JSON.stringify({ modelId }),
+    body: JSON.stringify({ refresh: true }),
   });
-  if (result.status === 200 || result.status === 201) invalidate();
+  if (result.status === 200 || result.status === 207) invalidate();
   return result;
 }
 

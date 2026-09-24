@@ -168,10 +168,26 @@ export interface InvalidRegistryResponse {
   fields: Record<string, InvalidReason>;
 }
 
+/**
+ * POST /api/models/catalog {refresh:true}. 200, or 207 when the catalog saved but
+ * the pricing projection did not — same split as a registry save.
+ *
+ * `discovered` names the model ids, it does not count them: "2 added" is a number
+ * the page can compute, while WHICH two is the thing an operator has to check.
+ */
 export interface CatalogRefreshResponse {
+  ok: boolean;
   catalog: CatalogRow[];
-  discovered: { added: number; retired: number; repriced: number };
   version: number;
+  discovered: {
+    added: string[];
+    retired: string[];
+    repriced: string[];
+    /** Published rate moved but was NOT applied — a refresh never changes a price silently. */
+    drifted: string[];
+    errors: string[];
+  };
+  pricing: { status: "projected" | "failed"; version?: number; error?: string };
 }
 
 export type ProbeMode = "api" | "cli";
