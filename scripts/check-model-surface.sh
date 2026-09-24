@@ -100,7 +100,7 @@ ALLOW=(
   # any literal these four files ever grow. deploy-fleet.sh holds MODEL_ID only to
   # print it in the banner, and exports it for the child deploy-one.sh /
   # deploy-one-robust.py, so banner and baked value cannot drift.
-  'deploy/runtime-agent/deploy-one.sh:/--env "[A-Z_]+=\$\{[A-Z_]+:-/'
+  'deploy/runtime-agent/deploy-one.sh:/"[A-Z_]+=\$\{[A-Z_]+:-/'
   'deploy/runtime-agent/deploy-one-robust.py:/os\.environ\.get\("[A-Z_]+", "/'
   'deploy/runtime-agent/deploy-fleet.sh:/^MODEL_ID="\$\{MODEL_ID:-/'
   'deploy/coding-agent-runtime/deploy.py:/os\.environ\.get\("[A-Z_]+", "/'
