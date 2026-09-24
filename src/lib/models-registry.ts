@@ -1028,6 +1028,45 @@ export interface RegistryMeta {
 }
 
 /**
+ * The last document we know to be good: the cached copy if there is one, else
+ * the bundled seed. Stamps the TTL either way, so a failing read costs one S3
+ * GET per minute instead of one per request (TEAM-5008 finding 3).
+ *
+ * `config/models.prev.json` is deliberately NOT consulted — it can be corrupt
+ * too, and reading it would add a blocking S3 GET to the request path at exactly
+ * the moment S3 is the thing going wrong.
+ */
+function lastGoodRegistry(): RegistryMeta {
+  if (_regCache) {
+    _regCache.at = Date.now();
+    return { registry: _regCache.registry, etag: _regCache.etag, source: "cache" };
+  }
+  _regCache = { registry: BUNDLED_REGISTRY, at: Date.now() };
+  return { registry: BUNDLED_REGISTRY, source: "seed" };
+}
+
+/**
+ * Is a document we just read fit to serve? `parseModelsRegistry` is deliberately
+ * TOLERANT — it warns and returns an EMPTY registry rather than throwing — so the
+ * loader has to re-read the verdict, or truncated JSON becomes a registry with no
+ * models and every agent silently routes off `LITERAL_PERSONA_DEFAULT`
+ * (TEAM-5008 finding 3).
+ *
+ * `unknown_agent` is excluded on purpose: it only means the live document pins an
+ * agent that a later deploy removed from `agents.json`. Treating a stale roster
+ * as corruption would revert ALL routing to the seed — a worse failure than the
+ * one this check exists to prevent.
+ */
+function registryReadFailure(registry: ModelsRegistry, warnings: readonly ParseWarning[]): string | null {
+  const structural = warnings.find((w) => w.reason === "invalid_json" || w.reason === "not_an_object");
+  if (structural) return structural.reason;
+  if (!registry.catalog.length) return "empty_catalog";
+  const fatal = Object.entries(validateRegistry(registry).errors).filter(([, reason]) => reason !== "unknown_agent");
+  if (fatal.length) return fatal.map(([field, reason]) => `${field}=${reason}`).slice(0, 3).join(" ");
+  return null;
+}
+
+/**
  * Live document with a 60s TTL, the bundled seed when S3 has no copy yet, and
  * last-good on any read/parse failure. A missing key seeds rather than empties:
  * a registry with no models is not a state the app can serve.
@@ -1042,6 +1081,13 @@ export async function loadModelsRegistryMeta(opts: { force?: boolean } = {}): Pr
     const s3 = new S3Client({ region: REGION });
     const obj = await s3.send(new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: MODELS_REGISTRY_KEY }));
     const { registry, warnings } = parseModelsRegistry(await obj.Body!.transformToString());
+    const failure = registryReadFailure(registry, warnings);
+    if (failure) {
+      // A corrupt read is a FAILED read: never cached as last-good, and never
+      // reported as `source:"s3"`.
+      console.warn(`[models] registry.fallback reason=invalid detail=${failure}`);
+      return lastGoodRegistry();
+    }
     _regCache = { registry, etag: obj.ETag, at: Date.now() };
     console.log(
       `[models] registry.loaded version=${registry.version} rows=${registry.catalog.length} warnings=${warnings.length}`
@@ -1055,8 +1101,7 @@ export async function loadModelsRegistryMeta(opts: { force?: boolean } = {}): Pr
     }
     const reason = (err as Error)?.name || "error";
     console.warn(`[models] registry.fallback reason=${reason}`);
-    if (_regCache) return { registry: _regCache.registry, etag: _regCache.etag, source: "cache" };
-    return { registry: BUNDLED_REGISTRY, source: "seed" };
+    return lastGoodRegistry();
   }
 }
 

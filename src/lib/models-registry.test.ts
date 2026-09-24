@@ -35,6 +35,8 @@ const h = vi.hoisted(() => ({
     putErrors: [] as Array<Error | null>,
     /** Errors to throw from the next GetObject calls, in order. */
     getErrors: [] as Array<Error | null>,
+    /** How many GetObject calls reached S3 — the TTL's observable effect. */
+    getCalls: 0,
     etag: '"etag-1"',
   },
 }));
@@ -44,6 +46,7 @@ vi.mock("@aws-sdk/client-s3", () => ({
     async send(cmd: { constructor: { name: string }; input: Record<string, unknown> }) {
       const name = cmd.constructor.name;
       if (name === "GetObjectCommand") {
+        h.state.getCalls++;
         const forced = h.state.getErrors.shift();
         if (forced) throw forced;
         const key = cmd.input.Key as string;
@@ -750,12 +753,120 @@ describe("loadModelsRegistry", () => {
     expect(meta.registry.version).toBe(9);
   });
 
-  it("never throws on a malformed live document — the bad rows just drop", async () => {
+  it("never throws on a malformed live document — it falls back instead", async () => {
     h.state.objects[mod.MODELS_REGISTRY_KEY] = JSON.stringify({ version: 3, catalog: "not-an-array" });
     const meta = await mod.loadModelsRegistryMeta({ force: true });
-    expect(meta.registry.catalog).toEqual([]);
-    // The routing then fails validation loudly instead of half-working.
-    expect(mod.validateRegistry(meta.registry).ok).toBe(false);
+    // A registry with no models is not a state the app can serve, so the read
+    // failed and the seed answers — loudly, never as `source:"s3"`.
+    expect(meta.source).toBe("seed");
+    expect(mod.validateRegistry(meta.registry).ok).toBe(true);
+  });
+});
+
+/**
+ * TEAM-5008 finding 3. `parseModelsRegistry` is tolerant by design (security
+ * finding 13: warn, never throw), and the loader used to cache whatever came
+ * back. Truncated JSON therefore became an EMPTY registry, cached as last-good
+ * for 60s, reported as `source:"s3"` — every agent silently routing off the
+ * literal default with nothing in the response saying so.
+ */
+describe("loadModelsRegistryMeta refuses a corrupt document", () => {
+  const GOOD = () => JSON.stringify({ ...(clone(seedJson) as unknown as Record<string, unknown>), version: 9 });
+
+  beforeEach(async () => {
+    h.state.objects = {};
+    h.state.getErrors = [];
+    h.state.getCalls = 0;
+    process.env.ARTIFACT_BUCKET = "test-bucket";
+    vi.resetModules();
+    mod = await import("@/lib/models-registry");
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(console, "log").mockImplementation(() => {});
+  });
+  afterEach(() => {
+    delete process.env.ARTIFACT_BUCKET;
+  });
+
+  it("serves the previous good document when the body is not JSON", async () => {
+    h.state.objects[mod.MODELS_REGISTRY_KEY] = GOOD();
+    expect((await mod.loadModelsRegistryMeta({ force: true })).registry.version).toBe(9);
+
+    h.state.objects[mod.MODELS_REGISTRY_KEY] = '{"version": 10, "catalog": [';
+    const meta = await mod.loadModelsRegistryMeta({ force: true });
+    expect(meta.source).toBe("cache");
+    expect(meta.registry.version).toBe(9);
+    expect(meta.registry.catalog).toHaveLength(21);
+  });
+
+  it("serves the seed, not an empty registry, when there is no cached copy", async () => {
+    h.state.objects[mod.MODELS_REGISTRY_KEY] = "<html>403 Forbidden</html>";
+    const meta = await mod.loadModelsRegistryMeta({ force: true });
+    expect(meta.source).toBe("seed");
+    expect(meta.registry.catalog).toHaveLength(21);
+    expect(meta.etag).toBeUndefined();
+  });
+
+  it("treats a JSON array body as corrupt", async () => {
+    h.state.objects[mod.MODELS_REGISTRY_KEY] = "[]";
+    expect((await mod.loadModelsRegistryMeta({ force: true })).source).toBe("seed");
+  });
+
+  it("treats a well-formed document that fails validateRegistry as corrupt", async () => {
+    h.state.objects[mod.MODELS_REGISTRY_KEY] = GOOD();
+    expect((await mod.loadModelsRegistryMeta({ force: true })).registry.version).toBe(9);
+
+    const broken = JSON.parse(GOOD()) as { version: number; agents: Record<string, string>; quarantine: string[] };
+    broken.version = 10;
+    broken.quarantine = [broken.agents.agentcore_hub_workflow_manager];
+    h.state.objects[mod.MODELS_REGISTRY_KEY] = JSON.stringify(broken);
+
+    const meta = await mod.loadModelsRegistryMeta({ force: true });
+    expect(meta.source).toBe("cache");
+    expect(meta.registry.version).toBe(9);
+  });
+
+  it("serves a document that only pins an agent the roster no longer has", async () => {
+    // A stale `agents` key is not corruption: reverting ALL routing to the seed
+    // because one agent was deleted would be the worse failure.
+    const stale = JSON.parse(GOOD()) as { agents: Record<string, string> };
+    stale.agents.retired_agent_from_a_past_deploy = "us.anthropic.claude-sonnet-5";
+    h.state.objects[mod.MODELS_REGISTRY_KEY] = JSON.stringify(stale);
+
+    const meta = await mod.loadModelsRegistryMeta({ force: true });
+    expect(meta.source).toBe("s3");
+    expect(meta.registry.version).toBe(9);
+  });
+
+  it("stamps the TTL on every path, so a bad document is read once per minute", async () => {
+    const gets = () => h.state.getCalls;
+
+    // 1. corrupt body, cold cache → seed, and the seed is cached.
+    h.state.objects[mod.MODELS_REGISTRY_KEY] = "not json at all";
+    expect((await mod.loadModelsRegistryMeta({ force: true })).source).toBe("seed");
+    const afterSeed = gets();
+    expect((await mod.loadModelsRegistryMeta()).source).toBe("cache");
+    expect(gets()).toBe(afterSeed);
+
+    // 2. corrupt body, warm cache → the cached copy, TTL re-stamped.
+    mod.__resetModelsCaches();
+    h.state.objects[mod.MODELS_REGISTRY_KEY] = GOOD();
+    await mod.loadModelsRegistryMeta({ force: true });
+    h.state.objects[mod.MODELS_REGISTRY_KEY] = "not json at all";
+    expect((await mod.loadModelsRegistryMeta({ force: true })).source).toBe("cache");
+    const afterCorrupt = gets();
+    await mod.loadModelsRegistryMeta();
+    expect(gets()).toBe(afterCorrupt);
+
+    // 3. S3 erroring on a cold cache → seed, also cached.
+    mod.__resetModelsCaches();
+    const down = new Error("service unavailable") as Error & { $metadata?: { httpStatusCode: number } };
+    down.name = "SlowDown";
+    down.$metadata = { httpStatusCode: 503 };
+    h.state.getErrors = [down];
+    expect((await mod.loadModelsRegistryMeta({ force: true })).source).toBe("seed");
+    const afterOutage = gets();
+    await mod.loadModelsRegistryMeta();
+    expect(gets()).toBe(afterOutage);
   });
 });
 

@@ -103,13 +103,16 @@ describe("GET /api/models", () => {
   });
 
   it("excludes a candidate and an unpriced row", async () => {
+    // Neither row is a routing target: an unpriced TARGET makes the whole
+    // document invalid, and the loader would answer from the seed instead
+    // (TEAM-5008 finding 3), which is a different behaviour than this test pins.
     seat((reg) => {
       reg.catalog.find((r) => r.modelId === "us.anthropic.claude-opus-5-5")!.status = "candidate";
-      delete reg.catalog.find((r) => r.modelId === "us.anthropic.claude-sonnet-5")!.price;
+      delete reg.catalog.find((r) => r.modelId === "global.anthropic.claude-sonnet-5")!.price;
     });
     const ids = (await models()).map((m) => m.modelId);
     expect(ids).not.toContain("us.anthropic.claude-opus-5-5");
-    expect(ids).not.toContain("us.anthropic.claude-sonnet-5");
+    expect(ids).not.toContain("global.anthropic.claude-sonnet-5");
   });
 
   it("marks exactly one default, and it is defaults.persona", async () => {
