@@ -232,6 +232,21 @@ export class VersionConflictError extends Error {
   }
 }
 
+/**
+ * The read a writer was about to build on is not the live S3 document — it is
+ * the cached last-good copy or the bundled seed, i.e. the live document was
+ * missing, unreadable, or one the read gate refused (TEAM-5052). A write built
+ * on that would either 412 forever against a stale ETag or, with no ETag at all,
+ * overwrite the live document wholesale. Thrown by `requireLiveRegistry`.
+ */
+export class RegistryFallbackError extends Error {
+  readonly code = "registry_unavailable";
+  constructor(readonly source: RegistryMeta["source"]) {
+    super(`registry read fell back to ${source}; refusing to write over it`);
+    this.name = "RegistryFallbackError";
+  }
+}
+
 export interface PricingEntry {
   input: number;
   output: number;
@@ -1059,6 +1074,19 @@ export interface RegistryMeta {
 }
 
 /**
+ * The guard for a BACKGROUND writer (probe outcomes, the catalog refresh): only
+ * the live S3 document, with the ETag its conditional PUT needs, may be built
+ * on. Strict on purpose — callers read with `force: true`, so `cache` or `seed`
+ * here can only mean the read failed. An operator's Save/Rollback deliberately
+ * does NOT use this (see runSaveSequence): a human writing a fully validated
+ * document is how a refused live document gets repaired.
+ */
+export function requireLiveRegistry(meta: RegistryMeta): RegistryMeta & { source: "s3"; etag: string } {
+  if (meta.source === "s3" && meta.etag) return meta as RegistryMeta & { source: "s3"; etag: string };
+  throw new RegistryFallbackError(meta.source);
+}
+
+/**
  * The last document we know to be good: the cached copy if there is one, else
  * the bundled seed. Stamps the TTL either way, so a failing read costs one S3
  * GET per minute instead of one per request (TEAM-5008 finding 3).
@@ -1070,6 +1098,9 @@ export interface RegistryMeta {
 function lastGoodRegistry(): RegistryMeta {
   if (_regCache) {
     _regCache.at = Date.now();
+    // A cache that only ever held the bundled seed IS the seed: saying "cache"
+    // would tell the page (and a writer's log) a live copy was once read.
+    if (_regCache.registry === BUNDLED_REGISTRY) return { registry: BUNDLED_REGISTRY, source: "seed" };
     return { registry: _regCache.registry, etag: _regCache.etag, source: "cache" };
   }
   _regCache = { registry: BUNDLED_REGISTRY, at: Date.now() };

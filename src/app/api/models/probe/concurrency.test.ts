@@ -1,0 +1,245 @@
+import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from "vitest";
+import { NextRequest } from "next/server";
+import seed from "@/config/models.json";
+import type { ModelsRegistry, ProbeOutcome } from "@/lib/models-registry";
+import { __resetModelsCaches } from "@/lib/models-registry";
+import { settleDetached } from "./detached";
+import { __resetProbeWriteDeps, __setProbeWriteDeps } from "./record";
+import { POST } from "./route";
+
+/**
+ * TEAM-5052 — many probes finishing at once. recordOutcome() is not a route
+ * export (Next forbids non-handler exports), so this drives it the way
+ * production does: POST each probe with the probe itself held, release them all
+ * together, and let every detached run reach recordOutcome in the same tick.
+ *
+ * Unlike ./route.test.ts, the S3 fake here has REAL compare-and-swap semantics:
+ * a PUT whose IfMatch is not the stored ETag is a 412, exactly as S3 answers it,
+ * which saveModelsRegistry turns into VersionConflictError. A writer that gives up
+ * after its single retry loses its outcome, and this file counts what survived.
+ */
+
+const h = vi.hoisted(() => {
+  const savedBucket = process.env.ARTIFACT_BUCKET;
+  process.env.ARTIFACT_BUCKET = "test-bucket";
+  const state = {
+    objects: {} as Record<string, string>,
+    etags: {} as Record<string, string>,
+    puts: 0,
+    rejected: 0,
+    /** Force this many conditional PUTs to 412 regardless of the ETag. */
+    forcedConflicts: 0,
+    gate: null as null | Promise<void>,
+    release: null as null | (() => void),
+  };
+  return { savedBucket, state };
+});
+
+/** Yield to the event loop, so concurrent readers genuinely interleave. */
+const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+vi.mock("@aws-sdk/client-s3", () => ({
+  S3Client: class {
+    async send(cmd: { constructor: { name: string }; input: Record<string, unknown> }) {
+      const name = cmd.constructor.name;
+      const key = cmd.input.Key as string;
+      await tick();
+      if (name === "GetObjectCommand") {
+        const body = h.state.objects[key];
+        if (body === undefined) {
+          const e = new Error("no such key");
+          e.name = "NoSuchKey";
+          throw e;
+        }
+        return { Body: { transformToString: async () => body }, ETag: h.state.etags[key] };
+      }
+      if (name === "PutObjectCommand") {
+        const forced = cmd.input.IfMatch !== undefined && h.state.forcedConflicts > 0;
+        if (forced) h.state.forcedConflicts--;
+        if (forced || (cmd.input.IfMatch !== undefined && cmd.input.IfMatch !== h.state.etags[key])) {
+          h.state.rejected++;
+          const e = new Error("At least one of the pre-conditions you specified did not hold");
+          e.name = "PreconditionFailed";
+          throw e;
+        }
+        h.state.puts++;
+        h.state.objects[key] = cmd.input.Body as string;
+        h.state.etags[key] = `"etag-${h.state.puts}"`;
+        return { ETag: h.state.etags[key] };
+      }
+      throw new Error(`unexpected S3 command ${name}`);
+    }
+  },
+  GetObjectCommand: class {
+    constructor(public input: Record<string, unknown>) {}
+  },
+  PutObjectCommand: class {
+    constructor(public input: Record<string, unknown>) {}
+  },
+}));
+
+/** Each probe reports an outcome that names its own row, so a lost write is visible. */
+const outcomeFor = (modelId: string, mode: string): ProbeOutcome => ({
+  ok: true,
+  at: "2026-09-24T12:00:00Z",
+  error: `${modelId}#${mode}`,
+});
+
+vi.mock("@/lib/models/probe", () => ({
+  runApiProbe: async (row: { modelId: string }) => {
+    if (h.state.gate) await h.state.gate;
+    return outcomeFor(row.modelId, "api");
+  },
+  runCliProbe: async (row: { modelId: string }) => {
+    if (h.state.gate) await h.state.gate;
+    return outcomeFor(row.modelId, "cli");
+  },
+}));
+
+const SEED = seed as unknown as ModelsRegistry;
+const MODELS_KEY = "config/models.json";
+
+/** Ten distinct probes: five routable seed rows, each probed on both planes. */
+const PROBES = SEED.catalog
+  .filter((r) => (r.status ?? "active") === "active" && !r.readOnly)
+  .slice(0, 5)
+  .flatMap((r) => (["api", "cli"] as const).map((mode) => ({ modelId: r.modelId, mode })));
+
+function req(body: unknown): NextRequest {
+  return new NextRequest("https://hub.example.com/api/models/probe", {
+    method: "POST",
+    headers: { "content-type": "application/json", host: "hub.example.com" },
+    body: JSON.stringify(body),
+  });
+}
+
+let savedAuth: string | undefined;
+const sleeps: number[] = [];
+const warnings = () => vi.mocked(console.warn).mock.calls.map((c) => String(c[0])).join("\n");
+const liveDoc = () => JSON.parse(h.state.objects[MODELS_KEY]) as ModelsRegistry;
+
+beforeEach(() => {
+  const live = JSON.parse(JSON.stringify(SEED)) as ModelsRegistry;
+  live.version = 5;
+  h.state.objects = { [MODELS_KEY]: JSON.stringify(live) };
+  h.state.etags = { [MODELS_KEY]: '"etag-live"' };
+  h.state.puts = 0;
+  h.state.rejected = 0;
+  h.state.forcedConflicts = 0;
+  sleeps.length = 0;
+  savedAuth = process.env.AUTH_MODE;
+  process.env.AUTH_MODE = "none";
+  vi.spyOn(console, "log").mockImplementation(() => {});
+  vi.spyOn(console, "warn").mockImplementation(() => {});
+  __resetModelsCaches();
+  // The backoff is recorded, not waited out; jitter is pinned to its midpoint.
+  __setProbeWriteDeps({
+    sleep: async (ms) => {
+      sleeps.push(ms);
+    },
+    random: () => 0.5,
+  });
+});
+
+afterEach(async () => {
+  h.state.release?.();
+  h.state.release = null;
+  h.state.gate = null;
+  await settleDetached();
+  __resetProbeWriteDeps();
+  if (savedAuth === undefined) delete process.env.AUTH_MODE;
+  else process.env.AUTH_MODE = savedAuth;
+  vi.restoreAllMocks();
+});
+
+afterAll(() => {
+  if (h.savedBucket === undefined) delete process.env.ARTIFACT_BUCKET;
+  else process.env.ARTIFACT_BUCKET = h.savedBucket;
+});
+
+describe("POST /api/models/probe — concurrent outcomes (TEAM-5052)", () => {
+  it("lands every one of 10 concurrent probe outcomes in the final document", async () => {
+    expect(PROBES).toHaveLength(10);
+    h.state.gate = new Promise<void>((resolve) => {
+      h.state.release = resolve;
+    });
+
+    for (const p of PROBES) {
+      const res = await POST(req(p));
+      expect(res.status).toBe(202);
+    }
+    h.state.release!();
+    await settleDetached();
+
+    const doc = JSON.parse(h.state.objects[MODELS_KEY]) as ModelsRegistry;
+    const landed = PROBES.filter(({ modelId, mode }) => {
+      const row = doc.catalog.find((r) => r.modelId === modelId);
+      return row?.probe?.[mode]?.error === `${modelId}#${mode}`;
+    }).map(({ modelId, mode }) => `${modelId}#${mode}`);
+
+    expect(landed).toEqual(PROBES.map(({ modelId, mode }) => `${modelId}#${mode}`));
+    expect(doc.version).toBe(5 + PROBES.length);
+  });
+
+  it("gives up after 5 conflicts without touching S3, and logs probe.write_failed", async () => {
+    const before = h.state.objects[MODELS_KEY];
+    h.state.forcedConflicts = Infinity;
+    await POST(req({ modelId: "us.anthropic.claude-opus-5", mode: "api" }));
+    await settleDetached();
+
+    // Five attempts plus the one best-effort write_failed record, every one a 412.
+    expect(h.state.rejected).toBe(6);
+    expect(h.state.puts).toBe(0);
+    expect(h.state.objects[MODELS_KEY]).toBe(before);
+    expect(sleeps).toEqual([300, 300, 300, 300]);
+    expect(warnings()).toContain(
+      "probe.write_failed modelId=us.anthropic.claude-opus-5 mode=api attempts=5 error=version_conflict"
+    );
+  });
+
+  it("records write_failed on the row when the last retry finally lands", async () => {
+    h.state.forcedConflicts = 5;
+    await POST(req({ modelId: "us.anthropic.claude-opus-5", mode: "api" }));
+    await settleDetached();
+
+    expect(h.state.rejected).toBe(5);
+    expect(h.state.puts).toBe(1);
+    const probe = liveDoc().catalog.find((r) => r.modelId === "us.anthropic.claude-opus-5")?.probe?.api;
+    expect(probe).toMatchObject({ ok: false, error: "write_failed" });
+    expect(typeof probe?.at).toBe("string");
+  });
+});
+
+describe("POST /api/models/probe — the live document is one the read gate refuses (TEAM-5052)", () => {
+  /** The document the reconcile actually wrote: the retired row still owns the
+   *  alias, and a candidate row now claims it as its id. */
+  function seatRefused(): string {
+    const live = JSON.parse(JSON.stringify(SEED)) as ModelsRegistry;
+    live.version = 2;
+    const { harnessLanes: _lanes, ...owner } = live.catalog.find((r) => r.modelId === "us.anthropic.claude-opus-4-6")!;
+    live.catalog.push({
+      ...owner,
+      modelId: "us.anthropic.claude-opus-4-6-v1",
+      aliases: [],
+      status: "candidate",
+    });
+    const body = JSON.stringify(live);
+    h.state.objects[MODELS_KEY] = body;
+    return body;
+  }
+
+  it("never overwrites the live document with the bundled seed", async () => {
+    const refused = seatRefused();
+    const res = await POST(req({ modelId: "us.anthropic.claude-opus-5", mode: "api" }));
+    expect(res.status).toBe(202);
+    await settleDetached();
+
+    // Today the read falls back to BUNDLED_REGISTRY with no etag, so the probe's
+    // save goes out WITHOUT IfMatch and replaces the live document wholesale.
+    expect(h.state.objects[MODELS_KEY]).toBe(refused);
+    expect(h.state.puts).toBe(0);
+    expect(warnings()).toContain(
+      "probe.write_refused modelId=us.anthropic.claude-opus-5 mode=api reason=registry_fallback source=seed"
+    );
+  });
+});

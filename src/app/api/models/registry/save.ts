@@ -180,6 +180,14 @@ export async function runSaveSequence(opts: SaveOptions): Promise<NextResponse> 
     );
   }
 
+  // Deliberately NOT `requireLiveRegistry` (TEAM-5052): the probe writer and the
+  // catalog refresh refuse to build on a fallback read, but a human Save/Rollback
+  // of a candidate that just passed validateRegistry above is exactly how an
+  // operator repairs a live document the read gate refuses — the /models banner
+  // says when that is the state. With no ETag (seed fallback) this PUT is
+  // unconditional, which is the point: it replaces the refused document. On a
+  // `cache` fallback the cached ETag is stale, so the PUT 412s into a 409 and
+  // the repair is the reconcile's heal or an `aws s3 cp` of a good document.
   const live = await loadModelsRegistryMeta({ force: true });
   if (live.registry.version !== opts.baseVersion) {
     return NextResponse.json(

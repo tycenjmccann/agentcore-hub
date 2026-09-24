@@ -10,9 +10,11 @@
  * Two guards make "detached" safe:
  *   • an in-flight map keyed `<modelId>#<mode>` refuses a duplicate for 10
  *     minutes — a double-click must not start two CLI sessions;
- *   • the write is read-before-write against the live document with one retry,
- *     because a probe finishing while an operator saves must not clobber the
- *     save (or be clobbered silently by it).
+ *   • the write (`./record.ts`) is read-before-write against the LIVE document,
+ *     serialized per instance and retried with backoff, because a probe
+ *     finishing while an operator saves must not clobber the save (or be
+ *     clobbered silently by it) — and it refuses to write at all when the read
+ *     fell back to the cache or the seed (TEAM-5052).
  *
  * The in-flight map is per-instance. With several hub tasks two probes of the
  * same model can still overlap; they are idempotent (each writes the same field)
@@ -23,23 +25,18 @@
 import { NextResponse } from "next/server";
 import type { NextRequest } from "next/server";
 import { isAdmin } from "@/lib/auth/identity";
-import {
-  MODEL_ID_RE,
-  VersionConflictError,
-  loadModelsRegistryMeta,
-  resolveModel,
-  saveModelsRegistry,
-} from "@/lib/models-registry";
-import type { CatalogRow, ModelsRegistry, ProbeOutcome } from "@/lib/models-registry";
+import { MODEL_ID_RE, loadModelsRegistryMeta, resolveModel } from "@/lib/models-registry";
 import { runApiProbe, runCliProbe } from "@/lib/models/probe";
 import { assertSameOrigin } from "@/lib/models/request-guard";
 import { track } from "./detached";
+import { recordOutcome } from "./record";
+import type { ProbeMode } from "./record";
 
 export const dynamic = "force-dynamic";
 
 const NO_STORE = { headers: { "Cache-Control": "no-store" } } as const;
 
-export type ProbeMode = "api" | "cli";
+export type { ProbeMode };
 const MODES: readonly ProbeMode[] = ["api", "cli"];
 
 /** Long enough to cover a 300s CLI turn plus its teardown, and then some. */
@@ -54,38 +51,6 @@ function claim(key: string): boolean {
   if (started !== undefined && Date.now() - started < IN_FLIGHT_TTL_MS) return false;
   inFlight.set(key, Date.now());
   return true;
-}
-
-/**
- * Write `probe.<mode>` onto the row. Reads the LIVE document first (never the
- * one the request saw), so a probe records a result onto whatever the catalog has
- * become while it ran.
- */
-async function recordOutcome(modelId: string, mode: ProbeMode, outcome: ProbeOutcome): Promise<void> {
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const live = await loadModelsRegistryMeta({ force: true });
-    const next: ModelsRegistry = JSON.parse(JSON.stringify(live.registry)) as ModelsRegistry;
-    const row = next.catalog.find((r: CatalogRow) => r.modelId === modelId);
-    if (!row) {
-      console.warn(`[models] probe.row_gone modelId=${modelId} mode=${mode}`);
-      return;
-    }
-    row.probe = { ...(row.probe || {}), [mode]: outcome };
-    next.version = live.registry.version + 1;
-    next.updatedAt = new Date().toISOString();
-    next.updatedBy = "probe";
-
-    try {
-      await saveModelsRegistry(next, { ifMatch: live.etag });
-      return;
-    } catch (err) {
-      if (err instanceof VersionConflictError && attempt === 0) continue;
-      console.warn(
-        `[models] probe.write_failed modelId=${modelId} mode=${mode} error=${(err as Error)?.message || "error"}`
-      );
-      return;
-    }
-  }
 }
 
 export async function POST(req: NextRequest): Promise<NextResponse> {

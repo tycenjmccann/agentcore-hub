@@ -312,6 +312,28 @@ describe("POST /api/models/catalog", () => {
     expect(res.status).toBe(409);
   });
 
+  it("refresh refuses to save over a fallback registry", async () => {
+    // TEAM-5052: the live document is one the read gate refuses (a row id that
+    // is also another row's alias), so the forced read falls back to the seed.
+    // Merging the sweep into the seed and PUTting it would replace the live
+    // catalog wholesale.
+    const live = clone(SEED);
+    live.version = 2;
+    const owner = live.catalog.find((r) => r.modelId === "us.anthropic.claude-opus-4-6")!;
+    const { harnessLanes: _lanes, ...shape } = clone({ ...live, catalog: [owner] }).catalog[0];
+    live.catalog.push({ ...shape, modelId: "us.anthropic.claude-opus-4-6-v1", aliases: [], status: "candidate" });
+    const refused = JSON.stringify(live);
+    h.state.objects[MODELS_KEY] = refused;
+    h.state.etags[MODELS_KEY] = '"etag-live"';
+    h.state.discovered = { models: sweepOf(live), errors: [] };
+
+    const res = await POST(postReq({ refresh: true }));
+    expect(res.status).toBe(503);
+    expect(await res.json()).toMatchObject({ error: "registry_unavailable", source: "seed" });
+    expect(h.state.puts).toEqual([]);
+    expect(h.state.objects[MODELS_KEY]).toBe(refused);
+  });
+
   it("refuses a non-admin and a body that is not a refresh", async () => {
     seatLive(3);
     process.env.AUTH_MODE = "oidc";

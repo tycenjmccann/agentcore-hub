@@ -877,6 +877,40 @@ describe("loadModelsRegistry", () => {
 });
 
 /**
+ * TEAM-5052. A background writer (probe outcomes, the catalog refresh) must only
+ * build on the live S3 document: the cache's ETag is stale, and the seed has none,
+ * so a PUT on top of either 412s forever or overwrites the live document.
+ */
+describe("requireLiveRegistry", () => {
+  beforeEach(async () => {
+    vi.resetModules();
+    mod = await import("@/lib/models-registry");
+  });
+
+  it("requireLiveRegistry throws for cache and seed, passes s3 with etag", () => {
+    const registry = mod.BUNDLED_REGISTRY;
+    const live = { registry, etag: '"etag-1"', source: "s3" as const };
+    expect(mod.requireLiveRegistry(live)).toBe(live);
+
+    for (const meta of [
+      { registry, etag: '"etag-stale"', source: "cache" as const },
+      { registry, source: "seed" as const },
+      // An s3 read with no ETag cannot be written conditionally either.
+      { registry, source: "s3" as const },
+    ]) {
+      let thrown: unknown;
+      try {
+        mod.requireLiveRegistry(meta);
+      } catch (err) {
+        thrown = err;
+      }
+      expect(thrown).toBeInstanceOf(mod.RegistryFallbackError);
+      expect(thrown).toMatchObject({ code: "registry_unavailable", source: meta.source });
+    }
+  });
+});
+
+/**
  * TEAM-5008 finding 3. `parseModelsRegistry` is tolerant by design (security
  * finding 13: warn, never throw), and the loader used to cache whatever came
  * back. Truncated JSON therefore became an EMPTY registry, cached as last-good
