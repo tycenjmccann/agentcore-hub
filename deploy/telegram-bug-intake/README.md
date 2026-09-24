@@ -270,7 +270,7 @@ which the `nodejs20.x` runtime provides. So a deploy is the zip and nothing else
 
 ```bash
 cd deploy/telegram-bug-intake
-zip function.zip index.mjs cd-registry.mjs
+zip function.zip index.mjs cd-registry.mjs models-registry.mjs
 aws lambda update-function-code \
   --function-name telegram-bug-intake \
   --zip-file fileb://function.zip
