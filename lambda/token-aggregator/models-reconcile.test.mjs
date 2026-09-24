@@ -171,7 +171,7 @@ describe('reconcileModels', () => {
     expect(s).toMatchObject({ outcome: 'failed', reason: 'registry_missing', added: 0 });
     expect(h.puts).toEqual([]);
     expect(h.logs.join('\n')).toContain('reconcile.summary added=0 retired=0 promoted=0 repriced=0 '
-      + 'autoAdopted=0 pinged=0 outcome=failed');
+      + 'autoAdopted=0 pinged=0 routingProtected=0 outcome=failed');
   });
 
   it('adds a newly discovered model as a candidate awaiting a human ping', async () => {
@@ -234,16 +234,31 @@ describe('reconcileModels', () => {
   });
 
   it('retires a vanished row and never deletes it', async () => {
-    const h = harness({ profiles: [], products: {} });
+    // Two Runtime rows vanish from a Runtime plane that answered. Nothing routes
+    // at sonnet-4-9, so it retires; opus-5 is defaults.persona, an agent pin and
+    // tiers.claude.opus, so it is kept and its absence reported (TEAM-5017).
+    const doc = baseDoc();
+    doc.catalog.push({
+      modelId: 'us.anthropic.claude-sonnet-4-9', label: 'Sonnet 4.9', vendor: 'anthropic', family: 'claude-sonnet',
+      endpoint: 'bedrock-runtime', region: 'us-east-1', api: 'converse', status: 'active',
+      price: { input: 3, output: 15, source: 'published' },
+    });
+    const h = harness({ doc, profiles: [], products: {} });
     const s = await reconcileModels({}, h.deps);
-    expect(s).toMatchObject({ outcome: 'ok', retired: 1 });
-    const doc = h.written(MODELS_KEY);
-    expect(doc.catalog).toHaveLength(2);
-    expect(row(doc, 'us.anthropic.claude-opus-5')).toMatchObject({
+    expect(s).toMatchObject({ outcome: 'ok', retired: 1, routingProtected: 1 });
+    const written = h.written(MODELS_KEY);
+    expect(written.catalog).toHaveLength(3);
+    expect(row(written, 'us.anthropic.claude-sonnet-4-9')).toMatchObject({
       status: 'retired', retiredAt: '2026-09-24T03:00:00.000Z',
     });
+    expect(row(written, 'us.anthropic.claude-opus-5').status).toBe('active');
     // The Mantle row survives: its scan succeeded and still lists it.
-    expect(row(doc, 'openai.gpt-5.5').status).toBe('active');
+    expect(row(written, 'openai.gpt-5.5').status).toBe('active');
+    const logs = h.logs.join('\n');
+    expect(logs).toContain('reconcile.retire-skipped modelId=us.anthropic.claude-opus-5 reason=routing_target '
+      + 'paths=defaults.persona,agents.agentcore_hub_backend_dev,tiers.claude.opus');
+    expect(logs).toContain('routingProtected=1 outcome=ok');
+    expect(logs).not.toContain('reconcile.invalid-document');
   });
 
   it('retires nothing when the discovery call for that endpoint failed', async () => {
@@ -681,23 +696,62 @@ describe('reconcileModels', () => {
     expect(h.logs.join('\n')).not.toContain('reconcile.invalid-document');
   });
 
-  it('retires a Mantle row when every region in the sweep answered without it', async () => {
-    // Existing behaviour, preserved: both regions were listed and neither has
-    // it. The row is defaults.codingCodex, so the document the pass writes is
-    // one the fleet refuses — that is the TEAM-5017 hazard, and it must stay
-    // LOUD in the log rather than be smoothed over here.
+  it('never retires a Mantle row the document routes at, even when every region answered without it', async () => {
+    // Both regions were listed and neither has it. The row is
+    // defaults.codingCodex and tiers.codex.sol: retiring it would put `inactive`
+    // on the live document, a fatal read for the hub and every twin (TEAM-5017).
+    // It is kept, and its absence is LOUD instead.
     const h = harness({
       env: TWO_REGIONS,
       mantleByRegion: { 'us-east-2': [], 'us-east-1': [] },
       products: {},
     });
     const s = await reconcileModels({}, h.deps);
-    expect(s).toMatchObject({ outcome: 'ok', retired: 1 });
-    expect(row(h.written(MODELS_KEY), 'openai.gpt-5.5').status).toBe('retired');
+    expect(s).toMatchObject({ outcome: 'ok', retired: 0, routingProtected: 1, changed: false });
+    expect(h.putsFor(MODELS_KEY)).toEqual([]);
+    const stored = JSON.parse(h.store.get(MODELS_KEY).body);
+    expect(row(stored, 'openai.gpt-5.5').status).toBe('active');
+    expect(stored.defaults.codingCodex).toBe('openai.gpt-5.5');
     const logs = h.logs.join('\n');
-    expect(logs).toContain('reconcile.retired modelId=openai.gpt-5.5 reason=not_discovered');
-    expect(logs).toContain('reconcile.invalid-document');
-    expect(logs).toContain('defaults.codingCodex=inactive');
+    expect(logs).toContain('reconcile.retire-skipped modelId=openai.gpt-5.5 reason=routing_target '
+      + 'paths=defaults.codingCodex,tiers.codex.sol');
+    expect(logs).not.toContain('reconcile.retired');
+    expect(logs).not.toContain('reconcile.invalid-document');
+    expect(logs).not.toContain('defaults.codingCodex=inactive');
+  });
+
+  it('never retires a row routed at only through one of its aliases', async () => {
+    // The read verdict resolves a target by id OR alias, so a tier pointing at an
+    // alias of a retired row is exactly as `inactive` as one pointing at its id.
+    const doc = baseDoc();
+    doc.catalog.push({
+      modelId: 'us.anthropic.claude-sonnet-4-9', label: 'Sonnet 4.9', vendor: 'anthropic', family: 'claude-sonnet',
+      endpoint: 'bedrock-runtime', region: 'us-east-1', api: 'converse', status: 'active',
+      aliases: ['claude-sonnet-4-9'],
+      price: { input: 3, output: 15, source: 'published' },
+    });
+    doc.tiers.claude.sonnet = 'claude-sonnet-4-9';
+    const h = harness({ doc, products: {} });
+    const s = await reconcileModels({}, h.deps);
+    expect(s).toMatchObject({ outcome: 'ok', retired: 0, routingProtected: 1, changed: false });
+    expect(h.putsFor(MODELS_KEY)).toEqual([]);
+    expect(row(JSON.parse(h.store.get(MODELS_KEY).body), 'us.anthropic.claude-sonnet-4-9').status).toBe('active');
+    const logs = h.logs.join('\n');
+    expect(logs).toContain('reconcile.retire-skipped modelId=us.anthropic.claude-sonnet-4-9 reason=routing_target '
+      + 'paths=tiers.claude.sonnet');
+    expect(logs).not.toContain('reconcile.invalid-document');
+  });
+
+  it('raises no routing alert for a routed row whose plane failed to answer', async () => {
+    // Protection only matters on a plane that DID answer: a failed scan proves
+    // nothing, so the scanned-plane guard runs first and the row is never even
+    // considered for retirement.
+    const h = harness({ profilesThrow: true, products: {} });
+    const s = await reconcileModels({}, h.deps);
+    expect(s).toMatchObject({ outcome: 'ok', retired: 0, routingProtected: 0 });
+    const logs = h.logs.join('\n');
+    expect(logs).toContain('reconcile.discover-failed endpoint=bedrock-runtime');
+    expect(logs).not.toContain('reconcile.retire-skipped');
   });
 
   it('never retires a Mantle row that records no region', async () => {
@@ -826,14 +880,14 @@ describe('reconcileModels — against the bundled seed', () => {
     expectPricingIntact(h);
   });
 
-  it('refuses to publish pricing from a document it could not validate', async () => {
-    // `defaults.persona` points at a Runtime row, and this time the Runtime plane
-    // IS scanned and comes back without it: the pass retires a current routing
-    // target, so the document it writes is one the fleet will refuse. models.json
-    // still goes out (TEAM-5017 owns whether it should), but pricing.json must
-    // not be re-derived from a document that did not validate.
+  it('never retires the persona default even when its plane answers without it', async () => {
+    // `defaults.persona` points at a Runtime row, and the Runtime plane IS
+    // scanned and comes back without it. Before TEAM-5017 the pass retired it and
+    // wrote a document the fleet refuses; now the row stays, the absence is
+    // reported, and pricing is re-derived from a document that still validates.
     const doc = JSON.parse(JSON.stringify(SEED_MODELS));
     const persona = doc.defaults.persona;
+    const personaStatus = row(doc, persona).status;
     const h = harness({
       doc,
       pricing: SEED_PRICING,
@@ -845,11 +899,35 @@ describe('reconcileModels — against the bundled seed', () => {
     });
     const s = await reconcileModels({}, h.deps);
     expect(s.outcome).toBe('ok');
-    expect(row(h.written(MODELS_KEY), persona).status).toBe('retired');
+    expect(s.retired).toBe(0);
+    expect(s.routingProtected).toBeGreaterThanOrEqual(1);
+    expect(row(JSON.parse(h.store.get(MODELS_KEY).body), persona).status).toBe(personaStatus);
+    const logs = h.logs.join('\n');
+    expect(logs).toMatch(new RegExp(`reconcile\\.retire-skipped modelId=${persona.replace(/[.]/g, '\\.')} `
+      + 'reason=routing_target paths=[^\\n]*defaults\\.persona'));
+    expect(logs).not.toContain('reconcile.invalid-document');
+    expectPricingIntact(h);
+  });
+
+  it('refuses to publish pricing from a document that was already invalid', async () => {
+    // The reconcile no longer MAKES a document invalid by retiring a routing
+    // target, but a hand-edited one can arrive that way: a tier at an id no row
+    // carries is a fatal `unknown_model`. pricing.json must not be re-derived
+    // from it — the last good projection stays in place.
+    const doc = JSON.parse(JSON.stringify(SEED_MODELS));
+    doc.tiers.claude.opus = 'us.anthropic.does-not-exist';
+    const profiles = doc.catalog
+      .filter((r) => (r.endpoint || 'bedrock-runtime') === 'bedrock-runtime'
+        && ['active', 'candidate'].includes(r.status || 'active'))
+      .map((r) => ({ inferenceProfileId: r.modelId, status: 'ACTIVE', inferenceProfileName: r.label }));
+    const mantle = doc.catalog.filter((r) => r.endpoint === 'bedrock-mantle').map((r) => ({ id: r.modelId }));
+    const h = harness({ doc, pricing: SEED_PRICING, profiles, mantle, products: {}, probeCli: async () => ({ ok: false }) });
+    const s = await reconcileModels({}, h.deps);
+    expect(s.outcome).toBe('ok');
     expect(h.putsFor(PRICING_KEY)).toEqual([]);
     const logs = h.logs.join('\n');
     expect(logs).toContain('reconcile.invalid-document');
-    expect(logs).toContain('defaults.persona=inactive');
+    expect(logs).toContain('tiers.claude.opus=unknown_model');
     expect(logs).toContain('pricing.projected skipped reason=invalid_registry');
   });
 });
