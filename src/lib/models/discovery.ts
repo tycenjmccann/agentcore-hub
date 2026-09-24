@@ -17,6 +17,7 @@
 
 import type { CatalogRow, ModelApi, ModelEndpoint, ModelsRegistry, Vendor } from "@/lib/models-registry";
 import { routingTargets } from "@/lib/models-registry";
+import { isDiscoverableModelId, MANTLE_ID_RE, PROFILE_ID_RE } from "./model-id";
 import { mintBedrockBearerToken, signedFetch } from "./sigv4";
 
 export interface DiscoveredModel {
@@ -48,10 +49,6 @@ function assertRegion(region: string): string {
   if (!isSupportedRegion(region)) throw new Error(`unsupported region ${region}`);
   return region;
 }
-
-/** Only ids the two listings can actually return are candidates for retirement. */
-const PROFILE_ID_RE = /^(us|global)\.(anthropic|openai)\.[A-Za-z0-9._:-]+$/;
-const MANTLE_ID_RE = /^openai\.[A-Za-z0-9._:-]+$/;
 
 /** `<base>-YYYYMMDD` with an optional `-vN[:M]` tail — the dated snapshot form. */
 const DATED_ID_RE = /^(.*)-\d{8}(?:-v\d+(?::\d+)?)?$/;
@@ -264,7 +261,7 @@ function candidateRow(m: DiscoveredModel): CatalogRow {
 function retirable(row: CatalogRow, targets: Set<string>): boolean {
   if (row.readOnly) return false;
   if (targets.has(row.modelId)) return false;
-  return PROFILE_ID_RE.test(row.modelId) || MANTLE_ID_RE.test(row.modelId);
+  return isDiscoverableModelId(row.modelId);
 }
 
 /**

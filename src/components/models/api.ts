@@ -141,6 +141,13 @@ export async function rollbackRegistry<T>(baseVersion: number): Promise<ApiResul
 
 // ─── Catalog ────────────────────────────────────────────────────────────────
 
+// There is deliberately no addCatalogRow(): the catalog's only intake is
+// refreshCatalog() below. POST /api/models/catalog refuses any body carrying
+// an `add` key with 400 (TEAM-5011) — a span-derived model id staged as a
+// candidate row was TEAM-4994 finding 9's injection origin, and a heuristic
+// row cannot supply the endpoint/region/api a real one needs. See that
+// route's header for the full rationale.
+
 /**
  * Re-discover models and republish prices. This rewrites the catalog on the
  * server, which is why the page makes the operator save or discard first.
