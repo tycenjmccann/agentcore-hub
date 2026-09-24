@@ -91,9 +91,11 @@ function row(overrides: Partial<CatalogRow> = {}): CatalogRow {
   };
 }
 
-/** A turn reply as the coding runtime serializes it. */
+/** A turn reply as the coding runtime serializes it. Carries the model it ran
+ *  (TEAM-5013); the mismatch tests override it. */
 function turnReply(body: Record<string, unknown>) {
-  return { response: { transformToString: async () => JSON.stringify(body) } };
+  const full = { model: row().modelId, ...body };
+  return { response: { transformToString: async () => JSON.stringify(full) } };
 }
 
 /** A command stream that emits `stdout` then a terminal status. */
@@ -327,7 +329,7 @@ describe("runCliProbe", () => {
   });
 
   it("drives codex for an openai row", async () => {
-    h.handlers.InvokeAgentRuntime = () => turnReply({ workspace: "/mnt/ws" });
+    h.handlers.InvokeAgentRuntime = () => turnReply({ workspace: "/mnt/ws", model: "openai.gpt-5.5" });
     h.handlers.InvokeAgentRuntimeCommand = () => commandStream("ok\n");
     h.handlers.StopRuntimeSession = () => ({});
 
@@ -340,5 +342,35 @@ describe("runCliProbe", () => {
     );
     expect(payload.cli).toBe("codex");
     expect(payload.model).toBe("openai.gpt-5.5");
+    expect(sentKinds()).toContain("InvokeAgentRuntimeCommand");
+  });
+
+  /**
+   * TEAM-5013 (TEAM-5008 finding 5). The runtime substitutes `defaults.coding*`
+   * for an id it cannot resolve, so a turn that did the work on a DIFFERENT
+   * model must not become a green probe.cli for this row.
+   */
+  it("fails without sending a command when the runtime ran a different model", async () => {
+    h.handlers.InvokeAgentRuntime = () =>
+      turnReply({ workspace: "/mnt/ws", model: "us.anthropic.claude-opus-5" });
+    h.handlers.StopRuntimeSession = () => ({});
+
+    const outcome = await runCliProbe(row(), { runtimeArn: RUNTIME_ARN });
+
+    expect(outcome.ok).toBe(false);
+    expect(outcome.error).toContain("us.anthropic.claude-opus-5");
+    expect(outcome.error).toContain("us.anthropic.claude-fable-5-1");
+    expect(sentKinds()).toEqual(["InvokeAgentRuntime", "StopRuntimeSession"]);
+  });
+
+  it("fails without sending a command when the turn result has no model", async () => {
+    // A pre-TEAM-5013 runtime image: nothing proves which model did the work.
+    h.handlers.InvokeAgentRuntime = () => turnReply({ workspace: "/mnt/ws", model: undefined });
+    h.handlers.StopRuntimeSession = () => ({});
+
+    const outcome = await runCliProbe(row(), { runtimeArn: RUNTIME_ARN });
+
+    expect(outcome).toMatchObject({ ok: false, error: "no model in turn result" });
+    expect(sentKinds()).toEqual(["InvokeAgentRuntime", "StopRuntimeSession"]);
   });
 });
