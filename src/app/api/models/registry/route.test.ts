@@ -1,7 +1,10 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from "vitest";
 import { NextRequest } from "next/server";
 import seed from "@/config/models.json";
 import type { CatalogRow, ModelsRegistry, ProbeOutcome } from "@/lib/models-registry";
+import { __resetModelsCaches } from "@/lib/models-registry";
+import { __resetHarnessDetailCache } from "./harness-detail";
+import { GET, POST } from "./route";
 
 /**
  * TEAM-4997 — the registry route. What is worth pinning here is the ORDER and the
@@ -14,26 +17,41 @@ import type { CatalogRow, ModelsRegistry, ProbeOutcome } from "@/lib/models-regi
  * and the write ORDER is observable as `h.state.puts`. Only the two AWS surfaces
  * this route cannot fake — the control plane behind `applyHarnessModels` and the
  * harness lookups in agentcore-sdk — are replaced.
+ *
+ * The route is imported ONCE (TEAM-5028). Isolation between tests is explicit:
+ * `h.state` is re-seeded, and the two module-level caches are emptied through
+ * their own seams. Resetting the module registry per test instead used to hide a
+ * real hazard — models-registry's lazy `await import("@aws-sdk/client-s3")` then
+ * became module-loader work mid-handler, so under load the 5s harness bound was
+ * armed only after this file had already advanced its fake clock past it.
  */
 
-const h = vi.hoisted(() => ({
-  state: {
-    objects: {} as Record<string, string>,
-    etags: {} as Record<string, string>,
-    puts: [] as Array<{ Key: string; Body: string; IfMatch?: string }>,
-    /** key → error name to throw on PutObject. */
-    failPut: {} as Record<string, string>,
-    /** Throw PreconditionFailed for a conditional PUT of the registry. */
-    ifMatchFails: false,
-    apply: [] as Array<{ agentId: string; current: string; status: string; error?: string }>,
-    applyCalls: [] as Array<{ agentIds?: readonly string[] }>,
-    /** harnessId → deployed model. */
-    detail: {} as Record<string, string>,
-    detailCalls: 0,
-    /** Never-resolving getHarnessDetail, to prove the GET is bounded. */
-    hang: false,
-  },
-}));
+const h = vi.hoisted(() => {
+  // models-registry reads ARTIFACT_BUCKET at module load and this file imports
+  // the route statically, so the value has to be in place before the import
+  // graph is evaluated. vi.hoisted is the only code that runs that early.
+  const savedBucket = process.env.ARTIFACT_BUCKET;
+  process.env.ARTIFACT_BUCKET = "test-bucket";
+  return {
+    savedBucket,
+    state: {
+      objects: {} as Record<string, string>,
+      etags: {} as Record<string, string>,
+      puts: [] as Array<{ Key: string; Body: string; IfMatch?: string }>,
+      /** key → error name to throw on PutObject. */
+      failPut: {} as Record<string, string>,
+      /** Throw PreconditionFailed for a conditional PUT of the registry. */
+      ifMatchFails: false,
+      apply: [] as Array<{ agentId: string; current: string; status: string; error?: string }>,
+      applyCalls: [] as Array<{ agentIds?: readonly string[] }>,
+      /** harnessId → deployed model. */
+      detail: {} as Record<string, string>,
+      detailCalls: 0,
+      /** Never-resolving getHarnessDetail, to prove the GET is bounded. */
+      hang: false,
+    },
+  };
+});
 
 vi.mock("@aws-sdk/client-s3", () => ({
   S3Client: class {
@@ -110,14 +128,6 @@ const MODELS_KEY = "config/models.json";
 const PREV_KEY = "config/models.prev.json";
 const PRICING_KEY = "config/pricing.json";
 
-let GET: typeof import("./route").GET;
-let POST: typeof import("./route").POST;
-
-async function load() {
-  vi.resetModules();
-  ({ GET, POST } = await import("./route"));
-}
-
 function clone(reg: ModelsRegistry): ModelsRegistry {
   return JSON.parse(JSON.stringify(reg)) as ModelsRegistry;
 }
@@ -171,10 +181,11 @@ function postReq(body: unknown, headers: Record<string, string> = {}): NextReque
   });
 }
 
-const SAVED = ["ARTIFACT_BUCKET", "AUTH_MODE"] as const;
+/** AUTH_MODE only: `isAdmin` reads it per request, so no module reload is needed. */
+const SAVED = ["AUTH_MODE"] as const;
 const savedEnv: Partial<Record<(typeof SAVED)[number], string | undefined>> = {};
 
-beforeEach(async () => {
+beforeEach(() => {
   h.state.objects = {};
   h.state.etags = {};
   h.state.puts.length = 0;
@@ -186,12 +197,13 @@ beforeEach(async () => {
   h.state.detailCalls = 0;
   h.state.hang = false;
   for (const k of SAVED) savedEnv[k] = process.env[k];
-  // Read at module load by models-registry, so it must be set before the import.
-  process.env.ARTIFACT_BUCKET = "test-bucket";
   process.env.AUTH_MODE = "none";
   vi.spyOn(console, "log").mockImplementation(() => {});
   vi.spyOn(console, "warn").mockImplementation(() => {});
-  await load();
+  // The two module-level caches the route reads through, emptied by their own
+  // seams rather than by reloading the modules that hold them.
+  __resetModelsCaches();
+  __resetHarnessDetailCache();
 });
 
 afterEach(() => {
@@ -201,6 +213,11 @@ afterEach(() => {
   }
   vi.useRealTimers();
   vi.restoreAllMocks();
+});
+
+afterAll(() => {
+  if (h.savedBucket === undefined) delete process.env.ARTIFACT_BUCKET;
+  else process.env.ARTIFACT_BUCKET = h.savedBucket;
 });
 
 describe("GET /api/models/registry", () => {
@@ -272,9 +289,14 @@ describe("GET /api/models/registry", () => {
     vi.useFakeTimers();
 
     const pending = GET(getReq());
-    // The 5s timer is armed several awaits into the handler, so the clock is
-    // advanced in slices rather than one jump that would land before it exists.
-    for (let i = 0; i < 10; i++) await vi.advanceTimersByTimeAsync(1_000);
+    // Everything ahead of the 5s bound is microtask-only, so flushing once is
+    // enough to arm it — and asserting that it IS armed before the clock moves is
+    // the regression itself (TEAM-5028): a lazy import anywhere in that preamble
+    // makes this read 0 instead of hanging the test for its whole timeout.
+    await vi.advanceTimersByTimeAsync(0);
+    expect(vi.getTimerCount()).toBeGreaterThan(0);
+    // One jump, not a loop of slices: the bound exists before time passes.
+    await vi.advanceTimersByTimeAsync(5_001);
     const res = await pending;
 
     expect(res.status).toBe(200);

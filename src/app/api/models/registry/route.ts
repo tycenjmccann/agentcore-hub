@@ -8,11 +8,9 @@
  *   • and what the live harness is actually running (`harnessModel`), which is
  *     the only way a console-vs-deploy divergence becomes visible.
  *
- * The third one talks to AWS, so it is strictly best-effort: cached 60s per
+ * The third one talks to AWS, so it is strictly best-effort — cached 60s per
  * agent, each lookup bounded at 5s, and a miss omits the field rather than
- * failing the page. `getHarnessDetail` never throws but has no timeout of its
- * own (src/lib/agentcore-sdk.ts) — the race is what keeps a hung control-plane
- * call from hanging the whole GET.
+ * failing the page. That lookup and its cache live in ./harness-detail.ts.
  *
  * POST is the save sequence in ./save.ts.
  */
@@ -20,7 +18,7 @@
 import { NextResponse } from "next/server";
 import type { NextRequest } from "next/server";
 import agentsConfig from "@/config/agents.json";
-import { DEFAULT_REGION, getHarnessDetail, discoverAgents } from "@/lib/agentcore-sdk";
+import { DEFAULT_REGION } from "@/lib/agentcore-sdk";
 import { isAdmin } from "@/lib/auth/identity";
 import {
   deployableAgentIds,
@@ -31,58 +29,19 @@ import {
 } from "@/lib/models-registry";
 import type { ModelsRegistry } from "@/lib/models-registry";
 import { assertSameOrigin } from "@/lib/models/request-guard";
+import { harnessModelFor } from "./harness-detail";
 import { NO_STORE, actorFor, runSaveSequence } from "./save";
 
 export const dynamic = "force-dynamic";
 
-/** Same TTL as discoverAgents, so the two caches expire on the same rhythm. */
-const HARNESS_DETAIL_TTL_MS = 60_000;
-/** A control-plane call that has not answered in 5s is not going to help. */
-const HARNESS_DETAIL_TIMEOUT_MS = 5_000;
 /** An `interim` rate older than this is a reminder, not an error. */
 const INTERIM_OVERDUE_DAYS = 14;
-
-/** Positive answers only — a timeout must not be remembered for a minute. */
-const detailCache = new Map<string, { model?: string; at: number }>();
 
 /** Harness agents are the only ones with a deployed model to compare against. */
 function harnessAgentIds(): string[] {
   return (agentsConfig as { agents: Array<{ agentId?: string; type?: string }> }).agents
     .filter((a) => a.type === "harness" && a.agentId)
     .map((a) => a.agentId as string);
-}
-
-function withTimeout<T>(work: Promise<T>, ms: number): Promise<T> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error("timeout")), ms);
-  });
-  return Promise.race([work, timeout]).finally(() => {
-    if (timer) clearTimeout(timer);
-  }) as Promise<T>;
-}
-
-async function harnessModelFor(agentId: string, region: string): Promise<string | undefined> {
-  const key = `${region}#${agentId}`;
-  const hit = detailCache.get(key);
-  if (hit && Date.now() - hit.at < HARNESS_DETAIL_TTL_MS) return hit.model;
-  try {
-    const model = await withTimeout(
-      (async () => {
-        const agents = await discoverAgents(region);
-        const harnessId = agents.find((a) => a.type === "harness" && a.name === agentId)?.id;
-        if (!harnessId) return undefined;
-        return (await getHarnessDetail(harnessId, region)).model;
-      })(),
-      HARNESS_DETAIL_TIMEOUT_MS
-    );
-    if (model) detailCache.set(key, { model, at: Date.now() });
-    return model;
-  } catch (err) {
-    const reason = (err as Error)?.message === "timeout" ? "timeout" : "error";
-    console.warn(`[models] harness.detail_failed agentId=${agentId} reason=${reason}`);
-    return undefined;
-  }
 }
 
 function interimOverdue(reg: ModelsRegistry, now: Date): string[] {

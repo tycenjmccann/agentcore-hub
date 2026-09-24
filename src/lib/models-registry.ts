@@ -23,6 +23,14 @@
  * Core lib: no imports from an optional module. `@/config/agents.json` is
  * shared config, not a module surface, so reading it here keeps that rule.
  *
+ * The S3 client is imported at MODULE SCOPE on purpose (TEAM-5028). This module
+ * is server-only — nothing client-side imports it, that is what
+ * `models-registry-client.ts` is for — so a lazy `await import` inside each
+ * loader bought nothing and cost correctness in tests: after a
+ * `vi.resetModules()` the import is real module-loader work rather than a
+ * microtask, which is enough, under load, for a route's own timeout to be armed
+ * only after a test has advanced its fake clock past it.
+ *
  * RESOLUTION IS TWO LAYERS, deliberately:
  *   `resolveModel`      pure lookup. Returns null for quarantined/retired/
  *                       unknown input and NEVER falls back on its own.
@@ -34,6 +42,7 @@
  * the same question depending on who asked.
  */
 
+import { S3Client, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
 import agentsConfig from "@/config/agents.json";
 import bundledRegistryJson from "@/config/models.json";
 import bundledPricingJson from "@/config/pricing.json";
@@ -1118,7 +1127,6 @@ export async function loadModelsRegistryMeta(opts: { force?: boolean } = {}): Pr
   }
   if (!ARTIFACT_BUCKET) return { registry: BUNDLED_REGISTRY, source: "seed" };
   try {
-    const { S3Client, GetObjectCommand } = await import("@aws-sdk/client-s3");
     const s3 = new S3Client({ region: REGION });
     const obj = await s3.send(new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: MODELS_REGISTRY_KEY }));
     const { registry, warnings } = parseModelsRegistry(await obj.Body!.transformToString());
@@ -1159,7 +1167,6 @@ export async function loadModelsRegistry(opts: { force?: boolean } = {}): Promis
 export async function loadPreviousModelsRegistry(): Promise<ModelsRegistry | null> {
   if (!ARTIFACT_BUCKET) return null;
   try {
-    const { S3Client, GetObjectCommand } = await import("@aws-sdk/client-s3");
     const s3 = new S3Client({ region: REGION });
     const obj = await s3.send(new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: MODELS_PREV_KEY }));
     return parseModelsRegistry(await obj.Body!.transformToString()).registry;
@@ -1180,7 +1187,6 @@ export async function saveModelsRegistry(
   if (!ARTIFACT_BUCKET) throw new Error("ARTIFACT_BUCKET is not set");
   const key = opts.key || MODELS_REGISTRY_KEY;
   const body = JSON.stringify(registry, null, 2) + "\n";
-  const { S3Client, PutObjectCommand } = await import("@aws-sdk/client-s3");
   const s3 = new S3Client({ region: REGION });
   for (let attempt = 0; attempt < CONFLICT_ATTEMPTS; attempt++) {
     try {
@@ -1227,7 +1233,6 @@ export async function loadPricingProjection(opts: { force?: boolean } = {}): Pro
   if (!opts.force && _priceCache && Date.now() - _priceCache.at < TTL_MS) return _priceCache.pricing;
   if (!ARTIFACT_BUCKET) return BUNDLED_PRICING;
   try {
-    const { S3Client, GetObjectCommand } = await import("@aws-sdk/client-s3");
     const s3 = new S3Client({ region: REGION });
     const obj = await s3.send(new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: PRICING_KEY }));
     const parsed = JSON.parse(await obj.Body!.transformToString()) as unknown;
@@ -1248,7 +1253,6 @@ export async function loadPricingProjection(opts: { force?: boolean } = {}): Pro
 export async function savePricingProjection(doc: PricingDoc): Promise<void> {
   if (!ARTIFACT_BUCKET) throw new Error("ARTIFACT_BUCKET is not set");
   const body = JSON.stringify(doc, null, 2) + "\n";
-  const { S3Client, PutObjectCommand } = await import("@aws-sdk/client-s3");
   const s3 = new S3Client({ region: REGION });
   await s3.send(
     new PutObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: PRICING_KEY, Body: body, ContentType: "application/json" })
