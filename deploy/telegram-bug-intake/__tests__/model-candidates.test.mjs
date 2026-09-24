@@ -22,7 +22,7 @@
  *          that legacy Markdown reads as entities, and a rejected send is a
  *          missed ping.
  */
-import { describe, it, expect, beforeEach, afterAll, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from "vitest";
 
 const TG_TOKEN = "111111:test-bot-token";
 const HUB = "https://hub.example.invalid";
@@ -304,6 +304,122 @@ describe("intake model comes from the registry", () => {
     await runScan(mod, net);
     await runScan(mod, net);
     expect(s3.gets.filter((k) => k === MODELS_KEY)).toHaveLength(1);
+  });
+});
+
+// ─── A2. last-good on a refused read (TEAM-5018) ────────────────────────────
+//
+// The sibling of TEAM-5016 finding 3: every OTHER failure direction already
+// kept _modelsRegistry at its last good value, but NoSuchKey/404 reset it to
+// null — discarding a document the container had already read and validated,
+// for the rest of the 60s TTL. That moved intake off the registry pin onto
+// BEDROCK_MODEL_ID/the literal, and made scanModelCandidates() ("if (!reg)
+// return") a total no-op, even though the cached document was perfectly good.
+//
+// A REFUSED read must never demote a document already held, and the TTL must
+// still be re-stamped on the failing read (one GET per TTL, not one per call).
+describe("last-good registry on a refused read (TEAM-5018)", () => {
+  const BASE_TIME = new Date("2026-09-24T00:00:00.000Z").getTime();
+  const PIN = "us.anthropic.claude-opus-6";
+  const FALLBACK = "us.anthropic.claude-sonnet-5";
+
+  const registryDoc = () => doc(
+    [row({ modelId: PIN, status: "candidate" })],
+    { agents: { telegram_intake: PIN } },
+  );
+  const msgUpdate = (n) => ({
+    update_id: n,
+    message: { message_id: n, chat: { id: CHAT }, text: `the save button does nothing (${n})` },
+  });
+
+  /** One handler invocation at wall-clock BASE_TIME + offsetMs. */
+  async function scanAt(mod, offsetMs, netOpts = {}) {
+    vi.setSystemTime(new Date(BASE_TIME + offsetMs));
+    const net = makeNet(makeCtx(), { batches: [[]], ...netOpts });
+    await runScan(mod, net);
+    return net;
+  }
+
+  beforeEach(() => { vi.useFakeTimers(); vi.setSystemTime(new Date(BASE_TIME)); });
+  afterEach(() => { vi.useRealTimers(); });
+
+  it("a 404 after a good load keeps serving the last-good document, and re-stamps the TTL rather than sticking", async () => {
+    const mod = await loadModule({ models: registryDoc(), bedrockModelId: FALLBACK });
+
+    // t=0: a good read. Intake resolves onto the registry pin.
+    await scanAt(mod, 0, { batches: [[msgUpdate(1)]] });
+    expect(bedrock.calls.at(-1)?.modelId).toBe(PIN);
+    expect(s3.gets.filter((k) => k === MODELS_KEY)).toHaveLength(1);
+
+    // t=61s: the TTL has expired, so a fresh read is attempted — and now 404s.
+    // A SECOND read happening at all proves the TTL actually expired; the
+    // intake answer staying on PIN proves the 404 did not discard it.
+    s3.doc = null;
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    await scanAt(mod, 61_000, { batches: [[msgUpdate(2)]] });
+    expect(s3.gets.filter((k) => k === MODELS_KEY)).toHaveLength(2);
+    expect(bedrock.calls.at(-1)?.modelId).toBe(PIN); // NOT FALLBACK
+    // Exactly once — this only runs on an actual (failing) read, which happens
+    // once per TTL window, not once per scan (loadModelsRegistry is called
+    // twice per invocation: intakeModelId() and scanModelCandidates()).
+    expect(warn.mock.calls.map((c) => String(c[0]))
+      .filter((l) => l.includes("registry.fallback"))).toEqual([
+        "[models] registry.fallback reason=missing keeping=last-good",
+      ]);
+    warn.mockRestore();
+
+    // t=122s: the TTL window from t=61s must not have wedged the cache open —
+    // a THIRD read is attempted, still 404s, and PIN still answers.
+    await scanAt(mod, 122_000, { batches: [[msgUpdate(3)]] });
+    expect(s3.gets.filter((k) => k === MODELS_KEY)).toHaveLength(3);
+    expect(bedrock.calls.at(-1)?.modelId).toBe(PIN);
+  });
+
+  it("scanModelCandidates still sees the cached rows across the same 404", async () => {
+    const mod = await loadModule({ models: registryDoc() });
+
+    // t=0: the ping send fails, so the claim is released — proving nothing
+    // about the registry yet (an early `if (!reg) return` would look the same).
+    await scanAt(mod, 0, { batches: [[]], sendFails: 1 });
+    expect(db.deletes).toContain(`model#${PIN}`);
+    expect(claims()).toEqual([]);
+
+    // t=61s: TTL expired, S3 404s. A clean retry either re-pings (registry
+    // still holds the row) or is silently a no-op (registry was nulled) — only
+    // the last-good fix produces the former.
+    s3.doc = null;
+    const net = await scanAt(mod, 61_000, { batches: [[]] });
+    expect(pings(net)).toHaveLength(2); // one per ALLOWED_CHAT_IDS entry
+    expect(claims()).toEqual([`model#${PIN}`]);
+  });
+
+  it.each([
+    ["a non-NoSuchKey S3 error (AccessDenied)", () => { s3.error = "AccessDenied"; }],
+    ["a malformed body", () => { s3.doc = "{not json"; }],
+    ["an invalid document (catalog[] missing)", () => { s3.doc = { version: 1, agents: { telegram_intake: "x.y" } }; }],
+  ])("%s after a good load keeps the last-good pin", async (_label, breakRegistry) => {
+    const mod = await loadModule({ models: registryDoc(), bedrockModelId: FALLBACK });
+    await scanAt(mod, 0, { batches: [[msgUpdate(1)]] });
+    expect(bedrock.calls.at(-1)?.modelId).toBe(PIN);
+
+    breakRegistry();
+    await scanAt(mod, 61_000, { batches: [[msgUpdate(2)]] });
+    expect(bedrock.calls.at(-1)?.modelId).toBe(PIN); // still NOT FALLBACK
+  });
+
+  it("a cold container's first-ever failure still yields no registry (regression guard)", async () => {
+    s3.error = "AccessDenied";
+    const mod = await loadModule({ models: null, bedrockModelId: FALLBACK });
+
+    await scanAt(mod, 0, { batches: [[msgUpdate(1)]] });
+    expect(bedrock.calls.at(-1)?.modelId).toBe(FALLBACK);
+    expect(s3.gets.filter((k) => k === MODELS_KEY)).toHaveLength(1);
+
+    // TTL expiry re-attempts the read (still failing) rather than caching the
+    // absence forever — the fallback answer is unchanged either way.
+    await scanAt(mod, 61_000, { batches: [[msgUpdate(2)]] });
+    expect(bedrock.calls.at(-1)?.modelId).toBe(FALLBACK);
+    expect(s3.gets.filter((k) => k === MODELS_KEY)).toHaveLength(2);
   });
 });
 
