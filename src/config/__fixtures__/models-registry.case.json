@@ -1,5 +1,5 @@
 {
-  "_comment": "Language-neutral contract cases for the model registry (TEAM-4990 / TEAM-4997). src/lib/models-registry.test.ts iterates every case; the Python/Lambda twin imports this same file, so DO NOT change a case's name, input or expected value without updating both sides. `registry` is \"seed\" (src/config/models.json as shipped) or null (no registry available at all); `patch` mutates the seed with explicit typed ops (merge into defaults/tiers/agents/legacyAliases, replace quarantine, append addRows, delete named fields via dropRowFields) rather than dotted paths, because model ids contain dots and a dotted path would be ambiguous. DEVIATIONS from the design table, both deliberate: (1) the four global.anthropic.* ids are CATALOG ROWS, not aliases of the us.* rows - their published rates genuinely differ - so the design's `alias-global` case is `raw-id-global` here and resolves to ITSELF with source \"catalog\"; (2) the two dated-duplicate cases patch the seed (whose sonnet-5 row is already the base id) instead of carrying a hand-written inline document, so the base/dated pair under test is the real one. `source` is a CLOSED enum: \"override\" | \"agents\" | \"defaults\" | \"env\" | \"literal\" are chain steps, emitted only by resolveAgentModel/resolveCodingModel; \"tier\" | \"legacyAlias\" | \"catalog\" | \"passthrough\" are lookup kinds, emitted by resolveModel and carried as `via` on a chain result. An alias hit reports \"catalog\" - the row was found, and how is not the caller's business. There is no \"alias\", \"legacy\", \"agent\", \"default\" or \"quarantine_fallback\".",
+  "_comment": "Language-neutral contract cases for the model registry (TEAM-4990 / TEAM-4997). src/lib/models-registry.test.ts iterates every case; the Python/Lambda twin imports this same file, so DO NOT change a case's name, input or expected value without updating both sides. `registry` is \"seed\" (src/config/models.json as shipped) or null (no registry available at all); `patch` mutates the seed with explicit typed ops (merge into defaults/tiers/agents/legacyAliases, replace quarantine, append addRows, delete named fields via dropRowFields) rather than dotted paths, because model ids contain dots and a dotted path would be ambiguous. DEVIATIONS from the design table, both deliberate: (1) the four global.anthropic.* ids are CATALOG ROWS, not aliases of the us.* rows - their published rates genuinely differ - so the design's `alias-global` case is `raw-id-global` here and resolves to ITSELF with source \"catalog\"; (2) the two dated-duplicate cases patch the seed (whose sonnet-5 row is already the base id) instead of carrying a hand-written inline document, so the base/dated pair under test is the real one. `source` is a CLOSED enum: \"override\" | \"agents\" | \"defaults\" | \"env\" | \"literal\" are chain steps, emitted only by resolveAgentModel/resolveCodingModel; \"tier\" | \"legacyAlias\" | \"catalog\" | \"passthrough\" are lookup kinds, emitted by resolveModel and carried as `via` on a chain result. An alias hit reports \"catalog\" - the row was found, and how is not the caller's business. There is no \"alias\", \"legacy\", \"agent\", \"default\" or \"quarantine_fallback\". For `validate` cases, `expected.readable` is the READ-time verdict (would a loader serve this document?), which tolerates NON_FATAL_READ_REASONS (`unknown_agent`, `unprobed`); when absent it defaults to `expected.ok`, so a document with only fatal errors is unreadable and a clean one is readable.",
   "cases": [
     {
       "name": "tier-claude",
@@ -263,6 +263,64 @@
       "patch": { "defaults": { "persona": "us.anthropic.claude-opus-5; rm -rf /" } },
       "input": { "kind": "validate" },
       "expected": { "ok": false, "errors": { "defaults.persona": "bad_model_id" } }
+    },
+    {
+      "name": "invalid-unprobed-candidate-default",
+      "note": "A candidate routed to with only one green plane is `unprobed` at SAVE time. But that is a point-in-time verdict, so the document is still READABLE (readable:true): a probe that fails AFTER adoption must not revert every reader to env/literal (TEAM-5016 finding 1). Readers assert both: validate reports the field, and the read-time verdict serves the document.",
+      "registry": "seed",
+      "patch": {
+        "addRows": [
+          {
+            "modelId": "us.anthropic.claude-opus-6",
+            "label": "Claude Opus 6",
+            "vendor": "anthropic",
+            "family": "opus",
+            "endpoint": "bedrock-runtime",
+            "region": "us-east-1",
+            "api": "converse",
+            "contextWindow": 200000,
+            "aliases": [],
+            "price": { "input": 5.5, "output": 27.5, "source": "interim", "asOf": "2026-09-24" },
+            "status": "candidate",
+            "probe": {
+              "api": { "ok": true, "at": "2026-09-24T00:00:00Z" },
+              "cli": { "ok": false, "at": "2026-09-24T00:00:00Z", "error": "turn failed" }
+            }
+          }
+        ],
+        "defaults": { "persona": "us.anthropic.claude-opus-6" }
+      },
+      "input": { "kind": "validate" },
+      "expected": { "ok": false, "errors": { "defaults.persona": "unprobed" }, "readable": true }
+    },
+    {
+      "name": "valid-probed-candidate-default",
+      "note": "Both planes green: the candidate is a legal target. The hub then flips it to active on save (activateAdoptedTargets), so a later failed re-probe cannot make it `unprobed` again.",
+      "registry": "seed",
+      "patch": {
+        "addRows": [
+          {
+            "modelId": "us.anthropic.claude-opus-6",
+            "label": "Claude Opus 6",
+            "vendor": "anthropic",
+            "family": "opus",
+            "endpoint": "bedrock-runtime",
+            "region": "us-east-1",
+            "api": "converse",
+            "contextWindow": 200000,
+            "aliases": [],
+            "price": { "input": 5.5, "output": 27.5, "source": "interim", "asOf": "2026-09-24" },
+            "status": "candidate",
+            "probe": {
+              "api": { "ok": true, "at": "2026-09-24T00:00:00Z" },
+              "cli": { "ok": true, "at": "2026-09-24T00:00:00Z", "seconds": 42 }
+            }
+          }
+        ],
+        "defaults": { "persona": "us.anthropic.claude-opus-6" }
+      },
+      "input": { "kind": "validate" },
+      "expected": { "ok": true, "errors": {}, "readable": true }
     },
     {
       "name": "projection-seed",

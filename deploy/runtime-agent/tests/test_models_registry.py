@@ -214,6 +214,9 @@ def test_shared_fixture_cases(case, monkeypatch):
         assert (errors == {}) is expected["ok"], errors
         for field, reason in expected["errors"].items():
             assert errors.get(field) == reason, (field, reason, errors)
+        # The READ-time verdict: a non-None doc is what load_registry serves.
+        # Defaults to `ok` — only NON_FATAL_READ_REASONS make the two differ.
+        assert (_registry is not None) is expected.get("readable", expected["ok"]), (name, errors)
         return
 
     # PARSE, not validate: the fixture's resolve cases are defined over a
@@ -639,8 +642,14 @@ def test_a_routing_target_reports_the_canonical_reason():
         doc = _registry()
         mutate(doc)
         out, _warnings, errors = mr.validate_registry(doc)
-        assert out is None, reason
         assert errors["defaults.persona"] == reason, (reason, errors)
+        # `unprobed` is reported but NOT fatal at read time (NON_FATAL_READ_REASONS):
+        # a routed candidate that failed a re-probe must not drop the whole fleet to
+        # env/literal (TEAM-5016 finding 1). Every other reason refuses the document.
+        if reason in mr.NON_FATAL_READ_REASONS:
+            assert out is not None, reason
+        else:
+            assert out is None, reason
 
 
 def test_a_half_probed_candidate_is_unprobed_on_either_plane():
@@ -653,8 +662,9 @@ def test_a_half_probed_candidate_is_unprobed_on_either_plane():
         doc = _registry()
         doc["models"][0]["status"] = "candidate"
         doc["models"][0]["probe"] = probe
-        _out, _warnings, errors = mr.validate_registry(doc)
+        out, _warnings, errors = mr.validate_registry(doc)
         assert errors["defaults.persona"] == "unprobed", probe
+        assert out is not None, probe   # reported, still readable
     doc = _registry()
     doc["models"][0]["status"] = "candidate"
     doc["models"][0]["probe"] = {"api": {"ok": True}, "cli": {"ok": True}}
@@ -829,7 +839,9 @@ def test_agents_keys_are_checked_against_the_real_roster():
     doc = _registry()
     doc["agents"] = {"not_a_real_agent": "us.anthropic.claude-opus-5"}
     out, _, errors = mr.validate_registry(doc, agents_path=str(roster))
-    assert out is None
+    # Reported, but served: a stale pin for an agent a later deploy removed is not
+    # corruption (NON_FATAL_READ_REASONS, mirror of the hub's registryReadFailure).
+    assert out is not None
     assert errors["agents.not_a_real_agent"] == "unknown_agent"
 
 
@@ -915,6 +927,84 @@ def test_load_registry_on_an_invalid_document(monkeypatch, caplog):
     with caplog.at_level("WARNING"):
         assert mr.load_registry() is None
     assert "registry.fallback reason=invalid" in caplog.text
+
+
+def test_fatal_read_errors_drops_only_the_point_in_time_reasons():
+    errors = {"agents.gone_agent": "unknown_agent", "defaults.persona": "unprobed",
+              "tiers.codex.luna": "unpriced"}
+    assert mr.fatal_read_errors(errors) == {"tiers.codex.luna": "unpriced"}
+    assert mr.fatal_read_errors({}) == {}
+    assert mr.NON_FATAL_READ_REASONS == frozenset({"unknown_agent", "unprobed"})
+
+
+def test_load_registry_serves_a_document_whose_only_fault_is_unprobed(monkeypatch, caplog):
+    # TEAM-5016 finding 1: a routed candidate whose re-probe failed is a state to
+    # fix, not a reason to drop the fleet to env/literal. Reported, and served.
+    doc = _registry()
+    doc["models"][0]["status"] = "candidate"
+    doc["models"][0]["probe"] = {"api": {"ok": True}, "cli": {"ok": False, "error": "turn failed"}}
+    _stub_s3(monkeypatch, json.dumps(doc).encode())
+    with caplog.at_level("INFO"):
+        reg = mr.load_registry()
+    assert reg is not None
+    assert mr.resolve_agent_model(reg, "agentcore_hub_frontend_dev") == "us.anthropic.claude-fable-5-1"
+    assert "registry.error defaults.persona reason=unprobed" in caplog.text
+    assert "registry.fallback reason=invalid" not in caplog.text
+    assert "registry.loaded source=s3" in caplog.text
+
+
+class _MutableBody:
+    """A stub S3 body whose content the test can swap between calls."""
+
+    def __init__(self, body):
+        self.body = body
+
+    def read(self):
+        return self.body
+
+
+def _stub_s3_mutable(monkeypatch, body):
+    holder = _MutableBody(body)
+
+    class _Client:
+        def get_object(self, Bucket, Key):
+            return {"Body": holder, "ETag": '"abc123"'}
+
+    monkeypatch.setenv("ARTIFACT_BUCKET", "bkt")
+    monkeypatch.setitem(sys.modules, "boto3", type("m", (), {"client": staticmethod(lambda *a, **k: _Client())}))
+    return holder
+
+
+def test_load_registry_keeps_the_last_good_document_when_a_cached_read_is_refused(monkeypatch, caplog):
+    # TEAM-5016 finding 2: the TTL cache used to store the refusal (None) and serve
+    # nothing for a whole TTL. Now a refused read keeps the last good document,
+    # as the hub's lastGoodRegistry() does.
+    good = _registry()
+    holder = _stub_s3_mutable(monkeypatch, json.dumps(good).encode())
+    first = mr.load_registry(ttl_seconds=60)
+    assert first is not None and first["version"] == 3
+
+    bad = _registry()
+    bad["defaults"]["persona"] = "gone"
+    holder.body = json.dumps(bad).encode()
+    mr._CACHE["at"] = 0.0          # expire the TTL without sleeping
+    with caplog.at_level("WARNING"):
+        second = mr.load_registry(ttl_seconds=60)
+    assert second is not None and second["version"] == 3
+    assert "registry.fallback reason=invalid" in caplog.text
+    assert "registry.fallback keeping=last-good" in caplog.text
+    # And the TTL was stamped: the next call within the TTL does not re-read.
+    assert mr.load_registry(ttl_seconds=60) is second
+
+
+def test_load_registry_first_refusal_with_no_last_good_still_caches_none(monkeypatch, caplog):
+    bad = _registry()
+    bad["defaults"]["persona"] = "gone"
+    _stub_s3_mutable(monkeypatch, json.dumps(bad).encode())
+    with caplog.at_level("WARNING"):
+        assert mr.load_registry(ttl_seconds=60) is None
+    assert "keeping=last-good" not in caplog.text
+    assert mr._CACHE["doc"] is None
 
 
 def test_load_registry_swallows_an_s3_error(monkeypatch, caplog):

@@ -165,6 +165,9 @@ def test_shared_fixture_cases(case, monkeypatch):
         assert (errors == {}) is expected["ok"], errors
         for field, reason in expected["errors"].items():
             assert errors.get(field) == reason, (field, reason, errors)
+        # The READ-time verdict: a non-None doc is what load_registry serves.
+        # Defaults to `ok` — only NON_FATAL_READ_REASONS make the two differ.
+        assert (_registry is not None) is expected.get("readable", expected["ok"]), (name, errors)
         return
 
     # PARSE, not validate: the fixture's resolve cases are defined over a

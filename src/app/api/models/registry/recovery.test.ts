@@ -248,6 +248,47 @@ describe("POST /api/models/registry/rollback", () => {
     expect(body.registry.agents.agentcore_hub_workflow_manager).toBe("us.anthropic.claude-opus-5-5");
   });
 
+  /**
+   * TEAM-5016 finding 1. prev can hold a routed `candidate` (adopted through the
+   * API before the server flipped status itself) whose re-probe has since
+   * failed. `validateRegistry` says `unprobed`; as a rollback that must not
+   * matter — a document that was once live is always restorable — so the save
+   * sequence judges a rollback by the READ-time verdict and activates the row.
+   */
+  it("restores a prev document whose routed candidate has since failed a probe", async () => {
+    seatLive(7);
+    const prev = clone(SEED);
+    prev.version = 6;
+    prev.catalog.push({
+      modelId: "us.anthropic.claude-opus-6",
+      label: "Claude Opus 6",
+      vendor: "anthropic",
+      family: "opus",
+      endpoint: "bedrock-runtime",
+      region: "us-east-1",
+      api: "converse",
+      contextWindow: 200_000,
+      aliases: [],
+      price: { input: 5.5, output: 27.5, source: "interim", asOf: "2026-09-24" },
+      status: "candidate",
+      probe: {
+        api: { ok: true, at: "2026-09-24T00:00:00Z" },
+        cli: { ok: false, at: "2026-09-24T01:00:00Z", error: "turn failed" },
+      },
+    });
+    prev.agents.agentcore_hub_workflow_manager = "us.anthropic.claude-opus-6";
+    h.state.objects[PREV_KEY] = JSON.stringify(prev);
+
+    const res = await rollback(req("rollback", { baseVersion: 7 }));
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.registry.agents.agentcore_hub_workflow_manager).toBe("us.anthropic.claude-opus-6");
+    expect(body.registry.catalog.find((r: { modelId: string }) => r.modelId === "us.anthropic.claude-opus-6").status).toBe(
+      "active"
+    );
+    expect(h.state.puts.map((p) => p.Key)).toEqual([PREV_KEY, MODELS_KEY, PRICING_KEY]);
+  });
+
   it("409s when the operator's page is behind the live document", async () => {
     seatLive(9);
     seatPrev(6);

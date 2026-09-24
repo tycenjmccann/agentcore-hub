@@ -6,8 +6,9 @@ import type { ModelsRegistry, ProbeOutcome } from "@/lib/models-registry";
 /**
  * TEAM-4997 — the probe route. It accepts work and answers 202, so the tests
  * assert both halves: the immediate response, and the row the DETACHED run
- * eventually writes (awaited with vi.waitFor, since nothing in the response
- * depends on it).
+ * eventually writes (awaited through the `settleDetached` seam in ./detached.ts,
+ * since nothing in the response depends on it — TEAM-5016 finding 7 retired the
+ * `vi.waitFor` poll and its implicit timeout).
  *
  * The three refusals are the interesting ones: an id that is not a model id
  * never reaches the catalog, an unknown model is a 404 rather than a probe of
@@ -86,10 +87,13 @@ const SEED = seed as unknown as ModelsRegistry;
 const MODELS_KEY = "config/models.json";
 
 let POST: typeof import("./route").POST;
+let settleDetached: typeof import("./detached").settleDetached;
 
 async function load() {
   vi.resetModules();
   ({ POST } = await import("./route"));
+  // Same module registry as the route, or the seam would track a different Set.
+  ({ settleDetached } = await import("./detached"));
 }
 
 function seatLive(version = 5): ModelsRegistry {
@@ -155,7 +159,8 @@ describe("POST /api/models/probe", () => {
       pollAfterMs: 15_000,
     });
 
-    await vi.waitFor(() => expect(h.state.puts).toHaveLength(1));
+    await settleDetached();
+    expect(h.state.puts).toHaveLength(1);
     expect(h.state.apiCalls).toEqual(["us.anthropic.claude-opus-5"]);
     expect(savedRow("us.anthropic.claude-opus-5").probe?.api).toEqual({
       ok: true,
@@ -176,7 +181,8 @@ describe("POST /api/models/probe", () => {
     h.state.objects[MODELS_KEY] = JSON.stringify(live);
 
     await POST(req({ modelId: "us.anthropic.claude-opus-5", mode: "cli" }));
-    await vi.waitFor(() => expect(h.state.puts).toHaveLength(1));
+    await settleDetached();
+    expect(h.state.puts).toHaveLength(1);
 
     const probe = savedRow("us.anthropic.claude-opus-5").probe!;
     expect(probe.api?.at).toBe("2026-01-01T00:00:00Z");
@@ -190,7 +196,8 @@ describe("POST /api/models/probe", () => {
     h.state.outcome = { ok: false, at: "2026-09-24T12:00:00Z", error: "HTTP 400" };
 
     await POST(req({ modelId: "us.anthropic.claude-opus-5", mode: "api" }));
-    await vi.waitFor(() => expect(h.state.puts).toHaveLength(1));
+    await settleDetached();
+    expect(h.state.puts).toHaveLength(1);
 
     expect(savedRow("us.anthropic.claude-opus-5").probe?.api).toEqual({
       ok: false,
@@ -204,7 +211,8 @@ describe("POST /api/models/probe", () => {
     h.state.conditionalFailures = 1;
 
     await POST(req({ modelId: "us.anthropic.claude-opus-5", mode: "api" }));
-    await vi.waitFor(() => expect(h.state.puts).toHaveLength(1));
+    await settleDetached();
+    expect(h.state.puts).toHaveLength(1);
     expect(savedRow("us.anthropic.claude-opus-5").probe?.api?.ok).toBe(true);
   });
 
@@ -246,7 +254,8 @@ describe("POST /api/models/probe", () => {
     expect((await POST(req({ modelId: "us.anthropic.claude-opus-5", mode: "cli" }))).status).toBe(202);
 
     release();
-    await vi.waitFor(() => expect(h.state.puts.length).toBeGreaterThanOrEqual(2));
+    await settleDetached();
+    expect(h.state.puts.length).toBeGreaterThanOrEqual(2);
     h.state.gate = null;
     expect((await POST(req({ modelId: "us.anthropic.claude-opus-5", mode: "api" }))).status).toBe(202);
   });
@@ -303,7 +312,8 @@ describe("POST /api/models/probe", () => {
 
     expect((await POST(req({ modelId: "us.anthropic.claude-opus-5-5", mode: "cli" }))).status).toBe(202);
     expect((await POST(req({ modelId: "us.anthropic.claude-opus-5", mode: "api" }))).status).toBe(202);
-    await vi.waitFor(() => expect(h.state.puts.length).toBeGreaterThanOrEqual(2));
+    await settleDetached();
+    expect(h.state.puts.length).toBeGreaterThanOrEqual(2);
     expect(h.state.cliCalls).toEqual(["us.anthropic.claude-opus-5-5"]);
     expect(h.state.apiCalls).toEqual(["us.anthropic.claude-opus-5"]);
   });

@@ -250,6 +250,20 @@ describe("intake model comes from the registry", () => {
     ))).toBe("us.anthropic.claude-haiku-6");
   });
 
+  it("serves a routed candidate whose re-probe failed — reported, not refused (TEAM-5016 F1)", async () => {
+    // `unprobed` is a point-in-time verdict: refusing the document would move
+    // intake back onto the literal for a whole TTL. validateRegistry still names
+    // the field; the loader serves the document.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    expect(await classifyWith(doc(
+      [row({ modelId: "us.anthropic.claude-sonnet-6", status: "candidate", notify: undefined,
+             probe: { api: { ok: true }, cli: { ok: false, error: "turn failed" } } })],
+      { agents: { telegram_intake: "us.anthropic.claude-sonnet-6" } },
+    ))).toBe("us.anthropic.claude-sonnet-6");
+    expect(warn.mock.calls.map((c) => String(c[0])).some((l) => l.includes("registry.tolerated agents.telegram_intake=unprobed"))).toBe(true);
+    warn.mockRestore();
+  });
+
   it("never resolves onto a retired row — it falls through to the tail", async () => {
     expect(await classifyWith(
       doc([row({ modelId: "us.anthropic.claude-opus-old", status: "retired", notify: undefined })],

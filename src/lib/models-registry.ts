@@ -899,6 +899,28 @@ export function adoptionErrors(live: ModelsRegistry, next: ModelsRegistry): Reco
   return errors;
 }
 
+/**
+ * Adoption IS the transition to `active` (TEAM-5016 finding 1). A row pointed at
+ * by `defaults` / `tiers` / `agents` — the same set `adoptionErrors` judges — is
+ * being routed to, so it must not stay `candidate`: a candidate that later fails
+ * a re-probe reads as `unprobed`, and before this the save path relied on the
+ * console flipping the status client-side (`adopt()` on /models), which an API
+ * caller could simply not do. Returns the document with every routed candidate
+ * made active, plus the ids flipped, for the audit line. Pure; no I/O.
+ */
+export function activateAdoptedTargets(reg: ModelsRegistry): { registry: ModelsRegistry; activated: string[] } {
+  const next: ModelsRegistry = JSON.parse(JSON.stringify(reg)) as ModelsRegistry;
+  const index = indexRegistry(next);
+  const targets = new Set(routingEntries(next, index).values());
+  const activated: string[] = [];
+  for (const row of next.catalog) {
+    if (row.status !== "candidate" || !targets.has(row.modelId)) continue;
+    row.status = "active";
+    activated.push(row.modelId);
+  }
+  return { registry: next, activated };
+}
+
 // ---------------------------------------------------------------------------
 // Pricing projection
 // ---------------------------------------------------------------------------
@@ -1046,30 +1068,49 @@ function lastGoodRegistry(): RegistryMeta {
 }
 
 /**
+ * The READ-time verdict's tolerance list — mirrored as `NON_FATAL_READ_REASONS` /
+ * `fatal_read_errors()` in deploy/runtime-agent/models_registry.py and
+ * `fatalReadErrors()` in lambda/token-aggregator/models-registry.mjs. These
+ * reasons describe a point in time, not a broken document:
+ *   • `unknown_agent` — the live document pins an agent a later deploy removed
+ *     from `agents.json`;
+ *   • `unprobed` — a routed candidate whose probe was re-run and FAILED after it
+ *     was adopted (adoption itself is gated at save time, by `adoptionErrors`).
+ * Refusing the whole document for either would revert ALL routing to the seed —
+ * a worse failure than the one being reported (TEAM-5016 finding 1). The
+ * SAVE-time verdict (`validateRegistry` in `runSaveSequence`) still refuses both.
+ */
+export const NON_FATAL_READ_REASONS: ReadonlySet<string> = new Set(["unknown_agent", "unprobed"]);
+
+/** The subset of a `validateRegistry()` error map that makes a document unservable. */
+export function fatalReadErrors(errors: Record<string, string>): Record<string, string> {
+  return Object.fromEntries(Object.entries(errors).filter(([, reason]) => !NON_FATAL_READ_REASONS.has(reason)));
+}
+
+/**
  * Is a document we just read fit to serve? `parseModelsRegistry` is deliberately
  * TOLERANT — it warns and returns an EMPTY registry rather than throwing — so the
  * loader has to re-read the verdict, or truncated JSON becomes a registry with no
  * models and every agent silently routes off `LITERAL_PERSONA_DEFAULT`
- * (TEAM-5008 finding 3).
- *
- * `unknown_agent` is excluded on purpose: it only means the live document pins an
- * agent that a later deploy removed from `agents.json`. Treating a stale roster
- * as corruption would revert ALL routing to the seed — a worse failure than the
- * one this check exists to prevent.
+ * (TEAM-5008 finding 3). Only `fatalReadErrors` count — see
+ * `NON_FATAL_READ_REASONS` for why a stale pin or a failed re-probe is not
+ * corruption.
  */
 function registryReadFailure(registry: ModelsRegistry, warnings: readonly ParseWarning[]): string | null {
   const structural = warnings.find((w) => w.reason === "invalid_json" || w.reason === "not_an_object");
   if (structural) return structural.reason;
   if (!registry.catalog.length) return "empty_catalog";
-  const fatal = Object.entries(validateRegistry(registry).errors).filter(([, reason]) => reason !== "unknown_agent");
+  const fatal = Object.entries(fatalReadErrors(validateRegistry(registry).errors));
   if (fatal.length) return fatal.map(([field, reason]) => `${field}=${reason}`).slice(0, 3).join(" ");
   return null;
 }
 
 /**
  * Live document with a 60s TTL, the bundled seed when S3 has no copy yet, and
- * last-good on any read/parse failure. A missing key seeds rather than empties:
- * a registry with no models is not a state the app can serve.
+ * last-good on any read/parse failure — a missing key included: a 404 seeds only
+ * when nothing is cached, and otherwise keeps the cached copy like every other
+ * failure (TEAM-5016 finding 3). A registry with no models is not a state the
+ * app can serve.
  */
 export async function loadModelsRegistryMeta(opts: { force?: boolean } = {}): Promise<RegistryMeta> {
   if (!opts.force && _regCache && Date.now() - _regCache.at < TTL_MS) {
@@ -1095,9 +1136,8 @@ export async function loadModelsRegistryMeta(opts: { force?: boolean } = {}): Pr
     return { registry, etag: obj.ETag, source: "s3" };
   } catch (err) {
     if (isNotFound(err)) {
-      _regCache = { registry: BUNDLED_REGISTRY, at: Date.now() };
       console.log("[models] registry.fallback reason=missing");
-      return { registry: BUNDLED_REGISTRY, source: "seed" };
+      return lastGoodRegistry(); // seed only when nothing is cached
     }
     const reason = (err as Error)?.name || "error";
     console.warn(`[models] registry.fallback reason=${reason}`);

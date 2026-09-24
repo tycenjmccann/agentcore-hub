@@ -90,6 +90,20 @@ CODEX_DEFAULT_PROJECT = "default"
 # roster row — but it does pick a model, so it needs a pin.
 EXEMPT_AGENTS = ("telegram_intake",)
 
+# The READ-time verdict's tolerance list — mirror of NON_FATAL_READ_REASONS /
+# fatalReadErrors() in src/lib/models-registry.ts. These reasons describe a point
+# in time, not a broken document: `unknown_agent` is a pin for an agent a later
+# deploy removed from agents.json; `unprobed` is a routed candidate whose probe
+# was re-run and FAILED after it was adopted (adoption is gated by the hub at
+# save time). Refusing the whole document for either reverts ALL routing to
+# env/literal — a worse failure than the one being reported (TEAM-5016 finding 1).
+NON_FATAL_READ_REASONS = frozenset({"unknown_agent", "unprobed"})
+
+
+def fatal_read_errors(errors):
+    """The subset of a validate_registry() error map that makes a document unservable."""
+    return {path: reason for path, reason in errors.items() if reason not in NON_FATAL_READ_REASONS}
+
 _RESOLVABLE_STATUSES = ("active", "candidate")
 _REGISTRY_KEY = "config/models.json"
 
@@ -163,11 +177,13 @@ def validate_registry(doc, agents_path=None):
     Returns `(doc_or_None, warnings, errors)`, where `errors` is a
     `{field path: reason}` map in the SAME vocabulary as validateRegistry() in
     src/lib/models-registry.ts — `bad_model_id`, `quarantined`, `unknown_model`,
-    `read_only`, `inactive`, `unpriced`, `unprobed`, `duplicate_alias`. The hub
+    `read_only`, `inactive`, `unpriced`, `unprobed`, `duplicate_alias`,
+    `unknown_agent`. `doc` is None only when a FATAL error is present; `errors`
+    may be non-empty on a served document (see NON_FATAL_READ_REASONS). The hub
     calls that function on its READ path (`registryReadFailure`) and falls back
-    to last-good/seed on any of those reasons, so a twin that keeps serving a
-    document the hub refuses IS the divergence DL-033 exists to prevent. Same
-    reasons, same paths, same verdict.
+    to last-good/seed on exactly the fatal reasons, so a twin that keeps serving
+    a document the hub refuses — or refuses one the hub serves — IS the
+    divergence DL-033 exists to prevent. Same reasons, same paths, same verdict.
 
     A malformed ROW is dropped with a warning — one bad candidate must not take
     the fleet down. But a document whose `defaults`, `tiers`, `agents` or
@@ -233,7 +249,7 @@ def validate_registry(doc, agents_path=None):
             if agent_id not in roster and agent_id not in EXEMPT_AGENTS:
                 errors[f"agents.{agent_id}"] = "unknown_agent"
 
-    if errors:
+    if fatal_read_errors(errors):
         return None, warnings, errors
     return normalized, warnings, errors
 
@@ -459,8 +475,10 @@ def load_registry(ttl_seconds=0, agents_path=None):
     without a redeploy. It is one small GET per run that resolves a model.
 
     Never raises. Every failure path logs `[models] registry.fallback reason=…`
-    and returns None, which every resolver below treats as "no tiers, no
-    aliases, no catalog" so the env/literal chain still produces an answer.
+    and returns None — or, with `ttl_seconds > 0` and a good document already
+    cached, that last good document — which every resolver below treats as "no
+    tiers, no aliases, no catalog" so the env/literal chain still produces an
+    answer.
     """
     import time
     if ttl_seconds > 0 and _CACHE["doc"] is not _UNSET and (time.time() - _CACHE["at"]) < ttl_seconds:
@@ -480,11 +498,12 @@ def load_registry(ttl_seconds=0, agents_path=None):
             doc, warnings, errors = validate_registry(raw, agents_path)
             for w in warnings:
                 logger.info(f"[models] registry.warn {w}")
-            if errors:
-                for path, reason in sorted(errors.items()):
-                    logger.warning(f"[models] registry.error {path} reason={reason}")
+            # Every error is logged, tolerated ones included: a served document
+            # with a failed re-probe on a routed row is a state to fix, not hide.
+            for path, reason in sorted(errors.items()):
+                logger.warning(f"[models] registry.error {path} reason={reason}")
+            if doc is None:
                 logger.warning("[models] registry.fallback reason=invalid")
-                doc = None
             else:
                 logger.info(
                     f"[models] registry.loaded source=s3 version={doc.get('version', 0)} "
@@ -498,7 +517,14 @@ def load_registry(ttl_seconds=0, agents_path=None):
             doc = None
 
     if ttl_seconds > 0:
-        _CACHE["doc"] = doc
+        if doc is None and isinstance(_CACHE["doc"], dict):
+            # A refused read keeps the LAST GOOD document, as the hub's
+            # lastGoodRegistry() does; the TTL is still stamped so a persistent
+            # failure costs one GET per TTL, not one per call (TEAM-5016 finding 2).
+            logger.warning("[models] registry.fallback keeping=last-good")
+            doc = _CACHE["doc"]
+        else:
+            _CACHE["doc"] = doc
         _CACHE["at"] = time.time()
     return doc
 

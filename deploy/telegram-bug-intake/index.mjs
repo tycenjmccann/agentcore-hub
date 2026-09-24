@@ -3842,6 +3842,10 @@ async function loadModelsRegistry() {
     }
     const first = !_modelsRegistryLoadedAt;
     _modelsRegistry = registry;
+    // A served document may still carry NON_FATAL_READ_REASONS (a routed candidate
+    // that failed a re-probe, a stale agent pin): visible, never fatal.
+    const tolerated = Object.entries(errors).map(([path, reason]) => `${path}=${reason}`);
+    if (tolerated.length) console.warn(`[models] registry.tolerated ${tolerated.join("; ")}`);
     if (first) {
       console.log(`[models] registry.loaded source=s3 version=${registry.version} rows=${registry.models.length}`);
     }

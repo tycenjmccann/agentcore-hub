@@ -11,6 +11,9 @@
  *   3. compare    — a stale `baseVersion` is a 409 before anything is written
  *   3b. adoption  — a NEW routing target must carry two green probes (DD6); a
  *                   target the live document already pointed at is grandfathered
+ *   3c. activate  — every routed `candidate` row becomes `active`: adoption IS
+ *                   the transition, and a routed candidate that later fails a
+ *                   re-probe would read as `unprobed` (TEAM-5016 finding 1)
  *   4. prev       — only when ROUTING changed, so a rollback target is meaningful
  *   5. models     — conditional PUT; 412/409 is a 409, anything else a 503
  *   6. pricing    — projected from what we just saved; a failure is a 207, not
@@ -29,7 +32,9 @@ import {
   BUNDLED_REGISTRY,
   MODELS_PREV_KEY,
   VersionConflictError,
+  activateAdoptedTargets,
   adoptionErrors,
+  fatalReadErrors,
   loadModelsRegistryMeta,
   loadPricingProjection,
   pricingProjection,
@@ -153,7 +158,10 @@ export interface SaveOptions {
    * DD6's adoption gate (step 3b). Off ONLY for a rollback: every routing target
    * in the previous document was live routing when that document was written, so
    * restoring it adopts nothing — and a gate that could refuse a rollback would
-   * take away the operator's recovery path exactly when they need it.
+   * take away the operator's recovery path exactly when they need it. For the
+   * same reason step 2 then judges the document by the READ-time verdict
+   * (`fatalReadErrors`): a document that was once live must always be restorable,
+   * even if a routed candidate has failed a re-probe since (TEAM-5016 finding 1).
    */
   adoptionGate?: boolean;
   now?: Date;
@@ -164,9 +172,10 @@ export async function runSaveSequence(opts: SaveOptions): Promise<NextResponse> 
   const candidate = applySeedOwnedFields(opts.candidate);
 
   const verdict = validateRegistry(candidate);
-  if (!verdict.ok) {
+  const blocking = opts.adoptionGate === false ? fatalReadErrors(verdict.errors) : verdict.errors;
+  if (Object.keys(blocking).length) {
     return NextResponse.json(
-      { error: "invalid_registry", fields: verdict.errors, warnings: verdict.warnings },
+      { error: "invalid_registry", fields: blocking, warnings: verdict.warnings },
       { status: 422, ...NO_STORE }
     );
   }
@@ -198,9 +207,14 @@ export async function runSaveSequence(opts: SaveOptions): Promise<NextResponse> 
     }
   }
 
-  const changed = changedFields(live.registry, candidate);
+  // 3c. Activate: a routed candidate becomes active. Runs for a rollback too —
+  // the restored routing is live routing, whatever a later probe said.
+  const { registry: adopted, activated } = activateAdoptedTargets(candidate);
+  if (activated.length) console.log(`[models] registry.adopted modelIds=[${activated.join(",")}]`);
+
+  const changed = changedFields(live.registry, adopted);
   const next: ModelsRegistry = {
-    ...candidate,
+    ...adopted,
     version: live.registry.version + 1,
     updatedAt: (opts.now ?? new Date()).toISOString(),
     updatedBy: opts.actor,

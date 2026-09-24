@@ -108,8 +108,9 @@ async function resolveDefaultModelId(agentId, doc) {
   let resolveAgentModel;
   let validateRegistry;
   try {
-    // TEAM-4997 authors the canonical loader. Until it lands on main this throws
-    // ERR_MODULE_NOT_FOUND, which is a fallback, not a failure.
+    // The canonical resolver (byte-copied to the token-aggregator and Telegram
+    // bridge Lambdas, scripts/check-models-registry-parity.sh). A checkout without
+    // it throws ERR_MODULE_NOT_FOUND, which is a fallback, not a failure.
     ({ resolveAgentModel, validateRegistry } =
       await import(new URL("../src/lib/models/models-registry.mjs", import.meta.url).href));
   } catch (err) {
