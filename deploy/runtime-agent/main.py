@@ -3056,7 +3056,8 @@ def _ensure_codex_config(model: str = "") -> tuple[str, str | None]:
     attached, so it is kept correct (both endpoints) but deliberately minimal:
     the canonical, fully-merged config generator is the coding runtime's.
     """
-    model_id, endpoint, region, _api, _ctx = resolve_coding_model(load_registry(), model, "codex")
+    model_id, endpoint, region, _api, context_window = resolve_coding_model(
+        load_registry(), model, "codex")
     codex_home = os.path.join(os.environ.get("HOME", "/tmp"), ".codex")
     os.makedirs(codex_home, exist_ok=True)
     mantle = endpoint == "bedrock-mantle"
@@ -3067,8 +3068,14 @@ def _ensure_codex_config(model: str = "") -> tuple[str, str | None]:
     # [table] header becomes a key OF that table. web_search is top-level and
     # must be explicit on Bedrock Runtime: --yolo otherwise defaults it to
     # "live", which that endpoint does not serve, and the turn fails.
+    # Same key order and values the canonical generator emits
+    # (deploy/coding-agent-runtime/merge-codex-config.py), so the two paths write
+    # the same provider — codex has no built-in metadata for these ids and warns
+    # its way into conservative defaults when the limits are missing.
     lines = [f'model = {json.dumps(model_id)}',
-             f'model_provider = {json.dumps(endpoint)}']
+             f'model_provider = {json.dumps(endpoint)}',
+             f'model_context_window = {context_window}',
+             'model_max_output_tokens = 128000']
     if not mantle:
         lines.append('web_search = "disabled"')
     lines += ['',
