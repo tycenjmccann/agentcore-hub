@@ -2995,7 +2995,7 @@ def _codex_resume_id(thread_id: str | None, model_id: str,
     old = _codex_thread_model(thread_id)
     if old and old != model_id:
         logger.info("codex_model_changed",
-                    extra={"thread": thread_id, "old_model": old, "new_model": model_id})
+                    extra={"thread_id": thread_id, "old_model": old, "new_model": model_id})
         return None
     return thread_id
 

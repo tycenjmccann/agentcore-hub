@@ -25,7 +25,6 @@ Run: python3 -m pytest deploy/coding-agent-runtime/test_codex_model_switch.py -v
 import importlib.util
 import json
 import os
-import subprocess
 import sys
 import tempfile
 import types
@@ -39,9 +38,21 @@ _TMP = tempfile.mkdtemp(prefix="coding-model-switch-")
 SOL = "us.openai.gpt-6-sol"
 TERRA = "us.openai.gpt-6-terra"
 TIERS = {"sol": SOL, "terra": TERRA}
-# main.subprocess IS the subprocess module, so patching main.subprocess.run
-# patches it globally: the fake CLI runs the merger through the real one.
-_REAL_RUN = subprocess.run
+
+
+def _load_merger():
+    """Load merge-codex-config.py's main() directly (hyphenated filename, no
+    plain import). Called IN-PROCESS, not shelled out: the tests below patch
+    subprocess.run/Popen globally to fake the codex CLI, and a real subprocess
+    call from inside this helper would recurse into that same fake."""
+    spec = importlib.util.spec_from_file_location(
+        "merge_codex_config_for_test", _HERE / "merge-codex-config.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_MERGER = _load_merger()
 
 
 def _load_main(module_name: str, env_overrides: dict | None = None):
@@ -84,14 +95,18 @@ class FakeCodex:
 
     def _run(self, args, env) -> str:
         self.calls.append(list(args))
-        codex_home = env.get("CODEX_HOME") or main.CODEX_HOME
-        os.makedirs(codex_home, exist_ok=True)
-        _REAL_RUN(
-            [sys.executable, str(_HERE / "merge-codex-config.py"),
-             os.path.join(codex_home, "config.toml"), env["CODEX_MODEL"],
-             env["CODEX_BASE_URL"], env["CODEX_ENDPOINT"], "",
-             env["CODEX_CONTEXT_WINDOW"]],
-            check=True)
+        # main.py's own subprocess env is a raw `{**os.environ, ...}` copy — it
+        # never overrides CODEX_HOME itself, relying on the container's ambient
+        # value matching the module constant. The dev sandbox this runs in
+        # happens to have an ambient CODEX_HOME of its own, so anchor on the
+        # module constant (also where the rollout fixtures below are written)
+        # rather than trust env["CODEX_HOME"] and go stale against a real one.
+        os.makedirs(main.CODEX_HOME, exist_ok=True)
+        rc = _MERGER.main([
+            os.path.join(main.CODEX_HOME, "config.toml"), env["CODEX_MODEL"],
+            env["CODEX_BASE_URL"], env["CODEX_ENDPOINT"], "",
+            env["CODEX_CONTEXT_WINDOW"]])
+        assert rc == 0, f"merge-codex-config.py failed (rc={rc})"
         if len(args) > 2:
             tid = args[2]
         else:
