@@ -125,10 +125,11 @@ ALLOW=(
   # Judge/evaluator configs: AgentCore evaluation resources, created by hand from
   # these documents; the registry does not own evaluation judges.
   'deploy/evaluations/'
-  # The builder harness's prompt copy — a create_harness example and the list of
-  # models it may pin. Superseded when harness-models.json comes from the registry.
-  # TEMP TEAM-4997: removed when their PR lands.
-  'deploy/setup-builder-agent.mjs:/modelId": "|^  - .*(Fast, good|Most capable|Fastest, cheapest)/'
+  # The builder's prompt copy is now generated: the create_harness example prints
+  # the resolved MODEL_ID and the "models you may pin" bullets are a projection of
+  # the catalog (pinnableModelsCopy). What is left is the tail it falls back to
+  # when config/models.json is unreadable — a named constant, like LITERAL_MODEL_ID.
+  'deploy/setup-builder-agent.mjs:/^const LITERAL_PINNABLE_MODEL_IDS = /'
   # Static /pipeline diagram copy (a display string in a fixed illustration).
   'src/lib/pipeline-config.ts:/{ key: "Model", val:/'
   # Prose: the discovery sweep's jsdoc explaining why the eval judge's bare
@@ -144,8 +145,12 @@ ALLOW=(
   'src/app/api/agentcore/traces/route.ts:/^\s*\/\//'
   'src/app/api/agentcore/metrics/route.ts:/^\s*\*/'
   'src/lib/agentcore-sdk.ts:/description: "Bedrock model ID/'
-  # TEMP TEAM-4996: the builder-tools Lambda's create_harness default.
-  'lambda/builder-tools/index.mjs:/const modelId = event\.model_id/'
+  # The builder-tools source has no deploy surface and no invoker — no deploy.sh
+  # in the directory, surfaces.json records "No deployed function", and the one
+  # BUILDER_TOOLS_LAMBDA mention is an unread env default (proof quoted at the
+  # constant). So its create_harness default is a named LITERAL floor, the same
+  # shape the five loaders and the three setup scripts use, not a resolution.
+  'lambda/builder-tools/index.mjs:/^const LITERAL_MODEL_ID = /'
 
   # This guard's own prose and --self-test fixtures: comments explaining WHY a
   # literal is allowed elsewhere, and planted strings it writes into a temp dir
