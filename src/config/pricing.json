@@ -1,41 +1,65 @@
 {
-  "_comment": "Single source of truth for model pricing. USD per 1M tokens, Amazon Bedrock on-demand, us-east-1 / US cross-region inference profiles (verified against Cost Explorer usage-type unit rates 2026-09-08: fable-5-1 = 11/55 input/output, cache-read 0.275 (2.5% of input, NOT the 10% every other Anthropic model bills), cache-write 13.75 (5m) / 22 (1h); fable-5 = 11/55 with 1.1 cache-read; opus-5/4-8 = 5.5/27.5; sonnet-5 = 2.2/11; haiku-4-5 = 1.1/5.5). Keys match gen_ai.request.model values seen in spans - both bare model names (Claude Code CLI) and Bedrock inference-profile ids (Strands personas). cachedInputDiscount = default cache-read rate as a fraction of input; a model may override it with an absolute cacheReadInput (USD per 1M). cacheWriteMultiplier = cache-write rate as a multiple of input, keyed by hub.cache_ttl (5m|1h) with a default fallback (TEAM-3954). kiro.usdPerCredit converts Kiro credits (its only usage unit) to USD for cross-engine comparison. HISTORY: fable-5-1 sat at 20/100 from TEAM-3849 through 2026-09-08 (flagged as unresolved in TEAM-3954); Cost Explorer settled it at 11/55 and REPORT_VERSION 4 backfilled every card.",
+  "_comment": "Generated from config/models.json version 1 at 2026-09-23T00:00:00Z by seed. Do not edit; edit the catalog on /models.",
   "models": {
-    "claude-fable-5": {
+    "us.anthropic.claude-fable-5-1": {
       "input": 11,
-      "output": 55
-    },
-    "us.anthropic.claude-fable-5": {
-      "input": 11,
-      "output": 55
+      "output": 55,
+      "cacheReadInput": 0.275
     },
     "claude-fable-5-1": {
       "input": 11,
       "output": 55,
       "cacheReadInput": 0.275
     },
-    "us.anthropic.claude-fable-5-1": {
-      "input": 11,
-      "output": 55,
-      "cacheReadInput": 0.275
+    "us.anthropic.claude-opus-5-5": {
+      "input": 4.4,
+      "output": 22,
+      "cacheReadInput": 0.22
     },
-    "claude-opus-5": {
-      "input": 5.5,
-      "output": 27.5
+    "claude-opus-5-5": {
+      "input": 4.4,
+      "output": 22,
+      "cacheReadInput": 0.22
     },
     "us.anthropic.claude-opus-5": {
       "input": 5.5,
       "output": 27.5
     },
-    "claude-opus-4-8": {
+    "claude-opus-5": {
       "input": 5.5,
       "output": 27.5
     },
-    "us.anthropic.claude-opus-4-8": {
-      "input": 5.5,
-      "output": 27.5
+    "us.anthropic.claude-sonnet-5": {
+      "input": 2.2,
+      "output": 11,
+      "cacheReadInput": 0.22
     },
-    "us.anthropic.claude-opus-4-7": {
+    "claude-sonnet-5": {
+      "input": 2.2,
+      "output": 11,
+      "cacheReadInput": 0.22
+    },
+    "us.anthropic.claude-haiku-4-5-20251001-v1:0": {
+      "input": 1.1,
+      "output": 5.5,
+      "cacheReadInput": 0.11
+    },
+    "claude-haiku-4-5": {
+      "input": 1.1,
+      "output": 5.5,
+      "cacheReadInput": 0.11
+    },
+    "anthropic.claude-haiku-4-5-20251001-v1:0": {
+      "input": 1.1,
+      "output": 5.5,
+      "cacheReadInput": 0.11
+    },
+    "us.anthropic.claude-haiku-4-5-20251001": {
+      "input": 1.1,
+      "output": 5.5,
+      "cacheReadInput": 0.11
+    },
+    "us.anthropic.claude-opus-4-6": {
       "input": 5.5,
       "output": 27.5
     },
@@ -43,13 +67,51 @@
       "input": 5.5,
       "output": 27.5
     },
-    "claude-sonnet-5": {
-      "input": 2.2,
-      "output": 11
+    "global.anthropic.claude-opus-5-5": {
+      "input": 4,
+      "output": 20,
+      "cacheReadInput": 0.2
     },
-    "us.anthropic.claude-sonnet-5": {
-      "input": 2.2,
-      "output": 11
+    "global.anthropic.claude-opus-5": {
+      "input": 5,
+      "output": 25,
+      "cacheReadInput": 0.5
+    },
+    "global.anthropic.claude-sonnet-5": {
+      "input": 2,
+      "output": 10,
+      "cacheReadInput": 0.2
+    },
+    "global.anthropic.claude-fable-5-1": {
+      "input": 10,
+      "output": 50,
+      "cacheReadInput": 0.25
+    },
+    "anthropic.claude-opus-5": {
+      "input": 5.5,
+      "output": 27.5
+    },
+    "us.anthropic.claude-fable-5": {
+      "input": 11,
+      "output": 55,
+      "cacheReadInput": 1.1
+    },
+    "claude-fable-5": {
+      "input": 11,
+      "output": 55,
+      "cacheReadInput": 1.1
+    },
+    "us.anthropic.claude-opus-4-8": {
+      "input": 5.5,
+      "output": 27.5
+    },
+    "claude-opus-4-8": {
+      "input": 5.5,
+      "output": 27.5
+    },
+    "us.anthropic.claude-opus-4-7": {
+      "input": 5.5,
+      "output": 27.5
     },
     "us.anthropic.claude-sonnet-4-6": {
       "input": 3.3,
@@ -59,29 +121,71 @@
       "input": 3.3,
       "output": 16.5
     },
-    "claude-haiku-4-5": {
-      "input": 1.1,
-      "output": 5.5
+    "us.openai.gpt-6-astra": {
+      "input": 11,
+      "output": 55,
+      "cacheReadInput": 1.1,
+      "longContext": {
+        "thresholdInputTokens": 272000,
+        "input": 22,
+        "output": 110,
+        "cacheReadInput": 2.2
+      }
     },
-    "anthropic.claude-haiku-4-5-20251001-v1:0": {
-      "input": 1.1,
-      "output": 5.5
+    "us.openai.gpt-6-sol": {
+      "input": 4.4,
+      "output": 22,
+      "cacheReadInput": 0.44,
+      "longContext": {
+        "thresholdInputTokens": 272000,
+        "input": 8.8,
+        "output": 44,
+        "cacheReadInput": 0.88
+      }
     },
-    "us.anthropic.claude-haiku-4-5-20251001-v1:0": {
-      "input": 1.1,
-      "output": 5.5
+    "us.openai.gpt-5.6-terra": {
+      "input": 2.2,
+      "output": 13.2,
+      "cacheReadInput": 0.22,
+      "longContext": {
+        "thresholdInputTokens": 272000,
+        "input": 4.4,
+        "output": 26.4,
+        "cacheReadInput": 0.44
+      }
     },
-    "us.anthropic.claude-haiku-4-5-20251001": {
-      "input": 1.1,
-      "output": 5.5
+    "us.openai.gpt-6-luna": {
+      "input": 0.22,
+      "output": 1.32,
+      "cacheReadInput": 0.022,
+      "longContext": {
+        "thresholdInputTokens": 272000,
+        "input": 0.44,
+        "output": 2.64,
+        "cacheReadInput": 0.044
+      }
     },
     "openai.gpt-5.5": {
-      "input": 1.25,
-      "output": 10
+      "input": 5.5,
+      "output": 33,
+      "cacheReadInput": 0.55,
+      "longContext": {
+        "thresholdInputTokens": 272000,
+        "input": 11,
+        "output": 66,
+        "cacheReadInput": 1.1
+      }
     },
     "openai.gpt-5.5-codex": {
-      "input": 1.25,
-      "output": 10
+      "input": 5.5,
+      "output": 33,
+      "cacheReadInput": 0.55,
+      "longContext": {
+        "thresholdInputTokens": 272000,
+        "input": 11,
+        "output": 66,
+        "cacheReadInput": 1.1
+      }
     }
   },
   "default": {
@@ -91,7 +195,7 @@
   "cachedInputDiscount": 0.1,
   "cacheWriteMultiplier": {
     "5m": 1.25,
-    "1h": 2.0,
+    "1h": 2,
     "default": 1.25,
     "_basis": "Bedrock prompt-cache write surcharge as a multiple of the base input rate: 5-minute cache = 1.25x, 1-hour cache = 2x input (Anthropic on-demand cache-write pricing). Keyed by the span's hub.cache_ttl (TEAM-3953); 'default' applies when ttl is absent/unknown (e.g. coding-CLI usage records)."
   },
