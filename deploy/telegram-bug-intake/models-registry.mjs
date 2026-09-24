@@ -144,7 +144,7 @@ export function isDatedDuplicate(id, idSet) {
  * Mirror of routingTargets() in src/lib/models-registry.ts. A dated duplicate
  * something routes at is kept; one nothing routes at is noise.
  */
-function routingTargetsOf(doc) {
+export function routingTargetsOf(doc) {
   const targets = new Set();
   if (!isPlainObject(doc)) return targets;
   for (const key of ['defaults', 'agents', 'legacyAliases']) {

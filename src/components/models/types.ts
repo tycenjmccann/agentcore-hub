@@ -122,8 +122,18 @@ export interface ResolvedModel {
   harnessModel?: string;
 }
 
+/** Mirror of `RegistryFallback` in src/lib/models-registry.ts (TEAM-5052). */
+export interface RegistryFallback {
+  reason: "invalid" | "missing" | "error" | "no_bucket";
+  detail: string;
+  refusedVersion?: number;
+}
+
 export interface RegistryResponse {
   registry: RegistryDoc;
+  /** Where `registry` came from. Anything but "s3" is a fallback the page banners. */
+  source?: "s3" | "cache" | "seed";
+  fallback?: RegistryFallback | null;
   previous: { version: number; updatedAt: string } | null;
   resolved: Record<string, ResolvedModel>;
   interimOverdue: string[];

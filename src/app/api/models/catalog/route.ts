@@ -16,7 +16,13 @@
 import { NextResponse } from "next/server";
 import type { NextRequest } from "next/server";
 import { isAdmin } from "@/lib/auth/identity";
-import { VersionConflictError, loadModelsRegistryMeta, saveModelsRegistry } from "@/lib/models-registry";
+import {
+  RegistryFallbackError,
+  VersionConflictError,
+  loadModelsRegistryMeta,
+  requireLiveRegistry,
+  saveModelsRegistry,
+} from "@/lib/models-registry";
 import type { ModelsRegistry } from "@/lib/models-registry";
 import { discoverModels, mergeDiscovered } from "@/lib/models/discovery";
 import { refreshPrices } from "@/lib/models/pricing-api";
@@ -74,7 +80,21 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
   let priceErrors: string[] = [];
 
   for (let attempt = 0; attempt < SAVE_ATTEMPTS; attempt++) {
-    const live = await loadModelsRegistryMeta({ force: true });
+    // Only the live S3 document may be merged into and written back (TEAM-5052):
+    // a forced read that comes back `cache` or `seed` means the live document is
+    // missing, unreadable or refused, and writing the seed + this sweep over it
+    // would replace the operator's catalog wholesale.
+    let live;
+    try {
+      live = requireLiveRegistry(await loadModelsRegistryMeta({ force: true }));
+    } catch (err) {
+      if (!(err instanceof RegistryFallbackError)) throw err;
+      console.warn(`[models] discovery.write_refused reason=registry_fallback source=${err.source}`);
+      return NextResponse.json(
+        { error: "registry_unavailable", source: err.source, fallback: err.fallback ?? null },
+        { status: 503, ...NO_STORE }
+      );
+    }
     const merged = mergeDiscovered(live.registry, discovery.models, { scanned: discovery.scanned });
     const priced = await refreshPrices(merged.next);
     added = merged.added;

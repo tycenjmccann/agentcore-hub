@@ -248,6 +248,26 @@ describe("GET /api/models/registry", () => {
     expect(res.headers.get("Cache-Control")).toBe("no-store");
   });
 
+  it("GET reports source seed with the fallback reason when the live doc is refused", async () => {
+    // TEAM-5052: what the pre-fix reconcile wrote — a candidate row whose id the
+    // retired opus-4-6 row still claims as an alias. The read gate refuses it.
+    const live = seatLive(2);
+    const { harnessLanes: _lanes, ...owner } = live.catalog.find((r) => r.modelId === "us.anthropic.claude-opus-4-6")!;
+    live.catalog.push({ ...owner, modelId: "us.anthropic.claude-opus-4-6-v1", aliases: [], status: "candidate" });
+    h.state.objects[MODELS_KEY] = JSON.stringify(live);
+
+    const body = await (await GET(getReq("?fresh=1"))).json();
+    expect(body.source).toBe("seed");
+    expect(body.registry.version).toBe(1);
+    expect(body.fallback).toMatchObject({ reason: "invalid", refusedVersion: 2 });
+    expect(body.fallback.detail).toContain("duplicate_alias");
+
+    // The live document again: no fallback on the wire.
+    seatLive(7);
+    const ok = await (await GET(getReq("?fresh=1"))).json();
+    expect(ok).toMatchObject({ source: "s3", fallback: null });
+  });
+
   it("reports whether a rollback target exists without shipping it, unless asked", async () => {
     seatLive(7);
     const prev = clone(SEED);
