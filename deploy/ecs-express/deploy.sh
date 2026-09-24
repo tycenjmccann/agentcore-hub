@@ -227,6 +227,24 @@ for _h in $HUB_HARNESSES; do
   fi
   HARNESS_ARNS+="${HARNESS_ARNS:+,}\"${_arn}\""
 done
+# UpdateHarness re-passes the harness's execution role (iam:PassRole on
+# agentcore-hub-harness-role, pinned to the bedrock-agentcore service) and is
+# ALSO authorized as UpdateAgentRuntime on the harness's BACKING
+# runtime (runtime/harness_<harnessName>-<suffix>) - the same rule the pipeline
+# stack's HarnessBackingRuntime statement exists for. The first /models re-pin in
+# prod (2026-09-24) saved the registry and then failed both non-WM harnesses on
+# exactly that action. Resolved by name; a runtime not found yet falls back to the
+# name-prefixed wildcard rather than "*".
+HARNESS_RUNTIME_ARNS=""
+for _h in $HUB_HARNESSES; do
+  _rarn="$(aws bedrock-agentcore-control list-agent-runtimes --region "$AWS_REGION" \
+    --query "agentRuntimes[?agentRuntimeName=='harness_${_h}'].agentRuntimeArn | [0]" --output text 2>/dev/null || true)"
+  if [[ -z "$_rarn" || "$_rarn" == "None" ]]; then
+    _rarn="arn:aws:bedrock-agentcore:${AWS_REGION}:${ACCOUNT_ID}:runtime/harness_${_h}-*"
+    echo "        note: backing runtime for ${_h} not found - granting the name-prefixed pattern"
+  fi
+  HARNESS_RUNTIME_ARNS+="${HARNESS_RUNTIME_ARNS:+,}\"${_rarn}\""
+done
 HARNESS_REPIN_STMT=""
 if [[ -n "$HARNESS_ARNS" ]]; then
   HARNESS_REPIN_STMT=",
@@ -235,6 +253,19 @@ if [[ -n "$HARNESS_ARNS" ]]; then
         \"Effect\": \"Allow\",
         \"Action\": \"bedrock-agentcore:UpdateHarness\",
         \"Resource\": [${HARNESS_ARNS}]
+      },
+      {
+        \"Sid\": \"HarnessBackingRuntime\",
+        \"Effect\": \"Allow\",
+        \"Action\": [\"bedrock-agentcore:GetAgentRuntime\", \"bedrock-agentcore:UpdateAgentRuntime\"],
+        \"Resource\": [${HARNESS_RUNTIME_ARNS}]
+      },
+      {
+        \"Sid\": \"HarnessPassRole\",
+        \"Effect\": \"Allow\",
+        \"Action\": \"iam:PassRole\",
+        \"Resource\": \"arn:aws:iam::${ACCOUNT_ID}:role/agentcore-hub-harness-role\",
+        \"Condition\": { \"StringEquals\": { \"iam:PassedToService\": \"bedrock-agentcore.amazonaws.com\" } }
       }"
 else
   echo "        WARNING: no hub harness resolved - HarnessRepin statement omitted (a model re-pin from the UI will be denied)"
