@@ -377,6 +377,13 @@ aws iam put-role-policy \
 echo "        Attached inline runtime policy"
 TASK_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${TASK_ROLE}"
 echo ""
+# IAM_ONLY=1 refreshes the three roles above and stops before the image build:
+# the pipeline's Deploy stage never touches IAM (deploy/pipeline/surfaces.json),
+# so a role change ships as a hand step, and re-rolling ECS for it is waste.
+if [[ "${IAM_ONLY:-0}" == "1" ]]; then
+  echo "  IAM_ONLY=1 - roles refreshed; skipping image build + service update."
+  exit 0
+fi
 
 # ─── Step 5: Docker build + ECR push ─────────────────────────────────────────
 
