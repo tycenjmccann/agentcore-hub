@@ -281,6 +281,7 @@ aws iam put-role-policy \
         \"Effect\": \"Allow\",
         \"Action\": [
           \"bedrock-agentcore:InvokeAgentRuntime\",
+          \"bedrock-agentcore:InvokeAgentRuntimeCommand\",
           \"bedrock-agentcore:InvokeAgentRuntimeCommandShell\",
           \"bedrock-agentcore:InvokeHarness\",
           \"bedrock-agentcore:GetAgentRuntime\",
@@ -318,7 +319,8 @@ aws iam put-role-policy \
       {
         \"Sid\": \"BedrockModels\",
         \"Effect\": \"Allow\",
-        \"Action\": [\"bedrock:InvokeModel\", \"bedrock:InvokeModelWithResponseStream\"],
+        \"Action\": [\"bedrock:InvokeModel\", \"bedrock:InvokeModelWithResponseStream\",
+          \"bedrock:CallWithBearerToken\"],
         \"Resource\": \"*\"
       },
       {
