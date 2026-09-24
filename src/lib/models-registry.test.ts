@@ -262,6 +262,14 @@ describe("models-registry fixture contract", () => {
           for (const id of (c.expected.modelsExclude ?? []) as string[]) {
             expect(doc.models[id]).toBeUndefined();
           }
+          // `reseeded`: the live block failed carriedValid(), so the projection
+          // took the bundled seed's copy instead (TEAM-5029). The twin asserts the
+          // same list against its `seed:<key>` notes.
+          for (const key of (c.expected.reseeded ?? []) as string[]) {
+            expect(doc[key as keyof typeof doc], `reseeded ${key}`).toEqual(
+              (bundledPricingJson as unknown as Record<string, unknown>)[key]
+            );
+          }
           break;
         }
       }

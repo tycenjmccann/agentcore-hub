@@ -724,6 +724,17 @@ export function usagetypeFor(row, kind) {
   return `USE1-MP:USE1_${kind}_tokens_${tier}-Units`;
 }
 
+/**
+ * The Pricing API `ServiceCode` that files this row's usagetype. Mantle usage
+ * rolls up under `AmazonBedrock`; inference profiles bill under the foundation-
+ * model service. MIRROR of serviceCodeFor() in src/lib/models/pricing-api.ts —
+ * keyed on the endpoint alone, exactly like the TS, so both callers ask the same
+ * product catalogue (TEAM-5029).
+ */
+export function serviceCodeFor(row) {
+  return row?.endpoint === 'bedrock-mantle' ? 'AmazonBedrock' : 'AmazonBedrockFoundationModels';
+}
+
 // ─── Pricing projection (reconcile) ──────────────────────────────────────────
 
 /** The per-model rate fields the card Lambda reads. `cacheWrite` is NEVER one of
@@ -784,17 +795,35 @@ function priceOf(row) {
   return out;
 }
 
+/**
+ * MIRROR of carriedValid() in src/lib/models-registry.ts — one rule; a block one
+ * writer keeps and the other drops alternates the file nightly (TEAM-5029).
+ * `posNum` coerces like the TS (`Number(v) > 0`, so "5.5" passes and is carried
+ * as written); `cachedInputDiscount` is the one field the TS reads WITHOUT
+ * coercion and rejects at 0. isPositive/isNonNegative above are untouched: they
+ * gate priceOf(), which is pinned byte-for-byte to the TS entryFor().
+ */
 function carriedBlockOk(key, value) {
-  if (key === 'default') return isPlainObject(value) && isPositive(value.input) && isPositive(value.output);
-  if (key === 'cachedInputDiscount') return typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 1;
-  if (key === 'cacheWriteMultiplier') {
-    if (!isPlainObject(value)) return false;
-    const rates = Object.entries(value).filter(([k]) => !k.startsWith('_'));
-    return rates.length > 0 && rates.every(([, v]) => typeof v === 'number' && Number.isFinite(v) && v >= 1 && v <= 10);
+  const posNum = (v) => {
+    const n = typeof v === 'number' ? v : Number(v);
+    return Number.isFinite(n) && n > 0;
+  };
+  switch (key) {
+    case 'default':
+      return isPlainObject(value) && posNum(value.input) && posNum(value.output);
+    case 'cachedInputDiscount':
+      return typeof value === 'number' && Number.isFinite(value) && value > 0 && value <= 1;
+    case 'cacheWriteMultiplier':
+      return isPlainObject(value)
+        && Object.entries(value).every(([k, v]) => k.startsWith('_') || posNum(v))
+        && posNum(value.default);
+    case 'kiro':
+      return isPlainObject(value) && posNum(value.usdPerCredit);
+    case 'agentcore':
+      return isPlainObject(value) && posNum(value.runtimeGbHourUsd) && posNum(value.runtimeVcpuHourUsd);
+    default:
+      return false;
   }
-  if (key === 'kiro') return isPlainObject(value) && isPositive(value.usdPerCredit);
-  if (key === 'agentcore') return isPlainObject(value) && isPositive(value.runtimeGbHourUsd);
-  return false;
 }
 
 /**

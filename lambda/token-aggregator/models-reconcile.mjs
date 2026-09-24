@@ -32,6 +32,8 @@
  *   s3Get(key) -> {body, etag} | null      s3Put(key, body, {ifMatch})
  *   listInferenceProfiles(region) -> [..]  mantleModels(region) -> [..]
  *   getProducts(serviceCode, filters) -> [product]   probeCli(row) -> {ok,..}
+ *     (serviceCode is per row, via serviceCodeFor(): Mantle bills under
+ *     AmazonBedrock, inference profiles under AmazonBedrockFoundationModels)
  *   now() -> Date    uuid() -> string    log    env
  */
 
@@ -45,6 +47,7 @@ import {
   predecessorRow,
   tierForFamily,
   usagetypeFor,
+  serviceCodeFor,
   priceBlockOf,
   pricingProjection,
   validateRegistry,
@@ -155,10 +158,15 @@ function candidateRow(found, now) {
 /**
  * Everything the account can reach right now, keyed by model id.
  *
- * Also returns which ENDPOINTS were successfully scanned. Retirement below is
- * scoped to those: if the Mantle call throws, every Mantle row would otherwise
- * "vanish" and the reconcile would retire the whole Codex catalog on a transient
- * 500. A failed scan means we learned nothing, not that the models are gone.
+ * Also returns which PLANES were successfully scanned: `bedrock-runtime`, and
+ * `bedrock-mantle:<region>` for each Mantle region that answered. Retirement
+ * below is scoped to those: if the Mantle call throws, every Mantle row would
+ * otherwise "vanish" and the reconcile would retire the whole Codex catalog on a
+ * transient 500. A failed scan means we learned nothing, not that the models are
+ * gone — and that holds PER REGION (TEAM-5029): a Mantle row is only retirable
+ * when the region it lives in was listed. A sweep that never reached us-east-2
+ * has learned nothing about a us-east-2 row, however completely us-east-1
+ * answered.
  */
 async function discover(deps, env) {
   const found = new Map();
@@ -205,7 +213,7 @@ async function discover(deps, env) {
           contextWindow: Number.isInteger(model?.context_window) ? model.context_window : 0,
         });
       }
-      scanned.add('bedrock-mantle');
+      scanned.add(`bedrock-mantle:${mregion}`);
     } catch (e) {
       deps.log.warn?.(`[models] reconcile.discover-failed endpoint=bedrock-mantle region=${mregion} error=${errText(e)}`);
     }
@@ -258,8 +266,12 @@ function mergeDiscovery(doc, discovered, counts, nowIso, log) {
     if (!RESOLVABLE_STATUSES.includes(statusOf(row))) continue;
     if (discovered.found.has(row.modelId)) continue;
     // A failed scan proves nothing. A row with no endpoint is a Bedrock Runtime
-    // row, same default the resolver applies.
-    if (!discovered.scanned.has(row.endpoint || 'bedrock-runtime')) continue;
+    // row, same default the resolver applies. A Mantle row is gated on ITS OWN
+    // region having answered; one with no region yields a key nothing scanned,
+    // so it is never retirable on absence — same philosophy as retirable().
+    const endpoint = row.endpoint || 'bedrock-runtime';
+    const scanKey = endpoint === 'bedrock-mantle' ? `bedrock-mantle:${trimmed(row.region)}` : endpoint;
+    if (!discovered.scanned.has(scanKey)) continue;
     if (!retirable(row)) continue;
     row.status = 'retired';
     row.retiredAt = nowIso;
@@ -310,7 +322,7 @@ async function publishedRates(deps, row) {
     const usagetype = usagetypeFor(row, kind);
     let products;
     try {
-      products = await deps.getProducts('AmazonBedrock', [
+      products = await deps.getProducts(serviceCodeFor(row), [
         { Type: 'TERM_MATCH', Field: 'usagetype', Value: usagetype },
       ]);
     } catch (e) {
@@ -341,25 +353,37 @@ function setPrice(row, price) {
 /**
  * Bring every live row's price up to date.
  *
+ * Provenance is `price.source`, in the canonical vocabulary the TS `parsePrice()`
+ * reads — `published` | `interim` | `manual` — and nothing else (TEAM-5029: an
+ * earlier version keyed on a `state` field no row has, so every listing
+ * overwrote every rate). Anything outside that vocabulary is what the canonical
+ * normalises it to: `manual`, i.e. an operator's number.
+ *
  * The three outcomes are deliberately different in kind:
  *   - a row the API prices and we do not (or that we priced as `interim`) is
- *     PROMOTED to the published rate;
- *   - a row the API prices DIFFERENTLY from a published rate we already carry
- *     records `priceDrift` and changes nothing. A rate the operator verified
- *     against Cost Explorer is not silently overwritten by a product listing —
- *     every card ever written used the old number, and a human decides whether
- *     the listing or the bill is right;
- *   - a row nothing prices borrows its predecessor's rate as `interim`, or stays
- *     unpriced. Unpriced is visible: REPORT_VERSION 7 makes it a gap on the card
- *     instead of a plausible guess.
+ *     PROMOTED to the published rate, with a `sourceNote` saying so;
+ *   - a row the API prices DIFFERENTLY from a `published` or `manual` rate we
+ *     already carry records `priceDrift` and changes nothing. A rate the
+ *     operator verified against Cost Explorer is not silently overwritten by a
+ *     product listing — every card ever written used the old number, and a
+ *     human decides whether the listing or the bill is right. A drift that has
+ *     since closed is cleared;
+ *   - a row nothing prices borrows its predecessor's rate as `interim`, naming
+ *     the predecessor in `sourceNote`, or stays unpriced. Unpriced is visible:
+ *     REPORT_VERSION 7 makes it a gap on the card instead of a plausible guess.
  *
  * The rate lands on `row.price` — the one field the seed, the TS canonical's
  * `parsePrice(raw.price)` and the projection's priceOf() all read. A document
  * still carrying the older `pricing` spelling is read through priceBlockOf() and
  * then rewritten as `price`, so no row ends up holding two rate blocks.
  */
+/** Same tolerance as the TS canonical's `differs`: a per-1K → per-1M
+ *  conversion can land a float hair off the carried number. */
+const rateDiffers = (a, b) => Math.abs(a - b) > 1e-6;
+
 async function refreshPricing(doc, deps, counts, nowIso, drifts) {
   const rows = Array.isArray(doc.catalog) ? doc.catalog : [];
+  const today = nowIso.slice(0, 10);
   // predecessorRow() reads a NORMALIZED registry (rows under `.models`), and this
   // is the raw document — hand it the rows in the shape it expects rather than
   // teaching the byte-copied twin a second one.
@@ -370,20 +394,34 @@ async function refreshPricing(doc, deps, counts, nowIso, drifts) {
     const rates = await publishedRates(deps, row);
 
     if (rates) {
-      const state = current?.state;
-      if (!usablePrice(current) || state !== 'published') {
-        setPrice(row, { ...(current || {}), ...rates, state: 'published', source: 'pricing-api', asOf: nowIso });
+      const source = current?.source;
+      if (!usablePrice(current) || source === 'interim') {
+        const from = source === 'interim' ? 'interim' : 'unpriced';
+        setPrice(row, {
+          ...(current || {}),
+          ...rates,
+          source: 'published',
+          asOf: nowIso,
+          sourceNote: `Promoted from ${from} to the published Price List rate on ${today}.`,
+        });
         delete row.price.priceDrift;
-        if (state === 'interim') counts.promoted += 1; else counts.repriced += 1;
+        if (source === 'interim') counts.promoted += 1; else counts.repriced += 1;
         deps.log.log(`[models] pricing.published modelId=${row.modelId} input=${rates.input} output=${rates.output}`);
         continue;
       }
-      const differs = PRICE_KINDS.some(([, f]) => isPositive(rates[f]) && rates[f] !== current[f]);
+      // Usable and `published`, `manual`, or anything else parsePrice() would
+      // read as manual: the operator's number stands; the listing is recorded.
+      const differs = PRICE_KINDS.some(([, f]) => isPositive(rates[f]) && rateDiffers(rates[f], current[f] ?? 0));
       if (differs) {
         setPrice(row, { ...current, priceDrift: { ...rates, seenAt: nowIso } });
         drifts.push(row.modelId);
         deps.log.warn?.(`[models] pricing.drift modelId=${row.modelId} `
           + `carried=${current.input}/${current.output} listed=${rates.input}/${rates.output} applied=no`);
+      } else if (current.priceDrift) {
+        // The listing agrees again: a stale drift is noise on the /models page.
+        setPrice(row, { ...current });
+        delete row.price.priceDrift;
+        deps.log.log(`[models] pricing.drift-cleared modelId=${row.modelId}`);
       }
       continue;
     }
@@ -396,8 +434,9 @@ async function refreshPricing(doc, deps, counts, nowIso, drifts) {
         input: predPrice.input,
         output: predPrice.output,
         ...(isPositive(predPrice.cacheReadInput) ? { cacheReadInput: predPrice.cacheReadInput } : {}),
-        state: 'interim',
-        source: `predecessor:${pred.modelId}`,
+        ...(isPlainObject(predPrice.longContext) ? { longContext: { ...predPrice.longContext } } : {}),
+        source: 'interim',
+        sourceNote: `Interim: inherited from ${pred.modelId} until this model's rate publishes.`,
         asOf: nowIso,
       });
       counts.repriced += 1;
@@ -554,7 +593,10 @@ async function pass(base, deps, env, nowIso) {
  * cache multipliers, Kiro, AgentCore) are carried forward from the live
  * document, so an unreadable previous pricing file means we would DROP them:
  * this Lambda ships no seed copy, so it writes nothing at all rather than
- * publish a pricing file with holes in it.
+ * publish a pricing file with holes in it. The same holds block by block
+ * (TEAM-5029): a live document whose carried block fails the shared rule
+ * (`missing:<key>` in the projection's notes) is left in place too — a hole is
+ * worse than a stale file.
  *
  * It projects from the VALIDATED registry or not at all. Projecting from the raw
  * document instead was the second half of TEAM-5022: a document the twins refuse
@@ -574,6 +616,11 @@ async function projectPricing(deps, counts, verdict) {
     return;
   }
   const { pricing, prevSourceNotes } = pricingProjection(verdict.registry, live.doc, null);
+  const missing = prevSourceNotes.filter((n) => n.startsWith('missing:'));
+  if (missing.length) {
+    deps.log.warn?.(`[models] pricing.projected skipped reason=${missing.join(',')}`);
+    return;
+  }
   if (JSON.stringify(live.doc) === JSON.stringify(pricing)) return;
   try {
     await deps.s3Put(PRICING_KEY, JSON.stringify(pricing, null, 2), { ifMatch: live.etag });
