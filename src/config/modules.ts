@@ -10,6 +10,7 @@ import {
   CalendarClock,
   Plug,
   Rocket,
+  SlidersHorizontal,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 
@@ -55,6 +56,7 @@ export interface NavItem {
 const RAW_NAV_ITEMS: NavItem[] = [
   { href: "/", label: "Dashboard", icon: LayoutDashboard, module: "core" },
   { href: "/agents", label: "Agents", icon: Bot, module: "core" },
+  { href: "/models", label: "Models", icon: SlidersHorizontal, module: "core" },
   { href: "/registry", label: "Registry", icon: Boxes, module: "registry" },
   { href: "/build", label: "Build", icon: Hammer, module: "builder" },
   { href: "/workflow", label: "Workflow", icon: GitPullRequest, module: "workflow" },

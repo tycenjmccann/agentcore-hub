@@ -12,6 +12,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { streamAgentInvocation, AgentInfo, TraceEvent } from "@/lib/agentcore-stream";
 import { cachedFetch, getCached, getClientRegion } from "@/lib/client-cache";
+import { useModelsRegistry } from "@/lib/models-registry-client";
 
 interface AgentDetail {
   id: string;
@@ -23,7 +24,6 @@ interface AgentDetail {
   updatedAt?: string;
   memoryId?: string | null;
   logGroup?: string | null;
-  model?: string;
   systemPrompt?: string;
   tools?: Array<{ type: string; name?: string }>;
 }
@@ -112,6 +112,10 @@ export default function AgentDetailPage({ params }: { params: { id: string } }) 
 
 function AgentInfoHeader({ agent }: { agent: AgentDetail }) {
   const [expanded, setExpanded] = useState(false);
+  // Keyed by agent.name (the resource name = the agents.json agentId), never
+  // agent.id, which carries AWS's random suffix and matches nothing in the registry.
+  const { resolve } = useModelsRegistry();
+  const model = resolve(agent.name);
 
 
   return (
@@ -160,12 +164,25 @@ function AgentInfoHeader({ agent }: { agent: AgentDetail }) {
 
       {expanded && (
         <div className="mt-3 pt-3 border-t border-theme grid grid-cols-2 md:grid-cols-4 gap-4 text-xs">
-          {agent.model && (
-            <div>
-              <span className="text-muted flex items-center gap-1"><Bot className="w-3 h-3" /> Model</span>
-              <p className="text-secondary mt-0.5 font-mono text-[10px]">{agent.model}</p>
-            </div>
-          )}
+          {/* The registry's answer, and a link to where it is changed — so this cell
+              is not just a readout but the start of the edit. */}
+          <div>
+            <span className="text-muted flex items-center gap-1"><Bot className="w-3 h-3" /> Model</span>
+            {model.unknown ? (
+              <p className="text-muted mt-0.5">-</p>
+            ) : (
+              <>
+                <p className="text-secondary mt-0.5">{model.shortLabel}</p>
+                <p className="text-muted font-mono text-[10px] truncate" title={model.modelId}>{model.modelId}</p>
+                <p className="text-muted text-[10px] mt-0.5">
+                  {model.inherited ? "Inherited from defaults.persona" : "Override"}
+                </p>
+              </>
+            )}
+            <Link href={`/models#agent-${agent.name}`} className="text-[10px] text-accent-fg hover:underline">
+              Change in Models
+            </Link>
+          </div>
           {agent.memoryId && (
             <div>
               <span className="text-muted flex items-center gap-1"><Database className="w-3 h-3" /> Memory</span>
