@@ -484,6 +484,79 @@ describe("validateRegistry", () => {
       "bad_api_key_arn"
     );
   });
+
+  it("refuses a candidate target with only one green probe — both planes or neither", () => {
+    const green = { ok: true, at: "2026-09-20T00:00:00.000Z" };
+    const reg = SEED();
+    const row = reg.catalog.find((r) => r.modelId === "us.anthropic.claude-opus-5-5")!;
+    row.status = "candidate";
+    reg.agents.agentcore_hub_workflow_manager = "us.anthropic.claude-opus-5-5";
+
+    row.probe = { api: green };
+    expect(mod.validateRegistry(reg).errors["agents.agentcore_hub_workflow_manager"]).toBe("unprobed");
+    row.probe = { cli: green };
+    expect(mod.validateRegistry(reg).errors["agents.agentcore_hub_workflow_manager"]).toBe("unprobed");
+    row.probe = { api: green, cli: green };
+    expect(mod.validateRegistry(reg).errors).toEqual({});
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 3b. Adoption — the rule that needs BOTH documents
+// ---------------------------------------------------------------------------
+
+describe("adoptionErrors", () => {
+  const green = { ok: true, at: "2026-09-20T00:00:00.000Z" };
+
+  it("passes a document whose routing did not change, probes or no probes", () => {
+    expect(mod.adoptionErrors(SEED(), SEED())).toEqual({});
+  });
+
+  it("names every field that points a routing target at an unprobed model", () => {
+    const next = SEED();
+    next.agents.agentcore_hub_workflow_manager = "us.anthropic.claude-opus-5-5";
+    next.defaults.persona = "us.anthropic.claude-opus-5-5";
+    expect(mod.adoptionErrors(SEED(), next)).toEqual({
+      "agents.agentcore_hub_workflow_manager": "unprobed",
+      "defaults.persona": "unprobed",
+    });
+  });
+
+  it("adopts a model once both planes are green", () => {
+    const next = SEED();
+    next.catalog.find((r) => r.modelId === "us.anthropic.claude-opus-5-5")!.probe = { api: green, cli: green };
+    next.agents.agentcore_hub_workflow_manager = "us.anthropic.claude-opus-5-5";
+    expect(mod.adoptionErrors(SEED(), next)).toEqual({});
+  });
+
+  it("compares models, not spellings: re-pointing a field at an alias of a live target is not an adoption", () => {
+    const next = SEED();
+    next.agents.agentcore_hub_workflow_manager = "claude-opus-5";
+    expect(mod.adoptionErrors(SEED(), next)).toEqual({});
+  });
+
+  it("grandfathers a model the live document already routed to, wherever the new field is", () => {
+    const live = SEED();
+    live.defaults.persona = "us.anthropic.claude-opus-5-5";
+    const next = SEED();
+    // Same unprobed model, now pinned per-agent instead of as the default: it was
+    // already carrying production traffic, so this is a move, not an adoption.
+    next.agents.agentcore_hub_workflow_manager = "us.anthropic.claude-opus-5-5";
+    expect(mod.adoptionErrors(live, next)).toEqual({});
+  });
+
+  it("leaves an uncatalogued target to validateRegistry rather than calling it unprobed", () => {
+    const next = SEED();
+    next.agents.agentcore_hub_workflow_manager = "us.anthropic.claude-nobody-has-heard-of";
+    expect(mod.adoptionErrors(SEED(), next)).toEqual({});
+    expect(mod.validateRegistry(next).errors["agents.agentcore_hub_workflow_manager"]).toBe("unknown_model");
+  });
+
+  it("ignores legacyAliases — a compat shim is not a way to adopt a model", () => {
+    const next = SEED();
+    next.legacyAliases["claude-opus-46"] = "us.anthropic.claude-opus-5-5";
+    expect(mod.adoptionErrors(SEED(), next)).toEqual({});
+  });
 });
 
 // ---------------------------------------------------------------------------

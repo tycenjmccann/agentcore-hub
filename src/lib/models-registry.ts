@@ -753,7 +753,9 @@ function targetReason(reg: ModelsRegistry, index: RegistryIndex, value: string):
   if (row.status === "quarantined") return "quarantined";
   if (row.status === "retired") return "inactive";
   if (!pricedOk(row.price)) return "unpriced";
-  if (row.status === "candidate" && !row.probe?.api?.ok && !row.probe?.cli?.ok) return "unprobed";
+  // BOTH planes, not either: a model that answers the API but not the coding CLI
+  // is half-proven, and `||` here let a single green probe adopt it (TEAM-5008).
+  if (row.status === "candidate" && !(row.probe?.api?.ok && row.probe?.cli?.ok)) return "unprobed";
   return null;
 }
 
@@ -843,6 +845,58 @@ export function validateRegistry(reg: ModelsRegistry): ValidationResult {
   }
 
   return { ok: Object.keys(errors).length === 0, errors, warnings };
+}
+
+/**
+ * The `defaults` / `tiers` / `agents` entries of one document, as
+ * `field path → resolved modelId`. Resolving through aliases is what makes the
+ * adoption gate below compare MODELS rather than spellings: re-pointing a tier
+ * from an alias to the row's canonical id is not an adoption.
+ *
+ * `legacyAliases` is deliberately excluded — it is a compatibility shim onto
+ * models that are already routed to, never a way to adopt a new one.
+ */
+function routingEntries(reg: ModelsRegistry, index: RegistryIndex): Map<string, string> {
+  const out = new Map<string, string>();
+  const add = (field: string, value: string | undefined) => {
+    const raw = str(value);
+    if (!raw) return;
+    const row = index.byId.get(raw) || index.byAlias.get(raw);
+    out.set(field, row?.modelId || raw);
+  };
+  for (const [key, value] of Object.entries(reg.defaults || {})) add(`defaults.${key}`, value);
+  for (const [cli, tierMap] of Object.entries(reg.tiers || {})) {
+    for (const [tier, value] of Object.entries(tierMap || {})) add(`tiers.${cli}.${tier}`, value);
+  }
+  for (const [agentId, value] of Object.entries(reg.agents || {})) add(`agents.${agentId}`, value);
+  return out;
+}
+
+/**
+ * DD6, the ADOPTION half of validation (TEAM-5008 finding 2): a model may only
+ * BECOME a routing target once both probe planes are green. `validateRegistry`
+ * cannot express this — it sees one document, and the seed's live targets have no
+ * probe blocks at all, so a rule applied to every target would reject the very
+ * routing that is running in production.
+ *
+ * So the rule is about the TRANSITION: a target whose resolved model was already
+ * a routing target in the live document is grandfathered; a model arriving at
+ * `defaults` / `tiers` / `agents` for the first time must carry
+ * `probe.api.ok && probe.cli.ok`. Returns `field path → reason`, merge-able into
+ * a `validateRegistry` error body.
+ */
+export function adoptionErrors(live: ModelsRegistry, next: ModelsRegistry): Record<string, string> {
+  const nextIndex = indexRegistry(next);
+  const liveTargets = new Set(routingEntries(live, indexRegistry(live)).values());
+  const errors: Record<string, string> = {};
+  for (const [field, modelId] of routingEntries(next, nextIndex)) {
+    if (liveTargets.has(modelId)) continue;
+    const row = nextIndex.byId.get(modelId);
+    if (!row) continue; // validateRegistry already reports this as unknown_model
+    if (row.probe?.api?.ok && row.probe?.cli?.ok) continue;
+    errors[field] = "unprobed";
+  }
+  return errors;
 }
 
 // ---------------------------------------------------------------------------

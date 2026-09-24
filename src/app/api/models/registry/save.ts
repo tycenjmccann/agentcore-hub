@@ -9,6 +9,8 @@
  *   1. normalize  — seed-owned fields are re-applied from the bundled catalog
  *   2. validate   — one 422 carrying every bad field at once
  *   3. compare    — a stale `baseVersion` is a 409 before anything is written
+ *   3b. adoption  — a NEW routing target must carry two green probes (DD6); a
+ *                   target the live document already pointed at is grandfathered
  *   4. prev       — only when ROUTING changed, so a rollback target is meaningful
  *   5. models     — conditional PUT; 412/409 is a 409, anything else a 503
  *   6. pricing    — projected from what we just saved; a failure is a 207, not
@@ -27,6 +29,7 @@ import {
   BUNDLED_REGISTRY,
   MODELS_PREV_KEY,
   VersionConflictError,
+  adoptionErrors,
   loadModelsRegistryMeta,
   loadPricingProjection,
   pricingProjection,
@@ -146,6 +149,13 @@ export interface SaveOptions {
   actor: string;
   /** Labels the audit line: a plain save, or a rollback. */
   reason?: string;
+  /**
+   * DD6's adoption gate (step 3b). Off ONLY for a rollback: every routing target
+   * in the previous document was live routing when that document was written, so
+   * restoring it adopts nothing — and a gate that could refuse a rollback would
+   * take away the operator's recovery path exactly when they need it.
+   */
+  adoptionGate?: boolean;
   now?: Date;
 }
 
@@ -174,6 +184,18 @@ export async function runSaveSequence(opts: SaveOptions): Promise<NextResponse> 
       },
       { status: 409, ...NO_STORE }
     );
+  }
+
+  // 3b. Adoption: a model may only BECOME a routing target with both probe
+  // planes green. Needs the live document, so it cannot live in validateRegistry.
+  if (opts.adoptionGate !== false) {
+    const adoption = adoptionErrors(live.registry, candidate);
+    if (Object.keys(adoption).length) {
+      return NextResponse.json(
+        { error: "invalid_registry", fields: adoption, warnings: verdict.warnings },
+        { status: 422, ...NO_STORE }
+      );
+    }
   }
 
   const changed = changedFields(live.registry, candidate);

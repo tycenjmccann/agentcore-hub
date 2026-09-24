@@ -231,6 +231,23 @@ describe("POST /api/models/registry/rollback", () => {
     expect(newPrev.agents.agentcore_hub_workflow_manager).toBe("us.anthropic.claude-fable-5-1");
   });
 
+  it("restores a target nothing else routes to — the adoption gate is off for a rollback", async () => {
+    seatLive(7);
+    // opus-5.5 is a catalogued, active, priced row with no probe block, and no
+    // other field in the live document points at it. As a SAVE this document is
+    // a 422 adoption (TEAM-5008 finding 2); as a rollback it must land, or an
+    // operator loses the recovery path exactly when they need it.
+    const prev = clone(SEED);
+    prev.version = 6;
+    prev.agents.agentcore_hub_workflow_manager = "us.anthropic.claude-opus-5-5";
+    h.state.objects[PREV_KEY] = JSON.stringify(prev);
+
+    const res = await rollback(req("rollback", { baseVersion: 7 }));
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.registry.agents.agentcore_hub_workflow_manager).toBe("us.anthropic.claude-opus-5-5");
+  });
+
   it("409s when the operator's page is behind the live document", async () => {
     seatLive(9);
     seatPrev(6);

@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { NextRequest } from "next/server";
 import seed from "@/config/models.json";
-import type { ModelsRegistry } from "@/lib/models-registry";
+import type { CatalogRow, ModelsRegistry, ProbeOutcome } from "@/lib/models-registry";
 
 /**
  * TEAM-4997 — the registry route. What is worth pinning here is the ORDER and the
@@ -129,6 +129,30 @@ function seatLive(version = 7): ModelsRegistry {
   h.state.objects[MODELS_KEY] = JSON.stringify(live);
   h.state.etags[MODELS_KEY] = '"etag-live"';
   return live;
+}
+
+const GREEN: ProbeOutcome = { ok: true, at: "2026-09-20T00:00:00.000Z", seconds: 3 };
+
+/**
+ * A brand-new, priced, catalogued model, and `tiers.codex.luna` re-pointed at it
+ * — the shape of every adoption an operator can make from the console.
+ */
+function adoptNewModel(candidate: ModelsRegistry, probe?: CatalogRow["probe"]): void {
+  candidate.catalog.push({
+    modelId: "us.openai.gpt-6-nova",
+    label: "GPT-6 Nova",
+    vendor: "openai",
+    family: "gpt-6",
+    endpoint: "bedrock-runtime",
+    region: "us-east-1",
+    api: "converse",
+    contextWindow: 400_000,
+    aliases: [],
+    price: { input: 2, output: 8, source: "interim", asOf: "2026-09-20" },
+    status: "active",
+    ...(probe ? { probe } : {}),
+  });
+  candidate.tiers.codex.luna = "us.openai.gpt-6-nova";
 }
 
 function getReq(query = ""): NextRequest {
@@ -420,6 +444,51 @@ describe("POST /api/models/registry", () => {
     expect(body.ok).toBe(false);
     expect(body.registry.version).toBe(8);
     expect(body.agents).toHaveLength(3);
+  });
+
+  it("422s a model promoted to a routing target before it was probed, naming the field", async () => {
+    seatLive(7);
+    const candidate = clone(SEED);
+    adoptNewModel(candidate);
+
+    const res = await POST(postReq({ baseVersion: 7, registry: candidate }));
+    expect(res.status).toBe(422);
+    const body = await res.json();
+    expect(body.error).toBe("invalid_registry");
+    expect(body.fields).toEqual({ "tiers.codex.luna": "unprobed" });
+    expect(h.state.puts).toEqual([]);
+  });
+
+  it("422s a target with only one green probe — half-proven is not proven", async () => {
+    seatLive(7);
+    const candidate = clone(SEED);
+    adoptNewModel(candidate, { api: GREEN });
+
+    const res = await POST(postReq({ baseVersion: 7, registry: candidate }));
+    expect(res.status).toBe(422);
+    expect((await res.json()).fields["tiers.codex.luna"]).toBe("unprobed");
+    expect(h.state.puts).toEqual([]);
+  });
+
+  it("accepts a new target once both probe planes are green", async () => {
+    seatLive(7);
+    const candidate = clone(SEED);
+    adoptNewModel(candidate, { api: GREEN, cli: GREEN });
+
+    const res = await POST(postReq({ baseVersion: 7, registry: candidate }));
+    expect(res.status).toBe(200);
+    expect((await res.json()).registry.tiers.codex.luna).toBe("us.openai.gpt-6-nova");
+  });
+
+  it("accepts the probe-less seed — a model that is ALREADY routed to is grandfathered", async () => {
+    seatLive(7);
+    const candidate = clone(SEED);
+    // Same model, spelled as one of the row's aliases: re-spelling is not adoption.
+    candidate.agents.agentcore_hub_workflow_manager = "claude-opus-5";
+
+    const res = await POST(postReq({ baseVersion: 7, registry: candidate }));
+    expect(res.status).toBe(200);
+    expect(h.state.puts.map((p) => p.Key)).toEqual([PREV_KEY, MODELS_KEY, PRICING_KEY]);
   });
 
   it("ignores harnessLanes and readOnly in the body — both are seed-owned", async () => {

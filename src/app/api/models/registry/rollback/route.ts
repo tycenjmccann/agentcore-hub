@@ -48,5 +48,8 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
     baseVersion,
     actor: actorFor(req),
     reason: `rollback-to-${previous.version}`,
+    // Every target in prev was live routing when prev was written, so a rollback
+    // adopts nothing — and a gate that could refuse one removes the recovery path.
+    adoptionGate: false,
   });
 }
