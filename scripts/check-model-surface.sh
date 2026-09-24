@@ -144,6 +144,11 @@ ALLOW=(
   'src/lib/agentcore-sdk.ts:/description: "Bedrock model ID/'
   # TEMP TEAM-4996: the builder-tools Lambda's create_harness default.
   'lambda/builder-tools/index.mjs:/const modelId = event\.model_id/'
+
+  # This guard's own prose and --self-test fixtures: comments explaining WHY a
+  # literal is allowed elsewhere, and planted strings it writes into a temp dir
+  # to prove itself. Neither resolves a model at runtime.
+  'scripts/check-model-surface.sh'
 )
 
 # ─── core check ───────────────────────────────────────────────────────────────
