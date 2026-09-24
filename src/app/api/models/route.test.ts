@@ -94,7 +94,6 @@ describe("GET /api/models", () => {
     // Every offered row has a price — an unpriced one would bill at the
     // pricing `default` rate and make its own cost card a guess.
     for (const m of list) {
-      if (m.provider === "openai") continue;
       const row = SEED.catalog.find((r) => r.modelId === m.modelId)!;
       expect(row.status).toBe("active");
       expect(row.price).toBeTruthy();
@@ -157,19 +156,21 @@ describe("GET /api/models", () => {
     expect(list.find((m) => m.modelId === "openai.gpt-5.5")!.description).toContain("Bedrock Mantle (us-east-2)");
   });
 
-  it("appends gpt-4-turbo only when OPENAI_API_KEY_ARN is set, unchanged", async () => {
+  /**
+   * TEAM-5008. The appended option produced an `openAiModelConfig` override, and
+   * the orchestrator honours only `bedrockModelConfig` — so picking it silently
+   * ran the default model. The front door now refuses that shape outright, so
+   * offering it would only move the failure from silent to loud.
+   */
+  it("offers no direct-OpenAI option, even with OPENAI_API_KEY_ARN set", async () => {
     seat();
-    expect((await models()).some((m) => m.id === "gpt-4-turbo")).toBe(false);
-
     process.env.OPENAI_API_KEY_ARN = "arn:aws:secretsmanager:us-east-1:1234:secret:openai";
     const list = await models();
-    expect(list[list.length - 1]).toEqual({
-      id: "gpt-4-turbo",
-      label: "GPT-4 Turbo (OpenAI)",
-      provider: "openai",
-      modelId: "gpt-4-turbo-preview",
-      description: "OpenAI's most capable model.",
-    });
+    expect(list.some((m) => m.id === "gpt-4-turbo")).toBe(false);
+    // Mantle's OpenAI models are catalog rows, so they are still offered.
+    expect(list.some((m) => m.modelId === "openai.gpt-5.5")).toBe(true);
+    // Every option is now a registry row: nothing is appended after the fact.
+    for (const m of list) expect(SEED.catalog.some((r) => r.modelId === m.modelId), String(m.id)).toBe(true);
   });
 
   it("serves the bundled seed when the live document is unreadable", async () => {

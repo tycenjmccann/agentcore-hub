@@ -8,33 +8,23 @@ export const dynamic = "force-dynamic";
 /**
  * GET /api/models
  *
- * Returns the list of available AI models for workflow execution:
- * - Bedrock models come from the registry catalog (active, priced, routable) —
- *   see `projectModelOptions`, which owns the filters and the (Recommended) label
- * - OpenAI models only included if OPENAI_API_KEY_ARN is set
- * - Gemini models only included if GEMINI_API_KEY is set (future)
+ * Every option comes from the registry catalog (active, priced, routable) — see
+ * `projectModelOptions`, which owns the filters and the (Recommended) label.
  *
- * The response contract (`ModelOption[]`, `modelOptionToOverride`) is unchanged,
- * including the OpenAI append below.
+ * TEAM-5008: the hardcoded `gpt-4-turbo` option this route used to append when
+ * OPENAI_API_KEY_ARN was set is gone. It was the one option the picker offered
+ * that nothing downstream could honour: it produced an `openAiModelConfig`
+ * override (`modelOptionToOverride`), and `lambda/orchestrator/agent-invoker.mjs`
+ * reads only `bedrockModelConfig` — so choosing it silently ran the default
+ * model. The workflow front door now refuses that shape outright
+ * (`validateModelOverride`), and offering a choice the front door rejects would
+ * just move the failure from silent to loud. OpenAI models reachable through
+ * Bedrock Mantle are catalog rows and are offered like any other.
  *
  * @returns {ModelsApiResponse} { models: ModelOption[] }
  */
 export async function GET(): Promise<NextResponse<ModelsApiResponse>> {
   const registry = await loadModelsRegistry();
   const models: ModelOption[] = projectModelOptions(registry);
-
-  // Include OpenAI models if API key ARN is configured
-  const openaiApiKeyArn = process.env.OPENAI_API_KEY_ARN;
-  if (openaiApiKeyArn) {
-    models.push({
-      id: "gpt-4-turbo",
-      label: "GPT-4 Turbo (OpenAI)",
-      provider: "openai",
-      modelId: "gpt-4-turbo-preview",
-      description: "OpenAI's most capable model.",
-      // apiKeyArn resolved server-side at invocation time, not sent to client
-    });
-  }
-
   return NextResponse.json({ models });
 }
