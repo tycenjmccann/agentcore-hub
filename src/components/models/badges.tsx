@@ -36,14 +36,31 @@ const PRICE_SOURCE_TITLES: Record<PriceSource, string> = {
 };
 
 /** Where a price came from, which is how much to trust the cost figures built on it. */
-export function PriceSourceBadge({ source, overdue }: { source: PriceSource; overdue?: boolean }) {
-  const title = overdue
-    ? "Interim price is more than 14 days old - replace it with a published rate."
-    : PRICE_SOURCE_TITLES[source];
+export function PriceSourceBadge({ source }: { source: PriceSource }) {
   return (
-    <span className={`${BADGE} ${overdue ? DANGER : PRICE_SOURCE_CLASSES[source]}`} title={title}>
+    <span className={`${BADGE} ${PRICE_SOURCE_CLASSES[source]}`} title={PRICE_SOURCE_TITLES[source]}>
       {source}
-      {overdue ? " overdue" : ""}
+    </span>
+  );
+}
+
+/** Whole days elapsed since an interim price was set — display only. */
+function daysSince(iso: string, now: number = Date.now()): number {
+  return Math.max(0, Math.floor((now - Date.parse(iso)) / 86_400_000));
+}
+
+/**
+ * `interim <N>d` — sits ALONGSIDE the plain PriceSourceBadge (AC10), never instead
+ * of it: the badge says where the price came from, this says how long it has been
+ * a placeholder. Only rendered once an interim price crosses the 14-day ceiling.
+ */
+export function InterimAgeChip({ asOf }: { asOf: string }) {
+  return (
+    <span
+      className={`${BADGE} ${WARNING}`}
+      title="Interim price is more than 14 days old - replace it with a published rate."
+    >
+      interim {daysSince(asOf)}d
     </span>
   );
 }

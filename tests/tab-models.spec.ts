@@ -554,9 +554,10 @@ test.describe("Models page (TEAM-4996)", () => {
     await expect(page.getByTestId("tier-select-claude-opus")).toHaveValue(OPUS5);
     await expect(tiers).toContainText("$5.50 / $27.50 / $0.55 / $6.88 per 1M");
 
-    // sol's interim price is 21 days old: past the ceiling, so it is called out.
+    // sol's interim price is 21 days old: past the ceiling, so the plain "interim"
+    // badge gets a separate "interim <N>d" age chip alongside it (AC10).
     await expect(page.getByTestId("tier-select-codex-sol")).toHaveValue(SOL);
-    await expect(tiers).toContainText("interim overdue");
+    await expect(tiers).toContainText("interim 21d");
 
     // luna points at an unpriced row, so the value stays visible but cannot be re-picked.
     const luna = page.getByTestId("tier-select-codex-luna");
@@ -675,6 +676,28 @@ test.describe("Models page (TEAM-4996)", () => {
     await expect(page.getByTestId(`catalog-quarantine-${FABLE}`)).toBeVisible();
     // Active rows have nothing to adopt.
     await expect(page.getByTestId(`catalog-adopt-${FABLE}`)).toHaveCount(0);
+  });
+
+  test("9b. an overdue interim catalog row gets a badge, an age chip and a tinted row (AC10)", async ({ page }) => {
+    await mockModels(page, mock);
+    await openModels(page);
+
+    // sol: interim, 21 days old — past the 14-day ceiling. The plain "interim"
+    // PriceSourceBadge stays warning-toned (never danger), and a SEPARATE
+    // "interim <N>d" chip carries the overdue call-out, alongside the badge
+    // rather than replacing its text.
+    const sol = page.getByTestId(`catalog-row-${SOL}`);
+    await expect(sol).toContainText("interim");
+    await expect(sol).toContainText(/interim \d+d/);
+    await expect(sol.getByText(/^interim$/)).toBeVisible();
+    expect(await sol.getAttribute("class")).toContain("bg-warning-subtle/40");
+
+    // luna carries no price at all, so it never renders a PriceSourceBadge in the
+    // first place — the control case for "neither the chip nor the tint appear
+    // unless a row is actually flagged overdue".
+    const luna = page.getByTestId(`catalog-row-${LUNA}`);
+    await expect(luna).not.toContainText(/interim \d+d/);
+    expect(await luna.getAttribute("class")).not.toContain("bg-warning-subtle/40");
   });
 
   test("10. a candidate's Adopt is aria-disabled and says which probe is missing", async ({ page }) => {

@@ -12,7 +12,7 @@
  * detail view.
  */
 
-import { ModelStatusBadge, PriceSourceBadge } from "./badges";
+import { InterimAgeChip, ModelStatusBadge, PriceSourceBadge } from "./badges";
 import { rateQuad } from "./format";
 import { ProbeCell } from "./ProbeCell";
 import { TestMenu } from "./TestMenu";
@@ -57,7 +57,7 @@ export function CatalogTableRow({
     <div
       id={`catalog-row-${row.modelId}`}
       data-testid={`catalog-row-${row.modelId}`}
-      className="py-3 border-b border-theme last:border-0 scroll-mt-24"
+      className={`py-3 border-b border-theme last:border-0 scroll-mt-24 ${interimOverdue ? "bg-warning-subtle/40" : ""}`}
     >
       <div className="grid md:grid-cols-[minmax(0,2fr)_minmax(0,2fr)_auto_auto] items-start gap-3">
         <div className="min-w-0">
@@ -91,7 +91,8 @@ export function CatalogTableRow({
             <span className={`text-[11px] tabular-nums ${row.price ? "text-secondary" : "text-danger-fg"}`}>
               {rateQuad(row.price)}
             </span>
-            {row.price && <PriceSourceBadge source={row.price.source} overdue={interimOverdue} />}
+            {row.price && <PriceSourceBadge source={row.price.source} />}
+            {interimOverdue && row.price?.asOf && <InterimAgeChip asOf={row.price.asOf} />}
           </div>
           {row.price?.asOf && <p className="text-[10px] text-muted">as of {row.price.asOf}</p>}
           {row.priceDrift && (

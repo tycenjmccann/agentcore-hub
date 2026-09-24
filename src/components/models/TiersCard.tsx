@@ -12,7 +12,7 @@
  * cache rates are usually the reason one tier costs what it does.
  */
 
-import { PriceSourceBadge } from "./badges";
+import { InterimAgeChip, PriceSourceBadge } from "./badges";
 import { rateQuad } from "./format";
 import { ModelSelect, rowFor } from "./ModelSelect";
 import type { InvalidReason, RegistryDoc } from "./types";
@@ -41,6 +41,7 @@ function TierRows({
       {tiers.map((tier) => {
         const value = map[tier] ?? "";
         const row = rowFor(draft.catalog, value);
+        const overdue = interimOverdue.includes(value);
         return (
           <div key={tier} className="grid grid-cols-[auto_minmax(0,1fr)] md:grid-cols-[auto_minmax(0,1fr)_auto] items-start gap-3">
             <span className={`${TIER_CHIP} mt-6`}>{tier}</span>
@@ -59,9 +60,8 @@ function TierRows({
               <span className={`text-[11px] tabular-nums ${row?.price ? "text-muted" : "text-danger-fg"}`}>
                 {rateQuad(row?.price)}
               </span>
-              {row?.price && (
-                <PriceSourceBadge source={row.price.source} overdue={interimOverdue.includes(row.modelId)} />
-              )}
+              {row?.price && <PriceSourceBadge source={row.price.source} />}
+              {overdue && row?.price?.asOf && <InterimAgeChip asOf={row.price.asOf} />}
             </div>
           </div>
         );
