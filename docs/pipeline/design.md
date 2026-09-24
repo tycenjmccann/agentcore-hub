@@ -821,6 +821,26 @@ so the module stays truly optional.
   approve its own deploy; the ManualApproval gate stays human (Telegram bridge).
   This exists because the coding-runtime role is AccessDenied on CodePipeline by
   design — the RM's dead-zone RCA.
+  **The READ allow-list is derived from the pipeline DEFINITION (TEAM-5033).**
+  The Deploy stage runs *two* CodeBuild actions in parallel — `Deploy`
+  (`agentcore-hub-deploy`) and `Deploy_runtime_images`
+  (`agentcore-hub-runtime-image-deploy`, `deploy/pipeline/lib/pipeline-stack.ts`)
+  — so a target's ci/build/deploy trio is not the full set of projects it owns.
+  `get_build_log` / `get_build_status` therefore resolve a project against the
+  trio **first** (unchanged, AWS-call-free) and only on a miss read each
+  **registered** pipeline's definition via `codepipeline:GetPipeline`, taking
+  every CodeBuild action's `ProjectName`. Cached per pipeline+region+role for
+  `PIPELINE_DISCOVERY_TTL_MS` (5 min), the window opening on failures too. A
+  discovery failure is non-fatal — the trio still resolves, and an unresolvable
+  project is refused as `project_discovery_failed` naming the missing grant and
+  the re-run remedy, never `project_not_registered` and never a 500 (likewise
+  `build_read_not_granted` for `codebuild:BatchGetBuilds`). `start_ci_build` is
+  deliberately **not** widened: the write path never discovers, so a
+  definition-derived deploy project can be read but never started. The grants
+  (`codepipeline:GetPipeline`; the runtime-image project's
+  `BatchGetBuilds`/`ListBuildsForProject`/`GetLogEvents`) land when an operator
+  re-runs `node deploy/setup-pipeline-tools-lambda.mjs`; `./scripts/verify-infra.sh`
+  asserts both.
 - **Ship merge-verify completion gate.** The orchestrator refuses to finalize a
   ship-phase workflow if it can prove the feature branch is unmerged (emits
   `workflow.cd_unmerged`, leaves the run open). Best-effort: a GitHub/API
