@@ -15,18 +15,23 @@
  *    locally (in api.ts), and it renders nothing at all when that module is not
  *    part of this deployment. Core may not import an optional module, and the
  *    module check is a module-scope constant so it reflects the build.
- *  - It is READ ONLY. The ids come from span attributes, i.e. data the fleet wrote,
- *    and there is no route that adopts one: a model enters the catalog through
- *    discovery (Refresh catalog), which sweeps the account rather than trusting a
- *    string out of telemetry. So every row here is inert text — the valid ids get
- *    the discover-then-price hint, and one that does not even look like a model id
- *    says so instead (TEAM-4994 finding 9).
+ *  - It is READ ONLY. The ids come from span attributes, i.e. data the fleet
+ *    wrote. Discovery is the ONLY catalog intake (TEAM-5011): there is no route
+ *    that adopts an id out of a span, because a span-derived string staged as a
+ *    catalog row was TEAM-4994 finding 9's injection origin, and because a
+ *    row's endpoint/region/api cannot be derived from a bare id — discovery
+ *    reads them from the account sweep instead of guessing. So every row here
+ *    is inert text: a valid, discoverable id gets the "press Refresh" hint; a
+ *    valid id a sweep will never list (a bare CLI short name, or a bare
+ *    foundation-model id) gets told so honestly, since it can only ever be
+ *    priced as an alias on an existing row and /models has no alias editor
+ *    yet; and one that does not even look like a model id says so instead.
  */
 
 import { useEffect, useState } from "react";
 import { NAV_ITEMS } from "@/config/modules";
+import { isDiscoverableModelId, isValidModelId } from "@/lib/models/model-id";
 import { getFleetPerformance } from "./api";
-import { isValidModelId } from "./types";
 
 /** Whether the Workflow module is part of this build at all. */
 const WORKFLOW_PRESENT = NAV_ITEMS.some((i) => i.module === "workflow");
@@ -85,6 +90,7 @@ export function UnpricedStrip({ knownModelIds }: { knownModelIds: string[] }) {
           <div className="mt-3 space-y-1">
             {missing.map((id) => {
               const valid = isValidModelId(id);
+              const discoverable = valid && isDiscoverableModelId(id);
               return (
                 <div
                   key={id}
@@ -94,12 +100,18 @@ export function UnpricedStrip({ knownModelIds }: { knownModelIds: string[] }) {
                   <span className="text-[11px] font-mono text-secondary truncate" title={id}>
                     {id}
                   </span>
-                  {valid ? (
+                  {!valid ? (
+                    <span className="text-[11px] text-warning-fg flex-shrink-0">not a valid model id</span>
+                  ) : discoverable ? (
                     <span className="text-[11px] text-muted flex-shrink-0 text-right">
                       Not in the catalog. Press Refresh catalog to discover it, then set a price.
                     </span>
                   ) : (
-                    <span className="text-[11px] text-warning-fg flex-shrink-0">not a valid model id</span>
+                    <span className="text-[11px] text-muted flex-shrink-0 text-right">
+                      Refresh catalog will not find this id — discovery only lists us.* / global.* profiles and
+                      openai.* Mantle models. It can only be priced as an alias on its catalog row, which /models
+                      cannot edit yet.
+                    </span>
                   )}
                 </div>
               );

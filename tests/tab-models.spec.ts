@@ -64,6 +64,8 @@ const PA_LIVE = "global.anthropic.claude-sonnet-4-5-20250929-v1:0";
 const SPAN_UNPRICED = "us.anthropic.claude-tiny-1";
 /** Seen in spans and NOT a model id: rendered with a reason instead. */
 const SPAN_EVIL = 'x"\n[evil]';
+/** A valid id a sweep will never list (bare CLI short name) — TEAM-5011's third hint. */
+const SPAN_BARE = "claude-opus-6";
 
 /**
  * What a catalog refresh reports. The API names the ids, it does not count them —
@@ -280,7 +282,7 @@ function runsFixture(): Json[] {
     {
       workflowId: "wf-models-4996",
       completedAt: new Date(NOW - 3600_000).toISOString(),
-      cost: { unpricedModels: [SPAN_UNPRICED, SPAN_EVIL] },
+      cost: { unpricedModels: [SPAN_UNPRICED, SPAN_EVIL, SPAN_BARE] },
     },
     {
       workflowId: "wf-models-4995",
@@ -819,12 +821,12 @@ test.describe("Models page (TEAM-4996)", () => {
     await openModels(page);
 
     const strip = page.getByTestId("unpriced-strip");
-    // FABLE is in the catalog, so only the two unknown ids are reported.
-    await expect(strip).toContainText("2 unpriced models seen in spans");
+    // FABLE is in the catalog, so only the three unknown ids are reported.
+    await expect(strip).toContainText("3 unpriced models seen in spans");
     await expect(strip).toContainText(SPAN_UNPRICED);
     // The second id is SPAN_EVIL, whose own characters make it unusable as a
     // selector — the row count plus its reason is the honest way to assert it.
-    await expect(strip.locator("[data-testid^='unpriced-row-']")).toHaveCount(2);
+    await expect(strip.locator("[data-testid^='unpriced-row-']")).toHaveCount(3);
     await expect(strip).toContainText("not a valid model id");
 
     // There is no route that adopts a model id out of a span attribute, so there is
@@ -833,6 +835,12 @@ test.describe("Models page (TEAM-4996)", () => {
     await expect(page.getByTestId(`unpriced-row-${SPAN_UNPRICED}`)).toContainText(
       "Not in the catalog. Press Refresh catalog to discover it, then set a price.",
     );
+    // SPAN_BARE is a valid id shape, but discovery never lists a bare CLI short
+    // name — TEAM-5011's third hint says so instead of implying Refresh would help.
+    await expect(page.getByTestId(`unpriced-row-${SPAN_BARE}`)).toContainText(
+      "Refresh catalog will not find this id",
+    );
+    await expect(page.getByTestId(`unpriced-row-${SPAN_BARE}`)).toContainText("cannot edit yet");
 
     // The strip reaching the catalog route at all is the bug this pins.
     expect(mock.counts.catalogPost).toBe(0);

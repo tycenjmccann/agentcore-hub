@@ -11,7 +11,10 @@
  *
  * The only shared config imported is src/config/agents.json, the roster's single
  * source of truth (see CLAUDE.md) — deriving the deployable list from it is what
- * keeps the page's 46 rows correct as the fleet changes.
+ * keeps the page's 46 rows correct as the fleet changes. The one *lib* import is
+ * src/lib/models/model-id.ts (TEAM-5011): it is a core lib with zero imports of
+ * its own and no AWS SDK, so it does not reintroduce the dependency this file
+ * otherwise avoids — it exists so MODEL_ID_RE has one definition, not two.
  */
 
 import agentsConfig from "@/config/agents.json";
@@ -351,17 +354,14 @@ export const JUDGE_PIN_FILES = [
 
 // ─── Validation ─────────────────────────────────────────────────────────────
 
-/**
- * A model id we are willing to offer "Add to catalog" for. The unpriced strip
- * reads ids out of span attributes, i.e. data the fleet wrote — so an id that
- * does not look like a model id is rendered as inert text instead of becoming a
- * one-click catalog write (TEAM-4994 finding 9).
- */
-export const MODEL_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{1,127}$/;
-
-export function isValidModelId(id: string): boolean {
-  return MODEL_ID_RE.test(id);
-}
+// The unpriced strip reads ids out of span attributes, i.e. data the fleet
+// wrote, not the operator. There is no route that turns one into a catalog
+// row (TEAM-5011): discovery is the only intake, because a span-derived string
+// staged as a candidate row was TEAM-4994 finding 9's injection origin. So the
+// shape check below only decides which of two inert-text messages a row gets,
+// never whether a write happens. The shape itself is defined once, in the
+// zero-dependency sibling lib, and re-exported here.
+export { MODEL_ID_RE, isValidModelId } from "@/lib/models/model-id";
 
 // ─── Path -> control ────────────────────────────────────────────────────────
 
