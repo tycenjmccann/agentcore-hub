@@ -122,8 +122,12 @@ METRIC_NAMES = [
 ]
 
 # ── Card versions ────────────────────────────────────────────────────────────
-CARD_V5 = 5                    # what lambda/cost-report/index.mjs emits on main
-CARD_V6 = 6                    # what PR #635 will emit
+# These two name WHICH VERSION FIRST CARRIED A FIELD, not the accept-minimum
+# (that is compute_metrics.CARD_MIN_REPORT_VERSION, 7 since TEAM-4995): the cost
+# fields below have been on every card since v5 and `quality.rewakes` since v6,
+# so a later repricing must NOT move them or the reasons below would lie.
+CARD_V5 = 5                    # the cost/time/quality counters every card carries
+CARD_V6 = 6                    # what PR #635 added (quality.rewakes)
 V6_PR = "PR #635"
 
 # ── Thresholds and windows (all arithmetic constants live here) ──────────────

@@ -57,8 +57,12 @@ const REGION = getArg("region") || process.env.AWS_REGION || "us-east-1";
 // text and flushed it in a single burst at message end, which read as a
 // frozen, unstreamed blob in the CHAT drawer after a long tool loop). If
 // fable-5-1 still buffers, fall back to pinning us.anthropic.claude-opus-5.
-const MODEL_ID = getArg("model-id") || "us.anthropic.claude-fable-5-1";
+const LITERAL_MODEL_ID = "us.anthropic.claude-fable-5-1";
+// --model-id always wins; otherwise the registry answers. Resolved below, AFTER
+// the --print-policy exit (that path must stay offline and print only JSON).
+const MODEL_ID_ARG = getArg("model-id");
 const HARNESS_NAME = "agentcore_hub_workflow_manager";
+const HARNESS_AGENT_ID = HARNESS_NAME;
 const MEMORY_NAME = "agentcore_hub_workflow_manager_memory";
 const ROLE_NAME = "agentcore-hub-harness-role";
 
@@ -188,6 +192,25 @@ const WM_DATA_POLICY = {
       ],
     },
     {
+      // This harness is prompt-driven and the Allow above is bucket-wide, so it also
+      // covers the model registry — the document that decides which model it and every
+      // fleet persona runs on. Its toolkit writes run artifacts and reads only
+      // config/workflows.json (pull_dossier.py); the registry read below happens at
+      // DEPLOY time, under the operator's credentials, not this role's. So the three
+      // registry keys are denied back and a Deny outranks every Allow. The writers are
+      // the token aggregator's own role (deploy/setup-token-aggregator-role.sh,
+      // RegistryReadWrite, already key-scoped) and the hub's ECS task role (the console
+      // save) — neither is touched.
+      Sid: "DenyRegistryWrite",
+      Effect: "Deny",
+      Action: ["s3:PutObject", "s3:DeleteObject"],
+      Resource: [
+        `arn:aws:s3:::${ARTIFACT_BUCKET}/config/models.json`,
+        `arn:aws:s3:::${ARTIFACT_BUCKET}/config/models.prev.json`,
+        `arn:aws:s3:::${ARTIFACT_BUCKET}/config/pricing.json`,
+      ],
+    },
+    {
       // crash-rca skill: pull_session_logs.py reads runtime log groups +
       // span destinations to diagnose dead agent sessions. Read-only.
       Sid: "SessionLogsRead",
@@ -217,6 +240,57 @@ if (PRINT_POLICY) {
   console.log(JSON.stringify(WM_DATA_POLICY, null, 2));
   process.exit(0);
 }
+
+// ─── Registry-driven default model (TEAM-4995, DL-033) ────────────────────────
+// The catalog in config/models.json owns which model this harness runs on, so a
+// model bump is an edit to that document rather than to this script. --model-id
+// still wins over everything.
+//
+// Deliberately BELOW the --print-policy exit: that path is offline, prints only
+// the policy JSON and must keep stdout machine-parseable, and it has no business
+// reading S3.
+//
+// Inlined rather than shared with the other two setup scripts: they import
+// nothing from each other, and a new shared module would have to be on the CD
+// Deploy role's path in all three deploy surfaces. Three copies of 20 lines beat
+// that. Every failure keeps LITERAL_MODEL_ID — this script's documented default
+// (see the streaming note next to it) — so an unreadable registry changes
+// nothing about what gets deployed.
+async function resolveDefaultModelId(agentId) {
+  let reg = null;
+  let resolveAgentModel;
+  let validateRegistry;
+  try {
+    // The canonical resolver (byte-copied to the token-aggregator and Telegram
+    // bridge Lambdas, scripts/check-models-registry-parity.sh). A checkout without
+    // it throws ERR_MODULE_NOT_FOUND, which is a fallback, not a failure.
+    ({ resolveAgentModel, validateRegistry } =
+      await import(new URL("../../src/lib/models/models-registry.mjs", import.meta.url).href));
+  } catch (err) {
+    console.log(`[models] registry.fallback reason=${err?.code === "ERR_MODULE_NOT_FOUND" ? "module-missing" : "import"}`);
+    return LITERAL_MODEL_ID;
+  }
+  try {
+    const { S3Client, GetObjectCommand } = await import("@aws-sdk/client-s3");
+    const res = await new S3Client({ region: REGION })
+      .send(new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: "config/models.json" }));
+    const doc = JSON.parse(await res.Body.transformToString());
+    reg = validateRegistry ? validateRegistry(doc).registry : doc;
+    if (!reg) throw new Error("invalid registry");
+  } catch (err) {
+    console.log(`[models] registry.fallback reason=s3 (${err?.name || err?.message})`);
+  }
+  const { modelId, source } = resolveAgentModel(reg, agentId, "", process.env);
+  // `literal` means nothing in the catalog or the env named a model. Keep THIS
+  // harness's documented default rather than the registry's generic persona
+  // literal, so a missing registry is a no-op for this script.
+  const chosen = source === "literal" ? LITERAL_MODEL_ID : modelId;
+  console.log(`[models] harness.model agentId=${agentId} modelId=${chosen} source=${source}`);
+  return chosen;
+}
+
+const MODEL_ID = MODEL_ID_ARG || (await resolveDefaultModelId(HARNESS_AGENT_ID));
+if (MODEL_ID_ARG) console.log(`[models] harness.model agentId=${HARNESS_AGENT_ID} modelId=${MODEL_ID} source=--model-id`);
 
 // ─── 1/4 Execution role (shared harness role + WM data-plane policy) ───────────
 console.log("\n1/4 Execution role");

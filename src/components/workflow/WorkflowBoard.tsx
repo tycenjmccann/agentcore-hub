@@ -11,6 +11,7 @@ import {
 } from "@/lib/workflow/types";
 import awsIcons from "@/lib/aws-icons.json";
 import { NAV_ITEMS } from "@/config/modules";
+import { useModelsRegistry } from "@/lib/models-registry-client";
 import { getPipelinePhases, resolveToolIcon, getPhaseToolCount, type PipelinePhaseConfig } from "@/lib/pipeline-config";
 import { DEFAULT_WORKFLOW_DEF_ID, getWorkflowDef } from "@/lib/workflow/workflow-defs";
 import { resolveSdlcFramework, sdlcBadgeFor } from "@/lib/workflow/sdlc-framework";
@@ -165,6 +166,19 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
   const sdlcBadge = sdlcBadgeFor(fw);
   const pipelinePhases = useMemo(() => getPipelinePhases(workflowDefId), [workflowDefId]);
   const phaseOrder = useMemo(() => buildPhaseOrder(pipelinePhases), [pipelinePhases]);
+  // The models a phase runs come from the registry, resolved per agent. The board used
+  // to print a roll-up of the display strings in agents.json, which described nothing
+  // the fleet actually invoked. phase.agents[].agentId is already the roster id, so
+  // these are exact keys.
+  const { resolve: resolveModel } = useModelsRegistry();
+  const phaseModels = useMemo(() => {
+    const byPhase: Record<string, string[]> = {};
+    for (const phase of pipelinePhases) {
+      const labels = phase.agents.map((a) => resolveModel(a.agentId).shortLabel).filter(Boolean);
+      byPhase[phase.id] = [...new Set(labels)];
+    }
+    return byPhase;
+  }, [pipelinePhases, resolveModel]);
   // Refs so stable useCallback event handlers always see the current def's phases/order.
   const pipelinePhasesRef = useRef(pipelinePhases);
   pipelinePhasesRef.current = pipelinePhases;
@@ -1649,13 +1663,15 @@ export default function WorkflowBoard({ workflowId, onAskManager }: WorkflowBoar
                     <div className="meta-row">{phase.typeLabel}</div>
                   </div>
 
-                  {phase.models.length > 0 && (
-                    <div className="card-models">
-                      {phase.models.map((model, i) => (
-                        <div key={i} className="model-row">{model}</div>
-                      ))}
-                    </div>
-                  )}
+                  <div className="card-models">
+                    {(phaseModels[phase.id] ?? []).length === 0 ? (
+                      <div className="model-row">-</div>
+                    ) : (
+                      phaseModels[phase.id].map((model) => (
+                        <div key={model} className="model-row">{model}</div>
+                      ))
+                    )}
+                  </div>
 
                   <div className="card-stats">
                     <div className="stat-row">{getPhaseToolCount(phase.id, workflowDefId || DEFAULT_WORKFLOW_DEF_ID)} Tools</div>

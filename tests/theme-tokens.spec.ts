@@ -10,8 +10,12 @@ import * as path from "path";
  * It should FAIL on the pre-fix codebase and PASS after the theme token migration.
  */
 
-// Files to scan
-const WORKFLOW_DIR = path.join(__dirname, "..", "src", "components", "workflow");
+// Files to scan. Every new themed component directory belongs here — a directory
+// nobody added is a directory nobody is checking.
+const SCAN_DIRS = [
+  path.join(__dirname, "..", "src", "components", "workflow"),
+  path.join(__dirname, "..", "src", "components", "models"),
+];
 
 // Forbidden patterns: hardcoded neutral color classes that break light mode
 const FORBIDDEN_PATTERNS = [
@@ -84,12 +88,18 @@ function isExemptLine(line: string, fileName: string): boolean {
 }
 
 test.describe("Theme Token Regression", () => {
-  test("workflow components must not contain hardcoded zinc/gray/slate neutral classes", () => {
-    const tsxFiles = fs.readdirSync(WORKFLOW_DIR).filter((f) => f.endsWith(".tsx"));
+  test("workflow and models components must not contain hardcoded zinc/gray/slate neutral classes", () => {
     const violations: string[] = [];
+    const scanned: Array<{ dir: string; file: string }> = SCAN_DIRS.flatMap((dir) =>
+      fs
+        .readdirSync(dir)
+        .filter((f) => f.endsWith(".tsx"))
+        .map((file) => ({ dir, file })),
+    );
 
-    for (const file of tsxFiles) {
-      const filePath = path.join(WORKFLOW_DIR, file);
+    for (const { dir, file } of scanned) {
+      const filePath = path.join(dir, file);
+      const label = `${path.basename(dir)}/${file}`;
       const content = fs.readFileSync(filePath, "utf-8");
       const lines = content.split("\n");
 
@@ -121,7 +131,7 @@ test.describe("Theme Token Regression", () => {
         for (const pattern of FORBIDDEN_PATTERNS) {
           if (pattern.test(line)) {
             if (!isExemptLine(line, file)) {
-              violations.push(`${file}:${i + 1}: ${line.trim().slice(0, 100)}`);
+              violations.push(`${label}:${i + 1}: ${line.trim().slice(0, 100)}`);
               break; // One violation per line is enough
             }
           }
@@ -131,7 +141,7 @@ test.describe("Theme Token Regression", () => {
 
     if (violations.length > 0) {
       const message = [
-        `Found ${violations.length} hardcoded neutral color class(es) in workflow components.`,
+        `Found ${violations.length} hardcoded neutral color class(es) in scanned components.`,
         "These break light mode. Use theme-aware tokens instead:",
         "  bg-zinc-800/900 → bg-surface-1/bg-surface-2",
         "  text-zinc-100/200 → text-primary",

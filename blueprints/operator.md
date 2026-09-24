@@ -189,7 +189,13 @@ the request, and you create no tickets.
 ```
 claude_code(repo="<owner/repo>", plan_only=True, model="opus", task=<PLAN PROMPT>)
 ```
-Use `model="fable"` when the request is ambiguous or architecture-heavy. Plan
+Use `model="fable"` when the request is ambiguous or architecture-heavy. Every
+`claude_code` tier has a `codex` peer on the same rung — `codex(model="astra")` ≈
+fable, `codex(model="sol")` ≈ opus, `codex(model="terra")` ≈ sonnet,
+`codex(model="luna")` ≈ haiku — so a review or re-check can be pitched at the same
+difficulty as the turn that produced the work; leaving `model=` off either tool takes
+the configured default. Tier names resolve through the model registry
+(`config/models.json`); never pass a raw model id from a blueprint. Plan
 mode cannot edit files. Read the plan yourself and check:
 - goal matches the work order; acceptance criteria all covered by a unit or a test
 - scope is the smallest change that meets the goal (bugs: root cause, not

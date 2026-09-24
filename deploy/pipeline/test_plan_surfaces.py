@@ -81,21 +81,64 @@ def test_wm_system_prompt_md_updates_harness():
     assert [a[1] for a in kinds(actions, "HARNESS")] == ["agentcore_hub_workflow_manager"]
 
 
-def test_pricing_json_is_an_s3_cp():
+def test_pricing_json_no_longer_unconditional_s3cp():
+    # TEAM-4995 / DL-033: pricing.json WAS an s3[] surface, so every deploy cp'd
+    # the repo copy over the rates the nightly reconcile had refreshed in S3. It
+    # is `excluded` now and seeded once, only alongside models.json, by the
+    # head-object guard in Target 2 — so a change to it must plan NOTHING.
     actions = ps.plan(["src/config/pricing.json"], MANIFEST)
-    assert kinds(actions, "S3CP") == [["S3CP", "src/config/pricing.json", "config/pricing.json"]]
+    assert actions == []
+    assert "src/config/pricing.json" not in [s["src"] for s in MANIFEST["s3"]]
+    assert "src/config/pricing.json" in MANIFEST["excluded"]
+
+
+def test_models_json_seeded_only_when_absent():
+    # The live registry is the S3 copy (POST /api/models/registry + the reconcile
+    # write it), so the deploy must only SEED it. Assert the buildspec guard text
+    # rather than the manifest: the whole point is that it is not a surface.
+    buildspec = (HERE / "buildspec-deploy.yml").read_text(encoding="utf-8")
+    guard = "if ! aws s3api head-object --bucket \"$ARTIFACT_BUCKET\" --key config/models.json"
+    assert guard in buildspec, "seed-if-absent guard for config/models.json is missing"
+    seed_block = buildspec.split(guard, 1)[1].split("\n        aws s3 cp \"s3://$ARTIFACT_BUCKET/config/agents.json\"", 1)[0]
+    # Both files are seeded only INSIDE the absent branch, each behind a -f test
+    # (their sources are TEAM-4997's and may not be on the branch yet).
+    for key in ("models.json", "pricing.json"):
+        assert f"[ -f src/config/{key} ] && aws s3 cp src/config/{key} " in seed_block, key
+    # ...and nowhere else: no unconditional cp of either one.
+    for key in ("models.json", "pricing.json"):
+        assert buildspec.count(f"aws s3 cp src/config/{key}") == 1, key
+    assert "src/config/models.json" in MANIFEST["excluded"]
 
 
 def test_workflows_json_is_an_s3_cp():
     # TEAM-4259: workflows.json used to ship via a hardcoded `aws s3 cp` in
     # buildspec-deploy.yml Target 2, outside the manifest. It is a plain S3CP
-    # surface now, exactly like pricing.json above.
+    # surface now — the one remaining src/config/*.json that IS a deploy surface
+    # (agents.json is merged, models/pricing.json are seed-if-absent).
     actions = ps.plan(["src/config/workflows.json"], MANIFEST)
     assert kinds(actions, "S3CP") == [["S3CP", "src/config/workflows.json", "config/workflows.json"]]
 
 
+def test_models_registry_py_in_both_runtime_surfaces():
+    # The Python twin is baked into BOTH images (deploy/runtime-agent/Dockerfile
+    # and deploy/coding-agent-runtime/Dockerfile COPY it), so editing it must roll
+    # every runtime — a change reaching only one image is a split-brain registry.
+    fleet = ps.plan(["deploy/runtime-agent/models_registry.py"], MANIFEST)
+    assert [a[1] for a in kinds(fleet, "RUNTIME")] == ["agentcore_hub_agent"]
+    assert not kinds(fleet, "HANDOFF")
+    coding = ps.plan(["deploy/coding-agent-runtime/models_registry.py"], MANIFEST)
+    assert [a[1] for a in kinds(coding, "RUNTIME")] == [
+        "agentcore_hub_coding_runtime",
+        "agentcore_hub_coding_runtime_ec2",
+    ]
+    assert not kinds(coding, "HANDOFF")
+
+
 def test_model_catalog_change_updates_builder_harness():
-    actions = ps.plan(["src/lib/models/harness-models.json"], MANIFEST)
+    # TEAM-4997: the builder's harness lanes moved off harness-models.json and
+    # onto the model registry seed (src/config/models.json) — a lane change
+    # there still re-runs setup-builder-agent.mjs, same as before.
+    actions = ps.plan(["src/config/models.json"], MANIFEST)
     assert [a[1] for a in kinds(actions, "HARNESS")] == ["agentcore_hub_builder"]
     assert kinds(actions, "HARNESS")[0][2] == "deploy/setup-builder-agent.mjs"
 

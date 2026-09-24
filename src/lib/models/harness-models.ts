@@ -23,11 +23,18 @@
  *      catalog ships only the Bedrock lanes for Mantle. To add a direct-OpenAI
  *      model, give its entry an apiKeyArn.
  *
- * The catalog DATA lives in `harness-models.json` so deploy scripts (.mjs) and
- * this module share exactly one list. This file adds the types + config builder.
+ * TEAM-4997: the lane DATA is no longer its own file. It is a projection of the
+ * model registry — `catalog[].harnessLanes[]` in `src/config/models.json` (live:
+ * `s3://$ARTIFACT_BUCKET/config/models.json`) — so a harness lane and the model's
+ * price, endpoint and probe results can no longer disagree about what a model is.
+ * `harness-models.mjs` derives the same list for deploy scripts with the same
+ * rule, and `harness-models-parity.test.ts` proves the two agree.
+ *
+ * Lanes on RETIRED rows are kept: an already-deployed harness still references
+ * them, and a config we can't resolve is worse than one we no longer recommend.
  */
 
-import catalog from "./harness-models.json";
+import { BUNDLED_REGISTRY } from "@/lib/models-registry";
 
 export type BedrockApiFormat = "converse_stream" | "responses" | "chat_completions";
 export type OpenAiApiFormat = "responses" | "chat_completions";
@@ -71,17 +78,95 @@ export interface HarnessModelOption {
   requiresMantle?: boolean;
 }
 
+/** The minimum shape the derivation needs — a parsed registry or the raw doc. */
+export interface RegistryLike {
+  defaults?: { persona?: string };
+  catalog?: Array<{
+    modelId: string;
+    label?: string;
+    requiresMantle?: boolean;
+    harnessLanes?: Array<{
+      id: string;
+      apiFormat: string;
+      requiresMantle?: boolean;
+      apiKeyArn?: string;
+      label?: string;
+      description?: string;
+    }>;
+  }>;
+}
+
+export interface HarnessCatalog {
+  models: HarnessModelOption[];
+  defaultId: string;
+}
+
+/**
+ * Flatten a registry's harness lanes into the catalog this module has always
+ * exported. THIS RULE IS DUPLICATED, BYTE FOR BYTE, IN harness-models.mjs —
+ * deploy scripts cannot import TypeScript, and the parity test is what keeps the
+ * two honest:
+ *   provider       = lane.apiKeyArn ? "openai" : "bedrock"
+ *   label          = lane.label ?? row.label ?? row.modelId
+ *   requiresMantle = lane.requiresMantle ?? row.requiresMantle
+ *   isDefault      = the FIRST lane of the `defaults.persona` row
+ * Display order is catalog order, then lane order within a row.
+ */
+export function harnessModelsFrom(registry: RegistryLike): HarnessCatalog {
+  const models: HarnessModelOption[] = [];
+  const persona = registry.defaults?.persona || "";
+  let defaultId = "";
+
+  for (const row of registry.catalog || []) {
+    for (const lane of row.harnessLanes || []) {
+      if (!lane?.id || !lane?.apiFormat) continue;
+      const option: HarnessModelOption = {
+        id: lane.id,
+        label: lane.label || row.label || row.modelId,
+        provider: lane.apiKeyArn ? "openai" : "bedrock",
+        modelId: row.modelId,
+        apiFormat: lane.apiFormat as BedrockApiFormat | OpenAiApiFormat,
+      };
+      if (lane.apiKeyArn) option.apiKeyArn = lane.apiKeyArn;
+      if (lane.description) option.description = lane.description;
+      const requiresMantle = lane.requiresMantle ?? row.requiresMantle;
+      if (requiresMantle) option.requiresMantle = true;
+      if (!defaultId && row.modelId === persona) {
+        option.isDefault = true;
+        defaultId = lane.id;
+      }
+      models.push(option);
+    }
+  }
+
+  // A persona with no harness lane (e.g. an openai default) still needs SOME
+  // resolvable default, or every CreateHarness call would have to name a lane.
+  if (!defaultId && models.length) {
+    models[0].isDefault = true;
+    defaultId = models[0].id;
+  }
+  return { models, defaultId };
+}
+
+const BUNDLED: HarnessCatalog = harnessModelsFrom(BUNDLED_REGISTRY);
+
 /** Curated catalog (order = display order; exactly one `isDefault`). */
-export const HARNESS_MODELS: HarnessModelOption[] =
-  catalog.models as HarnessModelOption[];
+export const HARNESS_MODELS: HarnessModelOption[] = BUNDLED.models;
 
-export const DEFAULT_HARNESS_MODEL_ID: string = catalog.defaultId;
+export const DEFAULT_HARNESS_MODEL_ID: string = BUNDLED.defaultId;
 
-/** Look up a catalog entry by UI id OR by raw provider modelId. */
-export function findHarnessModel(idOrModelId: string): HarnessModelOption | undefined {
+/**
+ * Look up a catalog entry by UI id OR by raw provider modelId. `models` defaults
+ * to the bundled seed's lanes; a caller holding a LIVE registry passes
+ * `harnessModelsFrom(registry).models` so there is still exactly one lookup rule.
+ */
+export function findHarnessModel(
+  idOrModelId: string,
+  models: HarnessModelOption[] = HARNESS_MODELS
+): HarnessModelOption | undefined {
   return (
-    HARNESS_MODELS.find((m) => m.id === idOrModelId) ||
-    HARNESS_MODELS.find((m) => m.modelId === idOrModelId)
+    models.find((m) => m.id === idOrModelId) ||
+    models.find((m) => m.modelId === idOrModelId)
   );
 }
 
@@ -93,8 +178,11 @@ export function findHarnessModel(idOrModelId: string): HarnessModelOption | unde
  * Falls back to a native-Converse bedrock config for unknown Bedrock model ids
  * (safe default), so passing a raw `us.anthropic.*` id still works.
  */
-export function buildHarnessModelConfig(idOrModelId: string): HarnessModelConfig {
-  const opt = findHarnessModel(idOrModelId);
+export function buildHarnessModelConfig(
+  idOrModelId: string,
+  models: HarnessModelOption[] = HARNESS_MODELS
+): HarnessModelConfig {
+  const opt = findHarnessModel(idOrModelId, models);
 
   if (!opt) {
     return { bedrockModelConfig: { modelId: idOrModelId, apiFormat: "converse_stream" } };

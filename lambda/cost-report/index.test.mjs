@@ -23,6 +23,11 @@
 // Importing index.mjs evaluates its top-level `@aws-sdk/*` imports; see
 // pricing.test.mjs's header for why that is safe offline and never ships.
 //
+// A second section at the bottom of this file covers REPORT_VERSION 7 (TEAM-4995):
+// unpriced models as a visible gap, long-context rates, and the pricing-document
+// shape gate. Same reason it lives here — those are the card's other cross-surface
+// contracts, pinned where a reader of the card's numbers will look for them.
+//
 // Run: `node --test lambda/cost-report` from the repo root.
 
 import { test } from "node:test";
@@ -30,7 +35,20 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
-import { dedupeEvents, fixTicketIds, intakeCompletedAt, isFixTicket } from "./index.mjs";
+import {
+  DEFAULT_PRICING,
+  LONG_CONTEXT_SPLIT,
+  LONG_CONTEXT_THRESHOLD_TOKENS,
+  REPORT_VERSION,
+  addUsage,
+  dedupeEvents,
+  fixTicketIds,
+  foldUnpriced,
+  intakeCompletedAt,
+  isFixTicket,
+  isUsablePricing,
+  pricingFrom,
+} from "./index.mjs";
 
 const FIXTURE = fileURLToPath(
   new URL("../../deploy/workflow-manager/toolkit/fixtures/fix-lineage.json", import.meta.url),
@@ -167,4 +185,167 @@ test("ids are deduped across the three sources and ordered by creation", () => {
   const ids = fixTicketIds(events(), rows, asWorkflow());
   assert.deepEqual(ids, EXPECTED_IDS);
   assert.equal(new Set(ids).size, ids.length);
+});
+
+// ─── REPORT_VERSION 7 (TEAM-4995) ─────────────────────────────────────────────
+//
+// A model with no row in config/pricing.json used to be billed silently at
+// pricing.default — a plausible number the reader had no way to distrust. v7 keeps
+// billing it (dropping the spend would be worse) and says so: one gap per model,
+// one `cost.unpricedModels` array, one log line. The same version adds long-context
+// rates, whose threshold split happens in the Logs Insights query.
+
+const M = 1_000_000;
+const round2 = (n) => Math.round(n * 100) / 100;
+
+/** Capture console.log for one call; returns [result, lines]. */
+function capturingLog(fn) {
+  const lines = [];
+  const real = console.log;
+  console.log = (...args) => lines.push(args.join(" "));
+  try {
+    return [fn(), lines];
+  } finally {
+    console.log = real;
+  }
+}
+
+test("REPORT_VERSION is 7", () => {
+  // The WM's CARD_MIN_REPORT_VERSION (deploy/workflow-manager/toolkit/
+  // compute_metrics.py) is pinned to the same number, and every card below it is
+  // rejected — which is why a version bump requires `deploy.sh --backfill`.
+  assert.equal(REPORT_VERSION, 7);
+});
+
+test("unpriced model lands in gaps and cost.unpricedModels (sorted, distinct)", () => {
+  const pricing = { models: { priced: { input: 1, output: 1 } }, default: { input: 10, output: 50 } };
+  const byAgent = {};
+  const unpriced = new Set();
+  // zzz twice (distinct), aaa once, and one priced model that must NOT appear.
+  for (const model of ["zzz", "priced", "aaa", "zzz"]) {
+    addUsage(byAgent, "dev", "persona", { model, inp: M, outp: 0 }, pricing, unpriced);
+  }
+  const gaps = [];
+  const [models, lines] = capturingLog(() => foldUnpriced(unpriced, gaps, "wf_1"));
+
+  assert.deepEqual(models, ["aaa", "zzz"]);
+  assert.deepEqual(gaps, [
+    "model aaa has no price row; billed at pricing.default",
+    "model zzz has no price row; billed at pricing.default",
+  ]);
+  // Exactly one log line per report, whatever the number of models.
+  assert.deepEqual(lines, ["[models] cost.unpriced workflowId=wf_1 models=aaa,zzz"]);
+  // Billed, not dropped: 4 rows × 1M input — 3 at the default rate, 1 priced.
+  assert.equal(round2(byAgent.dev.engines.persona.usd), round2(3 * 10 + 1));
+});
+
+test("a fully priced run yields cost.unpricedModels [] and logs nothing", () => {
+  const pricing = { models: { m: { input: 10, output: 50 } }, default: { input: 10, output: 50 } };
+  const byAgent = {};
+  const unpriced = new Set();
+  addUsage(byAgent, "dev", "persona", { model: "m", inp: M, outp: M }, pricing, unpriced);
+  const gaps = [];
+  const [models, lines] = capturingLog(() => foldUnpriced(unpriced, gaps, "wf_2"));
+
+  assert.deepEqual(models, []);
+  assert.deepEqual(gaps, []);
+  assert.deepEqual(lines, []);
+});
+
+test("the unpriced set is per-report — two reports never share one", () => {
+  // Regression guard for the warm-Lambda hazard: a module-global set would make
+  // run 2's card inherit run 1's missing model.
+  const pricing = { models: {}, default: { input: 10, output: 50 } };
+  const first = new Set(), second = new Set();
+  addUsage({}, "dev", "persona", { model: "only-in-run-1", inp: M, outp: 0 }, pricing, first);
+  addUsage({}, "dev", "persona", { model: "only-in-run-2", inp: M, outp: 0 }, pricing, second);
+  assert.deepEqual([...first], ["only-in-run-1"]);
+  assert.deepEqual([...second], ["only-in-run-2"]);
+});
+
+test("addUsage bills longContext rates only above the threshold", () => {
+  const pricing = {
+    models: {
+      g: {
+        input: 5.5, output: 33, cacheReadInput: 0.55,
+        longContext: { input: 11, output: 66, cacheReadInput: 1.1, thresholdInputTokens: 272_000 },
+      },
+    },
+    default: { input: 10, output: 50 },
+  };
+  // The threshold is applied by the Insights query, which tags each returned row;
+  // `lc` on the row is that tag, and the row's own `inp` is the SUM over the
+  // group. Mirror the query's comparison here so the boundary is pinned once.
+  const lcTag = (spanInput) => ({ lc: spanInput > LONG_CONTEXT_THRESHOLD_TOKENS });
+  assert.equal(lcTag(272_000).lc, false, "272,000 input tokens is still standard rate");
+  assert.equal(lcTag(272_001).lc, true, "the boundary is strictly greater");
+  // ...and the query halves encode exactly that boundary.
+  assert.deepEqual(LONG_CONTEXT_SPLIT.map(([lc, filter]) => [lc, filter]), [
+    [true, "| filter i > 272000"],
+    [false, "| filter i <= 272000"],
+  ]);
+
+  const bill = (spanInput) => {
+    const byAgent = {};
+    // claude_code: input_tokens is the uncached remainder, so 1M in / 1M out bills
+    // at face value and the rate swap is the only variable.
+    addUsage(byAgent, "dev", "claude_code",
+      { model: "g", inp: M, outp: M, ...lcTag(spanInput) }, pricing);
+    return round2(byAgent.dev.engines.claude_code.usd);
+  };
+  assert.equal(bill(272_000), round2(5.5 + 33));
+  assert.equal(bill(272_001), round2(11 + 66));
+
+  // A missing longContext field falls back to the row's standard rate.
+  const partial = { models: { g: { input: 5.5, output: 33, longContext: { input: 11 } } }, default: { input: 10, output: 50 } };
+  const byAgent = {};
+  addUsage(byAgent, "dev", "claude_code", { model: "g", inp: M, outp: M, lc: true }, partial);
+  assert.equal(round2(byAgent.dev.engines.claude_code.usd), round2(11 + 33));
+
+  // A model with no longContext block is never long-context billed.
+  const flat = { models: { g: { input: 5.5, output: 33 } }, default: { input: 10, output: 50 } };
+  const plain = {};
+  addUsage(plain, "dev", "claude_code", { model: "g", inp: M, outp: M, lc: true }, flat);
+  assert.equal(round2(plain.dev.engines.claude_code.usd), round2(5.5 + 33));
+});
+
+test("per-model cacheReadInput 0.22 beats cachedInputDiscount", () => {
+  const pricing = {
+    models: { s: { input: 2.2, output: 11, cacheReadInput: 0.22 } },
+    default: { input: 10, output: 50 },
+    cachedInputDiscount: 0.5, // would price 1M reads at $1.10 if it won
+  };
+  const byAgent = {};
+  addUsage(byAgent, "dev", "persona", { model: "s", inp: M, outp: 0, cacheRead: M }, pricing);
+  assert.equal(round2(byAgent.dev.engines.persona.usd), 0.22);
+});
+
+test("loadPricing accepts a usable document and falls back on shape", () => {
+  const good = {
+    models: { "us.anthropic.claude-opus-5": { input: 5.5, output: 27.5 } },
+    default: { input: 5.5, output: 27.5 },
+  };
+  assert.equal(isUsablePricing(good), true);
+  const [merged, quiet] = capturingLog(() => pricingFrom(good));
+  assert.equal(merged.models["us.anthropic.claude-opus-5"].input, 5.5);
+  assert.equal(merged.agentcore.runtimeGbHourUsd, DEFAULT_PRICING.agentcore.runtimeGbHourUsd); // merged, not replaced
+  assert.deepEqual(quiet, []);
+
+  // Shape, not parse success — each of these is valid JSON that used to win.
+  for (const bad of [
+    { models: {}, default: { input: 5.5, output: 27.5 } },      // no model rows
+    { models: good.models },                                    // no default pair
+    { models: good.models, default: { input: 5.5 } },            // half a default
+    { models: good.models, default: { input: 0, output: 27.5 } }, // not positive
+    { models: good.models, default: { input: "5.5", output: "27.5" } }, // strings
+    { models: [], default: { input: 5.5, output: 27.5 } },       // array, not a map
+    { _comment: "half-written" },
+    [], null, "nope",
+  ]) {
+    assert.equal(isUsablePricing(bad), false, JSON.stringify(bad));
+    const [p, lines] = capturingLog(() => pricingFrom(bad));
+    assert.equal(p, DEFAULT_PRICING);
+    assert.equal(lines.length, 1);
+    assert.match(lines[0], /^\[models\] pricing\.fallback reason=shape/);
+  }
 });

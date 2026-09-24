@@ -200,6 +200,46 @@ else
 fi
 
 ARTIFACT_BUCKET="${ARTIFACT_BUCKET:-agentcore-hub-artifacts-${ACCOUNT_ID}-${AWS_REGION}}"
+
+# ─── Model registry grants (TEAM-4995, DL-033) ───────────────────────────────
+# Two statements are appended to the policy below for the one-model-registry work.
+#
+# ModelDiscovery — bedrock:ListInferenceProfiles + pricing:GetProducts, the two
+# read-only listings the Models surface refreshes the catalog from. Neither API
+# takes a resource ARN, so Resource "*" is the only expressible form.
+#
+# HarnessRepin — the Models surface re-pins a harness onto the model the registry
+# names, which needs bedrock-agentcore:UpdateHarness. That action is NOT added to
+# the AgentCore statement below (Resource "*"): UpdateHarness REPLACES a harness's
+# model, system prompt and environment, so it stays in its own statement scoped to
+# the three harnesses this hub owns, resolved live here.
+#
+# A harness that does not exist yet is WARNed and skipped - never widened to "*".
+# Re-run this script after creating it (the put-role-policy below is idempotent).
+HUB_HARNESSES="agentcore_hub_workflow_manager agentcore_hub_builder agentcore_hub_routine_builder"
+HARNESS_ARNS=""
+for _h in $HUB_HARNESSES; do
+  _arn="$(aws bedrock-agentcore-control list-harnesses --region "$AWS_REGION" \
+    --query "harnesses[?harnessName=='${_h}'].arn | [0]" --output text 2>/dev/null || true)"
+  if [[ -z "$_arn" || "$_arn" == "None" ]]; then
+    echo "        WARNING: harness ${_h} not found - UpdateHarness not granted for it"
+    continue
+  fi
+  HARNESS_ARNS+="${HARNESS_ARNS:+,}\"${_arn}\""
+done
+HARNESS_REPIN_STMT=""
+if [[ -n "$HARNESS_ARNS" ]]; then
+  HARNESS_REPIN_STMT=",
+      {
+        \"Sid\": \"HarnessRepin\",
+        \"Effect\": \"Allow\",
+        \"Action\": \"bedrock-agentcore:UpdateHarness\",
+        \"Resource\": [${HARNESS_ARNS}]
+      }"
+else
+  echo "        WARNING: no hub harness resolved - HarnessRepin statement omitted (a model re-pin from the UI will be denied)"
+fi
+
 aws iam put-role-policy \
   --role-name "$TASK_ROLE" \
   --policy-name "AgentCoreHubRuntimePerms" \
@@ -325,7 +365,13 @@ aws iam put-role-policy \
         \"Effect\": \"Allow\",
         \"Action\": \"sts:AssumeRole\",
         \"Resource\": \"arn:aws:iam::*:role/hub-cd-trigger-*\"
-      }
+      },
+      {
+        \"Sid\": \"ModelDiscovery\",
+        \"Effect\": \"Allow\",
+        \"Action\": [\"bedrock:ListInferenceProfiles\", \"pricing:GetProducts\"],
+        \"Resource\": \"*\"
+      }${HARNESS_REPIN_STMT}
     ]
   }"
 echo "        Attached inline runtime policy"

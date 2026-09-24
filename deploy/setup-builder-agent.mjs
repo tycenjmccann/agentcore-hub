@@ -65,6 +65,74 @@ function getAllArgs(name) {
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
+// ─── Registry-driven default model (TEAM-4995, DL-033) ───────────────────────
+// The catalog in config/models.json owns which model this harness runs on, so a
+// model bump is an edit to that document rather than to this script. --model-id
+// still wins over everything.
+//
+// Inlined rather than shared with the other two setup scripts: they import
+// nothing from each other, and a new shared module would have to be on the CD
+// Deploy role's path in all three deploy surfaces. Three copies of 20 lines beat
+// that. Every failure keeps LITERAL_MODEL_ID — this script's documented default
+// — so an unreadable registry changes nothing about what gets deployed.
+const LITERAL_MODEL_ID = "us.anthropic.claude-sonnet-5";
+// The prompt's "models you may pin" list normally comes from the catalog (see
+// pinnableModelsCopy). This tail is reached only when config/models.json cannot
+// be read at all, and names the ids the prompt has always named — minus the
+// dated global Haiku 4.5 id it used to offer, which is not a catalog row at all
+// and so was never a model the builder could actually pin.
+const LITERAL_PINNABLE_MODEL_IDS = [LITERAL_MODEL_ID, "us.anthropic.claude-opus-5"];
+const HARNESS_AGENT_ID = "agentcore_hub_builder";
+
+/**
+ * config/models.json as read, or null. Read ONCE, used twice: the model this
+ * harness runs on, and the prompt copy's list of models the builder may pin.
+ * The read needs no loader module — the catalog is plain JSON — so it is
+ * separate from the resolution below and happens even with --model-id.
+ */
+async function loadRegistryDoc() {
+  try {
+    const { S3Client, GetObjectCommand } = await import("@aws-sdk/client-s3");
+    const bucket = process.env.ARTIFACT_BUCKET || `agentcore-hub-artifacts-${accountId}-${REGION}`;
+    const res = await new S3Client({ region: REGION })
+      .send(new GetObjectCommand({ Bucket: bucket, Key: "config/models.json" }));
+    return JSON.parse(await res.Body.transformToString());
+  } catch (err) {
+    console.log(`[models] registry.fallback reason=s3 (${err?.name || err?.message})`);
+    return null;
+  }
+}
+
+async function resolveDefaultModelId(agentId, doc) {
+  let reg = null;
+  let resolveAgentModel;
+  let validateRegistry;
+  try {
+    // The canonical resolver (byte-copied to the token-aggregator and Telegram
+    // bridge Lambdas, scripts/check-models-registry-parity.sh). A checkout without
+    // it throws ERR_MODULE_NOT_FOUND, which is a fallback, not a failure.
+    ({ resolveAgentModel, validateRegistry } =
+      await import(new URL("../src/lib/models/models-registry.mjs", import.meta.url).href));
+  } catch (err) {
+    console.log(`[models] registry.fallback reason=${err?.code === "ERR_MODULE_NOT_FOUND" ? "module-missing" : "import"}`);
+    return LITERAL_MODEL_ID;
+  }
+  try {
+    if (!doc) throw new Error("no registry document");
+    reg = validateRegistry ? validateRegistry(doc).registry : doc;
+    if (!reg) throw new Error("invalid registry");
+  } catch (err) {
+    console.log(`[models] registry.fallback reason=parse (${err?.name || err?.message})`);
+  }
+  const { modelId, source } = resolveAgentModel(reg, agentId, "", process.env);
+  // `literal` means nothing in the catalog or the env named a model. Keep THIS
+  // harness's documented default rather than the registry's generic persona
+  // literal, so a missing registry is a no-op for this script.
+  const chosen = source === "literal" ? LITERAL_MODEL_ID : modelId;
+  console.log(`[models] harness.model agentId=${agentId} modelId=${chosen} source=${source}`);
+  return chosen;
+}
+
 const REGION = getArg("region") || process.env.AWS_REGION || "us-east-1";
 let HARNESS_ROLE_ARN = getArg("harness-role-arn");
 let MEMORY_ID = getArg("memory-id");
@@ -73,7 +141,9 @@ let MEMORY_ID = getArg("memory-id");
 const NO_MEMORY = args.includes("--no-memory");
 const MEMORY_NAME = "agentcore_hub_builder_memory";
 const MCP_URLS = getAllArgs("mcp-url");
-const MODEL_ID = getArg("model-id") || "us.anthropic.claude-sonnet-5";
+// --model-id always wins; otherwise the registry answers (resolved below, once
+// the account id the bucket name is derived from is known).
+const MODEL_ID_ARG = getArg("model-id");
 const ROLE_NAME = "agentcore-hub-harness-role";
 // PIPELINE_MODE=1: the CI/CD Deploy stage runs this under its narrow role — no
 // IAM writes, no memory provisioning, no verify invoke. Only the code-like
@@ -85,6 +155,11 @@ const PIPELINE_MODE = process.env.PIPELINE_MODE === "1";
 const sts = new STSClient({ region: REGION });
 const identity = await sts.send(new GetCallerIdentityCommand({}));
 const accountId = identity.Account;
+
+// --- Resolve the model (TEAM-4995) ---
+const REGISTRY_DOC = await loadRegistryDoc();
+const MODEL_ID = MODEL_ID_ARG || (await resolveDefaultModelId(HARNESS_AGENT_ID, REGISTRY_DOC));
+if (MODEL_ID_ARG) console.log(`[models] harness.model agentId=${HARNESS_AGENT_ID} modelId=${MODEL_ID} source=--model-id`);
 
 // --- Create or verify IAM role ---
 if (PIPELINE_MODE && !HARNESS_ROLE_ARN) {
@@ -490,6 +565,31 @@ for (let i = 0; i < MCP_URLS.length; i++) {
 // --- System prompt ---
 // A hoisted function (not a const) so the update-in-place path above can build
 // it before this point in the file executes.
+/**
+ * The "Models" bullets in the system prompt, as a PROJECTION of the catalog
+ * rather than a second list of ids: a row the operator retires or quarantines
+ * stops being offered on the next deploy, without editing this script.
+ *
+ * Which rows: active, not read-only (the eval-judge row is not pinnable), and
+ * `converse` — a harness speaks Converse, so a `responses` row would be a
+ * create_harness failure, not a choice. Sorted by id so two runs against the
+ * same catalog produce byte-identical prompt copy. No resolution happens here,
+ * only a read of three fields of the one document, so no loader is needed.
+ */
+function pinnableModelsCopy() {
+  const rows = Array.isArray(REGISTRY_DOC?.catalog) ? REGISTRY_DOC.catalog : [];
+  const offered = rows
+    .filter((r) => r && typeof r.modelId === "string" && !r.readOnly)
+    .filter((r) => (r.status || "active") === "active" && (r.api || "converse") === "converse")
+    .map((r) => [r.modelId, r.label || r.family || r.vendor || ""])
+    .sort((a, b) => a[0].localeCompare(b[0]));
+  const list = offered.length ? offered : LITERAL_PINNABLE_MODEL_IDS.map((id) => [id, ""]);
+  return list
+    .map(([id, label]) =>
+      `  - \`${id}\`${label ? ` — ${label}` : ""}${id === MODEL_ID ? " (this harness's own default)" : ""}`)
+    .join("\n");
+}
+
 function buildSystemPrompt() {
   return `You are the Builder Agent — you create and configure AI agents on Amazon Bedrock AgentCore.
 
@@ -521,7 +621,7 @@ client = boto3.client("bedrock-agentcore-control", region_name="${REGION}")
 response = client.create_harness(
     harnessName="my_new_agent",
     executionRoleArn="${HARNESS_ROLE_ARN}",
-    model={"bedrockModelConfig": {"modelId": "us.anthropic.claude-sonnet-5"}},
+    model={"bedrockModelConfig": {"modelId": "${MODEL_ID}"}},
     systemPrompt=[{"text": "Your system prompt here..."}],
     tools=[
         # Add remote_mcp for each MCP server the agent needs:
@@ -539,10 +639,8 @@ print(f"Created: {response['harness']['harnessId']}")
 ## Agent Design Guidelines
 
 - **Naming**: snake_case, descriptive: \`customer_support_agent\`, \`code_review_agent\`
-- **Models**:
-  - \`us.anthropic.claude-sonnet-5\` — Fast, good for most tasks (default)
-  - \`us.anthropic.claude-opus-5\` — Most capable, complex reasoning
-  - \`global.anthropic.claude-haiku-4-5-20251001-v1:0\` — Fastest, cheapest
+- **Models** (from the catalog in config/models.json — pin one of these):
+${pinnableModelsCopy()}
 - **System Prompts**: Clear role, specific capabilities, when/how to use tools
 - **Tool Wiring**: Use \`remote_mcp\` to connect agents to MCP servers. The URL is all that's needed — the agent discovers available tools at runtime.
 

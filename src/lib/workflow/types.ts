@@ -369,8 +369,14 @@ export interface WorkflowInput {
   description: string;
   repoConfig: RepoConfig;
   sources: IntakeSource[];
-  /** Per-invocation model override for dev agents (e.g., Opus for complex tasks) */
-  modelOverride?: ModelOverride;
+  /**
+   * Per-invocation model override for dev agents (e.g., Opus for complex tasks).
+   * A bare string is as real as the object form — the Routines module sends one
+   * (`src/lib/routines/payload.ts`) and the orchestrator honours both — and
+   * `/api/workflow/start` normalises whichever arrives to a resolved catalog id
+   * (`validateModelOverride`, TEAM-5008).
+   */
+  modelOverride?: ModelOverride | string;
   /** Connector ids (routine-scoped) forwarded to each agent invoke so the runtime
    *  loads their creds/tools for this run only. See src/lib/connectors. */
   connectors?: string[];

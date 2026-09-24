@@ -2165,6 +2165,30 @@ async function verifyPrBase({ issue, prUrl }) {
 // Folded in from the (no-longer-shipped) agentcore-hub-s3-tools Lambda. Runtime
 // agents call these via S3Storage___read_object / write_object / list_objects.
 
+// `key` arrives straight from a prompt-driven persona and nothing checked it, so
+// S3Storage___write_object({key:"config/models.json"}) used to rewrite the document
+// that decides which model that very persona runs on — and config/ also holds the
+// agent roster, the CD registry and the connectors. The role's DenyRegistryWrite
+// (deploy/setup-lambda-role.sh) is the boundary; this is the same refusal one layer
+// up, as a value the agent can read instead of an opaque AccessDenied.
+//
+// Deliberately narrow: every documented use of these tools writes under workflows/
+// (blueprints/*.md), but other prefixes are written too (pipeline-artifacts/,
+// completions/, cloud-code/), so an allow-list here would guess. config/ is the one
+// prefix no agent has any reason to write.
+const PROTECTED_KEY_PREFIX = "config/";
+
+function refuseProtectedKey(key, what) {
+  if (!key.startsWith(PROTECTED_KEY_PREFIX)) return null;
+  console.warn(`[s3-tools] REFUSED ${what} ${key}: ${PROTECTED_KEY_PREFIX} is not agent-writable`);
+  return {
+    status: "refused",
+    reason: "protected_key",
+    key,
+    message: `Not written: ${PROTECTED_KEY_PREFIX}* holds the hub's own configuration — the model registry (config/models.json), the agent roster, the CD registry — and is not writable by an agent. The role denies it too, so retrying will not help. Write your artifacts under workflows/{workflow_id}/.`,
+  };
+}
+
 async function s3ReadObject({ bucket, key, encoding }) {
   const targetBucket = bucket || BUCKET;
   if (!targetBucket) throw new Error("bucket is required (no ARTIFACT_BUCKET configured)");
@@ -2190,6 +2214,12 @@ async function s3PresignUrl({ bucket, key, operation, content_type, expires_in }
   if (!targetBucket) throw new Error("bucket is required (no ARTIFACT_BUCKET configured)");
   if (!key) throw new Error("key is required");
   const op = (operation || "put").toLowerCase();
+  // A presigned PUT is a write with the Lambda's own credentials baked in, so the
+  // same refusal applies here; a GET is a read and stays open.
+  if (op !== "get") {
+    const refusal = refuseProtectedKey(key, "presign put");
+    if (refusal) return refusal;
+  }
   const cmd = op === "get"
     ? new GetObjectCommand({ Bucket: targetBucket, Key: key })
     : new PutObjectCommand({ Bucket: targetBucket, Key: key, ContentType: content_type || "application/octet-stream" });
@@ -2205,6 +2235,8 @@ async function s3WriteObject({ bucket, key, content, content_type, encoding }) {
   const targetBucket = bucket || BUCKET;
   if (!targetBucket) throw new Error("bucket is required (no ARTIFACT_BUCKET configured)");
   if (!key) throw new Error("key is required");
+  const protectedRefusal = refuseProtectedKey(key, "write");
+  if (protectedRefusal) return protectedRefusal;
   // Binary artifacts (images, PDFs, zips) can't survive as a UTF-8 string — the
   // S3 SDK re-encodes any byte > 0x7F. Agents deliver them base64-encoded with
   // encoding:"base64"; decode back to raw bytes here so the stored object is a

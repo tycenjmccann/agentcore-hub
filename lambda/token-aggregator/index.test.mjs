@@ -1,6 +1,20 @@
 // Hermetic unit tests for the token-aggregator's record parsing + bucketing.
 // No AWS: the module's clients are constructed but never sent to here.
-import { describe, it, expect, beforeAll } from 'vitest';
+import { describe, it, expect, beforeAll, vi } from 'vitest';
+
+// The model modes (TEAM-4995) are stubbed out: this file's job is the ROUTING —
+// that `{"mode":"reconcile"}` reaches the reconcile instead of being swallowed by
+// the "no awslogs data" early return. `./models-deps.mjs` is mocked as well
+// because the real one imports the Bedrock/Pricing/AgentCore SDKs, which are
+// dependencies of the Lambda's own package.json and not of the repo root.
+const { reconcileModels, probeModel, buildDeps } = vi.hoisted(() => ({
+  reconcileModels: vi.fn(async () => ({ outcome: 'ok', added: 0 })),
+  probeModel: vi.fn(async () => ({ statusCode: 200, ok: true })),
+  buildDeps: vi.fn(async () => ({ marker: 'deps' })),
+}));
+vi.mock('./models-reconcile.mjs', () => ({ reconcileModels }));
+vi.mock('./models-probe.mjs', () => ({ probeModel }));
+vi.mock('./models-deps.mjs', () => ({ buildDeps }));
 
 let mod;
 beforeAll(async () => {
@@ -145,5 +159,26 @@ describe('resolveAgentId', () => {
     expect(mod.resolveAgentId('/aws/bedrock-agentcore/runtimes/agentcore_hub_agent_x-abc-DEFAULT', agents)).toBe('agentcore_hub_agent_x');
     expect(mod.resolveAgentId('/aws/bedrock-agentcore/runtimes/harness_personal_assistant_agent-nQbmlnB3cI-DEFAULT', agents)).toBe('personal_assistant_agent');
     expect(mod.resolveAgentId('/aws/bedrock-agentcore/runtimes/FixItAgent_Agent-96xckb2RqK-DEFAULT', agents)).toBeNull();
+  });
+});
+
+describe('handler routing', () => {
+  it('routes mode=reconcile and mode=probe before the awslogs check', async () => {
+    expect(await mod.handler({ mode: 'reconcile' })).toEqual({ outcome: 'ok', added: 0 });
+    expect(reconcileModels).toHaveBeenCalledWith({ mode: 'reconcile' }, { marker: 'deps' });
+
+    const probeEvent = { mode: 'probe', modelId: 'us.anthropic.claude-opus-5', probe: 'api' };
+    expect(await mod.handler(probeEvent)).toEqual({ statusCode: 200, ok: true });
+    expect(probeModel).toHaveBeenCalledWith(probeEvent, { marker: 'deps' });
+    expect(buildDeps).toHaveBeenCalledTimes(2);
+  });
+
+  it('leaves the aggregation path alone: no model work for an event with no awslogs data', async () => {
+    reconcileModels.mockClear();
+    probeModel.mockClear();
+    expect(await mod.handler({})).toEqual({ statusCode: 200 });
+    expect(await mod.handler({ action: 'reset' })).toEqual({ statusCode: 200, body: 'reset-ignored' });
+    expect(reconcileModels).not.toHaveBeenCalled();
+    expect(probeModel).not.toHaveBeenCalled();
   });
 });

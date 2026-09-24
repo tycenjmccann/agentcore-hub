@@ -13,6 +13,13 @@
 # historical cost/quality trend survives. TTL is disabled on the table by
 # deploy/continuous-improvement/deploy-all.sh.
 #
+# This Lambda ALSO hosts the model registry's maintenance modes (TEAM-4995,
+# DL-033): the daily `{"mode":"reconcile"}` rule created by deploy.sh and the
+# on-demand `{"mode":"probe"}` invoke. That is why it has npm dependencies, its
+# own IAM role and a 15-minute timeout — the reconcile walks inference profiles,
+# Mantle's model list and the Pricing API, and a CLI probe drives a whole coding
+# turn on the coding runtime.
+#
 # Idempotent: re-runs update the Lambda code/config and skip resources that
 # already exist.
 #
@@ -20,8 +27,11 @@
 #
 # Required env (loaded from .env.local if present):
 #   AWS_REGION
-#   LAMBDA_ROLE_ARN  (set by deploy/setup-lambda-role.sh)
-#   ARTIFACT_BUCKET  (defaults to agentcore-hub-artifacts-<ACCOUNT>-<REGION>)
+#   ARTIFACT_BUCKET           (defaults to agentcore-hub-artifacts-<ACCOUNT>-<REGION>)
+# Optional:
+#   TOKEN_AGGREGATOR_ROLE_ARN (defaults to the role setup-token-aggregator-role.sh creates)
+#   CODING_AGENT_RUNTIME_ARN  (else resolved by deploy/config.sh; the `cli` probe needs it)
+#   BEDROCK_MANTLE_REGIONS    (defaults to us-east-2,us-east-1)
 
 set -euo pipefail
 
@@ -47,7 +57,11 @@ done
 
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 LAMBDA_NAME="agentcore-hub-token-aggregator"
-LAMBDA_ROLE="${LAMBDA_ROLE_ARN:-arn:aws:iam::${ACCOUNT_ID}:role/agentcore-hub-lambda-role}"
+# Its OWN role, not the shared agentcore-hub-lambda-role: the model modes need
+# bedrock:ListInferenceProfiles, pricing:GetProducts, a write on
+# config/models.json and the coding-runtime invoke, none of which belong on the
+# role every other Lambda shares. Created by deploy/setup-token-aggregator-role.sh.
+LAMBDA_ROLE="${TOKEN_AGGREGATOR_ROLE_ARN:-arn:aws:iam::${ACCOUNT_ID}:role/agentcore-hub-token-aggregator-role}"
 # Per-day bucket table (PK agentId / SK day, no TTL — buckets are permanent).
 # Created by deploy-all.sh; ensured here too so this script is a complete entry point.
 DAILY_TABLE_NAME="${EVAL_DAILY_TABLE:-agentcore-hub-eval-daily}"
@@ -57,11 +71,37 @@ DAILY_TABLE_NAME="${EVAL_DAILY_TABLE:-agentcore-hub-eval-daily}"
 BUCKET="${ARTIFACT_BUCKET:-agentcore-hub-artifacts-${ACCOUNT_ID}-${REGION}}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LAMBDA_DIR="${SCRIPT_DIR}/../../lambda/token-aggregator"
+# Which coding runtime the `cli` probe drives. deploy/config.sh owns that
+# resolution (env, else whichever deploy wrote its ARN file), so read it from
+# there — in a SUBSHELL, because config.sh derives its own region-dependent
+# exports and must not override the --region handling above.
+CODING_RUNTIME_ARN="${CODING_AGENT_RUNTIME_ARN:-}"
+if [[ -z "${CODING_RUNTIME_ARN}" ]]; then
+  CODING_RUNTIME_ARN="$(
+    (
+      # shellcheck disable=SC1091
+      source "${REPO_ROOT_BOOT}/deploy/config.sh" >/dev/null 2>&1
+      printf '%s' "${CODING_AGENT_RUNTIME_ARN:-}"
+    ) || true
+  )"
+fi
+# Mantle regions the reconcile's discovery asks for models (see mantleRegions()).
+MANTLE_REGIONS="${BEDROCK_MANTLE_REGIONS:-us-east-2,us-east-1}"
 
 echo "=== Deploy Token Aggregator ==="
 echo "Region:  ${REGION}"
 echo "Account: ${ACCOUNT_ID}"
 echo "Lambda:  ${LAMBDA_NAME}"
+echo "Role:    ${LAMBDA_ROLE}"
+echo "Coding runtime (cli probe): ${CODING_RUNTIME_ARN:-(unset - cli probes will report CODING_AGENT_RUNTIME_ARN unset)}"
+
+if ! aws iam get-role --role-name "${LAMBDA_ROLE##*/}" >/dev/null 2>&1; then
+  echo "ERROR: IAM role ${LAMBDA_ROLE} does not exist." >&2
+  echo "       Run deploy/setup-token-aggregator-role.sh first - it grants the model-registry" >&2
+  echo "       permissions (bedrock:ListInferenceProfiles, pricing:GetProducts, the coding-runtime" >&2
+  echo "       invoke and read+write on config/models.json) that the shared Lambda role does not." >&2
+  exit 1
+fi
 
 ###############################################################################
 # Step 0: Daily bucket table (idempotent; full setup lives in deploy-all.sh)
@@ -89,7 +129,19 @@ echo ""
 echo "--- Step 1: Deploy Lambda ---"
 
 cd "${LAMBDA_DIR}"
-zip -j /tmp/token-aggregator.zip index.mjs
+# The model modes need the Bedrock, Pricing, AgentCore and SigV4 packages, which
+# the nodejs20 runtime does not bundle — so this Lambda ships node_modules from
+# its committed lockfile. ONE zip line, which is what
+# scripts/check-lambda-zip-manifest.sh matches against the import closure.
+npm ci --omit=dev --no-audit --no-fund
+rm -f /tmp/token-aggregator.zip
+zip -rq /tmp/token-aggregator.zip index.mjs models-registry.mjs models-reconcile.mjs models-probe.mjs models-deps.mjs bedrock-token.mjs package.json node_modules/
+
+# 900s: a reconcile walks every region's inference profiles, Mantle's model list
+# and the Pricing API, and a `cli` probe drives a full coding turn. The log
+# subscription path still returns in milliseconds.
+LAMBDA_ENV="Variables={EVAL_DAILY_TABLE=${DAILY_TABLE_NAME},ARTIFACTS_BUCKET=${BUCKET}"
+LAMBDA_ENV="${LAMBDA_ENV},CODING_AGENT_RUNTIME_ARN=${CODING_RUNTIME_ARN},BEDROCK_MANTLE_REGIONS=${MANTLE_REGIONS}}"
 
 if aws lambda get-function --function-name "${LAMBDA_NAME}" --region "${REGION}" >/dev/null 2>&1; then
   echo "Updating existing Lambda..."
@@ -100,8 +152,9 @@ if aws lambda get-function --function-name "${LAMBDA_NAME}" --region "${REGION}"
   aws lambda wait function-updated --function-name "${LAMBDA_NAME}" --region "${REGION}"
   aws lambda update-function-configuration \
     --function-name "${LAMBDA_NAME}" \
-    --timeout 60 --memory-size 256 \
-    --environment "Variables={EVAL_DAILY_TABLE=${DAILY_TABLE_NAME},ARTIFACTS_BUCKET=${BUCKET}}" \
+    --role "${LAMBDA_ROLE}" \
+    --timeout 900 --memory-size 256 \
+    --environment "${LAMBDA_ENV}" \
     --region "${REGION}" --output text --query 'FunctionArn'
 else
   echo "Creating new Lambda..."
@@ -111,8 +164,8 @@ else
     --handler index.handler \
     --role "${LAMBDA_ROLE}" \
     --zip-file fileb:///tmp/token-aggregator.zip \
-    --timeout 60 --memory-size 256 \
-    --environment "Variables={EVAL_DAILY_TABLE=${DAILY_TABLE_NAME},ARTIFACTS_BUCKET=${BUCKET}}" \
+    --timeout 900 --memory-size 256 \
+    --environment "${LAMBDA_ENV}" \
     --region "${REGION}" --output text --query 'FunctionArn'
   aws lambda wait function-active --function-name "${LAMBDA_NAME}" --region "${REGION}"
 fi

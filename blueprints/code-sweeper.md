@@ -181,7 +181,7 @@ A session that dies after the deliverable but before the report leaves the run u
 
 ## Rules
 - Plan the removals and approve the plan BEFORE any deletion (Step 3). Never let the engine delete code before you have read and approved its removal plan. `codex` (the default) has no plan mode — get the plan as text and approve it before the delete turn; on the `claude_code` fallback use `plan_only=True`.
-- `claude_code` fallback model tiers (`model=`): PLAN turns on `"opus"` (`"fable"` for ambiguous work); EXECUTE turns on `"sonnet"`, `"opus"` for complex ones. Never plan on haiku. (`codex` is pinned — no `model=`.)
+- `claude_code` fallback model tiers (`model=`): PLAN turns on `"opus"` (`"fable"` for ambiguous work); EXECUTE turns on `"sonnet"`, `"opus"` for complex ones. Never plan on haiku. `codex` takes the same ladder through its own tier names — `codex(model="astra")` ≈ fable, `codex(model="sol")` ≈ opus, `codex(model="terra")` ≈ sonnet, `codex(model="luna")` ≈ haiku — and an empty `model=` takes the configured default. Tier names resolve through the model registry (`config/models.json`); never pass a raw model id from a blueprint.
 - ZERO verified removals = ZERO downstream work. Report `outcome="empty_sweep"`
   (the EMPTY SWEEP rule in Step 2) and stop — never transition another ticket
   yourself; cross-ticket skip cascades live in the tool (FR-10). Never push a

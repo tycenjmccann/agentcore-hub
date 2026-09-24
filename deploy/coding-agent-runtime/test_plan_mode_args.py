@@ -16,6 +16,7 @@ Run: python3 -m pytest -q deploy/coding-agent-runtime/test_plan_mode_args.py
 """
 
 import ast
+import importlib.util
 import json
 import textwrap
 from pathlib import Path
@@ -26,6 +27,26 @@ import pytest
 MAIN_PY = Path(__file__).resolve().parent / "main.py"
 _SRC = MAIN_PY.read_text()
 _TREE = ast.parse(_SRC)
+
+
+def _models_registry():
+    spec = importlib.util.spec_from_file_location(
+        "plan_mode_models_registry", MAIN_PY.parent / "models_registry.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_MR = _models_registry()
+OPUS = "us.anthropic.claude-opus-5"
+# `--model` is resolved against the registry now (TEAM-4995), so the namespace
+# gets the REAL resolver plus a stub registry instead of a CLAUDE_MODEL literal.
+TEST_REGISTRY = {
+    "version": 1,
+    "catalog": [{"modelId": OPUS, "status": "active", "endpoint": "bedrock-runtime",
+                 "region": "us-east-1", "api": "converse"}],
+    "tiers": {"claude": {"opus": OPUS}},
+}
 
 
 def _segment(pred):
@@ -49,7 +70,8 @@ def _load():
         "os": __import__("os"),
         "json": json,
         "subprocess": __import__("subprocess"),
-        "CLAUDE_MODEL": "us.anthropic.claude-fable-5-1",
+        "load_registry": lambda *a, **k: TEST_REGISTRY,
+        "resolve_coding_model": _MR.resolve_coding_model,
         "WORKSPACE_ROOT": "/tmp/pf-test-ws",
         "TURN_TIMEOUT_S": 1500,
         "_otel_turn_env": lambda session_id: {},
@@ -106,6 +128,13 @@ def test_plan_mode_keeps_resume_model_and_output_format(rt, tmp_path):
     assert args[args.index("--model") + 1] == "us.anthropic.claude-opus-5"
     assert args[args.index("--output-format") + 1] == "json"
     assert "--max-turns" in args
+
+
+def test_a_tier_name_is_resolved_against_the_registry(rt, tmp_path):
+    # The fleet forwards the tier VERBATIM now; this runtime owns resolution, so
+    # "opus" must reach the CLI as a concrete model id (TEAM-4995).
+    args = rt["_build_claude_args"](str(tmp_path), None, stream=False, model="opus")
+    assert args[args.index("--model") + 1] == OPUS
 
 
 def test_plan_mode_stream_variant(rt, tmp_path):

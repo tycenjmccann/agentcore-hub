@@ -38,15 +38,27 @@
  * still carry a stale `expiresAt` attribute; it is no longer a TTL attribute, so
  * nothing expires, and new writes stop stamping it.
  *
+ * This Lambda also hosts the model registry's two maintenance modes (TEAM-4995,
+ * DL-033) — `{"mode":"reconcile"}` on a daily EventBridge rule and
+ * `{"mode":"probe"}` on demand — because it is already the function that knows
+ * which models the fleet actually ran. Those paths share nothing with the
+ * aggregation path above except the S3 client.
+ *
  * Environment Variables:
- *   EVAL_DAILY_TABLE  — per-day bucket table (default: agentcore-hub-eval-daily)
- *   ARTIFACTS_BUCKET  — S3 bucket for agents.json lookup
+ *   EVAL_DAILY_TABLE          — per-day bucket table (default: agentcore-hub-eval-daily)
+ *   ARTIFACTS_BUCKET          — S3 bucket for agents.json / models.json / pricing.json
+ *   CODING_AGENT_RUNTIME_ARN  — coding runtime the `cli` probe drives (probe mode)
+ *   BEDROCK_MANTLE_REGIONS    — comma-separated Mantle regions to discover
+ *                               (default: $BEDROCK_MANTLE_REGION or us-east-2, plus us-east-1)
  */
 
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, UpdateCommand } from '@aws-sdk/lib-dynamodb';
 import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3';
 import { gunzipSync } from 'zlib';
+import { reconcileModels } from './models-reconcile.mjs';
+import { probeModel } from './models-probe.mjs';
+import { buildDeps } from './models-deps.mjs';
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
   marshallOptions: { removeUndefinedValues: true },
@@ -276,6 +288,11 @@ export const handler = async (event) => {
     console.log('[token-agg] ignoring legacy reset event — day buckets are permanent');
     return { statusCode: 200, body: 'reset-ignored' };
   }
+
+  // Model registry modes (TEAM-4995). Routed BEFORE the awslogs check, which
+  // would otherwise swallow them as "no data".
+  if (event?.mode === 'reconcile') return reconcileModels(event, await buildDeps());
+  if (event?.mode === 'probe') return probeModel(event, await buildDeps());
 
   if (!event?.awslogs?.data) {
     console.log('[token-agg] No awslogs data, skipping');
