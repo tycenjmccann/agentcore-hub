@@ -48,10 +48,17 @@ const EMPTY_FLEET_VIEW = {
 
 type Json = Record<string, unknown>;
 
-/** A v4 card — everything today's card has, and no `kpi` block. */
+/**
+ * A card in the legacy shape: every measured field, and no `kpi` block.
+ *
+ * What makes it stale is the missing `kpi` block, not its `reportVersion` — both
+ * this and v5Card() carry the CURRENT report version, because `isCurrentCard`
+ * compares the version with `===` and a fixture on an older version would exercise
+ * a version mismatch instead of the kpi-less path these cases are about.
+ */
 function v4Card(overrides: Json = {}): Json {
   return {
-    reportVersion: 4,
+    reportVersion: 7,
     workflowId: WF,
     epicId: "TEAM-4482",
     workflowDefId: "sdlc-14",
@@ -109,7 +116,7 @@ function kpiBlock(quality: Json = {}, cost: Json = {}): Json {
 }
 
 function v5Card(quality: Json = {}, cost: Json = {}, cardOverrides: Json = {}): Json {
-  return { ...v4Card({ reportVersion: 5, ...cardOverrides }), kpi: kpiBlock(quality, cost) };
+  return { ...v4Card({ reportVersion: 7, ...cardOverrides }), kpi: kpiBlock(quality, cost) };
 }
 
 /**
@@ -509,7 +516,7 @@ test.describe("Hero KPI strip (TEAM-4482)", () => {
 
   // ─── Review fixes (TEAM-4509) ────────────────────────────────────────────
 
-  test("12. Recompute on a v4 card keeps polling past stale v4 reads until the v5 card lands", async ({ page }) => {
+  test("12. Recompute on a kpi-less card keeps polling past stale reads until the kpi block lands", async ({ page }) => {
     test.setTimeout(60_000);
     const mock = perfMock(
       [{ card: v4Card() }, { card: v4Card() }, { card: v4Card() }, { card: v5Card() }],
@@ -531,8 +538,9 @@ test.describe("Hero KPI strip (TEAM-4482)", () => {
     // The button disappears once the card has a kpi block — nothing left to fix.
     await expect(button).toHaveCount(0);
     expect(mock.counts.post).toBe(1);
-    // Proves polling continued past the two stale v4 reads instead of stopping
-    // on the first one.
+    // Proves polling continued past the stale reads instead of stopping on the
+    // first one: `isCurrentCard` needs a `kpi` block, so the three kpi-less reads
+    // cannot end the poll however current their reportVersion is.
     expect(mock.counts.get).toBeGreaterThanOrEqual(4);
 
     await page.screenshot({ path: `${SCREENSHOT_DIR}/12-recompute-v4.png` });
