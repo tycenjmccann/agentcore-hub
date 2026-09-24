@@ -131,6 +131,11 @@ export default function ModelsPage() {
   const [announcement, setAnnouncement] = useState("");
 
   const [applying, setApplying] = useState<Set<string>>(new Set());
+  // The apply poll runs on a timer, outside any render, and has to read the set it
+  // is polling for. React state would be a stale closure there (and a state updater
+  // cannot hand a value back to the caller), so the set is mirrored in a ref and
+  // every writer goes through updateApplying().
+  const applyingRef = useRef<Set<string>>(new Set());
   const [failures, setFailures] = useState<Record<string, string>>({});
   const [reapplying, setReapplying] = useState<Set<string>>(new Set());
 
@@ -162,6 +167,11 @@ export default function ModelsPage() {
   }, []);
 
   const changes = useMemo(() => (docs ? diffRegistry(docs.server, docs.draft) : []), [docs]);
+
+  const updateApplying = useCallback((next: Set<string>) => {
+    applyingRef.current = next;
+    setApplying(next);
+  }, []);
 
   /**
    * Take a fresh registry read without throwing the draft away: the new document
@@ -314,22 +324,16 @@ export default function ModelsPage() {
     (deadline: number) => {
       const tick = async () => {
         const next = await load({ silent: true });
-        const stillPending = new Set<string>();
-        setApplying((prev) => {
-          if (prev.size === 0) return prev;
-          const remaining = new Set<string>();
-          for (const agentId of prev) {
-            const entry = next?.resolved?.[agentId];
-            const settled = entry?.harnessModel && entry.modelId && entry.harnessModel === entry.modelId;
-            if (!settled) remaining.add(agentId);
-          }
-          for (const id of remaining) stillPending.add(id);
-          return remaining;
-        });
+        if (applyingRef.current.size === 0) return;
+        const remaining = new Set<string>();
+        for (const agentId of applyingRef.current) {
+          const entry = next?.resolved?.[agentId];
+          const settled = entry?.harnessModel && entry.modelId && entry.harnessModel === entry.modelId;
+          if (!settled) remaining.add(agentId);
+        }
+        updateApplying(remaining);
 
-        // Read after the state update has been queued: `stillPending` is filled
-        // synchronously by the updater above.
-        if (stillPending.size === 0) return;
+        if (remaining.size === 0) return;
         if (Date.now() >= deadline) {
           setAnnouncement("Still applying, check again");
           return;
@@ -338,7 +342,7 @@ export default function ModelsPage() {
       };
       later(tick, APPLY_POLL_MS);
     },
-    [later, load],
+    [later, load, updateApplying],
   );
 
   const absorbWrite = useCallback(
@@ -352,7 +356,7 @@ export default function ModelsPage() {
       for (const a of body.agents ?? []) {
         if (a.status === "failed") failed[a.agentId] = a.error || "The apply failed.";
       }
-      setApplying(applyingNow);
+      updateApplying(applyingNow);
       setFailures(failed);
       if (applyingNow.size > 0) startApplyPoll(Date.now() + APPLY_MAX_MS);
       // The registry itself is authoritative for `resolved`; re-read so the rows
@@ -360,7 +364,7 @@ export default function ModelsPage() {
       void load({ silent: true });
       return applyingNow;
     },
-    [load, startApplyPoll],
+    [load, startApplyPoll, updateApplying],
   );
 
   // ─── Save ─────────────────────────────────────────────────────────────────
@@ -463,7 +467,7 @@ export default function ModelsPage() {
         delete next[agentId];
         return next;
       });
-      setApplying((prev) => new Set(prev).add(agentId));
+      updateApplying(new Set(applyingRef.current).add(agentId));
       startApplyPoll(Date.now() + APPLY_MAX_MS);
       return;
     }

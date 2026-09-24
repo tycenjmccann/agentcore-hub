@@ -9,11 +9,18 @@
 
 import type { CatalogRow, InvalidReason, Price } from "./types";
 
-/** `$11.00`, and `$0.275` for the sub-cent cache rates that must not round to $0.28. */
+/**
+ * `$11.00`, and `$0.275` for the cache rates that must not round to $0.28.
+ *
+ * Cents are the right precision for a token rate, except that published cache-read
+ * rates land on the third decimal ($0.275, $0.022). Rounding those to cents prints
+ * two different rates as the same number, so a sub-dollar value keeps its third
+ * decimal when it has one — and nothing else grows a trailing zero.
+ */
 export function rate(usd: number | null | undefined): string {
   if (usd == null || Number.isNaN(usd)) return "-";
-  const decimals = usd !== 0 && Math.abs(usd) < 0.1 ? 3 : 2;
-  return `$${usd.toFixed(decimals)}`;
+  const needsThird = Math.abs(usd) < 1 && Math.round(usd * 1000) % 10 !== 0;
+  return `$${usd.toFixed(needsThird ? 3 : 2)}`;
 }
 
 /** `$11.00 / $55.00 per 1M` — input then output, the pair used in option text. */
