@@ -10,19 +10,13 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { Gauge, Coins, Clock, CheckCircle2, RefreshCcw, Loader2, TrendingUp, TrendingDown, Minus, Server } from "lucide-react";
 import { LineChart, Line, ResponsiveContainer, ReferenceLine, YAxis, Tooltip } from "recharts";
 import { formatKpi, type FleetView, type FleetKpi, type BandStatus, type KpiGroup } from "@/lib/workflow/performance";
+import { STATUS_STYLE } from "./band-style";
 
 interface Props {
   onSelectRun?: (workflowId: string) => void;
   defaultDays?: 7 | 14 | 30;
 }
 
-const STATUS_STYLE: Record<BandStatus, string> = {
-  ok: "bg-emerald-500/15 text-emerald-400 border-emerald-500/30",
-  warn: "bg-amber-500/15 text-amber-400 border-amber-500/30",
-  alert: "bg-red-500/15 text-red-400 border-red-500/30",
-  insufficient: "bg-slate-500/15 text-slate-400 border-slate-500/30",
-  unknown: "bg-slate-500/15 text-slate-400 border-slate-500/30",
-};
 const STATUS_LABEL: Record<BandStatus, string> = {
   ok: "within bands", warn: "warn", alert: "alert", insufficient: "no baseline", unknown: "no data",
 };
