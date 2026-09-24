@@ -1,44 +1,27 @@
 import { NextResponse } from "next/server";
+import { loadModelsRegistry } from "@/lib/models-registry";
+import { projectModelOptions } from "@/lib/models/model-options";
 import type { ModelOption, ModelsApiResponse } from "@/lib/workflow/model-config";
 
-/**
- * Static list of available models.
- * Bedrock models are always available.
- * External provider models are filtered based on environment configuration.
- */
-const BEDROCK_MODELS: ModelOption[] = [
-  {
-    id: "claude-sonnet-5",
-    label: "Claude Sonnet 5 (Recommended)",
-    provider: "bedrock",
-    modelId: "us.anthropic.claude-sonnet-5",
-    description: "Balanced performance and cost. Default for all workflows.",
-    isDefault: true,
-  },
-  {
-    id: "claude-opus-5",
-    label: "Claude Opus 5",
-    provider: "bedrock",
-    modelId: "us.anthropic.claude-opus-5",
-    description: "Latest and most capable model. Best for complex reasoning and code generation.",
-  },
-];
+export const dynamic = "force-dynamic";
 
 /**
  * GET /api/models
- * 
- * Returns the list of available AI models for workflow execution.
- * Models are filtered based on environment configuration:
- * - Bedrock models (Claude) are always included
+ *
+ * Returns the list of available AI models for workflow execution:
+ * - Bedrock models come from the registry catalog (active, priced, routable) —
+ *   see `projectModelOptions`, which owns the filters and the (Recommended) label
  * - OpenAI models only included if OPENAI_API_KEY_ARN is set
  * - Gemini models only included if GEMINI_API_KEY is set (future)
- * 
- * Response time target: < 100ms (static data)
- * 
+ *
+ * The response contract (`ModelOption[]`, `modelOptionToOverride`) is unchanged,
+ * including the OpenAI append below.
+ *
  * @returns {ModelsApiResponse} { models: ModelOption[] }
  */
 export async function GET(): Promise<NextResponse<ModelsApiResponse>> {
-  const models: ModelOption[] = [...BEDROCK_MODELS];
+  const registry = await loadModelsRegistry();
+  const models: ModelOption[] = projectModelOptions(registry);
 
   // Include OpenAI models if API key ARN is configured
   const openaiApiKeyArn = process.env.OPENAI_API_KEY_ARN;

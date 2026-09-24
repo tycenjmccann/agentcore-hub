@@ -1,0 +1,566 @@
+{
+  "_comment": "ONE model registry (TEAM-4990). This bundled copy is the first-deploy seed and the offline fallback; the live document is s3://<ARTIFACT_BUCKET>/config/models.json, edited on /models. It owns (a) ROUTING - defaults, tiers, per-agent pins, legacy aliases, quarantine - and (b) the CATALOG: one row per model id with its endpoint, context window, price and harness lanes. src/config/pricing.json is a GENERATED projection of the catalog (pricingProjection in src/lib/models-registry.ts); do not hand-edit it. The seed encodes today's live routing exactly, so no agent changes model when this ships.",
+  "version": 1,
+  "updatedAt": "2026-09-23T00:00:00Z",
+  "updatedBy": "seed",
+  "defaults": {
+    "persona": "us.anthropic.claude-fable-5-1",
+    "codingClaude": "us.anthropic.claude-fable-5-1",
+    "codingCodex": "openai.gpt-5.5"
+  },
+  "tiers": {
+    "claude": {
+      "fable": "us.anthropic.claude-fable-5-1",
+      "opus": "us.anthropic.claude-opus-5",
+      "sonnet": "us.anthropic.claude-sonnet-5",
+      "haiku": "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+    },
+    "codex": {
+      "astra": "us.openai.gpt-6-astra",
+      "sol": "us.openai.gpt-6-sol",
+      "terra": "us.openai.gpt-5.6-terra",
+      "luna": "us.openai.gpt-6-luna"
+    }
+  },
+  "agents": {
+    "agentcore_hub_workflow_manager": "us.anthropic.claude-fable-5-1",
+    "telegram_intake": "us.anthropic.claude-sonnet-5"
+  },
+  "autoAdopt": {},
+  "quarantine": [],
+  "legacyAliases": {
+    "claude-opus-46": "us.anthropic.claude-opus-5",
+    "claude-opus-47": "us.anthropic.claude-opus-5",
+    "claude-sonnet-45": "us.anthropic.claude-sonnet-5",
+    "claude-sonnet-46": "us.anthropic.claude-sonnet-5"
+  },
+  "catalog": [
+    {
+      "modelId": "us.anthropic.claude-fable-5-1",
+      "label": "Claude Fable 5.1",
+      "vendor": "anthropic",
+      "family": "fable",
+      "endpoint": "bedrock-runtime",
+      "region": "us-east-1",
+      "api": "converse",
+      "contextWindow": 200000,
+      "aliases": ["claude-fable-5-1"],
+      "price": {
+        "input": 11,
+        "output": 55,
+        "cacheReadInput": 0.275,
+        "cacheWrite": 13.75,
+        "cacheWriteTtl": "5m",
+        "source": "published",
+        "sourceNote": "Cache-read is 2.5% of input, NOT the 10% every other Anthropic model bills.",
+        "asOf": "2026-09-23"
+      },
+      "status": "active",
+      "harnessLanes": [
+        {
+          "id": "claude-fable-5-1",
+          "apiFormat": "converse_stream",
+          "label": "Claude Fable 5.1 (Recommended)",
+          "description": "Most capable general model. Native Converse; handles tool loops + prefill."
+        }
+      ]
+    },
+    {
+      "modelId": "us.anthropic.claude-opus-5-5",
+      "label": "Claude Opus 5.5",
+      "vendor": "anthropic",
+      "family": "opus",
+      "endpoint": "bedrock-runtime",
+      "region": "us-east-1",
+      "api": "converse",
+      "contextWindow": 200000,
+      "aliases": ["claude-opus-5-5"],
+      "price": {
+        "input": 4.4,
+        "output": 22,
+        "cacheReadInput": 0.22,
+        "cacheWrite": 5.5,
+        "cacheWrite1h": 8.8,
+        "cacheWriteTtl": "5m",
+        "source": "published",
+        "sourceNote": "cacheReadInput is an EXPLICIT 5% of input, not the 10% cachedInputDiscount default.",
+        "asOf": "2026-09-23"
+      },
+      "status": "active"
+    },
+    {
+      "modelId": "us.anthropic.claude-opus-5",
+      "label": "Claude Opus 5",
+      "vendor": "anthropic",
+      "family": "opus",
+      "endpoint": "bedrock-runtime",
+      "region": "us-east-1",
+      "api": "converse",
+      "contextWindow": 200000,
+      "aliases": ["claude-opus-5"],
+      "price": {
+        "input": 5.5,
+        "output": 27.5,
+        "cacheWrite": 6.875,
+        "cacheWriteTtl": "5m",
+        "source": "published",
+        "sourceNote": "No cacheReadInput: this model bills the 10% cachedInputDiscount default.",
+        "asOf": "2026-09-23"
+      },
+      "status": "active",
+      "harnessLanes": [
+        {
+          "id": "claude-opus-5",
+          "apiFormat": "converse_stream",
+          "label": "Claude Opus 5",
+          "description": "High-capability reasoning. Native Converse."
+        }
+      ]
+    },
+    {
+      "modelId": "us.anthropic.claude-sonnet-5",
+      "label": "Claude Sonnet 5",
+      "vendor": "anthropic",
+      "family": "sonnet",
+      "endpoint": "bedrock-runtime",
+      "region": "us-east-1",
+      "api": "converse",
+      "contextWindow": 200000,
+      "aliases": ["claude-sonnet-5"],
+      "price": {
+        "input": 2.2,
+        "output": 11,
+        "cacheReadInput": 0.22,
+        "cacheWrite": 2.75,
+        "cacheWriteTtl": "5m",
+        "source": "published",
+        "asOf": "2026-09-23"
+      },
+      "status": "active",
+      "harnessLanes": [
+        {
+          "id": "claude-sonnet-5",
+          "apiFormat": "converse_stream",
+          "description": "Fast, strong default for most tasks. Native Converse."
+        }
+      ]
+    },
+    {
+      "modelId": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+      "label": "Claude Haiku 4.5",
+      "vendor": "anthropic",
+      "family": "haiku",
+      "endpoint": "bedrock-runtime",
+      "region": "us-east-1",
+      "api": "converse",
+      "contextWindow": 200000,
+      "aliases": [
+        "claude-haiku-4-5",
+        "anthropic.claude-haiku-4-5-20251001-v1:0",
+        "us.anthropic.claude-haiku-4-5-20251001"
+      ],
+      "price": {
+        "input": 1.1,
+        "output": 5.5,
+        "cacheReadInput": 0.11,
+        "cacheWrite": 1.375,
+        "cacheWriteTtl": "5m",
+        "source": "published",
+        "asOf": "2026-09-23"
+      },
+      "status": "active"
+    },
+    {
+      "modelId": "us.anthropic.claude-opus-4-6",
+      "label": "Claude Opus 4.6",
+      "vendor": "anthropic",
+      "family": "opus",
+      "endpoint": "bedrock-runtime",
+      "region": "us-east-1",
+      "api": "converse",
+      "contextWindow": 200000,
+      "aliases": ["us.anthropic.claude-opus-4-6-v1"],
+      "price": {
+        "input": 5.5,
+        "output": 27.5,
+        "source": "manual",
+        "sourceNote": "opus-4-6-v1 rate",
+        "asOf": "2026-09-23"
+      },
+      "status": "retired",
+      "harnessLanes": [
+        {
+          "id": "claude-opus-4-6",
+          "apiFormat": "converse_stream",
+          "description": "High-capability reasoning. Native Converse."
+        }
+      ]
+    },
+    {
+      "modelId": "global.anthropic.claude-opus-5-5",
+      "label": "Claude Opus 5.5 (global)",
+      "vendor": "anthropic",
+      "family": "opus",
+      "endpoint": "bedrock-runtime",
+      "region": "us-east-1",
+      "api": "converse",
+      "contextWindow": 200000,
+      "aliases": [],
+      "price": {
+        "input": 4,
+        "output": 20,
+        "cacheReadInput": 0.2,
+        "source": "published",
+        "sourceNote": "Pricing API global_standard rate; differs from the us.* profile.",
+        "asOf": "2026-09-23"
+      },
+      "status": "active"
+    },
+    {
+      "modelId": "global.anthropic.claude-opus-5",
+      "label": "Claude Opus 5 (global)",
+      "vendor": "anthropic",
+      "family": "opus",
+      "endpoint": "bedrock-runtime",
+      "region": "us-east-1",
+      "api": "converse",
+      "contextWindow": 200000,
+      "aliases": [],
+      "price": {
+        "input": 5,
+        "output": 25,
+        "cacheReadInput": 0.5,
+        "source": "published",
+        "sourceNote": "Pricing API global_standard rate; differs from the us.* profile.",
+        "asOf": "2026-09-23"
+      },
+      "status": "active"
+    },
+    {
+      "modelId": "global.anthropic.claude-sonnet-5",
+      "label": "Claude Sonnet 5 (global)",
+      "vendor": "anthropic",
+      "family": "sonnet",
+      "endpoint": "bedrock-runtime",
+      "region": "us-east-1",
+      "api": "converse",
+      "contextWindow": 200000,
+      "aliases": [],
+      "price": {
+        "input": 2,
+        "output": 10,
+        "cacheReadInput": 0.2,
+        "source": "published",
+        "sourceNote": "Pricing API global_standard rate; differs from the us.* profile.",
+        "asOf": "2026-09-23"
+      },
+      "status": "active"
+    },
+    {
+      "modelId": "global.anthropic.claude-fable-5-1",
+      "label": "Claude Fable 5.1 (global)",
+      "vendor": "anthropic",
+      "family": "fable",
+      "endpoint": "bedrock-runtime",
+      "region": "us-east-1",
+      "api": "converse",
+      "contextWindow": 200000,
+      "aliases": [],
+      "price": {
+        "input": 10,
+        "output": 50,
+        "cacheReadInput": 0.25,
+        "source": "published",
+        "sourceNote": "Pricing API global_standard rate; differs from the us.* profile.",
+        "asOf": "2026-09-23"
+      },
+      "status": "active"
+    },
+    {
+      "modelId": "anthropic.claude-opus-5",
+      "label": "Claude Opus 5 (eval judge)",
+      "vendor": "anthropic",
+      "family": "opus",
+      "endpoint": "bedrock-runtime",
+      "region": "us-east-1",
+      "api": "converse",
+      "contextWindow": 200000,
+      "aliases": [],
+      "price": {
+        "input": 5.5,
+        "output": 27.5,
+        "source": "published",
+        "asOf": "2026-09-23"
+      },
+      "status": "active",
+      "readOnly": true
+    },
+    {
+      "modelId": "us.anthropic.claude-fable-5",
+      "label": "Claude Fable 5",
+      "vendor": "anthropic",
+      "family": "fable",
+      "endpoint": "bedrock-runtime",
+      "region": "us-east-1",
+      "api": "converse",
+      "contextWindow": 200000,
+      "aliases": ["claude-fable-5"],
+      "price": {
+        "input": 11,
+        "output": 55,
+        "cacheReadInput": 1.1,
+        "source": "manual",
+        "sourceNote": "carried from pricing.json 2026-09-08",
+        "asOf": "2026-09-23"
+      },
+      "status": "retired",
+      "harnessLanes": [
+        {
+          "id": "claude-fable-5",
+          "apiFormat": "converse_stream",
+          "label": "Claude Fable 5",
+          "description": "Most capable general model. Native Converse; handles tool loops + prefill."
+        }
+      ]
+    },
+    {
+      "modelId": "us.anthropic.claude-opus-4-8",
+      "label": "Claude Opus 4.8",
+      "vendor": "anthropic",
+      "family": "opus",
+      "endpoint": "bedrock-runtime",
+      "region": "us-east-1",
+      "api": "converse",
+      "contextWindow": 200000,
+      "aliases": ["claude-opus-4-8"],
+      "price": {
+        "input": 5.5,
+        "output": 27.5,
+        "source": "manual",
+        "sourceNote": "carried from pricing.json 2026-09-08",
+        "asOf": "2026-09-23"
+      },
+      "status": "retired",
+      "harnessLanes": [
+        {
+          "id": "claude-opus-4-8-mantle",
+          "apiFormat": "responses",
+          "requiresMantle": true,
+          "label": "Claude Opus 4.8 (via Mantle)",
+          "description": "Opus 4.8 through the Bedrock Mantle Responses endpoint. Required - this model rejects the harness loop's prefill turn on native Converse."
+        },
+        {
+          "id": "claude-opus-4-8-mantle-chat",
+          "apiFormat": "chat_completions",
+          "requiresMantle": true,
+          "label": "Claude Opus 4.8 (via Mantle, Chat Completions)",
+          "description": "Opus 4.8 through the Bedrock Mantle Chat Completions endpoint. Alternative Mantle lane; also tolerates the harness prefill turn."
+        }
+      ]
+    },
+    {
+      "modelId": "us.anthropic.claude-opus-4-7",
+      "label": "Claude Opus 4.7",
+      "vendor": "anthropic",
+      "family": "opus",
+      "endpoint": "bedrock-runtime",
+      "region": "us-east-1",
+      "api": "converse",
+      "contextWindow": 200000,
+      "aliases": [],
+      "price": {
+        "input": 5.5,
+        "output": 27.5,
+        "source": "manual",
+        "sourceNote": "carried from pricing.json 2026-09-08",
+        "asOf": "2026-09-23"
+      },
+      "status": "retired"
+    },
+    {
+      "modelId": "us.anthropic.claude-sonnet-4-6",
+      "label": "Claude Sonnet 4.6",
+      "vendor": "anthropic",
+      "family": "sonnet",
+      "endpoint": "bedrock-runtime",
+      "region": "us-east-1",
+      "api": "converse",
+      "contextWindow": 200000,
+      "aliases": [],
+      "price": {
+        "input": 3.3,
+        "output": 16.5,
+        "source": "manual",
+        "sourceNote": "carried from pricing.json 2026-09-08",
+        "asOf": "2026-09-23"
+      },
+      "status": "retired",
+      "harnessLanes": [
+        {
+          "id": "claude-sonnet-4-6",
+          "apiFormat": "converse_stream",
+          "label": "Claude Sonnet 4.6",
+          "description": "Fast, strong default for most tasks. Native Converse."
+        }
+      ]
+    },
+    {
+      "modelId": "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+      "label": "Claude Sonnet 4.5",
+      "vendor": "anthropic",
+      "family": "sonnet",
+      "endpoint": "bedrock-runtime",
+      "region": "us-east-1",
+      "api": "converse",
+      "contextWindow": 200000,
+      "aliases": [],
+      "price": {
+        "input": 3.3,
+        "output": 16.5,
+        "source": "manual",
+        "sourceNote": "carried from pricing.json 2026-09-08",
+        "asOf": "2026-09-23"
+      },
+      "status": "retired"
+    },
+    {
+      "modelId": "us.openai.gpt-6-astra",
+      "label": "GPT-6 Astra",
+      "vendor": "openai",
+      "family": "astra",
+      "endpoint": "bedrock-runtime",
+      "region": "us-east-1",
+      "api": "responses",
+      "contextWindow": 400000,
+      "aliases": [],
+      "price": {
+        "input": 11,
+        "output": 55,
+        "cacheReadInput": 1.1,
+        "cacheWrite": 13.75,
+        "cacheWriteTtl": "30m",
+        "source": "published",
+        "sourceNote": "The 2x long-context rate is derived from the design example and is interim until published.",
+        "asOf": "2026-09-23",
+        "longContext": {
+          "thresholdInputTokens": 272000,
+          "input": 22,
+          "output": 110,
+          "cacheReadInput": 2.2
+        }
+      },
+      "status": "active"
+    },
+    {
+      "modelId": "us.openai.gpt-6-sol",
+      "label": "GPT-6 Sol",
+      "vendor": "openai",
+      "family": "sol",
+      "endpoint": "bedrock-runtime",
+      "region": "us-east-1",
+      "api": "responses",
+      "contextWindow": 400000,
+      "aliases": [],
+      "price": {
+        "input": 4.4,
+        "output": 22,
+        "cacheReadInput": 0.44,
+        "cacheWrite": 5.5,
+        "cacheWriteTtl": "5m",
+        "source": "interim",
+        "sourceNote": "GPT-5.6 Sol rate until the model card publishes. The 2x long-context rate is derived from the design example and is interim until published.",
+        "asOf": "2026-09-23",
+        "longContext": {
+          "thresholdInputTokens": 272000,
+          "input": 8.8,
+          "output": 44,
+          "cacheReadInput": 0.88
+        }
+      },
+      "status": "active"
+    },
+    {
+      "modelId": "us.openai.gpt-5.6-terra",
+      "label": "GPT-5.6 Terra",
+      "vendor": "openai",
+      "family": "terra",
+      "endpoint": "bedrock-runtime",
+      "region": "us-east-1",
+      "api": "responses",
+      "contextWindow": 400000,
+      "aliases": [],
+      "price": {
+        "input": 2.2,
+        "output": 13.2,
+        "cacheReadInput": 0.22,
+        "cacheWrite": 2.75,
+        "cacheWriteTtl": "5m",
+        "source": "published",
+        "sourceNote": "The 2x long-context rate is derived from the design example and is interim until published.",
+        "asOf": "2026-09-23",
+        "longContext": {
+          "thresholdInputTokens": 272000,
+          "input": 4.4,
+          "output": 26.4,
+          "cacheReadInput": 0.44
+        }
+      },
+      "status": "active"
+    },
+    {
+      "modelId": "us.openai.gpt-6-luna",
+      "label": "GPT-6 Luna",
+      "vendor": "openai",
+      "family": "luna",
+      "endpoint": "bedrock-runtime",
+      "region": "us-east-1",
+      "api": "responses",
+      "contextWindow": 400000,
+      "aliases": [],
+      "price": {
+        "input": 0.22,
+        "output": 1.32,
+        "cacheReadInput": 0.022,
+        "cacheWrite": 0.275,
+        "cacheWriteTtl": "5m",
+        "source": "interim",
+        "sourceNote": "Interim rate until the model card publishes. The 2x long-context rate is derived from the design example and is interim until published.",
+        "asOf": "2026-09-23",
+        "longContext": {
+          "thresholdInputTokens": 272000,
+          "input": 0.44,
+          "output": 2.64,
+          "cacheReadInput": 0.044
+        }
+      },
+      "status": "active"
+    },
+    {
+      "modelId": "openai.gpt-5.5",
+      "label": "GPT-5.5 (Mantle)",
+      "vendor": "openai",
+      "family": "gpt-5.5",
+      "endpoint": "bedrock-mantle",
+      "region": "us-east-2",
+      "api": "responses",
+      "contextWindow": 400000,
+      "aliases": ["openai.gpt-5.5-codex"],
+      "price": {
+        "input": 5.5,
+        "output": 33,
+        "cacheReadInput": 0.55,
+        "source": "published",
+        "sourceNote": "Repriced from 1.25/10 (TEAM-4997). The 2x long-context rate is derived from the design example and is interim until published.",
+        "asOf": "2026-09-23",
+        "longContext": {
+          "thresholdInputTokens": 272000,
+          "input": 11,
+          "output": 66,
+          "cacheReadInput": 1.1
+        }
+      },
+      "status": "active",
+      "requiresMantle": true
+    }
+  ]
+}
