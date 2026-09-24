@@ -448,6 +448,41 @@ aws events put-targets --rule "$RECONCILE_RULE" --region "$AWS_REGION" \
 
 echo "✓ Reconcile: ${RECONCILE_RULE} (rate(1 day)) → packager {\"mode\":\"reconcile\",\"days\":2}"
 
+# ─── Daily model reconcile (EventBridge → token-aggregator) ──────────────────
+# TEAM-4995 / DL-033: config/models.json is the ONE place a model is named, so
+# keeping it true is a job. Once a day the token-aggregator walks the account's
+# inference profiles and Mantle's model list, reprices what it finds from the
+# Pricing API, and writes the differences back (new models land as `candidate`
+# and ping Telegram; vanished ones are retired, never deleted). Same idempotency
+# as the rule above: put-rule/put-targets overwrite by name.
+# The function itself is deployed by deploy-token-aggregator.sh.
+MODELS_RULE="agentcore-hub-models-reconcile"
+TOKEN_AGG_ARN="arn:aws:lambda:${AWS_REGION}:${ACCOUNT_ID}:function:agentcore-hub-token-aggregator"
+
+aws events put-rule \
+  --name "$MODELS_RULE" \
+  --schedule-expression "rate(1 day)" \
+  --state ENABLED \
+  --description "Daily model reconcile: discover, reprice and retire rows in config/models.json" \
+  --region "$AWS_REGION" --output text >/dev/null
+
+MODELS_RULE_ARN=$(aws events describe-rule --name "$MODELS_RULE" \
+  --region "$AWS_REGION" --query 'Arn' --output text)
+
+aws lambda add-permission \
+  --function-name agentcore-hub-token-aggregator \
+  --statement-id "${MODELS_RULE}-invoke" \
+  --action lambda:InvokeFunction --principal events.amazonaws.com \
+  --source-arn "$MODELS_RULE_ARN" \
+  --region "$AWS_REGION" --output text >/dev/null 2>&1 \
+  || echo "  (models reconcile invoke permission already present)"
+
+aws events put-targets --rule "$MODELS_RULE" --region "$AWS_REGION" \
+  --targets "[{\"Id\":\"token-aggregator\",\"Arn\":\"${TOKEN_AGG_ARN}\",\"Input\":\"{\\\"mode\\\":\\\"reconcile\\\"}\"}]" \
+  --output text >/dev/null
+
+echo "✓ Models: ${MODELS_RULE} (rate(1 day)) → token-aggregator {\"mode\":\"reconcile\"}"
+
 # ─── Prompts ─────────────────────────────────────────────────────────────────
 for f in "${REPO_ROOT}/deploy/runtime-agent/prompts/agentcore_hub_"*.txt; do
   aws s3 cp "$f" "s3://${BUCKET}/prompts/$(basename "$f")" --quiet

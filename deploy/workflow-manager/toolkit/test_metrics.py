@@ -17,6 +17,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).parent))
 
 from compute_metrics import (  # noqa: E402
+    CARD_MIN_REPORT_VERSION,
     CARD_QUALITY_KEYS,
     business_window,
     compute_metrics,
@@ -969,7 +970,14 @@ V5_KPI = {
 
 def v5_card(**overrides):
     """A performance card shaped exactly as lambda/cost-report/index.mjs buildCard
-    emits one (REPORT_VERSION 5), trimmed to the blocks compute_metrics reads.
+    emits one, trimmed to the blocks compute_metrics reads.
+
+    "v5" names the SHAPE: v5 was the first version with a `kpi` block, and the
+    blocks this toolkit reads have not changed since (SOURCE_CARD is still
+    `performance-card@v5`). The version STAMP tracks CARD_MIN_REPORT_VERSION
+    instead of a literal, because later versions changed only what the Lambda
+    BILLS — TEAM-4995's v7 repriced openai.gpt-5.5 — so a card-first test would
+    otherwise need editing on every repricing.
 
     Its counters deliberately DISAGREE with what the fix-lineage dossier computes
     (changeRequests 1 vs 0, nudges 2 vs 0, humanWaitMs 1800000 vs 0) everywhere
@@ -977,7 +985,7 @@ def v5_card(**overrides):
     disagreements are how these tests prove the card's numbers land in the
     namespaced blocks and the dossier's in the legacy keys."""
     card = {
-        "reportVersion": 5,
+        "reportVersion": CARD_MIN_REPORT_VERSION,
         "generatedAt": "2026-07-01T12:30:00Z",
         "workflowId": "wf_fixlineage",
         "run": {"outcome": "complete"},
@@ -1113,13 +1121,16 @@ class CardFirst(unittest.TestCase):
         self.assertTrue(any("cite the card-derived values" in n for n in notes),
                         f"the card-vs-legacy divergence note is missing: {notes}")
 
-    def test_a_v4_card_is_not_card_first(self):
-        m = self.metrics(card=v5_card(reportVersion=4))
+    def test_a_card_below_the_minimum_is_not_card_first(self):
+        old = CARD_MIN_REPORT_VERSION - 1
+        m = self.metrics(card=v5_card(reportVersion=old))
         self.assertEqual(m["source"], "computed")
         self.assertIsNone(m["kpi"])
         self.assertIsNone(m["kpiVersion"])
         self.assertNotIn("quality", m)
-        self.assertTrue(any("reportVersion 4 < 5" in n for n in self.notes(m)), self.notes(m))
+        self.assertTrue(
+            any(f"reportVersion {old} < {CARD_MIN_REPORT_VERSION}" in n for n in self.notes(m)),
+            self.notes(m))
 
     def test_an_absent_card_is_computed_and_says_so(self):
         m = self.metrics()
@@ -1128,7 +1139,8 @@ class CardFirst(unittest.TestCase):
         self.assertTrue(any("no performance card" in n for n in self.notes(m)), self.notes(m))
 
     def test_card_reason_is_recorded_verbatim(self):
-        reason = "card fetch timed out: no reportVersion >= 5 card within 60s"
+        reason = (f"card fetch timed out: no reportVersion >= {CARD_MIN_REPORT_VERSION} "
+                  f"card within 60s")
         m = self.metrics(card_reason=reason)
         self.assertEqual(m["source"], "computed")
         self.assertTrue(any(reason in n for n in self.notes(m)), self.notes(m))
@@ -1143,14 +1155,14 @@ class CardFirst(unittest.TestCase):
 
     def test_an_explicit_card_wins_over_the_dossiers(self):
         d = copy.deepcopy(self.dossier)
-        d["performanceCard"] = v5_card(reportVersion=4)
+        d["performanceCard"] = v5_card(reportVersion=CARD_MIN_REPORT_VERSION - 1)
         m = compute_metrics(d, card=v5_card())
         self.assertEqual(m["source"], "performance-card@v5")
 
     def test_a_partial_card_yields_nones_not_a_keyerror(self):
         """A card from a Lambda newer or older than this toolkit is missing
         fields, not malformed — one None beats a dead analysis."""
-        m = self.metrics(card={"reportVersion": 5})
+        m = self.metrics(card={"reportVersion": CARD_MIN_REPORT_VERSION})
         self.assertEqual(m["source"], "performance-card@v5")
         self.assertIsNone(m["kpi"])
         self.assertIsNone(m["kpiVersion"])

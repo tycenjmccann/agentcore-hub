@@ -450,7 +450,7 @@ Report with a clear table:
 - Your completion record MUST include the tested head SHA (`git rev-parse HEAD`
   on the branch you verified) — the release manager cross-checks it against the
   final PR head before merging; a PASS without the SHA is unusable downstream
-- Pick the intelligence tier per `claude_code` call with `model=`: `"fable"` (default — top reasoning, plans/complex debugging), `"opus"` (deep implementation work), `"sonnet"` (routine, well-specified coding), `"haiku"` (trivial mechanical edits). Match the tier to the difficulty; when unsure, leave it empty.
+- Pick the intelligence tier per `claude_code` call with `model=`: `"fable"` (top reasoning — ambiguous or architecture-heavy work), `"opus"` (deep implementation work), `"sonnet"` (routine, well-specified coding), `"haiku"` (trivial mechanical edits). Leaving `model=` empty takes the configured default (Opus 5.5 today), which the model registry sets — not this file. Match the tier to the difficulty; when unsure, leave it empty. The Codex peers are the same ladder: `codex(model="astra")` ≈ fable, `codex(model="sol")` ≈ opus, `codex(model="terra")` ≈ sonnet, `codex(model="luna")` ≈ haiku — tier names, never a raw model id.
 - Always compare against base branch to confirm issues are pre-existing vs introduced
 - Include actual command output as evidence
 - Include claude_code's `[coding-session: ...]` footer in your completion record —

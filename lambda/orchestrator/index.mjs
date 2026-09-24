@@ -3765,22 +3765,14 @@ async function invokeAgent(agentDef, context, workflow, ticketId, ticketPhase) {
   }
   console.log(`[orchestrator] Using ${harnessArn.includes("/runtime/") ? "Runtime" : "Harness"} for ${agentDef.agentId}`);
 
-  // Determine model override
+  // Model override — forwarded VERBATIM. Tier names ("opus") and legacy aliases
+  // resolve against the model registry in the runtime that runs the model
+  // (TEAM-4995/DL-033), so nothing is rewritten here; a bare string is only
+  // wrapped in the config shape the invoke below reads.
   let modelConfig = undefined;
-  if (workflow.input?.modelOverride) {
-    let override = workflow.input.modelOverride;
-    if (typeof override === "string") {
-      const modelMap = {
-        "opus": "us.anthropic.claude-opus-5",
-        "sonnet": "us.anthropic.claude-sonnet-5",
-        "claude-opus-47": "us.anthropic.claude-opus-5",
-        "claude-opus-46": "us.anthropic.claude-opus-5",
-        "claude-sonnet-46": "us.anthropic.claude-sonnet-5",
-        "claude-sonnet-45": "us.anthropic.claude-sonnet-5",
-      };
-      override = { bedrockModelConfig: { modelId: modelMap[override] || override } };
-    }
-    modelConfig = override;
+  const override = workflow.input?.modelOverride;
+  if (override) {
+    modelConfig = typeof override === "string" ? { bedrockModelConfig: { modelId: override } } : override;
   }
 
   try {

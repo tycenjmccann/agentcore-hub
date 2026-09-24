@@ -205,11 +205,16 @@ describe("message building", () => {
 });
 
 describe("tier map + cost accounting", () => {
-  it("mirrors CODING_MODEL_TIERS from deploy/runtime-agent/main.py", () => {
+  // DL-033 (TEAM-4995): CODING_MODEL_TIERS was deleted from main.py — a tier's
+  // model id now lives in exactly one place, config/models.json, resolved via
+  // resolve_coding_model() in models_registry.py, never in a second hardcoded
+  // map. This battery's own MODEL_TIERS is a standalone catalog for eval
+  // invocation cost accounting (evals/ is exempt from the model-surface guard),
+  // not a mirror of an in-repo map, so there is nothing left in main.py to pin
+  // against.
+  it("main.py no longer hardcodes a tier map", () => {
     const mainPy = readFileSync(join(REPO_ROOT, "deploy/runtime-agent/main.py"), "utf8");
-    for (const [tier, modelId] of Object.entries(MODEL_TIERS)) {
-      expect(mainPy).toContain(`"${tier}": "${modelId}"`);
-    }
+    expect(mainPy).not.toContain("CODING_MODEL_TIERS");
   });
 
   it("prices usage per tier", () => {

@@ -39,6 +39,20 @@
 #                         pipeline ARN, or every approval tap AccessDenies.
 #   CdRegistryRead        s3:GetObject on exactly config/cd-registry.json in
 #                         ARTIFACT_BUCKET — one key, not a prefix.
+#   ModelRegistryRead     s3:GetObject on exactly config/models.json in
+#                         ARTIFACT_BUCKET — one key, not a prefix, and READ ONLY
+#                         (TEAM-4995). The bridge reads the catalog for two
+#                         things: which model its intake Converse call uses, and
+#                         which rows are candidates awaiting a human decision.
+#                         Its own Sid rather than a second resource on
+#                         CdRegistryRead, so "who may read the CD allow-list" and
+#                         "who may read the model catalog" stay separately
+#                         auditable. No write: the decision is made on /models,
+#                         and the nightly reconcile is the only other writer.
+#                         Both reads are best-effort in index.mjs — while this
+#                         statement is missing, intake falls back to
+#                         BEDROCK_MODEL_ID / the literal and no candidate is
+#                         pinged.
 #   ShipRejectionMarkerWrite
 #                         s3:PutObject on pipeline-artifacts/ship-approvals/* in
 #                         ARTIFACT_BUCKET, for the <merge_commit>.rejected.json
@@ -245,6 +259,14 @@ policy = {
             "Resource": [f"arn:aws:s3:::{bucket}/config/cd-registry.json"],
         },
         {
+            # The model catalog (TEAM-4995, DL-033): one key, read only. Kept out
+            # of CdRegistryRead so the two allow-lists stay separately auditable.
+            "Sid": "ModelRegistryRead",
+            "Effect": "Allow",
+            "Action": ["s3:GetObject"],
+            "Resource": [f"arn:aws:s3:::{bucket}/config/models.json"],
+        },
+        {
             # The ship-approval REJECTION marker (TEAM-4739): one PutObject under
             # one prefix. Deliberately NOT folded into CdRegistryRead - that Sid
             # is read-only on the CD registry, and registry write access equals
@@ -283,5 +305,6 @@ echo "IAM inline policy '$POLICY_NAME' applied to $ROLE_NAME:"
 echo "  PipelineStateRead (pipeline-level, GetPipelineState + GetPipelineExecution) on $DEPLOY_PIPELINE (effective, $AWS_REGION) + hub-*-deploy ($PIPELINE_REGIONS)"
 echo "  DeployApprovalWrite (action-level, <pipeline>/*) on the same pipelines"
 echo "  CdRegistryRead on s3://$ARTIFACT_BUCKET/config/cd-registry.json"
+echo "  ModelRegistryRead on s3://$ARTIFACT_BUCKET/config/models.json (read only)"
 echo "  ShipRejectionMarkerWrite (s3:PutObject) on s3://$ARTIFACT_BUCKET/pipeline-artifacts/ship-approvals/*"
 echo "  GateEventPublish (events:PutEvents) on event-bus/$EFFECTIVE_EVENT_BUS ($AWS_REGION) - gate.requested"

@@ -55,6 +55,23 @@ from strands.models.model import Model
 MAIN_PY = Path(__file__).resolve().parent.parent / "main.py"
 
 
+def _models_registry() -> Any:
+    """The shipped models_registry twin, loaded by path.
+
+    main.py resolves the persona model through it on every invocation
+    (TEAM-4995). It is a zero-import module with no network in the resolvers, so
+    the exec namespace below runs the REAL ones — only the S3 read is stubbed.
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "prod_models_registry", MAIN_PY.parent / "models_registry.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 # ─── Test doubles ────────────────────────────────────────────────────────────
 
 
@@ -589,6 +606,14 @@ def _load_production_entrypoints(overrides: dict[str, Any] | None = None) -> dic
         # Only reachable via the model_override branch, which no test takes.
         "BotocoreConfig": None,
         "BedrockModel": None,
+        # TEAM-4995: the shipped source resolves the persona model through the
+        # model registry on entry. The S3 read is stubbed to None — the
+        # registry-unreadable case — and the REAL resolver runs, so resolution
+        # degrades to $MODEL_ID / the literal and `_build_bedrock_model` below
+        # hands back a MockModel either way. Keeping the resolver real means a
+        # regression in the fallback chain fails here instead of hiding.
+        "load_registry": lambda *args, **kwargs: None,
+        "resolve_agent_model": _models_registry().resolve_agent_model,
         # TEAM-3953 prompt-cache plumbing: the model_override branch now calls the
         # _build_bedrock_model factory, and _trace_attrs reads PERSONA_PROMPT_CACHE
         # / PERSONA_CACHE_TTL. Caching OFF here — `PERSONA_PROMPT_CACHE and ...`

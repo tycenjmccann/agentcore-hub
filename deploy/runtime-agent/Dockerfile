@@ -26,7 +26,10 @@ RUN pip freeze
 RUN python -c "from mcp.client.streamable_http import streamablehttp_client" \
  || python -c "from mcp.client.streamable_http import streamable_http_client"
 RUN python -c "import strands, strands.tools.mcp, strands_tools, bedrock_agentcore, boto3, httpx, nest_asyncio, playwright, aws_bedrock_token_generator, opentelemetry"
-COPY main.py .
+# models_registry.py sits next to main.py so `import models_registry` resolves
+# with no PYTHONPATH change; it is a byte-copy of the coding runtime's twin,
+# pinned by scripts/check-models-registry-parity.sh (TEAM-4995).
+COPY main.py models_registry.py .
 EXPOSE 8080
 # Wrap with opentelemetry-instrument so the runtime emits GenAI-semantic OTel
 # spans to CloudWatch. Without this, AgentCore online evaluations have no

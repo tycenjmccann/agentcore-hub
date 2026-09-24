@@ -24,7 +24,7 @@
         "kpi.json"
       ],
       "npm": false,
-      "note": "REPORT_VERSION is 5 (card.kpi, kpiVersion 1). If REPORT_VERSION or kpiVersion changed, run lambda/cost-report/deploy.sh --backfill [--since-days N] by hand: --rebuild-index alone drops every card that is not at the current REPORT_VERSION, so a bump REQUIRES --backfill or the fleet index empties."
+      "note": "REPORT_VERSION is 7 (card.kpi, kpiVersion 2). If REPORT_VERSION or kpiVersion changed, run lambda/cost-report/deploy.sh --backfill [--since-days N] by hand: --rebuild-index alone drops every card that is not at the current REPORT_VERSION, so a bump REQUIRES --backfill or the fleet index empties."
     },
     {
       "function": "agentcore-hub-anomaly-watcher",
@@ -108,9 +108,17 @@
       "function": "agentcore-hub-token-aggregator",
       "dir": "lambda/token-aggregator",
       "files": [
-        "index.mjs"
+        "index.mjs",
+        "models-registry.mjs",
+        "models-reconcile.mjs",
+        "models-probe.mjs",
+        "models-deps.mjs",
+        "bedrock-token.mjs",
+        "package.json",
+        "node_modules/"
       ],
-      "npm": false
+      "npm": true,
+      "note": "TEAM-4995: this function also hosts the model registry's maintenance modes, so it has its OWN IAM role (hand-apply deploy/setup-token-aggregator-role.sh — the shared Lambda role does not grant model discovery, the config/models.json write or the coding-runtime probe), a daily {\"mode\":\"reconcile\"} EventBridge rule (agentcore-hub-models-reconcile) and a 900s timeout. models-registry.mjs is a byte-copy pair with deploy/telegram-bug-intake/models-registry.mjs (scripts/check-models-registry-parity.sh)."
     },
     {
       "function": "agentcore-hub-workflow-output",
@@ -148,11 +156,13 @@
       "dir": "deploy/telegram-bug-intake",
       "paths": [
         "deploy/telegram-bug-intake/index.mjs",
-        "deploy/telegram-bug-intake/cd-registry.mjs"
+        "deploy/telegram-bug-intake/cd-registry.mjs",
+        "deploy/telegram-bug-intake/models-registry.mjs"
       ],
       "files": [
         "index.mjs",
-        "cd-registry.mjs"
+        "cd-registry.mjs",
+        "models-registry.mjs"
       ],
       "npm": false
     }
@@ -198,13 +208,6 @@
         "test_*.py",
         "--exclude",
         "*.pyc"
-      ]
-    },
-    {
-      "src": "src/config/pricing.json",
-      "dst": "config/pricing.json",
-      "paths": [
-        "src/config/pricing.json"
       ]
     },
     {
@@ -271,6 +274,7 @@
     "deploy/apprunner/",
     "deploy/setup-lambda-role.sh",
     "deploy/setup-runtime-role.sh",
+    "deploy/setup-token-aggregator-role.sh",
     "deploy/setup-tickets-lambda.mjs",
     "deploy/setup-pipeline-tools-lambda.mjs",
     "deploy/telegram-bug-intake/update-config.sh",
@@ -297,6 +301,7 @@
       "context": "deploy/runtime-agent",
       "paths": [
         "deploy/runtime-agent/main.py",
+        "deploy/runtime-agent/models_registry.py",
         "deploy/runtime-agent/requirements.txt",
         "deploy/runtime-agent/install-skills.sh",
         "deploy/runtime-agent/Dockerfile"
@@ -308,6 +313,7 @@
       "context": "deploy/coding-agent-runtime",
       "paths": [
         "deploy/coding-agent-runtime/main.py",
+        "deploy/coding-agent-runtime/models_registry.py",
         "deploy/coding-agent-runtime/requirements.txt",
         "deploy/coding-agent-runtime/otel-collector-config.yaml",
         "deploy/coding-agent-runtime/log.py",
@@ -324,6 +330,7 @@
       "context": "deploy/coding-agent-runtime",
       "paths": [
         "deploy/coding-agent-runtime/main.py",
+        "deploy/coding-agent-runtime/models_registry.py",
         "deploy/coding-agent-runtime/requirements.txt",
         "deploy/coding-agent-runtime/otel-collector-config.yaml",
         "deploy/coding-agent-runtime/log.py",
@@ -354,6 +361,8 @@
     "deploy/lib": "Sourced shell helpers for the opt-in config-evals deploy guard (require_eval_gate, --force parsing). Library code consumed by the deploy scripts at run time — nothing to deploy.",
     "src/config/agents.json": "NOT a plain cp — Target 2 of buildspec-deploy.yml MERGES the repo copy onto the S3 copy via merge-agents-json.py (the S3 version carries deploy-injected runtimeArns the repo nulls out); it ships on every deploy, unconditionally.",
     "src/config/cd-registry.json": "Target 2 seeds config/cd-registry.json only when ABSENT — the S3 copy is the live document (edited via the Workflow tab / scripts/cd-registry.sh), so it must never be cp'd over.",
+    "src/config/models.json": "Target 2 seeds config/models.json only when ABSENT — the S3 copy is the live document (written by POST /api/models/registry and the nightly reconcile), so it must never be cp'd over. DL-033, TEAM-4995.",
+    "src/config/pricing.json": "Target 2 seeds config/pricing.json only when ABSENT, and only together with models.json — the S3 copy is the live document (rates refreshed by the reconcile's pricing:GetProducts pass), so it must never be cp'd over. It used to be an unconditional s3[] cp, which overwrote every refreshed rate on each deploy.",
     "src/config/lease-constants.json": "Baked into pipeline-out/orchestrator.zip by buildspec-ci.yml (copied in beside lease.mjs before the zip, per lambda/orchestrator/deploy.sh's own file list), and Target 1 ships that zip on every run — nothing separate to deploy.",
     "src/config/liveness-constants.json": "Not an S3 config surface — deploy/workflow-manager/deploy.sh bakes it into the workflow-analyzer zip. NOTE: the analyzer's manifest `files` list does not yet carry it, so a change to this file does not reach prod through the pipeline; tracked as a follow-up against PR #407 / TEAM-4160.",
     "deploy/coding-agent-runtime/probe-instances.py": "Instances runtime probe/benchmark (cold/pin/fs/turn/persist/cleanup); run by hand, not deployed."
