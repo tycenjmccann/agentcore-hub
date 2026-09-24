@@ -29,6 +29,7 @@ import {
   PutRolePolicyCommand,
 } from "@aws-sdk/client-iam";
 import { snapshotHarness } from "../pipeline/harness-snapshot.mjs";
+import { loadRegistryDoc, resolveHarnessModel } from "../pipeline/harness-model.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
@@ -51,7 +52,11 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const PRINT_POLICY = hasFlag("print-policy");
 const IAM_ONLY = hasFlag("iam-only");
 
-const REGION = getArg("region") || process.env.AWS_REGION || "us-east-1";
+// AWS_REGION_HUB is what the pipeline's CodeBuild projects export (commonEnvVars
+// in deploy/pipeline/lib/pipeline-stack.ts); accepting it keeps a hand-run that
+// sourced the pipeline env in the hub region instead of silently us-east-1.
+const REGION =
+  getArg("region") || process.env.AWS_REGION || process.env.AWS_REGION_HUB || "us-east-1";
 // NOTE: fable-5-1 must be smoke-verified for live post-tool-call streaming at
 // deploy time (its predecessor, claude-fable-5, buffered all post-tool-call
 // text and flushed it in a single burst at message end, which read as a
@@ -250,46 +255,26 @@ if (PRINT_POLICY) {
 // the policy JSON and must keep stdout machine-parseable, and it has no business
 // reading S3.
 //
-// Inlined rather than shared with the other two setup scripts: they import
-// nothing from each other, and a new shared module would have to be on the CD
-// Deploy role's path in all three deploy surfaces. Three copies of 20 lines beat
-// that. Every failure keeps LITERAL_MODEL_ID — this script's documented default
-// (see the streaming note next to it) — so an unreadable registry changes
-// nothing about what gets deployed.
-async function resolveDefaultModelId(agentId) {
-  let reg = null;
-  let resolveAgentModel;
-  let validateRegistry;
-  try {
-    // The canonical resolver (byte-copied to the token-aggregator and Telegram
-    // bridge Lambdas, scripts/check-models-registry-parity.sh). A checkout without
-    // it throws ERR_MODULE_NOT_FOUND, which is a fallback, not a failure.
-    ({ resolveAgentModel, validateRegistry } =
-      await import(new URL("../../src/lib/models/models-registry.mjs", import.meta.url).href));
-  } catch (err) {
-    console.log(`[models] registry.fallback reason=${err?.code === "ERR_MODULE_NOT_FOUND" ? "module-missing" : "import"}`);
-    return LITERAL_MODEL_ID;
-  }
-  try {
-    const { S3Client, GetObjectCommand } = await import("@aws-sdk/client-s3");
-    const res = await new S3Client({ region: REGION })
-      .send(new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: "config/models.json" }));
-    const doc = JSON.parse(await res.Body.transformToString());
-    reg = validateRegistry ? validateRegistry(doc).registry : doc;
-    if (!reg) throw new Error("invalid registry");
-  } catch (err) {
-    console.log(`[models] registry.fallback reason=s3 (${err?.name || err?.message})`);
-  }
-  const { modelId, source } = resolveAgentModel(reg, agentId, "", process.env);
-  // `literal` means nothing in the catalog or the env named a model. Keep THIS
-  // harness's documented default rather than the registry's generic persona
-  // literal, so a missing registry is a no-op for this script.
-  const chosen = source === "literal" ? LITERAL_MODEL_ID : modelId;
-  console.log(`[models] harness.model agentId=${agentId} modelId=${chosen} source=${source}`);
-  return chosen;
-}
-
-const MODEL_ID = MODEL_ID_ARG || (await resolveDefaultModelId(HARNESS_AGENT_ID));
+// The read and the resolution live in deploy/pipeline/harness-model.mjs, shared
+// with the other two setup scripts (TEAM-5034). They used to be three inline
+// copies "because a shared module would have to be on the CD Deploy role's path
+// in all three deploy surfaces" — which was already false, since all three
+// import pipeline/harness-snapshot.mjs from that same directory, and three
+// copies meant the same bug three times. Under PIPELINE_MODE a registry that
+// cannot be read now FAILS the deploy instead of silently re-pinning
+// LITERAL_MODEL_ID over an operator's /models choice.
+const REGISTRY = MODEL_ID_ARG
+  ? { doc: null, error: null }
+  : await loadRegistryDoc({ bucket: ARTIFACT_BUCKET, region: REGION });
+const MODEL_ID =
+  MODEL_ID_ARG ||
+  (await resolveHarnessModel({
+    agentId: HARNESS_AGENT_ID,
+    doc: REGISTRY.doc,
+    docError: REGISTRY.error,
+    literalModelId: LITERAL_MODEL_ID,
+    pipelineMode: PIPELINE_MODE,
+  }));
 if (MODEL_ID_ARG) console.log(`[models] harness.model agentId=${HARNESS_AGENT_ID} modelId=${MODEL_ID} source=--model-id`);
 
 // ─── 1/4 Execution role (shared harness role + WM data-plane policy) ───────────

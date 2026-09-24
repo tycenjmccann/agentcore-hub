@@ -332,8 +332,15 @@ describe("seed", () => {
       terra: "us.openai.gpt-5.6-terra",
       luna: "us.openai.gpt-6-luna",
     });
+    // The three harnesses are pinned EXPLICITLY, not left to defaults.persona
+    // (TEAM-5034): once the deploy scripts could actually read the document, an
+    // unpinned builder / routine builder would have followed the persona default
+    // and changed model, which is exactly what "the seed encodes today's live
+    // routing" forbids.
     expect(reg.agents).toEqual({
       agentcore_hub_workflow_manager: "us.anthropic.claude-fable-5-1",
+      agentcore_hub_builder: "us.anthropic.claude-sonnet-5",
+      agentcore_hub_routine_builder: "us.anthropic.claude-opus-5",
       telegram_intake: "us.anthropic.claude-sonnet-5",
     });
     expect(reg.legacyAliases).toEqual({
