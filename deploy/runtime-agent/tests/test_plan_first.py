@@ -59,7 +59,7 @@ OPUS = "us.anthropic.claude-opus-5"
 SONNET = "us.anthropic.claude-sonnet-5"
 TEST_REGISTRY = {
     "version": 1,
-    "models": [
+    "catalog": [
         {"modelId": OPUS, "status": "active", "endpoint": "bedrock-runtime",
          "region": "us-east-1", "api": "converse"},
         {"modelId": SONNET, "status": "active", "endpoint": "bedrock-runtime",

@@ -11,7 +11,17 @@
  * conditional.
  */
 import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { reconcileModels, MODELS_KEY, PREV_KEY, PRICING_KEY, mantleRegions, rateFromProduct } from './models-reconcile.mjs';
+
+// The real documents this job read-modify-writes in production. Rows live under
+// `catalog` — the one document key (TEAM-5022) — and `pricing.json` is a pure
+// projection of them, which is why the seed-backed cases at the bottom of this
+// file compare against it rather than against a hand-written expectation.
+const seed = (rel) => JSON.parse(readFileSync(fileURLToPath(new URL(rel, import.meta.url)), 'utf8'));
+const SEED_MODELS = seed('../../src/config/models.json');
+const SEED_PRICING = seed('../../src/config/pricing.json');
 
 // ─── harness ────────────────────────────────────────────────────────────────
 
@@ -33,7 +43,7 @@ const baseDoc = () => ({
   version: 4,
   updatedAt: '2026-09-01T00:00:00Z',
   updatedBy: 'human',
-  models: [
+  catalog: [
     {
       modelId: 'us.anthropic.claude-opus-5',
       label: 'Opus 5',
@@ -131,7 +141,7 @@ function harness(opts = {}) {
   };
 }
 
-const row = (doc, id) => doc.models.find((m) => m.modelId === id);
+const row = (doc, id) => doc.catalog.find((m) => m.modelId === id);
 
 // ─── cases ──────────────────────────────────────────────────────────────────
 
@@ -168,7 +178,7 @@ describe('reconcileModels', () => {
     const doc = h.written(MODELS_KEY);
     expect(doc.version).toBe(5);
     expect(doc.updatedBy).toBe('reconcile');
-    expect(doc.models.map((m) => m.modelId)).toEqual([
+    expect(doc.catalog.map((m) => m.modelId)).toEqual([
       'us.anthropic.claude-opus-5', 'openai.gpt-5.5', 'us.anthropic.claude-opus-6',
     ]);
     expect(row(doc, 'us.anthropic.claude-opus-6')).toMatchObject({
@@ -210,7 +220,7 @@ describe('reconcileModels', () => {
     const s = await reconcileModels({}, h.deps);
     expect(s).toMatchObject({ outcome: 'ok', retired: 1 });
     const doc = h.written(MODELS_KEY);
-    expect(doc.models).toHaveLength(2);
+    expect(doc.catalog).toHaveLength(2);
     expect(row(doc, 'us.anthropic.claude-opus-5')).toMatchObject({
       status: 'retired', retiredAt: '2026-09-24T03:00:00.000Z',
     });
@@ -272,11 +282,11 @@ describe('reconcileModels', () => {
 
   it('gives an unpriced row its predecessor rate as interim, and leaves a row with no predecessor unpriced', async () => {
     const doc = baseDoc();
-    doc.models.push({
+    doc.catalog.push({
       modelId: 'us.anthropic.claude-opus-6', vendor: 'anthropic', family: 'claude-opus',
       endpoint: 'bedrock-runtime', region: 'us-east-1', status: 'candidate',
     });
-    doc.models.push({
+    doc.catalog.push({
       modelId: 'us.anthropic.claude-nova-1', vendor: 'anthropic', family: 'claude-nova',
       endpoint: 'bedrock-runtime', region: 'us-east-1', status: 'candidate',
     });
@@ -324,7 +334,7 @@ describe('reconcileModels', () => {
   it('moves a tier only after a green cli probe, and writes models.prev.json', async () => {
     const doc = baseDoc();
     doc.autoAdopt = { 'claude.opus': true };
-    doc.models.push({
+    doc.catalog.push({
       modelId: 'us.anthropic.claude-opus-6', vendor: 'anthropic', family: 'claude-opus',
       endpoint: 'bedrock-runtime', region: 'us-east-1', status: 'candidate',
       pricing: { input: 11, output: 55, state: 'published' },
@@ -360,7 +370,7 @@ describe('reconcileModels', () => {
   it('blocks the tier move when the cli probe fails, recording the failure', async () => {
     const doc = baseDoc();
     doc.autoAdopt = { 'claude.opus': true };
-    doc.models.push({
+    doc.catalog.push({
       modelId: 'us.anthropic.claude-opus-6', vendor: 'anthropic', family: 'claude-opus',
       endpoint: 'bedrock-runtime', region: 'us-east-1', status: 'candidate',
       pricing: { input: 11, output: 55, state: 'published' },
@@ -388,7 +398,7 @@ describe('reconcileModels', () => {
     // against THEIR document and the outcome is reported as a conflict.
     const theirs = baseDoc();
     theirs.version = 5;
-    theirs.models[0].label = 'Opus 5 (renamed by a human)';
+    theirs.catalog[0].label = 'Opus 5 (renamed by a human)';
     const h = harness({
       profiles: [...sameAsBase.profiles, { inferenceProfileId: 'us.anthropic.claude-opus-6', status: 'ACTIVE' }],
       products: {},
@@ -460,6 +470,125 @@ describe('reconcileModels', () => {
     const s = await reconcileModels({}, h.deps);
     expect(s).toMatchObject({ outcome: 'ok', added: 0, retired: 0, repriced: 0 });
     expect(h.puts).toEqual([]);
+  });
+});
+
+// ─── the real registry ──────────────────────────────────────────────────────
+
+/**
+ * Every case above builds its own small document, which is exactly how TEAM-5022
+ * hid: the fixtures put their rows under `models`, the real
+ * `src/config/models.json` has only ever had `catalog`, and against the real file
+ * this job appended a SECOND, unpriced catalog under `models` and then published
+ * `pricing.json` with an empty `models` map — all 32 priced ids gone. So these two
+ * cases run the reconcile against the bundled seed itself. They assert the
+ * negative that matters: the pass must never introduce a `models` key, and it
+ * must never publish a pricing document that has lost the catalog's prices.
+ */
+/** A pricing write is allowed; LOSING the catalog's prices is not. `models: {}`
+ *  is precisely what the pre-fix projection published. */
+function expectPricingIntact(h) {
+  const puts = h.putsFor(PRICING_KEY);
+  if (!puts.length) return;
+  expect(JSON.parse(puts[puts.length - 1].body).models).toEqual(SEED_PRICING.models);
+}
+
+describe('reconcileModels — against the bundled seed', () => {
+  // The ticket's literal acceptance scenario: BOTH planes answer and report
+  // exactly the account state the seed already describes. Before TEAM-5022 this
+  // still wrote a `models` key (the F1 bug) — and, found while writing THIS
+  // case, the un-guarded retirement loop then retired the eval judge's bare
+  // foundation-model row (`readOnly: true`, no `us.`/`global.`/`openai.`
+  // prefix) on every run, because it can never appear in an inference-profile
+  // listing. A healthy night against unchanged reality must be a complete no-op.
+  it('is a complete no-op when discovery reports exactly what the seed already has', async () => {
+    const profiles = SEED_MODELS.catalog
+      .filter((r) => (r.endpoint || 'bedrock-runtime') === 'bedrock-runtime'
+        && ['active', 'candidate'].includes(r.status || 'active'))
+      .map((r) => ({ inferenceProfileId: r.modelId, status: 'ACTIVE', inferenceProfileName: r.label }));
+    const mantle = SEED_MODELS.catalog
+      .filter((r) => r.endpoint === 'bedrock-mantle')
+      .map((r) => ({ id: r.modelId }));
+
+    const h = harness({
+      doc: SEED_MODELS,
+      pricing: SEED_PRICING,
+      profiles,
+      mantle,
+      products: {},
+      probeCli: async () => ({ ok: false }),
+    });
+    const s = await reconcileModels({}, h.deps);
+
+    expect(s).toMatchObject({
+      outcome: 'ok', added: 0, retired: 0, repriced: 0, promoted: 0, autoAdopted: 0,
+    });
+    expect(h.putsFor(MODELS_KEY)).toEqual([]);
+    expect(JSON.parse(h.store.get(MODELS_KEY).body).models).toBeUndefined();
+    expectPricingIntact(h);
+  });
+
+  it('writes nothing when discovery cannot reach either plane', async () => {
+    // A failed scan proves nothing, so no row may be retired — and with every
+    // seed row already priced there is nothing to reprice either. The whole pass
+    // is a no-op, which is the shape a healthy night has.
+    const h = harness({ doc: SEED_MODELS, pricing: SEED_PRICING, profilesThrow: true, mantleThrow: true, products: {} });
+    const s = await reconcileModels({}, h.deps);
+    expect(s).toMatchObject({ outcome: 'ok', added: 0, retired: 0, repriced: 0, changed: false });
+    expect(h.putsFor(MODELS_KEY)).toEqual([]);
+    expect(h.logs.join('\n')).not.toContain('reconcile.invalid-document');
+    expectPricingIntact(h);
+  });
+
+  it('adds a discovered model to catalog, never to a new models array', async () => {
+    // Only the Mantle plane answers, so only Mantle rows are eligible for
+    // retirement — and `openai.gpt-5.5`, the seed's one Mantle row, is in the
+    // answer. The 20 Bedrock Runtime rows are untouched because their plane was
+    // never scanned.
+    const before = JSON.parse(JSON.stringify(SEED_MODELS));
+    const h = harness({
+      doc: SEED_MODELS,
+      pricing: SEED_PRICING,
+      profilesThrow: true,
+      mantle: [{ id: 'openai.gpt-5.5' }, { id: 'openai.gpt-6-nova' }],
+      products: {},
+    });
+    const s = await reconcileModels({}, h.deps);
+    expect(s).toMatchObject({ outcome: 'ok', added: 1, retired: 0, autoAdopted: 0 });
+
+    const doc = h.written(MODELS_KEY);
+    expect(doc.models).toBeUndefined();
+    expect(doc.catalog).toHaveLength(before.catalog.length + 1);
+    expect(doc.catalog.slice(0, before.catalog.length)).toEqual(before.catalog);
+    expect(row(doc, 'openai.gpt-6-nova')).toMatchObject({ status: 'candidate', endpoint: 'bedrock-mantle' });
+    expectPricingIntact(h);
+  });
+
+  it('refuses to publish pricing from a document it could not validate', async () => {
+    // `defaults.persona` points at a Runtime row, and this time the Runtime plane
+    // IS scanned and comes back without it: the pass retires a current routing
+    // target, so the document it writes is one the fleet will refuse. models.json
+    // still goes out (TEAM-5017 owns whether it should), but pricing.json must
+    // not be re-derived from a document that did not validate.
+    const doc = JSON.parse(JSON.stringify(SEED_MODELS));
+    const persona = doc.defaults.persona;
+    const h = harness({
+      doc,
+      pricing: SEED_PRICING,
+      profiles: doc.catalog
+        .filter((r) => (r.endpoint || 'bedrock-runtime') === 'bedrock-runtime' && r.modelId !== persona)
+        .map((r) => ({ inferenceProfileId: r.modelId, status: 'ACTIVE' })),
+      mantleThrow: true,
+      products: {},
+    });
+    const s = await reconcileModels({}, h.deps);
+    expect(s.outcome).toBe('ok');
+    expect(row(h.written(MODELS_KEY), persona).status).toBe('retired');
+    expect(h.putsFor(PRICING_KEY)).toEqual([]);
+    const logs = h.logs.join('\n');
+    expect(logs).toContain('reconcile.invalid-document');
+    expect(logs).toContain('defaults.persona=inactive');
+    expect(logs).toContain('pricing.projected skipped reason=invalid_registry');
   });
 });
 

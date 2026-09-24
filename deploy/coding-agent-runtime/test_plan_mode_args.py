@@ -43,8 +43,8 @@ OPUS = "us.anthropic.claude-opus-5"
 # gets the REAL resolver plus a stub registry instead of a CLAUDE_MODEL literal.
 TEST_REGISTRY = {
     "version": 1,
-    "models": [{"modelId": OPUS, "status": "active", "endpoint": "bedrock-runtime",
-                "region": "us-east-1", "api": "converse"}],
+    "catalog": [{"modelId": OPUS, "status": "active", "endpoint": "bedrock-runtime",
+                 "region": "us-east-1", "api": "converse"}],
     "tiers": {"claude": {"opus": OPUS}},
 }
 

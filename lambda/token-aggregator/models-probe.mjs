@@ -214,7 +214,10 @@ async function readDoc(deps) {
 async function persistProbe(deps, modelId, mode, result) {
   const fresh = await readDoc(deps);
   if (!fresh) return 'failed';
-  const rows = Array.isArray(fresh.doc?.models) ? fresh.doc.models : [];
+  // The RAW document keeps its rows under `catalog` and nowhere else
+  // (TEAM-5022) — reading `models` here found nothing in the real registry, so
+  // every probe answered 404 and no result was ever written.
+  const rows = Array.isArray(fresh.doc?.catalog) ? fresh.doc.catalog : [];
   const row = rows.find((r) => r?.modelId === modelId);
   if (!row) return 'failed';
   row.probe = { ...(isPlainObject(row.probe) ? row.probe : {}), [mode]: result };
@@ -248,7 +251,7 @@ export async function probeModel(event, deps) {
     deps.log.warn?.('[models] probe.failed reason=registry_missing');
     return { statusCode: 503, ok: false, modelId, mode, error: 'registry unreadable' };
   }
-  const rows = Array.isArray(current.doc?.models) ? current.doc.models : [];
+  const rows = Array.isArray(current.doc?.catalog) ? current.doc.catalog : [];
   const row = rows.find((r) => r?.modelId === modelId);
   if (!row) {
     deps.log.warn?.(`[models] probe.failed modelId=${modelId} reason=unknown_model`);

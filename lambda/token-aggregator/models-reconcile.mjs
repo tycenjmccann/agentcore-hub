@@ -93,6 +93,9 @@ const trimmed = (v) => (typeof v === 'string' ? v.trim() : '');
 const clone = (v) => JSON.parse(JSON.stringify(v));
 const errText = (e) => String((e && (e.message || e.name)) || e || 'error').slice(0, 300);
 const statusOf = (row) => row?.status ?? 'active';
+/** `validateRegistry().errors` as one log line — the same `path=reason; …` shape
+ *  the Telegram bridge already logs, so a refusal reads the same in both places. */
+const fmtErrors = (errors) => Object.entries(errors || {}).map(([p, r]) => `${p}=${r}`).join('; ');
 
 // ─── Step 1: read ────────────────────────────────────────────────────────────
 
@@ -212,10 +215,14 @@ async function discover(deps, env) {
 }
 
 /** Fold discovery into the document: add, un-retire, retire. Returns nothing —
- *  `doc.models` and `counts` are mutated in place, which keeps the five steps
- *  reading as one transaction over one object. */
+ *  `doc.catalog` and `counts` are mutated in place, which keeps the five steps
+ *  reading as one transaction over one object.
+ *
+ *  `doc` here is the RAW S3 document, so the rows are under `catalog` — the one
+ *  document key (TEAM-5022). Writing them under `models` instead put a second,
+ *  unpriced catalog beside the real one and split the fleet from the hub. */
 function mergeDiscovery(doc, discovered, counts, nowIso, log) {
-  const rows = Array.isArray(doc.models) ? doc.models : (doc.models = []);
+  const rows = Array.isArray(doc.catalog) ? doc.catalog : (doc.catalog = []);
   const byId = new Map(rows.map((r) => [r?.modelId, r]));
   const known = new Set([...byId.keys(), ...discovered.found.keys()]);
 
@@ -253,11 +260,30 @@ function mergeDiscovery(doc, discovered, counts, nowIso, log) {
     // A failed scan proves nothing. A row with no endpoint is a Bedrock Runtime
     // row, same default the resolver applies.
     if (!discovered.scanned.has(row.endpoint || 'bedrock-runtime')) continue;
+    if (!retirable(row)) continue;
     row.status = 'retired';
     row.retiredAt = nowIso;
     counts.retired += 1;
     log.log(`[models] reconcile.retired modelId=${row.modelId} reason=not_discovered`);
   }
+}
+
+/**
+ * Would a successful sweep ever have been ABLE to list this id? Only then may
+ * its absence mean "gone" — a narrower guard than `discovery.ts`'s
+ * `retirable()`: this job, unlike the interactive /models refresh, is allowed
+ * to retire a row something currently routes at (see the invalid-document
+ * warning in pass() below; TEAM-5017 owns whether it should stop doing that).
+ *
+ * The eval judge's bare foundation-model row (`readOnly: true`, no
+ * `us.`/`global.`/`openai.` prefix) is never an inference profile, so
+ * `listInferenceProfiles`/`mantleModels` could never have reported it either
+ * way — retiring it on absence, which the un-guarded loop did until
+ * TEAM-5022, is a lie about what the sweep actually saw, not a finding.
+ */
+function retirable(row) {
+  if (row.readOnly) return false;
+  return PROFILE_ID_RE.test(row.modelId) || MANTLE_ID_RE.test(row.modelId);
 }
 
 // ─── Step 3: pricing ─────────────────────────────────────────────────────────
@@ -333,7 +359,12 @@ function setPrice(row, price) {
  * then rewritten as `price`, so no row ends up holding two rate blocks.
  */
 async function refreshPricing(doc, deps, counts, nowIso, drifts) {
-  for (const row of doc.models || []) {
+  const rows = Array.isArray(doc.catalog) ? doc.catalog : [];
+  // predecessorRow() reads a NORMALIZED registry (rows under `.models`), and this
+  // is the raw document — hand it the rows in the shape it expects rather than
+  // teaching the byte-copied twin a second one.
+  const view = { models: rows };
+  for (const row of rows) {
     if (!RESOLVABLE_STATUSES.includes(statusOf(row))) continue;
     const current = priceBlockOf(row);
     const rates = await publishedRates(deps, row);
@@ -358,7 +389,7 @@ async function refreshPricing(doc, deps, counts, nowIso, drifts) {
     }
 
     if (usablePrice(current)) continue;
-    const pred = predecessorRow(doc, row);
+    const pred = predecessorRow(view, row);
     const predPrice = priceBlockOf(pred);
     if (usablePrice(predPrice)) {
       setPrice(row, {
@@ -399,7 +430,7 @@ async function autoAdopt(doc, deps, counts, nowIso) {
     const [cli, tier] = String(tierKey).split('.');
     if (!cli || !tier) continue;
 
-    const eligible = (doc.models || []).filter((row) => statusOf(row) === 'candidate'
+    const eligible = (doc.catalog || []).filter((row) => statusOf(row) === 'candidate'
       && tierForFamily(row.vendor, row.family) === `${cli}.${tier}`
       && usablePrice(priceBlockOf(row))
       && row.probe?.api?.ok === true);
@@ -465,6 +496,15 @@ async function pass(base, deps, env, nowIso) {
   await refreshPricing(next, deps, counts, nowIso, drifts);
   const tierMoved = await autoAdopt(next, deps, counts, nowIso);
 
+  // One verdict on the post-pass document, shared with projectPricing. A fatal
+  // verdict does NOT stop the models.json write — "the reconcile retired a
+  // current routing target" is TEAM-5017's to decide — but it must never be
+  // silent, because the fleet is about to refuse this document.
+  const verdict = validateRegistry(next);
+  if (!verdict.registry) {
+    deps.log.warn?.(`[models] reconcile.invalid-document ${fmtErrors(verdict.errors)}`);
+  }
+
   const changed = JSON.stringify(stripVolatile(next)) !== JSON.stringify(stripVolatile(base.doc));
 
   // Re-read immediately before writing. A version that moved is a human editing
@@ -501,7 +541,7 @@ async function pass(base, deps, env, nowIso) {
     }
   }
 
-  await projectPricing(next, deps, counts);
+  await projectPricing(deps, counts, verdict);
   return { ...counts, drifts, outcome: 'ok', changed };
 }
 
@@ -515,15 +555,25 @@ async function pass(base, deps, env, nowIso) {
  * document, so an unreadable previous pricing file means we would DROP them:
  * this Lambda ships no seed copy, so it writes nothing at all rather than
  * publish a pricing file with holes in it.
+ *
+ * It projects from the VALIDATED registry or not at all. Projecting from the raw
+ * document instead was the second half of TEAM-5022: a document the twins refuse
+ * would have been published as `models: {}`, i.e. every priced id silently gone
+ * from the card Lambda. A skipped projection leaves the last good pricing.json in
+ * place, which is the safe direction to fail in.
  */
-async function projectPricing(doc, deps, counts) {
+async function projectPricing(deps, counts, verdict) {
+  if (!verdict.registry) {
+    deps.log.warn?.('[models] pricing.projected skipped reason=invalid_registry '
+      + `errors=${fmtErrors(verdict.errors)}`);
+    return;
+  }
   const live = await readJson(deps, PRICING_KEY);
   if (!live) {
     deps.log.warn?.('[models] pricing.projected skipped reason=prev_unreadable');
     return;
   }
-  const { registry } = validateRegistry(doc);
-  const { pricing, prevSourceNotes } = pricingProjection(registry || doc, live.doc, null);
+  const { pricing, prevSourceNotes } = pricingProjection(verdict.registry, live.doc, null);
   if (JSON.stringify(live.doc) === JSON.stringify(pricing)) return;
   try {
     await deps.s3Put(PRICING_KEY, JSON.stringify(pricing, null, 2), { ifMatch: live.etag });

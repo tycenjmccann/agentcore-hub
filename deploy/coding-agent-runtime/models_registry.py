@@ -30,6 +30,19 @@ genuinely cannot afford the GET pass `ttl_seconds`.
 EVERY resolution failure is LOUD and then falls back to a literal. A registry
 that cannot be read or does not validate must never silently change which model
 runs: it degrades to the env var, then to the one literal per role below.
+
+ONE DOCUMENT KEY: `catalog` (TEAM-5022). The rows of `config/models.json` live
+under `catalog` and nowhere else — the same key the TS canonical
+(`parseModelsRegistry` in src/lib/models-registry.ts) reads, and the only key the
+seed has ever shipped. There is no `models` input fallback: preferring a `models`
+key let the nightly reconcile write a SECOND catalog beside the real one, after
+which these twins refused the document while the hub kept serving it. The
+NORMALIZED dict parse_registry/validate_registry hand back does carry its rows as
+`["models"]` — that is an in-memory representation, not a document key, and
+`catalog` is popped out of it so it can never be mistaken for a raw document.
+Nothing may serialize a normalized registry back to S3; the two writers of
+`config/models.json` (the reconcile and the probe, both in
+lambda/token-aggregator/) read-modify-write the RAW document.
 """
 
 import json
@@ -265,14 +278,13 @@ def _parse_registry(doc):
     if not isinstance(doc, dict):
         return None, warnings, {"document": "not_an_object"}
 
-    raw_models = doc.get("models")
-    if raw_models is None:
-        raw_models = doc.get("catalog")
-    if not isinstance(raw_models, list):
-        return None, warnings, {"models": "missing_or_not_an_array"}
+    # `catalog` ONLY — see the ONE DOCUMENT KEY note at the top of this file.
+    raw_catalog = doc.get("catalog")
+    if not isinstance(raw_catalog, list):
+        return None, warnings, {"catalog": "missing_or_not_an_array"}
 
     rows, seen_ids, alias_owner = [], set(), {}
-    for idx, row in enumerate(raw_models):
+    for idx, row in enumerate(raw_catalog):
         if not _row_ok(row):
             warnings.append(f"row {idx} dropped (malformed)")
             continue
@@ -337,6 +349,10 @@ def _parse_registry(doc):
             seen_ids.discard(row["modelId"])
 
     normalized = dict(doc)
+    # `catalog` is popped OUT: a normalized registry carries its rows as
+    # `["models"]`, so keeping the raw list too would leave a stale second copy
+    # that a re-parse (or an accidental S3 write) would silently prefer.
+    normalized.pop("catalog", None)
     normalized["models"] = rows
     normalized["_aliasOwner"] = alias_owner
     return normalized, warnings, errors

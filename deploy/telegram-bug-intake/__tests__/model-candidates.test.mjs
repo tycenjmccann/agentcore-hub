@@ -180,7 +180,9 @@ const row = (over = {}) => ({
   ...over,
 });
 
-const doc = (models, over = {}) => ({ version: 3, updatedAt: "2026-09-24T03:00:00Z", models, ...over });
+// Rows go under `catalog` and nowhere else — the one document key the registry
+// twin reads (TEAM-5022). `loadModule({ models })` names the S3 BODY, not the key.
+const doc = (catalog, over = {}) => ({ version: 3, updatedAt: "2026-09-24T03:00:00Z", catalog, ...over });
 
 /** Fresh container: module-level registry cache and _loggedIntakeModel reset. */
 async function loadModule({ bucket = BUCKET, models = null, bedrockModelId } = {}) {
@@ -291,7 +293,7 @@ describe("intake model comes from the registry", () => {
       .toBe("us.anthropic.claude-sonnet-5");
   });
 
-  it("an invalid document (models[] missing) does not stop intake", async () => {
+  it("an invalid document (catalog[] missing) does not stop intake", async () => {
     expect(await classifyWith({ version: 1, agents: { telegram_intake: "x.y" } }))
       .toBe("us.anthropic.claude-sonnet-5");
   });
