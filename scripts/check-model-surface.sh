@@ -12,7 +12,8 @@
 #   * the registry's own seed / catalog / pricing files
 #   * each byte-copied loader's LITERAL_* fallback constant (the last resort when
 #     S3 is unreadable — a hub with no registry must still boot)
-#   * the env-fallback layer in the deploy scripts (DD4: `--env X=${X:-<literal>}`)
+#   * the env-fallback layer in the deploy scripts (DD4: `--env X=${X:-<literal>}`
+#     in bash, `os.environ.get("X", <literal>)` in Python)
 #   * prose — a comment, docstring, help text or prompt example
 # Everything else is a resolution path and must go through the registry.
 #
@@ -90,13 +91,19 @@ ALLOW=(
   # The coding runtime's CLAUDE_MODEL / CODEX_MODEL env tails.
   'deploy/coding-agent-runtime/main.py:/os\.environ\.get\(/'
   'deploy/coding-agent-runtime/main.py:/^\s*"CLAUDE_MODEL", /'
-  # `--env NAME=${NAME:-<literal>}` on the create/update calls: the runtime reads
-  # the registry, but a runtime created before the registry existed still needs a
-  # model. These are deploy scripts, not a resolution path.
-  'deploy/runtime-agent/deploy-one.sh'
-  'deploy/runtime-agent/deploy-one-robust.py'
-  'deploy/runtime-agent/deploy-fleet.sh'
-  'deploy/coding-agent-runtime/deploy.py'
+  # The env-fallback tails on the create/update calls: the runtime reads the
+  # registry at the point of use, but a runtime created before the registry
+  # existed still needs a model, so a deploy script passes one as the LAST resort
+  # under an env override. Shape-pinned rather than whole-file (TEAM-5023): the
+  # entry now enforces the shape the reason claims — `--env NAME=${NAME:-<literal>}`
+  # in bash, `os.environ.get("NAME", "<literal>")` in Python — instead of blessing
+  # any literal these four files ever grow. deploy-fleet.sh holds MODEL_ID only to
+  # print it in the banner, and exports it for the child deploy-one.sh /
+  # deploy-one-robust.py, so banner and baked value cannot drift.
+  'deploy/runtime-agent/deploy-one.sh:/--env "[A-Z_]+=\$\{[A-Z_]+:-/'
+  'deploy/runtime-agent/deploy-one-robust.py:/os\.environ\.get\("[A-Z_]+", "/'
+  'deploy/runtime-agent/deploy-fleet.sh:/^MODEL_ID="\$\{MODEL_ID:-/'
+  'deploy/coding-agent-runtime/deploy.py:/os\.environ\.get\("[A-Z_]+", "/'
   # Both remaining hits are comments explaining which endpoint serves which id
   # shape; the model id itself now arrives via `models_registry.py --export`.
   'deploy/coding-agent-runtime/run-codex.sh:/^#/'
@@ -196,7 +203,10 @@ entry_covers() { # $1 = entry, $2 = path, $3 = line no, $4 = line text
     # directory prefix.
     *:/*/)
       spec="${entry%%:/*}"; where="${entry#*:/}"; where="${where%/}"
-      [ "$spec" = "$p" ] && printf '%s' "$text" | grep -qE "$where" && return 0 ;;
+      # `--`: a shape pin may legitimately begin with `-` (e.g. `--env `), and
+      # without an option terminator grep reads that as an option string, not
+      # a pattern, and misreports every real hit under it as unallowed.
+      [ "$spec" = "$p" ] && printf '%s' "$text" | grep -qE -- "$where" && return 0 ;;
     */) [ "${p#"$entry"}" != "$p" ] && return 0 ;;
     *:[0-9]*-[0-9]*)
       spec="${entry%%:*}"; where="${entry##*:}"
@@ -323,6 +333,26 @@ self_test() {
     echo "  ok — docs and *.test.ts are exempt"; pass=$((pass + 1))
   else
     echo "  SELF-TEST FAIL: an exempt path was reported" >&2; fail=$((fail + 1))
+  fi
+
+  # 5. a pin whose regex begins with `-` (e.g. `--env `) is read as a pattern,
+  # not misparsed as a grep option (TEAM-5023) — and the same pin still
+  # rejects a hardcoded line with no env fallback.
+  printf '  --env "X_MODEL=${X_MODEL:-us.anthropic.claude-opus-5}"\n' \
+    > "$tmp/lambda/somewhere/index.mjs"
+  ALLOW+=('lambda/somewhere/index.mjs:/--env "[A-Z_]+=\$\{[A-Z_]+:-/')
+  if run_check "$tmp" >/dev/null 2>&1; then
+    echo "  ok — a pin beginning with --env is read as a pattern, not a grep option"; pass=$((pass + 1))
+  else
+    echo "  SELF-TEST FAIL: a leading-dash pin misfired as a grep option" >&2; fail=$((fail + 1))
+  fi
+
+  printf '  --env "X_MODEL=us.anthropic.claude-opus-5"\n' \
+    > "$tmp/lambda/somewhere/index.mjs"
+  if run_check "$tmp" >/dev/null 2>&1; then
+    echo "  SELF-TEST FAIL: the leading-dash pin allowed a hardcoded literal with no fallback" >&2; fail=$((fail + 1))
+  else
+    echo "  ok — the same pin still rejects a hardcoded (non-fallback) line"; pass=$((pass + 1))
   fi
 
   rm -rf "$tmp"
