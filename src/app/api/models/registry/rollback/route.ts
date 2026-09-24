@@ -50,6 +50,9 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
     reason: `rollback-to-${previous.version}`,
     // Every target in prev was live routing when prev was written, so a rollback
     // adopts nothing — and a gate that could refuse one removes the recovery path.
+    // The save sequence also validates this document by the READ-time verdict
+    // (fatalReadErrors), so a routed candidate that failed a probe since prev
+    // was written cannot block the rollback either (TEAM-5016 finding 1).
     adoptionGate: false,
   });
 }

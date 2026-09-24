@@ -33,6 +33,7 @@ import {
 import type { CatalogRow, ModelsRegistry, ProbeOutcome } from "@/lib/models-registry";
 import { runApiProbe, runCliProbe } from "@/lib/models/probe";
 import { assertSameOrigin } from "@/lib/models/request-guard";
+import { track } from "./detached";
 
 export const dynamic = "force-dynamic";
 
@@ -141,16 +142,19 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
   console.log(`[models] probe.accepted modelId=${modelId} mode=${mode}`);
   // Detached on purpose — see the module doc. The `finally` releases the claim so
   // a failed probe can be retried immediately rather than after the 10-minute TTL.
-  void (async () => {
-    try {
-      const outcome = mode === "api" ? await runApiProbe(row) : await runCliProbe(row);
-      await recordOutcome(modelId, mode, outcome);
-    } catch (err) {
-      console.warn(`[models] probe.crashed modelId=${modelId} mode=${mode} error=${(err as Error)?.message || "error"}`);
-    } finally {
-      inFlight.delete(key);
-    }
-  })();
+  // `track` lets the tests await the run instead of polling for its write.
+  void track(
+    (async () => {
+      try {
+        const outcome = mode === "api" ? await runApiProbe(row) : await runCliProbe(row);
+        await recordOutcome(modelId, mode, outcome);
+      } catch (err) {
+        console.warn(`[models] probe.crashed modelId=${modelId} mode=${mode} error=${(err as Error)?.message || "error"}`);
+      } finally {
+        inFlight.delete(key);
+      }
+    })()
+  );
 
   return NextResponse.json(
     { accepted: true, modelId, mode, pollAfterMs: POLL_AFTER_MS },

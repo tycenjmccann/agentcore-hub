@@ -34,6 +34,7 @@ const PY_TWINS = [
   "deploy/coding-agent-runtime/models_registry.py",
 ];
 const MJS_TWINS = [
+  "src/lib/models/models-registry.mjs",
   "lambda/token-aggregator/models-registry.mjs",
   "deploy/telegram-bug-intake/models-registry.mjs",
 ];
@@ -129,10 +130,11 @@ describe("registry twins agree on the literal fallbacks (DL-033)", () => {
     });
   }
 
-  it("the Python pair and the mjs pair are each byte-identical", () => {
+  it("the Python pair and the mjs trio are each byte-identical", () => {
     // scripts/check-models-registry-parity.sh is the CI guard; this keeps the
-    // contract visible to anyone editing one copy from an editor.
-    expect(read(PY_TWINS[0])).toEqual(read(PY_TWINS[1]));
-    expect(read(MJS_TWINS[0])).toEqual(read(MJS_TWINS[1]));
+    // contract visible to anyone editing one copy from an editor. Every copy is
+    // compared to the first, so adding a copy to the list pins it too.
+    for (const copy of PY_TWINS.slice(1)) expect(read(copy), copy).toEqual(read(PY_TWINS[0]));
+    for (const copy of MJS_TWINS.slice(1)) expect(read(copy), copy).toEqual(read(MJS_TWINS[0]));
   });
 });

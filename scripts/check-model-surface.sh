@@ -71,10 +71,12 @@ ALLOW=(
   # ...and the two-endpoint explanation in resolve_coding_model's docstring.
   'deploy/runtime-agent/models_registry.py:/^\s*(#|`|Runtime serves|\*)/'
   'deploy/coding-agent-runtime/models_registry.py:/^\s*(#|`|Runtime serves|\*)/'
-  # mjs twins: the same three constants, plus the jsdoc that documents the two
-  # endpoints and the id-parsing rules (`us.anthropic.claude-opus-5 -> vendor …`).
+  # mjs canonical + twins: the same three constants, plus the jsdoc that documents
+  # the two endpoints and the id-parsing rules (`us.anthropic.claude-opus-5 -> vendor …`).
+  'src/lib/models/models-registry.mjs:/^export const LITERAL_[A-Z_]+ = /'
   'lambda/token-aggregator/models-registry.mjs:/^export const LITERAL_[A-Z_]+ = /'
   'deploy/telegram-bug-intake/models-registry.mjs:/^export const LITERAL_[A-Z_]+ = /'
+  'src/lib/models/models-registry.mjs:/^\s*\*/'
   'lambda/token-aggregator/models-registry.mjs:/^\s*\*/'
   'deploy/telegram-bug-intake/models-registry.mjs:/^\s*\*/'
 

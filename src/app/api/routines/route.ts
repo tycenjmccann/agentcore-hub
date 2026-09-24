@@ -13,6 +13,7 @@ import { getIdentity } from "@/lib/auth/identity";
 import { listRoutines, putRoutine } from "@/lib/routines/store";
 import { upsertSchedule } from "@/lib/routines/schedule";
 import { validateScheduleFloor } from "@/lib/routines/cron";
+import { guardRoutineModelOverride } from "@/lib/routines/model-override";
 import { resolveWorkflowDef } from "@/lib/workflow/defs-loader";
 import { boundConnectorIdsForDef } from "@/lib/workflow/roster-loader";
 import type { Routine } from "@/lib/routines/types";
@@ -48,6 +49,16 @@ export async function POST(request: NextRequest) {
         { error: "name, workflowDefId, schedule.expression, and input.titleTemplate are required" },
         { status: 400 }
       );
+    }
+
+    // Same rule as the workflow front door (TEAM-5016 finding 6): an override the
+    // start route would 400 must be refused HERE, where it is typed — otherwise the
+    // routine fails on every fire, silently, forever. Stored normalized.
+    if ("modelOverride" in input) {
+      const guard = await guardRoutineModelOverride(input.modelOverride);
+      if (!guard.ok) return guard.response;
+      if (guard.modelOverride === undefined) delete input.modelOverride;
+      else input.modelOverride = guard.modelOverride;
     }
 
     // Reject a routine whose workflow def doesn't actually exist in the live config

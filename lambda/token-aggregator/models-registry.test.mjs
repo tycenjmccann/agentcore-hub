@@ -22,6 +22,8 @@ import {
   LITERAL_PERSONA_DEFAULT,
   LITERAL_CODING_CODEX,
   CHAIN_STEPS,
+  NON_FATAL_READ_REASONS,
+  fatalReadErrors,
   validateRegistry,
   parseRegistry,
   resolveModel,
@@ -243,11 +245,14 @@ describe.skipIf(MISSING.length)(DESCRIBE_TITLE, () => {
         // Field path AND reason, not a substring: the reasons are the contract
         // (`unpriced` vs `inactive` decides what an operator goes and fixes), and
         // a substring match would pass on the right path with the wrong verdict.
-        const { errors } = validateRegistry(raw);
+        const { registry, errors } = validateRegistry(raw);
         expect(Object.keys(errors).length === 0, JSON.stringify(errors)).toBe(c.expected.ok);
         for (const [field, reason] of Object.entries(c.expected.errors)) {
           expect(errors[field], `${field} in ${JSON.stringify(errors)}`).toBe(reason);
         }
+        // The READ-time verdict: a non-null registry is what the loaders serve.
+        // Defaults to `ok` — only NON_FATAL_READ_REASONS make the two differ.
+        expect(registry !== null, `${c.name} readable`).toBe(c.expected.readable ?? c.expected.ok);
         return;
       }
 
@@ -572,9 +577,37 @@ describe('validateRegistry', () => {
       const doc = registryDoc();
       mutate(doc);
       const { registry, errors } = validateRegistry(doc);
-      expect(registry, reason).toBeNull();
       expect(errors['defaults.persona'], reason).toBe(reason);
+      // `unprobed` is reported but NOT fatal at read time (NON_FATAL_READ_REASONS):
+      // a routed candidate that failed a re-probe must not drop every reader to
+      // env/literal (TEAM-5016 finding 1). Every other reason refuses the document.
+      if (NON_FATAL_READ_REASONS.includes(reason)) expect(registry, reason).not.toBeNull();
+      else expect(registry, reason).toBeNull();
     }
+  });
+
+  it('read-time tolerance is exactly the two point-in-time reasons, same as the TS canonical', () => {
+    expect(NON_FATAL_READ_REASONS).toEqual(['unknown_agent', 'unprobed']);
+    expect(fatalReadErrors({
+      'agents.gone_agent': 'unknown_agent',
+      'defaults.persona': 'unprobed',
+      'tiers.codex.luna': 'unpriced',
+    })).toEqual({ 'tiers.codex.luna': 'unpriced' });
+    expect(fatalReadErrors({})).toEqual({});
+    expect(fatalReadErrors(undefined)).toEqual({});
+  });
+
+  it('serves a document whose only fault is a routed candidate that failed a re-probe', () => {
+    const doc = registryDoc();
+    doc.models[0].status = 'candidate';
+    doc.models[0].probe = { api: { ok: true }, cli: { ok: false, error: 'turn failed' } };
+    const { registry, errors } = validateRegistry(doc);
+    // Every field that routes at the row reports it (defaults AND tiers.claude.fable).
+    expect(errors['defaults.persona']).toBe('unprobed');
+    expect(new Set(Object.values(errors))).toEqual(new Set(['unprobed']));
+    expect(registry).not.toBeNull();
+    expect(resolveAgentModel(registry, 'agentcore_hub_frontend_dev', '', {}, { log: quiet() }).modelId)
+      .toBe('us.anthropic.claude-fable-5-1');
   });
 
   it('calls a half-probed candidate unprobed on EITHER plane', () => {
@@ -589,7 +622,9 @@ describe('validateRegistry', () => {
       const doc = registryDoc();
       doc.models[0].status = 'candidate';
       doc.models[0].probe = probe;
-      expect(validateRegistry(doc).errors['defaults.persona'], JSON.stringify(probe)).toBe('unprobed');
+      const { registry, errors } = validateRegistry(doc);
+      expect(errors['defaults.persona'], JSON.stringify(probe)).toBe('unprobed');
+      expect(registry, 'reported, still readable').not.toBeNull();
     }
     const ok = registryDoc();
     ok.models[0].status = 'candidate';

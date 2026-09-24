@@ -167,7 +167,7 @@ describe("models-registry fixture contract", () => {
     // not a hardcoded total: a count collides on every added case, and what has to
     // hold is that the fixture was not truncated, names are unique, and every kind
     // present is one the switch below actually asserts on. Mirrors the twin readers.
-    expect(CASES.length).toBeGreaterThanOrEqual(27);
+    expect(CASES.length).toBeGreaterThanOrEqual(29);
     expect(new Set(CASES.map((c) => c.name)).size).toBe(CASES.length);
     const HANDLED = ["resolveModel", "resolveAgentModel", "resolveCodingModel", "parse", "validate", "projection"];
     expect([...new Set(CASES.map((c) => c.input.kind))].filter((k) => !HANDLED.includes(k))).toEqual([]);
@@ -233,6 +233,10 @@ describe("models-registry fixture contract", () => {
           const result = mod.validateRegistry(registry!);
           expect(result.ok).toBe(c.expected.ok);
           expect(result.errors).toEqual(c.expected.errors);
+          // The READ-time verdict: would the loader serve this document? Defaults
+          // to `ok` — only NON_FATAL_READ_REASONS make the two differ.
+          const readable = (c.expected.readable ?? c.expected.ok) as boolean;
+          expect(Object.keys(mod.fatalReadErrors(result.errors)).length === 0, `${c.name} readable`).toBe(readable);
           break;
         }
         case "projection": {
@@ -538,6 +542,69 @@ describe("validateRegistry", () => {
 // ---------------------------------------------------------------------------
 // 3b. Adoption — the rule that needs BOTH documents
 // ---------------------------------------------------------------------------
+
+describe("fatalReadErrors", () => {
+  it("drops exactly the two point-in-time reasons and keeps every other verdict", () => {
+    expect([...mod.NON_FATAL_READ_REASONS].sort()).toEqual(["unknown_agent", "unprobed"]);
+    expect(
+      mod.fatalReadErrors({
+        "agents.gone_agent": "unknown_agent",
+        "defaults.persona": "unprobed",
+        "tiers.codex.luna": "unpriced",
+        "legacyAliases.claude-sonnet-45": "quarantined",
+      })
+    ).toEqual({ "tiers.codex.luna": "unpriced", "legacyAliases.claude-sonnet-45": "quarantined" });
+    expect(mod.fatalReadErrors({})).toEqual({});
+  });
+});
+
+describe("activateAdoptedTargets", () => {
+  const green = { ok: true, at: "2026-09-20T00:00:00.000Z" };
+  const candidateRow = () => ({
+    modelId: "us.anthropic.claude-opus-6",
+    label: "Claude Opus 6",
+    vendor: "anthropic" as const,
+    family: "opus",
+    endpoint: "bedrock-runtime" as const,
+    region: "us-east-1",
+    api: "converse" as const,
+    contextWindow: 200000,
+    aliases: ["opus-6"],
+    price: { input: 5.5, output: 27.5, source: "interim" as const, asOf: "2026-09-24" },
+    status: "candidate" as const,
+    probe: { api: green, cli: green },
+  });
+
+  it("flips a routed candidate to active — reached by id or by alias — and names it", () => {
+    const reg = SEED();
+    reg.catalog.push(candidateRow());
+    reg.tiers.claude.opus = "opus-6"; // alias, resolved like the adoption gate does
+    const { registry, activated } = mod.activateAdoptedTargets(reg);
+    expect(activated).toEqual(["us.anthropic.claude-opus-6"]);
+    expect(registry.catalog.find((r) => r.modelId === "us.anthropic.claude-opus-6")!.status).toBe("active");
+    // Pure: the input is untouched.
+    expect(reg.catalog.find((r) => r.modelId === "us.anthropic.claude-opus-6")!.status).toBe("candidate");
+    // And the now-active row can fail a re-probe without ever reading as unprobed.
+    registry.catalog.find((r) => r.modelId === "us.anthropic.claude-opus-6")!.probe!.cli = { ok: false, at: "x" };
+    expect(mod.validateRegistry(registry).ok).toBe(true);
+  });
+
+  it("leaves a candidate alone when nothing routes to it, or only a legacyAlias does", () => {
+    const reg = SEED();
+    reg.catalog.push(candidateRow());
+    expect(mod.activateAdoptedTargets(reg).activated).toEqual([]);
+    reg.legacyAliases["claude-opus-6-old"] = "us.anthropic.claude-opus-6";
+    const { registry, activated } = mod.activateAdoptedTargets(reg);
+    expect(activated).toEqual([]);
+    expect(registry.catalog.find((r) => r.modelId === "us.anthropic.claude-opus-6")!.status).toBe("candidate");
+  });
+
+  it("is a no-op on the seed — nothing there is a candidate", () => {
+    const { registry, activated } = mod.activateAdoptedTargets(SEED());
+    expect(activated).toEqual([]);
+    expect(registry).toEqual(SEED());
+  });
+});
 
 describe("adoptionErrors", () => {
   const green = { ok: true, at: "2026-09-20T00:00:00.000Z" };
@@ -866,6 +933,51 @@ describe("loadModelsRegistryMeta refuses a corrupt document", () => {
     const meta = await mod.loadModelsRegistryMeta({ force: true });
     expect(meta.source).toBe("s3");
     expect(meta.registry.version).toBe(9);
+  });
+
+  /**
+   * TEAM-5016 finding 1. `unprobed` is the ADOPTION rule applied at a point in
+   * time. A candidate adopted with two green probes, then re-probed and failed,
+   * used to read as a corrupt document — every hub task fell to last-good/seed,
+   * and rollback 422'd on the same rule. The read verdict now tolerates it (the
+   * save verdict does not), and the state is reported, not hidden.
+   */
+  it("serves a document whose only fault is a routed candidate that failed a re-probe", async () => {
+    const doc = JSON.parse(GOOD()) as { catalog: Array<Record<string, unknown>>; defaults: Record<string, string> };
+    doc.catalog.push({
+      modelId: "us.anthropic.claude-opus-6",
+      label: "Claude Opus 6",
+      vendor: "anthropic",
+      family: "opus",
+      endpoint: "bedrock-runtime",
+      region: "us-east-1",
+      api: "converse",
+      contextWindow: 200000,
+      aliases: [],
+      price: { input: 5.5, output: 27.5, source: "interim", asOf: "2026-09-24" },
+      status: "candidate",
+      probe: { api: { ok: true, at: "2026-09-24T00:00:00Z" }, cli: { ok: false, at: "2026-09-24T00:00:00Z", error: "turn failed" } },
+    });
+    doc.defaults.persona = "us.anthropic.claude-opus-6";
+    h.state.objects[mod.MODELS_REGISTRY_KEY] = JSON.stringify(doc);
+
+    const meta = await mod.loadModelsRegistryMeta({ force: true });
+    expect(meta.source).toBe("s3");
+    expect(meta.registry.defaults.persona).toBe("us.anthropic.claude-opus-6");
+    // The SAVE verdict still names it — the console cannot re-save this state.
+    expect(mod.validateRegistry(meta.registry).errors).toEqual({ "defaults.persona": "unprobed" });
+  });
+
+  it("keeps the cached document when the key goes missing (TEAM-5016 finding 3)", async () => {
+    h.state.objects[mod.MODELS_REGISTRY_KEY] = GOOD();
+    const live = await mod.loadModelsRegistryMeta({ force: true });
+    expect(live.source).toBe("s3");
+
+    delete h.state.objects[mod.MODELS_REGISTRY_KEY];
+    const meta = await mod.loadModelsRegistryMeta({ force: true });
+    expect(meta.source).toBe("cache");
+    expect(meta.registry.version).toBe(9);
+    expect(meta.etag).toBe(live.etag);
   });
 
   it("stamps the TTL on every path, so a bad document is read once per minute", async () => {

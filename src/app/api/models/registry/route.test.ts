@@ -137,7 +137,11 @@ const GREEN: ProbeOutcome = { ok: true, at: "2026-09-20T00:00:00.000Z", seconds:
  * A brand-new, priced, catalogued model, and `tiers.codex.luna` re-pointed at it
  * — the shape of every adoption an operator can make from the console.
  */
-function adoptNewModel(candidate: ModelsRegistry, probe?: CatalogRow["probe"]): void {
+function adoptNewModel(
+  candidate: ModelsRegistry,
+  probe?: CatalogRow["probe"],
+  status: CatalogRow["status"] = "active"
+): void {
   candidate.catalog.push({
     modelId: "us.openai.gpt-6-nova",
     label: "GPT-6 Nova",
@@ -149,7 +153,7 @@ function adoptNewModel(candidate: ModelsRegistry, probe?: CatalogRow["probe"]): 
     contextWindow: 400_000,
     aliases: [],
     price: { input: 2, output: 8, source: "interim", asOf: "2026-09-20" },
-    status: "active",
+    status,
     ...(probe ? { probe } : {}),
   });
   candidate.tiers.codex.luna = "us.openai.gpt-6-nova";
@@ -478,6 +482,27 @@ describe("POST /api/models/registry", () => {
     const res = await POST(postReq({ baseVersion: 7, registry: candidate }));
     expect(res.status).toBe(200);
     expect((await res.json()).registry.tiers.codex.luna).toBe("us.openai.gpt-6-nova");
+  });
+
+  /**
+   * TEAM-5016 finding 1. The console flips a row to `active` client-side when the
+   * operator adopts it; an API caller can leave it `candidate`. A routed candidate
+   * that later failed a re-probe then read as `unprobed` — a FAILED read on every
+   * hub task. Adoption is the transition, so the server owns it.
+   */
+  it("flips a newly adopted candidate to active, so a later failed probe cannot make the document unreadable", async () => {
+    seatLive(7);
+    const candidate = clone(SEED);
+    adoptNewModel(candidate, { api: GREEN, cli: GREEN }, "candidate");
+
+    const res = await POST(postReq({ baseVersion: 7, registry: candidate }));
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.registry.catalog.find((r: CatalogRow) => r.modelId === "us.openai.gpt-6-nova").status).toBe("active");
+    const saved = JSON.parse(h.state.puts.find((p) => p.Key === MODELS_KEY)!.Body) as ModelsRegistry;
+    expect(saved.catalog.find((r) => r.modelId === "us.openai.gpt-6-nova")!.status).toBe("active");
+    // Both probe results stay on the row for the /models page.
+    expect(saved.catalog.find((r) => r.modelId === "us.openai.gpt-6-nova")!.probe).toEqual({ api: GREEN, cli: GREEN });
   });
 
   it("accepts the probe-less seed — a model that is ALREADY routed to is grandfathered", async () => {

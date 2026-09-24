@@ -59,6 +59,24 @@ export const LITERAL_CODING_CODEX = 'openai.gpt-5.5';
  *  roster row — but it does pick a model, so it needs a pin. */
 export const EXEMPT_AGENT_IDS = ['telegram_intake'];
 
+/**
+ * The READ-time verdict's tolerance list — mirror of NON_FATAL_READ_REASONS /
+ * fatalReadErrors() in src/lib/models-registry.ts. These reasons describe a point
+ * in time, not a broken document: `unknown_agent` is a pin for an agent a later
+ * deploy removed from agents.json; `unprobed` is a routed candidate whose probe
+ * was re-run and FAILED after it was adopted (adoption is gated by the hub at
+ * save time). Refusing the whole document for either reverts ALL routing to
+ * env/literal — a worse failure than the one being reported (TEAM-5016 finding 1).
+ */
+export const NON_FATAL_READ_REASONS = ['unknown_agent', 'unprobed'];
+
+/** The subset of a validateRegistry() error map that makes a document unservable. */
+export function fatalReadErrors(errors) {
+  return Object.fromEntries(
+    Object.entries(errors || {}).filter(([, reason]) => !NON_FATAL_READ_REASONS.includes(reason)),
+  );
+}
+
 export const RESOLVABLE_STATUSES = ['active', 'candidate'];
 
 /** The CLOSED vocabulary a chain result may report as its `source`, mirroring
@@ -130,11 +148,13 @@ function routingTargetsOf(doc) {
  * where `errors` is a `{field path: reason}` map in the SAME vocabulary as
  * validateRegistry() in src/lib/models-registry.ts — `bad_model_id`,
  * `quarantined`, `unknown_model`, `read_only`, `inactive`, `unpriced`,
- * `unprobed`, `duplicate_alias`, `unknown_agent`. The hub calls that function on
- * its READ path (`registryReadFailure`) and falls back to last-good/seed on any
- * of those reasons, so a twin that keeps serving a document the hub refuses IS
- * the divergence DL-033 exists to prevent. Same reasons, same paths, same
- * verdict.
+ * `unprobed`, `duplicate_alias`, `unknown_agent`. `registry` is null only when a
+ * FATAL error is present; `errors` may be non-empty on a served document (see
+ * NON_FATAL_READ_REASONS). The hub calls that function on its READ path
+ * (`registryReadFailure`) and falls back to last-good/seed on exactly the fatal
+ * reasons, so a twin that keeps serving a document the hub refuses — or refuses
+ * one the hub serves — IS the divergence DL-033 exists to prevent. Same reasons,
+ * same paths, same verdict.
  *
  * A malformed ROW is dropped with a warning — one bad candidate must not take
  * the fleet down. But a document whose `defaults`, `tiers`, `agents` or
@@ -209,7 +229,7 @@ export function validateRegistry(doc, opts = {}) {
     }
   }
 
-  if (Object.keys(errors).length) return { registry: null, warnings, errors };
+  if (Object.keys(fatalReadErrors(errors)).length) return { registry: null, warnings, errors };
   return { registry: normalized, warnings, errors };
 }
 
