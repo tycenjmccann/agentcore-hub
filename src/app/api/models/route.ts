@@ -1,57 +1,30 @@
 import { NextResponse } from "next/server";
+import { loadModelsRegistry } from "@/lib/models-registry";
+import { projectModelOptions } from "@/lib/models/model-options";
 import type { ModelOption, ModelsApiResponse } from "@/lib/workflow/model-config";
 
-/**
- * Static list of available models.
- * Bedrock models are always available.
- * External provider models are filtered based on environment configuration.
- */
-const BEDROCK_MODELS: ModelOption[] = [
-  {
-    id: "claude-sonnet-5",
-    label: "Claude Sonnet 5 (Recommended)",
-    provider: "bedrock",
-    modelId: "us.anthropic.claude-sonnet-5",
-    description: "Balanced performance and cost. Default for all workflows.",
-    isDefault: true,
-  },
-  {
-    id: "claude-opus-5",
-    label: "Claude Opus 5",
-    provider: "bedrock",
-    modelId: "us.anthropic.claude-opus-5",
-    description: "Latest and most capable model. Best for complex reasoning and code generation.",
-  },
-];
+export const dynamic = "force-dynamic";
 
 /**
  * GET /api/models
- * 
- * Returns the list of available AI models for workflow execution.
- * Models are filtered based on environment configuration:
- * - Bedrock models (Claude) are always included
- * - OpenAI models only included if OPENAI_API_KEY_ARN is set
- * - Gemini models only included if GEMINI_API_KEY is set (future)
- * 
- * Response time target: < 100ms (static data)
- * 
+ *
+ * Every option comes from the registry catalog (active, priced, routable) — see
+ * `projectModelOptions`, which owns the filters and the (Recommended) label.
+ *
+ * TEAM-5008: the hardcoded `gpt-4-turbo` option this route used to append when
+ * OPENAI_API_KEY_ARN was set is gone. It was the one option the picker offered
+ * that nothing downstream could honour: it produced an `openAiModelConfig`
+ * override (`modelOptionToOverride`), and `lambda/orchestrator/agent-invoker.mjs`
+ * reads only `bedrockModelConfig` — so choosing it silently ran the default
+ * model. The workflow front door now refuses that shape outright
+ * (`validateModelOverride`), and offering a choice the front door rejects would
+ * just move the failure from silent to loud. OpenAI models reachable through
+ * Bedrock Mantle are catalog rows and are offered like any other.
+ *
  * @returns {ModelsApiResponse} { models: ModelOption[] }
  */
 export async function GET(): Promise<NextResponse<ModelsApiResponse>> {
-  const models: ModelOption[] = [...BEDROCK_MODELS];
-
-  // Include OpenAI models if API key ARN is configured
-  const openaiApiKeyArn = process.env.OPENAI_API_KEY_ARN;
-  if (openaiApiKeyArn) {
-    models.push({
-      id: "gpt-4-turbo",
-      label: "GPT-4 Turbo (OpenAI)",
-      provider: "openai",
-      modelId: "gpt-4-turbo-preview",
-      description: "OpenAI's most capable model.",
-      // apiKeyArn resolved server-side at invocation time, not sent to client
-    });
-  }
-
+  const registry = await loadModelsRegistry();
+  const models: ModelOption[] = projectModelOptions(registry);
   return NextResponse.json({ models });
 }

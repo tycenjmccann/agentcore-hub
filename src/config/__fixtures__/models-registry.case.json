@@ -1,0 +1,354 @@
+{
+  "_comment": "Language-neutral contract cases for the model registry (TEAM-4990 / TEAM-4997). src/lib/models-registry.test.ts iterates every case; the Python/Lambda twin imports this same file, so DO NOT change a case's name, input or expected value without updating both sides. `registry` is \"seed\" (src/config/models.json as shipped) or null (no registry available at all); `patch` mutates the seed with explicit typed ops (merge into defaults/tiers/agents/legacyAliases, replace quarantine, append addRows, delete named fields via dropRowFields) rather than dotted paths, because model ids contain dots and a dotted path would be ambiguous. DEVIATIONS from the design table, both deliberate: (1) the four global.anthropic.* ids are CATALOG ROWS, not aliases of the us.* rows - their published rates genuinely differ - so the design's `alias-global` case is `raw-id-global` here and resolves to ITSELF with source \"catalog\"; (2) the two dated-duplicate cases patch the seed (whose sonnet-5 row is already the base id) instead of carrying a hand-written inline document, so the base/dated pair under test is the real one. `source` is a CLOSED enum: \"override\" | \"agents\" | \"defaults\" | \"env\" | \"literal\" are chain steps, emitted only by resolveAgentModel/resolveCodingModel; \"tier\" | \"legacyAlias\" | \"catalog\" | \"passthrough\" are lookup kinds, emitted by resolveModel and carried as `via` on a chain result. An alias hit reports \"catalog\" - the row was found, and how is not the caller's business. There is no \"alias\", \"legacy\", \"agent\", \"default\" or \"quarantine_fallback\".",
+  "cases": [
+    {
+      "name": "tier-claude",
+      "note": "Driven through the pure resolver, not the agent chain: a bare tier word is a legal resolveModel input.",
+      "registry": "seed",
+      "input": { "kind": "resolveModel", "value": "opus", "cli": "claude" },
+      "expected": { "modelId": "us.anthropic.claude-opus-5", "source": "tier" }
+    },
+    {
+      "name": "tier-codex",
+      "registry": "seed",
+      "input": { "kind": "resolveModel", "value": "sol", "cli": "codex" },
+      "expected": { "modelId": "us.openai.gpt-6-sol", "source": "tier" }
+    },
+    {
+      "name": "raw-id",
+      "registry": "seed",
+      "input": { "kind": "resolveModel", "value": "us.anthropic.claude-sonnet-5" },
+      "expected": { "modelId": "us.anthropic.claude-sonnet-5", "source": "catalog" }
+    },
+    {
+      "name": "alias-bare",
+      "registry": "seed",
+      "input": { "kind": "resolveModel", "value": "claude-opus-5-5" },
+      "expected": { "modelId": "us.anthropic.claude-opus-5-5", "source": "catalog" }
+    },
+    {
+      "name": "raw-id-global",
+      "note": "global.* is its own row at its own rate, so it resolves to itself - it is not an alias of us.*.",
+      "registry": "seed",
+      "input": { "kind": "resolveModel", "value": "global.anthropic.claude-opus-5" },
+      "expected": { "modelId": "global.anthropic.claude-opus-5", "source": "catalog" }
+    },
+    {
+      "name": "legacy-alias",
+      "registry": "seed",
+      "input": { "kind": "resolveModel", "value": "claude-sonnet-45" },
+      "expected": { "modelId": "us.anthropic.claude-sonnet-5", "source": "legacyAlias" }
+    },
+    {
+      "name": "quarantined-id",
+      "note": "The override is REJECTED, not silently honoured: resolveModel returns null and the chain drops to defaults, keeping the rejection in diagnostics.",
+      "registry": "seed",
+      "patch": { "quarantine": ["us.anthropic.claude-opus-5"] },
+      "input": {
+        "kind": "resolveAgentModel",
+        "agentId": "agentcore_hub_backend_dev",
+        "override": "us.anthropic.claude-opus-5"
+      },
+      "expected": {
+        "modelId": "us.anthropic.claude-fable-5-1",
+        "source": "defaults",
+        "via": "catalog",
+        "diagnostics": [{ "step": "override", "reason": "quarantined" }]
+      }
+    },
+    {
+      "name": "unknown-raw",
+      "note": "A vendor-qualified id the catalog has never seen is passed through, not rejected - discovery lags reality.",
+      "registry": "seed",
+      "input": { "kind": "resolveModel", "value": "vendor.model-x" },
+      "expected": { "modelId": "vendor.model-x", "source": "passthrough" }
+    },
+    {
+      "name": "agent-pin",
+      "registry": "seed",
+      "input": { "kind": "resolveAgentModel", "agentId": "agentcore_hub_workflow_manager" },
+      "expected": { "modelId": "us.anthropic.claude-fable-5-1", "source": "agents", "via": "catalog" }
+    },
+    {
+      "name": "agent-default",
+      "registry": "seed",
+      "input": { "kind": "resolveAgentModel", "agentId": "agentcore_hub_backend_dev" },
+      "expected": { "modelId": "us.anthropic.claude-fable-5-1", "source": "defaults", "via": "catalog" }
+    },
+    {
+      "name": "override-wins",
+      "note": "telegram_intake is pinned to sonnet-5 in the seed, so the pin provably loses to the override.",
+      "registry": "seed",
+      "input": {
+        "kind": "resolveAgentModel",
+        "agentId": "telegram_intake",
+        "override": "us.anthropic.claude-opus-5"
+      },
+      "expected": { "modelId": "us.anthropic.claude-opus-5", "source": "override", "via": "catalog" }
+    },
+    {
+      "name": "override-tier",
+      "note": "A persona override may be a Claude tier word; tiers.claude apply when no cli is given.",
+      "registry": "seed",
+      "input": { "kind": "resolveAgentModel", "agentId": "agentcore_hub_backend_dev", "override": "sonnet" },
+      "expected": { "modelId": "us.anthropic.claude-sonnet-5", "source": "override", "via": "tier" }
+    },
+    {
+      "name": "env-fallback",
+      "registry": null,
+      "input": {
+        "kind": "resolveAgentModel",
+        "agentId": "agentcore_hub_backend_dev",
+        "env": { "MODEL_ID": "us.anthropic.claude-opus-5" }
+      },
+      "expected": { "modelId": "us.anthropic.claude-opus-5", "source": "env", "via": "passthrough" }
+    },
+    {
+      "name": "literal-fallback",
+      "note": "No registry and no env: the compiled-in literal is the last line of defence, so an agent never boots modelless.",
+      "registry": null,
+      "input": { "kind": "resolveAgentModel", "agentId": "agentcore_hub_backend_dev", "env": {} },
+      "expected": { "modelId": "us.anthropic.claude-fable-5-1", "source": "literal", "via": "passthrough" }
+    },
+    {
+      "name": "coding-claude-default",
+      "registry": "seed",
+      "input": { "kind": "resolveCodingModel", "cli": "claude" },
+      "expected": {
+        "modelId": "us.anthropic.claude-fable-5-1",
+        "endpoint": "bedrock-runtime",
+        "region": "us-east-1",
+        "api": "converse",
+        "source": "defaults",
+        "via": "catalog"
+      }
+    },
+    {
+      "name": "coding-codex-default",
+      "registry": "seed",
+      "input": { "kind": "resolveCodingModel", "cli": "codex" },
+      "expected": {
+        "modelId": "openai.gpt-5.5",
+        "endpoint": "bedrock-mantle",
+        "region": "us-east-2",
+        "api": "responses",
+        "source": "defaults",
+        "via": "catalog"
+      }
+    },
+    {
+      "name": "coding-env-fallback",
+      "note": "No registry: the endpoint tuple is DERIVED from the id prefix (openai.* -> Mantle) rather than read from a row.",
+      "registry": null,
+      "input": { "kind": "resolveCodingModel", "cli": "codex", "env": { "CODEX_MODEL": "openai.gpt-5.5" } },
+      "expected": {
+        "modelId": "openai.gpt-5.5",
+        "endpoint": "bedrock-mantle",
+        "region": "us-east-2",
+        "api": "responses",
+        "source": "env",
+        "via": "passthrough"
+      }
+    },
+    {
+      "name": "dated-duplicate-dropped",
+      "note": "Discovery returns both the stable alias and the dated snapshot of the same model; the dated row is noise unless something targets it.",
+      "registry": "seed",
+      "patch": {
+        "addRows": [
+          {
+            "modelId": "us.anthropic.claude-sonnet-5-20260101-v1:0",
+            "label": "Claude Sonnet 5 (dated)",
+            "vendor": "anthropic",
+            "family": "sonnet",
+            "endpoint": "bedrock-runtime",
+            "region": "us-east-1",
+            "api": "converse",
+            "contextWindow": 200000,
+            "aliases": [],
+            "price": { "input": 2.2, "output": 11, "source": "published", "asOf": "2026-09-23" },
+            "status": "active"
+          }
+        ]
+      },
+      "input": { "kind": "parse" },
+      "expected": {
+        "catalogIdsInclude": ["us.anthropic.claude-sonnet-5"],
+        "catalogIdsExclude": ["us.anthropic.claude-sonnet-5-20260101-v1:0"],
+        "warnings": [{ "modelId": "us.anthropic.claude-sonnet-5-20260101-v1:0", "reason": "dated_duplicate" }]
+      }
+    },
+    {
+      "name": "dated-kept-when-targeted",
+      "note": "Routing outranks tidiness: a tier/default/agent pointing at the dated id keeps it resolvable.",
+      "registry": "seed",
+      "patch": {
+        "tiers": { "claude": { "sonnet": "us.anthropic.claude-sonnet-5-20260101-v1:0" } },
+        "addRows": [
+          {
+            "modelId": "us.anthropic.claude-sonnet-5-20260101-v1:0",
+            "label": "Claude Sonnet 5 (dated)",
+            "vendor": "anthropic",
+            "family": "sonnet",
+            "endpoint": "bedrock-runtime",
+            "region": "us-east-1",
+            "api": "converse",
+            "contextWindow": 200000,
+            "aliases": [],
+            "price": { "input": 2.2, "output": 11, "source": "published", "asOf": "2026-09-23" },
+            "status": "active"
+          }
+        ]
+      },
+      "input": { "kind": "parse" },
+      "expected": {
+        "catalogIdsInclude": ["us.anthropic.claude-sonnet-5", "us.anthropic.claude-sonnet-5-20260101-v1:0"],
+        "catalogIdsExclude": [],
+        "warnings": []
+      }
+    },
+    {
+      "name": "invalid-unpriced-tier",
+      "note": "An unpriced routing target bills at the pricing default, so a cost card would be wrong without ever looking wrong.",
+      "registry": "seed",
+      "patch": { "dropRowFields": [{ "modelId": "us.openai.gpt-6-luna", "fields": ["price"] }] },
+      "input": { "kind": "validate" },
+      "expected": { "ok": false, "errors": { "tiers.codex.luna": "unpriced" } }
+    },
+    {
+      "name": "invalid-inactive-default",
+      "registry": "seed",
+      "patch": { "defaults": { "persona": "us.anthropic.claude-fable-5" } },
+      "input": { "kind": "validate" },
+      "expected": { "ok": false, "errors": { "defaults.persona": "inactive" } }
+    },
+    {
+      "name": "invalid-duplicate-alias",
+      "note": "Field paths are modelId-keyed, never index-keyed, so reordering the catalog in the UI cannot mislabel an error.",
+      "registry": "seed",
+      "patch": {
+        "addRows": [
+          {
+            "modelId": "us.anthropic.claude-opus-5-clone",
+            "label": "Claude Opus 5 (clone)",
+            "vendor": "anthropic",
+            "family": "opus",
+            "endpoint": "bedrock-runtime",
+            "region": "us-east-1",
+            "api": "converse",
+            "contextWindow": 200000,
+            "aliases": ["claude-opus-5"],
+            "price": { "input": 5.5, "output": 27.5, "source": "published", "asOf": "2026-09-23" },
+            "status": "active"
+          }
+        ]
+      },
+      "input": { "kind": "validate" },
+      "expected": {
+        "ok": false,
+        "errors": { "catalog.us.anthropic.claude-opus-5-clone.aliases.claude-opus-5": "duplicate_alias" }
+      }
+    },
+    {
+      "name": "invalid-read-only-target",
+      "note": "anthropic.claude-opus-5 exists only so the eval judge's spans have a price; routing an agent at it is a mistake.",
+      "registry": "seed",
+      "patch": { "agents": { "agentcore_hub_agent": "anthropic.claude-opus-5" } },
+      "input": { "kind": "validate" },
+      "expected": { "ok": false, "errors": { "agents.agentcore_hub_agent": "read_only" } }
+    },
+    {
+      "name": "invalid-bad-model-id",
+      "registry": "seed",
+      "patch": { "defaults": { "persona": "us.anthropic.claude-opus-5; rm -rf /" } },
+      "input": { "kind": "validate" },
+      "expected": { "ok": false, "errors": { "defaults.persona": "bad_model_id" } }
+    },
+    {
+      "name": "projection-seed",
+      "note": "One key per catalog modelId plus every alias, in catalog order, retired rows included. legacyAliases are NOT emitted - they are routing sugar, not ids that appear in spans. cacheWrite is never per-key: it stays the global cacheWriteMultiplier.",
+      "registry": "seed",
+      "input": { "kind": "projection", "previousPricing": null },
+      "expected": {
+        "keyOrder": [
+          "us.anthropic.claude-fable-5-1",
+          "claude-fable-5-1",
+          "us.anthropic.claude-opus-5-5",
+          "claude-opus-5-5",
+          "us.anthropic.claude-opus-5",
+          "claude-opus-5",
+          "us.anthropic.claude-sonnet-5",
+          "claude-sonnet-5",
+          "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+          "claude-haiku-4-5",
+          "anthropic.claude-haiku-4-5-20251001-v1:0",
+          "us.anthropic.claude-haiku-4-5-20251001",
+          "us.anthropic.claude-opus-4-6",
+          "us.anthropic.claude-opus-4-6-v1",
+          "global.anthropic.claude-opus-5-5",
+          "global.anthropic.claude-opus-5",
+          "global.anthropic.claude-sonnet-5",
+          "global.anthropic.claude-fable-5-1",
+          "anthropic.claude-opus-5",
+          "us.anthropic.claude-fable-5",
+          "claude-fable-5",
+          "us.anthropic.claude-opus-4-8",
+          "claude-opus-4-8",
+          "us.anthropic.claude-opus-4-7",
+          "us.anthropic.claude-sonnet-4-6",
+          "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+          "us.openai.gpt-6-astra",
+          "us.openai.gpt-6-sol",
+          "us.openai.gpt-5.6-terra",
+          "us.openai.gpt-6-luna",
+          "openai.gpt-5.5",
+          "openai.gpt-5.5-codex"
+        ],
+        "spot": {
+          "us.anthropic.claude-fable-5-1": { "input": 11, "output": 55, "cacheReadInput": 0.275 },
+          "claude-fable-5-1": { "input": 11, "output": 55, "cacheReadInput": 0.275 },
+          "us.anthropic.claude-opus-5-5": { "input": 4.4, "output": 22, "cacheReadInput": 0.22 },
+          "us.anthropic.claude-opus-5": { "input": 5.5, "output": 27.5 },
+          "global.anthropic.claude-opus-5": { "input": 5, "output": 25, "cacheReadInput": 0.5 },
+          "anthropic.claude-opus-5": { "input": 5.5, "output": 27.5 },
+          "us.anthropic.claude-sonnet-4-6": { "input": 3.3, "output": 16.5 },
+          "openai.gpt-5.5": { "input": 5.5, "output": 33, "cacheReadInput": 0.55 },
+          "openai.gpt-5.5-codex": { "input": 5.5, "output": 33, "cacheReadInput": 0.55 }
+        },
+        "topLevelKeyOrder": [
+          "_comment",
+          "models",
+          "default",
+          "cachedInputDiscount",
+          "cacheWriteMultiplier",
+          "kiro",
+          "agentcore"
+        ],
+        "carried": ["default", "cachedInputDiscount", "cacheWriteMultiplier", "kiro", "agentcore"]
+      }
+    },
+    {
+      "name": "projection-prev-keys",
+      "note": "The carried keys come from the LIVE pricing document, byte-for-byte, so an operator's cache-multiplier tuning is not reverted by a catalog edit. `models` is always fully regenerated - the previous models map is ignored entirely.",
+      "registry": "seed",
+      "input": {
+        "kind": "projection",
+        "previousPricing": {
+          "models": { "some.stale.model": { "input": 999, "output": 999 } },
+          "default": { "input": 7.25, "output": 36.25 },
+          "cachedInputDiscount": 0.08,
+          "cacheWriteMultiplier": { "5m": 1.3, "1h": 2.1, "default": 1.3, "_basis": "operator-tuned" },
+          "kiro": { "usdPerCredit": 0.04, "_basis": "overage rate" },
+          "agentcore": { "runtimeGbHourUsd": 0.01, "runtimeVcpuHourUsd": 0.09, "_basis": "operator-tuned" }
+        }
+      },
+      "expected": {
+        "carriedEqualsPrevious": ["default", "cachedInputDiscount", "cacheWriteMultiplier", "kiro", "agentcore"],
+        "modelsExclude": ["some.stale.model"],
+        "spot": {
+          "us.anthropic.claude-fable-5-1": { "input": 11, "output": 55, "cacheReadInput": 0.275 }
+        }
+      }
+    }
+  ]
+}

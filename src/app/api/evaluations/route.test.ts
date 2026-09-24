@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { NextRequest } from "next/server";
+import bundledPricing from "@/config/pricing.json";
 
 /**
  * TEAM-4688 — GET /api/evaluations, the scorecard + metrics feed.
@@ -24,6 +25,32 @@ const h = vi.hoisted(() => ({
   daily: [] as Array<Record<string, unknown>>,
   configError: null as Error | null,
   dailyCalls: 0,
+  /** Body served for config/pricing.json, or null to fail the GET. */
+  pricingObject: null as string | null,
+}));
+
+// TEAM-4997: prices come from the LIVE projection per request, so S3 is mocked at
+// the module seam and the real loadPricingProjection runs — including its
+// fallbacks, which are the reason a broken projection cannot black out the cost
+// column.
+vi.mock("@aws-sdk/client-s3", () => ({
+  S3Client: class {
+    async send(cmd: { constructor: { name: string } }) {
+      if (cmd.constructor.name !== "GetObjectCommand") throw new Error("unexpected S3 write");
+      if (h.pricingObject === null) {
+        const e = new Error("no such key");
+        e.name = "NoSuchKey";
+        throw e;
+      }
+      return { Body: { transformToString: async () => h.pricingObject }, ETag: '"etag"' };
+    }
+  },
+  GetObjectCommand: class {
+    constructor(public input: Record<string, unknown>) {}
+  },
+  PutObjectCommand: class {
+    constructor(public input: Record<string, unknown>) {}
+  },
 }));
 
 vi.mock("@/lib/eval-config", () => ({
@@ -85,16 +112,24 @@ async function get(query = "") {
   return GET(new NextRequest(`http://localhost/api/evaluations${query}`));
 }
 
+const SAVED_BUCKET = process.env.ARTIFACT_BUCKET;
+
 beforeEach(() => {
   vi.useFakeTimers();
   vi.setSystemTime(NOW);
   h.configs = [{ agentId: AGENT }, { agentId: "some_agent_not_on_the_roster" }];
   h.configError = null;
   h.dailyCalls = 0;
+  h.pricingObject = null;
+  // Read at module load by models-registry, so it must be set before the import.
+  process.env.ARTIFACT_BUCKET = "test-bucket";
+  vi.spyOn(console, "warn").mockImplementation(() => {});
   seedDaily();
 });
 
 afterEach(() => {
+  if (SAVED_BUCKET === undefined) delete process.env.ARTIFACT_BUCKET;
+  else process.env.ARTIFACT_BUCKET = SAVED_BUCKET;
   vi.useRealTimers();
   vi.restoreAllMocks();
 });
@@ -243,6 +278,66 @@ describe("GET /api/evaluations — existing contract is unchanged", () => {
     const res = await get("?days=7");
     expect(res.status).toBe(500);
     expect((await res.json()).error).toBe("ddb blip");
+  });
+});
+
+/**
+ * TEAM-4997 — the pricing projection. What matters is not which file wins but
+ * that the cost column is never silently wrong: the live projection is used when
+ * it is trustworthy, and the BUNDLED copy is used the moment it is not. A shape
+ * gate is the difference between "no rate for this model" (billed at the default,
+ * a guess) and "every rate, one deploy stale".
+ */
+describe("GET /api/evaluations — pricing projection", () => {
+  const MODEL = "us.anthropic.claude-fable-5-1";
+  /** One priced million input tokens, so the cost IS the per-1M rate in dollars. */
+  function seedOneMillionTokens() {
+    h.daily = [{ agentId: AGENT, day: "2026-09-15", sessions: 1, calls: 1, [`m|${MODEL}|input`]: 1_000_000 }];
+  }
+  const bundledRate = (bundledPricing as { models: Record<string, { input: number }> }).models[MODEL].input;
+
+  async function cost(query = "?days=7") {
+    return (await (await get(query)).json()).metrics[AGENT_NAME].cost as number;
+  }
+
+  it("prices from the LIVE projection, not the bundled file", async () => {
+    seedOneMillionTokens();
+    h.pricingObject = JSON.stringify({ models: { [MODEL]: { input: 99, output: 99 } }, default: { input: 1, output: 1 } });
+    expect(await cost()).toBeCloseTo(99, 6);
+    expect(bundledRate).not.toBe(99); // the assertion above would be vacuous otherwise
+  });
+
+  it("falls back to the bundled projection when the S3 read fails", async () => {
+    seedOneMillionTokens();
+    h.pricingObject = null; // NoSuchKey
+    expect(await cost()).toBeCloseTo(bundledRate, 6);
+  });
+
+  it("falls back to the bundled projection when the live document's shape is wrong", async () => {
+    seedOneMillionTokens();
+    for (const broken of [
+      // An empty models map would reprice EVERY model to the default rate.
+      { models: {}, default: { input: 1, output: 1 } },
+      // No usable default: nothing to fall back to for an unlisted model.
+      { models: { [MODEL]: { input: 99, output: 99 } } },
+      { models: { [MODEL]: { input: 99, output: 99 } }, default: { input: 0, output: 1 } },
+      // Not a pricing document at all.
+      [],
+    ]) {
+      h.pricingObject = JSON.stringify(broken);
+      expect(await cost(), JSON.stringify(broken)).toBeCloseTo(bundledRate, 6);
+    }
+  });
+
+  it("reports an unpriced model instead of passing its guessed cost off as a rate", async () => {
+    h.daily = [{ agentId: AGENT, day: "2026-09-15", sessions: 1, "m|zz.not-in-the-catalog|input": 1_000_000 }];
+    h.pricingObject = JSON.stringify({ models: { [MODEL]: { input: 11, output: 55 } }, default: { input: 5.5, output: 27.5 } });
+    const metrics = (await (await get("?days=7")).json()).metrics[AGENT_NAME];
+    expect(metrics.unpricedModels).toEqual(["zz.not-in-the-catalog"]);
+    expect(metrics.cost).toBeCloseTo(5.5, 6); // the default rate, flagged as such
+
+    h.daily = [{ agentId: AGENT, day: "2026-09-15", sessions: 1, [`m|${MODEL}|input`]: 1_000_000 }];
+    expect((await (await get("?days=7")).json()).metrics[AGENT_NAME].unpricedModels).toEqual([]);
   });
 });
 
