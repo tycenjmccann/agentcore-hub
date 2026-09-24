@@ -249,6 +249,7 @@ jobs:
           deploy/coding-agent-runtime/test_coding_models_registry.py
           deploy/coding-agent-runtime/test_merge_codex_config.py
           deploy/coding-agent-runtime/test_codex_model_switch.py
+          deploy/coding-agent-runtime/test_turn_model_echo.py
           deploy/session-reaper/test_handler.py
           deploy/workflow-manager/toolkit
           deploy/pipeline/test_ecs_primary_container.py
