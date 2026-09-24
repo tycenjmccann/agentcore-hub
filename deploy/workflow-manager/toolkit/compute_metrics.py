@@ -54,7 +54,14 @@ INVOKE_EVENTS = ("agent.invoked", "agent.started")
 # cost/time/quality counters but no score, so they are NOT card-first — a
 # partial carry-through would publish a card-shaped `metrics.quality` with no
 # score in it and leave the reader guessing which half came from where.
-CARD_MIN_REPORT_VERSION = 5
+#
+# Raised to 7 by TEAM-4995: v6 and older cards carry the OLD openai.gpt-5.5 rate
+# (1.25/10 per 1M instead of 5.50/33 with 0.55 cache reads), so every Codex run's
+# cost on them is understated by ~4x — a number the WM must not cite. There is no
+# one-version slack any more: `lambda/cost-report/deploy.sh --backfill` MUST run
+# right after the Lambda deploys, or every card is rejected and the WM falls back
+# to its own computed metrics until it does.
+CARD_MIN_REPORT_VERSION = 7
 SOURCE_CARD = "performance-card@v5"
 SOURCE_COMPUTED = "computed"
 # Exactly the fields the WM is told to cite. Read with .get so a card written by

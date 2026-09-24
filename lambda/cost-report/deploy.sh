@@ -42,6 +42,12 @@ usage: lambda/cost-report/deploy.sh [--backfill [--since-days N]] [--rebuild-ind
   --backfill [--since-days N]   ...then (re)generate a card for every terminal
                                 workflow completed in the last N days
                                 (default 90; 0 = all time), then rebuild the index
+
+  REPORT_VERSION bumps (now 7) REQUIRE --backfill: --rebuild-index alone drops
+  every card below the current version and EMPTIES the fleet index
+  (performance/index.json). The CD ticket runs --backfill by hand right after the
+  Lambda deploys and confirms the coverage line is >= 95% and the index is
+  non-empty.
 USAGE
 }
 

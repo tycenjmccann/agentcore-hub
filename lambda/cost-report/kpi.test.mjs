@@ -71,8 +71,16 @@ describe("kpi.json is the only home for the numbers", () => {
   });
 
   test("the fixture, the config and REPORT_VERSION agree on their versions", () => {
-    assert.equal(REPORT_VERSION, 6);
-    assert.equal(FIXTURE.reportVersion, REPORT_VERSION);
+    assert.equal(REPORT_VERSION, 7);
+    // TEAM-4995: v7 changed only what this Lambda BILLS (openai.gpt-5.5 rates,
+    // longContext rates, cost.unpricedModels) — nothing the KPI scorer reads — so
+    // the fixture's cards stay stamped at the shape they were derived from. They
+    // cannot simply be re-stamped here: the same file is pinned against
+    // CURRENT_REPORT_VERSION by src/lib/workflow/performance.test.ts, and that
+    // const (src/lib/workflow/performance.ts) is the API half of TEAM-4990. When
+    // it moves to 7, re-stamp the fixture and restore the equality below.
+    assert.ok(FIXTURE.reportVersion <= REPORT_VERSION,
+      `fixture cards claim v${FIXTURE.reportVersion}, newer than the writer's v${REPORT_VERSION}`);
     assert.equal(FIXTURE.kpiVersion, KPI_CONFIG.kpiVersion);
   });
 

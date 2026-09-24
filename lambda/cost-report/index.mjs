@@ -91,7 +91,9 @@ function loadKpiConfig() {
 }
 export const KPI_CONFIG = loadKpiConfig();
 
-export const REPORT_VERSION = 6; // 6: kpiVersion 2 — re-invocations classified (only fix/review-caused count as rework), dead sessions count as errors, WM interventions listed; 5: card.kpi contract (deterministic quality score); 4: uncached-input pricing (cache tokens no longer double-billed)
+// 7: openai.gpt-5.5 repriced 1.25/10 → 5.50/33/0.55, per-model cacheReadInput,
+// longContext rates, cost.unpricedModels[] (TEAM-4995)
+export const REPORT_VERSION = 7; // 6: kpiVersion 2 — re-invocations classified (only fix/review-caused count as rework), dead sessions count as errors, WM interventions listed; 5: card.kpi contract (deterministic quality score); 4: uncached-input pricing (cache tokens no longer double-billed)
 export const BASELINE_DAYS = 28;
 export const BASELINE_MIN = 5;
 const INFRA_WINDOW_DAYS = 30;
@@ -101,7 +103,7 @@ const INDEX_CAP = 2000;
 const METRIC_MAX_AGE_MS = 13 * 86_400_000;
 const TERMINAL_PHASES = new Set(["complete", "cancelled", "error", "deploy-blocked", "static-ci-only"]);
 
-const DEFAULT_PRICING = {
+export const DEFAULT_PRICING = {
   models: {}, default: { input: 5.5, output: 27.5 }, cachedInputDiscount: 0.1,
   // Cache-write (5-minute vs 1-hour) surcharge as a multiple of the input rate,
   // keyed by the span's hub.cache_ttl; `default` covers a missing/unknown ttl.
@@ -297,16 +299,19 @@ async function buildCard(workflowId, workflow, pricing, getCompletion = defaultG
 
   // ── Attribute usage rows to agents ──
   const byAgent = {};
+  // Per-report, never module-scoped (see foldUnpriced) — this Lambda stays warm.
+  const unpriced = new Set();
   const agentOf = (sid) => {
     const tail = sid.split(`_${workflowId}-`)[1] || "";
     return tail.replace(/-\d+$/, "") || "unknown";
   };
-  for (const row of personaUsage) addUsage(byAgent, agentOf(row.sid), "persona", row, pricing);
+  for (const row of personaUsage) addUsage(byAgent, agentOf(row.sid), "persona", row, pricing, unpriced);
   const sessionAgent = new Map(codingSessions.map((s) => [s.sessionId, s.agentId || "unknown"]));
-  for (const row of ccUsage) addUsage(byAgent, sessionAgent.get(row.sid) || "unknown", "claude_code", row, pricing);
+  for (const row of ccUsage) addUsage(byAgent, sessionAgent.get(row.sid) || "unknown", "claude_code", row, pricing, unpriced);
   for (const row of codingUsage) {
-    addUsage(byAgent, sessionAgent.get(row.sid) || "unknown", row.cli === "kiro" ? "kiro" : "codex", row, pricing);
+    addUsage(byAgent, sessionAgent.get(row.sid) || "unknown", row.cli === "kiro" ? "kiro" : "codex", row, pricing, unpriced);
   }
+  const unpricedModels = foldUnpriced(unpriced, gaps, workflowId);
 
   if (!personaUsage.length) gaps.push("no persona spans matched this run's session ids — persona LLM cost missing");
   if (codingSessions.length && !ccUsage.length && !codingUsage.length) {
@@ -434,6 +439,10 @@ async function buildCard(workflowId, workflow, pricing, getCompletion = defaultG
       cacheHitRate: cacheHitRateOverall,
       personaCacheHitRate,
       kiroCredits: round4(kiroCredits),
+      // Models this run spent on that have no price row — their spend IS in the
+      // totals above, at pricing.default, so the reader knows which part of the
+      // number is a guess. [] on a fully priced run (REPORT_VERSION 7).
+      unpricedModels,
       byEngine,
       byAgent: Object.fromEntries(Object.entries(byAgent).map(([k, v]) => [k, {
         totalUsd: v.totalUsd,
@@ -527,7 +536,38 @@ export function uncachedInput(engine, inp, read, write) {
   return inclusive ? Math.max(inp - cached, 0) : inp;
 }
 
-export function addUsage(byAgent, agentId, engine, row, pricing) {
+/**
+ * OpenAI's long-context threshold: a request whose INPUT exceeds this is billed at
+ * the model's long-context rates (`pricing.models[m].longContext`). Strictly
+ * greater — 272,000 input tokens is still a standard-rate request.
+ *
+ * It lives here as well as in the price row's `longContext.thresholdInputTokens`
+ * because the split happens in a Logs Insights query (queryPersonaSpans below),
+ * and Insights cannot read the price document — the threshold has to be a literal
+ * in the query string. The two must stay equal; the price row is the documentation,
+ * this constant is what the query is built from.
+ */
+export const LONG_CONTEXT_THRESHOLD_TOKENS = 272_000;
+
+/**
+ * Fold the per-report unpriced-model set into the card's gaps + one log line.
+ *
+ * `unpriced` is created per buildCard and passed down — NEVER a module global: this
+ * Lambda is warm across invocations and a leaked set would attribute one run's
+ * missing price row to the next run's card. Returns the sorted, distinct ids for
+ * `card.cost.unpricedModels` ([] when everything was priced), pushes one gap per
+ * id, and logs exactly once per report (nothing at all when the set is empty).
+ */
+export function foldUnpriced(unpriced, gaps, workflowId) {
+  const models = [...unpriced].sort();
+  for (const id of models) gaps.push(`model ${id} has no price row; billed at pricing.default`);
+  if (models.length) {
+    console.log(`[models] cost.unpriced workflowId=${workflowId} models=${models.join(",")}`);
+  }
+  return models;
+}
+
+export function addUsage(byAgent, agentId, engine, row, pricing, unpriced = null) {
   const rec = (byAgent[agentId] ||= { engines: {} });
   const u = (rec.engines[engine] ||= {
     usd: 0, inputTokens: 0, outputTokens: 0,
@@ -548,17 +588,34 @@ export function addUsage(byAgent, agentId, engine, row, pricing) {
   if (credits > 0) {
     usd = credits * (pricing.kiro?.usdPerCredit || 0);
   } else {
-    const p = pricing.models[model] || pricing.default;
+    // A model with no price row is still BILLED at pricing.default — a card that
+    // silently drops the spend would be worse — but it is recorded so the reader
+    // sees a guessed number as a guess (REPORT_VERSION 7). "unknown" (no
+    // gen_ai.request.model attribute on the span) counts too: it is exactly the
+    // case where the number cannot be trusted.
+    const priced = pricing.models[model];
+    if (!priced) unpriced?.add(model);
+    const p = priced || pricing.default;
     const discount = pricing.cachedInputDiscount ?? 0.1;
     const writeMult = pricing.cacheWriteMultiplier?.[row.ttl] ?? pricing.cacheWriteMultiplier?.default ?? 1.25;
     const uncached = uncachedInput(engine, inp, read, write);
+    // Long-context rates apply only to rows the query tagged `lc` (input above
+    // LONG_CONTEXT_THRESHOLD_TOKENS) on a model that HAS a longContext block; any
+    // field the block omits falls back to the row's standard rate.
+    const lc = (row.lc && p.longContext) || null;
+    const inRate = Number.isFinite(lc?.input) ? lc.input : p.input;
+    const outRate = Number.isFinite(lc?.output) ? lc.output : p.output;
     // Per-model absolute cache-read rate wins over the fractional default
-    // (fable-5-1 bills cache reads at 2.5% of input, not 10%).
-    const readRate = Number.isFinite(p.cacheReadInput) ? p.cacheReadInput : p.input * discount;
-    usd = (uncached / 1e6) * p.input
-      + (outp / 1e6) * p.output
+    // (fable-5-1 bills cache reads at 2.5% of input, not 10%). Cache reads and
+    // writes are priced off the rate the row is actually billed at, so a
+    // long-context row's cache traffic follows its long-context input rate.
+    const readRate = Number.isFinite(lc?.cacheReadInput) ? lc.cacheReadInput
+      : Number.isFinite(p.cacheReadInput) ? p.cacheReadInput
+        : inRate * discount;
+    usd = (uncached / 1e6) * inRate
+      + (outp / 1e6) * outRate
       + (read / 1e6) * readRate
-      + (write / 1e6) * p.input * writeMult;
+      + (write / 1e6) * inRate * writeMult;
   }
   u.usd += usd;
   const m = (u.byModel[model] ||= { inputTokens: 0, outputTokens: 0, cacheReadInputTokens: 0, cacheWriteInputTokens: 0, usd: 0 });
@@ -1151,9 +1208,42 @@ async function saveIndex(index) {
   }));
 }
 
+/**
+ * Is this S3 document usable as the price list? Shape, not parse success.
+ *
+ * Any valid JSON used to win, so an empty object, an array, or a half-written
+ * `{"_comment": "..."}` silently became the price list: `pricing.models[m]` was
+ * undefined for every model and `pricing.default` undefined too, which priced the
+ * whole fleet at NaN or 0 with no signal. Require the two things every caller
+ * dereferences — a non-empty `models` map and a usable `default` pair.
+ */
+export function isUsablePricing(doc) {
+  if (!doc || typeof doc !== "object" || Array.isArray(doc)) return false;
+  const models = doc.models;
+  if (!models || typeof models !== "object" || Array.isArray(models) || !Object.keys(models).length) return false;
+  const d = doc.default;
+  if (!d || typeof d !== "object") return false;
+  return Number.isFinite(d.input) && d.input > 0 && Number.isFinite(d.output) && d.output > 0;
+}
+
+/** Pure half of loadPricing: the shape gate + the DEFAULT_PRICING merge. */
+export function pricingFrom(doc) {
+  if (!isUsablePricing(doc)) {
+    console.log(`[models] pricing.fallback reason=shape key=${PRICING_S3_KEY}`);
+    return DEFAULT_PRICING;
+  }
+  return { ...DEFAULT_PRICING, ...doc, agentcore: { ...DEFAULT_PRICING.agentcore, ...(doc.agentcore || {}) } };
+}
+
 async function loadPricing() {
-  const p = await getJson(PRICING_S3_KEY).catch(() => null);
-  return p ? { ...DEFAULT_PRICING, ...p, agentcore: { ...DEFAULT_PRICING.agentcore, ...(p.agentcore || {}) } } : DEFAULT_PRICING;
+  let doc;
+  try {
+    doc = await getJson(PRICING_S3_KEY);
+  } catch (e) {
+    console.log(`[models] pricing.fallback reason=error key=${PRICING_S3_KEY} (${e.message})`);
+    return DEFAULT_PRICING;
+  }
+  return pricingFrom(doc);
 }
 
 async function publishMetrics(card) {
@@ -1349,35 +1439,81 @@ async function runInsights(groups, query, startSec, endSec) {
 // persona token/cache accounting on current strands.
 export const PERSONA_CHAT_SPAN_FILTER = '((name = "chat" or name like /^chat /) or `attributes.event.name` = "api_request")';
 
+/**
+ * The usage projection both span queries share. `i` is coalesced to 0 so the
+ * long-context split below is total: a span with no input_tokens attribute
+ * compares `<= threshold` and lands in the standard half instead of matching
+ * neither filter and vanishing from the card (nulls match no comparison).
+ * Cache read/write tokens land under either the nested (cache_read.input_tokens)
+ * or flat (cache_read_input_tokens) OTEL attribute depending on emitter version;
+ * hub.cache_ttl (set by the runtime, TEAM-3953) selects the write price tier.
+ */
+const SPAN_USAGE_FIELDS = 'fields `attributes.session.id` as sid, coalesce(`attributes.gen_ai.usage.input_tokens`, 0) as i, `attributes.gen_ai.usage.output_tokens` as o, coalesce(`attributes.gen_ai.usage.cache_read.input_tokens`, `attributes.gen_ai.usage.cache_read_input_tokens`, 0) as cr, coalesce(`attributes.gen_ai.usage.cache_creation.input_tokens`, `attributes.gen_ai.usage.cache_write_input_tokens`, 0) as cw, `attributes.hub.cache_ttl` as ttl, coalesce(`attributes.gen_ai.request.model`, "unknown") as model';
+const SPAN_USAGE_STATS = "stats sum(i) as inp, sum(o) as outp, sum(cr) as cacheRead, sum(cw) as cacheWrite by sid, model, ttl";
+
+/** The two halves of the long-context split, as `[lc, insightsFilter]` pairs. */
+export const LONG_CONTEXT_SPLIT = Object.freeze([
+  [true, `| filter i > ${LONG_CONTEXT_THRESHOLD_TOKENS}`],
+  [false, `| filter i <= ${LONG_CONTEXT_THRESHOLD_TOKENS}`],
+]);
+
+/**
+ * Run one usage query twice — once per side of the long-context threshold — and
+ * tag each returned row with `lc` so addUsage can pick the right rate.
+ *
+ * Two queries rather than one, because the obvious single-query form
+ * (`(i > 272000) as lc` inside a `fields` clause, then grouping by `lc`) is
+ * UNVERIFIED Logs Insights syntax — a comparison as a projected value is not
+ * documented, and a query that parses but returns `lc` as an empty column would
+ * silently bill every long-context request at standard rates. `filter` on a
+ * projected field is documented and used elsewhere in this file. The filter runs
+ * BEFORE `stats`, so each row of each half aggregates spans from one side of the
+ * threshold only — the grouping stays correct.
+ *
+ * The halves run in parallel, so the wall clock is unchanged (each half still
+ * polls its own query id; the caller already awaits the three usage queries
+ * together). One failing half degrades to [] on its own, exactly as the single
+ * query did, so a partial answer beats no card.
+ */
+async function queryUsageSplitByContext(groups, queryFor, label, startSec, endSec) {
+  const halves = await Promise.all(LONG_CONTEXT_SPLIT.map(([lc, lcFilter]) =>
+    runInsights(groups, queryFor(lcFilter), startSec, endSec)
+      .then((rows) => rows.map((r) => ({ ...r, lc })))
+      .catch((e) => {
+        console.warn(`${LOG} ${label} query failed (lc=${lc}):`, e.message);
+        return [];
+      })));
+  return halves.flat();
+}
+
 async function queryPersonaSpans(groups, workflowId, startSec, endSec) {
-  // Cache read/write tokens land under either the nested (cache_read.input_tokens)
-  // or flat (cache_read_input_tokens) OTEL attribute depending on emitter version;
-  // hub.cache_ttl (set by the runtime, TEAM-3953) selects the write price tier.
-  const q = `fields \`attributes.session.id\` as sid, \`attributes.gen_ai.usage.input_tokens\` as i, \`attributes.gen_ai.usage.output_tokens\` as o, coalesce(\`attributes.gen_ai.usage.cache_read.input_tokens\`, \`attributes.gen_ai.usage.cache_read_input_tokens\`, 0) as cr, coalesce(\`attributes.gen_ai.usage.cache_creation.input_tokens\`, \`attributes.gen_ai.usage.cache_write_input_tokens\`, 0) as cw, \`attributes.hub.cache_ttl\` as ttl, coalesce(\`attributes.gen_ai.request.model\`, "unknown") as model
+  const queryFor = (lcFilter) => `${SPAN_USAGE_FIELDS}
 | filter sid like "${workflowId}" and ${PERSONA_CHAT_SPAN_FILTER}
-| stats sum(i) as inp, sum(o) as outp, sum(cr) as cacheRead, sum(cw) as cacheWrite by sid, model, ttl`;
-  return runInsights(groups, q, startSec, endSec).catch((e) => {
-    console.warn(`${LOG} persona span query failed:`, e.message);
-    return [];
-  });
+${lcFilter}
+| ${SPAN_USAGE_STATS}`;
+  return queryUsageSplitByContext(groups, queryFor, "persona span", startSec, endSec);
 }
 
 async function queryClaudeCodeSpans(groups, codingSessions, startSec, endSec) {
   const ids = codingSessions.map((s) => s.sessionId).filter(Boolean);
   if (!ids.length) return [];
   const idList = ids.map((x) => `"${x}"`).join(",");
-  const q = `fields \`attributes.session.id\` as sid, \`attributes.gen_ai.usage.input_tokens\` as i, \`attributes.gen_ai.usage.output_tokens\` as o, coalesce(\`attributes.gen_ai.usage.cache_read.input_tokens\`, \`attributes.gen_ai.usage.cache_read_input_tokens\`, 0) as cr, coalesce(\`attributes.gen_ai.usage.cache_creation.input_tokens\`, \`attributes.gen_ai.usage.cache_write_input_tokens\`, 0) as cw, \`attributes.hub.cache_ttl\` as ttl, coalesce(\`attributes.gen_ai.request.model\`, "unknown") as model
+  const queryFor = (lcFilter) => `${SPAN_USAGE_FIELDS}
 | filter sid in [${idList}] and \`attributes.event.name\` = "api_request"
-| stats sum(i) as inp, sum(o) as outp, sum(cr) as cacheRead, sum(cw) as cacheWrite by sid, model, ttl`;
-  return runInsights(groups, q, startSec, endSec).catch((e) => {
-    console.warn(`${LOG} claude-code span query failed:`, e.message);
-    return [];
-  });
+${lcFilter}
+| ${SPAN_USAGE_STATS}`;
+  return queryUsageSplitByContext(groups, queryFor, "claude-code span", startSec, endSec);
 }
 
 async function queryCodingUsageRecords(codingSessions, startSec, endSec) {
   // Structured coding_usage app-log records (codex tokens, kiro credits) live
   // in the coding runtime's APPLICATION log group, not the span groups.
+  //
+  // Deliberately NOT split by the long-context threshold: one coding_usage record
+  // is a whole TURN's totals, not one request, so `input_tokens > 272000` on it
+  // says nothing about whether any single request crossed the line. These rows
+  // therefore bill at standard rates (row.lc stays undefined). Per-request codex
+  // usage would have to be emitted before the split could mean anything here.
   const ids = codingSessions.map((s) => s.sessionId).filter(Boolean);
   if (!ids.length || !CODING_LOG_GROUP) return [];
   const idList = ids.map((x) => `"${x}"`).join(",");
