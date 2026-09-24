@@ -1005,6 +1005,26 @@ export async function loadModelsRegistry(opts: { force?: boolean } = {}): Promis
 }
 
 /**
+ * The pre-change document (`config/models.prev.json`), or null when there isn't
+ * one. Never cached: it is read on a rollback and on an explicit
+ * `?withPrevious=1`, both of which want the truth rather than a fast answer. A
+ * read failure reads as "no previous document" — the caller's 404 is recoverable
+ * by retrying, whereas a 500 here would strand the operator mid-rollback.
+ */
+export async function loadPreviousModelsRegistry(): Promise<ModelsRegistry | null> {
+  if (!ARTIFACT_BUCKET) return null;
+  try {
+    const { S3Client, GetObjectCommand } = await import("@aws-sdk/client-s3");
+    const s3 = new S3Client({ region: REGION });
+    const obj = await s3.send(new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: MODELS_PREV_KEY }));
+    return parseModelsRegistry(await obj.Body!.transformToString()).registry;
+  } catch (err) {
+    if (!isNotFound(err)) console.warn(`[models] prev.read_failed reason=${(err as Error)?.name || "error"}`);
+    return null;
+  }
+}
+
+/**
  * Conditional PUT. 412 is a real version conflict; 409 is a race, retried up
  * to three times before it becomes one.
  */
