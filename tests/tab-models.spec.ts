@@ -55,6 +55,9 @@ const RETIRED = "us.anthropic.claude-sonnet-4-5";
 const BUILDER = "agentcore_hub_builder";
 const MANAGER = "agentcore_hub_workflow_manager";
 const CI_AGENT = "agentcore_hub_ci_agent";
+const PA = "personal_assistant_agent";
+/** What PA runs in prod (TEAM-5067) — a re-pin from before the fable/opus persona move, still live. */
+const PA_LIVE = "global.anthropic.claude-sonnet-4-5-20250929-v1:0";
 
 /** Seen in spans, absent from the catalog — the strip names it and points at Refresh. */
 const SPAN_UNPRICED = "us.anthropic.claude-tiny-1";
@@ -248,8 +251,14 @@ const HARNESS_IDS: string[] = agentsConfig.agents.filter((a) => a.type === "harn
  * dash (TEAM-5010 finding 1). Those three are DERIVED on the client from `source`
  * plus `registry.catalog`; deriveResolved's unit test
  * (src/lib/model-label.test.ts) is where they are asserted.
+ *
+ * `harnessOverrides` (TEAM-5067): what a harness OTHER than the builder reports it
+ * is running, when it is not the registry's model — the same shape `drift`s, just
+ * for the harnesses that never go through the apply-then-poll dance the builder
+ * lane exercises (personal_assistant_agent, most notably, which has no apply path
+ * at all).
  */
-function resolvedFixture(doc: FixtureDoc, builderHarnessModel: string): Json {
+function resolvedFixture(doc: FixtureDoc, builderHarnessModel: string, harnessOverrides: Record<string, string> = {}): Json {
   const out: Json = {};
   const persona = doc.defaults.persona;
   for (const agentId of ALL_DEPLOYABLE_IDS) {
@@ -257,7 +266,7 @@ function resolvedFixture(doc: FixtureDoc, builderHarnessModel: string): Json {
     const modelId = override ?? persona;
     const entry: Json = { modelId, source: override ? "agents" : "defaults", via: "catalog" };
     if (HARNESS_IDS.includes(agentId)) {
-      entry.harnessModel = agentId === BUILDER ? builderHarnessModel : modelId;
+      entry.harnessModel = agentId === BUILDER ? builderHarnessModel : (harnessOverrides[agentId] ?? modelId);
     }
     out[agentId] = entry;
   }
@@ -300,6 +309,8 @@ interface RegistryMock {
   runs: Json[];
   /** What the builder harness reports it is running; differs from the registry = drift. */
   builderHarnessModel: string;
+  /** What other harnesses report, when it is not the registry's model (TEAM-5067). */
+  harnessOverrides: Record<string, string>;
   /** From this GET number on, the builder harness reports the registry's model. */
   settleOnGet: number | null;
   /** The `agents` array the default write responder returns. */
@@ -319,6 +330,7 @@ function newMock(overrides: Partial<RegistryMock> = {}): RegistryMock {
     interimOverdue: [SOL],
     runs: runsFixture(),
     builderHarnessModel: SONNET,
+    harnessOverrides: {},
     settleOnGet: null,
     applyResults: [],
     counts: { get: 0, post: 0, reapply: 0, rollback: 0, catalogGet: 0, catalogPost: 0, probe: 0 },
@@ -376,7 +388,7 @@ async function mockModels(page: Page, mock: RegistryMock) {
       return json(route, {
         registry: mock.doc,
         previous: mock.previous,
-        resolved: resolvedFixture(mock.doc, mock.builderHarnessModel),
+        resolved: resolvedFixture(mock.doc, mock.builderHarnessModel, mock.harnessOverrides),
         interimOverdue: mock.interimOverdue,
       });
     }
@@ -677,6 +689,8 @@ test.describe("Models page (TEAM-4996)", () => {
     const pill = page.getByTestId(`agent-status-${BUILDER}`);
     await expect(pill).toHaveText("drift");
     await expect(pill).toHaveAttribute("title", `Running ${SONNET}, registry says ${FABLE}.`);
+    // TEAM-5067: the live model shows next to the select, not just in the tooltip.
+    await expect(page.getByTestId(`agent-harness-model-${BUILDER}`)).toContainText(SONNET);
 
     await page.getByTestId(`agent-reapply-${BUILDER}`).click();
     await expect(pill).toHaveText("applying");
@@ -969,5 +983,34 @@ test.describe("Models page (TEAM-4996)", () => {
     await expect(pill).toHaveText("live", { timeout: 30_000 });
     expect(mock.counts.get).toBeGreaterThanOrEqual(4);
     await expect(page.getByTestId(`agent-reapply-${BUILDER}`)).toBeVisible();
+  });
+
+  // ─── personal_assistant_agent drift (TEAM-5067) ────────────────────────────
+
+  test("20. a drifted harness outside the apply path says drift, names both models and offers no re-apply", async ({ page }) => {
+    mock.harnessOverrides = { [PA]: PA_LIVE };
+    await mockModels(page, mock);
+    await openModels(page);
+
+    const pill = page.getByTestId(`agent-status-${PA}`);
+    await expect(pill).toHaveText("drift");
+    await expect(pill).not.toHaveText("live");
+    const title = await pill.getAttribute("title");
+    expect(title).toContain(PA_LIVE);
+    expect(title).toContain(mock.doc.defaults.persona);
+
+    await expect(page.getByTestId(`agent-harness-model-${PA}`)).toContainText(PA_LIVE);
+    await expect(page.getByTestId(`agent-reapply-${PA}`)).toHaveCount(0);
+
+    await page.screenshot({ path: `${SCREENSHOT_DIR}/20-pa-drift.png` });
+  });
+
+  test("20b. an in-sync personal_assistant_agent stays live with no harness line and no re-apply", async ({ page }) => {
+    await mockModels(page, mock);
+    await openModels(page);
+
+    await expect(page.getByTestId(`agent-status-${PA}`)).toHaveText("live");
+    await expect(page.getByTestId(`agent-harness-model-${PA}`)).toHaveCount(0);
+    await expect(page.getByTestId(`agent-reapply-${PA}`)).toHaveCount(0);
   });
 });
