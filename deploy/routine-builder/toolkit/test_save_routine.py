@@ -128,7 +128,10 @@ def test_quarantined_and_unpriced_rows_are_refused(_harness):
     raw["quarantine"] = ["us.anthropic.claude-sonnet-5"]
     next(r for r in raw["catalog"] if r["modelId"] == "us.anthropic.claude-opus-5").pop("price", None)
     _harness.return_value = save_routine.models_registry.parse_registry(raw)[0]
-    for value, reason in (("claude-sonnet-5", "quarantined"), ("opus", "unpriced")):
+    # The quarantine list and resolve_model's re-check both key on the CANONICAL
+    # id (mirroring the TS canonical's resolveOverrideId) — an alias for a
+    # quarantined id resolves as an unrelated unknown_model, not "quarantined".
+    for value, reason in (("us.anthropic.claude-sonnet-5", "quarantined"), ("opus", "unpriced")):
         with pytest.raises(SystemExit) as exc:
             save_routine.validate(_routine(modelOverride=value))
         assert f"reason={reason}" in str(exc.value)
